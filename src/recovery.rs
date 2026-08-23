@@ -411,19 +411,19 @@ pub fn replay_remote_operations(
                     None
                 }
                 Operation::CreateRemote { content } => {
+                    let Some(staged) = prepare_upload(
+                        sync_root,
+                        upload_staging,
+                        &plan.path,
+                        content,
+                        &mut report,
+                    )?
+                    else {
+                        break;
+                    };
                     if let Some(blocked) = ensure_remote_parents(dropbox, &plan.path)? {
                         Some(blocked)
                     } else {
-                        let Some(staged) = prepare_upload(
-                            sync_root,
-                            upload_staging,
-                            &plan.path,
-                            content,
-                            &mut report,
-                        )?
-                        else {
-                            break;
-                        };
                         let outcome = dropbox
                             .create_file(&plan.path, &staged)
                             .map_err(|source| dropbox_error(&plan.path, source))?;

@@ -717,6 +717,44 @@ fn remote_replay_creates_nested_parents_before_the_file() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn stale_create_source_has_no_remote_effect() -> Result<(), Box<dyn Error>> {
+    let expected = dropbox_content_hash(b"planned bytes".as_slice())?;
+    let actual = dropbox_content_hash(b"changed bytes".as_slice())?;
+    let server = FakeServer::start(Vec::new())?;
+    let client = fake_client(&server, "opaque-access-stale-create")?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(root.join("nested"))?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("nested/file.txt"), b"changed bytes")?;
+    let operations = planned_operations(plan(
+        &Baseline::Absent,
+        &Observation::Present(LocalFile::new(expected)),
+        &Observation::ConfirmedAbsent,
+    ))?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    assert!(matches!(
+        journal.record_plan(Path::new("nested/file.txt"), &operations)?,
+        PlanWrite::Recorded(_)
+    ));
+
+    let report = replay_remote_operations(&mut journal, &client, &root, &staging, &recovery)?;
+    assert_eq!(
+        report.blocked,
+        vec![ReplayBlocked::PreconditionChanged {
+            path: Path::new("nested/file.txt").to_path_buf(),
+            actual: Some(actual),
+        }]
+    );
+    assert!(server.finish()?.is_empty());
+    assert_eq!(journal.pending_plans()?.len(), 1);
+    Ok(())
+}
+
+#[test]
 fn remote_replay_reuses_completed_recovery_and_leaves_ambiguous_create_pending()
 -> Result<(), Box<dyn Error>> {
     let old_bytes = b"old remote bytes";
