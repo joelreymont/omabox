@@ -10,7 +10,9 @@ use crate::journal::{
     Journal, JournalError, LocalObservationRecord, NoOpWrite, PlanConflictCompletion, PlanRecord,
     PlanWrite, RemoteObservationRecord,
 };
-use crate::local::{LocalError, StageOutcome, StagedUpload, scan_and_publish, stage_upload};
+use crate::local::{
+    LocalError, StageOutcome, StagedUpload, observe_upload_source, scan_and_publish, stage_upload,
+};
 use crate::model::{
     Baseline, Conflict, Decision, LocalObservation, Observation, Operation, RemoteObservation,
 };
@@ -408,9 +410,13 @@ fn prepare_local(
     content: &crate::model::ContentIdentity,
 ) -> Result<Prepared<StagedUpload>, ReconcileError> {
     match stage_upload(sync_root, path, upload_staging, content) {
-        Ok(StageOutcome::Staged(staged) | StageOutcome::AlreadyStaged(staged)) => {
-            Ok(Prepared::Ready(staged))
-        }
+        Ok(StageOutcome::Staged(staged)) => Ok(Prepared::Ready(staged)),
+        Ok(StageOutcome::AlreadyStaged(staged)) => match observe_upload_source(sync_root, path) {
+            Ok(actual) if actual == *content => Ok(Prepared::Ready(staged)),
+            Ok(_) => Ok(Prepared::FreshObservation),
+            Err(source) if local_source_changed(&source, path) => Ok(Prepared::FreshObservation),
+            Err(source) => Err(ReconcileError::Local { source }),
+        },
         Ok(StageOutcome::ContentChanged { .. }) => Ok(Prepared::FreshObservation),
         Ok(StageOutcome::DestinationOccupied { path }) => {
             Err(ReconcileError::StageDestinationOccupied { path })
@@ -544,8 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn local_bytes_are_staged_before_plan_visibility_and_races_do_not_plan()
-    -> Result<(), Box<dyn Error>> {
+    fn local_bytes_are_staged_before_plan_visibility() -> Result<(), Box<dyn Error>> {
         let root = TempDir::new()?;
         let staging = TempDir::new()?;
         let state = TempDir::new()?;
@@ -573,30 +578,42 @@ mod tests {
         };
         let _ = journal.record_plan(path, &operation_plan)?;
         assert_eq!(journal.pending_plans()?.len(), 1);
+        Ok(())
+    }
 
-        let changed_path = Path::new("changed.txt");
-        let changed_observation = identity(b"old observed bytes")?;
-        std::fs::write(root.path().join(changed_path), b"new bytes")?;
+    #[test]
+    fn matching_stage_still_requires_a_current_source_before_planning() -> Result<(), Box<dyn Error>>
+    {
+        let root = TempDir::new()?;
+        let staging = TempDir::new()?;
+        let state = TempDir::new()?;
+        let journal = Journal::open(state.path().join("journal.sqlite3"))?;
+        let path = Path::new("changed.txt");
+        let bytes = b"observed bytes";
+        let content = identity(bytes)?;
+        std::fs::write(root.path().join(path), bytes)?;
         assert!(matches!(
-            prepare_local(
-                root.path(),
-                staging.path(),
-                changed_path,
-                &changed_observation,
-            )?,
+            prepare_local(root.path(), staging.path(), path, &content)?,
+            Prepared::Ready(_)
+        ));
+
+        std::fs::write(root.path().join(path), b"new bytes")?;
+        assert!(matches!(
+            prepare_local(root.path(), staging.path(), path, &content)?,
             Prepared::FreshObservation
         ));
-        std::fs::remove_file(root.path().join(changed_path))?;
+        assert_eq!(std::fs::read(root.path().join(path))?, b"new bytes");
+        assert!(journal.pending_plans()?.is_empty());
+        assert!(journal.conflicts()?.is_empty());
+
+        std::fs::remove_file(root.path().join(path))?;
         assert!(matches!(
-            prepare_local(
-                root.path(),
-                staging.path(),
-                changed_path,
-                &changed_observation,
-            )?,
+            prepare_local(root.path(), staging.path(), path, &content)?,
             Prepared::FreshObservation
         ));
-        assert_eq!(journal.pending_plans()?.len(), 1);
+        assert!(!root.path().join(path).exists());
+        assert!(journal.pending_plans()?.is_empty());
+        assert!(journal.conflicts()?.is_empty());
         Ok(())
     }
 
