@@ -4,6 +4,8 @@ use miette::Diagnostic;
 use thiserror::Error;
 
 pub mod config;
+pub mod model;
+pub mod planner;
 
 /// An error reported by Omabox.
 #[derive(Debug, Diagnostic, Error)]
