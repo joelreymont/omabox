@@ -170,6 +170,7 @@ impl Paths {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     sync_root: PathBuf,
+    dropbox_app_key: String,
     paths: Paths,
 }
 
@@ -177,6 +178,7 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 struct ConfigDocument {
     sync_root: PathBuf,
+    dropbox_app_key: String,
 }
 
 impl Config {
@@ -200,15 +202,28 @@ impl Config {
             }
         })?;
         let requested_root = require_absolute("sync_root", document.sync_root)?;
+        if document.dropbox_app_key.trim().is_empty() {
+            return Err(ConfigError::EmptyDropboxAppKey);
+        }
         let sync_root = canonicalize_sync_root(&requested_root)?;
         let paths = Paths::resolve(xdg, &sync_root)?;
-        Ok(Self { sync_root, paths })
+        Ok(Self {
+            sync_root,
+            dropbox_app_key: document.dropbox_app_key,
+            paths,
+        })
     }
 
     /// Canonical local root synchronized with Dropbox.
     #[must_use]
     pub fn sync_root(&self) -> &Path {
         &self.sync_root
+    }
+
+    /// Public Dropbox application key used for OAuth.
+    #[must_use]
+    pub fn dropbox_app_key(&self) -> &str {
+        &self.dropbox_app_key
     }
 
     /// Validated configuration and state paths.
@@ -276,9 +291,7 @@ pub enum ConfigError {
     #[error("could not read Omabox configuration at `{path}`")]
     #[diagnostic(
         code(omabox::config::read),
-        help(
-            "Create the file and ensure it is readable; it must contain an absolute `sync_root`."
-        )
+        help("Create a readable file containing an absolute `sync_root` and a `dropbox_app_key`.")
     )]
     Read {
         /// Configuration file path.
@@ -293,7 +306,7 @@ pub enum ConfigError {
     #[diagnostic(
         code(omabox::config::parse),
         help(
-            "The file may contain only `sync_root = \"/absolute/path\"`; credentials do not belong in configuration."
+            "The file may contain only `sync_root` and `dropbox_app_key`; credentials do not belong in configuration."
         )
     )]
     Parse {
@@ -303,6 +316,14 @@ pub enum ConfigError {
         #[source]
         source: toml::de::Error,
     },
+
+    /// The public Dropbox application key was empty.
+    #[error("Dropbox application key is empty")]
+    #[diagnostic(
+        code(omabox::config::empty_dropbox_app_key),
+        help("Set `dropbox_app_key` to the public app key from the Dropbox developer console.")
+    )]
+    EmptyDropboxAppKey,
 
     /// The configured sync root could not be resolved.
     #[error("could not resolve sync root `{path}`")]
@@ -667,7 +688,10 @@ mod tests {
     fn write_config(xdg: &XdgDirectories, sync_root: &Path) -> Result<(), io::Error> {
         fs::write(
             xdg.config_file(),
-            format!("sync_root = {:?}\n", sync_root.display().to_string()),
+            format!(
+                "sync_root = {:?}\ndropbox_app_key = \"test-app-key\"\n",
+                sync_root.display().to_string()
+            ),
         )
     }
 
@@ -680,6 +704,7 @@ mod tests {
         config.prepare()?;
 
         assert_eq!(config.sync_root(), sync_root);
+        assert_eq!(config.dropbox_app_key(), "test-app-key");
         assert_eq!(
             config.paths().journal_file(),
             xdg.state_home.join("omabox/journal.sqlite3")
@@ -803,6 +828,36 @@ mod tests {
         }
         let report = format!("{:?}", miette::Report::new(error));
         assert!(!report.contains(SENTINEL));
+        Ok(())
+    }
+
+    #[test]
+    fn config_rejects_empty_app_key_without_rendering_other_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const SENTINEL: &str = "local-path-sentinel";
+
+        let (temporary, xdg, _sync_root) = fixture()?;
+        let sync_root = temporary.path().join(SENTINEL);
+        fs::create_dir(&sync_root)?;
+        fs::write(
+            xdg.config_file(),
+            format!(
+                "sync_root = {:?}\ndropbox_app_key = \"  \"\n",
+                sync_root.display().to_string()
+            ),
+        )?;
+
+        let error = Config::load_from(&xdg)
+            .err()
+            .ok_or("empty app key was accepted")?;
+        assert!(matches!(error, ConfigError::EmptyDropboxAppKey));
+        for rendered in [
+            format!("{error}"),
+            format!("{error:?}"),
+            format!("{:?}", miette::Report::new(error)),
+        ] {
+            assert!(!rendered.contains(SENTINEL));
+        }
         Ok(())
     }
 
