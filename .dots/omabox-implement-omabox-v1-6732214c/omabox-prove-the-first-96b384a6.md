@@ -1,9 +1,9 @@
 ---
 title: Prove the first-release acceptance path
-status: open
+status: active
 priority: 2
 issue-type: task
-created-at: "2026-08-23T20:47:57.992059+02:00"
+created-at: "\"2026-08-23T20:47:57.992059+02:00\""
 blocks:
   - omabox-wire-reconciliation-daemon-9b8dd33a
 ---
