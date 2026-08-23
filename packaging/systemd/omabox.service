@@ -1,0 +1,13 @@
+[Unit]
+Description=Omabox Dropbox sync service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/omaboxd
+Restart=on-failure
+UMask=0077
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=default.target
