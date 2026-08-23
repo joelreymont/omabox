@@ -1,9 +1,9 @@
 ---
 title: Implement config paths locking and logging
-status: open
+status: active
 priority: 2
 issue-type: task
-created-at: "2026-08-23T20:52:43.501713+02:00"
+created-at: "\"2026-08-23T20:52:43.501713+02:00\""
 blocks:
   - omabox-establish-the-rust-a22aa517
 ---
