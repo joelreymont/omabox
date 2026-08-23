@@ -1,9 +1,11 @@
 ---
 title: Implement the pure sync planner
-status: active
+status: closed
 priority: 2
 issue-type: task
-created-at: "\"2026-08-23T20:47:57.557478+02:00\""
+created-at: "\"\\\"2026-08-23T20:47:57.557478+02:00\\\"\""
+closed-at: "2026-08-23T21:31:47.141131+02:00"
+close-reason: Landed as 01a6c87e with minimality/safety approval; property, snapshot, full host, strict Clippy, and ARM64 checks green.
 blocks:
   - omabox-bootstrap-the-rust-fdad9292
 ---
