@@ -1,9 +1,11 @@
 ---
 title: Implement config paths locking and logging
-status: active
+status: closed
 priority: 2
 issue-type: task
-created-at: "\"2026-08-23T20:52:43.501713+02:00\""
+created-at: "\"\\\"2026-08-23T20:52:43.501713+02:00\\\"\""
+closed-at: "2026-08-23T21:19:00.786270+02:00"
+close-reason: Landed as 5e04ed86; host and ARM64 checks, strict Clippy, config/lock/full tests green.
 blocks:
   - omabox-establish-the-rust-a22aa517
 ---
