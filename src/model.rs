@@ -2,8 +2,10 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// Stable identity of a file's bytes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContentIdentity(String);
 
 impl ContentIdentity {
@@ -14,7 +16,7 @@ impl ContentIdentity {
 }
 
 /// Dropbox revision that guards a remote mutation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DropboxRevision(String);
 
 impl DropboxRevision {
@@ -25,7 +27,7 @@ impl DropboxRevision {
 }
 
 /// A locally observed regular file.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LocalFile {
     /// Identity of the observed bytes.
     pub content: ContentIdentity,
@@ -39,7 +41,7 @@ impl LocalFile {
 }
 
 /// A remotely observed Dropbox file.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RemoteFile {
     /// Identity of the observed bytes.
     pub content: ContentIdentity,
@@ -55,7 +57,7 @@ impl RemoteFile {
 }
 
 /// Last common state durably recorded for one path.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Baseline {
     /// The path had no synchronized file.
     Absent,
@@ -64,7 +66,7 @@ pub enum Baseline {
 }
 
 /// Why an observation cannot prove either presence or absence.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum UnknownReason {
     /// The complete scan or listing has not finished.
     Incomplete,
@@ -95,7 +97,7 @@ impl fmt::Display for UnknownReason {
 }
 
 /// Result of observing one side of a path.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Observation<T> {
     /// The path is present with a complete payload description.
     Present(T),
@@ -112,7 +114,7 @@ pub type LocalObservation = Observation<LocalFile>;
 pub type RemoteObservation = Observation<RemoteFile>;
 
 /// Ordered recovery or mutation step selected for one path.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Operation {
     /// Create a remote file only while the remote path remains absent.
     CreateRemote { content: ContentIdentity },
@@ -157,6 +159,22 @@ impl Operation {
     }
 }
 
+/// Non-empty ordered operations produced by the planner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationPlan(Vec<Operation>);
+
+impl OperationPlan {
+    pub(crate) fn new(operations: Vec<Operation>) -> Self {
+        Self(operations)
+    }
+
+    /// Return operations in their required execution order.
+    #[must_use]
+    pub fn operations(&self) -> &[Operation] {
+        &self.0
+    }
+}
+
 /// Explanation for a decision that requires no operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NoOpReason {
@@ -164,6 +182,31 @@ pub enum NoOpReason {
     BothAbsent,
     /// Both present observations identify the same bytes.
     ContentMatches,
+}
+
+/// A planner-approved baseline transition that requires no effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NoOpDecision {
+    reason: NoOpReason,
+    baseline: Baseline,
+}
+
+impl NoOpDecision {
+    pub(crate) fn new(reason: NoOpReason, baseline: Baseline) -> Self {
+        Self { reason, baseline }
+    }
+
+    /// Explain why no effect is required.
+    #[must_use]
+    pub fn reason(&self) -> NoOpReason {
+        self.reason
+    }
+
+    /// Return the completely observed common state to record.
+    #[must_use]
+    pub fn baseline(&self) -> &Baseline {
+        &self.baseline
+    }
 }
 
 /// Unknown input that prevents a safe decision.
@@ -181,7 +224,7 @@ pub enum BlockedReason {
 }
 
 /// Simultaneous states that cannot be reconciled without preserving a conflict.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Conflict {
     /// Different files were independently introduced at a path with no baseline.
     InitialCollision {
@@ -244,9 +287,9 @@ impl Conflict {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Decision {
     /// The complete observations already agree.
-    NoOp(NoOpReason),
+    NoOp(NoOpDecision),
     /// Recovery and mutation steps, in execution order.
-    Operations(Vec<Operation>),
+    Operations(OperationPlan),
     /// Uncertain state prevents a safe decision.
     Blocked(BlockedReason),
     /// Simultaneous changes must retain every present payload.
@@ -256,15 +299,13 @@ pub enum Decision {
 impl fmt::Display for Decision {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoOp(NoOpReason::BothAbsent) => {
+            Self::NoOp(noop) if noop.reason() == NoOpReason::BothAbsent => {
                 formatter.write_str("no operation: both sides are confirmed absent")
             }
-            Self::NoOp(NoOpReason::ContentMatches) => {
-                formatter.write_str("no operation: local and remote content match")
-            }
-            Self::Operations(operations) => {
+            Self::NoOp(_) => formatter.write_str("no operation: local and remote content match"),
+            Self::Operations(plan) => {
                 formatter.write_str("operations:")?;
-                for (index, operation) in operations.iter().enumerate() {
+                for (index, operation) in plan.operations().iter().enumerate() {
                     write!(formatter, "\n{}. {}", index + 1, operation.description())?;
                 }
                 Ok(())

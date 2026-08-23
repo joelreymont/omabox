@@ -86,20 +86,42 @@ proptest! {
     }
 
     #[test]
+    fn no_op_carries_the_completely_observed_baseline(
+        baseline in baseline_strategy(),
+        observations in observation_sequence_strategy(),
+    ) {
+        for (local, remote) in observations {
+            let decision = plan(&baseline, &local, &remote);
+            if let Decision::NoOp(noop) = decision {
+                match (&local, &remote) {
+                    (Observation::ConfirmedAbsent, Observation::ConfirmedAbsent) => {
+                        prop_assert_eq!(noop.baseline(), &Baseline::Absent);
+                    }
+                    (Observation::Present(local), Observation::Present(remote)) => {
+                        prop_assert_eq!(&local.content, &remote.content);
+                        prop_assert_eq!(noop.baseline(), &Baseline::Present(remote.clone()));
+                    }
+                    _ => prop_assert!(false, "no-op lacked a complete common observation"),
+                }
+            }
+        }
+    }
+
+    #[test]
     fn remote_mutations_retain_the_observed_revision(
         baseline in baseline_strategy(),
         observations in observation_sequence_strategy(),
     ) {
         for (local, remote) in observations {
             let decision = plan(&baseline, &local, &remote);
-            if let Decision::Operations(operations) = decision {
-                for operation in operations {
+            if let Decision::Operations(operation_plan) = decision {
+                for operation in operation_plan.operations() {
                     match (&remote, operation) {
                         (
                             Observation::Present(remote),
                             Operation::ReplaceRemote { expected_revision, .. }
                             | Operation::DeleteRemote { expected_revision },
-                        ) => prop_assert_eq!(expected_revision, remote.revision.clone()),
+                        ) => prop_assert_eq!(expected_revision, &remote.revision),
                         (
                             Observation::ConfirmedAbsent | Observation::Unknown(_),
                             Operation::ReplaceRemote { .. } | Operation::DeleteRemote { .. },
@@ -118,9 +140,9 @@ proptest! {
     ) {
         for (local, remote) in observations {
             let decision = plan(&baseline, &local, &remote);
-            if let Decision::Operations(operations) = decision {
+            if let Decision::Operations(operation_plan) = decision {
                 let mut previous: Option<&Operation> = None;
-                for operation in &operations {
+                for operation in operation_plan.operations() {
                     match (previous, operation) {
                         (
                             Some(Operation::PreserveLocal { file }),
