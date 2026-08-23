@@ -1,9 +1,11 @@
 ---
 title: Build crash-safe local operations
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-08-23T20:47:57.699622+02:00"
+created-at: "\"2026-08-23T20:47:57.699622+02:00\""
+closed-at: "2026-08-23T23:34:12.401393+02:00"
+close-reason: landed d7de47a8; fmt, strict clippy, full tests/docs, and ARM64 check pass
 blocks:
   - omabox-add-the-transactional-c8256b3a
 ---
