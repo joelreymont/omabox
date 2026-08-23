@@ -13,6 +13,12 @@ impl ContentIdentity {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
+
+    /// Return the Dropbox content-hash representation.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Dropbox revision that guards a remote mutation.
