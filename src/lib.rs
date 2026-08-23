@@ -7,4 +7,5 @@ pub mod journal;
 pub mod local;
 pub mod model;
 pub mod planner;
+pub mod reconcile;
 pub mod recovery;
