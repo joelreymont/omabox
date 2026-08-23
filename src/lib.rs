@@ -3,10 +3,27 @@
 use miette::Diagnostic;
 use thiserror::Error;
 
+pub mod config;
+
 /// An error reported by Omabox.
 #[derive(Debug, Diagnostic, Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// Configuration could not be loaded or prepared.
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Config(#[from] config::ConfigError),
+
+    /// The daemon's single-instance lock could not be acquired.
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Lock(#[from] config::LockError),
+
+    /// Structured logging could not be initialized.
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Logging(#[from] config::LoggingError),
+
     /// The requested functionality is not part of the current build.
     #[error("the requested Omabox functionality is not available")]
     #[diagnostic(
