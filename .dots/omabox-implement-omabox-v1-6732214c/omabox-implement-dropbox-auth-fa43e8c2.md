@@ -1,9 +1,9 @@
 ---
 title: Implement Dropbox auth and reads
-status: open
+status: active
 priority: 2
 issue-type: task
-created-at: "2026-08-23T20:47:57.767481+02:00"
+created-at: "\"2026-08-23T20:47:57.767481+02:00\""
 blocks:
   - omabox-build-crash-safe-946fe236
 ---
