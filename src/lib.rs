@@ -8,3 +8,4 @@ pub mod local;
 pub mod model;
 pub mod planner;
 pub mod recovery;
+pub mod status;
