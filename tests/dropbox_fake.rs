@@ -6,7 +6,7 @@ use std::path::Path;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use omabox::auth::OAuthClient;
+use omabox::auth::{AuthError, OAuthClient, RefreshToken};
 use omabox::dropbox::{
     DropboxClient, DropboxEndpoints, DropboxError, DropboxLink, DropboxRoot, InventoryRefresh,
 };
@@ -83,11 +83,9 @@ fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result
         FakeResponse::bytes(bytes.to_vec()).header("Dropbox-API-Result", download_metadata),
     ])?;
     let endpoints = server.endpoints();
-    let oauth =
-        OAuthClient::with_endpoints("app-key", "http://127.0.0.1/callback", endpoints.clone());
+    let oauth = OAuthClient::with_endpoints("app-key", endpoints.clone());
     let pending = oauth.begin()?;
-    let state = query_value(pending.authorization_url(), "state")?;
-    let grant = oauth.exchange(pending, "authorization-code", &state)?;
+    let grant = oauth.exchange(pending, "authorization-code")?;
     assert_eq!(grant.account_id, "account-a");
     let refreshed = oauth.refresh(&grant.refresh_token)?;
     let client = match DropboxClient::link_with_endpoints(
@@ -140,6 +138,9 @@ fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result
     assert_eq!(requests.len(), 8);
     assert_eq!(requests[0].path, "/oauth2/token");
     assert!(text_body(&requests[0])?.contains("grant_type=authorization_code"));
+    assert!(text_body(&requests[0])?.contains("code_verifier="));
+    assert!(!text_body(&requests[0])?.contains("redirect_uri"));
+    assert!(!text_body(&requests[0])?.contains("state="));
     assert!(text_body(&requests[1])?.contains("grant_type=refresh_token"));
     assert_eq!(requests[2].path, "/2/users/get_current_account");
     assert_eq!(requests[3].path, "/2/users/get_current_account");
@@ -157,6 +158,24 @@ fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result
         header(&requests[7], "dropbox-api-arg")
             .is_some_and(|value| value.contains(r#""path":"rev:rev-a""#))
     );
+    Ok(())
+}
+
+#[test]
+fn oauth_rate_limit_preserves_retry_after_header() -> Result<(), Box<dyn Error>> {
+    let server = FakeServer::start(vec![
+        FakeResponse::status_json(429, json!({})).header("Retry-After", "23"),
+    ])?;
+    let oauth = OAuthClient::with_endpoints("app-key", server.endpoints());
+
+    assert!(matches!(
+        oauth.refresh(&RefreshToken::from_secret("opaque-refresh")),
+        Err(AuthError::RateLimited {
+            operation: "refresh access token",
+            retry_after: Some(delay),
+        }) if delay == Duration::from_secs(23)
+    ));
+    assert_eq!(server.finish()?.len(), 1);
     Ok(())
 }
 
@@ -358,8 +377,7 @@ fn fake_client(server: &FakeServer, access_token: &str) -> Result<DropboxClient,
         "expires_in": 14400
     }))])?;
     let token_endpoints = token_server.endpoints();
-    let token_oauth =
-        OAuthClient::with_endpoints("app-key", "http://127.0.0.1/callback", token_endpoints);
+    let token_oauth = OAuthClient::with_endpoints("app-key", token_endpoints);
     let refreshed =
         token_oauth.refresh(&omabox::auth::RefreshToken::from_secret("opaque-refresh"))?;
     let requests = token_server.finish()?;
@@ -381,18 +399,6 @@ fn observation<'a>(
         .iter()
         .find(|record| record.path == path)
         .map(|record| &record.observation)
-}
-
-fn query_value(url: &str, key: &str) -> Result<String, io::Error> {
-    let query = url
-        .split_once('?')
-        .map(|(_, query)| query)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing query"))?;
-    query
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .find_map(|(name, value)| (name == key).then(|| String::from(value)))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing query field"))
 }
 
 fn text_body(request: &FakeRequest) -> Result<&str, std::str::Utf8Error> {

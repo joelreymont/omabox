@@ -2,7 +2,6 @@
 
 use std::fmt;
 use std::io::{self, Read as _, Write as _};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 #[cfg(test)]
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -20,7 +19,6 @@ use crate::dropbox::DropboxEndpoints;
 use crate::journal::DropboxBinding;
 
 const RANDOM_VALUE_BYTES: usize = 32;
-const CALLBACK_HEADER_LIMIT: usize = 16 * 1024;
 const SECRET_TOOL: &str = "/usr/bin/secret-tool";
 const SECRET_BYTES_LIMIT: usize = 8192;
 const SECRET_VERSION: u8 = 1;
@@ -264,7 +262,6 @@ struct LoadedSecret {
 pub struct PendingAuthorization {
     authorization_url: String,
     verifier: String,
-    state: String,
 }
 
 impl PendingAuthorization {
@@ -275,47 +272,12 @@ impl PendingAuthorization {
     }
 }
 
-/// A loopback callback that is already bound before a browser is launched.
-pub struct LoopbackAuthorization {
-    pending: PendingAuthorization,
-    listener: TcpListener,
-    callback_path: String,
-}
-
-impl LoopbackAuthorization {
-    /// URL the browser must open for this authorization attempt.
-    #[must_use]
-    pub fn authorization_url(&self) -> &str {
-        self.pending.authorization_url()
-    }
-
-    /// Open the authorization URL using the desktop's registered browser.
-    pub fn open_browser(&self) -> Result<(), AuthError> {
-        Command::new("xdg-open")
-            .arg(self.authorization_url())
-            .spawn()
-            .map_err(|source| AuthError::Browser { source })?;
-        Ok(())
-    }
-}
-
-impl fmt::Debug for LoopbackAuthorization {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("LoopbackAuthorization")
-            .field("pending", &self.pending)
-            .field("callback_path", &self.callback_path)
-            .finish_non_exhaustive()
-    }
-}
-
 impl fmt::Debug for PendingAuthorization {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PendingAuthorization")
             .field("authorization_url", &"[REDACTED]")
             .field("verifier", &"[REDACTED]")
-            .field("state", &"[REDACTED]")
             .finish()
     }
 }
@@ -345,7 +307,6 @@ pub struct RefreshedAccess {
 /// Direct blocking Dropbox OAuth client.
 pub struct OAuthClient {
     app_key: String,
-    redirect_uri: String,
     endpoints: DropboxEndpoints,
     agent: ureq::Agent,
 }
@@ -353,39 +314,32 @@ pub struct OAuthClient {
 impl OAuthClient {
     /// Construct an OAuth client using Dropbox's production endpoints.
     #[must_use]
-    pub fn new(app_key: impl Into<String>, redirect_uri: impl Into<String>) -> Self {
-        Self::with_endpoints(app_key, redirect_uri, DropboxEndpoints::production())
+    pub fn new(app_key: impl Into<String>) -> Self {
+        Self::with_endpoints(app_key, DropboxEndpoints::production())
     }
 
     /// Construct an OAuth client with explicit endpoints.
     ///
     /// This is intended for protocol tests against a local fake server.
     #[must_use]
-    pub fn with_endpoints(
-        app_key: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        endpoints: DropboxEndpoints,
-    ) -> Self {
+    pub fn with_endpoints(app_key: impl Into<String>, endpoints: DropboxEndpoints) -> Self {
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_global(Some(Duration::from_secs(60)))
             .build();
         Self {
             app_key: app_key.into(),
-            redirect_uri: redirect_uri.into(),
             endpoints,
             agent: ureq::Agent::new_with_config(config),
         }
     }
 
-    /// Start one authorization attempt with fresh verifier and CSRF state.
+    /// Start one authorization attempt with a fresh PKCE verifier.
     pub fn begin(&self) -> Result<PendingAuthorization, AuthError> {
         let verifier = random_urlsafe()?;
-        let state = random_urlsafe()?;
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let query = form_urlencoded::Serializer::new(String::new())
             .append_pair("client_id", &self.app_key)
-            .append_pair("redirect_uri", &self.redirect_uri)
             .append_pair("response_type", "code")
             .append_pair("token_access_type", "offline")
             .append_pair(
@@ -394,50 +348,19 @@ impl OAuthClient {
             )
             .append_pair("code_challenge", &challenge)
             .append_pair("code_challenge_method", "S256")
-            .append_pair("state", &state)
             .finish();
         Ok(PendingAuthorization {
             authorization_url: format!("{}?{query}", self.endpoints.authorize()),
             verifier,
-            state,
         })
     }
 
-    /// Bind the fixed registered loopback callback before browser launch.
-    pub fn begin_loopback(&self) -> Result<LoopbackAuthorization, AuthError> {
-        let (address, callback_path) = parse_loopback_redirect(&self.redirect_uri)?;
-        let listener =
-            TcpListener::bind(address).map_err(|source| AuthError::CallbackBind { source })?;
-        Ok(LoopbackAuthorization {
-            pending: self.begin()?,
-            listener,
-            callback_path,
-        })
-    }
-
-    /// Receive the exact loopback redirect and exchange its one-use code.
-    pub fn finish_loopback(
-        &self,
-        authorization: LoopbackAuthorization,
-    ) -> Result<AuthorizationGrant, AuthError> {
-        let (code, state) = receive_callback(
-            &authorization.listener,
-            &authorization.callback_path,
-            &authorization.pending.state,
-        )?;
-        self.exchange(authorization.pending, &code, &state)
-    }
-
-    /// Exchange a returned authorization code after validating its state.
+    /// Exchange the manually copied authorization code.
     pub fn exchange(
         &self,
         pending: PendingAuthorization,
         code: &str,
-        returned_state: &str,
     ) -> Result<AuthorizationGrant, AuthError> {
-        if pending.state != returned_state {
-            return Err(AuthError::StateMismatch);
-        }
         let mut response = self
             .agent
             .post(self.endpoints.token())
@@ -446,13 +369,16 @@ impl OAuthClient {
                 ("code", code),
                 ("code_verifier", pending.verifier.as_str()),
                 ("grant_type", "authorization_code"),
-                ("redirect_uri", self.redirect_uri.as_str()),
             ])
             .map_err(|source| AuthError::Transport {
                 operation: "exchange authorization code",
                 source,
             })?;
-        require_success(response.status().as_u16(), "exchange authorization code")?;
+        require_success(
+            response.status().as_u16(),
+            response.headers().get("Retry-After"),
+            "exchange authorization code",
+        )?;
         let payload: AuthorizationResponse =
             response
                 .body_mut()
@@ -483,7 +409,11 @@ impl OAuthClient {
                 operation: "refresh access token",
                 source,
             })?;
-        require_success(response.status().as_u16(), "refresh access token")?;
+        require_success(
+            response.status().as_u16(),
+            response.headers().get("Retry-After"),
+            "refresh access token",
+        )?;
         let payload: RefreshResponse =
             response
                 .body_mut()
@@ -523,39 +453,14 @@ pub enum AuthError {
         #[source]
         source: rustix::io::Errno,
     },
-    /// The registered redirect URI is not a fixed IPv4 loopback callback.
-    #[error("OAuth redirect URI must be a fixed http://127.0.0.1 callback")]
-    InvalidLoopbackRedirect,
-    /// The fixed loopback callback address could not be reserved.
-    #[error("could not bind the registered OAuth loopback callback")]
-    CallbackBind {
-        /// Original network error.
-        #[source]
-        source: io::Error,
+    /// Dropbox rate-limited an OAuth request.
+    #[error("Dropbox OAuth operation `{operation}` was rate limited")]
+    RateLimited {
+        /// Safe operation name.
+        operation: &'static str,
+        /// Server-requested delay when Dropbox returned valid delta seconds.
+        retry_after: Option<Duration>,
     },
-    /// The desktop browser could not be started.
-    #[error("could not open the Dropbox authorization page")]
-    Browser {
-        /// Original process launch error; arguments are not included.
-        #[source]
-        source: io::Error,
-    },
-    /// The local OAuth callback did not match the registered path and schema.
-    #[error("Dropbox authorization returned an invalid loopback callback")]
-    InvalidCallback,
-    /// The browser callback could not be received or answered.
-    #[error("could not receive the Dropbox authorization callback")]
-    CallbackIo {
-        /// Original local network error.
-        #[source]
-        source: io::Error,
-    },
-    /// Dropbox reported that authorization did not complete.
-    #[error("Dropbox authorization was denied or cancelled")]
-    AuthorizationDenied,
-    /// The browser redirect did not belong to this authorization attempt.
-    #[error("OAuth redirect state did not match the pending authorization")]
-    StateMismatch,
     /// Dropbox returned a non-success status.
     #[error("Dropbox OAuth operation `{operation}` returned HTTP status {status}")]
     HttpStatus {
@@ -660,129 +565,24 @@ fn random_urlsafe() -> Result<String, AuthError> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
-fn require_success(status: u16, operation: &'static str) -> Result<(), AuthError> {
+fn require_success(
+    status: u16,
+    retry_after: Option<&ureq::http::HeaderValue>,
+    operation: &'static str,
+) -> Result<(), AuthError> {
     if (200..300).contains(&status) {
         Ok(())
+    } else if status == 429 {
+        let retry_after = retry_after
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs);
+        Err(AuthError::RateLimited {
+            operation,
+            retry_after,
+        })
     } else {
         Err(AuthError::HttpStatus { operation, status })
-    }
-}
-
-fn parse_loopback_redirect(redirect_uri: &str) -> Result<(SocketAddrV4, String), AuthError> {
-    let remainder = redirect_uri
-        .strip_prefix("http://127.0.0.1:")
-        .ok_or(AuthError::InvalidLoopbackRedirect)?;
-    let (port, path) = remainder
-        .split_once('/')
-        .ok_or(AuthError::InvalidLoopbackRedirect)?;
-    let port = port
-        .parse::<u16>()
-        .map_err(|_| AuthError::InvalidLoopbackRedirect)?;
-    if port == 0
-        || path.is_empty()
-        || path.contains(['?', '#', '\r', '\n'])
-        || path.split('/').any(|component| component == "..")
-    {
-        return Err(AuthError::InvalidLoopbackRedirect);
-    }
-    Ok((
-        SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
-        format!("/{path}"),
-    ))
-}
-
-fn receive_callback(
-    listener: &TcpListener,
-    callback_path: &str,
-    expected_state: &str,
-) -> Result<(String, String), AuthError> {
-    let (mut stream, _) = listener
-        .accept()
-        .map_err(|source| AuthError::CallbackIo { source })?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .map_err(|source| AuthError::CallbackIo { source })?;
-    let request = read_callback_headers(&mut stream)?;
-    let parsed = parse_callback_request(&request, callback_path).and_then(|(code, state)| {
-        if state == expected_state {
-            Ok((code, state))
-        } else {
-            Err(AuthError::StateMismatch)
-        }
-    });
-    let (status, body) = if parsed.is_ok() {
-        (
-            "200 OK",
-            "Dropbox authorization received. You may close this window.",
-        )
-    } else {
-        ("400 Bad Request", "Invalid Dropbox authorization callback.")
-    };
-    write!(
-        stream,
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    )
-    .map_err(|source| AuthError::CallbackIo { source })?;
-    parsed
-}
-
-fn read_callback_headers(stream: &mut impl io::Read) -> Result<Vec<u8>, AuthError> {
-    let mut received = Vec::new();
-    loop {
-        if received.len() >= CALLBACK_HEADER_LIMIT {
-            return Err(AuthError::InvalidCallback);
-        }
-        let mut byte = [0_u8; 1];
-        stream
-            .read_exact(&mut byte)
-            .map_err(|source| AuthError::CallbackIo { source })?;
-        received.push(byte[0]);
-        if received.ends_with(b"\r\n\r\n") {
-            return Ok(received);
-        }
-    }
-}
-
-fn parse_callback_request(
-    request: &[u8],
-    callback_path: &str,
-) -> Result<(String, String), AuthError> {
-    let request = str::from_utf8(request).map_err(|_| AuthError::InvalidCallback)?;
-    let request_line = request
-        .split("\r\n")
-        .next()
-        .ok_or(AuthError::InvalidCallback)?;
-    let mut fields = request_line.split_whitespace();
-    if fields.next() != Some("GET") {
-        return Err(AuthError::InvalidCallback);
-    }
-    let target = fields.next().ok_or(AuthError::InvalidCallback)?;
-    if fields.next().is_none() || fields.next().is_some() {
-        return Err(AuthError::InvalidCallback);
-    }
-    let (path, query) = target.split_once('?').ok_or(AuthError::InvalidCallback)?;
-    if path != callback_path {
-        return Err(AuthError::InvalidCallback);
-    }
-    let mut code = None;
-    let mut state = None;
-    let mut denied = false;
-    for (name, value) in form_urlencoded::parse(query.as_bytes()) {
-        match name.as_ref() {
-            "code" if code.is_none() => code = Some(value.into_owned()),
-            "state" if state.is_none() => state = Some(value.into_owned()),
-            "error" => denied = true,
-            "code" | "state" => return Err(AuthError::InvalidCallback),
-            _ => {}
-        }
-    }
-    if denied {
-        return Err(AuthError::AuthorizationDenied);
-    }
-    match (code, state) {
-        (Some(code), Some(state)) if !code.is_empty() && !state.is_empty() => Ok((code, state)),
-        _ => Err(AuthError::InvalidCallback),
     }
 }
 
@@ -793,13 +593,14 @@ mod tests {
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     use crate::dropbox::{DropboxClient, DropboxEndpoints, DropboxRoot};
     use crate::journal::{DropboxBinding, Journal};
 
     use super::{
-        AccessToken, CredentialLookup, OAuthClient, RefreshToken, RefreshTokenStore,
-        parse_callback_request,
+        AccessToken, AuthError, CredentialLookup, OAuthClient, RefreshToken, RefreshTokenStore,
+        require_success,
     };
 
     #[test]
@@ -814,7 +615,7 @@ mod tests {
 
     #[test]
     fn pkce_authorization_uses_offline_code_flow() -> Result<(), Box<dyn Error>> {
-        let oauth = OAuthClient::new("app-key", "http://127.0.0.1/callback");
+        let oauth = OAuthClient::new("app-key");
         let pending = oauth.begin()?;
         let url = pending.authorization_url();
 
@@ -824,47 +625,35 @@ mod tests {
         assert!(url.contains("files.content.write"));
         assert!(url.contains("code_challenge_method=S256"));
         assert!(!url.contains("code_verifier"));
+        assert!(!url.contains("redirect_uri"));
+        assert!(!url.contains("state="));
         Ok(())
     }
 
     #[test]
-    fn pending_authorization_debug_omits_proof_and_state() -> Result<(), Box<dyn Error>> {
-        let oauth = OAuthClient::new("app-key", "http://127.0.0.1:34128/callback");
+    fn pending_authorization_debug_omits_pkce_proof() -> Result<(), Box<dyn Error>> {
+        let oauth = OAuthClient::new("app-key");
         let pending = oauth.begin()?;
         let verifier = pending.verifier.clone();
-        let state = pending.state.clone();
         let diagnostic = format!("{pending:?}");
 
         assert!(!diagnostic.contains(&verifier));
-        assert!(!diagnostic.contains(&state));
         assert!(!diagnostic.contains("code_challenge="));
         Ok(())
     }
 
     #[test]
-    fn callback_parser_requires_exact_path_and_unique_fields() -> Result<(), Box<dyn Error>> {
-        let parsed = parse_callback_request(
-            b"GET /callback?code=one%2Btwo&state=state-value HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            "/callback",
-        )?;
-        assert_eq!(
-            parsed,
-            (String::from("one+two"), String::from("state-value"))
-        );
-        assert!(
-            parse_callback_request(
-                b"GET /other?code=one&state=two HTTP/1.1\r\n\r\n",
-                "/callback"
-            )
-            .is_err()
-        );
-        assert!(
-            parse_callback_request(
-                b"GET /callback?code=one&state=two&state=three HTTP/1.1\r\n\r\n",
-                "/callback"
-            )
-            .is_err()
-        );
+    fn oauth_rate_limit_preserves_retry_after_seconds() -> Result<(), Box<dyn Error>> {
+        let retry_after = ureq::http::HeaderValue::from_static("17");
+        let result = require_success(429, Some(&retry_after), "refresh access token");
+
+        assert!(matches!(
+            result,
+            Err(AuthError::RateLimited {
+                operation: "refresh access token",
+                retry_after: Some(delay),
+            }) if delay == Duration::from_secs(17)
+        ));
         Ok(())
     }
 
@@ -878,19 +667,16 @@ mod tests {
             format!("{endpoint}/2"),
             format!("{endpoint}/2"),
         );
-        let oauth =
-            OAuthClient::with_endpoints("app-key", "http://127.0.0.1:34128/callback", endpoints);
+        let oauth = OAuthClient::with_endpoints("app-key", endpoints);
         let pending = oauth.begin()?;
-        let state = pending.state.clone();
         let verifier = pending.verifier.clone();
         let code = "authorization-code-sentinel";
-        let exchange = oauth.exchange(pending, code, &state);
+        let exchange = oauth.exchange(pending, code);
         let exchange_error = exchange
             .err()
             .ok_or_else(|| std::io::Error::other("closed endpoint accepted exchange"))?;
         let exchange_diagnostic = error_diagnostic(&exchange_error);
         assert!(!exchange_diagnostic.contains(code));
-        assert!(!exchange_diagnostic.contains(&state));
         assert!(!exchange_diagnostic.contains(&verifier));
 
         let refresh_value = "refresh-token-sentinel";

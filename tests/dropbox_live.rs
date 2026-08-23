@@ -24,7 +24,7 @@ fn refreshes_and_validates_desktop_credential() -> Result<(), Box<dyn Error>> {
             .into());
         }
     };
-    let oauth = OAuthClient::new(app_key, "http://127.0.0.1:34128/oauth/callback");
+    let oauth = OAuthClient::new(app_key);
     let access = oauth.refresh(&credential.refresh_token)?;
     let root = DropboxRoot::from_binding(&credential.binding)?;
     let client = DropboxClient::new(access.access_token, root);
