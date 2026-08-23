@@ -1,9 +1,10 @@
 ---
 title: Add the transactional journal
-status: active
+status: closed
 priority: 2
 issue-type: task
-created-at: "\"2026-08-23T20:47:57.627049+02:00\""
+created-at: "\"\\\"2026-08-23T20:47:57.627049+02:00\\\"\""
+closed-at: "2026-08-23T22:06:31.341509+02:00"
 blocks:
   - omabox-implement-the-pure-1d820aba
 ---
