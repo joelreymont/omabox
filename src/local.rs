@@ -368,6 +368,17 @@ pub fn stage_upload(
     map_stage_write(result, stage)
 }
 
+/// Re-observe one root-confined upload source without changing staging state.
+pub(crate) fn observe_upload_source(
+    root: impl AsRef<Path>,
+    relative: impl AsRef<Path>,
+) -> Result<ContentIdentity, LocalError> {
+    let relative = relative.as_ref();
+    let root = open_absolute_directory(root.as_ref(), "open sync root for upload observation")?;
+    let mut source = open_relative_regular(&root, relative, "open upload source")?;
+    hash_stable_file(&mut source, relative, "verify upload source")
+}
+
 /// Stage downloaded bytes beside their target, verify them, and sync them.
 pub fn stage_download(
     root: impl AsRef<Path>,

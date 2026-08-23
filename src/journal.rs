@@ -620,6 +620,20 @@ impl Journal {
             .transpose()
     }
 
+    /// Load every path with a durable common baseline.
+    pub fn baseline_paths(&self) -> Result<Vec<PathBuf>, JournalError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT path FROM baselines ORDER BY path")
+            .map_err(|source| sqlite("prepare baseline path query", &self.database_path, source))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|source| sqlite("query baseline paths", &self.database_path, source))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map(|paths| paths.into_iter().map(bytes_path).collect())
+            .map_err(|source| sqlite("read baseline paths", &self.database_path, source))
+    }
+
     /// Record a planner-approved common baseline that requires no effect.
     pub fn record_noop(
         &mut self,
