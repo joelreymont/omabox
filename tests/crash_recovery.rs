@@ -162,6 +162,15 @@ fn immutable_upload_stage_survives_source_changes() -> Result<(), Box<dyn Error>
     };
 
     std::fs::write(source, b"second")?;
+    assert!(matches!(
+        stage_upload(&root, "upload.txt", &staging, &first)?,
+        StageOutcome::AlreadyStaged(_)
+    ));
+    std::fs::remove_file(root.join("upload.txt"))?;
+    assert!(matches!(
+        stage_upload(&root, "upload.txt", &staging, &first)?,
+        StageOutcome::AlreadyStaged(_)
+    ));
     let mut staged = stage.open_verified()?;
     let mut bytes = Vec::new();
     staged.read_to_end(&mut bytes)?;

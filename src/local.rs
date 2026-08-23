@@ -327,16 +327,32 @@ pub fn stage_upload(
 ) -> Result<StageOutcome<StagedUpload>, LocalError> {
     require_content_hash(expected, "stage upload")?;
     let relative = relative.as_ref();
-    let root_fd = open_absolute_directory(root.as_ref(), "open sync root for upload staging")?;
-    let mut source = open_relative_regular(&root_fd, relative, "open upload source")?;
-    let source_before = stat_fd(&source, relative, "inspect upload source before staging")?;
     let directory_path = staging_directory.as_ref().to_path_buf();
     let directory = open_absolute_directory(&directory_path, "open upload staging directory")?;
     let name = OsString::from(expected.as_str());
+    let stage = || StagedUpload {
+        directory: directory_path.clone(),
+        name: name.clone(),
+        content: expected.clone(),
+    };
+    let stage_path = directory_path.join(&name);
+    if let Some((file, actual)) = open_and_hash_if_present(
+        &directory,
+        &name,
+        &stage_path,
+        "verify immutable upload stage",
+    )? && reuse_verified_stage(&file, &actual, expected, None, &directory, &stage_path)?
+    {
+        return Ok(StageOutcome::AlreadyStaged(stage()));
+    }
+
+    let root_fd = open_absolute_directory(root.as_ref(), "open sync root for upload staging")?;
+    let mut source = open_relative_regular(&root_fd, relative, "open upload source")?;
+    let source_before = stat_fd(&source, relative, "inspect upload source before staging")?;
     let result = write_verified_stage(
         &directory,
         &name,
-        &directory_path.join(&name),
+        &stage_path,
         expected,
         &mut source,
         ExistingPolicy::ReplacePrivate,
@@ -349,11 +365,7 @@ pub fn stage_upload(
             path: relative.to_path_buf(),
         });
     }
-    map_stage_write(result, || StagedUpload {
-        directory: directory_path,
-        name,
-        content: expected.clone(),
-    })
+    map_stage_write(result, stage)
 }
 
 /// Stage downloaded bytes beside their target, verify them, and sync them.
@@ -690,13 +702,13 @@ pub fn materialize_conflict(
     let root = root.as_ref();
     let original = original.as_ref();
     let root_fd = open_absolute_directory(root, "open sync root for conflict")?;
-    let Some((parent, _, parent_relative)) = open_parent(&root_fd, original, true)? else {
+    let Some((parent, _, _)) = open_parent(&root_fd, original, true)? else {
         return Err(LocalError::UnsafeRelativePath {
             path: original.to_path_buf(),
         });
     };
     let name = conflict_name(original, side, expected);
-    let relative_path = parent_relative.join(&name);
+    let relative_path = conflict_relative_path(original, side, expected)?;
     let display_path = root.join(&relative_path);
     let result = write_verified_stage(
         &parent,
@@ -720,6 +732,14 @@ pub fn materialize_conflict(
             path,
         }),
     }
+}
+
+pub(crate) fn conflict_relative_path(
+    original: &Path,
+    side: ConflictSide,
+    content: &ContentIdentity,
+) -> Result<PathBuf, LocalError> {
+    Ok(parent_path(original)?.join(conflict_name(original, side, content)))
 }
 
 pub(crate) fn open_root(root: &Path, operation: &'static str) -> Result<OwnedFd, LocalError> {

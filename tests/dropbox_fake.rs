@@ -11,12 +11,19 @@ use omabox::dropbox::{
     DropboxClient, DropboxEndpoints, DropboxError, DropboxLink, DropboxRoot, InventoryRefresh,
     MutationOutcome, RemotePathState,
 };
-use omabox::journal::{DropboxBinding, Journal, RemoteInventory, RemoteObservationRecord};
+use omabox::journal::{
+    DropboxBinding, Journal, PlanWrite, RemoteInventory, RemoteObservationRecord,
+};
 use omabox::local::{
     InstallOutcome, StageOutcome, StagedUpload, dropbox_content_hash, install_download,
     stage_upload,
 };
-use omabox::model::{ContentIdentity, DropboxRevision, Observation, RemoteFile, UnknownReason};
+use omabox::model::{
+    Baseline, Conflict, ContentIdentity, Decision, DropboxRevision, LocalFile, Observation,
+    OperationPlan, RemoteFile, UnknownReason,
+};
+use omabox::planner::plan;
+use omabox::recovery::{ReplayBlocked, destination, replay_remote_operations};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -546,6 +553,258 @@ fn ambiguous_mutations_are_verified_once_and_preserve_the_original_failure()
 }
 
 #[test]
+fn remote_replay_preserves_old_revision_and_retires_a_replacement_conflict()
+-> Result<(), Box<dyn Error>> {
+    let old_bytes = b"common bytes";
+    let local_bytes = b"new local bytes";
+    let remote_bytes = b"new remote bytes";
+    let old = RemoteFile::new(
+        dropbox_content_hash(old_bytes.as_slice())?,
+        DropboxRevision::new("old-rev"),
+    );
+    let local = LocalFile::new(dropbox_content_hash(local_bytes.as_slice())?);
+    let current = RemoteFile::new(
+        dropbox_content_hash(remote_bytes.as_slice())?,
+        DropboxRevision::new("current-rev"),
+    );
+    let old_metadata = download_metadata("replace.txt", "old-rev", &old.content);
+    let current_metadata = download_metadata("replace.txt", "current-rev", &current.content);
+    let server = FakeServer::start(vec![
+        FakeResponse::bytes(old_bytes.to_vec()).header("Dropbox-API-Result", old_metadata),
+        FakeResponse::status_json(409, json!({"error": {".tag": "path"}})),
+        FakeResponse::json(file_metadata(
+            "/replace.txt",
+            "/Replace.txt",
+            "current-rev",
+            &current.content,
+        )),
+        FakeResponse::bytes(remote_bytes.to_vec()).header("Dropbox-API-Result", current_metadata),
+    ])?;
+    let client = fake_client(&server, "opaque-access-replay-conflict")?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("replace.txt"), local_bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    seed_baseline(&mut journal, Path::new("replace.txt"), &old)?;
+    let operations = planned_operations(plan(
+        &Baseline::Present(old.clone()),
+        &Observation::Present(local.clone()),
+        &Observation::Present(old.clone()),
+    ))?;
+    assert!(matches!(
+        journal.record_plan(Path::new("replace.txt"), &operations)?,
+        PlanWrite::Recorded(_)
+    ));
+
+    let report = replay_remote_operations(&mut journal, &client, &root, &staging, &recovery)?;
+    assert_eq!(report.completed_operations, 2);
+    assert!(report.blocked.is_empty());
+    assert!(journal.pending_plans()?.is_empty());
+    assert_eq!(
+        journal.baseline(Path::new("replace.txt"))?,
+        Some(Baseline::Present(old.clone()))
+    );
+    assert_eq!(
+        journal.conflicts()?.as_slice(),
+        [omabox::journal::ConflictRecord {
+            id: 1,
+            path: Path::new("replace.txt").to_path_buf(),
+            conflict: Conflict::DivergentEdits {
+                local: local.clone(),
+                remote: current.clone(),
+            },
+        }]
+    );
+    assert_eq!(
+        std::fs::read(destination(
+            &recovery,
+            Path::new("replace.txt"),
+            &old.content,
+        ))?,
+        old_bytes
+    );
+    assert_eq!(
+        conflict_bytes(&root)?,
+        vec![local_bytes.to_vec(), remote_bytes.to_vec()]
+    );
+
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[0].path, "/2/files/download");
+    assert_eq!(requests[1].path, "/2/files/upload");
+    assert_eq!(requests[2].path, "/2/files/get_metadata");
+    assert_eq!(requests[3].path, "/2/files/download");
+    assert!(required_header(&requests[0], "dropbox-api-arg")?.contains("rev:old-rev"));
+    assert!(required_header(&requests[3], "dropbox-api-arg")?.contains("rev:current-rev"));
+    Ok(())
+}
+
+#[test]
+fn remote_replay_creates_nested_parents_before_the_file() -> Result<(), Box<dyn Error>> {
+    let bytes = b"nested bytes";
+    let content = dropbox_content_hash(bytes.as_slice())?;
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "metadata": {
+                ".tag": "folder",
+                "path_lower": "/one",
+                "path_display": "/one"
+            }
+        })),
+        FakeResponse::json(json!({
+            "metadata": {
+                ".tag": "folder",
+                "path_lower": "/one/two",
+                "path_display": "/one/two"
+            }
+        })),
+        FakeResponse::json(file_metadata(
+            "/one/two/file.txt",
+            "/one/two/file.txt",
+            "created-rev",
+            &content,
+        )),
+    ])?;
+    let client = fake_client(&server, "opaque-access-nested-create")?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(root.join("one/two"))?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("one/two/file.txt"), bytes)?;
+    let operations = planned_operations(plan(
+        &Baseline::Absent,
+        &Observation::Present(LocalFile::new(content.clone())),
+        &Observation::ConfirmedAbsent,
+    ))?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    assert!(matches!(
+        journal.record_plan(Path::new("one/two/file.txt"), &operations)?,
+        PlanWrite::Recorded(_)
+    ));
+
+    let report = replay_remote_operations(&mut journal, &client, &root, &staging, &recovery)?;
+    assert_eq!(report.completed_operations, 1);
+    assert!(report.blocked.is_empty());
+    assert_eq!(
+        journal.baseline(Path::new("one/two/file.txt"))?,
+        Some(Baseline::Present(RemoteFile::new(
+            content,
+            DropboxRevision::new("created-rev"),
+        )))
+    );
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].path, "/2/files/create_folder_v2");
+    assert_eq!(requests[1].path, "/2/files/create_folder_v2");
+    assert_eq!(requests[2].path, "/2/files/upload");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&requests[0].body)?,
+        json!({"path": "/one", "autorename": false})
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&requests[1].body)?,
+        json!({"path": "/one/two", "autorename": false})
+    );
+    Ok(())
+}
+
+#[test]
+fn remote_replay_reuses_completed_recovery_and_leaves_ambiguous_create_pending()
+-> Result<(), Box<dyn Error>> {
+    let old_bytes = b"old remote bytes";
+    let old = RemoteFile::new(
+        dropbox_content_hash(old_bytes.as_slice())?,
+        DropboxRevision::new("old-rev"),
+    );
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let database = directory.path().join("journal.sqlite3");
+    let mut journal = Journal::open(&database)?;
+    let delete = planned_operations(plan(
+        &Baseline::Present(old.clone()),
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(old.clone()),
+    ))?;
+    let delete_plan = match journal.record_plan(Path::new("delete.txt"), &delete)? {
+        PlanWrite::Recorded(plan) => plan,
+        PlanWrite::AlreadyPending(_) => {
+            return Err(io::Error::other("test expected a new delete plan").into());
+        }
+    };
+    let delete_operation = delete_plan
+        .operations
+        .get(1)
+        .ok_or_else(|| io::Error::other("test expected a delete operation"))?;
+    let recovery_path = destination(&recovery, Path::new("delete.txt"), &old.content);
+    std::fs::write(&recovery_path, old_bytes)?;
+    let recovery_record =
+        match journal.record_recovery_intent(delete_operation.id, &recovery_path)? {
+            omabox::journal::RecoveryWrite::Recorded(record) => record,
+            _ => return Err(io::Error::other("test expected a recovery record").into()),
+        };
+    assert!(matches!(
+        journal.complete_recovery(recovery_record.id)?,
+        omabox::journal::RecoveryCompletion::Completed
+    ));
+
+    let delete_server = FakeServer::start(vec![FakeResponse::json(json!({
+        "metadata": file_metadata("/delete.txt", "/Delete.txt", "old-rev", &old.content)
+    }))])?;
+    let delete_client = fake_client(&delete_server, "opaque-access-replay-delete")?;
+    let report =
+        replay_remote_operations(&mut journal, &delete_client, &root, &staging, &recovery)?;
+    assert_eq!(report.completed_operations, 2);
+    let requests = delete_server.finish()?;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/2/files/delete_v2");
+
+    std::fs::write(root.join("create.txt"), b"desired bytes")?;
+    let desired = LocalFile::new(dropbox_content_hash(b"desired bytes".as_slice())?);
+    let create = planned_operations(plan(
+        &Baseline::Absent,
+        &Observation::Present(desired),
+        &Observation::ConfirmedAbsent,
+    ))?;
+    assert!(matches!(
+        journal.record_plan(Path::new("create.txt"), &create)?,
+        PlanWrite::Recorded(_)
+    ));
+    let pending_server = FakeServer::start(vec![
+        FakeResponse::status_json(503, json!({})),
+        FakeResponse::status_json(
+            409,
+            json!({"error": {".tag": "path", "path": {".tag": "not_found"}}}),
+        ),
+    ])?;
+    let pending_client = fake_client(&pending_server, "opaque-access-replay-pending")?;
+    let pending =
+        replay_remote_operations(&mut journal, &pending_client, &root, &staging, &recovery)?;
+    assert_eq!(
+        pending.blocked,
+        vec![ReplayBlocked::RemotePending {
+            path: Path::new("create.txt").to_path_buf(),
+        }]
+    );
+    assert_eq!(pending_server.finish()?.len(), 2);
+    drop(journal);
+    assert_eq!(Journal::open(&database)?.pending_plans()?.len(), 1);
+    Ok(())
+}
+
+#[test]
 fn link_rejects_unavailable_file_and_restricted_roots() -> Result<(), Box<dyn Error>> {
     assert!(matches!(
         root_link_failure(FakeResponse::status_json(
@@ -971,6 +1230,58 @@ fn file_metadata(
         "content_hash": content.as_str(),
         "is_downloadable": true
     })
+}
+
+fn download_metadata(path: &str, revision: &str, content: &ContentIdentity) -> String {
+    json!({
+        ".tag": "file",
+        "name": path,
+        "path_lower": format!("/{path}"),
+        "path_display": format!("/{path}"),
+        "rev": revision,
+        "content_hash": content.as_str()
+    })
+    .to_string()
+}
+
+fn planned_operations(decision: Decision) -> Result<OperationPlan, io::Error> {
+    match decision {
+        Decision::Operations(operations) => Ok(operations),
+        Decision::NoOp(_) | Decision::Blocked(_) | Decision::Conflict(_) => {
+            Err(io::Error::other("test expected planned operations"))
+        }
+    }
+}
+
+fn seed_baseline(journal: &mut Journal, path: &Path, remote: &RemoteFile) -> Result<(), io::Error> {
+    let decision = plan(
+        &Baseline::Present(remote.clone()),
+        &Observation::Present(LocalFile::new(remote.content.clone())),
+        &Observation::Present(remote.clone()),
+    );
+    let Decision::NoOp(noop) = decision else {
+        return Err(io::Error::other("test expected a no-op baseline"));
+    };
+    journal
+        .record_noop(path, &noop)
+        .map(|_| ())
+        .map_err(io::Error::other)
+}
+
+fn conflict_bytes(root: &Path) -> Result<Vec<Vec<u8>>, io::Error> {
+    let mut bytes = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".omabox-conflict-")
+        {
+            bytes.push(std::fs::read(entry.path())?);
+        }
+    }
+    bytes.sort();
+    Ok(bytes)
 }
 
 fn root_link_failure(response: FakeResponse) -> Result<DropboxError, Box<dyn Error>> {
