@@ -23,6 +23,7 @@ use omabox::model::{
     OperationPlan, RemoteFile, UnknownReason,
 };
 use omabox::planner::plan;
+use omabox::reconcile::{ReconcileOutcome, reconcile_once};
 use omabox::recovery::{ReplayBlocked, destination, replay_remote_operations};
 use serde_json::json;
 use tempfile::TempDir;
@@ -184,6 +185,126 @@ fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result
         header(&requests[9], "dropbox-api-arg")
             .is_some_and(|value| value.contains(r#""path":"rev:rev-a""#))
     );
+    Ok(())
+}
+
+#[test]
+fn one_reconciliation_pass_synchronizes_files_in_both_directions() -> Result<(), Box<dyn Error>> {
+    let upload_bytes = b"local upload";
+    let download_bytes = b"remote download";
+    let upload_content = dropbox_content_hash(upload_bytes.as_slice())?;
+    let download_content = dropbox_content_hash(download_bytes.as_slice())?;
+    let downloaded = RemoteFile::new(
+        download_content.clone(),
+        DropboxRevision::new("rev-download"),
+    );
+    let uploaded = RemoteFile::new(upload_content.clone(), DropboxRevision::new("rev-upload"));
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [file_metadata(
+                "/download.txt",
+                "/download.txt",
+                "rev-download",
+                &download_content,
+            )],
+            "cursor": "cursor-complete",
+            "has_more": false
+        })),
+        FakeResponse::bytes(download_bytes.to_vec()).header(
+            "Dropbox-API-Result",
+            download_metadata("download.txt", "rev-download", &download_content),
+        ),
+        FakeResponse::json(file_metadata(
+            "/upload.txt",
+            "/upload.txt",
+            "rev-upload",
+            &upload_content,
+        )),
+    ])?;
+    let client = fake_client(&server, "opaque-access-reconcile")?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("upload.txt"), upload_bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+
+    let report = match reconcile_once(&mut journal, &client, &root, &staging, &recovery)? {
+        ReconcileOutcome::Complete(report) => report,
+        ReconcileOutcome::FreshObservationRequired { .. } => {
+            return Err(io::Error::other("stable fixture requested a fresh observation").into());
+        }
+    };
+
+    assert_eq!(report.planned, 2);
+    assert_eq!(report.replayed_operations, 2);
+    assert_eq!(report.blocked, 0);
+    assert_eq!(report.conflicts, 0);
+    assert_eq!(std::fs::read(root.join("download.txt"))?, download_bytes);
+    assert_eq!(
+        journal.baseline(Path::new("download.txt"))?,
+        Some(Baseline::Present(downloaded))
+    );
+    assert_eq!(
+        journal.baseline(Path::new("upload.txt"))?,
+        Some(Baseline::Present(uploaded))
+    );
+    assert!(journal.pending_plans()?.is_empty());
+    assert!(journal.conflicts()?.is_empty());
+
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[0].path, "/2/users/get_current_account");
+    assert_eq!(requests[1].path, "/2/files/list_folder");
+    assert_eq!(requests[2].path, "/2/files/download");
+    assert_eq!(requests[3].path, "/2/files/upload");
+    assert_eq!(requests[3].body, upload_bytes);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(required_header(
+            &requests[3],
+            "dropbox-api-arg",
+        )?)?,
+        json!({
+            "path": "/upload.txt",
+            "mode": "add",
+            "autorename": false,
+            "strict_conflict": true,
+            "content_hash": upload_content.as_str()
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn corrupt_exact_download_never_leaves_installable_bytes() -> Result<(), Box<dyn Error>> {
+    let expected_bytes = b"expected download";
+    let corrupt_bytes = b"corrupt response";
+    let expected = dropbox_content_hash(expected_bytes.as_slice())?;
+    let actual = dropbox_content_hash(corrupt_bytes.as_slice())?;
+    let server = FakeServer::start(vec![FakeResponse::bytes(corrupt_bytes.to_vec()).header(
+        "Dropbox-API-Result",
+        download_metadata("corrupt.txt", "rev-corrupt", &expected),
+    )])?;
+    let client = fake_client(&server, "opaque-access-corrupt")?;
+    let root = TempDir::new()?;
+    let remote = RemoteFile::new(expected, DropboxRevision::new("rev-corrupt"));
+
+    assert_eq!(
+        client.stage_exact_download(root.path(), "corrupt.txt", &remote)?,
+        StageOutcome::ContentChanged { actual }
+    );
+    assert!(!root.path().join("corrupt.txt").exists());
+    assert!(std::fs::read_dir(root.path())?.next().is_none());
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/2/files/download");
     Ok(())
 }
 
