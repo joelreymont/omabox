@@ -1,4 +1,4 @@
-//! Verified recovery copies and direct replay of journaled local operations.
+//! Verified recovery copies and direct replay of journaled operations.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -21,14 +21,14 @@ use crate::model::{Baseline, Conflict, ContentIdentity, LocalFile, Operation, Re
 #[derive(Debug, Error)]
 pub enum RecoveryError {
     /// A root-confined filesystem phase failed.
-    #[error("local recovery filesystem phase failed")]
+    #[error("recovery filesystem phase failed")]
     Local {
         /// Original local filesystem error.
         #[source]
         source: LocalError,
     },
     /// A durable journal phase failed.
-    #[error("local recovery journal phase failed")]
+    #[error("recovery journal phase failed")]
     Journal {
         /// Original journal error.
         #[source]
@@ -79,7 +79,7 @@ pub enum RecoveryMaterialization {
     },
 }
 
-/// Why a replayable local operation remains pending.
+/// Why a replayable operation remains pending.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplayBlocked {
     /// The exact remote payload must be downloaded before installation.
@@ -454,6 +454,15 @@ pub fn replay_remote_operations(
                     else {
                         break;
                     };
+                    ensure_destructive_remote_recovery(
+                        journal,
+                        dropbox,
+                        recovery_directory,
+                        &plan,
+                        index,
+                        planned,
+                        expected_revision,
+                    )?;
                     let outcome = dropbox
                         .replace_file(&plan.path, expected_revision, &staged)
                         .map_err(|source| dropbox_error(&plan.path, source))?;
@@ -470,6 +479,15 @@ pub fn replay_remote_operations(
                     )?
                 }
                 Operation::DeleteRemote { expected_revision } => {
+                    ensure_destructive_remote_recovery(
+                        journal,
+                        dropbox,
+                        recovery_directory,
+                        &plan,
+                        index,
+                        planned,
+                        expected_revision,
+                    )?;
                     let outcome = dropbox
                         .delete_file(&plan.path, expected_revision)
                         .map_err(|source| dropbox_error(&plan.path, source))?;
@@ -495,6 +513,41 @@ pub fn replay_remote_operations(
         }
     }
     Ok(report)
+}
+
+fn ensure_destructive_remote_recovery(
+    journal: &mut Journal,
+    dropbox: &DropboxClient,
+    recovery_directory: &Path,
+    plan: &crate::journal::PlanRecord,
+    index: usize,
+    destructive: &PlannedOperation,
+    expected_revision: &crate::model::DropboxRevision,
+) -> Result<(), RecoveryError> {
+    let preserve = index
+        .checked_sub(1)
+        .and_then(|previous| plan.operations.get(previous))
+        .ok_or_else(|| invalid(&plan.path, "remote mutation has no preceding preservation"))?;
+    let Operation::PreserveRemote { file } = &preserve.operation else {
+        return Err(invalid(
+            &plan.path,
+            "remote mutation is not preceded by remote preservation",
+        ));
+    };
+    if &file.revision != expected_revision {
+        return Err(invalid(
+            &plan.path,
+            "remote preservation revision does not match its mutation",
+        ));
+    }
+    preserve_remote(
+        journal,
+        dropbox,
+        recovery_directory,
+        destructive,
+        &plan.path,
+        file,
+    )
 }
 
 fn ensure_remote_parents(
@@ -916,7 +969,7 @@ fn complete_nonfinal(
         | OperationCompletion::WaitingForRecovery(_)
         | OperationCompletion::PlanCompleted => Err(RecoveryError::InvalidJournalState {
             path: path.to_path_buf(),
-            detail: "journal rejected an ordered local preservation completion",
+            detail: "journal rejected an ordered preservation completion",
         }),
     }
 }
@@ -938,7 +991,7 @@ fn complete_final(
         | OperationCompletion::WaitingForRecovery(_)
         | OperationCompletion::OperationCompleted => Err(RecoveryError::InvalidJournalState {
             path: path.to_path_buf(),
-            detail: "journal rejected a completed durable local effect",
+            detail: "journal rejected a completed durable effect",
         }),
     }
 }

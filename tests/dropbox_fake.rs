@@ -755,7 +755,7 @@ fn stale_create_source_has_no_remote_effect() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn remote_replay_reuses_completed_recovery_and_leaves_ambiguous_create_pending()
+fn remote_replay_rebuilds_missing_recovery_and_leaves_ambiguous_create_pending()
 -> Result<(), Box<dyn Error>> {
     let old_bytes = b"old remote bytes";
     let old = RemoteFile::new(
@@ -782,32 +782,31 @@ fn remote_replay_reuses_completed_recovery_and_leaves_ambiguous_create_pending()
             return Err(io::Error::other("test expected a new delete plan").into());
         }
     };
-    let delete_operation = delete_plan
+    let preserve_operation = delete_plan
         .operations
-        .get(1)
-        .ok_or_else(|| io::Error::other("test expected a delete operation"))?;
-    let recovery_path = destination(&recovery, Path::new("delete.txt"), &old.content);
-    std::fs::write(&recovery_path, old_bytes)?;
-    let recovery_record =
-        match journal.record_recovery_intent(delete_operation.id, &recovery_path)? {
-            omabox::journal::RecoveryWrite::Recorded(record) => record,
-            _ => return Err(io::Error::other("test expected a recovery record").into()),
-        };
+        .first()
+        .ok_or_else(|| io::Error::other("test expected a preservation operation"))?;
     assert!(matches!(
-        journal.complete_recovery(recovery_record.id)?,
-        omabox::journal::RecoveryCompletion::Completed
+        journal.complete_operation(preserve_operation.id, None)?,
+        omabox::journal::OperationCompletion::OperationCompleted
     ));
-
-    let delete_server = FakeServer::start(vec![FakeResponse::json(json!({
-        "metadata": file_metadata("/delete.txt", "/Delete.txt", "old-rev", &old.content)
-    }))])?;
+    let recovery_path = destination(&recovery, Path::new("delete.txt"), &old.content);
+    let delete_metadata = download_metadata("delete.txt", "old-rev", &old.content);
+    let delete_server = FakeServer::start(vec![
+        FakeResponse::bytes(old_bytes.to_vec()).header("Dropbox-API-Result", delete_metadata),
+        FakeResponse::json(json!({
+            "metadata": file_metadata("/delete.txt", "/Delete.txt", "old-rev", &old.content)
+        })),
+    ])?;
     let delete_client = fake_client(&delete_server, "opaque-access-replay-delete")?;
     let report =
         replay_remote_operations(&mut journal, &delete_client, &root, &staging, &recovery)?;
-    assert_eq!(report.completed_operations, 2);
+    assert_eq!(report.completed_operations, 1);
+    assert_eq!(std::fs::read(recovery_path)?, old_bytes);
     let requests = delete_server.finish()?;
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].path, "/2/files/delete_v2");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].path, "/2/files/download");
+    assert_eq!(requests[1].path, "/2/files/delete_v2");
 
     std::fs::write(root.join("create.txt"), b"desired bytes")?;
     let desired = LocalFile::new(dropbox_content_hash(b"desired bytes".as_slice())?);
