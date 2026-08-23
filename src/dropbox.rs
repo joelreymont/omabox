@@ -19,7 +19,7 @@ const LONG_POLL_MAXIMUM_SECONDS: u64 = 480;
 const JSON_REQUEST_SECONDS: u64 = 60;
 const CONNECT_SECONDS: u64 = 15;
 const DOWNLOAD_SECONDS: u64 = 60 * 60;
-const LONG_POLL_GRACE_SECONDS: u64 = 15;
+const LONG_POLL_GRACE_SECONDS: u64 = 105;
 
 /// Dropbox HTTP endpoint locations.
 ///
@@ -176,13 +176,21 @@ pub enum InventoryRefresh {
     RebuiltAfterCursorReset,
 }
 
-/// Result of one Dropbox long-poll request.
+/// Expected result of one Dropbox long-poll request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LongPollWakeup {
-    /// Whether the cursor has changes ready to list.
-    pub changes: bool,
-    /// Server-requested delay before the next long poll.
-    pub backoff: Option<Duration>,
+pub enum LongPollWakeup {
+    /// The cursor has changes ready to list.
+    Changes {
+        /// Server-requested delay before the next long poll.
+        backoff: Option<Duration>,
+    },
+    /// The request completed without a change.
+    TimedOut {
+        /// Server-requested delay before the next long poll.
+        backoff: Option<Duration>,
+    },
+    /// Dropbox invalidated the cursor and requires a complete rebuild.
+    CursorReset,
 }
 
 /// Direct blocking client for Dropbox read endpoints.
@@ -249,6 +257,7 @@ impl DropboxClient {
             return Ok(DropboxLink::AccountChanged);
         }
         client.root.namespace_id = account.root_info.root_namespace_id;
+        client.validate_remote_root()?;
         Ok(DropboxLink::Linked(Box::new(client)))
     }
 
@@ -269,6 +278,7 @@ impl DropboxClient {
         } else if response.root_info.root_namespace_id != self.root.namespace_id {
             Ok(AccountValidation::RootChanged)
         } else {
+            self.validate_remote_root()?;
             match journal
                 .bind_dropbox_root(&self.root.binding())
                 .map_err(|source| DropboxError::Journal { source })?
@@ -337,6 +347,7 @@ impl DropboxClient {
             .timeout_global(Some(
                 timeout.saturating_add(Duration::from_secs(LONG_POLL_GRACE_SECONDS)),
             ))
+            .timeout_connect(Some(Duration::from_secs(CONNECT_SECONDS)))
             .build();
         let mut response = ureq::Agent::new_with_config(config)
             .post(&url)
@@ -348,7 +359,25 @@ impl DropboxClient {
                 operation: "wait for Dropbox changes",
                 source,
             })?;
-        require_success(response.status().as_u16(), "wait for Dropbox changes")?;
+        let status = response.status().as_u16();
+        if status == 409 {
+            let error: TaggedError =
+                response
+                    .body_mut()
+                    .read_json()
+                    .map_err(|source| DropboxError::Response {
+                        operation: "decode Dropbox long-poll error",
+                        source,
+                    })?;
+            if error.error.tag == "reset" {
+                return Ok(LongPollWakeup::CursorReset);
+            }
+        }
+        require_success(
+            status,
+            response.headers().get("Retry-After"),
+            "wait for Dropbox changes",
+        )?;
         let payload: LongPollResponse =
             response
                 .body_mut()
@@ -357,9 +386,11 @@ impl DropboxClient {
                     operation: "decode Dropbox long-poll response",
                     source,
                 })?;
-        Ok(LongPollWakeup {
-            changes: payload.changes,
-            backoff: payload.backoff.map(Duration::from_secs),
+        let backoff = payload.backoff.map(Duration::from_secs);
+        Ok(if payload.changes {
+            LongPollWakeup::Changes { backoff }
+        } else {
+            LongPollWakeup::TimedOut { backoff }
         })
     }
 
@@ -397,6 +428,7 @@ impl DropboxClient {
             })?;
         require_success(
             response.status().as_u16(),
+            response.headers().get("Retry-After"),
             "download exact Dropbox revision",
         )?;
         let metadata_header = response
@@ -436,7 +468,11 @@ impl DropboxClient {
                 operation: "validate Dropbox account",
                 source,
             })?;
-        require_success(response.status().as_u16(), "validate Dropbox account")?;
+        require_success(
+            response.status().as_u16(),
+            response.headers().get("Retry-After"),
+            "validate Dropbox account",
+        )?;
         response
             .body_mut()
             .read_json()
@@ -444,6 +480,50 @@ impl DropboxClient {
                 operation: "decode Dropbox account response",
                 source,
             })
+    }
+
+    fn validate_remote_root(&self) -> Result<(), DropboxError> {
+        if self.root.path.is_empty() {
+            return Ok(());
+        }
+        let url = self.endpoints.api("/files/get_metadata");
+        let mut response = self
+            .authorized_post(&url)?
+            .send_json(MetadataRequest {
+                path: &self.root.path,
+                include_deleted: false,
+            })
+            .map_err(|source| DropboxError::Transport {
+                operation: "validate configured Dropbox root",
+                source,
+            })?;
+        let status = response.status().as_u16();
+        if status == 409 {
+            return Err(DropboxError::RemoteRootUnavailable);
+        }
+        require_success(
+            status,
+            response.headers().get("Retry-After"),
+            "validate configured Dropbox root",
+        )?;
+        let metadata: ListEntry =
+            response
+                .body_mut()
+                .read_json()
+                .map_err(|source| DropboxError::Response {
+                    operation: "decode configured Dropbox root metadata",
+                    source,
+                })?;
+        if metadata.path_lower.as_deref() != Some(self.root.lower_path.as_str()) {
+            return Err(DropboxError::RemoteRootUnavailable);
+        }
+        if !matches!(metadata.tag, EntryTag::Folder) {
+            return Err(DropboxError::RemoteRootNotFolder);
+        }
+        if metadata.restricted() {
+            return Err(DropboxError::RemoteRootRestricted);
+        }
+        Ok(())
     }
 
     fn full_inventory(&self) -> Result<(Vec<RemoteObservationRecord>, String), DropboxError> {
@@ -507,7 +587,11 @@ impl DropboxClient {
                 return Ok(ContinuePage::Reset);
             }
         }
-        require_success(status, "continue complete Dropbox listing")?;
+        require_success(
+            status,
+            response.headers().get("Retry-After"),
+            "continue complete Dropbox listing",
+        )?;
         let page = response
             .body_mut()
             .read_json()
@@ -533,7 +617,11 @@ impl DropboxClient {
             .authorized_post(&url)?
             .send_json(body)
             .map_err(|source| DropboxError::Transport { operation, source })?;
-        require_success(response.status().as_u16(), operation)?;
+        require_success(
+            response.status().as_u16(),
+            response.headers().get("Retry-After"),
+            operation,
+        )?;
         response
             .body_mut()
             .read_json()
@@ -605,6 +693,12 @@ struct ListFolderRequest<'a> {
 }
 
 #[derive(Serialize)]
+struct MetadataRequest<'a> {
+    path: &'a str,
+    include_deleted: bool,
+}
+
+#[derive(Serialize)]
 struct CursorRequest<'a> {
     cursor: &'a str,
 }
@@ -627,6 +721,23 @@ struct ListEntry {
     #[serde(default = "default_true")]
     is_downloadable: bool,
     symlink_info: Option<serde_json::Value>,
+    sharing_info: Option<FolderSharingInfo>,
+}
+
+impl ListEntry {
+    fn restricted(&self) -> bool {
+        self.sharing_info
+            .as_ref()
+            .is_some_and(|sharing| sharing.no_access || sharing.traverse_only)
+    }
+}
+
+#[derive(Deserialize)]
+struct FolderSharingInfo {
+    #[serde(default)]
+    no_access: bool,
+    #[serde(default)]
+    traverse_only: bool,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -683,6 +794,26 @@ pub enum DropboxError {
     /// The live account, Secret Service record, and journal do not share one binding.
     #[error("Dropbox account or root binding no longer matches the journal")]
     AccountBindingChanged,
+    /// The configured nonempty Dropbox root could not be found.
+    #[error("configured Dropbox root is unavailable")]
+    RemoteRootUnavailable,
+    /// The configured Dropbox root names a file rather than a folder.
+    #[error("configured Dropbox root is not a folder")]
+    RemoteRootNotFolder,
+    /// Dropbox does not permit complete traversal of the configured root.
+    #[error("configured Dropbox root cannot be traversed completely")]
+    RemoteRootRestricted,
+    /// A folder inside the listing cannot be traversed completely.
+    #[error("Dropbox listing contains a folder that cannot be traversed completely")]
+    RestrictedRemoteInventory,
+    /// Dropbox rate-limited a request.
+    #[error("Dropbox operation `{operation}` was rate limited")]
+    RateLimited {
+        /// Safe operation name.
+        operation: &'static str,
+        /// Server-requested delay when Dropbox returned valid delta seconds.
+        retry_after: Option<Duration>,
+    },
     /// Dropbox returned a non-success status.
     #[error("Dropbox operation `{operation}` returned HTTP status {status}")]
     HttpStatus {
@@ -730,9 +861,6 @@ pub enum DropboxError {
     /// An entry did not carry a path confined to the configured Dropbox root.
     #[error("Dropbox listing contained an invalid or out-of-root path")]
     InvalidEntryPath,
-    /// A full listing unexpectedly contained deletion metadata.
-    #[error("Dropbox full listing unexpectedly contained a deleted entry")]
-    UnexpectedDeletedEntry,
     /// A downloadable file omitted required revision or content-hash metadata.
     #[error("Dropbox listing returned incomplete metadata for a downloadable file")]
     IncompleteFileMetadata,
@@ -767,9 +895,22 @@ pub enum DropboxError {
     },
 }
 
-fn require_success(status: u16, operation: &'static str) -> Result<(), DropboxError> {
+fn require_success(
+    status: u16,
+    retry_after: Option<&ureq::http::HeaderValue>,
+    operation: &'static str,
+) -> Result<(), DropboxError> {
     if (200..300).contains(&status) {
         Ok(())
+    } else if status == 429 {
+        let retry_after = retry_after
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs);
+        Err(DropboxError::RateLimited {
+            operation,
+            retry_after,
+        })
     } else {
         Err(DropboxError::HttpStatus { operation, status })
     }
@@ -805,29 +946,67 @@ fn apply_entries(
             .as_deref()
             .ok_or(DropboxError::InvalidEntryPath)?;
         let (key, path) = relative_paths(root, lower, display)?;
+        if matches!(entry.tag, EntryTag::Deleted) {
+            remove_subtree(records, &key);
+            continue;
+        }
+        ensure_parent_folders(records, &key, &path);
         let observation = match entry.tag {
-            EntryTag::Deleted => return Err(DropboxError::UnexpectedDeletedEntry),
-            EntryTag::Folder => Observation::Unknown(UnknownReason::Unsupported),
-            EntryTag::File if !entry.is_downloadable || entry.symlink_info.is_some() => {
-                Observation::Unknown(UnknownReason::Unsupported)
+            EntryTag::Deleted => continue,
+            EntryTag::Folder if entry.restricted() => {
+                return Err(DropboxError::RestrictedRemoteInventory);
             }
+            EntryTag::Folder => Observation::Unknown(UnknownReason::Unsupported),
             EntryTag::File => {
-                let content = entry
-                    .content_hash
-                    .ok_or(DropboxError::IncompleteFileMetadata)?;
-                let revision = entry.rev.ok_or(DropboxError::IncompleteFileMetadata)?;
-                if !valid_content_hash(&content) || revision.is_empty() {
-                    return Err(DropboxError::IncompleteFileMetadata);
+                remove_subtree(records, &key);
+                if !entry.is_downloadable || entry.symlink_info.is_some() {
+                    Observation::Unknown(UnknownReason::Unsupported)
+                } else {
+                    let content = entry
+                        .content_hash
+                        .ok_or(DropboxError::IncompleteFileMetadata)?;
+                    let revision = entry.rev.ok_or(DropboxError::IncompleteFileMetadata)?;
+                    if !valid_content_hash(&content) || revision.is_empty() {
+                        return Err(DropboxError::IncompleteFileMetadata);
+                    }
+                    Observation::Present(RemoteFile::new(
+                        ContentIdentity::new(content),
+                        DropboxRevision::new(revision),
+                    ))
                 }
-                Observation::Present(RemoteFile::new(
-                    ContentIdentity::new(content),
-                    DropboxRevision::new(revision),
-                ))
             }
         };
         records.insert(key, RemoteObservationRecord { path, observation });
     }
     Ok(())
+}
+
+fn ensure_parent_folders(
+    records: &mut BTreeMap<String, RemoteObservationRecord>,
+    key: &str,
+    path: &Path,
+) {
+    let lower = key.split('/').collect::<Vec<_>>();
+    let display = path.iter().collect::<Vec<_>>();
+    for depth in 1..lower.len() {
+        let parent_key = lower[..depth].join("/");
+        records.insert(
+            parent_key,
+            RemoteObservationRecord {
+                path: display[..depth].iter().copied().collect(),
+                observation: Observation::Unknown(UnknownReason::Unsupported),
+            },
+        );
+    }
+}
+
+fn remove_subtree(records: &mut BTreeMap<String, RemoteObservationRecord>, key: &str) {
+    records.retain(|candidate, _| {
+        candidate != key
+            && !candidate
+                .strip_prefix(key)
+                .is_some_and(|remainder| remainder.starts_with('/'))
+    });
 }
 
 fn relative_paths(
@@ -884,6 +1063,7 @@ mod tests {
                     content_hash: None,
                     is_downloadable: true,
                     symlink_info: None,
+                    sharing_info: None,
                 },
                 ListEntry {
                     tag: EntryTag::File,
@@ -893,6 +1073,7 @@ mod tests {
                     content_hash: None,
                     is_downloadable: false,
                     symlink_info: None,
+                    sharing_info: None,
                 },
             ],
         )?;

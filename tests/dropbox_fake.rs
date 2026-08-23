@@ -6,7 +6,7 @@ use std::path::Path;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use omabox::auth::{AuthError, OAuthClient, RefreshToken};
+use omabox::auth::{AccessToken, AuthError, OAuthClient, RefreshToken};
 use omabox::dropbox::{
     DropboxClient, DropboxEndpoints, DropboxError, DropboxLink, DropboxRoot, InventoryRefresh,
 };
@@ -46,8 +46,18 @@ fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result
             "root_info": {"root_namespace_id": "namespace-a"}
         })),
         FakeResponse::json(json!({
+            ".tag": "folder",
+            "path_lower": "/sync",
+            "path_display": "/Sync"
+        })),
+        FakeResponse::json(json!({
             "account_id": "account-a",
             "root_info": {"root_namespace_id": "namespace-a"}
+        })),
+        FakeResponse::json(json!({
+            ".tag": "folder",
+            "path_lower": "/sync",
+            "path_display": "/Sync"
         })),
         FakeResponse::json(json!({
             "entries": [
@@ -118,9 +128,12 @@ fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result
         Some(&Observation::Unknown(UnknownReason::Unsupported))
     );
 
-    let wakeup = client.long_poll("cursor-b", Duration::from_secs(30))?;
-    assert!(wakeup.changes);
-    assert_eq!(wakeup.backoff, Some(Duration::from_secs(2)));
+    assert_eq!(
+        client.long_poll("cursor-b", Duration::from_secs(30))?,
+        omabox::dropbox::LongPollWakeup::Changes {
+            backoff: Some(Duration::from_secs(2))
+        }
+    );
 
     let sync_root = TempDir::new()?;
     let remote = RemoteFile::new(identity.clone(), DropboxRevision::new("rev-a"));
@@ -135,7 +148,7 @@ fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result
     assert_eq!(std::fs::read(sync_root.path().join("Alpha.txt"))?, bytes);
 
     let requests = server.finish()?;
-    assert_eq!(requests.len(), 8);
+    assert_eq!(requests.len(), 10);
     assert_eq!(requests[0].path, "/oauth2/token");
     assert!(text_body(&requests[0])?.contains("grant_type=authorization_code"));
     assert!(text_body(&requests[0])?.contains("code_verifier="));
@@ -143,19 +156,21 @@ fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result
     assert!(!text_body(&requests[0])?.contains("state="));
     assert!(text_body(&requests[1])?.contains("grant_type=refresh_token"));
     assert_eq!(requests[2].path, "/2/users/get_current_account");
-    assert_eq!(requests[3].path, "/2/users/get_current_account");
-    assert_eq!(requests[4].path, "/2/files/list_folder");
-    assert_eq!(requests[5].path, "/2/files/list_folder/continue");
-    assert_eq!(requests[6].path, "/2/files/list_folder/longpoll");
-    assert_eq!(requests[7].path, "/2/files/download");
+    assert_eq!(requests[3].path, "/2/files/get_metadata");
+    assert_eq!(requests[4].path, "/2/users/get_current_account");
+    assert_eq!(requests[5].path, "/2/files/get_metadata");
+    assert_eq!(requests[6].path, "/2/files/list_folder");
+    assert_eq!(requests[7].path, "/2/files/list_folder/continue");
+    assert_eq!(requests[8].path, "/2/files/list_folder/longpoll");
+    assert_eq!(requests[9].path, "/2/files/download");
     assert!(header(&requests[2], "authorization").is_some());
     assert!(header(&requests[2], "dropbox-api-path-root").is_none());
     assert_eq!(
-        header(&requests[4], "dropbox-api-path-root"),
+        header(&requests[3], "dropbox-api-path-root"),
         Some(r#"{".tag":"root","root":"namespace-a"}"#)
     );
     assert!(
-        header(&requests[7], "dropbox-api-arg")
+        header(&requests[9], "dropbox-api-arg")
             .is_some_and(|value| value.contains(r#""path":"rev:rev-a""#))
     );
     Ok(())
@@ -176,6 +191,70 @@ fn oauth_rate_limit_preserves_retry_after_header() -> Result<(), Box<dyn Error>>
         }) if delay == Duration::from_secs(23)
     ));
     assert_eq!(server.finish()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn long_poll_exposes_reset_and_rate_limit_outcomes() -> Result<(), Box<dyn Error>> {
+    let server = FakeServer::start(vec![
+        FakeResponse::status_json(
+            409,
+            json!({"error_summary": "reset/", "error": {".tag": "reset"}}),
+        ),
+        FakeResponse::status_json(429, json!({})).header("Retry-After", "17"),
+    ])?;
+    let client = fake_client(&server, "opaque-access-long-poll")?;
+
+    assert_eq!(
+        client.long_poll("old-cursor", Duration::from_secs(30))?,
+        omabox::dropbox::LongPollWakeup::CursorReset
+    );
+    assert!(matches!(
+        client.long_poll("new-cursor", Duration::from_secs(30)),
+        Err(DropboxError::RateLimited {
+            operation: "wait for Dropbox changes",
+            retry_after: Some(delay),
+        }) if delay == Duration::from_secs(17)
+    ));
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path == "/2/files/list_folder/longpoll")
+    );
+    Ok(())
+}
+
+#[test]
+fn link_rejects_unavailable_file_and_restricted_roots() -> Result<(), Box<dyn Error>> {
+    assert!(matches!(
+        root_link_failure(FakeResponse::status_json(
+            409,
+            json!({"error": {".tag": "path"}})
+        ))?,
+        DropboxError::RemoteRootUnavailable
+    ));
+    assert!(matches!(
+        root_link_failure(FakeResponse::json(json!({
+            ".tag": "file",
+            "path_lower": "/sync",
+            "path_display": "/Sync"
+        })))?,
+        DropboxError::RemoteRootNotFolder
+    ));
+    for restriction in [json!({"no_access": true}), json!({"traverse_only": true})] {
+        assert!(matches!(
+            root_link_failure(FakeResponse::json(json!({
+                ".tag": "folder",
+                "path_lower": "/sync",
+                "path_display": "/Sync",
+                "sharing_info": restriction
+            })))?,
+            DropboxError::RemoteRootRestricted
+        ));
+    }
+
     Ok(())
 }
 
@@ -241,6 +320,84 @@ fn cursor_reset_rebuilds_before_one_complete_publication() -> Result<(), Box<dyn
     );
     let requests = server.finish()?;
     assert_eq!(requests.len(), 4);
+    Ok(())
+}
+
+#[test]
+fn listing_applies_ordered_tree_mutations_across_pages() -> Result<(), Box<dyn Error>> {
+    let identity = dropbox_content_hash(b"tree payload".as_slice())?;
+    let file = |path_lower: &str, path_display: &str| {
+        json!({
+            ".tag": "file",
+            "path_lower": path_lower,
+            "path_display": path_display,
+            "rev": "tree-revision",
+            "content_hash": identity.as_str()
+        })
+    };
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [
+                {".tag": "folder", "path_lower": "/node", "path_display": "/Node"},
+                file("/node/child", "/Node/Child"),
+                {".tag": "folder", "path_lower": "/gone", "path_display": "/Gone"},
+                file("/gone/child", "/Gone/Child"),
+                file("/ancestor", "/Ancestor"),
+                file("/keep/child", "/Keep/Child")
+            ],
+            "cursor": "tree-a",
+            "has_more": true
+        })),
+        FakeResponse::json(json!({
+            "entries": [
+                file("/node", "/Node"),
+                {".tag": "deleted", "path_lower": "/gone", "path_display": "/Gone"},
+                file("/ancestor/leaf", "/Ancestor/Leaf"),
+                {".tag": "folder", "path_lower": "/keep", "path_display": "/Keep"},
+                {".tag": "deleted", "path_lower": "/phantom/leaf", "path_display": "/Phantom/Leaf"}
+            ],
+            "cursor": "tree-b",
+            "has_more": false
+        })),
+    ])?;
+    let client = fake_client(&server, "opaque-access-tree")?;
+    let directory = TempDir::new()?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+
+    assert_eq!(
+        client.refresh_inventory(&mut journal)?,
+        InventoryRefresh::Published
+    );
+    let inventory = journal.remote_inventory()?;
+    assert_eq!(inventory.observations.len(), 5);
+    assert!(matches!(
+        observation(&inventory, Path::new("Node")),
+        Some(Observation::Present(_))
+    ));
+    assert!(observation(&inventory, Path::new("Node/Child")).is_none());
+    assert!(observation(&inventory, Path::new("Gone")).is_none());
+    assert!(observation(&inventory, Path::new("Gone/Child")).is_none());
+    for folder in [Path::new("Ancestor"), Path::new("Keep")] {
+        assert_eq!(
+            observation(&inventory, folder),
+            Some(&Observation::Unknown(UnknownReason::Unsupported))
+        );
+    }
+    assert!(matches!(
+        observation(&inventory, Path::new("Ancestor/Leaf")),
+        Some(Observation::Present(_))
+    ));
+    assert!(matches!(
+        observation(&inventory, Path::new("Keep/Child")),
+        Some(Observation::Present(_))
+    ));
+    assert!(observation(&inventory, Path::new("Phantom")).is_none());
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 3);
     Ok(())
 }
 
@@ -348,6 +505,69 @@ fn incomplete_downloadable_metadata_cannot_replace_durable_inventory() -> Result
 }
 
 #[test]
+fn restricted_later_page_cannot_replace_durable_inventory() -> Result<(), Box<dyn Error>> {
+    let identity = dropbox_content_hash(b"partial tree".as_slice())?;
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [{
+                ".tag": "folder",
+                "path_lower": "/probe",
+                "path_display": "/Probe"
+            }],
+            "cursor": "probe",
+            "has_more": false
+        })),
+        FakeResponse::json(json!({
+            "entries": [{
+                ".tag": "file",
+                "path_lower": "/partial.txt",
+                "path_display": "/Partial.txt",
+                "rev": "partial-revision",
+                "content_hash": identity.as_str()
+            }],
+            "cursor": "partial",
+            "has_more": true
+        })),
+        FakeResponse::json(json!({
+            "entries": [{
+                ".tag": "folder",
+                "path_lower": "/restricted",
+                "path_display": "/Restricted",
+                "sharing_info": {"traverse_only": true}
+            }],
+            "cursor": "restricted",
+            "has_more": false
+        })),
+    ])?;
+    let client = fake_client(&server, "opaque-access-restricted")?;
+    let directory = TempDir::new()?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let durable = RemoteObservationRecord {
+        path: Path::new("Durable.txt").to_path_buf(),
+        observation: Observation::Unknown(UnknownReason::Stale),
+    };
+    journal.publish_remote_inventory("durable", std::slice::from_ref(&durable))?;
+
+    assert!(matches!(
+        client.refresh_inventory(&mut journal),
+        Err(DropboxError::RestrictedRemoteInventory)
+    ));
+    assert_eq!(
+        journal.remote_inventory()?,
+        RemoteInventory {
+            cursor: Some(String::from("durable")),
+            observations: vec![durable]
+        }
+    );
+    assert_eq!(server.finish()?.len(), 4);
+    Ok(())
+}
+
+#[test]
 fn journal_binding_mismatch_blocks_inventory_before_listing() -> Result<(), Box<dyn Error>> {
     let server = FakeServer::start(vec![FakeResponse::json(json!({
         "account_id": "account",
@@ -372,8 +592,14 @@ fn journal_binding_mismatch_blocks_inventory_before_listing() -> Result<(), Box<
 
 fn fake_client(server: &FakeServer, access_token: &str) -> Result<DropboxClient, Box<dyn Error>> {
     let endpoints = server.endpoints();
+    let access_token = fake_access_token(access_token)?;
+    let root = DropboxRoot::new("account", "namespace", "")?;
+    Ok(DropboxClient::with_endpoints(access_token, root, endpoints))
+}
+
+fn fake_access_token(value: &str) -> Result<AccessToken, Box<dyn Error>> {
     let token_server = FakeServer::start(vec![FakeResponse::json(json!({
-        "access_token": access_token,
+        "access_token": value,
         "expires_in": 14400
     }))])?;
     let token_endpoints = token_server.endpoints();
@@ -382,12 +608,28 @@ fn fake_client(server: &FakeServer, access_token: &str) -> Result<DropboxClient,
         token_oauth.refresh(&omabox::auth::RefreshToken::from_secret("opaque-refresh"))?;
     let requests = token_server.finish()?;
     assert_eq!(requests.len(), 1);
-    let root = DropboxRoot::new("account", "namespace", "")?;
-    Ok(DropboxClient::with_endpoints(
-        refreshed.access_token,
-        root,
-        endpoints,
-    ))
+    Ok(refreshed.access_token)
+}
+
+fn root_link_failure(response: FakeResponse) -> Result<DropboxError, Box<dyn Error>> {
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        response,
+    ])?;
+    let outcome = DropboxClient::link_with_endpoints(
+        fake_access_token("opaque-link-access")?,
+        "account",
+        "/Sync",
+        server.endpoints(),
+    );
+    let failure = outcome
+        .err()
+        .ok_or_else(|| io::Error::other("invalid Dropbox root was linked"))?;
+    assert_eq!(server.finish()?.len(), 2);
+    Ok(failure)
 }
 
 fn observation<'a>(
