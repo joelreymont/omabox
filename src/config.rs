@@ -7,12 +7,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use fs2::FileExt as _;
 use miette::Diagnostic;
 use serde::Deserialize;
 use thiserror::Error;
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::filter::LevelFilter;
 
 const APPLICATION_DIRECTORY: &str = "omabox";
 const CONFIG_FILE: &str = "config.toml";
@@ -403,17 +400,15 @@ impl InstanceLock {
                 path: path.to_path_buf(),
                 source,
             })?;
-        match file.try_lock_exclusive() {
+        match file.try_lock() {
             Ok(()) => Ok(Self {
                 _file: file,
                 path: path.to_path_buf(),
             }),
-            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
-                Err(LockError::AlreadyRunning {
-                    path: path.to_path_buf(),
-                })
-            }
-            Err(source) => Err(LockError::Acquire {
+            Err(fs::TryLockError::WouldBlock) => Err(LockError::AlreadyRunning {
+                path: path.to_path_buf(),
+            }),
+            Err(fs::TryLockError::Error(source)) => Err(LockError::Acquire {
                 path: path.to_path_buf(),
                 source,
             }),
@@ -499,11 +494,8 @@ impl<Value: ?Sized> fmt::Display for Redacted<'_, Value> {
 
 /// Initialize structured stderr logging for a CLI or daemon process.
 pub fn initialize_logging() -> Result<(), LoggingError> {
-    let filter = EnvFilter::builder()
-        .with_default_directive(LevelFilter::INFO.into())
-        .from_env_lossy();
     let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(filter)
+        .with_max_level(tracing::Level::INFO)
         .with_target(false)
         .finish();
     tracing::subscriber::set_global_default(subscriber)

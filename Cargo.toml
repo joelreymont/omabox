@@ -5,13 +5,12 @@ edition = "2024"
 publish = false
 
 [dependencies]
-fs2 = "0.4"
 miette = { version = "7.6", features = ["fancy"] }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 toml = "0.9"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = "0.3"
 
 [dev-dependencies]
 insta = "1.43"
