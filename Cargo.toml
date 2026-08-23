@@ -1,0 +1,17 @@
+[package]
+name = "omabox"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+miette = { version = "7.6", features = ["fancy"] }
+thiserror = "2.0"
+
+[[bin]]
+name = "omabox"
+path = "src/bin/omabox.rs"
+
+[[bin]]
+name = "omaboxd"
+path = "src/bin/omaboxd.rs"
