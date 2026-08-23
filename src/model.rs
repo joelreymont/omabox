@@ -30,6 +30,12 @@ impl DropboxRevision {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
+
+    /// Return the revision value supplied by Dropbox.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// A locally observed regular file.
