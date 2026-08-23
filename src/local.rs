@@ -129,6 +129,12 @@ impl StagedUpload {
         self.directory.join(&self.name)
     }
 
+    /// Return the verified content identity reserved by this immutable stage.
+    #[must_use]
+    pub fn content(&self) -> &ContentIdentity {
+        &self.content
+    }
+
     /// Reopen and verify the exact file descriptor that an uploader should read.
     pub fn open_verified(&self) -> Result<File, LocalError> {
         let directory = open_absolute_directory(&self.directory, "open upload staging directory")?;

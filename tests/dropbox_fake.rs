@@ -9,9 +9,13 @@ use std::time::Duration;
 use omabox::auth::{AccessToken, AuthError, OAuthClient, RefreshToken};
 use omabox::dropbox::{
     DropboxClient, DropboxEndpoints, DropboxError, DropboxLink, DropboxRoot, InventoryRefresh,
+    MutationOutcome, RemotePathState,
 };
 use omabox::journal::{DropboxBinding, Journal, RemoteInventory, RemoteObservationRecord};
-use omabox::local::{InstallOutcome, StageOutcome, dropbox_content_hash, install_download};
+use omabox::local::{
+    InstallOutcome, StageOutcome, StagedUpload, dropbox_content_hash, install_download,
+    stage_upload,
+};
 use omabox::model::{ContentIdentity, DropboxRevision, Observation, RemoteFile, UnknownReason};
 use serde_json::json;
 use tempfile::TempDir;
@@ -223,6 +227,321 @@ fn long_poll_exposes_reset_and_rate_limit_outcomes() -> Result<(), Box<dyn Error
             .iter()
             .all(|request| request.path == "/2/files/list_folder/longpoll")
     );
+    Ok(())
+}
+
+#[test]
+fn conditional_mutations_use_strict_documented_requests() -> Result<(), Box<dyn Error>> {
+    let bytes = b"immutable upload payload";
+    let fixture = upload_fixture(bytes)?;
+    let content = fixture.staged.content().clone();
+    let unicode_path = "Café/雪.txt";
+    let server = FakeServer::start(vec![
+        FakeResponse::json(file_metadata(
+            "/café/雪.txt",
+            "/Café/雪.txt",
+            "created-rev",
+            &content,
+        )),
+        FakeResponse::json(file_metadata(
+            "/replace.txt",
+            "/Replace.txt",
+            "replacement-rev",
+            &content,
+        )),
+        FakeResponse::json(json!({
+            "metadata": file_metadata(
+                "/delete.txt",
+                "/Delete.txt",
+                "delete-rev",
+                &content,
+            )
+        })),
+        FakeResponse::json(json!({
+            "metadata": {
+                ".tag": "folder",
+                "path_lower": "/folder",
+                "path_display": "/Folder"
+            }
+        })),
+    ])?;
+    let client = fake_client(&server, "opaque-access-writes")?;
+
+    assert_eq!(
+        client.create_file(unicode_path, &fixture.staged)?,
+        MutationOutcome::Applied(RemotePathState::File(RemoteFile::new(
+            content.clone(),
+            DropboxRevision::new("created-rev"),
+        )))
+    );
+    assert_eq!(
+        client.replace_file(
+            "Replace.txt",
+            &DropboxRevision::new("expected-rev"),
+            &fixture.staged,
+        )?,
+        MutationOutcome::Applied(RemotePathState::File(RemoteFile::new(
+            content.clone(),
+            DropboxRevision::new("replacement-rev"),
+        )))
+    );
+    assert_eq!(
+        client.delete_file("Delete.txt", &DropboxRevision::new("delete-rev"))?,
+        MutationOutcome::Applied(RemotePathState::Absent)
+    );
+    assert_eq!(
+        client.create_folder("Folder")?,
+        MutationOutcome::Applied(RemotePathState::Folder)
+    );
+
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[0].path, "/2/files/upload");
+    assert_eq!(requests[0].body, bytes);
+    assert_eq!(
+        header(&requests[0], "content-type"),
+        Some("application/octet-stream")
+    );
+    let create_argument = required_header(&requests[0], "dropbox-api-arg")?;
+    assert!(create_argument.is_ascii());
+    assert!(create_argument.contains(r#"\u00e9"#));
+    assert!(create_argument.contains(r#"\u96ea"#));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(create_argument)?,
+        json!({
+            "path": format!("/{unicode_path}"),
+            "mode": "add",
+            "autorename": false,
+            "strict_conflict": true,
+            "content_hash": content.as_str()
+        })
+    );
+
+    assert_eq!(requests[1].path, "/2/files/upload");
+    assert_eq!(requests[1].body, bytes);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(required_header(
+            &requests[1],
+            "dropbox-api-arg"
+        )?)?,
+        json!({
+            "path": "/Replace.txt",
+            "mode": {".tag": "update", "update": "expected-rev"},
+            "autorename": false,
+            "strict_conflict": true,
+            "content_hash": content.as_str()
+        })
+    );
+
+    assert_eq!(requests[2].path, "/2/files/delete_v2");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&requests[2].body)?,
+        json!({"path": "/Delete.txt", "parent_rev": "delete-rev"})
+    );
+    assert_eq!(requests[3].path, "/2/files/create_folder_v2");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&requests[3].body)?,
+        json!({"path": "/Folder", "autorename": false})
+    );
+    assert!(requests.iter().all(|request| {
+        header(request, "authorization") == Some("Bearer opaque-access-writes")
+            && header(request, "dropbox-api-path-root")
+                == Some(r#"{".tag":"root","root":"namespace"}"#)
+    }));
+    Ok(())
+}
+
+#[test]
+fn explicit_conflict_uses_current_metadata_without_inventing_retry_safety()
+-> Result<(), Box<dyn Error>> {
+    let fixture = upload_fixture(b"new local bytes")?;
+    let desired = fixture.staged.content().clone();
+    let current = dropbox_content_hash(b"different remote bytes".as_slice())?;
+    let server = FakeServer::start(vec![
+        FakeResponse::status_json(409, json!({"error": {".tag": "path"}})),
+        FakeResponse::json(file_metadata(
+            "/conflict.txt",
+            "/Conflict.txt",
+            "current-rev",
+            &current,
+        )),
+        FakeResponse::status_json(409, json!({"error": {".tag": "path"}})),
+        FakeResponse::json(json!({
+            ".tag": "deleted",
+            "path_lower": "/unchanged.txt",
+            "path_display": "/Unchanged.txt"
+        })),
+        FakeResponse::status_json(409, json!({"error": {".tag": "path"}})),
+        FakeResponse::json(file_metadata(
+            "/same.txt",
+            "/Same.txt",
+            "same-rev",
+            &desired,
+        )),
+        FakeResponse::status_json(409, json!({"error": {".tag": "path"}})),
+        FakeResponse::json(json!({
+            ".tag": "file",
+            "path_lower": "/incomplete.txt",
+            "path_display": "/Incomplete.txt"
+        })),
+    ])?;
+    let client = fake_client(&server, "opaque-access-conflict")?;
+
+    assert_eq!(
+        client.create_file("Conflict.txt", &fixture.staged)?,
+        MutationOutcome::PreconditionChanged(RemotePathState::File(RemoteFile::new(
+            current,
+            DropboxRevision::new("current-rev"),
+        )))
+    );
+    assert!(matches!(
+        client.create_file("Unchanged.txt", &fixture.staged),
+        Err(DropboxError::HttpStatus {
+            operation: "strictly create Dropbox file",
+            status: 409,
+        })
+    ));
+    assert!(matches!(
+        client.replace_file(
+            "Same.txt",
+            &DropboxRevision::new("same-rev"),
+            &fixture.staged,
+        ),
+        Err(DropboxError::HttpStatus {
+            operation: "conditionally replace Dropbox file",
+            status: 409,
+        })
+    ));
+    assert!(matches!(
+        client.delete_file("Incomplete.txt", &DropboxRevision::new("expected-rev")),
+        Err(DropboxError::HttpStatus {
+            operation: "conditionally delete Dropbox file",
+            status: 409,
+        })
+    ));
+
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 8);
+    let (pairs, remainder) = requests.as_chunks::<2>();
+    assert!(remainder.is_empty());
+    for pair in pairs {
+        assert_eq!(pair[1].path, "/2/files/get_metadata");
+        assert!(metadata_request_includes_deleted(&pair[1])?);
+    }
+    Ok(())
+}
+
+#[test]
+fn ambiguous_mutations_are_verified_once_and_preserve_the_original_failure()
+-> Result<(), Box<dyn Error>> {
+    let fixture = upload_fixture(b"desired bytes")?;
+    let desired = fixture.staged.content().clone();
+    let old = dropbox_content_hash(b"old bytes".as_slice())?;
+    let server = FakeServer::start(vec![
+        FakeResponse::status_json(503, json!({})),
+        FakeResponse::json(file_metadata(
+            "/replace.txt",
+            "/Replace.txt",
+            "applied-rev",
+            &desired,
+        )),
+        FakeResponse::status_json(503, json!({})),
+        FakeResponse::json(file_metadata("/delete.txt", "/Delete.txt", "old-rev", &old)),
+        FakeResponse::status_json(503, json!({})),
+        FakeResponse::status_json(
+            409,
+            json!({
+                "error": {".tag": "path", "path": {".tag": "not_found"}}
+            }),
+        ),
+        FakeResponse::status_json(503, json!({})),
+        FakeResponse::status_json(
+            409,
+            json!({
+                "error": {".tag": "path", "path": {".tag": "restricted_content"}}
+            }),
+        ),
+        FakeResponse::json(json!({})),
+        FakeResponse::json(file_metadata(
+            "/created.txt",
+            "/Created.txt",
+            "created-rev",
+            &desired,
+        )),
+        FakeResponse::status_json(503, json!({})),
+        FakeResponse::json(file_metadata(
+            "/same.txt",
+            "/Same.txt",
+            "same-rev",
+            &desired,
+        )),
+        FakeResponse::status_json(503, json!({})),
+        FakeResponse::json(json!({
+            ".tag": "file",
+            "path_lower": "/incomplete.txt",
+            "path_display": "/Incomplete.txt",
+            "rev": "expected-rev"
+        })),
+    ])?;
+    let client = fake_client(&server, "opaque-access-ambiguous")?;
+
+    assert_eq!(
+        client.replace_file(
+            "Replace.txt",
+            &DropboxRevision::new("old-rev"),
+            &fixture.staged,
+        )?,
+        MutationOutcome::Applied(RemotePathState::File(RemoteFile::new(
+            desired.clone(),
+            DropboxRevision::new("applied-rev"),
+        )))
+    );
+    assert_eq!(
+        client.delete_file("Delete.txt", &DropboxRevision::new("old-rev"))?,
+        MutationOutcome::Pending
+    );
+    assert_eq!(
+        client.delete_file("Gone.txt", &DropboxRevision::new("gone-rev"))?,
+        MutationOutcome::Applied(RemotePathState::Absent)
+    );
+    assert!(matches!(
+        client.create_folder("Blocked"),
+        Err(DropboxError::HttpStatus {
+            operation: "strictly create Dropbox folder",
+            status: 503,
+        })
+    ));
+    assert_eq!(
+        client.create_file("Created.txt", &fixture.staged)?,
+        MutationOutcome::Applied(RemotePathState::File(RemoteFile::new(
+            desired,
+            DropboxRevision::new("created-rev"),
+        )))
+    );
+    assert_eq!(
+        client.replace_file(
+            "Same.txt",
+            &DropboxRevision::new("same-rev"),
+            &fixture.staged,
+        )?,
+        MutationOutcome::Pending
+    );
+    assert!(matches!(
+        client.delete_file("Incomplete.txt", &DropboxRevision::new("expected-rev")),
+        Err(DropboxError::HttpStatus {
+            operation: "conditionally delete Dropbox file",
+            status: 503,
+        })
+    ));
+
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 14);
+    let (pairs, remainder) = requests.as_chunks::<2>();
+    assert!(remainder.is_empty());
+    for pair in pairs {
+        assert_eq!(pair[1].path, "/2/files/get_metadata");
+        assert!(metadata_request_includes_deleted(&pair[1])?);
+    }
     Ok(())
 }
 
@@ -611,6 +930,49 @@ fn fake_access_token(value: &str) -> Result<AccessToken, Box<dyn Error>> {
     Ok(refreshed.access_token)
 }
 
+struct UploadFixture {
+    _root: TempDir,
+    _staging: TempDir,
+    staged: StagedUpload,
+}
+
+fn upload_fixture(bytes: &[u8]) -> Result<UploadFixture, Box<dyn Error>> {
+    let root = TempDir::new()?;
+    let staging = TempDir::new()?;
+    std::fs::write(root.path().join("payload"), bytes)?;
+    let identity = dropbox_content_hash(bytes)?;
+    let staged = match stage_upload(root.path(), "payload", staging.path(), &identity)? {
+        StageOutcome::Staged(staged) | StageOutcome::AlreadyStaged(staged) => staged,
+        StageOutcome::ContentChanged { .. } => {
+            return Err(io::Error::other("upload fixture content changed").into());
+        }
+        StageOutcome::DestinationOccupied { .. } => {
+            return Err(io::Error::other("upload fixture destination was occupied").into());
+        }
+    };
+    Ok(UploadFixture {
+        _root: root,
+        _staging: staging,
+        staged,
+    })
+}
+
+fn file_metadata(
+    path_lower: &str,
+    path_display: &str,
+    revision: &str,
+    content: &ContentIdentity,
+) -> serde_json::Value {
+    json!({
+        ".tag": "file",
+        "path_lower": path_lower,
+        "path_display": path_display,
+        "rev": revision,
+        "content_hash": content.as_str(),
+        "is_downloadable": true
+    })
+}
+
 fn root_link_failure(response: FakeResponse) -> Result<DropboxError, Box<dyn Error>> {
     let server = FakeServer::start(vec![
         FakeResponse::json(json!({
@@ -649,6 +1011,15 @@ fn text_body(request: &FakeRequest) -> Result<&str, std::str::Utf8Error> {
 
 fn header<'a>(request: &'a FakeRequest, name: &str) -> Option<&'a str> {
     request.headers.get(name).map(String::as_str)
+}
+
+fn required_header<'a>(request: &'a FakeRequest, name: &str) -> Result<&'a str, io::Error> {
+    header(request, name).ok_or_else(|| io::Error::other(format!("missing {name} header")))
+}
+
+fn metadata_request_includes_deleted(request: &FakeRequest) -> Result<bool, serde_json::Error> {
+    let body = serde_json::from_slice::<serde_json::Value>(&request.body)?;
+    Ok(body.get("include_deleted") == Some(&serde_json::Value::Bool(true)))
 }
 
 struct FakeServer {

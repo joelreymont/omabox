@@ -1,7 +1,8 @@
-//! Documented blocking Dropbox read operations.
+//! Documented blocking Dropbox operations.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,7 @@ use crate::auth::AccessToken;
 use crate::journal::{
     DropboxBinding, DropboxBindingWrite, Journal, JournalError, RemoteObservationRecord,
 };
-use crate::local::{LocalError, StageOutcome, stage_download};
+use crate::local::{LocalError, StageOutcome, StagedUpload, stage_download};
 use crate::model::{ContentIdentity, DropboxRevision, Observation, RemoteFile, UnknownReason};
 
 const LONG_POLL_MINIMUM_SECONDS: u64 = 30;
@@ -20,6 +21,7 @@ const JSON_REQUEST_SECONDS: u64 = 60;
 const CONNECT_SECONDS: u64 = 15;
 const DOWNLOAD_SECONDS: u64 = 60 * 60;
 const LONG_POLL_GRACE_SECONDS: u64 = 105;
+const DIRECT_UPLOAD_MAX_BYTES: u64 = 150 * 1024 * 1024;
 
 /// Dropbox HTTP endpoint locations.
 ///
@@ -193,7 +195,31 @@ pub enum LongPollWakeup {
     CursorReset,
 }
 
-/// Direct blocking client for Dropbox read endpoints.
+/// Confirmed state of one Dropbox path after a mutation or verification read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RemotePathState {
+    /// Dropbox explicitly reports that the path is absent.
+    Absent,
+    /// A downloadable regular file is present.
+    File(RemoteFile),
+    /// A folder is present.
+    Folder,
+    /// A present object cannot be represented as a regular file or folder.
+    Unsupported,
+}
+
+/// Durable outcome of one conditional Dropbox mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MutationOutcome {
+    /// The desired state is confirmed at the path.
+    Applied(RemotePathState),
+    /// The original precondition is unchanged, so the journaled mutation remains retry-safe.
+    Pending,
+    /// A different confirmed state replaced the mutation's precondition.
+    PreconditionChanged(RemotePathState),
+}
+
+/// Direct blocking client for Dropbox endpoints.
 pub struct DropboxClient {
     access_token: AccessToken,
     root: DropboxRoot,
@@ -456,6 +482,293 @@ impl DropboxClient {
             .map_err(|source| DropboxError::LocalStage { source })
     }
 
+    /// Strictly create one Dropbox file from verified immutable staging.
+    pub fn create_file(
+        &self,
+        relative: impl AsRef<Path>,
+        staged: &StagedUpload,
+    ) -> Result<MutationOutcome, DropboxError> {
+        let target = self.mutation_target(relative.as_ref())?;
+        let expectation = MutationExpectation::CreateFile {
+            desired: staged.content().clone(),
+        };
+        self.upload_file(
+            &target,
+            UploadMode::Add("add"),
+            staged,
+            expectation,
+            "strictly create Dropbox file",
+        )
+    }
+
+    /// Replace one Dropbox file only while its exact revision is current.
+    pub fn replace_file(
+        &self,
+        relative: impl AsRef<Path>,
+        expected: &DropboxRevision,
+        staged: &StagedUpload,
+    ) -> Result<MutationOutcome, DropboxError> {
+        let target = self.mutation_target(relative.as_ref())?;
+        let expectation = MutationExpectation::ReplaceFile {
+            expected: expected.clone(),
+            desired: staged.content().clone(),
+        };
+        self.upload_file(
+            &target,
+            UploadMode::Update(UpdateMode {
+                tag: "update",
+                update: expected.as_str(),
+            }),
+            staged,
+            expectation,
+            "conditionally replace Dropbox file",
+        )
+    }
+
+    /// Delete one Dropbox file only while its exact revision is current.
+    pub fn delete_file(
+        &self,
+        relative: impl AsRef<Path>,
+        expected: &DropboxRevision,
+    ) -> Result<MutationOutcome, DropboxError> {
+        let target = self.mutation_target(relative.as_ref())?;
+        let expectation = MutationExpectation::DeleteFile {
+            expected: expected.clone(),
+        };
+        let url = self.endpoints.api("/files/delete_v2");
+        let response = self.authorized_post(&url)?.send_json(DeleteRequest {
+            path: &target,
+            parent_rev: expected.as_str(),
+        });
+        let operation = "conditionally delete Dropbox file";
+        match response {
+            Err(source) => self.resolve_ambiguous(
+                &target,
+                &expectation,
+                DropboxError::Transport { operation, source },
+            ),
+            Ok(mut response) => {
+                let status = response.status().as_u16();
+                if (200..300).contains(&status) {
+                    let confirmation = response
+                        .body_mut()
+                        .read_json::<MetadataResponse>()
+                        .map_err(|source| DropboxError::Response { operation, source })
+                        .and_then(|payload| {
+                            validate_deleted_file(&target, payload.metadata, expected)
+                        });
+                    match confirmation {
+                        Ok(()) => Ok(MutationOutcome::Applied(RemotePathState::Absent)),
+                        Err(failure) => self.resolve_ambiguous(&target, &expectation, failure),
+                    }
+                } else {
+                    self.resolve_mutation_status(&target, &expectation, &response, operation)
+                }
+            }
+        }
+    }
+
+    /// Strictly create one Dropbox folder for a future directory intent.
+    pub fn create_folder(
+        &self,
+        relative: impl AsRef<Path>,
+    ) -> Result<MutationOutcome, DropboxError> {
+        let target = self.mutation_target(relative.as_ref())?;
+        let expectation = MutationExpectation::CreateFolder;
+        let url = self.endpoints.api("/files/create_folder_v2");
+        let response = self.authorized_post(&url)?.send_json(CreateFolderRequest {
+            path: &target,
+            autorename: false,
+        });
+        let operation = "strictly create Dropbox folder";
+        match response {
+            Err(source) => self.resolve_ambiguous(
+                &target,
+                &expectation,
+                DropboxError::Transport { operation, source },
+            ),
+            Ok(mut response) => {
+                let status = response.status().as_u16();
+                if (200..300).contains(&status) {
+                    let confirmation = response
+                        .body_mut()
+                        .read_json::<MetadataResponse>()
+                        .map_err(|source| DropboxError::Response { operation, source })
+                        .and_then(|payload| validate_created_folder(&target, payload.metadata));
+                    match confirmation {
+                        Ok(()) => Ok(MutationOutcome::Applied(RemotePathState::Folder)),
+                        Err(failure) => self.resolve_ambiguous(&target, &expectation, failure),
+                    }
+                } else {
+                    self.resolve_mutation_status(&target, &expectation, &response, operation)
+                }
+            }
+        }
+    }
+
+    fn upload_file(
+        &self,
+        target: &str,
+        mode: UploadMode<'_>,
+        staged: &StagedUpload,
+        expectation: MutationExpectation,
+        operation: &'static str,
+    ) -> Result<MutationOutcome, DropboxError> {
+        let bytes = staged
+            .open_verified()
+            .map_err(|source| DropboxError::LocalStage { source })?;
+        let size = bytes
+            .metadata()
+            .map_err(|source| DropboxError::UploadStageMetadata { source })?
+            .len();
+        validate_direct_upload_size(size)?;
+        let argument = ascii_json(&UploadRequest {
+            path: target,
+            mode,
+            autorename: false,
+            strict_conflict: true,
+            content_hash: staged.content().as_str(),
+        })?;
+        let authorization = format!("Bearer {}", self.access_token.expose());
+        let path_root = self.path_root_header()?;
+        let url = self.endpoints.content("/files/upload");
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(DOWNLOAD_SECONDS)))
+            .timeout_connect(Some(Duration::from_secs(CONNECT_SECONDS)))
+            .build();
+        let response = ureq::Agent::new_with_config(config)
+            .post(&url)
+            .header("Authorization", authorization)
+            .header("Dropbox-API-Path-Root", path_root)
+            .header("Dropbox-API-Arg", argument)
+            .header("Content-Type", "application/octet-stream")
+            .send(bytes);
+        match response {
+            Err(source) => self.resolve_ambiguous(
+                target,
+                &expectation,
+                DropboxError::Transport { operation, source },
+            ),
+            Ok(mut response) => {
+                let status = response.status().as_u16();
+                if (200..300).contains(&status) {
+                    let confirmation = response
+                        .body_mut()
+                        .read_json::<ListEntry>()
+                        .map_err(|source| DropboxError::Response { operation, source })
+                        .and_then(|metadata| {
+                            validate_uploaded_file(target, metadata, staged.content())
+                        });
+                    match confirmation {
+                        Ok(remote) => Ok(MutationOutcome::Applied(RemotePathState::File(remote))),
+                        Err(failure) => self.resolve_ambiguous(target, &expectation, failure),
+                    }
+                } else {
+                    self.resolve_mutation_status(target, &expectation, &response, operation)
+                }
+            }
+        }
+    }
+
+    fn resolve_mutation_status(
+        &self,
+        target: &str,
+        expectation: &MutationExpectation,
+        response: &ureq::http::Response<ureq::Body>,
+        operation: &'static str,
+    ) -> Result<MutationOutcome, DropboxError> {
+        let status = response.status().as_u16();
+        let failure = status_failure(status, response.headers().get("Retry-After"), operation);
+        if status == 409 {
+            self.resolve_explicit_conflict(target, expectation, failure)
+        } else if (500..600).contains(&status) {
+            self.resolve_ambiguous(target, expectation, failure)
+        } else {
+            Err(failure)
+        }
+    }
+
+    fn resolve_explicit_conflict(
+        &self,
+        target: &str,
+        expectation: &MutationExpectation,
+        original: DropboxError,
+    ) -> Result<MutationOutcome, DropboxError> {
+        match self.metadata_state(target) {
+            Ok(state) => match expectation.classify(state) {
+                MutationOutcome::Applied(state) => Ok(MutationOutcome::Applied(state)),
+                MutationOutcome::PreconditionChanged(state) => {
+                    Ok(MutationOutcome::PreconditionChanged(state))
+                }
+                MutationOutcome::Pending => Err(original),
+            },
+            Err(_) => Err(original),
+        }
+    }
+
+    fn resolve_ambiguous(
+        &self,
+        target: &str,
+        expectation: &MutationExpectation,
+        original: DropboxError,
+    ) -> Result<MutationOutcome, DropboxError> {
+        match self.metadata_state(target) {
+            Ok(state) => Ok(expectation.classify(state)),
+            Err(_) => Err(original),
+        }
+    }
+
+    fn metadata_state(&self, target: &str) -> Result<RemotePathState, DropboxError> {
+        let operation = "verify Dropbox mutation";
+        let url = self.endpoints.api("/files/get_metadata");
+        let mut response = self
+            .authorized_post(&url)?
+            .send_json(MetadataRequest {
+                path: target,
+                include_deleted: true,
+            })
+            .map_err(|source| DropboxError::Transport { operation, source })?;
+        let status = response.status().as_u16();
+        if status == 409 {
+            let missing = response
+                .body_mut()
+                .read_json::<MetadataError>()
+                .map_err(|source| DropboxError::Response { operation, source })?;
+            if missing.explicitly_not_found() {
+                return Ok(RemotePathState::Absent);
+            }
+            return Err(DropboxError::HttpStatus { operation, status });
+        }
+        require_success(status, response.headers().get("Retry-After"), operation)?;
+        let metadata = response
+            .body_mut()
+            .read_json::<ListEntry>()
+            .map_err(|source| DropboxError::Response { operation, source })?;
+        metadata_remote_state(target, metadata)
+    }
+
+    fn mutation_target(&self, relative: &Path) -> Result<String, DropboxError> {
+        let mut suffix = String::new();
+        for component in relative.components() {
+            let Component::Normal(component) = component else {
+                return Err(DropboxError::InvalidMutationPath);
+            };
+            let component = component
+                .to_str()
+                .ok_or(DropboxError::InvalidMutationPath)?;
+            if invalid_dropbox_component(component) {
+                return Err(DropboxError::InvalidMutationPath);
+            }
+            suffix.push('/');
+            suffix.push_str(component);
+        }
+        if suffix.is_empty() {
+            return Err(DropboxError::InvalidMutationPath);
+        }
+        Ok(format!("{}{}", self.root.path, suffix))
+    }
+
     fn current_account(&self) -> Result<CurrentAccount, DropboxError> {
         let url = self.endpoints.api("/users/get_current_account");
         let authorization = format!("Bearer {}", self.access_token.expose());
@@ -642,14 +955,54 @@ impl DropboxClient {
     }
 
     fn path_root_header(&self) -> Result<String, DropboxError> {
-        serde_json::to_string(&PathRootHeader {
+        ascii_json(&PathRootHeader {
             tag: "root",
             root: &self.root.namespace_id,
         })
-        .map_err(|source| DropboxError::Json {
-            operation: "encode Dropbox path root",
-            source,
-        })
+    }
+}
+
+enum MutationExpectation {
+    CreateFile {
+        desired: ContentIdentity,
+    },
+    ReplaceFile {
+        expected: DropboxRevision,
+        desired: ContentIdentity,
+    },
+    DeleteFile {
+        expected: DropboxRevision,
+    },
+    CreateFolder,
+}
+
+impl MutationExpectation {
+    fn classify(&self, state: RemotePathState) -> MutationOutcome {
+        let unchanged = match (self, &state) {
+            (Self::CreateFile { .. } | Self::CreateFolder, RemotePathState::Absent) => true,
+            (
+                Self::ReplaceFile { expected, .. } | Self::DeleteFile { expected },
+                RemotePathState::File(remote),
+            ) => &remote.revision == expected,
+            _ => false,
+        };
+        if unchanged {
+            return MutationOutcome::Pending;
+        }
+        let applied = match (self, &state) {
+            (Self::CreateFile { desired }, RemotePathState::File(remote))
+            | (Self::ReplaceFile { desired, .. }, RemotePathState::File(remote)) => {
+                &remote.content == desired
+            }
+            (Self::DeleteFile { .. }, RemotePathState::Absent)
+            | (Self::CreateFolder, RemotePathState::Folder) => true,
+            _ => false,
+        };
+        if applied {
+            MutationOutcome::Applied(state)
+        } else {
+            MutationOutcome::PreconditionChanged(state)
+        }
     }
 }
 
@@ -782,6 +1135,65 @@ struct DownloadMetadata {
     content_hash: String,
 }
 
+#[derive(Serialize)]
+struct UploadRequest<'a> {
+    path: &'a str,
+    mode: UploadMode<'a>,
+    autorename: bool,
+    strict_conflict: bool,
+    content_hash: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum UploadMode<'a> {
+    Add(&'static str),
+    Update(UpdateMode<'a>),
+}
+
+#[derive(Serialize)]
+struct UpdateMode<'a> {
+    #[serde(rename = ".tag")]
+    tag: &'static str,
+    update: &'a str,
+}
+
+#[derive(Serialize)]
+struct DeleteRequest<'a> {
+    path: &'a str,
+    parent_rev: &'a str,
+}
+
+#[derive(Deserialize)]
+struct MetadataResponse {
+    metadata: ListEntry,
+}
+
+#[derive(Serialize)]
+struct CreateFolderRequest<'a> {
+    path: &'a str,
+    autorename: bool,
+}
+
+#[derive(Deserialize)]
+struct MetadataError {
+    error: serde_json::Value,
+}
+
+impl MetadataError {
+    fn explicitly_not_found(&self) -> bool {
+        self.error
+            .pointer("/.tag")
+            .and_then(serde_json::Value::as_str)
+            == Some("path")
+            && self
+                .error
+                .pointer("/path/.tag")
+                .and_then(serde_json::Value::as_str)
+                == Some("not_found")
+    }
+}
+
 /// Dropbox protocol, validation, or publication failure.
 #[derive(Debug, Error)]
 pub enum DropboxError {
@@ -791,6 +1203,17 @@ pub enum DropboxError {
     /// A timeout outside Dropbox's documented range was requested.
     #[error("Dropbox long-poll timeout must be between 30 and 480 seconds")]
     InvalidLongPollTimeout,
+    /// A mutating operation was given an empty, absolute, parent-relative, or non-UTF-8 path.
+    #[error("Dropbox mutation path must be a nonempty safe relative UTF-8 path")]
+    InvalidMutationPath,
+    /// The immutable stage exceeds Dropbox's direct-upload endpoint limit.
+    #[error(
+        "immutable upload stage is {bytes} bytes; direct Dropbox uploads allow at most 157286400 bytes"
+    )]
+    DirectUploadTooLarge {
+        /// Verified stage length.
+        bytes: u64,
+    },
     /// The live account, Secret Service record, and journal do not share one binding.
     #[error("Dropbox account or root binding no longer matches the journal")]
     AccountBindingChanged,
@@ -879,8 +1302,18 @@ pub enum DropboxError {
     /// Dropbox returned an identity different from the listed content hash.
     #[error("Dropbox exact-revision download returned a different content identity")]
     DownloadedIdentityChanged,
-    /// Verified bytes could not be written into local staging.
-    #[error("could not stage an exact Dropbox download")]
+    /// A successful mutation response did not describe the requested path and content.
+    #[error("Dropbox returned inconsistent mutation metadata")]
+    InvalidMutationMetadata,
+    /// The verified upload-stage descriptor could not be inspected.
+    #[error("could not inspect immutable upload staging")]
+    UploadStageMetadata {
+        /// Original descriptor metadata error.
+        #[source]
+        source: io::Error,
+    },
+    /// Verified local staging could not be accessed.
+    #[error("could not access verified local staging")]
     LocalStage {
         /// Original local staging error.
         #[source]
@@ -902,17 +1335,137 @@ fn require_success(
 ) -> Result<(), DropboxError> {
     if (200..300).contains(&status) {
         Ok(())
-    } else if status == 429 {
+    } else {
+        Err(status_failure(status, retry_after, operation))
+    }
+}
+
+fn status_failure(
+    status: u16,
+    retry_after: Option<&ureq::http::HeaderValue>,
+    operation: &'static str,
+) -> DropboxError {
+    if status == 429 {
         let retry_after = retry_after
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok())
             .map(Duration::from_secs);
-        Err(DropboxError::RateLimited {
+        DropboxError::RateLimited {
             operation,
             retry_after,
-        })
+        }
     } else {
-        Err(DropboxError::HttpStatus { operation, status })
+        DropboxError::HttpStatus { operation, status }
+    }
+}
+
+fn validate_direct_upload_size(bytes: u64) -> Result<(), DropboxError> {
+    if bytes > DIRECT_UPLOAD_MAX_BYTES {
+        Err(DropboxError::DirectUploadTooLarge { bytes })
+    } else {
+        Ok(())
+    }
+}
+
+fn ascii_json(value: &impl Serialize) -> Result<String, DropboxError> {
+    let json = serde_json::to_string(value).map_err(|source| DropboxError::Json {
+        operation: "encode Dropbox request header",
+        source,
+    })?;
+    let mut ascii = String::with_capacity(json.len());
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for character in json.chars() {
+        if character.is_ascii() {
+            ascii.push(character);
+        } else {
+            let mut units = [0_u16; 2];
+            for unit in character.encode_utf16(&mut units) {
+                ascii.push('\\');
+                ascii.push('u');
+                for shift in [12_u32, 8, 4, 0] {
+                    let digit = usize::from((*unit >> shift) & 0x0f);
+                    ascii.push(char::from(HEX[digit]));
+                }
+            }
+        }
+    }
+    Ok(ascii)
+}
+
+fn validate_uploaded_file(
+    target: &str,
+    metadata: ListEntry,
+    expected: &ContentIdentity,
+) -> Result<RemoteFile, DropboxError> {
+    validate_mutation_path(target, &metadata)?;
+    let remote = complete_remote_file(metadata).ok_or(DropboxError::InvalidMutationMetadata)?;
+    if &remote.content != expected {
+        return Err(DropboxError::InvalidMutationMetadata);
+    }
+    Ok(remote)
+}
+
+fn validate_deleted_file(
+    target: &str,
+    metadata: ListEntry,
+    expected: &DropboxRevision,
+) -> Result<(), DropboxError> {
+    validate_mutation_path(target, &metadata)?;
+    let remote = complete_remote_file(metadata).ok_or(DropboxError::InvalidMutationMetadata)?;
+    if &remote.revision != expected {
+        return Err(DropboxError::InvalidMutationMetadata);
+    }
+    Ok(())
+}
+
+fn validate_created_folder(target: &str, metadata: ListEntry) -> Result<(), DropboxError> {
+    validate_mutation_path(target, &metadata)?;
+    if !matches!(metadata.tag, EntryTag::Folder) {
+        return Err(DropboxError::InvalidMutationMetadata);
+    }
+    Ok(())
+}
+
+fn metadata_remote_state(
+    target: &str,
+    metadata: ListEntry,
+) -> Result<RemotePathState, DropboxError> {
+    validate_mutation_path(target, &metadata)?;
+    match metadata.tag {
+        EntryTag::Deleted => Ok(RemotePathState::Absent),
+        EntryTag::Folder => Ok(RemotePathState::Folder),
+        EntryTag::File if !metadata.is_downloadable || metadata.symlink_info.is_some() => {
+            Ok(RemotePathState::Unsupported)
+        }
+        EntryTag::File => complete_remote_file(metadata)
+            .map(RemotePathState::File)
+            .ok_or(DropboxError::InvalidMutationMetadata),
+    }
+}
+
+fn complete_remote_file(metadata: ListEntry) -> Option<RemoteFile> {
+    if !matches!(metadata.tag, EntryTag::File)
+        || !metadata.is_downloadable
+        || metadata.symlink_info.is_some()
+    {
+        return None;
+    }
+    let content = metadata.content_hash?;
+    let revision = metadata.rev?;
+    if !valid_content_hash(&content) || revision.is_empty() {
+        return None;
+    }
+    Some(RemoteFile::new(
+        ContentIdentity::new(content),
+        DropboxRevision::new(revision),
+    ))
+}
+
+fn validate_mutation_path(target: &str, metadata: &ListEntry) -> Result<(), DropboxError> {
+    if metadata.path_lower.as_deref() == Some(target.to_lowercase().as_str()) {
+        Ok(())
+    } else {
+        Err(DropboxError::InvalidMutationMetadata)
     }
 }
 
@@ -1045,7 +1598,10 @@ mod tests {
 
     use crate::model::{Observation, UnknownReason};
 
-    use super::{DropboxRoot, EntryTag, ListEntry, apply_entries};
+    use super::{
+        DIRECT_UPLOAD_MAX_BYTES, DropboxError, DropboxRoot, EntryTag, ListEntry, apply_entries,
+        ascii_json, validate_direct_upload_size,
+    };
 
     #[test]
     fn folders_and_non_downloadable_files_are_unknown() -> Result<(), Box<dyn Error>> {
@@ -1082,6 +1638,28 @@ mod tests {
         assert!(records.values().all(|record| {
             record.observation == Observation::Unknown(UnknownReason::Unsupported)
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn direct_upload_limit_is_checked_before_network_io() {
+        assert!(validate_direct_upload_size(DIRECT_UPLOAD_MAX_BYTES).is_ok());
+        assert!(matches!(
+            validate_direct_upload_size(DIRECT_UPLOAD_MAX_BYTES + 1),
+            Err(DropboxError::DirectUploadTooLarge { bytes })
+                if bytes == DIRECT_UPLOAD_MAX_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn dropbox_header_json_is_ascii_safe() -> Result<(), Box<dyn Error>> {
+        let value = serde_json::json!({"path": "/Café/雪.txt"});
+        let encoded = ascii_json(&value)?;
+
+        assert!(encoded.is_ascii());
+        assert!(encoded.contains(r#"\u00e9"#));
+        assert!(encoded.contains(r#"\u96ea"#));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&encoded)?, value);
         Ok(())
     }
 }
