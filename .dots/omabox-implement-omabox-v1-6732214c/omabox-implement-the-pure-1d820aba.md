@@ -1,9 +1,9 @@
 ---
 title: Implement the pure sync planner
-status: open
+status: active
 priority: 2
 issue-type: task
-created-at: "2026-08-23T20:47:57.557478+02:00"
+created-at: "\"2026-08-23T20:47:57.557478+02:00\""
 blocks:
   - omabox-bootstrap-the-rust-fdad9292
 ---
