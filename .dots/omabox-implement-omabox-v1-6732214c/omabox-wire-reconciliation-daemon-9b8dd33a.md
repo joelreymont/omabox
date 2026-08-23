@@ -1,9 +1,9 @@
 ---
 title: Wire reconciliation, daemon, and CLI
-status: open
+status: active
 priority: 2
 issue-type: task
-created-at: "2026-08-23T20:47:57.911113+02:00"
+created-at: "\"2026-08-23T20:47:57.911113+02:00\""
 blocks:
   - omabox-implement-conditional-dropbox-cbf984cd
 ---
