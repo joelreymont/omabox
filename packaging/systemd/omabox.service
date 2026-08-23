@@ -5,6 +5,7 @@ Description=Omabox Dropbox sync service
 Type=simple
 ExecStart=/usr/bin/omaboxd
 Restart=on-failure
+RestartSec=5s
 UMask=0077
 KillSignal=SIGTERM
 TimeoutStopSec=30s
