@@ -218,6 +218,17 @@ pub struct ConflictRecord {
     pub conflict: Conflict,
 }
 
+/// Result of finishing a pending plan as a conflict.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlanConflictCompletion {
+    /// The plan does not exist.
+    NotFound,
+    /// The plan was already completed, so no conflict was added.
+    AlreadyCompleted,
+    /// The conflict and plan completion were committed together.
+    Recorded,
+}
+
 /// A recovery copy that must exist before its destructive operation runs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryRecord {
@@ -796,6 +807,60 @@ impl Journal {
             .commit()
             .map_err(|source| sqlite("commit plan and baseline", &database_path, source))?;
         Ok(OperationCompletion::PlanCompleted)
+    }
+
+    /// Record a conflict and retire its pending plan in one transaction.
+    pub fn finish_plan_with_conflict(
+        &mut self,
+        plan_id: PlanId,
+        conflict: &Conflict,
+    ) -> Result<PlanConflictCompletion, JournalError> {
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite("begin plan conflict", &database_path, source))?;
+        let plan = transaction
+            .query_row(
+                "SELECT path, status FROM plans WHERE id = ?1",
+                [plan_id.0],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|source| sqlite("find plan for conflict", &database_path, source))?;
+        let Some((raw_path, status)) = plan else {
+            return Ok(PlanConflictCompletion::NotFound);
+        };
+        let path = bytes_path(raw_path);
+        if decode_status(&status, "read plan status for conflict", &path)?
+            == RecordStatus::Completed
+        {
+            return Ok(PlanConflictCompletion::AlreadyCompleted);
+        }
+
+        let json = encode(conflict, "serialize plan conflict", &path)?;
+        transaction
+            .execute(
+                "INSERT INTO conflicts(path, conflict_json) VALUES (?1, ?2)",
+                params![path_bytes(&path), json],
+            )
+            .map_err(|source| sqlite("record plan conflict", &path, source))?;
+        transaction
+            .execute(
+                "UPDATE operations SET status = 'completed' WHERE plan_id = ?1",
+                [plan_id.0],
+            )
+            .map_err(|source| sqlite("complete conflicted plan operations", &path, source))?;
+        transaction
+            .execute(
+                "UPDATE plans SET status = 'completed' WHERE id = ?1",
+                [plan_id.0],
+            )
+            .map_err(|source| sqlite("complete conflicted plan", &path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite("commit plan conflict", &database_path, source))?;
+        Ok(PlanConflictCompletion::Recorded)
     }
 
     /// Persist a planner conflict without interpreting it or discarding a side.
@@ -1669,6 +1734,76 @@ mod tests {
         let version =
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
         assert_eq!(version, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn journal_plan_conflict_completes_once_without_advancing_baseline()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+        let path = Path::new("conflict.txt");
+        let baseline_file = remote_file("old", "rev-old");
+        let conflict = Conflict::DivergentEdits {
+            local: LocalFile::new(content("local")),
+            remote: remote_file("remote", "rev-remote"),
+        };
+        let plan = {
+            let mut journal = Journal::open(&database_path)?;
+            let baseline = noop(plan(
+                &Baseline::Absent,
+                &Observation::Present(LocalFile::new(content("old"))),
+                &Observation::Present(baseline_file.clone()),
+            ))?;
+            assert_eq!(journal.record_noop(path, &baseline)?, NoOpWrite::Recorded);
+            let operations = operations(plan(
+                &Baseline::Present(baseline_file.clone()),
+                &Observation::Present(LocalFile::new(content("local"))),
+                &Observation::Present(baseline_file.clone()),
+            ))?;
+            let plan = recorded_plan(journal.record_plan(path, &operations)?)?;
+            assert_eq!(
+                journal.finish_plan_with_conflict(plan.id, &conflict)?,
+                PlanConflictCompletion::Recorded
+            );
+            plan
+        };
+
+        let mut reopened = Journal::open(&database_path)?;
+        assert_eq!(
+            reopened.baseline(path)?,
+            Some(Baseline::Present(baseline_file))
+        );
+        assert!(reopened.pending_plans()?.is_empty());
+        let completed =
+            read_plan(&reopened.connection, &database_path, plan.id)?.ok_or_else(|| {
+                JournalError::InvalidState {
+                    operation: "read completed test plan",
+                    path: path.to_path_buf(),
+                    detail: "completed plan disappeared",
+                }
+            })?;
+        assert_eq!(completed.status, RecordStatus::Completed);
+        assert!(
+            completed
+                .operations
+                .iter()
+                .all(|operation| operation.status == RecordStatus::Completed)
+        );
+        let conflicts = reopened.conflicts()?;
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, path);
+        assert_eq!(conflicts[0].conflict, conflict);
+
+        assert_eq!(
+            reopened.finish_plan_with_conflict(plan.id, &conflict)?,
+            PlanConflictCompletion::AlreadyCompleted
+        );
+        assert_eq!(reopened.conflicts()?, conflicts);
+        assert_eq!(
+            reopened.finish_plan_with_conflict(PlanId(i64::MAX), &conflict)?,
+            PlanConflictCompletion::NotFound
+        );
         Ok(())
     }
 
