@@ -1,5 +1,6 @@
 //! Stable, read-only explanations of durable synchronization state.
 
+use std::io;
 use std::path::{Path, PathBuf};
 
 use miette::Diagnostic;
@@ -11,8 +12,29 @@ use crate::model::Observation;
 /// Status shown before setup has created a journal.
 pub const NOT_INITIALIZED: &str = "Omabox is not set up; run `omabox setup [REMOTE_ROOT]`.";
 
-/// Read the journal and render its durable state without contacting Dropbox.
-pub fn render(journal: &mut Journal) -> Result<String, StatusError> {
+/// Open an initialized journal read-only and explain its durable state.
+pub fn render(path: impl AsRef<Path>) -> Result<String, StatusError> {
+    let path = path.as_ref();
+    match path.try_exists() {
+        Ok(true) => {}
+        Ok(false) => {
+            return Ok(format!("{NOT_INITIALIZED}\n"));
+        }
+        Err(source) => return Err(StatusError::Inspect { source }),
+    }
+    let mut journal = Journal::open_read_only(path)
+        .map_err(|source| status("open the journal read-only", source))?;
+    if journal
+        .dropbox_binding()
+        .map_err(|source| status("read Dropbox setup state", source))?
+        .is_none()
+    {
+        return Ok(format!("{NOT_INITIALIZED}\n"));
+    }
+    render_journal(&mut journal)
+}
+
+fn render_journal(journal: &mut Journal) -> Result<String, StatusError> {
     let mut entries = Vec::new();
 
     for plan in journal
@@ -93,15 +115,28 @@ pub fn render(journal: &mut Journal) -> Result<String, StatusError> {
 
 /// A typed failure while reading durable status.
 #[derive(Debug, Diagnostic, Error)]
-#[error("could not {operation}")]
-#[diagnostic(
-    code(omabox::status::journal),
-    help("Check access to the Omabox state directory, then retry `omabox status`.")
-)]
-pub struct StatusError {
-    operation: &'static str,
-    #[source]
-    source: JournalError,
+pub enum StatusError {
+    /// The journal path could not be inspected.
+    #[error("could not inspect Omabox setup state")]
+    #[diagnostic(
+        code(omabox::status::inspect),
+        help("Check access to the Omabox state directory, then retry `omabox status`.")
+    )]
+    Inspect {
+        #[source]
+        source: io::Error,
+    },
+    /// The initialized journal could not be read.
+    #[error("could not {operation}")]
+    #[diagnostic(
+        code(omabox::status::journal),
+        help("Check access to the Omabox state directory, then retry `omabox status`.")
+    )]
+    Journal {
+        operation: &'static str,
+        #[source]
+        source: JournalError,
+    },
 }
 
 #[derive(Debug)]
@@ -117,7 +152,10 @@ impl StatusEntry {
 }
 
 fn status(operation: &'static str, source: JournalError) -> StatusError {
-    StatusError { operation, source }
+    StatusError::Journal {
+        operation,
+        source: source.redact_paths(),
+    }
 }
 
 fn render_entries(entries: &[StatusEntry]) -> String {
@@ -149,6 +187,7 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use std::error::Error;
+    use std::fs;
 
     use crate::journal::{
         LocalObservationRecord, PlanWrite, RecoveryWrite, RemoteObservationRecord,
@@ -165,7 +204,13 @@ mod tests {
         const SENTINEL: &str = "absolute-state-sentinel";
 
         let temporary = tempfile::TempDir::new()?;
-        let mut journal = Journal::open(temporary.path().join("journal.sqlite3"))?;
+        let journal_path = temporary.path().join("journal.sqlite3");
+        let mut journal = Journal::open(&journal_path)?;
+        journal.bind_dropbox_root(&crate::journal::DropboxBinding {
+            account_id: String::from("account-id-must-not-render"),
+            root_namespace_id: String::from("namespace-id-must-not-render"),
+            remote_root: String::from("/remote-root-must-not-render"),
+        })?;
         journal.publish_local_inventory(&[LocalObservationRecord {
             path: PathBuf::from("z-local.txt"),
             observation: Observation::Unknown(UnknownReason::Inaccessible),
@@ -215,7 +260,8 @@ mod tests {
             },
         )?;
 
-        let rendered = render(&mut journal)?;
+        drop(journal);
+        let rendered = render(&journal_path)?;
         insta::assert_snapshot!(rendered, @r###"
         Omabox needs attention:
         - a-remote.txt: Dropbox status unknown: inventory is stale
@@ -232,9 +278,60 @@ mod tests {
             "revision-must-not-render",
             "local-secret-sentinel",
             "remote-secret-sentinel",
+            "account-id-must-not-render",
+            "namespace-id-must-not-render",
+            "remote-root-must-not-render",
         ] {
             assert!(!rendered.contains(forbidden));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn status_never_initializes_or_migrates_a_journal() -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+
+        let absent = temporary.path().join("absent.sqlite3");
+        assert_eq!(render(&absent)?, format!("{NOT_INITIALIZED}\n"));
+        assert!(!absent.exists());
+
+        let empty = temporary.path().join("empty.sqlite3");
+        fs::File::create(&empty)?;
+        assert!(render(&empty).is_err());
+        assert_eq!(fs::metadata(&empty)?.len(), 0);
+
+        let version_zero = temporary.path().join("version-zero.sqlite3");
+        drop(rusqlite::Connection::open(&version_zero)?);
+        assert!(render(&version_zero).is_err());
+        let connection = rusqlite::Connection::open_with_flags(
+            &version_zero,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        assert_eq!(
+            connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
+            0
+        );
+
+        let unbound = temporary.path().join("unbound.sqlite3");
+        drop(Journal::open(&unbound)?);
+        assert_eq!(render(&unbound)?, format!("{NOT_INITIALIZED}\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn status_diagnostics_redact_the_absolute_journal_path() -> Result<(), Box<dyn Error>> {
+        const SENTINEL: &str = "absolute-journal-path-sentinel";
+
+        let temporary = tempfile::TempDir::new()?;
+        let path = temporary.path().join(SENTINEL);
+        drop(rusqlite::Connection::open(&path)?);
+        let error = render(&path)
+            .err()
+            .ok_or("schema-zero journal unexpectedly rendered status")?;
+        for rendered in [format!("{error}"), format!("{error:?}")] {
+            assert!(!rendered.contains(SENTINEL));
+        }
+        assert!(!format!("{:?}", miette::Report::new(error)).contains(SENTINEL));
         Ok(())
     }
 }

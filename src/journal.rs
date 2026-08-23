@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
@@ -63,6 +63,42 @@ pub enum JournalError {
         /// Version this binary understands.
         supported: i64,
     },
+}
+
+impl JournalError {
+    pub(crate) fn redact_paths(self) -> Self {
+        let redacted = || PathBuf::from("[Omabox journal]");
+        match self {
+            Self::Sqlite {
+                operation, source, ..
+            } => Self::Sqlite {
+                operation,
+                path: redacted(),
+                source,
+            },
+            Self::Json {
+                operation, source, ..
+            } => Self::Json {
+                operation,
+                path: redacted(),
+                source,
+            },
+            Self::InvalidState {
+                operation, detail, ..
+            } => Self::InvalidState {
+                operation,
+                path: redacted(),
+                detail,
+            },
+            Self::UnsupportedVersion {
+                found, supported, ..
+            } => Self::UnsupportedVersion {
+                path: redacted(),
+                found,
+                supported,
+            },
+        }
+    }
 }
 
 /// One path from a complete local inventory.
@@ -336,6 +372,60 @@ impl Journal {
             connection,
             database_path: path,
         })
+    }
+
+    /// Open an existing version-one journal without creating or changing it.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, JournalError> {
+        let path = path.as_ref().to_path_buf();
+        let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|source| JournalError::Sqlite {
+                operation: "open journal read-only",
+                path: path.clone(),
+                source,
+            })?;
+        let version = connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .map_err(|source| JournalError::Sqlite {
+                operation: "read journal schema version",
+                path: path.clone(),
+                source,
+            })?;
+        if version != 1 {
+            return Err(JournalError::UnsupportedVersion {
+                path,
+                found: version,
+                supported: 1,
+            });
+        }
+        Ok(Self {
+            connection,
+            database_path: path,
+        })
+    }
+
+    /// Return the Dropbox account and root bound to this journal, if setup completed.
+    pub fn dropbox_binding(&self) -> Result<Option<DropboxBinding>, JournalError> {
+        self.connection
+            .query_row(
+                "SELECT account_id, root_namespace_id, remote_root \
+                 FROM dropbox_binding WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok(DropboxBinding {
+                        account_id: row.get(0)?,
+                        root_namespace_id: row.get(1)?,
+                        remote_root: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|source| {
+                sqlite(
+                    "read Dropbox account and root binding",
+                    &self.database_path,
+                    source,
+                )
+            })
     }
 
     /// Bind this journal to one Dropbox account and root without replacing an existing binding.
@@ -1476,6 +1566,7 @@ mod tests {
         }
 
         let mut reopened = Journal::open(database_path)?;
+        assert_eq!(reopened.dropbox_binding()?, Some(binding.clone()));
         assert_eq!(
             reopened.bind_dropbox_root(&binding)?,
             DropboxBindingWrite::AlreadyBound

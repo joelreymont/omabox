@@ -72,11 +72,6 @@ fn setup(remote_root: &str) -> Result<(), CliError> {
     })?;
     let _lock = InstanceLock::acquire(config.paths().lock_file())
         .map_err(|source| CliError::Lock { source })?;
-    let mut journal =
-        Journal::open(config.paths().journal_file()).map_err(|source| CliError::Journal {
-            operation: "open the journal",
-            source,
-        })?;
 
     let oauth = OAuthClient::new(config.dropbox_app_key());
     let pending = oauth.begin().map_err(|source| CliError::Auth {
@@ -112,21 +107,38 @@ fn setup(remote_root: &str) -> Result<(), CliError> {
         }
     };
     let binding = client.binding();
-    match journal
-        .bind_dropbox_root(&binding)
+    let mut journal =
+        Journal::open(config.paths().journal_file()).map_err(|source| CliError::Journal {
+            operation: "open the journal",
+            source,
+        })?;
+    let was_unbound = match journal
+        .dropbox_binding()
         .map_err(|source| CliError::Journal {
-            operation: "bind the journal to Dropbox",
+            operation: "read the Dropbox journal binding",
             source,
         })? {
-        DropboxBindingWrite::Bound | DropboxBindingWrite::AlreadyBound => {}
-        DropboxBindingWrite::Mismatch { .. } => return Err(CliError::JournalBindingMismatch),
-    }
+        Some(existing) if existing != binding => return Err(CliError::JournalBindingMismatch),
+        Some(_) => false,
+        None => true,
+    };
     RefreshTokenStore::new()
         .store(&binding, &refresh_token)
         .map_err(|source| CliError::Auth {
             operation: "store the Dropbox refresh token",
             source,
         })?;
+    if was_unbound {
+        match journal
+            .bind_dropbox_root(&binding)
+            .map_err(|source| CliError::Journal {
+                operation: "bind the journal to Dropbox",
+                source,
+            })? {
+            DropboxBindingWrite::Bound | DropboxBindingWrite::AlreadyBound => {}
+            DropboxBindingWrite::Mismatch { .. } => return Err(CliError::JournalBindingMismatch),
+        }
+    }
     write_stdout("\nOmabox setup is complete.\n")
 }
 
@@ -135,18 +147,7 @@ fn show_status() -> Result<(), CliError> {
         operation: "load configuration",
         source: Box::new(source),
     })?;
-    let journal_path = config.paths().journal_file();
-    if !journal_path.try_exists().map_err(|source| CliError::Io {
-        operation: "inspect the journal",
-        source,
-    })? {
-        return write_stdout(&format!("{}\n", status::NOT_INITIALIZED));
-    }
-    let mut journal = Journal::open(journal_path).map_err(|source| CliError::Journal {
-        operation: "open the journal",
-        source,
-    })?;
-    let output = status::render(&mut journal).map_err(CliError::Status)?;
+    let output = status::render(config.paths().journal_file()).map_err(CliError::Status)?;
     write_stdout(&output)
 }
 
