@@ -1,9 +1,11 @@
 ---
 title: Implement conditional Dropbox writes
-status: active
+status: closed
 priority: 2
 issue-type: task
-created-at: "\"2026-08-23T20:47:57.830429+02:00\""
+created-at: "\"\\\"2026-08-23T20:47:57.830429+02:00\\\"\""
+closed-at: "2026-08-24T01:20:47.377127+02:00"
+close-reason: conditional writes, recovery, and conflicts landed and verified
 blocks:
   - omabox-implement-dropbox-auth-fa43e8c2
 ---
