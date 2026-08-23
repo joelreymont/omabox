@@ -18,6 +18,13 @@ CREATE TABLE remote_inventory (
     cursor TEXT NOT NULL
 ) STRICT;
 
+CREATE TABLE dropbox_binding (
+    singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
+    account_id TEXT NOT NULL,
+    root_namespace_id TEXT NOT NULL,
+    remote_root TEXT NOT NULL
+) STRICT;
+
 CREATE TABLE plans (
     id INTEGER PRIMARY KEY NOT NULL,
     path BLOB NOT NULL,

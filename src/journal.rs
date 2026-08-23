@@ -92,6 +92,31 @@ pub struct RemoteInventory {
     pub observations: Vec<RemoteObservationRecord>,
 }
 
+/// Dropbox account and root permanently associated with this journal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DropboxBinding {
+    /// Stable Dropbox account identifier.
+    pub account_id: String,
+    /// Dropbox root namespace identifier for the account.
+    pub root_namespace_id: String,
+    /// Configured path within that namespace.
+    pub remote_root: String,
+}
+
+/// Result of binding a journal to a Dropbox account and root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DropboxBindingWrite {
+    /// The journal was unbound and now holds the requested binding.
+    Bound,
+    /// The journal already held the requested binding.
+    AlreadyBound,
+    /// The journal is bound to a different account or root and was not changed.
+    Mismatch {
+        /// Binding that remains stored in the journal.
+        existing: DropboxBinding,
+    },
+}
+
 /// Durable identity of a plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlanId(i64);
@@ -300,6 +325,64 @@ impl Journal {
             connection,
             database_path: path,
         })
+    }
+
+    /// Bind this journal to one Dropbox account and root without replacing an existing binding.
+    pub fn bind_dropbox_root(
+        &mut self,
+        binding: &DropboxBinding,
+    ) -> Result<DropboxBindingWrite, JournalError> {
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite("begin Dropbox root binding", &database_path, source))?;
+        let inserted = transaction
+            .execute(
+                "INSERT INTO dropbox_binding(\
+                     singleton, account_id, root_namespace_id, remote_root\
+                 ) VALUES (1, ?1, ?2, ?3)\
+                 ON CONFLICT(singleton) DO NOTHING",
+                params![
+                    binding.account_id,
+                    binding.root_namespace_id,
+                    binding.remote_root
+                ],
+            )
+            .map_err(|source| sqlite("bind Dropbox account and root", &database_path, source))?;
+        let outcome = if inserted == 1 {
+            DropboxBindingWrite::Bound
+        } else {
+            let existing = transaction
+                .query_row(
+                    "SELECT account_id, root_namespace_id, remote_root \
+                     FROM dropbox_binding WHERE singleton = 1",
+                    [],
+                    |row| {
+                        Ok(DropboxBinding {
+                            account_id: row.get(0)?,
+                            root_namespace_id: row.get(1)?,
+                            remote_root: row.get(2)?,
+                        })
+                    },
+                )
+                .map_err(|source| {
+                    sqlite(
+                        "read Dropbox account and root binding",
+                        &database_path,
+                        source,
+                    )
+                })?;
+            if existing == *binding {
+                DropboxBindingWrite::AlreadyBound
+            } else {
+                DropboxBindingWrite::Mismatch { existing }
+            }
+        };
+        transaction
+            .commit()
+            .map_err(|source| sqlite("commit Dropbox root binding", &database_path, source))?;
+        Ok(outcome)
     }
 
     /// Publish a complete local inventory as one replacement transaction.
@@ -1226,6 +1309,18 @@ mod tests {
         directory.path().join("journal.sqlite3")
     }
 
+    fn dropbox_binding(
+        account_id: &str,
+        root_namespace_id: &str,
+        remote_root: &str,
+    ) -> DropboxBinding {
+        DropboxBinding {
+            account_id: String::from(account_id),
+            root_namespace_id: String::from(root_namespace_id),
+            remote_root: String::from(remote_root),
+        }
+    }
+
     fn recorded_plan(write: PlanWrite) -> Result<PlanRecord, JournalError> {
         match write {
             PlanWrite::Recorded(plan) => Ok(plan),
@@ -1299,6 +1394,61 @@ mod tests {
         assert_eq!(reopened.baseline(path)?, None);
         assert_eq!(plan.operations[0].operation, operation);
         assert_eq!(reopened.pending_plans()?, vec![plan]);
+        Ok(())
+    }
+
+    #[test]
+    fn journal_dropbox_binding_survives_reopen() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+        let binding = dropbox_binding("dbid:account", "namespace-1", "/omabox");
+        {
+            let mut journal = Journal::open(&database_path)?;
+            assert_eq!(
+                journal.bind_dropbox_root(&binding)?,
+                DropboxBindingWrite::Bound
+            );
+        }
+
+        let mut reopened = Journal::open(database_path)?;
+        assert_eq!(
+            reopened.bind_dropbox_root(&binding)?,
+            DropboxBindingWrite::AlreadyBound
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn journal_dropbox_binding_mismatch_never_replaces_existing() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+        let existing = dropbox_binding("dbid:account", "namespace-1", "/omabox");
+        let mismatches = [
+            dropbox_binding("dbid:other", "namespace-1", "/omabox"),
+            dropbox_binding("dbid:account", "namespace-2", "/omabox"),
+            dropbox_binding("dbid:account", "namespace-1", "/other"),
+        ];
+        {
+            let mut journal = Journal::open(&database_path)?;
+            assert_eq!(
+                journal.bind_dropbox_root(&existing)?,
+                DropboxBindingWrite::Bound
+            );
+            for mismatch in mismatches {
+                assert_eq!(
+                    journal.bind_dropbox_root(&mismatch)?,
+                    DropboxBindingWrite::Mismatch {
+                        existing: existing.clone()
+                    }
+                );
+            }
+        }
+
+        let mut reopened = Journal::open(database_path)?;
+        assert_eq!(
+            reopened.bind_dropbox_root(&existing)?,
+            DropboxBindingWrite::AlreadyBound
+        );
         Ok(())
     }
 
