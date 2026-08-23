@@ -1,6 +1,6 @@
 # Omabox
 
-Omabox is a native, ARM64-first Dropbox sync service for Omarchy. It is planned in Go and uses Dropbox's documented API and OAuth flow, never a private protocol.
+Omabox is a native, ARM64-first Dropbox sync service for Omarchy. It is written in Rust nightly and uses Dropbox's documented API and OAuth flow, never a private protocol.
 
 ## Product shape
 
@@ -21,8 +21,9 @@ Omabox is a native, ARM64-first Dropbox sync service for Omarchy. It is planned 
 
 ## Development
 
+- Follow `~/.agents/docs/rust.md` for all Rust code; repository rules may be stricter.
 - Use `jj` and keep commits small and focused.
-- Run `gofmt`, `go vet`, and `go test` before landing Go changes.
+- Run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` before landing Rust changes.
 - Separate real Dropbox API integration tests from unit tests.
 - Never weaken a safety invariant to make a test pass.
 - Never commit credentials, OAuth tokens, test accounts, or other secrets.
