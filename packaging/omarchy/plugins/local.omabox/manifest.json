@@ -13,7 +13,7 @@
   },
   "barWidget": {
     "displayName": "Omabox",
-    "description": "Shows the active transfer, progress, queue health, conflicts, and service state.",
+    "description": "Shows the active transfer, progress, queue, and service state.",
     "category": "Files",
     "allowMultiple": false,
     "defaultSection": "right"

@@ -34,9 +34,7 @@ Item {
 
     var phases = ["starting", "syncing", "waiting", "backoff", "error"]
     if (!value || Array.isArray(value) || value.version !== 1
-        || phases.indexOf(value.phase) < 0 || !value.counts
-        || Array.isArray(value.counts) || !isCount(value.counts.queued)
-        || !isCount(value.counts.conflicts)
+        || phases.indexOf(value.phase) < 0 || !isCount(value.queued)
         || !isCount(value.updated_at) || value.updated_at === 0
         || (value.last_successful_pass !== null && !isCount(value.last_successful_pass))
         || (value.last_error !== null && typeof value.last_error !== "string")) return null

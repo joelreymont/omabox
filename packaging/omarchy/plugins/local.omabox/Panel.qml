@@ -13,12 +13,12 @@ Panel {
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property var snapshot: status.snapshot
   readonly property var transfer: status.transfer
-  readonly property var counts: snapshot ? snapshot.counts : ({ queued: 0, conflicts: 0 })
-  readonly property bool needsAttention: status.availability === "malformed" || status.stale
-    || (snapshot && snapshot.phase === "error") || counts.conflicts > 0
+  readonly property real queued: snapshot ? snapshot.queued : 0
+  readonly property bool alerting: status.availability === "malformed" || status.stale
+    || (snapshot && snapshot.phase === "error")
   readonly property bool inactive: status.availability === "missing" || status.stale
     || (snapshot && snapshot.phase === "backoff")
-  readonly property color stateColor: needsAttention ? urgent : (inactive ? dim : foreground)
+  readonly property color stateColor: alerting ? urgent : (inactive ? dim : foreground)
   readonly property string stateTitle: titleForState()
   readonly property string stateDetail: detailForState()
 
@@ -29,7 +29,6 @@ Panel {
     if (!snapshot) return "Unavailable"
     if (snapshot.phase === "error") return "Sync error"
     if (snapshot.phase === "backoff") return "Offline · retrying"
-    if (counts.conflicts > 0) return "Conflicts need attention"
     if (snapshot.phase === "starting") return "Starting"
     if (snapshot.phase === "syncing") return "Syncing"
     return "Up to date"
@@ -138,7 +137,7 @@ Panel {
             visible: root.stateDetail !== ""
             width: parent.width
             text: root.stateDetail
-            color: root.needsAttention ? root.urgent : root.dim
+            color: root.alerting ? root.urgent : root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
             wrapMode: Text.WordWrap
@@ -178,8 +177,7 @@ Panel {
             foreground: root.foreground
             fontFamily: root.fontFamily
           }
-          InfoPair { label: "Queued"; value: String(root.counts.queued) }
-          InfoPair { label: "Conflicts"; value: String(root.counts.conflicts); alarming: root.counts.conflicts > 0 }
+          InfoPair { label: "Queued"; value: String(root.queued) }
           InfoPair {
             label: "Last successful sync"
             value: root.snapshot ? root.relativeTime(root.snapshot.last_successful_pass) : "Unavailable"
@@ -191,7 +189,6 @@ Panel {
   component InfoPair: Row {
     property string label: ""
     property string value: ""
-    property bool alarming: false
 
     width: parent.width
     spacing: Style.space(8)
@@ -209,10 +206,9 @@ Panel {
     }
     Text {
       text: value
-      color: alarming ? root.urgent : root.foreground
+      color: root.foreground
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
-      font.bold: alarming
       elide: Text.ElideRight
     }
   }
