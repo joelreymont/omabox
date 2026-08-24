@@ -25,7 +25,8 @@ use crate::planner::plan;
 use crate::recovery::{
     RecoveryError, RecoveryMaterialization, ReplayBlocked, ReplayReport, destination,
     materialize_before_plan, materialize_local_conflict, materialize_remote_conflict,
-    prune_completed_recoveries, replay_local_operations, replay_remote_operations,
+    prune_completed_recoveries, replay_local_operations, replay_local_plans,
+    replay_remote_operations,
 };
 
 const MAX_PARALLEL_DOWNLOADS: usize = 4;
@@ -181,26 +182,31 @@ pub fn replay_pending(
         })
         .collect::<BTreeSet<_>>();
     if !missing_downloads.is_empty() {
-        let pending = journal
+        let mut pending = journal
             .pending_plans()?
             .into_iter()
             .map(|plan| (plan.path.clone(), plan))
             .collect::<BTreeMap<_, _>>();
         let mut downloads = Vec::with_capacity(missing_downloads.len());
         for path in missing_downloads {
-            let source = pending
-                .get(&path)
-                .and_then(|plan| {
-                    plan.operations.iter().find_map(|planned| {
-                        if planned.status == crate::journal::RecordStatus::Completed {
-                            return None;
-                        }
-                        match &planned.operation {
-                            Operation::InstallLocal { source }
-                            | Operation::ReplaceLocal { source, .. } => Some(source.clone()),
-                            _ => None,
-                        }
-                    })
+            let Some(plan) = pending.remove(&path) else {
+                return Err(invalid(
+                    &path,
+                    "pending download blocker has no matching plan",
+                ));
+            };
+            let source = plan
+                .operations
+                .iter()
+                .find_map(|planned| {
+                    if planned.status == crate::journal::RecordStatus::Completed {
+                        return None;
+                    }
+                    match &planned.operation {
+                        Operation::InstallLocal { source }
+                        | Operation::ReplaceLocal { source, .. } => Some(source.clone()),
+                        _ => None,
+                    }
                 })
                 .ok_or_else(|| {
                     invalid(
@@ -208,14 +214,24 @@ pub fn replay_pending(
                         "pending download blocker has no matching local operation",
                     )
                 })?;
-            downloads.push(PendingDownload { path, source });
+            downloads.push(PendingDownload { path, source, plan });
         }
-        require_active_local_root(journal, sync_root)?;
-        stage_pending_downloads(dropbox, sync_root, &downloads)?;
-        require_active_local_root(journal, sync_root)?;
-        let resumed = replay_local_operations(journal, sync_root, recovery_directory)?;
-        report.completed_operations += resumed.completed_operations;
-        report.blocked = resumed.blocked;
+        report
+            .blocked
+            .retain(|blocked| !matches!(blocked, ReplayBlocked::DownloadRequired { .. }));
+        for batch in downloads.chunks(MAX_PARALLEL_DOWNLOADS) {
+            require_active_local_root(journal, sync_root)?;
+            stage_pending_downloads(dropbox, sync_root, batch)?;
+            require_active_local_root(journal, sync_root)?;
+            let resumed = replay_local_plans(
+                journal,
+                sync_root,
+                recovery_directory,
+                batch.iter().map(|download| &download.plan),
+            )?;
+            report.completed_operations += resumed.completed_operations;
+            report.blocked.extend(resumed.blocked);
+        }
     }
     require_active_local_root(journal, sync_root)?;
     let remote = replay_remote_operations(
@@ -462,6 +478,7 @@ fn prepare_plan(
 struct PendingDownload {
     path: PathBuf,
     source: RemoteFile,
+    plan: PlanRecord,
 }
 
 fn stage_pending_downloads(

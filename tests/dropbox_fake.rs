@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -380,6 +380,62 @@ fn pending_exact_downloads_use_bounded_parallel_workers() -> Result<(), Box<dyn 
     );
     assert!(maximum_active >= 2);
     assert!(maximum_active <= 4);
+    Ok(())
+}
+
+#[test]
+fn completed_download_batch_is_installed_before_the_next_batch_fails() -> Result<(), Box<dyn Error>>
+{
+    const DOWNLOAD_COUNT: usize = 5;
+    const COMPLETED_BATCH: usize = 4;
+
+    let bytes = b"install each bounded batch";
+    let content = dropbox_content_hash(bytes.as_slice())?;
+    let remote = RemoteFile::new(content.clone(), DropboxRevision::new("batch-revision"));
+    let metadata = download_metadata("batch.txt", remote.revision.as_str(), &content);
+    let mut responses = (0..COMPLETED_BATCH)
+        .map(|_| FakeResponse::bytes(bytes.to_vec()).header("Dropbox-API-Result", metadata.clone()))
+        .collect::<Vec<_>>();
+    responses.push(FakeResponse::status_json(
+        500,
+        json!({"error": "later batch"}),
+    ));
+    let server = FakeServer::start(responses)?;
+    let client = fake_client(&server, "opaque-access-batches")?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    let operation_plan = planned_operations(plan(
+        &Baseline::Absent,
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(remote),
+    ))?;
+    let paths = (0..DOWNLOAD_COUNT)
+        .map(|index| PathBuf::from(format!("batch-{index}.txt")))
+        .collect::<Vec<_>>();
+    for path in &paths {
+        if !matches!(
+            journal.record_plan(path, &operation_plan)?,
+            PlanWrite::Recorded(_)
+        ) {
+            return Err(io::Error::other("fresh batch plan was already pending").into());
+        }
+    }
+
+    assert!(replay_pending(&mut journal, &client, &root, &staging, &recovery).is_err());
+
+    for path in &paths[..COMPLETED_BATCH] {
+        assert_eq!(std::fs::read(root.join(path))?, bytes);
+    }
+    assert!(!root.join(&paths[COMPLETED_BATCH]).exists());
+    assert_eq!(journal.pending_plans()?.len(), 1);
+    assert_eq!(server.finish()?.len(), DOWNLOAD_COUNT);
     Ok(())
 }
 

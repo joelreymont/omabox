@@ -9,8 +9,9 @@ use thiserror::Error;
 
 use crate::dropbox::{DropboxClient, DropboxError, MutationOutcome, RemotePathState};
 use crate::journal::{
-    Journal, JournalError, OperationCompletion, PlanConflictCompletion, PlannedOperation,
-    RecordStatus, RecoveryCompletion, RecoveryForget, RecoveryRecord, RecoveryWrite,
+    Journal, JournalError, OperationCompletion, PlanConflictCompletion, PlanRecord,
+    PlannedOperation, RecordStatus, RecoveryCompletion, RecoveryForget, RecoveryRecord,
+    RecoveryWrite,
 };
 use crate::local::{
     ConflictOutcome, ConflictSide, DeleteOutcome, InstallOutcome, LocalError, StageOutcome,
@@ -387,6 +388,15 @@ pub fn replay_local_operations(
     let sync_root = sync_root.as_ref();
     let recovery_directory = recovery_directory.as_ref();
     let plans = journal.pending_plans()?;
+    replay_local_plans(journal, sync_root, recovery_directory, plans.iter())
+}
+
+pub(crate) fn replay_local_plans<'a>(
+    journal: &mut Journal,
+    sync_root: &Path,
+    recovery_directory: &Path,
+    plans: impl IntoIterator<Item = &'a PlanRecord>,
+) -> Result<ReplayReport, RecoveryError> {
     let mut report = ReplayReport::default();
 
     for plan in plans {
