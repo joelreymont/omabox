@@ -32,7 +32,7 @@ Panel {
     if (snapshot.phase === "syncing") return "Syncing"
     if (snapshot.phase === "waiting") return "Up to date"
     if (snapshot.phase === "backoff") return "Offline · retrying"
-    if (snapshot.phase === "blocked") return "Sync blocked"
+    if (snapshot.phase === "blocked") return "Files need attention"
     return "Sync error"
   }
 
@@ -180,7 +180,7 @@ Panel {
             fontFamily: root.fontFamily
           }
           InfoPair { label: "Queued"; value: String(root.counts.queued) }
-          InfoPair { label: "Blocked"; value: String(root.counts.blocked); alarming: root.counts.blocked > 0 }
+          InfoPair { label: "Unable to sync"; value: String(root.counts.blocked); alarming: root.counts.blocked > 0 }
           InfoPair { label: "Conflicts"; value: String(root.counts.conflicts); alarming: root.counts.conflicts > 0 }
           InfoPair {
             label: "Last successful sync"
