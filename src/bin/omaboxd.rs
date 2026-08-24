@@ -1,5 +1,6 @@
 #![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+use std::error::Error as StdError;
 use std::time::Duration;
 
 use miette::Diagnostic;
@@ -30,7 +31,20 @@ fn run() -> Result<(), DaemonError> {
             operation: "open the journal",
             source,
         })?;
+    loop {
+        match run_session(&config, &mut journal) {
+            Ok(()) => continue,
+            Err(error) => {
+                let Some(delay) = rate_limit_delay(&error) else {
+                    return Err(error);
+                };
+                wait_for_rate_limit(delay);
+            }
+        }
+    }
+}
 
+fn run_session(config: &Config, journal: &mut Journal) -> Result<(), DaemonError> {
     let StoredCredential {
         binding: credential_binding,
         refresh_token,
@@ -61,7 +75,7 @@ fn run() -> Result<(), DaemonError> {
         })?;
     let dropbox = DropboxClient::new(refreshed.access_token, root);
     match dropbox
-        .validate_account(&mut journal)
+        .validate_account(journal)
         .map_err(|source| DaemonError::Dropbox {
             operation: "validate the Dropbox account and root",
             source,
@@ -77,15 +91,25 @@ fn run() -> Result<(), DaemonError> {
     tracing::info!("Omabox daemon started");
     let mut long_poll_backoff: Option<Duration> = None;
     loop {
-        match reconcile_once(
-            &mut journal,
+        let outcome = match reconcile_once(
+            journal,
             &dropbox,
             config.sync_root(),
             config.paths().upload_staging_directory(),
             config.paths().recovery_directory(),
         )
-        .map_err(|source| DaemonError::Reconcile { source })?
+        .map_err(|source| DaemonError::Reconcile { source })
         {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let Some(delay) = rate_limit_delay(&error) else {
+                    return Err(error);
+                };
+                wait_for_rate_limit(delay);
+                continue;
+            }
+        };
+        match outcome {
             ReconcileOutcome::Complete(report) => tracing::info!(
                 replayed_operations = report.replayed_operations,
                 noops = report.noops,
@@ -112,16 +136,49 @@ fn run() -> Result<(), DaemonError> {
             })?
             .cursor
             .ok_or(DaemonError::MissingRemoteCursor)?;
-        let wakeup = dropbox
+        let wakeup = match dropbox
             .long_poll(&cursor, LONG_POLL_TIMEOUT)
             .map_err(|source| DaemonError::Dropbox {
                 operation: "wait for Dropbox changes",
                 source,
-            })?;
+            }) {
+            Ok(wakeup) => wakeup,
+            Err(error) => {
+                let Some(delay) = rate_limit_delay(&error) else {
+                    return Err(error);
+                };
+                wait_for_rate_limit(delay);
+                continue;
+            }
+        };
         long_poll_backoff = match wakeup {
             LongPollWakeup::Changes { backoff } | LongPollWakeup::TimedOut { backoff } => backoff,
             LongPollWakeup::CursorReset => None,
         };
+    }
+}
+
+fn wait_for_rate_limit(delay: Duration) {
+    tracing::warn!(
+        seconds = delay.as_secs(),
+        "Dropbox rate limited the daemon; retrying after its requested delay"
+    );
+    std::thread::sleep(delay);
+}
+
+fn rate_limit_delay(error: &DaemonError) -> Option<Duration> {
+    let mut source: &(dyn StdError + 'static) = error;
+    loop {
+        if let Some(AuthError::RateLimited { retry_after, .. }) = source.downcast_ref::<AuthError>()
+        {
+            return *retry_after;
+        }
+        if let Some(DropboxError::RateLimited { retry_after, .. }) =
+            source.downcast_ref::<DropboxError>()
+        {
+            return *retry_after;
+        }
+        source = source.source()?;
     }
 }
 
@@ -255,6 +312,9 @@ enum DaemonError {
 #[cfg(test)]
 mod tests {
     use std::error::Error;
+    use std::path::PathBuf;
+
+    use omabox::recovery::RecoveryError;
 
     use super::*;
 
@@ -282,5 +342,75 @@ mod tests {
         let root = root_from_bindings(Some(expected.clone()), &expected)?;
         assert_eq!(root, DropboxRoot::from_binding(&expected)?);
         Ok(())
+    }
+
+    #[test]
+    fn supplied_rate_limit_delays_cross_typed_error_boundaries() {
+        let auth_delay = Duration::from_secs(11);
+        let auth = DaemonError::Auth {
+            operation: "refresh Dropbox access",
+            source: AuthError::RateLimited {
+                operation: "refresh access token",
+                retry_after: Some(auth_delay),
+            },
+        };
+        assert_eq!(rate_limit_delay(&auth), Some(auth_delay));
+
+        let dropbox_delay = Duration::from_secs(13);
+        let dropbox = DaemonError::Dropbox {
+            operation: "wait for Dropbox changes",
+            source: DropboxError::RateLimited {
+                operation: "long poll",
+                retry_after: Some(dropbox_delay),
+            },
+        };
+        assert_eq!(rate_limit_delay(&dropbox), Some(dropbox_delay));
+
+        let reconcile_delay = Duration::from_secs(17);
+        let reconcile = DaemonError::Reconcile {
+            source: ReconcileError::Dropbox {
+                source: DropboxError::RateLimited {
+                    operation: "list folder",
+                    retry_after: Some(reconcile_delay),
+                },
+            },
+        };
+        assert_eq!(rate_limit_delay(&reconcile), Some(reconcile_delay));
+
+        let recovery_delay = Duration::from_secs(19);
+        let recovery = DaemonError::Reconcile {
+            source: ReconcileError::Recovery {
+                source: RecoveryError::Dropbox {
+                    path: PathBuf::from("notes.txt"),
+                    source: DropboxError::RateLimited {
+                        operation: "replace file",
+                        retry_after: Some(recovery_delay),
+                    },
+                },
+            },
+        };
+        assert_eq!(rate_limit_delay(&recovery), Some(recovery_delay));
+    }
+
+    #[test]
+    fn missing_delays_and_other_errors_remain_fatal() {
+        let missing_delay = DaemonError::Auth {
+            operation: "refresh Dropbox access",
+            source: AuthError::RateLimited {
+                operation: "refresh access token",
+                retry_after: None,
+            },
+        };
+        assert_eq!(rate_limit_delay(&missing_delay), None);
+
+        let ordinary_dropbox = DaemonError::Dropbox {
+            operation: "wait for Dropbox changes",
+            source: DropboxError::HttpStatus {
+                operation: "long poll",
+                status: 503,
+            },
+        };
+        assert_eq!(rate_limit_delay(&ordinary_dropbox), None);
+        assert_eq!(rate_limit_delay(&DaemonError::SetupRequired), None);
     }
 }
