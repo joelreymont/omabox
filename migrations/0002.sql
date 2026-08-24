@@ -4,7 +4,10 @@ CREATE TABLE recovery_records_v2 (
     original_path BLOB NOT NULL,
     recovery_path BLOB NOT NULL,
     content_json TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('pending', 'completed'))
+    status TEXT NOT NULL CHECK (status IN ('pending', 'completed')),
+    retained_at INTEGER CHECK (
+        retained_at IS NULL OR (status = 'completed' AND retained_at >= 0)
+    )
 ) STRICT;
 
 INSERT INTO recovery_records_v2(
@@ -13,16 +16,26 @@ INSERT INTO recovery_records_v2(
     original_path,
     recovery_path,
     content_json,
-    status
+    status,
+    retained_at
 )
 SELECT
-    id,
-    operation_id,
-    original_path,
-    recovery_path,
-    content_json,
-    status
-FROM recovery_records;
+    recovery_records.id,
+    recovery_records.operation_id,
+    recovery_records.original_path,
+    recovery_records.recovery_path,
+    recovery_records.content_json,
+    recovery_records.status,
+    CASE
+        WHEN recovery_records.status = 'completed'
+         AND operations.status = 'completed'
+         AND plans.status = 'completed'
+        THEN unixepoch()
+        ELSE NULL
+    END
+FROM recovery_records
+JOIN operations ON operations.id = recovery_records.operation_id
+JOIN plans ON plans.id = operations.plan_id;
 
 DROP TABLE recovery_records;
 ALTER TABLE recovery_records_v2 RENAME TO recovery_records;

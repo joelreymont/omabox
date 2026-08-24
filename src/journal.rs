@@ -359,6 +359,8 @@ pub struct RecoveryRecord {
     pub content: ContentIdentity,
     /// Durable completion state.
     pub status: RecordStatus,
+    /// Retention start in seconds since the Unix epoch, set when destructive work commits.
+    pub retained_at: Option<u64>,
 }
 
 /// Result of recording recovery intent.
@@ -1051,7 +1053,10 @@ impl Journal {
                          JOIN recovery_records \
                            ON recovery_records.operation_id = operations.id \
                          WHERE operations.plan_id = plans.id \
-                           AND recovery_records.status = 'pending' \
+                           AND ( \
+                               recovery_records.status = 'pending' \
+                               OR recovery_records.retained_at IS NULL \
+                           ) \
                      ) \
                      ORDER BY plans.id",
                 )
@@ -1210,6 +1215,7 @@ impl Journal {
                 [plan_id],
             )
             .map_err(|source| sqlite("complete plan", &path, source))?;
+        start_recovery_retention(&transaction, plan_id, &path)?;
         transaction
             .commit()
             .map_err(|source| sqlite("commit plan and baseline", &database_path, source))?;
@@ -1264,6 +1270,7 @@ impl Journal {
                 [plan_id.0],
             )
             .map_err(|source| sqlite("complete conflicted plan", &path, source))?;
+        start_recovery_retention(&transaction, plan_id.0, &path)?;
         transaction
             .commit()
             .map_err(|source| sqlite("commit plan conflict", &database_path, source))?;
@@ -1411,7 +1418,7 @@ impl Journal {
             .map_err(|source| sqlite("record recovery intent", &original_path, source))?;
         let recovery_id = RecoveryId(transaction.last_insert_rowid());
         let record =
-            read_recovery(&transaction, &database_path, recovery_id)?.ok_or_else(|| {
+            read_recovery(&transaction, &database_path, recovery_id, true)?.ok_or_else(|| {
                 JournalError::InvalidState {
                     operation: "read recorded recovery intent",
                     path: original_path.clone(),
@@ -1431,11 +1438,15 @@ impl Journal {
             &self.database_path,
             "pending",
             "read pending recovery",
+            self.schema_version >= 2,
         )
     }
 
     /// Load retained recovery metadata whose payload is no longer needed by pending work.
     pub fn completed_recoveries(&self) -> Result<Vec<RecoveryRecord>, JournalError> {
+        if self.schema_version < 2 {
+            return Ok(Vec::new());
+        }
         let mut statement = self
             .connection
             .prepare(
@@ -1443,6 +1454,7 @@ impl Journal {
                  LEFT JOIN operations ON operations.id = recovery_records.operation_id \
                  LEFT JOIN plans ON plans.id = operations.plan_id \
                  WHERE recovery_records.status = 'completed' \
+                   AND recovery_records.retained_at IS NOT NULL \
                    AND ( \
                        operations.id IS NULL \
                        OR (operations.status = 'completed' AND plans.status = 'completed') \
@@ -1469,13 +1481,12 @@ impl Journal {
         drop(statement);
         ids.into_iter()
             .map(|id| {
-                read_recovery(&self.connection, &self.database_path, RecoveryId(id))?.ok_or_else(
-                    || JournalError::InvalidState {
+                read_recovery(&self.connection, &self.database_path, RecoveryId(id), true)?
+                    .ok_or_else(|| JournalError::InvalidState {
                         operation: "read completed recovery",
                         path: self.database_path.clone(),
                         detail: "eligible recovery disappeared while reading the journal",
-                    },
-                )
+                    })
             })
             .collect()
     }
@@ -1524,8 +1535,10 @@ impl Journal {
         let state = transaction
             .query_row(
                 "SELECT recovery_records.status, \
-                        operations.id IS NULL OR ( \
-                            operations.status = 'completed' AND plans.status = 'completed' \
+                        recovery_records.retained_at IS NOT NULL AND ( \
+                            operations.id IS NULL OR ( \
+                                operations.status = 'completed' AND plans.status = 'completed' \
+                            ) \
                         ) \
                  FROM recovery_records \
                  LEFT JOIN operations ON operations.id = recovery_records.operation_id \
@@ -1674,6 +1687,24 @@ fn write_baseline(
                 .map_err(|source| sqlite("record present baseline", path, source))
         }
     }
+}
+
+fn start_recovery_retention(
+    connection: &Connection,
+    plan_id: i64,
+    path: &Path,
+) -> Result<(), JournalError> {
+    connection
+        .execute(
+            "UPDATE recovery_records SET retained_at = unixepoch() \
+             WHERE status = 'completed' AND retained_at IS NULL \
+               AND operation_id IN ( \
+                   SELECT id FROM operations WHERE plan_id = ?1 \
+               )",
+            [plan_id],
+        )
+        .map(|_| ())
+        .map_err(|source| sqlite("start recovery retention", path, source))
 }
 
 fn read_local_root(
@@ -1838,7 +1869,7 @@ fn read_recovery_for_operation(
         )
         .optional()
         .map_err(|source| sqlite("find operation recovery", database_path, source))?;
-    id.map(|id| read_recovery(connection, database_path, RecoveryId(id)))
+    id.map(|id| read_recovery(connection, database_path, RecoveryId(id), true))
         .transpose()
         .map(Option::flatten)
 }
@@ -1848,6 +1879,7 @@ fn read_recoveries_with_status(
     database_path: &Path,
     status: &'static str,
     operation: &'static str,
+    has_retained_at: bool,
 ) -> Result<Vec<RecoveryRecord>, JournalError> {
     let mut statement = connection
         .prepare("SELECT id FROM recovery_records WHERE status = ?1 ORDER BY id")
@@ -1862,13 +1894,13 @@ fn read_recoveries_with_status(
 
     ids.into_iter()
         .map(|id| {
-            read_recovery(connection, database_path, RecoveryId(id))?.ok_or_else(|| {
-                JournalError::InvalidState {
+            read_recovery(connection, database_path, RecoveryId(id), has_retained_at)?.ok_or_else(
+                || JournalError::InvalidState {
                     operation,
                     path: database_path.to_path_buf(),
                     detail: "selected recovery disappeared while reading the journal",
-                }
-            })
+                },
+            )
         })
         .collect()
 }
@@ -1877,28 +1909,42 @@ fn read_recovery(
     connection: &Connection,
     database_path: &Path,
     recovery_id: RecoveryId,
+    has_retained_at: bool,
 ) -> Result<Option<RecoveryRecord>, JournalError> {
+    let query = if has_retained_at {
+        "SELECT operation_id, original_path, recovery_path, content_json, status, retained_at \
+         FROM recovery_records WHERE id = ?1"
+    } else {
+        "SELECT operation_id, original_path, recovery_path, content_json, status, NULL \
+         FROM recovery_records WHERE id = ?1"
+    };
     let row = connection
-        .query_row(
-            "SELECT operation_id, original_path, recovery_path, content_json, status \
-             FROM recovery_records WHERE id = ?1",
-            [recovery_id.0],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            },
-        )
+        .query_row(query, [recovery_id.0], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+            ))
+        })
         .optional()
         .map_err(|source| sqlite("read recovery", database_path, source))?;
-    let Some((operation_id, raw_original, raw_recovery, content_json, status)) = row else {
+    let Some((operation_id, raw_original, raw_recovery, content_json, status, retained_at)) = row
+    else {
         return Ok(None);
     };
     let original_path = bytes_path(raw_original);
+    let retained_at = retained_at
+        .map(|value| {
+            u64::try_from(value).map_err(|_| JournalError::InvalidState {
+                operation: "read recovery retention start",
+                path: original_path.clone(),
+                detail: "recovery retention start is outside the supported range",
+            })
+        })
+        .transpose()?;
     Ok(Some(RecoveryRecord {
         id: recovery_id,
         operation_id: OperationId(operation_id),
@@ -1909,6 +1955,7 @@ fn read_recovery(
             &original_path,
         )?,
         status: decode_status(&status, "read recovery status", &original_path)?,
+        retained_at,
         original_path,
     }))
 }
@@ -2637,6 +2684,16 @@ mod tests {
             reopened.complete_recovery(recovery.id)?,
             RecoveryCompletion::Completed
         );
+        let completed_copy =
+            read_recovery(&reopened.connection, &database_path, recovery.id, true)?.ok_or_else(
+                || JournalError::InvalidState {
+                    operation: "read completed test recovery copy",
+                    path: path.to_path_buf(),
+                    detail: "completed test recovery disappeared",
+                },
+            )?;
+        assert_eq!(completed_copy.status, RecordStatus::Completed);
+        assert_eq!(completed_copy.retained_at, None);
         assert!(reopened.completed_recoveries()?.is_empty());
         assert_eq!(
             reopened.forget_completed_recovery(recovery.id)?,
@@ -2651,11 +2708,30 @@ mod tests {
             OperationCompletion::AlreadyCompleted
         );
         assert_eq!(reopened.baseline(path)?, Some(target));
+        let eligible = reopened.completed_recoveries()?;
+        let [eligible] = eligible.as_slice() else {
+            return Err(JournalError::InvalidState {
+                operation: "read retained test recovery",
+                path: path.to_path_buf(),
+                detail: "test expected exactly one retained recovery",
+            }
+            .into());
+        };
+        let Some(retained_at) = eligible.retained_at else {
+            return Err(JournalError::InvalidState {
+                operation: "read retained test recovery",
+                path: path.to_path_buf(),
+                detail: "completed destructive operation did not start retention",
+            }
+            .into());
+        };
+        assert!(retained_at > 0);
         let completed = RecoveryRecord {
             status: RecordStatus::Completed,
+            retained_at: Some(retained_at),
             ..recovery.clone()
         };
-        assert_eq!(reopened.completed_recoveries()?, vec![completed]);
+        assert_eq!(eligible, &completed);
         assert_eq!(reopened.prune_completed_work()?, 1);
         assert!(read_plan(&reopened.connection, &database_path, plan.id)?.is_none());
         let fresh = operations(crate::planner::plan(
@@ -2669,6 +2745,7 @@ mod tests {
             reopened.completed_recoveries()?,
             vec![RecoveryRecord {
                 status: RecordStatus::Completed,
+                retained_at: Some(retained_at),
                 ..recovery.clone()
             }]
         );
@@ -2719,11 +2796,45 @@ mod tests {
                     encode(&content("old"), "test", path)?
                 ],
             )?;
+            connection.execute(
+                "INSERT INTO plans(id, path, status) VALUES (11, ?1, 'pending')",
+                [path_bytes(Path::new("pending.txt"))],
+            )?;
+            connection.execute(
+                "INSERT INTO operations( \
+                     id, plan_id, ordinal, operation_json, status \
+                 ) VALUES (21, 11, 0, ?1, 'pending')",
+                [encode(&operation, "test", Path::new("pending.txt"))?],
+            )?;
+            connection.execute(
+                "INSERT INTO recovery_records( \
+                     id, operation_id, original_path, recovery_path, content_json, status \
+                 ) VALUES (31, 21, ?1, ?2, ?3, 'pending')",
+                params![
+                    path_bytes(Path::new("pending.txt")),
+                    path_bytes(Path::new("recovery/pending.txt")),
+                    encode(&content("pending"), "test", Path::new("pending.txt"))?
+                ],
+            )?;
         }
 
         let legacy = Journal::open_read_only(&database_path)?;
         assert_eq!(legacy.baseline(path)?, None);
         assert_eq!(legacy.local_root_binding()?, None);
+        assert_eq!(legacy.pending_plans()?.len(), 1);
+        assert_eq!(
+            legacy.pending_recoveries()?,
+            vec![RecoveryRecord {
+                id: RecoveryId(31),
+                operation_id: OperationId(21),
+                original_path: PathBuf::from("pending.txt"),
+                recovery_path: PathBuf::from("recovery/pending.txt"),
+                content: content("pending"),
+                status: RecordStatus::Pending,
+                retained_at: None,
+            }]
+        );
+        assert!(legacy.completed_recoveries()?.is_empty());
         drop(legacy);
 
         let journal = Journal::open(&database_path)?;
@@ -2731,17 +2842,25 @@ mod tests {
         assert_eq!(journal.baseline(path)?, None);
         assert!(journal.baseline_paths()?.is_empty());
         assert!(read_plan(&journal.connection, &database_path, PlanId(10))?.is_none());
-        assert_eq!(
-            journal.completed_recoveries()?,
-            vec![RecoveryRecord {
-                id: RecoveryId(30),
-                operation_id: OperationId(20),
-                original_path: path.to_path_buf(),
-                recovery_path: PathBuf::from("recovery/removed.txt"),
-                content: content("old"),
-                status: RecordStatus::Completed,
-            }]
-        );
+        let migrated = journal.completed_recoveries()?;
+        let [migrated] = migrated.as_slice() else {
+            return Err(JournalError::InvalidState {
+                operation: "read migrated recovery",
+                path: path.to_path_buf(),
+                detail: "test expected exactly one migrated recovery",
+            }
+            .into());
+        };
+        assert_eq!(migrated.id, RecoveryId(30));
+        assert_eq!(migrated.operation_id, OperationId(20));
+        assert_eq!(migrated.original_path, path);
+        assert_eq!(migrated.recovery_path, Path::new("recovery/removed.txt"));
+        assert_eq!(migrated.content, content("old"));
+        assert_eq!(migrated.status, RecordStatus::Completed);
+        assert!(migrated.retained_at.is_some());
+        assert_eq!(journal.pending_plans()?.len(), 1);
+        assert_eq!(journal.pending_recoveries()?.len(), 1);
+        assert_eq!(journal.pending_recoveries()?[0].retained_at, None);
         let version = journal
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
@@ -2836,10 +2955,42 @@ mod tests {
                 &Observation::Present(baseline_file.clone()),
             ))?;
             let plan = recorded_plan(journal.record_plan(path, &operations)?)?;
+            let [preservation, destructive] = plan.operations.as_slice() else {
+                return Err(JournalError::InvalidState {
+                    operation: "prepare conflicted recovery test",
+                    path: path.to_path_buf(),
+                    detail: "test expected preservation followed by destruction",
+                }
+                .into());
+            };
+            assert_eq!(
+                journal.complete_operation(preservation.id, None)?,
+                OperationCompletion::OperationCompleted
+            );
+            let recovery = recorded_recovery(
+                journal
+                    .record_recovery_intent(destructive.id, Path::new("recovery/conflict.txt"))?,
+            )?;
+            assert_eq!(
+                journal.complete_recovery(recovery.id)?,
+                RecoveryCompletion::Completed
+            );
+            let completed_copy =
+                read_recovery(&journal.connection, &database_path, recovery.id, true)?.ok_or_else(
+                    || JournalError::InvalidState {
+                        operation: "read conflicted recovery test",
+                        path: path.to_path_buf(),
+                        detail: "test recovery disappeared before conflict completion",
+                    },
+                )?;
+            assert_eq!(completed_copy.retained_at, None);
             assert_eq!(
                 journal.finish_plan_with_conflict(plan.id, &conflict)?,
                 PlanConflictCompletion::Recorded
             );
+            let retained = journal.completed_recoveries()?;
+            assert_eq!(retained.len(), 1);
+            assert!(retained[0].retained_at.is_some());
             assert_eq!(
                 journal.finish_plan_with_conflict(plan.id, &conflict)?,
                 PlanConflictCompletion::AlreadyCompleted
