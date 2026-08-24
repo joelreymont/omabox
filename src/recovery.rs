@@ -195,7 +195,7 @@ fn prune_completed_recoveries_at(
             }
         };
         if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile
-            || !expired_recovery(&before, now)
+            || !expired_recovery(&record, now)
         {
             continue;
         }
@@ -234,7 +234,6 @@ fn prune_completed_recoveries_at(
         if FileType::from_raw_mode(after.st_mode) != FileType::RegularFile
             || before.st_dev != after.st_dev
             || before.st_ino != after.st_ino
-            || !expired_recovery(&after, now)
         {
             continue;
         }
@@ -255,20 +254,14 @@ fn prune_completed_recoveries_at(
     Ok(forgotten)
 }
 
-fn expired_recovery(metadata: &rustix::fs::Stat, now: SystemTime) -> bool {
-    let Ok(seconds) = u64::try_from(metadata.st_mtime) else {
+fn expired_recovery(record: &RecoveryRecord, now: SystemTime) -> bool {
+    let Some(retained_at) = record.retained_at else {
         return false;
     };
-    let Ok(nanoseconds) = u32::try_from(metadata.st_mtime_nsec) else {
+    let Some(retained_since) = UNIX_EPOCH.checked_add(Duration::from_secs(retained_at)) else {
         return false;
     };
-    if nanoseconds >= 1_000_000_000 {
-        return false;
-    }
-    let Some(modified) = UNIX_EPOCH.checked_add(Duration::new(seconds, nanoseconds)) else {
-        return false;
-    };
-    now.duration_since(modified)
+    now.duration_since(retained_since)
         .is_ok_and(|age| age >= COMPLETED_RECOVERY_RETENTION)
 }
 
@@ -1181,7 +1174,7 @@ mod retention_tests {
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use tempfile::TempDir;
 
@@ -1205,9 +1198,25 @@ mod retention_tests {
             &content,
         )?;
         fs::write(&recovery.recovery_path, b"retained bytes")?;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&recovery.recovery_path)?
+            .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH))?;
         complete_recovery_and_plan(&mut journal, &plan, &recovery)?;
-        let modified = fs::metadata(&recovery.recovery_path)?.modified()?;
-        let boundary = checked_add(modified, COMPLETED_RECOVERY_RETENTION)?;
+        let completed = journal.completed_recoveries()?;
+        let [completed] = completed.as_slice() else {
+            return Err(test_error("test expected one retained recovery").into());
+        };
+        if completed.id != recovery.id {
+            return Err(test_error("test retained the wrong recovery").into());
+        }
+        let Some(retained_at) = completed.retained_at else {
+            return Err(test_error("test recovery retention did not start").into());
+        };
+        let Some(retained_since) = UNIX_EPOCH.checked_add(Duration::from_secs(retained_at)) else {
+            return Err(test_error("test recovery timestamp overflowed").into());
+        };
+        let boundary = checked_add(retained_since, COMPLETED_RECOVERY_RETENTION)?;
         let before_boundary = boundary
             .checked_sub(Duration::from_nanos(1))
             .ok_or_else(|| test_error("test timestamp underflowed"))?;

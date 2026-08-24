@@ -21,7 +21,7 @@ use crate::planner::plan;
 use crate::recovery::{
     RecoveryError, RecoveryMaterialization, ReplayBlocked, ReplayReport, destination,
     materialize_before_plan, materialize_local_conflict, materialize_remote_conflict,
-    replay_local_operations, replay_remote_operations,
+    prune_completed_recoveries, replay_local_operations, replay_remote_operations,
 };
 
 /// A reconciliation failure. Expected observation races are returned as outcomes instead.
@@ -337,6 +337,7 @@ fn reconcile_published(
     )?;
     report.replayed_operations += applied.completed_operations;
     journal.prune_completed_work()?;
+    prune_completed_recoveries(journal, recovery_directory)?;
     let retained_uploads = journal.pending_upload_content()?;
     let pending = journal.pending_plans()?;
     blocked_paths.extend(pending.into_iter().map(|plan| plan.path));
