@@ -1,9 +1,11 @@
 ---
 title: Prove the first-release acceptance path
-status: active
+status: closed
 priority: 2
 issue-type: task
-created-at: "\"2026-08-23T20:47:57.992059+02:00\""
+created-at: "\"\\\"2026-08-23T20:47:57.992059+02:00\\\"\""
+closed-at: "2026-08-24T02:12:20.434455+02:00"
+close-reason: acceptance safety fixes and integrated proof landed; all host and ARM64 checks pass
 blocks:
   - omabox-wire-reconciliation-daemon-9b8dd33a
 ---
