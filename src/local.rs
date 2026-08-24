@@ -1,5 +1,6 @@
 //! Root-confined local observation and crash-safe file phases.
 
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -366,6 +367,76 @@ pub fn stage_upload(
         });
     }
     map_stage_write(result, stage)
+}
+
+/// Remove verified content-addressed upload stages that no pending work retains.
+///
+/// Unknown names, non-regular entries, changing files, and content mismatches are
+/// preserved. The staging directory is synchronized once after all removals.
+pub(crate) fn remove_unreferenced_upload_stages(
+    staging_directory: impl AsRef<Path>,
+    retained_contents: &[ContentIdentity],
+) -> Result<usize, LocalError> {
+    let staging_directory = staging_directory.as_ref();
+    let directory = open_absolute_directory(
+        staging_directory,
+        "open upload staging directory for collection",
+    )?;
+    let retained = retained_contents
+        .iter()
+        .map(ContentIdentity::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut stream = Dir::read_from(&directory).map_err(|source| {
+        syscall_failure(
+            "open upload staging directory stream",
+            staging_directory,
+            source,
+        )
+    })?;
+    let mut names = Vec::new();
+    while let Some(entry) = stream.read() {
+        let entry = entry.map_err(|source| {
+            syscall_failure("read upload staging directory", staging_directory, source)
+        })?;
+        let bytes = entry.file_name().to_bytes();
+        if bytes != b"." && bytes != b".." {
+            names.push(OsStr::from_bytes(bytes).to_os_string());
+        }
+    }
+    names.sort();
+
+    let mut removed = 0;
+    for name in names {
+        let Some(expected) = content_addressed_upload_name(&name) else {
+            continue;
+        };
+        if retained.contains(expected) {
+            continue;
+        }
+        let path = staging_directory.join(&name);
+        if !verified_upload_stage_entry(&directory, &name, &path, expected)? {
+            continue;
+        }
+        match unlinkat(&directory, &name, AtFlags::empty()) {
+            Ok(()) => removed += 1,
+            Err(source) if source == rustix::io::Errno::NOENT => {}
+            Err(source) => {
+                return Err(syscall_failure(
+                    "remove unreferenced upload stage",
+                    &path,
+                    source,
+                ));
+            }
+        }
+    }
+    if removed != 0 {
+        sync_directory(
+            &directory,
+            staging_directory,
+            "sync upload stage collection",
+        )?;
+    }
+    Ok(removed)
 }
 
 /// Re-observe one root-confined upload source without changing staging state.
@@ -980,15 +1051,108 @@ fn require_content_hash(
     identity: &ContentIdentity,
     operation: &'static str,
 ) -> Result<(), LocalError> {
-    let value = identity.as_str().as_bytes();
-    if value.len() == 64
-        && value
-            .iter()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
-    {
+    if valid_content_hash_bytes(identity.as_str().as_bytes()) {
         Ok(())
     } else {
         Err(LocalError::InvalidContentIdentity { operation })
+    }
+}
+
+fn valid_content_hash_bytes(value: &[u8]) -> bool {
+    value.len() == 64
+        && value
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+fn content_addressed_upload_name(name: &OsStr) -> Option<&str> {
+    let bytes = name.as_bytes();
+    if valid_content_hash_bytes(bytes) {
+        std::str::from_utf8(bytes).ok()
+    } else {
+        None
+    }
+}
+
+fn verified_upload_stage_entry(
+    directory: &OwnedFd,
+    name: &OsStr,
+    path: &Path,
+    expected: &str,
+) -> Result<bool, LocalError> {
+    let Some(named) = open_upload_stage_candidate(
+        directory,
+        name,
+        OFlags::PATH | OFlags::NOFOLLOW,
+        path,
+        "inspect upload stage for collection",
+    )?
+    else {
+        return Ok(false);
+    };
+    let before = stat_fd(&named, path, "inspect upload stage for collection")?;
+    if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile {
+        return Ok(false);
+    }
+    let Some(fd) = open_upload_stage_candidate(
+        directory,
+        name,
+        OFlags::RDONLY,
+        path,
+        "open upload stage for collection",
+    )?
+    else {
+        return Ok(false);
+    };
+    let mut file = File::from(fd);
+    let opened = stat_fd(&file, path, "inspect opened upload stage for collection")?;
+    if !same_observation(&before, &opened) {
+        return Ok(false);
+    }
+    let actual = match hash_stable_file(&mut file, path, "verify upload stage for collection") {
+        Ok(actual) => actual,
+        Err(LocalError::ChangedDuringRead { .. } | LocalError::UnsupportedObject { .. }) => {
+            return Ok(false);
+        }
+        Err(source) => return Err(source),
+    };
+    if actual.as_str() != expected {
+        return Ok(false);
+    }
+    let Some(current) = open_upload_stage_candidate(
+        directory,
+        name,
+        OFlags::PATH | OFlags::NOFOLLOW,
+        path,
+        "reinspect upload stage for collection",
+    )?
+    else {
+        return Ok(false);
+    };
+    let after = stat_fd(&file, path, "reinspect opened upload stage for collection")?;
+    let current = stat_fd(&current, path, "reinspect upload stage for collection")?;
+    Ok(same_observation(&after, &current))
+}
+
+fn open_upload_stage_candidate(
+    directory: &OwnedFd,
+    name: &OsStr,
+    flags: OFlags,
+    path: &Path,
+    operation: &'static str,
+) -> Result<Option<OwnedFd>, LocalError> {
+    match openat2(
+        directory,
+        name,
+        flags | OFlags::CLOEXEC,
+        Mode::empty(),
+        BELOW_ROOT,
+    ) {
+        Ok(fd) => Ok(Some(fd)),
+        Err(source) if source == rustix::io::Errno::NOENT || source == rustix::io::Errno::LOOP => {
+            Ok(None)
+        }
+        Err(source) => Err(syscall_failure(operation, path, source)),
     }
 }
 
@@ -1846,6 +2010,50 @@ mod tests {
         symlink(outside.path(), directory.path().join("escape"))?;
         let result = scan(directory.path());
         assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn upload_stage_collection_removes_only_verified_unreferenced_content()
+    -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new()?;
+        let staging = TempDir::new()?;
+        std::fs::write(root.path().join("retained"), b"pending bytes")?;
+        std::fs::write(root.path().join("orphan"), b"completed bytes")?;
+        let retained = identity(b"pending bytes")?;
+        let orphan = identity(b"completed bytes")?;
+        let corrupt = identity(b"claimed bytes")?;
+        let directory = identity(b"directory entry")?;
+        let link = identity(b"symlink entry")?;
+
+        let _ = stage_upload(root.path(), "retained", staging.path(), &retained)?;
+        let _ = stage_upload(root.path(), "orphan", staging.path(), &orphan)?;
+        std::fs::write(staging.path().join(corrupt.as_str()), b"different bytes")?;
+        std::fs::create_dir(staging.path().join(directory.as_str()))?;
+        symlink(
+            root.path().join("retained"),
+            staging.path().join(link.as_str()),
+        )?;
+        std::fs::write(staging.path().join("unrecognized"), b"leave me")?;
+
+        assert_eq!(
+            remove_unreferenced_upload_stages(staging.path(), std::slice::from_ref(&retained),)?,
+            1
+        );
+        assert!(staging.path().join(retained.as_str()).is_file());
+        assert!(!staging.path().join(orphan.as_str()).exists());
+        assert_eq!(
+            std::fs::read(staging.path().join(corrupt.as_str()))?,
+            b"different bytes"
+        );
+        assert!(staging.path().join(directory.as_str()).is_dir());
+        assert!(staging.path().join(link.as_str()).is_symlink());
+        assert_eq!(
+            std::fs::read(staging.path().join("unrecognized"))?,
+            b"leave me"
+        );
         Ok(())
     }
 

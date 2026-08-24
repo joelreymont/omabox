@@ -11,7 +11,8 @@ use crate::journal::{
     PlanWrite, RemoteObservationRecord,
 };
 use crate::local::{
-    LocalError, StageOutcome, StagedUpload, observe_upload_source, scan_and_publish, stage_upload,
+    LocalError, StageOutcome, StagedUpload, observe_upload_source,
+    remove_unreferenced_upload_stages, scan_and_publish, stage_upload,
 };
 use crate::model::{
     Baseline, Conflict, Decision, LocalObservation, Observation, Operation, RemoteObservation,
@@ -335,8 +336,12 @@ fn reconcile_published(
         recovery_directory,
     )?;
     report.replayed_operations += applied.completed_operations;
-    blocked_paths.extend(journal.pending_plans()?.into_iter().map(|plan| plan.path));
+    journal.prune_completed_work()?;
+    let retained_uploads = journal.pending_upload_content()?;
+    let pending = journal.pending_plans()?;
+    blocked_paths.extend(pending.into_iter().map(|plan| plan.path));
     report.blocked = blocked_paths.len();
+    remove_unreferenced_upload_stages(upload_staging, &retained_uploads)?;
     Ok(ReconcileOutcome::Complete(report))
 }
 
@@ -626,6 +631,13 @@ mod tests {
         };
         let _ = journal.record_plan(path, &operation_plan)?;
         assert_eq!(journal.pending_plans()?.len(), 1);
+        let retained = journal.pending_upload_content()?;
+        assert_eq!(retained, vec![content]);
+        assert_eq!(
+            remove_unreferenced_upload_stages(staging.path(), &retained)?,
+            0
+        );
+        assert!(staging.path().join(staged.content().as_str()).is_file());
         Ok(())
     }
 
@@ -705,7 +717,7 @@ mod tests {
         assert_eq!(replay.completed_operations, 2);
         assert!(replay.blocked.is_empty());
         assert!(journal.pending_plans()?.is_empty());
-        assert_eq!(journal.baseline(path)?, Some(Baseline::Absent));
+        assert_eq!(journal.baseline(path)?, None);
         assert_eq!(std::fs::read(recovery_path)?, bytes);
         Ok(())
     }

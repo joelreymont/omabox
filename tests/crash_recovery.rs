@@ -588,10 +588,7 @@ fn deletion_replays_after_effect_but_before_journal_completion() -> Result<(), B
         reopened.complete_operation(delete.id, Some(&Baseline::Absent))?,
         OperationCompletion::AlreadyCompleted
     );
-    assert_eq!(
-        reopened.baseline(Path::new("delete.txt"))?,
-        Some(Baseline::Absent)
-    );
+    assert_eq!(reopened.baseline(Path::new("delete.txt"))?, None);
     assert_eq!(std::fs::read(recovery_record.recovery_path)?, b"keep me");
     Ok(())
 }
