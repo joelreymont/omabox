@@ -16,7 +16,7 @@ use rustix::fs::{
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::journal::{Journal, JournalError, LocalObservationRecord};
+use crate::journal::{Journal, JournalError, LocalObservationRecord, LocalRootBinding};
 use crate::model::{ContentIdentity, LocalFile, Observation, UnknownReason};
 
 const DROPBOX_BLOCK_SIZE: usize = 4 * 1024 * 1024;
@@ -106,6 +106,7 @@ pub enum HashError {
 /// A complete local inventory, safe to publish for absence decisions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompleteScan {
+    root_binding: LocalRootBinding,
     observations: Vec<LocalObservationRecord>,
 }
 
@@ -115,6 +116,15 @@ impl CompleteScan {
     pub fn observations(&self) -> &[LocalObservationRecord] {
         &self.observations
     }
+}
+
+/// Result of publishing a complete local inventory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ScanPublication {
+    /// The scanned root still matched the active journal generation.
+    Published(CompleteScan),
+    /// The configured path no longer named the active root.
+    RootChanged,
 }
 
 /// A verified immutable upload-stage file.
@@ -304,19 +314,54 @@ fn scan(root: impl AsRef<Path>) -> Result<CompleteScan, LocalError> {
         });
     }
     observations.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(CompleteScan { observations })
+    Ok(CompleteScan {
+        root_binding: root_binding(root, &before),
+        observations,
+    })
 }
 
 /// Scan completely and publish only the successful inventory transaction.
 pub fn scan_and_publish(
     journal: &mut Journal,
     root: impl AsRef<Path>,
-) -> Result<CompleteScan, LocalError> {
+) -> Result<ScanPublication, LocalError> {
+    let root = root.as_ref();
     let scan = scan(root)?;
+    if !active_root_matches(journal, &scan.root_binding)?
+        || !configured_root_is_active(journal, root)?
+    {
+        return Ok(ScanPublication::RootChanged);
+    }
     journal
         .publish_local_inventory(scan.observations())
         .map_err(|source| LocalError::Journal { source })?;
-    Ok(scan)
+    Ok(ScanPublication::Published(scan))
+}
+
+/// Check that the configured path still names the journal's active root.
+pub(crate) fn configured_root_is_active(
+    journal: &Journal,
+    root: impl AsRef<Path>,
+) -> Result<bool, LocalError> {
+    let root = root.as_ref();
+    let directory = open_absolute_directory(root, "open sync root for identity verification")?;
+    let stat = stat_fd(&directory, root, "inspect sync root identity")?;
+    active_root_matches(journal, &root_binding(root, &stat))
+}
+
+fn active_root_matches(journal: &Journal, actual: &LocalRootBinding) -> Result<bool, LocalError> {
+    journal
+        .local_root_binding()
+        .map(|active| active.is_some_and(|record| record.binding == *actual))
+        .map_err(|source| LocalError::Journal { source })
+}
+
+fn root_binding(path: &Path, stat: &rustix::fs::Stat) -> LocalRootBinding {
+    LocalRootBinding {
+        canonical_path: path.to_path_buf(),
+        device: stat.st_dev,
+        inode: stat.st_ino,
+    }
 }
 
 /// Copy a root-confined local file into immutable upload staging.

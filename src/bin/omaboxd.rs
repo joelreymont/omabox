@@ -125,6 +125,10 @@ fn run_session(config: &Config, journal: &mut Journal) -> Result<(), DaemonError
                 tracing::info!("local state changed during reconciliation");
                 continue;
             }
+            ReconcileOutcome::LocalRootChanged => {
+                tracing::info!("configured local root changed during reconciliation");
+                continue;
+            }
         }
 
         if let Some(delay) = long_poll_backoff.take() {

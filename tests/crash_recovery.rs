@@ -4,12 +4,12 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 use omabox::journal::{
-    Journal, LocalObservationRecord, OperationCompletion, PlanRecord, PlanWrite, RecordStatus,
-    RecoveryCompletion, RecoveryRecord, RecoveryWrite,
+    Journal, LocalObservationRecord, LocalRootBinding, OperationCompletion, PlanRecord, PlanWrite,
+    RecordStatus, RecoveryCompletion, RecoveryRecord, RecoveryWrite,
 };
 use omabox::local::{
     ConflictOutcome, ConflictSide, DeleteOutcome, InstallOutcome, ReplacementPreparation,
-    StageOutcome, dropbox_content_hash, install_download, materialize_conflict,
+    ScanPublication, StageOutcome, dropbox_content_hash, install_download, materialize_conflict,
     prepare_replacement, scan_and_publish, stage_download, stage_upload,
 };
 use omabox::model::{
@@ -142,6 +142,32 @@ fn failed_scan_never_replaces_the_last_complete_inventory() -> Result<(), Box<dy
 }
 
 #[test]
+fn replacement_root_scan_never_publishes_absence_under_old_binding() -> Result<(), Box<dyn Error>> {
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let old_root = directory.path().join("old-root");
+    std::fs::create_dir(&root)?;
+    std::fs::write(root.join("keep.txt"), b"old root bytes")?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    assert!(matches!(
+        scan_and_publish(&mut journal, &root)?,
+        ScanPublication::Published(_)
+    ));
+    let published = journal.local_inventory()?;
+
+    std::fs::rename(&root, &old_root)?;
+    std::fs::create_dir(&root)?;
+
+    assert_eq!(
+        scan_and_publish(&mut journal, &root)?,
+        ScanPublication::RootChanged
+    );
+    assert_eq!(journal.local_inventory()?, published);
+    Ok(())
+}
+
+#[test]
 fn immutable_upload_stage_survives_source_changes() -> Result<(), Box<dyn Error>> {
     let directory = TempDir::new()?;
     let root = directory.path().join("root");
@@ -265,6 +291,7 @@ fn reserved_artifacts_are_unknown_but_conflicts_are_present() -> Result<(), Box<
     }
     let database = directory.path().join("journal.sqlite3");
     let mut journal = Journal::open(database)?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
 
     let _scan = scan_and_publish(&mut journal, &root)?;
     let inventory = journal.local_inventory()?;
@@ -304,6 +331,7 @@ fn already_installed_download_cleans_verified_stage_before_return() -> Result<()
 
     let database = directory.path().join("journal.sqlite3");
     let mut journal = Journal::open(database)?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
     let _scan = scan_and_publish(&mut journal, &root)?;
     assert_eq!(
         journal.local_inventory()?,

@@ -12,7 +12,7 @@ use omabox::dropbox::{
     MutationOutcome, RemotePathState,
 };
 use omabox::journal::{
-    DropboxBinding, Journal, PlanWrite, RemoteInventory, RemoteObservationRecord,
+    DropboxBinding, Journal, LocalRootBinding, PlanWrite, RemoteInventory, RemoteObservationRecord,
 };
 use omabox::local::{
     InstallOutcome, StageOutcome, StagedUpload, dropbox_content_hash, install_download,
@@ -235,11 +235,15 @@ fn one_reconciliation_pass_synchronizes_files_in_both_directions() -> Result<(),
     std::fs::create_dir_all(&recovery)?;
     std::fs::write(root.join("upload.txt"), upload_bytes)?;
     let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
 
     let report = match reconcile_once(&mut journal, &client, &root, &staging, &recovery)? {
         ReconcileOutcome::Complete(report) => report,
         ReconcileOutcome::FreshObservationRequired { .. } => {
             return Err(io::Error::other("stable fixture requested a fresh observation").into());
+        }
+        ReconcileOutcome::LocalRootChanged => {
+            return Err(io::Error::other("stable fixture changed its local root").into());
         }
     };
 
@@ -355,6 +359,48 @@ fn long_poll_exposes_reset_and_rate_limit_outcomes() -> Result<(), Box<dyn Error
             .iter()
             .all(|request| request.path == "/2/files/list_folder/longpoll")
     );
+    Ok(())
+}
+
+#[test]
+fn replaced_local_root_never_replays_pending_deletion() -> Result<(), Box<dyn Error>> {
+    let server = FakeServer::start(Vec::new())?;
+    let client = fake_client(&server, "opaque-access-root-replacement")?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let old_root = directory.path().join("old-root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+
+    let path = Path::new("keep.txt");
+    let bytes = b"must not be deleted from a replacement root";
+    let content = dropbox_content_hash(bytes.as_slice())?;
+    let remote = RemoteFile::new(content.clone(), DropboxRevision::new("rev-old"));
+    std::fs::write(root.join(path), bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_baseline(&mut journal, path, &remote)?;
+    let deletion = planned_operations(plan(
+        &Baseline::Present(remote),
+        &Observation::Present(LocalFile::new(content)),
+        &Observation::ConfirmedAbsent,
+    ))?;
+    let _ = journal.record_plan(path, &deletion)?;
+
+    std::fs::rename(&root, &old_root)?;
+    std::fs::create_dir(&root)?;
+    std::fs::write(root.join(path), bytes)?;
+
+    assert_eq!(
+        reconcile_once(&mut journal, &client, &root, &staging, &recovery)?,
+        ReconcileOutcome::LocalRootChanged
+    );
+    assert_eq!(std::fs::read(root.join(path))?, bytes);
+    assert_eq!(journal.pending_plans()?.len(), 1);
+    assert!(server.finish()?.is_empty());
     Ok(())
 }
 

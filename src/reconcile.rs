@@ -11,8 +11,8 @@ use crate::journal::{
     PlanWrite, RemoteObservationRecord,
 };
 use crate::local::{
-    LocalError, StageOutcome, StagedUpload, observe_upload_source,
-    remove_unreferenced_upload_stages, scan_and_publish, stage_upload,
+    LocalError, ScanPublication, StageOutcome, StagedUpload, configured_root_is_active,
+    observe_upload_source, remove_unreferenced_upload_stages, scan_and_publish, stage_upload,
 };
 use crate::model::{
     Baseline, Conflict, Decision, LocalObservation, Observation, Operation, RemoteObservation,
@@ -75,6 +75,9 @@ pub enum ReconcileError {
         /// Stable, non-secret explanation.
         detail: &'static str,
     },
+    /// The configured path no longer names the journal's active local root.
+    #[error("configured local root changed during reconciliation")]
+    LocalRootChanged,
 }
 
 impl From<LocalError> for ReconcileError {
@@ -126,6 +129,8 @@ pub enum ReconcileOutcome {
         /// Path whose observation became stale.
         path: PathBuf,
     },
+    /// The daemon must reactivate the configured local root before another pass.
+    LocalRootChanged,
 }
 
 /// Replay local work, fetch only missing exact downloads, then replay remote work once.
@@ -139,6 +144,7 @@ pub fn replay_pending(
     let sync_root = sync_root.as_ref();
     let upload_staging = upload_staging.as_ref();
     let recovery_directory = recovery_directory.as_ref();
+    require_active_local_root(journal, sync_root)?;
     let mut report = replay_local_operations(journal, sync_root, recovery_directory)?;
     let missing_downloads = report
         .blocked
@@ -174,10 +180,12 @@ pub fn replay_pending(
                 })?;
             stage_remote(dropbox, sync_root, path, path, source)?;
         }
+        require_active_local_root(journal, sync_root)?;
         let resumed = replay_local_operations(journal, sync_root, recovery_directory)?;
         report.completed_operations += resumed.completed_operations;
         report.blocked = resumed.blocked;
     }
+    require_active_local_root(journal, sync_root)?;
     let remote = replay_remote_operations(
         journal,
         dropbox,
@@ -198,6 +206,25 @@ pub fn reconcile_once(
     upload_staging: impl AsRef<Path>,
     recovery_directory: impl AsRef<Path>,
 ) -> Result<ReconcileOutcome, ReconcileError> {
+    match reconcile_active_root(
+        journal,
+        dropbox,
+        sync_root,
+        upload_staging,
+        recovery_directory,
+    ) {
+        Err(ReconcileError::LocalRootChanged) => Ok(ReconcileOutcome::LocalRootChanged),
+        outcome => outcome,
+    }
+}
+
+fn reconcile_active_root(
+    journal: &mut Journal,
+    dropbox: &DropboxClient,
+    sync_root: impl AsRef<Path>,
+    upload_staging: impl AsRef<Path>,
+    recovery_directory: impl AsRef<Path>,
+) -> Result<ReconcileOutcome, ReconcileError> {
     let sync_root = sync_root.as_ref();
     let upload_staging = upload_staging.as_ref();
     let recovery_directory = recovery_directory.as_ref();
@@ -208,8 +235,11 @@ pub fn reconcile_once(
         upload_staging,
         recovery_directory,
     )?;
-    scan_and_publish(journal, sync_root)?;
+    if scan_and_publish(journal, sync_root)? == ScanPublication::RootChanged {
+        return Err(ReconcileError::LocalRootChanged);
+    }
     dropbox.refresh_inventory(journal)?;
+    require_active_local_root(journal, sync_root)?;
     reconcile_published(
         journal,
         dropbox,
@@ -304,6 +334,7 @@ fn reconcile_published(
                         return Ok(ReconcileOutcome::FreshObservationRequired { path });
                     }
                 }
+                require_active_local_root(journal, sync_root)?;
                 match journal.record_plan(&path, &plan)? {
                     PlanWrite::Recorded(_) => report.planned += 1,
                     PlanWrite::AlreadyPending(_) => {
@@ -490,6 +521,14 @@ fn recovery_source_changed(error: &RecoveryError, path: &Path) -> bool {
         | RecoveryError::Journal { .. }
         | RecoveryError::Dropbox { .. }
         | RecoveryError::InvalidJournalState { .. } => false,
+    }
+}
+
+fn require_active_local_root(journal: &Journal, sync_root: &Path) -> Result<(), ReconcileError> {
+    if configured_root_is_active(journal, sync_root)? {
+        Ok(())
+    } else {
+        Err(ReconcileError::LocalRootChanged)
     }
 }
 
