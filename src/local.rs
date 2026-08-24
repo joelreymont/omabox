@@ -2006,8 +2006,9 @@ fn syscall_failure(operation: &'static str, path: &Path, source: rustix::io::Err
 #[cfg(test)]
 mod tests {
     use std::error::Error;
-    use std::io::Cursor;
+    use std::io::{Cursor, SeekFrom};
 
+    use proptest::prelude::*;
     use tempfile::TempDir;
 
     use super::*;
@@ -2030,6 +2031,97 @@ mod tests {
         }
     }
 
+    struct FragmentedReader<'a> {
+        bytes: &'a [u8],
+        fragments: &'a [usize],
+        position: usize,
+        next_fragment: usize,
+    }
+
+    impl<'a> FragmentedReader<'a> {
+        fn new(bytes: &'a [u8], fragments: &'a [usize]) -> Self {
+            Self {
+                bytes,
+                fragments,
+                position: 0,
+                next_fragment: 0,
+            }
+        }
+    }
+
+    impl Read for FragmentedReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if buffer.is_empty() || self.position == self.bytes.len() {
+                return Ok(0);
+            }
+            if self.fragments.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "fragment schedule is empty",
+                ));
+            }
+            let fragment_index = self.next_fragment % self.fragments.len();
+            let Some(&fragment) = self.fragments.get(fragment_index) else {
+                return Err(io::Error::other("fragment schedule changed during read"));
+            };
+            if fragment == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "fragment length is zero",
+                ));
+            }
+            let remaining = self.bytes.len() - self.position;
+            let count = remaining.min(buffer.len()).min(fragment);
+            let end = self.position + count;
+            buffer[..count].copy_from_slice(&self.bytes[self.position..end]);
+            self.position = end;
+            self.next_fragment += 1;
+            Ok(count)
+        }
+    }
+
+    fn hash_length_strategy() -> impl Strategy<Value = usize> {
+        prop_oneof![
+            Just(0),
+            Just(1),
+            Just(DROPBOX_BLOCK_SIZE - 1),
+            Just(DROPBOX_BLOCK_SIZE),
+            Just(DROPBOX_BLOCK_SIZE + 1),
+            Just(2 * DROPBOX_BLOCK_SIZE - 1),
+            Just(2 * DROPBOX_BLOCK_SIZE),
+            Just(2 * DROPBOX_BLOCK_SIZE + 1),
+            2_usize..=64 * 1024,
+        ]
+    }
+
+    fn fragment_strategy() -> impl Strategy<Value = Vec<usize>> {
+        prop_oneof![
+            Just(vec![1, 7, 4096, 65_535]),
+            Just(vec![17, 1021, 16_384]),
+            prop::collection::vec(1_usize..=128 * 1024, 1..12),
+        ]
+    }
+
+    fn patterned_bytes(length: usize, seed: u8) -> Vec<u8> {
+        let mut state = u64::from(seed) | 1;
+        (0..length)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect()
+    }
+
+    fn reference_dropbox_hash(bytes: &[u8]) -> ContentIdentity {
+        let mut aggregate = Sha256::new();
+        for block in bytes.chunks(DROPBOX_BLOCK_SIZE) {
+            aggregate.update(Sha256::digest(block));
+        }
+        ContentIdentity::new(hex_digest(aggregate.finalize()))
+    }
+
     #[test]
     fn dropbox_hash_uses_block_hash_composition() -> Result<(), Box<dyn Error>> {
         let empty = identity(b"")?;
@@ -2043,6 +2135,43 @@ mod tests {
             "4f8b42c22dd3729b519ba6f68d2da7cc5b2d606d05daed5ad5128cc03e6c6358"
         );
         Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(12))]
+
+        #[test]
+        fn dropbox_hash_and_copy_are_independent_of_reader_fragmentation(
+            length in hash_length_strategy(),
+            fragments in fragment_strategy(),
+            seed in any::<u8>(),
+        ) {
+            let bytes = patterned_bytes(length, seed);
+            let expected = reference_dropbox_hash(&bytes);
+            let streamed = dropbox_content_hash(FragmentedReader::new(&bytes, &fragments))
+                .map_err(|error| TestCaseError::fail(error.to_string()))?;
+            prop_assert_eq!(streamed.as_str(), expected.as_str());
+
+            let mut copied = tempfile::tempfile()
+                .map_err(|error| TestCaseError::fail(error.to_string()))?;
+            let copied_identity = copy_and_hash(
+                &mut FragmentedReader::new(&bytes, &fragments),
+                &mut copied,
+                Path::new("fragmented-download"),
+                "test fragmented download copy",
+            )
+            .map_err(|error| TestCaseError::fail(error.to_string()))?;
+            prop_assert_eq!(copied_identity.as_str(), expected.as_str());
+
+            copied
+                .seek(SeekFrom::Start(0))
+                .map_err(|error| TestCaseError::fail(error.to_string()))?;
+            let mut copied_bytes = Vec::new();
+            copied
+                .read_to_end(&mut copied_bytes)
+                .map_err(|error| TestCaseError::fail(error.to_string()))?;
+            prop_assert!(copied_bytes == bytes, "copied bytes differ from reader input");
+        }
     }
 
     #[test]
