@@ -12,7 +12,7 @@ Panel {
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property var snapshot: status.snapshot
-  readonly property var transfer: status.transfer
+  readonly property var transfers: status.transfers
   readonly property bool alerting: status.availability === "malformed" || status.stale
     || (snapshot && snapshot.phase === "error")
   readonly property bool inactive: status.availability === "missing" || status.stale
@@ -29,6 +29,8 @@ Panel {
     if (snapshot.phase === "error") return "Sync error"
     if (snapshot.phase === "backoff") return "Waiting to retry"
     if (snapshot.phase === "starting") return "Starting"
+    if (snapshot.phase === "syncing" && transfers.length > 0)
+      return "Syncing " + transfers.length + (transfers.length === 1 ? " file" : " files")
     if (snapshot.phase === "syncing") return "Syncing"
     return "Up to date"
   }
@@ -55,7 +57,7 @@ Panel {
     return value.toFixed(decimals).replace(/\.0+$/, "").replace(/(\.\d)0$/, "$1") + " " + units[index]
   }
 
-  function progressText() {
+  function progressText(transfer) {
     if (!transfer) return ""
     if (transfer.bytes_total === null || transfer.bytes_total <= 0)
       return formatBytes(transfer.bytes_done) + " · percent unknown"
@@ -63,6 +65,26 @@ Panel {
       Math.round(transfer.bytes_done / transfer.bytes_total * 100)))
     return formatBytes(transfer.bytes_done) + " of " + formatBytes(transfer.bytes_total)
       + " · " + percent + "%"
+  }
+
+  function aggregateProgressText() {
+    if (transfers.length === 0) return ""
+    if (status.aggregateBytesTotal === null || status.aggregateBytesTotal <= 0)
+      return formatBytes(status.aggregateBytesDone) + " · total unknown"
+    return formatBytes(status.aggregateBytesDone) + " of "
+      + formatBytes(status.aggregateBytesTotal) + " · "
+      + Math.round(status.aggregateFraction * 100) + "%"
+  }
+
+  function transferHeading() {
+    if (transfers.length === 0) return "TRANSFERS"
+    var direction = transfers[0].direction
+    for (var index = 1; index < transfers.length; index += 1) {
+      if (transfers[index].direction !== direction)
+        return "SYNCING " + transfers.length + " FILES"
+    }
+    var action = direction === "upload" ? "UPLOADING" : "DOWNLOADING"
+    return action + (transfers.length === 1 ? "" : " " + transfers.length + " FILES")
   }
 
   function relativeTime(timestamp) {
@@ -145,29 +167,71 @@ Panel {
           }
 
           Column {
-            visible: root.transfer !== null
+            visible: root.transfers.length > 0
             width: parent.width
             spacing: Style.space(6)
 
             PanelSeparator { foreground: root.foreground }
             PanelSectionHeader {
-              text: root.transfer && root.transfer.direction === "upload" ? "UPLOADING" : "DOWNLOADING"
+              text: root.transferHeading()
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
-            Text {
-              width: parent.width
-              text: root.transfer ? root.transfer.path : ""
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-              font.bold: true
-              wrapMode: Text.WrapAnywhere
-              maximumLineCount: 3
-              elide: Text.ElideRight
-            }
-            InfoPair { label: "Progress"; value: root.progressText() }
+            InfoPair { label: "Progress"; value: root.aggregateProgressText() }
             InfoPair { label: "Speed"; value: root.formatBytes(status.speedBytesPerSecond) + "/s" }
+
+            Item {
+              visible: status.aggregateBytesTotal !== null && status.aggregateBytesTotal > 0
+              width: parent.width
+              height: Style.space(4)
+
+              Rectangle {
+                anchors.fill: parent
+                radius: height / 2
+                color: root.dim
+                opacity: 0.35
+              }
+              Rectangle {
+                width: parent.width * status.aggregateFraction
+                height: parent.height
+                radius: height / 2
+                color: root.stateColor
+                Behavior on width {
+                  NumberAnimation { duration: 220; easing.type: Easing.OutCubic }
+                }
+              }
+            }
+
+            Repeater {
+              model: root.transfers
+
+              delegate: Column {
+                required property var modelData
+                width: content.width
+                spacing: Style.space(2)
+
+                Text {
+                  width: parent.width
+                  text: parent.modelData.path
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                  wrapMode: Text.WrapAnywhere
+                  maximumLineCount: 2
+                  elide: Text.ElideRight
+                }
+                Text {
+                  width: parent.width
+                  text: (parent.modelData.direction === "upload" ? "Upload · " : "Download · ")
+                    + root.progressText(parent.modelData)
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  elide: Text.ElideRight
+                }
+              }
+            }
           }
 
       }

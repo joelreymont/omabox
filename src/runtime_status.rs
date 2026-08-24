@@ -13,7 +13,7 @@ use thiserror::Error;
 
 const APPLICATION_DIRECTORY: &str = "omabox";
 const STATUS_FILE: &str = "status.json";
-const SCHEMA_VERSION: u8 = 1;
+const SCHEMA_VERSION: u8 = 2;
 
 /// Current high-level daemon activity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -88,7 +88,7 @@ pub type TransferObserver = Arc<dyn Fn(TransferEvent) + Send + Sync>;
 struct StatusSnapshot {
     version: u8,
     phase: DaemonPhase,
-    transfer: Option<TransferProgress>,
+    transfers: Vec<TransferProgress>,
     last_error: Option<&'static str>,
     updated_at: u64,
 }
@@ -120,11 +120,10 @@ impl RuntimeStatus {
         let mut publisher = Publisher {
             path: directory.join(STATUS_FILE),
             directory,
-            active_transfers: Vec::new(),
             snapshot: StatusSnapshot {
                 version: SCHEMA_VERSION,
                 phase: DaemonPhase::Starting,
-                transfer: None,
+                transfers: Vec::new(),
                 last_error: None,
                 updated_at: epoch_seconds()?,
             },
@@ -138,9 +137,8 @@ impl RuntimeStatus {
     /// Publish a phase transition.
     pub fn phase(&self, phase: DaemonPhase) {
         self.update(|publisher| {
-            publisher.active_transfers.clear();
             publisher.snapshot.phase = phase;
-            publisher.snapshot.transfer = None;
+            publisher.snapshot.transfers.clear();
             true
         });
     }
@@ -153,9 +151,8 @@ impl RuntimeStatus {
     /// Publish a fatal, deliberately sanitized error summary.
     pub fn fatal_error(&self, message: &'static str) {
         self.update(|publisher| {
-            publisher.active_transfers.clear();
             publisher.snapshot.phase = DaemonPhase::Error;
-            publisher.snapshot.transfer = None;
+            publisher.snapshot.transfers.clear();
             publisher.snapshot.last_error = Some(message);
             true
         });
@@ -190,7 +187,6 @@ impl RuntimeStatus {
 struct Publisher {
     directory: PathBuf,
     path: PathBuf,
-    active_transfers: Vec<TransferProgress>,
     snapshot: StatusSnapshot,
 }
 
@@ -203,41 +199,27 @@ impl Publisher {
     }
 
     fn record_progress(&mut self, progress: TransferProgress) -> bool {
-        let visible = self
-            .snapshot
-            .transfer
-            .as_ref()
-            .is_some_and(|current| current.same_transfer(&progress));
         match self
-            .active_transfers
+            .snapshot
+            .transfers
             .iter_mut()
             .find(|current| current.same_transfer(&progress))
         {
-            Some(current) => *current = progress.clone(),
-            None => self.active_transfers.push(progress.clone()),
+            Some(current) => *current = progress,
+            None => self.snapshot.transfers.push(progress),
         }
-        if visible || self.snapshot.transfer.is_none() {
-            self.snapshot.transfer = Some(progress);
-            true
-        } else {
-            false
-        }
+        self.snapshot
+            .transfers
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        true
     }
 
     fn finish_transfer(&mut self, finished: &TransferProgress) -> bool {
-        let visible = self
-            .snapshot
-            .transfer
-            .as_ref()
-            .is_some_and(|current| current.same_transfer(finished));
-        let previous_len = self.active_transfers.len();
-        self.active_transfers
+        let previous_len = self.snapshot.transfers.len();
+        self.snapshot
+            .transfers
             .retain(|current| !current.same_transfer(finished));
-        if !visible {
-            return false;
-        }
-        self.snapshot.transfer = self.active_transfers.first().cloned();
-        previous_len != self.active_transfers.len()
+        previous_len != self.snapshot.transfers.len()
     }
 
     fn publish(&mut self) -> Result<(), RuntimeStatusError> {
@@ -388,9 +370,9 @@ mod tests {
         assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
         let value = serde_json::from_slice::<Value>(&fs::read(path)?)?;
         assert_eq!(value.as_object().map(|object| object.len()), Some(5));
-        assert_eq!(value["version"], 1);
+        assert_eq!(value["version"], 2);
         assert_eq!(value["phase"], "waiting");
-        assert_eq!(value["transfer"], Value::Null);
+        assert_eq!(value["transfers"], serde_json::json!([]));
         assert!(value["updated_at"].as_u64().is_some());
         assert_eq!(value["last_error"], Value::Null);
         assert_eq!(fs::read_dir(directory)?.count(), 1);
@@ -412,10 +394,10 @@ mod tests {
 
         let path = runtime.path().join(APPLICATION_DIRECTORY).join(STATUS_FILE);
         let active = serde_json::from_slice::<Value>(&fs::read(&path)?)?;
-        assert_eq!(active["transfer"]["direction"], "download");
-        assert_eq!(active["transfer"]["path"], "folder/report.txt");
-        assert_eq!(active["transfer"]["bytes_done"], 4);
-        assert_eq!(active["transfer"]["bytes_total"], 10);
+        assert_eq!(active["transfers"][0]["direction"], "download");
+        assert_eq!(active["transfers"][0]["path"], "folder/report.txt");
+        assert_eq!(active["transfers"][0]["bytes_done"], 4);
+        assert_eq!(active["transfers"][0]["bytes_total"], 10);
 
         observer(TransferEvent::Finished(TransferProgress::new(
             TransferDirection::Download,
@@ -426,7 +408,7 @@ mod tests {
         status.fatal_error("Dropbox authentication is unavailable.");
         let failed = serde_json::from_slice::<Value>(&fs::read(path)?)?;
         assert_eq!(failed["phase"], "error");
-        assert_eq!(failed["transfer"], Value::Null);
+        assert_eq!(failed["transfers"], serde_json::json!([]));
         assert_eq!(
             failed["last_error"],
             "Dropbox authentication is unavailable."
@@ -435,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn finishing_one_transfer_keeps_another_transfer_visible() -> Result<(), Box<dyn Error>> {
+    fn every_active_transfer_is_published_until_it_finishes() -> Result<(), Box<dyn Error>> {
         let runtime = TempDir::new()?;
         let status = RuntimeStatus::new(runtime.path())?;
         let observer = status.transfer_observer();
@@ -456,16 +438,19 @@ mod tests {
 
         let path = runtime.path().join(APPLICATION_DIRECTORY).join(STATUS_FILE);
         let stable = serde_json::from_slice::<Value>(&fs::read(&path)?)?;
-        assert_eq!(stable["transfer"]["path"], "first.txt");
+        assert_eq!(stable["transfers"].as_array().map(Vec::len), Some(2));
+        assert_eq!(stable["transfers"][0]["path"], "first.txt");
+        assert_eq!(stable["transfers"][1]["path"], "second.txt");
 
         observer(TransferEvent::Finished(first));
         let promoted = serde_json::from_slice::<Value>(&fs::read(&path)?)?;
-        assert_eq!(promoted["transfer"]["path"], "second.txt");
-        assert_eq!(promoted["transfer"]["bytes_done"], 7);
+        assert_eq!(promoted["transfers"].as_array().map(Vec::len), Some(1));
+        assert_eq!(promoted["transfers"][0]["path"], "second.txt");
+        assert_eq!(promoted["transfers"][0]["bytes_done"], 7);
 
         observer(TransferEvent::Finished(second));
         let complete = serde_json::from_slice::<Value>(&fs::read(path)?)?;
-        assert_eq!(complete["transfer"], Value::Null);
+        assert_eq!(complete["transfers"], serde_json::json!([]));
         Ok(())
     }
 

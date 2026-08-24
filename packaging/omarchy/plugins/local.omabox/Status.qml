@@ -14,17 +14,46 @@ Item {
   property double nowMs: Date.now()
   property real measuredSpeed: 0
   property double speedMeasuredAtMs: 0
-  property var previousSample: null
+  property double speedWindowStartedAtMs: 0
+  property string speedIdentity: ""
+  property var speedBaseline: ({})
+  property var latestSamples: ({})
+  readonly property int speedWindowMs: 1000
 
   readonly property bool ready: availability === "ready" && snapshot !== null
   readonly property bool stale: ready && nowMs / 1000 - snapshot.updated_at > 75
-  readonly property var transfer: ready ? snapshot.transfer : null
-  readonly property real speedBytesPerSecond: transfer && speedMeasuredAtMs > 0
+  readonly property var transfers: ready ? snapshot.transfers : []
+  readonly property var transfer: transfers.length > 0 ? transfers[0] : null
+  readonly property real aggregateBytesDone: {
+    var total = 0
+    for (var index = 0; index < transfers.length; index += 1)
+      total += transfers[index].bytes_done
+    return total
+  }
+  readonly property var aggregateBytesTotal: {
+    if (transfers.length === 0) return null
+    var total = 0
+    for (var index = 0; index < transfers.length; index += 1) {
+      if (transfers[index].bytes_total === null) return null
+      total += transfers[index].bytes_total
+    }
+    return total
+  }
+  readonly property real aggregateFraction: aggregateBytesTotal > 0
+    ? Math.max(0, Math.min(1, aggregateBytesDone / aggregateBytesTotal)) : 0
+  readonly property real speedBytesPerSecond: transfers.length > 0 && speedMeasuredAtMs > 0
     && nowMs - speedMeasuredAtMs <= 5000 ? measuredSpeed : 0
 
   function isCount(value) {
     return typeof value === "number" && isFinite(value) && value >= 0
       && Math.floor(value) === value
+  }
+
+  function validTransfer(transfer) {
+    return transfer && !Array.isArray(transfer)
+      && ["upload", "download"].indexOf(transfer.direction) >= 0
+      && typeof transfer.path === "string" && isCount(transfer.bytes_done)
+      && (transfer.bytes_total === null || isCount(transfer.bytes_total))
   }
 
   function normalize(content) {
@@ -33,25 +62,87 @@ Item {
     catch (error) { return null }
 
     var phases = ["starting", "syncing", "waiting", "backoff", "error"]
-    if (!value || Array.isArray(value) || value.version !== 1
+    if (!value || Array.isArray(value) || [1, 2].indexOf(value.version) < 0
         || phases.indexOf(value.phase) < 0
         || !isCount(value.updated_at) || value.updated_at === 0
         || (value.last_error !== null && typeof value.last_error !== "string")) return null
 
-    if (value.transfer !== null) {
-      var transfer = value.transfer
-      if (!transfer || Array.isArray(transfer)
-          || ["upload", "download"].indexOf(transfer.direction) < 0
-          || typeof transfer.path !== "string" || !isCount(transfer.bytes_done)
-          || (transfer.bytes_total !== null && !isCount(transfer.bytes_total))) return null
+    var transfers
+    if (value.version === 1) {
+      if (value.transfer !== null && !validTransfer(value.transfer)) return null
+      transfers = value.transfer === null ? [] : [value.transfer]
+    } else {
+      if (!Array.isArray(value.transfers)) return null
+      transfers = value.transfers
+      for (var index = 0; index < transfers.length; index += 1) {
+        if (!validTransfer(transfers[index])) return null
+      }
     }
-    return value
+    return {
+      version: 2,
+      phase: value.phase,
+      transfers: transfers,
+      last_error: value.last_error,
+      updated_at: value.updated_at
+    }
   }
 
   function clearSample() {
-    previousSample = null
+    speedWindowStartedAtMs = 0
+    speedIdentity = ""
+    speedBaseline = ({})
+    latestSamples = ({})
     measuredSpeed = 0
     speedMeasuredAtMs = 0
+  }
+
+  function sampleTransfers(transfers, receivedAt) {
+    var samples = ({})
+    var identities = []
+    for (var index = 0; index < transfers.length; index += 1) {
+      var transfer = transfers[index]
+      var key = transfer.direction + "\n" + transfer.path
+      samples[key] = transfer.bytes_done
+      identities.push([transfer.direction, transfer.path])
+    }
+    var identity = JSON.stringify(identities)
+    if (identity !== speedIdentity) {
+      speedIdentity = identity
+      speedBaseline = samples
+      latestSamples = samples
+      speedWindowStartedAtMs = receivedAt
+      measuredSpeed = 0
+      speedMeasuredAtMs = 0
+      return
+    }
+
+    var changed = false
+    for (var sampleKey in samples) {
+      if (samples[sampleKey] !== latestSamples[sampleKey]) {
+        changed = true
+        break
+      }
+    }
+    latestSamples = samples
+    if (!changed || receivedAt - speedWindowStartedAtMs < speedWindowMs) return
+
+    var delta = 0
+    for (var key in samples) {
+      var baseline = speedBaseline[key]
+      if (typeof baseline !== "number" || samples[key] < baseline) {
+        speedBaseline = samples
+        speedWindowStartedAtMs = receivedAt
+        measuredSpeed = 0
+        speedMeasuredAtMs = 0
+        return
+      }
+      delta += samples[key] - baseline
+    }
+    var elapsed = (receivedAt - speedWindowStartedAtMs) / 1000
+    measuredSpeed = elapsed > 0 ? delta / elapsed : 0
+    speedMeasuredAtMs = receivedAt
+    speedBaseline = samples
+    speedWindowStartedAtMs = receivedAt
   }
 
   function apply(content) {
@@ -64,28 +155,11 @@ Item {
     }
 
     var receivedAt = Date.now()
-    var current = next.transfer
-    if (!current) {
+    var current = next.transfers
+    if (current.length === 0) {
       clearSample()
     } else {
-      var key = current.direction + "\n" + current.path
-      var changed = !previousSample || current.bytes_done !== previousSample.bytes
-        || next.updated_at !== previousSample.updatedAt || key !== previousSample.key
-      if (changed && previousSample && key === previousSample.key
-          && current.bytes_done >= previousSample.bytes) {
-        var elapsed = (receivedAt - previousSample.receivedAt) / 1000
-        if (elapsed > 0) {
-          measuredSpeed = (current.bytes_done - previousSample.bytes) / elapsed
-          speedMeasuredAtMs = receivedAt
-        }
-      } else if (changed) {
-        measuredSpeed = 0
-        speedMeasuredAtMs = 0
-      }
-      if (changed) previousSample = {
-        key: key, bytes: current.bytes_done,
-        updatedAt: next.updated_at, receivedAt: receivedAt
-      }
+      sampleTransfers(current, receivedAt)
     }
 
     snapshot = next
