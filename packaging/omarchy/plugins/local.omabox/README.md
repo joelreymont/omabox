@@ -1,10 +1,21 @@
 # Omabox Omarchy widget
 
 `local.omabox` watches `$XDG_RUNTIME_DIR/omabox/status.json`, the owner-only
-snapshot atomically published by `omaboxd`. It shows the active upload or
-download, live progress and speed, and service state. Missing, stale, and
-malformed snapshots are shown
-as explicit states rather than treated as healthy data.
+snapshot atomically published by `omaboxd`. It shows concurrent transfers,
+aggregate progress and speed, animated progress, and a rolling 30-second
+bandwidth chart. Chart samples live only in the shell process and are never
+written to disk.
+
+The panel reads the current sync folder from `omabox settings --json`. Its
+folder picker always asks for confirmation before running `omabox settings
+set-root`. Start, stop, restart, logs, and setup help also go through the
+documented `omabox` CLI; the widget has no daemon IPC or companion process.
+Setup help opens `omabox --help` in a held terminal so first-time setup shows
+the required sync-root and public app-key arguments instead of running a bare
+setup command that cannot succeed without configuration.
+
+Missing, stale, malformed, and CLI errors are explicit. Logs and setup help
+remain one click away.
 
 Install the release build while the desktop session is unlocked:
 

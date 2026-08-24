@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "local.omabox",
   "name": "Omabox",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Omabox",
-  "description": "Live Omabox sync status in the Omarchy bar.",
+  "description": "Omabox sync status and controls in the Omarchy bar.",
   "kinds": [
     "bar-widget"
   ],
@@ -13,7 +13,7 @@
   },
   "barWidget": {
     "displayName": "Omabox",
-    "description": "Shows active transfer progress and service state.",
+    "description": "Shows transfers, bandwidth, sync settings, and service controls.",
     "category": "Files",
     "allowMultiple": false,
     "defaultSection": "right"
