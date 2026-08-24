@@ -4,12 +4,13 @@ use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io;
-use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+use std::io::{self, Write as _};
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use miette::Diagnostic;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const APPLICATION_DIRECTORY: &str = "omabox";
@@ -18,6 +19,7 @@ const JOURNAL_FILE: &str = "journal.sqlite3";
 const UPLOAD_STAGING_DIRECTORY: &str = "upload-staging";
 const RECOVERY_DIRECTORY: &str = "recovery";
 const LOCK_FILE: &str = "daemon.lock";
+static CONFIG_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// XDG base directories used by Omabox.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -186,7 +188,7 @@ pub struct Config {
     paths: Paths,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigDocument {
     sync_root: PathBuf,
@@ -213,15 +215,25 @@ impl Config {
                 source,
             }
         })?;
-        let requested_root = require_absolute("sync_root", document.sync_root)?;
-        if document.dropbox_app_key.trim().is_empty() {
+        Self::from_values(xdg, document.sync_root, document.dropbox_app_key)
+    }
+
+    /// Validate a configuration supplied by a setup or settings command.
+    pub fn from_values(
+        xdg: &XdgDirectories,
+        sync_root: impl Into<PathBuf>,
+        dropbox_app_key: impl Into<String>,
+    ) -> Result<Self, ConfigError> {
+        let requested_root = require_absolute("sync_root", sync_root.into())?;
+        let dropbox_app_key = dropbox_app_key.into();
+        if dropbox_app_key.trim().is_empty() {
             return Err(ConfigError::EmptyDropboxAppKey);
         }
         let sync_root = canonicalize_sync_root(&requested_root)?;
         let paths = Paths::resolve(xdg, &sync_root)?;
         Ok(Self {
             sync_root,
-            dropbox_app_key: document.dropbox_app_key,
+            dropbox_app_key,
             paths,
         })
     }
@@ -247,6 +259,29 @@ impl Config {
     /// Prepare runtime directories after validating their placement.
     pub fn prepare(&self) -> Result<(), ConfigError> {
         self.paths.prepare(&self.sync_root)
+    }
+
+    /// Atomically persist this non-secret configuration with owner-only access.
+    pub fn write(&self) -> Result<(), ConfigError> {
+        self.write_with_replacement(true)
+    }
+
+    /// Atomically persist initial configuration without replacing an existing file.
+    pub fn write_new(&self) -> Result<(), ConfigError> {
+        self.write_with_replacement(false)
+    }
+
+    fn write_with_replacement(&self, replace_existing: bool) -> Result<(), ConfigError> {
+        let document = ConfigDocument {
+            sync_root: self.sync_root.clone(),
+            dropbox_app_key: self.dropbox_app_key.clone(),
+        };
+        let contents = toml::to_string(&document).map_err(ConfigError::Serialize)?;
+        atomic_write_config(
+            self.paths.config_file(),
+            contents.as_bytes(),
+            replace_existing,
+        )
     }
 }
 
@@ -337,6 +372,73 @@ pub enum ConfigError {
     )]
     EmptyDropboxAppKey,
 
+    /// Initial setup refused to replace an existing configuration.
+    #[error("Omabox configuration already exists at `{path}`")]
+    #[diagnostic(
+        code(omabox::config::already_exists),
+        help("Use Omabox settings commands to change existing configuration.")
+    )]
+    AlreadyExists {
+        /// Existing configuration path.
+        path: PathBuf,
+    },
+
+    /// A validated configuration could not be serialized.
+    #[error("could not serialize Omabox configuration")]
+    #[diagnostic(
+        code(omabox::config::serialize),
+        help("Use a sync-root path representable in TOML and retry.")
+    )]
+    Serialize(#[source] toml::ser::Error),
+
+    /// The private configuration directory could not be prepared.
+    #[error("could not prepare Omabox configuration directory at `{path}`")]
+    #[diagnostic(
+        code(omabox::config::prepare_configuration_directory),
+        help("Ensure the XDG configuration location is owned by this user and writable.")
+    )]
+    PrepareConfigurationDirectory {
+        /// Configuration directory path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+
+    /// An atomic configuration write failed.
+    #[error("could not {operation} Omabox configuration at `{path}`")]
+    #[diagnostic(
+        code(omabox::config::write),
+        help("Ensure the XDG configuration location is owned by this user and writable.")
+    )]
+    Write {
+        /// Failed write phase.
+        operation: &'static str,
+        /// Configuration or temporary file path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+
+    /// A failed write also left its private temporary file behind.
+    #[error("could not remove temporary configuration `{path}` after the write failed: {cleanup}")]
+    #[diagnostic(
+        code(omabox::config::cleanup_after_write),
+        help(
+            "The incomplete owner-only temporary file is ignored; fix directory access and retry."
+        )
+    )]
+    CleanupAfterWrite {
+        /// Temporary file that could not be removed.
+        path: PathBuf,
+        /// Original write failure.
+        #[source]
+        write: Box<ConfigError>,
+        /// Cleanup failure.
+        cleanup: io::Error,
+    },
+
     /// The configured sync root could not be resolved.
     #[error("could not resolve sync root `{path}`")]
     #[diagnostic(
@@ -422,6 +524,111 @@ pub enum ConfigError {
         #[source]
         source: io::Error,
     },
+}
+
+fn atomic_write_config(
+    path: &Path,
+    contents: &[u8],
+    replace_existing: bool,
+) -> Result<(), ConfigError> {
+    let parent = path.parent().ok_or_else(|| ConfigError::Write {
+        operation: "locate the parent of",
+        path: path.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "configuration path has no parent",
+        ),
+    })?;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    builder
+        .create(parent)
+        .and_then(|()| fs::set_permissions(parent, fs::Permissions::from_mode(0o700)))
+        .map_err(|source| ConfigError::PrepareConfigurationDirectory {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+
+    let sequence = CONFIG_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".{CONFIG_FILE}.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+    match write_config_temporary(&temporary, path, parent, contents, replace_existing) {
+        Ok(()) => Ok(()),
+        Err(write) => match fs::remove_file(&temporary) {
+            Ok(()) => Err(write),
+            Err(cleanup) if cleanup.kind() == io::ErrorKind::NotFound => Err(write),
+            Err(cleanup) => Err(ConfigError::CleanupAfterWrite {
+                path: temporary,
+                write: Box::new(write),
+                cleanup,
+            }),
+        },
+    }
+}
+
+fn write_config_temporary(
+    temporary: &Path,
+    destination: &Path,
+    parent: &Path,
+    contents: &[u8],
+    replace_existing: bool,
+) -> Result<(), ConfigError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(temporary)
+        .map_err(|source| ConfigError::Write {
+            operation: "create a temporary",
+            path: temporary.to_path_buf(),
+            source,
+        })?;
+    file.write_all(contents)
+        .and_then(|()| file.sync_all())
+        .map_err(|source| ConfigError::Write {
+            operation: "write a temporary",
+            path: temporary.to_path_buf(),
+            source,
+        })?;
+    if replace_existing {
+        fs::rename(temporary, destination).map_err(|source| ConfigError::Write {
+            operation: "install the new",
+            path: destination.to_path_buf(),
+            source,
+        })?;
+    } else {
+        match rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            temporary,
+            rustix::fs::CWD,
+            destination,
+            rustix::fs::RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => {}
+            Err(source) if source == rustix::io::Errno::EXIST => {
+                return Err(ConfigError::AlreadyExists {
+                    path: destination.to_path_buf(),
+                });
+            }
+            Err(source) => {
+                return Err(ConfigError::Write {
+                    operation: "install the initial",
+                    path: destination.to_path_buf(),
+                    source: source.into(),
+                });
+            }
+        }
+    }
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| ConfigError::Write {
+            operation: "make the new",
+            path: destination.to_path_buf(),
+            source,
+        })
 }
 
 /// The held kernel lock for one daemon instance.
@@ -740,6 +947,48 @@ mod tests {
         assert!(config.paths().upload_staging_directory().is_dir());
         assert!(config.paths().recovery_directory().is_dir());
         assert!(!config.paths().journal_file().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn config_write_atomically_replaces_with_owner_only_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (temporary, xdg, sync_root) = fixture()?;
+        let replacement_root = temporary.path().join("Replacement");
+        fs::create_dir(&replacement_root)?;
+        write_config(&xdg, &sync_root)?;
+        fs::set_permissions(xdg.config_file(), fs::Permissions::from_mode(0o644))?;
+
+        let replacement = Config::from_values(&xdg, &replacement_root, "replacement-app-key")?;
+        replacement.write()?;
+
+        assert_eq!(
+            fs::metadata(xdg.config_file())?.permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(Config::load_from(&xdg)?, replacement);
+        let config_file = xdg.config_file();
+        let config_directory = config_file.parent().ok_or("config path had no parent")?;
+        assert_eq!(fs::read_dir(config_directory)?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn initial_config_write_never_replaces_an_existing_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (temporary, xdg, sync_root) = fixture()?;
+        let replacement_root = temporary.path().join("Replacement");
+        fs::create_dir(&replacement_root)?;
+        let existing = Config::from_values(&xdg, &sync_root, "existing-app-key")?;
+        existing.write_new()?;
+        let original = fs::read(xdg.config_file())?;
+
+        let replacement = Config::from_values(&xdg, &replacement_root, "replacement-app-key")?;
+        assert!(matches!(
+            replacement.write_new(),
+            Err(ConfigError::AlreadyExists { .. })
+        ));
+        assert_eq!(fs::read(xdg.config_file())?, original);
         Ok(())
     }
 

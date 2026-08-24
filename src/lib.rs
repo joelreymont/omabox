@@ -10,4 +10,5 @@ pub mod planner;
 pub mod reconcile;
 pub mod recovery;
 pub mod runtime_status;
+pub mod service;
 pub mod status;

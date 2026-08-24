@@ -87,11 +87,11 @@ fn render_journal(journal: &mut Journal) -> Result<String, StatusError> {
 
     for record in journal
         .conflicts()
-        .map_err(|source| status("read conflicts", source))?
+        .map_err(|source| status("read version-preservation work", source))?
     {
         entries.push(StatusEntry::new(
             record.path,
-            format!("conflict: {}", record.conflict.description()),
+            String::from("different versions are being preserved automatically"),
         ));
     }
 
@@ -160,10 +160,10 @@ fn status(operation: &'static str, source: JournalError) -> StatusError {
 
 fn render_entries(entries: &[StatusEntry]) -> String {
     if entries.is_empty() {
-        return String::from("Omabox has no recorded pending work or conflicts.\n");
+        return String::from("Omabox has no recorded work needing attention.\n");
     }
 
-    let mut output = String::from("Omabox needs attention:\n");
+    let mut output = String::from("Omabox status:\n");
     for entry in entries {
         output.push_str("- ");
         output.push_str(&display_path(&entry.path));
@@ -246,13 +246,13 @@ mod tests {
             return Err("fresh recovery was not recorded".into());
         };
         journal.record_conflict(
-            Path::new("b-conflict.txt"),
+            Path::new("b-diverged.txt"),
             &Conflict::RemoteDeletionLocalEdit {
                 local: LocalFile::new(ContentIdentity::new("local-secret-sentinel")),
             },
         )?;
         journal.record_conflict(
-            Path::new("c-conflict.txt"),
+            Path::new("c-diverged.txt"),
             &Conflict::LocalDeletionRemoteEdit {
                 remote: RemoteFile::new(
                     ContentIdentity::new("remote-secret-sentinel"),
@@ -264,10 +264,10 @@ mod tests {
         drop(journal);
         let rendered = render(&journal_path)?;
         insta::assert_snapshot!(rendered, @r###"
-        Omabox needs attention:
+        Omabox status:
         - a-remote.txt: Dropbox status unknown: inventory is stale
-        - b-conflict.txt: conflict: remote deletion conflicts with a local edit; preserve the local payload
-        - c-conflict.txt: conflict: local deletion conflicts with a remote edit; preserve the remote payload
+        - b-diverged.txt: different versions are being preserved automatically
+        - c-diverged.txt: different versions are being preserved automatically
         - m-pending.txt: pending sync: 2 remaining; next: preserve displaced local payload
         - m-pending.txt: recovery copy is pending
         - z-local.txt: local status unknown: path is inaccessible

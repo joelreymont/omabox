@@ -1,18 +1,24 @@
 #![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead as _, Write as _};
+use std::path::{Path, PathBuf};
 
 use miette::Diagnostic;
 use omabox::auth::{AuthError, AuthorizationGrant, OAuthClient, RefreshTokenStore};
-use omabox::config::{Config, ConfigError, InstanceLock, LockError};
+use omabox::config::{Config, ConfigError, InstanceLock, LockError, XdgDirectories};
 use omabox::dropbox::{DropboxClient, DropboxError, DropboxLink};
 use omabox::journal::{DropboxBindingWrite, Journal, JournalError};
+use omabox::service::{ServiceAction, ServiceCommands, ServiceError};
 use omabox::status::{self, StatusError};
+use serde::Serialize;
 use thiserror::Error;
 
-const USAGE: &str = "Usage: omabox setup [REMOTE_ROOT]\n       omabox status";
+const HELP: &str = "Omabox synchronizes a local directory with Dropbox.\n\n\
+Usage:\n  omabox setup [REMOTE_ROOT]\n  omabox setup --sync-root PATH --app-key KEY [--remote-root ROOT]\n  omabox status\n  omabox settings [--json]\n  omabox settings set-root PATH\n  omabox service start|stop|restart|enable|disable|status\n  omabox logs\n  omabox --help\n  omabox --version\n\n\
+The Dropbox app key is public. Omabox never requests or stores an app secret.\n";
+const USAGE: &str = "Run `omabox --help` for usage.";
 const AUTHORIZATION_CODE_LIMIT: usize = 8192;
 
 fn main() -> miette::Result<()> {
@@ -25,54 +31,194 @@ fn main() -> miette::Result<()> {
 fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
     let command = parse(arguments)?;
     match command {
-        Command::Setup { remote_root } => setup(&remote_root),
+        Command::Help => write_stdout(HELP),
+        Command::Version => write_stdout(concat!("omabox ", env!("CARGO_PKG_VERSION"), "\n")),
+        Command::Setup(options) => setup(options),
         Command::Status => show_status(),
+        Command::Settings { json } => show_settings(json),
+        Command::SetRoot(path) => set_sync_root_from_environment(&path),
+        Command::Service(action) => ServiceCommands::default()
+            .control(action)
+            .map_err(CliError::Service),
+        Command::Logs => ServiceCommands::default().logs().map_err(CliError::Service),
     }
 }
 
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
-    Setup { remote_root: String },
+    Help,
+    Version,
+    Setup(SetupOptions),
     Status,
+    Settings { json: bool },
+    SetRoot(PathBuf),
+    Service(ServiceAction),
+    Logs,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SetupOptions {
+    remote_root: String,
+    initial_config: Option<InitialConfig>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct InitialConfig {
+    sync_root: PathBuf,
+    app_key: String,
 }
 
 fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, CliError> {
-    let arguments = arguments
-        .into_iter()
-        .map(|argument| {
-            argument
-                .into_string()
-                .map_err(|_| CliError::Usage("arguments must be valid UTF-8"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    match arguments.as_slice() {
-        [command] if command == "status" => Ok(Command::Status),
-        [command] if command == "setup" => Ok(Command::Setup {
-            remote_root: String::new(),
-        }),
-        [command, remote_root] if command == "setup" => Ok(Command::Setup {
-            remote_root: remote_root.clone(),
-        }),
-        [] => Err(CliError::Usage("a command is required")),
-        [command, ..] if command == "status" || command == "setup" => {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    let Some((command, rest)) = arguments.split_first() else {
+        return Err(CliError::Usage("a command is required"));
+    };
+    match command.to_str() {
+        Some("--help" | "-h" | "help") if rest.is_empty() => Ok(Command::Help),
+        Some("--version" | "-V") if rest.is_empty() => Ok(Command::Version),
+        Some("setup") => parse_setup(rest).map(Command::Setup),
+        Some("status") if rest.is_empty() => Ok(Command::Status),
+        Some("settings") => parse_settings(rest),
+        Some("service") => parse_service(rest),
+        Some("logs") if rest.is_empty() => Ok(Command::Logs),
+        Some("status" | "logs" | "--help" | "-h" | "help" | "--version" | "-V") => {
             Err(CliError::Usage("too many arguments"))
         }
-        _ => Err(CliError::Usage("unknown command")),
+        Some(_) => Err(CliError::Usage("unknown command")),
+        None => Err(CliError::Usage("the command must be valid UTF-8")),
     }
 }
 
-fn setup(remote_root: &str) -> Result<(), CliError> {
-    let config = Config::load().map_err(|source| CliError::Config {
-        operation: "load configuration",
-        source: Box::new(source),
-    })?;
-    config.prepare().map_err(|source| CliError::Config {
-        operation: "prepare state directories",
-        source: Box::new(source),
-    })?;
+fn parse_setup(arguments: &[OsString]) -> Result<SetupOptions, CliError> {
+    match arguments {
+        [] => {
+            return Ok(SetupOptions {
+                remote_root: String::new(),
+                initial_config: None,
+            });
+        }
+        [remote_root] if !is_option(remote_root) => {
+            return Ok(SetupOptions {
+                remote_root: utf8(remote_root, "the Dropbox root must be valid UTF-8")?,
+                initial_config: None,
+            });
+        }
+        _ => {}
+    }
+
+    let mut sync_root = None;
+    let mut app_key = None;
+    let mut remote_root = String::new();
+    let mut remote_root_set = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        let option = arguments[index]
+            .to_str()
+            .ok_or(CliError::Usage("setup options must be valid UTF-8"))?;
+        let value = arguments
+            .get(index + 1)
+            .ok_or(CliError::Usage("a setup option is missing its value"))?;
+        match option {
+            "--sync-root" if sync_root.is_none() => sync_root = Some(PathBuf::from(value)),
+            "--app-key" if app_key.is_none() => {
+                app_key = Some(utf8(value, "the Dropbox app key must be valid UTF-8")?)
+            }
+            "--remote-root" if !remote_root_set => {
+                remote_root = utf8(value, "the Dropbox root must be valid UTF-8")?;
+                remote_root_set = true;
+            }
+            "--sync-root" | "--app-key" | "--remote-root" => {
+                return Err(CliError::Usage(
+                    "a setup option was provided more than once",
+                ));
+            }
+            _ => return Err(CliError::Usage("unknown setup option")),
+        }
+        index += 2;
+    }
+    let (Some(sync_root), Some(app_key)) = (sync_root, app_key) else {
+        return Err(CliError::Usage(
+            "flag-driven setup requires --sync-root and --app-key",
+        ));
+    };
+    Ok(SetupOptions {
+        remote_root,
+        initial_config: Some(InitialConfig { sync_root, app_key }),
+    })
+}
+
+fn parse_settings(arguments: &[OsString]) -> Result<Command, CliError> {
+    match arguments {
+        [] => Ok(Command::Settings { json: false }),
+        [option] if option == "--json" => Ok(Command::Settings { json: true }),
+        [command, path] if command == "set-root" => Ok(Command::SetRoot(PathBuf::from(path))),
+        _ => Err(CliError::Usage("invalid settings command")),
+    }
+}
+
+fn parse_service(arguments: &[OsString]) -> Result<Command, CliError> {
+    let [action] = arguments else {
+        return Err(CliError::Usage("service requires exactly one action"));
+    };
+    let action = match action.to_str() {
+        Some("start") => ServiceAction::Start,
+        Some("stop") => ServiceAction::Stop,
+        Some("restart") => ServiceAction::Restart,
+        Some("enable") => ServiceAction::Enable,
+        Some("disable") => ServiceAction::Disable,
+        Some("status") => ServiceAction::Status,
+        _ => return Err(CliError::Usage("unknown service action")),
+    };
+    Ok(Command::Service(action))
+}
+
+fn is_option(argument: &OsStr) -> bool {
+    argument.as_encoded_bytes().starts_with(b"--")
+}
+
+fn utf8(argument: &OsStr, message: &'static str) -> Result<String, CliError> {
+    argument
+        .to_str()
+        .map(String::from)
+        .ok_or(CliError::Usage(message))
+}
+
+fn setup(options: SetupOptions) -> Result<(), CliError> {
+    let (config, write_initial_config) = match options.initial_config {
+        Some(initial) => {
+            let xdg =
+                XdgDirectories::from_environment().map_err(config_error("resolve XDG paths"))?;
+            let initial_config = Config::from_values(&xdg, initial.sync_root, initial.app_key)
+                .map_err(config_error("validate initial configuration"))?;
+            (initial_config, true)
+        }
+        None => (
+            Config::load().map_err(config_error("load configuration"))?,
+            false,
+        ),
+    };
+    config
+        .prepare()
+        .map_err(config_error("prepare state directories"))?;
     let _lock = InstanceLock::acquire(config.paths().lock_file())
         .map_err(|source| CliError::Lock { source })?;
+    if write_initial_config
+        && config
+            .paths()
+            .config_file()
+            .try_exists()
+            .map_err(|source| CliError::InspectConfig { source })?
+    {
+        return Err(CliError::InitialConfigExists);
+    }
 
+    complete_setup(&config, write_initial_config, || {
+        authorize_and_bind(&config, &options.remote_root)
+    })?;
+    write_stdout("\nOmabox setup is complete.\n")
+}
+
+fn authorize_and_bind(config: &Config, remote_root: &str) -> Result<(), CliError> {
     let oauth = OAuthClient::new(config.dropbox_app_key());
     let pending = oauth.begin().map_err(|source| CliError::Auth {
         operation: "start Dropbox authorization",
@@ -139,16 +285,141 @@ fn setup(remote_root: &str) -> Result<(), CliError> {
             DropboxBindingWrite::Mismatch { .. } => return Err(CliError::JournalBindingMismatch),
         }
     }
-    write_stdout("\nOmabox setup is complete.\n")
+    Ok(())
+}
+
+fn complete_setup<Operation>(
+    config: &Config,
+    write_initial_config: bool,
+    operation: Operation,
+) -> Result<(), CliError>
+where
+    Operation: FnOnce() -> Result<(), CliError>,
+{
+    operation()?;
+    if write_initial_config {
+        match config.write_new() {
+            Ok(()) => {}
+            Err(ConfigError::AlreadyExists { .. }) => return Err(CliError::InitialConfigExists),
+            Err(source) => return Err(config_error("write initial configuration")(source)),
+        }
+    }
+    Ok(())
 }
 
 fn show_status() -> Result<(), CliError> {
-    let config = Config::load().map_err(|source| CliError::Config {
-        operation: "load configuration",
-        source: Box::new(source),
-    })?;
+    let config = Config::load().map_err(config_error("load configuration"))?;
     let output = status::render(config.paths().journal_file()).map_err(CliError::Status)?;
     write_stdout(&output)
+}
+
+#[derive(Serialize)]
+struct SettingsDocument<'config> {
+    sync_root: &'config Path,
+    dropbox_app_key: &'config str,
+}
+
+fn show_settings(json: bool) -> Result<(), CliError> {
+    let config = Config::load().map_err(config_error("load configuration"))?;
+    let output = if json {
+        let mut serialized = serde_json::to_string_pretty(&SettingsDocument {
+            sync_root: config.sync_root(),
+            dropbox_app_key: config.dropbox_app_key(),
+        })
+        .map_err(CliError::SerializeOutput)?;
+        serialized.push('\n');
+        serialized
+    } else {
+        format!(
+            "Sync root: {}\nDropbox app key: {}\n",
+            config.sync_root().display(),
+            config.dropbox_app_key()
+        )
+    };
+    write_stdout(&output)
+}
+
+fn set_sync_root_from_environment(path: &Path) -> Result<(), CliError> {
+    let xdg = XdgDirectories::from_environment().map_err(config_error("resolve XDG paths"))?;
+    set_sync_root(path, &xdg, &ServiceCommands::default())
+}
+
+fn set_sync_root(
+    path: &Path,
+    xdg: &XdgDirectories,
+    services: &ServiceCommands,
+) -> Result<(), CliError> {
+    let current = Config::load_from(xdg).map_err(config_error("load configuration"))?;
+    let replacement = Config::from_values(xdg, path, current.dropbox_app_key())
+        .map_err(config_error("validate the new sync root"))?;
+    if replacement.sync_root() == current.sync_root() {
+        return write_stdout("The configured sync root is already set to that directory.\n");
+    }
+
+    let was_active = services.is_active().map_err(CliError::Service)?;
+    if was_active {
+        services
+            .control(ServiceAction::Stop)
+            .map_err(CliError::Service)?;
+    }
+    let change = change_sync_root_while_stopped(&current, &replacement);
+    if was_active && let Err(restore) = services.control(ServiceAction::Start) {
+        return match change {
+            Ok(()) => Err(CliError::Service(restore)),
+            Err(source) => Err(CliError::RootChangeAndRestore {
+                source: Box::new(source),
+                restore,
+            }),
+        };
+    }
+    change?;
+    write_stdout(&format!(
+        "Omabox sync root is now {}.\n",
+        replacement.sync_root().display()
+    ))
+}
+
+fn change_sync_root_while_stopped(current: &Config, replacement: &Config) -> Result<(), CliError> {
+    let _lock = InstanceLock::acquire(current.paths().lock_file())
+        .map_err(|source| CliError::Lock { source })?;
+    let journal_path = current.paths().journal_file();
+    if journal_path
+        .try_exists()
+        .map_err(|source| CliError::InspectJournal { source })?
+    {
+        let journal =
+            Journal::open_read_only(journal_path).map_err(|source| CliError::Journal {
+                operation: "inspect pending work before changing the sync root",
+                source,
+            })?;
+        if !journal
+            .pending_plans()
+            .map_err(|source| CliError::Journal {
+                operation: "inspect pending sync operations",
+                source,
+            })?
+            .is_empty()
+            || !journal
+                .pending_recoveries()
+                .map_err(|source| CliError::Journal {
+                    operation: "inspect pending recovery copies",
+                    source,
+                })?
+                .is_empty()
+        {
+            return Err(CliError::PendingWork);
+        }
+    }
+    replacement
+        .write()
+        .map_err(config_error("write the new sync root"))
+}
+
+fn config_error(operation: &'static str) -> impl FnOnce(ConfigError) -> CliError {
+    move |source| CliError::Config {
+        operation,
+        source: Box::new(source),
+    }
 }
 
 fn read_authorization_code() -> Result<String, CliError> {
@@ -197,10 +468,27 @@ enum CliError {
         source: Box<ConfigError>,
     },
 
+    #[error("could not inspect the Omabox configuration path")]
+    #[diagnostic(
+        code(omabox::cli::inspect_config),
+        help("Ensure the XDG configuration location is accessible and retry.")
+    )]
+    InspectConfig {
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("Omabox configuration already exists")]
+    #[diagnostic(
+        code(omabox::cli::initial_config_exists),
+        help("Use `omabox settings` or `omabox settings set-root PATH` to change configuration.")
+    )]
+    InitialConfigExists,
+
     #[error("could not acquire the Omabox daemon lock")]
     #[diagnostic(
         code(omabox::cli::lock),
-        help("Stop the running Omabox daemon before setup, then retry.")
+        help("Stop any manually started Omabox daemon, then retry.")
     )]
     Lock {
         #[source]
@@ -210,12 +498,40 @@ enum CliError {
     #[error("could not {operation}")]
     #[diagnostic(
         code(omabox::cli::journal),
-        help("Ensure the Omabox state directory is writable and retry.")
+        help("Ensure the Omabox state directory is accessible and retry.")
     )]
     Journal {
         operation: &'static str,
         #[source]
         source: JournalError,
+    },
+
+    #[error("could not inspect the Omabox journal before changing the sync root")]
+    #[diagnostic(
+        code(omabox::cli::inspect_journal),
+        help("Ensure the Omabox state directory is accessible and retry.")
+    )]
+    InspectJournal {
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("finish the current synchronization before changing the sync root")]
+    #[diagnostic(
+        code(omabox::cli::pending_work),
+        help("Wait for `omabox status` to report no pending work, then retry.")
+    )]
+    PendingWork,
+
+    #[error("the sync-root change failed and the Omabox service could not be restarted: {restore}")]
+    #[diagnostic(
+        code(omabox::cli::root_change_and_restore),
+        help("Start the service with `omabox service start`, then address the original error.")
+    )]
+    RootChangeAndRestore {
+        #[source]
+        source: Box<CliError>,
+        restore: ServiceError,
     },
 
     #[error("could not {operation}")]
@@ -261,6 +577,13 @@ enum CliError {
     )]
     InvalidAuthorizationCode,
 
+    #[error("could not serialize settings output")]
+    #[diagnostic(
+        code(omabox::cli::serialize_output),
+        help("Use `omabox settings` for human-readable output.")
+    )]
+    SerializeOutput(#[source] serde_json::Error),
+
     #[error("could not {operation}")]
     #[diagnostic(
         code(omabox::cli::io),
@@ -274,41 +597,280 @@ enum CliError {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
+    Service(#[from] ServiceError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
     Status(#[from] StatusError),
 }
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use omabox::journal::{LocalRootBinding, PlanWrite};
+    use omabox::model::{Baseline, ContentIdentity, Decision, LocalFile, Observation};
+
     use super::*;
 
     fn arguments(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
     }
 
+    fn fake_systemctl(
+        directory: &Path,
+        active: bool,
+        log: &Path,
+    ) -> Result<PathBuf, Box<dyn Error>> {
+        let path = directory.join("systemctl");
+        let active_status = if active { 0 } else { 3 };
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$2\" >> '{}'\nif [ \"$2\" = is-active ]; then exit {active_status}; fi\nexit 0\n",
+                log.display()
+            ),
+        )?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+        Ok(path)
+    }
+
+    fn fixture() -> Result<(tempfile::TempDir, XdgDirectories, PathBuf, PathBuf), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        fs::create_dir(&first)?;
+        fs::create_dir(&second)?;
+        let xdg = XdgDirectories::new(
+            temporary.path().join("config"),
+            temporary.path().join("state"),
+        )?;
+        let config = Config::from_values(&xdg, &first, "public-app-key")?;
+        config.prepare()?;
+        config.write()?;
+        Ok((temporary, xdg, first, second))
+    }
+
     #[test]
-    fn parser_accepts_only_documented_forms() -> Result<(), Box<dyn std::error::Error>> {
+    fn parser_accepts_documented_forms() -> Result<(), Box<dyn Error>> {
+        assert_eq!(parse(arguments(&["--help"]))?, Command::Help);
+        assert_eq!(parse(arguments(&["--version"]))?, Command::Version);
         assert_eq!(
             parse(arguments(&["setup"]))?,
-            Command::Setup {
-                remote_root: String::new()
-            }
+            Command::Setup(SetupOptions {
+                remote_root: String::new(),
+                initial_config: None,
+            })
         );
         assert_eq!(
             parse(arguments(&["setup", "/Work"]))?,
-            Command::Setup {
-                remote_root: String::from("/Work")
-            }
+            Command::Setup(SetupOptions {
+                remote_root: String::from("/Work"),
+                initial_config: None,
+            })
         );
-        assert_eq!(parse(arguments(&["status"]))?, Command::Status);
+        assert_eq!(
+            parse(arguments(&[
+                "setup",
+                "--remote-root",
+                "/Work",
+                "--app-key",
+                "key",
+                "--sync-root",
+                "/tmp/Dropbox",
+            ]))?,
+            Command::Setup(SetupOptions {
+                remote_root: String::from("/Work"),
+                initial_config: Some(InitialConfig {
+                    sync_root: PathBuf::from("/tmp/Dropbox"),
+                    app_key: String::from("key"),
+                }),
+            })
+        );
+        assert_eq!(
+            parse(arguments(&["settings", "--json"]))?,
+            Command::Settings { json: true }
+        );
+        assert_eq!(
+            parse(arguments(&["settings", "set-root", "/tmp/new"]))?,
+            Command::SetRoot(PathBuf::from("/tmp/new"))
+        );
+        assert_eq!(
+            parse(arguments(&["service", "restart"]))?,
+            Command::Service(ServiceAction::Restart)
+        );
+        assert_eq!(parse(arguments(&["logs"]))?, Command::Logs);
+        Ok(())
+    }
 
+    #[test]
+    fn parser_rejects_incomplete_or_secret_bearing_forms() {
         for rejected in [
             Vec::<OsString>::new(),
             arguments(&["unknown"]),
             arguments(&["status", "extra"]),
-            arguments(&["setup", "/one", "/two"]),
+            arguments(&["setup", "--sync-root", "/tmp/Dropbox"]),
+            arguments(&[
+                "setup",
+                "--sync-root",
+                "/tmp/Dropbox",
+                "--app-key",
+                "key",
+                "--app-secret",
+                "secret",
+            ]),
+            arguments(&["settings", "set-root"]),
+            arguments(&["service", "unknown"]),
         ] {
             assert!(matches!(parse(rejected), Err(CliError::Usage(_))));
         }
+    }
+
+    #[test]
+    fn failed_initial_setup_leaves_no_config_and_same_command_can_retry()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let sync_root = temporary.path().join("Dropbox");
+        fs::create_dir(&sync_root)?;
+        let xdg = XdgDirectories::new(
+            temporary.path().join("config"),
+            temporary.path().join("state"),
+        )?;
+        let command = || {
+            parse(vec![
+                OsString::from("setup"),
+                OsString::from("--sync-root"),
+                sync_root.as_os_str().to_os_string(),
+                OsString::from("--app-key"),
+                OsString::from("public-app-key"),
+            ])
+        };
+
+        for should_succeed in [false, true] {
+            let Command::Setup(options) = command()? else {
+                return Err("documented setup form parsed as another command".into());
+            };
+            let Some(initial) = options.initial_config else {
+                return Err("documented flag setup did not contain initial config".into());
+            };
+            let config = Config::from_values(&xdg, initial.sync_root, initial.app_key)?;
+            config.prepare()?;
+            let _lock = InstanceLock::acquire(config.paths().lock_file())?;
+            let result = complete_setup(&config, true, || {
+                if should_succeed {
+                    Ok(())
+                } else {
+                    Err(CliError::InvalidAuthorizationCode)
+                }
+            });
+            if should_succeed {
+                result?;
+            } else {
+                assert!(matches!(result, Err(CliError::InvalidAuthorizationCode)));
+                assert!(!xdg.config_file().exists());
+            }
+        }
+
+        assert_eq!(Config::load_from(&xdg)?.dropbox_app_key(), "public-app-key");
+        Ok(())
+    }
+
+    #[test]
+    fn set_root_refuses_pending_work_and_restores_running_service() -> Result<(), Box<dyn Error>> {
+        let (temporary, xdg, first, second) = fixture()?;
+        let config = Config::load_from(&xdg)?;
+        let original_config = fs::read(config.paths().config_file())?;
+        let mut journal = Journal::open(config.paths().journal_file())?;
+        let Decision::Operations(plan) = omabox::planner::plan(
+            &Baseline::Absent,
+            &Observation::Present(LocalFile::new(ContentIdentity::new("pending-content"))),
+            &Observation::ConfirmedAbsent,
+        ) else {
+            return Err("planner did not produce the pending operation".into());
+        };
+        assert!(matches!(
+            journal.record_plan(Path::new("pending.txt"), &plan)?,
+            PlanWrite::Recorded(_)
+        ));
+        drop(journal);
+
+        let service_log = temporary.path().join("service.log");
+        let systemctl = fake_systemctl(temporary.path(), true, &service_log)?;
+        let services = ServiceCommands::new(systemctl, "/unused/journalctl");
+        assert!(matches!(
+            set_sync_root(&second, &xdg, &services),
+            Err(CliError::PendingWork)
+        ));
+        assert_eq!(Config::load_from(&xdg)?.sync_root(), first);
+        assert_eq!(fs::read(config.paths().config_file())?, original_config);
+        assert_eq!(fs::read_to_string(service_log)?, "is-active\nstop\nstart\n");
+        Ok(())
+    }
+
+    #[test]
+    fn set_root_requires_the_daemon_lock_before_writing_config() -> Result<(), Box<dyn Error>> {
+        let (temporary, xdg, _first, second) = fixture()?;
+        let config = Config::load_from(&xdg)?;
+        let original_config = fs::read(config.paths().config_file())?;
+        let _held_lock = InstanceLock::acquire(config.paths().lock_file())?;
+        let service_log = temporary.path().join("service.log");
+        let systemctl = fake_systemctl(temporary.path(), false, &service_log)?;
+        let services = ServiceCommands::new(systemctl, "/unused/journalctl");
+
+        assert!(matches!(
+            set_sync_root(&second, &xdg, &services),
+            Err(CliError::Lock { .. })
+        ));
+        assert_eq!(fs::read(config.paths().config_file())?, original_config);
+        assert_eq!(fs::read_to_string(service_log)?, "is-active\n");
+        Ok(())
+    }
+
+    #[test]
+    fn set_root_preserves_inactive_state_and_uses_root_generation() -> Result<(), Box<dyn Error>> {
+        let (temporary, xdg, first, second) = fixture()?;
+        let config = Config::load_from(&xdg)?;
+        let mut journal = Journal::open(config.paths().journal_file())?;
+        let _ = journal.activate_local_root(&LocalRootBinding::inspect(&first)?)?;
+        let remote = omabox::model::RemoteFile::new(
+            ContentIdentity::new("remote-content"),
+            omabox::model::DropboxRevision::new("remote-revision"),
+        );
+        journal.publish_remote_inventory(
+            "remote-cursor",
+            &[omabox::journal::RemoteObservationRecord {
+                canonical_path: PathBuf::from("remote.txt"),
+                path: PathBuf::from("remote.txt"),
+                observation: Observation::Present(remote.clone()),
+            }],
+        )?;
+        let Decision::NoOp(agreement) = omabox::planner::plan(
+            &Baseline::Absent,
+            &Observation::Present(LocalFile::new(remote.content.clone())),
+            &Observation::Present(remote),
+        ) else {
+            return Err("planner did not produce the initial agreement".into());
+        };
+        let _ = journal.record_noop(Path::new("remote.txt"), &agreement)?;
+        assert_eq!(journal.baseline_paths()?, vec![PathBuf::from("remote.txt")]);
+        drop(journal);
+
+        let service_log = temporary.path().join("service.log");
+        let systemctl = fake_systemctl(temporary.path(), false, &service_log)?;
+        let services = ServiceCommands::new(systemctl, "/unused/journalctl");
+        set_sync_root(&second, &xdg, &services)?;
+        assert_eq!(Config::load_from(&xdg)?.sync_root(), second);
+        assert_eq!(fs::read_to_string(service_log)?, "is-active\n");
+
+        let mut journal = Journal::open(config.paths().journal_file())?;
+        let _ = journal.activate_local_root(&LocalRootBinding::inspect(&second)?)?;
+        assert!(journal.baseline_paths()?.is_empty());
+        assert_eq!(
+            journal.remote_inventory()?.cursor,
+            Some(String::from("remote-cursor"))
+        );
         Ok(())
     }
 }
