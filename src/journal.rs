@@ -6,8 +6,8 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::model::{
@@ -17,7 +17,8 @@ use crate::model::{
 
 const MIGRATION_V1: &str = include_str!("../migrations/0001.sql");
 const MIGRATION_V2: &str = include_str!("../migrations/0002.sql");
-const SCHEMA_VERSION: i64 = 2;
+const MIGRATION_V3: &str = include_str!("../migrations/0003.sql");
+const SCHEMA_VERSION: i64 = 3;
 
 /// A journal failure with its operation, affected path, and original cause.
 #[derive(Debug, Error)]
@@ -129,6 +130,32 @@ pub struct LocalObservationRecord {
     pub path: PathBuf,
     /// Complete observation for the path.
     pub observation: LocalObservation,
+}
+
+/// Filesystem metadata that identifies the exact bytes hashed during a local scan.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct LocalFileFingerprint {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) size: u64,
+    pub(crate) modified_seconds: i64,
+    pub(crate) modified_nanoseconds: u64,
+    pub(crate) changed_seconds: i64,
+    pub(crate) changed_nanoseconds: u64,
+}
+
+/// One reusable, verified Dropbox content hash from a complete local scan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalHashRecord {
+    pub(crate) path: PathBuf,
+    pub(crate) fingerprint: LocalFileFingerprint,
+    pub(crate) content: ContentIdentity,
+}
+
+#[derive(Deserialize, Serialize)]
+struct LocalHashValue {
+    fingerprint: LocalFileFingerprint,
+    content: ContentIdentity,
 }
 
 /// One path from a complete Dropbox inventory.
@@ -462,13 +489,24 @@ impl Journal {
                         source,
                     })?;
             }
-            transaction
-                .execute_batch(MIGRATION_V2)
-                .map_err(|source| JournalError::Sqlite {
-                    operation: "apply journal version-two migration",
-                    path: path.clone(),
-                    source,
-                })?;
+            if version < 2 {
+                transaction
+                    .execute_batch(MIGRATION_V2)
+                    .map_err(|source| JournalError::Sqlite {
+                        operation: "apply journal version-two migration",
+                        path: path.clone(),
+                        source,
+                    })?;
+            }
+            if version < 3 {
+                transaction
+                    .execute_batch(MIGRATION_V3)
+                    .map_err(|source| JournalError::Sqlite {
+                        operation: "apply journal version-three migration",
+                        path: path.clone(),
+                        source,
+                    })?;
+            }
             transaction
                 .commit()
                 .map_err(|source| JournalError::Sqlite {
@@ -503,7 +541,7 @@ impl Journal {
                 path: path.clone(),
                 source,
             })?;
-        if version != 1 && version != SCHEMA_VERSION {
+        if !(1..=SCHEMA_VERSION).contains(&version) {
             return Err(JournalError::UnsupportedVersion {
                 path,
                 found: version,
@@ -686,6 +724,9 @@ impl Journal {
             .execute("DELETE FROM local_observations", [])
             .map_err(|source| sqlite("clear prior root observations", &database_path, source))?;
         transaction
+            .execute("DELETE FROM local_hash_cache", [])
+            .map_err(|source| sqlite("clear prior root hash cache", &database_path, source))?;
+        transaction
             .execute("DELETE FROM conflicts", [])
             .map_err(|source| sqlite("clear prior root conflicts", &database_path, source))?;
         let record = LocalRootRecord {
@@ -736,6 +777,99 @@ impl Journal {
         transaction
             .commit()
             .map_err(|source| sqlite("commit local inventory", &database_path, source))
+    }
+
+    /// Load verified hashes belonging to the active local-root generation.
+    pub(crate) fn local_hash_cache(&self) -> Result<Vec<LocalHashRecord>, JournalError> {
+        if self.schema_version < 3 {
+            return Ok(Vec::new());
+        }
+        read_local_hash_cache(&self.connection, &self.database_path)
+    }
+
+    /// Atomically replace the complete local inventory and its bounded hash cache.
+    ///
+    /// Returns `false` without writing when `binding` is no longer the active root.
+    pub(crate) fn publish_local_scan(
+        &mut self,
+        binding: &LocalRootBinding,
+        observations: &[LocalObservationRecord],
+        hashes: &[LocalHashRecord],
+    ) -> Result<bool, JournalError> {
+        let encoded_observations = observations
+            .iter()
+            .map(|record| {
+                encode(
+                    &record.observation,
+                    "serialize local observation",
+                    &record.path,
+                )
+                .map(|json| (path_bytes(&record.path), json))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let encoded_hashes = hashes
+            .iter()
+            .map(|record| {
+                if !is_dropbox_content_hash(record.content.as_str()) {
+                    return Err(JournalError::InvalidState {
+                        operation: "publish local hash cache",
+                        path: record.path.clone(),
+                        detail: "cached content identity is not a Dropbox content hash",
+                    });
+                }
+                let value = LocalHashValue {
+                    fingerprint: record.fingerprint.clone(),
+                    content: record.content.clone(),
+                };
+                encode(&value, "serialize local hash cache", &record.path)
+                    .map(|json| (path_bytes(&record.path), json))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite("begin local scan publication", &database_path, source))?;
+        let Some(active) = read_local_root(&transaction, &database_path)? else {
+            return Ok(false);
+        };
+        if active.binding != *binding {
+            return Ok(false);
+        }
+        let generation =
+            i64::try_from(active.generation).map_err(|_| JournalError::InvalidState {
+                operation: "publish local hash cache",
+                path: database_path.clone(),
+                detail: "local root generation exceeds SQLite integer range",
+            })?;
+        transaction
+            .execute("DELETE FROM local_observations", [])
+            .map_err(|source| sqlite("replace local inventory", &database_path, source))?;
+        transaction
+            .execute("DELETE FROM local_hash_cache", [])
+            .map_err(|source| sqlite("replace local hash cache", &database_path, source))?;
+        for (path, json) in encoded_observations {
+            transaction
+                .execute(
+                    "INSERT INTO local_observations(path, observation_json) VALUES (?1, ?2)",
+                    params![path, json],
+                )
+                .map_err(|source| sqlite("publish local observation", &database_path, source))?;
+        }
+        for (path, json) in encoded_hashes {
+            transaction
+                .execute(
+                    "INSERT INTO local_hash_cache(\
+                         root_generation, path, hash_json\
+                     ) VALUES (?1, ?2, ?3)",
+                    params![generation, path, json],
+                )
+                .map_err(|source| sqlite("publish local hash", &database_path, source))?;
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite("commit local scan", &database_path, source))?;
+        Ok(true)
     }
 
     /// Load the complete committed local inventory.
@@ -1653,6 +1787,14 @@ fn decode_u64(bytes: &[u8], operation: &'static str, path: &Path) -> Result<u64,
     Ok(u64::from_be_bytes(raw))
 }
 
+fn is_dropbox_content_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
 fn decode_status(
     status: &str,
     operation: &'static str,
@@ -1802,6 +1944,47 @@ fn read_local_inventory(
             let path = bytes_path(raw_path);
             let observation = decode(&json, "deserialize local observation", &path)?;
             Ok(LocalObservationRecord { path, observation })
+        })
+        .collect()
+}
+
+fn read_local_hash_cache(
+    connection: &Connection,
+    database_path: &Path,
+) -> Result<Vec<LocalHashRecord>, JournalError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT cache.path, cache.hash_json \
+             FROM local_hash_cache AS cache \
+             JOIN local_root_binding AS root \
+               ON root.singleton = 1 AND cache.root_generation = root.generation \
+             ORDER BY cache.path",
+        )
+        .map_err(|source| sqlite("prepare local hash cache query", database_path, source))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|source| sqlite("query local hash cache", database_path, source))?;
+    let raw = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| sqlite("read local hash cache", database_path, source))?;
+    raw.into_iter()
+        .map(|(raw_path, json)| {
+            let path = bytes_path(raw_path);
+            let value: LocalHashValue = decode(&json, "deserialize local hash cache", &path)?;
+            if !is_dropbox_content_hash(value.content.as_str()) {
+                return Err(JournalError::InvalidState {
+                    operation: "read local hash cache",
+                    path,
+                    detail: "cached content identity is not a Dropbox content hash",
+                });
+            }
+            Ok(LocalHashRecord {
+                path,
+                fingerprint: value.fingerprint,
+                content: value.content,
+            })
         })
         .collect()
 }
@@ -2092,6 +2275,22 @@ mod tests {
             canonical_path: path.into(),
             device,
             inode,
+        }
+    }
+
+    fn local_hash(path: impl Into<PathBuf>, marker: u64) -> LocalHashRecord {
+        LocalHashRecord {
+            path: path.into(),
+            fingerprint: LocalFileFingerprint {
+                device: marker,
+                inode: marker + 1,
+                size: marker + 2,
+                modified_seconds: 1,
+                modified_nanoseconds: marker % 1_000_000_000,
+                changed_seconds: 2,
+                changed_nanoseconds: marker % 1_000_000_000,
+            },
+            content: ContentIdentity::new("a".repeat(64)),
         }
     }
 
@@ -2576,6 +2775,43 @@ mod tests {
     }
 
     #[test]
+    fn journal_local_scan_replaces_inventory_and_hashes_atomically() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let mut journal = Journal::open(journal_path(&directory))?;
+        let binding = local_root("/sync", 1, 2);
+        let _ = journal.activate_local_root(&binding)?;
+        let old = LocalObservationRecord {
+            path: PathBuf::from("old.txt"),
+            observation: Observation::Present(LocalFile::new(content("old"))),
+        };
+        let old_hash = local_hash("old.txt", 10);
+        assert!(journal.publish_local_scan(
+            &binding,
+            std::slice::from_ref(&old),
+            std::slice::from_ref(&old_hash),
+        )?);
+
+        let replacement = LocalObservationRecord {
+            path: PathBuf::from("new.txt"),
+            observation: Observation::Present(LocalFile::new(content("new"))),
+        };
+        let duplicate_hashes = [local_hash("new.txt", 20), local_hash("new.txt", 30)];
+        assert!(
+            journal
+                .publish_local_scan(
+                    &binding,
+                    std::slice::from_ref(&replacement),
+                    &duplicate_hashes,
+                )
+                .is_err()
+        );
+
+        assert_eq!(journal.local_inventory()?, vec![old]);
+        assert_eq!(journal.local_hash_cache()?, vec![old_hash]);
+        Ok(())
+    }
+
+    #[test]
     fn journal_final_operation_records_only_its_actual_result() -> Result<(), Box<dyn Error>> {
         let directory = TempDir::new()?;
         let mut journal = Journal::open(journal_path(&directory))?;
@@ -2884,7 +3120,7 @@ mod tests {
         drop(legacy);
 
         let mut journal = Journal::open(&database_path)?;
-        assert_eq!(journal.schema_version, 2);
+        assert_eq!(journal.schema_version, 3);
         assert_eq!(journal.baseline(path)?, None);
         assert_eq!(journal.baseline(kept_path)?, Some(kept_baseline.clone()));
         assert_eq!(journal.baseline_paths()?, vec![kept_path.to_path_buf()]);
@@ -2935,7 +3171,7 @@ mod tests {
         let version = journal
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let mut foreign_keys = journal
             .connection
             .prepare("PRAGMA foreign_key_list(recovery_records)")?;
@@ -2982,22 +3218,22 @@ mod tests {
         let directory = TempDir::new()?;
         let database_path = journal_path(&directory);
         let connection = Connection::open(&database_path)?;
-        connection.pragma_update(None, "user_version", 3)?;
+        connection.pragma_update(None, "user_version", 4)?;
         drop(connection);
 
         let opened = Journal::open(&database_path);
         assert!(matches!(
             opened,
             Err(JournalError::UnsupportedVersion {
-                found: 3,
-                supported: 2,
+                found: 4,
+                supported: 3,
                 ..
             })
         ));
         let connection = Connection::open(database_path)?;
         let version =
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         Ok(())
     }
 

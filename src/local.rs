@@ -1,6 +1,6 @@
 //! Root-confined local observation and crash-safe file phases.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -16,7 +16,10 @@ use rustix::fs::{
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::journal::{Journal, JournalError, LocalObservationRecord, LocalRootBinding};
+use crate::journal::{
+    Journal, JournalError, LocalFileFingerprint, LocalHashRecord, LocalObservationRecord,
+    LocalRootBinding,
+};
 use crate::model::{ContentIdentity, LocalFile, Observation, UnknownReason};
 
 const DROPBOX_BLOCK_SIZE: usize = 4 * 1024 * 1024;
@@ -108,6 +111,7 @@ pub enum HashError {
 pub struct CompleteScan {
     root_binding: LocalRootBinding,
     observations: Vec<LocalObservationRecord>,
+    hashes: Vec<LocalHashRecord>,
 }
 
 impl CompleteScan {
@@ -292,12 +296,27 @@ pub fn dropbox_content_hash(mut reader: impl Read) -> Result<ContentIdentity, Ha
 /// fails the whole scan. Callers therefore cannot confuse a partial walk with
 /// confirmed absence. Directories are retained as conservative unknown file
 /// observations while their contents are scanned recursively.
+#[cfg(test)]
 fn scan(root: impl AsRef<Path>) -> Result<CompleteScan, LocalError> {
+    scan_with_cache(root, &BTreeMap::new())
+}
+
+fn scan_with_cache(
+    root: impl AsRef<Path>,
+    cache: &BTreeMap<PathBuf, LocalHashRecord>,
+) -> Result<CompleteScan, LocalError> {
     let root = root.as_ref();
     let root_fd = open_absolute_directory(root, "open sync root for scan")?;
     let before = stat_fd(&root_fd, root, "inspect sync root before scan")?;
     let mut observations = Vec::new();
-    scan_directory(&root_fd, Path::new(""), &mut observations)?;
+    let mut hashes = Vec::new();
+    scan_directory(
+        &root_fd,
+        Path::new(""),
+        cache,
+        &mut observations,
+        &mut hashes,
+    )?;
     let after = stat_fd(&root_fd, root, "inspect sync root after scan")?;
     if !same_observation(&before, &after) {
         return Err(LocalError::ChangedDuringRead {
@@ -314,9 +333,11 @@ fn scan(root: impl AsRef<Path>) -> Result<CompleteScan, LocalError> {
         });
     }
     observations.sort_by(|left, right| left.path.cmp(&right.path));
+    hashes.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(CompleteScan {
         root_binding: root_binding(root, &before),
         observations,
+        hashes,
     })
 }
 
@@ -326,15 +347,24 @@ pub fn scan_and_publish(
     root: impl AsRef<Path>,
 ) -> Result<ScanPublication, LocalError> {
     let root = root.as_ref();
-    let scan = scan(root)?;
+    let cache = journal
+        .local_hash_cache()
+        .map_err(|source| LocalError::Journal { source })?
+        .into_iter()
+        .map(|record| (record.path.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+    let scan = scan_with_cache(root, &cache)?;
     if !active_root_matches(journal, &scan.root_binding)?
         || !configured_root_is_active(journal, root)?
     {
         return Ok(ScanPublication::RootChanged);
     }
-    journal
-        .publish_local_inventory(scan.observations())
-        .map_err(|source| LocalError::Journal { source })?;
+    if !journal
+        .publish_local_scan(&scan.root_binding, scan.observations(), &scan.hashes)
+        .map_err(|source| LocalError::Journal { source })?
+    {
+        return Ok(ScanPublication::RootChanged);
+    }
     Ok(ScanPublication::Published(scan))
 }
 
@@ -952,7 +982,9 @@ pub(crate) fn verify_private_copy(
 fn scan_directory(
     directory: &OwnedFd,
     relative: &Path,
+    cache: &BTreeMap<PathBuf, LocalHashRecord>,
     observations: &mut Vec<LocalObservationRecord>,
+    hashes: &mut Vec<LocalHashRecord>,
 ) -> Result<(), LocalError> {
     let before = stat_fd(directory, relative, "inspect directory before scan")?;
     let mut stream = Dir::read_from(directory)
@@ -995,10 +1027,30 @@ fn scan_directory(
                         path,
                     });
                 }
-                let content = hash_stable_file(&mut file, &path, "hash local scan file")?;
+                let opened_fingerprint = file_fingerprint(&opened, &path)?;
+                let (content, fingerprint) = match cache.get(&path) {
+                    Some(record) if record.fingerprint == opened_fingerprint => {
+                        let after = stat_fd(&file, &path, "verify cached local scan file")?;
+                        if !same_observation(&opened, &after) {
+                            return Err(LocalError::ChangedDuringRead {
+                                operation: "reuse cached local scan hash",
+                                path,
+                            });
+                        }
+                        (record.content.clone(), opened_fingerprint)
+                    }
+                    Some(_) | None => {
+                        hash_stable_file_with_fingerprint(&mut file, &path, "hash local scan file")?
+                    }
+                };
                 observations.push(LocalObservationRecord {
+                    path: path.clone(),
+                    observation: Observation::Present(LocalFile::new(content.clone())),
+                });
+                hashes.push(LocalHashRecord {
                     path,
-                    observation: Observation::Present(LocalFile::new(content)),
+                    fingerprint,
+                    content,
                 });
             }
             FileType::Directory => {
@@ -1014,7 +1066,7 @@ fn scan_directory(
                     path: path.clone(),
                     observation: Observation::Unknown(UnknownReason::Unsupported),
                 });
-                scan_directory(&child, &path, observations)?;
+                scan_directory(&child, &path, cache, observations, hashes)?;
             }
             FileType::Symlink
             | FileType::Fifo
@@ -1062,12 +1114,21 @@ fn hash_stable_file(
     path: &Path,
     operation: &'static str,
 ) -> Result<ContentIdentity, LocalError> {
+    hash_stable_file_with_fingerprint(file, path, operation).map(|(content, _)| content)
+}
+
+fn hash_stable_file_with_fingerprint(
+    file: &mut File,
+    path: &Path,
+    operation: &'static str,
+) -> Result<(ContentIdentity, LocalFileFingerprint), LocalError> {
     let before = stat_fd(file, path, operation)?;
     if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile {
         return Err(LocalError::UnsupportedObject {
             path: path.to_path_buf(),
         });
     }
+    let fingerprint = file_fingerprint(&before, path)?;
     file.seek(SeekFrom::Start(0))
         .map_err(|source| io_failure("rewind file before hashing", path, source))?;
     let identity = hash_stream(file).map_err(|source| io_failure(operation, path, source))?;
@@ -1078,7 +1139,32 @@ fn hash_stable_file(
             path: path.to_path_buf(),
         });
     }
-    Ok(identity)
+    Ok((identity, fingerprint))
+}
+
+fn file_fingerprint(
+    stat: &rustix::fs::Stat,
+    path: &Path,
+) -> Result<LocalFileFingerprint, LocalError> {
+    let size = u64::try_from(stat.st_size).map_err(|_| {
+        io_failure(
+            "inspect local file size",
+            path,
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "regular file reported a negative size",
+            ),
+        )
+    })?;
+    Ok(LocalFileFingerprint {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+        size,
+        modified_seconds: stat.st_mtime,
+        modified_nanoseconds: stat.st_mtime_nsec,
+        changed_seconds: stat.st_ctime,
+        changed_nanoseconds: stat.st_ctime_nsec,
+    })
 }
 
 fn hex_digest(digest: impl AsRef<[u8]>) -> String {
@@ -2122,6 +2208,44 @@ mod tests {
         ContentIdentity::new(hex_digest(aggregate.finalize()))
     }
 
+    fn scanned_content<'a>(
+        scan: &'a CompleteScan,
+        path: &Path,
+    ) -> Result<&'a ContentIdentity, io::Error> {
+        scan.observations
+            .iter()
+            .find_map(|record| {
+                if record.path != path {
+                    return None;
+                }
+                match &record.observation {
+                    Observation::Present(file) => Some(&file.content),
+                    Observation::ConfirmedAbsent | Observation::Unknown(_) => None,
+                }
+            })
+            .ok_or_else(|| io::Error::other("scan did not contain the expected regular file"))
+    }
+
+    fn fingerprint(root: &Path, relative: &Path) -> Result<LocalFileFingerprint, LocalError> {
+        let root = open_absolute_directory(root, "open test scan root")?;
+        let file = open_relative_regular(&root, relative, "open test scan file")?;
+        let stat = stat_fd(&file, relative, "inspect test scan file")?;
+        file_fingerprint(&stat, relative)
+    }
+
+    fn test_cache(
+        path: &Path,
+        fingerprint: LocalFileFingerprint,
+        content: &ContentIdentity,
+    ) -> BTreeMap<PathBuf, LocalHashRecord> {
+        let record = LocalHashRecord {
+            path: path.to_path_buf(),
+            fingerprint,
+            content: content.clone(),
+        };
+        BTreeMap::from([(path.to_path_buf(), record)])
+    }
+
     #[test]
     fn dropbox_hash_uses_block_hash_composition() -> Result<(), Box<dyn Error>> {
         let empty = identity(b"")?;
@@ -2184,6 +2308,132 @@ mod tests {
         symlink(outside.path(), directory.path().join("escape"))?;
         let result = scan(directory.path());
         assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_scan_file_reuses_cached_hash_without_reading_bytes() -> Result<(), Box<dyn Error>>
+    {
+        let directory = TempDir::new()?;
+        let root = directory.path().join("root");
+        std::fs::create_dir(&root)?;
+        let path = Path::new("cached.txt");
+        std::fs::write(root.join(path), b"bytes that would hash differently")?;
+        let fingerprint = fingerprint(&root, path)?;
+        let cached = ContentIdentity::new("0".repeat(64));
+        let binding = LocalRootBinding::inspect(&root)?;
+        let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+        let _ = journal.activate_local_root(&binding)?;
+        let cached_observation = LocalObservationRecord {
+            path: path.to_path_buf(),
+            observation: Observation::Present(LocalFile::new(cached.clone())),
+        };
+        let cached_record = LocalHashRecord {
+            path: path.to_path_buf(),
+            fingerprint,
+            content: cached.clone(),
+        };
+        assert!(journal.publish_local_scan(
+            &binding,
+            std::slice::from_ref(&cached_observation),
+            std::slice::from_ref(&cached_record),
+        )?);
+
+        let scan = match scan_and_publish(&mut journal, &root)? {
+            ScanPublication::Published(scan) => scan,
+            ScanPublication::RootChanged => {
+                return Err(io::Error::other("test root changed during cached scan").into());
+            }
+        };
+
+        assert_eq!(scanned_content(&scan, path)?, &cached);
+        Ok(())
+    }
+
+    #[test]
+    fn every_fingerprint_field_mismatch_rehashes_the_file() -> Result<(), Box<dyn Error>> {
+        let root = TempDir::new()?;
+        let path = Path::new("changed.txt");
+        let bytes = b"actual bytes";
+        std::fs::write(root.path().join(path), bytes)?;
+        let actual = identity(bytes)?;
+        let cached = ContentIdentity::new("0".repeat(64));
+        let original = fingerprint(root.path(), path)?;
+        let mut variants = Vec::new();
+
+        let mut changed = original.clone();
+        changed.device ^= 1;
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.inode ^= 1;
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.size ^= 1;
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.modified_seconds ^= 1;
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.modified_nanoseconds ^= 1;
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.changed_seconds ^= 1;
+        variants.push(changed);
+        let mut changed = original;
+        changed.changed_nanoseconds ^= 1;
+        variants.push(changed);
+
+        for changed in variants {
+            let scan = scan_with_cache(root.path(), &test_cache(path, changed, &cached))?;
+            assert_eq!(scanned_content(&scan, path)?, &actual);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_scan_preserves_published_inventory_and_hash_cache() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::symlink;
+
+        let directory = TempDir::new()?;
+        let root = directory.path().join("root");
+        let outside = directory.path().join("outside");
+        std::fs::create_dir(&root)?;
+        std::fs::create_dir(&outside)?;
+        std::fs::write(root.join("kept.txt"), b"kept")?;
+        let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+        let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+        assert!(matches!(
+            scan_and_publish(&mut journal, &root)?,
+            ScanPublication::Published(_)
+        ));
+        let inventory = journal.local_inventory()?;
+        let cache = journal.local_hash_cache()?;
+        assert_eq!(cache.len(), 1);
+
+        symlink(&outside, root.join("unsupported-link"))?;
+        assert!(scan_and_publish(&mut journal, &root).is_err());
+        assert_eq!(journal.local_inventory()?, inventory);
+        assert_eq!(journal.local_hash_cache()?, cache);
+        Ok(())
+    }
+
+    #[test]
+    fn switching_local_root_clears_the_hash_cache() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        std::fs::create_dir(&first)?;
+        std::fs::create_dir(&second)?;
+        std::fs::write(first.join("cached.txt"), b"cached")?;
+        let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+        let _ = journal.activate_local_root(&LocalRootBinding::inspect(&first)?)?;
+        let _ = scan_and_publish(&mut journal, &first)?;
+        assert_eq!(journal.local_hash_cache()?.len(), 1);
+
+        let _ = journal.activate_local_root(&LocalRootBinding::inspect(&second)?)?;
+
+        assert!(journal.local_inventory()?.is_empty());
+        assert!(journal.local_hash_cache()?.is_empty());
         Ok(())
     }
 
