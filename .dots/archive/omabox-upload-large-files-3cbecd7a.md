@@ -1,9 +1,11 @@
 ---
 title: Upload large files with Dropbox sessions
-status: active
+status: closed
 priority: 1
 issue-type: task
-created-at: "\"2026-08-24T23:15:02.284311+02:00\""
+created-at: "\"\\\"2026-08-24T23:15:02.284311+02:00\\\"\""
+closed-at: "2026-08-24T23:27:50.394902+02:00"
+close-reason: Large files stream through bounded sequential Dropbox upload sessions with strict conditional commit semantics; corrected Stone union wire format; 141 tests, fmt, Clippy, forbidden scan, and independent Sol re-review are clean.
 ---
 
 Problem: uploads above Dropbox’s 150 MiB direct-upload limit fail instead of syncing.
