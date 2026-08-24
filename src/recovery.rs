@@ -12,8 +12,8 @@ use crate::journal::{
 use crate::local::{
     ConflictOutcome, ConflictSide, DeleteOutcome, InstallOutcome, LocalError, StageOutcome,
     StagedUpload, VerifiedRecovery, conflict_relative_path, delete_local, install_download,
-    materialize_conflict, materialize_verified_copy, open_private_directory, open_root,
-    open_root_file, recovery_file_name, stage_upload, verify_private_copy,
+    materialize_conflict, materialize_verified_copy, observe_upload_source, open_private_directory,
+    open_root, open_root_file, recovery_file_name, stage_upload, verify_private_copy,
 };
 use crate::model::{Baseline, Conflict, ContentIdentity, LocalFile, Operation, RemoteFile};
 
@@ -155,9 +155,7 @@ pub fn materialize(
     recovery_directory: impl AsRef<Path>,
     record: &RecoveryRecord,
 ) -> Result<RecoveryMaterialization, RecoveryError> {
-    let sync_root = sync_root.as_ref();
     let recovery_directory = recovery_directory.as_ref();
-    let name = recovery_file_name(&record.original_path, &record.content);
     let expected_path = destination(recovery_directory, &record.original_path, &record.content);
     if record.recovery_path != expected_path {
         return Err(RecoveryError::InvalidJournalState {
@@ -165,28 +163,55 @@ pub fn materialize(
             detail: "recovery destination is not the deterministic configured path",
         });
     }
+    materialize_expected(
+        sync_root.as_ref(),
+        recovery_directory,
+        &record.original_path,
+        &record.content,
+    )
+}
 
+/// Materialize a deterministic local recovery copy before its plan is visible.
+///
+/// A prior matching copy is reusable, but never substitutes for checking that
+/// the currently observed source still contains the planned bytes.
+pub(crate) fn materialize_before_plan(
+    sync_root: &Path,
+    recovery_directory: &Path,
+    original_path: &Path,
+    content: &ContentIdentity,
+) -> Result<RecoveryMaterialization, RecoveryError> {
+    let materialized = materialize_expected(sync_root, recovery_directory, original_path, content)?;
+    let actual = observe_upload_source(sync_root, original_path)?;
+    if actual != *content {
+        return Ok(RecoveryMaterialization::SourceChanged { actual });
+    }
+    Ok(materialized)
+}
+
+fn materialize_expected(
+    sync_root: &Path,
+    recovery_directory: &Path,
+    original_path: &Path,
+    content: &ContentIdentity,
+) -> Result<RecoveryMaterialization, RecoveryError> {
+    let name = recovery_file_name(original_path, content);
     let directory =
         open_private_directory(recovery_directory, "open configured recovery directory")?;
-    if verify_private_copy(&directory, recovery_directory, &name, &record.content)? {
+    if verify_private_copy(&directory, recovery_directory, &name, content)? {
         return Ok(RecoveryMaterialization::AlreadyPresent(
-            VerifiedRecovery::new(record.original_path.clone(), record.content.clone()),
+            VerifiedRecovery::new(original_path.to_path_buf(), content.clone()),
         ));
     }
     let root = open_root(sync_root, "open sync root for recovery")?;
     let mut source = open_root_file(
         &root,
-        &record.original_path,
+        original_path,
         "open displaced local payload for recovery",
     )?;
-    let outcome = materialize_verified_copy(
-        &directory,
-        recovery_directory,
-        &name,
-        &record.content,
-        &mut source,
-    )?;
-    let verified = || VerifiedRecovery::new(record.original_path.clone(), record.content.clone());
+    let outcome =
+        materialize_verified_copy(&directory, recovery_directory, &name, content, &mut source)?;
+    let verified = || VerifiedRecovery::new(original_path.to_path_buf(), content.clone());
     match outcome {
         StageOutcome::Staged(()) => Ok(RecoveryMaterialization::Created(verified())),
         StageOutcome::AlreadyStaged(()) => Ok(RecoveryMaterialization::AlreadyPresent(verified())),

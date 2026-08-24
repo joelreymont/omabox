@@ -18,8 +18,9 @@ use crate::model::{
 };
 use crate::planner::plan;
 use crate::recovery::{
-    RecoveryError, ReplayBlocked, ReplayReport, destination, materialize_local_conflict,
-    materialize_remote_conflict, replay_local_operations, replay_remote_operations,
+    RecoveryError, RecoveryMaterialization, ReplayBlocked, ReplayReport, destination,
+    materialize_before_plan, materialize_local_conflict, materialize_remote_conflict,
+    replay_local_operations, replay_remote_operations,
 };
 
 /// A reconciliation failure. Expected observation races are returned as outcomes instead.
@@ -375,12 +376,34 @@ fn prepare_plan(
                 };
                 stage_remote(dropbox, recovery_directory, Path::new(name), path, file)?;
             }
-            Operation::PreserveLocal { .. }
-            | Operation::DeleteLocal { .. }
-            | Operation::DeleteRemote { .. } => {}
+            Operation::PreserveLocal { file } => {
+                if matches!(
+                    prepare_local_preservation(sync_root, recovery_directory, path, &file.content)?,
+                    Prepared::FreshObservation
+                ) {
+                    return Ok(Prepared::FreshObservation);
+                }
+            }
+            Operation::DeleteLocal { .. } | Operation::DeleteRemote { .. } => {}
         }
     }
     Ok(Prepared::Ready(()))
+}
+
+fn prepare_local_preservation(
+    sync_root: &Path,
+    recovery_directory: &Path,
+    path: &Path,
+    content: &crate::model::ContentIdentity,
+) -> Result<Prepared<()>, ReconcileError> {
+    match materialize_before_plan(sync_root, recovery_directory, path, content) {
+        Ok(RecoveryMaterialization::Created(_) | RecoveryMaterialization::AlreadyPresent(_)) => {
+            Ok(Prepared::Ready(()))
+        }
+        Ok(RecoveryMaterialization::SourceChanged { .. }) => Ok(Prepared::FreshObservation),
+        Err(source) if recovery_source_changed(&source, path) => Ok(Prepared::FreshObservation),
+        Err(source) => Err(ReconcileError::Recovery { source }),
+    }
 }
 
 fn prepare_conflict(
@@ -436,6 +459,31 @@ fn local_source_changed(error: &LocalError, path: &Path) -> bool {
             ..
         } => changed == path,
         _ => false,
+    }
+}
+
+fn recovery_source_changed(error: &RecoveryError, path: &Path) -> bool {
+    match error {
+        RecoveryError::Local { source } if local_source_changed(source, path) => true,
+        RecoveryError::Local {
+            source:
+                LocalError::Io {
+                    operation: "open displaced local payload for recovery",
+                    path: changed,
+                    ..
+                },
+        } => changed == path,
+        RecoveryError::Local {
+            source:
+                LocalError::ChangedDuringRead {
+                    operation: "materialize recovery copy",
+                    ..
+                },
+        } => true,
+        RecoveryError::Local { .. }
+        | RecoveryError::Journal { .. }
+        | RecoveryError::Dropbox { .. }
+        | RecoveryError::InvalidJournalState { .. } => false,
     }
 }
 
@@ -614,6 +662,84 @@ mod tests {
         assert!(!root.path().join(path).exists());
         assert!(journal.pending_plans()?.is_empty());
         assert!(journal.conflicts()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn local_recovery_exists_before_plan_and_survives_source_removal() -> Result<(), Box<dyn Error>>
+    {
+        let root = TempDir::new()?;
+        let recovery = TempDir::new()?;
+        let state = TempDir::new()?;
+        let mut journal = Journal::open(state.path().join("journal.sqlite3"))?;
+        let path = Path::new("deleted.txt");
+        let bytes = b"preserve before delete";
+        let old = RemoteFile::new(identity(bytes)?, DropboxRevision::new("rev-old"));
+        record_matching_baseline(&mut journal, path, &old)?;
+        std::fs::write(root.path().join(path), bytes)?;
+
+        assert!(matches!(
+            prepare_local_preservation(root.path(), recovery.path(), path, &old.content)?,
+            Prepared::Ready(())
+        ));
+        assert!(journal.pending_plans()?.is_empty());
+        let recovery_path = destination(recovery.path(), path, &old.content);
+        assert_eq!(std::fs::read(&recovery_path)?, bytes);
+
+        let Decision::Operations(operation_plan) = plan(
+            &Baseline::Present(old.clone()),
+            &Observation::Present(LocalFile::new(old.content.clone())),
+            &Observation::ConfirmedAbsent,
+        ) else {
+            return Err(std::io::Error::other("remote deletion did not produce a plan").into());
+        };
+        if !matches!(
+            journal.record_plan(path, &operation_plan)?,
+            PlanWrite::Recorded(_)
+        ) {
+            return Err(std::io::Error::other("fresh delete plan was not recorded").into());
+        }
+        std::fs::remove_file(root.path().join(path))?;
+
+        let replay = replay_local_operations(&mut journal, root.path(), recovery.path())?;
+        assert_eq!(replay.completed_operations, 2);
+        assert!(replay.blocked.is_empty());
+        assert!(journal.pending_plans()?.is_empty());
+        assert_eq!(journal.baseline(path)?, Some(Baseline::Absent));
+        assert_eq!(std::fs::read(recovery_path)?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn existing_local_recovery_never_substitutes_for_the_live_source() -> Result<(), Box<dyn Error>>
+    {
+        let root = TempDir::new()?;
+        let recovery = TempDir::new()?;
+        let state = TempDir::new()?;
+        let journal = Journal::open(state.path().join("journal.sqlite3"))?;
+        let path = Path::new("stale.txt");
+        let expected = identity(b"observed")?;
+        std::fs::write(root.path().join(path), b"observed")?;
+        assert!(matches!(
+            prepare_local_preservation(root.path(), recovery.path(), path, &expected)?,
+            Prepared::Ready(())
+        ));
+
+        std::fs::write(root.path().join(path), b"changed")?;
+        assert!(matches!(
+            prepare_local_preservation(root.path(), recovery.path(), path, &expected)?,
+            Prepared::FreshObservation
+        ));
+        std::fs::remove_file(root.path().join(path))?;
+        assert!(matches!(
+            prepare_local_preservation(root.path(), recovery.path(), path, &expected)?,
+            Prepared::FreshObservation
+        ));
+        assert!(journal.pending_plans()?.is_empty());
+        assert_eq!(
+            std::fs::read(destination(recovery.path(), path, &expected))?,
+            b"observed"
+        );
         Ok(())
     }
 
