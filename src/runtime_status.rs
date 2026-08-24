@@ -79,8 +79,6 @@ struct StatusSnapshot {
     version: u8,
     phase: DaemonPhase,
     transfer: Option<TransferProgress>,
-    queued: u64,
-    last_successful_pass: Option<u64>,
     last_error: Option<&'static str>,
     updated_at: u64,
 }
@@ -116,46 +114,32 @@ impl RuntimeStatus {
                 version: SCHEMA_VERSION,
                 phase: DaemonPhase::Starting,
                 transfer: None,
-                queued: 0,
-                last_successful_pass: None,
                 last_error: None,
                 updated_at: epoch_seconds()?,
             },
         };
-        publisher.publish(false)?;
+        publisher.publish()?;
         Ok(Self {
             inner: Arc::new(Mutex::new(publisher)),
         })
     }
 
-    /// Publish a phase transition or idle heartbeat.
+    /// Publish a phase transition.
     pub fn phase(&self, phase: DaemonPhase) {
-        self.update(false, |snapshot| {
+        self.update(|snapshot| {
             snapshot.phase = phase;
             snapshot.transfer = None;
         });
     }
 
-    /// Publish the number of pending journal operations.
-    pub fn queued(&self, queued: u64) {
-        self.update(false, |snapshot| snapshot.queued = queued);
-    }
-
-    /// Publish a completed pass, clearing any prior error.
-    pub fn successful_pass(&self, queued: Option<u64>) {
-        self.update(true, |snapshot| {
-            snapshot.phase = DaemonPhase::Waiting;
-            snapshot.transfer = None;
-            if let Some(queued) = queued {
-                snapshot.queued = queued;
-            }
-            snapshot.last_error = None;
-        });
+    /// Refresh `updated_at` without changing observable daemon state.
+    pub fn heartbeat(&self) {
+        self.update(|_| {});
     }
 
     /// Publish a fatal, deliberately sanitized error summary.
     pub fn fatal_error(&self, message: &'static str) {
-        self.update(false, |snapshot| {
+        self.update(|snapshot| {
             snapshot.phase = DaemonPhase::Error;
             snapshot.transfer = None;
             snapshot.last_error = Some(message);
@@ -167,13 +151,13 @@ impl RuntimeStatus {
     pub fn transfer_observer(&self) -> TransferObserver {
         let status = self.clone();
         Arc::new(move |transfer| {
-            status.update(false, |snapshot| {
+            status.update(|snapshot| {
                 snapshot.transfer = transfer;
             });
         })
     }
 
-    fn update(&self, successful: bool, change: impl FnOnce(&mut StatusSnapshot)) {
+    fn update(&self, change: impl FnOnce(&mut StatusSnapshot)) {
         let mut publisher = match self.inner.lock() {
             Ok(publisher) => publisher,
             Err(_) => {
@@ -182,7 +166,7 @@ impl RuntimeStatus {
             }
         };
         change(&mut publisher.snapshot);
-        if let Err(error) = publisher.publish(successful) {
+        if let Err(error) = publisher.publish() {
             tracing::warn!(error = %error, "could not publish runtime status");
         }
     }
@@ -195,12 +179,9 @@ struct Publisher {
 }
 
 impl Publisher {
-    fn publish(&mut self, successful: bool) -> Result<(), RuntimeStatusError> {
+    fn publish(&mut self) -> Result<(), RuntimeStatusError> {
         let now = epoch_seconds()?;
         self.snapshot.updated_at = now;
-        if successful {
-            self.snapshot.last_successful_pass = Some(now);
-        }
         let payload = serde_json::to_vec(&self.snapshot)
             .map_err(|source| RuntimeStatusError::Serialize { source })?;
         let (mut temporary, temporary_path) = self.create_temporary()?;
@@ -334,7 +315,8 @@ mod tests {
     fn status_is_private_versioned_and_atomically_replaced() -> Result<(), Box<dyn Error>> {
         let runtime = TempDir::new()?;
         let status = RuntimeStatus::new(runtime.path())?;
-        status.successful_pass(Some(2));
+        status.phase(DaemonPhase::Waiting);
+        status.heartbeat();
 
         let directory = runtime.path().join(APPLICATION_DIRECTORY);
         let path = directory.join(STATUS_FILE);
@@ -344,12 +326,10 @@ mod tests {
         );
         assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
         let value = serde_json::from_slice::<Value>(&fs::read(path)?)?;
+        assert_eq!(value.as_object().map(|object| object.len()), Some(5));
         assert_eq!(value["version"], 1);
         assert_eq!(value["phase"], "waiting");
         assert_eq!(value["transfer"], Value::Null);
-        assert_eq!(value["queued"], 2);
-        assert!(value.get("counts").is_none());
-        assert!(value["last_successful_pass"].as_u64().is_some());
         assert!(value["updated_at"].as_u64().is_some());
         assert_eq!(value["last_error"], Value::Null);
         assert_eq!(fs::read_dir(directory)?.count(), 1);
@@ -367,6 +347,7 @@ mod tests {
             4,
             Some(10),
         )));
+        status.heartbeat();
 
         let path = runtime.path().join(APPLICATION_DIRECTORY).join(STATUS_FILE);
         let active = serde_json::from_slice::<Value>(&fs::read(&path)?)?;

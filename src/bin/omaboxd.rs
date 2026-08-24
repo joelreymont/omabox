@@ -1,6 +1,7 @@
 #![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use std::error::Error as StdError;
+use std::thread;
 use std::time::Duration;
 
 use miette::Diagnostic;
@@ -12,18 +13,26 @@ use omabox::dropbox::{
     AccountValidation, DropboxClient, DropboxError, DropboxRoot, LongPollWakeup,
 };
 use omabox::journal::{
-    DropboxBinding, Journal, JournalError, LocalRootActivation, LocalRootBinding, RecordStatus,
+    DropboxBinding, Journal, JournalError, LocalRootActivation, LocalRootBinding,
 };
 use omabox::reconcile::{ReconcileError, ReconcileOutcome, reconcile_once};
 use omabox::runtime_status::{DaemonPhase, RuntimeStatus};
 use thiserror::Error;
 
 const LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+const STATUS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 
 fn main() -> miette::Result<()> {
     if let Err(error) = initialize_logging() {
         return Err(miette::Report::new(DaemonError::Logging(error)));
     }
+    run().map_err(miette::Report::new)
+}
+
+fn run() -> Result<(), DaemonError> {
+    let config = Config::load()?;
+    config.prepare()?;
+    let _instance_lock = InstanceLock::acquire(config.paths().lock_file())?;
     let status = match RuntimeStatus::from_environment() {
         Ok(status) => Some(status),
         Err(error) => {
@@ -31,22 +40,16 @@ fn main() -> miette::Result<()> {
             None
         }
     };
-    match run(status.as_ref()) {
+    start_status_heartbeat(status.as_ref());
+    match run_owned(&config, status.as_ref()) {
         Ok(()) => Ok(()),
         Err(error) => {
             if let Some(status) = &status {
                 status.fatal_error(error.public_status());
             }
-            Err(miette::Report::new(error))
+            Err(error)
         }
     }
-}
-
-fn run(status: Option<&RuntimeStatus>) -> Result<(), DaemonError> {
-    let config = Config::load()?;
-    config.prepare()?;
-    let _instance_lock = InstanceLock::acquire(config.paths().lock_file())?;
-    run_owned(&config, status)
 }
 
 fn run_owned(config: &Config, status: Option<&RuntimeStatus>) -> Result<(), DaemonError> {
@@ -55,7 +58,6 @@ fn run_owned(config: &Config, status: Option<&RuntimeStatus>) -> Result<(), Daem
             operation: "open the journal",
             source,
         })?;
-    publish_current_queue(status, &journal);
     loop {
         match run_session(config, &mut journal, status) {
             Ok(()) => continue,
@@ -155,7 +157,9 @@ fn run_session(
                     conflicts = report.conflicts,
                     "reconciliation pass completed"
                 );
-                publish_success(status, journal);
+                if report.blocked == 0 {
+                    publish_phase(status, DaemonPhase::Waiting);
+                }
             }
             ReconcileOutcome::FreshObservationRequired { .. } => {
                 tracing::info!("local state changed during reconciliation");
@@ -169,7 +173,7 @@ fn run_session(
 
         if let Some(delay) = long_poll_backoff.take() {
             tracing::info!(seconds = delay.as_secs(), "honoring Dropbox backoff");
-            wait_with_heartbeat(delay, status, DaemonPhase::Backoff);
+            wait_in_phase(delay, status, DaemonPhase::Backoff);
         }
         let cursor = journal
             .remote_inventory()
@@ -230,18 +234,12 @@ fn wait_for_rate_limit(delay: Duration, status: Option<&RuntimeStatus>) {
         seconds = delay.as_secs(),
         "Dropbox rate limited the daemon; retrying after its requested delay"
     );
-    wait_with_heartbeat(delay, status, DaemonPhase::Backoff);
+    wait_in_phase(delay, status, DaemonPhase::Backoff);
 }
 
-fn wait_with_heartbeat(delay: Duration, status: Option<&RuntimeStatus>, phase: DaemonPhase) {
+fn wait_in_phase(delay: Duration, status: Option<&RuntimeStatus>, phase: DaemonPhase) {
     publish_phase(status, phase);
-    let mut remaining = delay;
-    while !remaining.is_zero() {
-        let interval = remaining.min(LONG_POLL_TIMEOUT);
-        std::thread::sleep(interval);
-        remaining = remaining.saturating_sub(interval);
-        publish_phase(status, phase);
-    }
+    thread::sleep(delay);
 }
 
 fn publish_phase(status: Option<&RuntimeStatus>, phase: DaemonPhase) {
@@ -250,46 +248,27 @@ fn publish_phase(status: Option<&RuntimeStatus>, phase: DaemonPhase) {
     }
 }
 
-fn publish_current_queue(status: Option<&RuntimeStatus>, journal: &Journal) {
+fn start_status_heartbeat(status: Option<&RuntimeStatus>) {
     let Some(status) = status else {
         return;
     };
-    match current_status_queue(journal) {
-        Ok(queued) => status.queued(queued),
+    let status = status.clone();
+    match thread::Builder::new()
+        .name(String::from("omabox-status"))
+        .spawn(move || {
+            loop {
+                thread::sleep(STATUS_HEARTBEAT_INTERVAL);
+                status.heartbeat();
+            }
+        }) {
+        Ok(handle) => drop(handle),
         Err(source) => {
             tracing::warn!(
                 error = %source,
-                "could not read journal queue for runtime status"
+                "could not start the runtime status heartbeat"
             );
         }
     }
-}
-
-fn publish_success(status: Option<&RuntimeStatus>, journal: &Journal) {
-    let Some(status) = status else {
-        return;
-    };
-    let queued = match current_status_queue(journal) {
-        Ok(queued) => Some(queued),
-        Err(source) => {
-            tracing::warn!(
-                error = %source,
-                "could not read journal queue for runtime status"
-            );
-            None
-        }
-    };
-    status.successful_pass(queued);
-}
-
-fn current_status_queue(journal: &Journal) -> Result<u64, JournalError> {
-    let queued = journal
-        .pending_plans()?
-        .iter()
-        .flat_map(|plan| &plan.operations)
-        .filter(|operation| operation.status == RecordStatus::Pending)
-        .fold(0_u64, |count, _| count.saturating_add(1));
-    Ok(queued)
 }
 
 fn rate_limit_delay(error: &DaemonError) -> Option<Duration> {
