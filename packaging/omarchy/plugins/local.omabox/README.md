@@ -2,8 +2,8 @@
 
 `local.omabox` watches `$XDG_RUNTIME_DIR/omabox/status.json`, the owner-only
 snapshot atomically published by `omaboxd`. It shows service health, the active
-upload or download, live progress and speed, queued, unable-to-sync, and conflict counts,
-and the last successful pass. Missing, stale, and malformed snapshots are shown
+upload or download, live progress and speed, queued and conflict counts, and the
+last successful pass. Missing, stale, and malformed snapshots are shown
 as explicit states rather than treated as healthy data.
 
 To install this repository copy for the current user:

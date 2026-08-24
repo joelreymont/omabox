@@ -13,10 +13,9 @@ Panel {
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property var snapshot: status.snapshot
   readonly property var transfer: status.transfer
-  readonly property var counts: snapshot ? snapshot.counts : ({ queued: 0, blocked: 0, conflicts: 0 })
+  readonly property var counts: snapshot ? snapshot.counts : ({ queued: 0, conflicts: 0 })
   readonly property bool needsAttention: status.availability === "malformed" || status.stale
-    || (snapshot && (snapshot.phase === "error" || snapshot.phase === "blocked"))
-    || counts.blocked > 0 || counts.conflicts > 0
+    || (snapshot && snapshot.phase === "error") || counts.conflicts > 0
   readonly property bool inactive: status.availability === "missing" || status.stale
     || (snapshot && snapshot.phase === "backoff")
   readonly property color stateColor: needsAttention ? urgent : (inactive ? dim : foreground)
@@ -28,12 +27,12 @@ Panel {
     if (status.availability === "malformed") return "Status unavailable"
     if (status.stale) return "Service not updating"
     if (!snapshot) return "Unavailable"
+    if (snapshot.phase === "error") return "Sync error"
+    if (snapshot.phase === "backoff") return "Offline · retrying"
+    if (counts.conflicts > 0) return "Conflicts need attention"
     if (snapshot.phase === "starting") return "Starting"
     if (snapshot.phase === "syncing") return "Syncing"
-    if (snapshot.phase === "waiting") return "Up to date"
-    if (snapshot.phase === "backoff") return "Offline · retrying"
-    if (snapshot.phase === "blocked") return "Files need attention"
-    return "Sync error"
+    return "Up to date"
   }
 
   function detailForState() {
@@ -180,7 +179,6 @@ Panel {
             fontFamily: root.fontFamily
           }
           InfoPair { label: "Queued"; value: String(root.counts.queued) }
-          InfoPair { label: "Unable to sync"; value: String(root.counts.blocked); alarming: root.counts.blocked > 0 }
           InfoPair { label: "Conflicts"; value: String(root.counts.conflicts); alarming: root.counts.conflicts > 0 }
           InfoPair {
             label: "Last successful sync"
