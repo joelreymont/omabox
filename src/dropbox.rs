@@ -26,6 +26,15 @@ const LONG_POLL_GRACE_SECONDS: u64 = 105;
 const DIRECT_UPLOAD_MAX_BYTES: u64 = 150 * 1024 * 1024;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
+fn exact_download_agent() -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_connect(Some(Duration::from_secs(CONNECT_SECONDS)))
+        .timeout_recv_body(Some(Duration::from_secs(DOWNLOAD_SECONDS)))
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
 struct ProgressReader<'a, R> {
     inner: R,
     observer: Option<&'a TransferObserver>,
@@ -554,12 +563,7 @@ impl DropboxClient {
         let authorization = format!("Bearer {}", self.access_token.expose());
         let path_root = self.path_root_header()?;
         let url = self.endpoints.content("/files/download");
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(DOWNLOAD_SECONDS)))
-            .timeout_connect(Some(Duration::from_secs(CONNECT_SECONDS)))
-            .build();
-        let response = ureq::Agent::new_with_config(config)
+        let response = exact_download_agent()
             .post(&url)
             .header("Authorization", &authorization)
             .header("Dropbox-API-Path-Root", &path_root)
@@ -1747,7 +1751,7 @@ mod tests {
     use std::io::{self, Cursor, Read};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use proptest::prelude::*;
 
@@ -1758,9 +1762,23 @@ mod tests {
     };
 
     use super::{
-        DIRECT_UPLOAD_MAX_BYTES, DropboxError, DropboxRoot, EntryTag, ListEntry, PROGRESS_INTERVAL,
-        ProgressReader, apply_entries, ascii_json, validate_direct_upload_size,
+        CONNECT_SECONDS, DIRECT_UPLOAD_MAX_BYTES, DOWNLOAD_SECONDS, DropboxError, DropboxRoot,
+        EntryTag, ListEntry, PROGRESS_INTERVAL, ProgressReader, apply_entries, ascii_json,
+        exact_download_agent, validate_direct_upload_size,
     };
+
+    #[test]
+    fn exact_download_times_out_only_when_body_progress_stops() {
+        let agent = exact_download_agent();
+        let timeouts = agent.config().timeouts();
+
+        assert_eq!(timeouts.global, None);
+        assert_eq!(timeouts.connect, Some(Duration::from_secs(CONNECT_SECONDS)));
+        assert_eq!(
+            timeouts.recv_body,
+            Some(Duration::from_secs(DOWNLOAD_SECONDS))
+        );
+    }
 
     struct ByteAtATime(Cursor<Vec<u8>>);
 
