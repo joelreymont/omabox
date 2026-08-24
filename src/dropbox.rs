@@ -1,9 +1,9 @@
 //! Documented blocking Dropbox operations.
 
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -14,6 +14,7 @@ use crate::journal::{
 };
 use crate::local::{LocalError, StageOutcome, StagedUpload, stage_download};
 use crate::model::{ContentIdentity, DropboxRevision, Observation, RemoteFile, UnknownReason};
+use crate::runtime_status::{TransferDirection, TransferObserver, TransferProgress};
 
 const LONG_POLL_MINIMUM_SECONDS: u64 = 30;
 const LONG_POLL_MAXIMUM_SECONDS: u64 = 480;
@@ -22,6 +23,92 @@ const CONNECT_SECONDS: u64 = 15;
 const DOWNLOAD_SECONDS: u64 = 60 * 60;
 const LONG_POLL_GRACE_SECONDS: u64 = 105;
 const DIRECT_UPLOAD_MAX_BYTES: u64 = 150 * 1024 * 1024;
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+
+struct ProgressReader<'a, R> {
+    inner: R,
+    observer: Option<&'a TransferObserver>,
+    direction: TransferDirection,
+    path: PathBuf,
+    done: u64,
+    total: Option<u64>,
+    last_sample: Instant,
+    last_emitted: u64,
+}
+
+impl<'a, R> ProgressReader<'a, R> {
+    fn new(
+        inner: R,
+        observer: Option<&'a TransferObserver>,
+        direction: TransferDirection,
+        path: &Path,
+        total: Option<u64>,
+    ) -> Self {
+        let mut reader = Self {
+            inner,
+            observer,
+            direction,
+            path: path.to_path_buf(),
+            done: 0,
+            total,
+            last_sample: Instant::now(),
+            last_emitted: 0,
+        };
+        reader.emit();
+        reader
+    }
+
+    fn emit(&mut self) {
+        if let Some(observer) = self.observer {
+            observer(Some(TransferProgress::new(
+                self.direction,
+                &self.path,
+                self.done,
+                self.total,
+            )));
+        }
+        self.last_emitted = self.done;
+    }
+}
+
+impl<R: Read> Read for ProgressReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        let read_u64 = u64::try_from(read)
+            .map_err(|_| io::Error::other("transfer read length cannot be represented"))?;
+        self.done = self
+            .done
+            .checked_add(read_u64)
+            .ok_or_else(|| io::Error::other("transfer byte count overflowed"))?;
+        let now = Instant::now();
+        let sample_due = read == 0
+            || self.total.is_some_and(|total| self.done >= total)
+            || now.duration_since(self.last_sample) >= PROGRESS_INTERVAL;
+        if sample_due && self.done != self.last_emitted {
+            self.emit();
+            self.last_sample = now;
+        }
+        Ok(read)
+    }
+}
+
+struct TransferClear<'a> {
+    observer: Option<&'a TransferObserver>,
+}
+
+impl<'a> TransferClear<'a> {
+    fn new(observer: Option<&'a TransferObserver>) -> Self {
+        Self { observer }
+    }
+}
+
+impl Drop for TransferClear<'_> {
+    fn drop(&mut self) {
+        if let Some(observer) = self.observer {
+            observer(None);
+        }
+    }
+}
 
 /// Dropbox HTTP endpoint locations.
 ///
@@ -225,6 +312,7 @@ pub struct DropboxClient {
     root: DropboxRoot,
     endpoints: DropboxEndpoints,
     agent: ureq::Agent,
+    transfer_observer: Option<TransferObserver>,
 }
 
 impl DropboxClient {
@@ -251,7 +339,15 @@ impl DropboxClient {
             root,
             endpoints,
             agent: ureq::Agent::new_with_config(config),
+            transfer_observer: None,
         }
+    }
+
+    /// Publish throttled samples while blocking file transfers are active.
+    #[must_use]
+    pub fn with_transfer_observer(mut self, observer: TransferObserver) -> Self {
+        self.transfer_observer = Some(observer);
+        self
     }
 
     /// Inspect a newly authorized token and bind it to Dropbox's current namespace.
@@ -427,6 +523,17 @@ impl DropboxClient {
         target: impl AsRef<Path>,
         remote: &RemoteFile,
     ) -> Result<StageOutcome<()>, DropboxError> {
+        let target = target.as_ref();
+        self.stage_exact_download_for(sync_root, target, target, remote)
+    }
+
+    pub(crate) fn stage_exact_download_for(
+        &self,
+        sync_root: impl AsRef<Path>,
+        target: impl AsRef<Path>,
+        synchronized_path: &Path,
+        remote: &RemoteFile,
+    ) -> Result<StageOutcome<()>, DropboxError> {
         let argument = serde_json::to_string(&DownloadRequest {
             path: format!("rev:{}", remote.revision.as_str()),
         })
@@ -478,7 +585,16 @@ impl DropboxClient {
             return Err(DropboxError::DownloadedIdentityChanged);
         }
         let (_, body) = response.into_parts();
-        stage_download(sync_root, target, &remote.content, body.into_reader())
+        let total = body.content_length();
+        let reader = ProgressReader::new(
+            body.into_reader(),
+            self.transfer_observer.as_ref(),
+            TransferDirection::Download,
+            synchronized_path,
+            total,
+        );
+        let _clear = TransferClear::new(self.transfer_observer.as_ref());
+        stage_download(sync_root, target, &remote.content, reader)
             .map_err(|source| DropboxError::LocalStage { source })
     }
 
@@ -488,12 +604,14 @@ impl DropboxClient {
         relative: impl AsRef<Path>,
         staged: &StagedUpload,
     ) -> Result<MutationOutcome, DropboxError> {
-        let target = self.mutation_target(relative.as_ref())?;
+        let relative = relative.as_ref();
+        let target = self.mutation_target(relative)?;
         let expectation = MutationExpectation::CreateFile {
             desired: staged.content().clone(),
         };
         self.upload_file(
             &target,
+            relative,
             UploadMode::Add("add"),
             staged,
             expectation,
@@ -508,13 +626,15 @@ impl DropboxClient {
         expected: &DropboxRevision,
         staged: &StagedUpload,
     ) -> Result<MutationOutcome, DropboxError> {
-        let target = self.mutation_target(relative.as_ref())?;
+        let relative = relative.as_ref();
+        let target = self.mutation_target(relative)?;
         let expectation = MutationExpectation::ReplaceFile {
             expected: expected.clone(),
             desired: staged.content().clone(),
         };
         self.upload_file(
             &target,
+            relative,
             UploadMode::Update(UpdateMode {
                 tag: "update",
                 update: expected.as_str(),
@@ -609,6 +729,7 @@ impl DropboxClient {
     fn upload_file(
         &self,
         target: &str,
+        synchronized_path: &Path,
         mode: UploadMode<'_>,
         staged: &StagedUpload,
         expectation: MutationExpectation,
@@ -637,13 +758,22 @@ impl DropboxClient {
             .timeout_global(Some(Duration::from_secs(DOWNLOAD_SECONDS)))
             .timeout_connect(Some(Duration::from_secs(CONNECT_SECONDS)))
             .build();
+        let mut reader = ProgressReader::new(
+            bytes,
+            self.transfer_observer.as_ref(),
+            TransferDirection::Upload,
+            synchronized_path,
+            Some(size),
+        );
+        let _clear = TransferClear::new(self.transfer_observer.as_ref());
         let response = ureq::Agent::new_with_config(config)
             .post(&url)
             .header("Authorization", authorization)
             .header("Dropbox-API-Path-Root", path_root)
             .header("Dropbox-API-Arg", argument)
             .header("Content-Type", "application/octet-stream")
-            .send(bytes);
+            .header("Content-Length", size.to_string())
+            .send(ureq::SendBody::from_reader(&mut reader));
         match response {
             Err(source) => self.resolve_ambiguous(
                 target,
@@ -1595,13 +1725,42 @@ fn relative_paths(
 mod tests {
     use std::collections::BTreeMap;
     use std::error::Error;
+    use std::io::{self, Cursor, Read};
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
     use crate::model::{Observation, UnknownReason};
+    use crate::runtime_status::{TransferDirection, TransferObserver, TransferProgress};
 
     use super::{
-        DIRECT_UPLOAD_MAX_BYTES, DropboxError, DropboxRoot, EntryTag, ListEntry, apply_entries,
-        ascii_json, validate_direct_upload_size,
+        DIRECT_UPLOAD_MAX_BYTES, DropboxError, DropboxRoot, EntryTag, ListEntry, PROGRESS_INTERVAL,
+        ProgressReader, apply_entries, ascii_json, validate_direct_upload_size,
     };
+
+    struct ByteAtATime(Cursor<Vec<u8>>);
+
+    impl Read for ByteAtATime {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            self.0.read(&mut buffer[..1])
+        }
+    }
+
+    type RecordedTransfers = Arc<Mutex<Vec<Option<TransferProgress>>>>;
+
+    fn recording_observer() -> (TransferObserver, RecordedTransfers) {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&recorded);
+        let observer: TransferObserver = Arc::new(move |sample| {
+            if let Ok(mut samples) = captured.lock() {
+                samples.push(sample);
+            }
+        });
+        (observer, recorded)
+    }
 
     #[test]
     fn folders_and_non_downloadable_files_are_unknown() -> Result<(), Box<dyn Error>> {
@@ -1660,6 +1819,87 @@ mod tests {
         assert!(encoded.contains(r#"\u00e9"#));
         assert!(encoded.contains(r#"\u96ea"#));
         assert_eq!(serde_json::from_str::<serde_json::Value>(&encoded)?, value);
+        Ok(())
+    }
+
+    #[test]
+    fn progress_reader_throttles_fast_reads_but_reports_completion() -> Result<(), Box<dyn Error>> {
+        let (observer, recorded) = recording_observer();
+        let bytes = b"four";
+        let mut reader = ProgressReader::new(
+            ByteAtATime(Cursor::new(bytes.to_vec())),
+            Some(&observer),
+            TransferDirection::Upload,
+            Path::new("folder/file.txt"),
+            Some(u64::try_from(bytes.len())?),
+        );
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output)?;
+        assert_eq!(output, bytes);
+
+        let samples = recorded
+            .lock()
+            .map_err(|_| io::Error::other("recorded transfer lock was poisoned"))?;
+        assert_eq!(
+            samples.as_slice(),
+            [
+                Some(TransferProgress::new(
+                    TransferDirection::Upload,
+                    Path::new("folder/file.txt"),
+                    0,
+                    Some(4),
+                )),
+                Some(TransferProgress::new(
+                    TransferDirection::Upload,
+                    Path::new("folder/file.txt"),
+                    4,
+                    Some(4),
+                )),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn progress_reader_emits_due_sample_before_final_sample() -> Result<(), Box<dyn Error>> {
+        let (observer, recorded) = recording_observer();
+        let mut reader = ProgressReader::new(
+            ByteAtATime(Cursor::new(b"abc".to_vec())),
+            Some(&observer),
+            TransferDirection::Download,
+            Path::new("visible.txt"),
+            Some(3),
+        );
+        reader.last_sample = Instant::now()
+            .checked_sub(PROGRESS_INTERVAL)
+            .ok_or_else(|| io::Error::other("test clock could not move backward"))?;
+        let mut first = [0_u8; 1];
+        reader.read_exact(&mut first)?;
+        let mut remainder = Vec::new();
+        reader.read_to_end(&mut remainder)?;
+
+        let samples = recorded
+            .lock()
+            .map_err(|_| io::Error::other("recorded transfer lock was poisoned"))?;
+        assert_eq!(samples.len(), 3);
+        assert_eq!(
+            samples.get(1),
+            Some(&Some(TransferProgress::new(
+                TransferDirection::Download,
+                Path::new("visible.txt"),
+                1,
+                Some(3),
+            )))
+        );
+        assert_eq!(
+            samples.get(2),
+            Some(&Some(TransferProgress::new(
+                TransferDirection::Download,
+                Path::new("visible.txt"),
+                3,
+                Some(3),
+            )))
+        );
         Ok(())
     }
 }

@@ -3,6 +3,7 @@ use std::error::Error;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -25,6 +26,7 @@ use omabox::model::{
 use omabox::planner::plan;
 use omabox::reconcile::{ReconcileOutcome, reconcile_once};
 use omabox::recovery::{ReplayBlocked, destination, replay_remote_operations};
+use omabox::runtime_status::{TransferDirection, TransferObserver, TransferProgress};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -225,7 +227,14 @@ fn one_reconciliation_pass_synchronizes_files_in_both_directions() -> Result<(),
             &upload_content,
         )),
     ])?;
-    let client = fake_client(&server, "opaque-access-reconcile")?;
+    let transfers = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&transfers);
+    let observer: TransferObserver = Arc::new(move |sample| {
+        if let Ok(mut samples) = captured.lock() {
+            samples.push(sample);
+        }
+    });
+    let client = fake_client(&server, "opaque-access-reconcile")?.with_transfer_observer(observer);
     let directory = TempDir::new()?;
     let root = directory.path().join("root");
     let staging = directory.path().join("staging");
@@ -262,6 +271,22 @@ fn one_reconciliation_pass_synchronizes_files_in_both_directions() -> Result<(),
     );
     assert!(journal.pending_plans()?.is_empty());
     assert!(journal.conflicts()?.is_empty());
+    let transfers = transfers
+        .lock()
+        .map_err(|_| io::Error::other("recorded transfer lock was poisoned"))?;
+    assert!(transfers.contains(&Some(TransferProgress::new(
+        TransferDirection::Download,
+        Path::new("download.txt"),
+        u64::try_from(download_bytes.len())?,
+        Some(u64::try_from(download_bytes.len())?),
+    ))));
+    assert!(transfers.contains(&Some(TransferProgress::new(
+        TransferDirection::Upload,
+        Path::new("upload.txt"),
+        u64::try_from(upload_bytes.len())?,
+        Some(u64::try_from(upload_bytes.len())?),
+    ))));
+    assert_eq!(transfers.last(), Some(&None));
 
     let requests = server.finish()?;
     assert_eq!(requests.len(), 4);

@@ -12,41 +12,69 @@ use omabox::dropbox::{
     AccountValidation, DropboxClient, DropboxError, DropboxRoot, LongPollWakeup,
 };
 use omabox::journal::{
-    DropboxBinding, Journal, JournalError, LocalRootActivation, LocalRootBinding,
+    DropboxBinding, Journal, JournalError, LocalRootActivation, LocalRootBinding, RecordStatus,
 };
 use omabox::reconcile::{ReconcileError, ReconcileOutcome, reconcile_once};
+use omabox::runtime_status::{DaemonPhase, RuntimeStatus};
 use thiserror::Error;
 
 const LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn main() -> miette::Result<()> {
-    run().map_err(miette::Report::new)
+    if let Err(error) = initialize_logging() {
+        return Err(miette::Report::new(DaemonError::Logging(error)));
+    }
+    let status = match RuntimeStatus::from_environment() {
+        Ok(status) => Some(status),
+        Err(error) => {
+            tracing::warn!(error = %error, "runtime status is unavailable; syncing will continue");
+            None
+        }
+    };
+    match run(status.as_ref()) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Some(status) = &status {
+                status.fatal_error(error.public_status());
+            }
+            Err(miette::Report::new(error))
+        }
+    }
 }
 
-fn run() -> Result<(), DaemonError> {
-    initialize_logging()?;
+fn run(status: Option<&RuntimeStatus>) -> Result<(), DaemonError> {
     let config = Config::load()?;
     config.prepare()?;
     let _instance_lock = InstanceLock::acquire(config.paths().lock_file())?;
+    run_owned(&config, status)
+}
+
+fn run_owned(config: &Config, status: Option<&RuntimeStatus>) -> Result<(), DaemonError> {
     let mut journal =
         Journal::open(config.paths().journal_file()).map_err(|source| DaemonError::Journal {
             operation: "open the journal",
             source,
         })?;
+    publish_current_queue(status, &journal);
     loop {
-        match run_session(&config, &mut journal) {
+        match run_session(config, &mut journal, status) {
             Ok(()) => continue,
             Err(error) => {
                 let Some(delay) = rate_limit_delay(&error) else {
                     return Err(error);
                 };
-                wait_for_rate_limit(delay);
+                wait_for_rate_limit(delay, status);
             }
         }
     }
 }
 
-fn run_session(config: &Config, journal: &mut Journal) -> Result<(), DaemonError> {
+fn run_session(
+    config: &Config,
+    journal: &mut Journal,
+    status: Option<&RuntimeStatus>,
+) -> Result<(), DaemonError> {
+    publish_phase(status, DaemonPhase::Starting);
     let StoredCredential {
         binding: credential_binding,
         refresh_token,
@@ -76,6 +104,10 @@ fn run_session(config: &Config, journal: &mut Journal) -> Result<(), DaemonError
             source,
         })?;
     let dropbox = DropboxClient::new(refreshed.access_token, root);
+    let dropbox = match status {
+        Some(status) => dropbox.with_transfer_observer(status.transfer_observer()),
+        None => dropbox,
+    };
     match dropbox
         .validate_account(journal)
         .map_err(|source| DaemonError::Dropbox {
@@ -93,6 +125,7 @@ fn run_session(config: &Config, journal: &mut Journal) -> Result<(), DaemonError
     tracing::info!("Omabox daemon started");
     let mut long_poll_backoff: Option<Duration> = None;
     loop {
+        publish_phase(status, DaemonPhase::Syncing);
         activate_configured_root(config, journal)?;
         let outcome = match reconcile_once(
             journal,
@@ -108,19 +141,22 @@ fn run_session(config: &Config, journal: &mut Journal) -> Result<(), DaemonError
                 let Some(delay) = rate_limit_delay(&error) else {
                     return Err(error);
                 };
-                wait_for_rate_limit(delay);
+                wait_for_rate_limit(delay, status);
                 continue;
             }
         };
         match outcome {
-            ReconcileOutcome::Complete(report) => tracing::info!(
-                replayed_operations = report.replayed_operations,
-                noops = report.noops,
-                planned = report.planned,
-                blocked = report.blocked,
-                conflicts = report.conflicts,
-                "reconciliation pass completed"
-            ),
+            ReconcileOutcome::Complete(report) => {
+                tracing::info!(
+                    replayed_operations = report.replayed_operations,
+                    noops = report.noops,
+                    planned = report.planned,
+                    blocked = report.blocked,
+                    conflicts = report.conflicts,
+                    "reconciliation pass completed"
+                );
+                publish_success(status, journal);
+            }
             ReconcileOutcome::FreshObservationRequired { .. } => {
                 tracing::info!("local state changed during reconciliation");
                 continue;
@@ -133,7 +169,7 @@ fn run_session(config: &Config, journal: &mut Journal) -> Result<(), DaemonError
 
         if let Some(delay) = long_poll_backoff.take() {
             tracing::info!(seconds = delay.as_secs(), "honoring Dropbox backoff");
-            std::thread::sleep(delay);
+            wait_with_heartbeat(delay, status, DaemonPhase::Backoff);
         }
         let cursor = journal
             .remote_inventory()
@@ -154,7 +190,7 @@ fn run_session(config: &Config, journal: &mut Journal) -> Result<(), DaemonError
                 let Some(delay) = rate_limit_delay(&error) else {
                     return Err(error);
                 };
-                wait_for_rate_limit(delay);
+                wait_for_rate_limit(delay, status);
                 continue;
             }
         };
@@ -189,12 +225,71 @@ fn activate_configured_root(config: &Config, journal: &mut Journal) -> Result<()
     }
 }
 
-fn wait_for_rate_limit(delay: Duration) {
+fn wait_for_rate_limit(delay: Duration, status: Option<&RuntimeStatus>) {
     tracing::warn!(
         seconds = delay.as_secs(),
         "Dropbox rate limited the daemon; retrying after its requested delay"
     );
-    std::thread::sleep(delay);
+    wait_with_heartbeat(delay, status, DaemonPhase::Backoff);
+}
+
+fn wait_with_heartbeat(delay: Duration, status: Option<&RuntimeStatus>, phase: DaemonPhase) {
+    publish_phase(status, phase);
+    let mut remaining = delay;
+    while !remaining.is_zero() {
+        let interval = remaining.min(LONG_POLL_TIMEOUT);
+        std::thread::sleep(interval);
+        remaining = remaining.saturating_sub(interval);
+        publish_phase(status, phase);
+    }
+}
+
+fn publish_phase(status: Option<&RuntimeStatus>, phase: DaemonPhase) {
+    if let Some(status) = status {
+        status.phase(phase);
+    }
+}
+
+fn publish_current_queue(status: Option<&RuntimeStatus>, journal: &Journal) {
+    let Some(status) = status else {
+        return;
+    };
+    match current_status_queue(journal) {
+        Ok(queued) => status.queued(queued),
+        Err(source) => {
+            tracing::warn!(
+                error = %source,
+                "could not read journal queue for runtime status"
+            );
+        }
+    }
+}
+
+fn publish_success(status: Option<&RuntimeStatus>, journal: &Journal) {
+    let Some(status) = status else {
+        return;
+    };
+    let queued = match current_status_queue(journal) {
+        Ok(queued) => Some(queued),
+        Err(source) => {
+            tracing::warn!(
+                error = %source,
+                "could not read journal queue for runtime status"
+            );
+            None
+        }
+    };
+    status.successful_pass(queued);
+}
+
+fn current_status_queue(journal: &Journal) -> Result<u64, JournalError> {
+    let queued = journal
+        .pending_plans()?
+        .iter()
+        .flat_map(|plan| &plan.operations)
+        .filter(|operation| operation.status == RecordStatus::Pending)
+        .fold(0_u64, |count, _| count.saturating_add(1));
+    Ok(queued)
 }
 
 fn rate_limit_delay(error: &DaemonError) -> Option<Duration> {
@@ -347,6 +442,31 @@ enum DaemonError {
         help("Restart Omabox so it can rebuild the Dropbox inventory.")
     )]
     MissingRemoteCursor,
+}
+
+impl DaemonError {
+    fn public_status(&self) -> &'static str {
+        match self {
+            Self::Logging(_) => "Logging could not start.",
+            Self::Config(_) => "Omabox configuration is unavailable.",
+            Self::Lock(_) => "The Omabox service could not acquire its instance lock.",
+            Self::Journal { .. } => "The sync journal is unavailable.",
+            Self::LocalRootBusy => "The sync folder changed while earlier work is unfinished.",
+            Self::Auth { .. } | Self::CredentialsUnavailable { .. } => {
+                "Dropbox authentication is unavailable."
+            }
+            Self::SetupRequired => "Omabox setup is incomplete.",
+            Self::CredentialBindingChanged
+            | Self::AccountChanged
+            | Self::RootChanged
+            | Self::JournalBindingChanged => {
+                "The Dropbox account or sync root no longer matches setup."
+            }
+            Self::Dropbox { .. } => "Dropbox is unavailable.",
+            Self::Reconcile { .. } => "A synchronization pass failed.",
+            Self::MissingRemoteCursor => "The Dropbox inventory cursor is unavailable.",
+        }
+    }
 }
 
 #[cfg(test)]

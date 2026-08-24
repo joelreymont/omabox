@@ -539,7 +539,7 @@ fn stage_remote(
     synchronized_path: &Path,
     remote: &crate::model::RemoteFile,
 ) -> Result<(), ReconcileError> {
-    match dropbox.stage_exact_download(root, target, remote)? {
+    match dropbox.stage_exact_download_for(root, target, synchronized_path, remote)? {
         StageOutcome::Staged(()) | StageOutcome::AlreadyStaged(()) => Ok(()),
         StageOutcome::ContentChanged { .. } => Err(ReconcileError::RemoteContentChanged {
             path: synchronized_path.to_path_buf(),
