@@ -66,13 +66,23 @@ impl TransferProgress {
             bytes_total,
         }
     }
+
+    fn same_transfer(&self, other: &Self) -> bool {
+        self.direction == other.direction && self.path == other.path
+    }
+}
+
+/// One keyed update from a blocking Dropbox transfer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransferEvent {
+    /// The keyed transfer started or made progress.
+    Progress(TransferProgress),
+    /// The keyed transfer completed or failed.
+    Finished(TransferProgress),
 }
 
 /// Callback installed on the blocking Dropbox client.
-///
-/// `Some` publishes an active sample and `None` clears the completed or failed
-/// transfer.
-pub type TransferObserver = Arc<dyn Fn(Option<TransferProgress>) + Send + Sync>;
+pub type TransferObserver = Arc<dyn Fn(TransferEvent) + Send + Sync>;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct StatusSnapshot {
@@ -110,6 +120,7 @@ impl RuntimeStatus {
         let mut publisher = Publisher {
             path: directory.join(STATUS_FILE),
             directory,
+            active_transfers: Vec::new(),
             snapshot: StatusSnapshot {
                 version: SCHEMA_VERSION,
                 phase: DaemonPhase::Starting,
@@ -126,23 +137,27 @@ impl RuntimeStatus {
 
     /// Publish a phase transition.
     pub fn phase(&self, phase: DaemonPhase) {
-        self.update(|snapshot| {
-            snapshot.phase = phase;
-            snapshot.transfer = None;
+        self.update(|publisher| {
+            publisher.active_transfers.clear();
+            publisher.snapshot.phase = phase;
+            publisher.snapshot.transfer = None;
+            true
         });
     }
 
     /// Refresh `updated_at` without changing observable daemon state.
     pub fn heartbeat(&self) {
-        self.update(|_| {});
+        self.update(|_| true);
     }
 
     /// Publish a fatal, deliberately sanitized error summary.
     pub fn fatal_error(&self, message: &'static str) {
-        self.update(|snapshot| {
-            snapshot.phase = DaemonPhase::Error;
-            snapshot.transfer = None;
-            snapshot.last_error = Some(message);
+        self.update(|publisher| {
+            publisher.active_transfers.clear();
+            publisher.snapshot.phase = DaemonPhase::Error;
+            publisher.snapshot.transfer = None;
+            publisher.snapshot.last_error = Some(message);
+            true
         });
     }
 
@@ -150,14 +165,12 @@ impl RuntimeStatus {
     #[must_use]
     pub fn transfer_observer(&self) -> TransferObserver {
         let status = self.clone();
-        Arc::new(move |transfer| {
-            status.update(|snapshot| {
-                snapshot.transfer = transfer;
-            });
+        Arc::new(move |event| {
+            status.update(|publisher| publisher.record_transfer(event));
         })
     }
 
-    fn update(&self, change: impl FnOnce(&mut StatusSnapshot)) {
+    fn update(&self, change: impl FnOnce(&mut Publisher) -> bool) {
         let mut publisher = match self.inner.lock() {
             Ok(publisher) => publisher,
             Err(_) => {
@@ -165,7 +178,9 @@ impl RuntimeStatus {
                 return;
             }
         };
-        change(&mut publisher.snapshot);
+        if !change(&mut publisher) {
+            return;
+        }
         if let Err(error) = publisher.publish() {
             tracing::warn!(error = %error, "could not publish runtime status");
         }
@@ -175,10 +190,56 @@ impl RuntimeStatus {
 struct Publisher {
     directory: PathBuf,
     path: PathBuf,
+    active_transfers: Vec<TransferProgress>,
     snapshot: StatusSnapshot,
 }
 
 impl Publisher {
+    fn record_transfer(&mut self, event: TransferEvent) -> bool {
+        match event {
+            TransferEvent::Progress(progress) => self.record_progress(progress),
+            TransferEvent::Finished(finished) => self.finish_transfer(&finished),
+        }
+    }
+
+    fn record_progress(&mut self, progress: TransferProgress) -> bool {
+        let visible = self
+            .snapshot
+            .transfer
+            .as_ref()
+            .is_some_and(|current| current.same_transfer(&progress));
+        match self
+            .active_transfers
+            .iter_mut()
+            .find(|current| current.same_transfer(&progress))
+        {
+            Some(current) => *current = progress.clone(),
+            None => self.active_transfers.push(progress.clone()),
+        }
+        if visible || self.snapshot.transfer.is_none() {
+            self.snapshot.transfer = Some(progress);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn finish_transfer(&mut self, finished: &TransferProgress) -> bool {
+        let visible = self
+            .snapshot
+            .transfer
+            .as_ref()
+            .is_some_and(|current| current.same_transfer(finished));
+        let previous_len = self.active_transfers.len();
+        self.active_transfers
+            .retain(|current| !current.same_transfer(finished));
+        if !visible {
+            return false;
+        }
+        self.snapshot.transfer = self.active_transfers.first().cloned();
+        previous_len != self.active_transfers.len()
+    }
+
     fn publish(&mut self) -> Result<(), RuntimeStatusError> {
         let now = epoch_seconds()?;
         self.snapshot.updated_at = now;
@@ -341,7 +402,7 @@ mod tests {
         let runtime = TempDir::new()?;
         let status = RuntimeStatus::new(runtime.path())?;
         let observer = status.transfer_observer();
-        observer(Some(TransferProgress::new(
+        observer(TransferEvent::Progress(TransferProgress::new(
             TransferDirection::Download,
             Path::new("folder/report.txt"),
             4,
@@ -356,7 +417,12 @@ mod tests {
         assert_eq!(active["transfer"]["bytes_done"], 4);
         assert_eq!(active["transfer"]["bytes_total"], 10);
 
-        observer(None);
+        observer(TransferEvent::Finished(TransferProgress::new(
+            TransferDirection::Download,
+            Path::new("folder/report.txt"),
+            0,
+            None,
+        )));
         status.fatal_error("Dropbox authentication is unavailable.");
         let failed = serde_json::from_slice::<Value>(&fs::read(path)?)?;
         assert_eq!(failed["phase"], "error");
@@ -365,6 +431,41 @@ mod tests {
             failed["last_error"],
             "Dropbox authentication is unavailable."
         );
+        Ok(())
+    }
+
+    #[test]
+    fn finishing_one_transfer_keeps_another_transfer_visible() -> Result<(), Box<dyn Error>> {
+        let runtime = TempDir::new()?;
+        let status = RuntimeStatus::new(runtime.path())?;
+        let observer = status.transfer_observer();
+        let first = TransferProgress::new(
+            TransferDirection::Download,
+            Path::new("first.txt"),
+            3,
+            Some(10),
+        );
+        let second = TransferProgress::new(
+            TransferDirection::Download,
+            Path::new("second.txt"),
+            7,
+            Some(20),
+        );
+        observer(TransferEvent::Progress(first.clone()));
+        observer(TransferEvent::Progress(second.clone()));
+
+        let path = runtime.path().join(APPLICATION_DIRECTORY).join(STATUS_FILE);
+        let stable = serde_json::from_slice::<Value>(&fs::read(&path)?)?;
+        assert_eq!(stable["transfer"]["path"], "first.txt");
+
+        observer(TransferEvent::Finished(first));
+        let promoted = serde_json::from_slice::<Value>(&fs::read(&path)?)?;
+        assert_eq!(promoted["transfer"]["path"], "second.txt");
+        assert_eq!(promoted["transfer"]["bytes_done"], 7);
+
+        observer(TransferEvent::Finished(second));
+        let complete = serde_json::from_slice::<Value>(&fs::read(path)?)?;
+        assert_eq!(complete["transfer"], Value::Null);
         Ok(())
     }
 

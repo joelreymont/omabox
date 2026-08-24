@@ -3,6 +3,7 @@ use std::error::Error;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -24,9 +25,11 @@ use omabox::model::{
     OperationPlan, RemoteFile, UnknownReason,
 };
 use omabox::planner::plan;
-use omabox::reconcile::{ReconcileOutcome, reconcile_once};
+use omabox::reconcile::{ReconcileOutcome, reconcile_once, replay_pending};
 use omabox::recovery::{ReplayBlocked, destination, replay_remote_operations};
-use omabox::runtime_status::{TransferDirection, TransferObserver, TransferProgress};
+use omabox::runtime_status::{
+    TransferDirection, TransferEvent, TransferObserver, TransferProgress,
+};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -274,19 +277,24 @@ fn one_reconciliation_pass_synchronizes_files_in_both_directions() -> Result<(),
     let transfers = transfers
         .lock()
         .map_err(|_| io::Error::other("recorded transfer lock was poisoned"))?;
-    assert!(transfers.contains(&Some(TransferProgress::new(
+    let download_progress = TransferProgress::new(
         TransferDirection::Download,
         Path::new("download.txt"),
         u64::try_from(download_bytes.len())?,
         Some(u64::try_from(download_bytes.len())?),
-    ))));
-    assert!(transfers.contains(&Some(TransferProgress::new(
+    );
+    let upload_progress = TransferProgress::new(
         TransferDirection::Upload,
         Path::new("upload.txt"),
         u64::try_from(upload_bytes.len())?,
         Some(u64::try_from(upload_bytes.len())?),
-    ))));
-    assert_eq!(transfers.last(), Some(&None));
+    );
+    assert!(transfers.contains(&TransferEvent::Progress(download_progress)));
+    assert!(transfers.contains(&TransferEvent::Progress(upload_progress.clone())));
+    assert_eq!(
+        transfers.last(),
+        Some(&TransferEvent::Finished(upload_progress))
+    );
 
     let requests = server.finish()?;
     assert_eq!(requests.len(), 4);
@@ -308,6 +316,70 @@ fn one_reconciliation_pass_synchronizes_files_in_both_directions() -> Result<(),
             "content_hash": upload_content.as_str()
         })
     );
+    Ok(())
+}
+
+#[test]
+fn pending_exact_downloads_use_bounded_parallel_workers() -> Result<(), Box<dyn Error>> {
+    const DOWNLOAD_COUNT: usize = 8;
+
+    let bytes = b"bounded parallel download";
+    let content = dropbox_content_hash(bytes.as_slice())?;
+    let remote = RemoteFile::new(content.clone(), DropboxRevision::new("shared-revision"));
+    let metadata = download_metadata("shared.txt", remote.revision.as_str(), &content);
+    let responses = (0..DOWNLOAD_COUNT)
+        .map(|_| {
+            FakeResponse::bytes(bytes.to_vec())
+                .header("Dropbox-API-Result", metadata.clone())
+                .delay(Duration::from_millis(150))
+        })
+        .collect();
+    let server = FakeServer::start(responses)?;
+    let client = fake_client(&server, "opaque-access-parallel")?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    let operation_plan = planned_operations(plan(
+        &Baseline::Absent,
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(remote),
+    ))?;
+    let mut paths = Vec::with_capacity(DOWNLOAD_COUNT);
+    for index in 0..DOWNLOAD_COUNT {
+        let path = Path::new(&format!("download-{index}.txt")).to_path_buf();
+        if !matches!(
+            journal.record_plan(&path, &operation_plan)?,
+            PlanWrite::Recorded(_)
+        ) {
+            return Err(io::Error::other("fresh download plan was already pending").into());
+        }
+        paths.push(path);
+    }
+
+    let report = replay_pending(&mut journal, &client, &root, &staging, &recovery)?;
+
+    assert_eq!(report.completed_operations, DOWNLOAD_COUNT);
+    assert!(report.blocked.is_empty());
+    assert!(journal.pending_plans()?.is_empty());
+    for path in paths {
+        assert_eq!(std::fs::read(root.join(path))?, bytes);
+    }
+    let maximum_active = server.maximum_active();
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), DOWNLOAD_COUNT);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path == "/2/files/download")
+    );
+    assert!(maximum_active >= 2);
+    assert!(maximum_active <= 4);
     Ok(())
 }
 
@@ -1565,14 +1637,21 @@ fn metadata_request_includes_deleted(request: &FakeRequest) -> Result<bool, serd
 struct FakeServer {
     base: String,
     worker: JoinHandle<io::Result<Vec<FakeRequest>>>,
+    maximum_active: Arc<AtomicUsize>,
 }
 
 impl FakeServer {
     fn start(responses: Vec<FakeResponse>) -> io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let base = format!("http://{}", listener.local_addr()?);
-        let worker = thread::spawn(move || serve(listener, responses));
-        Ok(Self { base, worker })
+        let maximum_active = Arc::new(AtomicUsize::new(0));
+        let server_maximum = Arc::clone(&maximum_active);
+        let worker = thread::spawn(move || serve(listener, responses, server_maximum));
+        Ok(Self {
+            base,
+            worker,
+            maximum_active,
+        })
     }
 
     fn endpoints(&self) -> DropboxEndpoints {
@@ -1590,12 +1669,17 @@ impl FakeServer {
             .join()
             .map_err(|_| io::Error::other("fake Dropbox server thread failed"))?
     }
+
+    fn maximum_active(&self) -> usize {
+        self.maximum_active.load(Ordering::SeqCst)
+    }
 }
 
 struct FakeResponse {
     status: u16,
     body: Vec<u8>,
     headers: Vec<(String, String)>,
+    delay: Duration,
 }
 
 impl FakeResponse {
@@ -1611,6 +1695,7 @@ impl FakeResponse {
                 String::from("Content-Type"),
                 String::from("application/json"),
             )],
+            delay: Duration::ZERO,
         }
     }
 
@@ -1622,11 +1707,17 @@ impl FakeResponse {
                 String::from("Content-Type"),
                 String::from("application/octet-stream"),
             )],
+            delay: Duration::ZERO,
         }
     }
 
     fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    fn delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
         self
     }
 }
@@ -1637,12 +1728,36 @@ struct FakeRequest {
     body: Vec<u8>,
 }
 
-fn serve(listener: TcpListener, responses: Vec<FakeResponse>) -> io::Result<Vec<FakeRequest>> {
-    let mut requests = Vec::with_capacity(responses.len());
+fn serve(
+    listener: TcpListener,
+    responses: Vec<FakeResponse>,
+    maximum_active: Arc<AtomicUsize>,
+) -> io::Result<Vec<FakeRequest>> {
+    let active = Arc::new(AtomicUsize::new(0));
+    let mut handlers: Vec<JoinHandle<io::Result<FakeRequest>>> =
+        Vec::with_capacity(responses.len());
     for response in responses {
         let (mut stream, _) = listener.accept()?;
-        requests.push(read_request(&mut stream)?);
-        write_response(&mut stream, response)?;
+        let active = Arc::clone(&active);
+        let maximum_active = Arc::clone(&maximum_active);
+        handlers.push(thread::spawn(move || {
+            let request = read_request(&mut stream)?;
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum_active.fetch_max(current, Ordering::SeqCst);
+            thread::sleep(response.delay);
+            let written = write_response(&mut stream, response);
+            active.fetch_sub(1, Ordering::SeqCst);
+            written?;
+            Ok(request)
+        }));
+    }
+    let mut requests = Vec::with_capacity(handlers.len());
+    for handler in handlers {
+        requests.push(
+            handler
+                .join()
+                .map_err(|_| io::Error::other("fake Dropbox response worker failed"))??,
+        );
     }
     Ok(requests)
 }

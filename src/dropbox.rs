@@ -14,7 +14,7 @@ use crate::journal::{
 };
 use crate::local::{LocalError, StageOutcome, StagedUpload, stage_download};
 use crate::model::{ContentIdentity, DropboxRevision, Observation, RemoteFile, UnknownReason};
-use crate::runtime_status::{TransferDirection, TransferObserver, TransferProgress};
+use crate::runtime_status::{TransferDirection, TransferEvent, TransferObserver, TransferProgress};
 
 const LONG_POLL_MINIMUM_SECONDS: u64 = 30;
 const LONG_POLL_MAXIMUM_SECONDS: u64 = 480;
@@ -60,7 +60,7 @@ impl<'a, R> ProgressReader<'a, R> {
 
     fn emit(&mut self) {
         if let Some(observer) = self.observer {
-            observer(Some(TransferProgress::new(
+            observer(TransferEvent::Progress(TransferProgress::new(
                 self.direction,
                 &self.path,
                 self.done,
@@ -92,20 +92,15 @@ impl<R: Read> Read for ProgressReader<'_, R> {
     }
 }
 
-struct TransferClear<'a> {
-    observer: Option<&'a TransferObserver>,
-}
-
-impl<'a> TransferClear<'a> {
-    fn new(observer: Option<&'a TransferObserver>) -> Self {
-        Self { observer }
-    }
-}
-
-impl Drop for TransferClear<'_> {
+impl<R> Drop for ProgressReader<'_, R> {
     fn drop(&mut self) {
         if let Some(observer) = self.observer {
-            observer(None);
+            observer(TransferEvent::Finished(TransferProgress::new(
+                self.direction,
+                &self.path,
+                self.done,
+                self.total,
+            )));
         }
     }
 }
@@ -593,7 +588,6 @@ impl DropboxClient {
             synchronized_path,
             total,
         );
-        let _clear = TransferClear::new(self.transfer_observer.as_ref());
         stage_download(sync_root, target, &remote.content, reader)
             .map_err(|source| DropboxError::LocalStage { source })
     }
@@ -765,7 +759,6 @@ impl DropboxClient {
             synchronized_path,
             Some(size),
         );
-        let _clear = TransferClear::new(self.transfer_observer.as_ref());
         let response = ureq::Agent::new_with_config(config)
             .post(&url)
             .header("Authorization", authorization)
@@ -1726,12 +1719,17 @@ mod tests {
     use std::collections::BTreeMap;
     use std::error::Error;
     use std::io::{self, Cursor, Read};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
-    use crate::model::{Observation, UnknownReason};
-    use crate::runtime_status::{TransferDirection, TransferObserver, TransferProgress};
+    use proptest::prelude::*;
+
+    use crate::journal::RemoteObservationRecord;
+    use crate::model::{ContentIdentity, DropboxRevision, Observation, RemoteFile, UnknownReason};
+    use crate::runtime_status::{
+        TransferDirection, TransferEvent, TransferObserver, TransferProgress,
+    };
 
     use super::{
         DIRECT_UPLOAD_MAX_BYTES, DropboxError, DropboxRoot, EntryTag, ListEntry, PROGRESS_INTERVAL,
@@ -1749,7 +1747,155 @@ mod tests {
         }
     }
 
-    type RecordedTransfers = Arc<Mutex<Vec<Option<TransferProgress>>>>;
+    type RecordedTransfers = Arc<Mutex<Vec<TransferEvent>>>;
+
+    const TEST_CONTENT_HASH: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TEST_REVISION: &str = "test-revision";
+
+    #[derive(Clone, Copy, Debug)]
+    enum TinyPath {
+        A,
+        AChild,
+        Ab,
+        AbChild,
+    }
+
+    impl TinyPath {
+        fn key(self) -> &'static str {
+            match self {
+                Self::A => "a",
+                Self::AChild => "a/x",
+                Self::Ab => "ab",
+                Self::AbChild => "ab/y",
+            }
+        }
+
+        fn dropbox_path(self) -> &'static str {
+            match self {
+                Self::A => "/a",
+                Self::AChild => "/a/x",
+                Self::Ab => "/ab",
+                Self::AbChild => "/ab/y",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum TreeMutation {
+        File(TinyPath),
+        Folder(TinyPath),
+        Delete(TinyPath),
+    }
+
+    impl TreeMutation {
+        fn path(self) -> TinyPath {
+            match self {
+                Self::File(path) | Self::Folder(path) | Self::Delete(path) => path,
+            }
+        }
+
+        fn entry(self) -> ListEntry {
+            let (tag, rev, content_hash) = match self {
+                Self::File(_) => (
+                    EntryTag::File,
+                    Some(String::from(TEST_REVISION)),
+                    Some(String::from(TEST_CONTENT_HASH)),
+                ),
+                Self::Folder(_) => (EntryTag::Folder, None, None),
+                Self::Delete(_) => (EntryTag::Deleted, None, None),
+            };
+            ListEntry {
+                tag,
+                path_lower: Some(String::from(self.path().dropbox_path())),
+                path_display: Some(String::from(self.path().dropbox_path())),
+                rev,
+                content_hash,
+                is_downloadable: true,
+                symlink_info: None,
+                sharing_info: None,
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum OracleNode {
+        File,
+        Folder,
+    }
+
+    fn tree_mutation_strategy() -> impl Strategy<Value = TreeMutation> {
+        let path = prop_oneof![
+            Just(TinyPath::A),
+            Just(TinyPath::AChild),
+            Just(TinyPath::Ab),
+            Just(TinyPath::AbChild),
+        ];
+        (path, 0_u8..3).prop_map(|(path, kind)| match kind {
+            0 => TreeMutation::File(path),
+            1 => TreeMutation::Folder(path),
+            _ => TreeMutation::Delete(path),
+        })
+    }
+
+    fn tree_regression_prefix() -> Vec<TreeMutation> {
+        vec![
+            TreeMutation::Folder(TinyPath::A),
+            TreeMutation::File(TinyPath::AChild),
+            TreeMutation::File(TinyPath::AbChild),
+            TreeMutation::Delete(TinyPath::A),
+            TreeMutation::File(TinyPath::AChild),
+            TreeMutation::File(TinyPath::A),
+            TreeMutation::Delete(TinyPath::AbChild),
+            TreeMutation::Delete(TinyPath::AChild),
+        ]
+    }
+
+    fn apply_oracle(records: &mut BTreeMap<String, OracleNode>, mutation: TreeMutation) {
+        let key = mutation.path().key();
+        if matches!(mutation, TreeMutation::Delete(_)) {
+            records.retain(|candidate, _| !Path::new(candidate).starts_with(key));
+            return;
+        }
+
+        let components = key.split('/').collect::<Vec<_>>();
+        for depth in 1..components.len() {
+            records.insert(components[..depth].join("/"), OracleNode::Folder);
+        }
+        let node = match mutation {
+            TreeMutation::File(_) => {
+                records.retain(|candidate, _| !Path::new(candidate).starts_with(key));
+                OracleNode::File
+            }
+            TreeMutation::Folder(_) => OracleNode::Folder,
+            TreeMutation::Delete(_) => return,
+        };
+        records.insert(String::from(key), node);
+    }
+
+    fn oracle_records(
+        nodes: &BTreeMap<String, OracleNode>,
+    ) -> BTreeMap<String, RemoteObservationRecord> {
+        nodes
+            .iter()
+            .map(|(key, node)| {
+                let observation = match node {
+                    OracleNode::File => Observation::Present(RemoteFile::new(
+                        ContentIdentity::new(TEST_CONTENT_HASH),
+                        DropboxRevision::new(TEST_REVISION),
+                    )),
+                    OracleNode::Folder => Observation::Unknown(UnknownReason::Unsupported),
+                };
+                (
+                    key.clone(),
+                    RemoteObservationRecord {
+                        path: PathBuf::from(key),
+                        observation,
+                    },
+                )
+            })
+            .collect()
+    }
 
     fn recording_observer() -> (TransferObserver, RecordedTransfers) {
         let recorded = Arc::new(Mutex::new(Vec::new()));
@@ -1760,6 +1906,53 @@ mod tests {
             }
         });
         (observer, recorded)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn entry_sequences_match_a_declarative_tree_model(
+            generated in prop::collection::vec(tree_mutation_strategy(), 0..16),
+            split_seed in 0_usize..32,
+        ) {
+            let mut mutations = tree_regression_prefix();
+            mutations.extend(generated);
+            let root = DropboxRoot::new("account", "namespace", "")
+                .map_err(|error| TestCaseError::fail(error.to_string()))?;
+            let mut actual = BTreeMap::new();
+            let mut oracle = BTreeMap::new();
+
+            for mutation in &mutations {
+                apply_entries(&root, &mut actual, vec![mutation.entry()])
+                    .map_err(|error| TestCaseError::fail(error.to_string()))?;
+                apply_oracle(&mut oracle, *mutation);
+                prop_assert_eq!(&actual, &oracle_records(&oracle));
+            }
+
+            let all_entries = mutations.iter().map(|mutation| mutation.entry()).collect();
+            let mut single_page = BTreeMap::new();
+            apply_entries(&root, &mut single_page, all_entries)
+                .map_err(|error| TestCaseError::fail(error.to_string()))?;
+
+            let split = split_seed % (mutations.len() + 1);
+            let first_page = mutations[..split]
+                .iter()
+                .map(|mutation| mutation.entry())
+                .collect();
+            let second_page = mutations[split..]
+                .iter()
+                .map(|mutation| mutation.entry())
+                .collect();
+            let mut split_pages = BTreeMap::new();
+            apply_entries(&root, &mut split_pages, first_page)
+                .map_err(|error| TestCaseError::fail(error.to_string()))?;
+            apply_entries(&root, &mut split_pages, second_page)
+                .map_err(|error| TestCaseError::fail(error.to_string()))?;
+
+            prop_assert_eq!(&single_page, &oracle_records(&oracle));
+            prop_assert_eq!(single_page, split_pages);
+        }
     }
 
     #[test]
@@ -1836,6 +2029,7 @@ mod tests {
         let mut output = Vec::new();
         reader.read_to_end(&mut output)?;
         assert_eq!(output, bytes);
+        drop(reader);
 
         let samples = recorded
             .lock()
@@ -1843,13 +2037,19 @@ mod tests {
         assert_eq!(
             samples.as_slice(),
             [
-                Some(TransferProgress::new(
+                TransferEvent::Progress(TransferProgress::new(
                     TransferDirection::Upload,
                     Path::new("folder/file.txt"),
                     0,
                     Some(4),
                 )),
-                Some(TransferProgress::new(
+                TransferEvent::Progress(TransferProgress::new(
+                    TransferDirection::Upload,
+                    Path::new("folder/file.txt"),
+                    4,
+                    Some(4),
+                )),
+                TransferEvent::Finished(TransferProgress::new(
                     TransferDirection::Upload,
                     Path::new("folder/file.txt"),
                     4,
@@ -1884,7 +2084,7 @@ mod tests {
         assert_eq!(samples.len(), 3);
         assert_eq!(
             samples.get(1),
-            Some(&Some(TransferProgress::new(
+            Some(&TransferEvent::Progress(TransferProgress::new(
                 TransferDirection::Download,
                 Path::new("visible.txt"),
                 1,
@@ -1893,7 +2093,7 @@ mod tests {
         );
         assert_eq!(
             samples.get(2),
-            Some(&Some(TransferProgress::new(
+            Some(&TransferEvent::Progress(TransferProgress::new(
                 TransferDirection::Download,
                 Path::new("visible.txt"),
                 3,

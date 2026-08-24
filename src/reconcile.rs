@@ -1,7 +1,10 @@
 //! One finite observe, plan, and journal pass.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 
 use thiserror::Error;
 
@@ -15,7 +18,8 @@ use crate::local::{
     observe_upload_source, remove_unreferenced_upload_stages, scan_and_publish, stage_upload,
 };
 use crate::model::{
-    Baseline, Conflict, Decision, LocalObservation, Observation, Operation, RemoteObservation,
+    Baseline, Conflict, Decision, LocalObservation, Observation, Operation, RemoteFile,
+    RemoteObservation,
 };
 use crate::planner::plan;
 use crate::recovery::{
@@ -23,6 +27,8 @@ use crate::recovery::{
     materialize_before_plan, materialize_local_conflict, materialize_remote_conflict,
     prune_completed_recoveries, replay_local_operations, replay_remote_operations,
 };
+
+const MAX_PARALLEL_DOWNLOADS: usize = 4;
 
 /// A reconciliation failure. Expected observation races are returned as outcomes instead.
 #[derive(Debug, Error)]
@@ -37,6 +43,15 @@ pub enum ReconcileError {
     /// A Dropbox phase failed.
     #[error("reconciliation Dropbox phase failed")]
     Dropbox {
+        /// Original Dropbox error.
+        #[source]
+        source: DropboxError,
+    },
+    /// An exact Dropbox download failed for one synchronized path.
+    #[error("could not stage the exact Dropbox download for `{path}`")]
+    RemoteDownload {
+        /// Synchronized path being staged.
+        path: PathBuf,
         /// Original Dropbox error.
         #[source]
         source: DropboxError,
@@ -67,6 +82,16 @@ pub enum ReconcileError {
         /// Occupied path, without its contents.
         path: PathBuf,
     },
+    /// A bounded download worker could not be started.
+    #[error("could not start a Dropbox download worker")]
+    DownloadWorkerSpawn {
+        /// Operating-system thread creation failure.
+        #[source]
+        source: io::Error,
+    },
+    /// A bounded download worker stopped without returning its typed result.
+    #[error("a Dropbox download worker stopped unexpectedly")]
+    DownloadWorkerStopped,
     /// Durable records violated the finite reconciliation contract.
     #[error("reconciliation found invalid journal state for `{path}`: {detail}")]
     InvalidJournalState {
@@ -133,7 +158,8 @@ pub enum ReconcileOutcome {
     LocalRootChanged,
 }
 
-/// Replay local work, fetch only missing exact downloads, then replay remote work once.
+/// Replay local work, fetch missing exact downloads with at most four workers, then replay remote
+/// work once.
 pub fn replay_pending(
     journal: &mut Journal,
     dropbox: &DropboxClient,
@@ -155,11 +181,15 @@ pub fn replay_pending(
         })
         .collect::<BTreeSet<_>>();
     if !missing_downloads.is_empty() {
-        let pending = journal.pending_plans()?;
-        for path in &missing_downloads {
+        let pending = journal
+            .pending_plans()?
+            .into_iter()
+            .map(|plan| (plan.path.clone(), plan))
+            .collect::<BTreeMap<_, _>>();
+        let mut downloads = Vec::with_capacity(missing_downloads.len());
+        for path in missing_downloads {
             let source = pending
-                .iter()
-                .find(|plan| plan.path == *path)
+                .get(&path)
                 .and_then(|plan| {
                     plan.operations.iter().find_map(|planned| {
                         if planned.status == crate::journal::RecordStatus::Completed {
@@ -167,19 +197,21 @@ pub fn replay_pending(
                         }
                         match &planned.operation {
                             Operation::InstallLocal { source }
-                            | Operation::ReplaceLocal { source, .. } => Some(source),
+                            | Operation::ReplaceLocal { source, .. } => Some(source.clone()),
                             _ => None,
                         }
                     })
                 })
                 .ok_or_else(|| {
                     invalid(
-                        path,
+                        &path,
                         "pending download blocker has no matching local operation",
                     )
                 })?;
-            stage_remote(dropbox, sync_root, path, path, source)?;
+            downloads.push(PendingDownload { path, source });
         }
+        require_active_local_root(journal, sync_root)?;
+        stage_pending_downloads(dropbox, sync_root, &downloads)?;
         require_active_local_root(journal, sync_root)?;
         let resumed = replay_local_operations(journal, sync_root, recovery_directory)?;
         report.completed_operations += resumed.completed_operations;
@@ -400,9 +432,9 @@ fn prepare_plan(
                     return Ok(Prepared::FreshObservation);
                 }
             }
-            Operation::InstallLocal { source } | Operation::ReplaceLocal { source, .. } => {
-                stage_remote(dropbox, sync_root, path, path, source)?;
-            }
+            // Exact downloads are fetched only after this plan is durable, allowing startup and
+            // post-plan replay to share the same bounded batch.
+            Operation::InstallLocal { .. } | Operation::ReplaceLocal { .. } => {}
             Operation::PreserveRemote { file } => {
                 let target = destination(recovery_directory, path, &file.content);
                 let Some(name) = target.file_name() else {
@@ -425,6 +457,82 @@ fn prepare_plan(
         }
     }
     Ok(Prepared::Ready(()))
+}
+
+struct PendingDownload {
+    path: PathBuf,
+    source: RemoteFile,
+}
+
+fn stage_pending_downloads(
+    dropbox: &DropboxClient,
+    sync_root: &Path,
+    downloads: &[PendingDownload],
+) -> Result<(), ReconcileError> {
+    let worker_count = downloads.len().min(MAX_PARALLEL_DOWNLOADS);
+    if worker_count == 0 {
+        return Ok(());
+    }
+
+    let next = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(worker_count);
+        let mut spawn_failure = None;
+        for _ in 0..worker_count {
+            let next = &next;
+            match thread::Builder::new().spawn_scoped(scope, move || {
+                let mut first_failure = None;
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(download) = downloads.get(index) else {
+                        return first_failure;
+                    };
+                    match stage_remote(
+                        dropbox,
+                        sync_root,
+                        &download.path,
+                        &download.path,
+                        &download.source,
+                    ) {
+                        Ok(()) => {}
+                        Err(error) if first_failure.is_none() => {
+                            first_failure = Some((index, error));
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }) {
+                Ok(worker) => workers.push(worker),
+                Err(source) => {
+                    spawn_failure = Some(source);
+                    break;
+                }
+            }
+        }
+
+        let mut earliest_failure: Option<(usize, ReconcileError)> = None;
+        let mut worker_stopped = false;
+        for worker in workers {
+            match worker.join() {
+                Ok(Some((index, error))) => match &earliest_failure {
+                    Some((earliest, _)) if *earliest <= index => {}
+                    Some(_) | None => earliest_failure = Some((index, error)),
+                },
+                Ok(None) => {}
+                Err(_) => worker_stopped = true,
+            }
+        }
+
+        if let Some(source) = spawn_failure {
+            Err(ReconcileError::DownloadWorkerSpawn { source })
+        } else if worker_stopped {
+            Err(ReconcileError::DownloadWorkerStopped)
+        } else if let Some((_, error)) = earliest_failure {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    })
 }
 
 fn prepare_local_preservation(
@@ -539,7 +647,13 @@ fn stage_remote(
     synchronized_path: &Path,
     remote: &crate::model::RemoteFile,
 ) -> Result<(), ReconcileError> {
-    match dropbox.stage_exact_download_for(root, target, synchronized_path, remote)? {
+    let staged = dropbox
+        .stage_exact_download_for(root, target, synchronized_path, remote)
+        .map_err(|source| ReconcileError::RemoteDownload {
+            path: synchronized_path.to_path_buf(),
+            source,
+        })?;
+    match staged {
         StageOutcome::Staged(()) | StageOutcome::AlreadyStaged(()) => Ok(()),
         StageOutcome::ContentChanged { .. } => Err(ReconcileError::RemoteContentChanged {
             path: synchronized_path.to_path_buf(),
