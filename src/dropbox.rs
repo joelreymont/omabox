@@ -1667,7 +1667,14 @@ fn apply_entries(
                 }
             }
         };
-        records.insert(key, RemoteObservationRecord { path, observation });
+        records.insert(
+            key.clone(),
+            RemoteObservationRecord {
+                canonical_path: PathBuf::from(key),
+                path,
+                observation,
+            },
+        );
     }
     Ok(())
 }
@@ -1682,8 +1689,9 @@ fn ensure_parent_folders(
     for depth in 1..lower.len() {
         let parent_key = lower[..depth].join("/");
         records.insert(
-            parent_key,
+            parent_key.clone(),
             RemoteObservationRecord {
+                canonical_path: PathBuf::from(&parent_key),
                 path: display[..depth].iter().copied().collect(),
                 observation: Observation::Unknown(UnknownReason::Unsupported),
             },
@@ -1705,6 +1713,9 @@ fn relative_paths(
     lower: &str,
     display: &str,
 ) -> Result<(String, PathBuf), DropboxError> {
+    if display.to_lowercase() != lower {
+        return Err(DropboxError::InvalidEntryPath);
+    }
     let remainder = lower
         .strip_prefix(&root.lower_path)
         .ok_or(DropboxError::InvalidEntryPath)?;
@@ -1904,6 +1915,7 @@ mod tests {
                 (
                     key.clone(),
                     RemoteObservationRecord {
+                        canonical_path: PathBuf::from(key),
                         path: PathBuf::from(key),
                         observation,
                     },
@@ -2005,6 +2017,30 @@ mod tests {
         assert!(records.values().all(|record| {
             record.observation == Observation::Unknown(UnknownReason::Unsupported)
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn listing_rejects_mismatched_canonical_and_display_paths() -> Result<(), Box<dyn Error>> {
+        let root = DropboxRoot::new("account", "namespace", "")?;
+        let mut records = BTreeMap::new();
+        let result = apply_entries(
+            &root,
+            &mut records,
+            vec![ListEntry {
+                tag: EntryTag::File,
+                path_lower: Some(String::from("/report.txt")),
+                path_display: Some(String::from("/Different.txt")),
+                rev: Some(String::from("revision")),
+                content_hash: Some(String::from(TEST_CONTENT_HASH)),
+                is_downloadable: true,
+                symlink_info: None,
+                sharing_info: None,
+            }],
+        );
+
+        assert!(matches!(result, Err(DropboxError::InvalidEntryPath)));
+        assert!(records.is_empty());
         Ok(())
     }
 

@@ -12,17 +12,14 @@ use thiserror::Error;
 use crate::dropbox::{DropboxClient, DropboxError};
 use crate::journal::{
     Journal, JournalError, LocalObservationRecord, NoOpWrite, PlanConflictCompletion, PlanRecord,
-    PlanWrite, RemoteObservationRecord,
+    PlanWrite, RemoteObservationRecord, dropbox_canonical_path,
 };
 use crate::local::{
     LocalError, ScanPublication, StageOutcome, StagedUpload, configured_root_is_active,
     observe_upload_source, open_active_root, remove_unreferenced_upload_stages, scan_and_publish,
     stage_upload,
 };
-use crate::model::{
-    Baseline, Conflict, Decision, LocalObservation, Observation, Operation, RemoteFile,
-    RemoteObservation,
-};
+use crate::model::{Baseline, Conflict, Decision, Observation, Operation, RemoteFile};
 use crate::planner::plan;
 use crate::recovery::{
     RecoveryError, RecoveryMaterialization, ReplayBlocked, ReplayReport, destination,
@@ -102,6 +99,14 @@ pub enum ReconcileError {
         path: PathBuf,
         /// Stable, non-secret explanation.
         detail: &'static str,
+    },
+    /// Two local paths cannot both be represented by Dropbox's case-insensitive identity.
+    #[error("local paths `{first}` and `{second}` have the same Dropbox path identity")]
+    LocalCaseCollision {
+        /// First observed local spelling.
+        first: PathBuf,
+        /// Second observed local spelling.
+        second: PathBuf,
     },
     /// The configured path no longer names the journal's active local root.
     #[error("configured local root changed during reconciliation")]
@@ -312,17 +317,19 @@ fn reconcile_published(
     recovery_directory: &Path,
     replay: ReplayReport,
 ) -> Result<ReconcileOutcome, ReconcileError> {
-    let local = local_map(journal.local_inventory()?);
+    let local = local_map(journal.local_inventory()?)?;
     let remote = remote_map(journal.remote_inventory()?.observations);
     let pending = journal
         .pending_plans()?
         .into_iter()
-        .map(|plan| (plan.path.clone(), plan))
+        .map(|plan| (dropbox_canonical_path(&plan.path), plan))
         .collect::<BTreeMap<_, _>>();
-    let mut paths = journal
+    let baseline_paths = journal
         .baseline_paths()?
         .into_iter()
-        .collect::<BTreeSet<_>>();
+        .map(|path| (dropbox_canonical_path(&path), path))
+        .collect::<BTreeMap<_, _>>();
+    let mut paths = baseline_paths.keys().cloned().collect::<BTreeSet<_>>();
     paths.extend(local.keys().cloned());
     paths.extend(remote.keys().cloned());
     let conflicts = journal.conflicts()?;
@@ -332,22 +339,32 @@ fn reconcile_published(
     };
     let mut blocked_paths = BTreeSet::new();
 
-    for path in paths {
-        let baseline = match journal.baseline(&path)? {
+    for canonical_path in paths {
+        let baseline = match journal.baseline(&canonical_path)? {
             Some(value) => value,
             None => Baseline::Absent,
         };
-        let local_observation = match local.get(&path) {
-            Some(value) => value.clone(),
+        let local_observation = match local.get(&canonical_path) {
+            Some(value) => value.observation.clone(),
             None => Observation::ConfirmedAbsent,
         };
-        let remote_observation = match remote.get(&path) {
-            Some(value) => value.clone(),
+        let remote_observation = match remote.get(&canonical_path) {
+            Some(value) => value.observation.clone(),
             None => Observation::ConfirmedAbsent,
         };
+        let path = local
+            .get(&canonical_path)
+            .map(|record| record.path.clone())
+            .or_else(|| {
+                remote
+                    .get(&canonical_path)
+                    .map(|record| record.path.clone())
+            })
+            .or_else(|| baseline_paths.get(&canonical_path).cloned())
+            .ok_or_else(|| invalid(&canonical_path, "canonical path has no display spelling"))?;
         let decision = plan(&baseline, &local_observation, &remote_observation);
 
-        if let Some(pending_plan) = pending.get(&path) {
+        if let Some(pending_plan) = pending.get(&canonical_path) {
             if let Decision::Conflict(conflict) = decision {
                 match prepare_conflict(dropbox, sync_root, upload_staging, &path, &conflict)? {
                     Prepared::Ready(()) => {
@@ -359,7 +376,7 @@ fn reconcile_published(
                 }
                 report.conflicts += 1;
             } else {
-                blocked_paths.insert(path.clone());
+                blocked_paths.insert(canonical_path.clone());
             }
             continue;
         }
@@ -368,11 +385,11 @@ fn reconcile_published(
             Decision::NoOp(noop) => match journal.record_noop(&path, &noop)? {
                 NoOpWrite::Recorded => report.noops += 1,
                 NoOpWrite::PendingPlan(_) => {
-                    blocked_paths.insert(path.clone());
+                    blocked_paths.insert(canonical_path.clone());
                 }
             },
             Decision::Blocked(_) => {
-                blocked_paths.insert(path.clone());
+                blocked_paths.insert(canonical_path.clone());
             }
             Decision::Operations(plan) => {
                 match prepare_plan(
@@ -392,7 +409,7 @@ fn reconcile_published(
                 match journal.record_plan(&path, &plan)? {
                     PlanWrite::Recorded(_) => report.planned += 1,
                     PlanWrite::AlreadyPending(_) => {
-                        blocked_paths.insert(path.clone());
+                        blocked_paths.insert(canonical_path.clone());
                     }
                 }
             }
@@ -403,10 +420,10 @@ fn reconcile_published(
                         return Ok(ReconcileOutcome::FreshObservationRequired { path });
                     }
                 }
-                if !conflicts
-                    .iter()
-                    .any(|record| record.path == path && record.conflict == conflict)
-                {
+                if !conflicts.iter().any(|record| {
+                    dropbox_canonical_path(&record.path) == canonical_path
+                        && record.conflict == conflict
+                }) {
                     journal.record_conflict(&path, &conflict)?;
                     report.conflicts += 1;
                 }
@@ -425,7 +442,11 @@ fn reconcile_published(
     prune_completed_recoveries(journal, recovery_directory)?;
     let retained_uploads = journal.pending_upload_content()?;
     let pending = journal.pending_plans()?;
-    blocked_paths.extend(pending.into_iter().map(|plan| plan.path));
+    blocked_paths.extend(
+        pending
+            .into_iter()
+            .map(|plan| dropbox_canonical_path(&plan.path)),
+    );
     report.blocked = blocked_paths.len();
     remove_unreferenced_upload_stages(upload_staging, &retained_uploads)?;
     Ok(ReconcileOutcome::Complete(report))
@@ -728,17 +749,26 @@ fn finish_pending_conflict(
     }
 }
 
-fn local_map(records: Vec<LocalObservationRecord>) -> BTreeMap<PathBuf, LocalObservation> {
-    records
-        .into_iter()
-        .map(|record| (record.path, record.observation))
-        .collect()
+fn local_map(
+    records: Vec<LocalObservationRecord>,
+) -> Result<BTreeMap<PathBuf, LocalObservationRecord>, ReconcileError> {
+    let mut mapped = BTreeMap::new();
+    for record in records {
+        let canonical_path = dropbox_canonical_path(&record.path);
+        if let Some(existing) = mapped.insert(canonical_path, record.clone()) {
+            return Err(ReconcileError::LocalCaseCollision {
+                first: existing.path,
+                second: record.path,
+            });
+        }
+    }
+    Ok(mapped)
 }
 
-fn remote_map(records: Vec<RemoteObservationRecord>) -> BTreeMap<PathBuf, RemoteObservation> {
+fn remote_map(records: Vec<RemoteObservationRecord>) -> BTreeMap<PathBuf, RemoteObservationRecord> {
     records
         .into_iter()
-        .map(|record| (record.path, record.observation))
+        .map(|record| (record.canonical_path.clone(), record))
         .collect()
 }
 
@@ -754,10 +784,40 @@ mod tests {
     use std::error::Error;
     use std::io::{Cursor, Read as _};
 
+    use proptest::prelude::*;
     use tempfile::TempDir;
 
     use super::*;
     use crate::local::{ConflictSide, conflict_relative_path, dropbox_content_hash};
+
+    proptest! {
+        #[test]
+        fn local_case_variants_never_collapse_into_one_observation(
+            lowercase in "[a-z]{1,24}\\.txt",
+        ) {
+            let uppercase = lowercase.to_ascii_uppercase();
+            let records = vec![
+                LocalObservationRecord {
+                    path: PathBuf::from(&lowercase),
+                    observation: Observation::Present(crate::model::LocalFile::new(
+                        crate::model::ContentIdentity::new("lower"),
+                    )),
+                },
+                LocalObservationRecord {
+                    path: PathBuf::from(&uppercase),
+                    observation: Observation::Present(crate::model::LocalFile::new(
+                        crate::model::ContentIdentity::new("upper"),
+                    )),
+                },
+            ];
+
+            let collision = match local_map(records) {
+                Err(ReconcileError::LocalCaseCollision { .. }) => true,
+                Ok(_) | Err(_) => false,
+            };
+            prop_assert!(collision);
+        }
+    }
     use crate::model::{ContentIdentity, DropboxRevision, LocalFile, RemoteFile};
     use crate::recovery::replay_local_operations;
 

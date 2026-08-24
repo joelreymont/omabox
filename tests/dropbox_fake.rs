@@ -320,6 +320,106 @@ fn one_reconciliation_pass_synchronizes_files_in_both_directions() -> Result<(),
 }
 
 #[test]
+fn case_only_remote_spelling_change_is_a_stable_noop() -> Result<(), Box<dyn Error>> {
+    let bytes = b"same bytes across a case-only change";
+    let content = dropbox_content_hash(bytes.as_slice())?;
+    let remote = RemoteFile::new(content.clone(), DropboxRevision::new("rev-same"));
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [file_metadata(
+                "/report.txt",
+                "/report.txt",
+                "rev-same",
+                &content,
+            )],
+            "cursor": "case-only",
+            "has_more": false
+        })),
+    ])?;
+    let client = fake_client(&server, "opaque-access-case-only")?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("Report.TXT"), bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_baseline(&mut journal, Path::new("Report.TXT"), &remote)?;
+
+    let report = match reconcile_once(&mut journal, &client, &root, &staging, &recovery)? {
+        ReconcileOutcome::Complete(report) => report,
+        ReconcileOutcome::FreshObservationRequired { .. } => {
+            return Err(io::Error::other("stable case-only fixture requested a refresh").into());
+        }
+        ReconcileOutcome::LocalRootChanged => {
+            return Err(io::Error::other("stable case-only fixture changed its root").into());
+        }
+    };
+
+    assert_eq!(report.noops, 1);
+    assert_eq!(report.planned, 0);
+    assert_eq!(report.replayed_operations, 0);
+    assert!(journal.pending_plans()?.is_empty());
+    assert_eq!(
+        journal.baseline(Path::new("report.txt"))?,
+        Some(Baseline::Present(remote))
+    );
+    assert!(root.join("Report.TXT").is_file());
+    assert!(!root.join("report.txt").exists());
+    let inventory = journal.remote_inventory()?;
+    let [record] = inventory.observations.as_slice() else {
+        return Err(io::Error::other("expected one canonical remote observation").into());
+    };
+    assert_eq!(record.canonical_path, Path::new("report.txt"));
+    assert_eq!(record.path, Path::new("report.txt"));
+    assert_eq!(server.finish()?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn local_case_collision_cannot_create_any_plan() -> Result<(), Box<dyn Error>> {
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [],
+            "cursor": "empty",
+            "has_more": false
+        })),
+    ])?;
+    let client = fake_client(&server, "opaque-access-local-collision")?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("Foo.txt"), b"first")?;
+    std::fs::write(root.join("foo.txt"), b"second")?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+
+    assert!(matches!(
+        reconcile_once(&mut journal, &client, &root, &staging, &recovery),
+        Err(ReconcileError::LocalCaseCollision { .. })
+    ));
+    assert!(journal.pending_plans()?.is_empty());
+    assert!(journal.baseline_paths()?.is_empty());
+    assert_eq!(server.finish()?.len(), 2);
+    Ok(())
+}
+
+#[test]
 fn pending_exact_downloads_use_bounded_parallel_workers() -> Result<(), Box<dyn Error>> {
     const DOWNLOAD_COUNT: usize = 8;
 
@@ -1317,6 +1417,7 @@ fn cursor_reset_rebuilds_before_one_complete_publication() -> Result<(), Box<dyn
     let directory = TempDir::new()?;
     let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
     let old = RemoteObservationRecord {
+        canonical_path: Path::new("old.txt").to_path_buf(),
         path: Path::new("Old.txt").to_path_buf(),
         observation: Observation::Present(RemoteFile::new(
             ContentIdentity::new("old"),
@@ -1448,6 +1549,7 @@ fn failed_later_page_cannot_publish_partial_listing_as_absence() -> Result<(), B
     let directory = TempDir::new()?;
     let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
     let old = RemoteObservationRecord {
+        canonical_path: Path::new("old.txt").to_path_buf(),
         path: Path::new("Old.txt").to_path_buf(),
         observation: Observation::Present(RemoteFile::new(
             ContentIdentity::new("durable-old"),
@@ -1506,6 +1608,7 @@ fn incomplete_downloadable_metadata_cannot_replace_durable_inventory() -> Result
     let directory = TempDir::new()?;
     let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
     let old = RemoteObservationRecord {
+        canonical_path: Path::new("old.txt").to_path_buf(),
         path: Path::new("Old.txt").to_path_buf(),
         observation: Observation::Unknown(UnknownReason::Stale),
     };
@@ -1569,6 +1672,7 @@ fn restricted_later_page_cannot_replace_durable_inventory() -> Result<(), Box<dy
     let directory = TempDir::new()?;
     let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
     let durable = RemoteObservationRecord {
+        canonical_path: Path::new("durable.txt").to_path_buf(),
         path: Path::new("Durable.txt").to_path_buf(),
         observation: Observation::Unknown(UnknownReason::Stale),
     };

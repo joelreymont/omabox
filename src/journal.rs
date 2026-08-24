@@ -18,7 +18,8 @@ use crate::model::{
 const MIGRATION_V1: &str = include_str!("../migrations/0001.sql");
 const MIGRATION_V2: &str = include_str!("../migrations/0002.sql");
 const MIGRATION_V3: &str = include_str!("../migrations/0003.sql");
-const SCHEMA_VERSION: i64 = 3;
+const MIGRATION_V4: &str = include_str!("../migrations/0004.sql");
+const SCHEMA_VERSION: i64 = 4;
 
 /// A journal failure with its operation, affected path, and original cause.
 #[derive(Debug, Error)]
@@ -161,6 +162,8 @@ struct LocalHashValue {
 /// One path from a complete Dropbox inventory.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteObservationRecord {
+    /// Dropbox's case-insensitive identity relative to the configured root.
+    pub canonical_path: PathBuf,
     /// Path relative to the configured sync root.
     pub path: PathBuf,
     /// Complete observation for the path, including its Dropbox revision.
@@ -506,6 +509,16 @@ impl Journal {
                         path: path.clone(),
                         source,
                     })?;
+            }
+            if version < 4 {
+                transaction
+                    .execute_batch(MIGRATION_V4)
+                    .map_err(|source| JournalError::Sqlite {
+                        operation: "apply journal version-four migration",
+                        path: path.clone(),
+                        source,
+                    })?;
+                migrate_canonical_paths(&transaction, &path)?;
             }
             transaction
                 .commit()
@@ -891,7 +904,13 @@ impl Journal {
                     "serialize remote observation",
                     &record.path,
                 )
-                .map(|json| (path_bytes(&record.path), json))
+                .map(|json| {
+                    (
+                        path_bytes(&record.path),
+                        path_bytes(&record.canonical_path),
+                        json,
+                    )
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let database_path = self.database_path.clone();
@@ -904,11 +923,13 @@ impl Journal {
         transaction
             .execute("DELETE FROM remote_observations", [])
             .map_err(|source| sqlite("replace remote inventory", &database_path, source))?;
-        for (path, json) in encoded {
+        for (path, canonical_path, json) in encoded {
             transaction
                 .execute(
-                    "INSERT INTO remote_observations(path, observation_json) VALUES (?1, ?2)",
-                    params![path, json],
+                    "INSERT INTO remote_observations(\
+                         path, observation_json, canonical_path\
+                     ) VALUES (?1, ?2, ?3)",
+                    params![path, json, canonical_path],
                 )
                 .map_err(|source| sqlite("publish remote observation", &database_path, source))?;
         }
@@ -939,7 +960,8 @@ impl Journal {
             )
             .optional()
             .map_err(|source| sqlite("read remote cursor", &database_path, source))?;
-        let observations = read_remote_observations(&transaction, &database_path)?;
+        let observations =
+            read_remote_observations(&transaction, &database_path, self.schema_version)?;
         transaction
             .commit()
             .map_err(|source| sqlite("commit remote inventory read", &database_path, source))?;
@@ -954,11 +976,21 @@ impl Journal {
     /// Baselines can only be written by completing the final operation of a
     /// pending plan; the public API deliberately has no independent setter.
     pub fn baseline(&self, path: &Path) -> Result<Option<Baseline>, JournalError> {
+        let canonical_path = dropbox_canonical_path(path);
+        let query = if self.schema_version < 4 {
+            "SELECT baseline_json FROM baselines WHERE path = ?1"
+        } else {
+            "SELECT baseline_json FROM baselines WHERE canonical_path = ?1"
+        };
         let json = self
             .connection
             .query_row(
-                "SELECT baseline_json FROM baselines WHERE path = ?1",
-                [path_bytes(path)],
+                query,
+                [if self.schema_version < 4 {
+                    path_bytes(path)
+                } else {
+                    path_bytes(&canonical_path)
+                }],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -997,10 +1029,11 @@ impl Journal {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite("begin no-op baseline", &database_path, source))?;
+        let canonical_path = dropbox_canonical_path(path);
         let pending = transaction
             .query_row(
-                "SELECT id FROM plans WHERE path = ?1 AND status = 'pending'",
-                [path_bytes(path)],
+                "SELECT id FROM plans WHERE canonical_path = ?1 AND status = 'pending'",
+                [path_bytes(&canonical_path)],
                 |row| row.get::<_, i64>(0),
             )
             .optional()
@@ -1013,7 +1046,10 @@ impl Journal {
         }
         write_baseline(&transaction, path, noop.baseline())?;
         transaction
-            .execute("DELETE FROM conflicts WHERE path = ?1", [path_bytes(path)])
+            .execute(
+                "DELETE FROM conflicts WHERE canonical_path = ?1",
+                [path_bytes(&canonical_path)],
+            )
             .map_err(|source| sqlite("retire resolved conflicts", path, source))?;
         transaction
             .commit()
@@ -1045,10 +1081,11 @@ impl Journal {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite("begin plan intent", &database_path, source))?;
+        let canonical_path = dropbox_canonical_path(path);
         let existing = transaction
             .query_row(
-                "SELECT id FROM plans WHERE path = ?1 AND status = 'pending'",
-                [path_bytes(path)],
+                "SELECT id FROM plans WHERE canonical_path = ?1 AND status = 'pending'",
+                [path_bytes(&canonical_path)],
                 |row| row.get::<_, i64>(0),
             )
             .optional()
@@ -1069,8 +1106,8 @@ impl Journal {
 
         transaction
             .execute(
-                "INSERT INTO plans(path, status) VALUES (?1, 'pending')",
-                [path_bytes(path)],
+                "INSERT INTO plans(path, status, canonical_path) VALUES (?1, 'pending', ?2)",
+                params![path_bytes(path), path_bytes(&canonical_path)],
             )
             .map_err(|source| sqlite("record plan intent", path, source))?;
         let plan_id = PlanId(transaction.last_insert_rowid());
@@ -1345,7 +1382,10 @@ impl Journal {
 
         write_baseline(&transaction, &path, baseline)?;
         transaction
-            .execute("DELETE FROM conflicts WHERE path = ?1", [path_bytes(&path)])
+            .execute(
+                "DELETE FROM conflicts WHERE canonical_path = ?1",
+                [path_bytes(&dropbox_canonical_path(&path))],
+            )
             .map_err(|source| sqlite("retire resolved conflicts", &path, source))?;
         transaction
             .execute(
@@ -1392,8 +1432,12 @@ impl Journal {
         let json = encode(conflict, "serialize plan conflict", &path)?;
         transaction
             .execute(
-                "INSERT INTO conflicts(path, conflict_json) VALUES (?1, ?2)",
-                params![path_bytes(&path), json],
+                "INSERT INTO conflicts(path, conflict_json, canonical_path) VALUES (?1, ?2, ?3)",
+                params![
+                    path_bytes(&path),
+                    json,
+                    path_bytes(&dropbox_canonical_path(&path))
+                ],
             )
             .map_err(|source| sqlite("record plan conflict", &path, source))?;
         transaction
@@ -1424,8 +1468,12 @@ impl Journal {
         let json = encode(conflict, "serialize conflict", path)?;
         self.connection
             .execute(
-                "INSERT INTO conflicts(path, conflict_json) VALUES (?1, ?2)",
-                params![path_bytes(path), json],
+                "INSERT INTO conflicts(path, conflict_json, canonical_path) VALUES (?1, ?2, ?3)",
+                params![
+                    path_bytes(path),
+                    json,
+                    path_bytes(&dropbox_canonical_path(path))
+                ],
             )
             .map_err(|source| sqlite("record conflict", path, source))?;
         Ok(ConflictRecord {
@@ -1738,6 +1786,74 @@ fn configure_writable(connection: &Connection, database_path: &Path) -> Result<(
     Ok(())
 }
 
+fn migrate_canonical_paths(
+    connection: &Connection,
+    database_path: &Path,
+) -> Result<(), JournalError> {
+    populate_canonical_paths(
+        connection,
+        database_path,
+        "SELECT rowid, path FROM baselines",
+        "UPDATE baselines SET canonical_path = ?1 WHERE rowid = ?2",
+    )?;
+    populate_canonical_paths(
+        connection,
+        database_path,
+        "SELECT rowid, path FROM plans",
+        "UPDATE plans SET canonical_path = ?1 WHERE rowid = ?2",
+    )?;
+    populate_canonical_paths(
+        connection,
+        database_path,
+        "SELECT rowid, path FROM conflicts",
+        "UPDATE conflicts SET canonical_path = ?1 WHERE rowid = ?2",
+    )?;
+    connection
+        .execute_batch(
+            "DELETE FROM baselines WHERE canonical_path IN ( \
+                 SELECT canonical_path FROM baselines \
+                 GROUP BY canonical_path HAVING COUNT(*) > 1 \
+             ); \
+             CREATE UNIQUE INDEX baselines_by_canonical_path \
+                 ON baselines(canonical_path); \
+             CREATE UNIQUE INDEX remote_observations_by_canonical_path \
+                 ON remote_observations(canonical_path); \
+             CREATE INDEX plans_by_canonical_path \
+                 ON plans(canonical_path); \
+             CREATE INDEX conflicts_by_canonical_path \
+                 ON conflicts(canonical_path); \
+             PRAGMA user_version = 4;",
+        )
+        .map_err(|source| sqlite("finalize canonical path migration", database_path, source))
+}
+
+fn populate_canonical_paths(
+    connection: &Connection,
+    database_path: &Path,
+    select: &'static str,
+    update: &'static str,
+) -> Result<(), JournalError> {
+    let rows = {
+        let mut statement = connection
+            .prepare(select)
+            .map_err(|source| sqlite("prepare canonical path migration", database_path, source))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|source| sqlite("query canonical path migration", database_path, source))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|source| sqlite("read canonical path migration", database_path, source))?
+    };
+    for (row_id, raw_path) in rows {
+        let canonical = dropbox_canonical_path(&bytes_path(raw_path));
+        connection
+            .execute(update, params![path_bytes(&canonical), row_id])
+            .map_err(|source| sqlite("write canonical path migration", database_path, source))?;
+    }
+    Ok(())
+}
+
 fn sqlite(operation: &'static str, path: &Path, source: rusqlite::Error) -> JournalError {
     JournalError::Sqlite {
         operation,
@@ -1778,6 +1894,21 @@ fn bytes_path(bytes: Vec<u8>) -> PathBuf {
     PathBuf::from(OsString::from_vec(bytes))
 }
 
+pub(crate) fn dropbox_canonical_path(path: &Path) -> PathBuf {
+    path.iter()
+        .map(|component| match component.to_str() {
+            Some(text) => OsString::from(text.to_lowercase()),
+            None => OsString::from_vec(
+                component
+                    .as_bytes()
+                    .iter()
+                    .map(u8::to_ascii_lowercase)
+                    .collect(),
+            ),
+        })
+        .collect()
+}
+
 fn decode_u64(bytes: &[u8], operation: &'static str, path: &Path) -> Result<u64, JournalError> {
     let raw = <[u8; 8]>::try_from(bytes).map_err(|_| JournalError::InvalidState {
         operation,
@@ -1816,18 +1947,25 @@ fn write_baseline(
     path: &Path,
     baseline: &Baseline,
 ) -> Result<(), JournalError> {
+    let canonical_path = dropbox_canonical_path(path);
     match baseline {
         Baseline::Absent => connection
-            .execute("DELETE FROM baselines WHERE path = ?1", [path_bytes(path)])
+            .execute(
+                "DELETE FROM baselines WHERE canonical_path = ?1",
+                [path_bytes(&canonical_path)],
+            )
             .map(|_| ())
             .map_err(|source| sqlite("remove absent baseline", path, source)),
         Baseline::Present(_) => {
             let json = encode(baseline, "serialize present baseline", path)?;
             connection
                 .execute(
-                    "INSERT INTO baselines(path, baseline_json) VALUES (?1, ?2) \
-                     ON CONFLICT(path) DO UPDATE SET baseline_json = excluded.baseline_json",
-                    params![path_bytes(path), json],
+                    "INSERT INTO baselines(path, baseline_json, canonical_path) \
+                     VALUES (?1, ?2, ?3) \
+                     ON CONFLICT(canonical_path) DO UPDATE SET \
+                         path = excluded.path, \
+                         baseline_json = excluded.baseline_json",
+                    params![path_bytes(path), json, path_bytes(&canonical_path)],
                 )
                 .map(|_| ())
                 .map_err(|source| sqlite("record present baseline", path, source))
@@ -1992,23 +2130,39 @@ fn read_local_hash_cache(
 fn read_remote_observations(
     connection: &Connection,
     database_path: &Path,
+    schema_version: i64,
 ) -> Result<Vec<RemoteObservationRecord>, JournalError> {
+    let query = if schema_version < 4 {
+        "SELECT path, path, observation_json FROM remote_observations ORDER BY path"
+    } else {
+        "SELECT canonical_path, path, observation_json \
+         FROM remote_observations ORDER BY canonical_path"
+    };
     let mut statement = connection
-        .prepare("SELECT path, observation_json FROM remote_observations ORDER BY path")
+        .prepare(query)
         .map_err(|source| sqlite("prepare remote inventory query", database_path, source))?;
     let rows = statement
         .query_map([], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })
         .map_err(|source| sqlite("query remote inventory", database_path, source))?;
     let raw = rows
         .collect::<Result<Vec<_>, _>>()
         .map_err(|source| sqlite("read remote inventory", database_path, source))?;
     raw.into_iter()
-        .map(|(raw_path, json)| {
+        .map(|(raw_canonical_path, raw_path, json)| {
+            let canonical_path = bytes_path(raw_canonical_path);
             let path = bytes_path(raw_path);
             let observation = decode(&json, "deserialize remote observation", &path)?;
-            Ok(RemoteObservationRecord { path, observation })
+            Ok(RemoteObservationRecord {
+                canonical_path,
+                path,
+                observation,
+            })
         })
         .collect()
 }
@@ -2469,6 +2623,7 @@ mod tests {
         };
         journal.publish_local_inventory(std::slice::from_ref(&local_observation))?;
         let remote_observation = RemoteObservationRecord {
+            canonical_path: dropbox_canonical_path(path),
             path: path.to_path_buf(),
             observation: Observation::Present(agreed.clone()),
         };
@@ -2719,6 +2874,7 @@ mod tests {
         let directory = TempDir::new()?;
         let mut journal = Journal::open(journal_path(&directory))?;
         let old = RemoteObservationRecord {
+            canonical_path: PathBuf::from("old.txt"),
             path: PathBuf::from("old.txt"),
             observation: Observation::Present(remote_file("old", "rev-old")),
         };
@@ -2727,10 +2883,12 @@ mod tests {
         let duplicate_path = PathBuf::from("duplicate.txt");
         let invalid_replacement = [
             RemoteObservationRecord {
+                canonical_path: duplicate_path.clone(),
                 path: duplicate_path.clone(),
                 observation: Observation::ConfirmedAbsent,
             },
             RemoteObservationRecord {
+                canonical_path: duplicate_path.clone(),
                 path: duplicate_path,
                 observation: Observation::Present(remote_file("new", "rev-new")),
             },
@@ -3120,7 +3278,7 @@ mod tests {
         drop(legacy);
 
         let mut journal = Journal::open(&database_path)?;
-        assert_eq!(journal.schema_version, 3);
+        assert_eq!(journal.schema_version, 4);
         assert_eq!(journal.baseline(path)?, None);
         assert_eq!(journal.baseline(kept_path)?, Some(kept_baseline.clone()));
         assert_eq!(journal.baseline_paths()?, vec![kept_path.to_path_buf()]);
@@ -3171,12 +3329,138 @@ mod tests {
         let version = journal
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         let mut foreign_keys = journal
             .connection
             .prepare("PRAGMA foreign_key_list(recovery_records)")?;
         let references = foreign_keys.query_map([], |_| Ok(()))?.count();
         assert_eq!(references, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn version_three_migrates_existing_paths_to_canonical_identity() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+        let display_path = Path::new("Folder/Report.TXT");
+        let canonical_path = Path::new("folder/report.txt");
+        let baseline = Baseline::Present(remote_file("same", "rev-same"));
+        let operation = Operation::CreateRemote {
+            content: content("pending"),
+        };
+        {
+            let connection = Connection::open(&database_path)?;
+            connection.execute_batch(MIGRATION_V1)?;
+            connection.execute_batch(MIGRATION_V2)?;
+            connection.execute_batch(MIGRATION_V3)?;
+            connection.execute(
+                "INSERT INTO baselines(path, baseline_json) VALUES (?1, ?2)",
+                params![
+                    path_bytes(display_path),
+                    encode(&baseline, "test", display_path)?
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO plans(id, path, status) VALUES (10, ?1, 'pending')",
+                [path_bytes(Path::new("Pending.TXT"))],
+            )?;
+            connection.execute(
+                "INSERT INTO operations(\
+                     id, plan_id, ordinal, operation_json, status\
+                 ) VALUES (20, 10, 0, ?1, 'pending')",
+                [encode(&operation, "test", Path::new("Pending.TXT"))?],
+            )?;
+            connection.execute(
+                "INSERT INTO remote_observations(path, observation_json) VALUES (?1, ?2)",
+                params![
+                    path_bytes(display_path),
+                    encode(
+                        &Observation::Present(remote_file("same", "rev-same")),
+                        "test",
+                        display_path,
+                    )?
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO remote_inventory(singleton, cursor) VALUES (1, 'stale')",
+                [],
+            )?;
+        }
+
+        let mut journal = Journal::open(&database_path)?;
+        assert_eq!(journal.baseline(canonical_path)?, Some(baseline));
+        assert_eq!(journal.baseline_paths()?, vec![display_path.to_path_buf()]);
+        assert_eq!(
+            journal.remote_inventory()?,
+            RemoteInventory {
+                cursor: None,
+                observations: Vec::new(),
+            }
+        );
+        let duplicate = OperationPlan::new(vec![operation]);
+        assert!(matches!(
+            journal.record_plan(Path::new("pending.txt"), &duplicate)?,
+            PlanWrite::AlreadyPending(plan) if plan.path == Path::new("Pending.TXT")
+        ));
+        let version = journal
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+        assert_eq!(version, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn version_three_case_collisions_migrate_without_losing_pending_work()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+        let first_path = Path::new("Foo.txt");
+        let second_path = Path::new("foo.TXT");
+        let operation = Operation::CreateRemote {
+            content: content("pending"),
+        };
+        {
+            let connection = Connection::open(&database_path)?;
+            connection.execute_batch(MIGRATION_V1)?;
+            connection.execute_batch(MIGRATION_V2)?;
+            connection.execute_batch(MIGRATION_V3)?;
+            for (path, revision) in [(first_path, "rev-first"), (second_path, "rev-second")] {
+                let baseline = Baseline::Present(remote_file("old", revision));
+                connection.execute(
+                    "INSERT INTO baselines(path, baseline_json) VALUES (?1, ?2)",
+                    params![path_bytes(path), encode(&baseline, "test", path)?],
+                )?;
+            }
+            for (plan_id, operation_id, path) in [(10, 20, first_path), (11, 21, second_path)] {
+                connection.execute(
+                    "INSERT INTO plans(id, path, status) VALUES (?1, ?2, 'pending')",
+                    params![plan_id, path_bytes(path)],
+                )?;
+                connection.execute(
+                    "INSERT INTO operations(\
+                         id, plan_id, ordinal, operation_json, status\
+                     ) VALUES (?1, ?2, 0, ?3, 'pending')",
+                    params![operation_id, plan_id, encode(&operation, "test", path)?],
+                )?;
+            }
+        }
+
+        let mut journal = Journal::open(&database_path)?;
+        assert!(journal.baseline_paths()?.is_empty());
+        assert_eq!(journal.baseline(first_path)?, None);
+        assert_eq!(journal.baseline(second_path)?, None);
+        assert_eq!(journal.pending_plans()?.len(), 2);
+        let new_plan = OperationPlan::new(vec![operation]);
+        assert!(matches!(
+            journal.record_plan(Path::new("FOO.txt"), &new_plan)?,
+            PlanWrite::AlreadyPending(_)
+        ));
+        assert_eq!(journal.pending_plans()?.len(), 2);
+        drop(journal);
+
+        let reopened = Journal::open(&database_path)?;
+        assert_eq!(reopened.pending_plans()?.len(), 2);
+        assert!(reopened.baseline_paths()?.is_empty());
         Ok(())
     }
 
@@ -3218,22 +3502,22 @@ mod tests {
         let directory = TempDir::new()?;
         let database_path = journal_path(&directory);
         let connection = Connection::open(&database_path)?;
-        connection.pragma_update(None, "user_version", 4)?;
+        connection.pragma_update(None, "user_version", 5)?;
         drop(connection);
 
         let opened = Journal::open(&database_path);
         assert!(matches!(
             opened,
             Err(JournalError::UnsupportedVersion {
-                found: 4,
-                supported: 3,
+                found: 5,
+                supported: 4,
                 ..
             })
         ));
         let connection = Connection::open(database_path)?;
         let version =
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         Ok(())
     }
 

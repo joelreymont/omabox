@@ -218,6 +218,7 @@ mod tests {
         journal.publish_remote_inventory(
             "cursor-must-not-render",
             &[RemoteObservationRecord {
+                canonical_path: PathBuf::from("a-remote.txt"),
                 path: PathBuf::from("a-remote.txt"),
                 observation: Observation::Unknown(UnknownReason::Stale),
             }],
