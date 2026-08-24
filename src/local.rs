@@ -6,6 +6,9 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{
@@ -23,6 +26,10 @@ use crate::journal::{
 use crate::model::{ContentIdentity, LocalFile, Observation, UnknownReason};
 
 const DROPBOX_BLOCK_SIZE: usize = 4 * 1024 * 1024;
+const MAX_PARALLEL_HASHES: usize = 12;
+// Exceeds FAT's two-second mtime tick. The cache requires coherent local
+// filesystem metadata; arbitrary stale network metadata is not supported.
+const HASH_CACHE_RACY_WINDOW: Duration = Duration::from_secs(3);
 const DOWNLOAD_STAGE_XATTR: &str = "user.omabox.download-stage-v1";
 const BELOW_ROOT: ResolveFlags = ResolveFlags::BENEATH
     .union(ResolveFlags::NO_SYMLINKS)
@@ -92,6 +99,21 @@ pub enum LocalError {
         #[source]
         source: JournalError,
     },
+    /// A bounded local hashing worker could not be started.
+    #[error("could not start local hashing worker {worker}")]
+    HashWorkerSpawn {
+        /// Zero-based worker number.
+        worker: usize,
+        /// Original operating-system error.
+        #[source]
+        source: io::Error,
+    },
+    /// A bounded local hashing worker terminated without returning a result.
+    #[error("local hashing worker {worker} terminated unexpectedly")]
+    HashWorkerTerminated {
+        /// Zero-based worker number.
+        worker: usize,
+    },
 }
 
 /// A hashing failure from the source stream.
@@ -112,6 +134,45 @@ pub struct CompleteScan {
     root_binding: LocalRootBinding,
     observations: Vec<LocalObservationRecord>,
     hashes: Vec<LocalHashRecord>,
+}
+
+struct PendingScan {
+    root: PathBuf,
+    root_fd: OwnedFd,
+    root_before: rustix::fs::Stat,
+    directories: Vec<ScannedDirectory>,
+    observations: Vec<LocalObservationRecord>,
+    cached_files: Vec<LocalHashRecord>,
+    hash_jobs: Vec<HashJob>,
+}
+
+#[derive(Default)]
+struct ScanEntries {
+    observations: Vec<LocalObservationRecord>,
+    cached_files: Vec<LocalHashRecord>,
+    directories: Vec<ScannedDirectory>,
+    hash_jobs: Vec<HashJob>,
+}
+
+struct ScannedDirectory {
+    path: PathBuf,
+    before: rustix::fs::Stat,
+}
+
+struct HashJob {
+    path: PathBuf,
+    fingerprint: LocalFileFingerprint,
+}
+
+struct HashWorkerOutput {
+    records: Vec<(usize, LocalHashRecord)>,
+    failure: Option<(usize, LocalError)>,
+}
+
+#[derive(Clone, Copy)]
+struct HashCacheCutoff {
+    seconds: i64,
+    nanoseconds: u32,
 }
 
 impl CompleteScan {
@@ -290,6 +351,50 @@ pub fn dropbox_content_hash(mut reader: impl Read) -> Result<ContentIdentity, Ha
     hash_stream(&mut reader).map_err(|source| HashError::Read { source })
 }
 
+fn hash_cache_cutoff(now: SystemTime) -> Option<HashCacheCutoff> {
+    let elapsed = now
+        .checked_sub(HASH_CACHE_RACY_WINDOW)?
+        .duration_since(UNIX_EPOCH)
+        .ok()?;
+    Some(HashCacheCutoff {
+        seconds: i64::try_from(elapsed.as_secs()).ok()?,
+        nanoseconds: elapsed.subsec_nanos(),
+    })
+}
+
+fn hash_is_reusable(record: &LocalHashRecord, cutoff: Option<HashCacheCutoff>) -> bool {
+    let Some(cutoff) = cutoff else {
+        return false;
+    };
+    timestamp_is_before(
+        record.fingerprint.modified_seconds,
+        record.fingerprint.modified_nanoseconds,
+        cutoff,
+    ) && timestamp_is_before(
+        record.fingerprint.changed_seconds,
+        record.fingerprint.changed_nanoseconds,
+        cutoff,
+    )
+}
+
+fn timestamp_is_before(seconds: i64, nanoseconds: u64, cutoff: HashCacheCutoff) -> bool {
+    let Ok(nanoseconds) = u32::try_from(nanoseconds) else {
+        return false;
+    };
+    nanoseconds < 1_000_000_000 && (seconds, nanoseconds) < (cutoff.seconds, cutoff.nanoseconds)
+}
+
+fn reusable_hashes(
+    hashes: &[LocalHashRecord],
+    cutoff: Option<HashCacheCutoff>,
+) -> Vec<LocalHashRecord> {
+    hashes
+        .iter()
+        .filter(|record| hash_is_reusable(record, cutoff))
+        .cloned()
+        .collect()
+}
+
 /// Scan the complete root through no-follow, descriptor-relative opens.
 ///
 /// Any inaccessible, changing, symlinked, magic-linked, or special entry
@@ -298,45 +403,82 @@ pub fn dropbox_content_hash(mut reader: impl Read) -> Result<ContentIdentity, Ha
 /// observations while their contents are scanned recursively.
 #[cfg(test)]
 fn scan(root: impl AsRef<Path>) -> Result<CompleteScan, LocalError> {
-    scan_with_cache(root, &BTreeMap::new())
+    scan_with_cache_and_workers_at(root, &BTreeMap::new(), MAX_PARALLEL_HASHES, None)
 }
 
-fn scan_with_cache(
+fn scan_with_cache_and_workers_at(
     root: impl AsRef<Path>,
     cache: &BTreeMap<PathBuf, LocalHashRecord>,
+    max_workers: usize,
+    cache_cutoff: Option<HashCacheCutoff>,
 ) -> Result<CompleteScan, LocalError> {
-    let root = root.as_ref();
+    let pending = enumerate_scan(root.as_ref(), cache, cache_cutoff)?;
+    finish_scan(pending, max_workers)
+}
+
+fn enumerate_scan(
+    root: &Path,
+    cache: &BTreeMap<PathBuf, LocalHashRecord>,
+    cache_cutoff: Option<HashCacheCutoff>,
+) -> Result<PendingScan, LocalError> {
     let root_fd = open_absolute_directory(root, "open sync root for scan")?;
     let before = stat_fd(&root_fd, root, "inspect sync root before scan")?;
-    let mut observations = Vec::new();
-    let mut hashes = Vec::new();
-    scan_directory(
-        &root_fd,
-        Path::new(""),
-        cache,
-        &mut observations,
-        &mut hashes,
-    )?;
-    let after = stat_fd(&root_fd, root, "inspect sync root after scan")?;
-    if !same_observation(&before, &after) {
-        return Err(LocalError::ChangedDuringRead {
-            operation: "complete local scan",
-            path: root.to_path_buf(),
+    let mut entries = ScanEntries::default();
+    scan_directory(&root_fd, Path::new(""), cache, cache_cutoff, &mut entries)?;
+    entries
+        .directories
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    entries
+        .cached_files
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    entries
+        .hash_jobs
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(PendingScan {
+        root: root.to_path_buf(),
+        root_fd,
+        root_before: before,
+        directories: entries.directories,
+        observations: entries.observations,
+        cached_files: entries.cached_files,
+        hash_jobs: entries.hash_jobs,
+    })
+}
+
+fn finish_scan(mut pending: PendingScan, max_workers: usize) -> Result<CompleteScan, LocalError> {
+    let mut records = hash_scan_files(&pending.root_fd, &pending.hash_jobs, max_workers)?;
+    records.extend(revalidate_cached_files(
+        &pending.root_fd,
+        pending.cached_files,
+    )?);
+    let mut hashes = Vec::with_capacity(records.len());
+    for record in records {
+        pending.observations.push(LocalObservationRecord {
+            path: record.path.clone(),
+            observation: Observation::Present(LocalFile::new(record.content.clone())),
         });
+        hashes.push(record);
     }
-    let rebound = open_absolute_directory(root, "reopen sync root after scan")?;
-    let rebound_stat = stat_fd(&rebound, root, "verify sync root binding after scan")?;
-    if !same_inode(&before, &rebound_stat) {
+    revalidate_directories(&pending.root_fd, &pending.directories)?;
+    let rebound = open_absolute_directory(&pending.root, "reopen sync root after scan")?;
+    let rebound_stat = stat_fd(
+        &rebound,
+        &pending.root,
+        "verify sync root binding after scan",
+    )?;
+    if !same_inode(&pending.root_before, &rebound_stat) {
         return Err(LocalError::ChangedDuringRead {
             operation: "verify complete local scan root",
-            path: root.to_path_buf(),
+            path: pending.root,
         });
     }
-    observations.sort_by(|left, right| left.path.cmp(&right.path));
+    pending
+        .observations
+        .sort_by(|left, right| left.path.cmp(&right.path));
     hashes.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(CompleteScan {
-        root_binding: root_binding(root, &before),
-        observations,
+        root_binding: root_binding(&pending.root, &pending.root_before),
+        observations: pending.observations,
         hashes,
     })
 }
@@ -346,6 +488,14 @@ pub fn scan_and_publish(
     journal: &mut Journal,
     root: impl AsRef<Path>,
 ) -> Result<ScanPublication, LocalError> {
+    scan_and_publish_at(journal, root, hash_cache_cutoff(SystemTime::now()))
+}
+
+fn scan_and_publish_at(
+    journal: &mut Journal,
+    root: impl AsRef<Path>,
+    cache_cutoff: Option<HashCacheCutoff>,
+) -> Result<ScanPublication, LocalError> {
     let root = root.as_ref();
     let cache = journal
         .local_hash_cache()
@@ -353,14 +503,15 @@ pub fn scan_and_publish(
         .into_iter()
         .map(|record| (record.path.clone(), record))
         .collect::<BTreeMap<_, _>>();
-    let scan = scan_with_cache(root, &cache)?;
+    let scan = scan_with_cache_and_workers_at(root, &cache, MAX_PARALLEL_HASHES, cache_cutoff)?;
     if !active_root_matches(journal, &scan.root_binding)?
         || !configured_root_is_active(journal, root)?
     {
         return Ok(ScanPublication::RootChanged);
     }
+    let reusable_hashes = reusable_hashes(&scan.hashes, cache_cutoff);
     if !journal
-        .publish_local_scan(&scan.root_binding, scan.observations(), &scan.hashes)
+        .publish_local_scan(&scan.root_binding, scan.observations(), &reusable_hashes)
         .map_err(|source| LocalError::Journal { source })?
     {
         return Ok(ScanPublication::RootChanged);
@@ -983,8 +1134,8 @@ fn scan_directory(
     directory: &OwnedFd,
     relative: &Path,
     cache: &BTreeMap<PathBuf, LocalHashRecord>,
-    observations: &mut Vec<LocalObservationRecord>,
-    hashes: &mut Vec<LocalHashRecord>,
+    cache_cutoff: Option<HashCacheCutoff>,
+    entries: &mut ScanEntries,
 ) -> Result<(), LocalError> {
     let before = stat_fd(directory, relative, "inspect directory before scan")?;
     let mut stream = Dir::read_from(directory)
@@ -1013,13 +1164,13 @@ fn scan_directory(
         match FileType::from_raw_mode(probe_stat.st_mode) {
             FileType::RegularFile => {
                 if is_reserved_artifact_name(&name) {
-                    observations.push(LocalObservationRecord {
+                    entries.observations.push(LocalObservationRecord {
                         path,
                         observation: Observation::Unknown(UnknownReason::Unsupported),
                     });
                     continue;
                 }
-                let mut file = open_relative_at(directory, &name, &path, OFlags::RDONLY)?;
+                let file = open_relative_at(directory, &name, &path, OFlags::RDONLY)?;
                 let opened = stat_fd(&file, &path, "inspect opened scan file")?;
                 if !same_inode(&probe_stat, &opened) {
                     return Err(LocalError::ChangedDuringRead {
@@ -1027,31 +1178,29 @@ fn scan_directory(
                         path,
                     });
                 }
-                let opened_fingerprint = file_fingerprint(&opened, &path)?;
-                let (content, fingerprint) = match cache.get(&path) {
-                    Some(record) if record.fingerprint == opened_fingerprint => {
-                        let after = stat_fd(&file, &path, "verify cached local scan file")?;
-                        if !same_observation(&opened, &after) {
-                            return Err(LocalError::ChangedDuringRead {
-                                operation: "reuse cached local scan hash",
-                                path,
-                            });
-                        }
-                        (record.content.clone(), opened_fingerprint)
+                let fingerprint = file_fingerprint(&opened, &path)?;
+                let after = stat_fd(&file, &path, "verify enumerated scan file")?;
+                if !same_observation(&opened, &after) {
+                    return Err(LocalError::ChangedDuringRead {
+                        operation: "enumerate scanned file",
+                        path,
+                    });
+                }
+                match cache.get(&path) {
+                    Some(record)
+                        if record.fingerprint == fingerprint
+                            && hash_is_reusable(record, cache_cutoff) =>
+                    {
+                        entries.cached_files.push(LocalHashRecord {
+                            path,
+                            fingerprint,
+                            content: record.content.clone(),
+                        });
                     }
                     Some(_) | None => {
-                        hash_stable_file_with_fingerprint(&mut file, &path, "hash local scan file")?
+                        entries.hash_jobs.push(HashJob { path, fingerprint });
                     }
-                };
-                observations.push(LocalObservationRecord {
-                    path: path.clone(),
-                    observation: Observation::Present(LocalFile::new(content.clone())),
-                });
-                hashes.push(LocalHashRecord {
-                    path,
-                    fingerprint,
-                    content,
-                });
+                }
             }
             FileType::Directory => {
                 let child = open_directory_at(directory, &name, &path)?;
@@ -1062,11 +1211,11 @@ fn scan_directory(
                         path,
                     });
                 }
-                observations.push(LocalObservationRecord {
+                entries.observations.push(LocalObservationRecord {
                     path: path.clone(),
                     observation: Observation::Unknown(UnknownReason::Unsupported),
                 });
-                scan_directory(&child, &path, cache, observations, hashes)?;
+                scan_directory(&child, &path, cache, cache_cutoff, entries)?;
             }
             FileType::Symlink
             | FileType::Fifo
@@ -1082,6 +1231,161 @@ fn scan_directory(
             operation: "scan directory",
             path: relative.to_path_buf(),
         });
+    }
+    entries.directories.push(ScannedDirectory {
+        path: relative.to_path_buf(),
+        before,
+    });
+    Ok(())
+}
+
+fn hash_scan_files(
+    root: &OwnedFd,
+    jobs: &[HashJob],
+    max_workers: usize,
+) -> Result<Vec<LocalHashRecord>, LocalError> {
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let available_workers = thread::available_parallelism().map_or(1, |count| count.get());
+    let worker_count = max_workers.min(available_workers).max(1).min(jobs.len());
+    let next_job = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(worker_count);
+        let mut spawn_failure = None;
+        for worker in 0..worker_count {
+            let next_job = &next_job;
+            match thread::Builder::new()
+                .name(format!("omabox-local-hash-{worker}"))
+                .spawn_scoped(scope, move || {
+                    let mut records = Vec::new();
+                    let mut failure = None;
+                    loop {
+                        let index = next_job.fetch_add(1, Ordering::Relaxed);
+                        let Some(job) = jobs.get(index) else {
+                            return HashWorkerOutput { records, failure };
+                        };
+                        match hash_scan_file(root, job) {
+                            Ok(record) => records.push((index, record)),
+                            Err(error) if failure.is_none() => failure = Some((index, error)),
+                            Err(_) => {}
+                        }
+                    }
+                }) {
+                Ok(handle) => handles.push((worker, handle)),
+                Err(source) => {
+                    spawn_failure = Some(LocalError::HashWorkerSpawn { worker, source });
+                    break;
+                }
+            }
+        }
+
+        let mut records = Vec::with_capacity(jobs.len());
+        let mut failures = Vec::new();
+        let mut terminated_worker = None;
+        for (worker, handle) in handles {
+            match handle.join() {
+                Ok(output) => {
+                    records.extend(output.records);
+                    if let Some(failure) = output.failure {
+                        failures.push(failure);
+                    }
+                }
+                Err(_) if terminated_worker.is_none() => terminated_worker = Some(worker),
+                Err(_) => {}
+            }
+        }
+        if let Some(worker) = terminated_worker {
+            return Err(LocalError::HashWorkerTerminated { worker });
+        }
+        if let Some(error) = spawn_failure {
+            return Err(error);
+        }
+        if let Some((_, error)) = failures.into_iter().min_by_key(|(index, _)| *index) {
+            return Err(error);
+        }
+        records.sort_by_key(|(index, _)| *index);
+        Ok(records.into_iter().map(|(_, record)| record).collect())
+    })
+}
+
+fn hash_scan_file(root: &OwnedFd, job: &HashJob) -> Result<LocalHashRecord, LocalError> {
+    let mut file = open_relative_regular(root, &job.path, "open enumerated scan file")?;
+    let opened = stat_fd(&file, &job.path, "inspect enumerated scan file")?;
+    if file_fingerprint(&opened, &job.path)? != job.fingerprint {
+        return Err(LocalError::ChangedDuringRead {
+            operation: "open enumerated scan file",
+            path: job.path.clone(),
+        });
+    }
+    let (content, fingerprint) =
+        hash_stable_file_with_fingerprint(&mut file, &job.path, "hash local scan file")?;
+    if fingerprint != job.fingerprint {
+        return Err(LocalError::ChangedDuringRead {
+            operation: "hash enumerated scan file",
+            path: job.path.clone(),
+        });
+    }
+    Ok(LocalHashRecord {
+        path: job.path.clone(),
+        fingerprint,
+        content,
+    })
+}
+
+fn revalidate_cached_files(
+    root: &OwnedFd,
+    cached_files: Vec<LocalHashRecord>,
+) -> Result<Vec<LocalHashRecord>, LocalError> {
+    let mut records = Vec::with_capacity(cached_files.len());
+    for record in cached_files {
+        let file = open_relative_regular(root, &record.path, "reopen cached scan file")?;
+        let before = stat_fd(&file, &record.path, "revalidate cached scan file")?;
+        if file_fingerprint(&before, &record.path)? != record.fingerprint {
+            return Err(LocalError::ChangedDuringRead {
+                operation: "revalidate cached scan file",
+                path: record.path.clone(),
+            });
+        }
+        let after = stat_fd(&file, &record.path, "verify cached scan file")?;
+        if !same_observation(&before, &after) {
+            return Err(LocalError::ChangedDuringRead {
+                operation: "verify cached scan file",
+                path: record.path.clone(),
+            });
+        }
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn revalidate_directories(
+    root: &OwnedFd,
+    directories: &[ScannedDirectory],
+) -> Result<(), LocalError> {
+    for directory in directories {
+        let current = if directory.path.as_os_str().is_empty() {
+            stat_fd(root, &directory.path, "revalidate scanned directory")?
+        } else {
+            safe_components(&directory.path)?;
+            let reopened = openat2(
+                root,
+                &directory.path,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+                BELOW_ROOT,
+            )
+            .map_err(|source| {
+                syscall_failure("reopen scanned directory", &directory.path, source)
+            })?;
+            stat_fd(&reopened, &directory.path, "revalidate scanned directory")?
+        };
+        if !same_observation(&directory.before, &current) {
+            return Err(LocalError::ChangedDuringRead {
+                operation: "revalidate scanned directory",
+                path: directory.path.clone(),
+            });
+        }
     }
     Ok(())
 }
@@ -2246,6 +2550,13 @@ mod tests {
         BTreeMap::from([(path.to_path_buf(), record)])
     }
 
+    fn all_cache_entries_stable() -> Option<HashCacheCutoff> {
+        Some(HashCacheCutoff {
+            seconds: i64::MAX,
+            nanoseconds: 999_999_999,
+        })
+    }
+
     #[test]
     fn dropbox_hash_uses_block_hash_composition() -> Result<(), Box<dyn Error>> {
         let empty = identity(b"")?;
@@ -2312,41 +2623,159 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_scan_file_reuses_cached_hash_without_reading_bytes() -> Result<(), Box<dyn Error>>
-    {
+    fn parallel_cold_scan_matches_single_worker_scan() -> Result<(), Box<dyn Error>> {
+        let root = TempDir::new()?;
+        std::fs::create_dir_all(root.path().join("a/nested"))?;
+        std::fs::create_dir(root.path().join("b"))?;
+        for (path, bytes) in [
+            ("00", b"zero".as_slice()),
+            ("01", b"one".as_slice()),
+            ("02", b"two".as_slice()),
+            ("a/03", b"three".as_slice()),
+            ("a/04", b"four".as_slice()),
+            ("a/nested/05", b"five".as_slice()),
+            ("b/06", b"six".as_slice()),
+            ("b/07", b"seven".as_slice()),
+        ] {
+            std::fs::write(root.path().join(path), bytes)?;
+        }
+
+        let single = scan_with_cache_and_workers_at(root.path(), &BTreeMap::new(), 1, None)?;
+        let parallel = scan_with_cache_and_workers_at(
+            root.path(),
+            &BTreeMap::new(),
+            MAX_PARALLEL_HASHES,
+            None,
+        )?;
+
+        assert_eq!(parallel, single);
+        assert!(
+            parallel
+                .observations
+                .windows(2)
+                .all(|pair| pair[0].path < pair[1].path)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_hash_failure_reports_lowest_path_and_preserves_publication()
+    -> Result<(), Box<dyn Error>> {
         let directory = TempDir::new()?;
         let root = directory.path().join("root");
         std::fs::create_dir(&root)?;
-        let path = Path::new("cached.txt");
-        std::fs::write(root.join(path), b"bytes that would hash differently")?;
-        let fingerprint = fingerprint(&root, path)?;
-        let cached = ContentIdentity::new("0".repeat(64));
-        let binding = LocalRootBinding::inspect(&root)?;
+        std::fs::write(root.join("kept"), b"kept")?;
         let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
-        let _ = journal.activate_local_root(&binding)?;
-        let cached_observation = LocalObservationRecord {
-            path: path.to_path_buf(),
-            observation: Observation::Present(LocalFile::new(cached.clone())),
-        };
-        let cached_record = LocalHashRecord {
-            path: path.to_path_buf(),
-            fingerprint,
-            content: cached.clone(),
-        };
-        assert!(journal.publish_local_scan(
-            &binding,
-            std::slice::from_ref(&cached_observation),
-            std::slice::from_ref(&cached_record),
-        )?);
+        let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+        let _ = scan_and_publish(&mut journal, &root)?;
+        let published_inventory = journal.local_inventory()?;
+        let published_cache = journal.local_hash_cache()?;
+        let cache = published_cache
+            .iter()
+            .cloned()
+            .map(|record| (record.path.clone(), record))
+            .collect::<BTreeMap<_, _>>();
 
-        let scan = match scan_and_publish(&mut journal, &root)? {
-            ScanPublication::Published(scan) => scan,
-            ScanPublication::RootChanged => {
-                return Err(io::Error::other("test root changed during cached scan").into());
-            }
-        };
+        std::fs::write(root.join("a-missing"), b"a")?;
+        std::fs::write(root.join("b-missing"), b"b")?;
+        let pending = enumerate_scan(&root, &cache, hash_cache_cutoff(SystemTime::now()))?;
+        std::fs::remove_file(root.join("a-missing"))?;
+        std::fs::remove_file(root.join("b-missing"))?;
+
+        let failure = finish_scan(pending, MAX_PARALLEL_HASHES);
+        assert!(matches!(
+            failure,
+            Err(LocalError::Io { path, .. }) if path == Path::new("a-missing")
+        ));
+        assert_eq!(journal.local_inventory()?, published_inventory);
+        assert_eq!(journal.local_hash_cache()?, published_cache);
+        Ok(())
+    }
+
+    #[test]
+    fn scan_revalidates_nested_directories_after_parallel_hashing() -> Result<(), Box<dyn Error>> {
+        let root = TempDir::new()?;
+        std::fs::create_dir(root.path().join("nested"))?;
+        std::fs::write(root.path().join("nested/file"), b"bytes")?;
+        let pending = enumerate_scan(root.path(), &BTreeMap::new(), None)?;
+        std::fs::write(root.path().join("nested/appeared"), b"new")?;
+
+        let result = finish_scan(pending, MAX_PARALLEL_HASHES);
+
+        assert!(matches!(
+            result,
+            Err(LocalError::ChangedDuringRead { path, .. }) if path == Path::new("nested")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn scan_revalidates_cache_hits_after_parallel_hashing() -> Result<(), Box<dyn Error>> {
+        let root = TempDir::new()?;
+        let path = Path::new("cached");
+        std::fs::write(root.path().join(path), b"before")?;
+        let first = scan_with_cache_and_workers_at(root.path(), &BTreeMap::new(), 1, None)?;
+        let cache = first
+            .hashes
+            .iter()
+            .cloned()
+            .map(|record| (record.path.clone(), record))
+            .collect::<BTreeMap<_, _>>();
+        let pending = enumerate_scan(root.path(), &cache, all_cache_entries_stable())?;
+        assert!(pending.hash_jobs.is_empty());
+        assert_eq!(pending.cached_files.len(), 1);
+
+        std::fs::write(root.path().join(path), b"changed after enumeration")?;
+        let result = finish_scan(pending, MAX_PARALLEL_HASHES);
+
+        assert!(matches!(
+            result,
+            Err(LocalError::ChangedDuringRead { path: changed, .. }) if changed == path
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_scan_file_reuses_cached_hash_without_reading_bytes() -> Result<(), Box<dyn Error>>
+    {
+        let root = TempDir::new()?;
+        let path = Path::new("cached.txt");
+        std::fs::write(root.path().join(path), b"bytes that would hash differently")?;
+        let fingerprint = fingerprint(root.path(), path)?;
+        let cached = ContentIdentity::new("0".repeat(64));
+        let cache = test_cache(path, fingerprint, &cached);
+        let scan = scan_with_cache_and_workers_at(
+            root.path(),
+            &cache,
+            MAX_PARALLEL_HASHES,
+            all_cache_entries_stable(),
+        )?;
 
         assert_eq!(scanned_content(&scan, path)?, &cached);
+        Ok(())
+    }
+
+    #[test]
+    fn recent_cache_entry_is_rehashed_and_omitted() -> Result<(), Box<dyn Error>> {
+        let root = TempDir::new()?;
+        let path = Path::new("recent.txt");
+        let bytes = b"actual bytes";
+        std::fs::write(root.path().join(path), bytes)?;
+        let fingerprint = fingerprint(root.path(), path)?;
+        let cutoff = HashCacheCutoff {
+            seconds: fingerprint.modified_seconds,
+            nanoseconds: u32::try_from(fingerprint.modified_nanoseconds)?,
+        };
+        let cached = ContentIdentity::new("0".repeat(64));
+        let scan = scan_with_cache_and_workers_at(
+            root.path(),
+            &test_cache(path, fingerprint, &cached),
+            1,
+            Some(cutoff),
+        )?;
+
+        assert_eq!(scanned_content(&scan, path)?, &identity(bytes)?);
+        assert!(reusable_hashes(&scan.hashes, Some(cutoff)).is_empty());
         Ok(())
     }
 
@@ -2384,7 +2813,12 @@ mod tests {
         variants.push(changed);
 
         for changed in variants {
-            let scan = scan_with_cache(root.path(), &test_cache(path, changed, &cached))?;
+            let scan = scan_with_cache_and_workers_at(
+                root.path(),
+                &test_cache(path, changed, &cached),
+                MAX_PARALLEL_HASHES,
+                all_cache_entries_stable(),
+            )?;
             assert_eq!(scanned_content(&scan, path)?, &actual);
         }
         Ok(())
@@ -2403,7 +2837,7 @@ mod tests {
         let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
         let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
         assert!(matches!(
-            scan_and_publish(&mut journal, &root)?,
+            scan_and_publish_at(&mut journal, &root, all_cache_entries_stable())?,
             ScanPublication::Published(_)
         ));
         let inventory = journal.local_inventory()?;
@@ -2427,7 +2861,7 @@ mod tests {
         std::fs::write(first.join("cached.txt"), b"cached")?;
         let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
         let _ = journal.activate_local_root(&LocalRootBinding::inspect(&first)?)?;
-        let _ = scan_and_publish(&mut journal, &first)?;
+        let _ = scan_and_publish_at(&mut journal, &first, all_cache_entries_stable())?;
         assert_eq!(journal.local_hash_cache()?.len(), 1);
 
         let _ = journal.activate_local_root(&LocalRootBinding::inspect(&second)?)?;
