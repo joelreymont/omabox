@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -25,7 +25,7 @@ use omabox::model::{
     OperationPlan, RemoteFile, UnknownReason,
 };
 use omabox::planner::plan;
-use omabox::reconcile::{ReconcileOutcome, reconcile_once, replay_pending};
+use omabox::reconcile::{ReconcileError, ReconcileOutcome, reconcile_once, replay_pending};
 use omabox::recovery::{ReplayBlocked, destination, replay_remote_operations};
 use omabox::runtime_status::{
     TransferDirection, TransferEvent, TransferObserver, TransferProgress,
@@ -380,6 +380,93 @@ fn pending_exact_downloads_use_bounded_parallel_workers() -> Result<(), Box<dyn 
     );
     assert!(maximum_active >= 2);
     assert!(maximum_active <= 4);
+    Ok(())
+}
+
+#[test]
+fn root_swap_after_replay_validation_never_touches_the_replacement() -> Result<(), Box<dyn Error>> {
+    let bytes = b"descriptor-bound download";
+    let content = dropbox_content_hash(bytes.as_slice())?;
+    let remote = RemoteFile::new(content.clone(), DropboxRevision::new("root-swap-revision"));
+    let response = FakeResponse::bytes(bytes.to_vec()).header(
+        "Dropbox-API-Result",
+        download_metadata("download.txt", remote.revision.as_str(), &content),
+    );
+    let (response, gate) = response.gated();
+    let server = FakeServer::start(vec![response])?;
+    let client = fake_client(&server, "opaque-access-root-swap-download")?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let old_root = directory.path().join("old-root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    let path = Path::new("download.txt");
+    let operation_plan = planned_operations(plan(
+        &Baseline::Absent,
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(remote),
+    ))?;
+    if !matches!(
+        journal.record_plan(path, &operation_plan)?,
+        PlanWrite::Recorded(_)
+    ) {
+        return Err(io::Error::other("fresh root-swap plan was already pending").into());
+    }
+
+    let outcome = thread::scope(
+        |scope| -> Result<Result<_, ReconcileError>, Box<dyn Error>> {
+            let worker = thread::Builder::new().spawn_scoped(scope, || {
+                replay_pending(&mut journal, &client, &root, &staging, &recovery)
+            })?;
+            gate.request_received.recv().map_err(|_| {
+                io::Error::other("fake Dropbox server stopped before receiving the request")
+            })?;
+            let swap = (|| -> io::Result<()> {
+                std::fs::rename(&root, &old_root)?;
+                std::fs::create_dir(&root)?;
+                std::fs::write(root.join("canary.txt"), b"replacement bytes")
+            })();
+            let release = gate.release_response.send(()).map_err(|_| {
+                io::Error::other("fake Dropbox response worker stopped before release")
+            });
+            swap?;
+            release?;
+            worker
+                .join()
+                .map_err(|_| io::Error::other("replay worker stopped unexpectedly"))
+                .map_err(Into::into)
+        },
+    )?;
+
+    assert!(matches!(outcome, Err(ReconcileError::LocalRootChanged)));
+    assert_eq!(
+        std::fs::read(root.join("canary.txt"))?,
+        b"replacement bytes"
+    );
+    let replacement_names = std::fs::read_dir(&root)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        replacement_names,
+        vec![std::ffi::OsString::from("canary.txt")]
+    );
+    assert_eq!(journal.pending_plans()?.len(), 1);
+    assert_eq!(journal.baseline(path)?, None);
+    assert!(!old_root.join(path).exists());
+    assert!(
+        std::fs::read_dir(&old_root)?.any(|entry| entry.is_ok_and(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".omabox-download-")
+        }))
+    );
+    assert_eq!(server.finish()?.len(), 1);
     Ok(())
 }
 
@@ -1736,6 +1823,17 @@ struct FakeResponse {
     body: Vec<u8>,
     headers: Vec<(String, String)>,
     delay: Duration,
+    gate: Option<ResponseGate>,
+}
+
+struct ResponseGate {
+    request_received: mpsc::Sender<()>,
+    release_response: mpsc::Receiver<()>,
+}
+
+struct ResponseGateControl {
+    request_received: mpsc::Receiver<()>,
+    release_response: mpsc::Sender<()>,
 }
 
 impl FakeResponse {
@@ -1752,6 +1850,7 @@ impl FakeResponse {
                 String::from("application/json"),
             )],
             delay: Duration::ZERO,
+            gate: None,
         }
     }
 
@@ -1764,6 +1863,7 @@ impl FakeResponse {
                 String::from("application/octet-stream"),
             )],
             delay: Duration::ZERO,
+            gate: None,
         }
     }
 
@@ -1775,6 +1875,22 @@ impl FakeResponse {
     fn delay(mut self, delay: Duration) -> Self {
         self.delay = delay;
         self
+    }
+
+    fn gated(mut self) -> (Self, ResponseGateControl) {
+        let (request_received, wait_for_request) = mpsc::channel();
+        let (release_response, wait_for_release) = mpsc::channel();
+        self.gate = Some(ResponseGate {
+            request_received,
+            release_response: wait_for_release,
+        });
+        (
+            self,
+            ResponseGateControl {
+                request_received: wait_for_request,
+                release_response,
+            },
+        )
     }
 }
 
@@ -1800,6 +1916,14 @@ fn serve(
             let request = read_request(&mut stream)?;
             let current = active.fetch_add(1, Ordering::SeqCst) + 1;
             maximum_active.fetch_max(current, Ordering::SeqCst);
+            if let Some(gate) = &response.gate {
+                gate.request_received.send(()).map_err(|_| {
+                    io::Error::other("root-swap test stopped before request notification")
+                })?;
+                gate.release_response.recv().map_err(|_| {
+                    io::Error::other("root-swap test stopped before response release")
+                })?;
+            }
             thread::sleep(response.delay);
             let written = write_response(&mut stream, response);
             active.fetch_sub(1, Ordering::SeqCst);

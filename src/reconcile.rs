@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
+use rustix::fd::OwnedFd;
 use thiserror::Error;
 
 use crate::dropbox::{DropboxClient, DropboxError};
@@ -15,7 +16,8 @@ use crate::journal::{
 };
 use crate::local::{
     LocalError, ScanPublication, StageOutcome, StagedUpload, configured_root_is_active,
-    observe_upload_source, remove_unreferenced_upload_stages, scan_and_publish, stage_upload,
+    observe_upload_source, open_active_root, remove_unreferenced_upload_stages, scan_and_publish,
+    stage_upload,
 };
 use crate::model::{
     Baseline, Conflict, Decision, LocalObservation, Observation, Operation, RemoteFile,
@@ -25,8 +27,8 @@ use crate::planner::plan;
 use crate::recovery::{
     RecoveryError, RecoveryMaterialization, ReplayBlocked, ReplayReport, destination,
     materialize_before_plan, materialize_local_conflict, materialize_remote_conflict,
-    prune_completed_recoveries, replay_local_operations, replay_local_plans,
-    replay_remote_operations,
+    prune_completed_recoveries, replay_local_operations_at, replay_local_plans_at,
+    replay_remote_operations_at,
 };
 
 const MAX_PARALLEL_DOWNLOADS: usize = 4;
@@ -171,8 +173,10 @@ pub fn replay_pending(
     let sync_root = sync_root.as_ref();
     let upload_staging = upload_staging.as_ref();
     let recovery_directory = recovery_directory.as_ref();
-    require_active_local_root(journal, sync_root)?;
-    let mut report = replay_local_operations(journal, sync_root, recovery_directory)?;
+    let Some(root) = open_active_root(journal, sync_root)? else {
+        return Err(ReconcileError::LocalRootChanged);
+    };
+    let mut report = replay_local_operations_at(journal, &root, sync_root, recovery_directory)?;
     let missing_downloads = report
         .blocked
         .iter()
@@ -221,10 +225,11 @@ pub fn replay_pending(
             .retain(|blocked| !matches!(blocked, ReplayBlocked::DownloadRequired { .. }));
         for batch in downloads.chunks(MAX_PARALLEL_DOWNLOADS) {
             require_active_local_root(journal, sync_root)?;
-            stage_pending_downloads(dropbox, sync_root, batch)?;
+            stage_pending_downloads(dropbox, &root, sync_root, batch)?;
             require_active_local_root(journal, sync_root)?;
-            let resumed = replay_local_plans(
+            let resumed = replay_local_plans_at(
                 journal,
+                &root,
                 sync_root,
                 recovery_directory,
                 batch.iter().map(|download| &download.plan),
@@ -234,9 +239,10 @@ pub fn replay_pending(
         }
     }
     require_active_local_root(journal, sync_root)?;
-    let remote = replay_remote_operations(
+    let remote = replay_remote_operations_at(
         journal,
         dropbox,
+        &root,
         sync_root,
         upload_staging,
         recovery_directory,
@@ -483,7 +489,8 @@ struct PendingDownload {
 
 fn stage_pending_downloads(
     dropbox: &DropboxClient,
-    sync_root: &Path,
+    root: &OwnedFd,
+    root_path: &Path,
     downloads: &[PendingDownload],
 ) -> Result<(), ReconcileError> {
     let worker_count = downloads.len().min(MAX_PARALLEL_DOWNLOADS);
@@ -504,9 +511,10 @@ fn stage_pending_downloads(
                     let Some(download) = downloads.get(index) else {
                         return first_failure;
                     };
-                    match stage_remote(
+                    match stage_remote_at(
                         dropbox,
-                        sync_root,
+                        root,
+                        root_path,
                         &download.path,
                         &download.path,
                         &download.source,
@@ -681,6 +689,31 @@ fn stage_remote(
     }
 }
 
+fn stage_remote_at(
+    dropbox: &DropboxClient,
+    root: &OwnedFd,
+    root_path: &Path,
+    target: &Path,
+    synchronized_path: &Path,
+    remote: &crate::model::RemoteFile,
+) -> Result<(), ReconcileError> {
+    let staged = dropbox
+        .stage_exact_download_for_at(root, root_path, target, synchronized_path, remote)
+        .map_err(|source| ReconcileError::RemoteDownload {
+            path: synchronized_path.to_path_buf(),
+            source,
+        })?;
+    match staged {
+        StageOutcome::Staged(()) | StageOutcome::AlreadyStaged(()) => Ok(()),
+        StageOutcome::ContentChanged { .. } => Err(ReconcileError::RemoteContentChanged {
+            path: synchronized_path.to_path_buf(),
+        }),
+        StageOutcome::DestinationOccupied { path } => {
+            Err(ReconcileError::StageDestinationOccupied { path })
+        }
+    }
+}
+
 fn finish_pending_conflict(
     journal: &mut Journal,
     pending: &PlanRecord,
@@ -726,6 +759,7 @@ mod tests {
     use super::*;
     use crate::local::{ConflictSide, conflict_relative_path, dropbox_content_hash};
     use crate::model::{ContentIdentity, DropboxRevision, LocalFile, RemoteFile};
+    use crate::recovery::replay_local_operations;
 
     fn identity(bytes: &[u8]) -> Result<ContentIdentity, Box<dyn Error>> {
         Ok(dropbox_content_hash(Cursor::new(bytes))?)

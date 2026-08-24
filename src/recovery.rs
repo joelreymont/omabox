@@ -4,6 +4,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, fsync, statat, unlinkat};
 use thiserror::Error;
 
@@ -15,9 +16,10 @@ use crate::journal::{
 };
 use crate::local::{
     ConflictOutcome, ConflictSide, DeleteOutcome, InstallOutcome, LocalError, StageOutcome,
-    StagedUpload, VerifiedRecovery, conflict_relative_path, delete_local, install_download,
-    materialize_conflict, materialize_verified_copy, observe_upload_source, open_private_directory,
-    open_root, open_root_file, recovery_file_name, stage_upload, verify_private_copy,
+    StagedUpload, VerifiedRecovery, conflict_relative_path, delete_local_at, install_download_at,
+    materialize_conflict_at, materialize_verified_copy, observe_upload_source_at,
+    open_private_directory, open_root, open_root_file, recovery_file_name, stage_upload_at,
+    verify_private_copy,
 };
 use crate::model::{Baseline, Conflict, ContentIdentity, LocalFile, Operation, RemoteFile};
 
@@ -303,6 +305,16 @@ pub fn materialize(
     recovery_directory: impl AsRef<Path>,
     record: &RecoveryRecord,
 ) -> Result<RecoveryMaterialization, RecoveryError> {
+    let sync_root = sync_root.as_ref();
+    let root = open_root(sync_root, "open sync root for recovery")?;
+    materialize_at(&root, recovery_directory, record)
+}
+
+fn materialize_at(
+    root: &OwnedFd,
+    recovery_directory: impl AsRef<Path>,
+    record: &RecoveryRecord,
+) -> Result<RecoveryMaterialization, RecoveryError> {
     let recovery_directory = recovery_directory.as_ref();
     let expected_path = destination(recovery_directory, &record.original_path, &record.content);
     if record.recovery_path != expected_path {
@@ -311,8 +323,8 @@ pub fn materialize(
             detail: "recovery destination is not the deterministic configured path",
         });
     }
-    materialize_expected(
-        sync_root.as_ref(),
+    materialize_expected_at(
+        root,
         recovery_directory,
         &record.original_path,
         &record.content,
@@ -329,16 +341,17 @@ pub(crate) fn materialize_before_plan(
     original_path: &Path,
     content: &ContentIdentity,
 ) -> Result<RecoveryMaterialization, RecoveryError> {
-    let materialized = materialize_expected(sync_root, recovery_directory, original_path, content)?;
-    let actual = observe_upload_source(sync_root, original_path)?;
+    let root = open_root(sync_root, "open sync root for recovery preparation")?;
+    let materialized = materialize_expected_at(&root, recovery_directory, original_path, content)?;
+    let actual = observe_upload_source_at(&root, original_path)?;
     if actual != *content {
         return Ok(RecoveryMaterialization::SourceChanged { actual });
     }
     Ok(materialized)
 }
 
-fn materialize_expected(
-    sync_root: &Path,
+fn materialize_expected_at(
+    root: &OwnedFd,
     recovery_directory: &Path,
     original_path: &Path,
     content: &ContentIdentity,
@@ -351,9 +364,8 @@ fn materialize_expected(
             VerifiedRecovery::new(original_path.to_path_buf(), content.clone()),
         ));
     }
-    let root = open_root(sync_root, "open sync root for recovery")?;
     let mut source = open_root_file(
-        &root,
+        root,
         original_path,
         "open displaced local payload for recovery",
     )?;
@@ -386,14 +398,24 @@ pub fn replay_local_operations(
     recovery_directory: impl AsRef<Path>,
 ) -> Result<ReplayReport, RecoveryError> {
     let sync_root = sync_root.as_ref();
-    let recovery_directory = recovery_directory.as_ref();
-    let plans = journal.pending_plans()?;
-    replay_local_plans(journal, sync_root, recovery_directory, plans.iter())
+    let root = open_root(sync_root, "open sync root for local replay")?;
+    replay_local_operations_at(journal, &root, sync_root, recovery_directory.as_ref())
 }
 
-pub(crate) fn replay_local_plans<'a>(
+pub(crate) fn replay_local_operations_at(
     journal: &mut Journal,
-    sync_root: &Path,
+    root: &OwnedFd,
+    root_path: &Path,
+    recovery_directory: &Path,
+) -> Result<ReplayReport, RecoveryError> {
+    let plans = journal.pending_plans()?;
+    replay_local_plans_at(journal, root, root_path, recovery_directory, plans.iter())
+}
+
+pub(crate) fn replay_local_plans_at<'a>(
+    journal: &mut Journal,
+    root: &OwnedFd,
+    root_path: &Path,
     recovery_directory: &Path,
     plans: impl IntoIterator<Item = &'a PlanRecord>,
 ) -> Result<ReplayReport, RecoveryError> {
@@ -414,7 +436,7 @@ pub(crate) fn replay_local_plans<'a>(
                     })?;
                     match ensure_verified_recovery(
                         journal,
-                        sync_root,
+                        root,
                         recovery_directory,
                         following,
                         &plan.path,
@@ -433,7 +455,7 @@ pub(crate) fn replay_local_plans<'a>(
                     None
                 }
                 Operation::InstallLocal { source } => {
-                    match install_download(sync_root, &plan.path, &source.content, None)? {
+                    match install_download_at(root, root_path, &plan.path, &source.content, None)? {
                         InstallOutcome::Installed | InstallOutcome::AlreadyInstalled => {
                             complete_final(
                                 journal,
@@ -465,7 +487,7 @@ pub(crate) fn replay_local_plans<'a>(
                 } => {
                     let recovery = match ensure_verified_recovery(
                         journal,
-                        sync_root,
+                        root,
                         recovery_directory,
                         planned,
                         &plan.path,
@@ -479,8 +501,13 @@ pub(crate) fn replay_local_plans<'a>(
                             break;
                         }
                     };
-                    match install_download(sync_root, &plan.path, &source.content, Some(&recovery))?
-                    {
+                    match install_download_at(
+                        root,
+                        root_path,
+                        &plan.path,
+                        &source.content,
+                        Some(&recovery),
+                    )? {
                         InstallOutcome::Installed | InstallOutcome::AlreadyInstalled => {
                             complete_final(
                                 journal,
@@ -509,7 +536,7 @@ pub(crate) fn replay_local_plans<'a>(
                 Operation::DeleteLocal { .. } => {
                     let recovery = match ensure_verified_recovery(
                         journal,
-                        sync_root,
+                        root,
                         recovery_directory,
                         planned,
                         &plan.path,
@@ -523,7 +550,7 @@ pub(crate) fn replay_local_plans<'a>(
                             break;
                         }
                     };
-                    match delete_local(sync_root, &plan.path, &recovery)? {
+                    match delete_local_at(root, root_path, &plan.path, &recovery)? {
                         DeleteOutcome::Deleted | DeleteOutcome::AlreadyDeleted => {
                             complete_final(journal, planned, &plan.path, &Baseline::Absent)?;
                             report.completed_operations += 1;
@@ -562,8 +589,25 @@ pub fn replay_remote_operations(
     recovery_directory: impl AsRef<Path>,
 ) -> Result<ReplayReport, RecoveryError> {
     let sync_root = sync_root.as_ref();
-    let upload_staging = upload_staging.as_ref();
-    let recovery_directory = recovery_directory.as_ref();
+    let root = open_root(sync_root, "open sync root for remote replay")?;
+    replay_remote_operations_at(
+        journal,
+        dropbox,
+        &root,
+        sync_root,
+        upload_staging.as_ref(),
+        recovery_directory.as_ref(),
+    )
+}
+
+pub(crate) fn replay_remote_operations_at(
+    journal: &mut Journal,
+    dropbox: &DropboxClient,
+    root: &OwnedFd,
+    root_path: &Path,
+    upload_staging: &Path,
+    recovery_directory: &Path,
+) -> Result<ReplayReport, RecoveryError> {
     let plans = journal.pending_plans()?;
     let mut report = ReplayReport::default();
 
@@ -593,13 +637,8 @@ pub fn replay_remote_operations(
                     None
                 }
                 Operation::CreateRemote { content } => {
-                    let Some(staged) = prepare_upload(
-                        sync_root,
-                        upload_staging,
-                        &plan.path,
-                        content,
-                        &mut report,
-                    )?
+                    let Some(staged) =
+                        prepare_upload(root, upload_staging, &plan.path, content, &mut report)?
                     else {
                         break;
                     };
@@ -612,7 +651,8 @@ pub fn replay_remote_operations(
                         apply_file_mutation(
                             journal,
                             dropbox,
-                            sync_root,
+                            root,
+                            root_path,
                             &plan,
                             planned,
                             &staged,
@@ -626,13 +666,8 @@ pub fn replay_remote_operations(
                     content,
                     expected_revision,
                 } => {
-                    let Some(staged) = prepare_upload(
-                        sync_root,
-                        upload_staging,
-                        &plan.path,
-                        content,
-                        &mut report,
-                    )?
+                    let Some(staged) =
+                        prepare_upload(root, upload_staging, &plan.path, content, &mut report)?
                     else {
                         break;
                     };
@@ -651,7 +686,8 @@ pub fn replay_remote_operations(
                     apply_file_mutation(
                         journal,
                         dropbox,
-                        sync_root,
+                        root,
+                        root_path,
                         &plan,
                         planned,
                         &staged,
@@ -676,7 +712,8 @@ pub fn replay_remote_operations(
                     apply_delete_mutation(
                         journal,
                         dropbox,
-                        sync_root,
+                        root,
+                        root_path,
                         &plan,
                         planned,
                         outcome,
@@ -792,13 +829,13 @@ enum FileMutation {
 }
 
 fn prepare_upload(
-    sync_root: &Path,
+    root: &OwnedFd,
     upload_staging: &Path,
     path: &Path,
     content: &ContentIdentity,
     report: &mut ReplayReport,
 ) -> Result<Option<StagedUpload>, RecoveryError> {
-    match stage_upload(sync_root, path, upload_staging, content)? {
+    match stage_upload_at(root, path, upload_staging, content)? {
         StageOutcome::Staged(stage) | StageOutcome::AlreadyStaged(stage) => Ok(Some(stage)),
         StageOutcome::ContentChanged { actual } => {
             report.blocked.push(ReplayBlocked::PreconditionChanged {
@@ -866,7 +903,8 @@ fn recovery_record(
 fn apply_file_mutation(
     journal: &mut Journal,
     dropbox: &DropboxClient,
-    sync_root: &Path,
+    root: &OwnedFd,
+    root_path: &Path,
     plan: &crate::journal::PlanRecord,
     planned: &PlannedOperation,
     staged: &StagedUpload,
@@ -888,8 +926,8 @@ fn apply_file_mutation(
             path: plan.path.clone(),
         })),
         MutationOutcome::PreconditionChanged(RemotePathState::File(remote)) => {
-            materialize_local_conflict(sync_root, &plan.path, staged)?;
-            materialize_remote_conflict(dropbox, sync_root, &plan.path, &remote)?;
+            materialize_local_conflict_at(root, root_path, &plan.path, staged)?;
+            materialize_remote_conflict_at(dropbox, root, root_path, &plan.path, &remote)?;
             let local = LocalFile::new(staged.content().clone());
             let conflict = match mutation {
                 FileMutation::Create => Conflict::InitialCollision { local, remote },
@@ -901,7 +939,7 @@ fn apply_file_mutation(
         }
         MutationOutcome::PreconditionChanged(RemotePathState::Absent) => match mutation {
             FileMutation::Replace => {
-                materialize_local_conflict(sync_root, &plan.path, staged)?;
+                materialize_local_conflict_at(root, root_path, &plan.path, staged)?;
                 let conflict = Conflict::RemoteDeletionLocalEdit {
                     local: LocalFile::new(staged.content().clone()),
                 };
@@ -922,10 +960,12 @@ fn apply_file_mutation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_delete_mutation(
     journal: &mut Journal,
     dropbox: &DropboxClient,
-    sync_root: &Path,
+    root: &OwnedFd,
+    root_path: &Path,
     plan: &crate::journal::PlanRecord,
     planned: &PlannedOperation,
     outcome: MutationOutcome,
@@ -945,7 +985,7 @@ fn apply_delete_mutation(
             path: plan.path.clone(),
         })),
         MutationOutcome::PreconditionChanged(RemotePathState::File(remote)) => {
-            materialize_remote_conflict(dropbox, sync_root, &plan.path, &remote)?;
+            materialize_remote_conflict_at(dropbox, root, root_path, &plan.path, &remote)?;
             let conflict = Conflict::LocalDeletionRemoteEdit { remote };
             finish_conflict(journal, plan.id, &plan.path, &conflict)?;
             report.completed_operations += 1;
@@ -968,9 +1008,20 @@ pub(crate) fn materialize_local_conflict(
     path: &Path,
     staged: &StagedUpload,
 ) -> Result<(), RecoveryError> {
+    let root = open_root(sync_root, "open sync root for local conflict")?;
+    materialize_local_conflict_at(&root, sync_root, path, staged)
+}
+
+fn materialize_local_conflict_at(
+    root: &OwnedFd,
+    root_path: &Path,
+    path: &Path,
+    staged: &StagedUpload,
+) -> Result<(), RecoveryError> {
     let bytes = staged.open_verified()?;
-    match materialize_conflict(
-        sync_root,
+    match materialize_conflict_at(
+        root,
+        root_path,
         path,
         ConflictSide::Local,
         staged.content(),
@@ -990,8 +1041,19 @@ pub(crate) fn materialize_remote_conflict(
     path: &Path,
     remote: &RemoteFile,
 ) -> Result<(), RecoveryError> {
+    let root = open_root(sync_root, "open sync root for remote conflict")?;
+    materialize_remote_conflict_at(dropbox, &root, sync_root, path, remote)
+}
+
+fn materialize_remote_conflict_at(
+    dropbox: &DropboxClient,
+    root: &OwnedFd,
+    root_path: &Path,
+    path: &Path,
+    remote: &RemoteFile,
+) -> Result<(), RecoveryError> {
     let conflict = conflict_relative_path(path, ConflictSide::Remote, &remote.content)?;
-    ensure_exact_copy(dropbox, sync_root, &conflict, path, remote)
+    ensure_exact_copy_at(dropbox, root, root_path, &conflict, path, remote)
 }
 
 fn ensure_exact_copy(
@@ -1001,7 +1063,19 @@ fn ensure_exact_copy(
     path: &Path,
     remote: &RemoteFile,
 ) -> Result<(), RecoveryError> {
-    match install_download(root, target, &remote.content, None)? {
+    let root_fd = open_root(root, "open exact-copy root")?;
+    ensure_exact_copy_at(dropbox, &root_fd, root, target, path, remote)
+}
+
+fn ensure_exact_copy_at(
+    dropbox: &DropboxClient,
+    root: &OwnedFd,
+    root_path: &Path,
+    target: &Path,
+    path: &Path,
+    remote: &RemoteFile,
+) -> Result<(), RecoveryError> {
+    match install_download_at(root, root_path, target, &remote.content, None)? {
         InstallOutcome::Installed | InstallOutcome::AlreadyInstalled => return Ok(()),
         InstallOutcome::DownloadRequired => {}
         InstallOutcome::StageDestinationOccupied { .. }
@@ -1010,7 +1084,7 @@ fn ensure_exact_copy(
         }
     }
     match dropbox
-        .stage_exact_download_for(root, target, path, remote)
+        .stage_exact_download_for_at(root, root_path, target, path, remote)
         .map_err(|source| dropbox_error(path, source))?
     {
         StageOutcome::Staged(()) | StageOutcome::AlreadyStaged(()) => {}
@@ -1024,7 +1098,7 @@ fn ensure_exact_copy(
             ));
         }
     }
-    match install_download(root, target, &remote.content, None)? {
+    match install_download_at(root, root_path, target, &remote.content, None)? {
         InstallOutcome::Installed | InstallOutcome::AlreadyInstalled => Ok(()),
         InstallOutcome::DownloadRequired => {
             Err(invalid(path, "verified exact Dropbox download disappeared"))
@@ -1069,7 +1143,7 @@ enum RecoveryReady {
 
 fn ensure_verified_recovery(
     journal: &mut Journal,
-    sync_root: &Path,
+    root: &OwnedFd,
     recovery_directory: &Path,
     planned: &PlannedOperation,
     path: &Path,
@@ -1102,7 +1176,7 @@ fn ensure_verified_recovery(
             });
         }
     };
-    let verified = match materialize(sync_root, recovery_directory, &record)? {
+    let verified = match materialize_at(root, recovery_directory, &record)? {
         RecoveryMaterialization::Created(verified)
         | RecoveryMaterialization::AlreadyPresent(verified) => verified,
         RecoveryMaterialization::SourceChanged { actual } => {

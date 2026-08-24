@@ -5,6 +5,7 @@ use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use rustix::fd::OwnedFd;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -12,7 +13,7 @@ use crate::auth::AccessToken;
 use crate::journal::{
     DropboxBinding, DropboxBindingWrite, Journal, JournalError, RemoteObservationRecord,
 };
-use crate::local::{LocalError, StageOutcome, StagedUpload, stage_download};
+use crate::local::{LocalError, StageOutcome, StagedUpload, open_root, stage_download_at};
 use crate::model::{ContentIdentity, DropboxRevision, Observation, RemoteFile, UnknownReason};
 use crate::runtime_status::{TransferDirection, TransferEvent, TransferObserver, TransferProgress};
 
@@ -529,6 +530,20 @@ impl DropboxClient {
         synchronized_path: &Path,
         remote: &RemoteFile,
     ) -> Result<StageOutcome<()>, DropboxError> {
+        let sync_root = sync_root.as_ref();
+        let root = open_root(sync_root, "open sync root for exact Dropbox download")
+            .map_err(|source| DropboxError::LocalStage { source })?;
+        self.stage_exact_download_for_at(&root, sync_root, target, synchronized_path, remote)
+    }
+
+    pub(crate) fn stage_exact_download_for_at(
+        &self,
+        root: &OwnedFd,
+        root_path: &Path,
+        target: impl AsRef<Path>,
+        synchronized_path: &Path,
+        remote: &RemoteFile,
+    ) -> Result<StageOutcome<()>, DropboxError> {
         let argument = serde_json::to_string(&DownloadRequest {
             path: format!("rev:{}", remote.revision.as_str()),
         })
@@ -588,7 +603,7 @@ impl DropboxClient {
             synchronized_path,
             total,
         );
-        stage_download(sync_root, target, &remote.content, reader)
+        stage_download_at(root, root_path, target, &remote.content, reader)
             .map_err(|source| DropboxError::LocalStage { source })
     }
 

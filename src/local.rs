@@ -524,10 +524,22 @@ pub(crate) fn configured_root_is_active(
     journal: &Journal,
     root: impl AsRef<Path>,
 ) -> Result<bool, LocalError> {
+    Ok(open_active_root(journal, root)?.is_some())
+}
+
+/// Open the configured path and retain that exact directory when it is the active root.
+pub(crate) fn open_active_root(
+    journal: &Journal,
+    root: impl AsRef<Path>,
+) -> Result<Option<OwnedFd>, LocalError> {
     let root = root.as_ref();
     let directory = open_absolute_directory(root, "open sync root for identity verification")?;
     let stat = stat_fd(&directory, root, "inspect sync root identity")?;
-    active_root_matches(journal, &root_binding(root, &stat))
+    if active_root_matches(journal, &root_binding(root, &stat))? {
+        Ok(Some(directory))
+    } else {
+        Ok(None)
+    }
 }
 
 fn active_root_matches(journal: &Journal, actual: &LocalRootBinding) -> Result<bool, LocalError> {
@@ -548,6 +560,16 @@ fn root_binding(path: &Path, stat: &rustix::fs::Stat) -> LocalRootBinding {
 /// Copy a root-confined local file into immutable upload staging.
 pub fn stage_upload(
     root: impl AsRef<Path>,
+    relative: impl AsRef<Path>,
+    staging_directory: impl AsRef<Path>,
+    expected: &ContentIdentity,
+) -> Result<StageOutcome<StagedUpload>, LocalError> {
+    let root = open_absolute_directory(root.as_ref(), "open sync root for upload staging")?;
+    stage_upload_at(&root, relative, staging_directory, expected)
+}
+
+pub(crate) fn stage_upload_at(
+    root: &OwnedFd,
     relative: impl AsRef<Path>,
     staging_directory: impl AsRef<Path>,
     expected: &ContentIdentity,
@@ -573,8 +595,7 @@ pub fn stage_upload(
         return Ok(StageOutcome::AlreadyStaged(stage()));
     }
 
-    let root_fd = open_absolute_directory(root.as_ref(), "open sync root for upload staging")?;
-    let mut source = open_relative_regular(&root_fd, relative, "open upload source")?;
+    let mut source = open_relative_regular(root, relative, "open upload source")?;
     let source_before = stat_fd(&source, relative, "inspect upload source before staging")?;
     let result = write_verified_stage(
         &directory,
@@ -670,9 +691,16 @@ pub(crate) fn observe_upload_source(
     root: impl AsRef<Path>,
     relative: impl AsRef<Path>,
 ) -> Result<ContentIdentity, LocalError> {
-    let relative = relative.as_ref();
     let root = open_absolute_directory(root.as_ref(), "open sync root for upload observation")?;
-    let mut source = open_relative_regular(&root, relative, "open upload source")?;
+    observe_upload_source_at(&root, relative)
+}
+
+pub(crate) fn observe_upload_source_at(
+    root: &OwnedFd,
+    relative: impl AsRef<Path>,
+) -> Result<ContentIdentity, LocalError> {
+    let relative = relative.as_ref();
+    let mut source = open_relative_regular(root, relative, "open upload source")?;
     hash_stable_file(&mut source, relative, "verify upload source")
 }
 
@@ -681,19 +709,30 @@ pub fn stage_download(
     root: impl AsRef<Path>,
     target: impl AsRef<Path>,
     expected: &ContentIdentity,
+    bytes: impl Read,
+) -> Result<StageOutcome<()>, LocalError> {
+    let root = root.as_ref();
+    let root_fd = open_absolute_directory(root, "open sync root for download staging")?;
+    stage_download_at(&root_fd, root, target, expected, bytes)
+}
+
+pub(crate) fn stage_download_at(
+    root: &OwnedFd,
+    root_path: &Path,
+    target: impl AsRef<Path>,
+    expected: &ContentIdentity,
     mut bytes: impl Read,
 ) -> Result<StageOutcome<()>, LocalError> {
     require_content_hash(expected, "stage download")?;
     let target = target.as_ref();
-    let root_fd = open_absolute_directory(root.as_ref(), "open sync root for download staging")?;
-    let Some((parent, _, _)) = open_parent(&root_fd, target, true)? else {
+    let Some((parent, _, _)) = open_parent(root, target, true)? else {
         return Err(LocalError::UnsafeRelativePath {
             path: target.to_path_buf(),
         });
     };
     let name = internal_name("download", target, expected);
     let marker = internal_name("download-marker-v1", target, expected);
-    let display_path = root.as_ref().join(parent_path(target)?).join(&name);
+    let display_path = root_path.join(parent_path(target)?).join(&name);
     let result = write_verified_stage(
         &parent,
         &name,
@@ -745,14 +784,24 @@ pub fn install_download(
     recovery: Option<&VerifiedRecovery>,
 ) -> Result<InstallOutcome, LocalError> {
     let root = root.as_ref();
+    let root_fd = open_absolute_directory(root, "open sync root for download install")?;
+    install_download_at(&root_fd, root, target, desired, recovery)
+}
+
+pub(crate) fn install_download_at(
+    root: &OwnedFd,
+    root_path: &Path,
+    target: impl AsRef<Path>,
+    desired: &ContentIdentity,
+    recovery: Option<&VerifiedRecovery>,
+) -> Result<InstallOutcome, LocalError> {
     let target = target.as_ref();
     require_content_hash(desired, "install download")?;
-    let root_fd = open_absolute_directory(root, "open sync root for download install")?;
-    let Some((parent, target_name, parent_relative)) = open_parent(&root_fd, target, false)? else {
+    let Some((parent, target_name, parent_relative)) = open_parent(root, target, false)? else {
         return Ok(InstallOutcome::DownloadRequired);
     };
     let stage_name = internal_name("download", target, desired);
-    let stage_path = root.join(&parent_relative).join(&stage_name);
+    let stage_path = root_path.join(&parent_relative).join(&stage_name);
     let current = hash_at_if_present(&parent, &target_name, target, "check install precondition")?;
     if current.as_ref() == Some(desired) {
         sync_installed_download(
@@ -806,7 +855,7 @@ pub fn install_download(
 
     match prepare_replacement_at(
         &parent,
-        root,
+        root_path,
         &parent_relative,
         &target_name,
         target,
@@ -915,14 +964,23 @@ pub fn delete_local(
     recovery: &VerifiedRecovery,
 ) -> Result<DeleteOutcome, LocalError> {
     let root = root.as_ref();
+    let root_fd = open_absolute_directory(root, "open sync root for local deletion")?;
+    delete_local_at(&root_fd, root, target, recovery)
+}
+
+pub(crate) fn delete_local_at(
+    root: &OwnedFd,
+    root_path: &Path,
+    target: impl AsRef<Path>,
+    recovery: &VerifiedRecovery,
+) -> Result<DeleteOutcome, LocalError> {
     let target = target.as_ref();
     validate_recovery(recovery, target)?;
-    let root_fd = open_absolute_directory(root, "open sync root for local deletion")?;
-    let Some((parent, target_name, parent_relative)) = open_parent(&root_fd, target, false)? else {
+    let Some((parent, target_name, parent_relative)) = open_parent(root, target, false)? else {
         return Ok(DeleteOutcome::AlreadyDeleted);
     };
     let guard = internal_name("deleted", target, &recovery.content);
-    let guard_path = root.join(&parent_relative).join(&guard);
+    let guard_path = root_path.join(&parent_relative).join(&guard);
     let current = hash_at_if_present(&parent, &target_name, target, "check delete precondition")?;
 
     if current.is_none() {
@@ -1004,20 +1062,31 @@ pub fn materialize_conflict(
     original: impl AsRef<Path>,
     side: ConflictSide,
     expected: &ContentIdentity,
+    bytes: impl Read,
+) -> Result<ConflictOutcome, LocalError> {
+    let root = root.as_ref();
+    let root_fd = open_absolute_directory(root, "open sync root for conflict")?;
+    materialize_conflict_at(&root_fd, root, original, side, expected, bytes)
+}
+
+pub(crate) fn materialize_conflict_at(
+    root: &OwnedFd,
+    root_path: &Path,
+    original: impl AsRef<Path>,
+    side: ConflictSide,
+    expected: &ContentIdentity,
     mut bytes: impl Read,
 ) -> Result<ConflictOutcome, LocalError> {
     require_content_hash(expected, "materialize conflict")?;
-    let root = root.as_ref();
     let original = original.as_ref();
-    let root_fd = open_absolute_directory(root, "open sync root for conflict")?;
-    let Some((parent, _, _)) = open_parent(&root_fd, original, true)? else {
+    let Some((parent, _, _)) = open_parent(root, original, true)? else {
         return Err(LocalError::UnsafeRelativePath {
             path: original.to_path_buf(),
         });
     };
     let name = conflict_name(original, side, expected);
     let relative_path = conflict_relative_path(original, side, expected)?;
-    let display_path = root.join(&relative_path);
+    let display_path = root_path.join(&relative_path);
     let result = write_verified_stage(
         &parent,
         &name,
