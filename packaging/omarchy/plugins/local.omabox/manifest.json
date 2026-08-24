@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "local.omabox",
+  "name": "Omabox",
+  "version": "0.1.0",
+  "author": "Omabox",
+  "description": "Live Omabox sync status in the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Omabox",
+    "description": "Shows the active transfer, progress, queue health, conflicts, and service state.",
+    "category": "Files",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
