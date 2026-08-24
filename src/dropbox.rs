@@ -1,7 +1,7 @@
 //! Documented blocking Dropbox operations.
 
 use std::collections::BTreeMap;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,8 @@ const CONNECT_SECONDS: u64 = 15;
 const DOWNLOAD_SECONDS: u64 = 60 * 60;
 const LONG_POLL_GRACE_SECONDS: u64 = 105;
 const DIRECT_UPLOAD_MAX_BYTES: u64 = 150 * 1024 * 1024;
+const UPLOAD_SESSION_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
+const UPLOAD_SESSION_MAX_BYTES: u64 = (1_u64 << 41) - (1_u64 << 22);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 fn exact_download_agent() -> ureq::Agent {
@@ -99,6 +101,16 @@ impl<R: Read> Read for ProgressReader<'_, R> {
             self.last_sample = now;
         }
         Ok(read)
+    }
+}
+
+impl<R: Seek> Seek for ProgressReader<'_, R> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let offset = self.inner.seek(position)?;
+        self.done = offset;
+        self.last_emitted = offset;
+        self.last_sample = Instant::now();
+        Ok(offset)
     }
 }
 
@@ -755,6 +767,19 @@ impl DropboxClient {
             .metadata()
             .map_err(|source| DropboxError::UploadStageMetadata { source })?
             .len();
+        validate_upload_size(size)?;
+        if size > DIRECT_UPLOAD_MAX_BYTES {
+            return self.upload_session_file(
+                target,
+                synchronized_path,
+                mode,
+                staged,
+                expectation,
+                operation,
+                bytes,
+                size,
+            );
+        }
         validate_direct_upload_size(size)?;
         let argument = ascii_json(&UploadRequest {
             path: target,
@@ -811,6 +836,203 @@ impl DropboxClient {
                 }
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upload_session_file(
+        &self,
+        target: &str,
+        synchronized_path: &Path,
+        mode: UploadMode<'_>,
+        staged: &StagedUpload,
+        expectation: MutationExpectation,
+        operation: &'static str,
+        bytes: std::fs::File,
+        size: u64,
+    ) -> Result<MutationOutcome, DropboxError> {
+        let authorization = format!("Bearer {}", self.access_token.expose());
+        let path_root = self.path_root_header()?;
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(DOWNLOAD_SECONDS)))
+            .timeout_connect(Some(Duration::from_secs(CONNECT_SECONDS)))
+            .build();
+        let agent = ureq::Agent::new_with_config(config);
+        let mut reader = ProgressReader::new(
+            bytes,
+            self.transfer_observer.as_ref(),
+            TransferDirection::Upload,
+            synchronized_path,
+            Some(size),
+        );
+
+        let start_argument = ascii_json(&UploadSessionStartRequest { close: false })?;
+        let start_url = self.endpoints.content("/files/upload_session/start");
+        let mut start_response = agent
+            .post(&start_url)
+            .header("Authorization", &authorization)
+            .header("Dropbox-API-Path-Root", &path_root)
+            .header("Dropbox-API-Arg", start_argument)
+            .header("Content-Type", "application/octet-stream")
+            .header("Content-Length", "0")
+            .send_empty()
+            .map_err(|source| DropboxError::Transport {
+                operation: "start Dropbox upload session",
+                source,
+            })?;
+        require_success(
+            start_response.status().as_u16(),
+            start_response.headers().get("Retry-After"),
+            "start Dropbox upload session",
+        )?;
+        let session = start_response
+            .body_mut()
+            .read_json::<UploadSessionStartResponse>()
+            .map_err(|source| DropboxError::Response {
+                operation: "decode Dropbox upload-session start response",
+                source,
+            })?;
+
+        let mut offset = 0;
+        while offset < size {
+            let next = offset
+                .checked_add(UPLOAD_SESSION_CHUNK_BYTES.min(size.saturating_sub(offset)))
+                .ok_or(DropboxError::UploadSessionOffsetOverflow)?;
+            self.append_upload_session_chunk(
+                &agent,
+                &authorization,
+                &path_root,
+                &session.session_id,
+                &mut reader,
+                offset,
+                next,
+            )?;
+            offset = next;
+        }
+
+        let finish_argument = ascii_json(&UploadSessionFinishRequest {
+            cursor: UploadSessionCursor {
+                session_id: &session.session_id,
+                offset,
+            },
+            commit: UploadSessionCommit {
+                path: target,
+                mode,
+                autorename: false,
+                strict_conflict: true,
+            },
+        })?;
+        let finish_url = self.endpoints.content("/files/upload_session/finish");
+        let response = agent
+            .post(&finish_url)
+            .header("Authorization", authorization)
+            .header("Dropbox-API-Path-Root", path_root)
+            .header("Dropbox-API-Arg", finish_argument)
+            .header("Content-Type", "application/octet-stream")
+            .header("Content-Length", "0")
+            .send_empty();
+        match response {
+            Err(source) => self.resolve_ambiguous(
+                target,
+                &expectation,
+                DropboxError::Transport { operation, source },
+            ),
+            Ok(mut response) => {
+                let status = response.status().as_u16();
+                if (200..300).contains(&status) {
+                    let confirmation = response
+                        .body_mut()
+                        .read_json::<ListEntry>()
+                        .map_err(|source| DropboxError::Response { operation, source })
+                        .and_then(|metadata| {
+                            validate_uploaded_file(target, metadata, staged.content())
+                        });
+                    match confirmation {
+                        Ok(remote) => Ok(MutationOutcome::Applied(RemotePathState::File(remote))),
+                        Err(failure) => self.resolve_ambiguous(target, &expectation, failure),
+                    }
+                } else {
+                    self.resolve_mutation_status(target, &expectation, &response, operation)
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_upload_session_chunk<R: Read + Seek>(
+        &self,
+        agent: &ureq::Agent,
+        authorization: &str,
+        path_root: &str,
+        session_id: &str,
+        reader: &mut R,
+        offset: u64,
+        next: u64,
+    ) -> Result<(), DropboxError> {
+        let length = next
+            .checked_sub(offset)
+            .ok_or(DropboxError::UploadSessionOffsetOverflow)?;
+        let argument = ascii_json(&UploadSessionAppendRequest {
+            cursor: UploadSessionCursor { session_id, offset },
+            close: false,
+        })?;
+        let url = self.endpoints.content("/files/upload_session/append_v2");
+        for attempt in 0..=1 {
+            reader
+                .seek(SeekFrom::Start(offset))
+                .map_err(|source| DropboxError::UploadStageSeek { source })?;
+            let mut body = reader.take(length);
+            let response = agent
+                .post(&url)
+                .header("Authorization", authorization)
+                .header("Dropbox-API-Path-Root", path_root)
+                .header("Dropbox-API-Arg", &argument)
+                .header("Content-Type", "application/octet-stream")
+                .header("Content-Length", length.to_string())
+                .send(ureq::SendBody::from_reader(&mut body));
+            match response {
+                Err(_) if attempt == 0 => continue,
+                Err(source) => {
+                    return Err(DropboxError::Transport {
+                        operation: "append Dropbox upload session",
+                        source,
+                    });
+                }
+                Ok(mut response) => {
+                    let status = response.status().as_u16();
+                    if (200..300).contains(&status) {
+                        return Ok(());
+                    }
+                    if status == 409 {
+                        let offset_error = response
+                            .body_mut()
+                            .read_json::<UploadSessionAppendErrorResponse>()
+                            .map_err(|source| DropboxError::Response {
+                                operation: "decode Dropbox upload-session append error",
+                                source,
+                            })?
+                            .incorrect_offset();
+                        if let Some(correct_offset) = offset_error {
+                            return if correct_offset == next {
+                                Ok(())
+                            } else {
+                                Err(DropboxError::IncorrectUploadSessionOffset {
+                                    requested_offset: offset,
+                                    chunk_bytes: length,
+                                    correct_offset,
+                                })
+                            };
+                        }
+                    }
+                    return Err(status_failure(
+                        status,
+                        response.headers().get("Retry-After"),
+                        "append Dropbox upload session",
+                    ));
+                }
+            }
+        }
+        Err(DropboxError::UploadSessionOffsetOverflow)
     }
 
     fn resolve_mutation_status(
@@ -1287,6 +1509,66 @@ struct UploadRequest<'a> {
 }
 
 #[derive(Serialize)]
+struct UploadSessionStartRequest {
+    close: bool,
+}
+
+#[derive(Deserialize)]
+struct UploadSessionStartResponse {
+    session_id: String,
+}
+
+#[derive(Serialize)]
+struct UploadSessionCursor<'a> {
+    session_id: &'a str,
+    offset: u64,
+}
+
+#[derive(Serialize)]
+struct UploadSessionAppendRequest<'a> {
+    cursor: UploadSessionCursor<'a>,
+    close: bool,
+}
+
+#[derive(Serialize)]
+struct UploadSessionFinishRequest<'a> {
+    cursor: UploadSessionCursor<'a>,
+    commit: UploadSessionCommit<'a>,
+}
+
+#[derive(Serialize)]
+struct UploadSessionCommit<'a> {
+    path: &'a str,
+    mode: UploadMode<'a>,
+    autorename: bool,
+    strict_conflict: bool,
+}
+
+#[derive(Deserialize)]
+struct UploadSessionAppendErrorResponse {
+    error: UploadSessionAppendError,
+}
+
+impl UploadSessionAppendErrorResponse {
+    fn incorrect_offset(self) -> Option<u64> {
+        match self.error {
+            UploadSessionAppendError::IncorrectOffset { correct_offset } => Some(correct_offset),
+            UploadSessionAppendError::Other => None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = ".tag", rename_all = "snake_case")]
+enum UploadSessionAppendError {
+    IncorrectOffset {
+        correct_offset: u64,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Serialize)]
 #[serde(untagged)]
 enum UploadMode<'a> {
     Add(&'static str),
@@ -1356,6 +1638,29 @@ pub enum DropboxError {
         /// Verified stage length.
         bytes: u64,
     },
+    /// The immutable stage exceeds Dropbox's documented upload-session limit.
+    #[error(
+        "immutable upload stage is {bytes} bytes; Dropbox upload sessions allow at most 2199019061248 bytes"
+    )]
+    UploadTooLarge {
+        /// Verified stage length.
+        bytes: u64,
+    },
+    /// Dropbox reported an offset that cannot confirm the attempted sequential chunk.
+    #[error(
+        "Dropbox upload session reported offset {correct_offset} after a {chunk_bytes}-byte chunk at {requested_offset}"
+    )]
+    IncorrectUploadSessionOffset {
+        /// Offset sent with the request.
+        requested_offset: u64,
+        /// Bytes sent with the request.
+        chunk_bytes: u64,
+        /// Offset Dropbox reports having stored.
+        correct_offset: u64,
+    },
+    /// Upload-session offset arithmetic exceeded the supported integer range.
+    #[error("Dropbox upload-session offset overflowed")]
+    UploadSessionOffsetOverflow,
     /// The live account, Secret Service record, and journal do not share one binding.
     #[error("Dropbox account or root binding no longer matches the journal")]
     AccountBindingChanged,
@@ -1454,6 +1759,13 @@ pub enum DropboxError {
         #[source]
         source: io::Error,
     },
+    /// The immutable upload stage could not be repositioned after an ambiguous append.
+    #[error("could not reposition immutable upload staging")]
+    UploadStageSeek {
+        /// Original descriptor seek error.
+        #[source]
+        source: io::Error,
+    },
     /// Verified local staging could not be accessed.
     #[error("could not access verified local staging")]
     LocalStage {
@@ -1504,6 +1816,14 @@ fn status_failure(
 fn validate_direct_upload_size(bytes: u64) -> Result<(), DropboxError> {
     if bytes > DIRECT_UPLOAD_MAX_BYTES {
         Err(DropboxError::DirectUploadTooLarge { bytes })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_upload_size(bytes: u64) -> Result<(), DropboxError> {
+    if bytes > UPLOAD_SESSION_MAX_BYTES {
+        Err(DropboxError::UploadTooLarge { bytes })
     } else {
         Ok(())
     }
@@ -1763,8 +2083,9 @@ mod tests {
 
     use super::{
         CONNECT_SECONDS, DIRECT_UPLOAD_MAX_BYTES, DOWNLOAD_SECONDS, DropboxError, DropboxRoot,
-        EntryTag, ListEntry, PROGRESS_INTERVAL, ProgressReader, apply_entries, ascii_json,
-        exact_download_agent, validate_direct_upload_size,
+        EntryTag, ListEntry, PROGRESS_INTERVAL, ProgressReader, UPLOAD_SESSION_MAX_BYTES,
+        apply_entries, ascii_json, exact_download_agent, validate_direct_upload_size,
+        validate_upload_size,
     };
 
     #[test]
@@ -2069,6 +2390,12 @@ mod tests {
             validate_direct_upload_size(DIRECT_UPLOAD_MAX_BYTES + 1),
             Err(DropboxError::DirectUploadTooLarge { bytes })
                 if bytes == DIRECT_UPLOAD_MAX_BYTES + 1
+        ));
+        assert!(validate_upload_size(UPLOAD_SESSION_MAX_BYTES).is_ok());
+        assert!(matches!(
+            validate_upload_size(UPLOAD_SESSION_MAX_BYTES + 1),
+            Err(DropboxError::UploadTooLarge { bytes })
+                if bytes == UPLOAD_SESSION_MAX_BYTES + 1
         ));
     }
 

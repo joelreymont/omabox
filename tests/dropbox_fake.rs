@@ -320,6 +320,119 @@ fn one_reconciliation_pass_synchronizes_files_in_both_directions() -> Result<(),
 }
 
 #[test]
+fn large_replace_uses_a_sequential_upload_session_and_recovers_a_stored_append()
+-> Result<(), Box<dyn Error>> {
+    const MIB: u64 = 1024 * 1024;
+    const CHUNK: u64 = 32 * MIB;
+    const SIZE: u64 = 150 * MIB + 1;
+    let fixture = sparse_upload_fixture(SIZE)?;
+    let content = fixture.staged.content().clone();
+    let session_id = "opaque-session-must-not-appear-in-errors";
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({"session_id": session_id})),
+        FakeResponse::status_json(
+            409,
+            json!({
+                "error_summary": "incorrect_offset/...",
+                "error": {
+                    ".tag": "incorrect_offset",
+                    "correct_offset": CHUNK
+                }
+            }),
+        ),
+        FakeResponse::json(json!({})),
+        FakeResponse::json(json!({})),
+        FakeResponse::json(json!({})),
+        FakeResponse::json(json!({})),
+        FakeResponse::json(file_metadata(
+            "/large.bin",
+            "/Large.bin",
+            "new-revision",
+            &content,
+        )),
+    ])?;
+    let client = fake_client(&server, "opaque-access-large-upload")?;
+
+    assert_eq!(
+        client.replace_file(
+            "Large.bin",
+            &DropboxRevision::new("old-revision"),
+            &fixture.staged,
+        )?,
+        MutationOutcome::Applied(RemotePathState::File(RemoteFile::new(
+            content,
+            DropboxRevision::new("new-revision"),
+        )))
+    );
+
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 7);
+    assert_eq!(requests[0].path, "/2/files/upload_session/start");
+    assert_eq!(requests[1].path, "/2/files/upload_session/append_v2");
+    assert_eq!(requests[2].path, "/2/files/upload_session/append_v2");
+    assert_eq!(requests[3].path, "/2/files/upload_session/append_v2");
+    assert_eq!(requests[4].path, "/2/files/upload_session/append_v2");
+    assert_eq!(requests[5].path, "/2/files/upload_session/append_v2");
+    assert_eq!(requests[6].path, "/2/files/upload_session/finish");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(required_header(
+            &requests[0],
+            "dropbox-api-arg",
+        )?)?,
+        json!({"close": false})
+    );
+    for (request, offset) in requests[1..6]
+        .iter()
+        .zip([0, CHUNK, 2 * CHUNK, 3 * CHUNK, 4 * CHUNK])
+    {
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(required_header(
+                request,
+                "dropbox-api-arg",
+            )?)?,
+            json!({
+                "cursor": {"session_id": session_id, "offset": offset},
+                "close": false
+            })
+        );
+    }
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(required_header(
+            &requests[6],
+            "dropbox-api-arg",
+        )?)?,
+        json!({
+            "cursor": {"session_id": session_id, "offset": SIZE},
+            "commit": {
+                "path": "/Large.bin",
+                "mode": {".tag": "update", "update": "old-revision"},
+                "autorename": false,
+                "strict_conflict": true
+            }
+        })
+    );
+    assert!(requests[0].body.is_empty());
+    assert_eq!(u64::try_from(requests[1].body.len())?, CHUNK);
+    assert_eq!(u64::try_from(requests[2].body.len())?, CHUNK);
+    assert_eq!(u64::try_from(requests[3].body.len())?, CHUNK);
+    assert_eq!(u64::try_from(requests[4].body.len())?, CHUNK);
+    assert_eq!(u64::try_from(requests[5].body.len())?, SIZE - 4 * CHUNK);
+    assert!(requests[6].body.is_empty());
+    assert_eq!(
+        requests
+            .iter()
+            .try_fold(0_u64, |total, request| -> io::Result<u64> {
+                let length = u64::try_from(request.body.len()).map_err(io::Error::other)?;
+                total
+                    .checked_add(length)
+                    .ok_or_else(|| io::Error::other("captured upload length overflowed"))
+            })?,
+        SIZE
+    );
+    Ok(())
+}
+
+#[test]
 fn case_only_remote_spelling_change_is_a_stable_noop() -> Result<(), Box<dyn Error>> {
     let bytes = b"same bytes across a case-only change";
     let content = dropbox_content_hash(bytes.as_slice())?;
@@ -1748,6 +1861,29 @@ fn upload_fixture(bytes: &[u8]) -> Result<UploadFixture, Box<dyn Error>> {
     let staging = TempDir::new()?;
     std::fs::write(root.path().join("payload"), bytes)?;
     let identity = dropbox_content_hash(bytes)?;
+    let staged = match stage_upload(root.path(), "payload", staging.path(), &identity)? {
+        StageOutcome::Staged(staged) | StageOutcome::AlreadyStaged(staged) => staged,
+        StageOutcome::ContentChanged { .. } => {
+            return Err(io::Error::other("upload fixture content changed").into());
+        }
+        StageOutcome::DestinationOccupied { .. } => {
+            return Err(io::Error::other("upload fixture destination was occupied").into());
+        }
+    };
+    Ok(UploadFixture {
+        _root: root,
+        _staging: staging,
+        staged,
+    })
+}
+
+fn sparse_upload_fixture(size: u64) -> Result<UploadFixture, Box<dyn Error>> {
+    let root = TempDir::new()?;
+    let staging = TempDir::new()?;
+    let source = root.path().join("payload");
+    let file = std::fs::File::create(&source)?;
+    file.set_len(size)?;
+    let identity = dropbox_content_hash(std::fs::File::open(&source)?)?;
     let staged = match stage_upload(root.path(), "payload", staging.path(), &identity)? {
         StageOutcome::Staged(staged) | StageOutcome::AlreadyStaged(staged) => staged,
         StageOutcome::ContentChanged { .. } => {
