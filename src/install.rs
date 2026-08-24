@@ -230,7 +230,7 @@ fn publish(
         .and_then(|()| transaction.cleanup_prepared());
         return Err(rollback_failure(source, restored));
     }
-    let result = transaction.apply().and_then(|()| {
+    let result = transaction.apply(commands).and_then(|()| {
         commands
             .services
             .daemon_reload()
@@ -468,10 +468,14 @@ impl Transaction {
         Ok(())
     }
 
-    fn apply(&mut self) -> Result<(), InstallError> {
+    fn apply(&mut self, commands: &Commands) -> Result<(), InstallError> {
         self.preflight()?;
         for entry in &mut self.entries {
-            match (self.mode, path_kind(&entry.destination)?.is_some()) {
+            let destination_exists = path_kind(&entry.destination)?.is_some();
+            if entry.kind == ArtifactKind::Directory {
+                ensure_shell_unlocked(commands)?;
+            }
+            match (self.mode, destination_exists) {
                 (TransactionMode::Replace, true) => {
                     entry.transition(EntryState::Swapped)?;
                 }
@@ -1041,6 +1045,46 @@ mod tests {
         assert_eq!(fs::read(&fixture.layout.omabox)?, b"old");
         assert_eq!(fs::read(fixture.layout.plugin.join("old.qml"))?, b"old");
         assert!(!fixture.systemctl_log.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn lock_before_plugin_restores_earlier_artifacts_and_service() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new(true, true, false)?;
+        fixture.old_install()?;
+        let lock_checks = fixture._temporary.path().join("lock-checks");
+        fs::write(
+            &fixture.commands.omarchy_shell,
+            format!(
+                "#!/bin/sh\ncount=0\nif [ -f '{}' ]; then read count < '{}'; fi\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > '{}'\nif [ \"$count\" -lt 3 ]; then printf 'false\\n'; else printf 'true\\n'; fi\n",
+                lock_checks.display(),
+                lock_checks.display(),
+                lock_checks.display(),
+            ),
+        )?;
+        test_permissions(&fixture.commands.omarchy_shell)?;
+
+        let result = execute_with(
+            InstallAction::Uninstall,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        assert!(matches!(result, Err(InstallError::ShellLocked)));
+        for path in [
+            &fixture.layout.omabox,
+            &fixture.layout.omaboxd,
+            &fixture.layout.unit,
+        ] {
+            assert_eq!(fs::read(path)?, b"old");
+        }
+        assert_eq!(fs::read(fixture.layout.plugin.join("old.qml"))?, b"old");
+        assert_eq!(fs::read_to_string(lock_checks)?, "3\n");
+        assert_eq!(
+            fs::read_to_string(&fixture.systemctl_log)?,
+            "is-enabled\nis-active\nstop\ndisable\ndaemon-reload\nenable\nstart\n"
+        );
         Ok(())
     }
 
