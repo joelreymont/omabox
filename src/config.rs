@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
 
 use miette::Diagnostic;
@@ -120,10 +121,21 @@ impl Paths {
             (PathRole::UploadStaging, self.upload_staging_directory()),
             (PathRole::Recovery, self.recovery_directory()),
         ] {
-            fs::create_dir_all(path).map_err(|source| ConfigError::CreateDirectory {
-                role,
-                path: path.to_path_buf(),
-                source,
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder
+                .create(path)
+                .map_err(|source| ConfigError::CreateDirectory {
+                    role,
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
+                ConfigError::SetDirectoryPermissions {
+                    role,
+                    path: path.to_path_buf(),
+                    source,
+                }
             })?;
         }
         self.validate_outside(sync_root)
@@ -386,6 +398,22 @@ pub enum ConfigError {
         help("Ensure the XDG state location is writable and has sufficient space.")
     )]
     CreateDirectory {
+        /// Role of the directory.
+        role: PathRole,
+        /// Directory path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+
+    /// A runtime directory could not be restricted to its owner.
+    #[error("could not secure Omabox {role} at `{path}`")]
+    #[diagnostic(
+        code(omabox::config::set_directory_permissions),
+        help("Ensure the XDG state location is owned by this user and retry.")
+    )]
+    SetDirectoryPermissions {
         /// Role of the directory.
         role: PathRole,
         /// Directory path.
@@ -712,6 +740,50 @@ mod tests {
         assert!(config.paths().upload_staging_directory().is_dir());
         assert!(config.paths().recovery_directory().is_dir());
         assert!(!config.paths().journal_file().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_creates_private_runtime_directories() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, xdg, sync_root) = fixture()?;
+        write_config(&xdg, &sync_root)?;
+        let config = Config::load_from(&xdg)?;
+
+        config.prepare()?;
+
+        for path in [
+            config.paths().state_directory(),
+            config.paths().upload_staging_directory(),
+            config.paths().recovery_directory(),
+        ] {
+            let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "unexpected permissions for {}", path.display());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prepare_repairs_broad_runtime_directory_permissions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, xdg, sync_root) = fixture()?;
+        write_config(&xdg, &sync_root)?;
+        let config = Config::load_from(&xdg)?;
+        let paths = [
+            config.paths().state_directory(),
+            config.paths().upload_staging_directory(),
+            config.paths().recovery_directory(),
+        ];
+        for path in paths {
+            fs::create_dir_all(path)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o777))?;
+        }
+
+        config.prepare()?;
+
+        for path in paths {
+            let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "unexpected permissions for {}", path.display());
+        }
         Ok(())
     }
 

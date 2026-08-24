@@ -2,6 +2,7 @@
 
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -19,6 +20,17 @@ const MIGRATION: &str = include_str!("../migrations/0001.sql");
 /// A journal failure with its operation, affected path, and original cause.
 #[derive(Debug, Error)]
 pub enum JournalError {
+    /// The journal file could not be secured for its owner.
+    #[error("journal operation `{operation}` failed for `{path}`")]
+    File {
+        /// Operation being attempted.
+        operation: &'static str,
+        /// Journal path involved.
+        path: PathBuf,
+        /// Original filesystem error.
+        #[source]
+        source: std::io::Error,
+    },
     /// SQLite rejected a journal operation.
     #[error("journal operation `{operation}` failed for `{path}`")]
     Sqlite {
@@ -69,6 +81,13 @@ impl JournalError {
     pub(crate) fn redact_paths(self) -> Self {
         let redacted = || PathBuf::from("[Omabox journal]");
         match self {
+            Self::File {
+                operation, source, ..
+            } => Self::File {
+                operation,
+                path: redacted(),
+                source,
+            },
             Self::Sqlite {
                 operation, source, ..
             } => Self::Sqlite {
@@ -323,6 +342,13 @@ impl Journal {
             path: path.clone(),
             source,
         })?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |source| JournalError::File {
+                operation: "restrict journal permissions",
+                path: path.clone(),
+                source,
+            },
+        )?;
         let version = connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .map_err(|source| JournalError::Sqlite {
@@ -1459,6 +1485,7 @@ fn operation_matches_baseline(operation: &Operation, baseline: &Baseline) -> boo
 #[cfg(test)]
 mod tests {
     use std::error::Error;
+    use std::fs;
 
     use tempfile::TempDir;
 
@@ -1476,6 +1503,10 @@ mod tests {
 
     fn journal_path(directory: &TempDir) -> PathBuf {
         directory.path().join("journal.sqlite3")
+    }
+
+    fn file_mode(path: &Path) -> Result<u32, std::io::Error> {
+        Ok(fs::metadata(path)?.permissions().mode() & 0o777)
     }
 
     fn dropbox_binding(
@@ -1563,6 +1594,43 @@ mod tests {
         assert_eq!(reopened.baseline(path)?, None);
         assert_eq!(plan.operations[0].operation, operation);
         assert_eq!(reopened.pending_plans()?, vec![plan]);
+        Ok(())
+    }
+
+    #[test]
+    fn writable_journal_creates_owner_only_database() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+
+        let _journal = Journal::open(&database_path)?;
+
+        assert_eq!(file_mode(&database_path)?, 0o600);
+        Ok(())
+    }
+
+    #[test]
+    fn writable_journal_restricts_existing_database() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+        drop(Journal::open(&database_path)?);
+        fs::set_permissions(&database_path, fs::Permissions::from_mode(0o644))?;
+
+        let _journal = Journal::open(&database_path)?;
+
+        assert_eq!(file_mode(&database_path)?, 0o600);
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_journal_preserves_existing_permissions() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+        drop(Journal::open(&database_path)?);
+        fs::set_permissions(&database_path, fs::Permissions::from_mode(0o644))?;
+
+        let _journal = Journal::open_read_only(&database_path)?;
+
+        assert_eq!(file_mode(&database_path)?, 0o644);
         Ok(())
     }
 
