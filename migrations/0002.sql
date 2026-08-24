@@ -78,6 +78,22 @@ CREATE TABLE local_root_binding (
     generation INTEGER NOT NULL CHECK (generation >= 1)
 ) STRICT;
 
+CREATE TABLE legacy_local_root_adoption (
+    singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1)
+) STRICT;
+
+INSERT INTO legacy_local_root_adoption(singleton)
+SELECT 1
+WHERE EXISTS (
+    SELECT 1 FROM baselines
+    UNION ALL
+    SELECT 1 FROM local_observations
+    UNION ALL
+    SELECT 1 FROM plans
+    UNION ALL
+    SELECT 1 FROM conflicts
+);
+
 DELETE FROM baselines WHERE baseline_json = '"Absent"';
 
 PRAGMA user_version = 2;

@@ -226,7 +226,7 @@ pub struct LocalRootRecord {
 pub enum LocalRootActivation {
     /// A new root generation was activated and local state was reset.
     Activated(LocalRootRecord),
-    /// This exact path and filesystem object is already active.
+    /// This exact root is current, including after one-time legacy adoption.
     Current(LocalRootRecord),
     /// Unfinished work prevents changing or initially binding the root.
     Busy,
@@ -624,6 +624,34 @@ impl Journal {
         {
             return Ok(LocalRootActivation::Current(record.clone()));
         }
+        let legacy_adoption = transaction
+            .query_row(
+                "SELECT EXISTS( \
+                     SELECT 1 FROM legacy_local_root_adoption WHERE singleton = 1 \
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|source| sqlite("read legacy local root adoption", &database_path, source))?;
+        if existing.is_none() && legacy_adoption {
+            let record = LocalRootRecord {
+                binding: binding.clone(),
+                generation: 1,
+            };
+            write_local_root(&transaction, &record, &database_path)?;
+            transaction
+                .execute(
+                    "DELETE FROM legacy_local_root_adoption WHERE singleton = 1",
+                    [],
+                )
+                .map_err(|source| {
+                    sqlite("finish legacy local root adoption", &database_path, source)
+                })?;
+            transaction.commit().map_err(|source| {
+                sqlite("commit legacy local root adoption", &database_path, source)
+            })?;
+            return Ok(LocalRootActivation::Current(record));
+        }
         let pending = transaction
             .query_row(
                 "SELECT EXISTS( \
@@ -651,12 +679,6 @@ impl Journal {
             }
             None => 1,
         };
-        let stored_generation =
-            i64::try_from(generation).map_err(|_| JournalError::InvalidState {
-                operation: "advance local root generation",
-                path: database_path.clone(),
-                detail: "local root generation exceeds SQLite integer range",
-            })?;
         transaction
             .execute("DELETE FROM baselines", [])
             .map_err(|source| sqlite("clear prior root baselines", &database_path, source))?;
@@ -666,33 +688,15 @@ impl Journal {
         transaction
             .execute("DELETE FROM conflicts", [])
             .map_err(|source| sqlite("clear prior root conflicts", &database_path, source))?;
-        let device = binding.device.to_be_bytes();
-        let inode = binding.inode.to_be_bytes();
-        transaction
-            .execute(
-                "INSERT INTO local_root_binding( \
-                     singleton, canonical_path, device, inode, generation \
-                 ) VALUES (1, ?1, ?2, ?3, ?4) \
-                 ON CONFLICT(singleton) DO UPDATE SET \
-                     canonical_path = excluded.canonical_path, \
-                     device = excluded.device, \
-                     inode = excluded.inode, \
-                     generation = excluded.generation",
-                params![
-                    path_bytes(&binding.canonical_path),
-                    device.as_slice(),
-                    inode.as_slice(),
-                    stored_generation
-                ],
-            )
-            .map_err(|source| sqlite("write local root binding", &database_path, source))?;
+        let record = LocalRootRecord {
+            binding: binding.clone(),
+            generation,
+        };
+        write_local_root(&transaction, &record, &database_path)?;
         transaction
             .commit()
             .map_err(|source| sqlite("commit local root activation", &database_path, source))?;
-        Ok(LocalRootActivation::Activated(LocalRootRecord {
-            binding: binding.clone(),
-            generation,
-        }))
+        Ok(LocalRootActivation::Activated(record))
     }
 
     /// Publish a complete local inventory as one replacement transaction.
@@ -1705,6 +1709,39 @@ fn start_recovery_retention(
         )
         .map(|_| ())
         .map_err(|source| sqlite("start recovery retention", path, source))
+}
+
+fn write_local_root(
+    connection: &Connection,
+    record: &LocalRootRecord,
+    database_path: &Path,
+) -> Result<(), JournalError> {
+    let generation = i64::try_from(record.generation).map_err(|_| JournalError::InvalidState {
+        operation: "write local root binding",
+        path: database_path.to_path_buf(),
+        detail: "local root generation exceeds SQLite integer range",
+    })?;
+    let device = record.binding.device.to_be_bytes();
+    let inode = record.binding.inode.to_be_bytes();
+    connection
+        .execute(
+            "INSERT INTO local_root_binding( \
+                 singleton, canonical_path, device, inode, generation \
+             ) VALUES (1, ?1, ?2, ?3, ?4) \
+             ON CONFLICT(singleton) DO UPDATE SET \
+                 canonical_path = excluded.canonical_path, \
+                 device = excluded.device, \
+                 inode = excluded.inode, \
+                 generation = excluded.generation",
+            params![
+                path_bytes(&record.binding.canonical_path),
+                device.as_slice(),
+                inode.as_slice(),
+                generation
+            ],
+        )
+        .map(|_| ())
+        .map_err(|source| sqlite("write local root binding", database_path, source))
 }
 
 fn read_local_root(
@@ -2766,6 +2803,8 @@ mod tests {
         let directory = TempDir::new()?;
         let database_path = journal_path(&directory);
         let path = Path::new("removed.txt");
+        let kept_path = Path::new("kept.txt");
+        let kept_baseline = Baseline::Present(remote_file("kept", "rev-kept"));
         let operation = Operation::DeleteLocal {
             expected_content: content("old"),
         };
@@ -2775,6 +2814,13 @@ mod tests {
             connection.execute(
                 "INSERT INTO baselines(path, baseline_json) VALUES (?1, ?2)",
                 params![path_bytes(path), encode(&Baseline::Absent, "test", path)?],
+            )?;
+            connection.execute(
+                "INSERT INTO baselines(path, baseline_json) VALUES (?1, ?2)",
+                params![
+                    path_bytes(kept_path),
+                    encode(&kept_baseline, "test", kept_path)?
+                ],
             )?;
             connection.execute(
                 "INSERT INTO plans(id, path, status) VALUES (10, ?1, 'completed')",
@@ -2837,10 +2883,11 @@ mod tests {
         assert!(legacy.completed_recoveries()?.is_empty());
         drop(legacy);
 
-        let journal = Journal::open(&database_path)?;
+        let mut journal = Journal::open(&database_path)?;
         assert_eq!(journal.schema_version, 2);
         assert_eq!(journal.baseline(path)?, None);
-        assert!(journal.baseline_paths()?.is_empty());
+        assert_eq!(journal.baseline(kept_path)?, Some(kept_baseline.clone()));
+        assert_eq!(journal.baseline_paths()?, vec![kept_path.to_path_buf()]);
         assert!(read_plan(&journal.connection, &database_path, PlanId(10))?.is_none());
         let migrated = journal.completed_recoveries()?;
         let [migrated] = migrated.as_slice() else {
@@ -2861,6 +2908,30 @@ mod tests {
         assert_eq!(journal.pending_plans()?.len(), 1);
         assert_eq!(journal.pending_recoveries()?.len(), 1);
         assert_eq!(journal.pending_recoveries()?[0].retained_at, None);
+
+        let configured = local_root("/sync/configured", 7, 8);
+        let configured_record = LocalRootRecord {
+            binding: configured.clone(),
+            generation: 1,
+        };
+        assert_eq!(
+            journal.activate_local_root(&configured)?,
+            LocalRootActivation::Current(configured_record.clone())
+        );
+        assert_eq!(
+            journal.local_root_binding()?,
+            Some(configured_record.clone())
+        );
+        assert_eq!(journal.baseline(kept_path)?, Some(kept_baseline));
+        assert_eq!(journal.pending_plans()?.len(), 1);
+        assert_eq!(journal.pending_recoveries()?.len(), 1);
+
+        let changed = local_root("/sync/changed", 9, 10);
+        assert_eq!(
+            journal.activate_local_root(&changed)?,
+            LocalRootActivation::Busy
+        );
+        assert_eq!(journal.local_root_binding()?, Some(configured_record));
         let version = journal
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
