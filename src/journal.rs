@@ -661,6 +661,9 @@ impl Journal {
         transaction
             .execute("DELETE FROM local_observations", [])
             .map_err(|source| sqlite("clear prior root observations", &database_path, source))?;
+        transaction
+            .execute("DELETE FROM conflicts", [])
+            .map_err(|source| sqlite("clear prior root conflicts", &database_path, source))?;
         let device = binding.device.to_be_bytes();
         let inode = binding.inode.to_be_bytes();
         transaction
@@ -869,6 +872,9 @@ impl Journal {
             return Ok(NoOpWrite::PendingPlan(PlanId(id)));
         }
         write_baseline(&transaction, path, noop.baseline())?;
+        transaction
+            .execute("DELETE FROM conflicts WHERE path = ?1", [path_bytes(path)])
+            .map_err(|source| sqlite("retire resolved conflicts", path, source))?;
         transaction
             .commit()
             .map_err(|source| sqlite("commit no-op baseline", &database_path, source))?;
@@ -1195,6 +1201,9 @@ impl Journal {
         };
 
         write_baseline(&transaction, &path, baseline)?;
+        transaction
+            .execute("DELETE FROM conflicts WHERE path = ?1", [path_bytes(&path)])
+            .map_err(|source| sqlite("retire resolved conflicts", &path, source))?;
         transaction
             .execute(
                 "UPDATE plans SET status = 'completed' WHERE id = ?1",
@@ -2182,6 +2191,11 @@ mod tests {
         };
         journal
             .publish_remote_inventory("cursor-kept", std::slice::from_ref(&remote_observation))?;
+        let conflict = Conflict::DivergentEdits {
+            local: LocalFile::new(content("local")),
+            remote: remote_file("remote", "rev-conflict"),
+        };
+        let _ = journal.record_conflict(Path::new("old-root-conflict.txt"), &conflict)?;
 
         assert_eq!(
             journal.activate_local_root(&first)?,
@@ -2202,6 +2216,7 @@ mod tests {
         assert_eq!(journal.baseline(path)?, None);
         assert!(journal.baseline_paths()?.is_empty());
         assert!(journal.local_inventory()?.is_empty());
+        assert!(journal.conflicts()?.is_empty());
         assert_eq!(
             journal.remote_inventory()?,
             RemoteInventory {
@@ -2486,6 +2501,10 @@ mod tests {
             &Observation::Present(LocalFile::new(content("created"))),
             &Observation::ConfirmedAbsent,
         ))?;
+        let stale_conflict = Conflict::RemoteDeletionLocalEdit {
+            local: LocalFile::new(content("created")),
+        };
+        let _ = journal.record_conflict(path, &stale_conflict)?;
         let plan = recorded_plan(journal.record_plan(path, &operation_plan)?)?;
 
         assert_eq!(
@@ -2505,6 +2524,7 @@ mod tests {
             OperationCompletion::PlanCompleted
         );
         assert_eq!(journal.baseline(path)?, Some(actual));
+        assert!(journal.conflicts()?.is_empty());
         assert!(journal.pending_plans()?.is_empty());
         assert_eq!(
             journal.complete_operation(plan.operations[0].id, None)?,
@@ -2866,6 +2886,29 @@ mod tests {
 
         let reopened = Journal::open(database_path)?;
         assert_eq!(reopened.conflicts()?, vec![expected]);
+        Ok(())
+    }
+
+    #[test]
+    fn journal_retires_conflict_description_when_the_path_converges() -> Result<(), Box<dyn Error>>
+    {
+        let directory = TempDir::new()?;
+        let mut journal = Journal::open(journal_path(&directory))?;
+        let path = Path::new("resolved.txt");
+        let conflict = Conflict::DivergentEdits {
+            local: LocalFile::new(content("local")),
+            remote: remote_file("remote", "rev-remote"),
+        };
+        let _ = journal.record_conflict(path, &conflict)?;
+        assert_eq!(journal.conflicts()?.len(), 1);
+
+        let absent = noop(plan(
+            &Baseline::Absent,
+            &Observation::ConfirmedAbsent,
+            &Observation::ConfirmedAbsent,
+        ))?;
+        assert_eq!(journal.record_noop(path, &absent)?, NoOpWrite::Recorded);
+        assert!(journal.conflicts()?.is_empty());
         Ok(())
     }
 
