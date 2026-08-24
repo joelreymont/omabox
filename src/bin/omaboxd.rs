@@ -11,7 +11,9 @@ use omabox::config::{
 use omabox::dropbox::{
     AccountValidation, DropboxClient, DropboxError, DropboxRoot, LongPollWakeup,
 };
-use omabox::journal::{DropboxBinding, Journal, JournalError};
+use omabox::journal::{
+    DropboxBinding, Journal, JournalError, LocalRootActivation, LocalRootBinding,
+};
 use omabox::reconcile::{ReconcileError, ReconcileOutcome, reconcile_once};
 use thiserror::Error;
 
@@ -91,6 +93,7 @@ fn run_session(config: &Config, journal: &mut Journal) -> Result<(), DaemonError
     tracing::info!("Omabox daemon started");
     let mut long_poll_backoff: Option<Duration> = None;
     loop {
+        activate_configured_root(config, journal)?;
         let outcome = match reconcile_once(
             journal,
             &dropbox,
@@ -158,6 +161,30 @@ fn run_session(config: &Config, journal: &mut Journal) -> Result<(), DaemonError
     }
 }
 
+fn activate_configured_root(config: &Config, journal: &mut Journal) -> Result<(), DaemonError> {
+    let binding =
+        LocalRootBinding::inspect(config.sync_root()).map_err(|source| DaemonError::Journal {
+            operation: "inspect the configured local root",
+            source,
+        })?;
+    match journal
+        .activate_local_root(&binding)
+        .map_err(|source| DaemonError::Journal {
+            operation: "activate the configured local root",
+            source,
+        })? {
+        LocalRootActivation::Current(_) => Ok(()),
+        LocalRootActivation::Activated(record) => {
+            tracing::info!(
+                generation = record.generation,
+                "initialized a new local sync-root generation"
+            );
+            Ok(())
+        }
+        LocalRootActivation::Busy => Err(DaemonError::LocalRootBusy),
+    }
+}
+
 fn wait_for_rate_limit(delay: Duration) {
     tracing::warn!(
         seconds = delay.as_secs(),
@@ -222,6 +249,15 @@ enum DaemonError {
         #[source]
         source: JournalError,
     },
+
+    #[error("the configured sync root changed while prior sync work is unfinished")]
+    #[diagnostic(
+        code(omabox::daemon::local_root_busy),
+        help(
+            "Restore the previous sync root in settings and let Omabox finish before selecting the new directory."
+        )
+    )]
+    LocalRootBusy,
 
     #[error("could not {operation}")]
     #[diagnostic(
