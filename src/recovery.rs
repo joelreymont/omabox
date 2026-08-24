@@ -1,13 +1,16 @@
 //! Verified recovery copies and direct replay of journaled operations.
 
+use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rustix::fs::{AtFlags, FileType, fsync, statat, unlinkat};
 use thiserror::Error;
 
 use crate::dropbox::{DropboxClient, DropboxError, MutationOutcome, RemotePathState};
 use crate::journal::{
     Journal, JournalError, OperationCompletion, PlanConflictCompletion, PlannedOperation,
-    RecordStatus, RecoveryCompletion, RecoveryRecord, RecoveryWrite,
+    RecordStatus, RecoveryCompletion, RecoveryForget, RecoveryRecord, RecoveryWrite,
 };
 use crate::local::{
     ConflictOutcome, ConflictSide, DeleteOutcome, InstallOutcome, LocalError, StageOutcome,
@@ -16,6 +19,9 @@ use crate::local::{
     open_root, open_root_file, recovery_file_name, stage_upload, verify_private_copy,
 };
 use crate::model::{Baseline, Conflict, ContentIdentity, LocalFile, Operation, RemoteFile};
+
+/// Completed recovery payloads remain available for this long before cleanup.
+pub const COMPLETED_RECOVERY_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// A recovery or replay failure.
 #[derive(Debug, Error)]
@@ -144,6 +150,154 @@ pub fn destination(
     recovery_directory
         .as_ref()
         .join(recovery_file_name(original_path.as_ref(), content))
+}
+
+/// Remove expired recovery payloads that no unfinished journal work can need.
+///
+/// Unknown entries and records whose payload is not a verified regular file are
+/// retained. The directory entry is synchronized before its completed journal
+/// record is forgotten, so interruption safely retries the same cleanup.
+pub fn prune_completed_recoveries(
+    journal: &mut Journal,
+    recovery_directory: impl AsRef<Path>,
+) -> Result<usize, RecoveryError> {
+    prune_completed_recoveries_at(journal, recovery_directory.as_ref(), SystemTime::now())
+}
+
+fn prune_completed_recoveries_at(
+    journal: &mut Journal,
+    recovery_directory: &Path,
+    now: SystemTime,
+) -> Result<usize, RecoveryError> {
+    let directory =
+        open_private_directory(recovery_directory, "open recovery directory for retention")?;
+    let mut forgotten = 0;
+    for record in journal.completed_recoveries()? {
+        if record.recovery_path
+            != destination(recovery_directory, &record.original_path, &record.content)
+        {
+            continue;
+        }
+        let name = recovery_file_name(&record.original_path, &record.content);
+        let before = match statat(&directory, &name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(metadata) => metadata,
+            Err(source) if source == rustix::io::Errno::NOENT => {
+                sync_retention_directory(&directory, recovery_directory)?;
+                forgotten += forget_recovery(journal, &record)?;
+                continue;
+            }
+            Err(source) => {
+                return Err(retention_io(
+                    "inspect retained recovery payload",
+                    &record.recovery_path,
+                    source,
+                ));
+            }
+        };
+        if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile
+            || !expired_recovery(&before, now)
+        {
+            continue;
+        }
+        match verify_private_copy(&directory, recovery_directory, &name, &record.content) {
+            Ok(true) => {}
+            Ok(false) => {
+                sync_retention_directory(&directory, recovery_directory)?;
+                forgotten += forget_recovery(journal, &record)?;
+                continue;
+            }
+            Err(
+                LocalError::CorruptPrivateFile { .. }
+                | LocalError::UnsupportedObject { .. }
+                | LocalError::ChangedDuringRead { .. }
+                | LocalError::DestinationOccupied { .. }
+                | LocalError::InvalidContentIdentity { .. }
+                | LocalError::UnsafeRelativePath { .. },
+            ) => continue,
+            Err(source) => return Err(source.into()),
+        }
+        let after = match statat(&directory, &name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(metadata) => metadata,
+            Err(source) if source == rustix::io::Errno::NOENT => {
+                sync_retention_directory(&directory, recovery_directory)?;
+                forgotten += forget_recovery(journal, &record)?;
+                continue;
+            }
+            Err(source) => {
+                return Err(retention_io(
+                    "reinspect retained recovery payload",
+                    &record.recovery_path,
+                    source,
+                ));
+            }
+        };
+        if FileType::from_raw_mode(after.st_mode) != FileType::RegularFile
+            || before.st_dev != after.st_dev
+            || before.st_ino != after.st_ino
+            || !expired_recovery(&after, now)
+        {
+            continue;
+        }
+        match unlinkat(&directory, &name, AtFlags::empty()) {
+            Ok(()) => {}
+            Err(source) if source == rustix::io::Errno::NOENT => {}
+            Err(source) => {
+                return Err(retention_io(
+                    "remove expired recovery payload",
+                    &record.recovery_path,
+                    source,
+                ));
+            }
+        }
+        sync_retention_directory(&directory, recovery_directory)?;
+        forgotten += forget_recovery(journal, &record)?;
+    }
+    Ok(forgotten)
+}
+
+fn expired_recovery(metadata: &rustix::fs::Stat, now: SystemTime) -> bool {
+    let Ok(seconds) = u64::try_from(metadata.st_mtime) else {
+        return false;
+    };
+    let Ok(nanoseconds) = u32::try_from(metadata.st_mtime_nsec) else {
+        return false;
+    };
+    if nanoseconds >= 1_000_000_000 {
+        return false;
+    }
+    let Some(modified) = UNIX_EPOCH.checked_add(Duration::new(seconds, nanoseconds)) else {
+        return false;
+    };
+    now.duration_since(modified)
+        .is_ok_and(|age| age >= COMPLETED_RECOVERY_RETENTION)
+}
+
+fn sync_retention_directory(
+    directory: &impl rustix::fd::AsFd,
+    path: &Path,
+) -> Result<(), RecoveryError> {
+    fsync(directory).map_err(|source| retention_io("sync recovery retention", path, source))
+}
+
+fn forget_recovery(journal: &mut Journal, record: &RecoveryRecord) -> Result<usize, RecoveryError> {
+    match journal.forget_completed_recovery(record.id)? {
+        RecoveryForget::Forgotten => Ok(1),
+        RecoveryForget::NotFound => Ok(0),
+        RecoveryForget::Pending => Err(RecoveryError::InvalidJournalState {
+            path: record.original_path.clone(),
+            detail: "completed recovery became pending during retention",
+        }),
+    }
+}
+
+fn retention_io(operation: &'static str, path: &Path, source: rustix::io::Errno) -> RecoveryError {
+    RecoveryError::Local {
+        source: LocalError::Io {
+            operation,
+            path: path.to_path_buf(),
+            source: io::Error::from_raw_os_error(source.raw_os_error()),
+        },
+    }
 }
 
 /// Materialize and verify the concrete copy described by a recovery record.
@@ -1018,5 +1172,256 @@ fn complete_final(
             path: path.to_path_buf(),
             detail: "journal rejected a completed durable effect",
         }),
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use std::error::Error;
+    use std::fs;
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
+
+    use tempfile::TempDir;
+
+    use super::{COMPLETED_RECOVERY_RETENTION, destination, prune_completed_recoveries_at};
+    use crate::journal::{
+        Journal, OperationCompletion, PlanRecord, PlanWrite, RecoveryCompletion, RecoveryForget,
+        RecoveryRecord, RecoveryWrite,
+    };
+    use crate::local::dropbox_content_hash;
+    use crate::model::{Baseline, ContentIdentity, LocalFile, Operation, OperationPlan};
+
+    #[test]
+    fn retention_expires_verified_payload_only_at_boundary() -> Result<(), Box<dyn Error>> {
+        let fixture = RetentionFixture::new()?;
+        let mut journal = Journal::open(&fixture.journal_path)?;
+        let content = dropbox_content_hash(&b"retained bytes"[..])?;
+        let (plan, recovery) = record_recovery(
+            &mut journal,
+            &fixture.recovery_directory,
+            Path::new("expired.txt"),
+            &content,
+        )?;
+        fs::write(&recovery.recovery_path, b"retained bytes")?;
+        complete_recovery_and_plan(&mut journal, &plan, &recovery)?;
+        let modified = fs::metadata(&recovery.recovery_path)?.modified()?;
+        let boundary = checked_add(modified, COMPLETED_RECOVERY_RETENTION)?;
+        let before_boundary = boundary
+            .checked_sub(Duration::from_nanos(1))
+            .ok_or_else(|| test_error("test timestamp underflowed"))?;
+
+        assert_eq!(
+            prune_completed_recoveries_at(
+                &mut journal,
+                &fixture.recovery_directory,
+                before_boundary,
+            )?,
+            0
+        );
+        assert!(recovery.recovery_path.is_file());
+        assert_eq!(
+            prune_completed_recoveries_at(&mut journal, &fixture.recovery_directory, boundary,)?,
+            1
+        );
+        assert!(!recovery.recovery_path.exists());
+        assert_eq!(
+            journal.forget_completed_recovery(recovery.id)?,
+            RecoveryForget::NotFound
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retention_keeps_pending_corrupt_nonregular_and_orphan_entries() -> Result<(), Box<dyn Error>>
+    {
+        let fixture = RetentionFixture::new()?;
+        let mut journal = Journal::open(&fixture.journal_path)?;
+
+        let pending_content = dropbox_content_hash(&b"pending bytes"[..])?;
+        let (_, pending) = record_recovery(
+            &mut journal,
+            &fixture.recovery_directory,
+            Path::new("pending.txt"),
+            &pending_content,
+        )?;
+        fs::write(&pending.recovery_path, b"pending bytes")?;
+
+        let blocked_content = dropbox_content_hash(&b"blocked bytes"[..])?;
+        let (_, blocked) = record_recovery(
+            &mut journal,
+            &fixture.recovery_directory,
+            Path::new("blocked.txt"),
+            &blocked_content,
+        )?;
+        fs::write(&blocked.recovery_path, b"blocked bytes")?;
+        assert_eq!(
+            journal.complete_recovery(blocked.id)?,
+            RecoveryCompletion::Completed
+        );
+
+        let corrupt_content = dropbox_content_hash(&b"expected bytes"[..])?;
+        let (corrupt_plan, corrupt) = record_recovery(
+            &mut journal,
+            &fixture.recovery_directory,
+            Path::new("corrupt.txt"),
+            &corrupt_content,
+        )?;
+        fs::write(&corrupt.recovery_path, b"different bytes")?;
+        complete_recovery_and_plan(&mut journal, &corrupt_plan, &corrupt)?;
+
+        let nonregular_content = dropbox_content_hash(&b"directory bytes"[..])?;
+        let (nonregular_plan, nonregular) = record_recovery(
+            &mut journal,
+            &fixture.recovery_directory,
+            Path::new("nonregular.txt"),
+            &nonregular_content,
+        )?;
+        fs::create_dir(&nonregular.recovery_path)?;
+        complete_recovery_and_plan(&mut journal, &nonregular_plan, &nonregular)?;
+
+        let orphan = fixture.recovery_directory.join("unknown-orphan");
+        fs::write(&orphan, b"unknown bytes")?;
+        let after_retention = checked_add(SystemTime::now(), COMPLETED_RECOVERY_RETENTION)?;
+
+        assert_eq!(
+            prune_completed_recoveries_at(
+                &mut journal,
+                &fixture.recovery_directory,
+                after_retention,
+            )?,
+            0
+        );
+        assert!(pending.recovery_path.is_file());
+        assert!(blocked.recovery_path.is_file());
+        assert!(corrupt.recovery_path.is_file());
+        assert!(nonregular.recovery_path.is_dir());
+        assert!(orphan.is_file());
+        assert_eq!(journal.pending_recoveries()?, vec![pending]);
+        let eligible = journal.completed_recoveries()?;
+        assert_eq!(eligible.len(), 2);
+        assert!(eligible.iter().any(|record| record.id == corrupt.id));
+        assert!(eligible.iter().any(|record| record.id == nonregular.id));
+        Ok(())
+    }
+
+    #[test]
+    fn retention_finishes_metadata_cleanup_after_payload_deletion() -> Result<(), Box<dyn Error>> {
+        let fixture = RetentionFixture::new()?;
+        let mut journal = Journal::open(&fixture.journal_path)?;
+        let content = dropbox_content_hash(&b"deleted before retry"[..])?;
+        let (plan, recovery) = record_recovery(
+            &mut journal,
+            &fixture.recovery_directory,
+            Path::new("interrupted.txt"),
+            &content,
+        )?;
+        fs::write(&recovery.recovery_path, b"deleted before retry")?;
+        complete_recovery_and_plan(&mut journal, &plan, &recovery)?;
+        fs::remove_file(&recovery.recovery_path)?;
+
+        assert_eq!(
+            prune_completed_recoveries_at(
+                &mut journal,
+                &fixture.recovery_directory,
+                SystemTime::now(),
+            )?,
+            1
+        );
+        assert_eq!(
+            journal.forget_completed_recovery(recovery.id)?,
+            RecoveryForget::NotFound
+        );
+        Ok(())
+    }
+
+    struct RetentionFixture {
+        _directory: TempDir,
+        journal_path: PathBuf,
+        recovery_directory: PathBuf,
+    }
+
+    impl RetentionFixture {
+        fn new() -> Result<Self, Box<dyn Error>> {
+            let directory = TempDir::new()?;
+            let journal_path = directory.path().join("journal.sqlite3");
+            let recovery_directory = directory.path().join("recovery");
+            fs::create_dir(&recovery_directory)?;
+            Ok(Self {
+                _directory: directory,
+                journal_path,
+                recovery_directory,
+            })
+        }
+    }
+
+    fn record_recovery(
+        journal: &mut Journal,
+        recovery_directory: &Path,
+        original_path: &Path,
+        content: &ContentIdentity,
+    ) -> Result<(PlanRecord, RecoveryRecord), Box<dyn Error>> {
+        let operations = OperationPlan::new(vec![
+            Operation::PreserveLocal {
+                file: LocalFile::new(content.clone()),
+            },
+            Operation::DeleteLocal {
+                expected_content: content.clone(),
+            },
+        ]);
+        let plan = match journal.record_plan(original_path, &operations)? {
+            PlanWrite::Recorded(plan) => plan,
+            PlanWrite::AlreadyPending(_) => {
+                return Err(test_error("test path unexpectedly had a pending plan").into());
+            }
+        };
+        let [_, destructive] = plan.operations.as_slice() else {
+            return Err(test_error("test plan did not contain two operations").into());
+        };
+        let recovery_path = destination(recovery_directory, original_path, content);
+        let recovery = match journal.record_recovery_intent(destructive.id, &recovery_path)? {
+            RecoveryWrite::Recorded(recovery) => recovery,
+            RecoveryWrite::AlreadyRecorded(_)
+            | RecoveryWrite::OperationNotFound
+            | RecoveryWrite::OperationCompleted
+            | RecoveryWrite::OperationNotDestructive => {
+                return Err(test_error("test recovery intent was not recorded").into());
+            }
+        };
+        Ok((plan, recovery))
+    }
+
+    fn complete_recovery_and_plan(
+        journal: &mut Journal,
+        plan: &PlanRecord,
+        recovery: &RecoveryRecord,
+    ) -> Result<(), Box<dyn Error>> {
+        if journal.complete_recovery(recovery.id)? != RecoveryCompletion::Completed {
+            return Err(test_error("test recovery was not completed").into());
+        }
+        let [preservation, destructive] = plan.operations.as_slice() else {
+            return Err(test_error("test plan did not contain two operations").into());
+        };
+        if journal.complete_operation(preservation.id, None)?
+            != OperationCompletion::OperationCompleted
+        {
+            return Err(test_error("test preservation operation was not completed").into());
+        }
+        if journal.complete_operation(destructive.id, Some(&Baseline::Absent))?
+            != OperationCompletion::PlanCompleted
+        {
+            return Err(test_error("test destructive plan was not completed").into());
+        }
+        Ok(())
+    }
+
+    fn checked_add(time: SystemTime, duration: Duration) -> Result<SystemTime, io::Error> {
+        time.checked_add(duration)
+            .ok_or_else(|| test_error("test timestamp overflowed"))
+    }
+
+    fn test_error(detail: &'static str) -> io::Error {
+        io::Error::other(detail)
     }
 }
