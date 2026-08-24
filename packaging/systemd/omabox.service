@@ -3,7 +3,7 @@ Description=Omabox Dropbox sync service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/omaboxd
+ExecStart=%h/.local/bin/omaboxd
 Restart=on-failure
 RestartSec=5s
 UMask=0077

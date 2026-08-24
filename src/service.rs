@@ -90,6 +90,23 @@ impl ServiceCommands {
         }
     }
 
+    /// Return whether the user service is enabled at login.
+    pub fn is_enabled(&self) -> Result<bool, ServiceError> {
+        self.query_state("is-enabled", "systemctl is-enabled")
+    }
+
+    /// Reload user service unit files after installation changes.
+    pub fn daemon_reload(&self) -> Result<(), ServiceError> {
+        let status = Command::new(&self.systemctl)
+            .args(["--user", "daemon-reload"])
+            .status()
+            .map_err(|source| ServiceError::StartCommand {
+                command: "systemctl daemon-reload",
+                source,
+            })?;
+        status_result(status, "systemctl daemon-reload")
+    }
+
     /// Run one direct systemctl operation.
     pub fn control(&self, action: ServiceAction) -> Result<(), ServiceError> {
         let mut command = Command::new(&self.systemctl);
@@ -136,6 +153,47 @@ impl ServiceCommands {
                 command: "journalctl",
             }),
         }
+    }
+
+    fn query_state(
+        &self,
+        argument: &'static str,
+        command_name: &'static str,
+    ) -> Result<bool, ServiceError> {
+        let status = Command::new(&self.systemctl)
+            .args(["--user", argument, "--quiet", UNIT])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|source| ServiceError::StartCommand {
+                command: command_name,
+                source,
+            })?;
+        match status.code() {
+            Some(0) => Ok(true),
+            Some(1 | 3 | 4) => Ok(false),
+            Some(code) => Err(ServiceError::Unsuccessful {
+                command: command_name,
+                status: Some(code),
+            }),
+            None => Err(ServiceError::Terminated {
+                command: command_name,
+            }),
+        }
+    }
+}
+
+fn status_result(
+    status: std::process::ExitStatus,
+    command: &'static str,
+) -> Result<(), ServiceError> {
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(code) => Err(ServiceError::Unsuccessful {
+            command,
+            status: Some(code),
+        }),
+        None => Err(ServiceError::Terminated { command }),
     }
 }
 

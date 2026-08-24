@@ -9,6 +9,7 @@ use miette::Diagnostic;
 use omabox::auth::{AuthError, AuthorizationGrant, OAuthClient, RefreshTokenStore};
 use omabox::config::{Config, ConfigError, InstanceLock, LockError, XdgDirectories};
 use omabox::dropbox::{DropboxClient, DropboxError, DropboxLink};
+use omabox::install::{InstallAction, InstallError};
 use omabox::journal::{DropboxBindingWrite, Journal, JournalError};
 use omabox::service::{ServiceAction, ServiceCommands, ServiceError};
 use omabox::status::{self, StatusError};
@@ -16,7 +17,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 const HELP: &str = "Omabox synchronizes a local directory with Dropbox.\n\n\
-Usage:\n  omabox setup [REMOTE_ROOT]\n  omabox setup --sync-root PATH --app-key KEY [--remote-root ROOT]\n  omabox status\n  omabox settings [--json]\n  omabox settings set-root PATH\n  omabox service start|stop|restart|enable|disable|status\n  omabox logs\n  omabox --help\n  omabox --version\n\n\
+Usage:\n  omabox setup [REMOTE_ROOT]\n  omabox setup --sync-root PATH --app-key KEY [--remote-root ROOT]\n  omabox status\n  omabox settings [--json]\n  omabox settings set-root PATH\n  omabox install|upgrade|uninstall\n  omabox service start|stop|restart|enable|disable|status\n  omabox logs\n  omabox --help\n  omabox --version\n\n\
 The Dropbox app key is public. Omabox never requests or stores an app secret.\n";
 const USAGE: &str = "Run `omabox --help` for usage.";
 const AUTHORIZATION_CODE_LIMIT: usize = 8192;
@@ -37,6 +38,10 @@ fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
         Command::Status => show_status(),
         Command::Settings { json } => show_settings(json),
         Command::SetRoot(path) => set_sync_root_from_environment(&path),
+        Command::Install(action) => {
+            let report = omabox::install::execute(action).map_err(CliError::Install)?;
+            write_stdout(&report)
+        }
         Command::Service(action) => ServiceCommands::default()
             .control(action)
             .map_err(CliError::Service),
@@ -52,6 +57,7 @@ enum Command {
     Status,
     Settings { json: bool },
     SetRoot(PathBuf),
+    Install(InstallAction),
     Service(ServiceAction),
     Logs,
 }
@@ -79,11 +85,15 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, CliEr
         Some("setup") => parse_setup(rest).map(Command::Setup),
         Some("status") if rest.is_empty() => Ok(Command::Status),
         Some("settings") => parse_settings(rest),
+        Some("install") if rest.is_empty() => Ok(Command::Install(InstallAction::Install)),
+        Some("upgrade") if rest.is_empty() => Ok(Command::Install(InstallAction::Upgrade)),
+        Some("uninstall") if rest.is_empty() => Ok(Command::Install(InstallAction::Uninstall)),
         Some("service") => parse_service(rest),
         Some("logs") if rest.is_empty() => Ok(Command::Logs),
-        Some("status" | "logs" | "--help" | "-h" | "help" | "--version" | "-V") => {
-            Err(CliError::Usage("too many arguments"))
-        }
+        Some(
+            "status" | "logs" | "install" | "upgrade" | "uninstall" | "--help" | "-h" | "help"
+            | "--version" | "-V",
+        ) => Err(CliError::Usage("too many arguments")),
         Some(_) => Err(CliError::Usage("unknown command")),
         None => Err(CliError::Usage("the command must be valid UTF-8")),
     }
@@ -602,6 +612,10 @@ enum CliError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Status(#[from] StatusError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Install(#[from] InstallError),
 }
 
 #[cfg(test)]
@@ -702,6 +716,18 @@ mod tests {
             Command::Service(ServiceAction::Restart)
         );
         assert_eq!(parse(arguments(&["logs"]))?, Command::Logs);
+        assert_eq!(
+            parse(arguments(&["install"]))?,
+            Command::Install(InstallAction::Install)
+        );
+        assert_eq!(
+            parse(arguments(&["upgrade"]))?,
+            Command::Install(InstallAction::Upgrade)
+        );
+        assert_eq!(
+            parse(arguments(&["uninstall"]))?,
+            Command::Install(InstallAction::Uninstall)
+        );
         Ok(())
     }
 
@@ -711,6 +737,7 @@ mod tests {
             Vec::<OsString>::new(),
             arguments(&["unknown"]),
             arguments(&["status", "extra"]),
+            arguments(&["install", "extra"]),
             arguments(&["setup", "--sync-root", "/tmp/Dropbox"]),
             arguments(&[
                 "setup",
