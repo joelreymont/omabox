@@ -270,6 +270,17 @@ pub struct PlanId(i64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationId(i64);
 
+impl OperationId {
+    pub(crate) fn to_be_bytes(self) -> [u8; 8] {
+        self.0.to_be_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(value: i64) -> Self {
+        Self(value)
+    }
+}
+
 /// Durable identity of a recovery record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecoveryId(i64);

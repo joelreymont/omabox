@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -18,7 +20,7 @@ use omabox::journal::{
 };
 use omabox::local::{
     InstallOutcome, StageOutcome, StagedUpload, dropbox_content_hash, install_download,
-    stage_upload,
+    stage_download, stage_upload,
 };
 use omabox::model::{
     Baseline, Conflict, ContentIdentity, Decision, DropboxRevision, LocalFile, Observation,
@@ -44,7 +46,8 @@ fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result
         "path_lower": "/sync/alpha.txt",
         "path_display": "/Sync/Alpha.txt",
         "rev": "rev-a",
-        "content_hash": identity.as_str()
+        "content_hash": identity.as_str(),
+        "size": bytes.len()
     })
     .to_string();
     let server = FakeServer::start(vec![
@@ -107,7 +110,9 @@ fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result
             "has_more": false
         })),
         FakeResponse::json(json!({"changes": true, "backoff": 2})),
-        FakeResponse::bytes(bytes.to_vec()).header("Dropbox-API-Result", download_metadata),
+        FakeResponse::bytes(bytes.to_vec())
+            .without_content_length()
+            .header("Dropbox-API-Result", download_metadata),
     ])?;
     let endpoints = server.endpoints();
     let oauth = OAuthClient::with_endpoints("app-key", endpoints.clone());
@@ -194,6 +199,80 @@ fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result
 }
 
 #[test]
+fn exact_download_retry_reuses_a_stage_without_consuming_the_body() -> Result<(), Box<dyn Error>> {
+    let bytes = b"already staged Dropbox bytes";
+    let content = dropbox_content_hash(bytes.as_slice())?;
+    let remote = RemoteFile::new(content.clone(), DropboxRevision::new("staged-revision"));
+    let metadata = download_metadata(
+        "staged.txt",
+        remote.revision.as_str(),
+        &content,
+        bytes.len(),
+    );
+    let server = FakeServer::start(vec![
+        FakeResponse::bytes(bytes.to_vec()).header("Dropbox-API-Result", metadata),
+    ])?;
+    let client = fake_client(&server, "opaque-access-staged")?;
+    let root = TempDir::new()?;
+
+    assert!(matches!(
+        client.stage_exact_download(root.path(), Path::new("staged.txt"), &remote)?,
+        StageOutcome::Staged(())
+    ));
+    assert!(matches!(
+        client.stage_exact_download(root.path(), Path::new("staged.txt"), &remote)?,
+        StageOutcome::AlreadyStaged(())
+    ));
+    assert_eq!(server.finish()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn exact_download_stage_race_still_counts_the_response_body() -> Result<(), Box<dyn Error>> {
+    let bytes = b"complete expected Dropbox bytes";
+    let content = dropbox_content_hash(bytes.as_slice())?;
+    let remote = RemoteFile::new(content.clone(), DropboxRevision::new("raced-revision"));
+    let response = FakeResponse::bytes(b"short".to_vec())
+        .header(
+            "Dropbox-API-Result",
+            download_metadata("raced.txt", remote.revision.as_str(), &content, bytes.len()),
+        )
+        .without_content_length();
+    let (response, gate) = response.gated();
+    let server = FakeServer::start(vec![response])?;
+    let client = fake_client(&server, "opaque-access-raced-stage")?;
+    let root = TempDir::new()?;
+    let target = Path::new("raced.txt");
+
+    let outcome = thread::scope(|scope| -> Result<_, Box<dyn Error>> {
+        let worker = thread::Builder::new().spawn_scoped(scope, || {
+            client.stage_exact_download(root.path(), target, &remote)
+        })?;
+        gate.request_received.recv().map_err(|_| {
+            io::Error::other("fake Dropbox server stopped before receiving the request")
+        })?;
+        let staged = stage_download(root.path(), target, &content, bytes.as_slice());
+        let release = gate
+            .release_response
+            .send(())
+            .map_err(|_| io::Error::other("fake Dropbox response worker stopped before release"));
+        assert!(matches!(staged?, StageOutcome::Staged(())));
+        release?;
+        worker
+            .join()
+            .map_err(|_| io::Error::other("exact-download worker stopped unexpectedly"))
+            .map_err(Into::into)
+    })?;
+
+    assert!(matches!(
+        outcome,
+        Err(DropboxError::DownloadedLengthChanged)
+    ));
+    assert_eq!(server.finish()?.len(), 1);
+    Ok(())
+}
+
+#[test]
 fn one_reconciliation_pass_synchronizes_files_in_both_directions() -> Result<(), Box<dyn Error>> {
     let upload_bytes = b"local upload";
     let download_bytes = b"remote download";
@@ -221,7 +300,12 @@ fn one_reconciliation_pass_synchronizes_files_in_both_directions() -> Result<(),
         })),
         FakeResponse::bytes(download_bytes.to_vec()).header(
             "Dropbox-API-Result",
-            download_metadata("download.txt", "rev-download", &download_content),
+            download_metadata(
+                "download.txt",
+                "rev-download",
+                &download_content,
+                download_bytes.len(),
+            ),
         ),
         FakeResponse::json(file_metadata(
             "/upload.txt",
@@ -539,7 +623,12 @@ fn pending_exact_downloads_use_bounded_parallel_workers() -> Result<(), Box<dyn 
     let bytes = b"bounded parallel download";
     let content = dropbox_content_hash(bytes.as_slice())?;
     let remote = RemoteFile::new(content.clone(), DropboxRevision::new("shared-revision"));
-    let metadata = download_metadata("shared.txt", remote.revision.as_str(), &content);
+    let metadata = download_metadata(
+        "shared.txt",
+        remote.revision.as_str(),
+        &content,
+        bytes.len(),
+    );
     let responses = (0..DOWNLOAD_COUNT)
         .map(|_| {
             FakeResponse::bytes(bytes.to_vec())
@@ -597,13 +686,248 @@ fn pending_exact_downloads_use_bounded_parallel_workers() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn interrupted_exact_download_resumes_only_from_a_valid_range() -> Result<(), Box<dyn Error>> {
+    const CHECKPOINT: usize = 64 * 1024 * 1024;
+    const DROPBOX_BLOCK: usize = 4 * 1024 * 1024;
+
+    let bytes = vec![b'x'; CHECKPOINT + DROPBOX_BLOCK + 257];
+    let content = dropbox_content_hash(bytes.as_slice())?;
+    let remote = RemoteFile::new(content.clone(), DropboxRevision::new("resume-revision"));
+    let metadata = download_metadata(
+        "resume.bin",
+        remote.revision.as_str(),
+        &content,
+        bytes.len(),
+    );
+    let changed_content = dropbox_content_hash(b"different resumed bytes".as_slice())?;
+    let changed_revision =
+        download_metadata("resume.bin", "different-revision", &content, bytes.len());
+    let changed_hash = download_metadata(
+        "resume.bin",
+        remote.revision.as_str(),
+        &changed_content,
+        bytes.len(),
+    );
+    let changed_size = download_metadata(
+        "resume.bin",
+        remote.revision.as_str(),
+        &content,
+        CHECKPOINT - 1,
+    );
+    let end = bytes.len() - 1;
+    let valid_range = format!("bytes {CHECKPOINT}-{end}/{}", bytes.len());
+    let responses = vec![
+        FakeResponse::bytes(bytes.clone())
+            .header("Dropbox-API-Result", metadata.clone())
+            .disconnect_after(CHECKPOINT + DROPBOX_BLOCK + 17),
+        FakeResponse::bytes(Vec::new()).header("Dropbox-API-Result", metadata.clone()),
+        FakeResponse::range(
+            Vec::new(),
+            metadata.clone(),
+            format!("bytes {}-{end}/{}", CHECKPOINT + 1, bytes.len()),
+        ),
+        FakeResponse::range(
+            Vec::new(),
+            metadata.clone(),
+            format!("bytes {CHECKPOINT}-{}/{}", end - 1, bytes.len()),
+        ),
+        FakeResponse::range(
+            Vec::new(),
+            metadata.clone(),
+            format!("bytes {CHECKPOINT}-{end}/{}", bytes.len() + 1),
+        ),
+        FakeResponse::range(Vec::new(), changed_revision, valid_range.clone()),
+        FakeResponse::range(Vec::new(), changed_hash, valid_range.clone()),
+        FakeResponse::range(Vec::new(), changed_size, valid_range.clone()),
+        FakeResponse::range(Vec::new(), metadata.clone(), valid_range.clone()),
+        FakeResponse::range(bytes[CHECKPOINT..].to_vec(), metadata, valid_range),
+    ];
+    let server = FakeServer::start(responses)?;
+    let client = fake_client(&server, "opaque-access-resume")?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    let operation_plan = planned_operations(plan(
+        &Baseline::Absent,
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(remote.clone()),
+    ))?;
+    if !matches!(
+        journal.record_plan(Path::new("resume.bin"), &operation_plan)?,
+        PlanWrite::Recorded(_)
+    ) {
+        return Err(io::Error::other("fresh resume plan was already pending").into());
+    }
+
+    assert!(replay_pending(&mut journal, &client, &root, &staging, &recovery).is_err());
+    let partial = std::fs::read_dir(&staging)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".omabox-download-slot-"))
+        })
+        .ok_or_else(|| io::Error::other("interrupted download did not retain its slot"))?;
+    assert_eq!(
+        std::fs::metadata(&partial)?.len(),
+        u64::try_from(CHECKPOINT + DROPBOX_BLOCK)?
+    );
+    assert!(matches!(
+        replay_pending(&mut journal, &client, &root, &staging, &recovery),
+        Err(ReconcileError::RemoteDownload {
+            source: DropboxError::InvalidDownloadRange,
+            ..
+        })
+    ));
+    assert_eq!(
+        std::fs::metadata(&partial)?.len(),
+        u64::try_from(CHECKPOINT)?
+    );
+    assert!(matches!(
+        replay_pending(&mut journal, &client, &root, &staging, &recovery),
+        Err(ReconcileError::RemoteDownload {
+            source: DropboxError::InvalidDownloadRange,
+            ..
+        })
+    ));
+    assert!(matches!(
+        replay_pending(&mut journal, &client, &root, &staging, &recovery),
+        Err(ReconcileError::RemoteDownload {
+            source: DropboxError::InvalidDownloadRange,
+            ..
+        })
+    ));
+    assert!(matches!(
+        replay_pending(&mut journal, &client, &root, &staging, &recovery),
+        Err(ReconcileError::RemoteDownload {
+            source: DropboxError::InvalidDownloadRange,
+            ..
+        })
+    ));
+    assert!(matches!(
+        replay_pending(&mut journal, &client, &root, &staging, &recovery),
+        Err(ReconcileError::RemoteDownload {
+            source: DropboxError::DownloadedRevisionChanged,
+            ..
+        })
+    ));
+    assert!(matches!(
+        replay_pending(&mut journal, &client, &root, &staging, &recovery),
+        Err(ReconcileError::RemoteDownload {
+            source: DropboxError::DownloadedIdentityChanged,
+            ..
+        })
+    ));
+    assert!(matches!(
+        replay_pending(&mut journal, &client, &root, &staging, &recovery),
+        Err(ReconcileError::RemoteDownload {
+            source: DropboxError::DownloadedSizeChanged,
+            ..
+        })
+    ));
+    assert!(matches!(
+        replay_pending(&mut journal, &client, &root, &staging, &recovery),
+        Err(ReconcileError::RemoteDownload {
+            source: DropboxError::DownloadedLengthChanged,
+            ..
+        })
+    ));
+    let report = replay_pending(&mut journal, &client, &root, &staging, &recovery)?;
+    assert_eq!(report.completed_operations, 1);
+    assert_eq!(std::fs::read(root.join("resume.bin"))?, bytes);
+    assert!(journal.pending_plans()?.is_empty());
+
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 10);
+    assert!(header(&requests[0], "range").is_none());
+    for request in &requests[1..] {
+        assert_eq!(header(request, "range"), Some("bytes=67108864-"));
+    }
+    Ok(())
+}
+
+#[test]
+fn unknown_download_slots_are_preserved_with_disposable_fallback() -> Result<(), Box<dyn Error>> {
+    let bytes = b"fallback download";
+    let content = dropbox_content_hash(bytes.as_slice())?;
+    let remote = RemoteFile::new(content.clone(), DropboxRevision::new("fallback-revision"));
+    let server = FakeServer::start(vec![FakeResponse::bytes(bytes.to_vec()).header(
+        "Dropbox-API-Result",
+        download_metadata(
+            "fallback.txt",
+            remote.revision.as_str(),
+            &content,
+            bytes.len(),
+        ),
+    )])?;
+    let client = fake_client(&server, "opaque-access-fallback")?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let socket_path = staging.join(".omabox-download-slot-0");
+    let _socket = UnixListener::bind(&socket_path)?;
+    for slot in 1..4 {
+        std::fs::write(
+            staging.join(format!(".omabox-download-slot-{slot}")),
+            format!("unknown-{slot}"),
+        )?;
+    }
+    let read_only_path = staging.join(".omabox-download-slot-1");
+    std::fs::set_permissions(&read_only_path, std::fs::Permissions::from_mode(0o400))?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    let operations = planned_operations(plan(
+        &Baseline::Absent,
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(remote),
+    ))?;
+    let _ = journal.record_plan(Path::new("fallback.txt"), &operations)?;
+
+    let report = replay_pending(&mut journal, &client, &root, &staging, &recovery)?;
+
+    assert_eq!(report.completed_operations, 1);
+    assert_eq!(std::fs::read(root.join("fallback.txt"))?, bytes);
+    assert!(
+        std::fs::symlink_metadata(&socket_path)?
+            .file_type()
+            .is_socket()
+    );
+    for slot in 1..4 {
+        assert_eq!(
+            std::fs::read_to_string(staging.join(format!(".omabox-download-slot-{slot}")))?,
+            format!("unknown-{slot}")
+        );
+    }
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 1);
+    assert!(header(&requests[0], "range").is_none());
+    Ok(())
+}
+
+#[test]
 fn root_swap_after_replay_validation_never_touches_the_replacement() -> Result<(), Box<dyn Error>> {
     let bytes = b"descriptor-bound download";
     let content = dropbox_content_hash(bytes.as_slice())?;
     let remote = RemoteFile::new(content.clone(), DropboxRevision::new("root-swap-revision"));
     let response = FakeResponse::bytes(bytes.to_vec()).header(
         "Dropbox-API-Result",
-        download_metadata("download.txt", remote.revision.as_str(), &content),
+        download_metadata(
+            "download.txt",
+            remote.revision.as_str(),
+            &content,
+            bytes.len(),
+        ),
     );
     let (response, gate) = response.gated();
     let server = FakeServer::start(vec![response])?;
@@ -692,7 +1016,7 @@ fn completed_download_batch_is_installed_before_the_next_batch_fails() -> Result
     let bytes = b"install each bounded batch";
     let content = dropbox_content_hash(bytes.as_slice())?;
     let remote = RemoteFile::new(content.clone(), DropboxRevision::new("batch-revision"));
-    let metadata = download_metadata("batch.txt", remote.revision.as_str(), &content);
+    let metadata = download_metadata("batch.txt", remote.revision.as_str(), &content, bytes.len());
     let mut responses = (0..COMPLETED_BATCH)
         .map(|_| FakeResponse::bytes(bytes.to_vec()).header("Dropbox-API-Result", metadata.clone()))
         .collect::<Vec<_>>();
@@ -747,7 +1071,7 @@ fn corrupt_exact_download_never_leaves_installable_bytes() -> Result<(), Box<dyn
     let actual = dropbox_content_hash(corrupt_bytes.as_slice())?;
     let server = FakeServer::start(vec![FakeResponse::bytes(corrupt_bytes.to_vec()).header(
         "Dropbox-API-Result",
-        download_metadata("corrupt.txt", "rev-corrupt", &expected),
+        download_metadata("corrupt.txt", "rev-corrupt", &expected, corrupt_bytes.len()),
     )])?;
     let client = fake_client(&server, "opaque-access-corrupt")?;
     let root = TempDir::new()?;
@@ -1187,8 +1511,13 @@ fn remote_replay_preserves_old_revision_and_retires_a_replacement_conflict()
         dropbox_content_hash(remote_bytes.as_slice())?,
         DropboxRevision::new("current-rev"),
     );
-    let old_metadata = download_metadata("replace.txt", "old-rev", &old.content);
-    let current_metadata = download_metadata("replace.txt", "current-rev", &current.content);
+    let old_metadata = download_metadata("replace.txt", "old-rev", &old.content, old_bytes.len());
+    let current_metadata = download_metadata(
+        "replace.txt",
+        "current-rev",
+        &current.content,
+        remote_bytes.len(),
+    );
     let server = FakeServer::start(vec![
         FakeResponse::bytes(old_bytes.to_vec()).header("Dropbox-API-Result", old_metadata),
         FakeResponse::status_json(409, json!({"error": {".tag": "path"}})),
@@ -1411,7 +1740,7 @@ fn remote_replay_rebuilds_missing_recovery_and_leaves_ambiguous_create_pending()
         omabox::journal::OperationCompletion::OperationCompleted
     ));
     let recovery_path = destination(&recovery, Path::new("delete.txt"), &old.content);
-    let delete_metadata = download_metadata("delete.txt", "old-rev", &old.content);
+    let delete_metadata = download_metadata("delete.txt", "old-rev", &old.content, old_bytes.len());
     let delete_server = FakeServer::start(vec![
         FakeResponse::bytes(old_bytes.to_vec()).header("Dropbox-API-Result", delete_metadata),
         FakeResponse::json(json!({
@@ -1916,14 +2245,15 @@ fn file_metadata(
     })
 }
 
-fn download_metadata(path: &str, revision: &str, content: &ContentIdentity) -> String {
+fn download_metadata(path: &str, revision: &str, content: &ContentIdentity, size: usize) -> String {
     json!({
         ".tag": "file",
         "name": path,
         "path_lower": format!("/{path}"),
         "path_display": format!("/{path}"),
         "rev": revision,
-        "content_hash": content.as_str()
+        "content_hash": content.as_str(),
+        "size": size
     })
     .to_string()
 }
@@ -2063,6 +2393,8 @@ struct FakeResponse {
     body: Vec<u8>,
     headers: Vec<(String, String)>,
     delay: Duration,
+    disconnect_after: Option<usize>,
+    send_content_length: bool,
     gate: Option<ResponseGate>,
 }
 
@@ -2090,6 +2422,8 @@ impl FakeResponse {
                 String::from("application/json"),
             )],
             delay: Duration::ZERO,
+            disconnect_after: None,
+            send_content_length: true,
             gate: None,
         }
     }
@@ -2103,6 +2437,23 @@ impl FakeResponse {
                 String::from("application/octet-stream"),
             )],
             delay: Duration::ZERO,
+            disconnect_after: None,
+            send_content_length: true,
+            gate: None,
+        }
+    }
+
+    fn range(body: Vec<u8>, metadata: String, content_range: String) -> Self {
+        Self {
+            status: 206,
+            body,
+            headers: vec![
+                (String::from("Dropbox-API-Result"), metadata),
+                (String::from("Content-Range"), content_range),
+            ],
+            delay: Duration::ZERO,
+            disconnect_after: None,
+            send_content_length: true,
             gate: None,
         }
     }
@@ -2114,6 +2465,16 @@ impl FakeResponse {
 
     fn delay(mut self, delay: Duration) -> Self {
         self.delay = delay;
+        self
+    }
+
+    fn disconnect_after(mut self, bytes: usize) -> Self {
+        self.disconnect_after = Some(bytes);
+        self
+    }
+
+    fn without_content_length(mut self) -> Self {
+        self.send_content_length = false;
         self
     }
 
@@ -2235,16 +2596,17 @@ fn write_response(stream: &mut TcpStream, response: FakeResponse) -> io::Result<
     } else {
         "Test Response"
     };
-    write!(
-        stream,
-        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        response.status,
-        reason,
-        response.body.len()
-    )?;
+    write!(stream, "HTTP/1.1 {} {}\r\n", response.status, reason)?;
+    if response.send_content_length {
+        write!(stream, "Content-Length: {}\r\n", response.body.len())?;
+    }
+    stream.write_all(b"Connection: close\r\n")?;
     for (name, value) in response.headers {
         write!(stream, "{name}: {value}\r\n")?;
     }
     stream.write_all(b"\r\n")?;
-    stream.write_all(&response.body)
+    let sent = response
+        .disconnect_after
+        .map_or(response.body.len(), |limit| limit.min(response.body.len()));
+    stream.write_all(&response.body[..sent])
 }

@@ -15,7 +15,8 @@ use crate::journal::{
     PlanWrite, RemoteObservationRecord, dropbox_canonical_path,
 };
 use crate::local::{
-    LocalError, ScanPublication, StageOutcome, StagedUpload, configured_root_is_active,
+    DownloadSlotIdentity, DownloadSlotLease, LocalError, MAX_PARALLEL_DOWNLOADS, ScanPublication,
+    StageOutcome, StagedUpload, configured_root_is_active, lease_download_slots,
     observe_upload_source, open_active_root, remove_unreferenced_upload_stages, scan_and_publish,
     stage_upload,
 };
@@ -27,8 +28,6 @@ use crate::recovery::{
     prune_completed_recoveries, replay_local_operations_at, replay_local_plans_at,
     replay_remote_operations_at,
 };
-
-const MAX_PARALLEL_DOWNLOADS: usize = 4;
 
 /// A reconciliation failure. Expected observation races are returned as outcomes instead.
 #[derive(Debug, Error)]
@@ -181,6 +180,10 @@ pub fn replay_pending(
     let Some(root) = open_active_root(journal, sync_root)? else {
         return Err(ReconcileError::LocalRootChanged);
     };
+    let root_generation = journal
+        .local_root_binding()?
+        .ok_or(ReconcileError::LocalRootChanged)?
+        .generation;
     let mut report = replay_local_operations_at(journal, &root, sync_root, recovery_directory)?;
     let missing_downloads = report
         .blocked
@@ -190,6 +193,9 @@ pub fn replay_pending(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
+    if missing_downloads.is_empty() {
+        let _ = lease_download_slots(upload_staging, &[])?;
+    }
     if !missing_downloads.is_empty() {
         let mut pending = journal
             .pending_plans()?
@@ -204,7 +210,7 @@ pub fn replay_pending(
                     "pending download blocker has no matching plan",
                 ));
             };
-            let source = plan
+            let (operation_id, source) = plan
                 .operations
                 .iter()
                 .find_map(|planned| {
@@ -213,7 +219,9 @@ pub fn replay_pending(
                     }
                     match &planned.operation {
                         Operation::InstallLocal { source }
-                        | Operation::ReplaceLocal { source, .. } => Some(source.clone()),
+                        | Operation::ReplaceLocal { source, .. } => {
+                            Some((planned.id, source.clone()))
+                        }
                         _ => None,
                     }
                 })
@@ -223,14 +231,38 @@ pub fn replay_pending(
                         "pending download blocker has no matching local operation",
                     )
                 })?;
-            downloads.push(PendingDownload { path, source, plan });
+            downloads.push(PendingDownload {
+                path,
+                source,
+                operation_id,
+                plan,
+                slot: None,
+            });
         }
         report
             .blocked
             .retain(|blocked| !matches!(blocked, ReplayBlocked::DownloadRequired { .. }));
-        for batch in downloads.chunks(MAX_PARALLEL_DOWNLOADS) {
+        while !downloads.is_empty() {
+            let identities = downloads
+                .iter()
+                .map(|download| {
+                    DownloadSlotIdentity::new(
+                        root_generation,
+                        download.operation_id,
+                        &download.path,
+                        &download.source,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let leases = lease_download_slots(upload_staging, &identities)?;
+            for (download, lease) in downloads.iter_mut().zip(leases) {
+                download.slot = lease;
+            }
+            downloads.sort_by_key(|download| download.slot.is_none());
+            let batch_length = downloads.len().min(MAX_PARALLEL_DOWNLOADS);
+            let batch = downloads.drain(..batch_length).collect::<Vec<_>>();
             require_active_local_root(journal, sync_root)?;
-            stage_pending_downloads(dropbox, &root, sync_root, batch)?;
+            stage_pending_downloads(dropbox, &root, sync_root, &batch)?;
             require_active_local_root(journal, sync_root)?;
             let resumed = replay_local_plans_at(
                 journal,
@@ -505,7 +537,9 @@ fn prepare_plan(
 struct PendingDownload {
     path: PathBuf,
     source: RemoteFile,
+    operation_id: crate::journal::OperationId,
     plan: PlanRecord,
+    slot: Option<DownloadSlotLease>,
 }
 
 fn stage_pending_downloads(
@@ -539,6 +573,7 @@ fn stage_pending_downloads(
                         &download.path,
                         &download.path,
                         &download.source,
+                        download.slot.as_ref(),
                     ) {
                         Ok(()) => {}
                         Err(error) if first_failure.is_none() => {
@@ -717,9 +752,10 @@ fn stage_remote_at(
     target: &Path,
     synchronized_path: &Path,
     remote: &crate::model::RemoteFile,
+    slot: Option<&DownloadSlotLease>,
 ) -> Result<(), ReconcileError> {
     let staged = dropbox
-        .stage_exact_download_for_at(root, root_path, target, synchronized_path, remote)
+        .stage_exact_download_for_at(root, root_path, target, synchronized_path, remote, slot)
         .map_err(|source| ReconcileError::RemoteDownload {
             path: synchronized_path.to_path_buf(),
             source,

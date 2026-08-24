@@ -13,7 +13,10 @@ use crate::auth::AccessToken;
 use crate::journal::{
     DropboxBinding, DropboxBindingWrite, Journal, JournalError, RemoteObservationRecord,
 };
-use crate::local::{LocalError, StageOutcome, StagedUpload, open_root, stage_download_at};
+use crate::local::{
+    DownloadPreparation, DownloadSlotLease, LocalError, StageOutcome, StagedUpload,
+    existing_download_stage_at, open_root, prepare_download_slot_at, stage_download_at,
+};
 use crate::model::{ContentIdentity, DropboxRevision, Observation, RemoteFile, UnknownReason};
 use crate::runtime_status::{TransferDirection, TransferEvent, TransferObserver, TransferProgress};
 
@@ -56,15 +59,26 @@ impl<'a, R> ProgressReader<'a, R> {
         path: &Path,
         total: Option<u64>,
     ) -> Self {
+        Self::new_at(inner, observer, direction, path, 0, total)
+    }
+
+    fn new_at(
+        inner: R,
+        observer: Option<&'a TransferObserver>,
+        direction: TransferDirection,
+        path: &Path,
+        done: u64,
+        total: Option<u64>,
+    ) -> Self {
         let mut reader = Self {
             inner,
             observer,
             direction,
             path: path.to_path_buf(),
-            done: 0,
+            done,
             total,
             last_sample: Instant::now(),
-            last_emitted: 0,
+            last_emitted: done,
         };
         reader.emit();
         reader
@@ -80,6 +94,10 @@ impl<'a, R> ProgressReader<'a, R> {
             )));
         }
         self.last_emitted = self.done;
+    }
+
+    fn done(&self) -> u64 {
+        self.done
     }
 }
 
@@ -554,17 +572,44 @@ impl DropboxClient {
         let sync_root = sync_root.as_ref();
         let root = open_root(sync_root, "open sync root for exact Dropbox download")
             .map_err(|source| DropboxError::LocalStage { source })?;
-        self.stage_exact_download_for_at(&root, sync_root, target, synchronized_path, remote)
+        self.stage_exact_download_for_at(
+            &root,
+            sync_root,
+            target.as_ref(),
+            synchronized_path,
+            remote,
+            None,
+        )
     }
 
     pub(crate) fn stage_exact_download_for_at(
         &self,
         root: &OwnedFd,
         root_path: &Path,
-        target: impl AsRef<Path>,
+        target: &Path,
         synchronized_path: &Path,
         remote: &RemoteFile,
+        lease: Option<&DownloadSlotLease>,
     ) -> Result<StageOutcome<()>, DropboxError> {
+        let partial = if let Some(lease) = lease {
+            match prepare_download_slot_at(root, root_path, target, &remote.content, lease)
+                .map_err(|source| DropboxError::LocalStage { source })?
+            {
+                DownloadPreparation::Ready(partial) => Some(partial),
+                DownloadPreparation::Complete(outcome) => return Ok(outcome),
+                DownloadPreparation::Ephemeral => None,
+            }
+        } else {
+            None
+        };
+        if partial.is_none()
+            && let Some(outcome) =
+                existing_download_stage_at(root, root_path, target, &remote.content)
+                    .map_err(|source| DropboxError::LocalStage { source })?
+        {
+            return Ok(outcome);
+        }
+        let offset = partial.as_ref().map_or(0, |partial| partial.offset());
         let argument = serde_json::to_string(&DownloadRequest {
             path: format!("rev:{}", remote.revision.as_str()),
         })
@@ -575,21 +620,32 @@ impl DropboxClient {
         let authorization = format!("Bearer {}", self.access_token.expose());
         let path_root = self.path_root_header()?;
         let url = self.endpoints.content("/files/download");
-        let response = exact_download_agent()
+        let request = exact_download_agent()
             .post(&url)
             .header("Authorization", &authorization)
             .header("Dropbox-API-Path-Root", &path_root)
-            .header("Dropbox-API-Arg", &argument)
+            .header("Dropbox-API-Arg", &argument);
+        let range = format!("bytes={offset}-");
+        let request = if offset == 0 {
+            request
+        } else {
+            request.header("Range", &range)
+        };
+        let response = request
             .send_empty()
             .map_err(|source| DropboxError::Transport {
                 operation: "download exact Dropbox revision",
                 source,
             })?;
+        let status = response.status().as_u16();
         require_success(
-            response.status().as_u16(),
+            status,
             response.headers().get("Retry-After"),
             "download exact Dropbox revision",
         )?;
+        if (offset == 0 && status != 200) || (offset != 0 && status != 206) {
+            return Err(DropboxError::InvalidDownloadRange);
+        }
         let metadata_header = response
             .headers()
             .get("Dropbox-API-Result")
@@ -610,17 +666,62 @@ impl DropboxClient {
         if metadata.content_hash != remote.content.as_str() {
             return Err(DropboxError::DownloadedIdentityChanged);
         }
+        if offset > metadata.size {
+            return Err(DropboxError::DownloadedSizeChanged);
+        }
+        let remaining = metadata
+            .size
+            .checked_sub(offset)
+            .ok_or(DropboxError::DownloadedSizeChanged)?;
+        if offset != 0 {
+            let content_range = response
+                .headers()
+                .get("Content-Range")
+                .ok_or(DropboxError::InvalidDownloadRange)?
+                .to_str()
+                .map_err(|source| DropboxError::Header {
+                    operation: "decode Dropbox download range header",
+                    source,
+                })?;
+            validate_content_range(content_range, offset, metadata.size)?;
+        }
+        if let Some(length) = response.headers().get("Content-Length") {
+            let length = length
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok());
+            if length != Some(remaining) {
+                return Err(DropboxError::DownloadedLengthChanged);
+            }
+        }
         let (_, body) = response.into_parts();
-        let total = body.content_length();
-        let reader = ProgressReader::new(
+        let mut reader = ProgressReader::new_at(
             body.into_reader(),
             self.transfer_observer.as_ref(),
             TransferDirection::Download,
             synchronized_path,
-            total,
+            offset,
+            Some(metadata.size),
         );
-        stage_download_at(root, root_path, target, &remote.content, reader)
-            .map_err(|source| DropboxError::LocalStage { source })
+        if let Some(partial) = partial {
+            partial
+                .append(metadata.size, &mut reader)
+                .map_err(|source| DropboxError::LocalStage { source })
+        } else {
+            let staged = stage_download_at(root, root_path, target, &remote.content, &mut reader)
+                .map_err(|source| DropboxError::LocalStage { source })?;
+            if matches!(
+                &staged,
+                StageOutcome::AlreadyStaged(()) | StageOutcome::DestinationOccupied { .. }
+            ) {
+                io::copy(&mut reader, &mut io::sink())
+                    .map_err(|source| DropboxError::DownloadBody { source })?;
+            }
+            if reader.done() != metadata.size {
+                return Err(DropboxError::DownloadedLengthChanged);
+            }
+            Ok(staged)
+        }
     }
 
     /// Strictly create one Dropbox file from verified immutable staging.
@@ -1497,6 +1598,7 @@ struct DownloadRequest {
 struct DownloadMetadata {
     rev: String,
     content_hash: String,
+    size: u64,
 }
 
 #[derive(Serialize)]
@@ -1749,6 +1851,22 @@ pub enum DropboxError {
     /// Dropbox returned an identity different from the listed content hash.
     #[error("Dropbox exact-revision download returned a different content identity")]
     DownloadedIdentityChanged,
+    /// Dropbox returned a size different from the durable partial metadata.
+    #[error("Dropbox exact-revision download returned a different file size")]
+    DownloadedSizeChanged,
+    /// Dropbox did not honor an exact resume range.
+    #[error("Dropbox exact-revision download returned an invalid byte range")]
+    InvalidDownloadRange,
+    /// Dropbox's response body length did not match its file metadata.
+    #[error("Dropbox exact-revision download returned a different body length")]
+    DownloadedLengthChanged,
+    /// Dropbox's exact-revision response body could not be read completely.
+    #[error("could not read Dropbox exact-revision download body")]
+    DownloadBody {
+        /// Original response-body read error.
+        #[source]
+        source: io::Error,
+    },
     /// A successful mutation response did not describe the requested path and content.
     #[error("Dropbox returned inconsistent mutation metadata")]
     InvalidMutationMetadata,
@@ -1791,6 +1909,32 @@ fn require_success(
         Ok(())
     } else {
         Err(status_failure(status, retry_after, operation))
+    }
+}
+
+fn validate_content_range(value: &str, offset: u64, total: u64) -> Result<(), DropboxError> {
+    let Some(value) = value.strip_prefix("bytes ") else {
+        return Err(DropboxError::InvalidDownloadRange);
+    };
+    let Some((range, reported_total)) = value.split_once('/') else {
+        return Err(DropboxError::InvalidDownloadRange);
+    };
+    let Some((start, end)) = range.split_once('-') else {
+        return Err(DropboxError::InvalidDownloadRange);
+    };
+    let start = start
+        .parse::<u64>()
+        .map_err(|_| DropboxError::InvalidDownloadRange)?;
+    let end = end
+        .parse::<u64>()
+        .map_err(|_| DropboxError::InvalidDownloadRange)?;
+    let reported_total = reported_total
+        .parse::<u64>()
+        .map_err(|_| DropboxError::InvalidDownloadRange)?;
+    if start == offset && reported_total == total && end.checked_add(1) == Some(total) {
+        Ok(())
+    } else {
+        Err(DropboxError::InvalidDownloadRange)
     }
 }
 

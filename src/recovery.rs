@@ -1084,7 +1084,7 @@ fn ensure_exact_copy_at(
         }
     }
     match dropbox
-        .stage_exact_download_for_at(root, root_path, target, path, remote)
+        .stage_exact_download_for_at(root, root_path, target, path, remote, None)
         .map_err(|source| dropbox_error(path, source))?
     {
         StageOutcome::Staged(()) | StageOutcome::AlreadyStaged(()) => {}
