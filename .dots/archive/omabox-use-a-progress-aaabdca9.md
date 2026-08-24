@@ -1,9 +1,11 @@
 ---
 title: Use a progress-resetting download timeout
-status: active
+status: closed
 priority: 0
 issue-type: task
-created-at: "\"2026-08-24T23:10:01.755709+02:00\""
+created-at: "\"\\\"2026-08-24T23:10:01.755709+02:00\\\"\""
+closed-at: "2026-08-24T23:12:11.461693+02:00"
+close-reason: Exact downloads now use a 15s connect timeout and a 1h progress-resetting receive-body timeout; focused test, full suite, Clippy, fmt, doctests, forbidden scan, and Sol review are clean.
 ---
 
 Problem: a live progressing download was killed exactly at the one-hour global deadline, discarding its unnamed staging file.
