@@ -13,7 +13,6 @@ Panel {
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property var snapshot: status.snapshot
   readonly property var transfer: status.transfer
-  readonly property real queued: snapshot ? snapshot.queued : 0
   readonly property bool alerting: status.availability === "malformed" || status.stale
     || (snapshot && snapshot.phase === "error")
   readonly property bool inactive: status.availability === "missing" || status.stale
@@ -28,7 +27,7 @@ Panel {
     if (status.stale) return "Service not updating"
     if (!snapshot) return "Unavailable"
     if (snapshot.phase === "error") return "Sync error"
-    if (snapshot.phase === "backoff") return "Offline · retrying"
+    if (snapshot.phase === "backoff") return "Waiting to retry"
     if (snapshot.phase === "starting") return "Starting"
     if (snapshot.phase === "syncing") return "Syncing"
     return "Up to date"
@@ -39,7 +38,7 @@ Panel {
     if (status.availability === "malformed") return "Omabox published an unreadable status snapshot."
     if (status.stale) return "Last update " + relativeTime(snapshot.updated_at) + "."
     if (snapshot && snapshot.last_error) return String(snapshot.last_error)
-    if (snapshot && snapshot.phase === "backoff") return "Waiting to reconnect to Dropbox."
+    if (snapshot && snapshot.phase === "backoff") return "Dropbox requested a short delay."
     return ""
   }
 
@@ -171,17 +170,6 @@ Panel {
             InfoPair { label: "Speed"; value: root.formatBytes(status.speedBytesPerSecond) + "/s" }
           }
 
-          PanelSeparator { foreground: root.foreground }
-          PanelSectionHeader {
-            text: "SYNC STATUS"
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-          }
-          InfoPair { label: "Queued"; value: String(root.queued) }
-          InfoPair {
-            label: "Last successful sync"
-            value: root.snapshot ? root.relativeTime(root.snapshot.last_successful_pass) : "Unavailable"
-          }
       }
     }
   }
