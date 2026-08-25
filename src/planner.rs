@@ -126,30 +126,20 @@ pub fn plan(baseline: &Baseline, local: &LocalObservation, remote: &RemoteObserv
             Observation::Present(local),
             Observation::Present(remote),
         ) if local.content != baseline.content && remote.content == baseline.content => {
-            Decision::Operations(OperationPlan::new(vec![
-                Operation::PreserveRemote {
-                    file: remote.clone(),
-                },
-                Operation::ReplaceRemote {
-                    content: local.content.clone(),
-                    expected_revision: remote.revision.clone(),
-                },
-            ]))
+            Decision::Operations(OperationPlan::new(vec![Operation::ReplaceRemote {
+                content: local.content.clone(),
+                expected_revision: remote.revision.clone(),
+            }]))
         }
         (
             Baseline::Present(baseline),
             Observation::Present(local),
             Observation::Present(remote),
         ) if local.content == baseline.content && remote.content != baseline.content => {
-            Decision::Operations(OperationPlan::new(vec![
-                Operation::PreserveLocal {
-                    file: local.clone(),
-                },
-                Operation::ReplaceLocal {
-                    source: remote.clone(),
-                    expected_content: local.content.clone(),
-                },
-            ]))
+            Decision::Operations(OperationPlan::new(vec![Operation::ReplaceLocal {
+                source: remote.clone(),
+                expected_content: local.content.clone(),
+            }]))
         }
         (Baseline::Present(_), Observation::Present(local), Observation::Present(remote)) => {
             Decision::Conflict(Conflict::DivergentEdits {
@@ -161,14 +151,11 @@ pub fn plan(baseline: &Baseline, local: &LocalObservation, remote: &RemoteObserv
             Baseline::Present(baseline),
             Observation::ConfirmedAbsent,
             Observation::Present(remote),
-        ) if remote.content == baseline.content => Decision::Operations(OperationPlan::new(vec![
-            Operation::PreserveRemote {
-                file: remote.clone(),
-            },
-            Operation::DeleteRemote {
+        ) if remote.content == baseline.content => {
+            Decision::Operations(OperationPlan::new(vec![Operation::DeleteRemote {
                 expected_revision: remote.revision.clone(),
-            },
-        ])),
+            }]))
+        }
         (Baseline::Present(_), Observation::ConfirmedAbsent, Observation::Present(remote)) => {
             Decision::Conflict(Conflict::LocalDeletionRemoteEdit {
                 remote: remote.clone(),
@@ -178,14 +165,11 @@ pub fn plan(baseline: &Baseline, local: &LocalObservation, remote: &RemoteObserv
             Baseline::Present(baseline),
             Observation::Present(local),
             Observation::ConfirmedAbsent,
-        ) if local.content == baseline.content => Decision::Operations(OperationPlan::new(vec![
-            Operation::PreserveLocal {
-                file: local.clone(),
-            },
-            Operation::DeleteLocal {
+        ) if local.content == baseline.content => {
+            Decision::Operations(OperationPlan::new(vec![Operation::DeleteLocal {
                 expected_content: local.content.clone(),
-            },
-        ])),
+            }]))
+        }
         (Baseline::Present(_), Observation::Present(local), Observation::ConfirmedAbsent) => {
             Decision::Conflict(Conflict::RemoteDeletionLocalEdit {
                 local: local.clone(),

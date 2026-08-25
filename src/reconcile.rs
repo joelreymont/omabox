@@ -29,10 +29,9 @@ use crate::model::{
 };
 use crate::planner::plan;
 use crate::recovery::{
-    ExactCopyOutcome, RecoveryError, RecoveryMaterialization, ReplayBlocked, ReplayReport,
-    destination, materialize_before_plan, materialize_local_conflict, materialize_remote_conflict,
-    materialize_remote_copy_at, prune_completed_recoveries, replay_local_plans_at,
-    replay_remote_operations_at,
+    ExactCopyOutcome, RecoveryError, ReplayBlocked, ReplayReport, materialize_local_conflict,
+    materialize_remote_conflict, materialize_remote_copy_at, prune_completed_recoveries,
+    replay_local_plans_at, replay_remote_operations_at,
 };
 
 /// A reconciliation failure. Expected observation races are returned as outcomes instead.
@@ -328,7 +327,6 @@ pub fn replay_pending(
     downloads: &mut ExactDownloadPool,
     sync_root: impl AsRef<Path>,
     upload_staging: impl AsRef<Path>,
-    recovery_directory: impl AsRef<Path>,
 ) -> Result<ReplayReport, ReconcileError> {
     replay_pending_at(
         journal,
@@ -336,7 +334,6 @@ pub fn replay_pending(
         downloads,
         sync_root.as_ref(),
         upload_staging.as_ref(),
-        recovery_directory.as_ref(),
     )
 }
 
@@ -346,7 +343,6 @@ fn replay_pending_at(
     download_pool: &mut ExactDownloadPool,
     sync_root: &Path,
     upload_staging: &Path,
-    recovery_directory: &Path,
 ) -> Result<ReplayReport, ReconcileError> {
     let download_failure = download_pool.collect_results()?;
     let Some(root) = open_active_root(journal, sync_root)? else {
@@ -362,7 +358,6 @@ fn replay_pending_at(
         journal,
         &root,
         sync_root,
-        recovery_directory,
         pending_plans
             .iter()
             .filter(|plan| !download_pool.contains(&plan.path)),
@@ -424,14 +419,7 @@ fn replay_pending_at(
         )?;
     }
     require_active_local_root(journal, sync_root)?;
-    let remote = replay_remote_operations_at(
-        journal,
-        dropbox,
-        &root,
-        sync_root,
-        upload_staging,
-        recovery_directory,
-    )?;
+    let remote = replay_remote_operations_at(journal, dropbox, &root, sync_root, upload_staging)?;
     report.completed_operations += remote.completed_operations;
     report.blocked.extend(remote.blocked);
     Ok(report)
@@ -470,14 +458,7 @@ fn reconcile_active_root(
     let sync_root = sync_root.as_ref();
     let upload_staging = upload_staging.as_ref();
     let recovery_directory = recovery_directory.as_ref();
-    let replay = replay_pending_at(
-        journal,
-        dropbox,
-        downloads,
-        sync_root,
-        upload_staging,
-        recovery_directory,
-    )?;
+    let replay = replay_pending_at(journal, dropbox, downloads, sync_root, upload_staging)?;
     let scan = match scan_and_publish(journal, sync_root) {
         Ok(ScanPublication::Published(scan)) => scan,
         Ok(ScanPublication::RootChanged) => return Err(ReconcileError::LocalRootChanged),
@@ -620,14 +601,7 @@ fn reconcile_published(
                 blocked_paths.insert(canonical_path.clone());
             }
             Decision::Operations(plan) => {
-                match prepare_plan(
-                    dropbox,
-                    sync_root,
-                    upload_staging,
-                    recovery_directory,
-                    &path,
-                    plan.operations(),
-                )? {
+                match prepare_plan(sync_root, upload_staging, &path, plan.operations())? {
                     Prepared::Ready(()) => {}
                     Prepared::FreshObservation => {
                         return Ok(ReconcileOutcome::FreshObservationRequired { path });
@@ -662,7 +636,6 @@ fn reconcile_published(
                     journal,
                     sync_root,
                     upload_staging,
-                    recovery_directory,
                     &local,
                     &remote,
                     &path,
@@ -684,14 +657,7 @@ fn reconcile_published(
             }
         }
     }
-    let applied = replay_pending_at(
-        journal,
-        dropbox,
-        downloads,
-        sync_root,
-        upload_staging,
-        recovery_directory,
-    )?;
+    let applied = replay_pending_at(journal, dropbox, downloads, sync_root, upload_staging)?;
     report.replayed_operations += applied.completed_operations;
     if let Some(path) = applied.blocked.iter().find_map(|blocked| match blocked {
         ReplayBlocked::FreshObservationRequired { path } => Some(path.clone()),
@@ -752,10 +718,8 @@ enum Prepared<T> {
 }
 
 fn prepare_plan(
-    dropbox: &DropboxClient,
     sync_root: &Path,
     upload_staging: &Path,
-    recovery_directory: &Path,
     path: &Path,
     operations: &[Operation],
 ) -> Result<Prepared<()>, ReconcileError> {
@@ -775,24 +739,7 @@ fn prepare_plan(
             // Exact downloads are fetched only after this plan is durable, allowing startup and
             // post-plan replay to share the same bounded batch.
             Operation::InstallLocal { .. } | Operation::ReplaceLocal { .. } => {}
-            Operation::PreserveRemote { file } => {
-                let target = destination(recovery_directory, path, &file.content);
-                let Some(name) = target.file_name() else {
-                    return Err(invalid(
-                        path,
-                        "remote recovery destination has no file name",
-                    ));
-                };
-                stage_remote(dropbox, recovery_directory, Path::new(name), path, file)?;
-            }
-            Operation::PreserveLocal { file } => {
-                if matches!(
-                    prepare_local_preservation(sync_root, recovery_directory, path, &file.content)?,
-                    Prepared::FreshObservation
-                ) {
-                    return Ok(Prepared::FreshObservation);
-                }
-            }
+            Operation::PreserveRemote { .. } | Operation::PreserveLocal { .. } => {}
             Operation::DeleteLocal { .. } | Operation::DeleteRemote { .. } => {}
         }
     }
@@ -816,7 +763,6 @@ fn prepare_directory_collision(
     journal: &Journal,
     sync_root: &Path,
     upload_staging: &Path,
-    recovery_directory: &Path,
     local: &BTreeMap<PathBuf, LocalObservationRecord>,
     remote: &BTreeMap<PathBuf, RemoteObservationRecord>,
     path: &Path,
@@ -878,20 +824,12 @@ fn prepare_directory_collision(
                 }
             }
             let plan = OperationPlan::new(vec![
-                Operation::PreserveRemote { file: file.clone() },
                 Operation::DeleteRemote {
                     expected_revision: file.revision.clone(),
                 },
                 Operation::CreateRemoteDirectory,
             ]);
-            match prepare_plan(
-                dropbox,
-                sync_root,
-                upload_staging,
-                recovery_directory,
-                path,
-                plan.operations(),
-            )? {
+            match prepare_plan(sync_root, upload_staging, path, plan.operations())? {
                 Prepared::Ready(()) => Ok(PreparedDirectoryCollision::Plan(plan)),
                 Prepared::FreshObservation => Ok(PreparedDirectoryCollision::FreshObservation),
             }
@@ -1080,22 +1018,6 @@ fn schedule_pending_downloads(
     Ok(())
 }
 
-fn prepare_local_preservation(
-    sync_root: &Path,
-    recovery_directory: &Path,
-    path: &Path,
-    content: &crate::model::ContentIdentity,
-) -> Result<Prepared<()>, ReconcileError> {
-    match materialize_before_plan(sync_root, recovery_directory, path, content) {
-        Ok(RecoveryMaterialization::Created(_) | RecoveryMaterialization::AlreadyPresent(_)) => {
-            Ok(Prepared::Ready(()))
-        }
-        Ok(RecoveryMaterialization::SourceChanged { .. }) => Ok(Prepared::FreshObservation),
-        Err(source) if recovery_source_changed(&source, path) => Ok(Prepared::FreshObservation),
-        Err(source) => Err(ReconcileError::Recovery { source }),
-    }
-}
-
 fn prepare_conflict(
     dropbox: &DropboxClient,
     sync_root: &Path,
@@ -1152,60 +1074,11 @@ fn local_source_changed(error: &LocalError, path: &Path) -> bool {
     }
 }
 
-fn recovery_source_changed(error: &RecoveryError, path: &Path) -> bool {
-    match error {
-        RecoveryError::Local { source } if local_source_changed(source, path) => true,
-        RecoveryError::Local {
-            source:
-                LocalError::Io {
-                    operation: "open displaced local payload for recovery",
-                    path: changed,
-                    ..
-                },
-        } => changed == path,
-        RecoveryError::Local {
-            source:
-                LocalError::ChangedDuringRead {
-                    operation: "materialize recovery copy",
-                    ..
-                },
-        } => true,
-        RecoveryError::Local { .. }
-        | RecoveryError::Journal { .. }
-        | RecoveryError::Dropbox { .. }
-        | RecoveryError::InvalidJournalState { .. } => false,
-    }
-}
-
 fn require_active_local_root(journal: &Journal, sync_root: &Path) -> Result<(), ReconcileError> {
     if configured_root_is_active(journal, sync_root)? {
         Ok(())
     } else {
         Err(ReconcileError::LocalRootChanged)
-    }
-}
-
-fn stage_remote(
-    dropbox: &DropboxClient,
-    root: &Path,
-    target: &Path,
-    synchronized_path: &Path,
-    remote: &crate::model::RemoteFile,
-) -> Result<(), ReconcileError> {
-    let staged = dropbox
-        .stage_exact_download_for(root, target, synchronized_path, remote)
-        .map_err(|source| ReconcileError::RemoteDownload {
-            path: synchronized_path.to_path_buf(),
-            source,
-        })?;
-    match staged {
-        StageOutcome::Staged(()) | StageOutcome::AlreadyStaged(()) => Ok(()),
-        StageOutcome::ContentChanged { .. } => Err(ReconcileError::RemoteContentChanged {
-            path: synchronized_path.to_path_buf(),
-        }),
-        StageOutcome::DestinationOccupied { path } => {
-            Err(ReconcileError::StageDestinationOccupied { path })
-        }
     }
 }
 
@@ -1519,7 +1392,6 @@ mod tests {
     }
 
     use crate::model::{ContentIdentity, DropboxRevision, LocalFile, RemoteFile};
-    use crate::recovery::replay_local_operations;
 
     fn identity(bytes: &[u8]) -> Result<ContentIdentity, Box<dyn Error>> {
         Ok(dropbox_content_hash(Cursor::new(bytes))?)
@@ -1639,84 +1511,6 @@ mod tests {
         assert!(!root.path().join(path).exists());
         assert!(journal.pending_plans()?.is_empty());
         assert!(journal.conflicts()?.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn local_recovery_exists_before_plan_and_survives_source_removal() -> Result<(), Box<dyn Error>>
-    {
-        let root = TempDir::new()?;
-        let recovery = TempDir::new()?;
-        let state = TempDir::new()?;
-        let mut journal = Journal::open(state.path().join("journal.sqlite3"))?;
-        let path = Path::new("deleted.txt");
-        let bytes = b"preserve before delete";
-        let old = RemoteFile::new(identity(bytes)?, DropboxRevision::new("rev-old"));
-        record_matching_baseline(&mut journal, path, &old)?;
-        std::fs::write(root.path().join(path), bytes)?;
-
-        assert!(matches!(
-            prepare_local_preservation(root.path(), recovery.path(), path, &old.content)?,
-            Prepared::Ready(())
-        ));
-        assert!(journal.pending_plans()?.is_empty());
-        let recovery_path = destination(recovery.path(), path, &old.content);
-        assert_eq!(std::fs::read(&recovery_path)?, bytes);
-
-        let Decision::Operations(operation_plan) = plan(
-            &Baseline::Present(old.clone()),
-            &Observation::Present(LocalFile::new(old.content.clone())),
-            &Observation::ConfirmedAbsent,
-        ) else {
-            return Err(std::io::Error::other("remote deletion did not produce a plan").into());
-        };
-        if !matches!(
-            journal.record_plan(path, &operation_plan)?,
-            PlanWrite::Recorded(_)
-        ) {
-            return Err(std::io::Error::other("fresh delete plan was not recorded").into());
-        }
-        std::fs::remove_file(root.path().join(path))?;
-
-        let replay = replay_local_operations(&mut journal, root.path(), recovery.path())?;
-        assert_eq!(replay.completed_operations, 2);
-        assert!(replay.blocked.is_empty());
-        assert!(journal.pending_plans()?.is_empty());
-        assert_eq!(journal.baseline(path)?, None);
-        assert_eq!(std::fs::read(recovery_path)?, bytes);
-        Ok(())
-    }
-
-    #[test]
-    fn existing_local_recovery_never_substitutes_for_the_live_source() -> Result<(), Box<dyn Error>>
-    {
-        let root = TempDir::new()?;
-        let recovery = TempDir::new()?;
-        let state = TempDir::new()?;
-        let journal = Journal::open(state.path().join("journal.sqlite3"))?;
-        let path = Path::new("stale.txt");
-        let expected = identity(b"observed")?;
-        std::fs::write(root.path().join(path), b"observed")?;
-        assert!(matches!(
-            prepare_local_preservation(root.path(), recovery.path(), path, &expected)?,
-            Prepared::Ready(())
-        ));
-
-        std::fs::write(root.path().join(path), b"changed")?;
-        assert!(matches!(
-            prepare_local_preservation(root.path(), recovery.path(), path, &expected)?,
-            Prepared::FreshObservation
-        ));
-        std::fs::remove_file(root.path().join(path))?;
-        assert!(matches!(
-            prepare_local_preservation(root.path(), recovery.path(), path, &expected)?,
-            Prepared::FreshObservation
-        ));
-        assert!(journal.pending_plans()?.is_empty());
-        assert_eq!(
-            std::fs::read(destination(recovery.path(), path, &expected))?,
-            b"observed"
-        );
         Ok(())
     }
 

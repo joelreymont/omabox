@@ -129,7 +129,7 @@ pub type LocalObservation = Observation<LocalFile>;
 /// Remote observation accepted by the planner.
 pub type RemoteObservation = Observation<RemoteFile>;
 
-/// Ordered recovery or mutation step selected for one path.
+/// Ordered mutation step selected for one path.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Operation {
     /// Create a local directory while the path remains absent.
@@ -142,16 +142,16 @@ pub enum Operation {
     CreateRemote { content: ContentIdentity },
     /// Install a remote file at a locally absent path.
     InstallLocal { source: RemoteFile },
-    /// Retain the displaced local payload before mutation.
+    /// Legacy recovery step retained only to decode old journals.
     PreserveLocal { file: LocalFile },
-    /// Replace local bytes after retaining the displaced payload.
+    /// Replace local bytes if the observed content still matches.
     ReplaceLocal {
         source: RemoteFile,
         expected_content: ContentIdentity,
     },
-    /// Delete local bytes after retaining the displaced payload.
+    /// Delete local bytes if the observed content still matches.
     DeleteLocal { expected_content: ContentIdentity },
-    /// Retain the exact displaced Dropbox payload before mutation.
+    /// Legacy recovery step retained only to decode old journals.
     PreserveRemote { file: RemoteFile },
     /// Replace a Dropbox file only if its last known revision still matches.
     ReplaceRemote {

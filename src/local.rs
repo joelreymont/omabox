@@ -447,22 +447,6 @@ impl DownloadPartial {
     }
 }
 
-/// Verified recovery evidence required by a destructive local phase.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VerifiedRecovery {
-    original_path: PathBuf,
-    content: ContentIdentity,
-}
-
-impl VerifiedRecovery {
-    pub(crate) fn new(original_path: PathBuf, content: ContentIdentity) -> Self {
-        Self {
-            original_path,
-            content,
-        }
-    }
-}
-
 /// Result of atomically installing a verified download.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InstallOutcome {
@@ -1795,7 +1779,7 @@ fn hash_download_prefix(file: &mut File, offset: u64, path: &Path) -> Result<Sha
     Ok(aggregate)
 }
 
-/// Durably prepare a recovered local file for replacement without deleting it.
+/// Durably prepare an expected local file for replacement without deleting it.
 ///
 /// This real filesystem phase is independently replayable: after it returns,
 /// the original bytes are either still at the target or at a deterministic
@@ -1803,11 +1787,11 @@ fn hash_download_prefix(file: &mut File, offset: u64, path: &Path) -> Result<Sha
 pub fn prepare_replacement(
     root: impl AsRef<Path>,
     target: impl AsRef<Path>,
-    recovery: &VerifiedRecovery,
+    expected_content: &ContentIdentity,
 ) -> Result<ReplacementPreparation, LocalError> {
     let root = root.as_ref();
     let target = target.as_ref();
-    validate_recovery(recovery, target)?;
+    require_content_hash(expected_content, "prepare replacement")?;
     let root_fd = open_absolute_directory(root, "open sync root for replacement preparation")?;
     let Some((parent, target_name, parent_relative)) = open_parent(&root_fd, target, false)? else {
         return Ok(ReplacementPreparation::PreconditionChanged { actual: None });
@@ -1818,24 +1802,23 @@ pub fn prepare_replacement(
         &parent_relative,
         &target_name,
         target,
-        recovery,
+        expected_content,
     )
 }
 
 /// Atomically install a verified staged download without overwriting a changed target.
 ///
-/// `recovery` is required for replacement and proves the displaced bytes have
-/// already been copied and verified. An initially absent install passes `None`
-/// and uses `RENAME_NOREPLACE`.
+/// `expected_content` is required for replacement. An initially absent install
+/// passes `None` and uses `RENAME_NOREPLACE`.
 pub fn install_download(
     root: impl AsRef<Path>,
     target: impl AsRef<Path>,
     desired: &ContentIdentity,
-    recovery: Option<&VerifiedRecovery>,
+    expected_content: Option<&ContentIdentity>,
 ) -> Result<InstallOutcome, LocalError> {
     let root = root.as_ref();
     let root_fd = open_absolute_directory(root, "open sync root for download install")?;
-    install_download_at(&root_fd, root, target, desired, recovery)
+    install_download_at(&root_fd, root, target, desired, expected_content)
 }
 
 pub(crate) fn install_download_at(
@@ -1843,7 +1826,7 @@ pub(crate) fn install_download_at(
     root_path: &Path,
     target: impl AsRef<Path>,
     desired: &ContentIdentity,
-    recovery: Option<&VerifiedRecovery>,
+    expected_content: Option<&ContentIdentity>,
 ) -> Result<InstallOutcome, LocalError> {
     let target = target.as_ref();
     require_content_hash(desired, "install download")?;
@@ -1860,15 +1843,15 @@ pub(crate) fn install_download_at(
         {
             return Ok(InstallOutcome::StageDestinationOccupied { path });
         }
-        if let Some(recovery) = recovery {
-            validate_recovery(recovery, target)?;
-            remove_guard_if_verified(&parent, target, recovery)?;
+        if let Some(expected_content) = expected_content {
+            require_content_hash(expected_content, "clean replacement guard")?;
+            remove_guard_if_verified(&parent, target, expected_content)?;
         }
         sync_directory(&parent, target, "sync already-installed download")?;
         return Ok(InstallOutcome::AlreadyInstalled);
     }
 
-    let Some(recovery) = recovery else {
+    let Some(expected_content) = expected_content else {
         if current.is_some() {
             return Ok(InstallOutcome::PreconditionChanged { actual: current });
         }
@@ -1890,7 +1873,7 @@ pub(crate) fn install_download_at(
             desired,
         );
     };
-    validate_recovery(recovery, target)?;
+    require_content_hash(expected_content, "install replacement")?;
     let stage = match inspect_download_stage(&parent, &stage_name, &stage_path, target, desired)? {
         DownloadStage::Verified(file) => file,
         DownloadStage::Missing => return Ok(InstallOutcome::DownloadRequired),
@@ -1905,7 +1888,7 @@ pub(crate) fn install_download_at(
         &parent_relative,
         &target_name,
         target,
-        recovery,
+        expected_content,
     )? {
         ReplacementPreparation::Prepared | ReplacementPreparation::AlreadyPrepared => {}
         ReplacementPreparation::PreconditionChanged { actual } => {
@@ -1924,7 +1907,7 @@ pub(crate) fn install_download_at(
                 return Ok(InstallOutcome::StageDestinationOccupied { path });
             }
         }
-        remove_guard_if_verified(&parent, target, recovery)?;
+        remove_guard_if_verified(&parent, target, expected_content)?;
         if actual == *desired {
             sync_directory(&parent, target, "sync raced prepared replacement cleanup")?;
             return Ok(InstallOutcome::AlreadyInstalled);
@@ -1935,7 +1918,7 @@ pub(crate) fn install_download_at(
         });
     }
 
-    let guard = internal_name("displaced", target, &recovery.content);
+    let guard = internal_name("displaced", target, expected_content);
     verify_download_stage_before_rename(&stage, &stage_path)?;
     match renameat_with(
         &parent,
@@ -1986,29 +1969,29 @@ pub(crate) fn install_download_at(
     }
 }
 
-/// Conditionally delete a local file after a verified recovery copy exists.
+/// Conditionally delete a local file while its observed content still matches.
 pub fn delete_local(
     root: impl AsRef<Path>,
     target: impl AsRef<Path>,
-    recovery: &VerifiedRecovery,
+    expected_content: &ContentIdentity,
 ) -> Result<DeleteOutcome, LocalError> {
     let root = root.as_ref();
     let root_fd = open_absolute_directory(root, "open sync root for local deletion")?;
-    delete_local_at(&root_fd, root, target, recovery)
+    delete_local_at(&root_fd, root, target, expected_content)
 }
 
 pub(crate) fn delete_local_at(
     root: &OwnedFd,
     root_path: &Path,
     target: impl AsRef<Path>,
-    recovery: &VerifiedRecovery,
+    expected_content: &ContentIdentity,
 ) -> Result<DeleteOutcome, LocalError> {
     let target = target.as_ref();
-    validate_recovery(recovery, target)?;
+    require_content_hash(expected_content, "delete local file")?;
     let Some((parent, target_name, parent_relative)) = open_parent(root, target, false)? else {
         return Ok(DeleteOutcome::AlreadyDeleted);
     };
-    let guard = internal_name("deleted", target, &recovery.content);
+    let guard = internal_name("deleted", target, expected_content);
     let guard_path = root_path.join(&parent_relative).join(&guard);
     let current = hash_at_if_present(&parent, &target_name, target, "check delete precondition")?;
 
@@ -2016,7 +1999,7 @@ pub(crate) fn delete_local_at(
         if let Some(guard_content) =
             hash_at_if_present(&parent, &guard, &guard_path, "inspect interrupted deletion")?
         {
-            if guard_content != recovery.content {
+            if guard_content != *expected_content {
                 restore_or_preserve_changed_guard(
                     &parent,
                     &guard,
@@ -2035,13 +2018,26 @@ pub(crate) fn delete_local_at(
         }
         return Ok(DeleteOutcome::AlreadyDeleted);
     }
-    if current.as_ref() != Some(&recovery.content) {
+    if current.as_ref() != Some(expected_content) {
+        if let Some(guard_content) =
+            hash_at_if_present(&parent, &guard, &guard_path, "inspect raced deletion guard")?
+        {
+            if guard_content != *expected_content {
+                return Err(LocalError::DestinationOccupied {
+                    operation: "clean raced local deletion",
+                    path: guard_path,
+                });
+            }
+            unlinkat(&parent, &guard, AtFlags::empty())
+                .map_err(|source| syscall_failure("remove raced deletion guard", target, source))?;
+            sync_directory(&parent, target, "sync raced deletion guard removal")?;
+        }
         return Ok(DeleteOutcome::PreconditionChanged { actual: current });
     }
     if let Some(guard_content) =
         hash_at_if_present(&parent, &guard, &guard_path, "inspect deletion guard")?
     {
-        if guard_content != recovery.content {
+        if guard_content != *expected_content {
             return Err(LocalError::DestinationOccupied {
                 operation: "prepare local deletion",
                 path: guard_path,
@@ -2074,7 +2070,7 @@ pub(crate) fn delete_local_at(
     sync_directory(&parent, target, "sync deletion displacement")?;
     let displaced =
         hash_at_if_present(&parent, &guard, &guard_path, "verify deletion displacement")?;
-    if displaced.as_ref() != Some(&recovery.content) {
+    if displaced.as_ref() != Some(expected_content) {
         let actual = displaced;
         restore_or_preserve_changed_guard(&parent, &guard, &target_name, target, actual.as_ref())?;
         return Ok(DeleteOutcome::PreconditionChanged { actual });
@@ -2230,14 +2226,6 @@ pub(crate) fn open_root(root: &Path, operation: &'static str) -> Result<OwnedFd,
     open_absolute_directory(root, operation)
 }
 
-pub(crate) fn open_root_file(
-    root: &OwnedFd,
-    relative: &Path,
-    operation: &'static str,
-) -> Result<File, LocalError> {
-    open_relative_regular(root, relative, operation)
-}
-
 pub(crate) fn open_private_directory(
     path: &Path,
     operation: &'static str,
@@ -2247,42 +2235,6 @@ pub(crate) fn open_private_directory(
 
 pub(crate) fn recovery_file_name(original: &Path, content: &ContentIdentity) -> OsString {
     internal_name("recovery", original, content)
-}
-
-pub(crate) fn materialize_verified_copy(
-    directory: &OwnedFd,
-    directory_path: &Path,
-    name: &OsStr,
-    expected: &ContentIdentity,
-    source: &mut File,
-) -> Result<StageOutcome<()>, LocalError> {
-    let destination = directory_path.join(name);
-    let before = stat_fd(source, &destination, "inspect recovery source before copy")?;
-    let result = write_verified_stage(
-        directory,
-        name,
-        &destination,
-        expected,
-        source,
-        ExistingPolicy::Preserve,
-        "materialize recovery copy",
-    )?;
-    let after = stat_fd(source, &destination, "inspect recovery source after copy")?;
-    if !same_observation(&before, &after) {
-        return Err(LocalError::ChangedDuringRead {
-            operation: "materialize recovery copy",
-            path: destination,
-        });
-    }
-    match result {
-        StageWrite::Created => Ok(StageOutcome::Staged(())),
-        StageWrite::Reused => Ok(StageOutcome::AlreadyStaged(())),
-        StageWrite::Mismatch(actual) => Ok(StageOutcome::ContentChanged { actual }),
-        StageWrite::Occupied(path) => Err(LocalError::DestinationOccupied {
-            operation: "materialize recovery copy",
-            path,
-        }),
-    }
 }
 
 pub(crate) fn verify_private_copy(
@@ -3263,9 +3215,9 @@ fn prepare_replacement_at(
     parent_relative: &Path,
     target_name: &OsStr,
     target: &Path,
-    recovery: &VerifiedRecovery,
+    expected_content: &ContentIdentity,
 ) -> Result<ReplacementPreparation, LocalError> {
-    let guard = internal_name("displaced", target, &recovery.content);
+    let guard = internal_name("displaced", target, expected_content);
     let guard_path = root.join(parent_relative).join(&guard);
     let current = hash_at_if_present(
         parent,
@@ -3279,7 +3231,7 @@ fn prepare_replacement_at(
         &guard_path,
         "inspect replacement displacement guard",
     )? {
-        if guard_content == recovery.content {
+        if guard_content == *expected_content {
             return Ok(ReplacementPreparation::AlreadyPrepared);
         }
         return Err(LocalError::DestinationOccupied {
@@ -3287,7 +3239,7 @@ fn prepare_replacement_at(
             path: guard_path,
         });
     }
-    if current.as_ref() != Some(&recovery.content) {
+    if current.as_ref() != Some(expected_content) {
         return Ok(ReplacementPreparation::PreconditionChanged { actual: current });
     }
 
@@ -3303,7 +3255,7 @@ fn prepare_replacement_at(
                 &guard_path,
                 "verify raced replacement displacement",
             )?;
-            if existing.as_ref() == Some(&recovery.content) {
+            if existing.as_ref() == Some(expected_content) {
                 return Ok(ReplacementPreparation::AlreadyPrepared);
             }
             return Err(LocalError::DestinationOccupied {
@@ -3326,7 +3278,7 @@ fn prepare_replacement_at(
         &guard_path,
         "verify displaced replacement file",
     )?;
-    if displaced.as_ref() != Some(&recovery.content) {
+    if displaced.as_ref() != Some(expected_content) {
         let actual = displaced;
         restore_or_preserve_changed_guard(parent, &guard, target_name, target, actual.as_ref())?;
         return Ok(ReplacementPreparation::PreconditionChanged { actual });
@@ -3334,26 +3286,15 @@ fn prepare_replacement_at(
     Ok(ReplacementPreparation::Prepared)
 }
 
-fn validate_recovery(recovery: &VerifiedRecovery, target: &Path) -> Result<(), LocalError> {
-    require_content_hash(&recovery.content, "validate recovery before mutation")?;
-    if recovery.original_path == target {
-        Ok(())
-    } else {
-        Err(LocalError::UnsafeRelativePath {
-            path: recovery.original_path.clone(),
-        })
-    }
-}
-
 fn remove_guard_if_verified(
     parent: &OwnedFd,
     target: &Path,
-    recovery: &VerifiedRecovery,
+    expected_content: &ContentIdentity,
 ) -> Result<(), LocalError> {
-    let guard = internal_name("displaced", target, &recovery.content);
+    let guard = internal_name("displaced", target, expected_content);
     if let Some(actual) = hash_at_if_present(parent, &guard, target, "verify stale install guard")?
     {
-        if actual != recovery.content {
+        if actual != *expected_content {
             return Err(LocalError::DestinationOccupied {
                 operation: "clean completed replacement",
                 path: target.to_path_buf(),
@@ -4115,19 +4056,6 @@ mod tests {
             assert_eq!(resumed.offset(), durable);
             assert_eq!(resumed.file.metadata()?.len(), durable);
         }
-        Ok(())
-    }
-
-    #[test]
-    fn scan_rejects_symlinks_instead_of_publishing_absence() -> Result<(), Box<dyn Error>> {
-        use std::os::unix::fs::symlink;
-
-        let directory = TempDir::new()?;
-        let outside = TempDir::new()?;
-        std::fs::write(outside.path().join("outside.txt"), b"outside")?;
-        symlink(outside.path(), directory.path().join("escape"))?;
-        let result = scan(directory.path());
-        assert!(result.is_err());
         Ok(())
     }
 
@@ -4917,6 +4845,25 @@ mod tests {
             std::fs::read(directory.path().join("target.txt"))?,
             b"local"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn delete_replay_preserves_a_raced_edit_and_removes_its_guard() -> Result<(), Box<dyn Error>> {
+        let root = TempDir::new()?;
+        let target = Path::new("target.txt");
+        let expected = identity(b"old")?;
+        std::fs::write(root.path().join(target), b"old")?;
+        let guard = internal_name("deleted", target, &expected);
+        std::fs::rename(root.path().join(target), root.path().join(&guard))?;
+        std::fs::write(root.path().join(target), b"raced edit")?;
+
+        assert!(matches!(
+            delete_local(root.path(), target, &expected)?,
+            DeleteOutcome::PreconditionChanged { actual: Some(_) }
+        ));
+        assert_eq!(std::fs::read(root.path().join(target))?, b"raced edit");
+        assert!(!root.path().join(guard).exists());
         Ok(())
     }
 

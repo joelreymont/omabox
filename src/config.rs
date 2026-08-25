@@ -111,7 +111,7 @@ impl Paths {
         Ok(())
     }
 
-    /// Create the private state, upload staging, and recovery directories.
+    /// Create the private state, upload staging, and legacy recovery directories.
     ///
     /// Validation runs again before any directory is created so a symlinked
     /// XDG ancestor cannot silently redirect safety-critical data into the sync
@@ -167,7 +167,7 @@ impl Paths {
         &self.upload_staging_directory
     }
 
-    /// Directory containing automatic recovery data.
+    /// Directory retaining recovery data created by older versions.
     #[must_use]
     pub fn recovery_directory(&self) -> &Path {
         &self.recovery_directory
@@ -294,7 +294,7 @@ pub enum PathRole {
     Journal,
     /// Immutable upload staging directory.
     UploadStaging,
-    /// Automatic recovery directory.
+    /// Legacy recovery directory.
     Recovery,
 }
 

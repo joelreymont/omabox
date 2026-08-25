@@ -365,10 +365,6 @@ pub enum OperationCompletion {
     UnexpectedBaseline,
     /// The supplied baseline does not match the final operation's result.
     BaselineMismatch,
-    /// A destructive operation has no durable recovery intent.
-    RecoveryRequired,
-    /// Recovery intent exists, but the recovery copy is not complete.
-    WaitingForRecovery(RecoveryId),
     /// This operation completed, while later work remains.
     OperationCompleted,
     /// This was the final operation; its plan and baseline completed atomically.
@@ -408,18 +404,18 @@ pub enum PlanSupersede {
     Superseded,
 }
 
-/// A recovery copy that must exist before its destructive operation runs.
+/// A legacy recovery copy retained from an older Omabox version.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryRecord {
     /// Durable recovery identity.
     pub id: RecoveryId,
-    /// Destructive operation guarded by this recovery record.
+    /// Operation that originally created this recovery record.
     pub operation_id: OperationId,
     /// Original synchronized path.
     pub original_path: PathBuf,
     /// Destination in the recovery area.
     pub recovery_path: PathBuf,
-    /// Identity of the bytes that must be recoverable.
+    /// Identity of the retained bytes.
     pub content: ContentIdentity,
     /// Durable completion state.
     pub status: RecordStatus,
@@ -428,6 +424,7 @@ pub struct RecoveryRecord {
 }
 
 /// Result of recording recovery intent.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecoveryWrite {
     /// A new recovery intent was committed.
@@ -443,6 +440,7 @@ pub enum RecoveryWrite {
 }
 
 /// Result of completing a recovery record.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoveryCompletion {
     /// The recovery record does not exist.
@@ -1533,33 +1531,19 @@ impl Journal {
             Some(baseline)
         };
 
-        if is_destructive(&operation) {
-            let recovery = transaction
-                .query_row(
-                    "SELECT id, status FROM recovery_records WHERE operation_id = ?1",
-                    [operation_id.0],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
-                )
-                .optional()
-                .map_err(|source| sqlite("find required recovery", &path, source))?;
-            let Some((recovery_id, status)) = recovery else {
-                return Ok(OperationCompletion::RecoveryRequired);
-            };
-            if decode_status(&status, "read required recovery status", &path)?
-                == RecordStatus::Pending
-            {
-                return Ok(OperationCompletion::WaitingForRecovery(RecoveryId(
-                    recovery_id,
-                )));
-            }
-        }
-
         transaction
             .execute(
                 "UPDATE operations SET status = 'completed' WHERE id = ?1",
                 [operation_id.0],
             )
             .map_err(|source| sqlite("complete operation", &path, source))?;
+        transaction
+            .execute(
+                "UPDATE recovery_records SET status = 'completed' \
+                 WHERE operation_id = ?1 AND status = 'pending'",
+                [operation_id.0],
+            )
+            .map_err(|source| sqlite("retire legacy recovery intent", &path, source))?;
         let Some(baseline) = final_baseline else {
             transaction
                 .commit()
@@ -1740,7 +1724,8 @@ impl Journal {
             .collect()
     }
 
-    /// Commit recovery intent before the associated destructive effect runs.
+    /// Commit a legacy recovery intent for compatibility tests.
+    #[cfg(test)]
     pub fn record_recovery_intent(
         &mut self,
         operation_id: OperationId,
@@ -1907,7 +1892,8 @@ impl Journal {
             .collect()
     }
 
-    /// Mark a recovery record complete without altering its operation or baseline.
+    /// Mark a test recovery record complete without altering its operation or baseline.
+    #[cfg(test)]
     pub fn complete_recovery(
         &mut self,
         recovery_id: RecoveryId,
@@ -2460,6 +2446,7 @@ fn read_plan(
     }))
 }
 
+#[cfg(test)]
 fn read_recovery_for_operation(
     connection: &Connection,
     database_path: &Path,
@@ -2564,6 +2551,7 @@ fn read_recovery(
     }))
 }
 
+#[cfg(test)]
 fn is_destructive(operation: &Operation) -> bool {
     matches!(
         operation,
@@ -2574,6 +2562,7 @@ fn is_destructive(operation: &Operation) -> bool {
     )
 }
 
+#[cfg(test)]
 fn missing_preservation(path: &Path) -> JournalError {
     JournalError::InvalidState {
         operation: "derive recovery content",
@@ -2582,6 +2571,7 @@ fn missing_preservation(path: &Path) -> JournalError {
     }
 }
 
+#[cfg(test)]
 fn displaced_content(preservation: &Operation, destructive: &Operation) -> Option<ContentIdentity> {
     match (preservation, destructive) {
         (
@@ -3407,7 +3397,7 @@ mod tests {
             &Observation::Present(LocalFile::new(content("replace"))),
             &Observation::Present(old),
         ))?;
-        let replace = recorded_plan(journal.record_plan(replace_path, &replace)?)?;
+        let _ = recorded_plan(journal.record_plan(replace_path, &replace)?)?;
 
         let download = operations(plan(
             &Baseline::Absent,
@@ -3427,23 +3417,26 @@ mod tests {
             OperationCompletion::PlanCompleted
         );
         assert_eq!(journal.pending_upload_content()?, vec![content("replace")]);
-        assert_eq!(replace.operations.len(), 2);
         Ok(())
     }
 
     #[test]
-    fn journal_destructive_completion_waits_for_derived_recovery_across_reopen()
+    fn journal_destructive_completion_retires_legacy_recovery_across_reopen()
     -> Result<(), Box<dyn Error>> {
         let directory = TempDir::new()?;
         let database_path = journal_path(&directory);
         let path = Path::new("replace.txt");
         let old = content("old");
         let target = Baseline::Present(remote_file("new", "rev-server"));
-        let operation_plan = operations(plan(
-            &Baseline::Present(remote_file("old", "rev-old")),
-            &Observation::Present(LocalFile::new(content("new"))),
-            &Observation::Present(remote_file("old", "rev-current")),
-        ))?;
+        let operation_plan = OperationPlan::new(vec![
+            Operation::PreserveRemote {
+                file: remote_file("old", "rev-current"),
+            },
+            Operation::ReplaceRemote {
+                content: content("new"),
+                expected_revision: DropboxRevision::new("rev-current"),
+            },
+        ]);
         let (plan, recovery) = {
             let mut journal = Journal::open(&database_path)?;
             let plan = recorded_plan(journal.record_plan(path, &operation_plan)?)?;
@@ -3459,10 +3452,6 @@ mod tests {
                 journal.complete_operation(plan.operations[0].id, None)?,
                 OperationCompletion::OperationCompleted
             );
-            assert_eq!(
-                journal.complete_operation(plan.operations[1].id, Some(&target))?,
-                OperationCompletion::RecoveryRequired
-            );
             let recovery = recorded_recovery(journal.record_recovery_intent(
                 plan.operations[1].id,
                 Path::new("recovery/replace.txt"),
@@ -3474,29 +3463,6 @@ mod tests {
         assert_eq!(recovery.content, old);
         assert_eq!(reopened.baseline(path)?, None);
         assert_eq!(reopened.pending_recoveries()?, vec![recovery.clone()]);
-        assert_eq!(
-            reopened.forget_completed_recovery(recovery.id)?,
-            RecoveryForget::Pending
-        );
-        assert_eq!(
-            reopened.complete_operation(plan.operations[1].id, Some(&target))?,
-            OperationCompletion::WaitingForRecovery(recovery.id)
-        );
-        assert_eq!(
-            reopened.complete_recovery(recovery.id)?,
-            RecoveryCompletion::Completed
-        );
-        let completed_copy =
-            read_recovery(&reopened.connection, &database_path, recovery.id, true)?.ok_or_else(
-                || JournalError::InvalidState {
-                    operation: "read completed test recovery copy",
-                    path: path.to_path_buf(),
-                    detail: "completed test recovery disappeared",
-                },
-            )?;
-        assert_eq!(completed_copy.status, RecordStatus::Completed);
-        assert_eq!(completed_copy.retained_at, None);
-        assert!(reopened.completed_recoveries()?.is_empty());
         assert_eq!(
             reopened.forget_completed_recovery(recovery.id)?,
             RecoveryForget::Pending
@@ -3944,11 +3910,15 @@ mod tests {
                 &Observation::Present(baseline_file.clone()),
             ))?;
             assert_eq!(journal.record_noop(path, &baseline)?, NoOpWrite::Recorded);
-            let operations = operations(plan(
-                &Baseline::Present(baseline_file.clone()),
-                &Observation::Present(LocalFile::new(content("local"))),
-                &Observation::Present(baseline_file.clone()),
-            ))?;
+            let operations = OperationPlan::new(vec![
+                Operation::PreserveRemote {
+                    file: baseline_file.clone(),
+                },
+                Operation::ReplaceRemote {
+                    content: content("local"),
+                    expected_revision: baseline_file.revision.clone(),
+                },
+            ]);
             let plan = recorded_plan(journal.record_plan(path, &operations)?)?;
             let [preservation, destructive] = plan.operations.as_slice() else {
                 return Err(JournalError::InvalidState {

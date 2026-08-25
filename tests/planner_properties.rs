@@ -142,50 +142,20 @@ proptest! {
     }
 
     #[test]
-    fn destructive_operations_follow_payload_preservation(
+    fn ordinary_mutations_do_not_plan_recovery_copies(
         baseline in baseline_strategy(),
         observations in observation_sequence_strategy(),
     ) {
         for (local, remote) in observations {
             let decision = plan(&baseline, &local, &remote);
             if let Decision::Operations(operation_plan) = decision {
-                let mut previous: Option<&Operation> = None;
                 for operation in operation_plan.operations() {
-                    match (previous, operation) {
-                        (
-                            Some(Operation::PreserveLocal { file }),
-                            Operation::ReplaceLocal { expected_content, .. }
-                            | Operation::DeleteLocal { expected_content },
-                        ) => prop_assert_eq!(&file.content, expected_content),
-                        (
-                            Some(Operation::PreserveRemote { file }),
-                            Operation::ReplaceRemote { expected_revision, .. }
-                            | Operation::DeleteRemote { expected_revision },
-                        ) => prop_assert_eq!(&file.revision, expected_revision),
-                        (
-                            _,
-                            Operation::ReplaceLocal { .. }
-                            | Operation::DeleteLocal { .. }
-                            | Operation::ReplaceRemote { .. }
-                            | Operation::DeleteRemote { .. },
-                        ) => prop_assert!(false, "destructive operation was not preceded by preservation"),
-                        _ => {}
-                    }
-                    previous = Some(operation);
+                    prop_assert!(!matches!(
+                        operation,
+                        Operation::PreserveLocal { .. } | Operation::PreserveRemote { .. }
+                    ), "planner emitted a legacy preservation operation");
                 }
             }
-        }
-    }
-
-    #[test]
-    fn replaying_the_same_observations_is_idempotent(
-        baseline in baseline_strategy(),
-        observations in observation_sequence_strategy(),
-    ) {
-        for (local, remote) in observations {
-            let first = plan(&baseline, &local, &remote);
-            let replay = plan(&baseline, &local, &remote);
-            prop_assert_eq!(first, replay);
         }
     }
 

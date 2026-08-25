@@ -1,11 +1,9 @@
 use std::error::Error;
 use std::io::{self, Cursor, Read};
-use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 use omabox::journal::{
     Journal, LocalObservationRecord, LocalRootBinding, OperationCompletion, PlanRecord, PlanWrite,
-    RecordStatus, RecoveryCompletion, RecoveryRecord, RecoveryWrite,
 };
 use omabox::local::{
     ConflictOutcome, ConflictSide, DeleteOutcome, InstallOutcome, ReplacementPreparation,
@@ -17,9 +15,7 @@ use omabox::model::{
     RemoteFile, UnknownReason,
 };
 use omabox::planner::plan;
-use omabox::recovery::{
-    RecoveryMaterialization, destination, materialize, replay_local_operations,
-};
+use omabox::recovery::replay_local_operations;
 use tempfile::TempDir;
 
 fn identity(bytes: &[u8]) -> Result<ContentIdentity, Box<dyn Error>> {
@@ -50,18 +46,6 @@ fn recorded_plan(write: PlanWrite) -> Result<PlanRecord, Box<dyn Error>> {
         PlanWrite::Recorded(plan) => Ok(plan),
         PlanWrite::AlreadyPending(_) => {
             Err(io::Error::other("test expected a newly recorded plan").into())
-        }
-    }
-}
-
-fn recorded_recovery(write: RecoveryWrite) -> Result<RecoveryRecord, Box<dyn Error>> {
-    match write {
-        RecoveryWrite::Recorded(record) => Ok(record),
-        RecoveryWrite::AlreadyRecorded(_)
-        | RecoveryWrite::OperationNotFound
-        | RecoveryWrite::OperationCompleted
-        | RecoveryWrite::OperationNotDestructive => {
-            Err(io::Error::other("test expected a newly recorded recovery").into())
         }
     }
 }
@@ -101,18 +85,6 @@ fn observation_for<'a>(
         .ok_or_else(|| io::Error::other("test inventory observation was missing").into())
 }
 
-fn materialized_recovery(
-    outcome: RecoveryMaterialization,
-) -> Result<omabox::local::VerifiedRecovery, Box<dyn Error>> {
-    match outcome {
-        RecoveryMaterialization::Created(recovery)
-        | RecoveryMaterialization::AlreadyPresent(recovery) => Ok(recovery),
-        RecoveryMaterialization::SourceChanged { .. } => {
-            Err(io::Error::other("test expected verified recovery bytes").into())
-        }
-    }
-}
-
 fn operation(
     plan: &PlanRecord,
     index: usize,
@@ -144,7 +116,7 @@ fn directory_effects_replay_after_the_filesystem_changed_before_journal_completi
     drop(journal);
 
     let mut reopened = Journal::open(&database)?;
-    let created = replay_local_operations(&mut reopened, &root, &recovery)?;
+    let created = replay_local_operations(&mut reopened, &root)?;
     assert_eq!(created.completed_operations, 1);
     assert_eq!(reopened.baseline(path)?, Some(Baseline::Directory));
     assert!(reopened.pending_plans()?.is_empty());
@@ -159,32 +131,10 @@ fn directory_effects_replay_after_the_filesystem_changed_before_journal_completi
     drop(reopened);
 
     let mut replayed = Journal::open(&database)?;
-    let deleted = replay_local_operations(&mut replayed, &root, &recovery)?;
+    let deleted = replay_local_operations(&mut replayed, &root)?;
     assert_eq!(deleted.completed_operations, 1);
     assert_eq!(replayed.baseline(path)?, None);
     assert!(replayed.pending_plans()?.is_empty());
-    Ok(())
-}
-
-#[test]
-fn failed_scan_never_replaces_the_last_complete_inventory() -> Result<(), Box<dyn Error>> {
-    let directory = TempDir::new()?;
-    let root = directory.path().join("root");
-    let outside = directory.path().join("outside");
-    std::fs::create_dir_all(&root)?;
-    std::fs::create_dir_all(&outside)?;
-    std::fs::write(outside.join("payload.txt"), b"outside")?;
-    let database = directory.path().join("journal.sqlite3");
-    let old = LocalObservationRecord {
-        path: PathBuf::from("old.txt"),
-        observation: Observation::Present(LocalFile::new(identity(b"old")?)),
-    };
-    let mut journal = Journal::open(&database)?;
-    journal.publish_local_inventory(std::slice::from_ref(&old))?;
-    symlink(&outside, root.join("escape"))?;
-
-    assert!(scan_and_publish(&mut journal, &root).is_err());
-    assert_eq!(journal.local_inventory()?, vec![old]);
     Ok(())
 }
 
@@ -417,7 +367,7 @@ fn restart_installs_a_verified_download_and_replay_is_idempotent() -> Result<(),
     }
 
     let mut reopened = Journal::open(&database)?;
-    let report = replay_local_operations(&mut reopened, &root, &recovery)?;
+    let report = replay_local_operations(&mut reopened, &root)?;
     assert_eq!(report.completed_operations, 1);
     assert!(report.blocked.is_empty());
     assert_eq!(
@@ -431,7 +381,7 @@ fn restart_installs_a_verified_download_and_replay_is_idempotent() -> Result<(),
     drop(reopened);
 
     let mut replayed = Journal::open(&database)?;
-    let second = replay_local_operations(&mut replayed, &root, &recovery)?;
+    let second = replay_local_operations(&mut replayed, &root)?;
     assert_eq!(second.completed_operations, 0);
     assert!(second.blocked.is_empty());
     Ok(())
@@ -469,7 +419,7 @@ fn installed_download_completes_after_restart_without_its_consumed_stage()
     }
 
     let mut reopened = Journal::open(&database)?;
-    let report = replay_local_operations(&mut reopened, &root, &recovery)?;
+    let report = replay_local_operations(&mut reopened, &root)?;
     assert_eq!(report.completed_operations, 1);
     assert!(report.blocked.is_empty());
     assert_eq!(std::fs::read(root.join("installed.txt"))?, b"durable");
@@ -481,7 +431,7 @@ fn installed_download_completes_after_restart_without_its_consumed_stage()
 }
 
 #[test]
-fn replacement_replays_between_real_recovery_phases() -> Result<(), Box<dyn Error>> {
+fn replacement_replays_without_a_recovery_copy() -> Result<(), Box<dyn Error>> {
     let directory = TempDir::new()?;
     let root = directory.path().join("root");
     let recovery_directory = directory.path().join("recovery");
@@ -496,47 +446,22 @@ fn replacement_replays_between_real_recovery_phases() -> Result<(), Box<dyn Erro
         &Observation::Present(LocalFile::new(old.content.clone())),
         &Observation::Present(new.clone()),
     ))?;
-
-    let (replace, recovery_record) = {
+    let replace = {
         let mut journal = Journal::open(&database)?;
-        let plan = recorded_plan(journal.record_plan(Path::new("replace.txt"), &operation_plan)?)?;
-        let replace = operation(&plan, 1)?.clone();
-        let recovery_path =
-            destination(&recovery_directory, Path::new("replace.txt"), &old.content);
-        let recovery_record =
-            recorded_recovery(journal.record_recovery_intent(replace.id, &recovery_path)?)?;
+        let recorded =
+            recorded_plan(journal.record_plan(Path::new("replace.txt"), &operation_plan)?)?;
         staged_download(stage_download(
             &root,
             "replace.txt",
             &new.content,
             Cursor::new(b"new"),
         )?)?;
-        (replace, recovery_record)
+        operation(&recorded, 0)?.clone()
     };
 
-    let _verified =
-        materialized_recovery(materialize(&root, &recovery_directory, &recovery_record)?)?;
-    assert_eq!(std::fs::read(&recovery_record.recovery_path)?, b"old");
-    {
-        let journal = Journal::open(&database)?;
-        let pending = journal.pending_plans()?;
-        let pending_plan = pending
-            .first()
-            .ok_or_else(|| io::Error::other("test expected a pending replacement plan"))?;
-        assert_eq!(operation(pending_plan, 0)?.status, RecordStatus::Pending);
-    }
-
-    {
-        let mut journal = Journal::open(&database)?;
-        assert_eq!(
-            journal.complete_recovery(recovery_record.id)?,
-            RecoveryCompletion::Completed
-        );
-    }
-
     let mut reopened = Journal::open(&database)?;
-    let report = replay_local_operations(&mut reopened, &root, &recovery_directory)?;
-    assert_eq!(report.completed_operations, 2);
+    let report = replay_local_operations(&mut reopened, &root)?;
+    assert_eq!(report.completed_operations, 1);
     assert!(report.blocked.is_empty());
     assert_eq!(std::fs::read(root.join("replace.txt"))?, b"new");
     assert_eq!(
@@ -547,7 +472,9 @@ fn replacement_replays_between_real_recovery_phases() -> Result<(), Box<dyn Erro
         reopened.baseline(Path::new("replace.txt"))?,
         Some(Baseline::Present(new))
     );
-    assert_eq!(std::fs::read(recovery_record.recovery_path)?, b"old");
+    assert!(recovery_directory.read_dir()?.next().is_none());
+    assert!(reopened.pending_recoveries()?.is_empty());
+    assert!(reopened.completed_recoveries()?.is_empty());
     Ok(())
 }
 
@@ -570,23 +497,8 @@ fn replacement_resumes_from_a_durable_displacement_guard() -> Result<(), Box<dyn
 
     {
         let mut journal = Journal::open(&database)?;
-        let plan = recorded_plan(journal.record_plan(Path::new("guarded.txt"), &operation_plan)?)?;
-        let preserve = operation(&plan, 0)?;
-        let replace = operation(&plan, 1)?;
-        let recovery_path =
-            destination(&recovery_directory, Path::new("guarded.txt"), &old.content);
-        let recovery_record =
-            recorded_recovery(journal.record_recovery_intent(replace.id, &recovery_path)?)?;
-        let verified =
-            materialized_recovery(materialize(&root, &recovery_directory, &recovery_record)?)?;
-        assert_eq!(
-            journal.complete_recovery(recovery_record.id)?,
-            RecoveryCompletion::Completed
-        );
-        assert_eq!(
-            journal.complete_operation(preserve.id, None)?,
-            OperationCompletion::OperationCompleted
-        );
+        let _recorded =
+            recorded_plan(journal.record_plan(Path::new("guarded.txt"), &operation_plan)?)?;
         staged_download(stage_download(
             &root,
             "guarded.txt",
@@ -594,14 +506,14 @@ fn replacement_resumes_from_a_durable_displacement_guard() -> Result<(), Box<dyn
             Cursor::new(b"new"),
         )?)?;
         assert_eq!(
-            prepare_replacement(&root, "guarded.txt", &verified)?,
+            prepare_replacement(&root, "guarded.txt", &old.content)?,
             ReplacementPreparation::Prepared
         );
         assert!(!root.join("guarded.txt").exists());
     }
 
     let mut reopened = Journal::open(&database)?;
-    let report = replay_local_operations(&mut reopened, &root, &recovery_directory)?;
+    let report = replay_local_operations(&mut reopened, &root)?;
     assert_eq!(report.completed_operations, 1);
     assert!(report.blocked.is_empty());
     assert_eq!(std::fs::read(root.join("guarded.txt"))?, b"new");
@@ -609,6 +521,7 @@ fn replacement_resumes_from_a_durable_displacement_guard() -> Result<(), Box<dyn
         reopened.baseline(Path::new("guarded.txt"))?,
         Some(Baseline::Present(new))
     );
+    assert!(recovery_directory.read_dir()?.next().is_none());
     Ok(())
 }
 
@@ -619,44 +532,28 @@ fn deletion_replays_after_effect_but_before_journal_completion() -> Result<(), B
     let recovery_directory = directory.path().join("recovery");
     std::fs::create_dir_all(&root)?;
     std::fs::create_dir_all(&recovery_directory)?;
-    std::fs::write(root.join("delete.txt"), b"keep me")?;
+    std::fs::write(root.join("delete.txt"), b"delete me")?;
     let database = directory.path().join("journal.sqlite3");
-    let old = remote(b"keep me", "rev-old")?;
+    let old = remote(b"delete me", "rev-old")?;
     let operation_plan = operations(plan(
         &Baseline::Present(old.clone()),
         &Observation::Present(LocalFile::new(old.content.clone())),
         &Observation::ConfirmedAbsent,
     ))?;
 
-    let (delete, recovery_record) = {
+    let delete = {
         let mut journal = Journal::open(&database)?;
-        let plan = recorded_plan(journal.record_plan(Path::new("delete.txt"), &operation_plan)?)?;
-        let preserve = operation(&plan, 0)?;
-        let delete = operation(&plan, 1)?.clone();
-        let recovery_path = destination(&recovery_directory, Path::new("delete.txt"), &old.content);
-        let recovery_record =
-            recorded_recovery(journal.record_recovery_intent(delete.id, &recovery_path)?)?;
-        let verified =
-            materialized_recovery(materialize(&root, &recovery_directory, &recovery_record)?)?;
+        let recorded =
+            recorded_plan(journal.record_plan(Path::new("delete.txt"), &operation_plan)?)?;
         assert_eq!(
-            journal.complete_recovery(recovery_record.id)?,
-            RecoveryCompletion::Completed
-        );
-        assert_eq!(
-            journal.complete_operation(preserve.id, None)?,
-            OperationCompletion::OperationCompleted
-        );
-        assert_eq!(
-            omabox::local::delete_local(&root, "delete.txt", &verified)?,
+            omabox::local::delete_local(&root, "delete.txt", &old.content)?,
             DeleteOutcome::Deleted
         );
-        (delete, recovery_record)
+        operation(&recorded, 0)?.clone()
     };
 
-    assert!(!root.join("delete.txt").exists());
-    assert_eq!(std::fs::read(&recovery_record.recovery_path)?, b"keep me");
     let mut reopened = Journal::open(&database)?;
-    let report = replay_local_operations(&mut reopened, &root, &recovery_directory)?;
+    let report = replay_local_operations(&mut reopened, &root)?;
     assert_eq!(report.completed_operations, 1);
     assert!(report.blocked.is_empty());
     assert_eq!(
@@ -664,12 +561,12 @@ fn deletion_replays_after_effect_but_before_journal_completion() -> Result<(), B
         OperationCompletion::AlreadyCompleted
     );
     assert_eq!(reopened.baseline(Path::new("delete.txt"))?, None);
-    assert_eq!(std::fs::read(recovery_record.recovery_path)?, b"keep me");
+    assert!(recovery_directory.read_dir()?.next().is_none());
     Ok(())
 }
 
 #[test]
-fn changed_delete_precondition_is_preserved_and_left_pending() -> Result<(), Box<dyn Error>> {
+fn changed_delete_precondition_is_left_pending_without_a_copy() -> Result<(), Box<dyn Error>> {
     let directory = TempDir::new()?;
     let root = directory.path().join("root");
     let recovery_directory = directory.path().join("recovery");
@@ -684,32 +581,17 @@ fn changed_delete_precondition_is_preserved_and_left_pending() -> Result<(), Box
         &Observation::ConfirmedAbsent,
     ))?;
     let mut journal = Journal::open(&database)?;
-    let plan = recorded_plan(journal.record_plan(Path::new("changed.txt"), &operation_plan)?)?;
-    let preserve = operation(&plan, 0)?;
-    let delete = operation(&plan, 1)?;
-    let recovery_path = destination(&recovery_directory, Path::new("changed.txt"), &old.content);
-    let recovery_record =
-        recorded_recovery(journal.record_recovery_intent(delete.id, &recovery_path)?)?;
-    let verified =
-        materialized_recovery(materialize(&root, &recovery_directory, &recovery_record)?)?;
-    assert_eq!(
-        journal.complete_recovery(recovery_record.id)?,
-        RecoveryCompletion::Completed
-    );
-    assert_eq!(
-        journal.complete_operation(preserve.id, None)?,
-        OperationCompletion::OperationCompleted
-    );
+    let _recorded = recorded_plan(journal.record_plan(Path::new("changed.txt"), &operation_plan)?)?;
 
     std::fs::write(root.join("changed.txt"), b"new local edit")?;
     assert_eq!(
-        omabox::local::delete_local(&root, "changed.txt", &verified)?,
+        omabox::local::delete_local(&root, "changed.txt", &old.content)?,
         DeleteOutcome::PreconditionChanged {
             actual: Some(identity(b"new local edit")?)
         }
     );
     assert_eq!(std::fs::read(root.join("changed.txt"))?, b"new local edit");
-    assert_eq!(std::fs::read(recovery_record.recovery_path)?, b"old");
+    assert!(recovery_directory.read_dir()?.next().is_none());
     assert_eq!(journal.pending_plans()?.len(), 1);
     Ok(())
 }

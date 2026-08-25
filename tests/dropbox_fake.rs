@@ -30,7 +30,7 @@ use omabox::planner::plan;
 use omabox::reconcile::{
     ExactDownloadPool, ReconcileError, ReconcileOutcome, reconcile_once, replay_pending,
 };
-use omabox::recovery::{ReplayBlocked, ReplayReport, destination, replay_remote_operations};
+use omabox::recovery::{ReplayBlocked, ReplayReport, replay_remote_operations};
 use omabox::runtime_status::{
     TransferDirection, TransferEvent, TransferObserver, TransferProgress,
 };
@@ -43,11 +43,10 @@ fn drive_replay(
     downloads: &mut ExactDownloadPool,
     root: &Path,
     staging: &Path,
-    recovery: &Path,
 ) -> io::Result<Result<ReplayReport, ReconcileError>> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        match replay_pending(journal, client, downloads, root, staging, recovery) {
+        match replay_pending(journal, client, downloads, root, staging) {
             Ok(report)
                 if report
                     .blocked
@@ -389,14 +388,7 @@ fn one_reconciliation_pass_synchronizes_files_in_both_directions() -> Result<(),
     assert_eq!(report.replayed_operations, 1);
     assert_eq!(report.blocked, 1);
     assert_eq!(report.conflicts, 0);
-    let completed_download = drive_replay(
-        &mut journal,
-        &client,
-        &mut downloads,
-        &root,
-        &staging,
-        &recovery,
-    )??;
+    let completed_download = drive_replay(&mut journal, &client, &mut downloads, &root, &staging)??;
     assert_eq!(completed_download.completed_operations, 1);
     assert_eq!(std::fs::read(root.join("download.txt"))?, download_bytes);
     assert_eq!(
@@ -863,7 +855,6 @@ fn local_directory_preserves_a_dropbox_file_under_a_synchronized_name() -> Resul
             "has_more": false
         })),
         download(),
-        download(),
         FakeResponse::json(json!({"metadata": original})),
         FakeResponse::json(json!({
             "metadata": folder_metadata("/node", "/node")
@@ -920,7 +911,7 @@ fn local_directory_preserves_a_dropbox_file_under_a_synchronized_name() -> Resul
         }
     };
     assert_eq!(first.planned, 1);
-    assert_eq!(first.replayed_operations, 3);
+    assert_eq!(first.replayed_operations, 2);
     assert!(root.join("node").is_dir());
     assert_eq!(std::fs::read(root.join(&variant))?, bytes);
     assert_eq!(
@@ -929,7 +920,7 @@ fn local_directory_preserves_a_dropbox_file_under_a_synchronized_name() -> Resul
     );
     assert!(journal.pending_plans()?.is_empty());
     assert!(journal.conflicts()?.is_empty());
-    assert_eq!(journal.completed_recoveries()?.len(), 1);
+    assert!(journal.completed_recoveries()?.is_empty());
 
     let second = match reconcile_once(
         &mut journal,
@@ -956,13 +947,13 @@ fn local_directory_preserves_a_dropbox_file_under_a_synchronized_name() -> Resul
     ));
     assert!(journal.conflicts()?.is_empty());
     let requests = server.finish()?;
-    assert_eq!(requests.len(), 10);
+    assert_eq!(requests.len(), 9);
     assert_eq!(
         requests
             .iter()
             .filter(|request| request.path == "/2/files/download")
             .count(),
-        2
+        1
     );
     assert!(
         requests
@@ -997,10 +988,6 @@ fn directory_collision_copy_stays_bound_to_the_verified_root() -> Result<(), Box
         download_metadata("node", "rev-root-swap", &content, bytes.len()),
     );
     let (visible_download, gate) = visible_download.gated();
-    let recovery_download = FakeResponse::bytes(bytes.to_vec()).header(
-        "Dropbox-API-Result",
-        download_metadata("node", "rev-root-swap", &content, bytes.len()),
-    );
     let server = FakeServer::start(vec![
         FakeResponse::json(json!({
             "account_id": "account",
@@ -1012,7 +999,6 @@ fn directory_collision_copy_stays_bound_to_the_verified_root() -> Result<(), Box
             "has_more": false
         })),
         visible_download,
-        recovery_download,
     ])?;
     let client = Arc::new(fake_client(
         &server,
@@ -1062,7 +1048,7 @@ fn directory_collision_copy_stays_bound_to_the_verified_root() -> Result<(), Box
     assert_eq!(std::fs::read(root.join("canary.txt"))?, b"replacement root");
     assert!(journal.pending_plans()?.is_empty());
     assert_eq!(journal.baseline(Path::new("node"))?, None);
-    assert_eq!(server.finish()?.len(), 4);
+    assert_eq!(server.finish()?.len(), 3);
     Ok(())
 }
 
@@ -1172,7 +1158,6 @@ fn occupied_collision_stage_uses_the_next_synchronized_name() -> Result<(), Box<
             "has_more": false
         })),
         download(),
-        download(),
         FakeResponse::json(json!({"metadata": original})),
         FakeResponse::json(json!({
             "metadata": folder_metadata("/node", "/node")
@@ -1225,7 +1210,7 @@ fn occupied_collision_stage_uses_the_next_synchronized_name() -> Result<(), Box<
     };
 
     assert_eq!(report.planned, 1);
-    assert_eq!(report.replayed_operations, 3);
+    assert_eq!(report.replayed_operations, 2);
     assert!(!root.join(&first_variant).exists());
     assert_eq!(std::fs::read(root.join(&second_variant))?, bytes);
     assert_eq!(std::fs::read(&occupied_stage)?, b"unrelated stage bytes");
@@ -1235,7 +1220,7 @@ fn occupied_collision_stage_uses_the_next_synchronized_name() -> Result<(), Box<
     );
     assert!(journal.pending_plans()?.is_empty());
     assert!(journal.conflicts()?.is_empty());
-    assert_eq!(server.finish()?.len(), 6);
+    assert_eq!(server.finish()?.len(), 5);
     Ok(())
 }
 
@@ -1263,7 +1248,6 @@ fn changed_dropbox_file_during_directory_conversion_replans_without_a_conflict_r
             "cursor": "old-file",
             "has_more": false
         })),
-        download(),
         download(),
         FakeResponse::status_json(409, json!({"error": {".tag": "path"}})),
         FakeResponse::json(file_metadata("/node", "/node", "rev-new", &new_content)),
@@ -1309,7 +1293,7 @@ fn changed_dropbox_file_during_directory_conversion_replans_without_a_conflict_r
     assert!(journal.conflicts()?.is_empty());
     assert_eq!(journal.baseline(Path::new("node"))?, None);
     let requests = server.finish()?;
-    assert_eq!(requests.len(), 6);
+    assert_eq!(requests.len(), 5);
     assert!(
         !requests
             .iter()
@@ -1732,14 +1716,7 @@ fn pending_exact_downloads_use_bounded_parallel_workers() -> Result<(), Box<dyn 
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut completed_operations = 0;
     while !journal.pending_plans()?.is_empty() {
-        let report = replay_pending(
-            &mut journal,
-            &client,
-            &mut downloads,
-            &root,
-            &staging,
-            &recovery,
-        )?;
+        let report = replay_pending(&mut journal, &client, &mut downloads, &root, &staging)?;
         completed_operations += report.completed_operations;
         if Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -1846,14 +1823,7 @@ fn gated_download_does_not_stop_the_next_poll_and_reconciliation() -> Result<(),
         return Err(io::Error::other("fresh long download plan was already pending").into());
     }
 
-    let dispatched = replay_pending(
-        &mut journal,
-        &client,
-        &mut downloads,
-        &root,
-        &staging,
-        &recovery,
-    )?;
+    let dispatched = replay_pending(&mut journal, &client, &mut downloads, &root, &staging)?;
     assert_eq!(dispatched.completed_operations, 0);
     gate.request_received.recv().map_err(|_| {
         io::Error::other("fake Dropbox server stopped before receiving the long download")
@@ -1909,14 +1879,7 @@ fn gated_download_does_not_stop_the_next_poll_and_reconciliation() -> Result<(),
         thread::yield_now();
     }
     while !journal.pending_plans()?.is_empty() {
-        let _report = replay_pending(
-            &mut journal,
-            &client,
-            &mut downloads,
-            &root,
-            &staging,
-            &recovery,
-        )?;
+        let _report = replay_pending(&mut journal, &client, &mut downloads, &root, &staging)?;
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -2012,16 +1975,7 @@ fn interrupted_exact_download_resumes_only_from_a_valid_range() -> Result<(), Bo
         return Err(io::Error::other("fresh resume plan was already pending").into());
     }
 
-    let mut replay = || {
-        drive_replay(
-            &mut journal,
-            &client,
-            &mut downloads,
-            &root,
-            &staging,
-            &recovery,
-        )
-    };
+    let mut replay = || drive_replay(&mut journal, &client, &mut downloads, &root, &staging);
     assert!(replay()?.is_err());
     let partial = std::fs::read_dir(&staging)?
         .map(|entry| entry.map(|entry| entry.path()))
@@ -2153,14 +2107,7 @@ fn unknown_download_slots_are_preserved_with_disposable_fallback() -> Result<(),
     ))?;
     let _ = journal.record_plan(Path::new("fallback.txt"), &operations)?;
 
-    let report = drive_replay(
-        &mut journal,
-        &client,
-        &mut downloads,
-        &root,
-        &staging,
-        &recovery,
-    )??;
+    let report = drive_replay(&mut journal, &client, &mut downloads, &root, &staging)??;
 
     assert_eq!(report.completed_operations, 1);
     assert_eq!(std::fs::read(root.join("fallback.txt"))?, bytes);
@@ -2222,14 +2169,7 @@ fn root_swap_after_replay_validation_never_touches_the_replacement() -> Result<(
         return Err(io::Error::other("fresh root-swap plan was already pending").into());
     }
 
-    let dispatched = replay_pending(
-        &mut journal,
-        &client,
-        &mut downloads,
-        &root,
-        &staging,
-        &recovery,
-    )?;
+    let dispatched = replay_pending(&mut journal, &client, &mut downloads, &root, &staging)?;
     assert_eq!(dispatched.completed_operations, 0);
     gate.request_received.recv().map_err(|_| {
         io::Error::other("fake Dropbox server stopped before receiving the request")
@@ -2264,14 +2204,7 @@ fn root_swap_after_replay_validation_never_touches_the_replacement() -> Result<(
         thread::yield_now();
     }
 
-    let outcome = replay_pending(
-        &mut journal,
-        &client,
-        &mut downloads,
-        &root,
-        &staging,
-        &recovery,
-    );
+    let outcome = replay_pending(&mut journal, &client, &mut downloads, &root, &staging);
 
     assert!(matches!(outcome, Err(ReconcileError::LocalRootChanged)));
     assert_eq!(
@@ -2346,17 +2279,7 @@ fn completed_download_batch_is_installed_before_the_next_batch_fails() -> Result
         }
     }
 
-    assert!(
-        drive_replay(
-            &mut journal,
-            &client,
-            &mut downloads,
-            &root,
-            &staging,
-            &recovery,
-        )?
-        .is_err()
-    );
+    assert!(drive_replay(&mut journal, &client, &mut downloads, &root, &staging,)?.is_err());
 
     for path in &paths[..COMPLETED_BATCH] {
         assert_eq!(std::fs::read(root.join(path))?, bytes);
@@ -2809,8 +2732,8 @@ fn ambiguous_mutations_are_verified_once_and_preserve_the_original_failure()
 }
 
 #[test]
-fn remote_replay_preserves_old_revision_and_retires_a_replacement_conflict()
--> Result<(), Box<dyn Error>> {
+fn remote_replay_preserves_conflict_sides_without_a_backup_download() -> Result<(), Box<dyn Error>>
+{
     let old_bytes = b"common bytes";
     let local_bytes = b"new local bytes";
     let remote_bytes = b"new remote bytes";
@@ -2823,7 +2746,6 @@ fn remote_replay_preserves_old_revision_and_retires_a_replacement_conflict()
         dropbox_content_hash(remote_bytes.as_slice())?,
         DropboxRevision::new("current-rev"),
     );
-    let old_metadata = download_metadata("replace.txt", "old-rev", &old.content, old_bytes.len());
     let current_metadata = download_metadata(
         "replace.txt",
         "current-rev",
@@ -2831,7 +2753,6 @@ fn remote_replay_preserves_old_revision_and_retires_a_replacement_conflict()
         remote_bytes.len(),
     );
     let server = FakeServer::start(vec![
-        FakeResponse::bytes(old_bytes.to_vec()).header("Dropbox-API-Result", old_metadata),
         FakeResponse::status_json(409, json!({"error": {".tag": "path"}})),
         FakeResponse::json(file_metadata(
             "/replace.txt",
@@ -2862,8 +2783,8 @@ fn remote_replay_preserves_old_revision_and_retires_a_replacement_conflict()
         PlanWrite::Recorded(_)
     ));
 
-    let report = replay_remote_operations(&mut journal, &client, &root, &staging, &recovery)?;
-    assert_eq!(report.completed_operations, 2);
+    let report = replay_remote_operations(&mut journal, &client, &root, &staging)?;
+    assert_eq!(report.completed_operations, 1);
     assert!(report.blocked.is_empty());
     assert!(journal.pending_plans()?.is_empty());
     assert_eq!(
@@ -2881,27 +2802,20 @@ fn remote_replay_preserves_old_revision_and_retires_a_replacement_conflict()
             },
         }]
     );
-    assert_eq!(
-        std::fs::read(destination(
-            &recovery,
-            Path::new("replace.txt"),
-            &old.content,
-        ))?,
-        old_bytes
-    );
+    assert!(recovery.read_dir()?.next().is_none());
+    assert!(journal.pending_recoveries()?.is_empty());
+    assert!(journal.completed_recoveries()?.is_empty());
     assert_eq!(
         conflict_bytes(&root)?,
         vec![local_bytes.to_vec(), remote_bytes.to_vec()]
     );
 
     let requests = server.finish()?;
-    assert_eq!(requests.len(), 4);
-    assert_eq!(requests[0].path, "/2/files/download");
-    assert_eq!(requests[1].path, "/2/files/upload");
-    assert_eq!(requests[2].path, "/2/files/get_metadata");
-    assert_eq!(requests[3].path, "/2/files/download");
-    assert!(required_header(&requests[0], "dropbox-api-arg")?.contains("rev:old-rev"));
-    assert!(required_header(&requests[3], "dropbox-api-arg")?.contains("rev:current-rev"));
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].path, "/2/files/upload");
+    assert_eq!(requests[1].path, "/2/files/get_metadata");
+    assert_eq!(requests[2].path, "/2/files/download");
+    assert!(required_header(&requests[2], "dropbox-api-arg")?.contains("rev:current-rev"));
     Ok(())
 }
 
@@ -2951,7 +2865,7 @@ fn remote_replay_creates_nested_parents_before_the_file() -> Result<(), Box<dyn 
         PlanWrite::Recorded(_)
     ));
 
-    let report = replay_remote_operations(&mut journal, &client, &root, &staging, &recovery)?;
+    let report = replay_remote_operations(&mut journal, &client, &root, &staging)?;
     assert_eq!(report.completed_operations, 1);
     assert!(report.blocked.is_empty());
     assert_eq!(
@@ -3002,7 +2916,7 @@ fn stale_create_source_has_no_remote_effect() -> Result<(), Box<dyn Error>> {
         PlanWrite::Recorded(_)
     ));
 
-    let report = replay_remote_operations(&mut journal, &client, &root, &staging, &recovery)?;
+    let report = replay_remote_operations(&mut journal, &client, &root, &staging)?;
     assert_eq!(
         report.blocked,
         vec![ReplayBlocked::PreconditionChanged {
@@ -3016,7 +2930,7 @@ fn stale_create_source_has_no_remote_effect() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn remote_replay_rebuilds_missing_recovery_and_leaves_ambiguous_create_pending()
+fn remote_delete_skips_backup_download_and_ambiguous_create_stays_pending()
 -> Result<(), Box<dyn Error>> {
     let old_bytes = b"old remote bytes";
     let old = RemoteFile::new(
@@ -3037,37 +2951,24 @@ fn remote_replay_rebuilds_missing_recovery_and_leaves_ambiguous_create_pending()
         &Observation::ConfirmedAbsent,
         &Observation::Present(old.clone()),
     ))?;
-    let delete_plan = match journal.record_plan(Path::new("delete.txt"), &delete)? {
-        PlanWrite::Recorded(plan) => plan,
+    match journal.record_plan(Path::new("delete.txt"), &delete)? {
+        PlanWrite::Recorded(_) => {}
         PlanWrite::AlreadyPending(_) => {
             return Err(io::Error::other("test expected a new delete plan").into());
         }
-    };
-    let preserve_operation = delete_plan
-        .operations
-        .first()
-        .ok_or_else(|| io::Error::other("test expected a preservation operation"))?;
-    assert!(matches!(
-        journal.complete_operation(preserve_operation.id, None)?,
-        omabox::journal::OperationCompletion::OperationCompleted
-    ));
-    let recovery_path = destination(&recovery, Path::new("delete.txt"), &old.content);
-    let delete_metadata = download_metadata("delete.txt", "old-rev", &old.content, old_bytes.len());
-    let delete_server = FakeServer::start(vec![
-        FakeResponse::bytes(old_bytes.to_vec()).header("Dropbox-API-Result", delete_metadata),
-        FakeResponse::json(json!({
-            "metadata": file_metadata("/delete.txt", "/Delete.txt", "old-rev", &old.content)
-        })),
-    ])?;
+    }
+    let delete_server = FakeServer::start(vec![FakeResponse::json(json!({
+        "metadata": file_metadata("/delete.txt", "/Delete.txt", "old-rev", &old.content)
+    }))])?;
     let delete_client = fake_client(&delete_server, "opaque-access-replay-delete")?;
-    let report =
-        replay_remote_operations(&mut journal, &delete_client, &root, &staging, &recovery)?;
+    let report = replay_remote_operations(&mut journal, &delete_client, &root, &staging)?;
     assert_eq!(report.completed_operations, 1);
-    assert_eq!(std::fs::read(recovery_path)?, old_bytes);
+    assert!(recovery.read_dir()?.next().is_none());
+    assert!(journal.pending_recoveries()?.is_empty());
+    assert!(journal.completed_recoveries()?.is_empty());
     let requests = delete_server.finish()?;
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].path, "/2/files/download");
-    assert_eq!(requests[1].path, "/2/files/delete_v2");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/2/files/delete_v2");
 
     std::fs::write(root.join("create.txt"), b"desired bytes")?;
     let desired = LocalFile::new(dropbox_content_hash(b"desired bytes".as_slice())?);
@@ -3088,8 +2989,7 @@ fn remote_replay_rebuilds_missing_recovery_and_leaves_ambiguous_create_pending()
         ),
     ])?;
     let pending_client = fake_client(&pending_server, "opaque-access-replay-pending")?;
-    let pending =
-        replay_remote_operations(&mut journal, &pending_client, &root, &staging, &recovery)?;
+    let pending = replay_remote_operations(&mut journal, &pending_client, &root, &staging)?;
     assert_eq!(
         pending.blocked,
         vec![ReplayBlocked::RemotePending {

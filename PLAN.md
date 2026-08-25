@@ -21,8 +21,8 @@ systemd user service, and exposes useful CLI and Omarchy widget status.
 - Stage and hash downloads, then install them by same-filesystem atomic rename.
 - Stage immutable uploads and condition replacement/deletion on the known
   Dropbox revision.
-- Preserve every distinct payload automatically through recovery or a
-  deterministic synchronized copy; never require manual journal repair.
+- Preserve every genuinely divergent local and Dropbox payload as synchronized
+  conflict copies; never choose a conflict side destructively.
 - Treat a newly configured empty local root as a new root generation, not as
   evidence that remote content was deleted.
 

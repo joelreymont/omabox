@@ -15,23 +15,19 @@ no operation: local and remote content match
 
 local edit
 operations:
-1. preserve displaced remote payload
-2. replace remote content if the expected revision still matches
+1. replace remote content if the expected revision still matches
 
 remote edit
 operations:
-1. preserve displaced local payload
-2. replace local content
+1. replace local content
 
 explicit local deletion
 operations:
-1. preserve displaced remote payload
-2. delete remote file if the expected revision still matches
+1. delete remote file if the expected revision still matches
 
 explicit remote deletion
 operations:
-1. preserve displaced local payload
-2. delete local file
+1. delete local file
 
 inaccessible local state
 blocked: local path is inaccessible
