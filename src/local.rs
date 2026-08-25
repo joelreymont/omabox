@@ -27,6 +27,7 @@ use crate::journal::{
 use crate::model::{ContentIdentity, LocalFile, Observation, UnknownReason};
 
 const DROPBOX_BLOCK_SIZE: usize = 4 * 1024 * 1024;
+const HASH_IO_BUFFER_SIZE: usize = 64 * 1024;
 const MAX_PARALLEL_HASHES: usize = 12;
 // Exceeds FAT's two-second mtime tick. The cache requires coherent local
 // filesystem metadata; arbitrary stale network metadata is not supported.
@@ -417,24 +418,35 @@ impl DownloadPartial {
             .into());
         }
 
-        let mut block = vec![0_u8; DROPBOX_BLOCK_SIZE];
+        let mut buffer = [0_u8; HASH_IO_BUFFER_SIZE];
         while self.offset < total {
             let remaining = total - self.offset;
             let block_length = remaining.min(DROPBOX_BLOCK_SIZE as u64) as usize;
-            reader
-                .read_exact(&mut block[..block_length])
-                .map_err(|source| StageIoError::Read {
-                    operation: "read resumed download",
-                    path: self.location.target.clone(),
-                    source,
-                })?;
-            self.file
-                .write_all(&block[..block_length])
-                .map_err(|source| {
-                    io_failure("write resumed download", &self.location.slot_path, source)
-                })?;
-            self.aggregate
-                .update(Sha256::digest(&block[..block_length]));
+            let mut block_hasher = Sha256::new();
+            let mut copied = 0;
+            while copied < block_length {
+                let length = (block_length - copied).min(buffer.len());
+                if let Err(source) = reader.read_exact(&mut buffer[..length]) {
+                    self.discard_uncommitted_block()?;
+                    return Err(StageIoError::Read {
+                        operation: "read resumed download",
+                        path: self.location.target.clone(),
+                        source,
+                    });
+                }
+                if let Err(source) = self.file.write_all(&buffer[..length]) {
+                    self.discard_uncommitted_block()?;
+                    return Err(io_failure(
+                        "write resumed download",
+                        &self.location.slot_path,
+                        source,
+                    )
+                    .into());
+                }
+                block_hasher.update(&buffer[..length]);
+                copied += length;
+            }
+            self.aggregate.update(block_hasher.finalize());
             self.offset += block_length as u64;
             if self.offset.is_multiple_of(DOWNLOAD_CHECKPOINT_BYTES) && self.offset < total {
                 self.persist_checkpoint()?;
@@ -457,6 +469,16 @@ impl DownloadPartial {
             .into());
         }
         self.finish().map_err(Into::into)
+    }
+
+    fn discard_uncommitted_block(&mut self) -> Result<(), LocalError> {
+        self.file.set_len(self.offset).map_err(|source| {
+            io_failure(
+                "discard incomplete resumed download block",
+                &self.location.slot_path,
+                source,
+            )
+        })
     }
 
     fn persist_checkpoint(&mut self) -> Result<(), LocalError> {
@@ -1902,11 +1924,18 @@ fn hash_download_prefix(file: &mut File, offset: u64, path: &Path) -> Result<Sha
         .map_err(|source| io_failure("rewind resumed download", path, source))?;
     let mut aggregate = Sha256::new();
     let mut remaining = offset;
-    let mut block = vec![0_u8; DROPBOX_BLOCK_SIZE];
+    let mut buffer = [0_u8; HASH_IO_BUFFER_SIZE];
     while remaining != 0 {
-        file.read_exact(&mut block)
-            .map_err(|source| io_failure("rehash resumed download checkpoint", path, source))?;
-        aggregate.update(Sha256::digest(&block));
+        let mut block_hasher = Sha256::new();
+        let mut block_remaining = DROPBOX_BLOCK_SIZE;
+        while block_remaining != 0 {
+            let length = block_remaining.min(buffer.len());
+            file.read_exact(&mut buffer[..length])
+                .map_err(|source| io_failure("rehash resumed download checkpoint", path, source))?;
+            block_hasher.update(&buffer[..length]);
+            block_remaining -= length;
+        }
+        aggregate.update(block_hasher.finalize());
         remaining -= DROPBOX_BLOCK_SIZE as u64;
     }
     file.seek(SeekFrom::Start(offset))
@@ -2667,21 +2696,24 @@ fn revalidate_directories(
 
 fn hash_stream(reader: &mut impl Read) -> io::Result<ContentIdentity> {
     let mut aggregate = Sha256::new();
-    let mut block = vec![0_u8; DROPBOX_BLOCK_SIZE];
+    let mut buffer = [0_u8; HASH_IO_BUFFER_SIZE];
     loop {
-        let mut filled = 0;
-        while filled < block.len() {
-            let count = reader.read(&mut block[filled..])?;
+        let mut block_hasher = Sha256::new();
+        let mut block_length = 0;
+        while block_length < DROPBOX_BLOCK_SIZE {
+            let length = (DROPBOX_BLOCK_SIZE - block_length).min(buffer.len());
+            let count = reader.read(&mut buffer[..length])?;
             if count == 0 {
                 break;
             }
-            filled += count;
+            block_hasher.update(&buffer[..count]);
+            block_length += count;
         }
-        if filled == 0 {
+        if block_length == 0 {
             break;
         }
-        aggregate.update(Sha256::digest(&block[..filled]));
-        if filled < block.len() {
+        aggregate.update(block_hasher.finalize());
+        if block_length < DROPBOX_BLOCK_SIZE {
             break;
         }
     }
@@ -3258,30 +3290,34 @@ fn copy_and_hash(
     operation: &'static str,
 ) -> Result<ContentIdentity, StageIoError> {
     let mut aggregate = Sha256::new();
-    let mut block = vec![0_u8; DROPBOX_BLOCK_SIZE];
+    let mut buffer = [0_u8; HASH_IO_BUFFER_SIZE];
     loop {
-        let mut filled = 0;
-        while filled < block.len() {
-            let count = reader
-                .read(&mut block[filled..])
-                .map_err(|source| StageIoError::Read {
-                    operation,
-                    path: path.to_path_buf(),
-                    source,
-                })?;
+        let mut block_hasher = Sha256::new();
+        let mut block_length = 0;
+        while block_length < DROPBOX_BLOCK_SIZE {
+            let length = (DROPBOX_BLOCK_SIZE - block_length).min(buffer.len());
+            let count =
+                reader
+                    .read(&mut buffer[..length])
+                    .map_err(|source| StageIoError::Read {
+                        operation,
+                        path: path.to_path_buf(),
+                        source,
+                    })?;
             if count == 0 {
                 break;
             }
-            filled += count;
+            writer
+                .write_all(&buffer[..count])
+                .map_err(|source| io_failure("write private stage", path, source))?;
+            block_hasher.update(&buffer[..count]);
+            block_length += count;
         }
-        if filled == 0 {
+        if block_length == 0 {
             break;
         }
-        writer
-            .write_all(&block[..filled])
-            .map_err(|source| io_failure("write private stage", path, source))?;
-        aggregate.update(Sha256::digest(&block[..filled]));
-        if filled < block.len() {
+        aggregate.update(block_hasher.finalize());
+        if block_length < DROPBOX_BLOCK_SIZE {
             break;
         }
     }
