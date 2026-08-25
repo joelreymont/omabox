@@ -458,6 +458,12 @@ fn reconcile_active_root(
     let sync_root = sync_root.as_ref();
     let upload_staging = upload_staging.as_ref();
     let recovery_directory = recovery_directory.as_ref();
+    let published_local = journal.local_inventory()?;
+    if let CaseCollisionResolution::Renamed(path) =
+        resolve_case_collision(journal, sync_root, &published_local)?
+    {
+        return Ok(ReconcileOutcome::FreshObservationRequired { path });
+    }
     let replay = replay_pending_at(journal, dropbox, downloads, sync_root, upload_staging)?;
     let scan = match scan_and_publish(journal, sync_root) {
         Ok(ScanPublication::Published(scan)) => scan,
@@ -467,20 +473,10 @@ fn reconcile_active_root(
         }
         Err(source) => return Err(ReconcileError::Local { source }),
     };
-    if let Some(source) = case_variant_source(scan.observations()) {
-        let Some(root) = open_active_root(journal, sync_root)? else {
-            return Err(ReconcileError::LocalRootChanged);
-        };
-        let Some(name_max) = parent_name_max(&root, &source)? else {
-            return Ok(ReconcileOutcome::FreshObservationRequired { path: source });
-        };
-        let rename = case_variant_move(scan.observations(), source, name_max)?;
-        match rename_case_variant(&root, &rename.source, &rename.destination)? {
-            LocalRenameOutcome::Renamed | LocalRenameOutcome::Retry => {
-                return Ok(ReconcileOutcome::FreshObservationRequired {
-                    path: rename.source,
-                });
-            }
+    match resolve_case_collision(journal, sync_root, scan.observations())? {
+        CaseCollisionResolution::None => {}
+        CaseCollisionResolution::Renamed(path) | CaseCollisionResolution::Changed(path) => {
+            return Ok(ReconcileOutcome::FreshObservationRequired { path });
         }
     }
     dropbox.refresh_inventory(journal)?;
@@ -494,6 +490,42 @@ fn reconcile_active_root(
         replay,
         downloads,
     )
+}
+
+enum CaseCollisionResolution {
+    None,
+    Renamed(PathBuf),
+    Changed(PathBuf),
+}
+
+fn resolve_case_collision(
+    journal: &mut Journal,
+    sync_root: &Path,
+    observations: &[LocalObservationRecord],
+) -> Result<CaseCollisionResolution, ReconcileError> {
+    let Some(source) = case_variant_source(observations) else {
+        return Ok(CaseCollisionResolution::None);
+    };
+    let Some(root) = open_active_root(journal, sync_root)? else {
+        return Err(ReconcileError::LocalRootChanged);
+    };
+    let Some(name_max) = parent_name_max(&root, &source)? else {
+        return Ok(CaseCollisionResolution::Changed(source));
+    };
+    let rename = case_variant_move(observations, source, name_max)?;
+    let canonical_source = dropbox_canonical_path(&rename.source);
+    for pending in journal.pending_plans()? {
+        let canonical_pending = dropbox_canonical_path(&pending.path);
+        if canonical_pending == canonical_source || canonical_pending.starts_with(&canonical_source)
+        {
+            supersede_pending_plan(journal, &pending)?;
+        }
+    }
+    journal.invalidate_case_collision_baselines(&rename.source)?;
+    match rename_case_variant(&root, &rename.source, &rename.destination)? {
+        LocalRenameOutcome::Renamed => Ok(CaseCollisionResolution::Renamed(rename.source)),
+        LocalRenameOutcome::Retry => Ok(CaseCollisionResolution::Changed(rename.source)),
+    }
 }
 
 fn reconcile_published(

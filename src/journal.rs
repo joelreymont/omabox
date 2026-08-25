@@ -1200,6 +1200,38 @@ impl Journal {
             .map_err(|source| sqlite("read baseline paths", &self.database_path, source))
     }
 
+    /// Forget common history beneath an automatically renamed case-collision path.
+    ///
+    /// This is committed before the local rename so the resulting absence can
+    /// never be interpreted as a user-requested Dropbox deletion, including
+    /// after a crash between the two phases.
+    pub(crate) fn invalidate_case_collision_baselines(
+        &mut self,
+        path: &Path,
+    ) -> Result<(), JournalError> {
+        let canonical = dropbox_canonical_path(path);
+        let exact = path_bytes(&canonical);
+        if exact.is_empty() {
+            return Err(JournalError::InvalidState {
+                operation: "invalidate case-collision history",
+                path: path.to_path_buf(),
+                detail: "case-collision path is empty",
+            });
+        }
+        let mut descendants = exact.clone();
+        descendants.push(b'/');
+        let mut descendants_end = descendants.clone();
+        descendants_end.push(u8::MAX);
+        self.connection
+            .execute(
+                "DELETE FROM baselines WHERE canonical_path = ?1 \
+                 OR (canonical_path >= ?2 AND canonical_path < ?3)",
+                params![exact, descendants, descendants_end],
+            )
+            .map(|_| ())
+            .map_err(|source| sqlite("invalidate case-collision history", path, source))
+    }
+
     /// Record a planner-approved common baseline that requires no effect.
     pub fn record_noop(
         &mut self,

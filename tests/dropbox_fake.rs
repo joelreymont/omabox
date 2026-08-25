@@ -1579,6 +1579,126 @@ fn local_case_collision_is_renamed_before_planning_and_then_syncs() -> Result<()
 }
 
 #[test]
+fn automatic_case_rename_never_becomes_a_dropbox_delete() -> Result<(), Box<dyn Error>> {
+    let bytes = b"remote-associated local bytes";
+    let content = dropbox_content_hash(bytes.as_slice())?;
+    let remote = RemoteFile::new(content.clone(), DropboxRevision::new("rev-original"));
+    let download = FakeResponse::bytes(bytes.to_vec())
+        .header(
+            "Dropbox-API-Result",
+            download_metadata("Apps/entry.doentry", "rev-original", &content, bytes.len()),
+        )
+        .for_path("/2/files/download");
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        }))
+        .for_path("/2/users/get_current_account"),
+        FakeResponse::json(json!({
+            "entries": [
+                folder_metadata("/apps", "/Apps"),
+                file_metadata(
+                    "/apps/entry.doentry",
+                    "/Apps/entry.doentry",
+                    "rev-original",
+                    &content,
+                ),
+            ],
+            "cursor": "case-collision",
+            "has_more": false,
+        }))
+        .for_path("/2/files/list_folder"),
+        FakeResponse::json(json!({
+            "metadata": folder_metadata(
+                "/apps (case variant)",
+                "/apps (case variant)",
+            )
+        }))
+        .for_path("/2/files/create_folder_v2"),
+        FakeResponse::json(json!({
+            "metadata": folder_metadata(
+                "/apps (case variant)",
+                "/apps (case variant)",
+            )
+        }))
+        .for_path("/2/files/create_folder_v2"),
+        FakeResponse::json(file_metadata(
+            "/apps (case variant)/entry.doentry",
+            "/apps (case variant)/entry.doentry",
+            "rev-variant",
+            &content,
+        ))
+        .for_path("/2/files/upload"),
+        download,
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-case-rename-delete")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(root.join("Apps"))?;
+    std::fs::create_dir_all(root.join("apps"))?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("apps/entry.doentry"), bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_baseline(&mut journal, Path::new("Apps/entry.doentry"), &remote)?;
+    assert!(matches!(
+        scan_and_publish(&mut journal, &root)?,
+        ScanPublication::Published(_)
+    ));
+    let stale_delete = planned_operations(plan(
+        &Baseline::Present(remote.clone()),
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(remote.clone()),
+    ))?;
+    assert!(matches!(
+        journal.record_plan(Path::new("Apps/entry.doentry"), &stale_delete)?,
+        PlanWrite::Recorded(_)
+    ));
+
+    assert!(matches!(
+        reconcile_once(
+            &mut journal,
+            &client,
+            &mut downloads,
+            &root,
+            &staging,
+            &recovery,
+        )?,
+        ReconcileOutcome::FreshObservationRequired { .. }
+    ));
+    let _ = reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?;
+    let replay = drive_replay(&mut journal, &client, &mut downloads, &root, &staging)??;
+    assert!(replay.blocked.is_empty());
+    assert_eq!(std::fs::read(root.join("Apps/entry.doentry"))?, bytes);
+    assert_eq!(
+        std::fs::read(root.join("apps (case variant)/entry.doentry"))?,
+        bytes
+    );
+    assert!(!root.join("apps").exists());
+    assert!(!root.join("apps (case variant 2)").exists());
+
+    let requests = server.finish()?;
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path != "/2/files/delete_v2")
+    );
+    Ok(())
+}
+
+#[test]
 fn local_case_collision_preserves_both_directory_trees() -> Result<(), Box<dyn Error>> {
     let server = FakeServer::start(Vec::new())?;
     let client = Arc::new(fake_client(&server, "opaque-access-directory-collision")?);
