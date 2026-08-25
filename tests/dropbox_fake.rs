@@ -3135,6 +3135,76 @@ fn link_rejects_unavailable_file_and_restricted_roots() -> Result<(), Box<dyn Er
 }
 
 #[test]
+fn one_file_cursor_delta_updates_a_large_inventory_without_a_full_listing()
+-> Result<(), Box<dyn Error>> {
+    const INVENTORY_SIZE: usize = 10_000;
+
+    let old_content = dropbox_content_hash(b"old inventory bytes".as_slice())?;
+    let new_content = dropbox_content_hash(b"new inventory bytes".as_slice())?;
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [file_metadata(
+                "/bulk/05000.txt",
+                "/Bulk/05000.txt",
+                "rev-new",
+                &new_content,
+            )],
+            "cursor": "cursor-new",
+            "has_more": false
+        })),
+    ])?;
+    let client = fake_client(&server, "opaque-access-large-delta")?;
+    let directory = TempDir::new()?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let mut observations = Vec::with_capacity(INVENTORY_SIZE);
+    observations.push(RemoteObservationRecord {
+        canonical_path: PathBuf::from("bulk"),
+        path: PathBuf::from("Bulk"),
+        observation: Observation::Directory,
+    });
+    for index in 1..INVENTORY_SIZE {
+        let name = format!("{index:05}.txt");
+        observations.push(RemoteObservationRecord {
+            canonical_path: PathBuf::from("bulk").join(&name),
+            path: PathBuf::from("Bulk").join(name),
+            observation: Observation::Present(RemoteFile::new(
+                old_content.clone(),
+                DropboxRevision::new("rev-old"),
+            )),
+        });
+    }
+    journal.publish_remote_inventory("cursor-old", &observations)?;
+
+    assert_eq!(
+        client.refresh_inventory(&mut journal)?,
+        InventoryRefresh::Published
+    );
+    let inventory = journal.remote_inventory()?;
+    assert_eq!(inventory.cursor.as_deref(), Some("cursor-new"));
+    assert_eq!(inventory.observations.len(), INVENTORY_SIZE);
+    assert_eq!(
+        observation(&inventory, Path::new("Bulk/05000.txt")),
+        Some(&Observation::Present(RemoteFile::new(
+            new_content,
+            DropboxRevision::new("rev-new")
+        )))
+    );
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].path, "/2/files/list_folder/continue");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path != "/2/files/list_folder")
+    );
+    Ok(())
+}
+
+#[test]
 fn cursor_reset_rebuilds_before_one_complete_publication() -> Result<(), Box<dyn Error>> {
     let replacement = dropbox_content_hash(b"replacement".as_slice())?;
     let server = FakeServer::start(vec![
@@ -3323,13 +3393,14 @@ fn failed_later_page_cannot_publish_partial_listing_as_absence() -> Result<(), B
     let requests = server.finish()?;
     assert_eq!(requests.len(), 3);
     assert_eq!(requests[1].path, "/2/files/list_folder/continue");
-    assert_eq!(requests[2].path, "/2/files/list_folder");
+    assert_eq!(requests[2].path, "/2/files/list_folder/continue");
     Ok(())
 }
 
 #[test]
 fn incomplete_downloadable_metadata_cannot_replace_durable_inventory() -> Result<(), Box<dyn Error>>
 {
+    let changed = dropbox_content_hash(b"validated first page".as_slice())?;
     let server = FakeServer::start(vec![
         FakeResponse::json(json!({
             "account_id": "account",
@@ -3338,20 +3409,20 @@ fn incomplete_downloadable_metadata_cannot_replace_durable_inventory() -> Result
         FakeResponse::json(json!({
             "entries": [{
                 ".tag": "file",
-                "path_lower": "/changed.txt",
-                "path_display": "/Changed.txt",
-                "rev": "rev-changed",
-                "content_hash": "change-probe"
+                "path_lower": "/partial.txt",
+                "path_display": "/Partial.txt",
+                "rev": "rev-partial",
+                "content_hash": changed.as_str()
             }],
-            "cursor": "probe",
-            "has_more": false
+            "cursor": "partial",
+            "has_more": true
         })),
         FakeResponse::json(json!({
             "entries": [{
                 ".tag": "file",
-                "path_lower": "/partial.txt",
-                "path_display": "/Partial.txt",
-                "rev": "rev-partial",
+                "path_lower": "/incomplete.txt",
+                "path_display": "/Incomplete.txt",
+                "rev": "rev-incomplete",
                 "is_downloadable": true
             }],
             "cursor": "new",
@@ -3390,15 +3461,6 @@ fn restricted_later_page_cannot_replace_durable_inventory() -> Result<(), Box<dy
         FakeResponse::json(json!({
             "account_id": "account",
             "root_info": {"root_namespace_id": "namespace"}
-        })),
-        FakeResponse::json(json!({
-            "entries": [{
-                ".tag": "folder",
-                "path_lower": "/probe",
-                "path_display": "/Probe"
-            }],
-            "cursor": "probe",
-            "has_more": false
         })),
         FakeResponse::json(json!({
             "entries": [{
@@ -3443,7 +3505,7 @@ fn restricted_later_page_cannot_replace_durable_inventory() -> Result<(), Box<dy
             observations: vec![durable]
         }
     );
-    assert_eq!(server.finish()?.len(), 4);
+    assert_eq!(server.finish()?.len(), 3);
     Ok(())
 }
 

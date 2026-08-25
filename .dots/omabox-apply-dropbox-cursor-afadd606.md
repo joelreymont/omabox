@@ -1,9 +1,9 @@
 ---
 title: Apply Dropbox cursor deltas
-status: open
+status: active
 priority: 0
 issue-type: task
-created-at: "2026-08-24T23:42:15.788967+02:00"
+created-at: "\"2026-08-24T23:42:15.788967+02:00\""
 blocks:
   - omabox-synchronize-directories-as-e5c2cb99
 ---

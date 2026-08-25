@@ -11,7 +11,8 @@ use thiserror::Error;
 
 use crate::auth::AccessToken;
 use crate::journal::{
-    DropboxBinding, DropboxBindingWrite, Journal, JournalError, RemoteObservationRecord,
+    DropboxBinding, DropboxBindingWrite, Journal, JournalError, RemoteInventoryChange,
+    RemoteObservationRecord,
 };
 use crate::local::{
     DownloadPreparation, DownloadSlotLease, LocalError, StageOutcome, StagedUpload,
@@ -465,31 +466,32 @@ impl DropboxClient {
         if self.validate_account(journal)? != AccountValidation::Valid {
             return Err(DropboxError::AccountBindingChanged);
         }
-        let current = journal
-            .remote_inventory()
+        let current_cursor = journal
+            .remote_cursor()
             .map_err(|source| DropboxError::Journal { source })?;
-        let (records, cursor, outcome) = if let Some(cursor) = current.cursor {
-            match self.probe_cursor(&cursor)? {
-                CursorProbe::Unchanged { cursor } => {
-                    (current.observations, cursor, InventoryRefresh::Published)
+        if let Some(cursor) = current_cursor {
+            match self.cursor_delta(&cursor)? {
+                CursorDelta::Changes { changes, cursor } => {
+                    journal
+                        .apply_remote_inventory_delta(&cursor, &changes)
+                        .map_err(|source| DropboxError::Journal { source })?;
+                    Ok(InventoryRefresh::Published)
                 }
-                CursorProbe::Changed => {
+                CursorDelta::Reset => {
                     let (records, cursor) = self.full_inventory()?;
-                    (records, cursor, InventoryRefresh::Published)
-                }
-                CursorProbe::Reset => {
-                    let (records, cursor) = self.full_inventory()?;
-                    (records, cursor, InventoryRefresh::RebuiltAfterCursorReset)
+                    journal
+                        .publish_remote_inventory(&cursor, &records)
+                        .map_err(|source| DropboxError::Journal { source })?;
+                    Ok(InventoryRefresh::RebuiltAfterCursorReset)
                 }
             }
         } else {
             let (records, cursor) = self.full_inventory()?;
-            (records, cursor, InventoryRefresh::Published)
-        };
-        journal
-            .publish_remote_inventory(&cursor, &records)
-            .map_err(|source| DropboxError::Journal { source })?;
-        Ok(outcome)
+            journal
+                .publish_remote_inventory(&cursor, &records)
+                .map_err(|source| DropboxError::Journal { source })?;
+            Ok(InventoryRefresh::Published)
+        }
     }
 
     /// Block until Dropbox reports cursor changes or the request times out.
@@ -1335,15 +1337,25 @@ impl DropboxClient {
         }
     }
 
-    fn probe_cursor(&self, cursor: &str) -> Result<CursorProbe, DropboxError> {
-        match self.list_continue(cursor)? {
-            ContinuePage::Reset => Ok(CursorProbe::Reset),
-            ContinuePage::Page(page) if page.entries.is_empty() && !page.has_more => {
-                Ok(CursorProbe::Unchanged {
+    fn cursor_delta(&self, initial_cursor: &str) -> Result<CursorDelta, DropboxError> {
+        let mut changes = Vec::new();
+        let mut previous = initial_cursor.to_owned();
+        loop {
+            let page = match self.list_continue(&previous)? {
+                ContinuePage::Reset => return Ok(CursorDelta::Reset),
+                ContinuePage::Page(page) => page,
+            };
+            append_entry_changes(&self.root, &mut changes, page.entries)?;
+            if !page.has_more {
+                return Ok(CursorDelta::Changes {
+                    changes,
                     cursor: page.cursor,
-                })
+                });
             }
-            ContinuePage::Page(_) => Ok(CursorProbe::Changed),
+            if page.cursor == previous {
+                return Err(DropboxError::CursorDidNotAdvance);
+            }
+            previous = page.cursor;
         }
     }
 
@@ -1476,9 +1488,11 @@ impl MutationExpectation {
     }
 }
 
-enum CursorProbe {
-    Unchanged { cursor: String },
-    Changed,
+enum CursorDelta {
+    Changes {
+        changes: Vec<RemoteInventoryChange>,
+        cursor: String,
+    },
     Reset,
 }
 
@@ -2100,6 +2114,34 @@ fn apply_entries(
     records: &mut BTreeMap<String, RemoteObservationRecord>,
     entries: Vec<ListEntry>,
 ) -> Result<(), DropboxError> {
+    let mut changes = Vec::new();
+    append_entry_changes(root, &mut changes, entries)?;
+    for change in changes {
+        match change {
+            RemoteInventoryChange::Upsert(record) => {
+                let key = record
+                    .canonical_path
+                    .to_str()
+                    .ok_or(DropboxError::InvalidEntryPath)?
+                    .to_owned();
+                records.insert(key, record);
+            }
+            RemoteInventoryChange::DeleteSubtree { canonical_path } => {
+                let key = canonical_path
+                    .to_str()
+                    .ok_or(DropboxError::InvalidEntryPath)?;
+                remove_subtree(records, key);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn append_entry_changes(
+    root: &DropboxRoot,
+    changes: &mut Vec<RemoteInventoryChange>,
+    entries: Vec<ListEntry>,
+) -> Result<(), DropboxError> {
     for entry in entries {
         let lower = entry
             .path_lower
@@ -2111,10 +2153,11 @@ fn apply_entries(
             .ok_or(DropboxError::InvalidEntryPath)?;
         let (key, path) = relative_paths(root, lower, display)?;
         if matches!(entry.tag, EntryTag::Deleted) {
-            remove_subtree(records, &key);
+            changes.push(RemoteInventoryChange::DeleteSubtree {
+                canonical_path: PathBuf::from(key),
+            });
             continue;
         }
-        ensure_parent_folders(records, &key, &path);
         let observation = match entry.tag {
             EntryTag::Deleted => continue,
             EntryTag::Folder if entry.restricted() => {
@@ -2122,7 +2165,9 @@ fn apply_entries(
             }
             EntryTag::Folder => Observation::Directory,
             EntryTag::File => {
-                remove_subtree(records, &key);
+                changes.push(RemoteInventoryChange::DeleteSubtree {
+                    canonical_path: PathBuf::from(&key),
+                });
                 if !entry.is_downloadable || entry.symlink_info.is_some() {
                     Observation::Unknown(UnknownReason::Unsupported)
                 } else {
@@ -2140,35 +2185,26 @@ fn apply_entries(
                 }
             }
         };
-        records.insert(
-            key.clone(),
-            RemoteObservationRecord {
-                canonical_path: PathBuf::from(key),
-                path,
-                observation,
-            },
-        );
+        append_parent_folders(changes, &key, &path);
+        changes.push(RemoteInventoryChange::Upsert(RemoteObservationRecord {
+            canonical_path: PathBuf::from(key),
+            path,
+            observation,
+        }));
     }
     Ok(())
 }
 
-fn ensure_parent_folders(
-    records: &mut BTreeMap<String, RemoteObservationRecord>,
-    key: &str,
-    path: &Path,
-) {
+fn append_parent_folders(changes: &mut Vec<RemoteInventoryChange>, key: &str, path: &Path) {
     let lower = key.split('/').collect::<Vec<_>>();
     let display = path.iter().collect::<Vec<_>>();
     for depth in 1..lower.len() {
         let parent_key = lower[..depth].join("/");
-        records.insert(
-            parent_key.clone(),
-            RemoteObservationRecord {
-                canonical_path: PathBuf::from(&parent_key),
-                path: display[..depth].iter().copied().collect(),
-                observation: Observation::Directory,
-            },
-        );
+        changes.push(RemoteInventoryChange::Upsert(RemoteObservationRecord {
+            canonical_path: PathBuf::from(&parent_key),
+            path: display[..depth].iter().copied().collect(),
+            observation: Observation::Directory,
+        }));
     }
 }
 

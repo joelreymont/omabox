@@ -21,6 +21,8 @@ const MIGRATION_V3: &str = include_str!("../migrations/0003.sql");
 const MIGRATION_V4: &str = include_str!("../migrations/0004.sql");
 const MIGRATION_V5: &str = include_str!("../migrations/0005.sql");
 const SCHEMA_VERSION: i64 = 5;
+const DELETE_REMOTE_DESCENDANTS: &str = "DELETE FROM remote_observations \
+    WHERE canonical_path >= ?1 AND canonical_path < ?2";
 
 /// A journal failure with its operation, affected path, and original cause.
 #[derive(Debug, Error)]
@@ -178,6 +180,15 @@ pub struct RemoteInventory {
     pub cursor: Option<String>,
     /// Complete set of committed observations.
     pub observations: Vec<RemoteObservationRecord>,
+}
+
+/// One ordered mutation from a validated Dropbox cursor continuation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RemoteInventoryChange {
+    /// Insert or replace one observed path by canonical Dropbox identity.
+    Upsert(RemoteObservationRecord),
+    /// Remove one path and every descendant below it.
+    DeleteSubtree { canonical_path: PathBuf },
 }
 
 /// Dropbox account and root permanently associated with this journal.
@@ -975,6 +986,147 @@ impl Journal {
         transaction
             .commit()
             .map_err(|source| sqlite("commit remote inventory", &database_path, source))
+    }
+
+    /// Apply validated cursor changes and publish their final cursor atomically.
+    pub(crate) fn apply_remote_inventory_delta(
+        &mut self,
+        cursor: &str,
+        changes: &[RemoteInventoryChange],
+    ) -> Result<(), JournalError> {
+        enum EncodedChange {
+            Upsert {
+                path: Vec<u8>,
+                canonical_path: Vec<u8>,
+                observation: String,
+            },
+            DeleteSubtree {
+                canonical_path: Vec<u8>,
+                descendant_prefix: Vec<u8>,
+                descendant_end: Vec<u8>,
+            },
+        }
+
+        let encoded = changes
+            .iter()
+            .map(|change| match change {
+                RemoteInventoryChange::Upsert(record) => {
+                    if record.canonical_path != dropbox_canonical_path(&record.path) {
+                        return Err(JournalError::InvalidState {
+                            operation: "validate remote inventory delta",
+                            path: record.path.clone(),
+                            detail: "canonical path does not match display path",
+                        });
+                    }
+                    Ok(EncodedChange::Upsert {
+                        path: path_bytes(&record.path),
+                        canonical_path: path_bytes(&record.canonical_path),
+                        observation: encode(
+                            &record.observation,
+                            "serialize remote inventory delta",
+                            &record.path,
+                        )?,
+                    })
+                }
+                RemoteInventoryChange::DeleteSubtree { canonical_path } => {
+                    if canonical_path.as_os_str().is_empty() {
+                        return Err(JournalError::InvalidState {
+                            operation: "validate remote inventory delta",
+                            path: canonical_path.clone(),
+                            detail: "subtree deletion path is empty",
+                        });
+                    }
+                    let canonical_path = path_bytes(canonical_path);
+                    let mut descendant_prefix = canonical_path.clone();
+                    descendant_prefix.push(b'/');
+                    let mut descendant_end = descendant_prefix.clone();
+                    descendant_end.push(u8::MAX);
+                    Ok(EncodedChange::DeleteSubtree {
+                        canonical_path,
+                        descendant_prefix,
+                        descendant_end,
+                    })
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite("begin remote inventory delta", &database_path, source))?;
+        for change in encoded {
+            match change {
+                EncodedChange::Upsert {
+                    path,
+                    canonical_path,
+                    observation,
+                } => {
+                    transaction
+                        .execute(
+                            "INSERT INTO remote_observations(\
+                                 path, observation_json, canonical_path\
+                             ) VALUES (?1, ?2, ?3) \
+                             ON CONFLICT(canonical_path) DO UPDATE SET \
+                                 path = excluded.path, \
+                                 observation_json = excluded.observation_json \
+                             WHERE path != excluded.path \
+                                OR observation_json != excluded.observation_json",
+                            params![path, observation, canonical_path],
+                        )
+                        .map_err(|source| {
+                            sqlite("upsert remote inventory delta", &database_path, source)
+                        })?;
+                }
+                EncodedChange::DeleteSubtree {
+                    canonical_path,
+                    descendant_prefix,
+                    descendant_end,
+                } => {
+                    transaction
+                        .execute(
+                            "DELETE FROM remote_observations WHERE canonical_path = ?1",
+                            [canonical_path],
+                        )
+                        .map_err(|source| {
+                            sqlite("delete remote inventory path", &database_path, source)
+                        })?;
+                    transaction
+                        .execute(
+                            DELETE_REMOTE_DESCENDANTS,
+                            params![descendant_prefix, descendant_end],
+                        )
+                        .map_err(|source| {
+                            sqlite(
+                                "delete remote inventory descendants",
+                                &database_path,
+                                source,
+                            )
+                        })?;
+                }
+            }
+        }
+        transaction
+            .execute(
+                "INSERT INTO remote_inventory(singleton, cursor) VALUES (1, ?1) \
+                 ON CONFLICT(singleton) DO UPDATE SET cursor = excluded.cursor",
+                [cursor],
+            )
+            .map_err(|source| sqlite("publish remote delta cursor", &database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite("commit remote inventory delta", &database_path, source))
+    }
+
+    /// Load only the committed remote cursor without decoding the full inventory.
+    pub(crate) fn remote_cursor(&self) -> Result<Option<String>, JournalError> {
+        self.connection
+            .query_row(
+                "SELECT cursor FROM remote_inventory WHERE singleton = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| sqlite("read remote cursor", &self.database_path, source))
     }
 
     /// Load a mutually consistent remote cursor and inventory snapshot.
@@ -2986,6 +3138,140 @@ mod tests {
                 cursor: Some(String::from("cursor-old")),
                 observations: vec![old],
             }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_delta_mutates_only_changed_rows_and_cursor() -> Result<(), Box<dyn Error>> {
+        const INVENTORY_SIZE: usize = 10_000;
+
+        let directory = TempDir::new()?;
+        let mut journal = Journal::open(journal_path(&directory))?;
+        let mut observations = Vec::with_capacity(INVENTORY_SIZE);
+        observations.push(RemoteObservationRecord {
+            canonical_path: PathBuf::from("bulk"),
+            path: PathBuf::from("Bulk"),
+            observation: Observation::Directory,
+        });
+        for index in 1..INVENTORY_SIZE {
+            let canonical_path = PathBuf::from(format!("bulk/{index:05}.txt"));
+            observations.push(RemoteObservationRecord {
+                path: canonical_path.clone(),
+                canonical_path,
+                observation: Observation::Present(remote_file("old", "rev-old")),
+            });
+        }
+        journal.publish_remote_inventory("cursor-old", &observations)?;
+
+        let before_empty = journal.connection.total_changes();
+        journal.apply_remote_inventory_delta("cursor-empty", &[])?;
+        assert_eq!(journal.connection.total_changes() - before_empty, 1);
+
+        let changed_path = PathBuf::from("bulk/05000.txt");
+        let changes = [
+            RemoteInventoryChange::Upsert(RemoteObservationRecord {
+                canonical_path: PathBuf::from("bulk"),
+                path: PathBuf::from("Bulk"),
+                observation: Observation::Directory,
+            }),
+            RemoteInventoryChange::DeleteSubtree {
+                canonical_path: changed_path.clone(),
+            },
+            RemoteInventoryChange::Upsert(RemoteObservationRecord {
+                canonical_path: changed_path.clone(),
+                path: changed_path.clone(),
+                observation: Observation::Present(remote_file("new", "rev-new")),
+            }),
+        ];
+        let before_change = journal.connection.total_changes();
+        journal.apply_remote_inventory_delta("cursor-new", &changes)?;
+        assert_eq!(journal.connection.total_changes() - before_change, 3);
+
+        let inventory = journal.remote_inventory()?;
+        assert_eq!(inventory.cursor.as_deref(), Some("cursor-new"));
+        assert_eq!(inventory.observations.len(), INVENTORY_SIZE);
+        assert_eq!(
+            inventory
+                .observations
+                .iter()
+                .find(|record| record.canonical_path == changed_path)
+                .map(|record| &record.observation),
+            Some(&Observation::Present(remote_file("new", "rev-new")))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_delta_deletes_only_the_named_subtree() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let mut journal = Journal::open(journal_path(&directory))?;
+        let observations = [
+            ("a", Observation::Directory),
+            (
+                "a/child.txt",
+                Observation::Present(remote_file("a-child", "rev-a")),
+            ),
+            ("ab", Observation::Directory),
+            (
+                "ab/child.txt",
+                Observation::Present(remote_file("ab-child", "rev-ab")),
+            ),
+            (
+                "a-file.txt",
+                Observation::Present(remote_file("a-file", "rev-a-file")),
+            ),
+        ]
+        .map(|(path, observation)| RemoteObservationRecord {
+            canonical_path: PathBuf::from(path),
+            path: PathBuf::from(path),
+            observation,
+        });
+        journal.publish_remote_inventory("cursor-old", &observations)?;
+
+        let descendant_prefix = b"a/".to_vec();
+        let mut descendant_end = descendant_prefix.clone();
+        descendant_end.push(u8::MAX);
+        let query_plan = {
+            let mut statement = journal
+                .connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {DELETE_REMOTE_DESCENDANTS}"))?;
+            let rows = statement.query_map(params![descendant_prefix, descendant_end], |row| {
+                row.get::<_, String>(3)
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        assert!(
+            query_plan
+                .iter()
+                .any(|detail| detail.contains("remote_observations_by_canonical_path"))
+        );
+        assert!(
+            query_plan
+                .iter()
+                .all(|detail| !detail.contains("SCAN remote_observations"))
+        );
+
+        journal.apply_remote_inventory_delta(
+            "cursor-new",
+            &[RemoteInventoryChange::DeleteSubtree {
+                canonical_path: PathBuf::from("a"),
+            }],
+        )?;
+
+        let inventory = journal.remote_inventory()?;
+        assert_eq!(inventory.cursor.as_deref(), Some("cursor-new"));
+        assert_eq!(
+            inventory
+                .observations
+                .iter()
+                .map(|record| record.canonical_path.as_path())
+                .collect::<Vec<_>>(),
+            [
+                Path::new("a-file.txt"),
+                Path::new("ab"),
+                Path::new("ab/child.txt")
+            ]
         );
         Ok(())
     }
