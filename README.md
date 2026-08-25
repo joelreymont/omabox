@@ -1,96 +1,74 @@
 # Omabox
 
-Omabox is a local-first Dropbox sync service for Omarchy. The Rust daemon runs
-as a systemd user service; the separate CLI handles setup, status, settings,
-service controls, logs, and installation. It uses Dropbox's documented API and
-OAuth flow.
+Omabox is a local-first Dropbox client for Omarchy. A headless Rust daemon syncs
+ordinary files and directories through Dropbox's documented API; a CLI and an
+optional QuickShell widget provide setup, control, and status.
 
-## Build and install
+It supports one Dropbox account, one remote root, and one local root. It does
+not implement a virtual filesystem, selective sync, or Dropbox Paper documents.
 
-Build both release binaries, then run the release CLI while the desktop session
-is unlocked:
+## Install
+
+Install Rust nightly, create a Dropbox API app, and copy its public app key.
+Omabox neither needs nor accepts the app secret. Then, while the desktop is
+unlocked:
 
 ```bash
-cargo +nightly build --release
+cargo build --release
 target/release/omabox install
-```
-
-This installs only these user-owned artifacts:
-
-- `~/.local/bin/omabox` and `~/.local/bin/omaboxd`
-- `~/.config/systemd/user/omabox.service`
-- `~/.config/omarchy/plugins/local.omabox`
-
-The command validates the staged Omarchy plugin before publishing it, reloads
-the systemd user manager, and preserves the service's enabled/running state.
-
-## Set up Dropbox
-
-Create an empty local directory and use the public app key from the Dropbox
-developer console. An app secret is neither needed nor accepted.
-
-```bash
 mkdir -p "$HOME/Dropbox"
 omabox setup --sync-root "$HOME/Dropbox" --app-key YOUR_APP_KEY
 omabox service enable
 omabox service start
 ```
 
-Setup opens Dropbox's authorization flow and stores the refresh token in Secret
-Service. It never writes credentials to the config file or journal.
+Setup opens Dropbox authorization once and stores the refresh token in Secret
+Service, never in the configuration or SQLite journal. Installation writes only
+the two binaries, a systemd user unit, and the packaged Omarchy plugin.
 
-Enable the installed widget once if desired:
+Enable the widget if wanted:
 
 ```bash
 omarchy plugin enable local.omabox --section right --after omarchy.tray
 omarchy plugin disable omarchy.dropbox
 ```
 
-## Operate
+## Use
 
 ```bash
 omabox status
+omabox pause
+omabox resume
 omabox settings
 omabox settings set-root /absolute/new/root
-omabox service status
+omabox service status  # also: start, stop, restart, enable, disable
 omabox logs
 ```
 
 Changing to a new empty sync root does not imply that remote files were
-deleted. The durable journal changes local-root generation and downloads the
-known remote contents into the new root.
+deleted; Omabox records a new root generation and downloads the remote tree.
 
-## Upgrade and uninstall
+## Upgrade or remove
 
-Build the new release and run:
+After building a new release:
 
 ```bash
 target/release/omabox upgrade
-```
-
-Upgrade stages and validates the complete replacement before publication. A
-failure before the replacement daemon launches restores the previous artifacts.
-
-To remove the program:
-
-```bash
 omabox uninstall
 ```
 
-Uninstall stops and disables the service and removes only the binaries, user
-unit, and plugin. Configuration, the SQLite journal, recovery data, Secret
-Service credentials, synced files, and all Dropbox content are retained.
+Upgrade validates the complete replacement and rolls back if the new daemon
+cannot launch. Uninstall removes program artifacts but retains configuration,
+credentials, journal state, recovery data, local files, and Dropbox content.
+Commands that replace the live QuickShell plugin refuse to run while locked.
 
-Installation, upgrade, and uninstall refuse to modify the live Omarchy plugin
-while the session is locked. Unlock and retry; no recovery command is needed.
-
-## Development checks
+## Develop
 
 ```bash
-cargo +nightly fmt -- --check
-cargo +nightly clippy --all-targets -- -D warnings
-cargo +nightly test
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
 ```
 
-Dropbox live tests remain opt-in and require separate test-account credentials;
-credentials must never be committed.
+See [`formal/README.md`](formal/README.md) for TLC checks. Real Dropbox tests are
+opt-in and must use uncommitted test credentials. Omabox is MIT licensed.
