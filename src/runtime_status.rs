@@ -27,7 +27,7 @@ pub enum DaemonPhase {
     Waiting,
     /// Dropbox requested a retry delay.
     Backoff,
-    /// The daemon stopped after a fatal error.
+    /// A synchronization or daemon error requires attention.
     Error,
 }
 
@@ -140,6 +140,9 @@ impl RuntimeStatus {
         self.update(|publisher| {
             let changed = publisher.snapshot.phase != phase;
             publisher.snapshot.phase = phase;
+            if phase != DaemonPhase::Error {
+                publisher.snapshot.last_error = None;
+            }
             if changed {
                 publisher.snapshot.transfers.clear();
                 publisher.retained_finished = false;
@@ -160,6 +163,15 @@ impl RuntimeStatus {
             publisher.snapshot.transfers.clear();
             publisher.retained_finished = false;
             publisher.snapshot.last_error = Some(message);
+            true
+        });
+    }
+
+    /// Publish a sanitized per-path sync error while preserving active transfers.
+    pub fn sync_error(&self) {
+        self.update(|publisher| {
+            publisher.snapshot.phase = DaemonPhase::Error;
+            publisher.snapshot.last_error = Some("One or more files could not be synchronized.");
             true
         });
     }
@@ -431,6 +443,36 @@ mod tests {
             failed["last_error"],
             "Dropbox authentication is unavailable."
         );
+        Ok(())
+    }
+
+    #[test]
+    fn sync_error_preserves_transfers_and_clears_after_recovery() -> Result<(), Box<dyn Error>> {
+        let runtime = TempDir::new()?;
+        let status = RuntimeStatus::new(runtime.path())?;
+        status.phase(DaemonPhase::Syncing);
+        status.transfer_observer()(TransferEvent::Progress(TransferProgress::new(
+            TransferDirection::Upload,
+            Path::new("good.txt"),
+            4,
+            Some(10),
+        )));
+        status.sync_error();
+
+        let path = runtime.path().join(APPLICATION_DIRECTORY).join(STATUS_FILE);
+        let failed = serde_json::from_slice::<Value>(&fs::read(&path)?)?;
+        assert_eq!(failed["phase"], "error");
+        assert_eq!(failed["transfers"][0]["path"], "good.txt");
+        assert_eq!(
+            failed["last_error"],
+            "One or more files could not be synchronized."
+        );
+
+        status.phase(DaemonPhase::Waiting);
+        let recovered = serde_json::from_slice::<Value>(&fs::read(path)?)?;
+        assert_eq!(recovered["phase"], "waiting");
+        assert_eq!(recovered["transfers"], serde_json::json!([]));
+        assert_eq!(recovered["last_error"], Value::Null);
         Ok(())
     }
 

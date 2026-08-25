@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
+use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::ffi::OsStringExt as _;
 use std::os::unix::fs::{FileExt as _, FileTypeExt as _, PermissionsExt as _};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -3156,30 +3158,21 @@ fn explicit_conflict_uses_current_metadata_without_inventing_retry_safety()
             DropboxRevision::new("current-rev"),
         )))
     );
-    assert!(matches!(
-        client.create_file("Unchanged.txt", &fixture.staged),
-        Err(DropboxError::HttpStatus {
-            operation: "strictly create Dropbox file",
-            status: 409,
-        })
-    ));
-    assert!(matches!(
+    assert_eq!(
+        client.create_file("Unchanged.txt", &fixture.staged)?,
+        MutationOutcome::Pending
+    );
+    assert_eq!(
         client.replace_file(
             "Same.txt",
             &DropboxRevision::new("same-rev"),
             &fixture.staged,
-        ),
-        Err(DropboxError::HttpStatus {
-            operation: "conditionally replace Dropbox file",
-            status: 409,
-        })
-    ));
+        )?,
+        MutationOutcome::Pending
+    );
     assert!(matches!(
         client.delete_file("Incomplete.txt", &DropboxRevision::new("expected-rev")),
-        Err(DropboxError::HttpStatus {
-            operation: "conditionally delete Dropbox file",
-            status: 409,
-        })
+        Err(DropboxError::InvalidMutationMetadata)
     ));
 
     let requests = server.finish()?;
@@ -3304,6 +3297,135 @@ fn ambiguous_mutations_are_verified_once_and_preserve_the_original_failure()
         assert_eq!(pair[1].path, "/2/files/get_metadata");
         assert!(metadata_request_includes_deleted(&pair[1])?);
     }
+    Ok(())
+}
+
+#[test]
+fn rejected_paths_do_not_stop_unrelated_sync_or_report_progress() -> Result<(), Box<dyn Error>> {
+    let invalid_path = PathBuf::from(OsString::from_vec(b"invalid-\xff.txt".to_vec()));
+    let invalid_bytes = b"invalid path bytes";
+    let rejected_bytes = b"rejected bytes";
+    let good_bytes = b"uploaded bytes";
+    let invalid_content = dropbox_content_hash(invalid_bytes.as_slice())?;
+    let rejected_content = dropbox_content_hash(rejected_bytes.as_slice())?;
+    let good_content = dropbox_content_hash(good_bytes.as_slice())?;
+    let good_remote = RemoteFile::new(good_content.clone(), DropboxRevision::new("good-revision"));
+    let rejection = || {
+        FakeResponse::status_json(
+            409,
+            json!({
+                "error": {
+                    ".tag": "path",
+                    "reason": {".tag": "disallowed_name"}
+                }
+            }),
+        )
+        .for_path("/2/files/upload")
+    };
+    let server = FakeServer::start(vec![
+        rejection(),
+        FakeResponse::json(file_metadata(
+            "/good.txt",
+            "/good.txt",
+            good_remote.revision.as_str(),
+            &good_remote.content,
+        ))
+        .for_path("/2/files/upload"),
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        }))
+        .for_path("/2/users/get_current_account"),
+        FakeResponse::json(json!({
+            "entries": [file_metadata(
+                "/good.txt",
+                "/good.txt",
+                good_remote.revision.as_str(),
+                &good_remote.content,
+            )],
+            "cursor": "after-rejection",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder"),
+        rejection(),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-rejected-path")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join(&invalid_path), invalid_bytes)?;
+    std::fs::write(root.join("bad.txt"), rejected_bytes)?;
+    std::fs::write(root.join("good.txt"), good_bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    for (path, content) in [
+        (invalid_path.as_path(), invalid_content),
+        (Path::new("bad.txt"), rejected_content),
+        (Path::new("good.txt"), good_content),
+    ] {
+        let operations = planned_operations(plan(
+            &Baseline::Absent,
+            &Observation::Present(LocalFile::new(content)),
+            &Observation::ConfirmedAbsent,
+        ))?;
+        assert!(matches!(
+            journal.record_plan(path, &operations)?,
+            PlanWrite::Recorded(_)
+        ));
+    }
+
+    let report = match reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )? {
+        ReconcileOutcome::Complete(report) => report,
+        ReconcileOutcome::FreshObservationRequired { .. } => {
+            return Err(io::Error::other("stable rejected path requested a new scan").into());
+        }
+        ReconcileOutcome::LocalRootChanged => {
+            return Err(io::Error::other("stable rejected path changed its root").into());
+        }
+    };
+
+    assert_eq!(report.replayed_operations, 1);
+    assert_eq!(report.sync_errors, 2);
+    assert!(!report.downloads_in_progress);
+    assert_eq!(
+        journal.baseline(Path::new("good.txt"))?,
+        Some(Baseline::Present(good_remote))
+    );
+    assert_eq!(
+        journal
+            .pending_plans()?
+            .into_iter()
+            .map(|plan| plan.path)
+            .collect::<Vec<_>>(),
+        vec![invalid_path, Path::new("bad.txt").to_path_buf()]
+    );
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 5);
+    let upload_bodies = requests
+        .iter()
+        .filter(|request| request.path == "/2/files/upload")
+        .map(|request| request.body.as_slice())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        upload_bodies,
+        vec![
+            rejected_bytes.as_slice(),
+            good_bytes.as_slice(),
+            rejected_bytes.as_slice(),
+        ]
+    );
     Ok(())
 }
 

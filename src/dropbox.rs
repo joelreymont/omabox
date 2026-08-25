@@ -352,6 +352,34 @@ pub enum MutationOutcome {
     Pending,
     /// A different confirmed state replaced the mutation's precondition.
     PreconditionChanged(RemotePathState),
+    /// Dropbox permanently rejected this path or payload without applying it.
+    Rejected(MutationRejection),
+}
+
+/// A permanent per-path rejection that does not invalidate unrelated sync work.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum MutationRejection {
+    /// The local path cannot be represented by Dropbox's UTF-8 path API.
+    #[error("the local path is not a valid Dropbox UTF-8 path")]
+    InvalidPath,
+    /// Dropbox does not permit this file or folder name.
+    #[error("Dropbox does not permit this file or folder name")]
+    DisallowedName,
+    /// Dropbox cannot transfer this content because it is restricted.
+    #[error("Dropbox does not permit this content to be transferred")]
+    RestrictedContent,
+    /// The account cannot write at this Dropbox path.
+    #[error("the Dropbox account cannot write at this path")]
+    PermissionDenied,
+    /// The Dropbox account has no space for this mutation.
+    #[error("the Dropbox account has insufficient space")]
+    InsufficientSpace,
+    /// Dropbox does not allow this operation at the selected path.
+    #[error("Dropbox does not allow this operation at this path")]
+    OperationNotAllowed,
+    /// Dropbox rejected the path for a reason this client cannot classify more narrowly.
+    #[error("Dropbox rejected this path")]
+    RejectedByDropbox,
 }
 
 /// Direct blocking client for Dropbox endpoints.
@@ -815,7 +843,10 @@ impl DropboxClient {
         staged: &StagedUpload,
     ) -> Result<MutationOutcome, DropboxError> {
         let relative = relative.as_ref();
-        let target = self.mutation_target(relative)?;
+        let target = match self.mutation_target(relative) {
+            Ok(target) => target,
+            Err(rejection) => return Ok(MutationOutcome::Rejected(rejection)),
+        };
         let expectation = MutationExpectation::CreateFile {
             desired: staged.content().clone(),
         };
@@ -837,7 +868,10 @@ impl DropboxClient {
         staged: &StagedUpload,
     ) -> Result<MutationOutcome, DropboxError> {
         let relative = relative.as_ref();
-        let target = self.mutation_target(relative)?;
+        let target = match self.mutation_target(relative) {
+            Ok(target) => target,
+            Err(rejection) => return Ok(MutationOutcome::Rejected(rejection)),
+        };
         let expectation = MutationExpectation::ReplaceFile {
             expected: expected.clone(),
             desired: staged.content().clone(),
@@ -861,7 +895,10 @@ impl DropboxClient {
         relative: impl AsRef<Path>,
         expected: &DropboxRevision,
     ) -> Result<MutationOutcome, DropboxError> {
-        let target = self.mutation_target(relative.as_ref())?;
+        let target = match self.mutation_target(relative.as_ref()) {
+            Ok(target) => target,
+            Err(rejection) => return Ok(MutationOutcome::Rejected(rejection)),
+        };
         let expectation = MutationExpectation::DeleteFile {
             expected: expected.clone(),
         };
@@ -892,7 +929,7 @@ impl DropboxClient {
                         Err(failure) => self.resolve_ambiguous(&target, &expectation, failure),
                     }
                 } else {
-                    self.resolve_mutation_status(&target, &expectation, &response, operation)
+                    self.resolve_mutation_status(&target, &expectation, &mut response, operation)
                 }
             }
         }
@@ -903,7 +940,10 @@ impl DropboxClient {
         &self,
         relative: impl AsRef<Path>,
     ) -> Result<MutationOutcome, DropboxError> {
-        let target = self.mutation_target(relative.as_ref())?;
+        let target = match self.mutation_target(relative.as_ref()) {
+            Ok(target) => target,
+            Err(rejection) => return Ok(MutationOutcome::Rejected(rejection)),
+        };
         let expectation = MutationExpectation::CreateFolder;
         let url = self.endpoints.api("/files/create_folder_v2");
         let response = self.authorized_post(&url)?.send_json(CreateFolderRequest {
@@ -930,7 +970,7 @@ impl DropboxClient {
                         Err(failure) => self.resolve_ambiguous(&target, &expectation, failure),
                     }
                 } else {
-                    self.resolve_mutation_status(&target, &expectation, &response, operation)
+                    self.resolve_mutation_status(&target, &expectation, &mut response, operation)
                 }
             }
         }
@@ -1017,7 +1057,7 @@ impl DropboxClient {
                         Err(failure) => self.resolve_ambiguous(target, &expectation, failure),
                     }
                 } else {
-                    self.resolve_mutation_status(target, &expectation, &response, operation)
+                    self.resolve_mutation_status(target, &expectation, &mut response, operation)
                 }
             }
         }
@@ -1137,7 +1177,7 @@ impl DropboxClient {
                         Err(failure) => self.resolve_ambiguous(target, &expectation, failure),
                     }
                 } else {
-                    self.resolve_mutation_status(target, &expectation, &response, operation)
+                    self.resolve_mutation_status(target, &expectation, &mut response, operation)
                 }
             }
         }
@@ -1239,13 +1279,16 @@ impl DropboxClient {
         &self,
         target: &str,
         expectation: &MutationExpectation,
-        response: &ureq::http::Response<ureq::Body>,
+        response: &mut ureq::http::Response<ureq::Body>,
         operation: &'static str,
     ) -> Result<MutationOutcome, DropboxError> {
         let status = response.status().as_u16();
         let failure = status_failure(status, response.headers().get("Retry-After"), operation);
         if status == 409 {
-            self.resolve_explicit_conflict(target, expectation, failure)
+            if let Some(rejection) = mutation_rejection(response) {
+                return Ok(MutationOutcome::Rejected(rejection));
+            }
+            self.resolve_explicit_conflict(target, expectation)
         } else if (500..600).contains(&status) {
             self.resolve_ambiguous(target, expectation, failure)
         } else {
@@ -1257,17 +1300,13 @@ impl DropboxClient {
         &self,
         target: &str,
         expectation: &MutationExpectation,
-        original: DropboxError,
     ) -> Result<MutationOutcome, DropboxError> {
         match self.metadata_state(target) {
-            Ok(state) => match expectation.classify(state) {
-                MutationOutcome::Applied(state) => Ok(MutationOutcome::Applied(state)),
-                MutationOutcome::PreconditionChanged(state) => {
-                    Ok(MutationOutcome::PreconditionChanged(state))
-                }
-                MutationOutcome::Pending => Err(original),
-            },
-            Err(_) => Err(original),
+            Ok(state) => Ok(expectation.classify(state)),
+            Err(DropboxError::HttpStatus { status: 409, .. }) => Ok(MutationOutcome::Rejected(
+                MutationRejection::RejectedByDropbox,
+            )),
+            Err(error) => Err(error),
         }
     }
 
@@ -1312,23 +1351,21 @@ impl DropboxClient {
         metadata_remote_state(target, metadata)
     }
 
-    fn mutation_target(&self, relative: &Path) -> Result<String, DropboxError> {
+    fn mutation_target(&self, relative: &Path) -> Result<String, MutationRejection> {
         let mut suffix = String::new();
         for component in relative.components() {
             let Component::Normal(component) = component else {
-                return Err(DropboxError::InvalidMutationPath);
+                return Err(MutationRejection::InvalidPath);
             };
-            let component = component
-                .to_str()
-                .ok_or(DropboxError::InvalidMutationPath)?;
+            let component = component.to_str().ok_or(MutationRejection::InvalidPath)?;
             if invalid_dropbox_component(component) {
-                return Err(DropboxError::InvalidMutationPath);
+                return Err(MutationRejection::InvalidPath);
             }
             suffix.push('/');
             suffix.push_str(component);
         }
         if suffix.is_empty() {
-            return Err(DropboxError::InvalidMutationPath);
+            return Err(MutationRejection::InvalidPath);
         }
         Ok(format!("{}{}", self.root.path, suffix))
     }
@@ -1843,6 +1880,44 @@ impl MetadataError {
     }
 }
 
+fn mutation_rejection(
+    response: &mut ureq::http::Response<ureq::Body>,
+) -> Option<MutationRejection> {
+    let error = response.body_mut().read_json::<serde_json::Value>().ok()?;
+    find_mutation_rejection(&error)
+}
+
+fn find_mutation_rejection(value: &serde_json::Value) -> Option<MutationRejection> {
+    match value {
+        serde_json::Value::Object(fields) => {
+            if let Some(tag) = fields.get(".tag").and_then(serde_json::Value::as_str) {
+                let rejection = match tag {
+                    "malformed_path" => Some(MutationRejection::InvalidPath),
+                    "disallowed_name" => Some(MutationRejection::DisallowedName),
+                    "restricted_content" => Some(MutationRejection::RestrictedContent),
+                    "no_write_permission" | "access_restricted" => {
+                        Some(MutationRejection::PermissionDenied)
+                    }
+                    "insufficient_space" => Some(MutationRejection::InsufficientSpace),
+                    "operation_suppressed" | "team_folder" => {
+                        Some(MutationRejection::OperationNotAllowed)
+                    }
+                    _ => None,
+                };
+                if rejection.is_some() {
+                    return rejection;
+                }
+            }
+            fields.values().find_map(find_mutation_rejection)
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(find_mutation_rejection),
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => None,
+    }
+}
+
 /// Dropbox protocol, validation, or publication failure.
 #[derive(Debug, Error)]
 pub enum DropboxError {
@@ -1852,9 +1927,6 @@ pub enum DropboxError {
     /// A timeout outside Dropbox's documented range was requested.
     #[error("Dropbox long-poll timeout must be between 30 and 480 seconds")]
     InvalidLongPollTimeout,
-    /// A mutating operation was given an empty, absolute, parent-relative, or non-UTF-8 path.
-    #[error("Dropbox mutation path must be a nonempty safe relative UTF-8 path")]
-    InvalidMutationPath,
     /// The immutable stage exceeds Dropbox's direct-upload endpoint limit.
     #[error(
         "immutable upload stage is {bytes} bytes; direct Dropbox uploads allow at most 157286400 bytes"
@@ -2494,10 +2566,38 @@ mod tests {
 
     use super::{
         CONNECT_SECONDS, DIRECT_UPLOAD_MAX_BYTES, DOWNLOAD_SECONDS, DropboxError, DropboxRoot,
-        EntryTag, ListEntry, PROGRESS_INTERVAL, ProgressReader, UPLOAD_SESSION_MAX_BYTES,
-        apply_entries, ascii_json, exact_download_agent, validate_direct_upload_size,
-        validate_upload_size,
+        EntryTag, ListEntry, MutationRejection, PROGRESS_INTERVAL, ProgressReader,
+        UPLOAD_SESSION_MAX_BYTES, apply_entries, ascii_json, exact_download_agent,
+        find_mutation_rejection, validate_direct_upload_size, validate_upload_size,
     };
+
+    #[test]
+    fn permanent_mutation_tags_have_stable_dispositions() {
+        for (tag, expected) in [
+            ("malformed_path", MutationRejection::InvalidPath),
+            ("disallowed_name", MutationRejection::DisallowedName),
+            ("restricted_content", MutationRejection::RestrictedContent),
+            ("no_write_permission", MutationRejection::PermissionDenied),
+            ("access_restricted", MutationRejection::PermissionDenied),
+            ("insufficient_space", MutationRejection::InsufficientSpace),
+            (
+                "operation_suppressed",
+                MutationRejection::OperationNotAllowed,
+            ),
+            ("team_folder", MutationRejection::OperationNotAllowed),
+        ] {
+            let response = serde_json::json!({
+                "error": {"reason": [{".tag": tag}]}
+            });
+            assert_eq!(find_mutation_rejection(&response), Some(expected));
+        }
+        assert_eq!(
+            find_mutation_rejection(&serde_json::json!({
+                "error": {".tag": "too_many_write_operations"}
+            })),
+            None
+        );
+    }
 
     #[test]
     fn exact_download_times_out_only_when_body_progress_stops() {

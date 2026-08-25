@@ -164,10 +164,16 @@ fn run_session(
                     noops = report.noops,
                     planned = report.planned,
                     blocked = report.blocked,
+                    sync_errors = report.sync_errors,
+                    downloads_in_progress = report.downloads_in_progress,
                     conflicts = report.conflicts,
                     "reconciliation pass completed"
                 );
-                if report.blocked == 0 {
+                if report.sync_errors != 0 {
+                    if let Some(status) = status {
+                        status.sync_error();
+                    }
+                } else if !report.downloads_in_progress {
                     publish_phase(status, DaemonPhase::Waiting);
                 }
             }

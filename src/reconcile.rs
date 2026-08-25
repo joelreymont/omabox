@@ -156,6 +156,10 @@ pub struct ReconcileReport {
     pub planned: usize,
     /// Paths currently blocked by supported observation semantics.
     pub blocked: usize,
+    /// Paths Dropbox permanently rejected during this pass.
+    pub sync_errors: usize,
+    /// Whether background download workers still have files in flight.
+    pub downloads_in_progress: bool,
     /// Conflicts durably materialized and recorded.
     pub conflicts: usize,
 }
@@ -755,6 +759,14 @@ fn reconcile_published(
         replayed_operations: replay.completed_operations,
         ..ReconcileReport::default()
     };
+    let mut sync_error_paths = replay
+        .blocked
+        .iter()
+        .filter_map(|blocked| match blocked {
+            ReplayBlocked::SyncError { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
     let conflict_paths = conflicts
         .iter()
         .map(|record| dropbox_canonical_path(&record.path))
@@ -863,6 +875,10 @@ fn reconcile_published(
     );
     let applied = replay_pending_at(journal, dropbox, downloads, sync_root, upload_staging)?;
     report.replayed_operations += applied.completed_operations;
+    sync_error_paths.extend(applied.blocked.iter().filter_map(|blocked| match blocked {
+        ReplayBlocked::SyncError { path, .. } => Some(path.clone()),
+        _ => None,
+    }));
     if let Some(path) = applied.blocked.iter().find_map(|blocked| match blocked {
         ReplayBlocked::FreshObservationRequired { path } => Some(path.clone()),
         _ => None,
@@ -879,6 +895,8 @@ fn reconcile_published(
             .map(|plan| dropbox_canonical_path(&plan.path)),
     );
     report.blocked = blocked_paths.len();
+    report.sync_errors = sync_error_paths.len();
+    report.downloads_in_progress = !downloads.is_empty();
     remove_unreferenced_upload_stages(upload_staging, &retained_uploads)?;
     Ok(ReconcileOutcome::Complete(report))
 }

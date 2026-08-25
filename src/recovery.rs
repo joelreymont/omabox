@@ -8,7 +8,9 @@ use rustix::fd::OwnedFd;
 use rustix::fs::{AtFlags, FileType, fsync, statat, unlinkat};
 use thiserror::Error;
 
-use crate::dropbox::{DropboxClient, DropboxError, MutationOutcome, RemotePathState};
+use crate::dropbox::{
+    DropboxClient, DropboxError, MutationOutcome, MutationRejection, RemotePathState,
+};
 use crate::journal::{
     Journal, JournalError, OperationCompletion, OperationId, PlanConflictCompletion, PlanRecord,
     PlanSupersede, PlannedOperation, RecordStatus, RecoveryForget, RecoveryRecord,
@@ -125,6 +127,13 @@ pub enum ReplayBlocked {
     RemoteObject {
         /// Synchronized path preserved without mutation.
         path: PathBuf,
+    },
+    /// Dropbox permanently rejected this one path without affecting unrelated work.
+    SyncError {
+        /// Synchronized path that Dropbox rejected.
+        path: PathBuf,
+        /// Stable rejection category.
+        rejection: MutationRejection,
     },
 }
 
@@ -634,6 +643,9 @@ fn ensure_remote_parents(
                     "parent folder creation returned an impossible state",
                 ));
             }
+            MutationOutcome::Rejected(rejection) => {
+                return Ok(Some(sync_error(path, rejection)));
+            }
         }
     }
     Ok(None)
@@ -664,6 +676,7 @@ fn apply_folder_mutation(
                 path: plan.path.clone(),
             }))
         }
+        MutationOutcome::Rejected(rejection) => Ok(Some(sync_error(&plan.path, rejection))),
     }
 }
 
@@ -772,6 +785,7 @@ fn apply_file_mutation(
         ) => Ok(Some(ReplayBlocked::RemoteObject {
             path: plan.path.clone(),
         })),
+        MutationOutcome::Rejected(rejection) => Ok(Some(sync_error(&plan.path, rejection))),
     }
 }
 
@@ -846,6 +860,15 @@ fn apply_delete_mutation(
             &plan.path,
             "delete precondition changed to an impossible absent state",
         )),
+        MutationOutcome::Rejected(rejection) => Ok(Some(sync_error(&plan.path, rejection))),
+    }
+}
+
+fn sync_error(path: &Path, rejection: MutationRejection) -> ReplayBlocked {
+    tracing::error!(path = %path.display(), reason = %rejection, "Dropbox rejected sync path");
+    ReplayBlocked::SyncError {
+        path: path.to_path_buf(),
+        rejection,
     }
 }
 
