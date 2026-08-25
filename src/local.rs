@@ -13,8 +13,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{
     AtFlags, CWD, Dir, FileType, Mode, OFlags, RenameFlags, ResolveFlags, XattrFlags, fchmod,
-    fgetxattr, fremovexattr, fsetxattr, fstat, fsync, linkat, mkdirat, openat2, renameat_with,
-    unlinkat,
+    fgetxattr, fremovexattr, fsetxattr, fstat, fstatvfs, fsync, linkat, mkdirat, openat2,
+    renameat_with, unlinkat,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -200,6 +200,15 @@ pub enum ScanPublication {
     Published(CompleteScan),
     /// The configured path no longer named the active root.
     RootChanged,
+}
+
+/// Result of a non-overwriting local case-variant rename.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CaseVariantRename {
+    /// The observed entry was renamed and the parent directory was synchronized.
+    Renamed,
+    /// The source changed or the destination became occupied; rescan and retry.
+    Retry,
 }
 
 /// A verified immutable upload-stage file.
@@ -768,6 +777,113 @@ pub(crate) fn open_active_root(
     } else {
         Ok(None)
     }
+}
+
+/// Rename one local case variant without overwriting any destination.
+pub(crate) fn rename_case_variant(
+    root: &OwnedFd,
+    source: &Path,
+    destination: &Path,
+) -> Result<CaseVariantRename, LocalError> {
+    rename_case_variant_with(root, source, destination, || Ok(()))
+}
+
+fn rename_case_variant_with(
+    root: &OwnedFd,
+    source: &Path,
+    destination: &Path,
+    before_rename: impl FnOnce() -> io::Result<()>,
+) -> Result<CaseVariantRename, LocalError> {
+    if parent_path(source)? != parent_path(destination)? {
+        return Err(LocalError::UnsafeRelativePath {
+            path: destination.to_path_buf(),
+        });
+    }
+    let Some((parent, source_name, _)) = open_parent(root, source, false)? else {
+        return Ok(CaseVariantRename::Retry);
+    };
+    let destination_components = safe_components(destination)?;
+    let Some(destination_name) = destination_components.last() else {
+        return Err(LocalError::UnsafeRelativePath {
+            path: destination.to_path_buf(),
+        });
+    };
+    let source_entry = match openat2(
+        &parent,
+        &source_name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        BELOW_ROOT,
+    ) {
+        Ok(entry) => entry,
+        Err(error) if error == rustix::io::Errno::NOENT || error == rustix::io::Errno::LOOP => {
+            return Ok(CaseVariantRename::Retry);
+        }
+        Err(error) => {
+            return Err(syscall_failure("inspect local case variant", source, error));
+        }
+    };
+    let source_stat = stat_fd(&source_entry, source, "inspect local case variant type")?;
+    if !matches!(
+        FileType::from_raw_mode(source_stat.st_mode),
+        FileType::RegularFile | FileType::Directory
+    ) {
+        return Ok(CaseVariantRename::Retry);
+    }
+    before_rename().map_err(|error| io_failure("rename local case variant", source, error))?;
+
+    match renameat_with(
+        &parent,
+        &source_name,
+        &parent,
+        destination_name,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {
+            let renamed =
+                named_inode_matches(&source_entry, &parent, destination_name, destination)?;
+            sync_directory(&parent, destination, "sync local case-variant rename")?;
+            if renamed {
+                Ok(CaseVariantRename::Renamed)
+            } else {
+                Ok(CaseVariantRename::Retry)
+            }
+        }
+        Err(error) if error == rustix::io::Errno::NOENT || error == rustix::io::Errno::EXIST => {
+            Ok(CaseVariantRename::Retry)
+        }
+        Err(error) => Err(syscall_failure("rename local case variant", source, error)),
+    }
+}
+
+/// Return the component-length limit of the case variant's actual parent filesystem.
+pub(crate) fn case_variant_name_max(
+    root: &OwnedFd,
+    source: &Path,
+) -> Result<Option<usize>, LocalError> {
+    let Some((parent, _, _)) = open_parent(root, source, false)? else {
+        return Ok(None);
+    };
+    let statistics = fstatvfs(&parent)
+        .map_err(|error| syscall_failure("inspect case-variant filename limit", source, error))?;
+    let name_max = usize::try_from(statistics.f_namemax).map_err(|error| {
+        io_failure(
+            "inspect case-variant filename limit",
+            source,
+            io::Error::new(io::ErrorKind::InvalidData, error),
+        )
+    })?;
+    if name_max == 0 {
+        return Err(io_failure(
+            "inspect case-variant filename limit",
+            source,
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "filesystem reported a zero limit",
+            ),
+        ));
+    }
+    Ok(Some(name_max))
 }
 
 fn active_root_matches(journal: &Journal, actual: &LocalRootBinding) -> Result<bool, LocalError> {
@@ -1344,7 +1460,7 @@ fn named_inode_matches(
     name: &OsStr,
     path: &Path,
 ) -> Result<bool, LocalError> {
-    let held = stat_fd(file, path, "inspect held resumed download")?;
+    let held = stat_fd(file, path, "inspect held local entry")?;
     let entry = match openat2(
         directory,
         name,
@@ -1357,14 +1473,10 @@ fn named_inode_matches(
             return Ok(false);
         }
         Err(source) => {
-            return Err(syscall_failure(
-                "inspect resumed download binding",
-                path,
-                source,
-            ));
+            return Err(syscall_failure("inspect named local entry", path, source));
         }
     };
-    let named = stat_fd(&entry, path, "inspect named resumed download")?;
+    let named = stat_fd(&entry, path, "inspect named local entry")?;
     Ok(same_inode(&held, &named))
 }
 
@@ -3664,6 +3776,70 @@ mod tests {
             aggregate.update(Sha256::digest(block));
         }
         ContentIdentity::new(hex_digest(aggregate.finalize()))
+    }
+
+    #[test]
+    fn case_variant_rename_preserves_tree_and_retries_races() -> Result<(), Box<dyn Error>> {
+        let root = TempDir::new()?;
+        let source = Path::new("credit");
+        let destination = Path::new("credit (case variant)");
+        std::fs::create_dir(root.path().join(source))?;
+        std::fs::write(root.path().join(source).join("receipt.pdf"), b"receipt")?;
+        std::fs::write(root.path().join(destination), b"raced destination")?;
+        let root_fd = open_absolute_directory(root.path(), "open test root")?;
+
+        assert_eq!(
+            rename_case_variant(&root_fd, source, destination)?,
+            CaseVariantRename::Retry
+        );
+        assert_eq!(
+            std::fs::read(root.path().join(destination))?,
+            b"raced destination"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join(source).join("receipt.pdf"))?,
+            b"receipt"
+        );
+
+        std::fs::remove_file(root.path().join(destination))?;
+        assert_eq!(
+            rename_case_variant(&root_fd, source, destination)?,
+            CaseVariantRename::Renamed
+        );
+        assert!(!root.path().join(source).exists());
+        assert_eq!(
+            std::fs::read(root.path().join(destination).join("receipt.pdf"))?,
+            b"receipt"
+        );
+        assert_eq!(
+            rename_case_variant(&root_fd, source, destination)?,
+            CaseVariantRename::Retry
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn case_variant_rename_preserves_a_swapped_source() -> Result<(), Box<dyn Error>> {
+        let root = TempDir::new()?;
+        let source = Path::new("credit");
+        let destination = Path::new("credit (case variant)");
+        let preserved = Path::new("preserved-by-racer");
+        std::fs::write(root.path().join(source), b"observed bytes")?;
+        let root_fd = open_absolute_directory(root.path(), "open test root")?;
+
+        let outcome = rename_case_variant_with(&root_fd, source, destination, || {
+            std::fs::rename(root.path().join(source), root.path().join(preserved))?;
+            std::fs::write(root.path().join(source), b"new bytes")
+        })?;
+
+        assert_eq!(outcome, CaseVariantRename::Retry);
+        assert_eq!(
+            std::fs::read(root.path().join(preserved))?,
+            b"observed bytes"
+        );
+        assert_eq!(std::fs::read(root.path().join(destination))?, b"new bytes");
+        assert!(!root.path().join(source).exists());
+        Ok(())
     }
 
     fn scanned_content<'a>(

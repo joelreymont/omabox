@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -19,8 +19,8 @@ use omabox::journal::{
     DropboxBinding, Journal, LocalRootBinding, PlanWrite, RemoteInventory, RemoteObservationRecord,
 };
 use omabox::local::{
-    InstallOutcome, StageOutcome, StagedUpload, dropbox_content_hash, install_download,
-    stage_download, stage_upload,
+    InstallOutcome, ScanPublication, StageOutcome, StagedUpload, dropbox_content_hash,
+    install_download, scan_and_publish, stage_download, stage_upload,
 };
 use omabox::model::{
     Baseline, Conflict, ContentIdentity, Decision, DropboxRevision, LocalFile, Observation,
@@ -581,7 +581,11 @@ fn case_only_remote_spelling_change_is_a_stable_noop() -> Result<(), Box<dyn Err
 }
 
 #[test]
-fn local_case_collision_cannot_create_any_plan() -> Result<(), Box<dyn Error>> {
+fn local_case_collision_is_renamed_before_planning_and_then_syncs() -> Result<(), Box<dyn Error>> {
+    let first_bytes = b"first";
+    let second_bytes = b"second";
+    let first_content = dropbox_content_hash(first_bytes.as_slice())?;
+    let second_content = dropbox_content_hash(second_bytes.as_slice())?;
     let server = FakeServer::start(vec![
         FakeResponse::json(json!({
             "account_id": "account",
@@ -592,6 +596,18 @@ fn local_case_collision_cannot_create_any_plan() -> Result<(), Box<dyn Error>> {
             "cursor": "empty",
             "has_more": false
         })),
+        FakeResponse::json(file_metadata(
+            "/foo.txt",
+            "/Foo.txt",
+            "rev-first",
+            &first_content,
+        )),
+        FakeResponse::json(file_metadata(
+            "/foo.txt (case variant)",
+            "/foo.txt (case variant)",
+            "rev-second",
+            &second_content,
+        )),
     ])?;
     let client = fake_client(&server, "opaque-access-local-collision")?;
     let directory = TempDir::new()?;
@@ -601,18 +617,108 @@ fn local_case_collision_cannot_create_any_plan() -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(&root)?;
     std::fs::create_dir_all(&staging)?;
     std::fs::create_dir_all(&recovery)?;
-    std::fs::write(root.join("Foo.txt"), b"first")?;
-    std::fs::write(root.join("foo.txt"), b"second")?;
+    std::fs::write(root.join("Foo.txt"), first_bytes)?;
+    std::fs::write(root.join("foo.txt"), second_bytes)?;
     let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
     let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
 
-    assert!(matches!(
-        reconcile_once(&mut journal, &client, &root, &staging, &recovery),
-        Err(ReconcileError::LocalCaseCollision { .. })
-    ));
+    assert_eq!(
+        reconcile_once(&mut journal, &client, &root, &staging, &recovery)?,
+        ReconcileOutcome::FreshObservationRequired {
+            path: PathBuf::from("foo.txt")
+        }
+    );
     assert!(journal.pending_plans()?.is_empty());
     assert!(journal.baseline_paths()?.is_empty());
-    assert_eq!(server.finish()?.len(), 2);
+    assert_eq!(std::fs::read(root.join("Foo.txt"))?, first_bytes);
+    assert!(!root.join("foo.txt").exists());
+    assert_eq!(
+        std::fs::read(root.join("foo.txt (case variant)"))?,
+        second_bytes
+    );
+
+    drop(journal);
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let report = match reconcile_once(&mut journal, &client, &root, &staging, &recovery)? {
+        ReconcileOutcome::Complete(report) => report,
+        ReconcileOutcome::FreshObservationRequired { .. } => {
+            return Err(io::Error::other("renamed case variants did not converge").into());
+        }
+        ReconcileOutcome::LocalRootChanged => {
+            return Err(io::Error::other("stable case-variant fixture changed its root").into());
+        }
+    };
+    assert_eq!(report.planned, 2);
+    assert_eq!(report.replayed_operations, 2);
+    assert_eq!(report.blocked, 0);
+    assert!(journal.pending_plans()?.is_empty());
+    assert_eq!(server.finish()?.len(), 4);
+    Ok(())
+}
+
+#[test]
+fn local_case_collision_preserves_both_directory_trees() -> Result<(), Box<dyn Error>> {
+    let server = FakeServer::start(Vec::new())?;
+    let client = fake_client(&server, "opaque-access-directory-collision")?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(root.join("Credit/statements"))?;
+    std::fs::create_dir_all(root.join("credit/Expenses"))?;
+    std::fs::create_dir_all(root.join("credit/expenses"))?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("Credit/statements/april.pdf"), b"statement")?;
+    std::fs::write(root.join("credit/Expenses/invoice.pdf"), b"invoice")?;
+    std::fs::write(root.join("credit/expenses/receipt.pdf"), b"receipt")?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+
+    assert_eq!(
+        reconcile_once(&mut journal, &client, &root, &staging, &recovery)?,
+        ReconcileOutcome::FreshObservationRequired {
+            path: PathBuf::from("credit")
+        }
+    );
+    assert_eq!(
+        std::fs::read(root.join("Credit/statements/april.pdf"))?,
+        b"statement"
+    );
+    assert_eq!(
+        std::fs::read(root.join("credit (case variant)/expenses/receipt.pdf"))?,
+        b"receipt"
+    );
+    assert!(!root.join("credit").exists());
+    assert!(journal.pending_plans()?.is_empty());
+
+    assert_eq!(
+        reconcile_once(&mut journal, &client, &root, &staging, &recovery)?,
+        ReconcileOutcome::FreshObservationRequired {
+            path: PathBuf::from("credit (case variant)/expenses")
+        }
+    );
+    assert_eq!(
+        std::fs::read(root.join("credit (case variant)/Expenses/invoice.pdf"))?,
+        b"invoice"
+    );
+    assert_eq!(
+        std::fs::read(root.join("credit (case variant)/expenses (case variant)/receipt.pdf"))?,
+        b"receipt"
+    );
+    let scan = match scan_and_publish(&mut journal, &root)? {
+        ScanPublication::Published(scan) => scan,
+        ScanPublication::RootChanged => {
+            return Err(io::Error::other("stable nested fixture changed its root").into());
+        }
+    };
+    let mut canonical_paths = BTreeSet::new();
+    assert!(
+        scan.observations()
+            .iter()
+            .all(|record| canonical_paths.insert(record.path.to_string_lossy().to_lowercase()))
+    );
+    assert_eq!(server.finish()?.len(), 0);
     Ok(())
 }
 

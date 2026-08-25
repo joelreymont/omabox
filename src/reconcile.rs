@@ -1,7 +1,9 @@
 //! One finite observe, plan, and journal pass.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 use std::io;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -15,10 +17,10 @@ use crate::journal::{
     PlanWrite, RemoteObservationRecord, dropbox_canonical_path,
 };
 use crate::local::{
-    DownloadSlotIdentity, DownloadSlotLease, LocalError, MAX_PARALLEL_DOWNLOADS, ScanPublication,
-    StageOutcome, StagedUpload, configured_root_is_active, lease_download_slots,
-    observe_upload_source, open_active_root, remove_unreferenced_upload_stages, scan_and_publish,
-    stage_upload,
+    CaseVariantRename, DownloadSlotIdentity, DownloadSlotLease, LocalError, MAX_PARALLEL_DOWNLOADS,
+    ScanPublication, StageOutcome, StagedUpload, case_variant_name_max, configured_root_is_active,
+    lease_download_slots, observe_upload_source, open_active_root,
+    remove_unreferenced_upload_stages, rename_case_variant, scan_and_publish, stage_upload,
 };
 use crate::model::{Baseline, Conflict, Decision, Observation, Operation, RemoteFile};
 use crate::planner::plan;
@@ -326,8 +328,25 @@ fn reconcile_active_root(
         upload_staging,
         recovery_directory,
     )?;
-    if scan_and_publish(journal, sync_root)? == ScanPublication::RootChanged {
-        return Err(ReconcileError::LocalRootChanged);
+    let scan = match scan_and_publish(journal, sync_root)? {
+        ScanPublication::Published(scan) => scan,
+        ScanPublication::RootChanged => return Err(ReconcileError::LocalRootChanged),
+    };
+    if let Some(source) = case_variant_source(scan.observations()) {
+        let Some(root) = open_active_root(journal, sync_root)? else {
+            return Err(ReconcileError::LocalRootChanged);
+        };
+        let Some(name_max) = case_variant_name_max(&root, &source)? else {
+            return Ok(ReconcileOutcome::FreshObservationRequired { path: source });
+        };
+        let rename = case_variant_move(scan.observations(), source, name_max)?;
+        match rename_case_variant(&root, &rename.source, &rename.destination)? {
+            CaseVariantRename::Renamed | CaseVariantRename::Retry => {
+                return Ok(ReconcileOutcome::FreshObservationRequired {
+                    path: rename.source,
+                });
+            }
+        }
     }
     dropbox.refresh_inventory(journal)?;
     require_active_local_root(journal, sync_root)?;
@@ -801,6 +820,91 @@ fn local_map(
     Ok(mapped)
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct CaseVariantMove {
+    source: PathBuf,
+    destination: PathBuf,
+}
+
+fn case_variant_source(records: &[LocalObservationRecord]) -> Option<PathBuf> {
+    let mut spellings = BTreeMap::<PathBuf, BTreeSet<PathBuf>>::new();
+    for record in records {
+        let canonical = dropbox_canonical_path(&record.path);
+        spellings
+            .entry(canonical)
+            .or_default()
+            .insert(record.path.clone());
+    }
+    spellings
+        .values()
+        .find(|paths| paths.len() > 1)
+        .and_then(|variants| variants.last().cloned())
+}
+
+fn case_variant_move(
+    records: &[LocalObservationRecord],
+    source: PathBuf,
+    name_max: usize,
+) -> Result<CaseVariantMove, ReconcileError> {
+    let occupied = records
+        .iter()
+        .map(|record| dropbox_canonical_path(&record.path))
+        .collect::<BTreeSet<_>>();
+    let Some(name) = source.file_name() else {
+        return Err(invalid(
+            &source,
+            "local case collision has no final path component",
+        ));
+    };
+    let Some(parent) = source.parent() else {
+        return Err(invalid(&source, "local case collision has no parent path"));
+    };
+    for attempt in 0..=records.len() {
+        let Some(candidate_name) = case_variant_name(name, attempt, name_max) else {
+            break;
+        };
+        let destination = parent.join(candidate_name);
+        if !occupied.contains(&dropbox_canonical_path(&destination)) {
+            return Ok(CaseVariantMove {
+                source,
+                destination,
+            });
+        }
+    }
+    Err(invalid(
+        &source,
+        "could not select a unique local case-variant path",
+    ))
+}
+
+fn case_variant_name(name: &OsStr, attempt: usize, name_max: usize) -> Option<OsString> {
+    let suffix = if attempt == 0 {
+        String::from(" (case variant)")
+    } else {
+        format!(" (case variant {})", attempt.saturating_add(1))
+    };
+    let prefix_max = name_max.checked_sub(suffix.len())?;
+    let mut candidate = truncate_component(name, prefix_max);
+    candidate.push(suffix);
+    Some(candidate)
+}
+
+fn truncate_component(name: &OsStr, limit: usize) -> OsString {
+    let bytes = name.as_bytes();
+    if bytes.len() <= limit {
+        return name.to_os_string();
+    }
+    if let Some(text) = name.to_str() {
+        let mut end = limit;
+        while !text.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        OsString::from(&text[..end])
+    } else {
+        OsString::from_vec(bytes[..limit].to_vec())
+    }
+}
+
 fn remote_map(records: Vec<RemoteObservationRecord>) -> BTreeMap<PathBuf, RemoteObservationRecord> {
     records
         .into_iter()
@@ -826,34 +930,131 @@ mod tests {
     use super::*;
     use crate::local::{ConflictSide, conflict_relative_path, dropbox_content_hash};
 
+    fn local_records(paths: impl IntoIterator<Item = PathBuf>) -> Vec<LocalObservationRecord> {
+        paths
+            .into_iter()
+            .map(|path| LocalObservationRecord {
+                path,
+                observation: Observation::Unknown(crate::model::UnknownReason::Unsupported),
+            })
+            .collect()
+    }
+
     proptest! {
         #[test]
         fn local_case_variants_never_collapse_into_one_observation(
             lowercase in "[a-z]{1,24}\\.txt",
         ) {
             let uppercase = lowercase.to_ascii_uppercase();
-            let records = vec![
-                LocalObservationRecord {
-                    path: PathBuf::from(&lowercase),
-                    observation: Observation::Present(crate::model::LocalFile::new(
-                        crate::model::ContentIdentity::new("lower"),
-                    )),
-                },
-                LocalObservationRecord {
-                    path: PathBuf::from(&uppercase),
-                    observation: Observation::Present(crate::model::LocalFile::new(
-                        crate::model::ContentIdentity::new("upper"),
-                    )),
-                },
-            ];
+            let mut records = local_records([lowercase.into(), uppercase.into()]);
 
-            let collision = match local_map(records) {
+            let collision = match local_map(records.clone()) {
                 Err(ReconcileError::LocalCaseCollision { .. }) => true,
                 Ok(_) | Err(_) => false,
             };
             prop_assert!(collision);
+
+            let Some(forward_source) = case_variant_source(&records) else {
+                return Err(TestCaseError::fail("case collision had no source"));
+            };
+            let Ok(forward) = case_variant_move(&records, forward_source, 255) else {
+                return Err(TestCaseError::fail("case collision had no automatic rename"));
+            };
+            records.reverse();
+            let Some(reversed_source) = case_variant_source(&records) else {
+                return Err(TestCaseError::fail("reversed case collision had no source"));
+            };
+            let Ok(reversed) = case_variant_move(&records, reversed_source, 255) else {
+                return Err(TestCaseError::fail("reversed case collision had no rename"));
+            };
+            prop_assert_eq!(&forward, &reversed);
+            let destination_is_unique = records.iter().all(|record| {
+                dropbox_canonical_path(&record.path)
+                    != dropbox_canonical_path(&forward.destination)
+            });
+            prop_assert!(destination_is_unique);
         }
     }
+
+    #[test]
+    fn case_variant_name_skips_existing_suffixes() -> Result<(), Box<dyn Error>> {
+        let records = local_records(
+            [
+                "Credit",
+                "credit",
+                "credit (case variant)",
+                "CREDIT (CASE VARIANT 2)",
+            ]
+            .map(PathBuf::from),
+        );
+        let Some(source) = case_variant_source(&records) else {
+            return Err(io::Error::other("expected a case-variant rename").into());
+        };
+        let rename = case_variant_move(&records, source, 255)?;
+
+        assert_eq!(rename.source, Path::new("credit"));
+        assert_eq!(rename.destination, Path::new("credit (case variant 3)"));
+        Ok(())
+    }
+
+    #[test]
+    fn case_variant_name_fits_a_maximum_length_component() -> Result<(), Box<dyn Error>> {
+        let records = local_records(["A".repeat(255).into(), "a".repeat(255).into()]);
+        let Some(source) = case_variant_source(&records) else {
+            return Err(io::Error::other("expected a maximum-length collision").into());
+        };
+
+        let rename = case_variant_move(&records, source, 255)?;
+
+        let Some(destination_name) = rename.destination.file_name() else {
+            return Err(io::Error::other("case variant destination had no name").into());
+        };
+        assert_eq!(destination_name.as_bytes().len(), 255);
+        assert!(destination_name.as_bytes().ends_with(b" (case variant)"));
+        Ok(())
+    }
+
+    #[test]
+    fn case_variant_moves_converge_from_parent_to_child() -> Result<(), Box<dyn Error>> {
+        let records = local_records(
+            ["Credit", "credit", "credit/Expenses", "credit/expenses"].map(PathBuf::from),
+        );
+        let Some(parent_source) = case_variant_source(&records) else {
+            return Err(io::Error::other("expected a parent collision").into());
+        };
+        let parent = case_variant_move(&records, parent_source, 255)?;
+        assert_eq!(parent.source, Path::new("credit"));
+        assert_eq!(parent.destination, Path::new("credit (case variant)"));
+
+        let after_parent = local_records(
+            [
+                "Credit",
+                "credit (case variant)",
+                "credit (case variant)/Expenses",
+                "credit (case variant)/expenses",
+            ]
+            .map(PathBuf::from),
+        );
+        let Some(child_source) = case_variant_source(&after_parent) else {
+            return Err(io::Error::other("expected a child collision").into());
+        };
+        let child = case_variant_move(&after_parent, child_source, 255)?;
+        assert_eq!(child.source, Path::new("credit (case variant)/expenses"));
+        assert_eq!(
+            child.destination,
+            Path::new("credit (case variant)/expenses (case variant)")
+        );
+
+        let converged = local_records([
+            PathBuf::from("Credit"),
+            PathBuf::from("credit (case variant)"),
+            PathBuf::from("credit (case variant)/Expenses"),
+            child.destination,
+        ]);
+        assert_eq!(case_variant_source(&converged), None);
+        Ok(())
+    }
+
     use crate::model::{ContentIdentity, DropboxRevision, LocalFile, RemoteFile};
     use crate::recovery::replay_local_operations;
 
