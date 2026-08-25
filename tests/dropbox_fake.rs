@@ -3743,6 +3743,59 @@ fn cursor_reset_rebuilds_before_one_complete_publication() -> Result<(), Box<dyn
 }
 
 #[test]
+fn failed_rebuild_after_cursor_reset_preserves_durable_inventory() -> Result<(), Box<dyn Error>> {
+    let old_content = dropbox_content_hash(b"durable old bytes".as_slice())?;
+    let partial_content = dropbox_content_hash(b"uncommitted replacement".as_slice())?;
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::status_json(
+            409,
+            json!({"error_summary": "reset/", "error": {".tag": "reset"}}),
+        ),
+        FakeResponse::json(json!({
+            "entries": [file_metadata(
+                "/replacement.txt",
+                "/Replacement.txt",
+                "rev-partial",
+                &partial_content,
+            )],
+            "cursor": "fresh-partial",
+            "has_more": true
+        })),
+        FakeResponse::status_json(503, json!({"error": {".tag": "other"}})),
+    ])?;
+    let client = fake_client(&server, "opaque-access-failed-reset-rebuild")?;
+    let directory = TempDir::new()?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let old = RemoteObservationRecord {
+        canonical_path: Path::new("old.txt").to_path_buf(),
+        path: Path::new("Old.txt").to_path_buf(),
+        observation: Observation::Present(RemoteFile::new(
+            old_content,
+            DropboxRevision::new("rev-old"),
+        )),
+    };
+    let durable_cursor = "durable-cursor";
+    let durable = RemoteInventory {
+        cursor: Some(String::from(durable_cursor)),
+        observations: vec![old],
+    };
+    journal.publish_remote_inventory(durable_cursor, &durable.observations)?;
+
+    assert!(client.refresh_inventory(&mut journal).is_err());
+    assert_eq!(journal.remote_inventory()?, durable);
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[1].path, "/2/files/list_folder/continue");
+    assert_eq!(requests[2].path, "/2/files/list_folder");
+    assert_eq!(requests[3].path, "/2/files/list_folder/continue");
+    Ok(())
+}
+
+#[test]
 fn listing_applies_ordered_tree_mutations_across_pages() -> Result<(), Box<dyn Error>> {
     let identity = dropbox_content_hash(b"tree payload".as_slice())?;
     let file = |path_lower: &str, path_display: &str| {

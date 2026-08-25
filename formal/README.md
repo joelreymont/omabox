@@ -27,6 +27,11 @@ convergence for ordinary changes, and preservation of every present conflict
 side. The corresponding fake-Dropbox tests exercise these cases through Rust;
 TLC does not prove that the implementation conforms to the model.
 
+`InventoryPublication` checks fresh listings, cursor deltas, reset-triggered
+rebuilds, multi-page failures, crashes, retries, and atomic publication. Partial
+pages and failed attempts must leave the prior durable inventory and cursor
+unchanged; deleting durable entries requires a complete validated publication.
+
 Run it from this directory with the official TLA+ tools:
 
 ```sh
@@ -44,6 +49,9 @@ java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
 
 java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
   -config SyncBehavior.cfg SyncBehavior.tla
+
+java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
+  -config InventoryPublication.cfg InventoryPublication.tla
 ```
 
 Same- and cross-filesystem promotion share one durable abstract boundary; TLC
