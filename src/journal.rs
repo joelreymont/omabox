@@ -182,6 +182,13 @@ pub struct RemoteInventory {
     pub observations: Vec<RemoteObservationRecord>,
 }
 
+/// Durable common state with its display and Dropbox-canonical paths.
+pub(crate) struct BaselineRecord {
+    pub(crate) canonical_path: PathBuf,
+    pub(crate) path: PathBuf,
+    pub(crate) baseline: Baseline,
+}
+
 /// One ordered mutation from a validated Dropbox cursor continuation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RemoteInventoryChange {
@@ -860,35 +867,6 @@ impl Journal {
         observations: &[LocalObservationRecord],
         hashes: &[LocalHashRecord],
     ) -> Result<bool, JournalError> {
-        let encoded_observations = observations
-            .iter()
-            .map(|record| {
-                encode(
-                    &record.observation,
-                    "serialize local observation",
-                    &record.path,
-                )
-                .map(|json| (path_bytes(&record.path), json))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let encoded_hashes = hashes
-            .iter()
-            .map(|record| {
-                if !is_dropbox_content_hash(record.content.as_str()) {
-                    return Err(JournalError::InvalidState {
-                        operation: "publish local hash cache",
-                        path: record.path.clone(),
-                        detail: "cached content identity is not a Dropbox content hash",
-                    });
-                }
-                let value = LocalHashValue {
-                    fingerprint: record.fingerprint.clone(),
-                    content: record.content.clone(),
-                };
-                encode(&value, "serialize local hash cache", &record.path)
-                    .map(|json| (path_bytes(&record.path), json))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let database_path = self.database_path.clone();
         let transaction = self
             .connection
@@ -912,23 +890,56 @@ impl Journal {
         transaction
             .execute("DELETE FROM local_hash_cache", [])
             .map_err(|source| sqlite("replace local hash cache", &database_path, source))?;
-        for (path, json) in encoded_observations {
-            transaction
-                .execute(
-                    "INSERT INTO local_observations(path, observation_json) VALUES (?1, ?2)",
-                    params![path, json],
-                )
-                .map_err(|source| sqlite("publish local observation", &database_path, source))?;
+        {
+            let mut statement = transaction
+                .prepare("INSERT INTO local_observations(path, observation_json) VALUES (?1, ?2)")
+                .map_err(|source| {
+                    sqlite(
+                        "prepare local observation publication",
+                        &database_path,
+                        source,
+                    )
+                })?;
+            for record in observations {
+                let json = encode(
+                    &record.observation,
+                    "serialize local observation",
+                    &record.path,
+                )?;
+                statement
+                    .execute(params![path_bytes(&record.path), json])
+                    .map_err(|source| {
+                        sqlite("publish local observation", &database_path, source)
+                    })?;
+            }
         }
-        for (path, json) in encoded_hashes {
-            transaction
-                .execute(
+        {
+            let mut statement = transaction
+                .prepare(
                     "INSERT INTO local_hash_cache(\
                          root_generation, path, hash_json\
                      ) VALUES (?1, ?2, ?3)",
-                    params![generation, path, json],
                 )
-                .map_err(|source| sqlite("publish local hash", &database_path, source))?;
+                .map_err(|source| {
+                    sqlite("prepare local hash publication", &database_path, source)
+                })?;
+            for record in hashes {
+                if !is_dropbox_content_hash(record.content.as_str()) {
+                    return Err(JournalError::InvalidState {
+                        operation: "publish local hash cache",
+                        path: record.path.clone(),
+                        detail: "cached content identity is not a Dropbox content hash",
+                    });
+                }
+                let value = LocalHashValue {
+                    fingerprint: record.fingerprint.clone(),
+                    content: record.content.clone(),
+                };
+                let json = encode(&value, "serialize local hash cache", &record.path)?;
+                statement
+                    .execute(params![generation, path_bytes(&record.path), json])
+                    .map_err(|source| sqlite("publish local hash", &database_path, source))?;
+            }
         }
         transaction
             .commit()
@@ -1281,6 +1292,53 @@ impl Journal {
         rows.collect::<Result<Vec<_>, _>>()
             .map(|paths| paths.into_iter().map(bytes_path).collect())
             .map_err(|source| sqlite("read baseline paths", &self.database_path, source))
+    }
+
+    /// Load every durable common baseline in Dropbox-canonical path order.
+    pub(crate) fn baselines(&self) -> Result<Vec<BaselineRecord>, JournalError> {
+        let query = if self.schema_version < 4 {
+            "SELECT path, path, baseline_json FROM baselines \
+             WHERE baseline_json != '\"Absent\"' ORDER BY path"
+        } else {
+            "SELECT canonical_path, path, baseline_json FROM baselines \
+             WHERE baseline_json != '\"Absent\"' ORDER BY canonical_path"
+        };
+        let mut statement = self.connection.prepare(query).map_err(|source| {
+            sqlite(
+                "prepare baseline snapshot query",
+                &self.database_path,
+                source,
+            )
+        })?;
+        let mut rows = statement
+            .query([])
+            .map_err(|source| sqlite("query baseline snapshot", &self.database_path, source))?;
+        let mut records = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|source| sqlite("read baseline snapshot", &self.database_path, source))?
+        {
+            let raw_canonical_path = row.get::<_, Vec<u8>>(0).map_err(|source| {
+                sqlite("read baseline canonical path", &self.database_path, source)
+            })?;
+            let raw_path = row
+                .get::<_, Vec<u8>>(1)
+                .map_err(|source| sqlite("read baseline path", &self.database_path, source))?;
+            let json = row
+                .get::<_, String>(2)
+                .map_err(|source| sqlite("read baseline payload", &self.database_path, source))?;
+            let canonical_path = bytes_path(raw_canonical_path);
+            let path = bytes_path(raw_path);
+            let baseline = decode(&json, "deserialize baseline", &path)?;
+            if baseline != Baseline::Absent {
+                records.push(BaselineRecord {
+                    canonical_path,
+                    path,
+                    baseline,
+                });
+            }
+        }
+        Ok(records)
     }
 
     /// Forget common history beneath an automatically renamed case-collision path.
@@ -3373,6 +3431,35 @@ mod tests {
             |row| row.get::<_, i64>(0),
         )?;
         assert_eq!(stored, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn baseline_snapshot_is_canonical_sorted() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let mut journal = Journal::open(journal_path(&directory))?;
+        for (path, value, revision) in [
+            (Path::new("Zulu.TXT"), "zulu", "rev-zulu"),
+            (Path::new("alpha.txt"), "alpha", "rev-alpha"),
+        ] {
+            let agreed = noop(plan(
+                &Baseline::Absent,
+                &Observation::Present(LocalFile::new(content(value))),
+                &Observation::Present(remote_file(value, revision)),
+            ))?;
+            journal.record_noop(path, &agreed)?;
+        }
+
+        let records = journal.baselines()?;
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].canonical_path, Path::new("alpha.txt"));
+        assert_eq!(records[0].path, Path::new("alpha.txt"));
+        assert_eq!(records[1].canonical_path, Path::new("zulu.txt"));
+        assert_eq!(records[1].path, Path::new("Zulu.TXT"));
+        assert_eq!(
+            records[1].baseline,
+            Baseline::Present(remote_file("zulu", "rev-zulu"))
+        );
         Ok(())
     }
 

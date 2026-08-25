@@ -1,6 +1,8 @@
 //! Root-confined local observation and crash-safe file phases.
 
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -252,6 +254,10 @@ impl CompleteScan {
     #[must_use]
     pub fn observations(&self) -> &[LocalObservationRecord] {
         &self.observations
+    }
+
+    pub(crate) fn into_observations(self) -> Vec<LocalObservationRecord> {
+        self.observations
     }
 }
 
@@ -711,13 +717,13 @@ fn current_hash_cache_cutoff() -> Option<HashCacheCutoff> {
 /// while their contents are scanned recursively.
 #[cfg(test)]
 fn scan(root: impl AsRef<Path>) -> Result<CompleteScan, LocalError> {
-    scan_with_cache_and_workers_at(root, &BTreeMap::new(), MAX_PARALLEL_HASHES, None)
+    scan_with_cache_and_workers_at(root, &[], MAX_PARALLEL_HASHES, None)
 }
 
 #[cfg(test)]
 fn scan_with_cache_and_workers_at(
     root: impl AsRef<Path>,
-    cache: &BTreeMap<PathBuf, LocalHashRecord>,
+    cache: &[LocalHashRecord],
     max_workers: usize,
     cache_cutoff: Option<HashCacheCutoff>,
 ) -> Result<CompleteScan, LocalError> {
@@ -730,9 +736,10 @@ fn scan_with_cache_and_workers_at(
     )
 }
 
+#[cfg(test)]
 fn scan_with_cache_and_workers_completed_at(
     root: impl AsRef<Path>,
-    cache: &BTreeMap<PathBuf, LocalHashRecord>,
+    cache: &[LocalHashRecord],
     max_workers: usize,
     cache_cutoff: Option<HashCacheCutoff>,
     completed_cutoff: fn() -> Option<HashCacheCutoff>,
@@ -743,7 +750,7 @@ fn scan_with_cache_and_workers_completed_at(
 
 fn enumerate_scan(
     root: &Path,
-    cache: &BTreeMap<PathBuf, LocalHashRecord>,
+    cache: &[LocalHashRecord],
     cache_cutoff: Option<HashCacheCutoff>,
 ) -> Result<PendingScan, LocalError> {
     let root_fd = open_absolute_directory(root, "open sync root for scan")?;
@@ -855,17 +862,10 @@ fn scan_and_publish_at(
     let root = root.as_ref();
     let cache = journal
         .local_hash_cache()
-        .map_err(|source| LocalError::Journal { source })?
-        .into_iter()
-        .map(|record| (record.path.clone(), record))
-        .collect::<BTreeMap<_, _>>();
-    let scan = scan_with_cache_and_workers_completed_at(
-        root,
-        &cache,
-        MAX_PARALLEL_HASHES,
-        cache_cutoff,
-        completed_cutoff,
-    )?;
+        .map_err(|source| LocalError::Journal { source })?;
+    let pending = enumerate_scan(root, &cache, cache_cutoff)?;
+    drop(cache);
+    let scan = finish_scan_at(pending, MAX_PARALLEL_HASHES, completed_cutoff)?;
     if !active_root_matches(journal, &scan.root_binding)?
         || !configured_root_is_active(journal, root)?
     {
@@ -2588,7 +2588,7 @@ pub(crate) fn verify_private_copy(
 fn scan_directory(
     directory: &OwnedFd,
     relative: &Path,
-    cache: &BTreeMap<PathBuf, LocalHashRecord>,
+    cache: &[LocalHashRecord],
     cache_cutoff: Option<HashCacheCutoff>,
     entries: &mut ScanEntries,
 ) -> Result<(), LocalError> {
@@ -2635,15 +2635,7 @@ fn scan_directory(
                     continue;
                 }
                 let fingerprint = file_fingerprint(&opened, &path)?;
-                let after = stat_fd(&file, &path, "verify enumerated scan file")?;
-                if !same_observation(&opened, &after) {
-                    entries.observations.push(LocalObservationRecord {
-                        path,
-                        observation: Observation::Unknown(UnknownReason::Incomplete),
-                    });
-                    continue;
-                }
-                match cache.get(&path) {
+                match cached_hash(cache, &path) {
                     Some(record)
                         if record.fingerprint == fingerprint
                             && hash_is_reusable(record, cache_cutoff) =>
@@ -2694,6 +2686,13 @@ fn scan_directory(
         before,
     });
     Ok(())
+}
+
+fn cached_hash<'a>(cache: &'a [LocalHashRecord], path: &Path) -> Option<&'a LocalHashRecord> {
+    let Ok(index) = cache.binary_search_by(|record| record.path.as_path().cmp(path)) else {
+        return None;
+    };
+    cache.get(index)
 }
 
 fn hash_scan_files(
@@ -2770,8 +2769,8 @@ fn hash_scan_file(
     job: &HashJob,
     completed_cutoff: fn() -> Option<HashCacheCutoff>,
 ) -> Result<ScannedHash, LocalError> {
-    let mut file = open_relative_regular(root, &job.path, "open enumerated scan file")?;
-    let opened = stat_fd(&file, &job.path, "inspect enumerated scan file")?;
+    let (mut file, opened) =
+        open_relative_regular_with_stat(root, &job.path, "open enumerated scan file")?;
     if file_fingerprint(&opened, &job.path)? != job.fingerprint {
         return Err(LocalError::ChangedDuringRead {
             operation: "open enumerated scan file",
@@ -2779,7 +2778,7 @@ fn hash_scan_file(
         });
     }
     let (content, fingerprint) =
-        hash_stable_file_with_fingerprint(&mut file, &job.path, "hash local scan file")?;
+        hash_stable_file_from_stat(&mut file, &job.path, "hash local scan file", opened)?;
     if fingerprint != job.fingerprint {
         return Err(LocalError::ChangedDuringRead {
             operation: "hash enumerated scan file",
@@ -2804,14 +2803,9 @@ fn revalidate_cached_files(
     let mut records = Vec::with_capacity(cached_files.len());
     let mut changed = Vec::new();
     for record in cached_files {
-        let file = open_relative_regular(root, &record.path, "reopen cached scan file")?;
-        let before = stat_fd(&file, &record.path, "revalidate cached scan file")?;
+        let (_file, before) =
+            open_relative_regular_with_stat(root, &record.path, "reopen cached scan file")?;
         if file_fingerprint(&before, &record.path)? != record.fingerprint {
-            changed.push(record.path);
-            continue;
-        }
-        let after = stat_fd(&file, &record.path, "verify cached scan file")?;
-        if !same_observation(&before, &after) {
             changed.push(record.path);
             continue;
         }
@@ -2894,6 +2888,15 @@ fn hash_stable_file_with_fingerprint(
     operation: &'static str,
 ) -> Result<(ContentIdentity, LocalFileFingerprint), LocalError> {
     let before = stat_fd(file, path, operation)?;
+    hash_stable_file_from_stat(file, path, operation, before)
+}
+
+fn hash_stable_file_from_stat(
+    file: &mut File,
+    path: &Path,
+    operation: &'static str,
+    before: rustix::fs::Stat,
+) -> Result<(ContentIdentity, LocalFileFingerprint), LocalError> {
     if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile {
         return Err(LocalError::UnsupportedObject {
             path: path.to_path_buf(),
@@ -3158,6 +3161,14 @@ fn open_relative_regular(
     relative: &Path,
     operation: &'static str,
 ) -> Result<File, LocalError> {
+    open_relative_regular_with_stat(root, relative, operation).map(|(file, _)| file)
+}
+
+fn open_relative_regular_with_stat(
+    root: &OwnedFd,
+    relative: &Path,
+    operation: &'static str,
+) -> Result<(File, rustix::fs::Stat), LocalError> {
     safe_components(relative)?;
     let fd = openat2(
         root,
@@ -3173,7 +3184,7 @@ fn open_relative_regular(
             path: relative.to_path_buf(),
         });
     }
-    Ok(File::from(fd))
+    Ok((File::from(fd), stat))
 }
 
 fn open_relative_at(
@@ -4276,13 +4287,13 @@ mod tests {
         path: &Path,
         fingerprint: LocalFileFingerprint,
         content: &ContentIdentity,
-    ) -> BTreeMap<PathBuf, LocalHashRecord> {
+    ) -> Vec<LocalHashRecord> {
         let record = LocalHashRecord {
             path: path.to_path_buf(),
             fingerprint,
             content: content.clone(),
         };
-        BTreeMap::from([(path.to_path_buf(), record)])
+        vec![record]
     }
 
     fn all_cache_entries_stable() -> Option<HashCacheCutoff> {
@@ -4494,14 +4505,14 @@ mod tests {
 
         let single = scan_with_cache_and_workers_completed_at(
             root.path(),
-            &BTreeMap::new(),
+            &[],
             1,
             None,
             all_cache_entries_stable,
         )?;
         let parallel = scan_with_cache_and_workers_completed_at(
             root.path(),
-            &BTreeMap::new(),
+            &[],
             MAX_PARALLEL_HASHES,
             None,
             all_cache_entries_stable,
@@ -4529,11 +4540,7 @@ mod tests {
         let _ = scan_and_publish(&mut journal, &root)?;
         let published_inventory = journal.local_inventory()?;
         let published_cache = journal.local_hash_cache()?;
-        let cache = published_cache
-            .iter()
-            .cloned()
-            .map(|record| (record.path.clone(), record))
-            .collect::<BTreeMap<_, _>>();
+        let cache = published_cache.clone();
 
         std::fs::write(root.join("a-missing"), b"a")?;
         std::fs::write(root.join("b-missing"), b"b")?;
@@ -4556,7 +4563,7 @@ mod tests {
         let root = TempDir::new()?;
         std::fs::create_dir(root.path().join("nested"))?;
         std::fs::write(root.path().join("nested/file"), b"bytes")?;
-        let pending = enumerate_scan(root.path(), &BTreeMap::new(), None)?;
+        let pending = enumerate_scan(root.path(), &[], None)?;
         std::fs::write(root.path().join("nested/appeared"), b"new")?;
 
         let result = finish_scan(pending, MAX_PARALLEL_HASHES);
@@ -4575,17 +4582,12 @@ mod tests {
         std::fs::write(root.path().join(cached_path), b"before")?;
         let first = scan_with_cache_and_workers_completed_at(
             root.path(),
-            &BTreeMap::new(),
+            &[],
             1,
             None,
             all_cache_entries_stable,
         )?;
-        let cache = first
-            .reusable_hashes
-            .iter()
-            .cloned()
-            .map(|record| (record.path.clone(), record))
-            .collect::<BTreeMap<_, _>>();
+        let cache = first.reusable_hashes.clone();
         let hashing_path = Path::new("hashing");
         let stable_path = Path::new("stable");
         std::fs::write(root.path().join(hashing_path), b"before")?;
