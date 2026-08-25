@@ -138,7 +138,7 @@ pub enum HashError {
 pub struct CompleteScan {
     root_binding: LocalRootBinding,
     observations: Vec<LocalObservationRecord>,
-    hashes: Vec<LocalHashRecord>,
+    reusable_hashes: Vec<LocalHashRecord>,
 }
 
 struct PendingScan {
@@ -170,8 +170,13 @@ struct HashJob {
 }
 
 struct HashWorkerOutput {
-    records: Vec<(usize, LocalHashRecord)>,
+    records: Vec<(usize, ScannedHash)>,
     failure: Option<(usize, LocalError)>,
+}
+
+struct ScannedHash {
+    record: LocalHashRecord,
+    reusable: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -565,15 +570,8 @@ fn timestamp_is_before(seconds: i64, nanoseconds: u64, cutoff: HashCacheCutoff) 
     nanoseconds < 1_000_000_000 && (seconds, nanoseconds) < (cutoff.seconds, cutoff.nanoseconds)
 }
 
-fn reusable_hashes(
-    hashes: &[LocalHashRecord],
-    cutoff: Option<HashCacheCutoff>,
-) -> Vec<LocalHashRecord> {
-    hashes
-        .iter()
-        .filter(|record| hash_is_reusable(record, cutoff))
-        .cloned()
-        .collect()
+fn current_hash_cache_cutoff() -> Option<HashCacheCutoff> {
+    hash_cache_cutoff(SystemTime::now())
 }
 
 /// Scan the complete root through no-follow, descriptor-relative opens.
@@ -587,14 +585,31 @@ fn scan(root: impl AsRef<Path>) -> Result<CompleteScan, LocalError> {
     scan_with_cache_and_workers_at(root, &BTreeMap::new(), MAX_PARALLEL_HASHES, None)
 }
 
+#[cfg(test)]
 fn scan_with_cache_and_workers_at(
     root: impl AsRef<Path>,
     cache: &BTreeMap<PathBuf, LocalHashRecord>,
     max_workers: usize,
     cache_cutoff: Option<HashCacheCutoff>,
 ) -> Result<CompleteScan, LocalError> {
+    scan_with_cache_and_workers_completed_at(
+        root,
+        cache,
+        max_workers,
+        cache_cutoff,
+        current_hash_cache_cutoff,
+    )
+}
+
+fn scan_with_cache_and_workers_completed_at(
+    root: impl AsRef<Path>,
+    cache: &BTreeMap<PathBuf, LocalHashRecord>,
+    max_workers: usize,
+    cache_cutoff: Option<HashCacheCutoff>,
+    completed_cutoff: fn() -> Option<HashCacheCutoff>,
+) -> Result<CompleteScan, LocalError> {
     let pending = enumerate_scan(root.as_ref(), cache, cache_cutoff)?;
-    finish_scan(pending, max_workers)
+    finish_scan_at(pending, max_workers, completed_cutoff)
 }
 
 fn enumerate_scan(
@@ -626,19 +641,36 @@ fn enumerate_scan(
     })
 }
 
-fn finish_scan(mut pending: PendingScan, max_workers: usize) -> Result<CompleteScan, LocalError> {
-    let mut records = hash_scan_files(&pending.root_fd, &pending.hash_jobs, max_workers)?;
+#[cfg(test)]
+fn finish_scan(pending: PendingScan, max_workers: usize) -> Result<CompleteScan, LocalError> {
+    finish_scan_at(pending, max_workers, current_hash_cache_cutoff)
+}
+
+fn finish_scan_at(
+    mut pending: PendingScan,
+    max_workers: usize,
+    completed_cutoff: fn() -> Option<HashCacheCutoff>,
+) -> Result<CompleteScan, LocalError> {
+    let mut records = hash_scan_files(
+        &pending.root_fd,
+        &pending.hash_jobs,
+        max_workers,
+        completed_cutoff,
+    )?;
     records.extend(revalidate_cached_files(
         &pending.root_fd,
         pending.cached_files,
     )?);
-    let mut hashes = Vec::with_capacity(records.len());
-    for record in records {
+    let mut reusable_hashes = Vec::with_capacity(records.len());
+    for scanned in records {
+        let record = scanned.record;
         pending.observations.push(LocalObservationRecord {
             path: record.path.clone(),
             observation: Observation::Present(LocalFile::new(record.content.clone())),
         });
-        hashes.push(record);
+        if scanned.reusable {
+            reusable_hashes.push(record);
+        }
     }
     revalidate_directories(&pending.root_fd, &pending.directories)?;
     let rebound = open_absolute_directory(&pending.root, "reopen sync root after scan")?;
@@ -656,11 +688,11 @@ fn finish_scan(mut pending: PendingScan, max_workers: usize) -> Result<CompleteS
     pending
         .observations
         .sort_by(|left, right| left.path.cmp(&right.path));
-    hashes.sort_by(|left, right| left.path.cmp(&right.path));
+    reusable_hashes.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(CompleteScan {
         root_binding: root_binding(&pending.root, &pending.root_before),
         observations: pending.observations,
-        hashes,
+        reusable_hashes,
     })
 }
 
@@ -669,13 +701,19 @@ pub fn scan_and_publish(
     journal: &mut Journal,
     root: impl AsRef<Path>,
 ) -> Result<ScanPublication, LocalError> {
-    scan_and_publish_at(journal, root, hash_cache_cutoff(SystemTime::now()))
+    scan_and_publish_at(
+        journal,
+        root,
+        current_hash_cache_cutoff(),
+        current_hash_cache_cutoff,
+    )
 }
 
 fn scan_and_publish_at(
     journal: &mut Journal,
     root: impl AsRef<Path>,
     cache_cutoff: Option<HashCacheCutoff>,
+    completed_cutoff: fn() -> Option<HashCacheCutoff>,
 ) -> Result<ScanPublication, LocalError> {
     let root = root.as_ref();
     let cache = journal
@@ -684,15 +722,24 @@ fn scan_and_publish_at(
         .into_iter()
         .map(|record| (record.path.clone(), record))
         .collect::<BTreeMap<_, _>>();
-    let scan = scan_with_cache_and_workers_at(root, &cache, MAX_PARALLEL_HASHES, cache_cutoff)?;
+    let scan = scan_with_cache_and_workers_completed_at(
+        root,
+        &cache,
+        MAX_PARALLEL_HASHES,
+        cache_cutoff,
+        completed_cutoff,
+    )?;
     if !active_root_matches(journal, &scan.root_binding)?
         || !configured_root_is_active(journal, root)?
     {
         return Ok(ScanPublication::RootChanged);
     }
-    let reusable_hashes = reusable_hashes(&scan.hashes, cache_cutoff);
     if !journal
-        .publish_local_scan(&scan.root_binding, scan.observations(), &reusable_hashes)
+        .publish_local_scan(
+            &scan.root_binding,
+            scan.observations(),
+            &scan.reusable_hashes,
+        )
         .map_err(|source| LocalError::Journal { source })?
     {
         return Ok(ScanPublication::RootChanged);
@@ -766,7 +813,7 @@ pub(crate) fn stage_upload_at(
         content: expected.clone(),
     };
     let stage_path = directory_path.join(&name);
-    if let Some((file, actual)) = open_and_hash_if_present(
+    if let Some((file, actual, _)) = open_and_hash_if_present(
         &directory,
         &name,
         &stage_path,
@@ -942,7 +989,7 @@ pub(crate) fn existing_download_stage_at(
     let display_path = root_path.join(parent_relative).join(&name);
     match inspect_download_stage(&parent, &name, &display_path, target, expected)? {
         DownloadStage::Missing => Ok(None),
-        DownloadStage::Verified => Ok(Some(StageOutcome::AlreadyStaged(()))),
+        DownloadStage::Verified(_) => Ok(Some(StageOutcome::AlreadyStaged(()))),
         DownloadStage::Occupied(path) => Ok(Some(StageOutcome::DestinationOccupied { path })),
     }
 }
@@ -1093,7 +1140,7 @@ pub(crate) fn prepare_download_slot_at(
         target,
         expected,
     )? {
-        DownloadStage::Verified => {
+        DownloadStage::Verified(_) => {
             return Ok(DownloadPreparation::Complete(StageOutcome::AlreadyStaged(
                 (),
             )));
@@ -1482,7 +1529,7 @@ fn promote_completed_slot_with(
                 &location.target,
                 &location.expected,
             )? {
-                DownloadStage::Verified => {
+                DownloadStage::Verified(_) => {
                     let _ = reset_download_slot(file, location)?;
                     Ok(StageOutcome::AlreadyStaged(()))
                 }
@@ -1662,13 +1709,7 @@ pub(crate) fn install_download_at(
     let stage_path = root_path.join(&parent_relative).join(&stage_name);
     let current = hash_at_if_present(&parent, &target_name, target, "check install precondition")?;
     if current.as_ref() == Some(desired) {
-        sync_installed_download(
-            &parent,
-            &target_name,
-            target,
-            desired,
-            MarkerRequirement::Optional,
-        )?;
+        sync_installed_download(&parent, &target_name, target, desired)?;
         if let StageCleanup::Occupied(path) =
             remove_verified_stage(&parent, &stage_name, desired, &stage_path, target)?
         {
@@ -1686,30 +1727,32 @@ pub(crate) fn install_download_at(
         if current.is_some() {
             return Ok(InstallOutcome::PreconditionChanged { actual: current });
         }
-        match inspect_download_stage(&parent, &stage_name, &stage_path, target, desired)? {
-            DownloadStage::Verified => {}
-            DownloadStage::Missing => return Ok(InstallOutcome::DownloadRequired),
-            DownloadStage::Occupied(path) => {
-                return Ok(InstallOutcome::StageDestinationOccupied { path });
-            }
-        }
+        let stage =
+            match inspect_download_stage(&parent, &stage_name, &stage_path, target, desired)? {
+                DownloadStage::Verified(file) => file,
+                DownloadStage::Missing => return Ok(InstallOutcome::DownloadRequired),
+                DownloadStage::Occupied(path) => {
+                    return Ok(InstallOutcome::StageDestinationOccupied { path });
+                }
+            };
         return rename_stage_into_absent_target(
             &parent,
             &stage_name,
             &stage_path,
+            &stage,
             &target_name,
             target,
             desired,
         );
     };
     validate_recovery(recovery, target)?;
-    match inspect_download_stage(&parent, &stage_name, &stage_path, target, desired)? {
-        DownloadStage::Verified => {}
+    let stage = match inspect_download_stage(&parent, &stage_name, &stage_path, target, desired)? {
+        DownloadStage::Verified(file) => file,
         DownloadStage::Missing => return Ok(InstallOutcome::DownloadRequired),
         DownloadStage::Occupied(path) => {
             return Ok(InstallOutcome::StageDestinationOccupied { path });
         }
-    }
+    };
 
     match prepare_replacement_at(
         &parent,
@@ -1729,13 +1772,7 @@ pub(crate) fn install_download_at(
         hash_at_if_present(&parent, &target_name, target, "resume prepared replacement")?;
     if let Some(actual) = after_prepare {
         if actual == *desired {
-            sync_installed_download(
-                &parent,
-                &target_name,
-                target,
-                desired,
-                MarkerRequirement::Optional,
-            )?;
+            sync_installed_download(&parent, &target_name, target, desired)?;
             if let StageCleanup::Occupied(path) =
                 remove_verified_stage(&parent, &stage_name, desired, &stage_path, target)?
             {
@@ -1754,6 +1791,7 @@ pub(crate) fn install_download_at(
     }
 
     let guard = internal_name("displaced", target, &recovery.content);
+    verify_download_stage_before_rename(&stage, &stage_path)?;
     match renameat_with(
         &parent,
         &stage_name,
@@ -1762,13 +1800,7 @@ pub(crate) fn install_download_at(
         RenameFlags::NOREPLACE,
     ) {
         Ok(()) => {
-            sync_installed_download(
-                &parent,
-                &target_name,
-                target,
-                desired,
-                MarkerRequirement::Required,
-            )?;
+            sync_renamed_download(&stage, &parent, &target_name, target, desired)?;
             unlinkat(&parent, &guard, AtFlags::empty()).map_err(|source| {
                 syscall_failure("remove displaced install guard", target, source)
             })?;
@@ -1783,13 +1815,7 @@ pub(crate) fn install_download_at(
                 "inspect raced install destination",
             )?;
             if actual.as_ref() == Some(desired) {
-                sync_installed_download(
-                    &parent,
-                    &target_name,
-                    target,
-                    desired,
-                    MarkerRequirement::Optional,
-                )?;
+                sync_installed_download(&parent, &target_name, target, desired)?;
                 if let StageCleanup::Occupied(path) =
                     remove_verified_stage(&parent, &stage_name, desired, &stage_path, target)?
                 {
@@ -2170,7 +2196,8 @@ fn hash_scan_files(
     root: &OwnedFd,
     jobs: &[HashJob],
     max_workers: usize,
-) -> Result<Vec<LocalHashRecord>, LocalError> {
+    completed_cutoff: fn() -> Option<HashCacheCutoff>,
+) -> Result<Vec<ScannedHash>, LocalError> {
     if jobs.is_empty() {
         return Ok(Vec::new());
     }
@@ -2192,7 +2219,7 @@ fn hash_scan_files(
                         let Some(job) = jobs.get(index) else {
                             return HashWorkerOutput { records, failure };
                         };
-                        match hash_scan_file(root, job) {
+                        match hash_scan_file(root, job, completed_cutoff) {
                             Ok(record) => records.push((index, record)),
                             Err(error) if failure.is_none() => failure = Some((index, error)),
                             Err(_) => {}
@@ -2236,7 +2263,11 @@ fn hash_scan_files(
     })
 }
 
-fn hash_scan_file(root: &OwnedFd, job: &HashJob) -> Result<LocalHashRecord, LocalError> {
+fn hash_scan_file(
+    root: &OwnedFd,
+    job: &HashJob,
+    completed_cutoff: fn() -> Option<HashCacheCutoff>,
+) -> Result<ScannedHash, LocalError> {
     let mut file = open_relative_regular(root, &job.path, "open enumerated scan file")?;
     let opened = stat_fd(&file, &job.path, "inspect enumerated scan file")?;
     if file_fingerprint(&opened, &job.path)? != job.fingerprint {
@@ -2253,17 +2284,21 @@ fn hash_scan_file(root: &OwnedFd, job: &HashJob) -> Result<LocalHashRecord, Loca
             path: job.path.clone(),
         });
     }
-    Ok(LocalHashRecord {
+    let record = LocalHashRecord {
         path: job.path.clone(),
         fingerprint,
         content,
+    };
+    Ok(ScannedHash {
+        reusable: hash_is_reusable(&record, completed_cutoff()),
+        record,
     })
 }
 
 fn revalidate_cached_files(
     root: &OwnedFd,
     cached_files: Vec<LocalHashRecord>,
-) -> Result<Vec<LocalHashRecord>, LocalError> {
+) -> Result<Vec<ScannedHash>, LocalError> {
     let mut records = Vec::with_capacity(cached_files.len());
     for record in cached_files {
         let file = open_relative_regular(root, &record.path, "reopen cached scan file")?;
@@ -2281,7 +2316,10 @@ fn revalidate_cached_files(
                 path: record.path.clone(),
             });
         }
-        records.push(record);
+        records.push(ScannedHash {
+            record,
+            reusable: true,
+        });
     }
     Ok(records)
 }
@@ -2685,7 +2723,7 @@ fn hash_at_if_present(
     path: &Path,
     operation: &'static str,
 ) -> Result<Option<ContentIdentity>, LocalError> {
-    Ok(open_and_hash_if_present(directory, name, path, operation)?.map(|(_, content)| content))
+    Ok(open_and_hash_if_present(directory, name, path, operation)?.map(|(_, content, _)| content))
 }
 
 fn open_and_hash_if_present(
@@ -2693,7 +2731,7 @@ fn open_and_hash_if_present(
     name: &OsStr,
     path: &Path,
     operation: &'static str,
-) -> Result<Option<(File, ContentIdentity)>, LocalError> {
+) -> Result<Option<(File, ContentIdentity, LocalFileFingerprint)>, LocalError> {
     match openat2(
         directory,
         name,
@@ -2703,8 +2741,9 @@ fn open_and_hash_if_present(
     ) {
         Ok(fd) => {
             let mut file = File::from(fd);
-            let content = hash_stable_file(&mut file, path, operation)?;
-            Ok(Some((file, content)))
+            let (content, fingerprint) =
+                hash_stable_file_with_fingerprint(&mut file, path, operation)?;
+            Ok(Some((file, content, fingerprint)))
         }
         Err(source) if source == rustix::io::Errno::NOENT => Ok(None),
         Err(source) => Err(syscall_failure(operation, path, source)),
@@ -2725,9 +2764,14 @@ enum StageWrite {
     Occupied(PathBuf),
 }
 
+struct VerifiedDownloadStage {
+    file: File,
+    fingerprint: LocalFileFingerprint,
+}
+
 enum DownloadStage {
     Missing,
-    Verified,
+    Verified(VerifiedDownloadStage),
     Occupied(PathBuf),
 }
 
@@ -2738,7 +2782,7 @@ fn inspect_download_stage(
     target: &Path,
     expected: &ContentIdentity,
 ) -> Result<DownloadStage, LocalError> {
-    let Some((file, actual)) =
+    let Some((file, actual, hashed)) =
         open_and_hash_if_present(directory, name, display_path, "verify owned download stage")?
     else {
         return Ok(DownloadStage::Missing);
@@ -2747,7 +2791,38 @@ fn inspect_download_stage(
     if actual == *expected
         && read_download_marker(&file, marker.as_bytes(), display_path)? == DownloadMarker::Expected
     {
-        Ok(DownloadStage::Verified)
+        let observed = file_fingerprint(
+            &stat_fd(&file, display_path, "revalidate owned download stage")?,
+            display_path,
+        )?;
+        if observed != hashed {
+            return Err(LocalError::ChangedDuringRead {
+                operation: "revalidate owned download stage",
+                path: display_path.to_path_buf(),
+            });
+        }
+        fchmod(&file, Mode::RUSR).map_err(|source| {
+            syscall_failure(
+                "make verified download stage immutable",
+                display_path,
+                source,
+            )
+        })?;
+        sync_file(&file, display_path, "sync immutable download stage")?;
+        let fingerprint = file_fingerprint(
+            &stat_fd(&file, display_path, "inspect immutable download stage")?,
+            display_path,
+        )?;
+        if !same_hashed_content(&hashed, &fingerprint) {
+            return Err(LocalError::ChangedDuringRead {
+                operation: "make verified download stage immutable",
+                path: display_path.to_path_buf(),
+            });
+        }
+        Ok(DownloadStage::Verified(VerifiedDownloadStage {
+            file,
+            fingerprint,
+        }))
     } else {
         Ok(DownloadStage::Occupied(display_path.to_path_buf()))
     }
@@ -2787,7 +2862,7 @@ fn write_verified_stage(
         ExistingPolicy::OwnedDownload(marker) => Some(marker),
         ExistingPolicy::ReplacePrivate | ExistingPolicy::Preserve => None,
     };
-    if let Some((file, actual)) =
+    if let Some((file, actual, _)) =
         open_and_hash_if_present(directory, name, display_path, operation)?
     {
         if reuse_verified_stage(&file, &actual, expected, marker, directory, display_path)? {
@@ -2836,7 +2911,7 @@ fn write_verified_stage(
             Ok(StageWrite::Created)
         }
         Err(source) if source == rustix::io::Errno::EXIST => {
-            let Some((file, existing)) =
+            let Some((file, existing, _)) =
                 open_and_hash_if_present(directory, name, display_path, "verify raced stage")?
             else {
                 return Err(LocalError::ChangedDuringRead {
@@ -2915,10 +2990,12 @@ fn rename_stage_into_absent_target(
     parent: &OwnedFd,
     stage_name: &OsStr,
     stage_path: &Path,
+    stage: &VerifiedDownloadStage,
     target_name: &OsStr,
     target: &Path,
     desired: &ContentIdentity,
 ) -> Result<InstallOutcome, LocalError> {
+    verify_download_stage_before_rename(stage, stage_path)?;
     match renameat_with(
         parent,
         stage_name,
@@ -2927,26 +3004,14 @@ fn rename_stage_into_absent_target(
         RenameFlags::NOREPLACE,
     ) {
         Ok(()) => {
-            sync_installed_download(
-                parent,
-                target_name,
-                target,
-                desired,
-                MarkerRequirement::Required,
-            )?;
+            sync_renamed_download(stage, parent, target_name, target, desired)?;
             Ok(InstallOutcome::Installed)
         }
         Err(source) if source == rustix::io::Errno::EXIST => {
             let actual =
                 hash_at_if_present(parent, target_name, target, "inspect raced initial install")?;
             if actual.as_ref() == Some(desired) {
-                sync_installed_download(
-                    parent,
-                    target_name,
-                    target,
-                    desired,
-                    MarkerRequirement::Optional,
-                )?;
+                sync_installed_download(parent, target_name, target, desired)?;
                 match remove_verified_stage(parent, stage_name, desired, stage_path, target)? {
                     StageCleanup::RemovedOrAbsent => {
                         sync_directory(parent, target, "sync raced initial install cleanup")?;
@@ -3091,7 +3156,7 @@ fn remove_verified_stage(
 ) -> Result<StageCleanup, LocalError> {
     match inspect_download_stage(parent, name, path, target, expected)? {
         DownloadStage::Occupied(path) => Ok(StageCleanup::Occupied(path)),
-        DownloadStage::Verified => {
+        DownloadStage::Verified(_) => {
             unlinkat(parent, name, AtFlags::empty())
                 .map_err(|source| syscall_failure("remove verified staging file", path, source))?;
             Ok(StageCleanup::RemovedOrAbsent)
@@ -3169,10 +3234,60 @@ fn sync_installed_file(
     sync_directory(parent, target, "sync installed file entry")
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum MarkerRequirement {
-    Required,
-    Optional,
+fn verify_download_stage_before_rename(
+    stage: &VerifiedDownloadStage,
+    path: &Path,
+) -> Result<(), LocalError> {
+    let current = file_fingerprint(
+        &stat_fd(&stage.file, path, "verify download stage before rename")?,
+        path,
+    )?;
+    if current == stage.fingerprint {
+        Ok(())
+    } else {
+        Err(LocalError::ChangedDuringRead {
+            operation: "verify download stage before rename",
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+fn sync_renamed_download(
+    stage: &VerifiedDownloadStage,
+    parent: &OwnedFd,
+    target_name: &OsStr,
+    target: &Path,
+    expected: &ContentIdentity,
+) -> Result<(), LocalError> {
+    let marker = internal_name("download-marker-v1", target, expected);
+    let renamed = file_fingerprint(
+        &stat_fd(&stage.file, target, "verify renamed download content")?,
+        target,
+    )?;
+    if !same_hashed_content(&stage.fingerprint, &renamed)
+        || !named_inode_matches(&stage.file, parent, target_name, target)?
+        || read_download_marker(&stage.file, marker.as_bytes(), target)? != DownloadMarker::Expected
+    {
+        return Err(LocalError::ChangedDuringRead {
+            operation: "verify renamed download ownership",
+            path: target.to_path_buf(),
+        });
+    }
+    sync_directory(parent, target, "sync installed download rename")?;
+    finish_installed_download(&stage.file, target, true)?;
+    let installed = file_fingerprint(
+        &stat_fd(&stage.file, target, "verify installed download content")?,
+        target,
+    )?;
+    if !same_hashed_content(&stage.fingerprint, &installed)
+        || !named_inode_matches(&stage.file, parent, target_name, target)?
+    {
+        return Err(LocalError::ChangedDuringRead {
+            operation: "verify installed download binding",
+            path: target.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 fn sync_installed_download(
@@ -3180,9 +3295,8 @@ fn sync_installed_download(
     target_name: &OsStr,
     target: &Path,
     expected: &ContentIdentity,
-    marker_requirement: MarkerRequirement,
 ) -> Result<(), LocalError> {
-    let Some((file, actual)) =
+    let Some((file, actual, _)) =
         open_and_hash_if_present(parent, target_name, target, "verify installed download")?
     else {
         return Err(LocalError::ChangedDuringRead {
@@ -3199,33 +3313,35 @@ fn sync_installed_download(
     let marker = internal_name("download-marker-v1", target, expected);
     let marker_matches =
         read_download_marker(&file, marker.as_bytes(), target)? == DownloadMarker::Expected;
-    if marker_requirement == MarkerRequirement::Required && !marker_matches {
-        return Err(LocalError::ChangedDuringRead {
-            operation: "verify renamed download ownership",
-            path: target.to_path_buf(),
-        });
-    }
+    finish_installed_download(&file, target, marker_matches)?;
+    sync_directory(parent, target, "sync installed download entry")
+}
+
+fn finish_installed_download(
+    file: &File,
+    target: &Path,
+    marker_matches: bool,
+) -> Result<(), LocalError> {
     if marker_matches {
-        fchmod(&file, Mode::RUSR | Mode::WUSR).map_err(|source| {
+        fchmod(file, Mode::RUSR | Mode::WUSR).map_err(|source| {
             syscall_failure("make installed download writable", target, source)
         })?;
         remove_xattr(
-            &file,
+            file,
             DOWNLOAD_PARTIAL_XATTR,
             target,
             "clear resumed download marker",
         )?;
-        fsync(&file)
+        fsync(file)
             .map_err(|source| syscall_failure("sync installed download cleanup", target, source))?;
         remove_xattr(
-            &file,
+            file,
             DOWNLOAD_STAGE_XATTR,
             target,
             "clear installed download marker",
         )?;
     }
-    fsync(&file).map_err(|source| syscall_failure("sync installed download", target, source))?;
-    sync_directory(parent, target, "sync installed download entry")
+    fsync(file).map_err(|source| syscall_failure("sync installed download", target, source))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3335,6 +3451,14 @@ fn stat_fd(
 
 fn same_inode(left: &rustix::fs::Stat, right: &rustix::fs::Stat) -> bool {
     left.st_dev == right.st_dev && left.st_ino == right.st_ino
+}
+
+fn same_hashed_content(left: &LocalFileFingerprint, right: &LocalFileFingerprint) -> bool {
+    left.device == right.device
+        && left.inode == right.inode
+        && left.size == right.size
+        && left.modified_seconds == right.modified_seconds
+        && left.modified_nanoseconds == right.modified_nanoseconds
 }
 
 fn same_observation(left: &rustix::fs::Stat, right: &rustix::fs::Stat) -> bool {
@@ -3736,12 +3860,19 @@ mod tests {
             std::fs::write(root.path().join(path), bytes)?;
         }
 
-        let single = scan_with_cache_and_workers_at(root.path(), &BTreeMap::new(), 1, None)?;
-        let parallel = scan_with_cache_and_workers_at(
+        let single = scan_with_cache_and_workers_completed_at(
+            root.path(),
+            &BTreeMap::new(),
+            1,
+            None,
+            all_cache_entries_stable,
+        )?;
+        let parallel = scan_with_cache_and_workers_completed_at(
             root.path(),
             &BTreeMap::new(),
             MAX_PARALLEL_HASHES,
             None,
+            all_cache_entries_stable,
         )?;
 
         assert_eq!(parallel, single);
@@ -3810,9 +3941,15 @@ mod tests {
         let root = TempDir::new()?;
         let path = Path::new("cached");
         std::fs::write(root.path().join(path), b"before")?;
-        let first = scan_with_cache_and_workers_at(root.path(), &BTreeMap::new(), 1, None)?;
+        let first = scan_with_cache_and_workers_completed_at(
+            root.path(),
+            &BTreeMap::new(),
+            1,
+            None,
+            all_cache_entries_stable,
+        )?;
         let cache = first
-            .hashes
+            .reusable_hashes
             .iter()
             .cloned()
             .map(|record| (record.path.clone(), record))
@@ -3863,15 +4000,16 @@ mod tests {
             nanoseconds: u32::try_from(fingerprint.modified_nanoseconds)?,
         };
         let cached = ContentIdentity::new("0".repeat(64));
-        let scan = scan_with_cache_and_workers_at(
+        let scan = scan_with_cache_and_workers_completed_at(
             root.path(),
             &test_cache(path, fingerprint, &cached),
             1,
             Some(cutoff),
+            || None,
         )?;
 
         assert_eq!(scanned_content(&scan, path)?, &identity(bytes)?);
-        assert!(reusable_hashes(&scan.hashes, Some(cutoff)).is_empty());
+        assert!(scan.reusable_hashes.is_empty());
         Ok(())
     }
 
@@ -3921,6 +4059,21 @@ mod tests {
     }
 
     #[test]
+    fn scan_publication_uses_completion_cutoff_for_new_hashes() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let root = directory.path().join("root");
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("slow.txt"), b"newly hashed")?;
+        let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+        let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+
+        let _ = scan_and_publish_at(&mut journal, &root, None, all_cache_entries_stable)?;
+
+        assert_eq!(journal.local_hash_cache()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn failed_scan_preserves_published_inventory_and_hash_cache() -> Result<(), Box<dyn Error>> {
         use std::os::unix::fs::symlink;
 
@@ -3933,7 +4086,12 @@ mod tests {
         let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
         let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
         assert!(matches!(
-            scan_and_publish_at(&mut journal, &root, all_cache_entries_stable())?,
+            scan_and_publish_at(
+                &mut journal,
+                &root,
+                all_cache_entries_stable(),
+                all_cache_entries_stable,
+            )?,
             ScanPublication::Published(_)
         ));
         let inventory = journal.local_inventory()?;
@@ -3957,7 +4115,12 @@ mod tests {
         std::fs::write(first.join("cached.txt"), b"cached")?;
         let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
         let _ = journal.activate_local_root(&LocalRootBinding::inspect(&first)?)?;
-        let _ = scan_and_publish_at(&mut journal, &first, all_cache_entries_stable())?;
+        let _ = scan_and_publish_at(
+            &mut journal,
+            &first,
+            all_cache_entries_stable(),
+            all_cache_entries_stable,
+        )?;
         assert_eq!(journal.local_hash_cache()?.len(), 1);
 
         let _ = journal.activate_local_root(&LocalRootBinding::inspect(&second)?)?;
@@ -4405,6 +4568,63 @@ mod tests {
     }
 
     #[test]
+    fn install_rejects_stage_changed_through_a_preexisting_writer() -> Result<(), Box<dyn Error>> {
+        let root = TempDir::new()?;
+        let target = Path::new("target.txt");
+        let expected = identity(b"remote")?;
+        staged_download(stage_download(
+            root.path(),
+            target,
+            &expected,
+            Cursor::new(b"remote"),
+        )?)?;
+        let root_fd = open_absolute_directory(root.path(), "open test root")?;
+        let Some((parent, target_name, parent_relative)) = open_parent(&root_fd, target, false)?
+        else {
+            return Err(io::Error::other("test target had no parent").into());
+        };
+        let stage_name = internal_name("download", target, &expected);
+        let stage_path = root.path().join(parent_relative).join(&stage_name);
+        let stage_file = File::open(&stage_path)?;
+        fchmod(&stage_file, Mode::RUSR | Mode::WUSR)?;
+        drop(stage_file);
+        let mut writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&stage_path)?;
+        let DownloadStage::Verified(stage) =
+            inspect_download_stage(&parent, &stage_name, &stage_path, target, &expected)?
+        else {
+            return Err(io::Error::other("test stage was not verified").into());
+        };
+        fchmod(&writer, Mode::RUSR | Mode::WUSR)?;
+        writer.seek(SeekFrom::Start(0))?;
+        writer.write_all(b"mutant")?;
+        writer.sync_all()?;
+
+        let result = rename_stage_into_absent_target(
+            &parent,
+            &stage_name,
+            &stage_path,
+            &stage,
+            &target_name,
+            target,
+            &expected,
+        );
+
+        assert!(matches!(
+            result,
+            Err(LocalError::ChangedDuringRead {
+                operation: "verify download stage before rename",
+                ..
+            })
+        ));
+        assert!(!root.path().join(target).exists());
+        assert_eq!(std::fs::read(stage_path)?, b"mutant");
+        Ok(())
+    }
+
+    #[test]
     fn installed_download_cleanup_replays_around_partial_marker_removal()
     -> Result<(), Box<dyn Error>> {
         for partial_was_removed in [false, true] {
@@ -4451,13 +4671,7 @@ mod tests {
                 DownloadMarker::Expected
             );
 
-            sync_installed_download(
-                &parent,
-                target.as_os_str(),
-                target,
-                &expected,
-                MarkerRequirement::Required,
-            )?;
+            sync_installed_download(&parent, target.as_os_str(), target, &expected)?;
             assert_eq!(
                 read_download_marker(&file, stage_marker.as_bytes(), target)?,
                 DownloadMarker::Missing
@@ -4465,13 +4679,7 @@ mod tests {
             assert_eq!(read_download_slot_state(&file, target)?, None);
             let mode = Mode::from_bits_retain(stat_fd(&file, target, "inspect test mode")?.st_mode);
             assert!(mode.contains(Mode::RUSR | Mode::WUSR));
-            sync_installed_download(
-                &parent,
-                target.as_os_str(),
-                target,
-                &expected,
-                MarkerRequirement::Optional,
-            )?;
+            sync_installed_download(&parent, target.as_os_str(), target, &expected)?;
         }
         Ok(())
     }
@@ -4483,14 +4691,16 @@ mod tests {
         std::fs::write(directory.path().join(target), b"remote")?;
         let desired = identity(b"remote")?;
         let parent = open_absolute_directory(directory.path(), "open test root")?;
+        let file = File::open(directory.path().join(target))?;
+        let stage = VerifiedDownloadStage {
+            fingerprint: file_fingerprint(
+                &stat_fd(&file, target, "inspect test download")?,
+                target,
+            )?,
+            file,
+        };
 
-        let required = sync_installed_download(
-            &parent,
-            target.as_os_str(),
-            target,
-            &desired,
-            MarkerRequirement::Required,
-        );
+        let required = sync_renamed_download(&stage, &parent, target.as_os_str(), target, &desired);
         assert!(matches!(
             required,
             Err(LocalError::ChangedDuringRead {
@@ -4498,13 +4708,7 @@ mod tests {
                 ..
             })
         ));
-        sync_installed_download(
-            &parent,
-            target.as_os_str(),
-            target,
-            &desired,
-            MarkerRequirement::Optional,
-        )?;
+        sync_installed_download(&parent, target.as_os_str(), target, &desired)?;
         Ok(())
     }
 }
