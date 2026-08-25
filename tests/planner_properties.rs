@@ -1,6 +1,6 @@
 use omabox::model::{
-    Baseline, Conflict, ContentIdentity, Decision, DropboxRevision, LocalFile, LocalObservation,
-    Observation, Operation, RemoteFile, RemoteObservation, UnknownReason,
+    Baseline, Conflict, ContentIdentity, Decision, DirectoryCollision, DropboxRevision, LocalFile,
+    LocalObservation, Observation, Operation, RemoteFile, RemoteObservation, UnknownReason,
 };
 use omabox::planner::plan;
 use proptest::prelude::*;
@@ -25,6 +25,7 @@ fn remote_file_strategy() -> impl Strategy<Value = RemoteFile> {
 fn baseline_strategy() -> impl Strategy<Value = Baseline> {
     prop_oneof![
         Just(Baseline::Absent),
+        Just(Baseline::Directory),
         remote_file_strategy().prop_map(Baseline::Present),
     ]
 }
@@ -43,6 +44,7 @@ fn unknown_reason_strategy() -> impl Strategy<Value = UnknownReason> {
 fn local_observation_strategy() -> impl Strategy<Value = LocalObservation> {
     prop_oneof![
         local_file_strategy().prop_map(Observation::Present),
+        Just(Observation::Directory),
         Just(Observation::ConfirmedAbsent),
         unknown_reason_strategy().prop_map(Observation::Unknown),
     ]
@@ -51,6 +53,7 @@ fn local_observation_strategy() -> impl Strategy<Value = LocalObservation> {
 fn remote_observation_strategy() -> impl Strategy<Value = RemoteObservation> {
     prop_oneof![
         remote_file_strategy().prop_map(Observation::Present),
+        Just(Observation::Directory),
         Just(Observation::ConfirmedAbsent),
         unknown_reason_strategy().prop_map(Observation::Unknown),
     ]
@@ -101,6 +104,9 @@ proptest! {
                         prop_assert_eq!(&local.content, &remote.content);
                         prop_assert_eq!(noop.baseline(), &Baseline::Present(remote.clone()));
                     }
+                    (Observation::Directory, Observation::Directory) => {
+                        prop_assert_eq!(noop.baseline(), &Baseline::Directory);
+                    }
                     _ => prop_assert!(false, "no-op lacked a complete common observation"),
                 }
             }
@@ -123,7 +129,9 @@ proptest! {
                             | Operation::DeleteRemote { expected_revision },
                         ) => prop_assert_eq!(expected_revision, &remote.revision),
                         (
-                            Observation::ConfirmedAbsent | Observation::Unknown(_),
+                            Observation::Directory
+                            | Observation::ConfirmedAbsent
+                            | Observation::Unknown(_),
                             Operation::ReplaceRemote { .. } | Operation::DeleteRemote { .. },
                         ) => prop_assert!(false, "remote mutation lacked a present observation"),
                         _ => {}
@@ -191,11 +199,15 @@ proptest! {
             if let Decision::Conflict(conflict) = decision {
                 let observed_local = match &local {
                     Observation::Present(file) => Some(file),
-                    Observation::ConfirmedAbsent | Observation::Unknown(_) => None,
+                    Observation::Directory
+                    | Observation::ConfirmedAbsent
+                    | Observation::Unknown(_) => None,
                 };
                 let observed_remote = match &remote {
                     Observation::Present(file) => Some(file),
-                    Observation::ConfirmedAbsent | Observation::Unknown(_) => None,
+                    Observation::Directory
+                    | Observation::ConfirmedAbsent
+                    | Observation::Unknown(_) => None,
                 };
 
                 prop_assert_eq!(conflict.local(), observed_local);
@@ -207,5 +219,43 @@ proptest! {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_remote_directory_never_produces_a_remote_delete(
+        baseline in baseline_strategy(),
+        local in local_observation_strategy(),
+    ) {
+        let decision = plan(&baseline, &local, &Observation::Directory);
+        if let Decision::Operations(operations) = decision {
+            let safe = operations.operations().iter().all(|operation| {
+                !matches!(operation, Operation::DeleteRemote { .. })
+            });
+            prop_assert!(safe);
+        }
+    }
+
+    #[test]
+    fn directory_file_collisions_retain_the_exact_file_description(
+        baseline in baseline_strategy(),
+        local in local_file_strategy(),
+        remote in remote_file_strategy(),
+    ) {
+        prop_assert_eq!(
+            plan(
+                &baseline,
+                &Observation::Present(local.clone()),
+                &Observation::Directory,
+            ),
+            Decision::DirectoryCollision(DirectoryCollision::LocalFileRemoteDirectory { local })
+        );
+        prop_assert_eq!(
+            plan(
+                &baseline,
+                &Observation::Directory,
+                &Observation::Present(remote.clone()),
+            ),
+            Decision::DirectoryCollision(DirectoryCollision::LocalDirectoryRemoteFile { remote })
+        );
     }
 }

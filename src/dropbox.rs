@@ -2120,7 +2120,7 @@ fn apply_entries(
             EntryTag::Folder if entry.restricted() => {
                 return Err(DropboxError::RestrictedRemoteInventory);
             }
-            EntryTag::Folder => Observation::Unknown(UnknownReason::Unsupported),
+            EntryTag::Folder => Observation::Directory,
             EntryTag::File => {
                 remove_subtree(records, &key);
                 if !entry.is_downloadable || entry.symlink_info.is_some() {
@@ -2166,7 +2166,7 @@ fn ensure_parent_folders(
             RemoteObservationRecord {
                 canonical_path: PathBuf::from(&parent_key),
                 path: display[..depth].iter().copied().collect(),
-                observation: Observation::Unknown(UnknownReason::Unsupported),
+                observation: Observation::Directory,
             },
         );
     }
@@ -2400,7 +2400,7 @@ mod tests {
                         ContentIdentity::new(TEST_CONTENT_HASH),
                         DropboxRevision::new(TEST_REVISION),
                     )),
-                    OracleNode::Folder => Observation::Unknown(UnknownReason::Unsupported),
+                    OracleNode::Folder => Observation::Directory,
                 };
                 (
                     key.clone(),
@@ -2473,7 +2473,8 @@ mod tests {
     }
 
     #[test]
-    fn folders_and_non_downloadable_files_are_unknown() -> Result<(), Box<dyn Error>> {
+    fn folders_are_directories_and_non_downloadable_files_are_unknown() -> Result<(), Box<dyn Error>>
+    {
         let root = DropboxRoot::new("account", "namespace", "")?;
         let mut records = BTreeMap::new();
         apply_entries(
@@ -2504,9 +2505,11 @@ mod tests {
         )?;
 
         assert_eq!(records.len(), 2);
-        assert!(records.values().all(|record| {
-            record.observation == Observation::Unknown(UnknownReason::Unsupported)
-        }));
+        assert_eq!(records["folder"].observation, Observation::Directory);
+        assert_eq!(
+            records["paper"].observation,
+            Observation::Unknown(UnknownReason::Unsupported)
+        );
         Ok(())
     }
 

@@ -202,9 +202,9 @@ pub enum ScanPublication {
     RootChanged,
 }
 
-/// Result of a non-overwriting local case-variant rename.
+/// Result of a non-overwriting local entry rename.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CaseVariantRename {
+pub(crate) enum LocalRenameOutcome {
     /// The observed entry was renamed and the parent directory was synchronized.
     Renamed,
     /// The source changed or the destination became occupied; rescan and retry.
@@ -512,6 +512,28 @@ pub enum DeleteOutcome {
     },
 }
 
+/// Result of creating a root-confined local directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CreateDirectoryOutcome {
+    /// A new directory was created and synchronized.
+    Created,
+    /// The directory already existed and was synchronized.
+    AlreadyPresent,
+    /// The path changed or is occupied by another object; publish a fresh scan.
+    FreshObservation,
+}
+
+/// Result of nonrecursively deleting a root-confined local directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeleteDirectoryOutcome {
+    /// The empty directory was removed and its parent synchronized.
+    Deleted,
+    /// The directory was already absent.
+    AlreadyAbsent,
+    /// The path changed or became nonempty; publish a fresh scan.
+    FreshObservation,
+}
+
 /// Side represented by a materialized conflict copy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConflictSide {
@@ -587,8 +609,8 @@ fn current_hash_cache_cutoff() -> Option<HashCacheCutoff> {
 ///
 /// Any inaccessible, changing, symlinked, magic-linked, or special entry
 /// fails the whole scan. Callers therefore cannot confuse a partial walk with
-/// confirmed absence. Directories are retained as conservative unknown file
-/// observations while their contents are scanned recursively.
+/// confirmed absence. Directories are published as first-class observations
+/// while their contents are scanned recursively.
 #[cfg(test)]
 fn scan(root: impl AsRef<Path>) -> Result<CompleteScan, LocalError> {
     scan_with_cache_and_workers_at(root, &BTreeMap::new(), MAX_PARALLEL_HASHES, None)
@@ -784,23 +806,33 @@ pub(crate) fn rename_case_variant(
     root: &OwnedFd,
     source: &Path,
     destination: &Path,
-) -> Result<CaseVariantRename, LocalError> {
-    rename_case_variant_with(root, source, destination, || Ok(()))
+) -> Result<LocalRenameOutcome, LocalError> {
+    rename_case_variant_with(root, source, destination, true, || Ok(()))
+}
+
+/// Rename one local regular file to a non-overwriting synchronized sibling.
+pub(crate) fn rename_file_copy(
+    root: &OwnedFd,
+    source: &Path,
+    destination: &Path,
+) -> Result<LocalRenameOutcome, LocalError> {
+    rename_case_variant_with(root, source, destination, false, || Ok(()))
 }
 
 fn rename_case_variant_with(
     root: &OwnedFd,
     source: &Path,
     destination: &Path,
+    allow_directory: bool,
     before_rename: impl FnOnce() -> io::Result<()>,
-) -> Result<CaseVariantRename, LocalError> {
+) -> Result<LocalRenameOutcome, LocalError> {
     if parent_path(source)? != parent_path(destination)? {
         return Err(LocalError::UnsafeRelativePath {
             path: destination.to_path_buf(),
         });
     }
     let Some((parent, source_name, _)) = open_parent(root, source, false)? else {
-        return Ok(CaseVariantRename::Retry);
+        return Ok(LocalRenameOutcome::Retry);
     };
     let destination_components = safe_components(destination)?;
     let Some(destination_name) = destination_components.last() else {
@@ -817,20 +849,24 @@ fn rename_case_variant_with(
     ) {
         Ok(entry) => entry,
         Err(error) if error == rustix::io::Errno::NOENT || error == rustix::io::Errno::LOOP => {
-            return Ok(CaseVariantRename::Retry);
+            return Ok(LocalRenameOutcome::Retry);
         }
         Err(error) => {
-            return Err(syscall_failure("inspect local case variant", source, error));
+            return Err(syscall_failure(
+                "inspect local rename source",
+                source,
+                error,
+            ));
         }
     };
-    let source_stat = stat_fd(&source_entry, source, "inspect local case variant type")?;
-    if !matches!(
-        FileType::from_raw_mode(source_stat.st_mode),
-        FileType::RegularFile | FileType::Directory
-    ) {
-        return Ok(CaseVariantRename::Retry);
+    let source_stat = stat_fd(&source_entry, source, "inspect local rename source type")?;
+    let source_type = FileType::from_raw_mode(source_stat.st_mode);
+    if source_type != FileType::RegularFile
+        && !(allow_directory && source_type == FileType::Directory)
+    {
+        return Ok(LocalRenameOutcome::Retry);
     }
-    before_rename().map_err(|error| io_failure("rename local case variant", source, error))?;
+    before_rename().map_err(|error| io_failure("rename local entry", source, error))?;
 
     match renameat_with(
         &parent,
@@ -842,40 +878,37 @@ fn rename_case_variant_with(
         Ok(()) => {
             let renamed =
                 named_inode_matches(&source_entry, &parent, destination_name, destination)?;
-            sync_directory(&parent, destination, "sync local case-variant rename")?;
+            sync_directory(&parent, destination, "sync local entry rename")?;
             if renamed {
-                Ok(CaseVariantRename::Renamed)
+                Ok(LocalRenameOutcome::Renamed)
             } else {
-                Ok(CaseVariantRename::Retry)
+                Ok(LocalRenameOutcome::Retry)
             }
         }
         Err(error) if error == rustix::io::Errno::NOENT || error == rustix::io::Errno::EXIST => {
-            Ok(CaseVariantRename::Retry)
+            Ok(LocalRenameOutcome::Retry)
         }
-        Err(error) => Err(syscall_failure("rename local case variant", source, error)),
+        Err(error) => Err(syscall_failure("rename local entry", source, error)),
     }
 }
 
-/// Return the component-length limit of the case variant's actual parent filesystem.
-pub(crate) fn case_variant_name_max(
-    root: &OwnedFd,
-    source: &Path,
-) -> Result<Option<usize>, LocalError> {
+/// Return the component-length limit of an entry's actual parent filesystem.
+pub(crate) fn parent_name_max(root: &OwnedFd, source: &Path) -> Result<Option<usize>, LocalError> {
     let Some((parent, _, _)) = open_parent(root, source, false)? else {
         return Ok(None);
     };
     let statistics = fstatvfs(&parent)
-        .map_err(|error| syscall_failure("inspect case-variant filename limit", source, error))?;
+        .map_err(|error| syscall_failure("inspect parent filename limit", source, error))?;
     let name_max = usize::try_from(statistics.f_namemax).map_err(|error| {
         io_failure(
-            "inspect case-variant filename limit",
+            "inspect parent filename limit",
             source,
             io::Error::new(io::ErrorKind::InvalidData, error),
         )
     })?;
     if name_max == 0 {
         return Err(io_failure(
-            "inspect case-variant filename limit",
+            "inspect parent filename limit",
             source,
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2052,6 +2085,84 @@ pub(crate) fn delete_local_at(
     Ok(DeleteOutcome::Deleted)
 }
 
+/// Create one local directory without following links or replacing an object.
+pub(crate) fn create_directory_at(
+    root: &OwnedFd,
+    target: &Path,
+) -> Result<CreateDirectoryOutcome, LocalError> {
+    let Some((parent, name, _)) = open_parent(root, target, true)? else {
+        return Err(LocalError::UnsafeRelativePath {
+            path: target.to_path_buf(),
+        });
+    };
+    match mkdirat(&parent, &name, Mode::RWXU) {
+        Ok(()) => {
+            sync_directory(&parent, target, "sync created local directory entry")?;
+            let directory = open_directory_at(&parent, &name, target)?;
+            sync_directory(&directory, target, "sync created local directory")?;
+            Ok(CreateDirectoryOutcome::Created)
+        }
+        Err(source) if source == rustix::io::Errno::EXIST => match openat2(
+            &parent,
+            &name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            BELOW_ROOT,
+        ) {
+            Ok(directory) => {
+                sync_directory(&directory, target, "sync existing local directory")?;
+                sync_directory(&parent, target, "sync existing local directory entry")?;
+                Ok(CreateDirectoryOutcome::AlreadyPresent)
+            }
+            Err(error)
+                if error == rustix::io::Errno::NOENT
+                    || error == rustix::io::Errno::NOTDIR
+                    || error == rustix::io::Errno::LOOP =>
+            {
+                Ok(CreateDirectoryOutcome::FreshObservation)
+            }
+            Err(error) => Err(syscall_failure(
+                "inspect occupied local directory path",
+                target,
+                error,
+            )),
+        },
+        Err(source) => Err(syscall_failure("create local directory", target, source)),
+    }
+}
+
+/// Delete one local directory only when it is still empty.
+pub(crate) fn delete_directory_at(
+    root: &OwnedFd,
+    target: &Path,
+) -> Result<DeleteDirectoryOutcome, LocalError> {
+    let Some((parent, name, _)) = open_parent(root, target, false)? else {
+        return Ok(DeleteDirectoryOutcome::AlreadyAbsent);
+    };
+    match unlinkat(&parent, &name, AtFlags::REMOVEDIR) {
+        Ok(()) => {
+            sync_directory(&parent, target, "sync deleted local directory")?;
+            Ok(DeleteDirectoryOutcome::Deleted)
+        }
+        Err(source) if source == rustix::io::Errno::NOENT => {
+            Ok(DeleteDirectoryOutcome::AlreadyAbsent)
+        }
+        Err(source)
+            if source == rustix::io::Errno::NOTEMPTY
+                || source == rustix::io::Errno::EXIST
+                || source == rustix::io::Errno::NOTDIR
+                || source == rustix::io::Errno::ISDIR =>
+        {
+            Ok(DeleteDirectoryOutcome::FreshObservation)
+        }
+        Err(source) => Err(syscall_failure(
+            "delete empty local directory",
+            target,
+            source,
+        )),
+    }
+}
+
 /// Materialize one deterministic conflict copy without overwriting any file.
 pub fn materialize_conflict(
     root: impl AsRef<Path>,
@@ -2278,7 +2389,7 @@ fn scan_directory(
                 }
                 entries.observations.push(LocalObservationRecord {
                     path: path.clone(),
-                    observation: Observation::Unknown(UnknownReason::Unsupported),
+                    observation: Observation::Directory,
                 });
                 scan_directory(&child, &path, cache, cache_cutoff, entries)?;
             }
@@ -3790,7 +3901,7 @@ mod tests {
 
         assert_eq!(
             rename_case_variant(&root_fd, source, destination)?,
-            CaseVariantRename::Retry
+            LocalRenameOutcome::Retry
         );
         assert_eq!(
             std::fs::read(root.path().join(destination))?,
@@ -3804,7 +3915,7 @@ mod tests {
         std::fs::remove_file(root.path().join(destination))?;
         assert_eq!(
             rename_case_variant(&root_fd, source, destination)?,
-            CaseVariantRename::Renamed
+            LocalRenameOutcome::Renamed
         );
         assert!(!root.path().join(source).exists());
         assert_eq!(
@@ -3813,7 +3924,7 @@ mod tests {
         );
         assert_eq!(
             rename_case_variant(&root_fd, source, destination)?,
-            CaseVariantRename::Retry
+            LocalRenameOutcome::Retry
         );
         Ok(())
     }
@@ -3827,12 +3938,12 @@ mod tests {
         std::fs::write(root.path().join(source), b"observed bytes")?;
         let root_fd = open_absolute_directory(root.path(), "open test root")?;
 
-        let outcome = rename_case_variant_with(&root_fd, source, destination, || {
+        let outcome = rename_case_variant_with(&root_fd, source, destination, true, || {
             std::fs::rename(root.path().join(source), root.path().join(preserved))?;
             std::fs::write(root.path().join(source), b"new bytes")
         })?;
 
-        assert_eq!(outcome, CaseVariantRename::Retry);
+        assert_eq!(outcome, LocalRenameOutcome::Retry);
         assert_eq!(
             std::fs::read(root.path().join(preserved))?,
             b"observed bytes"
@@ -3854,7 +3965,9 @@ mod tests {
                 }
                 match &record.observation {
                     Observation::Present(file) => Some(&file.content),
-                    Observation::ConfirmedAbsent | Observation::Unknown(_) => None,
+                    Observation::Directory
+                    | Observation::ConfirmedAbsent
+                    | Observation::Unknown(_) => None,
                 }
             })
             .ok_or_else(|| io::Error::other("scan did not contain the expected regular file"))
@@ -4015,6 +4128,70 @@ mod tests {
         symlink(outside.path(), directory.path().join("escape"))?;
         let result = scan(directory.path());
         assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn scan_publishes_empty_and_nested_directories() -> Result<(), Box<dyn Error>> {
+        let root = TempDir::new()?;
+        std::fs::create_dir_all(root.path().join("parent/child"))?;
+        std::fs::create_dir(root.path().join("empty"))?;
+
+        let scan = scan(root.path())?;
+        let observations = scan
+            .observations()
+            .iter()
+            .map(|record| (record.path.as_path(), &record.observation))
+            .collect::<BTreeMap<_, _>>();
+        for path in [
+            Path::new("empty"),
+            Path::new("parent"),
+            Path::new("parent/child"),
+        ] {
+            assert_eq!(observations.get(path), Some(&&Observation::Directory));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn directory_effects_are_nonoverwriting_and_nonrecursive() -> Result<(), Box<dyn Error>> {
+        let root = TempDir::new()?;
+        let root_fd = open_absolute_directory(root.path(), "open directory-effect test root")?;
+
+        assert_eq!(
+            create_directory_at(&root_fd, Path::new("parent/child"))?,
+            CreateDirectoryOutcome::Created
+        );
+        assert_eq!(
+            create_directory_at(&root_fd, Path::new("parent/child"))?,
+            CreateDirectoryOutcome::AlreadyPresent
+        );
+        assert_eq!(
+            delete_directory_at(&root_fd, Path::new("parent"))?,
+            DeleteDirectoryOutcome::FreshObservation
+        );
+        assert_eq!(
+            delete_directory_at(&root_fd, Path::new("parent/child"))?,
+            DeleteDirectoryOutcome::Deleted
+        );
+        assert_eq!(
+            delete_directory_at(&root_fd, Path::new("parent"))?,
+            DeleteDirectoryOutcome::Deleted
+        );
+
+        std::fs::write(root.path().join("occupied"), b"preserved bytes")?;
+        assert_eq!(
+            create_directory_at(&root_fd, Path::new("occupied"))?,
+            CreateDirectoryOutcome::FreshObservation
+        );
+        assert_eq!(
+            delete_directory_at(&root_fd, Path::new("occupied"))?,
+            DeleteDirectoryOutcome::FreshObservation
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("occupied"))?,
+            b"preserved bytes"
+        );
         Ok(())
     }
 

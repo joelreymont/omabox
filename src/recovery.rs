@@ -10,16 +10,17 @@ use thiserror::Error;
 
 use crate::dropbox::{DropboxClient, DropboxError, MutationOutcome, RemotePathState};
 use crate::journal::{
-    Journal, JournalError, OperationCompletion, PlanConflictCompletion, PlanRecord,
+    Journal, JournalError, OperationCompletion, PlanConflictCompletion, PlanRecord, PlanSupersede,
     PlannedOperation, RecordStatus, RecoveryCompletion, RecoveryForget, RecoveryRecord,
     RecoveryWrite,
 };
 use crate::local::{
-    ConflictOutcome, ConflictSide, DeleteOutcome, InstallOutcome, LocalError, StageOutcome,
-    StagedUpload, VerifiedRecovery, conflict_relative_path, delete_local_at, install_download_at,
-    materialize_conflict_at, materialize_verified_copy, observe_upload_source_at,
-    open_private_directory, open_root, open_root_file, recovery_file_name, stage_upload_at,
-    verify_private_copy,
+    ConflictOutcome, ConflictSide, CreateDirectoryOutcome, DeleteDirectoryOutcome, DeleteOutcome,
+    InstallOutcome, LocalError, StageOutcome, StagedUpload, VerifiedRecovery,
+    conflict_relative_path, create_directory_at, delete_directory_at, delete_local_at,
+    install_download_at, materialize_conflict_at, materialize_verified_copy,
+    observe_upload_source_at, open_private_directory, open_root, open_root_file,
+    recovery_file_name, stage_upload_at, verify_private_copy,
 };
 use crate::model::{Baseline, Conflict, ContentIdentity, LocalFile, Operation, RemoteFile};
 
@@ -88,9 +89,25 @@ pub enum RecoveryMaterialization {
     },
 }
 
+/// Result of installing an exact remote file at a caller-selected visible path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ExactCopyOutcome {
+    /// The exact bytes are durably present at the selected path.
+    Ready,
+    /// The selected visible path changed after observation.
+    DestinationChanged,
+    /// Unrelated bytes occupy the selected path's deterministic download stage.
+    StageOccupied,
+}
+
 /// Why a replayable operation remains pending.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplayBlocked {
+    /// A raced directory effect was retired so a complete scan can replan it.
+    FreshObservationRequired {
+        /// Synchronized path that must be observed again.
+        path: PathBuf,
+    },
     /// The exact remote payload must be downloaded before installation.
     DownloadRequired {
         /// Synchronized path awaiting bytes.
@@ -427,6 +444,32 @@ pub(crate) fn replay_local_plans_at<'a>(
                 continue;
             }
             let blocked = match &planned.operation {
+                Operation::CreateLocalDirectory => match create_directory_at(root, &plan.path)? {
+                    CreateDirectoryOutcome::Created | CreateDirectoryOutcome::AlreadyPresent => {
+                        complete_final(journal, planned, &plan.path, &Baseline::Directory)?;
+                        report.completed_operations += 1;
+                        None
+                    }
+                    CreateDirectoryOutcome::FreshObservation => {
+                        supersede_plan(journal, plan)?;
+                        Some(ReplayBlocked::FreshObservationRequired {
+                            path: plan.path.clone(),
+                        })
+                    }
+                },
+                Operation::DeleteLocalDirectory => match delete_directory_at(root, &plan.path)? {
+                    DeleteDirectoryOutcome::Deleted | DeleteDirectoryOutcome::AlreadyAbsent => {
+                        complete_final(journal, planned, &plan.path, &Baseline::Absent)?;
+                        report.completed_operations += 1;
+                        None
+                    }
+                    DeleteDirectoryOutcome::FreshObservation => {
+                        supersede_plan(journal, plan)?;
+                        Some(ReplayBlocked::FreshObservationRequired {
+                            path: plan.path.clone(),
+                        })
+                    }
+                },
                 Operation::PreserveLocal { .. } => {
                     let following = plan.operations.get(index + 1).ok_or_else(|| {
                         RecoveryError::InvalidJournalState {
@@ -564,7 +607,8 @@ pub(crate) fn replay_local_plans_at<'a>(
                         }
                     }
                 }
-                Operation::CreateRemote { .. }
+                Operation::CreateRemoteDirectory
+                | Operation::CreateRemote { .. }
                 | Operation::PreserveRemote { .. }
                 | Operation::ReplaceRemote { .. }
                 | Operation::DeleteRemote { .. } => Some(ReplayBlocked::RemoteOperation {
@@ -617,6 +661,16 @@ pub(crate) fn replay_remote_operations_at(
                 continue;
             }
             let blocked = match &planned.operation {
+                Operation::CreateRemoteDirectory => {
+                    if let Some(blocked) = ensure_remote_parents(dropbox, &plan.path)? {
+                        Some(blocked)
+                    } else {
+                        let outcome = dropbox
+                            .create_folder(&plan.path)
+                            .map_err(|source| dropbox_error(&plan.path, source))?;
+                        apply_folder_mutation(journal, &plan, planned, outcome, &mut report)?
+                    }
+                }
                 Operation::PreserveRemote { file } => {
                     let following = plan.operations.get(index + 1).ok_or_else(|| {
                         RecoveryError::InvalidJournalState {
@@ -720,7 +774,9 @@ pub(crate) fn replay_remote_operations_at(
                         &mut report,
                     )?
                 }
-                Operation::InstallLocal { .. }
+                Operation::CreateLocalDirectory
+                | Operation::DeleteLocalDirectory
+                | Operation::InstallLocal { .. }
                 | Operation::PreserveLocal { .. }
                 | Operation::ReplaceLocal { .. }
                 | Operation::DeleteLocal { .. } => break,
@@ -820,6 +876,34 @@ fn ensure_remote_parents(
         }
     }
     Ok(None)
+}
+
+fn apply_folder_mutation(
+    journal: &mut Journal,
+    plan: &PlanRecord,
+    planned: &PlannedOperation,
+    outcome: MutationOutcome,
+    report: &mut ReplayReport,
+) -> Result<Option<ReplayBlocked>, RecoveryError> {
+    match outcome {
+        MutationOutcome::Applied(RemotePathState::Folder) => {
+            complete_final(journal, planned, &plan.path, &Baseline::Directory)?;
+            report.completed_operations += 1;
+            Ok(None)
+        }
+        MutationOutcome::Pending => Ok(Some(ReplayBlocked::RemotePending {
+            path: plan.path.clone(),
+        })),
+        MutationOutcome::PreconditionChanged(_)
+        | MutationOutcome::Applied(
+            RemotePathState::Absent | RemotePathState::File(_) | RemotePathState::Unsupported,
+        ) => {
+            supersede_plan(journal, plan)?;
+            Ok(Some(ReplayBlocked::FreshObservationRequired {
+                path: plan.path.clone(),
+            }))
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -971,9 +1055,21 @@ fn apply_delete_mutation(
     outcome: MutationOutcome,
     report: &mut ReplayReport,
 ) -> Result<Option<ReplayBlocked>, RecoveryError> {
+    let keeps_directory = plan
+        .operations
+        .iter()
+        .any(|operation| operation.operation == Operation::CreateRemoteDirectory);
     match outcome {
         MutationOutcome::Applied(RemotePathState::Absent) => {
-            complete_final(journal, planned, &plan.path, &Baseline::Absent)?;
+            if plan
+                .operations
+                .last()
+                .is_some_and(|last| last.id == planned.id)
+            {
+                complete_final(journal, planned, &plan.path, &Baseline::Absent)?;
+            } else {
+                complete_nonfinal(journal, planned, &plan.path)?;
+            }
             report.completed_operations += 1;
             Ok(None)
         }
@@ -985,6 +1081,12 @@ fn apply_delete_mutation(
             path: plan.path.clone(),
         })),
         MutationOutcome::PreconditionChanged(RemotePathState::File(remote)) => {
+            if keeps_directory {
+                supersede_plan(journal, plan)?;
+                return Ok(Some(ReplayBlocked::FreshObservationRequired {
+                    path: plan.path.clone(),
+                }));
+            }
             materialize_remote_conflict_at(dropbox, root, root_path, &plan.path, &remote)?;
             let conflict = Conflict::LocalDeletionRemoteEdit { remote };
             finish_conflict(journal, plan.id, &plan.path, &conflict)?;
@@ -993,9 +1095,22 @@ fn apply_delete_mutation(
         }
         MutationOutcome::PreconditionChanged(
             RemotePathState::Folder | RemotePathState::Unsupported,
+        ) if keeps_directory => {
+            supersede_plan(journal, plan)?;
+            Ok(Some(ReplayBlocked::FreshObservationRequired {
+                path: plan.path.clone(),
+            }))
+        }
+        MutationOutcome::PreconditionChanged(
+            RemotePathState::Folder | RemotePathState::Unsupported,
         ) => Ok(Some(ReplayBlocked::RemoteObject {
             path: plan.path.clone(),
         })),
+        MutationOutcome::PreconditionChanged(RemotePathState::Absent) if keeps_directory => {
+            complete_nonfinal(journal, planned, &plan.path)?;
+            report.completed_operations += 1;
+            Ok(None)
+        }
         MutationOutcome::PreconditionChanged(RemotePathState::Absent) => Err(invalid(
             &plan.path,
             "delete precondition changed to an impossible absent state",
@@ -1045,6 +1160,18 @@ pub(crate) fn materialize_remote_conflict(
     materialize_remote_conflict_at(dropbox, &root, sync_root, path, remote)
 }
 
+/// Install one exact Dropbox file through an already-verified sync-root descriptor.
+pub(crate) fn materialize_remote_copy_at(
+    dropbox: &DropboxClient,
+    root: &OwnedFd,
+    root_path: &Path,
+    target: &Path,
+    source_path: &Path,
+    remote: &RemoteFile,
+) -> Result<ExactCopyOutcome, RecoveryError> {
+    ensure_exact_copy_at(dropbox, root, root_path, target, source_path, remote)
+}
+
 fn materialize_remote_conflict_at(
     dropbox: &DropboxClient,
     root: &OwnedFd,
@@ -1053,7 +1180,10 @@ fn materialize_remote_conflict_at(
     remote: &RemoteFile,
 ) -> Result<(), RecoveryError> {
     let conflict = conflict_relative_path(path, ConflictSide::Remote, &remote.content)?;
-    ensure_exact_copy_at(dropbox, root, root_path, &conflict, path, remote)
+    require_exact_copy(
+        ensure_exact_copy_at(dropbox, root, root_path, &conflict, path, remote)?,
+        path,
+    )
 }
 
 fn ensure_exact_copy(
@@ -1064,7 +1194,10 @@ fn ensure_exact_copy(
     remote: &RemoteFile,
 ) -> Result<(), RecoveryError> {
     let root_fd = open_root(root, "open exact-copy root")?;
-    ensure_exact_copy_at(dropbox, &root_fd, root, target, path, remote)
+    require_exact_copy(
+        ensure_exact_copy_at(dropbox, &root_fd, root, target, path, remote)?,
+        path,
+    )
 }
 
 fn ensure_exact_copy_at(
@@ -1074,13 +1207,17 @@ fn ensure_exact_copy_at(
     target: &Path,
     path: &Path,
     remote: &RemoteFile,
-) -> Result<(), RecoveryError> {
+) -> Result<ExactCopyOutcome, RecoveryError> {
     match install_download_at(root, root_path, target, &remote.content, None)? {
-        InstallOutcome::Installed | InstallOutcome::AlreadyInstalled => return Ok(()),
+        InstallOutcome::Installed | InstallOutcome::AlreadyInstalled => {
+            return Ok(ExactCopyOutcome::Ready);
+        }
         InstallOutcome::DownloadRequired => {}
-        InstallOutcome::StageDestinationOccupied { .. }
-        | InstallOutcome::PreconditionChanged { .. } => {
-            return Err(invalid(path, "exact Dropbox destination is occupied"));
+        InstallOutcome::StageDestinationOccupied { .. } => {
+            return Ok(ExactCopyOutcome::StageOccupied);
+        }
+        InstallOutcome::PreconditionChanged { .. } => {
+            return Ok(ExactCopyOutcome::DestinationChanged);
         }
     }
     match dropbox
@@ -1092,21 +1229,29 @@ fn ensure_exact_copy_at(
             return Err(invalid(path, "exact Dropbox download changed content"));
         }
         StageOutcome::DestinationOccupied { .. } => {
-            return Err(invalid(
-                path,
-                "exact Dropbox staging destination is occupied",
-            ));
+            return Ok(ExactCopyOutcome::StageOccupied);
         }
     }
     match install_download_at(root, root_path, target, &remote.content, None)? {
-        InstallOutcome::Installed | InstallOutcome::AlreadyInstalled => Ok(()),
+        InstallOutcome::Installed | InstallOutcome::AlreadyInstalled => Ok(ExactCopyOutcome::Ready),
         InstallOutcome::DownloadRequired => {
             Err(invalid(path, "verified exact Dropbox download disappeared"))
         }
-        InstallOutcome::StageDestinationOccupied { .. }
-        | InstallOutcome::PreconditionChanged { .. } => {
+        InstallOutcome::StageDestinationOccupied { .. } => Ok(ExactCopyOutcome::StageOccupied),
+        InstallOutcome::PreconditionChanged { .. } => Ok(ExactCopyOutcome::DestinationChanged),
+    }
+}
+
+fn require_exact_copy(outcome: ExactCopyOutcome, path: &Path) -> Result<(), RecoveryError> {
+    match outcome {
+        ExactCopyOutcome::Ready => Ok(()),
+        ExactCopyOutcome::DestinationChanged => {
             Err(invalid(path, "exact Dropbox destination is occupied"))
         }
+        ExactCopyOutcome::StageOccupied => Err(invalid(
+            path,
+            "exact Dropbox staging destination is occupied",
+        )),
     }
 }
 
@@ -1200,12 +1345,22 @@ fn destructive_content(operation: &Operation) -> Option<&ContentIdentity> {
             expected_content, ..
         }
         | Operation::DeleteLocal { expected_content } => Some(expected_content),
-        Operation::CreateRemote { .. }
+        Operation::CreateLocalDirectory
+        | Operation::CreateRemoteDirectory
+        | Operation::DeleteLocalDirectory
+        | Operation::CreateRemote { .. }
         | Operation::InstallLocal { .. }
         | Operation::PreserveLocal { .. }
         | Operation::PreserveRemote { .. }
         | Operation::ReplaceRemote { .. }
         | Operation::DeleteRemote { .. } => None,
+    }
+}
+
+fn supersede_plan(journal: &mut Journal, plan: &PlanRecord) -> Result<(), RecoveryError> {
+    match journal.supersede_plan(plan.id)? {
+        PlanSupersede::Superseded | PlanSupersede::AlreadyCompleted => Ok(()),
+        PlanSupersede::NotFound => Err(invalid(&plan.path, "stale plan disappeared")),
     }
 }
 

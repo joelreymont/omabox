@@ -36,7 +36,10 @@ fn remote(bytes: &[u8], revision: &str) -> Result<RemoteFile, Box<dyn Error>> {
 fn operations(decision: Decision) -> Result<OperationPlan, Box<dyn Error>> {
     match decision {
         Decision::Operations(operations) => Ok(operations),
-        Decision::NoOp(_) | Decision::Blocked(_) | Decision::Conflict(_) => {
+        Decision::NoOp(_)
+        | Decision::Blocked(_)
+        | Decision::Conflict(_)
+        | Decision::DirectoryCollision(_) => {
             Err(io::Error::other("test expected planner operations").into())
         }
     }
@@ -117,6 +120,50 @@ fn operation(
     plan.operations
         .get(index)
         .ok_or_else(|| io::Error::other("test plan operation was missing").into())
+}
+
+#[test]
+fn directory_effects_replay_after_the_filesystem_changed_before_journal_completion()
+-> Result<(), Box<dyn Error>> {
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let recovery = directory.path().join("recovery");
+    let database = directory.path().join("journal.sqlite3");
+    std::fs::create_dir(&root)?;
+    std::fs::create_dir(&recovery)?;
+    let path = Path::new("empty");
+
+    let mut journal = Journal::open(&database)?;
+    let create = operations(plan(
+        &Baseline::Absent,
+        &Observation::ConfirmedAbsent,
+        &Observation::Directory,
+    ))?;
+    let _ = recorded_plan(journal.record_plan(path, &create)?)?;
+    std::fs::create_dir(root.join(path))?;
+    drop(journal);
+
+    let mut reopened = Journal::open(&database)?;
+    let created = replay_local_operations(&mut reopened, &root, &recovery)?;
+    assert_eq!(created.completed_operations, 1);
+    assert_eq!(reopened.baseline(path)?, Some(Baseline::Directory));
+    assert!(reopened.pending_plans()?.is_empty());
+
+    let delete = operations(plan(
+        &Baseline::Directory,
+        &Observation::Directory,
+        &Observation::ConfirmedAbsent,
+    ))?;
+    let _ = recorded_plan(reopened.record_plan(path, &delete)?)?;
+    std::fs::remove_dir(root.join(path))?;
+    drop(reopened);
+
+    let mut replayed = Journal::open(&database)?;
+    let deleted = replay_local_operations(&mut replayed, &root, &recovery)?;
+    assert_eq!(deleted.completed_operations, 1);
+    assert_eq!(replayed.baseline(path)?, None);
+    assert!(replayed.pending_plans()?.is_empty());
+    Ok(())
 }
 
 #[test]

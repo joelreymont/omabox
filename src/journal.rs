@@ -19,7 +19,8 @@ const MIGRATION_V1: &str = include_str!("../migrations/0001.sql");
 const MIGRATION_V2: &str = include_str!("../migrations/0002.sql");
 const MIGRATION_V3: &str = include_str!("../migrations/0003.sql");
 const MIGRATION_V4: &str = include_str!("../migrations/0004.sql");
-const SCHEMA_VERSION: i64 = 4;
+const MIGRATION_V5: &str = include_str!("../migrations/0005.sql");
+const SCHEMA_VERSION: i64 = 5;
 
 /// A journal failure with its operation, affected path, and original cause.
 #[derive(Debug, Error)]
@@ -385,6 +386,17 @@ pub enum PlanConflictCompletion {
     Recorded,
 }
 
+/// Result of retiring a stale pending plan without changing its baseline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlanSupersede {
+    /// The plan does not exist.
+    NotFound,
+    /// The plan was already completed.
+    AlreadyCompleted,
+    /// Pending operations and the plan were retired transactionally.
+    Superseded,
+}
+
 /// A recovery copy that must exist before its destructive operation runs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryRecord {
@@ -530,6 +542,15 @@ impl Journal {
                         source,
                     })?;
                 migrate_canonical_paths(&transaction, &path)?;
+            }
+            if version < 5 {
+                transaction
+                    .execute_batch(MIGRATION_V5)
+                    .map_err(|source| JournalError::Sqlite {
+                        operation: "apply journal version-five migration",
+                        path: path.clone(),
+                        source,
+                    })?;
             }
             transaction
                 .commit()
@@ -1011,7 +1032,7 @@ impl Journal {
         };
         match decode(&json, "deserialize baseline", path)? {
             Baseline::Absent => Ok(None),
-            baseline @ Baseline::Present(_) => Ok(Some(baseline)),
+            baseline @ (Baseline::Present(_) | Baseline::Directory) => Ok(Some(baseline)),
         }
     }
 
@@ -1206,7 +1227,10 @@ impl Journal {
                     Ok(Operation::CreateRemote { content })
                     | Ok(Operation::ReplaceRemote { content, .. }) => Some(Ok(content)),
                     Ok(
-                        Operation::InstallLocal { .. }
+                        Operation::CreateLocalDirectory
+                        | Operation::CreateRemoteDirectory
+                        | Operation::DeleteLocalDirectory
+                        | Operation::InstallLocal { .. }
                         | Operation::PreserveLocal { .. }
                         | Operation::ReplaceLocal { .. }
                         | Operation::DeleteLocal { .. }
@@ -1468,6 +1492,49 @@ impl Journal {
             .commit()
             .map_err(|source| sqlite("commit plan conflict", &database_path, source))?;
         Ok(PlanConflictCompletion::Recorded)
+    }
+
+    /// Retire stale effect intent without advancing or deleting its baseline.
+    pub fn supersede_plan(&mut self, plan_id: PlanId) -> Result<PlanSupersede, JournalError> {
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite("begin plan supersession", &database_path, source))?;
+        let plan = transaction
+            .query_row(
+                "SELECT path, status FROM plans WHERE id = ?1",
+                [plan_id.0],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|source| sqlite("find plan for supersession", &database_path, source))?;
+        let Some((raw_path, status)) = plan else {
+            return Ok(PlanSupersede::NotFound);
+        };
+        let path = bytes_path(raw_path);
+        if decode_status(&status, "read plan status for supersession", &path)?
+            == RecordStatus::Completed
+        {
+            return Ok(PlanSupersede::AlreadyCompleted);
+        }
+        transaction
+            .execute(
+                "UPDATE operations SET status = 'completed' WHERE plan_id = ?1",
+                [plan_id.0],
+            )
+            .map_err(|source| sqlite("retire superseded operations", &path, source))?;
+        transaction
+            .execute(
+                "UPDATE plans SET status = 'completed' WHERE id = ?1",
+                [plan_id.0],
+            )
+            .map_err(|source| sqlite("retire superseded plan", &path, source))?;
+        start_recovery_retention(&transaction, plan_id.0, &path)?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite("commit plan supersession", &database_path, source))?;
+        Ok(PlanSupersede::Superseded)
     }
 
     /// Persist a planner conflict without interpreting it or discarding a side.
@@ -1967,7 +2034,7 @@ fn write_baseline(
             )
             .map(|_| ())
             .map_err(|source| sqlite("remove absent baseline", path, source)),
-        Baseline::Present(_) => {
+        Baseline::Present(_) | Baseline::Directory => {
             let json = encode(baseline, "serialize present baseline", path)?;
             connection
                 .execute(
@@ -2385,6 +2452,11 @@ fn displaced_content(preservation: &Operation, destructive: &Operation) -> Optio
 
 fn operation_matches_baseline(operation: &Operation, baseline: &Baseline) -> bool {
     match (operation, baseline) {
+        (
+            Operation::CreateLocalDirectory | Operation::CreateRemoteDirectory,
+            Baseline::Directory,
+        ) => true,
+        (Operation::DeleteLocalDirectory, Baseline::Absent) => true,
         (Operation::CreateRemote { content }, Baseline::Present(remote))
         | (Operation::ReplaceRemote { content, .. }, Baseline::Present(remote)) => {
             content == &remote.content
@@ -2487,26 +2559,28 @@ mod tests {
     fn operations(decision: Decision) -> Result<OperationPlan, JournalError> {
         match decision {
             Decision::Operations(plan) => Ok(plan),
-            Decision::NoOp(_) | Decision::Blocked(_) | Decision::Conflict(_) => {
-                Err(JournalError::InvalidState {
-                    operation: "extract test operation plan",
-                    path: PathBuf::from("test"),
-                    detail: "test expected planner operations",
-                })
-            }
+            Decision::NoOp(_)
+            | Decision::Blocked(_)
+            | Decision::Conflict(_)
+            | Decision::DirectoryCollision(_) => Err(JournalError::InvalidState {
+                operation: "extract test operation plan",
+                path: PathBuf::from("test"),
+                detail: "test expected planner operations",
+            }),
         }
     }
 
     fn noop(decision: Decision) -> Result<NoOpDecision, JournalError> {
         match decision {
             Decision::NoOp(noop) => Ok(noop),
-            Decision::Operations(_) | Decision::Blocked(_) | Decision::Conflict(_) => {
-                Err(JournalError::InvalidState {
-                    operation: "extract test no-op",
-                    path: PathBuf::from("test"),
-                    detail: "test expected a planner no-op",
-                })
-            }
+            Decision::Operations(_)
+            | Decision::Blocked(_)
+            | Decision::Conflict(_)
+            | Decision::DirectoryCollision(_) => Err(JournalError::InvalidState {
+                operation: "extract test no-op",
+                path: PathBuf::from("test"),
+                detail: "test expected a planner no-op",
+            }),
         }
     }
 
@@ -3289,7 +3363,7 @@ mod tests {
         drop(legacy);
 
         let mut journal = Journal::open(&database_path)?;
-        assert_eq!(journal.schema_version, 4);
+        assert_eq!(journal.schema_version, 5);
         assert_eq!(journal.baseline(path)?, None);
         assert_eq!(journal.baseline(kept_path)?, Some(kept_baseline.clone()));
         assert_eq!(journal.baseline_paths()?, vec![kept_path.to_path_buf()]);
@@ -3340,7 +3414,7 @@ mod tests {
         let version = journal
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let mut foreign_keys = journal
             .connection
             .prepare("PRAGMA foreign_key_list(recovery_records)")?;
@@ -3416,7 +3490,7 @@ mod tests {
         let version = journal
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         Ok(())
     }
 
@@ -3513,22 +3587,55 @@ mod tests {
         let directory = TempDir::new()?;
         let database_path = journal_path(&directory);
         let connection = Connection::open(&database_path)?;
-        connection.pragma_update(None, "user_version", 5)?;
+        connection.pragma_update(None, "user_version", 6)?;
         drop(connection);
 
         let opened = Journal::open(&database_path);
         assert!(matches!(
             opened,
             Err(JournalError::UnsupportedVersion {
-                found: 5,
-                supported: 4,
+                found: 6,
+                supported: 5,
                 ..
             })
         ));
         let connection = Connection::open(database_path)?;
         let version =
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
+        Ok(())
+    }
+
+    #[test]
+    fn superseding_a_raced_directory_plan_never_advances_its_baseline() -> Result<(), Box<dyn Error>>
+    {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+        let path = Path::new("parent");
+        let mut journal = Journal::open(&database_path)?;
+        let agreed = noop(plan(
+            &Baseline::Absent,
+            &Observation::Directory,
+            &Observation::Directory,
+        ))?;
+        assert_eq!(journal.record_noop(path, &agreed)?, NoOpWrite::Recorded);
+        let pending = recorded_plan(journal.record_plan(
+            path,
+            &OperationPlan::new(vec![Operation::DeleteLocalDirectory]),
+        )?)?;
+
+        assert_eq!(
+            journal.supersede_plan(pending.id)?,
+            PlanSupersede::Superseded
+        );
+        assert_eq!(journal.baseline(path)?, Some(Baseline::Directory));
+        assert!(journal.pending_plans()?.is_empty());
+        assert!(journal.conflicts()?.is_empty());
+        drop(journal);
+
+        let reopened = Journal::open(&database_path)?;
+        assert_eq!(reopened.baseline(path)?, Some(Baseline::Directory));
+        assert!(reopened.pending_plans()?.is_empty());
         Ok(())
     }
 

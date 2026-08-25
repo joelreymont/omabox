@@ -75,6 +75,8 @@ pub enum Baseline {
     Absent,
     /// Both sides last agreed on this content and Dropbox revision.
     Present(RemoteFile),
+    /// Both sides last agreed that a directory exists at the path.
+    Directory,
 }
 
 /// Why an observation cannot prove either presence or absence.
@@ -113,6 +115,8 @@ impl fmt::Display for UnknownReason {
 pub enum Observation<T> {
     /// The path is present with a complete payload description.
     Present(T),
+    /// A directory is present at the path.
+    Directory,
     /// A complete observation proves the path is absent.
     ConfirmedAbsent,
     /// Presence or absence cannot safely be determined.
@@ -128,6 +132,12 @@ pub type RemoteObservation = Observation<RemoteFile>;
 /// Ordered recovery or mutation step selected for one path.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Operation {
+    /// Create a local directory while the path remains absent.
+    CreateLocalDirectory,
+    /// Create a Dropbox directory while the path remains absent.
+    CreateRemoteDirectory,
+    /// Remove an empty local directory after confirmed remote absence.
+    DeleteLocalDirectory,
     /// Create a remote file only while the remote path remains absent.
     CreateRemote { content: ContentIdentity },
     /// Install a remote file at a locally absent path.
@@ -155,6 +165,9 @@ pub enum Operation {
 impl Operation {
     pub(crate) fn description(&self) -> &'static str {
         match self {
+            Self::CreateLocalDirectory => "create local directory if still absent",
+            Self::CreateRemoteDirectory => "create remote directory if still absent",
+            Self::DeleteLocalDirectory => "delete empty local directory",
             Self::CreateRemote { .. } => "create remote file if still absent",
             Self::InstallLocal { .. } => "install remote content locally",
             Self::PreserveLocal { .. } => "preserve displaced local payload",
@@ -194,6 +207,17 @@ pub enum NoOpReason {
     BothAbsent,
     /// Both present observations identify the same bytes.
     ContentMatches,
+    /// Both complete observations report a directory.
+    DirectoriesMatch,
+}
+
+/// A file occupies the same synchronized path as a directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DirectoryCollision {
+    /// Move the local file to a deterministic synchronized sibling, then keep the directory.
+    LocalFileRemoteDirectory { local: LocalFile },
+    /// Copy the exact Dropbox file to a deterministic synchronized sibling, then keep the directory.
+    LocalDirectoryRemoteFile { remote: RemoteFile },
 }
 
 /// A planner-approved baseline transition that requires no effect.
@@ -306,6 +330,8 @@ pub enum Decision {
     Blocked(BlockedReason),
     /// Simultaneous changes must retain every present payload.
     Conflict(Conflict),
+    /// A directory wins over a file after the file is preserved under a synchronized name.
+    DirectoryCollision(DirectoryCollision),
 }
 
 impl fmt::Display for Decision {
@@ -313,6 +339,9 @@ impl fmt::Display for Decision {
         match self {
             Self::NoOp(noop) if noop.reason() == NoOpReason::BothAbsent => {
                 formatter.write_str("no operation: both sides are confirmed absent")
+            }
+            Self::NoOp(noop) if noop.reason() == NoOpReason::DirectoriesMatch => {
+                formatter.write_str("no operation: both sides contain a directory")
             }
             Self::NoOp(_) => formatter.write_str("no operation: local and remote content match"),
             Self::Operations(plan) => {
@@ -332,6 +361,8 @@ impl fmt::Display for Decision {
                 write!(formatter, "blocked: local {local}; remote {remote}")
             }
             Self::Conflict(conflict) => write!(formatter, "conflict: {}", conflict.description()),
+            Self::DirectoryCollision(_) => formatter
+                .write_str("preserve the file under a synchronized name and keep the directory"),
         }
     }
 }

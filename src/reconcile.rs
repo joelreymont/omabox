@@ -14,20 +14,25 @@ use thiserror::Error;
 use crate::dropbox::{DropboxClient, DropboxError};
 use crate::journal::{
     Journal, JournalError, LocalObservationRecord, NoOpWrite, PlanConflictCompletion, PlanRecord,
-    PlanWrite, RemoteObservationRecord, dropbox_canonical_path,
+    PlanSupersede, PlanWrite, RemoteObservationRecord, dropbox_canonical_path,
 };
 use crate::local::{
-    CaseVariantRename, DownloadSlotIdentity, DownloadSlotLease, LocalError, MAX_PARALLEL_DOWNLOADS,
-    ScanPublication, StageOutcome, StagedUpload, case_variant_name_max, configured_root_is_active,
-    lease_download_slots, observe_upload_source, open_active_root,
-    remove_unreferenced_upload_stages, rename_case_variant, scan_and_publish, stage_upload,
+    DownloadSlotIdentity, DownloadSlotLease, LocalError, LocalRenameOutcome,
+    MAX_PARALLEL_DOWNLOADS, ScanPublication, StageOutcome, StagedUpload, configured_root_is_active,
+    lease_download_slots, observe_upload_source, open_active_root, parent_name_max,
+    remove_unreferenced_upload_stages, rename_case_variant, rename_file_copy, scan_and_publish,
+    stage_upload,
 };
-use crate::model::{Baseline, Conflict, Decision, Observation, Operation, RemoteFile};
+use crate::model::{
+    Baseline, Conflict, ContentIdentity, Decision, DirectoryCollision, Observation, Operation,
+    OperationPlan, RemoteFile,
+};
 use crate::planner::plan;
 use crate::recovery::{
-    RecoveryError, RecoveryMaterialization, ReplayBlocked, ReplayReport, destination,
-    materialize_before_plan, materialize_local_conflict, materialize_remote_conflict,
-    prune_completed_recoveries, replay_local_plans_at, replay_remote_operations_at,
+    ExactCopyOutcome, RecoveryError, RecoveryMaterialization, ReplayBlocked, ReplayReport,
+    destination, materialize_before_plan, materialize_local_conflict, materialize_remote_conflict,
+    materialize_remote_copy_at, prune_completed_recoveries, replay_local_plans_at,
+    replay_remote_operations_at,
 };
 
 /// A reconciliation failure. Expected observation races are returned as outcomes instead.
@@ -171,6 +176,7 @@ pub struct ExactDownloadPool {
     jobs: mpsc::SyncSender<DownloadJob>,
     results: mpsc::Receiver<DownloadResult>,
     in_flight: BTreeSet<PathBuf>,
+    pending_failure: Option<ReconcileError>,
     workers: Vec<thread::JoinHandle<()>>,
 }
 
@@ -208,29 +214,36 @@ impl ExactDownloadPool {
             jobs,
             results,
             in_flight: BTreeSet::new(),
+            pending_failure: None,
             workers,
         })
     }
 
     fn collect_results(&mut self) -> Result<Option<ReconcileError>, ReconcileError> {
-        let failure = loop {
+        loop {
             match self.results.try_recv() {
                 Ok(result) => {
                     self.in_flight.remove(&result.path);
-                    if let Err(error) = result.outcome {
-                        break Some(error);
+                    if let Err(error) = result.outcome
+                        && self.pending_failure.is_none()
+                    {
+                        self.pending_failure = Some(error);
                     }
                 }
-                Err(mpsc::TryRecvError::Empty) => break None,
+                Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     return Err(ReconcileError::DownloadWorkerStopped);
                 }
             }
-        };
+        }
         if self.workers.iter().any(thread::JoinHandle::is_finished) {
             return Err(ReconcileError::DownloadWorkerStopped);
         }
-        Ok(failure)
+        if self.in_flight.is_empty() {
+            Ok(self.pending_failure.take())
+        } else {
+            Ok(None)
+        }
     }
 
     fn contains(&self, path: &Path) -> bool {
@@ -238,7 +251,11 @@ impl ExactDownloadPool {
     }
 
     fn available(&self) -> usize {
-        MAX_PARALLEL_DOWNLOADS.saturating_sub(self.in_flight.len())
+        if self.pending_failure.is_some() {
+            0
+        } else {
+            MAX_PARALLEL_DOWNLOADS.saturating_sub(self.in_flight.len())
+        }
     }
 
     fn schedule(&mut self, job: DownloadJob) -> Result<(), ReconcileError> {
@@ -473,12 +490,12 @@ fn reconcile_active_root(
         let Some(root) = open_active_root(journal, sync_root)? else {
             return Err(ReconcileError::LocalRootChanged);
         };
-        let Some(name_max) = case_variant_name_max(&root, &source)? else {
+        let Some(name_max) = parent_name_max(&root, &source)? else {
             return Ok(ReconcileOutcome::FreshObservationRequired { path: source });
         };
         let rename = case_variant_move(scan.observations(), source, name_max)?;
         match rename_case_variant(&root, &rename.source, &rename.destination)? {
-            CaseVariantRename::Renamed | CaseVariantRename::Retry => {
+            LocalRenameOutcome::Renamed | LocalRenameOutcome::Retry => {
                 return Ok(ReconcileOutcome::FreshObservationRequired {
                     path: rename.source,
                 });
@@ -522,26 +539,22 @@ fn reconcile_published(
     let mut paths = baseline_paths.keys().cloned().collect::<BTreeSet<_>>();
     paths.extend(local.keys().cloned());
     paths.extend(remote.keys().cloned());
-    let conflicts = journal.conflicts()?;
-    let mut report = ReconcileReport {
-        replayed_operations: replay.completed_operations,
-        ..ReconcileReport::default()
-    };
-    let mut blocked_paths = BTreeSet::new();
-
+    let mut decisions = Vec::with_capacity(paths.len());
     for canonical_path in paths {
         let baseline = match journal.baseline(&canonical_path)? {
             Some(value) => value,
             None => Baseline::Absent,
         };
-        let local_observation = match local.get(&canonical_path) {
-            Some(value) => value.observation.clone(),
-            None => Observation::ConfirmedAbsent,
-        };
-        let remote_observation = match remote.get(&canonical_path) {
-            Some(value) => value.observation.clone(),
-            None => Observation::ConfirmedAbsent,
-        };
+        let local_observation = local
+            .get(&canonical_path)
+            .map_or(Observation::ConfirmedAbsent, |record| {
+                record.observation.clone()
+            });
+        let remote_observation = remote
+            .get(&canonical_path)
+            .map_or(Observation::ConfirmedAbsent, |record| {
+                record.observation.clone()
+            });
         let path = local
             .get(&canonical_path)
             .map(|record| record.path.clone())
@@ -552,8 +565,26 @@ fn reconcile_published(
             })
             .or_else(|| baseline_paths.get(&canonical_path).cloned())
             .ok_or_else(|| invalid(&canonical_path, "canonical path has no display spelling"))?;
-        let decision = plan(&baseline, &local_observation, &remote_observation);
+        decisions.push(PathDecision {
+            canonical_path,
+            path,
+            decision: plan(&baseline, &local_observation, &remote_observation),
+        });
+    }
+    decisions.sort_by(order_path_decisions);
+    let conflicts = journal.conflicts()?;
+    let mut report = ReconcileReport {
+        replayed_operations: replay.completed_operations,
+        ..ReconcileReport::default()
+    };
+    let mut blocked_paths = BTreeSet::new();
 
+    for PathDecision {
+        canonical_path,
+        path,
+        decision,
+    } in decisions
+    {
         if let Some(pending_plan) = pending.get(&canonical_path) {
             if downloads.contains(&pending_plan.path) {
                 blocked_paths.insert(canonical_path.clone());
@@ -569,6 +600,9 @@ fn reconcile_published(
                     }
                 }
                 report.conflicts += 1;
+            } else if matches!(decision, Decision::DirectoryCollision(_)) {
+                supersede_pending_plan(journal, pending_plan)?;
+                return Ok(ReconcileOutcome::FreshObservationRequired { path });
             } else {
                 blocked_paths.insert(canonical_path.clone());
             }
@@ -622,6 +656,32 @@ fn reconcile_published(
                     report.conflicts += 1;
                 }
             }
+            Decision::DirectoryCollision(collision) => {
+                match prepare_directory_collision(
+                    dropbox,
+                    journal,
+                    sync_root,
+                    upload_staging,
+                    recovery_directory,
+                    &local,
+                    &remote,
+                    &path,
+                    &collision,
+                )? {
+                    PreparedDirectoryCollision::FreshObservation => {
+                        return Ok(ReconcileOutcome::FreshObservationRequired { path });
+                    }
+                    PreparedDirectoryCollision::Plan(plan) => {
+                        require_active_local_root(journal, sync_root)?;
+                        match journal.record_plan(&path, &plan)? {
+                            PlanWrite::Recorded(_) => report.planned += 1,
+                            PlanWrite::AlreadyPending(_) => {
+                                blocked_paths.insert(canonical_path.clone());
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     let applied = replay_pending_at(
@@ -633,6 +693,12 @@ fn reconcile_published(
         recovery_directory,
     )?;
     report.replayed_operations += applied.completed_operations;
+    if let Some(path) = applied.blocked.iter().find_map(|blocked| match blocked {
+        ReplayBlocked::FreshObservationRequired { path } => Some(path.clone()),
+        _ => None,
+    }) {
+        return Ok(ReconcileOutcome::FreshObservationRequired { path });
+    }
     journal.prune_completed_work()?;
     prune_completed_recoveries(journal, recovery_directory)?;
     let retained_uploads = journal.pending_upload_content()?;
@@ -645,6 +711,39 @@ fn reconcile_published(
     report.blocked = blocked_paths.len();
     remove_unreferenced_upload_stages(upload_staging, &retained_uploads)?;
     Ok(ReconcileOutcome::Complete(report))
+}
+
+struct PathDecision {
+    canonical_path: PathBuf,
+    path: PathBuf,
+    decision: Decision,
+}
+
+fn order_path_decisions(left: &PathDecision, right: &PathDecision) -> std::cmp::Ordering {
+    let left_delete = is_local_directory_delete(&left.decision);
+    let right_delete = is_local_directory_delete(&right.decision);
+    match (left_delete, right_delete) {
+        (true, true) => path_depth(&right.path)
+            .cmp(&path_depth(&left.path))
+            .then_with(|| left.canonical_path.cmp(&right.canonical_path)),
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => path_depth(&left.path)
+            .cmp(&path_depth(&right.path))
+            .then_with(|| left.canonical_path.cmp(&right.canonical_path)),
+    }
+}
+
+fn is_local_directory_delete(decision: &Decision) -> bool {
+    matches!(
+        decision,
+        Decision::Operations(plan)
+            if plan.operations() == [Operation::DeleteLocalDirectory]
+    )
+}
+
+fn path_depth(path: &Path) -> usize {
+    path.components().count()
 }
 
 enum Prepared<T> {
@@ -662,6 +761,9 @@ fn prepare_plan(
 ) -> Result<Prepared<()>, ReconcileError> {
     for operation in operations {
         match operation {
+            Operation::CreateLocalDirectory
+            | Operation::CreateRemoteDirectory
+            | Operation::DeleteLocalDirectory => {}
             Operation::CreateRemote { content } | Operation::ReplaceRemote { content, .. } => {
                 if matches!(
                     prepare_local(sync_root, upload_staging, path, content)?,
@@ -695,6 +797,203 @@ fn prepare_plan(
         }
     }
     Ok(Prepared::Ready(()))
+}
+
+enum PreparedDirectoryCollision {
+    FreshObservation,
+    Plan(OperationPlan),
+}
+
+#[derive(Clone, Copy)]
+enum FileCopyOrigin {
+    Local,
+    Dropbox,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_directory_collision(
+    dropbox: &DropboxClient,
+    journal: &Journal,
+    sync_root: &Path,
+    upload_staging: &Path,
+    recovery_directory: &Path,
+    local: &BTreeMap<PathBuf, LocalObservationRecord>,
+    remote: &BTreeMap<PathBuf, RemoteObservationRecord>,
+    path: &Path,
+    collision: &DirectoryCollision,
+) -> Result<PreparedDirectoryCollision, ReconcileError> {
+    let Some(root) = open_active_root(journal, sync_root)? else {
+        return Err(ReconcileError::LocalRootChanged);
+    };
+    let Some(name_max) = parent_name_max(&root, path)? else {
+        return Ok(PreparedDirectoryCollision::FreshObservation);
+    };
+    match collision {
+        DirectoryCollision::LocalFileRemoteDirectory { local: file } => {
+            let excluded = BTreeSet::new();
+            let destination = file_copy_path(
+                local,
+                remote,
+                path,
+                &file.content,
+                FileCopyOrigin::Local,
+                name_max,
+                false,
+                &excluded,
+            )?;
+            match rename_file_copy(&root, path, &destination)? {
+                LocalRenameOutcome::Renamed | LocalRenameOutcome::Retry => {
+                    Ok(PreparedDirectoryCollision::FreshObservation)
+                }
+            }
+        }
+        DirectoryCollision::LocalDirectoryRemoteFile { remote: file } => {
+            let mut excluded = BTreeSet::new();
+            loop {
+                let destination = file_copy_path(
+                    local,
+                    remote,
+                    path,
+                    &file.content,
+                    FileCopyOrigin::Dropbox,
+                    name_max,
+                    true,
+                    &excluded,
+                )?;
+                match materialize_remote_copy_at(
+                    dropbox,
+                    &root,
+                    sync_root,
+                    &destination,
+                    path,
+                    file,
+                )? {
+                    ExactCopyOutcome::Ready => break,
+                    ExactCopyOutcome::DestinationChanged => {
+                        return Ok(PreparedDirectoryCollision::FreshObservation);
+                    }
+                    ExactCopyOutcome::StageOccupied => {
+                        excluded.insert(destination);
+                    }
+                }
+            }
+            let plan = OperationPlan::new(vec![
+                Operation::PreserveRemote { file: file.clone() },
+                Operation::DeleteRemote {
+                    expected_revision: file.revision.clone(),
+                },
+                Operation::CreateRemoteDirectory,
+            ]);
+            match prepare_plan(
+                dropbox,
+                sync_root,
+                upload_staging,
+                recovery_directory,
+                path,
+                plan.operations(),
+            )? {
+                Prepared::Ready(()) => Ok(PreparedDirectoryCollision::Plan(plan)),
+                Prepared::FreshObservation => Ok(PreparedDirectoryCollision::FreshObservation),
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn file_copy_path(
+    local: &BTreeMap<PathBuf, LocalObservationRecord>,
+    remote: &BTreeMap<PathBuf, RemoteObservationRecord>,
+    source: &Path,
+    content: &ContentIdentity,
+    origin: FileCopyOrigin,
+    name_max: usize,
+    reuse_matching: bool,
+    excluded: &BTreeSet<PathBuf>,
+) -> Result<PathBuf, ReconcileError> {
+    let Some(name) = source.file_name() else {
+        return Err(invalid(
+            source,
+            "directory collision has no final path component",
+        ));
+    };
+    let Some(parent) = source.parent() else {
+        return Err(invalid(source, "directory collision has no parent path"));
+    };
+    for attempt in 0..10_000 {
+        let Some(candidate_name) = file_copy_name(name, content, origin, attempt, name_max) else {
+            break;
+        };
+        let candidate = parent.join(candidate_name);
+        if excluded.contains(&candidate) {
+            continue;
+        }
+        let canonical = dropbox_canonical_path(&candidate);
+        let local_record = local.get(&canonical);
+        let remote_record = remote.get(&canonical);
+        if local_record.is_none() && remote_record.is_none() {
+            return Ok(candidate);
+        }
+        let local_matches = local_record.is_none_or(|record| {
+            matches!(
+                &record.observation,
+                Observation::Present(file) if &file.content == content
+            )
+        });
+        let remote_matches = remote_record.is_none_or(|record| {
+            matches!(
+                &record.observation,
+                Observation::Present(file) if &file.content == content
+            )
+        });
+        if reuse_matching && local_matches && remote_matches {
+            return Ok(candidate);
+        }
+    }
+    Err(invalid(
+        source,
+        "could not select a unique synchronized file-copy path",
+    ))
+}
+
+fn file_copy_name(
+    name: &OsStr,
+    content: &ContentIdentity,
+    origin: FileCopyOrigin,
+    attempt: usize,
+    name_max: usize,
+) -> Option<OsString> {
+    let mut identity = content
+        .as_str()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(12)
+        .collect::<String>();
+    if identity.is_empty() {
+        identity.push_str("content");
+    }
+    let origin = match origin {
+        FileCopyOrigin::Local => "local file",
+        FileCopyOrigin::Dropbox => "Dropbox file",
+    };
+    let suffix = if attempt == 0 {
+        format!(" ({origin} {identity})")
+    } else {
+        format!(" ({origin} {identity} {})", attempt.saturating_add(1))
+    };
+    let prefix_limit = name_max.checked_sub(suffix.len())?;
+    let mut candidate = truncate_component(name, prefix_limit);
+    candidate.push(suffix);
+    Some(candidate)
+}
+
+fn supersede_pending_plan(
+    journal: &mut Journal,
+    pending: &PlanRecord,
+) -> Result<(), ReconcileError> {
+    match journal.supersede_plan(pending.id)? {
+        PlanSupersede::Superseded | PlanSupersede::AlreadyCompleted => Ok(()),
+        PlanSupersede::NotFound => Err(invalid(&pending.path, "stale pending plan disappeared")),
+    }
 }
 
 struct PendingDownload {
@@ -1157,6 +1456,24 @@ mod tests {
         };
         assert_eq!(destination_name.as_bytes().len(), 255);
         assert!(destination_name.as_bytes().ends_with(b" (case variant)"));
+        Ok(())
+    }
+
+    #[test]
+    fn file_copy_name_is_deterministic_and_fits_the_parent_limit() -> Result<(), Box<dyn Error>> {
+        let original = OsString::from("a".repeat(255));
+        let content = ContentIdentity::new("b".repeat(64));
+        let Some(first) = file_copy_name(&original, &content, FileCopyOrigin::Dropbox, 0, 255)
+        else {
+            return Err(io::Error::other("file-copy name did not fit").into());
+        };
+        let Some(second) = file_copy_name(&original, &content, FileCopyOrigin::Dropbox, 0, 255)
+        else {
+            return Err(io::Error::other("repeated file-copy name did not fit").into());
+        };
+        assert_eq!(first, second);
+        assert_eq!(first.as_bytes().len(), 255);
+        assert!(first.as_bytes().ends_with(b" (Dropbox file bbbbbbbbbbbb)"));
         Ok(())
     }
 

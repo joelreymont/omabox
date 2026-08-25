@@ -173,7 +173,7 @@ fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result
     assert_eq!(inventory.observations.len(), 3);
     assert_eq!(
         observation(&inventory, Path::new("Folder")),
-        Some(&Observation::Unknown(UnknownReason::Unsupported))
+        Some(&Observation::Directory)
     );
     assert_eq!(
         observation(&inventory, Path::new("Paper")),
@@ -455,6 +455,865 @@ fn one_reconciliation_pass_synchronizes_files_in_both_directions() -> Result<(),
             "strict_conflict": true,
             "content_hash": upload_content.as_str()
         })
+    );
+    Ok(())
+}
+
+#[test]
+fn one_reconciliation_pass_synchronizes_empty_and_nested_directories() -> Result<(), Box<dyn Error>>
+{
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [
+                folder_metadata("/remote", "/remote"),
+                folder_metadata("/remote/child", "/remote/child")
+            ],
+            "cursor": "directories",
+            "has_more": false
+        })),
+        FakeResponse::json(json!({"metadata": folder_metadata("/local", "/local")})),
+        FakeResponse::json(json!({"metadata": folder_metadata("/local", "/local")})),
+        FakeResponse::json(json!({
+            "metadata": folder_metadata("/local/child", "/local/child")
+        })),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-directories")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(root.join("local/child"))?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+
+    let report = match reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )? {
+        ReconcileOutcome::Complete(report) => report,
+        ReconcileOutcome::FreshObservationRequired { .. } => {
+            return Err(io::Error::other("stable directories requested a fresh scan").into());
+        }
+        ReconcileOutcome::LocalRootChanged => {
+            return Err(io::Error::other("stable directory root changed").into());
+        }
+    };
+
+    assert_eq!(report.planned, 4);
+    assert_eq!(report.replayed_operations, 4);
+    assert_eq!(report.blocked, 0);
+    for path in ["local", "local/child", "remote", "remote/child"] {
+        assert!(root.join(path).is_dir());
+        assert_eq!(
+            journal.baseline(Path::new(path))?,
+            Some(Baseline::Directory)
+        );
+    }
+    assert!(journal.pending_plans()?.is_empty());
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 5);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/2/files/create_folder_v2")
+            .count(),
+        3
+    );
+    Ok(())
+}
+
+#[test]
+fn remote_directory_deletion_removes_local_directories_deepest_first() -> Result<(), Box<dyn Error>>
+{
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [],
+            "cursor": "directories-deleted",
+            "has_more": false
+        })),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-directory-delete")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(root.join("gone/child"))?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_directory_baseline(&mut journal, Path::new("gone"))?;
+    seed_directory_baseline(&mut journal, Path::new("gone/child"))?;
+
+    let report = match reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )? {
+        ReconcileOutcome::Complete(report) => report,
+        ReconcileOutcome::FreshObservationRequired { .. } => {
+            return Err(io::Error::other("stable directory deletion requested a rescan").into());
+        }
+        ReconcileOutcome::LocalRootChanged => {
+            return Err(io::Error::other("directory deletion root changed").into());
+        }
+    };
+
+    assert_eq!(report.planned, 2);
+    assert_eq!(report.replayed_operations, 2);
+    assert!(!root.join("gone").exists());
+    assert_eq!(journal.baseline(Path::new("gone"))?, None);
+    assert_eq!(journal.baseline(Path::new("gone/child"))?, None);
+    assert!(journal.pending_plans()?.is_empty());
+    assert_eq!(server.finish()?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn child_created_after_scan_forces_an_immediate_directory_rescan() -> Result<(), Box<dyn Error>> {
+    let listing = FakeResponse::json(json!({
+        "entries": [],
+        "cursor": "directory-raced-after-scan",
+        "has_more": false
+    }));
+    let (listing, gate) = listing.gated();
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        listing,
+    ])?;
+    let client = Arc::new(fake_client(
+        &server,
+        "opaque-access-post-plan-directory-race",
+    )?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(root.join("gone"))?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_directory_baseline(&mut journal, Path::new("gone"))?;
+
+    let outcome = thread::scope(|scope| -> Result<_, Box<dyn Error>> {
+        let worker = thread::Builder::new().spawn_scoped(scope, || {
+            reconcile_once(
+                &mut journal,
+                &client,
+                &mut downloads,
+                &root,
+                &staging,
+                &recovery,
+            )
+        })?;
+        gate.request_received.recv().map_err(|_| {
+            io::Error::other("fake Dropbox server stopped before the directory listing")
+        })?;
+        std::fs::write(root.join("gone/new.txt"), b"created after scan")?;
+        gate.release_response
+            .send(())
+            .map_err(|_| io::Error::other("directory listing response could not be released"))?;
+        worker
+            .join()
+            .map_err(|_| io::Error::other("directory-race reconciliation stopped unexpectedly"))?
+            .map_err(Into::into)
+    })?;
+
+    assert_eq!(
+        outcome,
+        ReconcileOutcome::FreshObservationRequired {
+            path: PathBuf::from("gone")
+        }
+    );
+    assert_eq!(
+        std::fs::read(root.join("gone/new.txt"))?,
+        b"created after scan"
+    );
+    assert_eq!(
+        journal.baseline(Path::new("gone"))?,
+        Some(Baseline::Directory)
+    );
+    assert!(journal.pending_plans()?.is_empty());
+    assert_eq!(server.finish()?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn nonempty_directory_delete_reobserves_and_syncs_the_new_child() -> Result<(), Box<dyn Error>> {
+    let child_bytes = b"new child";
+    let child_content = dropbox_content_hash(child_bytes.as_slice())?;
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [],
+            "cursor": "parent-deleted",
+            "has_more": false
+        })),
+        FakeResponse::json(json!({
+            "metadata": folder_metadata("/parent", "/parent")
+        })),
+        FakeResponse::json(file_metadata(
+            "/parent/new.txt",
+            "/parent/new.txt",
+            "rev-new-child",
+            &child_content,
+        )),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-directory-race")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(root.join("parent"))?;
+    std::fs::write(root.join("parent/new.txt"), child_bytes)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_directory_baseline(&mut journal, Path::new("parent"))?;
+
+    let outcome = reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?;
+
+    assert_eq!(
+        outcome,
+        ReconcileOutcome::FreshObservationRequired {
+            path: PathBuf::from("parent")
+        }
+    );
+    assert_eq!(std::fs::read(root.join("parent/new.txt"))?, child_bytes);
+    assert_eq!(
+        journal.baseline(Path::new("parent"))?,
+        Some(Baseline::Directory)
+    );
+    assert!(matches!(
+        journal.baseline(Path::new("parent/new.txt"))?,
+        Some(Baseline::Present(_))
+    ));
+    assert!(journal.pending_plans()?.is_empty());
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[2].path, "/2/files/create_folder_v2");
+    assert_eq!(requests[3].path, "/2/files/upload");
+    Ok(())
+}
+
+#[test]
+fn remote_directory_preserves_a_local_file_under_a_synchronized_name() -> Result<(), Box<dyn Error>>
+{
+    let bytes = b"local file preserved beside directory";
+    let content = dropbox_content_hash(bytes.as_slice())?;
+    let identity_prefix = content
+        .as_str()
+        .get(..12)
+        .ok_or_else(|| io::Error::other("test content hash was too short"))?;
+    let variant = format!("node (local file {identity_prefix})");
+    let variant_api = format!("/{variant}");
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [folder_metadata("/node", "/node")],
+            "cursor": "directory-file-collision",
+            "has_more": false
+        })),
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [],
+            "cursor": "directory-file-collision",
+            "has_more": false
+        })),
+        FakeResponse::json(file_metadata(
+            &variant_api,
+            &variant_api,
+            "rev-local-copy",
+            &content,
+        )),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-local-file-directory")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("node"), bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+
+    assert_eq!(
+        reconcile_once(
+            &mut journal,
+            &client,
+            &mut downloads,
+            &root,
+            &staging,
+            &recovery,
+        )?,
+        ReconcileOutcome::FreshObservationRequired {
+            path: PathBuf::from("node")
+        }
+    );
+    assert!(!root.join("node").exists());
+    assert_eq!(std::fs::read(root.join(&variant))?, bytes);
+    assert!(journal.pending_plans()?.is_empty());
+    assert!(journal.conflicts()?.is_empty());
+
+    let report = match reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )? {
+        ReconcileOutcome::Complete(report) => report,
+        ReconcileOutcome::FreshObservationRequired { .. } => {
+            return Err(io::Error::other("preserved local file did not converge").into());
+        }
+        ReconcileOutcome::LocalRootChanged => {
+            return Err(io::Error::other("local file collision changed its root").into());
+        }
+    };
+    assert_eq!(report.planned, 2);
+    assert_eq!(report.replayed_operations, 2);
+    assert!(root.join("node").is_dir());
+    assert_eq!(std::fs::read(root.join(&variant))?, bytes);
+    assert_eq!(
+        journal.baseline(Path::new("node"))?,
+        Some(Baseline::Directory)
+    );
+    assert!(matches!(
+        journal.baseline(Path::new(&variant))?,
+        Some(Baseline::Present(_))
+    ));
+    assert!(journal.conflicts()?.is_empty());
+    assert_eq!(server.finish()?.len(), 5);
+    Ok(())
+}
+
+#[test]
+fn local_directory_preserves_a_dropbox_file_under_a_synchronized_name() -> Result<(), Box<dyn Error>>
+{
+    let bytes = b"Dropbox file preserved beside directory";
+    let content = dropbox_content_hash(bytes.as_slice())?;
+    let identity_prefix = content
+        .as_str()
+        .get(..12)
+        .ok_or_else(|| io::Error::other("test content hash was too short"))?;
+    let variant = format!("node (Dropbox file {identity_prefix})");
+    let variant_api = format!("/{variant}");
+    let variant_lower = variant_api.to_lowercase();
+    let original = file_metadata("/node", "/node", "rev-remote-file", &content);
+    let download = || {
+        FakeResponse::bytes(bytes.to_vec()).header(
+            "Dropbox-API-Result",
+            download_metadata("node", "rev-remote-file", &content, bytes.len()),
+        )
+    };
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [original.clone()],
+            "cursor": "remote-file",
+            "has_more": false
+        })),
+        download(),
+        download(),
+        FakeResponse::json(json!({"metadata": original})),
+        FakeResponse::json(json!({
+            "metadata": folder_metadata("/node", "/node")
+        })),
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [folder_metadata("/node", "/node")],
+            "cursor": "remote-directory",
+            "has_more": false
+        })),
+        FakeResponse::json(json!({
+            "entries": [folder_metadata("/node", "/node")],
+            "cursor": "remote-directory",
+            "has_more": false
+        })),
+        FakeResponse::json(file_metadata(
+            &variant_lower,
+            &variant_api,
+            "rev-dropbox-copy",
+            &content,
+        )),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-remote-file-directory")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(root.join("node"))?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+
+    let first = match reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )? {
+        ReconcileOutcome::Complete(report) => report,
+        ReconcileOutcome::FreshObservationRequired { .. } => {
+            return Err(
+                io::Error::other("stable Dropbox file collision requested a rescan").into(),
+            );
+        }
+        ReconcileOutcome::LocalRootChanged => {
+            return Err(io::Error::other("Dropbox file collision changed its root").into());
+        }
+    };
+    assert_eq!(first.planned, 1);
+    assert_eq!(first.replayed_operations, 3);
+    assert!(root.join("node").is_dir());
+    assert_eq!(std::fs::read(root.join(&variant))?, bytes);
+    assert_eq!(
+        journal.baseline(Path::new("node"))?,
+        Some(Baseline::Directory)
+    );
+    assert!(journal.pending_plans()?.is_empty());
+    assert!(journal.conflicts()?.is_empty());
+    assert_eq!(journal.completed_recoveries()?.len(), 1);
+
+    let second = match reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )? {
+        ReconcileOutcome::Complete(report) => report,
+        ReconcileOutcome::FreshObservationRequired { .. } => {
+            return Err(io::Error::other("Dropbox file copy did not converge").into());
+        }
+        ReconcileOutcome::LocalRootChanged => {
+            return Err(io::Error::other("Dropbox file copy changed its root").into());
+        }
+    };
+    assert_eq!(second.planned, 1);
+    assert_eq!(second.replayed_operations, 1);
+    assert_eq!(std::fs::read(root.join(&variant))?, bytes);
+    assert!(matches!(
+        journal.baseline(Path::new(&variant))?,
+        Some(Baseline::Present(_))
+    ));
+    assert!(journal.conflicts()?.is_empty());
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 10);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/2/files/download")
+            .count(),
+        2
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.path == "/2/files/delete_v2")
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.path == "/2/files/create_folder_v2")
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.path == "/2/files/upload")
+    );
+    Ok(())
+}
+
+#[test]
+fn directory_collision_copy_stays_bound_to_the_verified_root() -> Result<(), Box<dyn Error>> {
+    let bytes = b"descriptor-bound Dropbox file copy";
+    let content = dropbox_content_hash(bytes.as_slice())?;
+    let identity_prefix = content
+        .as_str()
+        .get(..12)
+        .ok_or_else(|| io::Error::other("test content hash was too short"))?;
+    let variant = format!("node (Dropbox file {identity_prefix})");
+    let original = file_metadata("/node", "/node", "rev-root-swap", &content);
+    let visible_download = FakeResponse::bytes(bytes.to_vec()).header(
+        "Dropbox-API-Result",
+        download_metadata("node", "rev-root-swap", &content, bytes.len()),
+    );
+    let (visible_download, gate) = visible_download.gated();
+    let recovery_download = FakeResponse::bytes(bytes.to_vec()).header(
+        "Dropbox-API-Result",
+        download_metadata("node", "rev-root-swap", &content, bytes.len()),
+    );
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [original],
+            "cursor": "root-swap-directory-copy",
+            "has_more": false
+        })),
+        visible_download,
+        recovery_download,
+    ])?;
+    let client = Arc::new(fake_client(
+        &server,
+        "opaque-access-directory-copy-root-swap",
+    )?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let old_root = directory.path().join("old-root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(root.join("node"))?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+
+    let outcome = thread::scope(|scope| -> Result<_, Box<dyn Error>> {
+        let worker = thread::Builder::new().spawn_scoped(scope, || {
+            reconcile_once(
+                &mut journal,
+                &client,
+                &mut downloads,
+                &root,
+                &staging,
+                &recovery,
+            )
+        })?;
+        gate.request_received.recv().map_err(|_| {
+            io::Error::other("fake Dropbox server stopped before the collision download")
+        })?;
+        std::fs::rename(&root, &old_root)?;
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("canary.txt"), b"replacement root")?;
+        gate.release_response
+            .send(())
+            .map_err(|_| io::Error::other("collision download response could not be released"))?;
+        worker
+            .join()
+            .map_err(|_| io::Error::other("root-swap reconciliation stopped unexpectedly"))?
+            .map_err(Into::into)
+    })?;
+
+    assert_eq!(outcome, ReconcileOutcome::LocalRootChanged);
+    assert_eq!(std::fs::read(old_root.join(&variant))?, bytes);
+    assert!(!root.join(&variant).exists());
+    assert_eq!(std::fs::read(root.join("canary.txt"))?, b"replacement root");
+    assert!(journal.pending_plans()?.is_empty());
+    assert_eq!(journal.baseline(Path::new("node"))?, None);
+    assert_eq!(server.finish()?.len(), 4);
+    Ok(())
+}
+
+#[test]
+fn directory_collision_destination_race_requests_a_fresh_scan() -> Result<(), Box<dyn Error>> {
+    let bytes = b"Dropbox bytes that must remain exact";
+    let raced_bytes = b"local file created after observation";
+    let content = dropbox_content_hash(bytes.as_slice())?;
+    let identity_prefix = content
+        .as_str()
+        .get(..12)
+        .ok_or_else(|| io::Error::other("test content hash was too short"))?;
+    let variant = format!("node (Dropbox file {identity_prefix})");
+    let original = file_metadata("/node", "/node", "rev-destination-race", &content);
+    let download = FakeResponse::bytes(bytes.to_vec()).header(
+        "Dropbox-API-Result",
+        download_metadata("node", "rev-destination-race", &content, bytes.len()),
+    );
+    let (download, gate) = download.gated();
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [original],
+            "cursor": "directory-copy-destination-race",
+            "has_more": false
+        })),
+        download,
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-directory-copy-race")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(root.join("node"))?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+
+    let outcome = thread::scope(|scope| -> Result<_, Box<dyn Error>> {
+        let worker = thread::Builder::new().spawn_scoped(scope, || {
+            reconcile_once(
+                &mut journal,
+                &client,
+                &mut downloads,
+                &root,
+                &staging,
+                &recovery,
+            )
+        })?;
+        gate.request_received.recv().map_err(|_| {
+            io::Error::other("fake Dropbox server stopped before the raced copy download")
+        })?;
+        std::fs::write(root.join(&variant), raced_bytes)?;
+        gate.release_response
+            .send(())
+            .map_err(|_| io::Error::other("raced copy response could not be released"))?;
+        worker
+            .join()
+            .map_err(|_| io::Error::other("destination-race reconciliation stopped unexpectedly"))?
+            .map_err(Into::into)
+    })?;
+
+    assert_eq!(
+        outcome,
+        ReconcileOutcome::FreshObservationRequired {
+            path: PathBuf::from("node")
+        }
+    );
+    assert_eq!(std::fs::read(root.join(&variant))?, raced_bytes);
+    assert!(root.join("node").is_dir());
+    assert!(journal.pending_plans()?.is_empty());
+    assert_eq!(journal.baseline(Path::new("node"))?, None);
+    assert_eq!(server.finish()?.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn occupied_collision_stage_uses_the_next_synchronized_name() -> Result<(), Box<dyn Error>> {
+    let bytes = b"Dropbox bytes preserved beside an occupied stage";
+    let content = dropbox_content_hash(bytes.as_slice())?;
+    let identity_prefix = content
+        .as_str()
+        .get(..12)
+        .ok_or_else(|| io::Error::other("test content hash was too short"))?;
+    let first_variant = format!("node (Dropbox file {identity_prefix})");
+    let second_variant = format!("node (Dropbox file {identity_prefix} 2)");
+    let original = file_metadata("/node", "/node", "rev-occupied-stage", &content);
+    let download = || {
+        FakeResponse::bytes(bytes.to_vec()).header(
+            "Dropbox-API-Result",
+            download_metadata("node", "rev-occupied-stage", &content, bytes.len()),
+        )
+    };
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [original.clone()],
+            "cursor": "occupied-directory-copy-stage",
+            "has_more": false
+        })),
+        download(),
+        download(),
+        FakeResponse::json(json!({"metadata": original})),
+        FakeResponse::json(json!({
+            "metadata": folder_metadata("/node", "/node")
+        })),
+    ])?;
+    let client = Arc::new(fake_client(
+        &server,
+        "opaque-access-occupied-directory-copy-stage",
+    )?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(root.join("node"))?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    assert!(matches!(
+        stage_download(&root, Path::new(&first_variant), &content, bytes.as_slice())?,
+        StageOutcome::Staged(())
+    ));
+    let occupied_stage = std::fs::read_dir(&root)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".omabox-download-"))
+        })
+        .ok_or_else(|| io::Error::other("test download stage was not created"))?;
+    std::fs::set_permissions(&occupied_stage, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::write(&occupied_stage, b"unrelated stage bytes")?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+
+    let report = match reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )? {
+        ReconcileOutcome::Complete(report) => report,
+        ReconcileOutcome::FreshObservationRequired { .. } => {
+            return Err(io::Error::other("stable occupied stage requested a rescan").into());
+        }
+        ReconcileOutcome::LocalRootChanged => {
+            return Err(io::Error::other("occupied-stage collision changed its root").into());
+        }
+    };
+
+    assert_eq!(report.planned, 1);
+    assert_eq!(report.replayed_operations, 3);
+    assert!(!root.join(&first_variant).exists());
+    assert_eq!(std::fs::read(root.join(&second_variant))?, bytes);
+    assert_eq!(std::fs::read(&occupied_stage)?, b"unrelated stage bytes");
+    assert_eq!(
+        journal.baseline(Path::new("node"))?,
+        Some(Baseline::Directory)
+    );
+    assert!(journal.pending_plans()?.is_empty());
+    assert!(journal.conflicts()?.is_empty());
+    assert_eq!(server.finish()?.len(), 6);
+    Ok(())
+}
+
+#[test]
+fn changed_dropbox_file_during_directory_conversion_replans_without_a_conflict_row()
+-> Result<(), Box<dyn Error>> {
+    let old_bytes = b"old Dropbox file";
+    let new_bytes = b"new Dropbox file";
+    let old_content = dropbox_content_hash(old_bytes.as_slice())?;
+    let new_content = dropbox_content_hash(new_bytes.as_slice())?;
+    let old = file_metadata("/node", "/node", "rev-old", &old_content);
+    let download = || {
+        FakeResponse::bytes(old_bytes.to_vec()).header(
+            "Dropbox-API-Result",
+            download_metadata("node", "rev-old", &old_content, old_bytes.len()),
+        )
+    };
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [old.clone()],
+            "cursor": "old-file",
+            "has_more": false
+        })),
+        download(),
+        download(),
+        FakeResponse::status_json(409, json!({"error": {".tag": "path"}})),
+        FakeResponse::json(file_metadata("/node", "/node", "rev-new", &new_content)),
+    ])?;
+    let client = Arc::new(fake_client(
+        &server,
+        "opaque-access-directory-revision-race",
+    )?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(root.join("node"))?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+
+    let outcome = reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?;
+
+    assert_eq!(
+        outcome,
+        ReconcileOutcome::FreshObservationRequired {
+            path: PathBuf::from("node")
+        }
+    );
+    assert!(root.join("node").is_dir());
+    let preserved = std::fs::read_dir(&root)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.is_file())
+        .ok_or_else(|| io::Error::other("old Dropbox file copy was not preserved"))?;
+    assert_eq!(std::fs::read(preserved)?, old_bytes);
+    assert!(journal.pending_plans()?.is_empty());
+    assert!(journal.conflicts()?.is_empty());
+    assert_eq!(journal.baseline(Path::new("node"))?, None);
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 6);
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.path == "/2/files/create_folder_v2")
     );
     Ok(())
 }
@@ -2334,7 +3193,7 @@ fn cursor_reset_rebuilds_before_one_complete_publication() -> Result<(), Box<dyn
     ));
     assert_eq!(
         observation(&inventory, Path::new("Folder")),
-        Some(&Observation::Unknown(UnknownReason::Unsupported))
+        Some(&Observation::Directory)
     );
     let requests = server.finish()?;
     assert_eq!(requests.len(), 4);
@@ -2402,7 +3261,7 @@ fn listing_applies_ordered_tree_mutations_across_pages() -> Result<(), Box<dyn E
     for folder in [Path::new("Ancestor"), Path::new("Keep")] {
         assert_eq!(
             observation(&inventory, folder),
-            Some(&Observation::Unknown(UnknownReason::Unsupported))
+            Some(&Observation::Directory)
         );
     }
     assert!(matches!(
@@ -2698,6 +3557,14 @@ fn file_metadata(
     })
 }
 
+fn folder_metadata(path_lower: &str, path_display: &str) -> serde_json::Value {
+    json!({
+        ".tag": "folder",
+        "path_lower": path_lower,
+        "path_display": path_display
+    })
+}
+
 fn download_metadata(path: &str, revision: &str, content: &ContentIdentity, size: usize) -> String {
     json!({
         ".tag": "file",
@@ -2714,7 +3581,10 @@ fn download_metadata(path: &str, revision: &str, content: &ContentIdentity, size
 fn planned_operations(decision: Decision) -> Result<OperationPlan, io::Error> {
     match decision {
         Decision::Operations(operations) => Ok(operations),
-        Decision::NoOp(_) | Decision::Blocked(_) | Decision::Conflict(_) => {
+        Decision::NoOp(_)
+        | Decision::Blocked(_)
+        | Decision::Conflict(_)
+        | Decision::DirectoryCollision(_) => {
             Err(io::Error::other("test expected planned operations"))
         }
     }
@@ -2728,6 +3598,21 @@ fn seed_baseline(journal: &mut Journal, path: &Path, remote: &RemoteFile) -> Res
     );
     let Decision::NoOp(noop) = decision else {
         return Err(io::Error::other("test expected a no-op baseline"));
+    };
+    journal
+        .record_noop(path, &noop)
+        .map(|_| ())
+        .map_err(io::Error::other)
+}
+
+fn seed_directory_baseline(journal: &mut Journal, path: &Path) -> Result<(), io::Error> {
+    let decision = plan(
+        &Baseline::Directory,
+        &Observation::Directory,
+        &Observation::Directory,
+    );
+    let Decision::NoOp(noop) = decision else {
+        return Err(io::Error::other("test expected a directory no-op baseline"));
     };
     journal
         .record_noop(path, &noop)

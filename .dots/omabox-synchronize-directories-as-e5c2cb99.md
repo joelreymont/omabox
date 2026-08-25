@@ -1,9 +1,9 @@
 ---
 title: Synchronize directories as first-class state
-status: open
+status: active
 priority: 0
 issue-type: task
-created-at: "2026-08-24T23:26:41.605487+02:00"
+created-at: "\"2026-08-24T23:26:41.605487+02:00\""
 blocks:
   - omabox-keep-syncing-during-d75d1f5f
 ---
