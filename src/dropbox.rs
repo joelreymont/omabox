@@ -16,7 +16,7 @@ use crate::journal::{
     RemoteObservationRecord,
 };
 use crate::local::{
-    DownloadPreparation, DownloadSlotLease, LocalError, StageOutcome, StagedUpload,
+    DownloadPreparation, DownloadSlotLease, LocalError, StageIoError, StageOutcome, StagedUpload,
     existing_download_stage_at, open_root, prepare_download_slot_at, stage_download_at,
 };
 use crate::model::{ContentIdentity, DropboxRevision, Observation, RemoteFile, UnknownReason};
@@ -717,10 +717,10 @@ impl DropboxClient {
         if let Some(partial) = partial {
             partial
                 .append(metadata.size, &mut reader)
-                .map_err(|source| DropboxError::LocalStage { source })
+                .map_err(download_stage_error)
         } else {
             let staged = stage_download_at(root, root_path, target, &remote.content, &mut reader)
-                .map_err(|source| DropboxError::LocalStage { source })?;
+                .map_err(download_stage_error)?;
             if matches!(
                 &staged,
                 StageOutcome::AlreadyStaged(()) | StageOutcome::DestinationOccupied { .. }
@@ -1450,6 +1450,13 @@ impl DropboxClient {
             tag: "root",
             root: &self.root.namespace_id,
         })
+    }
+}
+
+fn download_stage_error(error: StageIoError) -> DropboxError {
+    match error {
+        StageIoError::Read { source, .. } => DropboxError::DownloadBody { source },
+        StageIoError::Local { source } => DropboxError::LocalStage { source },
     }
 }
 

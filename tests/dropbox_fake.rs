@@ -2218,7 +2218,13 @@ fn interrupted_exact_download_resumes_only_from_a_valid_range() -> Result<(), Bo
     }
 
     let mut replay = || drive_replay(&mut journal, &client, &mut downloads, &root, &staging);
-    assert!(replay()?.is_err());
+    assert!(matches!(
+        replay()?,
+        Err(ReconcileError::RemoteDownload {
+            source: DropboxError::DownloadBody { .. },
+            ..
+        })
+    ));
     let partial = std::fs::read_dir(&staging)?
         .map(|entry| entry.map(|entry| entry.path()))
         .collect::<Result<Vec<_>, _>>()?

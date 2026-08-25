@@ -22,6 +22,7 @@ use thiserror::Error;
 
 const LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const STATUS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 fn main() -> miette::Result<()> {
     if let Err(error) = initialize_logging() {
@@ -63,10 +64,10 @@ fn run_owned(config: &Config, status: Option<&RuntimeStatus>) -> Result<(), Daem
         match run_session(config, &mut journal, status) {
             Ok(()) => continue,
             Err(error) => {
-                let Some(delay) = rate_limit_delay(&error) else {
+                let Some(delay) = retry_delay(&error) else {
                     return Err(error);
                 };
-                wait_for_rate_limit(delay, status);
+                wait_for_retry(delay, status);
             }
         }
     }
@@ -145,10 +146,10 @@ fn run_session(
         {
             Ok(outcome) => outcome,
             Err(error) => {
-                let Some(delay) = rate_limit_delay(&error) else {
+                let Some(delay) = retry_delay(&error) else {
                     return Err(error);
                 };
-                wait_for_rate_limit(delay, status);
+                wait_for_retry(delay, status);
                 continue;
             }
         };
@@ -195,10 +196,10 @@ fn run_session(
             }) {
             Ok(wakeup) => wakeup,
             Err(error) => {
-                let Some(delay) = rate_limit_delay(&error) else {
+                let Some(delay) = retry_delay(&error) else {
                     return Err(error);
                 };
-                wait_for_rate_limit(delay, status);
+                wait_for_retry(delay, status);
                 continue;
             }
         };
@@ -233,10 +234,10 @@ fn activate_configured_root(config: &Config, journal: &mut Journal) -> Result<()
     }
 }
 
-fn wait_for_rate_limit(delay: Duration, status: Option<&RuntimeStatus>) {
+fn wait_for_retry(delay: Duration, status: Option<&RuntimeStatus>) {
     tracing::warn!(
         seconds = delay.as_secs(),
-        "Dropbox rate limited the daemon; retrying after its requested delay"
+        "Dropbox is temporarily unavailable; retrying"
     );
     wait_in_phase(delay, status, DaemonPhase::Backoff);
 }
@@ -275,17 +276,39 @@ fn start_status_heartbeat(status: Option<&RuntimeStatus>) {
     }
 }
 
-fn rate_limit_delay(error: &DaemonError) -> Option<Duration> {
+fn retry_delay(error: &DaemonError) -> Option<Duration> {
     let mut source: &(dyn StdError + 'static) = error;
     loop {
-        if let Some(AuthError::RateLimited { retry_after, .. }) = source.downcast_ref::<AuthError>()
-        {
-            return *retry_after;
+        if let Some(error) = source.downcast_ref::<AuthError>() {
+            match error {
+                AuthError::RateLimited { retry_after, .. } => {
+                    return Some(match retry_after {
+                        Some(delay) => *delay,
+                        None => DEFAULT_RETRY_DELAY,
+                    });
+                }
+                AuthError::Transport { .. }
+                | AuthError::HttpStatus {
+                    status: 500..=599, ..
+                } => return Some(DEFAULT_RETRY_DELAY),
+                _ => {}
+            }
         }
-        if let Some(DropboxError::RateLimited { retry_after, .. }) =
-            source.downcast_ref::<DropboxError>()
-        {
-            return *retry_after;
+        if let Some(error) = source.downcast_ref::<DropboxError>() {
+            match error {
+                DropboxError::RateLimited { retry_after, .. } => {
+                    return Some(match retry_after {
+                        Some(delay) => *delay,
+                        None => DEFAULT_RETRY_DELAY,
+                    });
+                }
+                DropboxError::Transport { .. }
+                | DropboxError::DownloadBody { .. }
+                | DropboxError::HttpStatus {
+                    status: 500..=599, ..
+                } => return Some(DEFAULT_RETRY_DELAY),
+                _ => {}
+            }
         }
         source = source.source()?;
     }
@@ -455,6 +478,7 @@ impl DaemonError {
 #[cfg(test)]
 mod tests {
     use std::error::Error;
+    use std::io;
     use std::path::PathBuf;
 
     use omabox::recovery::RecoveryError;
@@ -488,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn supplied_rate_limit_delays_cross_typed_error_boundaries() {
+    fn retry_delays_cross_typed_error_boundaries() {
         let auth_delay = Duration::from_secs(11);
         let auth = DaemonError::Auth {
             operation: "refresh Dropbox access",
@@ -497,7 +521,7 @@ mod tests {
                 retry_after: Some(auth_delay),
             },
         };
-        assert_eq!(rate_limit_delay(&auth), Some(auth_delay));
+        assert_eq!(retry_delay(&auth), Some(auth_delay));
 
         let dropbox_delay = Duration::from_secs(13);
         let dropbox = DaemonError::Dropbox {
@@ -507,7 +531,7 @@ mod tests {
                 retry_after: Some(dropbox_delay),
             },
         };
-        assert_eq!(rate_limit_delay(&dropbox), Some(dropbox_delay));
+        assert_eq!(retry_delay(&dropbox), Some(dropbox_delay));
 
         let reconcile_delay = Duration::from_secs(17);
         let reconcile = DaemonError::Reconcile {
@@ -518,7 +542,7 @@ mod tests {
                 },
             },
         };
-        assert_eq!(rate_limit_delay(&reconcile), Some(reconcile_delay));
+        assert_eq!(retry_delay(&reconcile), Some(reconcile_delay));
 
         let recovery_delay = Duration::from_secs(19);
         let recovery = DaemonError::Reconcile {
@@ -532,11 +556,24 @@ mod tests {
                 },
             },
         };
-        assert_eq!(rate_limit_delay(&recovery), Some(recovery_delay));
+        assert_eq!(retry_delay(&recovery), Some(recovery_delay));
+
+        let interrupted_download = DaemonError::Reconcile {
+            source: ReconcileError::RemoteDownload {
+                path: PathBuf::from("resume.bin"),
+                source: DropboxError::DownloadBody {
+                    source: io::Error::new(io::ErrorKind::ConnectionReset, "test disconnect"),
+                },
+            },
+        };
+        assert_eq!(
+            retry_delay(&interrupted_download),
+            Some(DEFAULT_RETRY_DELAY)
+        );
     }
 
     #[test]
-    fn missing_delays_and_other_errors_remain_fatal() {
+    fn missing_delays_and_server_errors_use_default_but_permanent_errors_remain_fatal() {
         let missing_delay = DaemonError::Auth {
             operation: "refresh Dropbox access",
             source: AuthError::RateLimited {
@@ -544,16 +581,25 @@ mod tests {
                 retry_after: None,
             },
         };
-        assert_eq!(rate_limit_delay(&missing_delay), None);
+        assert_eq!(retry_delay(&missing_delay), Some(DEFAULT_RETRY_DELAY));
 
-        let ordinary_dropbox = DaemonError::Dropbox {
+        let unavailable_dropbox = DaemonError::Dropbox {
             operation: "wait for Dropbox changes",
             source: DropboxError::HttpStatus {
                 operation: "long poll",
                 status: 503,
             },
         };
-        assert_eq!(rate_limit_delay(&ordinary_dropbox), None);
-        assert_eq!(rate_limit_delay(&DaemonError::SetupRequired), None);
+        assert_eq!(retry_delay(&unavailable_dropbox), Some(DEFAULT_RETRY_DELAY));
+
+        let permanent_dropbox = DaemonError::Dropbox {
+            operation: "wait for Dropbox changes",
+            source: DropboxError::HttpStatus {
+                operation: "long poll",
+                status: 400,
+            },
+        };
+        assert_eq!(retry_delay(&permanent_dropbox), None);
+        assert_eq!(retry_delay(&DaemonError::SetupRequired), None);
     }
 }

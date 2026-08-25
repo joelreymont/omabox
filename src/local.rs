@@ -121,6 +121,38 @@ pub enum LocalError {
     },
 }
 
+/// Failure while copying stage input, preserving whether the source or local storage failed.
+#[derive(Debug, Error)]
+pub(crate) enum StageIoError {
+    /// Reading the supplied byte stream failed.
+    #[error("could not read stage input during `{operation}` for `{path}`")]
+    Read {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    /// A local staging operation failed.
+    #[error(transparent)]
+    Local {
+        #[from]
+        source: LocalError,
+    },
+}
+
+impl From<StageIoError> for LocalError {
+    fn from(error: StageIoError) -> Self {
+        match error {
+            StageIoError::Read {
+                operation,
+                path,
+                source,
+            } => io_failure(operation, &path, source),
+            StageIoError::Local { source } => source,
+        }
+    }
+}
+
 /// A hashing failure from the source stream.
 #[derive(Debug, Error)]
 pub enum HashError {
@@ -350,12 +382,13 @@ impl DownloadPartial {
         mut self,
         total: u64,
         reader: &mut impl Read,
-    ) -> Result<StageOutcome<()>, LocalError> {
+    ) -> Result<StageOutcome<()>, StageIoError> {
         if self.offset > total {
             return Err(LocalError::ChangedDuringRead {
                 operation: "validate resumed download size",
                 path: self.location.target.clone(),
-            });
+            }
+            .into());
         }
 
         let mut block = vec![0_u8; DROPBOX_BLOCK_SIZE];
@@ -364,8 +397,10 @@ impl DownloadPartial {
             let block_length = remaining.min(DROPBOX_BLOCK_SIZE as u64) as usize;
             reader
                 .read_exact(&mut block[..block_length])
-                .map_err(|source| {
-                    io_failure("read resumed download", &self.location.target, source)
+                .map_err(|source| StageIoError::Read {
+                    operation: "read resumed download",
+                    path: self.location.target.clone(),
+                    source,
                 })?;
             self.file
                 .write_all(&block[..block_length])
@@ -380,16 +415,22 @@ impl DownloadPartial {
             }
         }
         let mut extra = [0_u8; 1];
-        if reader.read(&mut extra).map_err(|source| {
-            io_failure("finish resumed download", &self.location.target, source)
-        })? != 0
+        if reader
+            .read(&mut extra)
+            .map_err(|source| StageIoError::Read {
+                operation: "finish resumed download",
+                path: self.location.target.clone(),
+                source,
+            })?
+            != 0
         {
             return Err(LocalError::ChangedDuringRead {
                 operation: "validate resumed download length",
                 path: self.location.target.clone(),
-            });
+            }
+            .into());
         }
-        self.finish()
+        self.finish().map_err(Into::into)
     }
 
     fn persist_checkpoint(&mut self) -> Result<(), LocalError> {
@@ -1081,7 +1122,7 @@ pub fn stage_download(
 ) -> Result<StageOutcome<()>, LocalError> {
     let root = root.as_ref();
     let root_fd = open_absolute_directory(root, "open sync root for download staging")?;
-    stage_download_at(&root_fd, root, target, expected, bytes)
+    stage_download_at(&root_fd, root, target, expected, bytes).map_err(Into::into)
 }
 
 pub(crate) fn stage_download_at(
@@ -1090,13 +1131,14 @@ pub(crate) fn stage_download_at(
     target: impl AsRef<Path>,
     expected: &ContentIdentity,
     mut bytes: impl Read,
-) -> Result<StageOutcome<()>, LocalError> {
+) -> Result<StageOutcome<()>, StageIoError> {
     require_content_hash(expected, "stage download")?;
     let target = target.as_ref();
     let Some((parent, _, _)) = open_parent(root, target, true)? else {
         return Err(LocalError::UnsafeRelativePath {
             path: target.to_path_buf(),
-        });
+        }
+        .into());
     };
     let name = internal_name("download", target, expected);
     let marker = internal_name("download-marker-v1", target, expected);
@@ -1110,7 +1152,7 @@ pub(crate) fn stage_download_at(
         ExistingPolicy::OwnedDownload(marker.as_bytes()),
         "stage download",
     )?;
-    map_stage_write(result, || ())
+    Ok(map_stage_write(result, || ())?)
 }
 
 pub(crate) fn existing_download_stage_at(
@@ -3083,7 +3125,7 @@ fn write_verified_stage(
     reader: &mut impl Read,
     policy: ExistingPolicy<'_>,
     operation: &'static str,
-) -> Result<StageWrite, LocalError> {
+) -> Result<StageWrite, StageIoError> {
     let marker = match policy {
         ExistingPolicy::OwnedDownload(marker) => Some(marker),
         ExistingPolicy::ReplacePrivate | ExistingPolicy::Preserve => None,
@@ -3143,7 +3185,8 @@ fn write_verified_stage(
                 return Err(LocalError::ChangedDuringRead {
                     operation,
                     path: display_path.to_path_buf(),
-                });
+                }
+                .into());
             };
             if reuse_verified_stage(&file, &existing, expected, marker, directory, display_path)? {
                 Ok(StageWrite::Reused)
@@ -3155,15 +3198,14 @@ fn write_verified_stage(
                     ExistingPolicy::ReplacePrivate => Err(LocalError::DestinationOccupied {
                         operation,
                         path: display_path.to_path_buf(),
-                    }),
+                    }
+                    .into()),
                 }
             }
         }
-        Err(source) => Err(syscall_failure(
-            "install verified private stage",
-            display_path,
-            source,
-        )),
+        Err(source) => {
+            Err(syscall_failure("install verified private stage", display_path, source).into())
+        }
     }
 }
 
@@ -3172,7 +3214,7 @@ fn copy_and_hash(
     writer: &mut File,
     path: &Path,
     operation: &'static str,
-) -> Result<ContentIdentity, LocalError> {
+) -> Result<ContentIdentity, StageIoError> {
     let mut aggregate = Sha256::new();
     let mut block = vec![0_u8; DROPBOX_BLOCK_SIZE];
     loop {
@@ -3180,7 +3222,11 @@ fn copy_and_hash(
         while filled < block.len() {
             let count = reader
                 .read(&mut block[filled..])
-                .map_err(|source| io_failure(operation, path, source))?;
+                .map_err(|source| StageIoError::Read {
+                    operation,
+                    path: path.to_path_buf(),
+                    source,
+                })?;
             if count == 0 {
                 break;
             }
