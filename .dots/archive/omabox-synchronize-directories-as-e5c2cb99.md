@@ -1,9 +1,11 @@
 ---
 title: Synchronize directories as first-class state
-status: active
+status: closed
 priority: 0
 issue-type: task
-created-at: "\"2026-08-24T23:26:41.605487+02:00\""
+created-at: "\"\\\"2026-08-24T23:26:41.605487+02:00\\\"\""
+closed-at: "2026-08-25T12:26:31.445848+02:00"
+close-reason: Landed as 2a11f6b6. Schema v5 journals directories; local effects are descriptor-relative, nonrecursive, and race-safe; Dropbox folders are first-class without remote folder deletion; file/directory collisions preserve exact file bytes under deterministic synchronized names. Verified fmt, clippy -D warnings, 201 tests including crash/fake/property/snapshot coverage, diff/forbidden scans, and independent Sol review CLEAN.
 blocks:
   - omabox-keep-syncing-during-d75d1f5f
 ---
