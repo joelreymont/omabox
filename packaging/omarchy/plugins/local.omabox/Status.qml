@@ -32,8 +32,8 @@ Item {
   property string actionProcessError: ""
   property bool settingsPending: false
   property bool actionPending: false
-  property bool stoppedByPanel: false
-  property double stoppedAt: 0
+  property bool pausedByPanel: false
+  property double pausedAt: 0
   readonly property int speedWindowMs: 1000
   readonly property int speedHistoryCapacity: 30
   readonly property bool commandBusy: settingsPending || actionPending
@@ -44,7 +44,7 @@ Item {
   readonly property bool hasError: availability === "malformed"
     || (snapshot && (snapshot.phase === "error" || snapshot.last_error !== null))
     || settingsError !== "" || actionError !== ""
-  readonly property var transfers: ready ? snapshot.transfers : []
+  readonly property var transfers: ready && !pausedByPanel ? snapshot.transfers : []
   readonly property real aggregateBytesDone: {
     var total = 0
     for (var index = 0; index < transfers.length; index += 1)
@@ -131,15 +131,14 @@ Item {
     actionProcess.running = true
   }
 
-  function controlService(action) {
-    if (commandBusy || ["start", "stop", "restart"].indexOf(action) < 0) return
+  function controlSync(action) {
+    if (commandBusy || ["pause", "resume"].indexOf(action) < 0) return
     actionKind = action
     actionOutput = ""
     actionProcessError = ""
-    actionMessage = action === "start" ? "Starting service…"
-      : (action === "stop" ? "Stopping service…" : "Restarting service…")
+    actionMessage = action === "pause" ? "Pausing sync…" : "Resuming sync…"
     actionError = ""
-    actionProcess.command = ["omabox", "service", action]
+    actionProcess.command = ["omabox", action]
     actionPending = true
     actionProcess.running = true
   }
@@ -154,9 +153,8 @@ Item {
     }
     var messages = {
       "set-root": "Sync folder changed.",
-      "start": "Service started.",
-      "stop": "Service stopped.",
-      "restart": "Service restarted."
+      "pause": "Sync paused.",
+      "resume": "Sync resumed."
     }
     return { ok: true, message: messages[kind] || "Done.", error: "" }
   }
@@ -166,11 +164,13 @@ Item {
     actionMessage = result.message
     actionError = result.error
     if (result.ok) {
-      if (kind === "stop") {
-        stoppedByPanel = true
-        stoppedAt = Math.floor(Date.now() / 1000)
-      } else if (kind === "start" || kind === "restart") {
-        stoppedByPanel = false
+      if (kind === "pause") {
+        pausedByPanel = true
+        pausedAt = Math.floor(Date.now() / 1000)
+        clearSample()
+        clearHistory()
+      } else if (kind === "resume") {
+        pausedByPanel = false
       }
       actionMessageTimer.restart()
     }
@@ -345,7 +345,7 @@ Item {
     snapshot = next
     availability = "ready"
     nowMs = receivedAt
-    if (stoppedByPanel && next.updated_at > stoppedAt) stoppedByPanel = false
+    if (pausedByPanel && next.updated_at > pausedAt) pausedByPanel = false
   }
 
   FileView {

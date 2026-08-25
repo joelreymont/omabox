@@ -21,14 +21,14 @@ Panel {
   readonly property var transfers: status.transfers
   readonly property bool rootConfirmationOpen: pendingSyncRoot !== ""
   readonly property bool alerting: status.hasError
-  readonly property bool inactive: status.stoppedByPanel || status.availability === "missing" || status.stale
+  readonly property bool inactive: status.pausedByPanel || status.availability === "missing" || status.stale
     || (snapshot && snapshot.phase === "backoff")
   readonly property color stateColor: alerting ? urgent : (inactive ? dim : foreground)
   readonly property string stateTitle: titleForState()
   readonly property string stateDetail: detailForState()
 
   function titleForState() {
-    if (status.stoppedByPanel) return "Service stopped"
+    if (status.pausedByPanel) return "Sync paused"
     if (status.availability === "missing") return "Service stopped"
     if (status.availability === "malformed") return "Status unavailable"
     if (status.stale) return "Service not updating"
@@ -43,7 +43,7 @@ Panel {
   }
 
   function detailForState() {
-    if (status.stoppedByPanel) return "Start the service to resume syncing."
+    if (status.pausedByPanel) return "Select Resume to continue syncing."
     if (status.availability === "missing") return "Omabox has not published a status snapshot."
     if (status.availability === "malformed") return "Omabox published an unreadable status snapshot."
     if (status.stale) return "Last update " + relativeTime(snapshot.updated_at) + "."
@@ -137,15 +137,14 @@ Panel {
   }
 
   function ensureActionCursor() {
-    actionIndex = Math.max(firstActionIndex(), Math.min(5, actionIndex))
+    actionIndex = Math.max(firstActionIndex(), Math.min(4, actionIndex))
   }
 
   function actionItem(index) {
     if (index === 0) return chooseFolderButton
-    if (index === 1) return startButton
-    if (index === 2) return stopButton
-    if (index === 3) return restartButton
-    if (index === 4) return setupHelpButton
+    if (index === 1) return pauseButton
+    if (index === 2) return resumeButton
+    if (index === 3) return setupHelpButton
     return logsButton
   }
 
@@ -167,7 +166,7 @@ Panel {
 
   function setActionCursor(index) {
     cursorActive = true
-    actionIndex = Math.max(firstActionIndex(), Math.min(5, index))
+    actionIndex = Math.max(firstActionIndex(), Math.min(4, index))
     scrollActionIntoView(actionItem(actionIndex))
   }
 
@@ -214,7 +213,7 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.snapshot && root.snapshot.phase === "syncing" ? "󰓦" : ""
+    text: !status.pausedByPanel && root.snapshot && root.snapshot.phase === "syncing" ? "󰓦" : ""
     foreground: root.stateColor
     tooltipText: root.stateTitle
     onPressed: root.toggle()
@@ -437,40 +436,28 @@ Panel {
             spacing: Style.space(6)
 
             Button {
-              id: startButton
-              width: (serviceButtons.width - serviceButtons.spacing * 2) / 3
-              text: "Start"
+              id: pauseButton
+              width: (serviceButtons.width - serviceButtons.spacing) / 2
+              text: "Pause"
               foreground: root.foreground
               fontFamily: root.fontFamily
               bordered: true
               enabled: !status.commandBusy
               hasCursor: root.cursorActive && root.actionIndex === 1
               onHovered: function(isHovered) { if (isHovered) root.setActionCursor(1) }
-              onClicked: status.controlService("start")
+              onClicked: status.controlSync("pause")
             }
             Button {
-              id: stopButton
-              width: (serviceButtons.width - serviceButtons.spacing * 2) / 3
-              text: "Stop"
+              id: resumeButton
+              width: (serviceButtons.width - serviceButtons.spacing) / 2
+              text: "Resume"
               foreground: root.foreground
               fontFamily: root.fontFamily
               bordered: true
               enabled: !status.commandBusy
               hasCursor: root.cursorActive && root.actionIndex === 2
               onHovered: function(isHovered) { if (isHovered) root.setActionCursor(2) }
-              onClicked: status.controlService("stop")
-            }
-            Button {
-              id: restartButton
-              width: (serviceButtons.width - serviceButtons.spacing * 2) / 3
-              text: "Restart"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              bordered: true
-              enabled: !status.commandBusy
-              hasCursor: root.cursorActive && root.actionIndex === 3
-              onHovered: function(isHovered) { if (isHovered) root.setActionCursor(3) }
-              onClicked: status.controlService("restart")
+              onClicked: status.controlSync("resume")
             }
           }
 
@@ -485,8 +472,8 @@ Panel {
               text: "Setup help"
               foreground: root.foreground
               fontFamily: root.fontFamily
-              hasCursor: root.cursorActive && root.actionIndex === 4
-              onHovered: function(isHovered) { if (isHovered) root.setActionCursor(4) }
+              hasCursor: root.cursorActive && root.actionIndex === 3
+              onHovered: function(isHovered) { if (isHovered) root.setActionCursor(3) }
               onClicked: { root.close(); status.openSetupHelp() }
             }
             Button {
@@ -495,8 +482,8 @@ Panel {
               text: "Logs"
               foreground: root.foreground
               fontFamily: root.fontFamily
-              hasCursor: root.cursorActive && root.actionIndex === 5
-              onHovered: function(isHovered) { if (isHovered) root.setActionCursor(5) }
+              hasCursor: root.cursorActive && root.actionIndex === 4
+              onHovered: function(isHovered) { if (isHovered) root.setActionCursor(4) }
               onClicked: { root.close(); status.openLogs() }
             }
           }

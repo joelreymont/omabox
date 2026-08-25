@@ -17,7 +17,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 const HELP: &str = "Omabox synchronizes a local directory with Dropbox.\n\n\
-Usage:\n  omabox setup [REMOTE_ROOT]\n  omabox setup --sync-root PATH --app-key KEY [--remote-root ROOT]\n  omabox status\n  omabox settings [--json]\n  omabox settings set-root PATH\n  omabox install|upgrade|uninstall\n  omabox service start|stop|restart|enable|disable|status\n  omabox logs\n  omabox --help\n  omabox --version\n\n\
+Usage:\n  omabox setup [REMOTE_ROOT]\n  omabox setup --sync-root PATH --app-key KEY [--remote-root ROOT]\n  omabox status\n  omabox pause|resume\n  omabox settings [--json]\n  omabox settings set-root PATH\n  omabox install|upgrade|uninstall\n  omabox service start|stop|restart|enable|disable|status\n  omabox logs\n  omabox --help\n  omabox --version\n\n\
 The Dropbox app key is public. Omabox never requests or stores an app secret.\n";
 const USAGE: &str = "Run `omabox --help` for usage.";
 const AUTHORIZATION_CODE_LIMIT: usize = 8192;
@@ -84,6 +84,8 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, CliEr
         Some("--version" | "-V") if rest.is_empty() => Ok(Command::Version),
         Some("setup") => parse_setup(rest).map(Command::Setup),
         Some("status") if rest.is_empty() => Ok(Command::Status),
+        Some("pause") if rest.is_empty() => Ok(Command::Service(ServiceAction::Stop)),
+        Some("resume") if rest.is_empty() => Ok(Command::Service(ServiceAction::Start)),
         Some("settings") => parse_settings(rest),
         Some("install") if rest.is_empty() => Ok(Command::Install(InstallAction::Install)),
         Some("upgrade") if rest.is_empty() => Ok(Command::Install(InstallAction::Upgrade)),
@@ -91,8 +93,8 @@ fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Command, CliEr
         Some("service") => parse_service(rest),
         Some("logs") if rest.is_empty() => Ok(Command::Logs),
         Some(
-            "status" | "logs" | "install" | "upgrade" | "uninstall" | "--help" | "-h" | "help"
-            | "--version" | "-V",
+            "status" | "pause" | "resume" | "logs" | "install" | "upgrade" | "uninstall" | "--help"
+            | "-h" | "help" | "--version" | "-V",
         ) => Err(CliError::Usage("too many arguments")),
         Some(_) => Err(CliError::Usage("unknown command")),
         None => Err(CliError::Usage("the command must be valid UTF-8")),
@@ -672,6 +674,14 @@ mod tests {
         assert_eq!(parse(arguments(&["--help"]))?, Command::Help);
         assert_eq!(parse(arguments(&["--version"]))?, Command::Version);
         assert_eq!(
+            parse(arguments(&["pause"]))?,
+            Command::Service(ServiceAction::Stop)
+        );
+        assert_eq!(
+            parse(arguments(&["resume"]))?,
+            Command::Service(ServiceAction::Start)
+        );
+        assert_eq!(
             parse(arguments(&["setup"]))?,
             Command::Setup(SetupOptions {
                 remote_root: String::new(),
@@ -737,6 +747,8 @@ mod tests {
             Vec::<OsString>::new(),
             arguments(&["unknown"]),
             arguments(&["status", "extra"]),
+            arguments(&["pause", "extra"]),
+            arguments(&["resume", "extra"]),
             arguments(&["install", "extra"]),
             arguments(&["setup", "--sync-root", "/tmp/Dropbox"]),
             arguments(&[

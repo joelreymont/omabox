@@ -8,8 +8,10 @@ written to disk.
 
 The panel reads the current sync folder from `omabox settings --json`. Its
 folder picker always asks for confirmation before running `omabox settings
-set-root`. Start, stop, restart, logs, and setup help also go through the
-documented `omabox` CLI; the widget has no daemon IPC or companion process.
+set-root`. Pause and Resume run `omabox pause` and `omabox resume`; stopping the
+service leaves staged transfers and journal state ready to continue safely.
+Logs and setup help also go through the documented `omabox` CLI; the widget has
+no daemon IPC or companion process.
 Setup help opens `omabox --help` in a held terminal so first-time setup shows
 the required sync-root and public app-key arguments instead of running a bare
 setup command that cannot succeed without configuration.

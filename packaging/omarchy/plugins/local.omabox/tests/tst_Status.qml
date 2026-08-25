@@ -25,6 +25,11 @@ TestCase {
     autoRefreshSettings: false
   }
 
+  Status {
+    id: pauseStatus
+    autoRefreshSettings: false
+  }
+
   function test_normalizes_concurrent_transfers() {
     var snapshot = status.normalize(JSON.stringify({
       version: 2,
@@ -62,7 +67,7 @@ TestCase {
     verify(!processFailureStatus.settingsPending)
     verify(processFailureStatus.settingsError.indexOf("available in PATH") >= 0)
 
-    processFailureStatus.actionKind = "restart"
+    processFailureStatus.actionKind = "pause"
     processFailureStatus.actionPending = true
     processFailureStatus.actionStoppedWithoutExit()
     verify(!processFailureStatus.actionPending)
@@ -78,13 +83,36 @@ TestCase {
   }
 
   function test_action_results_keep_cli_errors_actionable() {
-    var success = status.actionResult("restart", 0, "", "")
+    var success = status.actionResult("resume", 0, "", "")
     verify(success.ok)
-    compare(success.message, "Service restarted.")
+    compare(success.message, "Sync resumed.")
 
     var failure = status.actionResult("set-root", 1, "", "Wait for sync, then retry.\n")
     verify(!failure.ok)
     compare(failure.error, "Wait for sync, then retry.")
+  }
+
+  function test_pause_hides_stale_progress_until_resume() {
+    pauseStatus.apply(JSON.stringify({
+      version: 2,
+      phase: "syncing",
+      transfers: [
+        { direction: "download", path: "/large", bytes_done: 10, bytes_total: 20 }
+      ],
+      last_error: null,
+      updated_at: 42
+    }))
+    compare(pauseStatus.transfers.length, 1)
+
+    pauseStatus.applyActionResult("pause", 0, "", "")
+    verify(pauseStatus.pausedByPanel)
+    verify(!pauseStatus.hasError)
+    compare(pauseStatus.transfers.length, 0)
+    compare(pauseStatus.actionMessage, "Sync paused.")
+
+    pauseStatus.applyActionResult("resume", 0, "", "")
+    verify(!pauseStatus.pausedByPanel)
+    compare(pauseStatus.actionMessage, "Sync resumed.")
   }
 
   function test_bandwidth_history_is_bounded_and_in_memory() {
