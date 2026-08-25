@@ -1,9 +1,11 @@
 ---
 title: Complete Omabox dashboard
-status: active
+status: closed
 priority: 1
 issue-type: task
-created-at: "\"2026-08-24T23:35:56.094701+02:00\""
+created-at: "\"\\\"2026-08-24T23:35:56.094701+02:00\\\"\""
+closed-at: "2026-08-25T17:13:20.166112+02:00"
+close-reason: "landed and verified: dashboard source plus severity fix commit 0e8e0152; Qt 6 mocked suite 10/10, plugin validation, full Rust gate and release build passed; live plugin published while unlocked, QuickShell PID 2572357 unchanged with no new coredump/QML error, and live runtime snapshots showed real transfers"
 blocks:
   - omabox-make-widget-upgrades-e1eda907
 ---
