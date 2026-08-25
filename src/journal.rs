@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::model::{
-    Baseline, Conflict, ContentIdentity, LocalObservation, NoOpDecision, Operation, OperationPlan,
-    RemoteObservation,
+    Baseline, Conflict, ContentIdentity, LocalObservation, NoOpDecision, Observation, Operation,
+    OperationPlan, RemoteObservation,
 };
 
 const MIGRATION_V1: &str = include_str!("../migrations/0001.sql");
@@ -187,6 +187,8 @@ pub struct RemoteInventory {
 pub(crate) enum RemoteInventoryChange {
     /// Insert or replace one observed path by canonical Dropbox identity.
     Upsert(RemoteObservationRecord),
+    /// Materialize a missing ancestor without replacing its authoritative casing.
+    EnsureDirectory(RemoteObservationRecord),
     /// Remove one path and every descendant below it.
     DeleteSubtree { canonical_path: PathBuf },
 }
@@ -998,6 +1000,11 @@ impl Journal {
                 canonical_path: Vec<u8>,
                 observation: String,
             },
+            EnsureDirectory {
+                path: Vec<u8>,
+                canonical_path: Vec<u8>,
+                observation: String,
+            },
             DeleteSubtree {
                 canonical_path: Vec<u8>,
                 descendant_prefix: Vec<u8>,
@@ -1008,7 +1015,8 @@ impl Journal {
         let encoded = changes
             .iter()
             .map(|change| match change {
-                RemoteInventoryChange::Upsert(record) => {
+                RemoteInventoryChange::Upsert(record)
+                | RemoteInventoryChange::EnsureDirectory(record) => {
                     if record.canonical_path != dropbox_canonical_path(&record.path) {
                         return Err(JournalError::InvalidState {
                             operation: "validate remote inventory delta",
@@ -1016,15 +1024,33 @@ impl Journal {
                             detail: "canonical path does not match display path",
                         });
                     }
-                    Ok(EncodedChange::Upsert {
-                        path: path_bytes(&record.path),
-                        canonical_path: path_bytes(&record.canonical_path),
-                        observation: encode(
-                            &record.observation,
-                            "serialize remote inventory delta",
-                            &record.path,
-                        )?,
-                    })
+                    let path = path_bytes(&record.path);
+                    let canonical_path = path_bytes(&record.canonical_path);
+                    let observation = encode(
+                        &record.observation,
+                        "serialize remote inventory delta",
+                        &record.path,
+                    )?;
+                    if matches!(change, RemoteInventoryChange::EnsureDirectory(_)) {
+                        if record.observation != Observation::Directory {
+                            return Err(JournalError::InvalidState {
+                                operation: "validate remote inventory delta",
+                                path: record.path.clone(),
+                                detail: "ensured remote ancestor is not a directory",
+                            });
+                        }
+                        Ok(EncodedChange::EnsureDirectory {
+                            path,
+                            canonical_path,
+                            observation,
+                        })
+                    } else {
+                        Ok(EncodedChange::Upsert {
+                            path,
+                            canonical_path,
+                            observation,
+                        })
+                    }
                 }
                 RemoteInventoryChange::DeleteSubtree { canonical_path } => {
                     if canonical_path.as_os_str().is_empty() {
@@ -1073,6 +1099,25 @@ impl Journal {
                         )
                         .map_err(|source| {
                             sqlite("upsert remote inventory delta", &database_path, source)
+                        })?;
+                }
+                EncodedChange::EnsureDirectory {
+                    path,
+                    canonical_path,
+                    observation,
+                } => {
+                    transaction
+                        .execute(
+                            "INSERT INTO remote_observations(\
+                                 path, observation_json, canonical_path\
+                             ) VALUES (?1, ?2, ?3) \
+                             ON CONFLICT(canonical_path) DO UPDATE SET \
+                                 observation_json = excluded.observation_json \
+                             WHERE observation_json != excluded.observation_json",
+                            params![path, observation, canonical_path],
+                        )
+                        .map_err(|source| {
+                            sqlite("ensure remote inventory directory", &database_path, source)
                         })?;
                 }
                 EncodedChange::DeleteSubtree {
@@ -1125,6 +1170,36 @@ impl Journal {
             )
             .optional()
             .map_err(|source| sqlite("read remote cursor", &self.database_path, source))
+    }
+
+    pub(crate) fn remote_directory_paths(&self) -> Result<Vec<(PathBuf, PathBuf)>, JournalError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT canonical_path, path FROM remote_observations \
+                 WHERE observation_json = '\"Directory\"' ORDER BY canonical_path",
+            )
+            .map_err(|source| {
+                sqlite(
+                    "prepare remote directory path query",
+                    &self.database_path,
+                    source,
+                )
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|source| {
+                sqlite("query remote directory paths", &self.database_path, source)
+            })?;
+        rows.map(|row| {
+            row.map(|(canonical, path)| (bytes_path(canonical), bytes_path(path)))
+                .map_err(|source| {
+                    sqlite("read remote directory paths", &self.database_path, source)
+                })
+        })
+        .collect()
     }
 
     /// Load a mutually consistent remote cursor and inventory snapshot.

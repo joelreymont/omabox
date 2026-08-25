@@ -1,6 +1,7 @@
 //! Documented blocking Dropbox operations.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -470,7 +471,10 @@ impl DropboxClient {
             .remote_cursor()
             .map_err(|source| DropboxError::Journal { source })?;
         if let Some(cursor) = current_cursor {
-            match self.cursor_delta(&cursor)? {
+            let directories = journal
+                .remote_directory_paths()
+                .map_err(|source| DropboxError::Journal { source })?;
+            match self.cursor_delta(&cursor, &directories)? {
                 CursorDelta::Changes { changes, cursor } => {
                     journal
                         .apply_remote_inventory_delta(&cursor, &changes)
@@ -1337,7 +1341,11 @@ impl DropboxClient {
         }
     }
 
-    fn cursor_delta(&self, initial_cursor: &str) -> Result<CursorDelta, DropboxError> {
+    fn cursor_delta(
+        &self,
+        initial_cursor: &str,
+        directories: &[(PathBuf, PathBuf)],
+    ) -> Result<CursorDelta, DropboxError> {
         let mut changes = Vec::new();
         let mut previous = initial_cursor.to_owned();
         loop {
@@ -1347,6 +1355,7 @@ impl DropboxClient {
             };
             append_entry_changes(&self.root, &mut changes, page.entries)?;
             if !page.has_more {
+                normalize_inventory_changes(&mut changes, directories)?;
                 return Ok(CursorDelta::Changes {
                     changes,
                     cursor: page.cursor,
@@ -2126,6 +2135,18 @@ fn apply_entries(
                     .to_owned();
                 records.insert(key, record);
             }
+            RemoteInventoryChange::EnsureDirectory(record) => {
+                let key = record
+                    .canonical_path
+                    .to_str()
+                    .ok_or(DropboxError::InvalidEntryPath)?
+                    .to_owned();
+                if let Some(existing) = records.get_mut(&key) {
+                    existing.observation = Observation::Directory;
+                } else {
+                    records.insert(key, record);
+                }
+            }
             RemoteInventoryChange::DeleteSubtree { canonical_path } => {
                 let key = canonical_path
                     .to_str()
@@ -2134,7 +2155,7 @@ fn apply_entries(
             }
         }
     }
-    Ok(())
+    normalize_inventory_records(records)
 }
 
 fn append_entry_changes(
@@ -2200,12 +2221,122 @@ fn append_parent_folders(changes: &mut Vec<RemoteInventoryChange>, key: &str, pa
     let display = path.iter().collect::<Vec<_>>();
     for depth in 1..lower.len() {
         let parent_key = lower[..depth].join("/");
-        changes.push(RemoteInventoryChange::Upsert(RemoteObservationRecord {
-            canonical_path: PathBuf::from(&parent_key),
-            path: display[..depth].iter().copied().collect(),
-            observation: Observation::Directory,
-        }));
+        changes.push(RemoteInventoryChange::EnsureDirectory(
+            RemoteObservationRecord {
+                canonical_path: PathBuf::from(&parent_key),
+                path: display[..depth].iter().copied().collect(),
+                observation: Observation::Directory,
+            },
+        ));
     }
+}
+
+fn normalize_inventory_records(
+    records: &mut BTreeMap<String, RemoteObservationRecord>,
+) -> Result<(), DropboxError> {
+    let directories = directory_casing(records.values().filter_map(|record| {
+        (record.observation == Observation::Directory)
+            .then_some((&record.canonical_path, &record.path))
+    }))?;
+    for record in records.values_mut() {
+        record.path = normalized_remote_path(&record.canonical_path, &record.path, &directories)?;
+    }
+    Ok(())
+}
+
+fn normalize_inventory_changes(
+    changes: &mut [RemoteInventoryChange],
+    existing_directories: &[(PathBuf, PathBuf)],
+) -> Result<(), DropboxError> {
+    let mut directories = directory_casing(
+        existing_directories
+            .iter()
+            .map(|(canonical, path)| (canonical, path)),
+    )?;
+    for change in changes.iter() {
+        match change {
+            RemoteInventoryChange::Upsert(record) => {
+                if record.observation == Observation::Directory {
+                    insert_directory_casing(
+                        &mut directories,
+                        &record.canonical_path,
+                        &record.path,
+                    )?;
+                }
+            }
+            RemoteInventoryChange::EnsureDirectory(record) => {
+                if !directories.contains_key(&record.canonical_path) {
+                    insert_directory_casing(
+                        &mut directories,
+                        &record.canonical_path,
+                        &record.path,
+                    )?;
+                }
+            }
+            RemoteInventoryChange::DeleteSubtree { canonical_path } => {
+                directories.retain(|candidate, _| !candidate.starts_with(canonical_path));
+            }
+        }
+    }
+    for change in changes {
+        match change {
+            RemoteInventoryChange::Upsert(record)
+            | RemoteInventoryChange::EnsureDirectory(record) => {
+                record.path =
+                    normalized_remote_path(&record.canonical_path, &record.path, &directories)?;
+            }
+            RemoteInventoryChange::DeleteSubtree { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn directory_casing<'a>(
+    paths: impl IntoIterator<Item = (&'a PathBuf, &'a PathBuf)>,
+) -> Result<BTreeMap<PathBuf, OsString>, DropboxError> {
+    let mut directories = BTreeMap::new();
+    for (canonical, path) in paths {
+        insert_directory_casing(&mut directories, canonical, path)?;
+    }
+    Ok(directories)
+}
+
+fn insert_directory_casing(
+    directories: &mut BTreeMap<PathBuf, OsString>,
+    canonical: &Path,
+    path: &Path,
+) -> Result<(), DropboxError> {
+    let component = path
+        .file_name()
+        .ok_or(DropboxError::InvalidEntryPath)?
+        .to_os_string();
+    directories.insert(canonical.to_path_buf(), component);
+    Ok(())
+}
+
+fn normalized_remote_path(
+    canonical: &Path,
+    path: &Path,
+    directories: &BTreeMap<PathBuf, OsString>,
+) -> Result<PathBuf, DropboxError> {
+    let canonical_components = canonical.iter().collect::<Vec<_>>();
+    let display_components = path.iter().collect::<Vec<_>>();
+    if canonical_components.len() != display_components.len() {
+        return Err(DropboxError::InvalidEntryPath);
+    }
+    let mut prefix = PathBuf::new();
+    let mut normalized = PathBuf::new();
+    for (canonical_component, display_component) in
+        canonical_components.into_iter().zip(display_components)
+    {
+        prefix.push(canonical_component);
+        normalized.push(
+            directories
+                .get(&prefix)
+                .map_or(display_component, OsString::as_os_str),
+        );
+    }
+    Ok(normalized)
 }
 
 fn remove_subtree(records: &mut BTreeMap<String, RemoteObservationRecord>, key: &str) {
@@ -2545,6 +2676,61 @@ mod tests {
         assert_eq!(
             records["paper"].observation,
             Observation::Unknown(UnknownReason::Unsupported)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn directory_records_normalize_inconsistent_child_ancestor_casing() -> Result<(), Box<dyn Error>>
+    {
+        let root = DropboxRoot::new("account", "namespace", "")?;
+        let mut records = BTreeMap::new();
+        apply_entries(
+            &root,
+            &mut records,
+            vec![ListEntry {
+                tag: EntryTag::Folder,
+                path_lower: Some(String::from("/apps")),
+                path_display: Some(String::from("/apps")),
+                rev: None,
+                content_hash: None,
+                is_downloadable: true,
+                symlink_info: None,
+                sharing_info: None,
+            }],
+        )?;
+        apply_entries(
+            &root,
+            &mut records,
+            vec![
+                ListEntry {
+                    tag: EntryTag::File,
+                    path_lower: Some(String::from("/apps/day one/entry.doentry")),
+                    path_display: Some(String::from("/Apps/day one/Entry.doentry")),
+                    rev: Some(String::from(TEST_REVISION)),
+                    content_hash: Some(String::from(TEST_CONTENT_HASH)),
+                    is_downloadable: true,
+                    symlink_info: None,
+                    sharing_info: None,
+                },
+                ListEntry {
+                    tag: EntryTag::Folder,
+                    path_lower: Some(String::from("/apps/day one")),
+                    path_display: Some(String::from("/Apps/Day One")),
+                    rev: None,
+                    content_hash: None,
+                    is_downloadable: true,
+                    symlink_info: None,
+                    sharing_info: None,
+                },
+            ],
+        )?;
+
+        assert_eq!(records["apps"].path, Path::new("apps"));
+        assert_eq!(records["apps/day one"].path, Path::new("apps/Day One"));
+        assert_eq!(
+            records["apps/day one/entry.doentry"].path,
+            Path::new("apps/Day One/Entry.doentry")
         );
         Ok(())
     }

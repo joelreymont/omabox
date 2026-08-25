@@ -526,6 +526,105 @@ fn one_reconciliation_pass_synchronizes_empty_and_nested_directories() -> Result
 }
 
 #[test]
+fn fresh_download_uses_parent_directory_casing_without_remote_writes() -> Result<(), Box<dyn Error>>
+{
+    let bytes = b"Dropbox source bytes";
+    let content = dropbox_content_hash(bytes.as_slice())?;
+    let account = || {
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        }))
+    };
+    let server = FakeServer::start(vec![
+        account(),
+        FakeResponse::json(json!({
+            "entries": [
+                folder_metadata("/apps", "/apps"),
+                file_metadata(
+                    "/apps/entry.doentry",
+                    "/Apps/Entry.doentry",
+                    "remote-rev",
+                    &content,
+                )
+            ],
+            "cursor": "fresh-case",
+            "has_more": false
+        })),
+        FakeResponse::bytes(bytes.to_vec())
+            .header(
+                "Dropbox-API-Result",
+                download_metadata("apps/Entry.doentry", "remote-rev", &content, bytes.len()),
+            )
+            .for_path("/2/files/download"),
+        account(),
+        FakeResponse::json(json!({
+            "entries": [file_metadata(
+                "/apps/second.doentry",
+                "/Apps/Second.doentry",
+                "remote-rev-2",
+                &content,
+            )],
+            "cursor": "fresh-case-2",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder/continue"),
+        FakeResponse::bytes(bytes.to_vec())
+            .header(
+                "Dropbox-API-Result",
+                download_metadata("apps/Second.doentry", "remote-rev-2", &content, bytes.len()),
+            )
+            .for_path("/2/files/download"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-fresh-case")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+
+    let _ = reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?;
+    let replay = drive_replay(&mut journal, &client, &mut downloads, &root, &staging)??;
+    assert_eq!(replay.completed_operations, 1);
+    assert_eq!(std::fs::read(root.join("apps/Entry.doentry"))?, bytes);
+    assert!(!root.join("Apps").exists());
+
+    let second = reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?;
+    assert!(matches!(second, ReconcileOutcome::Complete(_)));
+    let replay = drive_replay(&mut journal, &client, &mut downloads, &root, &staging)??;
+    assert_eq!(replay.completed_operations, 1);
+    assert_eq!(std::fs::read(root.join("apps/Second.doentry"))?, bytes);
+    assert!(journal.pending_plans()?.is_empty());
+
+    let requests = server.finish()?;
+    assert!(requests.iter().all(|request| {
+        request.path != "/2/files/create_folder_v2"
+            && request.path != "/2/files/upload"
+            && request.path != "/2/files/delete_v2"
+    }));
+    Ok(())
+}
+
+#[test]
 fn remote_directory_deletion_removes_local_directories_deepest_first() -> Result<(), Box<dyn Error>>
 {
     let server = FakeServer::start(vec![
