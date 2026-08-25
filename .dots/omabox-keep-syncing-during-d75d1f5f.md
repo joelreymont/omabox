@@ -1,9 +1,9 @@
 ---
 title: Keep syncing during transfers
-status: open
+status: active
 priority: 0
 issue-type: task
-created-at: "2026-08-24T23:42:04.711741+02:00"
+created-at: "\"2026-08-24T23:42:04.711741+02:00\""
 blocks:
   - omabox-resume-interrupted-exact-08dc4996
 ---

@@ -36,6 +36,8 @@ fn exact_download_agent() -> ureq::Agent {
         .http_status_as_error(false)
         .timeout_connect(Some(Duration::from_secs(CONNECT_SECONDS)))
         .timeout_recv_body(Some(Duration::from_secs(DOWNLOAD_SECONDS)))
+        .max_idle_connections(4)
+        .max_idle_connections_per_host(4)
         .build();
     ureq::Agent::new_with_config(config)
 }
@@ -347,6 +349,7 @@ pub struct DropboxClient {
     root: DropboxRoot,
     endpoints: DropboxEndpoints,
     agent: ureq::Agent,
+    download_agent: ureq::Agent,
     transfer_observer: Option<TransferObserver>,
 }
 
@@ -374,6 +377,7 @@ impl DropboxClient {
             root,
             endpoints,
             agent: ureq::Agent::new_with_config(config),
+            download_agent: exact_download_agent(),
             transfer_observer: None,
         }
     }
@@ -620,7 +624,8 @@ impl DropboxClient {
         let authorization = format!("Bearer {}", self.access_token.expose());
         let path_root = self.path_root_header()?;
         let url = self.endpoints.content("/files/download");
-        let request = exact_download_agent()
+        let request = self
+            .download_agent
             .post(&url)
             .header("Authorization", &authorization)
             .header("Dropbox-API-Path-Root", &path_root)
@@ -2243,6 +2248,8 @@ mod tests {
             timeouts.recv_body,
             Some(Duration::from_secs(DOWNLOAD_SECONDS))
         );
+        assert_eq!(agent.config().max_idle_connections(), 4);
+        assert_eq!(agent.config().max_idle_connections_per_host(), 4);
     }
 
     struct ByteAtATime(Cursor<Vec<u8>>);
