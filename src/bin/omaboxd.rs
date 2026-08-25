@@ -146,6 +146,10 @@ fn run_session(
         {
             Ok(outcome) => outcome,
             Err(error) => {
+                if access_token_expired(&error) {
+                    tracing::info!("Dropbox access token expired; refreshing the session");
+                    return Ok(());
+                }
                 let Some(delay) = retry_delay(&error) else {
                     return Err(error);
                 };
@@ -196,6 +200,10 @@ fn run_session(
             }) {
             Ok(wakeup) => wakeup,
             Err(error) => {
+                if access_token_expired(&error) {
+                    tracing::info!("Dropbox access token expired; refreshing the session");
+                    return Ok(());
+                }
                 let Some(delay) = retry_delay(&error) else {
                     return Err(error);
                 };
@@ -311,6 +319,22 @@ fn retry_delay(error: &DaemonError) -> Option<Duration> {
             }
         }
         source = source.source()?;
+    }
+}
+
+fn access_token_expired(error: &DaemonError) -> bool {
+    let mut source: &(dyn StdError + 'static) = error;
+    loop {
+        if matches!(
+            source.downcast_ref::<DropboxError>(),
+            Some(DropboxError::HttpStatus { status: 401, .. })
+        ) {
+            return true;
+        }
+        let Some(next) = source.source() else {
+            return false;
+        };
+        source = next;
     }
 }
 
@@ -601,5 +625,28 @@ mod tests {
         };
         assert_eq!(retry_delay(&permanent_dropbox), None);
         assert_eq!(retry_delay(&DaemonError::SetupRequired), None);
+    }
+
+    #[test]
+    fn expired_session_token_is_distinct_from_permanent_client_errors() {
+        let expired = DaemonError::Reconcile {
+            source: ReconcileError::RemoteDownload {
+                path: PathBuf::from("expired.bin"),
+                source: DropboxError::HttpStatus {
+                    operation: "download exact Dropbox revision",
+                    status: 401,
+                },
+            },
+        };
+        assert!(access_token_expired(&expired));
+
+        let forbidden = DaemonError::Dropbox {
+            operation: "wait for Dropbox changes",
+            source: DropboxError::HttpStatus {
+                operation: "long poll",
+                status: 403,
+            },
+        };
+        assert!(!access_token_expired(&forbidden));
     }
 }

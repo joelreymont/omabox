@@ -25,5 +25,6 @@ Omabox is a native, ARM64-first Dropbox sync service for Omarchy. It is written 
 - Run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` before landing Rust changes.
 - Run the relevant `formal/*.tla` model with TLC after changing durable replay.
 - Separate real Dropbox API integration tests from unit tests.
+- Classify and test every external or filesystem failure; repeated identical input must not crash-loop or stop unrelated sync work.
 - Never weaken a safety invariant to make a test pass.
 - Never commit credentials, OAuth tokens, test accounts, or other secrets.
