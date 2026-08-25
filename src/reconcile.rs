@@ -715,56 +715,11 @@ fn reconcile_published(
         .map(|plan| (dropbox_canonical_path(&plan.path), plan))
         .collect::<BTreeMap<_, _>>();
     let baselines = journal.baselines()?;
-    let mut paths = Vec::with_capacity(baselines.len() + local.len() + remote.len());
-    paths.extend(baselines.iter().map(|record| record.canonical_path.clone()));
-    paths.extend(
-        local
-            .iter()
-            .map(|(canonical_path, _)| canonical_path.clone()),
-    );
-    paths.extend(remote.iter().map(|record| record.canonical_path.clone()));
-    paths.sort();
-    paths.dedup();
-    let mut baselines = baselines.into_iter().peekable();
-    let mut decisions = Vec::with_capacity(paths.len());
-    for canonical_path in paths {
-        let baseline_record = if baselines
-            .peek()
-            .is_some_and(|record| record.canonical_path == canonical_path)
-        {
-            baselines.next()
-        } else {
-            None
-        };
-        let (baseline_path, baseline) = match baseline_record {
-            Some(BaselineRecord { path, baseline, .. }) => (Some(path), baseline),
-            None => (None, Baseline::Absent),
-        };
-        let local_record = find_local(&local, &canonical_path);
-        let remote_record = find_remote(&remote, &canonical_path);
-        let absent_local = Observation::ConfirmedAbsent;
-        let local_observation = local_record.map_or(&absent_local, |record| &record.observation);
-        let absent_remote = Observation::ConfirmedAbsent;
-        let remote_observation = remote_record.map_or(&absent_remote, |record| &record.observation);
-        let path = local_record
-            .map(|record| record.path.clone())
-            .or_else(|| remote_record.map(|record| record.path.clone()))
-            .or(baseline_path)
-            .ok_or_else(|| invalid(&canonical_path, "canonical path has no display spelling"))?;
-        let decision = plan(&baseline, local_observation, remote_observation);
-        let baseline_matches_noop = matches!(
-            &decision,
-            Decision::NoOp(noop) if &baseline == noop.baseline()
-        );
-        decisions.push(PathDecision {
-            canonical_path,
-            path,
-            baseline_matches_noop,
-            decision,
-        });
-    }
-    decisions.sort_by(order_path_decisions);
     let conflicts = journal.conflicts()?;
+    let conflict_paths = conflicts
+        .iter()
+        .map(|record| dropbox_canonical_path(&record.path))
+        .collect::<BTreeSet<_>>();
     let mut report = ReconcileReport {
         replayed_operations: replay.completed_operations,
         ..ReconcileReport::default()
@@ -777,12 +732,59 @@ fn reconcile_published(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
-    let conflict_paths = conflicts
-        .iter()
-        .map(|record| dropbox_canonical_path(&record.path))
-        .collect::<BTreeSet<_>>();
-    let mut blocked_paths = BTreeSet::new();
     let mut noops = Vec::new();
+    let mut decisions = Vec::new();
+    for_each_known_path(
+        baselines,
+        &local,
+        &remote,
+        |canonical_path,
+         baseline_record,
+         local_record,
+         remote_record|
+         -> Result<(), ReconcileError> {
+            let (baseline_path, baseline) = match baseline_record {
+                Some(BaselineRecord { path, baseline, .. }) => (Some(path), baseline),
+                None => (None, Baseline::Absent),
+            };
+            let absent_local = Observation::ConfirmedAbsent;
+            let local_observation =
+                local_record.map_or(&absent_local, |record| &record.observation);
+            let absent_remote = Observation::ConfirmedAbsent;
+            let remote_observation =
+                remote_record.map_or(&absent_remote, |record| &record.observation);
+            let path = local_record
+                .map(|record| record.path.clone())
+                .or_else(|| remote_record.map(|record| record.path.clone()))
+                .or(baseline_path)
+                .ok_or_else(|| {
+                    invalid(&canonical_path, "canonical path has no display spelling")
+                })?;
+            let decision = plan(&baseline, local_observation, remote_observation);
+            let baseline_matches_noop = matches!(
+                &decision,
+                Decision::NoOp(noop) if &baseline == noop.baseline()
+            );
+            match decision {
+                Decision::NoOp(noop) if !pending.contains_key(&canonical_path) => {
+                    if baseline_matches_noop && !conflict_paths.contains(&canonical_path) {
+                        report.noops += 1;
+                    } else {
+                        noops.push((path, noop));
+                    }
+                }
+                decision => decisions.push(PathDecision {
+                    canonical_path,
+                    path,
+                    baseline_matches_noop,
+                    decision,
+                }),
+            }
+            Ok(())
+        },
+    )?;
+    decisions.sort_by(order_path_decisions);
+    let mut blocked_paths = BTreeSet::new();
     let mut plans = Vec::new();
 
     for PathDecision {
@@ -1443,6 +1445,62 @@ fn find_remote<'a>(
     records.get(index)
 }
 
+fn for_each_known_path<E>(
+    baselines: Vec<BaselineRecord>,
+    local: &[(PathBuf, LocalObservationRecord)],
+    remote: &[RemoteObservationRecord],
+    mut visit: impl FnMut(
+        PathBuf,
+        Option<BaselineRecord>,
+        Option<&LocalObservationRecord>,
+        Option<&RemoteObservationRecord>,
+    ) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut baselines = baselines.into_iter().peekable();
+    let mut local_index = 0;
+    let mut remote_index = 0;
+    loop {
+        let next = [
+            baselines
+                .peek()
+                .map(|record| record.canonical_path.as_path()),
+            local
+                .get(local_index)
+                .map(|(canonical_path, _)| canonical_path.as_path()),
+            remote
+                .get(remote_index)
+                .map(|record| record.canonical_path.as_path()),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let Some(canonical_path) = next.map(Path::to_path_buf) else {
+            return Ok(());
+        };
+        let baseline = if baselines
+            .peek()
+            .is_some_and(|record| record.canonical_path == canonical_path)
+        {
+            baselines.next()
+        } else {
+            None
+        };
+        let local_record = local
+            .get(local_index)
+            .and_then(|(path, record)| (path == &canonical_path).then_some(record));
+        if local_record.is_some() {
+            local_index += 1;
+        }
+        let remote_record = remote
+            .get(remote_index)
+            .and_then(|record| (record.canonical_path == canonical_path).then_some(record));
+        if remote_record.is_some() {
+            remote_index += 1;
+        }
+        visit(canonical_path, baseline, local_record, remote_record)?;
+    }
+}
+
 fn invalid(path: &Path, detail: &'static str) -> ReconcileError {
     ReconcileError::InvalidJournalState {
         path: path.to_path_buf(),
@@ -1504,6 +1562,52 @@ mod tests {
                     != dropbox_canonical_path(&forward.destination)
             });
             prop_assert!(destination_is_unique);
+        }
+
+        #[test]
+        fn known_path_merge_matches_set_union(
+            baseline_paths in prop::collection::btree_set("[a-z]{1,8}", 0..32),
+            local_paths in prop::collection::btree_set("[a-z]{1,8}", 0..32),
+            remote_paths in prop::collection::btree_set("[a-z]{1,8}", 0..32),
+        ) {
+            let baselines = baseline_paths
+                .iter()
+                .map(|path| BaselineRecord {
+                    canonical_path: PathBuf::from(path),
+                    path: PathBuf::from(path),
+                    baseline: Baseline::Directory,
+                })
+                .collect::<Vec<_>>();
+            let local = local_map(local_records(local_paths.iter().map(PathBuf::from)))
+                .map_err(|error| TestCaseError::fail(error.to_string()))?;
+            let remote = remote_paths
+                .iter()
+                .map(|path| RemoteObservationRecord {
+                    canonical_path: PathBuf::from(path),
+                    path: PathBuf::from(path),
+                    observation: Observation::Directory,
+                })
+                .collect::<Vec<_>>();
+            let mut merged = Vec::new();
+            for_each_known_path(
+                baselines,
+                &local,
+                &remote,
+                |path, baseline, local, remote| -> Result<(), TestCaseError> {
+                    prop_assert!(baseline.is_some() || local.is_some() || remote.is_some());
+                    merged.push(path);
+                    Ok(())
+                },
+            )?;
+            let expected = baseline_paths
+                .iter()
+                .chain(&local_paths)
+                .chain(&remote_paths)
+                .map(PathBuf::from)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            prop_assert_eq!(merged, expected);
         }
     }
 
