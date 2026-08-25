@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+use std::os::unix::fs::{FileExt as _, FileTypeExt as _, PermissionsExt as _};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1718,12 +1718,11 @@ fn changed_dropbox_file_during_directory_conversion_replans_without_a_conflict_r
 }
 
 #[test]
-fn large_replace_uses_a_sequential_upload_session_and_recovers_a_stored_append()
--> Result<(), Box<dyn Error>> {
+fn large_replace_resumes_a_partially_stored_upload_chunk() -> Result<(), Box<dyn Error>> {
     const MIB: u64 = 1024 * 1024;
     const CHUNK: u64 = 32 * MIB;
     const SIZE: u64 = 150 * MIB + 1;
-    let fixture = sparse_upload_fixture(SIZE)?;
+    let fixture = sparse_upload_fixture(SIZE, CHUNK / 2)?;
     let content = fixture.staged.content().clone();
     let session_id = "opaque-session-must-not-appear-in-errors";
     let server = FakeServer::start(vec![
@@ -1734,10 +1733,11 @@ fn large_replace_uses_a_sequential_upload_session_and_recovers_a_stored_append()
                 "error_summary": "incorrect_offset/...",
                 "error": {
                     ".tag": "incorrect_offset",
-                    "correct_offset": CHUNK
+                    "correct_offset": CHUNK / 2
                 }
             }),
         ),
+        FakeResponse::json(json!({})),
         FakeResponse::json(json!({})),
         FakeResponse::json(json!({})),
         FakeResponse::json(json!({})),
@@ -1764,14 +1764,15 @@ fn large_replace_uses_a_sequential_upload_session_and_recovers_a_stored_append()
     );
 
     let requests = server.finish()?;
-    assert_eq!(requests.len(), 7);
+    assert_eq!(requests.len(), 8);
     assert_eq!(requests[0].path, "/2/files/upload_session/start");
     assert_eq!(requests[1].path, "/2/files/upload_session/append_v2");
     assert_eq!(requests[2].path, "/2/files/upload_session/append_v2");
     assert_eq!(requests[3].path, "/2/files/upload_session/append_v2");
     assert_eq!(requests[4].path, "/2/files/upload_session/append_v2");
     assert_eq!(requests[5].path, "/2/files/upload_session/append_v2");
-    assert_eq!(requests[6].path, "/2/files/upload_session/finish");
+    assert_eq!(requests[6].path, "/2/files/upload_session/append_v2");
+    assert_eq!(requests[7].path, "/2/files/upload_session/finish");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(required_header(
             &requests[0],
@@ -1779,9 +1780,10 @@ fn large_replace_uses_a_sequential_upload_session_and_recovers_a_stored_append()
         )?)?,
         json!({"close": false})
     );
-    for (request, offset) in requests[1..6]
-        .iter()
-        .zip([0, CHUNK, 2 * CHUNK, 3 * CHUNK, 4 * CHUNK])
+    for (request, offset) in
+        requests[1..7]
+            .iter()
+            .zip([0, CHUNK / 2, CHUNK, 2 * CHUNK, 3 * CHUNK, 4 * CHUNK])
     {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(required_header(
@@ -1796,7 +1798,7 @@ fn large_replace_uses_a_sequential_upload_session_and_recovers_a_stored_append()
     }
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(required_header(
-            &requests[6],
+            &requests[7],
             "dropbox-api-arg",
         )?)?,
         json!({
@@ -1811,11 +1813,13 @@ fn large_replace_uses_a_sequential_upload_session_and_recovers_a_stored_append()
     );
     assert!(requests[0].body.is_empty());
     assert_eq!(u64::try_from(requests[1].body.len())?, CHUNK);
-    assert_eq!(u64::try_from(requests[2].body.len())?, CHUNK);
+    assert_eq!(u64::try_from(requests[2].body.len())?, CHUNK / 2);
+    assert_eq!(requests[2].body.first(), Some(&0xa5));
     assert_eq!(u64::try_from(requests[3].body.len())?, CHUNK);
     assert_eq!(u64::try_from(requests[4].body.len())?, CHUNK);
-    assert_eq!(u64::try_from(requests[5].body.len())?, SIZE - 4 * CHUNK);
-    assert!(requests[6].body.is_empty());
+    assert_eq!(u64::try_from(requests[5].body.len())?, CHUNK);
+    assert_eq!(u64::try_from(requests[6].body.len())?, SIZE - 4 * CHUNK);
+    assert!(requests[7].body.is_empty());
     assert_eq!(
         requests
             .iter()
@@ -1825,7 +1829,7 @@ fn large_replace_uses_a_sequential_upload_session_and_recovers_a_stored_append()
                     .checked_add(length)
                     .ok_or_else(|| io::Error::other("captured upload length overflowed"))
             })?,
-        SIZE
+        SIZE + CHUNK / 2
     );
     Ok(())
 }
@@ -4105,12 +4109,13 @@ fn upload_fixture(bytes: &[u8]) -> Result<UploadFixture, Box<dyn Error>> {
     })
 }
 
-fn sparse_upload_fixture(size: u64) -> Result<UploadFixture, Box<dyn Error>> {
+fn sparse_upload_fixture(size: u64, marker_offset: u64) -> Result<UploadFixture, Box<dyn Error>> {
     let root = TempDir::new()?;
     let staging = TempDir::new()?;
     let source = root.path().join("payload");
     let file = std::fs::File::create(&source)?;
     file.set_len(size)?;
+    file.write_all_at(&[0xa5], marker_offset)?;
     let identity = dropbox_content_hash(std::fs::File::open(&source)?)?;
     let staged = match stage_upload(root.path(), "payload", staging.path(), &identity)? {
         StageOutcome::Staged(staged) | StageOutcome::AlreadyStaged(staged) => staged,

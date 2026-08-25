@@ -1141,17 +1141,23 @@ impl DropboxClient {
         offset: u64,
         next: u64,
     ) -> Result<(), DropboxError> {
-        let length = next
-            .checked_sub(offset)
-            .ok_or(DropboxError::UploadSessionOffsetOverflow)?;
-        let argument = ascii_json(&UploadSessionAppendRequest {
-            cursor: UploadSessionCursor { session_id, offset },
-            close: false,
-        })?;
         let url = self.endpoints.content("/files/upload_session/append_v2");
-        for attempt in 0..=1 {
+        let mut requested_offset = offset;
+        let mut transport_retry_available = true;
+        let mut offset_correction_available = true;
+        loop {
+            let length = next
+                .checked_sub(requested_offset)
+                .ok_or(DropboxError::UploadSessionOffsetOverflow)?;
+            let argument = ascii_json(&UploadSessionAppendRequest {
+                cursor: UploadSessionCursor {
+                    session_id,
+                    offset: requested_offset,
+                },
+                close: false,
+            })?;
             reader
-                .seek(SeekFrom::Start(offset))
+                .seek(SeekFrom::Start(requested_offset))
                 .map_err(|source| DropboxError::UploadStageSeek { source })?;
             let mut body = reader.take(length);
             let response = agent
@@ -1163,7 +1169,10 @@ impl DropboxClient {
                 .header("Content-Length", length.to_string())
                 .send(ureq::SendBody::from_reader(&mut body));
             match response {
-                Err(_) if attempt == 0 => continue,
+                Err(_) if transport_retry_available => {
+                    transport_retry_available = false;
+                    continue;
+                }
                 Err(source) => {
                     return Err(DropboxError::Transport {
                         operation: "append Dropbox upload session",
@@ -1185,15 +1194,22 @@ impl DropboxClient {
                             })?
                             .incorrect_offset();
                         if let Some(correct_offset) = offset_error {
-                            return if correct_offset == next {
-                                Ok(())
-                            } else {
-                                Err(DropboxError::IncorrectUploadSessionOffset {
-                                    requested_offset: offset,
-                                    chunk_bytes: length,
-                                    correct_offset,
-                                })
-                            };
+                            if correct_offset == next {
+                                return Ok(());
+                            }
+                            if offset_correction_available
+                                && correct_offset != requested_offset
+                                && (offset..next).contains(&correct_offset)
+                            {
+                                requested_offset = correct_offset;
+                                offset_correction_available = false;
+                                continue;
+                            }
+                            return Err(DropboxError::IncorrectUploadSessionOffset {
+                                requested_offset,
+                                chunk_bytes: length,
+                                correct_offset,
+                            });
                         }
                     }
                     return Err(status_failure(
@@ -1204,7 +1220,6 @@ impl DropboxClient {
                 }
             }
         }
-        Err(DropboxError::UploadSessionOffsetOverflow)
     }
 
     fn resolve_mutation_status(
