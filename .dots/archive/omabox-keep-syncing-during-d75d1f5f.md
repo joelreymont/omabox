@@ -1,9 +1,11 @@
 ---
 title: Keep syncing during transfers
-status: active
+status: closed
 priority: 0
 issue-type: task
-created-at: "\"2026-08-24T23:42:04.711741+02:00\""
+created-at: "\"\\\"2026-08-24T23:42:04.711741+02:00\\\"\""
+closed-at: "2026-08-25T11:41:56.926537+02:00"
+close-reason: landed a833087e; 184 Rust tests, clippy/fmt, forbidden-pattern scan, Sol verification, and full TLC model check all clean
 blocks:
   - omabox-resume-interrupted-exact-08dc4996
 ---
