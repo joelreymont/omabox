@@ -228,8 +228,12 @@ struct HashJob {
 }
 
 struct HashWorkerOutput {
-    records: Vec<(usize, ScannedHash)>,
-    failure: Option<(usize, LocalError)>,
+    results: Vec<(usize, Result<ScannedHash, LocalError>)>,
+}
+
+struct ScanHashResults {
+    records: Vec<ScannedHash>,
+    changed: Vec<PathBuf>,
 }
 
 struct ScannedHash {
@@ -762,18 +766,17 @@ fn finish_scan_at(
     max_workers: usize,
     completed_cutoff: fn() -> Option<HashCacheCutoff>,
 ) -> Result<CompleteScan, LocalError> {
-    let mut records = hash_scan_files(
+    let mut hashed = hash_scan_files(
         &pending.root_fd,
         &pending.hash_jobs,
         max_workers,
         completed_cutoff,
     )?;
-    records.extend(revalidate_cached_files(
-        &pending.root_fd,
-        pending.cached_files,
-    )?);
-    let mut reusable_hashes = Vec::with_capacity(records.len());
-    for scanned in records {
+    let cached = revalidate_cached_files(&pending.root_fd, pending.cached_files)?;
+    hashed.records.extend(cached.records);
+    hashed.changed.extend(cached.changed);
+    let mut reusable_hashes = Vec::with_capacity(hashed.records.len());
+    for scanned in hashed.records {
         let record = scanned.record;
         pending.observations.push(LocalObservationRecord {
             path: record.path.clone(),
@@ -783,6 +786,15 @@ fn finish_scan_at(
             reusable_hashes.push(record);
         }
     }
+    pending.observations.extend(
+        hashed
+            .changed
+            .into_iter()
+            .map(|path| LocalObservationRecord {
+                path,
+                observation: Observation::Unknown(UnknownReason::Incomplete),
+            }),
+    );
     revalidate_directories(&pending.root_fd, &pending.directories)?;
     let rebound = open_absolute_directory(&pending.root, "reopen sync root after scan")?;
     let rebound_stat = stat_fd(
@@ -2465,18 +2477,20 @@ fn scan_directory(
                 let file = open_relative_at(directory, &name, &path, OFlags::RDONLY)?;
                 let opened = stat_fd(&file, &path, "inspect opened scan file")?;
                 if !same_inode(&probe_stat, &opened) {
-                    return Err(LocalError::ChangedDuringRead {
-                        operation: "open scanned file",
+                    entries.observations.push(LocalObservationRecord {
                         path,
+                        observation: Observation::Unknown(UnknownReason::Incomplete),
                     });
+                    continue;
                 }
                 let fingerprint = file_fingerprint(&opened, &path)?;
                 let after = stat_fd(&file, &path, "verify enumerated scan file")?;
                 if !same_observation(&opened, &after) {
-                    return Err(LocalError::ChangedDuringRead {
-                        operation: "enumerate scanned file",
+                    entries.observations.push(LocalObservationRecord {
                         path,
+                        observation: Observation::Unknown(UnknownReason::Incomplete),
                     });
+                    continue;
                 }
                 match cache.get(&path) {
                     Some(record)
@@ -2536,9 +2550,12 @@ fn hash_scan_files(
     jobs: &[HashJob],
     max_workers: usize,
     completed_cutoff: fn() -> Option<HashCacheCutoff>,
-) -> Result<Vec<ScannedHash>, LocalError> {
+) -> Result<ScanHashResults, LocalError> {
     if jobs.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ScanHashResults {
+            records: Vec::new(),
+            changed: Vec::new(),
+        });
     }
     let available_workers = thread::available_parallelism().map_or(1, |count| count.get());
     let worker_count = max_workers.min(available_workers).max(1).min(jobs.len());
@@ -2551,18 +2568,13 @@ fn hash_scan_files(
             match thread::Builder::new()
                 .name(format!("omabox-local-hash-{worker}"))
                 .spawn_scoped(scope, move || {
-                    let mut records = Vec::new();
-                    let mut failure = None;
+                    let mut results = Vec::new();
                     loop {
                         let index = next_job.fetch_add(1, Ordering::Relaxed);
                         let Some(job) = jobs.get(index) else {
-                            return HashWorkerOutput { records, failure };
+                            return HashWorkerOutput { results };
                         };
-                        match hash_scan_file(root, job, completed_cutoff) {
-                            Ok(record) => records.push((index, record)),
-                            Err(error) if failure.is_none() => failure = Some((index, error)),
-                            Err(_) => {}
-                        }
+                        results.push((index, hash_scan_file(root, job, completed_cutoff)));
                     }
                 }) {
                 Ok(handle) => handles.push((worker, handle)),
@@ -2573,17 +2585,11 @@ fn hash_scan_files(
             }
         }
 
-        let mut records = Vec::with_capacity(jobs.len());
-        let mut failures = Vec::new();
+        let mut results = Vec::with_capacity(jobs.len());
         let mut terminated_worker = None;
         for (worker, handle) in handles {
             match handle.join() {
-                Ok(output) => {
-                    records.extend(output.records);
-                    if let Some(failure) = output.failure {
-                        failures.push(failure);
-                    }
-                }
+                Ok(output) => results.extend(output.results),
                 Err(_) if terminated_worker.is_none() => terminated_worker = Some(worker),
                 Err(_) => {}
             }
@@ -2594,11 +2600,17 @@ fn hash_scan_files(
         if let Some(error) = spawn_failure {
             return Err(error);
         }
-        if let Some((_, error)) = failures.into_iter().min_by_key(|(index, _)| *index) {
-            return Err(error);
+        results.sort_by_key(|(index, _)| *index);
+        let mut records = Vec::with_capacity(results.len());
+        let mut changed = Vec::new();
+        for (_, result) in results {
+            match result {
+                Ok(record) => records.push(record),
+                Err(LocalError::ChangedDuringRead { path, .. }) => changed.push(path),
+                Err(error) => return Err(error),
+            }
         }
-        records.sort_by_key(|(index, _)| *index);
-        Ok(records.into_iter().map(|(_, record)| record).collect())
+        Ok(ScanHashResults { records, changed })
     })
 }
 
@@ -2637,30 +2649,27 @@ fn hash_scan_file(
 fn revalidate_cached_files(
     root: &OwnedFd,
     cached_files: Vec<LocalHashRecord>,
-) -> Result<Vec<ScannedHash>, LocalError> {
+) -> Result<ScanHashResults, LocalError> {
     let mut records = Vec::with_capacity(cached_files.len());
+    let mut changed = Vec::new();
     for record in cached_files {
         let file = open_relative_regular(root, &record.path, "reopen cached scan file")?;
         let before = stat_fd(&file, &record.path, "revalidate cached scan file")?;
         if file_fingerprint(&before, &record.path)? != record.fingerprint {
-            return Err(LocalError::ChangedDuringRead {
-                operation: "revalidate cached scan file",
-                path: record.path.clone(),
-            });
+            changed.push(record.path);
+            continue;
         }
         let after = stat_fd(&file, &record.path, "verify cached scan file")?;
         if !same_observation(&before, &after) {
-            return Err(LocalError::ChangedDuringRead {
-                operation: "verify cached scan file",
-                path: record.path.clone(),
-            });
+            changed.push(record.path);
+            continue;
         }
         records.push(ScannedHash {
             record,
             reusable: true,
         });
     }
-    Ok(records)
+    Ok(ScanHashResults { records, changed })
 }
 
 fn revalidate_directories(
@@ -4393,10 +4402,10 @@ mod tests {
     }
 
     #[test]
-    fn scan_revalidates_cache_hits_after_parallel_hashing() -> Result<(), Box<dyn Error>> {
+    fn changing_files_are_unknown_without_hiding_stable_files() -> Result<(), Box<dyn Error>> {
         let root = TempDir::new()?;
-        let path = Path::new("cached");
-        std::fs::write(root.path().join(path), b"before")?;
+        let cached_path = Path::new("cached");
+        std::fs::write(root.path().join(cached_path), b"before")?;
         let first = scan_with_cache_and_workers_completed_at(
             root.path(),
             &BTreeMap::new(),
@@ -4410,16 +4419,34 @@ mod tests {
             .cloned()
             .map(|record| (record.path.clone(), record))
             .collect::<BTreeMap<_, _>>();
+        let hashing_path = Path::new("hashing");
+        let stable_path = Path::new("stable");
+        std::fs::write(root.path().join(hashing_path), b"before")?;
+        std::fs::write(root.path().join(stable_path), b"stable")?;
         let pending = enumerate_scan(root.path(), &cache, all_cache_entries_stable())?;
-        assert!(pending.hash_jobs.is_empty());
+        assert_eq!(pending.hash_jobs.len(), 2);
         assert_eq!(pending.cached_files.len(), 1);
 
-        std::fs::write(root.path().join(path), b"changed after enumeration")?;
-        let result = finish_scan(pending, MAX_PARALLEL_HASHES);
+        std::fs::write(root.path().join(cached_path), b"changed after enumeration")?;
+        std::fs::write(root.path().join(hashing_path), b"also changed")?;
+        let scan = finish_scan(pending, MAX_PARALLEL_HASHES)?;
 
+        let observations = scan
+            .observations()
+            .iter()
+            .map(|record| (record.path.as_path(), &record.observation))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            observations.get(cached_path),
+            Some(&&Observation::Unknown(UnknownReason::Incomplete))
+        );
+        assert_eq!(
+            observations.get(hashing_path),
+            Some(&&Observation::Unknown(UnknownReason::Incomplete))
+        );
         assert!(matches!(
-            result,
-            Err(LocalError::ChangedDuringRead { path: changed, .. }) if changed == path
+            observations.get(stable_path),
+            Some(Observation::Present(_))
         ));
         Ok(())
     }
