@@ -26,7 +26,7 @@ systemd user service, and exposes useful CLI and Omarchy widget status.
 - Treat a newly configured empty local root as a new root generation, not as
   evidence that remote content was deleted.
 
-## Remaining sequence
+## Implementation sequence
 
 1. Finish exact-revision interrupted-download resume and replay the verified
    large staged download already on disk.
