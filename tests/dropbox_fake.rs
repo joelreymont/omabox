@@ -3468,40 +3468,115 @@ fn remote_replay_creates_nested_parents_before_the_file() -> Result<(), Box<dyn 
 }
 
 #[test]
-fn stale_create_source_has_no_remote_effect() -> Result<(), Box<dyn Error>> {
+fn stale_upload_is_superseded_and_current_bytes_sync() -> Result<(), Box<dyn Error>> {
     let expected = dropbox_content_hash(b"planned bytes".as_slice())?;
     let actual = dropbox_content_hash(b"changed bytes".as_slice())?;
-    let server = FakeServer::start(Vec::new())?;
-    let client = fake_client(&server, "opaque-access-stale-create")?;
+    let other = dropbox_content_hash(b"other bytes".as_slice())?;
+    let server = FakeServer::start(vec![
+        FakeResponse::json(file_metadata(
+            "/other.txt",
+            "/other.txt",
+            "other-revision",
+            &other,
+        )),
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [file_metadata(
+                "/other.txt",
+                "/other.txt",
+                "other-revision",
+                &other,
+            )],
+            "cursor": "stale-upload",
+            "has_more": false
+        })),
+        FakeResponse::json(file_metadata(
+            "/file.txt",
+            "/file.txt",
+            "current-revision",
+            &actual,
+        )),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-stale-create")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
     let directory = TempDir::new()?;
     let root = directory.path().join("root");
     let staging = directory.path().join("staging");
     let recovery = directory.path().join("recovery");
-    std::fs::create_dir_all(root.join("nested"))?;
+    std::fs::create_dir_all(&root)?;
     std::fs::create_dir_all(&staging)?;
     std::fs::create_dir_all(&recovery)?;
-    std::fs::write(root.join("nested/file.txt"), b"changed bytes")?;
+    std::fs::write(root.join("file.txt"), b"changed bytes")?;
+    std::fs::write(root.join("other.txt"), b"other bytes")?;
     let operations = planned_operations(plan(
         &Baseline::Absent,
         &Observation::Present(LocalFile::new(expected)),
         &Observation::ConfirmedAbsent,
     ))?;
     let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
     assert!(matches!(
-        journal.record_plan(Path::new("nested/file.txt"), &operations)?,
+        journal.record_plan(Path::new("file.txt"), &operations)?,
+        PlanWrite::Recorded(_)
+    ));
+    let other_operations = planned_operations(plan(
+        &Baseline::Absent,
+        &Observation::Present(LocalFile::new(other.clone())),
+        &Observation::ConfirmedAbsent,
+    ))?;
+    assert!(matches!(
+        journal.record_plan(Path::new("other.txt"), &other_operations)?,
         PlanWrite::Recorded(_)
     ));
 
     let report = replay_remote_operations(&mut journal, &client, &root, &staging)?;
+    assert_eq!(report.completed_operations, 1);
     assert_eq!(
         report.blocked,
-        vec![ReplayBlocked::PreconditionChanged {
-            path: Path::new("nested/file.txt").to_path_buf(),
-            actual: Some(actual),
+        vec![ReplayBlocked::FreshObservationRequired {
+            path: Path::new("file.txt").to_path_buf(),
         }]
     );
-    assert!(server.finish()?.is_empty());
-    assert_eq!(journal.pending_plans()?.len(), 1);
+    assert!(journal.pending_plans()?.is_empty());
+    assert_eq!(
+        journal.baseline(Path::new("other.txt"))?,
+        Some(Baseline::Present(RemoteFile::new(
+            other,
+            DropboxRevision::new("other-revision"),
+        )))
+    );
+
+    let outcome = reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?;
+    let ReconcileOutcome::Complete(report) = outcome else {
+        return Err(io::Error::other("stable changed upload did not converge").into());
+    };
+    assert_eq!(report.planned, 1);
+    assert_eq!(report.replayed_operations, 1);
+    assert_eq!(report.blocked, 0);
+    assert!(journal.pending_plans()?.is_empty());
+    assert_eq!(
+        journal.baseline(Path::new("file.txt"))?,
+        Some(Baseline::Present(RemoteFile::new(
+            actual,
+            DropboxRevision::new("current-revision"),
+        )))
+    );
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[0].path, "/2/files/upload");
+    assert_eq!(requests[0].body, b"other bytes");
+    assert_eq!(requests[3].path, "/2/files/upload");
+    assert_eq!(requests[3].body, b"changed bytes");
     Ok(())
 }
 

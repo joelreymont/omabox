@@ -22,7 +22,7 @@ use crate::local::{
     MAX_PARALLEL_DOWNLOADS, ScanPublication, StageOutcome, StagedUpload, SyncRootAccess,
     configured_root_is_active, lease_download_slot, lease_download_slots, observe_upload_source,
     open_active_root, parent_name_max, remove_unreferenced_upload_stages, rename_case_variant,
-    rename_file_copy, scan_and_publish, stage_upload,
+    rename_file_copy, scan_and_publish, stage_upload, upload_source_changed,
 };
 use crate::model::{
     Baseline, Conflict, ContentIdentity, Decision, DirectoryCollision, Observation, Operation,
@@ -1242,28 +1242,15 @@ fn prepare_local(
         Ok(StageOutcome::AlreadyStaged(staged)) => match observe_upload_source(sync_root, path) {
             Ok(actual) if actual == *content => Ok(Prepared::Ready(staged)),
             Ok(_) => Ok(Prepared::FreshObservation),
-            Err(source) if local_source_changed(&source, path) => Ok(Prepared::FreshObservation),
+            Err(source) if upload_source_changed(&source, path) => Ok(Prepared::FreshObservation),
             Err(source) => Err(ReconcileError::Local { source }),
         },
         Ok(StageOutcome::ContentChanged { .. }) => Ok(Prepared::FreshObservation),
         Ok(StageOutcome::DestinationOccupied { path }) => {
             Err(ReconcileError::StageDestinationOccupied { path })
         }
-        Err(source) if local_source_changed(&source, path) => Ok(Prepared::FreshObservation),
+        Err(source) if upload_source_changed(&source, path) => Ok(Prepared::FreshObservation),
         Err(source) => Err(ReconcileError::Local { source }),
-    }
-}
-
-fn local_source_changed(error: &LocalError, path: &Path) -> bool {
-    match error {
-        LocalError::ChangedDuringRead { path: changed, .. }
-        | LocalError::UnsupportedObject { path: changed } => changed == path,
-        LocalError::Io {
-            operation: "open upload source",
-            path: changed,
-            ..
-        } => changed == path,
-        _ => false,
     }
 }
 

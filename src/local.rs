@@ -1187,6 +1187,19 @@ pub(crate) fn observe_upload_source_at(
     hash_stable_file(&mut source, relative, "verify upload source")
 }
 
+pub(crate) fn upload_source_changed(error: &LocalError, path: &Path) -> bool {
+    match error {
+        LocalError::ChangedDuringRead { path: changed, .. }
+        | LocalError::UnsupportedObject { path: changed } => changed == path,
+        LocalError::Io {
+            operation: "open upload source",
+            path: changed,
+            ..
+        } => changed == path,
+        _ => false,
+    }
+}
+
 /// Stage downloaded bytes beside their target, verify them, and sync them.
 pub fn stage_download(
     root: impl AsRef<Path>,

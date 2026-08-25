@@ -11,7 +11,7 @@ ConflictScenarios == {
     "DivergentEdits", "InitialCollision",
     "LocalDeleteRemoteEdit", "RemoteDeleteLocalEdit"
 }
-Contents == {"Absent", "Base", "Local", "Remote"}
+Contents == {"Absent", "Base", "Local", "LaterLocal", "Remote"}
 Plans == {
     "None", "Upload", "Download", "DeleteRemote", "DeleteLocal", "Conflict"
 }
@@ -147,12 +147,35 @@ StageUpload ==
     /\ phase = "Staging"
     /\ plan = "Upload"
     /\ ~ uploadVerified
+    /\ local = observedLocal
     /\ uploadVerified' = TRUE
     /\ phase' = "Applying"
     /\ UNCHANGED
         <<scenario, local, remote, baseline, plan, journal,
           observedLocal, observedRemote, downloadVerified,
           localCopy, remoteCopy, conflictRecorded>>
+
+ChangeUploadSource ==
+    /\ phase = "Staging"
+    /\ plan = "Upload"
+    /\ local = observedLocal
+    /\ local' = "LaterLocal"
+    /\ UNCHANGED
+        <<scenario, remote, baseline, plan, phase, journal,
+          observedLocal, observedRemote, uploadVerified, downloadVerified,
+          localCopy, remoteCopy, conflictRecorded>>
+
+RetireStaleUpload ==
+    /\ phase = "Staging"
+    /\ plan = "Upload"
+    /\ local # observedLocal
+    /\ plan' = "None"
+    /\ phase' = "Observing"
+    /\ journal' = "Completed"
+    /\ uploadVerified' = FALSE
+    /\ UNCHANGED
+        <<scenario, local, remote, baseline, observedLocal, observedRemote,
+          downloadVerified, localCopy, remoteCopy, conflictRecorded>>
 
 StageDownload ==
     /\ phase = "Staging"
@@ -272,6 +295,8 @@ FinishEffect ==
 Next ==
     \/ Wake
     \/ ChoosePlan
+    \/ ChangeUploadSource
+    \/ RetireStaleUpload
     \/ StageUpload
     \/ StageDownload
     \/ ApplyEffect
@@ -285,6 +310,7 @@ Spec ==
     /\ [][Next]_vars
     /\ WF_vars(Wake)
     /\ WF_vars(ChoosePlan)
+    /\ WF_vars(RetireStaleUpload)
     /\ WF_vars(StageUpload)
     /\ WF_vars(StageDownload)
     /\ WF_vars(ApplyEffect)
@@ -316,6 +342,9 @@ JournalAuthorizesEffects ==
 VerifiedTransfersOnly ==
     /\ (phase = "Finishing" /\ plan = "Upload") => uploadVerified
     /\ (phase = "Finishing" /\ plan = "Download") => downloadVerified
+
+VerifiedUploadMatchesObservation ==
+    uploadVerified => local = observedLocal
 
 PendingKeepsBaseline ==
     (journal = "Pending") => baseline = InitialBaseline

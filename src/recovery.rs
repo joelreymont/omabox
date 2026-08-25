@@ -18,7 +18,7 @@ use crate::local::{
     InstallOutcome, LocalError, StageOutcome, StagedUpload, conflict_relative_path,
     create_directory_at, delete_directory_at, delete_local_at, install_download_at,
     materialize_conflict_at, open_private_directory, open_root, recovery_file_name,
-    stage_upload_at, verify_private_copy,
+    upload_source_changed, verify_private_copy,
 };
 use crate::model::{Baseline, Conflict, ContentIdentity, LocalFile, Operation, RemoteFile};
 
@@ -506,7 +506,7 @@ pub(crate) fn replay_remote_operations_at(
                 }
                 Operation::CreateRemote { content } => {
                     let Some(staged) =
-                        prepare_upload(root, upload_staging, &plan.path, content, &mut report)?
+                        prepare_upload(journal, &plan, root, upload_staging, content, &mut report)?
                     else {
                         break;
                     };
@@ -535,7 +535,7 @@ pub(crate) fn replay_remote_operations_at(
                     expected_revision,
                 } => {
                     let Some(staged) =
-                        prepare_upload(root, upload_staging, &plan.path, content, &mut report)?
+                        prepare_upload(journal, &plan, root, upload_staging, content, &mut report)?
                     else {
                         break;
                     };
@@ -674,19 +674,35 @@ enum FileMutation {
 }
 
 fn prepare_upload(
+    journal: &mut Journal,
+    plan: &PlanRecord,
     root: &OwnedFd,
     upload_staging: &Path,
-    path: &Path,
     content: &ContentIdentity,
     report: &mut ReplayReport,
 ) -> Result<Option<StagedUpload>, RecoveryError> {
-    match stage_upload_at(root, path, upload_staging, content)? {
+    let staged = match crate::local::stage_upload_at(root, &plan.path, upload_staging, content) {
+        Ok(staged) => staged,
+        Err(source) if upload_source_changed(&source, &plan.path) => {
+            supersede_plan(journal, plan)?;
+            report
+                .blocked
+                .push(ReplayBlocked::FreshObservationRequired {
+                    path: plan.path.clone(),
+                });
+            return Ok(None);
+        }
+        Err(source) => return Err(source.into()),
+    };
+    match staged {
         StageOutcome::Staged(stage) | StageOutcome::AlreadyStaged(stage) => Ok(Some(stage)),
-        StageOutcome::ContentChanged { actual } => {
-            report.blocked.push(ReplayBlocked::PreconditionChanged {
-                path: path.to_path_buf(),
-                actual: Some(actual),
-            });
+        StageOutcome::ContentChanged { .. } => {
+            supersede_plan(journal, plan)?;
+            report
+                .blocked
+                .push(ReplayBlocked::FreshObservationRequired {
+                    path: plan.path.clone(),
+                });
             Ok(None)
         }
         StageOutcome::DestinationOccupied { path } => {
