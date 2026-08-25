@@ -1,9 +1,9 @@
 ---
 title: Coalesce staging writes
-status: open
+status: active
 priority: 2
 issue-type: task
-created-at: "2026-08-24T23:42:23.603190+02:00"
+created-at: "\"2026-08-24T23:42:23.603190+02:00\""
 blocks:
   - omabox-resume-interrupted-exact-08dc4996
 ---

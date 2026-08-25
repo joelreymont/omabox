@@ -3181,14 +3181,14 @@ fn copy_and_hash(
             if count == 0 {
                 break;
             }
-            writer
-                .write_all(&block[filled..filled + count])
-                .map_err(|source| io_failure("write private stage", path, source))?;
             filled += count;
         }
         if filled == 0 {
             break;
         }
+        writer
+            .write_all(&block[..filled])
+            .map_err(|source| io_failure("write private stage", path, source))?;
         aggregate.update(Sha256::digest(&block[..filled]));
         if filled < block.len() {
             break;
