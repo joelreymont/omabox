@@ -1892,17 +1892,18 @@ fn pending_exact_downloads_use_bounded_parallel_workers() -> Result<(), Box<dyn 
         &content,
         bytes.len(),
     );
-    let response_groups = (0..WORKER_COUNT)
-        .map(|_| {
-            (0..(DOWNLOAD_COUNT / WORKER_COUNT))
-                .map(|_| {
-                    FakeResponse::bytes(bytes.to_vec())
-                        .header("Dropbox-API-Result", metadata.clone())
-                        .delay(Duration::from_millis(150))
-                })
-                .collect()
-        })
-        .collect();
+    let mut response_groups = Vec::with_capacity(WORKER_COUNT);
+    let mut first_wave = Vec::with_capacity(WORKER_COUNT);
+    let mut second_wave = Vec::with_capacity(WORKER_COUNT);
+    for _ in 0..WORKER_COUNT {
+        let response =
+            || FakeResponse::bytes(bytes.to_vec()).header("Dropbox-API-Result", metadata.clone());
+        let (first, first_gate) = response().gated();
+        let (second, second_gate) = response().gated();
+        response_groups.push(vec![first, second]);
+        first_wave.push(first_gate);
+        second_wave.push(second_gate);
+    }
     let server = FakeServer::start_keep_alive(response_groups)?;
     let client = Arc::new(fake_client(&server, "opaque-access-parallel")?);
     let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
@@ -1930,6 +1931,29 @@ fn pending_exact_downloads_use_bounded_parallel_workers() -> Result<(), Box<dyn 
             return Err(io::Error::other("fresh download plan was already pending").into());
         }
         paths.push(path);
+    }
+
+    let initial = replay_pending(&mut journal, &client, &mut downloads, &root, &staging)?;
+    assert_eq!(initial.completed_operations, 0);
+    for gate in &first_wave {
+        gate.request_received
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| io::Error::other("first download wave did not start"))?;
+    }
+    for gate in first_wave {
+        gate.release_response
+            .send(())
+            .map_err(|_| io::Error::other("first download wave stopped before release"))?;
+    }
+    for gate in &second_wave {
+        gate.request_received
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| io::Error::other("workers did not self-feed the second download wave"))?;
+    }
+    for gate in second_wave {
+        gate.release_response
+            .send(())
+            .map_err(|_| io::Error::other("second download wave stopped before release"))?;
     }
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1961,8 +1985,7 @@ fn pending_exact_downloads_use_bounded_parallel_workers() -> Result<(), Box<dyn 
             .iter()
             .all(|request| request.path == "/2/files/download")
     );
-    assert!(maximum_active >= 2);
-    assert!(maximum_active <= 4);
+    assert_eq!(maximum_active, WORKER_COUNT);
     assert!(connection_count <= 4);
     Ok(())
 }
@@ -2500,11 +2523,19 @@ fn completed_download_batch_is_installed_before_the_next_batch_fails() -> Result
 
     assert!(drive_replay(&mut journal, &client, &mut downloads, &root, &staging,)?.is_err());
 
-    for path in &paths[..COMPLETED_BATCH] {
+    let installed = paths
+        .iter()
+        .filter(|path| root.join(path).is_file())
+        .collect::<Vec<_>>();
+    assert_eq!(installed.len(), COMPLETED_BATCH);
+    for path in installed {
         assert_eq!(std::fs::read(root.join(path))?, bytes);
     }
-    assert!(!root.join(&paths[COMPLETED_BATCH]).exists());
-    assert_eq!(journal.pending_plans()?.len(), 1);
+    let pending = journal.pending_plans()?;
+    let [pending] = pending.as_slice() else {
+        return Err(io::Error::other("exactly one failed download must remain pending").into());
+    };
+    assert!(!root.join(&pending.path).exists());
     assert_eq!(server.finish()?.len(), DOWNLOAD_COUNT);
     Ok(())
 }
@@ -3944,7 +3975,6 @@ struct FakeResponse {
     body: Vec<u8>,
     headers: Vec<(String, String)>,
     request_path: Option<String>,
-    delay: Duration,
     disconnect_after: Option<usize>,
     send_content_length: bool,
     gate: Option<ResponseGate>,
@@ -3974,7 +4004,6 @@ impl FakeResponse {
                 String::from("application/json"),
             )],
             request_path: None,
-            delay: Duration::ZERO,
             disconnect_after: None,
             send_content_length: true,
             gate: None,
@@ -3990,7 +4019,6 @@ impl FakeResponse {
                 String::from("application/octet-stream"),
             )],
             request_path: None,
-            delay: Duration::ZERO,
             disconnect_after: None,
             send_content_length: true,
             gate: None,
@@ -4006,7 +4034,6 @@ impl FakeResponse {
                 (String::from("Content-Range"), content_range),
             ],
             request_path: None,
-            delay: Duration::ZERO,
             disconnect_after: None,
             send_content_length: true,
             gate: None,
@@ -4020,11 +4047,6 @@ impl FakeResponse {
 
     fn for_path(mut self, path: impl Into<String>) -> Self {
         self.request_path = Some(path.into());
-        self
-    }
-
-    fn delay(mut self, delay: Duration) -> Self {
-        self.delay = delay;
         self
     }
 
@@ -4184,7 +4206,6 @@ fn finish_response(
                 .recv()
                 .map_err(|_| io::Error::other("test stopped before fake response release"))?;
         }
-        thread::sleep(response.delay);
         write_response(stream, response, close)
     })();
     active.fetch_sub(1, Ordering::SeqCst);

@@ -10,8 +10,8 @@ use thiserror::Error;
 
 use crate::dropbox::{DropboxClient, DropboxError, MutationOutcome, RemotePathState};
 use crate::journal::{
-    Journal, JournalError, OperationCompletion, PlanConflictCompletion, PlanRecord, PlanSupersede,
-    PlannedOperation, RecordStatus, RecoveryForget, RecoveryRecord,
+    Journal, JournalError, OperationCompletion, OperationId, PlanConflictCompletion, PlanRecord,
+    PlanSupersede, PlannedOperation, RecordStatus, RecoveryForget, RecoveryRecord,
 };
 use crate::local::{
     ConflictOutcome, ConflictSide, CreateDirectoryOutcome, DeleteDirectoryOutcome, DeleteOutcome,
@@ -320,6 +320,7 @@ pub(crate) fn replay_local_plans_at<'a>(
     plans: impl IntoIterator<Item = &'a PlanRecord>,
 ) -> Result<ReplayReport, RecoveryError> {
     let mut report = ReplayReport::default();
+    let mut final_completions = Vec::new();
 
     for plan in plans {
         for planned in &plan.operations {
@@ -329,8 +330,11 @@ pub(crate) fn replay_local_plans_at<'a>(
             let blocked = match &planned.operation {
                 Operation::CreateLocalDirectory => match create_directory_at(root, &plan.path)? {
                     CreateDirectoryOutcome::Created | CreateDirectoryOutcome::AlreadyPresent => {
-                        complete_final(journal, planned, &plan.path, &Baseline::Directory)?;
-                        report.completed_operations += 1;
+                        final_completions.push(FinalCompletion::new(
+                            planned,
+                            &plan.path,
+                            Baseline::Directory,
+                        ));
                         None
                     }
                     CreateDirectoryOutcome::FreshObservation => {
@@ -342,8 +346,11 @@ pub(crate) fn replay_local_plans_at<'a>(
                 },
                 Operation::DeleteLocalDirectory => match delete_directory_at(root, &plan.path)? {
                     DeleteDirectoryOutcome::Deleted | DeleteDirectoryOutcome::AlreadyAbsent => {
-                        complete_final(journal, planned, &plan.path, &Baseline::Absent)?;
-                        report.completed_operations += 1;
+                        final_completions.push(FinalCompletion::new(
+                            planned,
+                            &plan.path,
+                            Baseline::Absent,
+                        ));
                         None
                     }
                     DeleteDirectoryOutcome::FreshObservation => {
@@ -361,13 +368,11 @@ pub(crate) fn replay_local_plans_at<'a>(
                 Operation::InstallLocal { source } => {
                     match install_download_at(root, root_path, &plan.path, &source.content, None)? {
                         InstallOutcome::Installed | InstallOutcome::AlreadyInstalled => {
-                            complete_final(
-                                journal,
+                            final_completions.push(FinalCompletion::new(
                                 planned,
                                 &plan.path,
-                                &Baseline::Present(source.clone()),
-                            )?;
-                            report.completed_operations += 1;
+                                Baseline::Present(source.clone()),
+                            ));
                             None
                         }
                         InstallOutcome::DownloadRequired => Some(ReplayBlocked::DownloadRequired {
@@ -397,13 +402,11 @@ pub(crate) fn replay_local_plans_at<'a>(
                         Some(expected_content),
                     )? {
                         InstallOutcome::Installed | InstallOutcome::AlreadyInstalled => {
-                            complete_final(
-                                journal,
+                            final_completions.push(FinalCompletion::new(
                                 planned,
                                 &plan.path,
-                                &Baseline::Present(source.clone()),
-                            )?;
-                            report.completed_operations += 1;
+                                Baseline::Present(source.clone()),
+                            ));
                             None
                         }
                         InstallOutcome::DownloadRequired => Some(ReplayBlocked::DownloadRequired {
@@ -424,8 +427,11 @@ pub(crate) fn replay_local_plans_at<'a>(
                 Operation::DeleteLocal { expected_content } => {
                     match delete_local_at(root, root_path, &plan.path, expected_content)? {
                         DeleteOutcome::Deleted | DeleteOutcome::AlreadyDeleted => {
-                            complete_final(journal, planned, &plan.path, &Baseline::Absent)?;
-                            report.completed_operations += 1;
+                            final_completions.push(FinalCompletion::new(
+                                planned,
+                                &plan.path,
+                                Baseline::Absent,
+                            ));
                             None
                         }
                         DeleteOutcome::PreconditionChanged { actual } => {
@@ -450,6 +456,8 @@ pub(crate) fn replay_local_plans_at<'a>(
             }
         }
     }
+    commit_final_completions(journal, &final_completions)?;
+    report.completed_operations += final_completions.len();
     Ok(report)
 }
 
@@ -979,6 +987,50 @@ fn supersede_plan(journal: &mut Journal, plan: &PlanRecord) -> Result<(), Recove
         PlanSupersede::Superseded | PlanSupersede::AlreadyCompleted => Ok(()),
         PlanSupersede::NotFound => Err(invalid(&plan.path, "stale plan disappeared")),
     }
+}
+
+struct FinalCompletion {
+    operation_id: OperationId,
+    path: PathBuf,
+    baseline: Baseline,
+}
+
+impl FinalCompletion {
+    fn new(planned: &PlannedOperation, path: &Path, baseline: Baseline) -> Self {
+        Self {
+            operation_id: planned.id,
+            path: path.to_path_buf(),
+            baseline,
+        }
+    }
+}
+
+fn commit_final_completions(
+    journal: &mut Journal,
+    completions: &[FinalCompletion],
+) -> Result<(), RecoveryError> {
+    let requests = completions
+        .iter()
+        .map(|completion| (completion.operation_id, completion.baseline.clone()))
+        .collect::<Vec<_>>();
+    let outcomes = journal.complete_final_operations(&requests)?;
+    for (completion, outcome) in completions.iter().zip(outcomes) {
+        match outcome {
+            OperationCompletion::PlanCompleted | OperationCompletion::AlreadyCompleted => {}
+            OperationCompletion::NotFound
+            | OperationCompletion::WaitingForEarlierOperation(_)
+            | OperationCompletion::BaselineRequired
+            | OperationCompletion::UnexpectedBaseline
+            | OperationCompletion::BaselineMismatch
+            | OperationCompletion::OperationCompleted => {
+                return Err(RecoveryError::InvalidJournalState {
+                    path: completion.path.clone(),
+                    detail: "journal rejected a completed durable effect",
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn complete_nonfinal(

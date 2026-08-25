@@ -5,6 +5,7 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
@@ -13,15 +14,15 @@ use thiserror::Error;
 
 use crate::dropbox::{DropboxClient, DropboxError};
 use crate::journal::{
-    Journal, JournalError, LocalObservationRecord, NoOpWrite, PlanConflictCompletion, PlanRecord,
-    PlanSupersede, PlanWrite, RemoteObservationRecord, dropbox_canonical_path,
+    Journal, JournalError, LocalObservationRecord, PlanConflictCompletion, PlanRecord,
+    PlanSupersede, RemoteObservationRecord, dropbox_canonical_path,
 };
 use crate::local::{
     DownloadSlotIdentity, DownloadSlotLease, LocalError, LocalRenameOutcome,
     MAX_PARALLEL_DOWNLOADS, ScanPublication, StageOutcome, StagedUpload, configured_root_is_active,
-    lease_download_slots, observe_upload_source, open_active_root, parent_name_max,
-    remove_unreferenced_upload_stages, rename_case_variant, rename_file_copy, scan_and_publish,
-    stage_upload,
+    lease_download_slot, lease_download_slots, observe_upload_source, open_active_root,
+    parent_name_max, remove_unreferenced_upload_stages, rename_case_variant, rename_file_copy,
+    scan_and_publish, stage_upload,
 };
 use crate::model::{
     Baseline, Conflict, ContentIdentity, Decision, DirectoryCollision, Observation, Operation,
@@ -96,6 +97,9 @@ pub enum ReconcileError {
     /// A bounded download worker stopped without returning its typed result.
     #[error("a Dropbox download worker stopped unexpectedly")]
     DownloadWorkerStopped,
+    /// The in-process resumable-slot coordinator became unavailable.
+    #[error("the Dropbox download slot coordinator is unavailable")]
+    DownloadSlotCoordinatorUnavailable,
     /// Durable records violated the finite reconciliation contract.
     #[error("reconciliation found invalid journal state for `{path}`: {detail}")]
     InvalidJournalState {
@@ -172,28 +176,34 @@ pub enum ReconcileOutcome {
 
 /// Four persistent workers that stage exact Dropbox downloads without touching the journal.
 pub struct ExactDownloadPool {
-    jobs: mpsc::SyncSender<DownloadJob>,
+    jobs: Option<mpsc::Sender<DownloadJob>>,
     results: mpsc::Receiver<DownloadResult>,
-    in_flight: BTreeSet<PathBuf>,
+    scheduled: BTreeSet<PathBuf>,
     pending_failure: Option<ReconcileError>,
+    slots: Arc<Mutex<DownloadSlots>>,
+    cancelled: Arc<AtomicBool>,
     workers: Vec<thread::JoinHandle<()>>,
 }
 
 impl ExactDownloadPool {
     /// Start the daemon's fixed download workers.
     pub fn new(dropbox: Arc<DropboxClient>) -> Result<Self, ReconcileError> {
-        let (jobs, job_receiver) = mpsc::sync_channel(MAX_PARALLEL_DOWNLOADS);
+        let (jobs, job_receiver) = mpsc::channel();
         let job_receiver = Arc::new(Mutex::new(job_receiver));
         let (result_sender, results) = mpsc::channel();
+        let slots = Arc::new(Mutex::new(DownloadSlots::default()));
+        let cancelled = Arc::new(AtomicBool::new(false));
         let mut workers = Vec::with_capacity(MAX_PARALLEL_DOWNLOADS);
 
         for index in 0..MAX_PARALLEL_DOWNLOADS {
             let receiver = Arc::clone(&job_receiver);
             let sender = result_sender.clone();
             let dropbox = Arc::clone(&dropbox);
+            let slots = Arc::clone(&slots);
+            let cancelled = Arc::clone(&cancelled);
             match thread::Builder::new()
                 .name(format!("omabox-download-{index}"))
-                .spawn(move || download_worker(&dropbox, &receiver, &sender))
+                .spawn(move || download_worker(&dropbox, &receiver, &sender, &slots, &cancelled))
             {
                 Ok(worker) => workers.push(worker),
                 Err(source) => {
@@ -210,10 +220,12 @@ impl ExactDownloadPool {
         }
         drop(result_sender);
         Ok(Self {
-            jobs,
+            jobs: Some(jobs),
             results,
-            in_flight: BTreeSet::new(),
+            scheduled: BTreeSet::new(),
             pending_failure: None,
+            slots,
+            cancelled,
             workers,
         })
     }
@@ -222,8 +234,8 @@ impl ExactDownloadPool {
         loop {
             match self.results.try_recv() {
                 Ok(result) => {
-                    self.in_flight.remove(&result.path);
-                    if let Err(error) = result.outcome
+                    self.scheduled.remove(&result.path);
+                    if let Some(Err(error)) = result.outcome
                         && self.pending_failure.is_none()
                     {
                         self.pending_failure = Some(error);
@@ -235,58 +247,99 @@ impl ExactDownloadPool {
                 }
             }
         }
+        if self.scheduled.is_empty() && self.pending_failure.is_some() {
+            self.cancelled.store(false, Ordering::Release);
+            return Ok(self.pending_failure.take());
+        }
         if self.workers.iter().any(thread::JoinHandle::is_finished) {
             return Err(ReconcileError::DownloadWorkerStopped);
         }
-        if self.in_flight.is_empty() {
-            Ok(self.pending_failure.take())
-        } else {
-            Ok(None)
-        }
+        Ok(None)
     }
 
     fn contains(&self, path: &Path) -> bool {
-        self.in_flight.contains(path)
+        self.scheduled.contains(path)
     }
 
-    fn available(&self) -> usize {
-        if self.pending_failure.is_some() {
-            0
-        } else {
-            MAX_PARALLEL_DOWNLOADS.saturating_sub(self.in_flight.len())
-        }
+    fn is_empty(&self) -> bool {
+        self.scheduled.is_empty()
+    }
+
+    fn accepts_jobs(&self) -> bool {
+        self.pending_failure.is_none() && !self.cancelled.load(Ordering::Acquire)
     }
 
     fn schedule(&mut self, job: DownloadJob) -> Result<(), ReconcileError> {
-        if self.workers.iter().any(thread::JoinHandle::is_finished) {
+        if self.pending_failure.is_some()
+            || self.cancelled.load(Ordering::Acquire)
+            || self.workers.iter().any(thread::JoinHandle::is_finished)
+        {
             return Err(ReconcileError::DownloadWorkerStopped);
         }
         let path = job.path.clone();
-        self.jobs
-            .send(job)
-            .map_err(|_| ReconcileError::DownloadWorkerStopped)?;
-        self.in_flight.insert(path);
+        if let Some(slot) = &job.slot {
+            let mut slots = self
+                .slots
+                .lock()
+                .map_err(|_| ReconcileError::DownloadSlotCoordinatorUnavailable)?;
+            if !slots.reserved.insert(slot.slot()) {
+                return Err(invalid(&path, "resumable download slot was assigned twice"));
+            }
+        }
+        let Some(jobs) = &self.jobs else {
+            return Err(ReconcileError::DownloadWorkerStopped);
+        };
+        if let Err(error) = jobs.send(job) {
+            if let Some(slot) = &error.0.slot
+                && let Ok(mut slots) = self.slots.lock()
+            {
+                slots.reserved.remove(&slot.slot());
+            }
+            return Err(ReconcileError::DownloadWorkerStopped);
+        }
+        self.scheduled.insert(path);
         Ok(())
     }
+}
+
+impl Drop for ExactDownloadPool {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        drop(self.jobs.take());
+        for worker in self.workers.drain(..) {
+            if worker.join().is_err() {
+                tracing::warn!("a download worker stopped during shutdown");
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct DownloadSlots {
+    reserved: BTreeSet<u8>,
 }
 
 struct DownloadJob {
     root: Arc<OwnedFd>,
     root_path: PathBuf,
+    staging_directory: PathBuf,
     path: PathBuf,
     source: RemoteFile,
+    slot_identity: DownloadSlotIdentity,
     slot: Option<DownloadSlotLease>,
 }
 
 struct DownloadResult {
     path: PathBuf,
-    outcome: Result<(), ReconcileError>,
+    outcome: Option<Result<(), ReconcileError>>,
 }
 
 fn download_worker(
     dropbox: &DropboxClient,
     jobs: &Mutex<mpsc::Receiver<DownloadJob>>,
     results: &mpsc::Sender<DownloadResult>,
+    slots: &Mutex<DownloadSlots>,
+    cancelled: &AtomicBool,
 ) {
     loop {
         let job = {
@@ -299,25 +352,94 @@ fn download_worker(
                 Err(_) => return,
             }
         };
-        let outcome = stage_remote_at(
-            dropbox,
-            &job.root,
-            &job.root_path,
-            &job.path,
-            &job.path,
-            &job.source,
-            job.slot.as_ref(),
-        );
+        let path = job.path.clone();
+        if cancelled.load(Ordering::Acquire) {
+            if results
+                .send(DownloadResult {
+                    path,
+                    outcome: None,
+                })
+                .is_err()
+            {
+                return;
+            }
+            continue;
+        }
+        let outcome = run_download_job(dropbox, job, slots);
+        if outcome.is_err() {
+            cancelled.store(true, Ordering::Release);
+        }
         if results
             .send(DownloadResult {
-                path: job.path,
-                outcome,
+                path,
+                outcome: Some(outcome),
             })
             .is_err()
         {
             return;
         }
     }
+}
+
+fn run_download_job(
+    dropbox: &DropboxClient,
+    mut job: DownloadJob,
+    slots: &Mutex<DownloadSlots>,
+) -> Result<(), ReconcileError> {
+    let (lease, reserved_slot) = match job.slot.take() {
+        Some(lease) => {
+            let slot = lease.slot();
+            (Some(lease), Some(slot))
+        }
+        None => acquire_download_slot(&job, slots)?,
+    };
+    let outcome = stage_remote_at(
+        dropbox,
+        &job.root,
+        &job.root_path,
+        &job.path,
+        &job.path,
+        &job.source,
+        lease.as_ref(),
+    );
+    if let Some(slot) = reserved_slot {
+        release_download_slot(slots, slot)?;
+    }
+    outcome
+}
+
+fn acquire_download_slot(
+    job: &DownloadJob,
+    slots: &Mutex<DownloadSlots>,
+) -> Result<(Option<DownloadSlotLease>, Option<u8>), ReconcileError> {
+    for slot in 0_u8..MAX_PARALLEL_DOWNLOADS as u8 {
+        let reserved = {
+            let mut slots = slots
+                .lock()
+                .map_err(|_| ReconcileError::DownloadSlotCoordinatorUnavailable)?;
+            slots.reserved.insert(slot)
+        };
+        if !reserved {
+            continue;
+        }
+        match lease_download_slot(&job.staging_directory, slot, &job.slot_identity) {
+            Ok(Some(lease)) => return Ok((Some(lease), Some(slot))),
+            Ok(None) => release_download_slot(slots, slot)?,
+            Err(source) => {
+                release_download_slot(slots, slot)?;
+                return Err(source.into());
+            }
+        }
+    }
+    Ok((None, None))
+}
+
+fn release_download_slot(slots: &Mutex<DownloadSlots>, slot: u8) -> Result<(), ReconcileError> {
+    let mut slots = slots
+        .lock()
+        .map_err(|_| ReconcileError::DownloadSlotCoordinatorUnavailable)?;
+    slots.reserved.remove(&slot);
+    Ok(())
 }
 
 /// Replay durable work once while missing exact downloads continue on persistent workers.
@@ -380,11 +502,15 @@ fn replay_pending_at(
         .blocked
         .iter()
         .filter_map(|blocked| match blocked {
-            ReplayBlocked::DownloadRequired { path, .. } => Some(path.clone()),
+            ReplayBlocked::DownloadRequired { path, .. }
+                if download_pool.accepts_jobs() && !download_pool.contains(path) =>
+            {
+                Some(path.clone())
+            }
             _ => None,
         })
         .collect::<BTreeSet<_>>();
-    if missing_downloads.is_empty() {
+    if missing_downloads.is_empty() && download_pool.is_empty() {
         let _ = lease_download_slots(upload_staging, &[])?;
     }
     if !missing_downloads.is_empty() {
@@ -402,9 +528,14 @@ fn replay_pending_at(
             };
             let (operation_id, source) = pending_download_operation(&plan)?;
             downloads.push(PendingDownload {
+                slot_identity: DownloadSlotIdentity::new(
+                    root_generation,
+                    operation_id,
+                    &path,
+                    &source,
+                ),
                 path,
                 source,
-                operation_id,
                 slot: None,
             });
         }
@@ -414,7 +545,6 @@ fn replay_pending_at(
             Arc::clone(&root),
             sync_root,
             upload_staging,
-            root_generation,
             downloads,
         )?;
     }
@@ -578,10 +708,12 @@ fn reconcile_published(
             })
             .or_else(|| baseline_paths.get(&canonical_path).cloned())
             .ok_or_else(|| invalid(&canonical_path, "canonical path has no display spelling"))?;
+        let decision = plan(&baseline, &local_observation, &remote_observation);
         decisions.push(PathDecision {
             canonical_path,
             path,
-            decision: plan(&baseline, &local_observation, &remote_observation),
+            baseline,
+            decision,
         });
     }
     decisions.sort_by(order_path_decisions);
@@ -590,11 +722,18 @@ fn reconcile_published(
         replayed_operations: replay.completed_operations,
         ..ReconcileReport::default()
     };
+    let conflict_paths = conflicts
+        .iter()
+        .map(|record| dropbox_canonical_path(&record.path))
+        .collect::<BTreeSet<_>>();
     let mut blocked_paths = BTreeSet::new();
+    let mut noops = Vec::new();
+    let mut plans = Vec::new();
 
     for PathDecision {
         canonical_path,
         path,
+        baseline,
         decision,
     } in decisions
     {
@@ -623,12 +762,13 @@ fn reconcile_published(
         }
 
         match decision {
-            Decision::NoOp(noop) => match journal.record_noop(&path, &noop)? {
-                NoOpWrite::Recorded => report.noops += 1,
-                NoOpWrite::PendingPlan(_) => {
-                    blocked_paths.insert(canonical_path.clone());
+            Decision::NoOp(noop) => {
+                if baseline == *noop.baseline() && !conflict_paths.contains(&canonical_path) {
+                    report.noops += 1;
+                } else {
+                    noops.push((path, noop));
                 }
-            },
+            }
             Decision::Blocked(_) => {
                 blocked_paths.insert(canonical_path.clone());
             }
@@ -640,12 +780,7 @@ fn reconcile_published(
                     }
                 }
                 require_active_local_root(journal, sync_root)?;
-                match journal.record_plan(&path, &plan)? {
-                    PlanWrite::Recorded(_) => report.planned += 1,
-                    PlanWrite::AlreadyPending(_) => {
-                        blocked_paths.insert(canonical_path.clone());
-                    }
-                }
+                plans.push((path, plan));
             }
             Decision::Conflict(conflict) => {
                 match prepare_conflict(dropbox, sync_root, upload_staging, &path, &conflict)? {
@@ -678,17 +813,21 @@ fn reconcile_published(
                     }
                     PreparedDirectoryCollision::Plan(plan) => {
                         require_active_local_root(journal, sync_root)?;
-                        match journal.record_plan(&path, &plan)? {
-                            PlanWrite::Recorded(_) => report.planned += 1,
-                            PlanWrite::AlreadyPending(_) => {
-                                blocked_paths.insert(canonical_path.clone());
-                            }
-                        }
+                        plans.push((path, plan));
                     }
                 }
             }
         }
     }
+    let write = journal.record_reconciliation(&noops, &plans)?;
+    report.noops += write.recorded_noops;
+    report.planned += write.recorded_plans;
+    blocked_paths.extend(
+        write
+            .pending_paths
+            .into_iter()
+            .map(|path| dropbox_canonical_path(&path)),
+    );
     let applied = replay_pending_at(journal, dropbox, downloads, sync_root, upload_staging)?;
     report.replayed_operations += applied.completed_operations;
     if let Some(path) = applied.blocked.iter().find_map(|blocked| match blocked {
@@ -714,6 +853,7 @@ fn reconcile_published(
 struct PathDecision {
     canonical_path: PathBuf,
     path: PathBuf,
+    baseline: Baseline,
     decision: Decision,
 }
 
@@ -969,7 +1109,7 @@ fn supersede_pending_plan(
 struct PendingDownload {
     path: PathBuf,
     source: RemoteFile,
-    operation_id: crate::journal::OperationId,
+    slot_identity: DownloadSlotIdentity,
     slot: Option<DownloadSlotLease>,
 }
 
@@ -999,19 +1139,11 @@ fn pending_download_operation(
 
 fn lease_pending_downloads(
     upload_staging: &Path,
-    root_generation: u64,
     downloads: &mut [PendingDownload],
 ) -> Result<(), ReconcileError> {
     let identities = downloads
         .iter()
-        .map(|download| {
-            DownloadSlotIdentity::new(
-                root_generation,
-                download.operation_id,
-                &download.path,
-                &download.source,
-            )
-        })
+        .map(|download| download.slot_identity.clone())
         .collect::<Vec<_>>();
     let leases = lease_download_slots(upload_staging, &identities)?;
     for (download, lease) in downloads.iter_mut().zip(leases) {
@@ -1025,27 +1157,23 @@ fn schedule_pending_downloads(
     root: Arc<OwnedFd>,
     root_path: &Path,
     upload_staging: &Path,
-    root_generation: u64,
     mut downloads: Vec<PendingDownload>,
 ) -> Result<(), ReconcileError> {
-    lease_pending_downloads(upload_staging, root_generation, &mut downloads)?;
+    lease_pending_downloads(upload_staging, &mut downloads)?;
     downloads.sort_by_key(|download| download.slot.is_none());
-    let mut available = pool.available();
     for download in downloads {
-        if available == 0 {
-            break;
-        }
         if pool.contains(&download.path) {
             continue;
         }
         pool.schedule(DownloadJob {
             root: Arc::clone(&root),
             root_path: root_path.to_path_buf(),
+            staging_directory: upload_staging.to_path_buf(),
             path: download.path,
             source: download.source,
+            slot_identity: download.slot_identity,
             slot: download.slot,
         })?;
-        available -= 1;
     }
     Ok(())
 }
@@ -1423,6 +1551,7 @@ mod tests {
         Ok(())
     }
 
+    use crate::journal::{NoOpWrite, PlanWrite};
     use crate::model::{ContentIdentity, DropboxRevision, LocalFile, RemoteFile};
 
     fn identity(bytes: &[u8]) -> Result<ContentIdentity, Box<dyn Error>> {

@@ -352,6 +352,14 @@ pub enum NoOpWrite {
     PendingPlan(PlanId),
 }
 
+/// Result of committing one reconciliation's journal-only decisions together.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ReconciliationWrite {
+    pub(crate) recorded_noops: usize,
+    pub(crate) recorded_plans: usize,
+    pub(crate) pending_paths: Vec<PathBuf>,
+}
+
 /// Result of completing one ordered operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OperationCompletion {
@@ -1318,32 +1326,11 @@ impl Journal {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite("begin no-op baseline", &database_path, source))?;
-        let canonical_path = dropbox_canonical_path(path);
-        let pending = transaction
-            .query_row(
-                "SELECT id FROM plans WHERE canonical_path = ?1 AND status = 'pending'",
-                [path_bytes(&canonical_path)],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(|source| sqlite("find pending plan for no-op", path, source))?;
-        if let Some(id) = pending {
-            transaction
-                .commit()
-                .map_err(|source| sqlite("commit pending plan read", &database_path, source))?;
-            return Ok(NoOpWrite::PendingPlan(PlanId(id)));
-        }
-        write_baseline(&transaction, path, noop.baseline())?;
-        transaction
-            .execute(
-                "DELETE FROM conflicts WHERE canonical_path = ?1",
-                [path_bytes(&canonical_path)],
-            )
-            .map_err(|source| sqlite("retire resolved conflicts", path, source))?;
+        let outcome = record_noop_in(&transaction, path, noop)?;
         transaction
             .commit()
             .map_err(|source| sqlite("commit no-op baseline", &database_path, source))?;
-        Ok(NoOpWrite::Recorded)
+        Ok(outcome)
     }
 
     /// Commit an ordered plan before returning it to an effect executor.
@@ -1352,74 +1339,49 @@ impl Journal {
         path: &Path,
         plan: &OperationPlan,
     ) -> Result<PlanWrite, JournalError> {
-        let encoded_operations = plan
-            .operations()
-            .iter()
-            .enumerate()
-            .map(|(ordinal, operation)| {
-                let ordinal = i64::try_from(ordinal).map_err(|_| JournalError::InvalidState {
-                    operation: "record plan",
-                    path: path.to_path_buf(),
-                    detail: "operation count exceeds SQLite integer range",
-                })?;
-                encode(operation, "serialize operation", path).map(|json| (ordinal, json))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let database_path = self.database_path.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite("begin plan intent", &database_path, source))?;
-        let canonical_path = dropbox_canonical_path(path);
-        let existing = transaction
-            .query_row(
-                "SELECT id FROM plans WHERE canonical_path = ?1 AND status = 'pending'",
-                [path_bytes(&canonical_path)],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(|source| sqlite("find pending plan", path, source))?;
-        if let Some(id) = existing {
-            let plan = read_plan(&transaction, &database_path, PlanId(id))?.ok_or_else(|| {
-                JournalError::InvalidState {
-                    operation: "read existing pending plan",
-                    path: path.to_path_buf(),
-                    detail: "pending plan disappeared inside its transaction",
-                }
-            })?;
-            transaction
-                .commit()
-                .map_err(|source| sqlite("commit pending plan read", &database_path, source))?;
-            return Ok(PlanWrite::AlreadyPending(plan));
-        }
-
-        transaction
-            .execute(
-                "INSERT INTO plans(path, status, canonical_path) VALUES (?1, 'pending', ?2)",
-                params![path_bytes(path), path_bytes(&canonical_path)],
-            )
-            .map_err(|source| sqlite("record plan intent", path, source))?;
-        let plan_id = PlanId(transaction.last_insert_rowid());
-        for (ordinal, operation_json) in encoded_operations {
-            transaction
-                .execute(
-                    "INSERT INTO operations(plan_id, ordinal, operation_json, status) \
-                     VALUES (?1, ?2, ?3, 'pending')",
-                    params![plan_id.0, ordinal, operation_json],
-                )
-                .map_err(|source| sqlite("record operation intent", path, source))?;
-        }
-        let plan = read_plan(&transaction, &database_path, plan_id)?.ok_or_else(|| {
-            JournalError::InvalidState {
-                operation: "read recorded plan",
-                path: path.to_path_buf(),
-                detail: "new plan disappeared inside its transaction",
-            }
-        })?;
+        let outcome = record_plan_in(&transaction, &database_path, path, plan)?;
         transaction
             .commit()
             .map_err(|source| sqlite("commit plan intent", &database_path, source))?;
-        Ok(PlanWrite::Recorded(plan))
+        Ok(outcome)
+    }
+
+    /// Commit all journal-only decisions from one complete observation together.
+    pub(crate) fn record_reconciliation(
+        &mut self,
+        noops: &[(PathBuf, NoOpDecision)],
+        plans: &[(PathBuf, OperationPlan)],
+    ) -> Result<ReconciliationWrite, JournalError> {
+        if noops.is_empty() && plans.is_empty() {
+            return Ok(ReconciliationWrite::default());
+        }
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite("begin reconciliation decisions", &database_path, source))?;
+        let mut write = ReconciliationWrite::default();
+        for (path, noop) in noops {
+            match record_noop_in(&transaction, path, noop)? {
+                NoOpWrite::Recorded => write.recorded_noops += 1,
+                NoOpWrite::PendingPlan(_) => write.pending_paths.push(path.clone()),
+            }
+        }
+        for (path, plan) in plans {
+            match record_plan_in(&transaction, &database_path, path, plan)? {
+                PlanWrite::Recorded(_) => write.recorded_plans += 1,
+                PlanWrite::AlreadyPending(_) => write.pending_paths.push(path.clone()),
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite("commit reconciliation decisions", &database_path, source))?;
+        Ok(write)
     }
 
     /// Load every unfinished plan after startup or interruption.
@@ -1568,114 +1530,43 @@ impl Journal {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite("begin operation completion", &database_path, source))?;
-        let row = transaction
-            .query_row(
-                "SELECT operations.plan_id, operations.ordinal, operations.status, plans.status, \
-                        plans.path, operations.operation_json \
-                 FROM operations JOIN plans ON plans.id = operations.plan_id \
-                 WHERE operations.id = ?1",
-                [operation_id.0],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Vec<u8>>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|source| sqlite("find operation", &database_path, source))?;
-        let Some((plan_id, ordinal, operation_status, plan_status, raw_path, operation_json)) = row
-        else {
-            return Ok(OperationCompletion::NotFound);
-        };
-        let path = bytes_path(raw_path);
-        let operation_status = decode_status(&operation_status, "read operation status", &path)?;
-        let plan_status = decode_status(&plan_status, "read plan status", &path)?;
-        if operation_status == RecordStatus::Completed || plan_status == RecordStatus::Completed {
-            return Ok(OperationCompletion::AlreadyCompleted);
-        }
-        let operation: Operation = decode(&operation_json, "deserialize operation", &path)?;
-
-        let earlier = transaction
-            .query_row(
-                "SELECT id FROM operations \
-                 WHERE plan_id = ?1 AND ordinal < ?2 AND status = 'pending' \
-                 ORDER BY ordinal LIMIT 1",
-                params![plan_id, ordinal],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(|source| sqlite("find earlier operation", &path, source))?;
-        if let Some(id) = earlier {
-            return Ok(OperationCompletion::WaitingForEarlierOperation(
-                OperationId(id),
-            ));
-        }
-
-        let has_later = transaction
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM operations WHERE plan_id = ?1 AND ordinal > ?2)",
-                params![plan_id, ordinal],
-                |row| row.get::<_, bool>(0),
-            )
-            .map_err(|source| sqlite("find later operation", &path, source))?;
-        let final_baseline = if has_later {
-            if resulting_baseline.is_some() {
-                return Ok(OperationCompletion::UnexpectedBaseline);
-            }
-            None
-        } else {
-            let Some(baseline) = resulting_baseline else {
-                return Ok(OperationCompletion::BaselineRequired);
-            };
-            if !operation_matches_baseline(&operation, baseline) {
-                return Ok(OperationCompletion::BaselineMismatch);
-            }
-            Some(baseline)
-        };
-
-        transaction
-            .execute(
-                "UPDATE operations SET status = 'completed' WHERE id = ?1",
-                [operation_id.0],
-            )
-            .map_err(|source| sqlite("complete operation", &path, source))?;
-        transaction
-            .execute(
-                "UPDATE recovery_records SET status = 'completed' \
-                 WHERE operation_id = ?1 AND status = 'pending'",
-                [operation_id.0],
-            )
-            .map_err(|source| sqlite("retire legacy recovery intent", &path, source))?;
-        let Some(baseline) = final_baseline else {
-            transaction
-                .commit()
-                .map_err(|source| sqlite("commit operation completion", &database_path, source))?;
-            return Ok(OperationCompletion::OperationCompleted);
-        };
-
-        write_baseline(&transaction, &path, baseline)?;
-        transaction
-            .execute(
-                "DELETE FROM conflicts WHERE canonical_path = ?1",
-                [path_bytes(&dropbox_canonical_path(&path))],
-            )
-            .map_err(|source| sqlite("retire resolved conflicts", &path, source))?;
-        transaction
-            .execute(
-                "UPDATE plans SET status = 'completed' WHERE id = ?1",
-                [plan_id],
-            )
-            .map_err(|source| sqlite("complete plan", &path, source))?;
-        start_recovery_retention(&transaction, plan_id, &path)?;
+        let completion = complete_operation_in(
+            &transaction,
+            &database_path,
+            operation_id,
+            resulting_baseline,
+        )?;
         transaction
             .commit()
-            .map_err(|source| sqlite("commit plan and baseline", &database_path, source))?;
-        Ok(OperationCompletion::PlanCompleted)
+            .map_err(|source| sqlite("commit operation completion", &database_path, source))?;
+        Ok(completion)
+    }
+
+    /// Complete independent final effects in one atomic journal write.
+    pub(crate) fn complete_final_operations(
+        &mut self,
+        completions: &[(OperationId, Baseline)],
+    ) -> Result<Vec<OperationCompletion>, JournalError> {
+        if completions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| {
+                sqlite("begin final operation completions", &database_path, source)
+            })?;
+        let outcomes = completions
+            .iter()
+            .map(|(operation_id, baseline)| {
+                complete_operation_in(&transaction, &database_path, *operation_id, Some(baseline))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        transaction.commit().map_err(|source| {
+            sqlite("commit final operation completions", &database_path, source)
+        })?;
+        Ok(outcomes)
     }
 
     /// Record a conflict and retire its pending plan in one transaction.
@@ -2287,13 +2178,217 @@ fn write_baseline(
                      VALUES (?1, ?2, ?3) \
                      ON CONFLICT(canonical_path) DO UPDATE SET \
                          path = excluded.path, \
-                         baseline_json = excluded.baseline_json",
+                         baseline_json = excluded.baseline_json \
+                     WHERE baselines.path != excluded.path \
+                        OR baselines.baseline_json != excluded.baseline_json",
                     params![path_bytes(path), json, path_bytes(&canonical_path)],
                 )
                 .map(|_| ())
                 .map_err(|source| sqlite("record present baseline", path, source))
         }
     }
+}
+
+fn record_noop_in(
+    connection: &Connection,
+    path: &Path,
+    noop: &NoOpDecision,
+) -> Result<NoOpWrite, JournalError> {
+    let canonical_path = dropbox_canonical_path(path);
+    let pending = connection
+        .query_row(
+            "SELECT id FROM plans WHERE canonical_path = ?1 AND status = 'pending'",
+            [path_bytes(&canonical_path)],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|source| sqlite("find pending plan for no-op", path, source))?;
+    if let Some(id) = pending {
+        return Ok(NoOpWrite::PendingPlan(PlanId(id)));
+    }
+    write_baseline(connection, path, noop.baseline())?;
+    connection
+        .execute(
+            "DELETE FROM conflicts WHERE canonical_path = ?1",
+            [path_bytes(&canonical_path)],
+        )
+        .map_err(|source| sqlite("retire resolved conflicts", path, source))?;
+    Ok(NoOpWrite::Recorded)
+}
+
+fn record_plan_in(
+    connection: &Connection,
+    database_path: &Path,
+    path: &Path,
+    plan: &OperationPlan,
+) -> Result<PlanWrite, JournalError> {
+    let encoded_operations = plan
+        .operations()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, operation)| {
+            let ordinal = i64::try_from(ordinal).map_err(|_| JournalError::InvalidState {
+                operation: "record plan",
+                path: path.to_path_buf(),
+                detail: "operation count exceeds SQLite integer range",
+            })?;
+            encode(operation, "serialize operation", path).map(|json| (ordinal, json))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let canonical_path = dropbox_canonical_path(path);
+    let existing = connection
+        .query_row(
+            "SELECT id FROM plans WHERE canonical_path = ?1 AND status = 'pending'",
+            [path_bytes(&canonical_path)],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|source| sqlite("find pending plan", path, source))?;
+    if let Some(id) = existing {
+        let plan = read_plan(connection, database_path, PlanId(id))?.ok_or_else(|| {
+            JournalError::InvalidState {
+                operation: "read existing pending plan",
+                path: path.to_path_buf(),
+                detail: "pending plan disappeared inside its transaction",
+            }
+        })?;
+        return Ok(PlanWrite::AlreadyPending(plan));
+    }
+
+    connection
+        .execute(
+            "INSERT INTO plans(path, status, canonical_path) VALUES (?1, 'pending', ?2)",
+            params![path_bytes(path), path_bytes(&canonical_path)],
+        )
+        .map_err(|source| sqlite("record plan intent", path, source))?;
+    let plan_id = PlanId(connection.last_insert_rowid());
+    for (ordinal, operation_json) in encoded_operations {
+        connection
+            .execute(
+                "INSERT INTO operations(plan_id, ordinal, operation_json, status) \
+                 VALUES (?1, ?2, ?3, 'pending')",
+                params![plan_id.0, ordinal, operation_json],
+            )
+            .map_err(|source| sqlite("record operation intent", path, source))?;
+    }
+    let plan = read_plan(connection, database_path, plan_id)?.ok_or_else(|| {
+        JournalError::InvalidState {
+            operation: "read recorded plan",
+            path: path.to_path_buf(),
+            detail: "new plan disappeared inside its transaction",
+        }
+    })?;
+    Ok(PlanWrite::Recorded(plan))
+}
+
+fn complete_operation_in(
+    connection: &Connection,
+    database_path: &Path,
+    operation_id: OperationId,
+    resulting_baseline: Option<&Baseline>,
+) -> Result<OperationCompletion, JournalError> {
+    let row = connection
+        .query_row(
+            "SELECT operations.plan_id, operations.ordinal, operations.status, plans.status, \
+                    plans.path, operations.operation_json \
+             FROM operations JOIN plans ON plans.id = operations.plan_id \
+             WHERE operations.id = ?1",
+            [operation_id.0],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|source| sqlite("find operation", database_path, source))?;
+    let Some((plan_id, ordinal, operation_status, plan_status, raw_path, operation_json)) = row
+    else {
+        return Ok(OperationCompletion::NotFound);
+    };
+    let path = bytes_path(raw_path);
+    let operation_status = decode_status(&operation_status, "read operation status", &path)?;
+    let plan_status = decode_status(&plan_status, "read plan status", &path)?;
+    if operation_status == RecordStatus::Completed || plan_status == RecordStatus::Completed {
+        return Ok(OperationCompletion::AlreadyCompleted);
+    }
+    let operation: Operation = decode(&operation_json, "deserialize operation", &path)?;
+
+    let earlier = connection
+        .query_row(
+            "SELECT id FROM operations \
+             WHERE plan_id = ?1 AND ordinal < ?2 AND status = 'pending' \
+             ORDER BY ordinal LIMIT 1",
+            params![plan_id, ordinal],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|source| sqlite("find earlier operation", &path, source))?;
+    if let Some(id) = earlier {
+        return Ok(OperationCompletion::WaitingForEarlierOperation(
+            OperationId(id),
+        ));
+    }
+
+    let has_later = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE plan_id = ?1 AND ordinal > ?2)",
+            params![plan_id, ordinal],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|source| sqlite("find later operation", &path, source))?;
+    let final_baseline = if has_later {
+        if resulting_baseline.is_some() {
+            return Ok(OperationCompletion::UnexpectedBaseline);
+        }
+        None
+    } else {
+        let Some(baseline) = resulting_baseline else {
+            return Ok(OperationCompletion::BaselineRequired);
+        };
+        if !operation_matches_baseline(&operation, baseline) {
+            return Ok(OperationCompletion::BaselineMismatch);
+        }
+        Some(baseline)
+    };
+
+    connection
+        .execute(
+            "UPDATE operations SET status = 'completed' WHERE id = ?1",
+            [operation_id.0],
+        )
+        .map_err(|source| sqlite("complete operation", &path, source))?;
+    connection
+        .execute(
+            "UPDATE recovery_records SET status = 'completed' \
+             WHERE operation_id = ?1 AND status = 'pending'",
+            [operation_id.0],
+        )
+        .map_err(|source| sqlite("retire legacy recovery intent", &path, source))?;
+    let Some(baseline) = final_baseline else {
+        return Ok(OperationCompletion::OperationCompleted);
+    };
+
+    write_baseline(connection, &path, baseline)?;
+    connection
+        .execute(
+            "DELETE FROM conflicts WHERE canonical_path = ?1",
+            [path_bytes(&dropbox_canonical_path(&path))],
+        )
+        .map_err(|source| sqlite("retire resolved conflicts", &path, source))?;
+    connection
+        .execute(
+            "UPDATE plans SET status = 'completed' WHERE id = ?1",
+            [plan_id],
+        )
+        .map_err(|source| sqlite("complete plan", &path, source))?;
+    start_recovery_retention(connection, plan_id, &path)?;
+    Ok(OperationCompletion::PlanCompleted)
 }
 
 fn start_recovery_retention(
@@ -2859,6 +2954,78 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_decisions_commit_atomically() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let mut journal = Journal::open(journal_path(&directory))?;
+        journal.connection.execute_batch(
+            "CREATE TRIGGER reject_test_plan BEFORE INSERT ON plans \
+             WHEN hex(NEW.path) = hex('reject.txt') \
+             BEGIN SELECT RAISE(ABORT, 'test rejection'); END;",
+        )?;
+        let matching = remote_file("same", "rev-same");
+        let agreed = noop(plan(
+            &Baseline::Absent,
+            &Observation::Present(LocalFile::new(content("same"))),
+            &Observation::Present(matching),
+        ))?;
+        let upload = operations(plan(
+            &Baseline::Absent,
+            &Observation::Present(LocalFile::new(content("upload"))),
+            &Observation::ConfirmedAbsent,
+        ))?;
+        let noops = vec![(PathBuf::from("same.txt"), agreed)];
+        let plans = vec![
+            (PathBuf::from("safe.txt"), upload.clone()),
+            (PathBuf::from("reject.txt"), upload),
+        ];
+
+        assert!(matches!(
+            journal.record_reconciliation(&noops, &plans),
+            Err(JournalError::Sqlite { .. })
+        ));
+        assert_eq!(journal.baseline(Path::new("same.txt"))?, None);
+        assert!(journal.pending_plans()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn final_effect_completions_commit_atomically() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let mut journal = Journal::open(journal_path(&directory))?;
+        let downloaded = remote_file("downloaded", "rev-downloaded");
+        let operation_plan = operations(plan(
+            &Baseline::Absent,
+            &Observation::ConfirmedAbsent,
+            &Observation::Present(downloaded.clone()),
+        ))?;
+        let first_path = Path::new("first.txt");
+        let second_path = Path::new("second.txt");
+        let first = recorded_plan(journal.record_plan(first_path, &operation_plan)?)?;
+        let second = recorded_plan(journal.record_plan(second_path, &operation_plan)?)?;
+        journal.connection.execute_batch(
+            "CREATE TRIGGER reject_test_completion BEFORE UPDATE OF status ON plans \
+             WHEN hex(OLD.path) = hex('second.txt') AND NEW.status = 'completed' \
+             BEGIN SELECT RAISE(ABORT, 'test rejection'); END;",
+        )?;
+        let completions = vec![
+            (
+                first.operations[0].id,
+                Baseline::Present(downloaded.clone()),
+            ),
+            (second.operations[0].id, Baseline::Present(downloaded)),
+        ];
+
+        assert!(matches!(
+            journal.complete_final_operations(&completions),
+            Err(JournalError::Sqlite { .. })
+        ));
+        assert_eq!(journal.baseline(first_path)?, None);
+        assert_eq!(journal.baseline(second_path)?, None);
+        assert_eq!(journal.pending_plans()?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
     fn writable_journal_creates_owner_only_database() -> Result<(), Box<dyn Error>> {
         let directory = TempDir::new()?;
         let database_path = journal_path(&directory);
@@ -3149,6 +3316,12 @@ mod tests {
             NoOpWrite::Recorded
         );
         assert_eq!(journal.baseline(path)?, Some(Baseline::Present(observed)));
+        let unchanged_at = journal.connection.total_changes();
+        assert_eq!(
+            journal.record_noop(path, &noop_decision)?,
+            NoOpWrite::Recorded
+        );
+        assert_eq!(journal.connection.total_changes(), unchanged_at);
 
         let pending = operations(plan(
             &Baseline::Absent,

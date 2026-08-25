@@ -11,6 +11,10 @@ baseline completion. It verifies that changed user content is never mutated,
 only verified bytes are installed, and no displacement guard survives a
 completed operation.
 
+`DownloadExecutor` checks the bounded worker queue around that lifecycle. It
+covers slot exclusivity, failure cancellation, preservation of successful
+stages, crash recovery, retry, installation, and journal completion.
+
 Run it from this directory with the official TLA+ tools:
 
 ```sh
@@ -19,6 +23,9 @@ java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
 
 java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
   -config MutationLifecycle.cfg MutationLifecycle.tla
+
+java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
+  -config DownloadExecutor.cfg DownloadExecutor.tla
 ```
 
 Same- and cross-filesystem promotion share one durable abstract boundary; TLC

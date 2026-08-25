@@ -284,6 +284,7 @@ pub(crate) enum DownloadPreparation {
     Ephemeral,
 }
 
+#[derive(Clone)]
 pub(crate) struct DownloadSlotIdentity {
     binding: [u8; 32],
 }
@@ -314,6 +315,12 @@ pub(crate) struct DownloadSlotLease {
     directory: PathBuf,
     slot: u8,
     binding: [u8; 32],
+}
+
+impl DownloadSlotLease {
+    pub(crate) fn slot(&self) -> u8 {
+        self.slot
+    }
 }
 
 struct DownloadLocation {
@@ -1223,6 +1230,50 @@ pub(crate) fn lease_download_slots(
             })?;
     }
     Ok(leases)
+}
+
+pub(crate) fn lease_download_slot(
+    staging_directory: &Path,
+    slot: u8,
+    identity: &DownloadSlotIdentity,
+) -> Result<Option<DownloadSlotLease>, LocalError> {
+    let directory =
+        open_private_directory(staging_directory, "open resumable download slot directory")?;
+    let name = download_slot_name(slot);
+    let path = staging_directory.join(&name);
+    let claimed = match open_download_slot(&directory, &name, &path)? {
+        DownloadSlotOpen::Missing => {
+            create_download_slot(&directory, &name, &path, identity.binding)?.is_some()
+        }
+        DownloadSlotOpen::File(file) => {
+            let stat = stat_fd(&file, &path, "inspect resumed download slot")?;
+            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+                false
+            } else if let Some(state) = read_download_slot_state(&file, &path)? {
+                if state.binding == identity.binding {
+                    true
+                } else {
+                    reset_download_slot_file_with(
+                        &file,
+                        &directory,
+                        &name,
+                        &path,
+                        identity.binding,
+                        || Ok(()),
+                    )?
+                    .is_some()
+                }
+            } else {
+                false
+            }
+        }
+        DownloadSlotOpen::Occupied => false,
+    };
+    Ok(claimed.then_some(DownloadSlotLease {
+        directory: staging_directory.to_path_buf(),
+        slot,
+        binding: identity.binding,
+    }))
 }
 
 struct AvailableDownloadSlot {
