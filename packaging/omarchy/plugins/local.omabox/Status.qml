@@ -41,6 +41,9 @@ Item {
 
   readonly property bool ready: availability === "ready" && snapshot !== null
   readonly property bool stale: ready && nowMs / 1000 - snapshot.updated_at > 75
+  readonly property bool hasError: availability === "malformed"
+    || (snapshot && (snapshot.phase === "error" || snapshot.last_error !== null))
+    || settingsError !== "" || actionError !== ""
   readonly property var transfers: ready ? snapshot.transfers : []
   readonly property real aggregateBytesDone: {
     var total = 0

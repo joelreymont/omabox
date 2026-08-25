@@ -20,8 +20,7 @@ Panel {
   readonly property var snapshot: status.snapshot
   readonly property var transfers: status.transfers
   readonly property bool rootConfirmationOpen: pendingSyncRoot !== ""
-  readonly property bool alerting: status.availability === "malformed" || status.stale
-    || (snapshot && snapshot.phase === "error")
+  readonly property bool alerting: status.hasError
   readonly property bool inactive: status.stoppedByPanel || status.availability === "missing" || status.stale
     || (snapshot && snapshot.phase === "backoff")
   readonly property color stateColor: alerting ? urgent : (inactive ? dim : foreground)

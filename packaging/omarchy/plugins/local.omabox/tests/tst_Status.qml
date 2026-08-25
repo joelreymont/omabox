@@ -20,6 +20,11 @@ TestCase {
     autoRefreshSettings: false
   }
 
+  Status {
+    id: severityStatus
+    autoRefreshSettings: false
+  }
+
   function test_normalizes_concurrent_transfers() {
     var snapshot = status.normalize(JSON.stringify({
       version: 2,
@@ -91,5 +96,22 @@ TestCase {
     compare(history[0], 6)
     compare(history[29], 35)
     compare(status.appendSpeed(history, -1, 30)[29], 0)
+  }
+
+  function test_staleness_is_not_an_error() {
+    severityStatus.apply(JSON.stringify({
+      version: 2,
+      phase: "waiting",
+      transfers: [],
+      last_error: null,
+      updated_at: 100
+    }))
+    severityStatus.nowMs = (100 + 5 * 60 * 60) * 1000
+
+    verify(severityStatus.stale)
+    verify(!severityStatus.hasError)
+
+    severityStatus.apply("not json")
+    verify(severityStatus.hasError)
   }
 }
