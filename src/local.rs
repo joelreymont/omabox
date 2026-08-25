@@ -7,6 +7,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -40,6 +41,30 @@ const BELOW_ROOT: ResolveFlags = ResolveFlags::BENEATH
     .union(ResolveFlags::NO_SYMLINKS)
     .union(ResolveFlags::NO_MAGICLINKS);
 const ABSOLUTE_SAFE: ResolveFlags = ResolveFlags::NO_SYMLINKS.union(ResolveFlags::NO_MAGICLINKS);
+
+/// Coordinates complete scans with daemon-owned mutations inside the sync root.
+#[derive(Default)]
+pub(crate) struct SyncRootAccess {
+    lock: RwLock<()>,
+}
+
+impl SyncRootAccess {
+    pub(crate) fn with_shared<T>(&self, action: impl FnOnce() -> T) -> T {
+        let _guard = match self.lock.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        action()
+    }
+
+    pub(crate) fn with_exclusive<T>(&self, action: impl FnOnce() -> T) -> T {
+        let _guard = match self.lock.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        action()
+    }
+}
 
 /// A local filesystem or local-inventory publication failure.
 #[derive(Debug, Error)]
@@ -365,6 +390,7 @@ struct DownloadLocation {
     target: PathBuf,
     expected: ContentIdentity,
     binding: [u8; 32],
+    root_access: Arc<SyncRootAccess>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1328,6 +1354,7 @@ fn download_slot_name(slot: u8) -> OsString {
     OsString::from(format!(".omabox-download-slot-{slot}"))
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_download_slot_at(
     root: &OwnedFd,
     root_path: &Path,
@@ -1335,9 +1362,22 @@ pub(crate) fn prepare_download_slot_at(
     expected: &ContentIdentity,
     lease: &DownloadSlotLease,
 ) -> Result<DownloadPreparation, LocalError> {
+    let root_access = Arc::new(SyncRootAccess::default());
+    prepare_download_slot_with_access_at(root, root_path, target, expected, lease, &root_access)
+}
+
+pub(crate) fn prepare_download_slot_with_access_at(
+    root: &OwnedFd,
+    root_path: &Path,
+    target: impl AsRef<Path>,
+    expected: &ContentIdentity,
+    lease: &DownloadSlotLease,
+    root_access: &Arc<SyncRootAccess>,
+) -> Result<DownloadPreparation, LocalError> {
     require_content_hash(expected, "prepare resumed download")?;
     let target = target.as_ref();
-    let Some((target_directory, _, parent_relative)) = open_parent(root, target, true)? else {
+    let parent = root_access.with_shared(|| open_parent(root, target, true))?;
+    let Some((target_directory, _, parent_relative)) = parent else {
         return Err(LocalError::UnsafeRelativePath {
             path: target.to_path_buf(),
         });
@@ -1358,6 +1398,7 @@ pub(crate) fn prepare_download_slot_at(
         target: target.to_path_buf(),
         expected: expected.clone(),
         binding: lease.binding,
+        root_access: Arc::clone(root_access),
     };
     match inspect_download_stage(
         &location.target_directory,
@@ -1658,7 +1699,8 @@ fn promote_completed_slot(
     file: &mut File,
     location: &DownloadLocation,
 ) -> Result<StageOutcome<()>, LocalError> {
-    promote_completed_slot_with(file, location, || Ok(()))
+    let root_access = Arc::clone(&location.root_access);
+    root_access.with_shared(|| promote_completed_slot_with(file, location, || Ok(())))
 }
 
 fn promote_completed_slot_with(
@@ -4610,6 +4652,74 @@ mod tests {
             );
             assert_eq!(std::fs::read(root.path().join(target))?, bytes);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn download_promotion_cannot_invalidate_complete_scan() -> Result<(), Box<dyn Error>> {
+        let root = TempDir::new()?;
+        let staging = TempDir::new()?;
+        let target = Path::new("target.txt");
+        let bytes = b"complete bytes";
+        let expected = identity(bytes)?;
+        let root_fd = open_absolute_directory(root.path(), "open test root")?;
+        let lease = test_download_lease(staging.path(), target, &expected, 1, 1)?;
+        let root_access = Arc::new(SyncRootAccess::default());
+        let DownloadPreparation::Ready(mut partial) = prepare_download_slot_with_access_at(
+            &root_fd,
+            root.path(),
+            target,
+            &expected,
+            &lease,
+            &root_access,
+        )?
+        else {
+            return Err(io::Error::other("test expected a new download partial").into());
+        };
+        partial.file.write_all(bytes)?;
+        let stage_marker = internal_name("download-marker-v1", target, &expected);
+        fsetxattr(
+            &partial.file,
+            DOWNLOAD_STAGE_XATTR,
+            stage_marker.as_bytes(),
+            XattrFlags::CREATE,
+        )?;
+        fsync(&partial.file)?;
+
+        let mut journal = Journal::open(staging.path().join("journal.sqlite3"))?;
+        let _ = journal.activate_local_root(&LocalRootBinding::inspect(root.path())?)?;
+        let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
+        let (publication, worker) = root_access.with_exclusive(|| {
+            let worker = thread::Builder::new()
+                .name(String::from("test-download-promotion"))
+                .spawn(move || {
+                    let result = promote_completed_slot(&mut partial.file, &partial.location);
+                    let _ = finished_sender.send(());
+                    result
+                })?;
+            match finished_receiver.recv_timeout(Duration::from_millis(50)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Ok(()) => {
+                    return Err(io::Error::other("download mutated the root during a scan").into());
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::other("download promotion worker disconnected").into());
+                }
+            }
+            let publication = scan_and_publish(&mut journal, root.path())?;
+            Ok::<_, Box<dyn Error>>((publication, worker))
+        })?;
+
+        assert!(matches!(publication, ScanPublication::Published(_)));
+        let outcome = worker
+            .join()
+            .map_err(|_| io::Error::other("download promotion worker stopped unexpectedly"))??;
+        assert!(matches!(outcome, StageOutcome::Staged(())));
+        assert_eq!(journal.local_inventory()?.len(), 0);
+        assert!(matches!(
+            existing_download_stage_at(&root_fd, root.path(), target, &expected)?,
+            Some(StageOutcome::AlreadyStaged(()))
+        ));
         Ok(())
     }
 

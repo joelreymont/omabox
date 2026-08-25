@@ -15,6 +15,10 @@ completed operation.
 covers slot exclusivity, failure cancellation, preservation of successful
 stages, crash recovery, retry, installation, and journal completion.
 
+`ScanCoordination` checks that downloads continue while a complete local scan
+runs, but verified-stage promotion cannot mutate the sync root until that scan
+has published. It also checks that a requested scan cannot starve.
+
 Run it from this directory with the official TLA+ tools:
 
 ```sh
@@ -26,6 +30,9 @@ java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
 
 java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
   -config DownloadExecutor.cfg DownloadExecutor.tla
+
+java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
+  -config ScanCoordination.cfg ScanCoordination.tla
 ```
 
 Same- and cross-filesystem promotion share one durable abstract boundary; TLC

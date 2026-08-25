@@ -19,10 +19,10 @@ use crate::journal::{
 };
 use crate::local::{
     DownloadSlotIdentity, DownloadSlotLease, LocalError, LocalRenameOutcome,
-    MAX_PARALLEL_DOWNLOADS, ScanPublication, StageOutcome, StagedUpload, configured_root_is_active,
-    lease_download_slot, lease_download_slots, observe_upload_source, open_active_root,
-    parent_name_max, remove_unreferenced_upload_stages, rename_case_variant, rename_file_copy,
-    scan_and_publish, stage_upload,
+    MAX_PARALLEL_DOWNLOADS, ScanPublication, StageOutcome, StagedUpload, SyncRootAccess,
+    configured_root_is_active, lease_download_slot, lease_download_slots, observe_upload_source,
+    open_active_root, parent_name_max, remove_unreferenced_upload_stages, rename_case_variant,
+    rename_file_copy, scan_and_publish, stage_upload,
 };
 use crate::model::{
     Baseline, Conflict, ContentIdentity, Decision, DirectoryCollision, Observation, Operation,
@@ -182,6 +182,7 @@ pub struct ExactDownloadPool {
     pending_failure: Option<ReconcileError>,
     slots: Arc<Mutex<DownloadSlots>>,
     cancelled: Arc<AtomicBool>,
+    root_access: Arc<SyncRootAccess>,
     workers: Vec<thread::JoinHandle<()>>,
 }
 
@@ -193,6 +194,7 @@ impl ExactDownloadPool {
         let (result_sender, results) = mpsc::channel();
         let slots = Arc::new(Mutex::new(DownloadSlots::default()));
         let cancelled = Arc::new(AtomicBool::new(false));
+        let root_access = Arc::new(SyncRootAccess::default());
         let mut workers = Vec::with_capacity(MAX_PARALLEL_DOWNLOADS);
 
         for index in 0..MAX_PARALLEL_DOWNLOADS {
@@ -201,10 +203,19 @@ impl ExactDownloadPool {
             let dropbox = Arc::clone(&dropbox);
             let slots = Arc::clone(&slots);
             let cancelled = Arc::clone(&cancelled);
+            let root_access = Arc::clone(&root_access);
             match thread::Builder::new()
                 .name(format!("omabox-download-{index}"))
-                .spawn(move || download_worker(&dropbox, &receiver, &sender, &slots, &cancelled))
-            {
+                .spawn(move || {
+                    download_worker(
+                        &dropbox,
+                        &receiver,
+                        &sender,
+                        &slots,
+                        &cancelled,
+                        &root_access,
+                    )
+                }) {
                 Ok(worker) => workers.push(worker),
                 Err(source) => {
                     drop(jobs);
@@ -226,6 +237,7 @@ impl ExactDownloadPool {
             pending_failure: None,
             slots,
             cancelled,
+            root_access,
             workers,
         })
     }
@@ -340,6 +352,7 @@ fn download_worker(
     results: &mpsc::Sender<DownloadResult>,
     slots: &Mutex<DownloadSlots>,
     cancelled: &AtomicBool,
+    root_access: &Arc<SyncRootAccess>,
 ) {
     loop {
         let job = {
@@ -365,7 +378,7 @@ fn download_worker(
             }
             continue;
         }
-        let outcome = run_download_job(dropbox, job, slots);
+        let outcome = run_download_job(dropbox, job, slots, root_access);
         if outcome.is_err() {
             cancelled.store(true, Ordering::Release);
         }
@@ -385,6 +398,7 @@ fn run_download_job(
     dropbox: &DropboxClient,
     mut job: DownloadJob,
     slots: &Mutex<DownloadSlots>,
+    root_access: &Arc<SyncRootAccess>,
 ) -> Result<(), ReconcileError> {
     let (lease, reserved_slot) = match job.slot.take() {
         Some(lease) => {
@@ -393,15 +407,28 @@ fn run_download_job(
         }
         None => acquire_download_slot(&job, slots)?,
     };
-    let outcome = stage_remote_at(
-        dropbox,
-        &job.root,
-        &job.root_path,
-        &job.path,
-        &job.path,
-        &job.source,
-        lease.as_ref(),
-    );
+    let outcome = dropbox
+        .stage_worker_download_at(
+            &job.root,
+            &job.root_path,
+            &job.path,
+            &job.source,
+            lease.as_ref(),
+            root_access,
+        )
+        .map_err(|source| ReconcileError::RemoteDownload {
+            path: job.path.clone(),
+            source,
+        })
+        .and_then(|staged| match staged {
+            StageOutcome::Staged(()) | StageOutcome::AlreadyStaged(()) => Ok(()),
+            StageOutcome::ContentChanged { .. } => Err(ReconcileError::RemoteContentChanged {
+                path: job.path.clone(),
+            }),
+            StageOutcome::DestinationOccupied { path } => {
+                Err(ReconcileError::StageDestinationOccupied { path })
+            }
+        });
     if let Some(slot) = reserved_slot {
         release_download_slot(slots, slot)?;
     }
@@ -595,7 +622,10 @@ fn reconcile_active_root(
         return Ok(ReconcileOutcome::FreshObservationRequired { path });
     }
     let replay = replay_pending_at(journal, dropbox, downloads, sync_root, upload_staging)?;
-    let scan = match scan_and_publish(journal, sync_root) {
+    let scan = match downloads
+        .root_access
+        .with_exclusive(|| scan_and_publish(journal, sync_root))
+    {
         Ok(ScanPublication::Published(scan)) => scan,
         Ok(ScanPublication::RootChanged) => return Err(ReconcileError::LocalRootChanged),
         Err(LocalError::ChangedDuringRead { path, .. }) => {
@@ -1239,32 +1269,6 @@ fn require_active_local_root(journal: &Journal, sync_root: &Path) -> Result<(), 
         Ok(())
     } else {
         Err(ReconcileError::LocalRootChanged)
-    }
-}
-
-fn stage_remote_at(
-    dropbox: &DropboxClient,
-    root: &OwnedFd,
-    root_path: &Path,
-    target: &Path,
-    synchronized_path: &Path,
-    remote: &crate::model::RemoteFile,
-    slot: Option<&DownloadSlotLease>,
-) -> Result<(), ReconcileError> {
-    let staged = dropbox
-        .stage_exact_download_for_at(root, root_path, target, synchronized_path, remote, slot)
-        .map_err(|source| ReconcileError::RemoteDownload {
-            path: synchronized_path.to_path_buf(),
-            source,
-        })?;
-    match staged {
-        StageOutcome::Staged(()) | StageOutcome::AlreadyStaged(()) => Ok(()),
-        StageOutcome::ContentChanged { .. } => Err(ReconcileError::RemoteContentChanged {
-            path: synchronized_path.to_path_buf(),
-        }),
-        StageOutcome::DestinationOccupied { path } => {
-            Err(ReconcileError::StageDestinationOccupied { path })
-        }
     }
 }
 
