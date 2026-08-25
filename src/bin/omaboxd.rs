@@ -1,6 +1,7 @@
 #![deny(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use std::error::Error as StdError;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use omabox::dropbox::{
 use omabox::journal::{
     DropboxBinding, Journal, JournalError, LocalRootActivation, LocalRootBinding,
 };
-use omabox::reconcile::{ReconcileError, ReconcileOutcome, reconcile_once};
+use omabox::reconcile::{ExactDownloadPool, ReconcileError, ReconcileOutcome, reconcile_once};
 use omabox::runtime_status::{DaemonPhase, RuntimeStatus};
 use thiserror::Error;
 
@@ -110,6 +111,7 @@ fn run_session(
         Some(status) => dropbox.with_transfer_observer(status.transfer_observer()),
         None => dropbox,
     };
+    let dropbox = Arc::new(dropbox);
     match dropbox
         .validate_account(journal)
         .map_err(|source| DaemonError::Dropbox {
@@ -123,6 +125,8 @@ fn run_session(
             return Err(DaemonError::JournalBindingChanged);
         }
     }
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&dropbox))
+        .map_err(|source| DaemonError::Reconcile { source })?;
 
     tracing::info!("Omabox daemon started");
     let mut long_poll_backoff: Option<Duration> = None;
@@ -132,6 +136,7 @@ fn run_session(
         let outcome = match reconcile_once(
             journal,
             &dropbox,
+            &mut downloads,
             config.sync_root(),
             config.paths().upload_staging_directory(),
             config.paths().recovery_directory(),

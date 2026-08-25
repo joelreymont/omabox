@@ -8,12 +8,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use omabox::auth::{AccessToken, AuthError, OAuthClient, RefreshToken};
 use omabox::dropbox::{
     DropboxClient, DropboxEndpoints, DropboxError, DropboxLink, DropboxRoot, InventoryRefresh,
-    MutationOutcome, RemotePathState,
+    LongPollWakeup, MutationOutcome, RemotePathState,
 };
 use omabox::journal::{
     DropboxBinding, Journal, LocalRootBinding, PlanWrite, RemoteInventory, RemoteObservationRecord,
@@ -27,13 +27,43 @@ use omabox::model::{
     OperationPlan, RemoteFile, UnknownReason,
 };
 use omabox::planner::plan;
-use omabox::reconcile::{ReconcileError, ReconcileOutcome, reconcile_once, replay_pending};
-use omabox::recovery::{ReplayBlocked, destination, replay_remote_operations};
+use omabox::reconcile::{
+    ExactDownloadPool, ReconcileError, ReconcileOutcome, reconcile_once, replay_pending,
+};
+use omabox::recovery::{ReplayBlocked, ReplayReport, destination, replay_remote_operations};
 use omabox::runtime_status::{
     TransferDirection, TransferEvent, TransferObserver, TransferProgress,
 };
 use serde_json::json;
 use tempfile::TempDir;
+
+fn drive_replay(
+    journal: &mut Journal,
+    client: &DropboxClient,
+    downloads: &mut ExactDownloadPool,
+    root: &Path,
+    staging: &Path,
+    recovery: &Path,
+) -> io::Result<Result<ReplayReport, ReconcileError>> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match replay_pending(journal, client, downloads, root, staging, recovery) {
+            Ok(report)
+                if report
+                    .blocked
+                    .iter()
+                    .any(|blocked| matches!(blocked, ReplayBlocked::DownloadRequired { .. })) => {}
+            outcome => return Ok(outcome),
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "background download replay did not settle",
+            ));
+        }
+        thread::yield_now();
+    }
+}
 
 #[test]
 fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result<(), Box<dyn Error>>
@@ -298,21 +328,24 @@ fn one_reconciliation_pass_synchronizes_files_in_both_directions() -> Result<(),
             "cursor": "cursor-complete",
             "has_more": false
         })),
-        FakeResponse::bytes(download_bytes.to_vec()).header(
-            "Dropbox-API-Result",
-            download_metadata(
-                "download.txt",
-                "rev-download",
-                &download_content,
-                download_bytes.len(),
-            ),
-        ),
+        FakeResponse::bytes(download_bytes.to_vec())
+            .header(
+                "Dropbox-API-Result",
+                download_metadata(
+                    "download.txt",
+                    "rev-download",
+                    &download_content,
+                    download_bytes.len(),
+                ),
+            )
+            .for_path("/2/files/download"),
         FakeResponse::json(file_metadata(
             "/upload.txt",
             "/upload.txt",
             "rev-upload",
             &upload_content,
-        )),
+        ))
+        .for_path("/2/files/upload"),
     ])?;
     let transfers = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&transfers);
@@ -321,7 +354,9 @@ fn one_reconciliation_pass_synchronizes_files_in_both_directions() -> Result<(),
             samples.push(sample);
         }
     });
-    let client = fake_client(&server, "opaque-access-reconcile")?.with_transfer_observer(observer);
+    let client =
+        Arc::new(fake_client(&server, "opaque-access-reconcile")?.with_transfer_observer(observer));
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
     let directory = TempDir::new()?;
     let root = directory.path().join("root");
     let staging = directory.path().join("staging");
@@ -333,7 +368,14 @@ fn one_reconciliation_pass_synchronizes_files_in_both_directions() -> Result<(),
     let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
     let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
 
-    let report = match reconcile_once(&mut journal, &client, &root, &staging, &recovery)? {
+    let report = match reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )? {
         ReconcileOutcome::Complete(report) => report,
         ReconcileOutcome::FreshObservationRequired { .. } => {
             return Err(io::Error::other("stable fixture requested a fresh observation").into());
@@ -344,9 +386,18 @@ fn one_reconciliation_pass_synchronizes_files_in_both_directions() -> Result<(),
     };
 
     assert_eq!(report.planned, 2);
-    assert_eq!(report.replayed_operations, 2);
-    assert_eq!(report.blocked, 0);
+    assert_eq!(report.replayed_operations, 1);
+    assert_eq!(report.blocked, 1);
     assert_eq!(report.conflicts, 0);
+    let completed_download = drive_replay(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )??;
+    assert_eq!(completed_download.completed_operations, 1);
     assert_eq!(std::fs::read(root.join("download.txt"))?, download_bytes);
     assert_eq!(
         journal.baseline(Path::new("download.txt"))?,
@@ -373,23 +424,28 @@ fn one_reconciliation_pass_synchronizes_files_in_both_directions() -> Result<(),
         u64::try_from(upload_bytes.len())?,
         Some(u64::try_from(upload_bytes.len())?),
     );
-    assert!(transfers.contains(&TransferEvent::Progress(download_progress)));
+    assert!(transfers.contains(&TransferEvent::Progress(download_progress.clone())));
     assert!(transfers.contains(&TransferEvent::Progress(upload_progress.clone())));
-    assert_eq!(
-        transfers.last(),
-        Some(&TransferEvent::Finished(upload_progress))
-    );
+    assert!(transfers.contains(&TransferEvent::Finished(download_progress)));
+    assert!(transfers.contains(&TransferEvent::Finished(upload_progress)));
 
     let requests = server.finish()?;
     assert_eq!(requests.len(), 4);
     assert_eq!(requests[0].path, "/2/users/get_current_account");
     assert_eq!(requests[1].path, "/2/files/list_folder");
-    assert_eq!(requests[2].path, "/2/files/download");
-    assert_eq!(requests[3].path, "/2/files/upload");
-    assert_eq!(requests[3].body, upload_bytes);
+    let download_request = requests[2..]
+        .iter()
+        .find(|request| request.path == "/2/files/download")
+        .ok_or_else(|| io::Error::other("missing concurrent download request"))?;
+    let upload_request = requests[2..]
+        .iter()
+        .find(|request| request.path == "/2/files/upload")
+        .ok_or_else(|| io::Error::other("missing concurrent upload request"))?;
+    assert!(download_request.body.is_empty());
+    assert_eq!(upload_request.body, upload_bytes);
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(required_header(
-            &requests[3],
+            upload_request,
             "dropbox-api-arg",
         )?)?,
         json!({
@@ -537,7 +593,8 @@ fn case_only_remote_spelling_change_is_a_stable_noop() -> Result<(), Box<dyn Err
             "has_more": false
         })),
     ])?;
-    let client = fake_client(&server, "opaque-access-case-only")?;
+    let client = Arc::new(fake_client(&server, "opaque-access-case-only")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
     let directory = TempDir::new()?;
     let root = directory.path().join("root");
     let staging = directory.path().join("staging");
@@ -550,7 +607,14 @@ fn case_only_remote_spelling_change_is_a_stable_noop() -> Result<(), Box<dyn Err
     let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
     seed_baseline(&mut journal, Path::new("Report.TXT"), &remote)?;
 
-    let report = match reconcile_once(&mut journal, &client, &root, &staging, &recovery)? {
+    let report = match reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )? {
         ReconcileOutcome::Complete(report) => report,
         ReconcileOutcome::FreshObservationRequired { .. } => {
             return Err(io::Error::other("stable case-only fixture requested a refresh").into());
@@ -609,7 +673,8 @@ fn local_case_collision_is_renamed_before_planning_and_then_syncs() -> Result<()
             &second_content,
         )),
     ])?;
-    let client = fake_client(&server, "opaque-access-local-collision")?;
+    let client = Arc::new(fake_client(&server, "opaque-access-local-collision")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
     let directory = TempDir::new()?;
     let root = directory.path().join("root");
     let staging = directory.path().join("staging");
@@ -623,7 +688,14 @@ fn local_case_collision_is_renamed_before_planning_and_then_syncs() -> Result<()
     let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
 
     assert_eq!(
-        reconcile_once(&mut journal, &client, &root, &staging, &recovery)?,
+        reconcile_once(
+            &mut journal,
+            &client,
+            &mut downloads,
+            &root,
+            &staging,
+            &recovery,
+        )?,
         ReconcileOutcome::FreshObservationRequired {
             path: PathBuf::from("foo.txt")
         }
@@ -639,7 +711,14 @@ fn local_case_collision_is_renamed_before_planning_and_then_syncs() -> Result<()
 
     drop(journal);
     let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
-    let report = match reconcile_once(&mut journal, &client, &root, &staging, &recovery)? {
+    let report = match reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )? {
         ReconcileOutcome::Complete(report) => report,
         ReconcileOutcome::FreshObservationRequired { .. } => {
             return Err(io::Error::other("renamed case variants did not converge").into());
@@ -659,7 +738,8 @@ fn local_case_collision_is_renamed_before_planning_and_then_syncs() -> Result<()
 #[test]
 fn local_case_collision_preserves_both_directory_trees() -> Result<(), Box<dyn Error>> {
     let server = FakeServer::start(Vec::new())?;
-    let client = fake_client(&server, "opaque-access-directory-collision")?;
+    let client = Arc::new(fake_client(&server, "opaque-access-directory-collision")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
     let directory = TempDir::new()?;
     let root = directory.path().join("root");
     let staging = directory.path().join("staging");
@@ -676,7 +756,14 @@ fn local_case_collision_preserves_both_directory_trees() -> Result<(), Box<dyn E
     let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
 
     assert_eq!(
-        reconcile_once(&mut journal, &client, &root, &staging, &recovery)?,
+        reconcile_once(
+            &mut journal,
+            &client,
+            &mut downloads,
+            &root,
+            &staging,
+            &recovery,
+        )?,
         ReconcileOutcome::FreshObservationRequired {
             path: PathBuf::from("credit")
         }
@@ -693,7 +780,14 @@ fn local_case_collision_preserves_both_directory_trees() -> Result<(), Box<dyn E
     assert!(journal.pending_plans()?.is_empty());
 
     assert_eq!(
-        reconcile_once(&mut journal, &client, &root, &staging, &recovery)?,
+        reconcile_once(
+            &mut journal,
+            &client,
+            &mut downloads,
+            &root,
+            &staging,
+            &recovery,
+        )?,
         ReconcileOutcome::FreshObservationRequired {
             path: PathBuf::from("credit (case variant)/expenses")
         }
@@ -725,6 +819,7 @@ fn local_case_collision_preserves_both_directory_trees() -> Result<(), Box<dyn E
 #[test]
 fn pending_exact_downloads_use_bounded_parallel_workers() -> Result<(), Box<dyn Error>> {
     const DOWNLOAD_COUNT: usize = 8;
+    const WORKER_COUNT: usize = 4;
 
     let bytes = b"bounded parallel download";
     let content = dropbox_content_hash(bytes.as_slice())?;
@@ -735,15 +830,20 @@ fn pending_exact_downloads_use_bounded_parallel_workers() -> Result<(), Box<dyn 
         &content,
         bytes.len(),
     );
-    let responses = (0..DOWNLOAD_COUNT)
+    let response_groups = (0..WORKER_COUNT)
         .map(|_| {
-            FakeResponse::bytes(bytes.to_vec())
-                .header("Dropbox-API-Result", metadata.clone())
-                .delay(Duration::from_millis(150))
+            (0..(DOWNLOAD_COUNT / WORKER_COUNT))
+                .map(|_| {
+                    FakeResponse::bytes(bytes.to_vec())
+                        .header("Dropbox-API-Result", metadata.clone())
+                        .delay(Duration::from_millis(150))
+                })
+                .collect()
         })
         .collect();
-    let server = FakeServer::start(responses)?;
-    let client = fake_client(&server, "opaque-access-parallel")?;
+    let server = FakeServer::start_keep_alive(response_groups)?;
+    let client = Arc::new(fake_client(&server, "opaque-access-parallel")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
     let directory = TempDir::new()?;
     let root = directory.path().join("root");
     let staging = directory.path().join("staging");
@@ -770,15 +870,35 @@ fn pending_exact_downloads_use_bounded_parallel_workers() -> Result<(), Box<dyn 
         paths.push(path);
     }
 
-    let report = replay_pending(&mut journal, &client, &root, &staging, &recovery)?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut completed_operations = 0;
+    while !journal.pending_plans()?.is_empty() {
+        let report = replay_pending(
+            &mut journal,
+            &client,
+            &mut downloads,
+            &root,
+            &staging,
+            &recovery,
+        )?;
+        completed_operations += report.completed_operations;
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "parallel downloads did not finish",
+            )
+            .into());
+        }
+        thread::yield_now();
+    }
 
-    assert_eq!(report.completed_operations, DOWNLOAD_COUNT);
-    assert!(report.blocked.is_empty());
+    assert_eq!(completed_operations, DOWNLOAD_COUNT);
     assert!(journal.pending_plans()?.is_empty());
     for path in paths {
         assert_eq!(std::fs::read(root.join(path))?, bytes);
     }
     let maximum_active = server.maximum_active();
+    let connection_count = server.connection_count();
     let requests = server.finish()?;
     assert_eq!(requests.len(), DOWNLOAD_COUNT);
     assert!(
@@ -788,6 +908,167 @@ fn pending_exact_downloads_use_bounded_parallel_workers() -> Result<(), Box<dyn 
     );
     assert!(maximum_active >= 2);
     assert!(maximum_active <= 4);
+    assert!(connection_count <= 4);
+    Ok(())
+}
+
+#[test]
+fn gated_download_does_not_stop_the_next_poll_and_reconciliation() -> Result<(), Box<dyn Error>> {
+    let download_bytes = b"long remote download";
+    let download_content = dropbox_content_hash(download_bytes.as_slice())?;
+    let download = RemoteFile::new(
+        download_content.clone(),
+        DropboxRevision::new("long-download-revision"),
+    );
+    let upload_bytes = b"local change during download";
+    let upload_content = dropbox_content_hash(upload_bytes.as_slice())?;
+    let uploaded = RemoteFile::new(
+        upload_content.clone(),
+        DropboxRevision::new("unrelated-upload-revision"),
+    );
+    let response = FakeResponse::bytes(download_bytes.to_vec()).header(
+        "Dropbox-API-Result",
+        download_metadata(
+            "long.bin",
+            download.revision.as_str(),
+            &download_content,
+            download_bytes.len(),
+        ),
+    );
+    let (response, gate) = response.gated();
+    let server = FakeServer::start(vec![
+        response,
+        FakeResponse::json(json!({"changes": false})),
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [],
+            "cursor": "cursor-after-gated-download",
+            "has_more": false
+        })),
+        FakeResponse::json(file_metadata(
+            "/unrelated.txt",
+            "/unrelated.txt",
+            uploaded.revision.as_str(),
+            &upload_content,
+        )),
+    ])?;
+    let finished_transfers = Arc::new(AtomicUsize::new(0));
+    let recorded_finishes = Arc::clone(&finished_transfers);
+    let observer: TransferObserver = Arc::new(move |event| {
+        if matches!(event, TransferEvent::Finished(_)) {
+            recorded_finishes.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let client = Arc::new(
+        fake_client(&server, "opaque-access-nonblocking")?.with_transfer_observer(observer),
+    );
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    let download_plan = planned_operations(plan(
+        &Baseline::Absent,
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(download.clone()),
+    ))?;
+    if !matches!(
+        journal.record_plan(Path::new("long.bin"), &download_plan)?,
+        PlanWrite::Recorded(_)
+    ) {
+        return Err(io::Error::other("fresh long download plan was already pending").into());
+    }
+
+    let dispatched = replay_pending(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?;
+    assert_eq!(dispatched.completed_operations, 0);
+    gate.request_received.recv().map_err(|_| {
+        io::Error::other("fake Dropbox server stopped before receiving the long download")
+    })?;
+
+    assert!(matches!(
+        client.long_poll("cursor-before-gated-download", Duration::from_secs(30))?,
+        LongPollWakeup::TimedOut { backoff: None }
+    ));
+    std::fs::write(root.join("unrelated.txt"), upload_bytes)?;
+    let started = Instant::now();
+    let report = match reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )? {
+        ReconcileOutcome::Complete(report) => report,
+        ReconcileOutcome::FreshObservationRequired { .. } => {
+            return Err(
+                io::Error::other("stable local change requested a fresh observation").into(),
+            );
+        }
+        ReconcileOutcome::LocalRootChanged => {
+            return Err(io::Error::other("stable fixture changed its local root").into());
+        }
+    };
+    assert!(started.elapsed() < Duration::from_secs(30));
+    assert_eq!(report.planned, 1);
+    assert_eq!(report.replayed_operations, 1);
+    assert_eq!(
+        journal.baseline(Path::new("unrelated.txt"))?,
+        Some(Baseline::Present(uploaded))
+    );
+    assert_eq!(journal.pending_plans()?.len(), 1);
+    assert!(!root.join("long.bin").exists());
+
+    let finishes_before_release = finished_transfers.load(Ordering::SeqCst);
+    gate.release_response
+        .send(())
+        .map_err(|_| io::Error::other("fake Dropbox response worker stopped before release"))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while finished_transfers.load(Ordering::SeqCst) == finishes_before_release {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "long download did not finish after release",
+            )
+            .into());
+        }
+        thread::yield_now();
+    }
+    while !journal.pending_plans()?.is_empty() {
+        let _report = replay_pending(
+            &mut journal,
+            &client,
+            &mut downloads,
+            &root,
+            &staging,
+            &recovery,
+        )?;
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "released long download was not installed",
+            )
+            .into());
+        }
+        thread::yield_now();
+    }
+    assert_eq!(std::fs::read(root.join("long.bin"))?, download_bytes);
+    assert_eq!(server.finish()?.len(), 5);
     Ok(())
 }
 
@@ -849,7 +1130,8 @@ fn interrupted_exact_download_resumes_only_from_a_valid_range() -> Result<(), Bo
         FakeResponse::range(bytes[CHECKPOINT..].to_vec(), metadata, valid_range),
     ];
     let server = FakeServer::start(responses)?;
-    let client = fake_client(&server, "opaque-access-resume")?;
+    let client = Arc::new(fake_client(&server, "opaque-access-resume")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
     let directory = TempDir::new()?;
     let root = directory.path().join("root");
     let staging = directory.path().join("staging");
@@ -871,7 +1153,17 @@ fn interrupted_exact_download_resumes_only_from_a_valid_range() -> Result<(), Bo
         return Err(io::Error::other("fresh resume plan was already pending").into());
     }
 
-    assert!(replay_pending(&mut journal, &client, &root, &staging, &recovery).is_err());
+    let mut replay = || {
+        drive_replay(
+            &mut journal,
+            &client,
+            &mut downloads,
+            &root,
+            &staging,
+            &recovery,
+        )
+    };
+    assert!(replay()?.is_err());
     let partial = std::fs::read_dir(&staging)?
         .map(|entry| entry.map(|entry| entry.path()))
         .collect::<Result<Vec<_>, _>>()?
@@ -886,7 +1178,7 @@ fn interrupted_exact_download_resumes_only_from_a_valid_range() -> Result<(), Bo
         u64::try_from(CHECKPOINT + DROPBOX_BLOCK)?
     );
     assert!(matches!(
-        replay_pending(&mut journal, &client, &root, &staging, &recovery),
+        replay()?,
         Err(ReconcileError::RemoteDownload {
             source: DropboxError::InvalidDownloadRange,
             ..
@@ -897,55 +1189,56 @@ fn interrupted_exact_download_resumes_only_from_a_valid_range() -> Result<(), Bo
         u64::try_from(CHECKPOINT)?
     );
     assert!(matches!(
-        replay_pending(&mut journal, &client, &root, &staging, &recovery),
+        replay()?,
         Err(ReconcileError::RemoteDownload {
             source: DropboxError::InvalidDownloadRange,
             ..
         })
     ));
     assert!(matches!(
-        replay_pending(&mut journal, &client, &root, &staging, &recovery),
+        replay()?,
         Err(ReconcileError::RemoteDownload {
             source: DropboxError::InvalidDownloadRange,
             ..
         })
     ));
     assert!(matches!(
-        replay_pending(&mut journal, &client, &root, &staging, &recovery),
+        replay()?,
         Err(ReconcileError::RemoteDownload {
             source: DropboxError::InvalidDownloadRange,
             ..
         })
     ));
     assert!(matches!(
-        replay_pending(&mut journal, &client, &root, &staging, &recovery),
+        replay()?,
         Err(ReconcileError::RemoteDownload {
             source: DropboxError::DownloadedRevisionChanged,
             ..
         })
     ));
     assert!(matches!(
-        replay_pending(&mut journal, &client, &root, &staging, &recovery),
+        replay()?,
         Err(ReconcileError::RemoteDownload {
             source: DropboxError::DownloadedIdentityChanged,
             ..
         })
     ));
     assert!(matches!(
-        replay_pending(&mut journal, &client, &root, &staging, &recovery),
+        replay()?,
         Err(ReconcileError::RemoteDownload {
             source: DropboxError::DownloadedSizeChanged,
             ..
         })
     ));
     assert!(matches!(
-        replay_pending(&mut journal, &client, &root, &staging, &recovery),
+        replay()?,
         Err(ReconcileError::RemoteDownload {
             source: DropboxError::DownloadedLengthChanged,
             ..
         })
     ));
-    let report = replay_pending(&mut journal, &client, &root, &staging, &recovery)?;
+    let report = replay()??;
+    drop(replay);
     assert_eq!(report.completed_operations, 1);
     assert_eq!(std::fs::read(root.join("resume.bin"))?, bytes);
     assert!(journal.pending_plans()?.is_empty());
@@ -973,7 +1266,8 @@ fn unknown_download_slots_are_preserved_with_disposable_fallback() -> Result<(),
             bytes.len(),
         ),
     )])?;
-    let client = fake_client(&server, "opaque-access-fallback")?;
+    let client = Arc::new(fake_client(&server, "opaque-access-fallback")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
     let directory = TempDir::new()?;
     let root = directory.path().join("root");
     let staging = directory.path().join("staging");
@@ -1000,7 +1294,14 @@ fn unknown_download_slots_are_preserved_with_disposable_fallback() -> Result<(),
     ))?;
     let _ = journal.record_plan(Path::new("fallback.txt"), &operations)?;
 
-    let report = replay_pending(&mut journal, &client, &root, &staging, &recovery)?;
+    let report = drive_replay(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )??;
 
     assert_eq!(report.completed_operations, 1);
     assert_eq!(std::fs::read(root.join("fallback.txt"))?, bytes);
@@ -1037,7 +1338,8 @@ fn root_swap_after_replay_validation_never_touches_the_replacement() -> Result<(
     );
     let (response, gate) = response.gated();
     let server = FakeServer::start(vec![response])?;
-    let client = fake_client(&server, "opaque-access-root-swap-download")?;
+    let client = Arc::new(fake_client(&server, "opaque-access-root-swap-download")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
     let directory = TempDir::new()?;
     let root = directory.path().join("root");
     let old_root = directory.path().join("old-root");
@@ -1061,30 +1363,56 @@ fn root_swap_after_replay_validation_never_touches_the_replacement() -> Result<(
         return Err(io::Error::other("fresh root-swap plan was already pending").into());
     }
 
-    let outcome = thread::scope(
-        |scope| -> Result<Result<_, ReconcileError>, Box<dyn Error>> {
-            let worker = thread::Builder::new().spawn_scoped(scope, || {
-                replay_pending(&mut journal, &client, &root, &staging, &recovery)
-            })?;
-            gate.request_received.recv().map_err(|_| {
-                io::Error::other("fake Dropbox server stopped before receiving the request")
-            })?;
-            let swap = (|| -> io::Result<()> {
-                std::fs::rename(&root, &old_root)?;
-                std::fs::create_dir(&root)?;
-                std::fs::write(root.join("canary.txt"), b"replacement bytes")
-            })();
-            let release = gate.release_response.send(()).map_err(|_| {
-                io::Error::other("fake Dropbox response worker stopped before release")
-            });
-            swap?;
-            release?;
-            worker
-                .join()
-                .map_err(|_| io::Error::other("replay worker stopped unexpectedly"))
-                .map_err(Into::into)
-        },
+    let dispatched = replay_pending(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
     )?;
+    assert_eq!(dispatched.completed_operations, 0);
+    gate.request_received.recv().map_err(|_| {
+        io::Error::other("fake Dropbox server stopped before receiving the request")
+    })?;
+    std::fs::rename(&root, &old_root)?;
+    std::fs::create_dir(&root)?;
+    std::fs::write(root.join("canary.txt"), b"replacement bytes")?;
+    gate.release_response
+        .send(())
+        .map_err(|_| io::Error::other("fake Dropbox response worker stopped before release"))?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let staged = std::fs::read_dir(&old_root)?.any(|entry| {
+            entry.is_ok_and(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".omabox-download-")
+            })
+        });
+        if staged {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "descriptor-bound download was not staged",
+            )
+            .into());
+        }
+        thread::yield_now();
+    }
+
+    let outcome = replay_pending(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    );
 
     assert!(matches!(outcome, Err(ReconcileError::LocalRootChanged)));
     assert_eq!(
@@ -1131,7 +1459,8 @@ fn completed_download_batch_is_installed_before_the_next_batch_fails() -> Result
         json!({"error": "later batch"}),
     ));
     let server = FakeServer::start(responses)?;
-    let client = fake_client(&server, "opaque-access-batches")?;
+    let client = Arc::new(fake_client(&server, "opaque-access-batches")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
     let directory = TempDir::new()?;
     let root = directory.path().join("root");
     let staging = directory.path().join("staging");
@@ -1158,7 +1487,17 @@ fn completed_download_batch_is_installed_before_the_next_batch_fails() -> Result
         }
     }
 
-    assert!(replay_pending(&mut journal, &client, &root, &staging, &recovery).is_err());
+    assert!(
+        drive_replay(
+            &mut journal,
+            &client,
+            &mut downloads,
+            &root,
+            &staging,
+            &recovery,
+        )?
+        .is_err()
+    );
 
     for path in &paths[..COMPLETED_BATCH] {
         assert_eq!(std::fs::read(root.join(path))?, bytes);
@@ -1248,7 +1587,8 @@ fn long_poll_exposes_reset_and_rate_limit_outcomes() -> Result<(), Box<dyn Error
 #[test]
 fn replaced_local_root_never_replays_pending_deletion() -> Result<(), Box<dyn Error>> {
     let server = FakeServer::start(Vec::new())?;
-    let client = fake_client(&server, "opaque-access-root-replacement")?;
+    let client = Arc::new(fake_client(&server, "opaque-access-root-replacement")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
     let directory = TempDir::new()?;
     let root = directory.path().join("root");
     let old_root = directory.path().join("old-root");
@@ -1278,7 +1618,14 @@ fn replaced_local_root_never_replays_pending_deletion() -> Result<(), Box<dyn Er
     std::fs::write(root.join(path), bytes)?;
 
     assert_eq!(
-        reconcile_once(&mut journal, &client, &root, &staging, &recovery)?,
+        reconcile_once(
+            &mut journal,
+            &client,
+            &mut downloads,
+            &root,
+            &staging,
+            &recovery,
+        )?,
         ReconcileOutcome::LocalRootChanged
     );
     assert_eq!(std::fs::read(root.join(path))?, bytes);
@@ -2457,6 +2804,7 @@ struct FakeServer {
     base: String,
     worker: JoinHandle<io::Result<Vec<FakeRequest>>>,
     maximum_active: Arc<AtomicUsize>,
+    connection_count: Arc<AtomicUsize>,
 }
 
 impl FakeServer {
@@ -2465,11 +2813,38 @@ impl FakeServer {
         let base = format!("http://{}", listener.local_addr()?);
         let maximum_active = Arc::new(AtomicUsize::new(0));
         let server_maximum = Arc::clone(&maximum_active);
-        let worker = thread::spawn(move || serve(listener, responses, server_maximum));
+        let connection_count = Arc::new(AtomicUsize::new(0));
+        let server_connections = Arc::clone(&connection_count);
+        let worker =
+            thread::spawn(move || serve(listener, responses, server_maximum, server_connections));
         Ok(Self {
             base,
             worker,
             maximum_active,
+            connection_count,
+        })
+    }
+
+    fn start_keep_alive(response_groups: Vec<Vec<FakeResponse>>) -> io::Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let maximum_active = Arc::new(AtomicUsize::new(0));
+        let server_maximum = Arc::clone(&maximum_active);
+        let connection_count = Arc::new(AtomicUsize::new(0));
+        let server_connections = Arc::clone(&connection_count);
+        let worker = thread::spawn(move || {
+            serve_keep_alive(
+                listener,
+                response_groups,
+                server_maximum,
+                server_connections,
+            )
+        });
+        Ok(Self {
+            base,
+            worker,
+            maximum_active,
+            connection_count,
         })
     }
 
@@ -2492,12 +2867,17 @@ impl FakeServer {
     fn maximum_active(&self) -> usize {
         self.maximum_active.load(Ordering::SeqCst)
     }
+
+    fn connection_count(&self) -> usize {
+        self.connection_count.load(Ordering::SeqCst)
+    }
 }
 
 struct FakeResponse {
     status: u16,
     body: Vec<u8>,
     headers: Vec<(String, String)>,
+    request_path: Option<String>,
     delay: Duration,
     disconnect_after: Option<usize>,
     send_content_length: bool,
@@ -2527,6 +2907,7 @@ impl FakeResponse {
                 String::from("Content-Type"),
                 String::from("application/json"),
             )],
+            request_path: None,
             delay: Duration::ZERO,
             disconnect_after: None,
             send_content_length: true,
@@ -2542,6 +2923,7 @@ impl FakeResponse {
                 String::from("Content-Type"),
                 String::from("application/octet-stream"),
             )],
+            request_path: None,
             delay: Duration::ZERO,
             disconnect_after: None,
             send_content_length: true,
@@ -2557,6 +2939,7 @@ impl FakeResponse {
                 (String::from("Dropbox-API-Result"), metadata),
                 (String::from("Content-Range"), content_range),
             ],
+            request_path: None,
             delay: Duration::ZERO,
             disconnect_after: None,
             send_content_length: true,
@@ -2566,6 +2949,11 @@ impl FakeResponse {
 
     fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    fn for_path(mut self, path: impl Into<String>) -> Self {
+        self.request_path = Some(path.into());
         self
     }
 
@@ -2609,33 +2997,45 @@ struct FakeRequest {
 
 fn serve(
     listener: TcpListener,
-    responses: Vec<FakeResponse>,
+    mut responses: Vec<FakeResponse>,
     maximum_active: Arc<AtomicUsize>,
+    connection_count: Arc<AtomicUsize>,
 ) -> io::Result<Vec<FakeRequest>> {
     let active = Arc::new(AtomicUsize::new(0));
     let mut handlers: Vec<JoinHandle<io::Result<FakeRequest>>> =
         Vec::with_capacity(responses.len());
-    for response in responses {
+    let response_count = responses.len();
+    for _ in 0..response_count {
         let (mut stream, _) = listener.accept()?;
+        connection_count.fetch_add(1, Ordering::SeqCst);
+        let request = read_request(&mut stream)?;
+        let response_index = match responses
+            .iter()
+            .position(|response| response.request_path.as_deref() == Some(request.path.as_str()))
+        {
+            Some(index) => index,
+            None => responses
+                .iter()
+                .position(|response| response.request_path.is_none())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("no fake response matches request path `{}`", request.path),
+                    )
+                })?,
+        };
+        let response = responses.remove(response_index);
         let active = Arc::clone(&active);
         let maximum_active = Arc::clone(&maximum_active);
-        handlers.push(thread::spawn(move || {
-            let request = read_request(&mut stream)?;
-            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
-            maximum_active.fetch_max(current, Ordering::SeqCst);
-            if let Some(gate) = &response.gate {
-                gate.request_received.send(()).map_err(|_| {
-                    io::Error::other("root-swap test stopped before request notification")
-                })?;
-                gate.release_response.recv().map_err(|_| {
-                    io::Error::other("root-swap test stopped before response release")
-                })?;
-            }
-            thread::sleep(response.delay);
-            let written = write_response(&mut stream, response);
-            active.fetch_sub(1, Ordering::SeqCst);
-            written?;
-            Ok(request)
+        handlers.push(thread::spawn(move || -> io::Result<FakeRequest> {
+            finish_response(
+                &mut stream,
+                request,
+                response,
+                &active,
+                &maximum_active,
+                true,
+            )
         }));
     }
     let mut requests = Vec::with_capacity(handlers.len());
@@ -2647,6 +3047,83 @@ fn serve(
         );
     }
     Ok(requests)
+}
+
+fn serve_keep_alive(
+    listener: TcpListener,
+    response_groups: Vec<Vec<FakeResponse>>,
+    maximum_active: Arc<AtomicUsize>,
+    connection_count: Arc<AtomicUsize>,
+) -> io::Result<Vec<FakeRequest>> {
+    let active = Arc::new(AtomicUsize::new(0));
+    let mut handlers = Vec::with_capacity(response_groups.len());
+    for responses in response_groups {
+        let (mut stream, _) = listener.accept()?;
+        connection_count.fetch_add(1, Ordering::SeqCst);
+        let active = Arc::clone(&active);
+        let maximum_active = Arc::clone(&maximum_active);
+        handlers.push(thread::spawn(move || -> io::Result<Vec<FakeRequest>> {
+            let response_count = responses.len();
+            let mut requests = Vec::with_capacity(response_count);
+            for (index, response) in responses.into_iter().enumerate() {
+                requests.push(serve_response(
+                    &mut stream,
+                    response,
+                    &active,
+                    &maximum_active,
+                    index + 1 == response_count,
+                )?);
+            }
+            Ok(requests)
+        }));
+    }
+    let mut requests = Vec::new();
+    for handler in handlers {
+        requests.extend(
+            handler
+                .join()
+                .map_err(|_| io::Error::other("fake keep-alive response worker failed"))??,
+        );
+    }
+    Ok(requests)
+}
+
+fn serve_response(
+    stream: &mut TcpStream,
+    response: FakeResponse,
+    active: &AtomicUsize,
+    maximum_active: &AtomicUsize,
+    close: bool,
+) -> io::Result<FakeRequest> {
+    let request = read_request(stream)?;
+    finish_response(stream, request, response, active, maximum_active, close)
+}
+
+fn finish_response(
+    stream: &mut TcpStream,
+    request: FakeRequest,
+    response: FakeResponse,
+    active: &AtomicUsize,
+    maximum_active: &AtomicUsize,
+    close: bool,
+) -> io::Result<FakeRequest> {
+    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+    maximum_active.fetch_max(current, Ordering::SeqCst);
+    let outcome = (|| {
+        if let Some(gate) = &response.gate {
+            gate.request_received
+                .send(())
+                .map_err(|_| io::Error::other("test stopped before fake request notification"))?;
+            gate.release_response
+                .recv()
+                .map_err(|_| io::Error::other("test stopped before fake response release"))?;
+        }
+        thread::sleep(response.delay);
+        write_response(stream, response, close)
+    })();
+    active.fetch_sub(1, Ordering::SeqCst);
+    outcome?;
+    Ok(request)
 }
 
 fn read_request(stream: &mut TcpStream) -> io::Result<FakeRequest> {
@@ -2696,7 +3173,7 @@ fn read_request(stream: &mut TcpStream) -> io::Result<FakeRequest> {
     })
 }
 
-fn write_response(stream: &mut TcpStream, response: FakeResponse) -> io::Result<()> {
+fn write_response(stream: &mut TcpStream, response: FakeResponse, close: bool) -> io::Result<()> {
     let reason = if response.status == 200 {
         "OK"
     } else {
@@ -2706,7 +3183,11 @@ fn write_response(stream: &mut TcpStream, response: FakeResponse) -> io::Result<
     if response.send_content_length {
         write!(stream, "Content-Length: {}\r\n", response.body.len())?;
     }
-    stream.write_all(b"Connection: close\r\n")?;
+    if close {
+        stream.write_all(b"Connection: close\r\n")?;
+    } else {
+        stream.write_all(b"Connection: keep-alive\r\n")?;
+    }
     for (name, value) in response.headers {
         write!(stream, "{name}: {value}\r\n")?;
     }
