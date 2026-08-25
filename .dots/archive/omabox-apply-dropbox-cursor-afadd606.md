@@ -1,9 +1,11 @@
 ---
 title: Apply Dropbox cursor deltas
-status: active
+status: closed
 priority: 0
 issue-type: task
-created-at: "\"2026-08-24T23:42:15.788967+02:00\""
+created-at: "\"\\\"2026-08-24T23:42:15.788967+02:00\\\"\""
+closed-at: "2026-08-25T12:40:30.189155+02:00"
+close-reason: Landed as cfe58325. All cursor continuation pages validate before one atomic ordered delta/cursor transaction; empty deltas mutate only the cursor; reset alone rebuilds. A 10,000-row one-file delta performs three row mutations, uses the canonical-path index with no table scan, and makes no full-list request. Later-page failures preserve the previous snapshot. Verified fmt, clippy -D warnings, 204 tests, diff/forbidden scans, and independent Sol review CLEAN.
 blocks:
   - omabox-synchronize-directories-as-e5c2cb99
 ---
