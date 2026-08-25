@@ -31,7 +31,7 @@ pub enum DaemonPhase {
     Error,
 }
 
-/// Direction of one active byte transfer.
+/// Direction of one byte transfer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransferDirection {
@@ -41,7 +41,7 @@ pub enum TransferDirection {
     Download,
 }
 
-/// A sampled active transfer. The path is always relative to the sync root.
+/// A sampled transfer. The path is always relative to the sync root.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct TransferProgress {
     direction: TransferDirection,
@@ -120,6 +120,7 @@ impl RuntimeStatus {
         let mut publisher = Publisher {
             path: directory.join(STATUS_FILE),
             directory,
+            retained_finished: false,
             snapshot: StatusSnapshot {
                 version: SCHEMA_VERSION,
                 phase: DaemonPhase::Starting,
@@ -137,8 +138,12 @@ impl RuntimeStatus {
     /// Publish a phase transition.
     pub fn phase(&self, phase: DaemonPhase) {
         self.update(|publisher| {
+            let changed = publisher.snapshot.phase != phase;
             publisher.snapshot.phase = phase;
-            publisher.snapshot.transfers.clear();
+            if changed {
+                publisher.snapshot.transfers.clear();
+                publisher.retained_finished = false;
+            }
             true
         });
     }
@@ -153,6 +158,7 @@ impl RuntimeStatus {
         self.update(|publisher| {
             publisher.snapshot.phase = DaemonPhase::Error;
             publisher.snapshot.transfers.clear();
+            publisher.retained_finished = false;
             publisher.snapshot.last_error = Some(message);
             true
         });
@@ -187,6 +193,7 @@ impl RuntimeStatus {
 struct Publisher {
     directory: PathBuf,
     path: PathBuf,
+    retained_finished: bool,
     snapshot: StatusSnapshot,
 }
 
@@ -199,6 +206,10 @@ impl Publisher {
     }
 
     fn record_progress(&mut self, progress: TransferProgress) -> bool {
+        if self.retained_finished {
+            self.snapshot.transfers.clear();
+            self.retained_finished = false;
+        }
         match self
             .snapshot
             .transfers
@@ -219,7 +230,14 @@ impl Publisher {
         self.snapshot
             .transfers
             .retain(|current| !current.same_transfer(finished));
-        previous_len != self.snapshot.transfers.len()
+        if previous_len == self.snapshot.transfers.len() {
+            return false;
+        }
+        if self.snapshot.transfers.is_empty() {
+            self.snapshot.transfers.push(finished.clone());
+            self.retained_finished = true;
+        }
+        true
     }
 
     fn publish(&mut self) -> Result<(), RuntimeStatusError> {
@@ -417,9 +435,11 @@ mod tests {
     }
 
     #[test]
-    fn every_active_transfer_is_published_until_it_finishes() -> Result<(), Box<dyn Error>> {
+    fn finished_transfer_remains_visible_until_activity_or_phase_changes()
+    -> Result<(), Box<dyn Error>> {
         let runtime = TempDir::new()?;
         let status = RuntimeStatus::new(runtime.path())?;
+        status.phase(DaemonPhase::Syncing);
         let observer = status.transfer_observer();
         let first = TransferProgress::new(
             TransferDirection::Download,
@@ -448,9 +468,34 @@ mod tests {
         assert_eq!(promoted["transfers"][0]["path"], "second.txt");
         assert_eq!(promoted["transfers"][0]["bytes_done"], 7);
 
-        observer(TransferEvent::Finished(second));
-        let complete = serde_json::from_slice::<Value>(&fs::read(path)?)?;
-        assert_eq!(complete["transfers"], serde_json::json!([]));
+        observer(TransferEvent::Finished(TransferProgress::new(
+            TransferDirection::Download,
+            Path::new("second.txt"),
+            20,
+            Some(20),
+        )));
+        let complete = serde_json::from_slice::<Value>(&fs::read(&path)?)?;
+        assert_eq!(complete["transfers"].as_array().map(Vec::len), Some(1));
+        assert_eq!(complete["transfers"][0]["path"], "second.txt");
+        assert_eq!(complete["transfers"][0]["bytes_done"], 20);
+        status.phase(DaemonPhase::Syncing);
+        let next_pass = serde_json::from_slice::<Value>(&fs::read(&path)?)?;
+        assert_eq!(next_pass["transfers"][0]["path"], "second.txt");
+
+        let third = TransferProgress::new(
+            TransferDirection::Upload,
+            Path::new("third.txt"),
+            2,
+            Some(9),
+        );
+        observer(TransferEvent::Progress(third));
+        let replaced = serde_json::from_slice::<Value>(&fs::read(&path)?)?;
+        assert_eq!(replaced["transfers"].as_array().map(Vec::len), Some(1));
+        assert_eq!(replaced["transfers"][0]["path"], "third.txt");
+
+        status.phase(DaemonPhase::Waiting);
+        let waiting = serde_json::from_slice::<Value>(&fs::read(path)?)?;
+        assert_eq!(waiting["transfers"], serde_json::json!([]));
         Ok(())
     }
 
