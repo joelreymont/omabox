@@ -958,23 +958,6 @@ impl Journal {
         cursor: &str,
         observations: &[RemoteObservationRecord],
     ) -> Result<(), JournalError> {
-        let encoded = observations
-            .iter()
-            .map(|record| {
-                encode(
-                    &record.observation,
-                    "serialize remote observation",
-                    &record.path,
-                )
-                .map(|json| {
-                    (
-                        path_bytes(&record.path),
-                        path_bytes(&record.canonical_path),
-                        json,
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let database_path = self.database_path.clone();
         let transaction = self
             .connection
@@ -985,15 +968,36 @@ impl Journal {
         transaction
             .execute("DELETE FROM remote_observations", [])
             .map_err(|source| sqlite("replace remote inventory", &database_path, source))?;
-        for (path, canonical_path, json) in encoded {
-            transaction
-                .execute(
+        {
+            let mut statement = transaction
+                .prepare(
                     "INSERT INTO remote_observations(\
                          path, observation_json, canonical_path\
                      ) VALUES (?1, ?2, ?3)",
-                    params![path, json, canonical_path],
                 )
-                .map_err(|source| sqlite("publish remote observation", &database_path, source))?;
+                .map_err(|source| {
+                    sqlite(
+                        "prepare remote inventory publication",
+                        &database_path,
+                        source,
+                    )
+                })?;
+            for record in observations {
+                let json = encode(
+                    &record.observation,
+                    "serialize remote observation",
+                    &record.path,
+                )?;
+                statement
+                    .execute(params![
+                        path_bytes(&record.path),
+                        json,
+                        path_bytes(&record.canonical_path)
+                    ])
+                    .map_err(|source| {
+                        sqlite("publish remote observation", &database_path, source)
+                    })?;
+            }
         }
         transaction
             .execute(
@@ -2550,16 +2554,14 @@ fn read_local_inventory(
             Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(|source| sqlite("query local inventory", database_path, source))?;
-    let raw = rows
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| sqlite("read local inventory", database_path, source))?;
-    raw.into_iter()
-        .map(|(raw_path, json)| {
-            let path = bytes_path(raw_path);
-            let observation = decode(&json, "deserialize local observation", &path)?;
-            Ok(LocalObservationRecord { path, observation })
-        })
-        .collect()
+    rows.map(|row| {
+        let (raw_path, json) =
+            row.map_err(|source| sqlite("read local inventory", database_path, source))?;
+        let path = bytes_path(raw_path);
+        let observation = decode(&json, "deserialize local observation", &path)?;
+        Ok(LocalObservationRecord { path, observation })
+    })
+    .collect()
 }
 
 fn read_local_hash_cache(
@@ -2580,27 +2582,25 @@ fn read_local_hash_cache(
             Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(|source| sqlite("query local hash cache", database_path, source))?;
-    let raw = rows
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| sqlite("read local hash cache", database_path, source))?;
-    raw.into_iter()
-        .map(|(raw_path, json)| {
-            let path = bytes_path(raw_path);
-            let value: LocalHashValue = decode(&json, "deserialize local hash cache", &path)?;
-            if !is_dropbox_content_hash(value.content.as_str()) {
-                return Err(JournalError::InvalidState {
-                    operation: "read local hash cache",
-                    path,
-                    detail: "cached content identity is not a Dropbox content hash",
-                });
-            }
-            Ok(LocalHashRecord {
+    rows.map(|row| {
+        let (raw_path, json) =
+            row.map_err(|source| sqlite("read local hash cache", database_path, source))?;
+        let path = bytes_path(raw_path);
+        let value: LocalHashValue = decode(&json, "deserialize local hash cache", &path)?;
+        if !is_dropbox_content_hash(value.content.as_str()) {
+            return Err(JournalError::InvalidState {
+                operation: "read local hash cache",
                 path,
-                fingerprint: value.fingerprint,
-                content: value.content,
-            })
+                detail: "cached content identity is not a Dropbox content hash",
+            });
+        }
+        Ok(LocalHashRecord {
+            path,
+            fingerprint: value.fingerprint,
+            content: value.content,
         })
-        .collect()
+    })
+    .collect()
 }
 
 fn read_remote_observations(
@@ -2626,21 +2626,19 @@ fn read_remote_observations(
             ))
         })
         .map_err(|source| sqlite("query remote inventory", database_path, source))?;
-    let raw = rows
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| sqlite("read remote inventory", database_path, source))?;
-    raw.into_iter()
-        .map(|(raw_canonical_path, raw_path, json)| {
-            let canonical_path = bytes_path(raw_canonical_path);
-            let path = bytes_path(raw_path);
-            let observation = decode(&json, "deserialize remote observation", &path)?;
-            Ok(RemoteObservationRecord {
-                canonical_path,
-                path,
-                observation,
-            })
+    rows.map(|row| {
+        let (raw_canonical_path, raw_path, json) =
+            row.map_err(|source| sqlite("read remote inventory", database_path, source))?;
+        let canonical_path = bytes_path(raw_canonical_path);
+        let path = bytes_path(raw_path);
+        let observation = decode(&json, "deserialize remote observation", &path)?;
+        Ok(RemoteObservationRecord {
+            canonical_path,
+            path,
+            observation,
         })
-        .collect()
+    })
+    .collect()
 }
 
 fn read_plan(
