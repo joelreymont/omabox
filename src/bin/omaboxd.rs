@@ -67,7 +67,7 @@ fn run_owned(config: &Config, status: Option<&RuntimeStatus>) -> Result<(), Daem
                 let Some(delay) = retry_delay(&error) else {
                     return Err(error);
                 };
-                wait_for_retry(delay, status);
+                wait_for_retry(delay, status, &error);
             }
         }
     }
@@ -153,7 +153,7 @@ fn run_session(
                 let Some(delay) = retry_delay(&error) else {
                     return Err(error);
                 };
-                wait_for_retry(delay, status);
+                wait_for_retry(delay, status, &error);
                 continue;
             }
         };
@@ -213,7 +213,7 @@ fn run_session(
                 let Some(delay) = retry_delay(&error) else {
                     return Err(error);
                 };
-                wait_for_retry(delay, status);
+                wait_for_retry(delay, status, &error);
                 continue;
             }
         };
@@ -248,8 +248,14 @@ fn activate_configured_root(config: &Config, journal: &mut Journal) -> Result<()
     }
 }
 
-fn wait_for_retry(delay: Duration, status: Option<&RuntimeStatus>) {
+fn wait_for_retry(delay: Duration, status: Option<&RuntimeStatus>, error: &DaemonError) {
+    let mut reason: &(dyn StdError + 'static) = error;
+    while let Some(source) = reason.source() {
+        reason = source;
+    }
     tracing::warn!(
+        error = %error,
+        reason = %reason,
         seconds = delay.as_secs(),
         "Dropbox is temporarily unavailable; retrying"
     );
