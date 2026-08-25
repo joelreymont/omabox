@@ -19,6 +19,14 @@ stages, crash recovery, retry, installation, and journal completion.
 runs, but verified-stage promotion cannot mutate the sync root until that scan
 has published. It also checks that a requested scan cannot starve.
 
+`SyncBehavior` checks the automatic top-level behavior after initial file
+creation, later local or remote edits, local or remote deletion, divergent
+edits, deletion/edit conflicts, and initial collisions. It requires a fair
+daemon wakeup, durable intent before effects, verified uploads and downloads,
+convergence for ordinary changes, and preservation of every present conflict
+side. The corresponding fake-Dropbox tests exercise these cases through Rust;
+TLC does not prove that the implementation conforms to the model.
+
 Run it from this directory with the official TLA+ tools:
 
 ```sh
@@ -33,6 +41,9 @@ java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
 
 java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
   -config ScanCoordination.cfg ScanCoordination.tla
+
+java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
+  -config SyncBehavior.cfg SyncBehavior.tla
 ```
 
 Same- and cross-filesystem promotion share one durable abstract boundary; TLC

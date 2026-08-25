@@ -452,6 +452,322 @@ fn one_reconciliation_pass_synchronizes_files_in_both_directions() -> Result<(),
 }
 
 #[test]
+fn later_edits_sync_and_divergence_preserves_both_sides() -> Result<(), Box<dyn Error>> {
+    let old_bytes = b"shared baseline";
+    let local_bytes = b"later local edit";
+    let remote_bytes = b"later Dropbox edit";
+    let local_conflict_bytes = b"divergent local edit";
+    let remote_conflict_bytes = b"divergent Dropbox edit";
+    let old = RemoteFile::new(
+        dropbox_content_hash(old_bytes.as_slice())?,
+        DropboxRevision::new("rev-old"),
+    );
+    let local_update = RemoteFile::new(
+        dropbox_content_hash(local_bytes.as_slice())?,
+        DropboxRevision::new("rev-local-update"),
+    );
+    let remote_update = RemoteFile::new(
+        dropbox_content_hash(remote_bytes.as_slice())?,
+        DropboxRevision::new("rev-remote-update"),
+    );
+    let local_conflict = LocalFile::new(dropbox_content_hash(local_conflict_bytes.as_slice())?);
+    let remote_conflict = RemoteFile::new(
+        dropbox_content_hash(remote_conflict_bytes.as_slice())?,
+        DropboxRevision::new("rev-remote-conflict"),
+    );
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [
+                file_metadata(
+                    "/a-local-update.txt",
+                    "/a-local-update.txt",
+                    old.revision.as_str(),
+                    &old.content,
+                ),
+                file_metadata(
+                    "/b-remote-update.txt",
+                    "/b-remote-update.txt",
+                    remote_update.revision.as_str(),
+                    &remote_update.content,
+                ),
+                file_metadata(
+                    "/c-diverged.txt",
+                    "/c-diverged.txt",
+                    remote_conflict.revision.as_str(),
+                    &remote_conflict.content,
+                )
+            ],
+            "cursor": "cursor-after-edits",
+            "has_more": false
+        })),
+        FakeResponse::bytes(remote_conflict_bytes.to_vec())
+            .header(
+                "Dropbox-API-Result",
+                download_metadata(
+                    "c-diverged.txt",
+                    remote_conflict.revision.as_str(),
+                    &remote_conflict.content,
+                    remote_conflict_bytes.len(),
+                ),
+            )
+            .for_path("/2/files/download"),
+        FakeResponse::bytes(remote_bytes.to_vec())
+            .header(
+                "Dropbox-API-Result",
+                download_metadata(
+                    "b-remote-update.txt",
+                    remote_update.revision.as_str(),
+                    &remote_update.content,
+                    remote_bytes.len(),
+                ),
+            )
+            .for_path("/2/files/download"),
+        FakeResponse::json(file_metadata(
+            "/a-local-update.txt",
+            "/a-local-update.txt",
+            local_update.revision.as_str(),
+            &local_update.content,
+        ))
+        .for_path("/2/files/upload"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-later-edits")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("a-local-update.txt"), local_bytes)?;
+    std::fs::write(root.join("b-remote-update.txt"), old_bytes)?;
+    std::fs::write(root.join("c-diverged.txt"), local_conflict_bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    for path in [
+        Path::new("a-local-update.txt"),
+        Path::new("b-remote-update.txt"),
+        Path::new("c-diverged.txt"),
+    ] {
+        seed_baseline(&mut journal, path, &old)?;
+    }
+
+    let report = match reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )? {
+        ReconcileOutcome::Complete(report) => report,
+        ReconcileOutcome::FreshObservationRequired { .. } => {
+            return Err(
+                io::Error::other("stable later edits requested a fresh observation").into(),
+            );
+        }
+        ReconcileOutcome::LocalRootChanged => {
+            return Err(io::Error::other("stable fixture changed its local root").into());
+        }
+    };
+    assert_eq!(report.planned, 2);
+    assert_eq!(report.replayed_operations, 1);
+    assert_eq!(report.blocked, 1);
+    assert_eq!(report.conflicts, 1);
+    let completed_download = drive_replay(&mut journal, &client, &mut downloads, &root, &staging)??;
+    assert_eq!(completed_download.completed_operations, 1);
+
+    assert_eq!(std::fs::read(root.join("a-local-update.txt"))?, local_bytes);
+    assert_eq!(
+        std::fs::read(root.join("b-remote-update.txt"))?,
+        remote_bytes
+    );
+    assert_eq!(
+        std::fs::read(root.join("c-diverged.txt"))?,
+        local_conflict_bytes
+    );
+    assert_eq!(
+        journal.baseline(Path::new("a-local-update.txt"))?,
+        Some(Baseline::Present(local_update))
+    );
+    assert_eq!(
+        journal.baseline(Path::new("b-remote-update.txt"))?,
+        Some(Baseline::Present(remote_update))
+    );
+    assert_eq!(
+        journal.baseline(Path::new("c-diverged.txt"))?,
+        Some(Baseline::Present(old))
+    );
+    let conflicts = journal.conflicts()?;
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].path, Path::new("c-diverged.txt"));
+    assert_eq!(
+        conflicts[0].conflict,
+        Conflict::DivergentEdits {
+            local: local_conflict,
+            remote: remote_conflict,
+        }
+    );
+    assert_eq!(
+        conflict_bytes(&root)?,
+        vec![
+            remote_conflict_bytes.to_vec(),
+            local_conflict_bytes.to_vec()
+        ]
+    );
+    assert!(journal.pending_plans()?.is_empty());
+    assert!(journal.pending_recoveries()?.is_empty());
+    assert!(journal.completed_recoveries()?.is_empty());
+    assert!(recovery.read_dir()?.next().is_none());
+
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 5);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path != "/2/files/delete_v2")
+    );
+    let upload = requests
+        .iter()
+        .find(|request| request.path == "/2/files/upload")
+        .ok_or_else(|| io::Error::other("missing conditional update request"))?;
+    assert_eq!(upload.body, local_bytes);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(required_header(upload, "dropbox-api-arg")?)?,
+        json!({
+            "path": "/a-local-update.txt",
+            "mode": {".tag": "update", "update": "rev-old"},
+            "autorename": false,
+            "strict_conflict": true,
+            "content_hash": dropbox_content_hash(local_bytes.as_slice())?.as_str()
+        })
+    );
+    let download_revisions = requests
+        .iter()
+        .filter(|request| request.path == "/2/files/download")
+        .map(|request| required_header(request, "dropbox-api-arg"))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(download_revisions.len(), 2);
+    assert!(
+        download_revisions
+            .iter()
+            .any(|header| header.contains("rev:rev-remote-update"))
+    );
+    assert!(
+        download_revisions
+            .iter()
+            .any(|header| header.contains("rev:rev-remote-conflict"))
+    );
+    Ok(())
+}
+
+#[test]
+fn later_deletions_sync_in_both_directions() -> Result<(), Box<dyn Error>> {
+    let old_bytes = b"shared deletion baseline";
+    let old = RemoteFile::new(
+        dropbox_content_hash(old_bytes.as_slice())?,
+        DropboxRevision::new("rev-delete-baseline"),
+    );
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [file_metadata(
+                "/local-deleted.txt",
+                "/local-deleted.txt",
+                old.revision.as_str(),
+                &old.content,
+            )],
+            "cursor": "cursor-after-deletions",
+            "has_more": false
+        })),
+        FakeResponse::json(json!({
+            "metadata": file_metadata(
+                "/local-deleted.txt",
+                "/local-deleted.txt",
+                old.revision.as_str(),
+                &old.content,
+            )
+        }))
+        .for_path("/2/files/delete_v2"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-later-deletions")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("dropbox-deleted.txt"), old_bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    for path in [
+        Path::new("local-deleted.txt"),
+        Path::new("dropbox-deleted.txt"),
+    ] {
+        seed_baseline(&mut journal, path, &old)?;
+    }
+
+    let report = match reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )? {
+        ReconcileOutcome::Complete(report) => report,
+        ReconcileOutcome::FreshObservationRequired { .. } => {
+            return Err(io::Error::other("stable deletions requested a fresh observation").into());
+        }
+        ReconcileOutcome::LocalRootChanged => {
+            return Err(io::Error::other("stable fixture changed its local root").into());
+        }
+    };
+    assert_eq!(report.planned, 2);
+    assert_eq!(report.replayed_operations, 2);
+    assert_eq!(report.blocked, 0);
+    assert_eq!(report.conflicts, 0);
+    assert!(!root.join("local-deleted.txt").exists());
+    assert!(!root.join("dropbox-deleted.txt").exists());
+    assert_eq!(journal.baseline(Path::new("local-deleted.txt"))?, None);
+    assert_eq!(journal.baseline(Path::new("dropbox-deleted.txt"))?, None);
+    assert!(journal.pending_plans()?.is_empty());
+    assert!(journal.conflicts()?.is_empty());
+    assert!(recovery.read_dir()?.next().is_none());
+
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 3);
+    let deletion = requests
+        .iter()
+        .find(|request| request.path == "/2/files/delete_v2")
+        .ok_or_else(|| io::Error::other("missing conditional Dropbox deletion"))?;
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&deletion.body)?,
+        json!({
+            "path": "/local-deleted.txt",
+            "parent_rev": "rev-delete-baseline"
+        })
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/2/files/delete_v2")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
 fn one_reconciliation_pass_synchronizes_empty_and_nested_directories() -> Result<(), Box<dyn Error>>
 {
     let server = FakeServer::start(vec![
