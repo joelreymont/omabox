@@ -86,16 +86,6 @@ fn render_journal(journal: &mut Journal) -> Result<String, StatusError> {
     }
 
     for record in journal
-        .conflicts()
-        .map_err(|source| status("read version-preservation work", source))?
-    {
-        entries.push(StatusEntry::new(
-            record.path,
-            String::from("different versions are being preserved automatically"),
-        ));
-    }
-
-    for record in journal
         .pending_recoveries()
         .map_err(|source| status("read pending recovery copies", source))?
     {
@@ -266,8 +256,6 @@ mod tests {
         insta::assert_snapshot!(rendered, @r###"
         Omabox status:
         - a-remote.txt: Dropbox status unknown: inventory is stale
-        - b-diverged.txt: different versions are being preserved automatically
-        - c-diverged.txt: different versions are being preserved automatically
         - m-pending.txt: pending sync: 2 remaining; next: preserve displaced local payload
         - m-pending.txt: recovery copy is pending
         - z-local.txt: local status unknown: path is inaccessible
@@ -282,6 +270,8 @@ mod tests {
             "account-id-must-not-render",
             "namespace-id-must-not-render",
             "remote-root-must-not-render",
+            "b-diverged.txt",
+            "c-diverged.txt",
         ] {
             assert!(!rendered.contains(forbidden));
         }
