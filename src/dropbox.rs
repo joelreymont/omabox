@@ -18,7 +18,8 @@ use crate::journal::{
 };
 use crate::local::{
     DownloadPreparation, DownloadSlotLease, LocalError, StageIoError, StageOutcome, StagedUpload,
-    SyncRootAccess, existing_download_stage_at, open_root, prepare_download_slot_with_access_at,
+    SyncRootAccess, existing_download_stage_at, open_root,
+    prepare_disposable_download_with_access_at, prepare_download_slot_with_access_at,
     stage_download_at,
 };
 use crate::model::{ContentIdentity, DropboxRevision, Observation, RemoteFile, UnknownReason};
@@ -35,9 +36,10 @@ const UPLOAD_SESSION_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
 const UPLOAD_SESSION_MAX_BYTES: u64 = (1_u64 << 41) - (1_u64 << 22);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
-struct DownloadAccess<'a> {
-    lease: Option<&'a DownloadSlotLease>,
-    root_access: &'a Arc<SyncRootAccess>,
+pub(crate) struct DownloadAccess<'a> {
+    pub(crate) lease: Option<&'a DownloadSlotLease>,
+    pub(crate) staging_directory: Option<&'a Path>,
+    pub(crate) root_access: &'a Arc<SyncRootAccess>,
 }
 
 fn exact_download_agent() -> ureq::Agent {
@@ -617,6 +619,7 @@ impl DropboxClient {
             remote,
             DownloadAccess {
                 lease,
+                staging_directory: None,
                 root_access: &root_access,
             },
         )
@@ -628,17 +631,9 @@ impl DropboxClient {
         root_path: &Path,
         path: &Path,
         remote: &RemoteFile,
-        lease: Option<&DownloadSlotLease>,
-        root_access: &Arc<SyncRootAccess>,
+        access: DownloadAccess<'_>,
     ) -> Result<StageOutcome<()>, DropboxError> {
-        self.stage_exact_download_for_access_at(
-            root,
-            root_path,
-            path,
-            path,
-            remote,
-            DownloadAccess { lease, root_access },
-        )
+        self.stage_exact_download_for_access_at(root, root_path, path, path, remote, access)
     }
 
     fn stage_exact_download_for_access_at(
@@ -650,7 +645,7 @@ impl DropboxClient {
         remote: &RemoteFile,
         access: DownloadAccess<'_>,
     ) -> Result<StageOutcome<()>, DropboxError> {
-        let partial = if let Some(lease) = access.lease {
+        let mut partial = if let Some(lease) = access.lease {
             match prepare_download_slot_with_access_at(
                 root,
                 root_path,
@@ -668,6 +663,24 @@ impl DropboxClient {
         } else {
             None
         };
+        if partial.is_none()
+            && let Some(staging_directory) = access.staging_directory
+        {
+            match prepare_disposable_download_with_access_at(
+                root,
+                root_path,
+                target,
+                &remote.content,
+                staging_directory,
+                access.root_access,
+            )
+            .map_err(|source| DropboxError::LocalStage { source })?
+            {
+                DownloadPreparation::Ready(disposable) => partial = Some(disposable),
+                DownloadPreparation::Complete(outcome) => return Ok(outcome),
+                DownloadPreparation::Ephemeral => {}
+            }
+        }
         if partial.is_none()
             && let Some(outcome) =
                 existing_download_stage_at(root, root_path, target, &remote.content)

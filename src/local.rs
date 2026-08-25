@@ -386,16 +386,33 @@ impl DownloadSlotLease {
 }
 
 struct DownloadLocation {
-    slot_directory: OwnedFd,
-    slot_name: OsString,
-    slot_path: PathBuf,
+    source: DownloadSource,
     target_directory: OwnedFd,
     stage_name: OsString,
     stage_path: PathBuf,
     target: PathBuf,
     expected: ContentIdentity,
-    binding: [u8; 32],
     root_access: Arc<SyncRootAccess>,
+}
+
+enum DownloadSource {
+    Resumable {
+        directory: OwnedFd,
+        name: OsString,
+        path: PathBuf,
+        binding: [u8; 32],
+    },
+    Disposable {
+        path: PathBuf,
+    },
+}
+
+impl DownloadSource {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Resumable { path, .. } | Self::Disposable { path } => path,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -442,7 +459,7 @@ impl DownloadPartial {
                     self.discard_uncommitted_block()?;
                     return Err(io_failure(
                         "write resumed download",
-                        &self.location.slot_path,
+                        self.location.source.path(),
                         source,
                     )
                     .into());
@@ -479,20 +496,19 @@ impl DownloadPartial {
         self.file.set_len(self.offset).map_err(|source| {
             io_failure(
                 "discard incomplete resumed download block",
-                &self.location.slot_path,
+                self.location.source.path(),
                 source,
             )
         })
     }
 
     fn persist_checkpoint(&mut self) -> Result<(), LocalError> {
-        sync_file(
-            &self.file,
-            &self.location.slot_path,
-            "sync resumed download checkpoint",
-        )?;
+        let DownloadSource::Resumable { binding, path, .. } = &self.location.source else {
+            return Ok(());
+        };
+        sync_file(&self.file, path, "sync resumed download checkpoint")?;
         let state = encode_download_slot_state(DownloadSlotState {
-            binding: self.location.binding,
+            binding: *binding,
             offset: self.offset,
         });
         set_xattr(
@@ -500,29 +516,27 @@ impl DownloadPartial {
             DOWNLOAD_PARTIAL_XATTR,
             &state,
             XattrFlags::empty(),
-            &self.location.slot_path,
+            path,
             "record resumed download checkpoint",
         )?;
-        sync_file(
-            &self.file,
-            &self.location.slot_path,
-            "sync resumed download checkpoint marker",
-        )
+        sync_file(&self.file, path, "sync resumed download checkpoint marker")
     }
 
     fn finish(mut self) -> Result<StageOutcome<()>, LocalError> {
         let actual = ContentIdentity::new(hex_digest(self.aggregate.finalize()));
         if actual != self.location.expected {
-            if reset_download_slot(&self.file, &self.location)?.is_none() {
+            if matches!(self.location.source, DownloadSource::Resumable { .. })
+                && reset_download_slot(&self.file, &self.location)?.is_none()
+            {
                 return Ok(StageOutcome::DestinationOccupied {
-                    path: self.location.slot_path,
+                    path: self.location.source.path().to_path_buf(),
                 });
             }
             return Ok(StageOutcome::ContentChanged { actual });
         }
         sync_file(
             &self.file,
-            &self.location.slot_path,
+            self.location.source.path(),
             "sync completed resumed download data",
         )?;
         let stage_marker = internal_name(
@@ -535,12 +549,12 @@ impl DownloadPartial {
             DOWNLOAD_STAGE_XATTR,
             stage_marker.as_bytes(),
             XattrFlags::CREATE,
-            &self.location.slot_path,
+            self.location.source.path(),
             "mark completed resumed download",
         )?;
         sync_file(
             &self.file,
-            &self.location.slot_path,
+            self.location.source.path(),
             "sync completed resumed download marker",
         )?;
         promote_completed_slot(&mut self.file, &self.location)
@@ -1422,22 +1436,10 @@ pub(crate) fn prepare_download_slot_with_access_at(
         open_private_directory(&lease.directory, "open resumable download slot directory")?;
     let slot_name = download_slot_name(lease.slot);
     let slot_path = lease.directory.join(&slot_name);
-    let location = DownloadLocation {
-        slot_directory,
-        slot_name,
-        slot_path,
-        target_directory,
-        stage_name,
-        stage_path,
-        target: target.to_path_buf(),
-        expected: expected.clone(),
-        binding: lease.binding,
-        root_access: Arc::clone(root_access),
-    };
     match inspect_download_stage(
-        &location.target_directory,
-        &location.stage_name,
-        &location.stage_path,
+        &target_directory,
+        &stage_name,
+        &stage_path,
         target,
         expected,
     )? {
@@ -1453,40 +1455,50 @@ pub(crate) fn prepare_download_slot_with_access_at(
         }
         DownloadStage::Missing => {}
     }
-    let mut file = match open_download_slot(
-        &location.slot_directory,
-        &location.slot_name,
-        &location.slot_path,
-    )? {
+    let mut file = match open_download_slot(&slot_directory, &slot_name, &slot_path)? {
         DownloadSlotOpen::File(file) => file,
         DownloadSlotOpen::Missing | DownloadSlotOpen::Occupied => {
             return Ok(DownloadPreparation::Ephemeral);
         }
     };
-    let stat = stat_fd(&file, &location.slot_path, "inspect resumed download")?;
+    let stat = stat_fd(&file, &slot_path, "inspect resumed download")?;
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
         return Ok(DownloadPreparation::Ephemeral);
     }
     let mut length = u64::try_from(stat.st_size).map_err(|_| {
         io_failure(
             "inspect resumed download size",
-            &location.slot_path,
+            &slot_path,
             io::Error::new(io::ErrorKind::InvalidData, "partial file size is negative"),
         )
     })?;
-    let Some(mut state) = read_download_slot_state(&file, &location.slot_path)? else {
+    let Some(mut state) = read_download_slot_state(&file, &slot_path)? else {
         return Ok(DownloadPreparation::Ephemeral);
     };
-    if state.binding != location.binding {
+    if state.binding != lease.binding {
         return Ok(DownloadPreparation::Ephemeral);
     }
+    let location = DownloadLocation {
+        source: DownloadSource::Resumable {
+            directory: slot_directory,
+            name: slot_name,
+            path: slot_path,
+            binding: lease.binding,
+        },
+        target_directory,
+        stage_name,
+        stage_path,
+        target: target.to_path_buf(),
+        expected: expected.clone(),
+        root_access: Arc::clone(root_access),
+    };
     let stage_marker = internal_name("download-marker-v1", target, expected);
     let needs_reset =
-        match read_download_marker(&file, stage_marker.as_bytes(), &location.slot_path)? {
+        match read_download_marker(&file, stage_marker.as_bytes(), location.source.path())? {
             DownloadMarker::Expected => {
                 let actual = hash_stable_file(
                     &mut file,
-                    &location.slot_path,
+                    location.source.path(),
                     "verify completed resumed download",
                 )?;
                 if actual == *expected {
@@ -1513,22 +1525,88 @@ pub(crate) fn prepare_download_slot_with_access_at(
         file.set_len(state.offset).map_err(|source| {
             io_failure(
                 "truncate resumed download tail",
-                &location.slot_path,
+                location.source.path(),
                 source,
             )
         })?;
         sync_file(
             &file,
-            &location.slot_path,
+            location.source.path(),
             "sync truncated resumed download",
         )?;
     }
-    let aggregate = hash_download_prefix(&mut file, state.offset, &location.slot_path)?;
+    let aggregate = hash_download_prefix(&mut file, state.offset, location.source.path())?;
     Ok(DownloadPreparation::Ready(Box::new(DownloadPartial {
         location,
         file,
         offset: state.offset,
         aggregate,
+    })))
+}
+
+pub(crate) fn prepare_disposable_download_with_access_at(
+    root: &OwnedFd,
+    root_path: &Path,
+    target: impl AsRef<Path>,
+    expected: &ContentIdentity,
+    staging_directory: &Path,
+    root_access: &Arc<SyncRootAccess>,
+) -> Result<DownloadPreparation, LocalError> {
+    require_content_hash(expected, "prepare disposable download")?;
+    let target = target.as_ref();
+    let parent = root_access.with_shared(|| open_parent(root, target, true))?;
+    let Some((target_directory, _, parent_relative)) = parent else {
+        return Err(LocalError::UnsafeRelativePath {
+            path: target.to_path_buf(),
+        });
+    };
+    let stage_name = internal_name("download", target, expected);
+    let stage_path = root_path.join(parent_relative).join(&stage_name);
+    match inspect_download_stage(
+        &target_directory,
+        &stage_name,
+        &stage_path,
+        target,
+        expected,
+    )? {
+        DownloadStage::Verified(_) => {
+            return Ok(DownloadPreparation::Complete(StageOutcome::AlreadyStaged(
+                (),
+            )));
+        }
+        DownloadStage::Occupied(path) => {
+            return Ok(DownloadPreparation::Complete(
+                StageOutcome::DestinationOccupied { path },
+            ));
+        }
+        DownloadStage::Missing => {}
+    }
+    let staging = open_private_directory(
+        staging_directory,
+        "open disposable download staging directory",
+    )?;
+    let display_path = staging_directory.join("<unnamed-download>");
+    let fd = openat2(
+        &staging,
+        ".",
+        OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+        BELOW_ROOT,
+    )
+    .map_err(|source| syscall_failure("create disposable download stage", &display_path, source))?;
+    Ok(DownloadPreparation::Ready(Box::new(DownloadPartial {
+        location: DownloadLocation {
+            source: DownloadSource::Disposable { path: display_path },
+            target_directory,
+            stage_name,
+            stage_path,
+            target: target.to_path_buf(),
+            expected: expected.clone(),
+            root_access: Arc::clone(root_access),
+        },
+        file: File::from(fd),
+        offset: 0,
+        aggregate: Sha256::new(),
     })))
 }
 
@@ -1669,14 +1747,16 @@ fn reset_download_slot(
     file: &File,
     location: &DownloadLocation,
 ) -> Result<Option<File>, LocalError> {
-    reset_download_slot_file_with(
-        file,
-        &location.slot_directory,
-        &location.slot_name,
-        &location.slot_path,
-        location.binding,
-        || Ok(()),
-    )
+    let DownloadSource::Resumable {
+        directory,
+        name,
+        path,
+        binding,
+    } = &location.source
+    else {
+        return Ok(None);
+    };
+    reset_download_slot_file_with(file, directory, name, path, *binding, || Ok(()))
 }
 
 fn reset_download_slot_file_with(
@@ -1742,21 +1822,22 @@ fn promote_completed_slot_with(
     location: &DownloadLocation,
     before_move: impl FnOnce() -> io::Result<()>,
 ) -> Result<StageOutcome<()>, LocalError> {
+    let DownloadSource::Resumable {
+        directory,
+        name,
+        path,
+        ..
+    } = &location.source
+    else {
+        return promote_completed_disposable(file, location, before_move);
+    };
     if !download_slot_matches(file, location)? {
-        return Ok(StageOutcome::DestinationOccupied {
-            path: location.slot_path.clone(),
-        });
+        return Ok(StageOutcome::DestinationOccupied { path: path.clone() });
     }
-    before_move().map_err(|source| {
-        io_failure(
-            "promote completed download slot",
-            &location.slot_path,
-            source,
-        )
-    })?;
+    before_move().map_err(|source| io_failure("promote completed download slot", path, source))?;
     match renameat_with(
-        &location.slot_directory,
-        &location.slot_name,
+        directory,
+        name,
         &location.target_directory,
         &location.stage_name,
         RenameFlags::NOREPLACE,
@@ -1771,11 +1852,11 @@ fn promote_completed_slot_with(
                 let occupied = match renameat_with(
                     &location.target_directory,
                     &location.stage_name,
-                    &location.slot_directory,
-                    &location.slot_name,
+                    directory,
+                    name,
                     RenameFlags::NOREPLACE,
                 ) {
-                    Ok(()) => location.slot_path.clone(),
+                    Ok(()) => path.clone(),
                     Err(source) if source == rustix::io::Errno::EXIST => {
                         location.stage_path.clone()
                     }
@@ -1787,11 +1868,7 @@ fn promote_completed_slot_with(
                         ));
                     }
                 };
-                sync_directory(
-                    &location.slot_directory,
-                    &location.slot_path,
-                    "sync restored download slot",
-                )?;
+                sync_directory(directory, path, "sync restored download slot")?;
                 sync_directory(
                     &location.target_directory,
                     &location.stage_path,
@@ -1799,11 +1876,7 @@ fn promote_completed_slot_with(
                 )?;
                 return Ok(StageOutcome::DestinationOccupied { path: occupied });
             }
-            sync_directory(
-                &location.slot_directory,
-                &location.slot_path,
-                "sync consumed download slot",
-            )?;
+            sync_directory(directory, path, "sync consumed download slot")?;
             sync_directory(
                 &location.target_directory,
                 &location.stage_path,
@@ -1841,7 +1914,65 @@ fn promote_completed_slot_with(
         Err(source) if source == rustix::io::Errno::XDEV => copy_completed_slot(file, location),
         Err(source) => Err(syscall_failure(
             "recover completed resumed download",
-            &location.slot_path,
+            path,
+            source,
+        )),
+    }
+}
+
+fn promote_completed_disposable(
+    file: &mut File,
+    location: &DownloadLocation,
+    before_move: impl FnOnce() -> io::Result<()>,
+) -> Result<StageOutcome<()>, LocalError> {
+    before_move().map_err(|source| {
+        io_failure(
+            "promote completed disposable download",
+            location.source.path(),
+            source,
+        )
+    })?;
+    match linkat(
+        &*file,
+        "",
+        &location.target_directory,
+        &location.stage_name,
+        AtFlags::EMPTY_PATH,
+    ) {
+        Ok(()) => {
+            sync_directory(
+                &location.target_directory,
+                &location.stage_path,
+                "sync promoted disposable download",
+            )?;
+            fchmod(&*file, Mode::RUSR).map_err(|source| {
+                syscall_failure(
+                    "make disposable download stage immutable",
+                    &location.stage_path,
+                    source,
+                )
+            })?;
+            sync_file(file, &location.stage_path, "sync disposable download stage")?;
+            Ok(StageOutcome::Staged(()))
+        }
+        Err(source) if source == rustix::io::Errno::EXIST => match inspect_download_stage(
+            &location.target_directory,
+            &location.stage_name,
+            &location.stage_path,
+            &location.target,
+            &location.expected,
+        )? {
+            DownloadStage::Verified(_) => Ok(StageOutcome::AlreadyStaged(())),
+            DownloadStage::Missing => Err(LocalError::ChangedDuringRead {
+                operation: "promote completed disposable download",
+                path: location.target.clone(),
+            }),
+            DownloadStage::Occupied(path) => Ok(StageOutcome::DestinationOccupied { path }),
+        },
+        Err(source) if source == rustix::io::Errno::XDEV => copy_completed_slot(file, location),
+        Err(source) => Err(syscall_failure(
+            "promote completed disposable download",
+            location.source.path(),
             source,
         )),
     }
@@ -1852,7 +1983,11 @@ fn copy_completed_slot(
     location: &DownloadLocation,
 ) -> Result<StageOutcome<()>, LocalError> {
     file.seek(SeekFrom::Start(0)).map_err(|error| {
-        io_failure("rewind completed download slot", &location.slot_path, error)
+        io_failure(
+            "rewind completed download slot",
+            location.source.path(),
+            error,
+        )
     })?;
     let marker = internal_name("download-marker-v1", &location.target, &location.expected);
     let result = write_verified_stage(
@@ -1927,8 +2062,11 @@ fn decode_download_slot_state(actual: &[u8]) -> Option<DownloadSlotState> {
 }
 
 fn download_slot_matches(file: &File, location: &DownloadLocation) -> Result<bool, LocalError> {
-    read_download_slot_state(file, &location.slot_path)
-        .map(|state| state.is_some_and(|state| state.binding == location.binding))
+    let DownloadSource::Resumable { path, binding, .. } = &location.source else {
+        return Ok(false);
+    };
+    read_download_slot_state(file, path)
+        .map(|state| state.is_some_and(|state| state.binding == *binding))
 }
 
 fn hash_download_prefix(file: &mut File, offset: u64, path: &Path) -> Result<Sha256, LocalError> {
@@ -3900,6 +4038,22 @@ mod tests {
         )
     }
 
+    fn resumable_source(
+        location: &DownloadLocation,
+    ) -> io::Result<(&OwnedFd, &OsStr, &Path, [u8; 32])> {
+        match &location.source {
+            DownloadSource::Resumable {
+                directory,
+                name,
+                path,
+                binding,
+            } => Ok((directory, name, path, *binding)),
+            DownloadSource::Disposable { .. } => {
+                Err(io::Error::other("test expected a resumable download"))
+            }
+        }
+    }
+
     struct FragmentedReader<'a> {
         bytes: &'a [u8],
         fragments: &'a [usize],
@@ -4218,7 +4372,7 @@ mod tests {
             else {
                 return Err(io::Error::other("test expected a new download partial").into());
             };
-            let partial_path = partial.location.slot_path.clone();
+            let partial_path = partial.location.source.path().to_path_buf();
 
             assert!(
                 partial
@@ -4682,9 +4836,10 @@ mod tests {
             )?;
             fsync(&partial.file)?;
             if renamed_before_chmod {
+                let (slot_directory, slot_name, _, _) = resumable_source(&partial.location)?;
                 renameat_with(
-                    &partial.location.slot_directory,
-                    &partial.location.slot_name,
+                    slot_directory,
+                    slot_name,
                     &partial.location.target_directory,
                     &partial.location.stage_name,
                     RenameFlags::NOREPLACE,
@@ -4787,6 +4942,94 @@ mod tests {
     }
 
     #[test]
+    fn disposable_download_body_does_not_hold_the_scan_lock() -> Result<(), Box<dyn Error>> {
+        struct GatedReader {
+            bytes: Cursor<Vec<u8>>,
+            started: Option<std::sync::mpsc::Sender<()>>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+
+        impl Read for GatedReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if let Some(started) = self.started.take() {
+                    started
+                        .send(())
+                        .map_err(|_| io::Error::other("test start receiver disconnected"))?;
+                    self.release
+                        .recv()
+                        .map_err(|_| io::Error::other("test release sender disconnected"))?;
+                }
+                self.bytes.read(buffer)
+            }
+        }
+
+        let root = TempDir::new()?;
+        let staging = TempDir::new()?;
+        let target = Path::new("fallback.bin");
+        let bytes = b"disposable download".to_vec();
+        let expected = identity(&bytes)?;
+        let root_fd = open_absolute_directory(root.path(), "open test root")?;
+        let root_access = Arc::new(SyncRootAccess::default());
+        let DownloadPreparation::Ready(partial) = prepare_disposable_download_with_access_at(
+            &root_fd,
+            root.path(),
+            target,
+            &expected,
+            staging.path(),
+            &root_access,
+        )?
+        else {
+            return Err(io::Error::other("test expected a disposable download").into());
+        };
+        assert!(matches!(
+            &partial.location.source,
+            DownloadSource::Disposable { .. }
+        ));
+
+        let total = u64::try_from(bytes.len())?;
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let (scan_sender, scan_receiver) = std::sync::mpsc::channel();
+        let outcome = thread::scope(|scope| -> Result<_, Box<dyn Error>> {
+            let download = thread::Builder::new().spawn_scoped(scope, || {
+                partial.append(
+                    total,
+                    &mut GatedReader {
+                        bytes: Cursor::new(bytes),
+                        started: Some(started_sender),
+                        release: release_receiver,
+                    },
+                )
+            })?;
+            started_receiver.recv_timeout(Duration::from_secs(1))?;
+            let scan_access = Arc::clone(&root_access);
+            let scan = thread::Builder::new().spawn_scoped(scope, move || {
+                scan_access.with_exclusive(|| scan_sender.send(()))
+            })?;
+            let scan_result = scan_receiver.recv_timeout(Duration::from_millis(250));
+            release_sender
+                .send(())
+                .map_err(|_| io::Error::other("test download reader disconnected"))?;
+            let download = download
+                .join()
+                .map_err(|_| io::Error::other("test download worker stopped"))??;
+            scan.join()
+                .map_err(|_| io::Error::other("test scan worker stopped"))?
+                .map_err(|_| io::Error::other("test scan receiver disconnected"))?;
+            scan_result?;
+            Ok(download)
+        })?;
+
+        assert!(matches!(outcome, StageOutcome::Staged(())));
+        assert!(matches!(
+            existing_download_stage_at(&root_fd, root.path(), target, &expected)?,
+            Some(StageOutcome::AlreadyStaged(()))
+        ));
+        assert_eq!(std::fs::read_dir(staging.path())?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn corrupt_completed_partial_restarts_only_when_owned() -> Result<(), Box<dyn Error>> {
         for owned in [true, false] {
             let root = TempDir::new()?;
@@ -4809,7 +5052,7 @@ mod tests {
                     XattrFlags::empty(),
                 )?;
             }
-            let partial_path = partial.location.slot_path.clone();
+            let partial_path = partial.location.source.path().to_path_buf();
             let stage_marker = internal_name("download-marker-v1", target, &expected);
             fsetxattr(
                 &partial.file,
@@ -4860,7 +5103,7 @@ mod tests {
         )?;
         fsync(&partial.file)?;
         let moved = staging.path().join("held-slot");
-        let partial_path = partial.location.slot_path.clone();
+        let partial_path = partial.location.source.path().to_path_buf();
 
         assert!(matches!(
             promote_completed_slot_with(&mut partial.file, &partial.location, || {
@@ -4905,7 +5148,7 @@ mod tests {
             copy_completed_slot(&mut partial.file, &partial.location)?,
             StageOutcome::Staged(())
         ));
-        assert_eq!(std::fs::metadata(&partial.location.slot_path)?.len(), 0);
+        assert_eq!(std::fs::metadata(partial.location.source.path())?.len(), 0);
         assert_eq!(
             install_download(root.path(), target, &expected, None)?,
             InstallOutcome::Installed
@@ -4927,16 +5170,17 @@ mod tests {
         else {
             return Err(io::Error::other("test expected a new download partial").into());
         };
-        let partial_path = partial.location.slot_path.clone();
+        let partial_path = partial.location.source.path().to_path_buf();
         let moved = staging.path().join("held-slot");
+        let (slot_directory, slot_name, slot_path, binding) = resumable_source(&partial.location)?;
 
         assert!(
             reset_download_slot_file_with(
                 &partial.file,
-                &partial.location.slot_directory,
-                &partial.location.slot_name,
-                &partial.location.slot_path,
-                partial.location.binding,
+                slot_directory,
+                slot_name,
+                slot_path,
+                binding,
                 || {
                     std::fs::rename(&partial_path, &moved)?;
                     std::fs::write(&partial_path, b"replacement")
@@ -4949,10 +5193,7 @@ mod tests {
         let moved_file = File::open(moved)?;
         assert_eq!(
             read_download_slot_state(&moved_file, target)?,
-            Some(DownloadSlotState {
-                binding: partial.location.binding,
-                offset: 0,
-            })
+            Some(DownloadSlotState { binding, offset: 0 })
         );
         let marker = internal_name("download-marker-v1", target, &expected);
         assert_eq!(
@@ -4987,13 +5228,11 @@ mod tests {
         )?;
         fsync(&partial.file)?;
         partial.file.set_len(0)?;
+        let (_, _, _, binding) = resumable_source(&partial.location)?;
         fsetxattr(
             &partial.file,
             DOWNLOAD_PARTIAL_XATTR,
-            &encode_download_slot_state(DownloadSlotState {
-                binding: partial.location.binding,
-                offset: 0,
-            }),
+            &encode_download_slot_state(DownloadSlotState { binding, offset: 0 }),
             XattrFlags::empty(),
         )?;
         fsync(&partial.file)?;
@@ -5003,7 +5242,7 @@ mod tests {
             &expected,
             Cursor::new(bytes),
         )?)?;
-        let partial_path = partial.location.slot_path.clone();
+        let partial_path = partial.location.source.path().to_path_buf();
         drop(partial);
 
         assert!(matches!(

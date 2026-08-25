@@ -12,7 +12,7 @@ use std::thread;
 use rustix::fd::OwnedFd;
 use thiserror::Error;
 
-use crate::dropbox::{DropboxClient, DropboxError};
+use crate::dropbox::{DownloadAccess, DropboxClient, DropboxError};
 use crate::journal::{
     Journal, JournalError, LocalObservationRecord, PlanConflictCompletion, PlanRecord,
     PlanSupersede, RemoteObservationRecord, dropbox_canonical_path,
@@ -413,8 +413,11 @@ fn run_download_job(
             &job.root_path,
             &job.path,
             &job.source,
-            lease.as_ref(),
-            root_access,
+            DownloadAccess {
+                lease: lease.as_ref(),
+                staging_directory: Some(&job.staging_directory),
+                root_access,
+            },
         )
         .map_err(|source| ReconcileError::RemoteDownload {
             path: job.path.clone(),
