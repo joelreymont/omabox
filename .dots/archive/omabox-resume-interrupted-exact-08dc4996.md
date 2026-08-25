@@ -1,9 +1,11 @@
 ---
 title: Resume interrupted exact downloads
-status: active
+status: closed
 priority: 0
 issue-type: task
-created-at: "\"2026-08-24T23:22:18.522452+02:00\""
+created-at: "\"\\\"2026-08-24T23:22:18.522452+02:00\\\"\""
+closed-at: "2026-08-25T02:30:00.546590+02:00"
+close-reason: Landed resumable exact downloads with four durable slots, strict range validation, and crash-safe promotion; all Rust gates and TLC pass.
 blocks:
   - omabox-upload-large-files-3cbecd7a
 ---
