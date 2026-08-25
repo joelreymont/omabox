@@ -181,12 +181,11 @@ fn run_session(
             wait_in_phase(delay, status, DaemonPhase::Backoff);
         }
         let cursor = journal
-            .remote_inventory()
+            .remote_cursor()
             .map_err(|source| DaemonError::Journal {
                 operation: "read the Dropbox cursor",
                 source,
             })?
-            .cursor
             .ok_or(DaemonError::MissingRemoteCursor)?;
         let wakeup = match dropbox
             .long_poll(&cursor, LONG_POLL_TIMEOUT)

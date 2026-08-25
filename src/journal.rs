@@ -1118,7 +1118,7 @@ impl Journal {
     }
 
     /// Load only the committed remote cursor without decoding the full inventory.
-    pub(crate) fn remote_cursor(&self) -> Result<Option<String>, JournalError> {
+    pub fn remote_cursor(&self) -> Result<Option<String>, JournalError> {
         self.connection
             .query_row(
                 "SELECT cursor FROM remote_inventory WHERE singleton = 1",
