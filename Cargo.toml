@@ -26,6 +26,7 @@ ureq = { version = "3.4", default-features = false, features = ["json", "rustls"
 [dev-dependencies]
 insta = "1.43"
 proptest = "1.7"
+rusqlite = { version = "0.37", features = ["trace"] }
 tempfile = "3.21"
 
 [[bin]]

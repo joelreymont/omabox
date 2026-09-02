@@ -10,6 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use miette::Diagnostic;
+use rustix::fs::OFlags;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -674,6 +675,32 @@ fn write_config_temporary(
         })
 }
 
+/// Create `path` as an owner-only regular file, or accept one that already
+/// exists.
+///
+/// `O_EXCL` reports a dangling symlink as an existing file, so the link itself
+/// is inspected before any caller follows it. Symlinks, directories, and
+/// special files are refused rather than written through, which stops a
+/// planted link from redirecting durable state to an attacker-chosen path.
+pub(crate) fn create_owner_only(path: &Path) -> Result<(), io::Error> {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+            if fs::symlink_metadata(path)?.file_type().is_file() {
+                Ok(())
+            } else {
+                Err(io::Error::other("existing path is not a regular file"))
+            }
+        }
+        Err(source) => Err(source),
+    }
+}
+
 /// The held kernel lock for one daemon instance.
 ///
 /// Dropping this value closes the file and releases the lock. The lock file is
@@ -689,11 +716,14 @@ impl InstanceLock {
     /// Try to acquire the daemon lock without waiting.
     pub fn acquire(path: impl AsRef<Path>) -> Result<Self, LockError> {
         let path = path.as_ref();
+        create_owner_only(path).map_err(|source| LockError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(false)
+            .custom_flags(OFlags::NOFOLLOW.bits().cast_signed())
             .open(path)
             .map_err(|source| LockError::Open {
                 path: path.to_path_buf(),
@@ -1369,6 +1399,52 @@ mod tests {
         let secret = "highly-sensitive-token";
         assert_eq!(format!("{}", redacted(secret)), "[REDACTED]");
         assert_eq!(format!("{:?}", redacted(secret)), "[REDACTED]");
+    }
+
+    #[test]
+    fn daemon_lock_file_is_created_for_its_owner_only() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let path = temporary.path().join("daemon.lock");
+
+        let lock = InstanceLock::acquire(&path)?;
+
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        drop(lock);
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_lock_refuses_a_symlinked_lock_file() -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let planted = temporary.path().join("planted.lock");
+        let dangling = temporary.path().join("dangling.lock");
+        std::os::unix::fs::symlink(&planted, &dangling)?;
+
+        let error = InstanceLock::acquire(&dangling)
+            .err()
+            .ok_or("a dangling symlink was accepted as a lock file")?;
+        assert!(
+            matches!(error, LockError::Open { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            !planted.try_exists()?,
+            "the lock file was created through a dangling symlink"
+        );
+
+        let existing = temporary.path().join("existing.lock");
+        drop(InstanceLock::acquire(&existing)?);
+        let linked = temporary.path().join("linked.lock");
+        std::os::unix::fs::symlink(&existing, &linked)?;
+
+        let error = InstanceLock::acquire(&linked)
+            .err()
+            .ok_or("a symlink to a lock file was accepted")?;
+        assert!(
+            matches!(error, LockError::Open { .. }),
+            "unexpected error: {error:?}"
+        );
+        Ok(())
     }
 
     #[test]

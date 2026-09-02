@@ -1144,7 +1144,7 @@ mod compatibility_tests {
         let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
         match journal.record_plan(Path::new("legacy.txt"), &legacy)? {
             PlanWrite::Recorded(_) => {}
-            PlanWrite::AlreadyPending(_) => {
+            PlanWrite::AlreadyLive(_) => {
                 return Err(std::io::Error::other("fresh test journal had pending work").into());
             }
         }
@@ -1373,7 +1373,7 @@ mod retention_tests {
         ]);
         let plan = match journal.record_plan(original_path, &operations)? {
             PlanWrite::Recorded(plan) => plan,
-            PlanWrite::AlreadyPending(_) => {
+            PlanWrite::AlreadyLive(_) => {
                 return Err(test_error("test path unexpectedly had a pending plan").into());
             }
         };

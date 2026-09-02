@@ -44,7 +44,7 @@ fn operations(decision: Decision) -> Result<OperationPlan, Box<dyn Error>> {
 fn recorded_plan(write: PlanWrite) -> Result<PlanRecord, Box<dyn Error>> {
     match write {
         PlanWrite::Recorded(plan) => Ok(plan),
-        PlanWrite::AlreadyPending(_) => {
+        PlanWrite::AlreadyLive(_) => {
             Err(io::Error::other("test expected a newly recorded plan").into())
         }
     }

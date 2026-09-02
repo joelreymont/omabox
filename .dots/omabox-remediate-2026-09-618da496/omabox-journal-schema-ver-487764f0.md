@@ -1,9 +1,11 @@
 ---
 title: Journal schema version 6 with blocked plans and conflict names
-status: active
+status: closed
 priority: 1
 issue-type: task
-created-at: "\"2026-09-02T11:28:11.353238+02:00\""
+created-at: "\"\\\"2026-09-02T11:28:11.353238+02:00\\\"\""
+closed-at: "2026-09-02T17:15:33.244657+02:00"
+close-reason: "landed as change wwxlssxt (Add journal schema six with blocked plans); destruction findings fixed (symlink guard, cursor retirement, operation-less plans, explicit busy_timeout); gates green at merged tip: fmt, clippy -D warnings, 248 tests; MutationLifecycle TLC passes"
 blocks:
   - omabox-order-canonical-paths-6ffaf324
 ---

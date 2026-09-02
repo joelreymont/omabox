@@ -3730,7 +3730,7 @@ fn remote_delete_skips_backup_download_and_ambiguous_create_stays_pending()
     ))?;
     match journal.record_plan(Path::new("delete.txt"), &delete)? {
         PlanWrite::Recorded(_) => {}
-        PlanWrite::AlreadyPending(_) => {
+        PlanWrite::AlreadyLive(_) => {
             return Err(io::Error::other("test expected a new delete plan").into());
         }
     }

@@ -887,7 +887,7 @@ fn reconcile_published(
     report.planned += write.recorded_plans;
     blocked_paths.extend(
         write
-            .pending_paths
+            .live_paths
             .into_iter()
             .map(|path| CanonicalPath::from_display(&path)),
     );
@@ -1915,7 +1915,7 @@ mod tests {
         };
         let pending = match journal.record_plan(path, &operation_plan)? {
             PlanWrite::Recorded(plan) => plan,
-            PlanWrite::AlreadyPending(_) => {
+            PlanWrite::AlreadyLive(_) => {
                 return Err(std::io::Error::other("fresh journal already had a plan").into());
             }
         };

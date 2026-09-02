@@ -10,6 +10,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::config::create_owner_only;
 use crate::model::{
     Baseline, CanonicalPath, Conflict, ContentIdentity, LocalObservation, NoOpDecision,
     Observation, Operation, OperationPlan, RemoteObservation,
@@ -20,7 +21,22 @@ const MIGRATION_V2: &str = include_str!("../migrations/0002.sql");
 const MIGRATION_V3: &str = include_str!("../migrations/0003.sql");
 const MIGRATION_V4: &str = include_str!("../migrations/0004.sql");
 const MIGRATION_V5: &str = include_str!("../migrations/0005.sql");
-const SCHEMA_VERSION: i64 = 5;
+const MIGRATION_V6: &str = include_str!("../migrations/0006.sql");
+const SCHEMA_VERSION: i64 = 6;
+const BUSY_TIMEOUT_MILLISECONDS: u64 = 5_000;
+const FINISH_PLAN: &str = "UPDATE plans \
+    SET status = 'completed', blocked_json = NULL, retry_at = NULL WHERE id = ?1";
+const PLAN_QUERY: &str = "SELECT plans.id, plans.path, plans.status, plans.blocked_json, \
+     plans.retry_at, operations.id, operations.ordinal, operations.operation_json, \
+     operations.status \
+     FROM plans JOIN operations ON operations.plan_id = plans.id \
+     WHERE plans.status = ?1 ORDER BY plans.id, operations.ordinal";
+/// Schema versions before six have neither a blocked status nor its columns, so
+/// a read-only journal opened on one reports every plan as pending or completed.
+const LEGACY_PLAN_QUERY: &str = "SELECT plans.id, plans.path, plans.status, NULL, NULL, \
+     operations.id, operations.ordinal, operations.operation_json, operations.status \
+     FROM plans JOIN operations ON operations.plan_id = plans.id \
+     WHERE plans.status = ?1 ORDER BY plans.id, operations.ordinal";
 const DELETE_REMOTE_DESCENDANTS: &str = "DELETE FROM remote_observations \
     WHERE canonical_path >= ?1 AND canonical_path < ?2";
 
@@ -337,8 +353,69 @@ pub struct PlanRecord {
     pub path: PathBuf,
     /// Operations in their required execution order.
     pub operations: Vec<PlannedOperation>,
-    /// Durable completion state.
-    pub status: RecordStatus,
+    /// Durable plan state.
+    pub status: PlanStatus,
+}
+
+/// Durable state of one per-path plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlanStatus {
+    /// The plan is ready for its next effect.
+    Pending,
+    /// A classified per-path failure holds the plan until `retry_at`.
+    Blocked {
+        /// Why this path cannot progress.
+        reason: BlockReason,
+        /// Earliest retry in seconds since the Unix epoch.
+        retry_at: u64,
+    },
+    /// The plan finished durably or was superseded.
+    Completed,
+}
+
+/// Why one path cannot make progress until its cause is retried or cleared.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum BlockReason {
+    /// Dropbox rejected the mutation with this documented tag.
+    RemoteRejected {
+        /// Documented Dropbox error tag.
+        tag: String,
+    },
+    /// An exact download answered with this client-error status.
+    DownloadUnavailable {
+        /// HTTP status returned by Dropbox.
+        status: u16,
+    },
+    /// Downloaded bytes did not match their expected hash, size, or revision.
+    DownloadVerificationFailed,
+    /// Unrelated bytes occupy the staging slot for this path.
+    StageOccupied,
+    /// A local object blocks the target path or one of its parents.
+    LocalObjectInWay,
+    /// Dropbox holds a folder or unsupported object where a file is expected.
+    RemoteObject,
+}
+
+/// Result of holding a live plan until its cause is retried.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlanBlock {
+    /// The plan does not exist.
+    NotFound,
+    /// The plan already finished, so nothing was blocked.
+    AlreadyCompleted,
+    /// The reason and retry time were committed.
+    Blocked,
+}
+
+/// Result of returning a blocked plan to pending work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlanUnblock {
+    /// The plan does not exist.
+    NotFound,
+    /// The plan is not blocked, so nothing changed.
+    NotBlocked,
+    /// The plan is pending again.
+    Unblocked,
 }
 
 /// Result of recording a plan intent.
@@ -346,8 +423,8 @@ pub struct PlanRecord {
 pub enum PlanWrite {
     /// A new plan was committed.
     Recorded(PlanRecord),
-    /// The path already has a pending plan; that committed plan is returned.
-    AlreadyPending(PlanRecord),
+    /// The path already owns a live plan; that committed plan is returned.
+    AlreadyLive(PlanRecord),
 }
 
 /// Result of recording a planner-approved transition with no effects.
@@ -355,8 +432,8 @@ pub enum PlanWrite {
 pub enum NoOpWrite {
     /// The observed baseline was committed.
     Recorded,
-    /// A pending effect plan owns the path, so the baseline was not changed.
-    PendingPlan(PlanId),
+    /// A live effect plan owns the path, so the baseline was not changed.
+    LivePlan(PlanId),
 }
 
 /// Result of committing one reconciliation's journal-only decisions together.
@@ -364,7 +441,9 @@ pub enum NoOpWrite {
 pub(crate) struct ReconciliationWrite {
     pub(crate) recorded_noops: usize,
     pub(crate) recorded_plans: usize,
-    pub(crate) pending_paths: Vec<PathBuf>,
+    /// Paths whose decision was not recorded because a live plan already owns
+    /// them; a live plan is pending or blocked.
+    pub(crate) live_paths: Vec<PathBuf>,
 }
 
 /// Result of completing one ordered operation.
@@ -490,11 +569,23 @@ impl Journal {
     /// Open a journal and apply its migration.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, JournalError> {
         let path = path.as_ref().to_path_buf();
-        let mut connection = Connection::open(&path).map_err(|source| JournalError::Sqlite {
+        create_owner_only(&path).map_err(|source| JournalError::File {
+            operation: "create journal database",
+            path: path.clone(),
+            source,
+        })?;
+        // The guard above cannot outlast its own check, so SQLite is told not to
+        // follow a link that appears between the two opens.
+        let mut connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|source| JournalError::Sqlite {
             operation: "open journal",
             path: path.clone(),
             source,
         })?;
+        set_busy_timeout(&connection, &path)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(
             |source| JournalError::File {
                 operation: "restrict journal permissions",
@@ -517,13 +608,6 @@ impl Journal {
             });
         }
         configure_writable(&connection, &path)?;
-        connection
-            .pragma_update(None, "foreign_keys", true)
-            .map_err(|source| JournalError::Sqlite {
-                operation: "enable foreign keys",
-                path: path.clone(),
-                source,
-            })?;
         if version < SCHEMA_VERSION {
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -578,6 +662,9 @@ impl Journal {
                         source,
                     })?;
             }
+            if version < 6 {
+                migrate_blocked_plans(&transaction, &path)?;
+            }
             transaction
                 .commit()
                 .map_err(|source| JournalError::Sqlite {
@@ -599,12 +686,16 @@ impl Journal {
     /// Open an existing supported journal without creating or changing it.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, JournalError> {
         let path = path.as_ref().to_path_buf();
-        let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|source| JournalError::Sqlite {
-                operation: "open journal read-only",
-                path: path.clone(),
-                source,
-            })?;
+        let connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(|source| JournalError::Sqlite {
+            operation: "open journal read-only",
+            path: path.clone(),
+            source,
+        })?;
+        set_busy_timeout(&connection, &path)?;
         let version = connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .map_err(|source| JournalError::Sqlite {
@@ -1430,13 +1521,13 @@ impl Journal {
         for (path, noop) in noops {
             match record_noop_in(&transaction, path, noop)? {
                 NoOpWrite::Recorded => write.recorded_noops += 1,
-                NoOpWrite::PendingPlan(_) => write.pending_paths.push(path.clone()),
+                NoOpWrite::LivePlan(_) => write.live_paths.push(path.clone()),
             }
         }
         for (path, plan) in plans {
             match record_plan_in(&transaction, &database_path, path, plan)? {
                 PlanWrite::Recorded(_) => write.recorded_plans += 1,
-                PlanWrite::AlreadyPending(_) => write.pending_paths.push(path.clone()),
+                PlanWrite::AlreadyLive(_) => write.live_paths.push(path.clone()),
             }
         }
         transaction
@@ -1445,31 +1536,111 @@ impl Journal {
         Ok(write)
     }
 
-    /// Load every unfinished plan after startup or interruption.
+    /// Load every plan awaiting its next effect after startup or interruption.
     pub fn pending_plans(&self) -> Result<Vec<PlanRecord>, JournalError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT id FROM plans WHERE status = 'pending' ORDER BY id")
-            .map_err(|source| sqlite("prepare pending plan query", &self.database_path, source))?;
-        let rows = statement
-            .query_map([], |row| row.get::<_, i64>(0))
-            .map_err(|source| sqlite("query pending plans", &self.database_path, source))?;
-        let ids = rows
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| sqlite("read pending plan identity", &self.database_path, source))?;
-        drop(statement);
+        read_plans_with_status(
+            &self.connection,
+            &self.database_path,
+            self.plan_query(),
+            "pending",
+            "read pending plans",
+        )
+    }
 
-        ids.into_iter()
-            .map(|id| {
-                read_plan(&self.connection, &self.database_path, PlanId(id))?.ok_or_else(|| {
-                    JournalError::InvalidState {
-                        operation: "read pending plan",
-                        path: self.database_path.clone(),
-                        detail: "pending plan disappeared while reading the journal",
-                    }
-                })
-            })
-            .collect()
+    fn plan_query(&self) -> &'static str {
+        if self.schema_version >= 6 {
+            PLAN_QUERY
+        } else {
+            LEGACY_PLAN_QUERY
+        }
+    }
+
+    /// Load every plan held by a classified per-path failure.
+    pub fn blocked_plans(&self) -> Result<Vec<PlanRecord>, JournalError> {
+        read_plans_with_status(
+            &self.connection,
+            &self.database_path,
+            self.plan_query(),
+            "blocked",
+            "read blocked plans",
+        )
+    }
+
+    /// Hold a live plan until its classified cause is worth retrying.
+    pub fn block_plan(
+        &mut self,
+        plan_id: PlanId,
+        reason: &BlockReason,
+        retry_at: u64,
+    ) -> Result<PlanBlock, JournalError> {
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite("begin plan block", &database_path, source))?;
+        let Some((path, status)) = read_plan_state(
+            &transaction,
+            &database_path,
+            plan_id,
+            "read plan status for blocking",
+        )?
+        else {
+            return Ok(PlanBlock::NotFound);
+        };
+        match status {
+            PlanStatus::Completed => return Ok(PlanBlock::AlreadyCompleted),
+            PlanStatus::Pending | PlanStatus::Blocked { .. } => {}
+        }
+        let json = encode(reason, "serialize block reason", &path)?;
+        let retry_at = i64::try_from(retry_at).map_err(|_| JournalError::InvalidState {
+            operation: "block plan",
+            path: path.clone(),
+            detail: "retry time exceeds the supported range",
+        })?;
+        transaction
+            .execute(
+                "UPDATE plans SET status = 'blocked', blocked_json = ?2, retry_at = ?3 \
+                 WHERE id = ?1",
+                params![plan_id.0, json, retry_at],
+            )
+            .map_err(|source| sqlite("block plan", &path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite("commit plan block", &database_path, source))?;
+        Ok(PlanBlock::Blocked)
+    }
+
+    /// Return a blocked plan to pending work for one more attempt.
+    pub fn unblock_plan(&mut self, plan_id: PlanId) -> Result<PlanUnblock, JournalError> {
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite("begin plan unblock", &database_path, source))?;
+        let Some((path, status)) = read_plan_state(
+            &transaction,
+            &database_path,
+            plan_id,
+            "read plan status for unblocking",
+        )?
+        else {
+            return Ok(PlanUnblock::NotFound);
+        };
+        match status {
+            PlanStatus::Pending | PlanStatus::Completed => return Ok(PlanUnblock::NotBlocked),
+            PlanStatus::Blocked { .. } => {}
+        }
+        transaction
+            .execute(
+                "UPDATE plans SET status = 'pending', blocked_json = NULL, retry_at = NULL \
+                 WHERE id = ?1",
+                [plan_id.0],
+            )
+            .map_err(|source| sqlite("unblock plan", &path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite("commit plan unblock", &database_path, source))?;
+        Ok(PlanUnblock::Unblocked)
     }
 
     /// Return upload payloads still referenced by pending remote mutations.
@@ -1479,7 +1650,8 @@ impl Journal {
             .prepare(
                 "SELECT plans.path, operations.operation_json \
                  FROM operations JOIN plans ON plans.id = operations.plan_id \
-                 WHERE plans.status = 'pending' AND operations.status = 'pending' \
+                 WHERE plans.status IN ('pending', 'blocked') \
+                   AND operations.status = 'pending' \
                  ORDER BY operations.id",
             )
             .map_err(|source| {
@@ -1641,22 +1813,18 @@ impl Journal {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite("begin plan conflict", &database_path, source))?;
-        let plan = transaction
-            .query_row(
-                "SELECT path, status FROM plans WHERE id = ?1",
-                [plan_id.0],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()
-            .map_err(|source| sqlite("find plan for conflict", &database_path, source))?;
-        let Some((raw_path, status)) = plan else {
+        let Some((path, status)) = read_plan_state(
+            &transaction,
+            &database_path,
+            plan_id,
+            "read plan status for conflict",
+        )?
+        else {
             return Ok(PlanConflictCompletion::NotFound);
         };
-        let path = bytes_path(raw_path);
-        if decode_status(&status, "read plan status for conflict", &path)?
-            == RecordStatus::Completed
-        {
-            return Ok(PlanConflictCompletion::AlreadyCompleted);
+        match status {
+            PlanStatus::Completed => return Ok(PlanConflictCompletion::AlreadyCompleted),
+            PlanStatus::Pending | PlanStatus::Blocked { .. } => {}
         }
 
         let json = encode(conflict, "serialize plan conflict", &path)?;
@@ -1677,10 +1845,7 @@ impl Journal {
             )
             .map_err(|source| sqlite("complete conflicted plan operations", &path, source))?;
         transaction
-            .execute(
-                "UPDATE plans SET status = 'completed' WHERE id = ?1",
-                [plan_id.0],
-            )
+            .execute(FINISH_PLAN, [plan_id.0])
             .map_err(|source| sqlite("complete conflicted plan", &path, source))?;
         start_recovery_retention(&transaction, plan_id.0, &path)?;
         transaction
@@ -1696,22 +1861,18 @@ impl Journal {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite("begin plan supersession", &database_path, source))?;
-        let plan = transaction
-            .query_row(
-                "SELECT path, status FROM plans WHERE id = ?1",
-                [plan_id.0],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()
-            .map_err(|source| sqlite("find plan for supersession", &database_path, source))?;
-        let Some((raw_path, status)) = plan else {
+        let Some((path, status)) = read_plan_state(
+            &transaction,
+            &database_path,
+            plan_id,
+            "read plan status for supersession",
+        )?
+        else {
             return Ok(PlanSupersede::NotFound);
         };
-        let path = bytes_path(raw_path);
-        if decode_status(&status, "read plan status for supersession", &path)?
-            == RecordStatus::Completed
-        {
-            return Ok(PlanSupersede::AlreadyCompleted);
+        match status {
+            PlanStatus::Completed => return Ok(PlanSupersede::AlreadyCompleted),
+            PlanStatus::Pending | PlanStatus::Blocked { .. } => {}
         }
         transaction
             .execute(
@@ -1720,10 +1881,7 @@ impl Journal {
             )
             .map_err(|source| sqlite("retire superseded operations", &path, source))?;
         transaction
-            .execute(
-                "UPDATE plans SET status = 'completed' WHERE id = ?1",
-                [plan_id.0],
-            )
+            .execute(FINISH_PLAN, [plan_id.0])
             .map_err(|source| sqlite("retire superseded plan", &path, source))?;
         start_recovery_retention(&transaction, plan_id.0, &path)?;
         transaction
@@ -2032,7 +2190,20 @@ impl Journal {
     }
 }
 
+/// Wait instead of failing while another connection commits.
+///
+/// Every connection sets this before its first statement, so a status read
+/// during a daemon commit never surfaces as "database is locked".
+fn set_busy_timeout(connection: &Connection, database_path: &Path) -> Result<(), JournalError> {
+    connection
+        .busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MILLISECONDS))
+        .map_err(|source| sqlite("set SQLite busy timeout", database_path, source))
+}
+
 fn configure_writable(connection: &Connection, database_path: &Path) -> Result<(), JournalError> {
+    connection
+        .pragma_update(None, "foreign_keys", true)
+        .map_err(|source| sqlite("enable foreign keys", database_path, source))?;
     let journal_mode = connection
         .query_row("PRAGMA journal_mode = DELETE", [], |row| {
             row.get::<_, String>(0)
@@ -2059,6 +2230,91 @@ fn configure_writable(connection: &Connection, database_path: &Path) -> Result<(
         });
     }
     Ok(())
+}
+
+fn migrate_blocked_plans(
+    connection: &Connection,
+    database_path: &Path,
+) -> Result<(), JournalError> {
+    // Version four made the canonical columns unique, so backfilling a null
+    // canonical path onto an existing claim would abort the whole migration
+    // instead of discarding both claims. The rebuild recreates both indexes.
+    connection
+        .execute_batch(
+            "DROP INDEX baselines_by_canonical_path; \
+             DROP INDEX remote_observations_by_canonical_path;",
+        )
+        .map_err(|source| sqlite("relax canonical path indexes", database_path, source))?;
+    for (select, update) in [
+        (
+            "SELECT rowid, path FROM baselines WHERE canonical_path IS NULL",
+            "UPDATE baselines SET canonical_path = ?1 WHERE rowid = ?2",
+        ),
+        (
+            "SELECT rowid, path FROM remote_observations WHERE canonical_path IS NULL",
+            "UPDATE remote_observations SET canonical_path = ?1 WHERE rowid = ?2",
+        ),
+        (
+            "SELECT rowid, path FROM conflicts WHERE canonical_path IS NULL",
+            "UPDATE conflicts SET canonical_path = ?1 WHERE rowid = ?2",
+        ),
+        (
+            "SELECT rowid, path FROM plans WHERE canonical_path IS NULL",
+            "UPDATE plans SET canonical_path = ?1 WHERE rowid = ?2",
+        ),
+    ] {
+        populate_canonical_paths(connection, database_path, select, update)?;
+    }
+    let sequence = connection
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'operations'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|source| sqlite("read operation sequence", database_path, source))?;
+    connection
+        .execute_batch(MIGRATION_V6)
+        .map_err(|source| sqlite("apply journal version-six migration", database_path, source))?;
+    if let Some(sequence) = sequence {
+        connection
+            .execute(
+                "INSERT INTO sqlite_sequence(name, seq) SELECT 'operations', ?1 \
+                 WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'operations')",
+                [sequence],
+            )
+            .and_then(|_| {
+                connection.execute(
+                    "UPDATE sqlite_sequence SET seq = ?1 \
+                     WHERE name = 'operations' AND seq < ?1",
+                    [sequence],
+                )
+            })
+            .map_err(|source| sqlite("restore operation sequence", database_path, source))?;
+    }
+    let violations = {
+        let mut statement = connection
+            .prepare("PRAGMA foreign_key_check")
+            .map_err(|source| sqlite("prepare foreign key check", database_path, source))?;
+        let rows = statement
+            .query_map([], |_| Ok(()))
+            .map_err(|source| sqlite("run foreign key check", database_path, source))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|source| sqlite("read foreign key check", database_path, source))?
+            .len()
+    };
+    if violations > 0 {
+        return Err(JournalError::InvalidState {
+            operation: "apply journal version-six migration",
+            path: database_path.to_path_buf(),
+            detail: "rebuilt plan and operation tables left dangling references",
+        });
+    }
+    // A migration step stamps the version it produces, not whatever the latest
+    // schema happens to be, so adding version seven cannot silently relabel it.
+    connection
+        .pragma_update(None, "user_version", 6)
+        .map_err(|source| sqlite("set journal schema version", database_path, source))
 }
 
 fn migrate_canonical_paths(
@@ -2105,8 +2361,8 @@ fn migrate_canonical_paths(
 fn populate_canonical_paths(
     connection: &Connection,
     database_path: &Path,
-    select: &'static str,
-    update: &'static str,
+    select: &str,
+    update: &str,
 ) -> Result<(), JournalError> {
     let rows = {
         let mut statement = connection
@@ -2202,6 +2458,33 @@ fn decode_status(
     }
 }
 
+fn decode_plan_status(
+    status: &str,
+    blocked_json: Option<&str>,
+    retry_at: Option<i64>,
+    operation: &'static str,
+    path: &Path,
+) -> Result<PlanStatus, JournalError> {
+    let invalid = |detail| JournalError::InvalidState {
+        operation,
+        path: path.to_path_buf(),
+        detail,
+    };
+    match (status, blocked_json, retry_at) {
+        ("pending", None, None) => Ok(PlanStatus::Pending),
+        ("completed", None, None) => Ok(PlanStatus::Completed),
+        ("blocked", Some(json), Some(retry_at)) => Ok(PlanStatus::Blocked {
+            reason: decode(json, "deserialize block reason", path)?,
+            retry_at: u64::try_from(retry_at)
+                .map_err(|_| invalid("blocked plan has a negative retry time"))?,
+        }),
+        ("pending" | "completed" | "blocked", _, _) => {
+            Err(invalid("plan status disagrees with its block columns"))
+        }
+        _ => Err(invalid("plan has an unrecognized status")),
+    }
+}
+
 fn write_baseline(
     connection: &Connection,
     path: &Path,
@@ -2241,16 +2524,17 @@ fn record_noop_in(
     noop: &NoOpDecision,
 ) -> Result<NoOpWrite, JournalError> {
     let canonical_path = CanonicalPath::from_display(path);
-    let pending = connection
+    let live = connection
         .query_row(
-            "SELECT id FROM plans WHERE canonical_path = ?1 AND status = 'pending'",
+            "SELECT id FROM plans \
+             WHERE canonical_path = ?1 AND status IN ('pending', 'blocked')",
             [canonical_path.as_bytes()],
             |row| row.get::<_, i64>(0),
         )
         .optional()
-        .map_err(|source| sqlite("find pending plan for no-op", path, source))?;
-    if let Some(id) = pending {
-        return Ok(NoOpWrite::PendingPlan(PlanId(id)));
+        .map_err(|source| sqlite("find live plan for no-op", path, source))?;
+    if let Some(id) = live {
+        return Ok(NoOpWrite::LivePlan(PlanId(id)));
     }
     write_baseline(connection, path, noop.baseline())?;
     connection
@@ -2268,6 +2552,13 @@ fn record_plan_in(
     path: &Path,
     plan: &OperationPlan,
 ) -> Result<PlanWrite, JournalError> {
+    if plan.operations().is_empty() {
+        return Err(JournalError::InvalidState {
+            operation: "record plan",
+            path: path.to_path_buf(),
+            detail: "a plan must carry at least one operation",
+        });
+    }
     let encoded_operations = plan
         .operations()
         .iter()
@@ -2284,21 +2575,22 @@ fn record_plan_in(
     let canonical_path = CanonicalPath::from_display(path);
     let existing = connection
         .query_row(
-            "SELECT id FROM plans WHERE canonical_path = ?1 AND status = 'pending'",
+            "SELECT id FROM plans \
+             WHERE canonical_path = ?1 AND status IN ('pending', 'blocked')",
             [canonical_path.as_bytes()],
             |row| row.get::<_, i64>(0),
         )
         .optional()
-        .map_err(|source| sqlite("find pending plan", path, source))?;
+        .map_err(|source| sqlite("find live plan", path, source))?;
     if let Some(id) = existing {
         let plan = read_plan(connection, database_path, PlanId(id))?.ok_or_else(|| {
             JournalError::InvalidState {
-                operation: "read existing pending plan",
+                operation: "read existing live plan",
                 path: path.to_path_buf(),
-                detail: "pending plan disappeared inside its transaction",
+                detail: "live plan disappeared inside its transaction",
             }
         })?;
-        return Ok(PlanWrite::AlreadyPending(plan));
+        return Ok(PlanWrite::AlreadyLive(plan));
     }
 
     connection
@@ -2336,7 +2628,7 @@ fn complete_operation_in(
     let row = connection
         .query_row(
             "SELECT operations.plan_id, operations.ordinal, operations.status, plans.status, \
-                    plans.path, operations.operation_json \
+                    plans.path, operations.operation_json, plans.blocked_json, plans.retry_at \
              FROM operations JOIN plans ON plans.id = operations.plan_id \
              WHERE operations.id = ?1",
             [operation_id.0],
@@ -2348,19 +2640,36 @@ fn complete_operation_in(
                     row.get::<_, String>(3)?,
                     row.get::<_, Vec<u8>>(4)?,
                     row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
                 ))
             },
         )
         .optional()
         .map_err(|source| sqlite("find operation", database_path, source))?;
-    let Some((plan_id, ordinal, operation_status, plan_status, raw_path, operation_json)) = row
+    let Some((
+        plan_id,
+        ordinal,
+        operation_status,
+        plan_status,
+        raw_path,
+        operation_json,
+        blocked_json,
+        retry_at,
+    )) = row
     else {
         return Ok(OperationCompletion::NotFound);
     };
     let path = bytes_path(raw_path);
     let operation_status = decode_status(&operation_status, "read operation status", &path)?;
-    let plan_status = decode_status(&plan_status, "read plan status", &path)?;
-    if operation_status == RecordStatus::Completed || plan_status == RecordStatus::Completed {
+    let plan_status = decode_plan_status(
+        &plan_status,
+        blocked_json.as_deref(),
+        retry_at,
+        "read plan status",
+        &path,
+    )?;
+    if operation_status == RecordStatus::Completed || plan_status == PlanStatus::Completed {
         return Ok(OperationCompletion::AlreadyCompleted);
     }
     let operation: Operation = decode(&operation_json, "deserialize operation", &path)?;
@@ -2428,10 +2737,7 @@ fn complete_operation_in(
         )
         .map_err(|source| sqlite("retire resolved conflicts", &path, source))?;
     connection
-        .execute(
-            "UPDATE plans SET status = 'completed' WHERE id = ?1",
-            [plan_id],
-        )
+        .execute(FINISH_PLAN, [plan_id])
         .map_err(|source| sqlite("complete plan", &path, source))?;
     start_recovery_retention(connection, plan_id, &path)?;
     Ok(OperationCompletion::PlanCompleted)
@@ -2639,24 +2945,115 @@ fn read_remote_observations(
     })
 }
 
+/// One joined plan and operation row.
+struct PlanRow {
+    plan_id: i64,
+    path: Vec<u8>,
+    status: String,
+    blocked_json: Option<String>,
+    retry_at: Option<i64>,
+    operation_id: i64,
+    ordinal: i64,
+    operation_json: String,
+    operation_status: String,
+}
+
+fn read_plans_with_status(
+    connection: &Connection,
+    database_path: &Path,
+    query: &'static str,
+    status: &'static str,
+    operation: &'static str,
+) -> Result<Vec<PlanRecord>, JournalError> {
+    let mut statement = connection
+        .prepare(query)
+        .map_err(|source| sqlite("prepare plan query", database_path, source))?;
+    let rows = statement
+        .query_map([status], |row| {
+            Ok(PlanRow {
+                plan_id: row.get(0)?,
+                path: row.get(1)?,
+                status: row.get(2)?,
+                blocked_json: row.get(3)?,
+                retry_at: row.get(4)?,
+                operation_id: row.get(5)?,
+                ordinal: row.get(6)?,
+                operation_json: row.get(7)?,
+                operation_status: row.get(8)?,
+            })
+        })
+        .map_err(|source| sqlite(operation, database_path, source))?;
+    let mut plans: Vec<PlanRecord> = Vec::new();
+    for row in rows {
+        let row = row.map_err(|source| sqlite(operation, database_path, source))?;
+        let path = bytes_path(row.path);
+        let planned = PlannedOperation {
+            id: OperationId(row.operation_id),
+            ordinal: u32::try_from(row.ordinal).map_err(|_| JournalError::InvalidState {
+                operation,
+                path: path.clone(),
+                detail: "operation ordinal exceeds the supported range",
+            })?,
+            operation: decode(&row.operation_json, "deserialize operation", &path)?,
+            status: decode_status(&row.operation_status, "read operation status", &path)?,
+        };
+        match plans.last_mut() {
+            Some(last) if last.id == PlanId(row.plan_id) => last.operations.push(planned),
+            _ => plans.push(PlanRecord {
+                id: PlanId(row.plan_id),
+                status: decode_plan_status(
+                    &row.status,
+                    row.blocked_json.as_deref(),
+                    row.retry_at,
+                    operation,
+                    &path,
+                )?,
+                path,
+                operations: vec![planned],
+            }),
+        }
+    }
+    Ok(plans)
+}
+
+fn read_plan_state(
+    connection: &Connection,
+    database_path: &Path,
+    plan_id: PlanId,
+    operation: &'static str,
+) -> Result<Option<(PathBuf, PlanStatus)>, JournalError> {
+    let header = connection
+        .query_row(
+            "SELECT path, status, blocked_json, retry_at FROM plans WHERE id = ?1",
+            [plan_id.0],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|source| sqlite(operation, database_path, source))?;
+    let Some((raw_path, status, blocked_json, retry_at)) = header else {
+        return Ok(None);
+    };
+    let path = bytes_path(raw_path);
+    let status = decode_plan_status(&status, blocked_json.as_deref(), retry_at, operation, &path)?;
+    Ok(Some((path, status)))
+}
+
 fn read_plan(
     connection: &Connection,
     database_path: &Path,
     plan_id: PlanId,
 ) -> Result<Option<PlanRecord>, JournalError> {
-    let header = connection
-        .query_row(
-            "SELECT path, status FROM plans WHERE id = ?1",
-            [plan_id.0],
-            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()
-        .map_err(|source| sqlite("read plan", database_path, source))?;
-    let Some((raw_path, status)) = header else {
+    let Some((path, status)) = read_plan_state(connection, database_path, plan_id, "read plan")?
+    else {
         return Ok(None);
     };
-    let path = bytes_path(raw_path);
-    let status = decode_status(&status, "read plan status", &path)?;
 
     let mut statement = connection
         .prepare(
@@ -2936,7 +3333,7 @@ mod tests {
     fn recorded_plan(write: PlanWrite) -> Result<PlanRecord, JournalError> {
         match write {
             PlanWrite::Recorded(plan) => Ok(plan),
-            PlanWrite::AlreadyPending(_) => Err(JournalError::InvalidState {
+            PlanWrite::AlreadyLive(_) => Err(JournalError::InvalidState {
                 operation: "extract recorded test plan",
                 path: PathBuf::from("test"),
                 detail: "test expected a newly recorded plan",
@@ -2956,6 +3353,18 @@ mod tests {
                 detail: "test expected a newly recorded recovery",
             }),
         }
+    }
+
+    /// Build an empty version-five database the way the migrations reach it.
+    fn version_five(database_path: &Path) -> Result<Connection, Box<dyn Error>> {
+        let connection = Connection::open(database_path)?;
+        connection.execute_batch(MIGRATION_V1)?;
+        connection.execute_batch(MIGRATION_V2)?;
+        connection.execute_batch(MIGRATION_V3)?;
+        connection.execute_batch(MIGRATION_V4)?;
+        migrate_canonical_paths(&connection, database_path)?;
+        connection.execute_batch(MIGRATION_V5)?;
+        Ok(connection)
     }
 
     fn operations(decision: Decision) -> Result<OperationPlan, JournalError> {
@@ -3120,6 +3529,28 @@ mod tests {
         Ok(())
     }
 
+    /// rusqlite happens to open connections with the same five-second timeout,
+    /// so this pins the value the design requires rather than whatever a
+    /// dependency currently defaults to.
+    #[test]
+    fn every_connection_waits_out_a_concurrent_commit() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+        let writable = Journal::open(&database_path)?;
+
+        let read_only = Journal::open_read_only(&database_path)?;
+
+        for journal in [&writable, &read_only] {
+            assert_eq!(
+                journal
+                    .connection
+                    .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))?,
+                i64::try_from(BUSY_TIMEOUT_MILLISECONDS)?
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn writable_journal_uses_full_synchronous_rollback_mode() -> Result<(), Box<dyn Error>> {
         let directory = TempDir::new()?;
@@ -3132,8 +3563,17 @@ mod tests {
             .connection
             .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))?;
 
+        let busy_timeout = journal
+            .connection
+            .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))?;
+        let foreign_keys = journal
+            .connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))?;
+
         assert_eq!(journal_mode, "delete");
         assert_eq!(synchronous, 2);
+        assert_eq!(busy_timeout, 5_000);
+        assert_eq!(foreign_keys, 1);
         Ok(())
     }
 
@@ -3394,7 +3834,7 @@ mod tests {
         ))?;
         assert_eq!(
             journal.record_noop(path, &absent)?,
-            NoOpWrite::PendingPlan(pending.id)
+            NoOpWrite::LivePlan(pending.id)
         );
         assert_eq!(
             journal.baseline(path)?,
@@ -4043,7 +4483,7 @@ mod tests {
         drop(legacy);
 
         let mut journal = Journal::open(&database_path)?;
-        assert_eq!(journal.schema_version, 5);
+        assert_eq!(journal.schema_version, 6);
         assert_eq!(journal.baseline(path)?, None);
         assert_eq!(journal.baseline(kept_path)?, Some(kept_baseline.clone()));
         assert_eq!(journal.baseline_paths()?, vec![kept_path.to_path_buf()]);
@@ -4094,7 +4534,7 @@ mod tests {
         let version = journal
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let mut foreign_keys = journal
             .connection
             .prepare("PRAGMA foreign_key_list(recovery_records)")?;
@@ -4165,17 +4605,17 @@ mod tests {
         let duplicate = OperationPlan::new(vec![operation]);
         assert!(matches!(
             journal.record_plan(Path::new("pending.txt"), &duplicate)?,
-            PlanWrite::AlreadyPending(plan) if plan.path == Path::new("Pending.TXT")
+            PlanWrite::AlreadyLive(plan) if plan.path == Path::new("Pending.TXT")
         ));
         let version = journal
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         Ok(())
     }
 
     #[test]
-    fn version_three_case_collisions_migrate_without_losing_pending_work()
+    fn version_three_case_collisions_keep_one_live_plan_per_canonical_path()
     -> Result<(), Box<dyn Error>> {
         let directory = TempDir::new()?;
         let database_path = journal_path(&directory);
@@ -4214,18 +4654,966 @@ mod tests {
         assert!(journal.baseline_paths()?.is_empty());
         assert_eq!(journal.baseline(first_path)?, None);
         assert_eq!(journal.baseline(second_path)?, None);
-        assert_eq!(journal.pending_plans()?.len(), 2);
+        let live = journal.pending_plans()?;
+        let [kept] = live.as_slice() else {
+            return Err("collided plans did not converge on one live plan".into());
+        };
+        assert_eq!(kept.id, PlanId(10));
+        assert_eq!(kept.path, first_path);
+        assert_eq!(kept.status, PlanStatus::Pending);
+        for (table, id) in [("plans", 11), ("operations", 21)] {
+            let surviving = journal.connection.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE id = ?1"),
+                [id],
+                |row| row.get::<_, i64>(0),
+            )?;
+            assert_eq!(surviving, 0, "superseded {table} row was not retired");
+        }
         let new_plan = OperationPlan::new(vec![operation]);
         assert!(matches!(
             journal.record_plan(Path::new("FOO.txt"), &new_plan)?,
-            PlanWrite::AlreadyPending(_)
+            PlanWrite::AlreadyLive(_)
         ));
-        assert_eq!(journal.pending_plans()?.len(), 2);
+        assert_eq!(journal.pending_plans()?.len(), 1);
         drop(journal);
 
         let reopened = Journal::open(&database_path)?;
-        assert_eq!(reopened.pending_plans()?.len(), 2);
+        assert_eq!(reopened.pending_plans()?.len(), 1);
         assert!(reopened.baseline_paths()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn blocking_a_plan_hides_it_from_pending_work_across_reopen() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+        let path = Path::new("blocked.txt");
+        let upload = operations(plan(
+            &Baseline::Absent,
+            &Observation::Present(LocalFile::new(content("upload"))),
+            &Observation::ConfirmedAbsent,
+        ))?;
+        let reason = BlockReason::RemoteRejected {
+            tag: String::from("insufficient_space"),
+        };
+
+        let mut journal = Journal::open(&database_path)?;
+        let recorded = recorded_plan(journal.record_plan(path, &upload)?)?;
+        assert_eq!(recorded.status, PlanStatus::Pending);
+        assert_eq!(
+            journal.block_plan(recorded.id, &reason, 1_700_000_000)?,
+            PlanBlock::Blocked
+        );
+
+        assert!(journal.pending_plans()?.is_empty());
+        let blocked = journal.blocked_plans()?;
+        let [blocked] = blocked.as_slice() else {
+            return Err("blocked plan was not durable".into());
+        };
+        assert_eq!(blocked.id, recorded.id);
+        assert_eq!(blocked.path, path);
+        assert_eq!(blocked.operations, recorded.operations);
+        assert_eq!(
+            blocked.status,
+            PlanStatus::Blocked {
+                reason: reason.clone(),
+                retry_at: 1_700_000_000,
+            }
+        );
+        drop(journal);
+
+        let mut reopened = Journal::open(&database_path)?;
+        assert!(reopened.pending_plans()?.is_empty());
+        assert_eq!(reopened.blocked_plans()?.len(), 1);
+        assert_eq!(
+            reopened.block_plan(recorded.id, &BlockReason::StageOccupied, 1_700_003_600)?,
+            PlanBlock::Blocked
+        );
+        let reblocked = reopened.blocked_plans()?;
+        let [reblocked] = reblocked.as_slice() else {
+            return Err("re-blocked plan was not durable".into());
+        };
+        assert_eq!(
+            reblocked.status,
+            PlanStatus::Blocked {
+                reason: BlockReason::StageOccupied,
+                retry_at: 1_700_003_600,
+            }
+        );
+
+        assert_eq!(reopened.unblock_plan(recorded.id)?, PlanUnblock::Unblocked);
+        assert!(reopened.blocked_plans()?.is_empty());
+        let live = reopened.pending_plans()?;
+        let [live] = live.as_slice() else {
+            return Err("unblocked plan did not return to pending work".into());
+        };
+        assert_eq!(live.id, recorded.id);
+        assert_eq!(live.status, PlanStatus::Pending);
+        assert_eq!(reopened.unblock_plan(recorded.id)?, PlanUnblock::NotBlocked);
+        Ok(())
+    }
+
+    #[test]
+    fn blocking_reports_missing_and_finished_plans_without_changing_them()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+        let path = Path::new("finished.txt");
+        let upload = operations(plan(
+            &Baseline::Absent,
+            &Observation::Present(LocalFile::new(content("upload"))),
+            &Observation::ConfirmedAbsent,
+        ))?;
+        let reason = BlockReason::DownloadUnavailable { status: 409 };
+
+        let mut journal = Journal::open(&database_path)?;
+        let recorded = recorded_plan(journal.record_plan(path, &upload)?)?;
+        assert_eq!(
+            journal.supersede_plan(recorded.id)?,
+            PlanSupersede::Superseded
+        );
+
+        assert_eq!(
+            journal.block_plan(recorded.id, &reason, 1_700_000_000)?,
+            PlanBlock::AlreadyCompleted
+        );
+        assert!(journal.blocked_plans()?.is_empty());
+        assert_eq!(journal.unblock_plan(recorded.id)?, PlanUnblock::NotBlocked);
+        assert_eq!(
+            journal.block_plan(PlanId(9_999), &reason, 1_700_000_000)?,
+            PlanBlock::NotFound
+        );
+        assert_eq!(journal.unblock_plan(PlanId(9_999))?, PlanUnblock::NotFound);
+        Ok(())
+    }
+
+    #[test]
+    fn blocked_plan_upload_payloads_stay_referenced() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+        let path = Path::new("upload.txt");
+        let upload = operations(plan(
+            &Baseline::Absent,
+            &Observation::Present(LocalFile::new(content("upload"))),
+            &Observation::ConfirmedAbsent,
+        ))?;
+
+        let mut journal = Journal::open(&database_path)?;
+        let recorded = recorded_plan(journal.record_plan(path, &upload)?)?;
+        assert_eq!(journal.pending_upload_content()?, vec![content("upload")]);
+
+        assert_eq!(
+            journal.block_plan(recorded.id, &BlockReason::RemoteObject, 1_700_000_000)?,
+            PlanBlock::Blocked
+        );
+
+        assert_eq!(journal.pending_upload_content()?, vec![content("upload")]);
+        assert_eq!(
+            journal.supersede_plan(recorded.id)?,
+            PlanSupersede::Superseded
+        );
+        assert!(journal.pending_upload_content()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_blocked_path_keeps_its_plan_instead_of_gaining_a_second_one() -> Result<(), Box<dyn Error>>
+    {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+        let path = Path::new("Contested.TXT");
+        let upload = operations(plan(
+            &Baseline::Absent,
+            &Observation::Present(LocalFile::new(content("upload"))),
+            &Observation::ConfirmedAbsent,
+        ))?;
+
+        let mut journal = Journal::open(&database_path)?;
+        let recorded = recorded_plan(journal.record_plan(path, &upload)?)?;
+        assert_eq!(
+            journal.block_plan(recorded.id, &BlockReason::LocalObjectInWay, 1_700_000_000)?,
+            PlanBlock::Blocked
+        );
+
+        let repeated = journal.record_plan(Path::new("contested.txt"), &upload)?;
+        let PlanWrite::AlreadyLive(live) = repeated else {
+            return Err("a blocked path accepted a second live plan".into());
+        };
+
+        assert_eq!(live.id, recorded.id);
+        assert_eq!(
+            live.status,
+            PlanStatus::Blocked {
+                reason: BlockReason::LocalObjectInWay,
+                retry_at: 1_700_000_000,
+            }
+        );
+        assert_eq!(
+            journal.connection.query_row(
+                "SELECT COUNT(*) FROM plans WHERE status IN ('pending', 'blocked')",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pending_plans_reads_every_plan_and_operation_in_one_query() -> Result<(), Box<dyn Error>> {
+        static STATEMENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+        fn count(_: rusqlite::trace::TraceEvent<'_>) {
+            STATEMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        let directory = TempDir::new()?;
+        let mut journal = Journal::open(journal_path(&directory))?;
+        let upload = operations(plan(
+            &Baseline::Absent,
+            &Observation::Present(LocalFile::new(content("upload"))),
+            &Observation::ConfirmedAbsent,
+        ))?;
+        let displaced = LocalFile::new(content("displaced"));
+        let ordered_plan = OperationPlan::new(vec![
+            Operation::PreserveLocal {
+                file: displaced.clone(),
+            },
+            Operation::DeleteLocal {
+                expected_content: displaced.content,
+            },
+        ]);
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            let _ = recorded_plan(journal.record_plan(Path::new(name), &upload)?)?;
+        }
+        let ordered = recorded_plan(journal.record_plan(Path::new("d.txt"), &ordered_plan)?)?;
+        assert!(ordered.operations.len() > 1);
+
+        STATEMENTS.store(0, std::sync::atomic::Ordering::Relaxed);
+        journal.connection.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(count),
+        );
+        let plans = journal.pending_plans()?;
+        journal
+            .connection
+            .trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+
+        assert_eq!(STATEMENTS.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(plans.len(), 4);
+        let identities = plans
+            .iter()
+            .map(|record| {
+                (
+                    record.id,
+                    record
+                        .operations
+                        .iter()
+                        .map(|operation| operation.ordinal)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut sorted = identities.clone();
+        sorted.sort_by_key(|(id, _)| id.0);
+        assert_eq!(identities, sorted);
+        for (_, ordinals) in &identities {
+            let mut expected = ordinals.clone();
+            expected.sort_unstable();
+            assert_eq!(ordinals, &expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn version_five_migrates_plans_operations_and_canonical_paths() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+        let legacy_baseline_path = Path::new("Legacy/Report.TXT");
+        let legacy_conflict_path = Path::new("Diverged.TXT");
+        let legacy_remote_path = Path::new("Remote/Dir");
+        let pending_path = Path::new("Pending.TXT");
+        let completed_path = Path::new("done.txt");
+        let baseline = Baseline::Present(remote_file("legacy", "rev-legacy"));
+        let conflict = Conflict::RemoteDeletionLocalEdit {
+            local: LocalFile::new(content("diverged")),
+        };
+        let first = Operation::CreateRemote {
+            content: content("first"),
+        };
+        let second = Operation::DeleteRemote {
+            expected_revision: DropboxRevision::new("rev-second"),
+        };
+        {
+            let connection = version_five(&database_path)?;
+            connection.execute(
+                "INSERT INTO baselines(path, baseline_json) VALUES (?1, ?2)",
+                params![
+                    path_bytes(legacy_baseline_path),
+                    encode(&baseline, "test", legacy_baseline_path)?
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO conflicts(id, path, conflict_json) VALUES (40, ?1, ?2)",
+                params![
+                    path_bytes(legacy_conflict_path),
+                    encode(&conflict, "test", legacy_conflict_path)?
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO remote_observations(path, observation_json) VALUES (?1, ?2)",
+                params![
+                    path_bytes(legacy_remote_path),
+                    encode(&RemoteObservation::Directory, "test", legacy_remote_path)?
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO plans(id, path, status, canonical_path) \
+                 VALUES (10, ?1, 'pending', ?2)",
+                params![
+                    path_bytes(pending_path),
+                    canonical("pending.txt").as_bytes()
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO operations(id, plan_id, ordinal, operation_json, status) \
+                 VALUES (20, 10, 0, ?1, 'pending')",
+                [encode(&first, "test", pending_path)?],
+            )?;
+            connection.execute(
+                "INSERT INTO operations(id, plan_id, ordinal, operation_json, status) \
+                 VALUES (21, 10, 1, ?1, 'pending')",
+                [encode(&second, "test", pending_path)?],
+            )?;
+            connection.execute(
+                "INSERT INTO plans(id, path, status, canonical_path) \
+                 VALUES (11, ?1, 'completed', ?2)",
+                params![path_bytes(completed_path), canonical("done.txt").as_bytes()],
+            )?;
+            connection.execute(
+                "INSERT INTO operations(id, plan_id, ordinal, operation_json, status) \
+                 VALUES (22, 11, 0, ?1, 'completed')",
+                [encode(&first, "test", completed_path)?],
+            )?;
+            connection.execute(
+                "INSERT INTO recovery_records( \
+                     id, operation_id, original_path, recovery_path, content_json, status \
+                 ) VALUES (30, 22, ?1, ?2, ?3, 'completed')",
+                params![
+                    path_bytes(completed_path),
+                    path_bytes(Path::new("recovery/done.txt")),
+                    encode(&content("first"), "test", completed_path)?
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO remote_inventory(singleton, cursor) VALUES (1, 'cursor-v5')",
+                [],
+            )?;
+            connection.execute(
+                "UPDATE sqlite_sequence SET seq = 99 WHERE name = 'operations'",
+                [],
+            )?;
+        }
+
+        let journal = Journal::open(&database_path)?;
+        assert_eq!(journal.schema_version, 6);
+        assert_eq!(
+            journal
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
+            6
+        );
+
+        let pending = journal.pending_plans()?;
+        let [plan] = pending.as_slice() else {
+            return Err("migrated journal lost its single pending plan".into());
+        };
+        assert_eq!(plan.id, PlanId(10));
+        assert_eq!(plan.path, pending_path);
+        let identities = plan
+            .operations
+            .iter()
+            .map(|operation| (operation.id, operation.ordinal, operation.status))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            identities,
+            vec![
+                (OperationId(20), 0, RecordStatus::Pending),
+                (OperationId(21), 1, RecordStatus::Pending),
+            ]
+        );
+        assert_eq!(
+            journal
+                .connection
+                .query_row("SELECT status FROM plans WHERE id = 11", [], |row| row
+                    .get::<_, String>(
+                    0
+                ))?,
+            "completed"
+        );
+        assert_eq!(
+            journal.connection.query_row(
+                "SELECT status FROM operations WHERE id = 22",
+                [],
+                |row| row.get::<_, String>(0)
+            )?,
+            "completed"
+        );
+
+        assert_eq!(
+            journal.baseline(Path::new("legacy/report.txt"))?,
+            Some(baseline)
+        );
+        for (table, path, canonical_path) in [
+            ("baselines", legacy_baseline_path, "legacy/report.txt"),
+            ("conflicts", legacy_conflict_path, "diverged.txt"),
+            ("remote_observations", legacy_remote_path, "remote/dir"),
+        ] {
+            let stored = journal.connection.query_row(
+                &format!("SELECT canonical_path FROM {table} WHERE path = ?1"),
+                [path_bytes(path)],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?;
+            assert_eq!(stored, canonical(canonical_path).as_bytes());
+        }
+
+        let mut check = journal.connection.prepare("PRAGMA foreign_key_check")?;
+        assert_eq!(check.query_map([], |_| Ok(()))?.count(), 0);
+        drop(check);
+        let mut parents = journal
+            .connection
+            .prepare("PRAGMA foreign_key_list(operations)")?;
+        let parents = parents
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(2)?, row.get::<_, String>(6)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            parents,
+            vec![(String::from("plans"), String::from("RESTRICT"))]
+        );
+
+        for (name, expected) in [
+            ("one_live_plan_per_path", 1),
+            ("one_pending_plan_per_path", 0),
+            ("operations_by_plan", 1),
+            ("remote_directories", 1),
+            ("baselines_by_canonical_path", 1),
+            ("remote_observations_by_canonical_path", 1),
+            ("conflicts_by_canonical_path", 1),
+        ] {
+            let found = journal.connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |row| row.get::<_, i64>(0),
+            )?;
+            assert_eq!(found, expected, "index {name}");
+        }
+
+        for table in ["baselines", "remote_observations", "conflicts", "plans"] {
+            let sql = journal.connection.query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get::<_, String>(0),
+            )?;
+            assert!(sql.contains("STRICT"), "{table} is not STRICT");
+            assert!(
+                sql.contains("canonical_path BLOB NOT NULL"),
+                "{table} allows a null canonical path"
+            );
+        }
+
+        assert!(
+            journal
+                .connection
+                .execute(
+                    "INSERT INTO baselines(path, baseline_json, canonical_path) \
+                     VALUES (?1, '\"Absent\"', NULL)",
+                    [path_bytes(Path::new("null.txt"))],
+                )
+                .is_err()
+        );
+        assert!(
+            journal
+                .connection
+                .execute(
+                    "INSERT INTO plans(path, status, canonical_path, blocked_json, retry_at) \
+                     VALUES (?1, 'blocked', ?2, NULL, NULL)",
+                    params![
+                        path_bytes(Path::new("blocked.txt")),
+                        canonical("blocked.txt").as_bytes()
+                    ],
+                )
+                .is_err()
+        );
+        assert_eq!(
+            journal.connection.query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'operations'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            99
+        );
+        assert_eq!(
+            journal
+                .connection
+                .query_row("SELECT cursor FROM remote_inventory", [], |row| row
+                    .get::<_, String>(0))?,
+            "cursor-v5",
+            "a migration that discarded no remote row still dropped its cursor"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn version_five_backfill_collisions_discard_both_claims() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+        let kept_path = Path::new("Unique.TXT");
+        let kept = Baseline::Present(remote_file("unique", "rev-unique"));
+        let collided = Baseline::Present(remote_file("collided", "rev-collided"));
+        let conflict = Conflict::RemoteDeletionLocalEdit {
+            local: LocalFile::new(content("diverged")),
+        };
+        {
+            let connection = version_five(&database_path)?;
+            connection.execute(
+                "INSERT INTO baselines(path, baseline_json, canonical_path) VALUES (?1, ?2, ?3)",
+                params![
+                    path_bytes(Path::new("Collided.TXT")),
+                    encode(&collided, "test", Path::new("Collided.TXT"))?,
+                    canonical("collided.txt").as_bytes()
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO baselines(path, baseline_json) VALUES (?1, ?2)",
+                params![
+                    path_bytes(Path::new("COLLIDED.txt")),
+                    encode(&collided, "test", Path::new("COLLIDED.txt"))?
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO baselines(path, baseline_json) VALUES (?1, ?2)",
+                params![path_bytes(kept_path), encode(&kept, "test", kept_path)?],
+            )?;
+            connection.execute(
+                "INSERT INTO remote_observations(path, observation_json, canonical_path) \
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    path_bytes(Path::new("Remote/Dir")),
+                    encode(
+                        &RemoteObservation::Directory,
+                        "test",
+                        Path::new("Remote/Dir")
+                    )?,
+                    canonical("remote/dir").as_bytes()
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO remote_observations(path, observation_json) VALUES (?1, ?2)",
+                params![
+                    path_bytes(Path::new("REMOTE/dir")),
+                    encode(
+                        &RemoteObservation::Directory,
+                        "test",
+                        Path::new("REMOTE/dir")
+                    )?
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO remote_inventory(singleton, cursor) VALUES (1, 'cursor-v5')",
+                [],
+            )?;
+            for (id, path) in [
+                (41, Path::new("Diverged.TXT")),
+                (42, Path::new("diverged.txt")),
+            ] {
+                connection.execute(
+                    "INSERT INTO conflicts(id, path, conflict_json) VALUES (?1, ?2, ?3)",
+                    params![id, path_bytes(path), encode(&conflict, "test", path)?],
+                )?;
+            }
+        }
+
+        let journal = Journal::open(&database_path)?;
+
+        assert_eq!(journal.schema_version, 6);
+        assert_eq!(journal.baseline_paths()?, vec![kept_path.to_path_buf()]);
+        assert_eq!(journal.baseline(Path::new("unique.txt"))?, Some(kept));
+        assert_eq!(journal.baseline(Path::new("collided.txt"))?, None);
+        assert_eq!(
+            journal.connection.query_row(
+                "SELECT COUNT(*) FROM remote_observations",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0
+        );
+        assert_eq!(
+            journal
+                .connection
+                .query_row("SELECT COUNT(*) FROM remote_inventory", [], |row| row
+                    .get::<_, i64>(0))?,
+            0,
+            "a discarded remote row left a cursor that can never redeliver it"
+        );
+        let conflicts = journal.conflicts()?;
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(
+            journal.connection.query_row(
+                "SELECT COUNT(*) FROM conflicts WHERE canonical_path = ?1",
+                [canonical("diverged.txt").as_bytes()],
+                |row| row.get::<_, i64>(0)
+            )?,
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_plan_without_operations_is_refused() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let mut journal = Journal::open(journal_path(&directory))?;
+        let empty = OperationPlan::new(Vec::new());
+
+        let recorded = journal.record_plan(Path::new("empty.txt"), &empty);
+
+        let error = recorded
+            .err()
+            .ok_or("journal accepted a plan with no operations")?;
+        assert!(
+            matches!(
+                error,
+                JournalError::InvalidState {
+                    operation: "record plan",
+                    ..
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert!(journal.pending_plans()?.is_empty());
+        assert_eq!(
+            journal
+                .connection
+                .query_row("SELECT COUNT(*) FROM plans", [], |row| row.get::<_, i64>(0))?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn journal_creation_reports_its_own_filesystem_failure() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let sealed = directory.path().join("sealed");
+        fs::create_dir(&sealed)?;
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o500))?;
+
+        let opened = Journal::open(sealed.join("journal.sqlite3"));
+
+        fs::set_permissions(&sealed, fs::Permissions::from_mode(0o700))?;
+        let error = opened.err().ok_or("sealed directory accepted a journal")?;
+        assert!(
+            matches!(
+                error,
+                JournalError::File {
+                    operation: "create journal database",
+                    ..
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn writable_journal_never_truncates_an_existing_database() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+        let path = Path::new("kept.txt");
+        let baseline = Baseline::Present(remote_file("kept", "rev-kept"));
+        {
+            let mut journal = Journal::open(&database_path)?;
+            journal.record_noop(
+                path,
+                &noop(plan(
+                    &Baseline::Absent,
+                    &Observation::Present(LocalFile::new(content("kept"))),
+                    &Observation::Present(remote_file("kept", "rev-kept")),
+                ))?,
+            )?;
+        }
+
+        let journal = Journal::open(&database_path)?;
+
+        assert_eq!(journal.baseline(path)?, Some(baseline));
+        assert_eq!(file_mode(&database_path)?, 0o600);
+        Ok(())
+    }
+
+    #[test]
+    fn journal_refuses_a_symlinked_database() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let planted = directory.path().join("planted.sqlite3");
+        let dangling = directory.path().join("dangling.sqlite3");
+        std::os::unix::fs::symlink(&planted, &dangling)?;
+
+        let opened = Journal::open(&dangling);
+
+        let error = opened
+            .err()
+            .ok_or("a dangling symlink was accepted as a journal")?;
+        assert!(
+            matches!(
+                error,
+                JournalError::File {
+                    operation: "create journal database",
+                    ..
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            !planted.try_exists()?,
+            "the journal was created through a dangling symlink"
+        );
+
+        let existing = directory.path().join("existing.sqlite3");
+        drop(Journal::open(&existing)?);
+        let linked = directory.path().join("linked.sqlite3");
+        std::os::unix::fs::symlink(&existing, &linked)?;
+
+        let opened = Journal::open(&linked);
+
+        let error = opened
+            .err()
+            .ok_or("a symlink to a database was accepted as a journal")?;
+        assert!(
+            matches!(
+                error,
+                JournalError::File {
+                    operation: "create journal database",
+                    ..
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plan_status_decoding_names_the_state_it_rejects() -> Result<(), Box<dyn Error>> {
+        let path = Path::new("crafted.txt");
+        let blocked = encode(&BlockReason::StageOccupied, "test", path)?;
+
+        assert_eq!(
+            decode_plan_status("pending", None, None, "read plan status", path)?,
+            PlanStatus::Pending
+        );
+        assert_eq!(
+            decode_plan_status("completed", None, None, "read plan status", path)?,
+            PlanStatus::Completed
+        );
+        for (status, json, retry_at, expected) in [
+            (
+                "pending",
+                Some(blocked.as_str()),
+                None,
+                "plan status disagrees with its block columns",
+            ),
+            (
+                "completed",
+                None,
+                Some(1),
+                "plan status disagrees with its block columns",
+            ),
+            (
+                "blocked",
+                None,
+                Some(1),
+                "plan status disagrees with its block columns",
+            ),
+            (
+                "blocked",
+                Some(blocked.as_str()),
+                None,
+                "plan status disagrees with its block columns",
+            ),
+            ("retired", None, None, "plan has an unrecognized status"),
+            (
+                "retired",
+                Some(blocked.as_str()),
+                Some(1),
+                "plan has an unrecognized status",
+            ),
+        ] {
+            let error = decode_plan_status(status, json, retry_at, "read plan status", path)
+                .err()
+                .ok_or("crafted plan columns decoded as a status")?;
+            assert!(
+                matches!(
+                    error,
+                    JournalError::InvalidState { detail, .. } if detail == expected
+                ),
+                "unexpected error for status {status}: {error:?}"
+            );
+        }
+        let negative = decode_plan_status(
+            "blocked",
+            Some(&blocked),
+            Some(-1),
+            "read plan status",
+            path,
+        )
+        .err()
+        .ok_or("a negative retry time decoded as a status")?;
+        assert!(
+            matches!(
+                negative,
+                JournalError::InvalidState {
+                    detail: "blocked plan has a negative retry time",
+                    ..
+                }
+            ),
+            "unexpected error: {negative:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn version_five_retires_a_legacy_plan_that_owns_no_operations() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+        let orphan_path = Path::new("Orphan.TXT");
+        {
+            let connection = version_five(&database_path)?;
+            connection.execute(
+                "INSERT INTO plans(id, path, status, canonical_path) \
+                 VALUES (12, ?1, 'pending', ?2)",
+                params![path_bytes(orphan_path), canonical("orphan.txt").as_bytes()],
+            )?;
+        }
+
+        let mut journal = Journal::open(&database_path)?;
+
+        assert!(journal.pending_plans()?.is_empty());
+        assert!(journal.blocked_plans()?.is_empty());
+        assert_eq!(
+            journal.connection.query_row(
+                "SELECT COUNT(*) FROM plans WHERE status IN ('pending', 'blocked')",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0
+        );
+        let upload = operations(plan(
+            &Baseline::Absent,
+            &Observation::Present(LocalFile::new(content("upload"))),
+            &Observation::ConfirmedAbsent,
+        ))?;
+        let recorded = recorded_plan(journal.record_plan(Path::new("orphan.txt"), &upload)?)?;
+        assert_eq!(recorded.status, PlanStatus::Pending);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_version_six_migration_leaves_version_five_intact() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+        let baseline_path = Path::new("Legacy/Report.TXT");
+        let plan_path = Path::new("Pending.TXT");
+        let baseline = Baseline::Present(remote_file("legacy", "rev-legacy"));
+        let operation = Operation::CreateRemote {
+            content: content("first"),
+        };
+        {
+            let connection = version_five(&database_path)?;
+            connection.execute(
+                "INSERT INTO baselines(path, baseline_json) VALUES (?1, ?2)",
+                params![
+                    path_bytes(baseline_path),
+                    encode(&baseline, "test", baseline_path)?
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO plans(id, path, status, canonical_path) \
+                 VALUES (10, ?1, 'pending', ?2)",
+                params![path_bytes(plan_path), canonical("pending.txt").as_bytes()],
+            )?;
+            connection.execute(
+                "INSERT INTO operations(id, plan_id, ordinal, operation_json, status) \
+                 VALUES (20, 10, 0, ?1, 'pending')",
+                [encode(&operation, "test", plan_path)?],
+            )?;
+            connection.execute_batch("CREATE TABLE plans_v6(blocker INTEGER) STRICT;")?;
+        }
+
+        let opened = Journal::open(&database_path);
+
+        let error = opened
+            .err()
+            .ok_or("a blocked version-six migration reported success")?;
+        assert!(
+            matches!(
+                error,
+                JournalError::Sqlite {
+                    operation: "apply journal version-six migration",
+                    ..
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+        let connection = Connection::open(&database_path)?;
+        assert_eq!(
+            connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
+            5
+        );
+        for (name, expected) in [
+            ("one_pending_plan_per_path", 1),
+            ("baselines_by_canonical_path", 1),
+            ("remote_observations_by_canonical_path", 1),
+            ("one_live_plan_per_path", 0),
+            ("remote_directories", 0),
+        ] {
+            let found = connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |row| row.get::<_, i64>(0),
+            )?;
+            assert_eq!(found, expected, "index {name}");
+        }
+        assert_eq!(
+            connection.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('plans') WHERE name = 'blocked_json'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0
+        );
+        assert_eq!(
+            connection.query_row(
+                "SELECT status FROM plans WHERE id = 10 AND canonical_path = ?1",
+                [canonical("pending.txt").as_bytes()],
+                |row| row.get::<_, String>(0)
+            )?,
+            "pending"
+        );
+        assert_eq!(
+            connection.query_row(
+                "SELECT COUNT(*) FROM operations WHERE id = 20 AND ordinal = 0 \
+                 AND status = 'pending'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            1
+        );
+        assert!(
+            connection.query_row(
+                "SELECT canonical_path IS NULL FROM baselines WHERE path = ?1",
+                [path_bytes(baseline_path)],
+                |row| row.get::<_, bool>(0)
+            )?,
+            "the rolled back migration kept a backfilled canonical path"
+        );
         Ok(())
     }
 
@@ -4267,22 +5655,22 @@ mod tests {
         let directory = TempDir::new()?;
         let database_path = journal_path(&directory);
         let connection = Connection::open(&database_path)?;
-        connection.pragma_update(None, "user_version", 6)?;
+        connection.pragma_update(None, "user_version", 7)?;
         drop(connection);
 
         let opened = Journal::open(&database_path);
         assert!(matches!(
             opened,
             Err(JournalError::UnsupportedVersion {
-                found: 6,
-                supported: 5,
+                found: 7,
+                supported: 6,
                 ..
             })
         ));
         let connection = Connection::open(database_path)?;
         let version =
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         Ok(())
     }
 
