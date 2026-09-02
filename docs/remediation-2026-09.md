@@ -324,6 +324,10 @@ gains `conflicts: Vec<String>` (bounded to 20 display paths) and
   order, merges with the new scan, and writes only inserted, updated, or
   deleted rows.
 - `pending_plans` is one join and is loaded once per pass and passed through.
+- The scanner computes `CanonicalPath` once per entry and
+  `LocalObservationRecord` carries it, so `local_map` only sorts and the
+  per-pass fold disappears; every ordered `LocalHashRecord` collection uses
+  byte order.
 - `validate_account` runs once per session and after a 401; `refresh_inventory`
   no longer calls it.
 - `require_active_local_root` runs once before planning and once before the
