@@ -55,9 +55,11 @@ impl XdgDirectories {
     /// Path to the non-secret Omabox configuration file.
     #[must_use]
     pub fn config_file(&self) -> PathBuf {
-        self.config_home
-            .join(APPLICATION_DIRECTORY)
-            .join(CONFIG_FILE)
+        self.config_directory().join(CONFIG_FILE)
+    }
+
+    fn config_directory(&self) -> PathBuf {
+        self.config_home.join(APPLICATION_DIRECTORY)
     }
 
     fn application_state_directory(&self) -> PathBuf {
@@ -68,7 +70,7 @@ impl XdgDirectories {
 /// Validated paths used by one Omabox instance.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Paths {
-    config_file: PathBuf,
+    config_directory: PathBuf,
     state_directory: PathBuf,
     journal_file: PathBuf,
     upload_staging_directory: PathBuf,
@@ -77,15 +79,28 @@ pub struct Paths {
 }
 
 impl Paths {
+    /// Resolve every path this instance owns.
+    ///
+    /// The staging and recovery directories are the ones opened with
+    /// `RESOLVE_NO_SYMLINKS`, so a symlinked XDG ancestor or leaf would make
+    /// every open of them fail with `ELOOP`. The state directory is only
+    /// created, the journal is opened by SQLite, and the lock by
+    /// `OpenOptions`; all five are stored physically anyway so the whole
+    /// private tree lives in one namespace, and `validate_outside` compares
+    /// every private path physically. Each leaf is projected in its own right,
+    /// so a relinked `upload-staging` is followed too, not just a symlinked
+    /// ancestor. The configuration directory stays lexical: it is read and
+    /// written with symlink-following calls, so a user may keep it in a
+    /// dotfiles tree.
     fn resolve(xdg: &XdgDirectories, sync_root: &Path) -> Result<Self, ConfigError> {
-        let state_directory = lexical_normalize(&xdg.application_state_directory());
+        let state = xdg.application_state_directory();
         let paths = Self {
-            config_file: lexical_normalize(&xdg.config_file()),
-            journal_file: state_directory.join(JOURNAL_FILE),
-            upload_staging_directory: state_directory.join(UPLOAD_STAGING_DIRECTORY),
-            recovery_directory: state_directory.join(RECOVERY_DIRECTORY),
-            lock_file: state_directory.join(LOCK_FILE),
-            state_directory,
+            config_directory: lexical_normalize(&xdg.config_directory()),
+            state_directory: project_physical_path(&state)?,
+            journal_file: project_physical_path(&state.join(JOURNAL_FILE))?,
+            upload_staging_directory: project_physical_path(&state.join(UPLOAD_STAGING_DIRECTORY))?,
+            recovery_directory: project_physical_path(&state.join(RECOVERY_DIRECTORY))?,
+            lock_file: project_physical_path(&state.join(LOCK_FILE))?,
         };
         paths.validate_outside(sync_root)?;
         Ok(paths)
@@ -94,10 +109,12 @@ impl Paths {
     fn validate_outside(&self, sync_root: &Path) -> Result<(), ConfigError> {
         let physical_root = canonicalize_sync_root(sync_root)?;
         for (role, path) in [
+            (PathRole::Config, self.config_directory()),
             (PathRole::StateDirectory, self.state_directory()),
             (PathRole::Journal, self.journal_file()),
             (PathRole::UploadStaging, self.upload_staging_directory()),
             (PathRole::Recovery, self.recovery_directory()),
+            (PathRole::Lock, self.lock_file()),
         ] {
             let projected = project_physical_path(path)?;
             if projected == physical_root || projected.starts_with(&physical_root) {
@@ -116,7 +133,7 @@ impl Paths {
     /// Validation runs again before any directory is created so a symlinked
     /// XDG ancestor cannot silently redirect safety-critical data into the sync
     /// root.
-    pub fn prepare(&self, sync_root: &Path) -> Result<(), ConfigError> {
+    pub(crate) fn prepare(&self, sync_root: &Path) -> Result<(), ConfigError> {
         self.validate_outside(sync_root)?;
         for (role, path) in [
             (PathRole::StateDirectory, self.state_directory()),
@@ -143,10 +160,16 @@ impl Paths {
         self.validate_outside(sync_root)
     }
 
+    /// XDG configuration directory reserved for Omabox.
+    #[must_use]
+    pub fn config_directory(&self) -> &Path {
+        &self.config_directory
+    }
+
     /// Path to the non-secret TOML configuration file.
     #[must_use]
-    pub fn config_file(&self) -> &Path {
-        &self.config_file
+    pub fn config_file(&self) -> PathBuf {
+        self.config_directory.join(CONFIG_FILE)
     }
 
     /// XDG state directory reserved for Omabox.
@@ -278,7 +301,7 @@ impl Config {
         };
         let contents = toml::to_string(&document).map_err(ConfigError::Serialize)?;
         atomic_write_config(
-            self.paths.config_file(),
+            &self.paths.config_file(),
             contents.as_bytes(),
             replace_existing,
         )
@@ -288,6 +311,8 @@ impl Config {
 /// Safety-sensitive path role used in diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PathRole {
+    /// XDG application configuration directory.
+    Config,
     /// XDG application state directory.
     StateDirectory,
     /// Transactional journal.
@@ -296,15 +321,33 @@ pub enum PathRole {
     UploadStaging,
     /// Legacy recovery directory.
     Recovery,
+    /// Daemon instance lock.
+    Lock,
+}
+
+impl PathRole {
+    /// XDG base-directory variable that governs where this path lives.
+    fn xdg_variable(self) -> &'static str {
+        match self {
+            Self::Config => "XDG_CONFIG_HOME",
+            Self::StateDirectory
+            | Self::Journal
+            | Self::UploadStaging
+            | Self::Recovery
+            | Self::Lock => "XDG_STATE_HOME",
+        }
+    }
 }
 
 impl fmt::Display for PathRole {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::Config => "configuration directory",
             Self::StateDirectory => "state directory",
             Self::Journal => "journal",
             Self::UploadStaging => "upload staging directory",
             Self::Recovery => "recovery directory",
+            Self::Lock => "daemon lock",
         })
     }
 }
@@ -482,7 +525,7 @@ pub enum ConfigError {
     #[error("{role} `{path}` must not be inside sync root `{sync_root}`")]
     #[diagnostic(
         code(omabox::config::state_inside_sync_root),
-        help("Set XDG_STATE_HOME to a local directory outside the sync root.")
+        help("Set {} to a local directory outside the sync root.", role.xdg_variable())
     )]
     ProtectedPathInsideSyncRoot {
         /// Role of the invalid path.
@@ -942,7 +985,7 @@ mod tests {
         assert_eq!(config.dropbox_app_key(), "test-app-key");
         assert_eq!(
             config.paths().journal_file(),
-            xdg.state_home.join("omabox/journal.sqlite3")
+            fs::canonicalize(&xdg.state_home)?.join("omabox/journal.sqlite3")
         );
         assert!(config.paths().upload_staging_directory().is_dir());
         assert!(config.paths().recovery_directory().is_dir());
@@ -1117,6 +1160,104 @@ mod tests {
         };
         assert!(matches!(error, ConfigError::InspectPath { .. }));
         assert!(!absent_target.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relinked_runtime_leaves_are_projected_individually() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use std::os::unix::fs::symlink;
+
+        let (temporary, xdg, sync_root) = fixture()?;
+        let elsewhere = temporary.path().join("elsewhere");
+        fs::create_dir(&elsewhere)?;
+        fs::create_dir_all(xdg.application_state_directory())?;
+        symlink(
+            &elsewhere,
+            xdg.application_state_directory()
+                .join(UPLOAD_STAGING_DIRECTORY),
+        )?;
+        write_config(&xdg, &sync_root)?;
+
+        let config = Config::load_from(&xdg)?;
+        config.prepare()?;
+
+        assert_eq!(
+            config.paths().upload_staging_directory(),
+            fs::canonicalize(&elsewhere)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn config_rejects_sync_root_containing_the_config_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let sync_root = temporary.path().join("Dropbox");
+        fs::create_dir(&sync_root)?;
+        let xdg = XdgDirectories::new(&sync_root, temporary.path().join("state"))?;
+
+        let error = Config::from_values(&xdg, &sync_root, "test-app-key")
+            .err()
+            .ok_or("config directory inside sync root was accepted")?;
+
+        assert!(
+            matches!(
+                error,
+                ConfigError::ProtectedPathInsideSyncRoot {
+                    role: PathRole::Config,
+                    ..
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+        let help = error
+            .help()
+            .ok_or("protected path error rendered no help")?
+            .to_string();
+        assert_eq!(
+            help,
+            "Set XDG_CONFIG_HOME to a local directory outside the sync root."
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_rejects_a_lock_symlinked_into_the_sync_root() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use std::os::unix::fs::symlink;
+
+        let (_temporary, xdg, sync_root) = fixture()?;
+        let stolen = sync_root.join("stolen.lock");
+        fs::write(&stolen, b"")?;
+        fs::create_dir_all(xdg.application_state_directory())?;
+        symlink(&stolen, xdg.application_state_directory().join(LOCK_FILE))?;
+        write_config(&xdg, &sync_root)?;
+
+        let error = Config::load_from(&xdg)
+            .err()
+            .ok_or("lock inside sync root was accepted")?;
+
+        assert!(
+            matches!(
+                error,
+                ConfigError::ProtectedPathInsideSyncRoot {
+                    role: PathRole::Lock,
+                    ..
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+        let help = error
+            .help()
+            .ok_or("protected path error rendered no help")?
+            .to_string();
+        assert_eq!(
+            help,
+            "Set XDG_STATE_HOME to a local directory outside the sync root."
+        );
         Ok(())
     }
 

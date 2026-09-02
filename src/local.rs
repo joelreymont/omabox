@@ -5302,6 +5302,52 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn slots_lease_through_a_symlinked_state_home() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::symlink;
+
+        use crate::config::{Config, XdgDirectories};
+
+        let temporary = TempDir::new()?;
+        let physical_state = temporary.path().join("physical-state");
+        std::fs::create_dir(&physical_state)?;
+        let physical_state = std::fs::canonicalize(&physical_state)?;
+        let state_link = temporary.path().join("state-link");
+        symlink(&physical_state, &state_link)?;
+        let sync_root = temporary.path().join("Dropbox");
+        std::fs::create_dir(&sync_root)?;
+        let xdg = XdgDirectories::new(temporary.path().join("config"), &state_link)?;
+        let config = Config::from_values(&xdg, &sync_root, "test-app-key")?;
+        config.prepare()?;
+
+        let staging = config.paths().upload_staging_directory();
+        let expected = identity(b"download")?;
+        let lease = test_download_lease(staging, Path::new("target.txt"), &expected, 1, 1)?;
+
+        let paths = config.paths();
+        for path in [
+            paths.state_directory(),
+            paths.journal_file(),
+            paths.upload_staging_directory(),
+            paths.recovery_directory(),
+            paths.lock_file(),
+        ] {
+            assert!(
+                path.starts_with(&physical_state),
+                "path was not projected: {}",
+                path.display()
+            );
+        }
+        assert!(
+            physical_state
+                .join("omabox/upload-staging")
+                .join(download_slot_name(lease.slot))
+                .is_file()
+        );
+        Ok(())
+    }
+
     #[test]
     fn stale_slot_is_rebound_across_root_and_operation_identity() -> Result<(), Box<dyn Error>> {
         let staging = TempDir::new()?;
