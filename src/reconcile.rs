@@ -15,7 +15,7 @@ use thiserror::Error;
 use crate::dropbox::{DownloadAccess, DropboxClient, DropboxError};
 use crate::journal::{
     BaselineRecord, Journal, JournalError, LocalObservationRecord, PlanConflictCompletion,
-    PlanRecord, PlanSupersede, RemoteObservationRecord, dropbox_canonical_path,
+    PlanRecord, PlanSupersede, RemoteObservationRecord,
 };
 use crate::local::{
     DownloadSlotIdentity, DownloadSlotLease, LocalError, LocalRenameOutcome,
@@ -25,8 +25,8 @@ use crate::local::{
     rename_file_copy, scan_and_publish, stage_upload, upload_source_changed,
 };
 use crate::model::{
-    Baseline, Conflict, ContentIdentity, Decision, DirectoryCollision, Observation, Operation,
-    OperationPlan, RemoteFile,
+    Baseline, CanonicalPath, Conflict, ContentIdentity, Decision, DirectoryCollision, Observation,
+    Operation, OperationPlan, RemoteFile,
 };
 use crate::planner::plan;
 use crate::recovery::{
@@ -681,10 +681,10 @@ fn resolve_case_collision(
         return Ok(CaseCollisionResolution::Changed(source));
     };
     let rename = case_variant_move(observations, source, name_max)?;
-    let canonical_source = dropbox_canonical_path(&rename.source);
+    let canonical_source = CanonicalPath::from_display(&rename.source);
     for pending in journal.pending_plans()? {
-        let canonical_pending = dropbox_canonical_path(&pending.path);
-        if canonical_pending == canonical_source || canonical_pending.starts_with(&canonical_source)
+        let canonical_pending = CanonicalPath::from_display(&pending.path);
+        if canonical_pending == canonical_source || canonical_pending.is_beneath(&canonical_source)
         {
             supersede_pending_plan(journal, &pending)?;
         }
@@ -712,13 +712,17 @@ fn reconcile_published(
     let pending = journal
         .pending_plans()?
         .into_iter()
-        .map(|plan| (dropbox_canonical_path(&plan.path), plan))
+        .map(|plan| (CanonicalPath::from_display(&plan.path), plan))
         .collect::<BTreeMap<_, _>>();
     let baselines = journal.baselines()?;
-    let conflicts = journal.conflicts()?;
+    let conflicts = journal
+        .conflicts()?
+        .into_iter()
+        .map(|record| (CanonicalPath::from_display(&record.path), record))
+        .collect::<Vec<_>>();
     let conflict_paths = conflicts
         .iter()
-        .map(|record| dropbox_canonical_path(&record.path))
+        .map(|(canonical_path, _)| canonical_path.clone())
         .collect::<BTreeSet<_>>();
     let mut report = ReconcileReport {
         replayed_operations: replay.completed_operations,
@@ -744,7 +748,7 @@ fn reconcile_published(
          remote_record|
          -> Result<(), ReconcileError> {
             let (baseline_path, baseline) = match baseline_record {
-                Some(BaselineRecord { path, baseline, .. }) => (Some(path), baseline),
+                Some((path, baseline)) => (Some(path), baseline),
                 None => (None, Baseline::Absent),
             };
             let absent_local = Observation::ConfirmedAbsent;
@@ -758,7 +762,10 @@ fn reconcile_published(
                 .or_else(|| remote_record.map(|record| record.path.clone()))
                 .or(baseline_path)
                 .ok_or_else(|| {
-                    invalid(&canonical_path, "canonical path has no display spelling")
+                    invalid(
+                        canonical_path.as_path(),
+                        "canonical path has no display spelling",
+                    )
                 })?;
             let decision = plan(&baseline, local_observation, remote_observation);
             let baseline_matches_noop = matches!(
@@ -766,15 +773,15 @@ fn reconcile_published(
                 Decision::NoOp(noop) if &baseline == noop.baseline()
             );
             match decision {
-                Decision::NoOp(noop) if !pending.contains_key(&canonical_path) => {
-                    if baseline_matches_noop && !conflict_paths.contains(&canonical_path) {
+                Decision::NoOp(noop) if !pending.contains_key(canonical_path) => {
+                    if baseline_matches_noop && !conflict_paths.contains(canonical_path) {
                         report.noops += 1;
                     } else {
                         noops.push((path, noop));
                     }
                 }
                 decision => decisions.push(PathDecision {
-                    canonical_path,
+                    canonical_path: canonical_path.clone(),
                     path,
                     baseline_matches_noop,
                     decision,
@@ -846,9 +853,8 @@ fn reconcile_published(
                         return Ok(ReconcileOutcome::FreshObservationRequired { path });
                     }
                 }
-                if !conflicts.iter().any(|record| {
-                    dropbox_canonical_path(&record.path) == canonical_path
-                        && record.conflict == conflict
+                if !conflicts.iter().any(|(existing, record)| {
+                    *existing == canonical_path && record.conflict == conflict
                 }) {
                     journal.record_conflict(&path, &conflict)?;
                     report.conflicts += 1;
@@ -883,7 +889,7 @@ fn reconcile_published(
         write
             .pending_paths
             .into_iter()
-            .map(|path| dropbox_canonical_path(&path)),
+            .map(|path| CanonicalPath::from_display(&path)),
     );
     let applied = replay_pending_at(journal, dropbox, downloads, sync_root, upload_staging)?;
     report.replayed_operations += applied.completed_operations;
@@ -904,7 +910,7 @@ fn reconcile_published(
     blocked_paths.extend(
         pending
             .into_iter()
-            .map(|plan| dropbox_canonical_path(&plan.path)),
+            .map(|plan| CanonicalPath::from_display(&plan.path)),
     );
     report.blocked = blocked_paths.len();
     report.sync_errors = sync_error_paths.len();
@@ -914,7 +920,7 @@ fn reconcile_published(
 }
 
 struct PathDecision {
-    canonical_path: PathBuf,
+    canonical_path: CanonicalPath,
     path: PathBuf,
     baseline_matches_noop: bool,
     decision: Decision,
@@ -998,7 +1004,7 @@ fn prepare_directory_collision(
     journal: &Journal,
     sync_root: &Path,
     upload_staging: &Path,
-    local: &[(PathBuf, LocalObservationRecord)],
+    local: &[(CanonicalPath, LocalObservationRecord)],
     remote: &[RemoteObservationRecord],
     path: &Path,
     collision: &DirectoryCollision,
@@ -1074,7 +1080,7 @@ fn prepare_directory_collision(
 
 #[allow(clippy::too_many_arguments)]
 fn file_copy_path(
-    local: &[(PathBuf, LocalObservationRecord)],
+    local: &[(CanonicalPath, LocalObservationRecord)],
     remote: &[RemoteObservationRecord],
     source: &Path,
     content: &ContentIdentity,
@@ -1100,7 +1106,7 @@ fn file_copy_path(
         if excluded.contains(&candidate) {
             continue;
         }
-        let canonical = dropbox_canonical_path(&candidate);
+        let canonical = CanonicalPath::from_display(&candidate);
         let local_record = find_local(local, &canonical);
         let remote_record = find_remote(remote, &canonical);
         if local_record.is_none() && remote_record.is_none() {
@@ -1308,10 +1314,10 @@ fn finish_pending_conflict(
 
 fn local_map(
     records: Vec<LocalObservationRecord>,
-) -> Result<Vec<(PathBuf, LocalObservationRecord)>, ReconcileError> {
+) -> Result<Vec<(CanonicalPath, LocalObservationRecord)>, ReconcileError> {
     let mut mapped = Vec::with_capacity(records.len());
     for record in records {
-        let canonical_path = dropbox_canonical_path(&record.path);
+        let canonical_path = CanonicalPath::from_display(&record.path);
         mapped.push((canonical_path, record));
     }
     mapped.sort_by(|(left_canonical, left), (right_canonical, right)| {
@@ -1334,10 +1340,10 @@ fn local_map(
 }
 
 fn find_local<'a>(
-    records: &'a [(PathBuf, LocalObservationRecord)],
-    canonical_path: &Path,
+    records: &'a [(CanonicalPath, LocalObservationRecord)],
+    canonical_path: &CanonicalPath,
 ) -> Option<&'a LocalObservationRecord> {
-    let Ok(index) = records.binary_search_by(|(path, _)| path.as_path().cmp(canonical_path)) else {
+    let Ok(index) = records.binary_search_by(|(path, _)| path.cmp(canonical_path)) else {
         return None;
     };
     records.get(index).map(|(_, record)| record)
@@ -1350,9 +1356,9 @@ struct CaseVariantMove {
 }
 
 fn case_variant_source(records: &[LocalObservationRecord]) -> Option<PathBuf> {
-    let mut spellings = BTreeMap::<PathBuf, BTreeSet<PathBuf>>::new();
+    let mut spellings = BTreeMap::<CanonicalPath, BTreeSet<PathBuf>>::new();
     for record in records {
-        let canonical = dropbox_canonical_path(&record.path);
+        let canonical = CanonicalPath::from_display(&record.path);
         spellings
             .entry(canonical)
             .or_default()
@@ -1371,7 +1377,7 @@ fn case_variant_move(
 ) -> Result<CaseVariantMove, ReconcileError> {
     let occupied = records
         .iter()
-        .map(|record| dropbox_canonical_path(&record.path))
+        .map(|record| CanonicalPath::from_display(&record.path))
         .collect::<BTreeSet<_>>();
     let Some(name) = source.file_name() else {
         return Err(invalid(
@@ -1387,7 +1393,7 @@ fn case_variant_move(
             break;
         };
         let destination = parent.join(candidate_name);
-        if !occupied.contains(&dropbox_canonical_path(&destination)) {
+        if !occupied.contains(&CanonicalPath::from_display(&destination)) {
             return Ok(CaseVariantMove {
                 source,
                 destination,
@@ -1435,23 +1441,28 @@ fn remote_map(mut records: Vec<RemoteObservationRecord>) -> Vec<RemoteObservatio
 
 fn find_remote<'a>(
     records: &'a [RemoteObservationRecord],
-    canonical_path: &Path,
+    canonical_path: &CanonicalPath,
 ) -> Option<&'a RemoteObservationRecord> {
-    let Ok(index) =
-        records.binary_search_by(|record| record.canonical_path.as_path().cmp(canonical_path))
+    let Ok(index) = records.binary_search_by(|record| record.canonical_path.cmp(canonical_path))
     else {
         return None;
     };
     records.get(index)
 }
 
+/// Visit every path any side knows once, in canonical order.
+///
+/// The visited path is borrowed: an idle pass decides a no-op for nearly every
+/// path and must not allocate one canonical path per decision. The baseline's
+/// own copy of the key is reused when the baseline is the merge minimum, so no
+/// step clones.
 fn for_each_known_path<E>(
     baselines: Vec<BaselineRecord>,
-    local: &[(PathBuf, LocalObservationRecord)],
+    local: &[(CanonicalPath, LocalObservationRecord)],
     remote: &[RemoteObservationRecord],
     mut visit: impl FnMut(
-        PathBuf,
-        Option<BaselineRecord>,
+        &CanonicalPath,
+        Option<(PathBuf, Baseline)>,
         Option<&LocalObservationRecord>,
         Option<&RemoteObservationRecord>,
     ) -> Result<(), E>,
@@ -1460,40 +1471,43 @@ fn for_each_known_path<E>(
     let mut local_index = 0;
     let mut remote_index = 0;
     loop {
-        let next = [
-            baselines
-                .peek()
-                .map(|record| record.canonical_path.as_path()),
+        let side_minimum = [
             local
                 .get(local_index)
-                .map(|(canonical_path, _)| canonical_path.as_path()),
+                .map(|(canonical_path, _)| canonical_path),
             remote
                 .get(remote_index)
-                .map(|record| record.canonical_path.as_path()),
+                .map(|record| &record.canonical_path),
         ]
         .into_iter()
         .flatten()
         .min();
-        let Some(canonical_path) = next.map(Path::to_path_buf) else {
-            return Ok(());
+        let baseline_leads = match (baselines.peek(), side_minimum) {
+            (Some(record), Some(minimum)) => &record.canonical_path <= minimum,
+            (Some(_), None) => true,
+            (None, _) => false,
         };
-        let baseline = if baselines
-            .peek()
-            .is_some_and(|record| record.canonical_path == canonical_path)
-        {
-            baselines.next()
-        } else {
-            None
+        let (baseline_key, baseline) = match baseline_leads.then(|| baselines.next()).flatten() {
+            Some(record) => (
+                Some(record.canonical_path),
+                Some((record.path, record.baseline)),
+            ),
+            None => (None, None),
+        };
+        let canonical_path = match (baseline_key.as_ref(), side_minimum) {
+            (Some(key), _) => key,
+            (None, Some(minimum)) => minimum,
+            (None, None) => return Ok(()),
         };
         let local_record = local
             .get(local_index)
-            .and_then(|(path, record)| (path == &canonical_path).then_some(record));
+            .and_then(|(path, record)| (path == canonical_path).then_some(record));
         if local_record.is_some() {
             local_index += 1;
         }
         let remote_record = remote
             .get(remote_index)
-            .and_then(|record| (record.canonical_path == canonical_path).then_some(record));
+            .and_then(|record| (&record.canonical_path == canonical_path).then_some(record));
         if remote_record.is_some() {
             remote_index += 1;
         }
@@ -1558,57 +1572,104 @@ mod tests {
             };
             prop_assert_eq!(&forward, &reversed);
             let destination_is_unique = records.iter().all(|record| {
-                dropbox_canonical_path(&record.path)
-                    != dropbox_canonical_path(&forward.destination)
+                CanonicalPath::from_display(&record.path)
+                    != CanonicalPath::from_display(&forward.destination)
             });
             prop_assert!(destination_is_unique);
         }
 
         #[test]
         fn known_path_merge_matches_set_union(
-            baseline_paths in prop::collection::btree_set("[a-z]{1,8}", 0..32),
-            local_paths in prop::collection::btree_set("[a-z]{1,8}", 0..32),
-            remote_paths in prop::collection::btree_set("[a-z]{1,8}", 0..32),
+            baseline_names in prop::collection::btree_set("[a-z./ -]{1,12}", 0..24),
+            local_names in prop::collection::btree_set("[a-z./ -]{1,12}", 0..24),
+            remote_names in prop::collection::btree_set("[a-z./ -]{1,12}", 0..24),
         ) {
-            let baselines = baseline_paths
-                .iter()
-                .map(|path| BaselineRecord {
-                    canonical_path: PathBuf::from(path),
-                    path: PathBuf::from(path),
-                    baseline: Baseline::Directory,
-                })
-                .collect::<Vec<_>>();
-            let local = local_map(local_records(local_paths.iter().map(PathBuf::from)))
+            let baseline_paths = merge_paths(&baseline_names);
+            let local_paths = merge_paths(&local_names);
+            let remote_paths = merge_paths(&remote_names);
+            let state = TempDir::new().map_err(|error| TestCaseError::fail(error.to_string()))?;
+            let mut journal = Journal::open(state.path().join("journal.sqlite3"))
+                .map_err(|error| TestCaseError::fail(error.to_string()))?;
+            seed_directory_baselines(&mut journal, &baseline_paths)
+                .map_err(|error| TestCaseError::fail(error.to_string()))?;
+            let baselines = journal
+                .baselines()
+                .map_err(|error| TestCaseError::fail(error.to_string()))?;
+            prop_assert_eq!(baselines.len(), baseline_paths.len());
+            let local = local_map(local_records(local_paths.iter().cloned()))
                 .map_err(|error| TestCaseError::fail(error.to_string()))?;
             let remote = remote_paths
                 .iter()
                 .map(|path| RemoteObservationRecord {
-                    canonical_path: PathBuf::from(path),
-                    path: PathBuf::from(path),
+                    canonical_path: CanonicalPath::from_display(path),
+                    path: path.clone(),
                     observation: Observation::Directory,
                 })
                 .collect::<Vec<_>>();
+            let remote = remote_map(remote);
             let mut merged = Vec::new();
             for_each_known_path(
                 baselines,
                 &local,
                 &remote,
                 |path, baseline, local, remote| -> Result<(), TestCaseError> {
-                    prop_assert!(baseline.is_some() || local.is_some() || remote.is_some());
-                    merged.push(path);
+                    let display = path.as_path();
+                    prop_assert_eq!(baseline.is_some(), baseline_paths.contains(display));
+                    prop_assert_eq!(local.is_some(), local_paths.contains(display));
+                    prop_assert_eq!(remote.is_some(), remote_paths.contains(display));
+                    merged.push(path.clone());
                     Ok(())
                 },
             )?;
-            let expected = baseline_paths
+            let mut expected = baseline_paths
                 .iter()
                 .chain(&local_paths)
                 .chain(&remote_paths)
-                .map(PathBuf::from)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
+                .map(|path| CanonicalPath::from_display(path))
                 .collect::<Vec<_>>();
+            expected.sort_by(|left, right| {
+                left.as_bytes().cmp(right.as_bytes())
+            });
+            expected.dedup();
             prop_assert_eq!(merged, expected);
         }
+    }
+
+    fn merge_path(raw: &str) -> Option<PathBuf> {
+        let mut path = PathBuf::new();
+        for component in raw.split('/') {
+            if component.is_empty() || component == "." || component == ".." {
+                continue;
+            }
+            path.push(component);
+        }
+        (!path.as_os_str().is_empty()).then_some(path)
+    }
+
+    fn merge_paths(raw: &BTreeSet<String>) -> BTreeSet<PathBuf> {
+        raw.iter()
+            .map(String::as_str)
+            .filter_map(merge_path)
+            .collect()
+    }
+
+    fn seed_directory_baselines(
+        journal: &mut Journal,
+        paths: &BTreeSet<PathBuf>,
+    ) -> Result<(), Box<dyn Error>> {
+        let Decision::NoOp(noop) = plan(
+            &Baseline::Directory,
+            &Observation::Directory,
+            &Observation::Directory,
+        ) else {
+            return Err(io::Error::other("matching directories were not a no-op").into());
+        };
+        for path in paths {
+            if journal.record_noop(path, &noop)? != crate::journal::NoOpWrite::Recorded {
+                return Err(io::Error::other("directory baseline was not recorded").into());
+            }
+        }
+        Ok(())
     }
 
     #[test]

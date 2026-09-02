@@ -25,12 +25,13 @@ use omabox::local::{
     install_download, scan_and_publish, stage_download, stage_upload,
 };
 use omabox::model::{
-    Baseline, Conflict, ContentIdentity, Decision, DropboxRevision, LocalFile, Observation,
-    OperationPlan, RemoteFile, UnknownReason,
+    Baseline, CanonicalPath, Conflict, ContentIdentity, Decision, DropboxRevision, LocalFile,
+    Observation, OperationPlan, RemoteFile, UnknownReason,
 };
 use omabox::planner::plan;
 use omabox::reconcile::{
-    ExactDownloadPool, ReconcileError, ReconcileOutcome, reconcile_once, replay_pending,
+    ExactDownloadPool, ReconcileError, ReconcileOutcome, ReconcileReport, reconcile_once,
+    replay_pending,
 };
 use omabox::recovery::{ReplayBlocked, ReplayReport, replay_remote_operations};
 use omabox::runtime_status::{
@@ -1902,7 +1903,10 @@ fn case_only_remote_spelling_change_is_a_stable_noop() -> Result<(), Box<dyn Err
     let [record] = inventory.observations.as_slice() else {
         return Err(io::Error::other("expected one canonical remote observation").into());
     };
-    assert_eq!(record.canonical_path, Path::new("report.txt"));
+    assert_eq!(
+        record.canonical_path,
+        CanonicalPath::from_display(Path::new("report.txt"))
+    );
     assert_eq!(record.path, Path::new("report.txt"));
     assert_eq!(server.finish()?.len(), 2);
     Ok(())
@@ -3835,14 +3839,14 @@ fn one_file_cursor_delta_updates_a_large_inventory_without_a_full_listing()
     let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
     let mut observations = Vec::with_capacity(INVENTORY_SIZE);
     observations.push(RemoteObservationRecord {
-        canonical_path: PathBuf::from("bulk"),
+        canonical_path: CanonicalPath::from_display(Path::new("bulk")),
         path: PathBuf::from("Bulk"),
         observation: Observation::Directory,
     });
     for index in 1..INVENTORY_SIZE {
         let name = format!("{index:05}.txt");
         observations.push(RemoteObservationRecord {
-            canonical_path: PathBuf::from("bulk").join(&name),
+            canonical_path: CanonicalPath::from_display(&PathBuf::from("bulk").join(&name)),
             path: PathBuf::from("Bulk").join(name),
             observation: Observation::Present(RemoteFile::new(
                 old_content.clone(),
@@ -3914,7 +3918,7 @@ fn cursor_reset_rebuilds_before_one_complete_publication() -> Result<(), Box<dyn
     let directory = TempDir::new()?;
     let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
     let old = RemoteObservationRecord {
-        canonical_path: Path::new("old.txt").to_path_buf(),
+        canonical_path: CanonicalPath::from_display(Path::new("old.txt")),
         path: Path::new("Old.txt").to_path_buf(),
         observation: Observation::Present(RemoteFile::new(
             ContentIdentity::new("old"),
@@ -3972,7 +3976,7 @@ fn failed_rebuild_after_cursor_reset_preserves_durable_inventory() -> Result<(),
     let directory = TempDir::new()?;
     let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
     let old = RemoteObservationRecord {
-        canonical_path: Path::new("old.txt").to_path_buf(),
+        canonical_path: CanonicalPath::from_display(Path::new("old.txt")),
         path: Path::new("Old.txt").to_path_buf(),
         observation: Observation::Present(RemoteFile::new(
             old_content,
@@ -4099,7 +4103,7 @@ fn failed_later_page_cannot_publish_partial_listing_as_absence() -> Result<(), B
     let directory = TempDir::new()?;
     let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
     let old = RemoteObservationRecord {
-        canonical_path: Path::new("old.txt").to_path_buf(),
+        canonical_path: CanonicalPath::from_display(Path::new("old.txt")),
         path: Path::new("Old.txt").to_path_buf(),
         observation: Observation::Present(RemoteFile::new(
             ContentIdentity::new("durable-old"),
@@ -4159,7 +4163,7 @@ fn incomplete_downloadable_metadata_cannot_replace_durable_inventory() -> Result
     let directory = TempDir::new()?;
     let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
     let old = RemoteObservationRecord {
-        canonical_path: Path::new("old.txt").to_path_buf(),
+        canonical_path: CanonicalPath::from_display(Path::new("old.txt")),
         path: Path::new("Old.txt").to_path_buf(),
         observation: Observation::Unknown(UnknownReason::Stale),
     };
@@ -4214,7 +4218,7 @@ fn restricted_later_page_cannot_replace_durable_inventory() -> Result<(), Box<dy
     let directory = TempDir::new()?;
     let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
     let durable = RemoteObservationRecord {
-        canonical_path: Path::new("durable.txt").to_path_buf(),
+        canonical_path: CanonicalPath::from_display(Path::new("durable.txt")),
         path: Path::new("Durable.txt").to_path_buf(),
         observation: Observation::Unknown(UnknownReason::Stale),
     };
@@ -4255,6 +4259,261 @@ fn journal_binding_mismatch_blocks_inventory_before_listing() -> Result<(), Box<
         Err(DropboxError::AccountBindingChanged)
     ));
     assert_eq!(server.finish()?.len(), 1);
+    Ok(())
+}
+
+struct SiblingFixture {
+    directory: TempDir,
+    root: PathBuf,
+    staging: PathBuf,
+    recovery: PathBuf,
+    journal: Journal,
+}
+
+fn sibling_fixture(shared: &RemoteFile, shared_bytes: &[u8]) -> Result<SiblingFixture, io::Error> {
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(root.join("report"))?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("report.txt"), shared_bytes)?;
+    let mut journal =
+        Journal::open(directory.path().join("journal.sqlite3")).map_err(io::Error::other)?;
+    let _ = journal
+        .activate_local_root(&LocalRootBinding::inspect(&root).map_err(io::Error::other)?)
+        .map_err(io::Error::other)?;
+    seed_directory_baseline(&mut journal, Path::new("report"))?;
+    for path in [Path::new("report.txt"), Path::new("report/x")] {
+        seed_baseline(&mut journal, path, shared)?;
+    }
+    Ok(SiblingFixture {
+        directory,
+        root,
+        staging,
+        recovery,
+        journal,
+    })
+}
+
+fn sibling_listing(shared: &RemoteFile, include_child: bool) -> serde_json::Value {
+    let mut entries = vec![
+        folder_metadata("/report", "/report"),
+        file_metadata(
+            "/report.txt",
+            "/report.txt",
+            shared.revision.as_str(),
+            &shared.content,
+        ),
+    ];
+    if include_child {
+        entries.push(file_metadata(
+            "/report/x",
+            "/report/x",
+            shared.revision.as_str(),
+            &shared.content,
+        ));
+    }
+    json!({
+        "entries": entries,
+        "cursor": "cursor-after-sibling",
+        "has_more": false
+    })
+}
+
+fn complete_report(outcome: ReconcileOutcome) -> Result<ReconcileReport, io::Error> {
+    match outcome {
+        ReconcileOutcome::Complete(report) => Ok(report),
+        ReconcileOutcome::FreshObservationRequired { path } => Err(io::Error::other(format!(
+            "stable sibling fixture requested a fresh observation of {}",
+            path.display()
+        ))),
+        ReconcileOutcome::LocalRootChanged => {
+            Err(io::Error::other("stable sibling fixture changed its root"))
+        }
+    }
+}
+
+#[test]
+fn file_beside_a_same_named_directory_still_deletes_on_dropbox() -> Result<(), Box<dyn Error>> {
+    let shared_bytes = b"shared sibling baseline";
+    let shared = RemoteFile::new(
+        dropbox_content_hash(shared_bytes.as_slice())?,
+        DropboxRevision::new("rev-sibling"),
+    );
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(sibling_listing(&shared, true)),
+        FakeResponse::json(json!({
+            "metadata": file_metadata(
+                "/report/x",
+                "/report/x",
+                shared.revision.as_str(),
+                &shared.content,
+            )
+        }))
+        .for_path("/2/files/delete_v2"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-sibling-delete")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let mut fixture = sibling_fixture(&shared, shared_bytes)?;
+
+    let report = complete_report(reconcile_once(
+        &mut fixture.journal,
+        &client,
+        &mut downloads,
+        &fixture.root,
+        &fixture.staging,
+        &fixture.recovery,
+    )?)?;
+
+    assert_eq!(report.planned, 1);
+    assert_eq!(report.replayed_operations, 1);
+    assert_eq!(report.conflicts, 0);
+    assert_eq!(report.blocked, 0);
+    assert!(!report.downloads_in_progress);
+    assert_eq!(fixture.journal.baseline(Path::new("report/x"))?, None);
+    assert_eq!(
+        fixture.journal.baseline(Path::new("report.txt"))?,
+        Some(Baseline::Present(shared))
+    );
+    assert!(!fixture.root.join("report/x").exists());
+    assert!(fixture.journal.conflicts()?.is_empty());
+    assert!(fixture.journal.pending_plans()?.is_empty());
+
+    let requests = server.finish()?;
+    let deletion = requests
+        .iter()
+        .find(|request| request.path == "/2/files/delete_v2")
+        .ok_or_else(|| io::Error::other("missing conditional Dropbox deletion"))?;
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&deletion.body)?,
+        json!({"path": "/report/x", "parent_rev": "rev-sibling"})
+    );
+    drop(fixture.directory);
+    Ok(())
+}
+
+#[test]
+fn file_beside_a_same_named_directory_still_deletes_locally() -> Result<(), Box<dyn Error>> {
+    let shared_bytes = b"shared sibling baseline";
+    let shared = RemoteFile::new(
+        dropbox_content_hash(shared_bytes.as_slice())?,
+        DropboxRevision::new("rev-sibling"),
+    );
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(sibling_listing(&shared, false)),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-sibling-remote-delete")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let mut fixture = sibling_fixture(&shared, shared_bytes)?;
+    std::fs::write(fixture.root.join("report/x"), shared_bytes)?;
+
+    let report = complete_report(reconcile_once(
+        &mut fixture.journal,
+        &client,
+        &mut downloads,
+        &fixture.root,
+        &fixture.staging,
+        &fixture.recovery,
+    )?)?;
+
+    assert_eq!(report.planned, 1);
+    assert_eq!(report.replayed_operations, 1);
+    assert_eq!(report.conflicts, 0);
+    assert_eq!(report.blocked, 0);
+    assert!(!fixture.root.join("report/x").exists());
+    assert_eq!(fixture.journal.baseline(Path::new("report/x"))?, None);
+    assert_eq!(
+        fixture.journal.baseline(Path::new("report.txt"))?,
+        Some(Baseline::Present(shared))
+    );
+    assert!(fixture.journal.conflicts()?.is_empty());
+    assert!(fixture.journal.pending_plans()?.is_empty());
+
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 2);
+    drop(fixture.directory);
+    Ok(())
+}
+
+#[test]
+fn file_beside_a_same_named_directory_still_uploads_a_local_edit() -> Result<(), Box<dyn Error>> {
+    let shared_bytes = b"shared sibling baseline";
+    let edited_bytes = b"sibling child edited locally";
+    let shared = RemoteFile::new(
+        dropbox_content_hash(shared_bytes.as_slice())?,
+        DropboxRevision::new("rev-sibling"),
+    );
+    let uploaded = RemoteFile::new(
+        dropbox_content_hash(edited_bytes.as_slice())?,
+        DropboxRevision::new("rev-sibling-upload"),
+    );
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(sibling_listing(&shared, true)),
+        FakeResponse::json(file_metadata(
+            "/report/x",
+            "/report/x",
+            uploaded.revision.as_str(),
+            &uploaded.content,
+        ))
+        .for_path("/2/files/upload"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-sibling-upload")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let mut fixture = sibling_fixture(&shared, shared_bytes)?;
+    std::fs::write(fixture.root.join("report/x"), edited_bytes)?;
+
+    let report = complete_report(reconcile_once(
+        &mut fixture.journal,
+        &client,
+        &mut downloads,
+        &fixture.root,
+        &fixture.staging,
+        &fixture.recovery,
+    )?)?;
+
+    assert_eq!(report.planned, 1);
+    assert_eq!(report.replayed_operations, 1);
+    assert_eq!(report.conflicts, 0);
+    assert_eq!(report.blocked, 0);
+    assert!(fixture.journal.conflicts()?.is_empty());
+    assert_eq!(conflict_bytes(&fixture.root)?, Vec::<Vec<u8>>::new());
+    assert_eq!(std::fs::read(fixture.root.join("report/x"))?, edited_bytes);
+    assert_eq!(
+        fixture.journal.baseline(Path::new("report/x"))?,
+        Some(Baseline::Present(uploaded.clone()))
+    );
+
+    let requests = server.finish()?;
+    let upload = requests
+        .iter()
+        .find(|request| request.path == "/2/files/upload")
+        .ok_or_else(|| io::Error::other("missing conditional Dropbox upload"))?;
+    assert_eq!(upload.body, edited_bytes);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(required_header(upload, "dropbox-api-arg")?)?,
+        json!({
+            "path": "/report/x",
+            "mode": {".tag": "update", "update": "rev-sibling"},
+            "autorename": false,
+            "strict_conflict": true,
+            "content_hash": uploaded.content.as_str()
+        })
+    );
+    drop(fixture.directory);
     Ok(())
 }
 

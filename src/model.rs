@@ -1,8 +1,123 @@
 //! Domain values used by the pure per-path sync planner.
 
+use std::borrow::Borrow;
+use std::cmp::Ordering;
+use std::ffi::OsString;
 use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+/// One byte past the separator, so `[path + "/", path + SUBTREE_END)` is
+/// exactly the set of byte strings that begin with `path + "/"`. Ending the
+/// range at `path + "/" + 0xFF` instead would drop every child whose name
+/// starts with `0xFF`.
+const SUBTREE_END: u8 = b'/' + 1;
+
+/// Dropbox-canonical path relative to the sync root.
+///
+/// Ordering, equality, and hashing all read the raw bytes, so the in-memory
+/// order of a set of canonical paths is always the SQLite BLOB order the
+/// journal returns. `Path` compares component by component, which puts
+/// `notes/bar` before `notes.txt` while SQLite puts it after; mixing the two
+/// silently drops the baselines of files under a directory that has a sibling
+/// sorting between the directory and its children.
+#[derive(Clone, Debug)]
+pub struct CanonicalPath(PathBuf);
+
+impl CanonicalPath {
+    /// Fold one display path relative to the sync root into Dropbox's identity.
+    #[must_use]
+    pub fn from_display(path: &Path) -> Self {
+        Self(
+            path.iter()
+                .map(|component| match component.to_str() {
+                    Some(text) => OsString::from(text.to_lowercase()),
+                    None => OsString::from_vec(
+                        component
+                            .as_bytes()
+                            .iter()
+                            .map(u8::to_ascii_lowercase)
+                            .collect(),
+                    ),
+                })
+                .collect(),
+        )
+    }
+
+    /// Rebuild an already canonical path from its stored bytes.
+    pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(PathBuf::from(OsString::from_vec(bytes)))
+    }
+
+    /// Borrow the canonical path for display and filesystem-shaped operations.
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    /// Borrow the ordered byte representation stored in the journal.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_os_str().as_bytes()
+    }
+
+    /// Return whether this path lies strictly beneath `ancestor`.
+    #[must_use]
+    pub fn is_beneath(&self, ancestor: &Self) -> bool {
+        let ancestor = ancestor.as_bytes();
+        self.as_bytes()
+            .strip_prefix(ancestor)
+            .is_some_and(|remainder| remainder.first() == Some(&b'/'))
+    }
+
+    /// Return the half-open byte range holding exactly the paths beneath this
+    /// one, so a range query and `is_beneath` always agree.
+    pub(crate) fn subtree_range(&self) -> (Vec<u8>, Vec<u8>) {
+        let mut start = Vec::with_capacity(self.as_bytes().len() + 1);
+        start.extend_from_slice(self.as_bytes());
+        let mut end = start.clone();
+        start.push(b'/');
+        end.push(SUBTREE_END);
+        (start, end)
+    }
+}
+
+impl Ord for CanonicalPath {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_bytes().cmp(other.as_bytes())
+    }
+}
+
+impl PartialOrd for CanonicalPath {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for CanonicalPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for CanonicalPath {}
+
+impl Hash for CanonicalPath {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_bytes().hash(state);
+    }
+}
+
+/// Ordering, equality, and hashing are all defined over these bytes, so keyed
+/// collections can be looked up by a borrowed slice without building a path.
+impl Borrow<[u8]> for CanonicalPath {
+    fn borrow(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
 
 /// Stable identity of a file's bytes.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -364,5 +479,70 @@ impl fmt::Display for Decision {
             Self::DirectoryCollision(_) => formatter
                 .write_str("preserve the file under a synchronized name and keep the directory"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn canonical(path: &str) -> CanonicalPath {
+        CanonicalPath::from_display(Path::new(path))
+    }
+
+    #[test]
+    fn canonical_order_is_bytewise_not_component_wise() {
+        let directory = canonical("report");
+        let sibling = canonical("report.txt");
+        let child = canonical("report/x");
+
+        assert!(directory < sibling);
+        assert!(sibling < child);
+        assert!(Path::new("report/x") < Path::new("report.txt"));
+    }
+
+    #[test]
+    fn canonical_paths_fold_case_and_compare_by_bytes() {
+        assert_eq!(canonical("Report/X.TXT"), canonical("report/x.txt"));
+        assert_eq!(canonical("Report/X.TXT").as_bytes(), b"report/x.txt");
+        assert_ne!(canonical("report"), canonical("report.txt"));
+    }
+
+    #[test]
+    fn subtree_range_holds_exactly_the_paths_beneath_an_ancestor() {
+        let ancestor = canonical("report");
+        let (start, end) = ancestor.subtree_range();
+
+        for beneath in [
+            CanonicalPath::from_bytes(b"report/\xff".to_vec()),
+            CanonicalPath::from_bytes(b"report/\xffdeep/\xff".to_vec()),
+            canonical("report/x"),
+            canonical("report/\u{10ffff}"),
+        ] {
+            assert!(beneath.is_beneath(&ancestor));
+            assert!(beneath.as_bytes() >= start.as_slice());
+            assert!(beneath.as_bytes() < end.as_slice());
+        }
+        for outside in [
+            canonical("report"),
+            canonical("report.txt"),
+            canonical("report0"),
+            canonical("reports/x"),
+        ] {
+            assert!(!outside.is_beneath(&ancestor));
+            assert!(outside.as_bytes() < start.as_slice() || outside.as_bytes() >= end.as_slice());
+        }
+    }
+
+    #[test]
+    fn only_true_descendants_are_beneath_an_ancestor() {
+        let ancestor = canonical("report");
+
+        assert!(canonical("report/x").is_beneath(&ancestor));
+        assert!(canonical("report/x/deep").is_beneath(&ancestor));
+        assert!(!canonical("report.txt").is_beneath(&ancestor));
+        assert!(!canonical("report2/x").is_beneath(&ancestor));
+        assert!(!ancestor.is_beneath(&ancestor));
+        assert!(!canonical("other/report/x").is_beneath(&ancestor));
     }
 }

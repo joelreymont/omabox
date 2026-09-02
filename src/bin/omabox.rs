@@ -627,7 +627,9 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
     use omabox::journal::{LocalRootBinding, PlanWrite};
-    use omabox::model::{Baseline, ContentIdentity, Decision, LocalFile, Observation};
+    use omabox::model::{
+        Baseline, CanonicalPath, ContentIdentity, Decision, LocalFile, Observation,
+    };
 
     use super::*;
 
@@ -880,7 +882,7 @@ mod tests {
         journal.publish_remote_inventory(
             "remote-cursor",
             &[omabox::journal::RemoteObservationRecord {
-                canonical_path: PathBuf::from("remote.txt"),
+                canonical_path: CanonicalPath::from_display(Path::new("remote.txt")),
                 path: PathBuf::from("remote.txt"),
                 observation: Observation::Present(remote.clone()),
             }],

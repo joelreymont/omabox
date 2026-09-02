@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::model::{
-    Baseline, Conflict, ContentIdentity, LocalObservation, NoOpDecision, Observation, Operation,
-    OperationPlan, RemoteObservation,
+    Baseline, CanonicalPath, Conflict, ContentIdentity, LocalObservation, NoOpDecision,
+    Observation, Operation, OperationPlan, RemoteObservation,
 };
 
 const MIGRATION_V1: &str = include_str!("../migrations/0001.sql");
@@ -166,7 +166,7 @@ struct LocalHashValue {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteObservationRecord {
     /// Dropbox's case-insensitive identity relative to the configured root.
-    pub canonical_path: PathBuf,
+    pub canonical_path: CanonicalPath,
     /// Path relative to the configured sync root.
     pub path: PathBuf,
     /// Complete observation for the path, including its Dropbox revision.
@@ -184,7 +184,7 @@ pub struct RemoteInventory {
 
 /// Durable common state with its display and Dropbox-canonical paths.
 pub(crate) struct BaselineRecord {
-    pub(crate) canonical_path: PathBuf,
+    pub(crate) canonical_path: CanonicalPath,
     pub(crate) path: PathBuf,
     pub(crate) baseline: Baseline,
 }
@@ -197,7 +197,7 @@ pub(crate) enum RemoteInventoryChange {
     /// Materialize a missing ancestor without replacing its authoritative casing.
     EnsureDirectory(RemoteObservationRecord),
     /// Remove one path and every descendant below it.
-    DeleteSubtree { canonical_path: PathBuf },
+    DeleteSubtree { canonical_path: CanonicalPath },
 }
 
 /// Dropbox account and root permanently associated with this journal.
@@ -992,7 +992,7 @@ impl Journal {
                     .execute(params![
                         path_bytes(&record.path),
                         json,
-                        path_bytes(&record.canonical_path)
+                        record.canonical_path.as_bytes()
                     ])
                     .map_err(|source| {
                         sqlite("publish remote observation", &database_path, source)
@@ -1040,7 +1040,7 @@ impl Journal {
             .map(|change| match change {
                 RemoteInventoryChange::Upsert(record)
                 | RemoteInventoryChange::EnsureDirectory(record) => {
-                    if record.canonical_path != dropbox_canonical_path(&record.path) {
+                    if record.canonical_path != CanonicalPath::from_display(&record.path) {
                         return Err(JournalError::InvalidState {
                             operation: "validate remote inventory delta",
                             path: record.path.clone(),
@@ -1048,7 +1048,7 @@ impl Journal {
                         });
                     }
                     let path = path_bytes(&record.path);
-                    let canonical_path = path_bytes(&record.canonical_path);
+                    let canonical_path = record.canonical_path.as_bytes().to_vec();
                     let observation = encode(
                         &record.observation,
                         "serialize remote inventory delta",
@@ -1076,20 +1076,16 @@ impl Journal {
                     }
                 }
                 RemoteInventoryChange::DeleteSubtree { canonical_path } => {
-                    if canonical_path.as_os_str().is_empty() {
+                    if canonical_path.as_bytes().is_empty() {
                         return Err(JournalError::InvalidState {
                             operation: "validate remote inventory delta",
-                            path: canonical_path.clone(),
+                            path: canonical_path.as_path().to_path_buf(),
                             detail: "subtree deletion path is empty",
                         });
                     }
-                    let canonical_path = path_bytes(canonical_path);
-                    let mut descendant_prefix = canonical_path.clone();
-                    descendant_prefix.push(b'/');
-                    let mut descendant_end = descendant_prefix.clone();
-                    descendant_end.push(u8::MAX);
+                    let (descendant_prefix, descendant_end) = canonical_path.subtree_range();
                     Ok(EncodedChange::DeleteSubtree {
-                        canonical_path,
+                        canonical_path: canonical_path.as_bytes().to_vec(),
                         descendant_prefix,
                         descendant_end,
                     })
@@ -1195,7 +1191,9 @@ impl Journal {
             .map_err(|source| sqlite("read remote cursor", &self.database_path, source))
     }
 
-    pub(crate) fn remote_directory_paths(&self) -> Result<Vec<(PathBuf, PathBuf)>, JournalError> {
+    pub(crate) fn remote_directory_paths(
+        &self,
+    ) -> Result<Vec<(CanonicalPath, PathBuf)>, JournalError> {
         let mut statement = self
             .connection
             .prepare(
@@ -1217,7 +1215,7 @@ impl Journal {
                 sqlite("query remote directory paths", &self.database_path, source)
             })?;
         rows.map(|row| {
-            row.map(|(canonical, path)| (bytes_path(canonical), bytes_path(path)))
+            row.map(|(canonical, path)| (CanonicalPath::from_bytes(canonical), bytes_path(path)))
                 .map_err(|source| {
                     sqlite("read remote directory paths", &self.database_path, source)
                 })
@@ -1256,7 +1254,7 @@ impl Journal {
     /// Baselines can only be written by completing the final operation of a
     /// pending plan; the public API deliberately has no independent setter.
     pub fn baseline(&self, path: &Path) -> Result<Option<Baseline>, JournalError> {
-        let canonical_path = dropbox_canonical_path(path);
+        let canonical_path = CanonicalPath::from_display(path);
         let query = if self.schema_version < 4 {
             "SELECT baseline_json FROM baselines WHERE path = ?1"
         } else {
@@ -1269,7 +1267,7 @@ impl Journal {
                 [if self.schema_version < 4 {
                     path_bytes(path)
                 } else {
-                    path_bytes(&canonical_path)
+                    canonical_path.as_bytes().to_vec()
                 }],
                 |row| row.get::<_, String>(0),
             )
@@ -1331,7 +1329,7 @@ impl Journal {
             let json = row
                 .get::<_, String>(2)
                 .map_err(|source| sqlite("read baseline payload", &self.database_path, source))?;
-            let canonical_path = bytes_path(raw_canonical_path);
+            let canonical_path = CanonicalPath::from_bytes(raw_canonical_path);
             let path = bytes_path(raw_path);
             let baseline = decode(&json, "deserialize baseline", &path)?;
             if baseline != Baseline::Absent {
@@ -1342,6 +1340,10 @@ impl Journal {
                 });
             }
         }
+        debug_assert!(
+            records.is_sorted_by(|left, right| left.canonical_path < right.canonical_path),
+            "baseline snapshot is not in canonical path order"
+        );
         Ok(records)
     }
 
@@ -1354,8 +1356,8 @@ impl Journal {
         &mut self,
         path: &Path,
     ) -> Result<(), JournalError> {
-        let canonical = dropbox_canonical_path(path);
-        let exact = path_bytes(&canonical);
+        let canonical = CanonicalPath::from_display(path);
+        let exact = canonical.as_bytes().to_vec();
         if exact.is_empty() {
             return Err(JournalError::InvalidState {
                 operation: "invalidate case-collision history",
@@ -1363,10 +1365,7 @@ impl Journal {
                 detail: "case-collision path is empty",
             });
         }
-        let mut descendants = exact.clone();
-        descendants.push(b'/');
-        let mut descendants_end = descendants.clone();
-        descendants_end.push(u8::MAX);
+        let (descendants, descendants_end) = canonical.subtree_range();
         self.connection
             .execute(
                 "DELETE FROM baselines WHERE canonical_path = ?1 \
@@ -1667,7 +1666,7 @@ impl Journal {
                 params![
                     path_bytes(&path),
                     json,
-                    path_bytes(&dropbox_canonical_path(&path))
+                    CanonicalPath::from_display(&path).as_bytes()
                 ],
             )
             .map_err(|source| sqlite("record plan conflict", &path, source))?;
@@ -1746,7 +1745,7 @@ impl Journal {
                 params![
                     path_bytes(path),
                     json,
-                    path_bytes(&dropbox_canonical_path(path))
+                    CanonicalPath::from_display(path).as_bytes()
                 ],
             )
             .map_err(|source| sqlite("record conflict", path, source))?;
@@ -2122,9 +2121,9 @@ fn populate_canonical_paths(
             .map_err(|source| sqlite("read canonical path migration", database_path, source))?
     };
     for (row_id, raw_path) in rows {
-        let canonical = dropbox_canonical_path(&bytes_path(raw_path));
+        let canonical = CanonicalPath::from_display(&bytes_path(raw_path));
         connection
-            .execute(update, params![path_bytes(&canonical), row_id])
+            .execute(update, params![canonical.as_bytes(), row_id])
             .map_err(|source| sqlite("write canonical path migration", database_path, source))?;
     }
     Ok(())
@@ -2170,21 +2169,6 @@ fn bytes_path(bytes: Vec<u8>) -> PathBuf {
     PathBuf::from(OsString::from_vec(bytes))
 }
 
-pub(crate) fn dropbox_canonical_path(path: &Path) -> PathBuf {
-    path.iter()
-        .map(|component| match component.to_str() {
-            Some(text) => OsString::from(text.to_lowercase()),
-            None => OsString::from_vec(
-                component
-                    .as_bytes()
-                    .iter()
-                    .map(u8::to_ascii_lowercase)
-                    .collect(),
-            ),
-        })
-        .collect()
-}
-
 fn decode_u64(bytes: &[u8], operation: &'static str, path: &Path) -> Result<u64, JournalError> {
     let raw = <[u8; 8]>::try_from(bytes).map_err(|_| JournalError::InvalidState {
         operation,
@@ -2223,12 +2207,12 @@ fn write_baseline(
     path: &Path,
     baseline: &Baseline,
 ) -> Result<(), JournalError> {
-    let canonical_path = dropbox_canonical_path(path);
+    let canonical_path = CanonicalPath::from_display(path);
     match baseline {
         Baseline::Absent => connection
             .execute(
                 "DELETE FROM baselines WHERE canonical_path = ?1",
-                [path_bytes(&canonical_path)],
+                [canonical_path.as_bytes()],
             )
             .map(|_| ())
             .map_err(|source| sqlite("remove absent baseline", path, source)),
@@ -2243,7 +2227,7 @@ fn write_baseline(
                          baseline_json = excluded.baseline_json \
                      WHERE baselines.path != excluded.path \
                         OR baselines.baseline_json != excluded.baseline_json",
-                    params![path_bytes(path), json, path_bytes(&canonical_path)],
+                    params![path_bytes(path), json, canonical_path.as_bytes()],
                 )
                 .map(|_| ())
                 .map_err(|source| sqlite("record present baseline", path, source))
@@ -2256,11 +2240,11 @@ fn record_noop_in(
     path: &Path,
     noop: &NoOpDecision,
 ) -> Result<NoOpWrite, JournalError> {
-    let canonical_path = dropbox_canonical_path(path);
+    let canonical_path = CanonicalPath::from_display(path);
     let pending = connection
         .query_row(
             "SELECT id FROM plans WHERE canonical_path = ?1 AND status = 'pending'",
-            [path_bytes(&canonical_path)],
+            [canonical_path.as_bytes()],
             |row| row.get::<_, i64>(0),
         )
         .optional()
@@ -2272,7 +2256,7 @@ fn record_noop_in(
     connection
         .execute(
             "DELETE FROM conflicts WHERE canonical_path = ?1",
-            [path_bytes(&canonical_path)],
+            [canonical_path.as_bytes()],
         )
         .map_err(|source| sqlite("retire resolved conflicts", path, source))?;
     Ok(NoOpWrite::Recorded)
@@ -2297,11 +2281,11 @@ fn record_plan_in(
             encode(operation, "serialize operation", path).map(|json| (ordinal, json))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let canonical_path = dropbox_canonical_path(path);
+    let canonical_path = CanonicalPath::from_display(path);
     let existing = connection
         .query_row(
             "SELECT id FROM plans WHERE canonical_path = ?1 AND status = 'pending'",
-            [path_bytes(&canonical_path)],
+            [canonical_path.as_bytes()],
             |row| row.get::<_, i64>(0),
         )
         .optional()
@@ -2320,7 +2304,7 @@ fn record_plan_in(
     connection
         .execute(
             "INSERT INTO plans(path, status, canonical_path) VALUES (?1, 'pending', ?2)",
-            params![path_bytes(path), path_bytes(&canonical_path)],
+            params![path_bytes(path), canonical_path.as_bytes()],
         )
         .map_err(|source| sqlite("record plan intent", path, source))?;
     let plan_id = PlanId(connection.last_insert_rowid());
@@ -2440,7 +2424,7 @@ fn complete_operation_in(
     connection
         .execute(
             "DELETE FROM conflicts WHERE canonical_path = ?1",
-            [path_bytes(&dropbox_canonical_path(&path))],
+            [CanonicalPath::from_display(&path).as_bytes()],
         )
         .map_err(|source| sqlite("retire resolved conflicts", &path, source))?;
     connection
@@ -2600,7 +2584,15 @@ fn read_local_hash_cache(
             content: value.content,
         })
     })
-    .collect()
+    .collect::<Result<Vec<_>, _>>()
+    .inspect(|records| {
+        debug_assert!(
+            records.is_sorted_by(|left, right| {
+                left.path.as_os_str().as_bytes() < right.path.as_os_str().as_bytes()
+            }),
+            "local hash cache is not in byte order"
+        );
+    })
 }
 
 fn read_remote_observations(
@@ -2629,7 +2621,7 @@ fn read_remote_observations(
     rows.map(|row| {
         let (raw_canonical_path, raw_path, json) =
             row.map_err(|source| sqlite("read remote inventory", database_path, source))?;
-        let canonical_path = bytes_path(raw_canonical_path);
+        let canonical_path = CanonicalPath::from_bytes(raw_canonical_path);
         let path = bytes_path(raw_path);
         let observation = decode(&json, "deserialize remote observation", &path)?;
         Ok(RemoteObservationRecord {
@@ -2638,7 +2630,13 @@ fn read_remote_observations(
             observation,
         })
     })
-    .collect()
+    .collect::<Result<Vec<_>, _>>()
+    .inspect(|records| {
+        debug_assert!(
+            records.is_sorted_by(|left, right| left.canonical_path < right.canonical_path),
+            "remote inventory is not in canonical path order"
+        );
+    })
 }
 
 fn read_plan(
@@ -2889,6 +2887,10 @@ mod tests {
 
     fn journal_path(directory: &TempDir) -> PathBuf {
         directory.path().join("journal.sqlite3")
+    }
+
+    fn canonical(path: &str) -> CanonicalPath {
+        CanonicalPath::from_display(Path::new(path))
     }
 
     fn file_mode(path: &Path) -> Result<u32, std::io::Error> {
@@ -3180,7 +3182,7 @@ mod tests {
         };
         journal.publish_local_inventory(std::slice::from_ref(&local_observation))?;
         let remote_observation = RemoteObservationRecord {
-            canonical_path: dropbox_canonical_path(path),
+            canonical_path: CanonicalPath::from_display(path),
             path: path.to_path_buf(),
             observation: Observation::Present(agreed.clone()),
         };
@@ -3433,6 +3435,67 @@ mod tests {
     }
 
     #[test]
+    fn remote_subtree_delete_covers_a_child_named_with_a_high_byte() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let mut journal = Journal::open(journal_path(&directory))?;
+        let parent = PathBuf::from("p");
+        let child = PathBuf::from(OsString::from_vec(b"p/\xffchild".to_vec()));
+        journal.publish_remote_inventory(
+            "cursor-old",
+            &[
+                RemoteObservationRecord {
+                    canonical_path: CanonicalPath::from_display(&parent),
+                    path: parent.clone(),
+                    observation: Observation::Directory,
+                },
+                RemoteObservationRecord {
+                    canonical_path: CanonicalPath::from_display(&child),
+                    path: child,
+                    observation: Observation::Present(remote_file("old", "rev-old")),
+                },
+            ],
+        )?;
+        assert_eq!(journal.remote_inventory()?.observations.len(), 2);
+
+        journal.apply_remote_inventory_delta(
+            "cursor-new",
+            &[RemoteInventoryChange::DeleteSubtree {
+                canonical_path: CanonicalPath::from_display(&parent),
+            }],
+        )?;
+
+        assert!(journal.remote_inventory()?.observations.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn case_collision_invalidation_covers_a_child_named_with_a_high_byte()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let mut journal = Journal::open(journal_path(&directory))?;
+        let parent = PathBuf::from("p");
+        let child = PathBuf::from(OsString::from_vec(b"p/\xffchild".to_vec()));
+        let directories = noop(plan(
+            &Baseline::Directory,
+            &Observation::Directory,
+            &Observation::Directory,
+        ))?;
+        journal.record_noop(&parent, &directories)?;
+        let agreed = noop(plan(
+            &Baseline::Absent,
+            &Observation::Present(LocalFile::new(content("old"))),
+            &Observation::Present(remote_file("old", "rev-old")),
+        ))?;
+        journal.record_noop(&child, &agreed)?;
+        assert_eq!(journal.baselines()?.len(), 2);
+
+        journal.invalidate_case_collision_baselines(&parent)?;
+
+        assert!(journal.baselines()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn baseline_snapshot_is_canonical_sorted() -> Result<(), Box<dyn Error>> {
         let directory = TempDir::new()?;
         let mut journal = Journal::open(journal_path(&directory))?;
@@ -3450,9 +3513,9 @@ mod tests {
 
         let records = journal.baselines()?;
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0].canonical_path, Path::new("alpha.txt"));
+        assert_eq!(records[0].canonical_path, canonical("alpha.txt"));
         assert_eq!(records[0].path, Path::new("alpha.txt"));
-        assert_eq!(records[1].canonical_path, Path::new("zulu.txt"));
+        assert_eq!(records[1].canonical_path, canonical("zulu.txt"));
         assert_eq!(records[1].path, Path::new("Zulu.TXT"));
         assert_eq!(
             records[1].baseline,
@@ -3466,7 +3529,7 @@ mod tests {
         let directory = TempDir::new()?;
         let mut journal = Journal::open(journal_path(&directory))?;
         let old = RemoteObservationRecord {
-            canonical_path: PathBuf::from("old.txt"),
+            canonical_path: canonical("old.txt"),
             path: PathBuf::from("old.txt"),
             observation: Observation::Present(remote_file("old", "rev-old")),
         };
@@ -3475,12 +3538,12 @@ mod tests {
         let duplicate_path = PathBuf::from("duplicate.txt");
         let invalid_replacement = [
             RemoteObservationRecord {
-                canonical_path: duplicate_path.clone(),
+                canonical_path: canonical("duplicate.txt"),
                 path: duplicate_path.clone(),
                 observation: Observation::ConfirmedAbsent,
             },
             RemoteObservationRecord {
-                canonical_path: duplicate_path.clone(),
+                canonical_path: canonical("duplicate.txt"),
                 path: duplicate_path,
                 observation: Observation::Present(remote_file("new", "rev-new")),
             },
@@ -3505,15 +3568,15 @@ mod tests {
         let mut journal = Journal::open(journal_path(&directory))?;
         let mut observations = Vec::with_capacity(INVENTORY_SIZE);
         observations.push(RemoteObservationRecord {
-            canonical_path: PathBuf::from("bulk"),
+            canonical_path: canonical("bulk"),
             path: PathBuf::from("Bulk"),
             observation: Observation::Directory,
         });
         for index in 1..INVENTORY_SIZE {
-            let canonical_path = PathBuf::from(format!("bulk/{index:05}.txt"));
+            let path = PathBuf::from(format!("bulk/{index:05}.txt"));
             observations.push(RemoteObservationRecord {
-                path: canonical_path.clone(),
-                canonical_path,
+                canonical_path: CanonicalPath::from_display(&path),
+                path,
                 observation: Observation::Present(remote_file("old", "rev-old")),
             });
         }
@@ -3526,15 +3589,15 @@ mod tests {
         let changed_path = PathBuf::from("bulk/05000.txt");
         let changes = [
             RemoteInventoryChange::Upsert(RemoteObservationRecord {
-                canonical_path: PathBuf::from("bulk"),
+                canonical_path: canonical("bulk"),
                 path: PathBuf::from("Bulk"),
                 observation: Observation::Directory,
             }),
             RemoteInventoryChange::DeleteSubtree {
-                canonical_path: changed_path.clone(),
+                canonical_path: CanonicalPath::from_display(&changed_path),
             },
             RemoteInventoryChange::Upsert(RemoteObservationRecord {
-                canonical_path: changed_path.clone(),
+                canonical_path: CanonicalPath::from_display(&changed_path),
                 path: changed_path.clone(),
                 observation: Observation::Present(remote_file("new", "rev-new")),
             }),
@@ -3550,7 +3613,7 @@ mod tests {
             inventory
                 .observations
                 .iter()
-                .find(|record| record.canonical_path == changed_path)
+                .find(|record| record.canonical_path == CanonicalPath::from_display(&changed_path))
                 .map(|record| &record.observation),
             Some(&Observation::Present(remote_file("new", "rev-new")))
         );
@@ -3578,7 +3641,7 @@ mod tests {
             ),
         ]
         .map(|(path, observation)| RemoteObservationRecord {
-            canonical_path: PathBuf::from(path),
+            canonical_path: canonical(path),
             path: PathBuf::from(path),
             observation,
         });
@@ -3610,7 +3673,7 @@ mod tests {
         journal.apply_remote_inventory_delta(
             "cursor-new",
             &[RemoteInventoryChange::DeleteSubtree {
-                canonical_path: PathBuf::from("a"),
+                canonical_path: canonical("a"),
             }],
         )?;
 

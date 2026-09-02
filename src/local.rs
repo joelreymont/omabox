@@ -760,9 +760,7 @@ fn enumerate_scan(
     entries
         .directories
         .sort_by(|left, right| left.path.cmp(&right.path));
-    entries
-        .cached_files
-        .sort_by(|left, right| left.path.cmp(&right.path));
+    entries.cached_files.sort_by(order_hash_records);
     entries
         .hash_jobs
         .sort_by(|left, right| left.path.cmp(&right.path));
@@ -832,7 +830,7 @@ fn finish_scan_at(
     pending
         .observations
         .sort_by(|left, right| left.path.cmp(&right.path));
-    reusable_hashes.sort_by(|left, right| left.path.cmp(&right.path));
+    reusable_hashes.sort_by(order_hash_records);
     Ok(CompleteScan {
         root_binding: root_binding(&pending.root, &pending.root_before),
         observations: pending.observations,
@@ -2688,8 +2686,26 @@ fn scan_directory(
     Ok(())
 }
 
+/// Order cached hashes the way SQLite and `cached_hash` order them.
+///
+/// Every ordered `LocalHashRecord` collection uses this, so a hash cache can
+/// never be written in one order and searched in another.
+fn order_hash_records(left: &LocalHashRecord, right: &LocalHashRecord) -> std::cmp::Ordering {
+    left.path
+        .as_os_str()
+        .as_bytes()
+        .cmp(right.path.as_os_str().as_bytes())
+}
+
+/// Look one scanned path up in the journal's hash cache.
+///
+/// The cache arrives in SQLite BLOB order, so the search compares raw bytes.
+/// `Path::cmp` walks components and would order `x/y.txt` before `x.txt`,
+/// which makes the search miss entries that are present.
 fn cached_hash<'a>(cache: &'a [LocalHashRecord], path: &Path) -> Option<&'a LocalHashRecord> {
-    let Ok(index) = cache.binary_search_by(|record| record.path.as_path().cmp(path)) else {
+    let wanted = path.as_os_str().as_bytes();
+    let Ok(index) = cache.binary_search_by(|record| record.path.as_os_str().as_bytes().cmp(wanted))
+    else {
         return None;
     };
     cache.get(index)
@@ -4637,6 +4653,35 @@ mod tests {
         )?;
 
         assert_eq!(scanned_content(&scan, path)?, &cached);
+        Ok(())
+    }
+
+    #[test]
+    fn file_beside_a_same_named_directory_keeps_its_cached_hash() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let root = directory.path().join("root");
+        std::fs::create_dir(&root)?;
+        std::fs::create_dir(root.join("x"))?;
+        std::fs::write(root.join("x.txt"), b"beside the directory")?;
+        std::fs::write(root.join("x/y.txt"), b"under the directory")?;
+        let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+        let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+        let _ = scan_and_publish_at(&mut journal, &root, None, all_cache_entries_stable)?;
+        let cache = journal.local_hash_cache()?;
+        assert_eq!(cache.len(), 2);
+
+        let rescan = enumerate_scan(&root, &cache, all_cache_entries_stable())?;
+
+        assert_eq!(rescan.hash_jobs.len(), 0);
+        assert_eq!(rescan.cached_files.len(), 2);
+        let fresh = scan_with_cache_and_workers_completed_at(
+            &root,
+            &[],
+            MAX_PARALLEL_HASHES,
+            None,
+            all_cache_entries_stable,
+        )?;
+        assert_eq!(fresh.reusable_hashes, cache);
         Ok(())
     }
 

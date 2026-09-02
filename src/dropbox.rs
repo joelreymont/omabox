@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{self, Read, Seek, SeekFrom};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,7 +23,9 @@ use crate::local::{
     prepare_disposable_download_with_access_at, prepare_download_slot_with_access_at,
     stage_download_at,
 };
-use crate::model::{ContentIdentity, DropboxRevision, Observation, RemoteFile, UnknownReason};
+use crate::model::{
+    CanonicalPath, ContentIdentity, DropboxRevision, Observation, RemoteFile, UnknownReason,
+};
 use crate::runtime_status::{TransferDirection, TransferEvent, TransferObserver, TransferProgress};
 
 const LONG_POLL_MINIMUM_SECONDS: u64 = 30;
@@ -1469,7 +1472,7 @@ impl DropboxClient {
     fn cursor_delta(
         &self,
         initial_cursor: &str,
-        directories: &[(PathBuf, PathBuf)],
+        directories: &[(CanonicalPath, PathBuf)],
     ) -> Result<CursorDelta, DropboxError> {
         let mut changes = Vec::new();
         let mut previous = initial_cursor.to_owned();
@@ -2295,19 +2298,11 @@ fn apply_entries(
     for change in changes {
         match change {
             RemoteInventoryChange::Upsert(record) => {
-                let key = record
-                    .canonical_path
-                    .to_str()
-                    .ok_or(DropboxError::InvalidEntryPath)?
-                    .to_owned();
+                let key = canonical_key(&record.canonical_path)?.to_owned();
                 records.insert(key, record);
             }
             RemoteInventoryChange::EnsureDirectory(record) => {
-                let key = record
-                    .canonical_path
-                    .to_str()
-                    .ok_or(DropboxError::InvalidEntryPath)?
-                    .to_owned();
+                let key = canonical_key(&record.canonical_path)?.to_owned();
                 if let Some(existing) = records.get_mut(&key) {
                     existing.observation = Observation::Directory;
                 } else {
@@ -2315,10 +2310,7 @@ fn apply_entries(
                 }
             }
             RemoteInventoryChange::DeleteSubtree { canonical_path } => {
-                let key = canonical_path
-                    .to_str()
-                    .ok_or(DropboxError::InvalidEntryPath)?;
-                remove_subtree(records, key);
+                remove_subtree(records, canonical_key(&canonical_path)?);
             }
         }
     }
@@ -2342,7 +2334,7 @@ fn append_entry_changes(
         let (key, path) = relative_paths(root, lower, display)?;
         if matches!(entry.tag, EntryTag::Deleted) {
             changes.push(RemoteInventoryChange::DeleteSubtree {
-                canonical_path: PathBuf::from(key),
+                canonical_path: CanonicalPath::from_bytes(key.into_bytes()),
             });
             continue;
         }
@@ -2354,7 +2346,7 @@ fn append_entry_changes(
             EntryTag::Folder => Observation::Directory,
             EntryTag::File => {
                 changes.push(RemoteInventoryChange::DeleteSubtree {
-                    canonical_path: PathBuf::from(&key),
+                    canonical_path: CanonicalPath::from_bytes(key.clone().into_bytes()),
                 });
                 if !entry.is_downloadable || entry.symlink_info.is_some() {
                     Observation::Unknown(UnknownReason::Unsupported)
@@ -2375,7 +2367,7 @@ fn append_entry_changes(
         };
         append_parent_folders(changes, &key, &path);
         changes.push(RemoteInventoryChange::Upsert(RemoteObservationRecord {
-            canonical_path: PathBuf::from(key),
+            canonical_path: CanonicalPath::from_bytes(key.into_bytes()),
             path,
             observation,
         }));
@@ -2390,7 +2382,7 @@ fn append_parent_folders(changes: &mut Vec<RemoteInventoryChange>, key: &str, pa
         let parent_key = lower[..depth].join("/");
         changes.push(RemoteInventoryChange::EnsureDirectory(
             RemoteObservationRecord {
-                canonical_path: PathBuf::from(&parent_key),
+                canonical_path: CanonicalPath::from_bytes(parent_key.into_bytes()),
                 path: display[..depth].iter().copied().collect(),
                 observation: Observation::Directory,
             },
@@ -2413,7 +2405,7 @@ fn normalize_inventory_records(
 
 fn normalize_inventory_changes(
     changes: &mut [RemoteInventoryChange],
-    existing_directories: &[(PathBuf, PathBuf)],
+    existing_directories: &[(CanonicalPath, PathBuf)],
 ) -> Result<(), DropboxError> {
     let mut directories = directory_casing(
         existing_directories
@@ -2441,7 +2433,9 @@ fn normalize_inventory_changes(
                 }
             }
             RemoteInventoryChange::DeleteSubtree { canonical_path } => {
-                directories.retain(|candidate, _| !candidate.starts_with(canonical_path));
+                directories.retain(|candidate, _| {
+                    candidate != canonical_path && !candidate.is_beneath(canonical_path)
+                });
             }
         }
     }
@@ -2459,8 +2453,8 @@ fn normalize_inventory_changes(
 }
 
 fn directory_casing<'a>(
-    paths: impl IntoIterator<Item = (&'a PathBuf, &'a PathBuf)>,
-) -> Result<BTreeMap<PathBuf, OsString>, DropboxError> {
+    paths: impl IntoIterator<Item = (&'a CanonicalPath, &'a PathBuf)>,
+) -> Result<BTreeMap<CanonicalPath, OsString>, DropboxError> {
     let mut directories = BTreeMap::new();
     for (canonical, path) in paths {
         insert_directory_casing(&mut directories, canonical, path)?;
@@ -2469,24 +2463,24 @@ fn directory_casing<'a>(
 }
 
 fn insert_directory_casing(
-    directories: &mut BTreeMap<PathBuf, OsString>,
-    canonical: &Path,
+    directories: &mut BTreeMap<CanonicalPath, OsString>,
+    canonical: &CanonicalPath,
     path: &Path,
 ) -> Result<(), DropboxError> {
     let component = path
         .file_name()
         .ok_or(DropboxError::InvalidEntryPath)?
         .to_os_string();
-    directories.insert(canonical.to_path_buf(), component);
+    directories.insert(canonical.clone(), component);
     Ok(())
 }
 
 fn normalized_remote_path(
-    canonical: &Path,
+    canonical: &CanonicalPath,
     path: &Path,
-    directories: &BTreeMap<PathBuf, OsString>,
+    directories: &BTreeMap<CanonicalPath, OsString>,
 ) -> Result<PathBuf, DropboxError> {
-    let canonical_components = canonical.iter().collect::<Vec<_>>();
+    let canonical_components = canonical.as_path().iter().collect::<Vec<_>>();
     let display_components = path.iter().collect::<Vec<_>>();
     if canonical_components.len() != display_components.len() {
         return Err(DropboxError::InvalidEntryPath);
@@ -2499,11 +2493,19 @@ fn normalized_remote_path(
         prefix.push(canonical_component);
         normalized.push(
             directories
-                .get(&prefix)
+                .get(prefix.as_os_str().as_bytes())
                 .map_or(display_component, OsString::as_os_str),
         );
     }
     Ok(normalized)
+}
+
+/// Borrow one canonical path as the UTF-8 key used by the listing accumulator.
+fn canonical_key(canonical: &CanonicalPath) -> Result<&str, DropboxError> {
+    canonical
+        .as_path()
+        .to_str()
+        .ok_or(DropboxError::InvalidEntryPath)
 }
 
 fn remove_subtree(records: &mut BTreeMap<String, RemoteObservationRecord>, key: &str) {
@@ -2559,7 +2561,9 @@ mod tests {
     use proptest::prelude::*;
 
     use crate::journal::RemoteObservationRecord;
-    use crate::model::{ContentIdentity, DropboxRevision, Observation, RemoteFile, UnknownReason};
+    use crate::model::{
+        CanonicalPath, ContentIdentity, DropboxRevision, Observation, RemoteFile, UnknownReason,
+    };
     use crate::runtime_status::{
         TransferDirection, TransferEvent, TransferObserver, TransferProgress,
     };
@@ -2767,7 +2771,7 @@ mod tests {
                 (
                     key.clone(),
                     RemoteObservationRecord {
-                        canonical_path: PathBuf::from(key),
+                        canonical_path: CanonicalPath::from_bytes(key.clone().into_bytes()),
                         path: PathBuf::from(key),
                         observation,
                     },

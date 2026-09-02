@@ -183,8 +183,8 @@ mod tests {
         LocalObservationRecord, PlanWrite, RecoveryWrite, RemoteObservationRecord,
     };
     use crate::model::{
-        Conflict, ContentIdentity, LocalFile, Observation, Operation, OperationPlan, RemoteFile,
-        UnknownReason,
+        CanonicalPath, Conflict, ContentIdentity, LocalFile, Observation, Operation, OperationPlan,
+        RemoteFile, UnknownReason,
     };
 
     use super::*;
@@ -208,7 +208,7 @@ mod tests {
         journal.publish_remote_inventory(
             "cursor-must-not-render",
             &[RemoteObservationRecord {
-                canonical_path: PathBuf::from("a-remote.txt"),
+                canonical_path: CanonicalPath::from_display(Path::new("a-remote.txt")),
                 path: PathBuf::from("a-remote.txt"),
                 observation: Observation::Unknown(UnknownReason::Stale),
             }],
