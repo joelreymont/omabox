@@ -586,7 +586,13 @@ would remove the adapters above; they are candidate upstream changes to
 ## M. Journal hygiene
 
 - `invalidate_case_collision_baselines` invalidates only the renamed spelling's
-  future and re-records the kept spelling's baseline.
+  future and re-records the kept spelling's baseline. Whether a spelling
+  "stays behind" is an existence check against the active root descriptor at
+  the moment of invalidation, never a lookup in a previously published
+  inventory, which can be stale after a crash or an early return. When a
+  baseline exists, the automatic rename moves a spelling other than the one
+  the baseline names, so history stays attached to the file it was recorded
+  for.
 - Legacy adoption of a v1 journal starts a fresh generation instead of binding
   existing baselines to whatever root is configured.
 - `config::redacted` is removed; `Journal::publish_local_inventory` moves under
