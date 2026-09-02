@@ -224,8 +224,12 @@ impl DaemonError { fn disposition(&self) -> Disposition }
   before anything live changes.
 - Unit: `RestartPreventExitStatus=70 78`, `StartLimitIntervalSec=10min`,
   `StartLimitBurst=5`, `After=graphical-session.target`,
-  `ExecStopPost=-/usr/bin/rm -f %t/omabox/status.json`. The daemon removes
-  `status.json` on clean exit.
+  `ExecStopPost=-/usr/bin/rm -f %t/omabox/status.json`, with the start-limit
+  keys in `[Unit]`. `ExecStopPost` is the only removal of `status.json`: the
+  daemon has no shutdown path by design, because every effect is crash-safe
+  (checkpointed stages, transactional journal), so SIGTERM may end it at any
+  instruction. A corrupt journal (`SQLITE_CORRUPT`, `SQLITE_NOTADB`) is
+  UserAction; busy, full, and other SQLite failures are Environmental.
 - The session loop, dispositions, and schedule live in a library module
   `src/daemon.rs`; `src/bin/omaboxd.rs` becomes the thin entry point, so tests
   can drive a session against the fake server.
