@@ -304,11 +304,17 @@ gains `conflicts: Vec<String>` (bounded to 20 display paths) and
   timeouts via ureq's request-level config.
 - `UPLOAD_SESSION_MAX_BYTES` = 350 GB (decimal, documented).
 - `ascii_json` escapes bytes below 0x20 and 0x7F as `\u00XX`.
-- `append_v2` sends the chunk's `content_hash`; a failed append retry chains
-  the first error as context; already-staged download outcomes drop the
-  response instead of draining it; an unparsable `Content-Length` is a header
-  error; `Retry-After` accepts the HTTP-date form; `resolve_ambiguous` chains
-  the verification error.
+- A failed append retry chains the first error as context; already-staged
+  download outcomes drop the response instead of draining it; an unparsable
+  `Content-Length` is a header error; `Retry-After` accepts the HTTP-date form
+  (shared parser in a private `src/http.rs`); `resolve_ambiguous` chains the
+  verification error. Per-chunk `content_hash` on `append_v2` is deliberately
+  omitted: block hashes are not available at upload time without re-reading
+  every chunk, which would double upload I/O. Instead, in the direct
+  upload/finish response path only, a committed `content_hash` that differs
+  from the staged content is a typed `UploadedContentMismatch` error retried
+  like a transport failure; the ambiguous re-verification path is unchanged
+  because there a differing hash legitimately means another writer.
 - `auth.rs`: child cleanup errors are chained into the primary error; `EPIPE`
   on write reports the child's exit status.
 
