@@ -285,7 +285,13 @@ gains `conflicts: Vec<String>` (bounded to 20 display paths) and
 ## I. Dropbox listing robustness and cost (M4, M5)
 
 - Restricted folder (`no_access` or `traverse_only`): `Unknown(Inaccessible)`
-  record; the root itself restricted stays `RemoteRootRestricted`.
+  record; the root itself restricted stays `RemoteRootRestricted`. An
+  `EnsureDirectory` change (an ancestor materialized from a listed child)
+  never overwrites an `Unknown` observation, in the listing accumulator and in
+  `apply_remote_inventory_delta` alike; otherwise a restricted folder with one
+  listable child would read as `Directory` and its invisible children as
+  absent. A mutation whose confirmed identity differs from the requested path
+  is a dedicated `MutationRejection` variant, not an error.
 - Downloadable file without `content_hash` or `rev`: `Unknown(Incomplete)`.
 - `display.to_lowercase() != path_lower`: `Unknown(Unsupported)` record keyed
   by Dropbox's `path_lower`, logged once per path; never an error.
