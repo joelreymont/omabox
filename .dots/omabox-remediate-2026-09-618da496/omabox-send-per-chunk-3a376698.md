@@ -5,6 +5,7 @@ priority: 3
 issue-type: task
 created-at: "2026-09-02T12:59:01.979111+02:00"
 blocks:
+  - omabox-move-the-dropbox-cb30bc34
   - omabox-make-idle-passes-24e8ce2a
 ---
 
