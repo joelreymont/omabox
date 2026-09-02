@@ -200,13 +200,21 @@ impl DaemonError { fn disposition(&self) -> Disposition }
   refresh). The daemon publishes the fatal status and exits 78.
 - Invariant: `InvalidJournalState` and other bugs exit 70.
 - `last_error` is cleared only when a pass completes with zero sync errors.
-- Launch observability without a readiness protocol: the unit becomes
-  `Type=exec`, so `systemctl start`/`restart` fails when the binary cannot be
-  executed; `omaboxd --self-check` prints the version and exits 0 without
-  touching state, and `install` runs it on the staged binary before
-  publishing; after a restart, `install` polls `is-active` for up to 10 s and
-  treats an inactive or failed unit as a launch failure. Credential and
-  account problems surface through the published status, not the launch.
+- Readiness: the daemon sends `READY=1` over `NOTIFY_SOCKET` using
+  `std::os::unix::net::UnixDatagram` (abstract addresses via
+  `SocketAddrExt::from_abstract_name`; no new crate) as soon as the
+  configuration is loaded, the instance lock is held, and the journal is open
+  and migrated. Credential loading and account validation happen after
+  readiness: a UserAction outcome there exits 78 from the active service; a
+  Retry or Environmental outcome runs as an active degraded service with its
+  status published; Invariant failures before readiness exit 70. The unit
+  becomes `Type=notify` with `TimeoutStartSec=5min` (migrations run before
+  readiness). Because `systemctl restart` of a notify unit returns only after
+  readiness or failure, `install` learns whether the new daemon launched from
+  that exit status alone; there is no polling. `omaboxd --self-check` prints
+  the version and exits 0 without touching state, and `install` runs it on the
+  staged binary before publishing, so a binary that cannot execute is caught
+  before anything live changes.
 - Unit: `RestartPreventExitStatus=70 78`, `StartLimitIntervalSec=10min`,
   `StartLimitBurst=5`, `After=graphical-session.target`,
   `ExecStopPost=-/usr/bin/rm -f %t/omabox/status.json`. The daemon removes
@@ -379,10 +387,11 @@ Wave 3: O.
 
 ## Simplifications after review
 
-Compared with the first draft: no readiness protocol (`Type=exec` plus a
-self-check and an `is-active` poll observe launch); no per-directory device
-history or adopt command (mount points are unsupported, like symlinks); no
-journal-recorded conflict names (deterministic readable names keep the
-existing idempotence); no WAL switch and no NOT NULL table rebuilds (the
-migration touches only `plans`/`operations` and adds one index); fixed
-one-second wait instead of an escalating schedule for fresh observations.
+Compared with the first draft: no per-directory device history or adopt
+command (mount points are unsupported, like symlinks); no journal-recorded
+conflict names (deterministic readable names keep the existing idempotence);
+no WAL switch and no NOT NULL table rebuilds (the migration touches only
+`plans`/`operations` and adds one index); fixed one-second wait instead of an
+escalating schedule for fresh observations. The readiness protocol stays: a
+`Type=notify` handshake is the structural signal that the daemon launched,
+whereas polling `is-active` for a fixed window is a timing heuristic.
