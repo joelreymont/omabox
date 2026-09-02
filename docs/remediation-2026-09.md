@@ -71,12 +71,17 @@ followed by `PRAGMA user_version = 6`:
   preserving ids, ordinals, and statuses, drop `operations` then `plans`,
   rename both, recreate `operations_by_plan`, and run `PRAGMA foreign_key_check`
   before `user_version` is set.
+- `baselines`, `remote_observations`, `conflicts`: rebuilt STRICT with
+  `canonical_path BLOB NOT NULL` (rows with a NULL canonical path are
+  backfilled from `path` in Rust first, using the existing
+  `populate_canonical_paths`); `plans_v6` carries the same constraint. The
+  database enforces the identity invariant; Rust write paths stop being the
+  only guard.
 - Partial index `remote_directories ON remote_observations(canonical_path)
   WHERE observation_json = '"Directory"'`.
 
-Nothing else changes: `canonical_path` stays nullable in the schema and
-non-null by construction in every Rust write path; conflicts need no new
-columns because copy names are deterministic (section H).
+Conflicts need no new columns because copy names are deterministic
+(section H).
 
 Connection setup keeps rollback journal mode and `synchronous = FULL`, and adds
 an explicit `busy_timeout = 5000` and `foreign_keys = ON`. The database file
@@ -131,14 +136,16 @@ record. `FreshObservationRequired` is no longer produced by directory churn;
 the remaining producers (case renames, destination races) are rare, and the
 daemon waits one second before re-entering the pass after one.
 
-Mount points (M11): the sync root is one filesystem. A directory whose
-`st_dev` differs from the sync root's device is published as
-`Unknown(Unsupported)` and nothing beneath it is scanned, exactly like a
-symlink. Content on another volume is therefore never synchronized, so an
-unmounted mount point is an ordinary empty directory with no baselines beneath
-it and nothing to infer. This also keeps the same-filesystem atomic-rename
-install guarantee true for the whole root. `omabox status` lists such
-directories as unsupported.
+Mount points (M11): a directory whose `st_dev` differs from the sync root's
+device is published as `Unknown(Unsupported)` and nothing beneath it is
+scanned, exactly like a symlink. Content on another volume is therefore never
+synchronized, so an unmounted mount point is an ordinary empty directory with
+no baselines beneath it and nothing to infer. This is a scope decision, not a
+technical necessity: installs already stage beside their target, so
+cross-device subtrees would install atomically; what they cannot do safely is
+distinguish "unmounted" from "emptied" without per-directory device history
+and an explicit re-adoption action. Until that machinery is wanted, a subtree
+on another volume is unsupported and `omabox status` says so.
 
 ## D. Per-path failure isolation and blocked plans (C3 remote, M1)
 
@@ -361,9 +368,10 @@ gains `conflicts: Vec<String>` (bounded to 20 display paths) and
   token, and a locked keyring, each asserting unrelated paths still sync;
   crash tests for remote effect then crash, conflict recorded then crash, and
   baseline invalidation then rename crash; a cross-filesystem promotion test
-  with the root on `/tmp` and staging on `/dev/shm`; an `#[ignore]`d test that
-  runs `qmltestrunner` against the plugin tests, documented in README under
-  Develop.
+  with the root on `/tmp` and staging on `/dev/shm`; an integration test that
+  runs `qmltestrunner` (part of `qt6-declarative`, which quickshell already
+  requires on Omarchy) against the plugin tests and fails when the runner is
+  absent, with the requirement stated in README under Develop.
 - Subprocess fixtures are spawned through `/bin/sh <path>`.
 - `formal/DownloadExecutor.tla` gains a permanent per-job failure state that
   never cancels siblings; `DownloadLifecycle.tla` `DiscardStaleSlot` guards on
@@ -388,10 +396,13 @@ Wave 3: O.
 ## Simplifications after review
 
 Compared with the first draft: no per-directory device history or adopt
-command (mount points are unsupported, like symlinks); no journal-recorded
-conflict names (deterministic readable names keep the existing idempotence);
-no WAL switch and no NOT NULL table rebuilds (the migration touches only
-`plans`/`operations` and adds one index); fixed one-second wait instead of an
-escalating schedule for fresh observations. The readiness protocol stays: a
-`Type=notify` handshake is the structural signal that the daemon launched,
-whereas polling `is-active` for a fixed window is a timing heuristic.
+command (mount points are unsupported, like symlinks; a scope decision, see
+section C); no journal-recorded conflict names (deterministic readable names
+keep the existing idempotence); no WAL switch (rollback mode with an explicit
+busy timeout satisfies every invariant, and a busy commit is a retried pass
+under section E); fixed one-second wait instead of an escalating schedule for
+fresh observations. Kept after a second look: the `Type=notify` readiness
+handshake (the structural signal that the daemon launched; polling is a
+timing heuristic), the NOT NULL rebuilds (the database enforces the identity
+invariant), and a real QML test rather than an ignored one (the runner is
+present on the target platform).
