@@ -17,6 +17,8 @@ use thiserror::Error;
 
 use crate::dropbox::DropboxEndpoints;
 use crate::journal::DropboxBinding;
+#[cfg(test)]
+use crate::spawn::Launch;
 
 const RANDOM_VALUE_BYTES: usize = 32;
 const SECRET_TOOL: &str = "/usr/bin/secret-tool";
@@ -91,7 +93,7 @@ pub enum CredentialLookup {
 #[derive(Clone, Debug)]
 pub struct RefreshTokenStore {
     #[cfg(test)]
-    executable: PathBuf,
+    launch: Launch,
 }
 
 impl RefreshTokenStore {
@@ -100,7 +102,7 @@ impl RefreshTokenStore {
     pub fn new() -> Self {
         Self {
             #[cfg(test)]
-            executable: PathBuf::from(SECRET_TOOL),
+            launch: Launch::Program(PathBuf::from(SECRET_TOOL)),
         }
     }
 
@@ -220,16 +222,17 @@ impl RefreshTokenStore {
 
     fn command(&self) -> Command {
         #[cfg(test)]
-        let command = Command::new(&self.executable);
+        let command = self.launch.command();
         #[cfg(not(test))]
         let command = Command::new(SECRET_TOOL);
         command
     }
 
+    /// Stand in for `secret-tool` with a shell script `/bin/sh` reads.
     #[cfg(test)]
-    fn with_executable(executable: impl Into<PathBuf>) -> Self {
+    fn with_script(script: impl Into<PathBuf>) -> Self {
         Self {
-            executable: executable.into(),
+            launch: Launch::Script(script.into()),
         }
     }
 }
@@ -591,7 +594,6 @@ mod tests {
     use std::error::Error;
     use std::fs;
     use std::net::TcpListener;
-    use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -719,7 +721,7 @@ mod tests {
     #[test]
     fn secret_tool_store_uses_fixed_arguments_and_exact_json_stdin() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::TempDir::new()?;
-        let executable = fake_executable(
+        let script = fake_script(
             directory.path(),
             "store-fake",
             "printf '%s\\n' \"$@\" > \"$0.args\"\ncat > \"$0.stdin\"\n",
@@ -731,10 +733,10 @@ mod tests {
         };
         let token = "credential-stdin-sentinel";
 
-        RefreshTokenStore::with_executable(&executable)
+        RefreshTokenStore::with_script(&script)
             .store(&binding, &RefreshToken::from_secret(token))?;
 
-        let arguments = fs::read_to_string(suffixed(&executable, ".args"))?;
+        let arguments = fs::read_to_string(suffixed(&script, ".args"))?;
         assert_eq!(
             arguments.lines().collect::<Vec<_>>(),
             vec![
@@ -746,7 +748,7 @@ mod tests {
                 "dropbox-credentials-v1"
             ]
         );
-        let input = fs::read(suffixed(&executable, ".stdin"))?;
+        let input = fs::read(suffixed(&script, ".stdin"))?;
         assert!(!input.ends_with(b"\n"));
         let record: serde_json::Value = serde_json::from_slice(&input)?;
         assert_eq!(record["version"], 1);
@@ -761,12 +763,12 @@ mod tests {
     fn secret_tool_lookup_decodes_record_and_preserves_nonzero_status() -> Result<(), Box<dyn Error>>
     {
         let directory = tempfile::TempDir::new()?;
-        let executable = fake_executable(
+        let script = fake_script(
             directory.path(),
             "lookup-fake",
             "printf '%s\\n' \"$@\" > \"$0.args\"\nprintf '%s' '{\"version\":1,\"refresh_token\":\"lookup-token\",\"account_id\":\"account\",\"root_namespace_id\":\"namespace\",\"remote_root\":\"/Root\"}'\n",
         )?;
-        let found = RefreshTokenStore::with_executable(&executable).load()?;
+        let found = RefreshTokenStore::with_script(&script).load()?;
         let CredentialLookup::Found(credential) = found else {
             return Err(std::io::Error::other("fake credential was unavailable").into());
         };
@@ -775,7 +777,7 @@ mod tests {
         assert_eq!(credential.binding.remote_root, "/Root");
         assert_eq!(credential.refresh_token.expose(), "lookup-token");
         assert_eq!(
-            fs::read_to_string(suffixed(&executable, ".args"))?
+            fs::read_to_string(suffixed(&script, ".args"))?
                 .lines()
                 .collect::<Vec<_>>(),
             vec![
@@ -787,9 +789,9 @@ mod tests {
             ]
         );
 
-        let unavailable = fake_executable(directory.path(), "unavailable-fake", "exit 7\n")?;
+        let unavailable = fake_script(directory.path(), "unavailable-fake", "exit 7\n")?;
         assert!(matches!(
-            RefreshTokenStore::with_executable(unavailable).load()?,
+            RefreshTokenStore::with_script(unavailable).load()?,
             CredentialLookup::CredentialsUnavailable { status: Some(7) }
         ));
         Ok(())
@@ -799,12 +801,12 @@ mod tests {
     fn secret_tool_parser_diagnostics_do_not_echo_output() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::TempDir::new()?;
         let secret = "parser-output-secret-sentinel";
-        let executable = fake_executable(
+        let script = fake_script(
             directory.path(),
             "malformed-fake",
             &format!("printf '%s' '{{\"refresh_token\":\"{secret}\",BROKEN'\n"),
         )?;
-        let failure = RefreshTokenStore::with_executable(executable)
+        let failure = RefreshTokenStore::with_script(script)
             .load()
             .err()
             .ok_or_else(|| std::io::Error::other("malformed credential was accepted"))?;
@@ -831,16 +833,13 @@ mod tests {
         diagnostic
     }
 
-    fn fake_executable(
-        directory: &Path,
-        name: &str,
-        body: &str,
-    ) -> Result<PathBuf, std::io::Error> {
+    /// Write a `secret-tool` stand-in without the executable bit.
+    ///
+    /// `RefreshTokenStore::with_script` reads it through `/bin/sh`, so writing
+    /// one can never collide with a concurrent spawn in the test binary.
+    fn fake_script(directory: &Path, name: &str, body: &str) -> Result<PathBuf, std::io::Error> {
         let path = directory.join(name);
-        fs::write(&path, format!("#!/bin/sh\n{body}"))?;
-        let mut permissions = fs::metadata(&path)?.permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&path, permissions)?;
+        fs::write(&path, body)?;
         Ok(path)
     }
 

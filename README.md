@@ -70,5 +70,12 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+`cargo test` runs the Omarchy plugin's QML tests through Qt 6's
+`qmltestrunner`, so `qt6-declarative` must be installed. The runner is located
+through `qmake6 -query QT_INSTALL_BINS` rather than `PATH`, because Qt 5 ships
+a `qmltestrunner` of its own that `PATH` may well find first and that cannot
+run these tests at all: it rejects the plugin's versionless imports with
+`Library import requires a version` and exits before a single case runs.
+
 See [`formal/README.md`](formal/README.md) for TLC checks. Real Dropbox tests are
 opt-in and must use uncommitted test credentials. Omabox is MIT licensed.

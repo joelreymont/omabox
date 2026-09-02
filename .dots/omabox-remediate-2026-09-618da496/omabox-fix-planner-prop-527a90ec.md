@@ -1,9 +1,11 @@
 ---
 title: Fix planner property strategies, fixtures, and models
-status: active
+status: closed
 priority: 2
 issue-type: task
-created-at: "\"2026-09-02T11:28:11.367544+02:00\""
+created-at: "\"\\\"2026-09-02T11:28:11.367544+02:00\\\"\""
+closed-at: "2026-09-02T17:27:43.842841+02:00"
+close-reason: "landed as change tqpwzpyk (Reach every planner outcome and stop exec races); destruction findings fixed (durable Blocked in DownloadExecutor with three mutation-proven properties, coverage tied to proptest config, 21 outcomes); gates green at merged tip: fmt, clippy -D warnings, 267 tests incl. the QML widget test; DownloadExecutor TLC 1548 states"
 blocks:
   - omabox-order-canonical-paths-6ffaf324
 ---

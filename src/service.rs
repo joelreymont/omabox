@@ -1,10 +1,12 @@
 //! Direct controls for the Omabox systemd user service and its journal.
 
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use miette::Diagnostic;
 use thiserror::Error;
+
+use crate::spawn::Launch;
 
 const UNIT: &str = "omabox.service";
 
@@ -41,34 +43,38 @@ impl ServiceAction {
 /// Programs used to control and inspect the user service.
 #[derive(Clone, Debug)]
 pub struct ServiceCommands {
-    systemctl: PathBuf,
-    journalctl: PathBuf,
+    systemctl: Launch,
+    journalctl: Launch,
 }
 
 impl Default for ServiceCommands {
     fn default() -> Self {
         Self {
-            systemctl: PathBuf::from("systemctl"),
-            journalctl: PathBuf::from("journalctl"),
+            systemctl: Launch::Program(PathBuf::from("systemctl")),
+            journalctl: Launch::Program(PathBuf::from("journalctl")),
         }
     }
 }
 
 impl ServiceCommands {
-    /// Construct commands with explicit program paths.
+    /// Run the given shell scripts in place of the real programs.
     ///
-    /// This also keeps subprocess behavior deterministic in tests.
+    /// This is the seam that keeps subprocess behavior deterministic in tests.
+    /// Each script is passed to `/bin/sh` rather than executed, so writing one
+    /// can never collide with a concurrent spawn.
     #[must_use]
-    pub fn new(systemctl: impl Into<PathBuf>, journalctl: impl Into<PathBuf>) -> Self {
+    pub fn scripts(systemctl: impl Into<PathBuf>, journalctl: impl Into<PathBuf>) -> Self {
         Self {
-            systemctl: systemctl.into(),
-            journalctl: journalctl.into(),
+            systemctl: Launch::Script(systemctl.into()),
+            journalctl: Launch::Script(journalctl.into()),
         }
     }
 
     /// Return whether systemd currently considers the user service active.
     pub fn is_active(&self) -> Result<bool, ServiceError> {
-        let status = Command::new(&self.systemctl)
+        let status = self
+            .systemctl
+            .command()
             .args(["--user", "is-active", "--quiet", UNIT])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -97,7 +103,9 @@ impl ServiceCommands {
 
     /// Reload user service unit files after installation changes.
     pub fn daemon_reload(&self) -> Result<(), ServiceError> {
-        let status = Command::new(&self.systemctl)
+        let status = self
+            .systemctl
+            .command()
             .args(["--user", "daemon-reload"])
             .status()
             .map_err(|source| ServiceError::StartCommand {
@@ -109,7 +117,7 @@ impl ServiceCommands {
 
     /// Run one direct systemctl operation.
     pub fn control(&self, action: ServiceAction) -> Result<(), ServiceError> {
-        let mut command = Command::new(&self.systemctl);
+        let mut command = self.systemctl.command();
         command.args(["--user", action.argument()]);
         if action == ServiceAction::Status {
             command.arg("--no-pager");
@@ -136,7 +144,9 @@ impl ServiceCommands {
 
     /// Show recent logs from the Omabox user service.
     pub fn logs(&self) -> Result<(), ServiceError> {
-        let status = Command::new(&self.journalctl)
+        let status = self
+            .journalctl
+            .command()
             .args(["--user-unit", UNIT, "--no-pager", "--lines", "200"])
             .status()
             .map_err(|source| ServiceError::StartCommand {
@@ -160,7 +170,9 @@ impl ServiceCommands {
         argument: &'static str,
         command_name: &'static str,
     ) -> Result<bool, ServiceError> {
-        let status = Command::new(&self.systemctl)
+        let status = self
+            .systemctl
+            .command()
             .args(["--user", argument, "--quiet", UNIT])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -244,12 +256,16 @@ pub enum ServiceError {
 mod tests {
     use std::error::Error;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt as _;
     use std::path::Path;
 
     use super::*;
 
-    fn fake_command(
+    /// Record the arguments the caller passed, then exit with `exit`.
+    ///
+    /// The script is never given the executable bit: `ServiceCommands::scripts`
+    /// reads it through `/bin/sh`, and a regression to a direct spawn fails
+    /// with a permission error instead of racing.
+    fn recording_script(
         directory: &Path,
         name: &str,
         output: &Path,
@@ -259,18 +275,16 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit {exit}\n",
+                "printf '%s\\n' \"$@\" > '{}'\nexit {exit}\n",
                 output.display()
             ),
         )?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
         Ok(path)
     }
 
-    fn terminating_command(directory: &Path, name: &str) -> Result<PathBuf, Box<dyn Error>> {
+    fn terminating_script(directory: &Path, name: &str) -> Result<PathBuf, Box<dyn Error>> {
         let path = directory.join(name);
-        fs::write(&path, "#!/bin/sh\nkill -TERM $$\n")?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+        fs::write(&path, "kill -TERM $$\n")?;
         Ok(path)
     }
 
@@ -279,9 +293,10 @@ mod tests {
         let temporary = tempfile::TempDir::new()?;
         let systemctl_arguments = temporary.path().join("systemctl.args");
         let journalctl_arguments = temporary.path().join("journalctl.args");
-        let systemctl = fake_command(temporary.path(), "systemctl", &systemctl_arguments, 0)?;
-        let journalctl = fake_command(temporary.path(), "journalctl", &journalctl_arguments, 0)?;
-        let commands = ServiceCommands::new(systemctl, journalctl);
+        let systemctl = recording_script(temporary.path(), "systemctl", &systemctl_arguments, 0)?;
+        let journalctl =
+            recording_script(temporary.path(), "journalctl", &journalctl_arguments, 0)?;
+        let commands = ServiceCommands::scripts(systemctl, journalctl);
 
         assert!(commands.is_active()?);
         assert_eq!(
@@ -307,8 +322,8 @@ mod tests {
     fn inactive_is_a_state_instead_of_an_error() -> Result<(), Box<dyn Error>> {
         let temporary = tempfile::TempDir::new()?;
         let arguments = temporary.path().join("systemctl.args");
-        let systemctl = fake_command(temporary.path(), "systemctl", &arguments, 3)?;
-        let commands = ServiceCommands::new(systemctl, "/unused/journalctl");
+        let systemctl = recording_script(temporary.path(), "systemctl", &arguments, 3)?;
+        let commands = ServiceCommands::scripts(systemctl, "/unused/journalctl");
 
         assert!(!commands.is_active()?);
         commands.control(ServiceAction::Status)?;
@@ -318,9 +333,9 @@ mod tests {
     #[test]
     fn signal_terminated_controls_have_a_distinct_error() -> Result<(), Box<dyn Error>> {
         let temporary = tempfile::TempDir::new()?;
-        let systemctl = terminating_command(temporary.path(), "systemctl")?;
-        let journalctl = terminating_command(temporary.path(), "journalctl")?;
-        let commands = ServiceCommands::new(systemctl, journalctl);
+        let systemctl = terminating_script(temporary.path(), "systemctl")?;
+        let journalctl = terminating_script(temporary.path(), "journalctl")?;
+        let commands = ServiceCommands::scripts(systemctl, journalctl);
 
         assert!(matches!(
             commands.control(ServiceAction::Start),

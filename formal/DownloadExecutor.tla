@@ -11,9 +11,9 @@ ASSUME /\ Cardinality(Paths) = 3
 NoPath == "NoPath"
 JobStates == {
     "Pending", "Queued", "Active", "Staged",
-    "Installed", "Failed", "Cancelled", "Completed"
+    "Installed", "Failed", "Blocked", "Cancelled", "Completed"
 }
-PlanStates == {"Pending", "Completed"}
+PlanStates == {"Pending", "Blocked", "Completed"}
 
 VARIABLES job, plan, workerPath, slotPath, cancelled, failure, running
 
@@ -31,6 +31,7 @@ Init ==
 Queue(path) ==
     /\ running
     /\ ~cancelled
+    /\ plan[path] = "Pending"
     /\ job[path] = "Pending"
     /\ job' = [job EXCEPT ![path] = "Queued"]
     /\ UNCHANGED <<plan, workerPath, slotPath, cancelled, failure, running>>
@@ -68,6 +69,28 @@ FinishFailure(path) ==
     /\ failure' = TRUE
     /\ UNCHANGED <<plan, running>>
 
+\* Dropbox rejected the download of this one path outright. The executor
+\* records a BlockReason against that plan and stops working on it, without
+\* retry and without touching the batch, so unrelated downloads keep running.
+\* Blocking at install time is modeled by the replay lane.
+FinishPermanent(path) ==
+    /\ running
+    /\ job[path] = "Active"
+    /\ job' = [job EXCEPT ![path] = "Blocked"]
+    /\ plan' = [plan EXCEPT ![path] = "Blocked"]
+    /\ Release(path)
+    /\ UNCHANGED <<cancelled, failure, running>>
+
+\* The reconciler decides a blocked plan is worth another attempt, either
+\* because its retry deadline passed or because the path changed. Until it
+\* does, the durable block outlives every crash.
+Unblock(path) ==
+    /\ running
+    /\ plan[path] = "Blocked"
+    /\ plan' = [plan EXCEPT ![path] = "Pending"]
+    /\ job' = [job EXCEPT ![path] = "Pending"]
+    /\ UNCHANGED <<workerPath, slotPath, cancelled, failure, running>>
+
 CancelQueued(path) ==
     /\ running
     /\ cancelled
@@ -102,7 +125,7 @@ ReportFailure ==
 Crash ==
     /\ running
     /\ job' = [path \in Paths |->
-        IF job[path] \in {"Queued", "Active", "Failed", "Cancelled"}
+        IF job[path] \in {"Queued", "Active", "Failed", "Blocked", "Cancelled"}
         THEN "Pending"
         ELSE job[path]]
     /\ workerPath' = [worker \in Workers |-> NoPath]
@@ -123,6 +146,8 @@ Next ==
         Start(path, worker, slot)
     \/ \E path \in Paths: FinishSuccess(path)
     \/ \E path \in Paths: FinishFailure(path)
+    \/ \E path \in Paths: FinishPermanent(path)
+    \/ \E path \in Paths: Unblock(path)
     \/ \E path \in Paths: CancelQueued(path)
     \/ \E path \in Paths: Install(path)
     \/ \E path \in Paths: Complete(path)
@@ -175,8 +200,39 @@ StagedStable ==
     \A path \in Paths:
         job[path] = "Staged" => job'[path] \in {"Staged", "Installed"}
 
+\* A permanent rejection is confined to its own path: it blocks that plan,
+\* cancels nothing, and leaves every other job and plan exactly as it was.
+PermanentFailureIsolated ==
+    \A path \in Paths:
+        (job[path] # "Blocked" /\ job'[path] = "Blocked")
+        => /\ cancelled' = cancelled
+           /\ failure' = failure
+           /\ plan'[path] = "Blocked"
+           /\ \A other \in Paths \ {path}:
+                /\ job'[other] = job[other]
+                /\ plan'[other] = plan[other]
+
+\* No worker ever picks up a path whose plan is blocked. Not the executor's
+\* own retry, and not the queue after a crash has reset the job: only the
+\* reconciler's Unblock returns the plan to pending first.
+BlockedNotRetried ==
+    \A path \in Paths:
+        plan[path] = "Blocked" => job'[path] \notin {"Queued", "Active"}
+
+\* A crash resets the job but never the block. Only a step that stops the
+\* daemon leaves running false, so this constrains exactly the crash.
+BlockOutlivesCrash ==
+    \A path \in Paths:
+        (plan[path] = "Blocked" /\ ~running') => plan'[path] = "Blocked"
+
 CompletedIsStable == [][CompletedStable]_vars
 
 StagedWorkIsPreserved == [][StagedStable]_vars
+
+PermanentFailureSparesSiblings == [][PermanentFailureIsolated]_vars
+
+BlockedWorkIsNotRetried == [][BlockedNotRetried]_vars
+
+BlockedPlansOutliveCrashes == [][BlockOutlivesCrash]_vars
 
 =============================================================================

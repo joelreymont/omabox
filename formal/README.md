@@ -13,7 +13,11 @@ completed operation.
 
 `DownloadExecutor` checks the bounded worker queue around that lifecycle. It
 covers slot exclusivity, failure cancellation, preservation of successful
-stages, crash recovery, retry, installation, and journal completion.
+stages, crash recovery, retry, installation, and journal completion. It also
+covers the durable per-path block that schema 6 records: a rejected download
+blocks its own plan without cancelling the batch or touching a sibling, no
+worker picks the path up while that plan is blocked, and the block outlives a
+crash, so only the reconciler returning the plan to pending queues it again.
 
 `ScanCoordination` checks that downloads continue while a complete local scan
 runs, but verified-stage promotion cannot mutate the sync root until that scan

@@ -6,7 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use miette::Diagnostic;
@@ -14,6 +14,7 @@ use rustix::fs::{CWD, RenameFlags, renameat_with};
 use thiserror::Error;
 
 use crate::service::{ServiceAction, ServiceCommands, ServiceError};
+use crate::spawn::Launch;
 
 const UNIT: &[u8] = include_bytes!("../packaging/systemd/omabox.service");
 const PLUGIN: [(&str, &[u8]); 4] = [
@@ -102,16 +103,16 @@ struct Sources {
 
 struct Commands {
     services: ServiceCommands,
-    omarchy: PathBuf,
-    omarchy_shell: PathBuf,
+    omarchy: Launch,
+    omarchy_shell: Launch,
 }
 
 impl Default for Commands {
     fn default() -> Self {
         Self {
             services: ServiceCommands::default(),
-            omarchy: PathBuf::from("omarchy"),
-            omarchy_shell: PathBuf::from("omarchy-shell"),
+            omarchy: Launch::Program(PathBuf::from("omarchy")),
+            omarchy_shell: Launch::Program(PathBuf::from("omarchy-shell")),
         }
     }
 }
@@ -249,7 +250,9 @@ fn publish(
 }
 
 fn ensure_shell_unlocked(commands: &Commands) -> Result<(), InstallError> {
-    let output = Command::new(&commands.omarchy_shell)
+    let output = commands
+        .omarchy_shell
+        .command()
         .args(["lock", "isLocked"])
         .stdin(Stdio::null())
         .output()
@@ -551,7 +554,9 @@ fn write_plugin(path: &Path) -> Result<(), InstallError> {
 }
 
 fn validate_plugin(commands: &Commands, path: &Path) -> Result<(), InstallError> {
-    let status = Command::new(&commands.omarchy)
+    let status = commands
+        .omarchy
+        .command()
         .args(["plugin", "validate"])
         .arg(path)
         .stdin(Stdio::null())
@@ -797,8 +802,8 @@ mod tests {
                 omabox: release.join("omabox"),
                 omaboxd: release.join("omaboxd"),
             };
-            test_executable(&sources.omabox, b"#!/bin/sh\necho omabox\n")?;
-            test_executable(&sources.omaboxd, b"#!/bin/sh\necho omaboxd\n")?;
+            release_artifact(&sources.omabox, b"#!/bin/sh\necho omabox\n")?;
+            release_artifact(&sources.omaboxd, b"#!/bin/sh\necho omaboxd\n")?;
 
             let systemctl_log = temporary.path().join("systemctl.log");
             let failed_reload = temporary.path().join("reload.failed");
@@ -806,7 +811,7 @@ mod tests {
             fs::write(
                 &systemctl,
                 format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$2\" >> '{}'\ncase \"$2\" in\n is-active) exit {};;\n is-enabled) exit {};;\n daemon-reload) if [ {} -eq 1 ] && [ ! -e '{}' ]; then : > '{}'; exit 1; fi;;\nesac\nexit 0\n",
+                    "printf '%s\\n' \"$2\" >> '{}'\ncase \"$2\" in\n is-active) exit {};;\n is-enabled) exit {};;\n daemon-reload) if [ {} -eq 1 ] && [ ! -e '{}' ]; then : > '{}'; exit 1; fi;;\nesac\nexit 0\n",
                     systemctl_log.display(),
                     if active { 0 } else { 3 },
                     if enabled { 0 } else { 1 },
@@ -815,28 +820,22 @@ mod tests {
                     failed_reload.display(),
                 ),
             )?;
-            test_permissions(&systemctl)?;
 
             let omarchy_log = temporary.path().join("omarchy.log");
             let omarchy = temporary.path().join("omarchy");
             fs::write(
                 &omarchy,
-                format!(
-                    "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
-                    omarchy_log.display()
-                ),
+                format!("printf '%s\\n' \"$@\" > '{}'\n", omarchy_log.display()),
             )?;
-            test_permissions(&omarchy)?;
             let omarchy_shell = temporary.path().join("omarchy-shell");
-            fs::write(&omarchy_shell, "#!/bin/sh\nprintf 'false\\n'\n")?;
-            test_permissions(&omarchy_shell)?;
+            fs::write(&omarchy_shell, "printf 'false\\n'\n")?;
             Ok(Self {
                 layout: Layout::new(home)?,
                 sources,
                 commands: Commands {
-                    services: ServiceCommands::new(systemctl, "/unused/journalctl"),
-                    omarchy,
-                    omarchy_shell,
+                    services: ServiceCommands::scripts(systemctl, "/unused/journalctl"),
+                    omarchy: Launch::Script(omarchy),
+                    omarchy_shell: Launch::Script(omarchy_shell),
                 },
                 systemctl_log,
                 omarchy_log,
@@ -858,12 +857,9 @@ mod tests {
         }
     }
 
-    fn test_executable(path: &Path, contents: &[u8]) -> Result<(), Box<dyn Error>> {
+    /// Write a release artifact the installer copies but never runs.
+    fn release_artifact(path: &Path, contents: &[u8]) -> Result<(), Box<dyn Error>> {
         fs::write(path, contents)?;
-        test_permissions(path)
-    }
-
-    fn test_permissions(path: &Path) -> Result<(), Box<dyn Error>> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
         Ok(())
     }
@@ -985,8 +981,7 @@ mod tests {
     fn validation_failure_changes_nothing_live() -> Result<(), Box<dyn Error>> {
         let fixture = Fixture::new(true, true, false)?;
         fixture.old_install()?;
-        fs::write(&fixture.commands.omarchy, "#!/bin/sh\nexit 9\n")?;
-        test_permissions(&fixture.commands.omarchy)?;
+        fs::write(fixture.commands.omarchy.path(), "exit 9\n")?;
         let result = execute_with(
             InstallAction::Install,
             &fixture.layout,
@@ -994,13 +989,16 @@ mod tests {
             &fixture.commands,
         );
 
-        assert!(matches!(
-            result,
-            Err(InstallError::CommandFailed {
-                status: Some(9),
-                ..
-            })
-        ));
+        assert!(
+            matches!(
+                result,
+                Err(InstallError::CommandFailed {
+                    status: Some(9),
+                    ..
+                })
+            ),
+            "plugin validation reported {result:?}"
+        );
         assert_eq!(fs::read(&fixture.layout.omabox)?, b"old");
         assert_eq!(fs::read(fixture.layout.plugin.join("old.qml"))?, b"old");
         assert!(!fixture.systemctl_log.exists());
@@ -1029,11 +1027,7 @@ mod tests {
     fn locked_shell_prevents_any_live_artifact_change() -> Result<(), Box<dyn Error>> {
         let fixture = Fixture::new(true, true, false)?;
         fixture.old_install()?;
-        fs::write(
-            &fixture.commands.omarchy_shell,
-            "#!/bin/sh\nprintf 'true\\n'\n",
-        )?;
-        test_permissions(&fixture.commands.omarchy_shell)?;
+        fs::write(fixture.commands.omarchy_shell.path(), "printf 'true\\n'\n")?;
         let result = execute_with(
             InstallAction::Upgrade,
             &fixture.layout,
@@ -1054,15 +1048,14 @@ mod tests {
         fixture.old_install()?;
         let lock_checks = fixture._temporary.path().join("lock-checks");
         fs::write(
-            &fixture.commands.omarchy_shell,
+            fixture.commands.omarchy_shell.path(),
             format!(
-                "#!/bin/sh\ncount=0\nif [ -f '{}' ]; then read count < '{}'; fi\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > '{}'\nif [ \"$count\" -lt 3 ]; then printf 'false\\n'; else printf 'true\\n'; fi\n",
+                "count=0\nif [ -f '{}' ]; then read count < '{}'; fi\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > '{}'\nif [ \"$count\" -lt 3 ]; then printf 'false\\n'; else printf 'true\\n'; fi\n",
                 lock_checks.display(),
                 lock_checks.display(),
                 lock_checks.display(),
             ),
         )?;
-        test_permissions(&fixture.commands.omarchy_shell)?;
 
         let result = execute_with(
             InstallAction::Uninstall,

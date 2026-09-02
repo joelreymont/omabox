@@ -624,7 +624,6 @@ enum CliError {
 mod tests {
     use std::error::Error;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt as _;
 
     use omabox::journal::{LocalRootBinding, PlanWrite};
     use omabox::model::{
@@ -637,6 +636,10 @@ mod tests {
         values.iter().map(OsString::from).collect()
     }
 
+    /// Write a `systemctl` stand-in without the executable bit.
+    ///
+    /// `ServiceCommands::scripts` reads it through `/bin/sh`, so writing one
+    /// can never collide with a concurrent spawn in the test binary.
     fn fake_systemctl(
         directory: &Path,
         active: bool,
@@ -647,11 +650,10 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$2\" >> '{}'\nif [ \"$2\" = is-active ]; then exit {active_status}; fi\nexit 0\n",
+                "printf '%s\\n' \"$2\" >> '{}'\nif [ \"$2\" = is-active ]; then exit {active_status}; fi\nexit 0\n",
                 log.display()
             ),
         )?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
         Ok(path)
     }
 
@@ -839,7 +841,7 @@ mod tests {
 
         let service_log = temporary.path().join("service.log");
         let systemctl = fake_systemctl(temporary.path(), true, &service_log)?;
-        let services = ServiceCommands::new(systemctl, "/unused/journalctl");
+        let services = ServiceCommands::scripts(systemctl, "/unused/journalctl");
         assert!(matches!(
             set_sync_root(&second, &xdg, &services),
             Err(CliError::PendingWork)
@@ -858,7 +860,7 @@ mod tests {
         let _held_lock = InstanceLock::acquire(config.paths().lock_file())?;
         let service_log = temporary.path().join("service.log");
         let systemctl = fake_systemctl(temporary.path(), false, &service_log)?;
-        let services = ServiceCommands::new(systemctl, "/unused/journalctl");
+        let services = ServiceCommands::scripts(systemctl, "/unused/journalctl");
 
         assert!(matches!(
             set_sync_root(&second, &xdg, &services),
@@ -900,7 +902,7 @@ mod tests {
 
         let service_log = temporary.path().join("service.log");
         let systemctl = fake_systemctl(temporary.path(), false, &service_log)?;
-        let services = ServiceCommands::new(systemctl, "/unused/journalctl");
+        let services = ServiceCommands::scripts(systemctl, "/unused/journalctl");
         set_sync_root(&second, &xdg, &services)?;
         assert_eq!(Config::load_from(&xdg)?.sync_root(), second);
         assert_eq!(fs::read_to_string(service_log)?, "is-active\n");
