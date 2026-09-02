@@ -116,9 +116,15 @@ includes blocked plans (their stages stay referenced).
 
 - Symlink, FIFO, socket, device, unknown type: `Unknown(Unsupported)` record,
   continue.
-- `EACCES`/`EPERM`/`EIO`/`ENXIO` on probe, open, stat, or read of an entry:
-  `Unknown(Inaccessible)` record for that entry, continue. For a directory the
-  record is the directory itself; nothing beneath it is published.
+- Every error raised while observing one entry (probe, open, stat, read,
+  hash, reopen) is scoped to that entry: `ENOENT`, `ENOTDIR`, `ELOOP`, and
+  `ESTALE` mean the object changed between two steps of its own observation
+  and become `Unknown(Incomplete)`; every other errno becomes
+  `Unknown(Inaccessible)`; only resource exhaustion (`EMFILE`, `ENFILE`,
+  `ENOMEM`, `ENOSPC`) and root-level failures propagate as `LocalError`. For
+  a directory the record is the directory itself; nothing beneath it is
+  published. Cache rows validated in this pass beneath a discarded subtree are
+  retained, so churn never forces a rehash.
 - A directory whose before/after stat differs: `Unknown(Incomplete)` record for
   the directory; every observation already collected beneath it is discarded
   from this publication. The scan still publishes.
@@ -129,16 +135,18 @@ Hash stage: a file that fails with `EIO`/`EACCES` during hashing becomes
 
 Reconciler ancestor rule, applied to both sides in `reconcile_published`:
 when a visited canonical path has no record on one side, the observation for
-that side is the nearest ancestor record's `Unknown(reason)` if that ancestor
-is `Unknown`, otherwise `ConfirmedAbsent`. Lookup is a binary search per
-ancestor over the side's sorted records, performed only for paths lacking a
-record. `FreshObservationRequired` is no longer produced by directory churn;
+that side is `Unknown(reason)` if ANY recorded ancestor on that side is
+`Unknown` (the nearest such ancestor supplies the reason), otherwise
+`ConfirmedAbsent`. The rule walks every ancestor to the root so its safety
+never depends on a producer keeping records out from under an `Unknown`
+directory. Lookup is a binary search per ancestor over the side's sorted
+records, performed only for paths lacking a record. `FreshObservationRequired` is no longer produced by directory churn;
 the remaining producers (case renames, destination races) are rare, and the
 daemon waits one second before re-entering the pass after one.
 
-Mount points (M11): a directory whose `st_dev` differs from the sync root's
-device is published as `Unknown(Unsupported)` and nothing beneath it is
-scanned, exactly like a symlink. Content on another volume is therefore never
+Mount points (M11): a directory or file whose `st_dev` differs from the sync
+root's device is published as `Unknown(Unsupported)` and nothing beneath a
+directory is scanned, exactly like a symlink. Content on another volume is therefore never
 synchronized, so an unmounted mount point is an ordinary empty directory with
 no baselines beneath it and nothing to infer. This is a scope decision, not a
 technical necessity: installs already stage beside their target, so
