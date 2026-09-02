@@ -23,6 +23,9 @@ use thiserror::Error;
 const LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const STATUS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(5);
+/// Settling time before observing again, so a path that is still being written
+/// cannot spin the pass on its own changes.
+const FRESH_OBSERVATION_DELAY: Duration = Duration::from_secs(1);
 
 fn main() -> miette::Result<()> {
     if let Err(error) = initialize_logging() {
@@ -179,6 +182,7 @@ fn run_session(
             }
             ReconcileOutcome::FreshObservationRequired { .. } => {
                 tracing::info!("local state changed during reconciliation");
+                wait_in_phase(FRESH_OBSERVATION_DELAY, status, DaemonPhase::Syncing);
                 continue;
             }
             ReconcileOutcome::LocalRootChanged => {

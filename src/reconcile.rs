@@ -25,8 +25,9 @@ use crate::local::{
     rename_file_copy, scan_and_publish, stage_upload, upload_source_changed,
 };
 use crate::model::{
-    Baseline, CanonicalPath, Conflict, ContentIdentity, Decision, DirectoryCollision, Observation,
-    Operation, OperationPlan, RemoteFile,
+    Baseline, CanonicalPath, Conflict, ContentIdentity, Decision, DirectoryCollision,
+    LocalObservation, Observation, Operation, OperationPlan, RemoteFile, RemoteObservation,
+    UnknownReason,
 };
 use crate::planner::plan;
 use crate::recovery::{
@@ -751,12 +752,22 @@ fn reconcile_published(
                 Some((path, baseline)) => (Some(path), baseline),
                 None => (None, Baseline::Absent),
             };
-            let absent_local = Observation::ConfirmedAbsent;
-            let local_observation =
-                local_record.map_or(&absent_local, |record| &record.observation);
-            let absent_remote = Observation::ConfirmedAbsent;
-            let remote_observation =
-                remote_record.map_or(&absent_remote, |record| &record.observation);
+            let unobserved_local;
+            let local_observation = match local_record {
+                Some(record) => &record.observation,
+                None => {
+                    unobserved_local = local_unobserved(&local, canonical_path);
+                    &unobserved_local
+                }
+            };
+            let unobserved_remote;
+            let remote_observation = match remote_record {
+                Some(record) => &record.observation,
+                None => {
+                    unobserved_remote = remote_unobserved(&remote, canonical_path);
+                    &unobserved_remote
+                }
+            };
             let path = local_record
                 .map(|record| record.path.clone())
                 .or_else(|| remote_record.map(|record| record.path.clone()))
@@ -1339,6 +1350,89 @@ fn local_map(
     Ok(mapped)
 }
 
+/// Observation for a local path the scan published no record for.
+fn local_unobserved(
+    local: &[(CanonicalPath, LocalObservationRecord)],
+    canonical_path: &CanonicalPath,
+) -> LocalObservation {
+    unobserved(ancestor_unknown(
+        local,
+        canonical_path,
+        |(canonical_path, _)| canonical_path,
+        |(_, record)| observed_unknown(&record.observation),
+    ))
+}
+
+/// Observation for a remote path the durable listing holds no record for.
+fn remote_unobserved(
+    remote: &[RemoteObservationRecord],
+    canonical_path: &CanonicalPath,
+) -> RemoteObservation {
+    unobserved(ancestor_unknown(
+        remote,
+        canonical_path,
+        |record| &record.canonical_path,
+        |record| observed_unknown(&record.observation),
+    ))
+}
+
+/// Observation for a path one side holds no record for.
+///
+/// A missing record only proves absence when every ancestor was observed
+/// completely. Beneath an unknown directory the scan or the listing never
+/// looked, so the path inherits that reason and the planner blocks instead of
+/// inferring a deletion from state nobody observed.
+fn unobserved<T>(reason: Option<UnknownReason>) -> Observation<T> {
+    match reason {
+        Some(reason) => Observation::Unknown(reason),
+        None => Observation::ConfirmedAbsent,
+    }
+}
+
+/// Reason held by any recorded ancestor that was not observed completely.
+///
+/// A missing record proves absence only when every ancestor above it was
+/// observed completely, so the walk climbs to the root rather than stopping at
+/// the first ancestor that happens to have a record. Whichever producer put a
+/// record beneath an unknown directory, it can never turn that directory's
+/// descendants back into confirmed absence.
+///
+/// Records are sorted by canonical bytes, so each ancestor is one binary
+/// search over the byte prefix ending at a separator.
+fn ancestor_unknown<T>(
+    records: &[T],
+    canonical_path: &CanonicalPath,
+    key: impl Fn(&T) -> &CanonicalPath,
+    reason: impl Fn(&T) -> Option<UnknownReason>,
+) -> Option<UnknownReason> {
+    let mut ancestor = parent_bytes(canonical_path.as_bytes());
+    while let Some(bytes) = ancestor {
+        if let Ok(index) = records.binary_search_by(|record| key(record).as_bytes().cmp(bytes))
+            && let Some(found) = records.get(index).and_then(&reason)
+        {
+            return Some(found);
+        }
+        ancestor = parent_bytes(bytes);
+    }
+    None
+}
+
+/// Canonical bytes of a path's parent, or `None` at a path with no parent.
+///
+/// Splitting from the right yields the last component first, so the remainder
+/// is the parent and its absence ends the climb. No index is computed, so the
+/// walk cannot end early on arithmetic that fails open into absence.
+fn parent_bytes(path: &[u8]) -> Option<&[u8]> {
+    path.rsplitn(2, |byte| *byte == b'/').nth(1)
+}
+
+fn observed_unknown<T>(observation: &Observation<T>) -> Option<UnknownReason> {
+    match observation {
+        Observation::Unknown(reason) => Some(*reason),
+        Observation::Present(_) | Observation::Directory | Observation::ConfirmedAbsent => None,
+    }
+}
+
 fn find_local<'a>(
     records: &'a [(CanonicalPath, LocalObservationRecord)],
     canonical_path: &CanonicalPath,
@@ -1770,7 +1864,7 @@ mod tests {
     }
 
     use crate::journal::{NoOpWrite, PlanWrite};
-    use crate::model::{ContentIdentity, DropboxRevision, LocalFile, RemoteFile};
+    use crate::model::{BlockedReason, ContentIdentity, DropboxRevision, LocalFile, RemoteFile};
 
     fn identity(bytes: &[u8]) -> Result<ContentIdentity, Box<dyn Error>> {
         Ok(dropbox_content_hash(Cursor::new(bytes))?)
@@ -1790,6 +1884,219 @@ mod tests {
         };
         if journal.record_noop(path, &noop)? != NoOpWrite::Recorded {
             return Err(std::io::Error::other("matching baseline was not recorded").into());
+        }
+        Ok(())
+    }
+
+    fn canonical(path: &str) -> CanonicalPath {
+        CanonicalPath::from_display(Path::new(path))
+    }
+
+    fn local_side(
+        records: impl IntoIterator<Item = (PathBuf, LocalObservation)>,
+    ) -> Result<Vec<(CanonicalPath, LocalObservationRecord)>, ReconcileError> {
+        local_map(
+            records
+                .into_iter()
+                .map(|(path, observation)| LocalObservationRecord { path, observation })
+                .collect(),
+        )
+    }
+
+    fn remote_side(
+        records: impl IntoIterator<Item = (PathBuf, RemoteObservation)>,
+    ) -> Vec<RemoteObservationRecord> {
+        remote_map(
+            records
+                .into_iter()
+                .map(|(path, observation)| RemoteObservationRecord {
+                    canonical_path: CanonicalPath::from_display(&path),
+                    path,
+                    observation,
+                })
+                .collect(),
+        )
+    }
+
+    fn present_locally(bytes: &[u8]) -> Result<LocalObservation, Box<dyn Error>> {
+        Ok(Observation::Present(LocalFile::new(identity(bytes)?)))
+    }
+
+    #[test]
+    fn a_path_below_an_unknown_directory_inherits_its_reason() -> Result<(), Box<dyn Error>> {
+        let local = local_side([
+            (
+                PathBuf::from("locked"),
+                Observation::Unknown(UnknownReason::Inaccessible),
+            ),
+            (PathBuf::from("open"), Observation::Directory),
+            (PathBuf::from("open/kept.txt"), present_locally(b"kept")?),
+        ])?;
+
+        for path in ["locked/secret.txt", "Locked/Deep/Deeper.TXT"] {
+            assert_eq!(
+                local_unobserved(&local, &canonical(path)),
+                Observation::Unknown(UnknownReason::Inaccessible),
+                "{path} did not inherit the unknown directory"
+            );
+        }
+        for path in ["gone.txt", "open/gone.txt", "open/kept.txt/below"] {
+            assert_eq!(
+                local_unobserved(&local, &canonical(path)),
+                Observation::ConfirmedAbsent,
+                "{path} was not confirmed absent"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_record_below_an_unknown_directory_cannot_restore_absence() -> Result<(), Box<dyn Error>> {
+        // Some producer listed `volume/listed` even though `volume` itself was
+        // never observed completely. Stopping the climb at the first ancestor
+        // that happens to hold a record would read the rest of that subtree as
+        // absent and delete it; the rule therefore climbs to the root.
+        let remote = remote_side([
+            (
+                PathBuf::from("volume"),
+                Observation::Unknown(UnknownReason::Unsupported),
+            ),
+            (PathBuf::from("volume/listed"), Observation::Directory),
+        ]);
+
+        for path in [
+            "volume/gone.txt",
+            "volume/listed/gone.txt",
+            "volume/listed/deeper/gone.txt",
+        ] {
+            assert_eq!(
+                remote_unobserved(&remote, &canonical(path)),
+                Observation::Unknown(UnknownReason::Unsupported),
+                "{path} was read as absent below an unknown directory"
+            );
+        }
+
+        // With every ancestor observed completely the same paths are absent.
+        let complete = remote_side([
+            (PathBuf::from("volume"), Observation::Directory),
+            (PathBuf::from("volume/listed"), Observation::Directory),
+        ]);
+        for path in ["volume/gone.txt", "volume/listed/deeper/gone.txt"] {
+            assert_eq!(
+                remote_unobserved(&complete, &canonical(path)),
+                Observation::ConfirmedAbsent,
+                "{path} was not confirmed absent below a complete listing"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn names_that_neighbor_the_separator_are_not_ancestors() -> Result<(), Box<dyn Error>> {
+        let unreadable = OsString::from_vec(b"unreadable\xff".to_vec());
+        let local = local_side([
+            (
+                PathBuf::from("report"),
+                Observation::Unknown(UnknownReason::Incomplete),
+            ),
+            (PathBuf::from("report.txt"), present_locally(b"report")?),
+            (PathBuf::from("report0"), Observation::Directory),
+            (
+                PathBuf::from(&unreadable),
+                Observation::Unknown(UnknownReason::Inaccessible),
+            ),
+        ])?;
+
+        for path in ["report/x", "REPORT/x/y"] {
+            assert_eq!(
+                local_unobserved(&local, &canonical(path)),
+                Observation::Unknown(UnknownReason::Incomplete),
+                "{path} did not inherit the incomplete directory"
+            );
+        }
+        let below_unreadable = OsString::from_vec([unreadable.as_bytes(), b"/x"].concat());
+        assert_eq!(
+            local_unobserved(
+                &local,
+                &CanonicalPath::from_display(Path::new(&below_unreadable))
+            ),
+            Observation::Unknown(UnknownReason::Inaccessible)
+        );
+        for path in [
+            "report.txt/x",
+            "report0/x",
+            "reportx/y",
+            "report",
+            "unreadable/x",
+        ] {
+            assert_eq!(
+                local_unobserved(&local, &canonical(path)),
+                Observation::ConfirmedAbsent,
+                "{path} borrowed a reason from a name that is not its ancestor"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_unknown_ancestor_blocks_a_deletion_on_either_side() -> Result<(), Box<dyn Error>> {
+        let file = RemoteFile::new(identity(b"secret")?, DropboxRevision::new("rev-secret"));
+        let baseline = Baseline::Present(file.clone());
+        let below = canonical("locked/secret.txt");
+        for reason in [
+            UnknownReason::Inaccessible,
+            UnknownReason::Unsupported,
+            UnknownReason::Incomplete,
+        ] {
+            let unknown_local =
+                local_side([(PathBuf::from("locked"), Observation::Unknown(reason))])?;
+            let listed_remote = remote_side([
+                (PathBuf::from("locked"), Observation::Directory),
+                (
+                    PathBuf::from("locked/secret.txt"),
+                    Observation::Present(file.clone()),
+                ),
+            ]);
+            let decision = plan(
+                &baseline,
+                &local_unobserved(&unknown_local, &below),
+                &match find_remote(&listed_remote, &below) {
+                    Some(record) => record.observation.clone(),
+                    None => remote_unobserved(&listed_remote, &below),
+                },
+            );
+            assert!(
+                matches!(
+                    decision,
+                    Decision::Blocked(BlockedReason::LocalUnknown(blocked)) if blocked == reason
+                ),
+                "an unreadable local directory planned {decision:?} for a path beneath it"
+            );
+
+            let scanned_local = local_side([
+                (PathBuf::from("locked"), Observation::Directory),
+                (
+                    PathBuf::from("locked/secret.txt"),
+                    present_locally(b"secret")?,
+                ),
+            ])?;
+            let unknown_remote =
+                remote_side([(PathBuf::from("locked"), Observation::Unknown(reason))]);
+            let decision = plan(
+                &baseline,
+                &match find_local(&scanned_local, &below) {
+                    Some(record) => record.observation.clone(),
+                    None => local_unobserved(&scanned_local, &below),
+                },
+                &remote_unobserved(&unknown_remote, &below),
+            );
+            assert!(
+                matches!(
+                    decision,
+                    Decision::Blocked(BlockedReason::RemoteUnknown(blocked)) if blocked == reason
+                ),
+                "an unknown Dropbox directory planned {decision:?} for a path beneath it"
+            );
         }
         Ok(())
     }

@@ -1,9 +1,11 @@
 ---
 title: Publish unsupported and inaccessible entries as Unknown
-status: active
+status: closed
 priority: 1
 issue-type: task
-created-at: "\"2026-09-02T11:28:11.354934+02:00\""
+created-at: "\"\\\"2026-09-02T11:28:11.354934+02:00\\\"\""
+closed-at: "2026-09-02T17:27:08.931846+02:00"
+close-reason: "landed as change xlluxllv (Publish unsupported and inaccessible scan entries); destruction findings fixed (entry-scoped errno rule, any-ancestor blocking, retained cache rows, file device rule); gates green at merged tip: fmt, clippy -D warnings, 261 tests"
 blocks:
   - omabox-order-canonical-paths-6ffaf324
 ---

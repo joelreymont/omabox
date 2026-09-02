@@ -13,3 +13,9 @@ pub mod recovery;
 pub mod runtime_status;
 pub mod service;
 pub mod status;
+
+/// Filesystem helpers shared with the integration tests, which declare the
+/// same file as an ordinary module of their own.
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod common;

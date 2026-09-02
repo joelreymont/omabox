@@ -1,3 +1,5 @@
+mod common;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::ffi::OsString;
@@ -12,6 +14,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use common::{allow_owner_access, deny_all_access};
 use omabox::auth::{AccessToken, AuthError, OAuthClient, RefreshToken};
 use omabox::dropbox::{
     DropboxClient, DropboxEndpoints, DropboxError, DropboxLink, DropboxRoot, InventoryRefresh,
@@ -4514,6 +4517,104 @@ fn file_beside_a_same_named_directory_still_uploads_a_local_edit() -> Result<(),
         })
     );
     drop(fixture.directory);
+    Ok(())
+}
+
+#[test]
+fn inaccessible_directory_never_deletes_its_dropbox_contents() -> Result<(), Box<dyn Error>> {
+    let secret_bytes = b"secret baseline bytes";
+    let secret = RemoteFile::new(
+        dropbox_content_hash(secret_bytes.as_slice())?,
+        DropboxRevision::new("rev-secret"),
+    );
+    let upload_bytes = b"sibling upload";
+    let upload_content = dropbox_content_hash(upload_bytes.as_slice())?;
+    let uploaded = RemoteFile::new(upload_content.clone(), DropboxRevision::new("rev-open"));
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [
+                folder_metadata("/locked", "/locked"),
+                file_metadata(
+                    "/locked/secret.txt",
+                    "/locked/secret.txt",
+                    secret.revision.as_str(),
+                    &secret.content,
+                ),
+            ],
+            "cursor": "cursor-locked",
+            "has_more": false
+        })),
+        FakeResponse::json(file_metadata(
+            "/open.txt",
+            "/open.txt",
+            uploaded.revision.as_str(),
+            &upload_content,
+        ))
+        .for_path("/2/files/upload"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-inaccessible")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(root.join("locked"))?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("locked/secret.txt"), secret_bytes)?;
+    std::fs::write(root.join("open.txt"), upload_bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_directory_baseline(&mut journal, Path::new("locked"))?;
+    seed_baseline(&mut journal, Path::new("locked/secret.txt"), &secret)?;
+    deny_all_access(&root.join("locked"))?;
+
+    let outcome = reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    );
+    allow_owner_access(&root.join("locked"))?;
+    let report = complete_report(outcome?)?;
+
+    assert_eq!(report.planned, 1);
+    assert_eq!(report.replayed_operations, 1);
+    assert_eq!(report.blocked, 2);
+    assert_eq!(report.conflicts, 0);
+    assert_eq!(
+        journal.baseline(Path::new("locked"))?,
+        Some(Baseline::Directory)
+    );
+    assert_eq!(
+        journal.baseline(Path::new("locked/secret.txt"))?,
+        Some(Baseline::Present(secret))
+    );
+    assert_eq!(
+        journal.baseline(Path::new("open.txt"))?,
+        Some(Baseline::Present(uploaded))
+    );
+    assert_eq!(std::fs::read(root.join("locked/secret.txt"))?, secret_bytes);
+    assert!(journal.conflicts()?.is_empty());
+
+    let requests = server.finish()?;
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.path == "/2/files/delete_v2"),
+        "an inaccessible directory planned a Dropbox deletion"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.path == "/2/files/upload")
+    );
     Ok(())
 }
 

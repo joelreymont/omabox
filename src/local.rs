@@ -19,6 +19,7 @@ use rustix::fs::{
     fgetxattr, fremovexattr, fsetxattr, fstat, fstatvfs, fsync, linkat, mkdirat, openat2,
     renameat_with, unlinkat,
 };
+use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -208,6 +209,8 @@ struct PendingScan {
     directories: Vec<ScannedDirectory>,
     observations: Vec<LocalObservationRecord>,
     cached_files: Vec<LocalHashRecord>,
+    /// Cached hashes the walk validated beneath a discarded entry.
+    retained: Vec<LocalHashRecord>,
     hash_jobs: Vec<HashJob>,
 }
 
@@ -215,8 +218,60 @@ struct PendingScan {
 struct ScanEntries {
     observations: Vec<LocalObservationRecord>,
     cached_files: Vec<LocalHashRecord>,
+    /// Cached hashes validated beneath an entry the walk later discarded.
+    retained: Vec<LocalHashRecord>,
     directories: Vec<ScannedDirectory>,
     hash_jobs: Vec<HashJob>,
+}
+
+/// Every collection length before one entry was scanned.
+///
+/// The walk is depth first, so everything an entry contributes is a suffix of
+/// each collection and one truncation discards its whole subtree.
+#[derive(Clone, Copy)]
+struct ScanMark {
+    observations: usize,
+    cached_files: usize,
+    directories: usize,
+    hash_jobs: usize,
+}
+
+impl ScanEntries {
+    fn mark(&self) -> ScanMark {
+        ScanMark {
+            observations: self.observations.len(),
+            cached_files: self.cached_files.len(),
+            directories: self.directories.len(),
+            hash_jobs: self.hash_jobs.len(),
+        }
+    }
+
+    fn truncate(&mut self, mark: ScanMark) {
+        self.observations.truncate(mark.observations);
+        // A cached hash was validated against the very file it names before
+        // the walk reached the entry that failed, so it stays reusable even
+        // though the observation it belongs to leaves this publication.
+        // Dropping it would rehash an untouched subtree on every later pass.
+        let kept = mark.cached_files.min(self.cached_files.len());
+        self.retained.extend(self.cached_files.drain(kept..));
+        self.directories.truncate(mark.directories);
+        self.hash_jobs.truncate(mark.hash_jobs);
+    }
+
+    fn unknown(&mut self, path: PathBuf, reason: UnknownReason) {
+        self.observations.push(LocalObservationRecord {
+            path,
+            observation: Observation::Unknown(reason),
+        });
+    }
+}
+
+/// Inputs every recursive scan step reads and none of them changes.
+struct ScanContext<'a> {
+    cache: &'a [LocalHashRecord],
+    cutoff: Option<HashCacheCutoff>,
+    /// Device of the sync root; a directory on any other device is out of scope.
+    root_device: u64,
 }
 
 struct ScannedDirectory {
@@ -235,7 +290,7 @@ struct HashWorkerOutput {
 
 struct ScanHashResults {
     records: Vec<ScannedHash>,
-    changed: Vec<PathBuf>,
+    unknown: Vec<(PathBuf, UnknownReason)>,
 }
 
 struct ScannedHash {
@@ -711,10 +766,11 @@ fn current_hash_cache_cutoff() -> Option<HashCacheCutoff> {
 
 /// Scan the complete root through no-follow, descriptor-relative opens.
 ///
-/// Any inaccessible, changing, symlinked, magic-linked, or special entry
-/// fails the whole scan. Callers therefore cannot confuse a partial walk with
-/// confirmed absence. Directories are published as first-class observations
-/// while their contents are scanned recursively.
+/// An inaccessible, changing, symlinked, magic-linked, or special entry is
+/// published as an `Unknown` observation and nothing beneath it is published,
+/// so a partial walk is never confused with confirmed absence. Only failures
+/// of the root itself fail the scan. Directories are published as first-class
+/// observations while their contents are scanned recursively.
 #[cfg(test)]
 fn scan(root: impl AsRef<Path>) -> Result<CompleteScan, LocalError> {
     scan_with_cache_and_workers_at(root, &[], MAX_PARALLEL_HASHES, None)
@@ -755,8 +811,36 @@ fn enumerate_scan(
 ) -> Result<PendingScan, LocalError> {
     let root_fd = open_absolute_directory(root, "open sync root for scan")?;
     let before = stat_fd(&root_fd, root, "inspect sync root before scan")?;
+    let root_device = before.st_dev;
+    enumerate_scan_on_device(root, root_fd, before, cache, cache_cutoff, root_device)
+}
+
+/// Enumerate a root whose every entry is treated as a foreign volume.
+#[cfg(test)]
+fn enumerate_scan_across_devices(root: &Path) -> Result<PendingScan, LocalError> {
+    let root_fd = open_absolute_directory(root, "open sync root for scan")?;
+    let before = stat_fd(&root_fd, root, "inspect sync root before scan")?;
+    let foreign = before.st_dev ^ 1;
+    enumerate_scan_on_device(root, root_fd, before, &[], None, foreign)
+}
+
+/// Enumerate every entry that lives on `root_device`, treating any other
+/// device as an unsupported subtree.
+fn enumerate_scan_on_device(
+    root: &Path,
+    root_fd: OwnedFd,
+    before: rustix::fs::Stat,
+    cache: &[LocalHashRecord],
+    cache_cutoff: Option<HashCacheCutoff>,
+    root_device: u64,
+) -> Result<PendingScan, LocalError> {
+    let context = ScanContext {
+        cache,
+        cutoff: cache_cutoff,
+        root_device,
+    };
     let mut entries = ScanEntries::default();
-    scan_directory(&root_fd, Path::new(""), cache, cache_cutoff, &mut entries)?;
+    scan_directory(&root_fd, Path::new(""), &context, &mut entries)?;
     entries
         .directories
         .sort_by(|left, right| left.path.cmp(&right.path));
@@ -771,6 +855,7 @@ fn enumerate_scan(
         directories: entries.directories,
         observations: entries.observations,
         cached_files: entries.cached_files,
+        retained: entries.retained,
         hash_jobs: entries.hash_jobs,
     })
 }
@@ -793,8 +878,9 @@ fn finish_scan_at(
     )?;
     let cached = revalidate_cached_files(&pending.root_fd, pending.cached_files)?;
     hashed.records.extend(cached.records);
-    hashed.changed.extend(cached.changed);
-    let mut reusable_hashes = Vec::with_capacity(hashed.records.len());
+    hashed.unknown.extend(cached.unknown);
+    let mut reusable_hashes = pending.retained;
+    reusable_hashes.reserve(hashed.records.len());
     for scanned in hashed.records {
         let record = scanned.record;
         pending.observations.push(LocalObservationRecord {
@@ -805,16 +891,19 @@ fn finish_scan_at(
             reusable_hashes.push(record);
         }
     }
-    pending.observations.extend(
-        hashed
-            .changed
-            .into_iter()
-            .map(|path| LocalObservationRecord {
-                path,
-                observation: Observation::Unknown(UnknownReason::Incomplete),
-            }),
-    );
-    revalidate_directories(&pending.root_fd, &pending.directories)?;
+    pending
+        .observations
+        .extend(
+            hashed
+                .unknown
+                .into_iter()
+                .map(|(path, reason)| LocalObservationRecord {
+                    path,
+                    observation: Observation::Unknown(reason),
+                }),
+        );
+    let unscanned = revalidate_directories(&pending.root_fd, &pending.directories)?;
+    discard_unknown_subtrees(&mut pending.observations, &unscanned);
     let rebound = open_absolute_directory(&pending.root, "reopen sync root after scan")?;
     let rebound_stat = stat_fd(
         &rebound,
@@ -2586,8 +2675,7 @@ pub(crate) fn verify_private_copy(
 fn scan_directory(
     directory: &OwnedFd,
     relative: &Path,
-    cache: &[LocalHashRecord],
-    cache_cutoff: Option<HashCacheCutoff>,
+    context: &ScanContext<'_>,
     entries: &mut ScanEntries,
 ) -> Result<(), LocalError> {
     let before = stat_fd(directory, relative, "inspect directory before scan")?;
@@ -2604,73 +2692,18 @@ fn scan_directory(
     names.sort();
 
     for name in names {
-        let path = relative.join(&name);
-        let probe = openat2(
-            directory,
-            &name,
-            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-            BELOW_ROOT,
-        )
-        .map_err(|source| syscall_failure("inspect directory entry", &path, source))?;
-        let probe_stat = stat_fd(&probe, &path, "inspect directory entry type")?;
-        match FileType::from_raw_mode(probe_stat.st_mode) {
-            FileType::RegularFile => {
-                if is_reserved_artifact_name(&name) {
-                    entries.observations.push(LocalObservationRecord {
-                        path,
-                        observation: Observation::Unknown(UnknownReason::Unsupported),
-                    });
-                    continue;
-                }
-                let file = open_relative_at(directory, &name, &path, OFlags::RDONLY)?;
-                let opened = stat_fd(&file, &path, "inspect opened scan file")?;
-                if !same_inode(&probe_stat, &opened) {
-                    entries.observations.push(LocalObservationRecord {
-                        path,
-                        observation: Observation::Unknown(UnknownReason::Incomplete),
-                    });
-                    continue;
-                }
-                let fingerprint = file_fingerprint(&opened, &path)?;
-                match cached_hash(cache, &path) {
-                    Some(record)
-                        if record.fingerprint == fingerprint
-                            && hash_is_reusable(record, cache_cutoff) =>
-                    {
-                        entries.cached_files.push(LocalHashRecord {
-                            path,
-                            fingerprint,
-                            content: record.content.clone(),
-                        });
-                    }
-                    Some(_) | None => {
-                        entries.hash_jobs.push(HashJob { path, fingerprint });
-                    }
-                }
-            }
-            FileType::Directory => {
-                let child = open_directory_at(directory, &name, &path)?;
-                let opened = stat_fd(&child, &path, "inspect opened scan directory")?;
-                if !same_inode(&probe_stat, &opened) {
-                    return Err(LocalError::ChangedDuringRead {
-                        operation: "open scanned directory",
-                        path,
-                    });
-                }
-                entries.observations.push(LocalObservationRecord {
-                    path: path.clone(),
-                    observation: Observation::Directory,
-                });
-                scan_directory(&child, &path, cache, cache_cutoff, entries)?;
-            }
-            FileType::Symlink
-            | FileType::Fifo
-            | FileType::Socket
-            | FileType::CharacterDevice
-            | FileType::BlockDevice
-            | FileType::Unknown => return Err(LocalError::UnsupportedObject { path }),
-        }
+        let mark = entries.mark();
+        let Err(error) = scan_entry(directory, &name, relative.join(&name), context, entries)
+        else {
+            continue;
+        };
+        // One entry never fails the pass: it is published as unknown and
+        // everything the walk collected beneath it leaves this publication.
+        // The failure owns the path it concerns, so the walk never keeps a
+        // second copy of a name it will almost always hand straight on.
+        let (path, reason) = walk_unknown(error)?;
+        entries.truncate(mark);
+        entries.unknown(path, reason);
     }
     let after = stat_fd(directory, relative, "inspect directory after scan")?;
     if !same_observation(&before, &after) {
@@ -2684,6 +2717,209 @@ fn scan_directory(
         before,
     });
     Ok(())
+}
+
+/// Collect one directory entry, or fail with the reason it cannot be observed.
+///
+/// The caller turns every failure that concerns this one entry into an
+/// `Unknown` observation, so the classification lives in `unknown_reason` and
+/// nothing here decides how a failure is published.
+fn scan_entry(
+    directory: &OwnedFd,
+    name: &OsStr,
+    path: PathBuf,
+    context: &ScanContext<'_>,
+    entries: &mut ScanEntries,
+) -> Result<(), LocalError> {
+    let probe = openat2(
+        directory,
+        name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        BELOW_ROOT,
+    )
+    .map_err(|source| syscall_failure("inspect directory entry", &path, source))?;
+    let probe_stat = stat_fd(&probe, &path, "inspect directory entry type")?;
+    // Content on another volume is never synchronized, so an object there is
+    // published exactly like a symlink and nothing beneath it is observed.
+    if probe_stat.st_dev != context.root_device {
+        entries.unknown(path, UnknownReason::Unsupported);
+        return Ok(());
+    }
+    match FileType::from_raw_mode(probe_stat.st_mode) {
+        FileType::RegularFile => {
+            if is_reserved_artifact_name(name) {
+                entries.unknown(path, UnknownReason::Unsupported);
+                return Ok(());
+            }
+            // A special file substituted between the probe and this open would
+            // block a plain read forever, so the open never waits and the
+            // inode check below rejects whatever was substituted.
+            let file = open_relative_at(directory, name, &path, OFlags::RDONLY | OFlags::NONBLOCK)?;
+            let opened = stat_fd(&file, &path, "inspect opened scan file")?;
+            if !same_inode(&probe_stat, &opened) {
+                return Err(LocalError::ChangedDuringRead {
+                    operation: "open scanned file",
+                    path,
+                });
+            }
+            let fingerprint = file_fingerprint(&opened, &path)?;
+            let reusable = cached_hash(context.cache, &path).and_then(|record| {
+                (record.fingerprint == fingerprint && hash_is_reusable(record, context.cutoff))
+                    .then(|| record.content.clone())
+            });
+            match reusable {
+                Some(content) => entries.cached_files.push(LocalHashRecord {
+                    path,
+                    fingerprint,
+                    content,
+                }),
+                None => entries.hash_jobs.push(HashJob { path, fingerprint }),
+            }
+            Ok(())
+        }
+        FileType::Directory => {
+            let child = open_directory_at(directory, name, &path)?;
+            let opened = stat_fd(&child, &path, "inspect opened scan directory")?;
+            if !same_inode(&probe_stat, &opened) {
+                return Err(LocalError::ChangedDuringRead {
+                    operation: "open scanned directory",
+                    path,
+                });
+            }
+            // The observation is pushed once the subtree is known to be
+            // complete, so the walk never owns a second copy of this path and
+            // a failure below simply leaves the directory unpublished.
+            scan_directory(&child, &path, context, entries)?;
+            entries.observations.push(LocalObservationRecord {
+                path,
+                observation: Observation::Directory,
+            });
+            Ok(())
+        }
+        FileType::Symlink
+        | FileType::Fifo
+        | FileType::Socket
+        | FileType::CharacterDevice
+        | FileType::BlockDevice
+        | FileType::Unknown => Err(LocalError::UnsupportedObject { path }),
+    }
+}
+
+/// Errors that describe this process rather than the object being observed.
+///
+/// Out of descriptors, memory, or space the next entry would fail exactly the
+/// same way, so publishing these as observations would block every path the
+/// walk happened to reach. They fail the scan and are retried instead.
+const EXHAUSTION: [Errno; 4] = [Errno::MFILE, Errno::NFILE, Errno::NOMEM, Errno::NOSPC];
+
+/// Errors that prove the object changed between two steps of its observation.
+///
+/// The walk resolved this path moments ago, so a missing component, a
+/// component that stopped being a directory, a symlink where none was, or a
+/// stale handle all mean the object moved under the scan.
+const REPLACED: [Errno; 4] = [Errno::NOENT, Errno::NOTDIR, Errno::LOOP, Errno::STALE];
+
+/// Reason an entry the walk itself is meeting cannot be observed.
+fn walk_unknown(error: LocalError) -> Result<(PathBuf, UnknownReason), LocalError> {
+    entry_unknown(error, UnknownReason::Unsupported)
+}
+
+/// Reason an object the scan already observed cannot be observed again.
+///
+/// The walk recorded this object's type, so finding a different one now is a
+/// replacement rather than something the scan cannot support.
+fn revisited_unknown(error: LocalError) -> Result<(PathBuf, UnknownReason), LocalError> {
+    entry_unknown(error, UnknownReason::Incomplete)
+}
+
+/// Classify a failure raised while observing one entry, recovering its path.
+///
+/// Scope comes from where the failure was raised, not from which error it is:
+/// every step between opening an entry and hashing it touches exactly one
+/// object, so its failure describes that object. Only the errors that describe
+/// the process escape, which is why the classification is a list of what
+/// propagates rather than a list of what is publishable - an errno nobody
+/// anticipated makes one path unknown, never a scan that stops.
+///
+/// `wrong_type` is what an object that is not a regular file means to the
+/// caller, which differs between the walk and the hash stage.
+fn entry_unknown(
+    error: LocalError,
+    wrong_type: UnknownReason,
+) -> Result<(PathBuf, UnknownReason), LocalError> {
+    match error {
+        LocalError::UnsupportedObject { path } => Ok((path, wrong_type)),
+        LocalError::ChangedDuringRead { path, .. } => Ok((path, UnknownReason::Incomplete)),
+        LocalError::Io {
+            operation,
+            path,
+            source,
+        } => match io_unknown_reason(&source) {
+            Some(reason) => Ok((path, reason)),
+            None => Err(LocalError::Io {
+                operation,
+                path,
+                source,
+            }),
+        },
+        error @ (LocalError::UnsafeRelativePath { .. }
+        | LocalError::InvalidContentIdentity { .. }
+        | LocalError::CorruptPrivateFile { .. }
+        | LocalError::DestinationOccupied { .. }
+        | LocalError::Journal { .. }
+        | LocalError::HashWorkerSpawn { .. }
+        | LocalError::HashWorkerTerminated { .. }) => Err(error),
+    }
+}
+
+/// Map an operating-system error raised against one object to its reason.
+///
+/// `None` is reserved for exhaustion, the only failure that says nothing about
+/// the object. An error carrying no errno still happened while this one object
+/// was being read, so it makes that object inaccessible.
+fn io_unknown_reason(source: &io::Error) -> Option<UnknownReason> {
+    let Some(code) = source.raw_os_error() else {
+        return Some(UnknownReason::Inaccessible);
+    };
+    let matches = |errno: &Errno| errno.raw_os_error() == code;
+    if EXHAUSTION.iter().any(matches) {
+        return None;
+    }
+    if REPLACED.iter().any(matches) {
+        return Some(UnknownReason::Incomplete);
+    }
+    Some(UnknownReason::Inaccessible)
+}
+
+/// Publish each untrustworthy directory and drop everything beneath it.
+///
+/// A directory that changed or became unreadable while the scan ran never
+/// proves what does or does not exist below it, so its descendants leave the
+/// publication and the reconciler inherits the reason for each of them.
+fn discard_unknown_subtrees(
+    observations: &mut Vec<LocalObservationRecord>,
+    unknown: &[(PathBuf, UnknownReason)],
+) {
+    if unknown.is_empty() {
+        return;
+    }
+    let roots = unknown
+        .iter()
+        .map(|(path, _)| path.as_path())
+        .collect::<BTreeSet<_>>();
+    let at_or_beneath = |path: &Path| path.ancestors().any(|at| roots.contains(at));
+    let strictly_beneath = |path: &Path| path.ancestors().skip(1).any(|at| roots.contains(at));
+    observations.retain(|record| !at_or_beneath(&record.path));
+    observations.extend(
+        unknown
+            .iter()
+            .filter(|(path, _)| !strictly_beneath(path))
+            .map(|(path, reason)| LocalObservationRecord {
+                path: path.clone(),
+                observation: Observation::Unknown(*reason),
+            }),
+    );
 }
 
 /// Order cached hashes the way SQLite and `cached_hash` order them.
@@ -2720,7 +2956,7 @@ fn hash_scan_files(
     if jobs.is_empty() {
         return Ok(ScanHashResults {
             records: Vec::new(),
-            changed: Vec::new(),
+            unknown: Vec::new(),
         });
     }
     let available_workers = thread::available_parallelism().map_or(1, |count| count.get());
@@ -2768,15 +3004,16 @@ fn hash_scan_files(
         }
         results.sort_by_key(|(index, _)| *index);
         let mut records = Vec::with_capacity(results.len());
-        let mut changed = Vec::new();
+        let mut unknown = Vec::new();
         for (_, result) in results {
             match result {
                 Ok(record) => records.push(record),
-                Err(LocalError::ChangedDuringRead { path, .. }) => changed.push(path),
-                Err(error) => return Err(error),
+                // Every failure below carries the job's own path, so the
+                // worker never has to hand one back beside the error.
+                Err(error) => unknown.push(revisited_unknown(error)?),
             }
         }
-        Ok(ScanHashResults { records, changed })
+        Ok(ScanHashResults { records, unknown })
     })
 }
 
@@ -2817,12 +3054,25 @@ fn revalidate_cached_files(
     cached_files: Vec<LocalHashRecord>,
 ) -> Result<ScanHashResults, LocalError> {
     let mut records = Vec::with_capacity(cached_files.len());
-    let mut changed = Vec::new();
+    let mut unknown = Vec::new();
     for record in cached_files {
-        let (_file, before) =
-            open_relative_regular_with_stat(root, &record.path, "reopen cached scan file")?;
-        if file_fingerprint(&before, &record.path)? != record.fingerprint {
-            changed.push(record.path);
+        let reopened =
+            match open_relative_regular_with_stat(root, &record.path, "reopen cached scan file") {
+                Ok((_file, before)) => before,
+                Err(error) => {
+                    unknown.push(revisited_unknown(error)?);
+                    continue;
+                }
+            };
+        let fingerprint = match file_fingerprint(&reopened, &record.path) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                unknown.push(revisited_unknown(error)?);
+                continue;
+            }
+        };
+        if fingerprint != record.fingerprint {
+            unknown.push((record.path, UnknownReason::Incomplete));
             continue;
         }
         records.push(ScannedHash {
@@ -2830,38 +3080,54 @@ fn revalidate_cached_files(
             reusable: true,
         });
     }
-    Ok(ScanHashResults { records, changed })
+    Ok(ScanHashResults { records, unknown })
 }
 
+/// Confirm every scanned directory still holds what the walk observed.
+///
+/// A directory that moved, changed, or became unreadable is returned with its
+/// reason so the caller can drop the subtree; only the root itself fails.
 fn revalidate_directories(
     root: &OwnedFd,
     directories: &[ScannedDirectory],
-) -> Result<(), LocalError> {
+) -> Result<Vec<(PathBuf, UnknownReason)>, LocalError> {
+    let mut unknown = Vec::new();
     for directory in directories {
-        let current = if directory.path.as_os_str().is_empty() {
-            stat_fd(root, &directory.path, "revalidate scanned directory")?
-        } else {
-            safe_components(&directory.path)?;
-            let reopened = openat2(
-                root,
-                &directory.path,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                Mode::empty(),
-                BELOW_ROOT,
-            )
-            .map_err(|source| {
-                syscall_failure("reopen scanned directory", &directory.path, source)
-            })?;
-            stat_fd(&reopened, &directory.path, "revalidate scanned directory")?
+        if directory.path.as_os_str().is_empty() {
+            let current = stat_fd(root, &directory.path, "revalidate scanned directory")?;
+            if !same_observation(&directory.before, &current) {
+                return Err(LocalError::ChangedDuringRead {
+                    operation: "revalidate scanned directory",
+                    path: directory.path.clone(),
+                });
+            }
+            continue;
+        }
+        let current = match reopen_scanned_directory(root, &directory.path) {
+            Ok(current) => current,
+            Err(error) => {
+                unknown.push(revisited_unknown(error)?);
+                continue;
+            }
         };
         if !same_observation(&directory.before, &current) {
-            return Err(LocalError::ChangedDuringRead {
-                operation: "revalidate scanned directory",
-                path: directory.path.clone(),
-            });
+            unknown.push((directory.path.clone(), UnknownReason::Incomplete));
         }
     }
-    Ok(())
+    Ok(unknown)
+}
+
+fn reopen_scanned_directory(root: &OwnedFd, path: &Path) -> Result<rustix::fs::Stat, LocalError> {
+    safe_components(path)?;
+    let reopened = openat2(
+        root,
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        BELOW_ROOT,
+    )
+    .map_err(|source| syscall_failure("reopen scanned directory", path, source))?;
+    stat_fd(&reopened, path, "revalidate scanned directory")
 }
 
 fn hash_stream(reader: &mut impl Read) -> io::Result<ContentIdentity> {
@@ -3186,10 +3452,12 @@ fn open_relative_regular_with_stat(
     operation: &'static str,
 ) -> Result<(File, rustix::fs::Stat), LocalError> {
     safe_components(relative)?;
+    // `NONBLOCK` keeps a special file substituted at this path from blocking
+    // the open forever; it does nothing to the regular files this returns.
     let fd = openat2(
         root,
         relative,
-        OFlags::RDONLY | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
         BELOW_ROOT,
     )
@@ -4020,6 +4288,7 @@ mod tests {
     use proptest::prelude::*;
     use tempfile::TempDir;
 
+    use crate::common::{allow_owner_access, deny_all_access};
     use crate::model::DropboxRevision;
 
     use super::*;
@@ -4312,6 +4581,46 @@ mod tests {
         vec![record]
     }
 
+    /// Index a publication by path, proving no path is published twice.
+    ///
+    /// Indexing alone would hide a duplicate behind whichever record happened
+    /// to land last, which is exactly how a discarded subtree could reappear.
+    fn observed_paths(
+        scan: &CompleteScan,
+    ) -> Result<BTreeMap<&Path, &Observation<LocalFile>>, Box<dyn Error>> {
+        let paths = scan
+            .observations
+            .iter()
+            .map(|record| (record.path.as_path(), &record.observation))
+            .collect::<BTreeMap<_, _>>();
+        if paths.len() != scan.observations.len() {
+            return Err(io::Error::other("a path was published more than once").into());
+        }
+        Ok(paths)
+    }
+
+    /// Give a directory an unmistakably different modification time.
+    ///
+    /// Creating or removing an entry only changes the directory's timestamps
+    /// as finely as the filesystem records them, so a test that relied on that
+    /// alone could stop exercising churn on a coarse clock and still pass.
+    fn force_changed(path: &Path) -> Result<(), Box<dyn Error>> {
+        let stamp = rustix::fs::Timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        rustix::fs::utimensat(
+            CWD,
+            path,
+            &rustix::fs::Timestamps {
+                last_access: stamp,
+                last_modification: stamp,
+            },
+            AtFlags::empty(),
+        )?;
+        Ok(())
+    }
+
     fn all_cache_entries_stable() -> Option<HashCacheCutoff> {
         Some(HashCacheCutoff {
             seconds: i64::MAX,
@@ -4545,29 +4854,83 @@ mod tests {
     }
 
     #[test]
-    fn parallel_hash_failure_reports_lowest_path_and_preserves_publication()
-    -> Result<(), Box<dyn Error>> {
+    fn files_removed_during_hashing_publish_an_incomplete_directory() -> Result<(), Box<dyn Error>>
+    {
+        let root = TempDir::new()?;
+        std::fs::create_dir(root.path().join("nested"))?;
+        std::fs::write(root.path().join("kept"), b"kept")?;
+        std::fs::write(root.path().join("nested/a-missing"), b"a")?;
+        std::fs::write(root.path().join("nested/b-missing"), b"b")?;
+        let pending = enumerate_scan(root.path(), &[], None)?;
+        std::fs::remove_file(root.path().join("nested/a-missing"))?;
+        std::fs::remove_file(root.path().join("nested/b-missing"))?;
+        force_changed(&root.path().join("nested"))?;
+
+        let scan = finish_scan(pending, MAX_PARALLEL_HASHES)?;
+
+        let observations = observed_paths(&scan)?;
+        assert_eq!(
+            observations.get(Path::new("nested")),
+            Some(&&Observation::Unknown(UnknownReason::Incomplete))
+        );
+        assert!(!observations.contains_key(Path::new("nested/a-missing")));
+        assert!(!observations.contains_key(Path::new("nested/b-missing")));
+        assert!(matches!(
+            observations.get(Path::new("kept")),
+            Some(Observation::Present(_))
+        ));
+        assert_eq!(scan.observations().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn file_locked_after_enumeration_is_inaccessible() -> Result<(), Box<dyn Error>> {
+        let root = TempDir::new()?;
+        std::fs::write(root.path().join("locked.txt"), b"locked")?;
+        std::fs::write(root.path().join("stable.txt"), b"stable")?;
+        let pending = enumerate_scan(root.path(), &[], None)?;
+        deny_all_access(&root.path().join("locked.txt"))?;
+
+        let scan = finish_scan(pending, MAX_PARALLEL_HASHES)?;
+
+        let observations = observed_paths(&scan)?;
+        assert_eq!(
+            observations.get(Path::new("locked.txt")),
+            Some(&&Observation::Unknown(UnknownReason::Inaccessible))
+        );
+        assert!(matches!(
+            observations.get(Path::new("stable.txt")),
+            Some(Observation::Present(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn changed_root_fails_the_scan_and_preserves_the_publication() -> Result<(), Box<dyn Error>> {
         let directory = TempDir::new()?;
         let root = directory.path().join("root");
         std::fs::create_dir(&root)?;
         std::fs::write(root.join("kept"), b"kept")?;
         let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
         let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
-        let _ = scan_and_publish(&mut journal, &root)?;
+        let _ = scan_and_publish_at(
+            &mut journal,
+            &root,
+            all_cache_entries_stable(),
+            all_cache_entries_stable,
+        )?;
         let published_inventory = journal.local_inventory()?;
         let published_cache = journal.local_hash_cache()?;
-        let cache = published_cache.clone();
 
         std::fs::write(root.join("a-missing"), b"a")?;
-        std::fs::write(root.join("b-missing"), b"b")?;
-        let pending = enumerate_scan(&root, &cache, hash_cache_cutoff(SystemTime::now()))?;
+        let pending = enumerate_scan(&root, &published_cache, all_cache_entries_stable())?;
         std::fs::remove_file(root.join("a-missing"))?;
-        std::fs::remove_file(root.join("b-missing"))?;
 
         let failure = finish_scan(pending, MAX_PARALLEL_HASHES);
+
         assert!(matches!(
             failure,
-            Err(LocalError::Io { path, .. }) if path == Path::new("a-missing")
+            Err(LocalError::ChangedDuringRead { path, .. }) if path == Path::new("")
         ));
         assert_eq!(journal.local_inventory()?, published_inventory);
         assert_eq!(journal.local_hash_cache()?, published_cache);
@@ -4575,19 +4938,49 @@ mod tests {
     }
 
     #[test]
-    fn scan_revalidates_nested_directories_after_parallel_hashing() -> Result<(), Box<dyn Error>> {
+    fn objects_on_another_device_are_unsupported_and_unscanned() -> Result<(), Box<dyn Error>> {
         let root = TempDir::new()?;
-        std::fs::create_dir(root.path().join("nested"))?;
-        std::fs::write(root.path().join("nested/file"), b"bytes")?;
-        let pending = enumerate_scan(root.path(), &[], None)?;
-        std::fs::write(root.path().join("nested/appeared"), b"new")?;
+        std::fs::create_dir(root.path().join("volume"))?;
+        std::fs::write(root.path().join("volume/inside.txt"), b"inside")?;
+        std::fs::write(root.path().join("outside.txt"), b"outside")?;
 
-        let result = finish_scan(pending, MAX_PARALLEL_HASHES);
+        let across_devices = finish_scan(
+            enumerate_scan_across_devices(root.path())?,
+            MAX_PARALLEL_HASHES,
+        )?;
 
-        assert!(matches!(
-            result,
-            Err(LocalError::ChangedDuringRead { path, .. }) if path == Path::new("nested")
-        ));
+        // Content on another volume is never synchronized, so a file there is
+        // as unsupported as a directory and nothing below one is observed.
+        let observations = observed_paths(&across_devices)?;
+        for name in ["volume", "outside.txt"] {
+            assert_eq!(
+                observations.get(Path::new(name)),
+                Some(&&Observation::Unknown(UnknownReason::Unsupported)),
+                "{name} was not published as unsupported"
+            );
+        }
+        assert!(!observations.contains_key(Path::new("volume/inside.txt")));
+        assert_eq!(across_devices.observations().len(), 2);
+        assert!(across_devices.reusable_hashes.is_empty());
+
+        // The same tree on the root's own device is scanned through, so the
+        // seam above differs from a production scan only in the device.
+        let same_device = scan(root.path())?;
+        let observations = observed_paths(&same_device)?;
+        assert_eq!(
+            observations.get(Path::new("volume")),
+            Some(&&Observation::Directory)
+        );
+        for name in ["volume/inside.txt", "outside.txt"] {
+            assert!(
+                matches!(
+                    observations.get(Path::new(name)),
+                    Some(Observation::Present(_))
+                ),
+                "{name} was not scanned on the root's own device"
+            );
+        }
+        assert_eq!(same_device.observations().len(), 3);
         Ok(())
     }
 
@@ -4771,7 +5164,8 @@ mod tests {
     }
 
     #[test]
-    fn failed_scan_preserves_published_inventory_and_hash_cache() -> Result<(), Box<dyn Error>> {
+    fn symlink_is_published_as_unsupported_beside_a_synchronized_file() -> Result<(), Box<dyn Error>>
+    {
         use std::os::unix::fs::symlink;
 
         let directory = TempDir::new()?;
@@ -4791,14 +5185,413 @@ mod tests {
             )?,
             ScanPublication::Published(_)
         ));
-        let inventory = journal.local_inventory()?;
-        let cache = journal.local_hash_cache()?;
-        assert_eq!(cache.len(), 1);
+        assert_eq!(journal.local_hash_cache()?.len(), 1);
 
         symlink(&outside, root.join("unsupported-link"))?;
-        assert!(scan_and_publish(&mut journal, &root).is_err());
-        assert_eq!(journal.local_inventory()?, inventory);
-        assert_eq!(journal.local_hash_cache()?, cache);
+        let ScanPublication::Published(scan) = scan_and_publish_at(
+            &mut journal,
+            &root,
+            all_cache_entries_stable(),
+            all_cache_entries_stable,
+        )?
+        else {
+            return Err(io::Error::other("test expected a published scan").into());
+        };
+
+        let observations = observed_paths(&scan)?;
+        assert_eq!(
+            observations.get(Path::new("unsupported-link")),
+            Some(&&Observation::Unknown(UnknownReason::Unsupported))
+        );
+        assert!(matches!(
+            observations.get(Path::new("kept.txt")),
+            Some(Observation::Present(_))
+        ));
+        assert_eq!(journal.local_inventory()?.len(), 2);
+        assert_eq!(journal.local_hash_cache()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn special_entries_are_published_as_unsupported() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixListener;
+
+        use rustix::fs::mkfifoat;
+
+        let root = TempDir::new()?;
+        std::fs::write(root.path().join("regular.txt"), b"regular")?;
+        symlink(root.path().join("regular.txt"), root.path().join("link"))?;
+        mkfifoat(CWD, root.path().join("fifo"), Mode::RUSR | Mode::WUSR)?;
+        let _socket = UnixListener::bind(root.path().join("socket"))?;
+
+        let scan = scan(root.path())?;
+
+        let observations = observed_paths(&scan)?;
+        for name in ["fifo", "link", "socket"] {
+            assert_eq!(
+                observations.get(Path::new(name)),
+                Some(&&Observation::Unknown(UnknownReason::Unsupported)),
+                "{name} was not published as unsupported"
+            );
+        }
+        assert!(matches!(
+            observations.get(Path::new("regular.txt")),
+            Some(Observation::Present(_))
+        ));
+        assert_eq!(scan.observations().len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn inaccessible_file_is_unknown_beside_a_readable_file() -> Result<(), Box<dyn Error>> {
+        let root = TempDir::new()?;
+        std::fs::write(root.path().join("locked.txt"), b"locked")?;
+        std::fs::write(root.path().join("open.txt"), b"open")?;
+        deny_all_access(&root.path().join("locked.txt"))?;
+
+        let scan = scan(root.path())?;
+
+        let observations = observed_paths(&scan)?;
+        assert_eq!(
+            observations.get(Path::new("locked.txt")),
+            Some(&&Observation::Unknown(UnknownReason::Inaccessible))
+        );
+        assert!(matches!(
+            observations.get(Path::new("open.txt")),
+            Some(Observation::Present(_))
+        ));
+        assert_eq!(scan.observations().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn inaccessible_directory_publishes_nothing_beneath_itself() -> Result<(), Box<dyn Error>> {
+        let root = TempDir::new()?;
+        // "earlier" is walked before "locked", so discarding the unreadable
+        // subtree must not reach back into a sibling already collected.
+        std::fs::create_dir(root.path().join("earlier"))?;
+        std::fs::write(root.path().join("earlier/inner.txt"), b"inner")?;
+        std::fs::create_dir(root.path().join("locked"))?;
+        std::fs::write(root.path().join("locked/secret.txt"), b"secret")?;
+        std::fs::write(root.path().join("open.txt"), b"open")?;
+        deny_all_access(&root.path().join("locked"))?;
+
+        let scan = scan(root.path());
+        allow_owner_access(&root.path().join("locked"))?;
+        let scan = scan?;
+
+        let observations = observed_paths(&scan)?;
+        assert_eq!(
+            observations.get(Path::new("locked")),
+            Some(&&Observation::Unknown(UnknownReason::Inaccessible))
+        );
+        assert!(!observations.contains_key(Path::new("locked/secret.txt")));
+        assert_eq!(
+            observations.get(Path::new("earlier")),
+            Some(&&Observation::Directory)
+        );
+        for name in ["earlier/inner.txt", "open.txt"] {
+            assert!(
+                matches!(
+                    observations.get(Path::new(name)),
+                    Some(Observation::Present(_))
+                ),
+                "{name} was lost with the unreadable subtree"
+            );
+        }
+        assert_eq!(scan.observations().len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn directory_changed_during_the_scan_hides_its_contents() -> Result<(), Box<dyn Error>> {
+        let root = TempDir::new()?;
+        std::fs::create_dir(root.path().join("nested"))?;
+        std::fs::write(root.path().join("nested/file"), b"bytes")?;
+        std::fs::write(root.path().join("stable.txt"), b"stable")?;
+        let pending = enumerate_scan(root.path(), &[], None)?;
+        std::fs::write(root.path().join("nested/appeared"), b"new")?;
+
+        let scan = finish_scan(pending, MAX_PARALLEL_HASHES)?;
+
+        let observations = observed_paths(&scan)?;
+        assert_eq!(
+            observations.get(Path::new("nested")),
+            Some(&&Observation::Unknown(UnknownReason::Incomplete))
+        );
+        assert!(!observations.contains_key(Path::new("nested/file")));
+        assert!(!observations.contains_key(Path::new("nested/appeared")));
+        assert!(matches!(
+            observations.get(Path::new("stable.txt")),
+            Some(Observation::Present(_))
+        ));
+        assert_eq!(scan.observations().len(), 2);
+        Ok(())
+    }
+
+    /// Puts something that is not a directory at an enumerated path.
+    type SwapEntry = fn(&Path) -> Result<(), Box<dyn Error>>;
+
+    #[test]
+    fn a_directory_replaced_by_a_file_is_incomplete() -> Result<(), Box<dyn Error>> {
+        fn write_regular_file(path: &Path) -> Result<(), Box<dyn Error>> {
+            std::fs::write(path, b"no longer a directory")?;
+            Ok(())
+        }
+
+        assert_swapped_subtree_is_incomplete(write_regular_file)
+    }
+
+    #[test]
+    fn a_directory_replaced_by_a_symlink_is_incomplete() -> Result<(), Box<dyn Error>> {
+        fn write_symlink(path: &Path) -> Result<(), Box<dyn Error>> {
+            std::os::unix::fs::symlink("elsewhere", path)?;
+            Ok(())
+        }
+
+        assert_swapped_subtree_is_incomplete(write_symlink)
+    }
+
+    /// Replace an enumerated directory and prove the scan still publishes.
+    ///
+    /// Reopening the swapped path fails with `ENOTDIR` or `ELOOP`, which the
+    /// scan owes to that one path. Removing the directory necessarily changes
+    /// the parent that held it, so the parent is what carries the reason and
+    /// the whole subtree beneath it leaves the publication.
+    fn assert_swapped_subtree_is_incomplete(swap: SwapEntry) -> Result<(), Box<dyn Error>> {
+        let root = TempDir::new()?;
+        std::fs::create_dir_all(root.path().join("outer/swapped"))?;
+        std::fs::write(root.path().join("outer/swapped/inside.txt"), b"inside")?;
+        std::fs::write(root.path().join("outer/sibling.txt"), b"sibling")?;
+        std::fs::write(root.path().join("kept.txt"), b"kept")?;
+        let pending = enumerate_scan(root.path(), &[], None)?;
+        std::fs::remove_file(root.path().join("outer/swapped/inside.txt"))?;
+        std::fs::remove_dir(root.path().join("outer/swapped"))?;
+        swap(&root.path().join("outer/swapped"))?;
+
+        let scan = finish_scan(pending, MAX_PARALLEL_HASHES)?;
+
+        let observations = observed_paths(&scan)?;
+        assert_eq!(
+            observations.get(Path::new("outer")),
+            Some(&&Observation::Unknown(UnknownReason::Incomplete))
+        );
+        for hidden in [
+            "outer/swapped",
+            "outer/swapped/inside.txt",
+            "outer/sibling.txt",
+        ] {
+            assert!(
+                !observations.contains_key(Path::new(hidden)),
+                "{hidden} was published beneath an incomplete directory"
+            );
+        }
+        assert!(matches!(
+            observations.get(Path::new("kept.txt")),
+            Some(Observation::Present(_))
+        ));
+        assert_eq!(scan.observations().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn a_discarded_subtree_keeps_its_validated_hashes() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let root = directory.path().join("root");
+        std::fs::create_dir_all(root.join("nested"))?;
+        std::fs::write(root.join("nested/kept.txt"), b"kept below")?;
+        std::fs::write(root.join("stable.txt"), b"stable")?;
+        let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+        let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+        let _ = scan_and_publish_at(&mut journal, &root, None, all_cache_entries_stable)?;
+        let cache = journal.local_hash_cache()?;
+        assert_eq!(cache.len(), 2);
+
+        let pending = enumerate_scan(&root, &cache, all_cache_entries_stable())?;
+        assert!(pending.hash_jobs.is_empty());
+        force_changed(&root.join("nested"))?;
+        let scan = finish_scan_at(pending, MAX_PARALLEL_HASHES, all_cache_entries_stable)?;
+
+        let observations = observed_paths(&scan)?;
+        assert_eq!(
+            observations.get(Path::new("nested")),
+            Some(&&Observation::Unknown(UnknownReason::Incomplete))
+        );
+        assert!(!observations.contains_key(Path::new("nested/kept.txt")));
+        // The bytes below the churn never changed, so the next pass must not
+        // pay to hash them again just because the walk could not publish them.
+        assert_eq!(scan.reusable_hashes.len(), 2);
+        let rescan = enumerate_scan(&root, &scan.reusable_hashes, all_cache_entries_stable())?;
+        assert!(rescan.hash_jobs.is_empty());
+        assert_eq!(rescan.cached_files.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn hashes_the_walk_retained_reach_the_publication() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let root = directory.path().join("root");
+        std::fs::create_dir_all(root.join("nested"))?;
+        std::fs::write(root.join("nested/kept.txt"), b"kept below")?;
+        std::fs::write(root.join("stable.txt"), b"stable")?;
+        let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+        let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+        let _ = scan_and_publish_at(&mut journal, &root, None, all_cache_entries_stable)?;
+        let cache = journal.local_hash_cache()?;
+        assert_eq!(cache.len(), 2);
+
+        // Shape the enumeration exactly as `ScanEntries::truncate` leaves it
+        // when an entry fails after its subtree was already validated: the
+        // subtree's observations and directories are gone and its validated
+        // cache rows have moved aside. Only a concurrent writer can reach that
+        // state through the walk itself, so the state is built here instead.
+        let mut pending = enumerate_scan(&root, &cache, all_cache_entries_stable())?;
+        assert!(pending.hash_jobs.is_empty());
+        let beneath = |path: &Path| path.starts_with("nested");
+        let (retained, kept) = pending
+            .cached_files
+            .into_iter()
+            .partition::<Vec<_>, _>(|record| beneath(&record.path));
+        assert_eq!(retained.len(), 1);
+        pending.cached_files = kept;
+        pending.retained = retained;
+        pending.observations.retain(|record| !beneath(&record.path));
+        pending
+            .directories
+            .retain(|scanned| !beneath(&scanned.path));
+        pending.observations.push(LocalObservationRecord {
+            path: PathBuf::from("nested"),
+            observation: Observation::Unknown(UnknownReason::Incomplete),
+        });
+
+        let scan = finish_scan_at(pending, MAX_PARALLEL_HASHES, all_cache_entries_stable)?;
+
+        let observations = observed_paths(&scan)?;
+        assert_eq!(
+            observations.get(Path::new("nested")),
+            Some(&&Observation::Unknown(UnknownReason::Incomplete))
+        );
+        assert!(!observations.contains_key(Path::new("nested/kept.txt")));
+        // The bytes below the failure never changed, so the next pass must not
+        // pay to hash them again just because the walk could not publish them.
+        assert_eq!(scan.reusable_hashes.len(), 2);
+        let rescan = enumerate_scan(&root, &scan.reusable_hashes, all_cache_entries_stable())?;
+        assert!(rescan.hash_jobs.is_empty());
+        assert_eq!(rescan.cached_files.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn truncating_a_failed_entry_keeps_its_validated_hashes() -> Result<(), Box<dyn Error>> {
+        let content = dropbox_content_hash(Cursor::new(b"bytes"))?;
+        let cached = |path: &str| LocalHashRecord {
+            path: PathBuf::from(path),
+            fingerprint: LocalFileFingerprint {
+                device: 1,
+                inode: 2,
+                size: 5,
+                modified_seconds: 3,
+                modified_nanoseconds: 0,
+                changed_seconds: 3,
+                changed_nanoseconds: 0,
+            },
+            content: content.clone(),
+        };
+        let mut entries = ScanEntries {
+            cached_files: vec![cached("before.txt")],
+            ..ScanEntries::default()
+        };
+
+        let mark = entries.mark();
+        entries.observations.push(LocalObservationRecord {
+            path: PathBuf::from("sub"),
+            observation: Observation::Directory,
+        });
+        entries.cached_files.push(cached("sub/kept.txt"));
+        entries.hash_jobs.push(HashJob {
+            path: PathBuf::from("sub/fresh.txt"),
+            fingerprint: cached("sub/fresh.txt").fingerprint,
+        });
+        entries.truncate(mark);
+        entries.unknown(PathBuf::from("sub"), UnknownReason::Incomplete);
+
+        let paths = |records: &[LocalHashRecord]| {
+            records
+                .iter()
+                .map(|record| record.path.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paths(&entries.cached_files), [PathBuf::from("before.txt")]);
+        assert_eq!(paths(&entries.retained), [PathBuf::from("sub/kept.txt")]);
+        assert!(entries.hash_jobs.is_empty());
+        assert_eq!(
+            entries.observations,
+            vec![LocalObservationRecord {
+                path: PathBuf::from("sub"),
+                observation: Observation::Unknown(UnknownReason::Incomplete),
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn only_exhaustion_escapes_a_failure_raised_against_one_entry() -> Result<(), Box<dyn Error>> {
+        let path = Path::new("subject.txt");
+        let owned = path.to_path_buf();
+        let raised = |errno| syscall_failure("observe scanned entry", path, errno);
+
+        for errno in EXHAUSTION {
+            assert!(
+                matches!(walk_unknown(raised(errno)), Err(LocalError::Io { .. })),
+                "{errno:?} did not fail the scan"
+            );
+        }
+        for errno in REPLACED {
+            assert_eq!(
+                walk_unknown(raised(errno))?,
+                (owned.clone(), UnknownReason::Incomplete),
+                "{errno:?} was not read as a replacement"
+            );
+        }
+        // Anticipated or not, an errno raised against one object concerns that
+        // object: the default is an unknown path, never a scan that stops.
+        for errno in [
+            Errno::ACCESS,
+            Errno::PERM,
+            Errno::IO,
+            Errno::NXIO,
+            Errno::TIMEDOUT,
+            Errno::NODEV,
+        ] {
+            assert_eq!(
+                walk_unknown(raised(errno))?,
+                (owned.clone(), UnknownReason::Inaccessible),
+                "{errno:?} did not make one path inaccessible"
+            );
+        }
+
+        // The walk meets an object it cannot synchronize; the hash stage
+        // already saw a regular file, so a different type there is a change.
+        let unsupported = || LocalError::UnsupportedObject {
+            path: owned.clone(),
+        };
+        assert_eq!(
+            walk_unknown(unsupported())?,
+            (owned.clone(), UnknownReason::Unsupported)
+        );
+        assert_eq!(
+            revisited_unknown(unsupported())?,
+            (owned.clone(), UnknownReason::Incomplete)
+        );
+
+        // A failure that is not about an object still stops the scan.
+        assert!(matches!(
+            walk_unknown(LocalError::UnsafeRelativePath {
+                path: owned.clone()
+            }),
+            Err(LocalError::UnsafeRelativePath { .. })
+        ));
         Ok(())
     }
 
