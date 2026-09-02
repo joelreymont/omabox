@@ -1,0 +1,11 @@
+---
+title: Classify daemon errors into retry, wait, or exit
+status: open
+priority: 1
+issue-type: task
+created-at: "2026-09-02T11:28:11.356631+02:00"
+blocks:
+  - omabox-order-canonical-paths-6ffaf324
+---
+
+Problem: src/bin/omaboxd.rs:299-335 retries only auth/Dropbox transport, rate-limit, and 5xx errors; everything else returns from run_owned (:63-74) and exits non-zero into packaging/systemd/omabox.service Restart=on-failure/RestartSec=5s with no start limit; a persistent 401 makes run_session return Ok and loop without delay (:149-152); Retry-After is honored unbounded (:304-324); publishing Syncing at :135 clears last_error; nothing removes status.json on stop. Design: docs/remediation-2026-09.md section E. Acceptance: Disposition enum with DaemonError::disposition mapping exactly as the design lists; escalating retry schedule 5 s to 5 min reset after a successful pass; MAX_RETRY_AFTER 15 min; Environmental conditions publish DaemonPhase::Error with a fixed message per condition, keep the lock, and wait on the same schedule; UserAction exits 78 after publishing the fatal status; Invariant exits 70; last_error cleared only after a pass with zero sync errors; the session loop, Disposition, and schedule move into a library module src/daemon.rs with src/bin/omaboxd.rs as the thin entry point; omaboxd --self-check prints the version and exits 0 without touching state; unit becomes Type=exec with RestartPreventExitStatus=70 78, StartLimitIntervalSec=10min, StartLimitBurst=5, After=graphical-session.target, ExecStopPost=-/usr/bin/rm -f %t/omabox/status.json; the daemon removes status.json on clean exit; unit tests for disposition mapping of every DaemonError variant and the schedule; the install test that embeds the unit still passes. Files: src/daemon.rs, src/lib.rs, src/bin/omaboxd.rs, src/runtime_status.rs, packaging/systemd/omabox.service, src/install.rs (tests). Verify: cargo fmt --check; cargo clippy --all-targets -- -D warnings; cargo test. Depends: canonical. Ownership: daemon lifecycle and unit. Claim: unassigned.

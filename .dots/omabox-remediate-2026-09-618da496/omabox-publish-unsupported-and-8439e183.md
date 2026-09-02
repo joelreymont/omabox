@@ -1,0 +1,11 @@
+---
+title: Publish unsupported and inaccessible entries as Unknown
+status: open
+priority: 1
+issue-type: task
+created-at: "2026-09-02T11:28:11.354934+02:00"
+blocks:
+  - omabox-order-canonical-paths-6ffaf324
+---
+
+Problem: src/local.rs:2669-2674 aborts the whole scan on any symlink, FIFO, socket, or device; :2610-2617, :2628, :2655 abort on EACCES; :2677-2688 and :2820-2849 abort when any directory changes during the scan; src/reconcile.rs:632-642 turns these into a daemon exit and src/bin/omaboxd.rs:180-183 retries fresh observations with no delay. One symlink in ~/Dropbox is a permanent outage. Design: docs/remediation-2026-09.md section C. Acceptance: scan_directory publishes Unknown(Unsupported) for special entries and for directories whose st_dev differs from the sync root's device (nothing beneath them is scanned), Unknown(Inaccessible) for EACCES/EPERM/EIO/ENXIO on an entry (a directory's descendants are not published), Unknown(Incomplete) for a directory that changed during the scan with its collected descendants discarded, and still publishes; root-level failures stay LocalError; hash-stage EIO/EACCES become Unknown(Inaccessible); reconciler ancestor rule: a path with no record on a side takes the nearest ancestor's Unknown reason, else ConfirmedAbsent, via binary search over that side's sorted records, applied to both sides; daemon waits one second before re-entering the pass after FreshObservationRequired; the existing test at src/local.rs:4753 is inverted; new tests: socket, symlink, mode-000 file, mode-000 directory with a baseline beneath it (asserts no DeleteRemote is planned and the sibling still syncs), directory churn during scan (asserts publication with Unknown(Incomplete) and no deletion beneath), a directory on another device (use /dev/shm inside a root under /tmp only if devices differ, else a unit test of the rule) with a baseline beneath it asserting no DeleteRemote; all fail before the fix. Files: src/local.rs, src/reconcile.rs, src/bin/omaboxd.rs, tests/dropbox_fake.rs. Verify: cargo fmt --check; cargo clippy --all-targets -- -D warnings; cargo test. Depends: canonical. Ownership: local scan observations and the ancestor rule. Claim: unassigned.
