@@ -5,6 +5,9 @@ priority: 1
 issue-type: task
 created-at: "2026-09-02T11:28:11.369247+02:00"
 blocks:
+  - omabox-journal-schema-ver-487764f0
+  - omabox-publish-unsupported-and-8439e183
+  - omabox-classify-daemon-errors-dd34c00a
   - omabox-protect-in-flight-34128729
 ---
 

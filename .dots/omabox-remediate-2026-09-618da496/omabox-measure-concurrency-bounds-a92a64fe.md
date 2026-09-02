@@ -5,6 +5,7 @@ priority: 3
 issue-type: task
 created-at: "2026-09-02T11:28:11.379585+02:00"
 blocks:
+  - omabox-make-idle-passes-24e8ce2a
   - omabox-publish-unsupported-and-8439e183
 ---
 

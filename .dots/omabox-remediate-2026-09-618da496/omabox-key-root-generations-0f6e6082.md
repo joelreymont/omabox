@@ -5,6 +5,7 @@ priority: 1
 issue-type: task
 created-at: "2026-09-02T11:28:11.370486+02:00"
 blocks:
+  - omabox-journal-schema-ver-487764f0
   - omabox-classify-daemon-errors-dd34c00a
 ---
 

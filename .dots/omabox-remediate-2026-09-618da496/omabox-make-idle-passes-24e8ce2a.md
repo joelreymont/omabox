@@ -5,6 +5,7 @@ priority: 2
 issue-type: task
 created-at: "2026-09-02T11:28:11.375257+02:00"
 blocks:
+  - omabox-journal-schema-ver-487764f0
   - omabox-tighten-dropbox-client-2a6b649a
 ---
 
