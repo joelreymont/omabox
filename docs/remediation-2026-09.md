@@ -378,6 +378,12 @@ struct Target { kind: RequestKind /* Rpc, Upload, Finish, Download, LongPoll, OA
   | Finish | `recv_response = SESSION_FINISH_SECONDS` (one hour); the finish body is always empty because every byte was appended first |
   | LongPoll | `global = timeout + 90 s + LONG_POLL_GRACE_SECONDS`, where `timeout` is parsed from the request body (absent means 30) with checked arithmetic |
 
+  `BODY_IDLE_SECONDS = 60` and `UPLOAD_RESPONSE_SECONDS = 60`: a dead
+  connection fails within one idle minute, and the upload response bound never
+  exceeds the body-idle bound, which ureq's composition requires for it to
+  bind at all; the long-poll server slack (90 s) is a named field of the
+  deadline set so the row can be proven with an injected zero. Both agents
+  follow no redirects, so `Authorization` can never leave the mapped origin.
   Each row is proven by a behavioral test against the fake server with
   injected constants and delays above the one-second floor.
 - Responses: the status is returned unchanged; `Dropbox-API-Result` and
