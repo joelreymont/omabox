@@ -1,9 +1,9 @@
 ---
 title: Isolate unavailable downloads with durable per-path retry
-status: open
+status: active
 priority: 1
 issue-type: task
-created-at: "2026-09-04T21:20:46.161126+02:00"
+created-at: "\"2026-09-04T21:20:46.161126+02:00\""
 blocks:
   - omabox-retire-obsolete-installs-5bc2d6f3
 ---
