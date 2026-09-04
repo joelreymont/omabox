@@ -12,8 +12,8 @@ use crate::dropbox::{
     DropboxClient, DropboxError, MutationOutcome, MutationRejection, RemotePathState,
 };
 use crate::journal::{
-    Journal, JournalError, OperationCompletion, OperationId, PlanConflictCompletion, PlanRecord,
-    PlanSupersede, PlannedOperation, RecordStatus, RecoveryForget, RecoveryRecord,
+    Journal, JournalError, OperationCompletion, OperationId, PlanConflictCompletion, PlanId,
+    PlanRecord, PlanSupersede, PlannedOperation, RecordStatus, RecoveryForget, RecoveryRecord,
 };
 use crate::local::{
     ConflictOutcome, ConflictSide, CreateDirectoryOutcome, DeleteDirectoryOutcome, DeleteOutcome,
@@ -89,6 +89,13 @@ pub(crate) enum ExactCopyOutcome {
 /// Why a replayable operation remains pending.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplayBlocked {
+    /// A classified durable failure holds one plan until its retry deadline.
+    DurablePlan {
+        /// Synchronized path preserved without mutation.
+        path: PathBuf,
+        /// Stable, safe reason recorded in the journal.
+        reason: crate::journal::BlockReason,
+    },
     /// A symlink, special object, or non-directory ancestor blocks a local effect.
     LocalObject {
         /// Synchronized path preserved without mutation.
@@ -108,6 +115,8 @@ pub enum ReplayBlocked {
     },
     /// Unrelated bytes occupy the deterministic download-stage path.
     StageDestinationOccupied {
+        /// Durable plan that owns the staging operation.
+        plan_id: PlanId,
         /// Reserved path that was preserved without modification.
         path: PathBuf,
     },
@@ -420,7 +429,10 @@ pub(crate) fn replay_local_plans_at<'a>(
                                 })
                             }
                             InstallOutcome::StageDestinationOccupied { path } => {
-                                Some(ReplayBlocked::StageDestinationOccupied { path })
+                                Some(ReplayBlocked::StageDestinationOccupied {
+                                    plan_id: plan.id,
+                                    path,
+                                })
                             }
                             InstallOutcome::PreconditionChanged { actual } => {
                                 Some(ReplayBlocked::PreconditionChanged {
@@ -464,7 +476,10 @@ pub(crate) fn replay_local_plans_at<'a>(
                                 })
                             }
                             InstallOutcome::StageDestinationOccupied { path } => {
-                                Some(ReplayBlocked::StageDestinationOccupied { path })
+                                Some(ReplayBlocked::StageDestinationOccupied {
+                                    plan_id: plan.id,
+                                    path,
+                                })
                             }
                             InstallOutcome::PreconditionChanged { actual } => {
                                 Some(ReplayBlocked::PreconditionChanged {
@@ -783,7 +798,10 @@ fn prepare_upload(
         StageOutcome::DestinationOccupied { path } => {
             report
                 .blocked
-                .push(ReplayBlocked::StageDestinationOccupied { path });
+                .push(ReplayBlocked::StageDestinationOccupied {
+                    plan_id: plan.id,
+                    path,
+                });
             Ok(None)
         }
     }

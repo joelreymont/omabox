@@ -8,14 +8,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::{SystemTime, SystemTimeError, UNIX_EPOCH};
 
 use rustix::fd::OwnedFd;
 use thiserror::Error;
 
 use crate::dropbox::{DownloadAccess, DropboxClient, DropboxError};
 use crate::journal::{
-    BaselineRecord, Journal, JournalError, LocalObservationRecord, PlanConflictCompletion,
-    PlanRecord, PlanSupersede, RecordStatus, RemoteObservationRecord,
+    BaselineRecord, BlockReason, Journal, JournalError, LocalObservationRecord, OperationId,
+    PlanBlock, PlanConflictCompletion, PlanId, PlanRecord, PlanStatus, PlanSupersede, PlanUnblock,
+    RecordStatus, RemoteObservationRecord,
 };
 use crate::local::{
     DownloadSlotIdentity, DownloadSlotLease, LocalError, LocalRenameOutcome,
@@ -101,6 +103,13 @@ pub enum ReconcileError {
     /// The in-process resumable-slot coordinator became unavailable.
     #[error("the Dropbox download slot coordinator is unavailable")]
     DownloadSlotCoordinatorUnavailable,
+    /// The retry deadline could not be derived from the system clock.
+    #[error("could not read the system clock for a download retry deadline")]
+    Clock {
+        /// Original system clock failure.
+        #[source]
+        source: SystemTimeError,
+    },
     /// Durable records violated the finite reconciliation contract.
     #[error("reconciliation found invalid journal state for `{path}`: {detail}")]
     InvalidJournalState {
@@ -183,7 +192,7 @@ pub enum ReconcileOutcome {
 pub struct ExactDownloadPool {
     jobs: Option<mpsc::Sender<DownloadJob>>,
     results: mpsc::Receiver<DownloadResult>,
-    scheduled: BTreeSet<PathBuf>,
+    scheduled: BTreeMap<PathBuf, DownloadIdentity>,
     pending_failure: Option<ReconcileError>,
     slots: Arc<Mutex<DownloadSlots>>,
     cancelled: Arc<AtomicBool>,
@@ -238,7 +247,7 @@ impl ExactDownloadPool {
         Ok(Self {
             jobs: Some(jobs),
             results,
-            scheduled: BTreeSet::new(),
+            scheduled: BTreeMap::new(),
             pending_failure: None,
             slots,
             cancelled,
@@ -247,15 +256,27 @@ impl ExactDownloadPool {
         })
     }
 
-    fn collect_results(&mut self) -> Result<Option<ReconcileError>, ReconcileError> {
+    fn collect_results(&mut self) -> Result<CollectedDownloads, ReconcileError> {
+        let mut collected = CollectedDownloads::default();
         loop {
             match self.results.try_recv() {
                 Ok(result) => {
-                    self.scheduled.remove(&result.path);
-                    if let Some(Err(error)) = result.outcome
-                        && self.pending_failure.is_none()
-                    {
-                        self.pending_failure = Some(error);
+                    if self.scheduled.get(&result.path) == Some(&result.identity) {
+                        self.scheduled.remove(&result.path);
+                    }
+                    match result.outcome {
+                        DownloadOutcome::Completed | DownloadOutcome::Cancelled => {}
+                        DownloadOutcome::Blocked(reason) => {
+                            collected.blocked.push(BlockedDownload {
+                                path: result.path,
+                                identity: result.identity,
+                                reason,
+                            });
+                        }
+                        DownloadOutcome::Failed(error) if self.pending_failure.is_none() => {
+                            self.pending_failure = Some(error);
+                        }
+                        DownloadOutcome::Failed(_) => {}
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -266,16 +287,23 @@ impl ExactDownloadPool {
         }
         if self.scheduled.is_empty() && self.pending_failure.is_some() {
             self.cancelled.store(false, Ordering::Release);
-            return Ok(self.pending_failure.take());
+            collected.failure = self.pending_failure.take();
         }
         if self.workers.iter().any(thread::JoinHandle::is_finished) {
             return Err(ReconcileError::DownloadWorkerStopped);
         }
-        Ok(None)
+        Ok(collected)
     }
 
     fn contains(&self, path: &Path) -> bool {
-        self.scheduled.contains(path)
+        self.scheduled.contains_key(path)
+    }
+
+    fn contains_plan(&self, plan: &PlanRecord) -> bool {
+        let Some(identity) = pending_download_identity(plan) else {
+            return false;
+        };
+        self.scheduled.get(&plan.path) == Some(&identity)
     }
 
     fn is_empty(&self) -> bool {
@@ -294,6 +322,7 @@ impl ExactDownloadPool {
             return Err(ReconcileError::DownloadWorkerStopped);
         }
         let path = job.path.clone();
+        let job_identity = job.identity;
         if let Some(slot) = &job.slot {
             let mut slots = self
                 .slots
@@ -314,7 +343,7 @@ impl ExactDownloadPool {
             }
             return Err(ReconcileError::DownloadWorkerStopped);
         }
-        self.scheduled.insert(path);
+        self.scheduled.insert(path, job_identity);
         Ok(())
     }
 }
@@ -341,6 +370,7 @@ struct DownloadJob {
     root_path: PathBuf,
     staging_directory: PathBuf,
     path: PathBuf,
+    identity: DownloadIdentity,
     source: RemoteFile,
     slot_identity: DownloadSlotIdentity,
     slot: Option<DownloadSlotLease>,
@@ -348,7 +378,33 @@ struct DownloadJob {
 
 struct DownloadResult {
     path: PathBuf,
-    outcome: Option<Result<(), ReconcileError>>,
+    identity: DownloadIdentity,
+    outcome: DownloadOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DownloadIdentity {
+    plan: PlanId,
+    operation: OperationId,
+}
+
+enum DownloadOutcome {
+    Completed,
+    Blocked(BlockReason),
+    Failed(ReconcileError),
+    Cancelled,
+}
+
+#[derive(Default)]
+struct CollectedDownloads {
+    blocked: Vec<BlockedDownload>,
+    failure: Option<ReconcileError>,
+}
+
+struct BlockedDownload {
+    path: PathBuf,
+    identity: DownloadIdentity,
+    reason: BlockReason,
 }
 
 fn download_worker(
@@ -371,11 +427,13 @@ fn download_worker(
             }
         };
         let path = job.path.clone();
+        let identity = job.identity;
         if cancelled.load(Ordering::Acquire) {
             if results
                 .send(DownloadResult {
                     path,
-                    outcome: None,
+                    identity,
+                    outcome: DownloadOutcome::Cancelled,
                 })
                 .is_err()
             {
@@ -383,19 +441,74 @@ fn download_worker(
             }
             continue;
         }
-        let outcome = run_download_job(dropbox, job, slots, root_access);
-        if outcome.is_err() {
+        let outcome = match run_download_job(dropbox, job, slots, root_access) {
+            Ok(()) => DownloadOutcome::Completed,
+            Err(error) => match download_block_reason(&error) {
+                Some(reason) => DownloadOutcome::Blocked(reason),
+                None => DownloadOutcome::Failed(error),
+            },
+        };
+        if matches!(outcome, DownloadOutcome::Failed(_)) {
             cancelled.store(true, Ordering::Release);
         }
         if results
             .send(DownloadResult {
                 path,
-                outcome: Some(outcome),
+                identity,
+                outcome,
             })
             .is_err()
         {
             return;
         }
+    }
+}
+
+fn download_block_reason(error: &ReconcileError) -> Option<BlockReason> {
+    match error {
+        ReconcileError::RemoteDownload {
+            source: DropboxError::HttpStatus { status, .. },
+            ..
+        } if (400..500).contains(status) && *status != 401 && *status != 429 => {
+            Some(BlockReason::DownloadUnavailable { status: *status })
+        }
+        ReconcileError::RemoteDownload {
+            source:
+                DropboxError::DownloadedRevisionChanged
+                | DropboxError::DownloadedIdentityChanged
+                | DropboxError::DownloadedSizeChanged
+                | DropboxError::InvalidDownloadRange
+                | DropboxError::DownloadedLengthChanged,
+            ..
+        }
+        | ReconcileError::RemoteContentChanged { .. } => {
+            Some(BlockReason::DownloadVerificationFailed)
+        }
+        ReconcileError::StageDestinationOccupied { .. }
+        | ReconcileError::RemoteDownload {
+            source:
+                DropboxError::LocalStage {
+                    source: LocalError::DestinationOccupied { .. },
+                },
+            ..
+        } => Some(BlockReason::StageOccupied),
+        ReconcileError::RemoteDownload {
+            source: DropboxError::LocalStage { source },
+            ..
+        } if local_download_object_blocks(source) => Some(BlockReason::LocalObjectInWay),
+        _ => None,
+    }
+}
+
+fn local_download_object_blocks(error: &LocalError) -> bool {
+    match error {
+        LocalError::UnsupportedObject { .. } => true,
+        LocalError::Io { source, .. } => {
+            let raw = source.raw_os_error();
+            raw == Some(rustix::io::Errno::LOOP.raw_os_error())
+                || raw == Some(rustix::io::Errno::NOTDIR.raw_os_error())
+        }
+        _ => false,
     }
 }
 
@@ -501,7 +614,9 @@ fn replay_pending_at(
     sync_root: &Path,
     upload_staging: &Path,
 ) -> Result<ReplayReport, ReconcileError> {
-    let download_failure = download_pool.collect_results()?;
+    let collected = download_pool.collect_results()?;
+    record_download_blocks(journal, &collected.blocked)?;
+    let blocked_plans = journal.blocked_plans()?;
     let Some(root) = open_active_root(journal, sync_root)? else {
         return Err(ReconcileError::LocalRootChanged);
     };
@@ -517,11 +632,23 @@ fn replay_pending_at(
         sync_root,
         pending_plans
             .iter()
-            .filter(|plan| !download_pool.contains(&plan.path)),
+            .filter(|plan| !download_pool.contains_plan(plan)),
     )?;
+    record_occupied_download_stages(journal, &pending_plans, &report.blocked)?;
+    report
+        .blocked
+        .extend(blocked_plans.into_iter().filter_map(|plan| {
+            let PlanStatus::Blocked { reason, .. } = plan.status else {
+                return None;
+            };
+            Some(ReplayBlocked::DurablePlan {
+                path: plan.path,
+                reason,
+            })
+        }));
     for plan in pending_plans
         .iter()
-        .filter(|plan| download_pool.contains(&plan.path))
+        .filter(|plan| download_pool.contains_plan(plan))
     {
         let (_, source) = pending_download_operation(plan)?;
         report.blocked.push(ReplayBlocked::DownloadRequired {
@@ -529,7 +656,7 @@ fn replay_pending_at(
             content: source.content,
         });
     }
-    if let Some(error) = download_failure {
+    if let Some(error) = collected.failure {
         require_active_local_root(journal, sync_root)?;
         return Err(error);
     }
@@ -545,7 +672,11 @@ fn replay_pending_at(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
-    if missing_downloads.is_empty() && download_pool.is_empty() {
+    let blocked_download_is_live = journal
+        .blocked_plans()?
+        .iter()
+        .any(|plan| pending_download_identity(plan).is_some());
+    if missing_downloads.is_empty() && download_pool.is_empty() && !blocked_download_is_live {
         let _ = lease_download_slots(upload_staging, &[])?;
     }
     if !missing_downloads.is_empty() {
@@ -563,6 +694,10 @@ fn replay_pending_at(
             };
             let (operation_id, source) = pending_download_operation(&plan)?;
             downloads.push(PendingDownload {
+                identity: DownloadIdentity {
+                    plan: plan.id,
+                    operation: operation_id,
+                },
                 slot_identity: DownloadSlotIdentity::new(
                     root_generation,
                     operation_id,
@@ -588,6 +723,63 @@ fn replay_pending_at(
     report.completed_operations += remote.completed_operations;
     report.blocked.extend(remote.blocked);
     Ok(report)
+}
+
+const DOWNLOAD_BLOCK_RETRY_SECONDS: u64 = 60 * 60;
+
+fn unix_now() -> Result<u64, ReconcileError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|source| ReconcileError::Clock { source })
+}
+
+fn record_download_blocks(
+    journal: &mut Journal,
+    blocked: &[BlockedDownload],
+) -> Result<(), ReconcileError> {
+    if blocked.is_empty() {
+        return Ok(());
+    }
+    let retry_at = unix_now()?.saturating_add(DOWNLOAD_BLOCK_RETRY_SECONDS);
+    let pending = journal.pending_plans()?;
+    for blocked in blocked {
+        let current = pending.iter().find(|plan| {
+            plan.path == blocked.path
+                && plan.id == blocked.identity.plan
+                && pending_download_identity(plan) == Some(blocked.identity)
+        });
+        let Some(plan) = current else {
+            continue;
+        };
+        match journal.block_plan(plan.id, &blocked.reason, retry_at)? {
+            PlanBlock::Blocked | PlanBlock::AlreadyCompleted | PlanBlock::NotFound => {}
+        }
+    }
+    Ok(())
+}
+
+fn record_occupied_download_stages(
+    journal: &mut Journal,
+    pending: &[PlanRecord],
+    blocked: &[ReplayBlocked],
+) -> Result<(), ReconcileError> {
+    for blocker in blocked {
+        let ReplayBlocked::StageDestinationOccupied { plan_id, .. } = blocker else {
+            continue;
+        };
+        let Some(plan) = pending
+            .iter()
+            .find(|plan| plan.id == *plan_id && pending_download_identity(plan).is_some())
+        else {
+            continue;
+        };
+        let retry_at = unix_now()?.saturating_add(DOWNLOAD_BLOCK_RETRY_SECONDS);
+        match journal.block_plan(plan.id, &BlockReason::StageOccupied, retry_at)? {
+            PlanBlock::Blocked | PlanBlock::AlreadyCompleted | PlanBlock::NotFound => {}
+        }
+    }
+    Ok(())
 }
 
 /// Run startup replay, publish two complete inventories, and plan every known path once.
@@ -683,7 +875,9 @@ fn resolve_case_collision(
     };
     let rename = case_variant_move(observations, source, name_max)?;
     let canonical_source = CanonicalPath::from_display(&rename.source);
-    for pending in journal.pending_plans()? {
+    let mut live = journal.pending_plans()?;
+    live.extend(journal.blocked_plans()?);
+    for pending in live {
         let canonical_pending = CanonicalPath::from_display(&pending.path);
         if canonical_pending == canonical_source || canonical_pending.is_beneath(&canonical_source)
         {
@@ -710,8 +904,9 @@ fn reconcile_published(
 ) -> Result<ReconcileOutcome, ReconcileError> {
     let local = local_map(local_observations)?;
     let remote = remote_map(journal.remote_inventory()?.observations);
-    let pending = journal
-        .pending_plans()?
+    let mut live_plans = journal.pending_plans()?;
+    live_plans.extend(journal.blocked_plans()?);
+    let live = live_plans
         .into_iter()
         .map(|plan| (CanonicalPath::from_display(&plan.path), plan))
         .collect::<BTreeMap<_, _>>();
@@ -732,10 +927,7 @@ fn reconcile_published(
     let mut sync_error_paths = replay
         .blocked
         .iter()
-        .filter_map(|blocked| match blocked {
-            ReplayBlocked::SyncError { path, .. } => Some(path.clone()),
-            _ => None,
-        })
+        .filter_map(replay_sync_error_path)
         .collect::<BTreeSet<_>>();
     let mut noops = Vec::new();
     let mut decisions = Vec::new();
@@ -743,7 +935,7 @@ fn reconcile_published(
         baselines,
         &local,
         &remote,
-        &pending,
+        &live,
         |canonical_path,
          baseline_record,
          local_record,
@@ -773,7 +965,7 @@ fn reconcile_published(
                 .map(|record| record.path.clone())
                 .or_else(|| remote_record.map(|record| record.path.clone()))
                 .or(baseline_path)
-                .or_else(|| pending.get(canonical_path).map(|plan| plan.path.clone()))
+                .or_else(|| live.get(canonical_path).map(|plan| plan.path.clone()))
                 .ok_or_else(|| {
                     invalid(
                         canonical_path.as_path(),
@@ -786,7 +978,7 @@ fn reconcile_published(
                 Decision::NoOp(noop) if &baseline == noop.baseline()
             );
             match decision {
-                Decision::NoOp(noop) if !pending.contains_key(canonical_path) => {
+                Decision::NoOp(noop) if !live.contains_key(canonical_path) => {
                     if baseline_matches_noop && !conflict_paths.contains(canonical_path) {
                         report.noops += 1;
                     } else {
@@ -806,6 +998,7 @@ fn reconcile_published(
     decisions.sort_by(order_path_decisions);
     let mut blocked_paths = BTreeSet::new();
     let mut plans = Vec::new();
+    let now = unix_now()?;
 
     for PathDecision {
         canonical_path,
@@ -814,8 +1007,8 @@ fn reconcile_published(
         decision,
     } in decisions
     {
-        if let Some(pending_plan) = pending.get(&canonical_path) {
-            if downloads.contains(&pending_plan.path) {
+        if let Some(pending_plan) = live.get(&canonical_path) {
+            if downloads.contains_plan(pending_plan) {
                 blocked_paths.insert(canonical_path.clone());
                 continue;
             }
@@ -833,13 +1026,25 @@ fn reconcile_published(
             } else if matches!(decision, Decision::DirectoryCollision(_)) {
                 supersede_pending_plan(journal, pending_plan)?;
                 return Ok(ReconcileOutcome::FreshObservationRequired { path });
-            } else if matches!(decision, Decision::Blocked(_))
-                || matches!(
-                    &decision,
-                    Decision::Operations(plan)
-                        if remaining_operations_match(pending_plan, plan)
-                )
+            } else if matches!(decision, Decision::Blocked(_)) {
+                blocked_paths.insert(canonical_path.clone());
+                continue;
+            } else if let Decision::Operations(plan) = &decision
+                && remaining_operations_match(pending_plan, plan)
             {
+                if let PlanStatus::Blocked { retry_at, .. } = &pending_plan.status
+                    && *retry_at <= now
+                {
+                    match journal.unblock_plan(pending_plan.id)? {
+                        PlanUnblock::Unblocked | PlanUnblock::NotBlocked => {}
+                        PlanUnblock::NotFound => {
+                            return Err(invalid(
+                                &pending_plan.path,
+                                "due blocked plan disappeared",
+                            ));
+                        }
+                    }
+                }
                 blocked_paths.insert(canonical_path.clone());
                 continue;
             } else {
@@ -915,10 +1120,7 @@ fn reconcile_published(
     );
     let applied = replay_pending_at(journal, dropbox, downloads, sync_root, upload_staging)?;
     report.replayed_operations += applied.completed_operations;
-    sync_error_paths.extend(applied.blocked.iter().filter_map(|blocked| match blocked {
-        ReplayBlocked::SyncError { path, .. } => Some(path.clone()),
-        _ => None,
-    }));
+    sync_error_paths.extend(applied.blocked.iter().filter_map(replay_sync_error_path));
     if let Some(path) = applied.blocked.iter().find_map(|blocked| match blocked {
         ReplayBlocked::FreshObservationRequired { path } => Some(path.clone()),
         _ => None,
@@ -928,10 +1130,10 @@ fn reconcile_published(
     journal.prune_completed_work()?;
     prune_completed_recoveries(journal, recovery_directory)?;
     let retained_uploads = journal.pending_upload_content()?;
-    let pending = journal.pending_plans()?;
+    let mut live = journal.pending_plans()?;
+    live.extend(journal.blocked_plans()?);
     blocked_paths.extend(
-        pending
-            .into_iter()
+        live.into_iter()
             .map(|plan| CanonicalPath::from_display(&plan.path)),
     );
     report.blocked = blocked_paths.len();
@@ -939,6 +1141,17 @@ fn reconcile_published(
     report.downloads_in_progress = !downloads.is_empty();
     remove_unreferenced_upload_stages(upload_staging, &retained_uploads)?;
     Ok(ReconcileOutcome::Complete(report))
+}
+
+fn replay_sync_error_path(blocked: &ReplayBlocked) -> Option<PathBuf> {
+    match blocked {
+        ReplayBlocked::SyncError { path, .. }
+        | ReplayBlocked::DurablePlan {
+            path,
+            reason: BlockReason::DownloadUnavailable { .. },
+        } => Some(path.clone()),
+        _ => None,
+    }
 }
 
 fn remaining_operations_match(pending: &PlanRecord, fresh: &OperationPlan) -> bool {
@@ -1208,6 +1421,7 @@ fn supersede_pending_plan(
 
 struct PendingDownload {
     path: PathBuf,
+    identity: DownloadIdentity,
     source: RemoteFile,
     slot_identity: DownloadSlotIdentity,
     slot: Option<DownloadSlotLease>,
@@ -1235,6 +1449,23 @@ fn pending_download_operation(
                 "pending download blocker has no matching local operation",
             )
         })
+}
+
+fn pending_download_identity(plan: &PlanRecord) -> Option<DownloadIdentity> {
+    plan.operations.iter().find_map(|planned| {
+        if planned.status == RecordStatus::Completed
+            || !matches!(
+                &planned.operation,
+                Operation::InstallLocal { .. } | Operation::ReplaceLocal { .. }
+            )
+        {
+            return None;
+        }
+        Some(DownloadIdentity {
+            plan: plan.id,
+            operation: planned.id,
+        })
+    })
 }
 
 fn lease_pending_downloads(
@@ -1270,6 +1501,7 @@ fn schedule_pending_downloads(
             root_path: root_path.to_path_buf(),
             staging_directory: upload_staging.to_path_buf(),
             path: download.path,
+            identity: download.identity,
             source: download.source,
             slot_identity: download.slot_identity,
             slot: download.slot,
@@ -1655,6 +1887,86 @@ mod tests {
 
     use super::*;
     use crate::local::{ConflictSide, conflict_relative_path, dropbox_content_hash};
+
+    fn remote_download_error(source: DropboxError) -> ReconcileError {
+        ReconcileError::RemoteDownload {
+            path: PathBuf::from("download.txt"),
+            source,
+        }
+    }
+
+    #[test]
+    fn download_failures_separate_path_blocks_from_global_errors() {
+        for status in [400, 403, 404, 409, 422, 499] {
+            assert_eq!(
+                download_block_reason(&remote_download_error(DropboxError::HttpStatus {
+                    operation: "download exact Dropbox revision",
+                    status,
+                })),
+                Some(BlockReason::DownloadUnavailable { status })
+            );
+        }
+        for status in [401, 429, 500] {
+            assert_eq!(
+                download_block_reason(&remote_download_error(DropboxError::HttpStatus {
+                    operation: "download exact Dropbox revision",
+                    status,
+                })),
+                None
+            );
+        }
+        assert_eq!(
+            download_block_reason(&remote_download_error(DropboxError::RateLimited {
+                operation: "download exact Dropbox revision",
+                retry_after: Some(std::time::Duration::from_secs(1)),
+            })),
+            None
+        );
+        for source in [
+            DropboxError::DownloadedRevisionChanged,
+            DropboxError::DownloadedIdentityChanged,
+            DropboxError::DownloadedSizeChanged,
+            DropboxError::InvalidDownloadRange,
+            DropboxError::DownloadedLengthChanged,
+        ] {
+            assert_eq!(
+                download_block_reason(&remote_download_error(source)),
+                Some(BlockReason::DownloadVerificationFailed)
+            );
+        }
+        assert_eq!(
+            download_block_reason(&ReconcileError::StageDestinationOccupied {
+                path: PathBuf::from("private-stage"),
+            }),
+            Some(BlockReason::StageOccupied)
+        );
+    }
+
+    #[test]
+    fn local_download_path_objects_are_durable_blocks() {
+        let unsupported = remote_download_error(DropboxError::LocalStage {
+            source: LocalError::UnsupportedObject {
+                path: PathBuf::from("download.txt"),
+            },
+        });
+        assert_eq!(
+            download_block_reason(&unsupported),
+            Some(BlockReason::LocalObjectInWay)
+        );
+        for errno in [rustix::io::Errno::LOOP, rustix::io::Errno::NOTDIR] {
+            let source = remote_download_error(DropboxError::LocalStage {
+                source: LocalError::Io {
+                    operation: "prepare exact download",
+                    path: PathBuf::from("download.txt"),
+                    source: io::Error::from_raw_os_error(errno.raw_os_error()),
+                },
+            });
+            assert_eq!(
+                download_block_reason(&source),
+                Some(BlockReason::LocalObjectInWay)
+            );
+        }
+    }
 
     fn local_records(paths: impl IntoIterator<Item = PathBuf>) -> Vec<LocalObservationRecord> {
         paths

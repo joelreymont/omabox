@@ -1,9 +1,11 @@
 ---
 title: Isolate unavailable downloads with durable per-path retry
-status: active
+status: closed
 priority: 1
 issue-type: task
-created-at: "\"2026-09-04T21:20:46.161126+02:00\""
+created-at: "\"\\\"2026-09-04T21:20:46.161126+02:00\\\"\""
+closed-at: "2026-09-04T21:53:55.564074+02:00"
+close-reason: "landed and verified: Astra reviewed worker identity, fresh-observation retry ordering, blocked checkpoint retention and preserved malformed-response coverage; cargo fmt --check, cargo clippy --all-targets -- -D warnings, cargo test (290 tests) and forbidden Rust scan passed; DownloadExecutor TLC (1548 distinct states), SyncBehavior TLC (102) and DownloadLifecycle TLC (543401) passed"
 blocks:
   - omabox-retire-obsolete-installs-5bc2d6f3
 ---

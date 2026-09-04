@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use miette::Diagnostic;
 use thiserror::Error;
 
-use crate::journal::{Journal, JournalError, RecordStatus};
+use crate::journal::{BlockReason, Journal, JournalError, PlanStatus, RecordStatus};
 use crate::model::Observation;
 
 /// Status shown before setup has created a journal.
@@ -60,6 +60,22 @@ fn render_journal(journal: &mut Journal) -> Result<String, StatusError> {
         entries.push(StatusEntry::new(plan.path, detail));
     }
 
+    for plan in journal
+        .blocked_plans()
+        .map_err(|source| status("read blocked sync plans", source))?
+    {
+        let PlanStatus::Blocked { reason, .. } = plan.status else {
+            continue;
+        };
+        entries.push(StatusEntry::new(
+            plan.path,
+            format!(
+                "blocked sync: {}; retry is scheduled",
+                block_reason(&reason)
+            ),
+        ));
+    }
+
     for record in journal
         .local_inventory()
         .map_err(|source| status("read local observations", source))?
@@ -101,6 +117,25 @@ fn render_journal(journal: &mut Journal) -> Result<String, StatusError> {
             .then_with(|| left.detail.cmp(&right.detail))
     });
     Ok(render_entries(&entries))
+}
+
+fn block_reason(reason: &BlockReason) -> String {
+    match reason {
+        BlockReason::RemoteRejected { tag } => {
+            format!("Dropbox rejected the path ({tag})")
+        }
+        BlockReason::DownloadUnavailable { status } => {
+            format!("Dropbox download returned HTTP {status}")
+        }
+        BlockReason::DownloadVerificationFailed => {
+            String::from("Dropbox download did not match its recorded identity")
+        }
+        BlockReason::StageOccupied => {
+            String::from("unrelated data occupies the private staging path")
+        }
+        BlockReason::LocalObjectInWay => String::from("a local object blocks the download path"),
+        BlockReason::RemoteObject => String::from("a Dropbox object blocks the file path"),
+    }
 }
 
 /// A typed failure while reading durable status.
@@ -180,7 +215,8 @@ mod tests {
     use std::fs;
 
     use crate::journal::{
-        LocalObservationRecord, PlanWrite, RecoveryWrite, RemoteObservationRecord,
+        BlockReason, LocalObservationRecord, PlanBlock, PlanWrite, RecoveryWrite,
+        RemoteObservationRecord,
     };
     use crate::model::{
         CanonicalPath, Conflict, ContentIdentity, LocalFile, Observation, Operation, OperationPlan,
@@ -235,6 +271,25 @@ mod tests {
         else {
             return Err("fresh recovery was not recorded".into());
         };
+        let blocked_plan = OperationPlan::new(vec![Operation::InstallLocal {
+            source: RemoteFile::new(
+                ContentIdentity::new("blocked-content-must-not-render"),
+                crate::model::DropboxRevision::new("blocked-revision-must-not-render"),
+            ),
+        }]);
+        let PlanWrite::Recorded(blocked) =
+            journal.record_plan(Path::new("n-blocked.txt"), &blocked_plan)?
+        else {
+            return Err("fresh blocked plan was already live".into());
+        };
+        assert_eq!(
+            journal.block_plan(
+                blocked.id,
+                &BlockReason::DownloadUnavailable { status: 409 },
+                1_700_000_000,
+            )?,
+            PlanBlock::Blocked
+        );
         journal.record_conflict(
             Path::new("b-diverged.txt"),
             &Conflict::RemoteDeletionLocalEdit {
@@ -258,6 +313,7 @@ mod tests {
         - a-remote.txt: Dropbox status unknown: inventory is stale
         - m-pending.txt: pending sync: 2 remaining; next: preserve displaced local payload
         - m-pending.txt: recovery copy is pending
+        - n-blocked.txt: blocked sync: Dropbox download returned HTTP 409; retry is scheduled
         - z-local.txt: local status unknown: path is inaccessible
         "###);
         for forbidden in [
@@ -265,6 +321,8 @@ mod tests {
             "cursor-must-not-render",
             "content-id-must-not-render",
             "revision-must-not-render",
+            "blocked-content-must-not-render",
+            "blocked-revision-must-not-render",
             "local-secret-sentinel",
             "remote-secret-sentinel",
             "account-id-must-not-render",
