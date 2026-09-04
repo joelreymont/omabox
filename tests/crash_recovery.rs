@@ -1,6 +1,10 @@
+use std::collections::BTreeSet;
+use std::env;
 use std::error::Error;
 use std::io::{self, Cursor, Read};
+use std::os::unix::fs::FileTypeExt as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use omabox::journal::{
     Journal, LocalObservationRecord, LocalRootBinding, OperationCompletion, PlanRecord, PlanWrite,
@@ -15,7 +19,8 @@ use omabox::model::{
     RemoteFile, UnknownReason,
 };
 use omabox::planner::plan;
-use omabox::recovery::replay_local_operations;
+use omabox::recovery::{ReplayBlocked, replay_local_operations};
+use rustix::fs::{CWD, Mode, mkfifoat};
 use tempfile::TempDir;
 
 fn identity(bytes: &[u8]) -> Result<ContentIdentity, Box<dyn Error>> {
@@ -593,6 +598,165 @@ fn changed_delete_precondition_is_left_pending_without_a_copy() -> Result<(), Bo
     assert_eq!(std::fs::read(root.join("changed.txt"))?, b"new local edit");
     assert!(recovery_directory.read_dir()?.next().is_none());
     assert_eq!(journal.pending_plans()?.len(), 1);
+    Ok(())
+}
+
+const SPECIAL_OBJECT_CHILD: &str = "OMABOX_SPECIAL_OBJECT_REPLAY_CHILD";
+
+#[test]
+fn local_replay_special_objects_finish_without_blocking() -> Result<(), Box<dyn Error>> {
+    let test_binary = env::current_exe()?;
+    let status = Command::new("/usr/bin/timeout")
+        .arg("--signal=KILL")
+        .arg("5s")
+        .arg(test_binary)
+        .arg("--exact")
+        .arg("local_replay_special_objects_child")
+        .arg("--nocapture")
+        .env(SPECIAL_OBJECT_CHILD, "1")
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "special-object replay child failed or exceeded its deadline: {status}"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+#[test]
+fn local_replay_special_objects_child() -> Result<(), Box<dyn Error>> {
+    if env::var_os(SPECIAL_OBJECT_CHILD).is_none() {
+        return Ok(());
+    }
+
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    std::fs::create_dir(&root)?;
+    let old = remote(b"old", "rev-old")?;
+    let delete_plan = operations(plan(
+        &Baseline::Present(old.clone()),
+        &Observation::Present(LocalFile::new(old.content.clone())),
+        &Observation::ConfirmedAbsent,
+    ))?;
+    let install = remote(b"downloaded", "rev-download")?;
+    let install_plan = operations(plan(
+        &Baseline::Absent,
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(install.clone()),
+    ))?;
+    let create_directory_plan = operations(plan(
+        &Baseline::Absent,
+        &Observation::ConfirmedAbsent,
+        &Observation::Directory,
+    ))?;
+    let delete_directory_plan = operations(plan(
+        &Baseline::Directory,
+        &Observation::Directory,
+        &Observation::ConfirmedAbsent,
+    ))?;
+    let delete_fifo = Path::new("delete-fifo");
+    let delete_symlink = Path::new("delete-symlink");
+    let delete_below_file = Path::new("parent/child");
+    let delete_regular = Path::new("delete-regular");
+    let install_fifo = Path::new("install-fifo");
+    let create_directory_below_symlink = Path::new("create-directory-parent/child");
+    let delete_directory_below_file = Path::new("delete-directory-parent/child");
+
+    std::fs::write(root.join(delete_fifo), b"old")?;
+    std::fs::write(root.join(delete_symlink), b"old")?;
+    std::fs::create_dir(root.join("parent"))?;
+    std::fs::write(root.join(delete_below_file), b"old")?;
+    std::fs::write(root.join(delete_regular), b"old")?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    for path in [
+        delete_fifo,
+        delete_symlink,
+        delete_below_file,
+        delete_regular,
+    ] {
+        let _ = recorded_plan(journal.record_plan(path, &delete_plan)?)?;
+    }
+    let _ = recorded_plan(journal.record_plan(install_fifo, &install_plan)?)?;
+    let _ = recorded_plan(
+        journal.record_plan(create_directory_below_symlink, &create_directory_plan)?,
+    )?;
+    std::fs::create_dir_all(root.join(delete_directory_below_file))?;
+    let _ =
+        recorded_plan(journal.record_plan(delete_directory_below_file, &delete_directory_plan)?)?;
+    staged_download(stage_download(
+        &root,
+        install_fifo,
+        &install.content,
+        Cursor::new(b"downloaded"),
+    )?)?;
+
+    std::fs::remove_file(root.join(delete_fifo))?;
+    mkfifoat(CWD, root.join(delete_fifo), Mode::RUSR | Mode::WUSR)?;
+    std::fs::remove_file(root.join(delete_symlink))?;
+    std::os::unix::fs::symlink("elsewhere", root.join(delete_symlink))?;
+    std::fs::remove_file(root.join(delete_below_file))?;
+    std::fs::remove_dir(root.join("parent"))?;
+    std::fs::write(root.join("parent"), b"not a directory")?;
+    std::os::unix::fs::symlink("elsewhere", root.join("create-directory-parent"))?;
+    std::fs::remove_dir(root.join(delete_directory_below_file))?;
+    std::fs::remove_dir(root.join("delete-directory-parent"))?;
+    std::fs::write(root.join("delete-directory-parent"), b"not a directory")?;
+    mkfifoat(CWD, root.join(install_fifo), Mode::RUSR | Mode::WUSR)?;
+
+    let report = replay_local_operations(&mut journal, &root)?;
+    assert_eq!(report.completed_operations, 1);
+    let mut blocked_paths = BTreeSet::new();
+    for blocked in report.blocked {
+        match blocked {
+            ReplayBlocked::LocalObject { path } => {
+                blocked_paths.insert(path);
+            }
+            other => {
+                return Err(io::Error::other(format!(
+                    "special object produced the wrong replay blocker: {other:?}"
+                ))
+                .into());
+            }
+        }
+    }
+    assert_eq!(
+        blocked_paths,
+        [
+            delete_fifo,
+            delete_symlink,
+            delete_below_file,
+            install_fifo,
+            create_directory_below_symlink,
+            delete_directory_below_file,
+        ]
+        .into_iter()
+        .map(Path::to_path_buf)
+        .collect()
+    );
+    assert!(!root.join(delete_regular).exists());
+    assert!(
+        std::fs::symlink_metadata(root.join(delete_fifo))?
+            .file_type()
+            .is_fifo()
+    );
+    assert!(
+        std::fs::symlink_metadata(root.join(install_fifo))?
+            .file_type()
+            .is_fifo()
+    );
+    assert!(
+        std::fs::symlink_metadata(root.join(delete_symlink))?
+            .file_type()
+            .is_symlink()
+    );
+    assert!(root.join("parent").is_file());
+    let pending_paths = journal
+        .pending_plans()?
+        .into_iter()
+        .map(|pending| pending.path)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(pending_paths, blocked_paths);
     Ok(())
 }
 

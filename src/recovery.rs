@@ -89,6 +89,11 @@ pub(crate) enum ExactCopyOutcome {
 /// Why a replayable operation remains pending.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplayBlocked {
+    /// A symlink, special object, or non-directory ancestor blocks a local effect.
+    LocalObject {
+        /// Synchronized path preserved without mutation.
+        path: PathBuf,
+    },
     /// A raced directory effect was retired so a complete scan can replan it.
     FreshObservationRequired {
         /// Synchronized path that must be observed again.
@@ -337,37 +342,54 @@ pub(crate) fn replay_local_plans_at<'a>(
                 continue;
             }
             let blocked = match &planned.operation {
-                Operation::CreateLocalDirectory => match create_directory_at(root, &plan.path)? {
-                    CreateDirectoryOutcome::Created | CreateDirectoryOutcome::AlreadyPresent => {
-                        final_completions.push(FinalCompletion::new(
-                            planned,
-                            &plan.path,
-                            Baseline::Directory,
-                        ));
-                        None
-                    }
-                    CreateDirectoryOutcome::FreshObservation => {
-                        supersede_plan(journal, plan)?;
-                        Some(ReplayBlocked::FreshObservationRequired {
+                Operation::CreateLocalDirectory => match create_directory_at(root, &plan.path) {
+                    Err(source) if local_object_blocks_replay(&source) => {
+                        Some(ReplayBlocked::LocalObject {
                             path: plan.path.clone(),
                         })
                     }
+                    Err(source) => return Err(source.into()),
+                    Ok(outcome) => match outcome {
+                        CreateDirectoryOutcome::Created
+                        | CreateDirectoryOutcome::AlreadyPresent => {
+                            final_completions.push(FinalCompletion::new(
+                                planned,
+                                &plan.path,
+                                Baseline::Directory,
+                            ));
+                            None
+                        }
+                        CreateDirectoryOutcome::FreshObservation => {
+                            supersede_plan(journal, plan)?;
+                            Some(ReplayBlocked::FreshObservationRequired {
+                                path: plan.path.clone(),
+                            })
+                        }
+                    },
                 },
-                Operation::DeleteLocalDirectory => match delete_directory_at(root, &plan.path)? {
-                    DeleteDirectoryOutcome::Deleted | DeleteDirectoryOutcome::AlreadyAbsent => {
-                        final_completions.push(FinalCompletion::new(
-                            planned,
-                            &plan.path,
-                            Baseline::Absent,
-                        ));
-                        None
-                    }
-                    DeleteDirectoryOutcome::FreshObservation => {
-                        supersede_plan(journal, plan)?;
-                        Some(ReplayBlocked::FreshObservationRequired {
+                Operation::DeleteLocalDirectory => match delete_directory_at(root, &plan.path) {
+                    Err(source) if local_object_blocks_replay(&source) => {
+                        Some(ReplayBlocked::LocalObject {
                             path: plan.path.clone(),
                         })
                     }
+                    Err(source) => return Err(source.into()),
+                    Ok(outcome) => match outcome {
+                        DeleteDirectoryOutcome::Deleted | DeleteDirectoryOutcome::AlreadyAbsent => {
+                            final_completions.push(FinalCompletion::new(
+                                planned,
+                                &plan.path,
+                                Baseline::Absent,
+                            ));
+                            None
+                        }
+                        DeleteDirectoryOutcome::FreshObservation => {
+                            supersede_plan(journal, plan)?;
+                            Some(ReplayBlocked::FreshObservationRequired {
+                                path: plan.path.clone(),
+                            })
+                        }
+                    },
                 },
                 Operation::PreserveLocal { .. } => {
                     complete_nonfinal(journal, planned, &plan.path)?;
@@ -375,28 +397,38 @@ pub(crate) fn replay_local_plans_at<'a>(
                     None
                 }
                 Operation::InstallLocal { source } => {
-                    match install_download_at(root, root_path, &plan.path, &source.content, None)? {
-                        InstallOutcome::Installed | InstallOutcome::AlreadyInstalled => {
-                            final_completions.push(FinalCompletion::new(
-                                planned,
-                                &plan.path,
-                                Baseline::Present(source.clone()),
-                            ));
-                            None
-                        }
-                        InstallOutcome::DownloadRequired => Some(ReplayBlocked::DownloadRequired {
-                            path: plan.path.clone(),
-                            content: source.content.clone(),
-                        }),
-                        InstallOutcome::StageDestinationOccupied { path } => {
-                            Some(ReplayBlocked::StageDestinationOccupied { path })
-                        }
-                        InstallOutcome::PreconditionChanged { actual } => {
-                            Some(ReplayBlocked::PreconditionChanged {
+                    match install_download_at(root, root_path, &plan.path, &source.content, None) {
+                        Err(source) if local_object_blocks_replay(&source) => {
+                            Some(ReplayBlocked::LocalObject {
                                 path: plan.path.clone(),
-                                actual,
                             })
                         }
+                        Err(source) => return Err(source.into()),
+                        Ok(outcome) => match outcome {
+                            InstallOutcome::Installed | InstallOutcome::AlreadyInstalled => {
+                                final_completions.push(FinalCompletion::new(
+                                    planned,
+                                    &plan.path,
+                                    Baseline::Present(source.clone()),
+                                ));
+                                None
+                            }
+                            InstallOutcome::DownloadRequired => {
+                                Some(ReplayBlocked::DownloadRequired {
+                                    path: plan.path.clone(),
+                                    content: source.content.clone(),
+                                })
+                            }
+                            InstallOutcome::StageDestinationOccupied { path } => {
+                                Some(ReplayBlocked::StageDestinationOccupied { path })
+                            }
+                            InstallOutcome::PreconditionChanged { actual } => {
+                                Some(ReplayBlocked::PreconditionChanged {
+                                    path: plan.path.clone(),
+                                    actual,
+                                })
+                            }
+                        },
                     }
                 }
                 Operation::ReplaceLocal {
@@ -409,46 +441,64 @@ pub(crate) fn replay_local_plans_at<'a>(
                         &plan.path,
                         &source.content,
                         Some(expected_content),
-                    )? {
-                        InstallOutcome::Installed | InstallOutcome::AlreadyInstalled => {
-                            final_completions.push(FinalCompletion::new(
-                                planned,
-                                &plan.path,
-                                Baseline::Present(source.clone()),
-                            ));
-                            None
-                        }
-                        InstallOutcome::DownloadRequired => Some(ReplayBlocked::DownloadRequired {
-                            path: plan.path.clone(),
-                            content: source.content.clone(),
-                        }),
-                        InstallOutcome::StageDestinationOccupied { path } => {
-                            Some(ReplayBlocked::StageDestinationOccupied { path })
-                        }
-                        InstallOutcome::PreconditionChanged { actual } => {
-                            Some(ReplayBlocked::PreconditionChanged {
+                    ) {
+                        Err(source) if local_object_blocks_replay(&source) => {
+                            Some(ReplayBlocked::LocalObject {
                                 path: plan.path.clone(),
-                                actual,
                             })
                         }
+                        Err(source) => return Err(source.into()),
+                        Ok(outcome) => match outcome {
+                            InstallOutcome::Installed | InstallOutcome::AlreadyInstalled => {
+                                final_completions.push(FinalCompletion::new(
+                                    planned,
+                                    &plan.path,
+                                    Baseline::Present(source.clone()),
+                                ));
+                                None
+                            }
+                            InstallOutcome::DownloadRequired => {
+                                Some(ReplayBlocked::DownloadRequired {
+                                    path: plan.path.clone(),
+                                    content: source.content.clone(),
+                                })
+                            }
+                            InstallOutcome::StageDestinationOccupied { path } => {
+                                Some(ReplayBlocked::StageDestinationOccupied { path })
+                            }
+                            InstallOutcome::PreconditionChanged { actual } => {
+                                Some(ReplayBlocked::PreconditionChanged {
+                                    path: plan.path.clone(),
+                                    actual,
+                                })
+                            }
+                        },
                     }
                 }
                 Operation::DeleteLocal { expected_content } => {
-                    match delete_local_at(root, root_path, &plan.path, expected_content)? {
-                        DeleteOutcome::Deleted | DeleteOutcome::AlreadyDeleted => {
-                            final_completions.push(FinalCompletion::new(
-                                planned,
-                                &plan.path,
-                                Baseline::Absent,
-                            ));
-                            None
-                        }
-                        DeleteOutcome::PreconditionChanged { actual } => {
-                            Some(ReplayBlocked::PreconditionChanged {
+                    match delete_local_at(root, root_path, &plan.path, expected_content) {
+                        Err(source) if local_object_blocks_replay(&source) => {
+                            Some(ReplayBlocked::LocalObject {
                                 path: plan.path.clone(),
-                                actual,
                             })
                         }
+                        Err(source) => return Err(source.into()),
+                        Ok(outcome) => match outcome {
+                            DeleteOutcome::Deleted | DeleteOutcome::AlreadyDeleted => {
+                                final_completions.push(FinalCompletion::new(
+                                    planned,
+                                    &plan.path,
+                                    Baseline::Absent,
+                                ));
+                                None
+                            }
+                            DeleteOutcome::PreconditionChanged { actual } => {
+                                Some(ReplayBlocked::PreconditionChanged {
+                                    path: plan.path.clone(),
+                                    actual,
+                                })
+                            }
+                        },
                     }
                 }
                 Operation::CreateRemoteDirectory
@@ -468,6 +518,18 @@ pub(crate) fn replay_local_plans_at<'a>(
     commit_final_completions(journal, &final_completions)?;
     report.completed_operations += final_completions.len();
     Ok(report)
+}
+
+fn local_object_blocks_replay(error: &LocalError) -> bool {
+    match error {
+        LocalError::UnsupportedObject { .. } => true,
+        LocalError::Io { source, .. } => {
+            let raw = source.raw_os_error();
+            raw == Some(rustix::io::Errno::LOOP.raw_os_error())
+                || raw == Some(rustix::io::Errno::NOTDIR.raw_os_error())
+        }
+        _ => false,
+    }
 }
 
 /// Replay every currently pending remote journal phase once.

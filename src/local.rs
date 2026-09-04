@@ -3509,8 +3509,11 @@ fn open_and_hash_at(
     path: &Path,
     operation: &'static str,
 ) -> Result<(File, ContentIdentity), LocalError> {
-    let mut file = open_relative_at(directory, name, path, OFlags::RDONLY)?;
-    let identity = hash_stable_file(&mut file, path, operation)?;
+    let Some((mut file, stat)) = open_regular_at_if_present(directory, name, path, operation)?
+    else {
+        return Err(syscall_failure(operation, path, rustix::io::Errno::NOENT));
+    };
+    let identity = hash_stable_file_from_stat(&mut file, path, operation, stat)?.0;
     Ok((file, identity))
 }
 
@@ -3529,22 +3532,57 @@ fn open_and_hash_if_present(
     path: &Path,
     operation: &'static str,
 ) -> Result<Option<(File, ContentIdentity, LocalFileFingerprint)>, LocalError> {
-    match openat2(
+    let Some((mut file, stat)) = open_regular_at_if_present(directory, name, path, operation)?
+    else {
+        return Ok(None);
+    };
+    let (content, fingerprint) = hash_stable_file_from_stat(&mut file, path, operation, stat)?;
+    Ok(Some((file, content, fingerprint)))
+}
+
+fn open_regular_at_if_present(
+    directory: &OwnedFd,
+    name: &OsStr,
+    path: &Path,
+    operation: &'static str,
+) -> Result<Option<(File, rustix::fs::Stat)>, LocalError> {
+    let probe = match openat2(
         directory,
         name,
-        OFlags::RDONLY | OFlags::CLOEXEC,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
         BELOW_ROOT,
     ) {
-        Ok(fd) => {
-            let mut file = File::from(fd);
-            let (content, fingerprint) =
-                hash_stable_file_with_fingerprint(&mut file, path, operation)?;
-            Ok(Some((file, content, fingerprint)))
-        }
-        Err(source) if source == rustix::io::Errno::NOENT => Ok(None),
-        Err(source) => Err(syscall_failure(operation, path, source)),
+        Ok(fd) => fd,
+        Err(source) if source == rustix::io::Errno::NOENT => return Ok(None),
+        Err(source) => return Err(syscall_failure(operation, path, source)),
+    };
+    let probed = stat_fd(&probe, path, operation)?;
+    if FileType::from_raw_mode(probed.st_mode) != FileType::RegularFile {
+        return Err(LocalError::UnsupportedObject {
+            path: path.to_path_buf(),
+        });
     }
+
+    let fd = match openat2(
+        directory,
+        name,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+        BELOW_ROOT,
+    ) {
+        Ok(fd) => fd,
+        Err(source) if source == rustix::io::Errno::NOENT => return Ok(None),
+        Err(source) => return Err(syscall_failure(operation, path, source)),
+    };
+    let file = File::from(fd);
+    let opened = stat_fd(&file, path, operation)?;
+    if FileType::from_raw_mode(opened.st_mode) != FileType::RegularFile {
+        return Err(LocalError::UnsupportedObject {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(Some((file, opened)))
 }
 
 #[derive(Clone, Copy)]
@@ -4023,7 +4061,14 @@ fn sync_installed_file(
     target_name: &OsStr,
     target: &Path,
 ) -> Result<(), LocalError> {
-    let file = open_relative_at(parent, target_name, target, OFlags::RDONLY)?;
+    let Some((file, _)) =
+        open_regular_at_if_present(parent, target_name, target, "open installed file for sync")?
+    else {
+        return Err(LocalError::ChangedDuringRead {
+            operation: "open installed file for sync",
+            path: target.to_path_buf(),
+        });
+    };
     fsync(&file).map_err(|source| syscall_failure("sync installed file", target, source))?;
     sync_directory(parent, target, "sync installed file entry")
 }
