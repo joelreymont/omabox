@@ -15,7 +15,7 @@ use thiserror::Error;
 use crate::dropbox::{DownloadAccess, DropboxClient, DropboxError};
 use crate::journal::{
     BaselineRecord, Journal, JournalError, LocalObservationRecord, PlanConflictCompletion,
-    PlanRecord, PlanSupersede, RemoteObservationRecord,
+    PlanRecord, PlanSupersede, RecordStatus, RemoteObservationRecord,
 };
 use crate::local::{
     DownloadSlotIdentity, DownloadSlotLease, LocalError, LocalRenameOutcome,
@@ -743,6 +743,7 @@ fn reconcile_published(
         baselines,
         &local,
         &remote,
+        &pending,
         |canonical_path,
          baseline_record,
          local_record,
@@ -772,6 +773,7 @@ fn reconcile_published(
                 .map(|record| record.path.clone())
                 .or_else(|| remote_record.map(|record| record.path.clone()))
                 .or(baseline_path)
+                .or_else(|| pending.get(canonical_path).map(|plan| plan.path.clone()))
                 .ok_or_else(|| {
                     invalid(
                         canonical_path.as_path(),
@@ -827,13 +829,22 @@ fn reconcile_published(
                     }
                 }
                 report.conflicts += 1;
+                continue;
             } else if matches!(decision, Decision::DirectoryCollision(_)) {
                 supersede_pending_plan(journal, pending_plan)?;
                 return Ok(ReconcileOutcome::FreshObservationRequired { path });
-            } else {
+            } else if matches!(decision, Decision::Blocked(_))
+                || matches!(
+                    &decision,
+                    Decision::Operations(plan)
+                        if remaining_operations_match(pending_plan, plan)
+                )
+            {
                 blocked_paths.insert(canonical_path.clone());
+                continue;
+            } else {
+                supersede_pending_plan(journal, pending_plan)?;
             }
-            continue;
         }
 
         match decision {
@@ -928,6 +939,15 @@ fn reconcile_published(
     report.downloads_in_progress = !downloads.is_empty();
     remove_unreferenced_upload_stages(upload_staging, &retained_uploads)?;
     Ok(ReconcileOutcome::Complete(report))
+}
+
+fn remaining_operations_match(pending: &PlanRecord, fresh: &OperationPlan) -> bool {
+    pending
+        .operations
+        .iter()
+        .filter(|planned| planned.status == RecordStatus::Pending)
+        .map(|planned| &planned.operation)
+        .eq(fresh.operations())
 }
 
 struct PathDecision {
@@ -1554,6 +1574,7 @@ fn for_each_known_path<E>(
     baselines: Vec<BaselineRecord>,
     local: &[(CanonicalPath, LocalObservationRecord)],
     remote: &[RemoteObservationRecord],
+    pending: &BTreeMap<CanonicalPath, PlanRecord>,
     mut visit: impl FnMut(
         &CanonicalPath,
         Option<(PathBuf, Baseline)>,
@@ -1564,6 +1585,7 @@ fn for_each_known_path<E>(
     let mut baselines = baselines.into_iter().peekable();
     let mut local_index = 0;
     let mut remote_index = 0;
+    let mut pending_paths = pending.keys().peekable();
     loop {
         let side_minimum = [
             local
@@ -1572,6 +1594,7 @@ fn for_each_known_path<E>(
             remote
                 .get(remote_index)
                 .map(|record| &record.canonical_path),
+            pending_paths.peek().copied(),
         ]
         .into_iter()
         .flatten()
@@ -1605,7 +1628,13 @@ fn for_each_known_path<E>(
         if remote_record.is_some() {
             remote_index += 1;
         }
+        let advance_pending = pending_paths
+            .peek()
+            .is_some_and(|pending| *pending == canonical_path);
         visit(canonical_path, baseline, local_record, remote_record)?;
+        if advance_pending {
+            let _ = pending_paths.next();
+        }
     }
 }
 
@@ -1701,11 +1730,13 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let remote = remote_map(remote);
+            let pending = BTreeMap::new();
             let mut merged = Vec::new();
             for_each_known_path(
                 baselines,
                 &local,
                 &remote,
+                &pending,
                 |path, baseline, local, remote| -> Result<(), TestCaseError> {
                     let display = path.as_path();
                     prop_assert_eq!(baseline.is_some(), baseline_paths.contains(display));
@@ -1727,6 +1758,93 @@ mod tests {
             expected.dedup();
             prop_assert_eq!(merged, expected);
         }
+    }
+
+    #[test]
+    fn remaining_operation_comparison_ignores_a_completed_prefix() -> Result<(), Box<dyn Error>> {
+        let state = TempDir::new()?;
+        let mut journal = Journal::open(state.path().join("journal.sqlite3"))?;
+        let local = LocalFile::new(dropbox_content_hash(b"preserved".as_slice())?);
+        let remote = RemoteFile::new(
+            dropbox_content_hash(b"replacement".as_slice())?,
+            crate::model::DropboxRevision::new("replacement-revision"),
+        );
+        let original = OperationPlan::new(vec![
+            Operation::PreserveLocal { file: local },
+            Operation::InstallLocal {
+                source: remote.clone(),
+            },
+        ]);
+        let recorded = match journal.record_plan(Path::new("file.txt"), &original)? {
+            crate::journal::PlanWrite::Recorded(recorded) => recorded,
+            crate::journal::PlanWrite::AlreadyLive(_) => {
+                return Err("new test journal already held a live plan".into());
+            }
+        };
+        let [completed, _remaining] = recorded.operations.as_slice() else {
+            return Err("test plan did not contain two operations".into());
+        };
+        assert!(matches!(
+            journal.complete_operation(completed.id, None)?,
+            crate::journal::OperationCompletion::OperationCompleted
+        ));
+        let pending = journal.pending_plans()?;
+        let [pending] = pending.as_slice() else {
+            return Err("test journal did not retain one partial plan".into());
+        };
+        let fresh = OperationPlan::new(vec![Operation::InstallLocal { source: remote }]);
+
+        assert!(remaining_operations_match(pending, &fresh));
+        assert!(!remaining_operations_match(pending, &original));
+        Ok(())
+    }
+
+    #[test]
+    fn pending_only_paths_are_visited_as_absent_without_creating_a_baseline()
+    -> Result<(), Box<dyn Error>> {
+        let state = TempDir::new()?;
+        let path = Path::new("removed.txt");
+        let mut journal = Journal::open(state.path().join("journal.sqlite3"))?;
+        let remote = RemoteFile::new(
+            dropbox_content_hash(b"obsolete".as_slice())?,
+            crate::model::DropboxRevision::new("obsolete-revision"),
+        );
+        let operation_plan = OperationPlan::new(vec![Operation::InstallLocal { source: remote }]);
+        assert!(matches!(
+            journal.record_plan(path, &operation_plan)?,
+            crate::journal::PlanWrite::Recorded(_)
+        ));
+        let pending = journal
+            .pending_plans()?
+            .into_iter()
+            .map(|plan| (CanonicalPath::from_display(&plan.path), plan))
+            .collect::<BTreeMap<_, _>>();
+        let local = Vec::new();
+        let remote = Vec::new();
+        let mut decisions = Vec::new();
+
+        for_each_known_path(
+            Vec::new(),
+            &local,
+            &remote,
+            &pending,
+            |canonical, baseline, local, remote| -> Result<(), io::Error> {
+                assert_eq!(canonical, &CanonicalPath::from_display(path));
+                assert!(baseline.is_none());
+                assert!(local.is_none());
+                assert!(remote.is_none());
+                decisions.push(plan(
+                    &Baseline::Absent,
+                    &Observation::ConfirmedAbsent,
+                    &Observation::ConfirmedAbsent,
+                ));
+                Ok(())
+            },
+        )?;
+
+        assert!(matches!(decisions.as_slice(), [Decision::NoOp(_)]));
+        assert_eq!(journal.baseline(path)?, None);
+        Ok(())
     }
 
     fn merge_path(raw: &str) -> Option<PathBuf> {

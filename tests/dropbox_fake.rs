@@ -3710,6 +3710,361 @@ fn stale_upload_is_superseded_and_current_bytes_sync() -> Result<(), Box<dyn Err
 }
 
 #[test]
+fn matching_observations_retire_a_stale_install_and_later_edits_sync() -> Result<(), Box<dyn Error>>
+{
+    let stale_bytes = b"obsolete Dropbox bytes";
+    let current_bytes = b"matching current bytes";
+    let edited_bytes = b"later local edit";
+    let stale = RemoteFile::new(
+        dropbox_content_hash(stale_bytes.as_slice())?,
+        DropboxRevision::new("stale-revision"),
+    );
+    let current = RemoteFile::new(
+        dropbox_content_hash(current_bytes.as_slice())?,
+        DropboxRevision::new("current-revision"),
+    );
+    let edited = RemoteFile::new(
+        dropbox_content_hash(edited_bytes.as_slice())?,
+        DropboxRevision::new("edited-revision"),
+    );
+    let account = || {
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        }))
+        .for_path("/2/users/get_current_account")
+    };
+    let server = FakeServer::start(vec![
+        account(),
+        FakeResponse::json(json!({
+            "entries": [file_metadata(
+                "/file.txt",
+                "/file.txt",
+                current.revision.as_str(),
+                &current.content,
+            )],
+            "cursor": "matching-current",
+            "has_more": false,
+        }))
+        .for_path("/2/files/list_folder"),
+        account(),
+        FakeResponse::json(json!({
+            "entries": [],
+            "cursor": "matching-stable",
+            "has_more": false,
+        }))
+        .for_path("/2/files/list_folder/continue"),
+        account(),
+        FakeResponse::json(json!({
+            "entries": [],
+            "cursor": "after-local-edit",
+            "has_more": false,
+        }))
+        .for_path("/2/files/list_folder/continue"),
+        FakeResponse::json(file_metadata(
+            "/file.txt",
+            "/file.txt",
+            edited.revision.as_str(),
+            &edited.content,
+        ))
+        .for_path("/2/files/upload"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-stale-install-noop")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("file.txt"), current_bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    let stale_install = planned_operations(plan(
+        &Baseline::Absent,
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(stale),
+    ))?;
+    assert!(matches!(
+        journal.record_plan(Path::new("file.txt"), &stale_install)?,
+        PlanWrite::Recorded(_)
+    ));
+
+    let first = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+    assert_eq!(first.noops, 1);
+    assert_eq!(first.blocked, 0);
+    assert!(journal.pending_plans()?.is_empty());
+    assert_eq!(
+        journal.baseline(Path::new("file.txt"))?,
+        Some(Baseline::Present(current.clone()))
+    );
+
+    let second = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+    assert_eq!(second.noops, 1);
+    assert_eq!(second.blocked, 0);
+
+    std::fs::write(root.join("file.txt"), edited_bytes)?;
+    let third = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+    assert_eq!(third.planned, 1);
+    assert_eq!(third.replayed_operations, 1);
+    assert_eq!(third.blocked, 0);
+    assert!(journal.pending_plans()?.is_empty());
+    assert_eq!(
+        journal.baseline(Path::new("file.txt"))?,
+        Some(Baseline::Present(edited))
+    );
+    assert_eq!(server.finish()?.len(), 7);
+    Ok(())
+}
+
+#[test]
+fn a_changed_safe_operation_replaces_a_stale_install_in_the_same_pass() -> Result<(), Box<dyn Error>>
+{
+    let stale = RemoteFile::new(
+        dropbox_content_hash(b"obsolete Dropbox bytes".as_slice())?,
+        DropboxRevision::new("stale-revision"),
+    );
+    let current_bytes = b"current local bytes";
+    let current_content = dropbox_content_hash(current_bytes.as_slice())?;
+    let current = RemoteFile::new(
+        current_content.clone(),
+        DropboxRevision::new("created-revision"),
+    );
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        }))
+        .for_path("/2/users/get_current_account"),
+        FakeResponse::json(json!({
+            "entries": [],
+            "cursor": "remote-absent",
+            "has_more": false,
+        }))
+        .for_path("/2/files/list_folder"),
+        FakeResponse::json(file_metadata(
+            "/file.txt",
+            "/file.txt",
+            current.revision.as_str(),
+            &current.content,
+        ))
+        .for_path("/2/files/upload"),
+    ])?;
+    let client = Arc::new(fake_client(
+        &server,
+        "opaque-access-stale-install-operation",
+    )?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("file.txt"), current_bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    let stale_install = planned_operations(plan(
+        &Baseline::Absent,
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(stale),
+    ))?;
+    assert!(matches!(
+        journal.record_plan(Path::new("file.txt"), &stale_install)?,
+        PlanWrite::Recorded(_)
+    ));
+
+    let report = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+    assert_eq!(report.planned, 1);
+    assert_eq!(report.replayed_operations, 1);
+    assert_eq!(report.blocked, 0);
+    assert!(journal.pending_plans()?.is_empty());
+    assert_eq!(
+        journal.baseline(Path::new("file.txt"))?,
+        Some(Baseline::Present(current))
+    );
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].path, "/2/files/upload");
+    assert_eq!(requests[2].body, current_bytes);
+    Ok(())
+}
+
+#[test]
+fn an_unknown_observation_does_not_retire_a_stale_install() -> Result<(), Box<dyn Error>> {
+    let stale = RemoteFile::new(
+        dropbox_content_hash(b"obsolete Dropbox bytes".as_slice())?,
+        DropboxRevision::new("stale-revision"),
+    );
+    let current_bytes = b"current local bytes";
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        }))
+        .for_path("/2/users/get_current_account"),
+        FakeResponse::json(json!({
+            "entries": [{
+                ".tag": "file",
+                "path_lower": "/file.txt",
+                "path_display": "/file.txt",
+                "is_downloadable": false,
+            }],
+            "cursor": "remote-unknown",
+            "has_more": false,
+        }))
+        .for_path("/2/files/list_folder"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-stale-install-unknown")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("file.txt"), current_bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    let stale_install = planned_operations(plan(
+        &Baseline::Absent,
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(stale),
+    ))?;
+    assert!(matches!(
+        journal.record_plan(Path::new("file.txt"), &stale_install)?,
+        PlanWrite::Recorded(_)
+    ));
+
+    let report = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+    assert_eq!(report.blocked, 1);
+    assert_eq!(journal.pending_plans()?.len(), 1);
+    assert_eq!(journal.baseline(Path::new("file.txt"))?, None);
+    assert_eq!(server.finish()?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn a_pending_only_path_retires_without_fetching_obsolete_bytes() -> Result<(), Box<dyn Error>> {
+    let stale_bytes = b"obsolete Dropbox bytes";
+    let stale = RemoteFile::new(
+        dropbox_content_hash(stale_bytes.as_slice())?,
+        DropboxRevision::new("stale-revision"),
+    );
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        }))
+        .for_path("/2/users/get_current_account"),
+        FakeResponse::json(json!({
+            "entries": [],
+            "cursor": "both-absent",
+            "has_more": false,
+        }))
+        .for_path("/2/files/list_folder"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-pending-only")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    assert!(matches!(
+        stage_download(
+            &root,
+            Path::new("removed.txt"),
+            &stale.content,
+            stale_bytes.as_slice(),
+        )?,
+        StageOutcome::Staged(())
+    ));
+    let occupied_stage = std::fs::read_dir(&root)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".omabox-download-"))
+        })
+        .ok_or_else(|| io::Error::other("test download stage was not created"))?;
+    std::fs::set_permissions(&occupied_stage, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::write(&occupied_stage, b"unrelated stage bytes")?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    let stale_install = planned_operations(plan(
+        &Baseline::Absent,
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(stale),
+    ))?;
+    assert!(matches!(
+        journal.record_plan(Path::new("removed.txt"), &stale_install)?,
+        PlanWrite::Recorded(_)
+    ));
+
+    let _report = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+
+    assert!(journal.pending_plans()?.is_empty());
+    assert_eq!(journal.baseline(Path::new("removed.txt"))?, None);
+    assert!(occupied_stage.exists());
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path != "/2/files/download")
+    );
+    Ok(())
+}
+
+#[test]
 fn remote_delete_skips_backup_download_and_ambiguous_create_stays_pending()
 -> Result<(), Box<dyn Error>> {
     let old_bytes = b"old remote bytes";
