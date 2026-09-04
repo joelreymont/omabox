@@ -181,7 +181,14 @@ fn install(
         Ok(())
     };
     if let Err(source) = launch {
-        return Err(cleanup_failure(source, transaction.finish()));
+        return Err(restore_after_failure(
+            source,
+            &mut transaction,
+            commands,
+            state,
+            false,
+            true,
+        ));
     }
     transaction.finish()?;
     Ok(format!(
@@ -239,11 +246,12 @@ fn publish(
     });
     match result {
         Ok(()) => Ok(()),
-        Err(source) => Err(restore_before_launch(
+        Err(source) => Err(restore_after_failure(
             source,
             transaction,
             commands,
             state,
+            restore_enabled,
             restore_enabled,
         )),
     }
@@ -271,15 +279,16 @@ fn ensure_shell_unlocked(commands: &Commands) -> Result<(), InstallError> {
     }
 }
 
-fn restore_before_launch(
+fn restore_after_failure(
     source: InstallError,
     transaction: &mut Transaction,
     commands: &Commands,
     state: ServiceState,
     restore_enabled: bool,
+    restore_service_state: bool,
 ) -> InstallError {
     let restored = transaction
-        .rollback()
+        .rollback(commands)
         .and_then(|()| {
             commands
                 .services
@@ -287,8 +296,8 @@ fn restore_before_launch(
                 .map_err(InstallError::Service)
         })
         .and_then(|()| {
-            if restore_enabled {
-                state.restore(commands, true)
+            if restore_service_state {
+                state.restore(commands, restore_enabled)
             } else {
                 Ok(())
             }
@@ -494,11 +503,14 @@ impl Transaction {
         Ok(())
     }
 
-    fn rollback(&mut self) -> Result<(), InstallError> {
+    fn rollback(&mut self, commands: &Commands) -> Result<(), InstallError> {
         for entry in self.entries.iter_mut().rev() {
             match entry.state {
                 EntryState::Ready => continue,
                 EntryState::Installed | EntryState::Swapped | EntryState::Removed => {
+                    if entry.kind == ArtifactKind::Directory {
+                        ensure_shell_unlocked(commands)?;
+                    }
                     entry.transition(EntryState::Ready)?;
                 }
             }
@@ -783,6 +795,7 @@ mod tests {
         layout: Layout,
         sources: Sources,
         commands: Commands,
+        systemctl: PathBuf,
         systemctl_log: PathBuf,
         omarchy_log: PathBuf,
     }
@@ -792,6 +805,7 @@ mod tests {
             active: bool,
             enabled: bool,
             fail_reload_once: bool,
+            fail_restart_once: bool,
         ) -> Result<Self, Box<dyn Error>> {
             let temporary = tempfile::TempDir::new()?;
             let home = temporary.path().join("home");
@@ -807,17 +821,21 @@ mod tests {
 
             let systemctl_log = temporary.path().join("systemctl.log");
             let failed_reload = temporary.path().join("reload.failed");
+            let failed_restart = temporary.path().join("restart.failed");
             let systemctl = temporary.path().join("systemctl");
             fs::write(
                 &systemctl,
                 format!(
-                    "printf '%s\\n' \"$2\" >> '{}'\ncase \"$2\" in\n is-active) exit {};;\n is-enabled) exit {};;\n daemon-reload) if [ {} -eq 1 ] && [ ! -e '{}' ]; then : > '{}'; exit 1; fi;;\nesac\nexit 0\n",
+                    "printf '%s\\n' \"$2\" >> '{}'\ncase \"$2\" in\n is-active) exit {};;\n is-enabled) exit {};;\n daemon-reload) if [ {} -eq 1 ] && [ ! -e '{}' ]; then : > '{}'; exit 1; fi;;\n restart) if [ {} -eq 1 ] && [ ! -e '{}' ]; then : > '{}'; exit 1; fi;;\nesac\nexit 0\n",
                     systemctl_log.display(),
                     if active { 0 } else { 3 },
                     if enabled { 0 } else { 1 },
                     if fail_reload_once { 1 } else { 0 },
                     failed_reload.display(),
                     failed_reload.display(),
+                    if fail_restart_once { 1 } else { 0 },
+                    failed_restart.display(),
+                    failed_restart.display(),
                 ),
             )?;
 
@@ -833,10 +851,11 @@ mod tests {
                 layout: Layout::new(home)?,
                 sources,
                 commands: Commands {
-                    services: ServiceCommands::scripts(systemctl, "/unused/journalctl"),
+                    services: ServiceCommands::scripts(&systemctl, "/unused/journalctl"),
                     omarchy: Launch::Script(omarchy),
                     omarchy_shell: Launch::Script(omarchy_shell),
                 },
+                systemctl,
                 systemctl_log,
                 omarchy_log,
                 _temporary: temporary,
@@ -864,6 +883,20 @@ mod tests {
         Ok(())
     }
 
+    fn transaction_artifacts(
+        directory: &Path,
+        prefix: &str,
+    ) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+        let mut artifacts = Vec::new();
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().starts_with(prefix) {
+                artifacts.push(entry.path());
+            }
+        }
+        Ok(artifacts)
+    }
+
     #[test]
     fn packaged_unit_runs_the_user_installed_daemon() {
         assert!(
@@ -874,7 +907,7 @@ mod tests {
 
     #[test]
     fn upgrade_validates_replaces_and_preserves_service_state() -> Result<(), Box<dyn Error>> {
-        let fixture = Fixture::new(true, true, false)?;
+        let fixture = Fixture::new(true, true, false, false)?;
         fixture.old_install()?;
         let report = execute_with(
             InstallAction::Upgrade,
@@ -920,8 +953,193 @@ mod tests {
     }
 
     #[test]
+    fn restart_failure_restores_old_artifacts_and_running_service() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new(true, true, false, true)?;
+        fixture.old_install()?;
+
+        let result = execute_with(
+            InstallAction::Upgrade,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        assert!(matches!(result, Err(InstallError::Service(_))));
+        for path in [
+            &fixture.layout.omabox,
+            &fixture.layout.omaboxd,
+            &fixture.layout.unit,
+        ] {
+            assert_eq!(fs::read(path)?, b"old");
+        }
+        assert_eq!(fs::read(fixture.layout.plugin.join("old.qml"))?, b"old");
+        assert_eq!(
+            fs::read_to_string(&fixture.systemctl_log)?,
+            "is-enabled\nis-active\ndaemon-reload\nrestart\ndaemon-reload\nstart\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn service_restore_failure_preserves_recovery_artifacts_and_both_errors()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new(true, true, false, false)?;
+        fixture.old_install()?;
+        fs::write(
+            &fixture.systemctl,
+            format!(
+                "printf '%s\\n' \"$2\" >> '{}'\ncase \"$2\" in\n is-active|is-enabled) exit 0;;\n restart) exit 7;;\n start) exit 8;;\nesac\nexit 0\n",
+                fixture.systemctl_log.display(),
+            ),
+        )?;
+
+        let result = execute_with(
+            InstallAction::Upgrade,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        match result {
+            Err(InstallError::RollbackFailed { source, restore }) => {
+                assert!(matches!(
+                    *source,
+                    InstallError::Service(ServiceError::Unsuccessful {
+                        status: Some(7),
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    *restore,
+                    InstallError::Service(ServiceError::Unsuccessful {
+                        status: Some(8),
+                        ..
+                    })
+                ));
+            }
+            other => return Err(io::Error::other(format!("unexpected result: {other:?}")).into()),
+        }
+        for path in [
+            &fixture.layout.omabox,
+            &fixture.layout.omaboxd,
+            &fixture.layout.unit,
+        ] {
+            assert_eq!(fs::read(path)?, b"old");
+        }
+        assert_eq!(fs::read(fixture.layout.plugin.join("old.qml"))?, b"old");
+        let bin_parent = fixture
+            .layout
+            .omabox
+            .parent()
+            .ok_or_else(|| io::Error::other("binary path had no parent"))?;
+        let recovery = transaction_artifacts(bin_parent, ".omabox.install.")?;
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(fs::read(&recovery[0])?, b"#!/bin/sh\necho omabox\n");
+        assert_eq!(
+            fs::read_to_string(&fixture.systemctl_log)?,
+            "is-enabled\nis-active\ndaemon-reload\nrestart\ndaemon-reload\nstart\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_failure_preserves_remaining_old_backups() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new(true, true, false, false)?;
+        fixture.old_install()?;
+        let unit_parent = fixture
+            .layout
+            .unit
+            .parent()
+            .ok_or_else(|| io::Error::other("unit path had no parent"))?;
+        fs::write(
+            &fixture.systemctl,
+            format!(
+                "printf '%s\\n' \"$2\" >> '{}'\ncase \"$2\" in\n is-active|is-enabled) exit 0;;\n restart) for backup in '{}/.omabox.service.install.'*; do if [ -e \"$backup\" ]; then rm -f -- \"$backup\"; fi; done; exit 7;;\nesac\nexit 0\n",
+                fixture.systemctl_log.display(),
+                unit_parent.display(),
+            ),
+        )?;
+
+        let result = execute_with(
+            InstallAction::Upgrade,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        match result {
+            Err(InstallError::RollbackFailed { source, restore }) => {
+                assert!(matches!(
+                    *source,
+                    InstallError::Service(ServiceError::Unsuccessful {
+                        status: Some(7),
+                        ..
+                    })
+                ));
+                assert!(matches!(*restore, InstallError::Filesystem { .. }));
+            }
+            other => return Err(io::Error::other(format!("unexpected result: {other:?}")).into()),
+        }
+        assert_eq!(fs::read(fixture.layout.plugin.join("old.qml"))?, b"old");
+        let bin_parent = fixture
+            .layout
+            .omabox
+            .parent()
+            .ok_or_else(|| io::Error::other("binary path had no parent"))?;
+        let omabox_backup = transaction_artifacts(bin_parent, ".omabox.install.")?;
+        let daemon_backup = transaction_artifacts(bin_parent, ".omaboxd.install.")?;
+        assert_eq!(omabox_backup.len(), 1);
+        assert_eq!(daemon_backup.len(), 1);
+        assert_eq!(fs::read(&omabox_backup[0])?, b"old");
+        assert_eq!(fs::read(&daemon_backup[0])?, b"old");
+        Ok(())
+    }
+
+    #[test]
+    fn lock_transition_during_rollback_preserves_live_and_backup_plugins()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new(true, true, false, true)?;
+        fixture.old_install()?;
+        let lock_checks = fixture._temporary.path().join("rollback-lock-checks");
+        fs::write(
+            fixture.commands.omarchy_shell.path(),
+            format!(
+                "count=0\nif [ -f '{}' ]; then read count < '{}'; fi\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > '{}'\nif [ \"$count\" -lt 4 ]; then printf 'false\\n'; else printf 'true\\n'; fi\n",
+                lock_checks.display(),
+                lock_checks.display(),
+                lock_checks.display(),
+            ),
+        )?;
+
+        let result = execute_with(
+            InstallAction::Upgrade,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        match result {
+            Err(InstallError::RollbackFailed { source, restore }) => {
+                assert!(matches!(*source, InstallError::Service(_)));
+                assert!(matches!(*restore, InstallError::ShellLocked));
+            }
+            other => return Err(io::Error::other(format!("unexpected result: {other:?}")).into()),
+        }
+        assert!(!fixture.layout.plugin.join("old.qml").exists());
+        for (name, contents) in PLUGIN {
+            assert_eq!(fs::read(fixture.layout.plugin.join(name))?, contents);
+        }
+        let plugin_backup =
+            transaction_artifacts(&fixture.layout.omarchy_root, ".local.omabox.install.")?;
+        assert_eq!(plugin_backup.len(), 1);
+        assert_eq!(fs::read(plugin_backup[0].join("old.qml"))?, b"old");
+        assert_eq!(fs::read_to_string(lock_checks)?, "4\n");
+        Ok(())
+    }
+
+    #[test]
     fn fresh_install_publishes_missing_artifacts_and_stays_stopped() -> Result<(), Box<dyn Error>> {
-        let fixture = Fixture::new(false, false, false)?;
+        let fixture = Fixture::new(false, false, false, false)?;
         let report = execute_with(
             InstallAction::Install,
             &fixture.layout,
@@ -952,7 +1170,7 @@ mod tests {
 
     #[test]
     fn reload_failure_restores_old_artifacts_before_restart() -> Result<(), Box<dyn Error>> {
-        let fixture = Fixture::new(true, true, true)?;
+        let fixture = Fixture::new(true, true, true, false)?;
         fixture.old_install()?;
         let result = execute_with(
             InstallAction::Upgrade,
@@ -979,7 +1197,7 @@ mod tests {
 
     #[test]
     fn validation_failure_changes_nothing_live() -> Result<(), Box<dyn Error>> {
-        let fixture = Fixture::new(true, true, false)?;
+        let fixture = Fixture::new(true, true, false, false)?;
         fixture.old_install()?;
         fs::write(fixture.commands.omarchy.path(), "exit 9\n")?;
         let result = execute_with(
@@ -1007,7 +1225,7 @@ mod tests {
 
     #[test]
     fn empty_daemon_is_rejected_before_any_live_change() -> Result<(), Box<dyn Error>> {
-        let fixture = Fixture::new(false, false, false)?;
+        let fixture = Fixture::new(false, false, false, false)?;
         fs::write(&fixture.sources.omaboxd, [])?;
         let result = execute_with(
             InstallAction::Install,
@@ -1025,7 +1243,7 @@ mod tests {
 
     #[test]
     fn locked_shell_prevents_any_live_artifact_change() -> Result<(), Box<dyn Error>> {
-        let fixture = Fixture::new(true, true, false)?;
+        let fixture = Fixture::new(true, true, false, false)?;
         fixture.old_install()?;
         fs::write(fixture.commands.omarchy_shell.path(), "printf 'true\\n'\n")?;
         let result = execute_with(
@@ -1044,7 +1262,7 @@ mod tests {
 
     #[test]
     fn lock_before_plugin_restores_earlier_artifacts_and_service() -> Result<(), Box<dyn Error>> {
-        let fixture = Fixture::new(true, true, false)?;
+        let fixture = Fixture::new(true, true, false, false)?;
         fixture.old_install()?;
         let lock_checks = fixture._temporary.path().join("lock-checks");
         fs::write(
@@ -1083,7 +1301,7 @@ mod tests {
 
     #[test]
     fn uninstall_removes_only_artifacts_and_retains_user_data() -> Result<(), Box<dyn Error>> {
-        let fixture = Fixture::new(true, true, false)?;
+        let fixture = Fixture::new(true, true, false, false)?;
         fixture.old_install()?;
         let retained = [
             fixture.layout.home.join(".config/omabox/config.toml"),
