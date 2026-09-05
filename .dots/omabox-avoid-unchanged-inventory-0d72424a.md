@@ -3,6 +3,8 @@ title: Avoid unchanged inventory writes and repeated account validation
 status: open
 priority: 2
 issue-type: task
+blocks:
+  - omabox-preserve-sync-history-d24798cd
 created-at: "2026-09-05T10:30:06.414310+03:00"
 ---
 

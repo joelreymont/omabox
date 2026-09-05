@@ -3,6 +3,8 @@ title: Wait for daemon readiness before finishing upgrades
 status: open
 priority: 2
 issue-type: task
+blocks:
+  - omabox-recover-environmental-daemon-3dcb7480
 created-at: "2026-09-05T10:30:06.273853+03:00"
 ---
 

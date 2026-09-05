@@ -3,6 +3,8 @@ title: Durably block rejected remote mutations
 status: open
 priority: 2
 issue-type: task
+blocks:
+  - omabox-make-active-download-cb539616
 created-at: "2026-09-05T10:30:06.351519+03:00"
 ---
 
