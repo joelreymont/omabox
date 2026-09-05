@@ -3,9 +3,11 @@
 The focused corrections authorized on 2026-09-05 are tracked in their own
 dots. Slot ownership, daemon recovery/readiness, root identity, durable
 mutation blocking, and idle-cost fixes use the current transport and do not
-depend on section J. A future SDK migration requires a concrete comparison
-showing reduced maintained code with the existing protocol and failure tests
-preserved; the adapter design below is not sufficient justification by itself.
+depend on section J. The previously approved SDK migration remains unfinished
+in its active dot, `omabox-move-the-dropbox-cb30bc34`, and workspace
+`.jj-ws/omabox-move-the-dropbox-cb30bc34`. That workspace adds the SDK dependency
+and transport adapter; OAuth and Dropbox routes still use the handwritten
+client. No SDK migration has landed in the main checkout.
 
 Baseline: commit `672301cf6366`. This document is the implementation contract
 for every dot in the remediation campaign. Workers code to it; deviations are
