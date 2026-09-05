@@ -432,18 +432,16 @@ impl DownloadSlotIdentity {
             binding: hasher.finalize().into(),
         }
     }
+
+    pub(crate) fn binding(&self) -> [u8; 32] {
+        self.binding
+    }
 }
 
 pub(crate) struct DownloadSlotLease {
     directory: PathBuf,
     slot: u8,
     binding: [u8; 32],
-}
-
-impl DownloadSlotLease {
-    pub(crate) fn slot(&self) -> u8 {
-        self.slot
-    }
 }
 
 struct DownloadLocation {
@@ -1353,6 +1351,7 @@ pub(crate) fn existing_download_stage_at(
 pub(crate) fn lease_download_slots(
     staging_directory: &Path,
     identities: &[DownloadSlotIdentity],
+    protected: impl Fn(&[u8; 32]) -> bool,
 ) -> Result<Vec<Option<DownloadSlotLease>>, LocalError> {
     let directory =
         open_private_directory(staging_directory, "open resumable download slot directory")?;
@@ -1367,7 +1366,8 @@ pub(crate) fn lease_download_slots(
                 if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
                     (None, false)
                 } else if let Some(state) = read_download_slot_state(&file, &path)? {
-                    (Some((file, state)), true)
+                    let usable = !protected(&state.binding);
+                    (Some((file, state)), usable)
                 } else {
                     (None, false)
                 }
@@ -1446,50 +1446,6 @@ pub(crate) fn lease_download_slots(
             })?;
     }
     Ok(leases)
-}
-
-pub(crate) fn lease_download_slot(
-    staging_directory: &Path,
-    slot: u8,
-    identity: &DownloadSlotIdentity,
-) -> Result<Option<DownloadSlotLease>, LocalError> {
-    let directory =
-        open_private_directory(staging_directory, "open resumable download slot directory")?;
-    let name = download_slot_name(slot);
-    let path = staging_directory.join(&name);
-    let claimed = match open_download_slot(&directory, &name, &path)? {
-        DownloadSlotOpen::Missing => {
-            create_download_slot(&directory, &name, &path, identity.binding)?.is_some()
-        }
-        DownloadSlotOpen::File(file) => {
-            let stat = stat_fd(&file, &path, "inspect resumed download slot")?;
-            if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-                false
-            } else if let Some(state) = read_download_slot_state(&file, &path)? {
-                if state.binding == identity.binding {
-                    true
-                } else {
-                    reset_download_slot_file_with(
-                        &file,
-                        &directory,
-                        &name,
-                        &path,
-                        identity.binding,
-                        || Ok(()),
-                    )?
-                    .is_some()
-                }
-            } else {
-                false
-            }
-        }
-        DownloadSlotOpen::Occupied => false,
-    };
-    Ok(claimed.then_some(DownloadSlotLease {
-        directory: staging_directory.to_path_buf(),
-        slot,
-        binding: identity.binding,
-    }))
 }
 
 struct AvailableDownloadSlot {
@@ -4364,7 +4320,7 @@ mod tests {
         operation_id: i64,
     ) -> Result<DownloadSlotLease, LocalError> {
         let identity = test_slot_identity(target, expected, root_generation, operation_id);
-        lease_download_slots(staging, &[identity])?
+        lease_download_slots(staging, &[identity], |_| false)?
             .into_iter()
             .next()
             .flatten()
@@ -6175,13 +6131,50 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let leases = lease_download_slots(staging.path(), &identities)?;
+        let leases = lease_download_slots(staging.path(), &identities, |_| false)?;
         assert_eq!(leases.iter().filter(|lease| lease.is_some()).count(), 4);
         let mut names = std::fs::read_dir(staging.path())?
             .map(|entry| entry.map(|entry| entry.file_name()))
             .collect::<Result<Vec<_>, _>>()?;
         names.sort();
         assert_eq!(names, (0_u8..4).map(download_slot_name).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[test]
+    fn protected_download_slot_keeps_its_binding_and_bytes() -> Result<(), Box<dyn Error>> {
+        let staging = TempDir::new()?;
+        let expected = identity(b"download")?;
+        let held = test_slot_identity(Path::new("held.bin"), &expected, 1, 20);
+        let held_lease =
+            lease_download_slots(staging.path(), std::slice::from_ref(&held), |_| false)?
+                .into_iter()
+                .next()
+                .flatten()
+                .ok_or_else(|| io::Error::other("held slot was not leased"))?;
+        let held_path = staging.path().join(download_slot_name(held_lease.slot));
+        std::fs::write(&held_path, b"partial download bytes")?;
+        let other = test_slot_identity(Path::new("other.bin"), &expected, 1, 21);
+
+        let other_lease =
+            lease_download_slots(staging.path(), std::slice::from_ref(&other), |binding| {
+                *binding == held.binding
+            })?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| io::Error::other("other slot was not leased"))?;
+
+        assert_ne!(other_lease.slot, held_lease.slot);
+        assert_eq!(std::fs::read(&held_path)?, b"partial download bytes");
+        let held_file = File::open(&held_path)?;
+        assert_eq!(
+            read_download_slot_state(&held_file, &held_path)?,
+            Some(DownloadSlotState {
+                binding: held.binding,
+                offset: 0,
+            })
+        );
         Ok(())
     }
 
@@ -6237,7 +6230,10 @@ mod tests {
         let target = Path::new("target.txt");
         let expected = identity(b"download")?;
         let old_identity = test_slot_identity(target, &expected, 1, 10);
-        let old_lease = lease_download_slots(staging.path(), std::slice::from_ref(&old_identity))?
+        let old_lease =
+            lease_download_slots(staging.path(), std::slice::from_ref(&old_identity), |_| {
+                false
+            })?
             .into_iter()
             .next()
             .flatten()
@@ -6245,7 +6241,7 @@ mod tests {
         let old_binding = old_lease.binding;
         let old_path = staging.path().join(download_slot_name(old_lease.slot));
         std::fs::write(&old_path, b"stale bytes")?;
-        assert!(lease_download_slots(staging.path(), &[])?.is_empty());
+        assert!(lease_download_slots(staging.path(), &[], |_| false)?.is_empty());
         let freed = File::open(&old_path)?;
         assert_eq!(freed.metadata()?.len(), 0);
         assert_eq!(
@@ -6260,7 +6256,7 @@ mod tests {
         let changed_operation = test_slot_identity(target, &expected, 1, 11);
         assert_ne!(changed_root.binding, old_binding);
         assert_ne!(changed_operation.binding, old_binding);
-        let new_lease = lease_download_slots(staging.path(), &[changed_root])?
+        let new_lease = lease_download_slots(staging.path(), &[changed_root], |_| false)?
             .into_iter()
             .next()
             .flatten()

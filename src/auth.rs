@@ -36,6 +36,11 @@ const SECRET_ATTRIBUTES: [&str; 4] = [
 pub struct AccessToken(String);
 
 impl AccessToken {
+    #[cfg(test)]
+    pub(crate) fn for_test(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
     pub(crate) fn expose(&self) -> &str {
         &self.0
     }

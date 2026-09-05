@@ -3136,6 +3136,109 @@ fn gated_download_does_not_stop_the_next_poll_and_reconciliation() -> Result<(),
     Ok(())
 }
 
+#[test]
+fn later_planned_download_does_not_reclaim_an_active_slot() -> Result<(), Box<dyn Error>> {
+    let held_bytes = b"first download held open by the fake server";
+    let held_content = dropbox_content_hash(held_bytes.as_slice())?;
+    let held = RemoteFile::new(held_content.clone(), DropboxRevision::new("rev-held-slot"));
+    let next_bytes = b"download introduced by the next pass";
+    let next_content = dropbox_content_hash(next_bytes.as_slice())?;
+    let next = RemoteFile::new(next_content.clone(), DropboxRevision::new("rev-next-slot"));
+    let (held_response, gate) = FakeResponse::bytes(held_bytes.to_vec())
+        .header(
+            "Dropbox-API-Result",
+            download_metadata(
+                "a.bin",
+                held.revision.as_str(),
+                &held_content,
+                held_bytes.len(),
+            ),
+        )
+        .for_path("/2/files/download")
+        .gated();
+    let server = FakeServer::start(vec![
+        held_response,
+        FakeResponse::bytes(next_bytes.to_vec())
+            .header(
+                "Dropbox-API-Result",
+                download_metadata(
+                    "b.bin",
+                    next.revision.as_str(),
+                    &next_content,
+                    next_bytes.len(),
+                ),
+            )
+            .for_path("/2/files/download"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-active-slot")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    let held_plan = planned_operations(plan(
+        &Baseline::Absent,
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(held),
+    ))?;
+    let next_plan = planned_operations(plan(
+        &Baseline::Absent,
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(next),
+    ))?;
+    if !matches!(
+        journal.record_plan(Path::new("a.bin"), &held_plan)?,
+        PlanWrite::Recorded(_)
+    ) {
+        return Err(io::Error::other("held plan was already live").into());
+    }
+    let _ = replay_pending(&mut journal, &client, &mut downloads, &root, &staging)?;
+    gate.request_received
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|_| io::Error::other("held download did not start"))?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let while_held = (|| -> Result<(), Box<dyn Error>> {
+        if !matches!(
+            journal.record_plan(Path::new("b.bin"), &next_plan)?,
+            PlanWrite::Recorded(_)
+        ) {
+            return Err(io::Error::other("next plan was already live").into());
+        }
+        let _ = replay_pending(&mut journal, &client, &mut downloads, &root, &staging)?;
+        while !root.join("b.bin").exists() {
+            let _ = replay_pending(&mut journal, &client, &mut downloads, &root, &staging)?;
+            if Instant::now() >= deadline {
+                return Err(
+                    io::Error::new(io::ErrorKind::TimedOut, "second download stalled").into(),
+                );
+            }
+            thread::yield_now();
+        }
+        assert_eq!(std::fs::read(root.join("b.bin"))?, next_bytes);
+        assert!(!root.join("a.bin").exists());
+        Ok(())
+    })();
+    let released = gate
+        .release_response
+        .send(())
+        .map_err(|_| io::Error::other("held download stopped before release"));
+    while_held?;
+    released?;
+    while !journal.pending_plans()?.is_empty() {
+        let _ = replay_pending(&mut journal, &client, &mut downloads, &root, &staging)?;
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "held download stalled").into());
+        }
+        thread::yield_now();
+    }
+    assert_eq!(std::fs::read(root.join("a.bin"))?, held_bytes);
+    assert_eq!(server.finish()?.len(), 2);
+    Ok(())
+}
+
 fn unblock_verification_failure(
     journal: &mut Journal,
     report: &ReplayReport,

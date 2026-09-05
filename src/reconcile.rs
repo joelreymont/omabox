@@ -22,9 +22,9 @@ use crate::journal::{
 use crate::local::{
     DownloadSlotIdentity, DownloadSlotLease, LocalError, LocalRenameOutcome,
     MAX_PARALLEL_DOWNLOADS, ScanPublication, StageOutcome, StagedUpload, SyncRootAccess,
-    configured_root_is_active, lease_download_slot, lease_download_slots, observe_upload_source,
-    open_active_root, parent_name_max, remove_unreferenced_upload_stages, rename_case_variant,
-    rename_file_copy, scan_and_publish, stage_upload, upload_source_changed,
+    configured_root_is_active, lease_download_slots, observe_upload_source, open_active_root,
+    parent_name_max, remove_unreferenced_upload_stages, rename_case_variant, rename_file_copy,
+    scan_and_publish, stage_upload, upload_source_changed,
 };
 use crate::model::{
     Baseline, CanonicalPath, Conflict, ContentIdentity, Decision, DirectoryCollision,
@@ -314,6 +314,64 @@ impl ExactDownloadPool {
         self.pending_failure.is_none() && !self.cancelled.load(Ordering::Acquire)
     }
 
+    fn lease_and_schedule(
+        &mut self,
+        root: Arc<OwnedFd>,
+        root_path: &Path,
+        staging_directory: &Path,
+        mut downloads: Vec<PendingDownload>,
+        live_bindings: BTreeSet<[u8; 32]>,
+    ) -> Result<(), ReconcileError> {
+        downloads.retain(|download| !self.contains(&download.path));
+        {
+            let mut slots = self
+                .slots
+                .lock()
+                .map_err(|_| ReconcileError::DownloadSlotCoordinatorUnavailable)?;
+            slots.live = live_bindings;
+            let identities = downloads
+                .iter()
+                .map(|download| download.slot_identity.clone())
+                .collect::<Vec<_>>();
+            let leases = lease_download_slots(staging_directory, &identities, |binding| {
+                slots.protects(binding)
+            })?;
+            for (download, lease) in downloads.iter_mut().zip(leases) {
+                let Some(lease) = lease else {
+                    continue;
+                };
+                let binding = download.slot_identity.binding();
+                if !slots.active.insert(binding) {
+                    return Err(invalid(
+                        &download.path,
+                        "resumable download binding was assigned twice",
+                    ));
+                }
+                download.slot = Some(LeasedDownloadSlot {
+                    lease,
+                    _reservation: DownloadSlotReservation {
+                        slots: Arc::clone(&self.slots),
+                        binding,
+                    },
+                });
+            }
+        }
+        downloads.sort_by_key(|download| download.slot.is_none());
+        for download in downloads {
+            self.schedule(DownloadJob {
+                root: Arc::clone(&root),
+                root_path: root_path.to_path_buf(),
+                staging_directory: staging_directory.to_path_buf(),
+                path: download.path,
+                identity: download.identity,
+                source: download.source,
+                slot_identity: download.slot_identity,
+                slot: download.slot,
+            })?;
+        }
+        Ok(())
+    }
+
     fn schedule(&mut self, job: DownloadJob) -> Result<(), ReconcileError> {
         if self.pending_failure.is_some()
             || self.cancelled.load(Ordering::Acquire)
@@ -323,24 +381,10 @@ impl ExactDownloadPool {
         }
         let path = job.path.clone();
         let job_identity = job.identity;
-        if let Some(slot) = &job.slot {
-            let mut slots = self
-                .slots
-                .lock()
-                .map_err(|_| ReconcileError::DownloadSlotCoordinatorUnavailable)?;
-            if !slots.reserved.insert(slot.slot()) {
-                return Err(invalid(&path, "resumable download slot was assigned twice"));
-            }
-        }
         let Some(jobs) = &self.jobs else {
             return Err(ReconcileError::DownloadWorkerStopped);
         };
-        if let Err(error) = jobs.send(job) {
-            if let Some(slot) = &error.0.slot
-                && let Ok(mut slots) = self.slots.lock()
-            {
-                slots.reserved.remove(&slot.slot());
-            }
+        if jobs.send(job).is_err() {
             return Err(ReconcileError::DownloadWorkerStopped);
         }
         self.scheduled.insert(path, job_identity);
@@ -362,7 +406,32 @@ impl Drop for ExactDownloadPool {
 
 #[derive(Default)]
 struct DownloadSlots {
-    reserved: BTreeSet<u8>,
+    active: BTreeSet<[u8; 32]>,
+    live: BTreeSet<[u8; 32]>,
+}
+
+impl DownloadSlots {
+    fn protects(&self, binding: &[u8; 32]) -> bool {
+        self.active.contains(binding) || self.live.contains(binding)
+    }
+}
+
+struct LeasedDownloadSlot {
+    lease: DownloadSlotLease,
+    _reservation: DownloadSlotReservation,
+}
+
+struct DownloadSlotReservation {
+    slots: Arc<Mutex<DownloadSlots>>,
+    binding: [u8; 32],
+}
+
+impl Drop for DownloadSlotReservation {
+    fn drop(&mut self) {
+        if let Ok(mut slots) = self.slots.lock() {
+            slots.active.remove(&self.binding);
+        }
+    }
 }
 
 struct DownloadJob {
@@ -373,7 +442,7 @@ struct DownloadJob {
     identity: DownloadIdentity,
     source: RemoteFile,
     slot_identity: DownloadSlotIdentity,
-    slot: Option<DownloadSlotLease>,
+    slot: Option<LeasedDownloadSlot>,
 }
 
 struct DownloadResult {
@@ -411,7 +480,7 @@ fn download_worker(
     dropbox: &DropboxClient,
     jobs: &Mutex<mpsc::Receiver<DownloadJob>>,
     results: &mpsc::Sender<DownloadResult>,
-    slots: &Mutex<DownloadSlots>,
+    slots: &Arc<Mutex<DownloadSlots>>,
     cancelled: &AtomicBool,
     root_access: &Arc<SyncRootAccess>,
 ) {
@@ -429,6 +498,7 @@ fn download_worker(
         let path = job.path.clone();
         let identity = job.identity;
         if cancelled.load(Ordering::Acquire) {
+            drop(job);
             if results
                 .send(DownloadResult {
                     path,
@@ -515,14 +585,11 @@ fn local_download_object_blocks(error: &LocalError) -> bool {
 fn run_download_job(
     dropbox: &DropboxClient,
     mut job: DownloadJob,
-    slots: &Mutex<DownloadSlots>,
+    slots: &Arc<Mutex<DownloadSlots>>,
     root_access: &Arc<SyncRootAccess>,
 ) -> Result<(), ReconcileError> {
-    let (lease, reserved_slot) = match job.slot.take() {
-        Some(lease) => {
-            let slot = lease.slot();
-            (Some(lease), Some(slot))
-        }
+    let lease = match job.slot.take() {
+        Some(lease) => Some(lease),
         None => acquire_download_slot(&job, slots)?,
     };
     let outcome = dropbox
@@ -532,7 +599,7 @@ fn run_download_job(
             &job.path,
             &job.source,
             DownloadAccess {
-                lease: lease.as_ref(),
+                lease: lease.as_ref().map(|leased| &leased.lease),
                 staging_directory: Some(&job.staging_directory),
                 root_access,
             },
@@ -550,44 +617,42 @@ fn run_download_job(
                 Err(ReconcileError::StageDestinationOccupied { path })
             }
         });
-    if let Some(slot) = reserved_slot {
-        release_download_slot(slots, slot)?;
-    }
+    drop(lease);
     outcome
 }
 
 fn acquire_download_slot(
     job: &DownloadJob,
-    slots: &Mutex<DownloadSlots>,
-) -> Result<(Option<DownloadSlotLease>, Option<u8>), ReconcileError> {
-    for slot in 0_u8..MAX_PARALLEL_DOWNLOADS as u8 {
-        let reserved = {
-            let mut slots = slots
-                .lock()
-                .map_err(|_| ReconcileError::DownloadSlotCoordinatorUnavailable)?;
-            slots.reserved.insert(slot)
-        };
-        if !reserved {
-            continue;
-        }
-        match lease_download_slot(&job.staging_directory, slot, &job.slot_identity) {
-            Ok(Some(lease)) => return Ok((Some(lease), Some(slot))),
-            Ok(None) => release_download_slot(slots, slot)?,
-            Err(source) => {
-                release_download_slot(slots, slot)?;
-                return Err(source.into());
-            }
-        }
-    }
-    Ok((None, None))
-}
-
-fn release_download_slot(slots: &Mutex<DownloadSlots>, slot: u8) -> Result<(), ReconcileError> {
-    let mut slots = slots
+    slots: &Arc<Mutex<DownloadSlots>>,
+) -> Result<Option<LeasedDownloadSlot>, ReconcileError> {
+    let mut slots_guard = slots
         .lock()
         .map_err(|_| ReconcileError::DownloadSlotCoordinatorUnavailable)?;
-    slots.reserved.remove(&slot);
-    Ok(())
+    let binding = job.slot_identity.binding();
+    let lease = lease_download_slots(
+        &job.staging_directory,
+        std::slice::from_ref(&job.slot_identity),
+        |candidate| slots_guard.protects(candidate),
+    )?
+    .into_iter()
+    .next()
+    .flatten();
+    let Some(lease) = lease else {
+        return Ok(None);
+    };
+    if !slots_guard.active.insert(binding) {
+        return Err(invalid(
+            &job.path,
+            "resumable download binding was assigned twice",
+        ));
+    }
+    Ok(Some(LeasedDownloadSlot {
+        lease,
+        _reservation: DownloadSlotReservation {
+            slots: Arc::clone(slots),
+            binding,
+        },
+    }))
 }
 
 /// Replay durable work once while missing exact downloads continue on persistent workers.
@@ -626,6 +691,12 @@ fn replay_pending_at(
         .ok_or(ReconcileError::LocalRootChanged)?
         .generation;
     let pending_plans = journal.pending_plans()?;
+    let live_bindings = pending_plans
+        .iter()
+        .chain(blocked_plans.iter())
+        .filter_map(|plan| pending_download_slot_identity(plan, root_generation))
+        .map(|identity| identity.binding())
+        .collect::<BTreeSet<_>>();
     let mut report = replay_local_plans_at(
         journal,
         &root,
@@ -672,19 +743,12 @@ fn replay_pending_at(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
-    let blocked_download_is_live = journal
-        .blocked_plans()?
-        .iter()
-        .any(|plan| pending_download_identity(plan).is_some());
-    if missing_downloads.is_empty() && download_pool.is_empty() && !blocked_download_is_live {
-        let _ = lease_download_slots(upload_staging, &[])?;
-    }
+    let mut downloads = Vec::with_capacity(missing_downloads.len());
     if !missing_downloads.is_empty() {
         let mut pending = pending_plans
             .into_iter()
             .map(|plan| (plan.path.clone(), plan))
             .collect::<BTreeMap<_, _>>();
-        let mut downloads = Vec::with_capacity(missing_downloads.len());
         for path in missing_downloads {
             let Some(plan) = pending.remove(&path) else {
                 return Err(invalid(
@@ -710,14 +774,14 @@ fn replay_pending_at(
             });
         }
         require_active_local_root(journal, sync_root)?;
-        schedule_pending_downloads(
-            download_pool,
-            Arc::clone(&root),
-            sync_root,
-            upload_staging,
-            downloads,
-        )?;
     }
+    download_pool.lease_and_schedule(
+        Arc::clone(&root),
+        sync_root,
+        upload_staging,
+        downloads,
+        live_bindings,
+    )?;
     require_active_local_root(journal, sync_root)?;
     let remote = replay_remote_operations_at(journal, dropbox, &root, sync_root, upload_staging)?;
     report.completed_operations += remote.completed_operations;
@@ -1424,7 +1488,7 @@ struct PendingDownload {
     identity: DownloadIdentity,
     source: RemoteFile,
     slot_identity: DownloadSlotIdentity,
-    slot: Option<DownloadSlotLease>,
+    slot: Option<LeasedDownloadSlot>,
 }
 
 fn pending_download_operation(
@@ -1468,46 +1532,25 @@ fn pending_download_identity(plan: &PlanRecord) -> Option<DownloadIdentity> {
     })
 }
 
-fn lease_pending_downloads(
-    upload_staging: &Path,
-    downloads: &mut [PendingDownload],
-) -> Result<(), ReconcileError> {
-    let identities = downloads
-        .iter()
-        .map(|download| download.slot_identity.clone())
-        .collect::<Vec<_>>();
-    let leases = lease_download_slots(upload_staging, &identities)?;
-    for (download, lease) in downloads.iter_mut().zip(leases) {
-        download.slot = lease;
-    }
-    Ok(())
-}
-
-fn schedule_pending_downloads(
-    pool: &mut ExactDownloadPool,
-    root: Arc<OwnedFd>,
-    root_path: &Path,
-    upload_staging: &Path,
-    mut downloads: Vec<PendingDownload>,
-) -> Result<(), ReconcileError> {
-    lease_pending_downloads(upload_staging, &mut downloads)?;
-    downloads.sort_by_key(|download| download.slot.is_none());
-    for download in downloads {
-        if pool.contains(&download.path) {
-            continue;
+fn pending_download_slot_identity(
+    plan: &PlanRecord,
+    root_generation: u64,
+) -> Option<DownloadSlotIdentity> {
+    plan.operations.iter().find_map(|planned| {
+        if planned.status == RecordStatus::Completed {
+            return None;
         }
-        pool.schedule(DownloadJob {
-            root: Arc::clone(&root),
-            root_path: root_path.to_path_buf(),
-            staging_directory: upload_staging.to_path_buf(),
-            path: download.path,
-            identity: download.identity,
-            source: download.source,
-            slot_identity: download.slot_identity,
-            slot: download.slot,
-        })?;
-    }
-    Ok(())
+        let source = match &planned.operation {
+            Operation::InstallLocal { source } | Operation::ReplaceLocal { source, .. } => source,
+            _ => return None,
+        };
+        Some(DownloadSlotIdentity::new(
+            root_generation,
+            planned.id,
+            &plan.path,
+            source,
+        ))
+    })
 }
 
 fn prepare_conflict(
@@ -1886,6 +1929,99 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn cancelled_queued_download_releases_its_binding_once() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let root_path = directory.path().join("root");
+        let staging = directory.path().join("staging");
+        std::fs::create_dir_all(&root_path)?;
+        std::fs::create_dir_all(&staging)?;
+        let root = Arc::new(crate::local::open_root(
+            &root_path,
+            "open cancellation test root",
+        )?);
+        let remote = RemoteFile::new(
+            identity(b"cancelled download")?,
+            DropboxRevision::new("cancelled-revision"),
+        );
+        let operation_plan = OperationPlan::new(vec![Operation::InstallLocal {
+            source: remote.clone(),
+        }]);
+        let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+        let recorded = match journal.record_plan(Path::new("cancelled.bin"), &operation_plan)? {
+            PlanWrite::Recorded(recorded) => recorded,
+            PlanWrite::AlreadyLive(_) => {
+                return Err(io::Error::other("cancellation test plan was already live").into());
+            }
+        };
+        let [operation] = recorded.operations.as_slice() else {
+            return Err(io::Error::other("cancellation test plan had another shape").into());
+        };
+        let identity = DownloadIdentity {
+            plan: recorded.id,
+            operation: operation.id,
+        };
+        let slot_identity =
+            DownloadSlotIdentity::new(1, operation.id, Path::new("cancelled.bin"), &remote);
+        let binding = slot_identity.binding();
+        let lease =
+            lease_download_slots(&staging, std::slice::from_ref(&slot_identity), |_| false)?
+                .into_iter()
+                .next()
+                .flatten()
+                .ok_or_else(|| io::Error::other("cancellation test slot was not leased"))?;
+        let slots = Arc::new(Mutex::new(DownloadSlots::default()));
+        {
+            let mut locked = slots
+                .lock()
+                .map_err(|_| io::Error::other("slot coordinator was poisoned"))?;
+            assert!(locked.active.insert(binding));
+        }
+        let (job_sender, job_receiver) = mpsc::channel();
+        let (result_sender, result_receiver) = mpsc::channel();
+        job_sender.send(DownloadJob {
+            root,
+            root_path,
+            staging_directory: staging,
+            path: PathBuf::from("cancelled.bin"),
+            identity,
+            source: remote,
+            slot_identity,
+            slot: Some(LeasedDownloadSlot {
+                lease,
+                _reservation: DownloadSlotReservation {
+                    slots: Arc::clone(&slots),
+                    binding,
+                },
+            }),
+        })?;
+        drop(job_sender);
+        let cancelled = AtomicBool::new(true);
+        let client = DropboxClient::new(
+            crate::auth::AccessToken::for_test("unused-cancelled-worker-token"),
+            crate::dropbox::DropboxRoot::new("account", "namespace", "")?,
+        );
+        download_worker(
+            &client,
+            &Mutex::new(job_receiver),
+            &result_sender,
+            &slots,
+            &cancelled,
+            &Arc::new(SyncRootAccess::default()),
+        );
+        let result = result_receiver.recv()?;
+        assert_eq!(result.path, Path::new("cancelled.bin"));
+        assert_eq!(result.identity, identity);
+        assert!(matches!(result.outcome, DownloadOutcome::Cancelled));
+
+        let mut locked = slots
+            .lock()
+            .map_err(|_| io::Error::other("slot coordinator was poisoned"))?;
+        assert!(locked.active.insert(binding));
+        assert!(!locked.active.insert(binding));
+        Ok(())
+    }
     use crate::local::{ConflictSide, conflict_relative_path, dropbox_content_hash};
 
     fn remote_download_error(source: DropboxError) -> ReconcileError {
