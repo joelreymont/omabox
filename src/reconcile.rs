@@ -538,33 +538,32 @@ fn download_worker(
 fn download_block_reason(error: &ReconcileError) -> Option<BlockReason> {
     match error {
         ReconcileError::RemoteDownload {
-            source: error @ DropboxError::Sdk { .. },
+            source: DropboxError::Sdk {
+                outcome, source, ..
+            },
             ..
         } => {
             if matches!(
-                error.api_outcome(),
+                outcome,
                 crate::dropbox::ApiOutcome::Unavailable | crate::dropbox::ApiOutcome::Unknown
             ) {
-                Some(BlockReason::DownloadUnavailable { status: 409 })
-            } else if let DropboxError::Sdk { source, .. } = error {
-                if matches!(
-                    source.as_ref(),
-                    dropbox_sdk::Error::Json(_) | dropbox_sdk::Error::UnexpectedResponse(_)
-                ) {
-                    return Some(BlockReason::DownloadVerificationFailed);
-                }
-                use crate::transport::TransportError as T;
-                match source.downcast_ref_inner::<T>() {
-                    Some(
-                        T::RangeIgnored { .. }
-                        | T::RangeMismatch { .. }
-                        | T::UnexpectedRangeStatus { .. }
-                        | T::RangeUnsatisfiable { .. },
-                    ) => Some(BlockReason::DownloadVerificationFailed),
-                    _ => None,
-                }
-            } else {
-                None
+                return Some(BlockReason::DownloadUnavailable { status: 409 });
+            }
+            if matches!(
+                source.as_ref(),
+                dropbox_sdk::Error::Json(_) | dropbox_sdk::Error::UnexpectedResponse(_)
+            ) {
+                return Some(BlockReason::DownloadVerificationFailed);
+            }
+            use crate::transport::TransportError as T;
+            match source.downcast_ref_inner::<T>() {
+                Some(
+                    T::RangeIgnored { .. }
+                    | T::RangeMismatch { .. }
+                    | T::UnexpectedRangeStatus { .. }
+                    | T::RangeUnsatisfiable { .. },
+                ) => Some(BlockReason::DownloadVerificationFailed),
+                _ => None,
             }
         }
 

@@ -961,12 +961,10 @@ impl DropboxClient {
             files::DeleteArg::new(target.clone()).with_parent_rev(expected.as_str().to_owned());
         let operation = "conditionally delete Dropbox file";
         match self.call(|| files::delete_v2(&self.transport, &argument)) {
-            Ok(payload) => {
-                match validate_deleted_file(&target, payload.metadata.into(), expected) {
-                    Ok(()) => Ok(MutationOutcome::Applied(RemotePathState::Absent)),
-                    Err(failure) => self.resolve_ambiguous(&target, &expectation, failure),
-                }
-            }
+            Ok(payload) => match validate_deleted_file(&target, payload.metadata, expected) {
+                Ok(()) => Ok(MutationOutcome::Applied(RemotePathState::Absent)),
+                Err(failure) => self.resolve_ambiguous(&target, &expectation, failure),
+            },
             Err(error) => self.resolve_mutation_error(
                 &target,
                 &expectation,
@@ -988,13 +986,12 @@ impl DropboxClient {
         let argument = files::CreateFolderArg::new(target.clone()).with_autorename(false);
         let operation = "strictly create Dropbox folder";
         match self.call(|| files::create_folder_v2(&self.transport, &argument)) {
-            Ok(payload) => match validate_created_folder(
-                &target,
-                files::Metadata::Folder(payload.metadata).into(),
-            ) {
-                Ok(()) => Ok(MutationOutcome::Applied(RemotePathState::Folder)),
-                Err(failure) => self.resolve_ambiguous(&target, &expectation, failure),
-            },
+            Ok(payload) => {
+                match validate_mutation_path(&target, payload.metadata.path_lower.as_deref()) {
+                    Ok(()) => Ok(MutationOutcome::Applied(RemotePathState::Folder)),
+                    Err(failure) => self.resolve_ambiguous(&target, &expectation, failure),
+                }
+            }
             Err(error) => self.resolve_mutation_error(
                 &target,
                 &expectation,
@@ -1081,11 +1078,7 @@ impl DropboxClient {
         match result {
             Ok(metadata) => {
                 progress.complete(size);
-                match validate_uploaded_file(
-                    target,
-                    files::Metadata::File(metadata).into(),
-                    staged.content(),
-                ) {
+                match validate_uploaded_file(target, metadata, staged.content()) {
                     Ok(remote) => Ok(MutationOutcome::Applied(RemotePathState::File(remote))),
                     Err(error) => self.resolve_ambiguous(target, &expectation, error),
                 }
@@ -1211,7 +1204,7 @@ impl DropboxClient {
     fn metadata_state(&self, target: &str) -> Result<RemotePathState, DropboxError> {
         let argument = files::GetMetadataArg::new(target.to_owned()).with_include_deleted(true);
         match self.call(|| files::get_metadata(&self.transport, &argument)) {
-            Ok(metadata) => metadata_remote_state(target, metadata.into()),
+            Ok(metadata) => metadata_remote_state(target, metadata),
             Err(SdkError::Api(files::GetMetadataError::Path(files::LookupError::NotFound))) => {
                 Ok(RemotePathState::Absent)
             }
@@ -1251,14 +1244,13 @@ impl DropboxClient {
         let metadata = self
             .call(|| files::get_metadata(&self.transport, &argument))
             .map_err(|e| DropboxError::sdk("validate configured Dropbox root", e))?;
-        let metadata = ListEntry::from(metadata);
-        if metadata.path_lower.as_deref() != Some(self.root.lower_path.as_str()) {
+        if metadata_paths(&metadata).0 != Some(self.root.lower_path.as_str()) {
             return Err(DropboxError::RemoteRootUnavailable);
         }
-        if !matches!(metadata.tag, EntryTag::Folder) {
+        let files::Metadata::Folder(folder) = metadata else {
             return Err(DropboxError::RemoteRootNotFolder);
-        }
-        if metadata.restricted() {
+        };
+        if folder_restricted(&folder) {
             return Err(DropboxError::RemoteRootRestricted);
         }
         Ok(())
@@ -1274,11 +1266,7 @@ impl DropboxClient {
         let mut records = BTreeMap::new();
         let mut page = first;
         loop {
-            apply_entries(
-                &self.root,
-                &mut records,
-                page.entries.into_iter().map(ListEntry::from).collect(),
-            )?;
+            apply_entries(&self.root, &mut records, page.entries)?;
             if !page.has_more {
                 return Ok((records.into_values().collect(), page.cursor));
             }
@@ -1303,11 +1291,7 @@ impl DropboxClient {
                 ContinuePage::Reset => return Ok(CursorDelta::Reset),
                 ContinuePage::Page(page) => page,
             };
-            append_entry_changes(
-                &self.root,
-                &mut changes,
-                page.entries.into_iter().map(ListEntry::from).collect(),
-            )?;
+            append_entry_changes(&self.root, &mut changes, page.entries)?;
             if !page.has_more {
                 normalize_inventory_changes(&mut changes, directories)?;
                 return Ok(CursorDelta::Changes {
@@ -1399,70 +1383,20 @@ enum ContinuePage {
     Reset,
 }
 
-// Engine projection of generated metadata; this is never a wire deserializer.
-struct ListEntry {
-    tag: EntryTag,
-    path_lower: Option<String>,
-    path_display: Option<String>,
-    rev: Option<String>,
-    content_hash: Option<String>,
-    is_downloadable: bool,
-    symlink_info: Option<dropbox_sdk::types::files::SymlinkInfo>,
-    sharing_info: Option<dropbox_sdk::types::files::FolderSharingInfo>,
+fn metadata_paths(metadata: &files::Metadata) -> (Option<&str>, Option<&str>) {
+    let (lower, display) = match metadata {
+        files::Metadata::File(file) => (&file.path_lower, &file.path_display),
+        files::Metadata::Folder(folder) => (&folder.path_lower, &folder.path_display),
+        files::Metadata::Deleted(deleted) => (&deleted.path_lower, &deleted.path_display),
+    };
+    (lower.as_deref(), display.as_deref())
 }
 
-impl ListEntry {
-    fn restricted(&self) -> bool {
-        self.sharing_info
-            .as_ref()
-            .is_some_and(|sharing| sharing.no_access || sharing.traverse_only)
-    }
-}
-
-#[derive(Clone, Copy)]
-enum EntryTag {
-    File,
-    Folder,
-    Deleted,
-    Unknown,
-}
-
-impl From<files::Metadata> for ListEntry {
-    fn from(metadata: files::Metadata) -> Self {
-        let mut entry = Self {
-            tag: EntryTag::Unknown,
-            path_lower: None,
-            path_display: None,
-            rev: None,
-            content_hash: None,
-            is_downloadable: false,
-            symlink_info: None,
-            sharing_info: None,
-        };
-        match metadata {
-            files::Metadata::File(file) => {
-                entry.tag = EntryTag::File;
-                entry.path_lower = file.path_lower;
-                entry.path_display = file.path_display;
-                entry.rev = Some(file.rev);
-                entry.content_hash = file.content_hash;
-                entry.is_downloadable = file.is_downloadable;
-                entry.symlink_info = file.symlink_info;
-            }
-            files::Metadata::Folder(folder) => {
-                entry.tag = EntryTag::Folder;
-                entry.path_lower = folder.path_lower;
-                entry.path_display = folder.path_display;
-                entry.sharing_info = folder.sharing_info;
-            }
-            files::Metadata::Deleted(deleted) => {
-                entry.tag = EntryTag::Deleted;
-                entry.path_lower = deleted.path_lower;
-                entry.path_display = deleted.path_display;
-            }
-        }
-        entry
-    }
+fn folder_restricted(folder: &files::FolderMetadata) -> bool {
+    folder
+        .sharing_info
+        .as_ref()
+        .is_some_and(|sharing| sharing.no_access || sharing.traverse_only)
 }
 
 fn namespace_id(root: &RootInfo) -> Result<String, DropboxError> {
@@ -1632,10 +1566,10 @@ fn validate_upload_size(bytes: u64) -> Result<(), DropboxError> {
 
 fn validate_uploaded_file(
     target: &str,
-    metadata: ListEntry,
+    metadata: files::FileMetadata,
     expected: &ContentIdentity,
 ) -> Result<RemoteFile, DropboxError> {
-    validate_mutation_path(target, &metadata)?;
+    validate_mutation_path(target, metadata.path_lower.as_deref())?;
     let remote = complete_remote_file(metadata).ok_or(DropboxError::InvalidMutationMetadata)?;
     if &remote.content != expected {
         return Err(DropboxError::UploadedContentMismatch);
@@ -1645,10 +1579,13 @@ fn validate_uploaded_file(
 
 fn validate_deleted_file(
     target: &str,
-    metadata: ListEntry,
+    metadata: files::Metadata,
     expected: &DropboxRevision,
 ) -> Result<(), DropboxError> {
-    validate_mutation_path(target, &metadata)?;
+    validate_mutation_path(target, metadata_paths(&metadata).0)?;
+    let files::Metadata::File(metadata) = metadata else {
+        return Err(DropboxError::InvalidMutationMetadata);
+    };
     let remote = complete_remote_file(metadata).ok_or(DropboxError::InvalidMutationMetadata)?;
     if &remote.revision != expected {
         return Err(DropboxError::InvalidMutationMetadata);
@@ -1656,41 +1593,29 @@ fn validate_deleted_file(
     Ok(())
 }
 
-fn validate_created_folder(target: &str, metadata: ListEntry) -> Result<(), DropboxError> {
-    validate_mutation_path(target, &metadata)?;
-    if !matches!(metadata.tag, EntryTag::Folder) {
-        return Err(DropboxError::InvalidMutationMetadata);
-    }
-    Ok(())
-}
-
 fn metadata_remote_state(
     target: &str,
-    metadata: ListEntry,
+    metadata: files::Metadata,
 ) -> Result<RemotePathState, DropboxError> {
-    validate_mutation_path(target, &metadata)?;
-    match metadata.tag {
-        EntryTag::Unknown => Ok(RemotePathState::Unsupported),
-        EntryTag::Deleted => Ok(RemotePathState::Absent),
-        EntryTag::Folder => Ok(RemotePathState::Folder),
-        EntryTag::File if !metadata.is_downloadable || metadata.symlink_info.is_some() => {
+    validate_mutation_path(target, metadata_paths(&metadata).0)?;
+    match metadata {
+        files::Metadata::Deleted(_) => Ok(RemotePathState::Absent),
+        files::Metadata::Folder(_) => Ok(RemotePathState::Folder),
+        files::Metadata::File(file) if !file.is_downloadable || file.symlink_info.is_some() => {
             Ok(RemotePathState::Unsupported)
         }
-        EntryTag::File => complete_remote_file(metadata)
+        files::Metadata::File(file) => complete_remote_file(file)
             .map(RemotePathState::File)
             .ok_or(DropboxError::InvalidMutationMetadata),
     }
 }
 
-fn complete_remote_file(metadata: ListEntry) -> Option<RemoteFile> {
-    if !matches!(metadata.tag, EntryTag::File)
-        || !metadata.is_downloadable
-        || metadata.symlink_info.is_some()
-    {
+fn complete_remote_file(metadata: files::FileMetadata) -> Option<RemoteFile> {
+    if !metadata.is_downloadable || metadata.symlink_info.is_some() {
         return None;
     }
     let content = metadata.content_hash?;
-    let revision = metadata.rev?;
+    let revision = metadata.rev;
     if !valid_content_hash(&content) || revision.is_empty() {
         return None;
     }
@@ -1700,8 +1625,8 @@ fn complete_remote_file(metadata: ListEntry) -> Option<RemoteFile> {
     ))
 }
 
-fn validate_mutation_path(target: &str, metadata: &ListEntry) -> Result<(), DropboxError> {
-    if metadata.path_lower.as_deref() == Some(target.to_lowercase().as_str()) {
+fn validate_mutation_path(target: &str, path_lower: Option<&str>) -> Result<(), DropboxError> {
+    if path_lower == Some(target.to_lowercase().as_str()) {
         Ok(())
     } else {
         Err(DropboxError::InvalidMutationMetadata)
@@ -1722,7 +1647,7 @@ fn valid_content_hash(value: &str) -> bool {
 fn apply_entries(
     root: &DropboxRoot,
     records: &mut BTreeMap<String, RemoteObservationRecord>,
-    entries: Vec<ListEntry>,
+    entries: Vec<files::Metadata>,
 ) -> Result<(), DropboxError> {
     let mut changes = Vec::new();
     append_entry_changes(root, &mut changes, entries)?;
@@ -1751,49 +1676,34 @@ fn apply_entries(
 fn append_entry_changes(
     root: &DropboxRoot,
     changes: &mut Vec<RemoteInventoryChange>,
-    entries: Vec<ListEntry>,
+    entries: Vec<files::Metadata>,
 ) -> Result<(), DropboxError> {
     for entry in entries {
-        let lower = entry
-            .path_lower
-            .as_deref()
-            .ok_or(DropboxError::InvalidEntryPath)?;
-        let display = entry
-            .path_display
-            .as_deref()
-            .ok_or(DropboxError::InvalidEntryPath)?;
+        let (lower, display) = metadata_paths(&entry);
+        let lower = lower.ok_or(DropboxError::InvalidEntryPath)?;
+        let display = display.ok_or(DropboxError::InvalidEntryPath)?;
         let (key, path) = relative_paths(root, lower, display)?;
-        if matches!(entry.tag, EntryTag::Deleted) {
-            changes.push(RemoteInventoryChange::DeleteSubtree {
-                canonical_path: CanonicalPath::from_bytes(key.into_bytes()),
-            });
-            continue;
-        }
-        let observation = match entry.tag {
-            EntryTag::Unknown => return Err(DropboxError::InvalidEntryPath),
-            EntryTag::Deleted => continue,
-            EntryTag::Folder if entry.restricted() => {
+        let observation = match entry {
+            files::Metadata::Deleted(_) => {
+                changes.push(RemoteInventoryChange::DeleteSubtree {
+                    canonical_path: CanonicalPath::from_bytes(key.into_bytes()),
+                });
+                continue;
+            }
+            files::Metadata::Folder(folder) if folder_restricted(&folder) => {
                 return Err(DropboxError::RestrictedRemoteInventory);
             }
-            EntryTag::Folder => Observation::Directory,
-            EntryTag::File => {
+            files::Metadata::Folder(_) => Observation::Directory,
+            files::Metadata::File(file) => {
                 changes.push(RemoteInventoryChange::DeleteSubtree {
                     canonical_path: CanonicalPath::from_bytes(key.clone().into_bytes()),
                 });
-                if !entry.is_downloadable || entry.symlink_info.is_some() {
+                if !file.is_downloadable || file.symlink_info.is_some() {
                     Observation::Unknown(UnknownReason::Unsupported)
                 } else {
-                    let content = entry
-                        .content_hash
-                        .ok_or(DropboxError::IncompleteFileMetadata)?;
-                    let revision = entry.rev.ok_or(DropboxError::IncompleteFileMetadata)?;
-                    if !valid_content_hash(&content) || revision.is_empty() {
-                        return Err(DropboxError::IncompleteFileMetadata);
-                    }
-                    Observation::Present(RemoteFile::new(
-                        ContentIdentity::new(content),
-                        DropboxRevision::new(revision),
-                    ))
+                    Observation::Present(
+                        complete_remote_file(file).ok_or(DropboxError::IncompleteFileMetadata)?,
+                    )
                 }
             }
         };
@@ -2352,9 +2262,9 @@ mod tests {
     };
 
     use super::{
-        ApiOutcome, DropboxError, DropboxRoot, EntryTag, ListEntry, MutationRejection,
-        PROGRESS_INTERVAL, ProgressReader, UPLOAD_SESSION_MAX_BYTES, apply_entries, files,
-        lookup_outcome, validate_upload_size, write_outcome,
+        ApiOutcome, DropboxError, DropboxRoot, MutationRejection, PROGRESS_INTERVAL,
+        ProgressReader, UPLOAD_SESSION_MAX_BYTES, apply_entries, files, lookup_outcome,
+        validate_upload_size, write_outcome,
     };
 
     #[test]
@@ -2402,6 +2312,26 @@ mod tests {
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const TEST_REVISION: &str = "test-revision";
 
+    fn file_metadata(lower: &str, display: &str) -> files::FileMetadata {
+        files::FileMetadata::new(
+            String::from("file"),
+            String::from("id:file"),
+            String::from("2024-01-02T03:04:05Z"),
+            String::from("2024-01-02T03:04:05Z"),
+            String::from(TEST_REVISION),
+            0,
+        )
+        .with_path_lower(lower.to_owned())
+        .with_path_display(display.to_owned())
+        .with_content_hash(String::from(TEST_CONTENT_HASH))
+    }
+
+    fn folder_metadata(lower: &str, display: &str) -> files::FolderMetadata {
+        files::FolderMetadata::new(String::from("folder"), String::from("id:folder"))
+            .with_path_lower(lower.to_owned())
+            .with_path_display(display.to_owned())
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum TinyPath {
         A,
@@ -2444,25 +2374,16 @@ mod tests {
             }
         }
 
-        fn entry(self) -> ListEntry {
-            let (tag, rev, content_hash) = match self {
-                Self::File(_) => (
-                    EntryTag::File,
-                    Some(String::from(TEST_REVISION)),
-                    Some(String::from(TEST_CONTENT_HASH)),
+        fn entry(self) -> files::Metadata {
+            let path = self.path().dropbox_path();
+            match self {
+                Self::File(_) => files::Metadata::File(file_metadata(path, path)),
+                Self::Folder(_) => files::Metadata::Folder(folder_metadata(path, path)),
+                Self::Delete(_) => files::Metadata::Deleted(
+                    files::DeletedMetadata::new(String::from("deleted"))
+                        .with_path_lower(path.to_owned())
+                        .with_path_display(path.to_owned()),
                 ),
-                Self::Folder(_) => (EntryTag::Folder, None, None),
-                Self::Delete(_) => (EntryTag::Deleted, None, None),
-            };
-            ListEntry {
-                tag,
-                path_lower: Some(String::from(self.path().dropbox_path())),
-                path_display: Some(String::from(self.path().dropbox_path())),
-                rev,
-                content_hash,
-                is_downloadable: true,
-                symlink_info: None,
-                sharing_info: None,
             }
         }
     }
@@ -2610,30 +2531,14 @@ mod tests {
     {
         let root = DropboxRoot::new("account", "namespace", "")?;
         let mut records = BTreeMap::new();
+        let mut paper = file_metadata("/paper", "/Paper").with_is_downloadable(false);
+        paper.content_hash = None;
         apply_entries(
             &root,
             &mut records,
             vec![
-                ListEntry {
-                    tag: EntryTag::Folder,
-                    path_lower: Some(String::from("/folder")),
-                    path_display: Some(String::from("/Folder")),
-                    rev: None,
-                    content_hash: None,
-                    is_downloadable: true,
-                    symlink_info: None,
-                    sharing_info: None,
-                },
-                ListEntry {
-                    tag: EntryTag::File,
-                    path_lower: Some(String::from("/paper")),
-                    path_display: Some(String::from("/Paper")),
-                    rev: Some(String::from("1")),
-                    content_hash: None,
-                    is_downloadable: false,
-                    symlink_info: None,
-                    sharing_info: None,
-                },
+                files::Metadata::Folder(folder_metadata("/folder", "/Folder")),
+                files::Metadata::File(paper),
             ],
         )?;
 
@@ -2654,41 +2559,17 @@ mod tests {
         apply_entries(
             &root,
             &mut records,
-            vec![ListEntry {
-                tag: EntryTag::Folder,
-                path_lower: Some(String::from("/apps")),
-                path_display: Some(String::from("/apps")),
-                rev: None,
-                content_hash: None,
-                is_downloadable: true,
-                symlink_info: None,
-                sharing_info: None,
-            }],
+            vec![files::Metadata::Folder(folder_metadata("/apps", "/apps"))],
         )?;
         apply_entries(
             &root,
             &mut records,
             vec![
-                ListEntry {
-                    tag: EntryTag::File,
-                    path_lower: Some(String::from("/apps/day one/entry.doentry")),
-                    path_display: Some(String::from("/Apps/day one/Entry.doentry")),
-                    rev: Some(String::from(TEST_REVISION)),
-                    content_hash: Some(String::from(TEST_CONTENT_HASH)),
-                    is_downloadable: true,
-                    symlink_info: None,
-                    sharing_info: None,
-                },
-                ListEntry {
-                    tag: EntryTag::Folder,
-                    path_lower: Some(String::from("/apps/day one")),
-                    path_display: Some(String::from("/Apps/Day One")),
-                    rev: None,
-                    content_hash: None,
-                    is_downloadable: true,
-                    symlink_info: None,
-                    sharing_info: None,
-                },
+                files::Metadata::File(file_metadata(
+                    "/apps/day one/entry.doentry",
+                    "/Apps/day one/Entry.doentry",
+                )),
+                files::Metadata::Folder(folder_metadata("/apps/day one", "/Apps/Day One")),
             ],
         )?;
 
@@ -2708,16 +2589,10 @@ mod tests {
         let result = apply_entries(
             &root,
             &mut records,
-            vec![ListEntry {
-                tag: EntryTag::File,
-                path_lower: Some(String::from("/report.txt")),
-                path_display: Some(String::from("/Different.txt")),
-                rev: Some(String::from("revision")),
-                content_hash: Some(String::from(TEST_CONTENT_HASH)),
-                is_downloadable: true,
-                symlink_info: None,
-                sharing_info: None,
-            }],
+            vec![files::Metadata::File(file_metadata(
+                "/report.txt",
+                "/Different.txt",
+            ))],
         );
 
         assert!(matches!(result, Err(DropboxError::InvalidEntryPath)));
