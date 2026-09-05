@@ -1,11 +1,13 @@
 ---
-title: "Journal hygiene: case collisions, legacy adoption, dead code"
-status: active
+title: "Journal hygiene: case collisions and dead code"
+status: open
 priority: 3
 issue-type: task
 created-at: "\"2026-09-02T11:28:11.365981+02:00\""
-blocks:
-  - omabox-journal-schema-ver-487764f0
 ---
 
-Problem: src/journal.rs:1372-1374 invalidates the kept spelling's baseline too, causing a spurious InitialCollision; :745-763 binds legacy v1 baselines to whatever root is configured, which can plan DeleteRemote for every file when the root is new; config::redacted (src/config.rs:729-748) has no production caller; Journal::publish_local_inventory is test-only. Design: docs/remediation-2026-09.md section M. Acceptance: invalidate_case_collision_baselines re-records the kept spelling's baseline in the same transaction (test asserts a later differing remote yields ReplaceLocal, not a conflict); legacy adoption starts a fresh generation (migration test from a v1 fixture with a different root asserts no DeleteRemote is ever planned); config::redacted removed; publish_local_inventory under cfg(test). Files: src/journal.rs, src/config.rs, src/status.rs. Verify: cargo fmt --check; cargo clippy --all-targets -- -D warnings; cargo test. Depends: schema. Ownership: journal hygiene. Claim: agent=worker-hygiene workspace=.jj-ws/omabox-journal-hygiene-case-8cc63437
+Problem: invalidate_case_collision_baselines still invalidates the kept spelling's baseline, which can cause a spurious InitialCollision. config::redacted has no production caller, and Journal::publish_local_inventory is only used by tests. Safe legacy-root adoption already landed in 8098526 and is no longer work for this dot.
+
+Design: docs/remediation-2026-09.md section M, remaining case-collision and dead-code items. Acceptance: invalidate_case_collision_baselines re-records the kept spelling's baseline in the same transaction, using the active root descriptor as section M specifies; a regression asserts a later differing remote yields ReplaceLocal rather than a conflict. Remove config::redacted and put publish_local_inventory under cfg(test).
+
+Files: src/journal.rs, src/config.rs, src/status.rs, src/reconcile.rs as needed for the existing case-collision path. Verify: cargo fmt --check; cargo clippy --all-targets -- -D warnings; cargo test. Depends: none; journal schema and safe root adoption are landed. Ownership: journal hygiene. Claim: unassigned. The old workspace is retained as historical work only.

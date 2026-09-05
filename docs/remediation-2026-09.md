@@ -4,10 +4,9 @@ The focused corrections authorized on 2026-09-05 are tracked in their own
 dots. Slot ownership, daemon recovery/readiness, root identity, durable
 mutation blocking, and idle-cost fixes landed independently of section J.
 Section J now replaces the handwritten OAuth and route layer in the main
-checkout. Its original dot is `omabox-move-the-dropbox-cb30bc34`; the old
-`.jj-ws/omabox-move-the-dropbox-cb30bc34` workspace remains historical work,
-not the integrated implementation. Durable upload-session resumption remains
-its separate J-resume dot.
+checkout. Its original dot is `omabox-move-the-dropbox-cb30bc34`; the superseded
+workspace was retired after integration in change `ltnqlvsx`. Durable
+upload-session resumption remains its separate J-resume dot.
 
 Baseline: commit `672301cf6366`. This document is the implementation contract
 for every dot in the remediation campaign. Workers code to it; deviations are
@@ -23,7 +22,7 @@ design feedback, not improvisation.
   retried in-process with bounded backoff and a published status.
 - Staging-slot ownership is decided under one lock from the complete set of
   pending downloads.
-- Idle passes are cheap: write only what changed, validate the account once.
+- Idle passes are cheap: avoid unchanged inventory writes, validate the account once.
 - Tests prove the production path. Fakes track documented Dropbox behavior.
 
 ## A. Canonical path identity (C1, hash cache)
@@ -571,9 +570,14 @@ would remove the adapters above; they are candidate upstream changes to
 
 ## K. Idle pass cost (M6)
 
-- `publish_local_scan` reads the existing inventory and hash cache in canonical
-  order, merges with the new scan, and writes only inserted, updated, or
-  deleted rows.
+- `publish_local_scan` compares the existing inventory and hash cache with the
+  new scan inside the active-root write transaction. An identical scan writes
+  no observation or hash-cache rows; a changed scan replaces both collections
+  atomically. The comparison still acquires the write lock. This deliberately
+  replaces the proposed row-diff merge with the smaller implementation landed
+  in `ac273d7b`. [Measurements](performance.md) showed a 62% idle-pass reduction
+  at 10k files and 47% at 50k files. These measurements justify the unchanged-scan
+  shortcut; they do not establish changed-scan performance or a lock-free read.
 - `pending_plans` is one join and is loaded once per pass and passed through.
 - The scanner computes `CanonicalPath` once per entry and
   `LocalObservationRecord` carries it, so `local_map` only sorts and the
