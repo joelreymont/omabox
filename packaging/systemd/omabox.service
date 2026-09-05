@@ -1,13 +1,19 @@
 [Unit]
 Description=Omabox Dropbox sync service
+After=graphical-session.target
+StartLimitIntervalSec=10min
+StartLimitBurst=5
 
 [Service]
-Type=simple
+Type=notify
 ExecStart=%h/.local/bin/omaboxd
+ExecStopPost=-/usr/bin/rm -f %t/omabox/status.json
 Restart=on-failure
+RestartPreventExitStatus=70 78
 RestartSec=5s
 UMask=0077
 KillSignal=SIGTERM
+TimeoutStartSec=5min
 TimeoutStopSec=30s
 
 [Install]

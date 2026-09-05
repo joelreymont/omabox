@@ -8,6 +8,7 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use miette::Diagnostic;
 use rustix::fs::{CWD, RenameFlags, renameat_with};
@@ -17,6 +18,10 @@ use crate::service::{ServiceAction, ServiceCommands, ServiceError};
 use crate::spawn::Launch;
 
 const UNIT: &[u8] = include_bytes!("../packaging/systemd/omabox.service");
+// A concurrent child can briefly inherit the staged file's writable descriptor
+// between fork and exec, even though the descriptor is close-on-exec.
+const DAEMON_SELF_CHECK_ATTEMPTS: usize = 5;
+const DAEMON_SELF_CHECK_RETRY_DELAY: Duration = Duration::from_millis(10);
 const PLUGIN: [(&str, &[u8]); 4] = [
     (
         "manifest.json",
@@ -407,6 +412,7 @@ impl Transaction {
             write_file(unit, UNIT, 0o644)?;
             write_plugin(plugin)?;
             transaction.preflight()?;
+            validate_daemon(omaboxd)?;
             validate_plugin(commands, plugin)
         })();
         if let Err(source) = result {
@@ -590,6 +596,38 @@ fn validate_plugin(commands: &Commands, path: &Path) -> Result<(), InstallError>
     }
 }
 
+fn validate_daemon(path: &Path) -> Result<(), InstallError> {
+    validate_daemon_with(path, &mut std::thread::sleep)
+}
+
+fn validate_daemon_with(path: &Path, wait: &mut impl FnMut(Duration)) -> Result<(), InstallError> {
+    let mut attempts_remaining = DAEMON_SELF_CHECK_ATTEMPTS;
+    loop {
+        let status = std::process::Command::new(path)
+            .arg("--self-check")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match status {
+            Ok(status) => {
+                return match status.code() {
+                    Some(0) => Ok(()),
+                    status => Err(InstallError::DaemonSelfCheckFailed { status }),
+                };
+            }
+            Err(source)
+                if source.raw_os_error() == Some(rustix::io::Errno::TXTBSY.raw_os_error())
+                    && attempts_remaining > 1 =>
+            {
+                attempts_remaining -= 1;
+                wait(DAEMON_SELF_CHECK_RETRY_DELAY);
+            }
+            Err(source) => return Err(InstallError::DaemonSelfCheckStart { source }),
+        }
+    }
+}
+
 fn copy_file(source: &Path, path: &Path, mode: u32) -> Result<(), InstallError> {
     let mut source_file =
         File::open(source).map_err(fs_error("open an executable source", source))?;
@@ -753,6 +791,21 @@ pub enum InstallError {
         command: &'static str,
         status: Option<i32>,
     },
+    #[error("could not start the staged Omabox daemon self-check")]
+    #[diagnostic(
+        code(omabox::install::daemon_self_check_start),
+        help("Rebuild Omabox and retry the installation.")
+    )]
+    DaemonSelfCheckStart {
+        #[source]
+        source: io::Error,
+    },
+    #[error("the staged Omabox daemon self-check failed with status {status:?}")]
+    #[diagnostic(
+        code(omabox::install::daemon_self_check_failed),
+        help("Rebuild Omabox and retry the installation.")
+    )]
+    DaemonSelfCheckFailed { status: Option<i32> },
     #[error("the Omarchy shell is locked")]
     #[diagnostic(
         code(omabox::install::shell_locked),
@@ -790,6 +843,8 @@ mod tests {
 
     use super::*;
 
+    const VALID_DAEMON: &[u8] = b"#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = --self-check ]; then printf 'omaboxd 0.1.0\\n'; exit 0; fi\nexit 64\n";
+
     struct Fixture {
         _temporary: tempfile::TempDir,
         layout: Layout,
@@ -817,7 +872,7 @@ mod tests {
                 omaboxd: release.join("omaboxd"),
             };
             release_artifact(&sources.omabox, b"#!/bin/sh\necho omabox\n")?;
-            release_artifact(&sources.omaboxd, b"#!/bin/sh\necho omaboxd\n")?;
+            release_artifact(&sources.omaboxd, VALID_DAEMON)?;
 
             let systemctl_log = temporary.path().join("systemctl.log");
             let failed_reload = temporary.path().join("reload.failed");
@@ -899,10 +954,21 @@ mod tests {
 
     #[test]
     fn packaged_unit_runs_the_user_installed_daemon() {
-        assert!(
-            UNIT.windows(b"ExecStart=%h/.local/bin/omaboxd".len())
-                .any(|window| window == b"ExecStart=%h/.local/bin/omaboxd")
-        );
+        for directive in [
+            b"After=graphical-session.target".as_slice(),
+            b"StartLimitIntervalSec=10min".as_slice(),
+            b"StartLimitBurst=5".as_slice(),
+            b"Type=notify".as_slice(),
+            b"ExecStart=%h/.local/bin/omaboxd".as_slice(),
+            b"ExecStopPost=-/usr/bin/rm -f %t/omabox/status.json".as_slice(),
+            b"RestartPreventExitStatus=70 78".as_slice(),
+            b"TimeoutStartSec=5min".as_slice(),
+        ] {
+            assert!(
+                UNIT.windows(directive.len())
+                    .any(|window| window == directive)
+            );
+        }
     }
 
     #[test]
@@ -924,10 +990,7 @@ mod tests {
             fs::read(&fixture.layout.omabox)?,
             b"#!/bin/sh\necho omabox\n"
         );
-        assert_eq!(
-            fs::read(&fixture.layout.omaboxd)?,
-            b"#!/bin/sh\necho omaboxd\n"
-        );
+        assert_eq!(fs::read(&fixture.layout.omaboxd)?, VALID_DAEMON);
         assert_eq!(fs::read(&fixture.layout.unit)?, UNIT);
         for (name, contents) in PLUGIN {
             assert_eq!(fs::read(fixture.layout.plugin.join(name))?, contents);
@@ -1155,10 +1218,7 @@ mod tests {
             fs::read(&fixture.layout.omabox)?,
             b"#!/bin/sh\necho omabox\n"
         );
-        assert_eq!(
-            fs::read(&fixture.layout.omaboxd)?,
-            b"#!/bin/sh\necho omaboxd\n"
-        );
+        assert_eq!(fs::read(&fixture.layout.omaboxd)?, VALID_DAEMON);
         assert_eq!(fs::read(&fixture.layout.unit)?, UNIT);
         assert!(fixture.layout.plugin.join("Panel.qml").is_file());
         assert_eq!(
@@ -1220,6 +1280,94 @@ mod tests {
         assert_eq!(fs::read(&fixture.layout.omabox)?, b"old");
         assert_eq!(fs::read(fixture.layout.plugin.join("old.qml"))?, b"old");
         assert!(!fixture.systemctl_log.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn staged_daemon_self_check_failure_preserves_published_artifacts() -> Result<(), Box<dyn Error>>
+    {
+        let fixture = Fixture::new(true, true, false, false)?;
+        fixture.old_install()?;
+        release_artifact(&fixture.sources.omaboxd, b"#!/bin/sh\nexit 9\n")?;
+
+        let result = execute_with(
+            InstallAction::Upgrade,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        assert!(matches!(
+            result,
+            Err(InstallError::DaemonSelfCheckFailed { status: Some(9) })
+        ));
+        for path in [
+            &fixture.layout.omabox,
+            &fixture.layout.omaboxd,
+            &fixture.layout.unit,
+        ] {
+            assert_eq!(fs::read(path)?, b"old");
+        }
+        assert_eq!(fs::read(fixture.layout.plugin.join("old.qml"))?, b"old");
+        assert!(!fixture.systemctl_log.exists());
+        assert!(!fixture.omarchy_log.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn staged_daemon_self_check_retries_a_transient_text_busy_spawn() -> Result<(), Box<dyn Error>>
+    {
+        let directory = tempfile::TempDir::new()?;
+        let daemon = directory.path().join("omaboxd");
+        release_artifact(&daemon, VALID_DAEMON)?;
+        let writer = OpenOptions::new().write(true).open(&daemon)?;
+        let mut writer = Some(writer);
+        let mut waits = Vec::new();
+
+        validate_daemon_with(&daemon, &mut |delay| {
+            waits.push(delay);
+            drop(writer.take());
+        })?;
+
+        assert!(!waits.is_empty());
+        assert!(waits.len() < DAEMON_SELF_CHECK_ATTEMPTS);
+        assert!(
+            waits
+                .iter()
+                .all(|delay| *delay == DAEMON_SELF_CHECK_RETRY_DELAY)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn staged_daemon_self_check_bounds_text_busy_and_preserves_other_spawn_errors()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::TempDir::new()?;
+        let daemon = directory.path().join("omaboxd");
+        release_artifact(&daemon, VALID_DAEMON)?;
+        let _writer = OpenOptions::new().write(true).open(&daemon)?;
+        let mut waits = Vec::new();
+
+        let busy = validate_daemon_with(&daemon, &mut |delay| waits.push(delay));
+        match busy {
+            Err(InstallError::DaemonSelfCheckStart { source }) => assert_eq!(
+                source.raw_os_error(),
+                Some(rustix::io::Errno::TXTBSY.raw_os_error())
+            ),
+            other => return Err(io::Error::other(format!("unexpected result: {other:?}")).into()),
+        }
+        assert_eq!(waits.len(), DAEMON_SELF_CHECK_ATTEMPTS - 1);
+
+        let missing = directory.path().join("missing");
+        let mut unrelated_waits = 0;
+        let missing = validate_daemon_with(&missing, &mut |_| unrelated_waits += 1);
+        match missing {
+            Err(InstallError::DaemonSelfCheckStart { source }) => {
+                assert_eq!(source.kind(), io::ErrorKind::NotFound);
+            }
+            other => return Err(io::Error::other(format!("unexpected result: {other:?}")).into()),
+        }
+        assert_eq!(unrelated_waits, 0);
         Ok(())
     }
 

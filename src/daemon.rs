@@ -1,6 +1,13 @@
 //! Long-running daemon control, recovery policy, and synchronization sessions.
 
+use std::env;
 use std::error::Error as StdError;
+use std::ffi::OsStr;
+use std::io;
+use std::os::linux::net::SocketAddrExt as _;
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::net::{SocketAddr, UnixDatagram};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::thread;
@@ -46,6 +53,7 @@ const SYNC_ROOT: &str = "The configured sync folder is temporarily unavailable."
 const SYNC_ERRORS: &str = "One or more files could not be synchronized.";
 const CURSOR: &str = "The Dropbox inventory cursor is temporarily unavailable.";
 const RUNNING: &str = "Another Omabox daemon is already running.";
+const READINESS: &str = "Omabox could not notify the service manager that startup completed.";
 const INTERNAL: &str = "Omabox stopped after detecting invalid internal state.";
 const LOGGING: &str = "Omabox logging could not start.";
 
@@ -126,8 +134,35 @@ fn run() -> Result<(), DaemonError> {
         },
         &mut wait,
     )?;
+    recovery.recover_with(notify_ready, &mut wait)?;
 
     run_owned(&config, &mut journal, &mut recovery, &mut wait)
+}
+
+fn notify_ready() -> Result<(), DaemonError> {
+    let target = env::var_os("NOTIFY_SOCKET");
+    send_readiness(target.as_deref()).map_err(|source| DaemonError::Notify { source })
+}
+
+fn send_readiness(target: Option<&OsStr>) -> io::Result<()> {
+    let Some(target) = target else {
+        return Ok(());
+    };
+    let bytes = target.as_bytes();
+    let address = match bytes.strip_prefix(b"@") {
+        Some(name) => SocketAddr::from_abstract_name(name)?,
+        None => SocketAddr::from_pathname(Path::new(target))?,
+    };
+    let socket = UnixDatagram::unbound()?;
+    let sent = socket.send_to_addr(b"READY=1", &address)?;
+    if sent == b"READY=1".len() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "systemd readiness datagram was truncated",
+        ))
+    }
 }
 
 fn run_owned(
@@ -518,6 +553,15 @@ pub enum DaemonError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Lock(#[from] LockError),
+    #[error("could not send the systemd readiness notification")]
+    #[diagnostic(
+        code(omabox::daemon::readiness),
+        help("Ensure the systemd notification socket is available, then retry.")
+    )]
+    Notify {
+        #[source]
+        source: io::Error,
+    },
     #[error("could not {operation}")]
     #[diagnostic(
         code(omabox::daemon::journal),
@@ -626,6 +670,7 @@ impl DaemonError {
             Self::Logging(_) => FailurePolicy::new(Disposition::Invariant, LOGGING),
             Self::Config(source) => config_policy(source),
             Self::Lock(source) => lock_policy(source),
+            Self::Notify { .. } => FailurePolicy::new(Disposition::Environmental, READINESS),
             Self::Journal { source, .. } => journal_policy(source),
             Self::LocalRootUnavailable { .. } => {
                 FailurePolicy::new(Disposition::Environmental, SYNC_ROOT)
@@ -946,15 +991,19 @@ fn sqlite_full(error: &rusqlite::Error) -> bool {
 mod tests {
     use std::cell::Cell;
     use std::error::Error;
+    use std::ffi::OsString;
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use serde_json::Value;
     use tempfile::TempDir;
 
     use super::*;
+
+    static SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     fn binding(account: &str, namespace: &str, root: &str) -> DropboxBinding {
         DropboxBinding {
@@ -1001,6 +1050,45 @@ mod tests {
         Ok(serde_json::from_slice(&fs::read(
             runtime.join("omabox/status.json"),
         )?)?)
+    }
+
+    fn receive_readiness(socket: &UnixDatagram) -> Result<Vec<u8>, Box<dyn Error>> {
+        socket.set_read_timeout(Some(Duration::from_secs(1)))?;
+        let mut buffer = [0_u8; 32];
+        let length = socket.recv(&mut buffer)?;
+        Ok(buffer[..length].to_vec())
+    }
+
+    #[test]
+    fn readiness_is_optional_without_a_notification_socket() -> Result<(), Box<dyn Error>> {
+        send_readiness(None)?;
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_sends_exact_bytes_to_a_path_socket() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let path = directory.path().join("notify.sock");
+        let receiver = UnixDatagram::bind(&path)?;
+        send_readiness(Some(path.as_os_str()))?;
+        assert_eq!(receive_readiness(&receiver)?, b"READY=1");
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_sends_exact_bytes_to_an_abstract_socket() -> Result<(), Box<dyn Error>> {
+        let name = format!(
+            "omabox-ready-{}-{}",
+            std::process::id(),
+            SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let address = SocketAddr::from_abstract_name(name.as_bytes())?;
+        let receiver = UnixDatagram::bind_addr(&address)?;
+        let mut target = OsString::from("@");
+        target.push(&name);
+        send_readiness(Some(&target))?;
+        assert_eq!(receive_readiness(&receiver)?, b"READY=1");
+        Ok(())
     }
 
     #[test]
