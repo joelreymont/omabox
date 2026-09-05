@@ -1118,6 +1118,323 @@ fn occupied_download_stage_is_durably_blocked_without_overwrite_or_request()
 }
 
 #[test]
+fn occupied_upload_stage_is_durably_blocked_without_overwrite_or_request()
+-> Result<(), Box<dyn Error>> {
+    let bytes = b"expected download bytes";
+    let occupant = b"unrelated occupant bytes";
+    let content = dropbox_content_hash(bytes.as_slice())?;
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        }))
+        .for_path("/2/users/get_current_account"),
+        FakeResponse::json(json!({
+            "entries": [],
+            "cursor": "occupied-upload-stage",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-occupied-stage")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("occupied.txt"), bytes)?;
+    assert!(matches!(
+        stage_upload(&root, Path::new("occupied.txt"), &staging, &content)?,
+        StageOutcome::Staged(_)
+    ));
+    let stage_path = std::fs::read_dir(&staging)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| io::Error::other("download stage was not created"))?;
+    std::fs::remove_file(&stage_path)?;
+    std::fs::write(&stage_path, occupant)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    let report = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+    assert_eq!(report.blocked, 1);
+    assert_eq!(report.sync_errors, 1);
+    assert_eq!(std::fs::read(&stage_path)?, occupant);
+    assert!(journal.pending_plans()?.is_empty());
+    let blocked = journal.blocked_plans()?;
+    assert_eq!(blocked.len(), 1);
+    assert!(matches!(
+        blocked[0].status,
+        PlanStatus::Blocked {
+            reason: BlockReason::StageOccupied,
+            ..
+        }
+    ));
+    drop(downloads);
+    drop(client);
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path != "/2/files/upload")
+    );
+    Ok(())
+}
+
+#[test]
+fn special_upload_stage_blocks_only_its_plan() -> Result<(), Box<dyn Error>> {
+    let blocked_bytes = b"blocked upload";
+    let good_bytes = b"sibling upload";
+    let blocked_content = dropbox_content_hash(blocked_bytes.as_slice())?;
+    let good_content = dropbox_content_hash(good_bytes.as_slice())?;
+    let good_remote = RemoteFile::new(
+        good_content.clone(),
+        DropboxRevision::new("sibling-upload-revision"),
+    );
+    let server = FakeServer::start(vec![
+        FakeResponse::json(file_metadata(
+            "/good.txt",
+            "/good.txt",
+            good_remote.revision.as_str(),
+            &good_remote.content,
+        ))
+        .for_path("/2/files/upload"),
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        }))
+        .for_path("/2/users/get_current_account"),
+        FakeResponse::json(json!({
+            "entries": [],
+            "cursor": "special-upload-stage",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-special-upload-stage")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("blocked.txt"), blocked_bytes)?;
+    std::fs::write(root.join("good.txt"), good_bytes)?;
+    let occupied_path = staging.join(blocked_content.as_str());
+    std::os::unix::fs::symlink("foreign-stage-target", &occupied_path)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+
+    let report = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+
+    assert_eq!(report.blocked, 1);
+    assert_eq!(report.sync_errors, 1);
+    assert!(
+        std::fs::symlink_metadata(&occupied_path)?
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        journal.baseline(Path::new("good.txt"))?,
+        Some(Baseline::Present(good_remote))
+    );
+    assert!(journal.pending_plans()?.is_empty());
+    let blocked = journal.blocked_plans()?;
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(blocked[0].path, Path::new("blocked.txt"));
+    assert!(matches!(
+        blocked[0].status,
+        PlanStatus::Blocked {
+            reason: BlockReason::StageOccupied,
+            ..
+        }
+    ));
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 3);
+    let uploads = requests
+        .iter()
+        .filter(|request| request.path == "/2/files/upload")
+        .collect::<Vec<_>>();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].body, good_bytes);
+    Ok(())
+}
+
+#[test]
+fn changed_upload_supersedes_a_rejected_plan_before_deadline() -> Result<(), Box<dyn Error>> {
+    let old_bytes = b"old rejected upload";
+    let new_bytes = b"new upload decision";
+    let old_content = dropbox_content_hash(old_bytes.as_slice())?;
+    let new_content = dropbox_content_hash(new_bytes.as_slice())?;
+    let new_remote = RemoteFile::new(
+        new_content.clone(),
+        DropboxRevision::new("changed-upload-revision"),
+    );
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        }))
+        .for_path("/2/users/get_current_account"),
+        FakeResponse::json(json!({
+            "entries": [],
+            "cursor": "changed-upload",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder"),
+        FakeResponse::json(file_metadata(
+            "/changed.txt",
+            "/changed.txt",
+            new_remote.revision.as_str(),
+            &new_remote.content,
+        ))
+        .for_path("/2/files/upload"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-changed-upload")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("changed.txt"), old_bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    let old_operations = planned_operations(plan(
+        &Baseline::Absent,
+        &Observation::Present(LocalFile::new(old_content)),
+        &Observation::ConfirmedAbsent,
+    ))?;
+    let PlanWrite::Recorded(old_plan) =
+        journal.record_plan(Path::new("changed.txt"), &old_operations)?
+    else {
+        return Err(io::Error::other("changed upload plan was already live").into());
+    };
+    assert_eq!(
+        journal.block_plan(
+            old_plan.id,
+            &BlockReason::RemoteRejected {
+                tag: String::from("disallowed_name"),
+            },
+            4_000_000_000,
+        )?,
+        PlanBlock::Blocked
+    );
+    std::fs::write(root.join("changed.txt"), new_bytes)?;
+
+    let report = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+
+    assert_eq!(report.replayed_operations, 1);
+    assert!(journal.pending_plans()?.is_empty());
+    assert!(journal.blocked_plans()?.is_empty());
+    assert_eq!(
+        journal.baseline(Path::new("changed.txt"))?,
+        Some(Baseline::Present(new_remote))
+    );
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 3);
+    let upload = requests
+        .iter()
+        .find(|request| request.path == "/2/files/upload")
+        .ok_or_else(|| io::Error::other("changed upload was not attempted"))?;
+    assert_eq!(upload.body, new_bytes);
+    Ok(())
+}
+
+#[test]
+fn unknown_local_state_keeps_a_rejected_upload_blocked() -> Result<(), Box<dyn Error>> {
+    let content = dropbox_content_hash(b"unreadable upload".as_slice())?;
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        })),
+        FakeResponse::json(json!({
+            "entries": [],
+            "cursor": "unknown-rejected-upload",
+            "has_more": false
+        })),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-unknown-rejected-upload")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::os::unix::fs::symlink("missing-target", root.join("unknown.txt"))?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    let operations = planned_operations(plan(
+        &Baseline::Absent,
+        &Observation::Present(LocalFile::new(content)),
+        &Observation::ConfirmedAbsent,
+    ))?;
+    let PlanWrite::Recorded(recorded) =
+        journal.record_plan(Path::new("unknown.txt"), &operations)?
+    else {
+        return Err(io::Error::other("unknown upload plan was already live").into());
+    };
+    assert_eq!(
+        journal.block_plan(
+            recorded.id,
+            &BlockReason::RemoteRejected {
+                tag: String::from("disallowed_name"),
+            },
+            0,
+        )?,
+        PlanBlock::Blocked
+    );
+
+    let report = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+
+    assert_eq!(report.blocked, 1);
+    assert_eq!(journal.blocked_plans()?[0].id, recorded.id);
+    assert!(journal.pending_plans()?.is_empty());
+    assert_eq!(server.finish()?.len(), 2);
+    Ok(())
+}
+
+#[test]
 fn later_edits_sync_and_divergence_preserves_both_sides() -> Result<(), Box<dyn Error>> {
     let old_bytes = b"shared baseline";
     let local_bytes = b"later local edit";
@@ -4039,10 +4356,15 @@ fn rejected_paths_do_not_stop_unrelated_sync_or_report_progress() -> Result<(), 
     let invalid_bytes = b"invalid path bytes";
     let rejected_bytes = b"rejected bytes";
     let good_bytes = b"uploaded bytes";
+    let download_bytes = b"downloaded sibling bytes";
     let invalid_content = dropbox_content_hash(invalid_bytes.as_slice())?;
     let rejected_content = dropbox_content_hash(rejected_bytes.as_slice())?;
     let good_content = dropbox_content_hash(good_bytes.as_slice())?;
     let good_remote = RemoteFile::new(good_content.clone(), DropboxRevision::new("good-revision"));
+    let download_remote = RemoteFile::new(
+        dropbox_content_hash(download_bytes.as_slice())?,
+        DropboxRevision::new("download-sibling-revision"),
+    );
     let rejection = || {
         FakeResponse::status_json(
             409,
@@ -4070,16 +4392,54 @@ fn rejected_paths_do_not_stop_unrelated_sync_or_report_progress() -> Result<(), 
         }))
         .for_path("/2/users/get_current_account"),
         FakeResponse::json(json!({
-            "entries": [file_metadata(
-                "/good.txt",
-                "/good.txt",
-                good_remote.revision.as_str(),
-                &good_remote.content,
-            )],
+            "entries": [
+                file_metadata(
+                    "/good.txt",
+                    "/good.txt",
+                    good_remote.revision.as_str(),
+                    &good_remote.content,
+                ),
+                file_metadata(
+                    "/download.txt",
+                    "/download.txt",
+                    download_remote.revision.as_str(),
+                    &download_remote.content,
+                ),
+            ],
             "cursor": "after-rejection",
             "has_more": false
         }))
         .for_path("/2/files/list_folder"),
+        FakeResponse::bytes(download_bytes.to_vec())
+            .header(
+                "Dropbox-API-Result",
+                download_metadata(
+                    "download.txt",
+                    download_remote.revision.as_str(),
+                    &download_remote.content,
+                    download_bytes.len(),
+                ),
+            )
+            .for_path("/2/files/download"),
+        FakeResponse::json(json!({
+            "entries": [
+                file_metadata(
+                    "/good.txt",
+                    "/good.txt",
+                    good_remote.revision.as_str(),
+                    &good_remote.content,
+                ),
+                file_metadata(
+                    "/download.txt",
+                    "/download.txt",
+                    download_remote.revision.as_str(),
+                    &download_remote.content,
+                ),
+            ],
+            "cursor": "after-due-rejection",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder/continue"),
         rejection(),
     ])?;
     let client = Arc::new(fake_client(&server, "opaque-access-rejected-path")?);
@@ -4094,7 +4454,8 @@ fn rejected_paths_do_not_stop_unrelated_sync_or_report_progress() -> Result<(), 
     std::fs::write(root.join(&invalid_path), invalid_bytes)?;
     std::fs::write(root.join("bad.txt"), rejected_bytes)?;
     std::fs::write(root.join("good.txt"), good_bytes)?;
-    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let database = directory.path().join("journal.sqlite3");
+    let mut journal = Journal::open(&database)?;
     let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
     for (path, content) in [
         (invalid_path.as_path(), invalid_content),
@@ -4131,21 +4492,63 @@ fn rejected_paths_do_not_stop_unrelated_sync_or_report_progress() -> Result<(), 
 
     assert_eq!(report.replayed_operations, 1);
     assert_eq!(report.sync_errors, 2);
-    assert!(!report.downloads_in_progress);
+    assert!(report.downloads_in_progress);
+    let _ = drive_replay(&mut journal, &client, &mut downloads, &root, &staging)??;
+    assert_eq!(std::fs::read(root.join("download.txt"))?, download_bytes);
     assert_eq!(
         journal.baseline(Path::new("good.txt"))?,
         Some(Baseline::Present(good_remote))
     );
-    assert_eq!(
-        journal
-            .pending_plans()?
-            .into_iter()
-            .map(|plan| plan.path)
-            .collect::<Vec<_>>(),
-        vec![invalid_path, Path::new("bad.txt").to_path_buf()]
+    assert!(journal.pending_plans()?.is_empty());
+    let blocked = journal.blocked_plans()?;
+    assert_eq!(blocked.len(), 2);
+    assert_eq!(blocked[0].path, invalid_path);
+    assert_eq!(blocked[1].path, Path::new("bad.txt"));
+    assert!(matches!(
+        &blocked[0].status,
+        PlanStatus::Blocked {
+            reason: BlockReason::RemoteRejected { tag },
+            ..
+        } if tag == "invalid_path"
+    ));
+    assert!(matches!(
+        &blocked[1].status,
+        PlanStatus::Blocked {
+            reason: BlockReason::RemoteRejected { tag },
+            ..
+        } if tag == "disallowed_name"
+    ));
+    drop(journal);
+    let mut reopened = Journal::open(&database)?;
+    assert!(
+        replay_remote_operations(&mut reopened, &client, &root, &staging)?
+            .blocked
+            .is_empty()
     );
+    let bad_plan = blocked[1].id;
+    assert_eq!(
+        reopened.block_plan(
+            bad_plan,
+            &BlockReason::RemoteRejected {
+                tag: String::from("disallowed_name"),
+            },
+            0,
+        )?,
+        PlanBlock::Blocked
+    );
+    let due = complete_report(reconcile_once(
+        &mut reopened,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+    assert_eq!(due.sync_errors, 2);
+    assert!(reopened.pending_plans()?.is_empty());
+    assert_eq!(reopened.blocked_plans()?.len(), 2);
     let requests = server.finish()?;
-    assert_eq!(requests.len(), 5);
+    assert_eq!(requests.len(), 7);
     let upload_bodies = requests
         .iter()
         .filter(|request| request.path == "/2/files/upload")

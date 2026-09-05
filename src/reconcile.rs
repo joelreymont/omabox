@@ -705,7 +705,7 @@ fn replay_pending_at(
             .iter()
             .filter(|plan| !download_pool.contains_plan(plan)),
     )?;
-    record_occupied_download_stages(journal, &pending_plans, &report.blocked)?;
+    record_local_replay_blocks(journal, &pending_plans, &report.blocked)?;
     report
         .blocked
         .extend(blocked_plans.into_iter().filter_map(|plan| {
@@ -823,23 +823,32 @@ fn record_download_blocks(
     Ok(())
 }
 
-fn record_occupied_download_stages(
+fn record_local_replay_blocks(
     journal: &mut Journal,
     pending: &[PlanRecord],
     blocked: &[ReplayBlocked],
 ) -> Result<(), ReconcileError> {
     for blocker in blocked {
-        let ReplayBlocked::StageDestinationOccupied { plan_id, .. } = blocker else {
-            continue;
-        };
-        let Some(plan) = pending
-            .iter()
-            .find(|plan| plan.id == *plan_id && pending_download_identity(plan).is_some())
-        else {
-            continue;
+        let (plan, reason) = match blocker {
+            ReplayBlocked::StageDestinationOccupied { plan_id, .. } => {
+                let Some(plan) = pending
+                    .iter()
+                    .find(|plan| plan.id == *plan_id && pending_download_identity(plan).is_some())
+                else {
+                    continue;
+                };
+                (plan, BlockReason::StageOccupied)
+            }
+            ReplayBlocked::LocalObject { path } => {
+                let Some(plan) = pending.iter().find(|plan| plan.path == *path) else {
+                    continue;
+                };
+                (plan, BlockReason::LocalObjectInWay)
+            }
+            _ => continue,
         };
         let retry_at = unix_now()?.saturating_add(DOWNLOAD_BLOCK_RETRY_SECONDS);
-        match journal.block_plan(plan.id, &BlockReason::StageOccupied, retry_at)? {
+        match journal.block_plan(plan.id, &reason, retry_at)? {
             PlanBlock::Blocked | PlanBlock::AlreadyCompleted | PlanBlock::NotFound => {}
         }
     }
@@ -1209,11 +1218,9 @@ fn reconcile_published(
 
 fn replay_sync_error_path(blocked: &ReplayBlocked) -> Option<PathBuf> {
     match blocked {
-        ReplayBlocked::SyncError { path, .. }
-        | ReplayBlocked::DurablePlan {
-            path,
-            reason: BlockReason::DownloadUnavailable { .. },
-        } => Some(path.clone()),
+        ReplayBlocked::SyncError { path, .. } | ReplayBlocked::DurablePlan { path, .. } => {
+            Some(path.clone())
+        }
         _ => None,
     }
 }
@@ -1278,11 +1285,13 @@ fn prepare_plan(
             | Operation::CreateRemoteDirectory
             | Operation::DeleteLocalDirectory => {}
             Operation::CreateRemote { content } | Operation::ReplaceRemote { content, .. } => {
-                if matches!(
-                    prepare_local(sync_root, upload_staging, path, content)?,
-                    Prepared::FreshObservation
-                ) {
-                    return Ok(Prepared::FreshObservation);
+                match prepare_local(sync_root, upload_staging, path, content) {
+                    Ok(Prepared::Ready(_)) => {}
+                    Ok(Prepared::FreshObservation) => {
+                        return Ok(Prepared::FreshObservation);
+                    }
+                    Err(ReconcileError::StageDestinationOccupied { .. }) => {}
+                    Err(error) => return Err(error),
                 }
             }
             // Exact downloads are fetched only after this plan is durable, allowing startup and
@@ -1589,6 +1598,9 @@ fn prepare_local(
         },
         Ok(StageOutcome::ContentChanged { .. }) => Ok(Prepared::FreshObservation),
         Ok(StageOutcome::DestinationOccupied { path }) => {
+            Err(ReconcileError::StageDestinationOccupied { path })
+        }
+        Err(LocalError::DestinationOccupied { path, .. }) => {
             Err(ReconcileError::StageDestinationOccupied { path })
         }
         Err(source) if upload_source_changed(&source, path) => Ok(Prepared::FreshObservation),

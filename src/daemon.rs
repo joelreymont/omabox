@@ -920,6 +920,7 @@ fn recovery_policy(error: &RecoveryError) -> FailurePolicy {
         RecoveryError::Local { source } => local_policy(source),
         RecoveryError::Journal { source } => journal_policy(source),
         RecoveryError::Dropbox { source, .. } => dropbox_policy(source),
+        RecoveryError::Clock { .. } => FailurePolicy::new(Disposition::Environmental, SYNC_ERRORS),
         RecoveryError::InvalidJournalState { .. } => {
             FailurePolicy::new(Disposition::Invariant, JOURNAL_INVALID)
         }

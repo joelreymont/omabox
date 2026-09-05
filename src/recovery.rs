@@ -12,8 +12,9 @@ use crate::dropbox::{
     DropboxClient, DropboxError, MutationOutcome, MutationRejection, RemotePathState,
 };
 use crate::journal::{
-    Journal, JournalError, OperationCompletion, OperationId, PlanConflictCompletion, PlanId,
-    PlanRecord, PlanSupersede, PlannedOperation, RecordStatus, RecoveryForget, RecoveryRecord,
+    BlockReason, Journal, JournalError, OperationCompletion, OperationId, PlanBlock,
+    PlanConflictCompletion, PlanId, PlanRecord, PlanSupersede, PlannedOperation, RecordStatus,
+    RecoveryForget, RecoveryRecord,
 };
 use crate::local::{
     ConflictOutcome, ConflictSide, CreateDirectoryOutcome, DeleteDirectoryOutcome, DeleteOutcome,
@@ -26,6 +27,7 @@ use crate::model::{Baseline, Conflict, ContentIdentity, LocalFile, Operation, Re
 
 /// Legacy recovery payloads remain available for this long before cleanup.
 pub const COMPLETED_RECOVERY_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const MUTATION_BLOCK_RETRY: Duration = Duration::from_secs(60 * 60);
 
 /// A recovery or replay failure.
 #[derive(Debug, Error)]
@@ -60,6 +62,13 @@ pub enum RecoveryError {
         path: PathBuf,
         /// Stable, non-secret explanation.
         detail: &'static str,
+    },
+    /// The retry deadline could not be derived from the system clock.
+    #[error("could not read the system clock for a mutation retry deadline")]
+    Clock {
+        /// Original system clock failure.
+        #[source]
+        source: std::time::SystemTimeError,
     },
 }
 
@@ -664,7 +673,9 @@ pub(crate) fn replay_remote_operations_at(
                 | Operation::DeleteLocal { .. } => break,
             };
             if let Some(blocked) = blocked {
-                report.blocked.push(blocked);
+                report
+                    .blocked
+                    .push(persist_remote_block(journal, &plan, blocked)?);
                 break;
             }
         }
@@ -773,6 +784,17 @@ fn prepare_upload(
 ) -> Result<Option<StagedUpload>, RecoveryError> {
     let staged = match crate::local::stage_upload_at(root, &plan.path, upload_staging, content) {
         Ok(staged) => staged,
+        Err(LocalError::DestinationOccupied { path, .. }) => {
+            report.blocked.push(persist_remote_block(
+                journal,
+                plan,
+                ReplayBlocked::StageDestinationOccupied {
+                    plan_id: plan.id,
+                    path,
+                },
+            )?);
+            return Ok(None);
+        }
         Err(source) if upload_source_changed(&source, &plan.path) => {
             supersede_plan(journal, plan)?;
             report
@@ -796,12 +818,14 @@ fn prepare_upload(
             Ok(None)
         }
         StageOutcome::DestinationOccupied { path } => {
-            report
-                .blocked
-                .push(ReplayBlocked::StageDestinationOccupied {
+            report.blocked.push(persist_remote_block(
+                journal,
+                plan,
+                ReplayBlocked::StageDestinationOccupied {
                     plan_id: plan.id,
                     path,
-                });
+                },
+            )?);
             Ok(None)
         }
     }
@@ -949,6 +973,47 @@ fn sync_error(path: &Path, rejection: MutationRejection) -> ReplayBlocked {
     ReplayBlocked::SyncError {
         path: path.to_path_buf(),
         rejection,
+    }
+}
+
+fn persist_remote_block(
+    journal: &mut Journal,
+    plan: &PlanRecord,
+    blocked: ReplayBlocked,
+) -> Result<ReplayBlocked, RecoveryError> {
+    let reason = match &blocked {
+        ReplayBlocked::SyncError { rejection, .. } => BlockReason::RemoteRejected {
+            tag: mutation_rejection_tag(*rejection).to_owned(),
+        },
+        ReplayBlocked::StageDestinationOccupied { .. } => BlockReason::StageOccupied,
+        ReplayBlocked::RemoteObject { .. } => BlockReason::RemoteObject,
+        _ => return Ok(blocked),
+    };
+    let retry_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|source| RecoveryError::Clock { source })?
+        .saturating_add(MUTATION_BLOCK_RETRY)
+        .as_secs();
+    match journal.block_plan(plan.id, &reason, retry_at)? {
+        PlanBlock::Blocked => Ok(ReplayBlocked::DurablePlan {
+            path: plan.path.clone(),
+            reason,
+        }),
+        PlanBlock::AlreadyCompleted | PlanBlock::NotFound => {
+            Err(invalid(&plan.path, "mutation blocker lost its owning plan"))
+        }
+    }
+}
+
+const fn mutation_rejection_tag(rejection: MutationRejection) -> &'static str {
+    match rejection {
+        MutationRejection::InvalidPath => "invalid_path",
+        MutationRejection::DisallowedName => "disallowed_name",
+        MutationRejection::RestrictedContent => "restricted_content",
+        MutationRejection::PermissionDenied => "permission_denied",
+        MutationRejection::InsufficientSpace => "insufficient_space",
+        MutationRejection::OperationNotAllowed => "operation_not_allowed",
+        MutationRejection::RejectedByDropbox => "rejected_by_dropbox",
     }
 }
 

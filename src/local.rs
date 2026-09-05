@@ -1153,27 +1153,41 @@ pub(crate) fn stage_upload_at(
         content: expected.clone(),
     };
     let stage_path = directory_path.join(&name);
-    if let Some((file, actual, _)) = open_and_hash_if_present(
+    let existing = match open_and_hash_if_present(
         &directory,
         &name,
         &stage_path,
         "verify immutable upload stage",
-    )? && reuse_verified_stage(&file, &actual, expected, None, &directory, &stage_path)?
+    ) {
+        Ok(existing) => existing,
+        Err(source) if upload_stage_occupied(&source, &stage_path) => {
+            return Ok(StageOutcome::DestinationOccupied { path: stage_path });
+        }
+        Err(source) => return Err(source),
+    };
+    if let Some((file, actual, _)) = existing
+        && reuse_verified_stage(&file, &actual, expected, None, &directory, &stage_path)?
     {
         return Ok(StageOutcome::AlreadyStaged(stage()));
     }
 
     let mut source = open_relative_regular(root, relative, "open upload source")?;
     let source_before = stat_fd(&source, relative, "inspect upload source before staging")?;
-    let result = write_verified_stage(
+    let result = match write_verified_stage(
         &directory,
         &name,
         &stage_path,
         expected,
         &mut source,
-        ExistingPolicy::ReplacePrivate,
+        ExistingPolicy::Preserve,
         "stage upload",
-    )?;
+    ) {
+        Ok(result) => result,
+        Err(StageIoError::Local { source }) if upload_stage_occupied(&source, &stage_path) => {
+            return Ok(StageOutcome::DestinationOccupied { path: stage_path });
+        }
+        Err(source) => return Err(source.into()),
+    };
     let source_after = stat_fd(&source, relative, "inspect upload source after staging")?;
     if !same_observation(&source_before, &source_after) {
         return Err(LocalError::ChangedDuringRead {
@@ -1182,6 +1196,17 @@ pub(crate) fn stage_upload_at(
         });
     }
     map_stage_write(result, stage)
+}
+
+fn upload_stage_occupied(error: &LocalError, stage_path: &Path) -> bool {
+    match error {
+        LocalError::UnsupportedObject { path, .. } => path == stage_path,
+        LocalError::Io { path, source, .. } => {
+            path == stage_path
+                && source.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error())
+        }
+        _ => false,
+    }
 }
 
 /// Remove verified content-addressed upload stages that no pending work retains.
@@ -3543,7 +3568,6 @@ fn open_regular_at_if_present(
 
 #[derive(Clone, Copy)]
 enum ExistingPolicy<'a> {
-    ReplacePrivate,
     Preserve,
     OwnedDownload(&'a [u8]),
 }
@@ -3651,7 +3675,7 @@ fn write_verified_stage(
 ) -> Result<StageWrite, StageIoError> {
     let marker = match policy {
         ExistingPolicy::OwnedDownload(marker) => Some(marker),
-        ExistingPolicy::ReplacePrivate | ExistingPolicy::Preserve => None,
+        ExistingPolicy::Preserve => None,
     };
     if let Some((file, actual, _)) =
         open_and_hash_if_present(directory, name, display_path, operation)?
@@ -3665,12 +3689,6 @@ fn write_verified_stage(
         match policy {
             ExistingPolicy::Preserve | ExistingPolicy::OwnedDownload(_) => {
                 return Ok(StageWrite::Occupied(display_path.to_path_buf()));
-            }
-            ExistingPolicy::ReplacePrivate => {
-                unlinkat(directory, name, AtFlags::empty()).map_err(|source| {
-                    syscall_failure("remove corrupt private stage", display_path, source)
-                })?;
-                sync_directory(directory, display_path, "sync corrupt stage removal")?;
             }
         }
     }
@@ -3718,11 +3736,6 @@ fn write_verified_stage(
                     ExistingPolicy::Preserve | ExistingPolicy::OwnedDownload(_) => {
                         Ok(StageWrite::Occupied(display_path.to_path_buf()))
                     }
-                    ExistingPolicy::ReplacePrivate => Err(LocalError::DestinationOccupied {
-                        operation,
-                        path: display_path.to_path_buf(),
-                    }
-                    .into()),
                 }
             }
         }
