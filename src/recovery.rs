@@ -982,6 +982,10 @@ fn persist_remote_block(
     blocked: ReplayBlocked,
 ) -> Result<ReplayBlocked, RecoveryError> {
     let reason = match &blocked {
+        ReplayBlocked::SyncError {
+            rejection: MutationRejection::UnsupportedFileSize,
+            ..
+        } => BlockReason::UnsupportedFileSize,
         ReplayBlocked::SyncError { rejection, .. } => BlockReason::RemoteRejected {
             tag: mutation_rejection_tag(*rejection).to_owned(),
         },
@@ -989,11 +993,15 @@ fn persist_remote_block(
         ReplayBlocked::RemoteObject { .. } => BlockReason::RemoteObject,
         _ => return Ok(blocked),
     };
-    let retry_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|source| RecoveryError::Clock { source })?
-        .saturating_add(MUTATION_BLOCK_RETRY)
-        .as_secs();
+    let retry_at = if reason == BlockReason::UnsupportedFileSize {
+        i64::MAX as u64
+    } else {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|source| RecoveryError::Clock { source })?
+            .saturating_add(MUTATION_BLOCK_RETRY)
+            .as_secs()
+    };
     match journal.block_plan(plan.id, &reason, retry_at)? {
         PlanBlock::Blocked => Ok(ReplayBlocked::DurablePlan {
             path: plan.path.clone(),
@@ -1007,6 +1015,7 @@ fn persist_remote_block(
 
 const fn mutation_rejection_tag(rejection: MutationRejection) -> &'static str {
     match rejection {
+        MutationRejection::UnsupportedFileSize => "unsupported_file_size",
         MutationRejection::InvalidPath => "invalid_path",
         MutationRejection::DisallowedName => "disallowed_name",
         MutationRejection::RestrictedContent => "restricted_content",
@@ -1268,6 +1277,45 @@ mod compatibility_tests {
     use crate::journal::{Journal, PlanWrite};
     use crate::local::dropbox_content_hash;
     use crate::model::{LocalFile, Operation, OperationPlan};
+
+    #[test]
+    fn unsupported_size_stays_blocked_across_reopen() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let database = directory.path().join("journal.sqlite3");
+        let mut journal = Journal::open(&database)?;
+        let content = dropbox_content_hash(&b"oversized source identity"[..])?;
+        let operations = OperationPlan::new(vec![Operation::CreateRemote { content }]);
+        let record = match journal.record_plan(Path::new("oversized.bin"), &operations)? {
+            PlanWrite::Recorded(record) => record,
+            PlanWrite::AlreadyLive(_) => {
+                return Err(std::io::Error::other("unexpected live plan").into());
+            }
+        };
+        let blocked = super::persist_remote_block(
+            &mut journal,
+            &record,
+            super::ReplayBlocked::SyncError {
+                path: record.path.clone(),
+                rejection: crate::dropbox::MutationRejection::UnsupportedFileSize,
+            },
+        )?;
+        assert!(matches!(
+            blocked,
+            super::ReplayBlocked::DurablePlan {
+                reason: crate::journal::BlockReason::UnsupportedFileSize,
+                ..
+            }
+        ));
+        drop(journal);
+        let journal = Journal::open(database)?;
+        let plans = journal.blocked_plans()?;
+        assert_eq!(plans.len(), 1);
+        assert!(
+            matches!(plans[0].status, crate::journal::PlanStatus::Blocked { reason: crate::journal::BlockReason::UnsupportedFileSize, retry_at } if retry_at == i64::MAX as u64)
+        );
+        assert!(journal.pending_plans()?.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn legacy_local_preservation_replays_without_creating_a_copy() -> Result<(), Box<dyn Error>> {

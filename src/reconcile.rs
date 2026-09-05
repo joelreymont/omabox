@@ -537,11 +537,36 @@ fn download_worker(
 fn download_block_reason(error: &ReconcileError) -> Option<BlockReason> {
     match error {
         ReconcileError::RemoteDownload {
-            source: DropboxError::HttpStatus { status, .. },
+            source: error @ DropboxError::Sdk { .. },
             ..
-        } if (400..500).contains(status) && *status != 401 && *status != 429 => {
-            Some(BlockReason::DownloadUnavailable { status: *status })
+        } => {
+            if matches!(
+                error.api_outcome(),
+                crate::dropbox::ApiOutcome::Unavailable | crate::dropbox::ApiOutcome::Unknown
+            ) {
+                Some(BlockReason::DownloadUnavailable { status: 409 })
+            } else if let DropboxError::Sdk { source, .. } = error {
+                if matches!(
+                    source.as_ref(),
+                    dropbox_sdk::Error::Json(_) | dropbox_sdk::Error::UnexpectedResponse(_)
+                ) {
+                    return Some(BlockReason::DownloadVerificationFailed);
+                }
+                use crate::transport::TransportError as T;
+                match source.downcast_ref_inner::<T>() {
+                    Some(
+                        T::RangeIgnored { .. }
+                        | T::RangeMismatch { .. }
+                        | T::UnexpectedRangeStatus { .. }
+                        | T::RangeUnsatisfiable { .. },
+                    ) => Some(BlockReason::DownloadVerificationFailed),
+                    _ => None,
+                }
+            } else {
+                None
+            }
         }
+
         ReconcileError::RemoteDownload {
             source:
                 DropboxError::DownloadedRevisionChanged
@@ -2013,7 +2038,7 @@ mod tests {
         let client = DropboxClient::new(
             crate::auth::AccessToken::for_test("unused-cancelled-worker-token"),
             crate::dropbox::DropboxRoot::new("account", "namespace", "")?,
-        );
+        )?;
         download_worker(
             &client,
             &Mutex::new(job_receiver),
@@ -2045,31 +2070,38 @@ mod tests {
 
     #[test]
     fn download_failures_separate_path_blocks_from_global_errors() {
-        for status in [400, 403, 404, 409, 422, 499] {
+        use dropbox_sdk::types::{auth, files};
+        use dropbox_sdk::{Error as SdkError, NoError};
+        for reason in [
+            files::LookupError::MalformedPath(None),
+            files::LookupError::NotFound,
+            files::LookupError::NotFile,
+            files::LookupError::NotFolder,
+            files::LookupError::RestrictedContent,
+            files::LookupError::UnsupportedContentType,
+        ] {
+            let error = DropboxError::sdk(
+                "download",
+                SdkError::Api(files::DownloadError::Path(reason)),
+            );
             assert_eq!(
-                download_block_reason(&remote_download_error(DropboxError::HttpStatus {
-                    operation: "download exact Dropbox revision",
-                    status,
-                })),
-                Some(BlockReason::DownloadUnavailable { status })
+                download_block_reason(&remote_download_error(error)),
+                Some(BlockReason::DownloadUnavailable { status: 409 })
             );
         }
-        for status in [401, 429, 500] {
+        for error in [
+            SdkError::<NoError>::Authentication(auth::AuthError::InvalidAccessToken),
+            SdkError::RateLimited {
+                reason: auth::RateLimitReason::Other,
+                retry_after_seconds: 1,
+            },
+            SdkError::ServerError(String::new()),
+        ] {
             assert_eq!(
-                download_block_reason(&remote_download_error(DropboxError::HttpStatus {
-                    operation: "download exact Dropbox revision",
-                    status,
-                })),
+                download_block_reason(&remote_download_error(DropboxError::sdk("download", error))),
                 None
             );
         }
-        assert_eq!(
-            download_block_reason(&remote_download_error(DropboxError::RateLimited {
-                operation: "download exact Dropbox revision",
-                retry_after: Some(std::time::Duration::from_secs(1)),
-            })),
-            None
-        );
         for source in [
             DropboxError::DownloadedRevisionChanged,
             DropboxError::DownloadedIdentityChanged,

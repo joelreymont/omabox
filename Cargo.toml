@@ -9,8 +9,8 @@ publish = false
 dropbox-live = []
 
 [dependencies]
+dropbox-sdk = { version = "=0.20.3", default-features = false, features = ["dbx_files", "dbx_users", "sync_routes"] }
 base64 = "0.23"
-form_urlencoded = "1.2"
 miette = { version = "7.6", features = ["fancy"] }
 rusqlite = "0.37"
 rustix = { version = "1.1", features = ["fs", "rand"] }

@@ -4,6 +4,10 @@ Omabox is a local-first Dropbox client for Omarchy. A headless Rust daemon syncs
 ordinary files and directories through Dropbox's documented API; a CLI and an
 optional QuickShell widget provide setup, control, and status.
 
+Dropbox requests, responses, route errors, and OAuth use pinned `dropbox-sdk`
+0.20.3. Omabox's `ureq` adapter supplies connection pools, request deadlines,
+verified ranges, and coordinated token refresh with durable credential rotation.
+
 It supports one Dropbox account, one remote root, and one local root. It does
 not implement a virtual filesystem, selective sync, or Dropbox Paper documents.
 

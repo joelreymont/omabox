@@ -4,22 +4,24 @@ use std::fmt;
 use std::io::{self, Read as _, Write as _};
 #[cfg(test)]
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::str;
-use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use dropbox_sdk::oauth2::{Authorization, AuthorizeUrlBuilder, Oauth2Type, PkceCode, TokenType};
 use rustix::rand::{GetRandomFlags, getrandom};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::dropbox::DropboxEndpoints;
 use crate::journal::DropboxBinding;
 #[cfg(test)]
 use crate::spawn::Launch;
+use crate::transport::{OAuthTransport, TransportError, oauth_failure};
 
+const OAUTH_SCOPE: &str =
+    "account_info.read files.metadata.read files.content.read files.content.write";
 const RANDOM_VALUE_BYTES: usize = 32;
 const SECRET_TOOL: &str = "/usr/bin/secret-tool";
 const SECRET_BYTES_LIMIT: usize = 8192;
@@ -36,9 +38,13 @@ const SECRET_ATTRIBUTES: [&str; 4] = [
 pub struct AccessToken(String);
 
 impl AccessToken {
+    pub(crate) fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(value: impl Into<String>) -> Self {
-        Self(value.into())
+        Self::new(value)
     }
 
     pub(crate) fn expose(&self) -> &str {
@@ -124,7 +130,7 @@ impl RefreshTokenStore {
             root_namespace_id: &binding.root_namespace_id,
             remote_root: &binding.remote_root,
         })
-        .map_err(|source| AuthError::CredentialJson { source })?;
+        .map_err(credential_json)?;
         if secret.len() >= SECRET_BYTES_LIMIT {
             return Err(AuthError::CredentialTooLarge);
         }
@@ -142,29 +148,14 @@ impl RefreshTokenStore {
                 source,
             })?;
         let Some(mut stdin) = child.stdin.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(AuthError::CredentialPipeUnavailable {
-                operation: "store Dropbox credential",
-            });
+            return Err(pipe_unavailable(
+                "store Dropbox credential",
+                terminate_child(&mut child),
+            ));
         };
         let written = stdin.write_all(&secret);
         drop(stdin);
-        if let Err(source) = written {
-            let _ = child.wait();
-            return Err(AuthError::CredentialWrite { source });
-        }
-        let status = child.wait().map_err(|source| AuthError::CredentialWait {
-            operation: "store Dropbox credential",
-            source,
-        })?;
-        if !status.success() {
-            return Err(AuthError::CredentialStatus {
-                operation: "store Dropbox credential",
-                status: status.code(),
-            });
-        }
-        Ok(())
+        write_outcome("store Dropbox credential", written, child.wait())
     }
 
     /// Load the singleton credential before the Dropbox account is known.
@@ -182,21 +173,16 @@ impl RefreshTokenStore {
                 source,
             })?;
         let Some(stdout) = child.stdout.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(AuthError::CredentialPipeUnavailable {
-                operation: "load Dropbox credential",
-            });
+            return Err(pipe_unavailable(
+                "load Dropbox credential",
+                terminate_child(&mut child),
+            ));
         };
         let mut secret = Vec::new();
         let read = stdout
             .take(SECRET_BYTES_LIMIT as u64)
             .read_to_end(&mut secret);
-        let status = child.wait().map_err(|source| AuthError::CredentialWait {
-            operation: "load Dropbox credential",
-            source,
-        })?;
-        read.map_err(|source| AuthError::CredentialRead { source })?;
+        let status = read_outcome("load Dropbox credential", read.map(|_| ()), child.wait())?;
         if !status.success() {
             return Ok(CredentialLookup::CredentialsUnavailable {
                 status: status.code(),
@@ -207,8 +193,7 @@ impl RefreshTokenStore {
         }
         let secret =
             str::from_utf8(&secret).map_err(|source| AuthError::CredentialUtf8 { source })?;
-        let stored: LoadedSecret =
-            serde_json::from_str(secret).map_err(|source| AuthError::CredentialJson { source })?;
+        let stored: LoadedSecret = serde_json::from_str(secret).map_err(credential_json)?;
         if stored.version != SECRET_VERSION {
             return Err(AuthError::StoredCredentialVersion {
                 found: stored.version,
@@ -269,7 +254,7 @@ struct LoadedSecret {
 /// Browser authorization in progress, including its one-use PKCE proof.
 pub struct PendingAuthorization {
     authorization_url: String,
-    verifier: String,
+    flow: Oauth2Type,
 }
 
 impl PendingAuthorization {
@@ -285,38 +270,24 @@ impl fmt::Debug for PendingAuthorization {
         formatter
             .debug_struct("PendingAuthorization")
             .field("authorization_url", &"[REDACTED]")
-            .field("verifier", &"[REDACTED]")
+            .field("flow", &"PKCE([REDACTED])")
             .finish()
     }
 }
 
-/// Tokens and account identity returned by initial authorization.
+/// Tokens returned by initial authorization.
 #[derive(Debug)]
 pub struct AuthorizationGrant {
-    /// Dropbox account that authorized access.
-    pub account_id: String,
     /// Short-lived token for Dropbox API calls.
     pub access_token: AccessToken,
     /// Long-lived token that belongs in Secret Service.
     pub refresh_token: RefreshToken,
-    /// Lifetime reported for the access token.
-    pub expires_in: Duration,
-}
-
-/// A freshly issued short-lived access token.
-#[derive(Debug)]
-pub struct RefreshedAccess {
-    /// Token for Dropbox API calls.
-    pub access_token: AccessToken,
-    /// Lifetime reported by Dropbox.
-    pub expires_in: Duration,
 }
 
 /// Direct blocking Dropbox OAuth client.
 pub struct OAuthClient {
     app_key: String,
-    endpoints: DropboxEndpoints,
-    agent: ureq::Agent,
+    transport: OAuthTransport,
 }
 
 impl OAuthClient {
@@ -331,35 +302,25 @@ impl OAuthClient {
     /// This is intended for protocol tests against a local fake server.
     #[must_use]
     pub fn with_endpoints(app_key: impl Into<String>, endpoints: DropboxEndpoints) -> Self {
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(60)))
-            .build();
         Self {
             app_key: app_key.into(),
-            endpoints,
-            agent: ureq::Agent::new_with_config(config),
+            transport: OAuthTransport::new(endpoints.bases()),
         }
     }
 
     /// Start one authorization attempt with a fresh PKCE verifier.
     pub fn begin(&self) -> Result<PendingAuthorization, AuthError> {
-        let verifier = random_urlsafe()?;
-        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-        let query = form_urlencoded::Serializer::new(String::new())
-            .append_pair("client_id", &self.app_key)
-            .append_pair("response_type", "code")
-            .append_pair("token_access_type", "offline")
-            .append_pair(
-                "scope",
-                "account_info.read files.metadata.read files.content.read files.content.write",
-            )
-            .append_pair("code_challenge", &challenge)
-            .append_pair("code_challenge_method", "S256")
-            .finish();
+        let flow = Oauth2Type::PKCE(PkceCode {
+            code: random_urlsafe()?,
+        });
+        let authorization_url = AuthorizeUrlBuilder::new(&self.app_key, &flow)
+            .token_type(TokenType::ShortLivedAndRefresh)
+            .scope(OAUTH_SCOPE)
+            .build()
+            .into();
         Ok(PendingAuthorization {
-            authorization_url: format!("{}?{query}", self.endpoints.authorize()),
-            verifier,
+            authorization_url,
+            flow,
         })
     }
 
@@ -369,86 +330,24 @@ impl OAuthClient {
         pending: PendingAuthorization,
         code: &str,
     ) -> Result<AuthorizationGrant, AuthError> {
-        let mut response = self
-            .agent
-            .post(self.endpoints.token())
-            .send_form([
-                ("client_id", self.app_key.as_str()),
-                ("code", code),
-                ("code_verifier", pending.verifier.as_str()),
-                ("grant_type", "authorization_code"),
-            ])
-            .map_err(|source| AuthError::Transport {
-                operation: "exchange authorization code",
-                source,
-            })?;
-        require_success(
-            response.status().as_u16(),
-            response.headers().get("Retry-After"),
-            "exchange authorization code",
-        )?;
-        let payload: AuthorizationResponse =
-            response
-                .body_mut()
-                .read_json()
-                .map_err(|source| AuthError::Response {
-                    operation: "decode authorization response",
-                    source,
-                })?;
+        let mut authorization = Authorization::from_auth_code(
+            self.app_key.clone(),
+            pending.flow,
+            String::from(code),
+            None,
+        );
+        let access_token = authorization
+            .obtain_access_token(self.transport.client())
+            .map_err(sdk_error)?;
+        let saved = authorization.save().ok_or(AuthError::MissingRefreshToken)?;
+        let refresh_token = saved
+            .strip_prefix("2&")
+            .ok_or(AuthError::MissingRefreshToken)?;
         Ok(AuthorizationGrant {
-            account_id: payload.account_id,
-            access_token: AccessToken(payload.access_token),
-            refresh_token: RefreshToken(payload.refresh_token),
-            expires_in: Duration::from_secs(payload.expires_in),
+            access_token: AccessToken::new(access_token),
+            refresh_token: RefreshToken::from_secret(refresh_token),
         })
     }
-
-    /// Use a protected refresh token to obtain a new short-lived access token.
-    pub fn refresh(&self, refresh_token: &RefreshToken) -> Result<RefreshedAccess, AuthError> {
-        let mut response = self
-            .agent
-            .post(self.endpoints.token())
-            .send_form([
-                ("client_id", self.app_key.as_str()),
-                ("refresh_token", refresh_token.expose()),
-                ("grant_type", "refresh_token"),
-            ])
-            .map_err(|source| AuthError::Transport {
-                operation: "refresh access token",
-                source,
-            })?;
-        require_success(
-            response.status().as_u16(),
-            response.headers().get("Retry-After"),
-            "refresh access token",
-        )?;
-        let payload: RefreshResponse =
-            response
-                .body_mut()
-                .read_json()
-                .map_err(|source| AuthError::Response {
-                    operation: "decode token refresh response",
-                    source,
-                })?;
-        Ok(RefreshedAccess {
-            access_token: AccessToken(payload.access_token),
-            expires_in: Duration::from_secs(payload.expires_in),
-        })
-    }
-}
-
-#[derive(Deserialize)]
-struct AuthorizationResponse {
-    access_token: String,
-    refresh_token: String,
-    expires_in: u64,
-    account_id: String,
-}
-
-#[derive(Deserialize)]
-struct RefreshResponse {
-    access_token: String,
-    expires_in: u64,
 }
 
 /// OAuth setup or refresh failure with secret-safe diagnostics.
@@ -461,40 +360,16 @@ pub enum AuthError {
         #[source]
         source: rustix::io::Errno,
     },
-    /// Dropbox rate-limited an OAuth request.
-    #[error("Dropbox OAuth operation `{operation}` was rate limited")]
-    RateLimited {
-        /// Safe operation name.
-        operation: &'static str,
-        /// Server-requested delay when Dropbox returned valid delta seconds.
-        retry_after: Option<Duration>,
-    },
-    /// Dropbox returned a non-success status.
-    #[error("Dropbox OAuth operation `{operation}` returned HTTP status {status}")]
-    HttpStatus {
-        /// Safe operation name.
-        operation: &'static str,
-        /// HTTP status code.
-        status: u16,
-    },
-    /// The request could not be completed.
-    #[error("Dropbox OAuth operation `{operation}` could not reach the service")]
-    Transport {
-        /// Safe operation name.
-        operation: &'static str,
-        /// Original transport error, which does not contain request headers or bodies.
+    /// The SDK OAuth exchange or refresh failed.
+    #[error("Dropbox OAuth could not issue an access token")]
+    Sdk {
+        /// Typed, secret-safe transport or protocol failure.
         #[source]
-        source: ureq::Error,
+        source: Box<TransportError>,
     },
-    /// A successful response did not match Dropbox's documented schema.
-    #[error("Dropbox OAuth operation `{operation}` returned an invalid response")]
-    Response {
-        /// Safe operation name.
-        operation: &'static str,
-        /// Original JSON decoding error.
-        #[source]
-        source: ureq::Error,
-    },
+    /// A completed code exchange did not yield the requested refresh token.
+    #[error("Dropbox OAuth did not issue a refresh token")]
+    MissingRefreshToken,
     /// `secret-tool` could not be started.
     #[error("credential operation `{operation}` could not start")]
     CredentialSpawn {
@@ -513,6 +388,8 @@ pub enum AuthError {
     /// The protected credential could not be written to `secret-tool`.
     #[error("could not send the Dropbox credential to Secret Service")]
     CredentialWrite {
+        /// Exit status of the credential process, or `None` when signalled or unreaped.
+        status: Option<i32>,
         /// Original pipe error; it does not contain written bytes.
         #[source]
         source: io::Error,
@@ -541,6 +418,9 @@ pub enum AuthError {
         /// Exit status, or `None` when terminated by a signal.
         status: Option<i32>,
     },
+    /// A credential subprocess failed and could not be reaped afterwards.
+    #[error(transparent)]
+    CredentialCleanup(Box<CredentialCleanup>),
     /// The versioned credential record could not be encoded or decoded.
     #[error("Secret Service returned an invalid Omabox Dropbox credential record")]
     CredentialJson {
@@ -566,6 +446,12 @@ pub enum AuthError {
     },
 }
 
+fn sdk_error(source: dropbox_sdk::Error) -> AuthError {
+    AuthError::Sdk {
+        source: Box::new(oauth_failure(source)),
+    }
+}
+
 fn random_urlsafe() -> Result<String, AuthError> {
     let mut bytes = [0_u8; RANDOM_VALUE_BYTES];
     getrandom(&mut bytes, GetRandomFlags::empty())
@@ -573,24 +459,94 @@ fn random_urlsafe() -> Result<String, AuthError> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
-fn require_success(
-    status: u16,
-    retry_after: Option<&ureq::http::HeaderValue>,
+fn credential_json(source: serde_json::Error) -> AuthError {
+    use serde::de::Error as _;
+
+    let category = match source.classify() {
+        serde_json::error::Category::Io => "I/O",
+        serde_json::error::Category::Syntax => "syntax",
+        serde_json::error::Category::Data => "data",
+        serde_json::error::Category::Eof => "end-of-input",
+    };
+    let safe = serde_json::Error::custom(format!(
+        "credential JSON {category} error at line {}, column {}",
+        source.line(),
+        source.column()
+    ));
+    AuthError::CredentialJson { source: safe }
+}
+
+/// A credential subprocess failure and the cleanup failure that followed it.
+#[derive(Debug, Error)]
+#[error("{failure}; its credential process could not be reaped: {cleanup}")]
+pub struct CredentialCleanup {
+    /// Failure that started cleanup, kept as the classifiable cause.
+    #[source]
+    pub failure: AuthError,
+    /// Cleanup failure, which never contains subprocess output.
+    pub cleanup: io::Error,
+}
+
+fn terminate_child(child: &mut Child) -> io::Result<()> {
+    match (child.kill(), child.wait()) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Err(source), _) | (Ok(()), Err(source)) => Err(source),
+    }
+}
+
+fn pipe_unavailable(operation: &'static str, cleanup: io::Result<()>) -> AuthError {
+    let failure = AuthError::CredentialPipeUnavailable { operation };
+    match cleanup {
+        Ok(()) => failure,
+        Err(cleanup) => {
+            AuthError::CredentialCleanup(Box::new(CredentialCleanup { failure, cleanup }))
+        }
+    }
+}
+
+fn write_outcome(
     operation: &'static str,
+    written: io::Result<()>,
+    reaped: io::Result<ExitStatus>,
 ) -> Result<(), AuthError> {
-    if (200..300).contains(&status) {
-        Ok(())
-    } else if status == 429 {
-        let retry_after = retry_after
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-            .map(Duration::from_secs);
-        Err(AuthError::RateLimited {
+    match (written, reaped) {
+        (Ok(()), Ok(status)) if status.success() => Ok(()),
+        (Ok(()), Ok(status)) => Err(AuthError::CredentialStatus {
             operation,
-            retry_after,
-        })
-    } else {
-        Err(AuthError::HttpStatus { operation, status })
+            status: status.code(),
+        }),
+        (Ok(()), Err(source)) => Err(AuthError::CredentialWait { operation, source }),
+        (Err(source), Ok(status)) => Err(AuthError::CredentialWrite {
+            status: status.code(),
+            source,
+        }),
+        (Err(source), Err(cleanup)) => {
+            Err(AuthError::CredentialCleanup(Box::new(CredentialCleanup {
+                failure: AuthError::CredentialWrite {
+                    status: None,
+                    source,
+                },
+                cleanup,
+            })))
+        }
+    }
+}
+
+fn read_outcome(
+    operation: &'static str,
+    read: io::Result<()>,
+    reaped: io::Result<ExitStatus>,
+) -> Result<ExitStatus, AuthError> {
+    match (read, reaped) {
+        (Ok(()), Ok(status)) => Ok(status),
+        (Ok(()), Err(source)) => Err(AuthError::CredentialWait { operation, source }),
+        (Err(source), Ok(_)) => Err(AuthError::CredentialRead { source }),
+        (Err(source), Err(cleanup)) => {
+            Err(AuthError::CredentialCleanup(Box::new(CredentialCleanup {
+                failure: AuthError::CredentialRead { source },
+                cleanup,
+            })))
+        }
     }
 }
 
@@ -600,14 +556,12 @@ mod tests {
     use std::fs;
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
 
     use crate::dropbox::{DropboxClient, DropboxEndpoints, DropboxRoot};
     use crate::journal::{DropboxBinding, Journal};
 
     use super::{
-        AccessToken, AuthError, CredentialLookup, OAuthClient, RefreshToken, RefreshTokenStore,
-        require_success,
+        AccessToken, CredentialLookup, OAuthClient, Oauth2Type, RefreshToken, RefreshTokenStore,
     };
 
     #[test]
@@ -641,26 +595,14 @@ mod tests {
     fn pending_authorization_debug_omits_pkce_proof() -> Result<(), Box<dyn Error>> {
         let oauth = OAuthClient::new("app-key");
         let pending = oauth.begin()?;
-        let verifier = pending.verifier.clone();
+        let Oauth2Type::PKCE(pkce) = &pending.flow else {
+            return Err(std::io::Error::other("authorization did not use PKCE").into());
+        };
+        let verifier = pkce.code.clone();
         let diagnostic = format!("{pending:?}");
 
         assert!(!diagnostic.contains(&verifier));
         assert!(!diagnostic.contains("code_challenge="));
-        Ok(())
-    }
-
-    #[test]
-    fn oauth_rate_limit_preserves_retry_after_seconds() -> Result<(), Box<dyn Error>> {
-        let retry_after = ureq::http::HeaderValue::from_static("17");
-        let result = require_success(429, Some(&retry_after), "refresh access token");
-
-        assert!(matches!(
-            result,
-            Err(AuthError::RateLimited {
-                operation: "refresh access token",
-                retry_after: Some(delay),
-            }) if delay == Duration::from_secs(17)
-        ));
         Ok(())
     }
 
@@ -676,7 +618,10 @@ mod tests {
         );
         let oauth = OAuthClient::with_endpoints("app-key", endpoints);
         let pending = oauth.begin()?;
-        let verifier = pending.verifier.clone();
+        let Oauth2Type::PKCE(pkce) = &pending.flow else {
+            return Err(std::io::Error::other("authorization did not use PKCE").into());
+        };
+        let verifier = pkce.code.clone();
         let code = "authorization-code-sentinel";
         let exchange = oauth.exchange(pending, code);
         let exchange_error = exchange
@@ -686,12 +631,6 @@ mod tests {
         assert!(!exchange_diagnostic.contains(code));
         assert!(!exchange_diagnostic.contains(&verifier));
 
-        let refresh_value = "refresh-token-sentinel";
-        let refresh = oauth.refresh(&RefreshToken::from_secret(refresh_value));
-        let refresh_error = refresh
-            .err()
-            .ok_or_else(|| std::io::Error::other("closed endpoint accepted refresh"))?;
-        assert!(!error_diagnostic(&refresh_error).contains(refresh_value));
         Ok(())
     }
 
@@ -710,7 +649,7 @@ mod tests {
             AccessToken(String::from(secret)),
             DropboxRoot::new("account", "namespace", "")?,
             endpoints,
-        );
+        )?;
         let directory = tempfile::TempDir::new()?;
         let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
         let failure = client
@@ -817,6 +756,30 @@ mod tests {
             .ok_or_else(|| std::io::Error::other("malformed credential was accepted"))?;
 
         assert!(!error_diagnostic(&failure).contains(secret));
+        Ok(())
+    }
+
+    #[test]
+    fn secret_tool_data_error_diagnostics_do_not_echo_output() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::TempDir::new()?;
+        let secret = "typed-field-secret-sentinel";
+        let script = fake_script(
+            directory.path(),
+            "wrong-type-fake",
+            &format!(
+                "printf '%s' '{{\"version\":\"{secret}\",\"refresh_token\":\"token\",\"account_id\":\"account\",\"root_namespace_id\":\"namespace\",\"remote_root\":\"\"}}'\n"
+            ),
+        )?;
+        let failure = RefreshTokenStore::with_script(script)
+            .load()
+            .err()
+            .ok_or_else(|| std::io::Error::other("wrongly typed credential was accepted"))?;
+        let diagnostic = error_diagnostic(&failure);
+        let report = format!("{:?}", miette::Report::msg(failure.to_string()));
+
+        assert!(!diagnostic.contains(secret));
+        assert!(!report.contains(secret));
+        assert!(diagnostic.contains("credential JSON data error"));
         Ok(())
     }
 

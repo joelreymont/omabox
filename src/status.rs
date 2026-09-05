@@ -121,6 +121,9 @@ fn render_journal(journal: &mut Journal) -> Result<String, StatusError> {
 
 fn block_reason(reason: &BlockReason) -> String {
     match reason {
+        BlockReason::UnsupportedFileSize => {
+            String::from("file exceeds the supported Dropbox upload size")
+        }
         BlockReason::RemoteRejected { tag } => {
             format!("Dropbox rejected the path ({tag})")
         }

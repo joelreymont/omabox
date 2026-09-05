@@ -1,7 +1,8 @@
 # Omabox
 
 Native, ARM64-first Dropbox sync for Omarchy, written in nightly Rust against
-Dropbox's documented API and OAuth flow.
+Dropbox's documented API and OAuth flow through pinned `dropbox-sdk` generated
+types and routes, with a local `ureq` transport adapter.
 
 ## Scope
 
@@ -21,6 +22,9 @@ Dropbox's documented API and OAuth flow.
 
 ## Changes
 
+- Astra owns design, complex implementation, and integration. Delegate bounded
+  implementation to Sol after interfaces and acceptance are clear; use a
+  separate Astra reviewer before landing.
 - Follow `~/.agents/docs/rust.md`; repository rules may be stricter.
 - Use `jj`. Make one commit per feature or significant fix and include its dot
   closure in that commit.

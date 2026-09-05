@@ -242,7 +242,6 @@ fn authorize_and_bind(config: &Config, remote_root: &str) -> Result<(), CliError
     ))?;
     let code = read_authorization_code()?;
     let AuthorizationGrant {
-        account_id,
         access_token,
         refresh_token,
         ..
@@ -254,7 +253,7 @@ fn authorize_and_bind(config: &Config, remote_root: &str) -> Result<(), CliError
         })?;
     drop(code);
 
-    let client = match DropboxClient::link(access_token, account_id, remote_root) {
+    let client = match DropboxClient::link_authorized(access_token, remote_root) {
         Ok(DropboxLink::Linked(client)) => client,
         Ok(DropboxLink::AccountChanged) => return Err(CliError::AuthorizedAccountChanged),
         Err(source) => {

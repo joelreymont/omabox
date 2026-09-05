@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use omabox::auth::{CredentialLookup, OAuthClient, RefreshTokenStore};
+use omabox::auth::{CredentialLookup, RefreshTokenStore};
 use omabox::dropbox::{
     AccountValidation, DropboxClient, DropboxRoot, MutationOutcome, RemotePathState,
 };
@@ -35,10 +35,8 @@ fn round_trips_a_file_through_real_dropbox() -> Result<(), Box<dyn Error>> {
             .into());
         }
     };
-    let oauth = OAuthClient::new(app_key);
-    let access = oauth.refresh(&credential.refresh_token)?;
     let root = DropboxRoot::from_binding(&credential.binding)?;
-    let client = DropboxClient::new(access.access_token, root);
+    let client = DropboxClient::from_credentials(&app_key, credential, root)?;
     let state_directory = TempDir::new()?;
     let mut journal = Journal::open(state_directory.path().join("journal.sqlite3"))?;
     if client.validate_account(&mut journal)? != AccountValidation::Valid {

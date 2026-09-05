@@ -16,7 +16,7 @@ use std::time::Duration;
 use miette::Diagnostic;
 use thiserror::Error;
 
-use crate::auth::{AuthError, CredentialLookup, OAuthClient, RefreshTokenStore, StoredCredential};
+use crate::auth::{AuthError, CredentialLookup, RefreshTokenStore, StoredCredential};
 use crate::config::{
     Config, ConfigError, InstanceLock, LockError, LoggingError, initialize_logging,
 };
@@ -171,17 +171,9 @@ fn run_owned(
     recovery: &mut RecoveryControl<'_>,
     wait: &mut impl FnMut(Duration),
 ) -> Result<(), DaemonError> {
-    let mut refresh = SessionRefresh::new();
     loop {
-        match run_session(config, journal, recovery, &mut refresh, wait) {
+        match run_session(config, journal, recovery, wait) {
             Ok(()) => return Ok(()),
-            Err(error) if error.session_rejected() => {
-                if refresh.rejected() {
-                    recovery.wait_for_failure(error, wait)?;
-                } else {
-                    tracing::info!("Dropbox access token was rejected; refreshing once");
-                }
-            }
             Err(error) => recovery.wait_for_failure(error, wait)?,
         }
     }
@@ -191,7 +183,6 @@ fn run_session(
     config: &Config,
     journal: &mut Journal,
     recovery: &mut RecoveryControl<'_>,
-    refresh: &mut SessionRefresh,
     wait: &mut impl FnMut(Duration),
 ) -> Result<(), DaemonError> {
     publish_phase(recovery.status, DaemonPhase::Starting);
@@ -216,29 +207,40 @@ fn run_session(
             source,
         })?;
     let root = root_from_bindings(durable_binding, &credential_binding)?;
-    let refreshed = OAuthClient::new(config.dropbox_app_key())
-        .refresh(&refresh_token)
-        .map_err(|source| DaemonError::Auth {
-            operation: "refresh Dropbox access",
-            source,
-        })?;
-    let dropbox = DropboxClient::new(refreshed.access_token, root);
+    let dropbox = DropboxClient::from_credentials(
+        config.dropbox_app_key(),
+        StoredCredential {
+            binding: credential_binding,
+            refresh_token,
+        },
+        root,
+    )
+    .map_err(|source| DaemonError::Dropbox {
+        operation: "prepare Dropbox access",
+        source,
+    })?;
     let dropbox = match recovery.status {
         Some(status) => dropbox.with_transfer_observer(status.transfer_observer()),
         None => dropbox,
     };
     let dropbox = Arc::new(dropbox);
-    match dropbox
-        .validate_account(journal)
-        .map_err(|source| DaemonError::Dropbox {
-            operation: "validate the Dropbox account and root",
-            source,
-        })? {
-        AccountValidation::Valid => {}
-        AccountValidation::AccountChanged => return Err(DaemonError::AccountChanged),
-        AccountValidation::RootChanged => return Err(DaemonError::RootChanged),
-        AccountValidation::JournalBindingChanged => {
-            return Err(DaemonError::JournalBindingChanged);
+    loop {
+        let validation = dropbox
+            .validate_account(journal)
+            .map_err(|source| DaemonError::Dropbox {
+                operation: "validate the Dropbox account and root",
+                source,
+            });
+        let Some(validation) = recovery.retain_session(validation, wait)? else {
+            continue;
+        };
+        match validation {
+            AccountValidation::Valid => break,
+            AccountValidation::AccountChanged => return Err(DaemonError::AccountChanged),
+            AccountValidation::RootChanged => return Err(DaemonError::RootChanged),
+            AccountValidation::JournalBindingChanged => {
+                return Err(DaemonError::JournalBindingChanged);
+            }
         }
     }
     let mut downloads = ExactDownloadPool::new(Arc::clone(&dropbox))
@@ -263,6 +265,14 @@ fn run_session(
             config.paths().recovery_directory(),
         )
         .map_err(|source| DaemonError::Reconcile { source });
+        if matches!(&reconciliation, Err(error) if error.session_must_rebuild()) {
+            if let Err(error) = reconciliation {
+                recovery.wait_for_failure(error, wait)?;
+            }
+            downloads = ExactDownloadPool::new(Arc::clone(&dropbox))
+                .map_err(|source| DaemonError::Reconcile { source })?;
+            continue;
+        }
         let Some(reconciliation) = recovery.retain_session(reconciliation, wait)? else {
             continue;
         };
@@ -329,7 +339,6 @@ fn run_session(
         let Some(wakeup) = recovery.retain_session(wakeup, wait)? else {
             continue;
         };
-        refresh.accepted();
         recovery.cycle_completed();
         long_poll_backoff = match wakeup {
             LongPollWakeup::Changes { backoff } | LongPollWakeup::TimedOut { backoff } => backoff,
@@ -450,26 +459,6 @@ impl<'status> RecoveryControl<'status> {
 
 struct RetrySchedule {
     next: Duration,
-}
-
-struct SessionRefresh {
-    refreshed: bool,
-}
-
-impl SessionRefresh {
-    const fn new() -> Self {
-        Self { refreshed: false }
-    }
-
-    fn rejected(&mut self) -> bool {
-        let repeated = self.refreshed;
-        self.refreshed = true;
-        repeated
-    }
-
-    fn accepted(&mut self) {
-        self.refreshed = false;
-    }
 }
 
 impl RetrySchedule {
@@ -704,30 +693,13 @@ impl DaemonError {
         }
     }
 
-    fn session_rejected(&self) -> bool {
-        let mut source: &(dyn StdError + 'static) = self;
-        loop {
-            if matches!(
-                source.downcast_ref::<DropboxError>(),
-                Some(DropboxError::HttpStatus { status: 401, .. })
-            ) {
-                return true;
-            }
-            let Some(next) = source.source() else {
-                return false;
-            };
-            source = next;
-        }
-    }
-
     fn session_must_rebuild(&self) -> bool {
-        self.session_rejected()
-            || matches!(
-                self,
-                Self::Reconcile {
-                    source: ReconcileError::DownloadWorkerStopped
-                }
-            )
+        matches!(
+            self,
+            Self::Reconcile {
+                source: ReconcileError::DownloadWorkerStopped
+            }
+        )
     }
 }
 
@@ -810,30 +782,22 @@ fn journal_policy(error: &JournalError) -> FailurePolicy {
 
 fn auth_policy(error: &AuthError) -> FailurePolicy {
     match error {
-        AuthError::RateLimited { retry_after, .. } => retry_policy(*retry_after),
-        AuthError::Transport { .. } | AuthError::Response { .. } => {
-            FailurePolicy::new(Disposition::Retry(RETRY_BASE), DROPBOX)
-        }
-        AuthError::HttpStatus {
-            status: 500..=599, ..
-        } => FailurePolicy::new(Disposition::Retry(RETRY_BASE), DROPBOX),
-        AuthError::HttpStatus {
-            status: 400 | 401, ..
-        }
+        AuthError::Sdk { source } => transport_policy(source.outcome()),
+        AuthError::MissingRefreshToken
         | AuthError::CredentialJson { .. }
         | AuthError::CredentialUtf8 { .. }
         | AuthError::CredentialTooLarge
         | AuthError::StoredCredentialVersion { .. } => {
             FailurePolicy::new(Disposition::UserAction, CREDENTIAL_INVALID)
         }
-        AuthError::HttpStatus { .. } => FailurePolicy::new(Disposition::Environmental, DROPBOX),
         AuthError::Random { .. } => FailurePolicy::new(Disposition::Environmental, STATE),
         AuthError::CredentialSpawn { .. }
         | AuthError::CredentialPipeUnavailable { .. }
         | AuthError::CredentialWrite { .. }
         | AuthError::CredentialRead { .. }
         | AuthError::CredentialWait { .. }
-        | AuthError::CredentialStatus { .. } => {
+        | AuthError::CredentialStatus { .. }
+        | AuthError::CredentialCleanup { .. } => {
             FailurePolicy::new(Disposition::Environmental, CREDENTIALS)
         }
     }
@@ -841,15 +805,37 @@ fn auth_policy(error: &AuthError) -> FailurePolicy {
 
 fn dropbox_policy(error: &DropboxError) -> FailurePolicy {
     match error {
-        DropboxError::RateLimited { retry_after, .. } => retry_policy(*retry_after),
-        DropboxError::Transport { .. }
-        | DropboxError::Response { .. }
-        | DropboxError::DownloadBody { .. } => {
-            FailurePolicy::new(Disposition::Retry(RETRY_BASE), DROPBOX)
+        DropboxError::Sdk {
+            outcome, source, ..
+        } => {
+            if let Some(outcome) = error.transport_outcome() {
+                return transport_policy(outcome);
+            }
+            if let dropbox_sdk::Error::RateLimited {
+                retry_after_seconds,
+                ..
+            } = source.as_ref()
+            {
+                return retry_policy(Some(Duration::from_secs(u64::from(*retry_after_seconds))));
+            }
+            use crate::dropbox::ApiOutcome as O;
+            match outcome {
+                O::Retry | O::HashMismatch => retry_policy(None),
+                O::UserAction => FailurePolicy::new(Disposition::UserAction, BINDING),
+                O::Invariant => FailurePolicy::new(Disposition::Invariant, INTERNAL),
+                O::Environmental
+                | O::Unknown
+                | O::Conflict
+                | O::Rejected(_)
+                | O::Absent
+                | O::Unavailable => FailurePolicy::new(Disposition::Environmental, DROPBOX),
+            }
         }
-        DropboxError::HttpStatus {
-            status: 500..=599, ..
-        } => FailurePolicy::new(Disposition::Retry(RETRY_BASE), DROPBOX),
+        DropboxError::UnverifiedMutation { verification, .. } => dropbox_policy(verification),
+        DropboxError::RetriedTransport { retry, .. } => dropbox_policy(retry),
+        DropboxError::UploadedContentMismatch => retry_policy(None),
+
+        DropboxError::DownloadBody { .. } => retry_policy(None),
         DropboxError::AccountBindingChanged => FailurePolicy::new(Disposition::UserAction, BINDING),
         DropboxError::InvalidRootPath
         | DropboxError::InvalidLongPollTimeout
@@ -862,10 +848,7 @@ fn dropbox_policy(error: &DropboxError) -> FailurePolicy {
         | DropboxError::RemoteRootNotFolder
         | DropboxError::RemoteRootRestricted
         | DropboxError::RestrictedRemoteInventory
-        | DropboxError::HttpStatus { .. }
         | DropboxError::IncorrectUploadSessionOffset { .. }
-        | DropboxError::Json { .. }
-        | DropboxError::Header { .. }
         | DropboxError::InvalidEntryPath
         | DropboxError::IncompleteFileMetadata
         | DropboxError::CursorDidNotAdvance
@@ -879,10 +862,12 @@ fn dropbox_policy(error: &DropboxError) -> FailurePolicy {
         | DropboxError::InvalidMutationMetadata => {
             FailurePolicy::new(Disposition::Environmental, DROPBOX)
         }
-        DropboxError::DirectUploadTooLarge { .. } | DropboxError::UploadTooLarge { .. } => {
+        DropboxError::UploadTooLarge { .. } => {
             FailurePolicy::new(Disposition::Environmental, SYNC_ERRORS)
         }
-        DropboxError::UploadStageMetadata { source } | DropboxError::UploadStageSeek { source } => {
+        DropboxError::UploadStageMetadata { source }
+        | DropboxError::UploadStageSeek { source }
+        | DropboxError::UploadStageRead { source } => {
             if disk_full(source) {
                 FailurePolicy::new(Disposition::Environmental, DISK_FULL)
             } else {
@@ -988,6 +973,16 @@ fn sqlite_full(error: &rusqlite::Error) -> bool {
     sqlite_primary_code(error) == Some(rusqlite::ffi::SQLITE_FULL)
 }
 
+fn transport_policy(outcome: crate::transport::Outcome) -> FailurePolicy {
+    use crate::transport::Outcome;
+    match outcome {
+        Outcome::Retry { delay } => retry_policy(delay),
+        Outcome::Environmental => FailurePolicy::new(Disposition::Environmental, CREDENTIALS),
+        Outcome::UserAction => FailurePolicy::new(Disposition::UserAction, BINDING),
+        Outcome::Invariant => FailurePolicy::new(Disposition::Invariant, INTERNAL),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -1032,10 +1027,10 @@ mod tests {
     fn long_poll_failure(status: u16) -> DaemonError {
         DaemonError::Dropbox {
             operation: "wait for Dropbox changes",
-            source: DropboxError::HttpStatus {
-                operation: "long poll",
-                status,
-            },
+            source: DropboxError::sdk(
+                "long poll",
+                dropbox_sdk::Error::<dropbox_sdk::NoError>::ServerError(format!("HTTP {status}")),
+            ),
         }
     }
 
@@ -1220,10 +1215,13 @@ mod tests {
     fn dispositions_cover_retry_environment_user_action_and_invariant() {
         let retry = DaemonError::Dropbox {
             operation: "long poll",
-            source: DropboxError::RateLimited {
-                operation: "long poll",
-                retry_after: Some(Duration::from_secs(24 * 60 * 60)),
-            },
+            source: DropboxError::sdk(
+                "long poll",
+                dropbox_sdk::Error::<dropbox_sdk::NoError>::RateLimited {
+                    reason: dropbox_sdk::types::auth::RateLimitReason::Other,
+                    retry_after_seconds: 24 * 60 * 60,
+                },
+            ),
         };
         assert_eq!(retry.disposition(), Disposition::Retry(MAX_RETRY_AFTER));
         assert_eq!(
@@ -1247,29 +1245,27 @@ mod tests {
     }
 
     #[test]
-    fn rejected_session_refreshes_once_then_uses_backoff() -> Result<(), Box<dyn Error>> {
-        let rejected = || long_poll_failure(401);
-        let mut refresh = SessionRefresh::new();
-        assert!(rejected().session_rejected());
-        assert!(!refresh.rejected());
-        let mut recovery = RecoveryControl::new(None);
-        let mut waits = Vec::new();
-        if refresh.rejected() {
-            recovery.wait_for_failure(rejected(), &mut |delay| waits.push(delay))?;
-        }
-        assert_eq!(waits, [RETRY_BASE]);
-        refresh.accepted();
-        assert!(!refresh.rejected());
-        Ok(())
+    fn rejected_token_exits_without_rebuilding_the_download_pool() {
+        let rejected = DaemonError::Auth {
+            operation: "refresh Dropbox access",
+            source: AuthError::Sdk {
+                source: Box::new(crate::transport::TransportError::RefreshRejected(
+                    crate::transport::RejectCause::InvalidAccessToken,
+                )),
+            },
+        };
+        assert!(!rejected.session_must_rebuild());
+        assert_eq!(rejected.disposition(), Disposition::UserAction);
     }
 
     #[test]
     fn refresh_rejection_and_binding_rejection_exit_for_user_action() {
         let refresh = DaemonError::Auth {
             operation: "refresh Dropbox access",
-            source: AuthError::HttpStatus {
-                operation: "refresh access token",
-                status: 400,
+            source: AuthError::Sdk {
+                source: Box::new(crate::transport::TransportError::RefreshRejected(
+                    crate::transport::RejectCause::InvalidGrant,
+                )),
             },
         };
         assert_eq!(refresh.disposition(), Disposition::UserAction);

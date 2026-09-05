@@ -381,6 +381,8 @@ pub enum PlanStatus {
 /// Why one path cannot make progress until its cause is retried or cleared.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum BlockReason {
+    /// The source exceeds the supported file-size limit; only changed input can retry.
+    UnsupportedFileSize,
     /// Dropbox rejected the mutation with this documented tag.
     RemoteRejected {
         /// Documented Dropbox error tag.

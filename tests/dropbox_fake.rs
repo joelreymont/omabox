@@ -15,10 +15,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use common::{allow_owner_access, deny_all_access};
-use omabox::auth::{AccessToken, AuthError, OAuthClient, RefreshToken};
+use dropbox_sdk::{Error as SdkError, types::auth::AuthError as SdkAuthError};
+use omabox::auth::{AccessToken, OAuthClient, RefreshToken, StoredCredential};
 use omabox::dropbox::{
-    AccountValidation, DropboxClient, DropboxEndpoints, DropboxError, DropboxLink, DropboxRoot,
-    InventoryRefresh, LongPollWakeup, MutationOutcome, RemotePathState,
+    AccountValidation, ApiOutcome, DropboxClient, DropboxEndpoints, DropboxError, DropboxLink,
+    DropboxRoot, InventoryRefresh, LongPollWakeup, MutationOutcome, RemotePathState,
 };
 use omabox::journal::{
     BlockReason, DropboxBinding, Journal, LocalRootBinding, PlanBlock, PlanStatus, PlanUnblock,
@@ -41,6 +42,8 @@ use omabox::recovery::{ReplayBlocked, ReplayReport, replay_remote_operations};
 use omabox::runtime_status::{
     TransferDirection, TransferEvent, TransferObserver, TransferProgress,
 };
+use omabox::transport::{Outcome as TransportOutcome, TransportError};
+use serde::ser::{SerializeMap as _, SerializeSeq as _};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -79,60 +82,42 @@ fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result
     let download_metadata = json!({
         ".tag": "file",
         "name": "Alpha.txt",
+        "id": "id:alpha",
+        "client_modified": "2024-01-02T03:04:05Z",
+        "server_modified": "2024-01-02T03:04:05Z",
         "path_lower": "/sync/alpha.txt",
         "path_display": "/Sync/Alpha.txt",
         "rev": "rev-a",
         "content_hash": identity.as_str(),
         "size": bytes.len()
-    })
-    .to_string();
+    });
     let server = FakeServer::start(vec![
         FakeResponse::json(json!({
             "access_token": "opaque-access-a",
             "refresh_token": "opaque-refresh-a",
-            "expires_in": 14400,
-            "account_id": "account-a"
+            "token_type": "bearer"
         })),
-        FakeResponse::json(json!({
-            "access_token": "opaque-access-b",
-            "expires_in": 14400
-        })),
-        FakeResponse::json(json!({
-            "account_id": "account-a",
-            "root_info": {"root_namespace_id": "namespace-a"}
-        })),
-        FakeResponse::json(json!({
-            ".tag": "folder",
-            "path_lower": "/sync",
-            "path_display": "/Sync"
-        })),
+        FakeResponse::json(account_metadata("dbid:account-a", "namespace-a")),
+        FakeResponse::json(folder_metadata("/sync", "/Sync")),
         FakeResponse::json(json!({
             "entries": [
-                {
-                    ".tag": "folder",
-                    "path_lower": "/sync/folder",
-                    "path_display": "/Sync/Folder"
-                },
-                {
-                    ".tag": "file",
-                    "path_lower": "/sync/alpha.txt",
-                    "path_display": "/Sync/Alpha.txt",
-                    "rev": "rev-a",
-                    "content_hash": identity.as_str(),
-                    "is_downloadable": true
-                }
+                folder_metadata("/sync/folder", "/Sync/Folder"),
+                file_metadata(
+                    "/sync/alpha.txt",
+                    "/Sync/Alpha.txt",
+                    "rev-a",
+                    &identity,
+                )
             ],
             "cursor": "cursor-a",
             "has_more": true
         })),
         FakeResponse::json(json!({
-            "entries": [{
-                ".tag": "file",
-                "path_lower": "/sync/paper",
-                "path_display": "/Sync/Paper",
-                "rev": "rev-paper",
-                "is_downloadable": false
-            }],
+            "entries": [unsupported_file_metadata(
+                "/sync/paper",
+                "/Sync/Paper",
+                "rev-paper",
+            )],
             "cursor": "cursor-b",
             "has_more": false
         })),
@@ -145,11 +130,9 @@ fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result
     let oauth = OAuthClient::with_endpoints("app-key", endpoints.clone());
     let pending = oauth.begin()?;
     let grant = oauth.exchange(pending, "authorization-code")?;
-    assert_eq!(grant.account_id, "account-a");
-    let refreshed = oauth.refresh(&grant.refresh_token)?;
     let client = match DropboxClient::link_with_endpoints(
-        refreshed.access_token,
-        grant.account_id,
+        grant.access_token,
+        "dbid:account-a",
         "/Sync",
         endpoints,
     )? {
@@ -197,28 +180,30 @@ fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result
     assert_eq!(std::fs::read(sync_root.path().join("Alpha.txt"))?, bytes);
 
     let requests = server.finish()?;
-    assert_eq!(requests.len(), 8);
+    assert_eq!(requests.len(), 7);
     assert_eq!(requests[0].path, "/oauth2/token");
     assert!(text_body(&requests[0])?.contains("grant_type=authorization_code"));
     assert!(text_body(&requests[0])?.contains("code_verifier="));
     assert!(!text_body(&requests[0])?.contains("redirect_uri"));
     assert!(!text_body(&requests[0])?.contains("state="));
-    assert!(text_body(&requests[1])?.contains("grant_type=refresh_token"));
-    assert_eq!(requests[2].path, "/2/users/get_current_account");
-    assert_eq!(requests[3].path, "/2/files/get_metadata");
-    assert_eq!(requests[4].path, "/2/files/list_folder");
-    assert_eq!(requests[5].path, "/2/files/list_folder/continue");
-    assert_eq!(requests[6].path, "/2/files/list_folder/longpoll");
-    assert_eq!(requests[7].path, "/2/files/download");
-    assert!(header(&requests[2], "authorization").is_some());
-    assert!(header(&requests[2], "dropbox-api-path-root").is_none());
+    assert_eq!(requests[1].path, "/2/users/get_current_account");
+    assert_eq!(requests[2].path, "/2/files/get_metadata");
+    assert_eq!(requests[3].path, "/2/files/list_folder");
+    assert_eq!(requests[4].path, "/2/files/list_folder/continue");
+    assert_eq!(requests[5].path, "/2/files/list_folder/longpoll");
+    assert_eq!(requests[6].path, "/2/files/download");
+    assert!(header(&requests[1], "authorization").is_some());
+    assert!(header(&requests[1], "dropbox-api-path-root").is_none());
     assert_eq!(
-        header(&requests[3], "dropbox-api-path-root"),
+        header(&requests[2], "dropbox-api-path-root"),
         Some(r#"{".tag":"root","root":"namespace-a"}"#)
     );
-    assert!(
-        header(&requests[7], "dropbox-api-arg")
-            .is_some_and(|value| value.contains(r#""path":"rev:rev-a""#))
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(required_header(
+            &requests[6],
+            "dropbox-api-arg",
+        )?)?,
+        json!({"path": "rev:rev-a", "rev": "rev-a"})
     );
     Ok(())
 }
@@ -253,7 +238,7 @@ fn exact_download_retry_reuses_a_stage_without_consuming_the_body() -> Result<()
 }
 
 #[test]
-fn exact_download_stage_race_still_counts_the_response_body() -> Result<(), Box<dyn Error>> {
+fn exact_download_stage_race_preserves_verified_stage() -> Result<(), Box<dyn Error>> {
     let bytes = b"complete expected Dropbox bytes";
     let content = dropbox_content_hash(bytes.as_slice())?;
     let remote = RemoteFile::new(content.clone(), DropboxRevision::new("raced-revision"));
@@ -289,10 +274,13 @@ fn exact_download_stage_race_still_counts_the_response_body() -> Result<(), Box<
             .map_err(Into::into)
     })?;
 
-    assert!(matches!(
-        outcome,
-        Err(DropboxError::DownloadedLengthChanged)
-    ));
+    // The verified stage won the race, so the unneeded short response body is intentionally ignored.
+    assert!(matches!(outcome, Ok(StageOutcome::AlreadyStaged(()))));
+    assert_eq!(
+        install_download(root.path(), target, &content, None)?,
+        InstallOutcome::Installed
+    );
+    assert_eq!(std::fs::read(root.path().join(target))?, bytes);
     assert_eq!(server.finish()?.len(), 1);
     Ok(())
 }
@@ -309,10 +297,7 @@ fn one_reconciliation_pass_synchronizes_files_in_both_directions() -> Result<(),
     );
     let uploaded = RemoteFile::new(upload_content.clone(), DropboxRevision::new("rev-upload"));
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [file_metadata(
                 "/download.txt",
@@ -438,8 +423,6 @@ fn one_reconciliation_pass_synchronizes_files_in_both_directions() -> Result<(),
         )?)?,
         json!({
             "path": "/upload.txt",
-            "mode": "add",
-            "autorename": false,
             "strict_conflict": true,
             "content_hash": upload_content.as_str()
         })
@@ -456,10 +439,7 @@ fn unavailable_download_blocks_only_its_plan_while_siblings_finish() -> Result<(
     let good_content = dropbox_content_hash(good_bytes.as_slice())?;
     let blocked_content = dropbox_content_hash(blocked_bytes.as_slice())?;
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [
                 file_metadata("/blocked.txt", "/blocked.txt", "rev-blocked", &blocked_content),
@@ -468,7 +448,7 @@ fn unavailable_download_blocks_only_its_plan_while_siblings_finish() -> Result<(
             "cursor": "cursor-download-isolation",
             "has_more": false
         })),
-        FakeResponse::status_json(409, json!({"error": {".tag": "path"}}))
+        FakeResponse::status_json(409, lookup_error("not_found"))
             .for_path("/2/files/download")
             .for_header_containing("dropbox-api-arg", "rev-blocked"),
         FakeResponse::bytes(good_bytes.to_vec())
@@ -605,10 +585,7 @@ fn due_unchanged_download_retries_after_fresh_observation() -> Result<(), Box<dy
         DropboxRevision::new("rev-due"),
     );
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [file_metadata("/due.txt", "/due.txt", "rev-due", &remote.content)],
             "cursor": "cursor-due",
@@ -659,10 +636,7 @@ fn due_download_stays_blocked_when_the_fresh_local_path_is_unknown() -> Result<(
         DropboxRevision::new("rev-unknown"),
     );
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [file_metadata(
                 "/unknown.txt",
@@ -716,10 +690,7 @@ fn changed_revision_supersedes_blocked_download(retry_at: u64) -> Result<(), Box
         DropboxRevision::new("rev-new-current"),
     );
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [file_metadata(
                 "/changed.txt",
@@ -773,8 +744,13 @@ fn changed_revision_supersedes_blocked_download(retry_at: u64) -> Result<(), Box
     assert!(journal.blocked_plans()?.is_empty());
     let requests = server.finish()?;
     assert_eq!(requests.len(), 3);
-    assert!(required_header(&requests[2], "dropbox-api-arg")?.contains("rev-new-current"));
-    assert!(!required_header(&requests[2], "dropbox-api-arg")?.contains("rev-old-blocked"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(required_header(
+            &requests[2],
+            "dropbox-api-arg",
+        )?)?,
+        json!({"path": "rev:rev-new-current", "rev": "rev-new-current"})
+    );
     Ok(())
 }
 
@@ -793,10 +769,7 @@ fn blocked_plan_is_retired_when_both_sides_are_absent() -> Result<(), Box<dyn Er
         DropboxRevision::new("rev-vanished"),
     );
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [],
             "cursor": "cursor-absent",
@@ -842,7 +815,7 @@ fn late_download_result_cannot_block_a_reused_plan_id() -> Result<(), Box<dyn Er
         dropbox_content_hash(new_bytes.as_slice())?,
         DropboxRevision::new("rev-late-new"),
     );
-    let (old_response, gate) = FakeResponse::status_json(409, json!({"error": {".tag": "path"}}))
+    let (old_response, gate) = FakeResponse::status_json(409, lookup_error("not_found"))
         .for_path("/2/files/download")
         .for_header_containing("dropbox-api-arg", "rev-late-old")
         .gated();
@@ -921,57 +894,70 @@ fn worker_verification_mismatch_durably_blocks_its_plan() -> Result<(), Box<dyn 
         dropbox_content_hash(bytes.as_slice())?,
         DropboxRevision::new("expected-revision"),
     );
-    let server = FakeServer::start(vec![
-        FakeResponse::bytes(bytes.to_vec())
-            .header(
-                "Dropbox-API-Result",
-                download_metadata(
-                    "mismatch.txt",
-                    "different-revision",
-                    &remote.content,
-                    bytes.len(),
-                ),
-            )
-            .for_path("/2/files/download"),
-    ])?;
-    let client = Arc::new(fake_client(&server, "opaque-access-verification-block")?);
-    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
-    let directory = TempDir::new()?;
-    let root = directory.path().join("root");
-    let staging = directory.path().join("staging");
-    std::fs::create_dir_all(&root)?;
-    std::fs::create_dir_all(&staging)?;
-    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
-    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
-    let operations = planned_operations(plan(
-        &Baseline::Absent,
-        &Observation::ConfirmedAbsent,
-        &Observation::Present(remote),
-    ))?;
-    assert!(matches!(
-        journal.record_plan(Path::new("mismatch.txt"), &operations)?,
-        PlanWrite::Recorded(_)
-    ));
+    let wrong_revision = FakeResponse::bytes(bytes.to_vec())
+        .header(
+            "Dropbox-API-Result",
+            download_metadata(
+                "mismatch.txt",
+                "different-revision",
+                &remote.content,
+                bytes.len(),
+            ),
+        )
+        .for_path("/2/files/download");
+    for (response, reason) in [
+        (wrong_revision, BlockReason::DownloadVerificationFailed),
+        (
+            FakeResponse::bytes(bytes.to_vec()).header("Dropbox-API-Result", "{invalid metadata"),
+            BlockReason::DownloadVerificationFailed,
+        ),
+        (
+            FakeResponse::status_json(
+                409,
+                json!({"error_summary": "future/...", "error": {".tag": "future_download_error"}}),
+            ),
+            BlockReason::DownloadUnavailable { status: 409 },
+        ),
+    ] {
+        let server = FakeServer::start(vec![response])?;
+        let client = Arc::new(fake_client(&server, "opaque-access-verification-block")?);
+        let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+        let directory = TempDir::new()?;
+        let root = directory.path().join("root");
+        let staging = directory.path().join("staging");
+        std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(&staging)?;
+        let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+        let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+        let operations = planned_operations(plan(
+            &Baseline::Absent,
+            &Observation::ConfirmedAbsent,
+            &Observation::Present(remote.clone()),
+        ))?;
+        assert!(matches!(
+            journal.record_plan(Path::new("mismatch.txt"), &operations)?,
+            PlanWrite::Recorded(_)
+        ));
 
-    let replay = drive_replay(&mut journal, &client, &mut downloads, &root, &staging)??;
-    assert!(replay.blocked.iter().any(|blocked| matches!(
-        blocked,
-        ReplayBlocked::DurablePlan {
-            path,
-            reason: BlockReason::DownloadVerificationFailed,
-        } if path == Path::new("mismatch.txt")
-    )));
-    assert!(journal.pending_plans()?.is_empty());
-    let blocked = journal.blocked_plans()?;
-    assert_eq!(blocked.len(), 1);
-    assert!(matches!(
-        blocked[0].status,
-        PlanStatus::Blocked {
-            reason: BlockReason::DownloadVerificationFailed,
-            ..
-        }
-    ));
-    assert_eq!(server.finish()?.len(), 1);
+        let replay = drive_replay(&mut journal, &client, &mut downloads, &root, &staging)??;
+        assert!(replay.blocked.iter().any(|blocked| matches!(
+            blocked,
+            ReplayBlocked::DurablePlan {
+                path,
+                reason: actual,
+            } if path == Path::new("mismatch.txt") && *actual == reason
+        )));
+        assert!(journal.pending_plans()?.is_empty());
+        let blocked = journal.blocked_plans()?;
+        assert_eq!(blocked.len(), 1);
+        assert!(matches!(
+            &blocked[0].status,
+            PlanStatus::Blocked { reason: actual, .. } if *actual == reason
+        ));
+        let repeated = drive_replay(&mut journal, &client, &mut downloads, &root, &staging)??;
+        assert_eq!(repeated.completed_operations, 0);
+        assert_eq!(server.finish()?.len(), 1);
+    }
     Ok(())
 }
 
@@ -979,7 +965,9 @@ fn worker_verification_mismatch_durably_blocks_its_plan() -> Result<(), Box<dyn 
 fn worker_auth_rate_limit_and_server_failures_remain_global() -> Result<(), Box<dyn Error>> {
     for status in [401, 429, 500] {
         let response = if status == 429 {
-            FakeResponse::status_json(status, json!({})).header("Retry-After", "7")
+            FakeResponse::status_json(status, rate_limit_error(1)).header("Retry-After", "7")
+        } else if status == 401 {
+            FakeResponse::status_json(status, authentication_error("invalid_access_token"))
         } else {
             FakeResponse::status_json(status, json!({}))
         };
@@ -1013,28 +1001,30 @@ fn worker_auth_rate_limit_and_server_failures_remain_global() -> Result<(), Box<
         let error = drive_replay(&mut journal, &client, &mut downloads, &root, &staging)?
             .err()
             .ok_or_else(|| io::Error::other(format!("HTTP {status} did not remain global")))?;
+        let ReconcileError::RemoteDownload {
+            source: DropboxError::Sdk { source, .. },
+            ..
+        } = error
+        else {
+            return Err(io::Error::other("global failure lost its typed SDK source").into());
+        };
         match status {
             401 => assert!(matches!(
-                error,
-                ReconcileError::RemoteDownload {
-                    source: DropboxError::HttpStatus { status: 401, .. },
-                    ..
-                }
+                source.as_ref(),
+                SdkError::Authentication(SdkAuthError::InvalidAccessToken)
             )),
-            429 => assert!(matches!(
-                error,
-                ReconcileError::RemoteDownload {
-                    source: DropboxError::RateLimited { .. },
-                    ..
-                }
-            )),
-            500 => assert!(matches!(
-                error,
-                ReconcileError::RemoteDownload {
-                    source: DropboxError::HttpStatus { status: 500, .. },
-                    ..
-                }
-            )),
+            429 => {
+                let transport = source
+                    .downcast_ref_inner::<TransportError>()
+                    .ok_or_else(|| io::Error::other("rate limit lost its transport source"))?;
+                assert_eq!(
+                    transport.outcome(),
+                    TransportOutcome::Retry {
+                        delay: Some(Duration::from_secs(7))
+                    }
+                );
+            }
+            500 => assert!(matches!(source.as_ref(), SdkError::ServerError(_))),
             _ => return Err(io::Error::other("unexpected global status fixture").into()),
         }
         assert_eq!(journal.pending_plans()?.len(), 1);
@@ -1124,11 +1114,7 @@ fn occupied_upload_stage_is_durably_blocked_without_overwrite_or_request()
     let occupant = b"unrelated occupant bytes";
     let content = dropbox_content_hash(bytes.as_slice())?;
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        }))
-        .for_path("/2/users/get_current_account"),
+        account().for_path("/2/users/get_current_account"),
         FakeResponse::json(json!({
             "entries": [],
             "cursor": "occupied-upload-stage",
@@ -1211,11 +1197,7 @@ fn special_upload_stage_blocks_only_its_plan() -> Result<(), Box<dyn Error>> {
             &good_remote.content,
         ))
         .for_path("/2/files/upload"),
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        }))
-        .for_path("/2/users/get_current_account"),
+        account().for_path("/2/users/get_current_account"),
         FakeResponse::json(json!({
             "entries": [],
             "cursor": "special-upload-stage",
@@ -1292,11 +1274,7 @@ fn changed_upload_supersedes_a_rejected_plan_before_deadline() -> Result<(), Box
         DropboxRevision::new("changed-upload-revision"),
     );
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        }))
-        .for_path("/2/users/get_current_account"),
+        account().for_path("/2/users/get_current_account"),
         FakeResponse::json(json!({
             "entries": [],
             "cursor": "changed-upload",
@@ -1375,10 +1353,7 @@ fn changed_upload_supersedes_a_rejected_plan_before_deadline() -> Result<(), Box
 fn unknown_local_state_keeps_a_rejected_upload_blocked() -> Result<(), Box<dyn Error>> {
     let content = dropbox_content_hash(b"unreadable upload".as_slice())?;
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [],
             "cursor": "unknown-rejected-upload",
@@ -1459,10 +1434,7 @@ fn later_edits_sync_and_divergence_preserves_both_sides() -> Result<(), Box<dyn 
         DropboxRevision::new("rev-remote-conflict"),
     );
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [
                 file_metadata(
@@ -1624,26 +1596,28 @@ fn later_edits_sync_and_divergence_preserves_both_sides() -> Result<(), Box<dyn 
         json!({
             "path": "/a-local-update.txt",
             "mode": {".tag": "update", "update": "rev-old"},
-            "autorename": false,
             "strict_conflict": true,
             "content_hash": dropbox_content_hash(local_bytes.as_slice())?.as_str()
         })
     );
-    let download_revisions = requests
+    let download_arguments = requests
         .iter()
         .filter(|request| request.path == "/2/files/download")
-        .map(|request| required_header(request, "dropbox-api-arg"))
+        .map(|request| {
+            serde_json::from_str::<serde_json::Value>(required_header(request, "dropbox-api-arg")?)
+                .map_err(io::Error::other)
+        })
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(download_revisions.len(), 2);
+    assert_eq!(download_arguments.len(), 2);
     assert!(
-        download_revisions
+        download_arguments
             .iter()
-            .any(|header| header.contains("rev:rev-remote-update"))
+            .any(|argument| argument.get("rev") == Some(&json!("rev-remote-update")))
     );
     assert!(
-        download_revisions
+        download_arguments
             .iter()
-            .any(|header| header.contains("rev:rev-remote-conflict"))
+            .any(|argument| argument.get("rev") == Some(&json!("rev-remote-conflict")))
     );
     Ok(())
 }
@@ -1656,10 +1630,7 @@ fn later_deletions_sync_in_both_directions() -> Result<(), Box<dyn Error>> {
         DropboxRevision::new("rev-delete-baseline"),
     );
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [file_metadata(
                 "/local-deleted.txt",
@@ -1754,10 +1725,7 @@ fn later_deletions_sync_in_both_directions() -> Result<(), Box<dyn Error>> {
 fn one_reconciliation_pass_synchronizes_empty_and_nested_directories() -> Result<(), Box<dyn Error>>
 {
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [
                 folder_metadata("/remote", "/remote"),
@@ -1829,12 +1797,7 @@ fn fresh_download_uses_parent_directory_casing_without_remote_writes() -> Result
 {
     let bytes = b"Dropbox source bytes";
     let content = dropbox_content_hash(bytes.as_slice())?;
-    let account = || {
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        }))
-    };
+    let account = || account();
     let server = FakeServer::start(vec![
         account(),
         FakeResponse::json(json!({
@@ -1926,10 +1889,7 @@ fn fresh_download_uses_parent_directory_casing_without_remote_writes() -> Result
 fn remote_directory_deletion_removes_local_directories_deepest_first() -> Result<(), Box<dyn Error>>
 {
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [],
             "cursor": "directories-deleted",
@@ -1985,13 +1945,7 @@ fn child_created_after_scan_forces_an_immediate_directory_rescan() -> Result<(),
         "has_more": false
     }));
     let (listing, gate) = listing.gated();
-    let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
-        listing,
-    ])?;
+    let server = FakeServer::start(vec![account(), listing])?;
     let client = Arc::new(fake_client(
         &server,
         "opaque-access-post-plan-directory-race",
@@ -2056,10 +2010,7 @@ fn nonempty_directory_delete_reobserves_and_syncs_the_new_child() -> Result<(), 
     let child_bytes = b"new child";
     let child_content = dropbox_content_hash(child_bytes.as_slice())?;
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [],
             "cursor": "parent-deleted",
@@ -2133,10 +2084,7 @@ fn remote_directory_preserves_a_local_file_under_a_synchronized_name() -> Result
     let variant = format!("node (local file {identity_prefix})");
     let variant_api = format!("/{variant}");
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [folder_metadata("/node", "/node")],
             "cursor": "directory-file-collision",
@@ -2238,10 +2186,7 @@ fn local_directory_preserves_a_dropbox_file_under_a_synchronized_name() -> Resul
         )
     };
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [original.clone()],
             "cursor": "remote-file",
@@ -2378,10 +2323,7 @@ fn directory_collision_copy_stays_bound_to_the_verified_root() -> Result<(), Box
     );
     let (visible_download, gate) = visible_download.gated();
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [original],
             "cursor": "root-swap-directory-copy",
@@ -2458,10 +2400,7 @@ fn directory_collision_destination_race_requests_a_fresh_scan() -> Result<(), Bo
     );
     let (download, gate) = download.gated();
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [original],
             "cursor": "directory-copy-destination-race",
@@ -2537,10 +2476,7 @@ fn occupied_collision_stage_uses_the_next_synchronized_name() -> Result<(), Box<
         )
     };
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [original.clone()],
             "cursor": "occupied-directory-copy-stage",
@@ -2628,17 +2564,14 @@ fn changed_dropbox_file_during_directory_conversion_replans_without_a_conflict_r
         )
     };
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [old.clone()],
             "cursor": "old-file",
             "has_more": false
         })),
         download(),
-        FakeResponse::status_json(409, json!({"error": {".tag": "path"}})),
+        FakeResponse::status_json(409, delete_write_error(write_conflict_file())),
         FakeResponse::json(file_metadata("/node", "/node", "rev-new", &new_content)),
     ])?;
     let client = Arc::new(fake_client(
@@ -2695,7 +2628,7 @@ fn changed_dropbox_file_during_directory_conversion_replans_without_a_conflict_r
 fn large_replace_resumes_a_partially_stored_upload_chunk() -> Result<(), Box<dyn Error>> {
     const MIB: u64 = 1024 * 1024;
     const CHUNK: u64 = 32 * MIB;
-    const SIZE: u64 = 150 * MIB + 1;
+    const SIZE: u64 = CHUNK + 1;
     let fixture = sparse_upload_fixture(SIZE, CHUNK / 2)?;
     let content = fixture.staged.content().clone();
     let session_id = "opaque-session-must-not-appear-in-errors";
@@ -2711,11 +2644,8 @@ fn large_replace_resumes_a_partially_stored_upload_chunk() -> Result<(), Box<dyn
                 }
             }),
         ),
-        FakeResponse::json(json!({})),
-        FakeResponse::json(json!({})),
-        FakeResponse::json(json!({})),
-        FakeResponse::json(json!({})),
-        FakeResponse::json(json!({})),
+        FakeResponse::json(json!(null)),
+        FakeResponse::json(json!(null)),
         FakeResponse::json(file_metadata(
             "/large.bin",
             "/Large.bin",
@@ -2732,47 +2662,39 @@ fn large_replace_resumes_a_partially_stored_upload_chunk() -> Result<(), Box<dyn
             &fixture.staged,
         )?,
         MutationOutcome::Applied(RemotePathState::File(RemoteFile::new(
-            content,
+            content.clone(),
             DropboxRevision::new("new-revision"),
         )))
     );
 
     let requests = server.finish()?;
-    assert_eq!(requests.len(), 8);
+    assert_eq!(requests.len(), 5);
     assert_eq!(requests[0].path, "/2/files/upload_session/start");
     assert_eq!(requests[1].path, "/2/files/upload_session/append_v2");
     assert_eq!(requests[2].path, "/2/files/upload_session/append_v2");
     assert_eq!(requests[3].path, "/2/files/upload_session/append_v2");
-    assert_eq!(requests[4].path, "/2/files/upload_session/append_v2");
-    assert_eq!(requests[5].path, "/2/files/upload_session/append_v2");
-    assert_eq!(requests[6].path, "/2/files/upload_session/append_v2");
-    assert_eq!(requests[7].path, "/2/files/upload_session/finish");
+    assert_eq!(requests[4].path, "/2/files/upload_session/finish");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(required_header(
             &requests[0],
             "dropbox-api-arg",
         )?)?,
-        json!({"close": false})
+        json!({})
     );
-    for (request, offset) in
-        requests[1..7]
-            .iter()
-            .zip([0, CHUNK / 2, CHUNK, 2 * CHUNK, 3 * CHUNK, 4 * CHUNK])
-    {
+    for (request, offset) in requests[1..4].iter().zip([0, CHUNK / 2, CHUNK]) {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(required_header(
                 request,
                 "dropbox-api-arg",
             )?)?,
             json!({
-                "cursor": {"session_id": session_id, "offset": offset},
-                "close": false
+                "cursor": {"session_id": session_id, "offset": offset}
             })
         );
     }
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(required_header(
-            &requests[7],
+            &requests[4],
             "dropbox-api-arg",
         )?)?,
         json!({
@@ -2780,20 +2702,17 @@ fn large_replace_resumes_a_partially_stored_upload_chunk() -> Result<(), Box<dyn
             "commit": {
                 "path": "/Large.bin",
                 "mode": {".tag": "update", "update": "old-revision"},
-                "autorename": false,
                 "strict_conflict": true
-            }
+            },
+            "content_hash": content.as_str()
         })
     );
     assert!(requests[0].body.is_empty());
     assert_eq!(u64::try_from(requests[1].body.len())?, CHUNK);
-    assert_eq!(u64::try_from(requests[2].body.len())?, CHUNK / 2);
     assert_eq!(requests[2].body.first(), Some(&0xa5));
-    assert_eq!(u64::try_from(requests[3].body.len())?, CHUNK);
-    assert_eq!(u64::try_from(requests[4].body.len())?, CHUNK);
-    assert_eq!(u64::try_from(requests[5].body.len())?, CHUNK);
-    assert_eq!(u64::try_from(requests[6].body.len())?, SIZE - 4 * CHUNK);
-    assert!(requests[7].body.is_empty());
+    assert_eq!(u64::try_from(requests[2].body.len())?, CHUNK / 2);
+    assert_eq!(u64::try_from(requests[3].body.len())?, SIZE - CHUNK);
+    assert!(requests[4].body.is_empty());
     assert_eq!(
         requests
             .iter()
@@ -2814,10 +2733,7 @@ fn case_only_remote_spelling_change_is_a_stable_noop() -> Result<(), Box<dyn Err
     let content = dropbox_content_hash(bytes.as_slice())?;
     let remote = RemoteFile::new(content.clone(), DropboxRevision::new("rev-same"));
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [file_metadata(
                 "/report.txt",
@@ -2890,10 +2806,7 @@ fn local_case_collision_is_renamed_before_planning_and_then_syncs() -> Result<()
     let first_content = dropbox_content_hash(first_bytes.as_slice())?;
     let second_content = dropbox_content_hash(second_bytes.as_slice())?;
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [],
             "cursor": "empty",
@@ -2986,11 +2899,7 @@ fn automatic_case_rename_never_becomes_a_dropbox_delete() -> Result<(), Box<dyn 
         )
         .for_path("/2/files/download");
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        }))
-        .for_path("/2/users/get_current_account"),
+        account().for_path("/2/users/get_current_account"),
         FakeResponse::json(json!({
             "entries": [
                 folder_metadata("/apps", "/Apps"),
@@ -3314,10 +3223,7 @@ fn gated_download_does_not_stop_the_next_poll_and_reconciliation() -> Result<(),
     let server = FakeServer::start(vec![
         response,
         FakeResponse::json(json!({"changes": false})),
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [],
             "cursor": "cursor-after-gated-download",
@@ -3678,9 +3584,19 @@ fn interrupted_exact_download_resumes_only_from_a_valid_range() -> Result<(), Bo
 
     let requests = server.finish()?;
     assert_eq!(requests.len(), 10);
-    assert!(header(&requests[0], "range").is_none());
-    for request in &requests[1..] {
-        assert_eq!(header(request, "range"), Some("bytes=67108864-"));
+    for (index, request) in requests.iter().enumerate() {
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(required_header(
+                request,
+                "dropbox-api-arg",
+            )?)?,
+            json!({"path": "rev:resume-revision", "rev": "resume-revision"})
+        );
+        if index == 0 {
+            assert!(header(request, "range").is_none());
+        } else {
+            assert_eq!(header(request, "range"), Some("bytes=67108864-"));
+        }
     }
     Ok(())
 }
@@ -3947,17 +3863,41 @@ fn corrupt_exact_download_never_leaves_installable_bytes() -> Result<(), Box<dyn
 #[test]
 fn oauth_rate_limit_preserves_retry_after_header() -> Result<(), Box<dyn Error>> {
     let server = FakeServer::start(vec![
-        FakeResponse::status_json(429, json!({})).header("Retry-After", "23"),
+        FakeResponse::status_json(429, rate_limit_error(1)).header("Retry-After", "23"),
     ])?;
-    let oauth = OAuthClient::with_endpoints("app-key", server.endpoints());
-
-    assert!(matches!(
-        oauth.refresh(&RefreshToken::from_secret("opaque-refresh")),
-        Err(AuthError::RateLimited {
-            operation: "refresh access token",
-            retry_after: Some(delay),
-        }) if delay == Duration::from_secs(23)
-    ));
+    let binding = DropboxBinding {
+        account_id: String::from("dbid:account"),
+        root_namespace_id: String::from("namespace"),
+        remote_root: String::new(),
+    };
+    let root = DropboxRoot::new("dbid:account", "namespace", "")?;
+    let client = DropboxClient::from_credentials_with_endpoints(
+        "app-key",
+        StoredCredential {
+            binding,
+            refresh_token: RefreshToken::from_secret("opaque-refresh"),
+        },
+        root,
+        server.endpoints(),
+    )?;
+    let directory = TempDir::new()?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let error = client
+        .validate_account(&mut journal)
+        .err()
+        .ok_or_else(|| io::Error::other("rate-limited credential refresh succeeded"))?;
+    let DropboxError::Sdk { source, .. } = error else {
+        return Err(io::Error::other("credential refresh did not retain its SDK error").into());
+    };
+    let transport = source
+        .downcast_ref_inner::<TransportError>()
+        .ok_or_else(|| io::Error::other("credential refresh lost its transport error"))?;
+    assert_eq!(
+        transport.outcome(),
+        TransportOutcome::Retry {
+            delay: Some(Duration::from_secs(23))
+        }
+    );
     assert_eq!(server.finish()?.len(), 1);
     Ok(())
 }
@@ -3969,7 +3909,7 @@ fn long_poll_exposes_reset_and_rate_limit_outcomes() -> Result<(), Box<dyn Error
             409,
             json!({"error_summary": "reset/", "error": {".tag": "reset"}}),
         ),
-        FakeResponse::status_json(429, json!({})).header("Retry-After", "17"),
+        FakeResponse::status_json(429, rate_limit_error(1)).header("Retry-After", "17"),
     ])?;
     let client = fake_client(&server, "opaque-access-long-poll")?;
 
@@ -3977,13 +3917,22 @@ fn long_poll_exposes_reset_and_rate_limit_outcomes() -> Result<(), Box<dyn Error
         client.long_poll("old-cursor", Duration::from_secs(30))?,
         omabox::dropbox::LongPollWakeup::CursorReset
     );
-    assert!(matches!(
-        client.long_poll("new-cursor", Duration::from_secs(30)),
-        Err(DropboxError::RateLimited {
-            operation: "wait for Dropbox changes",
-            retry_after: Some(delay),
-        }) if delay == Duration::from_secs(17)
-    ));
+    let error = client
+        .long_poll("new-cursor", Duration::from_secs(30))
+        .err()
+        .ok_or_else(|| io::Error::other("rate-limited long poll succeeded"))?;
+    let DropboxError::Sdk { source, .. } = error else {
+        return Err(io::Error::other("long poll lost its typed SDK error").into());
+    };
+    let transport = source
+        .downcast_ref_inner::<TransportError>()
+        .ok_or_else(|| io::Error::other("long poll lost its rate-limit transport error"))?;
+    assert_eq!(
+        transport.outcome(),
+        TransportOutcome::Retry {
+            delay: Some(Duration::from_secs(17))
+        }
+    );
     let requests = server.finish()?;
     assert_eq!(requests.len(), 2);
     assert!(
@@ -4072,11 +4021,7 @@ fn conditional_mutations_use_strict_documented_requests() -> Result<(), Box<dyn 
             )
         })),
         FakeResponse::json(json!({
-            "metadata": {
-                ".tag": "folder",
-                "path_lower": "/folder",
-                "path_display": "/Folder"
-            }
+            "metadata": folder_metadata("/folder", "/Folder")
         })),
     ])?;
     let client = fake_client(&server, "opaque-access-writes")?;
@@ -4124,8 +4069,6 @@ fn conditional_mutations_use_strict_documented_requests() -> Result<(), Box<dyn 
         serde_json::from_str::<serde_json::Value>(create_argument)?,
         json!({
             "path": format!("/{unicode_path}"),
-            "mode": "add",
-            "autorename": false,
             "strict_conflict": true,
             "content_hash": content.as_str()
         })
@@ -4141,7 +4084,6 @@ fn conditional_mutations_use_strict_documented_requests() -> Result<(), Box<dyn 
         json!({
             "path": "/Replace.txt",
             "mode": {".tag": "update", "update": "expected-rev"},
-            "autorename": false,
             "strict_conflict": true,
             "content_hash": content.as_str()
         })
@@ -4155,7 +4097,7 @@ fn conditional_mutations_use_strict_documented_requests() -> Result<(), Box<dyn 
     assert_eq!(requests[3].path, "/2/files/create_folder_v2");
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&requests[3].body)?,
-        json!({"path": "/Folder", "autorename": false})
+        json!({"path": "/Folder"})
     );
     assert!(requests.iter().all(|request| {
         header(request, "authorization") == Some("Bearer opaque-access-writes")
@@ -4172,32 +4114,28 @@ fn explicit_conflict_uses_current_metadata_without_inventing_retry_safety()
     let desired = fixture.staged.content().clone();
     let current = dropbox_content_hash(b"different remote bytes".as_slice())?;
     let server = FakeServer::start(vec![
-        FakeResponse::status_json(409, json!({"error": {".tag": "path"}})),
+        FakeResponse::status_json(409, upload_error(write_conflict_file())),
         FakeResponse::json(file_metadata(
             "/conflict.txt",
             "/Conflict.txt",
             "current-rev",
             &current,
         )),
-        FakeResponse::status_json(409, json!({"error": {".tag": "path"}})),
-        FakeResponse::json(json!({
-            ".tag": "deleted",
-            "path_lower": "/unchanged.txt",
-            "path_display": "/Unchanged.txt"
-        })),
-        FakeResponse::status_json(409, json!({"error": {".tag": "path"}})),
+        FakeResponse::status_json(409, upload_error(write_conflict_file())),
+        FakeResponse::json(deleted_metadata("/unchanged.txt", "/Unchanged.txt")),
+        FakeResponse::status_json(409, upload_error(write_conflict_file())),
         FakeResponse::json(file_metadata(
             "/same.txt",
             "/Same.txt",
             "same-rev",
             &desired,
         )),
-        FakeResponse::status_json(409, json!({"error": {".tag": "path"}})),
-        FakeResponse::json(json!({
-            ".tag": "file",
-            "path_lower": "/incomplete.txt",
-            "path_display": "/Incomplete.txt"
-        })),
+        FakeResponse::status_json(409, delete_write_error(write_conflict_file())),
+        FakeResponse::json(incomplete_file_metadata(
+            "/incomplete.txt",
+            "/Incomplete.txt",
+            "expected-rev",
+        )),
     ])?;
     let client = fake_client(&server, "opaque-access-conflict")?;
 
@@ -4253,19 +4191,9 @@ fn ambiguous_mutations_are_verified_once_and_preserve_the_original_failure()
         FakeResponse::status_json(503, json!({})),
         FakeResponse::json(file_metadata("/delete.txt", "/Delete.txt", "old-rev", &old)),
         FakeResponse::status_json(503, json!({})),
-        FakeResponse::status_json(
-            409,
-            json!({
-                "error": {".tag": "path", "path": {".tag": "not_found"}}
-            }),
-        ),
+        FakeResponse::status_json(409, lookup_error("not_found")),
         FakeResponse::status_json(503, json!({})),
-        FakeResponse::status_json(
-            409,
-            json!({
-                "error": {".tag": "path", "path": {".tag": "restricted_content"}}
-            }),
-        ),
+        FakeResponse::status_json(409, lookup_error("restricted_content")),
         FakeResponse::json(json!({})),
         FakeResponse::json(file_metadata(
             "/created.txt",
@@ -4281,12 +4209,11 @@ fn ambiguous_mutations_are_verified_once_and_preserve_the_original_failure()
             &desired,
         )),
         FakeResponse::status_json(503, json!({})),
-        FakeResponse::json(json!({
-            ".tag": "file",
-            "path_lower": "/incomplete.txt",
-            "path_display": "/Incomplete.txt",
-            "rev": "expected-rev"
-        })),
+        FakeResponse::json(incomplete_file_metadata(
+            "/incomplete.txt",
+            "/Incomplete.txt",
+            "expected-rev",
+        )),
     ])?;
     let client = fake_client(&server, "opaque-access-ambiguous")?;
 
@@ -4309,13 +4236,11 @@ fn ambiguous_mutations_are_verified_once_and_preserve_the_original_failure()
         client.delete_file("Gone.txt", &DropboxRevision::new("gone-rev"))?,
         MutationOutcome::Applied(RemotePathState::Absent)
     );
-    assert!(matches!(
-        client.create_folder("Blocked"),
-        Err(DropboxError::HttpStatus {
-            operation: "strictly create Dropbox folder",
-            status: 503,
-        })
-    ));
+    let blocked = client
+        .create_folder("Blocked")
+        .err()
+        .ok_or_else(|| io::Error::other("ambiguous folder creation unexpectedly succeeded"))?;
+    assert!(error_chain_contains_server_error(&blocked));
     assert_eq!(
         client.create_file("Created.txt", &fixture.staged)?,
         MutationOutcome::Applied(RemotePathState::File(RemoteFile::new(
@@ -4331,13 +4256,11 @@ fn ambiguous_mutations_are_verified_once_and_preserve_the_original_failure()
         )?,
         MutationOutcome::Pending
     );
-    assert!(matches!(
-        client.delete_file("Incomplete.txt", &DropboxRevision::new("expected-rev")),
-        Err(DropboxError::HttpStatus {
-            operation: "conditionally delete Dropbox file",
-            status: 503,
-        })
-    ));
+    let incomplete = client
+        .delete_file("Incomplete.txt", &DropboxRevision::new("expected-rev"))
+        .err()
+        .ok_or_else(|| io::Error::other("ambiguous deletion unexpectedly succeeded"))?;
+    assert!(error_chain_contains_server_error(&incomplete));
 
     let requests = server.finish()?;
     assert_eq!(requests.len(), 14);
@@ -4352,6 +4275,11 @@ fn ambiguous_mutations_are_verified_once_and_preserve_the_original_failure()
 
 #[test]
 fn rejected_paths_do_not_stop_unrelated_sync_or_report_progress() -> Result<(), Box<dyn Error>> {
+    rejected_path_case("disallowed_name", "disallowed_name")?;
+    rejected_path_case("future_write_error", "rejected_by_dropbox")
+}
+
+fn rejected_path_case(wire_tag: &str, recorded_tag: &str) -> Result<(), Box<dyn Error>> {
     let invalid_path = PathBuf::from(OsString::from_vec(b"invalid-\xff.txt".to_vec()));
     let invalid_bytes = b"invalid path bytes";
     let rejected_bytes = b"rejected bytes";
@@ -4366,16 +4294,8 @@ fn rejected_paths_do_not_stop_unrelated_sync_or_report_progress() -> Result<(), 
         DropboxRevision::new("download-sibling-revision"),
     );
     let rejection = || {
-        FakeResponse::status_json(
-            409,
-            json!({
-                "error": {
-                    ".tag": "path",
-                    "reason": {".tag": "disallowed_name"}
-                }
-            }),
-        )
-        .for_path("/2/files/upload")
+        FakeResponse::status_json(409, upload_error(json!({".tag": wire_tag})))
+            .for_path("/2/files/upload")
     };
     let server = FakeServer::start(vec![
         rejection(),
@@ -4386,11 +4306,7 @@ fn rejected_paths_do_not_stop_unrelated_sync_or_report_progress() -> Result<(), 
             &good_remote.content,
         ))
         .for_path("/2/files/upload"),
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        }))
-        .for_path("/2/users/get_current_account"),
+        account().for_path("/2/users/get_current_account"),
         FakeResponse::json(json!({
             "entries": [
                 file_metadata(
@@ -4516,7 +4432,7 @@ fn rejected_paths_do_not_stop_unrelated_sync_or_report_progress() -> Result<(), 
         PlanStatus::Blocked {
             reason: BlockReason::RemoteRejected { tag },
             ..
-        } if tag == "disallowed_name"
+        } if tag == recorded_tag
     ));
     drop(journal);
     let mut reopened = Journal::open(&database)?;
@@ -4530,7 +4446,7 @@ fn rejected_paths_do_not_stop_unrelated_sync_or_report_progress() -> Result<(), 
         reopened.block_plan(
             bad_plan,
             &BlockReason::RemoteRejected {
-                tag: String::from("disallowed_name"),
+                tag: String::from(recorded_tag),
             },
             0,
         )?,
@@ -4587,7 +4503,7 @@ fn remote_replay_preserves_conflict_sides_without_a_backup_download() -> Result<
         remote_bytes.len(),
     );
     let server = FakeServer::start(vec![
-        FakeResponse::status_json(409, json!({"error": {".tag": "path"}})),
+        FakeResponse::status_json(409, upload_error(write_conflict_file())),
         FakeResponse::json(file_metadata(
             "/replace.txt",
             "/Replace.txt",
@@ -4649,7 +4565,13 @@ fn remote_replay_preserves_conflict_sides_without_a_backup_download() -> Result<
     assert_eq!(requests[0].path, "/2/files/upload");
     assert_eq!(requests[1].path, "/2/files/get_metadata");
     assert_eq!(requests[2].path, "/2/files/download");
-    assert!(required_header(&requests[2], "dropbox-api-arg")?.contains("rev:current-rev"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(required_header(
+            &requests[2],
+            "dropbox-api-arg",
+        )?)?,
+        json!({"path": "rev:current-rev", "rev": "current-rev"})
+    );
     Ok(())
 }
 
@@ -4659,18 +4581,10 @@ fn remote_replay_creates_nested_parents_before_the_file() -> Result<(), Box<dyn 
     let content = dropbox_content_hash(bytes.as_slice())?;
     let server = FakeServer::start(vec![
         FakeResponse::json(json!({
-            "metadata": {
-                ".tag": "folder",
-                "path_lower": "/one",
-                "path_display": "/one"
-            }
+            "metadata": folder_metadata("/one", "/one")
         })),
         FakeResponse::json(json!({
-            "metadata": {
-                ".tag": "folder",
-                "path_lower": "/one/two",
-                "path_display": "/one/two"
-            }
+            "metadata": folder_metadata("/one/two", "/one/two")
         })),
         FakeResponse::json(file_metadata(
             "/one/two/file.txt",
@@ -4716,11 +4630,11 @@ fn remote_replay_creates_nested_parents_before_the_file() -> Result<(), Box<dyn 
     assert_eq!(requests[2].path, "/2/files/upload");
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&requests[0].body)?,
-        json!({"path": "/one", "autorename": false})
+        json!({"path": "/one"})
     );
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&requests[1].body)?,
-        json!({"path": "/one/two", "autorename": false})
+        json!({"path": "/one/two"})
     );
     Ok(())
 }
@@ -4737,10 +4651,7 @@ fn stale_upload_is_superseded_and_current_bytes_sync() -> Result<(), Box<dyn Err
             "other-revision",
             &other,
         )),
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [file_metadata(
                 "/other.txt",
@@ -4856,13 +4767,7 @@ fn matching_observations_retire_a_stale_install_and_later_edits_sync() -> Result
         dropbox_content_hash(edited_bytes.as_slice())?,
         DropboxRevision::new("edited-revision"),
     );
-    let account = || {
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        }))
-        .for_path("/2/users/get_current_account")
-    };
+    let account = || account().for_path("/2/users/get_current_account");
     let server = FakeServer::start(vec![
         account(),
         FakeResponse::json(json!({
@@ -4980,11 +4885,7 @@ fn a_changed_safe_operation_replaces_a_stale_install_in_the_same_pass() -> Resul
         DropboxRevision::new("created-revision"),
     );
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        }))
-        .for_path("/2/users/get_current_account"),
+        account().for_path("/2/users/get_current_account"),
         FakeResponse::json(json!({
             "entries": [],
             "cursor": "remote-absent",
@@ -5055,18 +4956,13 @@ fn an_unknown_observation_does_not_retire_a_stale_install() -> Result<(), Box<dy
     );
     let current_bytes = b"current local bytes";
     let server = FakeServer::start(vec![
+        account().for_path("/2/users/get_current_account"),
         FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        }))
-        .for_path("/2/users/get_current_account"),
-        FakeResponse::json(json!({
-            "entries": [{
-                ".tag": "file",
-                "path_lower": "/file.txt",
-                "path_display": "/file.txt",
-                "is_downloadable": false,
-            }],
+            "entries": [unsupported_file_metadata(
+                "/file.txt",
+                "/file.txt",
+                "unsupported-revision",
+            )],
             "cursor": "remote-unknown",
             "has_more": false,
         }))
@@ -5117,11 +5013,7 @@ fn a_pending_only_path_retires_without_fetching_obsolete_bytes() -> Result<(), B
         DropboxRevision::new("stale-revision"),
     );
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        }))
-        .for_path("/2/users/get_current_account"),
+        account().for_path("/2/users/get_current_account"),
         FakeResponse::json(json!({
             "entries": [],
             "cursor": "both-absent",
@@ -5245,10 +5137,7 @@ fn remote_delete_skips_backup_download_and_ambiguous_create_stays_pending()
     ));
     let pending_server = FakeServer::start(vec![
         FakeResponse::status_json(503, json!({})),
-        FakeResponse::status_json(
-            409,
-            json!({"error": {".tag": "path", "path": {".tag": "not_found"}}}),
-        ),
+        FakeResponse::status_json(409, lookup_error("not_found")),
     ])?;
     let pending_client = fake_client(&pending_server, "opaque-access-replay-pending")?;
     let pending = replay_remote_operations(&mut journal, &pending_client, &root, &staging)?;
@@ -5266,29 +5155,30 @@ fn remote_delete_skips_backup_download_and_ambiguous_create_stays_pending()
 
 #[test]
 fn link_rejects_unavailable_file_and_restricted_roots() -> Result<(), Box<dyn Error>> {
+    let file_content = dropbox_content_hash(b"root file".as_slice())?;
     assert!(matches!(
-        root_link_failure(FakeResponse::status_json(
-            409,
-            json!({"error": {".tag": "path"}})
-        ))?,
-        DropboxError::RemoteRootUnavailable
+        root_link_failure(FakeResponse::status_json(409, lookup_error("not_found")))?,
+        DropboxError::Sdk {
+            outcome: ApiOutcome::Unavailable,
+            ..
+        }
     ));
     assert!(matches!(
-        root_link_failure(FakeResponse::json(json!({
-            ".tag": "file",
-            "path_lower": "/sync",
-            "path_display": "/Sync"
-        })))?,
+        root_link_failure(FakeResponse::json(file_metadata(
+            "/sync",
+            "/Sync",
+            "root-file-revision",
+            &file_content,
+        )))?,
         DropboxError::RemoteRootNotFolder
     ));
     for restriction in [json!({"no_access": true}), json!({"traverse_only": true})] {
         assert!(matches!(
-            root_link_failure(FakeResponse::json(json!({
-                ".tag": "folder",
-                "path_lower": "/sync",
-                "path_display": "/Sync",
-                "sharing_info": restriction
-            })))?,
+            root_link_failure(FakeResponse::json(restricted_folder_metadata(
+                "/sync",
+                "/Sync",
+                restriction,
+            )))?,
             DropboxError::RemoteRootRestricted
         ));
     }
@@ -5304,10 +5194,7 @@ fn one_file_cursor_delta_updates_a_large_inventory_without_a_full_listing()
     let old_content = dropbox_content_hash(b"old inventory bytes".as_slice())?;
     let new_content = dropbox_content_hash(b"new inventory bytes".as_slice())?;
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [file_metadata(
                 "/bulk/05000.txt",
@@ -5370,31 +5257,23 @@ fn one_file_cursor_delta_updates_a_large_inventory_without_a_full_listing()
 fn cursor_reset_rebuilds_before_one_complete_publication() -> Result<(), Box<dyn Error>> {
     let replacement = dropbox_content_hash(b"replacement".as_slice())?;
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::status_json(
             409,
             json!({"error_summary": "reset/", "error": {".tag": "reset"}}),
         ),
         FakeResponse::json(json!({
-            "entries": [{
-                ".tag": "folder",
-                "path_lower": "/folder",
-                "path_display": "/Folder"
-            }],
+            "entries": [folder_metadata("/folder", "/Folder")],
             "cursor": "fresh-a",
             "has_more": true
         })),
         FakeResponse::json(json!({
-            "entries": [{
-                ".tag": "file",
-                "path_lower": "/new.txt",
-                "path_display": "/New.txt",
-                "rev": "rev-new",
-                "content_hash": replacement.as_str()
-            }],
+            "entries": [file_metadata(
+                "/new.txt",
+                "/New.txt",
+                "rev-new",
+                &replacement,
+            )],
             "cursor": "fresh-b",
             "has_more": false
         })),
@@ -5437,10 +5316,7 @@ fn failed_rebuild_after_cursor_reset_preserves_durable_inventory() -> Result<(),
     let old_content = dropbox_content_hash(b"durable old bytes".as_slice())?;
     let partial_content = dropbox_content_hash(b"uncommitted replacement".as_slice())?;
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::status_json(
             409,
             json!({"error_summary": "reset/", "error": {".tag": "reset"}}),
@@ -5489,24 +5365,15 @@ fn failed_rebuild_after_cursor_reset_preserves_durable_inventory() -> Result<(),
 fn listing_applies_ordered_tree_mutations_across_pages() -> Result<(), Box<dyn Error>> {
     let identity = dropbox_content_hash(b"tree payload".as_slice())?;
     let file = |path_lower: &str, path_display: &str| {
-        json!({
-            ".tag": "file",
-            "path_lower": path_lower,
-            "path_display": path_display,
-            "rev": "tree-revision",
-            "content_hash": identity.as_str()
-        })
+        file_metadata(path_lower, path_display, "tree-revision", &identity)
     };
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [
-                {".tag": "folder", "path_lower": "/node", "path_display": "/Node"},
+                folder_metadata("/node", "/Node"),
                 file("/node/child", "/Node/Child"),
-                {".tag": "folder", "path_lower": "/gone", "path_display": "/Gone"},
+                folder_metadata("/gone", "/Gone"),
                 file("/gone/child", "/Gone/Child"),
                 file("/ancestor", "/Ancestor"),
                 file("/keep/child", "/Keep/Child")
@@ -5517,10 +5384,10 @@ fn listing_applies_ordered_tree_mutations_across_pages() -> Result<(), Box<dyn E
         FakeResponse::json(json!({
             "entries": [
                 file("/node", "/Node"),
-                {".tag": "deleted", "path_lower": "/gone", "path_display": "/Gone"},
+                deleted_metadata("/gone", "/Gone"),
                 file("/ancestor/leaf", "/Ancestor/Leaf"),
-                {".tag": "folder", "path_lower": "/keep", "path_display": "/Keep"},
-                {".tag": "deleted", "path_lower": "/phantom/leaf", "path_display": "/Phantom/Leaf"}
+                folder_metadata("/keep", "/Keep"),
+                deleted_metadata("/phantom/leaf", "/Phantom/Leaf")
             ],
             "cursor": "tree-b",
             "has_more": false
@@ -5567,18 +5434,14 @@ fn listing_applies_ordered_tree_mutations_across_pages() -> Result<(), Box<dyn E
 fn failed_later_page_cannot_publish_partial_listing_as_absence() -> Result<(), Box<dyn Error>> {
     let changed = dropbox_content_hash(b"changed".as_slice())?;
     let server = FakeServer::start(vec![
+        account(),
         FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
-        FakeResponse::json(json!({
-            "entries": [{
-                ".tag": "file",
-                "path_lower": "/old.txt",
-                "path_display": "/Old.txt",
-                "rev": "rev-changed",
-                "content_hash": changed.as_str()
-            }],
+            "entries": [file_metadata(
+                "/old.txt",
+                "/Old.txt",
+                "rev-changed",
+                &changed,
+            )],
             "cursor": "next",
             "has_more": true
         })),
@@ -5617,29 +5480,23 @@ fn incomplete_downloadable_metadata_cannot_replace_durable_inventory() -> Result
 {
     let changed = dropbox_content_hash(b"validated first page".as_slice())?;
     let server = FakeServer::start(vec![
+        account(),
         FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
-        FakeResponse::json(json!({
-            "entries": [{
-                ".tag": "file",
-                "path_lower": "/partial.txt",
-                "path_display": "/Partial.txt",
-                "rev": "rev-partial",
-                "content_hash": changed.as_str()
-            }],
+            "entries": [file_metadata(
+                "/partial.txt",
+                "/Partial.txt",
+                "rev-partial",
+                &changed,
+            )],
             "cursor": "partial",
             "has_more": true
         })),
         FakeResponse::json(json!({
-            "entries": [{
-                ".tag": "file",
-                "path_lower": "/incomplete.txt",
-                "path_display": "/Incomplete.txt",
-                "rev": "rev-incomplete",
-                "is_downloadable": true
-            }],
+            "entries": [incomplete_file_metadata(
+                "/incomplete.txt",
+                "/Incomplete.txt",
+                "rev-incomplete",
+            )],
             "cursor": "new",
             "has_more": false
         })),
@@ -5673,28 +5530,23 @@ fn incomplete_downloadable_metadata_cannot_replace_durable_inventory() -> Result
 fn restricted_later_page_cannot_replace_durable_inventory() -> Result<(), Box<dyn Error>> {
     let identity = dropbox_content_hash(b"partial tree".as_slice())?;
     let server = FakeServer::start(vec![
+        account(),
         FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
-        FakeResponse::json(json!({
-            "entries": [{
-                ".tag": "file",
-                "path_lower": "/partial.txt",
-                "path_display": "/Partial.txt",
-                "rev": "partial-revision",
-                "content_hash": identity.as_str()
-            }],
+            "entries": [file_metadata(
+                "/partial.txt",
+                "/Partial.txt",
+                "partial-revision",
+                &identity,
+            )],
             "cursor": "partial",
             "has_more": true
         })),
         FakeResponse::json(json!({
-            "entries": [{
-                ".tag": "folder",
-                "path_lower": "/restricted",
-                "path_display": "/Restricted",
-                "sharing_info": {"traverse_only": true}
-            }],
+            "entries": [restricted_folder_metadata(
+                "/restricted",
+                "/Restricted",
+                json!({"traverse_only": true}),
+            )],
             "cursor": "restricted",
             "has_more": false
         })),
@@ -5726,10 +5578,7 @@ fn restricted_later_page_cannot_replace_durable_inventory() -> Result<(), Box<dy
 
 #[test]
 fn journal_binding_mismatch_blocks_inventory_before_listing() -> Result<(), Box<dyn Error>> {
-    let server = FakeServer::start(vec![FakeResponse::json(json!({
-        "account_id": "account",
-        "root_info": {"root_namespace_id": "namespace"}
-    }))])?;
+    let server = FakeServer::start(vec![account()])?;
     let client = fake_client(&server, "opaque-access-binding")?;
     let directory = TempDir::new()?;
     let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
@@ -5750,13 +5599,7 @@ fn journal_binding_mismatch_blocks_inventory_before_listing() -> Result<(), Box<
 #[test]
 fn account_validation_is_cached_per_client_but_every_journal_is_checked()
 -> Result<(), Box<dyn Error>> {
-    let account = || {
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        }))
-        .for_path("/2/users/get_current_account")
-    };
+    let account = || account().for_path("/2/users/get_current_account");
     let listing = |cursor: &str, route: &str| {
         FakeResponse::json(json!({
             "entries": [],
@@ -5822,11 +5665,7 @@ fn failed_account_validation_is_retried_by_the_same_client() -> Result<(), Box<d
     let server = FakeServer::start(vec![
         FakeResponse::status_json(500, json!({"error": {".tag": "other"}}))
             .for_path("/2/users/get_current_account"),
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        }))
-        .for_path("/2/users/get_current_account"),
+        account().for_path("/2/users/get_current_account"),
         FakeResponse::json(json!({
             "entries": [],
             "cursor": "cursor",
@@ -5930,10 +5769,7 @@ fn file_beside_a_same_named_directory_still_deletes_on_dropbox() -> Result<(), B
         DropboxRevision::new("rev-sibling"),
     );
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(sibling_listing(&shared, true)),
         FakeResponse::json(json!({
             "metadata": file_metadata(
@@ -5993,10 +5829,7 @@ fn file_beside_a_same_named_directory_still_deletes_locally() -> Result<(), Box<
         DropboxRevision::new("rev-sibling"),
     );
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(sibling_listing(&shared, false)),
     ])?;
     let client = Arc::new(fake_client(&server, "opaque-access-sibling-remote-delete")?);
@@ -6045,10 +5878,7 @@ fn file_beside_a_same_named_directory_still_uploads_a_local_edit() -> Result<(),
         DropboxRevision::new("rev-sibling-upload"),
     );
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(sibling_listing(&shared, true)),
         FakeResponse::json(file_metadata(
             "/report/x",
@@ -6095,7 +5925,6 @@ fn file_beside_a_same_named_directory_still_uploads_a_local_edit() -> Result<(),
         json!({
             "path": "/report/x",
             "mode": {".tag": "update", "update": "rev-sibling"},
-            "autorename": false,
             "strict_conflict": true,
             "content_hash": uploaded.content.as_str()
         })
@@ -6115,10 +5944,7 @@ fn inaccessible_directory_never_deletes_its_dropbox_contents() -> Result<(), Box
     let upload_content = dropbox_content_hash(upload_bytes.as_slice())?;
     let uploaded = RemoteFile::new(upload_content.clone(), DropboxRevision::new("rev-open"));
     let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
+        account(),
         FakeResponse::json(json!({
             "entries": [
                 folder_metadata("/locked", "/locked"),
@@ -6205,22 +6031,56 @@ fn inaccessible_directory_never_deletes_its_dropbox_contents() -> Result<(), Box
 fn fake_client(server: &FakeServer, access_token: &str) -> Result<DropboxClient, Box<dyn Error>> {
     let endpoints = server.endpoints();
     let access_token = fake_access_token(access_token)?;
-    let root = DropboxRoot::new("account", "namespace", "")?;
-    Ok(DropboxClient::with_endpoints(access_token, root, endpoints))
+    let root = DropboxRoot::new("dbid:account", "namespace", "")?;
+    Ok(DropboxClient::with_endpoints(
+        access_token,
+        root,
+        endpoints,
+    )?)
+}
+
+fn account() -> FakeResponse {
+    FakeResponse::json(account_metadata("dbid:account", "namespace"))
+}
+
+fn account_metadata(account_id: &str, namespace_id: &str) -> serde_json::Value {
+    json!({
+        "account_id": account_id,
+        "name": {
+            "given_name": "Fixture",
+            "surname": "Account",
+            "familiar_name": "Fixture",
+            "display_name": "Fixture Account",
+            "abbreviated_name": "FA"
+        },
+        "email": "fixture@example.invalid",
+        "email_verified": true,
+        "disabled": false,
+        "locale": "en",
+        "referral_link": "https://www.dropbox.com/referrals/fixture",
+        "is_paired": false,
+        "account_type": {".tag": "basic"},
+        "root_info": {
+            ".tag": "user",
+            "root_namespace_id": namespace_id,
+            "home_namespace_id": namespace_id
+        }
+    })
 }
 
 fn fake_access_token(value: &str) -> Result<AccessToken, Box<dyn Error>> {
     let token_server = FakeServer::start(vec![FakeResponse::json(json!({
         "access_token": value,
-        "expires_in": 14400
+        "refresh_token": "opaque-refresh",
+        "token_type": "bearer"
     }))])?;
     let token_endpoints = token_server.endpoints();
     let token_oauth = OAuthClient::with_endpoints("app-key", token_endpoints);
-    let refreshed =
-        token_oauth.refresh(&omabox::auth::RefreshToken::from_secret("opaque-refresh"))?;
+    let pending = token_oauth.begin()?;
+    let grant = token_oauth.exchange(pending, "authorization-code")?;
     let requests = token_server.finish()?;
     assert_eq!(requests.len(), 1);
-    Ok(refreshed.access_token)
+    Ok(grant.access_token)
 }
 
 struct UploadFixture {
@@ -6282,9 +6142,14 @@ fn file_metadata(
 ) -> serde_json::Value {
     json!({
         ".tag": "file",
+        "name": metadata_name(path_display),
+        "id": metadata_id(path_lower),
+        "client_modified": "2024-01-02T03:04:05Z",
+        "server_modified": "2024-01-02T03:04:05Z",
         "path_lower": path_lower,
         "path_display": path_display,
         "rev": revision,
+        "size": 0,
         "content_hash": content.as_str(),
         "is_downloadable": true
     })
@@ -6293,22 +6158,181 @@ fn file_metadata(
 fn folder_metadata(path_lower: &str, path_display: &str) -> serde_json::Value {
     json!({
         ".tag": "folder",
+        "name": metadata_name(path_display),
+        "id": metadata_id(path_lower),
         "path_lower": path_lower,
         "path_display": path_display
     })
 }
 
-fn download_metadata(path: &str, revision: &str, content: &ContentIdentity, size: usize) -> String {
+fn unsupported_file_metadata(
+    path_lower: &str,
+    path_display: &str,
+    revision: &str,
+) -> serde_json::Value {
     json!({
         ".tag": "file",
-        "name": path,
-        "path_lower": format!("/{path}"),
+        "name": metadata_name(path_display),
+        "id": metadata_id(path_lower),
+        "client_modified": "2024-01-02T03:04:05Z",
+        "server_modified": "2024-01-02T03:04:05Z",
+        "path_lower": path_lower,
+        "path_display": path_display,
+        "rev": revision,
+        "size": 0,
+        "is_downloadable": false,
+        "export_info": {"export_as": "html"}
+    })
+}
+
+fn incomplete_file_metadata(
+    path_lower: &str,
+    path_display: &str,
+    revision: &str,
+) -> serde_json::Value {
+    json!({
+        ".tag": "file",
+        "name": metadata_name(path_display),
+        "id": metadata_id(path_lower),
+        "client_modified": "2024-01-02T03:04:05Z",
+        "server_modified": "2024-01-02T03:04:05Z",
+        "path_lower": path_lower,
+        "path_display": path_display,
+        "rev": revision,
+        "size": 0,
+        "is_downloadable": true
+    })
+}
+
+fn restricted_folder_metadata(
+    path_lower: &str,
+    path_display: &str,
+    mut sharing_info: serde_json::Value,
+) -> serde_json::Value {
+    if let serde_json::Value::Object(fields) = &mut sharing_info {
+        fields.insert(String::from("read_only"), serde_json::Value::Bool(false));
+    }
+    let mut metadata = folder_metadata(path_lower, path_display);
+    if let serde_json::Value::Object(fields) = &mut metadata {
+        fields.insert(String::from("sharing_info"), sharing_info);
+    }
+    metadata
+}
+
+fn deleted_metadata(path_lower: &str, path_display: &str) -> serde_json::Value {
+    json!({
+        ".tag": "deleted",
+        "name": metadata_name(path_display),
+        "path_lower": path_lower,
+        "path_display": path_display
+    })
+}
+
+fn download_metadata(
+    path: &str,
+    revision: &str,
+    content: &ContentIdentity,
+    size: usize,
+) -> serde_json::Value {
+    json!({
+        ".tag": "file",
+        "name": metadata_name(path),
+        "id": metadata_id(&format!("/{path}")),
+        "client_modified": "2024-01-02T03:04:05Z",
+        "server_modified": "2024-01-02T03:04:05Z",
+        "path_lower": format!("/{}", path.to_ascii_lowercase()),
         "path_display": format!("/{path}"),
         "rev": revision,
         "content_hash": content.as_str(),
-        "size": size
+        "size": size,
+        "is_downloadable": true
     })
-    .to_string()
+}
+
+fn metadata_name(path_display: &str) -> &str {
+    path_display
+        .rsplit('/')
+        .find(|component| !component.is_empty())
+        .map_or(path_display, |component| component)
+}
+
+fn metadata_id(path_lower: &str) -> String {
+    format!("id:fixture{}", path_lower.replace('/', "_"))
+}
+
+fn lookup_error(reason: &str) -> serde_json::Value {
+    json!({
+        "error_summary": format!("path/{reason}/..."),
+        "error": {
+            ".tag": "path",
+            "path": {".tag": reason}
+        }
+    })
+}
+
+fn rate_limit_error(retry_after: u64) -> serde_json::Value {
+    json!({
+        "error_summary": "too_many_requests/...",
+        "error": {
+            "reason": {".tag": "too_many_requests"},
+            "retry_after": retry_after
+        }
+    })
+}
+
+fn authentication_error(reason: &str) -> serde_json::Value {
+    json!({
+        "error_summary": format!("{reason}/..."),
+        "error": {".tag": reason}
+    })
+}
+
+fn error_chain_contains_server_error(error: &DropboxError) -> bool {
+    let mut current: Option<&(dyn Error + 'static)> = Some(error);
+    while let Some(error) = current {
+        if matches!(
+            error.downcast_ref::<DropboxError>().or_else(|| error.downcast_ref::<Box<DropboxError>>().map(Box::as_ref)),
+            Some(DropboxError::Sdk { source, .. })
+                if matches!(source.as_ref(), SdkError::ServerError(_))
+        ) {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+fn write_conflict_file() -> serde_json::Value {
+    json!({
+        ".tag": "conflict",
+        "conflict": {".tag": "file"}
+    })
+}
+
+fn upload_error(reason: serde_json::Value) -> serde_json::Value {
+    let summary = match reason.get(".tag").and_then(serde_json::Value::as_str) {
+        Some("conflict") => "path/conflict/file/...",
+        Some("disallowed_name") => "path/disallowed_name/...",
+        _ => "path/other/...",
+    };
+    json!({
+        "error_summary": summary,
+        "error": {
+            ".tag": "path",
+            "reason": reason,
+            "upload_session_id": "fixture-session"
+        }
+    })
+}
+
+fn delete_write_error(reason: serde_json::Value) -> serde_json::Value {
+    json!({
+        "error_summary": "path_write/conflict/file/...",
+        "error": {
+            ".tag": "path_write",
+            "path_write": reason
+        }
+    })
 }
 
 fn planned_operations(decision: Decision) -> Result<OperationPlan, io::Error> {
@@ -6370,16 +6394,10 @@ fn conflict_bytes(root: &Path) -> Result<Vec<Vec<u8>>, io::Error> {
 }
 
 fn root_link_failure(response: FakeResponse) -> Result<DropboxError, Box<dyn Error>> {
-    let server = FakeServer::start(vec![
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
-        response,
-    ])?;
+    let server = FakeServer::start(vec![account(), response])?;
     let outcome = DropboxClient::link_with_endpoints(
         fake_access_token("opaque-link-access")?,
-        "account",
+        "dbid:account",
         "/Sync",
         server.endpoints(),
     );
@@ -6493,13 +6511,112 @@ impl FakeServer {
 
 struct FakeResponse {
     status: u16,
-    body: Vec<u8>,
-    headers: Vec<(String, String)>,
+    body: FakeResponseBody,
+    headers: Vec<(String, FakeHeaderValue)>,
     request_path: Option<String>,
     request_header: Option<(String, String)>,
     disconnect_after: Option<usize>,
     send_content_length: bool,
     gate: Option<ResponseGate>,
+}
+
+enum FakeResponseBody {
+    Bytes(Vec<u8>),
+    Json(serde_json::Value),
+}
+
+impl FakeResponseBody {
+    fn encode(&self) -> Result<Vec<u8>, serde_json::Error> {
+        match self {
+            Self::Bytes(bytes) => Ok(bytes.clone()),
+            Self::Json(value) => serde_json::to_vec(&TagFirst(value)),
+        }
+    }
+}
+
+enum FakeHeaderValue {
+    Text(String),
+    Json(serde_json::Value),
+}
+
+impl FakeHeaderValue {
+    fn encode(&self) -> Result<String, serde_json::Error> {
+        match self {
+            Self::Text(text) => Ok(text.clone()),
+            Self::Json(value) => serde_json::to_string(&TagFirst(value)),
+        }
+    }
+}
+
+trait IntoFakeHeaderValue {
+    fn into_fake_header_value(self) -> FakeHeaderValue;
+}
+
+impl IntoFakeHeaderValue for String {
+    fn into_fake_header_value(self) -> FakeHeaderValue {
+        FakeHeaderValue::Text(self)
+    }
+}
+
+impl IntoFakeHeaderValue for &str {
+    fn into_fake_header_value(self) -> FakeHeaderValue {
+        FakeHeaderValue::Text(String::from(self))
+    }
+}
+
+impl IntoFakeHeaderValue for serde_json::Value {
+    fn into_fake_header_value(self) -> FakeHeaderValue {
+        FakeHeaderValue::Json(self)
+    }
+}
+
+struct TagFirst<'a>(&'a serde_json::Value);
+
+impl serde::Serialize for TagFirst<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self.0 {
+            serde_json::Value::Null => serializer.serialize_unit(),
+            serde_json::Value::Bool(value) => serializer.serialize_bool(*value),
+            serde_json::Value::Number(value) => serde::Serialize::serialize(value, serializer),
+            serde_json::Value::String(value) => serializer.serialize_str(value),
+            serde_json::Value::Array(values) => {
+                let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    sequence.serialize_element(&TagFirst(value))?;
+                }
+                sequence.end()
+            }
+            serde_json::Value::Object(values) => {
+                let mut map = serializer.serialize_map(Some(values.len()))?;
+                if let Some(tag) = values.get(".tag") {
+                    map.serialize_entry(".tag", &TagFirst(tag))?;
+                }
+                for (key, value) in values {
+                    if key != ".tag" {
+                        map.serialize_entry(key, &TagFirst(value))?;
+                    }
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+#[test]
+fn fake_json_serialization_emits_every_tag_first() -> Result<(), Box<dyn Error>> {
+    let encoded = serde_json::to_string(&TagFirst(&json!({
+        "z": true,
+        ".tag": "outer",
+        "child": {"value": 1, ".tag": "inner"}
+    })))?;
+    assert_eq!(
+        encoded,
+        r#"{".tag":"outer","child":{".tag":"inner","value":1},"z":true}"#
+    );
+    Ok(())
 }
 
 struct ResponseGate {
@@ -6520,10 +6637,10 @@ impl FakeResponse {
     fn status_json(status: u16, value: serde_json::Value) -> Self {
         Self {
             status,
-            body: value.to_string().into_bytes(),
+            body: FakeResponseBody::Json(value),
             headers: vec![(
                 String::from("Content-Type"),
-                String::from("application/json"),
+                FakeHeaderValue::Text(String::from("application/json")),
             )],
             request_path: None,
             request_header: None,
@@ -6536,10 +6653,10 @@ impl FakeResponse {
     fn bytes(body: Vec<u8>) -> Self {
         Self {
             status: 200,
-            body,
+            body: FakeResponseBody::Bytes(body),
             headers: vec![(
                 String::from("Content-Type"),
-                String::from("application/octet-stream"),
+                FakeHeaderValue::Text(String::from("application/octet-stream")),
             )],
             request_path: None,
             request_header: None,
@@ -6549,13 +6666,19 @@ impl FakeResponse {
         }
     }
 
-    fn range(body: Vec<u8>, metadata: String, content_range: String) -> Self {
+    fn range(body: Vec<u8>, metadata: serde_json::Value, content_range: String) -> Self {
         Self {
             status: 206,
-            body,
+            body: FakeResponseBody::Bytes(body),
             headers: vec![
-                (String::from("Dropbox-API-Result"), metadata),
-                (String::from("Content-Range"), content_range),
+                (
+                    String::from("Dropbox-API-Result"),
+                    FakeHeaderValue::Json(metadata),
+                ),
+                (
+                    String::from("Content-Range"),
+                    FakeHeaderValue::Text(content_range),
+                ),
             ],
             request_path: None,
             request_header: None,
@@ -6565,8 +6688,9 @@ impl FakeResponse {
         }
     }
 
-    fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.headers.push((name.into(), value.into()));
+    fn header(mut self, name: impl Into<String>, value: impl IntoFakeHeaderValue) -> Self {
+        self.headers
+            .push((name.into(), value.into_fake_header_value()));
         self
     }
 
@@ -6798,6 +6922,12 @@ fn read_request(stream: &mut TcpStream) -> io::Result<FakeRequest> {
 }
 
 fn write_response(stream: &mut TcpStream, response: FakeResponse, close: bool) -> io::Result<()> {
+    let body = response.body.encode().map_err(io::Error::other)?;
+    let headers = response
+        .headers
+        .iter()
+        .map(|(name, value)| Ok((name, value.encode().map_err(io::Error::other)?)))
+        .collect::<io::Result<Vec<_>>>()?;
     let reason = if response.status == 200 {
         "OK"
     } else {
@@ -6805,19 +6935,161 @@ fn write_response(stream: &mut TcpStream, response: FakeResponse, close: bool) -
     };
     write!(stream, "HTTP/1.1 {} {}\r\n", response.status, reason)?;
     if response.send_content_length {
-        write!(stream, "Content-Length: {}\r\n", response.body.len())?;
+        write!(stream, "Content-Length: {}\r\n", body.len())?;
     }
     if close {
         stream.write_all(b"Connection: close\r\n")?;
     } else {
         stream.write_all(b"Connection: keep-alive\r\n")?;
     }
-    for (name, value) in response.headers {
+    for (name, value) in headers {
         write!(stream, "{name}: {value}\r\n")?;
     }
     stream.write_all(b"\r\n")?;
     let sent = response
         .disconnect_after
-        .map_or(response.body.len(), |limit| limit.min(response.body.len()));
-    stream.write_all(&response.body[..sent])
+        .map_or(body.len(), |limit| limit.min(body.len()));
+    stream.write_all(&body[..sent])
+}
+
+#[test]
+fn unsatisfiable_resume_restarts_only_the_owned_partial() -> Result<(), Box<dyn Error>> {
+    const CHECKPOINT: usize = 64 * 1024 * 1024;
+    const DROPBOX_BLOCK: usize = 4 * 1024 * 1024;
+
+    let bytes = vec![b'x'; CHECKPOINT + DROPBOX_BLOCK + 257];
+    let content = dropbox_content_hash(bytes.as_slice())?;
+    let remote = RemoteFile::new(content.clone(), DropboxRevision::new("resume-revision"));
+    let metadata = download_metadata(
+        "resume.bin",
+        remote.revision.as_str(),
+        &content,
+        bytes.len(),
+    );
+    let responses = vec![
+        FakeResponse::bytes(bytes.clone())
+            .header("Dropbox-API-Result", metadata.clone())
+            .disconnect_after(CHECKPOINT + DROPBOX_BLOCK + 17),
+        FakeResponse::status_json(416, json!({})).header("Content-Range", "bytes */1"),
+        FakeResponse::bytes(bytes.clone()).header("Dropbox-API-Result", metadata),
+    ];
+    let server = FakeServer::start(responses)?;
+    let client = Arc::new(fake_client(&server, "opaque-access-resume")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    let operation_plan = planned_operations(plan(
+        &Baseline::Absent,
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(remote.clone()),
+    ))?;
+    if !matches!(
+        journal.record_plan(Path::new("resume.bin"), &operation_plan)?,
+        PlanWrite::Recorded(_)
+    ) {
+        return Err(io::Error::other("fresh resume plan was already pending").into());
+    }
+
+    assert!(matches!(
+        drive_replay(&mut journal, &client, &mut downloads, &root, &staging)?,
+        Err(ReconcileError::RemoteDownload {
+            source: DropboxError::DownloadBody { .. },
+            ..
+        })
+    ));
+    let partial = std::fs::read_dir(&staging)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".omabox-download-slot-"))
+        })
+        .ok_or_else(|| io::Error::other("interrupted download did not retain its slot"))?;
+    assert_eq!(
+        std::fs::metadata(&partial)?.len(),
+        u64::try_from(CHECKPOINT + DROPBOX_BLOCK)?
+    );
+    let report = drive_replay(&mut journal, &client, &mut downloads, &root, &staging)??;
+    assert_eq!(report.completed_operations, 1);
+    assert_eq!(std::fs::read(root.join("resume.bin"))?, bytes);
+    assert!(journal.pending_plans()?.is_empty());
+
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 3);
+    for (index, request) in requests.iter().enumerate() {
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(required_header(
+                request,
+                "dropbox-api-arg",
+            )?)?,
+            json!({"path": "rev:resume-revision", "rev": "resume-revision"})
+        );
+        if index != 1 {
+            assert!(header(request, "range").is_none());
+        } else {
+            assert_eq!(header(request, "range"), Some("bytes=67108864-"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn sdk_expiry_refresh_reissues_the_route_with_the_same_client() -> Result<(), Box<dyn Error>> {
+    let server = FakeServer::start(vec![
+        FakeResponse::json(json!({"access_token": "access-initial"})),
+        account(),
+        FakeResponse::status_json(401, authentication_error("expired_access_token")),
+        FakeResponse::json(json!({"access_token": "access-renewed"})),
+        FakeResponse::json(json!({"entries": [], "cursor": "renewed-cursor", "has_more": false})),
+        FakeResponse::json(json!({"changes": false})),
+    ])?;
+    let root = DropboxRoot::new("dbid:account", "namespace", "")?;
+    let client = DropboxClient::from_credentials_with_endpoints(
+        "app-key",
+        StoredCredential {
+            binding: DropboxBinding {
+                account_id: "dbid:account".into(),
+                root_namespace_id: "namespace".into(),
+                remote_root: String::new(),
+            },
+            refresh_token: RefreshToken::from_secret("refresh-fixture"),
+        },
+        root,
+        server.endpoints(),
+    )?;
+    let state = TempDir::new()?;
+    let mut journal = Journal::open(state.path().join("journal.sqlite3"))?;
+    assert_eq!(
+        client.refresh_inventory(&mut journal)?,
+        InventoryRefresh::Published
+    );
+    assert!(matches!(
+        client.long_poll("renewed-cursor", Duration::from_secs(30))?,
+        LongPollWakeup::TimedOut { .. }
+    ));
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 6);
+    assert_eq!(requests[0].path, "/oauth2/token");
+    assert_eq!(requests[3].path, "/oauth2/token");
+    assert_eq!(
+        header(&requests[2], "authorization"),
+        Some("Bearer access-initial")
+    );
+    assert_eq!(
+        header(&requests[4], "authorization"),
+        Some("Bearer access-renewed")
+    );
+    for index in [0, 3, 5] {
+        assert!(header(&requests[index], "authorization").is_none());
+        assert!(header(&requests[index], "dropbox-api-path-root").is_none());
+    }
+    Ok(())
 }

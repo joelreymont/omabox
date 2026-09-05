@@ -481,6 +481,21 @@ struct DownloadSlotState {
 }
 
 impl DownloadPartial {
+    /// Restart only the slot still bound to this partial and operation.
+    pub(crate) fn restart(mut self) -> Result<DownloadPreparation, LocalError> {
+        let Some(file) = reset_download_slot(&self.file, &self.location)? else {
+            return Ok(DownloadPreparation::Complete(
+                StageOutcome::DestinationOccupied {
+                    path: self.location.source.path().to_path_buf(),
+                },
+            ));
+        };
+        self.file = file;
+        self.aggregate = Sha256::new();
+        self.offset = 0;
+        Ok(DownloadPreparation::Ready(Box::new(self)))
+    }
+
     pub(crate) fn offset(&self) -> u64 {
         self.offset
     }

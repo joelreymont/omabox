@@ -1327,6 +1327,8 @@ mod tests {
         validate_daemon_with(&daemon, &mut |delay| {
             waits.push(delay);
             drop(writer.take());
+            // Match production: concurrent fork/exec children may briefly retain the descriptor.
+            std::thread::sleep(delay);
         })?;
 
         assert!(!waits.is_empty());

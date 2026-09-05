@@ -9,11 +9,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::transport::{Bases, Outcome as TransportOutcome, TokenState, Transport, TransportError};
+use dropbox_sdk::client_trait::{HttpClient, HttpRequestResult};
+use dropbox_sdk::sync_routes::{files, users};
+use dropbox_sdk::types::{
+    auth::AuthError as SdkAuthError,
+    common::{PathRoot, RootInfo},
+};
+use dropbox_sdk::{Error as SdkError, NoError};
 use rustix::fd::OwnedFd;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::auth::AccessToken;
+use crate::auth::{AccessToken, RefreshTokenStore, StoredCredential};
 use crate::journal::{
     DropboxBinding, DropboxBindingWrite, Journal, JournalError, RemoteInventoryChange,
     RemoteObservationRecord,
@@ -31,30 +38,14 @@ use crate::runtime_status::{TransferDirection, TransferEvent, TransferObserver, 
 
 const LONG_POLL_MINIMUM_SECONDS: u64 = 30;
 const LONG_POLL_MAXIMUM_SECONDS: u64 = 480;
-const JSON_REQUEST_SECONDS: u64 = 60;
-const CONNECT_SECONDS: u64 = 15;
-const DOWNLOAD_SECONDS: u64 = 60 * 60;
-const LONG_POLL_GRACE_SECONDS: u64 = 105;
-const DIRECT_UPLOAD_MAX_BYTES: u64 = 150 * 1024 * 1024;
 const UPLOAD_SESSION_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
-const UPLOAD_SESSION_MAX_BYTES: u64 = (1_u64 << 41) - (1_u64 << 22);
+const UPLOAD_SESSION_MAX_BYTES: u64 = 350_000_000_000;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 pub(crate) struct DownloadAccess<'a> {
     pub(crate) lease: Option<&'a DownloadSlotLease>,
     pub(crate) staging_directory: Option<&'a Path>,
     pub(crate) root_access: &'a Arc<SyncRootAccess>,
-}
-
-fn exact_download_agent() -> ureq::Agent {
-    let config = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_connect(Some(Duration::from_secs(CONNECT_SECONDS)))
-        .timeout_recv_body(Some(Duration::from_secs(DOWNLOAD_SECONDS)))
-        .max_idle_connections(4)
-        .max_idle_connections_per_host(4)
-        .build();
-    ureq::Agent::new_with_config(config)
 }
 
 struct ProgressReader<'a, R> {
@@ -111,6 +102,11 @@ impl<'a, R> ProgressReader<'a, R> {
             )));
         }
         self.last_emitted = self.done;
+    }
+
+    fn complete(&mut self, done: u64) {
+        self.done = done;
+        self.emit();
     }
 
     fn done(&self) -> u64 {
@@ -206,24 +202,15 @@ impl DropboxEndpoints {
         }
     }
 
-    pub(crate) fn authorize(&self) -> &str {
-        &self.authorize
-    }
-
-    pub(crate) fn token(&self) -> &str {
-        &self.token
-    }
-
-    fn api(&self, route: &str) -> String {
-        format!("{}{route}", self.api.trim_end_matches('/'))
-    }
-
-    fn content(&self, route: &str) -> String {
-        format!("{}{route}", self.content.trim_end_matches('/'))
-    }
-
-    fn notify(&self, route: &str) -> String {
-        format!("{}{route}", self.notify.trim_end_matches('/'))
+    pub(crate) fn bases(&self) -> Bases {
+        Bases::new(
+            format!("{}/", self.api.trim_end_matches('/')),
+            format!("{}/", self.content.trim_end_matches('/')),
+            format!("{}/", self.notify.trim_end_matches('/')),
+            self.token
+                .strip_suffix("oauth2/token")
+                .map_or(self.token.as_str(), |base| base),
+        )
     }
 }
 
@@ -366,6 +353,9 @@ pub enum MutationRejection {
     /// The local path cannot be represented by Dropbox's UTF-8 path API.
     #[error("the local path is not a valid Dropbox UTF-8 path")]
     InvalidPath,
+    /// The file exceeds the supported upload limit.
+    #[error("the file exceeds Dropbox’s supported upload size")]
+    UnsupportedFileSize,
     /// Dropbox does not permit this file or folder name.
     #[error("Dropbox does not permit this file or folder name")]
     DisallowedName,
@@ -388,43 +378,139 @@ pub enum MutationRejection {
 
 /// Direct blocking client for Dropbox endpoints.
 pub struct DropboxClient {
-    access_token: AccessToken,
     root: DropboxRoot,
-    endpoints: DropboxEndpoints,
-    agent: ureq::Agent,
-    download_agent: ureq::Agent,
+    transport: Transport,
     transfer_observer: Option<TransferObserver>,
     account_validated: AtomicBool,
 }
 
 impl DropboxClient {
     /// Construct a client using Dropbox's production endpoints.
-    #[must_use]
-    pub fn new(access_token: AccessToken, root: DropboxRoot) -> Self {
+    pub fn new(access_token: AccessToken, root: DropboxRoot) -> Result<Self, DropboxError> {
         Self::with_endpoints(access_token, root, DropboxEndpoints::production())
     }
 
-    /// Construct a client with explicit endpoints for a local protocol server.
-    #[must_use]
+    /// Construct a client with explicit protocol-test endpoints.
     pub fn with_endpoints(
         access_token: AccessToken,
         root: DropboxRoot,
         endpoints: DropboxEndpoints,
-    ) -> Self {
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(JSON_REQUEST_SECONDS)))
-            .timeout_connect(Some(Duration::from_secs(CONNECT_SECONDS)))
-            .build();
-        Self {
-            access_token,
+    ) -> Result<Self, DropboxError> {
+        let transport = Transport::with_access_token(
+            endpoints.bases(),
+            &PathRoot::Root(root.namespace_id.clone()),
+            &access_token,
+        )
+        .map_err(DropboxError::transport)?;
+        Ok(Self {
             root,
-            endpoints,
-            agent: ureq::Agent::new_with_config(config),
-            download_agent: exact_download_agent(),
+            transport,
             transfer_observer: None,
             account_validated: AtomicBool::new(false),
+        })
+    }
+
+    /// Retain refresh and connection ownership for the lifetime of the daemon session.
+    pub fn from_credentials(
+        app_key: &str,
+        credential: StoredCredential,
+        root: DropboxRoot,
+    ) -> Result<Self, DropboxError> {
+        Self::from_credentials_with_endpoints(
+            app_key,
+            credential,
+            root,
+            DropboxEndpoints::production(),
+        )
+    }
+
+    /// Construct retained credentials against a protocol-test server.
+    pub fn from_credentials_with_endpoints(
+        app_key: &str,
+        credential: StoredCredential,
+        root: DropboxRoot,
+        endpoints: DropboxEndpoints,
+    ) -> Result<Self, DropboxError> {
+        if credential.binding != root.binding() {
+            return Err(DropboxError::AccountBindingChanged);
         }
+        let tokens = Arc::new(
+            TokenState::new(
+                app_key.to_owned(),
+                &credential.refresh_token,
+                credential.binding,
+                Arc::new(RefreshTokenStore::new()),
+            )
+            .map_err(DropboxError::transport)?,
+        );
+        let transport = Transport::new(
+            endpoints.bases(),
+            &PathRoot::Root(root.namespace_id.clone()),
+            tokens,
+        )
+        .map_err(DropboxError::transport)?;
+        Ok(Self {
+            root,
+            transport,
+            transfer_observer: None,
+            account_validated: AtomicBool::new(false),
+        })
+    }
+
+    fn call<T, E: std::error::Error + Send + Sync + 'static>(
+        &self,
+        mut request: impl FnMut() -> Result<T, SdkError<E>>,
+    ) -> Result<T, SdkError<E>> {
+        self.transport
+            .retry_persistence()
+            .map_err(|e| SdkError::HttpClient(Box::new(e)))?;
+        let token = self.transport.token();
+        let result = request();
+        if matches!(
+            &result,
+            Err(SdkError::Authentication(SdkAuthError::InvalidAccessToken))
+        ) {
+            if self.transport.tokens().refreshed() {
+                self.transport
+                    .tokens()
+                    .reject(crate::transport::RejectCause::InvalidAccessToken);
+                return result;
+            }
+            let rejected = match token {
+                Some(token) => token,
+                None => Arc::new(String::new()),
+            };
+            if self
+                .transport
+                .refresh_access(rejected)
+                .map_err(|e| SdkError::HttpClient(Box::new(e)))?
+            {
+                let retried = request();
+                if matches!(
+                    &retried,
+                    Err(SdkError::Authentication(SdkAuthError::InvalidAccessToken))
+                ) {
+                    self.transport
+                        .tokens()
+                        .reject(crate::transport::RejectCause::InvalidAccessToken);
+                }
+                return retried;
+            }
+        }
+        result
+    }
+
+    /// Bind a new authorization using the generated account lookup.
+    pub fn link_authorized(
+        access_token: AccessToken,
+        remote_root: impl Into<String>,
+    ) -> Result<DropboxLink, DropboxError> {
+        Self::link_inner(
+            access_token,
+            None,
+            remote_root.into(),
+            DropboxEndpoints::production(),
+        )
     }
 
     /// Publish throttled samples while blocking file transfers are active.
@@ -455,14 +541,35 @@ impl DropboxClient {
         remote_root: impl Into<String>,
         endpoints: DropboxEndpoints,
     ) -> Result<DropboxLink, DropboxError> {
-        let authorized_account_id = authorized_account_id.into();
-        let root = DropboxRoot::new(&authorized_account_id, "", remote_root)?;
-        let mut client = Self::with_endpoints(access_token, root, endpoints);
-        let account = client.current_account()?;
-        if account.account_id != authorized_account_id {
+        Self::link_inner(
+            access_token,
+            Some(authorized_account_id.into()),
+            remote_root.into(),
+            endpoints,
+        )
+    }
+
+    fn link_inner(
+        access_token: AccessToken,
+        expected_account: Option<String>,
+        remote_root: String,
+        endpoints: DropboxEndpoints,
+    ) -> Result<DropboxLink, DropboxError> {
+        // Home is an explicit preactivation mode; no empty namespace is activated.
+        let transport =
+            Transport::with_access_token(endpoints.bases(), &PathRoot::Home, &access_token)
+                .map_err(DropboxError::transport)?;
+        let account = users::get_current_account(&transport.account())
+            .map_err(|e| DropboxError::sdk("inspect authorized Dropbox account", e))?;
+        if expected_account
+            .as_ref()
+            .is_some_and(|id| id != &account.account_id)
+        {
             return Ok(DropboxLink::AccountChanged);
         }
-        client.root.namespace_id = account.root_info.root_namespace_id;
+        let namespace = namespace_id(&account.root_info)?;
+        let root = DropboxRoot::new(account.account_id, namespace, remote_root)?;
+        let client = Self::with_endpoints(access_token, root, endpoints)?;
         client.validate_remote_root()?;
         client.account_validated.store(true, Ordering::Relaxed);
         Ok(DropboxLink::Linked(Box::new(client)))
@@ -484,7 +591,7 @@ impl DropboxClient {
             if response.account_id != self.root.account_id {
                 return Ok(AccountValidation::AccountChanged);
             }
-            if response.root_info.root_namespace_id != self.root.namespace_id {
+            if namespace_id(&response.root_info)? != self.root.namespace_id {
                 return Ok(AccountValidation::RootChanged);
             }
             self.validate_remote_root()?;
@@ -553,51 +660,14 @@ impl DropboxClient {
         if !(LONG_POLL_MINIMUM_SECONDS..=LONG_POLL_MAXIMUM_SECONDS).contains(&seconds) {
             return Err(DropboxError::InvalidLongPollTimeout);
         }
-        let url = self.endpoints.notify("/files/list_folder/longpoll");
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(
-                timeout.saturating_add(Duration::from_secs(LONG_POLL_GRACE_SECONDS)),
-            ))
-            .timeout_connect(Some(Duration::from_secs(CONNECT_SECONDS)))
-            .build();
-        let mut response = ureq::Agent::new_with_config(config)
-            .post(&url)
-            .send_json(LongPollRequest {
-                cursor,
-                timeout: seconds,
-            })
-            .map_err(|source| DropboxError::Transport {
-                operation: "wait for Dropbox changes",
-                source,
-            })?;
-        let status = response.status().as_u16();
-        if status == 409 {
-            let error: TaggedError =
-                response
-                    .body_mut()
-                    .read_json()
-                    .map_err(|source| DropboxError::Response {
-                        operation: "decode Dropbox long-poll error",
-                        source,
-                    })?;
-            if error.error.tag == "reset" {
+        let argument = files::ListFolderLongpollArg::new(cursor.to_owned()).with_timeout(seconds);
+        let payload = match files::list_folder_longpoll(&self.transport.noauth(), &argument) {
+            Ok(payload) => payload,
+            Err(SdkError::Api(files::ListFolderLongpollError::Reset)) => {
                 return Ok(LongPollWakeup::CursorReset);
             }
-        }
-        require_success(
-            status,
-            response.headers().get("Retry-After"),
-            "wait for Dropbox changes",
-        )?;
-        let payload: LongPollResponse =
-            response
-                .body_mut()
-                .read_json()
-                .map_err(|source| DropboxError::Response {
-                    operation: "decode Dropbox long-poll response",
-                    source,
-                })?;
+            Err(error) => return Err(DropboxError::sdk("wait for Dropbox changes", error)),
+        };
         let backoff = payload.backoff.map(Duration::from_secs);
         Ok(if payload.changes {
             LongPollWakeup::Changes { backoff }
@@ -724,62 +794,61 @@ impl DropboxClient {
         {
             return Ok(outcome);
         }
-        let offset = partial.as_ref().map_or(0, |partial| partial.offset());
-        let argument = serde_json::to_string(&DownloadRequest {
-            path: format!("rev:{}", remote.revision.as_str()),
-        })
-        .map_err(|source| DropboxError::Json {
-            operation: "encode exact-revision download request",
-            source,
-        })?;
-        let authorization = format!("Bearer {}", self.access_token.expose());
-        let path_root = self.path_root_header()?;
-        let url = self.endpoints.content("/files/download");
-        let request = self
-            .download_agent
-            .post(&url)
-            .header("Authorization", &authorization)
-            .header("Dropbox-API-Path-Root", &path_root)
-            .header("Dropbox-API-Arg", &argument);
-        let range = format!("bytes={offset}-");
-        let request = if offset == 0 {
-            request
-        } else {
-            request.header("Range", &range)
+        let mut offset = partial.as_ref().map_or(0, |partial| partial.offset());
+        let path = format!("rev:{}", remote.revision.as_str());
+        #[allow(deprecated)] // Explicit revision pin is part of the download contract.
+        let argument = files::DownloadArg::new(path).with_rev(remote.revision.as_str().to_owned());
+        let response = match self.call(|| {
+            files::download(
+                &self.transport,
+                &argument,
+                (offset != 0).then_some(offset),
+                None,
+            )
+        }) {
+            Ok(response) => response,
+            Err(error)
+                if offset != 0
+                    && matches!(
+                        error.downcast_ref_inner::<TransportError>(),
+                        Some(TransportError::RangeUnsatisfiable { .. })
+                    ) =>
+            {
+                let length = match error.downcast_ref_inner::<TransportError>() {
+                    Some(TransportError::RangeUnsatisfiable { length }) => *length,
+                    _ => None,
+                };
+                if let Some(retained) = partial.take() {
+                    if length == Some(offset) {
+                        // Completion remains gated by the full expected Dropbox hash.
+                        return retained
+                            .append(offset, &mut io::empty())
+                            .map_err(download_stage_error);
+                    }
+                    match retained
+                        .restart()
+                        .map_err(|source| DropboxError::LocalStage { source })?
+                    {
+                        DownloadPreparation::Ready(restarted) => partial = Some(restarted),
+                        DownloadPreparation::Complete(outcome) => return Ok(outcome),
+                        DownloadPreparation::Ephemeral => {}
+                    }
+                }
+                offset = 0;
+                self.call(|| files::download(&self.transport, &argument, None, None))
+                    .map_err(|e| DropboxError::sdk("restart exact Dropbox download", e))?
+            }
+            Err(error) => return Err(DropboxError::sdk("download exact Dropbox revision", error)),
         };
-        let response = request
-            .send_empty()
-            .map_err(|source| DropboxError::Transport {
-                operation: "download exact Dropbox revision",
-                source,
-            })?;
-        let status = response.status().as_u16();
-        require_success(
-            status,
-            response.headers().get("Retry-After"),
-            "download exact Dropbox revision",
-        )?;
-        if (offset == 0 && status != 200) || (offset != 0 && status != 206) {
-            return Err(DropboxError::InvalidDownloadRange);
-        }
-        let metadata_header = response
-            .headers()
-            .get("Dropbox-API-Result")
-            .ok_or(DropboxError::MissingDownloadMetadata)?
-            .to_str()
-            .map_err(|source| DropboxError::Header {
-                operation: "decode Dropbox download metadata header",
-                source,
-            })?;
-        let metadata: DownloadMetadata =
-            serde_json::from_str(metadata_header).map_err(|source| DropboxError::Json {
-                operation: "decode Dropbox download metadata",
-                source,
-            })?;
+        let HttpRequestResult {
+            result: metadata,
+            content_length,
+            body,
+        } = response;
         if metadata.rev != remote.revision.as_str() {
             return Err(DropboxError::DownloadedRevisionChanged);
         }
-        if metadata.content_hash != remote.content.as_str() {
+        if metadata.content_hash.as_deref() != Some(remote.content.as_str()) {
             return Err(DropboxError::DownloadedIdentityChanged);
         }
         if offset > metadata.size {
@@ -789,30 +858,12 @@ impl DropboxClient {
             .size
             .checked_sub(offset)
             .ok_or(DropboxError::DownloadedSizeChanged)?;
-        if offset != 0 {
-            let content_range = response
-                .headers()
-                .get("Content-Range")
-                .ok_or(DropboxError::InvalidDownloadRange)?
-                .to_str()
-                .map_err(|source| DropboxError::Header {
-                    operation: "decode Dropbox download range header",
-                    source,
-                })?;
-            validate_content_range(content_range, offset, metadata.size)?;
+        if content_length.is_some_and(|length| length != remaining) {
+            return Err(DropboxError::DownloadedLengthChanged);
         }
-        if let Some(length) = response.headers().get("Content-Length") {
-            let length = length
-                .to_str()
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok());
-            if length != Some(remaining) {
-                return Err(DropboxError::DownloadedLengthChanged);
-            }
-        }
-        let (_, body) = response.into_parts();
+        let body = body.ok_or(DropboxError::MissingDownloadMetadata)?;
         let mut reader = ProgressReader::new_at(
-            body.into_reader(),
+            body,
             self.transfer_observer.as_ref(),
             TransferDirection::Download,
             synchronized_path,
@@ -834,8 +885,7 @@ impl DropboxClient {
                 &staged,
                 StageOutcome::AlreadyStaged(()) | StageOutcome::DestinationOccupied { .. }
             ) {
-                io::copy(&mut reader, &mut io::sink())
-                    .map_err(|source| DropboxError::DownloadBody { source })?;
+                return Ok(staged);
             }
             if reader.done() != metadata.size {
                 return Err(DropboxError::DownloadedLengthChanged);
@@ -861,7 +911,7 @@ impl DropboxClient {
         self.upload_file(
             &target,
             relative,
-            UploadMode::Add("add"),
+            files::WriteMode::Add,
             staged,
             expectation,
             "strictly create Dropbox file",
@@ -887,10 +937,7 @@ impl DropboxClient {
         self.upload_file(
             &target,
             relative,
-            UploadMode::Update(UpdateMode {
-                tag: "update",
-                update: expected.as_str(),
-            }),
+            files::WriteMode::Update(expected.as_str().to_owned()),
             staged,
             expectation,
             "conditionally replace Dropbox file",
@@ -910,36 +957,21 @@ impl DropboxClient {
         let expectation = MutationExpectation::DeleteFile {
             expected: expected.clone(),
         };
-        let url = self.endpoints.api("/files/delete_v2");
-        let response = self.authorized_post(&url)?.send_json(DeleteRequest {
-            path: &target,
-            parent_rev: expected.as_str(),
-        });
+        let argument =
+            files::DeleteArg::new(target.clone()).with_parent_rev(expected.as_str().to_owned());
         let operation = "conditionally delete Dropbox file";
-        match response {
-            Err(source) => self.resolve_ambiguous(
-                &target,
-                &expectation,
-                DropboxError::Transport { operation, source },
-            ),
-            Ok(mut response) => {
-                let status = response.status().as_u16();
-                if (200..300).contains(&status) {
-                    let confirmation = response
-                        .body_mut()
-                        .read_json::<MetadataResponse>()
-                        .map_err(|source| DropboxError::Response { operation, source })
-                        .and_then(|payload| {
-                            validate_deleted_file(&target, payload.metadata, expected)
-                        });
-                    match confirmation {
-                        Ok(()) => Ok(MutationOutcome::Applied(RemotePathState::Absent)),
-                        Err(failure) => self.resolve_ambiguous(&target, &expectation, failure),
-                    }
-                } else {
-                    self.resolve_mutation_status(&target, &expectation, &mut response, operation)
+        match self.call(|| files::delete_v2(&self.transport, &argument)) {
+            Ok(payload) => {
+                match validate_deleted_file(&target, payload.metadata.into(), expected) {
+                    Ok(()) => Ok(MutationOutcome::Applied(RemotePathState::Absent)),
+                    Err(failure) => self.resolve_ambiguous(&target, &expectation, failure),
                 }
             }
+            Err(error) => self.resolve_mutation_error(
+                &target,
+                &expectation,
+                DropboxError::sdk(operation, error),
+            ),
         }
     }
 
@@ -953,34 +985,21 @@ impl DropboxClient {
             Err(rejection) => return Ok(MutationOutcome::Rejected(rejection)),
         };
         let expectation = MutationExpectation::CreateFolder;
-        let url = self.endpoints.api("/files/create_folder_v2");
-        let response = self.authorized_post(&url)?.send_json(CreateFolderRequest {
-            path: &target,
-            autorename: false,
-        });
+        let argument = files::CreateFolderArg::new(target.clone()).with_autorename(false);
         let operation = "strictly create Dropbox folder";
-        match response {
-            Err(source) => self.resolve_ambiguous(
+        match self.call(|| files::create_folder_v2(&self.transport, &argument)) {
+            Ok(payload) => match validate_created_folder(
+                &target,
+                files::Metadata::Folder(payload.metadata).into(),
+            ) {
+                Ok(()) => Ok(MutationOutcome::Applied(RemotePathState::Folder)),
+                Err(failure) => self.resolve_ambiguous(&target, &expectation, failure),
+            },
+            Err(error) => self.resolve_mutation_error(
                 &target,
                 &expectation,
-                DropboxError::Transport { operation, source },
+                DropboxError::sdk(operation, error),
             ),
-            Ok(mut response) => {
-                let status = response.status().as_u16();
-                if (200..300).contains(&status) {
-                    let confirmation = response
-                        .body_mut()
-                        .read_json::<MetadataResponse>()
-                        .map_err(|source| DropboxError::Response { operation, source })
-                        .and_then(|payload| validate_created_folder(&target, payload.metadata));
-                    match confirmation {
-                        Ok(()) => Ok(MutationOutcome::Applied(RemotePathState::Folder)),
-                        Err(failure) => self.resolve_ambiguous(&target, &expectation, failure),
-                    }
-                } else {
-                    self.resolve_mutation_status(&target, &expectation, &mut response, operation)
-                }
-            }
         }
     }
 
@@ -988,319 +1007,175 @@ impl DropboxClient {
         &self,
         target: &str,
         synchronized_path: &Path,
-        mode: UploadMode<'_>,
+        mode: files::WriteMode,
         staged: &StagedUpload,
         expectation: MutationExpectation,
         operation: &'static str,
     ) -> Result<MutationOutcome, DropboxError> {
-        let bytes = staged
+        let mut bytes = staged
             .open_verified()
             .map_err(|source| DropboxError::LocalStage { source })?;
         let size = bytes
             .metadata()
             .map_err(|source| DropboxError::UploadStageMetadata { source })?
             .len();
-        validate_upload_size(size)?;
-        if size > DIRECT_UPLOAD_MAX_BYTES {
-            return self.upload_session_file(
-                target,
-                synchronized_path,
-                mode,
-                staged,
-                expectation,
-                operation,
-                bytes,
-                size,
-            );
+        if validate_upload_size(size).is_err() {
+            return Ok(MutationOutcome::Rejected(
+                MutationRejection::UnsupportedFileSize,
+            ));
         }
-        validate_direct_upload_size(size)?;
-        let argument = ascii_json(&UploadRequest {
-            path: target,
-            mode,
-            autorename: false,
-            strict_conflict: true,
-            content_hash: staged.content().as_str(),
-        })?;
-        let authorization = format!("Bearer {}", self.access_token.expose());
-        let path_root = self.path_root_header()?;
-        let url = self.endpoints.content("/files/upload");
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(DOWNLOAD_SECONDS)))
-            .timeout_connect(Some(Duration::from_secs(CONNECT_SECONDS)))
-            .build();
-        let mut reader = ProgressReader::new(
-            bytes,
+        let capacity = usize::try_from(size.min(UPLOAD_SESSION_CHUNK_BYTES))
+            .map_err(|_| DropboxError::UploadSessionOffsetOverflow)?;
+        let mut buffer = vec![0; capacity];
+        let mut progress = ProgressReader::new(
+            io::empty(),
             self.transfer_observer.as_ref(),
             TransferDirection::Upload,
             synchronized_path,
             Some(size),
         );
-        let response = ureq::Agent::new_with_config(config)
-            .post(&url)
-            .header("Authorization", authorization)
-            .header("Dropbox-API-Path-Root", path_root)
-            .header("Dropbox-API-Arg", argument)
-            .header("Content-Type", "application/octet-stream")
-            .header("Content-Length", size.to_string())
-            .send(ureq::SendBody::from_reader(&mut reader));
-        match response {
-            Err(source) => self.resolve_ambiguous(
-                target,
-                &expectation,
-                DropboxError::Transport { operation, source },
-            ),
-            Ok(mut response) => {
-                let status = response.status().as_u16();
-                if (200..300).contains(&status) {
-                    let confirmation = response
-                        .body_mut()
-                        .read_json::<ListEntry>()
-                        .map_err(|source| DropboxError::Response { operation, source })
-                        .and_then(|metadata| {
-                            validate_uploaded_file(target, metadata, staged.content())
-                        });
-                    match confirmation {
-                        Ok(remote) => Ok(MutationOutcome::Applied(RemotePathState::File(remote))),
-                        Err(failure) => self.resolve_ambiguous(target, &expectation, failure),
-                    }
-                } else {
-                    self.resolve_mutation_status(target, &expectation, &mut response, operation)
+        let result = if size <= UPLOAD_SESSION_CHUNK_BYTES {
+            bytes
+                .read_exact(&mut buffer)
+                .map_err(|source| DropboxError::UploadStageRead { source })?;
+            let argument = files::UploadArg::new(target.to_owned())
+                .with_mode(mode)
+                .with_autorename(false)
+                .with_strict_conflict(true)
+                .with_content_hash(staged.content().as_str().to_owned());
+            self.call(|| files::upload(&self.transport, &argument, &buffer))
+                .map_err(|e| DropboxError::sdk(operation, e))
+        } else {
+            let session = self
+                .call(|| {
+                    files::upload_session_start(
+                        &self.transport,
+                        &files::UploadSessionStartArg::default(),
+                        &[],
+                    )
+                })
+                .map_err(|e| DropboxError::sdk("start Dropbox upload session", e))?;
+            let mut offset = 0;
+            while offset < size {
+                let length = usize::try_from((size - offset).min(UPLOAD_SESSION_CHUNK_BYTES))
+                    .map_err(|_| DropboxError::UploadSessionOffsetOverflow)?;
+                bytes
+                    .read_exact(&mut buffer[..length])
+                    .map_err(|source| DropboxError::UploadStageRead { source })?;
+                self.append_upload_session_chunk(&session.session_id, &buffer[..length], offset)?;
+                offset += length as u64;
+                progress.complete(offset);
+            }
+            let commit = files::CommitInfo::new(target.to_owned())
+                .with_mode(mode)
+                .with_autorename(false)
+                .with_strict_conflict(true);
+            let argument = files::UploadSessionFinishArg::new(
+                files::UploadSessionCursor::new(session.session_id, size),
+                commit,
+            )
+            .with_content_hash(staged.content().as_str().to_owned());
+            self.call(|| files::upload_session_finish(&self.transport, &argument, &[]))
+                .map_err(|e| DropboxError::sdk(operation, e))
+        };
+        match result {
+            Ok(metadata) => {
+                progress.complete(size);
+                match validate_uploaded_file(
+                    target,
+                    files::Metadata::File(metadata).into(),
+                    staged.content(),
+                ) {
+                    Ok(remote) => Ok(MutationOutcome::Applied(RemotePathState::File(remote))),
+                    Err(error) => self.resolve_ambiguous(target, &expectation, error),
                 }
             }
+            Err(error) => self.resolve_mutation_error(target, &expectation, error),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn upload_session_file(
+    fn append_upload_session_chunk(
         &self,
-        target: &str,
-        synchronized_path: &Path,
-        mode: UploadMode<'_>,
-        staged: &StagedUpload,
-        expectation: MutationExpectation,
-        operation: &'static str,
-        bytes: std::fs::File,
-        size: u64,
-    ) -> Result<MutationOutcome, DropboxError> {
-        let authorization = format!("Bearer {}", self.access_token.expose());
-        let path_root = self.path_root_header()?;
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(DOWNLOAD_SECONDS)))
-            .timeout_connect(Some(Duration::from_secs(CONNECT_SECONDS)))
-            .build();
-        let agent = ureq::Agent::new_with_config(config);
-        let mut reader = ProgressReader::new(
-            bytes,
-            self.transfer_observer.as_ref(),
-            TransferDirection::Upload,
-            synchronized_path,
-            Some(size),
-        );
-
-        let start_argument = ascii_json(&UploadSessionStartRequest { close: false })?;
-        let start_url = self.endpoints.content("/files/upload_session/start");
-        let mut start_response = agent
-            .post(&start_url)
-            .header("Authorization", &authorization)
-            .header("Dropbox-API-Path-Root", &path_root)
-            .header("Dropbox-API-Arg", start_argument)
-            .header("Content-Type", "application/octet-stream")
-            .header("Content-Length", "0")
-            .send_empty()
-            .map_err(|source| DropboxError::Transport {
-                operation: "start Dropbox upload session",
-                source,
-            })?;
-        require_success(
-            start_response.status().as_u16(),
-            start_response.headers().get("Retry-After"),
-            "start Dropbox upload session",
-        )?;
-        let session = start_response
-            .body_mut()
-            .read_json::<UploadSessionStartResponse>()
-            .map_err(|source| DropboxError::Response {
-                operation: "decode Dropbox upload-session start response",
-                source,
-            })?;
-
-        let mut offset = 0;
-        while offset < size {
-            let next = offset
-                .checked_add(UPLOAD_SESSION_CHUNK_BYTES.min(size.saturating_sub(offset)))
-                .ok_or(DropboxError::UploadSessionOffsetOverflow)?;
-            self.append_upload_session_chunk(
-                &agent,
-                &authorization,
-                &path_root,
-                &session.session_id,
-                &mut reader,
-                offset,
-                next,
-            )?;
-            offset = next;
-        }
-
-        let finish_argument = ascii_json(&UploadSessionFinishRequest {
-            cursor: UploadSessionCursor {
-                session_id: &session.session_id,
-                offset,
-            },
-            commit: UploadSessionCommit {
-                path: target,
-                mode,
-                autorename: false,
-                strict_conflict: true,
-            },
-        })?;
-        let finish_url = self.endpoints.content("/files/upload_session/finish");
-        let response = agent
-            .post(&finish_url)
-            .header("Authorization", authorization)
-            .header("Dropbox-API-Path-Root", path_root)
-            .header("Dropbox-API-Arg", finish_argument)
-            .header("Content-Type", "application/octet-stream")
-            .header("Content-Length", "0")
-            .send_empty();
-        match response {
-            Err(source) => self.resolve_ambiguous(
-                target,
-                &expectation,
-                DropboxError::Transport { operation, source },
-            ),
-            Ok(mut response) => {
-                let status = response.status().as_u16();
-                if (200..300).contains(&status) {
-                    let confirmation = response
-                        .body_mut()
-                        .read_json::<ListEntry>()
-                        .map_err(|source| DropboxError::Response { operation, source })
-                        .and_then(|metadata| {
-                            validate_uploaded_file(target, metadata, staged.content())
-                        });
-                    match confirmation {
-                        Ok(remote) => Ok(MutationOutcome::Applied(RemotePathState::File(remote))),
-                        Err(failure) => self.resolve_ambiguous(target, &expectation, failure),
-                    }
-                } else {
-                    self.resolve_mutation_status(target, &expectation, &mut response, operation)
-                }
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn append_upload_session_chunk<R: Read + Seek>(
-        &self,
-        agent: &ureq::Agent,
-        authorization: &str,
-        path_root: &str,
         session_id: &str,
-        reader: &mut R,
+        buffer: &[u8],
         offset: u64,
-        next: u64,
     ) -> Result<(), DropboxError> {
-        let url = self.endpoints.content("/files/upload_session/append_v2");
-        let mut requested_offset = offset;
-        let mut transport_retry_available = true;
-        let mut offset_correction_available = true;
+        let next = offset
+            .checked_add(buffer.len() as u64)
+            .ok_or(DropboxError::UploadSessionOffsetOverflow)?;
+        let mut requested = offset;
+        let mut transport_failure = None;
+        let mut correction_available = true;
         loop {
-            let length = next
-                .checked_sub(requested_offset)
-                .ok_or(DropboxError::UploadSessionOffsetOverflow)?;
-            let argument = ascii_json(&UploadSessionAppendRequest {
-                cursor: UploadSessionCursor {
-                    session_id,
-                    offset: requested_offset,
-                },
-                close: false,
-            })?;
-            reader
-                .seek(SeekFrom::Start(requested_offset))
-                .map_err(|source| DropboxError::UploadStageSeek { source })?;
-            let mut body = reader.take(length);
-            let response = agent
-                .post(&url)
-                .header("Authorization", authorization)
-                .header("Dropbox-API-Path-Root", path_root)
-                .header("Dropbox-API-Arg", &argument)
-                .header("Content-Type", "application/octet-stream")
-                .header("Content-Length", length.to_string())
-                .send(ureq::SendBody::from_reader(&mut body));
-            match response {
-                Err(_) if transport_retry_available => {
-                    transport_retry_available = false;
-                    continue;
-                }
-                Err(source) => {
-                    return Err(DropboxError::Transport {
-                        operation: "append Dropbox upload session",
-                        source,
-                    });
-                }
-                Ok(mut response) => {
-                    let status = response.status().as_u16();
-                    if (200..300).contains(&status) {
+            let start = usize::try_from(requested - offset)
+                .map_err(|_| DropboxError::UploadSessionOffsetOverflow)?;
+            let argument = files::UploadSessionAppendArg::new(files::UploadSessionCursor::new(
+                session_id.to_owned(),
+                requested,
+            ));
+            let result = self.call(|| {
+                files::upload_session_append_v2(&self.transport, &argument, &buffer[start..])
+            });
+            match result {
+                Ok(()) => return Ok(()),
+                Err(SdkError::Api(files::UploadSessionAppendError::IncorrectOffset(error))) => {
+                    if error.correct_offset == next {
                         return Ok(());
                     }
-                    if status == 409 {
-                        let offset_error = response
-                            .body_mut()
-                            .read_json::<UploadSessionAppendErrorResponse>()
-                            .map_err(|source| DropboxError::Response {
-                                operation: "decode Dropbox upload-session append error",
-                                source,
-                            })?
-                            .incorrect_offset();
-                        if let Some(correct_offset) = offset_error {
-                            if correct_offset == next {
-                                return Ok(());
-                            }
-                            if offset_correction_available
-                                && correct_offset != requested_offset
-                                && (offset..next).contains(&correct_offset)
-                            {
-                                requested_offset = correct_offset;
-                                offset_correction_available = false;
-                                continue;
-                            }
-                            return Err(DropboxError::IncorrectUploadSessionOffset {
-                                requested_offset,
-                                chunk_bytes: length,
-                                correct_offset,
-                            });
-                        }
+                    if correction_available
+                        && error.correct_offset != requested
+                        && (offset..next).contains(&error.correct_offset)
+                    {
+                        requested = error.correct_offset;
+                        correction_available = false;
+                        continue;
                     }
-                    return Err(status_failure(
-                        status,
-                        response.headers().get("Retry-After"),
-                        "append Dropbox upload session",
-                    ));
+                    return Err(DropboxError::IncorrectUploadSessionOffset {
+                        requested_offset: requested,
+                        chunk_bytes: next - requested,
+                        correct_offset: error.correct_offset,
+                    });
+                }
+                Err(error) => {
+                    let error = DropboxError::sdk("append Dropbox upload session", error);
+                    if error.is_transport_retry() && transport_failure.is_none() {
+                        transport_failure = Some(error);
+                        continue;
+                    }
+                    return match transport_failure {
+                        Some(original) => Err(DropboxError::RetriedTransport {
+                            original: Box::new(original),
+                            retry: Box::new(error),
+                        }),
+                        None => Err(error),
+                    };
                 }
             }
         }
     }
 
-    fn resolve_mutation_status(
+    fn resolve_mutation_error(
         &self,
         target: &str,
         expectation: &MutationExpectation,
-        response: &mut ureq::http::Response<ureq::Body>,
-        operation: &'static str,
+        error: DropboxError,
     ) -> Result<MutationOutcome, DropboxError> {
-        let status = response.status().as_u16();
-        let failure = status_failure(status, response.headers().get("Retry-After"), operation);
-        if status == 409 {
-            if let Some(rejection) = mutation_rejection(response) {
-                return Ok(MutationOutcome::Rejected(rejection));
+        match error.api_outcome() {
+            ApiOutcome::Rejected(reason) => Ok(MutationOutcome::Rejected(reason)),
+            ApiOutcome::Unknown | ApiOutcome::Unavailable | ApiOutcome::Environmental => Ok(
+                MutationOutcome::Rejected(MutationRejection::RejectedByDropbox),
+            ),
+            ApiOutcome::Conflict => self.resolve_explicit_conflict(target, expectation),
+            ApiOutcome::Absent => Ok(MutationOutcome::Applied(RemotePathState::Absent)),
+            _ if error.mutation_may_have_applied() => {
+                if let Some(TransportOutcome::Retry { delay: Some(delay) }) =
+                    error.transport_outcome()
+                {
+                    std::thread::sleep(delay);
+                }
+                self.resolve_ambiguous(target, expectation, error)
             }
-            self.resolve_explicit_conflict(target, expectation)
-        } else if (500..600).contains(&status) {
-            self.resolve_ambiguous(target, expectation, failure)
-        } else {
-            Err(failure)
+            _ => Err(error),
         }
     }
 
@@ -1311,9 +1186,9 @@ impl DropboxClient {
     ) -> Result<MutationOutcome, DropboxError> {
         match self.metadata_state(target) {
             Ok(state) => Ok(expectation.classify(state)),
-            Err(DropboxError::HttpStatus { status: 409, .. }) => Ok(MutationOutcome::Rejected(
-                MutationRejection::RejectedByDropbox,
-            )),
+            Err(error) if matches!(error.api_outcome(), ApiOutcome::Unavailable) => Ok(
+                MutationOutcome::Rejected(MutationRejection::RejectedByDropbox),
+            ),
             Err(error) => Err(error),
         }
     }
@@ -1326,37 +1201,22 @@ impl DropboxClient {
     ) -> Result<MutationOutcome, DropboxError> {
         match self.metadata_state(target) {
             Ok(state) => Ok(expectation.classify(state)),
-            Err(_) => Err(original),
+            Err(source) => Err(DropboxError::UnverifiedMutation {
+                original: Box::new(original),
+                verification: Box::new(source),
+            }),
         }
     }
 
     fn metadata_state(&self, target: &str) -> Result<RemotePathState, DropboxError> {
-        let operation = "verify Dropbox mutation";
-        let url = self.endpoints.api("/files/get_metadata");
-        let mut response = self
-            .authorized_post(&url)?
-            .send_json(MetadataRequest {
-                path: target,
-                include_deleted: true,
-            })
-            .map_err(|source| DropboxError::Transport { operation, source })?;
-        let status = response.status().as_u16();
-        if status == 409 {
-            let missing = response
-                .body_mut()
-                .read_json::<MetadataError>()
-                .map_err(|source| DropboxError::Response { operation, source })?;
-            if missing.explicitly_not_found() {
-                return Ok(RemotePathState::Absent);
+        let argument = files::GetMetadataArg::new(target.to_owned()).with_include_deleted(true);
+        match self.call(|| files::get_metadata(&self.transport, &argument)) {
+            Ok(metadata) => metadata_remote_state(target, metadata.into()),
+            Err(SdkError::Api(files::GetMetadataError::Path(files::LookupError::NotFound))) => {
+                Ok(RemotePathState::Absent)
             }
-            return Err(DropboxError::HttpStatus { operation, status });
+            Err(error) => Err(DropboxError::sdk("verify Dropbox mutation", error)),
         }
-        require_success(status, response.headers().get("Retry-After"), operation)?;
-        let metadata = response
-            .body_mut()
-            .read_json::<ListEntry>()
-            .map_err(|source| DropboxError::Response { operation, source })?;
-        metadata_remote_state(target, metadata)
     }
 
     fn mutation_target(&self, relative: &Path) -> Result<String, MutationRejection> {
@@ -1378,64 +1238,20 @@ impl DropboxClient {
         Ok(format!("{}{}", self.root.path, suffix))
     }
 
-    fn current_account(&self) -> Result<CurrentAccount, DropboxError> {
-        let url = self.endpoints.api("/users/get_current_account");
-        let authorization = format!("Bearer {}", self.access_token.expose());
-        let mut response = self
-            .agent
-            .post(&url)
-            .header("Authorization", authorization)
-            .send_json(EmptyRequest {})
-            .map_err(|source| DropboxError::Transport {
-                operation: "validate Dropbox account",
-                source,
-            })?;
-        require_success(
-            response.status().as_u16(),
-            response.headers().get("Retry-After"),
-            "validate Dropbox account",
-        )?;
-        response
-            .body_mut()
-            .read_json()
-            .map_err(|source| DropboxError::Response {
-                operation: "decode Dropbox account response",
-                source,
-            })
+    fn current_account(&self) -> Result<dropbox_sdk::types::users::FullAccount, DropboxError> {
+        self.call(|| users::get_current_account(&self.transport.account()))
+            .map_err(|e| DropboxError::sdk("validate Dropbox account", e))
     }
 
     fn validate_remote_root(&self) -> Result<(), DropboxError> {
         if self.root.path.is_empty() {
             return Ok(());
         }
-        let url = self.endpoints.api("/files/get_metadata");
-        let mut response = self
-            .authorized_post(&url)?
-            .send_json(MetadataRequest {
-                path: &self.root.path,
-                include_deleted: false,
-            })
-            .map_err(|source| DropboxError::Transport {
-                operation: "validate configured Dropbox root",
-                source,
-            })?;
-        let status = response.status().as_u16();
-        if status == 409 {
-            return Err(DropboxError::RemoteRootUnavailable);
-        }
-        require_success(
-            status,
-            response.headers().get("Retry-After"),
-            "validate configured Dropbox root",
-        )?;
-        let metadata: ListEntry =
-            response
-                .body_mut()
-                .read_json()
-                .map_err(|source| DropboxError::Response {
-                    operation: "decode configured Dropbox root metadata",
-                    source,
-                })?;
+        let argument = files::GetMetadataArg::new(self.root.path.clone());
+        let metadata = self
+            .call(|| files::get_metadata(&self.transport, &argument))
+            .map_err(|e| DropboxError::sdk("validate configured Dropbox root", e))?;
+        let metadata = ListEntry::from(metadata);
         if metadata.path_lower.as_deref() != Some(self.root.lower_path.as_str()) {
             return Err(DropboxError::RemoteRootUnavailable);
         }
@@ -1449,19 +1265,20 @@ impl DropboxClient {
     }
 
     fn full_inventory(&self) -> Result<(Vec<RemoteObservationRecord>, String), DropboxError> {
-        let first: ListFolderResponse = self.post_api(
-            "/files/list_folder",
-            &ListFolderRequest {
-                path: &self.root.path,
-                recursive: true,
-                include_deleted: false,
-            },
-            "start complete Dropbox listing",
-        )?;
+        let argument = files::ListFolderArg::new(self.root.path.clone())
+            .with_recursive(true)
+            .with_include_deleted(false);
+        let first = self
+            .call(|| files::list_folder(&self.transport, &argument))
+            .map_err(|e| DropboxError::sdk("start complete Dropbox listing", e))?;
         let mut records = BTreeMap::new();
         let mut page = first;
         loop {
-            apply_entries(&self.root, &mut records, page.entries)?;
+            apply_entries(
+                &self.root,
+                &mut records,
+                page.entries.into_iter().map(ListEntry::from).collect(),
+            )?;
             if !page.has_more {
                 return Ok((records.into_values().collect(), page.cursor));
             }
@@ -1486,7 +1303,11 @@ impl DropboxClient {
                 ContinuePage::Reset => return Ok(CursorDelta::Reset),
                 ContinuePage::Page(page) => page,
             };
-            append_entry_changes(&self.root, &mut changes, page.entries)?;
+            append_entry_changes(
+                &self.root,
+                &mut changes,
+                page.entries.into_iter().map(ListEntry::from).collect(),
+            )?;
             if !page.has_more {
                 normalize_inventory_changes(&mut changes, directories)?;
                 return Ok(CursorDelta::Changes {
@@ -1502,87 +1323,15 @@ impl DropboxClient {
     }
 
     fn list_continue(&self, cursor: &str) -> Result<ContinuePage, DropboxError> {
-        let url = self.endpoints.api("/files/list_folder/continue");
-        let mut response = self
-            .authorized_post(&url)?
-            .send_json(CursorRequest { cursor })
-            .map_err(|source| DropboxError::Transport {
-                operation: "continue complete Dropbox listing",
-                source,
-            })?;
-        let status = response.status().as_u16();
-        if status == 409 {
-            let error: TaggedError =
-                response
-                    .body_mut()
-                    .read_json()
-                    .map_err(|source| DropboxError::Response {
-                        operation: "decode Dropbox cursor error",
-                        source,
-                    })?;
-            if error.error.tag == "reset" {
-                return Ok(ContinuePage::Reset);
-            }
+        let argument = files::ListFolderContinueArg::new(cursor.to_owned());
+        match self.call(|| files::list_folder_continue(&self.transport, &argument)) {
+            Ok(page) => Ok(ContinuePage::Page(page)),
+            Err(SdkError::Api(files::ListFolderContinueError::Reset)) => Ok(ContinuePage::Reset),
+            Err(error) => Err(DropboxError::sdk(
+                "continue complete Dropbox listing",
+                error,
+            )),
         }
-        require_success(
-            status,
-            response.headers().get("Retry-After"),
-            "continue complete Dropbox listing",
-        )?;
-        let page = response
-            .body_mut()
-            .read_json()
-            .map_err(|source| DropboxError::Response {
-                operation: "decode Dropbox listing page",
-                source,
-            })?;
-        Ok(ContinuePage::Page(page))
-    }
-
-    fn post_api<Body, Response>(
-        &self,
-        route: &str,
-        body: &Body,
-        operation: &'static str,
-    ) -> Result<Response, DropboxError>
-    where
-        Body: Serialize,
-        Response: for<'de> Deserialize<'de>,
-    {
-        let url = self.endpoints.api(route);
-        let mut response = self
-            .authorized_post(&url)?
-            .send_json(body)
-            .map_err(|source| DropboxError::Transport { operation, source })?;
-        require_success(
-            response.status().as_u16(),
-            response.headers().get("Retry-After"),
-            operation,
-        )?;
-        response
-            .body_mut()
-            .read_json()
-            .map_err(|source| DropboxError::Response { operation, source })
-    }
-
-    fn authorized_post(
-        &self,
-        url: &str,
-    ) -> Result<ureq::RequestBuilder<ureq::typestate::WithBody>, DropboxError> {
-        let authorization = format!("Bearer {}", self.access_token.expose());
-        let path_root = self.path_root_header()?;
-        Ok(self
-            .agent
-            .post(url)
-            .header("Authorization", authorization)
-            .header("Dropbox-API-Path-Root", path_root))
-    }
-
-    fn path_root_header(&self) -> Result<String, DropboxError> {
-        ascii_json(&PathRootHeader {
-            tag: "root",
-            root: &self.root.namespace_id,
-        })
     }
 }
 
@@ -1646,68 +1395,20 @@ enum CursorDelta {
 }
 
 enum ContinuePage {
-    Page(ListFolderResponse),
+    Page(files::ListFolderResult),
     Reset,
 }
 
-#[derive(Serialize)]
-struct EmptyRequest {}
-
-#[derive(Serialize)]
-struct PathRootHeader<'a> {
-    #[serde(rename = ".tag")]
-    tag: &'static str,
-    root: &'a str,
-}
-
-#[derive(Deserialize)]
-struct CurrentAccount {
-    account_id: String,
-    root_info: RootInfo,
-}
-
-#[derive(Deserialize)]
-struct RootInfo {
-    root_namespace_id: String,
-}
-
-#[derive(Serialize)]
-struct ListFolderRequest<'a> {
-    path: &'a str,
-    recursive: bool,
-    include_deleted: bool,
-}
-
-#[derive(Serialize)]
-struct MetadataRequest<'a> {
-    path: &'a str,
-    include_deleted: bool,
-}
-
-#[derive(Serialize)]
-struct CursorRequest<'a> {
-    cursor: &'a str,
-}
-
-#[derive(Deserialize)]
-struct ListFolderResponse {
-    entries: Vec<ListEntry>,
-    cursor: String,
-    has_more: bool,
-}
-
-#[derive(Deserialize)]
+// Engine projection of generated metadata; this is never a wire deserializer.
 struct ListEntry {
-    #[serde(rename = ".tag")]
     tag: EntryTag,
     path_lower: Option<String>,
     path_display: Option<String>,
     rev: Option<String>,
     content_hash: Option<String>,
-    #[serde(default = "default_true")]
     is_downloadable: bool,
-    symlink_info: Option<serde_json::Value>,
-    sharing_info: Option<FolderSharingInfo>,
+    symlink_info: Option<dropbox_sdk::types::files::SymlinkInfo>,
+    sharing_info: Option<dropbox_sdk::types::files::FolderSharingInfo>,
 }
 
 impl ListEntry {
@@ -1718,234 +1419,101 @@ impl ListEntry {
     }
 }
 
-#[derive(Deserialize)]
-struct FolderSharingInfo {
-    #[serde(default)]
-    no_access: bool,
-    #[serde(default)]
-    traverse_only: bool,
-}
-
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy)]
 enum EntryTag {
     File,
     Folder,
     Deleted,
+    Unknown,
 }
 
-#[derive(Deserialize)]
-struct TaggedError {
-    error: ErrorTag,
-}
-
-#[derive(Deserialize)]
-struct ErrorTag {
-    #[serde(rename = ".tag")]
-    tag: String,
-}
-
-#[derive(Serialize)]
-struct LongPollRequest<'a> {
-    cursor: &'a str,
-    timeout: u64,
-}
-
-#[derive(Deserialize)]
-struct LongPollResponse {
-    changes: bool,
-    backoff: Option<u64>,
-}
-
-#[derive(Serialize)]
-struct DownloadRequest {
-    path: String,
-}
-
-#[derive(Deserialize)]
-struct DownloadMetadata {
-    rev: String,
-    content_hash: String,
-    size: u64,
-}
-
-#[derive(Serialize)]
-struct UploadRequest<'a> {
-    path: &'a str,
-    mode: UploadMode<'a>,
-    autorename: bool,
-    strict_conflict: bool,
-    content_hash: &'a str,
-}
-
-#[derive(Serialize)]
-struct UploadSessionStartRequest {
-    close: bool,
-}
-
-#[derive(Deserialize)]
-struct UploadSessionStartResponse {
-    session_id: String,
-}
-
-#[derive(Serialize)]
-struct UploadSessionCursor<'a> {
-    session_id: &'a str,
-    offset: u64,
-}
-
-#[derive(Serialize)]
-struct UploadSessionAppendRequest<'a> {
-    cursor: UploadSessionCursor<'a>,
-    close: bool,
-}
-
-#[derive(Serialize)]
-struct UploadSessionFinishRequest<'a> {
-    cursor: UploadSessionCursor<'a>,
-    commit: UploadSessionCommit<'a>,
-}
-
-#[derive(Serialize)]
-struct UploadSessionCommit<'a> {
-    path: &'a str,
-    mode: UploadMode<'a>,
-    autorename: bool,
-    strict_conflict: bool,
-}
-
-#[derive(Deserialize)]
-struct UploadSessionAppendErrorResponse {
-    error: UploadSessionAppendError,
-}
-
-impl UploadSessionAppendErrorResponse {
-    fn incorrect_offset(self) -> Option<u64> {
-        match self.error {
-            UploadSessionAppendError::IncorrectOffset { correct_offset } => Some(correct_offset),
-            UploadSessionAppendError::Other => None,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(tag = ".tag", rename_all = "snake_case")]
-enum UploadSessionAppendError {
-    IncorrectOffset {
-        correct_offset: u64,
-    },
-    #[serde(other)]
-    Other,
-}
-
-#[derive(Serialize)]
-#[serde(untagged)]
-enum UploadMode<'a> {
-    Add(&'static str),
-    Update(UpdateMode<'a>),
-}
-
-#[derive(Serialize)]
-struct UpdateMode<'a> {
-    #[serde(rename = ".tag")]
-    tag: &'static str,
-    update: &'a str,
-}
-
-#[derive(Serialize)]
-struct DeleteRequest<'a> {
-    path: &'a str,
-    parent_rev: &'a str,
-}
-
-#[derive(Deserialize)]
-struct MetadataResponse {
-    metadata: ListEntry,
-}
-
-#[derive(Serialize)]
-struct CreateFolderRequest<'a> {
-    path: &'a str,
-    autorename: bool,
-}
-
-#[derive(Deserialize)]
-struct MetadataError {
-    error: serde_json::Value,
-}
-
-impl MetadataError {
-    fn explicitly_not_found(&self) -> bool {
-        self.error
-            .pointer("/.tag")
-            .and_then(serde_json::Value::as_str)
-            == Some("path")
-            && self
-                .error
-                .pointer("/path/.tag")
-                .and_then(serde_json::Value::as_str)
-                == Some("not_found")
-    }
-}
-
-fn mutation_rejection(
-    response: &mut ureq::http::Response<ureq::Body>,
-) -> Option<MutationRejection> {
-    let error = response.body_mut().read_json::<serde_json::Value>().ok()?;
-    find_mutation_rejection(&error)
-}
-
-fn find_mutation_rejection(value: &serde_json::Value) -> Option<MutationRejection> {
-    match value {
-        serde_json::Value::Object(fields) => {
-            if let Some(tag) = fields.get(".tag").and_then(serde_json::Value::as_str) {
-                let rejection = match tag {
-                    "malformed_path" => Some(MutationRejection::InvalidPath),
-                    "disallowed_name" => Some(MutationRejection::DisallowedName),
-                    "restricted_content" => Some(MutationRejection::RestrictedContent),
-                    "no_write_permission" | "access_restricted" => {
-                        Some(MutationRejection::PermissionDenied)
-                    }
-                    "insufficient_space" => Some(MutationRejection::InsufficientSpace),
-                    "operation_suppressed" | "team_folder" => {
-                        Some(MutationRejection::OperationNotAllowed)
-                    }
-                    _ => None,
-                };
-                if rejection.is_some() {
-                    return rejection;
-                }
+impl From<files::Metadata> for ListEntry {
+    fn from(metadata: files::Metadata) -> Self {
+        let mut entry = Self {
+            tag: EntryTag::Unknown,
+            path_lower: None,
+            path_display: None,
+            rev: None,
+            content_hash: None,
+            is_downloadable: false,
+            symlink_info: None,
+            sharing_info: None,
+        };
+        match metadata {
+            files::Metadata::File(file) => {
+                entry.tag = EntryTag::File;
+                entry.path_lower = file.path_lower;
+                entry.path_display = file.path_display;
+                entry.rev = Some(file.rev);
+                entry.content_hash = file.content_hash;
+                entry.is_downloadable = file.is_downloadable;
+                entry.symlink_info = file.symlink_info;
             }
-            fields.values().find_map(find_mutation_rejection)
+            files::Metadata::Folder(folder) => {
+                entry.tag = EntryTag::Folder;
+                entry.path_lower = folder.path_lower;
+                entry.path_display = folder.path_display;
+                entry.sharing_info = folder.sharing_info;
+            }
+            files::Metadata::Deleted(deleted) => {
+                entry.tag = EntryTag::Deleted;
+                entry.path_lower = deleted.path_lower;
+                entry.path_display = deleted.path_display;
+            }
         }
-        serde_json::Value::Array(values) => values.iter().find_map(find_mutation_rejection),
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_)
-        | serde_json::Value::String(_) => None,
+        entry
+    }
+}
+
+fn namespace_id(root: &RootInfo) -> Result<String, DropboxError> {
+    match root {
+        RootInfo::User(root) => Ok(root.root_namespace_id.clone()),
+        RootInfo::Team(root) => Ok(root.root_namespace_id.clone()),
+        _ => Err(DropboxError::AccountBindingChanged),
     }
 }
 
 /// Dropbox protocol, validation, or publication failure.
 #[derive(Debug, Error)]
 pub enum DropboxError {
+    /// Generated route failure, with its typed policy and original source.
+    #[error("Dropbox operation `{operation}` failed")]
+    Sdk {
+        operation: &'static str,
+        outcome: ApiOutcome,
+        #[source]
+        source: Box<SdkError<RouteError>>,
+    },
+    /// Both a mutation response and its verification failed.
+    #[error("could not verify the outcome of a Dropbox mutation: {original}")]
+    UnverifiedMutation {
+        #[source]
+        original: Box<DropboxError>,
+        verification: Box<DropboxError>,
+    },
+    /// A bounded append retry failed as well as the initial attempt.
+    #[error("Dropbox append retry failed after {original}")]
+    RetriedTransport {
+        #[source]
+        original: Box<DropboxError>,
+        retry: Box<DropboxError>,
+    },
+    /// Immutable source bytes could not be loaded into the bounded upload buffer.
+    #[error("could not read immutable upload staging")]
+    UploadStageRead {
+        #[source]
+        source: io::Error,
+    },
+
     /// The configured Dropbox folder is not an API path.
     #[error("configured Dropbox root must be empty or a normalized absolute Dropbox path")]
     InvalidRootPath,
     /// A timeout outside Dropbox's documented range was requested.
     #[error("Dropbox long-poll timeout must be between 30 and 480 seconds")]
     InvalidLongPollTimeout,
-    /// The immutable stage exceeds Dropbox's direct-upload endpoint limit.
-    #[error(
-        "immutable upload stage is {bytes} bytes; direct Dropbox uploads allow at most 157286400 bytes"
-    )]
-    DirectUploadTooLarge {
-        /// Verified stage length.
-        bytes: u64,
-    },
     /// The immutable stage exceeds Dropbox's documented upload-session limit.
     #[error(
-        "immutable upload stage is {bytes} bytes; Dropbox upload sessions allow at most 2199019061248 bytes"
+        "immutable upload stage is {bytes} bytes; Dropbox upload sessions allow at most 350000000000 bytes"
     )]
     UploadTooLarge {
         /// Verified stage length.
@@ -1981,58 +1549,6 @@ pub enum DropboxError {
     /// A folder inside the listing cannot be traversed completely.
     #[error("Dropbox listing contains a folder that cannot be traversed completely")]
     RestrictedRemoteInventory,
-    /// Dropbox rate-limited a request.
-    #[error("Dropbox operation `{operation}` was rate limited")]
-    RateLimited {
-        /// Safe operation name.
-        operation: &'static str,
-        /// Server-requested delay when Dropbox returned valid delta seconds.
-        retry_after: Option<Duration>,
-    },
-    /// Dropbox returned a non-success status.
-    #[error("Dropbox operation `{operation}` returned HTTP status {status}")]
-    HttpStatus {
-        /// Safe operation name.
-        operation: &'static str,
-        /// HTTP status code.
-        status: u16,
-    },
-    /// The request could not be completed.
-    #[error("Dropbox operation `{operation}` could not reach the service")]
-    Transport {
-        /// Safe operation name.
-        operation: &'static str,
-        /// Original transport error, which does not contain request headers or bodies.
-        #[source]
-        source: ureq::Error,
-    },
-    /// A successful response did not match Dropbox's documented schema.
-    #[error("Dropbox operation `{operation}` returned an invalid response")]
-    Response {
-        /// Safe operation name.
-        operation: &'static str,
-        /// Original JSON body decoding error.
-        #[source]
-        source: ureq::Error,
-    },
-    /// A locally built or header JSON value was invalid.
-    #[error("Dropbox operation `{operation}` could not process protocol JSON")]
-    Json {
-        /// Safe operation name.
-        operation: &'static str,
-        /// Original JSON error.
-        #[source]
-        source: serde_json::Error,
-    },
-    /// A Dropbox response header was not valid text.
-    #[error("Dropbox operation `{operation}` returned an invalid header")]
-    Header {
-        /// Safe operation name.
-        operation: &'static str,
-        /// Original header decoding error.
-        #[source]
-        source: ureq::http::header::ToStrError,
-    },
     /// An entry did not carry a path confined to the configured Dropbox root.
     #[error("Dropbox listing contained an invalid or out-of-root path")]
     InvalidEntryPath,
@@ -2073,6 +1589,9 @@ pub enum DropboxError {
     /// A successful mutation response did not describe the requested path and content.
     #[error("Dropbox returned inconsistent mutation metadata")]
     InvalidMutationMetadata,
+    /// A returned upload hash differs from the verified immutable source.
+    #[error("Dropbox upload response returned a different content identity")]
+    UploadedContentMismatch,
     /// The verified upload-stage descriptor could not be inspected.
     #[error("could not inspect immutable upload staging")]
     UploadStageMetadata {
@@ -2103,102 +1622,12 @@ pub enum DropboxError {
     },
 }
 
-fn require_success(
-    status: u16,
-    retry_after: Option<&ureq::http::HeaderValue>,
-    operation: &'static str,
-) -> Result<(), DropboxError> {
-    if (200..300).contains(&status) {
-        Ok(())
-    } else {
-        Err(status_failure(status, retry_after, operation))
-    }
-}
-
-fn validate_content_range(value: &str, offset: u64, total: u64) -> Result<(), DropboxError> {
-    let Some(value) = value.strip_prefix("bytes ") else {
-        return Err(DropboxError::InvalidDownloadRange);
-    };
-    let Some((range, reported_total)) = value.split_once('/') else {
-        return Err(DropboxError::InvalidDownloadRange);
-    };
-    let Some((start, end)) = range.split_once('-') else {
-        return Err(DropboxError::InvalidDownloadRange);
-    };
-    let start = start
-        .parse::<u64>()
-        .map_err(|_| DropboxError::InvalidDownloadRange)?;
-    let end = end
-        .parse::<u64>()
-        .map_err(|_| DropboxError::InvalidDownloadRange)?;
-    let reported_total = reported_total
-        .parse::<u64>()
-        .map_err(|_| DropboxError::InvalidDownloadRange)?;
-    if start == offset && reported_total == total && end.checked_add(1) == Some(total) {
-        Ok(())
-    } else {
-        Err(DropboxError::InvalidDownloadRange)
-    }
-}
-
-fn status_failure(
-    status: u16,
-    retry_after: Option<&ureq::http::HeaderValue>,
-    operation: &'static str,
-) -> DropboxError {
-    if status == 429 {
-        let retry_after = retry_after
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-            .map(Duration::from_secs);
-        DropboxError::RateLimited {
-            operation,
-            retry_after,
-        }
-    } else {
-        DropboxError::HttpStatus { operation, status }
-    }
-}
-
-fn validate_direct_upload_size(bytes: u64) -> Result<(), DropboxError> {
-    if bytes > DIRECT_UPLOAD_MAX_BYTES {
-        Err(DropboxError::DirectUploadTooLarge { bytes })
-    } else {
-        Ok(())
-    }
-}
-
 fn validate_upload_size(bytes: u64) -> Result<(), DropboxError> {
     if bytes > UPLOAD_SESSION_MAX_BYTES {
         Err(DropboxError::UploadTooLarge { bytes })
     } else {
         Ok(())
     }
-}
-
-fn ascii_json(value: &impl Serialize) -> Result<String, DropboxError> {
-    let json = serde_json::to_string(value).map_err(|source| DropboxError::Json {
-        operation: "encode Dropbox request header",
-        source,
-    })?;
-    let mut ascii = String::with_capacity(json.len());
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for character in json.chars() {
-        if character.is_ascii() {
-            ascii.push(character);
-        } else {
-            let mut units = [0_u16; 2];
-            for unit in character.encode_utf16(&mut units) {
-                ascii.push('\\');
-                ascii.push('u');
-                for shift in [12_u32, 8, 4, 0] {
-                    let digit = usize::from((*unit >> shift) & 0x0f);
-                    ascii.push(char::from(HEX[digit]));
-                }
-            }
-        }
-    }
-    Ok(ascii)
 }
 
 fn validate_uploaded_file(
@@ -2209,7 +1638,7 @@ fn validate_uploaded_file(
     validate_mutation_path(target, &metadata)?;
     let remote = complete_remote_file(metadata).ok_or(DropboxError::InvalidMutationMetadata)?;
     if &remote.content != expected {
-        return Err(DropboxError::InvalidMutationMetadata);
+        return Err(DropboxError::UploadedContentMismatch);
     }
     Ok(remote)
 }
@@ -2241,6 +1670,7 @@ fn metadata_remote_state(
 ) -> Result<RemotePathState, DropboxError> {
     validate_mutation_path(target, &metadata)?;
     match metadata.tag {
+        EntryTag::Unknown => Ok(RemotePathState::Unsupported),
         EntryTag::Deleted => Ok(RemotePathState::Absent),
         EntryTag::Folder => Ok(RemotePathState::Folder),
         EntryTag::File if !metadata.is_downloadable || metadata.symlink_info.is_some() => {
@@ -2280,10 +1710,6 @@ fn validate_mutation_path(target: &str, metadata: &ListEntry) -> Result<(), Drop
 
 fn invalid_dropbox_component(component: &str) -> bool {
     component.is_empty() || component == "." || component == ".." || component.contains('\0')
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn valid_content_hash(value: &str) -> bool {
@@ -2344,6 +1770,7 @@ fn append_entry_changes(
             continue;
         }
         let observation = match entry.tag {
+            EntryTag::Unknown => return Err(DropboxError::InvalidEntryPath),
             EntryTag::Deleted => continue,
             EntryTag::Folder if entry.restricted() => {
                 return Err(DropboxError::RestrictedRemoteInventory);
@@ -2554,6 +1981,357 @@ fn relative_paths(
     ))
 }
 
+/// Policy extracted from a generated route error before retaining its source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApiOutcome {
+    Retry,
+    Environmental,
+    UserAction,
+    Invariant,
+    Unknown,
+    Conflict,
+    Rejected(MutationRejection),
+    Absent,
+    Unavailable,
+    HashMismatch,
+}
+
+pub(crate) trait ApiError:
+    std::error::Error + Send + Sync + Into<RouteError> + 'static
+{
+    fn outcome(&self) -> ApiOutcome;
+}
+
+impl ApiError for NoError {
+    fn outcome(&self) -> ApiOutcome {
+        match *self {}
+    }
+}
+
+fn write_outcome(error: &files::WriteError) -> ApiOutcome {
+    use files::WriteError as E;
+    match error {
+        E::Conflict(_) => ApiOutcome::Conflict,
+        E::MalformedPath(_) => ApiOutcome::Rejected(MutationRejection::InvalidPath),
+        E::NoWritePermission | E::AccessRestricted => {
+            ApiOutcome::Rejected(MutationRejection::PermissionDenied)
+        }
+        E::InsufficientSpace => ApiOutcome::Rejected(MutationRejection::InsufficientSpace),
+        E::DisallowedName => ApiOutcome::Rejected(MutationRejection::DisallowedName),
+        E::TeamFolder | E::OperationSuppressed => {
+            ApiOutcome::Rejected(MutationRejection::OperationNotAllowed)
+        }
+        E::TooManyWriteOperations => ApiOutcome::Retry,
+        E::Other => ApiOutcome::Unknown,
+        _ => ApiOutcome::Unknown, // SDK enums are non-exhaustive.
+    }
+}
+
+fn lookup_outcome(error: &files::LookupError) -> ApiOutcome {
+    use files::LookupError as E;
+    match error {
+        E::MalformedPath(_)
+        | E::NotFound
+        | E::NotFile
+        | E::NotFolder
+        | E::RestrictedContent
+        | E::UnsupportedContentType => ApiOutcome::Unavailable,
+        E::Locked => ApiOutcome::Environmental,
+        E::Other => ApiOutcome::Unknown,
+        _ => ApiOutcome::Unknown,
+    }
+}
+
+impl ApiError for files::UploadError {
+    fn outcome(&self) -> ApiOutcome {
+        use files::UploadError as E;
+        match self {
+            E::Path(error) => write_outcome(&error.reason),
+            E::PropertiesError(_) => ApiOutcome::Invariant,
+            E::PayloadTooLarge => ApiOutcome::Retry,
+            E::ContentHashMismatch => ApiOutcome::HashMismatch,
+            E::EncryptionNotSupported => {
+                ApiOutcome::Rejected(MutationRejection::OperationNotAllowed)
+            }
+            E::Other => ApiOutcome::Unknown,
+            _ => ApiOutcome::Unknown,
+        }
+    }
+}
+
+impl ApiError for files::UploadSessionFinishError {
+    #[allow(deprecated)]
+    fn outcome(&self) -> ApiOutcome {
+        use files::UploadSessionFinishError as E;
+        match self {
+            E::Path(error) => write_outcome(error),
+            E::LookupFailed(error) => session_lookup_outcome(error),
+            E::PropertiesError(_)
+            | E::TooManySharedFolderTargets
+            | E::ConcurrentSessionDataNotAllowed
+            | E::ConcurrentSessionNotClosed
+            | E::ConcurrentSessionMissingData => ApiOutcome::Invariant,
+            E::TooManyWriteOperations | E::PayloadTooLarge => ApiOutcome::Retry,
+            E::ContentHashMismatch => ApiOutcome::HashMismatch,
+            E::EncryptionNotSupported => {
+                ApiOutcome::Rejected(MutationRejection::OperationNotAllowed)
+            }
+            E::Other => ApiOutcome::Unknown,
+            _ => ApiOutcome::Unknown,
+        }
+    }
+}
+
+fn session_lookup_outcome(error: &files::UploadSessionLookupError) -> ApiOutcome {
+    use files::UploadSessionLookupError as E;
+    match error {
+        E::NotFound | E::Closed | E::TooLarge | E::IncorrectOffset(_) | E::PayloadTooLarge => {
+            ApiOutcome::Retry
+        }
+        E::NotClosed | E::ConcurrentSessionInvalidOffset | E::ConcurrentSessionInvalidDataSize => {
+            ApiOutcome::Invariant
+        }
+        E::Other => ApiOutcome::Unknown,
+        _ => ApiOutcome::Unknown,
+    }
+}
+
+impl ApiError for files::UploadSessionAppendError {
+    fn outcome(&self) -> ApiOutcome {
+        use files::UploadSessionAppendError as E;
+        match self {
+            E::NotFound | E::Closed | E::TooLarge | E::IncorrectOffset(_) | E::PayloadTooLarge => {
+                ApiOutcome::Retry
+            }
+            E::ContentHashMismatch => ApiOutcome::HashMismatch,
+            E::ConcurrentSessionInvalidOffset | E::ConcurrentSessionInvalidDataSize => {
+                ApiOutcome::Invariant
+            }
+            E::Other => ApiOutcome::Unknown,
+            _ => ApiOutcome::Unknown,
+        }
+    }
+}
+
+impl ApiError for files::UploadSessionStartError {
+    fn outcome(&self) -> ApiOutcome {
+        use files::UploadSessionStartError as E;
+        match self {
+            E::PayloadTooLarge => ApiOutcome::Retry,
+            E::ContentHashMismatch => ApiOutcome::HashMismatch,
+            E::ConcurrentSessionDataNotAllowed | E::ConcurrentSessionCloseNotAllowed => {
+                ApiOutcome::Invariant
+            }
+            E::Other => ApiOutcome::Unknown,
+            _ => ApiOutcome::Unknown,
+        }
+    }
+}
+
+impl ApiError for files::DeleteError {
+    fn outcome(&self) -> ApiOutcome {
+        use files::DeleteError as E;
+        match self {
+            E::PathLookup(files::LookupError::NotFound) => ApiOutcome::Absent,
+            E::PathLookup(error) => lookup_outcome(error),
+            E::PathWrite(error) => write_outcome(error),
+            E::TooManyWriteOperations => ApiOutcome::Retry,
+            E::TooManyFiles => ApiOutcome::Invariant,
+            E::Other => ApiOutcome::Unknown,
+            _ => ApiOutcome::Unknown,
+        }
+    }
+}
+
+impl ApiError for files::CreateFolderError {
+    fn outcome(&self) -> ApiOutcome {
+        match self {
+            Self::Path(error) => write_outcome(error),
+        }
+    }
+}
+impl ApiError for files::GetMetadataError {
+    fn outcome(&self) -> ApiOutcome {
+        match self {
+            Self::Path(error) => lookup_outcome(error),
+        }
+    }
+}
+impl ApiError for files::DownloadError {
+    fn outcome(&self) -> ApiOutcome {
+        match self {
+            Self::Path(error) => lookup_outcome(error),
+            Self::UnsupportedFile => ApiOutcome::Unavailable,
+            Self::Other => ApiOutcome::Unknown,
+            _ => ApiOutcome::Unknown,
+        }
+    }
+}
+impl ApiError for files::ListFolderError {
+    fn outcome(&self) -> ApiOutcome {
+        match self {
+            Self::Path(_) => ApiOutcome::Environmental,
+            Self::TemplateError(_) => ApiOutcome::Invariant,
+            Self::Other => ApiOutcome::Unknown,
+            _ => ApiOutcome::Unknown,
+        }
+    }
+}
+impl ApiError for files::ListFolderContinueError {
+    fn outcome(&self) -> ApiOutcome {
+        match self {
+            Self::Path(_) => ApiOutcome::Environmental,
+            Self::Reset => ApiOutcome::Retry,
+            Self::Other => ApiOutcome::Unknown,
+            _ => ApiOutcome::Unknown,
+        }
+    }
+}
+impl ApiError for files::ListFolderLongpollError {
+    fn outcome(&self) -> ApiOutcome {
+        match self {
+            Self::Reset => ApiOutcome::Retry,
+            Self::Other => ApiOutcome::Unknown,
+            _ => ApiOutcome::Unknown,
+        }
+    }
+}
+
+impl DropboxError {
+    pub(crate) fn sdk<E: ApiError>(operation: &'static str, error: SdkError<E>) -> Self {
+        let outcome = match &error {
+            SdkError::Api(error) => error.outcome(),
+            SdkError::HttpClient(_) | SdkError::ServerError(_) | SdkError::RateLimited { .. } => {
+                ApiOutcome::Retry
+            }
+            SdkError::Authentication(_) | SdkError::AccessDenied(_) => ApiOutcome::UserAction,
+            SdkError::BadRequest(_)
+            | SdkError::UnexpectedResponse(_)
+            | SdkError::UnexpectedHttpError { .. }
+            | SdkError::Json(_) => ApiOutcome::Invariant,
+        };
+        let mut source = match error {
+            SdkError::Api(error) => SdkError::Api(error.into()),
+            SdkError::HttpClient(error) => SdkError::HttpClient(error),
+            SdkError::Json(error) => SdkError::Json(error),
+            SdkError::UnexpectedResponse(body) => SdkError::UnexpectedResponse(body),
+            SdkError::BadRequest(body) => SdkError::BadRequest(body),
+            SdkError::Authentication(error) => SdkError::Authentication(error),
+            SdkError::RateLimited {
+                reason,
+                retry_after_seconds,
+            } => SdkError::RateLimited {
+                reason,
+                retry_after_seconds,
+            },
+            SdkError::AccessDenied(error) => SdkError::AccessDenied(error),
+            SdkError::ServerError(body) => SdkError::ServerError(body),
+            SdkError::UnexpectedHttpError { code, response } => {
+                SdkError::UnexpectedHttpError { code, response }
+            }
+        };
+        // Body strings may echo request input; retain the typed error and safe causes.
+        match &mut source {
+            SdkError::BadRequest(body)
+            | SdkError::UnexpectedResponse(body)
+            | SdkError::ServerError(body) => body.clear(),
+            SdkError::UnexpectedHttpError { response, .. } => response.clear(),
+            SdkError::Json(error) if error.is_data() => {
+                *error = <serde_json::Error as serde::de::Error>::custom(
+                    "invalid Dropbox response field",
+                );
+            }
+            _ => {}
+        }
+        Self::Sdk {
+            operation,
+            outcome,
+            source: Box::new(source),
+        }
+    }
+
+    fn transport(source: TransportError) -> Self {
+        Self::Sdk {
+            operation: "prepare Dropbox transport",
+            outcome: ApiOutcome::Retry,
+            source: Box::new(SdkError::HttpClient(Box::new(source))),
+        }
+    }
+
+    pub(crate) fn api_outcome(&self) -> ApiOutcome {
+        match self {
+            Self::Sdk { outcome, .. } => *outcome,
+            _ => ApiOutcome::Unknown,
+        }
+    }
+
+    pub(crate) fn transport_outcome(&self) -> Option<TransportOutcome> {
+        match self {
+            Self::Sdk { source, .. } => source
+                .downcast_ref_inner::<TransportError>()
+                .map(TransportError::outcome),
+            _ => None,
+        }
+    }
+
+    fn is_transport_retry(&self) -> bool {
+        matches!(self, Self::Sdk { source, .. } if matches!(source.as_ref(), SdkError::HttpClient(_)))
+            && matches!(
+                self.transport_outcome(),
+                None | Some(TransportOutcome::Retry { delay: None })
+            )
+    }
+
+    fn mutation_may_have_applied(&self) -> bool {
+        match self {
+            Self::Sdk { source, .. } => match source.as_ref() {
+                SdkError::HttpClient(_) => match source.downcast_ref_inner::<TransportError>() {
+                    Some(TransportError::RateLimitFailure { .. }) => false,
+                    Some(TransportError::DelayedBodyFailure { status, .. }) => *status >= 500,
+                    Some(TransportError::ServerBusy { .. }) => true,
+                    _ => self.is_transport_retry(),
+                },
+                SdkError::ServerError(_) | SdkError::Json(_) | SdkError::UnexpectedResponse(_) => {
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+}
+
+/// Generated route sources retained without erasing their concrete types.
+#[derive(Debug, Error)]
+pub enum RouteError {
+    #[error(transparent)]
+    UploadError(#[from] files::UploadError),
+    #[error(transparent)]
+    UploadSessionFinishError(#[from] files::UploadSessionFinishError),
+    #[error(transparent)]
+    UploadSessionAppendError(#[from] files::UploadSessionAppendError),
+    #[error(transparent)]
+    UploadSessionStartError(#[from] files::UploadSessionStartError),
+    #[error(transparent)]
+    DeleteError(#[from] files::DeleteError),
+    #[error(transparent)]
+    CreateFolderError(#[from] files::CreateFolderError),
+    #[error(transparent)]
+    GetMetadataError(#[from] files::GetMetadataError),
+    #[error(transparent)]
+    DownloadError(#[from] files::DownloadError),
+    #[error(transparent)]
+    ListFolderError(#[from] files::ListFolderError),
+    #[error(transparent)]
+    ListFolderContinueError(#[from] files::ListFolderContinueError),
+    #[error(transparent)]
+    ListFolderLongpollError(#[from] files::ListFolderLongpollError),
+}
+impl From<NoError> for RouteError {
+    fn from(error: NoError) -> Self {
+        match error {}
+    }
+}
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -2561,7 +2339,7 @@ mod tests {
     use std::io::{self, Cursor, Read};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use proptest::prelude::*;
 
@@ -2574,18 +2352,15 @@ mod tests {
     };
 
     use super::{
-        CONNECT_SECONDS, DIRECT_UPLOAD_MAX_BYTES, DOWNLOAD_SECONDS, DropboxError, DropboxRoot,
-        EntryTag, ListEntry, MutationRejection, PROGRESS_INTERVAL, ProgressReader,
-        UPLOAD_SESSION_MAX_BYTES, apply_entries, ascii_json, exact_download_agent,
-        find_mutation_rejection, validate_direct_upload_size, validate_upload_size,
+        ApiOutcome, DropboxError, DropboxRoot, EntryTag, ListEntry, MutationRejection,
+        PROGRESS_INTERVAL, ProgressReader, UPLOAD_SESSION_MAX_BYTES, apply_entries, files,
+        lookup_outcome, validate_upload_size, write_outcome,
     };
 
     #[test]
-    fn permanent_mutation_tags_have_stable_dispositions() {
+    fn permanent_mutation_tags_have_stable_dispositions() -> Result<(), Box<dyn Error>> {
         for (tag, expected) in [
-            ("malformed_path", MutationRejection::InvalidPath),
             ("disallowed_name", MutationRejection::DisallowedName),
-            ("restricted_content", MutationRejection::RestrictedContent),
             ("no_write_permission", MutationRejection::PermissionDenied),
             ("access_restricted", MutationRejection::PermissionDenied),
             ("insufficient_space", MutationRejection::InsufficientSpace),
@@ -2595,32 +2370,19 @@ mod tests {
             ),
             ("team_folder", MutationRejection::OperationNotAllowed),
         ] {
-            let response = serde_json::json!({
-                "error": {"reason": [{".tag": tag}]}
-            });
-            assert_eq!(find_mutation_rejection(&response), Some(expected));
+            let error: files::WriteError =
+                serde_json::from_str(&serde_json::json!({".tag": tag}).to_string())?;
+            assert_eq!(write_outcome(&error), ApiOutcome::Rejected(expected));
         }
         assert_eq!(
-            find_mutation_rejection(&serde_json::json!({
-                "error": {".tag": "too_many_write_operations"}
-            })),
-            None
+            write_outcome(&files::WriteError::TooManyWriteOperations),
+            ApiOutcome::Retry
         );
-    }
-
-    #[test]
-    fn exact_download_times_out_only_when_body_progress_stops() {
-        let agent = exact_download_agent();
-        let timeouts = agent.config().timeouts();
-
-        assert_eq!(timeouts.global, None);
-        assert_eq!(timeouts.connect, Some(Duration::from_secs(CONNECT_SECONDS)));
         assert_eq!(
-            timeouts.recv_body,
-            Some(Duration::from_secs(DOWNLOAD_SECONDS))
+            lookup_outcome(&files::LookupError::RestrictedContent),
+            ApiOutcome::Unavailable
         );
-        assert_eq!(agent.config().max_idle_connections(), 4);
-        assert_eq!(agent.config().max_idle_connections_per_host(), 4);
+        Ok(())
     }
 
     struct ByteAtATime(Cursor<Vec<u8>>);
@@ -2965,30 +2727,12 @@ mod tests {
 
     #[test]
     fn direct_upload_limit_is_checked_before_network_io() {
-        assert!(validate_direct_upload_size(DIRECT_UPLOAD_MAX_BYTES).is_ok());
-        assert!(matches!(
-            validate_direct_upload_size(DIRECT_UPLOAD_MAX_BYTES + 1),
-            Err(DropboxError::DirectUploadTooLarge { bytes })
-                if bytes == DIRECT_UPLOAD_MAX_BYTES + 1
-        ));
         assert!(validate_upload_size(UPLOAD_SESSION_MAX_BYTES).is_ok());
         assert!(matches!(
             validate_upload_size(UPLOAD_SESSION_MAX_BYTES + 1),
             Err(DropboxError::UploadTooLarge { bytes })
                 if bytes == UPLOAD_SESSION_MAX_BYTES + 1
         ));
-    }
-
-    #[test]
-    fn dropbox_header_json_is_ascii_safe() -> Result<(), Box<dyn Error>> {
-        let value = serde_json::json!({"path": "/Café/雪.txt"});
-        let encoded = ascii_json(&value)?;
-
-        assert!(encoded.is_ascii());
-        assert!(encoded.contains(r#"\u00e9"#));
-        assert!(encoded.contains(r#"\u96ea"#));
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&encoded)?, value);
-        Ok(())
     }
 
     #[test]

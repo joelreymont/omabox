@@ -2,12 +2,12 @@
 
 The focused corrections authorized on 2026-09-05 are tracked in their own
 dots. Slot ownership, daemon recovery/readiness, root identity, durable
-mutation blocking, and idle-cost fixes use the current transport and do not
-depend on section J. The previously approved SDK migration remains unfinished
-in its active dot, `omabox-move-the-dropbox-cb30bc34`, and workspace
-`.jj-ws/omabox-move-the-dropbox-cb30bc34`. That workspace adds the SDK dependency
-and transport adapter; OAuth and Dropbox routes still use the handwritten
-client. No SDK migration has landed in the main checkout.
+mutation blocking, and idle-cost fixes landed independently of section J.
+Section J now replaces the handwritten OAuth and route layer in the main
+checkout. Its original dot is `omabox-move-the-dropbox-cb30bc34`; the old
+`.jj-ws/omabox-move-the-dropbox-cb30bc34` workspace remains historical work,
+not the integrated implementation. Durable upload-session resumption remains
+its separate J-resume dot.
 
 Baseline: commit `672301cf6366`. This document is the implementation contract
 for every dot in the remediation campaign. Workers code to it; deviations are
@@ -346,7 +346,8 @@ adapters depend on this version's parser, retry, and trait behavior; an
 upgrade requires re-running the transport conformance tests. No bundled HTTP
 client. Brings `ring`, `url`, `futures`, `async-lock`, `bytes`, `log`;
 `Cargo.lock` is committed with the change. Our `base64` use is removed if the
-SDK's PKCE replaces it. Both agents are configured with
+SDK's PKCE replaces it. Fallible OS randomness and `base64` remain because
+the SDK's random PKCE constructor panics on entropy-source failure. Both agents are configured with
 `http_status_as_error(false)` so every status reaches the SDK's parser.
 
 ### Transport
@@ -463,7 +464,8 @@ struct Target { kind: RequestKind /* Rpc, Upload, Finish, Download, LongPoll, OA
   `UploadSessionFinishArg::with_content_hash`.
 - Delete: `DeleteArg::new(path).with_parent_rev(last_known_rev)`.
 - Create folder: `CreateFolderArg` with `autorename = false`.
-- Download: `DownloadArg::new(path).with_rev(rev)` and range `Some(offset)`
+- Download: `DownloadArg::new("rev:<rev>").with_rev(rev)` preserves the
+  engine's exact-revision API without treating a staging path as a remote path; range `Some(offset)`
   on resume; `rev`, `content_hash`, `size` checks and whole-file hashing stay
   ours.
 - Batch mode (`upload_session/finish_batch`) is not used and never was; every
@@ -477,9 +479,9 @@ struct Target { kind: RequestKind /* Rpc, Upload, Finish, Download, LongPoll, OA
   `BlockReason::UnsupportedFileSize` (added to section B's enum), never
   retried, never inferring anything remote.
 
-Error mapping is a per-operation table implemented as exhaustive matches with
-no wildcard except the SDK's `Other` variants, each of which maps to a
-dedicated `Unknown` outcome; every high-level variant that extracts
+Error mapping is a per-operation table covering every current SDK variant.
+`Other` and the compiler-required fallback for non-exhaustive SDK enums map
+to a dedicated `Unknown` outcome; every high-level variant that extracts
 information keeps the SDK or local error as its source:
 
 | Operation | SDK error | Outcome |
@@ -548,6 +550,18 @@ source, `UploadedContentMismatch` on the direct upload/finish path,
 `auth.rs` child handling and its tests, dropping instead of draining an
 unneeded response, `ProgressReader::complete`. Not carried: per-phase timeout
 configuration, `http.rs`, `HeaderNumber`.
+
+### Integrated verification notes
+
+All original fake-server scenarios remain. SDK fixtures use documented shapes
+and omit arguments whose generated defaults already encode the requested value.
+The stage-race test now verifies that an existing verified stage is preserved
+and installed while the unused response is dropped, as required above. The old
+ASCII and timeout configuration assertions are covered by the adapter's Unicode
+and behavioral deadline tests. Token rejection policy tests replace daemon-side
+401 session reconstruction tests; SDK refresh/reissue and unauthenticated
+longpoll are exercised through generated routes. HTTP 416 restart and oversized
+plan persistence have explicit regressions.
 
 ### Upstream follow-ups (reference)
 
