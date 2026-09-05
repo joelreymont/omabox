@@ -1,9 +1,11 @@
 ---
 title: Avoid unchanged inventory writes and repeated account validation
-status: active
+status: closed
 priority: 2
 issue-type: task
-created-at: "\"2026-09-05T10:30:06.414310+03:00\""
+created-at: "\"\\\"2026-09-05T10:30:06.414310+03:00\\\"\""
+closed-at: "2026-09-05T11:06:04.195189+03:00"
+close-reason: "landed and verified: Astra reviewed no-op scan detection and per-session validation cache with journal checks retained; unchanged publication makes zero SQL row changes, stale-root/failed writes preserve prior snapshot, fresh client and failed validation recheck. Release 10k median 138 to 53ms and 50k 496 to 262ms, reproducible harness/results in docs/performance.md. Combined daemon/readiness/idle fmt, clippy all targets -D warnings, full cargo test pass; InventoryPublication TLC 50 states passes."
 blocks:
   - omabox-preserve-sync-history-d24798cd
 ---

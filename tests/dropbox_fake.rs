@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use common::{allow_owner_access, deny_all_access};
 use omabox::auth::{AccessToken, AuthError, OAuthClient, RefreshToken};
 use omabox::dropbox::{
-    DropboxClient, DropboxEndpoints, DropboxError, DropboxLink, DropboxRoot, InventoryRefresh,
-    LongPollWakeup, MutationOutcome, RemotePathState,
+    AccountValidation, DropboxClient, DropboxEndpoints, DropboxError, DropboxLink, DropboxRoot,
+    InventoryRefresh, LongPollWakeup, MutationOutcome, RemotePathState,
 };
 use omabox::journal::{
     BlockReason, DropboxBinding, Journal, LocalRootBinding, PlanBlock, PlanStatus, PlanUnblock,
@@ -96,15 +96,6 @@ fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result
         FakeResponse::json(json!({
             "access_token": "opaque-access-b",
             "expires_in": 14400
-        })),
-        FakeResponse::json(json!({
-            "account_id": "account-a",
-            "root_info": {"root_namespace_id": "namespace-a"}
-        })),
-        FakeResponse::json(json!({
-            ".tag": "folder",
-            "path_lower": "/sync",
-            "path_display": "/Sync"
         })),
         FakeResponse::json(json!({
             "account_id": "account-a",
@@ -206,7 +197,7 @@ fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result
     assert_eq!(std::fs::read(sync_root.path().join("Alpha.txt"))?, bytes);
 
     let requests = server.finish()?;
-    assert_eq!(requests.len(), 10);
+    assert_eq!(requests.len(), 8);
     assert_eq!(requests[0].path, "/oauth2/token");
     assert!(text_body(&requests[0])?.contains("grant_type=authorization_code"));
     assert!(text_body(&requests[0])?.contains("code_verifier="));
@@ -215,12 +206,10 @@ fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result
     assert!(text_body(&requests[1])?.contains("grant_type=refresh_token"));
     assert_eq!(requests[2].path, "/2/users/get_current_account");
     assert_eq!(requests[3].path, "/2/files/get_metadata");
-    assert_eq!(requests[4].path, "/2/users/get_current_account");
-    assert_eq!(requests[5].path, "/2/files/get_metadata");
-    assert_eq!(requests[6].path, "/2/files/list_folder");
-    assert_eq!(requests[7].path, "/2/files/list_folder/continue");
-    assert_eq!(requests[8].path, "/2/files/list_folder/longpoll");
-    assert_eq!(requests[9].path, "/2/files/download");
+    assert_eq!(requests[4].path, "/2/files/list_folder");
+    assert_eq!(requests[5].path, "/2/files/list_folder/continue");
+    assert_eq!(requests[6].path, "/2/files/list_folder/longpoll");
+    assert_eq!(requests[7].path, "/2/files/download");
     assert!(header(&requests[2], "authorization").is_some());
     assert!(header(&requests[2], "dropbox-api-path-root").is_none());
     assert_eq!(
@@ -228,7 +217,7 @@ fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result
         Some(r#"{".tag":"root","root":"namespace-a"}"#)
     );
     assert!(
-        header(&requests[9], "dropbox-api-arg")
+        header(&requests[7], "dropbox-api-arg")
             .is_some_and(|value| value.contains(r#""path":"rev:rev-a""#))
     );
     Ok(())
@@ -1550,7 +1539,6 @@ fn fresh_download_uses_parent_directory_casing_without_remote_writes() -> Result
                 download_metadata("apps/Entry.doentry", "remote-rev", &content, bytes.len()),
             )
             .for_path("/2/files/download"),
-        account(),
         FakeResponse::json(json!({
             "entries": [file_metadata(
                 "/apps/second.doentry",
@@ -1838,10 +1826,6 @@ fn remote_directory_preserves_a_local_file_under_a_synchronized_name() -> Result
             "has_more": false
         })),
         FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
-        })),
-        FakeResponse::json(json!({
             "entries": [],
             "cursor": "directory-file-collision",
             "has_more": false
@@ -1913,7 +1897,7 @@ fn remote_directory_preserves_a_local_file_under_a_synchronized_name() -> Result
         Some(Baseline::Present(_))
     ));
     assert!(journal.conflicts()?.is_empty());
-    assert_eq!(server.finish()?.len(), 5);
+    assert_eq!(server.finish()?.len(), 4);
     Ok(())
 }
 
@@ -1950,10 +1934,6 @@ fn local_directory_preserves_a_dropbox_file_under_a_synchronized_name() -> Resul
         FakeResponse::json(json!({"metadata": original})),
         FakeResponse::json(json!({
             "metadata": folder_metadata("/node", "/node")
-        })),
-        FakeResponse::json(json!({
-            "account_id": "account",
-            "root_info": {"root_namespace_id": "namespace"}
         })),
         FakeResponse::json(json!({
             "entries": [folder_metadata("/node", "/node")],
@@ -2039,7 +2019,7 @@ fn local_directory_preserves_a_dropbox_file_under_a_synchronized_name() -> Resul
     ));
     assert!(journal.conflicts()?.is_empty());
     let requests = server.finish()?;
-    assert_eq!(requests.len(), 9);
+    assert_eq!(requests.len(), 8);
     assert_eq!(
         requests
             .iter()
@@ -4493,14 +4473,12 @@ fn matching_observations_retire_a_stale_install_and_later_edits_sync() -> Result
             "has_more": false,
         }))
         .for_path("/2/files/list_folder"),
-        account(),
         FakeResponse::json(json!({
             "entries": [],
             "cursor": "matching-stable",
             "has_more": false,
         }))
         .for_path("/2/files/list_folder/continue"),
-        account(),
         FakeResponse::json(json!({
             "entries": [],
             "cursor": "after-local-edit",
@@ -4581,7 +4559,7 @@ fn matching_observations_retire_a_stale_install_and_later_edits_sync() -> Result
         journal.baseline(Path::new("file.txt"))?,
         Some(Baseline::Present(edited))
     );
-    assert_eq!(server.finish()?.len(), 7);
+    assert_eq!(server.finish()?.len(), 5);
     Ok(())
 }
 
@@ -5363,6 +5341,108 @@ fn journal_binding_mismatch_blocks_inventory_before_listing() -> Result<(), Box<
         Err(DropboxError::AccountBindingChanged)
     ));
     assert_eq!(server.finish()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn account_validation_is_cached_per_client_but_every_journal_is_checked()
+-> Result<(), Box<dyn Error>> {
+    let account = || {
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        }))
+        .for_path("/2/users/get_current_account")
+    };
+    let listing = |cursor: &str, route: &str| {
+        FakeResponse::json(json!({
+            "entries": [],
+            "cursor": cursor,
+            "has_more": false
+        }))
+        .for_path(route)
+    };
+    let server = FakeServer::start(vec![
+        account(),
+        listing("cursor-1", "/2/files/list_folder"),
+        listing("cursor-2", "/2/files/list_folder/continue"),
+        account(),
+        listing("cursor-3", "/2/files/list_folder/continue"),
+    ])?;
+    let journal_directory = TempDir::new()?;
+    let mut journal = Journal::open(journal_directory.path().join("journal.sqlite3"))?;
+    let client = fake_client(&server, "opaque-access-cached-validation")?;
+    assert_eq!(
+        client.validate_account(&mut journal)?,
+        AccountValidation::Valid
+    );
+    assert_eq!(
+        client.refresh_inventory(&mut journal)?,
+        InventoryRefresh::Published
+    );
+    assert_eq!(
+        client.refresh_inventory(&mut journal)?,
+        InventoryRefresh::Published
+    );
+
+    let new_client = fake_client(&server, "opaque-access-new-client")?;
+    assert_eq!(
+        new_client.refresh_inventory(&mut journal)?,
+        InventoryRefresh::Published
+    );
+    let wrong_directory = TempDir::new()?;
+    let mut wrong_journal = Journal::open(wrong_directory.path().join("journal.sqlite3"))?;
+    let _ = wrong_journal.bind_dropbox_root(&DropboxBinding {
+        account_id: String::from("different-account"),
+        root_namespace_id: String::from("namespace"),
+        remote_root: String::new(),
+    })?;
+    assert!(matches!(
+        new_client.refresh_inventory(&mut wrong_journal),
+        Err(DropboxError::AccountBindingChanged)
+    ));
+
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 5);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/2/users/get_current_account")
+            .count(),
+        2
+    );
+    Ok(())
+}
+
+#[test]
+fn failed_account_validation_is_retried_by_the_same_client() -> Result<(), Box<dyn Error>> {
+    let server = FakeServer::start(vec![
+        FakeResponse::status_json(500, json!({"error": {".tag": "other"}}))
+            .for_path("/2/users/get_current_account"),
+        FakeResponse::json(json!({
+            "account_id": "account",
+            "root_info": {"root_namespace_id": "namespace"}
+        }))
+        .for_path("/2/users/get_current_account"),
+        FakeResponse::json(json!({
+            "entries": [],
+            "cursor": "cursor",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder"),
+    ])?;
+    let client = fake_client(&server, "opaque-access-validation-retry")?;
+    let directory = TempDir::new()?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    assert!(client.refresh_inventory(&mut journal).is_err());
+    assert_eq!(
+        client.refresh_inventory(&mut journal)?,
+        InventoryRefresh::Published
+    );
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].path, "/2/users/get_current_account");
+    assert_eq!(requests[1].path, "/2/users/get_current_account");
     Ok(())
 }
 

@@ -6,6 +6,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rustix::fd::OwnedFd;
@@ -393,6 +394,7 @@ pub struct DropboxClient {
     agent: ureq::Agent,
     download_agent: ureq::Agent,
     transfer_observer: Option<TransferObserver>,
+    account_validated: AtomicBool,
 }
 
 impl DropboxClient {
@@ -421,6 +423,7 @@ impl DropboxClient {
             agent: ureq::Agent::new_with_config(config),
             download_agent: exact_download_agent(),
             transfer_observer: None,
+            account_validated: AtomicBool::new(false),
         }
     }
 
@@ -461,6 +464,7 @@ impl DropboxClient {
         }
         client.root.namespace_id = account.root_info.root_namespace_id;
         client.validate_remote_root()?;
+        client.account_validated.store(true, Ordering::Relaxed);
         Ok(DropboxLink::Linked(Box::new(client)))
     }
 
@@ -475,24 +479,25 @@ impl DropboxClient {
         &self,
         journal: &mut Journal,
     ) -> Result<AccountValidation, DropboxError> {
-        let response = self.current_account()?;
-        if response.account_id != self.root.account_id {
-            Ok(AccountValidation::AccountChanged)
-        } else if response.root_info.root_namespace_id != self.root.namespace_id {
-            Ok(AccountValidation::RootChanged)
-        } else {
-            self.validate_remote_root()?;
-            match journal
-                .bind_dropbox_root(&self.root.binding())
-                .map_err(|source| DropboxError::Journal { source })?
-            {
-                DropboxBindingWrite::Bound | DropboxBindingWrite::AlreadyBound => {
-                    Ok(AccountValidation::Valid)
-                }
-                DropboxBindingWrite::Mismatch { .. } => {
-                    Ok(AccountValidation::JournalBindingChanged)
-                }
+        if !self.account_validated.load(Ordering::Relaxed) {
+            let response = self.current_account()?;
+            if response.account_id != self.root.account_id {
+                return Ok(AccountValidation::AccountChanged);
             }
+            if response.root_info.root_namespace_id != self.root.namespace_id {
+                return Ok(AccountValidation::RootChanged);
+            }
+            self.validate_remote_root()?;
+        }
+        match journal
+            .bind_dropbox_root(&self.root.binding())
+            .map_err(|source| DropboxError::Journal { source })?
+        {
+            DropboxBindingWrite::Bound | DropboxBindingWrite::AlreadyBound => {
+                self.account_validated.store(true, Ordering::Relaxed);
+                Ok(AccountValidation::Valid)
+            }
+            DropboxBindingWrite::Mismatch { .. } => Ok(AccountValidation::JournalBindingChanged),
         }
     }
 

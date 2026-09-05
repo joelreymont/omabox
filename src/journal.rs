@@ -936,6 +936,13 @@ impl Journal {
         if active.binding != *binding {
             return Ok(false);
         }
+        let stored_observations = read_local_inventory(&transaction, &database_path)?;
+        if stored_observations.as_slice() == observations {
+            let stored_hashes = read_local_hash_cache(&transaction, &database_path)?;
+            if stored_hashes.as_slice() == hashes {
+                return Ok(true);
+            }
+        }
         let generation =
             i64::try_from(active.generation).map_err(|_| JournalError::InvalidState {
                 operation: "publish local hash cache",
@@ -4363,6 +4370,13 @@ mod tests {
             std::slice::from_ref(&old),
             std::slice::from_ref(&old_hash),
         )?);
+        let unchanged_start = journal.connection.total_changes();
+        assert!(journal.publish_local_scan(
+            &binding,
+            std::slice::from_ref(&old),
+            std::slice::from_ref(&old_hash),
+        )?);
+        assert_eq!(journal.connection.total_changes(), unchanged_start);
 
         let replacement = LocalObservationRecord {
             path: PathBuf::from("new.txt"),
@@ -4379,6 +4393,16 @@ mod tests {
                 .is_err()
         );
 
+        assert_eq!(journal.local_inventory()?, vec![old.clone()]);
+        assert_eq!(journal.local_hash_cache()?, vec![old_hash.clone()]);
+
+        let stale_start = journal.connection.total_changes();
+        assert!(!journal.publish_local_scan(
+            &local_root("/stale", 3, 4),
+            std::slice::from_ref(&replacement),
+            &[local_hash("new.txt", 20)],
+        )?);
+        assert_eq!(journal.connection.total_changes(), stale_start);
         assert_eq!(journal.local_inventory()?, vec![old]);
         assert_eq!(journal.local_hash_cache()?, vec![old_hash]);
         Ok(())
