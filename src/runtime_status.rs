@@ -140,9 +140,6 @@ impl RuntimeStatus {
         self.update(|publisher| {
             let changed = publisher.snapshot.phase != phase;
             publisher.snapshot.phase = phase;
-            if phase != DaemonPhase::Error {
-                publisher.snapshot.last_error = None;
-            }
             if changed {
                 publisher.snapshot.transfers.clear();
                 publisher.retained_finished = false;
@@ -156,13 +153,21 @@ impl RuntimeStatus {
         self.update(|_| true);
     }
 
-    /// Publish a fatal, deliberately sanitized error summary.
-    pub fn fatal_error(&self, message: &'static str) {
+    /// Publish a deliberately sanitized daemon error summary.
+    pub fn error(&self, message: &'static str) {
         self.update(|publisher| {
             publisher.snapshot.phase = DaemonPhase::Error;
             publisher.snapshot.transfers.clear();
             publisher.retained_finished = false;
             publisher.snapshot.last_error = Some(message);
+            true
+        });
+    }
+
+    /// Clear the last error only after a clean reconciliation pass.
+    pub fn clear_error(&self) {
+        self.update(|publisher| {
+            publisher.snapshot.last_error = None;
             true
         });
     }
@@ -435,7 +440,7 @@ mod tests {
             0,
             None,
         )));
-        status.fatal_error("Dropbox authentication is unavailable.");
+        status.error("Dropbox authentication is unavailable.");
         let failed = serde_json::from_slice::<Value>(&fs::read(path)?)?;
         assert_eq!(failed["phase"], "error");
         assert_eq!(failed["transfers"], serde_json::json!([]));
@@ -447,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_error_preserves_transfers_and_clears_after_recovery() -> Result<(), Box<dyn Error>> {
+    fn sync_error_survives_phase_changes_until_a_clean_pass() -> Result<(), Box<dyn Error>> {
         let runtime = TempDir::new()?;
         let status = RuntimeStatus::new(runtime.path())?;
         status.phase(DaemonPhase::Syncing);
@@ -469,9 +474,16 @@ mod tests {
         );
 
         status.phase(DaemonPhase::Waiting);
+        let waiting = serde_json::from_slice::<Value>(&fs::read(&path)?)?;
+        assert_eq!(waiting["phase"], "waiting");
+        assert_eq!(waiting["transfers"], serde_json::json!([]));
+        assert_eq!(
+            waiting["last_error"],
+            "One or more files could not be synchronized."
+        );
+
+        status.clear_error();
         let recovered = serde_json::from_slice::<Value>(&fs::read(path)?)?;
-        assert_eq!(recovered["phase"], "waiting");
-        assert_eq!(recovered["transfers"], serde_json::json!([]));
         assert_eq!(recovered["last_error"], Value::Null);
         Ok(())
     }
