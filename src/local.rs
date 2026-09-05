@@ -1180,10 +1180,23 @@ pub(crate) fn stage_upload_at(
         }
         Err(source) => return Err(source),
     };
-    if let Some((file, actual, _)) = existing
-        && reuse_verified_stage(&file, &actual, expected, None, &directory, &stage_path)?
-    {
-        return Ok(StageOutcome::AlreadyStaged(stage()));
+    if let Some((file, actual, _)) = existing {
+        if reuse_verified_stage(&file, &actual, expected, None, &directory, &stage_path)? {
+            return Ok(StageOutcome::AlreadyStaged(stage()));
+        }
+        // This content-addressed entry is in the private upload cache. A
+        // confirmed corrupt regular file is disposable and must not prevent
+        // rebuilding the stage from the source on every subsequent retry.
+        if !named_inode_matches(&file, &directory, &name, &stage_path)? {
+            return Err(LocalError::ChangedDuringRead {
+                operation: "remove corrupt upload stage",
+                path: stage_path,
+            });
+        }
+        unlinkat(&directory, &name, AtFlags::empty()).map_err(|source| {
+            syscall_failure("remove corrupt upload stage", &stage_path, source)
+        })?;
+        sync_directory(&directory, &stage_path, "sync corrupt upload stage removal")?;
     }
 
     let mut source = open_relative_regular(root, relative, "open upload source")?;

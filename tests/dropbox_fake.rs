@@ -1110,11 +1110,26 @@ fn occupied_download_stage_is_durably_blocked_without_overwrite_or_request()
 }
 
 #[test]
-fn occupied_upload_stage_is_durably_blocked_without_overwrite_or_request()
--> Result<(), Box<dyn Error>> {
-    let bytes = b"expected download bytes";
-    let occupant = b"unrelated occupant bytes";
+fn corrupt_upload_stage_is_rebuilt_and_uploaded() -> Result<(), Box<dyn Error>> {
+    assert_corrupt_upload_stage_recovers(false)
+}
+
+#[test]
+fn corrupt_upload_stage_recovers_from_durable_block_after_reopen() -> Result<(), Box<dyn Error>> {
+    assert_corrupt_upload_stage_recovers(true)
+}
+
+fn assert_corrupt_upload_stage_recovers(previously_blocked: bool) -> Result<(), Box<dyn Error>> {
+    let bytes = b"expected upload bytes";
+    let occupant = b"corrupt private cache bytes";
     let content = dropbox_content_hash(bytes.as_slice())?;
+    let remote = RemoteFile::new(content.clone(), DropboxRevision::new("repaired-upload"));
+    let metadata = file_metadata(
+        "/occupied.txt",
+        "/occupied.txt",
+        remote.revision.as_str(),
+        &remote.content,
+    );
     let server = FakeServer::start(vec![
         account().for_path("/2/users/get_current_account"),
         FakeResponse::json(json!({
@@ -1123,6 +1138,13 @@ fn occupied_upload_stage_is_durably_blocked_without_overwrite_or_request()
             "has_more": false
         }))
         .for_path("/2/files/list_folder"),
+        FakeResponse::json(metadata.clone()).for_path("/2/files/upload"),
+        FakeResponse::json(json!({
+            "entries": [metadata],
+            "cursor": "repaired-upload-stage",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder/continue"),
     ])?;
     let client = Arc::new(fake_client(&server, "opaque-access-occupied-stage")?);
     let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
@@ -1138,16 +1160,43 @@ fn occupied_upload_stage_is_durably_blocked_without_overwrite_or_request()
         stage_upload(&root, Path::new("occupied.txt"), &staging, &content)?,
         StageOutcome::Staged(_)
     ));
-    let stage_path = std::fs::read_dir(&staging)?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .next()
-        .ok_or_else(|| io::Error::other("download stage was not created"))?;
+    let stage_path = staging.join(content.as_str());
     std::fs::remove_file(&stage_path)?;
     std::fs::write(&stage_path, occupant)?;
-    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let journal_path = directory.path().join("journal.sqlite3");
+    let mut journal = Journal::open(&journal_path)?;
     let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    if previously_blocked {
+        let recorded = record_fixture_plan(
+            &mut journal,
+            Path::new("occupied.txt"),
+            &Baseline::Absent,
+            &Observation::Present(LocalFile::new(content)),
+            &Observation::ConfirmedAbsent,
+        )?;
+        assert_eq!(
+            journal.block_plan(recorded, &BlockReason::StageOccupied, 0)?,
+            PlanBlock::Blocked
+        );
+        drop(journal);
+        journal = Journal::open(&journal_path)?;
+        assert_eq!(journal.blocked_plans()?.len(), 1);
+    }
+    let _ = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+    assert_eq!(std::fs::read(root.join("occupied.txt"))?, bytes);
+    assert!(journal.pending_plans()?.is_empty());
+    assert!(journal.blocked_plans()?.is_empty());
+    assert_eq!(
+        journal.baseline(Path::new("occupied.txt"))?,
+        Some(Baseline::Present(remote))
+    );
     let report = complete_report(reconcile_once(
         &mut journal,
         &client,
@@ -1156,28 +1205,18 @@ fn occupied_upload_stage_is_durably_blocked_without_overwrite_or_request()
         &staging,
         &recovery,
     )?)?;
-    assert_eq!(report.blocked, 1);
-    assert_eq!(report.sync_errors, 1);
-    assert_eq!(std::fs::read(&stage_path)?, occupant);
-    assert!(journal.pending_plans()?.is_empty());
-    let blocked = journal.blocked_plans()?;
-    assert_eq!(blocked.len(), 1);
-    assert!(matches!(
-        blocked[0].status,
-        PlanStatus::Blocked {
-            reason: BlockReason::StageOccupied,
-            ..
-        }
-    ));
+    assert_eq!(report.blocked, 0);
+    assert_eq!(report.sync_errors, 0);
     drop(downloads);
     drop(client);
     let requests = server.finish()?;
-    assert_eq!(requests.len(), 2);
-    assert!(
-        requests
-            .iter()
-            .all(|request| request.path != "/2/files/upload")
-    );
+    assert_eq!(requests.len(), 4);
+    let uploads = requests
+        .iter()
+        .filter(|request| request.path == "/2/files/upload")
+        .collect::<Vec<_>>();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].body, bytes);
     Ok(())
 }
 
