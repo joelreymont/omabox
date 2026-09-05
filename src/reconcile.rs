@@ -14,6 +14,7 @@ use rustix::fd::OwnedFd;
 use thiserror::Error;
 
 use crate::dropbox::{DownloadAccess, DropboxClient, DropboxError};
+use crate::exclusions::is_excluded;
 use crate::journal::{
     BaselineRecord, BlockReason, Journal, JournalError, LocalObservationRecord, OperationId,
     PlanBlock, PlanConflictCompletion, PlanId, PlanRecord, PlanStatus, PlanSupersede, PlanUnblock,
@@ -35,7 +36,7 @@ use crate::planner::plan;
 use crate::recovery::{
     ExactCopyOutcome, RecoveryError, ReplayBlocked, ReplayReport, materialize_local_conflict,
     materialize_remote_conflict, materialize_remote_copy_at, prune_completed_recoveries,
-    replay_local_plans_at, replay_remote_operations_at,
+    replay_local_plans_at, replay_remote_operations_at, retire_excluded_plans,
 };
 
 /// A reconciliation failure. Expected observation races are returned as outcomes instead.
@@ -706,7 +707,8 @@ fn replay_pending_at(
 ) -> Result<ReplayReport, ReconcileError> {
     let collected = download_pool.collect_results()?;
     record_download_blocks(journal, &collected.blocked)?;
-    let blocked_plans = journal.blocked_plans()?;
+    let mut blocked_plans = journal.blocked_plans()?;
+    retire_excluded_plans(journal, &mut blocked_plans)?;
     let Some(root) = open_active_root(journal, sync_root)? else {
         return Err(ReconcileError::LocalRootChanged);
     };
@@ -715,7 +717,8 @@ fn replay_pending_at(
         .local_root_binding()?
         .ok_or(ReconcileError::LocalRootChanged)?
         .generation;
-    let pending_plans = journal.pending_plans()?;
+    let mut pending_plans = journal.pending_plans()?;
+    retire_excluded_plans(journal, &mut pending_plans)?;
     let live_bindings = pending_plans
         .iter()
         .chain(blocked_plans.iter())
@@ -1039,6 +1042,12 @@ fn reconcile_published(
          local_record,
          remote_record|
          -> Result<(), ReconcileError> {
+            // An excluded path is outside synchronization, even when an older
+            // journal has a baseline or remote observation for it. Never infer
+            // deletion from its omission in the local scan.
+            if is_excluded(canonical_path.as_path()) {
+                return Ok(());
+            }
             let (baseline_path, baseline) = match baseline_record {
                 Some((path, baseline)) => (Some(path), baseline),
                 None => (None, Baseline::Absent),
@@ -1659,7 +1668,10 @@ fn local_map(
     records: Vec<LocalObservationRecord>,
 ) -> Result<Vec<(CanonicalPath, LocalObservationRecord)>, ReconcileError> {
     let mut mapped = Vec::with_capacity(records.len());
-    for record in records {
+    for record in records
+        .into_iter()
+        .filter(|record| !is_excluded(&record.path))
+    {
         let canonical_path = CanonicalPath::from_display(&record.path);
         mapped.push((canonical_path, record));
     }
@@ -1783,7 +1795,7 @@ struct CaseVariantMove {
 
 fn case_variant_source(records: &[LocalObservationRecord]) -> Option<PathBuf> {
     let mut spellings = BTreeMap::<CanonicalPath, BTreeSet<PathBuf>>::new();
-    for record in records {
+    for record in records.iter().filter(|record| !is_excluded(&record.path)) {
         let canonical = CanonicalPath::from_display(&record.path);
         spellings
             .entry(canonical)

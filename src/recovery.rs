@@ -355,6 +355,10 @@ pub(crate) fn replay_local_plans_at<'a>(
     let mut final_completions = Vec::new();
 
     for plan in plans {
+        if crate::exclusions::is_excluded(&plan.path) {
+            supersede_plan(journal, plan)?;
+            continue;
+        }
         for planned in &plan.operations {
             if planned.status == RecordStatus::Completed {
                 continue;
@@ -579,6 +583,10 @@ pub(crate) fn replay_remote_operations_at(
     let mut report = ReplayReport::default();
 
     for plan in plans {
+        if crate::exclusions::is_excluded(&plan.path) {
+            supersede_plan(journal, &plan)?;
+            continue;
+        }
         for planned in &plan.operations {
             if planned.status == RecordStatus::Completed {
                 continue;
@@ -1173,6 +1181,22 @@ fn invalid(path: &Path, detail: &'static str) -> RecoveryError {
         path: path.to_path_buf(),
         detail,
     }
+}
+
+/// Retire old intent for newly excluded paths before reporting or queuing it.
+/// Supersession preserves the baseline and does not mutate either sync tree.
+pub(crate) fn retire_excluded_plans(
+    journal: &mut Journal,
+    plans: &mut Vec<PlanRecord>,
+) -> Result<(), RecoveryError> {
+    for plan in plans
+        .iter()
+        .filter(|plan| crate::exclusions::is_excluded(&plan.path))
+    {
+        supersede_plan(journal, plan)?;
+    }
+    plans.retain(|plan| !crate::exclusions::is_excluded(&plan.path));
+    Ok(())
 }
 
 fn supersede_plan(journal: &mut Journal, plan: &PlanRecord) -> Result<(), RecoveryError> {

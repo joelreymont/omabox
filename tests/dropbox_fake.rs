@@ -22,8 +22,8 @@ use omabox::dropbox::{
     DropboxRoot, InventoryRefresh, LongPollWakeup, MutationOutcome, RemotePathState,
 };
 use omabox::journal::{
-    BlockReason, DropboxBinding, Journal, LocalRootBinding, PlanBlock, PlanStatus, PlanUnblock,
-    PlanWrite, RemoteInventory, RemoteObservationRecord,
+    BlockReason, DropboxBinding, Journal, LocalRootBinding, PlanBlock, PlanId, PlanStatus,
+    PlanUnblock, PlanWrite, RemoteInventory, RemoteObservationRecord,
 };
 use omabox::local::{
     InstallOutcome, ScanPublication, StageOutcome, StagedUpload, dropbox_content_hash,
@@ -38,7 +38,9 @@ use omabox::reconcile::{
     ExactDownloadPool, ReconcileError, ReconcileOutcome, ReconcileReport, reconcile_once,
     replay_pending,
 };
-use omabox::recovery::{ReplayBlocked, ReplayReport, replay_remote_operations};
+use omabox::recovery::{
+    ReplayBlocked, ReplayReport, replay_local_operations, replay_remote_operations,
+};
 use omabox::runtime_status::{
     TransferDirection, TransferEvent, TransferObserver, TransferProgress,
 };
@@ -4279,6 +4281,368 @@ fn rejected_paths_do_not_stop_unrelated_sync_or_report_progress() -> Result<(), 
     rejected_path_case("future_write_error", "rejected_by_dropbox")
 }
 
+#[test]
+fn documented_exclusions_preserve_payloads_while_ordinary_siblings_sync()
+-> Result<(), Box<dyn Error>> {
+    let stale_bytes = b"preserve stale local metadata";
+    let stale = RemoteFile::new(
+        dropbox_content_hash(stale_bytes.as_slice())?,
+        DropboxRevision::new("stale-metadata-revision"),
+    );
+    let old_case = RemoteFile::new(
+        dropbox_content_hash(b"old excluded inventory".as_slice())?,
+        DropboxRevision::new("old-excluded-revision"),
+    );
+    let new_case = RemoteFile::new(
+        dropbox_content_hash(b"new excluded inventory".as_slice())?,
+        DropboxRevision::new("new-excluded-revision"),
+    );
+    let remote_only = RemoteFile::new(
+        dropbox_content_hash(b"remote excluded payload".as_slice())?,
+        DropboxRevision::new("remote-excluded-revision"),
+    );
+    let remote_child = RemoteFile::new(
+        dropbox_content_hash(b"remote excluded descendant".as_slice())?,
+        DropboxRevision::new("remote-child-revision"),
+    );
+    let upload_bytes = b"ordinary local upload";
+    let upload = RemoteFile::new(
+        dropbox_content_hash(upload_bytes.as_slice())?,
+        DropboxRevision::new("ordinary-upload-revision"),
+    );
+    let download_bytes = b"ordinary remote download";
+    let download = RemoteFile::new(
+        dropbox_content_hash(download_bytes.as_slice())?,
+        DropboxRevision::new("ordinary-download-revision"),
+    );
+    let server = FakeServer::start(vec![
+        account().for_path("/2/users/get_current_account"),
+        FakeResponse::json(json!({
+            "entries": [
+                file_metadata(
+                    "/.ds_store",
+                    "/.ds_store",
+                    new_case.revision.as_str(),
+                    &new_case.content,
+                ),
+                file_metadata(
+                    "/thumbs.db",
+                    "/THUMBS.DB",
+                    remote_only.revision.as_str(),
+                    &remote_only.content,
+                ),
+                folder_metadata("/.dropbox", "/.Dropbox"),
+                file_metadata(
+                    "/.dropbox/remote-child.txt",
+                    "/.Dropbox/remote-child.txt",
+                    remote_child.revision.as_str(),
+                    &remote_child.content,
+                ),
+                file_metadata(
+                    "/ordinary-download.txt",
+                    "/ordinary-download.txt",
+                    download.revision.as_str(),
+                    &download.content,
+                ),
+            ],
+            "cursor": "excluded-delta",
+            "has_more": false,
+        }))
+        .for_path("/2/files/list_folder/continue"),
+        FakeResponse::json(file_metadata(
+            "/ordinary-upload.txt",
+            "/ordinary-upload.txt",
+            upload.revision.as_str(),
+            &upload.content,
+        ))
+        .for_path("/2/files/upload"),
+        FakeResponse::bytes(download_bytes.to_vec())
+            .header(
+                "Dropbox-API-Result",
+                download_metadata(
+                    "ordinary-download.txt",
+                    download.revision.as_str(),
+                    &download.content,
+                    download_bytes.len(),
+                ),
+            )
+            .for_path("/2/files/download"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-known-exclusions")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(root.join(".DROPBOX"))?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    for (path, bytes) in [
+        ("Desktop.INI", stale_bytes.as_slice()),
+        ("Icon\r", b"local icon metadata".as_slice()),
+        (".DROPBOX.ATTR", b"local Dropbox attributes".as_slice()),
+        ("metadata.DS_STORE", b"local suffixed metadata".as_slice()),
+        ("~$draft.docx", b"local office temporary file".as_slice()),
+        (".~draft.docx", b"local hidden temporary file".as_slice()),
+        (
+            ".DROPBOX/local-child.txt",
+            b"local excluded descendant".as_slice(),
+        ),
+    ] {
+        std::fs::write(root.join(path), bytes)?;
+    }
+    std::fs::write(root.join("ordinary-upload.txt"), upload_bytes)?;
+
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_baseline(&mut journal, Path::new("Desktop.INI"), &stale)?;
+    seed_baseline(&mut journal, Path::new("THUMBS.DB"), &remote_only)?;
+    journal.publish_remote_inventory(
+        "old-excluded-cursor",
+        &[RemoteObservationRecord {
+            canonical_path: CanonicalPath::from_display(Path::new(".DS_Store")),
+            path: Path::new(".DS_Store").to_path_buf(),
+            observation: Observation::Present(old_case),
+        }],
+    )?;
+
+    let report = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+    assert_eq!(report.sync_errors, 0);
+    let _ = drive_replay(&mut journal, &client, &mut downloads, &root, &staging)??;
+
+    for (path, bytes) in [
+        ("Desktop.INI", stale_bytes.as_slice()),
+        ("Icon\r", b"local icon metadata".as_slice()),
+        (".DROPBOX.ATTR", b"local Dropbox attributes".as_slice()),
+        ("metadata.DS_STORE", b"local suffixed metadata".as_slice()),
+        ("~$draft.docx", b"local office temporary file".as_slice()),
+        (".~draft.docx", b"local hidden temporary file".as_slice()),
+        (
+            ".DROPBOX/local-child.txt",
+            b"local excluded descendant".as_slice(),
+        ),
+    ] {
+        assert_eq!(std::fs::read(root.join(path))?, bytes);
+    }
+    assert!(!root.join(".ds_store").exists());
+    assert!(!root.join("THUMBS.DB").exists());
+    assert!(!root.join(".Dropbox/remote-child.txt").exists());
+    assert_eq!(
+        std::fs::read(root.join("ordinary-upload.txt"))?,
+        upload_bytes
+    );
+    assert_eq!(
+        std::fs::read(root.join("ordinary-download.txt"))?,
+        download_bytes
+    );
+    assert_eq!(
+        journal.baseline(Path::new("ordinary-upload.txt"))?,
+        Some(Baseline::Present(upload))
+    );
+    assert_eq!(
+        journal.baseline(Path::new("ordinary-download.txt"))?,
+        Some(Baseline::Present(download))
+    );
+    assert_eq!(
+        journal.baseline(Path::new("Desktop.INI"))?,
+        Some(Baseline::Present(stale))
+    );
+    assert_eq!(
+        journal.baseline(Path::new("THUMBS.DB"))?,
+        Some(Baseline::Present(remote_only))
+    );
+    assert!(journal.pending_plans()?.is_empty());
+    assert!(journal.blocked_plans()?.is_empty());
+
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[0].path, "/2/users/get_current_account");
+    assert_eq!(requests[1].path, "/2/files/list_folder/continue");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/2/files/upload")
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/2/files/download")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn excluded_pending_and_blocked_work_is_retired_across_reopen_without_effects()
+-> Result<(), Box<dyn Error>> {
+    let local_bytes = b"preserved excluded local bytes";
+    let local = LocalFile::new(dropbox_content_hash(local_bytes.as_slice())?);
+    let remote = RemoteFile::new(
+        local.content.clone(),
+        DropboxRevision::new("excluded-remote-revision"),
+    );
+    let expected_baseline = remote.clone();
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::write(root.join(".DS_Store"), local_bytes)?;
+    std::fs::write(root.join("Icon\r"), local_bytes)?;
+    let database = directory.path().join("journal.sqlite3");
+    let mut journal = Journal::open(&database)?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    let _ = journal.bind_dropbox_root(&DropboxBinding {
+        account_id: String::from("dbid:account"),
+        root_namespace_id: String::from("namespace"),
+        remote_root: String::new(),
+    })?;
+
+    record_fixture_plan(
+        &mut journal,
+        Path::new(".DS_Store"),
+        &Baseline::Absent,
+        &Observation::Present(local.clone()),
+        &Observation::ConfirmedAbsent,
+    )?;
+    seed_baseline(&mut journal, Path::new("Desktop.ini"), &remote)?;
+    record_fixture_plan(
+        &mut journal,
+        Path::new("Desktop.ini"),
+        &Baseline::Present(remote.clone()),
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(remote.clone()),
+    )?;
+    drop(journal);
+    let mut journal = Journal::open(&database)?;
+    let remote_server = FakeServer::start(vec![])?;
+    let remote_client = fake_client(&remote_server, "opaque-access-excluded-remote-replay")?;
+    let remote_report = replay_remote_operations(&mut journal, &remote_client, &root, &staging)?;
+    assert_eq!(remote_report.completed_operations, 0);
+    assert!(journal.pending_plans()?.is_empty());
+    assert!(remote_server.finish()?.is_empty());
+    assert_eq!(std::fs::read(root.join(".DS_Store"))?, local_bytes);
+
+    record_fixture_plan(
+        &mut journal,
+        Path::new("Thumbs.db"),
+        &Baseline::Absent,
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(remote.clone()),
+    )?;
+    seed_baseline(&mut journal, Path::new("Icon\r"), &remote)?;
+    record_fixture_plan(
+        &mut journal,
+        Path::new("Icon\r"),
+        &Baseline::Present(remote.clone()),
+        &Observation::Present(local.clone()),
+        &Observation::ConfirmedAbsent,
+    )?;
+    drop(journal);
+    let mut journal = Journal::open(&database)?;
+    let local_report = replay_local_operations(&mut journal, &root)?;
+    assert_eq!(local_report.completed_operations, 0);
+    assert!(journal.pending_plans()?.is_empty());
+    assert!(!root.join("Thumbs.db").exists());
+    assert_eq!(std::fs::read(root.join("Icon\r"))?, local_bytes);
+
+    record_fixture_plan(
+        &mut journal,
+        Path::new("folder/metadata.ds_store"),
+        &Baseline::Absent,
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(remote.clone()),
+    )?;
+    std::fs::write(root.join(".dropbox.attr"), local_bytes)?;
+    let blocked_upload = record_fixture_plan(
+        &mut journal,
+        Path::new(".dropbox.attr"),
+        &Baseline::Absent,
+        &Observation::Present(local),
+        &Observation::ConfirmedAbsent,
+    )?;
+    assert_eq!(
+        journal.block_plan(
+            blocked_upload,
+            &BlockReason::RemoteRejected {
+                tag: String::from("disallowed_name"),
+            },
+            4_000_000_000,
+        )?,
+        PlanBlock::Blocked
+    );
+    let blocked_download = record_fixture_plan(
+        &mut journal,
+        Path::new("~$blocked-download"),
+        &Baseline::Absent,
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(remote.clone()),
+    )?;
+    assert_eq!(
+        journal.block_plan(
+            blocked_download,
+            &BlockReason::DownloadVerificationFailed,
+            4_000_000_000,
+        )?,
+        PlanBlock::Blocked
+    );
+    seed_baseline(&mut journal, Path::new(".~remote-delete"), &remote)?;
+    let blocked_delete = record_fixture_plan(
+        &mut journal,
+        Path::new(".~remote-delete"),
+        &Baseline::Present(remote.clone()),
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(remote),
+    )?;
+    assert_eq!(
+        journal.block_plan(
+            blocked_delete,
+            &BlockReason::RemoteRejected {
+                tag: String::from("conflict"),
+            },
+            4_000_000_000,
+        )?,
+        PlanBlock::Blocked
+    );
+    drop(journal);
+    assert_eq!(
+        omabox::status::render(&database)?,
+        "Omabox has no recorded work needing attention.\n"
+    );
+    let mut journal = Journal::open(&database)?;
+    let local_server = FakeServer::start(vec![])?;
+    let local_client = Arc::new(fake_client(
+        &local_server,
+        "opaque-access-excluded-local-replay",
+    )?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&local_client))?;
+    let blocked_report =
+        replay_pending(&mut journal, &local_client, &mut downloads, &root, &staging)?;
+    assert_eq!(blocked_report.completed_operations, 0);
+    assert!(journal.pending_plans()?.is_empty());
+    assert!(journal.blocked_plans()?.is_empty());
+    for path in ["Desktop.ini", "Icon\r", ".~remote-delete"] {
+        assert_eq!(
+            journal.baseline(Path::new(path))?,
+            Some(Baseline::Present(expected_baseline.clone()))
+        );
+    }
+    assert_eq!(std::fs::read(root.join(".dropbox.attr"))?, local_bytes);
+    assert!(!root.join("folder/metadata.ds_store").exists());
+    assert!(local_server.finish()?.is_empty());
+    Ok(())
+}
+
 fn rejected_path_case(wire_tag: &str, recorded_tag: &str) -> Result<(), Box<dyn Error>> {
     let invalid_path = PathBuf::from(OsString::from_vec(b"invalid-\xff.txt".to_vec()));
     let invalid_bytes = b"invalid path bytes";
@@ -6343,6 +6707,22 @@ fn planned_operations(decision: Decision) -> Result<OperationPlan, io::Error> {
         | Decision::Conflict(_)
         | Decision::DirectoryCollision(_) => {
             Err(io::Error::other("test expected planned operations"))
+        }
+    }
+}
+
+fn record_fixture_plan(
+    journal: &mut Journal,
+    path: &Path,
+    baseline: &Baseline,
+    local: &Observation<LocalFile>,
+    remote: &Observation<RemoteFile>,
+) -> Result<PlanId, Box<dyn Error>> {
+    let operations = planned_operations(plan(baseline, local, remote))?;
+    match journal.record_plan(path, &operations)? {
+        PlanWrite::Recorded(recorded) => Ok(recorded.id),
+        PlanWrite::AlreadyLive(_) => {
+            Err(io::Error::other("fixture path already had a live plan").into())
         }
     }
 }

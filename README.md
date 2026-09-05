@@ -11,6 +11,12 @@ verified ranges, and coordinated token refresh with durable credential rotation.
 It supports one Dropbox account, one remote root, and one local root. It does
 not implement a virtual filesystem, selective sync, or Dropbox Paper documents.
 
+Omabox leaves Dropbox's [known excluded files](https://help.dropbox.com/en-en/sync/files-not-syncing)
+untouched locally and skips syncing them: names ending in `.DS_Store`,
+`desktop.ini`, `thumbs.db`, `Icon` followed by a carriage return, `.dropbox`, or
+`.dropbox.attr` (case-insensitive), and temporary names beginning with `~$` or
+`.~`. An excluded directory's contents are excluded too.
+
 ## Install
 
 Install Rust nightly, create a Dropbox API app, and copy its public app key.

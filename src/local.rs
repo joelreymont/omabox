@@ -2688,6 +2688,9 @@ fn scan_directory(
     names.sort();
 
     for name in names {
+        if crate::exclusions::is_excluded_name(&name) {
+            continue;
+        }
         let mark = entries.mark();
         let Err(error) = scan_entry(directory, &name, relative.join(&name), context, entries)
         else {
@@ -5189,6 +5192,49 @@ mod tests {
         let _ = scan_and_publish_at(&mut journal, &root, None, all_cache_entries_stable)?;
 
         assert_eq!(journal.local_hash_cache()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn excluded_entries_are_not_opened_hashed_or_published() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::symlink;
+
+        let directory = TempDir::new()?;
+        let root = directory.path().join("root");
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("kept.txt"), b"kept")?;
+        std::fs::write(root.join(".DS_Store"), b"Finder metadata")?;
+        let denied = root.join("~$private");
+        std::fs::create_dir(&denied)?;
+        std::fs::write(denied.join("child.txt"), b"private")?;
+        deny_all_access(&denied)?;
+        symlink("missing", root.join(".dropbox"))?;
+        let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+        let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+
+        let scanned = scan_and_publish_at(
+            &mut journal,
+            &root,
+            all_cache_entries_stable(),
+            all_cache_entries_stable,
+        );
+        allow_owner_access(&denied)?;
+        let ScanPublication::Published(scan) = scanned? else {
+            return Err(io::Error::other("test expected a published scan").into());
+        };
+        let observations = observed_paths(&scan)?;
+        assert_eq!(observations.len(), 1);
+        assert!(matches!(
+            observations.get(Path::new("kept.txt")),
+            Some(Observation::Present(_))
+        ));
+        assert_eq!(journal.local_hash_cache()?.len(), 1);
+        assert_eq!(std::fs::read(root.join(".DS_Store"))?, b"Finder metadata");
+        assert_eq!(std::fs::read(denied.join("child.txt"))?, b"private");
+        assert_eq!(
+            std::fs::read_link(root.join(".dropbox"))?,
+            Path::new("missing")
+        );
         Ok(())
     }
 

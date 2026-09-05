@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use miette::Diagnostic;
 use thiserror::Error;
 
+use crate::exclusions::is_excluded;
 use crate::journal::{BlockReason, Journal, JournalError, PlanStatus, RecordStatus};
 use crate::model::Observation;
 
@@ -40,6 +41,8 @@ fn render_journal(journal: &mut Journal) -> Result<String, StatusError> {
     for plan in journal
         .pending_plans()
         .map_err(|source| status("read pending sync plans", source))?
+        .into_iter()
+        .filter(|plan| !is_excluded(&plan.path))
     {
         let pending = plan
             .operations
@@ -63,6 +66,8 @@ fn render_journal(journal: &mut Journal) -> Result<String, StatusError> {
     for plan in journal
         .blocked_plans()
         .map_err(|source| status("read blocked sync plans", source))?
+        .into_iter()
+        .filter(|plan| !is_excluded(&plan.path))
     {
         let PlanStatus::Blocked { reason, .. } = plan.status else {
             continue;
@@ -79,6 +84,8 @@ fn render_journal(journal: &mut Journal) -> Result<String, StatusError> {
     for record in journal
         .local_inventory()
         .map_err(|source| status("read local observations", source))?
+        .into_iter()
+        .filter(|record| !is_excluded(&record.path))
     {
         if let Observation::Unknown(reason) = record.observation {
             entries.push(StatusEntry::new(
@@ -92,6 +99,8 @@ fn render_journal(journal: &mut Journal) -> Result<String, StatusError> {
         .remote_inventory()
         .map_err(|source| status("read remote observations", source))?
         .observations
+        .into_iter()
+        .filter(|record| !is_excluded(&record.path))
     {
         if let Observation::Unknown(reason) = record.observation {
             entries.push(StatusEntry::new(

@@ -4,6 +4,7 @@ pub mod auth;
 pub mod config;
 pub mod daemon;
 pub mod dropbox;
+mod exclusions;
 pub mod install;
 pub mod journal;
 pub mod local;
