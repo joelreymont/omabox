@@ -248,7 +248,7 @@ fn activate_configured_root(config: &Config, journal: &mut Journal) -> Result<()
             );
             Ok(())
         }
-        LocalRootActivation::Busy => Err(DaemonError::LocalRootBusy),
+        LocalRootActivation::Unavailable { .. } => Err(DaemonError::LocalRootUnavailable),
     }
 }
 
@@ -395,14 +395,12 @@ enum DaemonError {
         source: JournalError,
     },
 
-    #[error("the configured sync root changed while prior sync work is unfinished")]
+    #[error("the configured sync root path now names a different filesystem object")]
     #[diagnostic(
-        code(omabox::daemon::local_root_busy),
-        help(
-            "Restore the previous sync root in settings and let Omabox finish before selecting the new directory."
-        )
+        code(omabox::daemon::local_root_unavailable),
+        help("Restore the previous sync root, or select this directory again in Omabox settings.")
     )]
-    LocalRootBusy,
+    LocalRootUnavailable,
 
     #[error("could not {operation}")]
     #[diagnostic(
@@ -497,7 +495,9 @@ impl DaemonError {
             Self::Config(_) => "Omabox configuration is unavailable.",
             Self::Lock(_) => "The Omabox service could not acquire its instance lock.",
             Self::Journal { .. } => "The sync journal is unavailable.",
-            Self::LocalRootBusy => "The sync folder changed while earlier work is unfinished.",
+            Self::LocalRootUnavailable => {
+                "The configured sync folder is unavailable or was replaced."
+            }
             Self::Auth { .. } | Self::CredentialsUnavailable { .. } => {
                 "Dropbox authentication is unavailable."
             }

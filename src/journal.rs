@@ -293,10 +293,15 @@ pub struct LocalRootRecord {
 pub enum LocalRootActivation {
     /// A new root generation was activated and local state was reset.
     Activated(LocalRootRecord),
-    /// This exact root is current, including after one-time legacy adoption.
+    /// This exact root is already current.
     Current(LocalRootRecord),
-    /// Unfinished work prevents changing or initially binding the root.
-    Busy,
+    /// The configured path now names a different filesystem object.
+    Unavailable {
+        /// Root identity previously accepted for this path.
+        recorded: LocalRootBinding,
+        /// Root identity currently found at this path.
+        actual: LocalRootBinding,
+    },
 }
 
 /// Durable identity of a plan.
@@ -814,91 +819,53 @@ impl Journal {
         binding: &LocalRootBinding,
     ) -> Result<LocalRootActivation, JournalError> {
         let database_path = self.database_path.clone();
+        let existing = read_local_root(&self.connection, &database_path)?;
+        if let Some(outcome) = local_root_activation_without_write(existing.as_ref(), binding) {
+            return Ok(outcome);
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite("begin local root activation", &database_path, source))?;
+        let existing = read_local_root(&transaction, &database_path)?;
+        if let Some(outcome) = local_root_activation_without_write(existing.as_ref(), binding) {
+            return Ok(outcome);
+        }
+        let record =
+            activate_new_local_root(&transaction, existing.as_ref(), binding, &database_path)?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite("commit local root activation", &database_path, source))?;
+        Ok(LocalRootActivation::Activated(record))
+    }
+
+    /// Explicitly adopt a selected root, including a replacement at the same path.
+    pub fn adopt_local_root(
+        &mut self,
+        binding: &LocalRootBinding,
+    ) -> Result<LocalRootActivation, JournalError> {
+        let database_path = self.database_path.clone();
+        let existing = read_local_root(&self.connection, &database_path)?;
+        if let Some(record) = &existing
+            && record.binding == *binding
+        {
+            return Ok(LocalRootActivation::Current(record.clone()));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite("begin local root adoption", &database_path, source))?;
         let existing = read_local_root(&transaction, &database_path)?;
         if let Some(record) = &existing
             && record.binding == *binding
         {
             return Ok(LocalRootActivation::Current(record.clone()));
         }
-        let legacy_adoption = transaction
-            .query_row(
-                "SELECT EXISTS( \
-                     SELECT 1 FROM legacy_local_root_adoption WHERE singleton = 1 \
-                 )",
-                [],
-                |row| row.get::<_, bool>(0),
-            )
-            .map_err(|source| sqlite("read legacy local root adoption", &database_path, source))?;
-        if existing.is_none() && legacy_adoption {
-            let record = LocalRootRecord {
-                binding: binding.clone(),
-                generation: 1,
-            };
-            write_local_root(&transaction, &record, &database_path)?;
-            transaction
-                .execute(
-                    "DELETE FROM legacy_local_root_adoption WHERE singleton = 1",
-                    [],
-                )
-                .map_err(|source| {
-                    sqlite("finish legacy local root adoption", &database_path, source)
-                })?;
-            transaction.commit().map_err(|source| {
-                sqlite("commit legacy local root adoption", &database_path, source)
-            })?;
-            return Ok(LocalRootActivation::Current(record));
-        }
-        let pending = transaction
-            .query_row(
-                "SELECT EXISTS( \
-                     SELECT 1 FROM plans WHERE status = 'pending' \
-                     UNION ALL \
-                     SELECT 1 FROM recovery_records WHERE status = 'pending' \
-                 )",
-                [],
-                |row| row.get::<_, bool>(0),
-            )
-            .map_err(|source| sqlite("check local root activation work", &database_path, source))?;
-        if pending {
-            return Ok(LocalRootActivation::Busy);
-        }
-        let generation = match existing {
-            Some(record) => {
-                record
-                    .generation
-                    .checked_add(1)
-                    .ok_or_else(|| JournalError::InvalidState {
-                        operation: "advance local root generation",
-                        path: database_path.clone(),
-                        detail: "local root generation exhausted",
-                    })?
-            }
-            None => 1,
-        };
-        transaction
-            .execute("DELETE FROM baselines", [])
-            .map_err(|source| sqlite("clear prior root baselines", &database_path, source))?;
-        transaction
-            .execute("DELETE FROM local_observations", [])
-            .map_err(|source| sqlite("clear prior root observations", &database_path, source))?;
-        transaction
-            .execute("DELETE FROM local_hash_cache", [])
-            .map_err(|source| sqlite("clear prior root hash cache", &database_path, source))?;
-        transaction
-            .execute("DELETE FROM conflicts", [])
-            .map_err(|source| sqlite("clear prior root conflicts", &database_path, source))?;
-        let record = LocalRootRecord {
-            binding: binding.clone(),
-            generation,
-        };
-        write_local_root(&transaction, &record, &database_path)?;
+        let record =
+            activate_new_local_root(&transaction, existing.as_ref(), binding, &database_path)?;
         transaction
             .commit()
-            .map_err(|source| sqlite("commit local root activation", &database_path, source))?;
+            .map_err(|source| sqlite("commit local root adoption", &database_path, source))?;
         Ok(LocalRootActivation::Activated(record))
     }
 
@@ -2761,6 +2728,93 @@ fn start_recovery_retention(
         .map_err(|source| sqlite("start recovery retention", path, source))
 }
 
+fn activate_new_local_root(
+    connection: &Connection,
+    existing: Option<&LocalRootRecord>,
+    binding: &LocalRootBinding,
+    database_path: &Path,
+) -> Result<LocalRootRecord, JournalError> {
+    let generation = match existing {
+        Some(record) => {
+            record
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| JournalError::InvalidState {
+                    operation: "advance local root generation",
+                    path: database_path.to_path_buf(),
+                    detail: "local root generation exhausted",
+                })?
+        }
+        None => 1,
+    };
+    connection
+        .execute(
+            "DELETE FROM recovery_records \
+             WHERE status = 'pending' OR operation_id IN ( \
+                 SELECT operations.id FROM operations \
+                 JOIN plans ON plans.id = operations.plan_id \
+                 WHERE plans.status IN ('pending', 'blocked') \
+             )",
+            [],
+        )
+        .map_err(|source| sqlite("retire prior root recovery intents", database_path, source))?;
+    connection
+        .execute(
+            "DELETE FROM operations WHERE plan_id IN ( \
+                 SELECT id FROM plans WHERE status IN ('pending', 'blocked') \
+             )",
+            [],
+        )
+        .map_err(|source| sqlite("retire prior root operations", database_path, source))?;
+    connection
+        .execute(
+            "DELETE FROM plans WHERE status IN ('pending', 'blocked')",
+            [],
+        )
+        .map_err(|source| sqlite("retire prior root plans", database_path, source))?;
+    connection
+        .execute("DELETE FROM baselines", [])
+        .map_err(|source| sqlite("clear prior root baselines", database_path, source))?;
+    connection
+        .execute("DELETE FROM local_observations", [])
+        .map_err(|source| sqlite("clear prior root observations", database_path, source))?;
+    connection
+        .execute("DELETE FROM local_hash_cache", [])
+        .map_err(|source| sqlite("clear prior root hash cache", database_path, source))?;
+    connection
+        .execute("DELETE FROM conflicts", [])
+        .map_err(|source| sqlite("clear prior root conflicts", database_path, source))?;
+    connection
+        .execute(
+            "DELETE FROM legacy_local_root_adoption WHERE singleton = 1",
+            [],
+        )
+        .map_err(|source| sqlite("finish local root adoption", database_path, source))?;
+    let record = LocalRootRecord {
+        binding: binding.clone(),
+        generation,
+    };
+    write_local_root(connection, &record, database_path)?;
+    Ok(record)
+}
+
+fn local_root_activation_without_write(
+    existing: Option<&LocalRootRecord>,
+    binding: &LocalRootBinding,
+) -> Option<LocalRootActivation> {
+    let record = existing?;
+    if record.binding == *binding {
+        Some(LocalRootActivation::Current(record.clone()))
+    } else if record.binding.canonical_path == binding.canonical_path {
+        Some(LocalRootActivation::Unavailable {
+            recorded: record.binding.clone(),
+            actual: binding.clone(),
+        })
+    } else {
+        None
+    }
+}
+
 fn write_local_root(
     connection: &Connection,
     record: &LocalRootRecord,
@@ -3595,6 +3649,109 @@ mod tests {
     }
 
     #[test]
+    fn replaced_same_path_is_unavailable_without_changing_journal_state()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let root = directory.path().join("root");
+        let moved_root = directory.path().join("moved-root");
+        fs::create_dir(&root)?;
+        let recorded = LocalRootBinding::inspect(&root)?;
+        let mut journal = Journal::open(journal_path(&directory))?;
+        let _ = journal.activate_local_root(&recorded)?;
+
+        let agreed_path = Path::new("agreed.txt");
+        let agreed_file = remote_file("agreed", "rev-agreed");
+        let agreement = noop(plan(
+            &Baseline::Absent,
+            &Observation::Present(LocalFile::new(agreed_file.content.clone())),
+            &Observation::Present(agreed_file),
+        ))?;
+        journal.record_noop(agreed_path, &agreement)?;
+        journal.publish_local_inventory(&[LocalObservationRecord {
+            path: PathBuf::from("local.txt"),
+            observation: Observation::Present(LocalFile::new(content("local"))),
+        }])?;
+        let destructive = OperationPlan::new(vec![
+            Operation::PreserveLocal {
+                file: LocalFile::new(content("old")),
+            },
+            Operation::DeleteLocal {
+                expected_content: content("old"),
+            },
+        ]);
+        let recovery_payload = directory.path().join("recovery-payload");
+        let staged_payload = directory.path().join("staged-payload");
+        fs::write(&recovery_payload, b"recovery")?;
+        fs::write(&staged_payload, b"staged")?;
+        let pending = recorded_plan(journal.record_plan(Path::new("pending.txt"), &destructive)?)?;
+        let _ = recorded_recovery(
+            journal.record_recovery_intent(pending.operations[1].id, &recovery_payload)?,
+        )?;
+        let upload = operations(plan(
+            &Baseline::Absent,
+            &Observation::Present(LocalFile::new(content("blocked"))),
+            &Observation::ConfirmedAbsent,
+        ))?;
+        let blocked = recorded_plan(journal.record_plan(Path::new("blocked.txt"), &upload)?)?;
+        assert_eq!(
+            journal.block_plan(blocked.id, &BlockReason::StageOccupied, 1_700_000_000)?,
+            PlanBlock::Blocked
+        );
+        let conflict = Conflict::DivergentEdits {
+            local: LocalFile::new(content("local-conflict")),
+            remote: remote_file("remote-conflict", "rev-conflict"),
+        };
+        let _ = journal.record_conflict(Path::new("conflict.txt"), &conflict)?;
+
+        let root_before = journal.local_root_binding()?;
+        let baselines_before = journal.baseline_paths()?;
+        let local_before = journal.local_inventory()?;
+        let pending_before = journal.pending_plans()?;
+        let blocked_before = journal.blocked_plans()?;
+        let recoveries_before = journal.pending_recoveries()?;
+        let conflicts_before = journal.conflicts()?;
+        let changes_before = journal.connection.total_changes();
+
+        fs::rename(&root, &moved_root)?;
+        fs::create_dir(&root)?;
+        let actual = LocalRootBinding::inspect(&root)?;
+        assert_ne!(recorded, actual);
+        assert_eq!(recorded.canonical_path, actual.canonical_path);
+        assert_eq!(
+            journal.activate_local_root(&actual)?,
+            LocalRootActivation::Unavailable {
+                recorded: recorded.clone(),
+                actual: actual.clone(),
+            }
+        );
+        assert_eq!(journal.local_root_binding()?, root_before);
+        assert_eq!(journal.baseline_paths()?, baselines_before);
+        assert_eq!(journal.local_inventory()?, local_before);
+        assert_eq!(journal.pending_plans()?, pending_before);
+        assert_eq!(journal.blocked_plans()?, blocked_before);
+        assert_eq!(journal.pending_recoveries()?, recoveries_before);
+        assert_eq!(journal.conflicts()?, conflicts_before);
+        assert_eq!(journal.connection.total_changes(), changes_before);
+
+        assert_eq!(
+            journal.adopt_local_root(&actual)?,
+            LocalRootActivation::Activated(LocalRootRecord {
+                binding: actual,
+                generation: 2,
+            })
+        );
+        assert!(journal.baseline_paths()?.is_empty());
+        assert!(journal.local_inventory()?.is_empty());
+        assert!(journal.pending_plans()?.is_empty());
+        assert!(journal.blocked_plans()?.is_empty());
+        assert!(journal.pending_recoveries()?.is_empty());
+        assert!(journal.conflicts()?.is_empty());
+        assert_eq!(fs::read(recovery_payload)?, b"recovery");
+        assert_eq!(fs::read(staged_payload)?, b"staged");
+        Ok(())
+    }
+
+    #[test]
     fn local_root_generation_resets_only_root_local_state() -> Result<(), Box<dyn Error>> {
         let directory = TempDir::new()?;
         let mut journal = Journal::open(journal_path(&directory))?;
@@ -3665,7 +3822,8 @@ mod tests {
     }
 
     #[test]
-    fn local_root_activation_is_busy_without_changing_state() -> Result<(), Box<dyn Error>> {
+    fn local_root_activation_retires_work_from_a_prior_or_unbound_root()
+    -> Result<(), Box<dyn Error>> {
         let directory = TempDir::new()?;
         let mut journal = Journal::open(journal_path(&directory))?;
         let current = local_root("/sync/current", 1, 2);
@@ -3673,38 +3831,66 @@ mod tests {
             journal.activate_local_root(&current)?,
             LocalRootActivation::Activated(_)
         ));
-        let operation_plan = operations(plan(
+        let operation_plan = OperationPlan::new(vec![
+            Operation::PreserveLocal {
+                file: LocalFile::new(content("pending")),
+            },
+            Operation::DeleteLocal {
+                expected_content: content("pending"),
+            },
+        ]);
+        let pending =
+            recorded_plan(journal.record_plan(Path::new("pending.txt"), &operation_plan)?)?;
+        let recovery_payload = directory.path().join("retained-recovery");
+        let staged_payload = directory.path().join("retained-stage");
+        fs::write(&recovery_payload, b"recovery")?;
+        fs::write(&staged_payload, b"stage")?;
+        let _ = recorded_recovery(
+            journal.record_recovery_intent(pending.operations[1].id, &recovery_payload)?,
+        )?;
+        let blocked_plan = operations(plan(
             &Baseline::Absent,
-            &Observation::Present(LocalFile::new(content("pending"))),
+            &Observation::Present(LocalFile::new(content("blocked"))),
             &Observation::ConfirmedAbsent,
         ))?;
-        let _ = journal.record_plan(Path::new("pending.txt"), &operation_plan)?;
+        let blocked = recorded_plan(journal.record_plan(Path::new("blocked.txt"), &blocked_plan)?)?;
+        assert_eq!(
+            journal.block_plan(blocked.id, &BlockReason::StageOccupied, 1_700_000_000)?,
+            PlanBlock::Blocked
+        );
 
         let replacement = local_root("/sync/replacement", 3, 4);
         assert_eq!(
             journal.activate_local_root(&replacement)?,
-            LocalRootActivation::Busy
+            LocalRootActivation::Activated(LocalRootRecord {
+                binding: replacement.clone(),
+                generation: 2,
+            })
         );
         assert_eq!(
             journal.local_root_binding()?,
             Some(LocalRootRecord {
-                binding: current.clone(),
-                generation: 1,
+                binding: replacement.clone(),
+                generation: 2,
             })
         );
-        assert!(matches!(
-            journal.activate_local_root(&current)?,
-            LocalRootActivation::Current(_)
-        ));
+        assert!(journal.pending_plans()?.is_empty());
+        assert!(journal.blocked_plans()?.is_empty());
+        assert!(journal.pending_recoveries()?.is_empty());
+        assert_eq!(fs::read(&recovery_payload)?, b"recovery");
+        assert_eq!(fs::read(&staged_payload)?, b"stage");
 
         let unbound_path = directory.path().join("unbound.sqlite3");
         let mut unbound = Journal::open(unbound_path)?;
         let _ = unbound.record_plan(Path::new("pending.txt"), &operation_plan)?;
         assert_eq!(
             unbound.activate_local_root(&replacement)?,
-            LocalRootActivation::Busy
+            LocalRootActivation::Activated(LocalRootRecord {
+                binding: replacement.clone(),
+                generation: 1,
+            })
         );
-        assert_eq!(unbound.local_root_binding()?, None);
+        assert!(unbound.pending_plans()?.is_empty());
         Ok(())
     }
 
@@ -4515,22 +4701,24 @@ mod tests {
         };
         assert_eq!(
             journal.activate_local_root(&configured)?,
-            LocalRootActivation::Current(configured_record.clone())
+            LocalRootActivation::Activated(configured_record.clone())
         );
         assert_eq!(
             journal.local_root_binding()?,
             Some(configured_record.clone())
         );
-        assert_eq!(journal.baseline(kept_path)?, Some(kept_baseline));
-        assert_eq!(journal.pending_plans()?.len(), 1);
-        assert_eq!(journal.pending_recoveries()?.len(), 1);
+        assert_eq!(journal.baseline(kept_path)?, None);
+        assert!(journal.pending_plans()?.is_empty());
+        assert!(journal.pending_recoveries()?.is_empty());
 
         let changed = local_root("/sync/changed", 9, 10);
         assert_eq!(
             journal.activate_local_root(&changed)?,
-            LocalRootActivation::Busy
+            LocalRootActivation::Activated(LocalRootRecord {
+                binding: changed,
+                generation: 2,
+            })
         );
-        assert_eq!(journal.local_root_binding()?, Some(configured_record));
         let version = journal
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;

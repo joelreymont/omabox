@@ -10,7 +10,7 @@ use omabox::auth::{AuthError, AuthorizationGrant, OAuthClient, RefreshTokenStore
 use omabox::config::{Config, ConfigError, InstanceLock, LockError, XdgDirectories};
 use omabox::dropbox::{DropboxClient, DropboxError, DropboxLink};
 use omabox::install::{InstallAction, InstallError};
-use omabox::journal::{DropboxBindingWrite, Journal, JournalError};
+use omabox::journal::{DropboxBindingWrite, Journal, JournalError, LocalRootBinding};
 use omabox::service::{ServiceAction, ServiceCommands, ServiceError};
 use omabox::status::{self, StatusError};
 use serde::Serialize;
@@ -361,12 +361,10 @@ fn set_sync_root(
     xdg: &XdgDirectories,
     services: &ServiceCommands,
 ) -> Result<(), CliError> {
-    let current = Config::load_from(xdg).map_err(config_error("load configuration"))?;
+    let current = Config::load_for_root_change_from(xdg)
+        .map_err(config_error("load configuration for sync-root change"))?;
     let replacement = Config::from_values(xdg, path, current.dropbox_app_key())
         .map_err(config_error("validate the new sync root"))?;
-    if replacement.sync_root() == current.sync_root() {
-        return write_stdout("The configured sync root is already set to that directory.\n");
-    }
 
     let was_active = services.is_active().map_err(CliError::Service)?;
     if was_active {
@@ -394,37 +392,37 @@ fn set_sync_root(
 fn change_sync_root_while_stopped(current: &Config, replacement: &Config) -> Result<(), CliError> {
     let _lock = InstanceLock::acquire(current.paths().lock_file())
         .map_err(|source| CliError::Lock { source })?;
+    let binding =
+        LocalRootBinding::inspect(replacement.sync_root()).map_err(|source| CliError::Journal {
+            operation: "inspect the selected sync root",
+            source,
+        })?;
     let journal_path = current.paths().journal_file();
-    if journal_path
+    let mut journal = if journal_path
         .try_exists()
         .map_err(|source| CliError::InspectJournal { source })?
     {
-        let journal =
-            Journal::open_read_only(journal_path).map_err(|source| CliError::Journal {
-                operation: "inspect pending work before changing the sync root",
+        Some(
+            Journal::open(journal_path).map_err(|source| CliError::Journal {
+                operation: "open the sync journal before changing the sync root",
                 source,
-            })?;
-        if !journal
-            .pending_plans()
-            .map_err(|source| CliError::Journal {
-                operation: "inspect pending sync operations",
-                source,
-            })?
-            .is_empty()
-            || !journal
-                .pending_recoveries()
-                .map_err(|source| CliError::Journal {
-                    operation: "inspect pending recovery copies",
-                    source,
-                })?
-                .is_empty()
-        {
-            return Err(CliError::PendingWork);
-        }
-    }
+            })?,
+        )
+    } else {
+        None
+    };
     replacement
         .write()
-        .map_err(config_error("write the new sync root"))
+        .map_err(config_error("write the new sync root"))?;
+    if let Some(journal) = &mut journal {
+        let _ = journal
+            .adopt_local_root(&binding)
+            .map_err(|source| CliError::Journal {
+                operation: "adopt the selected sync root",
+                source,
+            })?;
+    }
+    Ok(())
 }
 
 fn config_error(operation: &'static str) -> impl FnOnce(ConfigError) -> CliError {
@@ -528,13 +526,6 @@ enum CliError {
         source: io::Error,
     },
 
-    #[error("finish the current synchronization before changing the sync root")]
-    #[diagnostic(
-        code(omabox::cli::pending_work),
-        help("Wait for `omabox status` to report no pending work, then retry.")
-    )]
-    PendingWork,
-
     #[error("the sync-root change failed and the Omabox service could not be restarted: {restore}")]
     #[diagnostic(
         code(omabox::cli::root_change_and_restore),
@@ -625,7 +616,9 @@ mod tests {
     use std::error::Error;
     use std::fs;
 
-    use omabox::journal::{LocalRootBinding, PlanWrite};
+    use omabox::journal::{
+        BlockReason, LocalRootActivation, LocalRootBinding, PlanBlock, PlanWrite,
+    };
     use omabox::model::{
         Baseline, CanonicalPath, ContentIdentity, Decision, LocalFile, Observation,
     };
@@ -821,11 +814,11 @@ mod tests {
     }
 
     #[test]
-    fn set_root_refuses_pending_work_and_restores_running_service() -> Result<(), Box<dyn Error>> {
+    fn set_root_retires_live_intent_and_preserves_payloads() -> Result<(), Box<dyn Error>> {
         let (temporary, xdg, first, second) = fixture()?;
         let config = Config::load_from(&xdg)?;
-        let original_config = fs::read(config.paths().config_file())?;
         let mut journal = Journal::open(config.paths().journal_file())?;
+        let _ = journal.activate_local_root(&LocalRootBinding::inspect(&first)?)?;
         let Decision::Operations(plan) = omabox::planner::plan(
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(ContentIdentity::new("pending-content"))),
@@ -837,18 +830,39 @@ mod tests {
             journal.record_plan(Path::new("pending.txt"), &plan)?,
             PlanWrite::Recorded(_)
         ));
+        let Decision::Operations(blocked_plan) = omabox::planner::plan(
+            &Baseline::Absent,
+            &Observation::Present(LocalFile::new(ContentIdentity::new("blocked-content"))),
+            &Observation::ConfirmedAbsent,
+        ) else {
+            return Err("planner did not produce the blocked operation".into());
+        };
+        let PlanWrite::Recorded(blocked) =
+            journal.record_plan(Path::new("blocked.txt"), &blocked_plan)?
+        else {
+            return Err("journal did not record the blocked operation".into());
+        };
+        assert_eq!(
+            journal.block_plan(blocked.id, &BlockReason::StageOccupied, 1_700_000_000)?,
+            PlanBlock::Blocked
+        );
         drop(journal);
+        let staged_payload = config.paths().upload_staging_directory().join("payload");
+        let recovery_payload = config.paths().recovery_directory().join("payload");
+        fs::write(&staged_payload, b"staged")?;
+        fs::write(&recovery_payload, b"recovery")?;
 
         let service_log = temporary.path().join("service.log");
         let systemctl = fake_systemctl(temporary.path(), true, &service_log)?;
         let services = ServiceCommands::scripts(systemctl, "/unused/journalctl");
-        assert!(matches!(
-            set_sync_root(&second, &xdg, &services),
-            Err(CliError::PendingWork)
-        ));
-        assert_eq!(Config::load_from(&xdg)?.sync_root(), first);
-        assert_eq!(fs::read(config.paths().config_file())?, original_config);
+        set_sync_root(&second, &xdg, &services)?;
+        assert_eq!(Config::load_from(&xdg)?.sync_root(), second);
         assert_eq!(fs::read_to_string(service_log)?, "is-active\nstop\nstart\n");
+        let journal = Journal::open(config.paths().journal_file())?;
+        assert!(journal.pending_plans()?.is_empty());
+        assert!(journal.blocked_plans()?.is_empty());
+        assert_eq!(fs::read(staged_payload)?, b"staged");
+        assert_eq!(fs::read(recovery_payload)?, b"recovery");
         Ok(())
     }
 
@@ -872,7 +886,62 @@ mod tests {
     }
 
     #[test]
-    fn set_root_preserves_inactive_state_and_uses_root_generation() -> Result<(), Box<dyn Error>> {
+    fn config_write_failure_preserves_root_generation_and_live_intent() -> Result<(), Box<dyn Error>>
+    {
+        let (temporary, xdg, first, second) = fixture()?;
+        let config = Config::load_from(&xdg)?;
+        let mut journal = Journal::open(config.paths().journal_file())?;
+        let _ = journal.activate_local_root(&LocalRootBinding::inspect(&first)?)?;
+        let Decision::Operations(plan) = omabox::planner::plan(
+            &Baseline::Absent,
+            &Observation::Present(LocalFile::new(ContentIdentity::new("pending-content"))),
+            &Observation::ConfirmedAbsent,
+        ) else {
+            return Err("planner did not produce the pending operation".into());
+        };
+        let _ = journal.record_plan(Path::new("pending.txt"), &plan)?;
+        let binding_before = journal.local_root_binding()?;
+        let pending_before = journal.pending_plans()?;
+        drop(journal);
+
+        let config_directory = config.paths().config_directory();
+        let saved_config_directory = temporary.path().join("saved-config");
+        let service_log = temporary.path().join("service.log");
+        let systemctl = temporary.path().join("systemctl-write-failure");
+        fs::write(
+            &systemctl,
+            format!(
+                "printf '%s\\n' \"$2\" >> '{}'\n\
+                 if [ \"$2\" = is-active ]; then exit 0; fi\n\
+                 if [ \"$2\" = stop ]; then mv '{}' '{}'; : > '{}'; fi\n\
+                 exit 0\n",
+                service_log.display(),
+                config_directory.display(),
+                saved_config_directory.display(),
+                config_directory.display(),
+            ),
+        )?;
+        let services = ServiceCommands::scripts(systemctl, "/unused/journalctl");
+        assert!(matches!(
+            set_sync_root(&second, &xdg, &services),
+            Err(CliError::Config { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(&service_log)?,
+            "is-active\nstop\nstart\n"
+        );
+
+        fs::remove_file(config_directory)?;
+        fs::rename(saved_config_directory, config_directory)?;
+        assert_eq!(Config::load_from(&xdg)?.sync_root(), first);
+        let journal = Journal::open(config.paths().journal_file())?;
+        assert_eq!(journal.local_root_binding()?, binding_before);
+        assert_eq!(journal.pending_plans()?, pending_before);
+        Ok(())
+    }
+
+    #[test]
+    fn set_root_works_when_the_prior_root_is_unavailable() -> Result<(), Box<dyn Error>> {
         let (temporary, xdg, first, second) = fixture()?;
         let config = Config::load_from(&xdg)?;
         let mut journal = Journal::open(config.paths().journal_file())?;
@@ -899,6 +968,7 @@ mod tests {
         let _ = journal.record_noop(Path::new("remote.txt"), &agreement)?;
         assert_eq!(journal.baseline_paths()?, vec![PathBuf::from("remote.txt")]);
         drop(journal);
+        fs::rename(&first, temporary.path().join("unavailable-first"))?;
 
         let service_log = temporary.path().join("service.log");
         let systemctl = fake_systemctl(temporary.path(), false, &service_log)?;
@@ -908,12 +978,59 @@ mod tests {
         assert_eq!(fs::read_to_string(service_log)?, "is-active\n");
 
         let mut journal = Journal::open(config.paths().journal_file())?;
-        let _ = journal.activate_local_root(&LocalRootBinding::inspect(&second)?)?;
         assert!(journal.baseline_paths()?.is_empty());
         assert_eq!(
             journal.remote_inventory()?.cursor,
             Some(String::from("remote-cursor"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn set_root_explicitly_adopts_a_replacement_at_the_same_path() -> Result<(), Box<dyn Error>> {
+        let (temporary, xdg, first, _second) = fixture()?;
+        let config = Config::load_from(&xdg)?;
+        let recorded = LocalRootBinding::inspect(&first)?;
+        let mut journal = Journal::open(config.paths().journal_file())?;
+        let _ = journal.activate_local_root(&recorded)?;
+        let remote = omabox::model::RemoteFile::new(
+            ContentIdentity::new("same-content"),
+            omabox::model::DropboxRevision::new("same-revision"),
+        );
+        let Decision::NoOp(agreement) = omabox::planner::plan(
+            &Baseline::Absent,
+            &Observation::Present(LocalFile::new(remote.content.clone())),
+            &Observation::Present(remote),
+        ) else {
+            return Err("planner did not produce the initial agreement".into());
+        };
+        let _ = journal.record_noop(Path::new("tracked.txt"), &agreement)?;
+        drop(journal);
+
+        fs::rename(&first, temporary.path().join("moved-first"))?;
+        fs::create_dir(&first)?;
+        let actual = LocalRootBinding::inspect(&first)?;
+        assert_ne!(recorded, actual);
+        let service_log = temporary.path().join("service.log");
+        let systemctl = fake_systemctl(temporary.path(), false, &service_log)?;
+        let services = ServiceCommands::scripts(systemctl, "/unused/journalctl");
+        set_sync_root(&first, &xdg, &services)?;
+
+        let journal = Journal::open(config.paths().journal_file())?;
+        assert_eq!(
+            journal.local_root_binding()?,
+            Some(omabox::journal::LocalRootRecord {
+                binding: actual.clone(),
+                generation: 2,
+            })
+        );
+        assert!(journal.baseline_paths()?.is_empty());
+        let mut journal = journal;
+        assert!(matches!(
+            journal.activate_local_root(&actual)?,
+            LocalRootActivation::Current(_)
+        ));
+        assert_eq!(fs::read_to_string(service_log)?, "is-active\n");
         Ok(())
     }
 }

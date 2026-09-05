@@ -94,17 +94,21 @@ impl Paths {
     /// written with symlink-following calls, so a user may keep it in a
     /// dotfiles tree.
     fn resolve(xdg: &XdgDirectories, sync_root: &Path) -> Result<Self, ConfigError> {
+        let paths = Self::resolve_private(xdg)?;
+        paths.validate_outside(sync_root)?;
+        Ok(paths)
+    }
+
+    fn resolve_private(xdg: &XdgDirectories) -> Result<Self, ConfigError> {
         let state = xdg.application_state_directory();
-        let paths = Self {
+        Ok(Self {
             config_directory: lexical_normalize(&xdg.config_directory()),
             state_directory: project_physical_path(&state)?,
             journal_file: project_physical_path(&state.join(JOURNAL_FILE))?,
             upload_staging_directory: project_physical_path(&state.join(UPLOAD_STAGING_DIRECTORY))?,
             recovery_directory: project_physical_path(&state.join(RECOVERY_DIRECTORY))?,
             lock_file: project_physical_path(&state.join(LOCK_FILE))?,
-        };
-        paths.validate_outside(sync_root)?;
-        Ok(paths)
+        })
     }
 
     fn validate_outside(&self, sync_root: &Path) -> Result<(), ConfigError> {
@@ -227,19 +231,26 @@ impl Config {
 
     /// Load configuration from explicit XDG base directories.
     pub fn load_from(xdg: &XdgDirectories) -> Result<Self, ConfigError> {
-        let config_file = xdg.config_file();
-        let contents = fs::read_to_string(&config_file).map_err(|source| ConfigError::Read {
-            path: config_file.clone(),
-            source,
-        })?;
-        let document = toml::from_str::<ConfigDocument>(&contents).map_err(|mut source| {
-            source.set_input(None);
-            ConfigError::Parse {
-                path: config_file,
-                source,
-            }
-        })?;
+        let document = read_config_document(xdg)?;
         Self::from_values(xdg, document.sync_root, document.dropbox_app_key)
+    }
+
+    /// Load settings needed to replace an unavailable configured sync root.
+    ///
+    /// The stored root remains unresolved because the caller will validate a
+    /// selected replacement before writing it. XDG state paths and all other
+    /// configuration fields are still validated.
+    pub fn load_for_root_change_from(xdg: &XdgDirectories) -> Result<Self, ConfigError> {
+        let document = read_config_document(xdg)?;
+        let sync_root = require_absolute("sync_root", document.sync_root)?;
+        if document.dropbox_app_key.trim().is_empty() {
+            return Err(ConfigError::EmptyDropboxAppKey);
+        }
+        Ok(Self {
+            sync_root,
+            dropbox_app_key: document.dropbox_app_key,
+            paths: Paths::resolve_private(xdg)?,
+        })
     }
 
     /// Validate a configuration supplied by a setup or settings command.
@@ -307,6 +318,21 @@ impl Config {
             replace_existing,
         )
     }
+}
+
+fn read_config_document(xdg: &XdgDirectories) -> Result<ConfigDocument, ConfigError> {
+    let config_file = xdg.config_file();
+    let contents = fs::read_to_string(&config_file).map_err(|source| ConfigError::Read {
+        path: config_file.clone(),
+        source,
+    })?;
+    toml::from_str::<ConfigDocument>(&contents).map_err(|mut source| {
+        source.set_input(None);
+        ConfigError::Parse {
+            path: config_file,
+            source,
+        }
+    })
 }
 
 /// Safety-sensitive path role used in diagnostics.
@@ -1020,6 +1046,25 @@ mod tests {
         assert!(config.paths().upload_staging_directory().is_dir());
         assert!(config.paths().recovery_directory().is_dir());
         assert!(!config.paths().journal_file().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn root_change_loads_settings_when_the_recorded_root_is_unavailable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temporary, xdg, sync_root) = fixture()?;
+        write_config(&xdg, &sync_root)?;
+        let available = Config::load_from(&xdg)?;
+        fs::remove_dir(&sync_root)?;
+
+        assert!(matches!(
+            Config::load_from(&xdg),
+            Err(ConfigError::ResolveSyncRoot { .. })
+        ));
+        let settings = Config::load_for_root_change_from(&xdg)?;
+        assert_eq!(settings.sync_root(), sync_root);
+        assert_eq!(settings.dropbox_app_key(), "test-app-key");
+        assert_eq!(settings.paths(), available.paths());
         Ok(())
     }
 
