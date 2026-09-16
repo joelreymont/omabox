@@ -530,6 +530,7 @@ pub(crate) fn replay_local_plans_at<'a>(
                     }
                 }
                 Operation::CreateRemoteDirectory
+                | Operation::DeleteRemoteDirectory
                 | Operation::CreateRemote { .. }
                 | Operation::PreserveRemote { .. }
                 | Operation::ReplaceRemote { .. }
@@ -673,6 +674,12 @@ pub(crate) fn replay_remote_operations_at(
                         &mut report,
                     )?
                 }
+                Operation::DeleteRemoteDirectory => {
+                    let outcome = dropbox
+                        .delete_folder(&plan.path)
+                        .map_err(|source| dropbox_error(&plan.path, source))?;
+                    apply_folder_delete_mutation(journal, &plan, planned, outcome, &mut report)?
+                }
                 Operation::CreateLocalDirectory
                 | Operation::DeleteLocalDirectory
                 | Operation::InstallLocal { .. }
@@ -772,6 +779,50 @@ fn apply_folder_mutation(
                 path: plan.path.clone(),
             }))
         }
+        MutationOutcome::Rejected(rejection) => Ok(Some(sync_error(&plan.path, rejection))),
+    }
+}
+
+/// Record the outcome of one guarded empty-folder delete.
+///
+/// Entries still inside the folder, or an object of another type at its path,
+/// retire the plan so a fresh observation replans it; nothing beneath the path
+/// is inferred deleted here. An already absent folder completes the plan, which
+/// keeps replay after a crash idempotent.
+fn apply_folder_delete_mutation(
+    journal: &mut Journal,
+    plan: &PlanRecord,
+    planned: &PlannedOperation,
+    outcome: MutationOutcome,
+    report: &mut ReplayReport,
+) -> Result<Option<ReplayBlocked>, RecoveryError> {
+    match outcome {
+        MutationOutcome::Applied(RemotePathState::Absent) => {
+            complete_final(journal, planned, &plan.path, &Baseline::Absent)?;
+            report.completed_operations += 1;
+            Ok(None)
+        }
+        MutationOutcome::Applied(
+            RemotePathState::File(_) | RemotePathState::Folder | RemotePathState::Unsupported,
+        ) => Err(invalid(
+            &plan.path,
+            "folder delete returned an impossible applied state",
+        )),
+        MutationOutcome::Pending => Ok(Some(ReplayBlocked::RemotePending {
+            path: plan.path.clone(),
+        })),
+        MutationOutcome::PreconditionChanged(
+            RemotePathState::Folder | RemotePathState::File(_) | RemotePathState::Unsupported,
+        ) => {
+            supersede_plan(journal, plan)?;
+            Ok(Some(ReplayBlocked::FreshObservationRequired {
+                path: plan.path.clone(),
+            }))
+        }
+        MutationOutcome::PreconditionChanged(RemotePathState::Absent) => Err(invalid(
+            &plan.path,
+            "folder delete precondition changed to an impossible absent state",
+        )),
         MutationOutcome::Rejected(rejection) => Ok(Some(sync_error(&plan.path, rejection))),
     }
 }

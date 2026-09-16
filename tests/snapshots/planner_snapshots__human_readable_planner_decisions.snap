@@ -29,6 +29,17 @@ explicit remote deletion
 operations:
 1. delete local file
 
+explicit local directory deletion
+operations:
+1. delete empty remote directory
+
+explicit local directory deletion with Dropbox entries beneath
+blocked: remote directory still holds entries
+
+explicit remote directory deletion
+operations:
+1. delete empty local directory
+
 inaccessible local state
 blocked: local path is inaccessible
 

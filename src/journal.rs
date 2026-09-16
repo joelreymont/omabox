@@ -1663,7 +1663,8 @@ impl Journal {
                         | Operation::ReplaceLocal { .. }
                         | Operation::DeleteLocal { .. }
                         | Operation::PreserveRemote { .. }
-                        | Operation::DeleteRemote { .. },
+                        | Operation::DeleteRemote { .. }
+                        | Operation::DeleteRemoteDirectory,
                     ) => None,
                     Err(error) => Some(Err(error)),
                 }
@@ -3314,7 +3315,9 @@ fn operation_matches_baseline(operation: &Operation, baseline: &Baseline) -> boo
             Operation::CreateLocalDirectory | Operation::CreateRemoteDirectory,
             Baseline::Directory,
         ) => true,
-        (Operation::DeleteLocalDirectory, Baseline::Absent) => true,
+        (Operation::DeleteLocalDirectory | Operation::DeleteRemoteDirectory, Baseline::Absent) => {
+            true
+        }
         (Operation::CreateRemote { content }, Baseline::Present(remote))
         | (Operation::ReplaceRemote { content, .. }, Baseline::Present(remote)) => {
             content == &remote.content
@@ -3334,7 +3337,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::model::{Decision, DropboxRevision, LocalFile, Observation, RemoteFile};
+    use crate::model::{
+        Decision, DropboxRevision, LocalFile, Observation, RemoteFile, RemoteSubtree,
+    };
     use crate::planner::plan;
 
     fn content(value: &str) -> ContentIdentity {
@@ -3469,6 +3474,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(content("new"))),
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ))?;
 
         let plan = {
@@ -3497,11 +3503,13 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(content("same"))),
             &Observation::Present(matching),
+            RemoteSubtree::Empty,
         ))?;
         let upload = operations(plan(
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(content("upload"))),
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ))?;
         let noops = vec![(PathBuf::from("same.txt"), agreed)];
         let plans = vec![
@@ -3527,6 +3535,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::ConfirmedAbsent,
             &Observation::Present(downloaded.clone()),
+            RemoteSubtree::Empty,
         ))?;
         let first_path = Path::new("first.txt");
         let second_path = Path::new("second.txt");
@@ -3674,6 +3683,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(agreed_file.content.clone())),
             &Observation::Present(agreed_file),
+            RemoteSubtree::Empty,
         ))?;
         journal.record_noop(agreed_path, &agreement)?;
         journal.publish_local_inventory(&[LocalObservationRecord {
@@ -3700,6 +3710,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(content("blocked"))),
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ))?;
         let blocked = recorded_plan(journal.record_plan(Path::new("blocked.txt"), &upload)?)?;
         assert_eq!(
@@ -3780,6 +3791,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(content("same"))),
             &Observation::Present(agreed.clone()),
+            RemoteSubtree::Empty,
         ))?;
         journal.record_noop(path, &baseline)?;
         let local_observation = LocalObservationRecord {
@@ -3861,6 +3873,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(content("blocked"))),
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ))?;
         let blocked = recorded_plan(journal.record_plan(Path::new("blocked.txt"), &blocked_plan)?)?;
         assert_eq!(
@@ -3915,6 +3928,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(content("remote"))),
             &Observation::Present(remote.clone()),
+            RemoteSubtree::Empty,
         ))?;
         journal.record_noop(path, &agreed)?;
 
@@ -3927,6 +3941,7 @@ mod tests {
             &baseline,
             &Observation::ConfirmedAbsent,
             &Observation::Present(remote.clone()),
+            RemoteSubtree::Empty,
         ))?;
 
         assert_eq!(
@@ -4003,6 +4018,7 @@ mod tests {
             &Baseline::Present(remote_file("same", "rev-old")),
             &Observation::Present(LocalFile::new(content("same"))),
             &Observation::Present(observed.clone()),
+            RemoteSubtree::Empty,
         ))?;
         assert_eq!(
             journal.record_noop(path, &noop_decision)?,
@@ -4020,12 +4036,14 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(content("new"))),
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ))?;
         let pending = recorded_plan(journal.record_plan(path, &pending)?)?;
         let absent = noop(plan(
             &Baseline::Absent,
             &Observation::ConfirmedAbsent,
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ))?;
         assert_eq!(
             journal.record_noop(path, &absent)?,
@@ -4047,6 +4065,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(content("old"))),
             &Observation::Present(remote_file("old", "rev-old")),
+            RemoteSubtree::Empty,
         ))?;
         journal.record_noop(path, &present)?;
         assert_eq!(journal.baseline_paths()?, vec![path.to_path_buf()]);
@@ -4055,6 +4074,7 @@ mod tests {
             &Baseline::Present(remote_file("old", "rev-old")),
             &Observation::ConfirmedAbsent,
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ))?;
         journal.record_noop(path, &absent)?;
 
@@ -4114,12 +4134,14 @@ mod tests {
             &Baseline::Directory,
             &Observation::Directory,
             &Observation::Directory,
+            RemoteSubtree::Empty,
         ))?;
         journal.record_noop(&parent, &directories)?;
         let agreed = noop(plan(
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(content("old"))),
             &Observation::Present(remote_file("old", "rev-old")),
+            RemoteSubtree::Empty,
         ))?;
         journal.record_noop(&child, &agreed)?;
         assert_eq!(journal.baselines()?.len(), 2);
@@ -4142,6 +4164,7 @@ mod tests {
                 &Baseline::Absent,
                 &Observation::Present(LocalFile::new(content(value))),
                 &Observation::Present(remote_file(value, revision)),
+                RemoteSubtree::Empty,
             ))?;
             journal.record_noop(path, &agreed)?;
         }
@@ -4419,6 +4442,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(content("created"))),
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ))?;
         let stale_conflict = Conflict::RemoteDeletionLocalEdit {
             local: LocalFile::new(content("created")),
@@ -4467,6 +4491,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(content("create"))),
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ))?;
         let create = recorded_plan(journal.record_plan(create_path, &create)?)?;
 
@@ -4476,6 +4501,7 @@ mod tests {
             &Baseline::Present(old.clone()),
             &Observation::Present(LocalFile::new(content("replace"))),
             &Observation::Present(old),
+            RemoteSubtree::Empty,
         ))?;
         let _ = recorded_plan(journal.record_plan(replace_path, &replace)?)?;
 
@@ -4483,6 +4509,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::ConfirmedAbsent,
             &Observation::Present(remote_file("download", "rev-download")),
+            RemoteSubtree::Empty,
         ))?;
         let _ = journal.record_plan(Path::new("download.txt"), &download)?;
 
@@ -4586,6 +4613,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(content("fresh"))),
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ))?;
         let fresh = recorded_plan(reopened.record_plan(Path::new("fresh.txt"), &fresh)?)?;
         assert!(fresh.operations[0].id.0 > recovery.operation_id.0);
@@ -4906,6 +4934,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(content("upload"))),
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ))?;
         let reason = BlockReason::RemoteRejected {
             tag: String::from("insufficient_space"),
@@ -4977,6 +5006,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(content("upload"))),
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ))?;
         let reason = BlockReason::DownloadUnavailable { status: 409 };
 
@@ -5010,6 +5040,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(content("upload"))),
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ))?;
 
         let mut journal = Journal::open(&database_path)?;
@@ -5040,6 +5071,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(content("upload"))),
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ))?;
 
         let mut journal = Journal::open(&database_path)?;
@@ -5087,6 +5119,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(content("upload"))),
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ))?;
         let displaced = LocalFile::new(content("displaced"));
         let ordered_plan = OperationPlan::new(vec![
@@ -5553,6 +5586,7 @@ mod tests {
                     &Baseline::Absent,
                     &Observation::Present(LocalFile::new(content("kept"))),
                     &Observation::Present(remote_file("kept", "rev-kept")),
+                    RemoteSubtree::Empty,
                 ))?,
             )?;
         }
@@ -5723,6 +5757,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(content("upload"))),
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ))?;
         let recorded = recorded_plan(journal.record_plan(Path::new("orphan.txt"), &upload)?)?;
         assert_eq!(recorded.status, PlanStatus::Pending);
@@ -5899,6 +5934,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Directory,
             &Observation::Directory,
+            RemoteSubtree::Empty,
         ))?;
         assert_eq!(journal.record_noop(path, &agreed)?, NoOpWrite::Recorded);
         let pending = recorded_plan(journal.record_plan(
@@ -5938,6 +5974,7 @@ mod tests {
                 &Baseline::Absent,
                 &Observation::Present(LocalFile::new(content("old"))),
                 &Observation::Present(baseline_file.clone()),
+                RemoteSubtree::Empty,
             ))?;
             assert_eq!(journal.record_noop(path, &baseline)?, NoOpWrite::Recorded);
             let operations = OperationPlan::new(vec![
@@ -6052,6 +6089,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::ConfirmedAbsent,
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ))?;
         assert_eq!(journal.record_noop(path, &absent)?, NoOpWrite::Recorded);
         assert!(journal.conflicts()?.is_empty());

@@ -58,6 +58,15 @@ omabox logs
 Changing to a new empty sync root does not imply that remote files were
 deleted; Omabox records a new root generation and downloads the remote tree.
 
+Deleting a file or directory under the sync root deletes it on Dropbox. A file
+is deleted only while its last synchronized revision is still current. A
+Dropbox folder is deleted only after the inventory shows nothing beneath it and
+a listing taken immediately before the delete still finds it empty, because
+Dropbox removes a folder together with its contents. A deleted local directory
+whose Dropbox folder still holds entries Omabox never synchronized, such as
+Dropbox Paper documents, stays on Dropbox and counts as blocked; it is not
+re-created locally.
+
 ## Upgrade or remove
 
 After building a new release:

@@ -19,7 +19,8 @@ use dropbox_sdk::{Error as SdkError, types::auth::AuthError as SdkAuthError};
 use omabox::auth::{AccessToken, OAuthClient, RefreshToken, StoredCredential};
 use omabox::dropbox::{
     AccountValidation, ApiOutcome, DropboxClient, DropboxEndpoints, DropboxError, DropboxLink,
-    DropboxRoot, InventoryRefresh, LongPollWakeup, MutationOutcome, RemotePathState,
+    DropboxRoot, InventoryRefresh, LongPollWakeup, MutationOutcome, MutationRejection,
+    RemotePathState,
 };
 use omabox::journal::{
     BlockReason, DropboxBinding, Journal, LocalRootBinding, PlanBlock, PlanId, PlanStatus,
@@ -31,7 +32,7 @@ use omabox::local::{
 };
 use omabox::model::{
     Baseline, CanonicalPath, Conflict, ContentIdentity, Decision, DropboxRevision, LocalFile,
-    Observation, OperationPlan, RemoteFile, UnknownReason,
+    Observation, OperationPlan, RemoteFile, RemoteSubtree, UnknownReason,
 };
 use omabox::planner::plan;
 use omabox::reconcile::{
@@ -564,6 +565,7 @@ fn record_blocked_install(
         &Baseline::Absent,
         &Observation::ConfirmedAbsent,
         &Observation::Present(remote.clone()),
+        RemoteSubtree::Empty,
     ))?;
     let PlanWrite::Recorded(recorded) = journal.record_plan(path, &operations)? else {
         return Err(io::Error::other("fresh download plan was already live").into());
@@ -844,6 +846,7 @@ fn late_download_result_cannot_block_a_reused_plan_id() -> Result<(), Box<dyn Er
         &Baseline::Absent,
         &Observation::ConfirmedAbsent,
         &Observation::Present(old),
+        RemoteSubtree::Empty,
     ))?;
     let PlanWrite::Recorded(old_record) =
         journal.record_plan(Path::new("reused.txt"), &old_plan)?
@@ -866,6 +869,7 @@ fn late_download_result_cannot_block_a_reused_plan_id() -> Result<(), Box<dyn Er
             &Baseline::Absent,
             &Observation::ConfirmedAbsent,
             &Observation::Present(new),
+            RemoteSubtree::Empty,
         ))?;
         let PlanWrite::Recorded(new_record) =
             journal.record_plan(Path::new("reused.txt"), &new_plan)?
@@ -935,6 +939,7 @@ fn worker_verification_mismatch_durably_blocks_its_plan() -> Result<(), Box<dyn 
             &Baseline::Absent,
             &Observation::ConfirmedAbsent,
             &Observation::Present(remote.clone()),
+            RemoteSubtree::Empty,
         ))?;
         assert!(matches!(
             journal.record_plan(Path::new("mismatch.txt"), &operations)?,
@@ -994,6 +999,7 @@ fn worker_auth_rate_limit_and_server_failures_remain_global() -> Result<(), Box<
             &Baseline::Absent,
             &Observation::ConfirmedAbsent,
             &Observation::Present(remote),
+            RemoteSubtree::Empty,
         ))?;
         assert!(matches!(
             journal.record_plan(Path::new("global.txt"), &operations)?,
@@ -1079,6 +1085,7 @@ fn occupied_download_stage_is_durably_blocked_without_overwrite_or_request()
         &Baseline::Absent,
         &Observation::ConfirmedAbsent,
         &Observation::Present(remote),
+        RemoteSubtree::Empty,
     ))?;
     let PlanWrite::Recorded(recorded) =
         journal.record_plan(Path::new("occupied.txt"), &operations)?
@@ -1346,6 +1353,7 @@ fn changed_upload_supersedes_a_rejected_plan_before_deadline() -> Result<(), Box
         &Baseline::Absent,
         &Observation::Present(LocalFile::new(old_content)),
         &Observation::ConfirmedAbsent,
+        RemoteSubtree::Empty,
     ))?;
     let PlanWrite::Recorded(old_plan) =
         journal.record_plan(Path::new("changed.txt"), &old_operations)?
@@ -1417,6 +1425,7 @@ fn unknown_local_state_keeps_a_rejected_upload_blocked() -> Result<(), Box<dyn E
         &Baseline::Absent,
         &Observation::Present(LocalFile::new(content)),
         &Observation::ConfirmedAbsent,
+        RemoteSubtree::Empty,
     ))?;
     let PlanWrite::Recorded(recorded) =
         journal.record_plan(Path::new("unknown.txt"), &operations)?
@@ -1975,6 +1984,509 @@ fn remote_directory_deletion_removes_local_directories_deepest_first() -> Result
     assert_eq!(journal.baseline(Path::new("gone/child"))?, None);
     assert!(journal.pending_plans()?.is_empty());
     assert_eq!(server.finish()?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn local_directory_deletion_removes_dropbox_directories_after_their_entries()
+-> Result<(), Box<dyn Error>> {
+    let bytes = b"leaf payload";
+    let leaf = RemoteFile::new(
+        dropbox_content_hash(bytes.as_slice())?,
+        DropboxRevision::new("rev-leaf"),
+    );
+    let empty_listing = |cursor: &str| {
+        FakeResponse::json(json!({
+            "entries": [],
+            "cursor": cursor,
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder")
+    };
+    let server = FakeServer::start(vec![
+        account(),
+        FakeResponse::json(json!({
+            "entries": [
+                folder_metadata("/gone", "/Gone"),
+                folder_metadata("/gone/child", "/Gone/Child"),
+                file_metadata(
+                    "/gone/child/leaf.txt",
+                    "/Gone/Child/leaf.txt",
+                    leaf.revision.as_str(),
+                    &leaf.content,
+                ),
+            ],
+            "cursor": "cursor-tree",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder"),
+        // Pass 1: only the file is deletable; its delete carries the revision.
+        FakeResponse::json(json!({
+            "metadata": file_metadata(
+                "/gone/child/leaf.txt",
+                "/Gone/Child/leaf.txt",
+                leaf.revision.as_str(),
+                &leaf.content,
+            )
+        }))
+        .for_path("/2/files/delete_v2"),
+        // Pass 2: the delta shows the file gone, so the child folder is probed and deleted.
+        FakeResponse::json(json!({
+            "entries": [deleted_metadata("/gone/child/leaf.txt", "/Gone/Child/leaf.txt")],
+            "cursor": "cursor-after-leaf",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder/continue"),
+        empty_listing("probe-child"),
+        FakeResponse::json(json!({
+            "metadata": folder_metadata("/gone/child", "/Gone/Child")
+        }))
+        .for_path("/2/files/delete_v2"),
+        // Pass 3: the delta shows the child gone, so the parent is probed and deleted.
+        FakeResponse::json(json!({
+            "entries": [deleted_metadata("/gone/child", "/Gone/Child")],
+            "cursor": "cursor-after-child",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder/continue"),
+        empty_listing("probe-gone"),
+        FakeResponse::json(json!({
+            "metadata": folder_metadata("/gone", "/Gone")
+        }))
+        .for_path("/2/files/delete_v2"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-directory-tree-delete")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_directory_baseline(&mut journal, Path::new("Gone"))?;
+    seed_directory_baseline(&mut journal, Path::new("Gone/Child"))?;
+    seed_baseline(&mut journal, Path::new("Gone/Child/leaf.txt"), &leaf)?;
+
+    let mut pass = || -> Result<ReconcileReport, Box<dyn Error>> {
+        Ok(complete_report(reconcile_once(
+            &mut journal,
+            &client,
+            &mut downloads,
+            &root,
+            &staging,
+            &recovery,
+        )?)?)
+    };
+    let first = pass()?;
+    assert_eq!(
+        (first.planned, first.replayed_operations, first.blocked),
+        (1, 1, 2)
+    );
+    let second = pass()?;
+    assert_eq!(
+        (second.planned, second.replayed_operations, second.blocked),
+        (1, 1, 1)
+    );
+    let third = pass()?;
+    assert_eq!(
+        (third.planned, third.replayed_operations, third.blocked),
+        (1, 1, 0)
+    );
+
+    assert!(!root.join("Gone").exists());
+    for path in ["Gone", "Gone/Child", "Gone/Child/leaf.txt"] {
+        assert_eq!(journal.baseline(Path::new(path))?, None, "{path}");
+    }
+    assert!(journal.pending_plans()?.is_empty());
+    assert!(journal.blocked_plans()?.is_empty());
+
+    let requests = server.finish()?;
+    let deletes = requests
+        .iter()
+        .filter(|request| request.path == "/2/files/delete_v2")
+        .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        deletes,
+        vec![
+            json!({"path": "/Gone/Child/leaf.txt", "parent_rev": "rev-leaf"}),
+            json!({"path": "/Gone/Child"}),
+            json!({"path": "/Gone"}),
+        ]
+    );
+    let probes = requests
+        .iter()
+        .filter(|request| request.path == "/2/files/list_folder")
+        .skip(1)
+        .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(probes.len(), 2);
+    for (probe, path) in probes.iter().zip(["/Gone/Child", "/Gone"]) {
+        assert_eq!(probe["path"], json!(path));
+        assert_eq!(probe["limit"], json!(1));
+        // The SDK omits defaults; the probe must not opt into either flag.
+        assert_ne!(probe["recursive"], json!(true));
+        assert_ne!(probe["include_deleted"], json!(true));
+    }
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path != "/2/files/create_folder_v2")
+    );
+    Ok(())
+}
+
+#[test]
+fn local_directory_deletion_waits_for_unsynchronized_dropbox_entries() -> Result<(), Box<dyn Error>>
+{
+    let server = FakeServer::start(vec![
+        account(),
+        FakeResponse::json(json!({
+            "entries": [
+                folder_metadata("/docs", "/docs"),
+                unsupported_file_metadata("/docs/note.paper", "/docs/note.paper", "rev-paper"),
+            ],
+            "cursor": "cursor-paper",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-occupied-directory")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_directory_baseline(&mut journal, Path::new("docs"))?;
+
+    let report = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+
+    assert_eq!(report.planned, 0);
+    assert_eq!(report.replayed_operations, 0);
+    assert_eq!(report.blocked, 2);
+    assert!(!root.join("docs").exists());
+    assert_eq!(
+        journal.baseline(Path::new("docs"))?,
+        Some(Baseline::Directory)
+    );
+    assert!(journal.pending_plans()?.is_empty());
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn dropbox_directory_that_gained_an_entry_is_not_deleted_from_a_stale_inventory()
+-> Result<(), Box<dyn Error>> {
+    let late = dropbox_content_hash(b"late arrival".as_slice())?;
+    let server = FakeServer::start(vec![
+        account(),
+        FakeResponse::json(json!({
+            "entries": [folder_metadata("/gone", "/gone")],
+            "cursor": "cursor-empty",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder"),
+        FakeResponse::json(json!({
+            "entries": [file_metadata("/gone/late.txt", "/gone/late.txt", "rev-late", &late)],
+            "cursor": "probe-late",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-stale-empty-directory")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_directory_baseline(&mut journal, Path::new("gone"))?;
+
+    assert_eq!(
+        reconcile_once(
+            &mut journal,
+            &client,
+            &mut downloads,
+            &root,
+            &staging,
+            &recovery,
+        )?,
+        ReconcileOutcome::FreshObservationRequired {
+            path: PathBuf::from("gone")
+        }
+    );
+
+    assert!(!root.join("gone").exists());
+    assert_eq!(
+        journal.baseline(Path::new("gone"))?,
+        Some(Baseline::Directory)
+    );
+    assert!(journal.pending_plans()?.is_empty());
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path != "/2/files/delete_v2")
+    );
+    Ok(())
+}
+
+#[test]
+fn already_absent_dropbox_directory_completes_its_replayed_delete() -> Result<(), Box<dyn Error>> {
+    let server = FakeServer::start(vec![
+        FakeResponse::status_json(409, lookup_error("not_found")).for_path("/2/files/list_folder"),
+    ])?;
+    let client = fake_client(&server, "opaque-access-absent-directory-replay")?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_directory_baseline(&mut journal, Path::new("gone"))?;
+    let delete = planned_operations(plan(
+        &Baseline::Directory,
+        &Observation::ConfirmedAbsent,
+        &Observation::Directory,
+        RemoteSubtree::Empty,
+    ))?;
+    assert!(matches!(
+        journal.record_plan(Path::new("gone"), &delete)?,
+        PlanWrite::Recorded(_)
+    ));
+
+    let report = replay_remote_operations(&mut journal, &client, &root, &staging)?;
+
+    assert_eq!(report.completed_operations, 1);
+    assert!(report.blocked.is_empty());
+    assert_eq!(journal.baseline(Path::new("gone"))?, None);
+    assert!(journal.pending_plans()?.is_empty());
+    assert_eq!(server.finish()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn dropbox_file_at_a_deleted_directory_path_retires_the_replayed_delete()
+-> Result<(), Box<dyn Error>> {
+    let content = dropbox_content_hash(b"file where a folder was".as_slice())?;
+    let server = FakeServer::start(vec![
+        FakeResponse::status_json(409, lookup_error("not_folder")).for_path("/2/files/list_folder"),
+        FakeResponse::json(file_metadata("/gone", "/gone", "rev-file", &content))
+            .for_path("/2/files/get_metadata"),
+    ])?;
+    let client = fake_client(&server, "opaque-access-file-at-directory-path")?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_directory_baseline(&mut journal, Path::new("gone"))?;
+    let delete = planned_operations(plan(
+        &Baseline::Directory,
+        &Observation::ConfirmedAbsent,
+        &Observation::Directory,
+        RemoteSubtree::Empty,
+    ))?;
+    assert!(matches!(
+        journal.record_plan(Path::new("gone"), &delete)?,
+        PlanWrite::Recorded(_)
+    ));
+
+    let report = replay_remote_operations(&mut journal, &client, &root, &staging)?;
+
+    assert_eq!(report.completed_operations, 0);
+    assert_eq!(
+        report.blocked,
+        vec![ReplayBlocked::FreshObservationRequired {
+            path: PathBuf::from("gone")
+        }]
+    );
+    assert_eq!(
+        journal.baseline(Path::new("gone"))?,
+        Some(Baseline::Directory)
+    );
+    assert!(journal.pending_plans()?.is_empty());
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path != "/2/files/delete_v2")
+    );
+    Ok(())
+}
+
+#[test]
+fn folder_delete_probe_outcomes_are_classified_per_path() -> Result<(), Box<dyn Error>> {
+    let content = dropbox_content_hash(b"raced file".as_slice())?;
+    let reset = || {
+        FakeResponse::status_json(
+            409,
+            json!({"error_summary": "reset/", "error": {".tag": "reset"}}),
+        )
+        .for_path("/2/files/list_folder/continue")
+    };
+    let page = |entries: serde_json::Value, cursor: &str, has_more: bool| json!({"entries": entries, "cursor": cursor, "has_more": has_more});
+    let server = FakeServer::start(vec![
+        // 1. A transport failure on the probe is verified through metadata: still a folder.
+        FakeResponse::status_json(503, json!({})).for_path("/2/files/list_folder"),
+        FakeResponse::json(folder_metadata("/gone", "/gone")).for_path("/2/files/get_metadata"),
+        // 2. A documented lookup rejection blocks only this path.
+        FakeResponse::status_json(409, lookup_error("restricted_content"))
+            .for_path("/2/files/list_folder"),
+        // 3. A listing reset before the page settles.
+        FakeResponse::json(page(json!([]), "probe-reset", true)).for_path("/2/files/list_folder"),
+        reset(),
+        // 4. A continuation whose cursor does not advance.
+        FakeResponse::json(page(json!([]), "probe-stall", true)).for_path("/2/files/list_folder"),
+        FakeResponse::json(page(json!([]), "probe-stall", true))
+            .for_path("/2/files/list_folder/continue"),
+        // 5. An entry that only a later page reveals.
+        FakeResponse::json(page(json!([]), "probe-more", true)).for_path("/2/files/list_folder"),
+        FakeResponse::json(page(
+            json!([folder_metadata("/gone/inner", "/gone/inner")]),
+            "probe-more-2",
+            false,
+        ))
+        .for_path("/2/files/list_folder/continue"),
+        // 6. The folder's own entry does not count as an occupant.
+        FakeResponse::json(page(
+            json!([folder_metadata("/gone", "/gone")]),
+            "probe-self",
+            false,
+        ))
+        .for_path("/2/files/list_folder"),
+        FakeResponse::json(json!({"metadata": folder_metadata("/gone", "/gone")}))
+            .for_path("/2/files/delete_v2"),
+        // 7. A file that replaced the folder inside the residual window is
+        //    reported, and the path is absent as requested.
+        FakeResponse::json(page(json!([]), "probe-race", false)).for_path("/2/files/list_folder"),
+        FakeResponse::json(json!({
+            "metadata": file_metadata("/gone", "/gone", "rev-race", &content)
+        }))
+        .for_path("/2/files/delete_v2"),
+    ])?;
+    let client = fake_client(&server, "opaque-access-probe-outcomes")?;
+
+    assert_eq!(client.delete_folder("gone")?, MutationOutcome::Pending);
+    assert_eq!(
+        client.delete_folder("gone")?,
+        MutationOutcome::Rejected(MutationRejection::RejectedByDropbox)
+    );
+    assert_eq!(client.delete_folder("gone")?, MutationOutcome::Pending);
+    assert_eq!(client.delete_folder("gone")?, MutationOutcome::Pending);
+    assert_eq!(
+        client.delete_folder("gone")?,
+        MutationOutcome::PreconditionChanged(RemotePathState::Folder)
+    );
+    assert_eq!(
+        client.delete_folder("gone")?,
+        MutationOutcome::Applied(RemotePathState::Absent)
+    );
+    assert_eq!(
+        client.delete_folder("gone")?,
+        MutationOutcome::Applied(RemotePathState::Absent)
+    );
+
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 13);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/2/files/delete_v2")
+            .count(),
+        2
+    );
+    Ok(())
+}
+
+#[test]
+fn folder_delete_probe_failures_keep_the_plan_retry_safe_or_block_only_its_path()
+-> Result<(), Box<dyn Error>> {
+    let server = FakeServer::start(vec![
+        FakeResponse::status_json(503, json!({})).for_path("/2/files/list_folder"),
+        FakeResponse::json(folder_metadata("/gone", "/gone")).for_path("/2/files/get_metadata"),
+        FakeResponse::status_json(409, lookup_error("restricted_content"))
+            .for_path("/2/files/list_folder"),
+    ])?;
+    let client = fake_client(&server, "opaque-access-probe-replay")?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_directory_baseline(&mut journal, Path::new("gone"))?;
+    let delete = planned_operations(plan(
+        &Baseline::Directory,
+        &Observation::ConfirmedAbsent,
+        &Observation::Directory,
+        RemoteSubtree::Empty,
+    ))?;
+    assert!(matches!(
+        journal.record_plan(Path::new("gone"), &delete)?,
+        PlanWrite::Recorded(_)
+    ));
+
+    let pending = replay_remote_operations(&mut journal, &client, &root, &staging)?;
+    assert_eq!(pending.completed_operations, 0);
+    assert_eq!(
+        pending.blocked,
+        vec![ReplayBlocked::RemotePending {
+            path: PathBuf::from("gone")
+        }]
+    );
+    assert_eq!(journal.pending_plans()?.len(), 1);
+
+    let rejected = replay_remote_operations(&mut journal, &client, &root, &staging)?;
+    assert_eq!(rejected.completed_operations, 0);
+    assert_eq!(
+        rejected.blocked,
+        vec![ReplayBlocked::DurablePlan {
+            path: PathBuf::from("gone"),
+            reason: BlockReason::RemoteRejected {
+                tag: String::from("rejected_by_dropbox"),
+            },
+        }]
+    );
+    assert!(journal.pending_plans()?.is_empty());
+    assert_eq!(journal.blocked_plans()?.len(), 1);
+    assert_eq!(
+        journal.baseline(Path::new("gone"))?,
+        Some(Baseline::Directory)
+    );
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path != "/2/files/delete_v2")
+    );
     Ok(())
 }
 
@@ -3000,6 +3512,7 @@ fn automatic_case_rename_never_becomes_a_dropbox_delete() -> Result<(), Box<dyn 
         &Baseline::Present(remote.clone()),
         &Observation::ConfirmedAbsent,
         &Observation::Present(remote.clone()),
+        RemoteSubtree::Empty,
     ))?;
     assert!(matches!(
         journal.record_plan(Path::new("Apps/entry.doentry"), &stale_delete)?,
@@ -3167,6 +3680,7 @@ fn pending_exact_downloads_use_bounded_parallel_workers() -> Result<(), Box<dyn 
         &Baseline::Absent,
         &Observation::ConfirmedAbsent,
         &Observation::Present(remote),
+        RemoteSubtree::Empty,
     ))?;
     let mut paths = Vec::with_capacity(DOWNLOAD_COUNT);
     for index in 0..DOWNLOAD_COUNT {
@@ -3301,6 +3815,7 @@ fn gated_download_does_not_stop_the_next_poll_and_reconciliation() -> Result<(),
         &Baseline::Absent,
         &Observation::ConfirmedAbsent,
         &Observation::Present(download.clone()),
+        RemoteSubtree::Empty,
     ))?;
     if !matches!(
         journal.record_plan(Path::new("long.bin"), &download_plan)?,
@@ -3427,11 +3942,13 @@ fn later_planned_download_does_not_reclaim_an_active_slot() -> Result<(), Box<dy
         &Baseline::Absent,
         &Observation::ConfirmedAbsent,
         &Observation::Present(held),
+        RemoteSubtree::Empty,
     ))?;
     let next_plan = planned_operations(plan(
         &Baseline::Absent,
         &Observation::ConfirmedAbsent,
         &Observation::Present(next),
+        RemoteSubtree::Empty,
     ))?;
     if !matches!(
         journal.record_plan(Path::new("a.bin"), &held_plan)?,
@@ -3580,6 +4097,7 @@ fn interrupted_exact_download_resumes_only_from_a_valid_range() -> Result<(), Bo
         &Baseline::Absent,
         &Observation::ConfirmedAbsent,
         &Observation::Present(remote.clone()),
+        RemoteSubtree::Empty,
     ))?;
     if !matches!(
         journal.record_plan(Path::new("resume.bin"), &operation_plan)?,
@@ -3681,6 +4199,7 @@ fn unknown_download_slots_are_preserved_with_disposable_fallback() -> Result<(),
         &Baseline::Absent,
         &Observation::ConfirmedAbsent,
         &Observation::Present(remote),
+        RemoteSubtree::Empty,
     ))?;
     let _ = journal.record_plan(Path::new("fallback.txt"), &operations)?;
 
@@ -3738,6 +4257,7 @@ fn root_swap_after_replay_validation_never_touches_the_replacement() -> Result<(
         &Baseline::Absent,
         &Observation::ConfirmedAbsent,
         &Observation::Present(remote),
+        RemoteSubtree::Empty,
     ))?;
     if !matches!(
         journal.record_plan(path, &operation_plan)?,
@@ -3843,6 +4363,7 @@ fn completed_download_batch_is_installed_before_the_next_batch_fails() -> Result
         &Baseline::Absent,
         &Observation::ConfirmedAbsent,
         &Observation::Present(remote),
+        RemoteSubtree::Empty,
     ))?;
     let paths = (0..DOWNLOAD_COUNT)
         .map(|index| PathBuf::from(format!("batch-{index}.txt")))
@@ -4010,6 +4531,7 @@ fn replaced_local_root_never_replays_pending_deletion() -> Result<(), Box<dyn Er
         &Baseline::Present(remote),
         &Observation::Present(LocalFile::new(content)),
         &Observation::ConfirmedAbsent,
+        RemoteSubtree::Empty,
     ))?;
     let _ = journal.record_plan(path, &deletion)?;
 
@@ -4785,6 +5307,7 @@ fn rejected_path_case(wire_tag: &str, recorded_tag: &str) -> Result<(), Box<dyn 
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(content)),
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ))?;
         assert!(matches!(
             journal.record_plan(path, &operations)?,
@@ -4930,6 +5453,7 @@ fn remote_replay_preserves_conflict_sides_without_a_backup_download() -> Result<
         &Baseline::Present(old.clone()),
         &Observation::Present(local.clone()),
         &Observation::Present(old.clone()),
+        RemoteSubtree::Empty,
     ))?;
     assert!(matches!(
         journal.record_plan(Path::new("replace.txt"), &operations)?,
@@ -5009,6 +5533,7 @@ fn remote_replay_creates_nested_parents_before_the_file() -> Result<(), Box<dyn 
         &Baseline::Absent,
         &Observation::Present(LocalFile::new(content.clone())),
         &Observation::ConfirmedAbsent,
+        RemoteSubtree::Empty,
     ))?;
     let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
     assert!(matches!(
@@ -5087,6 +5612,7 @@ fn stale_upload_is_superseded_and_current_bytes_sync() -> Result<(), Box<dyn Err
         &Baseline::Absent,
         &Observation::Present(LocalFile::new(expected)),
         &Observation::ConfirmedAbsent,
+        RemoteSubtree::Empty,
     ))?;
     let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
     let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
@@ -5098,6 +5624,7 @@ fn stale_upload_is_superseded_and_current_bytes_sync() -> Result<(), Box<dyn Err
         &Baseline::Absent,
         &Observation::Present(LocalFile::new(other.clone())),
         &Observation::ConfirmedAbsent,
+        RemoteSubtree::Empty,
     ))?;
     assert!(matches!(
         journal.record_plan(Path::new("other.txt"), &other_operations)?,
@@ -5220,6 +5747,7 @@ fn matching_observations_retire_a_stale_install_and_later_edits_sync() -> Result
         &Baseline::Absent,
         &Observation::ConfirmedAbsent,
         &Observation::Present(stale),
+        RemoteSubtree::Empty,
     ))?;
     assert!(matches!(
         journal.record_plan(Path::new("file.txt"), &stale_install)?,
@@ -5322,6 +5850,7 @@ fn a_changed_safe_operation_replaces_a_stale_install_in_the_same_pass() -> Resul
         &Baseline::Absent,
         &Observation::ConfirmedAbsent,
         &Observation::Present(stale),
+        RemoteSubtree::Empty,
     ))?;
     assert!(matches!(
         journal.record_plan(Path::new("file.txt"), &stale_install)?,
@@ -5387,6 +5916,7 @@ fn an_unknown_observation_does_not_retire_a_stale_install() -> Result<(), Box<dy
         &Baseline::Absent,
         &Observation::ConfirmedAbsent,
         &Observation::Present(stale),
+        RemoteSubtree::Empty,
     ))?;
     assert!(matches!(
         journal.record_plan(Path::new("file.txt"), &stale_install)?,
@@ -5458,6 +5988,7 @@ fn a_pending_only_path_retires_without_fetching_obsolete_bytes() -> Result<(), B
         &Baseline::Absent,
         &Observation::ConfirmedAbsent,
         &Observation::Present(stale),
+        RemoteSubtree::Empty,
     ))?;
     assert!(matches!(
         journal.record_plan(Path::new("removed.txt"), &stale_install)?,
@@ -5507,6 +6038,7 @@ fn remote_delete_skips_backup_download_and_ambiguous_create_stays_pending()
         &Baseline::Present(old.clone()),
         &Observation::ConfirmedAbsent,
         &Observation::Present(old.clone()),
+        RemoteSubtree::Empty,
     ))?;
     match journal.record_plan(Path::new("delete.txt"), &delete)? {
         PlanWrite::Recorded(_) => {}
@@ -5533,6 +6065,7 @@ fn remote_delete_skips_backup_download_and_ambiguous_create_stays_pending()
         &Baseline::Absent,
         &Observation::Present(desired),
         &Observation::ConfirmedAbsent,
+        RemoteSubtree::Empty,
     ))?;
     assert!(matches!(
         journal.record_plan(Path::new("create.txt"), &create)?,
@@ -6757,7 +7290,7 @@ fn record_fixture_plan(
     local: &Observation<LocalFile>,
     remote: &Observation<RemoteFile>,
 ) -> Result<PlanId, Box<dyn Error>> {
-    let operations = planned_operations(plan(baseline, local, remote))?;
+    let operations = planned_operations(plan(baseline, local, remote, RemoteSubtree::Empty))?;
     match journal.record_plan(path, &operations)? {
         PlanWrite::Recorded(recorded) => Ok(recorded.id),
         PlanWrite::AlreadyLive(_) => {
@@ -6771,6 +7304,7 @@ fn seed_baseline(journal: &mut Journal, path: &Path, remote: &RemoteFile) -> Res
         &Baseline::Present(remote.clone()),
         &Observation::Present(LocalFile::new(remote.content.clone())),
         &Observation::Present(remote.clone()),
+        RemoteSubtree::Empty,
     );
     let Decision::NoOp(noop) = decision else {
         return Err(io::Error::other("test expected a no-op baseline"));
@@ -6786,6 +7320,7 @@ fn seed_directory_baseline(journal: &mut Journal, path: &Path) -> Result<(), io:
         &Baseline::Directory,
         &Observation::Directory,
         &Observation::Directory,
+        RemoteSubtree::Empty,
     );
     let Decision::NoOp(noop) = decision else {
         return Err(io::Error::other("test expected a directory no-op baseline"));
@@ -7408,6 +7943,7 @@ fn unsatisfiable_resume_restarts_only_the_owned_partial() -> Result<(), Box<dyn 
         &Baseline::Absent,
         &Observation::ConfirmedAbsent,
         &Observation::Present(remote.clone()),
+        RemoteSubtree::Empty,
     ))?;
     if !matches!(
         journal.record_plan(Path::new("resume.bin"), &operation_plan)?,

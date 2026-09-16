@@ -34,7 +34,8 @@ systemd user service, and exposes useful CLI and Omarchy widget status.
    daemon-owned pool capped at four workers. Reuse one Dropbox content agent and
    coalesce staging writes. Add concurrency only after profiling.
 3. Synchronize directories with parents before children and safe, non-recursive
-   local removal. Apply Dropbox cursor deltas transactionally; reserve recursive
+   removal on both sides; a Dropbox folder is deleted only once its inventory
+   subtree is empty and a listing immediately before the delete agrees. Apply Dropbox cursor deltas transactionally; reserve recursive
    relisting for initial state and cursor reset.
 4. Finish rootless install, upgrade, and uninstall for the two binaries, user
    unit, and packaged Omarchy plugin. Preserve service state, roll back before a

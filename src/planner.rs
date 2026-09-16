@@ -3,14 +3,23 @@
 use crate::model::{
     Baseline, BlockedReason, Conflict, Decision, DirectoryCollision, LocalObservation,
     NoOpDecision, NoOpReason, Observation, Operation, OperationPlan, RemoteObservation,
+    RemoteSubtree,
 };
 
 /// Plan the next safe action for one path.
 ///
 /// Unknown observations are handled before all other transitions, so they can
-/// never be reinterpreted as absence or produce a deletion.
+/// never be reinterpreted as absence or produce a deletion. `remote_subtree`
+/// reports what the same inventory holds beneath the path; it decides only
+/// whether a locally deleted directory can be deleted on Dropbox, where a
+/// folder delete is recursive.
 #[must_use]
-pub fn plan(baseline: &Baseline, local: &LocalObservation, remote: &RemoteObservation) -> Decision {
+pub fn plan(
+    baseline: &Baseline,
+    local: &LocalObservation,
+    remote: &RemoteObservation,
+    remote_subtree: RemoteSubtree,
+) -> Decision {
     match (baseline, local, remote) {
         (_, Observation::Unknown(local), Observation::Unknown(remote)) => {
             Decision::Blocked(BlockedReason::BothUnknown {
@@ -78,7 +87,14 @@ pub fn plan(baseline: &Baseline, local: &LocalObservation, remote: &RemoteObserv
             Decision::Operations(OperationPlan::new(vec![Operation::DeleteLocalDirectory]))
         }
         (Baseline::Directory, Observation::ConfirmedAbsent, Observation::Directory) => {
-            Decision::Operations(OperationPlan::new(vec![Operation::CreateLocalDirectory]))
+            match remote_subtree {
+                RemoteSubtree::Empty => {
+                    Decision::Operations(OperationPlan::new(vec![Operation::DeleteRemoteDirectory]))
+                }
+                RemoteSubtree::Occupied => {
+                    Decision::Blocked(BlockedReason::RemoteDirectoryOccupied)
+                }
+            }
         }
         (Baseline::Directory, Observation::Present(local), Observation::ConfirmedAbsent) => {
             Decision::Operations(OperationPlan::new(vec![Operation::CreateRemote {

@@ -16,7 +16,7 @@ use omabox::local::{
 };
 use omabox::model::{
     Baseline, ContentIdentity, Decision, DropboxRevision, LocalFile, Observation, OperationPlan,
-    RemoteFile, UnknownReason,
+    RemoteFile, RemoteSubtree, UnknownReason,
 };
 use omabox::planner::plan;
 use omabox::recovery::{ReplayBlocked, replay_local_operations};
@@ -115,6 +115,7 @@ fn directory_effects_replay_after_the_filesystem_changed_before_journal_completi
         &Baseline::Absent,
         &Observation::ConfirmedAbsent,
         &Observation::Directory,
+        RemoteSubtree::Empty,
     ))?;
     let _ = recorded_plan(journal.record_plan(path, &create)?)?;
     std::fs::create_dir(root.join(path))?;
@@ -130,6 +131,7 @@ fn directory_effects_replay_after_the_filesystem_changed_before_journal_completi
         &Baseline::Directory,
         &Observation::Directory,
         &Observation::ConfirmedAbsent,
+        RemoteSubtree::Empty,
     ))?;
     let _ = recorded_plan(reopened.record_plan(path, &delete)?)?;
     std::fs::remove_dir(root.join(path))?;
@@ -358,6 +360,7 @@ fn restart_installs_a_verified_download_and_replay_is_idempotent() -> Result<(),
         &Baseline::Absent,
         &Observation::ConfirmedAbsent,
         &Observation::Present(remote.clone()),
+        RemoteSubtree::Empty,
     ))?;
     {
         let mut journal = Journal::open(&database)?;
@@ -406,6 +409,7 @@ fn installed_download_completes_after_restart_without_its_consumed_stage()
         &Baseline::Absent,
         &Observation::ConfirmedAbsent,
         &Observation::Present(remote.clone()),
+        RemoteSubtree::Empty,
     ))?;
     {
         let mut journal = Journal::open(&database)?;
@@ -450,6 +454,7 @@ fn replacement_replays_without_a_recovery_copy() -> Result<(), Box<dyn Error>> {
         &Baseline::Present(old.clone()),
         &Observation::Present(LocalFile::new(old.content.clone())),
         &Observation::Present(new.clone()),
+        RemoteSubtree::Empty,
     ))?;
     let replace = {
         let mut journal = Journal::open(&database)?;
@@ -498,6 +503,7 @@ fn replacement_resumes_from_a_durable_displacement_guard() -> Result<(), Box<dyn
         &Baseline::Present(old.clone()),
         &Observation::Present(LocalFile::new(old.content.clone())),
         &Observation::Present(new.clone()),
+        RemoteSubtree::Empty,
     ))?;
 
     {
@@ -544,6 +550,7 @@ fn deletion_replays_after_effect_but_before_journal_completion() -> Result<(), B
         &Baseline::Present(old.clone()),
         &Observation::Present(LocalFile::new(old.content.clone())),
         &Observation::ConfirmedAbsent,
+        RemoteSubtree::Empty,
     ))?;
 
     let delete = {
@@ -584,6 +591,7 @@ fn changed_delete_precondition_is_left_pending_without_a_copy() -> Result<(), Bo
         &Baseline::Present(old.clone()),
         &Observation::Present(LocalFile::new(old.content.clone())),
         &Observation::ConfirmedAbsent,
+        RemoteSubtree::Empty,
     ))?;
     let mut journal = Journal::open(&database)?;
     let _recorded = recorded_plan(journal.record_plan(Path::new("changed.txt"), &operation_plan)?)?;
@@ -638,22 +646,26 @@ fn local_replay_special_objects_child() -> Result<(), Box<dyn Error>> {
         &Baseline::Present(old.clone()),
         &Observation::Present(LocalFile::new(old.content.clone())),
         &Observation::ConfirmedAbsent,
+        RemoteSubtree::Empty,
     ))?;
     let install = remote(b"downloaded", "rev-download")?;
     let install_plan = operations(plan(
         &Baseline::Absent,
         &Observation::ConfirmedAbsent,
         &Observation::Present(install.clone()),
+        RemoteSubtree::Empty,
     ))?;
     let create_directory_plan = operations(plan(
         &Baseline::Absent,
         &Observation::ConfirmedAbsent,
         &Observation::Directory,
+        RemoteSubtree::Empty,
     ))?;
     let delete_directory_plan = operations(plan(
         &Baseline::Directory,
         &Observation::Directory,
         &Observation::ConfirmedAbsent,
+        RemoteSubtree::Empty,
     ))?;
     let delete_fifo = Path::new("delete-fifo");
     let delete_symlink = Path::new("delete-symlink");

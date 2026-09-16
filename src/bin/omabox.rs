@@ -619,7 +619,7 @@ mod tests {
         BlockReason, LocalRootActivation, LocalRootBinding, PlanBlock, PlanWrite,
     };
     use omabox::model::{
-        Baseline, CanonicalPath, ContentIdentity, Decision, LocalFile, Observation,
+        Baseline, CanonicalPath, ContentIdentity, Decision, LocalFile, Observation, RemoteSubtree,
     };
 
     use super::*;
@@ -822,6 +822,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(ContentIdentity::new("pending-content"))),
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ) else {
             return Err("planner did not produce the pending operation".into());
         };
@@ -833,6 +834,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(ContentIdentity::new("blocked-content"))),
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ) else {
             return Err("planner did not produce the blocked operation".into());
         };
@@ -895,6 +897,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(ContentIdentity::new("pending-content"))),
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ) else {
             return Err("planner did not produce the pending operation".into());
         };
@@ -961,6 +964,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(remote.content.clone())),
             &Observation::Present(remote),
+            RemoteSubtree::Empty,
         ) else {
             return Err("planner did not produce the initial agreement".into());
         };
@@ -1000,6 +1004,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(remote.content.clone())),
             &Observation::Present(remote),
+            RemoteSubtree::Empty,
         ) else {
             return Err("planner did not produce the initial agreement".into());
         };

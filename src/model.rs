@@ -244,6 +244,20 @@ pub type LocalObservation = Observation<LocalFile>;
 /// Remote observation accepted by the planner.
 pub type RemoteObservation = Observation<RemoteFile>;
 
+/// What the durable remote inventory holds beneath one path.
+///
+/// Dropbox deletes a folder together with everything inside it, so the planner
+/// deletes a remote directory only while the inventory shows nothing beneath
+/// it. An occupied directory waits until every descendant has been reconciled
+/// away on its own terms; nothing beneath it is ever inferred deleted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteSubtree {
+    /// The inventory records nothing beneath the path.
+    Empty,
+    /// The inventory records at least one descendant, whatever its state.
+    Occupied,
+}
+
 /// Ordered mutation step selected for one path.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Operation {
@@ -253,6 +267,8 @@ pub enum Operation {
     CreateRemoteDirectory,
     /// Remove an empty local directory after confirmed remote absence.
     DeleteLocalDirectory,
+    /// Remove an empty Dropbox directory after confirmed local absence.
+    DeleteRemoteDirectory,
     /// Create a remote file only while the remote path remains absent.
     CreateRemote { content: ContentIdentity },
     /// Install a remote file at a locally absent path.
@@ -283,6 +299,7 @@ impl Operation {
             Self::CreateLocalDirectory => "create local directory if still absent",
             Self::CreateRemoteDirectory => "create remote directory if still absent",
             Self::DeleteLocalDirectory => "delete empty local directory",
+            Self::DeleteRemoteDirectory => "delete empty remote directory",
             Self::CreateRemote { .. } => "create remote file if still absent",
             Self::InstallLocal { .. } => "install remote content locally",
             Self::PreserveLocal { .. } => "preserve displaced local payload",
@@ -360,7 +377,7 @@ impl NoOpDecision {
     }
 }
 
-/// Unknown input that prevents a safe decision.
+/// Input that prevents a safe decision for now.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlockedReason {
     /// Only the local observation is unknown.
@@ -372,6 +389,9 @@ pub enum BlockedReason {
         local: UnknownReason,
         remote: UnknownReason,
     },
+    /// The locally deleted directory still holds Dropbox entries, so its
+    /// deletion waits until each descendant has been reconciled away.
+    RemoteDirectoryOccupied,
 }
 
 /// Simultaneous states that cannot be reconciled without preserving a conflict.
@@ -474,6 +494,9 @@ impl fmt::Display for Decision {
             }
             Self::Blocked(BlockedReason::BothUnknown { local, remote }) => {
                 write!(formatter, "blocked: local {local}; remote {remote}")
+            }
+            Self::Blocked(BlockedReason::RemoteDirectoryOccupied) => {
+                formatter.write_str("blocked: remote directory still holds entries")
             }
             Self::Conflict(conflict) => write!(formatter, "conflict: {}", conflict.description()),
             Self::DirectoryCollision(_) => formatter

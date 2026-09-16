@@ -973,6 +973,110 @@ impl DropboxClient {
         }
     }
 
+    /// Delete one Dropbox folder only while Dropbox reports it empty.
+    ///
+    /// Dropbox offers no conditional folder delete and `delete_v2` removes a
+    /// folder together with everything inside it, so the folder is listed
+    /// immediately before the delete. Any entry found retires the request as a
+    /// changed precondition. An entry created between that listing and the
+    /// delete is the residual window Dropbox's API leaves; Dropbox retains such
+    /// deleted files for restoration, and a file found in the delete's own
+    /// result is reported with its revision.
+    pub fn delete_folder(
+        &self,
+        relative: impl AsRef<Path>,
+    ) -> Result<MutationOutcome, DropboxError> {
+        let relative = relative.as_ref();
+        let target = match self.mutation_target(relative) {
+            Ok(target) => target,
+            Err(rejection) => return Ok(MutationOutcome::Rejected(rejection)),
+        };
+        let expectation = MutationExpectation::DeleteFolder;
+        match self.probe_folder(&target) {
+            Ok(FolderProbe::Empty) => {}
+            Ok(FolderProbe::Occupied) => {
+                return Ok(MutationOutcome::PreconditionChanged(
+                    RemotePathState::Folder,
+                ));
+            }
+            Ok(FolderProbe::Absent) => {
+                return Ok(MutationOutcome::Applied(RemotePathState::Absent));
+            }
+            Ok(FolderProbe::NotFolder) => {
+                return self.resolve_explicit_conflict(&target, &expectation);
+            }
+            Ok(FolderProbe::Interrupted) => return Ok(MutationOutcome::Pending),
+            // A probe that Dropbox answers with any other API error is
+            // classified like the mutation it guards, so one path that cannot
+            // be listed blocks itself instead of the pass.
+            Err(error @ DropboxError::Sdk { .. }) => {
+                return self.resolve_mutation_error(&target, &expectation, error);
+            }
+            Err(error) => return Err(error),
+        }
+        let argument = files::DeleteArg::new(target.clone());
+        let operation = "delete empty Dropbox folder";
+        match self.call(|| files::delete_v2(&self.transport, &argument)) {
+            Ok(payload) => match validate_deleted_folder(&target, payload.metadata) {
+                Ok(DeletedObject::Folder) => Ok(MutationOutcome::Applied(RemotePathState::Absent)),
+                Ok(DeletedObject::File { revision }) => {
+                    tracing::error!(
+                        path = %relative.display(),
+                        revision,
+                        "Dropbox deleted a file that replaced the empty folder after its listing; \
+                         restore it from Dropbox's deleted files if it is wanted"
+                    );
+                    Ok(MutationOutcome::Applied(RemotePathState::Absent))
+                }
+                Err(failure) => self.resolve_ambiguous(&target, &expectation, failure),
+            },
+            Err(error) => self.resolve_mutation_error(
+                &target,
+                &expectation,
+                DropboxError::sdk(operation, error),
+            ),
+        }
+    }
+
+    /// List one folder just far enough to learn whether it holds any entry.
+    fn probe_folder(&self, target: &str) -> Result<FolderProbe, DropboxError> {
+        let argument = files::ListFolderArg::new(target.to_owned())
+            .with_recursive(false)
+            .with_include_deleted(false)
+            .with_limit(1);
+        let operation = "list Dropbox folder before deleting it";
+        let mut page = match self.call(|| files::list_folder(&self.transport, &argument)) {
+            Ok(page) => page,
+            Err(SdkError::Api(files::ListFolderError::Path(files::LookupError::NotFound))) => {
+                return Ok(FolderProbe::Absent);
+            }
+            Err(SdkError::Api(files::ListFolderError::Path(files::LookupError::NotFolder))) => {
+                return Ok(FolderProbe::NotFolder);
+            }
+            Err(error) => return Err(DropboxError::sdk(operation, error)),
+        };
+        let lower_target = target.to_lowercase();
+        loop {
+            if page
+                .entries
+                .iter()
+                .any(|entry| metadata_paths(entry).0 != Some(lower_target.as_str()))
+            {
+                return Ok(FolderProbe::Occupied);
+            }
+            if !page.has_more {
+                return Ok(FolderProbe::Empty);
+            }
+            let previous = page.cursor;
+            page = match self.list_continue(&previous)? {
+                ContinuePage::Page(next) if next.cursor != previous => next,
+                ContinuePage::Page(_) | ContinuePage::Reset => {
+                    return Ok(FolderProbe::Interrupted);
+                }
+            };
+        }
+    }
+
     /// Strictly create one Dropbox folder for a future directory intent.
     pub fn create_folder(
         &self,
@@ -1338,12 +1442,14 @@ enum MutationExpectation {
         expected: DropboxRevision,
     },
     CreateFolder,
+    DeleteFolder,
 }
 
 impl MutationExpectation {
     fn classify(&self, state: RemotePathState) -> MutationOutcome {
         let unchanged = match (self, &state) {
-            (Self::CreateFile { .. } | Self::CreateFolder, RemotePathState::Absent) => true,
+            (Self::CreateFile { .. } | Self::CreateFolder, RemotePathState::Absent)
+            | (Self::DeleteFolder, RemotePathState::Folder) => true,
             (
                 Self::ReplaceFile { expected, .. } | Self::DeleteFile { expected },
                 RemotePathState::File(remote),
@@ -1358,7 +1464,7 @@ impl MutationExpectation {
             | (Self::ReplaceFile { desired, .. }, RemotePathState::File(remote)) => {
                 &remote.content == desired
             }
-            (Self::DeleteFile { .. }, RemotePathState::Absent)
+            (Self::DeleteFile { .. } | Self::DeleteFolder, RemotePathState::Absent)
             | (Self::CreateFolder, RemotePathState::Folder) => true,
             _ => false,
         };
@@ -1368,6 +1474,27 @@ impl MutationExpectation {
             MutationOutcome::PreconditionChanged(state)
         }
     }
+}
+
+/// What a bounded listing found at a folder that is about to be deleted.
+enum FolderProbe {
+    /// The folder exists and holds no entry.
+    Empty,
+    /// The folder holds at least one entry.
+    Occupied,
+    /// No object exists at the path.
+    Absent,
+    /// The path holds something other than a folder.
+    NotFolder,
+    /// Dropbox reset or stalled the listing before it settled. Nothing was
+    /// mutated, so the delete stays retry-safe for the next pass.
+    Interrupted,
+}
+
+/// The object Dropbox reports it removed for a folder delete.
+enum DeletedObject {
+    Folder,
+    File { revision: String },
 }
 
 enum CursorDelta {
@@ -1591,6 +1718,18 @@ fn validate_deleted_file(
         return Err(DropboxError::InvalidMutationMetadata);
     }
     Ok(())
+}
+
+fn validate_deleted_folder(
+    target: &str,
+    metadata: files::Metadata,
+) -> Result<DeletedObject, DropboxError> {
+    validate_mutation_path(target, metadata_paths(&metadata).0)?;
+    match metadata {
+        files::Metadata::Folder(_) => Ok(DeletedObject::Folder),
+        files::Metadata::File(file) => Ok(DeletedObject::File { revision: file.rev }),
+        files::Metadata::Deleted(_) => Err(DropboxError::InvalidMutationMetadata),
+    }
 }
 
 fn metadata_remote_state(

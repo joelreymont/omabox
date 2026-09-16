@@ -5,7 +5,7 @@ use std::io;
 use omabox::model::{
     Baseline, BlockedReason, Conflict, ContentIdentity, Decision, DirectoryCollision,
     DropboxRevision, LocalFile, LocalObservation, NoOpReason, Observation, Operation, RemoteFile,
-    RemoteObservation, UnknownReason,
+    RemoteObservation, RemoteSubtree, UnknownReason,
 };
 use omabox::planner::plan;
 use proptest::prelude::*;
@@ -16,8 +16,11 @@ use proptest::test_runner::{Config, TestRunner};
 /// baseline often enough to reach the states that compare bytes.
 const ALPHABET: &str = "[ab]{1,2}";
 
-/// A baseline and the observation pairs planned against it.
-type Scenario = (Baseline, Vec<(LocalObservation, RemoteObservation)>);
+/// One planner input drawn against a shared baseline.
+type Observed = (LocalObservation, RemoteObservation, RemoteSubtree);
+
+/// A baseline and the observations planned against it.
+type Scenario = (Baseline, Vec<Observed>);
 
 fn revision() -> impl Strategy<Value = DropboxRevision> {
     "[a-z0-9]{1,8}".prop_map(DropboxRevision::new)
@@ -58,6 +61,11 @@ fn remote_observation(baseline: ContentIdentity) -> impl Strategy<Value = Remote
     ]
 }
 
+/// What the inventory holds beneath the path, independent of the path itself.
+fn remote_subtree() -> impl Strategy<Value = RemoteSubtree> {
+    prop_oneof![Just(RemoteSubtree::Empty), Just(RemoteSubtree::Occupied)]
+}
+
 /// Draw the baseline first, then observations derived from its content.
 ///
 /// Drawing all three independently left the planner's comparisons unreachable:
@@ -79,6 +87,7 @@ fn scenario() -> impl Strategy<Value = Scenario> {
             (
                 local_observation(content.clone()),
                 remote_observation(content),
+                remote_subtree(),
             ),
             1..16,
         );
@@ -89,15 +98,15 @@ fn scenario() -> impl Strategy<Value = Scenario> {
 /// The same baselines, with at least one side of every pair uncertain.
 fn uncertain_scenario() -> impl Strategy<Value = Scenario> {
     scenario().prop_flat_map(|(baseline, pairs)| {
-        let uncertain = pairs.into_iter().map(|(local, remote)| {
+        let uncertain = pairs.into_iter().map(|(local, remote, subtree)| {
             prop_oneof![
                 unknown_reason().prop_map({
                     let remote = remote.clone();
-                    move |reason| (Observation::Unknown(reason), remote.clone())
+                    move |reason| (Observation::Unknown(reason), remote.clone(), subtree)
                 }),
                 unknown_reason().prop_map({
                     let local = local.clone();
-                    move |reason| (local.clone(), Observation::Unknown(reason))
+                    move |reason| (local.clone(), Observation::Unknown(reason), subtree)
                 }),
             ]
         });
@@ -111,9 +120,10 @@ fn uncertain_scenario() -> impl Strategy<Value = Scenario> {
 /// purpose: they decode old journals and must never be planned. The coverage
 /// test compares the reached outcomes against this list exactly, so planning
 /// one would fail it as surely as losing one.
-const OUTCOMES: [&str; 21] = [
+const OUTCOMES: [&str; 23] = [
     "Blocked::BothUnknown",
     "Blocked::LocalUnknown",
+    "Blocked::RemoteDirectoryOccupied",
     "Blocked::RemoteUnknown",
     "Conflict::DivergentEdits",
     "Conflict::InitialCollision",
@@ -125,6 +135,7 @@ const OUTCOMES: [&str; 21] = [
     "DeleteLocal",
     "DeleteLocalDirectory",
     "DeleteRemote",
+    "DeleteRemoteDirectory",
     "DirectoryCollision::LocalDirectoryRemoteFile",
     "DirectoryCollision::LocalFileRemoteDirectory",
     "InstallLocal",
@@ -140,6 +151,7 @@ fn operation_name(operation: &Operation) -> &'static str {
         Operation::CreateLocalDirectory => "CreateLocalDirectory",
         Operation::CreateRemoteDirectory => "CreateRemoteDirectory",
         Operation::DeleteLocalDirectory => "DeleteLocalDirectory",
+        Operation::DeleteRemoteDirectory => "DeleteRemoteDirectory",
         Operation::CreateRemote { .. } => "CreateRemote",
         Operation::InstallLocal { .. } => "InstallLocal",
         Operation::PreserveLocal { .. } => "PreserveLocal",
@@ -170,6 +182,7 @@ fn record(decision: &Decision, reached: &mut BTreeSet<&'static str>) {
                 BlockedReason::LocalUnknown(_) => "Blocked::LocalUnknown",
                 BlockedReason::RemoteUnknown(_) => "Blocked::RemoteUnknown",
                 BlockedReason::BothUnknown { .. } => "Blocked::BothUnknown",
+                BlockedReason::RemoteDirectoryOccupied => "Blocked::RemoteDirectoryOccupied",
             });
         }
         Decision::Conflict(conflict) => {
@@ -214,8 +227,8 @@ fn one_run_reaches_every_planner_outcome() -> Result<(), Box<dyn Error>> {
             .new_tree(&mut runner)
             .map_err(|reason| io::Error::other(reason.message().to_owned()))?
             .current();
-        for (local, remote) in &observations {
-            record(&plan(&baseline, local, remote), &mut reached);
+        for (local, remote, subtree) in &observations {
+            record(&plan(&baseline, local, remote, *subtree), &mut reached);
         }
     }
     assert_eq!(
@@ -231,8 +244,8 @@ proptest! {
     fn unknown_state_always_blocks_without_deleting(
         (baseline, observations) in uncertain_scenario(),
     ) {
-        for (local, remote) in observations {
-            let decision = plan(&baseline, &local, &remote);
+        for (local, remote, subtree) in observations {
+            let decision = plan(&baseline, &local, &remote, subtree);
             prop_assert!(matches!(decision, Decision::Blocked(_)));
         }
     }
@@ -241,8 +254,8 @@ proptest! {
     fn no_op_carries_the_completely_observed_baseline(
         (baseline, observations) in scenario(),
     ) {
-        for (local, remote) in observations {
-            let decision = plan(&baseline, &local, &remote);
+        for (local, remote, subtree) in observations {
+            let decision = plan(&baseline, &local, &remote, subtree);
             if let Decision::NoOp(noop) = decision {
                 match (&local, &remote) {
                     (Observation::ConfirmedAbsent, Observation::ConfirmedAbsent) => {
@@ -265,8 +278,8 @@ proptest! {
     fn remote_mutations_retain_the_observed_revision(
         (baseline, observations) in scenario(),
     ) {
-        for (local, remote) in observations {
-            let decision = plan(&baseline, &local, &remote);
+        for (local, remote, subtree) in observations {
+            let decision = plan(&baseline, &local, &remote, subtree);
             if let Decision::Operations(operation_plan) = decision {
                 for operation in operation_plan.operations() {
                     match (&remote, operation) {
@@ -292,8 +305,8 @@ proptest! {
     fn ordinary_mutations_do_not_plan_recovery_copies(
         (baseline, observations) in scenario(),
     ) {
-        for (local, remote) in observations {
-            let decision = plan(&baseline, &local, &remote);
+        for (local, remote, subtree) in observations {
+            let decision = plan(&baseline, &local, &remote, subtree);
             if let Decision::Operations(operation_plan) = decision {
                 for operation in operation_plan.operations() {
                     prop_assert!(!matches!(
@@ -309,8 +322,8 @@ proptest! {
     fn conflicts_retain_every_present_payload(
         (baseline, observations) in scenario(),
     ) {
-        for (local, remote) in observations {
-            let decision = plan(&baseline, &local, &remote);
+        for (local, remote, subtree) in observations {
+            let decision = plan(&baseline, &local, &remote, subtree);
             if let Decision::Conflict(conflict) = decision {
                 let observed_local = match &local {
                     Observation::Present(file) => Some(file),
@@ -337,11 +350,11 @@ proptest! {
     }
 
     #[test]
-    fn a_remote_directory_never_produces_a_remote_delete(
+    fn a_remote_directory_never_produces_a_remote_file_delete(
         (baseline, observations) in scenario(),
     ) {
-        for (local, _) in observations {
-            let decision = plan(&baseline, &local, &Observation::Directory);
+        for (local, _, subtree) in observations {
+            let decision = plan(&baseline, &local, &Observation::Directory, subtree);
             if let Decision::Operations(operations) = decision {
                 let safe = operations.operations().iter().all(|operation| {
                     !matches!(operation, Operation::DeleteRemote { .. })
@@ -351,17 +364,67 @@ proptest! {
         }
     }
 
+    /// Dropbox deletes a folder with everything inside it, so the only state
+    /// that may delete one is a directory baseline, a confirmed local absence,
+    /// and an inventory that holds nothing beneath the path.
+    #[test]
+    fn a_remote_directory_delete_requires_an_empty_subtree_and_a_deleted_local_directory(
+        (baseline, observations) in scenario(),
+    ) {
+        for (local, remote, subtree) in observations {
+            let decision = plan(&baseline, &local, &remote, subtree);
+            let deletes = matches!(
+                &decision,
+                Decision::Operations(operations)
+                    if operations.operations().contains(&Operation::DeleteRemoteDirectory)
+            );
+            let deletable = baseline == Baseline::Directory
+                && local == Observation::ConfirmedAbsent
+                && remote == Observation::Directory
+                && subtree == RemoteSubtree::Empty;
+            prop_assert_eq!(deletes, deletable);
+            if let Decision::Operations(operations) = &decision
+                && deletable
+            {
+                prop_assert_eq!(operations.operations(), [Operation::DeleteRemoteDirectory]);
+            }
+        }
+    }
+
+    /// The same locally deleted directory waits, and is never re-created
+    /// locally, while the inventory still holds entries beneath it.
+    #[test]
+    fn an_occupied_remote_directory_waits_instead_of_returning_locally(
+        (baseline, _observations) in scenario(),
+    ) {
+        let decision = plan(
+            &baseline,
+            &Observation::ConfirmedAbsent,
+            &Observation::Directory,
+            RemoteSubtree::Occupied,
+        );
+        if baseline == Baseline::Directory {
+            prop_assert_eq!(
+                decision,
+                Decision::Blocked(BlockedReason::RemoteDirectoryOccupied)
+            );
+        } else {
+            prop_assert!(!matches!(decision, Decision::Blocked(_)));
+        }
+    }
+
     #[test]
     fn directory_file_collisions_retain_the_exact_file_description(
         (baseline, observations) in scenario(),
     ) {
-        for (local, remote) in observations {
+        for (local, remote, subtree) in observations {
             if let Observation::Present(local) = local {
                 prop_assert_eq!(
                     plan(
                         &baseline,
                         &Observation::Present(local.clone()),
                         &Observation::Directory,
+                        subtree,
                     ),
                     Decision::DirectoryCollision(
                         DirectoryCollision::LocalFileRemoteDirectory { local },
@@ -374,6 +437,7 @@ proptest! {
                         &baseline,
                         &Observation::Directory,
                         &Observation::Present(remote.clone()),
+                        subtree,
                     ),
                     Decision::DirectoryCollision(
                         DirectoryCollision::LocalDirectoryRemoteFile { remote },

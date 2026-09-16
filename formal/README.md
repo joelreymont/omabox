@@ -31,6 +31,17 @@ convergence for ordinary changes, and preservation of every present conflict
 side. The corresponding fake-Dropbox tests exercise these cases through Rust;
 TLC does not prove that the implementation conforms to the model.
 
+`DirectoryDeletion` checks one locally deleted directory holding one
+synchronized file while another Dropbox client may rewrite or re-create that
+file. It requires that a remote directory delete is planned only from an
+inventory that holds nothing beneath the path, that no step deletes a Dropbox
+folder still holding an entry or content the local side never synchronized,
+that a locally deleted directory returns only holding, or about to hold,
+Dropbox content the user never deleted, and that an unraced deletion propagates
+completely while a raced one settles with the payload preserved on both sides. Effects and journal
+completions are separate steps, so replay after a crash between them is
+covered. `DropboxClient::delete_folder` realizes the probe-then-delete step.
+
 `InventoryPublication` checks fresh listings, cursor deltas, reset-triggered
 rebuilds, multi-page failures, crashes, retries, and atomic publication. Partial
 pages and failed attempts must leave the prior durable inventory and cursor
@@ -56,6 +67,9 @@ java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
 
 java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
   -config InventoryPublication.cfg InventoryPublication.tla
+
+java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
+  -config DirectoryDeletion.cfg DirectoryDeletion.tla
 ```
 
 Same- and cross-filesystem promotion share one durable abstract boundary; TLC

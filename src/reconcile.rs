@@ -28,9 +28,9 @@ use crate::local::{
     scan_and_publish, stage_upload, upload_source_changed,
 };
 use crate::model::{
-    Baseline, CanonicalPath, Conflict, ContentIdentity, Decision, DirectoryCollision,
-    LocalObservation, Observation, Operation, OperationPlan, RemoteFile, RemoteObservation,
-    UnknownReason,
+    Baseline, BlockedReason, CanonicalPath, Conflict, ContentIdentity, Decision,
+    DirectoryCollision, LocalObservation, Observation, Operation, OperationPlan, RemoteFile,
+    RemoteObservation, RemoteSubtree, UnknownReason,
 };
 use crate::planner::plan;
 use crate::recovery::{
@@ -1078,7 +1078,12 @@ fn reconcile_published(
                         "canonical path has no display spelling",
                     )
                 })?;
-            let decision = plan(&baseline, local_observation, remote_observation);
+            let decision = plan(
+                &baseline,
+                local_observation,
+                remote_observation,
+                remote_subtree(&remote, canonical_path),
+            );
             let baseline_matches_noop = matches!(
                 &decision,
                 Decision::NoOp(noop) if &baseline == noop.baseline()
@@ -1132,7 +1137,14 @@ fn reconcile_published(
             } else if matches!(decision, Decision::DirectoryCollision(_)) {
                 supersede_pending_plan(journal, pending_plan)?;
                 return Ok(ReconcileOutcome::FreshObservationRequired { path });
-            } else if matches!(decision, Decision::Blocked(_)) {
+            } else if let Decision::Blocked(reason) = decision {
+                // A recorded remote directory delete rests on an inventory that
+                // showed nothing beneath the path; entries there now retire it.
+                // Every other block keeps its plan, whose own precondition still
+                // guards the replay.
+                if reason == BlockedReason::RemoteDirectoryOccupied {
+                    supersede_pending_plan(journal, pending_plan)?;
+                }
                 blocked_paths.insert(canonical_path.clone());
                 continue;
             } else if let Decision::Operations(plan) = &decision
@@ -1316,7 +1328,8 @@ fn prepare_plan(
         match operation {
             Operation::CreateLocalDirectory
             | Operation::CreateRemoteDirectory
-            | Operation::DeleteLocalDirectory => {}
+            | Operation::DeleteLocalDirectory
+            | Operation::DeleteRemoteDirectory => {}
             Operation::CreateRemote { content } | Operation::ReplaceRemote { content, .. } => {
                 match prepare_local(sync_root, upload_staging, path, content) {
                     Ok(Prepared::Ready(_)) => {}
@@ -1876,6 +1889,34 @@ fn remote_map(mut records: Vec<RemoteObservationRecord>) -> Vec<RemoteObservatio
     records
 }
 
+/// What the sorted inventory holds beneath one canonical path.
+///
+/// Records sort by canonical bytes, so every descendant follows `path + "/"`
+/// contiguously and the first record at or past that prefix decides. A sibling
+/// such as `path.txt` sorts between the path and its children, so the search
+/// targets the child prefix rather than the path itself.
+fn remote_subtree(
+    records: &[RemoteObservationRecord],
+    canonical_path: &CanonicalPath,
+) -> RemoteSubtree {
+    let parent = canonical_path.as_bytes();
+    let first_child = records
+        .partition_point(|record| precedes_children(record.canonical_path.as_bytes(), parent));
+    match records.get(first_child) {
+        Some(record) if record.canonical_path.is_beneath(canonical_path) => RemoteSubtree::Occupied,
+        _ => RemoteSubtree::Empty,
+    }
+}
+
+/// Whether `bytes` sorts before every path beneath `parent`, that is before
+/// `parent + "/"`, decided without building that prefix.
+fn precedes_children(bytes: &[u8], parent: &[u8]) -> bool {
+    match bytes.strip_prefix(parent) {
+        None => bytes < parent,
+        Some(rest) => rest.first().is_none_or(|byte| *byte < b'/'),
+    }
+}
+
 fn find_remote<'a>(
     records: &'a [RemoteObservationRecord],
     canonical_path: &CanonicalPath,
@@ -2340,6 +2381,7 @@ mod tests {
                     &Baseline::Absent,
                     &Observation::ConfirmedAbsent,
                     &Observation::ConfirmedAbsent,
+                    RemoteSubtree::Empty,
                 ));
                 Ok(())
             },
@@ -2376,6 +2418,7 @@ mod tests {
             &Baseline::Directory,
             &Observation::Directory,
             &Observation::Directory,
+            RemoteSubtree::Empty,
         ) else {
             return Err(io::Error::other("matching directories were not a no-op").into());
         };
@@ -2498,7 +2541,12 @@ mod tests {
     ) -> Result<(), Box<dyn Error>> {
         let local = Observation::Present(LocalFile::new(remote.content.clone()));
         let remote_observation = Observation::Present(remote.clone());
-        let Decision::NoOp(noop) = plan(&Baseline::Absent, &local, &remote_observation) else {
+        let Decision::NoOp(noop) = plan(
+            &Baseline::Absent,
+            &local,
+            &remote_observation,
+            RemoteSubtree::Empty,
+        ) else {
             return Err(
                 std::io::Error::other("matching observations did not produce a no-op").into(),
             );
@@ -2685,6 +2733,7 @@ mod tests {
                     Some(record) => record.observation.clone(),
                     None => remote_unobserved(&listed_remote, &below),
                 },
+                RemoteSubtree::Empty,
             );
             assert!(
                 matches!(
@@ -2710,6 +2759,7 @@ mod tests {
                     None => local_unobserved(&scanned_local, &below),
                 },
                 &remote_unobserved(&unknown_remote, &below),
+                RemoteSubtree::Empty,
             );
             assert!(
                 matches!(
@@ -2740,6 +2790,7 @@ mod tests {
                 },
                 &Observation::ConfirmedAbsent,
                 &Observation::ConfirmedAbsent,
+                RemoteSubtree::Empty,
             ),
             Decision::NoOp(ref noop) if noop.baseline() == &Baseline::Absent
         ));
@@ -2770,6 +2821,7 @@ mod tests {
             &Baseline::Absent,
             &Observation::Present(LocalFile::new(content.clone())),
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ) else {
             return Err(std::io::Error::other("local creation did not produce a plan").into());
         };
@@ -2838,6 +2890,7 @@ mod tests {
             &Baseline::Present(old.clone()),
             &Observation::Present(LocalFile::new(edited.clone())),
             &Observation::Present(old.clone()),
+            RemoteSubtree::Empty,
         ) else {
             return Err(std::io::Error::other("local edit did not produce a remote plan").into());
         };
@@ -2852,6 +2905,7 @@ mod tests {
             &Baseline::Present(old.clone()),
             &Observation::Present(LocalFile::new(edited.clone())),
             &Observation::ConfirmedAbsent,
+            RemoteSubtree::Empty,
         ) else {
             return Err(
                 std::io::Error::other("remote deletion did not conflict with local edit").into(),
@@ -2872,5 +2926,49 @@ mod tests {
         let copy = conflict_relative_path(path, ConflictSide::Local, &edited)?;
         assert_eq!(std::fs::read(root.path().join(copy))?, b"local edit");
         Ok(())
+    }
+
+    fn remote_directory(path: &[u8]) -> RemoteObservationRecord {
+        let path = PathBuf::from(OsString::from_vec(path.to_vec()));
+        RemoteObservationRecord {
+            canonical_path: CanonicalPath::from_display(&path),
+            path,
+            observation: Observation::Directory,
+        }
+    }
+
+    #[test]
+    fn remote_subtree_holds_only_true_descendants() {
+        let records = remote_map(vec![
+            remote_directory(b"Report"),
+            remote_directory(b"report.txt"),
+            remote_directory(b"Report/x"),
+            remote_directory(b"reports/y"),
+            remote_directory(b"deep/\xff"),
+        ]);
+        let subtree =
+            |path: &str| remote_subtree(&records, &CanonicalPath::from_display(Path::new(path)));
+
+        assert_eq!(subtree("report"), RemoteSubtree::Occupied);
+        assert_eq!(subtree("reports"), RemoteSubtree::Occupied);
+        assert_eq!(subtree("deep"), RemoteSubtree::Occupied);
+        assert_eq!(subtree("report.txt"), RemoteSubtree::Empty);
+        assert_eq!(subtree("report/x"), RemoteSubtree::Empty);
+        assert_eq!(subtree("repo"), RemoteSubtree::Empty);
+        assert_eq!(subtree("other"), RemoteSubtree::Empty);
+    }
+
+    proptest! {
+        /// The allocation-free comparator must order exactly as a comparison
+        /// against the materialized child prefix would.
+        #[test]
+        fn child_prefix_order_matches_the_materialized_prefix(
+            bytes in prop::collection::vec(any::<u8>(), 0..6),
+            parent in prop::collection::vec(any::<u8>(), 0..6),
+        ) {
+            let mut prefix = parent.clone();
+            prefix.push(b'/');
+            prop_assert_eq!(precedes_children(&bytes, &parent), bytes < prefix);
+        }
     }
 }

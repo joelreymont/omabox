@@ -1,6 +1,6 @@
 use omabox::model::{
     Baseline, ContentIdentity, Decision, DropboxRevision, LocalFile, Observation, RemoteFile,
-    UnknownReason,
+    RemoteSubtree, UnknownReason,
 };
 use omabox::planner::plan;
 
@@ -29,13 +29,14 @@ fn present_baseline(value: &str, revision: &str) -> Baseline {
 #[test]
 fn human_readable_planner_decisions() {
     let baseline = present_baseline("baseline", "baseline-revision");
-    let scenarios: [(&str, Decision); 10] = [
+    let scenarios: [(&str, Decision); 13] = [
         (
             "initial local file",
             plan(
                 &Baseline::Absent,
                 &local("local"),
                 &Observation::ConfirmedAbsent,
+                RemoteSubtree::Empty,
             ),
         ),
         (
@@ -44,6 +45,7 @@ fn human_readable_planner_decisions() {
                 &Baseline::Absent,
                 &Observation::ConfirmedAbsent,
                 &remote("remote", "remote-revision"),
+                RemoteSubtree::Empty,
             ),
         ),
         (
@@ -52,6 +54,7 @@ fn human_readable_planner_decisions() {
                 &baseline,
                 &local("baseline"),
                 &remote("baseline", "current-revision"),
+                RemoteSubtree::Empty,
             ),
         ),
         (
@@ -60,6 +63,7 @@ fn human_readable_planner_decisions() {
                 &baseline,
                 &local("local-edit"),
                 &remote("baseline", "current-revision"),
+                RemoteSubtree::Empty,
             ),
         ),
         (
@@ -68,6 +72,7 @@ fn human_readable_planner_decisions() {
                 &baseline,
                 &local("baseline"),
                 &remote("remote-edit", "remote-revision"),
+                RemoteSubtree::Empty,
             ),
         ),
         (
@@ -76,11 +81,44 @@ fn human_readable_planner_decisions() {
                 &baseline,
                 &Observation::ConfirmedAbsent,
                 &remote("baseline", "current-revision"),
+                RemoteSubtree::Empty,
             ),
         ),
         (
             "explicit remote deletion",
-            plan(&baseline, &local("baseline"), &Observation::ConfirmedAbsent),
+            plan(
+                &baseline,
+                &local("baseline"),
+                &Observation::ConfirmedAbsent,
+                RemoteSubtree::Empty,
+            ),
+        ),
+        (
+            "explicit local directory deletion",
+            plan(
+                &Baseline::Directory,
+                &Observation::ConfirmedAbsent,
+                &Observation::Directory,
+                RemoteSubtree::Empty,
+            ),
+        ),
+        (
+            "explicit local directory deletion with Dropbox entries beneath",
+            plan(
+                &Baseline::Directory,
+                &Observation::ConfirmedAbsent,
+                &Observation::Directory,
+                RemoteSubtree::Occupied,
+            ),
+        ),
+        (
+            "explicit remote directory deletion",
+            plan(
+                &Baseline::Directory,
+                &Observation::Directory,
+                &Observation::ConfirmedAbsent,
+                RemoteSubtree::Empty,
+            ),
         ),
         (
             "inaccessible local state",
@@ -88,6 +126,7 @@ fn human_readable_planner_decisions() {
                 &baseline,
                 &Observation::Unknown(UnknownReason::Inaccessible),
                 &Observation::ConfirmedAbsent,
+                RemoteSubtree::Empty,
             ),
         ),
         (
@@ -96,6 +135,7 @@ fn human_readable_planner_decisions() {
                 &baseline,
                 &Observation::ConfirmedAbsent,
                 &Observation::Unknown(UnknownReason::Stale),
+                RemoteSubtree::Empty,
             ),
         ),
         (
@@ -104,6 +144,7 @@ fn human_readable_planner_decisions() {
                 &baseline,
                 &local("local-edit"),
                 &remote("remote-edit", "remote-revision"),
+                RemoteSubtree::Empty,
             ),
         ),
     ];
