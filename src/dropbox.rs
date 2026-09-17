@@ -795,9 +795,9 @@ impl DropboxClient {
             return Ok(outcome);
         }
         let mut offset = partial.as_ref().map_or(0, |partial| partial.offset());
-        let path = format!("rev:{}", remote.revision.as_str());
-        #[allow(deprecated)] // Explicit revision pin is part of the download contract.
-        let argument = files::DownloadArg::new(path).with_rev(remote.revision.as_str().to_owned());
+        // Dropbox rejects the deprecated top-level `rev` field; the `rev:` path
+        // form is the only supported revision pin.
+        let argument = files::DownloadArg::new(format!("rev:{}", remote.revision.as_str()));
         let response = match self.call(|| {
             files::download(
                 &self.transport,

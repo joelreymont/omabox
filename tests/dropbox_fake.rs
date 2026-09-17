@@ -206,7 +206,7 @@ fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result
             &requests[6],
             "dropbox-api-arg",
         )?)?,
-        json!({"path": "rev:rev-a", "rev": "rev-a"})
+        json!({"path": "rev:rev-a"})
     );
     Ok(())
 }
@@ -785,7 +785,7 @@ fn changed_revision_supersedes_blocked_download(retry_at: u64) -> Result<(), Box
             &requests[2],
             "dropbox-api-arg",
         )?)?,
-        json!({"path": "rev:rev-new-current", "rev": "rev-new-current"})
+        json!({"path": "rev:rev-new-current"})
     );
     Ok(())
 }
@@ -1694,12 +1694,12 @@ fn later_edits_sync_and_divergence_preserves_both_sides() -> Result<(), Box<dyn 
     assert!(
         download_arguments
             .iter()
-            .any(|argument| argument.get("rev") == Some(&json!("rev-remote-update")))
+            .any(|argument| argument == &json!({"path": "rev:rev-remote-update"}))
     );
     assert!(
         download_arguments
             .iter()
-            .any(|argument| argument.get("rev") == Some(&json!("rev-remote-conflict")))
+            .any(|argument| argument == &json!({"path": "rev:rev-remote-conflict"}))
     );
     Ok(())
 }
@@ -4279,7 +4279,7 @@ fn interrupted_exact_download_resumes_only_from_a_valid_range() -> Result<(), Bo
                 request,
                 "dropbox-api-arg",
             )?)?,
-            json!({"path": "rev:resume-revision", "rev": "resume-revision"})
+            json!({"path": "rev:resume-revision"})
         );
         if index == 0 {
             assert!(header(request, "range").is_none());
@@ -5627,7 +5627,7 @@ fn remote_replay_preserves_conflict_sides_without_a_backup_download() -> Result<
             &requests[2],
             "dropbox-api-arg",
         )?)?,
-        json!({"path": "rev:current-rev", "rev": "current-rev"})
+        json!({"path": "rev:current-rev"})
     );
     Ok(())
 }
@@ -8131,7 +8131,7 @@ fn unsatisfiable_resume_restarts_only_the_owned_partial() -> Result<(), Box<dyn 
                 request,
                 "dropbox-api-arg",
             )?)?,
-            json!({"path": "rev:resume-revision", "rev": "resume-revision"})
+            json!({"path": "rev:resume-revision"})
         );
         if index != 1 {
             assert!(header(request, "range").is_none());
