@@ -435,6 +435,38 @@ fn one_reconciliation_pass_synchronizes_files_in_both_directions() -> Result<(),
 
 #[test]
 fn unavailable_download_blocks_only_its_plan_while_siblings_finish() -> Result<(), Box<dyn Error>> {
+    assert_download_failure_blocks_only_its_plan(
+        409,
+        FakeResponse::status_json(409, lookup_error("not_found")),
+    )
+}
+
+#[test]
+fn rejected_download_request_blocks_only_its_plan_while_siblings_finish()
+-> Result<(), Box<dyn Error>> {
+    assert_download_failure_blocks_only_its_plan(
+        400,
+        FakeResponse::status_text(
+            400,
+            "Error in call to API function \"files/download\": HTTP header \
+             \"Dropbox-API-Arg\": could not decode input as JSON",
+        ),
+    )
+}
+
+#[test]
+fn unmapped_download_status_blocks_only_its_plan_while_siblings_finish()
+-> Result<(), Box<dyn Error>> {
+    assert_download_failure_blocks_only_its_plan(418, FakeResponse::status_json(418, json!({})))
+}
+
+/// One failing exact download leaves one blocked plan carrying its status
+/// while an unrelated download and upload in the same pass complete, and the
+/// block survives a reopen without a request.
+fn assert_download_failure_blocks_only_its_plan(
+    status: u16,
+    failure: FakeResponse,
+) -> Result<(), Box<dyn Error>> {
     let upload_bytes = b"independent upload";
     let good_bytes = b"independent download";
     let blocked_bytes = b"unavailable download";
@@ -451,7 +483,7 @@ fn unavailable_download_blocks_only_its_plan_while_siblings_finish() -> Result<(
             "cursor": "cursor-download-isolation",
             "has_more": false
         })),
-        FakeResponse::status_json(409, lookup_error("not_found"))
+        failure
             .for_path("/2/files/download")
             .for_header_containing("dropbox-api-arg", "rev-blocked"),
         FakeResponse::bytes(good_bytes.to_vec())
@@ -506,16 +538,16 @@ fn unavailable_download_blocks_only_its_plan_while_siblings_finish() -> Result<(
     assert!(matches!(
         blocked.status,
         PlanStatus::Blocked {
-            reason: BlockReason::DownloadUnavailable { status: 409 },
+            reason: BlockReason::DownloadUnavailable { status: found },
             ..
-        }
+        } if found == status
     ));
     assert!(settled.blocked.iter().any(|blocked| matches!(
         blocked,
         ReplayBlocked::DurablePlan {
             path,
-            reason: BlockReason::DownloadUnavailable { status: 409 },
-        } if path == Path::new("blocked.txt")
+            reason: BlockReason::DownloadUnavailable { status: found },
+        } if path == Path::new("blocked.txt") && *found == status
     )));
 
     drop(downloads);
@@ -546,8 +578,8 @@ fn unavailable_download_blocks_only_its_plan_while_siblings_finish() -> Result<(
         blocked,
         ReplayBlocked::DurablePlan {
             path,
-            reason: BlockReason::DownloadUnavailable { status: 409 },
-        } if path == Path::new("blocked.txt")
+            reason: BlockReason::DownloadUnavailable { status: found },
+        } if path == Path::new("blocked.txt") && *found == status
     )));
     drop(downloads);
     drop(client);
@@ -7595,6 +7627,22 @@ impl FakeResponse {
             headers: vec![(
                 String::from("Content-Type"),
                 FakeHeaderValue::Text(String::from("application/json")),
+            )],
+            request_path: None,
+            request_header: None,
+            disconnect_after: None,
+            send_content_length: true,
+            gate: None,
+        }
+    }
+
+    fn status_text(status: u16, text: &str) -> Self {
+        Self {
+            status,
+            body: FakeResponseBody::Bytes(text.as_bytes().to_vec()),
+            headers: vec![(
+                String::from("Content-Type"),
+                FakeHeaderValue::Text(String::from("text/plain")),
             )],
             request_path: None,
             request_header: None,

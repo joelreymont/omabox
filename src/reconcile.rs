@@ -515,7 +515,15 @@ fn download_worker(
         let outcome = match run_download_job(dropbox, job, slots, root_access) {
             Ok(()) => DownloadOutcome::Completed,
             Err(error) => match download_block_reason(&error) {
-                Some(reason) => DownloadOutcome::Blocked(reason),
+                Some(reason) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        reason = ?reason,
+                        cause = %root_cause(&error),
+                        "exact download blocked for its path"
+                    );
+                    DownloadOutcome::Blocked(reason)
+                }
                 None => DownloadOutcome::Failed(error),
             },
         };
@@ -535,6 +543,17 @@ fn download_worker(
     }
 }
 
+/// The deepest cause in an error chain, which names what actually failed.
+fn root_cause(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut reason = error;
+    while let Some(source) = reason.source() {
+        reason = source;
+    }
+    reason.to_string()
+}
+
+/// The durable per-path block one failed exact download earns, or `None`
+/// when the failure concerns the session rather than the path.
 fn download_block_reason(error: &ReconcileError) -> Option<BlockReason> {
     match error {
         ReconcileError::RemoteDownload {
@@ -548,6 +567,19 @@ fn download_block_reason(error: &ReconcileError) -> Option<BlockReason> {
                 crate::dropbox::ApiOutcome::Unavailable | crate::dropbox::ApiOutcome::Unknown
             ) {
                 return Some(BlockReason::DownloadUnavailable { status: 409 });
+            }
+            // A rejected or unmapped client status names this exact download,
+            // not the session: block the path and let every other path continue.
+            match source.as_ref() {
+                dropbox_sdk::Error::BadRequest(_) => {
+                    return Some(BlockReason::DownloadUnavailable { status: 400 });
+                }
+                dropbox_sdk::Error::UnexpectedHttpError { code, .. }
+                    if (400..500).contains(code) =>
+                {
+                    return Some(BlockReason::DownloadUnavailable { status: *code });
+                }
+                _ => {}
             }
             if matches!(
                 source.as_ref(),
@@ -2148,10 +2180,32 @@ mod tests {
                 retry_after_seconds: 1,
             },
             SdkError::ServerError(String::new()),
+            SdkError::UnexpectedHttpError {
+                code: 302,
+                response: String::new(),
+            },
         ] {
             assert_eq!(
                 download_block_reason(&remote_download_error(DropboxError::sdk("download", error))),
                 None
+            );
+        }
+        for (error, status) in [
+            (
+                SdkError::<NoError>::BadRequest(String::from("Error in call to API function")),
+                400,
+            ),
+            (
+                SdkError::UnexpectedHttpError {
+                    code: 418,
+                    response: String::new(),
+                },
+                418,
+            ),
+        ] {
+            assert_eq!(
+                download_block_reason(&remote_download_error(DropboxError::sdk("download", error))),
+                Some(BlockReason::DownloadUnavailable { status })
             );
         }
         for source in [

@@ -2246,6 +2246,32 @@ impl ApiError for files::ListFolderLongpollError {
     }
 }
 
+/// Longest excerpt of a Dropbox error body kept in a typed failure.
+const ERROR_EXCERPT_CHARS: usize = 256;
+
+/// A bounded, single-line excerpt of a Dropbox error body.
+///
+/// Dropbox explains a rejected request only in the body, so a typed failure
+/// keeps enough of it for a log line to name the cause, with control
+/// characters flattened so the excerpt cannot break the line.
+fn bounded_excerpt(body: &str) -> String {
+    let mut excerpt = body
+        .chars()
+        .take(ERROR_EXCERPT_CHARS)
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if body.chars().nth(ERROR_EXCERPT_CHARS).is_some() {
+        excerpt.push('…');
+    }
+    excerpt
+}
+
 impl DropboxError {
     pub(crate) fn sdk<E: ApiError>(operation: &'static str, error: SdkError<E>) -> Self {
         let outcome = match &error {
@@ -2279,12 +2305,15 @@ impl DropboxError {
                 SdkError::UnexpectedHttpError { code, response }
             }
         };
-        // Body strings may echo request input; retain the typed error and safe causes.
+        // Body strings may echo request input and can be arbitrarily large;
+        // keep a bounded excerpt so the rejection reason survives into the log.
         match &mut source {
             SdkError::BadRequest(body)
             | SdkError::UnexpectedResponse(body)
-            | SdkError::ServerError(body) => body.clear(),
-            SdkError::UnexpectedHttpError { response, .. } => response.clear(),
+            | SdkError::ServerError(body) => *body = bounded_excerpt(body),
+            SdkError::UnexpectedHttpError { response, .. } => {
+                *response = bounded_excerpt(response);
+            }
             SdkError::Json(error) if error.is_data() => {
                 *error = <serde_json::Error as serde::de::Error>::custom(
                     "invalid Dropbox response field",
@@ -2401,9 +2430,9 @@ mod tests {
     };
 
     use super::{
-        ApiOutcome, DropboxError, DropboxRoot, MutationRejection, PROGRESS_INTERVAL,
-        ProgressReader, UPLOAD_SESSION_MAX_BYTES, apply_entries, files, lookup_outcome,
-        validate_upload_size, write_outcome,
+        ApiOutcome, DropboxError, DropboxRoot, ERROR_EXCERPT_CHARS, MutationRejection,
+        PROGRESS_INTERVAL, ProgressReader, UPLOAD_SESSION_MAX_BYTES, apply_entries, files,
+        lookup_outcome, validate_upload_size, write_outcome,
     };
 
     #[test]
@@ -2719,6 +2748,33 @@ mod tests {
             Path::new("apps/Day One/Entry.doentry")
         );
         Ok(())
+    }
+
+    #[test]
+    fn rejected_request_bodies_survive_as_bounded_excerpts() {
+        let body = format!(
+            "Error in call to API function \"files/download\":\r\n{}",
+            "x".repeat(2 * ERROR_EXCERPT_CHARS)
+        );
+        let error = DropboxError::sdk(
+            "download",
+            dropbox_sdk::Error::<dropbox_sdk::NoError>::BadRequest(body),
+        );
+        assert_eq!(error.api_outcome(), ApiOutcome::Invariant);
+        let rendered = match &error {
+            DropboxError::Sdk { source, .. } => source.to_string(),
+            _ => String::new(),
+        };
+        assert!(
+            rendered.contains("Error in call to API function \"files/download\":  xxx"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains('\n') && !rendered.contains('\r'));
+        assert!(rendered.ends_with('…'), "{rendered}");
+        assert!(
+            rendered.chars().count() < ERROR_EXCERPT_CHARS + 80,
+            "{rendered}"
+        );
     }
 
     #[test]
