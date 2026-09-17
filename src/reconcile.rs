@@ -1099,17 +1099,21 @@ fn reconcile_published(
                     &unobserved_remote
                 }
             };
-            let path = local_record
-                .map(|record| record.path.clone())
-                .or_else(|| remote_record.map(|record| record.path.clone()))
-                .or(baseline_path)
-                .or_else(|| live.get(canonical_path).map(|plan| plan.path.clone()))
-                .ok_or_else(|| {
-                    invalid(
-                        canonical_path.as_path(),
-                        "canonical path has no display spelling",
-                    )
-                })?;
+            let path = match local_record {
+                Some(record) => record.path.clone(),
+                None => {
+                    let candidate = baseline_path
+                        .or_else(|| remote_record.map(|record| record.path.clone()))
+                        .or_else(|| live.get(canonical_path).map(|plan| plan.path.clone()))
+                        .ok_or_else(|| {
+                            invalid(
+                                canonical_path.as_path(),
+                                "canonical path has no display spelling",
+                            )
+                        })?;
+                    spell_with_local_ancestors(&local, canonical_path, candidate)
+                }
+            };
             let decision = plan(
                 &baseline,
                 local_observation,
@@ -1831,6 +1835,49 @@ fn find_local<'a>(
     records.get(index).map(|(_, record)| record)
 }
 
+/// Spell a path the scan did not observe with the local spelling of every
+/// ancestor it did observe.
+///
+/// Dropbox guarantees the casing of only the last `path_display` component,
+/// and a baseline may predate a local re-spelling, so a candidate spelling can
+/// name ancestors that differ from the directories the filesystem holds. On a
+/// case-sensitive filesystem an effect at that spelling would build a sibling
+/// tree beside them, which the next scan reports as a case collision. Every
+/// ancestor with a local record is therefore respelled from that record; the
+/// final component keeps the candidate spelling.
+fn spell_with_local_ancestors(
+    local: &[(CanonicalPath, LocalObservationRecord)],
+    canonical_path: &CanonicalPath,
+    candidate: PathBuf,
+) -> PathBuf {
+    let canonical = canonical_path.as_path().iter().collect::<Vec<_>>();
+    let display = candidate.iter().collect::<Vec<_>>();
+    if canonical.len() != display.len() {
+        return candidate;
+    }
+    let mut prefix = PathBuf::new();
+    let mut spelled = PathBuf::new();
+    for (index, (canonical_component, display_component)) in
+        canonical.iter().zip(&display).enumerate()
+    {
+        prefix.push(canonical_component);
+        let ancestor = if index + 1 < canonical.len() {
+            local
+                .binary_search_by(|(path, _)| path.as_bytes().cmp(prefix.as_os_str().as_bytes()))
+                .ok()
+                .and_then(|found| local.get(found))
+                .and_then(|(_, record)| record.path.file_name())
+        } else {
+            None
+        };
+        match ancestor {
+            Some(name) => spelled.push(name),
+            None => spelled.push(display_component),
+        }
+    }
+    spelled
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct CaseVariantMove {
     source: PathBuf,
@@ -2252,6 +2299,40 @@ mod tests {
                 Some(BlockReason::LocalObjectInWay)
             );
         }
+    }
+
+    #[test]
+    fn absent_paths_are_spelled_with_local_ancestor_casing() -> Result<(), Box<dyn Error>> {
+        let local = local_map(local_records([
+            PathBuf::from("Apps"),
+            PathBuf::from("Apps/Day One"),
+            PathBuf::from("Notes"),
+        ]))?;
+        let respelled = spell_with_local_ancestors(
+            &local,
+            &CanonicalPath::from_display(Path::new("apps/day one/journal")),
+            PathBuf::from("apps/day one/Journal"),
+        );
+        assert_eq!(respelled, PathBuf::from("Apps/Day One/Journal"));
+        let deeper = spell_with_local_ancestors(
+            &local,
+            &CanonicalPath::from_display(Path::new("apps/day one/journal/entries")),
+            PathBuf::from("APPS/Day one/journal/Entries"),
+        );
+        assert_eq!(deeper, PathBuf::from("Apps/Day One/journal/Entries"));
+        let fresh = spell_with_local_ancestors(
+            &local,
+            &CanonicalPath::from_display(Path::new("docs/report.txt")),
+            PathBuf::from("Docs/Report.txt"),
+        );
+        assert_eq!(fresh, PathBuf::from("Docs/Report.txt"));
+        let top = spell_with_local_ancestors(
+            &local,
+            &CanonicalPath::from_display(Path::new("notes")),
+            PathBuf::from("NOTES"),
+        );
+        assert_eq!(top, PathBuf::from("NOTES"));
+        Ok(())
     }
 
     fn local_records(paths: impl IntoIterator<Item = PathBuf>) -> Vec<LocalObservationRecord> {

@@ -1968,6 +1968,104 @@ fn fresh_download_uses_parent_directory_casing_without_remote_writes() -> Result
 }
 
 #[test]
+fn delta_folder_with_miscased_parents_is_created_inside_the_local_tree()
+-> Result<(), Box<dyn Error>> {
+    let server = FakeServer::start(vec![
+        account(),
+        FakeResponse::json(json!({
+            "entries": [
+                folder_metadata("/apps", "/Apps"),
+                folder_metadata("/apps/day one", "/Apps/Day One"),
+            ],
+            "cursor": "miscased-parents",
+            "has_more": false
+        })),
+        // Dropbox re-created the folder and reports its new child with parent
+        // components it spells in lower case, as its documentation allows.
+        FakeResponse::json(json!({
+            "entries": [
+                deleted_metadata("/apps/day one", "/apps/day one"),
+                folder_metadata("/apps/day one", "/apps/day one"),
+                folder_metadata("/apps/day one/journal", "/apps/day one/Journal"),
+            ],
+            "cursor": "miscased-parents-2",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder/continue"),
+        FakeResponse::json(json!({
+            "entries": [],
+            "cursor": "miscased-parents-2",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder/continue"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-miscased-parents")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(root.join("Apps/Day One"))?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+
+    let first = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+    assert_eq!(first.noops, 2);
+    assert_eq!(first.planned, 0);
+
+    let second = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+    assert_eq!(second.planned, 1);
+    assert_eq!(second.replayed_operations, 1);
+    assert!(root.join("Apps/Day One/Journal").is_dir());
+    assert!(!root.join("Apps/day one").exists());
+    let mut apps_entries = std::fs::read_dir(root.join("Apps"))?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<Vec<_>, _>>()?;
+    apps_entries.sort();
+    assert_eq!(apps_entries, vec![OsString::from("Day One")]);
+    assert_eq!(
+        journal.baseline(Path::new("apps/day one/journal"))?,
+        Some(Baseline::Directory)
+    );
+
+    let third = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+    assert_eq!(third.planned, 0);
+    assert_eq!(third.noops, 3);
+    assert!(journal.pending_plans()?.is_empty());
+
+    let requests = server.finish()?;
+    assert!(requests.iter().all(|request| {
+        request.path != "/2/files/create_folder_v2"
+            && request.path != "/2/files/upload"
+            && request.path != "/2/files/delete_v2"
+    }));
+    Ok(())
+}
+
+#[test]
 fn remote_directory_deletion_removes_local_directories_deepest_first() -> Result<(), Box<dyn Error>>
 {
     let server = FakeServer::start(vec![

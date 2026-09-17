@@ -1893,19 +1893,16 @@ fn normalize_inventory_changes(
             .iter()
             .map(|(canonical, path)| (canonical, path)),
     )?;
+    // Dropbox never reports a case-only rename and guarantees only the last
+    // `path_display` component, so a directory keeps its recorded spelling
+    // until a delete removes it; only a re-created directory is respelled.
     for change in changes.iter() {
         match change {
-            RemoteInventoryChange::Upsert(record) => {
-                if record.observation == Observation::Directory {
-                    insert_directory_casing(
-                        &mut directories,
-                        &record.canonical_path,
-                        &record.path,
-                    )?;
-                }
-            }
-            RemoteInventoryChange::EnsureDirectory(record) => {
-                if !directories.contains_key(&record.canonical_path) {
+            RemoteInventoryChange::Upsert(record)
+            | RemoteInventoryChange::EnsureDirectory(record) => {
+                if record.observation == Observation::Directory
+                    && !directories.contains_key(&record.canonical_path)
+                {
                     insert_directory_casing(
                         &mut directories,
                         &record.canonical_path,
@@ -2431,8 +2428,9 @@ mod tests {
 
     use super::{
         ApiOutcome, DropboxError, DropboxRoot, ERROR_EXCERPT_CHARS, MutationRejection,
-        PROGRESS_INTERVAL, ProgressReader, UPLOAD_SESSION_MAX_BYTES, apply_entries, files,
-        lookup_outcome, validate_upload_size, write_outcome,
+        PROGRESS_INTERVAL, ProgressReader, RemoteInventoryChange, UPLOAD_SESSION_MAX_BYTES,
+        append_entry_changes, apply_entries, files, lookup_outcome, normalize_inventory_changes,
+        validate_upload_size, write_outcome,
     };
 
     #[test]
@@ -2748,6 +2746,74 @@ mod tests {
             Path::new("apps/Day One/Entry.doentry")
         );
         Ok(())
+    }
+
+    #[test]
+    fn delta_never_respells_a_directory_that_still_exists() -> Result<(), Box<dyn Error>> {
+        let root = DropboxRoot::new("account", "namespace", "")?;
+        let existing = vec![
+            (
+                CanonicalPath::from_display(Path::new("apps")),
+                PathBuf::from("Apps"),
+            ),
+            (
+                CanonicalPath::from_display(Path::new("apps/day one")),
+                PathBuf::from("Apps/Day One"),
+            ),
+        ];
+        let mut changes = Vec::new();
+        append_entry_changes(
+            &root,
+            &mut changes,
+            vec![
+                files::Metadata::Folder(folder_metadata("/apps", "/apps")),
+                files::Metadata::Folder(folder_metadata(
+                    "/apps/day one/journal",
+                    "/apps/day one/Journal",
+                )),
+            ],
+        )?;
+        normalize_inventory_changes(&mut changes, &existing)?;
+        assert_eq!(
+            change_paths(&changes),
+            vec![
+                PathBuf::from("Apps"),
+                PathBuf::from("Apps"),
+                PathBuf::from("Apps/Day One"),
+                PathBuf::from("Apps/Day One/Journal"),
+            ]
+        );
+
+        let mut changes = Vec::new();
+        append_entry_changes(
+            &root,
+            &mut changes,
+            vec![
+                files::Metadata::Deleted(
+                    files::DeletedMetadata::new(String::from("day one"))
+                        .with_path_lower(String::from("/apps/day one"))
+                        .with_path_display(String::from("/apps/day one")),
+                ),
+                files::Metadata::Folder(folder_metadata("/apps/day one", "/apps/DAY ONE")),
+            ],
+        )?;
+        normalize_inventory_changes(&mut changes, &existing)?;
+        assert_eq!(
+            change_paths(&changes),
+            vec![PathBuf::from("Apps"), PathBuf::from("Apps/DAY ONE")]
+        );
+        Ok(())
+    }
+
+    fn change_paths(changes: &[RemoteInventoryChange]) -> Vec<PathBuf> {
+        changes
+            .iter()
+            .filter_map(|change| match change {
+                RemoteInventoryChange::Upsert(record)
+                | RemoteInventoryChange::EnsureDirectory(record) => Some(record.path.clone()),
+                RemoteInventoryChange::DeleteSubtree { .. } => None,
+            })
+            .collect()
     }
 
     #[test]
