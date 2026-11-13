@@ -127,16 +127,20 @@ fn parse_setup(arguments: &[OsString]) -> Result<SetupOptions, CliError> {
         let option = arguments[index]
             .to_str()
             .ok_or(CliError::Usage("setup options must be valid UTF-8"))?;
-        let value = arguments
-            .get(index + 1)
-            .ok_or(CliError::Usage("a setup option is missing its value"))?;
+        // Take the value only after the option is known and not repeated, so
+        // a trailing unknown or repeated option is reported as such.
+        let value = || {
+            arguments
+                .get(index + 1)
+                .ok_or(CliError::Usage("a setup option is missing its value"))
+        };
         match option {
-            "--sync-root" if sync_root.is_none() => sync_root = Some(PathBuf::from(value)),
+            "--sync-root" if sync_root.is_none() => sync_root = Some(PathBuf::from(value()?)),
             "--app-key" if app_key.is_none() => {
-                app_key = Some(utf8(value, "the Dropbox app key must be valid UTF-8")?)
+                app_key = Some(utf8(value()?, "the Dropbox app key must be valid UTF-8")?)
             }
             "--remote-root" if !remote_root_set => {
-                remote_root = utf8(value, "the Dropbox root must be valid UTF-8")?;
+                remote_root = utf8(value()?, "the Dropbox root must be valid UTF-8")?;
                 remote_root_set = true;
             }
             "--sync-root" | "--app-key" | "--remote-root" => {
@@ -760,6 +764,30 @@ mod tests {
             arguments(&["service", "unknown"]),
         ] {
             assert!(matches!(parse(rejected), Err(CliError::Usage(_))));
+        }
+    }
+
+    #[test]
+    fn parser_names_the_setup_option_fault() {
+        for (rejected, message) in [
+            (arguments(&["setup", "--help"]), "unknown setup option"),
+            (
+                arguments(&["setup", "--sync-root", "/tmp/Dropbox", "--bogus"]),
+                "unknown setup option",
+            ),
+            (
+                arguments(&["setup", "--app-key"]),
+                "a setup option is missing its value",
+            ),
+            (
+                arguments(&["setup", "--app-key", "key", "--app-key"]),
+                "a setup option was provided more than once",
+            ),
+        ] {
+            assert!(
+                matches!(parse(rejected.clone()), Err(CliError::Usage(found)) if found == message),
+                "{rejected:?} must be rejected with {message:?}"
+            );
         }
     }
 
