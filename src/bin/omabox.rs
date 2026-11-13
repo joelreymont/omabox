@@ -2,7 +2,9 @@
 
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::fs;
 use std::io::{self, BufRead as _, Write as _};
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 
 use miette::Diagnostic;
@@ -17,10 +19,13 @@ use serde::Serialize;
 use thiserror::Error;
 
 const HELP: &str = "Omabox synchronizes a local directory with Dropbox.\n\n\
-Usage:\n  omabox setup [REMOTE_ROOT]\n  omabox setup --sync-root PATH --app-key KEY [--remote-root ROOT]\n  omabox status\n  omabox pause|resume\n  omabox settings [--json]\n  omabox settings set-root PATH\n  omabox install|upgrade|uninstall\n  omabox service start|stop|restart|enable|disable|status\n  omabox logs\n  omabox --help\n  omabox --version\n\n\
-The Dropbox app key is public. Omabox never requests or stores an app secret.\n";
+Usage:\n  omabox setup [REMOTE_ROOT]\n  omabox setup --app-key KEY [--sync-root PATH] [--remote-root ROOT]\n  omabox status\n  omabox pause|resume\n  omabox settings [--json]\n  omabox settings set-root PATH\n  omabox install|upgrade|uninstall\n  omabox service start|stop|restart|enable|disable|status\n  omabox logs\n  omabox --help\n  omabox --version\n\n\
+Setup with --app-key syncs ~/Dropbox, creating it if missing, unless --sync-root\n\
+names another existing directory. The Dropbox app key is public. Omabox never\n\
+requests or stores an app secret.\n";
 const USAGE: &str = "Run `omabox --help` for usage.";
 const AUTHORIZATION_CODE_LIMIT: usize = 8192;
+const DEFAULT_SYNC_ROOT: &str = "Dropbox";
 
 fn main() -> miette::Result<()> {
     match run(env::args_os().skip(1)) {
@@ -70,7 +75,8 @@ struct SetupOptions {
 
 #[derive(Debug, Eq, PartialEq)]
 struct InitialConfig {
-    sync_root: PathBuf,
+    /// `None` selects `~/Dropbox`.
+    sync_root: Option<PathBuf>,
     app_key: String,
 }
 
@@ -152,10 +158,8 @@ fn parse_setup(arguments: &[OsString]) -> Result<SetupOptions, CliError> {
         }
         index += 2;
     }
-    let (Some(sync_root), Some(app_key)) = (sync_root, app_key) else {
-        return Err(CliError::Usage(
-            "flag-driven setup requires --sync-root and --app-key",
-        ));
+    let Some(app_key) = app_key else {
+        return Err(CliError::Usage("flag-driven setup requires --app-key"));
     };
     Ok(SetupOptions {
         remote_root,
@@ -216,7 +220,16 @@ fn setup(options: SetupOptions) -> Result<(), CliError> {
         Some(initial) => {
             let xdg =
                 XdgDirectories::from_environment().map_err(config_error("resolve XDG paths"))?;
-            let initial_config = Config::from_values(&xdg, initial.sync_root, initial.app_key)
+            let sync_root = match initial.sync_root {
+                Some(path) => path,
+                None => {
+                    // Refuse first, so setup on a configured machine leaves
+                    // no new, empty ~/Dropbox behind.
+                    refuse_existing_config(&xdg.config_file())?;
+                    create_default_sync_root(env::var_os("HOME"))?
+                }
+            };
+            let initial_config = Config::from_values(&xdg, sync_root, initial.app_key)
                 .map_err(config_error("validate initial configuration"))?;
             (initial_config, true)
         }
@@ -230,20 +243,40 @@ fn setup(options: SetupOptions) -> Result<(), CliError> {
         .map_err(config_error("prepare state directories"))?;
     let _lock = InstanceLock::acquire(config.paths().lock_file())
         .map_err(|source| CliError::Lock { source })?;
-    if write_initial_config
-        && config
-            .paths()
-            .config_file()
-            .try_exists()
-            .map_err(|source| CliError::InspectConfig { source })?
-    {
-        return Err(CliError::InitialConfigExists);
+    if write_initial_config {
+        refuse_existing_config(&config.paths().config_file())?;
     }
 
     complete_setup(&config, write_initial_config, || {
         authorize_and_bind(&config, &options.remote_root)
     })?;
     write_stdout("\nOmabox setup is complete.\n")
+}
+
+fn refuse_existing_config(path: &Path) -> Result<(), CliError> {
+    if path
+        .try_exists()
+        .map_err(|source| CliError::InspectConfig { source })?
+    {
+        return Err(CliError::InitialConfigExists);
+    }
+    Ok(())
+}
+
+// The default root is created when missing; a root named with --sync-root
+// must already exist, so a mistyped path fails instead of becoming a new,
+// empty root.
+fn create_default_sync_root(home: Option<OsString>) -> Result<PathBuf, CliError> {
+    let home = home
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .ok_or(CliError::DefaultSyncRootUnavailable)?;
+    let root = home.join(DEFAULT_SYNC_ROOT);
+    match fs::DirBuilder::new().mode(0o700).create(&root) {
+        Ok(()) => Ok(root),
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => Ok(root),
+        Err(source) => Err(CliError::CreateDefaultSyncRoot { path: root, source }),
+    }
 }
 
 fn authorize_and_bind(config: &Config, remote_root: &str) -> Result<(), CliError> {
@@ -602,6 +635,24 @@ enum CliError {
     )]
     SerializeOutput(#[source] serde_json::Error),
 
+    #[error("HOME must be an absolute path to find the default sync root ~/Dropbox")]
+    #[diagnostic(
+        code(omabox::cli::default_sync_root),
+        help("Set HOME, or pass --sync-root PATH.")
+    )]
+    DefaultSyncRootUnavailable,
+
+    #[error("could not create the default sync root {}", path.display())]
+    #[diagnostic(
+        code(omabox::cli::create_default_sync_root),
+        help("Create the directory, or pass --sync-root PATH.")
+    )]
+    CreateDefaultSyncRoot {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
     #[error("could not {operation}")]
     #[diagnostic(
         code(omabox::cli::io),
@@ -630,6 +681,7 @@ enum CliError {
 mod tests {
     use std::error::Error;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
 
     use omabox::journal::{
         BlockReason, LocalRootActivation, LocalRootBinding, PlanBlock, PlanWrite,
@@ -720,7 +772,17 @@ mod tests {
             Command::Setup(SetupOptions {
                 remote_root: String::from("/Work"),
                 initial_config: Some(InitialConfig {
-                    sync_root: PathBuf::from("/tmp/Dropbox"),
+                    sync_root: Some(PathBuf::from("/tmp/Dropbox")),
+                    app_key: String::from("key"),
+                }),
+            })
+        );
+        assert_eq!(
+            parse(arguments(&["setup", "--app-key", "key"]))?,
+            Command::Setup(SetupOptions {
+                remote_root: String::new(),
+                initial_config: Some(InitialConfig {
+                    sync_root: None,
                     app_key: String::from("key"),
                 }),
             })
@@ -750,6 +812,26 @@ mod tests {
             parse(arguments(&["uninstall"]))?,
             Command::Install(InstallAction::Uninstall)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn default_sync_root_is_a_private_home_dropbox_created_once() -> Result<(), Box<dyn Error>> {
+        let home = tempfile::TempDir::new()?;
+        let root = home.path().join("Dropbox");
+        for _ in 0..2 {
+            assert_eq!(
+                create_default_sync_root(Some(home.path().as_os_str().to_os_string()))?,
+                root
+            );
+            assert_eq!(fs::metadata(&root)?.permissions().mode() & 0o777, 0o700);
+        }
+        for home in [None, Some(OsString::from("relative/home"))] {
+            assert!(matches!(
+                create_default_sync_root(home),
+                Err(CliError::DefaultSyncRootUnavailable)
+            ));
+        }
         Ok(())
     }
 
@@ -847,7 +929,10 @@ mod tests {
             let Some(initial) = options.initial_config else {
                 return Err("documented flag setup did not contain initial config".into());
             };
-            let config = Config::from_values(&xdg, initial.sync_root, initial.app_key)?;
+            let sync_root = initial
+                .sync_root
+                .ok_or("documented flag setup lost its sync root")?;
+            let config = Config::from_values(&xdg, sync_root, initial.app_key)?;
             config.prepare()?;
             let _lock = InstanceLock::acquire(config.paths().lock_file())?;
             let result = complete_setup(&config, true, || {

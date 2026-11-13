@@ -13,7 +13,7 @@ service leaves staged transfers and journal state ready to continue safely.
 Logs and setup help also go through the documented `omabox` CLI; the widget has
 no daemon IPC or companion process.
 Setup help opens `omabox --help` in a held terminal so first-time setup shows
-the required sync-root and public app-key arguments instead of running a bare
+the required public app-key argument instead of running a bare
 setup command that cannot succeed without configuration.
 
 Missing, stale, malformed, and CLI errors are explicit. Logs and setup help

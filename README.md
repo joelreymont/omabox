@@ -26,11 +26,13 @@ unlocked:
 ```bash
 cargo build --release
 target/release/omabox install
-mkdir -p "$HOME/Dropbox"
-omabox setup --sync-root "$HOME/Dropbox" --app-key YOUR_APP_KEY
+omabox setup --app-key YOUR_APP_KEY
 omabox service enable
 omabox service start
 ```
+
+Setup syncs `~/Dropbox`, creating it if missing; pass `--sync-root PATH` to sync
+another existing directory instead.
 
 Setup opens Dropbox authorization once and stores the refresh token in Secret
 Service, never in the configuration or SQLite journal. Installation writes only
