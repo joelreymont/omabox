@@ -231,6 +231,17 @@ pub struct DropboxRoot {
 }
 
 impl DropboxRoot {
+    /// Whether `path` has root syntax: empty for the whole Dropbox, or a
+    /// normalized absolute Dropbox path such as `/Work`. Linking checks with
+    /// Dropbox that it names a folder.
+    #[must_use]
+    pub fn is_valid_path(path: &str) -> bool {
+        path.is_empty()
+            || (path.starts_with('/')
+                && !path.ends_with('/')
+                && !path.split('/').skip(1).any(invalid_dropbox_component))
+    }
+
     /// Bind Dropbox operations to one known account and namespace root.
     pub fn new(
         account_id: impl Into<String>,
@@ -238,11 +249,7 @@ impl DropboxRoot {
         path: impl Into<String>,
     ) -> Result<Self, DropboxError> {
         let path = path.into();
-        if !path.is_empty()
-            && (!path.starts_with('/')
-                || path.ends_with('/')
-                || path.split('/').skip(1).any(invalid_dropbox_component))
-        {
+        if !Self::is_valid_path(&path) {
             return Err(DropboxError::InvalidRootPath);
         }
         let depth = path.split('/').skip(1).count();

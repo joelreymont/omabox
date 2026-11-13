@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use miette::Diagnostic;
 use omabox::auth::{AuthError, AuthorizationGrant, OAuthClient, RefreshTokenStore};
 use omabox::config::{Config, ConfigError, InstanceLock, LockError, XdgDirectories};
-use omabox::dropbox::{DropboxClient, DropboxError, DropboxLink};
+use omabox::dropbox::{DropboxClient, DropboxError, DropboxLink, DropboxRoot};
 use omabox::install::{InstallAction, InstallError};
 use omabox::journal::{DropboxBindingWrite, Journal, JournalError, LocalRootBinding};
 use omabox::service::{ServiceAction, ServiceCommands, ServiceError};
@@ -111,7 +111,7 @@ fn parse_setup(arguments: &[OsString]) -> Result<SetupOptions, CliError> {
         }
         [remote_root] if !is_option(remote_root) => {
             return Ok(SetupOptions {
-                remote_root: utf8(remote_root, "the Dropbox root must be valid UTF-8")?,
+                remote_root: dropbox_root(remote_root)?,
                 initial_config: None,
             });
         }
@@ -140,7 +140,7 @@ fn parse_setup(arguments: &[OsString]) -> Result<SetupOptions, CliError> {
                 app_key = Some(utf8(value()?, "the Dropbox app key must be valid UTF-8")?)
             }
             "--remote-root" if !remote_root_set => {
-                remote_root = utf8(value()?, "the Dropbox root must be valid UTF-8")?;
+                remote_root = dropbox_root(value()?)?;
                 remote_root_set = true;
             }
             "--sync-root" | "--app-key" | "--remote-root" => {
@@ -190,6 +190,18 @@ fn parse_service(arguments: &[OsString]) -> Result<Command, CliError> {
 
 fn is_option(argument: &OsStr) -> bool {
     argument.as_encoded_bytes().starts_with(b"--")
+}
+
+// Reject a malformed root here, before setup sends the user through the
+// browser authorization that linking the root would otherwise follow.
+fn dropbox_root(argument: &OsStr) -> Result<String, CliError> {
+    let root = utf8(argument, "the Dropbox root must be valid UTF-8")?;
+    if !DropboxRoot::is_valid_path(&root) {
+        return Err(CliError::Usage(
+            "the Dropbox root must be empty or an absolute folder path such as /Work, with no trailing slash and no empty, . or .. parts",
+        ));
+    }
+    Ok(root)
 }
 
 fn utf8(argument: &OsStr, message: &'static str) -> Result<String, CliError> {
@@ -769,6 +781,7 @@ mod tests {
 
     #[test]
     fn parser_names_the_setup_option_fault() {
+        const ROOT_FAULT: &str = "the Dropbox root must be empty or an absolute folder path such as /Work, with no trailing slash and no empty, . or .. parts";
         for (rejected, message) in [
             (arguments(&["setup", "--help"]), "unknown setup option"),
             (
@@ -782,6 +795,22 @@ mod tests {
             (
                 arguments(&["setup", "--app-key", "key", "--app-key"]),
                 "a setup option was provided more than once",
+            ),
+            (arguments(&["setup", "-h"]), ROOT_FAULT),
+            (arguments(&["setup", "Work"]), ROOT_FAULT),
+            (arguments(&["setup", "/Work/"]), ROOT_FAULT),
+            (arguments(&["setup", "/Work/../Home"]), ROOT_FAULT),
+            (
+                arguments(&[
+                    "setup",
+                    "--sync-root",
+                    "/tmp/Dropbox",
+                    "--app-key",
+                    "key",
+                    "--remote-root",
+                    "Work",
+                ]),
+                ROOT_FAULT,
             ),
         ] {
             assert!(
