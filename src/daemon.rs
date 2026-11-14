@@ -56,6 +56,8 @@ const RUNNING: &str = "Another Omabox daemon is already running.";
 const READINESS: &str = "Omabox could not notify the service manager that startup completed.";
 const INTERNAL: &str = "Omabox stopped after detecting invalid internal state.";
 const LOGGING: &str = "Omabox logging could not start.";
+const WORKERS: &str = "Omabox is restarting its download workers.";
+const CLOCK: &str = "The system clock is set before 1970.";
 
 /// The single recovery decision attached to every daemon failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -348,11 +350,8 @@ fn run_session(
 }
 
 fn activate_configured_root(config: &Config, journal: &mut Journal) -> Result<(), DaemonError> {
-    let binding =
-        LocalRootBinding::inspect(config.sync_root()).map_err(|source| DaemonError::Journal {
-            operation: "inspect the configured local root",
-            source,
-        })?;
+    let binding = LocalRootBinding::inspect(config.sync_root())
+        .map_err(|source| DaemonError::LocalRoot { source })?;
     match journal
         .activate_local_root(&binding)
         .map_err(|source| DaemonError::Journal {
@@ -570,6 +569,17 @@ pub enum DaemonError {
         recorded: LocalRootBinding,
         actual: LocalRootBinding,
     },
+    #[error("could not inspect the configured sync root")]
+    #[diagnostic(
+        code(omabox::daemon::local_root),
+        help(
+            "Ensure the configured sync folder exists and is readable, or select another one in Omabox settings."
+        )
+    )]
+    LocalRoot {
+        #[source]
+        source: JournalError,
+    },
     #[error("could not {operation}")]
     #[diagnostic(
         code(omabox::daemon::oauth),
@@ -664,6 +674,7 @@ impl DaemonError {
             Self::LocalRootUnavailable { .. } => {
                 FailurePolicy::new(Disposition::Environmental, SYNC_ROOT)
             }
+            Self::LocalRoot { .. } => FailurePolicy::new(Disposition::Environmental, SYNC_ROOT),
             Self::Auth { source, .. } => auth_policy(source),
             Self::CredentialsUnavailable { .. } => {
                 FailurePolicy::new(Disposition::Environmental, CREDENTIALS)
@@ -905,7 +916,7 @@ fn recovery_policy(error: &RecoveryError) -> FailurePolicy {
         RecoveryError::Local { source } => local_policy(source),
         RecoveryError::Journal { source } => journal_policy(source),
         RecoveryError::Dropbox { source, .. } => dropbox_policy(source),
-        RecoveryError::Clock { .. } => FailurePolicy::new(Disposition::Environmental, SYNC_ERRORS),
+        RecoveryError::Clock { .. } => FailurePolicy::new(Disposition::Environmental, CLOCK),
         RecoveryError::InvalidJournalState { .. } => {
             FailurePolicy::new(Disposition::Invariant, JOURNAL_INVALID)
         }
@@ -936,9 +947,11 @@ fn reconcile_policy(error: &ReconcileError) -> FailurePolicy {
                 FailurePolicy::new(Disposition::Environmental, STATE)
             }
         }
-        ReconcileError::DownloadWorkerStopped
-        | ReconcileError::Clock { .. }
-        | ReconcileError::LocalRootChanged => {
+        ReconcileError::DownloadWorkerStopped => {
+            FailurePolicy::new(Disposition::Environmental, WORKERS)
+        }
+        ReconcileError::Clock { .. } => FailurePolicy::new(Disposition::Environmental, CLOCK),
+        ReconcileError::LocalRootChanged => {
             FailurePolicy::new(Disposition::Environmental, SYNC_ROOT)
         }
     }
@@ -998,6 +1011,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::config::XdgDirectories;
 
     static SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1305,5 +1319,59 @@ mod tests {
             },
         };
         assert_eq!(invariant.disposition(), Disposition::Invariant);
+    }
+
+    #[test]
+    fn local_root_failures_name_their_own_cause() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let root = directory.path().join("Dropbox");
+        fs::create_dir(&root)?;
+        let xdg = XdgDirectories::new(
+            directory.path().join("config"),
+            directory.path().join("state"),
+        )?;
+        let config = Config::from_values(&xdg, &root, "test-app-key")?;
+        let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+        fs::remove_dir(&root)?;
+        let Err(missing) = activate_configured_root(&config, &mut journal) else {
+            return Err("a missing sync root was activated".into());
+        };
+        assert!(matches!(missing, DaemonError::LocalRoot { .. }));
+        assert_eq!(missing.disposition(), Disposition::Environmental);
+        assert_eq!(missing.public_status(), SYNC_ROOT);
+        Ok(())
+    }
+
+    #[test]
+    fn worker_and_clock_failures_name_their_own_cause() -> Result<(), Box<dyn Error>> {
+        let workers = DaemonError::Reconcile {
+            source: ReconcileError::DownloadWorkerStopped,
+        };
+        assert_eq!(workers.disposition(), Disposition::Environmental);
+        assert_eq!(workers.public_status(), WORKERS);
+
+        let clock_error = || {
+            std::time::UNIX_EPOCH
+                .duration_since(std::time::UNIX_EPOCH + Duration::from_secs(1))
+                .err()
+                .ok_or("a later instant preceded the epoch")
+        };
+        let reconcile = DaemonError::Reconcile {
+            source: ReconcileError::Clock {
+                source: clock_error()?,
+            },
+        };
+        assert_eq!(reconcile.disposition(), Disposition::Environmental);
+        assert_eq!(reconcile.public_status(), CLOCK);
+        let recovery = DaemonError::Reconcile {
+            source: ReconcileError::Recovery {
+                source: RecoveryError::Clock {
+                    source: clock_error()?,
+                },
+            },
+        };
+        assert_eq!(recovery.disposition(), Disposition::Environmental);
+        assert_eq!(recovery.public_status(), CLOCK);
+        Ok(())
     }
 }
