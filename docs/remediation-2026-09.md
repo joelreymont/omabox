@@ -528,7 +528,8 @@ information keeps the SDK or local error as its source:
 | upload / finish | `TooManyWriteOperations`, `PayloadTooLarge` | Retry |
 | upload / finish | `ContentHashMismatch` | `UploadedContentMismatch` (transport-class retry) |
 | append | `IncorrectOffset(correct_offset)` | offset reconciliation (existing) |
-| append | `NotFound`, `Closed`, `TooLarge` | session restart from durable state (section J-resume) |
+| append | `NotFound`, `Closed` | the session machine verifies, then replaces the session (section J-resume) |
+| append | `TooLarge` | blocked plan (`UnsupportedFileSize`) |
 | delete | `PathLookup(NotFound)` | `Absent` (already gone) |
 | delete | `PathWrite(Conflict)` | definitive `MutationRejection` |
 | download | `Path(NotFound)` | `DownloadUnavailable` → blocked plan |
@@ -548,18 +549,51 @@ variants that survive: `UnverifiedMutation`, `RetriedTransport`,
 `UploadedContentMismatch`, `DownloadedIdentityChanged`,
 `CursorDidNotAdvance`, `ResetDuringFreshListing`.
 
-Longpoll: after any response the daemon waits at least the typed `backoff`
-before the next longpoll (existing behavior, now typed).
+Longpoll: after any response the daemon waits at least the ty### Durable upload sessions (J-resume, its own dot)
 
-### Durable upload sessions (J-resume, its own dot)
+A large upload, one over a single 32 MiB chunk, runs as a named machine in
+`src/dropbox.rs` whose progress is durable, so an interrupted upload resumes
+instead of restarting. Its record (`upload_sessions`, schema v8), keyed by
+the pending operation, holds the session id, the confirmed offset, the total
+length and the content identity of the staged bytes. The operation row already
+fixes the path, the content and the expected revision, and the journal's
+Dropbox binding cannot change, so the record repeats none of them. Session
+bytes come only from the content-addressed, verified stage, never from the
+live file.
 
-Upload sessions become durable so an interrupted large upload resumes instead
-of restarting: after every accepted append the journal records session id,
-confirmed offset, source fingerprint, expected baseline revision, and hash
-progress in one transaction keyed by the plan's operation; replay reconciles
-`incorrect_offset` against that record and the local bytes; a session the
-server no longer knows restarts from zero. An ambiguous finish is verified by
-metadata exactly as today (`resolve_ambiguous`) and never repeated blindly; a
+- After every append Dropbox accepts, the confirmed offset is committed in its
+  own transaction before the next append is sent; a failed commit stops the
+  upload. The record is never ahead of the server and at most one chunk
+  behind it.
+- Replay of a record below the full length appends from its offset. An
+  `incorrect_offset` answer within the file is adopted and checkpointed: the
+  stage is immutable and finish checks the whole-file hash, so resending from
+  the server's offset is safe in either direction. An offset outside the file
+  retires the session.
+- A record at the full length means a finish may have been sent, so replay
+  reads metadata before any finish: Applied completes the operation, a changed
+  precondition records the conflict, and Pending finishes again on the same
+  session. A finish whose answer was lost never opens a replacement session.
+- A replacement session opens only after Dropbox reports the recorded one gone
+  (`not_found`, or `closed` while metadata still shows the operation pending)
+  and, for a record at the full length, a fresh metadata read still shows it
+  pending. The conditional commit (`Update(rev)`, or `Add` with
+  `strict_conflict`) keeps that safe.
+- `ContentHashMismatch` on finish retires a resumed session and retries once
+  from zero; on a session that started from zero it blocks the plan as
+  rejected by Dropbox. `TooLarge` blocks the plan as `UnsupportedFileSize`.
+  Neither repeats every pass.
+- The record is deleted in the transaction that completes the operation,
+  records its conflict, supersedes its plan, or purges pending plans for a new
+  local root; `ON DELETE CASCADE` covers pruning. Blocking and unblocking keep
+  it, since Dropbox keeps appended data for a later finish.
+- After a restart, a resumed session for a file the user has since edited
+  finishes the planned content first, and the next scan plans the newer
+  upload, as for direct uploads.
+- `formal/UploadSession.tla` models crashes, lost append and finish answers,
+  server-side session expiry and concurrent remote edits.
+
+dly; a
 finish that merely timed out never opens a replacement session.
 
 ### Auth
