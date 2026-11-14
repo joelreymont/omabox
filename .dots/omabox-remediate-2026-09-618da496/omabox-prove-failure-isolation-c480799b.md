@@ -6,7 +6,6 @@ issue-type: task
 created-at: "2026-09-02T11:28:11.377939+02:00"
 blocks:
   - omabox-isolate-per-path-3600f60c
-  - omabox-key-root-generations-0f6e6082
   - omabox-record-readable-conflict-9224fe0a
   - omabox-make-dropbox-listing-96c0afc3
 ---

@@ -5,7 +5,6 @@ priority: 2
 issue-type: task
 created-at: "2026-09-02T11:28:11.376382+02:00"
 blocks:
-  - omabox-key-root-generations-0f6e6082
   - omabox-store-state-paths-a4a19746
 ---
 

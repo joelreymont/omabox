@@ -1,9 +1,11 @@
 ---
 title: Key root generations on configuration, not inode drift
-status: open
+status: closed
 priority: 1
 issue-type: task
 created-at: "2026-09-02T11:28:11.370486+02:00"
+closed-at: "2026-11-14T15:43:30.221118+02:00"
+close-reason: "landed with omabox-preserve-sync-history-d24798cd: same-path Unavailable without writes (src/journal.rs:3670), path change retires prior work (src/journal.rs:3846), same-path set-root adoption (src/bin/omabox.rs:1135), Busy removed"
 blocks:
   - omabox-journal-schema-ver-487764f0
   - omabox-classify-daemon-errors-dd34c00a
