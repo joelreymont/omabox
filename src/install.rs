@@ -959,8 +959,9 @@ mod tests {
             b"StartLimitIntervalSec=10min".as_slice(),
             b"StartLimitBurst=5".as_slice(),
             b"Type=notify".as_slice(),
+            b"ExecStartPre=-/usr/bin/rm -f %t/omabox/status.json".as_slice(),
             b"ExecStart=%h/.local/bin/omaboxd".as_slice(),
-            b"ExecStopPost=-/usr/bin/rm -f %t/omabox/status.json".as_slice(),
+            br#"ExecStopPost=-/bin/sh -c 'if [ "$$SERVICE_RESULT" = success ]; then exec /usr/bin/rm -f "%t/omabox/status.json"; fi'"#.as_slice(),
             b"RestartPreventExitStatus=70 78".as_slice(),
             b"TimeoutStartSec=5min".as_slice(),
         ] {
@@ -969,6 +970,44 @@ mod tests {
                     .any(|window| window == directive)
             );
         }
+    }
+
+    #[test]
+    fn stop_post_keeps_the_status_only_after_a_failed_stop() -> Result<(), Box<dyn Error>> {
+        let unit = std::str::from_utf8(UNIT)?;
+        let Some(line) = unit
+            .lines()
+            .find_map(|line| line.strip_prefix("ExecStopPost=-/bin/sh -c "))
+        else {
+            return Err(io::Error::other("unit had no ExecStopPost=-/bin/sh -c line").into());
+        };
+        let (Some(first), Some(last)) = (line.find('\''), line.rfind('\'')) else {
+            return Err(io::Error::other("ExecStopPost script was not quoted").into());
+        };
+        if first == last {
+            return Err(io::Error::other("ExecStopPost script had one quote").into());
+        }
+        let runtime = tempfile::TempDir::new()?;
+        let Some(runtime_path) = runtime.path().to_str() else {
+            return Err(io::Error::other("runtime path was not UTF-8").into());
+        };
+        let script = line[first + 1..last]
+            .replace("$$", "$")
+            .replace("%t", runtime_path);
+        let status = runtime.path().join("omabox").join("status.json");
+        fs::create_dir(runtime.path().join("omabox"))?;
+        fs::write(&status, b"{}")?;
+
+        for (result, kept) in [("exit-code", true), ("success", false)] {
+            let exit = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&script)
+                .env("SERVICE_RESULT", result)
+                .status()?;
+            assert!(exit.success(), "ExecStopPost failed for {result}: {exit}");
+            assert_eq!(status.exists(), kept, "status kept after {result}");
+        }
+        Ok(())
     }
 
     #[test]

@@ -224,8 +224,22 @@ impl DaemonError { fn disposition(&self) -> Disposition }
   journal binding changed, refresh token rejected (the SDK's
   `AuthError::InvalidAccessToken` after a refresh attempt, or an OAuth
   `invalid_grant`). An expired access token is refreshed inside the transport
-  and re-issued once by the SDK; the daemon never restarts a session for it. The daemon publishes the fatal status and exits 78.
-- Invariant: `InvalidJournalState` and other bugs exit 70.
+  and re-issued once by the SDK; the daemon never restarts a session for it. The daemon publishes the fatal status as phase `stopped` and exits 78.
+  After `omabox setup` or `omabox settings set-root` succeeds, the CLI reads
+  the unit's `ActiveState`; when it is `failed`, the CLI clears that state
+  with `reset-failed` and starts the service, so the daemon checks the fixed
+  cause again. Every start or restart the CLI makes (`omabox resume`,
+  `service start|restart`, and set-root's restart of a running service) runs
+  `reset-failed` first, which also resets the start-limit counter, so systemd
+  never refuses a start the user asked for. When a start after a completed
+  setup or set-root fails, the CLI reports that the change is complete and
+  that the service did not start, and names `omabox logs`. set-root stops the
+  service only while it is running or stopping, since only then can a daemon
+  hold the instance lock. `omabox pause` (`service stop`) clears a failed
+  state after stopping, so a paused service is always inactive and stays
+  stopped.
+- Invariant: `InvalidJournalState` and other bugs publish phase `stopped` and
+  exit 70; a logging failure exits 70 before any status exists.
 - `last_error` is cleared only when a pass completes with zero sync errors.
 - Readiness: the daemon sends `READY=1` over `NOTIFY_SOCKET` using
   `std::os::unix::net::UnixDatagram` (abstract addresses via
@@ -243,12 +257,16 @@ impl DaemonError { fn disposition(&self) -> Disposition }
   staged binary before publishing, so a binary that cannot execute is caught
   before anything live changes.
 - Unit: `RestartPreventExitStatus=70 78`, `StartLimitIntervalSec=10min`,
-  `StartLimitBurst=5`, `After=graphical-session.target`,
-  `ExecStopPost=-/usr/bin/rm -f %t/omabox/status.json`, with the start-limit
-  keys in `[Unit]`. `ExecStopPost` is the only removal of `status.json`: the
-  daemon has no shutdown path by design, because every effect is crash-safe
-  (checkpointed stages, transactional journal), so SIGTERM may end it at any
-  instruction. A corrupt journal (`SQLITE_CORRUPT`, `SQLITE_NOTADB`) is
+  `StartLimitBurst=5`, `After=graphical-session.target`, an `ExecStartPre`
+  that removes `status.json`, so a snapshot only ever describes the latest
+  start, and an `ExecStopPost` that removes it only when `$SERVICE_RESULT` is
+  `success`: after exit 78 or 70 the file keeps the daemon's final `stopped`
+  status, and after any other failed exit it keeps the last snapshot until the
+  restart's `ExecStartPre` removes it; once the start limit ends the restarts,
+  the widget ages that snapshot into "Service not updating". The start-limit keys are in
+  `[Unit]`. The unit is the only remover of `status.json`: the daemon has no shutdown path by
+  design, because every effect is crash-safe (checkpointed stages,
+  transactional journal), so SIGTERM may end it at any instruction. A corrupt journal (`SQLITE_CORRUPT`, `SQLITE_NOTADB`) is
   UserAction; busy, full, and other SQLite failures are Environmental.
 - The session loop, dispositions, and schedule live in a library module
   `src/daemon.rs`; `src/bin/omaboxd.rs` becomes the thin entry point, so tests
@@ -616,8 +634,9 @@ would remove the adapters above; they are candidate upstream changes to
   `adopt_local_root`; `status` and `settings` render an unresolvable root as a
   line. The config directory is added to `validate_outside`. State, staging,
   and recovery paths are stored as projected physical paths.
-- `setup` stops and restores the service like `set-root`; the lock error names
-  `omabox pause`. The authorization code read is bounded with `take` and
+- `setup` takes the instance lock, so it refuses while the daemon runs; the
+  lock error names `omabox pause`. After it succeeds, the CLI starts a failed
+  service (UserAction above). The authorization code read is bounded with `take` and
   trimmed. README: setup prints a URL; live tests need
   `--features dropbox-live -- --ignored`.
 

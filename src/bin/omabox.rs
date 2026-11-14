@@ -13,7 +13,7 @@ use omabox::config::{Config, ConfigError, InstanceLock, LockError, XdgDirectorie
 use omabox::dropbox::{DropboxClient, DropboxError, DropboxLink, DropboxRoot};
 use omabox::install::{InstallAction, InstallError};
 use omabox::journal::{DropboxBindingWrite, Journal, JournalError, LocalRootBinding};
-use omabox::service::{ServiceAction, ServiceCommands, ServiceError};
+use omabox::service::{ServiceAction, ServiceCommands, ServiceError, UnitState};
 use omabox::status::{self, StatusError};
 use serde::Serialize;
 use thiserror::Error;
@@ -39,7 +39,7 @@ fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
     match command {
         Command::Help => write_stdout(HELP),
         Command::Version => write_stdout(concat!("omabox ", env!("CARGO_PKG_VERSION"), "\n")),
-        Command::Setup(options) => setup(options),
+        Command::Setup(options) => setup(options, &ServiceCommands::default()),
         Command::Status => show_status(),
         Command::Settings { json } => show_settings(json),
         Command::SetRoot(path) => set_sync_root_from_environment(&path),
@@ -47,11 +47,31 @@ fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
             let report = omabox::install::execute(action).map_err(CliError::Install)?;
             write_stdout(&report)
         }
-        Command::Service(action) => ServiceCommands::default()
-            .control(action)
-            .map_err(CliError::Service),
+        Command::Service(action) => run_service(action, &ServiceCommands::default()),
         Command::Logs => ServiceCommands::default().logs().map_err(CliError::Service),
     }
+}
+
+/// Run one service command. A start or restart first resets the failed state and the start-limit
+/// counter, so systemd never refuses a start the user asked for; a stop clears a failed state
+/// afterwards, so a paused service reads as inactive.
+fn run_service(action: ServiceAction, services: &ServiceCommands) -> Result<(), CliError> {
+    match action {
+        ServiceAction::Start | ServiceAction::Restart => {
+            services.reset_failed()?;
+            services.control(action)?;
+        }
+        ServiceAction::Stop => {
+            services.control(action)?;
+            if services.state()? == UnitState::Failed {
+                services.reset_failed()?;
+            }
+        }
+        ServiceAction::Enable | ServiceAction::Disable | ServiceAction::Status => {
+            services.control(action)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -215,7 +235,7 @@ fn utf8(argument: &OsStr, message: &'static str) -> Result<String, CliError> {
         .ok_or(CliError::Usage(message))
 }
 
-fn setup(options: SetupOptions) -> Result<(), CliError> {
+fn setup(options: SetupOptions, services: &ServiceCommands) -> Result<(), CliError> {
     let (config, write_initial_config) = match options.initial_config {
         Some(initial) => {
             let xdg =
@@ -241,7 +261,7 @@ fn setup(options: SetupOptions) -> Result<(), CliError> {
     config
         .prepare()
         .map_err(config_error("prepare state directories"))?;
-    let _lock = InstanceLock::acquire(config.paths().lock_file())
+    let lock = InstanceLock::acquire(config.paths().lock_file())
         .map_err(|source| CliError::Lock { source })?;
     if write_initial_config {
         refuse_existing_config(&config.paths().config_file())?;
@@ -250,7 +270,34 @@ fn setup(options: SetupOptions) -> Result<(), CliError> {
     complete_setup(&config, write_initial_config, || {
         authorize_and_bind(&config, &options.remote_root)
     })?;
-    write_stdout("\nOmabox setup is complete.\n")
+    finish_setup(lock, services)
+}
+
+fn finish_setup(lock: InstanceLock, services: &ServiceCommands) -> Result<(), CliError> {
+    // The daemon cannot start while setup holds its instance lock.
+    drop(lock);
+    let restarted = start_failed(services).map_err(|source| CliError::StartAfterChange {
+        change: "Omabox setup is complete".into(),
+        source,
+    })?;
+    if restarted {
+        write_stdout("\nOmabox setup is complete. The stopped service has been started again.\n")
+    } else {
+        write_stdout("\nOmabox setup is complete.\n")
+    }
+}
+
+/// Start the user service when systemd reports it failed, and return whether it
+/// did. A fatal daemon exit leaves the unit failed with no automatic restart, so
+/// a command that fixes the cause clears the failed state, which also resets the
+/// start limit, and starts it. A paused service is inactive and stays stopped.
+fn start_failed(services: &ServiceCommands) -> Result<bool, ServiceError> {
+    if services.state()? != UnitState::Failed {
+        return Ok(false);
+    }
+    services.reset_failed()?;
+    services.control(ServiceAction::Start)?;
+    Ok(true)
 }
 
 fn refuse_existing_config(path: &Path) -> Result<(), CliError> {
@@ -414,16 +461,32 @@ fn set_sync_root(
     let replacement = Config::from_values(xdg, path, current.dropbox_app_key())
         .map_err(config_error("validate the new sync root"))?;
 
-    let was_active = services.is_active().map_err(CliError::Service)?;
-    if was_active {
+    let before = services.state()?;
+    // Only a running or stopping unit can hold the instance lock; the stop
+    // cancels `activating` and waits out `deactivating`.
+    if matches!(before, UnitState::Running | UnitState::Stopping) {
         services
             .control(ServiceAction::Stop)
             .map_err(CliError::Service)?;
     }
     let change = change_sync_root_while_stopped(&current, &replacement);
-    if was_active && let Err(restore) = services.control(ServiceAction::Start) {
+    let changed = || {
+        format!(
+            "Omabox sync root is now {}",
+            replacement.sync_root().display()
+        )
+    };
+    let running = before == UnitState::Running;
+    if running
+        && let Err(restore) = services
+            .reset_failed()
+            .and_then(|()| services.control(ServiceAction::Start))
+    {
         return match change {
-            Ok(()) => Err(CliError::Service(restore)),
+            Ok(()) => Err(CliError::StartAfterChange {
+                change: changed(),
+                source: restore,
+            }),
             Err(source) => Err(CliError::RootChangeAndRestore {
                 source: Box::new(source),
                 restore,
@@ -431,10 +494,17 @@ fn set_sync_root(
         };
     }
     change?;
-    write_stdout(&format!(
-        "Omabox sync root is now {}.\n",
-        replacement.sync_root().display()
-    ))
+    let restarted = !running
+        && start_failed(services).map_err(|source| CliError::StartAfterChange {
+            change: changed(),
+            source,
+        })?;
+    let note = if restarted {
+        " The stopped service has been started again."
+    } else {
+        ""
+    };
+    write_stdout(&format!("{}.{note}\n", changed()))
 }
 
 fn change_sync_root_while_stopped(current: &Config, replacement: &Config) -> Result<(), CliError> {
@@ -591,6 +661,19 @@ enum CliError {
         restore: ServiceError,
     },
 
+    #[error("{change}, but the Omabox service did not start")]
+    #[diagnostic(
+        code(omabox::cli::start_after_change),
+        help(
+            "The change is kept. Run `omabox logs` to see why the service did not start, then `omabox resume`."
+        )
+    )]
+    StartAfterChange {
+        change: String,
+        #[source]
+        source: ServiceError,
+    },
+
     #[error("could not {operation}")]
     #[diagnostic(
         code(omabox::cli::oauth),
@@ -708,15 +791,14 @@ mod tests {
     /// can never collide with a concurrent spawn in the test binary.
     fn fake_systemctl(
         directory: &Path,
-        active: bool,
+        state: &str,
         log: &Path,
     ) -> Result<PathBuf, Box<dyn Error>> {
         let path = directory.join("systemctl");
-        let active_status = if active { 0 } else { 3 };
         fs::write(
             &path,
             format!(
-                "printf '%s\\n' \"$2\" >> '{}'\nif [ \"$2\" = is-active ]; then exit {active_status}; fi\nexit 0\n",
+                "printf '%s\\n' \"$2\" >> '{}'\nif [ \"$2\" = show ]; then printf '%s\\n' {state}; fi\nexit 0\n",
                 log.display()
             ),
         )?;
@@ -1027,16 +1109,129 @@ mod tests {
         fs::write(&recovery_payload, b"recovery")?;
 
         let service_log = temporary.path().join("service.log");
-        let systemctl = fake_systemctl(temporary.path(), true, &service_log)?;
+        let systemctl = fake_systemctl(temporary.path(), "active", &service_log)?;
         let services = ServiceCommands::scripts(systemctl, "/unused/journalctl");
         set_sync_root(&second, &xdg, &services)?;
         assert_eq!(Config::load_from(&xdg)?.sync_root(), second);
-        assert_eq!(fs::read_to_string(service_log)?, "is-active\nstop\nstart\n");
+        assert_eq!(
+            fs::read_to_string(service_log)?,
+            "show\nstop\nreset-failed\nstart\n"
+        );
         let journal = Journal::open(config.paths().journal_file())?;
         assert!(journal.pending_plans()?.is_empty());
         assert!(journal.blocked_plans()?.is_empty());
         assert_eq!(fs::read(staged_payload)?, b"staged");
         assert_eq!(fs::read(recovery_payload)?, b"recovery");
+        Ok(())
+    }
+
+    #[test]
+    fn set_root_starts_a_failed_service_after_the_change() -> Result<(), Box<dyn Error>> {
+        let (temporary, xdg, _first, second) = fixture()?;
+        let service_log = temporary.path().join("service.log");
+        let systemctl = fake_systemctl(temporary.path(), "failed", &service_log)?;
+        let services = ServiceCommands::scripts(systemctl, "/unused/journalctl");
+
+        set_sync_root(&second, &xdg, &services)?;
+        assert_eq!(Config::load_from(&xdg)?.sync_root(), second);
+        assert_eq!(
+            fs::read_to_string(service_log)?,
+            "show\nshow\nreset-failed\nstart\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn set_root_waits_out_a_stopping_service() -> Result<(), Box<dyn Error>> {
+        let (temporary, xdg, _first, second) = fixture()?;
+        let service_log = temporary.path().join("service.log");
+        let systemctl = fake_systemctl(temporary.path(), "deactivating", &service_log)?;
+        let services = ServiceCommands::scripts(systemctl, "/unused/journalctl");
+
+        set_sync_root(&second, &xdg, &services)?;
+        assert_eq!(Config::load_from(&xdg)?.sync_root(), second);
+        assert_eq!(fs::read_to_string(service_log)?, "show\nstop\nshow\n");
+        Ok(())
+    }
+
+    #[test]
+    fn finish_setup_releases_the_lock_before_starting_a_failed_service()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let lock_file = temporary.path().join("daemon.lock");
+        let lock = InstanceLock::acquire(&lock_file)?;
+        let service_log = temporary.path().join("service.log");
+        let systemctl = temporary.path().join("systemctl");
+        fs::write(
+            &systemctl,
+            format!(
+                "printf '%s\\n' \"$2\" >> '{}'\ncase \"$2\" in\n  show) printf '%s\\n' failed ;;\n  start) exec flock -n '{}' true ;;\nesac\nexit 0\n",
+                service_log.display(),
+                lock_file.display()
+            ),
+        )?;
+        let services = ServiceCommands::scripts(systemctl, "/unused/journalctl");
+
+        finish_setup(lock, &services)?;
+        assert_eq!(
+            fs::read_to_string(service_log)?,
+            "show\nreset-failed\nstart\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_completed_change_reports_a_failed_start() -> Result<(), Box<dyn Error>> {
+        fn failing_start(directory: &Path, state: &str) -> Result<ServiceCommands, Box<dyn Error>> {
+            let systemctl = directory.join("systemctl");
+            fs::write(
+                &systemctl,
+                format!(
+                    "printf '%s\\n' \"$2\" >> '{}'\ncase \"$2\" in\n  show) printf '%s\\n' {state} ;;\n  start) exit 1 ;;\nesac\nexit 0\n",
+                    directory.join("service.log").display()
+                ),
+            )?;
+            Ok(ServiceCommands::scripts(systemctl, "/unused/journalctl"))
+        }
+
+        let temporary = tempfile::TempDir::new()?;
+        let lock = InstanceLock::acquire(temporary.path().join("daemon.lock"))?;
+        let services = failing_start(temporary.path(), "failed")?;
+        assert!(matches!(
+            finish_setup(lock, &services),
+            Err(CliError::StartAfterChange { .. })
+        ));
+
+        for state in ["failed", "active"] {
+            let (temporary, xdg, _first, second) = fixture()?;
+            let services = failing_start(temporary.path(), state)?;
+            let result = set_sync_root(&second, &xdg, &services);
+            assert!(
+                matches!(result, Err(CliError::StartAfterChange { .. })),
+                "{state}: {result:?}"
+            );
+            assert_eq!(Config::load_from(&xdg)?.sync_root(), second, "{state}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn service_commands_reset_the_start_limit_before_a_start() -> Result<(), Box<dyn Error>> {
+        for (action, state, log) in [
+            (ServiceAction::Start, "failed", "reset-failed\nstart\n"),
+            (ServiceAction::Start, "inactive", "reset-failed\nstart\n"),
+            (ServiceAction::Restart, "active", "reset-failed\nrestart\n"),
+            (ServiceAction::Stop, "failed", "stop\nshow\nreset-failed\n"),
+            (ServiceAction::Stop, "active", "stop\nshow\n"),
+        ] {
+            let temporary = tempfile::TempDir::new()?;
+            let service_log = temporary.path().join("service.log");
+            let systemctl = fake_systemctl(temporary.path(), state, &service_log)?;
+            let services = ServiceCommands::scripts(systemctl, "/unused/journalctl");
+
+            run_service(action, &services)?;
+            assert_eq!(fs::read_to_string(service_log)?, log, "{action:?} {state}");
+        }
         Ok(())
     }
 
@@ -1047,7 +1242,7 @@ mod tests {
         let original_config = fs::read(config.paths().config_file())?;
         let _held_lock = InstanceLock::acquire(config.paths().lock_file())?;
         let service_log = temporary.path().join("service.log");
-        let systemctl = fake_systemctl(temporary.path(), false, &service_log)?;
+        let systemctl = fake_systemctl(temporary.path(), "inactive", &service_log)?;
         let services = ServiceCommands::scripts(systemctl, "/unused/journalctl");
 
         assert!(matches!(
@@ -1055,7 +1250,7 @@ mod tests {
             Err(CliError::Lock { .. })
         ));
         assert_eq!(fs::read(config.paths().config_file())?, original_config);
-        assert_eq!(fs::read_to_string(service_log)?, "is-active\n");
+        assert_eq!(fs::read_to_string(service_log)?, "show\n");
         Ok(())
     }
 
@@ -1087,7 +1282,7 @@ mod tests {
             &systemctl,
             format!(
                 "printf '%s\\n' \"$2\" >> '{}'\n\
-                 if [ \"$2\" = is-active ]; then exit 0; fi\n\
+                 if [ \"$2\" = show ]; then printf '%s\\n' active; fi\n\
                  if [ \"$2\" = stop ]; then mv '{}' '{}'; : > '{}'; fi\n\
                  exit 0\n",
                 service_log.display(),
@@ -1103,7 +1298,7 @@ mod tests {
         ));
         assert_eq!(
             fs::read_to_string(&service_log)?,
-            "is-active\nstop\nstart\n"
+            "show\nstop\nreset-failed\nstart\n"
         );
 
         fs::remove_file(config_directory)?;
@@ -1112,6 +1307,40 @@ mod tests {
         let journal = Journal::open(config.paths().journal_file())?;
         assert_eq!(journal.local_root_binding()?, binding_before);
         assert_eq!(journal.pending_plans()?, pending_before);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_change_and_restart_report_both() -> Result<(), Box<dyn Error>> {
+        let (temporary, xdg, first, second) = fixture()?;
+        let config = Config::load_from(&xdg)?;
+        let config_directory = config.paths().config_directory();
+        let saved_config_directory = temporary.path().join("saved-config");
+        let service_log = temporary.path().join("service.log");
+        let systemctl = temporary.path().join("systemctl-restore-failure");
+        fs::write(
+            &systemctl,
+            format!(
+                "printf '%s\\n' \"$2\" >> '{}'\n\
+                 if [ \"$2\" = show ]; then printf '%s\\n' active; fi\n\
+                 if [ \"$2\" = stop ]; then mv '{}' '{}'; : > '{}'; fi\n\
+                 if [ \"$2\" = start ]; then exit 1; fi\n\
+                 exit 0\n",
+                service_log.display(),
+                config_directory.display(),
+                saved_config_directory.display(),
+                config_directory.display(),
+            ),
+        )?;
+        let services = ServiceCommands::scripts(systemctl, "/unused/journalctl");
+        assert!(matches!(
+            set_sync_root(&second, &xdg, &services),
+            Err(CliError::RootChangeAndRestore { .. })
+        ));
+
+        fs::remove_file(config_directory)?;
+        fs::rename(saved_config_directory, config_directory)?;
+        assert_eq!(Config::load_from(&xdg)?.sync_root(), first);
         Ok(())
     }
 
@@ -1147,11 +1376,11 @@ mod tests {
         fs::rename(&first, temporary.path().join("unavailable-first"))?;
 
         let service_log = temporary.path().join("service.log");
-        let systemctl = fake_systemctl(temporary.path(), false, &service_log)?;
+        let systemctl = fake_systemctl(temporary.path(), "inactive", &service_log)?;
         let services = ServiceCommands::scripts(systemctl, "/unused/journalctl");
         set_sync_root(&second, &xdg, &services)?;
         assert_eq!(Config::load_from(&xdg)?.sync_root(), second);
-        assert_eq!(fs::read_to_string(service_log)?, "is-active\n");
+        assert_eq!(fs::read_to_string(service_log)?, "show\nshow\n");
 
         let mut journal = Journal::open(config.paths().journal_file())?;
         assert!(journal.baseline_paths()?.is_empty());
@@ -1189,7 +1418,7 @@ mod tests {
         let actual = LocalRootBinding::inspect(&first)?;
         assert_ne!(recorded, actual);
         let service_log = temporary.path().join("service.log");
-        let systemctl = fake_systemctl(temporary.path(), false, &service_log)?;
+        let systemctl = fake_systemctl(temporary.path(), "inactive", &service_log)?;
         let services = ServiceCommands::scripts(systemctl, "/unused/journalctl");
         set_sync_root(&first, &xdg, &services)?;
 
@@ -1207,7 +1436,7 @@ mod tests {
             journal.activate_local_root(&actual)?,
             LocalRootActivation::Current(_)
         ));
-        assert_eq!(fs::read_to_string(service_log)?, "is-active\n");
+        assert_eq!(fs::read_to_string(service_log)?, "show\nshow\n");
         Ok(())
     }
 }

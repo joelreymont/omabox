@@ -13,7 +13,7 @@ use thiserror::Error;
 
 const APPLICATION_DIRECTORY: &str = "omabox";
 const STATUS_FILE: &str = "status.json";
-const SCHEMA_VERSION: u8 = 2;
+const SCHEMA_VERSION: u8 = 3;
 
 /// Current high-level daemon activity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -29,6 +29,8 @@ pub enum DaemonPhase {
     Backoff,
     /// A synchronization or daemon error requires attention.
     Error,
+    /// The daemon exited after a failure it does not retry; it stays stopped until the user acts.
+    Stopped,
 }
 
 /// Direction of one byte transfer.
@@ -157,6 +159,17 @@ impl RuntimeStatus {
     pub fn error(&self, message: &'static str) {
         self.update(|publisher| {
             publisher.snapshot.phase = DaemonPhase::Error;
+            publisher.snapshot.transfers.clear();
+            publisher.retained_finished = false;
+            publisher.snapshot.last_error = Some(message);
+            true
+        });
+    }
+
+    /// Publish the final status of a daemon that is exiting after a failure it does not retry.
+    pub fn stopped(&self, message: &'static str) {
+        self.update(|publisher| {
+            publisher.snapshot.phase = DaemonPhase::Stopped;
             publisher.snapshot.transfers.clear();
             publisher.retained_finished = false;
             publisher.snapshot.last_error = Some(message);
@@ -405,7 +418,7 @@ mod tests {
         assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
         let value = serde_json::from_slice::<Value>(&fs::read(path)?)?;
         assert_eq!(value.as_object().map(|object| object.len()), Some(5));
-        assert_eq!(value["version"], 2);
+        assert_eq!(value["version"], 3);
         assert_eq!(value["phase"], "waiting");
         assert_eq!(value["transfers"], serde_json::json!([]));
         assert!(value["updated_at"].as_u64().is_some());
@@ -448,6 +461,27 @@ mod tests {
             failed["last_error"],
             "Dropbox authentication is unavailable."
         );
+        Ok(())
+    }
+
+    #[test]
+    fn stopped_status_clears_transfers_and_keeps_the_fatal_text() -> Result<(), Box<dyn Error>> {
+        let runtime = TempDir::new()?;
+        let status = RuntimeStatus::new(runtime.path())?;
+        status.transfer_observer()(TransferEvent::Progress(TransferProgress::new(
+            TransferDirection::Upload,
+            Path::new("folder/report.txt"),
+            4,
+            Some(10),
+        )));
+        status.stopped("Omabox setup is required.");
+
+        let path = runtime.path().join(APPLICATION_DIRECTORY).join(STATUS_FILE);
+        let stopped = serde_json::from_slice::<Value>(&fs::read(path)?)?;
+        assert_eq!(stopped["phase"], "stopped");
+        assert_eq!(stopped["transfers"], serde_json::json!([]));
+        assert_eq!(stopped["last_error"], "Omabox setup is required.");
+        assert_eq!(stopped["version"], 3);
         Ok(())
     }
 

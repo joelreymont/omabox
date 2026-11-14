@@ -30,6 +30,21 @@ TestCase {
     autoRefreshSettings: false
   }
 
+  Status {
+    id: stoppedDisplayStatus
+    autoRefreshSettings: false
+  }
+
+  Status {
+    id: missingDisplayStatus
+    autoRefreshSettings: false
+  }
+
+  Status {
+    id: waitingDisplayStatus
+    autoRefreshSettings: false
+  }
+
   function test_normalizes_concurrent_transfers() {
     var snapshot = status.normalize(JSON.stringify({
       version: 2,
@@ -141,5 +156,76 @@ TestCase {
 
     severityStatus.apply("not json")
     verify(severityStatus.hasError)
+  }
+
+  function test_stopped_status_is_final_and_explains_itself() {
+    severityStatus.apply(JSON.stringify({
+      version: 3,
+      phase: "stopped",
+      transfers: [],
+      last_error: "Omabox setup is required.",
+      updated_at: 100
+    }))
+    severityStatus.nowMs = (100 + 5 * 60 * 60) * 1000
+
+    compare(severityStatus.availability, "ready")
+    verify(!severityStatus.stale)
+    verify(severityStatus.hasError)
+    compare(severityStatus.snapshot.last_error, "Omabox setup is required.")
+
+    severityStatus.apply(JSON.stringify({
+      version: 2,
+      phase: "stopped",
+      transfers: [],
+      last_error: "Omabox setup is required.",
+      updated_at: 100
+    }))
+    compare(severityStatus.availability, "malformed")
+    compare(severityStatus.snapshot, null)
+
+    severityStatus.apply(JSON.stringify({
+      version: 3,
+      phase: "stopped",
+      transfers: [],
+      last_error: null,
+      updated_at: 100
+    }))
+    compare(severityStatus.availability, "malformed")
+    compare(severityStatus.snapshot, null)
+  }
+
+  function test_display_ranks_stopped_over_pause() {
+    stoppedDisplayStatus.apply(JSON.stringify({
+      version: 3,
+      phase: "stopped",
+      transfers: [],
+      last_error: "Omabox setup is required.",
+      updated_at: 100
+    }))
+    compare(stoppedDisplayStatus.display, "stopped")
+
+    stoppedDisplayStatus.applyActionResult("pause", 0, "", "")
+    verify(stoppedDisplayStatus.pausedByPanel)
+    compare(stoppedDisplayStatus.display, "stopped")
+
+    compare(missingDisplayStatus.availability, "missing")
+    missingDisplayStatus.applyActionResult("pause", 0, "", "")
+    verify(missingDisplayStatus.pausedByPanel)
+    compare(missingDisplayStatus.display, "paused")
+  }
+
+  function test_display_separates_stale_from_waiting() {
+    var updatedAt = Math.floor(Date.now() / 1000)
+    waitingDisplayStatus.apply(JSON.stringify({
+      version: 3,
+      phase: "waiting",
+      transfers: [],
+      last_error: null,
+      updated_at: updatedAt
+    }))
+    compare(waitingDisplayStatus.display, "waiting")
+
+    waitingDisplayStatus.nowMs = (updatedAt + 5 * 60 * 60) * 1000
+    compare(waitingDisplayStatus.display, "stale")
   }
 }

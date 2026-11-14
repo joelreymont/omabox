@@ -40,6 +40,19 @@ impl ServiceAction {
     }
 }
 
+/// What systemd's `ActiveState` lets the CLI do with the user service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnitState {
+    /// `active`, `reloading`, `refreshing` or `activating`, including the wait before an automatic restart.
+    Running,
+    /// `failed`: ended by a fatal exit, the start limit or a stop that timed out, until a command clears it.
+    Failed,
+    /// `deactivating`: stopping after a stop request or the daemon's own exit; it can still end `failed`.
+    Stopping,
+    /// `inactive` or `maintenance`, which an unloaded unit also reports: no daemon process.
+    Stopped,
+}
+
 /// Programs used to control and inspect the user service.
 #[derive(Clone, Debug)]
 pub struct ServiceCommands {
@@ -99,6 +112,45 @@ impl ServiceCommands {
     /// Return whether the user service is enabled at login.
     pub fn is_enabled(&self) -> Result<bool, ServiceError> {
         self.query_state("is-enabled", "systemctl is-enabled")
+    }
+
+    /// Read the user service's `ActiveState` from systemd.
+    pub fn state(&self) -> Result<UnitState, ServiceError> {
+        let output = self
+            .systemctl
+            .command()
+            .args(["--user", "show", "--property=ActiveState", "--value", UNIT])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|source| ServiceError::StartCommand {
+                command: "systemctl show",
+                source,
+            })?;
+        status_result(output.status, "systemctl show")?;
+        match String::from_utf8_lossy(&output.stdout).trim() {
+            "active" | "reloading" | "refreshing" | "activating" => Ok(UnitState::Running),
+            "failed" => Ok(UnitState::Failed),
+            "deactivating" => Ok(UnitState::Stopping),
+            "inactive" | "maintenance" => Ok(UnitState::Stopped),
+            state => Err(ServiceError::UnknownState {
+                state: state.to_owned(),
+            }),
+        }
+    }
+
+    /// Clear the user service's failed state and its start-limit counter.
+    pub fn reset_failed(&self) -> Result<(), ServiceError> {
+        let status = self
+            .systemctl
+            .command()
+            .args(["--user", "reset-failed", UNIT])
+            .status()
+            .map_err(|source| ServiceError::StartCommand {
+                command: "systemctl reset-failed",
+                source,
+            })?;
+        status_result(status, "systemctl reset-failed")
     }
 
     /// Reload user service unit files after installation changes.
@@ -250,6 +302,17 @@ pub enum ServiceError {
         /// Exit status, or `None` when terminated by a signal.
         status: Option<i32>,
     },
+
+    /// systemd reported an `ActiveState` this version does not know.
+    #[error("systemd reported the unknown service state `{state}`")]
+    #[diagnostic(
+        code(omabox::service::unknown_state),
+        help("Update Omabox, or report this state if Omabox is current.")
+    )]
+    UnknownState {
+        /// The trimmed state systemd printed.
+        state: String,
+    },
 }
 
 #[cfg(test)]
@@ -310,6 +373,22 @@ mod tests {
             "--user\nrestart\nomabox.service\n"
         );
 
+        // The recording script prints nothing, which is not a known state.
+        assert!(matches!(
+            commands.state(),
+            Err(ServiceError::UnknownState { state }) if state.is_empty()
+        ));
+        assert_eq!(
+            fs::read_to_string(&systemctl_arguments)?,
+            "--user\nshow\n--property=ActiveState\n--value\nomabox.service\n"
+        );
+
+        commands.reset_failed()?;
+        assert_eq!(
+            fs::read_to_string(&systemctl_arguments)?,
+            "--user\nreset-failed\nomabox.service\n"
+        );
+
         commands.logs()?;
         assert_eq!(
             fs::read_to_string(&journalctl_arguments)?,
@@ -327,6 +406,33 @@ mod tests {
 
         assert!(!commands.is_active()?);
         commands.control(ServiceAction::Status)?;
+        Ok(())
+    }
+
+    #[test]
+    fn state_maps_each_active_state() -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let systemctl = temporary.path().join("systemctl");
+        for (printed, expected) in [
+            ("active", UnitState::Running),
+            ("reloading", UnitState::Running),
+            ("refreshing", UnitState::Running),
+            ("activating", UnitState::Running),
+            ("failed", UnitState::Failed),
+            ("inactive", UnitState::Stopped),
+            ("deactivating", UnitState::Stopping),
+            ("maintenance", UnitState::Stopped),
+        ] {
+            fs::write(&systemctl, format!("printf '%s\\n' {printed}\n"))?;
+            let commands = ServiceCommands::scripts(&systemctl, "/unused/journalctl");
+            assert_eq!(commands.state()?, expected, "{printed}");
+        }
+        fs::write(&systemctl, "printf '%s\\n' bogus\n")?;
+        let commands = ServiceCommands::scripts(&systemctl, "/unused/journalctl");
+        assert!(matches!(
+            commands.state(),
+            Err(ServiceError::UnknownState { state }) if state == "bogus"
+        ));
         Ok(())
     }
 

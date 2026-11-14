@@ -16,8 +16,8 @@ Setup help opens `omabox --help` in a held terminal so first-time setup shows
 the required public app-key argument instead of running a bare
 setup command that cannot succeed without configuration.
 
-Missing, stale, malformed, and CLI errors are explicit. Logs and setup help
-remain one click away.
+Missing, stale, malformed, and CLI errors are explicit, and a service that
+stopped on a failure shows why. Logs and setup help remain one click away.
 
 Install the release build while the desktop session is unlocked:
 

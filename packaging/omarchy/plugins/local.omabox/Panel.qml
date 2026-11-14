@@ -21,35 +21,64 @@ Panel {
   readonly property var transfers: status.transfers
   readonly property bool rootConfirmationOpen: pendingSyncRoot !== ""
   readonly property bool alerting: status.hasError
-  readonly property bool inactive: status.pausedByPanel || status.availability === "missing" || status.stale
-    || (snapshot && snapshot.phase === "backoff")
+  readonly property bool inactive: inactiveForState(status.display)
   readonly property color stateColor: alerting ? urgent : (inactive ? dim : foreground)
-  readonly property string stateTitle: titleForState()
-  readonly property string stateDetail: detailForState()
+  readonly property string stateTitle: titleForState(status.display)
+  readonly property string stateDetail: detailForState(status.display)
 
-  function titleForState() {
-    if (status.pausedByPanel) return "Sync paused"
-    if (status.availability === "missing") return "Service stopped"
-    if (status.availability === "malformed") return "Status unavailable"
-    if (status.stale) return "Service not updating"
-    if (!snapshot) return "Unavailable"
-    if (snapshot.phase === "error") return "Sync error"
-    if (snapshot.phase === "backoff") return "Waiting to retry"
-    if (snapshot.phase === "starting") return "Starting"
-    if (snapshot.phase === "syncing" && transfers.length > 0)
-      return "Syncing " + transfers.length + (transfers.length === 1 ? " file" : " files")
-    if (snapshot.phase === "syncing") return "Syncing"
-    return "Up to date"
+  function inactiveForState(display) {
+    switch (display) {
+    case "stopped":
+    case "paused":
+    case "missing":
+    case "stale":
+    case "backoff":
+      return true
+    case "malformed":
+    case "error":
+    case "starting":
+    case "syncing":
+    case "waiting":
+      return false
+    }
+    return false
   }
 
-  function detailForState() {
-    if (status.pausedByPanel) return "Select Resume to continue syncing."
-    if (status.availability === "missing") return "Omabox has not published a status snapshot."
-    if (status.availability === "malformed") return "Omabox published an unreadable status snapshot."
-    if (status.stale) return "Last update " + relativeTime(snapshot.updated_at) + "."
-    if (snapshot && snapshot.last_error) return String(snapshot.last_error)
-    if (snapshot && snapshot.phase === "backoff") return "Dropbox requested a short delay."
-    return ""
+  function titleForState(display) {
+    switch (display) {
+    case "stopped": return "Service stopped"
+    case "paused": return "Sync paused"
+    case "missing": return "Service stopped"
+    case "malformed": return "Status unavailable"
+    case "stale": return "Service not updating"
+    case "error": return "Sync error"
+    case "backoff": return "Waiting to retry"
+    case "starting": return "Starting"
+    case "syncing":
+      return transfers.length > 0
+        ? "Syncing " + transfers.length + (transfers.length === 1 ? " file" : " files")
+        : "Syncing"
+    case "waiting": return "Up to date"
+    }
+    return "Unavailable"
+  }
+
+  function detailForState(display) {
+    var lastError = snapshot && snapshot.last_error ? String(snapshot.last_error) : ""
+    switch (display) {
+    case "stopped": return String(snapshot.last_error)
+    case "paused": return "Select Resume to continue syncing."
+    case "missing": return "Omabox has not published a status snapshot."
+    case "malformed": return "Omabox published an unreadable status snapshot."
+    case "stale": return "Last update " + relativeTime(snapshot.updated_at) + "."
+    case "backoff": return lastError || "Dropbox requested a short delay."
+    case "error":
+    case "starting":
+    case "syncing":
+    case "waiting":
+      return lastError
+    }
+    return lastError
   }
 
   function formatBytes(bytes) {
@@ -213,7 +242,7 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: !status.pausedByPanel && root.snapshot && root.snapshot.phase === "syncing" ? "󰓦" : ""
+    text: status.display === "syncing" ? "󰓦" : ""
     foreground: root.stateColor
     tooltipText: root.stateTitle
     onPressed: root.toggle()

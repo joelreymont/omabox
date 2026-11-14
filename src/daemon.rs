@@ -427,14 +427,19 @@ impl<'status> RecoveryControl<'status> {
         wait: &mut impl FnMut(Duration),
     ) -> Result<(), DaemonError> {
         let policy = error.policy();
-        if let Some(status) = self.status {
-            status.error(policy.status);
-        }
         let (minimum, phase) = match policy.disposition {
             Disposition::Retry(minimum) => (minimum, Some(DaemonPhase::Backoff)),
             Disposition::Environmental => (Duration::ZERO, None),
-            Disposition::UserAction | Disposition::Invariant => return Err(error),
+            Disposition::UserAction | Disposition::Invariant => {
+                if let Some(status) = self.status {
+                    status.stopped(policy.status);
+                }
+                return Err(error);
+            }
         };
+        if let Some(status) = self.status {
+            status.error(policy.status);
+        }
         let delay = self.schedule.advance(minimum);
         let mut reason: &(dyn StdError + 'static) = &error;
         while let Some(source) = reason.source() {
@@ -1191,6 +1196,21 @@ mod tests {
         recovery.clean_sync_pass();
         assert_eq!(status_value(directory.path())?["last_error"], Value::Null);
         drop(held);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_control_publishes_stopped_before_a_fatal_exit() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let status = RuntimeStatus::new(directory.path())?;
+        let mut recovery = RecoveryControl::new(Some(&status));
+        assert!(matches!(
+            recovery.wait_for_failure(DaemonError::SetupRequired, &mut |_| {}),
+            Err(DaemonError::SetupRequired)
+        ));
+        let stopped = status_value(directory.path())?;
+        assert_eq!(stopped["phase"], "stopped");
+        assert_eq!(stopped["last_error"], SETUP);
         Ok(())
     }
 

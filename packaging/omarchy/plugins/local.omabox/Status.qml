@@ -40,7 +40,9 @@ Item {
     || settingsProcess.running || actionProcess.running
 
   readonly property bool ready: availability === "ready" && snapshot !== null
-  readonly property bool stale: ready && nowMs / 1000 - snapshot.updated_at > 75
+  readonly property bool stale: ready && snapshot.phase !== "stopped"
+    && nowMs / 1000 - snapshot.updated_at > 75
+  readonly property string display: displayState()
   readonly property bool hasError: availability === "malformed"
     || (snapshot && (snapshot.phase === "error" || snapshot.last_error !== null))
     || settingsError !== "" || actionError !== ""
@@ -64,6 +66,17 @@ Item {
     ? Math.max(0, Math.min(1, aggregateBytesDone / aggregateBytesTotal)) : 0
   readonly property real speedBytesPerSecond: transfers.length > 0 && speedMeasuredAtMs > 0
     && nowMs - speedMeasuredAtMs <= 5000 ? measuredSpeed : 0
+
+  // The one place that ranks what the widget shows. A fatally stopped service
+  // is not paused, so its reason outranks a pause made from the panel.
+  function displayState() {
+    if (ready && snapshot.phase === "stopped") return "stopped"
+    if (pausedByPanel) return "paused"
+    if (availability === "malformed") return "malformed"
+    if (!ready) return "missing"
+    if (stale) return "stale"
+    return snapshot.phase
+  }
 
   function elideOutput(output, fallback) {
     var value = String(output || fallback || "").replace(/\s+/g, " ").trim()
@@ -240,11 +253,13 @@ Item {
     try { value = JSON.parse(String(content || "")) }
     catch (error) { return null }
 
+    if (!value || Array.isArray(value) || [1, 2, 3].indexOf(value.version) < 0) return null
     var phases = ["starting", "syncing", "waiting", "backoff", "error"]
-    if (!value || Array.isArray(value) || [1, 2].indexOf(value.version) < 0
-        || phases.indexOf(value.phase) < 0
+    if (value.version === 3) phases.push("stopped")
+    if (phases.indexOf(value.phase) < 0
         || !isCount(value.updated_at) || value.updated_at === 0
-        || (value.last_error !== null && typeof value.last_error !== "string")) return null
+        || (value.last_error !== null && typeof value.last_error !== "string")
+        || (value.phase === "stopped" && typeof value.last_error !== "string")) return null
 
     var transfers
     if (value.version === 1) {
@@ -258,7 +273,7 @@ Item {
       }
     }
     return {
-      version: 2,
+      version: 3,
       phase: value.phase,
       transfers: transfers,
       last_error: value.last_error,
