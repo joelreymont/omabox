@@ -36,8 +36,8 @@ SUMTYPE reply
 ## The words
 
 ```forth
-\ One client per task. A file hash or path in an answer is
-\ borrowed from the client until its next call.
+\ One client per task, opened on a config (below). A file hash
+\ or path in an answer is borrowed until the next call.
 : OPEN   ( ptr config ptr ARENA:arena -- ptr client )
 : CLOSE  ( ptr client -- )
 
@@ -89,6 +89,23 @@ STRUCTURE upload
 ;STRUCTURE
 ```
 
+```forth
+\ What OPEN copies into the client.
+STRUCTURE config
+   FIELD key ...        \ the app key, Dropbox's client_id
+   FIELD token ...      \ the refresh token; empty until EXCHANGE
+   FIELD root ...       \ root namespace; empty means the account's home
+   FIELD api ...        \ origins, which tests point at the fake
+   FIELD content ...
+   FIELD notify ...
+;STRUCTURE
+: PRODUCTION ( ptr config -- )   \ sets the three origins to Dropbox's
+```
+
+- **`root`** goes in a `Dropbox-API-Path-Root` header,
+  `{".tag": "root", "root": "<id>"}`, on every call but the token calls. Every
+  path is then relative to that namespace, which the journal binds. An empty
+  root sends no header, which only linking needs before it knows the root.
 - **`DOWNLOAD`** fetches `rev:<rev>`, which is that exact revision, from
   `offset` with a Range header. It checks the answer's Content-Range and
   metadata, and hands each body chunk to the quotation. The caller writes and
