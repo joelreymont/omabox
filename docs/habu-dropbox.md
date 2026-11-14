@@ -66,7 +66,7 @@ SUMTYPE reply
 \ create_folder_v2; each answers the entry Dropbox reports
 : METADATA      ( ptr u8 n ptr client -- reply )
 : DOWNLOAD      ( ptr u8 n n ptr client [ ptr u8 n -- ] -- reply )  \ rev, offset, bytes
-: UPLOAD        ( ptr upload ptr client -- reply )
+: UPLOAD        ( ptr upload ptr client [ n -- ] -- reply )  \ bytes accepted
 : DELETE        ( ptr u8 n ptr u8 n ptr client -- reply )  \ path, rev
 : CREATE-FOLDER ( ptr u8 n ptr client -- reply )
 : ENTRY         ( ptr client -- ptr entry )
