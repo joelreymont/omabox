@@ -34,9 +34,10 @@ omabox service start
 Setup syncs `~/Dropbox`, creating it if missing; pass `--sync-root PATH` to sync
 another existing directory instead.
 
-Setup opens Dropbox authorization once and stores the refresh token in Secret
-Service, never in the configuration or SQLite journal. Installation writes only
-the two binaries, a systemd user unit, and the packaged Omarchy plugin.
+Setup prints a Dropbox authorization URL, asks for the code Dropbox shows once
+you approve, and stores the refresh token in Secret Service, never in the
+configuration or SQLite journal. Installation writes only the two binaries, a
+systemd user unit, and the packaged Omarchy plugin.
 
 Enable the widget if wanted:
 
@@ -102,4 +103,7 @@ run these tests at all: it rejects the plugin's versionless imports with
 `Library import requires a version` and exits before a single case runs.
 
 See [`formal/README.md`](formal/README.md) for TLC checks. Real Dropbox tests are
-opt-in and must use uncommitted test credentials. Omabox is MIT licensed.
+opt-in: `OMABOX_DROPBOX_APP_KEY=... cargo test --features dropbox-live --
+--ignored` runs them against a dedicated test account whose refresh token
+`omabox setup` stored. They must use uncommitted test credentials. Omabox is
+MIT licensed.
