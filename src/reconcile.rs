@@ -1899,7 +1899,8 @@ struct CaseVariantMove {
     destination: PathBuf,
 }
 
-/// Choose the spelling to rename in the first local case collision.
+/// Choose the spelling to rename in the first local case collision that has a
+/// renamable spelling.
 ///
 /// The rename moves only a regular file or a directory, so a spelling the scan
 /// published as unsupported (a symlink, a special file, a reserved name or an
