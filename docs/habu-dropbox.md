@@ -190,11 +190,20 @@ The sync code builds these from the words above:
 - **`json.f`:** a writer mode that escapes DEL and every non-ASCII character
   as `\uXXXX`. `Dropbox-API-Arg` is a header, and Dropbox requires those
   escapes in it.
+- **`net/curl.f`:** `RESET`, which sets a handle back to the options `INIT`
+  gives it, as `curl_easy_reset` does, and keeps its connections. A handle
+  keeps every option from one request to the next, and nothing clears its
+  headers, so without it a client's one handle would resend every earlier
+  request's headers, old tokens included.
 
-`net/curl.f` needs nothing new: `CURL:LOW-SPEED!` bounds the connect by the
-same seconds as a stalled body, so a call's deadlines are `TIMEOUT!` for the
-whole call and `LOW-SPEED!` for a stall. A long poll, whose body is silent
-until it answers, sets `LOW-SPEED!` to zero and only `TIMEOUT!`.
+A call's deadlines need nothing new: `CURL:LOW-SPEED!` bounds the connect by
+the same seconds as a stalled body, so a call has `TIMEOUT!` for the whole
+call and `LOW-SPEED!` for a stall. A long poll, whose body is silent until it
+answers, sets `LOW-SPEED!` to zero and only `TIMEOUT!`.
+
+A client reads every answer through curl's streaming words, so no buffer caps
+its size. A program that uses `DROPBOX` therefore starts the CURL loop first
+(`AIO:START CURL:LOOP-START`) and stops it last.
 
 ## How it is tested
 

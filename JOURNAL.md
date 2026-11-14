@@ -134,3 +134,35 @@ everything at once, because that is what the words say. The user's
 instinct, a vocabulary first and on its own, gave a smaller, checkable
 artifact that a person could approve in one reading. Everything downstream
 now has a fixed surface to aim at.
+
+## 2026-11-15: What the first two lanes hit
+
+Two workers started at once: the Dropbox client core in omabox, and the JSON
+writer mode in Habu. Both stopped within minutes, and neither for a bug in its
+own code.
+
+- **A curl handle remembers.** The core's worker stopped before writing a
+  line. Habu's `net/curl.f` adds request headers to a list kept on the handle,
+  and no word empties it. A client that reuses its handle, to keep its
+  connection to Dropbox, would resend every earlier request's headers,
+  including an expired bearer token beside the new one. Rust's `ureq` builds
+  each request from nothing, so the Rust code never met this. The fix goes into
+  Habu as `CURL:RESET`, libcurl's `curl_easy_reset`.
+- **A library that is not a library.** Habu's JSON package is compiled into
+  the `hb` engine, because Habu's own tools use it. Loading the workspace's
+  `json.f` silently loaded nothing, and the tests ran the engine's old copy.
+  The brief had said the opposite, from a check that looked in the wrong list.
+- **An engine that cannot build its own master.** This machine's installed
+  `hb` is 326 commits behind master. A script walked the history: it built
+  revision 31 and stopped at 32, a commit that moves a file the build itself
+  loads. Habu's bootstrap doc names that case: no revision can stage it, and
+  the host needs an engine built elsewhere.
+
+**Observed:** in the worker's own words, the curl handle was "harder than
+Rust", while curl's failure classes (`LOST?`, `UNAVAILABLE?`) were easier.
+
+Observation for the blog: in Rust the toolchain is someone else's problem.
+`cargo` is current, and a crate is a crate. With Habu, the agent works on the
+language's own build chain too. The first hours of an application rewrite
+went into the platform under it. That cost falls once per platform gap, and
+it lands in the platform, where the next application gets it free.
