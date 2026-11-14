@@ -650,16 +650,14 @@ would remove the adapters above; they are candidate upstream changes to
   in `ac273d7b`. [Measurements](performance.md) showed a 62% idle-pass reduction
   at 10k files and 47% at 50k files. These measurements justify the unchanged-scan
   shortcut; they do not establish changed-scan performance or a lock-free read.
-- `pending_plans` is one join and is loaded once per pass and passed through.
-- The scanner computes `CanonicalPath` once per entry and
-  `LocalObservationRecord` carries it, so `local_map` only sorts and the
-  per-pass fold disappears; every ordered `LocalHashRecord` collection uses
-  byte order.
-- `validate_account` runs once per session; `refresh_inventory` no longer
-  calls it. Agent reuse is a property of the transport (section J).
-- `require_active_local_root` runs once before planning and once before the
-  completion batch; effects go through the held root descriptor.
-- `ensure_remote_parents` runs only after a `path/not_found` rejection.
+- Scan records and hash-cache records are ordered by path bytes, as canonical
+  paths are.
+- `validate_account` runs every pass, so a token bound to another account or
+  root between passes is caught before any effect. Agent reuse is a property
+  of the transport (section J).
+- Every local effect of a pass goes through the root descriptor held since the
+  root was verified; `require_active_local_root` runs once before planning and
+  once before the completion batch, not once per planned path.
 
 ## L. Install, CLI, config
 
