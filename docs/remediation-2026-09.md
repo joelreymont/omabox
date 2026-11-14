@@ -549,10 +549,13 @@ variants that survive: `UnverifiedMutation`, `RetriedTransport`,
 `UploadedContentMismatch`, `DownloadedIdentityChanged`,
 `CursorDidNotAdvance`, `ResetDuringFreshListing`.
 
-Longpoll: after any response the daemon waits at least the ty### Durable upload sessions (J-resume, its own dot)
+Longpoll: after any response the daemon waits at least the typed `backoff`
+before the next longpoll (existing behavior, now typed).
+
+### Durable upload sessions (J-resume, its own dot)
 
 A large upload, one over a single 32 MiB chunk, runs as a named machine in
-`src/dropbox.rs` whose progress is durable, so an interrupted upload resumes
+`src/upload_session.rs` whose progress is durable, so an interrupted upload resumes
 instead of restarting. Its record (`upload_sessions`, schema v8), keyed by
 the pending operation, holds the session id, the confirmed offset, the total
 length and the content identity of the staged bytes. The operation row already
@@ -592,9 +595,6 @@ live file.
   upload, as for direct uploads.
 - `formal/UploadSession.tla` models crashes, lost append and finish answers,
   server-side session expiry and concurrent remote edits.
-
-dly; a
-finish that merely timed out never opens a replacement session.
 
 ### Auth
 
