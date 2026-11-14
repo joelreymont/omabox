@@ -516,10 +516,7 @@ enum CliError {
     Usage(&'static str),
 
     #[error("could not {operation}")]
-    #[diagnostic(
-        code(omabox::cli::config),
-        help("Check the Omabox configuration and retry.")
-    )]
+    #[diagnostic(forward(source))]
     Config {
         operation: &'static str,
         #[source]
@@ -731,6 +728,31 @@ mod tests {
         config.prepare()?;
         config.write()?;
         Ok((temporary, xdg, first, second))
+    }
+
+    #[test]
+    fn config_errors_show_their_own_help() -> Result<(), Box<dyn Error>> {
+        let (temporary, xdg, _first, _second) = fixture()?;
+        let file = temporary.path().join("file");
+        fs::write(&file, b"not a directory")?;
+        let services = ServiceCommands::scripts("/unused/systemctl", "/unused/journalctl");
+
+        let Err(error) = set_sync_root(&file, &xdg, &services) else {
+            return Err("a regular file became the sync root".into());
+        };
+
+        assert!(matches!(error, CliError::Config { .. }), "{error:?}");
+        let code = Diagnostic::code(&error).map(|code| code.to_string());
+        assert_eq!(
+            code.as_deref(),
+            Some("omabox::config::sync_root_not_directory")
+        );
+        let help = Diagnostic::help(&error).map(|help| help.to_string());
+        assert_eq!(
+            help.as_deref(),
+            Some("Set `sync_root` to an existing local directory.")
+        );
+        Ok(())
     }
 
     #[test]
