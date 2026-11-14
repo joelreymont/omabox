@@ -1,8 +1,10 @@
 # Omabox
 
-Native, ARM64-first Dropbox sync for Omarchy, written in nightly Rust against
-Dropbox's documented API and OAuth flow through pinned `dropbox-sdk` generated
-types and routes, with a local `ureq` transport adapter.
+Native, ARM64-first Dropbox sync for Omarchy against Dropbox's documented API
+and OAuth flow. The nightly Rust implementation (`src/`, `tests/`), built on
+pinned `dropbox-sdk` generated types and routes with a local `ureq` transport
+adapter, is being rewritten in Habu as a drop-in replacement; `JOURNAL.md`
+records the rewrite.
 
 ## Scope
 
@@ -25,7 +27,7 @@ types and routes, with a local `ureq` transport adapter.
 - Astra owns design, complex implementation, and integration. Delegate bounded
   implementation to Sol after interfaces and acceptance are clear; use a
   separate Astra reviewer before landing.
-- Follow `~/.agents/docs/rust.md`; repository rules may be stricter.
+- Follow `~/.agents/docs/rust.md` in Rust; repository rules may be stricter.
 - Use `jj`. Make one commit per feature or significant fix and include its dot
   closure in that commit.
 - Run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` before landing Rust changes.
