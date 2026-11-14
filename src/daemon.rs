@@ -22,7 +22,7 @@ use crate::config::{
 };
 use crate::dropbox::{AccountValidation, DropboxClient, DropboxError, DropboxRoot, LongPollWakeup};
 use crate::journal::{
-    DropboxBinding, Journal, JournalError, LocalRootActivation, LocalRootBinding,
+    DropboxBinding, Journal, JournalError, LocalRootActivation, LocalRootBinding, LocalRootRecord,
 };
 use crate::local::LocalError;
 use crate::reconcile::{ExactDownloadPool, ReconcileError, ReconcileOutcome, reconcile_once};
@@ -50,6 +50,7 @@ const CREDENTIAL_INVALID: &str = "Dropbox credentials need to be renewed.";
 const DROPBOX: &str = "Dropbox is temporarily unavailable.";
 const BINDING: &str = "The Dropbox account or sync root no longer matches setup.";
 const SYNC_ROOT: &str = "The configured sync folder is temporarily unavailable.";
+const ROOT_UNSUPPORTED: &str = "The sync folder's filesystem does not record creation times.";
 const SYNC_ERRORS: &str = "One or more files could not be synchronized.";
 const CURSOR: &str = "The Dropbox inventory cursor is temporarily unavailable.";
 const RUNNING: &str = "Another Omabox daemon is already running.";
@@ -350,8 +351,19 @@ fn run_session(
 }
 
 fn activate_configured_root(config: &Config, journal: &mut Journal) -> Result<(), DaemonError> {
-    let binding = LocalRootBinding::inspect(config.sync_root())
-        .map_err(|source| DaemonError::LocalRoot { source })?;
+    let binding = match LocalRootBinding::inspect(config.sync_root()) {
+        Ok(binding) => binding,
+        Err(source @ JournalError::NoBirthTime { .. }) => {
+            let recorded = journal
+                .local_root_binding()
+                .map_err(|source| DaemonError::Journal {
+                    operation: "read the recorded local root",
+                    source,
+                })?;
+            return Err(root_inspection_failure(source, recorded.as_ref()));
+        }
+        Err(source) => return Err(root_inspection_failure(source, None)),
+    };
     match journal
         .activate_local_root(&binding)
         .map_err(|source| DaemonError::Journal {
@@ -366,9 +378,20 @@ fn activate_configured_root(config: &Config, journal: &mut Journal) -> Result<()
             );
             Ok(())
         }
-        LocalRootActivation::Unavailable { recorded, actual } => {
-            Err(DaemonError::LocalRootUnavailable { recorded, actual })
-        }
+        LocalRootActivation::Unavailable { .. } => Err(DaemonError::LocalRootUnavailable),
+    }
+}
+
+/// A directory standing in for the recorded root (`LocalRootRecord::stood_in_by`)
+/// makes the root unavailable, not unsupported.
+fn root_inspection_failure(
+    source: JournalError,
+    recorded: Option<&LocalRootRecord>,
+) -> DaemonError {
+    if recorded.is_some_and(|record| record.stood_in_by(&source)) {
+        DaemonError::LocalRootUnavailable
+    } else {
+        DaemonError::LocalRoot { source }
     }
 }
 
@@ -565,15 +588,12 @@ pub enum DaemonError {
         code(omabox::daemon::local_root_unavailable),
         help("Restore the previous sync root, or select this directory again in Omabox settings.")
     )]
-    LocalRootUnavailable {
-        recorded: LocalRootBinding,
-        actual: LocalRootBinding,
-    },
+    LocalRootUnavailable,
     #[error("could not inspect the configured sync root")]
     #[diagnostic(
         code(omabox::daemon::local_root),
         help(
-            "Ensure the configured sync folder exists and is readable, or select another one in Omabox settings."
+            "Ensure the configured sync folder exists, is readable and is on a filesystem that records file creation times, or select another one in Omabox settings."
         )
     )]
     LocalRoot {
@@ -671,10 +691,8 @@ impl DaemonError {
             Self::Lock(source) => lock_policy(source),
             Self::Notify { .. } => FailurePolicy::new(Disposition::Environmental, READINESS),
             Self::Journal { source, .. } => journal_policy(source),
-            Self::LocalRootUnavailable { .. } => {
-                FailurePolicy::new(Disposition::Environmental, SYNC_ROOT)
-            }
-            Self::LocalRoot { .. } => FailurePolicy::new(Disposition::Environmental, SYNC_ROOT),
+            Self::LocalRootUnavailable => FailurePolicy::new(Disposition::Environmental, SYNC_ROOT),
+            Self::LocalRoot { source } => local_root_policy(source),
             Self::Auth { source, .. } => auth_policy(source),
             Self::CredentialsUnavailable { .. } => {
                 FailurePolicy::new(Disposition::Environmental, CREDENTIALS)
@@ -788,6 +806,20 @@ fn journal_policy(error: &JournalError) -> FailurePolicy {
         JournalError::UnsupportedVersion { .. } => {
             FailurePolicy::new(Disposition::UserAction, JOURNAL_INVALID)
         }
+        JournalError::NoBirthTime { .. } => {
+            FailurePolicy::new(Disposition::UserAction, ROOT_UNSUPPORTED)
+        }
+    }
+}
+
+fn local_root_policy(error: &JournalError) -> FailurePolicy {
+    match error {
+        JournalError::File { .. } => FailurePolicy::new(Disposition::Environmental, SYNC_ROOT),
+        JournalError::NoBirthTime { .. }
+        | JournalError::Sqlite { .. }
+        | JournalError::Json { .. }
+        | JournalError::InvalidState { .. }
+        | JournalError::UnsupportedVersion { .. } => journal_policy(error),
     }
 }
 
@@ -1012,6 +1044,7 @@ mod tests {
 
     use super::*;
     use crate::config::XdgDirectories;
+    use crate::journal::BirthTime;
 
     static SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1339,6 +1372,81 @@ mod tests {
         assert!(matches!(missing, DaemonError::LocalRoot { .. }));
         assert_eq!(missing.disposition(), Disposition::Environmental);
         assert_eq!(missing.public_status(), SYNC_ROOT);
+        Ok(())
+    }
+
+    #[test]
+    fn root_inspection_failure_is_unavailable_only_for_a_stand_in() {
+        let no_birth = || JournalError::NoBirthTime {
+            path: PathBuf::from("/sync/root"),
+            inode: 2,
+        };
+        let recorded = LocalRootRecord {
+            binding: LocalRootBinding {
+                canonical_path: PathBuf::from("/sync/root"),
+                inode: 2,
+                birth: Some(BirthTime {
+                    seconds: 1_700_000_000,
+                    nanoseconds: 5,
+                }),
+                subvolume: None,
+            },
+            generation: 1,
+        };
+        let legacy = LocalRootRecord {
+            binding: LocalRootBinding {
+                canonical_path: PathBuf::from("/sync/root"),
+                inode: 2,
+                birth: None,
+                subvolume: None,
+            },
+            generation: 1,
+        };
+
+        let unavailable = root_inspection_failure(no_birth(), Some(&recorded));
+        assert!(matches!(unavailable, DaemonError::LocalRootUnavailable));
+        assert_eq!(unavailable.disposition(), Disposition::Environmental);
+        assert_eq!(unavailable.public_status(), SYNC_ROOT);
+
+        let unsupported = root_inspection_failure(no_birth(), Some(&legacy));
+        assert!(matches!(
+            unsupported,
+            DaemonError::LocalRoot {
+                source: JournalError::NoBirthTime { .. }
+            }
+        ));
+        assert_eq!(unsupported.disposition(), Disposition::UserAction);
+        assert_eq!(unsupported.public_status(), ROOT_UNSUPPORTED);
+    }
+
+    #[test]
+    fn stand_in_without_birth_time_leaves_the_root_unavailable() -> Result<(), Box<dyn Error>> {
+        let stand_in = Path::new("/sys/kernel");
+        assert!(matches!(
+            LocalRootBinding::inspect(stand_in),
+            Err(JournalError::NoBirthTime { .. })
+        ));
+        let directory = TempDir::new()?;
+        let xdg = XdgDirectories::new(
+            directory.path().join("config"),
+            directory.path().join("state"),
+        )?;
+        let config = Config::from_values(&xdg, stand_in, "test-app-key")?;
+        let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+        journal.activate_local_root(&LocalRootBinding {
+            canonical_path: stand_in.to_path_buf(),
+            inode: 1,
+            birth: Some(BirthTime {
+                seconds: 1_700_000_000,
+                nanoseconds: 5,
+            }),
+            subvolume: None,
+        })?;
+
+        assert!(matches!(
+            activate_configured_root(&config, &mut journal),
+            Err(DaemonError::LocalRootUnavailable)
+        ));
         Ok(())
     }
 

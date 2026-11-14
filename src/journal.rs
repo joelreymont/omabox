@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -22,7 +22,8 @@ const MIGRATION_V3: &str = include_str!("../migrations/0003.sql");
 const MIGRATION_V4: &str = include_str!("../migrations/0004.sql");
 const MIGRATION_V5: &str = include_str!("../migrations/0005.sql");
 const MIGRATION_V6: &str = include_str!("../migrations/0006.sql");
-const SCHEMA_VERSION: i64 = 6;
+const MIGRATION_V7: &str = include_str!("../migrations/0007.sql");
+const SCHEMA_VERSION: i64 = 7;
 const BUSY_TIMEOUT_MILLISECONDS: u64 = 5_000;
 const FINISH_PLAN: &str = "UPDATE plans \
     SET status = 'completed', blocked_json = NULL, retry_at = NULL WHERE id = ?1";
@@ -98,6 +99,14 @@ pub enum JournalError {
         /// Version this binary understands.
         supported: i64,
     },
+    /// The sync root's filesystem does not record creation times, so the root's identity cannot be kept.
+    #[error("sync root `{path}` is on a filesystem that does not record creation times")]
+    NoBirthTime {
+        /// Canonical sync root path.
+        path: PathBuf,
+        /// Inode statx reported for the refused directory.
+        inode: u64,
+    },
 }
 
 impl JournalError {
@@ -139,6 +148,10 @@ impl JournalError {
                 found,
                 supported,
             },
+            Self::NoBirthTime { inode, .. } => Self::NoBirthTime {
+                path: PathBuf::from("[Omabox sync root]"),
+                inode,
+            },
         }
     }
 }
@@ -153,9 +166,10 @@ pub struct LocalObservationRecord {
 }
 
 /// Filesystem metadata that identifies the exact bytes hashed during a local scan.
+///
+/// Unknown fields are ignored so rows from earlier versions, which stored a `device`, still decode.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct LocalFileFingerprint {
-    pub(crate) device: u64,
     pub(crate) inode: u64,
     pub(crate) size: u64,
     pub(crate) modified_seconds: i64,
@@ -242,39 +256,105 @@ pub enum DropboxBindingWrite {
 }
 
 /// Filesystem identity of the configured local synchronization root.
+///
+/// The device number is not part of the identity: btrfs assigns each subvolume
+/// a new anonymous device number at every mount, so the same directory reports
+/// a different one after a reboot. Inode, birth time and subvolume live on disk.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalRootBinding {
     /// Canonical absolute path selected by the user.
     pub canonical_path: PathBuf,
-    /// Device identity returned by the local filesystem.
-    pub device: u64,
     /// Inode identity returned by the local filesystem.
     pub inode: u64,
+    /// Creation time of the root directory. `None` only for a binding recorded
+    /// by a schema-6 journal, before birth times were kept.
+    pub birth: Option<BirthTime>,
+    /// The filesystem's subvolume ID when statx reports one (btrfs, bcachefs),
+    /// else `None`.
+    pub subvolume: Option<u64>,
 }
+
+/// Creation time of a filesystem object, as statx reports it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BirthTime {
+    /// Seconds since the Unix epoch.
+    pub seconds: i64,
+    /// Nanoseconds within the second, below one billion.
+    pub nanoseconds: u32,
+}
+
+/// `STATX_SUBVOL` from include/uapi/linux/stat.h (since Linux 6.10), which
+/// rustix 1.1.4's `StatxFlags` does not name.
+const STATX_SUBVOL: rustix::fs::StatxFlags = rustix::fs::StatxFlags::from_bits_retain(0x8000);
+
+/// Fields every root identity statx asks the kernel for.
+pub(crate) const ROOT_IDENTITY_STATX: rustix::fs::StatxFlags = rustix::fs::StatxFlags::INO
+    .union(rustix::fs::StatxFlags::BTIME)
+    .union(STATX_SUBVOL);
 
 impl LocalRootBinding {
     /// Inspect one canonical local root path and capture its filesystem identity.
     pub fn inspect(canonical_path: impl AsRef<Path>) -> Result<Self, JournalError> {
         let canonical_path = canonical_path.as_ref().to_path_buf();
-        let metadata = std::fs::metadata(&canonical_path).map_err(|source| JournalError::File {
+        let failure = |source| JournalError::File {
             operation: "inspect local root",
             path: canonical_path.clone(),
             source,
-        })?;
-        if !metadata.is_dir() {
-            return Err(JournalError::File {
-                operation: "inspect local root",
+        };
+        let statx = rustix::fs::statx(
+            rustix::fs::CWD,
+            &canonical_path,
+            rustix::fs::AtFlags::empty(),
+            ROOT_IDENTITY_STATX.union(rustix::fs::StatxFlags::TYPE),
+        )
+        .map_err(|errno| failure(std::io::Error::from(errno)))?;
+        let mode = rustix::fs::RawMode::from(statx.stx_mode);
+        if rustix::fs::FileType::from_raw_mode(mode) != rustix::fs::FileType::Directory {
+            return Err(failure(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "configured local root is not a directory",
+            )));
+        }
+        Self::from_statx(canonical_path.clone(), &statx)
+    }
+
+    /// Capture the identity of the root that `statx` describes.
+    pub(crate) fn from_statx(
+        canonical_path: PathBuf,
+        statx: &rustix::fs::Statx,
+    ) -> Result<Self, JournalError> {
+        Self::from_statx_fields(
+            canonical_path,
+            rustix::fs::StatxFlags::from_bits_retain(statx.stx_mask),
+            statx.stx_ino,
+            BirthTime {
+                seconds: statx.stx_btime.tv_sec,
+                nanoseconds: statx.stx_btime.tv_nsec,
+            },
+            statx.stx_subvol,
+        )
+    }
+
+    /// Build an identity from the mask statx returned and its raw fields;
+    /// `Statx` is non-exhaustive, so tests reach the decision through here.
+    fn from_statx_fields(
+        canonical_path: PathBuf,
+        mask: rustix::fs::StatxFlags,
+        inode: u64,
+        birth: BirthTime,
+        subvolume: u64,
+    ) -> Result<Self, JournalError> {
+        if !mask.contains(rustix::fs::StatxFlags::BTIME) {
+            return Err(JournalError::NoBirthTime {
                 path: canonical_path,
-                source: std::io::Error::new(
-                    std::io::ErrorKind::NotADirectory,
-                    "configured local root is not a directory",
-                ),
+                inode,
             });
         }
         Ok(Self {
             canonical_path,
-            device: metadata.dev(),
-            inode: metadata.ino(),
+            inode,
+            birth: Some(birth),
+            subvolume: mask.contains(STATX_SUBVOL).then_some(subvolume),
         })
     }
 }
@@ -286,6 +366,20 @@ pub struct LocalRootRecord {
     pub binding: LocalRootBinding,
     /// Monotonically increasing root generation.
     pub generation: u64,
+}
+
+impl LocalRootRecord {
+    /// Whether a refusal for missing birth times means another directory stands at
+    /// this root's path, such as the mount point under an absent mount: the
+    /// recorded root had a birth time, or, recorded before schema 7, another inode.
+    pub(crate) fn stood_in_by(&self, error: &JournalError) -> bool {
+        matches!(
+            error,
+            JournalError::NoBirthTime { path, inode }
+                if *path == self.binding.canonical_path
+                    && (self.binding.birth.is_some() || self.binding.inode != *inode)
+        )
+    }
 }
 
 /// Result of activating a configured local root.
@@ -672,6 +766,15 @@ impl Journal {
             if version < 6 {
                 migrate_blocked_plans(&transaction, &path)?;
             }
+            if version < 7 {
+                transaction
+                    .execute_batch(MIGRATION_V7)
+                    .map_err(|source| JournalError::Sqlite {
+                        operation: "apply journal version-seven migration",
+                        path: path.clone(),
+                        source,
+                    })?;
+            }
             transaction
                 .commit()
                 .map_err(|source| JournalError::Sqlite {
@@ -812,7 +915,7 @@ impl Journal {
         if self.schema_version < 2 {
             return Ok(None);
         }
-        read_local_root(&self.connection, &self.database_path)
+        read_local_root(&self.connection, &self.database_path, self.schema_version)
     }
 
     /// Activate a local root without carrying another root's deletion history into it.
@@ -821,7 +924,7 @@ impl Journal {
         binding: &LocalRootBinding,
     ) -> Result<LocalRootActivation, JournalError> {
         let database_path = self.database_path.clone();
-        let existing = read_local_root(&self.connection, &database_path)?;
+        let existing = read_local_root(&self.connection, &database_path, self.schema_version)?;
         if let Some(outcome) = local_root_activation_without_write(existing.as_ref(), binding) {
             return Ok(outcome);
         }
@@ -829,16 +932,20 @@ impl Journal {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite("begin local root activation", &database_path, source))?;
-        let existing = read_local_root(&transaction, &database_path)?;
+        let existing = read_local_root(&transaction, &database_path, self.schema_version)?;
         if let Some(outcome) = local_root_activation_without_write(existing.as_ref(), binding) {
             return Ok(outcome);
         }
-        let record =
-            activate_new_local_root(&transaction, existing.as_ref(), binding, &database_path)?;
+        let outcome = activate_or_upgrade_local_root(
+            &transaction,
+            existing.as_ref(),
+            binding,
+            &database_path,
+        )?;
         transaction
             .commit()
             .map_err(|source| sqlite("commit local root activation", &database_path, source))?;
-        Ok(LocalRootActivation::Activated(record))
+        Ok(outcome)
     }
 
     /// Explicitly adopt a selected root, including a replacement at the same path.
@@ -847,7 +954,7 @@ impl Journal {
         binding: &LocalRootBinding,
     ) -> Result<LocalRootActivation, JournalError> {
         let database_path = self.database_path.clone();
-        let existing = read_local_root(&self.connection, &database_path)?;
+        let existing = read_local_root(&self.connection, &database_path, self.schema_version)?;
         if let Some(record) = &existing
             && record.binding == *binding
         {
@@ -857,18 +964,22 @@ impl Journal {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite("begin local root adoption", &database_path, source))?;
-        let existing = read_local_root(&transaction, &database_path)?;
+        let existing = read_local_root(&transaction, &database_path, self.schema_version)?;
         if let Some(record) = &existing
             && record.binding == *binding
         {
             return Ok(LocalRootActivation::Current(record.clone()));
         }
-        let record =
-            activate_new_local_root(&transaction, existing.as_ref(), binding, &database_path)?;
+        let outcome = activate_or_upgrade_local_root(
+            &transaction,
+            existing.as_ref(),
+            binding,
+            &database_path,
+        )?;
         transaction
             .commit()
             .map_err(|source| sqlite("commit local root adoption", &database_path, source))?;
-        Ok(LocalRootActivation::Activated(record))
+        Ok(outcome)
     }
 
     /// Publish a complete local inventory as one replacement transaction.
@@ -932,7 +1043,8 @@ impl Journal {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite("begin local scan publication", &database_path, source))?;
-        let Some(active) = read_local_root(&transaction, &database_path)? else {
+        let Some(active) = read_local_root(&transaction, &database_path, self.schema_version)?
+        else {
             return Ok(false);
         };
         if active.binding != *binding {
@@ -2808,6 +2920,38 @@ fn activate_new_local_root(
     Ok(record)
 }
 
+/// Write the identity of a schema-6 root that `binding` inspected again, keeping
+/// its generation and every piece of root-local state; otherwise start a new
+/// generation.
+fn activate_or_upgrade_local_root(
+    connection: &Connection,
+    existing: Option<&LocalRootRecord>,
+    binding: &LocalRootBinding,
+    database_path: &Path,
+) -> Result<LocalRootActivation, JournalError> {
+    if let Some(record) = existing
+        && upgrades_legacy_root(&record.binding, binding)
+    {
+        let upgraded = LocalRootRecord {
+            binding: binding.clone(),
+            generation: record.generation,
+        };
+        write_local_root(connection, &upgraded, database_path)?;
+        return Ok(LocalRootActivation::Current(upgraded));
+    }
+    activate_new_local_root(connection, existing, binding, database_path)
+        .map(LocalRootActivation::Activated)
+}
+
+/// A binding recorded before schema 7 kept only the path, the inode and a
+/// device number, which btrfs reassigns at every mount, so path and inode are
+/// all that can tie it to the directory inspected now.
+fn upgrades_legacy_root(recorded: &LocalRootBinding, actual: &LocalRootBinding) -> bool {
+    recorded.birth.is_none()
+        && recorded.canonical_path == actual.canonical_path
+        && recorded.inode == actual.inode
+}
+
 fn local_root_activation_without_write(
     existing: Option<&LocalRootRecord>,
     binding: &LocalRootBinding,
@@ -2815,6 +2959,8 @@ fn local_root_activation_without_write(
     let record = existing?;
     if record.binding == *binding {
         Some(LocalRootActivation::Current(record.clone()))
+    } else if upgrades_legacy_root(&record.binding, binding) {
+        None
     } else if record.binding.canonical_path == binding.canonical_path {
         Some(LocalRootActivation::Unavailable {
             recorded: record.binding.clone(),
@@ -2835,22 +2981,32 @@ fn write_local_root(
         path: database_path.to_path_buf(),
         detail: "local root generation exceeds SQLite integer range",
     })?;
-    let device = record.binding.device.to_be_bytes();
     let inode = record.binding.inode.to_be_bytes();
+    let birth_seconds = record.binding.birth.map(|birth| birth.seconds);
+    let birth_nanoseconds = record
+        .binding
+        .birth
+        .map(|birth| i64::from(birth.nanoseconds));
+    let subvolume = record.binding.subvolume.map(u64::to_be_bytes);
     connection
         .execute(
             "INSERT INTO local_root_binding( \
-                 singleton, canonical_path, device, inode, generation \
-             ) VALUES (1, ?1, ?2, ?3, ?4) \
+                 singleton, canonical_path, inode, birth_seconds, birth_nanoseconds, \
+                 subvolume, generation \
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6) \
              ON CONFLICT(singleton) DO UPDATE SET \
                  canonical_path = excluded.canonical_path, \
-                 device = excluded.device, \
                  inode = excluded.inode, \
+                 birth_seconds = excluded.birth_seconds, \
+                 birth_nanoseconds = excluded.birth_nanoseconds, \
+                 subvolume = excluded.subvolume, \
                  generation = excluded.generation",
             params![
                 path_bytes(&record.binding.canonical_path),
-                device.as_slice(),
                 inode.as_slice(),
+                birth_seconds,
+                birth_nanoseconds,
+                subvolume.as_ref().map(<[u8; 8]>::as_slice),
                 generation
             ],
         )
@@ -2861,38 +3017,74 @@ fn write_local_root(
 fn read_local_root(
     connection: &Connection,
     database_path: &Path,
+    schema_version: i64,
 ) -> Result<Option<LocalRootRecord>, JournalError> {
+    // A read-only journal below version seven still holds the device column and
+    // no birth time, so its binding reads exactly as the migration copies it.
+    let query = if schema_version < 7 {
+        "SELECT canonical_path, inode, NULL, NULL, NULL, generation \
+         FROM local_root_binding WHERE singleton = 1"
+    } else {
+        "SELECT canonical_path, inode, birth_seconds, birth_nanoseconds, subvolume, generation \
+         FROM local_root_binding WHERE singleton = 1"
+    };
     connection
-        .query_row(
-            "SELECT canonical_path, device, inode, generation \
-             FROM local_root_binding WHERE singleton = 1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            },
-        )
+        .query_row(query, [], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<Vec<u8>>>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
         .optional()
         .map_err(|source| sqlite("read local root binding", database_path, source))?
-        .map(|(raw_path, raw_device, raw_inode, generation)| {
-            let canonical_path = bytes_path(raw_path);
-            Ok(LocalRootRecord {
-                binding: LocalRootBinding {
-                    device: decode_u64(&raw_device, "read local root device", &canonical_path)?,
-                    inode: decode_u64(&raw_inode, "read local root inode", &canonical_path)?,
-                    canonical_path,
-                },
-                generation: u64::try_from(generation).map_err(|_| JournalError::InvalidState {
-                    operation: "read local root generation",
-                    path: database_path.to_path_buf(),
-                    detail: "local root generation is outside the supported range",
-                })?,
-            })
-        })
+        .map(
+            |(raw_path, raw_inode, birth_seconds, birth_nanoseconds, raw_subvolume, generation)| {
+                let canonical_path = bytes_path(raw_path);
+                let birth = match (birth_seconds, birth_nanoseconds) {
+                    (Some(seconds), Some(nanoseconds)) => Some(BirthTime {
+                        seconds,
+                        nanoseconds: u32::try_from(nanoseconds)
+                            .ok()
+                            .filter(|nanoseconds| *nanoseconds < 1_000_000_000)
+                            .ok_or_else(|| JournalError::InvalidState {
+                                operation: "read local root birth time",
+                                path: canonical_path.clone(),
+                                detail: "local root birth nanoseconds are out of range",
+                            })?,
+                    }),
+                    (None, None) => None,
+                    _ => {
+                        return Err(JournalError::InvalidState {
+                            operation: "read local root birth time",
+                            path: canonical_path,
+                            detail: "local root birth time is only partly recorded",
+                        });
+                    }
+                };
+                let subvolume = raw_subvolume
+                    .map(|raw| decode_u64(&raw, "read local root subvolume", &canonical_path))
+                    .transpose()?;
+                Ok(LocalRootRecord {
+                    binding: LocalRootBinding {
+                        inode: decode_u64(&raw_inode, "read local root inode", &canonical_path)?,
+                        birth,
+                        subvolume,
+                        canonical_path,
+                    },
+                    generation: u64::try_from(generation).map_err(|_| {
+                        JournalError::InvalidState {
+                            operation: "read local root generation",
+                            path: database_path.to_path_buf(),
+                            detail: "local root generation is outside the supported range",
+                        }
+                    })?,
+                })
+            },
+        )
         .transpose()
 }
 
@@ -3374,11 +3566,15 @@ mod tests {
         }
     }
 
-    fn local_root(path: impl Into<PathBuf>, device: u64, inode: u64) -> LocalRootBinding {
+    fn local_root(path: impl Into<PathBuf>, inode: u64) -> LocalRootBinding {
         LocalRootBinding {
             canonical_path: path.into(),
-            device,
             inode,
+            birth: Some(BirthTime {
+                seconds: 1_700_000_000,
+                nanoseconds: 5,
+            }),
+            subvolume: Some(256),
         }
     }
 
@@ -3386,7 +3582,6 @@ mod tests {
         LocalHashRecord {
             path: path.into(),
             fingerprint: LocalFileFingerprint {
-                device: marker,
                 inode: marker + 1,
                 size: marker + 2,
                 modified_seconds: 1,
@@ -3433,6 +3628,42 @@ mod tests {
         migrate_canonical_paths(&connection, database_path)?;
         connection.execute_batch(MIGRATION_V5)?;
         Ok(connection)
+    }
+
+    /// Build a version-six database holding a root binding, with the device
+    /// number that version kept, and one baseline.
+    fn version_six_with_root(
+        database_path: &Path,
+        root: &str,
+        inode: u64,
+        baseline_path: &Path,
+        baseline: &Baseline,
+    ) -> Result<(), Box<dyn Error>> {
+        let connection = version_five(database_path)?;
+        migrate_blocked_plans(&connection, database_path)?;
+        connection.execute(
+            "INSERT INTO local_root_binding(singleton, canonical_path, device, inode, generation) \
+             VALUES (1, ?1, ?2, ?3, 3)",
+            params![
+                path_bytes(Path::new(root)),
+                44_u64.to_be_bytes().as_slice(),
+                inode.to_be_bytes().as_slice()
+            ],
+        )?;
+        connection.execute(
+            "INSERT INTO baselines(path, baseline_json, canonical_path) VALUES (?1, ?2, ?3)",
+            params![
+                path_bytes(baseline_path),
+                encode(baseline, "test", baseline_path)?,
+                CanonicalPath::from_display(baseline_path).as_bytes()
+            ],
+        )?;
+        let version =
+            connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+        if version != 6 {
+            return Err(format!("test journal reached version {version}, not 6").into());
+        }
+        Ok(())
     }
 
     fn operations(decision: Decision) -> Result<OperationPlan, JournalError> {
@@ -3653,16 +3884,262 @@ mod tests {
     fn local_root_inspection_uses_directory_filesystem_identity() -> Result<(), Box<dyn Error>> {
         let directory = TempDir::new()?;
         let binding = LocalRootBinding::inspect(directory.path())?;
-        let metadata = fs::metadata(directory.path())?;
+        let statx = rustix::fs::statx(
+            rustix::fs::CWD,
+            directory.path(),
+            rustix::fs::AtFlags::empty(),
+            ROOT_IDENTITY_STATX,
+        )?;
+        let mask = rustix::fs::StatxFlags::from_bits_retain(statx.stx_mask);
 
         assert_eq!(binding.canonical_path, directory.path());
-        assert_eq!(binding.device, metadata.dev());
-        assert_eq!(binding.inode, metadata.ino());
+        assert_eq!(binding.inode, statx.stx_ino);
+        assert_eq!(
+            binding.birth,
+            Some(BirthTime {
+                seconds: statx.stx_btime.tv_sec,
+                nanoseconds: statx.stx_btime.tv_nsec,
+            })
+        );
+        assert_eq!(
+            binding.subvolume,
+            mask.contains(STATX_SUBVOL).then_some(statx.stx_subvol)
+        );
 
         let file = directory.path().join("not-a-root");
         fs::write(&file, b"file")?;
         let rejected = LocalRootBinding::inspect(file);
         assert!(matches!(rejected, Err(JournalError::File { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn root_identity_requires_a_recorded_birth_time() -> Result<(), Box<dyn Error>> {
+        let birth = BirthTime {
+            seconds: 1_700_000_000,
+            nanoseconds: 5,
+        };
+        let Err(error) = LocalRootBinding::from_statx_fields(
+            PathBuf::from("/sync"),
+            rustix::fs::StatxFlags::INO | STATX_SUBVOL,
+            2,
+            birth,
+            256,
+        ) else {
+            return Err("a root without a birth time was accepted".into());
+        };
+        assert!(
+            matches!(&error, JournalError::NoBirthTime { path, .. } if path == Path::new("/sync"))
+        );
+
+        let without_subvolume = LocalRootBinding::from_statx_fields(
+            PathBuf::from("/sync"),
+            rustix::fs::StatxFlags::INO | rustix::fs::StatxFlags::BTIME,
+            2,
+            birth,
+            256,
+        )?;
+        assert_eq!(without_subvolume.subvolume, None);
+        Ok(())
+    }
+
+    #[test]
+    fn stand_in_needs_the_root_path_and_a_birth_time_or_another_inode() {
+        let refusal = |path: &str, inode| JournalError::NoBirthTime {
+            path: PathBuf::from(path),
+            inode,
+        };
+        let record = |path: &str, birth| LocalRootRecord {
+            binding: LocalRootBinding {
+                canonical_path: PathBuf::from(path),
+                inode: 2,
+                birth,
+                subvolume: None,
+            },
+            generation: 1,
+        };
+        let birth = Some(BirthTime {
+            seconds: 1_700_000_000,
+            nanoseconds: 5,
+        });
+
+        let born = record("/sync/root", birth);
+        assert!(born.stood_in_by(&refusal("/sync/root", 2)));
+        assert!(born.stood_in_by(&refusal("/sync/root", 9)));
+
+        let legacy = record("/sync/root", None);
+        assert!(legacy.stood_in_by(&refusal("/sync/root", 9)));
+        assert!(!legacy.stood_in_by(&refusal("/sync/root", 2)));
+
+        let elsewhere = record("/sync/other", birth);
+        assert!(!elsewhere.stood_in_by(&refusal("/sync/root", 9)));
+
+        let file = JournalError::File {
+            operation: "open the journal",
+            path: PathBuf::from("/sync/root"),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        };
+        assert!(!born.stood_in_by(&file));
+    }
+
+    #[test]
+    fn version_six_root_binding_upgrades_in_place_when_path_and_inode_match()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+        let baseline_path = Path::new("kept.txt");
+        let baseline = Baseline::Present(remote_file("kept", "rev-kept"));
+        version_six_with_root(&database_path, "/sync/root", 2, baseline_path, &baseline)?;
+        let legacy = LocalRootRecord {
+            binding: LocalRootBinding {
+                canonical_path: PathBuf::from("/sync/root"),
+                inode: 2,
+                birth: None,
+                subvolume: None,
+            },
+            generation: 3,
+        };
+
+        let read_only = Journal::open_read_only(&database_path)?;
+        assert_eq!(read_only.local_root_binding()?, Some(legacy.clone()));
+        drop(read_only);
+
+        let mut journal = Journal::open(&database_path)?;
+        assert_eq!(journal.schema_version, 7);
+        assert_eq!(
+            journal
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
+            7
+        );
+        assert_eq!(journal.local_root_binding()?, Some(legacy.clone()));
+        let observation = LocalObservationRecord {
+            path: PathBuf::from("observed.txt"),
+            observation: Observation::Present(LocalFile::new(content("observed"))),
+        };
+        let hash = local_hash("observed.txt", 10);
+        assert!(journal.publish_local_scan(
+            &legacy.binding,
+            std::slice::from_ref(&observation),
+            std::slice::from_ref(&hash),
+        )?);
+        let conflict = Conflict::DivergentEdits {
+            local: LocalFile::new(content("local-conflict")),
+            remote: remote_file("remote-conflict", "rev-conflict"),
+        };
+        let conflict = journal.record_conflict(Path::new("conflict.txt"), &conflict)?;
+
+        let inspected = local_root("/sync/root", 2);
+        let upgraded = LocalRootRecord {
+            binding: inspected.clone(),
+            generation: 3,
+        };
+        let changes_before = journal.connection.total_changes();
+        assert_eq!(
+            journal.activate_local_root(&inspected)?,
+            LocalRootActivation::Current(upgraded.clone())
+        );
+        assert_eq!(journal.connection.total_changes() - changes_before, 1);
+        assert_eq!(journal.baseline(baseline_path)?, Some(baseline));
+        assert_eq!(journal.local_inventory()?, vec![observation]);
+        assert_eq!(journal.local_hash_cache()?, vec![hash]);
+        assert_eq!(journal.conflicts()?, vec![conflict]);
+        assert_eq!(journal.local_root_binding()?, Some(upgraded.clone()));
+        assert_eq!(
+            journal.activate_local_root(&inspected)?,
+            LocalRootActivation::Current(upgraded)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn version_six_root_binding_with_another_inode_is_unavailable_without_changes()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+        let baseline_path = Path::new("kept.txt");
+        let baseline = Baseline::Present(remote_file("kept", "rev-kept"));
+        version_six_with_root(&database_path, "/sync/root", 2, baseline_path, &baseline)?;
+        let mut journal = Journal::open(&database_path)?;
+
+        let root_before = journal.local_root_binding()?;
+        let baselines_before = journal.baseline_paths()?;
+        let changes_before = journal.connection.total_changes();
+        let Some(recorded) = root_before.clone() else {
+            return Err("the migrated journal lost its root binding".into());
+        };
+        let actual = local_root("/sync/root", 9);
+        assert_eq!(
+            journal.activate_local_root(&actual)?,
+            LocalRootActivation::Unavailable {
+                recorded: recorded.binding,
+                actual,
+            }
+        );
+        assert_eq!(journal.local_root_binding()?, root_before);
+        assert_eq!(journal.baseline_paths()?, baselines_before);
+        assert_eq!(journal.baseline(baseline_path)?, Some(baseline));
+        assert_eq!(journal.connection.total_changes(), changes_before);
+        Ok(())
+    }
+
+    #[test]
+    fn same_path_and_inode_with_another_birth_or_subvolume_is_unavailable_without_changes()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let mut journal = Journal::open(journal_path(&directory))?;
+        let recorded = local_root("/sync/root", 2);
+        let _ = journal.activate_local_root(&recorded)?;
+
+        let another_birth = LocalRootBinding {
+            birth: Some(BirthTime {
+                seconds: 1_700_000_001,
+                nanoseconds: 5,
+            }),
+            ..recorded.clone()
+        };
+        let another_subvolume = LocalRootBinding {
+            subvolume: Some(257),
+            ..recorded.clone()
+        };
+        let no_subvolume = LocalRootBinding {
+            subvolume: None,
+            ..recorded.clone()
+        };
+        for actual in [another_birth, another_subvolume, no_subvolume] {
+            let changes_before = journal.connection.total_changes();
+            assert_eq!(
+                journal.activate_local_root(&actual)?,
+                LocalRootActivation::Unavailable {
+                    recorded: recorded.clone(),
+                    actual,
+                }
+            );
+            assert_eq!(journal.connection.total_changes(), changes_before);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn adopting_a_matching_version_six_root_keeps_its_generation() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let database_path = journal_path(&directory);
+        let baseline_path = Path::new("kept.txt");
+        let baseline = Baseline::Present(remote_file("kept", "rev-kept"));
+        version_six_with_root(&database_path, "/sync/root", 2, baseline_path, &baseline)?;
+        let mut journal = Journal::open(&database_path)?;
+
+        let inspected = local_root("/sync/root", 2);
+        let upgraded = LocalRootRecord {
+            binding: inspected.clone(),
+            generation: 3,
+        };
+        assert_eq!(
+            journal.adopt_local_root(&inspected)?,
+            LocalRootActivation::Current(upgraded.clone())
+        );
+        assert_eq!(journal.local_root_binding()?, Some(upgraded));
+        assert_eq!(journal.baseline(baseline_path)?, Some(baseline));
         Ok(())
     }
 
@@ -3775,7 +4252,7 @@ mod tests {
     fn local_root_generation_resets_only_root_local_state() -> Result<(), Box<dyn Error>> {
         let directory = TempDir::new()?;
         let mut journal = Journal::open(journal_path(&directory))?;
-        let first = local_root("/sync/first", 1, 2);
+        let first = local_root("/sync/first", 2);
         let first_record = LocalRootRecord {
             binding: first.clone(),
             generation: 1,
@@ -3818,7 +4295,7 @@ mod tests {
         );
         assert_eq!(journal.baseline(path)?, Some(Baseline::Present(agreed)));
 
-        let replacement = local_root("/sync/second", 3, 4);
+        let replacement = local_root("/sync/second", 4);
         let replacement_record = LocalRootRecord {
             binding: replacement.clone(),
             generation: 2,
@@ -3847,7 +4324,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let directory = TempDir::new()?;
         let mut journal = Journal::open(journal_path(&directory))?;
-        let current = local_root("/sync/current", 1, 2);
+        let current = local_root("/sync/current", 2);
         assert!(matches!(
             journal.activate_local_root(&current)?,
             LocalRootActivation::Activated(_)
@@ -3881,7 +4358,7 @@ mod tests {
             PlanBlock::Blocked
         );
 
-        let replacement = local_root("/sync/replacement", 3, 4);
+        let replacement = local_root("/sync/replacement", 4);
         assert_eq!(
             journal.activate_local_root(&replacement)?,
             LocalRootActivation::Activated(LocalRootRecord {
@@ -3921,7 +4398,7 @@ mod tests {
     {
         let directory = TempDir::new()?;
         let mut journal = Journal::open(journal_path(&directory))?;
-        let _ = journal.activate_local_root(&local_root("/sync/old", 1, 2))?;
+        let _ = journal.activate_local_root(&local_root("/sync/old", 2))?;
         let path = Path::new("remote-only.txt");
         let remote = remote_file("remote", "rev-remote");
         let agreed = noop(plan(
@@ -3932,7 +4409,7 @@ mod tests {
         ))?;
         journal.record_noop(path, &agreed)?;
 
-        let _ = journal.activate_local_root(&local_root("/sync/new-empty", 3, 4))?;
+        let _ = journal.activate_local_root(&local_root("/sync/new-empty", 4))?;
         let baseline = match journal.baseline(path)? {
             Some(baseline) => baseline,
             None => Baseline::Absent,
@@ -4383,7 +4860,7 @@ mod tests {
     fn journal_local_scan_replaces_inventory_and_hashes_atomically() -> Result<(), Box<dyn Error>> {
         let directory = TempDir::new()?;
         let mut journal = Journal::open(journal_path(&directory))?;
-        let binding = local_root("/sync", 1, 2);
+        let binding = local_root("/sync", 2);
         let _ = journal.activate_local_root(&binding)?;
         let old = LocalObservationRecord {
             path: PathBuf::from("old.txt"),
@@ -4423,7 +4900,7 @@ mod tests {
 
         let stale_start = journal.connection.total_changes();
         assert!(!journal.publish_local_scan(
-            &local_root("/stale", 3, 4),
+            &local_root("/stale", 4),
             std::slice::from_ref(&replacement),
             &[local_hash("new.txt", 20)],
         )?);
@@ -4723,7 +5200,7 @@ mod tests {
         drop(legacy);
 
         let mut journal = Journal::open(&database_path)?;
-        assert_eq!(journal.schema_version, 6);
+        assert_eq!(journal.schema_version, 7);
         assert_eq!(journal.baseline(path)?, None);
         assert_eq!(journal.baseline(kept_path)?, Some(kept_baseline.clone()));
         assert_eq!(journal.baseline_paths()?, vec![kept_path.to_path_buf()]);
@@ -4748,7 +5225,7 @@ mod tests {
         assert_eq!(journal.pending_recoveries()?.len(), 1);
         assert_eq!(journal.pending_recoveries()?[0].retained_at, None);
 
-        let configured = local_root("/sync/configured", 7, 8);
+        let configured = local_root("/sync/configured", 8);
         let configured_record = LocalRootRecord {
             binding: configured.clone(),
             generation: 1,
@@ -4765,7 +5242,7 @@ mod tests {
         assert!(journal.pending_plans()?.is_empty());
         assert!(journal.pending_recoveries()?.is_empty());
 
-        let changed = local_root("/sync/changed", 9, 10);
+        let changed = local_root("/sync/changed", 10);
         assert_eq!(
             journal.activate_local_root(&changed)?,
             LocalRootActivation::Activated(LocalRootRecord {
@@ -4776,7 +5253,7 @@ mod tests {
         let version = journal
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         let mut foreign_keys = journal
             .connection
             .prepare("PRAGMA foreign_key_list(recovery_records)")?;
@@ -4852,7 +5329,7 @@ mod tests {
         let version = journal
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         Ok(())
     }
 
@@ -5263,12 +5740,12 @@ mod tests {
         }
 
         let journal = Journal::open(&database_path)?;
-        assert_eq!(journal.schema_version, 6);
+        assert_eq!(journal.schema_version, 7);
         assert_eq!(
             journal
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
-            6
+            7
         );
 
         let pending = journal.pending_plans()?;
@@ -5484,7 +5961,7 @@ mod tests {
 
         let journal = Journal::open(&database_path)?;
 
-        assert_eq!(journal.schema_version, 6);
+        assert_eq!(journal.schema_version, 7);
         assert_eq!(journal.baseline_paths()?, vec![kept_path.to_path_buf()]);
         assert_eq!(journal.baseline(Path::new("unique.txt"))?, Some(kept));
         assert_eq!(journal.baseline(Path::new("collided.txt"))?, None);
@@ -5904,22 +6381,22 @@ mod tests {
         let directory = TempDir::new()?;
         let database_path = journal_path(&directory);
         let connection = Connection::open(&database_path)?;
-        connection.pragma_update(None, "user_version", 7)?;
+        connection.pragma_update(None, "user_version", 8)?;
         drop(connection);
 
         let opened = Journal::open(&database_path);
         assert!(matches!(
             opened,
             Err(JournalError::UnsupportedVersion {
-                found: 7,
-                supported: 6,
+                found: 8,
+                supported: 7,
                 ..
             })
         ));
         let connection = Connection::open(database_path)?;
         let version =
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         Ok(())
     }
 

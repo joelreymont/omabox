@@ -440,11 +440,8 @@ fn set_sync_root(
 fn change_sync_root_while_stopped(current: &Config, replacement: &Config) -> Result<(), CliError> {
     let _lock = InstanceLock::acquire(current.paths().lock_file())
         .map_err(|source| CliError::Lock { source })?;
-    let binding =
-        LocalRootBinding::inspect(replacement.sync_root()).map_err(|source| CliError::Journal {
-            operation: "inspect the selected sync root",
-            source,
-        })?;
+    let binding = LocalRootBinding::inspect(replacement.sync_root())
+        .map_err(|source| CliError::SyncRoot { source })?;
     let journal_path = current.paths().journal_file();
     let mut journal = if journal_path
         .try_exists()
@@ -557,6 +554,18 @@ enum CliError {
     )]
     Journal {
         operation: &'static str,
+        #[source]
+        source: JournalError,
+    },
+
+    #[error("could not inspect the sync folder")]
+    #[diagnostic(
+        code(omabox::cli::sync_root),
+        help(
+            "Ensure the sync folder exists, is readable and is on a filesystem that records file creation times, or choose another folder."
+        )
+    )]
+    SyncRoot {
         #[source]
         source: JournalError,
     },

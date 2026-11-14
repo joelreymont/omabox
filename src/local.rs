@@ -25,7 +25,7 @@ use thiserror::Error;
 
 use crate::journal::{
     Journal, JournalError, LocalFileFingerprint, LocalHashRecord, LocalObservationRecord,
-    LocalRootBinding, OperationId,
+    LocalRootBinding, OperationId, ROOT_IDENTITY_STATX,
 };
 use crate::model::{ContentIdentity, LocalFile, Observation, UnknownReason};
 
@@ -934,7 +934,7 @@ fn finish_scan_at(
         .sort_by(|left, right| left.path.cmp(&right.path));
     reusable_hashes.sort_by(order_hash_records);
     Ok(CompleteScan {
-        root_binding: root_binding(&pending.root, &pending.root_before),
+        root_binding: root_binding(&pending.root, &pending.root_fd)?,
         observations: pending.observations,
         reusable_hashes,
     })
@@ -965,7 +965,11 @@ fn scan_and_publish_at(
         .map_err(|source| LocalError::Journal { source })?;
     let pending = enumerate_scan(root, &cache, cache_cutoff)?;
     drop(cache);
-    let scan = finish_scan_at(pending, MAX_PARALLEL_HASHES, completed_cutoff)?;
+    let scan = match finish_scan_at(pending, MAX_PARALLEL_HASHES, completed_cutoff) {
+        Ok(scan) => scan,
+        Err(error) if root_stood_in(journal, &error)? => return Ok(ScanPublication::RootChanged),
+        Err(error) => return Err(error),
+    };
     if !active_root_matches(journal, &scan.root_binding)?
         || !configured_root_is_active(journal, root)?
     {
@@ -999,12 +1003,28 @@ pub(crate) fn open_active_root(
 ) -> Result<Option<OwnedFd>, LocalError> {
     let root = root.as_ref();
     let directory = open_absolute_directory(root, "open sync root for identity verification")?;
-    let stat = stat_fd(&directory, root, "inspect sync root identity")?;
-    if active_root_matches(journal, &root_binding(root, &stat))? {
+    let binding = match root_binding(root, &directory) {
+        Ok(binding) => binding,
+        Err(error) if root_stood_in(journal, &error)? => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if active_root_matches(journal, &binding)? {
         Ok(Some(directory))
     } else {
         Ok(None)
     }
+}
+
+/// Whether an identity refusal means another directory stands at the recorded
+/// root's path (`LocalRootRecord::stood_in_by`).
+fn root_stood_in(journal: &Journal, error: &LocalError) -> Result<bool, LocalError> {
+    let LocalError::Journal { source } = error else {
+        return Ok(false);
+    };
+    Ok(journal
+        .local_root_binding()
+        .map_err(|source| LocalError::Journal { source })?
+        .is_some_and(|record| record.stood_in_by(source)))
 }
 
 /// Rename one local case variant without overwriting any destination.
@@ -1132,12 +1152,12 @@ fn active_root_matches(journal: &Journal, actual: &LocalRootBinding) -> Result<b
         .map_err(|source| LocalError::Journal { source })
 }
 
-fn root_binding(path: &Path, stat: &rustix::fs::Stat) -> LocalRootBinding {
-    LocalRootBinding {
-        canonical_path: path.to_path_buf(),
-        device: stat.st_dev,
-        inode: stat.st_ino,
-    }
+fn root_binding(path: &Path, root: &OwnedFd) -> Result<LocalRootBinding, LocalError> {
+    const OPERATION: &str = "inspect sync root identity";
+    let statx = rustix::fs::statx(root, "", AtFlags::EMPTY_PATH, ROOT_IDENTITY_STATX)
+        .map_err(|source| syscall_failure(OPERATION, path, source))?;
+    LocalRootBinding::from_statx(path.to_path_buf(), &statx)
+        .map_err(|source| LocalError::Journal { source })
 }
 
 /// Copy a root-confined local file into immutable upload staging.
@@ -3225,7 +3245,6 @@ fn file_fingerprint(
         )
     })?;
     Ok(LocalFileFingerprint {
-        device: stat.st_dev,
         inode: stat.st_ino,
         size,
         modified_seconds: stat.st_mtime,
@@ -4293,8 +4312,7 @@ fn same_inode(left: &rustix::fs::Stat, right: &rustix::fs::Stat) -> bool {
 }
 
 fn same_hashed_content(left: &LocalFileFingerprint, right: &LocalFileFingerprint) -> bool {
-    left.device == right.device
-        && left.inode == right.inode
+    left.inode == right.inode
         && left.size == right.size
         && left.modified_seconds == right.modified_seconds
         && left.modified_nanoseconds == right.modified_nanoseconds
@@ -4334,6 +4352,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::common::{allow_owner_access, deny_all_access};
+    use crate::journal::BirthTime;
     use crate::model::DropboxRevision;
 
     use super::*;
@@ -4983,6 +5002,35 @@ mod tests {
     }
 
     #[test]
+    fn scan_of_a_stand_in_publishes_nothing() -> Result<(), Box<dyn Error>> {
+        let stand_in = Path::new("/sys/class/mem");
+        assert!(matches!(
+            LocalRootBinding::inspect(stand_in),
+            Err(JournalError::NoBirthTime { .. })
+        ));
+        let directory = TempDir::new()?;
+        let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+        journal.activate_local_root(&LocalRootBinding {
+            canonical_path: stand_in.to_path_buf(),
+            inode: 1,
+            birth: Some(BirthTime {
+                seconds: 1_700_000_000,
+                nanoseconds: 5,
+            }),
+            subvolume: None,
+        })?;
+        let before = journal.local_inventory()?;
+
+        assert!(matches!(
+            scan_and_publish(&mut journal, stand_in),
+            Ok(ScanPublication::RootChanged)
+        ));
+        assert_eq!(journal.local_inventory()?, before);
+        assert!(matches!(open_active_root(&journal, stand_in), Ok(None)));
+        Ok(())
+    }
+
+    #[test]
     fn objects_on_another_device_are_unsupported_and_unscanned() -> Result<(), Box<dyn Error>> {
         let root = TempDir::new()?;
         std::fs::create_dir(root.path().join("volume"))?;
@@ -5160,9 +5208,6 @@ mod tests {
         let mut variants = Vec::new();
 
         let mut changed = original.clone();
-        changed.device ^= 1;
-        variants.push(changed);
-        let mut changed = original.clone();
         changed.inode ^= 1;
         variants.push(changed);
         let mut changed = original.clone();
@@ -5190,6 +5235,62 @@ mod tests {
             )?;
             assert_eq!(scanned_content(&scan, path)?, &actual);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn cached_hash_with_a_stored_device_is_reused() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let root = directory.path().join("root");
+        std::fs::create_dir(&root)?;
+        let path = Path::new("kept.txt");
+        std::fs::write(root.join(path), b"actual bytes")?;
+        let database_path = directory.path().join("journal.sqlite3");
+        let mut journal = Journal::open(&database_path)?;
+        let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+        let _ = scan_and_publish_at(&mut journal, &root, None, all_cache_entries_stable)?;
+
+        // Rewrite the row as an earlier version stored it, with a device that
+        // no longer matches, and with content only the cache could supply.
+        let cached = ContentIdentity::new("0".repeat(64));
+        let connection = rusqlite::Connection::open(&database_path)?;
+        let stored: String =
+            connection.query_row("SELECT hash_json FROM local_hash_cache", [], |row| {
+                row.get(0)
+            })?;
+        let mut value: serde_json::Value = serde_json::from_str(&stored)?;
+        let Some(hash) = value.as_object_mut() else {
+            return Err(io::Error::other("stored hash is not an object").into());
+        };
+        let Some(fingerprint) = hash
+            .get_mut("fingerprint")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            return Err(io::Error::other("stored hash has no fingerprint object").into());
+        };
+        fingerprint.insert("device".to_owned(), serde_json::Value::from(44_u64));
+        hash.insert(
+            "content".to_owned(),
+            serde_json::Value::from(cached.as_str()),
+        );
+        let updated = connection.execute(
+            "UPDATE local_hash_cache SET hash_json = ?1",
+            [serde_json::to_string(&value)?],
+        )?;
+        assert_eq!(updated, 1);
+        drop(connection);
+
+        let ScanPublication::Published(scan) = scan_and_publish_at(
+            &mut journal,
+            &root,
+            all_cache_entries_stable(),
+            all_cache_entries_stable,
+        )?
+        else {
+            return Err(io::Error::other("rescan was not published").into());
+        };
+
+        assert_eq!(scanned_content(&scan, path)?, &cached);
         Ok(())
     }
 
@@ -5576,7 +5677,6 @@ mod tests {
         let cached = |path: &str| LocalHashRecord {
             path: PathBuf::from(path),
             fingerprint: LocalFileFingerprint {
-                device: 1,
                 inode: 2,
                 size: 5,
                 modified_seconds: 3,

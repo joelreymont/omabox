@@ -219,8 +219,9 @@ impl DaemonError { fn disposition(&self) -> Disposition }
   the inventory), a refresh-token store failure after rotation (section J). The daemon
   publishes `DaemonPhase::Error` with a fixed message per condition, keeps the
   instance lock, and waits with the same escalating schedule.
-- UserAction: setup required, account changed, root namespace changed,
-  credential or journal binding changed, refresh token rejected (the SDK's
+- UserAction: setup required, a sync root whose filesystem records no
+  creation time, account changed, root namespace changed, credential or
+  journal binding changed, refresh token rejected (the SDK's
   `AuthError::InvalidAccessToken` after a refresh attempt, or an OAuth
   `invalid_grant`). An expired access token is refreshed inside the transport
   and re-issued once by the SDK; the daemon never restarts a session for it. The daemon publishes the fatal status and exits 78.
@@ -262,16 +263,26 @@ pub enum LocalRootActivation {
     Unavailable { recorded: LocalRootBinding, actual: LocalRootBinding },
 }
 pub fn activate_local_root(&mut self, binding) -> Result<LocalRootActivation, JournalError>;
-pub fn adopt_local_root(&mut self, binding) -> Result<LocalRootRecord, JournalError>;
+pub fn adopt_local_root(&mut self, binding) -> Result<LocalRootActivation, JournalError>;
 ```
 
-`activate_local_root`: same canonical path with different device or inode is
-`Unavailable` and writes nothing (daemon: Environmental). A different canonical
+`activate_local_root`: same canonical path whose inode, birth time or subvolume
+differs is `Unavailable` and writes nothing (daemon: Environmental). The device
+number is not part of the identity because btrfs assigns each subvolume a new
+one at every mount. A schema-6 binding, which has no birth time, is upgraded in
+place when its path and inode match. A root whose filesystem records no
+creation time is refused as a user action (`JournalError::NoBirthTime`).
+At the path of a recorded root that has a birth time, or a schema-6 root
+whose inode differs, the daemon treats that refusal as the root being
+unavailable (Environmental), at activation and during a pass: a directory
+stands in for it, such as the mount point under an absent mount.
+A different canonical
 path (configuration changed) supersedes every pending and blocked plan and
 retires pending recovery intents in the same transaction, then starts a new
-generation. `Busy` is removed. `adopt_local_root` starts a new generation
-unconditionally and is used by `setup` and `settings set-root`, which is
-allowed for the same path when the identity differs.
+generation. `Busy` is removed. `adopt_local_root` returns the current record
+when the path and identity are unchanged, upgrades a schema-6 binding in place when its
+path and inode match, and otherwise starts a new generation, including for the
+same path when the identity differs; it is used by `settings set-root`.
 
 ## G. Staging-slot ownership (C2, orphaned stages)
 
