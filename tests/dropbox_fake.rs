@@ -6320,6 +6320,60 @@ fn one_file_cursor_delta_updates_a_large_inventory_without_a_full_listing()
 }
 
 #[test]
+fn large_full_listing_builds_its_inventory_in_linear_time() -> Result<(), Box<dyn Error>> {
+    const LISTING_SIZE: usize = 20_000;
+    const PAGE_SIZE: usize = 2_000;
+    // A debug build lists this in about 1 s; rescanning the whole inventory
+    // for each entry or page takes about 13 s, so the bound fails a quadratic
+    // listing.
+    const LISTING_BOUND: Duration = Duration::from_secs(5);
+
+    let content = dropbox_content_hash(b"bulk listing bytes".as_slice())?;
+    let mut entries = Vec::with_capacity(LISTING_SIZE);
+    entries.push(folder_metadata("/bulk", "/Bulk"));
+    for index in 1..LISTING_SIZE {
+        let lower = format!("/bulk/{index:05}.txt");
+        let display = format!("/Bulk/{index:05}.txt");
+        entries.push(file_metadata(&lower, &display, "rev-bulk", &content));
+    }
+    let pages = entries.chunks(PAGE_SIZE).collect::<Vec<_>>();
+    let mut responses = vec![account()];
+    for (index, page) in pages.iter().enumerate() {
+        responses.push(FakeResponse::json(json!({
+            "entries": page,
+            "cursor": format!("cursor-{index}"),
+            "has_more": index + 1 < pages.len()
+        })));
+    }
+    let server = FakeServer::start(responses)?;
+    let client = fake_client(&server, "opaque-access-large-listing")?;
+    let directory = TempDir::new()?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+
+    let started = Instant::now();
+    let refresh = client.refresh_inventory(&mut journal)?;
+    let elapsed = started.elapsed();
+
+    assert_eq!(refresh, InventoryRefresh::Published);
+    assert!(
+        elapsed < LISTING_BOUND,
+        "a {LISTING_SIZE}-entry listing took {elapsed:?}"
+    );
+    let inventory = journal.remote_inventory()?;
+    assert_eq!(inventory.observations.len(), LISTING_SIZE);
+    assert_eq!(
+        observation(&inventory, Path::new("Bulk/19999.txt")),
+        Some(&Observation::Present(RemoteFile::new(
+            content,
+            DropboxRevision::new("rev-bulk")
+        )))
+    );
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 1 + pages.len());
+    Ok(())
+}
+
+#[test]
 fn cursor_reset_rebuilds_before_one_complete_publication() -> Result<(), Box<dyn Error>> {
     let replacement = dropbox_content_hash(b"replacement".as_slice())?;
     let server = FakeServer::start(vec![

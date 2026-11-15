@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{self, Read, Seek, SeekFrom};
+use std::ops::Bound;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -1379,6 +1380,7 @@ impl DropboxClient {
         loop {
             apply_entries(&self.root, &mut records, page.entries)?;
             if !page.has_more {
+                normalize_inventory_records(&mut records)?;
                 return Ok((records.into_values().collect(), page.cursor));
             }
             let previous = page.cursor;
@@ -1792,7 +1794,7 @@ fn valid_content_hash(value: &str) -> bool {
 
 fn apply_entries(
     root: &DropboxRoot,
-    records: &mut BTreeMap<String, RemoteObservationRecord>,
+    records: &mut BTreeMap<CanonicalPath, RemoteObservationRecord>,
     entries: Vec<files::Metadata>,
 ) -> Result<(), DropboxError> {
     let mut changes = Vec::new();
@@ -1800,23 +1802,21 @@ fn apply_entries(
     for change in changes {
         match change {
             RemoteInventoryChange::Upsert(record) => {
-                let key = canonical_key(&record.canonical_path)?.to_owned();
-                records.insert(key, record);
+                records.insert(record.canonical_path.clone(), record);
             }
             RemoteInventoryChange::EnsureDirectory(record) => {
-                let key = canonical_key(&record.canonical_path)?.to_owned();
-                if let Some(existing) = records.get_mut(&key) {
+                if let Some(existing) = records.get_mut(&record.canonical_path) {
                     existing.observation = Observation::Directory;
                 } else {
-                    records.insert(key, record);
+                    records.insert(record.canonical_path.clone(), record);
                 }
             }
             RemoteInventoryChange::DeleteSubtree { canonical_path } => {
-                remove_subtree(records, canonical_key(&canonical_path)?);
+                remove_subtree(records, &canonical_path);
             }
         }
     }
-    normalize_inventory_records(records)
+    Ok(())
 }
 
 fn append_entry_changes(
@@ -1879,7 +1879,7 @@ fn append_parent_folders(changes: &mut Vec<RemoteInventoryChange>, key: &str, pa
 }
 
 fn normalize_inventory_records(
-    records: &mut BTreeMap<String, RemoteObservationRecord>,
+    records: &mut BTreeMap<CanonicalPath, RemoteObservationRecord>,
 ) -> Result<(), DropboxError> {
     let directories = directory_casing(records.values().filter_map(|record| {
         (record.observation == Observation::Directory)
@@ -1918,9 +1918,7 @@ fn normalize_inventory_changes(
                 }
             }
             RemoteInventoryChange::DeleteSubtree { canonical_path } => {
-                directories.retain(|candidate, _| {
-                    candidate != canonical_path && !candidate.is_beneath(canonical_path)
-                });
+                remove_subtree(&mut directories, canonical_path);
             }
         }
     }
@@ -1985,21 +1983,21 @@ fn normalized_remote_path(
     Ok(normalized)
 }
 
-/// Borrow one canonical path as the UTF-8 key used by the listing accumulator.
-fn canonical_key(canonical: &CanonicalPath) -> Result<&str, DropboxError> {
-    canonical
-        .as_path()
-        .to_str()
-        .ok_or(DropboxError::InvalidEntryPath)
-}
-
-fn remove_subtree(records: &mut BTreeMap<String, RemoteObservationRecord>, key: &str) {
-    records.retain(|candidate, _| {
-        candidate != key
-            && !candidate
-                .strip_prefix(key)
-                .is_some_and(|remainder| remainder.starts_with('/'))
-    });
+/// Remove `path` and every key beneath it, visiting only the removed keys so
+/// a listing that deletes as it goes stays linear in its size.
+fn remove_subtree<V>(map: &mut BTreeMap<CanonicalPath, V>, path: &CanonicalPath) {
+    map.remove(path);
+    let (start, end) = path.subtree_range();
+    let beneath = map
+        .range::<[u8], _>((
+            Bound::Included(start.as_slice()),
+            Bound::Excluded(end.as_slice()),
+        ))
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    for key in beneath {
+        map.remove(&key);
+    }
 }
 
 fn relative_paths(
@@ -2437,7 +2435,7 @@ mod tests {
         ApiOutcome, DropboxError, DropboxRoot, ERROR_EXCERPT_CHARS, MutationRejection,
         PROGRESS_INTERVAL, ProgressReader, RemoteInventoryChange, UPLOAD_SESSION_MAX_BYTES,
         append_entry_changes, apply_entries, files, lookup_outcome, normalize_inventory_changes,
-        validate_upload_size, write_outcome,
+        normalize_inventory_records, validate_upload_size, write_outcome,
     };
 
     #[test]
@@ -2618,7 +2616,7 @@ mod tests {
 
     fn oracle_records(
         nodes: &BTreeMap<String, OracleNode>,
-    ) -> BTreeMap<String, RemoteObservationRecord> {
+    ) -> BTreeMap<CanonicalPath, RemoteObservationRecord> {
         nodes
             .iter()
             .map(|(key, node)| {
@@ -2629,10 +2627,11 @@ mod tests {
                     )),
                     OracleNode::Folder => Observation::Directory,
                 };
+                let canonical_path = CanonicalPath::from_bytes(key.clone().into_bytes());
                 (
-                    key.clone(),
+                    canonical_path.clone(),
                     RemoteObservationRecord {
-                        canonical_path: CanonicalPath::from_bytes(key.clone().into_bytes()),
+                        canonical_path,
                         path: PathBuf::from(key),
                         observation,
                     },
@@ -2678,6 +2677,8 @@ mod tests {
             let mut single_page = BTreeMap::new();
             apply_entries(&root, &mut single_page, all_entries)
                 .map_err(|error| TestCaseError::fail(error.to_string()))?;
+            normalize_inventory_records(&mut single_page)
+                .map_err(|error| TestCaseError::fail(error.to_string()))?;
 
             let split = split_seed % (mutations.len() + 1);
             let first_page = mutations[..split]
@@ -2692,6 +2693,8 @@ mod tests {
             apply_entries(&root, &mut split_pages, first_page)
                 .map_err(|error| TestCaseError::fail(error.to_string()))?;
             apply_entries(&root, &mut split_pages, second_page)
+                .map_err(|error| TestCaseError::fail(error.to_string()))?;
+            normalize_inventory_records(&mut split_pages)
                 .map_err(|error| TestCaseError::fail(error.to_string()))?;
 
             prop_assert_eq!(&single_page, &oracle_records(&oracle));
@@ -2716,9 +2719,12 @@ mod tests {
         )?;
 
         assert_eq!(records.len(), 2);
-        assert_eq!(records["folder"].observation, Observation::Directory);
         assert_eq!(
-            records["paper"].observation,
+            records[b"folder".as_slice()].observation,
+            Observation::Directory
+        );
+        assert_eq!(
+            records[b"paper".as_slice()].observation,
             Observation::Unknown(UnknownReason::Unsupported)
         );
         Ok(())
@@ -2745,11 +2751,15 @@ mod tests {
                 files::Metadata::Folder(folder_metadata("/apps/day one", "/Apps/Day One")),
             ],
         )?;
+        normalize_inventory_records(&mut records)?;
 
-        assert_eq!(records["apps"].path, Path::new("apps"));
-        assert_eq!(records["apps/day one"].path, Path::new("apps/Day One"));
+        assert_eq!(records[b"apps".as_slice()].path, Path::new("apps"));
         assert_eq!(
-            records["apps/day one/entry.doentry"].path,
+            records[b"apps/day one".as_slice()].path,
+            Path::new("apps/Day One")
+        );
+        assert_eq!(
+            records[b"apps/day one/entry.doentry".as_slice()].path,
             Path::new("apps/Day One/Entry.doentry")
         );
         Ok(())
@@ -2808,6 +2818,32 @@ mod tests {
         assert_eq!(
             change_paths(&changes),
             vec![PathBuf::from("Apps"), PathBuf::from("Apps/DAY ONE")]
+        );
+
+        let mut changes = Vec::new();
+        append_entry_changes(
+            &root,
+            &mut changes,
+            vec![
+                files::Metadata::Deleted(
+                    files::DeletedMetadata::new(String::from("apps"))
+                        .with_path_lower(String::from("/apps"))
+                        .with_path_display(String::from("/apps")),
+                ),
+                files::Metadata::Folder(folder_metadata(
+                    "/apps/day one/journal",
+                    "/APPS/DAY ONE/Journal",
+                )),
+            ],
+        )?;
+        normalize_inventory_changes(&mut changes, &existing)?;
+        assert_eq!(
+            change_paths(&changes),
+            vec![
+                PathBuf::from("APPS"),
+                PathBuf::from("APPS/DAY ONE"),
+                PathBuf::from("APPS/DAY ONE/Journal"),
+            ]
         );
         Ok(())
     }

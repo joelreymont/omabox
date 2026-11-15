@@ -361,7 +361,8 @@ gains `conflicts: Vec<String>` (bounded to 20 display paths) and
   reports `MutationRejection` rather than an error.
 - An entry whose `path_lower` equals the root is skipped; a `deleted` entry for
   the root is `RemoteRootUnavailable`.
-- `remove_subtree` deletes the key and the `key/`…`key/\u{10FFFF}` range;
+- `remove_subtree` deletes the key and the half-open range from `key/` to
+  `key0` (`0` is the byte after `/`) that `CanonicalPath::subtree_range` gives;
   `normalize_inventory_records` runs once after the last page.
 - Listing entries are the SDK's `Metadata` enum (`File`, `Folder`, `Deleted`)
   and `FolderSharingInfo { traverse_only, no_access }`; classification matches
