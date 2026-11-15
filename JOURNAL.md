@@ -339,3 +339,137 @@ onto master periodically. Moving the work showed what drift costs here:
 The same day the Rust version left master for a `rust` branch. Master now
 holds only what the Habu daemon is built from, and the port docs cite the
 branch where they compare.
+
+## 2026-11-15: Stopped all at once
+
+Three times today running lanes stopped mid-brief at the same moment: once a
+network outage ended ten of them, twice the five-hour usage limit ended them
+all. The second time the reviews moved to Codex, a reviewer from another
+vendor, so the review queue kept moving while the lanes waited.
+Earlier a weekly limit stopped a Rust-era worker for days. Each lane resumed
+from its own transcript on one message ("continue from where you stopped;
+check your workspace first"), because its state was in a jj workspace and
+its instructions in a brief file, not in anyone's memory.
+
+Observation for the blog: parallel agents fail together. The cost of an
+outage is set by how much of a lane's state lives outside the agent.
+
+## 2026-11-15: Three lanes, three log helpers
+
+Three lanes that each needed to check a log line each wrote their own way to
+capture stderr: LOGGED, LOGGING/SAID? and a LOGGED buffer. Two fault lanes
+each added a fake fault called SHORTEN, meaning different things. The merge
+found them; one LOGGED/LOGGED? pair and the name CUT-BODY replaced them.
+
+Observation for the blog: a brief that names the words to change keeps lanes
+apart, but it cannot see a helper two lanes will both invent. Merges are
+where duplicates surface; Rust's crates would have had one already.
+
+## 2026-11-15: A flag that became a machine
+
+The download's "draining" flag, set in one place and tested in another, was
+what the review asked to become a named machine, and it did. Later every
+transfer interrupted by a throw got one owner (ABANDONED, READ-OUT), and the
+machine lost its own draining and thrown states. The machine got smaller
+once the concern that cut across it had a single home.
+
+## 2026-11-15: What the fake hid, again
+
+The fake Dropbox runs in its own task. A scripted answer meant for an API
+call could be taken by a token request, so a test could pass on the wrong
+exchange; scripts now go to API calls only. A fixture word ran in the test's
+task and overwrote the test's task-local string builder while a test was
+building in it.
+
+## 2026-11-15: The checker holds no constants
+
+Habu records gain inline byte runs (`BUFFER name N`) for the content hasher's
+SHA-256 contexts. N must be a literal, where C accepts a constant expression:
+replay builds a record's MAKE and UNMAKE from its text, and the verifier
+holds no constant values. Three more things a C programmer never sees:
+- MAKE carries a buffer as one cell per eight bytes, and nothing counted
+  them, so `BUFFER b $1000000000` used 2 GB before anything refused it. The
+  limit MAKE always had is now refused at the clause that passes it.
+- An accessor that answers a span needed a new kind of compiled body: none
+  of the existing kinds pushes a second constant cell.
+- span.f loaded after sha256.f, so SHA-256's own records could not use the
+  span type until the boot order changed.
+
+## 2026-11-15: An example that contradicted its rule
+
+My brief for the HTTP date parser stated RFC 9110's 50-year rule for RFC 850
+years and then gave an example that broke it (in 2026, `70` means 2070, not
+1970). The worker followed the rule. The review then found the rule itself
+applied to years, not timestamps, so from 2050 on `20` would read as 2020
+instead of 2120.
+
+Observation for the blog: an example in a brief is code that nothing runs.
+
+## 2026-11-15: A decision kept in a test
+
+Habu's CURL:LOST? left out TLS handshake failures (libcurl's 35) on purpose,
+and a test asserted it. omabox retries what LOST? accepts, so a connection
+reset during the handshake would not be retried, where the Rust version's
+reqwest retried every connect error. A failed handshake sends no request,
+so retrying it is always safe; LOST? now takes 35 and the test says why.
+
+## 2026-11-15: Where the interpreter meets the checker
+
+At top level a word that carries a record value now runs, but `drop` was
+still the engine's one-cell drop, and the checker could only allow or refuse
+a word before it ran. Dropping a whole value needed a new word between them
+that tells the interpreter how many cells the value takes. A refusal of
+`?dup` set a flag that nothing read, so its message named no reason.
+
+## 2026-11-15: Two green lanes, one red merge
+
+Two Habu lanes built the record byte run in parallel. One reserved the word
+`buffer` in declarations, so a field cannot be named after the clause. The
+other, finding `span` taken, named its new compiler body kind `buffer`. Each
+lane's tests passed. Merged, the engine still built, because the host that
+built it did not yet reserve the word. The engine it built then refused its
+own compiler source, and the test that rebuilds from a cached object caught it.
+
+Observation for the blog: a language that checks names against its own
+grammar turns a naming clash between lanes into a build failure, but only
+one stage later. A self-build is the check that sees it.
+
+## 2026-11-15: A flake that was libcurl's
+
+One run in about 44 of Habu's curl tests failed a low-speed case: a body
+arriving at 64 bytes every 100 ms was ended as slower than 10 bytes a second.
+The rules forbid calling that a flake, so a hunt followed. libcurl 8.23 times a
+one-second low-speed window in milliseconds rounded toward zero, before its
+first once-a-second speed record exists, so a check at 999.x ms sees a speed of
+0 and ends a transfer receiving 48 times the limit. The plain curl command line
+fails 6 of 6 times with a one-second window and passes with two.
+
+Observation for the blog: the cause sat below both languages. The Rust
+version, on ureq, never met it; the Habu version inherits libcurl's defects
+along with its features.
+
+## 2026-11-15: Lowercase is not casefold
+
+The upload checks that Dropbox committed the entry at the upload's path. The
+port compared paths by case folding; the Rust version compares `path_lower`
+with `to_lowercase`. They differ: Straße and STRASSE fold equal but lowercase
+apart. Habu's LOWER writes into caller storage, and at that point the client
+had none it could grow without moving spans it had already handed out. The
+fix was a library word, `UNICODE:LOWERS-TO?`, which lowers, compares and frees
+in one place.
+
+Observation for the blog: a port finds where a library's shape falls short,
+not only where it lacks a feature. Rust's `String` hides the allocation that
+made this a question in Habu.
+
+## 2026-11-15: Halfway: better or worse?
+
+Asked midway whether Habu beats Rust, the answer was: slower for shipping
+omabox, because most of the time went into Habu itself (streaming HTTP, HTTP
+dates, byte fields in records, `^T`, top-level stack rules, lowercasing),
+each a lane and a review where Rust had a crate. The checker and exhaustive
+`MATCH` push the code into explicit state machines, and the defects that
+pass the checker are the same kind that passed Rust's compiler: getting the
+spec wrong, as with Retry-After rules or case comparison. Agents write Rust
+from memory; in Habu they lean on the card, slip on Forth details, and
+reinvent helpers they cannot find.
