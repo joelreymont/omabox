@@ -682,8 +682,8 @@ variable ARGS-U
 \ CONTENT! keeps each rev's bytes. Each fault applies to the next download
 \ alone: SKEWED shifts its Content-Range's start by one, MISFILED answers
 \ another rev's file, SHORTED drops its body's last byte, WHOLED answers
-\ the whole file whatever Range it asked, and PARTED answers a 206 with a
-\ Content-Range though it asked none.
+\ the whole file whatever Range it asked, PARTED answers a 206 with a
+\ Content-Range though it asked none, and BREAKING cuts its body.
 SLOTS NAME-CAP * BUFFER: CONTENT-REVS
 SLOTS TYPED-BUFFER CONTENT-REV-US n
 SLOTS TEXT-CAP * BUFFER: CONTENT-BYTES
@@ -695,6 +695,7 @@ variable MISFILED-U
 TYPED-VARIABLE SHORTED bool
 TYPED-VARIABLE WHOLED bool
 TYPED-VARIABLE PARTED bool
+TYPED-VARIABLE BREAKING bool
 create REV-SEEN NAME-CAP allot
 variable REV-SEEN-U
 create ARG-SENT TEXT-CAP allot
@@ -831,6 +832,27 @@ TYPED-VARIABLE RANGED bool
    false WHOLED ! ;
 
 
+\ The bytes a cut download sends of its body.
+10 constant PART
+
+
+\ The file in slot i with the bytes in slot k from the offset, cut: a 200
+\ head promising them all, PART of them, and a close, which libcurl
+\ answers CURLE_PARTIAL_FILE.
+: BROKEN ( HTTP:request n n n -- )
+   {: q:HTTP:request i:n k:n from:n :}
+   false BREAKING !
+   k CONTENT$ {: b:ptr size:n :}
+   q HTTP:BODY$ 2drop
+   q HTTP:TAKE-OVER 2drop {: conn:TCP4:connection :}
+   SB-RESET S\" HTTP/1.1 200 OK\r\nDropbox-API-Result: " SB-APPEND
+   i ENTRY$ SB-APPEND S\" \r\nContent-Length: " SB-APPEND
+   size from - FMT:SB-INT S\" \r\n\r\n" SB-APPEND
+   b from + size from - PART min SB-APPEND
+   conn SB$ TCP4:TRANSFER-BYTES TCP4:WRITE CLOSED
+   conn TCP4:CLOSE CLOSED ;
+
+
 : DOWNLOAD ( HTTP:request HTTP:response -- )
    {: q:HTTP:request a:HTTP:response :}
    q a ADMITTED? 0= if exit then
@@ -840,6 +862,7 @@ TYPED-VARIABLE RANGED bool
    r ru FILE-OF r ru CONTENT-OF {: i:n k:n :}
    i 0< k 0< or if a NOT-FOUND! exit then
    from 0< if a 400 HTTP:STATUS! a s" bad range" HTTP:BODY! exit then
+   BREAKING @ if q i k from BROKEN exit then
    a i k from FILE-SENT ;
 
 
@@ -1113,8 +1136,8 @@ $2100000 constant UPLOAD-CAP
    0 ARG-SENT-U ! 0 RANGE-SENT-U !
    false ROOTED ! false TYPED ! false LEAKED ! false RANGED !
    false SKEWED ! 0 MISFILED-U ! false SHORTED ! false WHOLED !
-   false PARTED ! false LOSING ! 0 CUTS ! false TOKEN-CUTTING !
-   false REVOKED ! false GARBLING !
+   false PARTED ! false BREAKING ! false LOSING ! 0 CUTS !
+   false TOKEN-CUTTING ! false REVOKED ! false GARBLING !
    LISTING-RESET ;
 
 
@@ -1224,6 +1247,8 @@ $2100000 constant UPLOAD-CAP
 : MISFILE ( ptr u8 n -- ) MISFILED NAME-CAP STORE MISFILED-U ! ;
 \ The next download's body lacks its last byte.
 : SHORTEN ( -- ) true SHORTED ! ;
+\ The next download's body is cut after PART bytes.
+: CUT-BODY ( -- ) true BREAKING ! ;
 \ The next download answers the whole file, whatever Range it asked.
 : IGNORE-RANGE ( -- ) true WHOLED ! ;
 \ The next download answers a 206 with its Content-Range, even with no

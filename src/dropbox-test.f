@@ -20,6 +20,7 @@ require src/lib/test/mapped.f
 require src/lib/memory.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
+require src/lib/test/stderr.f
 require src/lib/net/curl.f
 require src/dropbox.f
 require src/test-dropbox.f
@@ -837,10 +838,35 @@ variable SUNK-AT
    USABLE ;
 
 
+\ The next download cut mid-body: a retry, not a failure, so no log line.
+: BROKEN-CASE ( -- )
+   s" download cut mid-body" T-LABEL
+   TEST-DROPBOX:RESET ALPHABET
+   TEST-DROPBOX:CUT-BODY
+   [: 0 FETCH RETRY-MS 0 T= ;] LOGGED 0 T=
+   ERR-U @ 0 T=
+   SUNK-U @ 10 <= TTRUE
+   SUNK$ s" abcdefghij" SUNK-U @ min STR= TTRUE ;
+
+
+\ A sink that fails as a full disk would.
+: REFUSING ( ptr u8 n n -- ) 2drop drop 77 throw ;
+
+
+\ DOWNLOAD rethrows its sink's throw and leaves the client usable.
+: SINK-THROWS-CASE ( -- )
+   s" download sink throws" T-LABEL
+   TEST-DROPBOX:RESET ALPHABET
+   [: s" 0160a1b2c3d4" 0 MAIN @ [: REFUSING ;]
+      DROPBOX:DOWNLOAD DONE? drop ;] 77 TTHROWSQ
+   s" /docs/abc.txt" MAIN @ DROPBOX:METADATA DONE? ASSERT ;
+
+
 : DOWNLOAD-CASES ( -- )
    WHOLE-CASE RESUME-CASE SKEW-CASE UNSATISFIED-CASE RESTART-CASE
    UNSATISFIABLE-CASE FIRST-UNSATISFIABLE-CASE UNKNOWN-REV-CASE
-   OTHER-REV-CASE SHORT-CASE WHOLE-FOR-RANGE-CASE UNASKED-RANGE-CASE ;
+   OTHER-REV-CASE SHORT-CASE WHOLE-FOR-RANGE-CASE UNASKED-RANGE-CASE
+   BROKEN-CASE SINK-THROWS-CASE ;
 
 
 \ ---- delete_v2, create_folder_v2 and the code exchange
@@ -1086,6 +1112,8 @@ TYPED-VARIABLE FAULT fault
 
 
 : UNSTAGED ( -- ) UP DROPBOX-UPLOAD:FD @ FD>N close ;
+
+
 : EXPECTED$ ( -- ptr u8 n ) EXPECTED 64 ;
 
 

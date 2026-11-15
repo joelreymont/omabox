@@ -1023,68 +1023,192 @@ ENUM verdict
    c at e RANGED ;
 
 
-\ One read of a cancelled transfer; true once it ended.
-: DRAINED ( CURL:handle ptr client -- bool )
-   {: h:CURL:handle c :}
-   c CLIENT-BODY @ {: buf :}
-   buf BUF:CLEAR
-   h buf ROOM CURL:NEXT MATCH CURL:chunk-result
-      chunk OF 2drop false ENDOF
-      response OF drop true ENDOF
-      failed OF drop true ENDOF
-   ;MATCH ;
+\ ---- the download's machine
+
+\ One download's read, the machine's context: client and handle the
+\ call's; rev and offset the revision and offset asked; held the chunk read
+\ last and status its HTTP status, or a response's; failure a failed
+\ transfer's curl code; total the bytes handed to sink; code what a
+\ failed check or sink threw, else 0.
+STRUCTURE fetch DERIVE addr
+   FIELD client ptr client
+   FIELD handle CURL:handle
+   FIELD rev SPAN:span<u8>
+   FIELD offset n
+   FIELD held SPAN:span<u8>
+   FIELD status n
+   FIELD failure n
+   FIELD total n
+   FIELD code n
+;STRUCTURE
+
+HEAP FETCHES fetch
+
+\ A step ends in streaming only with a new chunk held, for sink.
+ENUM download-step DERIVE eq
+   opened streaming buffering draining answered lost thrown ;ENUM
+ENUM read-event chunk response failure ;ENUM
+ENUM open-event passed spoiled other response failure ;ENUM
+ENUM stream-event chunk threw response failure ;ENUM
 
 
-\ The first 2xx chunk's checks, through the headers curl answers from that
-\ chunk on. One that fails ends the transfer before its code goes on, so the
-\ handle is free for the next request and sink sees no byte.
-: FIRST-CHECKED ( CURL:handle ptr client n ptr u8 n n -- )
-   {: h:CURL:handle c s:n r:ptr ru:n at:n :}
-   s c CLIENT-STATUS !
-   c CAPTURE
-   [: c r ru at CHECKED ;] catch {: code:n :}
-   code 0= if exit then
-   h CURL:CANCEL
-   begin h c DRAINED until
-   code throw ;
+: HOLD ( CURL:http-status len ptr u8 ptr fetch -- )
+   {: p:ptr f :}
+   LEN>N p swap SPAN:MAKE f FETCH-HELD !
+   CURL:HTTP-STATUS>N f FETCH-STATUS ! ;
 
 
-\ A 2xx chunk goes to sink at its file offset and is counted, the first once
-\ the answer passed its checks; any other status's bytes go to the answer
-\ buffer for the core to classify.
-: PASSED ( n n n ptr u8 CURL:handle ptr client ptr u8 n n [ ptr u8 n n -- ] -- n )
-   {: got:n s:n total:n p:ptr h:CURL:handle c r:ptr ru:n at:n sink :}
-   s 200 >= s 300 < and if
-      total 0= if h c s r ru at FIRST-CHECKED then
-      p got at total + sink execute
-      total got + exit
-   then
-   p got c CLIENT-ANSWER @ APPEND total ;
-
-
-\ One read into the body buffer, which a download never sends; true once the
-\ transfer ended, its status or failure kept.
-: PIECE ( n CURL:handle ptr client ptr u8 n n [ ptr u8 n n -- ] -- n bool )
-   {: total:n h:CURL:handle c r:ptr ru:n at:n sink :}
-   c CLIENT-BODY @ {: buf :}
+\ One read into the body buffer, which a download never sends.
+: PULL ( ptr fetch -- read-event )
+   {: f :}
+   f FETCH-CLIENT @ CLIENT-BODY @ {: buf :}
    buf BUF:CLEAR
    buf ROOM {: p:ptr room:len :}
-   h p room CURL:NEXT MATCH CURL:chunk-result
-      chunk OF
-         LEN>N swap CURL:HTTP-STATUS>N total p h c r ru at sink PASSED false
+   f FETCH-HANDLE @ p room CURL:NEXT MATCH CURL:chunk-result
+      chunk OF p f HOLD construct read-event chunk ENDOF
+      response OF
+         CURL:HTTP-STATUS>N f FETCH-STATUS !
+         construct read-event response
       ENDOF
-      response OF CURL:HTTP-STATUS>N c CLIENT-STATUS ! total true ENDOF
-      failed OF CURL:CODE>N c CLIENT-FAILURE ! total true ENDOF
+      failed OF
+         CURL:CODE>N f FETCH-FAILURE !
+         construct read-event failure
+      ENDOF
    ;MATCH ;
 
 
-\ Sends the prepared request, streaming a checked 2xx body to sink; the
-\ bytes handed.
-: STREAMED ( ptr client ptr u8 n n [ ptr u8 n n -- ] -- n )
+\ What CHECKED throws of the held answer, else 0.
+: CHECKS ( ptr fetch -- n )
+   {: f :}
+   f FETCH-CLIENT @ {: c :}
+   [: c f FETCH-REV @ SPAN:$ f FETCH-OFFSET @ CHECKED ;] catch ;
+
+
+\ The first chunk: a 2xx one passes or spoils on its checks, made
+\ through the headers curl answers from that chunk on; any other status
+\ is the core's to classify.
+: FIRST-CHECKED ( ptr fetch -- open-event )
+   {: f :}
+   f FETCH-STATUS @ {: s:n :}
+   s 200 >= s 300 < and 0= if construct open-event other exit then
+   f FETCH-CLIENT @ {: c :}
+   s c CLIENT-STATUS !
+   c CAPTURE
+   f CHECKS {: code:n :}
+   code f FETCH-CODE !
+   code 0= if construct open-event passed exit then
+   construct open-event spoiled ;
+
+
+: OPEN-SENSE ( ptr fetch -- open-event )
+   {: f :}
+   f PULL MATCH read-event
+      chunk OF f FIRST-CHECKED ENDOF
+      response OF construct open-event response ENDOF
+      failure OF construct open-event failure ENDOF
+   ;MATCH ;
+
+
+\ What sink threw on the last chunk, before the next read.
+: STREAM-SENSE ( ptr fetch -- stream-event )
+   {: f :}
+   f FETCH-CODE @ 0<> if construct stream-event threw exit then
+   f PULL MATCH read-event
+      chunk OF construct stream-event chunk ENDOF
+      response OF construct stream-event response ENDOF
+      failure OF construct stream-event failure ENDOF
+   ;MATCH ;
+
+
+\ Ends the transfer early; draining reads it to its end, so the handle
+\ is free for the next request.
+: CANCELLED ( ptr fetch -- ) FETCH-HANDLE @ CURL:CANCEL ;
+
+
+\ A chunk of a status other than 2xx, for the core to classify.
+: ANSWER+ ( ptr fetch -- )
+   {: f :}
+   f FETCH-HELD @ SPAN:$ f FETCH-CLIENT @ CLIENT-ANSWER @ APPEND ;
+
+
+: RESPONDED ( ptr fetch -- )
+   {: f :}
+   f FETCH-CLIENT @ {: c :}
+   f FETCH-STATUS @ c CLIENT-STATUS !
+   c CAPTURE ;
+
+
+: BROKE ( ptr fetch -- )
+   {: f :}
+   f FETCH-CLIENT @ {: c :}
+   0 c CLIENT-STATUS !
+   f FETCH-FAILURE @ c CLIENT-FAILURE ! ;
+
+
+: RETHROWN ( ptr fetch -- ) FETCH-CODE @ throw ;
+
+
+FSM:DEFINE DOWNLOADING ( ptr fetch ) download-step open-event
+   IN opened  OPEN-SENSE
+      passed    -          >streaming
+      spoiled   CANCELLED  >draining
+      other     ANSWER+    >buffering
+      response  RESPONDED  >answered
+      failure   BROKE      >lost
+   IN streaming  STREAM-SENSE ( stream-event )
+      chunk     -          >streaming
+      threw     CANCELLED  >draining
+      response  RESPONDED  >answered
+      failure   BROKE      >lost
+   IN buffering  PULL ( read-event )
+      chunk     ANSWER+    >buffering
+      response  RESPONDED  >answered
+      failure   BROKE      >lost
+   IN draining  PULL ( read-event )
+      chunk     -  >draining
+      response  -  >thrown
+      failure   -  >thrown
+   FINAL answered  -
+   FINAL lost      -
+   FINAL thrown    RETHROWN
+;DEFINE
+
+
+: STREAMING? ( download-step -- bool )
+   construct download-step streaming DOWNLOAD-STEP-EQ ;
+
+
+\ Hands the held chunk to sink at its file offset and counts it; what
+\ sink throws is kept for STREAM-SENSE.
+: DELIVERED ( ptr fetch [ ptr u8 n n -- ] -- )
+   {: f sink :}
+   f FETCH-HELD @ SPAN:$ {: p:ptr u:n :}
+   [: p u f FETCH-OFFSET @ f FETCH-TOTAL @ + sink execute ;] catch
+   f FETCH-CODE !
+   u f FETCH-TOTAL +! ;
+
+
+\ Steps the machine from opened to its end; each step that leaves it
+\ streaming hands its chunk to sink.
+: DRIVEN ( ptr fetch [ ptr u8 n n -- ] -- download-step )
+   {: f sink :}
+   construct download-step opened
+   begin
+      f swap DOWNLOADING-STEP >r
+      dup STREAMING? if f sink DELIVERED then
+      r>
+   until ;
+
+
+\ Sends the prepared request and reads its answer through DOWNLOADING:
+\ the end, answered or lost, and the bytes sink took.
+: STREAMED ( ptr client ptr u8 n n [ ptr u8 n n -- ] -- download-step n )
    {: c r:ptr ru:n at:n sink :}
    c STARTED {: h:CURL:handle :}
-   0 begin h c r ru at sink PIECE until
-   c ENDED ;
+   FETCHES-NEW {: f :}
+   c f FETCH-CLIENT ! h f FETCH-HANDLE !
+   r ru SPAN:MAKE f FETCH-REV ! at f FETCH-OFFSET !
+   [: f sink DRIVEN f FETCH-TOTAL @ ;] [: f FETCHES-RELEASE ;] finally ;
 
 
 \ A 206 is a download's done too; RANGED checks it was asked for.
@@ -1108,12 +1232,11 @@ ENUM verdict
    s" a range it cannot satisfy from 0" E-ANSWER FAILED ;
 
 
-\ A 416, RangeUnsatisfiable in dropbox.rs, carries no Dropbox-API-Result,
-\ so it is never done; unsat answers it, whatever size its Content-Range
-\ names.
-: FETCHED ( ptr client ptr u8 n n [ ptr u8 n n -- ] [ ptr client -- reply ] -- verdict )
-   {: c r:ptr ru:n at:n sink unsat :}
-   c r ru at sink STREAMED {: got:n :}
+\ An answer that arrived. A 416, RangeUnsatisfiable in dropbox.rs, carries
+\ no Dropbox-API-Result, so it is never done; unsat answers it, whatever
+\ size its Content-Range names.
+: ARRIVED ( ptr client ptr u8 n n n [ ptr client -- reply ] -- verdict )
+   {: c r:ptr ru:n at:n got:n unsat :}
    c CLIENT-STATUS @ 416 = if c unsat execute ANSWER exit then
    c SORTED {: v:verdict :}
    v MATCH verdict
@@ -1121,6 +1244,16 @@ ENUM verdict
       expired OF ENDOF
    ;MATCH
    v ;
+
+
+\ A lost transfer is the core's to classify; a thrown one rethrew in
+\ DOWNLOADING once it ended.
+: FETCHED ( ptr client ptr u8 n n [ ptr u8 n n -- ] [ ptr client -- reply ] -- verdict )
+   {: c r:ptr ru:n at:n sink unsat :}
+   c r ru at sink STREAMED {: end:download-step got:n :}
+   end construct download-step lost DOWNLOAD-STEP-EQ
+   if c LOST ANSWER exit then
+   c r ru at got unsat ARRIVED ;
 
 
 \ files/download from the offset; unsat answers a 416.
