@@ -1,7 +1,9 @@
 \ config-test.f - CONFIG against the Rust version's config.rs tests of what
 \ it ports, under their names: the XDG paths, the private paths and their
-\ symlink projection, the sync root's checks and the refusals of a config
-\ that names a protected path inside it. Then config.toml as the toml crate
+\ symlink projection, the sync root's checks, the refusals of a config
+\ that names a protected path inside it, the prepared directories and the
+\ daemon lock, contended in this process and by util-linux's flock(1)
+\ through /usr/bin/flock. Then config.toml as the toml crate
 \ reads it: each string form, each escape, comments, whitespace, CRLF, a
 \ BOM and quoted keys, and each refusal with the code the Rust error maps
 \ to. Every case runs in a directory of its own under TMPDIR, sets its own
@@ -18,6 +20,8 @@ require src/lib/test.f
 require src/lib/test/stderr.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
+require src/lib/fd.f
+require src/lib/process.f
 require src/config.f
 
 package CONFIG-TEST
@@ -25,15 +29,15 @@ package CONFIG-TEST
 
 
 \ CONFIG reopened for project_physical_path, resolve_xdg_directories,
-\ the XDG fields and fs::canonicalize. Each name lands in CONFIG-TEST, so
-\ CONFIG gains none.
+\ the XDG fields, fs::canonicalize, Paths::prepare and a lock's descriptor.
+\ Each name lands in CONFIG-TEST, so CONFIG gains none.
 package CONFIG
 
-: CONFIG-TEST:FOLLOW ( path ^ARENA:arena -- path )
+: CONFIG-TEST:FOLLOW ( abs-path ^ARENA:arena -- abs-path )
    {: p ar :}
    p DANGLING-FOLLOW ar PROJECT ;
 
-: CONFIG-TEST:REFUSE ( path ^ARENA:arena -- path )
+: CONFIG-TEST:REFUSE ( abs-path ^ARENA:arena -- abs-path )
    {: p ar :}
    p DANGLING-REFUSE ar PROJECT ;
 
@@ -42,19 +46,26 @@ package CONFIG
 : CONFIG-TEST:RESOLVE ( option<str> option<str> option<str> ^ARENA:arena -- ^xdg )
    RESOLVE-XDG ;
 
-: CONFIG-TEST:CONFIG-HOME ( ^xdg -- path ) XDG-CONFIG-HOME @ ;
-: CONFIG-TEST:STATE-HOME ( ^xdg -- path ) XDG-STATE-HOME @ ;
+: CONFIG-TEST:CONFIG-HOME ( ^xdg -- abs-path ) XDG-CONFIG-HOME @ ;
+: CONFIG-TEST:STATE-HOME ( ^xdg -- abs-path ) XDG-STATE-HOME @ ;
 
 \ application_state_directory.
-: CONFIG-TEST:STATE-APP ( ^xdg ^ARENA:arena -- path ) XDG-STATE-DIRECTORY ;
+: CONFIG-TEST:STATE-APP ( ^xdg ^ARENA:arena -- abs-path ) XDG-STATE-DIRECTORY ;
 
 : CANON-FAILED ( -- ) E-INSPECT-PATH throw ;
 
-: CONFIG-TEST:CANON ( str ^ARENA:arena -- path )
+: CONFIG-TEST:CANON ( str ^ARENA:arena -- abs-path )
    CANONICAL MATCH option
       some OF ENDOF
       none OF CANON-FAILED ENDOF
    ;MATCH ;
+
+: CONFIG-TEST:PREPARE-PATHS ( ^paths abs-path ^ARENA:arena -- )
+   PREPARE-PATHS ;
+
+: CONFIG-TEST:LOCK-FD ( lock -- lock n )
+   LOCK-UNMAKE {: f:fd p :}
+   f p LOCK-MAKE f FD>N ;
 
 ;package
 
@@ -70,6 +81,8 @@ TYPED-VARIABLE BODY [ -- ]
 TYPED-VARIABLE ACTION [ -- ]
 TYPED-VARIABLE XDG ^CONFIG:xdg
 TYPED-VARIABLE ROOT str
+TYPED-VARIABLE SET ^CONFIG:paths
+TYPED-VARIABLE HELD ^CONFIG:config
 create ERR 1024 allot
 variable ERR-U
 \ FS:ERRNO as the logged action left it.
@@ -104,16 +117,22 @@ variable CAUSE
    {: n:^ u:n :}
    REAL @ s" /" S+ n u S+ ;
 
-: P ( ^u8 n -- CONFIG:path ) UNDER CONFIG:>PATH ;
+: P ( ^u8 n -- CONFIG:abs-path ) UNDER CONFIG:>ABS-PATH ;
 
 : MKDIR ( str -- ) str> FS:MAKE-DIR ;
 : MKDIRS ( str -- ) str> FS:MAKE-DIRS ;
 : SYMLINK ( str str -- ) {: target link :} target str> link str> FS:MAKE-SYMLINK ;
 : EXISTS? ( str -- bool ) str> FS:TRY-STAT ;
+: DIRECTORY? ( CONFIG:abs-path -- bool ) CONFIG:ABS-PATH>STR str> FS:DIR? ;
 
-: PATH= ( CONFIG:path str -- )
+\ The permission bits of the entry a path names, links followed.
+: MODE ( CONFIG:abs-path -- n )
+   CONFIG:ABS-PATH>STR str> FS:TRY-STAT TTRUE
+   FS:STAT-MODE@ $1FF and ;
+
+: PATH= ( CONFIG:abs-path str -- )
    {: p s :}
-   p CONFIG:PATH>STR str> s str> T$= ;
+   p CONFIG:ABS-PATH>STR str> s str> T$= ;
 
 : CONTAINS? ( ^u8 n ^u8 n -- bool )
    {: a:^ u:n t:^ tu:n :}
@@ -134,7 +153,7 @@ variable CAUSE
    BODY ! T-LABEL
    ARENA:NEW AR !
    s" TMPDIR" GETENV s" config-test-" FS:MKTEMP-DIR-IN KEEP DIR !
-   DIR @ AR @ CONFIG-TEST:CANON CONFIG:PATH>STR REAL !
+   DIR @ AR @ CONFIG-TEST:CANON CONFIG:ABS-PATH>STR REAL !
    [: BODY @ execute ;] [: CLEANUP ;] finally ;
 
 
@@ -188,11 +207,11 @@ variable CAUSE
 
 : XDG-LINKED ( ^u8 n str -- )
    {: c:^ cu:n s :}
-   c cu P s CONFIG:>PATH AR @ CONFIG:XDG-NEW XDG ! ;
+   c cu P s CONFIG:>ABS-PATH AR @ CONFIG:XDG-NEW XDG ! ;
 
-: CONFIG-FILE ( -- str ) XDG @ AR @ CONFIG:XDG-CONFIG-FILE CONFIG:PATH>STR ;
-: CONFIG-DIR ( -- str ) XDG @ AR @ CONFIG:RESOLVE-PRIVATE CONFIG:CONFIG-DIRECTORY CONFIG:PATH>STR ;
-: STATE-APP ( -- str ) XDG @ AR @ CONFIG-TEST:STATE-APP CONFIG:PATH>STR ;
+: CONFIG-FILE ( -- str ) XDG @ AR @ CONFIG:XDG-CONFIG-FILE CONFIG:ABS-PATH>STR ;
+: CONFIG-DIR ( -- str ) XDG @ AR @ CONFIG:RESOLVE-PRIVATE CONFIG:CONFIG-DIRECTORY CONFIG:ABS-PATH>STR ;
+: STATE-APP ( -- str ) XDG @ AR @ CONFIG-TEST:STATE-APP CONFIG:ABS-PATH>STR ;
 
 : WRITE-CONFIG ( str -- ) {: t :} CONFIG-FILE str> t str> FS:WRITE-ALL ;
 
@@ -221,29 +240,31 @@ variable CAUSE
 
 : SAME-PATHS ( ^CONFIG:paths ^CONFIG:paths -- )
    {: a b :}
-   a CONFIG:CONFIG-DIRECTORY b CONFIG:CONFIG-DIRECTORY CONFIG:PATH>STR PATH=
-   a CONFIG:STATE-DIRECTORY b CONFIG:STATE-DIRECTORY CONFIG:PATH>STR PATH=
-   a CONFIG:JOURNAL-FILE b CONFIG:JOURNAL-FILE CONFIG:PATH>STR PATH=
+   a CONFIG:CONFIG-DIRECTORY b CONFIG:CONFIG-DIRECTORY CONFIG:ABS-PATH>STR PATH=
+   a CONFIG:STATE-DIRECTORY b CONFIG:STATE-DIRECTORY CONFIG:ABS-PATH>STR PATH=
+   a CONFIG:JOURNAL-FILE b CONFIG:JOURNAL-FILE CONFIG:ABS-PATH>STR PATH=
    a CONFIG:UPLOAD-STAGING-DIRECTORY b CONFIG:UPLOAD-STAGING-DIRECTORY
-   CONFIG:PATH>STR PATH=
-   a CONFIG:RECOVERY-DIRECTORY b CONFIG:RECOVERY-DIRECTORY CONFIG:PATH>STR PATH=
-   a CONFIG:LOCK-FILE b CONFIG:LOCK-FILE CONFIG:PATH>STR PATH= ;
+   CONFIG:ABS-PATH>STR PATH=
+   a CONFIG:RECOVERY-DIRECTORY b CONFIG:RECOVERY-DIRECTORY CONFIG:ABS-PATH>STR PATH=
+   a CONFIG:LOCK-FILE b CONFIG:LOCK-FILE CONFIG:ABS-PATH>STR PATH= ;
 
 
 \ ---- config.rs's tests
 
-\ Its loading half: the Rust test then prepares the state, after which
-\ state_home exists and fs::canonicalize names it; before, the journal is
-\ the canonical case directory's state/omabox/journal.sqlite3. The Rust
-\ test compares the root as spelled, which is canonical under its TMPDIR.
+\ The Rust test compares the root as spelled, which is canonical under its
+\ TMPDIR.
 : RESOLVES-XDG-PATHS ( -- )
    FIXTURE STANDARD
    LOAD {: c :}
+   c CONFIG:PREPARE
+   c CONFIG:PATHS {: p :}
    c CONFIG:SYNC-ROOT s" Dropbox" REAL-UNDER PATH=
    c CONFIG:APP-KEY str> s" test-app-key" T$=
-   c CONFIG:PATHS CONFIG:JOURNAL-FILE
-   s" state/omabox/journal.sqlite3" REAL-UNDER PATH=
-   c CONFIG:PATHS CONFIG:JOURNAL-FILE CONFIG:PATH>STR EXISTS? TFALSE ;
+   p CONFIG:JOURNAL-FILE s" state" UNDER AR @ CONFIG-TEST:CANON
+   CONFIG:ABS-PATH>STR s" /omabox/journal.sqlite3" S+ PATH=
+   p CONFIG:UPLOAD-STAGING-DIRECTORY DIRECTORY? TTRUE
+   p CONFIG:RECOVERY-DIRECTORY DIRECTORY? TTRUE
+   p CONFIG:JOURNAL-FILE CONFIG:ABS-PATH>STR EXISTS? TFALSE ;
 
 : ROOT-UNAVAILABLE ( -- )
    FIXTURE STANDARD
@@ -336,7 +357,7 @@ variable CAUSE
    s" could not inspect `" >str s" link" UNDER CAT
    s" ` while validating configuration paths" S+ REFUSED ;
 
-: FROM-ROOT ( -- ) XDG @ ROOT @ CONFIG:>PATH s" test-app-key" >str AR @ CONFIG:FROM-VALUES drop ;
+: FROM-ROOT ( -- ) XDG @ ROOT @ CONFIG:>ABS-PATH s" test-app-key" >str AR @ CONFIG:FROM-VALUES drop ;
 
 \ The Rust test also checks the miette help, "Set XDG_CONFIG_HOME to a
 \ local directory outside the sync root."; CONFIG ports no help, so the
@@ -394,6 +415,122 @@ variable CAUSE
    s" /configured/state" >str SOME AR @ CONFIG-TEST:RESOLVE {: x :}
    x CONFIG-TEST:CONFIG-HOME s" /configured/config" >str PATH=
    x CONFIG-TEST:STATE-HOME s" /configured/state" >str PATH= ;
+
+
+\ ---- prepare and the daemon lock
+
+\ 0700, each.
+: RUNTIME-MODES ( ^CONFIG:paths -- )
+   {: p :}
+   p CONFIG:STATE-DIRECTORY MODE $1C0 T=
+   p CONFIG:UPLOAD-STAGING-DIRECTORY MODE $1C0 T=
+   p CONFIG:RECOVERY-DIRECTORY MODE $1C0 T= ;
+
+: PREPARE-CREATES ( -- )
+   FIXTURE STANDARD
+   LOAD {: c :}
+   c CONFIG:PREPARE
+   c CONFIG:PATHS RUNTIME-MODES ;
+
+\ The directory made, then set 0777.
+: BROAD ( CONFIG:abs-path -- )
+   CONFIG:ABS-PATH>STR str> {: a:^ u:n :}
+   a u FS:MAKE-DIRS
+   a u $1FF FS:CHMOD-MODE ;
+
+: PREPARE-REPAIRS ( -- )
+   FIXTURE STANDARD
+   LOAD {: c :}
+   c CONFIG:PATHS {: p :}
+   p CONFIG:STATE-DIRECTORY BROAD
+   p CONFIG:UPLOAD-STAGING-DIRECTORY BROAD
+   p CONFIG:RECOVERY-DIRECTORY BROAD
+   c CONFIG:PREPARE
+   p RUNTIME-MODES ;
+
+: PREPARE-ROOT ( -- )
+   SET @ ROOT @ CONFIG:>ABS-PATH AR @ CONFIG-TEST:PREPARE-PATHS ;
+
+\ ROOT is DIR/root, a link to the missing DIR/data, which holds the state.
+: DANGLING-ROOT-TARGET ( -- )
+   s" data" UNDER s" root" UNDER SYMLINK
+   s" root" UNDER ROOT !
+   s" config" s" data/state" XDG-AT
+   XDG @ AR @ CONFIG:RESOLVE-PRIVATE SET !
+   ['] PREPARE-ROOT CONFIG:E-INSIDE-SYNC-ROOT
+   s" state directory" s" data/state/omabox" REAL-UNDER ROOT @
+   INSIDE-TEXT REFUSED
+   s" data" UNDER EXISTS? TFALSE ;
+
+\ A config over the fixture, prepared; its lock file is
+\ REAL/state/omabox/daemon.lock.
+: LOCKABLE ( -- ^CONFIG:config )
+   FIXTURE STANDARD
+   LOAD {: c :}
+   c CONFIG:PREPARE
+   c ;
+
+: LOCK-PATH ( -- str )
+   HELD @ CONFIG:PATHS CONFIG:LOCK-FILE CONFIG:ABS-PATH>STR ;
+: LOCK-DROP ( -- ) HELD @ CONFIG:LOCK CONFIG:UNLOCK ;
+
+: OPEN-TEXT ( -- str )
+   s" could not open daemon lock file `" >str LOCK-PATH CAT s" `" S+ ;
+
+\ The exit code of `flock -n LOCK-PATH true`: 1 while the lock is held.
+: FLOCK-RC ( -- n )
+   s" /usr/bin/flock" PROCESS:NEW s" -n" PROCESS:ARG
+   LOCK-PATH str> PROCESS:ARG s" true" PROCESS:ARG
+   PROCESS:SPAWN PROCESS:WAIT PROCESS:STATUS>RC RC>N ;
+
+: LOCK-OWNER-ONLY ( -- )
+   LOCKABLE HELD !
+   HELD @ CONFIG:LOCK {: l :}
+   LOCK-PATH str> FS:TRY-STAT TTRUE
+   FS:STAT-MODE@ $1FF and $180 T=
+   l CONFIG:UNLOCK ;
+
+\ The Rust test makes existing.lock by locking it; a plain file stands for
+\ it, as the lock file is one.
+: LOCK-SYMLINKED ( -- )
+   LOCKABLE HELD !
+   s" planted.lock" UNDER LOCK-PATH SYMLINK
+   ['] LOCK-DROP CONFIG:E-LOCK-OPEN OPEN-TEXT REFUSED
+   CAUSE @ 0 T=
+   s" planted.lock" UNDER EXISTS? TFALSE
+   LOCK-PATH str> FS:REMOVE-FILE
+   s" existing.lock" UNDER str> s" " FS:WRITE-ALL
+   s" existing.lock" UNDER LOCK-PATH SYMLINK
+   ['] LOCK-DROP CONFIG:E-LOCK-OPEN OPEN-TEXT REFUSED
+   CAUSE @ 0 T= ;
+
+\ A lock's path is its config's LOCK-FILE, so the Rust test's path check
+\ is the file's presence. flock(1) contends as the Rust daemon would.
+: LOCK-CONTENTION ( -- )
+   LOCKABLE HELD !
+   HELD @ CONFIG:LOCK {: first :}
+   ['] LOCK-DROP CONFIG:E-ALREADY-RUNNING
+   s" another Omabox daemon is already running" >str REFUSED
+   CAUSE @ 0 T=
+   FLOCK-RC 1 T=
+   first CONFIG:UNLOCK
+   FLOCK-RC 0 T=
+   HELD @ CONFIG:LOCK {: second :}
+   LOCK-PATH EXISTS? TTRUE
+   second CONFIG:UNLOCK ;
+
+\ The copy shares the lock's open file description, as a forked child's
+\ copy of the descriptor does.
+: LOCK-COPY ( -- )
+   LOCKABLE HELD !
+   HELD @ CONFIG:LOCK CONFIG-TEST:LOCK-FD {: first copy:n :}
+   copy FD:F-DUPFD-CLOEXEC 0 fcntl {: twin:n :}
+   twin 0 >= TTRUE
+   first CONFIG:UNLOCK
+   HELD @ CONFIG:LOCK {: second :}
+   FLOCK-RC 1 T=
+   twin close
+   second CONFIG:UNLOCK ;
 
 
 \ ---- config.toml
@@ -493,6 +630,8 @@ public
    T-RESET
    s" config_resolves_xdg_paths_and_prepares_state" ['] RESOLVES-XDG-PATHS RUN-CASE
    s" document_loads_when_the_recorded_root_is_unavailable" ['] ROOT-UNAVAILABLE RUN-CASE
+   s" prepare_creates_private_runtime_directories" ['] PREPARE-CREATES RUN-CASE
+   s" prepare_repairs_broad_runtime_directory_permissions" ['] PREPARE-REPAIRS RUN-CASE
    s" config_rejects_state_inside_sync_root" ['] STATE-INSIDE RUN-CASE
    s" config_rejects_symlinked_state_inside_sync_root" ['] SYMLINKED-STATE RUN-CASE
    s" config_rejects_dangling_state_symlink_into_sync_root_without_creating_target"
@@ -503,6 +642,8 @@ public
    s" projection_leaves_a_missing_component_on_parent" ['] MISSING-ON-PARENT RUN-CASE
    s" projection_refuses_a_symlink_loop" ['] SYMLINK-LOOP RUN-CASE
    s" refusing_projection_fails_on_a_dangling_symlink" ['] REFUSES-DANGLING RUN-CASE
+   s" prepare_refuses_state_below_a_dangling_root_target"
+   ['] DANGLING-ROOT-TARGET RUN-CASE
    s" config_rejects_sync_root_containing_the_config_directory"
    ['] ROOT-HOLDS-CONFIG RUN-CASE
    s" config_rejects_a_lock_symlinked_into_the_sync_root" ['] LOCK-INSIDE RUN-CASE
@@ -511,6 +652,11 @@ public
    s" xdg_empty_values_use_home_defaults" ['] EMPTY-VALUES RUN-CASE
    s" xdg_relative_values_use_home_defaults" ['] RELATIVE-VALUES RUN-CASE
    s" xdg_absolute_values_do_not_require_home" ['] ABSOLUTE-VALUES RUN-CASE
+   s" daemon_lock_file_is_created_for_its_owner_only" ['] LOCK-OWNER-ONLY RUN-CASE
+   s" daemon_lock_refuses_a_symlinked_lock_file" ['] LOCK-SYMLINKED RUN-CASE
+   s" lock_contention_is_clean_and_release_is_automatic" ['] LOCK-CONTENTION RUN-CASE
+   s" dropping_the_lock_releases_it_while_a_descriptor_copy_is_open"
+   ['] LOCK-COPY RUN-CASE
    s" a basic string" ['] BASIC RUN-CASE
    s" a literal string" ['] LITERAL RUN-CASE
    s" a multi-line basic string" ['] ML-BASIC RUN-CASE
