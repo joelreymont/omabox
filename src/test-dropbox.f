@@ -6,6 +6,8 @@
 \ the shapes tests/dropbox_fake.rs gives them. It accepts one app key and
 \ refresh token, and one code GRANT! sets; it issues the access tokens
 \ sl.fake-1, sl.fake-2 and on, and EXPIRE expires every token issued so far.
+\ ROTATE! makes the next refresh also answer a new refresh token, which the
+\ token route accepts from then on.
 \ LOSE applies the next API call and loses its answer; each CUT loses one
 \ more API call's answer, before the call takes effect, and CUT-TOKEN a token
 \ request's; GARBLE answers the next API call, before it takes effect, with a
@@ -48,6 +50,8 @@ create ORIGIN NAME-CAP allot
 variable ORIGIN-U
 create ISSUED NAME-CAP allot
 variable ISSUED-U
+create ROTATED NAME-CAP allot
+variable ROTATED-U
 variable ISSUES
 \ Tokens numbered up to this one are expired.
 variable EXPIRED
@@ -279,6 +283,13 @@ variable FORM-AT
    SB$ ISSUED NAME-CAP STORE ISSUED-U ! ;
 
 
+\ The rotated refresh token, which the token route accepts from then on.
+: ROTATION+ ( -- )
+   S\" \q,\qrefresh_token\q:\q" SB-APPEND ROTATED ROTATED-U @ SB-APPEND
+   ROTATED ROTATED-U @ REFRESH NAME-CAP STORE REFRESH-U !
+   0 ROTATED-U ! ;
+
+
 : TOKEN ( HTTP:request HTTP:response -- )
    {: q:HTTP:request a:HTTP:response :}
    q HTTP:BODY$ FIELDS$ FORM$ STR= 0= if
@@ -288,6 +299,7 @@ variable FORM-AT
    then
    ISSUE
    SB-RESET S\" {\qaccess_token\q:\q" SB-APPEND ISSUED ISSUED-U @ SB-APPEND
+   ROTATED-U @ 0<> if ROTATION+ then
    S\" \q,\qtoken_type\q:\qbearer\q,\qexpires_in\q:14400}" SB-APPEND
    a BUILT ANSWER! ;
 
@@ -1143,10 +1155,11 @@ $2100000 constant UPLOAD-CAP
 \ Forgets the script, the entries, the kept bytes, the pages, the long
 \ poll's answer, the sessions, the revs uploads took, a download's fault, a
 \ SKEW, a LOSE, the CUTs, a CUT-TOKEN, a GARBLE, a code GRANT! set, a
-\ REVOKE, a DENY and what was sent; the tokens and the root stay.
+\ ROTATE!, a REVOKE, a DENY and what was sent; the tokens and the root
+\ stay.
 : RESET ( -- )
    0 SCRIPTS ! 0 SCRIPTED ! 0 FILES ! 0 CONTENTS ! 0 SESSIONS ! 0 REVS !
-   0 GRANT-CODE-U !
+   0 GRANT-CODE-U ! 0 ROTATED-U !
    0 SEEN-U ! 0 AUTH-U ! 0 ROOT-SENT-U ! 0 TYPE-SENT-U !
    0 ARG-SENT-U ! 0 RANGE-SENT-U !
    false ROOTED ! false TYPED ! false LEAKED ! false RANGED !
@@ -1165,6 +1178,11 @@ $2100000 constant UPLOAD-CAP
 
 \ The root every call's Path-Root names; empty means none is sent.
 : ROOT! ( ^u8 n -- ) ROOT NAME-CAP STORE ROOT-U ! ;
+
+
+\ The next refresh also answers this refresh token, which the token route
+\ accepts in place of the one before from then on.
+: ROTATE! ( ^u8 n -- ) ROTATED NAME-CAP STORE ROTATED-U ! ;
 
 
 \ Expires every access token issued so far.

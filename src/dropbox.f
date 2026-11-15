@@ -6,12 +6,16 @@
 \ <api>/2/<route>; a client with no access token refreshes first, and any 401
 \ refreshes and resends the call once, which answers unlinked if refused
 \ again. Unlinked is logged once, where it is decided, and a confirmation
-\ that answers unlinked answers it in its call's place. The long poll is a
+\ that answers unlinked answers it in its call's place. A refresh that
+\ rotates the refresh token hands it to the config's store before the new
+\ access token is used (the token's phase, below). The long poll is a
 \ POST to <notify>/2/files/list_folder/longpoll with neither token nor root.
 \ An answer is classified once: 200 done, 403 unlinked, 409 refused by its
 \ error tag, 422 refused invalid-root, 429, 408 and 5xx retry, a timeout or
 \ lost connection retry 0; anything else logs one line (route, status, at
-\ most EXCERPT bytes of the body, never a token) and throws a DROPBOX code.
+\ most EXCERPT bytes of the body, never a token) and throws a DROPBOX code,
+\ a bug on one side of the wire. E-NOT-STORED is environmental instead:
+\ the store failed, and the next call retries it.
 \ A 409's error is a Dropbox union: its leaf tag is the `.tag` of the member
 \ named by the outer `.tag`, or of `reason` in an upload's error, when that
 \ member is an object, else the outer `.tag` itself, so path/not_found reads
@@ -50,6 +54,8 @@ public
 -100003 s" Dropbox's answer did not parse" ERROR:CODE E-ANSWER
 -100004 s" Dropbox refused the access token" ERROR:CODE E-AUTH
 -100005 s" the transfer to Dropbox failed" ERROR:CODE E-TRANSPORT
+-100007 s" the rotated Dropbox refresh token could not be stored"
+   ERROR:CODE E-NOT-STORED
 
 \ Dropbox's 409 error tags omabox decides on; any other tag is other.
 ENUM error DERIVE eq
@@ -94,16 +100,28 @@ STRUCTURE entry DERIVE addr
 ;STRUCTURE
 
 \ What OPEN copies: key is the app key, Dropbox's client_id; token the
-\ refresh token; root the root namespace, empty for the account's home;
-\ api, content and notify the origins, which tests point at a fake.
+\ refresh token; store keeps a rotated refresh token where token came
+\ from, throws when it cannot and must not use the client; root the root
+\ namespace, empty for the account's home; api, content and notify the
+\ origins, which tests point at a fake.
 STRUCTURE config DERIVE addr
    FIELD key SPAN:span<u8>
    FIELD token SPAN:span<u8>
+   FIELD store [ ^u8 n -- ]
    FIELD root SPAN:span<u8>
    FIELD api SPAN:span<u8>
    FIELD content SPAN:span<u8>
    FIELD notify SPAN:span<u8>
 ;STRUCTURE
+
+private
+
+\ The refresh token's phase. pending: the client holds a rotated refresh
+\ token the store refused; rejected: Dropbox refuses the client until the
+\ user logs in again.
+ENUM phase ready pending rejected ;ENUM
+
+public
 
 \ The buffers are BUF headers in the arena: token holds the refresh token,
 \ access the access token, body a route's JSON body, line a URL or header
@@ -122,11 +140,14 @@ STRUCTURE config DERIVE addr
 \ must hold, one bit each; changes and backoff are a long poll's answer.
 \ tagged marks the `.tag` of the Metadata union being read into entry.
 \ drain takes the reads of a transfer ABANDONED ends; laid out at OPEN
-\ and never grown, so ending a transfer allocates nothing.
+\ and never grown, so ending a transfer allocates nothing. store and
+\ phase are the config's store and the refresh token's phase.
 STRUCTURE client OPAQUE DERIVE addr
    FIELD handle CURL:handle
    FIELD key SPAN:span<u8>
    FIELD token ^n
+   FIELD store [ ^u8 n -- ]
+   FIELD phase phase
    FIELD api SPAN:span<u8>
    FIELD content SPAN:span<u8>
    FIELD notify SPAN:span<u8>
@@ -290,6 +311,8 @@ ENUM verdict
    cfg ar [: DROPBOX-CONFIG:KEY ;] KEPT c CLIENT-KEY !
    cfg DROPBOX-CONFIG:TOKEN @ SPAN:$ BUF:N>BLEN
    c CLIENT-TOKEN @ BUF:REPLACE
+   cfg DROPBOX-CONFIG:STORE @ c CLIENT-STORE !
+   construct phase ready c CLIENT-PHASE !
    cfg ar [: DROPBOX-CONFIG:API ;] KEPT c CLIENT-API !
    cfg ar [: DROPBOX-CONFIG:CONTENT ;] KEPT c CLIENT-CONTENT !
    cfg ar [: DROPBOX-CONFIG:NOTIFY ;] KEPT c CLIENT-NOTIFY !
@@ -757,14 +780,80 @@ ENUM verdict
    c STRING c CLIENT-ISSUED ! ;
 
 
+\ A token answer's members: access_token and refresh_token.
+: GRANTED-MEMBER ( JSON:reader ^client -- JSON:reader )
+   {: c :}
+   s" refresh_token" JSON:READ-STR-EQ? 0= if c ISSUED-MEMBER exit then
+   c STRING c CLIENT-GRANTED ! ;
+
+
+: REPLACED ( SPAN:span<u8> ^n -- )
+   {: t:SPAN:span<u8> buf :}
+   t SPAN:$ BUF:N>BLEN buf BUF:REPLACE ;
+
+
+\ ---- the refresh token's phase
+\ phase     input                                  next
+\ ready     a refresh with no new refresh token    ready
+\ ready     a new one the store takes              ready
+\ ready     a new one the store refuses            pending
+\ ready     invalid_grant, a fresh token refused   rejected
+\ pending   a call, the store taking the token     ready
+\ pending   a call, the store refusing it          pending
+\ rejected  a call, answered unlinked unsent       rejected
+\ any       an exchange's tokens kept              ready
+\ A refusal throws E-NOT-STORED from the call. A call starts by its
+\ phase, so a refresh only ever starts in ready.
+
+\ Hands the client's refresh token to the store: ready when it returns,
+\ pending when it throws. Answers its code, 0 for none.
+: PERSIST ( ^client -- n )
+   {: c :}
+   [: c CLIENT-TOKEN @ BUF$ c CLIENT-STORE @ execute ;] catch
+   {: code:n :}
+   code 0= if construct phase ready else construct phase pending then
+   c CLIENT-PHASE !
+   code ;
+
+
+\ One line with the store's code, then E-NOT-STORED.
+: NOT-STORED ( n -- )
+   {: code:n :}
+   LOG-OPEN E-NOT-STORED LOG:CODE+
+   s" ; the store threw " LOG:TEXT+ code LOG:CODE+ LOG:;LINE
+   E-NOT-STORED throw ;
+
+
+\ A new refresh token goes to the store, and the client keeps it either
+\ way. Answers the store's code, 0 when it took it or none was new.
+: ROTATED ( ^client -- n )
+   {: c :}
+   c CLIENT-GRANTED @ SPAN:$ {: g:^ gu:n :}
+   gu 0= if 0 exit then
+   g gu c CLIENT-TOKEN @ BUF$ STR= if 0 exit then
+   c CLIENT-GRANTED @ c CLIENT-TOKEN @ REPLACED
+   c PERSIST ;
+
+
+\ A refresh's tokens: the access token is kept once the store has run.
 : KEPT-TOKEN ( ^client -- reply )
    {: c :}
-   EMPTY c CLIENT-ISSUED !
-   c [: ISSUED-MEMBER ;] PARSE
-   c CLIENT-ISSUED @ SPAN:$ {: t:^ tu:n :}
-   tu 0= if c s" no access_token" E-ANSWER FAILED then
-   t tu BUF:N>BLEN c CLIENT-ACCESS @ BUF:REPLACE
+   EMPTY c CLIENT-ISSUED ! EMPTY c CLIENT-GRANTED !
+   c [: GRANTED-MEMBER ;] PARSE
+   c CLIENT-ISSUED @ SPAN:LEN 0=
+   if c s" no access_token" E-ANSWER FAILED then
+   c ROTATED {: code:n :}
+   c CLIENT-ISSUED @ c CLIENT-ACCESS @ REPLACED
+   code 0<> if code NOT-STORED then
    construct reply done ;
+
+
+\ Unlinked, which every later call that carries a token answers with
+\ nothing sent.
+: REJECTED ( ^client ^u8 n -- reply )
+   {: c why:^ wu:n :}
+   construct phase rejected c CLIENT-PHASE !
+   c why wu UNLINKED ;
 
 
 \ invalid_grant answers what `dead` answers.
@@ -806,7 +895,7 @@ ENUM verdict
    {: c :}
    c [: FORM ;] TOKEN-POST
    c [: KEPT-TOKEN ;]
-   [: s" the refresh token was refused" UNLINKED ;] REFRESHED ;
+   [: s" the refresh token was refused" REJECTED ;] REFRESHED ;
 
 
 \ ---- a call
@@ -839,14 +928,31 @@ ENUM verdict
    again DONE? 0= if again exit then
    c o r ru body send ATTEMPT MATCH verdict
       answer OF ENDOF
-      rejected OF c s" a refreshed token was refused" UNLINKED ENDOF
+      rejected OF c s" a refreshed token was refused" REJECTED ENDOF
    ;MATCH ;
 
 
-: READY ( ^client -- reply )
+: ACCESS ( ^client -- reply )
    {: c :}
    c CLIENT-ACCESS @ BLEN 0<> if construct reply done exit then
    c REFRESH ;
+
+
+: RETRIED ( ^client -- reply )
+   {: c :}
+   c PERSIST {: code:n :}
+   code 0<> if code NOT-STORED then
+   c ACCESS ;
+
+
+\ A call starts by the refresh token's phase.
+: READY ( ^client -- reply )
+   {: c :}
+   c CLIENT-PHASE @ MATCH phase
+      ready OF c ACCESS ENDOF
+      pending OF c RETRIED ENDOF
+      rejected OF construct reply unlinked ENDOF
+   ;MATCH ;
 
 
 : CALL-AT ( ^client SPAN:span<u8> ^u8 n [ CURL:handle ^client -- ] [ ^client -- verdict ] -- reply )
@@ -1790,17 +1896,6 @@ private
    buf BUF$ ;
 
 
-: GRANTED-MEMBER ( JSON:reader ^client -- JSON:reader )
-   {: c :}
-   s" refresh_token" JSON:READ-STR-EQ? 0= if c ISSUED-MEMBER exit then
-   c STRING c CLIENT-GRANTED ! ;
-
-
-: REPLACED ( SPAN:span<u8> ^n -- )
-   {: t:SPAN:span<u8> buf :}
-   t SPAN:$ BUF:N>BLEN buf BUF:REPLACE ;
-
-
 \ An exchange's tokens, both kept only when both came.
 : KEPT-GRANT ( ^client -- reply )
    {: c :}
@@ -1812,6 +1907,7 @@ private
    if c s" no access_token" E-ANSWER FAILED then
    c CLIENT-GRANTED @ c CLIENT-TOKEN @ REPLACED
    c CLIENT-ISSUED @ c CLIENT-ACCESS @ REPLACED
+   construct phase ready c CLIENT-PHASE !
    construct reply done ;
 
 public

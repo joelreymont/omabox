@@ -1,6 +1,7 @@
 \ dropbox-test.f - DROPBOX's client core against the fake Dropbox of
 \ test-dropbox.f on a loopback port: the account, metadata, the Path-Root
-\ header, the token's refresh, a revoked token, access denied, rate limits,
+\ header, the token's refresh, its rotation and the store that keeps it, a
+\ rejected grant, a revoked token, access denied, rate limits,
 \ outages, a redirect, a malformed request, the listing, the long poll,
 \ downloads, delete, create-folder, the code exchange, Dropbox's content
 \ hash and uploads, whose stages are written under TMPDIR and removed once
@@ -33,10 +34,12 @@ private
 TYPED-VARIABLE PROBE config
 
 
-\ A client on an arena of its own, with PROBE's root and no origins.
+\ A client on an arena of its own, with PROBE's root, no origins and a
+\ store that keeps nothing, as no case refreshes.
 : PROBED ( ^u8 n ^ARENA:arena -- ^client )
    {: r:^ ru:n ar :}
    r ru SPAN:MAKE PROBE DROPBOX-CONFIG:ROOT !
+   [: 2drop ;] PROBE DROPBOX-CONFIG:STORE !
    PROBE ar OPEN ;
 
 
@@ -206,9 +209,46 @@ TYPED-VARIABLE MAIN ^DROPBOX:client
    ;MATCH ;
 
 
-\ A client on the fake with the refresh token and root.
+\ The recording store: the refresh tokens it was handed, joined by
+\ spaces, the paths the fake had seen at its last call, and how many more
+\ calls it refuses, throwing E-FS-IO, before it takes one.
+create KEPT 256 allot
+variable KEPT-U
+create WITNESS 256 allot
+variable WITNESS-U
+variable REFUSALS
+
+
+: KEPT$ ( -- ^u8 n ) KEPT KEPT-U @ ;
+: WITNESS$ ( -- ^u8 n ) WITNESS WITNESS-U @ ;
+
+
+: KEPT+ ( ^u8 n -- )
+   {: a:^ u:n :}
+   a KEPT KEPT-U @ + u BYTE-COPY
+   u KEPT-U +! ;
+
+
+: RECORD ( ^u8 n -- )
+   {: t:^ tu:n :}
+   KEPT-U @ 0<> if s"  " KEPT+ then
+   t tu KEPT+
+   TEST-DROPBOX:SEEN$ {: w:^ wu:n :}
+   w WITNESS wu BYTE-COPY wu WITNESS-U !
+   REFUSALS @ 0= if exit then
+   -1 REFUSALS +!
+   E-FS-IO throw ;
+
+
+\ The store refuses its next n calls; nothing is recorded yet.
+: RECORDING ( n -- ) REFUSALS ! 0 KEPT-U ! 0 WITNESS-U ! ;
+
+
+\ A client on the fake with the refresh token and root, and the
+\ recording store.
 : OPENED ( ^u8 n ^u8 n -- ^DROPBOX:client )
    {: t:^ tu:n r:^ ru:n :}
+   [: RECORD ;] CFG DROPBOX-CONFIG:STORE !
    CFG DROPBOX:PRODUCTION
    TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:API !
    TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:NOTIFY !
@@ -363,28 +403,37 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    OUTCOME @ TTRUE ;
 
 
-: UNLINKED-CASE ( -- )
-   s" invalid grant" T-LABEL
+: REJECTED-GRANT-CASE ( -- )
+   s" a_refused_grant_becomes_a_rejected_token" T-LABEL
    TEST-DROPBOX:RESET
    s" dead-token" s" ns-root" OPENED {: dead :}
    dead UNLINKED-LOGGED
    s" error dropbox: oauth2/token unlinked: the refresh token was refused"
    LOGGED? TTRUE
+   dead UNLINKED-LOGGED
+   ERR-U @ 0 T=
    TEST-DROPBOX:SEEN$ s" /oauth2/token" T$=
    dead DROPBOX:CLOSE ;
 
 
+\ A client of its own, as a refreshed token refused rejects it.
 : REVOKED-CASE ( -- )
    s" revoked token" T-LABEL
    TEST-DROPBOX:RESET
+   s" live-token" s" ns-root" OPENED {: gone :}
+   gone DROPBOX:ACCOUNT DONE? ASSERT
+   TEST-DROPBOX:RESET
    TEST-DROPBOX:REVOKE
-   MAIN @ UNLINKED-LOGGED
+   gone UNLINKED-LOGGED
    s" error dropbox: users/get_current_account unlinked: a refreshed token was refused"
    LOGGED? TTRUE
+   gone UNLINKED-LOGGED
+   ERR-U @ 0 T=
    TEST-DROPBOX:SEEN$
    s" /2/users/get_current_account /oauth2/token /2/users/get_current_account" T$=
    SB-RESET s" Bearer " SB-APPEND TEST-DROPBOX:ISSUED$ SB-APPEND
-   TEST-DROPBOX:AUTH$ SB$ T$= ;
+   TEST-DROPBOX:AUTH$ SB$ T$=
+   gone DROPBOX:CLOSE ;
 
 
 : DENIED-CASE ( -- )
@@ -396,6 +445,69 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    MAIN @ UNLINKED-LOGGED
    s" error dropbox: users/get_current_account unlinked: 403" LOGGED? TTRUE
    TEST-DROPBOX:SEEN$ s" /2/users/get_current_account" T$= ;
+
+
+\ ---- the refresh token's rotation
+
+: BEARER$ ( -- ^u8 n )
+   SB-RESET s" Bearer " SB-APPEND TEST-DROPBOX:ISSUED$ SB-APPEND SB$ ;
+
+
+\ The store saw only the refresh: no call had used its access token yet.
+: STORED-FIRST-CASE ( -- )
+   s" a_rotated_refresh_token_is_stored_before_the_new_token_is_published"
+   T-LABEL
+   TEST-DROPBOX:RESET 0 RECORDING
+   s" refresh-2" TEST-DROPBOX:ROTATE!
+   s" live-token" s" ns-root" OPENED {: c :}
+   c DROPBOX:ACCOUNT DONE? ASSERT
+   KEPT$ s" refresh-2" T$=
+   WITNESS$ s" /oauth2/token" T$=
+   c DROPBOX:REFRESH-TOKEN s" refresh-2" T$=
+   TEST-DROPBOX:AUTH$ BEARER$ T$=
+   c DROPBOX:CLOSE
+   s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT! ;
+
+
+\ OUTCOME: OWN's account call answered done.
+: ACCOUNT-DONE ( -- ) OWN @ DROPBOX:ACCOUNT DONE? OUTCOME ! ;
+
+
+\ The refused store throws from the call, which keeps both tokens; the
+\ next call stores the token again and goes out with no new refresh.
+: UNSTORED-CASE ( -- )
+   s" an_unstored_rotation_stays_usable_and_is_retried" T-LABEL
+   TEST-DROPBOX:RESET 1 RECORDING
+   s" refresh-2" TEST-DROPBOX:ROTATE!
+   s" live-token" s" ns-root" OPENED {: c :}
+   c OWN ! false OUTCOME !
+   [: ACCOUNT-DONE ;] LOGGED DROPBOX:E-NOT-STORED T=
+   SB-RESET
+   s" the rotated Dropbox refresh token could not be stored; the store threw "
+   SB-APPEND E-FS-IO FMT:SB-INT SB$ LOGGED? TTRUE
+   c DROPBOX:REFRESH-TOKEN s" refresh-2" T$=
+   c DROPBOX:ACCOUNT DONE? ASSERT
+   KEPT$ s" refresh-2 refresh-2" T$=
+   TEST-DROPBOX:SEEN$ s" /oauth2/token /2/users/get_current_account" T$=
+   TEST-DROPBOX:AUTH$ BEARER$ T$=
+   c DROPBOX:CLOSE
+   s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT! ;
+
+
+\ Neither a refresh with no refresh_token nor one that answers the same
+\ one runs the store.
+: UNROTATED-CASE ( -- )
+   s" an_unrotated_refresh_never_touches_secret_service" T-LABEL
+   TEST-DROPBOX:RESET 0 RECORDING
+   s" live-token" s" ns-root" OPENED {: c :}
+   c DROPBOX:ACCOUNT DONE? ASSERT
+   TEST-DROPBOX:SEEN$ s" /oauth2/token /2/users/get_current_account" T$=
+   c DROPBOX:CLOSE
+   s" live-token" TEST-DROPBOX:ROTATE!
+   s" live-token" s" ns-root" OPENED {: same :}
+   same DROPBOX:ACCOUNT DONE? ASSERT
+   same DROPBOX:CLOSE
+   KEPT-U @ 0 T= ;
 
 
 \ A client that holds no access token refreshes first; the answer
@@ -1720,7 +1832,8 @@ TYPED-VARIABLE FAULT fault
    s" live-token" s" ns-root" OPENED MAIN !
    ACCOUNT-CASE FILE-CASE BUILT-PATH-CASE MISSING-CASE ROOT-CASE
    LOST-READ-CASE EXPIRED-CASE
-   UNLINKED-CASE REVOKED-CASE DENIED-CASE SCRIPTED-REFRESH-CASE
+   REJECTED-GRANT-CASE REVOKED-CASE DENIED-CASE
+   STORED-FIRST-CASE UNSTORED-CASE UNROTATED-CASE SCRIPTED-REFRESH-CASE
    RATE-CASE RATE-BODY-CASE RATE-DATE-CASE RATE-CAP-CASE
    RATE-ZEROS-CASE RATE-HUGE-CASE
    BUSY-CASE REDIRECT-CASE BAD-REQUEST-CASE

@@ -33,10 +33,18 @@ ENUM reply
   refused, or `invalid_grant` on the refresh. A confirmation that answers
   `unlinked` answers it in its call's place. A code exchange's `unlinked`
   means the code is dead and logs nothing.
+- A refreshed token refused, or `invalid_grant`, also rejects the client:
+  every later call that carries a token answers `unlinked` without sending
+  anything or logging again. Only a new login restores access: an
+  `EXCHANGE`, or a new client.
 - Anything else throws a `DROPBOX:E-` code after one log line, because it
   means a bug on one side of the wire. That includes 400, a 3xx (redirects are
   never followed), an answer that does not parse, and a cursor that did not
   advance.
+- `E-NOT-STORED` is not such a bug: the config's store refused a rotated
+  refresh token (below). The cause is local and may clear, as when a keyring
+  is locked, so the caller waits and calls again; the next call retries the
+  store.
 - Mapping a tag to what sync does (block the path, wait, show the user) is
   sync policy, not the vocabulary's job.
 
@@ -111,6 +119,7 @@ STRUCTURE hasher ... ;STRUCTURE
 STRUCTURE config
    FIELD key ...        \ the app key, Dropbox's client_id
    FIELD token ...      \ the refresh token; empty until EXCHANGE
+   FIELD store [ ^u8 n -- ]  \ keeps a rotated refresh token
    FIELD root ...       \ root namespace; empty means the account's home
    FIELD api ...        \ origins, which tests point at the fake
    FIELD content ...
@@ -119,6 +128,16 @@ STRUCTURE config
 : PRODUCTION ( ^config -- )   \ sets the three origins to Dropbox's
 ```
 
+- **`store`** keeps a refresh token that Dropbox rotates, where `token` came
+  from, and throws when it cannot. When a refresh answers a new
+  `refresh_token`, the client hands it to the store before the new access
+  token goes out. The client keeps both new tokens either way. If the store
+  throws, the call that refreshed throws `E-NOT-STORED`. The rotation is then
+  pending: each later call that carries a token first hands the rotated one
+  to the store again, and throws the same way until the store takes it. A
+  refresh that answers no `refresh_token`, or the same one, never runs the
+  store. The store runs inside the call that refreshed, so it must not use
+  the client.
 - **`root`** goes in a `Dropbox-API-Path-Root` header,
   `{".tag": "root", "root": "<id>"}`, on every call but the token calls. Every
   path is then relative to that namespace, which the journal binds. An empty
@@ -225,7 +244,8 @@ The sync code builds these from the words above:
 - **Token refresh.** Each client refreshes its own access token when Dropbox
   answers any 401, then resends the request once; a second 401, like a 403
   or `invalid_grant`, answers `unlinked`, as Rust reports them as needing
-  the user. The Rust version shares one token across tasks behind a
+  the user, and a second 401 or `invalid_grant` rejects the client as
+  Rust's token does. The Rust version shares one token across tasks behind a
   single-flight refresh. Dropbox tokens last four hours, so a few workers
   each refreshing on their own costs a few extra calls a day.
 - **No SDK.** The generated `dropbox-sdk` and the `ureq` adapter give way to
@@ -281,11 +301,15 @@ The tests run against a fake Dropbox on `net/http.f`, in the style of
   path is already gone;
 - **auth and transport:**
   - an expired token, refreshed and resent;
-  - a revoked token, refreshed and resent once, which answers `unlinked`;
+  - a revoked token, refreshed and resent once, which answers `unlinked`,
+    and again with no request;
   - a refreshed token refused again, and a 403, which answer `unlinked`;
   - a lost delete, a lost upload, and a create-folder conflict whose
     confirmation is refused 403, which answer `unlinked`;
-  - `invalid_grant`, which answers `unlinked`;
+  - `invalid_grant`, which answers `unlinked`, and again with no request;
+  - a rotated refresh token, stored before its access token goes out; one
+    the store refuses, which stays usable and is stored by the next call;
+    and a refresh with no new token, which never runs the store;
   - 429 with `Retry-After`, and 5xx;
   - a 3xx, which is not followed;
   - a non-ASCII path in `Dropbox-API-Arg`.
