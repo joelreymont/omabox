@@ -2900,4 +2900,210 @@ public
    SQLITE:WITH-STATEMENT
    found ;
 
+
+\ ---- recoveries: values ---------------------------------------------
+
+public
+
+DEFTYPE RECOVERY-ID
+
+\ A recovery copy an older Omabox version retained. retained-at: when its
+\ retention started, seconds since the epoch, set as the destructive work
+\ committed.
+STRUCTURE recovery-record
+   FIELD id recovery-id
+   FIELD operation-id operation-id
+   FIELD original-path MODEL:path
+   FIELD recovery-path MODEL:path
+   FIELD content DROPBOX:hash
+   FIELD status record-status
+   FIELD retained-at option<n>
+;STRUCTURE
+
+\ pending: unfinished work may still need the recovery payload.
+ENUM recovery-forget not-found pending forgotten ;ENUM
+
+private
+
+
+\ ---- recoveries: reading ---------------------------------------------
+
+: NO-RECOVERY ( -- option<recovery-record> ) OPTION:NONE ;
+: NO-FLAG ( -- option<bool> ) OPTION:NONE ;
+
+: DECODE-CONTENT ( str MODEL:path ^ARENA:arena -- DROPBOX:hash )
+   {: json:str path ar :}
+   NO-HASH
+   [: DROP-HASH json ar MODEL:JSON>HASH ;]
+   s" deserialize recovery content" >str path MODEL:PATH>STR DECODE ;
+
+: RETAINED-AT ( option<n> MODEL:path -- option<n> )
+   {: path :}
+   MATCH option
+      none OF NO-INT ENDOF
+      some OF
+         {: at :}
+         at 0 < if
+            s" read recovery retention start" >str path
+            s" recovery retention start is outside the supported range"
+            PATH-INVALID
+         then
+         at OPTION:SOME
+      ENDOF
+   ;MATCH ;
+
+\ The record in a row of READ-RECOVERY's query; a value that does not
+\ read is invalid state at its original path.
+: RECOVERY-COLS
+   ( SQLITE:statement recovery-id ^ARENA:arena
+     -- SQLITE:statement recovery-record )
+   {: id ar :}
+   1 ar PATH-COPY {: original :}
+   5 INT? original RETAINED-AT {: retained :}
+   2 ar PATH-COPY {: copy :}
+   3 SQLITE:COL-TEXT >str original ar DECODE-CONTENT {: content :}
+   4 SQLITE:COL-TEXT s" read recovery status" >str original
+   DECODE-STATUS {: status :}
+   0 SQLITE:COL-INT >OPERATION-ID {: op :}
+   id op original copy content status retained
+   JOURNAL-RECOVERY--RECORD:MAKE ;
+
+: RECOVERY-ROW
+   ( SQLITE:statement recovery-id ^ARENA:arena
+     -- option<recovery-record> SQLITE:statement )
+   {: id ar :}
+   SQLITE:STEP 0= if NO-RECOVERY swap exit then
+   id ar RECOVERY-COLS OPTION:SOME swap ;
+
+: READ-RECOVERY
+   ( SQLITE:connection recovery-id ^ARENA:arena -- option<recovery-record> )
+   {: c id ar :}
+   c s" SELECT operation_id, original_path, recovery_path, content_json,
+         status, retained_at
+      FROM recovery_records WHERE id = ?1"
+   [: id RECOVERY-ID>N 1 SQLITE:BIND-INT id ar RECOVERY-ROW ;]
+   SQLITE:WITH-STATEMENT ;
+
+: PUSH-RECOVERY-ID
+   ( SQLITE:statement ^VEC:vector<recovery-id> -- SQLITE:statement )
+   {: ids :}
+   0 SQLITE:COL-INT >RECOVERY-ID ids VEC:PUSH ! ;
+
+\ Each selected record, read again; one gone since is op's invalid state
+\ on path, as detail says.
+: READ-EACH
+   ( SQLITE:connection ^VEC:vector<recovery-id> str str ^u8 n
+     ^ARENA:arena -- ^VEC:vector<recovery-record> )
+   {: c ids op:str path:str d:^ du ar :}
+   ar [type] recovery-record NEW-VECTOR {: found :}
+   ids VEC:COUNT 0 ?do
+      c ids i VEC:AT @ ar READ-RECOVERY MATCH option
+         none OF op path d du >str INVALID ENDOF
+         some OF found VEC:PUSH ! ENDOF
+      ;MATCH
+   loop
+   found ;
+
+\ Every record whose status is the text, by id; op names a failure.
+: READ-RECOVERIES-WITH-STATUS
+   ( SQLITE:connection str ^u8 n str ^ARENA:arena
+     -- ^VEC:vector<recovery-record> )
+   {: c path:str s:^ su op:str ar :}
+   ar [type] recovery-id NEW-VECTOR {: ids :}
+   c s" SELECT id FROM recovery_records WHERE status = ?1 ORDER BY id"
+   [: s su 1 SQLITE:BIND-TEXT
+      begin SQLITE:STEP while ids PUSH-RECOVERY-ID repeat ;]
+   SQLITE:WITH-STATEMENT
+   c ids op path
+   s" selected recovery disappeared while reading the journal" ar
+   READ-EACH ;
+
+: ELIGIBLE-QUERY ( -- ^u8 n )
+   s" SELECT recovery_records.id FROM recovery_records
+      LEFT JOIN operations
+         ON operations.id = recovery_records.operation_id
+      LEFT JOIN plans ON plans.id = operations.plan_id
+      WHERE recovery_records.status = 'completed'
+         AND recovery_records.retained_at IS NOT NULL
+         AND (operations.id IS NULL
+            OR (operations.status = 'completed'
+               AND plans.status = 'completed'))
+      ORDER BY recovery_records.id" ;
+
+
+\ ---- recoveries: writing ---------------------------------------------
+
+: FORGET-QUERY ( -- ^u8 n )
+   s" SELECT recovery_records.status,
+         recovery_records.retained_at IS NOT NULL
+         AND (operations.id IS NULL
+            OR (operations.status = 'completed'
+               AND plans.status = 'completed'))
+      FROM recovery_records
+      LEFT JOIN operations
+         ON operations.id = recovery_records.operation_id
+      LEFT JOIN plans ON plans.id = operations.plan_id
+      WHERE recovery_records.id = ?1" ;
+
+\ Whether the row the statement steps to, if any, is completed and no
+\ unfinished work needs its payload.
+: FORGETTABLE-ROW
+   ( SQLITE:statement MODEL:path -- option<bool> SQLITE:statement )
+   {: path :}
+   SQLITE:STEP 0= if NO-FLAG swap exit then
+   0 SQLITE:COL-TEXT s" read recovery status to forget" >str path
+   DECODE-STATUS {: s :}
+   1 SQLITE:COL-INT 0<> {: eligible:bool :}
+   s DONE? eligible and OPTION:SOME swap ;
+
+: FORGOTTEN ( bool SQLITE:connection recovery-id -- recovery-forget )
+   {: done:bool c id :}
+   done 0= if construct recovery-forget pending exit then
+   c s" DELETE FROM recovery_records
+      WHERE id = ?1 AND status = 'completed'"
+   [: id RECOVERY-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT
+   construct recovery-forget forgotten ;
+
+: FORGET-IN
+   ( SQLITE:connection recovery-id MODEL:path -- recovery-forget )
+   {: c id path :}
+   c FORGET-QUERY
+   [: id RECOVERY-ID>N 1 SQLITE:BIND-INT path FORGETTABLE-ROW ;]
+   SQLITE:WITH-STATEMENT
+   MATCH option
+      none OF construct recovery-forget not-found ENDOF
+      some OF c id FORGOTTEN ENDOF
+   ;MATCH ;
+
+public
+
+\ Every unfinished recovery record, by id.
+: PENDING-RECOVERIES
+   ( journal ^ARENA:arena -- ^VEC:vector<recovery-record> )
+   {: j ar :}
+   j >CONNECTION j >PATH s" pending" s" read pending recovery" >str ar
+   READ-RECOVERIES-WITH-STATUS ;
+
+\ Every retained recovery record whose payload no unfinished work needs,
+\ by id.
+: COMPLETED-RECOVERIES
+   ( journal ^ARENA:arena -- ^VEC:vector<recovery-record> )
+   {: j ar :}
+   ar [type] recovery-id NEW-VECTOR {: ids :}
+   j >CONNECTION {: c :}
+   c ELIGIBLE-QUERY
+   [: begin SQLITE:STEP while ids PUSH-RECOVERY-ID repeat ;]
+   SQLITE:WITH-STATEMENT
+   c ids s" read completed recovery" >str j >PATH
+   s" eligible recovery disappeared while reading the journal" ar
+   READ-EACH ;
+
+\ Forgets a completed recovery record once no unfinished work needs its
+\ payload.
+: FORGET-COMPLETED-RECOVERY ( journal recovery-id -- recovery-forget )
+   {: j id :}
+   j >CONNECTION {: c :}
+   c [: c id j >PATH MODEL:>PATH FORGET-IN ;] SQLITE:WITH-TRANSACTION ;
+
 ;package

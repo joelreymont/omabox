@@ -1,19 +1,19 @@
 \ journal-test.f - JOURNAL's open, schema 8, bindings, inventories,
-\ baselines, plans, completions and conflicts on journals under TMPDIR: a
-\ new journal's sqlite_master and user_version against
+\ baselines, plans, completions, conflicts and recoveries on journals
+\ under TMPDIR: a new journal's sqlite_master and user_version against
 \ src/oracle/schema.tsv as a set; versions 1, 7 and 9 refused unchanged;
 \ src/oracle/journal.sqlite3, copied and opened, giving journal.tsv's
 \ Dropbox and local root bindings, local and remote inventories, remote
 \ cursor, baselines, baseline paths, pending and blocked plans, pending
-\ upload content and conflicts, each in the line's own form; and
-\ thirty-four tests of the Rust version (rust src/journal.rs) under their
-\ names, which build each decision the Rust ones ask the planner for as
-\ src/oracle/plan.tsv holds it. Habu opens no schema-6 file, so the
-\ version-six tests start from a schema-8 journal holding the row
-\ migration 7 leaves for a schema-6 root, birth and subvolume NULL, and
-\ one baseline row, which stands for the local scan and conflict the
-\ Rust tests also keep. Each case removes its directory; a refusal's log
-\ line is captured in it, checked and removed.
+\ upload content, conflicts and pending and completed recoveries, each in
+\ the line's own form; and forty tests of the Rust version (rust
+\ src/journal.rs) under their names, which build each decision the Rust
+\ ones ask the planner for as src/oracle/plan.tsv holds it. Habu opens no
+\ schema-6 file, so the version-six tests start from a schema-8 journal
+\ holding the row migration 7 leaves for a schema-6 root, birth and
+\ subvolume NULL, and the baseline the Rust tests' version_six_with_root
+\ writes. Each case removes its directory; a refusal's log line is
+\ captured in it, checked and removed.
 \ Run from the repository root: hb --load src/journal-test.f </dev/null
 require src/lib/arena.f
 require src/lib/string.f
@@ -30,6 +30,7 @@ require src/lib/vector.f
 require src/dropbox.f
 require src/model.f
 require src/journal.f
+require src/test-journal.f
 
 \ JOURNAL reopened: a case reads the journal's connection, its rows, the
 \ bindings' and records' fields, and the inventories' private words.
@@ -268,25 +269,8 @@ TYPED-VARIABLE SUBJECT str
 
 \ ---- the journal's rows ------------------------------------------
 
-: BASELINE-ROWS ( journal -- n )
-   >CONNECTION s" SELECT count(*) FROM baselines" QUERY-INT ;
-
 : CHANGED ( journal -- n )
    >CONNECTION s" SELECT total_changes()" QUERY-INT ;
-
-\ A schema-8 journal holding a schema-6 root's row, as migration 7
-\ copies it, and one baseline, whose JSON only stands in.
-: LEGACY ( str -- )
-   {: p:str :}
-   p OPEN CLOSE
-   p str> SQLITE:OPEN {: c :}
-   c s" INSERT INTO local_root_binding(
-         singleton, canonical_path, inode, generation
-      ) VALUES (1, CAST('/sync/root' AS BLOB), X'0000000000000002', 3);
-      INSERT INTO baselines(path, baseline_json, canonical_path)
-      VALUES (CAST('kept.txt' AS BLOB), '{}', CAST('kept.txt' AS BLOB));"
-   SQLITE:EXEC
-   c SQLITE:CLOSE ;
 
 : SCHEMA-SQL ( -- ^u8 n )
    s" SELECT type || char(9) || name || char(9) || tbl_name || char(9)
@@ -780,65 +764,6 @@ variable SCANNED       \ query plan rows that scan the table
    legacy s" /sync/root" >str 2 STOOD-IN-BY? TFALSE
    s" /sync/other" BIRTH-5 OPTION:SOME RECORDED {: elsewhere :}
    elsewhere s" /sync/root" >str 9 STOOD-IN-BY? TFALSE ;
-
-\ The Rust test also publishes a local scan and records a conflict, which
-\ the activation keeps; here the baseline row stands for that state.
-: VERSION-SIX-ROOT-BINDING-UPGRADES-IN-PLACE-WHEN-PATH-AND-INODE-MATCH
-   ( ^ARENA:arena -- )
-   {: ar :}
-   s" version_six_root_binding_upgrades_in_place_when_path_and_inode_match"
-   T-LABEL
-   ar JOURNAL-AT {: d:str p:str :}
-   p LEGACY
-   p OPEN-READ {: r :}
-   r ar LOCAL-ROOT-BINDING LEGACY-ROOT RECORD-HELD? TTRUE
-   r CLOSE
-   p OPEN {: j :}
-   j >CONNECTION VERSION 8 T=
-   j ar LOCAL-ROOT-BINDING LEGACY-ROOT RECORD-HELD? TTRUE
-   s" /sync/root" 2 LOCAL-ROOT {: inspected :}
-   inspected 3 JOURNAL-LOCAL--ROOT--RECORD:MAKE {: upgraded :}
-   j CHANGED {: before :}
-   j inspected ar ACTIVATE-LOCAL-ROOT upgraded CURRENT? TTRUE
-   j CHANGED before - 1 T=
-   j BASELINE-ROWS 1 T=
-   j ar LOCAL-ROOT-BINDING upgraded RECORD-HELD? TTRUE
-   j inspected ar ACTIVATE-LOCAL-ROOT upgraded CURRENT? TTRUE
-   j CLOSE
-   d GONE ;
-
-: VERSION-SIX-ROOT-BINDING-WITH-ANOTHER-INODE-IS-UNAVAILABLE-WITHOUT-CHANGES
-   ( ^ARENA:arena -- )
-   {: ar :}
-   s" version_six_root_binding_with_another_inode_is_unavailable_without_changes"
-   T-LABEL
-   ar JOURNAL-AT {: d:str p:str :}
-   p LEGACY
-   p OPEN {: j :}
-   j CHANGED {: before :}
-   s" /sync/root" 9 LOCAL-ROOT {: actual :}
-   j actual ar ACTIVATE-LOCAL-ROOT LEGACY-ROOT >BINDING actual UNAVAILABLE?
-   TTRUE
-   j ar LOCAL-ROOT-BINDING LEGACY-ROOT RECORD-HELD? TTRUE
-   j BASELINE-ROWS 1 T=
-   j CHANGED before T=
-   j CLOSE
-   d GONE ;
-
-: ADOPTING-A-MATCHING-VERSION-SIX-ROOT-KEEPS-ITS-GENERATION
-   ( ^ARENA:arena -- )
-   {: ar :}
-   s" adopting_a_matching_version_six_root_keeps_its_generation" T-LABEL
-   ar JOURNAL-AT {: d:str p:str :}
-   p LEGACY
-   p OPEN {: j :}
-   s" /sync/root" 2 LOCAL-ROOT {: inspected :}
-   inspected 3 JOURNAL-LOCAL--ROOT--RECORD:MAKE {: upgraded :}
-   j inspected ar ADOPT-LOCAL-ROOT upgraded CURRENT? TTRUE
-   j ar LOCAL-ROOT-BINDING upgraded RECORD-HELD? TTRUE
-   j BASELINE-ROWS 1 T=
-   j CLOSE
-   d GONE ;
 
 : JOURNAL-DROPBOX-BINDING-SURVIVES-REOPEN ( ^ARENA:arena -- )
    {: ar :}
@@ -2120,6 +2045,526 @@ variable CRAFT
    d GONE ;
 
 
+\ ---- the Rust version's version-six tests -------------------------
+
+: KEPT-PATH ( -- MODEL:path ) s" kept.txt" DISPLAY ;
+
+: KEPT ( -- MODEL:baseline )
+   s" kept" s" rev-kept" REMOTE-FILE MODEL-BASELINE:present ;
+
+\ A schema-8 journal holding a schema-6 root's row, as migration 7
+\ copies it, and the baseline version_six_with_root writes.
+: LEGACY ( str ^ARENA:arena -- )
+   {: p:str ar :}
+   p OPEN CLOSE
+   p str> SQLITE:OPEN {: c :}
+   c s" INSERT INTO local_root_binding(
+         singleton, canonical_path, inode, generation
+      ) VALUES (1, CAST('/sync/root' AS BLOB), X'0000000000000002', 3)"
+   SQLITE:EXEC
+   c KEPT-PATH KEPT ar [: WRITE-BASELINE ;] ENCODING
+   c SQLITE:CLOSE ;
+
+: OBSERVED ( -- MODEL:local-record )
+   s" observed.txt" s" observed" PRESENT-LOCAL LOCAL-RECORD ;
+
+: CONFLICTED ( -- MODEL:conflict )
+   s" local-conflict" CONTENT MODEL-LOCAL:MAKE
+   s" remote-conflict" s" rev-conflict" REMOTE-FILE
+   MODEL-CONFLICT:divergent ;
+
+: ONLY-CONFLICT ( ^VEC:vector<conflict-record> -- conflict-record )
+   {: found :}
+   found VEC:COUNT 1 T=
+   found 0 VEC:AT @ ;
+
+\ The local scan and conflict recorded before the upgrade stay.
+: SIX-KEPT
+   ( journal MODEL:hash-record conflict-record ^ARENA:arena -- )
+   {: j hash conflict ar :}
+   j KEPT-PATH ar BASELINE KEPT BASELINE-HELD? TTRUE
+   j OBSERVED hash ar SCAN-HELD
+   j ar CONFLICTS ONLY-CONFLICT conflict CONFLICT-RECORD= TTRUE ;
+
+: VERSION-SIX-ROOT-BINDING-UPGRADES-IN-PLACE-WHEN-PATH-AND-INODE-MATCH
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" version_six_root_binding_upgrades_in_place_when_path_and_inode_match"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar LEGACY
+   p OPEN-READ {: r :}
+   r ar LOCAL-ROOT-BINDING LEGACY-ROOT RECORD-HELD? TTRUE
+   r CLOSE
+   p OPEN {: j :}
+   j >CONNECTION VERSION 8 T=
+   j ar LOCAL-ROOT-BINDING LEGACY-ROOT RECORD-HELD? TTRUE
+   s" observed.txt" 10 ar LOCAL-HASH {: hash :}
+   j LEGACY-ROOT >BINDING OBSERVED ar ONE-LOCAL hash ar ONE-HASH
+   PUBLISH-LOCAL-SCAN TTRUE
+   j s" conflict.txt" DISPLAY CONFLICTED ar RECORD-CONFLICT {: conflict :}
+   s" /sync/root" 2 LOCAL-ROOT {: inspected :}
+   inspected 3 JOURNAL-LOCAL--ROOT--RECORD:MAKE {: upgraded :}
+   j CHANGED {: before :}
+   j inspected ar ACTIVATE-LOCAL-ROOT upgraded CURRENT? TTRUE
+   j CHANGED before - 1 T=
+   j hash conflict ar SIX-KEPT
+   j ar LOCAL-ROOT-BINDING upgraded RECORD-HELD? TTRUE
+   j inspected ar ACTIVATE-LOCAL-ROOT upgraded CURRENT? TTRUE
+   j CLOSE
+   d GONE ;
+
+: VERSION-SIX-ROOT-BINDING-WITH-ANOTHER-INODE-IS-UNAVAILABLE-WITHOUT-CHANGES
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" version_six_root_binding_with_another_inode_is_unavailable_without_changes"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar LEGACY
+   p OPEN {: j :}
+   j ar BASELINE-PATHS {: paths :}
+   j CHANGED {: before :}
+   s" /sync/root" 9 LOCAL-ROOT {: actual :}
+   j actual ar ACTIVATE-LOCAL-ROOT LEGACY-ROOT >BINDING actual UNAVAILABLE?
+   TTRUE
+   j ar LOCAL-ROOT-BINDING LEGACY-ROOT RECORD-HELD? TTRUE
+   j ar BASELINE-PATHS paths PATHS= TTRUE
+   j KEPT-PATH ar BASELINE KEPT BASELINE-HELD? TTRUE
+   j CHANGED before T=
+   j CLOSE
+   d GONE ;
+
+: ADOPTING-A-MATCHING-VERSION-SIX-ROOT-KEEPS-ITS-GENERATION
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" adopting_a_matching_version_six_root_keeps_its_generation" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar LEGACY
+   p OPEN {: j :}
+   s" /sync/root" 2 LOCAL-ROOT {: inspected :}
+   inspected 3 JOURNAL-LOCAL--ROOT--RECORD:MAKE {: upgraded :}
+   j inspected ar ADOPT-LOCAL-ROOT upgraded CURRENT? TTRUE
+   j ar LOCAL-ROOT-BINDING upgraded RECORD-HELD? TTRUE
+   j KEPT-PATH ar BASELINE KEPT BASELINE-HELD? TTRUE
+   j CLOSE
+   d GONE ;
+
+
+\ ---- recoveries as the Rust version prints them -------------------
+
+: RETAINED-DEBUG ( option<n> n -- n )
+   {: at :}
+   MATCH option
+      none OF s" None" at PUT ENDOF
+      some OF {: v :} s" Some(" at PUT v swap PUT-N s" )" rot PUT ENDOF
+   ;MATCH ;
+
+: RECOVERY-DEBUG ( recovery-record n -- n )
+   {: r at :}
+   r JOURNAL-RECOVERY--RECORD:UNMAKE {: id op from to c s kept :}
+   s" RecoveryRecord { id: RecoveryId(" at PUT
+   id RECOVERY-ID>N swap PUT-N
+   s" ), operation_id: OperationId(" rot PUT
+   op OPERATION-ID>N swap PUT-N
+   s" ), original_path: " rot PUT  from MODEL:PATH>STR swap PUT-QUOTED
+   s" , recovery_path: " rot PUT  to MODEL:PATH>STR swap PUT-QUOTED
+   s" , content: " rot PUT  c swap HASH-DEBUG
+   s" , status: " rot PUT  s swap RECORD-STATUS-DEBUG
+   s" , retained_at: " rot PUT  kept swap RETAINED-DEBUG SHUT ;
+
+\ name, a tab, then the records as a list.
+: RECOVERIES-LINE ( ^u8 n ^VEC:vector<recovery-record> -- ^u8 n )
+   {: a:^ u found :}
+   a u 0 PUT  s\" \t[" rot PUT
+   found VEC:COUNT 0 ?do
+      i 0<> if s" , " rot PUT then
+      found i VEC:AT @ swap RECOVERY-DEBUG
+   loop
+   s" ]" rot PUT {: v :}
+   WANT v ;
+
+\ Two records alike as the Rust version prints them, every field named.
+: RECOVERY= ( recovery-record recovery-record -- bool )
+   {: a b :}
+   a 0 RECOVERY-DEBUG {: u :}
+   b u RECOVERY-DEBUG {: v :}
+   WANT u WANT u + v u - STR= ;
+
+\ retained_at in completed_recoveries is the clock journal.sqlite3 was
+\ written at, which the file holds.
+: ORACLE-JOURNAL-HOLDS-ITS-RECOVERIES ( ^ARENA:arena -- )
+   {: ar :}
+   s" the oracle journal's recoveries are journal.tsv's" T-LABEL
+   s" src/oracle/journal.tsv" ORACLE
+   ar JOURNAL-AT {: d:str p:str :}
+   s" src/oracle/journal.sqlite3" p str> FS:COPY-FILE-STREAM
+   p OPEN-READ {: j :}
+   s" pending_recoveries" j ar PENDING-RECOVERIES RECOVERIES-LINE HELD?
+   TTRUE
+   s" completed_recoveries" j ar COMPLETED-RECOVERIES RECOVERIES-LINE
+   HELD? TTRUE
+   j CLOSE
+   d GONE ;
+
+
+\ ---- the Rust version's recovery tests ----------------------------
+
+\ The Rust tests' recorded_recovery(write).
+: NO-RECOVERY-RECORDED ( -- )
+   s" extract recorded test recovery" >str TEST-PATH
+   s" test expected a newly recorded recovery" >str INVALID ;
+
+: RECORDED-RECOVERY ( recovery-write -- recovery-record )
+   MATCH recovery-write
+      recorded OF ENDOF
+      already-recorded OF drop NO-RECOVERY-RECORDED ENDOF
+      operation-not-found OF NO-RECOVERY-RECORDED ENDOF
+      operation-completed OF NO-RECOVERY-RECORDED ENDOF
+      operation-not-destructive OF NO-RECOVERY-RECORDED ENDOF
+   ;MATCH ;
+
+: COMPLETION-N ( operation-completion -- n )
+   MATCH operation-completion
+      not-found OF 0 ENDOF
+      already-completed OF 1 ENDOF
+      waiting-for-earlier-operation OF drop 2 ENDOF
+      baseline-required OF 3 ENDOF
+      unexpected-baseline OF 4 ENDOF
+      baseline-mismatch OF 5 ENDOF
+      operation-completed OF 6 ENDOF
+      plan-completed OF 7 ENDOF
+   ;MATCH ;
+
+: WAITING-FOR? ( operation-completion operation-id -- bool )
+   {: id :}
+   MATCH operation-completion
+      not-found OF false ENDOF
+      already-completed OF false ENDOF
+      waiting-for-earlier-operation OF
+         OPERATION-ID>N id OPERATION-ID>N =
+      ENDOF
+      baseline-required OF false ENDOF
+      unexpected-baseline OF false ENDOF
+      baseline-mismatch OF false ENDOF
+      operation-completed OF false ENDOF
+      plan-completed OF false ENDOF
+   ;MATCH ;
+
+: RECOVERY-COMPLETION-N ( recovery-completion -- n )
+   MATCH recovery-completion
+      not-found OF 0 ENDOF
+      already-completed OF 1 ENDOF
+      completed OF 2 ENDOF
+   ;MATCH ;
+
+: FORGET-N ( recovery-forget -- n )
+   MATCH recovery-forget
+      not-found OF 0 ENDOF
+      pending OF 1 ENDOF
+      forgotten OF 2 ENDOF
+   ;MATCH ;
+
+: CONFLICT-COMPLETION-N ( plan-conflict-completion -- n )
+   MATCH plan-conflict-completion
+      not-found OF 0 ENDOF
+      already-completed OF 1 ENDOF
+      recorded OF 2 ENDOF
+   ;MATCH ;
+
+: ID-OF ( recovery-record -- recovery-id )
+   JOURNAL-RECOVERY--RECORD:UNMAKE {: i o a b c s r :} i ;
+
+: OPERATION-OF ( recovery-record -- operation-id )
+   JOURNAL-RECOVERY--RECORD:UNMAKE {: i o a b c s r :} o ;
+
+: CONTENT-OF ( recovery-record -- DROPBOX:hash )
+   JOURNAL-RECOVERY--RECORD:UNMAKE {: i o a b c s r :} c ;
+
+: RETAINED-OF ( recovery-record -- option<n> )
+   JOURNAL-RECOVERY--RECORD:UNMAKE {: i o a b c s r :} r ;
+
+\ The record completed, its retention started at the time.
+: COMPLETED-AT ( recovery-record n -- recovery-record )
+   {: rec at :}
+   rec JOURNAL-RECOVERY--RECORD:UNMAKE {: i o a b c s r :}
+   i o a b c construct record-status completed at OPTION:SOME
+   JOURNAL-RECOVERY--RECORD:MAKE ;
+
+: RETAINED? ( option<n> -- bool )
+   MATCH option
+      none OF false ENDOF
+      some OF drop true ENDOF
+   ;MATCH ;
+
+\ When the record's retention started; none is invalid state on path.
+: RETENTION ( recovery-record MODEL:path -- n )
+   {: path :}
+   RETAINED-OF MATCH option
+      none OF
+         s" read retained test recovery" >str path
+         s" completed destructive operation did not start retention"
+         PATH-INVALID
+      ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+: ONE-RECOVERY ( ^VEC:vector<recovery-record> -- recovery-record )
+   {: found :}
+   found VEC:COUNT 1 T=
+   found 0 VEC:AT @ ;
+
+: NTH-ID ( plan-record n -- operation-id )
+   {: r k :}
+   r >OPERATIONS k VEC:AT @ JOURNAL-PLANNED--OPERATION:UNMAKE
+   {: i o x s :} i ;
+
+: PLAN-GONE? ( option<plan-record> -- bool )
+   MATCH option
+      none OF true ENDOF
+      some OF drop false ENDOF
+   ;MATCH ;
+
+\ The upload content at k is the content of the text.
+: UPLOAD-AT? ( ^VEC:vector<DROPBOX:hash> n ^u8 n -- bool )
+   {: v k c:^ cu :}
+   v k VEC:AT @ c cu CONTENT HASH= ;
+
+\ The file preserved, then replaced with the content of the text where
+\ its revision still stands.
+: PRESERVED-REPLACE
+   ( MODEL:remote ^u8 n ^ARENA:arena -- operation-plan )
+   {: file c:^ cu ar :}
+   ar [type] MODEL:operation NEW-VECTOR {: ops :}
+   file MODEL-OPERATION:preserve-remote ops VEC:PUSH !
+   file MODEL-REMOTE:UNMAKE {: old rev :}
+   c cu CONTENT rev MODEL-OPERATION:replace-remote ops VEC:PUSH !
+   ops JOURNAL-OPERATION--PLAN:MAKE ;
+
+: JOURNAL-FINAL-OPERATION-RECORDS-ONLY-ITS-ACTUAL-RESULT
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" journal_final_operation_records_only_its_actual_result" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   s" created.txt" DISPLAY {: path :}
+   s" created" UPLOAD-DECISION ar OPERATIONS {: plan :}
+   s" created" CONTENT MODEL-LOCAL:MAKE MODEL-CONFLICT:remote-deleted
+   {: stale :}
+   p OPEN {: j :}
+   j path stale ar RECORD-CONFLICT drop
+   j path plan ar RECORD-PLAN RECORDED-PLAN FIRST-ID {: id :}
+   j id NO-BASELINE ar COMPLETE-OPERATION COMPLETION-N 3 T=
+   j path ar BASELINE NO-BASELINE? TTRUE
+   s" wrong" s" rev-server" REMOTE-FILE MODEL-BASELINE:present {: wrong :}
+   j id wrong OPTION:SOME ar COMPLETE-OPERATION COMPLETION-N 5 T=
+   j path ar BASELINE NO-BASELINE? TTRUE
+   s" created" s" rev-server" REMOTE-FILE MODEL-BASELINE:present
+   {: actual :}
+   j id actual OPTION:SOME ar COMPLETE-OPERATION COMPLETION-N 7 T=
+   j path ar BASELINE actual BASELINE-HELD? TTRUE
+   j ar CONFLICTS VEC:COUNT 0 T=
+   j ar PENDING-PLANS VEC:COUNT 0 T=
+   j id NO-BASELINE ar COMPLETE-OPERATION COMPLETION-N 1 T=
+   j PRUNE-COMPLETED-WORK 1 T=
+   j id NO-BASELINE ar COMPLETE-OPERATION COMPLETION-N 0 T=
+   j CLOSE
+   d GONE ;
+
+\ The planner replaces the remote file with an edit made where the
+\ baseline and the remote file agree, as src/oracle/plan.tsv holds.
+: PENDING-UPLOAD-CONTENT-LISTS-ONLY-UNFINISHED-REMOTE-PAYLOADS
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" pending_upload_content_lists_only_unfinished_remote_payloads"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   s" create.txt" DISPLAY {: create-path :}
+   j create-path s" create" UPLOAD-DECISION ar OPERATIONS ar RECORD-PLAN
+   RECORDED-PLAN {: create :}
+   s" replace" CONTENT s" rev-old" >str DROPBOX:>REV
+   MODEL-OPERATION:replace-remote ar ONE-PLAN {: replace :}
+   j s" replace.txt" replace ar RECORD-UPLOAD
+   s" download" s" rev-download" REMOTE-FILE DOWNLOAD-DECISION
+   ar OPERATIONS {: download :}
+   j s" download.txt" DISPLAY download ar RECORD-PLAN drop
+   j ar PENDING-UPLOAD-CONTENT {: two :}
+   two VEC:COUNT 2 T=
+   two 0 s" create" UPLOAD-AT? TTRUE
+   two 1 s" replace" UPLOAD-AT? TTRUE
+   s" create" s" rev-created" REMOTE-FILE MODEL-BASELINE:present
+   {: created :}
+   j create FIRST-ID created OPTION:SOME ar COMPLETE-OPERATION
+   COMPLETION-N 7 T=
+   j ar PENDING-UPLOAD-CONTENT {: one :}
+   one VEC:COUNT 1 T=
+   one 0 s" replace" UPLOAD-AT? TTRUE
+   j CLOSE
+   d GONE ;
+
+\ The intent recorded between the preservation and the replacement.
+: INTENDED
+   ( journal plan-record MODEL:baseline ^ARENA:arena -- recovery-record )
+   {: j plan target ar :}
+   plan 0 NTH-ID {: first :}
+   plan 1 NTH-ID {: second :}
+   j second target OPTION:SOME ar COMPLETE-OPERATION first WAITING-FOR?
+   TTRUE
+   j first target OPTION:SOME ar COMPLETE-OPERATION COMPLETION-N 4 T=
+   j first NO-BASELINE ar COMPLETE-OPERATION COMPLETION-N 6 T=
+   j second s" recovery/replace.txt" DISPLAY ar RECORD-RECOVERY-INTENT
+   RECORDED-RECOVERY ;
+
+\ The replacement completes and starts the copy's retention.
+: RETAINED
+   ( journal plan-record MODEL:path MODEL:baseline recovery-record
+     ^ARENA:arena -- recovery-record )
+   {: k plan path target recovery ar :}
+   plan 1 NTH-ID {: second :}
+   k ar PENDING-RECOVERIES ONE-RECOVERY recovery RECOVERY= TTRUE
+   k recovery ID-OF FORGET-COMPLETED-RECOVERY FORGET-N 1 T=
+   k second target OPTION:SOME ar COMPLETE-OPERATION COMPLETION-N 7 T=
+   k second target OPTION:SOME ar COMPLETE-OPERATION COMPLETION-N 1 T=
+   k path ar BASELINE target BASELINE-HELD? TTRUE
+   k ar COMPLETED-RECOVERIES ONE-RECOVERY {: eligible :}
+   eligible path RETENTION {: at :}
+   at 0 > TTRUE
+   recovery at COMPLETED-AT {: completed :}
+   eligible completed RECOVERY= TTRUE
+   completed ;
+
+: JOURNAL-DESTRUCTIVE-COMPLETION-RETIRES-LEGACY-RECOVERY-ACROSS-REOPEN
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" journal_destructive_completion_retires_legacy_recovery_across_reopen"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   s" replace.txt" DISPLAY {: path :}
+   s" new" s" rev-server" REMOTE-FILE MODEL-BASELINE:present {: target :}
+   s" old" s" rev-current" REMOTE-FILE s" new" ar PRESERVED-REPLACE
+   {: plan :}
+   p OPEN {: j :}
+   j path plan ar RECORD-PLAN RECORDED-PLAN {: recorded :}
+   j recorded target ar INTENDED {: recovery :}
+   j CLOSE
+   p OPEN {: k :}
+   recovery CONTENT-OF s" old" CONTENT HASH= TTRUE
+   k path ar BASELINE NO-BASELINE? TTRUE
+   k recorded path target recovery ar RETAINED {: completed :}
+   k PRUNE-COMPLETED-WORK 1 T=
+   k >CONNECTION recorded >ID ar READ-PLAN PLAN-GONE? TTRUE
+   s" fresh" UPLOAD-DECISION ar OPERATIONS {: fresh :}
+   k s" fresh.txt" DISPLAY fresh ar RECORD-PLAN RECORDED-PLAN FIRST-ID
+   OPERATION-ID>N recovery OPERATION-OF OPERATION-ID>N > TTRUE
+   k ar COMPLETED-RECOVERIES ONE-RECOVERY completed RECOVERY= TTRUE
+   k recovery ID-OF FORGET-COMPLETED-RECOVERY FORGET-N 2 T=
+   k ar COMPLETED-RECOVERIES VEC:COUNT 0 T=
+   k recovery ID-OF FORGET-COMPLETED-RECOVERY FORGET-N 0 T=
+   k CLOSE
+   d GONE ;
+
+: BLOCKING-REPORTS-MISSING-AND-FINISHED-PLANS-WITHOUT-CHANGING-THEM
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" blocking_reports_missing_and_finished_plans_without_changing_them"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   s" upload" UPLOAD-DECISION ar OPERATIONS {: upload :}
+   409 MODEL-BLOCKAGE:download-unavailable {: why :}
+   p OPEN {: j :}
+   j s" finished.txt" DISPLAY upload ar RECORD-PLAN RECORDED-PLAN >ID
+   {: id :}
+   j id ar SUPERSEDE-PLAN SUPERSEDED? TTRUE
+   j id why 1700000000 ar BLOCK-PLAN BLOCK-N 1 T=
+   j ar BLOCKED-PLANS VEC:COUNT 0 T=
+   j id ar UNBLOCK-PLAN UNBLOCK-N 1 T=
+   9999 >PLAN-ID {: missing :}
+   j missing why 1700000000 ar BLOCK-PLAN BLOCK-N 0 T=
+   j missing ar UNBLOCK-PLAN UNBLOCK-N 0 T=
+   j CLOSE
+   d GONE ;
+
+: BLOCKED-PLAN-UPLOAD-PAYLOADS-STAY-REFERENCED ( ^ARENA:arena -- )
+   {: ar :}
+   s" blocked_plan_upload_payloads_stay_referenced" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   s" upload" UPLOAD-DECISION ar OPERATIONS {: upload :}
+   p OPEN {: j :}
+   j s" upload.txt" DISPLAY upload ar RECORD-PLAN RECORDED-PLAN >ID
+   {: id :}
+   j ar PENDING-UPLOAD-CONTENT {: before :}
+   before VEC:COUNT 1 T=
+   before 0 s" upload" UPLOAD-AT? TTRUE
+   j id MODEL-BLOCKAGE:remote-object 1700000000 ar BLOCK-PLAN BLOCK-N
+   2 T=
+   j ar PENDING-UPLOAD-CONTENT {: blocked :}
+   blocked VEC:COUNT 1 T=
+   blocked 0 s" upload" UPLOAD-AT? TTRUE
+   j id ar SUPERSEDE-PLAN SUPERSEDED? TTRUE
+   j ar PENDING-UPLOAD-CONTENT VEC:COUNT 0 T=
+   j CLOSE
+   d GONE ;
+
+\ The recovery copy, completed before its plan finishes, starts no
+\ retention until then.
+: COPY-UNRETAINED ( journal recovery-record MODEL:path ^ARENA:arena -- )
+   {: j recovery path ar :}
+   j recovery ID-OF COMPLETE-RECOVERY RECOVERY-COMPLETION-N 2 T=
+   j >CONNECTION recovery ID-OF ar READ-RECOVERY MATCH option
+      none OF
+         s" read conflicted recovery test" >str path
+         s" test recovery disappeared before conflict completion"
+         PATH-INVALID
+      ENDOF
+      some OF RETAINED-OF RETAINED? TFALSE ENDOF
+   ;MATCH ;
+
+\ The conflict retires the plan of a preservation and a replacement
+\ whose recovery copy is complete, once.
+: CONFLICTED-ONCE
+   ( journal MODEL:path MODEL:remote ^ARENA:arena -- plan-id )
+   {: j path file ar :}
+   file s" local" ar PRESERVED-REPLACE {: ops :}
+   j path ops ar RECORD-PLAN RECORDED-PLAN {: plan :}
+   plan >OPERATIONS VEC:COUNT 2 T=
+   j plan 0 NTH-ID NO-BASELINE ar COMPLETE-OPERATION COMPLETION-N 6 T=
+   j plan 1 NTH-ID s" recovery/conflict.txt" DISPLAY ar
+   RECORD-RECOVERY-INTENT RECORDED-RECOVERY {: recovery :}
+   j recovery path ar COPY-UNRETAINED
+   j plan >ID DIVERGENT ar FINISH-PLAN-WITH-CONFLICT
+   CONFLICT-COMPLETION-N 2 T=
+   j ar COMPLETED-RECOVERIES ONE-RECOVERY RETAINED-OF RETAINED? TTRUE
+   j plan >ID DIVERGENT ar FINISH-PLAN-WITH-CONFLICT
+   CONFLICT-COMPLETION-N 1 T=
+   plan >ID ;
+
+: JOURNAL-PLAN-CONFLICT-COMPLETES-ONCE-WITHOUT-ADVANCING-BASELINE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" journal_plan_conflict_completes_once_without_advancing_baseline"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   s" conflict.txt" DISPLAY {: path :}
+   s" old" s" rev-old" REMOTE-FILE {: file :}
+   p OPEN {: j :}
+   j path file MATCH-DECISION NOOP ar RECORD-NOOP NOOP-RECORDED? TTRUE
+   j path file ar CONFLICTED-ONCE {: id :}
+   j CLOSE
+   p OPEN {: k :}
+   k path ar BASELINE file MODEL-BASELINE:present BASELINE-HELD? TTRUE
+   k ar PENDING-PLANS VEC:COUNT 0 T=
+   k >CONNECTION id ar READ-PLAN PLAN-GONE? TTRUE
+   k ar CONFLICTS ONLY-CONFLICT {: found :}
+   found JOURNAL-CONFLICT--RECORD:UNMAKE {: n at x :}
+   at path PATH= TTRUE
+   x DIVERGENT MODEL:CONFLICT= TTRUE
+   k id DIVERGENT ar FINISH-PLAN-WITH-CONFLICT CONFLICT-COMPLETION-N 0 T=
+   k ar CONFLICTS ONLY-CONFLICT found CONFLICT-RECORD= TTRUE
+   k INT-MAX >PLAN-ID DIVERGENT ar FINISH-PLAN-WITH-CONFLICT
+   CONFLICT-COMPLETION-N 0 T=
+   k CLOSE
+   d GONE ;
+
+
 : CASES ( ^ARENA:arena -- )
    {: ar :}
    ar NEW-JOURNAL-HAS-THE-ORACLE-SCHEMA
@@ -2162,7 +2607,14 @@ variable CRAFT
    ar FINAL-EFFECT-COMPLETIONS-COMMIT-ATOMICALLY
    ar SUPERSEDING-A-RACED-DIRECTORY-PLAN-NEVER-ADVANCES-ITS-BASELINE
    ar JOURNAL-CONFLICT-PRESERVES-EVERY-TYPED-SIDE-ACROSS-REOPEN
-   ar JOURNAL-RETIRES-CONFLICT-DESCRIPTION-WHEN-THE-PATH-CONVERGES ;
+   ar JOURNAL-RETIRES-CONFLICT-DESCRIPTION-WHEN-THE-PATH-CONVERGES
+   ar ORACLE-JOURNAL-HOLDS-ITS-RECOVERIES
+   ar JOURNAL-FINAL-OPERATION-RECORDS-ONLY-ITS-ACTUAL-RESULT
+   ar PENDING-UPLOAD-CONTENT-LISTS-ONLY-UNFINISHED-REMOTE-PAYLOADS
+   ar JOURNAL-DESTRUCTIVE-COMPLETION-RETIRES-LEGACY-RECOVERY-ACROSS-REOPEN
+   ar BLOCKING-REPORTS-MISSING-AND-FINISHED-PLANS-WITHOUT-CHANGING-THEM
+   ar BLOCKED-PLAN-UPLOAD-PAYLOADS-STAY-REFERENCED
+   ar JOURNAL-PLAN-CONFLICT-COMPLETES-ONCE-WITHOUT-ADVANCING-BASELINE ;
 
 
 : TESTS ( -- )
