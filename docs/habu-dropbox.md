@@ -8,12 +8,13 @@ cursor and upload session. The signatures below are not checked yet.
 
 ```forth
 \ Dropbox's 409 error tags that omabox decides on; any other tag
-\ is `other`, and its text goes in the log line.
+\ is `other`, and its text goes in the log line. `path-mismatch`
+\ is no tag: an entry whose path_lower is not the path's full lowercase.
 ENUM error
    not-found not-file not-folder malformed-path disallowed-name
    conflict no-write-permission restricted-content
    insufficient-space locked reset invalid-root
-   content-hash-mismatch unsupported-file other ;ENUM
+   content-hash-mismatch unsupported-file path-mismatch other ;ENUM
 
 ENUM reply
    VARIANT done ;VARIANT                    \ the client holds the answer
@@ -165,15 +166,18 @@ STRUCTURE config
   mutation Dropbox applied can come back lost or refused. `UPLOAD`, `DELETE`
   and `CREATE-FOLDER` then ask `get_metadata` whether Dropbox holds the
   intended result: the same content hash, no entry, or a folder.
-  - A lost answer: `done` if it holds, else `retry`.
+  - A lost answer, or a `done` whose entry's `path_lower` is not the
+    path's full Unicode lowercase: `done` if it holds, else `retry`.
   - A `conflict` refusal: `done` if it holds, else the refusal stands.
   - `DELETE` refused `not-found` is `done` without asking: the path is
     absent, which is what a delete intends.
+  - A confirmation whose entry's `path_lower` is not the path's full
+    Unicode lowercase answers `refused path-mismatch`, for that path alone.
   - Every other refusal stands. A mutation never answers "unknown".
-- **`UPLOAD` checks what Dropbox committed.** The entry's `path_lower` must be
-  the upload path's full Unicode lowercase, else it throws `E-ANSWER`. Its content hash must be the
-  upload's, else it answers `refused content-hash-mismatch`, the tag Dropbox
-  gives a single upload whose bytes do not match.
+- **`UPLOAD` checks what Dropbox committed.** An entry at another path is
+  confirmed, as above. Its content hash must be the upload's, else it
+  answers `refused content-hash-mismatch`, the tag Dropbox gives a single
+  upload whose bytes do not match.
 
 ## The upload, as a state machine
 

@@ -58,11 +58,12 @@ public
    ERROR:CODE E-NOT-STORED
 
 \ Dropbox's 409 error tags omabox decides on; any other tag is other.
+\ path-mismatch: an entry whose path_lower is not the path's full lowercase.
 ENUM error DERIVE eq
    not-found not-file not-folder malformed-path disallowed-name
    conflict no-write-permission restricted-content
    insufficient-space locked reset invalid-root
-   content-hash-mismatch unsupported-file other ;ENUM
+   content-hash-mismatch unsupported-file path-mismatch other ;ENUM
 
 \ What a call answers: done, the client holds the answer; refused, Dropbox
 \ said no and why; retry, the ms Dropbox asked to wait, else 0; unlinked,
@@ -1757,18 +1758,49 @@ private
    VALUE OBJECT c construct kind folder PLAIN-OBJECT ;
 
 
-: DELETED-READ ( ^client -- )
-   construct kind deleted [: DELETED-MEMBER ;] ENTRY-PARSE ;
+\ Whether the entry's path_lower is the path's full lowercase.
+: AT? ( ^u8 n ^client -- bool )
+   CLIENT-ENTRY DROPBOX-ENTRY:LOWER @ SPAN:$ UNICODE:LOWERS-TO? ;
 
 
-: MADE-READ ( ^client -- )
-   construct kind deleted [: MADE-MEMBER ;] ENTRY-PARSE ;
+\ Each reads the answer's entry and answers whether it is at the path.
+: DELETED-READ ( ^u8 n ^client -- bool )
+   {: p:^ pu:n c :}
+   c construct kind deleted [: DELETED-MEMBER ;] ENTRY-PARSE
+   p pu c AT? ;
+
+
+: MADE-READ ( ^u8 n ^client -- bool )
+   {: p:^ pu:n c :}
+   c construct kind deleted [: MADE-MEMBER ;] ENTRY-PARSE
+   p pu c AT? ;
+
+
+\ A confirmation's get_metadata of the path: an entry at another path is
+\ refused path-mismatch.
+: CONFIRMED ( ^u8 n ^client -- reply )
+   {: p:^ pu:n c :}
+   p pu c METADATA {: m:reply :}
+   m DONE? 0= if m exit then
+   p pu c AT? if m exit then
+   construct error path-mismatch construct reply refused ;
+
+
+: MISMATCH? ( reply -- bool )
+   MATCH reply
+      done OF false ENDOF
+      refused OF construct error path-mismatch DROPBOX-ERROR:EQ ENDOF
+      retry OF drop false ENDOF
+      unlinked OF false ENDOF
+   ;MATCH ;
 
 
 \ A confirmation that failed: retry, after the ms get_metadata asked for;
-\ unlinked stands.
+\ unlinked and path-mismatch stand.
 : UNCONFIRMED ( reply -- reply )
-   MATCH reply
+   {: m:reply :}
+   m MISMATCH? if m exit then
+   m MATCH reply
       done OF 0 RETRY ENDOF
       refused OF drop 0 RETRY ENDOF
       retry OF RETRY ENDOF
@@ -1794,6 +1826,12 @@ private
    ;MATCH ;
 
 
+\ A confirmation that answers in its call's place.
+: STANDS? ( reply -- bool )
+   {: r:reply :}
+   r UNLINKED? r MISMATCH? or ;
+
+
 : FOLDER? ( ^entry -- bool )
    DROPBOX-ENTRY:KIND @ construct kind folder DROPBOX-KIND:EQ ;
 
@@ -1807,22 +1845,20 @@ private
 \ A lost delete took effect only if the path is now not found.
 : GONE ( ^u8 n ^client -- reply )
    {: p:^ pu:n c :}
-   p pu c METADATA {: r:reply :}
+   p pu c CONFIRMED {: r:reply :}
    r NOT-FOUND? if c ABSENT exit then
    r UNCONFIRMED ;
 
 
-\ A refused delete: not-found is done, as the path is absent; a conflict is
-\ done if the path is now not found, as a resent delete that Dropbox
-\ already applied answers, and unlinked if the confirmation is; any other
-\ refusal stands.
+\ not-found is done, and a conflict once the path is gone, as a resent
+\ applied delete answers; else a confirmation that STANDS? answers.
 : DELETE-REFUSED ( error ^u8 n ^client -- reply )
    {: e:error p:^ pu:n c :}
    e construct error not-found DROPBOX-ERROR:EQ if c ABSENT exit then
    e construct error conflict DROPBOX-ERROR:EQ if
-      p pu c METADATA {: m:reply :}
+      p pu c CONFIRMED {: m:reply :}
       m NOT-FOUND? if c ABSENT exit then
-      m UNLINKED? if m exit then
+      m STANDS? if m exit then
    then
    e construct reply refused ;
 
@@ -1830,36 +1866,36 @@ private
 \ A lost create-folder took effect only if the path is now a folder.
 : MADE ( ^u8 n ^client -- reply )
    {: p:^ pu:n c :}
-   p pu c METADATA {: r:reply :}
+   p pu c CONFIRMED {: r:reply :}
    r DONE? c CLIENT-ENTRY FOLDER? and if r exit then
    r UNCONFIRMED ;
 
 
-\ A refused create-folder: a conflict is done if the path is now a folder,
-\ as a resent create-folder that Dropbox already applied answers, and the
-\ entry is that folder, and unlinked if the confirmation is; any other
-\ refusal stands.
+\ A conflict is done once the path holds a folder, as a resent applied
+\ create-folder answers; else a confirmation that STANDS? answers.
 : FOLDER-REFUSED ( error ^u8 n ^client -- reply )
    {: e:error p:^ pu:n c :}
    e construct error conflict DROPBOX-ERROR:EQ if
-      p pu c METADATA {: m:reply :}
+      p pu c CONFIRMED {: m:reply :}
       m DONE? c CLIENT-ENTRY FOLDER? and
       if construct reply done exit then
-      m UNLINKED? if m exit then
+      m STANDS? if m exit then
    then
    e construct reply refused ;
 
 
-\ A mutation's call: done reads the entry with `read`. A lost answer goes
-\ to `lost` and a refusal to `refusal`, which confirm what Dropbox now
-\ holds, since either may come from a call Dropbox applied.
-: MUTATE ( ^client ^u8 n [ ^client -- ] [ ^client -- reply ]
+\ done stands if `read` finds its entry at the path; a lost answer or one
+\ elsewhere goes to `lost`, a refusal to `refusal`, which confirm it.
+: MUTATE ( ^client ^u8 n [ ^client -- bool ] [ ^client -- reply ]
            [ error ^client -- reply ] -- reply )
    {: c rt:^ rtu:n read lost refusal :}
    c rt rtu [: JSON-BODY ;] CALL {: r:reply :}
    c LOST? if c lost execute exit then
    r MATCH reply
-      done OF c read execute construct reply done ENDOF
+      done OF
+         c read execute
+         if construct reply done else c lost execute then
+      ENDOF
       refused OF c refusal execute ENDOF
       retry OF RETRY ENDOF
       unlinked OF construct reply unlinked ENDOF
@@ -1916,7 +1952,8 @@ public
 : DELETE ( ^u8 n ^u8 n ^client -- reply )
    {: p:^ pu:n r:^ ru:n c :}
    p pu r ru c DELETE-BODY
-   c s" files/delete_v2" [: DELETED-READ ;] [: drop p pu c GONE ;]
+   c s" files/delete_v2" [: drop p pu c DELETED-READ ;]
+   [: drop p pu c GONE ;]
    [: drop p pu c DELETE-REFUSED ;] MUTATE ;
 
 
@@ -1924,7 +1961,8 @@ public
 : CREATE-FOLDER ( ^u8 n ^client -- reply )
    {: p:^ pu:n c :}
    p pu c FOLDER-BODY
-   c s" files/create_folder_v2" [: MADE-READ ;] [: drop p pu c MADE ;]
+   c s" files/create_folder_v2" [: drop p pu c MADE-READ ;]
+   [: drop p pu c MADE ;]
    [: drop p pu c FOLDER-REFUSED ;] MUTATE ;
 
 
@@ -1946,10 +1984,10 @@ public
 \ through an upload session: CHUNK-SIZE appends, then a finish that carries
 \ no content_hash, as Dropbox checks that field against the call's own
 \ bytes. The entry Dropbox commits must have the upload's path and content
-\ hash. A lost answer to the upload or the finish, or a conflict, which a
-\ POST libcurl resent can answer for an upload already applied, is
-\ confirmed by get_metadata. A run's chunk buffer is MEM's, released before
-\ UPLOAD answers or throws.
+\ hash. A lost answer to the upload or the finish, an entry at another
+\ path, or a conflict, which a POST libcurl resent can answer for an
+\ upload already applied, is confirmed by get_metadata. A run's chunk
+\ buffer is MEM's, released before UPLOAD answers or throws.
 
 public
 
@@ -2262,18 +2300,20 @@ HEAP RUNS run
 
 \ ---- the answers
 
-\ The committed entry is the upload's: its path_lower is the upload path's
-\ full lowercase, else E-ANSWER, and its content hash, else last is refused
+\ Reads the entry Dropbox committed: whether it is at the upload's path.
+: COMMITTED-AT? ( ^run -- bool )
+   {: r :}
+   r RUN-CLIENT @ {: c :}
+   c FILE-READ
+   r RUN-UP @ DROPBOX-UPLOAD:PATH @ SPAN:$ c AT? ;
+
+
+\ The committed entry has the upload's content hash, else last is refused
 \ content-hash-mismatch.
 : COMMITTED? ( ^run -- bool )
    {: r :}
-   r RUN-CLIENT @ {: c :}
+   r RUN-CLIENT @ CLIENT-ENTRY {: e :}
    r RUN-UP @ {: up :}
-   c FILE-READ
-   c CLIENT-ENTRY {: e :}
-   up DROPBOX-UPLOAD:PATH @ SPAN:$
-   e DROPBOX-ENTRY:LOWER @ SPAN:$ UNICODE:LOWERS-TO?
-   0= if c s" an entry of another path" E-ANSWER FAILED then
    e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$
    up DROPBOX-UPLOAD:CONTENT-HASH @ SPAN:$ STR= if true exit then
    construct error content-hash-mismatch construct reply refused
@@ -2349,12 +2389,19 @@ HEAP RUNS run
 ENUM upload-step
    single starting appending finishing confirming verifying restarting
    ended ;ENUM
-ENUM send-event committed lost conflict failed ;ENUM
+ENUM send-event committed elsewhere lost conflict failed ;ENUM
 ENUM start-event opened lost failed ;ENUM
 ENUM append-event stored complete lost cut gone failed ;ENUM
-ENUM finish-event committed lost conflict gone failed ;ENUM
-ENUM confirm-event same other unlinked ;ENUM
+ENUM finish-event committed elsewhere lost conflict gone failed ;ENUM
+ENUM confirm-event same elsewhere other unlinked ;ENUM
 ENUM restart-event once twice ;ENUM
+
+
+: SEND-DONE ( ^run -- send-event )
+   {: r :}
+   r COMMITTED-AT? 0= if construct send-event elsewhere exit then
+   r COMMITTED? if construct send-event committed exit then
+   construct send-event failed ;
 
 
 : SEND-SENSE ( ^run -- send-event )
@@ -2364,10 +2411,7 @@ ENUM restart-event once twice ;ENUM
    r RUN-CHUNK @ r SIZE <> if r SHORT then
    r SINGLE-SENT {: rep:reply :}
    rep r RUN-LAST !
-   rep DONE? if
-      r COMMITTED? if construct send-event committed exit then
-      construct send-event failed exit
-   then
+   rep DONE? if r SEND-DONE exit then
    r RUN-CLIENT @ LOST? if construct send-event lost exit then
    rep CONFLICT? if construct send-event conflict exit then
    construct send-event failed ;
@@ -2411,15 +2455,19 @@ ENUM restart-event once twice ;ENUM
    construct append-event failed ;
 
 
+: FINISH-DONE ( ^run -- finish-event )
+   {: r :}
+   r COMMITTED-AT? 0= if construct finish-event elsewhere exit then
+   r COMMITTED? if construct finish-event committed exit then
+   construct finish-event failed ;
+
+
 : FINISH-SENSE ( ^run -- finish-event )
    {: r :}
    r RUN-CLIENT @ {: c :}
    r FINISH-SENT {: rep:reply :}
    rep r RUN-LAST !
-   rep DONE? if
-      r COMMITTED? if construct finish-event committed exit then
-      construct finish-event failed exit
-   then
+   rep DONE? if r FINISH-DONE exit then
    c LOST? if construct finish-event lost exit then
    rep CONFLICT? if construct finish-event conflict exit then
    rep c FINISH-GONE? if construct finish-event gone exit then
@@ -2427,13 +2475,14 @@ ENUM restart-event once twice ;ENUM
 
 
 \ get_metadata of the path shows a file with the upload's content hash,
-\ or answers unlinked.
+\ or an entry at another path, or answers unlinked.
 : CONFIRM-SENSE ( ^run -- confirm-event )
    {: r :}
    r RUN-CLIENT @ {: c :}
    r RUN-UP @ {: up :}
-   up DROPBOX-UPLOAD:PATH @ SPAN:$ c METADATA {: m:reply :}
+   up DROPBOX-UPLOAD:PATH @ SPAN:$ c CONFIRMED {: m:reply :}
    m UNLINKED? if construct confirm-event unlinked exit then
+   m MISMATCH? if construct confirm-event elsewhere exit then
    m DONE? 0= if construct confirm-event other exit then
    c CLIENT-ENTRY {: e :}
    e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$
@@ -2463,7 +2512,18 @@ ENUM restart-event once twice ;ENUM
    construct reply unlinked r RUN-ANSWER ! ;
 
 
-\ Answers the last call's reply as it came, or as COMMITTED? set it.
+: ANSWER-MISMATCH ( ^run -- )
+   {: r :}
+   construct error path-mismatch construct reply refused
+   r RUN-ANSWER ! ;
+
+
+\ A done answer at another path, as a lost one: retry unless confirmed.
+: DISTRUST ( ^run -- ) {: r :} 0 RETRY r RUN-LAST ! ;
+
+
+\ Answers the last call's reply as it came, or as COMMITTED? or DISTRUST
+\ set it.
 : ANSWER-REPLY ( ^run -- ) {: r :} r RUN-LAST @ r RUN-ANSWER ! ;
 
 
@@ -2484,6 +2544,7 @@ ENUM restart-event once twice ;ENUM
 FSM:DEFINE SESSION ( ^run ) upload-step send-event
    IN single  SEND-SENSE
       committed  ANSWER-DONE   >ended
+      elsewhere  DISTRUST      >confirming
       lost       -             >confirming
       conflict   -             >confirming
       failed     ANSWER-REPLY  >ended
@@ -2500,18 +2561,21 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
       failed    ANSWER-REPLY   >ended
    IN finishing  FINISH-SENSE ( finish-event )
       committed  ANSWER-DONE   >ended
+      elsewhere  DISTRUST      >confirming
       lost       -             >confirming
       conflict   -             >confirming
       gone       -             >verifying
       failed     ANSWER-REPLY  >ended
    IN confirming  CONFIRM-SENSE ( confirm-event )
-      same      ANSWER-DONE      >ended
-      other     ANSWER-REPLY     >ended
-      unlinked  ANSWER-UNLINKED  >ended
+      same       ANSWER-DONE      >ended
+      elsewhere  ANSWER-MISMATCH  >ended
+      other      ANSWER-REPLY     >ended
+      unlinked   ANSWER-UNLINKED  >ended
    IN verifying  CONFIRM-SENSE ( confirm-event )
-      same      ANSWER-DONE      >ended
-      other     -                >restarting
-      unlinked  ANSWER-UNLINKED  >ended
+      same       ANSWER-DONE      >ended
+      elsewhere  ANSWER-MISMATCH  >ended
+      other      -                >restarting
+      unlinked   ANSWER-UNLINKED  >ended
    IN restarting  RESTART-SENSE ( restart-event )
       once   REWIND        >starting
       twice  ANSWER-RETRY  >ended

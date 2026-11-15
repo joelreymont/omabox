@@ -5,11 +5,14 @@
 \ outages, a redirect, a malformed request, the listing, the long poll,
 \ downloads, delete, create-folder, the code exchange, Dropbox's content
 \ hash and uploads, whose stages are written under TMPDIR and removed once
-\ open, so no run leaves one. One server and one main client serve every
-\ case; a case that needs another config opens its own client. DROPBOX's
-\ log lines go to stderr, but those a case checks, which are captured in
-\ TMPDIR, checked and removed. A stub in place of AIO's transfer fails the
-\ stage's reads. The first failed assertion ends the run.
+\ open, so no run leaves one; a mutation or session finish Dropbox answers
+\ at another path, an upload's that get_metadata then does not find, and
+\ a conflict whose confirmation is at another path. One server and one
+\ main client serve every case; a case that needs another config opens its
+\ own client. DROPBOX's log lines go to stderr, but those a case checks,
+\ which are captured in TMPDIR, checked and removed. A stub in place of
+\ AIO's transfer fails the stage's reads. The first failed assertion ends
+\ the run.
 \ Run from the repository root: hb --load src/dropbox-test.f </dev/null
 require src/lib/aio.f
 require src/lib/arena.f
@@ -1124,6 +1127,31 @@ variable SUNK-AT
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
 
 
+\ A delete answered with the entry at /Ä.txt as its path_lower, not the
+\ full lowercase, which get_metadata then finds too.
+: DELETE-ELSEWHERE-CASE ( -- )
+   s" delete answered at another path" T-LABEL
+   TEST-DROPBOX:RESET
+   S\" /\xc3\x84.txt" s" rev-a" DELETED-FILE
+   200 s" " s" "
+   S\" {\qmetadata\q:{\q.tag\q:\qfile\q,\qpath_lower\q:\q/\xc3\x84.txt\q,\qpath_display\q:\q/\xc3\x84.txt\q,\qrev\q:\qrev-a\q,\qsize\q:0,\qcontent_hash\q:\qe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\q}}"
+   TEST-DROPBOX:SCRIPT!
+   S\" /\xc3\x84.txt" s" rev-a" MAIN @ DROPBOX:DELETE
+   DROPBOX-ERROR:path-mismatch REFUSED? ASSERT
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
+
+
+\ A delete refused as a conflict whose confirmation finds the file with
+\ /Ä.txt as its path_lower.
+: CONFLICT-ELSEWHERE-CASE ( -- )
+   s" delete conflict confirmed at another path" T-LABEL
+   TEST-DROPBOX:RESET
+   S\" /\xc3\x84.txt" s" rev-a" DELETED-FILE
+   S\" /\xc3\x84.txt" s" rev-b" MAIN @ DROPBOX:DELETE
+   DROPBOX-ERROR:path-mismatch REFUSED? ASSERT
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
+
+
 : DELETE-UNLINKED ( -- )
    s" /kept.txt" s" " MAIN @ DROPBOX:DELETE UNLINKED? OUTCOME ! ;
 
@@ -1185,6 +1213,29 @@ variable SUNK-AT
    s" /lost-made" MAIN @ DROPBOX:CREATE-FOLDER DONE? ASSERT
    DROPBOX-KIND:folder KIND? TTRUE
    LOWER$ s" /lost-made" T$=
+   TEST-DROPBOX:SEEN$
+   s" /2/files/create_folder_v2 /2/files/get_metadata" T$= ;
+
+
+\ The fake answers the folder's path as its path_lower, which for /Ä is
+\ not the full lowercase, and get_metadata confirms it.
+: FOLDER-ELSEWHERE-CASE ( -- )
+   s" create-folder answered at another path" T-LABEL
+   TEST-DROPBOX:RESET
+   S\" /\xc3\x84" MAIN @ DROPBOX:CREATE-FOLDER
+   DROPBOX-ERROR:path-mismatch REFUSED? ASSERT
+   TEST-DROPBOX:SEEN$
+   s" /2/files/create_folder_v2 /2/files/get_metadata" T$= ;
+
+
+\ A create-folder refused as a conflict with a file whose confirmation
+\ finds it with /Ä as its path_lower.
+: FOLDER-TAKEN-ELSEWHERE-CASE ( -- )
+   s" create-folder conflict confirmed at another path" T-LABEL
+   TEST-DROPBOX:RESET
+   S\" /\xc3\x84" s" rev-a" DELETED-FILE
+   S\" /\xc3\x84" MAIN @ DROPBOX:CREATE-FOLDER
+   DROPBOX-ERROR:path-mismatch REFUSED? ASSERT
    TEST-DROPBOX:SEEN$
    s" /2/files/create_folder_v2 /2/files/get_metadata" T$= ;
 
@@ -1507,13 +1558,27 @@ TYPED-VARIABLE FAULT fault
 
 
 \ The fake lowers ASCII alone, so its path_lower folds equal to the upload
-\ path but is not its full lowercase.
+\ path but is not its full lowercase, and get_metadata confirms it.
 : OTHER-CASE-CASE ( -- )
    s" committed path of another case" T-LABEL
    TEST-DROPBOX:RESET -1 FAULT-AT !
    s" cafe.txt" STAGE! s" hello cafe" S\" /Docs/CAF\xc3\x89.txt" s" " STAGED
-   SEND-LOGGED DROPBOX:E-ANSWER T=
-   s" an entry of another path" LOGGED? TTRUE
+   SEND DROPBOX-ERROR:path-mismatch REFUSED? ASSERT
+   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
+   UNSTAGED ;
+
+
+\ An upload answered at another path that get_metadata does not find:
+\ retry, as a lost upload is.
+: UNFOUND-ELSEWHERE-CASE ( -- )
+   s" upload answered at another path, not found" T-LABEL
+   TEST-DROPBOX:RESET -1 FAULT-AT !
+   s" cafe.txt" STAGE! s" hello cafe" S\" /Docs/CAF\xc3\x89.txt" s" " STAGED
+   200 s" " s" "
+   S\" {\qname\q:\qCAF\xc3\x89.txt\q,\qid\q:\qid:a\q,\qpath_lower\q:\q/docs/caf\xc3\x89.txt\q,\qpath_display\q:\q/Docs/CAF\xc3\x89.txt\q,\qrev\q:\q0170a\q,\qsize\q:10,\qcontent_hash\q:\q0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\q,\qis_downloadable\q:true}"
+   TEST-DROPBOX:SCRIPT!
+   SEND RETRY-MS 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
    UNSTAGED ;
 
 
@@ -1652,9 +1717,9 @@ TYPED-VARIABLE FAULT fault
 
 : SINGLE-CASES ( -- )
    SINGLE-CASE CONFLICT-CASE HELD-CASE NON-ASCII-CASE OTHER-CASE-CASE
-   CUT-SINGLE-CASE DENIED-SINGLE-CASE LOST-SINGLE-CASE SHORT-STAGE-CASE
-   REFUSED-STAGE-CASE FULL-READ-CASE ENTERED-READ-CASE TIMED-OUT-READ-CASE
-   CANCELLED-READ-CASE ;
+   UNFOUND-ELSEWHERE-CASE CUT-SINGLE-CASE DENIED-SINGLE-CASE
+   LOST-SINGLE-CASE SHORT-STAGE-CASE REFUSED-STAGE-CASE FULL-READ-CASE
+   ENTERED-READ-CASE TIMED-OUT-READ-CASE CANCELLED-READ-CASE ;
 
 
 \ A file one byte over a chunk: two appends.
@@ -1772,6 +1837,19 @@ TYPED-VARIABLE FAULT fault
    EXPECTED$ SPAN:MAKE UP DROPBOX-UPLOAD:CONTENT-HASH ! ;
 
 
+\ The fake lowers ASCII alone, so the finish's path_lower is not /É.bin's
+\ full lowercase, and get_metadata confirms it.
+: FINISH-ELSEWHERE-CASE ( -- )
+   s" finish answered at another path" T-LABEL
+   S\" /\xc3\x89.bin" SPAN:MAKE UP DROPBOX-UPLOAD:PATH !
+   -1 construct fault cut 1 STRUCK
+   DROPBOX-ERROR:path-mismatch REFUSED? ASSERT
+   SB-RESET S-START S-APPEND S-APPEND S-FINISH
+   s"  /2/files/get_metadata" SB-APPEND
+   TEST-DROPBOX:SEEN$ SB$ T$=
+   s" /Big.bin" SPAN:MAKE UP DROPBOX-UPLOAD:PATH ! ;
+
+
 \ Sized a byte past the stage: the second append carries the stage's last
 \ byte and the read for the next one returns 0.
 : ENDED-EARLY-CASE ( -- )
@@ -1820,7 +1898,7 @@ TYPED-VARIABLE FAULT fault
    SESSION-CASE LOST-APPEND-CASE HELD-APPEND-CASE OFFSET-APPEND-CASE
    CLOSED-CASE LOST-START-CASE LOST-FINISH-CASE APPLIED-FINISH-CASE
    UNFOUND-FINISH-CASE DENIED-FINISH-CASE CUT-APPEND-CASE CLOSED-TWICE-CASE
-   MISMATCH-CASE
+   MISMATCH-CASE FINISH-ELSEWHERE-CASE
    ENDED-EARLY-CASE
    UNSTAGED ;
 
@@ -1840,8 +1918,10 @@ TYPED-VARIABLE FAULT fault
    PAGES-CASE RESET-CASE STALL-CASE UNTAGGED-CASE POLL-CASE POLL-RESET-CASE
    DOWNLOAD-CASES
    DELETE-CONFLICT-CASE DELETE-MISSING-CASE DELETE-GONE-CASE
-   LOST-DELETE-CASE CUT-DELETE-CASE DENIED-DELETE-CASE DENIED-CONFLICT-CASE
-   FOLDER-CONFLICT-CASE LOST-FOLDER-CASE CUT-FOLDER-CASE DENIED-FOLDER-CASE
+   LOST-DELETE-CASE CUT-DELETE-CASE DELETE-ELSEWHERE-CASE
+   CONFLICT-ELSEWHERE-CASE DENIED-DELETE-CASE DENIED-CONFLICT-CASE
+   FOLDER-CONFLICT-CASE LOST-FOLDER-CASE FOLDER-ELSEWHERE-CASE
+   FOLDER-TAKEN-ELSEWHERE-CASE CUT-FOLDER-CASE DENIED-FOLDER-CASE
    DENIED-CUT-FOLDER-CASE
    LOST-REFRESH-CASE
    EXCHANGE-CASE DEAD-CODE-CASE RESERVED-REFRESH-CASE RESERVED-CODE-CASE
