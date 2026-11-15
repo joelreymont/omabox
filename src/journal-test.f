@@ -2,8 +2,9 @@
 \ on journals under TMPDIR: a new journal's sqlite_master and user_version
 \ against src/oracle/schema.tsv as a set; versions 1, 7 and 9 refused
 \ unchanged; src/oracle/journal.sqlite3, copied and opened, giving
-\ journal.tsv's Dropbox and local root bindings, baselines and baseline
-\ paths; and nineteen tests of the Rust version (rust src/journal.rs)
+\ journal.tsv's Dropbox and local root bindings, baselines, baseline
+\ paths, pending and blocked plans and pending upload content; and
+\ twenty-four tests of the Rust version (rust src/journal.rs)
 \ under their names, which build each decision the Rust ones ask the
 \ planner for as src/oracle/plan.tsv holds it. Habu opens no schema-6
 \ file, so the version-six tests start from a schema-8 journal holding the
@@ -766,14 +767,27 @@ TYPED-VARIABLE PLANS ^VEC:vector<path-plan>
 
 \ ---- the oracle's baselines as the Rust version prints them ------
 
+: HASH-DEBUG ( DROPBOX:hash n -- n )
+   {: h at :}
+   s" ContentIdentity(" at PUT
+   h DROPBOX:HASH>STR swap PUT-QUOTED
+   s" )" rot PUT ;
+
+: REV-DEBUG ( DROPBOX:rev n -- n )
+   {: r at :}
+   s" DropboxRevision(" at PUT
+   r DROPBOX:REV>STR swap PUT-QUOTED
+   s" )" rot PUT ;
+
+: SHUT ( n -- n ) s"  }" rot PUT ;
+
 : REMOTE-DEBUG ( MODEL:remote n -- n )
    {: r at :}
    r MODEL-REMOTE:UNMAKE {: c rev :}
-   s" RemoteFile { content: ContentIdentity(" at PUT
-   c DROPBOX:HASH>STR swap PUT-QUOTED
-   s" ), revision: DropboxRevision(" rot PUT
-   rev DROPBOX:REV>STR swap PUT-QUOTED
-   s" ) }" rot PUT ;
+   s" RemoteFile { content: " at PUT
+   c swap HASH-DEBUG
+   s" , revision: " rot PUT
+   rev swap REV-DEBUG SHUT ;
 
 : VALUE-DEBUG ( MODEL:baseline n -- n )
    {: at :}
@@ -972,6 +986,406 @@ TYPED-VARIABLE PLANS ^VEC:vector<path-plan>
    d GONE ;
 
 
+\ ---- the oracle's plans as the Rust version prints them ----------
+
+: LOCAL-DEBUG ( MODEL:local n -- n )
+   {: l at :}
+   s" LocalFile { content: " at PUT
+   l MODEL-LOCAL:UNMAKE swap HASH-DEBUG SHUT ;
+
+: REPLACE-LOCAL-DEBUG ( MODEL:remote DROPBOX:hash n -- n )
+   {: r h at :}
+   s" ReplaceLocal { source: " at PUT
+   r swap REMOTE-DEBUG
+   s" , expected_content: " rot PUT
+   h swap HASH-DEBUG SHUT ;
+
+: REPLACE-REMOTE-DEBUG ( DROPBOX:hash DROPBOX:rev n -- n )
+   {: h r at :}
+   s" ReplaceRemote { content: " at PUT
+   h swap HASH-DEBUG
+   s" , expected_revision: " rot PUT
+   r swap REV-DEBUG SHUT ;
+
+: OPERATION-DEBUG ( MODEL:operation n -- n )
+   {: at :}
+   MATCH MODEL:operation
+      create-local-directory OF s" CreateLocalDirectory" at PUT ENDOF
+      create-remote-directory OF s" CreateRemoteDirectory" at PUT ENDOF
+      delete-local-directory OF s" DeleteLocalDirectory" at PUT ENDOF
+      delete-remote-directory OF s" DeleteRemoteDirectory" at PUT ENDOF
+      create-remote OF
+         s" CreateRemote { content: " at PUT HASH-DEBUG SHUT
+      ENDOF
+      install-local OF
+         s" InstallLocal { source: " at PUT REMOTE-DEBUG SHUT
+      ENDOF
+      preserve-local OF
+         s" PreserveLocal { file: " at PUT LOCAL-DEBUG SHUT
+      ENDOF
+      replace-local OF at REPLACE-LOCAL-DEBUG ENDOF
+      delete-local OF
+         s" DeleteLocal { expected_content: " at PUT HASH-DEBUG SHUT
+      ENDOF
+      preserve-remote OF
+         s" PreserveRemote { file: " at PUT REMOTE-DEBUG SHUT
+      ENDOF
+      replace-remote OF at REPLACE-REMOTE-DEBUG ENDOF
+      delete-remote OF
+         s" DeleteRemote { expected_revision: " at PUT REV-DEBUG SHUT
+      ENDOF
+   ;MATCH ;
+
+: BLOCKAGE-DEBUG ( MODEL:blockage n -- n )
+   {: at :}
+   MATCH MODEL:blockage
+      unsupported-file-size OF s" UnsupportedFileSize" at PUT ENDOF
+      remote-rejected OF
+         s" RemoteRejected { tag: " at PUT PUT-QUOTED SHUT
+      ENDOF
+      download-unavailable OF
+         s" DownloadUnavailable { status: " at PUT PUT-N SHUT
+      ENDOF
+      download-verification-failed OF
+         s" DownloadVerificationFailed" at PUT
+      ENDOF
+      stage-occupied OF s" StageOccupied" at PUT ENDOF
+      local-object-in-way OF s" LocalObjectInWay" at PUT ENDOF
+      remote-object OF s" RemoteObject" at PUT ENDOF
+      conflict-copy-occupied OF s" ConflictCopyOccupied" at PUT ENDOF
+   ;MATCH ;
+
+: BLOCKED-DEBUG ( MODEL:blockage n n -- n )
+   {: reason retry at :}
+   s" Blocked { reason: " at PUT
+   reason swap BLOCKAGE-DEBUG
+   s" , retry_at: " rot PUT
+   retry swap PUT-N SHUT ;
+
+: STATUS-DEBUG ( plan-status n -- n )
+   {: at :}
+   MATCH plan-status
+      pending OF s" Pending" at PUT ENDOF
+      blocked OF at BLOCKED-DEBUG ENDOF
+      completed OF s" Completed" at PUT ENDOF
+   ;MATCH ;
+
+: RECORD-STATUS-DEBUG ( record-status n -- n )
+   {: at :}
+   MATCH record-status
+      pending OF s" Pending" at PUT ENDOF
+      completed OF s" Completed" at PUT ENDOF
+   ;MATCH ;
+
+: PLANNED-DEBUG ( planned-operation n -- n )
+   {: at :}
+   JOURNAL-PLANNED--OPERATION:UNMAKE {: id ordinal o st :}
+   s" PlannedOperation { id: OperationId(" at PUT
+   id OPERATION-ID>N swap PUT-N
+   s" ), ordinal: " rot PUT  ordinal swap PUT-N
+   s" , operation: " rot PUT  o swap OPERATION-DEBUG
+   s" , status: " rot PUT  st swap RECORD-STATUS-DEBUG SHUT ;
+
+: PLANNED-LIST ( ^VEC:vector<planned-operation> n -- n )
+   {: ops at :}
+   s" [" at PUT
+   ops VEC:COUNT 0 ?do
+      i 0<> if s" , " rot PUT then
+      ops i VEC:AT @ swap PLANNED-DEBUG
+   loop
+   s" ]" rot PUT ;
+
+: PLAN-DEBUG ( plan-record n -- n )
+   {: at :}
+   JOURNAL-PLAN--RECORD:UNMAKE {: id path ops st :}
+   s" PlanRecord { id: PlanId(" at PUT
+   id PLAN-ID>N swap PUT-N
+   s" ), path: " rot PUT  path MODEL:PATH>STR swap PUT-QUOTED
+   s" , operations: " rot PUT  ops swap PLANNED-LIST
+   s" , status: " rot PUT  st swap STATUS-DEBUG SHUT ;
+
+\ name, a tab, then the plans as a list.
+: PLANS-LINE ( ^u8 n ^VEC:vector<plan-record> -- ^u8 n )
+   {: a:^ u plans :}
+   a u 0 PUT  s\" \t[" rot PUT
+   plans VEC:COUNT 0 ?do
+      i 0<> if s" , " rot PUT then
+      plans i VEC:AT @ swap PLAN-DEBUG
+   loop
+   s" ]" rot PUT {: v :}
+   WANT v ;
+
+: CONTENT-LINE ( ^VEC:vector<DROPBOX:hash> -- ^u8 n )
+   {: hashes :}
+   s\" pending_upload_content\t[" 0 PUT
+   hashes VEC:COUNT 0 ?do
+      i 0<> if s" , " rot PUT then
+      hashes i VEC:AT @ swap HASH-DEBUG
+   loop
+   s" ]" rot PUT {: u :}
+   WANT u ;
+
+\ Two statuses alike as the Rust version prints them, which names each
+\ field: the first is printed at WANT, the second after it.
+: STATUS= ( plan-status plan-status -- bool )
+   {: a b :}
+   a 0 STATUS-DEBUG {: u :}
+   b u STATUS-DEBUG {: v :}
+   WANT u WANT u + v u - STR= ;
+
+: ORACLE-JOURNAL-HOLDS-ITS-PLANS ( ^ARENA:arena -- )
+   {: ar :}
+   s" the oracle journal's plans are journal.tsv's" T-LABEL
+   s" src/oracle/journal.tsv" ORACLE
+   ar JOURNAL-AT {: d:str p:str :}
+   s" src/oracle/journal.sqlite3" p str> FS:COPY-FILE-STREAM
+   p OPEN-READ {: j :}
+   s" pending_plans" j ar PENDING-PLANS PLANS-LINE HELD? TTRUE
+   s" blocked_plans" j ar BLOCKED-PLANS PLANS-LINE HELD? TTRUE
+   j ar PENDING-UPLOAD-CONTENT CONTENT-LINE HELD? TTRUE
+   j CLOSE
+   d GONE ;
+
+
+\ ---- the Rust version's blocked plan tests ------------------------
+
+TYPED-VARIABLE HELD-OPS ^VEC:vector<MODEL:operation>
+variable CRAFT
+
+: STATUS-OF ( plan-record -- plan-status )
+   JOURNAL-PLAN--RECORD:UNMAKE {: i p o s :} s ;
+
+: BLOCKED-AS ( MODEL:blockage n -- plan-status )
+   construct plan-status blocked ;
+
+: PENDING-STATUS ( -- plan-status ) construct plan-status pending ;
+
+\ Two plans alike but for their status.
+: SAME-PLAN? ( plan-record plan-record -- bool )
+   JOURNAL-PLAN--RECORD:UNMAKE {: i p o s :}
+   JOURNAL-PLAN--RECORD:UNMAKE {: j q r t :}
+   i j ID= p q PATH= and o r OPERATIONS= and ;
+
+: BLOCK-N ( plan-block -- n )
+   MATCH plan-block
+      not-found OF 0 ENDOF
+      already-completed OF 1 ENDOF
+      blocked OF 2 ENDOF
+   ;MATCH ;
+
+: UNBLOCK-N ( plan-unblock -- n )
+   MATCH plan-unblock
+      not-found OF 0 ENDOF
+      not-blocked OF 1 ENDOF
+      unblocked OF 2 ENDOF
+   ;MATCH ;
+
+\ The Rust tests' let PlanWrite::AlreadyLive(live) = write.
+: ALREADY-LIVE-PLAN ( plan-write -- plan-record )
+   MATCH plan-write
+      already-live OF ENDOF
+      recorded OF
+         drop s" extract live test plan" >str TEST-PATH
+         s" a blocked path accepted a second live plan" >str INVALID
+      ENDOF
+   ;MATCH ;
+
+: LIVE-PLAN-ROWS ( journal -- n )
+   >CONNECTION
+   s" SELECT COUNT(*) FROM plans WHERE status IN ('pending', 'blocked')"
+   QUERY-INT ;
+
+: PLAN-ROWS ( journal -- n )
+   >CONNECTION s" SELECT COUNT(*) FROM plans" QUERY-INT ;
+
+: ONLY ( ^VEC:vector<plan-record> -- plan-record )
+   {: plans :}
+   plans VEC:COUNT 1 T=
+   plans 0 VEC:AT @ ;
+
+: BLOCKING-A-PLAN-HIDES-IT-FROM-PENDING-WORK-ACROSS-REOPEN
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" blocking_a_plan_hides_it_from_pending_work_across_reopen" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   s" blocked.txt" AT-PATH {: path :}
+   s" upload" UPLOAD-DECISION ar OPERATIONS {: upload :}
+   s" insufficient_space" >str MODEL-BLOCKAGE:remote-rejected {: why :}
+   p OPEN {: j :}
+   j path upload ar RECORD-PLAN RECORDED-PLAN {: recorded :}
+   recorded >ID {: id :}
+   recorded STATUS-OF PENDING-STATUS STATUS= TTRUE
+   j id why 1700000000 ar BLOCK-PLAN BLOCK-N 2 T=
+   j ar PENDING-PLANS VEC:COUNT 0 T=
+   j ar BLOCKED-PLANS ONLY {: blocked :}
+   blocked recorded SAME-PLAN? TTRUE
+   blocked STATUS-OF why 1700000000 BLOCKED-AS STATUS= TTRUE
+   j CLOSE
+   p OPEN {: k :}
+   k ar PENDING-PLANS VEC:COUNT 0 T=
+   k ar BLOCKED-PLANS VEC:COUNT 1 T=
+   MODEL-BLOCKAGE:stage-occupied {: stage :}
+   k id stage 1700003600 ar BLOCK-PLAN BLOCK-N 2 T=
+   k ar BLOCKED-PLANS ONLY STATUS-OF stage 1700003600 BLOCKED-AS
+   STATUS= TTRUE
+   k id ar UNBLOCK-PLAN UNBLOCK-N 2 T=
+   k ar BLOCKED-PLANS VEC:COUNT 0 T=
+   k ar PENDING-PLANS ONLY {: live :}
+   live >ID id ID= TTRUE
+   live STATUS-OF PENDING-STATUS STATUS= TTRUE
+   k id ar UNBLOCK-PLAN UNBLOCK-N 1 T=
+   k CLOSE
+   d GONE ;
+
+: A-BLOCKED-PATH-KEEPS-ITS-PLAN-INSTEAD-OF-GAINING-A-SECOND-ONE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" a_blocked_path_keeps_its_plan_instead_of_gaining_a_second_one"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   s" upload" UPLOAD-DECISION ar OPERATIONS {: upload :}
+   MODEL-BLOCKAGE:local-object-in-way {: why :}
+   p OPEN {: j :}
+   j s" Contested.TXT" AT-PATH upload ar RECORD-PLAN RECORDED-PLAN
+   >ID {: id :}
+   j id why 1700000000 ar BLOCK-PLAN BLOCK-N 2 T=
+   j s" contested.txt" AT-PATH upload ar RECORD-PLAN ALREADY-LIVE-PLAN
+   {: live :}
+   live >ID id ID= TTRUE
+   live STATUS-OF why 1700000000 BLOCKED-AS STATUS= TTRUE
+   j LIVE-PLAN-ROWS 1 T=
+   j CLOSE
+   d GONE ;
+
+: ORDINAL-OF ( planned-operation -- u32 )
+   JOURNAL-PLANNED--OPERATION:UNMAKE {: i o x s :} o ;
+
+\ The plan's ordinals ascend.
+: ORDINALS-ASCEND? ( plan-record -- bool )
+   >OPERATIONS {: ops :}
+   ops VEC:COUNT 1 ?do
+      ops i 1- VEC:AT @ ORDINAL-OF ops i VEC:AT @ ORDINAL-OF >= if
+         unloop false exit
+      then
+   loop
+   true ;
+
+\ The plans' ids ascend and each one's ordinals do.
+: IN-ORDER? ( ^VEC:vector<plan-record> -- bool )
+   {: plans :}
+   plans VEC:COUNT 0 ?do
+      plans i VEC:AT @ ORDINALS-ASCEND? 0= if unloop false exit then
+      i 0<> if
+         plans i 1- VEC:AT @ >ID PLAN-ID>N
+         plans i VEC:AT @ >ID PLAN-ID>N >= if unloop false exit then
+      then
+   loop
+   true ;
+
+: RECORD-UPLOAD ( journal ^u8 n operation-plan ^ARENA:arena -- )
+   {: j a:^ u plan ar :}
+   j a u AT-PATH plan ar RECORD-PLAN RECORDED-PLAN drop ;
+
+\ The Rust test also counts the statements pending_plans runs, by
+\ rusqlite's trace. SQLITE has no trace hook; PENDING-PLANS reads in
+\ READ-PLANS-WITH-STATUS's one WITH-STATEMENT.
+: PENDING-PLANS-READS-EVERY-PLAN-AND-OPERATION-IN-ONE-QUERY
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" pending_plans_reads_every_plan_and_operation_in_one_query" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   s" upload" UPLOAD-DECISION ar OPERATIONS {: upload :}
+   s" displaced" CONTENT {: displaced :}
+   ar [type] MODEL:operation NEW-VECTOR {: ops :}
+   displaced MODEL-LOCAL:MAKE MODEL-OPERATION:preserve-local
+   ops VEC:PUSH !
+   displaced MODEL-OPERATION:delete-local ops VEC:PUSH !
+   ops JOURNAL-OPERATION--PLAN:MAKE {: ordered :}
+   p OPEN {: j :}
+   j s" a.txt" upload ar RECORD-UPLOAD
+   j s" b.txt" upload ar RECORD-UPLOAD
+   j s" c.txt" upload ar RECORD-UPLOAD
+   j s" d.txt" AT-PATH ordered ar RECORD-PLAN RECORDED-PLAN
+   >OPERATIONS VEC:COUNT 1 > TTRUE
+   j ar PENDING-PLANS {: plans :}
+   plans VEC:COUNT 4 T=
+   plans IN-ORDER? TTRUE
+   j CLOSE
+   d GONE ;
+
+: RECORD-EMPTY ( -- )
+   HELD-JOURNAL @ s" empty.txt" AT-PATH
+   HELD-OPS @ JOURNAL-OPERATION--PLAN:MAKE HELD-ARENA @ RECORD-PLAN
+   drop ;
+
+: A-PLAN-WITHOUT-OPERATIONS-IS-REFUSED ( ^ARENA:arena -- )
+   {: ar :}
+   s" a_plan_without_operations_is_refused" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j HELD-JOURNAL !  ar HELD-ARENA !
+   ar [type] MODEL:operation NEW-VECTOR HELD-OPS !
+   [: RECORD-EMPTY ;] E-INVALID-STATE d
+   s" journal operation `record plan` found invalid state" ar LOGGED
+   j ar PENDING-PLANS VEC:COUNT 0 T=
+   j PLAN-ROWS 0 T=
+   j CLOSE
+   d GONE ;
+
+\ The Rust test's crafted columns, case k: status, blocked_json and
+\ retry_at.
+: CRAFTED-STATUS ( n -- ^u8 n )
+   {: k :}
+   k 0= if s" pending" exit then
+   k 1 = if s" completed" exit then
+   k 4 < if s" blocked" exit then
+   k 6 < if s" retired" exit then
+   s" blocked" ;
+
+: CRAFTED-JSON ( n -- option<str> )
+   {: k :}
+   k 0= k 3 = or k 5 = or k 6 = or if SUBJECT @ OPTION:SOME exit then
+   NO-TEXT ;
+
+: CRAFTED-RETRY ( n -- option<n> )
+   {: k :}
+   k 6 = if -1 OPTION:SOME exit then
+   k 1 = k 2 = or k 5 = or if 1 OPTION:SOME exit then
+   NO-INT ;
+
+: CRAFTED-DETAIL ( n -- ^u8 n )
+   {: k :}
+   k 4 < if s" plan status disagrees with its block columns" exit then
+   k 6 < if s" plan has an unrecognized status" exit then
+   s" blocked plan has a negative retry time" ;
+
+: CRAFTED-PATH ( -- MODEL:path ) s" crafted.txt" AT-PATH ;
+
+: DECODE-COLUMNS ( ^u8 n option<str> option<n> -- plan-status )
+   s" read plan status" >str CRAFTED-PATH HELD-ARENA @
+   DECODE-PLAN-STATUS ;
+
+: DECODE-CRAFTED ( -- )
+   CRAFT @ {: k :}
+   k CRAFTED-STATUS k CRAFTED-JSON k CRAFTED-RETRY DECODE-COLUMNS drop ;
+
+: PLAN-STATUS-DECODING-NAMES-THE-STATE-IT-REJECTS ( ^ARENA:arena -- )
+   {: ar :}
+   s" plan_status_decoding_names_the_state_it_rejects" T-LABEL
+   ar SCRATCH {: d:str :}
+   ar HELD-ARENA !
+   MODEL-BLOCKAGE:stage-occupied ar ENCODE-BLOCKAGE SUBJECT !
+   s" pending" NO-TEXT NO-INT DECODE-COLUMNS PENDING-STATUS STATUS=
+   TTRUE
+   s" completed" NO-TEXT NO-INT DECODE-COLUMNS
+   construct plan-status completed STATUS= TTRUE
+   7 0 ?do
+      i CRAFT !
+      [: DECODE-CRAFTED ;] E-INVALID-STATE d i CRAFTED-DETAIL ar LOGGED
+   loop
+   d GONE ;
+
+
 : CASES ( ^ARENA:arena -- )
    {: ar :}
    ar NEW-JOURNAL-HAS-THE-ORACLE-SCHEMA
@@ -996,7 +1410,13 @@ TYPED-VARIABLE PLANS ^VEC:vector<path-plan>
    ar ABSENT-BASELINE-REMOVES-ITS-ROW
    ar CASE-COLLISION-INVALIDATION-COVERS-A-CHILD-NAMED-WITH-A-HIGH-BYTE
    ar CASE-COLLISION-INVALIDATION-JUDGES-EACH-RECORDED-SPELLING
-   ar BASELINE-SNAPSHOT-IS-CANONICAL-SORTED ;
+   ar BASELINE-SNAPSHOT-IS-CANONICAL-SORTED
+   ar ORACLE-JOURNAL-HOLDS-ITS-PLANS
+   ar BLOCKING-A-PLAN-HIDES-IT-FROM-PENDING-WORK-ACROSS-REOPEN
+   ar A-BLOCKED-PATH-KEEPS-ITS-PLAN-INSTEAD-OF-GAINING-A-SECOND-ONE
+   ar PENDING-PLANS-READS-EVERY-PLAN-AND-OPERATION-IN-ONE-QUERY
+   ar A-PLAN-WITHOUT-OPERATIONS-IS-REFUSED
+   ar PLAN-STATUS-DECODING-NAMES-THE-STATE-IT-REJECTS ;
 
 
 : TESTS ( -- )

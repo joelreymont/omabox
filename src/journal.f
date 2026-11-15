@@ -38,6 +38,7 @@ require src/lib/type/deftype.f
 require src/lib/byte-buffer.f
 require src/lib/json.f
 require src/lib/vector.f
+require src/dropbox.f
 require src/model.f
 
 package JOURNAL
@@ -281,7 +282,7 @@ private
       PRAGMA user_version = 4;" SQLITE:EXEC ;
 
 \ migrate_blocked_plans of the Rust version on empty tables.
-: BLOCKED-PLANS ( SQLITE:connection -- )
+: MIGRATE-BLOCKED-PLANS ( SQLITE:connection -- )
    {: c :}
    c s" DROP INDEX baselines_by_canonical_path;
       DROP INDEX remote_observations_by_canonical_path;" SQLITE:EXEC
@@ -294,7 +295,7 @@ private
    c V1 RUN  c V2 RUN  c V3 RUN  c V4 RUN
    c CANONICAL-PATHS
    c V5 RUN
-   c BLOCKED-PLANS
+   c MIGRATE-BLOCKED-PLANS
    c V7 RUN  c V8 RUN ;
 
 : WRITABLE ( journal -- )
@@ -308,6 +309,46 @@ private
    j CONFIGURE-WRITABLE
    v 0= if c [: c CREATE-SCHEMA ;] SQLITE:WITH-TRANSACTION then ;
 
+\ Deletes each completed plan, and its operations, that no pending or
+\ unretained recovery record of its operations holds. The plans' delete
+\ selects the plans the operations' did: a held plan keeps the operation
+\ its record names.
+: PRUNE ( SQLITE:connection -- n )
+   {: c :}
+   c s" DELETE FROM operations WHERE plan_id IN (
+         SELECT plans.id FROM plans WHERE plans.status = 'completed'
+         AND NOT EXISTS (
+            SELECT 1 FROM operations JOIN recovery_records
+               ON recovery_records.operation_id = operations.id
+            WHERE operations.plan_id = plans.id
+               AND (recovery_records.status = 'pending'
+                  OR recovery_records.retained_at IS NULL)))"
+   SQLITE:EXEC
+   c s" DELETE FROM plans WHERE plans.status = 'completed'
+      AND NOT EXISTS (
+         SELECT 1 FROM operations JOIN recovery_records
+            ON recovery_records.operation_id = operations.id
+         WHERE operations.plan_id = plans.id
+            AND (recovery_records.status = 'pending'
+               OR recovery_records.retained_at IS NULL))"
+   SQLITE:EXEC
+   c SQLITE:CHANGES ;
+
+public
+
+\ Removes completed plans and their operations that no pending recovery
+\ needs; completed recovery records stay. Answers the plans removed.
+: PRUNE-COMPLETED-WORK ( journal -- n )
+   >CONNECTION {: c :}
+   c [: c PRUNE ;] SQLITE:WITH-TRANSACTION ;
+
+private
+
+: READY ( journal -- )
+   {: j :}
+   j WRITABLE
+   j PRUNE-COMPLETED-WORK drop ;
+
 : READABLE ( journal -- )
    {: j :}
    j >CONNECTION {: c :}
@@ -317,12 +358,13 @@ private
 
 public
 
-\ The journal at path, schema 8 created in a new or empty file. Another
-\ version is E-UNSUPPORTED-VERSION, the file unchanged.
+\ The journal at path, schema 8 created in a new or empty file, its
+\ completed work pruned. Another version is E-UNSUPPORTED-VERSION, the
+\ file unchanged.
 : OPEN ( str -- journal )
    {: path:str :}
    path OWNER-ONLY
-   path str> SQLITE:OPEN path JOURNAL-MAKE [: WRITABLE ;] SET-UP ;
+   path str> SQLITE:OPEN path JOURNAL-MAKE [: READY ;] SET-UP ;
 
 \ The schema-8 journal at path, never created or changed.
 : OPEN-READ ( str -- journal )
@@ -945,6 +987,13 @@ STRUCTURE path-plan
    FIELD plan operation-plan
 ;STRUCTURE
 
+\ not-found: no such plan; already-completed: the plan finished, so
+\ nothing was blocked; blocked: the reason and retry time committed.
+ENUM plan-block not-found already-completed blocked ;ENUM
+
+\ not-blocked: the plan is pending or completed, unchanged.
+ENUM plan-unblock not-found not-blocked unblocked ;ENUM
+
 \ live-paths: the paths whose decision a live plan, pending or blocked,
 \ kept from being recorded.
 STRUCTURE reconciliation-write
@@ -1019,11 +1068,14 @@ ARENA WRITERS JSON:writer
    [: DROP-BASELINE json ar MODEL:JSON>BASELINE ;]
    s" deserialize baseline" >str path DECODED ;
 
-: DECODE-OPERATION ( str MODEL:path ^ARENA:arena -- MODEL:operation )
-   {: json:str path ar :}
+: OPERATION-AS
+   ( str MODEL:path ^ARENA:arena str -- MODEL:operation )
+   {: json:str path ar op:str :}
    MODEL-OPERATION:create-local-directory
-   [: DROP-OPERATION json ar MODEL:JSON>OPERATION ;]
-   s" deserialize operation" >str path DECODED ;
+   [: DROP-OPERATION json ar MODEL:JSON>OPERATION ;] op path DECODED ;
+
+: DECODE-OPERATION ( str MODEL:path ^ARENA:arena -- MODEL:operation )
+   s" deserialize operation" >str OPERATION-AS ;
 
 : DECODE-BLOCKAGE ( str MODEL:path ^ARENA:arena -- MODEL:blockage )
    {: json:str path ar :}
@@ -1038,6 +1090,10 @@ ARENA WRITERS JSON:writer
 : ENCODE-OPERATION ( MODEL:operation ^ARENA:arena -- str )
    {: o ar :}
    [: o swap MODEL:OPERATION>JSON ;] ar ENCODED ;
+
+: ENCODE-BLOCKAGE ( MODEL:blockage ^ARENA:arena -- str )
+   {: b ar :}
+   [: b swap MODEL:BLOCKAGE>JSON ;] ar ENCODED ;
 
 : ABSENT? ( MODEL:baseline -- bool )
    MATCH MODEL:baseline
@@ -1713,5 +1769,152 @@ public
    {: j ar :}
    j >CONNECTION PLAN-QUERY s" pending" s" read pending plans" >str ar
    READ-PLANS-WITH-STATUS ;
+
+\ Every plan a classified failure holds, by id, each one's operations in
+\ order.
+: BLOCKED-PLANS ( journal ^ARENA:arena -- ^VEC:vector<plan-record> )
+   {: j ar :}
+   j >CONNECTION PLAN-QUERY s" blocked" s" read blocked plans" >str ar
+   READ-PLANS-WITH-STATUS ;
+
+private
+
+
+\ ---- blocking ------------------------------------------------------
+
+: COMPLETED? ( plan-status -- bool )
+   MATCH plan-status
+      pending OF false ENDOF
+      blocked OF 2drop false ENDOF
+      completed OF true ENDOF
+   ;MATCH ;
+
+: BLOCKED? ( plan-status -- bool )
+   MATCH plan-status
+      pending OF false ENDOF
+      blocked OF 2drop true ENDOF
+      completed OF false ENDOF
+   ;MATCH ;
+
+\ A retry time past SQLite's integer range is a u64 above INT-MAX, which
+\ a cell holds as a negative number.
+: BLOCKING ( SQLITE:connection plan-id str n MODEL:path -- )
+   {: c id json:str at path :}
+   at 0 < if
+      s" block plan" >str path
+      s" retry time exceeds the supported range" PATH-INVALID
+   then
+   c s" UPDATE plans SET status = 'blocked', blocked_json = ?2,
+         retry_at = ?3
+      WHERE id = ?1"
+   [: id PLAN-ID>N 1 SQLITE:BIND-INT
+      json str> 2 SQLITE:BIND-TEXT
+      at 3 SQLITE:BIND-INT
+      SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT ;
+
+: BLOCK-STATED
+   ( SQLITE:connection plan-id MODEL:blockage n plan-state ^ARENA:arena
+     -- plan-block )
+   {: c id reason at state ar :}
+   state PLAN-STATE-UNMAKE {: path status :}
+   status COMPLETED? if
+      construct plan-block already-completed exit
+   then
+   c id reason ar ENCODE-BLOCKAGE at path BLOCKING
+   construct plan-block blocked ;
+
+: BLOCK-IN
+   ( SQLITE:connection plan-id MODEL:blockage n ^ARENA:arena
+     -- plan-block )
+   {: c id reason at ar :}
+   c id s" read plan status for blocking" >str ar READ-PLAN-STATE
+   MATCH option
+      none OF construct plan-block not-found ENDOF
+      some OF {: state :} c id reason at state ar BLOCK-STATED ENDOF
+   ;MATCH ;
+
+: UNBLOCKING ( SQLITE:connection plan-id -- )
+   {: c id :}
+   c s" UPDATE plans SET status = 'pending', blocked_json = NULL,
+         retry_at = NULL
+      WHERE id = ?1"
+   [: id PLAN-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT ;
+
+: UNBLOCK-STATED
+   ( SQLITE:connection plan-id plan-state -- plan-unblock )
+   {: c id state :}
+   state PLAN-STATE-UNMAKE {: path status :}
+   status BLOCKED? 0= if construct plan-unblock not-blocked exit then
+   c id UNBLOCKING
+   construct plan-unblock unblocked ;
+
+: UNBLOCK-IN ( SQLITE:connection plan-id ^ARENA:arena -- plan-unblock )
+   {: c id ar :}
+   c id s" read plan status for unblocking" >str ar READ-PLAN-STATE
+   MATCH option
+      none OF construct plan-unblock not-found ENDOF
+      some OF {: state :} c id state UNBLOCK-STATED ENDOF
+   ;MATCH ;
+
+\ The upload payload a remote mutation still references, if any.
+: PUSH-UPLOAD ( MODEL:operation ^VEC:vector<DROPBOX:hash> -- )
+   {: hashes :}
+   MATCH MODEL:operation
+      create-local-directory OF ENDOF
+      create-remote-directory OF ENDOF
+      delete-local-directory OF ENDOF
+      delete-remote-directory OF ENDOF
+      create-remote OF hashes VEC:PUSH ! ENDOF
+      install-local OF drop ENDOF
+      preserve-local OF drop ENDOF
+      replace-local OF 2drop ENDOF
+      delete-local OF drop ENDOF
+      preserve-remote OF drop ENDOF
+      replace-remote OF drop hashes VEC:PUSH ! ENDOF
+      delete-remote OF drop ENDOF
+   ;MATCH ;
+
+: UPLOAD-ROW
+   ( SQLITE:statement ^VEC:vector<DROPBOX:hash> ^ARENA:arena
+     -- SQLITE:statement )
+   {: hashes ar :}
+   0 ar PATH-COPY {: path :}
+   1 SQLITE:COL-TEXT >str path ar
+   s" deserialize pending upload operation" >str OPERATION-AS
+   hashes PUSH-UPLOAD ;
+
+public
+
+\ Holds a live plan until its classified cause is worth retrying, at
+\ retry-at, seconds since the epoch.
+: BLOCK-PLAN
+   ( journal plan-id MODEL:blockage n ^ARENA:arena -- plan-block )
+   {: j id reason at ar :}
+   j >CONNECTION {: c :}
+   c [: c id reason at ar BLOCK-IN ;] SQLITE:WITH-TRANSACTION ;
+
+\ Returns a blocked plan to pending work for one more attempt.
+: UNBLOCK-PLAN ( journal plan-id ^ARENA:arena -- plan-unblock )
+   {: j id ar :}
+   j >CONNECTION {: c :}
+   c [: c id ar UNBLOCK-IN ;] SQLITE:WITH-TRANSACTION ;
+
+\ The upload payloads pending remote mutations of live plans still
+\ reference, in operation order.
+: PENDING-UPLOAD-CONTENT
+   ( journal ^ARENA:arena -- ^VEC:vector<DROPBOX:hash> )
+   {: j ar :}
+   ar [type] DROPBOX:hash NEW-VECTOR {: hashes :}
+   j >CONNECTION
+   s" SELECT plans.path, operations.operation_json
+      FROM operations JOIN plans ON plans.id = operations.plan_id
+      WHERE plans.status IN ('pending', 'blocked')
+         AND operations.status = 'pending'
+      ORDER BY operations.id"
+   [: begin SQLITE:STEP while hashes ar UPLOAD-ROW repeat ;]
+   SQLITE:WITH-STATEMENT
+   hashes ;
 
 ;package
