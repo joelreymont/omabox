@@ -4,6 +4,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -17,6 +18,7 @@ use thiserror::Error;
 use crate::config::resolve_config_home;
 use crate::service::{ServiceCommands, ServiceError, ServiceGoal, UnitState};
 use crate::spawn::Launch;
+use crate::stale::{self, Leftover};
 
 const UNIT: &[u8] = include_bytes!("../packaging/systemd/omabox.service");
 // A concurrent child can briefly inherit the staged file's writable descriptor
@@ -191,7 +193,7 @@ fn install(
     };
     let enabled = if state.enabled { "enabled" } else { "disabled" };
 
-    match state.unit {
+    let report = match state.unit {
         // A service that reached readiness shows the old build worked, so a failed restart rolls back to it.
         UnitState::Running => {
             if let Err(source) = commands.services.drive(ServiceGoal::Restart) {
@@ -204,10 +206,13 @@ fn install(
                     true,
                 ));
             }
-            transaction.finish()?;
-            Ok(format!(
-                "Omabox was {done}. The service remains {enabled} and running.\n"
-            ))
+            if let Err(source) = transaction.finish() {
+                return Err(InstallError::CleanupAfterChange {
+                    done,
+                    source: Box::new(source),
+                });
+            }
+            format!("Omabox was {done}. The service remains {enabled} and running.\n")
         }
         // A starting service has not shown the old build works and may still run it, so the new build is kept and replaces it.
         UnitState::Starting => {
@@ -216,9 +221,7 @@ fn install(
                 .services
                 .drive(ServiceGoal::Restart)
                 .map_err(|source| InstallError::StartAfterChange { done, source })?;
-            Ok(format!(
-                "Omabox was {done}. The service remains {enabled} and running.\n"
-            ))
+            format!("Omabox was {done}. The service remains {enabled} and running.\n")
         }
         // A failed unit usually stopped for a cause the old build shares, so the new build is kept before Recover starts it.
         UnitState::Failed | UnitState::Stopping | UnitState::Stopped => {
@@ -227,15 +230,16 @@ fn install(
                 .services
                 .drive(ServiceGoal::Recover)
                 .map_err(|source| InstallError::StartAfterChange { done, source })?;
-            Ok(if driven.launched {
+            if driven.launched {
                 format!(
                     "Omabox was {done}. The service remains {enabled}. The stopped service has been started again.\n"
                 )
             } else {
                 format!("Omabox was {done}. The service remains {enabled} and stopped.\n")
-            })
+            }
         }
-    }
+    };
+    Ok(report + &stale::report(&transaction.leftovers))
 }
 
 fn uninstall(layout: &Layout, commands: &Commands) -> Result<String, InstallError> {
@@ -258,7 +262,7 @@ fn uninstall(layout: &Layout, commands: &Commands) -> Result<String, InstallErro
     transaction.finish()?;
     Ok(String::from(
         "Omabox program, service, and plugin files were removed. Configuration, the journal, recovery data, Secret Service credentials, and synced files were retained.\n",
-    ))
+    ) + &stale::report(&transaction.leftovers))
 }
 
 fn publish(
@@ -426,6 +430,8 @@ impl Entry {
 struct Transaction {
     entries: Vec<Entry>,
     mode: TransactionMode,
+    /// What the sweep before this transaction could not remove.
+    leftovers: Vec<Leftover>,
 }
 
 impl Transaction {
@@ -435,9 +441,10 @@ impl Transaction {
         commands: &Commands,
     ) -> Result<Self, InstallError> {
         prepare_parents(layout)?;
+        let leftovers = sweep_stale(layout)?;
         let token = temporary_token();
         let staged = staged_paths(layout, &token)?;
-        let transaction = Self::new(layout, staged.clone(), TransactionMode::Replace);
+        let transaction = Self::new(layout, staged.clone(), TransactionMode::Replace, leftovers);
         let [omabox, omaboxd, unit, plugin] = &staged;
         let result = (|| {
             copy_file(&sources.omabox, omabox, 0o755)?;
@@ -455,17 +462,24 @@ impl Transaction {
     }
 
     fn remove(layout: &Layout) -> Result<Self, InstallError> {
+        let leftovers = sweep_stale(layout)?;
         let token = temporary_token();
         let transaction = Self::new(
             layout,
             staged_paths(layout, &token)?,
             TransactionMode::Remove,
+            leftovers,
         );
         transaction.preflight()?;
         Ok(transaction)
     }
 
-    fn new(layout: &Layout, staged: [PathBuf; 4], mode: TransactionMode) -> Self {
+    fn new(
+        layout: &Layout,
+        staged: [PathBuf; 4],
+        mode: TransactionMode,
+        leftovers: Vec<Leftover>,
+    ) -> Self {
         let destinations = [
             layout.omabox.clone(),
             layout.omaboxd.clone(),
@@ -489,7 +503,11 @@ impl Transaction {
                 state: EntryState::Ready,
             })
             .collect();
-        Self { entries, mode }
+        Self {
+            entries,
+            mode,
+            leftovers,
+        }
     }
 
     fn preflight(&self) -> Result<(), InstallError> {
@@ -710,6 +728,21 @@ fn staged_paths(layout: &Layout, token: &str) -> Result<[PathBuf; 4], InstallErr
     ])
 }
 
+/// Remove the staged artifacts and backups that a killed or failed run left
+/// behind, and return what could not be removed. Only a layout without an
+/// artifact directory fails; the sweep itself never does.
+fn sweep_stale(layout: &Layout) -> Result<Vec<Leftover>, InstallError> {
+    let mut leftovers = Vec::new();
+    // An empty token turns each staged path into the prefix its names share.
+    for prefix in staged_paths(layout, "")? {
+        let (Some(directory), Some(name)) = (prefix.parent(), prefix.file_name()) else {
+            return Err(invalid(&prefix, "an artifact has no parent directory"));
+        };
+        leftovers.extend(stale::sweep(directory, name.as_bytes(), b""));
+    }
+    Ok(leftovers)
+}
+
 fn temporary_sibling(path: &Path, role: &str, token: &str) -> Result<PathBuf, InstallError> {
     let parent = path
         .parent()
@@ -886,6 +919,18 @@ pub enum InstallError {
         #[source]
         source: ServiceError,
     },
+    #[error(
+        "Omabox was {done} and the service runs the new build, but the replaced files could not be removed"
+    )]
+    #[diagnostic(
+        code(omabox::install::cleanup_after_change),
+        help("The next install, upgrade or uninstall removes the leftover files.")
+    )]
+    CleanupAfterChange {
+        done: &'static str,
+        #[source]
+        source: Box<InstallError>,
+    },
     #[error("the lifecycle operation failed and rollback also failed: {}", .restore[0])]
     #[diagnostic(
         code(omabox::install::rollback_failed),
@@ -919,6 +964,7 @@ mod tests {
     use std::error::Error;
 
     use super::*;
+    use crate::config::{Config, XdgDirectories};
 
     const VALID_DAEMON: &[u8] = b"#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = --self-check ]; then printf 'omaboxd 0.1.0\\n'; exit 0; fi\nexit 64\n";
 
@@ -1304,6 +1350,229 @@ mod tests {
         assert_eq!(daemon_backup.len(), 1);
         assert_eq!(fs::read(&omabox_backup[0])?, b"old");
         assert_eq!(fs::read(&daemon_backup[0])?, b"old");
+        Ok(())
+    }
+
+    #[test]
+    fn upgrade_and_config_write_sweep_only_dead_temporaries() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new("active", true, false, false)?;
+        fixture.old_install()?;
+        let root = fixture._temporary.path();
+        let pid_max: u32 = fs::read_to_string("/proc/sys/kernel/pid_max")?
+            .trim()
+            .parse()?;
+        let dead = format!("{}.0", pid_max + 1);
+        let live = format!("{}.999999999", std::process::id());
+        let Some(bin) = fixture.layout.omabox.parent() else {
+            return Err(io::Error::other("binary path had no parent").into());
+        };
+        let Some(unit) = fixture.layout.unit.parent() else {
+            return Err(io::Error::other("unit path had no parent").into());
+        };
+        let omarchy = fixture.layout.omarchy_root.as_path();
+        let xdg = XdgDirectories::new(root.join("xdg-config"), root.join("xdg-state"))?;
+        let config_file = xdg.config_file();
+        let Some(config) = config_file.parent() else {
+            return Err(io::Error::other("config path had no parent").into());
+        };
+        fs::create_dir_all(config)?;
+        let sync_root = root.join("Dropbox");
+        fs::create_dir(&sync_root)?;
+
+        let outside_directory = root.join("outside-directory");
+        fs::create_dir(&outside_directory)?;
+        fs::write(outside_directory.join("kept"), b"outside")?;
+        let outside_file = root.join("outside-file");
+        fs::write(&outside_file, b"outside")?;
+
+        let stale_plugin = omarchy.join(format!(".local.omabox.install.{dead}"));
+        fs::create_dir(&stale_plugin)?;
+        fs::write(stale_plugin.join("Panel.qml"), b"old")?;
+        std::os::unix::fs::symlink(&outside_directory, stale_plugin.join("link"))?;
+        let removed = [
+            bin.join(format!(".omabox.install.{dead}")),
+            bin.join(format!(".omaboxd.install.{dead}")),
+            unit.join(format!(".omabox.service.install.{dead}")),
+            stale_plugin,
+            config.join(format!(".config.toml.{dead}.tmp")),
+            config.join(format!(".config.toml.{}.1.tmp", pid_max + 1)),
+        ];
+        let kept = [
+            bin.join(format!(".omabox.install.{live}")),
+            bin.join(format!(".omaboxd.install.{live}")),
+            unit.join(format!(".omabox.service.install.{live}")),
+            omarchy.join(format!(".local.omabox.install.{live}")),
+            config.join(format!(".config.toml.{live}.tmp")),
+            // Near misses with a dead PID do not match the exact pattern.
+            bin.join(format!(".omabox.install.{dead}.1")),
+            bin.join(format!(".omabox.install.{}", pid_max + 1)),
+            bin.join(format!(".omabox.install.0{dead}")),
+            config.join(format!(".config.toml.{dead}")),
+        ];
+        for path in [&removed[0], &removed[2], &removed[4]]
+            .into_iter()
+            .chain(&kept)
+        {
+            fs::write(path, b"stale")?;
+        }
+        for link in [&removed[1], &removed[5]] {
+            std::os::unix::fs::symlink(&outside_file, link)?;
+        }
+
+        execute_with(
+            InstallAction::Upgrade,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        )?;
+        Config::from_values(&xdg, &sync_root, "test-app-key")?.write()?;
+
+        for path in &removed {
+            assert!(fs::symlink_metadata(path).is_err(), "{}", path.display());
+        }
+        for path in &kept {
+            assert_eq!(fs::read(path)?, b"stale", "{}", path.display());
+        }
+        assert_eq!(fs::read(outside_directory.join("kept"))?, b"outside");
+        assert_eq!(fs::read_dir(&outside_directory)?.count(), 1);
+        assert_eq!(fs::read(&outside_file)?, b"outside");
+        assert_eq!(fs::read(&fixture.layout.omaboxd)?, VALID_DAEMON);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unremovable_stale_temporary_is_reported_and_left_in_place() -> Result<(), Box<dyn Error>>
+    {
+        // Root removes entries from a read-only directory, so nothing would stay.
+        if rustix::process::geteuid().is_root() {
+            return Ok(());
+        }
+        let fixture = Fixture::new("active", true, false, false)?;
+        fixture.old_install()?;
+        let root = fixture._temporary.path();
+        let pid_max: u32 = fs::read_to_string("/proc/sys/kernel/pid_max")?
+            .trim()
+            .parse()?;
+        let dead = format!("{}.0", pid_max + 1);
+        let xdg = XdgDirectories::new(root.join("xdg-config"), root.join("xdg-state"))?;
+        let config_file = xdg.config_file();
+        let Some(config) = config_file.parent() else {
+            return Err(io::Error::other("config path had no parent").into());
+        };
+        fs::create_dir_all(config)?;
+        let sync_root = root.join("Dropbox");
+        fs::create_dir(&sync_root)?;
+
+        // A file inside a directory without write permission cannot be removed.
+        let stale_plugin = fixture
+            .layout
+            .omarchy_root
+            .join(format!(".local.omabox.install.{dead}"));
+        let stale_config = config.join(format!(".config.toml.{dead}.tmp"));
+        let mut locked = Vec::new();
+        for stale in [&stale_plugin, &stale_config] {
+            let subdirectory = stale.join("locked");
+            fs::create_dir_all(&subdirectory)?;
+            fs::write(subdirectory.join("Panel.qml"), b"old")?;
+            fs::set_permissions(&subdirectory, fs::Permissions::from_mode(0o500))?;
+            locked.push(subdirectory);
+        }
+
+        let upgraded = execute_with(
+            InstallAction::Upgrade,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+        let written = Config::from_values(&xdg, &sync_root, "test-app-key")?.write();
+        let present = [&stale_plugin, &stale_config].map(|path| path.exists());
+        // Let the temporary directory remove the fixture.
+        for subdirectory in &locked {
+            fs::set_permissions(subdirectory, fs::Permissions::from_mode(0o700))?;
+        }
+
+        let report = upgraded?;
+        let leftover = |path: &Path| {
+            format!(
+                "Left a stale temporary in place: could not remove a stale temporary `{}`: ",
+                path.display()
+            )
+        };
+        let Some((summary, left)) = report.split_once('\n') else {
+            return Err(io::Error::other(format!("unexpected report: {report}")).into());
+        };
+        assert_eq!(
+            summary,
+            "Omabox was upgraded. The service remains enabled and running."
+        );
+        assert!(left.starts_with(&leftover(&stale_plugin)), "{report}");
+        assert_eq!(left.lines().count(), 1, "{report}");
+        let leftovers = written?;
+        assert_eq!(leftovers.len(), 1, "{leftovers:?}");
+        assert_eq!(leftovers[0].path, stale_config);
+        assert_eq!(leftovers[0].operation, "remove a stale temporary");
+        assert_eq!(leftovers[0].source.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            format!("Left a stale temporary in place: {}\n", leftovers[0])
+                .starts_with(&leftover(&stale_config))
+        );
+        assert_eq!(present, [true, true]);
+        assert_eq!(fs::read(&fixture.layout.omaboxd)?, VALID_DAEMON);
+        assert_eq!(Config::load_from(&xdg)?.sync_root(), sync_root);
+        Ok(())
+    }
+
+    #[test]
+    fn finish_failure_after_restart_reports_the_completed_upgrade() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new("active", true, false, false)?;
+        fixture.old_install()?;
+        let Some(bin) = fixture.layout.omabox.parent() else {
+            return Err(io::Error::other("binary path had no parent").into());
+        };
+        // The restart succeeds after turning the old build's backup into a
+        // directory, so finish() cannot remove it as the file it staged.
+        fs::write(
+            &fixture.systemctl,
+            format!(
+                "printf '%s\\n' \"$2\" >> '{}'\ncase \"$2\" in\n is-enabled) exit 0;;\n show) printf 'active\\n';;\n restart) for backup in '{}/.omabox.install.'*; do rm -f -- \"$backup\"; mkdir -- \"$backup\"; done;;\nesac\nexit 0\n",
+                fixture.systemctl_log.display(),
+                bin.display(),
+            ),
+        )?;
+
+        let result = execute_with(
+            InstallAction::Upgrade,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        let error = match result {
+            Err(error @ InstallError::CleanupAfterChange { .. }) => error,
+            other => return Err(io::Error::other(format!("unexpected result: {other:?}")).into()),
+        };
+        let InstallError::CleanupAfterChange { done, source } = &error else {
+            return Err(io::Error::other("the error changed variant").into());
+        };
+        assert_eq!(*done, "upgraded");
+        assert!(matches!(**source, InstallError::InvalidArtifact { .. }));
+        assert_eq!(
+            error.to_string(),
+            "Omabox was upgraded and the service runs the new build, but the replaced files could not be removed"
+        );
+        assert_eq!(
+            error.help().map(|help| help.to_string()).as_deref(),
+            Some("The next install, upgrade or uninstall removes the leftover files.")
+        );
+        assert_eq!(
+            fs::read(&fixture.layout.omabox)?,
+            b"#!/bin/sh\necho omabox\n"
+        );
+        assert_eq!(fs::read(&fixture.layout.omaboxd)?, VALID_DAEMON);
+        assert_eq!(
+            fs::read_to_string(&fixture.systemctl_log)?,
+            "is-enabled\nshow\ndaemon-reload\nreset-failed\nrestart\n"
+        );
         Ok(())
     }
 
@@ -1822,6 +2091,38 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_sweeps_dead_temporaries_from_every_install_directory() -> Result<(), Box<dyn Error>>
+    {
+        let fixture = Fixture::new("active", true, false, false)?;
+        fixture.old_install()?;
+        let pid_max: u32 = fs::read_to_string("/proc/sys/kernel/pid_max")?
+            .trim()
+            .parse()?;
+        let dead = format!("{}.0", pid_max + 1);
+        let stale = staged_paths(&fixture.layout, &dead)?;
+        let [omabox, omaboxd, unit, plugin] = &stale;
+        for file in [omabox, omaboxd, unit] {
+            fs::write(file, b"stale")?;
+        }
+        fs::create_dir(plugin)?;
+        fs::write(plugin.join("Panel.qml"), b"stale")?;
+
+        let report = execute_with(
+            InstallAction::Uninstall,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        )?;
+
+        for path in &stale {
+            assert!(fs::symlink_metadata(path).is_err(), "{}", path.display());
+        }
+        assert!(!fixture.layout.plugin.exists());
+        assert!(!report.contains("Left a stale temporary"), "{report}");
+        Ok(())
+    }
+
+    #[test]
     fn uninstall_stops_a_starting_or_stopping_service() -> Result<(), Box<dyn Error>> {
         for active_state in ["activating", "deactivating"] {
             let fixture = Fixture::new(active_state, true, false, false)?;
@@ -1936,6 +2237,10 @@ mod tests {
                 done: "upgraded",
                 source: ServiceError::Terminated { command: "command" },
             },
+            InstallError::CleanupAfterChange {
+                done: "upgraded",
+                source: inner(),
+            },
             InstallError::RollbackFailed {
                 source: inner(),
                 restore: Box::new([*inner()]),
@@ -1961,6 +2266,7 @@ mod tests {
                 InstallError::InvalidLockState => "InvalidLockState",
                 InstallError::Service(_) => "Service",
                 InstallError::StartAfterChange { .. } => "StartAfterChange",
+                InstallError::CleanupAfterChange { .. } => "CleanupAfterChange",
                 InstallError::RollbackFailed { .. } => "RollbackFailed",
                 InstallError::CleanupFailed { .. } => "CleanupFailed",
             })

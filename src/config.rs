@@ -14,6 +14,8 @@ use rustix::fs::OFlags;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::stale::{self, Leftover};
+
 const APPLICATION_DIRECTORY: &str = "omabox";
 const CONFIG_FILE: &str = "config.toml";
 const JOURNAL_FILE: &str = "journal.sqlite3";
@@ -330,17 +332,19 @@ impl Config {
         self.paths.prepare(&self.sync_root)
     }
 
-    /// Atomically persist this non-secret configuration with owner-only access.
-    pub fn write(&self) -> Result<(), ConfigError> {
+    /// Atomically persist this non-secret configuration with owner-only access,
+    /// and return the stale temporaries the write could not remove.
+    pub fn write(&self) -> Result<Vec<Leftover>, ConfigError> {
         self.write_with_replacement(true)
     }
 
-    /// Atomically persist initial configuration without replacing an existing file.
-    pub fn write_new(&self) -> Result<(), ConfigError> {
+    /// Atomically persist initial configuration without replacing an existing
+    /// file, and return the stale temporaries the write could not remove.
+    pub fn write_new(&self) -> Result<Vec<Leftover>, ConfigError> {
         self.write_with_replacement(false)
     }
 
-    fn write_with_replacement(&self, replace_existing: bool) -> Result<(), ConfigError> {
+    fn write_with_replacement(&self, replace_existing: bool) -> Result<Vec<Leftover>, ConfigError> {
         let document = StoredDocument {
             sync_root: self.sync_root.clone(),
             dropbox_app_key: self.dropbox_app_key.clone(),
@@ -633,7 +637,7 @@ fn atomic_write_config(
     path: &Path,
     contents: &[u8],
     replace_existing: bool,
-) -> Result<(), ConfigError> {
+) -> Result<Vec<Leftover>, ConfigError> {
     let parent = path.parent().ok_or_else(|| ConfigError::Write {
         operation: "locate the parent of",
         path: path.to_path_buf(),
@@ -652,6 +656,8 @@ fn atomic_write_config(
             source,
         })?;
 
+    // A failed write drops these; the next write sweeps again.
+    let leftovers = stale::sweep(parent, format!(".{CONFIG_FILE}.").as_bytes(), b".tmp");
     let sequence = CONFIG_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = parent.join(format!(
         ".{CONFIG_FILE}.{}.{}.tmp",
@@ -659,7 +665,7 @@ fn atomic_write_config(
         sequence
     ));
     match write_config_temporary(&temporary, path, parent, contents, replace_existing) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(leftovers),
         Err(write) => match fs::remove_file(&temporary) {
             Ok(()) => Err(write),
             Err(cleanup) if cleanup.kind() == io::ErrorKind::NotFound => Err(write),

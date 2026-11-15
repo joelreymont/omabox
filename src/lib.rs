@@ -15,6 +15,7 @@ pub mod recovery;
 pub mod runtime_status;
 pub mod service;
 mod spawn;
+pub mod stale;
 pub mod status;
 
 /// Filesystem helpers shared with the integration tests, which declare the

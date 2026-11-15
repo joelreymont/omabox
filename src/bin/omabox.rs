@@ -18,6 +18,7 @@ use omabox::journal::{
     DropboxBinding, DropboxBindingWrite, Journal, JournalError, LocalRootBinding,
 };
 use omabox::service::{ServiceAction, ServiceCommands, ServiceError, ServiceGoal};
+use omabox::stale::{self, Leftover};
 use omabox::status::{self, StatusError};
 use serde::Serialize;
 use thiserror::Error;
@@ -395,7 +396,7 @@ fn complete_setup<Bind>(
     config: &Config,
     write_initial_config: bool,
     bind: Bind,
-) -> Result<(), CliError>
+) -> Result<Vec<Leftover>, CliError>
 where
     Bind: FnOnce() -> Result<(), CliError>,
 {
@@ -405,14 +406,14 @@ where
         refuse_existing_config(&config.paths().config_file())?;
     }
     bind()?;
-    if write_initial_config {
-        match config.write_new() {
-            Ok(()) => {}
-            Err(ConfigError::AlreadyExists { .. }) => return Err(CliError::InitialConfigExists),
-            Err(source) => return Err(config_error("write initial configuration")(source)),
-        }
+    if !write_initial_config {
+        return Ok(Vec::new());
     }
-    Ok(())
+    match config.write_new() {
+        Ok(leftovers) => Ok(leftovers),
+        Err(ConfigError::AlreadyExists { .. }) => Err(CliError::InitialConfigExists),
+        Err(source) => Err(config_error("write initial configuration")(source)),
+    }
 }
 
 fn show_status() -> Result<(), CliError> {
@@ -530,7 +531,8 @@ fn set_sync_root(
 /// Stop a service that can hold the instance lock, run `change`, then start
 /// the service again if it was running, or start a failed one the change may
 /// have fixed. `name` names the change, as in "setup"; `done` states the
-/// finished change, as in "Omabox setup is complete".
+/// finished change, as in "Omabox setup is complete". A successful command's
+/// report also names each stale temporary the change left in place.
 fn change_while_released<Change>(
     services: &ServiceCommands,
     name: &'static str,
@@ -538,7 +540,7 @@ fn change_while_released<Change>(
     change: Change,
 ) -> Result<(), CliError>
 where
-    Change: FnOnce() -> Result<(), CliError>,
+    Change: FnOnce() -> Result<Vec<Leftover>, CliError>,
 {
     let released = services
         .drive(ServiceGoal::Release)
@@ -552,11 +554,11 @@ where
             restore: [restore],
         }),
         (Err(source), Ok(_)) => Err(source),
-        (Ok(()), Err(source)) => Err(CliError::StartAfterChange {
+        (Ok(_), Err(source)) => Err(CliError::StartAfterChange {
             change: done.into(),
             source,
         }),
-        (Ok(()), Ok(restored)) => {
+        (Ok(leftovers), Ok(restored)) => {
             // The change may fix the fatal cause of a unit Release left failed.
             let recovered = !restored.launched
                 && services
@@ -573,14 +575,17 @@ where
             };
             write_to(
                 io::stdout().lock(),
-                &format!("{done}.{note}\n"),
+                &format!("{done}.{note}\n{}", stale::report(&leftovers)),
                 "write command output",
             )
         }
     }
 }
 
-fn change_sync_root_while_stopped(paths: &Paths, replacement: &Config) -> Result<(), CliError> {
+fn change_sync_root_while_stopped(
+    paths: &Paths,
+    replacement: &Config,
+) -> Result<Vec<Leftover>, CliError> {
     let _lock =
         InstanceLock::acquire(paths.lock_file()).map_err(|source| CliError::Lock { source })?;
     let binding = LocalRootBinding::inspect(replacement.sync_root())
@@ -599,7 +604,7 @@ fn change_sync_root_while_stopped(paths: &Paths, replacement: &Config) -> Result
     } else {
         None
     };
-    replacement
+    let leftovers = replacement
         .write()
         .map_err(config_error("write the new sync root"))?;
     if let Some(journal) = &mut journal {
@@ -610,7 +615,7 @@ fn change_sync_root_while_stopped(paths: &Paths, replacement: &Config) -> Result
                 source,
             })?;
     }
-    Ok(())
+    Ok(leftovers)
 }
 
 fn config_error(operation: &'static str) -> impl FnOnce(ConfigError) -> CliError {
@@ -1310,7 +1315,7 @@ mod tests {
 
             change_while_released(&services, "setup", "Omabox setup is complete", || {
                 during = Some(service_trace(temporary.path()));
-                Ok(())
+                Ok(Vec::new())
             })?;
             let Some(during) = during else {
                 return Err(format!("{initial}: the change did not run").into());

@@ -677,8 +677,11 @@ would remove the adapters above; they are candidate upstream changes to
   `~/.config/omarchy`, the only place Omarchy reads plugins; every
   `InstallError` has help; `RollbackFailed` and
   `CleanupFailed` expose both chains via `#[related]`; stale
-  `.omabox*.install.*` and `.config.toml.*.tmp` siblings whose PID is dead are
-  swept before each transaction.
+  `.omabox.install.*`, `.omaboxd.install.*`, `.omabox.service.install.*`,
+  `.local.omabox.install.*` and `.config.toml.*.tmp` siblings whose PID is dead
+  are swept before each transaction and config write. The sweep never fails
+  the command: a temporary it cannot remove stays in place, a successful
+  command's report names it, and the next sweep tries again.
 - `config`: `ConfigDocument` loads without filesystem checks; `Config::validate`
   is separate. `settings set-root` validates only the replacement and calls
   `adopt_local_root`; `status` and `settings` render an unresolvable root as a
