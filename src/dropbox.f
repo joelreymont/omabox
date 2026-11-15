@@ -576,6 +576,14 @@ ENUM verdict
    code r ru CURL-FAILED ;
 
 
+\ Whether the last call's own answer was lost: its route's transfer failed,
+\ so LOST answered retry 0. A lost refresh is the quiet token route's, so
+\ the call never went out.
+: LOST? ( ptr client -- bool )
+   {: c :}
+   c CLIENT-STATUS @ 0= c CLIENT-QUIET @ 0= and ;
+
+
 \ 429, 408 or 5xx: Retry-After, else a 429 body's error.retry_after, else 0.
 : WAITED ( ptr client -- reply )
    {: c :}
@@ -1431,14 +1439,6 @@ private
    construct kind deleted [: MADE-MEMBER ;] ENTRY-PARSE ;
 
 
-\ Whether the last request was the route's and its answer was lost: a
-\ CALL that returns with status 0 answered LOST's retry.
-: LOST-ON? ( ptr client ptr u8 n -- bool )
-   {: c r:ptr ru:n :}
-   c CLIENT-STATUS @ 0<> if false exit then
-   c CLIENT-ROUTE @ SPAN:$ r ru STR= ;
-
-
 \ A confirmation that failed: retry, after the ms get_metadata asked for.
 : UNCONFIRMED ( reply -- reply )
    MATCH reply
@@ -1515,7 +1515,7 @@ private
            [ error ptr client -- reply ] -- reply )
    {: c rt:ptr rtu:n read lost refusal :}
    c rt rtu [: JSON-BODY ;] CALL {: r:reply :}
-   c rt rtu LOST-ON? if c lost execute exit then
+   c LOST? if c lost execute exit then
    r MATCH reply
       done OF c read execute construct reply done ENDOF
       refused OF c refusal execute ENDOF
@@ -1952,14 +1952,6 @@ HEAP RUNS run
    ;MATCH ;
 
 
-\ The route's own transfer failed, so its answer is lost; a refresh's
-\ failure is the quiet route's.
-: DROPPED? ( reply ptr client -- bool )
-   {: rep:reply c :}
-   rep DONE? if false exit then
-   c CLIENT-STATUS @ 0= c CLIENT-QUIET @ 0= and ;
-
-
 \ A session Dropbox no longer takes chunks for.
 : GONE-TAG? ( ptr u8 n -- bool )
    {: t:ptr tu:n :}
@@ -2028,7 +2020,7 @@ ENUM restart-event once twice ;ENUM
       r COMMITTED? if construct send-event committed exit then
       construct send-event failed exit
    then
-   rep r RUN-CLIENT @ DROPPED? if construct send-event lost exit then
+   r RUN-CLIENT @ LOST? if construct send-event lost exit then
    rep CONFLICT? if construct send-event conflict exit then
    construct send-event failed ;
 
@@ -2038,7 +2030,7 @@ ENUM restart-event once twice ;ENUM
    r START-SENT {: rep:reply :}
    rep r RUN-LAST !
    rep DONE? if r SESSION-READ construct start-event opened exit then
-   rep r RUN-CLIENT @ DROPPED? if construct start-event lost exit then
+   r RUN-CLIENT @ LOST? if construct start-event lost exit then
    construct start-event failed ;
 
 
@@ -2065,7 +2057,7 @@ ENUM restart-event once twice ;ENUM
    r APPEND-SENT {: rep:reply :}
    rep r RUN-LAST !
    rep DONE? if r ACCEPTED exit then
-   rep c DROPPED? if r LOST-AGAIN exit then
+   c LOST? if r LOST-AGAIN exit then
    rep r HELD? if r ACCEPTED exit then
    rep c APPEND-GONE? if construct append-event gone exit then
    construct append-event failed ;
@@ -2080,7 +2072,7 @@ ENUM restart-event once twice ;ENUM
       r COMMITTED? if construct finish-event committed exit then
       construct finish-event failed exit
    then
-   rep c DROPPED? if construct finish-event lost exit then
+   c LOST? if construct finish-event lost exit then
    rep CONFLICT? if construct finish-event conflict exit then
    rep c FINISH-GONE? if construct finish-event gone exit then
    construct finish-event failed ;

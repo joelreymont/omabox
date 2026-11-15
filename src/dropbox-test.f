@@ -797,6 +797,18 @@ TYPED-VARIABLE FAULT fault
    UNSTAGED ;
 
 
+\ The upload takes effect and its answer is lost: confirmed by get_metadata.
+: LOST-SINGLE-CASE ( -- )
+   s" lost upload" T-LABEL
+   TEST-DROPBOX:RESET -1 FAULT-AT !
+   s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
+   TEST-DROPBOX:LOSE
+   SEND DONE? ASSERT
+   ENTRY-HASH$ EXPECTED$ T$=
+   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
+   UNSTAGED ;
+
+
 : NON-ASCII-CASE ( -- )
    s" non-ascii path" T-LABEL
    TEST-DROPBOX:RESET -1 FAULT-AT !
@@ -912,7 +924,7 @@ TYPED-VARIABLE FAULT fault
 
 
 : SINGLE-CASES ( -- )
-   SINGLE-CASE CONFLICT-CASE HELD-CASE NON-ASCII-CASE
+   SINGLE-CASE CONFLICT-CASE HELD-CASE LOST-SINGLE-CASE NON-ASCII-CASE
    SHORT-STAGE-CASE REFUSED-STAGE-CASE
    FULL-READ-CASE ENTERED-READ-CASE TIMED-OUT-READ-CASE
    CANCELLED-READ-CASE ;
