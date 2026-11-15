@@ -4004,6 +4004,79 @@ fn case_collision_beside_a_symlink_renames_the_baselined_file() -> Result<(), Bo
 }
 
 #[test]
+fn case_collision_of_symlinks_stays_in_place() -> Result<(), Box<dyn Error>> {
+    let bytes = b"other notes";
+    let content = dropbox_content_hash(bytes.as_slice())?;
+    let uploaded = file_metadata("/other.txt", "/other.txt", "rev-other", &content);
+    let server = FakeServer::start(vec![
+        account().for_path("/2/users/get_current_account"),
+        FakeResponse::json(json!({
+            "entries": [],
+            "cursor": "symlink-collision",
+            "has_more": false,
+        }))
+        .for_path("/2/files/list_folder"),
+        FakeResponse::json(uploaded.clone()).for_path("/2/files/upload"),
+        FakeResponse::json(json!({
+            "entries": [uploaded],
+            "cursor": "symlink-collision-after",
+            "has_more": false,
+        }))
+        .for_path("/2/files/list_folder/continue"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-symlink-collision")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("other.txt"), bytes)?;
+    std::os::unix::fs::symlink("upper-target", root.join("Link"))?;
+    std::os::unix::fs::symlink("lower-target", root.join("link"))?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+
+    for _ in 0..2 {
+        let outcome = reconcile_once(
+            &mut journal,
+            &client,
+            &mut downloads,
+            &root,
+            &staging,
+            &recovery,
+        )?;
+        assert!(
+            !matches!(outcome, ReconcileOutcome::FreshObservationRequired { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    let requests = server.finish()?;
+    let uploads = requests
+        .iter()
+        .filter(|request| request.path == "/2/files/upload")
+        .count();
+    assert_eq!(uploads, 1);
+    assert_eq!(
+        std::fs::read_link(root.join("Link"))?,
+        PathBuf::from("upper-target")
+    );
+    assert_eq!(
+        std::fs::read_link(root.join("link"))?,
+        PathBuf::from("lower-target")
+    );
+    let mut names = std::fs::read_dir(&root)?
+        .map(|entry| Ok(entry?.file_name()))
+        .collect::<io::Result<Vec<_>>>()?;
+    names.sort();
+    assert_eq!(names, ["Link", "link", "other.txt"]);
+    Ok(())
+}
+
+#[test]
 fn pending_exact_downloads_use_bounded_parallel_workers() -> Result<(), Box<dyn Error>> {
     const DOWNLOAD_COUNT: usize = 8;
     const WORKER_COUNT: usize = 4;

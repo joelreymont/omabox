@@ -1733,17 +1733,27 @@ fn local_map(
             .cmp(right_canonical)
             .then_with(|| left.path.cmp(&right.path))
     });
-    for pair in mapped.windows(2) {
-        let [(first_canonical, first), (second_canonical, second)] = pair else {
+    for collision in mapped.chunk_by(|(left, _), (right, _)| left == right) {
+        let [(_, first), (_, second), ..] = collision else {
             continue;
         };
-        if first_canonical == second_canonical {
+        let unsupported_only = collision.iter().all(|(_, record)| {
+            matches!(
+                record.observation,
+                Observation::Unknown(UnknownReason::Unsupported)
+            )
+        });
+        if !unsupported_only {
             return Err(ReconcileError::LocalCaseCollision {
                 first: first.path.clone(),
                 second: second.path.clone(),
             });
         }
     }
+    // A collision of unsupported spellings only cannot be renamed apart; it
+    // plans nothing and infers no deletion, so its least spelling stands for
+    // the path as one unknown observation.
+    mapped.dedup_by(|(later, _), (earlier, _)| later == earlier);
     Ok(mapped)
 }
 
@@ -1893,7 +1903,9 @@ struct CaseVariantMove {
 ///
 /// The rename moves only a regular file or a directory, so a spelling the scan
 /// published as unsupported (a symlink, a special file, a reserved name or an
-/// entry on another volume) is a candidate only when every spelling is.
+/// entry on another volume) is never a candidate. A collision of unsupported
+/// spellings only is left in place: it plans nothing and infers no deletion,
+/// so planning keeps it as one unknown path.
 /// `recorded` reads the spelling a baseline at the colliding canonical path
 /// was recorded under. The greatest candidate other than that one is renamed,
 /// so the history stays attached to the file it was recorded for; when the
@@ -1914,14 +1926,16 @@ fn case_variant_source(
             .or_default()
             .insert(&record.path, renamable);
     }
-    let Some((canonical, variants)) = spellings.iter().find(|(_, paths)| paths.len() > 1) else {
+    let Some((canonical, variants)) = spellings
+        .iter()
+        .find(|(_, paths)| paths.len() > 1 && paths.values().any(|renamable| *renamable))
+    else {
         return Ok(None);
     };
     let kept = recorded(canonical)?;
-    let any_renamable = variants.values().any(|renamable| *renamable);
     let mut candidates = variants
         .iter()
-        .filter(|(_, renamable)| **renamable || !any_renamable)
+        .filter(|(_, renamable)| **renamable)
         .map(|(path, _)| *path)
         .rev();
     let preferred = candidates
@@ -2375,7 +2389,7 @@ mod tests {
             .into_iter()
             .map(|path| LocalObservationRecord {
                 path,
-                observation: Observation::Unknown(crate::model::UnknownReason::Unsupported),
+                observation: Observation::Directory,
             })
             .collect()
     }
@@ -2727,6 +2741,47 @@ mod tests {
             case_variant_source(&records, recorded("notes.txt"))?,
             Some(PathBuf::from("Notes.txt"))
         );
+        Ok(())
+    }
+
+    fn unsupported_records(paths: &[&str]) -> Vec<LocalObservationRecord> {
+        paths
+            .iter()
+            .map(|path| LocalObservationRecord {
+                path: PathBuf::from(path),
+                observation: Observation::Unknown(UnknownReason::Unsupported),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn case_variant_source_leaves_unsupported_spellings() -> Result<(), Box<dyn Error>> {
+        let records = unsupported_records(&["Link", "link"]);
+        assert_eq!(case_variant_source(&records, no_baseline)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn case_variant_source_skips_an_unsupported_collision() -> Result<(), Box<dyn Error>> {
+        let mut records = unsupported_records(&["Link", "link"]);
+        for path in ["Notes.txt", "notes.txt"] {
+            records.push(LocalObservationRecord {
+                path: PathBuf::from(path),
+                observation: Observation::Present(LocalFile::new(identity(path.as_bytes())?)),
+            });
+        }
+        assert_eq!(
+            case_variant_source(&records, no_baseline)?,
+            Some(PathBuf::from("notes.txt"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn local_map_keeps_one_unsupported_spelling() -> Result<(), Box<dyn Error>> {
+        let mapped = local_map(unsupported_records(&["link", "Link"]))?;
+        let paths: Vec<_> = mapped.iter().map(|(_, record)| &record.path).collect();
+        assert_eq!(paths, [&PathBuf::from("Link")]);
         Ok(())
     }
 
