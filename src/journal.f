@@ -10,8 +10,8 @@
 \ a subvolume a new device number at every mount, so the device is none
 \ of it. A binding with no birth time is one a version-6 journal recorded;
 \ an activation whose path and inode match it upgrades it in place.
-\ A baseline and a plan are keyed by the canonical path MODEL:FOLD gives
-\ the display path; every stored value is MODEL's JSON, and a stored
+\ A baseline, a plan and a conflict are keyed by the canonical path
+\ MODEL:FOLD gives the display path; every stored value is MODEL's JSON, and a stored
 \ value that does not read is logged and thrown as E-JSON. Each write is
 \ one immediate transaction.
 \ STORAGE CLASS. CALLER-OWNED: a journal borrows the path it was opened
@@ -1713,5 +1713,444 @@ public
    {: j ar :}
    j >CONNECTION PLAN-QUERY s" pending" s" read pending plans" >str ar
    READ-PLANS-WITH-STATUS ;
+
+
+\ ---- completions and conflicts: values ----------------------------
+
+public
+
+\ What completing one operation answered. waiting-for-earlier-operation:
+\ id, an earlier operation of the plan, is pending. baseline-required:
+\ a final operation needs its resulting baseline; unexpected-baseline: a
+\ non-final one takes none; baseline-mismatch: the baseline is not the
+\ final operation's result. plan-completed: the final operation, its
+\ plan and baseline committed together.
+ENUM operation-completion
+   VARIANT not-found ;VARIANT
+   VARIANT already-completed ;VARIANT
+   VARIANT waiting-for-earlier-operation FIELD id operation-id ;VARIANT
+   VARIANT baseline-required ;VARIANT
+   VARIANT unexpected-baseline ;VARIANT
+   VARIANT baseline-mismatch ;VARIANT
+   VARIANT operation-completed ;VARIANT
+   VARIANT plan-completed ;VARIANT
+;ENUM
+
+\ A final operation and the baseline it resulted in.
+STRUCTURE operation-baseline
+   FIELD id operation-id
+   FIELD baseline MODEL:baseline
+;STRUCTURE
+
+\ One durable conflict, the planner's payload whole.
+STRUCTURE conflict-record
+   FIELD id n
+   FIELD path MODEL:path
+   FIELD conflict MODEL:conflict
+;STRUCTURE
+
+\ recorded: the conflict and the plan's completion committed together.
+ENUM plan-conflict-completion not-found already-completed recorded ;ENUM
+
+\ superseded: the plan and its pending operations retired together.
+ENUM plan-supersede not-found already-completed superseded ;ENUM
+
+private
+
+\ An operation's plan, its ordinal, whether it or its plan has
+\ completed, its plan's path and its stored JSON.
+STRUCTURE operation-state
+   FIELD plan plan-id
+   FIELD ordinal n
+   FIELD done bool
+   FIELD path MODEL:path
+   FIELD json str
+;STRUCTURE
+
+
+\ ---- completions and conflicts: stored values ---------------------
+
+: DROP-CONFLICT ( MODEL:conflict -- ) drop ;
+
+: DECODE-CONFLICT ( str MODEL:path ^ARENA:arena -- MODEL:conflict )
+   {: json:str path ar :}
+   s" " >str DROPBOX:>HASH MODEL-LOCAL:MAKE MODEL-CONFLICT:remote-deleted
+   [: DROP-CONFLICT json ar MODEL:JSON>CONFLICT ;]
+   s" deserialize conflict" >str path DECODED ;
+
+: ENCODE-CONFLICT ( MODEL:conflict ^ARENA:arena -- str )
+   {: x ar :}
+   [: x swap MODEL:CONFLICT>JSON ;] ar ENCODED ;
+
+: NO-OPERATION-ID ( -- option<operation-id> ) OPTION:NONE ;
+: NO-STEP ( -- option<operation-state> ) OPTION:NONE ;
+
+: SOME-BASELINE? ( option<MODEL:baseline> -- bool )
+   MATCH option
+      none OF false ENDOF
+      some OF drop true ENDOF
+   ;MATCH ;
+
+: DONE? ( record-status -- bool )
+   MATCH record-status
+      pending OF false ENDOF
+      completed OF true ENDOF
+   ;MATCH ;
+
+: PLAN-DONE? ( plan-status -- bool )
+   MATCH plan-status
+      pending OF false ENDOF
+      blocked OF 2drop false ENDOF
+      completed OF true ENDOF
+   ;MATCH ;
+
+
+\ ---- operation_matches_baseline ------------------------------------
+
+: HASH= ( DROPBOX:hash DROPBOX:hash -- bool )
+   DROPBOX:HASH>STR str> {: b:^ bu :}
+   DROPBOX:HASH>STR str> b bu STR= ;
+
+: DIRECTORY? ( MODEL:baseline -- bool )
+   MATCH MODEL:baseline
+      absent OF false ENDOF
+      present OF drop false ENDOF
+      directory OF true ENDOF
+   ;MATCH ;
+
+\ The baseline is a present file with the content.
+: HAS-CONTENT? ( DROPBOX:hash MODEL:baseline -- bool )
+   {: c b :}
+   b MATCH MODEL:baseline
+      absent OF false ENDOF
+      present OF MODEL-REMOTE:UNMAKE drop c HASH= ENDOF
+      directory OF false ENDOF
+   ;MATCH ;
+
+\ The baseline is the present remote file.
+: HOLDS? ( MODEL:remote MODEL:baseline -- bool )
+   {: r b :}
+   b MATCH MODEL:baseline
+      absent OF false ENDOF
+      present OF r MODEL:REMOTE= ENDOF
+      directory OF false ENDOF
+   ;MATCH ;
+
+\ Whether the baseline is the one the final operation results in.
+: OPERATION-MATCHES-BASELINE? ( MODEL:operation MODEL:baseline -- bool )
+   {: b :}
+   MATCH MODEL:operation
+      create-local-directory OF b DIRECTORY? ENDOF
+      create-remote-directory OF b DIRECTORY? ENDOF
+      delete-local-directory OF b ABSENT? ENDOF
+      delete-remote-directory OF b ABSENT? ENDOF
+      create-remote OF b HAS-CONTENT? ENDOF
+      install-local OF b HOLDS? ENDOF
+      preserve-local OF drop false ENDOF
+      replace-local OF drop b HOLDS? ENDOF
+      delete-local OF drop b ABSENT? ENDOF
+      preserve-remote OF drop false ENDOF
+      replace-remote OF drop b HAS-CONTENT? ENDOF
+      delete-remote OF drop b ABSENT? ENDOF
+   ;MATCH ;
+
+
+\ ---- the writes they share -----------------------------------------
+
+: FINISH-PLAN ( SQLITE:connection plan-id -- )
+   {: c id :}
+   c s" UPDATE plans
+      SET status = 'completed', blocked_json = NULL, retry_at = NULL
+      WHERE id = ?1"
+   [: id PLAN-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT ;
+
+\ The plan's completed recovery copies start their retention now.
+: START-RECOVERY-RETENTION ( SQLITE:connection plan-id -- )
+   {: c id :}
+   c s" UPDATE recovery_records SET retained_at = unixepoch()
+      WHERE status = 'completed' AND retained_at IS NULL
+         AND operation_id IN (
+            SELECT id FROM operations WHERE plan_id = ?1
+         )"
+   [: id PLAN-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT ;
+
+\ The plan and every operation of it completed, its baseline unchanged.
+: RETIRE-PLAN ( SQLITE:connection plan-id -- )
+   {: c id :}
+   c s" UPDATE operations SET status = 'completed' WHERE plan_id = ?1"
+   [: id PLAN-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT
+   c id FINISH-PLAN
+   c id START-RECOVERY-RETENTION ;
+
+\ The new conflict's id.
+: INSERT-CONFLICT
+   ( SQLITE:connection MODEL:path MODEL:conflict ^ARENA:arena -- n )
+   {: c path x ar :}
+   x ar ENCODE-CONFLICT {: json:str :}
+   path ar MODEL:FOLD {: k :}
+   c s" INSERT INTO conflicts(path, conflict_json, canonical_path)
+      VALUES (?1, ?2, ?3)"
+   [: path PATH-BYTES 1 SQLITE:BIND-BLOB
+      json str> 2 SQLITE:BIND-TEXT
+      k KEY-BYTES 3 SQLITE:BIND-BLOB
+      SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT
+   c SQLITE:LAST-ROWID ;
+
+
+\ ---- complete_operation_in -----------------------------------------
+
+: STEP-QUERY ( -- ^u8 n )
+   s" SELECT operations.plan_id, operations.ordinal, operations.status,
+         plans.status, plans.path, operations.operation_json,
+         plans.blocked_json, plans.retry_at
+      FROM operations JOIN plans ON plans.id = operations.plan_id
+      WHERE operations.id = ?1" ;
+
+\ STEP-QUERY's row; a status that does not read is invalid state.
+: STEP-COLS
+   ( SQLITE:statement ^ARENA:arena -- SQLITE:statement operation-state )
+   {: ar :}
+   4 ar PATH-COPY {: path :}
+   2 SQLITE:COL-TEXT s" read operation status" >str path DECODE-STATUS
+   {: s :}
+   3 SQLITE:COL-TEXT {: ps:^ pu :}
+   6 TEXT? {: json :}
+   7 INT? {: retry :}
+   ps pu json retry s" read plan status" >str path ar DECODE-PLAN-STATUS
+   {: status :}
+   5 ar TEXT-COPY {: o:str :}
+   0 SQLITE:COL-INT >PLAN-ID {: plan :}
+   1 SQLITE:COL-INT {: ordinal :}
+   plan ordinal s DONE? status PLAN-DONE? or path o
+   OPERATION-STATE-MAKE ;
+
+: STEP-ROW
+   ( SQLITE:statement ^ARENA:arena
+     -- option<operation-state> SQLITE:statement )
+   {: ar :}
+   SQLITE:STEP 0= if NO-STEP swap exit then
+   ar STEP-COLS OPTION:SOME swap ;
+
+: READ-STEP
+   ( SQLITE:connection operation-id ^ARENA:arena
+     -- option<operation-state> )
+   {: c id ar :}
+   c STEP-QUERY
+   [: id OPERATION-ID>N 1 SQLITE:BIND-INT ar STEP-ROW ;]
+   SQLITE:WITH-STATEMENT ;
+
+: EARLIER-ROW ( SQLITE:statement -- option<operation-id> SQLITE:statement )
+   SQLITE:STEP 0= if NO-OPERATION-ID swap exit then
+   0 SQLITE:COL-INT >OPERATION-ID OPTION:SOME swap ;
+
+\ The first pending operation of the plan before the ordinal, if any.
+: EARLIER ( SQLITE:connection operation-state -- option<operation-id> )
+   {: c s :}
+   s OPERATION-STATE-UNMAKE {: plan ordinal done:bool path json:str :}
+   c s" SELECT id FROM operations
+      WHERE plan_id = ?1 AND ordinal < ?2 AND status = 'pending'
+      ORDER BY ordinal LIMIT 1"
+   [: plan PLAN-ID>N 1 SQLITE:BIND-INT ordinal 2 SQLITE:BIND-INT
+      EARLIER-ROW ;]
+   SQLITE:WITH-STATEMENT ;
+
+\ Whether the plan holds an operation after the ordinal.
+: LATER? ( SQLITE:connection operation-state -- bool )
+   {: c s :}
+   s OPERATION-STATE-UNMAKE {: plan ordinal done:bool path json:str :}
+   c s" SELECT EXISTS(SELECT 1 FROM operations
+      WHERE plan_id = ?1 AND ordinal > ?2)"
+   [: plan PLAN-ID>N 1 SQLITE:BIND-INT ordinal 2 SQLITE:BIND-INT
+      INT-ROW ;]
+   SQLITE:WITH-STATEMENT 0<> ;
+
+\ The operation completed, and the legacy recovery intent it had.
+: MARK-COMPLETED ( SQLITE:connection operation-id -- )
+   {: c id :}
+   c s" UPDATE operations SET status = 'completed' WHERE id = ?1"
+   [: id OPERATION-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT
+   c s" UPDATE recovery_records SET status = 'completed'
+      WHERE operation_id = ?1 AND status = 'pending'"
+   [: id OPERATION-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT ;
+
+\ The final operation, its plan and the actual baseline completed; the
+\ path's conflicts are resolved.
+: COMPLETE-FINAL
+   ( SQLITE:connection operation-id operation-state MODEL:operation
+     MODEL:baseline ^ARENA:arena -- operation-completion )
+   {: c id s o b ar :}
+   o b OPERATION-MATCHES-BASELINE? 0= if
+      construct operation-completion baseline-mismatch exit
+   then
+   s OPERATION-STATE-UNMAKE {: plan ordinal done:bool path json:str :}
+   c id MARK-COMPLETED
+   c path b ar WRITE-BASELINE
+   c path ar MODEL:FOLD RETIRE-CONFLICTS
+   c plan FINISH-PLAN
+   c plan START-RECOVERY-RETENTION
+   construct operation-completion plan-completed ;
+
+\ No earlier operation is pending: a non-final one completes with no
+\ baseline, the final one with its own.
+: COMPLETE-IN-ORDER
+   ( SQLITE:connection operation-id operation-state MODEL:operation
+     option<MODEL:baseline> ^ARENA:arena -- operation-completion )
+   {: c id s o b ar :}
+   c s LATER? if
+      b SOME-BASELINE? if
+         construct operation-completion unexpected-baseline exit
+      then
+      c id MARK-COMPLETED
+      construct operation-completion operation-completed exit
+   then
+   b MATCH option
+      none OF construct operation-completion baseline-required ENDOF
+      some OF {: r :} c id s o r ar COMPLETE-FINAL ENDOF
+   ;MATCH ;
+
+: COMPLETE-FOUND
+   ( SQLITE:connection operation-id operation-state
+     option<MODEL:baseline> ^ARENA:arena -- operation-completion )
+   {: c id s b ar :}
+   s OPERATION-STATE-UNMAKE {: plan ordinal done:bool path json:str :}
+   done if construct operation-completion already-completed exit then
+   json path ar DECODE-OPERATION {: o :}
+   c s EARLIER MATCH option
+      some OF construct operation-completion waiting-for-earlier-operation
+      ENDOF
+      none OF c id s o b ar COMPLETE-IN-ORDER ENDOF
+   ;MATCH ;
+
+: COMPLETE-OPERATION-IN
+   ( SQLITE:connection operation-id option<MODEL:baseline> ^ARENA:arena
+     -- operation-completion )
+   {: c id b ar :}
+   c id ar READ-STEP MATCH option
+      none OF construct operation-completion not-found ENDOF
+      some OF {: s :} c id s b ar COMPLETE-FOUND ENDOF
+   ;MATCH ;
+
+: COMPLETE-ALL
+   ( SQLITE:connection ^VEC:vector<operation-baseline>
+     ^VEC:vector<operation-completion> ^ARENA:arena -- )
+   {: c finals outcomes ar :}
+   finals VEC:COUNT 0 ?do
+      finals i VEC:AT @ JOURNAL-OPERATION--BASELINE:UNMAKE {: id b :}
+      c id b OPTION:SOME ar COMPLETE-OPERATION-IN outcomes VEC:PUSH !
+   loop ;
+
+
+\ ---- plan retirement -----------------------------------------------
+
+: RECORD-LIVE-CONFLICT
+   ( SQLITE:connection plan-id plan-state MODEL:conflict ^ARENA:arena
+     -- plan-conflict-completion )
+   {: c id st x ar :}
+   st PLAN-STATE-UNMAKE {: path status :}
+   status PLAN-DONE? if
+      construct plan-conflict-completion already-completed exit
+   then
+   c path x ar INSERT-CONFLICT drop
+   c id RETIRE-PLAN
+   construct plan-conflict-completion recorded ;
+
+: FINISH-WITH-CONFLICT-IN
+   ( SQLITE:connection plan-id MODEL:conflict ^ARENA:arena
+     -- plan-conflict-completion )
+   {: c id x ar :}
+   c id s" read plan status for conflict" >str ar READ-PLAN-STATE
+   MATCH option
+      none OF construct plan-conflict-completion not-found ENDOF
+      some OF {: st :} c id st x ar RECORD-LIVE-CONFLICT ENDOF
+   ;MATCH ;
+
+: SUPERSEDE-LIVE ( SQLITE:connection plan-id plan-state -- plan-supersede )
+   {: c id st :}
+   st PLAN-STATE-UNMAKE {: path status :}
+   status PLAN-DONE? if construct plan-supersede already-completed exit then
+   c id RETIRE-PLAN
+   construct plan-supersede superseded ;
+
+: SUPERSEDE-IN
+   ( SQLITE:connection plan-id ^ARENA:arena -- plan-supersede )
+   {: c id ar :}
+   c id s" read plan status for supersession" >str ar READ-PLAN-STATE
+   MATCH option
+      none OF construct plan-supersede not-found ENDOF
+      some OF {: st :} c id st SUPERSEDE-LIVE ENDOF
+   ;MATCH ;
+
+: CONFLICT-ROW
+   ( SQLITE:statement ^VEC:vector<conflict-record> ^ARENA:arena
+     -- SQLITE:statement )
+   {: found ar :}
+   1 ar PATH-COPY {: path :}
+   2 SQLITE:COL-TEXT >str path ar DECODE-CONFLICT {: x :}
+   0 SQLITE:COL-INT path x JOURNAL-CONFLICT--RECORD:MAKE
+   found VEC:PUSH ! ;
+
+public
+
+\ Completes one operation in its plan's order. The final one completes
+\ its plan and writes its actual resulting baseline in the same
+\ transaction; an interruption before the commit changes neither.
+: COMPLETE-OPERATION
+   ( journal operation-id option<MODEL:baseline> ^ARENA:arena
+     -- operation-completion )
+   {: j id b ar :}
+   j >CONNECTION {: c :}
+   c [: c id b ar COMPLETE-OPERATION-IN ;] SQLITE:WITH-TRANSACTION ;
+
+\ Completes independent final operations in one transaction: all, or
+\ none when one throws; an outcome for each, in order.
+: COMPLETE-FINAL-OPERATIONS
+   ( journal ^VEC:vector<operation-baseline> ^ARENA:arena
+     -- ^VEC:vector<operation-completion> )
+   {: j finals ar :}
+   ar [type] operation-completion NEW-VECTOR {: outcomes :}
+   finals VEC:COUNT 0= if outcomes exit then
+   j >CONNECTION {: c :}
+   c [: c finals outcomes ar COMPLETE-ALL ;] SQLITE:WITH-TRANSACTION
+   outcomes ;
+
+\ Records the conflict and retires its live plan together; the baseline
+\ stays.
+: FINISH-PLAN-WITH-CONFLICT
+   ( journal plan-id MODEL:conflict ^ARENA:arena
+     -- plan-conflict-completion )
+   {: j id x ar :}
+   j >CONNECTION {: c :}
+   c [: c id x ar FINISH-WITH-CONFLICT-IN ;] SQLITE:WITH-TRANSACTION ;
+
+\ Retires a stale live plan without advancing or deleting its baseline.
+: SUPERSEDE-PLAN ( journal plan-id ^ARENA:arena -- plan-supersede )
+   {: j id ar :}
+   j >CONNECTION {: c :}
+   c [: c id ar SUPERSEDE-IN ;] SQLITE:WITH-TRANSACTION ;
+
+\ Records a planner conflict as it is, neither side interpreted or
+\ dropped.
+: RECORD-CONFLICT
+   ( journal MODEL:path MODEL:conflict ^ARENA:arena -- conflict-record )
+   {: j path x ar :}
+   j >CONNECTION {: c :}
+   c [: c path x ar INSERT-CONFLICT ;] SQLITE:WITH-TRANSACTION {: id :}
+   id path x JOURNAL-CONFLICT--RECORD:MAKE ;
+
+\ Every recorded conflict, by id.
+: CONFLICTS ( journal ^ARENA:arena -- ^VEC:vector<conflict-record> )
+   {: j ar :}
+   ar [type] conflict-record NEW-VECTOR {: found :}
+   j >CONNECTION
+   s" SELECT id, path, conflict_json FROM conflicts ORDER BY id"
+   [: begin SQLITE:STEP while found ar CONFLICT-ROW repeat ;]
+   SQLITE:WITH-STATEMENT
+   found ;
 
 ;package

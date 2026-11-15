@@ -1,16 +1,17 @@
-\ journal-test.f - JOURNAL's open, schema 8, bindings, baselines and plans
-\ on journals under TMPDIR: a new journal's sqlite_master and user_version
-\ against src/oracle/schema.tsv as a set; versions 1, 7 and 9 refused
-\ unchanged; src/oracle/journal.sqlite3, copied and opened, giving
-\ journal.tsv's Dropbox and local root bindings, baselines and baseline
-\ paths; and nineteen tests of the Rust version (rust src/journal.rs)
-\ under their names, which build each decision the Rust ones ask the
-\ planner for as src/oracle/plan.tsv holds it. Habu opens no schema-6
-\ file, so the version-six tests start from a schema-8 journal holding the
-\ row migration 7 leaves for a schema-6 root, birth and subvolume NULL,
-\ and one baseline row; their inventory and conflict halves wait for the
-\ words that write those. Each case removes its directory; a refusal's
-\ log line is captured in it, checked and removed.
+\ journal-test.f - JOURNAL's open, schema 8, bindings, baselines, plans,
+\ completions and conflicts on journals under TMPDIR: a new journal's
+\ sqlite_master and user_version against src/oracle/schema.tsv as a set;
+\ versions 1, 7 and 9 refused unchanged; src/oracle/journal.sqlite3,
+\ copied and opened, giving journal.tsv's Dropbox and local root
+\ bindings, baselines, baseline paths and conflicts; and twenty-three
+\ tests of the Rust version (rust src/journal.rs) under their names,
+\ which build each decision the Rust ones ask the planner for as
+\ src/oracle/plan.tsv holds it. Habu opens no schema-6 file, so the
+\ version-six tests start from a schema-8 journal holding the row
+\ migration 7 leaves for a schema-6 root, birth and subvolume NULL, and
+\ one baseline row, which stands for their inventory and conflict
+\ halves. Each case removes its directory; a refusal's log line is
+\ captured in it, checked and removed.
 \ Run from the repository root: hb --load src/journal-test.f </dev/null
 require src/lib/arena.f
 require src/lib/string.f
@@ -570,6 +571,7 @@ TYPED-VARIABLE HELD-JOURNAL journal
 TYPED-VARIABLE HELD-ARENA ^ARENA:arena
 TYPED-VARIABLE NOOPS ^VEC:vector<path-baseline>
 TYPED-VARIABLE PLANS ^VEC:vector<path-plan>
+TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
 
 : AT-PATH ( ^u8 n -- MODEL:path ) >str MODEL:>PATH ;
 
@@ -597,6 +599,11 @@ TYPED-VARIABLE PLANS ^VEC:vector<path-plan>
 \ baseline: the remote file becomes the baseline.
 : MATCH-DECISION ( MODEL:remote -- MODEL:decision )
    MODEL-BASELINE:present MODEL-DECISION:noop ;
+
+\ A download: no baseline, the local side confirmed absent, the remote
+\ file present.
+: DOWNLOAD-DECISION ( MODEL:remote -- MODEL:decision )
+   MODEL-OPERATION:install-local MODEL-DECISION:operate ;
 
 \ Both sides confirmed absent.
 : ABSENT-DECISION ( -- MODEL:decision )
@@ -764,6 +771,32 @@ TYPED-VARIABLE PLANS ^VEC:vector<path-plan>
    key k ku ar CANONICAL MODEL:KEY= path p pu AT-PATH PATH= and ;
 
 
+\ The id of the plan's first operation.
+: FIRST-ID ( plan-record -- operation-id )
+   >OPERATIONS 0 VEC:AT @ JOURNAL-PLANNED--OPERATION:UNMAKE
+   {: i o x s :} i ;
+
+: COMPLETE-FINALS ( -- )
+   HELD-JOURNAL @ FINALS @ HELD-ARENA @ COMPLETE-FINAL-OPERATIONS drop ;
+
+: SUPERSEDED? ( plan-supersede -- bool )
+   MATCH plan-supersede
+      not-found OF false ENDOF
+      already-completed OF false ENDOF
+      superseded OF true ENDOF
+   ;MATCH ;
+
+\ The Rust tests' DivergentEdits conflict.
+: DIVERGENT ( -- MODEL:conflict )
+   s" local" CONTENT MODEL-LOCAL:MAKE
+   s" remote" s" rev-remote" REMOTE-FILE MODEL-CONFLICT:divergent ;
+
+: CONFLICT-RECORD= ( conflict-record conflict-record -- bool )
+   JOURNAL-CONFLICT--RECORD:UNMAKE {: i p x :}
+   JOURNAL-CONFLICT--RECORD:UNMAKE {: j q y :}
+   i j = p q PATH= and x y MODEL:CONFLICT= and ;
+
+
 \ ---- the oracle's baselines as the Rust version prints them ------
 
 : REMOTE-DEBUG ( MODEL:remote n -- n )
@@ -824,6 +857,70 @@ TYPED-VARIABLE PLANS ^VEC:vector<path-plan>
    j s" Docs/A.txt" ar BASELINE-LINE HELD? TTRUE
    j s" Old/Gone.txt" ar BASELINE-LINE HELD? TTRUE
    j ar BASELINE-PATHS PATHS-LINE HELD? TTRUE
+   j CLOSE
+   d GONE ;
+
+
+\ ---- the oracle's conflicts as the Rust version prints them ------
+
+: LOCAL-DEBUG ( MODEL:local n -- n )
+   {: l at :}
+   l MODEL-LOCAL:UNMAKE {: c :}
+   s" LocalFile { content: ContentIdentity(" at PUT
+   c DROPBOX:HASH>STR swap PUT-QUOTED
+   s" ) }" rot PUT ;
+
+\ A conflict that holds both sides: its name, then local and remote.
+: BOTH-DEBUG ( ^u8 n MODEL:local MODEL:remote n -- n )
+   {: a:^ u l r at :}
+   a u at PUT
+   s"  { local: " rot PUT  l swap LOCAL-DEBUG
+   s" , remote: " rot PUT  r swap REMOTE-DEBUG
+   s"  }" rot PUT ;
+
+: CONFLICT-DEBUG ( MODEL:conflict n -- n )
+   {: at :}
+   MATCH MODEL:conflict
+      initial OF
+         {: l r :} s" InitialCollision" l r at BOTH-DEBUG
+      ENDOF
+      divergent OF {: l r :} s" DivergentEdits" l r at BOTH-DEBUG ENDOF
+      local-deleted OF
+         {: r :} s" LocalDeletionRemoteEdit { remote: " at PUT
+         r swap REMOTE-DEBUG s"  }" rot PUT
+      ENDOF
+      remote-deleted OF
+         {: l :} s" RemoteDeletionLocalEdit { local: " at PUT
+         l swap LOCAL-DEBUG s"  }" rot PUT
+      ENDOF
+   ;MATCH ;
+
+: RECORD-DEBUG ( conflict-record n -- n )
+   {: r at :}
+   r JOURNAL-CONFLICT--RECORD:UNMAKE {: id path x :}
+   s" ConflictRecord { id: " at PUT  id swap PUT-N
+   s" , path: " rot PUT  path MODEL:PATH>STR swap PUT-QUOTED
+   s" , conflict: " rot PUT  x swap CONFLICT-DEBUG
+   s"  }" rot PUT ;
+
+: CONFLICTS-LINE ( ^VEC:vector<conflict-record> -- ^u8 n )
+   {: found :}
+   s\" conflicts\t[" 0 PUT
+   found VEC:COUNT 0 ?do
+      i 0<> if s" , " rot PUT then
+      found i VEC:AT @ swap RECORD-DEBUG
+   loop
+   s" ]" rot PUT {: u :}
+   WANT u ;
+
+: ORACLE-JOURNAL-HOLDS-ITS-CONFLICTS ( ^ARENA:arena -- )
+   {: ar :}
+   s" the oracle journal's conflicts are journal.tsv's" T-LABEL
+   s" src/oracle/journal.tsv" ORACLE
+   ar JOURNAL-AT {: d:str p:str :}
+   s" src/oracle/journal.sqlite3" p str> FS:COPY-FILE-STREAM
+   p OPEN-READ {: j :}
+   j ar CONFLICTS CONFLICTS-LINE HELD? TTRUE
    j CLOSE
    d GONE ;
 
@@ -972,6 +1069,91 @@ TYPED-VARIABLE PLANS ^VEC:vector<path-plan>
    d GONE ;
 
 
+\ ---- the Rust version's completion and conflict tests -----------
+
+\ The second plan's rejected completion is logged once, with the
+\ trigger's text, and takes the first one's back.
+: FINAL-EFFECT-COMPLETIONS-COMMIT-ATOMICALLY ( ^ARENA:arena -- )
+   {: ar :}
+   s" final_effect_completions_commit_atomically" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   s" downloaded" s" rev-downloaded" REMOTE-FILE {: downloaded :}
+   downloaded DOWNLOAD-DECISION ar OPERATIONS {: plan :}
+   s" first.txt" AT-PATH {: one :}
+   s" second.txt" AT-PATH {: two :}
+   j one plan ar RECORD-PLAN RECORDED-PLAN {: first :}
+   j two plan ar RECORD-PLAN RECORDED-PLAN {: second :}
+   j >CONNECTION
+   s" CREATE TRIGGER reject_test_completion BEFORE UPDATE OF status ON plans
+      WHEN hex(OLD.path) = hex('second.txt') AND NEW.status = 'completed'
+      BEGIN SELECT RAISE(ABORT, 'test rejection'); END;" SQLITE:EXEC
+   downloaded MODEL-BASELINE:present {: b :}
+   ar [type] operation-baseline NEW-VECTOR {: finals :}
+   first FIRST-ID b JOURNAL-OPERATION--BASELINE:MAKE finals VEC:PUSH !
+   second FIRST-ID b JOURNAL-OPERATION--BASELINE:MAKE finals VEC:PUSH !
+   j HELD-JOURNAL !  ar HELD-ARENA !  finals FINALS !
+   [: COMPLETE-FINALS ;] SQLITE:E-SQL d s" test rejection" ar LOGGED
+   j one ar BASELINE NO-BASELINE? TTRUE
+   j two ar BASELINE NO-BASELINE? TTRUE
+   j ar PENDING-PLANS VEC:COUNT 2 T=
+   j CLOSE
+   d GONE ;
+
+: SUPERSEDING-A-RACED-DIRECTORY-PLAN-NEVER-ADVANCES-ITS-BASELINE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" superseding_a_raced_directory_plan_never_advances_its_baseline"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   s" parent" AT-PATH {: path :}
+   MODEL-BASELINE:directory {: dir :}
+   p OPEN {: j :}
+   j path DIRECTORY-DECISION NOOP ar RECORD-NOOP NOOP-RECORDED? TTRUE
+   MODEL-OPERATION:delete-local-directory ar ONE-PLAN {: plan :}
+   j path plan ar RECORD-PLAN RECORDED-PLAN {: pending :}
+   j pending >ID ar SUPERSEDE-PLAN SUPERSEDED? TTRUE
+   j path ar BASELINE dir BASELINE-HELD? TTRUE
+   j ar PENDING-PLANS VEC:COUNT 0 T=
+   j ar CONFLICTS VEC:COUNT 0 T=
+   j CLOSE
+   p OPEN {: k :}
+   k path ar BASELINE dir BASELINE-HELD? TTRUE
+   k ar PENDING-PLANS VEC:COUNT 0 T=
+   k CLOSE
+   d GONE ;
+
+: JOURNAL-CONFLICT-PRESERVES-EVERY-TYPED-SIDE-ACROSS-REOPEN
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" journal_conflict_preserves_every_typed_side_across_reopen" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j s" conflict.txt" AT-PATH DIVERGENT ar RECORD-CONFLICT {: expected :}
+   j CLOSE
+   p OPEN {: k :}
+   k ar CONFLICTS {: found :}
+   found VEC:COUNT 1 T=
+   found 0 VEC:AT @ expected CONFLICT-RECORD= TTRUE
+   k CLOSE
+   d GONE ;
+
+: JOURNAL-RETIRES-CONFLICT-DESCRIPTION-WHEN-THE-PATH-CONVERGES
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" journal_retires_conflict_description_when_the_path_converges"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   s" resolved.txt" AT-PATH {: path :}
+   j path DIVERGENT ar RECORD-CONFLICT drop
+   j ar CONFLICTS VEC:COUNT 1 T=
+   j path ABSENT-DECISION NOOP ar RECORD-NOOP NOOP-RECORDED? TTRUE
+   j ar CONFLICTS VEC:COUNT 0 T=
+   j CLOSE
+   d GONE ;
+
+
 : CASES ( ^ARENA:arena -- )
    {: ar :}
    ar NEW-JOURNAL-HAS-THE-ORACLE-SCHEMA
@@ -996,7 +1178,12 @@ TYPED-VARIABLE PLANS ^VEC:vector<path-plan>
    ar ABSENT-BASELINE-REMOVES-ITS-ROW
    ar CASE-COLLISION-INVALIDATION-COVERS-A-CHILD-NAMED-WITH-A-HIGH-BYTE
    ar CASE-COLLISION-INVALIDATION-JUDGES-EACH-RECORDED-SPELLING
-   ar BASELINE-SNAPSHOT-IS-CANONICAL-SORTED ;
+   ar BASELINE-SNAPSHOT-IS-CANONICAL-SORTED
+   ar ORACLE-JOURNAL-HOLDS-ITS-CONFLICTS
+   ar FINAL-EFFECT-COMPLETIONS-COMMIT-ATOMICALLY
+   ar SUPERSEDING-A-RACED-DIRECTORY-PLAN-NEVER-ADVANCES-ITS-BASELINE
+   ar JOURNAL-CONFLICT-PRESERVES-EVERY-TYPED-SIDE-ACROSS-REOPEN
+   ar JOURNAL-RETIRES-CONFLICT-DESCRIPTION-WHEN-THE-PATH-CONVERGES ;
 
 
 : TESTS ( -- )
