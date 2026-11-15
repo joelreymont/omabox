@@ -6,8 +6,8 @@
 \ under TMPDIR and removed once open, so no run leaves one. One server and
 \ one main client serve every case; a case that needs another config opens
 \ its own client. DROPBOX's log lines go to stderr, but a stage failure's
-\ line, which is captured under TMPDIR and checked. The first failed
-\ assertion ends the run.
+\ line, which is captured under TMPDIR and checked. A stub in place of AIO's
+\ transfer fails the stage's reads. The first failed assertion ends the run.
 \ Run from the repository root: hb --load src/dropbox-test.f </dev/null
 require src/lib/aio.f
 require src/lib/arena.f
@@ -15,12 +15,93 @@ require src/lib/span.f
 require src/lib/string.f
 require src/lib/test.f
 require src/lib/test/stderr.f
+require src/lib/test/mapped.f
 require src/lib/memory.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
 require src/lib/net/curl.f
 require src/dropbox.f
 require src/test-dropbox.f
+
+package DROPBOX-TEST
+public
+
+\ How the stub fails a read of the stage: refused before its entry is
+\ written, entered with the entry left to the kernel, or ended by the
+\ kernel as timed out or cancelled.
+ENUM read-fault full entered timed-out cancelled ;ENUM
+
+;package
+
+
+\ White-box, as Habu's aio-test.f: package AIO reopened to swap its private
+\ HOST-XFER for STAGE-XFER, which fails the reads of FAILING's descriptor
+\ and passes every other transfer, the fake's HTTP reads included, to the
+\ real XFER-STAGE. Each name lands in DROPBOX-TEST, so AIO gains none.
+package AIO
+
+TYPED-VARIABLE DROPBOX-TEST:READ-FAULT DROPBOX-TEST:read-fault
+variable DROPBOX-TEST:FAILING
+\ The buffer the failed read was handed.
+TYPED-VARIABLE DROPBOX-TEST:OFFERED ptr u8
+TYPED-VARIABLE DROPBOX-TEST:OFFERED-CAP NUM:alloc-byte-len
+
+
+\ The record holds the buffer as XFER-STAGE's does, so AWAIT-XFER gives
+\ it back with the record's outcome.
+: DROPBOX-TEST:HOLDS ( ptr u8 NUM:alloc-byte-len n -- )
+   {: buf cap:NUM:alloc-byte-len idx:n :}
+   buf idx REC-BUF ! cap idx REC-BUF-LEN!
+   1 idx REC REC.HOLD ! ;
+
+
+\ A timer of ms in the read's place, which the kernel ends as timed out.
+: DROPBOX-TEST:TIMED-XFER ( ptr u8 NUM:alloc-byte-len n -- n n )
+   {: buf cap:NUM:alloc-byte-len ms:n :}
+   ms HOST-TIMEOUT {: rc:n idx:n :}
+   rc 0<> if rc idx exit then
+   buf cap idx DROPBOX-TEST:HOLDS 0 idx ;
+
+
+\ A minute's timer in the read's place, cancelled at once: the kernel ends
+\ it as cancelled. A refused cancel leaves the buffer the caller's.
+: DROPBOX-TEST:CANCELLED-XFER ( ptr u8 NUM:alloc-byte-len -- n n )
+   {: buf cap:NUM:alloc-byte-len :}
+   60000 HOST-TIMEOUT {: rc:n idx:n :}
+   rc 0<> if rc idx exit then
+   idx HOST-CANCEL {: refused:n :}
+   refused 0<> if refused idx exit then
+   buf cap idx DROPBOX-TEST:HOLDS 0 idx ;
+
+
+\ E-AIO-FULL leaves the buffer the caller's, as a refused claim does.
+\ E-AIO-ENTER leaves it with the kernel, which the test plays: it keeps
+\ OFFERED and releases it as AIO's loop would at the late completion.
+\ Runs under AIO-LOCK, as every HOST-XFER does.
+: DROPBOX-TEST:STAGE-XFER ( n ptr u8 NUM:alloc-byte-len n n n -- n n )
+   {: f:n buf cap:NUM:alloc-byte-len count:n off:n kind:n :}
+   f DROPBOX-TEST:FAILING @ <> if
+      f buf cap count off kind XFER-STAGE exit
+   then
+   buf DROPBOX-TEST:OFFERED ! cap DROPBOX-TEST:OFFERED-CAP !
+   DROPBOX-TEST:READ-FAULT @ MATCH DROPBOX-TEST:read-fault
+      full OF E-AIO-FULL -1 ENDOF
+      entered OF E-AIO-ENTER -1 ENDOF
+      timed-out OF buf cap 1 DROPBOX-TEST:TIMED-XFER ENDOF
+      cancelled OF buf cap DROPBOX-TEST:CANCELLED-XFER ENDOF
+   ;MATCH ;
+
+
+\ Fails the reads of descriptor f as the fault says, until ;FAIL-READS.
+: DROPBOX-TEST:FAIL-READS ( n DROPBOX-TEST:read-fault -- )
+   DROPBOX-TEST:READ-FAULT ! DROPBOX-TEST:FAILING !
+   ['] DROPBOX-TEST:STAGE-XFER is HOST-XFER ;
+
+
+: DROPBOX-TEST:;FAIL-READS ( -- ) ['] XFER-STAGE is HOST-XFER ;
+
+;package
+
 
 package DROPBOX-TEST
 private
@@ -775,9 +856,66 @@ TYPED-VARIABLE FAULT fault
    UNSTAGED ;
 
 
+\ The code SEND throws with the reads of UP's stage failed as the fault
+\ says, and its log in ERR$; the real transfer is back however SEND ends.
+: READ-FAILED ( read-fault -- n )
+   UP DROPBOX-UPLOAD:FD @ FD>N swap FAIL-READS
+   [: LOGGED ;] [: ;FAIL-READS ;] finally ;
+
+
+\ The stage, readied for a single upload with no fault from the fake.
+: SMALL-STAGED ( -- )
+   TEST-DROPBOX:RESET -1 FAULT-AT !
+   s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED ;
+
+
+\ The ring full: the buffer stays UPLOAD's, which it releases.
+: FULL-READ-CASE ( -- )
+   s" stage read refused by a full ring" T-LABEL
+   SMALL-STAGED
+   construct read-fault full READ-FAILED E-AIO-FULL T=
+   OFFERED @ MAPPED:LIVE? TFALSE
+   ERR-U @ 0 T=
+   TEST-DROPBOX:SEEN$ s" " T$=
+   UNSTAGED ;
+
+
+\ The enter refused: the kernel may yet run the read, so UPLOAD leaves
+\ its buffer mapped.
+: ENTERED-READ-CASE ( -- )
+   s" stage read's enter refused" T-LABEL
+   SMALL-STAGED
+   construct read-fault entered READ-FAILED E-AIO-ENTER T=
+   OFFERED @ MAPPED:LIVE? TTRUE
+   OFFERED @ OFFERED-CAP @ MEM:RELEASE-BYTES
+   ERR-U @ 0 T=
+   TEST-DROPBOX:SEEN$ s" " T$=
+   UNSTAGED ;
+
+
+: TIMED-OUT-READ-CASE ( -- )
+   s" stage read timed out" T-LABEL
+   SMALL-STAGED
+   construct read-fault timed-out READ-FAILED DROPBOX:E-STAGE T=
+   s" the stage's read timed out" STAGE-LOGGED? TTRUE
+   TEST-DROPBOX:SEEN$ s" " T$=
+   UNSTAGED ;
+
+
+: CANCELLED-READ-CASE ( -- )
+   s" stage read cancelled" T-LABEL
+   SMALL-STAGED
+   construct read-fault cancelled READ-FAILED DROPBOX:E-STAGE T=
+   s" the stage's read was cancelled" STAGE-LOGGED? TTRUE
+   TEST-DROPBOX:SEEN$ s" " T$=
+   UNSTAGED ;
+
+
 : SINGLE-CASES ( -- )
    SINGLE-CASE CONFLICT-CASE HELD-CASE NON-ASCII-CASE
-   SHORT-STAGE-CASE REFUSED-STAGE-CASE ;
+   SHORT-STAGE-CASE REFUSED-STAGE-CASE
+   FULL-READ-CASE ENTERED-READ-CASE TIMED-OUT-READ-CASE
+   CANCELLED-READ-CASE ;
 
 
 \ A file one byte over a chunk: two appends.
@@ -878,11 +1016,25 @@ TYPED-VARIABLE FAULT fault
    EXPECTED$ SPAN:MAKE UP DROPBOX-UPLOAD:CONTENT-HASH ! ;
 
 
+\ Sized a byte past the stage: the second append carries the stage's last
+\ byte and the read for the next one returns 0.
+: ENDED-EARLY-CASE ( -- )
+   s" session stage shorter than its size" T-LABEL
+   TEST-DROPBOX:RESET -1 FAULT-AT !
+   CHUNK 2 + UP DROPBOX-UPLOAD:SIZE !
+   LOGGED DROPBOX:E-STAGE T=
+   s" the stage is shorter than its size" STAGE-LOGGED? TTRUE
+   SB-RESET S-START S-APPEND S-APPEND
+   TEST-DROPBOX:SEEN$ SB$ T$=
+   CHUNK 1+ UP DROPBOX-UPLOAD:SIZE ! ;
+
+
 : UPLOAD-CASES ( -- )
    HASH-CASE SINGLE-CASES
    BIG-STAGED
    SESSION-CASE LOST-APPEND-CASE HELD-APPEND-CASE CLOSED-CASE
    LOST-FINISH-CASE CUT-APPEND-CASE CLOSED-TWICE-CASE MISMATCH-CASE
+   ENDED-EARLY-CASE
    UNSTAGED ;
 
 
