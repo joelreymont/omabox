@@ -3,7 +3,7 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{self, BufRead as _, Write as _};
+use std::io::{self, BufRead, Write as _};
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 
@@ -325,7 +325,7 @@ fn authorize_and_bind(config: &Config, remote_root: &str) -> Result<(), CliError
         "Open this URL in a browser:\n{}\n\nPaste the authorization code: ",
         pending.authorization_url()
     ))?;
-    let code = read_authorization_code()?;
+    let code = read_authorization_code(io::stdin().lock())?;
     let AuthorizationGrant {
         access_token,
         refresh_token,
@@ -531,21 +531,29 @@ fn config_error(operation: &'static str) -> impl FnOnce(ConfigError) -> CliError
     }
 }
 
-fn read_authorization_code() -> Result<String, CliError> {
-    let mut code = String::new();
-    io::stdin()
-        .lock()
-        .read_line(&mut code)
+/// Read one authorization code line of at most `AUTHORIZATION_CODE_LIMIT + 1`
+/// bytes, terminator included, and trim its surrounding whitespace.
+fn read_authorization_code(input: impl BufRead) -> Result<String, CliError> {
+    let bound = AUTHORIZATION_CODE_LIMIT + 1;
+    let mut line = Vec::new();
+    input
+        .take(bound as u64)
+        .read_until(b'\n', &mut line)
         .map_err(|source| CliError::Io {
             operation: "read the authorization code",
             source,
         })?;
-    let length = code.trim_end_matches(['\r', '\n']).len();
-    code.truncate(length);
+    if line.len() == bound && !line.ends_with(b"\n") {
+        return Err(CliError::InvalidAuthorizationCode);
+    }
+    let Ok(line) = String::from_utf8(line) else {
+        return Err(CliError::InvalidAuthorizationCode);
+    };
+    let code = line.trim();
     if code.is_empty() || code.len() > AUTHORIZATION_CODE_LIMIT {
         return Err(CliError::InvalidAuthorizationCode);
     }
-    Ok(code)
+    Ok(code.to_owned())
 }
 
 fn write_stdout(value: &str) -> Result<(), CliError> {
@@ -1443,5 +1451,43 @@ mod tests {
         ));
         assert_eq!(fs::read_to_string(service_log)?, "show\nshow\n");
         Ok(())
+    }
+
+    #[test]
+    fn an_overlong_authorization_code_is_rejected_within_the_bound() {
+        for extra in [1, 2, 4096] {
+            let mut input = io::Cursor::new(vec![b'a'; AUTHORIZATION_CODE_LIMIT + extra]);
+            assert!(matches!(
+                read_authorization_code(&mut input),
+                Err(CliError::InvalidAuthorizationCode)
+            ));
+            assert!(input.position() <= AUTHORIZATION_CODE_LIMIT as u64 + 1);
+        }
+    }
+
+    #[test]
+    fn an_authorization_code_at_the_limit_is_accepted() -> Result<(), Box<dyn Error>> {
+        let mut line = vec![b'a'; AUTHORIZATION_CODE_LIMIT];
+        line.push(b'\n');
+        let code = read_authorization_code(io::Cursor::new(line))?;
+        assert_eq!(code.len(), AUTHORIZATION_CODE_LIMIT);
+        Ok(())
+    }
+
+    #[test]
+    fn an_authorization_code_is_trimmed() -> Result<(), Box<dyn Error>> {
+        assert_eq!(read_authorization_code(&b" \tcode \r\n"[..])?, "code");
+        assert_eq!(read_authorization_code(&b"code"[..])?, "code");
+        Ok(())
+    }
+
+    #[test]
+    fn a_blank_or_non_utf8_authorization_code_is_rejected() {
+        for input in [&b"  \n"[..], &b"\xff\n"[..]] {
+            assert!(matches!(
+                read_authorization_code(input),
+                Err(CliError::InvalidAuthorizationCode)
+            ));
+        }
     }
 }
