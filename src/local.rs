@@ -305,7 +305,7 @@ struct HashCacheCutoff {
 }
 
 impl CompleteScan {
-    /// Return the complete, path-sorted local observations.
+    /// Return the complete local observations, sorted by path bytes.
     #[must_use]
     pub fn observations(&self) -> &[LocalObservationRecord] {
         &self.observations
@@ -929,9 +929,7 @@ fn finish_scan_at(
             path: pending.root,
         });
     }
-    pending
-        .observations
-        .sort_by(|left, right| left.path.cmp(&right.path));
+    pending.observations.sort_by(order_observations);
     reusable_hashes.sort_by(order_hash_records);
     Ok(CompleteScan {
         root_binding: root_binding(&pending.root, &pending.root_fd)?,
@@ -2965,6 +2963,22 @@ fn order_hash_records(left: &LocalHashRecord, right: &LocalHashRecord) -> std::c
         .cmp(right.path.as_os_str().as_bytes())
 }
 
+/// Order observations the way SQLite orders the published inventory.
+///
+/// `publish_local_scan` compares a scan with the stored rows in order, so a
+/// scan sorted any other way would never match and every pass would rewrite
+/// the whole inventory. `Path::cmp` walks components and would order
+/// `x/y.txt` before `x.txt`.
+fn order_observations(
+    left: &LocalObservationRecord,
+    right: &LocalObservationRecord,
+) -> std::cmp::Ordering {
+    left.path
+        .as_os_str()
+        .as_bytes()
+        .cmp(right.path.as_os_str().as_bytes())
+}
+
 /// Look one scanned path up in the journal's hash cache.
 ///
 /// The cache arrives in SQLite BLOB order, so the search compares raw bytes.
@@ -4912,7 +4926,7 @@ mod tests {
             parallel
                 .observations
                 .windows(2)
-                .all(|pair| pair[0].path < pair[1].path)
+                .all(|pair| order_observations(&pair[0], &pair[1]).is_lt())
         );
         Ok(())
     }
@@ -5168,6 +5182,26 @@ mod tests {
             all_cache_entries_stable,
         )?;
         assert_eq!(fresh.reusable_hashes, cache);
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_tree_beside_a_same_named_directory_republishes_nothing()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let root = directory.path().join("root");
+        std::fs::create_dir(&root)?;
+        std::fs::create_dir(root.join("x"))?;
+        std::fs::write(root.join("x.txt"), b"beside the directory")?;
+        std::fs::write(root.join("x/y.txt"), b"under the directory")?;
+        let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+        let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+        let _ = scan_and_publish_at(&mut journal, &root, None, all_cache_entries_stable)?;
+        let before = journal.total_changes();
+
+        let _ = scan_and_publish_at(&mut journal, &root, None, all_cache_entries_stable)?;
+
+        assert_eq!(journal.total_changes(), before);
         Ok(())
     }
 

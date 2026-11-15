@@ -1127,6 +1127,12 @@ impl Journal {
         Ok(true)
     }
 
+    /// Count every row this connection has inserted, updated, or deleted.
+    #[cfg(test)]
+    pub(crate) fn total_changes(&self) -> u64 {
+        self.connection.total_changes()
+    }
+
     /// Load the complete committed local inventory.
     pub fn local_inventory(&self) -> Result<Vec<LocalObservationRecord>, JournalError> {
         read_local_inventory(&self.connection, &self.database_path)
