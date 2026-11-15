@@ -51,14 +51,17 @@ the plan is the reverse: a small vocabulary written for exactly these routes.
 **What Habu lacks** (searched for and not found):
 
 - SQLite, which holds omabox's journal.
-- inotify, for watching the sync root.
-- A SHA-256 digest word. `crypto/evp.f` already binds libcrypto's SHA-256, but
-  only for HMAC and signatures. Dropbox's content hash needs SHA-256.
+- Anchored mutations: `fs-anchored.f` only opens and reads, and omabox also
+  creates, renames, unlinks and links through a directory descriptor.
+- Extended attributes, which mark omabox's download stages.
 - Writing to the Secret Service. `secret.f` on Linux only reads; the Rust
   version runs `secret-tool` as a child process to write. The user's direction
   is to extend Habu instead.
 
 The decision is that these become Habu libraries, not omabox code.
+
+Corrected later: SHA-256 is in Habu's core (`src/core/sha256.f`), and inotify
+is not needed, because the Rust daemon rescans after each long poll.
 
 ## 2026-11-15: A rule that blocked the work before it began
 
@@ -166,3 +169,44 @@ Observation for the blog: in Rust the toolchain is someone else's problem.
 language's own build chain too. The first hours of an application rewrite
 went into the platform under it. That cost falls once per platform gap, and
 it lands in the platform, where the next application gets it free.
+
+## 2026-11-15: A person reading the signatures
+
+The user read the vocabulary's signatures and found three faults in Habu's
+type notation that the agents had not raised:
+
+- `( ptr upload ptr client -- reply )` reads as four arguments. It takes two.
+- In `METADATA ( ptr u8 n ptr client -- reply )` nothing says whether the
+  bytes are a string or a buffer, or which string. The checker accepts
+  `DELETE`'s path and rev swapped. The Rust code has newtypes for exactly
+  these: `CanonicalPath`, `DropboxRevision`, `ContentIdentity`, `AccessToken`
+  and `RefreshToken`.
+- "The n after pointers smells strongly." A Rust `&str` is one value that
+  carries its length.
+
+Decided: a pointer is `^T`, and a string is one stack item whose type carries
+its role, so the vocabulary reads `DELETE ( path rev ^client -- reply )`. That
+is a change to Habu's type language across about 17,000 `ptr` tokens, and it
+is designed before more omabox code is written.
+
+Observation for the blog: writing the vocabulary first put the language's
+notation in front of a person before any code. In Rust the type notation is
+settled, and the agent's job is to use it. In Habu, the rewrite changes the
+notation.
+
+## 2026-11-15: Engines, and checking less often
+
+- **An engine from another machine.** This machine's engine could not build
+  Habu's master, so the build started from the spark's engine. Built again
+  from master, the engine reproduced the spark's byte for byte (gen1 = gen2).
+- **A candidate engine instead of an install.** The two Habu lanes are merged
+  into one tree, and an engine built there runs omabox's tests. Habu's suite
+  and install run once, at the end.
+- **The user cut the checks.** A worker ran a test ten times hunting a flaky
+  low-speed timeout. The user's rule since: run only the one check that shows
+  the goal moved, and the rest once at the end. The flake is parked in a dot.
+- **Reviews found what the tests missed.** The JSON review ran every Unicode
+  scalar against Python's `json.dumps` and found a mutant at U+FFFF that the
+  tests let through. The `RESET` review found two guards with no test, and a
+  comment that left out what libcurl keeps (the cookies).
+
