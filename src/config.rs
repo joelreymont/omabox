@@ -526,7 +526,7 @@ pub enum ConfigError {
     },
 
     /// A failed write also left its private temporary file behind.
-    #[error("could not remove temporary configuration `{path}` after the write failed: {cleanup}")]
+    #[error("the configuration write failed and cleanup also failed: {}", .cleanup[0])]
     #[diagnostic(
         code(omabox::config::cleanup_after_write),
         help(
@@ -534,13 +534,12 @@ pub enum ConfigError {
         )
     )]
     CleanupAfterWrite {
-        /// Temporary file that could not be removed.
-        path: PathBuf,
         /// Original write failure.
         #[source]
         write: Box<ConfigError>,
-        /// Cleanup failure.
-        cleanup: io::Error,
+        /// The single cleanup failure, rendered as a related diagnostic.
+        #[related]
+        cleanup: Box<[ConfigError; 1]>,
     },
 
     /// The configured sync root could not be resolved.
@@ -664,12 +663,19 @@ fn atomic_write_config(
         Err(write) => match fs::remove_file(&temporary) {
             Ok(()) => Err(write),
             Err(cleanup) if cleanup.kind() == io::ErrorKind::NotFound => Err(write),
-            Err(cleanup) => Err(ConfigError::CleanupAfterWrite {
-                path: temporary,
-                write: Box::new(write),
-                cleanup,
-            }),
+            Err(cleanup) => Err(cleanup_after_write(temporary, write, cleanup)),
         },
+    }
+}
+
+fn cleanup_after_write(temporary: PathBuf, write: ConfigError, cleanup: io::Error) -> ConfigError {
+    ConfigError::CleanupAfterWrite {
+        cleanup: Box::new([ConfigError::Write {
+            operation: "remove the temporary",
+            path: temporary,
+            source: cleanup,
+        }]),
+        write: Box::new(write),
     }
 }
 
@@ -1386,6 +1392,30 @@ mod tests {
         let report = format!("{:?}", miette::Report::new(error));
         assert!(!report.contains(SENTINEL));
         Ok(())
+    }
+
+    #[test]
+    fn cleanup_after_write_renders_both_chains_and_cleanup_help() {
+        let write = ConfigError::Write {
+            operation: "write a temporary",
+            path: PathBuf::from("/config.tmp"),
+            source: io::Error::other("write-inner-cause"),
+        };
+        let error = cleanup_after_write(
+            PathBuf::from("/config.tmp"),
+            write,
+            io::Error::other("cleanup-inner-cause"),
+        );
+        // miette wraps help at the terminal width; compare word sequences.
+        let rendered = format!("{:?}", miette::Report::new(error));
+        let report = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+        for text in [
+            "write-inner-cause",
+            "cleanup-inner-cause",
+            "Ensure the XDG configuration location is owned by this user and writable.",
+        ] {
+            assert!(report.contains(text), "missing {text:?} in:\n{report}");
+        }
     }
 
     #[test]

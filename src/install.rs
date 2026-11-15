@@ -349,7 +349,7 @@ fn rollback_failure(source: InstallError, restored: Result<(), InstallError>) ->
         Ok(()) => source,
         Err(restore) => InstallError::RollbackFailed {
             source: Box::new(source),
-            restore: Box::new(restore),
+            restore: Box::new([restore]),
         },
     }
 }
@@ -359,7 +359,7 @@ fn cleanup_failure(source: InstallError, cleanup: Result<(), InstallError>) -> I
         Ok(()) => source,
         Err(cleanup) => InstallError::CleanupFailed {
             source: Box::new(source),
-            cleanup: Box::new(cleanup),
+            cleanup: Box::new([cleanup]),
         },
     }
 }
@@ -886,7 +886,7 @@ pub enum InstallError {
         #[source]
         source: ServiceError,
     },
-    #[error("the lifecycle operation failed and rollback also failed: {restore}")]
+    #[error("the lifecycle operation failed and rollback also failed: {}", .restore[0])]
     #[diagnostic(
         code(omabox::install::rollback_failed),
         help(
@@ -896,9 +896,11 @@ pub enum InstallError {
     RollbackFailed {
         #[source]
         source: Box<InstallError>,
-        restore: Box<InstallError>,
+        /// The single rollback failure, rendered as a related diagnostic.
+        #[related]
+        restore: Box<[InstallError; 1]>,
     },
-    #[error("the lifecycle operation failed and cleanup also failed: {cleanup}")]
+    #[error("the lifecycle operation failed and cleanup also failed: {}", .cleanup[0])]
     #[diagnostic(
         code(omabox::install::cleanup_failed),
         help("Address the first error, then run the install or upgrade again from the new build.")
@@ -906,7 +908,9 @@ pub enum InstallError {
     CleanupFailed {
         #[source]
         source: Box<InstallError>,
-        cleanup: Box<InstallError>,
+        /// The single cleanup failure, rendered as a related diagnostic.
+        #[related]
+        cleanup: Box<[InstallError; 1]>,
     },
 }
 
@@ -1218,7 +1222,7 @@ mod tests {
                     })
                 ));
                 assert!(matches!(
-                    *restore,
+                    restore[0],
                     InstallError::Service(ServiceError::Unsuccessful {
                         status: Some(8),
                         ..
@@ -1284,7 +1288,7 @@ mod tests {
                         ..
                     })
                 ));
-                assert!(matches!(*restore, InstallError::Filesystem { .. }));
+                assert!(matches!(restore[0], InstallError::Filesystem { .. }));
             }
             other => return Err(io::Error::other(format!("unexpected result: {other:?}")).into()),
         }
@@ -1329,7 +1333,7 @@ mod tests {
         match result {
             Err(InstallError::RollbackFailed { source, restore }) => {
                 assert!(matches!(*source, InstallError::Service(_)));
-                assert!(matches!(*restore, InstallError::ShellLocked));
+                assert!(matches!(restore[0], InstallError::ShellLocked));
             }
             other => return Err(io::Error::other(format!("unexpected result: {other:?}")).into()),
         }
@@ -1343,6 +1347,53 @@ mod tests {
         assert_eq!(fs::read(plugin_backup[0].join("old.qml"))?, b"old");
         assert_eq!(fs::read_to_string(lock_checks)?, "4\n");
         Ok(())
+    }
+
+    fn primary_failure() -> InstallError {
+        InstallError::Filesystem {
+            operation: "replace",
+            path: PathBuf::from("/primary"),
+            source: io::Error::other("primary-inner-cause"),
+        }
+    }
+
+    fn assert_renders(error: InstallError, expected: &[&str]) {
+        // miette wraps help at the terminal width; compare word sequences.
+        let rendered = format!("{:?}", miette::Report::new(error));
+        let report = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+        for text in expected {
+            assert!(report.contains(text), "missing {text:?} in:\n{report}");
+        }
+    }
+
+    #[test]
+    fn rollback_failure_renders_both_chains_and_restore_help() {
+        let restore = InstallError::DaemonSelfCheckStart {
+            source: io::Error::other("restore-inner-cause"),
+        };
+        assert_renders(
+            rollback_failure(primary_failure(), Err(restore)),
+            &[
+                "primary-inner-cause",
+                "restore-inner-cause",
+                "Rebuild Omabox and retry the installation.",
+            ],
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_renders_both_chains_and_cleanup_help() {
+        let cleanup = InstallError::DaemonSelfCheckStart {
+            source: io::Error::other("cleanup-inner-cause"),
+        };
+        assert_renders(
+            cleanup_failure(primary_failure(), Err(cleanup)),
+            &[
+                "primary-inner-cause",
+                "cleanup-inner-cause",
+                "Rebuild Omabox and retry the installation.",
+            ],
+        );
     }
 
     #[test]
@@ -1887,11 +1938,11 @@ mod tests {
             },
             InstallError::RollbackFailed {
                 source: inner(),
-                restore: inner(),
+                restore: Box::new([*inner()]),
             },
             InstallError::CleanupFailed {
                 source: inner(),
-                cleanup: inner(),
+                cleanup: Box::new([*inner()]),
             },
         ];
         // The exhaustive match makes a new variant fail to compile until it joins `errors`.
