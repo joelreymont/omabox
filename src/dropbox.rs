@@ -1175,7 +1175,12 @@ impl DropboxClient {
                 bytes
                     .read_exact(&mut buffer[..length])
                     .map_err(|source| DropboxError::UploadStageRead { source })?;
-                self.append_upload_session_chunk(&session.session_id, &buffer[..length], offset)?;
+                self.append_upload_session_chunk(
+                    target,
+                    &session.session_id,
+                    &buffer[..length],
+                    offset,
+                )?;
                 offset += length as u64;
                 progress.complete(offset);
             }
@@ -1205,6 +1210,7 @@ impl DropboxClient {
 
     fn append_upload_session_chunk(
         &self,
+        target: &str,
         session_id: &str,
         buffer: &[u8],
         offset: u64,
@@ -1229,16 +1235,37 @@ impl DropboxClient {
                 Ok(()) => return Ok(()),
                 Err(SdkError::Api(files::UploadSessionAppendError::IncorrectOffset(error))) => {
                     if error.correct_offset == next {
+                        tracing::warn!(
+                            path = target,
+                            requested,
+                            correct = error.correct_offset,
+                            chunk_end = next,
+                            "Dropbox reported the upload chunk already stored"
+                        );
                         return Ok(());
                     }
                     if correction_available
                         && error.correct_offset != requested
                         && (offset..next).contains(&error.correct_offset)
                     {
+                        tracing::warn!(
+                            path = target,
+                            requested,
+                            correct = error.correct_offset,
+                            chunk_end = next,
+                            "adopting the upload session offset Dropbox reported"
+                        );
                         requested = error.correct_offset;
                         correction_available = false;
                         continue;
                     }
+                    tracing::warn!(
+                        path = target,
+                        requested,
+                        correct = error.correct_offset,
+                        chunk_end = next,
+                        "refusing the upload session offset Dropbox reported"
+                    );
                     return Err(DropboxError::IncorrectUploadSessionOffset {
                         requested_offset: requested,
                         chunk_bytes: next - requested,
@@ -1248,6 +1275,13 @@ impl DropboxClient {
                 Err(error) => {
                     let error = DropboxError::sdk("append Dropbox upload session", error);
                     if error.is_transport_retry() && transport_failure.is_none() {
+                        tracing::warn!(
+                            path = target,
+                            requested,
+                            chunk_end = next,
+                            error = %error,
+                            "resending an upload chunk after a transport failure"
+                        );
                         transport_failure = Some(error);
                         continue;
                     }
