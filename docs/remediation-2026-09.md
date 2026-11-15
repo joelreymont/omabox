@@ -225,19 +225,28 @@ impl DaemonError { fn disposition(&self) -> Disposition }
   `AuthError::InvalidAccessToken` after a refresh attempt, or an OAuth
   `invalid_grant`). An expired access token is refreshed inside the transport
   and re-issued once by the SDK; the daemon never restarts a session for it. The daemon publishes the fatal status as phase `stopped` and exits 78.
-  After `omabox setup` or `omabox settings set-root` succeeds, the CLI reads
-  the unit's `ActiveState`; when it is `failed`, the CLI clears that state
-  with `reset-failed` and starts the service, so the daemon checks the fixed
-  cause again. Every start or restart the CLI makes (`omabox resume`,
-  `service start|restart`, and set-root's restart of a running service) runs
-  `reset-failed` first, which also resets the start-limit counter, so systemd
-  never refuses a start the user asked for. When a start after a completed
-  setup or set-root fails, the CLI reports that the change is complete and
-  that the service did not start, and names `omabox logs`. set-root stops the
-  service only while it is running or stopping, since only then can a daemon
-  hold the instance lock. `omabox pause` (`service stop`) clears a failed
-  state after stopping, so a paused service is always inactive and stays
-  stopped.
+  Every CLI service decision goes through one machine, `ServiceGoal` in
+  `src/service.rs`, which reads the unit's `ActiveState` and runs the
+  systemctl steps its table names. Every start or restart (`omabox resume`,
+  `service start|restart`, set-root's start of a service it stopped, the
+  restart by `omabox upgrade`, and a rollback's start) runs `reset-failed`
+  first, which also resets the start-limit counter, so systemd never refuses a
+  start the user asked for; a unit systemd has unloaded, such as a disabled,
+  stopped service, has nothing to clear or stop. `omabox upgrade` rolls back
+  only a service that had reached readiness (`active`, `reloading` or
+  `refreshing`) when its restart fails; an `activating` service, including one
+  waiting to restart after a crash, is restarted on the new build, which is
+  kept. After `omabox setup`, `omabox settings set-root` or `omabox upgrade`
+  succeeds, a `failed` service is cleared and started, so the daemon checks
+  the fixed cause again; a `deactivating` one is stopped and read again first.
+  When that start fails, the command reports that its change is complete and
+  kept and that the service could not be started or checked, and names
+  `omabox status` and `omabox logs`. set-root stops the service only while it
+  is running, starting or stopping, since only then can a daemon hold the
+  instance lock, and afterwards starts again one that was running or
+  starting. `omabox pause` (`service stop`) and `omabox uninstall` stop a
+  running, starting or stopping service and clear a failed state, so a paused
+  service is always inactive and no failed unit outlives its files.
 - Invariant: `InvalidJournalState` and other bugs publish phase `stopped` and
   exit 70; a logging failure exits 70 before any status exists.
 - `last_error` is cleared only when a pass completes with zero sync errors.
@@ -620,7 +629,10 @@ would remove the adapters above; they are candidate upstream changes to
 
 ## L. Install, CLI, config
 
-- `install`: restart failure runs rollback, `daemon-reload`, and state restore;
+- `install`: a failed restart of a service that had reached readiness runs
+  rollback, `daemon-reload`, and state restore; a failed restart or start of
+  any other service keeps the new build (UserAction above); a failed
+  uninstall service step before the files are removed restores the service;
   before publishing, the staged `omaboxd` is executed with `--self-check`
   (prints version, exits 0 without touching state); symlinked destinations and
   source-equals-destination are refused with typed errors; uninstall disables

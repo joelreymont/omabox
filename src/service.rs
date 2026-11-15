@@ -1,5 +1,6 @@
 //! Direct controls for the Omabox systemd user service and its journal.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -43,14 +44,123 @@ impl ServiceAction {
 /// What systemd's `ActiveState` lets the CLI do with the user service.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnitState {
-    /// `active`, `reloading`, `refreshing` or `activating`, including the wait before an automatic restart.
+    /// `active`, `reloading` or `refreshing`: the daemon reached readiness.
     Running,
+    /// `activating`, including the wait before an automatic restart: no daemon has reached readiness yet.
+    Starting,
     /// `failed`: ended by a fatal exit, the start limit or a stop that timed out, until a command clears it.
     Failed,
     /// `deactivating`: stopping after a stop request or the daemon's own exit; it can still end `failed`.
     Stopping,
     /// `inactive` or `maintenance`, which an unloaded unit also reports: no daemon process.
     Stopped,
+}
+
+/// What a command wants from the user service; [`ServiceCommands::drive`] reaches it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceGoal {
+    /// Clear a failed state and the start limit, then start.
+    Start,
+    /// Clear a failed state and the start limit, then restart.
+    Restart,
+    /// After a change that may fix a fatal cause, start a failed unit; stop a stopping unit and look again first; leave a running, starting or stopped unit.
+    Recover,
+    /// Stop a running, starting or stopping unit and leave no failed state.
+    Halt,
+    /// Stop a unit that can hold the instance lock (running, starting or stopping); leave a failed state for a later Recover.
+    Release,
+    /// Start again a unit observed running or starting before a change; leave any other, or one never observed.
+    Restore(Option<UnitState>),
+}
+
+/// What [`ServiceCommands::drive`] observed and did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Driven {
+    /// The state observed before any change; `None` for Start, Restart and Restore, which observe nothing.
+    pub first: Option<UnitState>,
+    /// Whether the goal ran start or restart.
+    pub launched: bool,
+}
+
+/// Where [`ServiceCommands::drive`] is on the way to its goal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Phase {
+    /// Nothing observed or changed yet.
+    Begin,
+    /// The state observed before any change.
+    Seen(UnitState),
+    /// A stop ran; the state is not yet observed again.
+    AfterStop,
+    /// The state observed after a stop.
+    Settled(UnitState),
+    /// A failed state and the start limit were cleared.
+    Cleared,
+    /// Start or restart ran.
+    Launched,
+}
+
+/// The one systemctl operation [`ServiceCommands::drive`] runs next.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Step {
+    /// Read the unit's state.
+    Observe,
+    /// Stop the unit.
+    Stop,
+    /// Clear a failed state and the start limit.
+    Clear,
+    /// Start or restart the unit.
+    Launch(ServiceAction),
+    /// The goal is reached.
+    Done,
+}
+
+/// What the step [`ServiceCommands::drive`] just ran did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Outcome {
+    /// The unit's state was read.
+    Observed(UnitState),
+    /// The unit was stopped.
+    Stopped,
+    /// A failed state and the start limit were cleared.
+    Cleared,
+    /// Start or restart ran.
+    Launched,
+}
+
+/// The phase after `outcome`: the first observation is Seen, any later one Settled.
+const fn advance(phase: Phase, outcome: Outcome) -> Phase {
+    match (phase, outcome) {
+        (Phase::Begin, Outcome::Observed(state)) => Phase::Seen(state),
+        (_, Outcome::Observed(state)) => Phase::Settled(state),
+        (_, Outcome::Stopped) => Phase::AfterStop,
+        (_, Outcome::Cleared) => Phase::Cleared,
+        (_, Outcome::Launched) => Phase::Launched,
+    }
+}
+
+/// Choose the next step toward `goal` from `phase`.
+const fn next(goal: ServiceGoal, phase: Phase) -> Step {
+    use ServiceGoal::{Halt, Recover, Release, Restart, Restore, Start};
+    use UnitState::{Failed, Running, Starting, Stopping};
+    match (goal, phase) {
+        (Start | Restart, Phase::Begin) => Step::Clear,
+        (Start, Phase::Cleared) => Step::Launch(ServiceAction::Start),
+        (Restart, Phase::Cleared) => Step::Launch(ServiceAction::Restart),
+        (Recover | Halt | Release, Phase::Begin) => Step::Observe,
+        (Recover, Phase::Seen(Failed)) => Step::Clear,
+        (Recover, Phase::Seen(Stopping)) => Step::Stop,
+        (Recover, Phase::AfterStop) => Step::Observe,
+        (Recover, Phase::Settled(Failed)) => Step::Clear,
+        (Recover, Phase::Cleared) => Step::Launch(ServiceAction::Start),
+        (Halt, Phase::Seen(Running | Starting | Stopping)) => Step::Stop,
+        (Halt, Phase::Seen(Failed)) => Step::Clear,
+        (Halt, Phase::AfterStop) => Step::Observe,
+        (Halt, Phase::Settled(Failed)) => Step::Clear,
+        (Release, Phase::Seen(Running | Starting | Stopping)) => Step::Stop,
+        (Restore(Some(Running | Starting)), Phase::Begin) => Step::Clear,
+        (Restore(_), Phase::Cleared) => Step::Launch(ServiceAction::Start),
+        _ => Step::Done,
+    }
 }
 
 /// Programs used to control and inspect the user service.
@@ -83,32 +193,6 @@ impl ServiceCommands {
         }
     }
 
-    /// Return whether systemd currently considers the user service active.
-    pub fn is_active(&self) -> Result<bool, ServiceError> {
-        let status = self
-            .systemctl
-            .command()
-            .args(["--user", "is-active", "--quiet", UNIT])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|source| ServiceError::StartCommand {
-                command: "systemctl is-active",
-                source,
-            })?;
-        match status.code() {
-            Some(0) => Ok(true),
-            Some(3 | 4) => Ok(false),
-            Some(code) => Err(ServiceError::Unsuccessful {
-                command: "systemctl is-active",
-                status: Some(code),
-            }),
-            None => Err(ServiceError::Terminated {
-                command: "systemctl is-active",
-            }),
-        }
-    }
-
     /// Return whether the user service is enabled at login.
     pub fn is_enabled(&self) -> Result<bool, ServiceError> {
         self.query_state("is-enabled", "systemctl is-enabled")
@@ -129,7 +213,8 @@ impl ServiceCommands {
             })?;
         status_result(output.status, "systemctl show")?;
         match String::from_utf8_lossy(&output.stdout).trim() {
-            "active" | "reloading" | "refreshing" | "activating" => Ok(UnitState::Running),
+            "active" | "reloading" | "refreshing" => Ok(UnitState::Running),
+            "activating" => Ok(UnitState::Starting),
             "failed" => Ok(UnitState::Failed),
             "deactivating" => Ok(UnitState::Stopping),
             "inactive" | "maintenance" => Ok(UnitState::Stopped),
@@ -139,18 +224,97 @@ impl ServiceCommands {
         }
     }
 
-    /// Clear the user service's failed state and its start-limit counter.
-    pub fn reset_failed(&self) -> Result<(), ServiceError> {
-        let status = self
+    /// Run `verb` (stop or reset-failed) on the unit.
+    ///
+    /// An unloaded unit has nothing to stop or clear: systemd unloads a disabled,
+    /// stopped unit and then refuses both, so that refusal succeeds once systemd
+    /// confirms the unit is not loaded. Only that refusal's message is dropped;
+    /// anything else systemctl writes to stderr goes to `errors`.
+    fn settle(
+        &self,
+        verb: &'static str,
+        command: &'static str,
+        errors: &mut impl Write,
+    ) -> Result<(), ServiceError> {
+        let output = self
             .systemctl
             .command()
-            .args(["--user", "reset-failed", UNIT])
-            .status()
-            .map_err(|source| ServiceError::StartCommand {
-                command: "systemctl reset-failed",
-                source,
-            })?;
-        status_result(status, "systemctl reset-failed")
+            .args(["--user", verb, UNIT])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|source| ServiceError::StartCommand { command, source })?;
+        match status_result(output.status, command) {
+            // Checked after the failure: systemd can unload the unit between two calls.
+            Err(ServiceError::Unsuccessful { .. }) if self.unloaded() => Ok(()),
+            result => {
+                // The result still reports a failure if stderr is gone.
+                let _ = errors.write_all(&output.stderr);
+                result
+            }
+        }
+    }
+
+    /// Return whether systemd confirms the unit is not loaded.
+    ///
+    /// `list-units` lists only loaded units and loads none, unlike `show`.
+    fn unloaded(&self) -> bool {
+        self.systemctl
+            .command()
+            .args([
+                "--user",
+                "list-units",
+                "--all",
+                "--plain",
+                "--no-legend",
+                UNIT,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|output| {
+                output.status.success() && String::from_utf8_lossy(&output.stdout).trim().is_empty()
+            })
+    }
+
+    /// Drive the user service toward `goal` through systemctl, observing its
+    /// state only where the goal's steps, tabled at `next`, call for it.
+    pub fn drive(&self, goal: ServiceGoal) -> Result<Driven, ServiceError> {
+        let mut phase = Phase::Begin;
+        let mut driven = Driven {
+            first: None,
+            launched: false,
+        };
+        loop {
+            let outcome = match next(goal, phase) {
+                Step::Observe => {
+                    let state = self.state()?;
+                    if phase == Phase::Begin {
+                        driven.first = Some(state);
+                    }
+                    Outcome::Observed(state)
+                }
+                Step::Stop => {
+                    self.settle("stop", "systemctl stop", &mut std::io::stderr())?;
+                    Outcome::Stopped
+                }
+                Step::Clear => {
+                    self.settle(
+                        "reset-failed",
+                        "systemctl reset-failed",
+                        &mut std::io::stderr(),
+                    )?;
+                    Outcome::Cleared
+                }
+                Step::Launch(action) => {
+                    self.control(action)?;
+                    driven.launched = true;
+                    Outcome::Launched
+                }
+                Step::Done => return Ok(driven),
+            };
+            phase = advance(phase, outcome);
+        }
     }
 
     /// Reload user service unit files after installation changes.
@@ -168,7 +332,7 @@ impl ServiceCommands {
     }
 
     /// Run one direct systemctl operation.
-    pub fn control(&self, action: ServiceAction) -> Result<(), ServiceError> {
+    fn control(&self, action: ServiceAction) -> Result<(), ServiceError> {
         let mut command = self.systemctl.command();
         command.args(["--user", action.argument()]);
         if action == ServiceAction::Status {
@@ -192,6 +356,21 @@ impl ServiceCommands {
                 command: "systemctl",
             }),
         }
+    }
+
+    /// Start the service automatically at login.
+    pub fn enable(&self) -> Result<(), ServiceError> {
+        self.control(ServiceAction::Enable)
+    }
+
+    /// Stop starting the service automatically at login.
+    pub fn disable(&self) -> Result<(), ServiceError> {
+        self.control(ServiceAction::Disable)
+    }
+
+    /// Show systemd's current service status.
+    pub fn status(&self) -> Result<(), ServiceError> {
+        self.control(ServiceAction::Status)
     }
 
     /// Show recent logs from the Omabox user service.
@@ -361,12 +540,6 @@ mod tests {
             recording_script(temporary.path(), "journalctl", &journalctl_arguments, 0)?;
         let commands = ServiceCommands::scripts(systemctl, journalctl);
 
-        assert!(commands.is_active()?);
-        assert_eq!(
-            fs::read_to_string(&systemctl_arguments)?,
-            "--user\nis-active\n--quiet\nomabox.service\n"
-        );
-
         commands.control(ServiceAction::Restart)?;
         assert_eq!(
             fs::read_to_string(&systemctl_arguments)?,
@@ -383,10 +556,34 @@ mod tests {
             "--user\nshow\n--property=ActiveState\n--value\nomabox.service\n"
         );
 
-        commands.reset_failed()?;
+        commands.settle("reset-failed", "systemctl reset-failed", &mut Vec::new())?;
         assert_eq!(
             fs::read_to_string(&systemctl_arguments)?,
             "--user\nreset-failed\nomabox.service\n"
+        );
+
+        commands.settle("stop", "systemctl stop", &mut Vec::new())?;
+        assert_eq!(
+            fs::read_to_string(&systemctl_arguments)?,
+            "--user\nstop\nomabox.service\n"
+        );
+
+        // A failed reset-failed asks list-units whether the unit is loaded.
+        fs::write(
+            temporary.path().join("systemctl"),
+            format!(
+                "printf '%s\\n' \"$@\" > '{}'\nexit 1\n",
+                systemctl_arguments.display()
+            ),
+        )?;
+        assert!(
+            commands
+                .settle("reset-failed", "systemctl reset-failed", &mut Vec::new())
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(&systemctl_arguments)?,
+            "--user\nlist-units\n--all\n--plain\n--no-legend\nomabox.service\n"
         );
 
         commands.logs()?;
@@ -404,7 +601,6 @@ mod tests {
         let systemctl = recording_script(temporary.path(), "systemctl", &arguments, 3)?;
         let commands = ServiceCommands::scripts(systemctl, "/unused/journalctl");
 
-        assert!(!commands.is_active()?);
         commands.control(ServiceAction::Status)?;
         Ok(())
     }
@@ -417,7 +613,7 @@ mod tests {
             ("active", UnitState::Running),
             ("reloading", UnitState::Running),
             ("refreshing", UnitState::Running),
-            ("activating", UnitState::Running),
+            ("activating", UnitState::Starting),
             ("failed", UnitState::Failed),
             ("inactive", UnitState::Stopped),
             ("deactivating", UnitState::Stopping),
@@ -433,6 +629,301 @@ mod tests {
             commands.state(),
             Err(ServiceError::UnknownState { state }) if state == "bogus"
         ));
+        Ok(())
+    }
+
+    /// Walk `next` from Begin for `goal`, observing `first`, then `settled` after a stop.
+    fn walk(goal: ServiceGoal, first: UnitState, settled: UnitState) -> Vec<Step> {
+        let mut phase = Phase::Begin;
+        let mut steps = Vec::new();
+        while steps.len() < 8 {
+            let step = next(goal, phase);
+            steps.push(step);
+            let outcome = match step {
+                Step::Observe if phase == Phase::Begin => Outcome::Observed(first),
+                Step::Observe => Outcome::Observed(settled),
+                Step::Stop => Outcome::Stopped,
+                Step::Clear => Outcome::Cleared,
+                Step::Launch(_) => Outcome::Launched,
+                Step::Done => break,
+            };
+            phase = advance(phase, outcome);
+        }
+        steps
+    }
+
+    #[test]
+    fn every_goal_takes_its_steps_from_each_state() {
+        use ServiceGoal::{Halt, Recover, Release, Restart, Restore, Start};
+        use Step::{Clear, Done, Launch, Observe, Stop};
+        use UnitState::{Failed, Running, Starting, Stopped, Stopping};
+        const START: Step = Launch(ServiceAction::Start);
+        const RESTART: Step = Launch(ServiceAction::Restart);
+        const STOP_LOOK: &[Step] = &[Observe, Stop, Observe, Done];
+        const STOP_CLEAR: &[Step] = &[Observe, Stop, Observe, Clear, Done];
+        /// Goal, first observed, observed after a stop, steps; `None` matches any state.
+        type Walk = (
+            ServiceGoal,
+            Option<UnitState>,
+            Option<UnitState>,
+            &'static [Step],
+        );
+        let table: &[Walk] = &[
+            (Start, None, None, &[Clear, START, Done]),
+            (Restart, None, None, &[Clear, RESTART, Done]),
+            (Recover, Some(Running), None, &[Observe, Done]),
+            (Recover, Some(Starting), None, &[Observe, Done]),
+            (Recover, Some(Failed), None, &[Observe, Clear, START, Done]),
+            (Recover, Some(Stopped), None, &[Observe, Done]),
+            (Recover, Some(Stopping), Some(Running), STOP_LOOK),
+            (Recover, Some(Stopping), Some(Starting), STOP_LOOK),
+            (
+                Recover,
+                Some(Stopping),
+                Some(Failed),
+                &[Observe, Stop, Observe, Clear, START, Done],
+            ),
+            (Recover, Some(Stopping), Some(Stopping), STOP_LOOK),
+            (Recover, Some(Stopping), Some(Stopped), STOP_LOOK),
+            (Halt, Some(Running), Some(Running), STOP_LOOK),
+            (Halt, Some(Running), Some(Starting), STOP_LOOK),
+            (Halt, Some(Running), Some(Failed), STOP_CLEAR),
+            (Halt, Some(Running), Some(Stopping), STOP_LOOK),
+            (Halt, Some(Running), Some(Stopped), STOP_LOOK),
+            (Halt, Some(Starting), Some(Running), STOP_LOOK),
+            (Halt, Some(Starting), Some(Starting), STOP_LOOK),
+            (Halt, Some(Starting), Some(Failed), STOP_CLEAR),
+            (Halt, Some(Starting), Some(Stopping), STOP_LOOK),
+            (Halt, Some(Starting), Some(Stopped), STOP_LOOK),
+            (Halt, Some(Stopping), Some(Running), STOP_LOOK),
+            (Halt, Some(Stopping), Some(Starting), STOP_LOOK),
+            (Halt, Some(Stopping), Some(Failed), STOP_CLEAR),
+            (Halt, Some(Stopping), Some(Stopping), STOP_LOOK),
+            (Halt, Some(Stopping), Some(Stopped), STOP_LOOK),
+            (Halt, Some(Failed), None, &[Observe, Clear, Done]),
+            (Halt, Some(Stopped), None, &[Observe, Done]),
+            (Release, Some(Running), None, &[Observe, Stop, Done]),
+            (Release, Some(Starting), None, &[Observe, Stop, Done]),
+            (Release, Some(Stopping), None, &[Observe, Stop, Done]),
+            (Release, Some(Failed), None, &[Observe, Done]),
+            (Release, Some(Stopped), None, &[Observe, Done]),
+            (Restore(None), None, None, &[Done]),
+            (Restore(Some(Running)), None, None, &[Clear, START, Done]),
+            (Restore(Some(Starting)), None, None, &[Clear, START, Done]),
+            (Restore(Some(Failed)), None, None, &[Done]),
+            (Restore(Some(Stopping)), None, None, &[Done]),
+            (Restore(Some(Stopped)), None, None, &[Done]),
+        ];
+        let states = [Running, Starting, Failed, Stopping, Stopped];
+        let goals = [Start, Restart, Recover, Halt, Release, Restore(None)]
+            .into_iter()
+            .chain(states.map(|state| Restore(Some(state))));
+        for goal in goals {
+            for first in states {
+                for settled in states {
+                    let case = format!("{goal:?} seeing {first:?} settling {settled:?}");
+                    let rows: Vec<_> = table
+                        .iter()
+                        .filter(|(g, f, s, _)| {
+                            *g == goal
+                                && f.is_none_or(|f| f == first)
+                                && s.is_none_or(|s| s == settled)
+                        })
+                        .collect();
+                    assert_eq!(rows.len(), 1, "{case}: one expected walk");
+                    let steps = walk(goal, first, settled);
+                    assert_eq!(steps, rows[0].3, "{case}");
+                    assert_eq!(steps.last(), Some(&Done), "{case}: ends at Done");
+                }
+            }
+        }
+    }
+
+    /// A systemctl that logs each verb to `log` and answers each `show` with
+    /// the next of `states`, then exits 0.
+    fn scripted_systemctl(
+        directory: &Path,
+        log: &Path,
+        states: &[&str],
+    ) -> Result<PathBuf, Box<dyn Error>> {
+        let queue = directory.join("states");
+        fs::write(
+            &queue,
+            states.iter().map(|s| format!("{s}\n")).collect::<String>(),
+        )?;
+        let path = directory.join("systemctl");
+        let (log, queue) = (log.display(), queue.display());
+        fs::write(
+            &path,
+            format!(
+                "printf '%s\\n' \"$2\" >> '{log}'\n\
+                 if [ \"$2\" = show ]; then\n\
+                 head -n 1 '{queue}'\n\
+                 tail -n +2 '{queue}' > '{queue}.next'\n\
+                 mv '{queue}.next' '{queue}'\n\
+                 fi\n"
+            ),
+        )?;
+        Ok(path)
+    }
+
+    #[test]
+    fn drive_runs_each_step_through_systemctl() -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let log = temporary.path().join("systemctl.log");
+
+        let systemctl = scripted_systemctl(temporary.path(), &log, &["active", "failed"])?;
+        let commands = ServiceCommands::scripts(systemctl, "/unused/journalctl");
+        assert_eq!(
+            commands.drive(ServiceGoal::Halt)?,
+            Driven {
+                first: Some(UnitState::Running),
+                launched: false
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(&log)?,
+            "show\nstop\nshow\nreset-failed\n"
+        );
+
+        fs::remove_file(&log)?;
+        let systemctl = scripted_systemctl(temporary.path(), &log, &["failed"])?;
+        let commands = ServiceCommands::scripts(systemctl, "/unused/journalctl");
+        assert_eq!(
+            commands.drive(ServiceGoal::Recover)?,
+            Driven {
+                first: Some(UnitState::Failed),
+                launched: true
+            }
+        );
+        assert_eq!(fs::read_to_string(&log)?, "show\nreset-failed\nstart\n");
+        Ok(())
+    }
+
+    #[test]
+    fn settling_an_unloaded_unit_succeeds() -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let systemctl = temporary.path().join("systemctl");
+        let script = |verb: &str, refusal: &str, listed: &str| {
+            format!(
+                "if [ \"$2\" = {verb} ]; then echo '{refusal}' >&2; exit 1; fi\nprintf '{listed}'\n"
+            )
+        };
+
+        for (verb, command) in [
+            ("stop", "systemctl stop"),
+            ("reset-failed", "systemctl reset-failed"),
+        ] {
+            fs::write(
+                &systemctl,
+                script(verb, "Unit omabox.service not loaded.", ""),
+            )?;
+            let commands = ServiceCommands::scripts(&systemctl, "/unused/journalctl");
+            let mut errors = Vec::new();
+            commands.settle(verb, command, &mut errors)?;
+            assert!(errors.is_empty(), "{verb}: no message for an unloaded unit");
+
+            let refusal = format!("Failed to {verb} unit omabox.service: Access denied");
+            fs::write(
+                &systemctl,
+                script(
+                    verb,
+                    &refusal,
+                    "omabox.service loaded inactive dead Omabox\\n",
+                ),
+            )?;
+            let commands = ServiceCommands::scripts(&systemctl, "/unused/journalctl");
+            let mut errors = Vec::new();
+            assert!(
+                matches!(
+                    commands.settle(verb, command, &mut errors),
+                    Err(ServiceError::Unsuccessful { command: c, .. }) if c == command
+                ),
+                "{verb}"
+            );
+            assert_eq!(String::from_utf8(errors)?, format!("{refusal}\n"), "{verb}");
+
+            let warning = "Warning: The unit file, source configuration file or drop-ins of \
+                           omabox.service changed on disk.";
+            fs::write(&systemctl, format!("echo '{warning}' >&2\n"))?;
+            let commands = ServiceCommands::scripts(&systemctl, "/unused/journalctl");
+            let mut errors = Vec::new();
+            commands.settle(verb, command, &mut errors)?;
+            assert_eq!(String::from_utf8(errors)?, format!("{warning}\n"), "{verb}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_clear_stops_the_drive() -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let log = temporary.path().join("systemctl.log");
+        let systemctl = temporary.path().join("systemctl");
+        let script = |listed: &str| {
+            format!(
+                "printf '%s\\n' \"$2\" >> '{}'\n\
+                 case \"$2\" in\n\
+                 reset-failed) exit 1;;\n\
+                 list-units) printf '{listed}';;\n\
+                 esac\n",
+                log.display()
+            )
+        };
+
+        fs::write(
+            &systemctl,
+            script("omabox.service loaded failed failed Omabox\\n"),
+        )?;
+        let commands = ServiceCommands::scripts(&systemctl, "/unused/journalctl");
+        assert!(matches!(
+            commands.drive(ServiceGoal::Start),
+            Err(ServiceError::Unsuccessful {
+                command: "systemctl reset-failed",
+                ..
+            })
+        ));
+        assert_eq!(fs::read_to_string(&log)?, "reset-failed\nlist-units\n");
+
+        fs::remove_file(&log)?;
+        fs::write(&systemctl, script(""))?;
+        let commands = ServiceCommands::scripts(&systemctl, "/unused/journalctl");
+        assert_eq!(
+            commands.drive(ServiceGoal::Start)?,
+            Driven {
+                first: None,
+                launched: true
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(&log)?,
+            "reset-failed\nlist-units\nstart\n"
+        );
+
+        // systemd can unload the unit between the observation and the stop.
+        fs::remove_file(&log)?;
+        let queue = temporary.path().join("states");
+        fs::write(&queue, "active\ninactive\n")?;
+        fs::write(
+            &systemctl,
+            format!(
+                "printf '%s\\n' \"$2\" >> '{log}'\n\
+                 case \"$2\" in\n\
+                 show) head -n 1 '{queue}'; tail -n +2 '{queue}' > '{queue}.next'; mv '{queue}.next' '{queue}';;\n\
+                 stop) exit 5;;\n\
+                 esac\n",
+                log = log.display(),
+                queue = queue.display()
+            ),
+        )?;
+        let commands = ServiceCommands::scripts(&systemctl, "/unused/journalctl");
+        assert_eq!(
+            commands.drive(ServiceGoal::Halt)?,
+            Driven {
+                first: Some(UnitState::Running),
+                launched: false
+            }
+        );
+        assert_eq!(fs::read_to_string(&log)?, "show\nstop\nlist-units\nshow\n");
         Ok(())
     }
 

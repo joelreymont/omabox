@@ -79,7 +79,10 @@ omabox uninstall
 ```
 
 Upgrade validates the complete replacement and rolls back if the new daemon
-cannot launch. Uninstall removes program artifacts but retains configuration,
+cannot replace a running one. A service that was still starting is restarted
+on the new build, and one that had failed is started again on it; if either
+still fails, the new build stays and `omabox status` and `omabox logs` show
+why. Uninstall removes program artifacts but retains configuration,
 credentials, journal state, recovery data, local files, and Dropbox content.
 Commands that replace the live QuickShell plugin refuse to run while locked.
 

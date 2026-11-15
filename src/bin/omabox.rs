@@ -13,7 +13,7 @@ use omabox::config::{Config, ConfigError, InstanceLock, LockError, XdgDirectorie
 use omabox::dropbox::{DropboxClient, DropboxError, DropboxLink, DropboxRoot};
 use omabox::install::{InstallAction, InstallError};
 use omabox::journal::{DropboxBindingWrite, Journal, JournalError, LocalRootBinding};
-use omabox::service::{ServiceAction, ServiceCommands, ServiceError, UnitState};
+use omabox::service::{ServiceAction, ServiceCommands, ServiceError, ServiceGoal};
 use omabox::status::{self, StatusError};
 use serde::Serialize;
 use thiserror::Error;
@@ -52,24 +52,23 @@ fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
     }
 }
 
-/// Run one service command. A start or restart first resets the failed state and the start-limit
-/// counter, so systemd never refuses a start the user asked for; a stop clears a failed state
-/// afterwards, so a paused service reads as inactive.
+/// Run one service command. A start or restart first clears a failed state and the start limit,
+/// so systemd never refuses a start the user asked for; a stop stops a running or stopping
+/// service and leaves no failed state, so a paused service reads as inactive.
 fn run_service(action: ServiceAction, services: &ServiceCommands) -> Result<(), CliError> {
     match action {
-        ServiceAction::Start | ServiceAction::Restart => {
-            services.reset_failed()?;
-            services.control(action)?;
+        ServiceAction::Start => {
+            services.drive(ServiceGoal::Start)?;
+        }
+        ServiceAction::Restart => {
+            services.drive(ServiceGoal::Restart)?;
         }
         ServiceAction::Stop => {
-            services.control(action)?;
-            if services.state()? == UnitState::Failed {
-                services.reset_failed()?;
-            }
+            services.drive(ServiceGoal::Halt)?;
         }
-        ServiceAction::Enable | ServiceAction::Disable | ServiceAction::Status => {
-            services.control(action)?;
-        }
+        ServiceAction::Enable => services.enable()?,
+        ServiceAction::Disable => services.disable()?,
+        ServiceAction::Status => services.status()?,
     }
     Ok(())
 }
@@ -276,28 +275,18 @@ fn setup(options: SetupOptions, services: &ServiceCommands) -> Result<(), CliErr
 fn finish_setup(lock: InstanceLock, services: &ServiceCommands) -> Result<(), CliError> {
     // The daemon cannot start while setup holds its instance lock.
     drop(lock);
-    let restarted = start_failed(services).map_err(|source| CliError::StartAfterChange {
-        change: "Omabox setup is complete".into(),
-        source,
-    })?;
-    if restarted {
+    let recovered =
+        services
+            .drive(ServiceGoal::Recover)
+            .map_err(|source| CliError::StartAfterChange {
+                change: "Omabox setup is complete".into(),
+                source,
+            })?;
+    if recovered.launched {
         write_stdout("\nOmabox setup is complete. The stopped service has been started again.\n")
     } else {
         write_stdout("\nOmabox setup is complete.\n")
     }
-}
-
-/// Start the user service when systemd reports it failed, and return whether it
-/// did. A fatal daemon exit leaves the unit failed with no automatic restart, so
-/// a command that fixes the cause clears the failed state, which also resets the
-/// start limit, and starts it. A paused service is inactive and stays stopped.
-fn start_failed(services: &ServiceCommands) -> Result<bool, ServiceError> {
-    if services.state()? != UnitState::Failed {
-        return Ok(false);
-    }
-    services.reset_failed()?;
-    services.control(ServiceAction::Start)?;
-    Ok(true)
 }
 
 fn refuse_existing_config(path: &Path) -> Result<(), CliError> {
@@ -461,14 +450,9 @@ fn set_sync_root(
     let replacement = Config::from_values(xdg, path, current.dropbox_app_key())
         .map_err(config_error("validate the new sync root"))?;
 
-    let before = services.state()?;
-    // Only a running or stopping unit can hold the instance lock; the stop
-    // cancels `activating` and waits out `deactivating`.
-    if matches!(before, UnitState::Running | UnitState::Stopping) {
-        services
-            .control(ServiceAction::Stop)
-            .map_err(CliError::Service)?;
-    }
+    let released = services
+        .drive(ServiceGoal::Release)
+        .map_err(CliError::Service)?;
     let change = change_sync_root_while_stopped(&current, &replacement);
     let changed = || {
         format!(
@@ -476,35 +460,35 @@ fn set_sync_root(
             replacement.sync_root().display()
         )
     };
-    let running = before == UnitState::Running;
-    if running
-        && let Err(restore) = services
-            .reset_failed()
-            .and_then(|()| services.control(ServiceAction::Start))
-    {
-        return match change {
-            Ok(()) => Err(CliError::StartAfterChange {
-                change: changed(),
-                source: restore,
-            }),
-            Err(source) => Err(CliError::RootChangeAndRestore {
-                source: Box::new(source),
-                restore,
-            }),
-        };
-    }
-    change?;
-    let restarted = !running
-        && start_failed(services).map_err(|source| CliError::StartAfterChange {
+    let restored = services.drive(ServiceGoal::Restore(released.first));
+    match (change, restored) {
+        (Err(source), Err(restore)) => Err(CliError::RootChangeAndRestore {
+            source: Box::new(source),
+            restore,
+        }),
+        (Err(source), Ok(_)) => Err(source),
+        (Ok(()), Err(source)) => Err(CliError::StartAfterChange {
             change: changed(),
             source,
-        })?;
-    let note = if restarted {
-        " The stopped service has been started again."
-    } else {
-        ""
-    };
-    write_stdout(&format!("{}.{note}\n", changed()))
+        }),
+        (Ok(()), Ok(restored)) => {
+            // The new root may fix the fatal cause of a unit Release left failed.
+            let recovered = !restored.launched
+                && services
+                    .drive(ServiceGoal::Recover)
+                    .map_err(|source| CliError::StartAfterChange {
+                        change: changed(),
+                        source,
+                    })?
+                    .launched;
+            let note = if recovered {
+                " The stopped service has been started again."
+            } else {
+                ""
+            };
+            write_stdout(&format!("{}.{note}\n", changed()))
+        }
+    }
 }
 
 fn change_sync_root_while_stopped(current: &Config, replacement: &Config) -> Result<(), CliError> {
@@ -661,11 +645,11 @@ enum CliError {
         restore: ServiceError,
     },
 
-    #[error("{change}, but the Omabox service did not start")]
+    #[error("{change}, but the Omabox service could not be started or checked")]
     #[diagnostic(
         code(omabox::cli::start_after_change),
         help(
-            "The change is kept. Run `omabox logs` to see why the service did not start, then `omabox resume`."
+            "The change is kept. Run `omabox status` and `omabox logs` to see why, then `omabox resume`."
         )
     )]
     StartAfterChange {
@@ -1142,6 +1126,22 @@ mod tests {
     }
 
     #[test]
+    fn set_root_restarts_a_starting_service() -> Result<(), Box<dyn Error>> {
+        let (temporary, xdg, _first, second) = fixture()?;
+        let service_log = temporary.path().join("service.log");
+        let systemctl = fake_systemctl(temporary.path(), "activating", &service_log)?;
+        let services = ServiceCommands::scripts(systemctl, "/unused/journalctl");
+
+        set_sync_root(&second, &xdg, &services)?;
+        assert_eq!(Config::load_from(&xdg)?.sync_root(), second);
+        assert_eq!(
+            fs::read_to_string(service_log)?,
+            "show\nstop\nreset-failed\nstart\n"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn set_root_waits_out_a_stopping_service() -> Result<(), Box<dyn Error>> {
         let (temporary, xdg, _first, second) = fixture()?;
         let service_log = temporary.path().join("service.log");
@@ -1150,7 +1150,10 @@ mod tests {
 
         set_sync_root(&second, &xdg, &services)?;
         assert_eq!(Config::load_from(&xdg)?.sync_root(), second);
-        assert_eq!(fs::read_to_string(service_log)?, "show\nstop\nshow\n");
+        assert_eq!(
+            fs::read_to_string(service_log)?,
+            "show\nstop\nshow\nstop\nshow\n"
+        );
         Ok(())
     }
 
@@ -1221,8 +1224,10 @@ mod tests {
             (ServiceAction::Start, "failed", "reset-failed\nstart\n"),
             (ServiceAction::Start, "inactive", "reset-failed\nstart\n"),
             (ServiceAction::Restart, "active", "reset-failed\nrestart\n"),
-            (ServiceAction::Stop, "failed", "stop\nshow\nreset-failed\n"),
-            (ServiceAction::Stop, "active", "stop\nshow\n"),
+            (ServiceAction::Stop, "failed", "show\nreset-failed\n"),
+            (ServiceAction::Stop, "active", "show\nstop\nshow\n"),
+            (ServiceAction::Stop, "inactive", "show\n"),
+            (ServiceAction::Stop, "deactivating", "show\nstop\nshow\n"),
         ] {
             let temporary = tempfile::TempDir::new()?;
             let service_log = temporary.path().join("service.log");

@@ -14,7 +14,7 @@ use miette::Diagnostic;
 use rustix::fs::{CWD, RenameFlags, renameat_with};
 use thiserror::Error;
 
-use crate::service::{ServiceAction, ServiceCommands, ServiceError};
+use crate::service::{ServiceCommands, ServiceError, ServiceGoal, UnitState};
 use crate::spawn::Launch;
 
 const UNIT: &[u8] = include_bytes!("../packaging/systemd/omabox.service");
@@ -125,24 +125,24 @@ impl Default for Commands {
 #[derive(Clone, Copy)]
 struct ServiceState {
     enabled: bool,
-    running: bool,
+    unit: UnitState,
 }
 
 impl ServiceState {
     fn read(commands: &Commands) -> Result<Self, InstallError> {
         Ok(Self {
             enabled: commands.services.is_enabled()?,
-            running: commands.services.is_active()?,
+            unit: commands.services.state()?,
         })
     }
 
     fn restore(self, commands: &Commands, restore_enabled: bool) -> Result<(), InstallError> {
         if restore_enabled && self.enabled {
-            commands.services.control(ServiceAction::Enable)?;
+            commands.services.enable()?;
         }
-        if self.running {
-            commands.services.control(ServiceAction::Start)?;
-        }
+        commands
+            .services
+            .drive(ServiceGoal::Restore(Some(self.unit)))?;
         Ok(())
     }
 }
@@ -176,48 +176,73 @@ fn install(
         Err(source) => return Err(cleanup_failure(source, transaction.cleanup_prepared())),
     };
     publish(&mut transaction, commands, state, false)?;
-
-    let launch = if state.running {
-        commands
-            .services
-            .control(ServiceAction::Restart)
-            .map_err(InstallError::Service)
+    let done = if action == InstallAction::Install {
+        "installed"
     } else {
-        Ok(())
+        "upgraded"
     };
-    if let Err(source) = launch {
-        return Err(restore_after_failure(
-            source,
-            &mut transaction,
-            commands,
-            state,
-            false,
-            true,
-        ));
+    let enabled = if state.enabled { "enabled" } else { "disabled" };
+
+    match state.unit {
+        // A service that reached readiness shows the old build worked, so a failed restart rolls back to it.
+        UnitState::Running => {
+            if let Err(source) = commands.services.drive(ServiceGoal::Restart) {
+                return Err(restore_after_failure(
+                    InstallError::Service(source),
+                    &mut transaction,
+                    commands,
+                    state,
+                    false,
+                    true,
+                ));
+            }
+            transaction.finish()?;
+            Ok(format!(
+                "Omabox was {done}. The service remains {enabled} and running.\n"
+            ))
+        }
+        // A starting service has not shown the old build works and may still run it, so the new build is kept and replaces it.
+        UnitState::Starting => {
+            transaction.finish()?;
+            commands
+                .services
+                .drive(ServiceGoal::Restart)
+                .map_err(|source| InstallError::StartAfterChange { done, source })?;
+            Ok(format!(
+                "Omabox was {done}. The service remains {enabled} and running.\n"
+            ))
+        }
+        // A failed unit usually stopped for a cause the old build shares, so the new build is kept before Recover starts it.
+        UnitState::Failed | UnitState::Stopping | UnitState::Stopped => {
+            transaction.finish()?;
+            let driven = commands
+                .services
+                .drive(ServiceGoal::Recover)
+                .map_err(|source| InstallError::StartAfterChange { done, source })?;
+            Ok(if driven.launched {
+                format!(
+                    "Omabox was {done}. The service remains {enabled}. The stopped service has been started again.\n"
+                )
+            } else {
+                format!("Omabox was {done}. The service remains {enabled} and stopped.\n")
+            })
+        }
     }
-    transaction.finish()?;
-    Ok(format!(
-        "Omabox was {}. The service remains {} and {}.\n",
-        if action == InstallAction::Install {
-            "installed"
-        } else {
-            "upgraded"
-        },
-        if state.enabled { "enabled" } else { "disabled" },
-        if state.running { "running" } else { "stopped" }
-    ))
 }
 
 fn uninstall(layout: &Layout, commands: &Commands) -> Result<String, InstallError> {
     let mut transaction = Transaction::remove(layout)?;
     ensure_shell_unlocked(commands)?;
     let state = ServiceState::read(commands)?;
-    if state.running {
-        commands.services.control(ServiceAction::Stop)?;
-    }
-    if state.enabled
-        && let Err(source) = commands.services.control(ServiceAction::Disable)
-    {
+    // Leave no failed unit behind once its files are gone.
+    let released = commands.services.drive(ServiceGoal::Halt).and_then(|_| {
+        if state.enabled {
+            commands.services.disable()
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(source) = released {
         let source = InstallError::Service(source);
         return Err(rollback_failure(source, state.restore(commands, true)));
     }
@@ -821,6 +846,18 @@ pub enum InstallError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Service(#[from] ServiceError),
+    #[error("Omabox was {done}, but the Omabox service could not be started or checked")]
+    #[diagnostic(
+        code(omabox::install::start_after_change),
+        help(
+            "The new build is kept. Run `omabox status` and `omabox logs` to see why, then `omabox resume`."
+        )
+    )]
+    StartAfterChange {
+        done: &'static str,
+        #[source]
+        source: ServiceError,
+    },
     #[error("the lifecycle operation failed and rollback also failed: {restore}")]
     #[diagnostic(code(omabox::install::rollback_failed))]
     RollbackFailed {
@@ -857,7 +894,7 @@ mod tests {
 
     impl Fixture {
         fn new(
-            active: bool,
+            active_state: &str,
             enabled: bool,
             fail_reload_once: bool,
             fail_restart_once: bool,
@@ -881,9 +918,9 @@ mod tests {
             fs::write(
                 &systemctl,
                 format!(
-                    "printf '%s\\n' \"$2\" >> '{}'\ncase \"$2\" in\n is-active) exit {};;\n is-enabled) exit {};;\n daemon-reload) if [ {} -eq 1 ] && [ ! -e '{}' ]; then : > '{}'; exit 1; fi;;\n restart) if [ {} -eq 1 ] && [ ! -e '{}' ]; then : > '{}'; exit 1; fi;;\nesac\nexit 0\n",
+                    "printf '%s\\n' \"$2\" >> '{}'\ncase \"$2\" in\n show) printf '%s\\n' '{}';;\n is-enabled) exit {};;\n daemon-reload) if [ {} -eq 1 ] && [ ! -e '{}' ]; then : > '{}'; exit 1; fi;;\n restart) if [ {} -eq 1 ] && [ ! -e '{}' ]; then : > '{}'; exit 1; fi;;\nesac\nexit 0\n",
                     systemctl_log.display(),
-                    if active { 0 } else { 3 },
+                    active_state,
                     if enabled { 0 } else { 1 },
                     if fail_reload_once { 1 } else { 0 },
                     failed_reload.display(),
@@ -1012,51 +1049,60 @@ mod tests {
 
     #[test]
     fn upgrade_validates_replaces_and_preserves_service_state() -> Result<(), Box<dyn Error>> {
-        let fixture = Fixture::new(true, true, false, false)?;
-        fixture.old_install()?;
-        let report = execute_with(
-            InstallAction::Upgrade,
-            &fixture.layout,
-            &fixture.sources,
-            &fixture.commands,
-        )?;
+        for state in ["active", "activating"] {
+            let fixture = Fixture::new(state, true, false, false)?;
+            fixture.old_install()?;
+            let report = execute_with(
+                InstallAction::Upgrade,
+                &fixture.layout,
+                &fixture.sources,
+                &fixture.commands,
+            )?;
 
-        assert_eq!(
-            report,
-            "Omabox was upgraded. The service remains enabled and running.\n"
-        );
-        assert_eq!(
-            fs::read(&fixture.layout.omabox)?,
-            b"#!/bin/sh\necho omabox\n"
-        );
-        assert_eq!(fs::read(&fixture.layout.omaboxd)?, VALID_DAEMON);
-        assert_eq!(fs::read(&fixture.layout.unit)?, UNIT);
-        for (name, contents) in PLUGIN {
-            assert_eq!(fs::read(fixture.layout.plugin.join(name))?, contents);
+            assert_eq!(
+                report, "Omabox was upgraded. The service remains enabled and running.\n",
+                "{state}"
+            );
+            assert_eq!(
+                fs::read(&fixture.layout.omabox)?,
+                b"#!/bin/sh\necho omabox\n",
+                "{state}"
+            );
+            assert_eq!(fs::read(&fixture.layout.omaboxd)?, VALID_DAEMON, "{state}");
+            assert_eq!(fs::read(&fixture.layout.unit)?, UNIT, "{state}");
+            for (name, contents) in PLUGIN {
+                assert_eq!(
+                    fs::read(fixture.layout.plugin.join(name))?,
+                    contents,
+                    "{state}"
+                );
+            }
+            assert_eq!(
+                fs::read_to_string(&fixture.systemctl_log)?,
+                "is-enabled\nshow\ndaemon-reload\nreset-failed\nrestart\n",
+                "{state}"
+            );
+            let validator = fs::read_to_string(&fixture.omarchy_log)?;
+            let Some(staged_plugin) = validator.lines().nth(2) else {
+                return Err(io::Error::other("validator did not receive a plugin path").into());
+            };
+            assert!(
+                !Path::new(staged_plugin).starts_with(
+                    fixture
+                        .layout
+                        .plugin
+                        .parent()
+                        .ok_or_else(|| io::Error::other("plugin path had no parent"))?
+                ),
+                "{state}"
+            );
         }
-        assert_eq!(
-            fs::read_to_string(&fixture.systemctl_log)?,
-            "is-enabled\nis-active\ndaemon-reload\nrestart\n"
-        );
-        let validator = fs::read_to_string(&fixture.omarchy_log)?;
-        let Some(staged_plugin) = validator.lines().nth(2) else {
-            return Err(io::Error::other("validator did not receive a plugin path").into());
-        };
-        assert!(
-            !Path::new(staged_plugin).starts_with(
-                fixture
-                    .layout
-                    .plugin
-                    .parent()
-                    .ok_or_else(|| io::Error::other("plugin path had no parent"))?
-            )
-        );
         Ok(())
     }
 
     #[test]
     fn restart_failure_restores_old_artifacts_and_running_service() -> Result<(), Box<dyn Error>> {
-        let fixture = Fixture::new(true, true, false, true)?;
+        let fixture = Fixture::new("active", true, false, true)?;
         fixture.old_install()?;
 
         let result = execute_with(
@@ -1077,7 +1123,7 @@ mod tests {
         assert_eq!(fs::read(fixture.layout.plugin.join("old.qml"))?, b"old");
         assert_eq!(
             fs::read_to_string(&fixture.systemctl_log)?,
-            "is-enabled\nis-active\ndaemon-reload\nrestart\ndaemon-reload\nstart\n"
+            "is-enabled\nshow\ndaemon-reload\nreset-failed\nrestart\ndaemon-reload\nreset-failed\nstart\n"
         );
         Ok(())
     }
@@ -1085,12 +1131,12 @@ mod tests {
     #[test]
     fn service_restore_failure_preserves_recovery_artifacts_and_both_errors()
     -> Result<(), Box<dyn Error>> {
-        let fixture = Fixture::new(true, true, false, false)?;
+        let fixture = Fixture::new("active", true, false, false)?;
         fixture.old_install()?;
         fs::write(
             &fixture.systemctl,
             format!(
-                "printf '%s\\n' \"$2\" >> '{}'\ncase \"$2\" in\n is-active|is-enabled) exit 0;;\n restart) exit 7;;\n start) exit 8;;\nesac\nexit 0\n",
+                "printf '%s\\n' \"$2\" >> '{}'\ncase \"$2\" in\n is-enabled) exit 0;;\n show) printf 'active\\n';;\n restart) exit 7;;\n start) exit 8;;\nesac\nexit 0\n",
                 fixture.systemctl_log.display(),
             ),
         )?;
@@ -1139,14 +1185,14 @@ mod tests {
         assert_eq!(fs::read(&recovery[0])?, b"#!/bin/sh\necho omabox\n");
         assert_eq!(
             fs::read_to_string(&fixture.systemctl_log)?,
-            "is-enabled\nis-active\ndaemon-reload\nrestart\ndaemon-reload\nstart\n"
+            "is-enabled\nshow\ndaemon-reload\nreset-failed\nrestart\ndaemon-reload\nreset-failed\nstart\n"
         );
         Ok(())
     }
 
     #[test]
     fn rollback_failure_preserves_remaining_old_backups() -> Result<(), Box<dyn Error>> {
-        let fixture = Fixture::new(true, true, false, false)?;
+        let fixture = Fixture::new("active", true, false, false)?;
         fixture.old_install()?;
         let unit_parent = fixture
             .layout
@@ -1156,7 +1202,7 @@ mod tests {
         fs::write(
             &fixture.systemctl,
             format!(
-                "printf '%s\\n' \"$2\" >> '{}'\ncase \"$2\" in\n is-active|is-enabled) exit 0;;\n restart) for backup in '{}/.omabox.service.install.'*; do if [ -e \"$backup\" ]; then rm -f -- \"$backup\"; fi; done; exit 7;;\nesac\nexit 0\n",
+                "printf '%s\\n' \"$2\" >> '{}'\ncase \"$2\" in\n is-enabled) exit 0;;\n show) printf 'active\\n';;\n restart) for backup in '{}/.omabox.service.install.'*; do if [ -e \"$backup\" ]; then rm -f -- \"$backup\"; fi; done; exit 7;;\nesac\nexit 0\n",
                 fixture.systemctl_log.display(),
                 unit_parent.display(),
             ),
@@ -1200,7 +1246,7 @@ mod tests {
     #[test]
     fn lock_transition_during_rollback_preserves_live_and_backup_plugins()
     -> Result<(), Box<dyn Error>> {
-        let fixture = Fixture::new(true, true, false, true)?;
+        let fixture = Fixture::new("active", true, false, true)?;
         fixture.old_install()?;
         let lock_checks = fixture._temporary.path().join("rollback-lock-checks");
         fs::write(
@@ -1241,7 +1287,7 @@ mod tests {
 
     #[test]
     fn fresh_install_publishes_missing_artifacts_and_stays_stopped() -> Result<(), Box<dyn Error>> {
-        let fixture = Fixture::new(false, false, false, false)?;
+        let fixture = Fixture::new("inactive", false, false, false)?;
         let report = execute_with(
             InstallAction::Install,
             &fixture.layout,
@@ -1262,14 +1308,14 @@ mod tests {
         assert!(fixture.layout.plugin.join("Panel.qml").is_file());
         assert_eq!(
             fs::read_to_string(&fixture.systemctl_log)?,
-            "is-enabled\nis-active\ndaemon-reload\n"
+            "is-enabled\nshow\ndaemon-reload\nshow\n"
         );
         Ok(())
     }
 
     #[test]
     fn reload_failure_restores_old_artifacts_before_restart() -> Result<(), Box<dyn Error>> {
-        let fixture = Fixture::new(true, true, true, false)?;
+        let fixture = Fixture::new("active", true, true, false)?;
         fixture.old_install()?;
         let result = execute_with(
             InstallAction::Upgrade,
@@ -1289,14 +1335,14 @@ mod tests {
         assert_eq!(fs::read(fixture.layout.plugin.join("old.qml"))?, b"old");
         assert_eq!(
             fs::read_to_string(&fixture.systemctl_log)?,
-            "is-enabled\nis-active\ndaemon-reload\ndaemon-reload\n"
+            "is-enabled\nshow\ndaemon-reload\ndaemon-reload\n"
         );
         Ok(())
     }
 
     #[test]
     fn validation_failure_changes_nothing_live() -> Result<(), Box<dyn Error>> {
-        let fixture = Fixture::new(true, true, false, false)?;
+        let fixture = Fixture::new("active", true, false, false)?;
         fixture.old_install()?;
         fs::write(fixture.commands.omarchy.path(), "exit 9\n")?;
         let result = execute_with(
@@ -1325,7 +1371,7 @@ mod tests {
     #[test]
     fn staged_daemon_self_check_failure_preserves_published_artifacts() -> Result<(), Box<dyn Error>>
     {
-        let fixture = Fixture::new(true, true, false, false)?;
+        let fixture = Fixture::new("active", true, false, false)?;
         fixture.old_install()?;
         release_artifact(&fixture.sources.omaboxd, b"#!/bin/sh\nexit 9\n")?;
 
@@ -1414,7 +1460,7 @@ mod tests {
 
     #[test]
     fn empty_daemon_is_rejected_before_any_live_change() -> Result<(), Box<dyn Error>> {
-        let fixture = Fixture::new(false, false, false, false)?;
+        let fixture = Fixture::new("inactive", false, false, false)?;
         fs::write(&fixture.sources.omaboxd, [])?;
         let result = execute_with(
             InstallAction::Install,
@@ -1432,7 +1478,7 @@ mod tests {
 
     #[test]
     fn locked_shell_prevents_any_live_artifact_change() -> Result<(), Box<dyn Error>> {
-        let fixture = Fixture::new(true, true, false, false)?;
+        let fixture = Fixture::new("active", true, false, false)?;
         fixture.old_install()?;
         fs::write(fixture.commands.omarchy_shell.path(), "printf 'true\\n'\n")?;
         let result = execute_with(
@@ -1451,7 +1497,7 @@ mod tests {
 
     #[test]
     fn lock_before_plugin_restores_earlier_artifacts_and_service() -> Result<(), Box<dyn Error>> {
-        let fixture = Fixture::new(true, true, false, false)?;
+        let fixture = Fixture::new("active", true, false, false)?;
         fixture.old_install()?;
         let lock_checks = fixture._temporary.path().join("lock-checks");
         fs::write(
@@ -1483,14 +1529,14 @@ mod tests {
         assert_eq!(fs::read_to_string(lock_checks)?, "3\n");
         assert_eq!(
             fs::read_to_string(&fixture.systemctl_log)?,
-            "is-enabled\nis-active\nstop\ndisable\ndaemon-reload\nenable\nstart\n"
+            "is-enabled\nshow\nshow\nstop\nshow\ndisable\ndaemon-reload\nenable\nreset-failed\nstart\n"
         );
         Ok(())
     }
 
     #[test]
     fn uninstall_removes_only_artifacts_and_retains_user_data() -> Result<(), Box<dyn Error>> {
-        let fixture = Fixture::new(true, true, false, false)?;
+        let fixture = Fixture::new("active", true, false, false)?;
         fixture.old_install()?;
         let retained = [
             fixture.layout.home.join(".config/omabox/config.toml"),
@@ -1532,7 +1578,214 @@ mod tests {
         assert!(report.contains("Secret Service credentials"));
         assert_eq!(
             fs::read_to_string(&fixture.systemctl_log)?,
-            "is-enabled\nis-active\nstop\ndisable\ndaemon-reload\n"
+            "is-enabled\nshow\nshow\nstop\nshow\ndisable\ndaemon-reload\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn upgrade_starts_a_failed_service_after_clearing_it() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new("failed", true, false, false)?;
+        fixture.old_install()?;
+        let report = execute_with(
+            InstallAction::Upgrade,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        )?;
+
+        assert_eq!(
+            report,
+            "Omabox was upgraded. The service remains enabled. The stopped service has been started again.\n"
+        );
+        assert_eq!(fs::read(&fixture.layout.omaboxd)?, VALID_DAEMON);
+        assert_eq!(
+            fs::read_to_string(&fixture.systemctl_log)?,
+            "is-enabled\nshow\ndaemon-reload\nshow\nreset-failed\nstart\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn upgrade_keeps_the_new_build_when_a_failed_service_still_fails() -> Result<(), Box<dyn Error>>
+    {
+        let fixture = Fixture::new("failed", true, false, false)?;
+        fixture.old_install()?;
+        fs::write(
+            &fixture.systemctl,
+            format!(
+                "printf '%s\\n' \"$2\" >> '{}'\ncase \"$2\" in\n is-enabled) exit 0;;\n show) printf 'failed\\n';;\n start) exit 1;;\nesac\nexit 0\n",
+                fixture.systemctl_log.display(),
+            ),
+        )?;
+
+        let result = execute_with(
+            InstallAction::Upgrade,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(InstallError::StartAfterChange {
+                    done: "upgraded",
+                    ..
+                })
+            ),
+            "upgrade reported {result:?}"
+        );
+        assert_eq!(
+            fs::read(&fixture.layout.omabox)?,
+            b"#!/bin/sh\necho omabox\n"
+        );
+        assert_eq!(fs::read(&fixture.layout.omaboxd)?, VALID_DAEMON);
+        assert_eq!(fs::read(&fixture.layout.unit)?, UNIT);
+        assert!(!fixture.layout.plugin.join("old.qml").exists());
+        assert_eq!(
+            fs::read_to_string(&fixture.systemctl_log)?,
+            "is-enabled\nshow\ndaemon-reload\nshow\nreset-failed\nstart\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn upgrade_keeps_the_new_build_when_a_starting_service_fails_to_restart()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new("activating", true, false, true)?;
+        fixture.old_install()?;
+
+        let result = execute_with(
+            InstallAction::Upgrade,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(InstallError::StartAfterChange {
+                    done: "upgraded",
+                    ..
+                })
+            ),
+            "upgrade reported {result:?}"
+        );
+        assert_eq!(
+            fs::read(&fixture.layout.omabox)?,
+            b"#!/bin/sh\necho omabox\n"
+        );
+        assert_eq!(fs::read(&fixture.layout.omaboxd)?, VALID_DAEMON);
+        assert_eq!(fs::read(&fixture.layout.unit)?, UNIT);
+        assert!(!fixture.layout.plugin.join("old.qml").exists());
+        assert_eq!(
+            fs::read_to_string(&fixture.systemctl_log)?,
+            "is-enabled\nshow\ndaemon-reload\nreset-failed\nrestart\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn upgrade_settles_a_stopping_service() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new("deactivating", true, false, false)?;
+        fixture.old_install()?;
+        let report = execute_with(
+            InstallAction::Upgrade,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        )?;
+
+        assert_eq!(
+            report,
+            "Omabox was upgraded. The service remains enabled and stopped.\n"
+        );
+        assert_eq!(fs::read(&fixture.layout.omaboxd)?, VALID_DAEMON);
+        assert_eq!(
+            fs::read_to_string(&fixture.systemctl_log)?,
+            "is-enabled\nshow\ndaemon-reload\nshow\nstop\nshow\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn uninstall_stops_a_starting_or_stopping_service() -> Result<(), Box<dyn Error>> {
+        for active_state in ["activating", "deactivating"] {
+            let fixture = Fixture::new(active_state, true, false, false)?;
+            fixture.old_install()?;
+            execute_with(
+                InstallAction::Uninstall,
+                &fixture.layout,
+                &fixture.sources,
+                &fixture.commands,
+            )?;
+
+            assert!(!fixture.layout.omaboxd.exists(), "{active_state}");
+            assert_eq!(
+                fs::read_to_string(&fixture.systemctl_log)?,
+                "is-enabled\nshow\nshow\nstop\nshow\ndisable\ndaemon-reload\n",
+                "{active_state}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn uninstall_restores_the_service_when_the_state_after_stop_fails() -> Result<(), Box<dyn Error>>
+    {
+        let fixture = Fixture::new("active", true, false, false)?;
+        fixture.old_install()?;
+        let shown = fixture._temporary.path().join("shown");
+        fs::write(
+            &fixture.systemctl,
+            format!(
+                "printf '%s\\n' \"$2\" >> '{}'\ncase \"$2\" in\n is-enabled) exit 0;;\n show) count=0; if [ -f '{}' ]; then read count < '{}'; fi; count=$((count + 1)); printf '%s\\n' \"$count\" > '{}'; if [ \"$count\" -ge 3 ]; then exit 1; fi; printf 'active\\n';;\nesac\nexit 0\n",
+                fixture.systemctl_log.display(),
+                shown.display(),
+                shown.display(),
+                shown.display(),
+            ),
+        )?;
+
+        let result = execute_with(
+            InstallAction::Uninstall,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        assert!(matches!(
+            result,
+            Err(InstallError::Service(ServiceError::Unsuccessful {
+                command: "systemctl show",
+                ..
+            }))
+        ));
+        assert!(fixture.layout.omaboxd.exists());
+        assert_eq!(
+            fs::read_to_string(&fixture.systemctl_log)?,
+            "is-enabled\nshow\nshow\nstop\nshow\nenable\nreset-failed\nstart\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn uninstall_clears_a_failed_service() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new("failed", true, false, false)?;
+        fixture.old_install()?;
+        execute_with(
+            InstallAction::Uninstall,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        )?;
+
+        assert!(!fixture.layout.omaboxd.exists());
+        assert_eq!(
+            fs::read_to_string(&fixture.systemctl_log)?,
+            "is-enabled\nshow\nshow\nreset-failed\ndisable\ndaemon-reload\n"
         );
         Ok(())
     }
