@@ -19,11 +19,11 @@
 \ search permission only. An io failure's errno stays in FS:ERRNO, 0 where
 \ the Habu word that failed keeps none.
 \ LOCAL logs a failure once, with its text, where it throws, unless the
-\ failure is the outcome of an entry the scan observes: inside an
-\ observation a failure logs nothing, except one whose errno is
-\ exhaustion, which ends the scan; so a file that changes while it is
-\ hashed logs nothing on every pass. A failure XATTR logged gets no
-\ second line.
+\ catch around it turns it into an outcome: CONVERTING runs a word under a
+\ predicate naming the codes and errnos its caller converts, and QUIET?
+\ asks the innermost one. A scan's observation converts what ENTRY-CODE?
+\ names and rethrows the rest, which logs and ends the scan; a failure
+\ XATTR logged gets no second line.
 \ The scan walks the root depth first, each directory's names in byte order,
 \ and collects observations, cached hashes it may reuse and files to hash; a
 \ failure that concerns one entry publishes that entry as unknown and drops
@@ -34,7 +34,7 @@
 \ name hasher, the marker and slot state buffers, the slot name and path
 \ buffers, a lease's slot table, the byte a partial's end is probed with,
 \ an upload collection's listing buffer and names, the scan's directory
-\ listing context and the depth of the entry observations open; one task
+\ listing context and the predicate of the innermost CONVERTING; one task
 \ syncs, so one uses them at a time. CALLER-OWNED: every descriptor
 \ answered, the hashes, names, paths, vectors, staged uploads and partials
 \ laid in the caller's arena, the paths a stage's result names and a
@@ -118,29 +118,40 @@ $2E constant DOT
    {: e:n :}
    e FS:ENOENT = e FS:ENOTDIR = or e FS:ELOOP = or e FS:ESTALE = or ;
 
-\ How many entry observations OBSERVING has open; inside one, a failure
-\ is the entry's outcome unless its errno, 0 for none, is exhaustion.
-variable OBSERVING-DEPTH
-\ How many rethrows of a failure XATTR logged LOGGED has open.
-variable LOGGED-DEPTH
+\ The failures that are an observed entry's outcome, as Rust's
+\ entry_unknown publishes them: an io failure with no errno still concerns
+\ the one object, and exhaustion, which says nothing about it, fails the
+\ scan.
+: ENTRY-CODE? ( n n -- bool )
+   {: code:n e:n :}
+   code E-UNSUPPORTED = code E-CHANGED = or code E-UNREADABLE = or if
+      true exit
+   then
+   code E-IO = e EXHAUSTED? 0= and ;
 
-\ Whether LOCAL logs nothing for a failure with errno e, 0 for none.
-: QUIET? ( n -- bool )
-   {: e:n :}
-   LOGGED-DEPTH @ 0 > if true exit then
-   OBSERVING-DEPTH @ 0 > e EXHAUSTED? 0= and ;
+: NONE-CONVERTED ( n n -- bool ) 2drop false ;
 
-\ Runs q, which observes one entry, and answers what it threw, 0 for none.
-: OBSERVING ( [ -- ] -- n )
-   {: q :}
-   1 OBSERVING-DEPTH +!
+\ The predicate of the innermost CONVERTING: the code and errno of each
+\ failure its caller turns into an outcome.
+TYPED-VARIABLE CONVERTS [ n n -- bool ]
+' NONE-CONVERTED CONVERTS !
+
+\ Whether LOCAL logs nothing for a failure: its catcher converts it.
+: QUIET? ( n n -- bool ) CONVERTS @ execute ;
+
+\ Runs q with converted? as the predicate QUIET? asks, the outer one back
+\ on every exit; answers what q threw, 0 for none.
+: CONVERTING ( R [ R -- R ] [ n n -- bool ] -- R n )
+   {: q converted? :}
+   CONVERTS @ {: outer :}
+   converted? CONVERTS !
    [: q execute ;] catch
-   -1 OBSERVING-DEPTH +! ;
+   outer CONVERTS ! ;
 
 \ Logs "local path `p`" and the text after it, then throws code.
 : PATH-FAILS ( ^u8 n ^u8 n n -- )
    {: p:^ u:n t:^ tu:n code:n :}
-   0 QUIET? 0= if
+   code FS:ERRNO QUIET? 0= if
       LOG-OPEN s" local path " LOG:TEXT+ p u QUOTED+
       t tu LOG:TEXT+ LOG:;LINE
    then
@@ -160,7 +171,7 @@ variable LOGGED-DEPTH
 \ The operation, then the path, as every word below takes them.
 : CHANGED-FAILS ( ^u8 n ^u8 n n -- )
    {: o:^ ou:n p:^ u:n code:n :}
-   0 QUIET? 0= if
+   code FS:ERRNO QUIET? 0= if
       LOG-OPEN s" local path " LOG:TEXT+ p u QUOTED+
       s"  changed during " LOG:TEXT+ o ou QUOTED+ LOG:;LINE
    then
@@ -170,7 +181,7 @@ variable LOGGED-DEPTH
 
 : INVALID-HASH ( ^u8 n -- )
    {: o:^ ou:n :}
-   0 QUIET? 0= if
+   E-CONTENT-HASH FS:ERRNO QUIET? 0= if
       LOG-OPEN s" operation " LOG:TEXT+ o ou QUOTED+
       s"  requires a lowercase Dropbox content hash" LOG:TEXT+ LOG:;LINE
    then
@@ -178,7 +189,7 @@ variable LOGGED-DEPTH
 
 : CORRUPT ( ^u8 n ^u8 n -- )
    {: o:^ ou:n p:^ u:n :}
-   0 QUIET? 0= if
+   E-CORRUPT FS:ERRNO QUIET? 0= if
       LOG-OPEN s" private local file for " LOG:TEXT+ o ou QUOTED+
       s"  at " LOG:TEXT+ p u QUOTED+
       s"  failed content verification" LOG:TEXT+ LOG:;LINE
@@ -187,7 +198,7 @@ variable LOGGED-DEPTH
 
 : OCCUPIED ( ^u8 n ^u8 n -- )
    {: o:^ ou:n p:^ u:n :}
-   0 QUIET? 0= if
+   E-OCCUPIED FS:ERRNO QUIET? 0= if
       LOG-OPEN s" non-overwriting operation " LOG:TEXT+ o ou QUOTED+
       s"  found unrelated bytes at " LOG:TEXT+ p u QUOTED+ LOG:;LINE
    then
@@ -198,7 +209,7 @@ variable LOGGED-DEPTH
 : IO-FAILS ( ^u8 n ^u8 n n -- )
    {: o:^ ou:n p:^ u:n code:n :}
    FS:ERRNO {: e:n :}
-   e QUIET? 0= if
+   code e QUIET? 0= if
       LOG-OPEN s" local filesystem operation " LOG:TEXT+ o ou QUOTED+
       s"  failed for " LOG:TEXT+ p u QUOTED+ e ERRNO+ LOG:;LINE
    then
@@ -215,7 +226,7 @@ variable LOGGED-DEPTH
 : STAGE-READ ( ^u8 n ^u8 n -- )
    {: o:^ ou:n p:^ u:n :}
    FS:ERRNO {: e:n :}
-   e QUIET? 0= if
+   E-STAGE-READ e QUIET? 0= if
       LOG-OPEN s" could not read stage input during " LOG:TEXT+
       o ou QUOTED+ s"  for " LOG:TEXT+ p u QUOTED+ e ERRNO+ LOG:;LINE
    then
@@ -229,7 +240,7 @@ variable LOGGED-DEPTH
 
 : HASH-READ ( -- )
    FS:ERRNO {: e:n :}
-   e QUIET? 0= if
+   E-HASH-READ e QUIET? 0= if
       LOG-OPEN
       s" could not read bytes while computing the Dropbox content hash"
       LOG:TEXT+ e ERRNO+ LOG:;LINE
@@ -243,13 +254,9 @@ variable LOGGED-DEPTH
    code XATTR:E-XATTR = if true exit then
    code E-FS-LAST >= code E-FS-FIRST <= and ;
 
-\ Runs fail, which throws, with LOCAL's log off: XATTR logs each E-XATTR
-\ an attribute name LOCAL passes can draw.
-: LOGGED ( [ -- ] -- )
-   {: fail :}
-   1 LOGGED-DEPTH +!
-   [: fail execute ;] catch
-   -1 LOGGED-DEPTH +! throw ;
+\ Every failure fail throws for an E-XATTR restates the one XATTR logged:
+\ XATTR logs each E-XATTR an attribute name LOCAL passes can draw.
+: XATTR-LOGGED? ( n n -- bool ) 2drop true ;
 
 \ Runs q from a clear FS:ERRNO; an FS code it throws runs fail, which
 \ throws LOCAL's code in its place, logged unless XATTR logged it.
@@ -259,7 +266,10 @@ variable LOGGED-DEPTH
    [: q execute ;] catch {: code:n :}
    code 0= if exit then
    code FS-CODE? if
-      code XATTR:E-XATTR = if fail LOGGED else fail execute then
+      code XATTR:E-XATTR = if
+         fail ['] XATTR-LOGGED? CONVERTING {: c:n :}
+         c 0<> if c throw then
+      else fail execute then
    then
    code throw ;
 
@@ -1232,28 +1242,18 @@ defer SCAN-SUBTREE ( fd str scan-context scan-entries -- )
       ENDOF
    ;MATCH ;
 
-\ Rust's io_unknown_reason: none for exhaustion, which fails the scan; a
-\ failure with no errno still concerns the one object, so it is
-\ inaccessible.
-: IO-UNKNOWN-REASON ( n -- option<MODEL:unknown-reason> )
-   {: e:n :}
-   e EXHAUSTED? if OPTION:NONE exit then
-   e REPLACED? if MODEL-UNKNOWN--REASON:incomplete OPTION:SOME exit then
-   MODEL-UNKNOWN--REASON:inaccessible OPTION:SOME ;
-
-\ Rust's entry_unknown: the reason code, thrown while one entry was
-\ observed, publishes; wrong is what an object that is not a regular file
-\ means to the caller. Any other code is the scan's, rethrown.
+\ Rust's entry_unknown and io_unknown_reason: the reason code, thrown
+\ while one entry was observed, publishes; wrong is what an object that is
+\ not a regular file means to the caller. Any code ENTRY-CODE? does not
+\ name is the scan's, rethrown.
 : ENTRY-UNKNOWN ( n MODEL:unknown-reason -- MODEL:unknown-reason )
    {: code:n wrong:MODEL:unknown-reason :}
+   code FS:ERRNO ENTRY-CODE? 0= if code throw then
    code E-UNSUPPORTED = if wrong exit then
    code E-CHANGED = if MODEL-UNKNOWN--REASON:incomplete exit then
    code E-UNREADABLE = if MODEL-UNKNOWN--REASON:inaccessible exit then
-   code E-IO <> if code throw then
-   FS:ERRNO IO-UNKNOWN-REASON MATCH option
-      none OF code throw ENDOF
-      some OF ENDOF
-   ;MATCH ;
+   FS:ERRNO REPLACED? if MODEL-UNKNOWN--REASON:incomplete exit then
+   MODEL-UNKNOWN--REASON:inaccessible ;
 
 \ Rust's walk_unknown: an entry the walk meets.
 : WALK-UNKNOWN ( n -- MODEL:unknown-reason )
@@ -1271,7 +1271,8 @@ defer SCAN-SUBTREE ( fd str scan-context scan-entries -- )
    path parent NAME-OF {: name:^ nu:n :}
    name nu MODEL:EXCLUDED-NAME? if exit then
    en MARK {: mk:scan-mark :}
-   [: dir name nu path cx en SCAN-ENTRY ;] OBSERVING {: code:n :}
+   [: dir name nu path cx en SCAN-ENTRY ;] ['] ENTRY-CODE? CONVERTING
+   {: code:n :}
    code 0= if exit then
    code WALK-UNKNOWN {: why:MODEL:unknown-reason :}
    en mk TRUNCATE
@@ -1345,7 +1346,7 @@ SUBTREE-INSTALL
    ( fd hash-job [ -- option<cutoff> ] ^ARENA:arena scan-hash-results -- )
    {: root:fd job:hash-job q ar:^ARENA:arena res:scan-hash-results :}
    [: root job q ar HASH-SCAN-FILE res RESULT-RECORDS VEC:PUSH ! ;]
-   OBSERVING {: code:n :}
+   ['] ENTRY-CODE? CONVERTING {: code:n :}
    code 0= if exit then
    code REVISITED-UNKNOWN {: why:MODEL:unknown-reason :}
    job HASH-JOB-UNMAKE {: path:str want:MODEL:fingerprint :}
@@ -1373,7 +1374,7 @@ SUBTREE-INSTALL
 
 : REVALIDATE-CACHED ( fd MODEL:hash-record scan-hash-results -- )
    {: root:fd r:MODEL:hash-record res:scan-hash-results :}
-   [: root r res CHECK-CACHED ;] OBSERVING {: code:n :}
+   [: root r res CHECK-CACHED ;] ['] ENTRY-CODE? CONVERTING {: code:n :}
    code 0= if exit then
    code REVISITED-UNKNOWN {: why:MODEL:unknown-reason :}
    res r RECORD-PATH >str why STILL-UNKNOWN ;
@@ -1418,7 +1419,8 @@ SUBTREE-INSTALL
    {: root:fd d:scanned-directory unknown :}
    d SCANNED-DIRECTORY-UNMAKE {: path:str before:stat :}
    path str> nip 0= if root before REVALIDATE-ROOT exit then
-   [: root path before unknown CHECK-DIRECTORY ;] OBSERVING {: code:n :}
+   [: root path before unknown CHECK-DIRECTORY ;] ['] ENTRY-CODE?
+   CONVERTING {: code:n :}
    code 0= if exit then
    path code REVISITED-UNKNOWN UNKNOWN-RECORD unknown VEC:PUSH ! ;
 
@@ -2082,13 +2084,13 @@ public
 
 private
 
-\ Whether a stage's failure means another entry holds its path: one not
-\ a regular file, or a symlink. Its callers catch only throws whose path
-\ is the stage's, so the code alone tells.
-: UPLOAD-STAGE-OCCUPIED? ( n -- bool )
-   {: code:n :}
+\ Whether a stage's failure, its code and errno, means another entry
+\ holds its path: one not a regular file, or a symlink. Its callers catch
+\ only throws whose path is the stage's, so the code alone tells.
+: UPLOAD-STAGE-OCCUPIED? ( n n -- bool )
+   {: code:n e:n :}
    code E-UNSUPPORTED = if true exit then
-   code E-IO = FS:ERRNO FS:ELOOP = and ;
+   code E-IO = e FS:ELOOP = and ;
 
 : NO-HASHED ( -- option<hashed> ) OPTION:NONE ;
 : DROP-HASHED ( option<hashed> -- ) drop ;
@@ -2102,9 +2104,9 @@ private
    {: dir:fd name:^ nu:n p:^ u:n ar:^ARENA:arena :}
    NO-HASHED [: DROP-HASHED dir name nu p u
       s" verify immutable upload stage" ar OPEN-AND-HASH-IF-PRESENT ;]
-   catch {: code:n :}
+   ['] UPLOAD-STAGE-OCCUPIED? CONVERTING {: code:n :}
    code 0= if false exit then
-   drop code UPLOAD-STAGE-OCCUPIED? if NO-HASHED true exit then
+   drop code FS:ERRNO UPLOAD-STAGE-OCCUPIED? if NO-HASHED true exit then
    code throw ;
 
 \ A stage file that does not hold want is disposable: it is removed when
@@ -2127,29 +2129,33 @@ private
       then ;] CLOSING
    f DISCARD ;
 
-\ WRITE-VERIFIED-STAGE of the source's bytes; an occupied stage path is
-\ destination-occupied, and a failed read of the source an io failure.
+\ WRITE-VERIFIED-STAGE of the source's bytes, true when a throw found the
+\ stage path occupied: then destination-occupied. A failed read of the
+\ source is an io failure.
 : WRITE-UPLOAD-STAGE
-   ( fd fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- stage-write )
+   ( fd fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- stage-write bool )
    {: src:fd dir:fd name:^ nu:n p:^ u:n want:DROPBOX:hash
       ar:^ARENA:arena :}
    STAGE-WRITE-CREATED [: DROP-STAGE-WRITE
       dir name nu p u want [: src -rot FD-READ ;] NO-MARKER
-      s" stage upload" ar WRITE-VERIFIED-STAGE ;] catch {: code:n :}
-   code 0= if exit then
-   drop code UPLOAD-STAGE-OCCUPIED? if
-      p u >str STAGE-WRITE-DESTINATION-OCCUPIED exit
+      s" stage upload" ar WRITE-VERIFIED-STAGE ;]
+   ['] UPLOAD-STAGE-OCCUPIED? CONVERTING {: code:n :}
+   code 0= if false exit then
+   drop code FS:ERRNO UPLOAD-STAGE-OCCUPIED? if
+      p u >str STAGE-WRITE-DESTINATION-OCCUPIED true exit
    then
    code LOCAL-CODE throw ;
 
-\ Stages the source's bytes; its stat must not change while they copy.
+\ Stages the source's bytes; its stat must not change while they copy,
+\ unless the stage path was occupied, answered before the second stat.
 : STAGE-SOURCE
    ( fd ^u8 n fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- stage-write )
    {: src:fd r:^ ru:n dir:fd name:^ nu:n p:^ u:n want:DROPBOX:hash
       ar:^ARENA:arena :}
    src r ru s" inspect upload source before staging" STAT-FD
    {: before:stat :}
-   src dir name nu p u want ar WRITE-UPLOAD-STAGE {: w:stage-write :}
+   src dir name nu p u want ar WRITE-UPLOAD-STAGE if exit then
+   {: w:stage-write :}
    src r ru s" inspect upload source after staging" STAT-FD
    before SAME-OBSERVATION 0= if
       s" stage upload" r ru E-SOURCE-CHANGED CHANGED-FAILS
@@ -2267,16 +2273,21 @@ private
       ENDOF
    ;MATCH ;
 
-\ Whether the file hashes to its name; a file that changed or stopped
-\ being regular while it was read does not.
+\ Whether a stage's failure, its code and errno, says it changed or
+\ stopped being regular while it was read.
+: UNSTABLE? ( n n -- bool )
+   {: code:n e:n :}
+   code E-CHANGED = code E-UNSUPPORTED = or ;
+
+\ Whether the file hashes to its name; an UNSTABLE? file does not.
 : HOLDS-ITS-NAME? ( fd ^u8 n ^u8 n ^ARENA:arena -- bool )
    {: f:fd name:^ nu:n p:^ u:n ar:^ARENA:arena :}
    false [: drop f p u s" verify upload stage for collection" ar
       E-UNSUPPORTED E-CHANGED HASH-STABLE-FILE
-      DROPBOX:HASH>STR str> name nu STR= ;] catch
-   {: code:n :}
+      DROPBOX:HASH>STR str> name nu STR= ;]
+   ['] UNSTABLE? CONVERTING {: code:n :}
    code 0= if exit then
-   drop code E-CHANGED = code E-UNSUPPORTED = or if false exit then
+   drop code FS:ERRNO UNSTABLE? if false exit then
    code throw ;
 
 \ Whether the name is still the opened file's entry, unchanged.

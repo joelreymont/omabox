@@ -1298,6 +1298,18 @@ SHA256-CTX-BYTES BUFFER: PART
    T-LABEL
    [: drop COLLECTION-CASE ;] IN-CASE-DIR ;
 
+\ A directory at the stage's path answers destination-occupied, a
+\ converted failure, so no LOCAL line goes to stderr.txt, which is removed.
+: OCCUPIED-QUIETLY ( ^u8 n DROPBOX:hash -- )
+   {: name:^ nu:n want:DROPBOX:hash :}
+   s" stderr.txt" AT STDERR:CAPTURE
+   [: name nu want UPLOAD-STAGE UPLOAD-OUTCOME$ HOLD
+      want STAGE-PATH T$= s" destination-occupied" T$= ;]
+   [: STDERR:;CAPTURE ;] finally
+   s" stderr.txt" AT ERR 256 FS:READ-ALL {: n :}
+   s" stderr.txt" AT FS:REMOVE-FILE
+   n 0 T= ;
+
 \ Each outcome STAGE-UPLOAD answers, from one source file.
 : UPLOAD-OUTCOME-CASES ( -- )
    UPLOAD-DIRS
@@ -1318,8 +1330,7 @@ SHA256-CTX-BYTES BUFFER: PART
    s" root/occupied" s" occupied bytes" PUT-FILE
    s" occupied bytes" HASH-OF {: occupied:DROPBOX:hash :}
    occupied STAGE-PATH FS:MAKE-DIR
-   s" occupied" occupied UPLOAD-STAGE UPLOAD-OUTCOME$ HOLD
-   occupied STAGE-PATH T$= s" destination-occupied" T$= ;
+   s" occupied" occupied OCCUPIED-QUIETLY ;
 
 : EACH-UPLOAD-STAGE-OUTCOME-IS-REACHED ( -- )
    s" each upload stage outcome is reached" T-LABEL
