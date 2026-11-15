@@ -821,32 +821,6 @@ pub enum LockError {
     },
 }
 
-/// A display and debug wrapper that never formats the wrapped value.
-///
-/// Use this for any credential-derived field passed to `tracing`. Omabox does
-/// not accept secrets in its configuration file.
-pub struct Redacted<'value, Value: ?Sized>(&'value Value);
-
-/// Wrap a sensitive log field so both `%field` and `?field` are redacted.
-#[must_use]
-pub const fn redacted<Value: ?Sized>(value: &Value) -> Redacted<'_, Value> {
-    Redacted(value)
-}
-
-impl<Value: ?Sized> fmt::Debug for Redacted<'_, Value> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let _ = self.0;
-        formatter.write_str("[REDACTED]")
-    }
-}
-
-impl<Value: ?Sized> fmt::Display for Redacted<'_, Value> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let _ = self.0;
-        formatter.write_str("[REDACTED]")
-    }
-}
-
 /// Initialize structured stderr logging for a CLI or daemon process.
 pub fn initialize_logging() -> Result<(), LoggingError> {
     let subscriber = tracing_subscriber::fmt()
@@ -1437,13 +1411,6 @@ mod tests {
         assert_eq!(xdg.config_home, Path::new("/configured/config"));
         assert_eq!(xdg.state_home, Path::new("/configured/state"));
         Ok(())
-    }
-
-    #[test]
-    fn redacted_fields_never_format_the_secret() {
-        let secret = "highly-sensitive-token";
-        assert_eq!(format!("{}", redacted(secret)), "[REDACTED]");
-        assert_eq!(format!("{:?}", redacted(secret)), "[REDACTED]");
     }
 
     #[test]

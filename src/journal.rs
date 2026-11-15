@@ -983,6 +983,7 @@ impl Journal {
     }
 
     /// Publish a complete local inventory as one replacement transaction.
+    #[cfg(test)]
     pub fn publish_local_inventory(
         &mut self,
         observations: &[LocalObservationRecord],
@@ -4826,33 +4827,6 @@ mod tests {
                 Path::new("ab/child.txt")
             ]
         );
-        Ok(())
-    }
-
-    #[test]
-    fn journal_local_inventory_is_a_complete_atomic_replacement() -> Result<(), Box<dyn Error>> {
-        let directory = TempDir::new()?;
-        let mut journal = Journal::open(journal_path(&directory))?;
-        let old = LocalObservationRecord {
-            path: PathBuf::from("old.txt"),
-            observation: Observation::Present(LocalFile::new(content("old"))),
-        };
-        journal.publish_local_inventory(std::slice::from_ref(&old))?;
-
-        let duplicate_path = PathBuf::from("duplicate.txt");
-        let invalid_replacement = [
-            LocalObservationRecord {
-                path: duplicate_path.clone(),
-                observation: Observation::ConfirmedAbsent,
-            },
-            LocalObservationRecord {
-                path: duplicate_path,
-                observation: Observation::Present(LocalFile::new(content("new"))),
-            },
-        ];
-        let failed = journal.publish_local_inventory(&invalid_replacement);
-        assert!(failed.is_err());
-        assert_eq!(journal.local_inventory()?, vec![old]);
         Ok(())
     }
 
