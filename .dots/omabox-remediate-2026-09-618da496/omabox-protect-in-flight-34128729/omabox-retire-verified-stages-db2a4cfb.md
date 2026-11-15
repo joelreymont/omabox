@@ -6,4 +6,4 @@ issue-type: task
 created-at: "2026-11-15T08:12:23.585840+02:00"
 ---
 
-Problem: superseding or ending a download plan leaves its verified download stage in the staging directory forever. Acceptance: after record_reconciliation, verified stages of ended download plans are removed with a parent fsync unless a live pending or blocked plan for the same path and content or an in-flight job holds them, startup pruning keeps download plans until then, DownloadLifecycle.tla models the retirement and passes TLC, and doc G names what landed (tests). Depends: none. Claim: unassigned.
+Problem: superseding or ending a download plan leaves its verified download stage in the staging directory forever. Acceptance: after a plan's reconciliation is recorded, the verified stages of ended or superseded download plans are removed with a sync of the parent directory, unless a live pending or blocked plan for the same path and content, or an in-flight job, still holds them; startup pruning keeps stages of download plans until then; the download lifecycle model in formal/ covers the retirement and TLC runs it clean (tests). Depends: none. Claim: unassigned.
