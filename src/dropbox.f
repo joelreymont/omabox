@@ -5,8 +5,9 @@
 \ block, so no option or header outlives its request. A call is a POST to
 \ <api>/2/<route>; a client with no access token refreshes first, and any 401
 \ refreshes and resends the call once, which answers unlinked if refused
-\ again. The long poll is a POST to <notify>/2/files/list_folder/longpoll
-\ with neither token nor root.
+\ again. Unlinked is logged once, where it is decided, and a confirmation
+\ that answers unlinked answers it in its call's place. The long poll is a
+\ POST to <notify>/2/files/list_folder/longpoll with neither token nor root.
 \ An answer is classified once: 200 done, 403 unlinked, 409 refused by its
 \ error tag, 422 refused invalid-root, 429, 408 and 5xx retry, a timeout or
 \ lost connection retry 0; anything else logs one line (route, status, at
@@ -655,13 +656,23 @@ ENUM verdict
    construct reply refused ;
 
 
+\ One line, the route and why: Dropbox refuses this app until the user
+\ logs in again.
+: UNLINKED ( ptr client ptr u8 n -- reply )
+   {: c why:ptr wu:n :}
+   LOG-OPEN
+   c CLIENT-ROUTE @ SPAN:$ LOG:TEXT+ s"  unlinked: " LOG:TEXT+
+   why wu LOG:TEXT+ LOG:;LINE
+   construct reply unlinked ;
+
+
 : CLASSIFY ( ptr client -- verdict )
    {: c :}
    c CLIENT-STATUS @ {: s:n :}
    s 0= if c LOST ANSWER exit then
    s 200 = if construct reply done ANSWER exit then
    s 401 = if construct verdict rejected exit then
-   s 403 = if construct reply unlinked ANSWER exit then
+   s 403 = if c s" 403" UNLINKED ANSWER exit then
    s 409 = if c REFUSED ANSWER exit then
    s 422 = if construct error invalid-root construct reply refused ANSWER exit then
    s CURL:>HTTP-STATUS CURL:UNAVAILABLE? if c WAITED ANSWER exit then
@@ -721,21 +732,23 @@ ENUM verdict
    construct reply done ;
 
 
-: GRANT ( ptr client -- reply )
-   {: c :}
+\ invalid_grant answers what `dead` answers.
+: GRANT ( ptr client [ ptr client -- reply ] -- reply )
+   {: c dead :}
    c ERROR-READ? if
-      c TAG$ s" invalid_grant" STR= if construct reply unlinked exit then
+      c TAG$ s" invalid_grant" STR= if c dead execute exit then
    then
    c s" a refused token request" E-BAD-REQUEST FAILED ;
 
 
-\ A token answer; `kept` reads a 200's tokens.
-: REFRESHED ( ptr client [ ptr client -- reply ] -- reply )
-   {: c kept :}
+\ A token answer; `kept` reads a 200's tokens and `dead` answers an
+\ invalid_grant.
+: REFRESHED ( ptr client [ ptr client -- reply ] [ ptr client -- reply ] -- reply )
+   {: c kept dead :}
    c CLIENT-STATUS @ {: s:n :}
    s 0= if c LOST exit then
    s 200 = if c kept execute exit then
-   s 400 = if c GRANT exit then
+   s 400 = if c dead GRANT exit then
    s CURL:>HTTP-STATUS CURL:UNAVAILABLE? if c WAITED exit then
    c s UNEXPECTED ;
 
@@ -757,7 +770,8 @@ ENUM verdict
 : REFRESH ( ptr client -- reply )
    {: c :}
    c [: FORM ;] TOKEN-POST
-   c [: KEPT-TOKEN ;] REFRESHED ;
+   c [: KEPT-TOKEN ;]
+   [: s" the refresh token was refused" UNLINKED ;] REFRESHED ;
 
 
 \ ---- a call
@@ -790,7 +804,7 @@ ENUM verdict
    again DONE? 0= if again exit then
    c o r ru body send ATTEMPT MATCH verdict
       answer OF ENDOF
-      rejected OF construct reply unlinked ENDOF
+      rejected OF c s" a refreshed token was refused" UNLINKED ENDOF
    ;MATCH ;
 
 
@@ -1610,13 +1624,14 @@ private
    construct kind deleted [: MADE-MEMBER ;] ENTRY-PARSE ;
 
 
-\ A confirmation that failed: retry, after the ms get_metadata asked for.
+\ A confirmation that failed: retry, after the ms get_metadata asked for;
+\ unlinked stands.
 : UNCONFIRMED ( reply -- reply )
    MATCH reply
       done OF 0 RETRY ENDOF
       refused OF drop 0 RETRY ENDOF
       retry OF RETRY ENDOF
-      unlinked OF 0 RETRY ENDOF
+      unlinked OF construct reply unlinked ENDOF
    ;MATCH ;
 
 
@@ -1626,6 +1641,15 @@ private
       refused OF construct error not-found DROPBOX-ERROR:EQ ENDOF
       retry OF drop false ENDOF
       unlinked OF false ENDOF
+   ;MATCH ;
+
+
+: UNLINKED? ( reply -- bool )
+   MATCH reply
+      done OF false ENDOF
+      refused OF drop false ENDOF
+      retry OF drop false ENDOF
+      unlinked OF true ENDOF
    ;MATCH ;
 
 
@@ -1649,12 +1673,15 @@ private
 
 \ A refused delete: not-found is done, as the path is absent; a conflict is
 \ done if the path is now not found, as a resent delete that Dropbox
-\ already applied answers; any other refusal stands.
+\ already applied answers, and unlinked if the confirmation is; any other
+\ refusal stands.
 : DELETE-REFUSED ( error ptr u8 n ptr client -- reply )
    {: e:error p:ptr pu:n c :}
    e construct error not-found DROPBOX-ERROR:EQ if c ABSENT exit then
    e construct error conflict DROPBOX-ERROR:EQ if
-      p pu c METADATA NOT-FOUND? if c ABSENT exit then
+      p pu c METADATA {: m:reply :}
+      m NOT-FOUND? if c ABSENT exit then
+      m UNLINKED? if m exit then
    then
    e construct reply refused ;
 
@@ -1669,12 +1696,15 @@ private
 
 \ A refused create-folder: a conflict is done if the path is now a folder,
 \ as a resent create-folder that Dropbox already applied answers, and the
-\ entry is that folder; any other refusal stands.
+\ entry is that folder, and unlinked if the confirmation is; any other
+\ refusal stands.
 : FOLDER-REFUSED ( error ptr u8 n ptr client -- reply )
    {: e:error p:ptr pu:n c :}
    e construct error conflict DROPBOX-ERROR:EQ if
-      p pu c METADATA DONE? c CLIENT-ENTRY FOLDER? and
+      p pu c METADATA {: m:reply :}
+      m DONE? c CLIENT-ENTRY FOLDER? and
       if construct reply done exit then
+      m UNLINKED? if m exit then
    then
    e construct reply refused ;
 
@@ -1772,7 +1802,7 @@ public
 : EXCHANGE ( ptr u8 n ptr u8 n ptr client -- reply )
    {: k:ptr ku:n v:ptr vu:n c :}
    c [: drop k ku v vu c CODE-FORM ;] TOKEN-POST
-   c [: KEPT-GRANT ;] REFRESHED ;
+   c [: KEPT-GRANT ;] [: drop construct reply unlinked ;] REFRESHED ;
 
 
 \ The refresh token: the config's, or the one an EXCHANGE kept.
@@ -2190,7 +2220,7 @@ ENUM send-event committed lost conflict failed ;ENUM
 ENUM start-event opened lost failed ;ENUM
 ENUM append-event stored complete lost cut gone failed ;ENUM
 ENUM finish-event committed lost conflict gone failed ;ENUM
-ENUM confirm-event same other ;ENUM
+ENUM confirm-event same other unlinked ;ENUM
 ENUM restart-event once twice ;ENUM
 
 
@@ -2263,13 +2293,15 @@ ENUM restart-event once twice ;ENUM
    construct finish-event failed ;
 
 
-\ get_metadata of the path shows a file with the upload's content hash.
+\ get_metadata of the path shows a file with the upload's content hash,
+\ or answers unlinked.
 : CONFIRM-SENSE ( ptr run -- confirm-event )
    {: r :}
    r RUN-CLIENT @ {: c :}
    r RUN-UP @ {: up :}
-   up DROPBOX-UPLOAD:PATH @ SPAN:$ c METADATA DONE?
-   0= if construct confirm-event other exit then
+   up DROPBOX-UPLOAD:PATH @ SPAN:$ c METADATA {: m:reply :}
+   m UNLINKED? if construct confirm-event unlinked exit then
+   m DONE? 0= if construct confirm-event other exit then
    c CLIENT-ENTRY {: e :}
    e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$
    up DROPBOX-UPLOAD:CONTENT-HASH @ SPAN:$ STR= e FILE? and
@@ -2291,6 +2323,13 @@ ENUM restart-event once twice ;ENUM
 
 
 : ANSWER-RETRY ( ptr run -- ) {: r :} 0 RETRY r RUN-ANSWER ! ;
+
+
+: ANSWER-UNLINKED ( ptr run -- )
+   {: r :}
+   construct reply unlinked r RUN-ANSWER ! ;
+
+
 \ Answers the last call's reply as it came, or as COMMITTED? set it.
 : ANSWER-REPLY ( ptr run -- ) {: r :} r RUN-LAST @ r RUN-ANSWER ! ;
 
@@ -2333,11 +2372,13 @@ FSM:DEFINE SESSION ( ptr run ) upload-step send-event
       gone       -             >verifying
       failed     ANSWER-REPLY  >ended
    IN confirming  CONFIRM-SENSE ( confirm-event )
-      same   ANSWER-DONE   >ended
-      other  ANSWER-REPLY  >ended
+      same      ANSWER-DONE      >ended
+      other     ANSWER-REPLY     >ended
+      unlinked  ANSWER-UNLINKED  >ended
    IN verifying  CONFIRM-SENSE ( confirm-event )
-      same   ANSWER-DONE   >ended
-      other  -             >restarting
+      same      ANSWER-DONE      >ended
+      other     -                >restarting
+      unlinked  ANSWER-UNLINKED  >ended
    IN restarting  RESTART-SENSE ( restart-event )
       once   REWIND        >starting
       twice  ANSWER-RETRY  >ended

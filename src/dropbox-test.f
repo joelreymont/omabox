@@ -301,11 +301,75 @@ TYPED-VARIABLE MAIN ptr DROPBOX:client
    s" /2/users/get_current_account /oauth2/token /2/users/get_current_account" T$= ;
 
 
+\ ---- the log a case checks
+
+create ERR-PATH 256 allot
+variable ERR-PATH-U
+create ERR 512 allot
+variable ERR-U
+TYPED-VARIABLE ACTION [ -- ]
+TYPED-VARIABLE OUTCOME bool
+
+
+: ERR-PATH$ ( -- ptr u8 n ) ERR-PATH ERR-PATH-U @ ;
+: ERR$ ( -- ptr u8 n ) ERR ERR-U @ ;
+
+
+\ TMPDIR/<name> at dst; answers its length.
+: IN-TMP ( ptr u8 n ptr u8 -- n )
+   {: nm:ptr nu:n dst:ptr :}
+   s" TMPDIR" GETENV {: d:ptr du:n :}
+   d dst du BYTE-COPY
+   47 dst du + c!
+   nm dst du + 1+ nu BYTE-COPY
+   du 1+ nu + ;
+
+
+\ The code xt throws, 0 for none, with fd 2 sent to TMPDIR/stderr.txt,
+\ which ERR$ then holds and which is removed.
+: LOGGED ( [ -- ] -- n )
+   ACTION !
+   s" stderr.txt" ERR-PATH IN-TMP ERR-PATH-U !
+   ERR-PATH$ STDERR:CAPTURE
+   [: ACTION @ catch ;] [: STDERR:;CAPTURE ;] finally
+   ERR-PATH$ ERR 512 FS:READ-ALL ERR-U !
+   ERR-PATH$ FS:REMOVE-FILE ;
+
+
+: LINES ( ptr u8 n -- n )
+   {: a:ptr u:n :}
+   0 u 0 ?do a i + c@ 10 = if 1+ then loop ;
+
+
+\ ERR$ is one line that holds the text.
+: LOGGED? ( ptr u8 n -- bool )
+   {: t:ptr tu:n :}
+   ERR$ LINES 1 = ERR$ t tu CONTAINS? and ;
+
+
+\ A case's own client, for an action LOGGED runs.
+TYPED-VARIABLE OWN ptr DROPBOX:client
+
+
+\ OUTCOME: the client's account call answered unlinked.
+: ACCOUNT-UNLINKED ( ptr DROPBOX:client -- )
+   DROPBOX:ACCOUNT UNLINKED? OUTCOME ! ;
+
+
+\ The client's account call, logged: it answers unlinked.
+: UNLINKED-LOGGED ( ptr DROPBOX:client -- )
+   OWN ! false OUTCOME !
+   [: OWN @ ACCOUNT-UNLINKED ;] LOGGED 0 T=
+   OUTCOME @ TTRUE ;
+
+
 : UNLINKED-CASE ( -- )
    s" invalid grant" T-LABEL
    TEST-DROPBOX:RESET
    s" dead-token" s" ns-root" OPENED {: dead :}
-   dead DROPBOX:ACCOUNT UNLINKED? ASSERT
+   dead UNLINKED-LOGGED
+   s" error dropbox: oauth2/token unlinked: the refresh token was refused"
+   LOGGED? TTRUE
    TEST-DROPBOX:SEEN$ s" /oauth2/token" T$=
    dead DROPBOX:CLOSE ;
 
@@ -314,7 +378,9 @@ TYPED-VARIABLE MAIN ptr DROPBOX:client
    s" revoked token" T-LABEL
    TEST-DROPBOX:RESET
    TEST-DROPBOX:REVOKE
-   MAIN @ DROPBOX:ACCOUNT UNLINKED? ASSERT
+   MAIN @ UNLINKED-LOGGED
+   s" error dropbox: users/get_current_account unlinked: a refreshed token was refused"
+   LOGGED? TTRUE
    TEST-DROPBOX:SEEN$
    s" /2/users/get_current_account /oauth2/token /2/users/get_current_account" T$=
    SB-RESET s" Bearer " SB-APPEND TEST-DROPBOX:ISSUED$ SB-APPEND
@@ -327,7 +393,8 @@ TYPED-VARIABLE MAIN ptr DROPBOX:client
    403 s" " s" "
    S\" {\qerror_summary\q:\qno_permission/...\q,\qerror\q:{\q.tag\q:\qno_permission\q}}"
    TEST-DROPBOX:SCRIPT!
-   MAIN @ DROPBOX:ACCOUNT UNLINKED? ASSERT
+   MAIN @ UNLINKED-LOGGED
+   s" error dropbox: users/get_current_account unlinked: 403" LOGGED? TTRUE
    TEST-DROPBOX:SEEN$ s" /2/users/get_current_account" T$= ;
 
 
@@ -380,50 +447,6 @@ TYPED-VARIABLE MAIN ptr DROPBOX:client
 
 
 \ ---- the classifier's other answers
-
-create ERR-PATH 256 allot
-variable ERR-PATH-U
-create ERR 512 allot
-variable ERR-U
-TYPED-VARIABLE ACTION [ -- ]
-TYPED-VARIABLE OUTCOME bool
-
-
-: ERR-PATH$ ( -- ptr u8 n ) ERR-PATH ERR-PATH-U @ ;
-: ERR$ ( -- ptr u8 n ) ERR ERR-U @ ;
-
-
-\ TMPDIR/<name> at dst; answers its length.
-: IN-TMP ( ptr u8 n ptr u8 -- n )
-   {: nm:ptr nu:n dst:ptr :}
-   s" TMPDIR" GETENV {: d:ptr du:n :}
-   d dst du BYTE-COPY
-   47 dst du + c!
-   nm dst du + 1+ nu BYTE-COPY
-   du 1+ nu + ;
-
-
-\ The code xt throws, 0 for none, with fd 2 sent to TMPDIR/stderr.txt,
-\ which ERR$ then holds and which is removed.
-: LOGGED ( [ -- ] -- n )
-   ACTION !
-   s" stderr.txt" ERR-PATH IN-TMP ERR-PATH-U !
-   ERR-PATH$ STDERR:CAPTURE
-   [: ACTION @ catch ;] [: STDERR:;CAPTURE ;] finally
-   ERR-PATH$ ERR 512 FS:READ-ALL ERR-U !
-   ERR-PATH$ FS:REMOVE-FILE ;
-
-
-: LINES ( ptr u8 n -- n )
-   {: a:ptr u:n :}
-   0 u 0 ?do a i + c@ 10 = if 1+ then loop ;
-
-
-\ ERR$ is one line that holds the text.
-: LOGGED? ( ptr u8 n -- bool )
-   {: t:ptr tu:n :}
-   ERR$ LINES 1 = ERR$ t tu CONTAINS? and ;
-
 
 : METADATA-DROPPED ( -- ) s" /docs/a.txt" MAIN @ DROPBOX:METADATA DONE? drop ;
 
@@ -942,6 +965,43 @@ variable SUNK-AT
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
 
 
+: DELETE-UNLINKED ( -- )
+   s" /kept.txt" s" " MAIN @ DROPBOX:DELETE UNLINKED? OUTCOME ! ;
+
+
+\ A lost delete whose confirmation Dropbox refuses 403: unlinked.
+: DENIED-DELETE-CASE ( -- )
+   s" lost delete, confirmation denied" T-LABEL
+   TEST-DROPBOX:RESET
+   s" /kept.txt" s" rev-kept" DELETED-FILE
+   TEST-DROPBOX:CUT TEST-DROPBOX:DENY
+   false OUTCOME !
+   [: DELETE-UNLINKED ;] LOGGED 0 T=
+   OUTCOME @ TTRUE
+   s" error dropbox: files/get_metadata unlinked: 403" LOGGED? TTRUE
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
+
+
+: CONFLICT-UNLINKED ( -- )
+   s" /gone.txt" s" rev-gone" MAIN @ DROPBOX:DELETE UNLINKED? OUTCOME ! ;
+
+
+\ A delete refused as a conflict whose confirmation Dropbox refuses 403:
+\ unlinked.
+: DENIED-CONFLICT-CASE ( -- )
+   s" delete conflict, confirmation denied" T-LABEL
+   TEST-DROPBOX:RESET
+   409 s" " s" "
+   S\" {\qerror_summary\q:\qpath_write/conflict/file/...\q,\qerror\q:{\q.tag\q:\qpath_write\q,\qpath_write\q:{\q.tag\q:\qconflict\q,\qconflict\q:{\q.tag\q:\qfile\q}}}}"
+   TEST-DROPBOX:SCRIPT!
+   TEST-DROPBOX:DENY
+   false OUTCOME !
+   [: CONFLICT-UNLINKED ;] LOGGED 0 T=
+   OUTCOME @ TTRUE
+   s" error dropbox: files/get_metadata unlinked: 403" LOGGED? TTRUE
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
+
+
 : FOLDER-CONFLICT-CASE ( -- )
    s" create-folder conflict" T-LABEL
    TEST-DROPBOX:RESET
@@ -976,6 +1036,45 @@ variable SUNK-AT
    TEST-DROPBOX:RESET
    TEST-DROPBOX:CUT
    s" /cut-made" MAIN @ DROPBOX:CREATE-FOLDER RETRY-MS 0 T=
+   TEST-DROPBOX:SEEN$
+   s" /2/files/create_folder_v2 /2/files/get_metadata" T$= ;
+
+
+: FOLDER-UNLINKED ( -- )
+   s" /denied" MAIN @ DROPBOX:CREATE-FOLDER UNLINKED? OUTCOME ! ;
+
+
+\ A create-folder refused as a conflict whose confirmation Dropbox refuses
+\ 403: unlinked.
+: DENIED-FOLDER-CASE ( -- )
+   s" create-folder conflict, confirmation denied" T-LABEL
+   TEST-DROPBOX:RESET
+   409 s" " s" "
+   S\" {\qerror_summary\q:\qpath/conflict/folder/...\q,\qerror\q:{\q.tag\q:\qpath\q,\qpath\q:{\q.tag\q:\qconflict\q,\qconflict\q:{\q.tag\q:\qfolder\q}}}}"
+   TEST-DROPBOX:SCRIPT!
+   TEST-DROPBOX:DENY
+   false OUTCOME !
+   [: FOLDER-UNLINKED ;] LOGGED 0 T=
+   OUTCOME @ TTRUE
+   s" error dropbox: files/get_metadata unlinked: 403" LOGGED? TTRUE
+   TEST-DROPBOX:SEEN$
+   s" /2/files/create_folder_v2 /2/files/get_metadata" T$= ;
+
+
+: CUT-FOLDER-UNLINKED ( -- )
+   s" /cut-made" MAIN @ DROPBOX:CREATE-FOLDER UNLINKED? OUTCOME ! ;
+
+
+\ A create-folder lost before Dropbox applied it whose confirmation Dropbox
+\ refuses 403: unlinked.
+: DENIED-CUT-FOLDER-CASE ( -- )
+   s" lost create-folder, confirmation denied" T-LABEL
+   TEST-DROPBOX:RESET
+   TEST-DROPBOX:CUT TEST-DROPBOX:DENY
+   false OUTCOME !
+   [: CUT-FOLDER-UNLINKED ;] LOGGED 0 T=
+   OUTCOME @ TTRUE
+   s" error dropbox: files/get_metadata unlinked: 403" LOGGED? TTRUE
    TEST-DROPBOX:SEEN$
    s" /2/files/create_folder_v2 /2/files/get_metadata" T$= ;
 
@@ -1034,11 +1133,21 @@ variable SUNK-AT
    link DROPBOX:CLOSE ;
 
 
+\ OUTCOME: OWN's exchange of a dead code answered unlinked.
+: DEAD-EXCHANGE ( -- )
+   s" dead-code" s" fake-verifier" OWN @ DROPBOX:EXCHANGE UNLINKED?
+   OUTCOME ! ;
+
+
+\ A dead code answers unlinked and logs nothing.
 : DEAD-CODE-CASE ( -- )
    s" exchange invalid grant" T-LABEL
    TEST-DROPBOX:RESET
    s" " s" ns-root" OPENED {: link :}
-   s" dead-code" s" fake-verifier" link DROPBOX:EXCHANGE UNLINKED? ASSERT
+   link OWN ! false OUTCOME !
+   [: DEAD-EXCHANGE ;] LOGGED 0 T=
+   OUTCOME @ TTRUE
+   ERR-U @ 0 T=
    link DROPBOX:REFRESH-TOKEN s" " T$=
    TEST-DROPBOX:SEEN$ s" /oauth2/token" T$=
    link DROPBOX:CLOSE ;
@@ -1059,7 +1168,7 @@ variable SHOWS
 \ the strikes left there.
 variable FAULT-AT
 variable STRIKES
-ENUM fault cut cut-twice lose close unfound applied offset ;ENUM
+ENUM fault cut cut-twice lose close unfound applied offset denied ;ENUM
 TYPED-VARIABLE FAULT fault
 
 
@@ -1150,6 +1259,7 @@ TYPED-VARIABLE FAULT fault
       unfound OF UNFOUND ENDOF
       applied OF UNFOUND APPLIED ENDOF
       offset OF OFFSET! ENDOF
+      denied OF UNFOUND TEST-DROPBOX:DENY ENDOF
    ;MATCH ;
 
 
@@ -1339,6 +1449,24 @@ TYPED-VARIABLE FAULT fault
    UNSTAGED ;
 
 
+: SEND-UNLINKED ( -- ) SEND UNLINKED? OUTCOME ! ;
+
+
+\ A lost single upload whose confirmation Dropbox refuses 403: unlinked.
+: DENIED-SINGLE-CASE ( -- )
+   s" lost upload, confirmation denied" T-LABEL
+   TEST-DROPBOX:RESET -1 FAULT-AT !
+   s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
+   TEST-DROPBOX:CUT TEST-DROPBOX:DENY
+   false OUTCOME !
+   [: SEND-UNLINKED ;] LOGGED 0 T=
+   OUTCOME @ TTRUE
+   s" error dropbox: files/get_metadata unlinked: 403" LOGGED? TTRUE
+   SHOWS @ 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
+   UNSTAGED ;
+
+
 \ A single upload lost after Dropbox committed it: the confirmation finds
 \ the file with its content hash.
 : LOST-SINGLE-CASE ( -- )
@@ -1355,7 +1483,7 @@ TYPED-VARIABLE FAULT fault
 
 : SINGLE-CASES ( -- )
    SINGLE-CASE CONFLICT-CASE HELD-CASE NON-ASCII-CASE CUT-SINGLE-CASE
-   LOST-SINGLE-CASE SHORT-STAGE-CASE REFUSED-STAGE-CASE
+   DENIED-SINGLE-CASE LOST-SINGLE-CASE SHORT-STAGE-CASE REFUSED-STAGE-CASE
    FULL-READ-CASE ENTERED-READ-CASE TIMED-OUT-READ-CASE
    CANCELLED-READ-CASE ;
 
@@ -1503,12 +1631,27 @@ TYPED-VARIABLE FAULT fault
    CHUNK 1+ construct fault unfound FAULTED ;
 
 
+\ A finish answered gone whose confirmation Dropbox refuses 403: unlinked.
+: DENIED-FINISH-CASE ( -- )
+   s" finish gone, confirmation denied" T-LABEL
+   SB-RESET S-START S-APPEND S-APPEND S-FINISH
+   s"  /2/files/get_metadata" SB-APPEND
+   1 STRIKES ! construct fault denied FAULT ! CHUNK 1+ FAULT-AT !
+   TEST-DROPBOX:RESET
+   false OUTCOME !
+   [: SEND-UNLINKED ;] LOGGED 0 T=
+   OUTCOME @ TTRUE
+   s" error dropbox: files/get_metadata unlinked: 403" LOGGED? TTRUE
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
+
+
 : UPLOAD-CASES ( -- )
    HASH-CASE SINGLE-CASES
    BIG-STAGED
    SESSION-CASE LOST-APPEND-CASE HELD-APPEND-CASE OFFSET-APPEND-CASE
    CLOSED-CASE LOST-START-CASE LOST-FINISH-CASE APPLIED-FINISH-CASE
-   UNFOUND-FINISH-CASE CUT-APPEND-CASE CLOSED-TWICE-CASE MISMATCH-CASE
+   UNFOUND-FINISH-CASE DENIED-FINISH-CASE CUT-APPEND-CASE CLOSED-TWICE-CASE
+   MISMATCH-CASE
    ENDED-EARLY-CASE
    UNSTAGED ;
 
@@ -1525,8 +1668,10 @@ TYPED-VARIABLE FAULT fault
    PAGES-CASE RESET-CASE STALL-CASE UNTAGGED-CASE POLL-CASE POLL-RESET-CASE
    DOWNLOAD-CASES
    DELETE-CONFLICT-CASE DELETE-MISSING-CASE DELETE-GONE-CASE
-   LOST-DELETE-CASE CUT-DELETE-CASE
-   FOLDER-CONFLICT-CASE LOST-FOLDER-CASE CUT-FOLDER-CASE LOST-REFRESH-CASE
+   LOST-DELETE-CASE CUT-DELETE-CASE DENIED-DELETE-CASE DENIED-CONFLICT-CASE
+   FOLDER-CONFLICT-CASE LOST-FOLDER-CASE CUT-FOLDER-CASE DENIED-FOLDER-CASE
+   DENIED-CUT-FOLDER-CASE
+   LOST-REFRESH-CASE
    EXCHANGE-CASE DEAD-CODE-CASE RESERVED-REFRESH-CASE RESERVED-CODE-CASE
    UPLOAD-CASES DROPBOX:THROW-CASES
    MAIN @ DROPBOX:CLOSE ;

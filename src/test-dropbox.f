@@ -10,9 +10,10 @@
 \ more API call's answer, before the call takes effect, and CUT-TOKEN a token
 \ request's; GARBLE answers the next API call, before it takes effect, with a
 \ line that is not HTTP. REVOKE refuses every access token, issued or yet to
-\ be, as invalid until RESET; the refresh still issues them. A call must
-\ carry the Path-Root ROOT! expects, none when that is empty, else it answers
-\ 422. Scripted answers go out in order, each before its route's own, to API
+\ be, as invalid until RESET; the refresh still issues them. DENY refuses
+\ every call that carries a token 403 until RESET. A call must carry the
+\ Path-Root ROOT! expects, none when that is empty, else it answers 422.
+\ Scripted answers go out in order, each before its route's own, to API
 \ calls only: a token request leaves them queued. It records each request's
 \ path, and the last API call's Authorization, Path-Root and Content-Type.
 \ STORAGE CLASS. PROCESS-WIDE: one worker serves every request, so its handler
@@ -52,6 +53,7 @@ variable ISSUES
 variable EXPIRED
 \ Every access token is refused as invalid.
 variable REVOKED
+variable DENIED
 
 SLOTS PATH-CAP * BUFFER: PATHS
 SLOTS TYPED-BUFFER PATH-US n
@@ -344,8 +346,15 @@ variable FORM-AT
    false ;
 
 
+: FORBIDDEN! ( HTTP:response -- )
+   {: a:HTTP:response :}
+   a 403 HTTP:STATUS!
+   a S\" {\qerror_summary\q:\qno_permission/...\q,\qerror\q:{\q.tag\q:\qno_permission\q}}" ANSWER! ;
+
+
 : ADMITTED? ( HTTP:request HTTP:response -- bool )
    {: q:HTTP:request a:HTTP:response :}
+   DENIED @ if a FORBIDDEN! false exit then
    q a AUTHORIZED? 0= if false exit then
    q a ROOTED? ;
 
@@ -1099,7 +1108,7 @@ $2100000 constant UPLOAD-CAP
 
 \ Starts the server on a free port with one worker.
 : START ( -- )
-   0 ISSUES ! 0 EXPIRED ! false REVOKED !
+   0 ISSUES ! 0 EXPIRED ! false REVOKED ! false DENIED !
    HTTP:ROUTES-RESET
    s" POST" s" /oauth2/token" [: [: GRANT ;] SERVE ;] HTTP:ROUTE
    s" POST" s" /2/users/get_current_account" [: [: ACCOUNT ;] SERVE ;] HTTP:ROUTE
@@ -1133,8 +1142,8 @@ $2100000 constant UPLOAD-CAP
 
 \ Forgets the script, the entries, the kept bytes, the pages, the long
 \ poll's answer, the sessions, the revs uploads took, a download's fault, a
-\ SKEW, a LOSE, the CUTs, a CUT-TOKEN, a GARBLE, a code GRANT! set, a REVOKE
-\ and what was sent; the tokens and the root stay.
+\ SKEW, a LOSE, the CUTs, a CUT-TOKEN, a GARBLE, a code GRANT! set, a
+\ REVOKE, a DENY and what was sent; the tokens and the root stay.
 : RESET ( -- )
    0 SCRIPTS ! 0 SCRIPTED ! 0 FILES ! 0 CONTENTS ! 0 SESSIONS ! 0 REVS !
    0 GRANT-CODE-U !
@@ -1143,7 +1152,7 @@ $2100000 constant UPLOAD-CAP
    false ROOTED ! false TYPED ! false LEAKED ! false RANGED !
    false SKEWED ! 0 MISFILED-U ! false SHORTED ! false WHOLED !
    false PARTED ! false BREAKING ! false LOSING ! 0 CUTS !
-   false TOKEN-CUTTING ! false REVOKED ! false GARBLING !
+   false TOKEN-CUTTING ! false REVOKED ! false DENIED ! false GARBLING !
    LISTING-RESET ;
 
 
@@ -1168,6 +1177,11 @@ $2100000 constant UPLOAD-CAP
 \ Refuses every access token, issued or yet to be, as Dropbox does once the
 \ user disconnects the app, until RESET.
 : REVOKE ( -- ) true REVOKED ! ;
+
+
+\ Refuses every call that carries a token 403, as Dropbox does an app it no
+\ longer allows, until RESET. The long poll takes no token, so it still answers.
+: DENY ( -- ) true DENIED ! ;
 
 
 \ A file get_metadata finds: path_lower, path_display, rev, content_hash and

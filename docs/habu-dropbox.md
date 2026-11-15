@@ -25,6 +25,10 @@ ENUM reply
 
 - `retry` covers 429, 5xx, 408, `too_many_write_operations`, a timeout or a
   lost connection.
+- `unlinked` is logged once, where it is decided: a 403, a refreshed token
+  refused, or `invalid_grant` on the refresh. A confirmation that answers
+  `unlinked` answers it in its call's place. A code exchange's `unlinked`
+  means the code is dead and logs nothing.
 - Anything else throws a `DROPBOX:E-` code after one log line, because it
   means a bug on one side of the wire. That includes 400, a 3xx (redirects are
   never followed), an answer that does not parse, and a cursor that did not
@@ -275,6 +279,8 @@ The tests run against a fake Dropbox on `net/http.f`, in the style of
   - an expired token, refreshed and resent;
   - a revoked token, refreshed and resent once, which answers `unlinked`;
   - a refreshed token refused again, and a 403, which answer `unlinked`;
+  - a lost delete, a lost upload, and a create-folder conflict whose
+    confirmation is refused 403, which answer `unlinked`;
   - `invalid_grant`, which answers `unlinked`;
   - 429 with `Retry-After`, and 5xx;
   - a 3xx, which is not followed;
