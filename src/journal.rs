@@ -3604,6 +3604,9 @@ fn operation_matches_baseline(operation: &Operation, baseline: &Baseline) -> boo
 }
 
 #[cfg(test)]
+mod oracle;
+
+#[cfg(test)]
 mod tests {
     use std::error::Error;
     use std::fs;
