@@ -10,11 +10,16 @@
 \ a subvolume a new device number at every mount, so the device is none
 \ of it. A binding with no birth time is one a version-6 journal recorded;
 \ an activation whose path and inode match it upgrades it in place.
+\ Each publication is one immediate transaction, and the remote cursor
+\ and inventory are read in one deferred one. A stored value is written
+\ and read by MODEL's JSON words; one MODEL cannot read is E-JSON, logged
+\ with the record's path.
 \ STORAGE CLASS. CALLER-OWNED: a journal borrows the path it was opened
 \ with until CLOSE, and a binding INSPECT answers borrows its path; every
-\ string a reader answers lies in the arena the caller passes. A journal
-\ belongs to the task that opened it. TASK-LOCAL: the bytes a root's
-\ inode and subvolume are bound from, a TASK:+USERS row.
+\ string and vector a reader answers lies in the arena the caller passes.
+\ A journal belongs to the task that opened it. TASK-LOCAL: the bytes a
+\ root's inode and subvolume are bound from, and the JSON writer and
+\ buffer a publication encodes with, TASK:+USERS rows.
 
 require src/lib/error.f
 require src/lib/string.f
@@ -29,6 +34,11 @@ require src/lib/fs-mutate.f
 require src/lib/fs-anchored.f
 require src/lib/fs-statx.f
 require src/lib/sqlite.f
+require src/lib/byte-buffer.f
+require src/lib/json.f
+require src/lib/vector.f
+require src/dropbox.f
+require src/model.f
 
 package JOURNAL
 public
@@ -869,5 +879,566 @@ public
 : ADOPT-LOCAL-ROOT
    ( journal local-root-binding ^ARENA:arena -- local-root-activation )
    [: ADOPTION-WITHOUT-WRITE ;] ACTIVATING ;
+
+
+\ ---- inventories ---------------------------------------------------
+
+public
+
+\ The committed cursor, none before a first publication, and every
+\ observation, in key order.
+STRUCTURE remote-inventory
+   FIELD cursor option<DROPBOX:cursor>
+   FIELD observations ^VEC:vector<MODEL:remote-record>
+;STRUCTURE
+
+\ One step of a validated cursor continuation. upsert writes a key's
+\ path and observation; ensure-directory adds a missing ancestor, a
+\ stored one keeping its path, and its observation when that is unknown;
+\ delete-subtree removes a key and every key beneath it.
+ENUM remote-inventory-change
+   VARIANT upsert FIELD record MODEL:remote-record ;VARIANT
+   VARIANT ensure-directory FIELD record MODEL:remote-record ;VARIANT
+   VARIANT delete-subtree FIELD key MODEL:key ;VARIANT
+;ENUM
+
+\ A remote directory's key and display path.
+STRUCTURE remote-directory
+   FIELD key MODEL:key
+   FIELD path MODEL:path
+;STRUCTURE
+
+private
+
+1 TASK:+USERS ENCODER JSON:writer
+BUF:HDR-BYTES TASK:+USERS ENCODED u8
+256 constant ENCODED-CAP
+
+
+\ ---- stored columns ------------------------------------------------
+
+: PATH-BYTES ( MODEL:path -- ^u8 n ) MODEL:PATH>STR str> ;
+
+: BYTES-PATH ( ^u8 n ^ARENA:arena -- MODEL:path ) COPIED MODEL:>PATH ;
+
+: KEY-BYTES ( MODEL:key -- ^u8 n ) MODEL:KEY>STR str> ;
+
+: BYTES-KEY ( ^u8 n ^ARENA:arena -- MODEL:key ) COPIED MODEL:>KEY ;
+
+: ON-BUFFER ( R ^n [ R ^JSON:writer -- S ] -- S )
+   {: buf body :}
+   0 ENCODER buf JSON:WRITE-OPEN-BUF body execute ;
+
+\ Runs body on the task's JSON writer, whose buffer is freed after.
+: ENCODING ( R [ R ^JSON:writer -- S ] -- S )
+   {: body :}
+   0 ENCODED CELL-VIEW {: buf :}
+   buf ENCODED-CAP BUF:N>BLEN BUF:INIT
+   buf body [: ON-BUFFER ;] [: buf BUF:DISPOSE ;] finally ;
+
+\ The JSON `write` puts on the writer, until the writer's next use.
+: ENCODE ( ^JSON:writer [ ^JSON:writer -- ^JSON:writer ] -- ^u8 n )
+   {: w write :}
+   w JSON:WRITE-RESET write execute JSON:WRITTEN$ ;
+
+: UNPROCESSED ( str str -- )
+   {: op:str path:str :}
+   op OPERATION s" could not process the record for `" LOG:TEXT+
+   path STR+ s" `" LOG:TEXT+ LOG:;LINE
+   E-JSON throw ;
+
+\ Runs a MODEL read that replaces the seed it is given; a stored value
+\ MODEL cannot read is op's E-JSON on path.
+: DECODE ( R [ R -- R ] str str -- R )
+   {: read op:str path:str :}
+   [: read execute ;] catch {: code :}
+   code 0= if exit then
+   code MODEL:E-STORED <> if code throw then
+   op path UNPROCESSED ;
+
+: HEX-DIGIT? ( u8 -- bool )
+   {: c :}
+   c 48 >= c 57 <= and c 97 >= c 102 <= and or ;
+
+\ Dropbox's content hash: 64 lower-case hex digits.
+: DROPBOX-CONTENT-HASH? ( DROPBOX:hash -- bool )
+   DROPBOX:HASH>STR str> {: a:^ u :}
+   u 64 <> if false exit then
+   true u 0 ?do a i + c@ HEX-DIGIT? and loop ;
+
+: NOT-CONTENT-HASH ( str str -- )
+   {: op:str path:str :}
+   op path
+   s" cached content identity is not a Dropbox content hash" >str
+   INVALID ;
+
+
+\ ---- reading -------------------------------------------------------
+
+\ A seed's typed drop, which types the read that replaces it.
+: DROP-LOCAL ( MODEL:observation<MODEL:local> -- ) drop ;
+: DROP-REMOTE ( MODEL:observation<MODEL:remote> -- ) drop ;
+: DROP-FINGERPRINT ( MODEL:fingerprint -- ) drop ;
+: DROP-HASH ( DROPBOX:hash -- ) drop ;
+
+: NO-FINGERPRINT ( -- MODEL:fingerprint )
+   0 0 0 0 0 0 MODEL-FINGERPRINT:MAKE ;
+
+: NO-HASH ( -- DROPBOX:hash ) s" " >str DROPBOX:>HASH ;
+
+: NO-CURSOR ( -- option<DROPBOX:cursor> ) OPTION:NONE ;
+
+: LOCAL-OBSERVATION-OF
+   ( str str ^ARENA:arena -- MODEL:observation<MODEL:local> )
+   {: json:str path:str ar :}
+   MODEL-OBSERVATION:directory
+   [: DROP-LOCAL json ar MODEL:JSON>LOCAL-OBSERVATION ;]
+   s" deserialize local observation" >str path DECODE ;
+
+: REMOTE-OBSERVATION-OF
+   ( str str ^ARENA:arena -- MODEL:observation<MODEL:remote> )
+   {: json:str path:str ar :}
+   MODEL-OBSERVATION:directory
+   [: DROP-REMOTE json ar MODEL:JSON>REMOTE-OBSERVATION ;]
+   s" deserialize remote observation" >str path DECODE ;
+
+: HASH-VALUE-OF
+   ( str str ^ARENA:arena -- MODEL:fingerprint DROPBOX:hash )
+   {: json:str path:str ar :}
+   NO-FINGERPRINT NO-HASH
+   [: DROP-HASH DROP-FINGERPRINT json ar MODEL:JSON>HASH-VALUE ;]
+   s" deserialize local hash cache" >str path DECODE ;
+
+: LOCAL-ROW
+   ( SQLITE:statement ^ARENA:arena
+     -- SQLITE:statement MODEL:local-record )
+   {: ar :}
+   0 SQLITE:COL-BLOB ar BYTES-PATH {: p:MODEL:path :}
+   1 SQLITE:COL-TEXT >str p MODEL:PATH>STR ar LOCAL-OBSERVATION-OF
+   {: o :}
+   p o MODEL-LOCAL--RECORD:MAKE ;
+
+: HASH-ROW
+   ( SQLITE:statement ^ARENA:arena
+     -- SQLITE:statement MODEL:hash-record )
+   {: ar :}
+   0 SQLITE:COL-BLOB ar BYTES-PATH {: p:MODEL:path :}
+   1 SQLITE:COL-TEXT >str p MODEL:PATH>STR ar HASH-VALUE-OF
+   {: f h :}
+   h DROPBOX-CONTENT-HASH? 0= if
+      s" read local hash cache" >str p MODEL:PATH>STR NOT-CONTENT-HASH
+   then
+   p f h MODEL-HASH--RECORD:MAKE ;
+
+: REMOTE-ROW
+   ( SQLITE:statement ^ARENA:arena
+     -- SQLITE:statement MODEL:remote-record )
+   {: ar :}
+   0 SQLITE:COL-BLOB ar BYTES-KEY {: k:MODEL:key :}
+   1 SQLITE:COL-BLOB ar BYTES-PATH {: p:MODEL:path :}
+   2 SQLITE:COL-TEXT >str p MODEL:PATH>STR ar REMOTE-OBSERVATION-OF
+   {: o :}
+   k p o MODEL-REMOTE--RECORD:MAKE ;
+
+: DIRECTORY-ROW
+   ( SQLITE:statement ^ARENA:arena
+     -- SQLITE:statement remote-directory )
+   {: ar :}
+   0 SQLITE:COL-BLOB ar BYTES-KEY {: k:MODEL:key :}
+   1 SQLITE:COL-BLOB ar BYTES-PATH {: p:MODEL:path :}
+   k p JOURNAL-REMOTE--DIRECTORY:MAKE ;
+
+: CURSOR-ROW
+   ( ^ARENA:arena SQLITE:statement
+     -- option<DROPBOX:cursor> SQLITE:statement )
+   swap {: ar :}
+   SQLITE:STEP 0= if NO-CURSOR swap exit then
+   0 ar TEXT-COPY DROPBOX:>CURSOR OPTION:SOME swap ;
+
+: READ-LOCAL-INVENTORY
+   ( SQLITE:connection ^ARENA:arena
+     -- ^VEC:vector<MODEL:local-record> )
+   {: c ar :}
+   ar ARENA:ALLOCATOR 0 [type] MODEL:local-record VEC:NEW {: v :}
+   c s" SELECT path, observation_json FROM local_observations
+      ORDER BY path"
+   [: begin SQLITE:STEP while ar LOCAL-ROW v VEC:PUSH ! repeat ;]
+   SQLITE:WITH-STATEMENT
+   v ;
+
+\ The hashes of the active root's generation.
+: READ-LOCAL-HASH-CACHE
+   ( SQLITE:connection ^ARENA:arena
+     -- ^VEC:vector<MODEL:hash-record> )
+   {: c ar :}
+   ar ARENA:ALLOCATOR 0 [type] MODEL:hash-record VEC:NEW {: v :}
+   c s" SELECT cache.path, cache.hash_json
+      FROM local_hash_cache AS cache
+      JOIN local_root_binding AS root
+         ON root.singleton = 1 AND cache.root_generation = root.generation
+      ORDER BY cache.path"
+   [: begin SQLITE:STEP while ar HASH-ROW v VEC:PUSH ! repeat ;]
+   SQLITE:WITH-STATEMENT
+   v ;
+
+: READ-REMOTE-OBSERVATIONS
+   ( SQLITE:connection ^ARENA:arena
+     -- ^VEC:vector<MODEL:remote-record> )
+   {: c ar :}
+   ar ARENA:ALLOCATOR 0 [type] MODEL:remote-record VEC:NEW {: v :}
+   c s" SELECT canonical_path, path, observation_json
+      FROM remote_observations ORDER BY canonical_path"
+   [: begin SQLITE:STEP while ar REMOTE-ROW v VEC:PUSH ! repeat ;]
+   SQLITE:WITH-STATEMENT
+   v ;
+
+public
+
+\ The hashes verified for the active root, by path.
+: LOCAL-HASH-CACHE
+   ( journal ^ARENA:arena -- ^VEC:vector<MODEL:hash-record> )
+   {: j ar :}
+   j >CONNECTION ar READ-LOCAL-HASH-CACHE ;
+
+\ The committed local inventory, by path.
+: LOCAL-INVENTORY
+   ( journal ^ARENA:arena -- ^VEC:vector<MODEL:local-record> )
+   {: j ar :}
+   j >CONNECTION ar READ-LOCAL-INVENTORY ;
+
+\ The committed cursor, without the inventory.
+: REMOTE-CURSOR ( journal ^ARENA:arena -- option<DROPBOX:cursor> )
+   {: j ar :}
+   ar j >CONNECTION
+   s" SELECT cursor FROM remote_inventory WHERE singleton = 1"
+   [: CURSOR-ROW ;] SQLITE:WITH-STATEMENT ;
+
+\ The directories and restricted folders Dropbox holds, by key.
+: REMOTE-DIRECTORY-PATHS
+   ( journal ^ARENA:arena -- ^VEC:vector<remote-directory> )
+   {: j ar :}
+   ar ARENA:ALLOCATOR 0 [type] remote-directory VEC:NEW {: v :}
+   j >CONNECTION
+   s\" SELECT canonical_path, path FROM remote_observations
+      WHERE observation_json IN
+         ('\"Directory\"', '{\"Unknown\":\"Inaccessible\"}')
+      ORDER BY canonical_path"
+   [: begin SQLITE:STEP while ar DIRECTORY-ROW v VEC:PUSH ! repeat ;]
+   SQLITE:WITH-STATEMENT
+   v ;
+
+private
+
+: SNAPSHOT ( journal ^ARENA:arena -- remote-inventory )
+   {: j ar :}
+   j ar REMOTE-CURSOR
+   j >CONNECTION ar READ-REMOTE-OBSERVATIONS
+   JOURNAL-REMOTE--INVENTORY:MAKE ;
+
+public
+
+\ The cursor and the inventory it produced, read as one snapshot.
+: REMOTE-INVENTORY ( journal ^ARENA:arena -- remote-inventory )
+   {: j ar :}
+   j >CONNECTION [: j ar SNAPSHOT ;] SQLITE:WITH-READ ;
+
+private
+
+
+\ ---- the local scan ------------------------------------------------
+
+: INSERT-LOCAL ( -- ^u8 n )
+   s" INSERT INTO local_observations(path, observation_json)
+      VALUES (?1, ?2)" ;
+
+: INSERT-HASH ( -- ^u8 n )
+   s" INSERT INTO local_hash_cache(root_generation, path, hash_json)
+      VALUES (?1, ?2, ?3)" ;
+
+\ Runs the statement's row, reset for the next.
+: RAN ( SQLITE:statement -- SQLITE:statement )
+   SQLITE:STEP drop SQLITE:RESET ;
+
+: LOCAL-INSERTED
+   ( SQLITE:statement MODEL:local-record ^JSON:writer
+     -- SQLITE:statement )
+   {: r w :}
+   r MODEL-LOCAL--RECORD:UNMAKE {: p:MODEL:path o :}
+   p PATH-BYTES 1 SQLITE:BIND-BLOB
+   w [: o swap MODEL:LOCAL-OBSERVATION>JSON ;] ENCODE 2 SQLITE:BIND-TEXT
+   RAN ;
+
+: LOCAL-INSERTS
+   ( SQLITE:statement ^VEC:vector<MODEL:local-record> ^JSON:writer
+     -- SQLITE:statement )
+   {: v w :}
+   v VEC:COUNT 0 ?do v i VEC:AT @ w LOCAL-INSERTED loop ;
+
+\ A hash that is not Dropbox's is never cached.
+: HASH-INSERTED
+   ( SQLITE:statement n MODEL:hash-record ^JSON:writer
+     -- SQLITE:statement )
+   {: g r w :}
+   r MODEL-HASH--RECORD:UNMAKE {: p:MODEL:path f h :}
+   h DROPBOX-CONTENT-HASH? 0= if
+      s" publish local hash cache" >str p MODEL:PATH>STR
+      NOT-CONTENT-HASH
+   then
+   g 1 SQLITE:BIND-INT
+   p PATH-BYTES 2 SQLITE:BIND-BLOB
+   w [: r swap MODEL:HASH-VALUE>JSON ;] ENCODE 3 SQLITE:BIND-TEXT
+   RAN ;
+
+: HASH-INSERTS
+   ( SQLITE:statement n ^VEC:vector<MODEL:hash-record> ^JSON:writer
+     -- SQLITE:statement )
+   {: g v w :}
+   v VEC:COUNT 0 ?do g v i VEC:AT @ w HASH-INSERTED loop ;
+
+: LOCAL-RECORDS=
+   ( ^VEC:vector<MODEL:local-record> ^VEC:vector<MODEL:local-record>
+     -- bool )
+   {: a b :}
+   a VEC:COUNT b VEC:COUNT <> if false exit then
+   true a VEC:COUNT 0 ?do
+      a i VEC:AT @ b i VEC:AT @ MODEL:LOCAL-RECORD= and
+   loop ;
+
+: HASH-RECORDS=
+   ( ^VEC:vector<MODEL:hash-record> ^VEC:vector<MODEL:hash-record>
+     -- bool )
+   {: a b :}
+   a VEC:COUNT b VEC:COUNT <> if false exit then
+   true a VEC:COUNT 0 ?do
+      a i VEC:AT @ b i VEC:AT @ MODEL:HASH-RECORD= and
+   loop ;
+
+: SCAN-UNCHANGED?
+   ( SQLITE:connection ^VEC:vector<MODEL:local-record>
+     ^VEC:vector<MODEL:hash-record> ^ARENA:arena -- bool )
+   {: c obs hashes ar :}
+   c ar READ-LOCAL-INVENTORY obs LOCAL-RECORDS= 0= if false exit then
+   c ar READ-LOCAL-HASH-CACHE hashes HASH-RECORDS= ;
+
+\ g, the generation, was read as an SQLite integer, so it binds as one.
+: SCAN-WRITTEN
+   ( SQLITE:connection n ^VEC:vector<MODEL:local-record>
+     ^VEC:vector<MODEL:hash-record> ^JSON:writer -- )
+   {: c g obs hashes w :}
+   c s" DELETE FROM local_observations" SQLITE:EXEC
+   c s" DELETE FROM local_hash_cache" SQLITE:EXEC
+   c INSERT-LOCAL [: obs w LOCAL-INSERTS ;] SQLITE:WITH-STATEMENT
+   c INSERT-HASH [: g hashes w HASH-INSERTS ;] SQLITE:WITH-STATEMENT ;
+
+: ACTIVE-SCAN
+   ( local-root-record journal local-root-binding
+     ^VEC:vector<MODEL:local-record> ^VEC:vector<MODEL:hash-record>
+     ^ARENA:arena -- bool )
+   {: r j b obs hashes ar :}
+   r >BINDING b ROOT= 0= if false exit then
+   j >CONNECTION {: c :}
+   c obs hashes ar SCAN-UNCHANGED? if true exit then
+   c r >GENERATION obs hashes [: SCAN-WRITTEN ;] ENCODING
+   true ;
+
+: SCAN-PUBLISHED
+   ( journal local-root-binding ^VEC:vector<MODEL:local-record>
+     ^VEC:vector<MODEL:hash-record> ^ARENA:arena -- bool )
+   {: j b obs hashes ar :}
+   j ar LOCAL-ROOT-BINDING MATCH option
+      none OF false ENDOF
+      some OF j b obs hashes ar ACTIVE-SCAN ENDOF
+   ;MATCH ;
+
+public
+
+\ Replaces the local inventory and its hash cache in one transaction;
+\ false, nothing written, when binding is no longer the active root.
+: PUBLISH-LOCAL-SCAN
+   ( journal local-root-binding ^VEC:vector<MODEL:local-record>
+     ^VEC:vector<MODEL:hash-record> -- bool )
+   {: j b obs hashes :}
+   j >CONNECTION [: j b obs hashes [: SCAN-PUBLISHED ;] ARENA:WITH ;]
+   SQLITE:WITH-TRANSACTION ;
+
+private
+
+
+\ ---- the remote inventory ------------------------------------------
+
+: INSERT-REMOTE ( -- ^u8 n )
+   s" INSERT INTO remote_observations(
+         path, observation_json, canonical_path
+      ) VALUES (?1, ?2, ?3)" ;
+
+: UPSERT-REMOTE ( -- ^u8 n )
+   s" INSERT INTO remote_observations(
+         path, observation_json, canonical_path
+      ) VALUES (?1, ?2, ?3)
+      ON CONFLICT(canonical_path) DO UPDATE SET
+         path = excluded.path,
+         observation_json = excluded.observation_json
+      WHERE path != excluded.path
+         OR observation_json != excluded.observation_json" ;
+
+: ENSURE-REMOTE ( -- ^u8 n )
+   s" INSERT INTO remote_observations(
+         path, observation_json, canonical_path
+      ) VALUES (?1, ?2, ?3)
+      ON CONFLICT(canonical_path) DO UPDATE SET
+         observation_json = excluded.observation_json
+      WHERE observation_json != excluded.observation_json
+         AND json_type(
+            remote_observations.observation_json, '$.Unknown'
+         ) IS NULL" ;
+
+: DELETE-REMOTE-DESCENDANTS ( -- ^u8 n )
+   s" DELETE FROM remote_observations
+      WHERE canonical_path >= ?1 AND canonical_path < ?2" ;
+
+\ Binds the record's path, observation and key to ?1, ?2 and ?3.
+: BIND-REMOTE
+   ( SQLITE:statement MODEL:remote-record ^JSON:writer
+     -- SQLITE:statement )
+   {: r w :}
+   r MODEL-REMOTE--RECORD:UNMAKE {: k:MODEL:key p:MODEL:path o :}
+   p PATH-BYTES 1 SQLITE:BIND-BLOB
+   w [: o swap MODEL:REMOTE-OBSERVATION>JSON ;] ENCODE 2 SQLITE:BIND-TEXT
+   k KEY-BYTES 3 SQLITE:BIND-BLOB ;
+
+: REMOTE-INSERTS
+   ( SQLITE:statement ^VEC:vector<MODEL:remote-record> ^JSON:writer
+     -- SQLITE:statement )
+   {: v w :}
+   v VEC:COUNT 0 ?do v i VEC:AT @ w BIND-REMOTE RAN loop ;
+
+: PUBLISH-CURSOR ( SQLITE:connection DROPBOX:cursor -- )
+   {: c cur:DROPBOX:cursor :}
+   c s" INSERT INTO remote_inventory(singleton, cursor) VALUES (1, ?1)
+      ON CONFLICT(singleton) DO UPDATE SET cursor = excluded.cursor"
+   [: cur DROPBOX:CURSOR>STR str> 1 SQLITE:BIND-TEXT RAN ;]
+   SQLITE:WITH-STATEMENT ;
+
+: REMOTE-WRITTEN
+   ( SQLITE:connection DROPBOX:cursor
+     ^VEC:vector<MODEL:remote-record> ^JSON:writer -- )
+   {: c cur:DROPBOX:cursor v w :}
+   c s" DELETE FROM remote_observations" SQLITE:EXEC
+   c INSERT-REMOTE [: v w REMOTE-INSERTS ;] SQLITE:WITH-STATEMENT
+   c cur PUBLISH-CURSOR ;
+
+public
+
+\ Replaces the remote inventory and its cursor in one transaction.
+: PUBLISH-REMOTE-INVENTORY
+   ( journal DROPBOX:cursor ^VEC:vector<MODEL:remote-record> -- )
+   {: j cur:DROPBOX:cursor v :}
+   j >CONNECTION {: c :}
+   c [: c cur v [: REMOTE-WRITTEN ;] ENCODING ;]
+   SQLITE:WITH-TRANSACTION ;
+
+private
+
+: DELTA-INVALID ( str str -- )
+   {: path:str detail:str :}
+   s" validate remote inventory delta" >str path detail INVALID ;
+
+\ An upserted or ensured record's key is its path's.
+: CHECK-KEY ( MODEL:remote-record ^ARENA:arena -- )
+   {: r ar :}
+   r MODEL-REMOTE--RECORD:UNMAKE {: k:MODEL:key p:MODEL:path o :}
+   p ar MODEL:FOLD k MODEL:KEY= if exit then
+   p MODEL:PATH>STR
+   s" canonical path does not match display path" >str DELTA-INVALID ;
+
+: REMOTE-DIRECTORY ( -- MODEL:observation<MODEL:remote> )
+   MODEL-OBSERVATION:directory ;
+
+: DIRECTORY? ( MODEL:remote-record -- bool )
+   MODEL-REMOTE--RECORD:UNMAKE {: k:MODEL:key p:MODEL:path o :}
+   o REMOTE-DIRECTORY MODEL:REMOTE-OBSERVATION= ;
+
+: CHECK-ENSURED ( MODEL:remote-record ^ARENA:arena -- )
+   {: r ar :}
+   r ar CHECK-KEY
+   r DIRECTORY? if exit then
+   r MODEL-REMOTE--RECORD:UNMAKE {: k:MODEL:key p:MODEL:path o :}
+   p MODEL:PATH>STR
+   s" ensured remote ancestor is not a directory" >str DELTA-INVALID ;
+
+: CHECK-SUBTREE ( MODEL:key -- )
+   {: k:MODEL:key :}
+   k KEY-BYTES nip 0<> if exit then
+   k MODEL:KEY>STR
+   s" subtree deletion path is empty" >str DELTA-INVALID ;
+
+: CHECK-CHANGE ( remote-inventory-change ^ARENA:arena -- )
+   {: ar :}
+   MATCH remote-inventory-change
+      upsert OF ar CHECK-KEY ENDOF
+      ensure-directory OF ar CHECK-ENSURED ENDOF
+      delete-subtree OF CHECK-SUBTREE ENDOF
+   ;MATCH ;
+
+: DELTA-CHECKED
+   ( ^VEC:vector<remote-inventory-change> ^ARENA:arena -- )
+   {: v ar :}
+   v VEC:COUNT 0 ?do v i VEC:AT @ ar CHECK-CHANGE loop ;
+
+\ The record written by the statement sql names.
+: RECORD-WRITTEN
+   ( SQLITE:connection MODEL:remote-record ^JSON:writer ^u8 n -- )
+   {: c r w sql:^ u :}
+   c sql u [: r w BIND-REMOTE SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT ;
+
+: SUBTREE-DELETED ( SQLITE:connection MODEL:key ^ARENA:arena -- )
+   {: c k:MODEL:key ar :}
+   c s" DELETE FROM remote_observations WHERE canonical_path = ?1"
+   [: k KEY-BYTES 1 SQLITE:BIND-BLOB SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT
+   k ar MODEL:SUBTREE-RANGE {: lo:str hi:str :}
+   c DELETE-REMOTE-DESCENDANTS
+   [: lo str> 1 SQLITE:BIND-BLOB hi str> 2 SQLITE:BIND-BLOB
+      SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT ;
+
+: CHANGE-APPLIED
+   ( remote-inventory-change SQLITE:connection ^JSON:writer
+     ^ARENA:arena -- )
+   {: c w ar :}
+   MATCH remote-inventory-change
+      upsert OF {: r :} c r w UPSERT-REMOTE RECORD-WRITTEN ENDOF
+      ensure-directory OF
+         {: r :} c r w ENSURE-REMOTE RECORD-WRITTEN
+      ENDOF
+      delete-subtree OF {: k :} c k ar SUBTREE-DELETED ENDOF
+   ;MATCH ;
+
+: DELTA-WRITTEN
+   ( SQLITE:connection DROPBOX:cursor
+     ^VEC:vector<remote-inventory-change> ^ARENA:arena
+     ^JSON:writer -- )
+   {: c cur:DROPBOX:cursor v ar w :}
+   v VEC:COUNT 0 ?do v i VEC:AT @ c w ar CHANGE-APPLIED loop
+   c cur PUBLISH-CURSOR ;
+
+\ Every change is checked before the transaction begins.
+: DELTA-APPLIED
+   ( SQLITE:connection DROPBOX:cursor
+     ^VEC:vector<remote-inventory-change> ^ARENA:arena -- )
+   {: c cur:DROPBOX:cursor v ar :}
+   v ar DELTA-CHECKED
+   c [: c cur v ar [: DELTA-WRITTEN ;] ENCODING ;]
+   SQLITE:WITH-TRANSACTION ;
+
+public
+
+\ Applies a cursor continuation's changes, in order, and publishes its
+\ cursor, in one transaction.
+: APPLY-REMOTE-INVENTORY-DELTA
+   ( journal DROPBOX:cursor ^VEC:vector<remote-inventory-change> -- )
+   {: j cur:DROPBOX:cursor v :}
+   j >CONNECTION cur v [: DELTA-APPLIED ;] ARENA:WITH ;
 
 ;package
