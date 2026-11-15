@@ -617,3 +617,47 @@ comments that told history, a marker saved and restored twice, a test that
 read an internal cell rather than behaviour, and two limits of `split-str`:
 a marked file's diagnostics print a `str` as `^u8 n`, and a file read from
 stdin cannot carry the marker.
+
+## 2026-11-15: Baked libraries, borrowed flags and stored JSON
+
+The JSON lane stopped at its first `JSON:WRITE-U64`. The word was on
+Habu master, but `json.f` is built into the engine, and a `require`
+of a file the engine already holds loads nothing. The words were in the
+source tree but missing from the running engine, until the engine was
+rebuilt (8 s). In Rust, a new library function is available once the
+crate builds; here the library and the engine are released together.
+
+Rust's integers come in widths; Habu's cell is one signed 64-bit word.
+A file's inode is a `u64`, and serde writes one at or above 2^63 as a
+20-digit number. Habu's JSON gained `WRITE-U64` and `READ-U64`. The
+review of that lane found the reader's overflow check used a signed
+compare, so a total above 2^63 wrapped; a failing test showed it before
+the fix.
+
+Habu refused `block-reason` as a name: `block-` is a reserved prefix.
+Rust's BlockReason became `blockage`. In CONFIG the type `lock` collided
+with a private variant `lock`, renamed `daemon-lock`. Three lanes so far
+have renamed something because Habu has one namespace for types, variants
+and words, where Rust has several.
+
+The JSON readers need a seed value and a typed `drop` for each type. A
+checked `catch` must leave the stack the same shape whether the code
+threw or not, so each reader is given a placeholder value of the type it
+reads. Rust's `?` returns early instead and needs no placeholder.
+
+Rust's file code gets its flags from the standard library
+(`OpenOptions::create_new`, `custom_flags(O_NOFOLLOW)`). Habu's file
+words do not yet cover everything the daemon needs, so the CONFIG lane
+bound `open`, `mkdir`, `chmod` and `flock` from libc itself. Those
+bindings belong in Habu's library; the review decides where.
+
+Habu's anchored path walk opened every directory on the way for reading,
+so a parent the user could enter but not list stopped the journal's
+root check; the kernel's own lookup needs only search permission. The
+walk now opens the directories in between with `O_PATH`. Habu also
+refuses a symlink anywhere in an anchored path. Rust's status file
+follows one in `$XDG_RUNTIME_DIR`; its sync root, opened with
+`RESOLVE_NO_SYMLINKS`, does not. Habu keeps the stricter rule for both.
+
+Lane times: STATUS fold 5.5 min, CONFIG lock 8.5 min, MODEL JSON 16 min
+(stalled on the engine), the anchored walk 3.5 min.
