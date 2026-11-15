@@ -8,11 +8,13 @@ use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 
 use miette::Diagnostic;
-use omabox::auth::{AuthError, AuthorizationGrant, OAuthClient, RefreshTokenStore};
+use omabox::auth::{AuthError, AuthorizationGrant, OAuthClient, RefreshToken, RefreshTokenStore};
 use omabox::config::{Config, ConfigError, InstanceLock, LockError, XdgDirectories};
 use omabox::dropbox::{DropboxClient, DropboxError, DropboxLink, DropboxRoot};
 use omabox::install::{InstallAction, InstallError};
-use omabox::journal::{DropboxBindingWrite, Journal, JournalError, LocalRootBinding};
+use omabox::journal::{
+    DropboxBinding, DropboxBindingWrite, Journal, JournalError, LocalRootBinding,
+};
 use omabox::service::{ServiceAction, ServiceCommands, ServiceError, ServiceGoal};
 use omabox::status::{self, StatusError};
 use serde::Serialize;
@@ -239,14 +241,12 @@ fn setup(options: SetupOptions, services: &ServiceCommands) -> Result<(), CliErr
         Some(initial) => {
             let xdg =
                 XdgDirectories::from_environment().map_err(config_error("resolve XDG paths"))?;
+            // Refuse before authorizing, so setup on a configured machine
+            // asks for no login and leaves no new, empty ~/Dropbox behind.
+            refuse_existing_config(&xdg.config_file())?;
             let sync_root = match initial.sync_root {
                 Some(path) => path,
-                None => {
-                    // Refuse first, so setup on a configured machine leaves
-                    // no new, empty ~/Dropbox behind.
-                    refuse_existing_config(&xdg.config_file())?;
-                    create_default_sync_root(env::var_os("HOME"))?
-                }
+                None => create_default_sync_root(env::var_os("HOME"))?,
             };
             let initial_config = Config::from_values(&xdg, sync_root, initial.app_key)
                 .map_err(config_error("validate initial configuration"))?;
@@ -260,33 +260,12 @@ fn setup(options: SetupOptions, services: &ServiceCommands) -> Result<(), CliErr
     config
         .prepare()
         .map_err(config_error("prepare state directories"))?;
-    let lock = InstanceLock::acquire(config.paths().lock_file())
-        .map_err(|source| CliError::Lock { source })?;
-    if write_initial_config {
-        refuse_existing_config(&config.paths().config_file())?;
-    }
 
-    complete_setup(&config, write_initial_config, || {
-        authorize_and_bind(&config, &options.remote_root)
-    })?;
-    finish_setup(lock, services)
-}
-
-fn finish_setup(lock: InstanceLock, services: &ServiceCommands) -> Result<(), CliError> {
-    // The daemon cannot start while setup holds its instance lock.
-    drop(lock);
-    let recovered =
-        services
-            .drive(ServiceGoal::Recover)
-            .map_err(|source| CliError::StartAfterChange {
-                change: "Omabox setup is complete".into(),
-                source,
-            })?;
-    if recovered.launched {
-        write_stdout("\nOmabox setup is complete. The stopped service has been started again.\n")
-    } else {
-        write_stdout("\nOmabox setup is complete.\n")
-    }
+    // Authorization waits on the browser, so it runs while the service syncs.
+    let authorized = authorize(&config, &options.remote_root)?;
+    change_while_released(services, "setup", "Omabox setup is complete", || {
+        complete_setup(&config, write_initial_config, || bind(&config, &authorized))
+    })
 }
 
 fn refuse_existing_config(path: &Path) -> Result<(), CliError> {
@@ -315,7 +294,13 @@ fn create_default_sync_root(home: Option<OsString>) -> Result<PathBuf, CliError>
     }
 }
 
-fn authorize_and_bind(config: &Config, remote_root: &str) -> Result<(), CliError> {
+/// A Dropbox login validated against the account and root, not yet stored.
+struct Authorized {
+    binding: DropboxBinding,
+    refresh_token: RefreshToken,
+}
+
+fn authorize(config: &Config, remote_root: &str) -> Result<Authorized, CliError> {
     let oauth = OAuthClient::new(config.dropbox_app_key());
     let pending = oauth.begin().map_err(|source| CliError::Auth {
         operation: "start Dropbox authorization",
@@ -348,7 +333,17 @@ fn authorize_and_bind(config: &Config, remote_root: &str) -> Result<(), CliError
             });
         }
     };
-    let binding = client.binding();
+    Ok(Authorized {
+        binding: client.binding(),
+        refresh_token,
+    })
+}
+
+fn bind(config: &Config, authorized: &Authorized) -> Result<(), CliError> {
+    let Authorized {
+        binding,
+        refresh_token,
+    } = authorized;
     let mut journal =
         Journal::open(config.paths().journal_file()).map_err(|source| CliError::Journal {
             operation: "open the journal",
@@ -360,19 +355,19 @@ fn authorize_and_bind(config: &Config, remote_root: &str) -> Result<(), CliError
             operation: "read the Dropbox journal binding",
             source,
         })? {
-        Some(existing) if existing != binding => return Err(CliError::JournalBindingMismatch),
+        Some(existing) if existing != *binding => return Err(CliError::JournalBindingMismatch),
         Some(_) => false,
         None => true,
     };
     RefreshTokenStore::new()
-        .store(&binding, &refresh_token)
+        .store(binding, refresh_token)
         .map_err(|source| CliError::Auth {
             operation: "store the Dropbox refresh token",
             source,
         })?;
     if was_unbound {
         match journal
-            .bind_dropbox_root(&binding)
+            .bind_dropbox_root(binding)
             .map_err(|source| CliError::Journal {
                 operation: "bind the journal to Dropbox",
                 source,
@@ -384,15 +379,22 @@ fn authorize_and_bind(config: &Config, remote_root: &str) -> Result<(), CliError
     Ok(())
 }
 
-fn complete_setup<Operation>(
+/// Under the instance lock, run `bind`, then write a new config when
+/// `write_initial_config` is set and none appeared since setup began.
+fn complete_setup<Bind>(
     config: &Config,
     write_initial_config: bool,
-    operation: Operation,
+    bind: Bind,
 ) -> Result<(), CliError>
 where
-    Operation: FnOnce() -> Result<(), CliError>,
+    Bind: FnOnce() -> Result<(), CliError>,
 {
-    operation()?;
+    let _lock = InstanceLock::acquire(config.paths().lock_file())
+        .map_err(|source| CliError::Lock { source })?;
+    if write_initial_config {
+        refuse_existing_config(&config.paths().config_file())?;
+    }
+    bind()?;
     if write_initial_config {
         match config.write_new() {
             Ok(()) => {}
@@ -450,34 +452,51 @@ fn set_sync_root(
     let replacement = Config::from_values(xdg, path, current.dropbox_app_key())
         .map_err(config_error("validate the new sync root"))?;
 
+    let done = format!(
+        "Omabox sync root is now {}",
+        replacement.sync_root().display()
+    );
+    change_while_released(services, "the sync-root change", &done, || {
+        change_sync_root_while_stopped(&current, &replacement)
+    })
+}
+
+/// Stop a service that can hold the instance lock, run `change`, then start
+/// the service again if it was running, or start a failed one the change may
+/// have fixed. `name` names the change, as in "setup"; `done` states the
+/// finished change, as in "Omabox setup is complete".
+fn change_while_released<Change>(
+    services: &ServiceCommands,
+    name: &'static str,
+    done: &str,
+    change: Change,
+) -> Result<(), CliError>
+where
+    Change: FnOnce() -> Result<(), CliError>,
+{
     let released = services
         .drive(ServiceGoal::Release)
         .map_err(CliError::Service)?;
-    let change = change_sync_root_while_stopped(&current, &replacement);
-    let changed = || {
-        format!(
-            "Omabox sync root is now {}",
-            replacement.sync_root().display()
-        )
-    };
+    let change = change();
     let restored = services.drive(ServiceGoal::Restore(released.first));
     match (change, restored) {
-        (Err(source), Err(restore)) => Err(CliError::RootChangeAndRestore {
+        (Err(source), Err(restore)) => Err(CliError::ChangeAndRestore {
+            change: name,
             source: Box::new(source),
-            restore,
+            restore: [restore],
         }),
         (Err(source), Ok(_)) => Err(source),
         (Ok(()), Err(source)) => Err(CliError::StartAfterChange {
-            change: changed(),
+            change: done.into(),
             source,
         }),
         (Ok(()), Ok(restored)) => {
-            // The new root may fix the fatal cause of a unit Release left failed.
+            // The change may fix the fatal cause of a unit Release left failed.
             let recovered = !restored.launched
                 && services
                     .drive(ServiceGoal::Recover)
                     .map_err(|source| CliError::StartAfterChange {
-                        change: changed(),
+                        change: done.into(),
                         source,
                     })?
                     .launched;
@@ -486,7 +505,7 @@ fn set_sync_root(
             } else {
                 ""
             };
-            write_stdout(&format!("{}.{note}\n", changed()))
+            write_stdout(&format!("{done}.{note}\n"))
         }
     }
 }
@@ -642,15 +661,18 @@ enum CliError {
         source: io::Error,
     },
 
-    #[error("the sync-root change failed and the Omabox service could not be restarted: {restore}")]
-    #[diagnostic(
-        code(omabox::cli::root_change_and_restore),
-        help("Start the service with `omabox service start`, then address the original error.")
+    /// Renders the change's chain and help, then the restore failure as a
+    /// related diagnostic with its own.
+    #[error(
+        "{change} failed, and the Omabox service could not be restarted; run `omabox resume` once the errors below are fixed"
     )]
-    RootChangeAndRestore {
+    #[diagnostic(code(omabox::cli::change_and_restore), forward(source))]
+    ChangeAndRestore {
+        change: &'static str,
         #[source]
         source: Box<CliError>,
-        restore: ServiceError,
+        #[related]
+        restore: [ServiceError; 1],
     },
 
     #[error("{change}, but the Omabox service could not be started or checked")]
@@ -1039,7 +1061,6 @@ mod tests {
                 .ok_or("documented flag setup lost its sync root")?;
             let config = Config::from_values(&xdg, sync_root, initial.app_key)?;
             config.prepare()?;
-            let _lock = InstanceLock::acquire(config.paths().lock_file())?;
             let result = complete_setup(&config, true, || {
                 if should_succeed {
                     Ok(())
@@ -1165,12 +1186,169 @@ mod tests {
         Ok(())
     }
 
+    /// Write a `systemctl` stand-in that keeps the unit state in a file:
+    /// `show` prints it, `stop` and `reset-failed` leave the unit inactive,
+    /// and `start` makes it active, or exits with `start_exit` when nonzero.
+    /// Every command is logged to `service.log` in `directory`.
+    fn stateful_systemctl(
+        directory: &Path,
+        initial: &str,
+        start_exit: i32,
+    ) -> Result<ServiceCommands, Box<dyn Error>> {
+        let state = directory.join("unit-state");
+        fs::write(&state, format!("{initial}\n"))?;
+        let systemctl = directory.join("systemctl");
+        fs::write(
+            &systemctl,
+            format!(
+                "printf '%s\\n' \"$2\" >> '{log}'\n\
+                 case \"$2\" in\n\
+                 show) cat '{state}' ;;\n\
+                 stop | reset-failed) printf '%s\\n' inactive > '{state}' ;;\n\
+                 start) [ {start_exit} = 0 ] || exit {start_exit}; printf '%s\\n' active > '{state}' ;;\n\
+                 esac\n\
+                 exit 0\n",
+                log = directory.join("service.log").display(),
+                state = state.display(),
+            ),
+        )?;
+        Ok(ServiceCommands::scripts(systemctl, "/unused/journalctl"))
+    }
+
+    /// The service log and unit state, read from `directory`.
+    fn service_trace(directory: &Path) -> io::Result<(String, String)> {
+        Ok((
+            fs::read_to_string(directory.join("service.log"))?,
+            fs::read_to_string(directory.join("unit-state"))?,
+        ))
+    }
+
     #[test]
-    fn finish_setup_releases_the_lock_before_starting_a_failed_service()
-    -> Result<(), Box<dyn Error>> {
+    fn a_change_runs_while_the_service_is_released() -> Result<(), Box<dyn Error>> {
+        for (initial, before, seen, after) in [
+            (
+                "active",
+                "show\nstop\n",
+                "inactive\n",
+                "show\nstop\nreset-failed\nstart\n",
+            ),
+            (
+                "failed",
+                "show\n",
+                "failed\n",
+                "show\nshow\nreset-failed\nstart\n",
+            ),
+        ] {
+            let temporary = tempfile::TempDir::new()?;
+            let services = stateful_systemctl(temporary.path(), initial, 0)?;
+            let mut during = None;
+
+            change_while_released(&services, "setup", "Omabox setup is complete", || {
+                during = Some(service_trace(temporary.path()));
+                Ok(())
+            })?;
+            let Some(during) = during else {
+                return Err(format!("{initial}: the change did not run").into());
+            };
+            assert_eq!(during?, (before.into(), seen.into()), "{initial}");
+            assert_eq!(
+                service_trace(temporary.path())?,
+                (after.into(), "active\n".into()),
+                "{initial}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_change_still_restores_the_service() -> Result<(), Box<dyn Error>> {
         let temporary = tempfile::TempDir::new()?;
-        let lock_file = temporary.path().join("daemon.lock");
-        let lock = InstanceLock::acquire(&lock_file)?;
+        let services = stateful_systemctl(temporary.path(), "active", 0)?;
+
+        let result = change_while_released(&services, "setup", "Omabox setup is complete", || {
+            Err(CliError::InvalidAuthorizationCode)
+        });
+        assert!(
+            matches!(result, Err(CliError::InvalidAuthorizationCode)),
+            "{result:?}"
+        );
+        assert_eq!(
+            service_trace(temporary.path())?,
+            (
+                "show\nstop\nreset-failed\nstart\n".into(),
+                "active\n".into()
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn setup_reports_a_held_lock_and_restores_the_service() -> Result<(), Box<dyn Error>> {
+        let (temporary, xdg, _first, _second) = fixture()?;
+        let config = Config::load_from(&xdg)?;
+        let _held_lock = InstanceLock::acquire(config.paths().lock_file())?;
+        let services = stateful_systemctl(temporary.path(), "active", 0)?;
+
+        let result = change_while_released(&services, "setup", "Omabox setup is complete", || {
+            complete_setup(&config, false, || Ok(()))
+        });
+        assert!(matches!(result, Err(CliError::Lock { .. })), "{result:?}");
+        assert_eq!(
+            service_trace(temporary.path())?,
+            (
+                "show\nstop\nreset-failed\nstart\n".into(),
+                "active\n".into()
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_change_and_restore_render_both() -> Result<(), Box<dyn Error>> {
+        let (temporary, xdg, _first, _second) = fixture()?;
+        let config = Config::load_from(&xdg)?;
+        let _held_lock = InstanceLock::acquire(config.paths().lock_file())?;
+        let services = stateful_systemctl(temporary.path(), "active", 1)?;
+
+        let Err(error) =
+            change_while_released(&services, "setup", "Omabox setup is complete", || {
+                complete_setup(&config, false, || Ok(()))
+            })
+        else {
+            return Err("setup succeeded under a held lock".into());
+        };
+        assert!(
+            matches!(&error, CliError::ChangeAndRestore { source, .. }
+                if matches!(**source, CliError::Lock { .. })),
+            "{error:?}"
+        );
+        // The report wraps the message at the terminal width, so check the
+        // whole message, with its `omabox resume` advice, unwrapped.
+        assert_eq!(
+            error.to_string(),
+            "setup failed, and the Omabox service could not be restarted; \
+             run `omabox resume` once the errors below are fixed"
+        );
+        let report = format!("{:?}", miette::Report::new(error));
+        for expected in [
+            "setup failed, and the Omabox service could not be restarted",
+            "could not acquire the Omabox daemon lock",
+            "Stop any manually started Omabox daemon, then retry.",
+            "`systemctl` failed with status Some(1)",
+            "Review the command output and `omabox logs`, then retry.",
+        ] {
+            assert!(
+                report.contains(expected),
+                "{expected:?} missing from {report}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn setup_releases_the_lock_before_starting_a_failed_service() -> Result<(), Box<dyn Error>> {
+        let (temporary, xdg, _first, _second) = fixture()?;
+        let config = Config::load_from(&xdg)?;
         let service_log = temporary.path().join("service.log");
         let systemctl = temporary.path().join("systemctl");
         fs::write(
@@ -1178,15 +1356,17 @@ mod tests {
             format!(
                 "printf '%s\\n' \"$2\" >> '{}'\ncase \"$2\" in\n  show) printf '%s\\n' failed ;;\n  start) exec flock -n '{}' true ;;\nesac\nexit 0\n",
                 service_log.display(),
-                lock_file.display()
+                config.paths().lock_file().display()
             ),
         )?;
         let services = ServiceCommands::scripts(systemctl, "/unused/journalctl");
 
-        finish_setup(lock, &services)?;
+        change_while_released(&services, "setup", "Omabox setup is complete", || {
+            complete_setup(&config, false, || Ok(()))
+        })?;
         assert_eq!(
             fs::read_to_string(service_log)?,
-            "show\nreset-failed\nstart\n"
+            "show\nshow\nreset-failed\nstart\n"
         );
         Ok(())
     }
@@ -1205,11 +1385,13 @@ mod tests {
             Ok(ServiceCommands::scripts(systemctl, "/unused/journalctl"))
         }
 
-        let temporary = tempfile::TempDir::new()?;
-        let lock = InstanceLock::acquire(temporary.path().join("daemon.lock"))?;
+        let (temporary, xdg, _first, _second) = fixture()?;
+        let config = Config::load_from(&xdg)?;
         let services = failing_start(temporary.path(), "failed")?;
         assert!(matches!(
-            finish_setup(lock, &services),
+            change_while_released(&services, "setup", "Omabox setup is complete", || {
+                complete_setup(&config, false, || Ok(()))
+            }),
             Err(CliError::StartAfterChange { .. })
         ));
 
@@ -1348,7 +1530,7 @@ mod tests {
         let services = ServiceCommands::scripts(systemctl, "/unused/journalctl");
         assert!(matches!(
             set_sync_root(&second, &xdg, &services),
-            Err(CliError::RootChangeAndRestore { .. })
+            Err(CliError::ChangeAndRestore { .. })
         ));
 
         fs::remove_file(config_directory)?;

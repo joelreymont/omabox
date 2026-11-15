@@ -228,7 +228,8 @@ impl DaemonError { fn disposition(&self) -> Disposition }
   Every CLI service decision goes through one machine, `ServiceGoal` in
   `src/service.rs`, which reads the unit's `ActiveState` and runs the
   systemctl steps its table names. Every start or restart (`omabox resume`,
-  `service start|restart`, set-root's start of a service it stopped, the
+  `service start|restart`, set-root's and setup's start of a service they
+  stopped, the
   restart by `omabox upgrade`, and a rollback's start) runs `reset-failed`
   first, which also resets the start-limit counter, so systemd never refuses a
   start the user asked for; a unit systemd has unloaded, such as a disabled,
@@ -241,8 +242,8 @@ impl DaemonError { fn disposition(&self) -> Disposition }
   the fixed cause again; a `deactivating` one is stopped and read again first.
   When that start fails, the command reports that its change is complete and
   kept and that the service could not be started or checked, and names
-  `omabox status` and `omabox logs`. set-root stops the service only while it
-  is running, starting or stopping, since only then can a daemon hold the
+  `omabox status` and `omabox logs`. set-root and setup stop the service only
+  while it is running, starting or stopping, since only then can a daemon hold the
   instance lock, and afterwards starts again one that was running or
   starting. `omabox pause` (`service stop`) and `omabox uninstall` stop a
   running, starting or stopping service and clear a failed state, so a paused
@@ -680,9 +681,11 @@ would remove the adapters above; they are candidate upstream changes to
   `adopt_local_root`; `status` and `settings` render an unresolvable root as a
   line. The config directory is added to `validate_outside`. State, staging,
   and recovery paths are stored as projected physical paths.
-- `setup` takes the instance lock, so it refuses while the daemon runs; the
-  lock error names `omabox pause`. After it succeeds, the CLI starts a failed
-  service (UserAction above). The authorization code read is bounded with `take` and
+- `setup` authorizes with Dropbox first, then releases the service like
+  `set-root`, makes its change under the instance lock and restores the
+  service; a failed service is started again afterwards (UserAction above). A
+  lock still held after the release belongs to a daemon started by hand, and
+  the lock error says so. The authorization code read is bounded with `take` and
   trimmed. README: setup prints a URL; live tests need
   `--features dropbox-live -- --ignored`.
 
