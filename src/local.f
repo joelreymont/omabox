@@ -1096,8 +1096,8 @@ private
    b MODEL-FINGERPRINT:UNMAKE {: i2 s2 ms2 mn2 cs2 cn2 :}
    cs cs2 = cn cn2 = and ;
 
-\ Rust's Path::join of the relative q onto p, laid anew in the arena: a
-\ "/" between them unless either is empty or p ends in one.
+\ p and the relative q joined as Rust's Path::join joins them, laid anew in
+\ the arena; an empty q answers p, where Rust appends a "/".
 : JOIN ( ^u8 n ^u8 n ^ARENA:arena -- ^u8 n )
    {: p:^ u:n q:^ qu:n ar:^ARENA:arena :}
    u 0= qu 0= or p u FS:JOIN-SEPARATED? or {: bare:bool :}
