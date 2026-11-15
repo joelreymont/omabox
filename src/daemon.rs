@@ -936,6 +936,9 @@ fn local_policy(error: &LocalError) -> FailurePolicy {
                 FailurePolicy::new(Disposition::Environmental, SYNC_ROOT)
             }
         }
+        LocalError::UnreadableFile { .. } => {
+            FailurePolicy::new(Disposition::Environmental, SYNC_ROOT)
+        }
         LocalError::UnsupportedObject { .. }
         | LocalError::ChangedDuringRead { .. }
         | LocalError::CorruptPrivateFile { .. }

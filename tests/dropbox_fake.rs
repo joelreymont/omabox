@@ -27,8 +27,9 @@ use omabox::journal::{
     PlanUnblock, PlanWrite, RemoteInventory, RemoteObservationRecord,
 };
 use omabox::local::{
-    InstallOutcome, ScanPublication, StageOutcome, StagedUpload, dropbox_content_hash,
-    install_download, scan_and_publish, stage_download, stage_upload,
+    ConflictOutcome, ConflictSide, InstallOutcome, LocalError, ScanPublication, StageOutcome,
+    StagedUpload, dropbox_content_hash, install_download, materialize_conflict, scan_and_publish,
+    stage_download, stage_upload,
 };
 use omabox::model::{
     Baseline, CanonicalPath, Conflict, ContentIdentity, Decision, DropboxRevision, LocalFile,
@@ -40,7 +41,7 @@ use omabox::reconcile::{
     replay_pending,
 };
 use omabox::recovery::{
-    ReplayBlocked, ReplayReport, replay_local_operations, replay_remote_operations,
+    RecoveryError, ReplayBlocked, ReplayReport, replay_local_operations, replay_remote_operations,
 };
 use omabox::runtime_status::{
     TransferDirection, TransferEvent, TransferObserver, TransferProgress,
@@ -6051,6 +6052,693 @@ fn remote_replay_preserves_conflict_sides_without_a_backup_download() -> Result<
     Ok(())
 }
 
+/// What sits at a local conflict copy's own name before replay places it.
+#[derive(Clone, Copy)]
+enum CopyOccupant {
+    /// A readable file with bytes other than the copy's.
+    DifferentFile,
+    /// A regular file Omabox cannot open for reading.
+    UnreadableFile,
+}
+
+#[test]
+fn replay_blocks_a_conflict_whose_local_copy_name_is_occupied() -> Result<(), Box<dyn Error>> {
+    replay_blocks_an_occupied_copy_name(CopyOccupant::DifferentFile)
+}
+
+#[test]
+fn replay_blocks_a_conflict_whose_local_copy_name_is_unreadable() -> Result<(), Box<dyn Error>> {
+    // Root opens a file whatever its mode.
+    if rustix::process::geteuid().is_root() {
+        return Ok(());
+    }
+    replay_blocks_an_occupied_copy_name(CopyOccupant::UnreadableFile)
+}
+
+fn replay_blocks_an_occupied_copy_name(occupant: CopyOccupant) -> Result<(), Box<dyn Error>> {
+    let old_bytes = b"common bytes";
+    let local_bytes = b"new local bytes";
+    let remote_bytes = b"new remote bytes";
+    let occupant_bytes = b"a file the user made";
+    let old = RemoteFile::new(
+        dropbox_content_hash(old_bytes.as_slice())?,
+        DropboxRevision::new("old-rev"),
+    );
+    let local = LocalFile::new(dropbox_content_hash(local_bytes.as_slice())?);
+    let current = RemoteFile::new(
+        dropbox_content_hash(remote_bytes.as_slice())?,
+        DropboxRevision::new("current-rev"),
+    );
+    let server = FakeServer::start(vec![
+        FakeResponse::status_json(409, upload_error(write_conflict_file()))
+            .for_path("/2/files/upload"),
+        FakeResponse::json(file_metadata(
+            "/replace.txt",
+            "/replace.txt",
+            "current-rev",
+            &current.content,
+        ))
+        .for_path("/2/files/get_metadata"),
+        account().for_path("/2/users/get_current_account"),
+        FakeResponse::json(json!({
+            "entries": [file_metadata(
+                "/replace.txt",
+                "/replace.txt",
+                "current-rev",
+                &current.content,
+            )],
+            "cursor": "cursor-retry",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder"),
+        FakeResponse::json(json!({
+            "entries": [],
+            "cursor": "cursor-retry",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder/continue"),
+        FakeResponse::bytes(remote_bytes.to_vec())
+            .header(
+                "Dropbox-API-Result",
+                download_metadata(
+                    "replace.txt",
+                    "current-rev",
+                    &current.content,
+                    remote_bytes.len(),
+                ),
+            )
+            .for_path("/2/files/download"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-occupied-local-copy")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("replace.txt"), local_bytes)?;
+    let copy = conflict_copy_path(Path::new("replace.txt"), ConflictSide::Local, local_bytes)?;
+    let remote_copy =
+        conflict_copy_path(Path::new("replace.txt"), ConflictSide::Remote, remote_bytes)?;
+    std::fs::write(root.join(&copy), occupant_bytes)?;
+    if matches!(occupant, CopyOccupant::UnreadableFile) {
+        std::fs::set_permissions(root.join(&copy), std::fs::Permissions::from_mode(0o000))?;
+    }
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_baseline(&mut journal, Path::new("replace.txt"), &old)?;
+    let operations = planned_operations(plan(
+        &Baseline::Present(old.clone()),
+        &Observation::Present(local),
+        &Observation::Present(old),
+        RemoteSubtree::Empty,
+    ))?;
+    assert!(matches!(
+        journal.record_plan(Path::new("replace.txt"), &operations)?,
+        PlanWrite::Recorded(_)
+    ));
+
+    let report = replay_remote_operations(&mut journal, &client, &root, &staging)?;
+    assert_eq!(report.completed_operations, 0);
+    assert_eq!(
+        report.blocked,
+        vec![ReplayBlocked::DurablePlan {
+            path: PathBuf::from("replace.txt"),
+            reason: BlockReason::ConflictCopyOccupied,
+        }]
+    );
+    let blocked = journal.blocked_plans()?;
+    assert_eq!(blocked.len(), 1);
+    assert!(matches!(
+        blocked[0].status,
+        PlanStatus::Blocked {
+            reason: BlockReason::ConflictCopyOccupied,
+            ..
+        }
+    ));
+    let id = blocked[0].id;
+    assert!(journal.conflicts()?.is_empty());
+    if matches!(occupant, CopyOccupant::UnreadableFile) {
+        std::fs::set_permissions(root.join(&copy), std::fs::Permissions::from_mode(0o600))?;
+    }
+    assert_eq!(std::fs::read(root.join(&copy))?, occupant_bytes);
+    assert_eq!(std::fs::read(root.join("replace.txt"))?, local_bytes);
+
+    // The occupant is gone, but the block is not yet due.
+    std::fs::remove_file(root.join(&copy))?;
+    let waiting = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+    assert_eq!(waiting.conflicts, 0);
+    assert_eq!(waiting.blocked, 1);
+    let blocked = journal.blocked_plans()?;
+    assert_eq!(blocked.len(), 1);
+    assert!(matches!(
+        blocked[0].status,
+        PlanStatus::Blocked {
+            reason: BlockReason::ConflictCopyOccupied,
+            ..
+        }
+    ));
+    assert!(!root.join(&copy).exists());
+    assert!(journal.conflicts()?.is_empty());
+
+    // A due block is prepared again and places both copies.
+    assert_eq!(
+        journal.block_plan(id, &BlockReason::ConflictCopyOccupied, 0)?,
+        PlanBlock::Blocked
+    );
+    let due = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+    assert_eq!(due.conflicts, 1);
+    assert_eq!(std::fs::read(root.join(&copy))?, local_bytes);
+    assert_eq!(std::fs::read(root.join(&remote_copy))?, remote_bytes);
+    assert_eq!(std::fs::read(root.join("replace.txt"))?, local_bytes);
+    let recorded = journal.conflicts()?;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].path, PathBuf::from("replace.txt"));
+    assert!(journal.pending_plans()?.is_empty());
+    assert!(journal.blocked_plans()?.is_empty());
+
+    let requests = server.finish()?;
+    assert_eq!(requests[0].path, "/2/files/upload");
+    assert_eq!(requests[1].path, "/2/files/get_metadata");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/2/files/download")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn replay_does_not_block_a_conflict_whose_copy_parent_is_read_only() -> Result<(), Box<dyn Error>> {
+    // Root writes into a directory whatever its mode.
+    if rustix::process::geteuid().is_root() {
+        return Ok(());
+    }
+    let old_bytes = b"common bytes";
+    let local_bytes = b"new local bytes";
+    let remote_bytes = b"new remote bytes";
+    let old = RemoteFile::new(
+        dropbox_content_hash(old_bytes.as_slice())?,
+        DropboxRevision::new("old-rev"),
+    );
+    let local = LocalFile::new(dropbox_content_hash(local_bytes.as_slice())?);
+    let current = RemoteFile::new(
+        dropbox_content_hash(remote_bytes.as_slice())?,
+        DropboxRevision::new("current-rev"),
+    );
+    let server = FakeServer::start(vec![
+        FakeResponse::status_json(409, upload_error(write_conflict_file()))
+            .for_path("/2/files/upload"),
+        FakeResponse::json(file_metadata(
+            "/replace.txt",
+            "/replace.txt",
+            "current-rev",
+            &current.content,
+        ))
+        .for_path("/2/files/get_metadata"),
+    ])?;
+    let client = fake_client(&server, "opaque-access-read-only-copy-parent")?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::write(root.join("replace.txt"), local_bytes)?;
+    let copy = conflict_copy_path(Path::new("replace.txt"), ConflictSide::Local, local_bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_baseline(&mut journal, Path::new("replace.txt"), &old)?;
+    let operations = planned_operations(plan(
+        &Baseline::Present(old.clone()),
+        &Observation::Present(local),
+        &Observation::Present(old),
+        RemoteSubtree::Empty,
+    ))?;
+    assert!(matches!(
+        journal.record_plan(Path::new("replace.txt"), &operations)?,
+        PlanWrite::Recorded(_)
+    ));
+
+    // Nothing is at the copy's name; its parent just cannot be written.
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500))?;
+    let replayed = replay_remote_operations(&mut journal, &client, &root, &staging);
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+
+    // The denial is an environment failure that propagates; the plan stays
+    // pending rather than waiting out a block for an occupant that is not there.
+    let copy_path = root.join(&copy);
+    assert!(
+        matches!(
+            &replayed,
+            Err(RecoveryError::Local {
+                source: LocalError::Io { path, source, .. },
+            }) if *path == copy_path
+                && source.raw_os_error() == Some(rustix::io::Errno::ACCESS.raw_os_error())
+        ),
+        "{replayed:?}"
+    );
+    assert!(journal.blocked_plans()?.is_empty());
+    assert_eq!(journal.pending_plans()?.len(), 1);
+    assert!(!copy_path.exists());
+    assert_eq!(std::fs::read(root.join("replace.txt"))?, local_bytes);
+    let requests = server.finish()?;
+    assert_eq!(requests[0].path, "/2/files/upload");
+    assert_eq!(requests[1].path, "/2/files/get_metadata");
+    Ok(())
+}
+
+#[test]
+fn recorded_conflict_leaves_an_edited_copy_alone() -> Result<(), Box<dyn Error>> {
+    let old_bytes = b"shared baseline";
+    let local_bytes = b"divergent local edit";
+    let remote_bytes = b"divergent Dropbox edit";
+    let edited_bytes = b"the user edited the Dropbox copy";
+    let unrelated_bytes = b"an unrelated new file";
+    let old = RemoteFile::new(
+        dropbox_content_hash(old_bytes.as_slice())?,
+        DropboxRevision::new("rev-old"),
+    );
+    let remote = RemoteFile::new(
+        dropbox_content_hash(remote_bytes.as_slice())?,
+        DropboxRevision::new("rev-remote"),
+    );
+    let edited = dropbox_content_hash(edited_bytes.as_slice())?;
+    let local_content = dropbox_content_hash(local_bytes.as_slice())?;
+    let unrelated = RemoteFile::new(
+        dropbox_content_hash(unrelated_bytes.as_slice())?,
+        DropboxRevision::new("rev-unrelated"),
+    );
+    let path = Path::new("c-diverged.txt");
+    let local_copy = conflict_copy_path(path, ConflictSide::Local, local_bytes)?;
+    let remote_copy = conflict_copy_path(path, ConflictSide::Remote, remote_bytes)?;
+    let local_copy_name = local_copy.to_string_lossy().into_owned();
+    let remote_copy_name = remote_copy.to_string_lossy().into_owned();
+    let upload = |name: &str, revision: &str, content: &ContentIdentity| {
+        let remote_path = format!("/{name}");
+        FakeResponse::json(file_metadata(&remote_path, &remote_path, revision, content))
+            .for_path("/2/files/upload")
+            .for_header_containing("dropbox-api-arg", name)
+    };
+    let server = FakeServer::start(vec![
+        account(),
+        FakeResponse::json(json!({
+            "entries": [file_metadata(
+                "/c-diverged.txt",
+                "/c-diverged.txt",
+                remote.revision.as_str(),
+                &remote.content,
+            )],
+            "cursor": "cursor-conflict",
+            "has_more": false
+        })),
+        FakeResponse::bytes(remote_bytes.to_vec())
+            .header(
+                "Dropbox-API-Result",
+                download_metadata(
+                    "c-diverged.txt",
+                    remote.revision.as_str(),
+                    &remote.content,
+                    remote_bytes.len(),
+                ),
+            )
+            .for_path("/2/files/download"),
+        FakeResponse::json(json!({
+            "entries": [],
+            "cursor": "cursor-conflict",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder/continue"),
+        upload(&local_copy_name, "rev-local-copy", &local_content),
+        upload(&remote_copy_name, "rev-edited-copy", &edited),
+        upload(
+            "d-unrelated.txt",
+            unrelated.revision.as_str(),
+            &unrelated.content,
+        ),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-edited-copy")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join(path), local_bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_baseline(&mut journal, path, &old)?;
+
+    let first = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+    assert_eq!(first.conflicts, 1);
+    let recorded = journal.conflicts()?;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(std::fs::read(root.join(&remote_copy))?, remote_bytes);
+
+    std::fs::write(root.join(&remote_copy), edited_bytes)?;
+    std::fs::write(root.join("d-unrelated.txt"), unrelated_bytes)?;
+    let second = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+    assert_eq!(second.conflicts, 0);
+    assert_eq!(second.blocked, 0);
+    assert_eq!(std::fs::read(root.join(&remote_copy))?, edited_bytes);
+    assert_eq!(std::fs::read(root.join(&local_copy))?, local_bytes);
+    assert_eq!(journal.conflicts()?, recorded);
+    assert_eq!(
+        journal.baseline(Path::new("d-unrelated.txt"))?,
+        Some(Baseline::Present(unrelated))
+    );
+    assert!(journal.pending_plans()?.is_empty());
+    assert!(journal.blocked_plans()?.is_empty());
+
+    let requests = server.finish()?;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/2/files/download")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[test]
+fn occupied_dropbox_conflict_copy_name_blocks_only_its_path() -> Result<(), Box<dyn Error>> {
+    let old_bytes = b"shared baseline";
+    let local_bytes = b"divergent local edit";
+    let remote_bytes = b"divergent Dropbox edit";
+    let occupant_bytes = b"a file the user made";
+    let unrelated_bytes = b"an unrelated new file";
+    let old = RemoteFile::new(
+        dropbox_content_hash(old_bytes.as_slice())?,
+        DropboxRevision::new("rev-old"),
+    );
+    let remote = RemoteFile::new(
+        dropbox_content_hash(remote_bytes.as_slice())?,
+        DropboxRevision::new("rev-remote"),
+    );
+    let occupant = dropbox_content_hash(occupant_bytes.as_slice())?;
+    let unrelated = RemoteFile::new(
+        dropbox_content_hash(unrelated_bytes.as_slice())?,
+        DropboxRevision::new("rev-unrelated"),
+    );
+    let path = Path::new("c-diverged.txt");
+    let remote_copy = conflict_copy_path(path, ConflictSide::Remote, remote_bytes)?;
+    let remote_copy_name = remote_copy.to_string_lossy().into_owned();
+    let upload = |name: &str, revision: &str, content: &ContentIdentity| {
+        let remote_path = format!("/{name}");
+        FakeResponse::json(file_metadata(&remote_path, &remote_path, revision, content))
+            .for_path("/2/files/upload")
+            .for_header_containing("dropbox-api-arg", name)
+    };
+    let server = FakeServer::start(vec![
+        account(),
+        FakeResponse::json(json!({
+            "entries": [file_metadata(
+                "/c-diverged.txt",
+                "/c-diverged.txt",
+                remote.revision.as_str(),
+                &remote.content,
+            )],
+            "cursor": "cursor-occupied",
+            "has_more": false
+        })),
+        upload(&remote_copy_name, "rev-occupant", &occupant),
+        upload(
+            "d-unrelated.txt",
+            unrelated.revision.as_str(),
+            &unrelated.content,
+        ),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-occupied-copy")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join(path), local_bytes)?;
+    std::fs::write(root.join(&remote_copy), occupant_bytes)?;
+    std::fs::write(root.join("d-unrelated.txt"), unrelated_bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_baseline(&mut journal, path, &old)?;
+
+    let report = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+    assert_eq!(report.conflicts, 0);
+    assert_eq!(report.blocked, 1);
+    assert!(journal.conflicts()?.is_empty());
+    assert_eq!(std::fs::read(root.join(&remote_copy))?, occupant_bytes);
+    assert_eq!(std::fs::read(root.join(path))?, local_bytes);
+    assert_eq!(journal.baseline(path)?, Some(Baseline::Present(old)));
+    assert_eq!(
+        journal.baseline(Path::new("d-unrelated.txt"))?,
+        Some(Baseline::Present(unrelated))
+    );
+
+    let requests = server.finish()?;
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path != "/2/files/download")
+    );
+    Ok(())
+}
+
+#[test]
+fn conflict_on_a_plan_blocked_for_its_size_is_prepared_at_once() -> Result<(), Box<dyn Error>> {
+    let old_bytes = b"common bytes";
+    let local_bytes = b"new local bytes";
+    let remote_bytes = b"new remote bytes";
+    let old = RemoteFile::new(
+        dropbox_content_hash(old_bytes.as_slice())?,
+        DropboxRevision::new("old-rev"),
+    );
+    let local = LocalFile::new(dropbox_content_hash(local_bytes.as_slice())?);
+    let current = RemoteFile::new(
+        dropbox_content_hash(remote_bytes.as_slice())?,
+        DropboxRevision::new("current-rev"),
+    );
+    let server = FakeServer::start(vec![
+        account().for_path("/2/users/get_current_account"),
+        FakeResponse::json(json!({
+            "entries": [file_metadata(
+                "/replace.txt",
+                "/replace.txt",
+                "current-rev",
+                &current.content,
+            )],
+            "cursor": "cursor-size",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder"),
+        FakeResponse::bytes(remote_bytes.to_vec())
+            .header(
+                "Dropbox-API-Result",
+                download_metadata(
+                    "replace.txt",
+                    "current-rev",
+                    &current.content,
+                    remote_bytes.len(),
+                ),
+            )
+            .for_path("/2/files/download"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-size-blocked-conflict")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("replace.txt"), local_bytes)?;
+    let copy = conflict_copy_path(Path::new("replace.txt"), ConflictSide::Local, local_bytes)?;
+    let remote_copy =
+        conflict_copy_path(Path::new("replace.txt"), ConflictSide::Remote, remote_bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_baseline(&mut journal, Path::new("replace.txt"), &old)?;
+    let operations = planned_operations(plan(
+        &Baseline::Present(old.clone()),
+        &Observation::Present(local),
+        &Observation::Present(old),
+        RemoteSubtree::Empty,
+    ))?;
+    let PlanWrite::Recorded(recorded) =
+        journal.record_plan(Path::new("replace.txt"), &operations)?
+    else {
+        return Err(io::Error::other("plan was not recorded").into());
+    };
+    assert_eq!(
+        journal.block_plan(
+            recorded.id,
+            &BlockReason::UnsupportedFileSize,
+            i64::MAX as u64
+        )?,
+        PlanBlock::Blocked
+    );
+
+    let report = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+    assert_eq!(report.conflicts, 1);
+    assert_eq!(report.blocked, 0);
+    assert_eq!(std::fs::read(root.join(&copy))?, local_bytes);
+    assert_eq!(std::fs::read(root.join(&remote_copy))?, remote_bytes);
+    assert_eq!(std::fs::read(root.join("replace.txt"))?, local_bytes);
+    let recorded = journal.conflicts()?;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].path, PathBuf::from("replace.txt"));
+    assert!(journal.pending_plans()?.is_empty());
+    assert!(journal.blocked_plans()?.is_empty());
+
+    let requests = server.finish()?;
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path != "/2/files/upload")
+    );
+    Ok(())
+}
+
+#[test]
+fn directory_at_dropbox_conflict_copy_name_blocks_only_its_path() -> Result<(), Box<dyn Error>> {
+    let old_bytes = b"shared baseline";
+    let local_bytes = b"divergent local edit";
+    let remote_bytes = b"divergent Dropbox edit";
+    let unrelated_bytes = b"an unrelated new file";
+    let old = RemoteFile::new(
+        dropbox_content_hash(old_bytes.as_slice())?,
+        DropboxRevision::new("rev-old"),
+    );
+    let remote = RemoteFile::new(
+        dropbox_content_hash(remote_bytes.as_slice())?,
+        DropboxRevision::new("rev-remote"),
+    );
+    let unrelated = RemoteFile::new(
+        dropbox_content_hash(unrelated_bytes.as_slice())?,
+        DropboxRevision::new("rev-unrelated"),
+    );
+    let path = Path::new("c-diverged.txt");
+    let remote_copy = conflict_copy_path(path, ConflictSide::Remote, remote_bytes)?;
+    let remote_copy_path = format!("/{}", remote_copy.to_string_lossy());
+    let server = FakeServer::start(vec![
+        account(),
+        FakeResponse::json(json!({
+            "entries": [file_metadata(
+                "/c-diverged.txt",
+                "/c-diverged.txt",
+                remote.revision.as_str(),
+                &remote.content,
+            )],
+            "cursor": "cursor-occupied-directory",
+            "has_more": false
+        })),
+        FakeResponse::json(json!({
+            "metadata": folder_metadata(&remote_copy_path, &remote_copy_path)
+        }))
+        .for_path("/2/files/create_folder_v2"),
+        FakeResponse::json(file_metadata(
+            "/d-unrelated.txt",
+            "/d-unrelated.txt",
+            unrelated.revision.as_str(),
+            &unrelated.content,
+        ))
+        .for_path("/2/files/upload"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-occupied-directory")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join(path), local_bytes)?;
+    std::fs::create_dir(root.join(&remote_copy))?;
+    std::fs::write(root.join("d-unrelated.txt"), unrelated_bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_baseline(&mut journal, path, &old)?;
+
+    let report = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+    assert_eq!(report.conflicts, 0);
+    assert_eq!(report.blocked, 1);
+    assert!(journal.conflicts()?.is_empty());
+    assert!(root.join(&remote_copy).is_dir());
+    assert_eq!(std::fs::read_dir(root.join(&remote_copy))?.count(), 0);
+    assert_eq!(std::fs::read(root.join(path))?, local_bytes);
+    assert_eq!(journal.baseline(path)?, Some(Baseline::Present(old)));
+    assert_eq!(
+        journal.baseline(Path::new("d-unrelated.txt"))?,
+        Some(Baseline::Present(unrelated))
+    );
+
+    let requests = server.finish()?;
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path != "/2/files/download")
+    );
+    Ok(())
+}
+
 #[test]
 fn remote_replay_creates_nested_parents_before_the_file() -> Result<(), Box<dyn Error>> {
     let bytes = b"nested bytes";
@@ -8178,6 +8866,22 @@ fn seed_directory_baseline(journal: &mut Journal, path: &Path) -> Result<(), io:
         .record_noop(path, &noop)
         .map(|_| ())
         .map_err(io::Error::other)
+}
+
+/// Name the deterministic conflict copy of `bytes` by materializing it in a scratch root.
+fn conflict_copy_path(
+    path: &Path,
+    side: ConflictSide,
+    bytes: &[u8],
+) -> Result<PathBuf, Box<dyn Error>> {
+    let scratch = TempDir::new()?;
+    let content = dropbox_content_hash(bytes)?;
+    match materialize_conflict(scratch.path(), path, side, &content, bytes)? {
+        ConflictOutcome::Created { path } => Ok(path),
+        ConflictOutcome::AlreadyPresent { .. } | ConflictOutcome::ContentChanged { .. } => {
+            Err(io::Error::other("scratch conflict copy was not created").into())
+        }
+    }
 }
 
 fn conflict_bytes(root: &Path) -> Result<Vec<Vec<u8>>, io::Error> {

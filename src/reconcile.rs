@@ -16,9 +16,9 @@ use thiserror::Error;
 use crate::dropbox::{DownloadAccess, DropboxClient, DropboxError};
 use crate::exclusions::is_excluded;
 use crate::journal::{
-    BaselineRecord, BlockReason, Journal, JournalError, LocalObservationRecord, OperationId,
-    PlanBlock, PlanConflictCompletion, PlanId, PlanRecord, PlanStatus, PlanSupersede, PlanUnblock,
-    RecordStatus, RemoteObservationRecord,
+    BLOCK_RETRY_SECONDS, BaselineRecord, BlockReason, Journal, JournalError,
+    LocalObservationRecord, OperationId, PlanBlock, PlanConflictCompletion, PlanId, PlanRecord,
+    PlanStatus, PlanSupersede, PlanUnblock, RecordStatus, RemoteObservationRecord,
 };
 use crate::local::{
     DownloadSlotIdentity, DownloadSlotLease, LocalError, LocalRenameOutcome,
@@ -34,9 +34,10 @@ use crate::model::{
 };
 use crate::planner::plan;
 use crate::recovery::{
-    ExactCopyOutcome, RecoveryError, ReplayBlocked, ReplayReport, materialize_local_conflict,
-    materialize_remote_conflict, materialize_remote_copy_at, prune_completed_recoveries,
-    replay_local_plans_at, replay_remote_operations_at, retire_excluded_plans,
+    CopyOutcome, ExactCopyOutcome, RecoveryError, ReplayBlocked, ReplayReport,
+    materialize_local_conflict, materialize_remote_conflict, materialize_remote_copy_at,
+    prune_completed_recoveries, replay_local_plans_at, replay_remote_operations_at,
+    retire_excluded_plans,
 };
 
 /// A reconciliation failure. Expected observation races are returned as outcomes instead.
@@ -848,8 +849,6 @@ fn replay_pending_at(
     Ok(report)
 }
 
-const DOWNLOAD_BLOCK_RETRY_SECONDS: u64 = 60 * 60;
-
 fn unix_now() -> Result<u64, ReconcileError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -864,7 +863,7 @@ fn record_download_blocks(
     if blocked.is_empty() {
         return Ok(());
     }
-    let retry_at = unix_now()?.saturating_add(DOWNLOAD_BLOCK_RETRY_SECONDS);
+    let retry_at = unix_now()?.saturating_add(BLOCK_RETRY_SECONDS);
     let pending = journal.pending_plans()?;
     for blocked in blocked {
         let current = pending.iter().find(|plan| {
@@ -906,7 +905,7 @@ fn record_local_replay_blocks(
             }
             _ => continue,
         };
-        let retry_at = unix_now()?.saturating_add(DOWNLOAD_BLOCK_RETRY_SECONDS);
+        let retry_at = unix_now()?.saturating_add(BLOCK_RETRY_SECONDS);
         match journal.block_plan(plan.id, &reason, retry_at)? {
             PlanBlock::Blocked | PlanBlock::AlreadyCompleted | PlanBlock::NotFound => {}
         }
@@ -1165,12 +1164,36 @@ fn reconcile_published(
                 continue;
             }
             if let Decision::Conflict(conflict) = decision {
+                if let PlanStatus::Blocked { reason, retry_at } = &pending_plan.status
+                    && matches!(
+                        reason,
+                        BlockReason::ConflictCopyOccupied | BlockReason::StageOccupied
+                    )
+                    && *retry_at > now
+                {
+                    blocked_paths.insert(canonical_path.clone());
+                    continue;
+                }
                 match prepare_conflict(dropbox, sync_root, upload_staging, &path, &conflict)? {
-                    Prepared::Ready(()) => {
+                    PreparedConflict::Ready => {
                         finish_pending_conflict(journal, pending_plan, &conflict)?
                     }
-                    Prepared::FreshObservation => {
+                    PreparedConflict::FreshObservation => {
                         return Ok(ReconcileOutcome::FreshObservationRequired { path });
+                    }
+                    PreparedConflict::Blocked(reason) => {
+                        let retry_at = now.saturating_add(BLOCK_RETRY_SECONDS);
+                        match journal.block_plan(pending_plan.id, &reason, retry_at)? {
+                            PlanBlock::Blocked => {}
+                            PlanBlock::AlreadyCompleted | PlanBlock::NotFound => {
+                                return Err(invalid(
+                                    &pending_plan.path,
+                                    "blocked conflict lost its pending plan",
+                                ));
+                            }
+                        }
+                        blocked_paths.insert(canonical_path.clone());
+                        continue;
                     }
                 }
                 report.conflicts += 1;
@@ -1233,18 +1256,25 @@ fn reconcile_published(
                 plans.push((path, plan));
             }
             Decision::Conflict(conflict) => {
-                match prepare_conflict(dropbox, sync_root, upload_staging, &path, &conflict)? {
-                    Prepared::Ready(()) => {}
-                    Prepared::FreshObservation => {
-                        return Ok(ReconcileOutcome::FreshObservationRequired { path });
-                    }
-                }
-                if !conflicts.iter().any(|(existing, record)| {
+                // A recorded conflict was prepared once; its copies now belong
+                // to the user, who may edit, move, or delete them.
+                if conflicts.iter().any(|(existing, record)| {
                     *existing == canonical_path && record.conflict == conflict
                 }) {
-                    journal.record_conflict(&path, &conflict)?;
-                    report.conflicts += 1;
+                    continue;
                 }
+                match prepare_conflict(dropbox, sync_root, upload_staging, &path, &conflict)? {
+                    PreparedConflict::Ready => {}
+                    PreparedConflict::FreshObservation => {
+                        return Ok(ReconcileOutcome::FreshObservationRequired { path });
+                    }
+                    PreparedConflict::Blocked(_) => {
+                        blocked_paths.insert(canonical_path.clone());
+                        continue;
+                    }
+                }
+                journal.record_conflict(&path, &conflict)?;
+                report.conflicts += 1;
             }
             Decision::DirectoryCollision(collision) => {
                 match prepare_directory_collision(
@@ -1357,6 +1387,13 @@ fn path_depth(path: &Path) -> usize {
 enum Prepared<T> {
     Ready(T),
     FreshObservation,
+}
+
+/// Result of placing every copy of one conflict at its deterministic name.
+enum PreparedConflict {
+    Ready,
+    FreshObservation,
+    Blocked(BlockReason),
 }
 
 fn prepare_plan(
@@ -1655,18 +1692,30 @@ fn prepare_conflict(
     upload_staging: &Path,
     path: &Path,
     conflict: &Conflict,
-) -> Result<Prepared<()>, ReconcileError> {
+) -> Result<PreparedConflict, ReconcileError> {
     if let Some(local) = conflict.local() {
-        let staged = match prepare_local(sync_root, upload_staging, path, &local.content)? {
-            Prepared::Ready(staged) => staged,
-            Prepared::FreshObservation => return Ok(Prepared::FreshObservation),
+        let staged = match prepare_local(sync_root, upload_staging, path, &local.content) {
+            Ok(Prepared::Ready(staged)) => staged,
+            Ok(Prepared::FreshObservation) => return Ok(PreparedConflict::FreshObservation),
+            Err(ReconcileError::StageDestinationOccupied { .. }) => {
+                return Ok(PreparedConflict::Blocked(BlockReason::StageOccupied));
+            }
+            Err(source) => return Err(source),
         };
-        materialize_local_conflict(sync_root, path, &staged)?;
+        match materialize_local_conflict(sync_root, path, &staged)? {
+            CopyOutcome::Ready => {}
+            CopyOutcome::Blocked(reason) => return Ok(PreparedConflict::Blocked(reason)),
+            CopyOutcome::SourceChanged => return Ok(PreparedConflict::FreshObservation),
+        }
     }
     if let Some(remote) = conflict.remote() {
-        materialize_remote_conflict(dropbox, sync_root, path, remote)?;
+        match materialize_remote_conflict(dropbox, sync_root, path, remote)? {
+            CopyOutcome::Ready => {}
+            CopyOutcome::Blocked(reason) => return Ok(PreparedConflict::Blocked(reason)),
+            CopyOutcome::SourceChanged => return Ok(PreparedConflict::FreshObservation),
+        }
     }
-    Ok(Prepared::Ready(()))
+    Ok(PreparedConflict::Ready)
 }
 
 fn prepare_local(
@@ -3176,7 +3225,10 @@ mod tests {
                 std::io::Error::other("stable conflict source requested a fresh scan").into(),
             );
         };
-        materialize_local_conflict(root.path(), path, &staged)?;
+        assert_eq!(
+            materialize_local_conflict(root.path(), path, &staged)?,
+            CopyOutcome::Ready
+        );
         finish_pending_conflict(&mut journal, &pending, &conflict)?;
 
         assert!(journal.pending_plans()?.is_empty());

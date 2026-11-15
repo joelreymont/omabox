@@ -85,6 +85,12 @@ pub enum LocalError {
         /// Rejected path.
         path: PathBuf,
     },
+    /// A regular file exists at the path but cannot be opened for reading.
+    #[error("local path `{path}` is a file Omabox cannot read")]
+    UnreadableFile {
+        /// The unreadable file.
+        path: PathBuf,
+    },
     /// A file or directory changed while it was being observed.
     #[error("local path `{path}` changed during `{operation}`")]
     ChangedDuringRead {
@@ -2881,6 +2887,7 @@ fn entry_unknown(
     match error {
         LocalError::UnsupportedObject { path } => Ok((path, wrong_type)),
         LocalError::ChangedDuringRead { path, .. } => Ok((path, UnknownReason::Incomplete)),
+        LocalError::UnreadableFile { path } => Ok((path, UnknownReason::Inaccessible)),
         LocalError::Io {
             operation,
             path,
@@ -3663,6 +3670,11 @@ fn open_regular_at_if_present(
     ) {
         Ok(fd) => fd,
         Err(source) if source == rustix::io::Errno::NOENT => return Ok(None),
+        Err(source) if source == rustix::io::Errno::ACCESS => {
+            return Err(LocalError::UnreadableFile {
+                path: path.to_path_buf(),
+            });
+        }
         Err(source) => return Err(syscall_failure(operation, path, source)),
     };
     let file = File::from(fd);
@@ -5568,6 +5580,72 @@ mod tests {
             Some(Observation::Present(_))
         ));
         assert_eq!(scan.observations().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_regular_file_is_reported_as_unreadable() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Root opens a file whatever its mode.
+        if rustix::process::geteuid().is_root() {
+            return Ok(());
+        }
+        let root = TempDir::new()?;
+        std::fs::write(root.path().join("locked.txt"), b"locked")?;
+        let root_fd = open_absolute_directory(root.path(), "open test root")?;
+        std::fs::set_permissions(
+            root.path().join("locked.txt"),
+            std::fs::Permissions::from_mode(0o000),
+        )?;
+
+        let hashed = hash_at_if_present(
+            &root_fd,
+            OsStr::new("locked.txt"),
+            Path::new("locked.txt"),
+            "hash unreadable test file",
+        );
+
+        assert!(
+            matches!(&hashed, Err(LocalError::UnreadableFile { path }) if path == Path::new("locked.txt")),
+            "{hashed:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unsearchable_parent_is_an_io_failure() -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Root searches a directory whatever its mode.
+        if rustix::process::geteuid().is_root() {
+            return Ok(());
+        }
+        let root = TempDir::new()?;
+        std::fs::create_dir(root.path().join("closed"))?;
+        std::fs::write(root.path().join("closed/file.txt"), b"inside")?;
+        let parent = open_absolute_directory(&root.path().join("closed"), "open test parent")?;
+        std::fs::set_permissions(
+            root.path().join("closed"),
+            std::fs::Permissions::from_mode(0o600),
+        )?;
+
+        let hashed = hash_at_if_present(
+            &parent,
+            OsStr::new("file.txt"),
+            Path::new("closed/file.txt"),
+            "hash file below unsearchable parent",
+        );
+        allow_owner_access(&root.path().join("closed"))?;
+
+        assert!(
+            matches!(
+                &hashed,
+                Err(LocalError::Io { source, .. })
+                    if source.raw_os_error() == Some(Errno::ACCESS.raw_os_error())
+            ),
+            "{hashed:?}"
+        );
         Ok(())
     }
 

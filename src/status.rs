@@ -147,6 +147,9 @@ fn block_reason(reason: &BlockReason) -> String {
         }
         BlockReason::LocalObjectInWay => String::from("a local object blocks the download path"),
         BlockReason::RemoteObject => String::from("a Dropbox object blocks the file path"),
+        BlockReason::ConflictCopyOccupied => {
+            String::from("another file holds this path's conflict copy name")
+        }
     }
 }
 

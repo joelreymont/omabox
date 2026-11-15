@@ -337,8 +337,14 @@ the existing `internal_name` digest over (side, path, content). Two different
 payloads never share a name, and the same payload maps to the same name, so no
 suffix negotiation or journal-recorded names are needed. The journal's
 conflict record is unchanged. A conflict is prepared once: later passes skip a
-path whose conflict record exists and whose copies are present at their
-deterministic names.
+path whose conflict record holds the same conflict, so a copy the user edits,
+moves or deletes is left alone. When a copy's name already holds anything but
+that copy (other bytes, a directory, a symlink, a special file or a file Omabox
+cannot read), or a staging slot the conflict needs is occupied, only that path
+is blocked (`ConflictCopyOccupied` or `StageOccupied`); its payloads stay where
+they are. A conflict on a pending plan blocks the plan and tries again an hour
+later; a new conflict has no plan to hold the block, so every pass tries it
+again.
 
 `omabox status` lists conflicts with both copy names. The runtime snapshot
 gains `conflicts: Vec<String>` (bounded to 20 display paths) and

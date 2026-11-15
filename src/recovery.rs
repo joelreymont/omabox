@@ -12,9 +12,9 @@ use crate::dropbox::{
     DropboxClient, DropboxError, MutationOutcome, MutationRejection, RemotePathState,
 };
 use crate::journal::{
-    BlockReason, Journal, JournalError, OperationCompletion, OperationId, PlanBlock,
-    PlanConflictCompletion, PlanId, PlanRecord, PlanSupersede, PlannedOperation, RecordStatus,
-    RecoveryForget, RecoveryRecord,
+    BLOCK_RETRY_SECONDS, BlockReason, Journal, JournalError, OperationCompletion, OperationId,
+    PlanBlock, PlanConflictCompletion, PlanId, PlanRecord, PlanSupersede, PlannedOperation,
+    RecordStatus, RecoveryForget, RecoveryRecord,
 };
 use crate::local::{
     ConflictOutcome, ConflictSide, CreateDirectoryOutcome, DeleteDirectoryOutcome, DeleteOutcome,
@@ -27,7 +27,6 @@ use crate::model::{Baseline, Conflict, ContentIdentity, LocalFile, Operation, Re
 
 /// Legacy recovery payloads remain available for this long before cleanup.
 pub const COMPLETED_RECOVERY_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-const MUTATION_BLOCK_RETRY: Duration = Duration::from_secs(60 * 60);
 
 /// A recovery or replay failure.
 #[derive(Debug, Error)]
@@ -93,6 +92,17 @@ pub(crate) enum ExactCopyOutcome {
     DestinationChanged,
     /// Unrelated bytes occupy the selected path's deterministic download stage.
     StageOccupied,
+}
+
+/// Result of placing one conflict copy at its deterministic name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CopyOutcome {
+    /// The copy's exact bytes are durably present at its deterministic name.
+    Ready,
+    /// The copy cannot be placed until this cause clears; every payload stays where it is.
+    Blocked(BlockReason),
+    /// The bytes being copied no longer match their recorded identity.
+    SourceChanged,
 }
 
 /// Why a replayable operation remains pending.
@@ -917,8 +927,20 @@ fn apply_file_mutation(
             path: plan.path.clone(),
         })),
         MutationOutcome::PreconditionChanged(RemotePathState::File(remote)) => {
-            materialize_local_conflict_at(root, root_path, &plan.path, staged)?;
-            materialize_remote_conflict_at(dropbox, root, root_path, &plan.path, &remote)?;
+            if let Some(blocked) = unplaced_copy(
+                journal,
+                plan,
+                materialize_local_conflict_at(root, root_path, &plan.path, staged)?,
+            )? {
+                return Ok(Some(blocked));
+            }
+            if let Some(blocked) = unplaced_copy(
+                journal,
+                plan,
+                materialize_remote_conflict_at(dropbox, root, root_path, &plan.path, &remote)?,
+            )? {
+                return Ok(Some(blocked));
+            }
             let local = LocalFile::new(staged.content().clone());
             let conflict = match mutation {
                 FileMutation::Create => Conflict::InitialCollision { local, remote },
@@ -930,7 +952,13 @@ fn apply_file_mutation(
         }
         MutationOutcome::PreconditionChanged(RemotePathState::Absent) => match mutation {
             FileMutation::Replace => {
-                materialize_local_conflict_at(root, root_path, &plan.path, staged)?;
+                if let Some(blocked) = unplaced_copy(
+                    journal,
+                    plan,
+                    materialize_local_conflict_at(root, root_path, &plan.path, staged)?,
+                )? {
+                    return Ok(Some(blocked));
+                }
                 let conflict = Conflict::RemoteDeletionLocalEdit {
                     local: LocalFile::new(staged.content().clone()),
                 };
@@ -995,7 +1023,13 @@ fn apply_delete_mutation(
                     path: plan.path.clone(),
                 }));
             }
-            materialize_remote_conflict_at(dropbox, root, root_path, &plan.path, &remote)?;
+            if let Some(blocked) = unplaced_copy(
+                journal,
+                plan,
+                materialize_remote_conflict_at(dropbox, root, root_path, &plan.path, &remote)?,
+            )? {
+                return Ok(Some(blocked));
+            }
             let conflict = Conflict::LocalDeletionRemoteEdit { remote };
             finish_conflict(journal, plan.id, &plan.path, &conflict)?;
             report.completed_operations += 1;
@@ -1052,13 +1086,41 @@ fn persist_remote_block(
         ReplayBlocked::RemoteObject { .. } => BlockReason::RemoteObject,
         _ => return Ok(blocked),
     };
+    block_durably(journal, plan, reason)
+}
+
+/// Settle a conflict copy that was not placed: hold the plan for a blocked copy, or
+/// retire it for a fresh observation when the copied bytes changed. `None` means placed.
+fn unplaced_copy(
+    journal: &mut Journal,
+    plan: &PlanRecord,
+    outcome: CopyOutcome,
+) -> Result<Option<ReplayBlocked>, RecoveryError> {
+    match outcome {
+        CopyOutcome::Ready => Ok(None),
+        CopyOutcome::Blocked(reason) => block_durably(journal, plan, reason).map(Some),
+        CopyOutcome::SourceChanged => {
+            supersede_plan(journal, plan)?;
+            Ok(Some(ReplayBlocked::FreshObservationRequired {
+                path: plan.path.clone(),
+            }))
+        }
+    }
+}
+
+/// Hold one plan with a classified reason until its retry deadline.
+fn block_durably(
+    journal: &mut Journal,
+    plan: &PlanRecord,
+    reason: BlockReason,
+) -> Result<ReplayBlocked, RecoveryError> {
     let retry_at = if reason == BlockReason::UnsupportedFileSize {
         i64::MAX as u64
     } else {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|source| RecoveryError::Clock { source })?
-            .saturating_add(MUTATION_BLOCK_RETRY)
+            .saturating_add(Duration::from_secs(BLOCK_RETRY_SECONDS))
             .as_secs()
     };
     match journal.block_plan(plan.id, &reason, retry_at)? {
@@ -1090,7 +1152,7 @@ pub(crate) fn materialize_local_conflict(
     sync_root: &Path,
     path: &Path,
     staged: &StagedUpload,
-) -> Result<(), RecoveryError> {
+) -> Result<CopyOutcome, RecoveryError> {
     let root = open_root(sync_root, "open sync root for local conflict")?;
     materialize_local_conflict_at(&root, sync_root, path, staged)
 }
@@ -1100,8 +1162,14 @@ fn materialize_local_conflict_at(
     root_path: &Path,
     path: &Path,
     staged: &StagedUpload,
-) -> Result<(), RecoveryError> {
+) -> Result<CopyOutcome, RecoveryError> {
     let bytes = staged.open_verified()?;
+    // Conflict writes name the copy by its absolute display path.
+    let copy = root_path.join(conflict_relative_path(
+        path,
+        ConflictSide::Local,
+        staged.content(),
+    )?);
     match materialize_conflict_at(
         root,
         root_path,
@@ -1109,12 +1177,29 @@ fn materialize_local_conflict_at(
         ConflictSide::Local,
         staged.content(),
         bytes,
-    )? {
-        ConflictOutcome::Created { .. } | ConflictOutcome::AlreadyPresent { .. } => Ok(()),
-        ConflictOutcome::ContentChanged { .. } => Err(invalid(
-            path,
-            "verified upload changed during conflict copy",
-        )),
+    ) {
+        Ok(ConflictOutcome::Created { .. } | ConflictOutcome::AlreadyPresent { .. }) => {
+            Ok(CopyOutcome::Ready)
+        }
+        Ok(ConflictOutcome::ContentChanged { .. }) => Ok(CopyOutcome::SourceChanged),
+        Err(LocalError::DestinationOccupied { .. }) => {
+            Ok(CopyOutcome::Blocked(BlockReason::ConflictCopyOccupied))
+        }
+        Err(source) if copy_name_occupied(&source, &copy) => {
+            Ok(CopyOutcome::Blocked(BlockReason::ConflictCopyOccupied))
+        }
+        Err(source) => Err(source.into()),
+    }
+}
+
+/// Whether `error` reports something Omabox cannot replace at a conflict copy's
+/// own name: a directory, symlink or special file, or a file it cannot read.
+fn copy_name_occupied(error: &LocalError, copy: &Path) -> bool {
+    match error {
+        LocalError::UnsupportedObject { path } | LocalError::UnreadableFile { path } => {
+            path == copy
+        }
+        _ => false,
     }
 }
 
@@ -1123,7 +1208,7 @@ pub(crate) fn materialize_remote_conflict(
     sync_root: &Path,
     path: &Path,
     remote: &RemoteFile,
-) -> Result<(), RecoveryError> {
+) -> Result<CopyOutcome, RecoveryError> {
     let root = open_root(sync_root, "open sync root for remote conflict")?;
     materialize_remote_conflict_at(dropbox, &root, sync_root, path, remote)
 }
@@ -1146,12 +1231,20 @@ fn materialize_remote_conflict_at(
     root_path: &Path,
     path: &Path,
     remote: &RemoteFile,
-) -> Result<(), RecoveryError> {
+) -> Result<CopyOutcome, RecoveryError> {
+    // Installs name the copy by its path relative to the sync root.
     let conflict = conflict_relative_path(path, ConflictSide::Remote, &remote.content)?;
-    require_exact_copy(
-        ensure_exact_copy_at(dropbox, root, root_path, &conflict, path, remote)?,
-        path,
-    )
+    match ensure_exact_copy_at(dropbox, root, root_path, &conflict, path, remote) {
+        Ok(ExactCopyOutcome::Ready) => Ok(CopyOutcome::Ready),
+        Ok(ExactCopyOutcome::DestinationChanged) => {
+            Ok(CopyOutcome::Blocked(BlockReason::ConflictCopyOccupied))
+        }
+        Ok(ExactCopyOutcome::StageOccupied) => Ok(CopyOutcome::Blocked(BlockReason::StageOccupied)),
+        Err(RecoveryError::Local { source }) if copy_name_occupied(&source, &conflict) => {
+            Ok(CopyOutcome::Blocked(BlockReason::ConflictCopyOccupied))
+        }
+        Err(source) => Err(source),
+    }
 }
 
 fn ensure_exact_copy_at(
@@ -1193,19 +1286,6 @@ fn ensure_exact_copy_at(
         }
         InstallOutcome::StageDestinationOccupied { .. } => Ok(ExactCopyOutcome::StageOccupied),
         InstallOutcome::PreconditionChanged { .. } => Ok(ExactCopyOutcome::DestinationChanged),
-    }
-}
-
-fn require_exact_copy(outcome: ExactCopyOutcome, path: &Path) -> Result<(), RecoveryError> {
-    match outcome {
-        ExactCopyOutcome::Ready => Ok(()),
-        ExactCopyOutcome::DestinationChanged => {
-            Err(invalid(path, "exact Dropbox destination is occupied"))
-        }
-        ExactCopyOutcome::StageOccupied => Err(invalid(
-            path,
-            "exact Dropbox staging destination is occupied",
-        )),
     }
 }
 
@@ -1693,5 +1773,45 @@ mod retention_tests {
 
     fn test_error(detail: &'static str) -> io::Error {
         io::Error::other(detail)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    use super::copy_name_occupied;
+    use crate::local::LocalError;
+
+    #[test]
+    fn only_an_object_at_the_copy_name_occupies_it() {
+        let copy = Path::new("notes (conflicted copy).txt");
+        let other = PathBuf::from("notes.txt");
+        let unsupported = |path: &Path| LocalError::UnsupportedObject {
+            path: path.to_path_buf(),
+        };
+        let unreadable = |path: &Path| LocalError::UnreadableFile {
+            path: path.to_path_buf(),
+        };
+
+        assert!(copy_name_occupied(&unsupported(copy), copy));
+        assert!(copy_name_occupied(&unreadable(copy), copy));
+        assert!(!copy_name_occupied(&unsupported(&other), copy));
+        assert!(!copy_name_occupied(&unreadable(&other), copy));
+    }
+
+    #[test]
+    fn a_denied_operation_at_the_copy_name_does_not_occupy_it() {
+        // A parent that cannot be written or searched carries the copy's path
+        // and EACCES without proving anything exists at the copy's name.
+        let copy = Path::new("notes (conflicted copy).txt");
+        let denied = LocalError::Io {
+            operation: "stage conflict copy",
+            path: copy.to_path_buf(),
+            source: io::Error::from_raw_os_error(rustix::io::Errno::ACCESS.raw_os_error()),
+        };
+
+        assert!(!copy_name_occupied(&denied, copy));
     }
 }

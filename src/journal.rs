@@ -23,7 +23,8 @@ const MIGRATION_V4: &str = include_str!("../migrations/0004.sql");
 const MIGRATION_V5: &str = include_str!("../migrations/0005.sql");
 const MIGRATION_V6: &str = include_str!("../migrations/0006.sql");
 const MIGRATION_V7: &str = include_str!("../migrations/0007.sql");
-const SCHEMA_VERSION: i64 = 7;
+const MIGRATION_V8: &str = include_str!("../migrations/0008.sql");
+const SCHEMA_VERSION: i64 = 8;
 const BUSY_TIMEOUT_MILLISECONDS: u64 = 5_000;
 const FINISH_PLAN: &str = "UPDATE plans \
     SET status = 'completed', blocked_json = NULL, retry_at = NULL WHERE id = ?1";
@@ -495,7 +496,12 @@ pub enum BlockReason {
     LocalObjectInWay,
     /// Dropbox holds a folder or unsupported object where a file is expected.
     RemoteObject,
+    /// Other bytes hold the deterministic name of one of this path's conflict copies.
+    ConflictCopyOccupied,
 }
+
+/// Seconds a blocked plan waits before its cause is retried.
+pub(crate) const BLOCK_RETRY_SECONDS: u64 = 60 * 60;
 
 /// Result of holding a live plan until its cause is retried.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -771,6 +777,15 @@ impl Journal {
                     .execute_batch(MIGRATION_V7)
                     .map_err(|source| JournalError::Sqlite {
                         operation: "apply journal version-seven migration",
+                        path: path.clone(),
+                        source,
+                    })?;
+            }
+            if version < 8 {
+                transaction
+                    .execute_batch(MIGRATION_V8)
+                    .map_err(|source| JournalError::Sqlite {
+                        operation: "apply journal version-eight migration",
                         path: path.clone(),
                         source,
                     })?;
@@ -4072,12 +4087,12 @@ mod tests {
         drop(read_only);
 
         let mut journal = Journal::open(&database_path)?;
-        assert_eq!(journal.schema_version, 7);
+        assert_eq!(journal.schema_version, 8);
         assert_eq!(
             journal
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
-            7
+            8
         );
         assert_eq!(journal.local_root_binding()?, Some(legacy.clone()));
         let observation = LocalObservationRecord {
@@ -5358,7 +5373,7 @@ mod tests {
         drop(legacy);
 
         let mut journal = Journal::open(&database_path)?;
-        assert_eq!(journal.schema_version, 7);
+        assert_eq!(journal.schema_version, 8);
         assert_eq!(journal.baseline(path)?, None);
         assert_eq!(journal.baseline(kept_path)?, Some(kept_baseline.clone()));
         assert_eq!(journal.baseline_paths()?, vec![kept_path.to_path_buf()]);
@@ -5411,7 +5426,7 @@ mod tests {
         let version = journal
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         let mut foreign_keys = journal
             .connection
             .prepare("PRAGMA foreign_key_list(recovery_records)")?;
@@ -5487,7 +5502,7 @@ mod tests {
         let version = journal
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         Ok(())
     }
 
@@ -5898,12 +5913,12 @@ mod tests {
         }
 
         let journal = Journal::open(&database_path)?;
-        assert_eq!(journal.schema_version, 7);
+        assert_eq!(journal.schema_version, 8);
         assert_eq!(
             journal
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
-            7
+            8
         );
 
         let pending = journal.pending_plans()?;
@@ -6119,7 +6134,7 @@ mod tests {
 
         let journal = Journal::open(&database_path)?;
 
-        assert_eq!(journal.schema_version, 7);
+        assert_eq!(journal.schema_version, 8);
         assert_eq!(journal.baseline_paths()?, vec![kept_path.to_path_buf()]);
         assert_eq!(journal.baseline(Path::new("unique.txt"))?, Some(kept));
         assert_eq!(journal.baseline(Path::new("collided.txt"))?, None);
@@ -6539,22 +6554,22 @@ mod tests {
         let directory = TempDir::new()?;
         let database_path = journal_path(&directory);
         let connection = Connection::open(&database_path)?;
-        connection.pragma_update(None, "user_version", 8)?;
+        connection.pragma_update(None, "user_version", 9)?;
         drop(connection);
 
         let opened = Journal::open(&database_path);
         assert!(matches!(
             opened,
             Err(JournalError::UnsupportedVersion {
-                found: 8,
-                supported: 7,
+                found: 9,
+                supported: 8,
                 ..
             })
         ));
         let connection = Connection::open(database_path)?;
         let version =
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         Ok(())
     }
 
