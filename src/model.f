@@ -840,12 +840,7 @@ ARENA CURSORS JSON:cursor
 
 \ The text of the object's member named by the second string.
 : MEMBER ( ^u8 n ^u8 n reading -- ^u8 n )
-   {: k:^ ku:n r:reading :}
-   r OPEN JSON:T-OBJ EXPECT
-   k ku JSON:READ-FIND-KEY 0= if E-STORED throw then
-   JSON:READ-ANY-SPAN$ {: v:^ vu:n :}
-   k ku JSON:READ-FIND-KEY if E-STORED throw then
-   JSON:READ-FINISH v vu ;
+   READING-UNMAKE drop JSON:READ-MEMBER$ ;
 
 \ A string's decoded bytes, copied into the arena; its text bounds them.
 : READ-STRING ( ^u8 n reading -- str )
