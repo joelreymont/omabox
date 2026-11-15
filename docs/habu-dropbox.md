@@ -121,10 +121,9 @@ STRUCTURE config
   and metadata before any byte reaches the quotation, then hands it each body
   chunk with that chunk's file offset. The caller writes and hashes the
   chunks.
-  - A 416 whose size is `offset` answers `done` with no chunks: the caller
-    already holds the whole file.
-  - Any other 416 starts over once from 0, so the quotation sees offset 0
-    again.
+  - A 416 from a nonzero offset starts over once from 0, as the Rust version
+    does, so the quotation sees offset 0 again. A 416 from 0 throws
+    `E-ANSWER`. Every `done` therefore carries the entry Dropbox reported.
 - **`DELETE`** sends the rev as `parent_rev`. With an empty rev it deletes
   unconditionally, which sync uses only for a folder it has just seen empty.
 - **A mutation confirms an answer it cannot trust.** libcurl resends a POST
