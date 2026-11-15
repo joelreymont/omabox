@@ -6,6 +6,14 @@
   JSON, then its decision.
 - `fold.tsv`: a display path in hex, then `CanonicalPath::from_display` of
   it in hex.
+- `schema.tsv`: a fresh journal's `sqlite_master` in `rowid` order (`type`,
+  `name`, `tbl_name`, `sql`; NULL empty; `\n`, `\t`, `\\` escaped), then
+  `user_version`.
+- `journal.sqlite3`: a schema-8 journal written through `Journal`, a row in
+  every table but `legacy_local_root_adoption`, which only a migration fills.
+  `recovery_records.retained_at` holds the clock (`unixepoch()`).
+- `journal.tsv`: each public read of `journal.sqlite3`, then its answer as
+  Rust's `{:?}`; `completed_recoveries` carries that clock.
 
 Written by `OMABOX_ORACLE=<dir> cargo test oracle -- --ignored` at `rust`
-commit `abb0d2fe8ab165983c02714f1338e07eb08ffcf5` (`src/journal/oracle.rs`).
+commit `e3c161352d0ddca750059a1ef7aea4f7c7cce811` (`src/journal/oracle.rs`).

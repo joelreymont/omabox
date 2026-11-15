@@ -1,0 +1,27 @@
+table	local_observations	local_observations	CREATE TABLE local_observations (\n    path BLOB PRIMARY KEY NOT NULL,\n    observation_json TEXT NOT NULL\n) STRICT
+index	sqlite_autoindex_local_observations_1	local_observations	
+table	remote_inventory	remote_inventory	CREATE TABLE remote_inventory (\n    singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),\n    cursor TEXT NOT NULL\n) STRICT
+table	dropbox_binding	dropbox_binding	CREATE TABLE dropbox_binding (\n    singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),\n    account_id TEXT NOT NULL,\n    root_namespace_id TEXT NOT NULL,\n    remote_root TEXT NOT NULL\n) STRICT
+table	recovery_records	recovery_records	CREATE TABLE "recovery_records" (\n    id INTEGER PRIMARY KEY NOT NULL,\n    operation_id INTEGER NOT NULL UNIQUE,\n    original_path BLOB NOT NULL,\n    recovery_path BLOB NOT NULL,\n    content_json TEXT NOT NULL,\n    status TEXT NOT NULL CHECK (status IN ('pending', 'completed')),\n    retained_at INTEGER CHECK (\n        retained_at IS NULL OR (status = 'completed' AND retained_at >= 0)\n    )\n) STRICT
+index	sqlite_autoindex_recovery_records_1	recovery_records	
+table	sqlite_sequence	sqlite_sequence	CREATE TABLE sqlite_sequence(name,seq)
+table	legacy_local_root_adoption	legacy_local_root_adoption	CREATE TABLE legacy_local_root_adoption (\n    singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1)\n) STRICT
+table	local_hash_cache	local_hash_cache	CREATE TABLE local_hash_cache (\n    root_generation INTEGER NOT NULL CHECK (root_generation >= 1),\n    path BLOB NOT NULL,\n    hash_json TEXT NOT NULL,\n    PRIMARY KEY (root_generation, path)\n) STRICT
+index	sqlite_autoindex_local_hash_cache_1	local_hash_cache	
+table	baselines	baselines	CREATE TABLE "baselines" (\n    path BLOB PRIMARY KEY NOT NULL,\n    baseline_json TEXT NOT NULL,\n    canonical_path BLOB NOT NULL\n) STRICT
+index	sqlite_autoindex_baselines_1	baselines	
+index	baselines_by_canonical_path	baselines	CREATE UNIQUE INDEX baselines_by_canonical_path\n    ON baselines(canonical_path)
+table	remote_observations	remote_observations	CREATE TABLE "remote_observations" (\n    path BLOB PRIMARY KEY NOT NULL,\n    observation_json TEXT NOT NULL,\n    canonical_path BLOB NOT NULL\n) STRICT
+index	sqlite_autoindex_remote_observations_1	remote_observations	
+index	remote_observations_by_canonical_path	remote_observations	CREATE UNIQUE INDEX remote_observations_by_canonical_path\n    ON remote_observations(canonical_path)
+index	remote_directories	remote_observations	CREATE INDEX remote_directories\n    ON remote_observations(canonical_path)\n    WHERE observation_json = '"Directory"'
+table	conflicts	conflicts	CREATE TABLE "conflicts" (\n    id INTEGER PRIMARY KEY NOT NULL,\n    path BLOB NOT NULL,\n    conflict_json TEXT NOT NULL,\n    canonical_path BLOB NOT NULL\n) STRICT
+index	conflicts_by_canonical_path	conflicts	CREATE INDEX conflicts_by_canonical_path\n    ON conflicts(canonical_path)
+table	plans	plans	CREATE TABLE "plans" (\n    id INTEGER PRIMARY KEY NOT NULL,\n    path BLOB NOT NULL,\n    canonical_path BLOB NOT NULL,\n    status TEXT NOT NULL CHECK (status IN ('pending', 'blocked', 'completed')),\n    blocked_json TEXT,\n    retry_at INTEGER,\n    CHECK ((status = 'blocked') = (blocked_json IS NOT NULL)),\n    CHECK ((status = 'blocked') = (retry_at IS NOT NULL)),\n    CHECK (retry_at IS NULL OR retry_at >= 0)\n) STRICT
+table	operations	operations	CREATE TABLE "operations" (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    plan_id INTEGER NOT NULL REFERENCES "plans"(id) ON DELETE RESTRICT,\n    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),\n    operation_json TEXT NOT NULL,\n    status TEXT NOT NULL CHECK (status IN ('pending', 'completed')),\n    UNIQUE (plan_id, ordinal)\n) STRICT
+index	sqlite_autoindex_operations_1	operations	
+index	one_live_plan_per_path	plans	CREATE UNIQUE INDEX one_live_plan_per_path\n    ON plans(canonical_path) WHERE status IN ('pending', 'blocked')
+index	plans_by_canonical_path	plans	CREATE INDEX plans_by_canonical_path\n    ON plans(canonical_path)
+index	operations_by_plan	operations	CREATE INDEX operations_by_plan\n    ON operations(plan_id, ordinal)
+table	local_root_binding	local_root_binding	CREATE TABLE "local_root_binding" (\n    singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),\n    canonical_path BLOB NOT NULL,\n    inode BLOB NOT NULL,\n    birth_seconds INTEGER,\n    birth_nanoseconds INTEGER,\n    subvolume BLOB,\n    generation INTEGER NOT NULL CHECK (generation >= 1),\n    CHECK ((birth_seconds IS NULL) = (birth_nanoseconds IS NULL)),\n    CHECK (birth_nanoseconds IS NULL OR birth_nanoseconds BETWEEN 0 AND 999999999),\n    CHECK (birth_seconds IS NOT NULL OR subvolume IS NULL)\n) STRICT
+user_version	8
