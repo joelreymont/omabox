@@ -65,7 +65,8 @@ ENUM reply
 \ files/get_metadata, download, upload (+ session), delete_v2,
 \ create_folder_v2; each answers the entry Dropbox reports
 : METADATA      ( ptr u8 n ptr client -- reply )  \ path
-: DOWNLOAD      ( ptr u8 n n ptr client [ ptr u8 n -- ] -- reply )  \ rev, offset, bytes
+: DOWNLOAD      ( ptr u8 n n ptr client [ ptr u8 n n -- ] -- reply )
+                \ rev, offset; each chunk and its offset
 : UPLOAD        ( ptr upload ptr client [ n -- ] -- reply )  \ bytes accepted
 : DELETE        ( ptr u8 n ptr u8 n ptr client -- reply )  \ path, rev
 : CREATE-FOLDER ( ptr u8 n ptr client -- reply )  \ path
@@ -89,6 +90,13 @@ STRUCTURE upload
    FIELD path ...
    FIELD rev ...        \ empty: add only if absent
 ;STRUCTURE
+
+\ Dropbox's content hash: SHA-256 over the joined SHA-256 digests
+\ of each 4 MiB block
+STRUCTURE hasher ... ;STRUCTURE
+: HASH-BEGIN ( ptr hasher -- )
+: HASH-FEED  ( ptr u8 n ptr hasher -- )
+: HASH-END   ( ptr hasher -- ptr u8 n )   \ 64 lowercase hex digits
 ```
 
 ```forth
@@ -109,16 +117,30 @@ STRUCTURE config
   path is then relative to that namespace, which the journal binds. An empty
   root sends no header, which only linking needs before it knows the root.
 - **`DOWNLOAD`** fetches `rev:<rev>`, which is that exact revision, from
-  `offset` with a Range header. It checks the answer's Content-Range and
-  metadata, and hands each body chunk to the quotation. The caller writes and
-  hashes the chunks.
+  `offset` with a Range header. It checks the answer's status, Content-Range
+  and metadata before any byte reaches the quotation, then hands it each body
+  chunk with that chunk's file offset. The caller writes and hashes the
+  chunks.
+  - A 416 whose size is `offset` answers `done` with no chunks: the caller
+    already holds the whole file.
+  - Any other 416 starts over once from 0, so the quotation sees offset 0
+    again.
 - **`DELETE`** sends the rev as `parent_rev`. With an empty rev it deletes
   unconditionally, which sync uses only for a folder it has just seen empty.
-- **A mutation whose answer is lost is confirmed before it answers.**
-  `UPLOAD`, `DELETE` and `CREATE-FOLDER` then ask `get_metadata`. They answer
-  `done` only if Dropbox now holds the intended result: the same content hash,
-  no entry, or a folder. Otherwise they answer `retry`. A mutation never
-  answers "unknown".
+- **A mutation confirms an answer it cannot trust.** libcurl resends a POST
+  on a new connection when a reused one closes before any answer byte, so a
+  mutation Dropbox applied can come back lost or refused. `UPLOAD`, `DELETE`
+  and `CREATE-FOLDER` then ask `get_metadata` whether Dropbox holds the
+  intended result: the same content hash, no entry, or a folder.
+  - A lost answer: `done` if it holds, else `retry`.
+  - A `conflict` refusal: `done` if it holds, else the refusal stands.
+  - `DELETE` refused `not-found` is `done` without asking: the path is
+    absent, which is what a delete intends.
+  - Every other refusal stands. A mutation never answers "unknown".
+- **`UPLOAD` checks what Dropbox committed.** The entry's lower path must be
+  the upload's, else it throws `E-ANSWER`. Its content hash must be the
+  upload's, else it answers `refused content-hash-mismatch`, the tag Dropbox
+  gives a single upload whose bytes do not match.
 
 ## The upload, as a state machine
 
@@ -197,6 +219,10 @@ The sync code builds these from the words above:
   keeps every option from one request to the next, and nothing clears its
   headers, so without it a client's one handle would resend every earlier
   request's headers, old tokens included.
+- **`net/curl.f`:** `HEADERS` answering a streamed transfer's headers from its
+  first chunk on. Today it refuses a transfer in flight, so `DOWNLOAD` could
+  check the status and Content-Range only after the body had reached the
+  caller.
 
 A call's deadlines need nothing new: `CURL:LOW-SPEED!` bounds the connect by
 the same seconds as a stalled body, so a call has `TIMEOUT!` for the whole
@@ -216,17 +242,24 @@ The tests run against a fake Dropbox on `net/http.f`, in the style of
   advance;
 - **long poll:** changes, a timeout and a backoff;
 - **metadata:** found and not found;
-- **download:** a resume by range, and a Content-Range mismatch;
-- **single upload:** add, and an update that conflicts;
+- **download:** a resume by range, a Content-Range mismatch, and a 416;
+- **content hash:** empty, one byte, exactly 4 MiB, and 4 MiB plus one;
+- **single upload:** add, an update that conflicts, and an upload Dropbox
+  already holds, refused as a conflict and confirmed;
 - **session upload:**
   - a lost append, resent;
   - `incorrect_offset` at the chunk's end;
   - a closed session, restarted once;
   - a lost finish, confirmed;
-- **delete and create-folder:** a conflict, and not found;
+- **delete and create-folder:** a conflict, not found, and a conflict whose
+  path is already gone;
 - **auth and transport:**
   - an expired token, refreshed and resent;
   - `invalid_grant`, which answers `unlinked`;
   - 429 with `Retry-After`, and 5xx;
   - a 3xx, which is not followed;
   - a non-ASCII path in `Dropbox-API-Arg`.
+
+The fake cuts an answer two ways: after the call takes effect (`LOSE`) and
+before (`DROP`). Either way it sends part of a status line and closes, so
+libcurl reports a failed transfer instead of resending the request.

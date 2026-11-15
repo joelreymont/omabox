@@ -210,3 +210,55 @@ notation.
   tests let through. The `RESET` review found two guards with no test, and a
   comment that left out what libcurl keeps (the cookies).
 
+## 2026-11-15: The request libcurl sent twice
+
+The delete lane's fake dropped the connection after applying a delete, to
+test a lost answer. The test still saw an answer: `refused not-found`.
+libcurl had sent the same POST again on a new connection, because the reused
+one closed before any answer byte. The second delete found nothing to delete.
+
+The Rust version already handles that outcome in `resolve_mutation_error`
+(`src/dropbox.rs:1300`): a conflict is checked against `get_metadata`, and a
+delete answered "not found" counts as done. The Habu port copied the
+confirmation of a lost answer but not of a refused one, because its design
+doc said only "lost". The fix follows Rust, and the fake now sends half a
+status line before it closes, so libcurl reports the failure instead of
+hiding it.
+
+Observation for the blog: the Rust code knew this; the port's design doc did not.
+Porting from the doc instead of the code dropped a behaviour that only a test
+of a lost answer could show.
+
+The upload lane stopped with six questions before writing code: how to read
+the file, what the session table does with other replies, how the fake loses
+an answer, where the content hash lives, how to check what Dropbox committed,
+and whether a conflict is confirmed. The brief settled none of them. The
+answers came from the Rust code (the hash, the commit check, the conflict),
+from Habu's libraries (the read) and from the lead (the table, the fake).
+
+## 2026-11-15: The size of `^T`
+
+The type change the user asked for, measured across Habu's tree: 16,678
+`ptr` tokens in the sources and tools, 4,263 in the tests, and 12,092
+`ptr u8 n` string pairs in 696 files. Every top-level string literal (3,406
+lines) needs the interpreter to accept a two-cell value, which it refuses
+today.
+
+The plan runs in steps, each built by the engine of the step before:
+1. an engine that reads both `ptr T` and `^T` and writes `^T`;
+2. one rewrite of the tree to `^T`;
+3. two-cell values at top level;
+4. an engine that adds `str`, a string as one item;
+5. string literals and primitives turn to `str`, with a marker on every file
+   that still reads a `str` as two cells;
+6. the files move over callees first, each dropping its marker;
+7. the marker goes, and nothing on master ever carried it.
+
+A role is a one-field record over `str`: `STRUCTURE rev FIELD text str
+;STRUCTURE`. Making one is a cast that emits no code, so the role costs
+nothing at run time, and the checker refuses a rev where a path goes.
+
+Observation for the blog: in Rust, `struct Rev(String)` is one line and the
+compiler already knows strings. Here the language learns what a string is
+before the application can say which one it holds.
+
