@@ -473,3 +473,40 @@ pass the checker are the same kind that passed Rust's compiler: getting the
 spec wrong, as with Retry-After rules or case comparison. Agents write Rust
 from memory; in Habu they lean on the card, slip on Forth details, and
 reinvent helpers they cannot find.
+
+## 2026-11-15: Step 2's shape, and Rust as the oracle
+
+Step 2 is seven Habu libraries (SQLite, operations on names under a directory
+descriptor, descriptor words, xattr, statx, secret writing, lossy UTF-8)
+before any omabox package that needs them. In Rust each was a crate or a
+`std` call. The design settled three departures from the plan's wording:
+SQLite failures throw one of three codes rather than return a result,
+because every journal call passes a failure up and the daemon tells only
+corrupt, full and other apart; the anchored calls use `O_NOFOLLOW` on one
+checked name instead of openat2, which gives the same property; and there is
+no secret erase, because nothing in the Rust version erases the credential.
+
+The planner's table, the JSON of every stored value and the case folding of
+paths now come from the Rust version itself: a test-only generator on the
+`rust` branch prints them, and the Habu tests read the output in
+`src/oracle/`. Hand-written expectations could not show byte identity with
+serde. One fold result was a surprise worth a test: `ΟΔΟΣ.txt` lowers to
+`οδοσ.txt`, since a sigma followed by `.txt` is not final.
+
+Observation for the blog: porting to a young language makes the old program
+the specification, and the cheapest way to read that specification is to
+run it.
+
+## 2026-11-15: An undefined word that was defined
+
+On the first engine with `str`, a definition calling `>str` failed with
+"undefined word", while `' >str` found it. Two hunts and about 90 tool calls
+found the cause far from the symptom. A primitive's row pushed a `str` as one
+cell, but the signature parser lays it out as its two. The build checks each
+row by writing it out as text and reading it back. The two rows differed, so
+the build silently dropped the text, and the run that loads it had no row.
+The fix is five lines: a row lays a layout type out as a signature does.
+
+Observation for the blog: Rust's errors point near their cause; here a
+silent consistency check turned a type-layout mismatch into a missing word.
+A check that drops data on a mismatch should say so.
