@@ -22,7 +22,8 @@
 \ failure is the outcome of an entry the scan observes: inside an
 \ observation a failure logs nothing, except one whose errno is
 \ exhaustion, which ends the scan; so a file that changes while it is
-\ hashed logs nothing on every pass.
+\ hashed logs nothing on every pass. A failure XATTR logged gets no
+\ second line.
 \ The scan walks the root depth first, each directory's names in byte order,
 \ and collects observations, cached hashes it may reuse and files to hash; a
 \ failure that concerns one entry publishes that entry as unknown and drops
@@ -120,9 +121,13 @@ $2E constant DOT
 \ How many entry observations OBSERVING has open; inside one, a failure
 \ is the entry's outcome unless its errno, 0 for none, is exhaustion.
 variable OBSERVING-DEPTH
+\ How many rethrows of a failure XATTR logged LOGGED has open.
+variable LOGGED-DEPTH
 
-: OUTCOME? ( n -- bool )
+\ Whether LOCAL logs nothing for a failure with errno e, 0 for none.
+: QUIET? ( n -- bool )
    {: e:n :}
+   LOGGED-DEPTH @ 0 > if true exit then
    OBSERVING-DEPTH @ 0 > e EXHAUSTED? 0= and ;
 
 \ Runs q, which observes one entry, and answers what it threw, 0 for none.
@@ -135,7 +140,7 @@ variable OBSERVING-DEPTH
 \ Logs "local path `p`" and the text after it, then throws code.
 : PATH-FAILS ( ^u8 n ^u8 n n -- )
    {: p:^ u:n t:^ tu:n code:n :}
-   0 OUTCOME? 0= if
+   0 QUIET? 0= if
       LOG-OPEN s" local path " LOG:TEXT+ p u QUOTED+
       t tu LOG:TEXT+ LOG:;LINE
    then
@@ -155,7 +160,7 @@ variable OBSERVING-DEPTH
 \ The operation, then the path, as every word below takes them.
 : CHANGED-FAILS ( ^u8 n ^u8 n n -- )
    {: o:^ ou:n p:^ u:n code:n :}
-   0 OUTCOME? 0= if
+   0 QUIET? 0= if
       LOG-OPEN s" local path " LOG:TEXT+ p u QUOTED+
       s"  changed during " LOG:TEXT+ o ou QUOTED+ LOG:;LINE
    then
@@ -165,7 +170,7 @@ variable OBSERVING-DEPTH
 
 : INVALID-HASH ( ^u8 n -- )
    {: o:^ ou:n :}
-   0 OUTCOME? 0= if
+   0 QUIET? 0= if
       LOG-OPEN s" operation " LOG:TEXT+ o ou QUOTED+
       s"  requires a lowercase Dropbox content hash" LOG:TEXT+ LOG:;LINE
    then
@@ -173,7 +178,7 @@ variable OBSERVING-DEPTH
 
 : CORRUPT ( ^u8 n ^u8 n -- )
    {: o:^ ou:n p:^ u:n :}
-   0 OUTCOME? 0= if
+   0 QUIET? 0= if
       LOG-OPEN s" private local file for " LOG:TEXT+ o ou QUOTED+
       s"  at " LOG:TEXT+ p u QUOTED+
       s"  failed content verification" LOG:TEXT+ LOG:;LINE
@@ -182,7 +187,7 @@ variable OBSERVING-DEPTH
 
 : OCCUPIED ( ^u8 n ^u8 n -- )
    {: o:^ ou:n p:^ u:n :}
-   0 OUTCOME? 0= if
+   0 QUIET? 0= if
       LOG-OPEN s" non-overwriting operation " LOG:TEXT+ o ou QUOTED+
       s"  found unrelated bytes at " LOG:TEXT+ p u QUOTED+ LOG:;LINE
    then
@@ -193,7 +198,7 @@ variable OBSERVING-DEPTH
 : IO-FAILS ( ^u8 n ^u8 n n -- )
    {: o:^ ou:n p:^ u:n code:n :}
    FS:ERRNO {: e:n :}
-   e OUTCOME? 0= if
+   e QUIET? 0= if
       LOG-OPEN s" local filesystem operation " LOG:TEXT+ o ou QUOTED+
       s"  failed for " LOG:TEXT+ p u QUOTED+ e ERRNO+ LOG:;LINE
    then
@@ -210,7 +215,7 @@ variable OBSERVING-DEPTH
 : STAGE-READ ( ^u8 n ^u8 n -- )
    {: o:^ ou:n p:^ u:n :}
    FS:ERRNO {: e:n :}
-   e OUTCOME? 0= if
+   e QUIET? 0= if
       LOG-OPEN s" could not read stage input during " LOG:TEXT+
       o ou QUOTED+ s"  for " LOG:TEXT+ p u QUOTED+ e ERRNO+ LOG:;LINE
    then
@@ -224,7 +229,7 @@ variable OBSERVING-DEPTH
 
 : HASH-READ ( -- )
    FS:ERRNO {: e:n :}
-   e OUTCOME? 0= if
+   e QUIET? 0= if
       LOG-OPEN
       s" could not read bytes while computing the Dropbox content hash"
       LOG:TEXT+ e ERRNO+ LOG:;LINE
@@ -238,14 +243,24 @@ variable OBSERVING-DEPTH
    code XATTR:E-XATTR = if true exit then
    code E-FS-LAST >= code E-FS-FIRST <= and ;
 
+\ Runs fail, which throws, with LOCAL's log off: XATTR logs each E-XATTR
+\ an attribute name LOCAL passes can draw.
+: LOGGED ( [ -- ] -- )
+   {: fail :}
+   1 LOGGED-DEPTH +!
+   [: fail execute ;] catch
+   -1 LOGGED-DEPTH +! throw ;
+
 \ Runs q from a clear FS:ERRNO; an FS code it throws runs fail, which
-\ throws LOCAL's code in its place.
+\ throws LOCAL's code in its place, logged unless XATTR logged it.
 : FS-FAILS ( R [ R -- R ] [ -- ] -- R )
    {: q fail :}
    0 FS:CAUSE!
    [: q execute ;] catch {: code:n :}
    code 0= if exit then
-   code FS-CODE? if fail execute then
+   code FS-CODE? if
+      code XATTR:E-XATTR = if fail LOGGED else fail execute then
+   then
    code throw ;
 
 \ Closes a descriptor, keeping FS:ERRNO; as Rust's drop of a File, it
@@ -1068,30 +1083,6 @@ private
 
 \ ---- the walk
 
-\ Dropbox's documented metadata suffixes and temporary-file prefixes
-\ (help.dropbox.com/en-en/sync/files-not-syncing), as Rust's
-\ is_excluded_name.
-: PREFIX? ( ^u8 n ^u8 n -- bool )
-   {: p:^ u:n x:^ xu:n :}
-   u xu < if false exit then
-   p xu x xu STR= ;
-
-: SUFFIX-CI? ( ^u8 n ^u8 n -- bool )
-   {: p:^ u:n x:^ xu:n :}
-   u xu < if false exit then
-   p u + xu - xu x xu STR=CI ;
-
-: EXCLUDED-NAME? ( ^u8 n -- bool )
-   {: p:^ u:n :}
-   p u s" ~$" PREFIX? if true exit then
-   p u s" .~" PREFIX? if true exit then
-   p u s" desktop.ini" SUFFIX-CI? if true exit then
-   p u s" thumbs.db" SUFFIX-CI? if true exit then
-   p u s" .ds_store" SUFFIX-CI? if true exit then
-   p u s\" icon\r" SUFFIX-CI? if true exit then
-   p u s" .dropbox" SUFFIX-CI? if true exit then
-   p u s" .dropbox.attr" SUFFIX-CI? ;
-
 : STAT-DEV ( stat -- n ) STAT-UNMAKE {: d i m s ms mn cs cn :} d ;
 
 : DIRECTORY? ( stat -- bool )
@@ -1278,7 +1269,7 @@ defer SCAN-SUBTREE ( fd str scan-context scan-entries -- )
 : SCAN-NAME ( fd str str scan-context scan-entries -- )
    {: dir:fd path:str parent:str cx:scan-context en:scan-entries :}
    path parent NAME-OF {: name:^ nu:n :}
-   name nu EXCLUDED-NAME? if exit then
+   name nu MODEL:EXCLUDED-NAME? if exit then
    en MARK {: mk:scan-mark :}
    [: dir name nu path cx en SCAN-ENTRY ;] OBSERVING {: code:n :}
    code 0= if exit then
@@ -1612,9 +1603,6 @@ SUBTREE-INSTALL
 
 \ ---- parents
 
-\ S_IRWXU: a parent directory a download makes.
-$1C0 constant MODE-PRIVATE-DIR
-
 \ An open parent below the root, as Rust's (OwnedFd, OsString, PathBuf):
 \ its descriptor, then the last component and the parent's path, both
 \ spans of the path opened.
@@ -1635,7 +1623,7 @@ STRUCTURE parent-dir
 \ exists by now is used as it is.
 : MAKE-PARENT ( fd ^u8 n ^u8 n -- )
    {: dir:fd name:^ nu:n p:^ u:n :}
-   dir name nu MODE-PRIVATE-DIR FS:TRY-MAKE-DIR-AT if
+   dir name nu FS:MODE-PRIVATE-DIR FS:TRY-MAKE-DIR-AT if
       dir p u s" sync newly created parent directory entry"
       SYNC-DIRECTORY exit
    then
@@ -3038,6 +3026,26 @@ private
 : EPHEMERAL ( -- download-preparation )
    LOCAL-DOWNLOAD--PREPARATION:ephemeral ;
 
+: READY? ( download-preparation -- bool )
+   MATCH download-preparation
+      ready OF drop true ENDOF
+      complete OF DROP-STAGE-OUTCOME false ENDOF
+      ephemeral OF false ENDOF
+   ;MATCH ;
+
+: UNLESS-READY ( download-preparation [ -- ] -- download-preparation )
+   {: p:download-preparation close :}
+   p READY? 0= if close execute then
+   p ;
+
+\ Runs q; close frees what a ready partial would hold, when q throws or
+\ answers no partial.
+: PREPARING ( [ -- download-preparation ] [ -- ] -- download-preparation )
+   {: q close :}
+   EPHEMERAL [: DROP-PREPARATION q execute ;] catch {: code:n :}
+   code 0= if close UNLESS-READY exit then
+   close execute code throw ;
+
 \ What a stage already at the download's name comes to, none when there
 \ is none; a verified stage's descriptor is closed.
 : EXISTING-OUTCOME ( download-stage -- option<stage-outcome<n>> )
@@ -3134,18 +3142,13 @@ public
       none OF t tu UNSAFE ENDOF
       some OF ENDOF
    ;MATCH PARENT-DIR-UNMAKE {: dir:fd last:str rel:str :}
-   EPHEMERAL dir
-   [: DROP-PREPARATION
-      s su s" <unnamed-download>" ar JOIN >str DOWNLOAD-SOURCE-DISPOSABLE
+   [: s su s" <unnamed-download>" ar JOIN >str DOWNLOAD-SOURCE-DISPOSABLE
       dir r ru rel str> t tu want ar NEW-LOCATION s su ar DISPOSABLE ;]
-   CLOSING ;
+   [: dir DISCARD ;] PREPARING ;
 
 private
 
 \ ---- partial ownership
-
-\ Dropbox's content-hash block: a partial grows a whole block at a time.
-$400000 constant DROPBOX-BLOCK
 
 : TARGET-DIR@ ( ^download-location -- fd )
    DOWNLOAD-LOCATION-TARGET-DIRECTORY @ ;
@@ -3187,35 +3190,20 @@ $400000 constant DROPBOX-BLOCK
       disposable OF {: p:str :} ENDOF
    ;MATCH ;
 
-\ Rust's drop of a partial: its file and its location's directories.
+public
+
+\ Rust's drop of a partial: its file and its location's directories. It
+\ closes a ready partial the daemon never appends to or restarts.
 : CLOSE-PARTIAL ( ^download-partial -- )
    {: x :}
    x PARTIAL-FILE DISCARD x DOWNLOAD-PARTIAL-LOCATION @ CLOSE-LOCATION ;
+
+private
 
 \ Closes the file the partial held and keeps f in its place.
 : SWAP-FILE ( fd ^download-partial -- )
    {: f:fd x :}
    x PARTIAL-FILE DISCARD f x DOWNLOAD-PARTIAL-FILE ! ;
-
-: READY? ( download-preparation -- bool )
-   MATCH download-preparation
-      ready OF drop true ENDOF
-      complete OF DROP-STAGE-OUTCOME false ENDOF
-      ephemeral OF false ENDOF
-   ;MATCH ;
-
-: UNLESS-READY ( download-preparation [ -- ] -- download-preparation )
-   {: p:download-preparation close :}
-   p READY? 0= if close execute then
-   p ;
-
-\ Runs q; close frees what a ready partial would hold, when q throws or
-\ answers no partial.
-: PREPARING ( [ -- download-preparation ] [ -- ] -- download-preparation )
-   {: q close :}
-   EPHEMERAL [: DROP-PREPARATION q execute ;] catch {: code:n :}
-   code 0= if close UNLESS-READY exit then
-   close execute code throw ;
 
 \ Runs q; a stage read's failure becomes an io failure, as Rust's
 \ From<StageIoError> for LocalError makes it.
@@ -3466,7 +3454,7 @@ $400000 constant DROPBOX-BLOCK
 : APPEND-BLOCKS ( ^download-partial n [ ^u8 n -- n ] -- )
    {: x total:n read :}
    begin x DOWNLOAD-PARTIAL-OFFSET @ total < while
-      x total x DOWNLOAD-PARTIAL-OFFSET @ - DROPBOX-BLOCK min read
+      x total x DOWNLOAD-PARTIAL-OFFSET @ - DROPBOX:BLOCK min read
       APPEND-BLOCK
       x DOWNLOAD-PARTIAL-OFFSET @ total CHECKPOINT? if
          x PERSIST-CHECKPOINT
@@ -4558,7 +4546,7 @@ private
 
 : MAKE-DIRECTORY-IN ( fd ^u8 n ^u8 n -- create-directory-outcome )
    {: dir:fd name:^ nu:n p:^ u:n :}
-   dir name nu MODE-PRIVATE-DIR FS:TRY-MAKE-DIR-AT if
+   dir name nu FS:MODE-PRIVATE-DIR FS:TRY-MAKE-DIR-AT if
       dir p u s" sync created local directory entry" SYNC-DIRECTORY
       dir name nu p u SYNC-MADE-DIRECTORY
       LOCAL-CREATE--DIRECTORY--OUTCOME:created exit

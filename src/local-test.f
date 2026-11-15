@@ -24,6 +24,7 @@
 \ directory under TMPDIR and removes it.
 \ Run from the repository root: hb --load src/local-test.f </dev/null
 require src/lib/test.f
+require src/lib/test/stderr.f
 require src/lib/fmt.f
 require src/lib/arena.f
 require src/lib/memory.f
@@ -31,6 +32,7 @@ require src/lib/property.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
 require src/lib/fs-anchored.f
+require src/lib/fs-list.f
 require src/lib/fd.f
 require src/lib/xattr.f
 require src/lib/adt/option.f
@@ -104,6 +106,11 @@ private
 : STATE-ROUND-TRIP ( binding n -- binding n bool )
    DOWNLOAD-SLOT-STATE-MAKE ENCODE-DOWNLOAD-SLOT-STATE
    DECODE-DOWNLOAD-SLOT-STATE STATE-APART ;
+
+\ The slot state's bytes for the binding at offset, valid until the
+\ next encode.
+: STATE-BYTES ( binding n -- ^u8 n )
+   DOWNLOAD-SLOT-STATE-MAKE ENCODE-DOWNLOAD-SLOT-STATE ;
 
 32 BUFFER: FILLED
 
@@ -253,7 +260,6 @@ EXPORT ZERO-CHECKPOINT
 EXPORT PROMOTE-WITH
 EXPORT COPY-PARTIAL
 EXPORT PARTIAL-STAGE-PATH
-EXPORT CLOSE-PARTIAL
 EXPORT PARTIAL-FILE
 EXPORT PARTIAL-PATH
 EXPORT DOWNLOAD-PARTIAL-XATTR
@@ -264,6 +270,7 @@ EXPORT TAKEN?
 EXPORT LEASE-OF
 EXPORT SLOT-STATE-OF
 EXPORT STATE-ROUND-TRIP
+EXPORT STATE-BYTES
 EXPORT FILLED-BINDING
 EXPORT OPENED-SLOT
 EXPORT STAGE-NAME
@@ -719,7 +726,7 @@ create TIMES 32 allot
 : NESTED? ( ^u8 n -- bool )
    {: p:^ u:n :}
    p u s" nested" STR= if true exit then
-   p u s" nested/" PREFIX? ;
+   p u s" nested/" STARTS-WITH? ;
 
 \ Moves the cached hashes beneath "nested" to retained.
 : RETAIN-NESTED ( scan-entries -- )
@@ -1093,13 +1100,26 @@ SHA256-CTX-BYTES BUFFER: PART
    LOCAL:DOWNLOAD-STAGE-XATTR s" marked" s" test unmark"
    LOCAL:REMOVE-XATTR ;
 
+256 BUFFER: ERR
+
+\ Marking an attribute that exists throws LOCAL's code with EEXIST, fd 2
+\ sent to stderr.txt, which then holds XATTR's one line and is removed.
+: ONE-XATTR-LINE ( fd ^u8 n -- )
+   {: f:fd p:^ u:n :}
+   s" stderr.txt" AT STDERR:CAPTURE
+   [: [: f p u MARK ;] LOCAL:E-IO TTHROWSQ FS:ERRNO FS:EEXIST T= ;]
+   [: STDERR:;CAPTURE ;] finally
+   s" stderr.txt" AT ERR 256 FS:READ-ALL {: n :}
+   s" stderr.txt" AT FS:REMOVE-FILE
+   ERR n 10 COUNT-CHAR 1 T=
+   ERR n s" xattr: fsetxattr" CONTAINS? TTRUE ;
+
 : MARKER-CHECKS ( fd -- )
    {: f:fd :}
    f s" marked" MARK
    f MARKER s" marked" LOCAL:MARKER$ s" expected" T$=
    f s" other" s" marked" LOCAL:MARKER$ s" other" T$=
-   [: f s" marked" MARK ;] LOCAL:E-IO TTHROWSQ
-   FS:ERRNO FS:EEXIST T=
+   f s" marked" ONE-XATTR-LINE
    f UNMARK
    f MARKER s" marked" LOCAL:MARKER$ s" missing" T$=
    f UNMARK ;
@@ -1345,6 +1365,35 @@ SHA256-CTX-BYTES BUFFER: PART
    {: b:LOCAL:binding at:n found:bool :}
    found TTRUE at offset T= b seven LOCAL:BINDING= TTRUE
    offset x <= TTRUE x offset cp + < TTRUE offset BLOCK mod 0 T= ;
+
+64 BUFFER: UNHEXED
+
+\ The byte the two hex digits at p spell.
+: HEX-BYTE ( ^u8 -- n )
+   {: p:^ :}
+   p c@ STR-HEX-DIGIT-VALUE 4 lshift p 1+ c@ STR-HEX-DIGIT-VALUE or ;
+
+\ The bytes the hex digits spell, valid until the next.
+: UNHEX ( ^u8 n -- ^u8 n )
+   {: h:^ hu:n :}
+   hu 2 / 0 ?do h i 2 * + HEX-BYTE UNHEXED i + c! loop
+   UNHEXED hu 2 / ;
+
+\ Rust's DownloadSlotIdentity::new and encode_download_slot_state; the
+\ binding is sha256sum of Rust's input for this download.
+: SLOT-BYTES-ARE-RUSTS ( -- )
+   s" slot identity and state bytes are the Rust daemon's" T-LABEL
+   s" 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+   >str DROPBOX:>HASH s" 015f1a2b3c4d" >str DROPBOX:>REV
+   MODEL-REMOTE:MAKE {: r:MODEL:remote :}
+   7 42 s" Docs/a.txt" r LOCAL:NEW-SLOT-IDENTITY LOCAL:SLOT-BINDING
+   $0102030405060708 LOCAL:STATE-BYTES {: p:^ u:n :}
+   u 63 T=
+   p 23 s" omabox-download-slot-v1" T$=
+   p 23 + 32
+   s" 5ab14b7f1ecd878a5ce03fa13ad45efd36df5aad8c4bef0129fefdc17a4b9430"
+   UNHEX T$=
+   p 55 + 8 s" 0102030405060708" UNHEX T$= ;
 
 \ Rust's range is 0 to 1024 checkpoints and a block; its boundaries are
 \ 0, each checkpoint and the bytes either side of it, and the last.
@@ -2017,6 +2066,29 @@ variable REMAINING
    s" each replacement preparation is reached" T-LABEL
    [: PREPARE-CASES ;] IN-CASE-DIR ;
 
+variable OPEN-FDS
+
+: FD-ENTRY ( ^u8 n -- ) 2drop 1 OPEN-FDS +! ;
+
+: FD-COUNT ( -- n )
+   0 OPEN-FDS !
+   s" /proc/self/fd" [: FD-ENTRY ;] FS-LIST:EACH
+   OPEN-FDS @ ;
+
+\ A disposable download whose stage is complete keeps no descriptor.
+: COMPLETE-DISPOSABLE ( fd -- )
+   {: root:fd :}
+   root TARGET STAGE-REMOTE
+   FD-COUNT {: before:n :}
+   root ROOT$ TARGET WANT ROOT$ AR @
+   LOCAL:PREPARE-DISPOSABLE-DOWNLOAD-AT
+   DOWNLOAD-PREPARATION$ s" " T$= s" already-staged" T$=
+   FD-COUNT before T= ;
+
+: COMPLETE-DISPOSABLE-DOWNLOAD-CLOSES-ITS-PARENT ( -- )
+   s" complete disposable download closes its parent" T-LABEL
+   [: COMPLETE-DISPOSABLE ;] IN-CASE-DIR ;
+
 \ ---- parents
 
 : INODE ( fd -- n ) FS:FD-STAT FS:STAT-INO@ ;
@@ -2301,6 +2373,7 @@ variable REMAINING
    SYMLINK-PARENT-IS-REFUSED
    UNSAFE-PARENT-PATH-FAILS
    DOWNLOAD-CHECKPOINT-STATE-ENCODES-THE-LAST-COMPLETE-BOUNDARY
+   SLOT-BYTES-ARE-RUSTS
    PARTIAL-RESET-NEVER-MUTATES-A-SWAPPED-REPLACEMENT
    DOWNLOAD-SLOT-POOL-HAS-FOUR-FIXED-PATHS-WITHOUT-OVERFLOW
    PROTECTED-DOWNLOAD-SLOT-KEEPS-ITS-BINDING-AND-BYTES
@@ -2317,6 +2390,7 @@ variable REMAINING
    RENAMED-DOWNLOAD-REQUIRES-ITS-OWNERSHIP-MARKER
    EACH-INSTALL-OUTCOME-IS-REACHED
    EACH-REPLACEMENT-PREPARATION-IS-REACHED
+   COMPLETE-DISPOSABLE-DOWNLOAD-CLOSES-ITS-PARENT
    DIRECTORY-EFFECTS-ARE-NONOVERWRITING-AND-NONRECURSIVE
    DELETE-REPLAY-PRESERVES-A-RACED-EDIT-AND-REMOVES-ITS-GUARD
    EACH-DELETE-OUTCOME-IS-REACHED

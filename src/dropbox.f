@@ -2000,9 +2000,11 @@ STRUCTURE hasher OPAQUE DERIVE addr
    FIELD hex cells8
 ;STRUCTURE
 
+\ A content-hash block's bytes.
+$400000 constant BLOCK
+
 private
 
-$400000 constant BLOCK
 $2000000 constant CHUNK-SIZE
 512 constant ID-CAP
 
