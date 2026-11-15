@@ -1314,7 +1314,6 @@ variable SUNK-AT
 
 \ ---- files/upload and upload sessions
 
-$400000 constant BLOCK
 $2000000 constant CHUNK
 TYPED-VARIABLE HASHER DROPBOX:hasher
 TYPED-VARIABLE UP DROPBOX:upload
@@ -1347,16 +1346,16 @@ TYPED-VARIABLE FAULT fault
 \ Pinned by Python's hashlib over the same pattern.
 : HASH-CASE ( -- )
    s" content hash" T-LABEL
-   BLOCK 1+ MEM:BYTES-ALLOC-LEN MEM:ALLOC-BYTES
+   DROPBOX:BLOCK 1+ MEM:BYTES-ALLOC-LEN MEM:ALLOC-BYTES
    {: a:^ cap:NUM:alloc-byte-len :}
-   a BLOCK 1+ PATTERN
+   a DROPBOX:BLOCK 1+ PATTERN
    a 0 HASHED
    s" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" T$=
    a 1 HASHED
    s" 1406e05881e299367766d313e26c05564ec91bf721d31726bd6e46e60689539a" T$=
-   a BLOCK HASHED
+   a DROPBOX:BLOCK HASHED
    s" 894bbb52d1212d6bcbe9967f1a2169138c4d4af0c8dfbaeae86cd1d3f0c03faf" T$=
-   a BLOCK 1+ HASHED
+   a DROPBOX:BLOCK 1+ HASHED
    s" 9eb62f609dee341fdcc4521fd6d5a78d9e5c5bb36d844618d9e8d1b32f28ba95" T$=
    a cap MEM:RELEASE-BYTES ;
 

@@ -8,21 +8,26 @@
 \ the journal, in the part LOCAL SCAN-TEST, which sees LOCAL's private
 \ types; that upload stage collection removes only verified unreferenced
 \ content; then each stage outcome, each inspected download stage, a
-\ stage marker set, read and removed, each upload stage outcome, an
-\ upload source that vanished or is a directory, and each parent a
-\ download opens; then that a slot's state keeps its last checkpoint, a
-\ reset never touches a replacement swapped in, the pool's four fixed
-\ slots, a protected slot kept and a stale one rebound; then that a cut
-\ download resumes from its last durable checkpoint, a completed partial
-\ is promoted before or after its rename, a corrupt one restarts only in
-\ its own slot, a promotion keeps a swapped replacement, a copy across
-\ filesystems frees its slot, and a reset slot replays to offset 0; then
-\ local.rs's install tests, each install outcome, an install a directory
-\ or an unreadable file at its stage's name blocks, and each replacement
-\ preparation; then that directory effects never overwrite or recurse,
-\ that a delete's replay keeps a raced edit, and each delete, directory
-\ and conflict outcome. A case that makes files works in its own
-\ directory under TMPDIR and removes it.
+\ stage marker set, read and removed, a second mark failing with one
+\ xattr line on stderr, each upload stage outcome, an upload source that
+\ vanished or is a directory, and each parent a download opens; then
+\ that a slot's state keeps its last checkpoint, that slot identity and
+\ state bytes are the Rust daemon's, a reset never touches a replacement
+\ swapped in, the pool's four fixed slots, a protected slot kept and a
+\ stale one rebound; then that a cut download resumes from its last
+\ durable checkpoint, a completed partial is promoted before or after its
+\ rename, a corrupt one restarts only in its own slot, a promotion keeps
+\ a swapped replacement, a copy across filesystems frees its slot, and a
+\ reset slot replays to offset 0, each completed stage installed and read
+\ back at its target; then local.rs's install tests, each install
+\ outcome, an install a directory or an unreadable file at its stage's
+\ name blocks, each replacement preparation, that a complete disposable
+\ download closes its parent, and the scan lock test's half without the
+\ lock: a disposable partial appended is staged and leaves its staging
+\ directory empty; then that directory effects never overwrite or
+\ recurse, that a delete's replay keeps a raced edit, and each delete,
+\ directory and conflict outcome. A case that makes files works in its
+\ own directory under TMPDIR and removes it.
 \ Run from the repository root: hb --load src/local-test.f </dev/null
 require src/lib/test.f
 require src/lib/test/stderr.f
@@ -140,6 +145,11 @@ private
       ENDOF
       ephemeral OF s" test expected a ready download partial" 1 die ENDOF
    ;MATCH ;
+
+\ Whether the partial is an unnamed file in a staging directory, as
+\ Rust's DownloadSource::Disposable.
+: DISPOSABLE? ( ^download-partial -- bool )
+   DOWNLOAD-PARTIAL-LOCATION SOURCE@ RESUMABLE? 0= ;
 
 : LEASED ( option<download-slot-lease> -- download-slot-lease )
    MATCH option
@@ -268,6 +278,7 @@ private
 
 public
 EXPORT READY-PARTIAL
+EXPORT DISPOSABLE?
 EXPORT LEASED
 EXPORT MARK-PARTIAL
 EXPORT RENAME-TO-STAGE
@@ -869,7 +880,6 @@ private
 
 TYPED-VARIABLE AR ^ARENA:arena
 
-$400000 constant BLOCK
 448 constant MODE-0700
 
 \ ---- entry existence
@@ -998,7 +1008,7 @@ SHA256-CTX-BYTES BUFFER: PART
    WHOLE SHA256-BEGIN
    0 begin dup u < while
       {: at:n :}
-      u at - BLOCK min {: k:n :}
+      u at - DROPBOX:BLOCK min {: k:n :}
       PART a at + k DIGEST SHA256-IN
       WHOLE DIGEST 32 SHA256-FEED
       at k +
@@ -1011,12 +1021,12 @@ SHA256-CTX-BYTES BUFFER: PART
    case
       0 of 0 endof
       1 of 1 endof
-      2 of BLOCK 1- endof
-      3 of BLOCK endof
-      4 of BLOCK 1+ endof
-      5 of BLOCK 2 * 1- endof
-      6 of BLOCK 2 * endof
-      7 of BLOCK 2 * 1+ endof
+      2 of DROPBOX:BLOCK 1- endof
+      3 of DROPBOX:BLOCK endof
+      4 of DROPBOX:BLOCK 1+ endof
+      5 of DROPBOX:BLOCK 2 * 1- endof
+      6 of DROPBOX:BLOCK 2 * endof
+      7 of DROPBOX:BLOCK 2 * 1+ endof
       65535 PROP:RND% 2 + swap
    endcase ;
 
@@ -1084,7 +1094,8 @@ SHA256-CTX-BYTES BUFFER: PART
 : DROPBOX-HASH-AND-COPY-ARE-INDEPENDENT-OF-READER-FRAGMENTATION ( -- )
    s" dropbox_hash_and_copy_are_independent_of_reader_fragmentation" T-LABEL
    1 PROP:SEED!
-   BLOCK 2 * 1+ MEM:BYTES-ALLOC-LEN {: len:NUM:alloc-byte-len :}
+   DROPBOX:BLOCK 2 * 1+ MEM:BYTES-ALLOC-LEN
+   {: len:NUM:alloc-byte-len :}
    len MEM:ALLOC-BYTES {: bytes:^ cap:NUM:alloc-byte-len :}
    len MEM:ALLOC-BYTES {: back:^ cap2:NUM:alloc-byte-len :}
    [: [: bytes back FRAGMENT-CASES ;] IN-CASE-DIR ;]
@@ -1399,7 +1410,8 @@ SHA256-CTX-BYTES BUFFER: PART
    seven offset LOCAL:STATE-ROUND-TRIP
    {: b:LOCAL:binding at:n found:bool :}
    found TTRUE at offset T= b seven LOCAL:BINDING= TTRUE
-   offset x <= TTRUE x offset cp + < TTRUE offset BLOCK mod 0 T= ;
+   offset x <= TTRUE x offset cp + < TTRUE
+   offset DROPBOX:BLOCK mod 0 T= ;
 
 64 BUFFER: UNHEXED
 
@@ -1440,7 +1452,7 @@ SHA256-CTX-BYTES BUFFER: PART
    1025 1 ?do
       i cp * 1- CHECKPOINT i cp * CHECKPOINT i cp * 1+ CHECKPOINT
    loop
-   1024 cp * BLOCK + CHECKPOINT ;
+   1024 cp * DROPBOX:BLOCK + CHECKPOINT ;
 
 32 BUFFER: TEXT-BUF
 
@@ -1697,7 +1709,8 @@ variable REMAINING
    k negate REMAINING +!
    k ;
 
-: TOTAL ( -- n ) LOCAL:DOWNLOAD-CHECKPOINT-BYTES BLOCK 2 * + ;
+: TOTAL ( -- n )
+   LOCAL:DOWNLOAD-CHECKPOINT-BYTES DROPBOX:BLOCK 2 * + ;
 
 : BOUNDARY ( -- ^u8 n ) s" boundary.bin" ;
 
@@ -1723,10 +1736,11 @@ variable REMAINING
 : INTERRUPTED-DOWNLOADS-RESUME-FROM-DURABLE-BOUNDARIES ( -- )
    s" interrupted_downloads_resume_from_durable_boundaries" T-LABEL
    LOCAL:DOWNLOAD-CHECKPOINT-BYTES {: cp:n :}
-   [: cp 1- cp BLOCK - 0 INTERRUPTED ;] IN-SYNC-ROOT
+   DROPBOX:BLOCK {: b:n :}
+   [: cp 1- cp b - 0 INTERRUPTED ;] IN-SYNC-ROOT
    [: cp cp cp INTERRUPTED ;] IN-SYNC-ROOT
    [: cp 1+ cp cp INTERRUPTED ;] IN-SYNC-ROOT
-   [: cp BLOCK + 1+ cp BLOCK + cp INTERRUPTED ;] IN-SYNC-ROOT ;
+   [: cp b + 1+ cp b + cp INTERRUPTED ;] IN-SYNC-ROOT ;
 
 \ The prepared partial of target.txt's download of c, its bytes written.
 : WRITTEN
@@ -1741,8 +1755,36 @@ variable REMAINING
    {: x b:^ bu:n :}
    x LOCAL:PARTIAL-STAGE-PATH b bu HOLDS ;
 
-\ install_download is not ported yet: Rust's test then installs the
-\ stage and reads the bytes back at the target.
+: NO-CONTENT ( -- option<DROPBOX:hash> ) OPTION:NONE ;
+
+: ACTUAL$ ( option<DROPBOX:hash> -- ^u8 n )
+   MATCH option
+      none OF s" none" ENDOF
+      some OF DROPBOX:HASH>STR str> ENDOF
+   ;MATCH ;
+
+\ The outcome's variant, and its path or actual content, else empty.
+: INSTALL$ ( LOCAL:install-outcome -- ^u8 n ^u8 n )
+   MATCH LOCAL:install-outcome
+      installed OF s" installed" s" " ENDOF
+      already-installed OF s" already-installed" s" " ENDOF
+      download-required OF s" download-required" s" " ENDOF
+      stage-destination-occupied OF {: p:str :}
+         s" stage-destination-occupied" p str>
+      ENDOF
+      precondition-changed OF {: a:option<DROPBOX:hash> :}
+         s" precondition-changed" a ACTUAL$
+      ENDOF
+   ;MATCH ;
+
+\ Rust's install_download of c at the target below the sync root, then
+\ the target read back: it holds b.
+: INSTALLS ( fd DROPBOX:hash ^u8 n -- )
+   {: root:fd c:DROPBOX:hash b:^ bu:n :}
+   root SYNC$ TARGET c NO-CONTENT AR @ LOCAL:INSTALL-DOWNLOAD-AT
+   INSTALL$ s" " T$= s" installed" T$=
+   SYNC$ TARGET JOINED FS:JOIN-PATH JOINED swap b bu HOLDS ;
+
 : RECOVERED ( fd bool -- )
    {: root:fd renamed:bool :}
    s" completed bytes" {: b:^ bu:n :}
@@ -1755,7 +1797,8 @@ variable REMAINING
    root TARGET c lease DOWNLOAD-PREPARE
    renamed if s" already-staged" else s" staged" then PREPARED-AS
    root TARGET c lease DOWNLOAD-PREPARE s" already-staged" PREPARED-AS
-   x b bu STAGE-HOLDS ;
+   x b bu STAGE-HOLDS
+   root c b bu INSTALLS ;
 
 : COMPLETED-PARTIAL-RECOVERS-BEFORE-AND-AFTER-RENAME ( -- )
    s" completed_partial_recovers_before_and_after_rename" T-LABEL
@@ -1817,8 +1860,6 @@ variable REMAINING
    s" completed_partial_promotion_preserves_a_swapped_replacement" T-LABEL
    [: SWAPPED-PROMOTION ;] IN-SYNC-ROOT ;
 
-\ install_download is not ported yet: Rust's test then installs the
-\ stage and reads the bytes back at the target.
 : CROSS-FILESYSTEM ( fd -- )
    {: root:fd :}
    s" complete bytes" {: b:^ bu:n :}
@@ -1829,7 +1870,8 @@ variable REMAINING
    [: x AR @ LOCAL:COPY-PARTIAL OUTCOME$ s" " T$= s" staged" T$= ;]
    [: x LOCAL:CLOSE-PARTIAL ;] finally
    x LOCAL:PARTIAL-PATH FS:FILE-SIZE 0 T=
-   x b bu STAGE-HOLDS ;
+   x b bu STAGE-HOLDS
+   root c b bu INSTALLS ;
 
 : CROSS-FILESYSTEM-SLOT-COMPLETION-COPIES-REHASHES-AND-FREES-THE-SLOT
    ( -- )
@@ -1846,8 +1888,6 @@ variable REMAINING
    OUTCOME$
    s" " T$= s" staged" T$= ;
 
-\ install_download is not ported yet: Rust's test then installs the
-\ stage and reads the bytes back at the target.
 : ZERO-REPLAY ( fd -- )
    {: root:fd :}
    s" complete bytes" {: b:^ bu:n :}
@@ -1861,7 +1901,8 @@ variable REMAINING
    x LOCAL:CLOSE-PARTIAL
    root TARGET c lease DOWNLOAD-PREPARE s" already-staged" PREPARED-AS
    p u FS:FILE-SIZE 0 T=
-   root TARGET c lease DOWNLOAD-PREPARE s" already-staged" PREPARED-AS ;
+   root TARGET c lease DOWNLOAD-PREPARE s" already-staged" PREPARED-AS
+   root c b bu INSTALLS ;
 
 : INTERRUPTED-PARTIAL-RESET-REPLAYS-TO-A-REUSABLE-ZERO-CHECKPOINT ( -- )
    s" interrupted_partial_reset_replays_to_a_reusable_zero_checkpoint"
@@ -1876,28 +1917,7 @@ variable REMAINING
 : READ$ ( ^u8 n -- ^u8 n )
    AT READ-BUF 64 FS:READ-ALL READ-BUF swap ;
 
-: NO-CONTENT ( -- option<DROPBOX:hash> ) OPTION:NONE ;
 : HELD ( ^u8 n -- option<DROPBOX:hash> ) HASH-OF OPTION:SOME ;
-
-: ACTUAL$ ( option<DROPBOX:hash> -- ^u8 n )
-   MATCH option
-      none OF s" none" ENDOF
-      some OF DROPBOX:HASH>STR str> ENDOF
-   ;MATCH ;
-
-\ The outcome's variant, and its path or actual content, else empty.
-: INSTALL$ ( LOCAL:install-outcome -- ^u8 n ^u8 n )
-   MATCH LOCAL:install-outcome
-      installed OF s" installed" s" " ENDOF
-      already-installed OF s" already-installed" s" " ENDOF
-      download-required OF s" download-required" s" " ENDOF
-      stage-destination-occupied OF {: p:str :}
-         s" stage-destination-occupied" p str>
-      ENDOF
-      precondition-changed OF {: a:option<DROPBOX:hash> :}
-         s" precondition-changed" a ACTUAL$
-      ENDOF
-   ;MATCH ;
 
 : REPLACEMENT-PREPARATION$
    ( LOCAL:replacement-preparation -- ^u8 n ^u8 n )
@@ -2131,14 +2151,15 @@ variable REMAINING
    s" each replacement preparation is reached" T-LABEL
    [: PREPARE-CASES ;] IN-CASE-DIR ;
 
-variable OPEN-FDS
+variable ENTRIES
 
-: FD-ENTRY ( ^u8 n -- ) 2drop 1 OPEN-FDS +! ;
+: COUNT-ENTRY ( ^u8 n -- ) 2drop 1 ENTRIES +! ;
 
-: FD-COUNT ( -- n )
-   0 OPEN-FDS !
-   s" /proc/self/fd" [: FD-ENTRY ;] FS-LIST:EACH
-   OPEN-FDS @ ;
+\ The count of the directory's entries but . and ..
+: ENTRY-COUNT ( ^u8 n -- n )
+   0 ENTRIES ! [: COUNT-ENTRY ;] FS-LIST:EACH ENTRIES @ ;
+
+: FD-COUNT ( -- n ) s" /proc/self/fd" ENTRY-COUNT ;
 
 \ A disposable download whose stage is complete keeps no descriptor.
 : COMPLETE-DISPOSABLE ( fd -- )
@@ -2153,6 +2174,41 @@ variable OPEN-FDS
 : COMPLETE-DISPOSABLE-DOWNLOAD-CLOSES-ITS-PARENT ( -- )
    s" complete disposable download closes its parent" T-LABEL
    [: COMPLETE-DISPOSABLE ;] IN-CASE-DIR ;
+
+: FALLBACK ( -- ^u8 n ) s" fallback.bin" ;
+
+: EXISTING$ ( option<LOCAL:stage-outcome<n>> -- ^u8 n ^u8 n )
+   MATCH option
+      none OF s" none" s" " ENDOF
+      some OF OUTCOME$ ENDOF
+   ;MATCH ;
+
+\ The disposable partial of fallback.bin's download of c: an unnamed
+\ file in a staging directory beside the sync root.
+: DISPOSABLE-PARTIAL ( fd DROPBOX:hash -- ^LOCAL:download-partial )
+   {: root:fd c:DROPBOX:hash :}
+   s" staging" AT FS:MAKE-DIR
+   root SYNC$ FALLBACK c STAGING AR @
+   LOCAL:PREPARE-DISPOSABLE-DOWNLOAD-AT LOCAL:READY-PARTIAL ;
+
+\ Rust's test without the scan lock: the appended partial is staged,
+\ the stage is then already staged, and the staging directory is empty.
+: DISPOSABLE-BODY ( fd -- )
+   {: root:fd :}
+   s" disposable download" {: b:^ bu:n :}
+   b bu HASH-OF {: c:DROPBOX:hash :}
+   root c DISPOSABLE-PARTIAL {: x :}
+   x LOCAL:DISPOSABLE? TTRUE
+   b bu START 0 SCHEDULE
+   x bu [: FRAGMENT ;] AR @ LOCAL:APPEND-PARTIAL OUTCOME$
+   s" " T$= s" staged" T$=
+   root SYNC$ FALLBACK c AR @ LOCAL:EXISTING-DOWNLOAD-STAGE-AT
+   EXISTING$ s" " T$= s" already-staged" T$=
+   STAGING ENTRY-COUNT 0 T= ;
+
+: DISPOSABLE-DOWNLOAD-BODY-DOES-NOT-HOLD-THE-SCAN-LOCK ( -- )
+   s" disposable_download_body_does_not_hold_the_scan_lock" T-LABEL
+   [: DISPOSABLE-BODY ;] IN-SYNC-ROOT ;
 
 \ ---- parents
 
@@ -2460,6 +2516,7 @@ variable OPEN-FDS
    OBJECT-AT-STAGE-NAME-BLOCKS-ONLY-ITS-INSTALL
    EACH-REPLACEMENT-PREPARATION-IS-REACHED
    COMPLETE-DISPOSABLE-DOWNLOAD-CLOSES-ITS-PARENT
+   DISPOSABLE-DOWNLOAD-BODY-DOES-NOT-HOLD-THE-SCAN-LOCK
    DIRECTORY-EFFECTS-ARE-NONOVERWRITING-AND-NONRECURSIVE
    DELETE-REPLAY-PRESERVES-A-RACED-EDIT-AND-REMOVES-ITS-GUARD
    EACH-DELETE-OUTCOME-IS-REACHED
