@@ -7,13 +7,14 @@
 \ refresh token, and one code GRANT! sets; it issues the access tokens
 \ sl.fake-1, sl.fake-2 and on, and EXPIRE expires every token issued so far.
 \ LOSE applies the next API call and loses its answer; each CUT loses one
-\ more API call's answer, before the call takes effect; GARBLE answers the
-\ next, before it takes effect, with a line that is not HTTP. REVOKE refuses
-\ every access token, issued or yet to be, as invalid until RESET; the
-\ refresh still issues them. A call must carry the Path-Root ROOT! expects,
-\ none when that is empty, else it answers 422. Scripted answers go out in
-\ order before any route's own. It records each request's path, and the last
-\ API call's Authorization, Path-Root and Content-Type.
+\ more API call's answer, before the call takes effect, and CUT-TOKEN a token
+\ request's; GARBLE answers the next API call, before it takes effect, with a
+\ line that is not HTTP. REVOKE refuses every access token, issued or yet to
+\ be, as invalid until RESET; the refresh still issues them. A call must
+\ carry the Path-Root ROOT! expects, none when that is empty, else it answers
+\ 422. Scripted answers go out in order before any route's own. It records
+\ each request's path, and the last API call's Authorization, Path-Root and
+\ Content-Type.
 \ STORAGE CLASS. PROCESS-WIDE: one worker serves every request, so its handler
 \ alone writes the state while a test waits on its call, and the test sets it
 \ between calls. A body stays in its buffer, as HTTP:BODY! borrows it, until
@@ -93,6 +94,7 @@ TYPED-VARIABLE PARSER JSON:cursor
 TYPED-VARIABLE LOSING bool
 variable CUTS
 TYPED-VARIABLE GARBLING bool
+TYPED-VARIABLE TOKEN-CUTTING bool
 
 
 \ Copies a span into a buffer of cap bytes and answers its length.
@@ -470,14 +472,22 @@ variable HELD-U
    q SEVER ;
 
 
-\ While CUTS counts answers to lose, an API call's body is read and its
-\ answer severed before its route runs: read, so no unread byte turns the
-\ close into a reset.
+\ Whether a cut waits for the request, one of CUT's for an API call or
+\ CUT-TOKEN's for a token request, which it then takes.
+: ARMED? ( HTTP:request -- bool )
+   API? if
+      CUTS @ 0= if false exit then
+      -1 CUTS +! true exit
+   then
+   TOKEN-CUTTING @ false TOKEN-CUTTING ! ;
+
+
+\ After CUT, an API call's body is read and its answer severed before its
+\ route runs, and after CUT-TOKEN a token request's: read, so no unread
+\ byte turns the close into a reset.
 : CUT? ( HTTP:request -- bool )
    {: q:HTTP:request :}
-   CUTS @ 0= if false exit then
-   q API? 0= if false exit then
-   -1 CUTS +!
+   q ARMED? 0= if false exit then
    q HTTP:BODY$ 2drop
    q SEVER true ;
 
@@ -998,15 +1008,16 @@ $2100000 constant UPLOAD-CAP
 
 \ Forgets the script, the entries, the kept bytes, the pages, the long
 \ poll's answer, the sessions, the revs uploads took, a SKEW, a LOSE, the
-\ CUTs, a GARBLE, a code GRANT! set, a REVOKE and what was sent; the tokens
-\ and the root stay.
+\ CUTs, a CUT-TOKEN, a GARBLE, a code GRANT! set, a REVOKE and what was sent;
+\ the tokens and the root stay.
 : RESET ( -- )
    0 SCRIPTS ! 0 SCRIPTED ! 0 FILES ! 0 CONTENTS ! 0 SESSIONS ! 0 REVS !
    0 GRANT-CODE-U !
    0 SEEN-U ! 0 AUTH-U ! 0 ROOT-SENT-U ! 0 TYPE-SENT-U !
    0 ARG-SENT-U ! 0 RANGE-SENT-U !
    false ROOTED ! false TYPED ! false LEAKED ! false RANGED !
-   false SKEWED ! false LOSING ! 0 CUTS ! false REVOKED ! false GARBLING !
+   false SKEWED ! false LOSING ! 0 CUTS ! false TOKEN-CUTTING !
+   false REVOKED ! false GARBLING !
    LISTING-RESET ;
 
 
@@ -1023,6 +1034,9 @@ $2100000 constant UPLOAD-CAP
 
 \ Expires every access token issued so far.
 : EXPIRE ( -- ) ISSUES @ EXPIRED ! ;
+\ The next token request's answer is lost as CUT's is, before a token is
+\ issued.
+: CUT-TOKEN ( -- ) true TOKEN-CUTTING ! ;
 
 
 \ Refuses every access token, issued or yet to be, as Dropbox does once the

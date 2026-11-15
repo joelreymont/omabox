@@ -255,6 +255,14 @@ TYPED-VARIABLE MAIN ptr DROPBOX:client
    s" /missing" MAIN @ DROPBOX:METADATA DROPBOX-ERROR:not-found REFUSED? ASSERT ;
 
 
+: LOST-READ-CASE ( -- )
+   s" lost metadata" T-LABEL
+   TEST-DROPBOX:RESET
+   TEST-DROPBOX:CUT
+   s" /docs/a.txt" MAIN @ DROPBOX:METADATA RETRY-MS 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/get_metadata" T$= ;
+
+
 : ROOT-CASE ( -- )
    s" path root" T-LABEL
    TEST-DROPBOX:ROOT-SENT? TTRUE
@@ -828,6 +836,16 @@ variable SUNK-AT
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
 
 
+\ A delete lost before Dropbox applied it: the path is still there.
+: CUT-DELETE-CASE ( -- )
+   s" lost delete not applied" T-LABEL
+   TEST-DROPBOX:RESET
+   s" /kept.txt" s" rev-kept" DELETED-FILE
+   TEST-DROPBOX:CUT
+   s" /kept.txt" s" " MAIN @ DROPBOX:DELETE RETRY-MS 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
+
+
 : FOLDER-CONFLICT-CASE ( -- )
    s" create-folder conflict" T-LABEL
    TEST-DROPBOX:RESET
@@ -854,6 +872,31 @@ variable SUNK-AT
    LOWER$ s" /lost-made" T$=
    TEST-DROPBOX:SEEN$
    s" /2/files/create_folder_v2 /2/files/get_metadata" T$= ;
+
+
+\ A create-folder lost before Dropbox applied it: no folder is there.
+: CUT-FOLDER-CASE ( -- )
+   s" lost create-folder not applied" T-LABEL
+   TEST-DROPBOX:RESET
+   TEST-DROPBOX:CUT
+   s" /cut-made" MAIN @ DROPBOX:CREATE-FOLDER RETRY-MS 0 T=
+   TEST-DROPBOX:SEEN$
+   s" /2/files/create_folder_v2 /2/files/get_metadata" T$= ;
+
+
+\ A delete refused for an expired token, whose refresh is lost: retried,
+\ and neither resent nor confirmed, so the path is still there.
+: LOST-REFRESH-CASE ( -- )
+   s" refresh lost during a delete" T-LABEL
+   TEST-DROPBOX:RESET
+   s" /held.txt" s" rev-held" DELETED-FILE
+   TEST-DROPBOX:EXPIRE TEST-DROPBOX:CUT-TOKEN
+   s" /held.txt" s" " MAIN @ DROPBOX:DELETE RETRY-MS 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /oauth2/token" T$=
+   s" /held.txt" MAIN @ DROPBOX:METADATA DONE? ASSERT
+   TEST-DROPBOX:SEEN$
+   s" /2/files/delete_v2 /oauth2/token /oauth2/token /2/files/get_metadata"
+   T$= ;
 
 
 : EXCHANGE-CASE ( -- )
@@ -895,7 +938,7 @@ variable SHOWS
 \ the strikes left there.
 variable FAULT-AT
 variable STRIKES
-ENUM fault cut cut-twice lose close unfound applied ;ENUM
+ENUM fault cut cut-twice lose close unfound applied offset ;ENUM
 TYPED-VARIABLE FAULT fault
 
 
@@ -968,6 +1011,13 @@ TYPED-VARIABLE FAULT fault
    TEST-DROPBOX:FILE! ;
 
 
+\ The next call refused with incorrect_offset at 0, short of any chunk's end.
+: OFFSET! ( -- )
+   409 s" " s" "
+   S\" {\qerror_summary\q:\qincorrect_offset/...\q,\qerror\q:{\q.tag\q:\qincorrect_offset\q,\qcorrect_offset\q:0}}"
+   TEST-DROPBOX:SCRIPT! ;
+
+
 : STRIKE ( -- )
    FAULT @ MATCH fault
       cut OF TEST-DROPBOX:CUT ENDOF
@@ -976,6 +1026,7 @@ TYPED-VARIABLE FAULT fault
       close OF TEST-DROPBOX:CLOSE-SESSIONS ENDOF
       unfound OF UNFOUND ENDOF
       applied OF UNFOUND APPLIED ENDOF
+      offset OF OFFSET! ENDOF
    ;MATCH ;
 
 
@@ -1042,18 +1093,6 @@ TYPED-VARIABLE FAULT fault
    TEST-DROPBOX:RESET -1 FAULT-AT !
    s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
    s" /docs/up.txt" s" /Docs/Up.txt" s" 0160a" EXPECTED$ 12 TEST-DROPBOX:FILE!
-   SEND DONE? ASSERT
-   ENTRY-HASH$ EXPECTED$ T$=
-   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
-   UNSTAGED ;
-
-
-\ The upload takes effect and its answer is lost: confirmed by get_metadata.
-: LOST-SINGLE-CASE ( -- )
-   s" lost upload" T-LABEL
-   TEST-DROPBOX:RESET -1 FAULT-AT !
-   s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
-   TEST-DROPBOX:LOSE
    SEND DONE? ASSERT
    ENTRY-HASH$ EXPECTED$ T$=
    TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
@@ -1164,9 +1203,36 @@ TYPED-VARIABLE FAULT fault
    UNSTAGED ;
 
 
+\ A single upload lost before Dropbox committed it: the confirmation finds
+\ no file, so the lost call's retry stands.
+: CUT-SINGLE-CASE ( -- )
+   s" lost upload not applied" T-LABEL
+   TEST-DROPBOX:RESET -1 FAULT-AT !
+   s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
+   TEST-DROPBOX:CUT
+   SEND RETRY-MS 0 T=
+   SHOWS @ 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
+   UNSTAGED ;
+
+
+\ A single upload lost after Dropbox committed it: the confirmation finds
+\ the file with its content hash.
+: LOST-SINGLE-CASE ( -- )
+   s" lost upload applied" T-LABEL
+   TEST-DROPBOX:RESET -1 FAULT-AT !
+   s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
+   TEST-DROPBOX:LOSE
+   SEND DONE? ASSERT
+   ENTRY-HASH$ EXPECTED$ T$=
+   SHOWN @ 12 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
+   UNSTAGED ;
+
+
 : SINGLE-CASES ( -- )
-   SINGLE-CASE CONFLICT-CASE HELD-CASE LOST-SINGLE-CASE NON-ASCII-CASE
-   SHORT-STAGE-CASE REFUSED-STAGE-CASE
+   SINGLE-CASE CONFLICT-CASE HELD-CASE NON-ASCII-CASE CUT-SINGLE-CASE
+   LOST-SINGLE-CASE SHORT-STAGE-CASE REFUSED-STAGE-CASE
    FULL-READ-CASE ENTERED-READ-CASE TIMED-OUT-READ-CASE
    CANCELLED-READ-CASE ;
 
@@ -1231,6 +1297,23 @@ TYPED-VARIABLE FAULT fault
    SB-RESET S-START S-APPEND S-APPEND S-RESTART S-APPEND S-APPEND
    S-FINISH
    CHUNK construct fault close FAULTED ;
+
+
+\ incorrect_offset short of the chunk's end: Dropbox does not hold the
+\ chunk, so the session is gone and the upload starts over.
+: OFFSET-APPEND-CASE ( -- )
+   s" incorrect_offset short of the chunk's end" T-LABEL
+   SB-RESET S-START S-APPEND S-APPEND S-RESTART S-APPEND S-APPEND S-FINISH
+   CHUNK construct fault offset FAULTED ;
+
+
+: LOST-START-CASE ( -- )
+   s" lost session start" T-LABEL
+   TEST-DROPBOX:RESET -1 FAULT-AT !
+   TEST-DROPBOX:CUT
+   SEND RETRY-MS 0 T=
+   SHOWS @ 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/upload_session/start" T$= ;
 
 
 : LOST-FINISH-CASE ( -- )
@@ -1305,9 +1388,10 @@ TYPED-VARIABLE FAULT fault
 : UPLOAD-CASES ( -- )
    HASH-CASE SINGLE-CASES
    BIG-STAGED
-   SESSION-CASE LOST-APPEND-CASE HELD-APPEND-CASE CLOSED-CASE
-   LOST-FINISH-CASE APPLIED-FINISH-CASE UNFOUND-FINISH-CASE CUT-APPEND-CASE
-   CLOSED-TWICE-CASE MISMATCH-CASE ENDED-EARLY-CASE
+   SESSION-CASE LOST-APPEND-CASE HELD-APPEND-CASE OFFSET-APPEND-CASE
+   CLOSED-CASE LOST-START-CASE LOST-FINISH-CASE APPLIED-FINISH-CASE
+   UNFOUND-FINISH-CASE CUT-APPEND-CASE CLOSED-TWICE-CASE MISMATCH-CASE
+   ENDED-EARLY-CASE
    UNSTAGED ;
 
 
@@ -1315,15 +1399,16 @@ TYPED-VARIABLE FAULT fault
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
    s" ns-root" TEST-DROPBOX:ROOT!
    s" live-token" s" ns-root" OPENED MAIN !
-   ACCOUNT-CASE FILE-CASE MISSING-CASE ROOT-CASE EXPIRED-CASE
+   ACCOUNT-CASE FILE-CASE MISSING-CASE ROOT-CASE LOST-READ-CASE EXPIRED-CASE
    UNLINKED-CASE REVOKED-CASE DENIED-CASE REFUSED-AGAIN-CASE
    RATE-CASE BUSY-CASE REDIRECT-CASE BAD-REQUEST-CASE
    CLASSIFY-CASES
    PAGES-CASE RESET-CASE STALL-CASE UNTAGGED-CASE POLL-CASE POLL-RESET-CASE
    DOWNLOAD-CASES
    DELETE-CONFLICT-CASE DELETE-MISSING-CASE DELETE-GONE-CASE
-   LOST-DELETE-CASE
-   FOLDER-CONFLICT-CASE LOST-FOLDER-CASE EXCHANGE-CASE DEAD-CODE-CASE
+   LOST-DELETE-CASE CUT-DELETE-CASE
+   FOLDER-CONFLICT-CASE LOST-FOLDER-CASE CUT-FOLDER-CASE LOST-REFRESH-CASE
+   EXCHANGE-CASE DEAD-CODE-CASE
    UPLOAD-CASES DROPBOX:THROW-CASES
    MAIN @ DROPBOX:CLOSE ;
 
