@@ -697,6 +697,20 @@ private
 
 : SYNC-FILE ( fd ^u8 n ^u8 n -- ) SYNC-DIRECTORY ;
 
+\ Syncs the regular file at the name and its entry in dir; nothing there
+\ is a change.
+: SYNC-INSTALLED-FILE ( fd ^u8 n ^u8 n -- )
+   {: dir:fd name:^ nu:n p:^ u:n :}
+   s" open installed file for sync" {: o:^ ou:n :}
+   dir name nu p u o ou OPEN-REGULAR-AT-IF-PRESENT MATCH option
+      none OF o ou p u CHANGED ENDOF
+      some OF OPENED-UNMAKE {: f:fd st:stat :}
+         [: f p u s" sync installed file" SYNC-FILE ;] [: f DISCARD ;]
+         finally
+      ENDOF
+   ;MATCH
+   dir p u s" sync installed file entry" SYNC-DIRECTORY ;
+
 \ ---- parents
 
 \ S_IRWXU: a parent directory a download makes.
@@ -1122,6 +1136,382 @@ $100 constant MODE-READ-ONLY
    actual MATCH option
       none OF s" preserve raced local destination" t tu CHANGED ENDOF
       some OF {: c:DROPBOX:hash :} dir g gu t tu c ar PRESERVE-GUARD ENDOF
+   ;MATCH ;
+
+\ ---- deletes
+
+public
+
+\ What a conditional delete of a local file came to: the expected file
+\ removed now or by an earlier attempt, or other content found, none
+\ when nothing is there.
+ENUM delete-outcome
+   VARIANT deleted ;VARIANT
+   VARIANT already-deleted ;VARIANT
+   VARIANT precondition-changed FIELD actual option<DROPBOX:hash> ;VARIANT
+;ENUM
+
+private
+
+\ Rust's Path::join of the relative q onto p, laid in the arena; a path
+\ a failure names.
+: JOIN ( ^u8 n ^u8 n ^ARENA:arena -- ^u8 n )
+   {: p:^ u:n q:^ qu:n ar:^ARENA:arena :}
+   u 0= if q qu exit then
+   p u FS:JOIN-SEPARATED? if 0 else 1 then {: sep:n :}
+   u sep + qu + {: size:n :}
+   ar size ARENA:ALLOC drop {: dst:^ :}
+   p u dst 0 PUT drop
+   sep 1 = if SLASH dst u + c! then
+   q qu dst u sep + PUT drop
+   dst size ;
+
+\ A delete in its open parent: the descriptor, the target's last component,
+\ the target, the guard's name and the path a failure names for it, and the
+\ content the delete expects.
+STRUCTURE deletion
+   FIELD dir fd
+   FIELD name str
+   FIELD target str
+   FIELD guard str
+   FIELD guard-path str
+   FIELD want DROPBOX:hash
+;STRUCTURE
+
+: DELETION-WANT ( deletion -- DROPBOX:hash )
+   DELETION-UNMAKE {: d:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
+   want ;
+
+\ The content of the guard, none when it is absent; o names the read.
+: GUARD-CONTENT
+   ( deletion ^u8 n ^ARENA:arena -- option<DROPBOX:hash> )
+   {: x:deletion o:^ ou:n ar:^ARENA:arena :}
+   x DELETION-UNMAKE {: dir:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
+   dir g str> gp str> o ou ar HASH-AT-IF-PRESENT ;
+
+\ Whether a guard holding the expected content is there; other bytes are
+\ kept and stop the operation oc names. i names the read.
+: GUARD-HELD? ( deletion ^u8 n ^u8 n ^ARENA:arena -- bool )
+   {: x:deletion i:^ iu:n oc:^ ocu:n ar:^ARENA:arena :}
+   x i iu ar GUARD-CONTENT MATCH option
+      none OF false ENDOF
+      some OF x DELETION-WANT SAME-CONTENT? 0= if
+            x DELETION-UNMAKE
+            {: d:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
+            oc ocu gp str> OCCUPIED
+         then true
+      ENDOF
+   ;MATCH ;
+
+\ Removes the guard, then syncs its directory; o names the removal, sy
+\ the sync.
+: REMOVE-GUARD ( deletion ^u8 n ^u8 n -- )
+   {: x:deletion o:^ ou:n sy:^ syu:n :}
+   x DELETION-UNMAKE {: dir:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
+   dir g str> FS:TRY-REMOVE-FILE-AT 0= if o ou t str> IO-FAILURE then
+   dir t str> sy syu SYNC-DIRECTORY ;
+
+\ The guard holds other content than expected: it goes back to the target,
+\ or is kept beside an entry raced in there.
+: GUARD-CHANGED
+   ( deletion option<DROPBOX:hash> ^ARENA:arena -- delete-outcome )
+   {: x:deletion c:option<DROPBOX:hash> ar:^ARENA:arena :}
+   x DELETION-UNMAKE {: dir:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
+   dir g str> n str> t str> c ar RESTORE-OR-PRESERVE-CHANGED-GUARD
+   c LOCAL-DELETE--OUTCOME:precondition-changed ;
+
+\ The target is absent: a guard holding the expected content finishes an
+\ interrupted delete.
+: FINISH-INTERRUPTED ( deletion ^ARENA:arena -- delete-outcome )
+   {: x:deletion ar:^ARENA:arena :}
+   x s" inspect interrupted deletion" ar GUARD-CONTENT
+   {: c:option<DROPBOX:hash> :}
+   c x DELETION-WANT HOLDS? if
+      x s" finish interrupted deletion" s" sync interrupted deletion"
+      REMOVE-GUARD LOCAL-DELETE--OUTCOME:deleted exit
+   then
+   c MATCH option
+      none OF LOCAL-DELETE--OUTCOME:already-deleted ENDOF
+      some OF drop x c ar GUARD-CHANGED ENDOF
+   ;MATCH ;
+
+\ Other content is at the target: a guard holding the expected content is
+\ removed, and the outcome names what is there.
+: RACED-DELETE ( deletion DROPBOX:hash ^ARENA:arena -- delete-outcome )
+   {: x:deletion c:DROPBOX:hash ar:^ARENA:arena :}
+   x s" inspect raced deletion guard" s" clean raced local deletion" ar
+   GUARD-HELD? if
+      x s" remove raced deletion guard"
+      s" sync raced deletion guard removal" REMOVE-GUARD
+   then
+   c OPTION:SOME LOCAL-DELETE--OUTCOME:precondition-changed ;
+
+\ Moves the target to the guard's name and syncs; false when the target
+\ is gone by now.
+: DISPLACE ( deletion -- bool )
+   {: x:deletion :}
+   x DELETION-UNMAKE {: dir:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
+   dir n str> dir g str> FS:TRY-RENAME-NEW-AT if
+      dir t str> s" sync deletion displacement" SYNC-DIRECTORY true exit
+   then
+   FS:ERRNO FS:ENOENT = if false exit then
+   s" move deleted file to displacement guard" t str> IO-FAILURE ;
+
+\ The target holds the expected content: it moves aside to the guard and
+\ is removed there only while the guard still holds it.
+: DELETE-EXPECTED ( deletion ^ARENA:arena -- delete-outcome )
+   {: x:deletion ar:^ARENA:arena :}
+   x s" inspect deletion guard" s" prepare local deletion" ar
+   GUARD-HELD? if
+      x s" remove stale deletion guard"
+      s" sync stale deletion guard removal" REMOVE-GUARD
+   then
+   x DISPLACE 0= if LOCAL-DELETE--OUTCOME:already-deleted exit then
+   x s" verify deletion displacement" ar GUARD-CONTENT
+   {: c:option<DROPBOX:hash> :}
+   c x DELETION-WANT HOLDS? 0= if x c ar GUARD-CHANGED exit then
+   x s" delete verified displaced file" s" sync local deletion"
+   REMOVE-GUARD LOCAL-DELETE--OUTCOME:deleted ;
+
+: DELETE-IN ( deletion ^ARENA:arena -- delete-outcome )
+   {: x:deletion ar:^ARENA:arena :}
+   x DELETION-UNMAKE {: dir:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
+   dir n str> t str> s" check delete precondition" ar HASH-AT-IF-PRESENT
+   {: c:option<DROPBOX:hash> :}
+   c MATCH option
+      none OF x ar FINISH-INTERRUPTED ENDOF
+      some OF {: h:DROPBOX:hash :}
+         h want SAME-CONTENT? if x ar DELETE-EXPECTED exit then
+         x h ar RACED-DELETE
+      ENDOF
+   ;MATCH ;
+
+\ The delete in the open parent, which closes after it; r is the root's
+\ path, which failures name.
+: DELETE-BELOW
+   ( parent-dir ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- delete-outcome )
+   {: pd:parent-dir r:^ ru:n t:^ tu:n want:DROPBOX:hash
+      ar:^ARENA:arena :}
+   pd PARENT-DIR-UNMAKE {: dir:fd name:str path:str :}
+   s" deleted" t tu want ar INTERNAL-NAME {: g:^ gu:n :}
+   r ru path str> ar JOIN g gu ar JOIN {: gp:^ gpu:n :}
+   dir name t tu >str g gu >str gp gpu >str want DELETION-MAKE
+   {: x:deletion :}
+   [: x ar DELETE-IN ;] [: dir DISCARD ;] finally ;
+
+public
+
+\ Rust's delete_local_at: deletes the target below the root, whose path is
+\ r, while it holds want. It moves aside under a guard name first, and a
+\ guard left by an interrupted attempt is finished or put back.
+: DELETE-LOCAL-AT
+   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- delete-outcome )
+   {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
+   want s" delete local file" REQUIRE-CONTENT-HASH
+   root t tu false OPEN-PARENT MATCH option
+      none OF LOCAL-DELETE--OUTCOME:already-deleted ENDOF
+      some OF r ru t tu want ar DELETE-BELOW ENDOF
+   ;MATCH ;
+
+\ DELETE-LOCAL-AT below the root at the absolute path r.
+: DELETE-LOCAL
+   ( ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- delete-outcome )
+   {: r:^ ru:n t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
+   r ru s" open sync root for local deletion" OPEN-ABSOLUTE-DIRECTORY
+   {: root:fd :}
+   [: root r ru t tu want ar DELETE-LOCAL-AT ;] [: root DISCARD ;]
+   finally ;
+
+\ ---- directories
+
+\ What making a directory came to: made, already there, or another entry
+\ or a change at its path, which a fresh scan observes.
+ENUM create-directory-outcome
+   created already-present fresh-observation
+;ENUM
+
+\ What removing an empty directory came to: removed, already absent, or
+\ an entry that is not one or not empty, which a fresh scan observes.
+ENUM delete-directory-outcome
+   deleted already-absent fresh-observation
+;ENUM
+
+private
+
+\ A directory open at the name in dir is synced with its entry; a missing
+\ name, a non-directory or a symlink there is a fresh observation.
+: EXISTING-DIRECTORY ( fd ^u8 n ^u8 n -- create-directory-outcome )
+   {: dir:fd name:^ nu:n p:^ u:n :}
+   dir name nu FS:TRY-OPEN-DIR-AT MATCH option
+      none OF FS:ERRNO {: e:n :}
+         e FS:ENOENT = e FS:ENOTDIR = or e FS:ELOOP = or 0= if
+            s" inspect occupied local directory path" p u IO-FAILURE
+         then LOCAL-CREATE--DIRECTORY--OUTCOME:fresh-observation
+      ENDOF
+      some OF {: d:fd :}
+         [: d p u s" sync existing local directory" SYNC-DIRECTORY ;]
+         [: d DISCARD ;] finally
+         dir p u s" sync existing local directory entry" SYNC-DIRECTORY
+         LOCAL-CREATE--DIRECTORY--OUTCOME:already-present
+      ENDOF
+   ;MATCH ;
+
+\ Opens the directory just made at the name in dir and syncs it.
+: SYNC-MADE-DIRECTORY ( fd ^u8 n ^u8 n -- )
+   {: dir:fd name:^ nu:n p:^ u:n :}
+   dir name nu p u OPEN-DIRECTORY-AT {: d:fd :}
+   [: d p u s" sync created local directory" SYNC-DIRECTORY ;]
+   [: d DISCARD ;] finally ;
+
+: MAKE-DIRECTORY-IN ( fd ^u8 n ^u8 n -- create-directory-outcome )
+   {: dir:fd name:^ nu:n p:^ u:n :}
+   dir name nu MODE-PRIVATE-DIR FS:TRY-MAKE-DIR-AT if
+      dir p u s" sync created local directory entry" SYNC-DIRECTORY
+      dir name nu p u SYNC-MADE-DIRECTORY
+      LOCAL-CREATE--DIRECTORY--OUTCOME:created exit
+   then
+   FS:ERRNO FS:EEXIST <> if s" create local directory" p u IO-FAILURE then
+   dir name nu p u EXISTING-DIRECTORY ;
+
+\ Whether a failed rmdir found an entry that is not an empty directory.
+: OCCUPIED-DIRECTORY? ( n -- bool )
+   {: e:n :}
+   e FS:ENOTEMPTY = e FS:EEXIST = or e FS:ENOTDIR = or e FS:EISDIR = or ;
+
+: REMOVE-DIRECTORY-IN ( fd ^u8 n ^u8 n -- delete-directory-outcome )
+   {: dir:fd name:^ nu:n p:^ u:n :}
+   dir name nu FS:TRY-REMOVE-DIR-AT if
+      dir p u s" sync deleted local directory" SYNC-DIRECTORY
+      LOCAL-DELETE--DIRECTORY--OUTCOME:deleted exit
+   then
+   FS:ERRNO {: e:n :}
+   e FS:ENOENT = if LOCAL-DELETE--DIRECTORY--OUTCOME:already-absent exit then
+   e OCCUPIED-DIRECTORY? if
+      LOCAL-DELETE--DIRECTORY--OUTCOME:fresh-observation exit
+   then
+   s" delete empty local directory" p u IO-FAILURE ;
+
+public
+
+\ Makes the directory at p below the root, its missing parents as well;
+\ it never follows a link or replaces an entry.
+: CREATE-DIRECTORY-AT ( fd ^u8 n -- create-directory-outcome )
+   {: root:fd p:^ u:n :}
+   root p u true OPEN-PARENT MATCH option
+      none OF p u UNSAFE ENDOF
+      some OF PARENT-DIR-UNMAKE {: dir:fd name:str path:str :}
+         [: dir name str> p u MAKE-DIRECTORY-IN ;] [: dir DISCARD ;]
+         finally
+      ENDOF
+   ;MATCH ;
+
+\ Removes the directory at p below the root only while it is empty.
+: DELETE-DIRECTORY-AT ( fd ^u8 n -- delete-directory-outcome )
+   {: root:fd p:^ u:n :}
+   root p u false OPEN-PARENT MATCH option
+      none OF LOCAL-DELETE--DIRECTORY--OUTCOME:already-absent ENDOF
+      some OF PARENT-DIR-UNMAKE {: dir:fd name:str path:str :}
+         [: dir name str> p u REMOVE-DIRECTORY-IN ;] [: dir DISCARD ;]
+         finally
+      ENDOF
+   ;MATCH ;
+
+\ ---- conflicts
+
+\ What writing one side of a conflict came to: a new copy at path,
+\ relative to the root, the same bytes already there, or supplied bytes
+\ whose hash is actual.
+ENUM conflict-outcome
+   VARIANT created FIELD path str ;VARIANT
+   VARIANT already-present FIELD path str ;VARIANT
+   VARIANT content-changed FIELD actual DROPBOX:hash ;VARIANT
+;ENUM
+
+\ The path, relative to the root, of p's conflict copy for side holding c.
+: CONFLICT-RELATIVE-PATH
+   ( ^u8 n conflict-side DROPBOX:hash ^ARENA:arena -- ^u8 n )
+   {: p:^ u:n side:conflict-side c:DROPBOX:hash ar:^ARENA:arena :}
+   p u PARENT-PATH p u side c ar CONFLICT-NAME ar JOIN ;
+
+private
+
+\ The stage written at the conflict's path rel, which shown names in
+\ full; another file there is kept.
+: CONFLICT-RESULT ( stage-write ^u8 n ^u8 n -- conflict-outcome )
+   {: w:stage-write rel:^ relu:n shown:^ shownu:n :}
+   w MATCH stage-write
+      created OF rel relu >str LOCAL-CONFLICT--OUTCOME:created ENDOF
+      reused OF rel relu >str LOCAL-CONFLICT--OUTCOME:already-present
+      ENDOF
+      mismatch OF LOCAL-CONFLICT--OUTCOME:content-changed ENDOF
+      destination-occupied OF {: q:str :}
+         s" materialize conflict" q str> OCCUPIED
+      ENDOF
+   ;MATCH ;
+
+\ A conflict copy carries no stage marker.
+: NO-MARKER ( -- option<str> ) OPTION:NONE ;
+
+\ The conflict copy written in the open parent, which closes after it.
+: CONFLICT-BELOW
+   ( parent-dir ^u8 n ^u8 n conflict-side DROPBOX:hash [ ^u8 n -- n ]
+     ^ARENA:arena -- conflict-outcome )
+   {: pd:parent-dir r:^ ru:n p:^ u:n side:conflict-side
+      want:DROPBOX:hash read ar:^ARENA:arena :}
+   pd PARENT-DIR-UNMAKE {: dir:fd name:str path:str :}
+   p u side want ar CONFLICT-NAME {: cn:^ cnu:n :}
+   p u side want ar CONFLICT-RELATIVE-PATH {: rel:^ relu:n :}
+   r ru rel relu ar JOIN {: shown:^ shownu:n :}
+   [: dir cn cnu shown shownu want read NO-MARKER
+      s" materialize conflict" ar WRITE-VERIFIED-STAGE ;]
+   [: dir DISCARD ;] finally
+   rel relu shown shownu CONFLICT-RESULT ;
+
+public
+
+\ Writes read's bytes as p's conflict copy for side below the root, whose
+\ path is r, when they hash to want; it never overwrites a file.
+: MATERIALIZE-CONFLICT-AT
+   ( fd ^u8 n ^u8 n conflict-side DROPBOX:hash [ ^u8 n -- n ]
+     ^ARENA:arena -- conflict-outcome )
+   {: root:fd r:^ ru:n p:^ u:n side:conflict-side want:DROPBOX:hash
+      read ar:^ARENA:arena :}
+   want s" materialize conflict" REQUIRE-CONTENT-HASH
+   root p u true OPEN-PARENT MATCH option
+      none OF p u UNSAFE ENDOF
+      some OF r ru p u side want read ar CONFLICT-BELOW ENDOF
+   ;MATCH ;
+
+\ MATERIALIZE-CONFLICT-AT below the root at the absolute path r.
+: MATERIALIZE-CONFLICT
+   ( ^u8 n ^u8 n conflict-side DROPBOX:hash [ ^u8 n -- n ]
+     ^ARENA:arena -- conflict-outcome )
+   {: r:^ ru:n p:^ u:n side:conflict-side want:DROPBOX:hash read
+      ar:^ARENA:arena :}
+   r ru s" open sync root for conflict" OPEN-ABSOLUTE-DIRECTORY
+   {: root:fd :}
+   [: root r ru p u side want read ar MATERIALIZE-CONFLICT-AT ;]
+   [: root DISCARD ;] finally ;
+
+\ ---- recovery copies
+
+\ The name of a private recovery copy of p holding c, laid in the arena.
+: RECOVERY-FILE-NAME ( ^u8 n DROPBOX:hash ^ARENA:arena -- ^u8 n )
+   {: p:^ u:n c:DROPBOX:hash ar:^ARENA:arena :}
+   s" recovery" p u c ar INTERNAL-NAME ;
+
+\ Whether the copy at the name in dir, whose path is p, is there; one
+\ there holds want and is synced, else it is corrupt.
+: VERIFY-PRIVATE-COPY
+   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- bool )
+   {: dir:fd p:^ u:n name:^ nu:n want:DROPBOX:hash ar:^ARENA:arena :}
+   s" verify recovery copy" {: o:^ ou:n :}
+   p u name nu ar JOIN {: at:^ atu:n :}
+   dir name nu at atu o ou ar HASH-AT-IF-PRESENT MATCH option
+      none OF false ENDOF
+      some OF want SAME-CONTENT? 0= if o ou at atu CORRUPT then
+         dir name nu at atu SYNC-INSTALLED-FILE true
+      ENDOF
    ;MATCH ;
 
 ;package

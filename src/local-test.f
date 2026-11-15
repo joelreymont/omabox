@@ -1,11 +1,14 @@
-\ local-test.f - LOCAL's shared words and download stages: local.rs's tests
-\ that an entry's existence below the root never follows a symlink and
-\ takes a failed probe as unconfirmed, that the content hash composes block
-\ hashes, and that neither the hash nor a stage's copy depends on how a
-\ reader fragments the bytes; then each stage outcome, each inspected
-\ download stage, a stage marker set, read and removed, and each parent a
-\ download opens. A case that makes files works in its own directory
-\ under TMPDIR and removes it.
+\ local-test.f - LOCAL's shared words, download stages, deletes,
+\ directories and conflicts: local.rs's tests that an entry's existence
+\ below the root never follows a symlink and takes a failed probe as
+\ unconfirmed, that the content hash composes block hashes, that neither
+\ the hash nor a stage's copy depends on how a reader fragments the
+\ bytes, that directory effects never overwrite or recurse and that a
+\ delete's replay keeps a raced edit; then each stage outcome, each
+\ inspected download stage, a stage marker set, read and removed, each
+\ parent a download opens, and each delete, directory and conflict
+\ outcome. A case that makes files works in its own directory under
+\ TMPDIR and removes it.
 \ Run from the repository root: hb --load src/local-test.f </dev/null
 require src/lib/test.f
 require src/lib/fmt.f
@@ -14,6 +17,7 @@ require src/lib/memory.f
 require src/lib/property.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
+require src/lib/fs-anchored.f
 require src/lib/fd.f
 require src/lib/adt/option.f
 require src/dropbox.f
@@ -62,6 +66,7 @@ private
    ;MATCH ;
 
 public
+EXPORT INTERNAL-NAME
 EXPORT PARENT-OF
 EXPORT HASH-STREAM
 EXPORT COPY-AND-HASH
@@ -526,6 +531,169 @@ SHA256-CTX-BYTES BUFFER: PART
    s" unsafe parent path fails" T-LABEL
    [: UNSAFE-PARENTS ;] IN-CASE-DIR ;
 
+\ ---- deletes
+
+: OLD ( -- DROPBOX:hash ) s" old" HASH-OF ;
+
+\ The actual hash's text, empty for none.
+: ACTUAL$ ( option<DROPBOX:hash> -- ^u8 n )
+   MATCH option
+      none OF s" " ENDOF
+      some OF DROPBOX:HASH>STR str> ENDOF
+   ;MATCH ;
+
+\ The outcome's variant, and its actual hash, else empty.
+: DELETED$ ( LOCAL:delete-outcome -- ^u8 n ^u8 n )
+   MATCH LOCAL:delete-outcome
+      deleted OF s" deleted" s" " ENDOF
+      already-deleted OF s" already-deleted" s" " ENDOF
+      precondition-changed OF {: c:option<DROPBOX:hash> :}
+         s" precondition-changed" c ACTUAL$
+      ENDOF
+   ;MATCH ;
+
+\ Deletes target.txt below the case directory while it holds "old".
+: DELETE ( -- ^u8 n ^u8 n )
+   ROOT$ TARGET OLD AR @ LOCAL:DELETE-LOCAL DELETED$ ;
+
+: GUARD ( -- ^u8 n ) s" deleted" TARGET OLD AR @ LOCAL:INTERNAL-NAME ;
+
+64 BUFFER: BACK
+
+\ The bytes of the file at the name below the case directory.
+: BYTES ( ^u8 n -- ^u8 n ) AT BACK 64 FS:READ-ALL BACK swap ;
+
+: PRESENT? ( ^u8 n -- bool ) AT FS:TRY-LSTAT ;
+
+: DELETE-REPLAY ( fd -- )
+   {: root:fd :}
+   TARGET s" old" PUT-FILE
+   root TARGET root GUARD FS:TRY-RENAME-AT TTRUE
+   TARGET s" raced edit" PUT-FILE
+   DELETE s" raced edit" IDENTITY T$= s" precondition-changed" T$=
+   TARGET BYTES s" raced edit" T$=
+   GUARD PRESENT? TFALSE ;
+
+: DELETE-REPLAY-PRESERVES-A-RACED-EDIT-AND-REMOVES-ITS-GUARD ( -- )
+   s" delete_replay_preserves_a_raced_edit_and_removes_its_guard" T-LABEL
+   [: DELETE-REPLAY ;] IN-CASE-DIR ;
+
+\ An interrupted delete's guard holding other bytes goes back.
+: GUARD-RESTORED ( -- )
+   s" guard restored" T-LABEL
+   GUARD s" edited" PUT-FILE
+   DELETE s" edited" IDENTITY T$= s" precondition-changed" T$=
+   TARGET BYTES s" edited" T$=
+   GUARD PRESENT? TFALSE ;
+
+: DELETE-CASES ( fd -- )
+   {: root:fd :}
+   s" deleted" T-LABEL
+   TARGET s" old" PUT-FILE
+   DELETE s" " T$= s" deleted" T$=
+   TARGET PRESENT? TFALSE GUARD PRESENT? TFALSE
+   s" already deleted" T-LABEL
+   DELETE s" " T$= s" already-deleted" T$=
+   s" precondition changed" T-LABEL
+   TARGET s" new" PUT-FILE
+   DELETE s" new" IDENTITY T$= s" precondition-changed" T$=
+   TARGET BYTES s" new" T$=
+   TARGET AT FS:REMOVE-FILE
+   GUARD-RESTORED ;
+
+\ precondition-changed with none needs the guard to vanish between its
+\ hash and its restore, a race a scratch tree cannot stage; left out.
+: EACH-DELETE-OUTCOME-IS-REACHED ( -- )
+   s" each delete outcome is reached" T-LABEL
+   [: DELETE-CASES ;] IN-CASE-DIR ;
+
+\ ---- directories
+
+: CREATED$ ( LOCAL:create-directory-outcome -- ^u8 n )
+   MATCH LOCAL:create-directory-outcome
+      created OF s" created" ENDOF
+      already-present OF s" already-present" ENDOF
+      fresh-observation OF s" fresh-observation" ENDOF
+   ;MATCH ;
+
+: REMOVED$ ( LOCAL:delete-directory-outcome -- ^u8 n )
+   MATCH LOCAL:delete-directory-outcome
+      deleted OF s" deleted" ENDOF
+      already-absent OF s" already-absent" ENDOF
+      fresh-observation OF s" fresh-observation" ENDOF
+   ;MATCH ;
+
+: MKDIR ( fd ^u8 n ^u8 n -- )
+   {: root:fd p:^ u:n want:^ wu:n :}
+   p u T-LABEL
+   root p u LOCAL:CREATE-DIRECTORY-AT CREATED$ want wu T$= ;
+
+: RMDIR ( fd ^u8 n ^u8 n -- )
+   {: root:fd p:^ u:n want:^ wu:n :}
+   p u T-LABEL
+   root p u LOCAL:DELETE-DIRECTORY-AT REMOVED$ want wu T$= ;
+
+: DIRECTORY-EFFECTS ( fd -- )
+   {: root:fd :}
+   root s" parent/child" s" created" MKDIR
+   root s" parent/child" s" already-present" MKDIR
+   root s" parent" s" fresh-observation" RMDIR
+   root s" parent/child" s" deleted" RMDIR
+   root s" parent" s" deleted" RMDIR
+   s" occupied" s" preserved bytes" PUT-FILE
+   root s" occupied" s" fresh-observation" MKDIR
+   root s" occupied" s" fresh-observation" RMDIR
+   s" occupied" BYTES s" preserved bytes" T$=
+   root s" parent" s" already-absent" RMDIR ;
+
+\ local.rs's test, then the absent directory's outcome.
+: DIRECTORY-EFFECTS-ARE-NONOVERWRITING-AND-NONRECURSIVE ( -- )
+   s" directory_effects_are_nonoverwriting_and_nonrecursive" T-LABEL
+   [: DIRECTORY-EFFECTS ;] IN-CASE-DIR ;
+
+\ ---- conflicts
+
+\ The outcome's variant, and its path or actual hash.
+: CONFLICT$ ( LOCAL:conflict-outcome -- ^u8 n ^u8 n )
+   MATCH LOCAL:conflict-outcome
+      created OF {: p:str :} s" created" p str> ENDOF
+      already-present OF {: p:str :} s" already-present" p str> ENDOF
+      content-changed OF {: c:DROPBOX:hash :}
+         s" content-changed" c DROPBOX:HASH>STR str>
+      ENDOF
+   ;MATCH ;
+
+: ORIGINAL ( -- ^u8 n ) s" dir/original.txt" ;
+
+\ Materializes the bytes as ORIGINAL's remote conflict copy of "remote".
+: MATERIALIZED ( ^u8 n -- ^u8 n ^u8 n )
+   {: b:^ bu:n :}
+   b bu START 0 SCHEDULE
+   ROOT$ ORIGINAL LOCAL-CONFLICT--SIDE:remote WANT [: FRAGMENT ;] AR @
+   LOCAL:MATERIALIZE-CONFLICT CONFLICT$ ;
+
+: COPY-PATH ( -- ^u8 n )
+   ORIGINAL LOCAL-CONFLICT--SIDE:remote WANT AR @
+   LOCAL:CONFLICT-RELATIVE-PATH ;
+
+: CONFLICT-CASES ( fd -- )
+   {: root:fd :}
+   s" created" T-LABEL
+   s" remote" MATERIALIZED COPY-PATH T$= s" created" T$=
+   COPY-PATH BYTES s" remote" T$=
+   COPY-PATH drop 4 s" dir/" T$=
+   s" already present" T-LABEL
+   s" remote" MATERIALIZED COPY-PATH T$= s" already-present" T$=
+   s" content changed" T-LABEL
+   COPY-PATH AT FS:REMOVE-FILE
+   s" mutant" MATERIALIZED s" mutant" IDENTITY T$=
+   s" content-changed" T$=
+   COPY-PATH PRESENT? TFALSE ;
+
+: EACH-CONFLICT-OUTCOME-IS-REACHED ( -- )
+   s" each conflict outcome is reached" T-LABEL
+   [: CONFLICT-CASES ;] IN-CASE-DIR ;
+
 : CASES ( -- )
    ENTRY-EXISTENCE-NEVER-FOLLOWS-SYMLINKS-AND-TREATS-PROBE-FAILURES-AS-UNCONFIRMED
    DROPBOX-HASH-USES-BLOCK-HASH-COMPOSITION
@@ -539,7 +707,11 @@ SHA256-CTX-BYTES BUFFER: PART
    MISSING-PARENT-IS-NONE-WITHOUT-CREATE
    CREATE-MAKES-PRIVATE-PARENTS
    SYMLINK-PARENT-IS-REFUSED
-   UNSAFE-PARENT-PATH-FAILS ;
+   UNSAFE-PARENT-PATH-FAILS
+   DIRECTORY-EFFECTS-ARE-NONOVERWRITING-AND-NONRECURSIVE
+   DELETE-REPLAY-PRESERVES-A-RACED-EDIT-AND-REMOVES-ITS-GUARD
+   EACH-DELETE-OUTCOME-IS-REACHED
+   EACH-CONFLICT-OUTCOME-IS-REACHED ;
 
 public
 
