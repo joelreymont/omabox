@@ -6,7 +6,7 @@
 \ Dropbox and local root bindings, local and remote inventories, remote
 \ cursor, baselines, baseline paths, pending and blocked plans, pending
 \ upload content, conflicts and pending and completed recoveries, each in
-\ the line's own form; and forty tests of the Rust version (rust
+\ the line's own form; and forty-five tests of the Rust version (rust
 \ src/journal.rs) under their names, which build each decision the Rust
 \ ones ask the planner for as src/oracle/plan.tsv holds it. Habu opens no
 \ schema-6 file, so the version-six tests start from a schema-8 journal
@@ -2643,6 +2643,293 @@ variable CRAFT
    d GONE ;
 
 
+\ ---- the Rust version's root activation tests ---------------------
+
+: ACTIVATED? ( local-root-activation local-root-record -- bool )
+   {: want :}
+   MATCH local-root-activation
+      activated OF want RECORD= ENDOF
+      current OF drop false ENDOF
+      unavailable OF 2drop false ENDOF
+   ;MATCH ;
+
+: PLAN= ( plan-record plan-record -- bool )
+   {: a b :}
+   a b SAME-PLAN? a STATUS-OF b STATUS-OF STATUS= and ;
+
+: PLANS= ( ^VEC:vector<plan-record> ^VEC:vector<plan-record> -- bool )
+   {: a b :}
+   a VEC:COUNT b VEC:COUNT <> if false exit then
+   a VEC:COUNT 0 ?do
+      a i VEC:AT @ b i VEC:AT @ PLAN= 0= if unloop false exit then
+   loop
+   true ;
+
+: RECOVERIES=
+   ( ^VEC:vector<recovery-record> ^VEC:vector<recovery-record> -- bool )
+   {: a b :}
+   a VEC:COUNT b VEC:COUNT <> if false exit then
+   a VEC:COUNT 0 ?do
+      a i VEC:AT @ b i VEC:AT @ RECOVERY= 0= if unloop false exit then
+   loop
+   true ;
+
+: CONFLICTS=
+   ( ^VEC:vector<conflict-record> ^VEC:vector<conflict-record> -- bool )
+   {: a b :}
+   a VEC:COUNT b VEC:COUNT <> if false exit then
+   a VEC:COUNT 0 ?do
+      a i VEC:AT @ b i VEC:AT @ CONFLICT-RECORD= 0=
+      if unloop false exit then
+   loop
+   true ;
+
+\ /sync/root at inode 2, with the birth time and subvolume statx gave.
+: SYNC-ROOT ( birth-time n bool -- local-root-binding )
+   {: birth sub has:bool :}
+   s" /sync/root" >str 2 birth true sub has FROM-STATX-FIELDS ;
+
+\ Activating actual over recorded is unavailable and writes nothing.
+: UNAVAILABLE-UNCHANGED
+   ( journal local-root-binding local-root-binding ^ARENA:arena -- )
+   {: j recorded actual ar :}
+   j CHANGED {: before :}
+   j actual ar ACTIVATE-LOCAL-ROOT recorded actual UNAVAILABLE? TTRUE
+   j CHANGED before T= ;
+
+: SAME-PATH-AND-INODE-WITH-ANOTHER-BIRTH-OR-SUBVOLUME-IS-UNAVAILABLE-WITHOUT-CHANGES
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" same_path_and_inode_with_another_birth_or_subvolume_is_unavailable_without_changes"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   s" /sync/root" 2 LOCAL-ROOT {: recorded :}
+   j recorded ar ACTIVATE-LOCAL-ROOT ACTIVATED
+   1700000001 5 JOURNAL-BIRTH--TIME:MAKE 256 true SYNC-ROOT {: reborn :}
+   BIRTH-5 257 true SYNC-ROOT {: resubvolumed :}
+   BIRTH-5 0 false SYNC-ROOT {: unsubvolumed :}
+   j recorded reborn ar UNAVAILABLE-UNCHANGED
+   j recorded resubvolumed ar UNAVAILABLE-UNCHANGED
+   j recorded unsubvolumed ar UNAVAILABLE-UNCHANGED
+   j CLOSE
+   d GONE ;
+
+\ The content preserved as a local file, then deleted where it stands.
+: PRESERVED-DELETE ( ^u8 n ^ARENA:arena -- operation-plan )
+   {: c:^ cu ar :}
+   ar [type] MODEL:operation NEW-VECTOR {: ops :}
+   c cu CONTENT MODEL-LOCAL:MAKE MODEL-OPERATION:preserve-local
+   ops VEC:PUSH !
+   c cu CONTENT MODEL-OPERATION:delete-local ops VEC:PUSH !
+   ops JOURNAL-OPERATION--PLAN:MAKE ;
+
+\ A pending destructive plan of the content, whose deletion has a
+\ recovery intent copying to copy, and a blocked upload.
+: PRIOR-WORK ( journal ^u8 n MODEL:path ^ARENA:arena -- )
+   {: j c:^ cu copy ar :}
+   j s" pending.txt" DISPLAY c cu ar PRESERVED-DELETE ar RECORD-PLAN
+   RECORDED-PLAN {: pending :}
+   j pending 1 NTH-ID copy ar RECORD-RECOVERY-INTENT RECORDED-RECOVERY
+   drop
+   s" blocked" UPLOAD-DECISION ar OPERATIONS {: upload :}
+   j s" blocked.txt" DISPLAY upload ar RECORD-PLAN RECORDED-PLAN >ID
+   {: id :}
+   j id MODEL-BLOCKAGE:stage-occupied 1700000000 ar BLOCK-PLAN BLOCK-N
+   2 T= ;
+
+\ dir/recovery-payload and dir/staged-payload, written.
+: PAYLOADS ( str ^ARENA:arena -- str str )
+   {: d:str ar :}
+   d s" recovery-payload" ar INSIDE {: r:str :}
+   d s" staged-payload" ar INSIDE {: s:str :}
+   r str> s" recovery" FS:WRITE-ALL
+   s str> s" staged" FS:WRITE-ALL
+   r s ;
+
+: FILE-HOLDS? ( str ^u8 n ^ARENA:arena -- bool )
+   {: f:str t:^ tu ar :}
+   ar 16 ARENA:ALLOC drop {: buf:^ :}
+   f str> buf 16 FS:READ-ALL {: u :}
+   buf u t tu STR= ;
+
+\ Retiring a root's work leaves the payload files as they were written.
+: PAYLOADS-KEPT ( str str ^ARENA:arena -- )
+   {: r:str s:str ar :}
+   r s" recovery" ar FILE-HOLDS? TTRUE
+   s s" staged" ar FILE-HOLDS? TTRUE ;
+
+\ The journal holds none of a prior root's state.
+: ROOT-WORK-RETIRED ( journal ^ARENA:arena -- )
+   {: j ar :}
+   j ar BASELINE-PATHS VEC:COUNT 0 T=
+   j ar LOCAL-INVENTORY VEC:COUNT 0 T=
+   j ar PENDING-PLANS VEC:COUNT 0 T=
+   j ar BLOCKED-PLANS VEC:COUNT 0 T=
+   j ar PENDING-RECOVERIES VEC:COUNT 0 T=
+   j ar CONFLICTS VEC:COUNT 0 T= ;
+
+\ The journal's state reads the same after the action as before it.
+: KEPT-ACROSS ( journal ^ARENA:arena [ -- ] -- )
+   {: j ar act :}
+   j ar BASELINE-PATHS {: paths :}
+   j ar LOCAL-INVENTORY {: locals :}
+   j ar PENDING-PLANS {: pending :}
+   j ar BLOCKED-PLANS {: blocked :}
+   j ar PENDING-RECOVERIES {: recoveries :}
+   j ar CONFLICTS {: conflicts :}
+   act execute
+   j ar BASELINE-PATHS paths PATHS= TTRUE
+   j ar LOCAL-INVENTORY locals LOCAL-RECORDS= TTRUE
+   j ar PENDING-PLANS pending PLANS= TTRUE
+   j ar BLOCKED-PLANS blocked PLANS= TTRUE
+   j ar PENDING-RECOVERIES recoveries RECOVERIES= TTRUE
+   j ar CONFLICTS conflicts CONFLICTS= TTRUE ;
+
+\ A new directory at root, the old one moved aside, inspected.
+: REPLACED ( str str -- local-root-binding )
+   {: root:str moved:str :}
+   root str> moved str> FS:RENAME-FILE
+   root str> FS:MAKE-DIR
+   root INSPECT ;
+
+\ The root's state: an agreed baseline, a local inventory, prior work
+\ recovering to the payload and a conflict.
+: ROOT-STATE ( journal str ^ARENA:arena -- )
+   {: j payload:str ar :}
+   j s" agreed.txt" s" agreed" s" rev-agreed" ar AGREE
+   j s" local.txt" s" local" PRESENT-LOCAL LOCAL-RECORD ar ONE-LOCAL
+   PUBLISH-LOCAL-INVENTORY
+   j s" old" payload MODEL:>PATH ar PRIOR-WORK
+   j s" conflict.txt" DISPLAY CONFLICTED ar RECORD-CONFLICT drop ;
+
+: REPLACED-SAME-PATH-IS-UNAVAILABLE-WITHOUT-CHANGING-JOURNAL-STATE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" replaced_same_path_is_unavailable_without_changing_journal_state"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   d s" root" ar INSIDE {: root:str :}
+   root str> FS:MAKE-DIR
+   root INSPECT {: recorded :}
+   recorded 1 JOURNAL-LOCAL--ROOT--RECORD:MAKE {: was :}
+   p OPEN {: j :}
+   j recorded ar ACTIVATE-LOCAL-ROOT ACTIVATED
+   d ar PAYLOADS {: rp:str sp:str :}
+   j rp ar ROOT-STATE
+   root d s" moved-root" ar INSIDE REPLACED {: actual :}
+   recorded actual ROOT= TFALSE
+   recorded ROOT-PATH actual ROOT-PATH SAME? TTRUE
+   j ar [: j recorded actual ar UNAVAILABLE-UNCHANGED ;] KEPT-ACROSS
+   j ar LOCAL-ROOT-BINDING was RECORD-HELD? TTRUE
+   actual 2 JOURNAL-LOCAL--ROOT--RECORD:MAKE {: adopted :}
+   j actual ar ADOPT-LOCAL-ROOT adopted ACTIVATED? TTRUE
+   j ar ROOT-WORK-RETIRED
+   rp sp ar PAYLOADS-KEPT
+   j CLOSE
+   d GONE ;
+
+\ The remote inventory still holds the cursor and the record.
+: REMOTE-KEPT ( remote-inventory MODEL:remote-record ^ARENA:arena -- )
+   {: inv r ar :}
+   inv JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur v :}
+   cur s" cursor-kept" CURSOR-IS? TTRUE
+   v r ar ONE-REMOTE REMOTES= TTRUE ;
+
+: SAME-REV-1 ( -- MODEL:remote ) s" same" s" rev-1" REMOTE-FILE ;
+
+\ The first root's state at tracked.txt, agreed as the remote record
+\ answered holds it, and a conflict.
+: TRACKED ( journal ^ARENA:arena -- MODEL:remote-record )
+   {: j ar :}
+   s" tracked.txt" DISPLAY {: path :}
+   SAME-REV-1 {: agreed :}
+   j path agreed MATCH-DECISION NOOP ar RECORD-NOOP NOOP-RECORDED? TTRUE
+   j s" tracked.txt" s" same" PRESENT-LOCAL LOCAL-RECORD ar ONE-LOCAL
+   PUBLISH-LOCAL-INVENTORY
+   s" tracked.txt" s" tracked.txt" agreed MODEL-OBSERVATION:present ar
+   REMOTE-RECORD {: remote :}
+   j s" cursor-kept" CURSOR remote ar ONE-REMOTE PUBLISH-REMOTE-INVENTORY
+   j s" old-root-conflict.txt" DISPLAY DIVERGENT ar RECORD-CONFLICT drop
+   remote ;
+
+: LOCAL-ROOT-GENERATION-RESETS-ONLY-ROOT-LOCAL-STATE ( ^ARENA:arena -- )
+   {: ar :}
+   s" local_root_generation_resets_only_root_local_state" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   s" /sync/first" 2 LOCAL-ROOT {: first :}
+   first 1 JOURNAL-LOCAL--ROOT--RECORD:MAKE {: first-record :}
+   j first ar ACTIVATE-LOCAL-ROOT first-record ACTIVATED? TTRUE
+   j ar TRACKED {: remote :}
+   s" tracked.txt" DISPLAY {: path :}
+   j first ar ACTIVATE-LOCAL-ROOT first-record CURRENT? TTRUE
+   j path ar BASELINE SAME-REV-1 MODEL-BASELINE:present BASELINE-HELD?
+   TTRUE
+   s" /sync/second" 4 LOCAL-ROOT {: second :}
+   second 2 JOURNAL-LOCAL--ROOT--RECORD:MAKE {: second-record :}
+   j second ar ACTIVATE-LOCAL-ROOT second-record ACTIVATED? TTRUE
+   j ar LOCAL-ROOT-BINDING second-record RECORD-HELD? TTRUE
+   j path ar BASELINE NO-BASELINE? TTRUE
+   j ar ROOT-WORK-RETIRED
+   j ar REMOTE-INVENTORY remote ar REMOTE-KEPT
+   j CLOSE
+   d GONE ;
+
+\ A journal bound to no root, holding a pending plan, retires it when
+\ the root activates as the first generation.
+: UNBOUND-RETIRED ( str local-root-binding ^ARENA:arena -- )
+   {: d:str b ar :}
+   d s" unbound.sqlite3" ar INSIDE OPEN {: u :}
+   u s" pending.txt" DISPLAY s" pending" ar PRESERVED-DELETE ar
+   RECORD-PLAN RECORDED-PLAN drop
+   b 1 JOURNAL-LOCAL--ROOT--RECORD:MAKE {: first :}
+   u b ar ACTIVATE-LOCAL-ROOT first ACTIVATED? TTRUE
+   u ar PENDING-PLANS VEC:COUNT 0 T=
+   u CLOSE ;
+
+: LOCAL-ROOT-ACTIVATION-RETIRES-WORK-FROM-A-PRIOR-OR-UNBOUND-ROOT
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" local_root_activation_retires_work_from_a_prior_or_unbound_root"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   d ar PAYLOADS {: rp:str sp:str :}
+   p OPEN {: j :}
+   s" /sync/current" 2 LOCAL-ROOT {: current :}
+   current 1 JOURNAL-LOCAL--ROOT--RECORD:MAKE {: was :}
+   j current ar ACTIVATE-LOCAL-ROOT was ACTIVATED? TTRUE
+   j s" pending" rp MODEL:>PATH ar PRIOR-WORK
+   s" /sync/replacement" 4 LOCAL-ROOT {: replacement :}
+   replacement 2 JOURNAL-LOCAL--ROOT--RECORD:MAKE {: record :}
+   j replacement ar ACTIVATE-LOCAL-ROOT record ACTIVATED? TTRUE
+   j ar LOCAL-ROOT-BINDING record RECORD-HELD? TTRUE
+   j ar ROOT-WORK-RETIRED
+   rp sp ar PAYLOADS-KEPT
+   j CLOSE
+   d replacement ar UNBOUND-RETIRED
+   d GONE ;
+
+\ JOURNAL's half: the new root finds no baseline. Planning the absent
+\ baseline, the empty root and the remote file into an install is
+\ PLANNER's half, which this file does not load.
+: NEW-EMPTY-ROOT-DOWNLOADS-REMOTE-CONTENT-INSTEAD-OF-DELETING-IT
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" new_empty_root_downloads_remote_content_instead_of_deleting_it"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j s" /sync/old" 2 LOCAL-ROOT ar ACTIVATE-LOCAL-ROOT ACTIVATED
+   s" remote-only.txt" DISPLAY {: path :}
+   s" remote" s" rev-remote" REMOTE-FILE {: remote :}
+   j path remote MATCH-DECISION NOOP ar RECORD-NOOP NOOP-RECORDED? TTRUE
+   j s" /sync/new-empty" 4 LOCAL-ROOT ar ACTIVATE-LOCAL-ROOT ACTIVATED
+   j path ar BASELINE NO-BASELINE? TTRUE
+   j CLOSE
+   d GONE ;
+
+
 : CASES ( ^ARENA:arena -- )
    {: ar :}
    ar NEW-JOURNAL-HAS-THE-ORACLE-SCHEMA
@@ -2658,6 +2945,11 @@ variable CRAFT
    ar VERSION-SIX-ROOT-BINDING-UPGRADES-IN-PLACE-WHEN-PATH-AND-INODE-MATCH
    ar VERSION-SIX-ROOT-BINDING-WITH-ANOTHER-INODE-IS-UNAVAILABLE-WITHOUT-CHANGES
    ar ADOPTING-A-MATCHING-VERSION-SIX-ROOT-KEEPS-ITS-GENERATION
+   ar SAME-PATH-AND-INODE-WITH-ANOTHER-BIRTH-OR-SUBVOLUME-IS-UNAVAILABLE-WITHOUT-CHANGES
+   ar REPLACED-SAME-PATH-IS-UNAVAILABLE-WITHOUT-CHANGING-JOURNAL-STATE
+   ar LOCAL-ROOT-GENERATION-RESETS-ONLY-ROOT-LOCAL-STATE
+   ar LOCAL-ROOT-ACTIVATION-RETIRES-WORK-FROM-A-PRIOR-OR-UNBOUND-ROOT
+   ar NEW-EMPTY-ROOT-DOWNLOADS-REMOTE-CONTENT-INSTEAD-OF-DELETING-IT
    ar JOURNAL-DROPBOX-BINDING-SURVIVES-REOPEN
    ar JOURNAL-DROPBOX-BINDING-MISMATCH-NEVER-REPLACES-EXISTING
    ar JOURNAL-REJECTS-NEWER-SCHEMA-WITHOUT-CHANGING-ITS-VERSION
