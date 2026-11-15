@@ -6,7 +6,8 @@
 \ Dropbox and local root bindings, local and remote inventories, remote
 \ cursor, baselines, baseline paths, pending and blocked plans, pending
 \ upload content, conflicts and pending and completed recoveries, each in
-\ the line's own form; and forty-five tests of the Rust version (rust
+\ the line's own form; a file of other bytes refused as corrupt by both
+\ opens, unchanged; and fifty-one tests of the Rust version (rust
 \ src/journal.rs) under their names, which build each decision the Rust
 \ ones ask the planner for as src/oracle/plan.tsv holds it. Habu opens no
 \ schema-6 file, so the version-six tests start from a schema-8 journal
@@ -44,6 +45,8 @@ CAP BUFFER: WANT       \ a binding as the Rust version prints it
 CAP BUFFER: ERR        \ a captured log
 variable BODY-U
 $1A4 constant MODE-SHARED
+$140 constant MODE-SEALED          \ 0500
+$1C0 constant MODE-DIR-OWNER       \ 0700
 
 TYPED-VARIABLE ACTION [ -- ]
 TYPED-VARIABLE SUBJECT str
@@ -716,6 +719,111 @@ variable SCANNED       \ query plan rows that scan the table
    p OPEN-READ {: j :}
    p MODE-OF MODE-SHARED T=
    j CLOSE
+   d GONE ;
+
+: WRITABLE-JOURNAL-RESTRICTS-EXISTING-DATABASE ( ^ARENA:arena -- )
+   {: ar :}
+   s" writable_journal_restricts_existing_database" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN CLOSE
+   p str> MODE-SHARED FS:CHMOD-MODE
+   p OPEN {: j :}
+   p MODE-OF MODE-OWNER T=
+   j CLOSE
+   d GONE ;
+
+: BUSY-MS-OF ( journal -- n )
+   >CONNECTION s" PRAGMA busy_timeout" QUERY-INT ;
+
+: EVERY-CONNECTION-WAITS-OUT-A-CONCURRENT-COMMIT ( ^ARENA:arena -- )
+   {: ar :}
+   s" every_connection_waits_out_a_concurrent_commit" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   p OPEN-READ {: k :}
+   j BUSY-MS-OF BUSY-MS T=
+   k BUSY-MS-OF BUSY-MS T=
+   k CLOSE
+   j CLOSE
+   d GONE ;
+
+\ The journal mode's name, exactly as SQLite reports it.
+: DELETE-ROW? ( SQLITE:statement -- bool SQLITE:statement )
+   SQLITE:STEP drop 0 SQLITE:COL-TEXT s" delete" STR= swap ;
+
+: WRITABLE-JOURNAL-USES-FULL-SYNCHRONOUS-ROLLBACK-MODE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" writable_journal_uses_full_synchronous_rollback_mode" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j >CONNECTION {: c :}
+   c s" PRAGMA journal_mode" [: DELETE-ROW? ;] SQLITE:WITH-STATEMENT
+   TTRUE
+   c s" PRAGMA synchronous" QUERY-INT 2 T=
+   j BUSY-MS-OF 5000 T=
+   c s" PRAGMA foreign_keys" QUERY-INT 1 T=
+   j CLOSE
+   d GONE ;
+
+: CREATE-FAILED ( -- ^u8 n )
+   s" journal operation `create journal database` failed for" ;
+
+\ Opening path throws E-FILE with a log line in dir holding the text.
+: OPEN-REFUSED ( str str ^u8 n ^ARENA:arena -- )
+   {: path:str dir:str t:^ tu ar :}
+   path SUBJECT !
+   [: SUBJECT @ OPEN CLOSE ;] E-FILE dir t tu ar LOGGED ;
+
+: JOURNAL-CREATION-REPORTS-ITS-OWN-FILESYSTEM-FAILURE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" journal_creation_reports_its_own_filesystem_failure" T-LABEL
+   ar SCRATCH {: d:str :}
+   d s" sealed" ar INSIDE {: sealed:str :}
+   sealed str> FS:MAKE-DIR
+   sealed str> MODE-SEALED FS:CHMOD-MODE
+   sealed s" journal.sqlite3" ar INSIDE {: path:str :}
+   path d CREATE-FAILED ar OPEN-REFUSED
+   sealed str> MODE-DIR-OWNER FS:CHMOD-MODE
+   d GONE ;
+
+: JOURNAL-REFUSES-A-SYMLINKED-DATABASE ( ^ARENA:arena -- )
+   {: ar :}
+   s" journal_refuses_a_symlinked_database" T-LABEL
+   ar SCRATCH {: d:str :}
+   d s" planted.sqlite3" ar INSIDE {: planted:str :}
+   d s" dangling.sqlite3" ar INSIDE {: dangling:str :}
+   planted str> dangling str> FS:MAKE-SYMLINK
+   dangling d CREATE-FAILED ar OPEN-REFUSED
+   planted str> FS:EXISTS? TFALSE
+   d s" existing.sqlite3" ar INSIDE {: existing:str :}
+   existing OPEN CLOSE
+   d s" linked.sqlite3" ar INSIDE {: linked:str :}
+   existing str> linked str> FS:MAKE-SYMLINK
+   linked d s" `: existing path is not a regular file" ar
+   OPEN-REFUSED
+   d GONE ;
+
+: GARBAGE ( -- ^u8 n )
+   s" these bytes are text, not a SQLite database's" ;
+
+: GARBAGE-KEPT? ( str -- bool )
+   str> BODY CAP FS:READ-ALL {: u :}
+   BODY u GARBAGE STR= ;
+
+: GARBAGE-FILE-IS-CORRUPT ( ^ARENA:arena -- )
+   {: ar :}
+   s" a file of other bytes is corrupt to both opens" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p str> GARBAGE FS:WRITE-ALL
+   p SUBJECT !
+   [: SUBJECT @ OPEN CLOSE ;] SQLITE:E-CORRUPT d
+   s" file is not a database" ar LOGGED
+   p GARBAGE-KEPT? TTRUE
+   [: SUBJECT @ OPEN-READ CLOSE ;] SQLITE:E-CORRUPT d
+   s" file is not a database" ar LOGGED
+   p GARBAGE-KEPT? TTRUE
    d GONE ;
 
 \ The identity statx gives for the directory, read here on its own.
@@ -1540,6 +1648,22 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    j s" same.txt" DISPLAY ar BASELINE NO-BASELINE? TTRUE
    j ar PENDING-PLANS VEC:COUNT 0 T=
    j CLOSE
+   d GONE ;
+
+: WRITABLE-JOURNAL-NEVER-TRUNCATES-AN-EXISTING-DATABASE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" writable_journal_never_truncates_an_existing_database" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   s" kept.txt" DISPLAY {: path :}
+   s" kept" s" rev-kept" REMOTE-FILE {: file :}
+   p OPEN {: j :}
+   j path file MATCH-DECISION NOOP ar RECORD-NOOP NOOP-RECORDED? TTRUE
+   j CLOSE
+   p OPEN {: k :}
+   k path ar BASELINE file MODEL-BASELINE:present BASELINE-HELD? TTRUE
+   p MODE-OF MODE-OWNER T=
+   k CLOSE
    d GONE ;
 
 : JOURNAL-NOOP-REFRESHES-REVISION-BUT-CANNOT-CROSS-A-PENDING-PLAN
@@ -2937,6 +3061,13 @@ variable CRAFT
    ar ORACLE-JOURNAL-HOLDS-ITS-BINDINGS
    ar WRITABLE-JOURNAL-CREATES-OWNER-ONLY-DATABASE
    ar READ-ONLY-JOURNAL-PRESERVES-EXISTING-PERMISSIONS
+   ar WRITABLE-JOURNAL-RESTRICTS-EXISTING-DATABASE
+   ar EVERY-CONNECTION-WAITS-OUT-A-CONCURRENT-COMMIT
+   ar WRITABLE-JOURNAL-USES-FULL-SYNCHRONOUS-ROLLBACK-MODE
+   ar JOURNAL-CREATION-REPORTS-ITS-OWN-FILESYSTEM-FAILURE
+   ar WRITABLE-JOURNAL-NEVER-TRUNCATES-AN-EXISTING-DATABASE
+   ar JOURNAL-REFUSES-A-SYMLINKED-DATABASE
+   ar GARBAGE-FILE-IS-CORRUPT
    ar LOCAL-ROOT-INSPECTION-USES-DIRECTORY-FILESYSTEM-IDENTITY
    ar ROOT-IDENTITY-REQUIRES-A-RECORDED-BIRTH-TIME
    STAND-IN-NEEDS-THE-ROOT-PATH-AND-A-BIRTH-TIME-OR-ANOTHER-INODE
