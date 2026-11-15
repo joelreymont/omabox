@@ -34,7 +34,7 @@ General code goes into Habu's `src/lib`; sync policy stays here.
 - **`SECRET`:** write on Linux, as `secret-tool store` writes, under the
   attribute keys and label a program binds once (`src/auth.rs:30`). Nothing
   in the Rust version erases the credential, so there is no erase.
-- **`UTF8:LOSSY`:** Rust's `from_utf8_lossy`, for the paths in `status.json`
+- **`UTF8-LOSSY:REPAIR`:** Rust's `from_utf8_lossy`, for the paths in `status.json`
   (`src/runtime_status.rs:336`).
 
 These take a string as `^u8 n` until Habu's `str` lands; its sweep moves them
