@@ -1086,18 +1086,13 @@ ENUM verdict
    s" a range it cannot satisfy from 0" E-ANSWER FAILED ;
 
 
-\ A 416 carries no Dropbox-API-Result, so it is never done: from offset 0
-\ it throws E-ANSWER, from any other it is again's, RangeUnsatisfiable in
-\ dropbox.rs, whatever size its Content-Range names.
-: UNSATISFIED ( ptr client n [ ptr client -- reply ] -- reply )
-   {: c at:n again :}
-   at 0= if c UNSATISFIABLE else c again execute then ;
-
-
+\ A 416, RangeUnsatisfiable in dropbox.rs, carries no Dropbox-API-Result,
+\ so it is never done; unsat answers it, whatever size its Content-Range
+\ names.
 : FETCHED ( ptr client ptr u8 n n [ ptr u8 n n -- ] [ ptr client -- reply ] -- verdict )
-   {: c r:ptr ru:n at:n sink again :}
+   {: c r:ptr ru:n at:n sink unsat :}
    c r ru at sink STREAMED {: got:n :}
-   c CLIENT-STATUS @ 416 = if c at again UNSATISFIED ANSWER exit then
+   c CLIENT-STATUS @ 416 = if c unsat execute ANSWER exit then
    c SORTED {: v:verdict :}
    v MATCH verdict
       answer OF DONE? if c r ru at got VERIFIED then ENDOF
@@ -1106,15 +1101,14 @@ ENUM verdict
    v ;
 
 
-\ files/download from the offset; again answers a 416 from a nonzero one.
+\ files/download from the offset; unsat answers a 416.
 : FROM ( ptr u8 n n ptr client [ ptr u8 n n -- ] [ ptr client -- reply ] -- reply )
-   {: r:ptr ru:n at:n c sink again :}
+   {: r:ptr ru:n at:n c sink unsat :}
    c c CLIENT-CONTENT @ s" files/download"
-   [: r ru at ASKED ;] [: r ru at sink again FETCHED ;] CALL-AT ;
+   [: r ru at ASKED ;] [: r ru at sink unsat FETCHED ;] CALL-AT ;
 
 
-\ files/download started over from offset 0, which a 416 ends: UNSATISFIED
-\ throws before again is asked.
+\ files/download from offset 0.
 : AFRESH ( ptr client ptr u8 n [ ptr u8 n n -- ] -- reply )
    {: c r:ptr ru:n sink :}
    r ru 0 c sink [: UNSATISFIABLE ;] FROM ;
@@ -1398,6 +1392,7 @@ public
 \ entry.
 : DOWNLOAD ( ptr u8 n n ptr client [ ptr u8 n n -- ] -- reply )
    {: r:ptr ru:n at:n c sink :}
+   at 0= if c r ru sink AFRESH exit then
    r ru at c sink [: r ru sink AFRESH ;] FROM ;
 
 \ ---- delete_v2, create_folder_v2 and the code exchange

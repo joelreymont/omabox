@@ -397,7 +397,7 @@ variable SUNK-AT
    MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:SIZE @ 26 T= ;
 
 
-\ A 416 with no Range to drop: the restart's.
+\ A 416 with no Range to drop: one from offset 0.
 : UNSATISFIABLE! ( -- )
    416 s" Content-Range" s" bytes */26" s" " TEST-DROPBOX:SCRIPT! ;
 
@@ -408,6 +408,15 @@ variable SUNK-AT
    UNSATISFIABLE! UNSATISFIABLE!
    [: FETCH-DROPPED ;] DROPBOX:E-ANSWER TTHROWSQ
    TEST-DROPBOX:SEEN$ s" /2/files/download /2/files/download" T$=
+   SUNK-U @ 0 T= ;
+
+
+: FIRST-UNSATISFIABLE-CASE ( -- )
+   s" download 416 from 0" T-LABEL
+   TEST-DROPBOX:RESET ALPHABET
+   UNSATISFIABLE!
+   [: 0 FETCH DONE? drop ;] DROPBOX:E-ANSWER TTHROWSQ
+   TEST-DROPBOX:SEEN$ s" /2/files/download" T$=
    SUNK-U @ 0 T= ;
 
 
@@ -422,7 +431,7 @@ variable SUNK-AT
 
 : DOWNLOAD-CASES ( -- )
    WHOLE-CASE RESUME-CASE SKEW-CASE UNSATISFIED-CASE RESTART-CASE
-   UNSATISFIABLE-CASE UNKNOWN-REV-CASE ;
+   UNSATISFIABLE-CASE FIRST-UNSATISFIABLE-CASE UNKNOWN-REV-CASE ;
 
 
 \ ---- delete_v2, create_folder_v2 and the code exchange
