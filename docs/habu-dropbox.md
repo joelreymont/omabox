@@ -123,6 +123,14 @@ STRUCTURE config
   - A 416 from a nonzero offset starts over once from 0, as the Rust version
     does, so the quotation sees offset 0 again. A 416 from 0 throws
     `E-ANSWER`. Every `done` therefore carries the entry Dropbox reported.
+  - A throw while the transfer is in flight, from a failed check, the
+    quotation or an allocation, ends it in one place: the client cancels the
+    transfer and reads it to its end into a region laid out at `OPEN`, so
+    ending it allocates nothing, then rethrows the code. The client's handle
+    is then free for its next call. In the read loop nothing after the read
+    that ended a transfer throws, so every throw there finds it in flight;
+    the header capture and checks after the loop may throw, with the handle
+    already free.
 - **`DELETE`** sends the rev as `parent_rev`. With an empty rev it deletes
   unconditionally, which sync uses only for a folder it has just seen empty.
 - **A mutation confirms an answer it cannot trust.** libcurl resends a POST
