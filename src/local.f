@@ -1,7 +1,8 @@
 \ local.f - package LOCAL: the local half of a sync (docs/habu-rewrite.md,
 \ the LOCAL row) on Habu's anchored file words: its errors, the opens it
-\ confines below the sync root, Dropbox content hashes of local files, and
-\ the verified stages a download writes, with their xattr markers.
+\ confines below the sync root, Dropbox content hashes of local files, the
+\ verified stages a download writes, with their xattr markers, and the
+\ slots in the state home where a download's partial bytes resume.
 \ A relative path splits as Rust's Path::components splits it: empty and "."
 \ components past the first are skipped, and an empty, absolute or leading "."
 \ path, or one with a ".." component, is unsafe. Each component opens
@@ -13,9 +14,11 @@
 \ throws its code; an io failure's errno stays in FS:ERRNO, 0 where the
 \ Habu word that failed keeps none.
 \ STORAGE CLASS. PROCESS-WIDE: the content hasher, its read buffer, the
-\ name hasher and the marker read buffer; one task syncs, so one uses them
-\ at a time. CALLER-OWNED: every descriptor answered, the hashes and names
-\ laid in the caller's arena, and the paths a stage's result names.
+\ name hasher, the marker and slot state buffers, the slot name and path
+\ buffers and a lease's slot table; one task syncs, so one uses them at a
+\ time. CALLER-OWNED: every descriptor answered, the hashes, names and
+\ partials laid in the caller's arena, the paths a stage's result names
+\ and a lease's slot directory.
 
 require src/lib/error.f
 require src/lib/string.f
@@ -1123,5 +1126,715 @@ $100 constant MODE-READ-ONLY
       none OF s" preserve raced local destination" t tu CHANGED ENDOF
       some OF {: c:DROPBOX:hash :} dir g gu t tu c ar PRESERVE-GUARD ENDOF
    ;MATCH ;
+
+
+\ ---- download slots
+
+\ The Rust daemon's names and sizes, so either resumes the other's
+\ partials.
+: DOWNLOAD-PARTIAL-XATTR ( -- ^u8 n ) s" user.omabox.download-partial-v1" ;
+\ 64 MiB, a whole number of Dropbox's 4 MiB blocks.
+$4000000 constant DOWNLOAD-CHECKPOINT-BYTES
+: DOWNLOAD-SLOT-OWNER-PREFIX ( -- ^u8 n ) s" omabox-download-slot-v1" ;
+\ The owner prefix, the binding's 32 bytes, then the offset big-endian.
+DOWNLOAD-SLOT-OWNER-PREFIX nip 32 + 8 + constant DOWNLOAD-SLOT-STATE-LENGTH
+\ The slots are this many fixed files, so a partial either daemon left in
+\ any of them is found.
+4 constant MAX-PARALLEL-DOWNLOADS
+
+public
+
+\ A slot's owner, Rust's 32-byte binding: four cells of eight of its
+\ bytes, each read most significant first.
+STRUCTURE binding OPAQUE
+   FIELD b0 n
+   FIELD b1 n
+   FIELD b2 n
+   FIELD b3 n
+;STRUCTURE
+
+\ The download a slot is bound to.
+STRUCTURE download-slot-identity OPAQUE FIELD binding binding ;STRUCTURE
+
+\ A slot leased to one download: the caller's slot directory, the slot's
+\ number and the download's binding.
+STRUCTURE download-slot-lease OPAQUE
+   FIELD directory str
+   FIELD slot n
+   FIELD binding binding
+;STRUCTURE
+
+private
+
+\ Where a download's bytes go before they are staged: a slot in its
+\ directory, bound to the download, or an unnamed file shown as path.
+ENUM download-source
+   VARIANT resumable
+      FIELD directory fd
+      FIELD name str
+      FIELD path str
+      FIELD binding binding
+   ;VARIANT
+   VARIANT disposable FIELD path str ;VARIANT
+;ENUM
+
+\ A download's source and the stage it becomes: the target's directory,
+\ the stage's name and path there, the target and its content.
+STRUCTURE download-location DERIVE addr
+   FIELD source download-source
+   FIELD target-directory fd
+   FIELD stage-name str
+   FIELD stage-path str
+   FIELD target str
+   FIELD expected DROPBOX:hash
+;STRUCTURE
+
+public
+
+\ A download in progress: where it goes, its file, the bytes in it, and
+\ the Dropbox hash of those bytes so far.
+STRUCTURE download-partial OPAQUE DERIVE addr
+   FIELD location download-location
+   FIELD file fd
+   FIELD offset n
+   FIELD aggregate DROPBOX:hasher
+;STRUCTURE
+
+\ A stage a preparation found complete, its stage 0 for Rust's (); an
+\ ENUM payload names no applied family, a field does.
+STRUCTURE completed-stage FIELD outcome stage-outcome<n> ;STRUCTURE
+
+\ What preparing a download came to: a partial ready for bytes, a stage
+\ complete already, or no slot to resume in.
+ENUM download-preparation
+   VARIANT ready FIELD partial ^download-partial ;VARIANT
+   VARIANT complete FIELD stage completed-stage ;VARIANT
+   VARIANT ephemeral ;VARIANT
+;ENUM
+
+private
+
+\ A slot's owner and the bytes of its partial known durable.
+STRUCTURE download-slot-state
+   FIELD binding binding
+   FIELD offset n
+;STRUCTURE
+
+ARENA PARTIALS download-partial
+
+\ The source's path: a slot's, or an unnamed file's display path.
+: SOURCE-PATH ( download-source -- ^u8 n )
+   MATCH download-source
+      resumable OF {: dir:fd name:str path:str b:binding :} path str>
+      ENDOF
+      disposable OF str> ENDOF
+   ;MATCH ;
+
+\ ---- slot bindings
+
+\ Eight bytes at p as one cell, the first most significant.
+: BE@ ( ^u8 -- n )
+   {: p:^ :}
+   0 8 0 ?do 8 lshift p i + c@ or loop ;
+
+: BE! ( n ^u8 -- )
+   {: v:n p:^ :}
+   8 0 ?do v 7 i - 8 * rshift $FF and p i + c! loop ;
+
+: BYTES>BINDING ( ^u8 -- binding )
+   {: p:^ :}
+   p BE@ p 8 + BE@ p 16 + BE@ p 24 + BE@ BINDING-MAKE ;
+
+: BINDING>BYTES ( binding ^u8 -- )
+   {: b:binding p:^ :}
+   b BINDING-UNMAKE {: b0:n b1:n b2:n b3:n :}
+   b0 p BE! b1 p 8 + BE! b2 p 16 + BE! b3 p 24 + BE! ;
+
+8 BUFFER: BE-BUF
+
+: FEED-BE ( n -- ) BE-BUF BE! BE-BUF 8 FEED ;
+
+public
+
+: BINDING= ( binding binding -- bool )
+   {: a:binding b:binding :}
+   a BINDING-UNMAKE {: a0:n a1:n a2:n a3:n :}
+   b BINDING-UNMAKE {: b0:n b1:n b2:n b3:n :}
+   a0 b0 = a1 b1 = and a2 b2 = and a3 b3 = and ;
+
+\ Rust's DownloadSlotIdentity::new for a root's generation, an operation
+\ and its target: the SHA-256 of the lease's tag, the generation and the
+\ operation big-endian, the target, the rev and the content, the last
+\ three NUL-separated.
+: NEW-SLOT-IDENTITY
+   ( n n ^u8 n MODEL:remote -- download-slot-identity )
+   {: generation:n operation:n t:^ tu:n r:MODEL:remote :}
+   r MODEL-REMOTE:UNMAKE {: c:DROPBOX:hash rev:DROPBOX:rev :}
+   NAME-CTX SHA256-BEGIN
+   s" omabox-download-slot-lease-v1" FEED
+   generation FEED-BE operation FEED-BE
+   t tu FEED NUL 1 FEED rev DROPBOX:REV>STR str> FEED
+   NUL 1 FEED c DROPBOX:HASH>STR str> FEED
+   NAME-CTX NAME-DIGEST SHA256-END
+   NAME-DIGEST BYTES>BINDING DOWNLOAD-SLOT-IDENTITY-MAKE ;
+
+: SLOT-BINDING ( download-slot-identity -- binding )
+   DOWNLOAD-SLOT-IDENTITY-UNMAKE ;
+
+private
+
+\ ---- slot state
+
+DOWNLOAD-SLOT-STATE-LENGTH BUFFER: STATE-BUF
+
+\ The xattr's bytes, valid until the next encode or read.
+: ENCODE-DOWNLOAD-SLOT-STATE ( download-slot-state -- ^u8 n )
+   DOWNLOAD-SLOT-STATE-UNMAKE {: b:binding offset:n :}
+   DOWNLOAD-SLOT-OWNER-PREFIX {: x:^ xu:n :}
+   x STATE-BUF xu BYTE-COPY
+   b STATE-BUF xu + BINDING>BYTES
+   offset STATE-BUF xu + 32 + BE!
+   STATE-BUF DOWNLOAD-SLOT-STATE-LENGTH ;
+
+: DECODE-DOWNLOAD-SLOT-STATE ( ^u8 n -- option<download-slot-state> )
+   {: p:^ u:n :}
+   DOWNLOAD-SLOT-OWNER-PREFIX {: x:^ xu:n :}
+   u DOWNLOAD-SLOT-STATE-LENGTH <> if OPTION:NONE exit then
+   p xu x xu STR= 0= if OPTION:NONE exit then
+   p xu + BYTES>BINDING p xu + 32 + BE@
+   DOWNLOAD-SLOT-STATE-MAKE OPTION:SOME ;
+
+: STATE-GOT ( XATTR:got -- option<download-slot-state> )
+   MATCH XATTR:got
+      absent OF OPTION:NONE ENDOF
+      value OF STATE-BUF swap DECODE-DOWNLOAD-SLOT-STATE ENDOF
+      oversize OF OPTION:NONE ENDOF
+   ;MATCH ;
+
+: DROP-SLOT-STATE ( option<download-slot-state> -- ) drop ;
+
+\ The slot's state, none when it carries none in this format.
+: READ-DOWNLOAD-SLOT-STATE ( fd ^u8 n -- option<download-slot-state> )
+   {: f:fd p:^ u:n :}
+   OPTION:NONE
+   [: DROP-SLOT-STATE f DOWNLOAD-PARTIAL-XATTR
+      STATE-BUF DOWNLOAD-SLOT-STATE-LENGTH SPAN:MAKE XATTR:GET STATE-GOT ;]
+   [: s" inspect resumed download slot marker" p u IO-FAILURE ;] FS-FAILS ;
+
+: SLOT-BOUND? ( option<download-slot-state> binding -- bool )
+   {: s:option<download-slot-state> b:binding :}
+   s MATCH option
+      none OF false ENDOF
+      some OF DOWNLOAD-SLOT-STATE-UNMAKE {: held:binding at:n :}
+         held b BINDING=
+      ENDOF
+   ;MATCH ;
+
+\ Whether the file is a slot still bound to the location's download.
+: DOWNLOAD-SLOT-MATCHES ( fd ^download-location -- bool )
+   {: f:fd loc :}
+   loc DOWNLOAD-LOCATION-SOURCE @ MATCH download-source
+      resumable OF {: dir:fd name:str path:str b:binding :}
+         f path str> READ-DOWNLOAD-SLOT-STATE b SLOT-BOUND?
+      ENDOF
+      disposable OF {: path:str :} false ENDOF
+   ;MATCH ;
+
+\ ---- slot files
+
+\ ".omabox-download-slot-" and the slot's digit; the slots are 0 to 3.
+24 BUFFER: SLOT-NAME
+FS:PATHZ-CAP BUFFER: SLOT-PATH
+
+\ The slot's name, valid until the next.
+: DOWNLOAD-SLOT-NAME ( n -- ^u8 n )
+   {: slot:n :}
+   s" .omabox-download-slot-" {: p:^ u:n :}
+   p SLOT-NAME u BYTE-COPY
+   slot $30 + SLOT-NAME u + c!
+   SLOT-NAME u 1+ ;
+
+\ The slot's path in the directory, for logs; valid until the next.
+: DOWNLOAD-SLOT-PATH ( ^u8 n n -- ^u8 n )
+   {: d:^ du:n slot:n :}
+   d du slot DOWNLOAD-SLOT-NAME SLOT-PATH FS:JOIN-PATH SLOT-PATH swap ;
+
+ENUM download-slot-open
+   VARIANT missing ;VARIANT
+   VARIANT file FIELD file fd ;VARIANT
+   VARIANT occupied ;VARIANT
+;ENUM
+: DROP-SLOT-OPEN ( download-slot-open -- ) drop ;
+
+\ The opened file, when it is the regular file probed.
+: CHECK-SLOT-FILE ( fd stat ^u8 n -- download-slot-open )
+   {: f:fd probed:stat p:^ u:n :}
+   NO-STAT f
+   [: DROP-STAT f p u s" inspect opened download slot" STAT-FD ;] CLOSING
+   {: opened:stat :}
+   opened REGULAR? opened probed SAME-INODE and if
+      f DOWNLOAD-SLOT-OPEN-FILE exit
+   then
+   f DISCARD DOWNLOAD-SLOT-OPEN-OCCUPIED ;
+
+\ After the open for writing failed: missing, occupied by another inode
+\ or one Omabox may not write, else the failure.
+: SLOT-OPEN-FAILED ( fd fd ^u8 n ^u8 n -- download-slot-open )
+   {: probe:fd dir:fd name:^ nu:n p:^ u:n :}
+   FS:ERRNO {: e:n :}
+   e FS:ENOENT = if DOWNLOAD-SLOT-OPEN-MISSING exit then
+   probe dir name nu p u NAMED-INODE-MATCHES 0= if
+      DOWNLOAD-SLOT-OPEN-OCCUPIED exit
+   then
+   e FS:EACCES = e FS:EPERM = or if DOWNLOAD-SLOT-OPEN-OCCUPIED exit then
+   e s" open resumed download" p u SYSCALL-FAILURE ;
+
+\ Opens the probed name for writing when the probe found a regular file.
+: OPEN-PROBED-SLOT ( fd fd ^u8 n ^u8 n -- download-slot-open )
+   {: probe:fd dir:fd name:^ nu:n p:^ u:n :}
+   probe p u s" inspect resumed download slot" STAT-FD {: probed:stat :}
+   probed REGULAR? 0= if DOWNLOAD-SLOT-OPEN-OCCUPIED exit then
+   dir name nu FS:TRY-OPEN-WRITE-AT MATCH option
+      none OF probe dir name nu p u SLOT-OPEN-FAILED ENDOF
+      some OF probed p u CHECK-SLOT-FILE ENDOF
+   ;MATCH ;
+
+: SLOT-PROBE-FAILED ( ^u8 n -- download-slot-open )
+   {: p:^ u:n :}
+   FS:ERRNO {: e:n :}
+   e FS:ENOENT = if DOWNLOAD-SLOT-OPEN-MISSING exit then
+   e FS:ELOOP = if DOWNLOAD-SLOT-OPEN-OCCUPIED exit then
+   e s" inspect resumed download slot" p u SYSCALL-FAILURE ;
+
+\ The slot at the name in dir, open for writing when it is a regular file
+\ that stays the inode its name held; a symlink there is occupied.
+: OPEN-DOWNLOAD-SLOT ( fd ^u8 n ^u8 n -- download-slot-open )
+   {: dir:fd name:^ nu:n p:^ u:n :}
+   dir name nu FS:TRY-OPEN-ENTRY-AT MATCH option
+      none OF p u SLOT-PROBE-FAILED ENDOF
+      some OF {: probe:fd :}
+         DOWNLOAD-SLOT-OPEN-MISSING probe
+         [: DROP-SLOT-OPEN probe dir name nu p u OPEN-PROBED-SLOT ;]
+         CLOSING probe DISCARD
+      ENDOF
+   ;MATCH ;
+
+\ A new unnamed file in dir; o names the operation that makes it.
+: UNNAMED-FILE ( fd ^u8 n ^u8 n -- fd )
+   {: dir:fd p:^ u:n o:^ ou:n :}
+   -1 >FD [: drop dir FS:TEMP-AT ;] [: o ou p u IO-FAILURE ;] FS-FAILS ;
+
+\ Binds the unnamed file at offset 0 and names it; false when the name
+\ is taken.
+: INSTALL-SLOT ( fd fd ^u8 n ^u8 n binding -- bool )
+   {: f:fd dir:fd name:^ nu:n p:^ u:n b:binding :}
+   f DOWNLOAD-PARTIAL-XATTR b 0 DOWNLOAD-SLOT-STATE-MAKE
+   ENCODE-DOWNLOAD-SLOT-STATE true p u s" mark resumed download slot"
+   SET-XATTR
+   f p u s" sync new resumed download slot" SYNC-FILE
+   f dir name nu FS:TRY-LINK-AT if
+      dir p u s" sync new resumed download slot entry" SYNC-DIRECTORY
+      true exit
+   then
+   FS:ERRNO FS:EEXIST <> if
+      s" install new resumed download slot" p u IO-FAILURE
+   then false ;
+
+\ A new slot at the name in dir bound to b; none when the name is taken.
+: CREATE-DOWNLOAD-SLOT ( fd ^u8 n ^u8 n binding -- option<fd> )
+   {: dir:fd name:^ nu:n p:^ u:n b:binding :}
+   dir p u s" create resumed download slot" UNNAMED-FILE {: f:fd :}
+   false f [: drop f dir name nu p u b INSTALL-SLOT ;] CLOSING
+   if f OPTION:SOME exit then
+   f DISCARD OPTION:NONE ;
+
+\ Empties the open slot c and binds it to b at offset 0, its stage marker
+\ cleared; true when its name still holds it then.
+: CLEAR-SLOT ( fd fd ^u8 n ^u8 n binding -- bool )
+   {: c:fd dir:fd name:^ nu:n p:^ u:n b:binding :}
+   [: c 0 FD:RESIZE ;]
+   [: s" truncate resumed download slot for reuse" p u IO-FAILURE ;]
+   FS-FAILS
+   c DOWNLOAD-PARTIAL-XATTR b 0 DOWNLOAD-SLOT-STATE-MAKE
+   ENCODE-DOWNLOAD-SLOT-STATE false p u
+   s" reset resumed download slot checkpoint" SET-XATTR
+   c p u s" sync reset resumed download slot" SYNC-FILE
+   c DOWNLOAD-STAGE-XATTR p u
+   s" clear resumed download slot completion marker" REMOVE-XATTR
+   c p u s" sync reusable resumed download slot" SYNC-FILE
+   c dir name nu p u NAMED-INODE-MATCHES ;
+
+\ Runs before, then clears c, when c is held's inode.
+: REBIND-SLOT ( fd fd fd ^u8 n ^u8 n binding [ -- ] -- bool )
+   {: held:fd c:fd dir:fd name:^ nu:n p:^ u:n b:binding before :}
+   held p u s" inspect held resumed download slot" STAT-FD
+   c p u s" inspect reusable resumed download slot" STAT-FD
+   SAME-INODE 0= if false exit then
+   before [: s" reset resumed download slot" p u IO-FAILURE ;] FS-FAILS
+   c dir name nu p u b CLEAR-SLOT ;
+
+\ The slot named again, rebound, when it is still held's inode; a throw
+\ closes it.
+: REBIND-OPENED ( fd fd fd ^u8 n ^u8 n binding [ -- ] -- option<fd> )
+   {: held:fd c:fd dir:fd name:^ nu:n p:^ u:n b:binding before :}
+   false c
+   [: drop held c dir name nu p u b before REBIND-SLOT ;] CLOSING
+   if c OPTION:SOME exit then
+   c DISCARD OPTION:NONE ;
+
+: REBIND-NAMED ( fd fd ^u8 n ^u8 n binding [ -- ] -- option<fd> )
+   {: held:fd dir:fd name:^ nu:n p:^ u:n b:binding before :}
+   dir name nu p u OPEN-DOWNLOAD-SLOT MATCH download-slot-open
+      missing OF OPTION:NONE ENDOF
+      file OF {: c:fd :} held c dir name nu p u b before REBIND-OPENED
+      ENDOF
+      occupied OF OPTION:NONE ENDOF
+   ;MATCH ;
+
+\ Rust's reset_download_slot_file_with: the slot held, a partial whose
+\ name in dir still names it, reopened, emptied and bound to b at offset
+\ 0; before runs just ahead of the truncate. None when held carries no
+\ state or its name holds another entry, which stays as it is.
+: RESET-DOWNLOAD-SLOT-FILE-WITH
+   ( fd fd ^u8 n ^u8 n binding [ -- ] -- option<fd> )
+   {: held:fd dir:fd name:^ nu:n p:^ u:n b:binding before :}
+   held p u READ-DOWNLOAD-SLOT-STATE MATCH option
+      none OF OPTION:NONE ENDOF
+      some OF DOWNLOAD-SLOT-STATE-UNMAKE {: was:binding at:n :}
+         held dir name nu p u b before REBIND-NAMED
+      ENDOF
+   ;MATCH ;
+
+\ The location's slot reset for its own binding; none for an unnamed
+\ file.
+: RESET-DOWNLOAD-SLOT ( fd ^download-location -- option<fd> )
+   {: f:fd loc :}
+   loc DOWNLOAD-LOCATION-SOURCE @ MATCH download-source
+      resumable OF {: dir:fd name:str path:str b:binding :}
+         f dir name str> path str> b [: ;] RESET-DOWNLOAD-SLOT-FILE-WITH
+      ENDOF
+      disposable OF {: path:str :} OPTION:NONE ENDOF
+   ;MATCH ;
+
+\ ---- slot leases
+
+\ A slot's file and state, Rust's (File, DownloadSlotState).
+STRUCTURE owned-slot
+   FIELD file fd
+   FIELD state download-slot-state
+;STRUCTURE
+
+\ A slot as the lease found it: its file and state when it holds a
+\ partial, and whether the lease may claim it.
+STRUCTURE available-download-slot DERIVE addr
+   FIELD slot n
+   FIELD owned option<owned-slot>
+   FIELD usable bool
+;STRUCTURE
+
+\ One lease runs at a time; it closes every file it holds here.
+MAX-PARALLEL-DOWNLOADS TYPED-BUFFER SLOTS available-download-slot
+
+: DROP-AVAILABLE ( available-download-slot -- ) drop ;
+
+: NOT-OWNED ( -- option<owned-slot> ) OPTION:NONE ;
+
+: UNOWNED ( n bool -- available-download-slot )
+   {: slot:n usable:bool :}
+   slot NOT-OWNED usable AVAILABLE-DOWNLOAD-SLOT-MAKE ;
+
+\ The open slot's state, usable unless protected says its binding is.
+: SLOT-STATE ( n fd ^u8 n [ binding -- bool ] -- available-download-slot )
+   {: slot:n f:fd p:^ u:n protected :}
+   f p u s" inspect resumed download slot" STAT-FD REGULAR? 0= if
+      f DISCARD slot false UNOWNED exit
+   then
+   f p u READ-DOWNLOAD-SLOT-STATE MATCH option
+      none OF f DISCARD slot false UNOWNED ENDOF
+      some OF {: s:download-slot-state :}
+         s DOWNLOAD-SLOT-STATE-UNMAKE {: b:binding at:n :}
+         b protected execute 0= {: usable:bool :}
+         slot f s OWNED-SLOT-MAKE OPTION:SOME usable
+         AVAILABLE-DOWNLOAD-SLOT-MAKE
+      ENDOF
+   ;MATCH ;
+
+: OWNED ( n fd ^u8 n [ binding -- bool ] -- available-download-slot )
+   {: slot:n f:fd p:^ u:n protected :}
+   slot false UNOWNED f
+   [: DROP-AVAILABLE slot f p u protected SLOT-STATE ;] CLOSING ;
+
+: SCAN-SLOT ( fd ^u8 n n [ binding -- bool ] -- available-download-slot )
+   {: dir:fd d:^ du:n slot:n protected :}
+   d du slot DOWNLOAD-SLOT-PATH {: p:^ u:n :}
+   dir slot DOWNLOAD-SLOT-NAME p u OPEN-DOWNLOAD-SLOT
+   MATCH download-slot-open
+      missing OF slot true UNOWNED ENDOF
+      file OF {: f:fd :} slot f p u protected OWNED ENDOF
+      occupied OF slot false UNOWNED ENDOF
+   ;MATCH ;
+
+: SLOT-OWNED@ ( n -- option<owned-slot> )
+   SLOTS AVAILABLE-DOWNLOAD-SLOT-OWNED @ ;
+
+: SLOT-USABLE@ ( n -- bool ) SLOTS AVAILABLE-DOWNLOAD-SLOT-USABLE @ ;
+
+: CLAIMED ( n -- ) false swap SLOTS AVAILABLE-DOWNLOAD-SLOT-USABLE ! ;
+
+: CLEAR-SLOTS ( -- )
+   MAX-PARALLEL-DOWNLOADS 0 ?do i false UNOWNED i SLOTS ! loop ;
+
+: CLOSE-OWNED ( option<owned-slot> -- )
+   MATCH option
+      none OF ENDOF
+      some OF OWNED-SLOT-UNMAKE {: f:fd s:download-slot-state :} f DISCARD
+      ENDOF
+   ;MATCH ;
+
+: CLOSE-SLOTS ( -- )
+   MAX-PARALLEL-DOWNLOADS 0 ?do i SLOT-OWNED@ CLOSE-OWNED loop
+   CLEAR-SLOTS ;
+
+: SCAN-SLOTS ( fd ^u8 n [ binding -- bool ] -- )
+   {: dir:fd d:^ du:n protected :}
+   MAX-PARALLEL-DOWNLOADS 0 ?do
+      dir d du i protected SCAN-SLOT i SLOTS !
+   loop ;
+
+: OWNED-BY? ( option<owned-slot> binding -- bool )
+   {: o:option<owned-slot> b:binding :}
+   o MATCH option
+      none OF false ENDOF
+      some OF OWNED-SLOT-UNMAKE {: f:fd s:download-slot-state :}
+         s OPTION:SOME b SLOT-BOUND?
+      ENDOF
+   ;MATCH ;
+
+: NEW-LEASE ( ^u8 n n binding -- option<download-slot-lease> )
+   {: d:^ du:n slot:n b:binding :}
+   d du >str slot b DOWNLOAD-SLOT-LEASE-MAKE OPTION:SOME ;
+
+\ The first slot whose partial is bound to b, claimed.
+: BOUND-SLOT ( ^u8 n binding -- option<download-slot-lease> )
+   {: d:^ du:n b:binding :}
+   MAX-PARALLEL-DOWNLOADS 0 ?do
+      i SLOT-OWNED@ b OWNED-BY? if
+         i CLAIMED d du i b NEW-LEASE unloop exit
+      then
+   loop OPTION:NONE ;
+
+\ Closes the slot a reset or create answered; whether there was one.
+: TAKEN? ( option<fd> -- bool )
+   MATCH option
+      none OF false ENDOF
+      some OF DISCARD true ENDOF
+   ;MATCH ;
+
+\ Rebinds the slot's partial to b, or makes the slot bound to b.
+: TAKE-SLOT ( fd ^u8 n n binding -- bool )
+   {: dir:fd d:^ du:n slot:n b:binding :}
+   d du slot DOWNLOAD-SLOT-PATH {: p:^ u:n :}
+   slot SLOT-OWNED@ MATCH option
+      none OF dir slot DOWNLOAD-SLOT-NAME p u b CREATE-DOWNLOAD-SLOT ENDOF
+      some OF OWNED-SLOT-UNMAKE {: f:fd s:download-slot-state :}
+         f dir slot DOWNLOAD-SLOT-NAME p u b [: ;]
+         RESET-DOWNLOAD-SLOT-FILE-WITH
+      ENDOF
+   ;MATCH TAKEN? ;
+
+\ The first usable slot that takes b; each one tried is used up.
+: CLAIM-SLOT ( fd ^u8 n binding -- option<download-slot-lease> )
+   {: dir:fd d:^ du:n b:binding :}
+   MAX-PARALLEL-DOWNLOADS 0 ?do
+      i SLOT-USABLE@ if
+         i CLAIMED
+         dir d du i b TAKE-SLOT if d du i b NEW-LEASE unloop exit then
+      then
+   loop OPTION:NONE ;
+
+\ Empties a usable slot's partial, its binding kept.
+: FREE-SLOT ( fd ^u8 n n -- )
+   {: dir:fd d:^ du:n slot:n :}
+   d du slot DOWNLOAD-SLOT-PATH {: p:^ u:n :}
+   slot SLOT-OWNED@ MATCH option
+      none OF ENDOF
+      some OF OWNED-SLOT-UNMAKE {: f:fd s:download-slot-state :}
+         s DOWNLOAD-SLOT-STATE-UNMAKE {: b:binding at:n :}
+         f dir slot DOWNLOAD-SLOT-NAME p u b [: ;]
+         RESET-DOWNLOAD-SLOT-FILE-WITH TAKEN? drop
+      ENDOF
+   ;MATCH ;
+
+: FREE-SLOTS ( fd ^u8 n -- )
+   {: dir:fd d:^ du:n :}
+   MAX-PARALLEL-DOWNLOADS 0 ?do
+      i SLOT-USABLE@ if dir d du i FREE-SLOT then
+   loop ;
+
+: LEASE-IN
+   ( fd ^u8 n binding [ binding -- bool ] -- option<download-slot-lease> )
+   {: dir:fd d:^ du:n b:binding protected :}
+   dir d du protected SCAN-SLOTS
+   d du b BOUND-SLOT MATCH option
+      none OF dir d du b CLAIM-SLOT ENDOF
+      some OF OPTION:SOME ENDOF
+   ;MATCH
+   dir d du FREE-SLOTS ;
+
+public
+
+\ Rust's lease_download_slots for one download: the slot in directory d
+\ whose partial is bound to it, else the first free or unprotected one,
+\ rebound to it; none when no slot can be. Every other unprotected partial
+\ is emptied, its binding kept. The lease holds d's span.
+: LEASE-DOWNLOAD-SLOT
+   ( ^u8 n download-slot-identity [ binding -- bool ]
+     -- option<download-slot-lease> )
+   {: d:^ du:n id:download-slot-identity protected :}
+   d du s" open resumable download slot directory" OPEN-PRIVATE-DIRECTORY
+   {: dir:fd :}
+   CLEAR-SLOTS
+   [: dir d du id SLOT-BINDING protected LEASE-IN ;]
+   [: CLOSE-SLOTS dir DISCARD ;] finally ;
+
+private
+
+\ ---- download preparation
+
+\ Rust's Path::join for display paths, laid in the arena: one slash
+\ between a and b unless a is empty or ends in one; a alone for an empty
+\ b.
+: JOIN ( ^u8 n ^u8 n ^ARENA:arena -- ^u8 n )
+   {: a:^ au:n b:^ bu:n ar:^ARENA:arena :}
+   bu 0= if a au exit then
+   au 0= if 0 else a au + 1- c@ SLASH = if 0 else 1 then then {: sep:n :}
+   ar au sep + bu + ARENA:ALLOC {: dst:^ size:n :}
+   a au dst 0 PUT {: at:n :}
+   s" /" drop sep dst at PUT {: at2:n :}
+   b bu dst at2 PUT drop
+   dst size ;
+
+\ Feeds the next bytes of f, at most IO-SIZE of the left ones, to h;
+\ answers the bytes left after them. A short file fails as a read.
+: REHASH-CHUNK ( fd n ^u8 n ^DROPBOX:hasher -- n )
+   {: f:fd left:n p:^ u:n h :}
+   s" rehash resumed download checkpoint" {: o:^ ou:n :}
+   left IO-SIZE min {: k:n :}
+   0 [: drop f IO-BUF k FD-READ ;] [: o ou p u IO-FAILURE ;] FS-FAILS
+   k < if 0 FS:CAUSE! o ou p u IO-FAILURE then
+   IO-BUF k h DROPBOX:HASH-FEED
+   left k - ;
+
+\ Rust's hash_download_prefix: h begun and fed the slot's first offset
+\ bytes, a whole number of checkpoints, and f left at offset.
+: HASH-DOWNLOAD-PREFIX ( fd n ^u8 n ^DROPBOX:hasher -- )
+   {: f:fd offset:n p:^ u:n h :}
+   [: f 0 FD:SEEK ;] [: s" rewind resumed download" p u IO-FAILURE ;]
+   FS-FAILS
+   h DROPBOX:HASH-BEGIN
+   offset begin dup 0 > while f swap p u h REHASH-CHUNK repeat drop
+   [: f offset FD:SEEK ;]
+   [: s" position resumed download" p u IO-FAILURE ;] FS-FAILS ;
+
+: DROP-PREPARATION ( download-preparation -- ) drop ;
+
+: COMPLETE ( stage-outcome<n> -- download-preparation )
+   LOCAL-COMPLETED--STAGE:MAKE LOCAL-DOWNLOAD--PREPARATION:complete ;
+
+\ What a stage already at the download's name makes of it, none when
+\ there is none; a verified stage's descriptor is closed.
+: STAGE-PREPARATION ( download-stage -- option<download-preparation> )
+   MATCH download-stage
+      missing OF OPTION:NONE ENDOF
+      verified OF VERIFIED-DOWNLOAD-STAGE-UNMAKE
+         {: f:fd print:MODEL:fingerprint :} f DISCARD
+         0 LOCAL-STAGE--OUTCOME:already-staged COMPLETE OPTION:SOME
+      ENDOF
+      destination-occupied OF LOCAL-STAGE--OUTCOME:destination-occupied
+         COMPLETE OPTION:SOME
+      ENDOF
+   ;MATCH ;
+
+\ The download's stage name for target t, and its path below root path r
+\ through the parent's path rel, laid in the arena.
+: STAGE-PATHS
+   ( ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- ^u8 n ^u8 n )
+   {: r:^ ru:n rel:^ relu:n t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
+   s" download" t tu want ar INTERNAL-NAME {: name:^ nu:n :}
+   r ru rel relu ar JOIN name nu ar JOIN {: sp:^ spu:n :}
+   name nu sp spu ;
+
+\ The location of target t's download from src into dir, its stage
+\ named and the target kept in the arena.
+: NEW-LOCATION
+   ( download-source fd ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+     -- download-location )
+   {: src:download-source dir:fd r:^ ru:n rel:^ relu:n t:^ tu:n
+      want:DROPBOX:hash ar:^ARENA:arena :}
+   r ru rel relu t tu want ar STAGE-PATHS {: name:^ nu:n sp:^ spu:n :}
+   src dir name nu >str sp spu >str t tu ar KEEP want
+   DOWNLOAD-LOCATION-MAKE ;
+
+: LOCATION-PATH ( download-location -- ^u8 n )
+   DOWNLOAD-LOCATION-UNMAKE
+   {: src:download-source dir:fd name:str sp:str t:str want:DROPBOX:hash :}
+   src SOURCE-PATH ;
+
+: INSPECT-LOCATION ( download-location ^ARENA:arena -- download-stage )
+   {: loc:download-location ar:^ARENA:arena :}
+   loc DOWNLOAD-LOCATION-UNMAKE
+   {: src:download-source dir:fd name:str sp:str t:str want:DROPBOX:hash :}
+   dir name str> sp str> t str> want ar INSPECT-DOWNLOAD-STAGE ;
+
+\ The partial of the location's download in f, at offset 0.
+: NEW-PARTIAL ( download-location fd ^ARENA:arena -- ^download-partial )
+   {: loc:download-location f:fd ar:^ARENA:arena :}
+   ar PARTIALS-NEW {: x :}
+   loc x DOWNLOAD-PARTIAL-LOCATION !
+   f x DOWNLOAD-PARTIAL-FILE !
+   0 x DOWNLOAD-PARTIAL-OFFSET !
+   x DOWNLOAD-PARTIAL-AGGREGATE DROPBOX:HASH-BEGIN
+   x ;
+
+\ A partial in a new unnamed file in the staging directory s.
+: DISPOSABLE-PARTIAL
+   ( download-location ^u8 n ^ARENA:arena -- download-preparation )
+   {: loc:download-location s:^ su:n ar:^ARENA:arena :}
+   s su s" open disposable download staging directory"
+   OPEN-PRIVATE-DIRECTORY {: staging:fd :}
+   loc LOCATION-PATH {: p:^ u:n :}
+   [: staging p u s" create disposable download stage" UNNAMED-FILE ;]
+   [: staging DISCARD ;] finally {: f:fd :}
+   loc f ar NEW-PARTIAL LOCAL-DOWNLOAD--PREPARATION:ready ;
+
+: DISPOSABLE
+   ( download-location ^u8 n ^ARENA:arena -- download-preparation )
+   {: loc:download-location s:^ su:n ar:^ARENA:arena :}
+   loc ar INSPECT-LOCATION STAGE-PREPARATION MATCH option
+      none OF loc s su ar DISPOSABLE-PARTIAL ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+public
+
+\ Rust's prepare_disposable_download_with_access_at: the stage below root
+\ path r for target t holding want when one is complete, else a partial
+\ in an unnamed file in the staging directory s, its paths in the arena.
+\ The partial holds the target's parent directory.
+: PREPARE-DISPOSABLE-DOWNLOAD-AT
+   ( fd ^u8 n ^u8 n DROPBOX:hash ^u8 n ^ARENA:arena
+     -- download-preparation )
+   {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash s:^ su:n
+      ar:^ARENA:arena :}
+   want s" prepare disposable download" REQUIRE-CONTENT-HASH
+   root t tu true OPEN-PARENT MATCH option
+      none OF t tu UNSAFE ENDOF
+      some OF ENDOF
+   ;MATCH PARENT-DIR-UNMAKE {: dir:fd last:str rel:str :}
+   LOCAL-DOWNLOAD--PREPARATION:ephemeral dir
+   [: DROP-PREPARATION
+      s su s" <unnamed-download>" ar JOIN >str DOWNLOAD-SOURCE-DISPOSABLE
+      dir r ru rel str> t tu want ar NEW-LOCATION s su ar DISPOSABLE ;]
+   CLOSING ;
 
 ;package

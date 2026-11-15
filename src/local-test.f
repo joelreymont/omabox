@@ -4,8 +4,10 @@
 \ hashes, and that neither the hash nor a stage's copy depends on how a
 \ reader fragments the bytes; then each stage outcome, each inspected
 \ download stage, a stage marker set, read and removed, and each parent a
-\ download opens. A case that makes files works in its own directory
-\ under TMPDIR and removes it.
+\ download opens; then that a slot's state keeps its last checkpoint, a
+\ reset never touches a replacement swapped in, the pool's four fixed
+\ slots, a protected slot kept and a stale one rebound. A case that makes
+\ files works in its own directory under TMPDIR and removes it.
 \ Run from the repository root: hb --load src/local-test.f </dev/null
 require src/lib/test.f
 require src/lib/fmt.f
@@ -17,6 +19,7 @@ require src/lib/fs-mutate.f
 require src/lib/fd.f
 require src/lib/adt/option.f
 require src/dropbox.f
+require src/model.f
 require src/local.f
 
 \ LOCAL reopened for the stream a fragmenting reader feeds, its stage
@@ -61,7 +64,58 @@ private
       ENDOF
    ;MATCH ;
 
+\ The lease's slot, its binding and true; for none, -1, a zero binding
+\ and false.
+: LEASE-OF ( option<download-slot-lease> -- n binding bool )
+   MATCH option
+      none OF -1 0 0 0 0 BINDING-MAKE false ENDOF
+      some OF DOWNLOAD-SLOT-LEASE-UNMAKE {: d:str slot:n b:binding :}
+         slot b true
+      ENDOF
+   ;MATCH ;
+
+: STATE-APART ( option<download-slot-state> -- binding n bool )
+   MATCH option
+      none OF 0 0 0 0 BINDING-MAKE 0 false ENDOF
+      some OF DOWNLOAD-SLOT-STATE-UNMAKE true ENDOF
+   ;MATCH ;
+
+\ The slot's state apart: its binding, its offset and true.
+: SLOT-STATE-OF ( fd ^u8 n -- binding n bool )
+   READ-DOWNLOAD-SLOT-STATE STATE-APART ;
+
+\ The state encoded and decoded again, apart.
+: STATE-ROUND-TRIP ( binding n -- binding n bool )
+   DOWNLOAD-SLOT-STATE-MAKE ENCODE-DOWNLOAD-SLOT-STATE
+   DECODE-DOWNLOAD-SLOT-STATE STATE-APART ;
+
+32 BUFFER: FILLED
+
+\ The binding whose 32 bytes are all c.
+: FILLED-BINDING ( n -- binding )
+   {: c:n :}
+   32 0 ?do c FILLED i + c! loop
+   FILLED BYTES>BINDING ;
+
+\ The slot opened for writing and true; for a missing or occupied one,
+\ -1 and false.
+: OPENED-SLOT ( fd ^u8 n ^u8 n -- fd bool )
+   OPEN-DOWNLOAD-SLOT MATCH download-slot-open
+      missing OF -1 >FD false ENDOF
+      file OF true ENDOF
+      occupied OF -1 >FD false ENDOF
+   ;MATCH ;
+
 public
+EXPORT DOWNLOAD-CHECKPOINT-BYTES
+EXPORT DOWNLOAD-SLOT-NAME
+EXPORT RESET-DOWNLOAD-SLOT-FILE-WITH
+EXPORT TAKEN?
+EXPORT LEASE-OF
+EXPORT SLOT-STATE-OF
+EXPORT STATE-ROUND-TRIP
+EXPORT FILLED-BINDING
+EXPORT OPENED-SLOT
 EXPORT PARENT-OF
 EXPORT HASH-STREAM
 EXPORT COPY-AND-HASH
@@ -417,6 +471,225 @@ SHA256-CTX-BYTES BUFFER: PART
    s" each stage outcome is reached" T-LABEL
    [: STAGE-CASES ;] IN-CASE-DIR ;
 
+\ ---- download slots
+
+\ One case of Rust's property: the checkpoint at or below x round-trips,
+\ is the last at or before x, and is a whole number of blocks.
+: CHECKPOINT ( n -- )
+   {: x:n :}
+   LOCAL:DOWNLOAD-CHECKPOINT-BYTES {: cp:n :}
+   x cp / cp * {: offset:n :}
+   7 LOCAL:FILLED-BINDING {: seven:LOCAL:binding :}
+   seven offset LOCAL:STATE-ROUND-TRIP
+   {: b:LOCAL:binding at:n found:bool :}
+   found TTRUE at offset T= b seven LOCAL:BINDING= TTRUE
+   offset x <= TTRUE x offset cp + < TTRUE offset BLOCK mod 0 T= ;
+
+\ Rust's range is 0 to 1024 checkpoints and a block; its boundaries are
+\ 0, each checkpoint and the bytes either side of it, and the last.
+: DOWNLOAD-CHECKPOINT-STATE-ENCODES-THE-LAST-COMPLETE-BOUNDARY ( -- )
+   s" download_checkpoint_state_encodes_the_last_complete_boundary"
+   T-LABEL
+   LOCAL:DOWNLOAD-CHECKPOINT-BYTES {: cp:n :}
+   0 CHECKPOINT
+   1025 1 ?do
+      i cp * 1- CHECKPOINT i cp * CHECKPOINT i cp * 1+ CHECKPOINT
+   loop
+   1024 cp * BLOCK + CHECKPOINT ;
+
+32 BUFFER: TEXT-BUF
+
+\ The prefix and n's digits, valid until the next.
+: NUMBERED ( ^u8 n n -- ^u8 n )
+   {: x:^ xu:n k:n :}
+   x TEXT-BUF xu BYTE-COPY
+   k FMT:INT$ {: d:^ du:n :}
+   d TEXT-BUF xu + du BYTE-COPY
+   TEXT-BUF xu du + ;
+
+\ Rust's test_slot_identity: target t's download of c at "revision-<op>".
+: SLOT-IDENTITY
+   ( ^u8 n DROPBOX:hash n n -- LOCAL:download-slot-identity )
+   {: t:^ tu:n c:DROPBOX:hash generation:n op:n :}
+   c s" revision-" op NUMBERED >str DROPBOX:>REV MODEL-REMOTE:MAKE
+   {: r:MODEL:remote :}
+   generation op t tu r LOCAL:NEW-SLOT-IDENTITY ;
+
+: DOWNLOAD ( -- DROPBOX:hash ) s" download" HASH-OF ;
+
+\ The lease of the case directory's slots for the identity, apart.
+: LEASE
+   ( ^u8 n DROPBOX:hash n n [ LOCAL:binding -- bool ]
+     -- n LOCAL:binding bool )
+   {: t:^ tu:n c:DROPBOX:hash generation:n op:n protected :}
+   t tu c generation op SLOT-IDENTITY {: id:LOCAL:download-slot-identity :}
+   ROOT$ id protected LOCAL:LEASE-DOWNLOAD-SLOT LOCAL:LEASE-OF ;
+
+: UNPROTECTED ( LOCAL:binding -- bool ) drop false ;
+
+TYPED-VARIABLE HELD LOCAL:binding
+: HELD? ( LOCAL:binding -- bool ) HELD @ LOCAL:BINDING= ;
+
+4 TYPED-BUFFER LEASED LOCAL:binding
+variable LEASED-COUNT
+
+: LEASED? ( LOCAL:binding -- bool )
+   {: b:LOCAL:binding :}
+   LEASED-COUNT @ 0 ?do
+      i LEASED @ b LOCAL:BINDING= if true unloop exit then
+   loop false ;
+
+: SLOT-AT ( n -- ^u8 n ) LOCAL:DOWNLOAD-SLOT-NAME AT ;
+
+64 BUFFER: HELD-BYTES
+
+\ The file at the path holds exactly the bytes.
+: HOLDS ( ^u8 n ^u8 n -- )
+   {: p:^ u:n b:^ bu:n :}
+   p u HELD-BYTES 64 FS:READ-ALL {: k:n :}
+   HELD-BYTES k b bu T$= ;
+
+\ The open file carries the binding at offset at.
+: STATE-IS ( fd ^u8 n LOCAL:binding n -- )
+   {: f:fd name:^ nu:n want:LOCAL:binding offset:n :}
+   f name nu LOCAL:SLOT-STATE-OF {: b:LOCAL:binding at:n found:bool :}
+   found TTRUE b want LOCAL:BINDING= TTRUE at offset T= ;
+
+\ The file at name below the root carries the binding at offset at.
+: STATE-AT ( fd ^u8 n LOCAL:binding n -- )
+   {: root:fd name:^ nu:n want:LOCAL:binding offset:n :}
+   root name nu OPEN-AT {: f:fd :}
+   [: f name nu want offset STATE-IS ;] [: f FS:CLOSE-DIR ;] finally ;
+
+variable FILES
+
+: POOL-LEASE ( n -- )
+   {: op:n :}
+   s" target-" op NUMBERED DOWNLOAD 1 op 1+ [: LEASED? ;] LEASE
+   {: slot:n b:LOCAL:binding found:bool :}
+   found if b LEASED-COUNT @ LEASED ! 1 LEASED-COUNT +! then ;
+
+\ A one-slot lease takes a slot per call, so the leases already held
+\ are protected, as one Rust call's leases are from each other.
+: POOL ( fd -- )
+   {: root:fd :}
+   0 LEASED-COUNT !
+   5 0 ?do i POOL-LEASE loop
+   LEASED-COUNT @ 4 T=
+   0 FILES ! ROOT$ [: 2drop 1 FILES +! ;] FS:WALK-FILES FILES @ 4 T=
+   4 0 ?do i SLOT-AT FS:FILE? TTRUE loop ;
+
+: DOWNLOAD-SLOT-POOL-HAS-FOUR-FIXED-PATHS-WITHOUT-OVERFLOW ( -- )
+   s" download_slot_pool_has_four_fixed_paths_without_overflow" T-LABEL
+   [: POOL ;] IN-CASE-DIR ;
+
+: PROTECTED ( fd -- )
+   {: root:fd :}
+   s" held.bin" DOWNLOAD 1 20 [: UNPROTECTED ;] LEASE
+   {: hs:n hb:LOCAL:binding held:bool :}
+   held TTRUE hb HELD !
+   hs SLOT-AT s" partial download bytes" FS:WRITE-ALL
+   s" other.bin" DOWNLOAD 1 21 [: HELD? ;] LEASE
+   {: os:n ob:LOCAL:binding other:bool :}
+   other TTRUE os hs <> TTRUE
+   hs SLOT-AT s" partial download bytes" HOLDS
+   root hs LOCAL:DOWNLOAD-SLOT-NAME hb 0 STATE-AT ;
+
+: PROTECTED-DOWNLOAD-SLOT-KEEPS-ITS-BINDING-AND-BYTES ( -- )
+   s" protected_download_slot_keeps_its_binding_and_bytes" T-LABEL
+   [: PROTECTED ;] IN-CASE-DIR ;
+
+: STALE ( n -- ) SLOT-AT s" stale bytes" FS:WRITE-ALL ;
+
+\ The slot is empty and carries the binding at offset 0.
+: EMPTY-SLOT ( fd n LOCAL:binding -- )
+   {: root:fd slot:n b:LOCAL:binding :}
+   slot SLOT-AT FS:FILE-SIZE 0 T=
+   root slot LOCAL:DOWNLOAD-SLOT-NAME b 0 STATE-AT ;
+
+\ A one-slot lease has no empty form to free a stale slot with, so a
+\ second stale slot shows the freeing: the rebinding lease claims the
+\ first and empties the second, its binding kept.
+: STALE-SLOTS ( fd -- )
+   {: root:fd :}
+   TARGET DOWNLOAD 1 10 [: UNPROTECTED ;] LEASE
+   {: old:n ob:LOCAL:binding f0:bool :}
+   f0 TTRUE ob HELD ! old STALE
+   s" other.bin" DOWNLOAD 1 30 [: HELD? ;] LEASE
+   {: other:n xb:LOCAL:binding f1:bool :}
+   f1 TTRUE other STALE
+   TARGET DOWNLOAD 2 10 SLOT-IDENTITY LOCAL:SLOT-BINDING
+   ob LOCAL:BINDING= TFALSE
+   TARGET DOWNLOAD 1 11 SLOT-IDENTITY LOCAL:SLOT-BINDING
+   ob LOCAL:BINDING= TFALSE
+   TARGET DOWNLOAD 2 10 [: UNPROTECTED ;] LEASE
+   {: new:n nb:LOCAL:binding f2:bool :}
+   f2 TTRUE
+   root new nb EMPTY-SLOT
+   root other xb EMPTY-SLOT ;
+
+: STALE-SLOT-IS-REBOUND-ACROSS-ROOT-AND-OPERATION-IDENTITY ( -- )
+   s" stale_slot_is_rebound_across_root_and_operation_identity" T-LABEL
+   [: STALE-SLOTS ;] IN-CASE-DIR ;
+
+FS:PATHZ-CAP BUFFER: JOINED2
+32 BUFFER: SLOT-NAME-BUF
+variable SLOT-NAME-U
+FS:PATHZ-CAP BUFFER: SLOT-PATH-BUF
+variable SLOT-PATH-U
+
+\ AT into a buffer of its own.
+: AT2 ( ^u8 n -- ^u8 n )
+   {: p:^ u:n :}
+   ROOT$ p u JOINED2 FS:JOIN-PATH JOINED2 swap ;
+
+: SLOT$ ( -- ^u8 n ) SLOT-NAME-BUF SLOT-NAME-U @ ;
+: SLOT-PATH$ ( -- ^u8 n ) SLOT-PATH-BUF SLOT-PATH-U @ ;
+
+\ Keeps the slot's name and path where only the case reads them.
+: KEEP-SLOT ( n -- )
+   {: slot:n :}
+   slot LOCAL:DOWNLOAD-SLOT-NAME {: p:^ u:n :}
+   p SLOT-NAME-BUF u BYTE-COPY u SLOT-NAME-U !
+   SLOT$ AT {: q:^ qu:n :}
+   q SLOT-PATH-BUF qu BYTE-COPY qu SLOT-PATH-U ! ;
+
+\ Rust's before_reset here: the slot moves to held-slot and a new file
+\ takes its name.
+: SWAP-SLOT ( -- )
+   SLOT$ AT2 s" held-slot" AT FS:RENAME-FILE
+   SLOT$ AT s" replacement" FS:WRITE-ALL ;
+
+: EXPECTED ( -- DROPBOX:hash ) s" expected bytes" HASH-OF ;
+
+\ The reset of the slot open at f, with the swap before its truncate.
+: SWAP-RESET ( fd fd LOCAL:binding -- bool )
+   {: f:fd root:fd b:LOCAL:binding :}
+   f root SLOT$ SLOT-PATH$ b [: SWAP-SLOT ;]
+   LOCAL:RESET-DOWNLOAD-SLOT-FILE-WITH LOCAL:TAKEN? ;
+
+\ prepare_download_slot_at answers a fresh lease's slot opened, which
+\ this case opens itself: it leaves prepare_download_slot_at out.
+: SWAPPED ( fd -- )
+   {: root:fd :}
+   TARGET EXPECTED 1 1 [: UNPROTECTED ;] LEASE
+   {: slot:n b:LOCAL:binding found:bool :}
+   found TTRUE slot KEEP-SLOT
+   root SLOT$ SLOT-PATH$ LOCAL:OPENED-SLOT {: f:fd opened:bool :}
+   opened TTRUE
+   [: f root b SWAP-RESET TFALSE ;] [: f FS:CLOSE-DIR ;] finally
+   SLOT$ AT s" replacement" HOLDS
+   s" held-slot" AT FS:FILE-SIZE 0 T=
+   root s" held-slot" b 0 STATE-AT
+   root s" held-slot" OPEN-AT {: moved:fd :}
+   [: moved TARGET EXPECTED AR @ LOCAL:STAGE-MARKER s" held-slot"
+      LOCAL:MARKER$ s" missing" T$= ;]
+   [: moved FS:CLOSE-DIR ;] finally ;
+
+: PARTIAL-RESET-NEVER-MUTATES-A-SWAPPED-REPLACEMENT ( -- )
+   s" partial_reset_never_mutates_a_swapped_replacement" T-LABEL
+   [: SWAPPED ;] IN-CASE-DIR ;
+
 \ ---- parents
 
 : INODE ( fd -- n ) FS:FD-STAT FS:STAT-INO@ ;
@@ -539,7 +812,12 @@ SHA256-CTX-BYTES BUFFER: PART
    MISSING-PARENT-IS-NONE-WITHOUT-CREATE
    CREATE-MAKES-PRIVATE-PARENTS
    SYMLINK-PARENT-IS-REFUSED
-   UNSAFE-PARENT-PATH-FAILS ;
+   UNSAFE-PARENT-PATH-FAILS
+   DOWNLOAD-CHECKPOINT-STATE-ENCODES-THE-LAST-COMPLETE-BOUNDARY
+   PARTIAL-RESET-NEVER-MUTATES-A-SWAPPED-REPLACEMENT
+   DOWNLOAD-SLOT-POOL-HAS-FOUR-FIXED-PATHS-WITHOUT-OVERFLOW
+   PROTECTED-DOWNLOAD-SLOT-KEEPS-ITS-BINDING-AND-BYTES
+   STALE-SLOT-IS-REBOUND-ACROSS-ROOT-AND-OPERATION-IDENTITY ;
 
 public
 
