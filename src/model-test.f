@@ -1,12 +1,12 @@
 \ model-test.f - MODEL's values: every line of src/oracle/fold.tsv, the
 \ Rust version's answers, through FOLD; model.rs's tests of a key's order,
 \ folding and BENEATH?; SUBTREE-RANGE against BENEATH?; BEGINS? on
-\ display paths; the planner's equality words on one equal and one
-\ unequal pair, and the observation, fingerprint and record ones on
-\ values that differ in one field or variant; each display word on every
-\ variant against model.rs's text; every line of src/oracle/json.tsv
-\ through the JSON writers and readers, and the readers' acceptance and
-\ refusals.
+\ display paths; exclusions.rs's tests through EXCLUDED?; the planner's
+\ equality words on one equal and one unequal pair, and the observation,
+\ fingerprint and record ones on values that differ in one field or
+\ variant; each display word on every variant against model.rs's text;
+\ every line of src/oracle/json.tsv through the JSON writers and readers,
+\ and the readers' acceptance and refusals.
 \ Run from the repository root: hb --load src/model-test.f </dev/null
 require src/lib/arena.f
 require src/lib/string.f
@@ -125,6 +125,39 @@ TYPED-VARIABLE AR ^ARENA:arena
    s" /a/b" DISPLAY s" /" DISPLAY MODEL:BEGINS? TTRUE
    s" /" DISPLAY s" /" DISPLAY MODEL:BEGINS? TTRUE
    s" a/b" DISPLAY s" /" DISPLAY MODEL:BEGINS? TFALSE ;
+
+: EXCLUDED ( ^u8 n -- ) DISPLAY MODEL:EXCLUDED? TTRUE ;
+: SYNCED ( ^u8 n -- ) DISPLAY MODEL:EXCLUDED? TFALSE ;
+
+: DOCUMENTED-NAMES-AND-DESCENDANTS-ARE-EXCLUDED ( -- )
+   s" documented_names_and_descendants_are_excluded" T-LABEL
+   s" .DS_Store" EXCLUDED
+   s" folder/DESKTOP.INI" EXCLUDED
+   s" folder/Thumbs.db" EXCLUDED
+   s\" folder/Icon\r" EXCLUDED
+   s" folder/.dropbox" EXCLUDED
+   s" folder/.DROPBOX.ATTR" EXCLUDED
+   s" folder/metadata.ds_store" EXCLUDED
+   s" folder/~$draft.docx" EXCLUDED
+   s" folder/.~draft.docx" EXCLUDED
+   s" folder/.dropbox/child.txt" EXCLUDED
+   s" ~$temporary/child.txt" EXCLUDED
+   s\" folder/~$\xff" EXCLUDED ;
+
+: OTHER-NAMES-STILL-SYNC ( -- )
+   s" other_names_still_sync" T-LABEL
+   s" notes.md" SYNCED
+   s" .obsidian/settings.json" SYNCED
+   s" .gitignore" SYNCED
+   s" file.tmp" SYNCED
+   s" file~" SYNCED
+   s" DS_Store" SYNCED
+   s" .DS_Store.backup" SYNCED
+   s" thumbs.db.txt" SYNCED
+   s" icon" SYNCED
+   s" icon\r" SYNCED
+   s" rules.dropboxignore" SYNCED
+   s" .dropbox-folder/notes.md" SYNCED ;
 
 \ True when the key falls in the top's subtree range.
 : IN-RANGE? ( MODEL:key MODEL:key -- bool )
@@ -742,6 +775,8 @@ TYPED-VARIABLE W JSON:writer
    SUBTREE-RANGE-HOLDS-EXACTLY-THE-PATHS-BENEATH-AN-ANCESTOR
    ONLY-TRUE-DESCENDANTS-ARE-BENEATH-AN-ANCESTOR
    PATHS-BEGIN-BY-COMPONENT
+   DOCUMENTED-NAMES-AND-DESCENDANTS-ARE-EXCLUDED
+   OTHER-NAMES-STILL-SYNC
    EQUALITY-CASE
    RECORD-EQUALITY-CASE
    UNKNOWN-TEXT-CASE

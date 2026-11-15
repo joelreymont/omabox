@@ -453,6 +453,44 @@ public
    p p u LEAD q q v LEAD STR= 0= if false exit then
    q v [: p u MATCH-PART ;] PARTS 0 >= ;
 
+private
+
+: SUFFIX-CI? ( ^u8 n ^u8 n -- bool )
+   {: p:^ u:n x:^ xu:n :}
+   u xu < if false exit then
+   p u + xu - xu x xu STR=CI ;
+
+public
+
+\ Dropbox's documented temporary-file prefixes and metadata suffixes, the
+\ suffixes in any ASCII case (help.dropbox.com/en-en/sync/files-not-syncing).
+: EXCLUDED-NAME? ( ^u8 n -- bool )
+   {: p:^ u:n :}
+   p u s" ~$" STARTS-WITH? if true exit then
+   p u s" .~" STARTS-WITH? if true exit then
+   p u s" desktop.ini" SUFFIX-CI? if true exit then
+   p u s" thumbs.db" SUFFIX-CI? if true exit then
+   p u s" .ds_store" SUFFIX-CI? if true exit then
+   p u s\" icon\r" SUFFIX-CI? if true exit then
+   p u s" .dropbox" SUFFIX-CI? if true exit then
+   p u s" .dropbox.attr" SUFFIX-CI? ;
+
+private
+
+\ For PARTS: -1 once a component is an excluded name, else `at`.
+: EXCLUDED-PART ( n bool ^u8 n -- n )
+   {: at:n root:bool q:^ v:n :}
+   at 0 < if -1 exit then
+   q v EXCLUDED-NAME? if -1 exit then
+   at ;
+
+public
+
+\ Some component is an excluded name: an excluded directory excludes
+\ everything beneath it.
+: EXCLUDED? ( path -- bool )
+   PATH>STR str> [: EXCLUDED-PART ;] PARTS 0 < ;
+
 : LOCAL= ( local local -- bool )
    {: a:local b:local :}
    0 a LOCAL-FORM 0 b LOCAL-FORM FORM= ;
