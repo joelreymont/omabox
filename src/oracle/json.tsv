@@ -1,0 +1,67 @@
+Baseline.Absent	"Absent"
+Baseline.Directory	"Directory"
+Baseline.Present	{"Present":{"content":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","revision":"5f0a1b2c3d4e"}}
+Baseline.Present.escapes	{"Present":{"content":"\"\\\u0001é ","revision":"\"\\\u0001é "}}
+BlockReason.ConflictCopyOccupied	"ConflictCopyOccupied"
+BlockReason.DownloadUnavailable	{"DownloadUnavailable":{"status":409}}
+BlockReason.DownloadVerificationFailed	"DownloadVerificationFailed"
+BlockReason.LocalObjectInWay	"LocalObjectInWay"
+BlockReason.RemoteObject	"RemoteObject"
+BlockReason.RemoteRejected	{"RemoteRejected":{"tag":"insufficient_space"}}
+BlockReason.RemoteRejected.escapes	{"RemoteRejected":{"tag":"\"\\\u0001é "}}
+BlockReason.StageOccupied	"StageOccupied"
+BlockReason.UnsupportedFileSize	"UnsupportedFileSize"
+Conflict.DivergentEdits	{"DivergentEdits":{"local":{"content":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},"remote":{"content":"2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae","revision":"5f0a1b2c3d4f"}}}
+Conflict.InitialCollision	{"InitialCollision":{"local":{"content":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},"remote":{"content":"2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae","revision":"5f0a1b2c3d4f"}}}
+Conflict.InitialCollision.escapes	{"InitialCollision":{"local":{"content":"\"\\\u0001é "},"remote":{"content":"\"\\\u0001é ","revision":"\"\\\u0001é "}}}
+Conflict.LocalDeletionRemoteEdit	{"LocalDeletionRemoteEdit":{"remote":{"content":"2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae","revision":"5f0a1b2c3d4f"}}}
+Conflict.RemoteDeletionLocalEdit	{"RemoteDeletionLocalEdit":{"local":{"content":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}}}
+ContentIdentity.value	"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+ContentIdentity.value.escapes	"\"\\\u0001é "
+DropboxRevision.value	"5f0a1b2c3d4e"
+DropboxRevision.value.escapes	"\"\\\u0001é "
+LocalFile.value	{"content":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
+LocalFile.value.escapes	{"content":"\"\\\u0001é "}
+LocalHashValue.value	{"fingerprint":{"inode":18446744073709551615,"size":12345,"modified_seconds":-1,"modified_nanoseconds":999999999,"changed_seconds":9223372036854775807,"changed_nanoseconds":0},"content":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
+LocalHashValue.value.escapes	{"fingerprint":{"inode":18446744073709551615,"size":12345,"modified_seconds":-1,"modified_nanoseconds":999999999,"changed_seconds":9223372036854775807,"changed_nanoseconds":0},"content":"\"\\\u0001é "}
+LocalObservation.ConfirmedAbsent	"ConfirmedAbsent"
+LocalObservation.Directory	"Directory"
+LocalObservation.Present	{"Present":{"content":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}}
+LocalObservation.Present.escapes	{"Present":{"content":"\"\\\u0001é "}}
+LocalObservation.Unknown.CursorReset	{"Unknown":"CursorReset"}
+LocalObservation.Unknown.Inaccessible	{"Unknown":"Inaccessible"}
+LocalObservation.Unknown.Incomplete	{"Unknown":"Incomplete"}
+LocalObservation.Unknown.Stale	{"Unknown":"Stale"}
+LocalObservation.Unknown.Unavailable	{"Unknown":"Unavailable"}
+LocalObservation.Unknown.Unsupported	{"Unknown":"Unsupported"}
+Operation.CreateLocalDirectory	"CreateLocalDirectory"
+Operation.CreateRemote	{"CreateRemote":{"content":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}}
+Operation.CreateRemoteDirectory	"CreateRemoteDirectory"
+Operation.DeleteLocal	{"DeleteLocal":{"expected_content":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}}
+Operation.DeleteLocalDirectory	"DeleteLocalDirectory"
+Operation.DeleteRemote	{"DeleteRemote":{"expected_revision":"5f0a1b2c3d4e"}}
+Operation.DeleteRemoteDirectory	"DeleteRemoteDirectory"
+Operation.InstallLocal	{"InstallLocal":{"source":{"content":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","revision":"5f0a1b2c3d4e"}}}
+Operation.PreserveLocal	{"PreserveLocal":{"file":{"content":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}}}
+Operation.PreserveRemote	{"PreserveRemote":{"file":{"content":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","revision":"5f0a1b2c3d4e"}}}
+Operation.ReplaceLocal	{"ReplaceLocal":{"source":{"content":"2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae","revision":"5f0a1b2c3d4f"},"expected_content":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}}
+Operation.ReplaceLocal.escapes	{"ReplaceLocal":{"source":{"content":"\"\\\u0001é ","revision":"\"\\\u0001é "},"expected_content":"\"\\\u0001é "}}
+Operation.ReplaceRemote	{"ReplaceRemote":{"content":"2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae","expected_revision":"5f0a1b2c3d4e"}}
+RemoteFile.value	{"content":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","revision":"5f0a1b2c3d4e"}
+RemoteFile.value.escapes	{"content":"\"\\\u0001é ","revision":"\"\\\u0001é "}
+RemoteObservation.ConfirmedAbsent	"ConfirmedAbsent"
+RemoteObservation.Directory	"Directory"
+RemoteObservation.Present	{"Present":{"content":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","revision":"5f0a1b2c3d4e"}}
+RemoteObservation.Present.escapes	{"Present":{"content":"\"\\\u0001é ","revision":"\"\\\u0001é "}}
+RemoteObservation.Unknown.CursorReset	{"Unknown":"CursorReset"}
+RemoteObservation.Unknown.Inaccessible	{"Unknown":"Inaccessible"}
+RemoteObservation.Unknown.Incomplete	{"Unknown":"Incomplete"}
+RemoteObservation.Unknown.Stale	{"Unknown":"Stale"}
+RemoteObservation.Unknown.Unavailable	{"Unknown":"Unavailable"}
+RemoteObservation.Unknown.Unsupported	{"Unknown":"Unsupported"}
+UnknownReason.CursorReset	"CursorReset"
+UnknownReason.Inaccessible	"Inaccessible"
+UnknownReason.Incomplete	"Incomplete"
+UnknownReason.Stale	"Stale"
+UnknownReason.Unavailable	"Unavailable"
+UnknownReason.Unsupported	"Unsupported"
