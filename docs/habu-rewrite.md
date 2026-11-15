@@ -10,18 +10,35 @@ names a file there.
 
 General code goes into Habu's `src/lib`; sync policy stays here.
 
-- **`SQLITE`:** libsqlite3 on Habu's database model (Habu `docs/design.md`,
-  "Databases"): result types, one connection per task, a busy timeout,
-  `BEGIN IMMEDIATE`.
-- **`FS-ANCHORED`:** the openat2 calls `src/local.rs` makes, each relative to
-  a directory descriptor and never following a symlink. They open, create,
-  rename (with and without replace), unlink, make and remove directories, list,
-  stat, fsync and chmod, plus O_TMPFILE named by linkat.
-- **`XATTR`:** get, set and erase, for the stage and partial markers
-  (`src/local.rs:38`).
+- **`SQLITE`:** libsqlite3. A connection belongs to the task that opened it;
+  a statement is linear and lives inside `WITH-STATEMENT`; `WITH-TRANSACTION`
+  is `BEGIN IMMEDIATE`; the caller sets the busy timeout. Every failure is
+  logged once with SQLite's text and throws one of three codes, the classes
+  `src/daemon.rs:803-843` tells apart: corrupt (CORRUPT or NOTADB), full, any
+  other. The journal passes every failure up, so a result sum would only be
+  matched and rethrown; Habu's `pg-rows.f` throws its refusals the same way.
+- **`FS-ANCHORED`:** the `*at` calls `src/local.rs` makes, each on one name
+  relative to a directory descriptor and never following a symlink: open a
+  directory, a file to read or write, or any entry by `O_PATH`; `O_TMPFILE`
+  named by linkat; rename with and without replace; remove a file or a
+  directory; make a directory; stat. A name is checked as `OPEN-DIR-AT`
+  checks one and opened with `O_NOFOLLOW`, which gives what openat2's resolve
+  flags give and needs no glibc 2.43. Each answers a bool or an option, with
+  errno in `FS:ERRNO`.
+- **Descriptor words:** fstat with inode and device, the name length limit,
+  chmod, seek, a directory listed by its descriptor, and the errno constants
+  `src/local.rs` decides on.
+- **`XATTR`:** get, add (create only), set and erase, for the stage and
+  partial markers (`src/local.rs:38`).
 - **statx:** birth time and subvolume, which the root binding stores.
-- **`SECRET`:** write and erase on Linux, on omabox's attributes
-  (`src/auth.rs:30`).
+- **`SECRET`:** write on Linux, as `secret-tool store` writes, under the
+  attribute keys and label a program binds once (`src/auth.rs:30`). Nothing
+  in the Rust version erases the credential, so there is no erase.
+- **`UTF8:LOSSY`:** Rust's `from_utf8_lossy`, for the paths in `status.json`
+  (`src/runtime_status.rs:336`).
+
+These take a string as `^u8 n` until Habu's `str` lands; its sweep moves them
+with the rest of Habu.
 
 SHA-256 is already in Habu core (`src/core/sha256.f`). Inotify is not added:
 the daemon rescans after each 30 s long poll, as the Rust one does, and a
@@ -44,6 +61,21 @@ watcher comes only for a measured need.
 
 - **Journal.** Opens schema 8, or creates it from `migrations/`; refuses 1 to
   7. Schema 8 is frozen while the Rust upload-session work stays parked.
+- **Values.** `MODEL` holds types, equality and JSON, no state. A display
+  path and its Dropbox identity, `FOLD`'s answer, are `DEFTYPE`s over `str`; the hash, revision
+  and cursor roles are `DROPBOX`'s. A value travels by value; its strings are
+  borrowed, and a reader copies them into the arena the caller passes, one per
+  pass. Each stored column type has a writer and a reader of serde's bytes; a
+  stored value this version cannot read throws `MODEL:E-STORED`.
+- **Decisions.** A no-op carries only its baseline, a block is unknown or
+  occupied, and an operating decision carries one operation: production reads
+  no more (`src/reconcile.rs:1085-1300`). `PLAN` is a nested `MATCH`, its
+  exhaustiveness the checker's.
+- **`CONFIG`** loads, prepares and locks (flock on the `daemon.lock` the Rust
+  daemon locks); its writer comes with the CLI.
+- **`STATUS`** keeps one transfer, as one task syncs. Tasks are threads, so
+  one `TASK:FACILITY` guards the snapshot the sync task and the heartbeat
+  share.
 - **One task does the sync.** Downloads and hashing run one at a time. The
   Rust daemon's four download workers and parallel hashing come back only for a
   measured need.
@@ -59,7 +91,8 @@ watcher comes only for a measured need.
 
 - The 105 tests of `tests/dropbox_fake.rs`, ported under their names, each
   running `RECONCILE:PASS` against the fake Dropbox.
-- The planner's table against Rust's.
+- The planner's table, every value's JSON and `FOLD` over a case corpus,
+  against what the Rust version prints (`src/oracle/`).
 - A Habu-made schema against a Rust-made one (`sqlite_master`), and a journal
   the Rust daemon wrote, read back.
 - Startup and crash tests of the built `omaboxd`.
