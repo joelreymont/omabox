@@ -1763,11 +1763,15 @@ private
    CLIENT-ENTRY DROPBOX-ENTRY:LOWER @ SPAN:$ UNICODE:LOWERS-TO? ;
 
 
-\ Each reads the answer's entry and answers whether it is at the path.
-: DELETED-READ ( ^u8 n ^client -- bool )
-   {: p:^ pu:n c :}
+\ Each reads the answer's entry and answers whether it is at the path;
+\ DELETED-READ, given a rev, also whether it is a file at that rev.
+: DELETED-READ ( ^u8 n ^u8 n ^client -- bool )
+   {: p:^ pu:n r:^ ru:n c :}
    c construct kind deleted [: DELETED-MEMBER ;] ENTRY-PARSE
-   p pu c AT? ;
+   p pu c AT? 0= if false exit then
+   ru 0= if true exit then
+   c CLIENT-ENTRY {: e :}
+   e FILE? e DROPBOX-ENTRY:REV @ SPAN:$ r ru STR= and ;
 
 
 : MADE-READ ( ^u8 n ^client -- bool )
@@ -1952,7 +1956,7 @@ public
 : DELETE ( ^u8 n ^u8 n ^client -- reply )
    {: p:^ pu:n r:^ ru:n c :}
    p pu r ru c DELETE-BODY
-   c s" files/delete_v2" [: drop p pu c DELETED-READ ;]
+   c s" files/delete_v2" [: drop p pu r ru c DELETED-READ ;]
    [: drop p pu c GONE ;]
    [: drop p pu c DELETE-REFUSED ;] MUTATE ;
 

@@ -168,6 +168,8 @@ STRUCTURE config
   intended result: the same content hash, no entry, or a folder.
   - A lost answer, or a `done` whose entry's `path_lower` is not the
     path's full Unicode lowercase: `done` if it holds, else `retry`.
+    `DELETE` given a rev treats a `done` whose entry is not a file at that
+    rev the same way.
   - A `conflict` refusal: `done` if it holds, else the refusal stands.
   - `DELETE` refused `not-found` is `done` without asking: the path is
     absent, which is what a delete intends.

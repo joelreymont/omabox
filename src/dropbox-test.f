@@ -6,13 +6,14 @@
 \ downloads, delete, create-folder, the code exchange, Dropbox's content
 \ hash and uploads, whose stages are written under TMPDIR and removed once
 \ open, so no run leaves one; a mutation or session finish Dropbox answers
-\ at another path, an upload's that get_metadata then does not find, and
-\ a conflict whose confirmation is at another path. One server and one
-\ main client serve every case; a case that needs another config opens its
-\ own client. DROPBOX's log lines go to stderr, but those a case checks,
+\ at another path, an upload's that get_metadata then does not find, a
+\ conflict whose confirmation is at another path, and a delete it answers
+\ with a folder or a file at another rev. One server and one main client
+\ serve every case; a case that needs another config opens its own
+\ client. DROPBOX's log lines go to stderr, but those a case checks,
 \ which are captured in TMPDIR, checked and removed. A stub in place of
-\ AIO's transfer fails the stage's reads. The first failed assertion ends
-\ the run.
+\ AIO's transfer fails the stage's reads. Each failed assertion prints its
+\ label; the run goes on and fails at its end.
 \ Run from the repository root: hb --load src/dropbox-test.f </dev/null
 require src/lib/aio.f
 require src/lib/arena.f
@@ -1152,6 +1153,31 @@ variable SUNK-AT
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
 
 
+\ A delete answered with the file at another rev, which get_metadata
+\ finds still there at the rev asked.
+: DELETE-REV-CASE ( -- )
+   s" delete answered at another rev" T-LABEL
+   TEST-DROPBOX:RESET
+   s" /rev.txt" s" rev-new" DELETED-FILE
+   200 s" " s" "
+   S\" {\qmetadata\q:{\q.tag\q:\qfile\q,\qpath_lower\q:\q/rev.txt\q,\qpath_display\q:\q/rev.txt\q,\qrev\q:\qrev-old\q,\qsize\q:0,\qcontent_hash\q:\qe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\q}}"
+   TEST-DROPBOX:SCRIPT!
+   s" /rev.txt" s" rev-new" MAIN @ DROPBOX:DELETE RETRY-MS 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
+
+
+\ A delete answered with a folder, which get_metadata finds gone.
+: DELETE-AS-FOLDER-CASE ( -- )
+   s" delete answered with a folder" T-LABEL
+   TEST-DROPBOX:RESET
+   200 s" " s" "
+   S\" {\qmetadata\q:{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/dir\q,\qpath_display\q:\q/dir\q}}"
+   TEST-DROPBOX:SCRIPT!
+   s" /dir" s" rev-dir" MAIN @ DROPBOX:DELETE DONE? ASSERT
+   DROPBOX-KIND:deleted KIND? TTRUE
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
+
+
 : DELETE-UNLINKED ( -- )
    s" /kept.txt" s" " MAIN @ DROPBOX:DELETE UNLINKED? OUTCOME ! ;
 
@@ -1919,7 +1945,8 @@ TYPED-VARIABLE FAULT fault
    DOWNLOAD-CASES
    DELETE-CONFLICT-CASE DELETE-MISSING-CASE DELETE-GONE-CASE
    LOST-DELETE-CASE CUT-DELETE-CASE DELETE-ELSEWHERE-CASE
-   CONFLICT-ELSEWHERE-CASE DENIED-DELETE-CASE DENIED-CONFLICT-CASE
+   CONFLICT-ELSEWHERE-CASE DELETE-REV-CASE DELETE-AS-FOLDER-CASE
+   DENIED-DELETE-CASE DENIED-CONFLICT-CASE
    FOLDER-CONFLICT-CASE LOST-FOLDER-CASE FOLDER-ELSEWHERE-CASE
    FOLDER-TAKEN-ELSEWHERE-CASE CUT-FOLDER-CASE DENIED-FOLDER-CASE
    DENIED-CUT-FOLDER-CASE
