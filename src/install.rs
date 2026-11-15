@@ -795,16 +795,30 @@ fn invalid(path: &Path, detail: &'static str) -> InstallError {
 #[non_exhaustive]
 pub enum InstallError {
     #[error("HOME is not set")]
-    #[diagnostic(code(omabox::install::home_unavailable))]
+    #[diagnostic(
+        code(omabox::install::home_unavailable),
+        help("Set HOME to your absolute home directory, then retry.")
+    )]
     HomeUnavailable,
     #[error("HOME must be absolute, but was `{path}`")]
-    #[diagnostic(code(omabox::install::home_not_absolute))]
+    #[diagnostic(
+        code(omabox::install::home_not_absolute),
+        help("Set HOME to your absolute home directory, then retry.")
+    )]
     HomeNotAbsolute { path: PathBuf },
     #[error("invalid Omabox artifact `{path}`: {detail}")]
-    #[diagnostic(code(omabox::install::invalid_artifact))]
+    #[diagnostic(
+        code(omabox::install::invalid_artifact),
+        help(
+            "Rebuild Omabox if the path belongs to the new build; otherwise ensure only the file or directory Omabox installed is at that path. Then retry."
+        )
+    )]
     InvalidArtifact { path: PathBuf, detail: &'static str },
     #[error("could not {operation} at `{path}`")]
-    #[diagnostic(code(omabox::install::filesystem))]
+    #[diagnostic(
+        code(omabox::install::filesystem),
+        help("Ensure the path is accessible and its filesystem has free space, then retry.")
+    )]
     Filesystem {
         operation: &'static str,
         path: PathBuf,
@@ -812,14 +826,20 @@ pub enum InstallError {
         source: io::Error,
     },
     #[error("could not run `{command}`")]
-    #[diagnostic(code(omabox::install::command_start))]
+    #[diagnostic(
+        code(omabox::install::command_start),
+        help("Ensure Omarchy is installed and its commands are on PATH, then retry.")
+    )]
     CommandStart {
         command: &'static str,
         #[source]
         source: io::Error,
     },
     #[error("`{command}` failed with status {status:?}")]
-    #[diagnostic(code(omabox::install::command_failed))]
+    #[diagnostic(
+        code(omabox::install::command_failed),
+        help("Run the named command yourself to see its error, fix the cause, then retry.")
+    )]
     CommandFailed {
         command: &'static str,
         status: Option<i32>,
@@ -867,14 +887,22 @@ pub enum InstallError {
         source: ServiceError,
     },
     #[error("the lifecycle operation failed and rollback also failed: {restore}")]
-    #[diagnostic(code(omabox::install::rollback_failed))]
+    #[diagnostic(
+        code(omabox::install::rollback_failed),
+        help(
+            "Run `omabox status` and `omabox logs` to see the service state, then rerun the same install, upgrade, or uninstall command."
+        )
+    )]
     RollbackFailed {
         #[source]
         source: Box<InstallError>,
         restore: Box<InstallError>,
     },
     #[error("the lifecycle operation failed and cleanup also failed: {cleanup}")]
-    #[diagnostic(code(omabox::install::cleanup_failed))]
+    #[diagnostic(
+        code(omabox::install::cleanup_failed),
+        help("Address the first error, then run the install or upgrade again from the new build.")
+    )]
     CleanupFailed {
         #[source]
         source: Box<InstallError>,
@@ -1819,6 +1847,81 @@ mod tests {
             fs::read_to_string(&fixture.systemctl_log)?,
             "is-enabled\nshow\nshow\nreset-failed\ndisable\ndaemon-reload\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn every_install_error_has_help() -> Result<(), Box<dyn Error>> {
+        let io = || io::Error::other("cause");
+        let inner = || Box::new(InstallError::HomeUnavailable);
+        let errors = [
+            InstallError::HomeUnavailable,
+            InstallError::HomeNotAbsolute {
+                path: PathBuf::from("home"),
+            },
+            InstallError::InvalidArtifact {
+                path: PathBuf::from("/artifact"),
+                detail: "detail",
+            },
+            InstallError::Filesystem {
+                operation: "read",
+                path: PathBuf::from("/artifact"),
+                source: io(),
+            },
+            InstallError::CommandStart {
+                command: "command",
+                source: io(),
+            },
+            InstallError::CommandFailed {
+                command: "command",
+                status: Some(1),
+            },
+            InstallError::DaemonSelfCheckStart { source: io() },
+            InstallError::DaemonSelfCheckFailed { status: Some(1) },
+            InstallError::ShellLocked,
+            InstallError::InvalidLockState,
+            InstallError::Service(ServiceError::Terminated { command: "command" }),
+            InstallError::StartAfterChange {
+                done: "upgraded",
+                source: ServiceError::Terminated { command: "command" },
+            },
+            InstallError::RollbackFailed {
+                source: inner(),
+                restore: inner(),
+            },
+            InstallError::CleanupFailed {
+                source: inner(),
+                cleanup: inner(),
+            },
+        ];
+        // The exhaustive match makes a new variant fail to compile until it joins `errors`.
+        let names: std::collections::BTreeSet<&str> = errors
+            .iter()
+            .map(|error| match error {
+                InstallError::HomeUnavailable => "HomeUnavailable",
+                InstallError::HomeNotAbsolute { .. } => "HomeNotAbsolute",
+                InstallError::InvalidArtifact { .. } => "InvalidArtifact",
+                InstallError::Filesystem { .. } => "Filesystem",
+                InstallError::CommandStart { .. } => "CommandStart",
+                InstallError::CommandFailed { .. } => "CommandFailed",
+                InstallError::DaemonSelfCheckStart { .. } => "DaemonSelfCheckStart",
+                InstallError::DaemonSelfCheckFailed { .. } => "DaemonSelfCheckFailed",
+                InstallError::ShellLocked => "ShellLocked",
+                InstallError::InvalidLockState => "InvalidLockState",
+                InstallError::Service(_) => "Service",
+                InstallError::StartAfterChange { .. } => "StartAfterChange",
+                InstallError::RollbackFailed { .. } => "RollbackFailed",
+                InstallError::CleanupFailed { .. } => "CleanupFailed",
+            })
+            .collect();
+        assert_eq!(names.len(), errors.len());
+
+        for error in &errors {
+            let Some(help) = Diagnostic::help(error).map(|help| help.to_string()) else {
+                return Err(format!("{error:?} has no help").into());
+            };
+            assert!(!help.trim().is_empty(), "{error:?} has empty help");
+        }
         Ok(())
     }
 }
