@@ -676,6 +676,7 @@ impl Transaction {
         refuse_self_install(&sources.omaboxd, &layout.omaboxd)?;
         transaction.check_destinations()?;
         prepare_parents(layout)?;
+        transaction.open_parents()?;
         transaction.leftovers = sweep_stale(layout)?;
         let [omabox, omaboxd, unit, plugin] = &staged;
         let result = (|| {
@@ -694,14 +695,15 @@ impl Transaction {
     }
 
     fn remove(layout: &Layout) -> Result<Self, InstallError> {
-        let leftovers = sweep_stale(layout)?;
         let token = temporary_token();
-        let transaction = Self::new(
+        let mut transaction = Self::new(
             layout,
             staged_paths(layout, &token)?,
             TransactionMode::Remove,
-            leftovers,
+            Vec::new(),
         );
+        transaction.open_parents()?;
+        transaction.leftovers = sweep_stale(layout)?;
         transaction.preflight()?;
         Ok(transaction)
     }
@@ -745,6 +747,36 @@ impl Transaction {
     fn check_destinations(&self) -> Result<(), InstallError> {
         for entry in &self.entries {
             entry.check_destination()?;
+        }
+        Ok(())
+    }
+
+    /// Open the parent directory of each destination and staged path, as
+    /// `sync_directory` does, so a directory it could not open fails before
+    /// the sweep or any staged copy or move, instead of after a move, when
+    /// the rollback could not sync it either.
+    fn open_parents(&self) -> Result<(), InstallError> {
+        let mut opened: Vec<&Path> = Vec::new();
+        let paths = self
+            .entries
+            .iter()
+            .flat_map(|entry| [&entry.destination, &entry.staged]);
+        for path in paths {
+            let parent = path
+                .parent()
+                .ok_or_else(|| invalid(path, "an artifact has no parent directory"))?;
+            if opened.contains(&parent) {
+                continue;
+            }
+            match File::open(parent) {
+                Ok(_) => {}
+                // A missing directory holds nothing to remove.
+                Err(source)
+                    if matches!(self.mode, TransactionMode::Remove)
+                        && source.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => return Err(fs_error("open an artifact directory", parent)(source)),
+            }
+            opened.push(parent);
         }
         Ok(())
     }
@@ -1772,6 +1804,102 @@ mod tests {
         assert_eq!(fs::read_dir(&outside_directory)?.count(), 1);
         assert_eq!(fs::read(&outside_file)?, b"outside");
         assert_eq!(fs::read(&fixture.layout.omaboxd)?, VALID_DAEMON);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unreadable_artifact_directory_is_refused_before_any_change() -> Result<(), Box<dyn Error>>
+    {
+        // Root opens a directory without read permission, so nothing would fail.
+        if rustix::process::geteuid().is_root() {
+            return Ok(());
+        }
+        let pid_max: u32 = fs::read_to_string("/proc/sys/kernel/pid_max")?
+            .trim()
+            .parse()?;
+        let dead = format!("{}.0", pid_max + 1);
+        for case in ["unit", "omarchy root"] {
+            let fixture = Fixture::new("active", true, false, false)?;
+            fixture.old_install()?;
+            let (Some(bin), Some(units), Some(plugins)) = (
+                fixture.layout.omabox.parent(),
+                fixture.layout.unit.parent(),
+                fixture.layout.plugin.parent(),
+            ) else {
+                return Err(io::Error::other("test path had no parent").into());
+            };
+            // The sweep would remove this, so it must survive the refusal.
+            let stale = bin.join(format!(".omabox.install.{dead}"));
+            fs::write(&stale, b"stale")?;
+            let locked = match case {
+                "unit" => fixture.layout.unit.parent().map(Path::to_path_buf),
+                // The plugin is staged here, outside its destination's parent.
+                _ => Some(fixture.layout.omarchy_root.clone()),
+            };
+            let Some(locked) = locked else {
+                return Err(io::Error::other("test path had no parent").into());
+            };
+            // Searchable and writable, so every move would succeed, but not readable.
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o300))?;
+
+            let result = execute_with(
+                InstallAction::Upgrade,
+                &fixture.layout,
+                &fixture.sources,
+                &fixture.commands,
+            );
+            // Restore before any assertion, which needs to list the directory,
+            // and so the temporary directory can remove the fixture.
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o700))?;
+
+            assert!(
+                matches!(
+                    &result,
+                    Err(InstallError::Filesystem {
+                        operation: "open an artifact directory",
+                        path,
+                        ..
+                    }) if *path == locked
+                ),
+                "{case}: {result:?}"
+            );
+            for path in [
+                &fixture.layout.omabox,
+                &fixture.layout.omaboxd,
+                &fixture.layout.unit,
+            ] {
+                assert_eq!(fs::read(path)?, b"old", "{case}");
+            }
+            assert_eq!(
+                fs::read(fixture.layout.plugin.join("old.qml"))?,
+                b"old",
+                "{case}"
+            );
+            assert_eq!(fs::read_dir(&fixture.layout.plugin)?.count(), 1, "{case}");
+            assert_eq!(
+                fs::read(&stale).ok().as_deref(),
+                Some(&b"stale"[..]),
+                "{case}"
+            );
+            assert_eq!(
+                transaction_artifacts(bin, ".omabox")?,
+                std::slice::from_ref(&stale),
+                "{case}"
+            );
+            for directory in [bin, units, plugins, &fixture.layout.omarchy_root] {
+                if directory != bin {
+                    assert!(
+                        transaction_artifacts(directory, ".omabox")?.is_empty(),
+                        "{case}"
+                    );
+                }
+                assert!(
+                    transaction_artifacts(directory, ".local.omabox.install.")?.is_empty(),
+                    "{case}"
+                );
+            }
+            assert!(!fixture.systemctl_log.exists(), "{case}");
+        }
         Ok(())
     }
 
