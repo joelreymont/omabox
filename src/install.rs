@@ -24,10 +24,6 @@ use crate::spawn::Launch;
 use crate::stale::{self, Leftover};
 
 const UNIT: &[u8] = include_bytes!("../packaging/systemd/omabox.service");
-// A concurrent child can briefly inherit the staged file's writable descriptor
-// between fork and exec, even though the descriptor is close-on-exec.
-const DAEMON_SELF_CHECK_ATTEMPTS: usize = 5;
-const DAEMON_SELF_CHECK_RETRY_DELAY: Duration = Duration::from_millis(10);
 const PLUGIN: [(&str, &[u8]); 4] = [
     (
         "manifest.json",
@@ -141,6 +137,8 @@ struct Commands {
     services: ServiceCommands,
     omarchy: Launch,
     omarchy_shell: Launch,
+    /// How the staged daemon runs for its self-check.
+    staged_daemon: fn(PathBuf) -> Launch,
 }
 
 impl Default for Commands {
@@ -149,6 +147,7 @@ impl Default for Commands {
             services: ServiceCommands::default(),
             omarchy: Launch::Program(PathBuf::from("omarchy")),
             omarchy_shell: Launch::Program(PathBuf::from("omarchy-shell")),
+            staged_daemon: Launch::Program,
         }
     }
 }
@@ -703,7 +702,7 @@ impl Transaction {
             write_file(unit, UNIT, 0o644)?;
             write_plugin(plugin)?;
             transaction.preflight()?;
-            validate_daemon(omaboxd)?;
+            validate_daemon(commands, omaboxd)?;
             validate_plugin(commands, plugin)
         })();
         if let Err(source) = result {
@@ -952,35 +951,18 @@ fn validate_plugin(commands: &Commands, path: &Path) -> Result<(), InstallError>
     }
 }
 
-fn validate_daemon(path: &Path) -> Result<(), InstallError> {
-    validate_daemon_with(path, &mut std::thread::sleep)
-}
-
-fn validate_daemon_with(path: &Path, wait: &mut impl FnMut(Duration)) -> Result<(), InstallError> {
-    let mut attempts_remaining = DAEMON_SELF_CHECK_ATTEMPTS;
-    loop {
-        let status = std::process::Command::new(path)
-            .arg("--self-check")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        match status {
-            Ok(status) => {
-                return match status.code() {
-                    Some(0) => Ok(()),
-                    status => Err(InstallError::DaemonSelfCheckFailed { status }),
-                };
-            }
-            Err(source)
-                if source.raw_os_error() == Some(rustix::io::Errno::TXTBSY.raw_os_error())
-                    && attempts_remaining > 1 =>
-            {
-                attempts_remaining -= 1;
-                wait(DAEMON_SELF_CHECK_RETRY_DELAY);
-            }
-            Err(source) => return Err(InstallError::DaemonSelfCheckStart { source }),
-        }
+fn validate_daemon(commands: &Commands, path: &Path) -> Result<(), InstallError> {
+    let status = (commands.staged_daemon)(path.to_path_buf())
+        .command()
+        .arg("--self-check")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|source| InstallError::DaemonSelfCheckStart { source })?;
+    match status.code() {
+        Some(0) => Ok(()),
+        status => Err(InstallError::DaemonSelfCheckFailed { status }),
     }
 }
 
@@ -1385,6 +1367,7 @@ mod tests {
                     services: ServiceCommands::scripts(&systemctl, "/unused/journalctl"),
                     omarchy: Launch::Script(omarchy),
                     omarchy_shell: Launch::Script(omarchy_shell),
+                    staged_daemon: Launch::Script,
                 },
                 systemctl,
                 systemctl_log,
@@ -2465,61 +2448,20 @@ mod tests {
     }
 
     #[test]
-    fn staged_daemon_self_check_retries_a_transient_text_busy_spawn() -> Result<(), Box<dyn Error>>
-    {
-        let directory = tempfile::TempDir::new()?;
-        let daemon = directory.path().join("omaboxd");
-        release_artifact(&daemon, VALID_DAEMON)?;
-        let writer = OpenOptions::new().write(true).open(&daemon)?;
-        let mut writer = Some(writer);
-        let mut waits = Vec::new();
+    fn staged_daemon_self_check_reports_a_spawn_failure() -> Result<(), Box<dyn Error>> {
+        let commands = Commands {
+            services: ServiceCommands::scripts("/unused/systemctl", "/unused/journalctl"),
+            omarchy: Launch::Script(PathBuf::from("/unused/omarchy")),
+            omarchy_shell: Launch::Script(PathBuf::from("/unused/omarchy-shell")),
+            staged_daemon: Launch::Program,
+        };
 
-        validate_daemon_with(&daemon, &mut |delay| {
-            waits.push(delay);
-            drop(writer.take());
-            // Match production: concurrent fork/exec children may briefly retain the descriptor.
-            std::thread::sleep(delay);
-        })?;
-
-        assert!(!waits.is_empty());
-        assert!(waits.len() < DAEMON_SELF_CHECK_ATTEMPTS);
-        assert!(
-            waits
-                .iter()
-                .all(|delay| *delay == DAEMON_SELF_CHECK_RETRY_DELAY)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn staged_daemon_self_check_bounds_text_busy_and_preserves_other_spawn_errors()
-    -> Result<(), Box<dyn Error>> {
-        let directory = tempfile::TempDir::new()?;
-        let daemon = directory.path().join("omaboxd");
-        release_artifact(&daemon, VALID_DAEMON)?;
-        let _writer = OpenOptions::new().write(true).open(&daemon)?;
-        let mut waits = Vec::new();
-
-        let busy = validate_daemon_with(&daemon, &mut |delay| waits.push(delay));
-        match busy {
-            Err(InstallError::DaemonSelfCheckStart { source }) => assert_eq!(
-                source.raw_os_error(),
-                Some(rustix::io::Errno::TXTBSY.raw_os_error())
-            ),
-            other => return Err(io::Error::other(format!("unexpected result: {other:?}")).into()),
-        }
-        assert_eq!(waits.len(), DAEMON_SELF_CHECK_ATTEMPTS - 1);
-
-        let missing = directory.path().join("missing");
-        let mut unrelated_waits = 0;
-        let missing = validate_daemon_with(&missing, &mut |_| unrelated_waits += 1);
-        match missing {
+        match validate_daemon(&commands, Path::new("/nonexistent/omaboxd")) {
             Err(InstallError::DaemonSelfCheckStart { source }) => {
                 assert_eq!(source.kind(), io::ErrorKind::NotFound);
             }
             other => return Err(io::Error::other(format!("unexpected result: {other:?}")).into()),
         }
-        assert_eq!(unrelated_waits, 0);
         Ok(())
     }
 

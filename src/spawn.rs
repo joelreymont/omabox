@@ -1,11 +1,12 @@
 //! How a configured program becomes a `std::process::Command`.
 //!
-//! Tests stand in for `systemctl`, `omarchy`, and `secret-tool` with shell
-//! scripts they write themselves. Executing such a script races with the rest
-//! of a parallel test binary: `execve` reports `ETXTBSY` while any process
-//! still holds a write descriptor on the file, and a concurrent spawn inherits
-//! that descriptor until its own `execve` closes it. A script is therefore
-//! passed to the shell as an argument, so it is read and never executed.
+//! Tests stand in for `systemctl`, `omarchy`, `secret-tool` and the staged
+//! daemon with shell scripts they write themselves. Executing such a script
+//! races with the rest of a parallel test binary: `execve` reports `ETXTBSY`
+//! while any process still holds a write descriptor on the file, and a
+//! concurrent spawn inherits that descriptor until its own `execve` closes it.
+//! A script is therefore passed to the shell as an argument, so it is read and
+//! never executed.
 
 #[cfg(test)]
 use std::path::Path;
