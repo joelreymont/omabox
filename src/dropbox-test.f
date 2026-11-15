@@ -6,9 +6,9 @@
 \ hash and uploads, whose stages are written under TMPDIR and removed once
 \ open, so no run leaves one. One server and one main client serve every
 \ case; a case that needs another config opens its own client. DROPBOX's
-\ log lines go to stderr, but a stage or classifier failure's, which is
-\ captured in TMPDIR, checked and removed. A stub in place of AIO's
-\ transfer fails the stage's reads. The first failed assertion ends the run.
+\ log lines go to stderr, but those a case checks, which are captured in
+\ TMPDIR, checked and removed. A stub in place of AIO's transfer fails the
+\ stage's reads. The first failed assertion ends the run.
 \ Run from the repository root: hb --load src/dropbox-test.f </dev/null
 require src/lib/aio.f
 require src/lib/arena.f
@@ -567,26 +567,37 @@ variable GOT-U
    S\" {\qpath\q:\q/sync\q,\qrecursive\q:true,\qinclude_deleted\q:false} {\qcursor\q:\qc1\q} {\qcursor\q:\qc2\q}" T$= ;
 
 
+\ A listing of one page that answers done with the cursor, so a case sets
+\ the cursor it starts from.
+: LISTED ( ptr u8 n -- )
+   {: k:ptr ku:n :}
+   LISTING
+   S\" [{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/sync\q,\qpath_display\q:\q/Sync\q}]"
+   k ku false TEST-DROPBOX:PAGE!
+   s" /sync" MAIN @ [: SAW ;] DROPBOX:LIST DONE? ASSERT
+   LISTING ;
+
+
 \ A reset leaves the cursor of the last listing that answered done.
 : RESET-CASE ( -- )
    s" listing reset" T-LABEL
-   LISTING
+   s" r0" LISTED
    S\" [{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/sync\q,\qpath_display\q:\q/Sync\q}]"
    s" r1" true TEST-DROPBOX:PAGE!
    TEST-DROPBOX:PAGE-RESET!
    s" /sync" MAIN @ [: SAW ;] DROPBOX:LIST
    DROPBOX-ERROR:reset REFUSED? ASSERT
-   MAIN @ DROPBOX:CURSOR s" c3" T$=
+   MAIN @ DROPBOX:CURSOR s" r0" T$=
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/list_folder/continue" T$= ;
 
 
 : CHANGES-DROPPED ( -- )
-   s" c3" MAIN @ [: SAW ;] DROPBOX:CHANGES DONE? drop ;
+   MAIN @ DROPBOX:CURSOR MAIN @ [: SAW ;] DROPBOX:CHANGES DONE? drop ;
 
 
 : STALL-CASE ( -- )
    s" cursor stalled" T-LABEL
-   LISTING
+   s" s0" LISTED
    S\" [{\q.tag\q:\qdeleted\q,\qname\q:\qb\q,\qpath_lower\q:\q/sync/b\q,\qpath_display\q:\q/Sync/b\q}]"
    s" c4" true TEST-DROPBOX:PAGE!
    s" []" s" c4" true TEST-DROPBOX:PAGE!
@@ -594,7 +605,7 @@ variable GOT-U
    GOT$ s" x/sync/b" T$=
    TEST-DROPBOX:SEEN$
    s" /2/files/list_folder/continue /2/files/list_folder/continue" T$=
-   TEST-DROPBOX:ARGS$ S\" {\qcursor\q:\qc3\q} {\qcursor\q:\qc4\q}" T$= ;
+   TEST-DROPBOX:ARGS$ S\" {\qcursor\q:\qs0\q} {\qcursor\q:\qc4\q}" T$= ;
 
 
 \ A listing's entry is a Metadata union: one with no `.tag` has no kind,
@@ -771,9 +782,65 @@ variable SUNK-AT
    SUNK-U @ 0 T= ;
 
 
+\ A download refused as a bad answer leaves the client usable.
+: USABLE ( -- )
+   s" /docs/abc.txt" MAIN @ DROPBOX:METADATA DONE? ASSERT ;
+
+
+: WHOLE-DROPPED ( -- ) 0 FETCH DONE? drop ;
+
+
+: OTHER-REV-CASE ( -- )
+   s" download of another rev" T-LABEL
+   TEST-DROPBOX:RESET ALPHABET
+   s" /docs/abc.txt" s" /Docs/abc.txt" s" 0160aaaaaaaa"
+   s" 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+   26 TEST-DROPBOX:FILE!
+   s" 0160aaaaaaaa" s" ABCDEFGHIJKLMNOPQRSTUVWXYZ" TEST-DROPBOX:CONTENT!
+   s" 0160aaaaaaaa" TEST-DROPBOX:MISFILE
+   [: WHOLE-DROPPED ;] LOGGED DROPBOX:E-ANSWER T=
+   s" another rev" LOGGED? TTRUE
+   SUNK-U @ 0 T=
+   USABLE ;
+
+
+\ The length is known once the body ended, so the bytes before it were
+\ handed to sink.
+: SHORT-CASE ( -- )
+   s" download of another length" T-LABEL
+   TEST-DROPBOX:RESET ALPHABET
+   TEST-DROPBOX:SHORTEN
+   [: WHOLE-DROPPED ;] LOGGED DROPBOX:E-ANSWER T=
+   s" a body of another length" LOGGED? TTRUE
+   USABLE ;
+
+
+: WHOLE-FOR-RANGE-CASE ( -- )
+   s" download whole for a range" T-LABEL
+   TEST-DROPBOX:RESET ALPHABET
+   TEST-DROPBOX:IGNORE-RANGE
+   [: FETCH-DROPPED ;] LOGGED DROPBOX:E-ANSWER T=
+   s" a whole file for a range" LOGGED? TTRUE
+   TEST-DROPBOX:RANGE-SENT$ s" bytes=10-" T$=
+   SUNK-U @ 0 T=
+   USABLE ;
+
+
+: UNASKED-RANGE-CASE ( -- )
+   s" download range nobody asked for" T-LABEL
+   TEST-DROPBOX:RESET ALPHABET
+   TEST-DROPBOX:FORCE-RANGE
+   [: WHOLE-DROPPED ;] LOGGED DROPBOX:E-ANSWER T=
+   s" a range nobody asked for" LOGGED? TTRUE
+   TEST-DROPBOX:RANGE-SENT? TFALSE
+   SUNK-U @ 0 T=
+   USABLE ;
+
+
 : DOWNLOAD-CASES ( -- )
    WHOLE-CASE RESUME-CASE SKEW-CASE UNSATISFIED-CASE RESTART-CASE
-   UNSATISFIABLE-CASE FIRST-UNSATISFIABLE-CASE UNKNOWN-REV-CASE ;
+   UNSATISFIABLE-CASE FIRST-UNSATISFIABLE-CASE UNKNOWN-REV-CASE
+   OTHER-REV-CASE SHORT-CASE WHOLE-FOR-RANGE-CASE UNASKED-RANGE-CASE ;
 
 
 \ ---- delete_v2, create_folder_v2 and the code exchange
@@ -910,6 +977,31 @@ variable SUNK-AT
    link DROPBOX:ACCOUNT DONE? ASSERT
    TEST-DROPBOX:SEEN$ s" /oauth2/token /2/users/get_current_account" T$=
    TEST-DROPBOX:LEAKED? TFALSE
+   link DROPBOX:CLOSE ;
+
+
+\ Bytes a form reserves: each must reach Dropbox encoded.
+: RESERVED$ ( -- ptr u8 n ) s" a+b&c=d%e f" ;
+
+
+: RESERVED-REFRESH-CASE ( -- )
+   s" refresh token with reserved bytes" T-LABEL
+   TEST-DROPBOX:RESET
+   s" fake-key" RESERVED$ TEST-DROPBOX:ACCEPT!
+   RESERVED$ s" ns-root" OPENED {: odd :}
+   odd DROPBOX:ACCOUNT DONE? ASSERT
+   TEST-DROPBOX:SEEN$ s" /oauth2/token /2/users/get_current_account" T$=
+   odd DROPBOX:CLOSE
+   s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT! ;
+
+
+: RESERVED-CODE-CASE ( -- )
+   s" code with reserved bytes" T-LABEL
+   TEST-DROPBOX:RESET
+   RESERVED$ s" fake-verifier" TEST-DROPBOX:GRANT!
+   s" " s" ns-root" OPENED {: link :}
+   RESERVED$ s" fake-verifier" link DROPBOX:EXCHANGE DONE? ASSERT
+   link DROPBOX:REFRESH-TOKEN s" fake-refresh-granted" T$=
    link DROPBOX:CLOSE ;
 
 
@@ -1408,7 +1500,7 @@ TYPED-VARIABLE FAULT fault
    DELETE-CONFLICT-CASE DELETE-MISSING-CASE DELETE-GONE-CASE
    LOST-DELETE-CASE CUT-DELETE-CASE
    FOLDER-CONFLICT-CASE LOST-FOLDER-CASE CUT-FOLDER-CASE LOST-REFRESH-CASE
-   EXCHANGE-CASE DEAD-CODE-CASE
+   EXCHANGE-CASE DEAD-CODE-CASE RESERVED-REFRESH-CASE RESERVED-CODE-CASE
    UPLOAD-CASES DROPBOX:THROW-CASES
    MAIN @ DROPBOX:CLOSE ;
 

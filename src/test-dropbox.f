@@ -190,10 +190,80 @@ TYPED-VARIABLE TOKEN-CUTTING bool
 
 \ ---- the token
 
+\ A token form is read as a form decoder reads it: & and = part names and
+\ values, + is a space, %XX a byte, and any byte its encoder escapes is
+\ malformed. DECODED holds each name and value followed by a NUL.
+create DECODED TEXT-CAP allot
+variable DECODED-U
+variable FORM-AT
+
+
+\ A byte a form may carry unescaped.
+: PLAIN? ( n -- bool )
+   {: b:n :}
+   b STR-DIGIT? b ASCII-LOWER dup 97 >= swap 122 <= and or
+   b 45 = or b 46 = or b 95 = or b 126 = or b 42 = or ;
+
+
+\ The byte a %XX at the offset names and the offset after it; -1 for a
+\ malformed escape.
+: ESCAPED ( ptr u8 n n -- n n )
+   {: a:ptr u:n at:n :}
+   at 3 + u > if -1 u exit then
+   a at 1+ + c@ a at 2 + + c@ {: h:n l:n :}
+   h STR-HEX-DIGIT? l STR-HEX-DIGIT? and 0= if -1 u exit then
+   h STR-HEX-DIGIT-VALUE 16 * l STR-HEX-DIGIT-VALUE + at 3 + ;
+
+
+\ The byte at the offset, decoded, and the offset after it; -1 for one
+\ the form may not carry.
+: FORM-BYTE ( ptr u8 n n -- n n )
+   {: a:ptr u:n at:n :}
+   a at + c@ {: b:n :}
+   b 43 = if 32 at 1+ exit then
+   b 37 = if a u at ESCAPED exit then
+   b PLAIN? if b else -1 then at 1+ ;
+
+
+\ The byte onto DECODED; false once it is full.
+: KEPT ( n -- bool )
+   {: b:n :}
+   DECODED-U @ TEXT-CAP >= if false exit then
+   b DECODED DECODED-U @ + c! 1 DECODED-U +! true ;
+
+
+\ One step from FORM-AT: a separator as a NUL, else a decoded byte, which
+\ may not be a NUL; false when the form is malformed.
+: FORM-STEP ( ptr u8 n n -- bool )
+   {: a:ptr u:n at:n :}
+   a at + c@ {: b:n :}
+   b 38 = b 61 = or if at 1+ FORM-AT ! 0 KEPT exit then
+   a u at FORM-BYTE FORM-AT ! {: d:n :}
+   d 0 <= if false exit then
+   d KEPT ;
+
+
+\ A form body's names and values as DECODED holds them; empty when it is
+\ malformed.
+: FIELDS$ ( ptr u8 n -- ptr u8 n )
+   {: a:ptr u:n :}
+   0 DECODED-U ! 0 FORM-AT !
+   begin FORM-AT @ u < while
+      a u FORM-AT @ FORM-STEP 0= if DECODED 0 exit then
+   repeat
+   0 KEPT 0= if DECODED 0 exit then
+   DECODED DECODED-U @ ;
+
+
+: FIELD+ ( ptr u8 n -- ) SB-APPEND 0 SB-APPEND-C ;
+
+
+\ The refresh form's names and values, as FIELDS$ decodes them.
 : FORM$ ( -- ptr u8 n )
    SB-RESET
-   s" grant_type=refresh_token&refresh_token=" SB-APPEND REFRESH$ SB-APPEND
-   s" &client_id=" SB-APPEND KEY$ SB-APPEND
+   s" grant_type" FIELD+ s" refresh_token" FIELD+
+   s" refresh_token" FIELD+ REFRESH$ FIELD+
+   s" client_id" FIELD+ KEY$ FIELD+
    SB$ ;
 
 
@@ -205,7 +275,7 @@ TYPED-VARIABLE TOKEN-CUTTING bool
 
 : TOKEN ( HTTP:request HTTP:response -- )
    {: q:HTTP:request a:HTTP:response :}
-   q HTTP:BODY$ FORM$ STR= 0= if
+   q HTTP:BODY$ FIELDS$ FORM$ STR= 0= if
       a 400 HTTP:STATUS!
       a S\" {\qerror\q:\qinvalid_grant\q,\qerror_description\q:\qrefresh token is invalid or revoked\q}" ANSWER!
       exit
@@ -324,19 +394,21 @@ create HELD NAME-CAP allot
 variable HELD-U
 
 
+\ The code grant's names and values, as FIELDS$ decodes them.
 : CODE-FORM$ ( -- ptr u8 n )
    SB-RESET
-   s" grant_type=authorization_code&code=" SB-APPEND
-   GRANT-CODE GRANT-CODE-U @ SB-APPEND
-   s" &code_verifier=" SB-APPEND VERIFIER VERIFIER-U @ SB-APPEND
-   s" &client_id=" SB-APPEND KEY$ SB-APPEND
+   s" grant_type" FIELD+ s" authorization_code" FIELD+
+   s" code" FIELD+ GRANT-CODE GRANT-CODE-U @ FIELD+
+   s" code_verifier" FIELD+ VERIFIER VERIFIER-U @ FIELD+
+   s" client_id" FIELD+ KEY$ FIELD+
    SB$ ;
 
 
 \ The code grant, good once; any other form goes to TOKEN.
 : GRANT ( HTTP:request HTTP:response -- )
    {: q:HTTP:request a:HTTP:response :}
-   GRANT-CODE-U @ 0<> q HTTP:BODY$ CODE-FORM$ STR= and 0= if q a TOKEN exit then
+   GRANT-CODE-U @ 0<> q HTTP:BODY$ FIELDS$ CODE-FORM$ STR= and 0=
+   if q a TOKEN exit then
    0 GRANT-CODE-U !
    ISSUE
    SB-RESET S\" {\qaccess_token\q:\q" SB-APPEND ISSUED ISSUED-U @ SB-APPEND
@@ -607,14 +679,22 @@ variable ARGS-U
 
 \ ---- files/download
 
-\ CONTENT! keeps each rev's bytes; SKEWED shifts the next Content-Range's
-\ start by one.
+\ CONTENT! keeps each rev's bytes. Each fault applies to the next download
+\ alone: SKEWED shifts its Content-Range's start by one, MISFILED answers
+\ another rev's file, SHORTED drops its body's last byte, WHOLED answers
+\ the whole file whatever Range it asked, and PARTED answers a 206 with a
+\ Content-Range though it asked none.
 SLOTS NAME-CAP * BUFFER: CONTENT-REVS
 SLOTS TYPED-BUFFER CONTENT-REV-US n
 SLOTS TEXT-CAP * BUFFER: CONTENT-BYTES
 SLOTS TYPED-BUFFER CONTENT-US n
 variable CONTENTS
 TYPED-VARIABLE SKEWED bool
+create MISFILED NAME-CAP allot
+variable MISFILED-U
+TYPED-VARIABLE SHORTED bool
+TYPED-VARIABLE WHOLED bool
+TYPED-VARIABLE PARTED bool
 create REV-SEEN NAME-CAP allot
 variable REV-SEEN-U
 create ARG-SENT TEXT-CAP allot
@@ -729,19 +809,35 @@ TYPED-VARIABLE RANGED bool
    from size >= from 0 > and if a size UNSATISFIABLE! exit then
    a s" Dropbox-API-Result" i ENTRY$ HTTP:HEADER!
    a s" Content-Type" s" application/octet-stream" HTTP:HEADER!
-   from 0 > if
+   from 0 > PARTED @ or if
       a 206 HTTP:STATUS!
       a s" Content-Range" from size CONTENT-RANGE$ HTTP:HEADER!
    then
-   a b from + size from - HTTP:BODY! ;
+   false PARTED !
+   size from - SHORTED @ if 1- then {: len:n :}
+   false SHORTED !
+   a b from + len HTTP:BODY! ;
+
+
+\ The rev the next download answers: a MISFILE's once, else the one asked.
+: SERVED-REV$ ( -- ptr u8 n )
+   MISFILED-U @ 0= if REV$ exit then
+   MISFILED MISFILED-U @ 0 MISFILED-U ! ;
+
+
+\ The offset the next download answers from: 0 once WHOLED.
+: SERVED-AT ( n -- n )
+   WHOLED @ if drop 0 then
+   false WHOLED ! ;
 
 
 : DOWNLOAD ( HTTP:request HTTP:response -- )
    {: q:HTTP:request a:HTTP:response :}
    q a ADMITTED? 0= if exit then
-   q RANGE-OF {: from:n :}
+   q RANGE-OF SERVED-AT {: from:n :}
    q REV-ASK
-   REV$ FILE-OF REV$ CONTENT-OF {: i:n k:n :}
+   SERVED-REV$ {: r:ptr ru:n :}
+   r ru FILE-OF r ru CONTENT-OF {: i:n k:n :}
    i 0< k 0< or if a NOT-FOUND! exit then
    from 0< if a 400 HTTP:STATUS! a s" bad range" HTTP:BODY! exit then
    a i k from FILE-SENT ;
@@ -1007,16 +1103,17 @@ $2100000 constant UPLOAD-CAP
 
 
 \ Forgets the script, the entries, the kept bytes, the pages, the long
-\ poll's answer, the sessions, the revs uploads took, a SKEW, a LOSE, the
-\ CUTs, a CUT-TOKEN, a GARBLE, a code GRANT! set, a REVOKE and what was sent;
-\ the tokens and the root stay.
+\ poll's answer, the sessions, the revs uploads took, a download's fault, a
+\ SKEW, a LOSE, the CUTs, a CUT-TOKEN, a GARBLE, a code GRANT! set, a REVOKE
+\ and what was sent; the tokens and the root stay.
 : RESET ( -- )
    0 SCRIPTS ! 0 SCRIPTED ! 0 FILES ! 0 CONTENTS ! 0 SESSIONS ! 0 REVS !
    0 GRANT-CODE-U !
    0 SEEN-U ! 0 AUTH-U ! 0 ROOT-SENT-U ! 0 TYPE-SENT-U !
    0 ARG-SENT-U ! 0 RANGE-SENT-U !
    false ROOTED ! false TYPED ! false LEAKED ! false RANGED !
-   false SKEWED ! false LOSING ! 0 CUTS ! false TOKEN-CUTTING !
+   false SKEWED ! 0 MISFILED-U ! false SHORTED ! false WHOLED !
+   false PARTED ! false LOSING ! 0 CUTS ! false TOKEN-CUTTING !
    false REVOKED ! false GARBLING !
    LISTING-RESET ;
 
@@ -1123,6 +1220,15 @@ $2100000 constant UPLOAD-CAP
 
 \ Shifts the next download's Content-Range start by one.
 : SKEW ( -- ) true SKEWED ! ;
+\ The next download answers the file at this rev, whatever rev it asked.
+: MISFILE ( ptr u8 n -- ) MISFILED NAME-CAP STORE MISFILED-U ! ;
+\ The next download's body lacks its last byte.
+: SHORTEN ( -- ) true SHORTED ! ;
+\ The next download answers the whole file, whatever Range it asked.
+: IGNORE-RANGE ( -- ) true WHOLED ! ;
+\ The next download answers a 206 with its Content-Range, even with no
+\ Range asked.
+: FORCE-RANGE ( -- ) true PARTED ! ;
 \ The last download's Dropbox-API-Arg value.
 : ARG-SENT$ ( -- ptr u8 n ) ARG-SENT ARG-SENT-U @ ;
 \ The last download's Range value, and whether it sent one.
