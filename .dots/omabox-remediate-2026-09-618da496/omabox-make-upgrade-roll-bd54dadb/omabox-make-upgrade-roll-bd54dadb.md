@@ -1,9 +1,10 @@
 ---
 title: Make upgrade roll back on launch failure and harden install paths
-status: open
+status: closed
 priority: 2
 issue-type: task
 created-at: "2026-09-02T11:28:11.362911+02:00"
+closed-at: "2026-11-15T10:28:52.245869+02:00"
 blocks:
   - omabox-classify-daemon-errors-dd34c00a
 ---

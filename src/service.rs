@@ -78,6 +78,8 @@ pub enum ServiceGoal {
 pub struct Driven {
     /// The state observed before any change; `None` for Start, Restart and Restore, which observe nothing.
     pub first: Option<UnitState>,
+    /// The state last observed; `None` when the goal observes nothing.
+    pub last: Option<UnitState>,
     /// Whether the goal ran start or restart.
     pub launched: bool,
 }
@@ -283,6 +285,7 @@ impl ServiceCommands {
         let mut phase = Phase::Begin;
         let mut driven = Driven {
             first: None,
+            last: None,
             launched: false,
         };
         loop {
@@ -292,6 +295,7 @@ impl ServiceCommands {
                     if phase == Phase::Begin {
                         driven.first = Some(state);
                     }
+                    driven.last = Some(state);
                     Outcome::Observed(state)
                 }
                 Step::Stop => {
@@ -778,6 +782,7 @@ mod tests {
             commands.drive(ServiceGoal::Halt)?,
             Driven {
                 first: Some(UnitState::Running),
+                last: Some(UnitState::Failed),
                 launched: false
             }
         );
@@ -793,6 +798,7 @@ mod tests {
             commands.drive(ServiceGoal::Recover)?,
             Driven {
                 first: Some(UnitState::Failed),
+                last: Some(UnitState::Failed),
                 launched: true
             }
         );
@@ -891,6 +897,7 @@ mod tests {
             commands.drive(ServiceGoal::Start)?,
             Driven {
                 first: None,
+                last: None,
                 launched: true
             }
         );
@@ -920,6 +927,7 @@ mod tests {
             commands.drive(ServiceGoal::Halt)?,
             Driven {
                 first: Some(UnitState::Running),
+                last: Some(UnitState::Stopped),
                 launched: false
             }
         );

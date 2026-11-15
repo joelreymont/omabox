@@ -366,40 +366,45 @@ fn install(
                     true,
                 ));
             }
-            if let Err(source) = transaction.finish() {
-                return Err(InstallError::CleanupAfterChange {
-                    done,
-                    source: Box::new(source),
-                });
-            }
-            format!("Omabox was {done}. The service remains {enabled} and running.\n")
+            format!("Omabox was {done}. The service remains {enabled} and running.")
         }
         // A starting service has not shown the old build works and may still run it, so the new build is kept and replaces it.
+        // A failed restart leaves the set-aside files as dead-process temporaries for the next install, upgrade or uninstall to sweep.
         UnitState::Starting => {
-            transaction.finish()?;
             commands
                 .services
                 .drive(ServiceGoal::Restart)
                 .map_err(|source| InstallError::StartAfterChange { done, source })?;
-            format!("Omabox was {done}. The service remains {enabled} and running.\n")
+            format!("Omabox was {done}. The service remains {enabled} and running.")
         }
         // A failed unit usually stopped for a cause the old build shares, so the new build is kept before Recover starts it.
+        // A failed Recover leaves the set-aside files as dead-process temporaries for the next install, upgrade or uninstall to sweep.
         UnitState::Failed | UnitState::Stopping | UnitState::Stopped => {
-            transaction.finish()?;
             let driven = commands
                 .services
                 .drive(ServiceGoal::Recover)
                 .map_err(|source| InstallError::StartAfterChange { done, source })?;
-            if driven.launched {
-                format!(
-                    "Omabox was {done}. The service remains {enabled}. The stopped service has been started again.\n"
-                )
-            } else {
-                format!("Omabox was {done}. The service remains {enabled} and stopped.\n")
+            match (driven.launched, driven.last) {
+                (true, _) => format!(
+                    "Omabox was {done}. The service remains {enabled}. The stopped service has been started again."
+                ),
+                (false, None) => format!(
+                    "Omabox was {done}. The service remains {enabled}; its state was not observed."
+                ),
+                (false, Some(state)) => {
+                    let last = match state {
+                        UnitState::Running => "running",
+                        UnitState::Starting => "starting",
+                        UnitState::Stopping => "stopping",
+                        UnitState::Stopped => "stopped",
+                        UnitState::Failed => "failed",
+                    };
+                    format!("Omabox was {done}. The service remains {enabled} and {last}.")
+                }
             }
         }
     };
-    Ok(report + &stale::report(&transaction.leftovers))
+    finish_change(&mut transaction, report)
 }
 
 fn uninstall(layout: &Layout, commands: &Commands) -> Result<String, InstallError> {
@@ -420,10 +425,23 @@ fn uninstall(layout: &Layout, commands: &Commands) -> Result<String, InstallErro
         return Err(rollback_failure(source, state.restore(commands, true)));
     }
     publish(&mut transaction, commands, state, Some(plugin), true)?;
-    transaction.finish()?;
-    Ok(String::from(
-        "Omabox program, service, and plugin files were removed. Configuration, the journal, recovery data, Secret Service credentials, and synced files were retained.\n",
-    ) + &stale::report(&transaction.leftovers))
+    finish_change(
+        &mut transaction,
+        String::from(
+            "Omabox program, service, and plugin files were removed. Configuration, the journal, recovery data, Secret Service credentials, and synced files were retained.",
+        ),
+    )
+}
+
+/// A failed cleanup still reports the change: it has already taken effect.
+fn finish_change(transaction: &mut Transaction, report: String) -> Result<String, InstallError> {
+    match transaction.finish() {
+        Ok(()) => Ok(format!("{report}\n") + &stale::report(&transaction.leftovers)),
+        Err(source) => Err(InstallError::CleanupAfterChange {
+            report,
+            source: Box::new(source),
+        }),
+    }
 }
 
 /// Move the artifacts into place. `plugin` is the shell's state for a plugin
@@ -1248,15 +1266,16 @@ pub enum InstallError {
         #[source]
         source: ServiceError,
     },
-    #[error(
-        "Omabox was {done} and the service runs the new build, but the replaced files could not be removed"
-    )]
+    #[error("{report} The old files set aside during the change could not be cleaned up.")]
     #[diagnostic(
         code(omabox::install::cleanup_after_change),
-        help("The next install, upgrade or uninstall removes the leftover files.")
+        help(
+            "The next install, upgrade or uninstall retries the cleanup and reports any file it cannot remove."
+        )
     )]
     CleanupAfterChange {
-        done: &'static str,
+        /// The sentence that describes the completed change.
+        report: String,
         #[source]
         source: Box<InstallError>,
     },
@@ -2012,18 +2031,23 @@ mod tests {
             Err(error @ InstallError::CleanupAfterChange { .. }) => error,
             other => return Err(io::Error::other(format!("unexpected result: {other:?}")).into()),
         };
-        let InstallError::CleanupAfterChange { done, source } = &error else {
+        let InstallError::CleanupAfterChange { report, source } = &error else {
             return Err(io::Error::other("the error changed variant").into());
         };
-        assert_eq!(*done, "upgraded");
+        assert_eq!(
+            report,
+            "Omabox was upgraded. The service remains enabled and running."
+        );
         assert!(matches!(**source, InstallError::InvalidArtifact { .. }));
         assert_eq!(
             error.to_string(),
-            "Omabox was upgraded and the service runs the new build, but the replaced files could not be removed"
+            "Omabox was upgraded. The service remains enabled and running. The old files set aside during the change could not be cleaned up."
         );
         assert_eq!(
             error.help().map(|help| help.to_string()).as_deref(),
-            Some("The next install, upgrade or uninstall removes the leftover files.")
+            Some(
+                "The next install, upgrade or uninstall retries the cleanup and reports any file it cannot remove."
+            )
         );
         assert_eq!(
             fs::read(&fixture.layout.omabox)?,
@@ -2033,6 +2057,204 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&fixture.systemctl_log)?,
             "is-enabled\nshow\ndaemon-reload\nreset-failed\nrestart\n"
+        );
+        Ok(())
+    }
+
+    /// Answer `systemctl` for an enabled unit, each `show` with the next of
+    /// `states`, repeating the last; `cases` adds `case` arms for other verbs.
+    fn answer_show(fixture: &Fixture, states: &[&str], cases: &str) -> Result<(), Box<dyn Error>> {
+        let queue = fixture.systemctl.with_file_name("states");
+        fs::write(&queue, states.join("\n") + "\n")?;
+        fs::write(
+            &fixture.systemctl,
+            format!(
+                "printf '%s\\n' \"$2\" >> '{log}'\ncase \"$2\" in\n is-enabled) exit 0;;\n show) head -n 1 '{queue}'; if [ \"$(wc -l < '{queue}')\" -gt 1 ]; then tail -n +2 '{queue}' > '{queue}.next'; mv '{queue}.next' '{queue}'; fi;;\n{cases}esac\nexit 0\n",
+                log = fixture.systemctl_log.display(),
+                queue = queue.display(),
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// Answer `systemctl` as [`answer_show`] does and turn each set-aside
+    /// backup of the `omabox` binary into a directory when `command` runs, so
+    /// the transaction's finish cannot remove it as the file it set aside.
+    fn fail_finish_on(
+        fixture: &Fixture,
+        states: &[&str],
+        command: &str,
+    ) -> Result<(), Box<dyn Error>> {
+        let Some(bin) = fixture.layout.omabox.parent() else {
+            return Err(io::Error::other("binary path had no parent").into());
+        };
+        answer_show(
+            fixture,
+            states,
+            &format!(
+                " {command}) for backup in '{}/.omabox.install.'*; do rm -f -- \"$backup\"; mkdir -- \"$backup\"; done;;\n",
+                bin.display()
+            ),
+        )
+    }
+
+    #[test]
+    fn finish_failure_after_restarting_a_starting_service_reports_the_upgrade()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new("activating", true, false, false)?;
+        fixture.old_install()?;
+        fail_finish_on(&fixture, &["activating"], "restart")?;
+
+        let result = execute_with(
+            InstallAction::Upgrade,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        let error = match result {
+            Err(error @ InstallError::CleanupAfterChange { .. }) => error,
+            other => return Err(io::Error::other(format!("unexpected result: {other:?}")).into()),
+        };
+        assert!(
+            error
+                .to_string()
+                .starts_with("Omabox was upgraded. The service remains enabled and running."),
+            "upgrade reported {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.systemctl_log)?,
+            "is-enabled\nshow\ndaemon-reload\nreset-failed\nrestart\n"
+        );
+        assert_eq!(
+            fs::read(&fixture.layout.omabox)?,
+            b"#!/bin/sh\necho omabox\n"
+        );
+        assert_eq!(fs::read(&fixture.layout.omaboxd)?, VALID_DAEMON);
+        assert_eq!(fs::read(&fixture.layout.unit)?, UNIT);
+        Ok(())
+    }
+
+    #[test]
+    fn finish_failure_after_recovering_a_failed_service_reports_the_upgrade()
+    -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new("failed", true, false, false)?;
+        fixture.old_install()?;
+        fail_finish_on(&fixture, &["failed"], "start")?;
+
+        let result = execute_with(
+            InstallAction::Upgrade,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        let error = match result {
+            Err(error @ InstallError::CleanupAfterChange { .. }) => error,
+            other => return Err(io::Error::other(format!("unexpected result: {other:?}")).into()),
+        };
+        assert!(
+            error.to_string().starts_with(
+                "Omabox was upgraded. The service remains enabled. The stopped service has been started again."
+            ),
+            "upgrade reported {error}"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.systemctl_log)?,
+            "is-enabled\nshow\ndaemon-reload\nshow\nreset-failed\nstart\n"
+        );
+        assert_eq!(
+            fs::read(&fixture.layout.omabox)?,
+            b"#!/bin/sh\necho omabox\n"
+        );
+        assert_eq!(fs::read(&fixture.layout.omaboxd)?, VALID_DAEMON);
+        assert_eq!(fs::read(&fixture.layout.unit)?, UNIT);
+        Ok(())
+    }
+
+    /// Upgrade a unit first observed stopped that systemd brings to `later`
+    /// before Recover observes it, failing the cleanup, and return the error.
+    fn upgrade_with_a_late_state(later: &str) -> Result<InstallError, Box<dyn Error>> {
+        let fixture = Fixture::new("inactive", true, false, false)?;
+        fixture.old_install()?;
+        fail_finish_on(&fixture, &["inactive", later], "daemon-reload")?;
+
+        let result = execute_with(
+            InstallAction::Upgrade,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        let error = match result {
+            Err(error @ InstallError::CleanupAfterChange { .. }) => error,
+            other => return Err(io::Error::other(format!("unexpected result: {other:?}")).into()),
+        };
+        assert_eq!(
+            fs::read_to_string(&fixture.systemctl_log)?,
+            "is-enabled\nshow\ndaemon-reload\nshow\n"
+        );
+        Ok(error)
+    }
+
+    #[test]
+    fn recover_reports_a_service_systemd_started_as_running() -> Result<(), Box<dyn Error>> {
+        let error = upgrade_with_a_late_state("active")?;
+        assert!(
+            error
+                .to_string()
+                .starts_with("Omabox was upgraded. The service remains enabled and running."),
+            "upgrade reported {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recover_reports_a_service_systemd_is_starting_as_starting() -> Result<(), Box<dyn Error>> {
+        let error = upgrade_with_a_late_state("activating")?;
+        assert!(
+            error
+                .to_string()
+                .starts_with("Omabox was upgraded. The service remains enabled and starting."),
+            "upgrade reported {error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn finish_failure_after_uninstall_reports_the_removal() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new("failed", true, false, false)?;
+        fixture.old_install()?;
+        fail_finish_on(&fixture, &["failed"], "daemon-reload")?;
+
+        let result = execute_with(
+            InstallAction::Uninstall,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        let error = match result {
+            Err(error @ InstallError::CleanupAfterChange { .. }) => error,
+            other => return Err(io::Error::other(format!("unexpected result: {other:?}")).into()),
+        };
+        assert!(
+            error.to_string().starts_with(
+                "Omabox program, service, and plugin files were removed. Configuration, the journal, recovery data, Secret Service credentials, and synced files were retained."
+            ),
+            "uninstall reported {error}"
+        );
+        for path in [
+            &fixture.layout.omabox,
+            &fixture.layout.omaboxd,
+            &fixture.layout.unit,
+            &fixture.layout.plugin,
+        ] {
+            assert!(!path.exists());
+        }
+        assert_eq!(
+            fs::read_to_string(&fixture.systemctl_log)?,
+            "is-enabled\nshow\nshow\nreset-failed\ndisable\ndaemon-reload\n"
         );
         Ok(())
     }
@@ -3171,6 +3393,8 @@ mod tests {
     fn upgrade_settles_a_stopping_service() -> Result<(), Box<dyn Error>> {
         let fixture = Fixture::new("deactivating", true, false, false)?;
         fixture.old_install()?;
+        // The lifecycle's read and Recover's first look see it stopping; the stop leaves it inactive.
+        answer_show(&fixture, &["deactivating", "deactivating", "inactive"], "")?;
         let report = execute_with(
             InstallAction::Upgrade,
             &fixture.layout,
@@ -3352,7 +3576,7 @@ mod tests {
                 source: ServiceError::Terminated { command: "command" },
             },
             InstallError::CleanupAfterChange {
-                done: "upgraded",
+                report: String::from("Omabox was upgraded."),
                 source: inner(),
             },
             InstallError::RollbackFailed {
