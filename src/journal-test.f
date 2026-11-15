@@ -7,9 +7,10 @@
 \ cursor, baselines, baseline paths, pending and blocked plans, pending
 \ upload content, conflicts and pending and completed recoveries, each in
 \ the line's own form; a file of other bytes refused as corrupt by both
-\ opens, unchanged; and fifty-one tests of the Rust version (rust
-\ src/journal.rs) under their names, which build each decision the Rust
-\ ones ask the planner for as src/oracle/plan.tsv holds it. Habu opens no
+\ opens, unchanged; and fifty-one tests of the Rust version's
+\ src/journal.rs and two of its src/daemon.rs under their names, which
+\ build each decision the Rust ones ask the planner for as
+\ src/oracle/plan.tsv holds it. Habu opens no
 \ schema-6 file, so the version-six tests start from a schema-8 journal
 \ holding the row migration 7 leaves for a schema-6 root, birth and
 \ subvolume NULL, and the baseline the Rust tests' version_six_with_root
@@ -3013,6 +3014,7 @@ variable CRAFT
    b 1 JOURNAL-LOCAL--ROOT--RECORD:MAKE {: first :}
    u b ar ACTIVATE-LOCAL-ROOT first ACTIVATED? TTRUE
    u ar PENDING-PLANS VEC:COUNT 0 T=
+   u LIVE-PLAN-ROWS 0 T=
    u CLOSE ;
 
 : LOCAL-ROOT-ACTIVATION-RETIRES-WORK-FROM-A-PRIOR-OR-UNBOUND-ROOT
@@ -3032,6 +3034,7 @@ variable CRAFT
    j replacement ar ACTIVATE-LOCAL-ROOT record ACTIVATED? TTRUE
    j ar LOCAL-ROOT-BINDING record RECORD-HELD? TTRUE
    j ar ROOT-WORK-RETIRED
+   j LIVE-PLAN-ROWS 0 T=
    rp sp ar PAYLOADS-KEPT
    j CLOSE
    d replacement ar UNBOUND-RETIRED

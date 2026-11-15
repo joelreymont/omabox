@@ -212,32 +212,15 @@ $2E constant DOT
 \ The bytes a component adds after `len`.
 : ADD-SIZE ( n bool ^u8 n -- n )
    {: len:n root:bool p:^ u:n :}
-   p u PART? 0= if len exit then
    len len root SEP? if 1+ then
    p u LOWERED-BYTES + ;
 
 \ Writes a component after `len` of `size` bytes at `dst`.
 : ADD-BYTES ( n bool ^u8 n ^u8 n -- n )
    {: len:n root:bool p:^ u:n dst:^ size:n :}
-   p u PART? 0= if len exit then
    len root SEP? if SLASH dst len + c! len 1+ else len then
    {: at:n :}
    p u dst at + size at - LOWER-INTO at + ;
-
-\ Runs ADD on the component at `at`; false past the last.
-: STEP ( ^u8 n bool n n [ n bool ^u8 n -- n ] -- n n bool )
-   {: p:^ u:n root:bool len:n at:n add :}
-   p u SLASH at SPLIT-NEXT 0= if 2drop drop len at false exit then
-   {: next:n :}
-   len root 2swap add execute next true ;
-
-\ Runs ADD over every component, from the lead's bytes on.
-: PARTS ( ^u8 n [ n bool ^u8 n -- n ] -- n )
-   {: p:^ u:n add :}
-   p u ROOT? {: root:bool :}
-   p u LEAD 0
-   begin 2>r p u root 2r> add STEP 0= until
-   drop ;
 
 \ The component from `at` that PART? accepts and the index after it;
 \ false past the last.
@@ -248,12 +231,27 @@ $2E constant DOT
    q v PART? if q v next true exit then
    p u next RECURSE ;
 
+\ Runs ADD on the next component from `at`; false past the last.
+: STEP ( ^u8 n bool n n [ n bool ^u8 n -- n ] -- n n bool )
+   {: p:^ u:n root:bool len:n at:n add :}
+   p u at NEXT-PART 0= if 2drop drop len at false exit then
+   {: next:n :}
+   len root 2swap add execute next true ;
+
+\ Runs ADD over every component PART? accepts, from the lead's
+\ bytes on.
+: PARTS ( ^u8 n [ n bool ^u8 n -- n ] -- n )
+   {: p:^ u:n add :}
+   p u ROOT? {: root:bool :}
+   p u LEAD 0
+   begin 2>r p u root 2r> add STEP 0= until
+   drop ;
+
 \ For PARTS over q: the index in p after p's next component when that is
 \ q's component, else -1, which every later component keeps.
 : MATCH-PART ( n bool ^u8 n ^u8 n -- n )
    {: at:n root:bool q:^ v:n p:^ u:n :}
    at 0 < if -1 exit then
-   q v PART? 0= if at exit then
    p u at NEXT-PART 0= if 2drop drop -1 exit then
    {: a:^ au:n next:n :}
    a au q v STR= if next exit then

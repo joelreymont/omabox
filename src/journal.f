@@ -2470,7 +2470,7 @@ STRUCTURE operation-state
 
 : DECODE-CONFLICT ( str MODEL:path ^ARENA:arena -- MODEL:conflict )
    {: json:str path ar :}
-   s" " >str DROPBOX:>HASH MODEL-LOCAL:MAKE MODEL-CONFLICT:remote-deleted
+   MODEL:NO-HASH MODEL-LOCAL:MAKE MODEL-CONFLICT:remote-deleted
    [: DROP-CONFLICT json ar MODEL:JSON>CONFLICT ;]
    s" deserialize conflict" >str path MODEL:PATH>STR DECODE ;
 
