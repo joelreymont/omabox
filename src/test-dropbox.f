@@ -100,29 +100,29 @@ TYPED-VARIABLE TOKEN-CUTTING bool
 
 
 \ Copies a span into a buffer of cap bytes and answers its length.
-: STORE ( ptr u8 n ptr u8 n -- n )
-   {: a:ptr u:n dst:ptr cap:n :}
+: STORE ( ^u8 n ^u8 n -- n )
+   {: a:^ u:n dst:^ cap:n :}
    a u dst cap SPAN:MAKE SPAN:COPY u ;
 
 
-: AT ( ptr u8 n n -- ptr u8 n )
-   {: base:ptr cap:n i:n :}
+: AT ( ^u8 n n -- ^u8 n )
+   {: base:^ cap:n i:n :}
    base i cap * + cap ;
 
 
-: KEY$ ( -- ptr u8 n ) KEY KEY-U @ ;
-: REFRESH$ ( -- ptr u8 n ) REFRESH REFRESH-U @ ;
-: ROOT$ ( -- ptr u8 n ) ROOT ROOT-U @ ;
-: OUT$ ( -- ptr u8 n ) OUT OUT-U @ ;
-: PATH$ ( n -- ptr u8 n ) {: i:n :} PATHS i PATH-CAP * + i PATH-US @ ;
-: ENTRY$ ( n -- ptr u8 n ) {: i:n :} ENTRIES i TEXT-CAP * + i ENTRY-US @ ;
-: NAME$ ( n -- ptr u8 n ) {: i:n :} NAMES i NAME-CAP * + i NAME-US @ ;
-: VALUE$ ( n -- ptr u8 n ) {: i:n :} VALUES i NAME-CAP * + i VALUE-US @ ;
-: BODY$ ( n -- ptr u8 n ) {: i:n :} BODIES i TEXT-CAP * + i BODY-US @ ;
+: KEY$ ( -- ^u8 n ) KEY KEY-U @ ;
+: REFRESH$ ( -- ^u8 n ) REFRESH REFRESH-U @ ;
+: ROOT$ ( -- ^u8 n ) ROOT ROOT-U @ ;
+: OUT$ ( -- ^u8 n ) OUT OUT-U @ ;
+: PATH$ ( n -- ^u8 n ) {: i:n :} PATHS i PATH-CAP * + i PATH-US @ ;
+: ENTRY$ ( n -- ^u8 n ) {: i:n :} ENTRIES i TEXT-CAP * + i ENTRY-US @ ;
+: NAME$ ( n -- ^u8 n ) {: i:n :} NAMES i NAME-CAP * + i NAME-US @ ;
+: VALUE$ ( n -- ^u8 n ) {: i:n :} VALUES i NAME-CAP * + i VALUE-US @ ;
+: BODY$ ( n -- ^u8 n ) {: i:n :} BODIES i TEXT-CAP * + i BODY-US @ ;
 
 
 \ The builder's text into OUT, which outlives the handler.
-: BUILT ( -- ptr u8 n )
+: BUILT ( -- ^u8 n )
    SB$ OUT TEXT-CAP STORE OUT-U !
    OUT$ ;
 
@@ -133,28 +133,28 @@ TYPED-VARIABLE TOKEN-CUTTING bool
    {: i:n :}
    i FOLDERS @ if S\" {\q.tag\q:\qfolder\q," else S\" {\q.tag\q:\qfile\q," then
    SB-APPEND
-   i ENTRY$ {: e:ptr eu:n :}
+   i ENTRY$ {: e:^ eu:n :}
    e 1 + eu 1 - SB-APPEND ;
 
 
-: TAGGED$ ( n -- ptr u8 n ) SB-RESET TAGGED+ BUILT ;
+: TAGGED$ ( n -- ^u8 n ) SB-RESET TAGGED+ BUILT ;
 
 
-: ANSWER! ( HTTP:response ptr u8 n -- )
-   {: a:HTTP:response b:ptr bu:n :}
+: ANSWER! ( HTTP:response ^u8 n -- )
+   {: a:HTTP:response b:^ bu:n :}
    a s" Content-Type" s" application/json" HTTP:HEADER!
    a b bu HTTP:BODY! ;
 
 
 \ ---- what was sent
 
-: SEEN+ ( ptr u8 n -- )
-   {: a:ptr u:n :}
+: SEEN+ ( ^u8 n -- )
+   {: a:^ u:n :}
    a u SEEN SEEN-U @ + TEXT-CAP SEEN-U @ - STORE SEEN-U +! ;
 
 
-: SENT ( HTTP:request ptr u8 n ptr u8 n -- n bool )
-   {: q:HTTP:request nm:ptr nu:n dst:ptr cap:n :}
+: SENT ( HTTP:request ^u8 n ^u8 n -- n bool )
+   {: q:HTTP:request nm:^ nu:n dst:^ cap:n :}
    q nm nu HTTP:HEADER-OF$ if dst cap STORE true exit then
    2drop 0 false ;
 
@@ -213,8 +213,8 @@ variable FORM-AT
 
 \ The byte a %XX at the offset names and the offset after it; -1 for a
 \ malformed escape.
-: ESCAPED ( ptr u8 n n -- n n )
-   {: a:ptr u:n at:n :}
+: ESCAPED ( ^u8 n n -- n n )
+   {: a:^ u:n at:n :}
    at 3 + u > if -1 u exit then
    a at 1+ + c@ a at 2 + + c@ {: h:n l:n :}
    h STR-HEX-DIGIT? l STR-HEX-DIGIT? and 0= if -1 u exit then
@@ -223,8 +223,8 @@ variable FORM-AT
 
 \ The byte at the offset, decoded, and the offset after it; -1 for one
 \ the form may not carry.
-: FORM-BYTE ( ptr u8 n n -- n n )
-   {: a:ptr u:n at:n :}
+: FORM-BYTE ( ^u8 n n -- n n )
+   {: a:^ u:n at:n :}
    a at + c@ {: b:n :}
    b 43 = if 32 at 1+ exit then
    b 37 = if a u at ESCAPED exit then
@@ -240,8 +240,8 @@ variable FORM-AT
 
 \ One step from FORM-AT: a separator as a NUL, else a decoded byte, which
 \ may not be a NUL; false when the form is malformed.
-: FORM-STEP ( ptr u8 n n -- bool )
-   {: a:ptr u:n at:n :}
+: FORM-STEP ( ^u8 n n -- bool )
+   {: a:^ u:n at:n :}
    a at + c@ {: b:n :}
    b 38 = b 61 = or if at 1+ FORM-AT ! 0 KEPT exit then
    a u at FORM-BYTE FORM-AT ! {: d:n :}
@@ -251,8 +251,8 @@ variable FORM-AT
 
 \ A form body's names and values as DECODED holds them; empty when it is
 \ malformed.
-: FIELDS$ ( ptr u8 n -- ptr u8 n )
-   {: a:ptr u:n :}
+: FIELDS$ ( ^u8 n -- ^u8 n )
+   {: a:^ u:n :}
    0 DECODED-U ! 0 FORM-AT !
    begin FORM-AT @ u < while
       a u FORM-AT @ FORM-STEP 0= if DECODED 0 exit then
@@ -261,11 +261,11 @@ variable FORM-AT
    DECODED DECODED-U @ ;
 
 
-: FIELD+ ( ptr u8 n -- ) SB-APPEND 0 SB-APPEND-C ;
+: FIELD+ ( ^u8 n -- ) SB-APPEND 0 SB-APPEND-C ;
 
 
 \ The refresh form's names and values, as FIELDS$ decodes them.
-: FORM$ ( -- ptr u8 n )
+: FORM$ ( -- ^u8 n )
    SB-RESET
    s" grant_type" FIELD+ s" refresh_token" FIELD+
    s" refresh_token" FIELD+ REFRESH$ FIELD+
@@ -294,8 +294,8 @@ variable FORM-AT
 
 \ ---- calls
 
-: UNAUTHORIZED! ( HTTP:response ptr u8 n -- )
-   {: a:HTTP:response t:ptr tu:n :}
+: UNAUTHORIZED! ( HTTP:response ^u8 n -- )
+   {: a:HTTP:response t:^ tu:n :}
    a 401 HTTP:STATUS!
    SB-RESET S\" {\qerror_summary\q:\q" SB-APPEND t tu SB-APPEND
    S\" /...\q,\qerror\q:{\q.tag\q:\q" SB-APPEND t tu SB-APPEND
@@ -304,8 +304,8 @@ variable FORM-AT
 
 
 \ The number of an issued token in an Authorization value, else -1.
-: TOKEN-NUMBER ( ptr u8 n -- n )
-   {: t:ptr tu:n :}
+: TOKEN-NUMBER ( ^u8 n -- n )
+   {: t:^ tu:n :}
    s" Bearer sl.fake-" nip {: pu:n :}
    tu pu <= if -1 exit then
    t pu s" Bearer sl.fake-" STR= 0= if -1 exit then
@@ -326,14 +326,14 @@ variable FORM-AT
    true ;
 
 
-: ROOT-LINE$ ( -- ptr u8 n )
+: ROOT-LINE$ ( -- ^u8 n )
    SB-RESET S\" {\q.tag\q:\qroot\q,\qroot\q:\q" SB-APPEND ROOT$ SB-APPEND
    S\" \q}" SB-APPEND SB$ ;
 
 
 : ROOT-OK? ( HTTP:request -- bool )
    {: q:HTTP:request :}
-   q s" Dropbox-API-Path-Root" HTTP:HEADER-OF$ {: v:ptr vu:n sent:bool :}
+   q s" Dropbox-API-Path-Root" HTTP:HEADER-OF$ {: v:^ vu:n sent:bool :}
    ROOT-U @ 0= if sent 0= exit then
    sent if v vu ROOT-LINE$ STR= else false then ;
 
@@ -408,7 +408,7 @@ variable HELD-U
 
 
 \ The code grant's names and values, as FIELDS$ decodes them.
-: CODE-FORM$ ( -- ptr u8 n )
+: CODE-FORM$ ( -- ^u8 n )
    SB-RESET
    s" grant_type" FIELD+ s" authorization_code" FIELD+
    s" code" FIELD+ GRANT-CODE GRANT-CODE-U @ FIELD+
@@ -444,7 +444,7 @@ variable HELD-U
 
 
 \ The rev of entry i, empty for a folder.
-: HELD$ ( n -- ptr u8 n )
+: HELD$ ( n -- ^u8 n )
    {: i:n :}
    0 HELD-U !
    PARSER i ENTRY$ JSON:READ-INIT
@@ -467,14 +467,14 @@ variable HELD-U
 
 \ Appends a span to entry i in its slot, so no argument shares a buffer
 \ with it.
-: ENTRY+ ( ptr u8 n n -- )
-   {: a:ptr u:n i:n :}
+: ENTRY+ ( ^u8 n n -- )
+   {: a:^ u:n i:n :}
    a u i ENTRY$ + TEXT-CAP i ENTRY-US @ - STORE i ENTRY-US +! ;
 
 
 \ A folder at the path, which serves as path_lower and path_display.
-: FOLDER+ ( ptr u8 n -- )
-   {: p:ptr pu:n :}
+: FOLDER+ ( ^u8 n -- )
+   {: p:^ pu:n :}
    FILES @ {: i:n :}
    p pu PATHS PATH-CAP i AT STORE i PATH-US !
    0 i ENTRY-US ! S\" {\qname\q:\qa\q,\qid\q:\qid:a\q" i ENTRY+
@@ -498,8 +498,8 @@ variable HELD-U
    a BUILT ANSWER! ;
 
 
-: REFUSED! ( HTTP:response ptr u8 n -- )
-   {: a:HTTP:response b:ptr bu:n :}
+: REFUSED! ( HTTP:response ^u8 n -- )
+   {: a:HTTP:response b:^ bu:n :}
    a 409 HTTP:STATUS!
    a b bu ANSWER! ;
 
@@ -606,8 +606,8 @@ variable HELD-U
 
 \ A file's FileMetadata after its `{`, appended to entry i: path_lower,
 \ path_display, rev, content_hash and size.
-: FIELDS+ ( ptr u8 n ptr u8 n ptr u8 n ptr u8 n n n -- )
-   {: l:ptr lu:n d:ptr du:n r:ptr ru:n h:ptr hu:n size:n i:n :}
+: FIELDS+ ( ^u8 n ^u8 n ^u8 n ^u8 n n n -- )
+   {: l:^ lu:n d:^ du:n r:^ ru:n h:^ hu:n size:n i:n :}
    S\" \qname\q:\qa\q,\qid\q:\qid:a\q,\qpath_lower\q:\q" i ENTRY+
    l lu i ENTRY+ S\" \q,\qpath_display\q:\q" i ENTRY+ d du i ENTRY+
    S\" \q,\qrev\q:\q" i ENTRY+ r ru i ENTRY+
@@ -617,8 +617,8 @@ variable HELD-U
 
 
 \ The file get_metadata finds in slot i.
-: FILE-AT! ( ptr u8 n ptr u8 n ptr u8 n ptr u8 n n n -- )
-   {: l:ptr lu:n d:ptr du:n r:ptr ru:n h:ptr hu:n size:n i:n :}
+: FILE-AT! ( ^u8 n ^u8 n ^u8 n ^u8 n n n -- )
+   {: l:^ lu:n d:^ du:n r:^ ru:n h:^ hu:n size:n i:n :}
    l lu PATHS PATH-CAP i AT STORE i PATH-US !
    0 i ENTRY-US ! s" {" i ENTRY+
    l lu d du r ru h hu size i FIELDS+
@@ -640,11 +640,11 @@ create ARGS TEXT-CAP allot
 variable ARGS-U
 
 
-: PAGE$ ( n -- ptr u8 n ) {: i:n :} PAGES i TEXT-CAP * + i PAGE-US @ ;
+: PAGE$ ( n -- ^u8 n ) {: i:n :} PAGES i TEXT-CAP * + i PAGE-US @ ;
 
 
-: ARG+ ( ptr u8 n -- )
-   {: a:ptr u:n :}
+: ARG+ ( ^u8 n -- )
+   {: a:^ u:n :}
    a u ARGS ARGS-U @ + TEXT-CAP ARGS-U @ - STORE ARGS-U +! ;
 
 
@@ -682,8 +682,8 @@ variable ARGS-U
    0 PAGE-COUNT ! 0 PAGE-SERVED ! 0 POLLED-U ! 0 ARGS-U ! ;
 
 
-: QUEUE ( n ptr u8 n -- )
-   {: s:n b:ptr bu:n :}
+: QUEUE ( n ^u8 n -- )
+   {: s:n b:^ bu:n :}
    PAGE-COUNT @ {: i:n :}
    s i PAGE-STATUSES !
    b bu PAGES TEXT-CAP i AT STORE i PAGE-US !
@@ -720,15 +720,15 @@ variable RANGE-SENT-U
 TYPED-VARIABLE RANGED bool
 
 
-: CONTENT-REV$ ( n -- ptr u8 n )
+: CONTENT-REV$ ( n -- ^u8 n )
    {: i:n :} CONTENT-REVS NAME-CAP i AT drop i CONTENT-REV-US @ ;
-: CONTENT$ ( n -- ptr u8 n )
+: CONTENT$ ( n -- ^u8 n )
    {: i:n :} CONTENT-BYTES TEXT-CAP i AT drop i CONTENT-US @ ;
 
 
 \ The slot holding the rev's bytes, else -1.
-: CONTENT-OF ( ptr u8 n -- n )
-   {: r:ptr ru:n :}
+: CONTENT-OF ( ^u8 n -- n )
+   {: r:^ ru:n :}
    CONTENTS @ 0 ?do
       i CONTENT-REV$ r ru STR= if i unloop exit then
    loop -1 ;
@@ -738,7 +738,7 @@ TYPED-VARIABLE RANGED bool
 \ empty when it names no rev.
 : REV-ASK ( HTTP:request -- )
    {: q:HTTP:request :}
-   q s" Dropbox-API-Arg" HTTP:HEADER-OF$ {: v:ptr vu:n sent:bool :}
+   q s" Dropbox-API-Arg" HTTP:HEADER-OF$ {: v:^ vu:n sent:bool :}
    v vu ARG-SENT TEXT-CAP STORE ARG-SENT-U !
    0 ASKED-U !
    sent if
@@ -752,15 +752,15 @@ TYPED-VARIABLE RANGED bool
    then ;
 
 
-: REV$ ( -- ptr u8 n )
+: REV$ ( -- ^u8 n )
    ASKED-U @ 4 <= if ASKED 0 exit then
    ASKED 4 s" rev:" STR= 0= if ASKED 0 exit then
    ASKED 4 + ASKED-U @ 4 - ;
 
 
 \ An entry's rev into REV-SEEN.
-: ENTRY-REV ( ptr u8 n -- ptr u8 n )
-   {: e:ptr eu:n :}
+: ENTRY-REV ( ^u8 n -- ^u8 n )
+   {: e:^ eu:n :}
    0 REV-SEEN-U !
    PARSER e eu JSON:READ-INIT
    JSON:READ-NEXT JSON:T-OBJ = if
@@ -773,8 +773,8 @@ TYPED-VARIABLE RANGED bool
 
 
 \ The FILE! slot whose entry has the rev, else -1.
-: FILE-OF ( ptr u8 n -- n )
-   {: r:ptr ru:n :}
+: FILE-OF ( ^u8 n -- n )
+   {: r:^ ru:n :}
    FILES @ 0 ?do
       i ENTRY$ ENTRY-REV r ru STR= if i unloop exit then
    loop -1 ;
@@ -783,7 +783,7 @@ TYPED-VARIABLE RANGED bool
 \ The offset a Range bytes=<n>- names, 0 for none, -1 for another form.
 : RANGE-OF ( HTTP:request -- n )
    {: q:HTTP:request :}
-   q s" Range" HTTP:HEADER-OF$ {: v:ptr vu:n sent:bool :}
+   q s" Range" HTTP:HEADER-OF$ {: v:^ vu:n sent:bool :}
    sent RANGED !
    v vu RANGE-SENT NAME-CAP STORE RANGE-SENT-U !
    sent 0= if 0 exit then
@@ -803,7 +803,7 @@ TYPED-VARIABLE RANGED bool
 
 
 \ bytes <from>-<size-1>/<size>, from shifted by one once when skewed.
-: CONTENT-RANGE$ ( n n -- ptr u8 n )
+: CONTENT-RANGE$ ( n n -- ^u8 n )
    {: from:n size:n :}
    SKEWED @ if from 1+ else from then {: shown:n :}
    false SKEWED !
@@ -821,7 +821,7 @@ TYPED-VARIABLE RANGED bool
 \ The file in slot i with the bytes in slot k, from the offset.
 : FILE-SENT ( HTTP:response n n n -- )
    {: a:HTTP:response i:n k:n from:n :}
-   k CONTENT$ {: b:ptr size:n :}
+   k CONTENT$ {: b:^ size:n :}
    from size >= from 0 > and if a size UNSATISFIABLE! exit then
    a s" Dropbox-API-Result" i ENTRY$ HTTP:HEADER!
    a s" Content-Type" s" application/octet-stream" HTTP:HEADER!
@@ -836,7 +836,7 @@ TYPED-VARIABLE RANGED bool
 
 
 \ The rev the next download answers: a MISFILE's once, else the one asked.
-: SERVED-REV$ ( -- ptr u8 n )
+: SERVED-REV$ ( -- ^u8 n )
    MISFILED-U @ 0= if REV$ exit then
    MISFILED MISFILED-U @ 0 MISFILED-U ! ;
 
@@ -857,7 +857,7 @@ TYPED-VARIABLE RANGED bool
 : BROKEN ( HTTP:request n n n -- )
    {: q:HTTP:request i:n k:n from:n :}
    false BREAKING !
-   k CONTENT$ {: b:ptr size:n :}
+   k CONTENT$ {: b:^ size:n :}
    q HTTP:BODY$ 2drop
    q HTTP:TAKE-OVER 2drop {: conn:TCP4:connection :}
    SB-RESET S\" HTTP/1.1 200 OK\r\nDropbox-API-Result: " SB-APPEND
@@ -873,7 +873,7 @@ TYPED-VARIABLE RANGED bool
    q a ADMITTED? 0= if exit then
    q RANGE-OF SERVED-AT {: from:n :}
    q REV-ASK
-   SERVED-REV$ {: r:ptr ru:n :}
+   SERVED-REV$ {: r:^ ru:n :}
    r ru FILE-OF r ru CONTENT-OF {: i:n k:n :}
    i 0< k 0< or if a NOT-FOUND! exit then
    from 0< if a 400 HTTP:STATUS! a s" bad range" HTTP:BODY! exit then
@@ -912,16 +912,16 @@ SLOTS TYPED-BUFFER SESSION-OPEN bool
 variable SESSIONS
 
 
-: ARG-PATH$ ( -- ptr u8 n ) ARG-PATH ARG-PATH-U @ ;
-: ARG-MODE$ ( -- ptr u8 n ) ARG-MODE ARG-MODE-U @ ;
-: ARG-REV$ ( -- ptr u8 n ) ARG-REV ARG-REV-U @ ;
-: ARG-HASH$ ( -- ptr u8 n ) ARG-HASH ARG-HASH-U @ ;
-: REV-NEW$ ( -- ptr u8 n ) REV-NEW REV-NEW-U @ ;
+: ARG-PATH$ ( -- ^u8 n ) ARG-PATH ARG-PATH-U @ ;
+: ARG-MODE$ ( -- ^u8 n ) ARG-MODE ARG-MODE-U @ ;
+: ARG-REV$ ( -- ^u8 n ) ARG-REV ARG-REV-U @ ;
+: ARG-HASH$ ( -- ^u8 n ) ARG-HASH ARG-HASH-U @ ;
+: REV-NEW$ ( -- ^u8 n ) REV-NEW REV-NEW-U @ ;
 
 
 \ A string member's value into the ARG- field its key names.
 : ARG-STRING ( JSON:reader -- JSON:reader )
-   ARG-KEY ARG-KEY-U @ {: k:ptr ku:n :}
+   ARG-KEY ARG-KEY-U @ {: k:^ ku:n :}
    k ku s" path" STR= if ARG-PATH PATH-CAP JSON:READ-STR ARG-PATH-U ! exit then
    k ku s" mode" STR= k ku s" .tag" STR= or
    if ARG-MODE NAME-CAP JSON:READ-STR ARG-MODE-U ! exit then
@@ -954,7 +954,7 @@ variable SESSIONS
    {: q:HTTP:request :}
    0 ARG-PATH-U ! 0 ARG-MODE-U ! 0 ARG-REV-U ! 0 ARG-HASH-U !
    0 ARG-SESSION-U ! -1 ARG-OFFSET !
-   q s" Dropbox-API-Arg" HTTP:HEADER-OF$ {: v:ptr vu:n sent:bool :}
+   q s" Dropbox-API-Arg" HTTP:HEADER-OF$ {: v:^ vu:n sent:bool :}
    v vu ARG-SENT TEXT-CAP STORE ARG-SENT-U !
    sent 0= if exit then
    PARSER v vu JSON:READ-INIT
@@ -962,7 +962,7 @@ variable SESSIONS
    JSON:READ-FINISH ;
 
 
-: LOWERED$ ( -- ptr u8 n )
+: LOWERED$ ( -- ^u8 n )
    ARG-PATH-U @ 0 ?do ARG-PATH i + c@ ASCII-LOWER LOWERED i + c! loop
    LOWERED ARG-PATH-U @ ;
 
@@ -994,8 +994,8 @@ variable SESSIONS
 
 \ Commits the argument's path with the hash and size as its mode allows,
 \ and answers the FileMetadata, which carries no `.tag`.
-: COMMIT ( HTTP:response ptr u8 n n bool -- )
-   {: a:HTTP:response h:ptr hu:n size:n single:bool :}
+: COMMIT ( HTTP:response ^u8 n n bool -- )
+   {: a:HTTP:response h:^ hu:n size:n single:bool :}
    LOWERED$ ASKED PATH-CAP STORE ASKED-U !
    FOUND {: i:n :}
    i TAKES? 0= if a single CONFLICT! exit then
@@ -1009,10 +1009,10 @@ variable SESSIONS
    {: q:HTTP:request a:HTTP:response :}
    q a ADMITTED? 0= if exit then
    q ARG-READ
-   q HTTP:BODY$ {: b:ptr bu:n :}
+   q HTTP:BODY$ {: b:^ bu:n :}
    BODY-HASHER DROPBOX:HASH-BEGIN
    b bu BODY-HASHER DROPBOX:HASH-FEED
-   BODY-HASHER DROPBOX:HASH-END {: h:ptr hu:n :}
+   BODY-HASHER DROPBOX:HASH-END {: h:^ hu:n :}
    h hu ARG-HASH$ STR= 0= if
       a 409 HTTP:STATUS!
       a S\" {\qerror_summary\q:\qcontent_hash_mismatch/...\q,\qerror\q:{\q.tag\q:\qcontent_hash_mismatch\q}}" ANSWER!
@@ -1047,8 +1047,8 @@ variable SESSIONS
 
 \ A session lookup's error, inside lookup_failed for a finish; offset is
 \ incorrect_offset's correct_offset.
-: LOOKUP! ( HTTP:response ptr u8 n n bool -- )
-   {: a:HTTP:response t:ptr tu:n at:n finish:bool :}
+: LOOKUP! ( HTTP:response ^u8 n n bool -- )
+   {: a:HTTP:response t:^ tu:n at:n finish:bool :}
    a 409 HTTP:STATUS!
    SB-RESET S\" {\qerror_summary\q:\q" SB-APPEND t tu SB-APPEND
    S\" /...\q,\qerror\q:" SB-APPEND
@@ -1078,7 +1078,7 @@ variable SESSIONS
    {: q:HTTP:request a:HTTP:response :}
    q a ADMITTED? 0= if exit then
    q ARG-READ
-   q HTTP:BODY$ {: b:ptr bu:n :}
+   q HTTP:BODY$ {: b:^ bu:n :}
    a false SESSION-CHECK {: i:n :}
    i 0< if exit then
    b bu i SESSION-HASHERS DROPBOX:HASH-FEED
@@ -1094,7 +1094,7 @@ variable SESSIONS
    a true SESSION-CHECK {: i:n :}
    i 0< if exit then
    false i SESSION-OPEN !
-   i SESSION-HASHERS DROPBOX:HASH-END {: h:ptr hu:n :}
+   i SESSION-HASHERS DROPBOX:HASH-END {: h:^ hu:n :}
    a h hu i SESSION-ATS @ false COMMIT ;
 
 
@@ -1137,7 +1137,7 @@ $2100000 constant UPLOAD-CAP
 
 
 \ The server's origin, http://127.0.0.1:<port>.
-: ORIGIN$ ( -- ptr u8 n ) ORIGIN ORIGIN-U @ ;
+: ORIGIN$ ( -- ^u8 n ) ORIGIN ORIGIN-U @ ;
 
 
 \ Forgets the script, the entries, the kept bytes, the pages, the long
@@ -1157,14 +1157,14 @@ $2100000 constant UPLOAD-CAP
 
 
 \ The app key and refresh token the token route accepts.
-: ACCEPT! ( ptr u8 n ptr u8 n -- )
-   {: k:ptr ku:n t:ptr tu:n :}
+: ACCEPT! ( ^u8 n ^u8 n -- )
+   {: k:^ ku:n t:^ tu:n :}
    k ku KEY NAME-CAP STORE KEY-U !
    t tu REFRESH NAME-CAP STORE REFRESH-U ! ;
 
 
 \ The root every call's Path-Root names; empty means none is sent.
-: ROOT! ( ptr u8 n -- ) ROOT NAME-CAP STORE ROOT-U ! ;
+: ROOT! ( ^u8 n -- ) ROOT NAME-CAP STORE ROOT-U ! ;
 
 
 \ Expires every access token issued so far.
@@ -1186,14 +1186,14 @@ $2100000 constant UPLOAD-CAP
 
 \ A file get_metadata finds: path_lower, path_display, rev, content_hash and
 \ size.
-: FILE! ( ptr u8 n ptr u8 n ptr u8 n ptr u8 n n -- )
+: FILE! ( ^u8 n ^u8 n ^u8 n ^u8 n n -- )
    FILES @ FILE-AT! 1 FILES +! ;
 
 
 \ An answer an API call gets before its route's own: status, one header
 \ (an empty name for none) and a body. A token request leaves it queued.
-: SCRIPT! ( n ptr u8 n ptr u8 n ptr u8 n -- )
-   {: s:n nm:ptr nu:n v:ptr vu:n b:ptr bu:n :}
+: SCRIPT! ( n ^u8 n ^u8 n ^u8 n -- )
+   {: s:n nm:^ nu:n v:^ vu:n b:^ bu:n :}
    SCRIPTS @ {: i:n :}
    s i STATUSES !
    nm nu NAMES NAME-CAP i AT STORE i NAME-US !
@@ -1203,16 +1203,16 @@ $2100000 constant UPLOAD-CAP
 
 
 \ The paths requested since RESET, joined by spaces.
-: SEEN$ ( -- ptr u8 n ) SEEN SEEN-U @ ;
+: SEEN$ ( -- ^u8 n ) SEEN SEEN-U @ ;
 \ The last API call's Authorization value.
-: AUTH$ ( -- ptr u8 n ) AUTH AUTH-U @ ;
+: AUTH$ ( -- ^u8 n ) AUTH AUTH-U @ ;
 \ The access token the fake issued last.
-: ISSUED$ ( -- ptr u8 n ) ISSUED ISSUED-U @ ;
+: ISSUED$ ( -- ^u8 n ) ISSUED ISSUED-U @ ;
 \ The last API call's Path-Root value, and whether it sent one.
-: ROOT-SENT$ ( -- ptr u8 n ) ROOT-SENT ROOT-SENT-U @ ;
+: ROOT-SENT$ ( -- ^u8 n ) ROOT-SENT ROOT-SENT-U @ ;
 : ROOT-SENT? ( -- bool ) ROOTED @ ;
 \ The last API call's Content-Type value, and whether it sent one.
-: TYPE-SENT$ ( -- ptr u8 n ) TYPE-SENT TYPE-SENT-U @ ;
+: TYPE-SENT$ ( -- ^u8 n ) TYPE-SENT TYPE-SENT-U @ ;
 : TYPE-SENT? ( -- bool ) TYPED @ ;
 \ Whether a token request or long poll since RESET carried Authorization or
 \ Path-Root.
@@ -1223,8 +1223,8 @@ $2100000 constant UPLOAD-CAP
 
 \ A page the listing routes answer in turn: the entries array's JSON, the
 \ cursor and has_more.
-: PAGE! ( ptr u8 n ptr u8 n bool -- )
-   {: e:ptr eu:n k:ptr ku:n more:bool :}
+: PAGE! ( ^u8 n ^u8 n bool -- )
+   {: e:^ eu:n k:^ ku:n more:bool :}
    SB-RESET S\" {\qentries\q:" SB-APPEND e eu SB-APPEND
    S\" ,\qcursor\q:\q" SB-APPEND k ku SB-APPEND
    S\" \q,\qhas_more\q:" SB-APPEND more BOOL+
@@ -1248,15 +1248,15 @@ $2100000 constant UPLOAD-CAP
 
 \ The bodies of the listing calls and long polls since RESET, joined by
 \ spaces.
-: ARGS$ ( -- ptr u8 n ) ARGS ARGS-U @ ;
+: ARGS$ ( -- ^u8 n ) ARGS ARGS-U @ ;
 
 
 \ ---- files/download
 
 \ The bytes files/download serves for a FILE!'s rev, which replace any kept
 \ for it; the size FILE! was given must be their length.
-: CONTENT! ( ptr u8 n ptr u8 n -- )
-   {: r:ptr ru:n b:ptr bu:n :}
+: CONTENT! ( ^u8 n ^u8 n -- )
+   {: r:^ ru:n b:^ bu:n :}
    r ru CONTENT-OF {: k:n :}
    k 0< if CONTENTS @ 1 CONTENTS +! else k then {: j:n :}
    r ru CONTENT-REVS NAME-CAP j AT STORE j CONTENT-REV-US !
@@ -1266,7 +1266,7 @@ $2100000 constant UPLOAD-CAP
 \ Shifts the next download's Content-Range start by one.
 : SKEW ( -- ) true SKEWED ! ;
 \ The next download answers the file at this rev, whatever rev it asked.
-: MISFILE ( ptr u8 n -- ) MISFILED NAME-CAP STORE MISFILED-U ! ;
+: MISFILE ( ^u8 n -- ) MISFILED NAME-CAP STORE MISFILED-U ! ;
 \ The next download's body lacks its last byte.
 : SHORTEN ( -- ) true SHORTED ! ;
 \ The next download's body is cut after PART bytes.
@@ -1277,9 +1277,9 @@ $2100000 constant UPLOAD-CAP
 \ Range asked.
 : FORCE-RANGE ( -- ) true PARTED ! ;
 \ The last download's Dropbox-API-Arg value.
-: ARG-SENT$ ( -- ptr u8 n ) ARG-SENT ARG-SENT-U @ ;
+: ARG-SENT$ ( -- ^u8 n ) ARG-SENT ARG-SENT-U @ ;
 \ The last download's Range value, and whether it sent one.
-: RANGE-SENT$ ( -- ptr u8 n ) RANGE-SENT RANGE-SENT-U @ ;
+: RANGE-SENT$ ( -- ^u8 n ) RANGE-SENT RANGE-SENT-U @ ;
 : RANGE-SENT? ( -- bool ) RANGED @ ;
 
 
@@ -1287,8 +1287,8 @@ $2100000 constant UPLOAD-CAP
 
 \ The code and PKCE verifier the token route grants once, answering the
 \ refresh token fake-refresh-granted.
-: GRANT! ( ptr u8 n ptr u8 n -- )
-   {: k:ptr ku:n v:ptr vu:n :}
+: GRANT! ( ^u8 n ^u8 n -- )
+   {: k:^ ku:n v:^ vu:n :}
    k ku GRANT-CODE NAME-CAP STORE GRANT-CODE-U !
    v vu VERIFIER NAME-CAP STORE VERIFIER-U ! ;
 

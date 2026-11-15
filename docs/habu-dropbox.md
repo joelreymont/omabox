@@ -45,39 +45,39 @@ ENUM reply
 ```forth
 \ One client per task, opened on a config (below). A file hash
 \ or path in an answer is borrowed until the next call.
-: OPEN   ( ptr config ptr ARENA:arena -- ptr client )
-: CLOSE  ( ptr client -- )
+: OPEN   ( ^config ^ARENA:arena -- ^client )
+: CLOSE  ( ^client -- )
 
 \ oauth2/token
-: EXCHANGE      ( ptr u8 n ptr u8 n ptr client -- reply )  \ code, PKCE verifier
-: REFRESH-TOKEN ( ptr client -- ptr u8 n )
+: EXCHANGE      ( ^u8 n ^u8 n ^client -- reply )  \ code, PKCE verifier
+: REFRESH-TOKEN ( ^client -- ^u8 n )
 
 \ users/get_current_account
-: ACCOUNT        ( ptr client -- reply )
-: ACCOUNT-ID     ( ptr client -- ptr u8 n )
-: ROOT-NAMESPACE ( ptr client -- ptr u8 n )
+: ACCOUNT        ( ^client -- reply )
+: ACCOUNT-ID     ( ^client -- ^u8 n )
+: ROOT-NAMESPACE ( ^client -- ^u8 n )
 
 \ files/list_folder (recursive) and list_folder/continue, every
 \ page, each entry handed to the quotation; `reset` mid-way
 \ means nothing seen may be published
-: LIST    ( ptr u8 n ptr client [ ptr entry -- ] -- reply )  \ path
-: CHANGES ( ptr u8 n ptr client [ ptr entry -- ] -- reply )  \ cursor
-: CURSOR  ( ptr client -- ptr u8 n )
+: LIST    ( ^u8 n ^client [ ^entry -- ] -- reply )  \ path
+: CHANGES ( ^u8 n ^client [ ^entry -- ] -- reply )  \ cursor
+: CURSOR  ( ^client -- ^u8 n )
 
 \ files/list_folder/longpoll
-: WAIT     ( ptr u8 n n ptr client -- reply )  \ cursor, seconds
-: CHANGED? ( ptr client -- bool )
-: BACKOFF  ( ptr client -- n )                 \ seconds
+: WAIT     ( ^u8 n n ^client -- reply )  \ cursor, seconds
+: CHANGED? ( ^client -- bool )
+: BACKOFF  ( ^client -- n )                 \ seconds
 
 \ files/get_metadata, download, upload (+ session), delete_v2,
 \ create_folder_v2; each answers the entry Dropbox reports
-: METADATA      ( ptr u8 n ptr client -- reply )  \ path
-: DOWNLOAD      ( ptr u8 n n ptr client [ ptr u8 n n -- ] -- reply )
+: METADATA      ( ^u8 n ^client -- reply )  \ path
+: DOWNLOAD      ( ^u8 n n ^client [ ^u8 n n -- ] -- reply )
                 \ rev, offset; each chunk and its offset
-: UPLOAD        ( ptr upload ptr client [ n -- ] -- reply )  \ bytes accepted
-: DELETE        ( ptr u8 n ptr u8 n ptr client -- reply )  \ path, rev
-: CREATE-FOLDER ( ptr u8 n ptr client -- reply )  \ path
-: ENTRY         ( ptr client -- ptr entry )
+: UPLOAD        ( ^upload ^client [ n -- ] -- reply )  \ bytes accepted
+: DELETE        ( ^u8 n ^u8 n ^client -- reply )  \ path, rev
+: CREATE-FOLDER ( ^u8 n ^client -- reply )  \ path
+: ENTRY         ( ^client -- ^entry )
 
 ENUM kind file folder deleted ;ENUM
 
@@ -101,9 +101,9 @@ STRUCTURE upload
 \ Dropbox's content hash: SHA-256 over the joined SHA-256 digests
 \ of each 4 MiB block
 STRUCTURE hasher ... ;STRUCTURE
-: HASH-BEGIN ( ptr hasher -- )
-: HASH-FEED  ( ptr u8 n ptr hasher -- )
-: HASH-END   ( ptr hasher -- ptr u8 n )   \ 64 lowercase hex digits
+: HASH-BEGIN ( ^hasher -- )
+: HASH-FEED  ( ^u8 n ^hasher -- )
+: HASH-END   ( ^hasher -- ^u8 n )   \ 64 lowercase hex digits
 ```
 
 ```forth
@@ -116,7 +116,7 @@ STRUCTURE config
    FIELD content ...
    FIELD notify ...
 ;STRUCTURE
-: PRODUCTION ( ptr config -- )   \ sets the three origins to Dropbox's
+: PRODUCTION ( ^config -- )   \ sets the three origins to Dropbox's
 ```
 
 - **`root`** goes in a `Dropbox-API-Path-Root` header,
@@ -161,7 +161,7 @@ STRUCTURE config
 Files up to 32 MiB go in one `upload` call; larger ones go through a session.
 
 ```forth
-FSM:DEFINE SESSION ( ptr upload ) upload-step
+FSM:DEFINE SESSION ( ^upload ) upload-step
    IN single      SEND-SENSE ( send-event )
       committed   ANSWER-DONE     >ended
       lost        -               >confirming

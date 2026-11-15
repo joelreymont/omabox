@@ -114,18 +114,18 @@ STRUCTURE config DERIVE addr
 STRUCTURE client OPAQUE DERIVE addr
    FIELD handle CURL:handle
    FIELD key SPAN:span<u8>
-   FIELD token ptr n
+   FIELD token ^n
    FIELD api SPAN:span<u8>
    FIELD content SPAN:span<u8>
    FIELD notify SPAN:span<u8>
    FIELD root-line SPAN:span<u8>
-   FIELD access ptr n
-   FIELD body ptr n
-   FIELD line ptr n
-   FIELD answer ptr n
+   FIELD access ^n
+   FIELD body ^n
+   FIELD line ^n
+   FIELD answer ^n
    FIELD holds SPAN:span<u8>
-   FIELD heads ptr n
-   FIELD values ptr n
+   FIELD heads ^n
+   FIELD values ^n
    FIELD writer JSON:writer
    FIELD cursor JSON:cursor
    FIELD route SPAN:span<u8>
@@ -142,8 +142,8 @@ STRUCTURE client OPAQUE DERIVE addr
    FIELD account SPAN:span<u8>
    FIELD namespace SPAN:span<u8>
    FIELD entry entry
-   FIELD sent ptr n
-   FIELD mark ptr n
+   FIELD sent ^n
+   FIELD mark ^n
    FIELD page SPAN:span<u8>
    FIELD more bool
    FIELD got n
@@ -170,11 +170,11 @@ ENUM verdict
 ;ENUM
 
 : EMPTY ( -- SPAN:span<u8> ) s" " SPAN:MAKE ;
-: BLEN ( ptr n -- n ) BUF:LEN@ BUF:BLEN>N ;
-: BUF$ ( ptr n -- ptr u8 n ) BUF:SPAN$ BUF:BLEN>N ;
-: APPEND ( ptr u8 n ptr n -- ) {: a:ptr u:n buf :} a u BUF:N>BLEN buf BUF:APPEND-SPAN ;
-: ANSWER$ ( ptr client -- ptr u8 n ) CLIENT-ANSWER @ BUF$ ;
-: TAG$ ( ptr client -- ptr u8 n ) CLIENT-OUTER @ SPAN:$ ;
+: BLEN ( ^n -- n ) BUF:LEN@ BUF:BLEN>N ;
+: BUF$ ( ^n -- ^u8 n ) BUF:SPAN$ BUF:BLEN>N ;
+: APPEND ( ^u8 n ^n -- ) {: a:^ u:n buf :} a u BUF:N>BLEN buf BUF:APPEND-SPAN ;
+: ANSWER$ ( ^client -- ^u8 n ) CLIENT-ANSWER @ BUF$ ;
+: TAG$ ( ^client -- ^u8 n ) CLIENT-OUTER @ SPAN:$ ;
 
 
 \ ---- logging and the codes it precedes
@@ -182,14 +182,14 @@ ENUM verdict
 : LOG-OPEN ( -- ) LOG:ERROR s" dropbox" LOG:LINE ;
 
 
-: EXCERPT$ ( ptr client -- ptr u8 n )
+: EXCERPT$ ( ^client -- ^u8 n )
    ANSWER$ EXCERPT min ;
 
 
 \ One line: the route, the status, why, and the answer buffer's start,
 \ labelled by what it holds, unless the route is quiet.
-: REPORT ( ptr client ptr u8 n -- )
-   {: c why:ptr why-u:n :}
+: REPORT ( ^client ^u8 n -- )
+   {: c why:^ why-u:n :}
    LOG-OPEN
    c CLIENT-ROUTE @ SPAN:$ LOG:TEXT+
    s"  answered " LOG:TEXT+ c CLIENT-STATUS @ LOG:INT+
@@ -201,14 +201,14 @@ ENUM verdict
    LOG:;LINE ;
 
 
-: FAILED ( ptr client ptr u8 n n -- )
-   {: c why:ptr why-u:n code:n :}
+: FAILED ( ^client ^u8 n n -- )
+   {: c why:^ why-u:n code:n :}
    c why why-u REPORT
    code throw ;
 
 
-: CURL-FAILED ( CURL:code ptr u8 n -- )
-   {: code:CURL:code what:ptr what-u:n :}
+: CURL-FAILED ( CURL:code ^u8 n -- )
+   {: code:CURL:code what:^ what-u:n :}
    LOG-OPEN
    s" curl " LOG:TEXT+ what what-u LOG:TEXT+
    s" : " LOG:TEXT+ code CURL:ERROR$ LOG:TEXT+
@@ -217,8 +217,8 @@ ENUM verdict
 
 
 \ A setter's status; the step names it in the log.
-: OK ( CURL:status ptr u8 n -- )
-   {: s:CURL:status what:ptr what-u:n :}
+: OK ( CURL:status ^u8 n -- )
+   {: s:CURL:status what:^ what-u:n :}
    s MATCH CURL:status
       ok OF ENDOF
       failed OF what what-u CURL-FAILED ENDOF
@@ -227,20 +227,20 @@ ENUM verdict
 
 \ ---- opening
 
-: KEEP ( ptr u8 n ptr ARENA:arena -- SPAN:span<u8> )
-   {: a:ptr u:n ar :}
+: KEEP ( ^u8 n ^ARENA:arena -- SPAN:span<u8> )
+   {: a:^ u:n ar :}
    u 0= if EMPTY exit then
-   ar u ARENA:ALLOC {: dst:ptr du:n :}
+   ar u ARENA:ALLOC {: dst:^ du:n :}
    a dst u BYTE-COPY
    dst u SPAN:MAKE ;
 
 
-: KEPT ( ptr config ptr ARENA:arena [ ptr config -- ptr SPAN:span<u8> ] -- SPAN:span<u8> )
+: KEPT ( ^config ^ARENA:arena [ ^config -- ^SPAN:span<u8> ] -- SPAN:span<u8> )
    {: cfg ar field :}
    cfg field execute @ SPAN:$ ar KEEP ;
 
 
-: BUFFER ( ptr ARENA:arena -- ptr n )
+: BUFFER ( ^ARENA:arena -- ^n )
    BUF:HDR-BYTES ARENA:ALLOC drop CELL-VIEW
    dup FIRST-CAP BUF:N>BLEN BUF:INIT ;
 
@@ -254,8 +254,8 @@ ENUM verdict
 
 \ The Path-Root line, written once through the line buffer; Dropbox
 \ requires DEL and non-ASCII escaped in a header.
-: ROOT-LINE ( ptr client ptr u8 n ptr ARENA:arena -- SPAN:span<u8> )
-   {: c r:ptr ru:n ar :}
+: ROOT-LINE ( ^client ^u8 n ^ARENA:arena -- SPAN:span<u8> )
+   {: c r:^ ru:n ar :}
    ru 0= if EMPTY exit then
    c CLIENT-LINE @ {: line :}
    c CLIENT-WRITER line JSON:WRITE-OPEN-BUF
@@ -264,16 +264,16 @@ ENUM verdict
    s" .tag" s" root" JSON:WRITE-FIELD-S JSON:WRITE-COMMA
    s" root" r ru JSON:WRITE-FIELD-S
    JSON:WRITE-OBJECT-END JSON:WRITE-CLOSE
-   line BUF$ {: j:ptr ju:n :}
+   line BUF$ {: j:^ ju:n :}
    s" Dropbox-API-Path-Root: " nip ju + {: u:n :}
-   ar u ARENA:ALLOC {: dst:ptr du:n :}
-   s" Dropbox-API-Path-Root: " {: p:ptr pu:n :}
+   ar u ARENA:ALLOC {: dst:^ du:n :}
+   s" Dropbox-API-Path-Root: " {: p:^ pu:n :}
    p dst pu BYTE-COPY
    j dst pu + ju BYTE-COPY
    dst u SPAN:MAKE ;
 
 
-: CONFIGURED ( ptr client ptr config ptr ARENA:arena -- )
+: CONFIGURED ( ^client ^config ^ARENA:arena -- )
    {: c cfg ar :}
    cfg ar [: DROPBOX-CONFIG:KEY ;] KEPT c CLIENT-KEY !
    cfg DROPBOX-CONFIG:TOKEN @ SPAN:$ BUF:N>BLEN
@@ -284,7 +284,7 @@ ENUM verdict
    ar CHUNK ARENA:ALLOC SPAN:MAKE c CLIENT-DRAIN ! ;
 
 
-: BUFFERED ( ptr client ptr ARENA:arena -- )
+: BUFFERED ( ^client ^ARENA:arena -- )
    {: c ar :}
    ar BUFFER c CLIENT-TOKEN !
    ar BUFFER c CLIENT-ACCESS !
@@ -300,14 +300,14 @@ ENUM verdict
 
 \ ---- one request
 
-: LINE-CLEAR ( ptr client -- ) CLIENT-LINE @ BUF:CLEAR ;
-: LINE+ ( ptr client ptr u8 n -- ) {: c a:ptr u:n :} a u c CLIENT-LINE @ APPEND ;
-: LINE$ ( ptr client -- ptr u8 n ) CLIENT-LINE @ BUF$ ;
+: LINE-CLEAR ( ^client -- ) CLIENT-LINE @ BUF:CLEAR ;
+: LINE+ ( ^client ^u8 n -- ) {: c a:^ u:n :} a u c CLIENT-LINE @ APPEND ;
+: LINE$ ( ^client -- ^u8 n ) CLIENT-LINE @ BUF$ ;
 
 
 \ Resets the handle and sets what every request needs, the URL the line
 \ buffer holds included.
-: PREPARE ( ptr client -- CURL:handle )
+: PREPARE ( ^client -- CURL:handle )
    {: c :}
    c CLIENT-HANDLE @ {: h:CURL:handle :}
    h CURL:RESET s" reset" OK
@@ -317,32 +317,32 @@ ENUM verdict
    h ;
 
 
-: AUTHORIZE ( CURL:handle ptr client -- )
+: AUTHORIZE ( CURL:handle ^client -- )
    {: h:CURL:handle c :}
    c LINE-CLEAR
    c s" Authorization: Bearer " LINE+
    c c CLIENT-ACCESS @ BUF$ LINE+
    h c LINE$ CURL:HEADER+ s" header" OK
-   c CLIENT-ROOT-LINE @ SPAN:$ {: r:ptr ru:n :}
+   c CLIENT-ROOT-LINE @ SPAN:$ {: r:^ ru:n :}
    ru 0= if exit then
    h r ru CURL:HEADER+ s" header" OK ;
 
 
 \ Free room past the answer's end, at least CHUNK bytes.
-: ROOM ( ptr n -- ptr u8 len )
+: ROOM ( ^n -- ^u8 len )
    {: buf :}
    buf buf BLEN CHUNK + BUF:N>BLEN BUF:ENSURE
    buf BUF$ +
    buf BUF:CAP@ BUF:BLEN>N buf BLEN - >LEN ;
 
 
-: ADVANCE ( n ptr n -- )
+: ADVANCE ( n ^n -- )
    {: got:n buf :}
    buf BLEN got + BUF:N>BLEN buf BUF:LEN! ;
 
 
 \ One read; true once the transfer ended, its status or failure kept.
-: STEP ( CURL:handle ptr client -- bool )
+: STEP ( CURL:handle ^client -- bool )
    {: h:CURL:handle c :}
    c CLIENT-ANSWER @ {: buf :}
    h buf ROOM CURL:NEXT MATCH CURL:chunk-result
@@ -353,7 +353,7 @@ ENUM verdict
 
 
 \ The final header block into heads; true when it fit.
-: HEADS-FIT? ( ptr client -- bool )
+: HEADS-FIT? ( ^client -- bool )
    {: c :}
    c CLIENT-HEADS @ {: buf :}
    c CLIENT-HANDLE @ buf BUF:SPAN$ drop buf BUF:CAP@ BUF:BLEN>N >LEN
@@ -363,14 +363,14 @@ ENUM verdict
    ;MATCH ;
 
 
-: CAPTURE ( ptr client -- )
+: CAPTURE ( ^client -- )
    {: c :}
    c HEADS-FIT? if exit then
    c HEADS-FIT? drop ;
 
 
 \ Starts the prepared request with nothing received yet.
-: STARTED ( ptr client -- CURL:handle )
+: STARTED ( ^client -- CURL:handle )
    {: c :}
    0 c CLIENT-STATUS ! 0 c CLIENT-FAILURE !
    c CLIENT-ANSWER @ BUF:CLEAR
@@ -382,17 +382,17 @@ ENUM verdict
 
 
 \ The header block of an answer that arrived.
-: ENDED ( ptr client -- )
+: ENDED ( ^client -- )
    {: c :}
    c CLIENT-STATUS @ 0<> if c CAPTURE then ;
 
 
 \ Cancels the transfer in flight on h and reads it to its end, its
 \ result included, so the handle is free for the next request.
-: ABANDONED ( CURL:handle ptr client -- )
+: ABANDONED ( CURL:handle ^client -- )
    {: h:CURL:handle c :}
    h CURL:CANCEL
-   c CLIENT-DRAIN @ SPAN:$ >LEN {: p:ptr room:len :}
+   c CLIENT-DRAIN @ SPAN:$ >LEN {: p:^ room:len :}
    begin
       h p room CURL:NEXT MATCH CURL:chunk-result
          chunk OF drop drop false ENDOF
@@ -406,7 +406,7 @@ ENUM verdict
 \ throw ends a transfer: whatever reads throws, ABANDONED ends the
 \ transfer and the code is rethrown. reads throws only while the
 \ transfer is in flight, never after a read that ended it.
-: READ-OUT ( CURL:handle ptr client [ -- ] -- )
+: READ-OUT ( CURL:handle ^client [ -- ] -- )
    {: h:CURL:handle c reads :}
    [: reads execute ;] catch {: code:n :}
    code 0= if exit then
@@ -415,7 +415,7 @@ ENUM verdict
 
 
 \ Sends the prepared request and reads its answer whole.
-: TRANSFER ( ptr client -- )
+: TRANSFER ( ^client -- )
    {: c :}
    c STARTED {: h:CURL:handle :}
    h c [: begin h c STEP until ;] READ-OUT
@@ -424,8 +424,8 @@ ENUM verdict
 
 \ ---- reading headers
 
-: LINE-END ( ptr u8 n n -- n )
-   {: a:ptr u:n at:n :}
+: LINE-END ( ^u8 n n -- n )
+   {: a:^ u:n at:n :}
    at begin dup u < while
       a over + c@ 10 = if exit then
       1+
@@ -433,23 +433,23 @@ ENUM verdict
 
 
 \ The line at `at`, and where the next one starts.
-: LINE ( ptr u8 n n -- ptr u8 n n )
-   {: a:ptr u:n at:n :}
+: LINE ( ^u8 n n -- ^u8 n n )
+   {: a:^ u:n at:n :}
    a u at LINE-END {: lf:n :}
    a at + lf at - lf 1+ ;
 
 
-: NAMES? ( ptr u8 n ptr u8 n -- bool )
-   {: a:ptr u:n nm:ptr nu:n :}
+: NAMES? ( ^u8 n ^u8 n -- bool )
+   {: a:^ u:n nm:^ nu:n :}
    u nu > 0= if false exit then
    a nu + c@ 58 <> if false exit then
    a nu nm nu STR=CI ;
 
 
 \ The trimmed value of the header name in the captured block, else empty.
-: HEADER$ ( ptr client ptr u8 n -- ptr u8 n )
-   {: c nm:ptr nu:n :}
-   c CLIENT-HEADS @ BUF$ {: a:ptr u:n :}
+: HEADER$ ( ^client ^u8 n -- ^u8 n )
+   {: c nm:^ nu:n :}
+   c CLIENT-HEADS @ BUF$ {: a:^ u:n :}
    0 begin dup u < while
       a u rot LINE >r
       2dup nm nu NAMES? if
@@ -464,8 +464,8 @@ ENUM verdict
 
 
 \ Delta-seconds: digits only, any number of them, at most WAIT-CAP.
-: DELTA-SECONDS ( ptr u8 n -- option<n> )
-   {: a:ptr u:n :}
+: DELTA-SECONDS ( ^u8 n -- option<n> )
+   {: a:^ u:n :}
    a u STR-DIGITS? 0= if OPTION:NONE exit then
    0 0 begin dup u < while
       swap STR-BASE * over a + c@ STR-DIGIT-VALUE +
@@ -475,8 +475,8 @@ ENUM verdict
 
 \ Retry-After in seconds: delta-seconds, else an HTTP date less now and at
 \ least 0 (a passed date asks for no wait); 0 false when absent or neither.
-: RETRY-AFTER ( ptr client -- n bool )
-   s" Retry-After" HEADER$ epoch-seconds {: a:ptr u:n now:n :}
+: RETRY-AFTER ( ^client -- n bool )
+   s" Retry-After" HEADER$ epoch-seconds {: a:^ u:n now:n :}
    a u DELTA-SECONDS MATCH option
       some OF true ENDOF
       none OF a u now DATE:PARSE-HTTP MATCH option
@@ -498,18 +498,18 @@ ENUM verdict
 
 \ The current string or key decoded into values. PARSES? reserves values
 \ for the whole answer first, so a span taken here never moves.
-: DECODE ( JSON:reader ptr client -- JSON:reader SPAN:span<u8> )
+: DECODE ( JSON:reader ^client -- JSON:reader SPAN:span<u8> )
    {: c :}
    JSON:READ-TOKEN dup JSON:T-STR = swap JSON:T-KEY = or
    0= if E-ANSWER throw then
    c CLIENT-VALUES @ {: buf :}
    buf BLEN {: at:n :}
    buf JSON:READ-STR-APPEND
-   buf BUF$ {: base:ptr end:n :}
+   buf BUF$ {: base:^ end:n :}
    base at + end at - SPAN:MAKE ;
 
 
-: STRING ( JSON:reader ptr client -- JSON:reader SPAN:span<u8> )
+: STRING ( JSON:reader ^client -- JSON:reader SPAN:span<u8> )
    {: c :}
    VALUE drop c DECODE ;
 
@@ -520,7 +520,7 @@ ENUM verdict
 
 
 \ The members of the object just opened, each read by `member` at its key.
-: MEMBERS ( JSON:reader ptr client [ JSON:reader ptr client -- JSON:reader ] -- JSON:reader )
+: MEMBERS ( JSON:reader ^client [ JSON:reader ^client -- JSON:reader ] -- JSON:reader )
    {: c member :}
    begin JSON:READ-NEXT dup JSON:T-KEY = while
       drop c member execute
@@ -528,7 +528,7 @@ ENUM verdict
    JSON:T-OBJ-END <> if E-ANSWER throw then ;
 
 
-: READ-ANSWER ( ptr client [ JSON:reader ptr client -- JSON:reader ] -- ptr client )
+: READ-ANSWER ( ^client [ JSON:reader ^client -- JSON:reader ] -- ^client )
    {: c member :}
    c CLIENT-VALUES @ {: buf :}
    buf BUF:CLEAR
@@ -548,7 +548,7 @@ ENUM verdict
 
 \ Whether the answer is one JSON object `member` reads; a failure leaves
 \ the cursor disposed, and any other code, such as a memory fault, goes on.
-: PARSES? ( ptr client [ JSON:reader ptr client -- JSON:reader ] -- bool )
+: PARSES? ( ^client [ JSON:reader ^client -- JSON:reader ] -- bool )
    {: c member :}
    c [: member READ-ANSWER ;] catch {: code:n :} drop
    code 0= if true exit then
@@ -557,7 +557,7 @@ ENUM verdict
    false ;
 
 
-: PARSE ( ptr client [ JSON:reader ptr client -- JSON:reader ] -- )
+: PARSE ( ^client [ JSON:reader ^client -- JSON:reader ] -- )
    {: c member :}
    c member PARSES? if exit then
    c s" an answer that does not parse" E-ANSWER FAILED ;
@@ -565,13 +565,13 @@ ENUM verdict
 
 \ ---- error bodies
 
-: LEAF-MEMBER ( JSON:reader ptr client -- JSON:reader )
+: LEAF-MEMBER ( JSON:reader ^client -- JSON:reader )
    {: c :}
    s" .tag" JSON:READ-STR-EQ? if c STRING c CLIENT-LEAF ! exit then
    SKIP ;
 
 
-: ERROR-MEMBER ( JSON:reader ptr client -- JSON:reader )
+: ERROR-MEMBER ( JSON:reader ^client -- JSON:reader )
    {: c :}
    s" .tag" JSON:READ-STR-EQ? if c STRING c CLIENT-OUTER ! exit then
    s" retry_after" JSON:READ-STR-EQ? if INT c CLIENT-WAIT ! exit then
@@ -585,29 +585,29 @@ ENUM verdict
 
 
 \ `error` is a string in an OAuth answer and a union object in an API one.
-: ERROR-TOP ( JSON:reader ptr client -- JSON:reader )
+: ERROR-TOP ( JSON:reader ^client -- JSON:reader )
    {: c :}
    s" error" JSON:READ-STR-EQ? 0= if SKIP exit then
    VALUE dup JSON:T-STR = if drop c DECODE c CLIENT-OUTER ! exit then
    OBJECT c [: ERROR-MEMBER ;] MEMBERS ;
 
 
-: ERROR-READ? ( ptr client -- bool )
+: ERROR-READ? ( ^client -- bool )
    {: c :}
    EMPTY c CLIENT-OUTER ! EMPTY c CLIENT-LEAF-NAME ! EMPTY c CLIENT-LEAF !
    -1 c CLIENT-WAIT ! -1 c CLIENT-CORRECT !
    c [: ERROR-TOP ;] PARSES? ;
 
 
-: LEAF$ ( ptr client -- ptr u8 n )
+: LEAF$ ( ^client -- ^u8 n )
    {: c :}
-   c CLIENT-LEAF-NAME @ SPAN:$ {: m:ptr mu:n :}
+   c CLIENT-LEAF-NAME @ SPAN:$ {: m:^ mu:n :}
    m mu c TAG$ STR= m mu s" reason" STR= or
    c CLIENT-LEAF @ SPAN:LEN 0<> and if c CLIENT-LEAF @ SPAN:$ exit then
    c TAG$ ;
 
 
-: TAG>ERROR ( ptr u8 n -- error bool )
+: TAG>ERROR ( ^u8 n -- error bool )
    2dup s" not_found" STR= if 2drop construct error not-found true exit then
    2dup s" not_file" STR= if 2drop construct error not-file true exit then
    2dup s" not_folder" STR= if 2drop construct error not-folder true exit then
@@ -631,18 +631,18 @@ ENUM verdict
 
 
 \ A failed transfer: a timeout or a lost connection is retry 0.
-: LOST ( ptr client -- reply )
+: LOST ( ^client -- reply )
    {: c :}
    c CLIENT-FAILURE @ CURL:>CODE {: code:CURL:code :}
    code CURL:LOST? if 0 RETRY exit then
-   c CLIENT-ROUTE @ SPAN:$ {: r:ptr ru:n :}
+   c CLIENT-ROUTE @ SPAN:$ {: r:^ ru:n :}
    code r ru CURL-FAILED ;
 
 
 \ Whether the last call's own answer was lost: its route's transfer failed,
 \ so LOST answered retry 0. A lost refresh is the quiet token route's, so
 \ the call never went out.
-: LOST? ( ptr client -- bool )
+: LOST? ( ^client -- bool )
    {: c :}
    c CLIENT-STATUS @ 0= c CLIENT-QUIET @ 0= and ;
 
@@ -650,7 +650,7 @@ ENUM verdict
 \ 429: the larger of Retry-After and the body's error.retry_after; 408 or
 \ 5xx: Retry-After; 0 when neither gives one. Each wait is at most WAIT-CAP
 \ seconds.
-: WAITED ( ptr client -- reply )
+: WAITED ( ^client -- reply )
    {: c :}
    c RETRY-AFTER 0= if drop 0 then
    c CLIENT-STATUS @ 429 = if
@@ -659,7 +659,7 @@ ENUM verdict
    0 max WAIT-CAP min 1000 * RETRY ;
 
 
-: UNEXPECTED ( ptr client n -- )
+: UNEXPECTED ( ^client n -- )
    {: c s:n :}
    s 300 >= s 400 < and if c s" a redirect" E-REDIRECT FAILED then
    s 400 = if c s" a malformed request" E-BAD-REQUEST FAILED then
@@ -667,10 +667,10 @@ ENUM verdict
    c s" an unexpected status" E-STATUS FAILED ;
 
 
-: REFUSED ( ptr client -- reply )
+: REFUSED ( ^client -- reply )
    {: c :}
    c ERROR-READ? 0= if c s" an error that does not parse" E-ANSWER FAILED then
-   c LEAF$ {: t:ptr tu:n :}
+   c LEAF$ {: t:^ tu:n :}
    t tu s" too_many_write_operations" STR= if 0 RETRY exit then
    t tu TAG>ERROR if construct reply refused exit then
    LOG:WARN s" dropbox" LOG:LINE
@@ -681,15 +681,15 @@ ENUM verdict
 
 \ One line, the route and why: Dropbox refuses this app until the user
 \ logs in again.
-: UNLINKED ( ptr client ptr u8 n -- reply )
-   {: c why:ptr wu:n :}
+: UNLINKED ( ^client ^u8 n -- reply )
+   {: c why:^ wu:n :}
    LOG-OPEN
    c CLIENT-ROUTE @ SPAN:$ LOG:TEXT+ s"  unlinked: " LOG:TEXT+
    why wu LOG:TEXT+ LOG:;LINE
    construct reply unlinked ;
 
 
-: CLASSIFY ( ptr client -- verdict )
+: CLASSIFY ( ^client -- verdict )
    {: c :}
    c CLIENT-STATUS @ {: s:n :}
    s 0= if c LOST ANSWER exit then
@@ -713,7 +713,7 @@ ENUM verdict
 : HEX ( n -- n ) dup 10 < if 48 + else 55 + then ;
 
 
-: BYTE+ ( n ptr n -- )
+: BYTE+ ( n ^n -- )
    {: b:n buf :}
    b UNRESERVED? if b buf BUF:APPEND-BYTE exit then
    37 buf BUF:APPEND-BYTE
@@ -722,13 +722,13 @@ ENUM verdict
 
 
 \ Percent-encodes all but RFC 3986's unreserved bytes.
-: ENCODED+ ( ptr u8 n ptr n -- )
-   {: a:ptr u:n buf :}
+: ENCODED+ ( ^u8 n ^n -- )
+   {: a:^ u:n buf :}
    u 0 ?do a i + c@ buf BYTE+ loop ;
 
 
 \ The refresh's form body, in the line buffer once PREPARE copied the URL.
-: FORM ( ptr client -- ptr u8 n )
+: FORM ( ^client -- ^u8 n )
    {: c :}
    c CLIENT-LINE @ {: buf :}
    buf BUF:CLEAR
@@ -739,24 +739,24 @@ ENUM verdict
    buf BUF$ ;
 
 
-: ISSUED-MEMBER ( JSON:reader ptr client -- JSON:reader )
+: ISSUED-MEMBER ( JSON:reader ^client -- JSON:reader )
    {: c :}
    s" access_token" JSON:READ-STR-EQ? 0= if SKIP exit then
    c STRING c CLIENT-ISSUED ! ;
 
 
-: KEPT-TOKEN ( ptr client -- reply )
+: KEPT-TOKEN ( ^client -- reply )
    {: c :}
    EMPTY c CLIENT-ISSUED !
    c [: ISSUED-MEMBER ;] PARSE
-   c CLIENT-ISSUED @ SPAN:$ {: t:ptr tu:n :}
+   c CLIENT-ISSUED @ SPAN:$ {: t:^ tu:n :}
    tu 0= if c s" no access_token" E-ANSWER FAILED then
    t tu BUF:N>BLEN c CLIENT-ACCESS @ BUF:REPLACE
    construct reply done ;
 
 
 \ invalid_grant answers what `dead` answers.
-: GRANT ( ptr client [ ptr client -- reply ] -- reply )
+: GRANT ( ^client [ ^client -- reply ] -- reply )
    {: c dead :}
    c ERROR-READ? if
       c TAG$ s" invalid_grant" STR= if c dead execute exit then
@@ -766,7 +766,7 @@ ENUM verdict
 
 \ A token answer; `kept` reads a 200's tokens and `dead` answers an
 \ invalid_grant.
-: REFRESHED ( ptr client [ ptr client -- reply ] [ ptr client -- reply ] -- reply )
+: REFRESHED ( ^client [ ^client -- reply ] [ ^client -- reply ] -- reply )
    {: c kept dead :}
    c CLIENT-STATUS @ {: s:n :}
    s 0= if c LOST exit then
@@ -778,7 +778,7 @@ ENUM verdict
 
 \ A POST to <api>/oauth2/token of the form `form` writes, with no
 \ Authorization or Path-Root; the access token is empty until one is kept.
-: TOKEN-POST ( ptr client [ ptr client -- ptr u8 n ] -- )
+: TOKEN-POST ( ^client [ ^client -- ^u8 n ] -- )
    {: c form :}
    c CLIENT-ACCESS @ BUF:CLEAR
    s" oauth2/token" SPAN:MAKE c CLIENT-ROUTE !
@@ -790,7 +790,7 @@ ENUM verdict
 
 
 \ A new access token for the refresh token.
-: REFRESH ( ptr client -- reply )
+: REFRESH ( ^client -- reply )
    {: c :}
    c [: FORM ;] TOKEN-POST
    c [: KEPT-TOKEN ;]
@@ -810,8 +810,8 @@ ENUM verdict
 
 \ A POST to <origin>/2/<route>; body sets the route's headers and body, and
 \ send exchanges the request and classifies its answer.
-: ATTEMPT ( ptr client SPAN:span<u8> ptr u8 n [ CURL:handle ptr client -- ] [ ptr client -- verdict ] -- verdict )
-   {: c o:SPAN:span<u8> r:ptr ru:n body send :}
+: ATTEMPT ( ^client SPAN:span<u8> ^u8 n [ CURL:handle ^client -- ] [ ^client -- verdict ] -- verdict )
+   {: c o:SPAN:span<u8> r:^ ru:n body send :}
    r ru SPAN:MAKE c CLIENT-ROUTE !
    false c CLIENT-QUIET !
    c LINE-CLEAR c o SPAN:$ LINE+ c s" /2/" LINE+ c r ru LINE+
@@ -821,8 +821,8 @@ ENUM verdict
    c send execute ;
 
 
-: RESEND ( ptr client SPAN:span<u8> ptr u8 n [ CURL:handle ptr client -- ] [ ptr client -- verdict ] -- reply )
-   {: c o:SPAN:span<u8> r:ptr ru:n body send :}
+: RESEND ( ^client SPAN:span<u8> ^u8 n [ CURL:handle ^client -- ] [ ^client -- verdict ] -- reply )
+   {: c o:SPAN:span<u8> r:^ ru:n body send :}
    c REFRESH {: again:reply :}
    again DONE? 0= if again exit then
    c o r ru body send ATTEMPT MATCH verdict
@@ -831,14 +831,14 @@ ENUM verdict
    ;MATCH ;
 
 
-: READY ( ptr client -- reply )
+: READY ( ^client -- reply )
    {: c :}
    c CLIENT-ACCESS @ BLEN 0<> if construct reply done exit then
    c REFRESH ;
 
 
-: CALL-AT ( ptr client SPAN:span<u8> ptr u8 n [ CURL:handle ptr client -- ] [ ptr client -- verdict ] -- reply )
-   {: c o:SPAN:span<u8> r:ptr ru:n body send :}
+: CALL-AT ( ^client SPAN:span<u8> ^u8 n [ CURL:handle ^client -- ] [ ^client -- verdict ] -- reply )
+   {: c o:SPAN:span<u8> r:^ ru:n body send :}
    c READY {: first:reply :}
    first DONE? 0= if first exit then
    c o r ru body send ATTEMPT MATCH verdict
@@ -848,17 +848,17 @@ ENUM verdict
 
 
 \ The whole answer read and classified.
-: RECEIVED ( ptr client -- verdict ) dup TRANSFER CLASSIFY ;
+: RECEIVED ( ^client -- verdict ) dup TRANSFER CLASSIFY ;
 
 
 \ A POST to <api>/2/<route>; body sets the route's headers and body.
-: CALL ( ptr client ptr u8 n [ CURL:handle ptr client -- ] -- reply )
-   {: c r:ptr ru:n body :}
+: CALL ( ^client ^u8 n [ CURL:handle ^client -- ] -- reply )
+   {: c r:^ ru:n body :}
    c c CLIENT-API @ r ru body [: RECEIVED ;] CALL-AT ;
 
 
 \ On done, reads the answer into the client.
-: ANSWERED ( reply ptr client [ ptr client -- ] -- reply )
+: ANSWERED ( reply ^client [ ^client -- ] -- reply )
    {: r:reply c read :}
    r DONE? if c read execute then
    r ;
@@ -866,19 +866,19 @@ ENUM verdict
 
 \ An empty body, and an empty Content-Type line to drop the form type
 \ libcurl adds to it.
-: NO-BODY ( CURL:handle ptr client -- )
+: NO-BODY ( CURL:handle ^client -- )
    drop {: h:CURL:handle :}
    h s" Content-Type:" CURL:HEADER+ s" header" OK
    h s" " CURL:BODY! s" body" OK ;
 
 
-: JSON-BODY ( CURL:handle ptr client -- )
+: JSON-BODY ( CURL:handle ^client -- )
    {: h:CURL:handle c :}
    h s" Content-Type: application/json" CURL:HEADER+ s" header" OK
    h c CLIENT-BODY @ BUF$ CURL:BODY! s" body" OK ;
 
 
-: BODY-OPEN ( ptr client -- ptr JSON:writer )
+: BODY-OPEN ( ^client -- ^JSON:writer )
    {: c :}
    c CLIENT-WRITER c CLIENT-BODY @ JSON:WRITE-OPEN-BUF
    true JSON:WRITE-ASCII! ;
@@ -886,20 +886,20 @@ ENUM verdict
 
 \ ---- the routes' answers
 
-: ROOT-MEMBER ( JSON:reader ptr client -- JSON:reader )
+: ROOT-MEMBER ( JSON:reader ^client -- JSON:reader )
    {: c :}
    s" root_namespace_id" JSON:READ-STR-EQ? 0= if SKIP exit then
    c STRING c CLIENT-NAMESPACE ! ;
 
 
-: ACCOUNT-MEMBER ( JSON:reader ptr client -- JSON:reader )
+: ACCOUNT-MEMBER ( JSON:reader ^client -- JSON:reader )
    {: c :}
    s" account_id" JSON:READ-STR-EQ? if c STRING c CLIENT-ACCOUNT ! exit then
    s" root_info" JSON:READ-STR-EQ? 0= if SKIP exit then
    VALUE OBJECT c [: ROOT-MEMBER ;] MEMBERS ;
 
 
-: ACCOUNT-READ ( ptr client -- )
+: ACCOUNT-READ ( ^client -- )
    {: c :}
    EMPTY c CLIENT-ACCOUNT ! EMPTY c CLIENT-NAMESPACE !
    c [: ACCOUNT-MEMBER ;] PARSE
@@ -915,7 +915,7 @@ ENUM verdict
    E-ANSWER throw ;
 
 
-: ENTRY-CLEAR ( ptr entry -- )
+: ENTRY-CLEAR ( ^entry -- )
    {: e :}
    construct kind deleted e DROPBOX-ENTRY:KIND !
    EMPTY e DROPBOX-ENTRY:LOWER ! EMPTY e DROPBOX-ENTRY:DISPLAY !
@@ -923,13 +923,13 @@ ENUM verdict
    0 e DROPBOX-ENTRY:SIZE ! ;
 
 
-: FILE? ( ptr entry -- bool )
+: FILE? ( ^entry -- bool )
    DROPBOX-ENTRY:KIND @ construct kind file DROPBOX-KIND:EQ ;
 
 
 \ Whether the entry holds what its kind needs: both paths, and for a file
 \ its rev and hash.
-: WHOLE? ( ptr entry -- bool )
+: WHOLE? ( ^entry -- bool )
    {: e :}
    e DROPBOX-ENTRY:LOWER @ SPAN:LEN 0<> e DROPBOX-ENTRY:DISPLAY @ SPAN:LEN 0<> and
    e FILE? 0= if exit then
@@ -943,7 +943,7 @@ ENUM verdict
 \ from its `.tag`.
 
 \ The members both shapes hold.
-: FIELD-MEMBER ( JSON:reader ptr client -- JSON:reader )
+: FIELD-MEMBER ( JSON:reader ^client -- JSON:reader )
    {: c :}
    c CLIENT-ENTRY {: e :}
    s" path_lower" JSON:READ-STR-EQ? if c STRING e DROPBOX-ENTRY:LOWER ! exit then
@@ -954,7 +954,7 @@ ENUM verdict
    SKIP ;
 
 
-: TAGGED-MEMBER ( JSON:reader ptr client -- JSON:reader )
+: TAGGED-MEMBER ( JSON:reader ^client -- JSON:reader )
    {: c :}
    s" .tag" JSON:READ-STR-EQ? if
       KIND-OF c CLIENT-ENTRY DROPBOX-ENTRY:KIND ! true c CLIENT-TAGGED ! exit
@@ -963,7 +963,7 @@ ENUM verdict
 
 
 \ The entry cleared to read one of kind k, with no `.tag` read yet.
-: ENTRY-OPEN ( ptr client kind -- )
+: ENTRY-OPEN ( ^client kind -- )
    {: c k:kind :}
    c CLIENT-ENTRY {: e :}
    e ENTRY-CLEAR k e DROPBOX-ENTRY:KIND !
@@ -971,7 +971,7 @@ ENUM verdict
 
 
 \ A plain record of kind k, its object just opened, read into the entry.
-: PLAIN-OBJECT ( JSON:reader ptr client kind -- JSON:reader )
+: PLAIN-OBJECT ( JSON:reader ^client kind -- JSON:reader )
    {: c k:kind :}
    c k ENTRY-OPEN
    c [: FIELD-MEMBER ;] MEMBERS ;
@@ -979,7 +979,7 @@ ENUM verdict
 
 \ A Metadata union, its object just opened, read into the entry: one with
 \ no `.tag` has no kind, and is never taken for a deleted entry.
-: TAGGED-OBJECT ( JSON:reader ptr client -- JSON:reader )
+: TAGGED-OBJECT ( JSON:reader ^client -- JSON:reader )
    {: c :}
    c construct kind deleted ENTRY-OPEN
    c [: TAGGED-MEMBER ;] MEMBERS
@@ -989,7 +989,7 @@ ENUM verdict
 \ The answer's entry, as `member` finds it with the entry open at kind k.
 \ A deleted entry is a listing's alone; any other route answers a file or
 \ folder, so an entry left at deleted, as a union with no `.tag` is, fails.
-: ENTRY-PARSE ( ptr client kind [ JSON:reader ptr client -- JSON:reader ] -- )
+: ENTRY-PARSE ( ^client kind [ JSON:reader ^client -- JSON:reader ] -- )
    {: c k:kind member :}
    c k ENTRY-OPEN
    c member PARSE
@@ -999,13 +999,13 @@ ENUM verdict
 
 
 \ get_metadata's answer, a Metadata union.
-: ENTRY-READ ( ptr client -- )
+: ENTRY-READ ( ^client -- )
    construct kind deleted [: TAGGED-MEMBER ;] ENTRY-PARSE ;
 
 
 \ The answer of upload and upload_session/finish, and download's
 \ Dropbox-API-Result: a plain FileMetadata.
-: FILE-READ ( ptr client -- )
+: FILE-READ ( ^client -- )
    construct kind file [: FIELD-MEMBER ;] ENTRY-PARSE ;
 
 
@@ -1015,13 +1015,13 @@ ENUM verdict
 60 constant IDLE
 
 
-: INT+ ( ptr client n -- ) {: c v:n :} c v FMT:INT$ LINE+ ;
+: INT+ ( ^client n -- ) {: c v:n :} c v FMT:INT$ LINE+ ;
 
 
 \ The Dropbox-API-Arg line, {"path": "rev:<rev>"}: the value is built in
 \ the line, the JSON in the body buffer a download never sends.
-: ARG-LINE ( ptr client ptr u8 n -- ptr u8 n )
-   {: c r:ptr ru:n :}
+: ARG-LINE ( ^client ^u8 n -- ^u8 n )
+   {: c r:^ ru:n :}
    c LINE-CLEAR c s" rev:" LINE+ c r ru LINE+
    c BODY-OPEN JSON:WRITE-OBJECT-START
    s" path" c LINE$ JSON:WRITE-FIELD-S
@@ -1040,8 +1040,8 @@ ENUM verdict
 
 \ An empty body, the rev's argument, a Range from a nonzero offset, and the
 \ content deadlines.
-: ASKED ( CURL:handle ptr client ptr u8 n n -- )
-   {: h:CURL:handle c r:ptr ru:n at:n :}
+: ASKED ( CURL:handle ^client ^u8 n n -- )
+   {: h:CURL:handle c r:^ ru:n at:n :}
    h c NO-BODY
    h c r ru ARG-LINE CURL:HEADER+ s" header" OK
    at 0 > if
@@ -1054,7 +1054,7 @@ ENUM verdict
 \ The metadata the Dropbox-API-Result header holds, read into the entry.
 \ It replaces the answer buffer, so a 2xx chunk lands in the body buffer
 \ and a failed check logs the result, never a byte of the file.
-: RESULT-READ ( ptr client -- )
+: RESULT-READ ( ^client -- )
    {: c :}
    c s" Dropbox-API-Result" HEADER$ BUF:N>BLEN
    c CLIENT-ANSWER @ BUF:REPLACE
@@ -1063,7 +1063,7 @@ ENUM verdict
 
 
 \ The Content-Range a ranged answer of the entry must carry, in the line.
-: RANGE-LINE ( ptr client n ptr entry -- ptr u8 n )
+: RANGE-LINE ( ^client n ^entry -- ^u8 n )
    {: c at:n e :}
    e DROPBOX-ENTRY:SIZE @ {: size:n :}
    c LINE-CLEAR c s" bytes " LINE+ c at INT+ c s" -" LINE+
@@ -1073,7 +1073,7 @@ ENUM verdict
 
 \ An offset above 0 needs a 206 with the range asked, InvalidDownloadRange
 \ in dropbox.rs; offset 0 needs a 200.
-: RANGED ( ptr client n ptr entry -- )
+: RANGED ( ^client n ^entry -- )
    {: c at:n e :}
    c CLIENT-STATUS @ {: s:n :}
    at 0= if
@@ -1088,8 +1088,8 @@ ENUM verdict
 
 \ The status, metadata and Content-Range of a 2xx answer, from the captured
 \ headers: the rev asked and the range asked.
-: CHECKED ( ptr client ptr u8 n n -- )
-   {: c r:ptr ru:n at:n :}
+: CHECKED ( ^client ^u8 n n -- )
+   {: c r:^ ru:n at:n :}
    c RESULT-READ
    c CLIENT-ENTRY {: e :}
    e DROPBOX-ENTRY:REV @ SPAN:$ r ru STR=
@@ -1104,7 +1104,7 @@ ENUM verdict
 \ last and status its HTTP status, or a response's; failure a failed
 \ transfer's curl code; total the bytes handed to sink.
 STRUCTURE fetch DERIVE addr
-   FIELD client ptr client
+   FIELD client ^client
    FIELD handle CURL:handle
    FIELD rev SPAN:span<u8>
    FIELD offset n
@@ -1123,18 +1123,18 @@ ENUM read-event chunk response failure ;ENUM
 ENUM open-event passed other response failure ;ENUM
 
 
-: HOLD ( CURL:http-status len ptr u8 ptr fetch -- )
-   {: p:ptr f :}
+: HOLD ( CURL:http-status len ^u8 ^fetch -- )
+   {: p:^ f :}
    LEN>N p swap SPAN:MAKE f FETCH-HELD !
    CURL:HTTP-STATUS>N f FETCH-STATUS ! ;
 
 
 \ One read into the body buffer, which a download never sends.
-: PULL ( ptr fetch -- read-event )
+: PULL ( ^fetch -- read-event )
    {: f :}
    f FETCH-CLIENT @ CLIENT-BODY @ {: buf :}
    buf BUF:CLEAR
-   buf ROOM {: p:ptr room:len :}
+   buf ROOM {: p:^ room:len :}
    f FETCH-HANDLE @ p room CURL:NEXT MATCH CURL:chunk-result
       chunk OF p f HOLD construct read-event chunk ENDOF
       response OF
@@ -1151,7 +1151,7 @@ ENUM open-event passed other response failure ;ENUM
 \ The first chunk: a 2xx one passes CHECKED, made through the headers
 \ curl answers from that chunk on, or CHECKED throws; any other status is
 \ the core's to classify.
-: FIRST-CHECKED ( ptr fetch -- open-event )
+: FIRST-CHECKED ( ^fetch -- open-event )
    {: f :}
    f FETCH-STATUS @ {: s:n :}
    s 200 >= s 300 < and 0= if construct open-event other exit then
@@ -1162,7 +1162,7 @@ ENUM open-event passed other response failure ;ENUM
    construct open-event passed ;
 
 
-: OPEN-SENSE ( ptr fetch -- open-event )
+: OPEN-SENSE ( ^fetch -- open-event )
    {: f :}
    f PULL MATCH read-event
       chunk OF f FIRST-CHECKED ENDOF
@@ -1172,19 +1172,19 @@ ENUM open-event passed other response failure ;ENUM
 
 
 \ A chunk of a status other than 2xx, for the core to classify.
-: ANSWER+ ( ptr fetch -- )
+: ANSWER+ ( ^fetch -- )
    {: f :}
    f FETCH-HELD @ SPAN:$ f FETCH-CLIENT @ CLIENT-ANSWER @ APPEND ;
 
 
 \ The transfer ended with an answer: only its status, as nothing after
 \ the read that ended a transfer may throw; ENDED captures its headers.
-: RESPONDED ( ptr fetch -- )
+: RESPONDED ( ^fetch -- )
    {: f :}
    f FETCH-STATUS @ f FETCH-CLIENT @ CLIENT-STATUS ! ;
 
 
-: BROKE ( ptr fetch -- )
+: BROKE ( ^fetch -- )
    {: f :}
    f FETCH-CLIENT @ {: c :}
    0 c CLIENT-STATUS !
@@ -1193,7 +1193,7 @@ ENUM open-event passed other response failure ;ENUM
 
 \ A throw from a sense or an action leaves the transfer in flight, for
 \ READ-OUT to end.
-FSM:DEFINE DOWNLOADING ( ptr fetch ) download-step open-event
+FSM:DEFINE DOWNLOADING ( ^fetch ) download-step open-event
    IN opened  OPEN-SENSE
       passed    -          >streaming
       other     ANSWER+    >buffering
@@ -1217,16 +1217,16 @@ FSM:DEFINE DOWNLOADING ( ptr fetch ) download-step open-event
 
 
 \ Hands the held chunk to sink at its file offset and counts it.
-: DELIVERED ( ptr fetch [ ptr u8 n n -- ] -- )
+: DELIVERED ( ^fetch [ ^u8 n n -- ] -- )
    {: f sink :}
-   f FETCH-HELD @ SPAN:$ {: p:ptr u:n :}
+   f FETCH-HELD @ SPAN:$ {: p:^ u:n :}
    p u f FETCH-OFFSET @ f FETCH-TOTAL @ + sink execute
    u f FETCH-TOTAL +! ;
 
 
 \ Steps the machine from opened to its end, answered or lost; each step
 \ that leaves it streaming hands its chunk to sink.
-: DRIVEN ( ptr fetch [ ptr u8 n n -- ] -- )
+: DRIVEN ( ^fetch [ ^u8 n n -- ] -- )
    {: f sink :}
    construct download-step opened
    begin
@@ -1238,7 +1238,7 @@ FSM:DEFINE DOWNLOADING ( ptr fetch ) download-step open-event
 
 \ Sends the prepared request, reads its answer through DOWNLOADING
 \ under READ-OUT, and captures an arrived answer's header block.
-: RECEIVING ( ptr client ptr fetch [ ptr u8 n n -- ] -- )
+: RECEIVING ( ^client ^fetch [ ^u8 n n -- ] -- )
    {: c f sink :}
    c STARTED {: h:CURL:handle :}
    h f FETCH-HANDLE !
@@ -1249,8 +1249,8 @@ FSM:DEFINE DOWNLOADING ( ptr fetch ) download-step open-event
 \ The prepared request's answer through RECEIVING: the bytes sink took.
 \ The fetch is made before the transfer starts, so nothing allocates
 \ while it is in flight but what READ-OUT covers.
-: STREAMED ( ptr client ptr u8 n n [ ptr u8 n n -- ] -- n )
-   {: c r:ptr ru:n at:n sink :}
+: STREAMED ( ^client ^u8 n n [ ^u8 n n -- ] -- n )
+   {: c r:^ ru:n at:n sink :}
    FETCHES-NEW {: f :}
    c f FETCH-CLIENT !
    r ru SPAN:MAKE f FETCH-REV ! at f FETCH-OFFSET !
@@ -1259,7 +1259,7 @@ FSM:DEFINE DOWNLOADING ( ptr fetch ) download-step open-event
 
 
 \ A 206 is a download's done too; RANGED checks it was asked for.
-: SORTED ( ptr client -- verdict )
+: SORTED ( ^client -- verdict )
    {: c :}
    c CLIENT-STATUS @ 206 = if construct reply done ANSWER exit then
    c CLASSIFY ;
@@ -1267,23 +1267,23 @@ FSM:DEFINE DOWNLOADING ( ptr fetch ) download-step open-event
 
 \ A done answer is the rev and range asked, checked here when no chunk came,
 \ and every byte after the offset.
-: VERIFIED ( ptr client ptr u8 n n n -- )
-   {: c r:ptr ru:n at:n got:n :}
+: VERIFIED ( ^client ^u8 n n n -- )
+   {: c r:^ ru:n at:n got:n :}
    got 0= if c r ru at CHECKED then
    c CLIENT-ENTRY DROPBOX-ENTRY:SIZE @ at - got <>
    if c s" a body of another length" E-ANSWER FAILED then ;
 
 
 \ A 416 from offset 0, where no Range was sent.
-: UNSATISFIABLE ( ptr client -- reply )
+: UNSATISFIABLE ( ^client -- reply )
    s" a range it cannot satisfy from 0" E-ANSWER FAILED ;
 
 
 \ An answer that arrived. A 416, RangeUnsatisfiable in dropbox.rs, carries
 \ no Dropbox-API-Result, so it is never done; unsat answers it, whatever
 \ size its Content-Range names.
-: ARRIVED ( ptr client ptr u8 n n n [ ptr client -- reply ] -- verdict )
-   {: c r:ptr ru:n at:n got:n unsat :}
+: ARRIVED ( ^client ^u8 n n n [ ^client -- reply ] -- verdict )
+   {: c r:^ ru:n at:n got:n unsat :}
    c CLIENT-STATUS @ 416 = if c unsat execute ANSWER exit then
    c SORTED {: v:verdict :}
    v MATCH verdict
@@ -1294,36 +1294,36 @@ FSM:DEFINE DOWNLOADING ( ptr fetch ) download-step open-event
 
 
 \ A lost transfer, status 0, is the core's to classify.
-: FETCHED ( ptr client ptr u8 n n [ ptr u8 n n -- ] [ ptr client -- reply ] -- verdict )
-   {: c r:ptr ru:n at:n sink unsat :}
+: FETCHED ( ^client ^u8 n n [ ^u8 n n -- ] [ ^client -- reply ] -- verdict )
+   {: c r:^ ru:n at:n sink unsat :}
    c r ru at sink STREAMED {: got:n :}
    c CLIENT-STATUS @ 0= if c LOST ANSWER exit then
    c r ru at got unsat ARRIVED ;
 
 
 \ files/download from the offset; unsat answers a 416.
-: FROM ( ptr u8 n n ptr client [ ptr u8 n n -- ] [ ptr client -- reply ] -- reply )
-   {: r:ptr ru:n at:n c sink unsat :}
+: FROM ( ^u8 n n ^client [ ^u8 n n -- ] [ ^client -- reply ] -- reply )
+   {: r:^ ru:n at:n c sink unsat :}
    c c CLIENT-CONTENT @ s" files/download"
    [: r ru at ASKED ;] [: r ru at sink unsat FETCHED ;] CALL-AT ;
 
 
 \ files/download from offset 0.
-: AFRESH ( ptr client ptr u8 n [ ptr u8 n n -- ] -- reply )
-   {: c r:ptr ru:n sink :}
+: AFRESH ( ^client ^u8 n [ ^u8 n n -- ] -- reply )
+   {: c r:^ ru:n sink :}
    r ru 0 c sink [: UNSATISFIABLE ;] FROM ;
 
 
 \ Disposes buf unless it is null, a buffer OPEN never made: the arena
 \ zeroes the record.
-: DISCARD ( ptr n -- )
+: DISCARD ( ^n -- )
    {: buf :}
    buf NULL-PTR = if exit then
    buf BUF:DISPOSE ;
 
 
 \ The buffers BUFFERED made, before a throw part-way or after them all.
-: UNBUFFERED ( ptr client -- )
+: UNBUFFERED ( ^client -- )
    {: c :}
    c CLIENT-TOKEN @ DISCARD
    c CLIENT-ACCESS @ DISCARD
@@ -1339,7 +1339,7 @@ FSM:DEFINE DOWNLOADING ( ptr fetch ) download-step open-event
 \ What OPEN keeps in c. A throw part-way disposes the buffers made and
 \ goes on; the rest is the arena's, and the handle, made last, exists only
 \ when nothing threw.
-: FILLED ( ptr client ptr config ptr ARENA:arena -- )
+: FILLED ( ^client ^config ^ARENA:arena -- )
    {: c cfg ar :}
    [: c ar BUFFERED
       c cfg ar CONFIGURED
@@ -1353,21 +1353,21 @@ FSM:DEFINE DOWNLOADING ( ptr fetch ) download-step open-event
 public
 
 \ Sets the three origins to Dropbox's.
-: PRODUCTION ( ptr config -- )
+: PRODUCTION ( ^config -- )
    {: cfg :}
    s" https://api.dropboxapi.com" SPAN:MAKE cfg DROPBOX-CONFIG:API !
    s" https://content.dropboxapi.com" SPAN:MAKE cfg DROPBOX-CONFIG:CONTENT !
    s" https://notify.dropboxapi.com" SPAN:MAKE cfg DROPBOX-CONFIG:NOTIFY ! ;
 
 
-: OPEN ( ptr config ptr ARENA:arena -- ptr client )
+: OPEN ( ^config ^ARENA:arena -- ^client )
    {: cfg ar :}
    ar CLIENTS-NEW {: c :}
    c cfg ar FILLED
    c ;
 
 
-: CLOSE ( ptr client -- )
+: CLOSE ( ^client -- )
    {: c :}
    c CLIENT-HANDLE @ CURL:CLEANUP
    c CLIENT-CURSOR JSON:READ-DISPOSE
@@ -1375,19 +1375,19 @@ public
 
 
 \ users/get_current_account
-: ACCOUNT ( ptr client -- reply )
+: ACCOUNT ( ^client -- reply )
    {: c :}
    c s" users/get_current_account" [: NO-BODY ;] CALL
    c [: ACCOUNT-READ ;] ANSWERED ;
 
 
-: ACCOUNT-ID ( ptr client -- ptr u8 n ) CLIENT-ACCOUNT @ SPAN:$ ;
-: ROOT-NAMESPACE ( ptr client -- ptr u8 n ) CLIENT-NAMESPACE @ SPAN:$ ;
+: ACCOUNT-ID ( ^client -- ^u8 n ) CLIENT-ACCOUNT @ SPAN:$ ;
+: ROOT-NAMESPACE ( ^client -- ^u8 n ) CLIENT-NAMESPACE @ SPAN:$ ;
 
 
 \ files/get_metadata of the path.
-: METADATA ( ptr u8 n ptr client -- reply )
-   {: p:ptr pu:n c :}
+: METADATA ( ^u8 n ^client -- reply )
+   {: p:^ pu:n c :}
    c BODY-OPEN JSON:WRITE-OBJECT-START
    s" path" p pu JSON:WRITE-FIELD-S
    JSON:WRITE-OBJECT-END JSON:WRITE-CLOSE
@@ -1395,7 +1395,7 @@ public
    c [: ENTRY-READ ;] ANSWERED ;
 
 
-: ENTRY ( ptr client -- ptr entry ) CLIENT-ENTRY ;
+: ENTRY ( ^client -- ^entry ) CLIENT-ENTRY ;
 
 
 \ ---- list_folder, list_folder/continue and list_folder/longpoll
@@ -1416,7 +1416,7 @@ private
 1 constant GOT-CHANGES
 
 
-: GOT ( ptr client n -- )
+: GOT ( ^client n -- )
    {: c bit:n :}
    c CLIENT-GOT @ bit or c CLIENT-GOT ! ;
 
@@ -1428,7 +1428,7 @@ private
 
 
 \ Each object of the array that opens next, read by `entry` once opened.
-: ENTRIES ( JSON:reader ptr client [ JSON:reader ptr client -- JSON:reader ] -- JSON:reader )
+: ENTRIES ( JSON:reader ^client [ JSON:reader ^client -- JSON:reader ] -- JSON:reader )
    {: c entry :}
    VALUE JSON:T-ARR <> if E-ANSWER throw then
    begin VALUE dup JSON:T-OBJ = while
@@ -1437,13 +1437,13 @@ private
    JSON:T-ARR-END <> if E-ANSWER throw then ;
 
 
-: LISTED ( JSON:reader ptr client -- JSON:reader )
+: LISTED ( JSON:reader ^client -- JSON:reader )
    {: c :}
    c TAGGED-OBJECT
    c CLIENT-ENTRY WHOLE? 0= if E-ANSWER throw then ;
 
 
-: PAGE-MEMBER ( JSON:reader ptr client -- JSON:reader )
+: PAGE-MEMBER ( JSON:reader ^client -- JSON:reader )
    {: c :}
    s" entries" JSON:READ-STR-EQ? if
       c [: LISTED ;] ENTRIES c GOT-ENTRIES GOT exit
@@ -1457,7 +1457,7 @@ private
 
 \ Reads and checks a page; one with more whose cursor is the one sent
 \ would list the same page forever.
-: PAGE-READ ( ptr client -- )
+: PAGE-READ ( ^client -- )
    {: c :}
    0 c CLIENT-GOT ! EMPTY c CLIENT-PAGE ! false c CLIENT-MORE !
    c [: PAGE-MEMBER ;] PARSE
@@ -1468,13 +1468,13 @@ private
    if c s" a cursor that did not advance" E-ANSWER FAILED then ;
 
 
-: HANDED ( JSON:reader ptr client [ ptr entry -- ] -- JSON:reader )
+: HANDED ( JSON:reader ^client [ ^entry -- ] -- JSON:reader )
    {: c each :}
    c TAGGED-OBJECT
    c CLIENT-ENTRY each execute ;
 
 
-: HAND-MEMBER ( JSON:reader ptr client [ ptr entry -- ] -- JSON:reader )
+: HAND-MEMBER ( JSON:reader ^client [ ^entry -- ] -- JSON:reader )
    {: c each :}
    s" entries" JSON:READ-STR-EQ? 0= if SKIP exit then
    c [: each HANDED ;] ENTRIES ;
@@ -1483,7 +1483,7 @@ private
 \ A done page: checked whole, its cursor kept in sent, then read again to
 \ hand its entries on outside PARSE, so a throw of each stays its own;
 \ true when another page follows.
-: TURN ( ptr client [ ptr entry -- ] -- bool )
+: TURN ( ^client [ ^entry -- ] -- bool )
    {: c each :}
    c PAGE-READ
    c CLIENT-PAGE @ SPAN:$ BUF:N>BLEN c CLIENT-SENT @ BUF:REPLACE
@@ -1491,9 +1491,9 @@ private
    c CLIENT-MORE @ ;
 
 
-: CONTINUE ( ptr client -- reply )
+: CONTINUE ( ^client -- reply )
    {: c :}
-   c CLIENT-SENT @ BUF$ {: k:ptr ku:n :}
+   c CLIENT-SENT @ BUF$ {: k:^ ku:n :}
    c BODY-OPEN JSON:WRITE-OBJECT-START
    s" cursor" k ku JSON:WRITE-FIELD-S
    JSON:WRITE-OBJECT-END JSON:WRITE-CLOSE
@@ -1502,7 +1502,7 @@ private
 
 \ One page of a listing: the reply and true when it ends the listing,
 \ else the next page's reply and false.
-: PAGE-STEP ( reply ptr client [ ptr entry -- ] -- reply bool )
+: PAGE-STEP ( reply ^client [ ^entry -- ] -- reply bool )
    {: r:reply c each :}
    r DONE? 0= if r true exit then
    c each TURN 0= if r true exit then
@@ -1510,7 +1510,7 @@ private
 
 
 \ Every page from the first page's reply; done keeps the last cursor.
-: PAGES ( reply ptr client [ ptr entry -- ] -- reply )
+: PAGES ( reply ^client [ ^entry -- ] -- reply )
    {: c each :}
    begin c each PAGE-STEP until
    {: r:reply :}
@@ -1520,8 +1520,8 @@ private
    r ;
 
 
-: LIST-BODY ( ptr u8 n ptr client -- )
-   {: p:ptr pu:n c :}
+: LIST-BODY ( ^u8 n ^client -- )
+   {: p:^ pu:n c :}
    c BODY-OPEN JSON:WRITE-OBJECT-START
    s" path" p pu JSON:WRITE-FIELD-S JSON:WRITE-COMMA
    s" recursive" true JSON:WRITE-FIELD-BOOL JSON:WRITE-COMMA
@@ -1529,7 +1529,7 @@ private
    JSON:WRITE-OBJECT-END JSON:WRITE-CLOSE ;
 
 
-: POLL-MEMBER ( JSON:reader ptr client -- JSON:reader )
+: POLL-MEMBER ( JSON:reader ^client -- JSON:reader )
    {: c :}
    s" changes" JSON:READ-STR-EQ? if
       BOOLEAN c CLIENT-CHANGES ! c GOT-CHANGES GOT exit
@@ -1538,15 +1538,15 @@ private
    INT c CLIENT-BACKOFF ! ;
 
 
-: POLL-READ ( ptr client -- )
+: POLL-READ ( ^client -- )
    {: c :}
    0 c CLIENT-GOT ! false c CLIENT-CHANGES ! 0 c CLIENT-BACKOFF !
    c [: POLL-MEMBER ;] PARSE
    c CLIENT-GOT @ GOT-CHANGES <> if c s" no changes" E-ANSWER FAILED then ;
 
 
-: POLL-BODY ( ptr u8 n n ptr client -- )
-   {: k:ptr ku:n secs:n c :}
+: POLL-BODY ( ^u8 n n ^client -- )
+   {: k:^ ku:n secs:n c :}
    c BODY-OPEN JSON:WRITE-OBJECT-START
    s" cursor" k ku JSON:WRITE-FIELD-S JSON:WRITE-COMMA
    s" timeout" secs JSON:WRITE-FIELD-INT
@@ -1555,7 +1555,7 @@ private
 
 \ The body is silent until Dropbox answers, so only the whole call is
 \ bounded: the timeout asked for, Dropbox's slack and ours.
-: LONG-POLL ( ptr client n -- verdict )
+: LONG-POLL ( ^client n -- verdict )
    {: c secs:n :}
    s" files/list_folder/longpoll" SPAN:MAKE c CLIENT-ROUTE !
    false c CLIENT-QUIET !
@@ -1571,8 +1571,8 @@ private
 public
 
 \ files/list_folder of the path, recursive, and every page after it.
-: LIST ( ptr u8 n ptr client [ ptr entry -- ] -- reply )
-   {: p:ptr pu:n c each :}
+: LIST ( ^u8 n ^client [ ^entry -- ] -- reply )
+   {: p:^ pu:n c each :}
    c CLIENT-SENT @ BUF:CLEAR
    p pu c LIST-BODY
    c s" files/list_folder" [: JSON-BODY ;] CALL
@@ -1580,18 +1580,18 @@ public
 
 
 \ files/list_folder/continue from the cursor, deleted entries included.
-: CHANGES ( ptr u8 n ptr client [ ptr entry -- ] -- reply )
-   {: k:ptr ku:n c each :}
+: CHANGES ( ^u8 n ^client [ ^entry -- ] -- reply )
+   {: k:^ ku:n c each :}
    k ku BUF:N>BLEN c CLIENT-SENT @ BUF:REPLACE
    c CONTINUE c each PAGES ;
 
 
-: CURSOR ( ptr client -- ptr u8 n ) CLIENT-MARK @ BUF$ ;
+: CURSOR ( ^client -- ^u8 n ) CLIENT-MARK @ BUF$ ;
 
 
 \ files/list_folder/longpoll on the cursor for at most secs seconds.
-: WAIT ( ptr u8 n n ptr client -- reply )
-   {: k:ptr ku:n secs:n c :}
+: WAIT ( ^u8 n n ^client -- reply )
+   {: k:^ ku:n secs:n c :}
    k ku secs c POLL-BODY
    c secs LONG-POLL MATCH verdict
       answer OF ENDOF
@@ -1600,9 +1600,9 @@ public
    c [: POLL-READ ;] ANSWERED ;
 
 
-: CHANGED? ( ptr client -- bool ) CLIENT-CHANGES @ ;
+: CHANGED? ( ^client -- bool ) CLIENT-CHANGES @ ;
 \ Seconds Dropbox asks to wait before the next long poll, 0 for none.
-: BACKOFF ( ptr client -- n ) CLIENT-BACKOFF @ ;
+: BACKOFF ( ^client -- n ) CLIENT-BACKOFF @ ;
 
 
 \ ---- files/download
@@ -1616,8 +1616,8 @@ public
 \ while the transfer is in flight, sink's included, cancels it and reads it
 \ to its end before it goes on, so the client stays usable. Every done
 \ answer carried Dropbox-API-Result, and ENTRY is its entry.
-: DOWNLOAD ( ptr u8 n n ptr client [ ptr u8 n n -- ] -- reply )
-   {: r:ptr ru:n at:n c sink :}
+: DOWNLOAD ( ^u8 n n ^client [ ^u8 n n -- ] -- reply )
+   {: r:^ ru:n at:n c sink :}
    at 0= if c r ru sink AFRESH exit then
    r ru at c sink [: r ru sink AFRESH ;] FROM ;
 
@@ -1627,23 +1627,23 @@ private
 \ delete_v2 and create_folder_v2 answer the entry as `metadata`: delete_v2
 \ a Metadata union, create_folder_v2 a plain FolderMetadata. The entry
 \ opens at deleted, so an answer with no `metadata` fails.
-: DELETED-MEMBER ( JSON:reader ptr client -- JSON:reader )
+: DELETED-MEMBER ( JSON:reader ^client -- JSON:reader )
    {: c :}
    s" metadata" JSON:READ-STR-EQ? 0= if SKIP exit then
    VALUE OBJECT c TAGGED-OBJECT ;
 
 
-: MADE-MEMBER ( JSON:reader ptr client -- JSON:reader )
+: MADE-MEMBER ( JSON:reader ^client -- JSON:reader )
    {: c :}
    s" metadata" JSON:READ-STR-EQ? 0= if SKIP exit then
    VALUE OBJECT c construct kind folder PLAIN-OBJECT ;
 
 
-: DELETED-READ ( ptr client -- )
+: DELETED-READ ( ^client -- )
    construct kind deleted [: DELETED-MEMBER ;] ENTRY-PARSE ;
 
 
-: MADE-READ ( ptr client -- )
+: MADE-READ ( ^client -- )
    construct kind deleted [: MADE-MEMBER ;] ENTRY-PARSE ;
 
 
@@ -1676,19 +1676,19 @@ private
    ;MATCH ;
 
 
-: FOLDER? ( ptr entry -- bool )
+: FOLDER? ( ^entry -- bool )
    DROPBOX-ENTRY:KIND @ construct kind folder DROPBOX-KIND:EQ ;
 
 
 \ The path is absent, as a delete intends: done, with the entry cleared,
 \ as Dropbox holds none.
-: ABSENT ( ptr client -- reply )
+: ABSENT ( ^client -- reply )
    CLIENT-ENTRY ENTRY-CLEAR construct reply done ;
 
 
 \ A lost delete took effect only if the path is now not found.
-: GONE ( ptr u8 n ptr client -- reply )
-   {: p:ptr pu:n c :}
+: GONE ( ^u8 n ^client -- reply )
+   {: p:^ pu:n c :}
    p pu c METADATA {: r:reply :}
    r NOT-FOUND? if c ABSENT exit then
    r UNCONFIRMED ;
@@ -1698,8 +1698,8 @@ private
 \ done if the path is now not found, as a resent delete that Dropbox
 \ already applied answers, and unlinked if the confirmation is; any other
 \ refusal stands.
-: DELETE-REFUSED ( error ptr u8 n ptr client -- reply )
-   {: e:error p:ptr pu:n c :}
+: DELETE-REFUSED ( error ^u8 n ^client -- reply )
+   {: e:error p:^ pu:n c :}
    e construct error not-found DROPBOX-ERROR:EQ if c ABSENT exit then
    e construct error conflict DROPBOX-ERROR:EQ if
       p pu c METADATA {: m:reply :}
@@ -1710,8 +1710,8 @@ private
 
 
 \ A lost create-folder took effect only if the path is now a folder.
-: MADE ( ptr u8 n ptr client -- reply )
-   {: p:ptr pu:n c :}
+: MADE ( ^u8 n ^client -- reply )
+   {: p:^ pu:n c :}
    p pu c METADATA {: r:reply :}
    r DONE? c CLIENT-ENTRY FOLDER? and if r exit then
    r UNCONFIRMED ;
@@ -1721,8 +1721,8 @@ private
 \ as a resent create-folder that Dropbox already applied answers, and the
 \ entry is that folder, and unlinked if the confirmation is; any other
 \ refusal stands.
-: FOLDER-REFUSED ( error ptr u8 n ptr client -- reply )
-   {: e:error p:ptr pu:n c :}
+: FOLDER-REFUSED ( error ^u8 n ^client -- reply )
+   {: e:error p:^ pu:n c :}
    e construct error conflict DROPBOX-ERROR:EQ if
       p pu c METADATA {: m:reply :}
       m DONE? c CLIENT-ENTRY FOLDER? and
@@ -1735,9 +1735,9 @@ private
 \ A mutation's call: done reads the entry with `read`. A lost answer goes
 \ to `lost` and a refusal to `refusal`, which confirm what Dropbox now
 \ holds, since either may come from a call Dropbox applied.
-: MUTATE ( ptr client ptr u8 n [ ptr client -- ] [ ptr client -- reply ]
-           [ error ptr client -- reply ] -- reply )
-   {: c rt:ptr rtu:n read lost refusal :}
+: MUTATE ( ^client ^u8 n [ ^client -- ] [ ^client -- reply ]
+           [ error ^client -- reply ] -- reply )
+   {: c rt:^ rtu:n read lost refusal :}
    c rt rtu [: JSON-BODY ;] CALL {: r:reply :}
    c LOST? if c lost execute exit then
    r MATCH reply
@@ -1748,16 +1748,16 @@ private
    ;MATCH ;
 
 
-: DELETE-BODY ( ptr u8 n ptr u8 n ptr client -- )
-   {: p:ptr pu:n r:ptr ru:n c :}
+: DELETE-BODY ( ^u8 n ^u8 n ^client -- )
+   {: p:^ pu:n r:^ ru:n c :}
    c BODY-OPEN JSON:WRITE-OBJECT-START
    s" path" p pu JSON:WRITE-FIELD-S
    ru 0<> if JSON:WRITE-COMMA s" parent_rev" r ru JSON:WRITE-FIELD-S then
    JSON:WRITE-OBJECT-END JSON:WRITE-CLOSE ;
 
 
-: FOLDER-BODY ( ptr u8 n ptr client -- )
-   {: p:ptr pu:n c :}
+: FOLDER-BODY ( ^u8 n ^client -- )
+   {: p:^ pu:n c :}
    c BODY-OPEN JSON:WRITE-OBJECT-START
    s" path" p pu JSON:WRITE-FIELD-S JSON:WRITE-COMMA
    s" autorename" false JSON:WRITE-FIELD-BOOL
@@ -1765,8 +1765,8 @@ private
 
 
 \ The code grant's form body, in the line buffer as FORM's is.
-: CODE-FORM ( ptr u8 n ptr u8 n ptr client -- ptr u8 n )
-   {: k:ptr ku:n v:ptr vu:n c :}
+: CODE-FORM ( ^u8 n ^u8 n ^client -- ^u8 n )
+   {: k:^ ku:n v:^ vu:n c :}
    c CLIENT-LINE @ {: buf :}
    buf BUF:CLEAR
    s" grant_type=authorization_code&code=" buf APPEND
@@ -1778,19 +1778,19 @@ private
    buf BUF$ ;
 
 
-: GRANTED-MEMBER ( JSON:reader ptr client -- JSON:reader )
+: GRANTED-MEMBER ( JSON:reader ^client -- JSON:reader )
    {: c :}
    s" refresh_token" JSON:READ-STR-EQ? 0= if c ISSUED-MEMBER exit then
    c STRING c CLIENT-GRANTED ! ;
 
 
-: REPLACED ( SPAN:span<u8> ptr n -- )
+: REPLACED ( SPAN:span<u8> ^n -- )
    {: t:SPAN:span<u8> buf :}
    t SPAN:$ BUF:N>BLEN buf BUF:REPLACE ;
 
 
 \ An exchange's tokens, both kept only when both came.
-: KEPT-GRANT ( ptr client -- reply )
+: KEPT-GRANT ( ^client -- reply )
    {: c :}
    EMPTY c CLIENT-ISSUED ! EMPTY c CLIENT-GRANTED !
    c [: GRANTED-MEMBER ;] PARSE
@@ -1805,16 +1805,16 @@ private
 public
 
 \ files/delete_v2, conditional on the rev unless it is empty.
-: DELETE ( ptr u8 n ptr u8 n ptr client -- reply )
-   {: p:ptr pu:n r:ptr ru:n c :}
+: DELETE ( ^u8 n ^u8 n ^client -- reply )
+   {: p:^ pu:n r:^ ru:n c :}
    p pu r ru c DELETE-BODY
    c s" files/delete_v2" [: DELETED-READ ;] [: drop p pu c GONE ;]
    [: drop p pu c DELETE-REFUSED ;] MUTATE ;
 
 
 \ files/create_folder_v2, which never renames.
-: CREATE-FOLDER ( ptr u8 n ptr client -- reply )
-   {: p:ptr pu:n c :}
+: CREATE-FOLDER ( ^u8 n ^client -- reply )
+   {: p:^ pu:n c :}
    p pu c FOLDER-BODY
    c s" files/create_folder_v2" [: MADE-READ ;] [: drop p pu c MADE ;]
    [: drop p pu c FOLDER-REFUSED ;] MUTATE ;
@@ -1822,14 +1822,14 @@ public
 
 \ oauth2/token's authorization_code grant of the code and its PKCE
 \ verifier; unlinked means the code is dead.
-: EXCHANGE ( ptr u8 n ptr u8 n ptr client -- reply )
-   {: k:ptr ku:n v:ptr vu:n c :}
+: EXCHANGE ( ^u8 n ^u8 n ^client -- reply )
+   {: k:^ ku:n v:^ vu:n c :}
    c [: drop k ku v vu c CODE-FORM ;] TOKEN-POST
    c [: KEPT-GRANT ;] [: drop construct reply unlinked ;] REFRESHED ;
 
 
 \ The refresh token: the config's, or the one an EXCHANGE kept.
-: REFRESH-TOKEN ( ptr client -- ptr u8 n ) CLIENT-TOKEN @ BUF$ ;
+: REFRESH-TOKEN ( ^client -- ^u8 n ) CLIENT-TOKEN @ BUF$ ;
 
 
 \ ---- files/upload and upload sessions
@@ -1876,9 +1876,9 @@ STRUCTURE sha-room DERIVE addr
    FIELD d cells8 FIELD e cells8 FIELD f cells8
 ;STRUCTURE
 
-CAST: CELLS8>BYTES ( ptr cells8 -- ptr u8 )
-CAST: CELLS64>BYTES ( ptr cells64 -- ptr u8 )
-CAST: ROOM>BYTES ( ptr sha-room -- ptr u8 )
+CAST: CELLS8>BYTES ( ^cells8 -- ^u8 )
+CAST: CELLS64>BYTES ( ^cells64 -- ^u8 )
+CAST: ROOM>BYTES ( ^sha-room -- ^u8 )
 
 public
 
@@ -1910,14 +1910,14 @@ TYPED-VARIABLE ID-PROBE cells64
 ROOMS-FIT
 
 
-: BLOCK$ ( ptr hasher -- ptr u8 ) HASHER-BLOCK ROOM>BYTES ;
-: WHOLE$ ( ptr hasher -- ptr u8 ) HASHER-WHOLE ROOM>BYTES ;
-: DIGEST$ ( ptr hasher -- ptr u8 ) HASHER-DIGEST CELLS8>BYTES ;
-: HEX$ ( ptr hasher -- ptr u8 ) HASHER-HEX CELLS8>BYTES ;
+: BLOCK$ ( ^hasher -- ^u8 ) HASHER-BLOCK ROOM>BYTES ;
+: WHOLE$ ( ^hasher -- ^u8 ) HASHER-WHOLE ROOM>BYTES ;
+: DIGEST$ ( ^hasher -- ^u8 ) HASHER-DIGEST CELLS8>BYTES ;
+: HEX$ ( ^hasher -- ^u8 ) HASHER-HEX CELLS8>BYTES ;
 
 
 \ Ends the block, feeds its digest to the whole and starts the next.
-: BLOCK-END ( ptr hasher -- )
+: BLOCK-END ( ^hasher -- )
    {: h :}
    h BLOCK$ h DIGEST$ SHA256-END
    h WHOLE$ h DIGEST$ 32 SHA256-FEED
@@ -1926,8 +1926,8 @@ ROOMS-FIT
 
 
 \ Feeds what fits in the block; answers the bytes it took.
-: BLOCK-FEED ( ptr u8 n ptr hasher -- n )
-   {: a:ptr u:n h :}
+: BLOCK-FEED ( ^u8 n ^hasher -- n )
+   {: a:^ u:n h :}
    BLOCK h HASHER-FILL @ - u min {: k:n :}
    h BLOCK$ a k SHA256-FEED
    k h HASHER-FILL +!
@@ -1936,21 +1936,21 @@ ROOMS-FIT
 
 
 \ Feeds the bytes past done; answers done with the bytes taken added.
-: FEED-PAST ( ptr u8 n n ptr hasher -- n )
-   {: a:ptr u:n done:n h :}
+: FEED-PAST ( ^u8 n n ^hasher -- n )
+   {: a:^ u:n done:n h :}
    a done + u done - h BLOCK-FEED done + ;
 
 public
 
-: HASH-BEGIN ( ptr hasher -- )
+: HASH-BEGIN ( ^hasher -- )
    {: h :}
    0 h HASHER-FILL !
    h BLOCK$ SHA256-BEGIN
    h WHOLE$ SHA256-BEGIN ;
 
 
-: HASH-FEED ( ptr u8 n ptr hasher -- )
-   {: a:ptr u:n h :}
+: HASH-FEED ( ^u8 n ^hasher -- )
+   {: a:^ u:n h :}
    0 begin dup u < while
       a u rot h FEED-PAST
    repeat drop ;
@@ -1958,7 +1958,7 @@ public
 
 \ The 64 lowercase hex digits, held in the hasher until its next
 \ HASH-BEGIN.
-: HASH-END ( ptr hasher -- ptr u8 n )
+: HASH-END ( ^hasher -- ^u8 n )
    {: h :}
    h HASHER-FILL @ 0 > if h BLOCK-END then
    h WHOLE$ h DIGEST$ SHA256-END
@@ -1974,11 +1974,11 @@ private
 \ session's id of id-u bytes; resent and restarted the one resend of a
 \ chunk and the one restart an UPLOAD allows.
 STRUCTURE run OPAQUE DERIVE addr
-   FIELD up ptr upload
-   FIELD client ptr client
+   FIELD up ^upload
+   FIELD client ^client
    FIELD last reply
    FIELD answer reply
-   FIELD buf ptr u8
+   FIELD buf ^u8
    FIELD cap NUM:alloc-byte-len
    FIELD held bool
    FIELD xfer AIO:xfer
@@ -1994,22 +1994,22 @@ STRUCTURE run OPAQUE DERIVE addr
 HEAP RUNS run
 
 
-: SIZE ( ptr run -- n ) RUN-UP @ DROPBOX-UPLOAD:SIZE @ ;
-: CHUNK$ ( ptr run -- ptr u8 n ) dup RUN-BUF @ swap RUN-CHUNK @ ;
-: SESSION$ ( ptr run -- ptr u8 n ) dup RUN-ID CELLS64>BYTES swap RUN-ID-U @ ;
+: SIZE ( ^run -- n ) RUN-UP @ DROPBOX-UPLOAD:SIZE @ ;
+: CHUNK$ ( ^run -- ^u8 n ) dup RUN-BUF @ swap RUN-CHUNK @ ;
+: SESSION$ ( ^run -- ^u8 n ) dup RUN-ID CELLS64>BYTES swap RUN-ID-U @ ;
 
 
 \ ---- reading the stage
 
-: STAGE-FAILED ( ptr run ptr u8 n -- )
-   {: r why:ptr wu:n :}
+: STAGE-FAILED ( ^run ^u8 n -- )
+   {: r why:^ wu:n :}
    LOG-OPEN s" upload of " LOG:TEXT+
    r RUN-UP @ DROPBOX-UPLOAD:PATH @ SPAN:$ LOG:TEXT+
    s" : " LOG:TEXT+ why wu LOG:TEXT+ LOG:;LINE
    E-STAGE throw ;
 
 
-: READ-REFUSED ( ptr run n -- )
+: READ-REFUSED ( ^run n -- )
    {: r errno:n :}
    LOG-OPEN s" upload of " LOG:TEXT+
    r RUN-UP @ DROPBOX-UPLOAD:PATH @ SPAN:$ LOG:TEXT+
@@ -2018,7 +2018,7 @@ HEAP RUNS run
    E-STAGE throw ;
 
 
-: SUBMIT ( ptr run -- ptr run )
+: SUBMIT ( ^run -- ^run )
    {: r :}
    r RUN-UP @ DROPBOX-UPLOAD:FD @ r RUN-BUF @ r RUN-CAP @
    r RUN-CHUNK @ r RUN-ACCEPTED @ AIO:READ r RUN-XFER !
@@ -2027,7 +2027,7 @@ HEAP RUNS run
 
 \ A read owns the buffer from its submission until AWAIT-XFER gives it
 \ back; E-AIO-ENTER leaves it the kernel's, which the loop releases.
-: SUBMITTED ( ptr run -- )
+: SUBMITTED ( ^run -- )
    {: r :}
    false r RUN-HELD !
    r [: SUBMIT ;] catch {: code:n :} drop
@@ -2038,7 +2038,7 @@ HEAP RUNS run
 
 \ Reads chunk bytes of the stage from accepted into the buffer; chunk becomes
 \ the bytes read, fewer at the stage's end.
-: CHUNK-READ ( ptr run -- )
+: CHUNK-READ ( ^run -- )
    {: r :}
    r RUN-CHUNK @ 0= if exit then
    r SUBMITTED
@@ -2052,14 +2052,14 @@ HEAP RUNS run
    ;MATCH ;
 
 
-: SHORT ( ptr run -- )
+: SHORT ( ^run -- )
    s" the stage is shorter than its size" STAGE-FAILED ;
 
 
 \ ---- the requests
 
-: MODE+ ( ptr JSON:writer ptr upload -- ptr JSON:writer )
-   DROPBOX-UPLOAD:REV @ SPAN:$ {: v:ptr vu:n :}
+: MODE+ ( ^JSON:writer ^upload -- ^JSON:writer )
+   DROPBOX-UPLOAD:REV @ SPAN:$ {: v:^ vu:n :}
    vu 0= if s" mode" s" add" JSON:WRITE-FIELD-S exit then
    s" mode" JSON:WRITE-KEY JSON:WRITE-OBJECT-START
    s" .tag" s" update" JSON:WRITE-FIELD-S JSON:WRITE-COMMA
@@ -2067,7 +2067,7 @@ HEAP RUNS run
 
 
 \ Dropbox's CommitInfo, which the single upload's argument extends.
-: COMMIT+ ( ptr JSON:writer ptr upload -- ptr JSON:writer )
+: COMMIT+ ( ^JSON:writer ^upload -- ^JSON:writer )
    {: up :}
    s" path" up DROPBOX-UPLOAD:PATH @ SPAN:$ JSON:WRITE-FIELD-S
    JSON:WRITE-COMMA up MODE+ JSON:WRITE-COMMA
@@ -2075,14 +2075,14 @@ HEAP RUNS run
    s" strict_conflict" true JSON:WRITE-FIELD-BOOL ;
 
 
-: CURSOR+ ( ptr JSON:writer ptr run n -- ptr JSON:writer )
+: CURSOR+ ( ^JSON:writer ^run n -- ^JSON:writer )
    {: r at:n :}
    s" cursor" JSON:WRITE-KEY JSON:WRITE-OBJECT-START
    s" session_id" r SESSION$ JSON:WRITE-FIELD-S JSON:WRITE-COMMA
    s" offset" at JSON:WRITE-FIELD-INT JSON:WRITE-OBJECT-END ;
 
 
-: CLOSE+ ( ptr JSON:writer -- ptr JSON:writer )
+: CLOSE+ ( ^JSON:writer -- ^JSON:writer )
    s" close" false JSON:WRITE-FIELD-BOOL ;
 
 
@@ -2100,8 +2100,8 @@ HEAP RUNS run
 
 
 \ The argument the fields write, the bytes, and the deadlines.
-: ARGUED ( CURL:handle ptr client ptr u8 n [ ptr JSON:writer -- ptr JSON:writer ] [ CURL:handle -- ] -- )
-   {: h:CURL:handle c b:ptr bu:n fields deadline :}
+: ARGUED ( CURL:handle ^client ^u8 n [ ^JSON:writer -- ^JSON:writer ] [ CURL:handle -- ] -- )
+   {: h:CURL:handle c b:^ bu:n fields deadline :}
    c BODY-OPEN JSON:WRITE-OBJECT-START fields execute
    JSON:WRITE-OBJECT-END JSON:WRITE-CLOSE
    c LINE-CLEAR c s" Dropbox-API-Arg: " LINE+
@@ -2113,14 +2113,14 @@ HEAP RUNS run
 
 
 \ A POST of the bytes to <content>/2/<route>, under the deadlines.
-: SENT ( ptr run ptr u8 n ptr u8 n [ ptr JSON:writer -- ptr JSON:writer ] [ CURL:handle -- ] -- reply )
-   {: r rt:ptr ru:n b:ptr bu:n fields deadline :}
+: SENT ( ^run ^u8 n ^u8 n [ ^JSON:writer -- ^JSON:writer ] [ CURL:handle -- ] -- reply )
+   {: r rt:^ ru:n b:^ bu:n fields deadline :}
    r RUN-CLIENT @ {: c :}
    c c CLIENT-CONTENT @ rt ru
    [: b bu fields deadline ARGUED ;] [: RECEIVED ;] CALL-AT ;
 
 
-: SINGLE-SENT ( ptr run -- reply )
+: SINGLE-SENT ( ^run -- reply )
    {: r :}
    r RUN-UP @ {: up :}
    r s" files/upload" r CHUNK$
@@ -2129,19 +2129,19 @@ HEAP RUNS run
    [: STALLED ;] SENT ;
 
 
-: START-SENT ( ptr run -- reply )
+: START-SENT ( ^run -- reply )
    s" files/upload_session/start" s" " [: CLOSE+ ;] [: STALLED ;]
    SENT ;
 
 
-: APPEND-SENT ( ptr run -- reply )
+: APPEND-SENT ( ^run -- reply )
    {: r :}
    r s" files/upload_session/append_v2" r CHUNK$
    [: r r RUN-ACCEPTED @ CURSOR+ JSON:WRITE-COMMA CLOSE+ ;]
    [: STALLED ;] SENT ;
 
 
-: FINISH-SENT ( ptr run -- reply )
+: FINISH-SENT ( ^run -- reply )
    {: r :}
    r s" files/upload_session/finish" s" "
    [: r r SIZE CURSOR+ JSON:WRITE-COMMA
@@ -2155,7 +2155,7 @@ HEAP RUNS run
 \ The committed entry is the upload's: its path_lower is the upload path's
 \ full lowercase, else E-ANSWER, and its content hash, else last is refused
 \ content-hash-mismatch.
-: COMMITTED? ( ptr run -- bool )
+: COMMITTED? ( ^run -- bool )
    {: r :}
    r RUN-CLIENT @ {: c :}
    r RUN-UP @ {: up :}
@@ -2190,14 +2190,14 @@ HEAP RUNS run
 
 
 \ A session Dropbox no longer takes chunks for.
-: GONE-TAG? ( ptr u8 n -- bool )
-   {: t:ptr tu:n :}
+: GONE-TAG? ( ^u8 n -- bool )
+   {: t:^ tu:n :}
    t tu s" not_found" STR= t tu s" closed" STR= or
    t tu s" incorrect_offset" STR= or ;
 
 
 \ incorrect_offset at the chunk's end: Dropbox already holds the chunk.
-: HELD? ( reply ptr run -- bool )
+: HELD? ( reply ^run -- bool )
    {: rep:reply r :}
    rep REFUSAL? 0= if false exit then
    r RUN-CLIENT @ {: c :}
@@ -2205,28 +2205,28 @@ HEAP RUNS run
    c CLIENT-CORRECT @ r RUN-ACCEPTED @ r RUN-CHUNK @ + = and ;
 
 
-: APPEND-GONE? ( reply ptr client -- bool )
+: APPEND-GONE? ( reply ^client -- bool )
    {: rep:reply c :}
    rep REFUSAL? 0= if false exit then
    c TAG$ GONE-TAG? ;
 
 
-: FINISH-GONE? ( reply ptr client -- bool )
+: FINISH-GONE? ( reply ^client -- bool )
    {: rep:reply c :}
    rep REFUSAL? 0= if false exit then
    c TAG$ s" lookup_failed" STR= c LEAF$ GONE-TAG? and ;
 
 
-: SESSION-MEMBER ( JSON:reader ptr client ptr run -- JSON:reader )
+: SESSION-MEMBER ( JSON:reader ^client ^run -- JSON:reader )
    {: c r :}
    s" session_id" JSON:READ-STR-EQ? 0= if SKIP exit then
-   c STRING SPAN:$ {: a:ptr u:n :}
+   c STRING SPAN:$ {: a:^ u:n :}
    u 0= u ID-CAP > or if E-ANSWER throw then
    a r RUN-ID CELLS64>BYTES u BYTE-COPY
    u r RUN-ID-U ! ;
 
 
-: SESSION-READ ( ptr run -- )
+: SESSION-READ ( ^run -- )
    {: r :}
    0 r RUN-ID-U !
    r RUN-CLIENT @ {: c :}
@@ -2247,7 +2247,7 @@ ENUM confirm-event same other unlinked ;ENUM
 ENUM restart-event once twice ;ENUM
 
 
-: SEND-SENSE ( ptr run -- send-event )
+: SEND-SENSE ( ^run -- send-event )
    {: r :}
    r SIZE r RUN-CHUNK !
    r CHUNK-READ
@@ -2263,7 +2263,7 @@ ENUM restart-event once twice ;ENUM
    construct send-event failed ;
 
 
-: START-SENSE ( ptr run -- start-event )
+: START-SENSE ( ^run -- start-event )
    {: r :}
    r START-SENT {: rep:reply :}
    rep r RUN-LAST !
@@ -2272,21 +2272,21 @@ ENUM restart-event once twice ;ENUM
    construct start-event failed ;
 
 
-: ACCEPTED ( ptr run -- append-event )
+: ACCEPTED ( ^run -- append-event )
    {: r :}
    r RUN-ACCEPTED @ r RUN-CHUNK @ + r SIZE =
    if construct append-event complete exit then
    construct append-event stored ;
 
 
-: LOST-AGAIN ( ptr run -- append-event )
+: LOST-AGAIN ( ^run -- append-event )
    {: r :}
    r RUN-RESENT @ if construct append-event cut exit then
    true r RUN-RESENT !
    construct append-event lost ;
 
 
-: APPEND-SENSE ( ptr run -- append-event )
+: APPEND-SENSE ( ^run -- append-event )
    {: r :}
    r RUN-CLIENT @ {: c :}
    r SIZE r RUN-ACCEPTED @ - CHUNK-SIZE min r RUN-CHUNK !
@@ -2301,7 +2301,7 @@ ENUM restart-event once twice ;ENUM
    construct append-event failed ;
 
 
-: FINISH-SENSE ( ptr run -- finish-event )
+: FINISH-SENSE ( ^run -- finish-event )
    {: r :}
    r RUN-CLIENT @ {: c :}
    r FINISH-SENT {: rep:reply :}
@@ -2318,7 +2318,7 @@ ENUM restart-event once twice ;ENUM
 
 \ get_metadata of the path shows a file with the upload's content hash,
 \ or answers unlinked.
-: CONFIRM-SENSE ( ptr run -- confirm-event )
+: CONFIRM-SENSE ( ^run -- confirm-event )
    {: r :}
    r RUN-CLIENT @ {: c :}
    r RUN-UP @ {: up :}
@@ -2332,38 +2332,38 @@ ENUM restart-event once twice ;ENUM
    construct confirm-event other ;
 
 
-: RESTART-SENSE ( ptr run -- restart-event )
+: RESTART-SENSE ( ^run -- restart-event )
    {: r :}
    r RUN-RESTARTED @ if construct restart-event twice exit then
    true r RUN-RESTARTED !
    construct restart-event once ;
 
 
-: ANSWER-DONE ( ptr run -- )
+: ANSWER-DONE ( ^run -- )
    {: r :}
    construct reply done r RUN-ANSWER !
    r SIZE r RUN-ACCEPTED ! ;
 
 
-: ANSWER-RETRY ( ptr run -- ) {: r :} 0 RETRY r RUN-ANSWER ! ;
+: ANSWER-RETRY ( ^run -- ) {: r :} 0 RETRY r RUN-ANSWER ! ;
 
 
-: ANSWER-UNLINKED ( ptr run -- )
+: ANSWER-UNLINKED ( ^run -- )
    {: r :}
    construct reply unlinked r RUN-ANSWER ! ;
 
 
 \ Answers the last call's reply as it came, or as COMMITTED? set it.
-: ANSWER-REPLY ( ptr run -- ) {: r :} r RUN-LAST @ r RUN-ANSWER ! ;
+: ANSWER-REPLY ( ^run -- ) {: r :} r RUN-LAST @ r RUN-ANSWER ! ;
 
 
-: CHUNK-ADVANCE ( ptr run -- )
+: CHUNK-ADVANCE ( ^run -- )
    {: r :}
    r RUN-CHUNK @ r RUN-ACCEPTED +!
    false r RUN-RESENT ! ;
 
 
-: REWIND ( ptr run -- )
+: REWIND ( ^run -- )
    {: r :}
    0 r RUN-ACCEPTED ! false r RUN-RESENT ! ;
 
@@ -2371,7 +2371,7 @@ ENUM restart-event once twice ;ENUM
 \ confirming asks whether an answer it cannot trust took effect; verifying
 \ asks whether a finish whose session is gone was a resend Dropbox already
 \ committed, and starts over only when it was not.
-FSM:DEFINE SESSION ( ptr run ) upload-step send-event
+FSM:DEFINE SESSION ( ^run ) upload-step send-event
    IN single  SEND-SENSE
       committed  ANSWER-DONE   >ended
       lost       -             >confirming
@@ -2411,7 +2411,7 @@ FSM:DEFINE SESSION ( ptr run ) upload-step send-event
 
 \ ---- running an upload
 
-: RUN-INIT ( ptr run ptr upload ptr client -- )
+: RUN-INIT ( ^run ^upload ^client -- )
    {: r up c :}
    up r RUN-UP ! c r RUN-CLIENT !
    0 RETRY r RUN-LAST ! 0 RETRY r RUN-ANSWER !
@@ -2420,18 +2420,18 @@ FSM:DEFINE SESSION ( ptr run ) upload-step send-event
    r RUN-CAP ! r RUN-BUF ! true r RUN-HELD ! ;
 
 
-: RELEASED ( ptr run -- )
+: RELEASED ( ^run -- )
    {: r :}
    r RUN-HELD @ if r RUN-BUF @ r RUN-CAP @ MEM:RELEASE-BYTES then
    r RUNS-RELEASE ;
 
 
-: FIRST ( ptr run -- upload-step )
+: FIRST ( ^run -- upload-step )
    SIZE CHUNK-SIZE > if construct upload-step starting exit then
    construct upload-step single ;
 
 
-: SHOW ( ptr run [ n -- ] -- )
+: SHOW ( ^run [ n -- ] -- )
    {: r progress :}
    r RUN-ACCEPTED @ {: at:n :}
    at r RUN-SHOWN @ = if exit then
@@ -2439,7 +2439,7 @@ FSM:DEFINE SESSION ( ptr run ) upload-step send-event
    at progress execute ;
 
 
-: DRIVE ( ptr run [ n -- ] -- reply )
+: DRIVE ( ^run [ n -- ] -- reply )
    {: r progress :}
    r FIRST
    begin r swap SESSION-STEP r progress SHOW until
@@ -2450,7 +2450,7 @@ public
 \ files/upload of the stage, or an upload session for one over 32 MiB.
 \ progress is called with the bytes Dropbox has accepted each time that
 \ count changes. On done, ENTRY holds the entry Dropbox committed.
-: UPLOAD ( ptr upload ptr client [ n -- ] -- reply )
+: UPLOAD ( ^upload ^client [ n -- ] -- reply )
    {: up c progress :}
    RUNS-NEW {: r :}
    [: r up c RUN-INIT r progress DRIVE ;] [: r RELEASED ;] finally ;

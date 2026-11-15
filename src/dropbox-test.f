@@ -34,8 +34,8 @@ TYPED-VARIABLE PROBE config
 
 
 \ A client on an arena of its own, with PROBE's root and no origins.
-: PROBED ( ptr u8 n ptr ARENA:arena -- ptr client )
-   {: r:ptr ru:n ar :}
+: PROBED ( ^u8 n ^ARENA:arena -- ^client )
+   {: r:^ ru:n ar :}
    r ru SPAN:MAKE PROBE DROPBOX-CONFIG:ROOT !
    PROBE ar OPEN ;
 
@@ -97,20 +97,20 @@ package AIO
 TYPED-VARIABLE DROPBOX-TEST:READ-FAULT DROPBOX-TEST:read-fault
 variable DROPBOX-TEST:FAILING
 \ The buffer the failed read was handed.
-TYPED-VARIABLE DROPBOX-TEST:OFFERED ptr u8
+TYPED-VARIABLE DROPBOX-TEST:OFFERED ^u8
 TYPED-VARIABLE DROPBOX-TEST:OFFERED-CAP NUM:alloc-byte-len
 
 
 \ The record holds the buffer as XFER-STAGE's does, so AWAIT-XFER gives
 \ it back with the record's outcome.
-: DROPBOX-TEST:HOLDS ( ptr u8 NUM:alloc-byte-len n -- )
+: DROPBOX-TEST:HOLDS ( ^u8 NUM:alloc-byte-len n -- )
    {: buf cap:NUM:alloc-byte-len idx:n :}
    buf idx REC-BUF ! cap idx REC-BUF-LEN!
    1 idx REC REC.HOLD ! ;
 
 
 \ A timer of ms in the read's place, which the kernel ends as timed out.
-: DROPBOX-TEST:TIMED-XFER ( ptr u8 NUM:alloc-byte-len n -- n n )
+: DROPBOX-TEST:TIMED-XFER ( ^u8 NUM:alloc-byte-len n -- n n )
    {: buf cap:NUM:alloc-byte-len ms:n :}
    ms HOST-TIMEOUT {: rc:n idx:n :}
    rc 0<> if rc idx exit then
@@ -119,7 +119,7 @@ TYPED-VARIABLE DROPBOX-TEST:OFFERED-CAP NUM:alloc-byte-len
 
 \ A minute's timer in the read's place, cancelled at once: the kernel ends
 \ it as cancelled. A refused cancel leaves the buffer the caller's.
-: DROPBOX-TEST:CANCELLED-XFER ( ptr u8 NUM:alloc-byte-len -- n n )
+: DROPBOX-TEST:CANCELLED-XFER ( ^u8 NUM:alloc-byte-len -- n n )
    {: buf cap:NUM:alloc-byte-len :}
    60000 HOST-TIMEOUT {: rc:n idx:n :}
    rc 0<> if rc idx exit then
@@ -132,7 +132,7 @@ TYPED-VARIABLE DROPBOX-TEST:OFFERED-CAP NUM:alloc-byte-len
 \ E-AIO-ENTER leaves it with the kernel, which the test plays: it keeps
 \ OFFERED and releases it as AIO's loop would at the late completion.
 \ Runs under AIO-LOCK, as every HOST-XFER does.
-: DROPBOX-TEST:STAGE-XFER ( n ptr u8 NUM:alloc-byte-len n n n -- n n )
+: DROPBOX-TEST:STAGE-XFER ( n ^u8 NUM:alloc-byte-len n n n -- n n )
    {: f:n buf cap:NUM:alloc-byte-len count:n off:n kind:n :}
    f DROPBOX-TEST:FAILING @ <> if
       f buf cap count off kind XFER-STAGE exit
@@ -161,8 +161,8 @@ package DROPBOX-TEST
 private
 
 TYPED-VARIABLE CFG DROPBOX:config
-TYPED-VARIABLE AR ptr ARENA:arena
-TYPED-VARIABLE MAIN ptr DROPBOX:client
+TYPED-VARIABLE AR ^ARENA:arena
+TYPED-VARIABLE MAIN ^DROPBOX:client
 
 
 : ASSERT ( bool -- ) dup T-ASSERT 0= if T-REPORT then ;
@@ -207,8 +207,8 @@ TYPED-VARIABLE MAIN ptr DROPBOX:client
 
 
 \ A client on the fake with the refresh token and root.
-: OPENED ( ptr u8 n ptr u8 n -- ptr DROPBOX:client )
-   {: t:ptr tu:n r:ptr ru:n :}
+: OPENED ( ^u8 n ^u8 n -- ^DROPBOX:client )
+   {: t:^ tu:n r:^ ru:n :}
    CFG DROPBOX:PRODUCTION
    TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:API !
    TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:NOTIFY !
@@ -311,14 +311,14 @@ TYPED-VARIABLE ACTION [ -- ]
 TYPED-VARIABLE OUTCOME bool
 
 
-: ERR-PATH$ ( -- ptr u8 n ) ERR-PATH ERR-PATH-U @ ;
-: ERR$ ( -- ptr u8 n ) ERR ERR-U @ ;
+: ERR-PATH$ ( -- ^u8 n ) ERR-PATH ERR-PATH-U @ ;
+: ERR$ ( -- ^u8 n ) ERR ERR-U @ ;
 
 
 \ TMPDIR/<name> at dst; answers its length.
-: IN-TMP ( ptr u8 n ptr u8 -- n )
-   {: nm:ptr nu:n dst:ptr :}
-   s" TMPDIR" GETENV {: d:ptr du:n :}
+: IN-TMP ( ^u8 n ^u8 -- n )
+   {: nm:^ nu:n dst:^ :}
+   s" TMPDIR" GETENV {: d:^ du:n :}
    d dst du BYTE-COPY
    47 dst du + c!
    nm dst du + 1+ nu BYTE-COPY
@@ -336,28 +336,28 @@ TYPED-VARIABLE OUTCOME bool
    ERR-PATH$ FS:REMOVE-FILE ;
 
 
-: LINES ( ptr u8 n -- n )
-   {: a:ptr u:n :}
+: LINES ( ^u8 n -- n )
+   {: a:^ u:n :}
    0 u 0 ?do a i + c@ 10 = if 1+ then loop ;
 
 
 \ ERR$ is one line that holds the text.
-: LOGGED? ( ptr u8 n -- bool )
-   {: t:ptr tu:n :}
+: LOGGED? ( ^u8 n -- bool )
+   {: t:^ tu:n :}
    ERR$ LINES 1 = ERR$ t tu CONTAINS? and ;
 
 
 \ A case's own client, for an action LOGGED runs.
-TYPED-VARIABLE OWN ptr DROPBOX:client
+TYPED-VARIABLE OWN ^DROPBOX:client
 
 
 \ OUTCOME: the client's account call answered unlinked.
-: ACCOUNT-UNLINKED ( ptr DROPBOX:client -- )
+: ACCOUNT-UNLINKED ( ^DROPBOX:client -- )
    DROPBOX:ACCOUNT UNLINKED? OUTCOME ! ;
 
 
 \ The client's account call, logged: it answers unlinked.
-: UNLINKED-LOGGED ( ptr DROPBOX:client -- )
+: UNLINKED-LOGGED ( ^DROPBOX:client -- )
    OWN ! false OUTCOME !
    [: OWN @ ACCOUNT-UNLINKED ;] LOGGED 0 T=
    OUTCOME @ TTRUE ;
@@ -596,13 +596,13 @@ create GOT GOT-CAP allot
 variable GOT-U
 
 
-: GOT+ ( ptr u8 n -- )
-   {: a:ptr u:n :}
+: GOT+ ( ^u8 n -- )
+   {: a:^ u:n :}
    a u GOT GOT-U @ + GOT-CAP GOT-U @ - SPAN:MAKE SPAN:COPY
    u GOT-U +! ;
 
 
-: KIND$ ( DROPBOX:kind -- ptr u8 n )
+: KIND$ ( DROPBOX:kind -- ^u8 n )
    MATCH DROPBOX:kind
       file OF s" f" ENDOF
       folder OF s" d" ENDOF
@@ -612,14 +612,14 @@ variable GOT-U
 
 \ Each entry handed on, as its kind's letter and path_lower, joined by
 \ spaces.
-: SAW ( ptr DROPBOX:entry -- )
+: SAW ( ^DROPBOX:entry -- )
    {: e :}
    GOT-U @ 0<> if s"  " GOT+ then
    e DROPBOX-ENTRY:KIND @ KIND$ GOT+
    e DROPBOX-ENTRY:LOWER @ SPAN:$ GOT+ ;
 
 
-: GOT$ ( -- ptr u8 n ) GOT GOT-U @ ;
+: GOT$ ( -- ^u8 n ) GOT GOT-U @ ;
 : LISTING ( -- ) TEST-DROPBOX:RESET 0 GOT-U ! ;
 
 
@@ -643,8 +643,8 @@ variable GOT-U
 
 \ A listing of one page that answers done with the cursor, so a case sets
 \ the cursor it starts from.
-: LISTED ( ptr u8 n -- )
-   {: k:ptr ku:n :}
+: LISTED ( ^u8 n -- )
+   {: k:^ ku:n :}
    LISTING
    S\" [{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/sync\q,\qpath_display\q:\q/Sync\q}]"
    k ku false TEST-DROPBOX:PAGE!
@@ -741,8 +741,8 @@ variable SUNK-AT
 
 \ A download's sink: each chunk appended to SUNK, its offset the one after
 \ the last; SUNK-AT keeps the first chunk's.
-: SUNK+ ( ptr u8 n n -- )
-   {: a:ptr u:n off:n :}
+: SUNK+ ( ^u8 n n -- )
+   {: a:^ u:n off:n :}
    SUNK-U @ 0= if off SUNK-AT ! then
    off SUNK-AT @ SUNK-U @ + T=
    SUNK-U @ u + 64 > if false ASSERT exit then
@@ -750,7 +750,7 @@ variable SUNK-AT
    u SUNK-U +! ;
 
 
-: SUNK$ ( -- ptr u8 n ) SUNK SUNK-U @ ;
+: SUNK$ ( -- ^u8 n ) SUNK SUNK-U @ ;
 
 
 \ The alphabet as the file at rev 0160a1b2c3d4.
@@ -923,7 +923,7 @@ variable SUNK-AT
 
 
 \ A sink that fails as a full disk would.
-: REFUSING ( ptr u8 n n -- ) 2drop drop 77 throw ;
+: REFUSING ( ^u8 n n -- ) 2drop drop 77 throw ;
 
 
 \ DOWNLOAD rethrows its sink's throw and leaves the client usable.
@@ -948,11 +948,11 @@ variable SUNK-AT
    MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:KIND @ DROPBOX-KIND:EQ ;
 
 
-: LOWER$ ( -- ptr u8 n ) MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:LOWER @ SPAN:$ ;
+: LOWER$ ( -- ^u8 n ) MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:LOWER @ SPAN:$ ;
 
 
-: DELETED-FILE ( ptr u8 n ptr u8 n -- )
-   {: l:ptr lu:n r:ptr ru:n :}
+: DELETED-FILE ( ^u8 n ^u8 n -- )
+   {: l:^ lu:n r:^ ru:n :}
    l lu l lu r ru
    s" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
    0 TEST-DROPBOX:FILE! ;
@@ -1156,7 +1156,7 @@ variable SUNK-AT
 
 
 \ Bytes a form reserves: each must reach Dropbox encoded.
-: RESERVED$ ( -- ptr u8 n ) s" a+b&c=d%e f" ;
+: RESERVED$ ( -- ^u8 n ) s" a+b&c=d%e f" ;
 
 
 : RESERVED-REFRESH-CASE ( -- )
@@ -1220,13 +1220,13 @@ TYPED-VARIABLE FAULT fault
 
 
 \ Byte i of every patterned file is i mod 256.
-: PATTERN ( ptr u8 n -- )
-   {: a:ptr u:n :}
+: PATTERN ( ^u8 n -- )
+   {: a:^ u:n :}
    u 0 ?do i 255 and a i + c! loop ;
 
 
-: HASHED ( ptr u8 n -- ptr u8 n )
-   {: a:ptr u:n :}
+: HASHED ( ^u8 n -- ^u8 n )
+   {: a:^ u:n :}
    HASHER DROPBOX:HASH-BEGIN
    a u HASHER DROPBOX:HASH-FEED
    HASHER DROPBOX:HASH-END ;
@@ -1236,7 +1236,7 @@ TYPED-VARIABLE FAULT fault
 : HASH-CASE ( -- )
    s" content hash" T-LABEL
    BLOCK 1+ MEM:BYTES-ALLOC-LEN MEM:ALLOC-BYTES
-   {: a:ptr cap:NUM:alloc-byte-len :}
+   {: a:^ cap:NUM:alloc-byte-len :}
    a BLOCK 1+ PATTERN
    a 0 HASHED
    s" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" T$=
@@ -1249,17 +1249,17 @@ TYPED-VARIABLE FAULT fault
    a cap MEM:RELEASE-BYTES ;
 
 
-: STAGE$ ( -- ptr u8 n ) STAGE STAGE-U @ ;
+: STAGE$ ( -- ^u8 n ) STAGE STAGE-U @ ;
 
 
 \ TMPDIR/<name>, made fresh.
-: STAGE! ( ptr u8 n -- ) STAGE IN-TMP STAGE-U ! ;
+: STAGE! ( ^u8 n -- ) STAGE IN-TMP STAGE-U ! ;
 
 
 \ Writes the bytes as the stage, opens it and removes its name before any
 \ check can end the run, and readies UP to upload them to path over rev.
-: STAGED ( ptr u8 n ptr u8 n ptr u8 n -- )
-   {: b:ptr bu:n p:ptr pu:n r:ptr ru:n :}
+: STAGED ( ^u8 n ^u8 n ^u8 n -- )
+   {: b:^ bu:n p:^ pu:n r:^ ru:n :}
    STAGE$ b bu FS:WRITE-ALL
    STAGE$ FS:OPEN-SIZED STAGE$ FS:REMOVE-FILE ASSERT {: f:fd size:n :}
    f UP DROPBOX-UPLOAD:FD !
@@ -1273,7 +1273,7 @@ TYPED-VARIABLE FAULT fault
 : UNSTAGED ( -- ) UP DROPBOX-UPLOAD:FD @ FD>N close ;
 
 
-: EXPECTED$ ( -- ptr u8 n ) EXPECTED 64 ;
+: EXPECTED$ ( -- ^u8 n ) EXPECTED 64 ;
 
 
 \ The next call answers lookup_failed/not_found, as Dropbox answers a
@@ -1326,7 +1326,7 @@ TYPED-VARIABLE FAULT fault
    UP MAIN @ [: PROGRESSED ;] DROPBOX:UPLOAD ;
 
 
-: ENTRY-HASH$ ( -- ptr u8 n )
+: ENTRY-HASH$ ( -- ^u8 n )
    MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$ ;
 
 
@@ -1386,7 +1386,7 @@ TYPED-VARIABLE FAULT fault
    SEND DONE? ASSERT
    MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:LOWER @ SPAN:$
    S\" /docs/caf\xc3\xa9.txt" T$=
-   S\" {\qpath\q:\q/Docs/Caf\\u00e9.txt\q," {: x:ptr xu:n :}
+   S\" {\qpath\q:\q/Docs/Caf\\u00e9.txt\q," {: x:^ xu:n :}
    TEST-DROPBOX:ARG-SENT$ xu min x xu T$=
    UNSTAGED ;
 
@@ -1407,8 +1407,8 @@ TYPED-VARIABLE FAULT fault
 
 
 \ ERR$ holds the line UPLOAD logs for a failure of UP's stage.
-: STAGE-LOGGED? ( ptr u8 n -- bool )
-   {: why:ptr wu:n :}
+: STAGE-LOGGED? ( ^u8 n -- bool )
+   {: why:^ wu:n :}
    SB-RESET s" error dropbox: upload of " SB-APPEND
    UP DROPBOX-UPLOAD:PATH @ SPAN:$ SB-APPEND
    s" : " SB-APPEND why wu SB-APPEND
@@ -1549,7 +1549,7 @@ TYPED-VARIABLE FAULT fault
 \ A file one byte over a chunk: two appends.
 : BIG-STAGED ( -- )
    CHUNK 1+ MEM:BYTES-ALLOC-LEN MEM:ALLOC-BYTES
-   {: a:ptr cap:NUM:alloc-byte-len :}
+   {: a:^ cap:NUM:alloc-byte-len :}
    a CHUNK 1+ PATTERN
    s" big.bin" STAGE! a CHUNK 1+ s" /Big.bin" s" " STAGED
    a cap MEM:RELEASE-BYTES ;
