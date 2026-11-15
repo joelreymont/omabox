@@ -15,9 +15,12 @@ require src/lib/arena.f
 require src/lib/log.f
 require src/lib/adt/option.f
 require src/lib/vector.f
+require src/lib/span.f
+require src/lib/fd.f
 require src/dropbox.f
 require src/model.f
 require src/journal.f
+require src/local.f
 
 package REPLAY
 public
@@ -286,5 +289,94 @@ public
    loop
    0 plans VEC:COUNT 0 ?do plans i rot KEPT loop
    plans swap VEC:RESIZE ;
+
+
+\ ---- local conflict copies ------------------------------------------
+
+private
+
+\ Closes a descriptor; as Rust's drop of a File, it ignores close's own
+\ failure.
+: DISCARD ( fd -- ) FD>N close ;
+
+\ The span filled from the open upload, or the bytes before its end.
+: UPLOAD-READ ( fd ^u8 n -- n )
+   {: f:fd p:^ u:n :}
+   f p u SPAN:MAKE FD:READ-EXACT MATCH FD:fill
+      full OF u ENDOF
+      eof OF ENDOF
+   ;MATCH ;
+
+: COPY-OCCUPIED ( -- copy-outcome )
+   MODEL-BLOCKAGE:CONFLICT-COPY-OCCUPIED REPLAY-COPY--OUTCOME:BLOCKED ;
+: DROP-COPY ( copy-outcome -- ) drop ;
+
+: >COPY-OUTCOME ( LOCAL:conflict-outcome -- copy-outcome )
+   MATCH LOCAL:conflict-outcome
+      created OF drop REPLAY-COPY--OUTCOME:READY ENDOF
+      already-present OF drop REPLAY-COPY--OUTCOME:READY ENDOF
+      content-changed OF
+         drop REPLAY-COPY--OUTCOME:SOURCE-CHANGED
+      ENDOF
+   ;MATCH ;
+
+\ Rust's copy_name_occupied. Writing a conflict copy, LOCAL throws these
+\ only for the entry at the copy's own name: a directory, symlink or
+\ special file, or a file Omabox cannot read.
+: COPY-NAME-OCCUPIED? ( n -- bool )
+   {: code:n :}
+   code LOCAL:E-UNSUPPORTED = code LOCAL:E-UNREADABLE = or ;
+
+\ Whether a failed copy found its name held: by other bytes, or by an
+\ entry Omabox cannot replace.
+: OCCUPIED? ( n -- bool )
+   {: code:n :}
+   code LOCAL:E-OCCUPIED = if true exit then
+   code COPY-NAME-OCCUPIED? ;
+
+\ The upload's bytes, read from f, written as path's local conflict copy.
+: WRITE-COPY
+   ( fd ^u8 n MODEL:path ^LOCAL:staged-upload fd ^ARENA:arena
+     -- LOCAL:conflict-outcome )
+   {: root:fd r:^ ru:n path:MODEL:path up:^LOCAL:staged-upload f:fd
+      ar:^ARENA:arena :}
+   root r ru path MODEL:PATH>STR str> LOCAL-CONFLICT--SIDE:LOCAL
+   up LOCAL:UPLOAD-CONTENT [: f -rot UPLOAD-READ ;] ar
+   LOCAL:MATERIALIZE-CONFLICT-AT ;
+
+\ An occupied copy name blocks the copy; another failure passes up.
+: COPY-IN
+   ( fd ^u8 n MODEL:path ^LOCAL:staged-upload fd ^ARENA:arena
+     -- copy-outcome )
+   {: root:fd r:^ ru:n path:MODEL:path up:^LOCAL:staged-upload f:fd
+      ar:^ARENA:arena :}
+   COPY-OCCUPIED [: DROP-COPY root r ru path up f ar WRITE-COPY
+      >COPY-OUTCOME ;] catch {: code:n :}
+   code 0= if exit then
+   drop code OCCUPIED? if COPY-OCCUPIED exit then
+   code throw ;
+
+\ COPY-IN from the verified upload, which closes after it.
+: COPY-FROM-UPLOAD
+   ( fd ^u8 n MODEL:path ^LOCAL:staged-upload ^ARENA:arena
+     -- copy-outcome )
+   {: root:fd r:^ ru:n path:MODEL:path up:^LOCAL:staged-upload
+      ar:^ARENA:arena :}
+   up ar LOCAL:OPEN-VERIFIED-UPLOAD {: f:fd :}
+   [: root r ru path up f ar COPY-IN ;] [: f DISCARD ;] finally ;
+
+public
+
+\ Writes the staged upload as path's local conflict copy below the sync
+\ root, whose absolute path is r; it never overwrites a file.
+: MATERIALIZE-LOCAL-CONFLICT
+   ( ^u8 n MODEL:path ^LOCAL:staged-upload ^ARENA:arena
+     -- copy-outcome )
+   {: r:^ ru:n path:MODEL:path up:^LOCAL:staged-upload
+      ar:^ARENA:arena :}
+   r ru s" open sync root for local conflict" LOCAL:OPEN-ROOT
+   {: root:fd :}
+   [: root r ru path up ar COPY-FROM-UPLOAD ;] [: root DISCARD ;]
+   finally ;
 
 ;package
