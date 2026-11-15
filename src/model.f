@@ -239,6 +239,26 @@ $2E constant DOT
    begin 2>r p u root 2r> add STEP 0= until
    drop ;
 
+\ The component from `at` that PART? accepts and the index after it;
+\ false past the last.
+: NEXT-PART ( ^u8 n n -- ^u8 n n bool )
+   {: p:^ u:n at:n :}
+   p u SLASH at SPLIT-NEXT 0= if false exit then
+   {: q:^ v:n next:n :}
+   q v PART? if q v next true exit then
+   p u next RECURSE ;
+
+\ For PARTS over q: the index in p after p's next component when that is
+\ q's component, else -1, which every later component keeps.
+: MATCH-PART ( n bool ^u8 n ^u8 n -- n )
+   {: at:n root:bool q:^ v:n p:^ u:n :}
+   at 0 < if -1 exit then
+   q v PART? 0= if at exit then
+   p u at NEXT-PART 0= if 2drop drop -1 exit then
+   {: a:^ au:n next:n :}
+   a au q v STR= if next exit then
+   -1 ;
+
 : BYTES ( key -- ^u8 n ) KEY>STR str> ;
 
 \ The key's bytes then one byte, laid in the arena.
@@ -424,6 +444,16 @@ public
 : SUBTREE-RANGE ( key ^ARENA:arena -- str str )
    {: k:key ar:^ARENA:arena :}
    k SLASH ar EXTENDED k SLASH 1+ ar EXTENDED ;
+
+\ Rust's Path::starts_with: the second path's components, its root or
+\ leading "." included, begin the first's, byte for byte. PARTS starts
+\ at the second's lead length, which the first's lead shares.
+: BEGINS? ( path path -- bool )
+   {: a:path b:path :}
+   a PATH>STR str> {: p:^ u:n :}
+   b PATH>STR str> {: q:^ v:n :}
+   p p u LEAD q q v LEAD STR= 0= if false exit then
+   q v [: p u MATCH-PART ;] PARTS 0 >= ;
 
 : LOCAL= ( local local -- bool )
    {: a:local b:local :}
@@ -1049,11 +1079,17 @@ ARENA CURSORS JSON:cursor
    r READING-UNMAKE drop JSON:READ-DISPOSE
    code STORED-CODE throw ;
 
+public
+
+\ The empty seeds a read replaces.
 : NO-HASH ( -- DROPBOX:hash ) NONE DROPBOX:>HASH ;
+: NO-FINGERPRINT ( -- fingerprint ) 0 0 0 0 0 0 MODEL-FINGERPRINT:MAKE ;
+
+private
+
 : NO-REV ( -- DROPBOX:rev ) NONE DROPBOX:>REV ;
 : NO-LOCAL ( -- local ) NO-HASH MODEL-LOCAL:MAKE ;
 : NO-REMOTE ( -- remote ) NO-HASH NO-REV MODEL-REMOTE:MAKE ;
-: NO-FINGERPRINT ( -- fingerprint ) 0 0 0 0 0 0 MODEL-FINGERPRINT:MAKE ;
 
 \ A seed's typed drop, which types the read that replaces it.
 : DROP-HASH ( DROPBOX:hash -- ) drop ;

@@ -530,7 +530,7 @@ private
       some OF v = ENDOF
    ;MATCH ;
 
-: NO-SUBVOLUME? ( option<n> -- bool )
+: NO-INT? ( option<n> -- bool )
    MATCH option
       none OF true ENDOF
       some OF drop false ENDOF
@@ -538,7 +538,7 @@ private
 
 : SUBVOLUME= ( option<n> option<n> -- bool )
    MATCH option
-      none OF NO-SUBVOLUME? ENDOF
+      none OF NO-INT? ENDOF
       some OF SOME-SUBVOLUME= ENDOF
    ;MATCH ;
 
@@ -1025,11 +1025,10 @@ BUF:HDR-BYTES TASK:+USERS ENCODED u8
 : DROP-REMOTE ( MODEL:observation<MODEL:remote> -- ) drop ;
 : DROP-FINGERPRINT ( MODEL:fingerprint -- ) drop ;
 : DROP-HASH ( DROPBOX:hash -- ) drop ;
-
-: NO-FINGERPRINT ( -- MODEL:fingerprint )
-   0 0 0 0 0 0 MODEL-FINGERPRINT:MAKE ;
-
-: NO-HASH ( -- DROPBOX:hash ) s" " >str DROPBOX:>HASH ;
+: DROP-BASELINE ( MODEL:baseline -- ) drop ;
+: DROP-OPERATION ( MODEL:operation -- ) drop ;
+: DROP-BLOCKAGE ( MODEL:blockage -- ) drop ;
+: DROP-CONFLICT ( MODEL:conflict -- ) drop ;
 
 : NO-CURSOR ( -- option<DROPBOX:cursor> ) OPTION:NONE ;
 
@@ -1050,7 +1049,7 @@ BUF:HDR-BYTES TASK:+USERS ENCODED u8
 : HASH-VALUE-OF
    ( str str ^ARENA:arena -- MODEL:fingerprint DROPBOX:hash )
    {: json:str path:str ar :}
-   NO-FINGERPRINT NO-HASH
+   MODEL:NO-FINGERPRINT MODEL:NO-HASH
    [: DROP-HASH DROP-FINGERPRINT json ar MODEL:JSON>HASH-VALUE ;]
    s" deserialize local hash cache" >str path DECODE ;
 
@@ -1581,17 +1580,9 @@ STRUCTURE plan-state
 ;STRUCTURE
 
 $FFFFFFFF constant U32-MAX
-$2F constant SLASH
-$2E constant DOT
-$30 constant SUBTREE-END       \ the byte after SLASH
 
 
 \ ---- stored values -------------------------------------------------
-
-\ A seed's typed drop, which types the read that replaces it.
-: DROP-BASELINE ( MODEL:baseline -- ) drop ;
-: DROP-OPERATION ( MODEL:operation -- ) drop ;
-: DROP-BLOCKAGE ( MODEL:blockage -- ) drop ;
 
 : DECODE-BASELINE ( str MODEL:path ^ARENA:arena -- MODEL:baseline )
    {: json:str path ar :}
@@ -1749,58 +1740,6 @@ private
 
 \ ---- a case-collision rename ---------------------------------------
 
-: DOT? ( ^u8 n -- bool )
-   {: p:^ u :}
-   u 1 = if p c@ DOT = exit then
-   false ;
-
-\ The bytes of a path's root or leading "." component.
-: LEAD ( ^u8 n -- n )
-   {: p:^ u :}
-   u 0= if 0 exit then
-   p c@ SLASH = if 1 exit then
-   p u SLASH 0 SPLIT-NEXT 2drop DOT? if 1 exit then
-   0 ;
-
-\ The component from at and the index after it, empty and "." ones
-\ skipped; false past the last.
-: NEXT-PART ( ^u8 n n -- ^u8 n n bool )
-   {: p:^ u at :}
-   p u SLASH at SPLIT-NEXT 0= if false exit then
-   {: q:^ v next :}
-   v 0= q v DOT? or if p u next RECURSE exit then
-   q v next true ;
-
-\ Whether the second path's components from its index match the first's
-\ from its, each in turn.
-: FOLLOWS? ( ^u8 n n ^u8 n n -- bool )
-   {: p:^ u pat q:^ v qat :}
-   q v qat NEXT-PART 0= if 2drop drop true exit then
-   {: b:^ bu qnext :}
-   p u pat NEXT-PART 0= if 2drop drop false exit then
-   {: a:^ au pnext :}
-   a au b bu STR= 0= if false exit then
-   p u pnext q v qnext RECURSE ;
-
-\ Rust's Path::starts_with: the second path's components, its root or
-\ leading "." included, begin the first's.
-: BEGINS? ( MODEL:path MODEL:path -- bool )
-   PATH-BYTES {: q:^ v :}
-   PATH-BYTES {: p:^ u :}
-   p u LEAD {: pl :}
-   q v LEAD {: ql :}
-   p pl q ql STR= 0= if false exit then
-   p u pl q v ql FOLLOWS? ;
-
-\ The canonical path with one byte after it, in the arena.
-: SUFFIXED ( MODEL:key n ^ARENA:arena -- ^u8 n )
-   {: k c ar :}
-   k KEY-BYTES {: p:^ u :}
-   ar u 1+ ARENA:ALLOC drop {: dst:^ :}
-   p dst u BYTE-COPY
-   c dst u + c!
-   dst u 1+ ;
-
 : FORGET ( SQLITE:connection MODEL:key -- )
    {: c k :}
    c s" DELETE FROM baselines WHERE canonical_path = ?1"
@@ -1820,14 +1759,13 @@ private
    ( SQLITE:connection MODEL:key ^ARENA:arena -- ^VEC:vector<spelling> )
    {: c k ar :}
    ar [type] spelling NEW-VECTOR {: found :}
-   k SLASH ar SUFFIXED {: from:^ fu :}
-   k SUBTREE-END ar SUFFIXED {: to:^ tu :}
+   k ar MODEL:SUBTREE-RANGE {: from:str to:str :}
    c s" SELECT canonical_path, path FROM baselines
       WHERE canonical_path = ?1
          OR (canonical_path >= ?2 AND canonical_path < ?3)"
    [: k KEY-BYTES 1 SQLITE:BIND-BLOB
-      from fu 2 SQLITE:BIND-BLOB
-      to tu 3 SQLITE:BIND-BLOB
+      from str> 2 SQLITE:BIND-BLOB
+      to str> 3 SQLITE:BIND-BLOB
       begin SQLITE:STEP while found ar COLLECT-SPELLING repeat ;]
    SQLITE:WITH-STATEMENT
    found ;
@@ -1838,7 +1776,7 @@ private
    ( SQLITE:connection MODEL:path [ MODEL:path -- bool ] spelling -- )
    {: c renamed exists s :}
    s SPELLING-UNMAKE {: k path :}
-   path renamed BEGINS? if c k FORGET exit then
+   path renamed MODEL:BEGINS? if c k FORGET exit then
    path exists execute if exit then
    c k FORGET ;
 
@@ -1888,19 +1826,13 @@ private
    {: op:str path d:^ du :}
    op path MODEL:PATH>STR d du >str INVALID ;
 
-: DECODE-STATUS ( ^u8 n str MODEL:path -- record-status )
-   {: s:^ u op:str path :}
+: DECODE-STATUS ( ^u8 n str str -- record-status )
+   {: s:^ u op:str path:str :}
    s u s" pending" STR= if construct record-status pending exit then
    s u s" completed" STR= if construct record-status completed exit then
-   op path s" record has an unrecognized status" PATH-INVALID ;
+   op path s" record has an unrecognized status" >str INVALID ;
 
 : NO-JSON? ( option<str> -- bool )
-   MATCH option
-      none OF true ENDOF
-      some OF drop false ENDOF
-   ;MATCH ;
-
-: NO-RETRY? ( option<n> -- bool )
    MATCH option
       none OF true ENDOF
       some OF drop false ENDOF
@@ -1946,7 +1878,7 @@ private
    ( ^u8 n option<str> option<n> str MODEL:path ^ARENA:arena
      -- plan-status )
    {: s:^ u json retry op:str path ar :}
-   json NO-JSON? retry NO-RETRY? and {: clear:bool :}
+   json NO-JSON? retry NO-INT? and {: clear:bool :}
    s u s" pending" STR= clear and if
       construct plan-status pending exit
    then
@@ -1975,8 +1907,8 @@ private
    {: at op:str path ar :}
    at 1+ SQLITE:COL-INT op path ORDINAL {: ordinal :}
    at 2 + SQLITE:COL-TEXT >str path ar DECODE-OPERATION {: o :}
-   at 3 + SQLITE:COL-TEXT s" read operation status" >str path
-   DECODE-STATUS {: s :}
+   at 3 + SQLITE:COL-TEXT s" read operation status" >str
+   path MODEL:PATH>STR DECODE-STATUS {: s :}
    at SQLITE:COL-INT >OPERATION-ID {: id :}
    id ordinal o s JOURNAL-PLANNED--OPERATION:MAKE ;
 
@@ -2022,13 +1954,13 @@ private
    then
    plans id path planned op ar NEW-PLAN-ROW ;
 
-\ Every plan whose status is the text, by PLAN-QUERY.
+\ Every plan whose status is the text, each one's operations in order.
 : READ-PLANS-WITH-STATUS
-   ( SQLITE:connection ^u8 n ^u8 n str ^ARENA:arena
+   ( SQLITE:connection ^u8 n str ^ARENA:arena
      -- ^VEC:vector<plan-record> )
-   {: c q:^ qu s:^ su op:str ar :}
+   {: c s:^ su op:str ar :}
    ar [type] plan-record NEW-VECTOR {: plans :}
-   c q qu
+   c PLAN-QUERY
    [: s su 1 SQLITE:BIND-TEXT
       begin SQLITE:STEP while plans op ar PLAN-ROW repeat ;]
    SQLITE:WITH-STATEMENT
@@ -2303,14 +2235,14 @@ public
 \ order.
 : PENDING-PLANS ( journal ^ARENA:arena -- ^VEC:vector<plan-record> )
    {: j ar :}
-   j >CONNECTION PLAN-QUERY s" pending" s" read pending plans" >str ar
+   j >CONNECTION s" pending" s" read pending plans" >str ar
    READ-PLANS-WITH-STATUS ;
 
 \ Every plan a classified failure holds, by id, each one's operations in
 \ order.
 : BLOCKED-PLANS ( journal ^ARENA:arena -- ^VEC:vector<plan-record> )
    {: j ar :}
-   j >CONNECTION PLAN-QUERY s" blocked" s" read blocked plans" >str ar
+   j >CONNECTION s" blocked" s" read blocked plans" >str ar
    READ-PLANS-WITH-STATUS ;
 
 private
@@ -2510,8 +2442,6 @@ STRUCTURE operation-state
 
 \ ---- completions and conflicts: stored values ---------------------
 
-: DROP-CONFLICT ( MODEL:conflict -- ) drop ;
-
 : DECODE-CONFLICT ( str MODEL:path ^ARENA:arena -- MODEL:conflict )
    {: json:str path ar :}
    s" " >str DROPBOX:>HASH MODEL-LOCAL:MAKE MODEL-CONFLICT:remote-deleted
@@ -2534,13 +2464,6 @@ STRUCTURE operation-state
 : DONE? ( record-status -- bool )
    MATCH record-status
       pending OF false ENDOF
-      completed OF true ENDOF
-   ;MATCH ;
-
-: PLAN-DONE? ( plan-status -- bool )
-   MATCH plan-status
-      pending OF false ENDOF
-      blocked OF 2drop false ENDOF
       completed OF true ENDOF
    ;MATCH ;
 
@@ -2656,8 +2579,8 @@ STRUCTURE operation-state
    ( SQLITE:statement ^ARENA:arena -- SQLITE:statement operation-state )
    {: ar :}
    4 ar PATH-COPY {: path :}
-   2 SQLITE:COL-TEXT s" read operation status" >str path DECODE-STATUS
-   {: s :}
+   2 SQLITE:COL-TEXT s" read operation status" >str
+   path MODEL:PATH>STR DECODE-STATUS {: s :}
    3 SQLITE:COL-TEXT {: ps:^ pu :}
    6 TEXT? {: json :}
    7 INT? {: retry :}
@@ -2666,7 +2589,7 @@ STRUCTURE operation-state
    5 ar TEXT-COPY {: o:str :}
    0 SQLITE:COL-INT >PLAN-ID {: plan :}
    1 SQLITE:COL-INT {: ordinal :}
-   plan ordinal s DONE? status PLAN-DONE? or path o
+   plan ordinal s DONE? status COMPLETED? or path o
    OPERATION-STATE-MAKE ;
 
 : STEP-ROW
@@ -2796,7 +2719,7 @@ STRUCTURE operation-state
      ^JSON:writer -- plan-conflict-completion )
    {: c id st x ar w :}
    st PLAN-STATE-UNMAKE {: path status :}
-   status PLAN-DONE? if
+   status COMPLETED? if
       construct plan-conflict-completion already-completed exit
    then
    c path x ar w INSERT-CONFLICT drop
@@ -2816,7 +2739,7 @@ STRUCTURE operation-state
 : SUPERSEDE-LIVE ( SQLITE:connection plan-id plan-state -- plan-supersede )
    {: c id st :}
    st PLAN-STATE-UNMAKE {: path status :}
-   status PLAN-DONE? if construct plan-supersede already-completed exit then
+   status COMPLETED? if construct plan-supersede already-completed exit then
    c id RETIRE-PLAN
    construct plan-supersede superseded ;
 
@@ -2933,7 +2856,7 @@ private
 
 : DECODE-CONTENT ( str MODEL:path ^ARENA:arena -- DROPBOX:hash )
    {: json:str path ar :}
-   NO-HASH
+   MODEL:NO-HASH
    [: DROP-HASH json ar MODEL:JSON>HASH ;]
    s" deserialize recovery content" >str path MODEL:PATH>STR DECODE ;
 
@@ -2962,8 +2885,8 @@ private
    5 INT? original RETAINED-AT {: retained :}
    2 ar PATH-COPY {: copy :}
    3 SQLITE:COL-TEXT >str original ar DECODE-CONTENT {: content :}
-   4 SQLITE:COL-TEXT s" read recovery status" >str original
-   DECODE-STATUS {: status :}
+   4 SQLITE:COL-TEXT s" read recovery status" >str
+   original MODEL:PATH>STR DECODE-STATUS {: status :}
    0 SQLITE:COL-INT >OPERATION-ID {: op :}
    id op original copy content status retained
    JOURNAL-RECOVERY--RECORD:MAKE ;
@@ -3048,8 +2971,8 @@ private
 \ Whether the row the statement steps to, if any, is completed and no
 \ unfinished work needs its payload.
 : FORGETTABLE-ROW
-   ( SQLITE:statement MODEL:path -- option<bool> SQLITE:statement )
-   {: path :}
+   ( SQLITE:statement str -- option<bool> SQLITE:statement )
+   {: path:str :}
    SQLITE:STEP 0= if NO-FLAG swap exit then
    0 SQLITE:COL-TEXT s" read recovery status to forget" >str path
    DECODE-STATUS {: s :}
@@ -3066,8 +2989,8 @@ private
    construct recovery-forget forgotten ;
 
 : FORGET-IN
-   ( SQLITE:connection recovery-id MODEL:path -- recovery-forget )
-   {: c id path :}
+   ( SQLITE:connection recovery-id str -- recovery-forget )
+   {: c id path:str :}
    c FORGET-QUERY
    [: id RECOVERY-ID>N 1 SQLITE:BIND-INT path FORGETTABLE-ROW ;]
    SQLITE:WITH-STATEMENT
@@ -3104,6 +3027,6 @@ public
 : FORGET-COMPLETED-RECOVERY ( journal recovery-id -- recovery-forget )
    {: j id :}
    j >CONNECTION {: c :}
-   c [: c id j >PATH MODEL:>PATH FORGET-IN ;] SQLITE:WITH-TRANSACTION ;
+   c [: c id j >PATH FORGET-IN ;] SQLITE:WITH-TRANSACTION ;
 
 ;package

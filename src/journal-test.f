@@ -743,7 +743,7 @@ variable SCANNED       \ query plan rows that scan the table
    [: UNBORN-SYNC ;] E-NO-BIRTH-TIME d s" sync root `/sync` is on" ar
    LOGGED
    s" /sync" >str 2 BIRTH-5 true 256 false FROM-STATX-FIELDS
-   SUBVOLUME-OF NO-SUBVOLUME? TTRUE
+   SUBVOLUME-OF NO-INT? TTRUE
    d GONE ;
 
 : RECORDED ( ^u8 n option<birth-time> -- local-root-record )

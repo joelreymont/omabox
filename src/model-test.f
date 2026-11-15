@@ -1,11 +1,12 @@
 \ model-test.f - MODEL's values: every line of src/oracle/fold.tsv, the
 \ Rust version's answers, through FOLD; model.rs's tests of a key's order,
-\ folding and BENEATH?; SUBTREE-RANGE against BENEATH?; the planner's
-\ equality words on one equal and one unequal pair, and the observation,
-\ fingerprint and record ones on values that differ in one field or
-\ variant; each display word on every variant against model.rs's text; every
-\ line of src/oracle/json.tsv through the JSON writers and readers, and
-\ the readers' acceptance and refusals.
+\ folding and BENEATH?; SUBTREE-RANGE against BENEATH?; BEGINS? on
+\ display paths; the planner's equality words on one equal and one
+\ unequal pair, and the observation, fingerprint and record ones on
+\ values that differ in one field or variant; each display word on every
+\ variant against model.rs's text; every line of src/oracle/json.tsv
+\ through the JSON writers and readers, and the readers' acceptance and
+\ refusals.
 \ Run from the repository root: hb --load src/model-test.f </dev/null
 require src/lib/arena.f
 require src/lib/string.f
@@ -110,6 +111,20 @@ TYPED-VARIABLE AR ^ARENA:arena
    s" report2/x" KEY top MODEL:BENEATH? TFALSE
    top top MODEL:BENEATH? TFALSE
    s" other/report/x" KEY top MODEL:BENEATH? TFALSE ;
+
+: DISPLAY ( ^u8 n -- MODEL:path ) >str MODEL:>PATH ;
+
+\ BEGINS? compares whole components: a byte prefix is not a parent.
+: PATHS-BEGIN-BY-COMPONENT ( -- )
+   s" begins" T-LABEL
+   s" /a/b" DISPLAY s" /a/b" DISPLAY MODEL:BEGINS? TTRUE
+   s" /a/b" DISPLAY s" /a" DISPLAY MODEL:BEGINS? TTRUE
+   s" /a" DISPLAY s" /a/b" DISPLAY MODEL:BEGINS? TFALSE
+   s" /a/b" DISPLAY s" /a/bc" DISPLAY MODEL:BEGINS? TFALSE
+   s" /a/bc" DISPLAY s" /a/b" DISPLAY MODEL:BEGINS? TFALSE
+   s" /a/b" DISPLAY s" /" DISPLAY MODEL:BEGINS? TTRUE
+   s" /" DISPLAY s" /" DISPLAY MODEL:BEGINS? TTRUE
+   s" a/b" DISPLAY s" /" DISPLAY MODEL:BEGINS? TFALSE ;
 
 \ True when the key falls in the top's subtree range.
 : IN-RANGE? ( MODEL:key MODEL:key -- bool )
@@ -726,6 +741,7 @@ TYPED-VARIABLE W JSON:writer
    CANONICAL-PATHS-FOLD-CASE-AND-COMPARE-BY-BYTES
    SUBTREE-RANGE-HOLDS-EXACTLY-THE-PATHS-BENEATH-AN-ANCESTOR
    ONLY-TRUE-DESCENDANTS-ARE-BENEATH-AN-ANCESTOR
+   PATHS-BEGIN-BY-COMPONENT
    EQUALITY-CASE
    RECORD-EQUALITY-CASE
    UNKNOWN-TEXT-CASE

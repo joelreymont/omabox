@@ -43,9 +43,9 @@ private
 
 \ The status of the row the statement steps to, if any.
 : RECOVERY-STATUS
-   ( SQLITE:statement str MODEL:path
+   ( SQLITE:statement str str
      -- option<record-status> SQLITE:statement )
-   {: op:str path :}
+   {: op:str path:str :}
    SQLITE:STEP 0= if NO-RECORD-STATUS swap exit then
    0 SQLITE:COL-TEXT op path DECODE-STATUS OPTION:SOME swap ;
 
@@ -59,8 +59,8 @@ private
    construct recovery-completion completed ;
 
 : COMPLETE-RECOVERY-IN
-   ( SQLITE:connection recovery-id MODEL:path -- recovery-completion )
-   {: c id path :}
+   ( SQLITE:connection recovery-id str -- recovery-completion )
+   {: c id path:str :}
    c s" SELECT status FROM recovery_records WHERE id = ?1"
    [: id RECOVERY-ID>N 1 SQLITE:BIND-INT
       s" read recovery status" >str path RECOVERY-STATUS ;]
@@ -76,7 +76,7 @@ public
 : COMPLETE-RECOVERY ( journal recovery-id -- recovery-completion )
    {: j id :}
    j >CONNECTION {: c :}
-   c [: c id j >PATH MODEL:>PATH COMPLETE-RECOVERY-IN ;]
+   c [: c id j >PATH COMPLETE-RECOVERY-IN ;]
    SQLITE:WITH-TRANSACTION ;
 
 private
@@ -289,8 +289,8 @@ STRUCTURE intent
      ^JSON:writer -- recovery-write )
    {: c id copy t ar w :}
    t INTENT-UNMAKE {: path json:str status:str plan ordinal :}
-   status str> s" read recovery operation status" >str path
-   DECODE-STATUS DONE? if
+   status str> s" read recovery operation status" >str
+   path MODEL:PATH>STR DECODE-STATUS DONE? if
       construct recovery-write operation-completed exit
    then
    json path ar s" deserialize recovery operation" >str OPERATION-AS {: o :}
