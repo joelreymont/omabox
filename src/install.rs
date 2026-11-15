@@ -9,10 +9,13 @@ use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use miette::Diagnostic;
 use rustix::fs::{CWD, RenameFlags, renameat_with};
+use serde::Deserialize;
+use serde_json::Value;
+use serde_json::error::Category;
 use thiserror::Error;
 
 use crate::config::resolve_config_home;
@@ -44,6 +47,24 @@ const PLUGIN: [(&str, &[u8]); 4] = [
     ),
 ];
 const PLUGIN_ID: &str = "local.omabox";
+// Omarchy's bar sections in the order its PluginRegistry.findBarLocation searches them.
+const BAR_SECTIONS: [&str; 6] = [
+    "left",
+    "centerBegin",
+    "center",
+    "centerEnd",
+    "right",
+    "tray",
+];
+const LOCK_CHECK: &str = "omarchy-shell lock isLocked";
+const LIST_PLUGINS: &str = "omarchy-shell shell listPlugins";
+const LIST_CONFIG: &str = "omarchy-shell shell listShellConfig";
+const SET_ENABLED: &str = "omarchy-shell shell setPluginEnabled";
+const ENABLE_PLUGIN: &str = "omarchy-shell shell enablePlugin";
+const RESCAN_PLUGINS: &str = "omarchy-shell shell rescanPlugins";
+// The shell rescans plugins asynchronously after their files move back.
+const LISTED_POLL: Duration = Duration::from_millis(100);
+const LISTED_WAIT: Duration = Duration::from_secs(10);
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// A user-requested artifact lifecycle operation.
@@ -157,6 +178,144 @@ impl ServiceState {
     }
 }
 
+/// How the Omarchy shell showed the plugin before uninstall, which a failed uninstall puts back.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PluginState {
+    /// The shell does not show the plugin, so uninstall leaves its shell state alone.
+    Disabled,
+    /// The shell listed the plugin as enabled, but the bar layout read next did not place it.
+    Enabled,
+    /// The shell shows the plugin at this place in the bar layout.
+    Placed { section: &'static str, index: usize },
+}
+
+/// One `listPlugins` entry; the shell's other fields are not needed.
+#[derive(Deserialize)]
+struct ListedPlugin {
+    id: String,
+    enabled: bool,
+}
+
+impl PluginState {
+    fn read(commands: &Commands) -> Result<Self, InstallError> {
+        if !list_plugins(commands)?
+            .iter()
+            .any(|plugin| plugin.id == PLUGIN_ID && plugin.enabled)
+        {
+            return Ok(Self::Disabled);
+        }
+        let reply = shell_call(commands, &["shell", "listShellConfig"], LIST_CONFIG)?;
+        let config: Value =
+            serde_json::from_slice(&reply).map_err(|error| invalid_reply(LIST_CONFIG, &error))?;
+        let layout = config.get("bar").and_then(|bar| bar.get("layout"));
+        for section in BAR_SECTIONS {
+            let Some(entries) = layout
+                .and_then(|layout| layout.get(section))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            // A bar entry is the widget id or an object carrying it.
+            let found = entries.iter().position(|entry| {
+                entry
+                    .as_str()
+                    .or_else(|| entry.get("id").and_then(Value::as_str))
+                    == Some(PLUGIN_ID)
+            });
+            if let Some(index) = found {
+                return Ok(Self::Placed { section, index });
+            }
+        }
+        Ok(Self::Enabled)
+    }
+
+    fn disable(self, commands: &Commands) -> Result<(), InstallError> {
+        if self == Self::Disabled {
+            return Ok(());
+        }
+        let reply = shell_call(
+            commands,
+            &["shell", "setPluginEnabled", PLUGIN_ID, "false"],
+            SET_ENABLED,
+        )?;
+        expect_ok(&reply, SET_ENABLED)
+    }
+
+    /// Re-enabling a plugin that is still on leaves it where it is. Both
+    /// re-enable commands need the shell to list the plugin first.
+    fn restore(self, commands: &Commands) -> Result<(), InstallError> {
+        match self {
+            Self::Disabled => Ok(()),
+            Self::Enabled => {
+                await_listed(commands)?;
+                let reply = shell_call(
+                    commands,
+                    &["shell", "setPluginEnabled", PLUGIN_ID, "true"],
+                    SET_ENABLED,
+                )?;
+                expect_ok(&reply, SET_ENABLED)
+            }
+            Self::Placed { section, index } => {
+                await_listed(commands)?;
+                let placement =
+                    format!("{{\"section\":{},\"index\":{index}}}", Value::from(section));
+                let reply = shell_call(
+                    commands,
+                    &["shell", "enablePlugin", PLUGIN_ID, &placement],
+                    ENABLE_PLUGIN,
+                )?;
+                expect_ok(&reply, ENABLE_PLUGIN)
+            }
+        }
+    }
+}
+
+fn list_plugins(commands: &Commands) -> Result<Vec<ListedPlugin>, InstallError> {
+    let reply = shell_call(commands, &["shell", "listPlugins"], LIST_PLUGINS)?;
+    serde_json::from_slice(&reply).map_err(|error| invalid_reply(LIST_PLUGINS, &error))
+}
+
+/// Describe an unreadable shell reply by where it broke, never by its text:
+/// `serde_json` quotes the reply in its messages, and child output stays out
+/// of diagnostics.
+fn invalid_reply(command: &'static str, error: &serde_json::Error) -> InstallError {
+    let category = match error.classify() {
+        Category::Syntax => "syntax",
+        Category::Data => "data",
+        Category::Eof => "eof",
+        Category::Io => "io",
+    };
+    InstallError::InvalidShellReply {
+        command,
+        category,
+        line: error.line(),
+        column: error.column(),
+    }
+}
+
+/// Wait until the shell lists the plugin, which both `enablePlugin` and
+/// `setPluginEnabled <id> true` need: each answers "unknown" for a plugin the
+/// shell's rescan has not listed yet.
+fn await_listed(commands: &Commands) -> Result<(), InstallError> {
+    await_listed_within(commands, LISTED_WAIT)
+}
+
+fn await_listed_within(commands: &Commands, limit: Duration) -> Result<(), InstallError> {
+    let deadline = Instant::now() + limit;
+    loop {
+        if list_plugins(commands)?
+            .iter()
+            .any(|plugin| plugin.id == PLUGIN_ID)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(InstallError::PluginNotListed);
+        }
+        std::thread::sleep(LISTED_POLL);
+    }
+}
+
 fn execute_with(
     action: InstallAction,
     layout: &Layout,
@@ -185,7 +344,7 @@ fn install(
         Ok(state) => state,
         Err(source) => return Err(cleanup_failure(source, transaction.cleanup_prepared())),
     };
-    publish(&mut transaction, commands, state, false)?;
+    publish(&mut transaction, commands, state, None, false)?;
     let done = if action == InstallAction::Install {
         "installed"
     } else {
@@ -202,6 +361,7 @@ fn install(
                     &mut transaction,
                     commands,
                     state,
+                    None,
                     false,
                     true,
                 ));
@@ -245,6 +405,7 @@ fn install(
 fn uninstall(layout: &Layout, commands: &Commands) -> Result<String, InstallError> {
     let mut transaction = Transaction::remove(layout)?;
     ensure_shell_unlocked(commands)?;
+    let plugin = PluginState::read(commands)?;
     let state = ServiceState::read(commands)?;
     // Leave no failed unit behind once its files are gone.
     let released = commands.services.drive(ServiceGoal::Halt).and_then(|_| {
@@ -258,17 +419,22 @@ fn uninstall(layout: &Layout, commands: &Commands) -> Result<String, InstallErro
         let source = InstallError::Service(source);
         return Err(rollback_failure(source, state.restore(commands, true)));
     }
-    publish(&mut transaction, commands, state, true)?;
+    publish(&mut transaction, commands, state, Some(plugin), true)?;
     transaction.finish()?;
     Ok(String::from(
         "Omabox program, service, and plugin files were removed. Configuration, the journal, recovery data, Secret Service credentials, and synced files were retained.\n",
     ) + &stale::report(&transaction.leftovers))
 }
 
+/// Move the artifacts into place. `plugin` is the shell's state for a plugin
+/// this removes: an enabled plugin is disabled before the files move, the shell
+/// rescans after, and a failure from the disable on re-enables it once the
+/// rollback has put every artifact back.
 fn publish(
     transaction: &mut Transaction,
     commands: &Commands,
     state: ServiceState,
+    plugin: Option<PluginState>,
     restore_enabled: bool,
 ) -> Result<(), InstallError> {
     if let Err(source) = ensure_shell_unlocked(commands) {
@@ -280,12 +446,20 @@ fn publish(
         .and_then(|()| transaction.cleanup_prepared());
         return Err(rollback_failure(source, restored));
     }
-    let result = transaction.apply(commands).and_then(|()| {
-        commands
-            .services
-            .daemon_reload()
-            .map_err(InstallError::Service)
-    });
+    let result = plugin
+        .map_or(Ok(()), |plugin| plugin.disable(commands))
+        .and_then(|()| transaction.apply(commands))
+        .and_then(|()| {
+            commands
+                .services
+                .daemon_reload()
+                .map_err(InstallError::Service)
+        })
+        .and_then(|()| {
+            plugin.map_or(Ok(()), |_| {
+                shell_call(commands, &["shell", "rescanPlugins"], RESCAN_PLUGINS).map(|_| ())
+            })
+        });
     match result {
         Ok(()) => Ok(()),
         Err(source) => Err(restore_after_failure(
@@ -293,6 +467,7 @@ fn publish(
             transaction,
             commands,
             state,
+            plugin,
             restore_enabled,
             restore_enabled,
         )),
@@ -300,24 +475,38 @@ fn publish(
 }
 
 fn ensure_shell_unlocked(commands: &Commands) -> Result<(), InstallError> {
+    match shell_call(commands, &["lock", "isLocked"], LOCK_CHECK)?.as_slice() {
+        b"false\n" | b"false" => Ok(()),
+        b"true\n" | b"true" => Err(InstallError::ShellLocked),
+        _ => Err(InstallError::InvalidLockState),
+    }
+}
+
+/// Run one Omarchy shell call and return its reply. A shell that is not
+/// running or not responding makes `omarchy-shell` exit nonzero, which fails
+/// the call.
+fn shell_call(
+    commands: &Commands,
+    args: &[&str],
+    command: &'static str,
+) -> Result<Vec<u8>, InstallError> {
     let output = commands
         .omarchy_shell
         .command()
-        .args(["lock", "isLocked"])
+        .args(args)
         .stdin(Stdio::null())
         .output()
-        .map_err(|source| InstallError::CommandStart {
-            command: "omarchy-shell lock isLocked",
-            source,
-        })?;
-    match (output.status.code(), output.stdout.as_slice()) {
-        (Some(0), b"false\n" | b"false") => Ok(()),
-        (Some(0), b"true\n" | b"true") => Err(InstallError::ShellLocked),
-        (Some(0), _) => Err(InstallError::InvalidLockState),
-        (status, _) => Err(InstallError::CommandFailed {
-            command: "omarchy-shell lock isLocked",
-            status,
-        }),
+        .map_err(|source| InstallError::CommandStart { command, source })?;
+    match output.status.code() {
+        Some(0) => Ok(output.stdout),
+        status => Err(InstallError::CommandFailed { command, status }),
+    }
+}
+
+fn expect_ok(reply: &[u8], command: &'static str) -> Result<(), InstallError> {
+    match reply {
+        b"ok\n" | b"ok" => Ok(()),
+        _ => Err(InstallError::PluginRefused { command }),
     }
 }
 
@@ -326,23 +515,28 @@ fn restore_after_failure(
     transaction: &mut Transaction,
     commands: &Commands,
     state: ServiceState,
+    plugin: Option<PluginState>,
     restore_enabled: bool,
     restore_service_state: bool,
 ) -> InstallError {
     let restored = transaction
         .rollback(commands)
         .and_then(|()| {
-            commands
+            let service = commands
                 .services
                 .daemon_reload()
                 .map_err(InstallError::Service)
-        })
-        .and_then(|()| {
-            if restore_service_state {
-                state.restore(commands, restore_enabled)
-            } else {
-                Ok(())
-            }
+                .and_then(|()| {
+                    if restore_service_state {
+                        state.restore(commands, restore_enabled)
+                    } else {
+                        Ok(())
+                    }
+                });
+            // The plugin's files are back, so re-enable it whatever the
+            // service did; a service failure is the one reported.
+            let plugin = plugin.map_or(Ok(()), |plugin| plugin.restore(commands));
+            service.and(plugin)
         })
         .and_then(|()| transaction.cleanup_prepared());
     rollback_failure(source, restored)
@@ -982,6 +1176,31 @@ pub enum InstallError {
         help("Run `omarchy-shell lock isLocked`; it must print exactly true or false.")
     )]
     InvalidLockState,
+    #[error(
+        "Omarchy returned an unreadable reply to `{command}` ({category} error at line {line}, column {column})"
+    )]
+    #[diagnostic(
+        code(omabox::install::invalid_shell_reply),
+        help("Run `{command}`; it must print JSON.")
+    )]
+    InvalidShellReply {
+        command: &'static str,
+        category: &'static str,
+        line: usize,
+        column: usize,
+    },
+    #[error("`{command}` for the Omabox plugin did not reply ok")]
+    #[diagnostic(
+        code(omabox::install::plugin_refused),
+        help("Run `omarchy-shell shell listPlugins` to see the plugin's state, then retry.")
+    )]
+    PluginRefused { command: &'static str },
+    #[error("the Omarchy shell did not list the restored widget within 10 seconds")]
+    #[diagnostic(
+        code(omabox::install::plugin_not_listed),
+        help("Enable it again with `omarchy plugin enable local.omabox`.")
+    )]
+    PluginNotListed,
     #[error(transparent)]
     #[diagnostic(transparent)]
     Service(#[from] ServiceError),
@@ -1054,7 +1273,14 @@ mod tests {
         systemctl: PathBuf,
         systemctl_log: PathBuf,
         omarchy_log: PathBuf,
+        shell_log: PathBuf,
     }
+
+    /// The shell's plugin list when the widget is in the bar.
+    const PLUGIN_ENABLED: &str =
+        r#"[{"id":"omarchy.clock","enabled":true},{"id":"local.omabox","enabled":true}]"#;
+    /// The shell's config with the widget second in the right section.
+    const PLUGIN_PLACED: &str = r#"{"bar":{"layout":{"left":["omarchy.workspaces"],"right":["omarchy.clock",{"id":"local.omabox"},"omarchy.tray"]}}}"#;
 
     impl Fixture {
         fn new(
@@ -1102,8 +1328,8 @@ mod tests {
                 format!("printf '%s\\n' \"$@\" > '{}'\n", omarchy_log.display()),
             )?;
             let omarchy_shell = temporary.path().join("omarchy-shell");
-            fs::write(&omarchy_shell, "printf 'false\\n'\n")?;
-            Ok(Self {
+            let shell_log = temporary.path().join("omarchy-shell.log");
+            let fixture = Self {
                 layout: Layout::new(home, None)?,
                 sources,
                 commands: Commands {
@@ -1114,8 +1340,39 @@ mod tests {
                 systemctl,
                 systemctl_log,
                 omarchy_log,
+                shell_log,
                 _temporary: temporary,
-            })
+            };
+            fixture.write_shell("printf 'false\\n'", PLUGIN_ENABLED, PLUGIN_PLACED, "")?;
+            Ok(fixture)
+        }
+
+        /// Answer shell calls as Omarchy does and log each one: `lock` runs
+        /// for the lock check, `plugins` and `config` are the list replies,
+        /// and the call whose arguments equal `fail` exits 1, as a shell that
+        /// is not running does.
+        fn write_shell(
+            &self,
+            lock: &str,
+            plugins: &str,
+            config: &str,
+            fail: &str,
+        ) -> Result<(), Box<dyn Error>> {
+            self.write_shell_script(&format!(
+                "if [ \"$*\" = '{fail}' ]; then exit 1; fi\ncase \"$2\" in\n isLocked) {lock};;\n listPlugins) printf '%s\\n' '{plugins}';;\n listShellConfig) printf '%s\\n' '{config}';;\n rescanPlugins) ;;\n *) printf 'ok\\n';;\nesac\n"
+            ))
+        }
+
+        /// Answer shell calls with `body` after logging each one.
+        fn write_shell_script(&self, body: &str) -> Result<(), Box<dyn Error>> {
+            fs::write(
+                self.commands.omarchy_shell.path(),
+                format!(
+                    "printf '%s\\n' \"$*\" >> '{}'\n{body}",
+                    self.shell_log.display()
+                ),
+            )?;
+            Ok(())
         }
 
         fn old_install(&self) -> Result<(), Box<dyn Error>> {
@@ -2200,14 +2457,16 @@ mod tests {
         let fixture = Fixture::new("active", true, false, false)?;
         fixture.old_install()?;
         let lock_checks = fixture._temporary.path().join("lock-checks");
-        fs::write(
-            fixture.commands.omarchy_shell.path(),
-            format!(
-                "count=0\nif [ -f '{}' ]; then read count < '{}'; fi\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > '{}'\nif [ \"$count\" -lt 3 ]; then printf 'false\\n'; else printf 'true\\n'; fi\n",
+        fixture.write_shell(
+            &format!(
+                "count=0; if [ -f '{}' ]; then read count < '{}'; fi; count=$((count + 1)); printf '%s\\n' \"$count\" > '{}'; if [ \"$count\" -lt 3 ]; then printf 'false\\n'; else printf 'true\\n'; fi",
                 lock_checks.display(),
                 lock_checks.display(),
                 lock_checks.display(),
             ),
+            PLUGIN_ENABLED,
+            PLUGIN_PLACED,
+            "",
         )?;
 
         let result = execute_with(
@@ -2230,6 +2489,10 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&fixture.systemctl_log)?,
             "is-enabled\nshow\nshow\nstop\nshow\ndisable\ndaemon-reload\nenable\nreset-failed\nstart\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.shell_log)?,
+            "lock isLocked\nshell listPlugins\nshell listShellConfig\nlock isLocked\nshell setPluginEnabled local.omabox false\nlock isLocked\nshell listPlugins\nshell enablePlugin local.omabox {\"section\":\"right\",\"index\":1}\n"
         );
         Ok(())
     }
@@ -2279,6 +2542,395 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&fixture.systemctl_log)?,
             "is-enabled\nshow\nshow\nstop\nshow\ndisable\ndaemon-reload\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.shell_log)?,
+            "lock isLocked\nshell listPlugins\nshell listShellConfig\nlock isLocked\nshell setPluginEnabled local.omabox false\nlock isLocked\nshell rescanPlugins\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn uninstall_leaves_a_disabled_plugin_alone() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new("active", true, false, false)?;
+        fixture.old_install()?;
+        fixture.write_shell(
+            "printf 'false\\n'",
+            r#"[{"id":"local.omabox","enabled":false}]"#,
+            PLUGIN_PLACED,
+            "",
+        )?;
+
+        execute_with(
+            InstallAction::Uninstall,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        )?;
+
+        assert!(!fixture.layout.plugin.exists());
+        assert_eq!(
+            fs::read_to_string(&fixture.shell_log)?,
+            "lock isLocked\nshell listPlugins\nlock isLocked\nlock isLocked\nshell rescanPlugins\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn uninstall_rollback_restores_the_plugin_place() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new("active", true, true, false)?;
+        fixture.old_install()?;
+
+        let result = execute_with(
+            InstallAction::Uninstall,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        assert!(matches!(
+            result,
+            Err(InstallError::Service(ServiceError::Unsuccessful {
+                command: "systemctl daemon-reload",
+                ..
+            }))
+        ));
+        assert_eq!(fs::read(&fixture.layout.omabox)?, b"old");
+        assert_eq!(fs::read(fixture.layout.plugin.join("old.qml"))?, b"old");
+        assert_eq!(
+            fs::read_to_string(&fixture.systemctl_log)?,
+            "is-enabled\nshow\nshow\nstop\nshow\ndisable\ndaemon-reload\ndaemon-reload\nenable\nreset-failed\nstart\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.shell_log)?,
+            "lock isLocked\nshell listPlugins\nshell listShellConfig\nlock isLocked\nshell setPluginEnabled local.omabox false\nlock isLocked\nlock isLocked\nshell listPlugins\nshell enablePlugin local.omabox {\"section\":\"right\",\"index\":1}\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_disable_re_enables_an_unplaced_plugin() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new("active", true, false, false)?;
+        fixture.old_install()?;
+        fixture.write_shell(
+            "printf 'false\\n'",
+            PLUGIN_ENABLED,
+            r#"{"bar":{"layout":{"right":["omarchy.tray"]}}}"#,
+            "shell setPluginEnabled local.omabox false",
+        )?;
+
+        let result = execute_with(
+            InstallAction::Uninstall,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        assert!(matches!(
+            result,
+            Err(InstallError::CommandFailed {
+                command: "omarchy-shell shell setPluginEnabled",
+                status: Some(1),
+            })
+        ));
+        assert_eq!(fs::read(&fixture.layout.omabox)?, b"old");
+        assert_eq!(fs::read(fixture.layout.plugin.join("old.qml"))?, b"old");
+        assert_eq!(
+            fs::read_to_string(&fixture.systemctl_log)?,
+            "is-enabled\nshow\nshow\nstop\nshow\ndisable\ndaemon-reload\nenable\nreset-failed\nstart\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.shell_log)?,
+            "lock isLocked\nshell listPlugins\nshell listShellConfig\nlock isLocked\nshell setPluginEnabled local.omabox false\nshell listPlugins\nshell setPluginEnabled local.omabox true\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_plugin_list_changes_nothing() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new("active", true, false, false)?;
+        fixture.old_install()?;
+        fixture.write_shell("printf 'false\\n'", "not json", PLUGIN_PLACED, "")?;
+
+        let result = execute_with(
+            InstallAction::Uninstall,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        assert!(matches!(
+            result,
+            Err(InstallError::InvalidShellReply {
+                command: "omarchy-shell shell listPlugins",
+                ..
+            })
+        ));
+        assert_eq!(fs::read(&fixture.layout.omabox)?, b"old");
+        assert_eq!(fs::read(fixture.layout.plugin.join("old.qml"))?, b"old");
+        assert!(!fixture.systemctl_log.exists());
+        assert_eq!(
+            fs::read_to_string(&fixture.shell_log)?,
+            "lock isLocked\nshell listPlugins\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_shell_config_changes_nothing() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new("active", true, false, false)?;
+        fixture.old_install()?;
+        fixture.write_shell("printf 'false\\n'", PLUGIN_ENABLED, "not json", "")?;
+
+        let result = execute_with(
+            InstallAction::Uninstall,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        assert!(matches!(
+            result,
+            Err(InstallError::InvalidShellReply {
+                command: "omarchy-shell shell listShellConfig",
+                ..
+            })
+        ));
+        assert_eq!(fs::read(&fixture.layout.omabox)?, b"old");
+        assert_eq!(fs::read(fixture.layout.plugin.join("old.qml"))?, b"old");
+        assert!(!fixture.systemctl_log.exists());
+        assert_eq!(
+            fs::read_to_string(&fixture.shell_log)?,
+            "lock isLocked\nshell listPlugins\nshell listShellConfig\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refused_disable_rolls_back_and_re_enables_the_plugin() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new("active", true, false, false)?;
+        fixture.old_install()?;
+        fixture.write_shell_script(&format!(
+            "case \"$2\" in\n isLocked) printf 'false\\n';;\n listPlugins) printf '%s\\n' '{PLUGIN_ENABLED}';;\n listShellConfig) printf '%s\\n' '{PLUGIN_PLACED}';;\n setPluginEnabled) printf 'unknown\\n';;\n *) printf 'ok\\n';;\nesac\n"
+        ))?;
+
+        let result = execute_with(
+            InstallAction::Uninstall,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        assert!(matches!(
+            result,
+            Err(InstallError::PluginRefused {
+                command: "omarchy-shell shell setPluginEnabled",
+            })
+        ));
+        assert_eq!(fs::read(&fixture.layout.omabox)?, b"old");
+        assert_eq!(fs::read(fixture.layout.plugin.join("old.qml"))?, b"old");
+        assert_eq!(
+            fs::read_to_string(&fixture.systemctl_log)?,
+            "is-enabled\nshow\nshow\nstop\nshow\ndisable\ndaemon-reload\nenable\nreset-failed\nstart\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.shell_log)?,
+            "lock isLocked\nshell listPlugins\nshell listShellConfig\nlock isLocked\nshell setPluginEnabled local.omabox false\nshell listPlugins\nshell enablePlugin local.omabox {\"section\":\"right\",\"index\":1}\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_reload_still_re_enables_the_plugin() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new("active", true, false, false)?;
+        fixture.old_install()?;
+        fs::write(
+            &fixture.systemctl,
+            format!(
+                "printf '%s\\n' \"$2\" >> '{}'\ncase \"$2\" in\n show) printf '%s\\n' 'active';;\n daemon-reload) exit 1;;\nesac\nexit 0\n",
+                fixture.systemctl_log.display(),
+            ),
+        )?;
+
+        let result = execute_with(
+            InstallAction::Uninstall,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        let Err(InstallError::RollbackFailed { source, restore }) = result else {
+            return Err(format!("expected a rollback failure, got {result:?}").into());
+        };
+        let [restore] = *restore;
+        for error in [*source, restore] {
+            assert!(matches!(
+                error,
+                InstallError::Service(ServiceError::Unsuccessful {
+                    command: "systemctl daemon-reload",
+                    ..
+                })
+            ));
+        }
+        assert_eq!(fs::read(&fixture.layout.omabox)?, b"old");
+        assert_eq!(fs::read(fixture.layout.plugin.join("old.qml"))?, b"old");
+        assert!(
+            fs::read_to_string(&fixture.shell_log)?
+                .ends_with("shell enablePlugin local.omabox {\"section\":\"right\",\"index\":1}\n")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_re_enable_reports_after_the_service() -> Result<(), Box<dyn Error>> {
+        // Whether daemon-reload fails again during the rollback.
+        for reload_fails_again in [false, true] {
+            let fixture = Fixture::new("active", true, false, false)?;
+            fixture.old_install()?;
+            let reloaded = fixture._temporary.path().join("reloaded");
+            let reload = if reload_fails_again {
+                String::from("exit 1")
+            } else {
+                format!(
+                    "if [ -f '{reloaded}' ]; then exit 0; fi; : > '{reloaded}'; exit 1",
+                    reloaded = reloaded.display(),
+                )
+            };
+            fs::write(
+                &fixture.systemctl,
+                format!(
+                    "printf '%s\\n' \"$2\" >> '{}'\ncase \"$2\" in\n show) printf '%s\\n' 'active';;\n daemon-reload) {reload};;\nesac\nexit 0\n",
+                    fixture.systemctl_log.display(),
+                ),
+            )?;
+            fixture.write_shell_script(&format!(
+                "case \"$2\" in\n isLocked) printf 'false\\n';;\n listPlugins) printf '%s\\n' '{PLUGIN_ENABLED}';;\n listShellConfig) printf '%s\\n' '{PLUGIN_PLACED}';;\n enablePlugin) printf 'unknown\\n';;\n *) printf 'ok\\n';;\nesac\n"
+            ))?;
+
+            let result = execute_with(
+                InstallAction::Uninstall,
+                &fixture.layout,
+                &fixture.sources,
+                &fixture.commands,
+            );
+
+            let Err(InstallError::RollbackFailed { source, restore }) = result else {
+                return Err(format!("expected a rollback failure, got {result:?}").into());
+            };
+            let [restore] = *restore;
+            assert!(matches!(
+                *source,
+                InstallError::Service(ServiceError::Unsuccessful {
+                    command: "systemctl daemon-reload",
+                    ..
+                })
+            ));
+            if reload_fails_again {
+                assert!(matches!(
+                    restore,
+                    InstallError::Service(ServiceError::Unsuccessful {
+                        command: "systemctl daemon-reload",
+                        ..
+                    })
+                ));
+            } else {
+                assert!(matches!(
+                    restore,
+                    InstallError::PluginRefused {
+                        command: ENABLE_PLUGIN
+                    }
+                ));
+            }
+            assert_eq!(fs::read(fixture.layout.plugin.join("old.qml"))?, b"old");
+            assert!(fs::read_to_string(&fixture.shell_log)?.ends_with(
+                "shell enablePlugin local.omabox {\"section\":\"right\",\"index\":1}\n"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_reply_omits_the_reply_text() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new("active", true, false, false)?;
+        fixture.write_shell_script(
+            "printf '%s\\n' '[{\"id\":\"local.omabox\",\"enabled\":\"child output text\"}]'\n",
+        )?;
+
+        let Err(error) = list_plugins(&fixture.commands) else {
+            return Err("expected an unreadable plugin list".into());
+        };
+
+        assert!(matches!(
+            error,
+            InstallError::InvalidShellReply {
+                command: LIST_PLUGINS,
+                category: "data",
+                ..
+            }
+        ));
+        let rendered = format!("{:?}", miette::Report::new(error));
+        assert!(!rendered.contains("child output text"), "{rendered}");
+        Ok(())
+    }
+
+    #[test]
+    fn restore_waits_for_the_shell_to_list_the_plugin() -> Result<(), Box<dyn Error>> {
+        let unplaced = r#"{"bar":{"layout":{"right":["omarchy.tray"]}}}"#;
+        for (config, reenable) in [
+            (
+                PLUGIN_PLACED,
+                "shell enablePlugin local.omabox {\"section\":\"right\",\"index\":1}\n",
+            ),
+            (unplaced, "shell setPluginEnabled local.omabox true\n"),
+        ] {
+            let fixture = Fixture::new("active", true, true, false)?;
+            fixture.old_install()?;
+            let listings = fixture._temporary.path().join("listings");
+            // The first listing is the read before uninstall; the next two
+            // come before the shell's rescan has listed the restored plugin.
+            fixture.write_shell_script(&format!(
+                "case \"$2\" in\n isLocked) printf 'false\\n';;\n listPlugins) count=0; if [ -f '{listings}' ]; then read count < '{listings}'; fi; count=$((count + 1)); printf '%s\\n' \"$count\" > '{listings}'; if [ \"$count\" -eq 2 ] || [ \"$count\" -eq 3 ]; then printf '%s\\n' '[{{\"id\":\"omarchy.clock\",\"enabled\":true}}]'; else printf '%s\\n' '{PLUGIN_ENABLED}'; fi;;\n listShellConfig) printf '%s\\n' '{config}';;\n *) printf 'ok\\n';;\nesac\n",
+                listings = listings.display(),
+            ))?;
+
+            let result = execute_with(
+                InstallAction::Uninstall,
+                &fixture.layout,
+                &fixture.sources,
+                &fixture.commands,
+            );
+
+            assert!(matches!(
+                result,
+                Err(InstallError::Service(ServiceError::Unsuccessful {
+                    command: "systemctl daemon-reload",
+                    ..
+                }))
+            ));
+            assert_eq!(fs::read(fixture.layout.plugin.join("old.qml"))?, b"old");
+            assert_eq!(
+                fs::read_to_string(&fixture.shell_log)?,
+                format!(
+                    "lock isLocked\nshell listPlugins\nshell listShellConfig\nlock isLocked\nshell setPluginEnabled local.omabox false\nlock isLocked\nlock isLocked\nshell listPlugins\nshell listPlugins\nshell listPlugins\n{reenable}"
+                )
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn await_listed_gives_up_at_the_deadline() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new("active", true, false, false)?;
+        fixture.write_shell_script(
+            "case \"$2\" in\n listPlugins) printf '%s\\n' '[{\"id\":\"omarchy.clock\",\"enabled\":true}]';;\n *) printf 'ok\\n';;\nesac\n",
+        )?;
+
+        let result = await_listed_within(&fixture.commands, Duration::ZERO);
+
+        assert!(matches!(result, Err(InstallError::PluginNotListed)));
+        assert_eq!(
+            fs::read_to_string(&fixture.shell_log)?,
+            "shell listPlugins\n"
         );
         Ok(())
     }
@@ -2558,6 +3210,14 @@ mod tests {
             InstallError::DaemonSelfCheckFailed { status: Some(1) },
             InstallError::ShellLocked,
             InstallError::InvalidLockState,
+            InstallError::InvalidShellReply {
+                command: "command",
+                category: "syntax",
+                line: 1,
+                column: 1,
+            },
+            InstallError::PluginRefused { command: "command" },
+            InstallError::PluginNotListed,
             InstallError::Service(ServiceError::Terminated { command: "command" }),
             InstallError::StartAfterChange {
                 done: "upgraded",
@@ -2593,6 +3253,9 @@ mod tests {
                 InstallError::DaemonSelfCheckFailed { .. } => "DaemonSelfCheckFailed",
                 InstallError::ShellLocked => "ShellLocked",
                 InstallError::InvalidLockState => "InvalidLockState",
+                InstallError::InvalidShellReply { .. } => "InvalidShellReply",
+                InstallError::PluginRefused { .. } => "PluginRefused",
+                InstallError::PluginNotListed => "PluginNotListed",
                 InstallError::Service(_) => "Service",
                 InstallError::StartAfterChange { .. } => "StartAfterChange",
                 InstallError::CleanupAfterChange { .. } => "CleanupAfterChange",

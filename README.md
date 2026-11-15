@@ -85,6 +85,8 @@ on the new build, and one that had failed is started again on it; if either
 still fails, the new build stays and `omabox status` and `omabox logs` show
 why. Uninstall removes program artifacts but retains configuration,
 credentials, journal state, recovery data, local files, and Dropbox content.
+It also takes the widget off the Omarchy bar; after a reinstall, enable it
+again as above.
 Commands that replace the live QuickShell plugin refuse to run while locked.
 
 ## Develop
