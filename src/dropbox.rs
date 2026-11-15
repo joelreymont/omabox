@@ -1828,6 +1828,18 @@ fn append_entry_changes(
         let (lower, display) = metadata_paths(&entry);
         let lower = lower.ok_or(DropboxError::InvalidEntryPath)?;
         let display = display.ok_or(DropboxError::InvalidEntryPath)?;
+        if !root.lower_path.is_empty() && lower == root.lower_path {
+            // A recursive listing of a non-root folder includes the folder
+            // itself; only an unrestricted folder keeps the root usable.
+            match &entry {
+                files::Metadata::Folder(folder) if folder_restricted(folder) => {
+                    return Err(DropboxError::RemoteRootRestricted);
+                }
+                files::Metadata::Folder(_) => continue,
+                files::Metadata::Deleted(_) => return Err(DropboxError::RemoteRootUnavailable),
+                files::Metadata::File(_) => return Err(DropboxError::RemoteRootNotFolder),
+            }
+        }
         let (key, path) = relative_paths(root, lower, display)?;
         let observation = match entry {
             files::Metadata::Deleted(_) => {
@@ -2901,6 +2913,67 @@ mod tests {
 
         assert!(matches!(result, Err(DropboxError::InvalidEntryPath)));
         assert!(records.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn listing_classifies_the_remote_roots_own_entry() -> Result<(), Box<dyn Error>> {
+        type Check = fn(&DropboxError) -> bool;
+        let root = DropboxRoot::new("account", "namespace", "/Sync")?;
+        let restricted = folder_metadata("/sync", "/Sync")
+            .with_sharing_info(files::FolderSharingInfo::new(false).with_no_access(true));
+        let deleted = files::DeletedMetadata::new(String::from("Sync"))
+            .with_path_lower(String::from("/sync"))
+            .with_path_display(String::from("/Sync"));
+        let child = files::Metadata::Folder(folder_metadata("/sync/child", "/Sync/Child"));
+        let mut prior = BTreeMap::new();
+        apply_entries(
+            &root,
+            &mut prior,
+            vec![files::Metadata::Folder(folder_metadata(
+                "/sync/old",
+                "/Sync/Old",
+            ))],
+        )?;
+        let cases: [(files::Metadata, Option<Check>); 4] = [
+            (
+                files::Metadata::Folder(folder_metadata("/sync", "/Sync")),
+                None,
+            ),
+            (
+                files::Metadata::Deleted(deleted),
+                Some(|error| matches!(error, DropboxError::RemoteRootUnavailable)),
+            ),
+            (
+                files::Metadata::Folder(restricted),
+                Some(|error| matches!(error, DropboxError::RemoteRootRestricted)),
+            ),
+            (
+                files::Metadata::File(file_metadata("/sync", "/Sync")),
+                Some(|error| matches!(error, DropboxError::RemoteRootNotFolder)),
+            ),
+        ];
+        for (root_entry, expected) in cases {
+            let entries = vec![root_entry, child.clone()];
+            match expected {
+                None => {
+                    let mut records = BTreeMap::new();
+                    apply_entries(&root, &mut records, entries)?;
+                    let paths = records
+                        .values()
+                        .map(|record| record.path.clone())
+                        .collect::<Vec<_>>();
+                    assert_eq!(paths, vec![PathBuf::from("Child")]);
+                }
+                Some(check) => {
+                    let mut records = prior.clone();
+                    let result = apply_entries(&root, &mut records, entries);
+                    let error = result.err().ok_or("root entry was accepted")?;
+                    assert!(check(&error), "{error:?}");
+                    assert_eq!(records, prior);
+                }
+            }
+        }
         Ok(())
     }
 

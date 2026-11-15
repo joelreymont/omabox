@@ -359,8 +359,10 @@ gains `conflicts: Vec<String>` (bounded to 20 display paths) and
   by Dropbox's `path_lower`, logged once per path; never an error.
   `validate_mutation_path` compares against the canonical form the same way and
   reports `MutationRejection` rather than an error.
-- An entry whose `path_lower` equals the root is skipped; a `deleted` entry for
-  the root is `RemoteRootUnavailable`.
+- An entry whose `path_lower` equals the root is skipped when it is an
+  unrestricted folder; a `deleted` entry for the root is
+  `RemoteRootUnavailable`, a restricted one `RemoteRootRestricted`, and a file
+  `RemoteRootNotFolder`.
 - `remove_subtree` deletes the key and the half-open range from `key/` to
   `key0` (`0` is the byte after `/`) that `CanonicalPath::subtree_range` gives;
   `normalize_inventory_records` runs once after the last page.

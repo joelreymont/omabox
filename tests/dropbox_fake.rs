@@ -104,6 +104,7 @@ fn oauth_listing_longpoll_and_exact_download_use_documented_protocol() -> Result
         FakeResponse::json(folder_metadata("/sync", "/Sync")),
         FakeResponse::json(json!({
             "entries": [
+                folder_metadata("/sync", "/Sync"),
                 folder_metadata("/sync/folder", "/Sync/Folder"),
                 file_metadata(
                     "/sync/alpha.txt",
