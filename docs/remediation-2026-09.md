@@ -254,8 +254,16 @@ impl DaemonError { fn disposition(&self) -> Disposition }
 - Readiness: the daemon sends `READY=1` over `NOTIFY_SOCKET` using
   `std::os::unix::net::UnixDatagram` (abstract addresses via
   `SocketAddrExt::from_abstract_name`; no new crate) as soon as the
-  configuration is loaded, the instance lock is held, and the journal is open
-  and migrated. Credential loading and account validation happen after
+  configuration document is loaded and the private state paths are checked
+  against the configured sync root, the instance lock is held, and the journal
+  is open and migrated. Before readiness the private paths are compared with
+  the physical path the sync root has, or will have once it exists; the root's
+  availability is enforced after readiness, and while it is unavailable the
+  service runs active and degraded with its status published. A root whose
+  projection fails, such as a symlink loop or a directory that cannot be
+  searched, stops startup before readiness and is retried there, since nothing
+  then shows the private paths lie outside it.
+  Credential loading and account validation happen after
   readiness: a UserAction outcome there exits 78 from the active service; a
   Retry or Environmental outcome runs as an active degraded service with its
   status published; Invariant failures before readiness exit 70. The unit

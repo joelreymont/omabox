@@ -18,7 +18,8 @@ use thiserror::Error;
 
 use crate::auth::{AuthError, CredentialLookup, RefreshTokenStore, StoredCredential};
 use crate::config::{
-    Config, ConfigError, InstanceLock, LockError, LoggingError, initialize_logging,
+    Config, ConfigDocument, ConfigError, InstanceLock, LockError, LoggingError, Paths,
+    XdgDirectories, initialize_logging,
 };
 use crate::dropbox::{AccountValidation, DropboxClient, DropboxError, DropboxRoot, LongPollWakeup};
 use crate::journal::{
@@ -116,21 +117,25 @@ fn run() -> Result<(), DaemonError> {
     let mut recovery = RecoveryControl::new(status.as_ref());
     let mut wait = |delay| thread::sleep(delay);
 
-    let config = recovery.recover_with(
+    let (document, paths) = recovery.recover_with(
         || {
-            let config = Config::load().map_err(DaemonError::Config)?;
-            config.prepare().map_err(DaemonError::Config)?;
-            Ok(config)
+            let xdg = XdgDirectories::from_environment().map_err(DaemonError::Config)?;
+            let document = ConfigDocument::load_from(&xdg).map_err(DaemonError::Config)?;
+            let paths = Paths::resolve_private(&xdg).map_err(DaemonError::Config)?;
+            paths
+                .prepare(document.sync_root())
+                .map_err(DaemonError::Config)?;
+            Ok((document, paths))
         },
         &mut wait,
     )?;
     let _instance_lock = recovery.recover_with(
-        || InstanceLock::acquire(config.paths().lock_file()).map_err(DaemonError::Lock),
+        || InstanceLock::acquire(paths.lock_file()).map_err(DaemonError::Lock),
         &mut wait,
     )?;
     let mut journal = recovery.recover_with(
         || {
-            Journal::open(config.paths().journal_file()).map_err(|source| DaemonError::Journal {
+            Journal::open(paths.journal_file()).map_err(|source| DaemonError::Journal {
                 operation: "open the journal",
                 source,
             })
@@ -139,6 +144,15 @@ fn run() -> Result<(), DaemonError> {
     )?;
     recovery.recover_with(notify_ready, &mut wait)?;
 
+    let config = recovery.recover_with(
+        || {
+            let config =
+                Config::validate_with(&document, paths.clone()).map_err(DaemonError::Config)?;
+            config.prepare().map_err(DaemonError::Config)?;
+            Ok(config)
+        },
+        &mut wait,
+    )?;
     run_owned(&config, &mut journal, &mut recovery, &mut wait)
 }
 

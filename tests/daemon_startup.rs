@@ -3,14 +3,21 @@
 use std::error::Error;
 use std::fs;
 use std::io;
+use std::os::unix::fs::symlink;
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use omabox::config::{Config, InstanceLock, LockError, XdgDirectories};
 use omabox::journal::Journal;
+use serde_json::Value;
 use tempfile::TempDir;
+
+const SYNC_ROOT: &str = "The configured sync folder is temporarily unavailable.";
+const CONFIGURATION_INVALID: &str = "Omabox configuration needs attention.";
+const EXIT_USER_ACTION: i32 = 78;
 
 struct ChildGuard {
     child: Option<Child>,
@@ -150,23 +157,65 @@ fn initialized_journal_and_held_lock_precede_readiness() -> Result<(), Box<dyn E
 }
 
 #[test]
-fn unavailable_root_never_sends_readiness() -> Result<(), Box<dyn Error>> {
+fn unavailable_root_still_signals_readiness() -> Result<(), Box<dyn Error>> {
+    for dangling in [false, true] {
+        let fixture = StartupFixture::new()?;
+        let sync_root = fixture.config.sync_root();
+        fs::remove_dir(sync_root)?;
+        if dangling {
+            let parent = sync_root
+                .parent()
+                .ok_or_else(|| io::Error::other("sync root has no parent"))?;
+            symlink(parent.join("missing"), sync_root)?;
+        }
+        let mut command = fixture.command();
+        let mut child = ChildGuard::spawn(&mut command)?;
+
+        assert_eq!(fixture.receive(Duration::from_secs(3))?, b"READY=1");
+        assert!(child.is_running()?);
+        assert!(matches!(
+            InstanceLock::acquire(fixture.config.paths().lock_file()),
+            Err(LockError::AlreadyRunning { .. })
+        ));
+        assert!(fixture.config.paths().journal_file().is_file());
+
+        let status = fixture.runtime.join("omabox/status.json");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let last_error = loop {
+            let last_error = fs::read(&status)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .map(|value| value["last_error"].clone());
+            if last_error.as_ref().and_then(Value::as_str) == Some(SYNC_ROOT)
+                || Instant::now() >= deadline
+            {
+                break last_error;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(last_error.as_ref().and_then(Value::as_str), Some(SYNC_ROOT));
+        assert!(child.is_running()?);
+        let _ = child.terminate()?;
+    }
+
+    // A dangling root whose target lies above the state directory would
+    // contain the state once the target appears: refused before readiness.
     let fixture = StartupFixture::new()?;
-    fs::remove_dir(fixture.config.sync_root())?;
+    let sync_root = fixture.config.sync_root();
+    fs::remove_dir(sync_root)?;
+    symlink(&fixture.state_home, sync_root)?;
     let mut command = fixture.command();
     let mut child = ChildGuard::spawn(&mut command)?;
-
-    let receive = fixture.receive(Duration::from_secs(1));
-    assert!(matches!(
-        receive,
-        Err(ref source)
-            if matches!(
-                source.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-            )
-    ));
-    assert!(child.is_running()?);
-    let _ = child.terminate()?;
-    assert!(!fixture.config.paths().journal_file().exists());
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while child.is_running()? && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let exit = child.terminate()?;
+    assert_eq!(exit.code(), Some(EXIT_USER_ACTION));
+    assert!(fixture.receive(Duration::from_millis(100)).is_err());
+    assert!(!fixture.state_home.exists());
+    let status: Value =
+        serde_json::from_slice(&fs::read(fixture.runtime.join("omabox/status.json"))?)?;
+    assert_eq!(status["last_error"].as_str(), Some(CONFIGURATION_INVALID));
     Ok(())
 }

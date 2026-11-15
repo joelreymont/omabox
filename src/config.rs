@@ -84,13 +84,6 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// Resolve every path this instance owns and check each lies outside `sync_root`.
-    fn resolve(xdg: &XdgDirectories, sync_root: &Path) -> Result<Self, ConfigError> {
-        let paths = Self::resolve_private(xdg)?;
-        paths.validate_outside(sync_root)?;
-        Ok(paths)
-    }
-
     /// Resolve every path this instance owns, without checking them against a sync root.
     ///
     /// The staging and recovery directories are the ones opened with
@@ -108,16 +101,27 @@ impl Paths {
         let state = xdg.application_state_directory();
         Ok(Self {
             config_directory: lexical_normalize(&xdg.config_directory()),
-            state_directory: project_physical_path(&state)?,
-            journal_file: project_physical_path(&state.join(JOURNAL_FILE))?,
-            upload_staging_directory: project_physical_path(&state.join(UPLOAD_STAGING_DIRECTORY))?,
-            recovery_directory: project_physical_path(&state.join(RECOVERY_DIRECTORY))?,
-            lock_file: project_physical_path(&state.join(LOCK_FILE))?,
+            state_directory: project_physical_path(&state, Dangling::Refuse)?,
+            journal_file: project_physical_path(&state.join(JOURNAL_FILE), Dangling::Refuse)?,
+            upload_staging_directory: project_physical_path(
+                &state.join(UPLOAD_STAGING_DIRECTORY),
+                Dangling::Refuse,
+            )?,
+            recovery_directory: project_physical_path(
+                &state.join(RECOVERY_DIRECTORY),
+                Dangling::Refuse,
+            )?,
+            lock_file: project_physical_path(&state.join(LOCK_FILE), Dangling::Refuse)?,
         })
     }
 
+    /// Check every private path lies outside `sync_root`. The root need not
+    /// exist: it is compared by the physical path it will have once it does,
+    /// following dangling symlinks; a root whose projection fails is refused.
+    /// [`Config::validate_with`] checks again with the canonical root before
+    /// anything reads it.
     fn validate_outside(&self, sync_root: &Path) -> Result<(), ConfigError> {
-        let physical_root = canonicalize_sync_root(sync_root)?;
+        let physical_root = project_physical_path(sync_root, Dangling::Follow)?;
         for (role, path) in [
             (PathRole::Config, self.config_directory()),
             (PathRole::StateDirectory, self.state_directory()),
@@ -126,7 +130,7 @@ impl Paths {
             (PathRole::Recovery, self.recovery_directory()),
             (PathRole::Lock, self.lock_file()),
         ] {
-            let projected = project_physical_path(path)?;
+            let projected = project_physical_path(path, Dangling::Refuse)?;
             if projected == physical_root || projected.starts_with(&physical_root) {
                 return Err(ConfigError::ProtectedPathInsideSyncRoot {
                     role,
@@ -300,8 +304,14 @@ impl Config {
 
     /// Resolve a stored configuration's sync root and check the state paths lie outside it.
     pub fn validate(document: &ConfigDocument, xdg: &XdgDirectories) -> Result<Self, ConfigError> {
+        Self::validate_with(document, Paths::resolve_private(xdg)?)
+    }
+
+    /// Validate `document` against `paths` already resolved, so the
+    /// configuration holds the same paths the caller has opened.
+    pub fn validate_with(document: &ConfigDocument, paths: Paths) -> Result<Self, ConfigError> {
         let sync_root = canonicalize_sync_root(document.sync_root())?;
-        let paths = Paths::resolve(xdg, &sync_root)?;
+        paths.validate_outside(&sync_root)?;
         Ok(Self {
             sync_root,
             dropbox_app_key: document.dropbox_app_key.clone(),
@@ -983,23 +993,99 @@ fn canonicalize_sync_root(path: &Path) -> Result<PathBuf, ConfigError> {
     }
 }
 
-fn project_physical_path(path: &Path) -> Result<PathBuf, ConfigError> {
+/// How [`project_physical_path`] treats a dangling symlink on the way.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Dangling {
+    /// A dangling symlink on the way fails the projection, for a path Omabox creates.
+    Refuse,
+    /// A dangling symlink on the way is followed to where its target would be,
+    /// for a path that is only compared.
+    Follow,
+}
+
+/// Symlinks one projection may follow, as Linux's `MAXSYMLINKS`.
+const MAX_SYMLINK_HOPS: usize = 40;
+
+/// The physical path `path` has, or will have once its missing components
+/// exist: the nearest existing ancestor is canonicalized; `dangling` says
+/// whether a dangling symlink on the way fails the projection or is followed.
+/// Missing components count as plain directories, so a `..` after one leaves it.
+fn project_physical_path(path: &Path, dangling: Dangling) -> Result<PathBuf, ConfigError> {
+    let mut current = path.to_path_buf();
+    let mut hops = 0;
+    loop {
+        match project_once(&current, dangling)? {
+            Projection::Physical(projected) => return Ok(projected),
+            Projection::Dangling(next) if hops < MAX_SYMLINK_HOPS => {
+                hops += 1;
+                current = next;
+            }
+            Projection::Dangling(_) => {
+                return Err(ConfigError::InspectPath {
+                    path: path.to_path_buf(),
+                    // `ELOOP`, whose kind is `FilesystemLoop`, as the kernel reports it.
+                    source: io::Error::from_raw_os_error(rustix::io::Errno::LOOP.raw_os_error()),
+                });
+            }
+        }
+    }
+}
+
+/// One step of [`project_physical_path`].
+enum Projection {
+    /// The physical path, fully projected.
+    Physical(PathBuf),
+    /// The path a followed dangling symlink leads to, still to be projected.
+    Dangling(PathBuf),
+}
+
+fn project_once(path: &Path, dangling: Dangling) -> Result<Projection, ConfigError> {
     let mut existing = path.to_path_buf();
     let mut missing = Vec::<OsString>::new();
     loop {
         match fs::symlink_metadata(&existing) {
-            Ok(_) => {
-                let mut projected =
-                    fs::canonicalize(&existing).map_err(|source| ConfigError::InspectPath {
-                        path: existing.clone(),
-                        source,
-                    })?;
+            Ok(metadata) => {
+                let canonical = match fs::canonicalize(&existing) {
+                    Ok(canonical) => canonical,
+                    Err(source)
+                        if dangling == Dangling::Follow
+                            && metadata.file_type().is_symlink()
+                            && source.kind() == io::ErrorKind::NotFound =>
+                    {
+                        let target = fs::read_link(&existing).map_err(|source| {
+                            ConfigError::InspectPath {
+                                path: existing.clone(),
+                                source,
+                            }
+                        })?;
+                        let mut next = existing
+                            .parent()
+                            .map_or_else(PathBuf::new, Path::to_path_buf)
+                            .join(target);
+                        for component in missing.iter().rev() {
+                            next.push(component);
+                        }
+                        return Ok(Projection::Dangling(next));
+                    }
+                    Err(source) => {
+                        return Err(ConfigError::InspectPath {
+                            path: existing,
+                            source,
+                        });
+                    }
+                };
+                let mut projected = canonical;
                 for component in missing.iter().rev() {
                     projected.push(component);
                 }
-                return Ok(lexical_normalize(&projected));
+                return Ok(Projection::Physical(lexical_normalize(&projected)));
             }
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                if existing.components().next_back() == Some(Component::ParentDir) {
+                    missing.push(OsString::from(".."));
+                    existing.pop();
+                    continue;
+                }
                 let name = existing.file_name().map(OsString::from).ok_or_else(|| {
                     ConfigError::InspectPath {
                         path: path.to_path_buf(),
@@ -1305,6 +1391,132 @@ mod tests {
             config.paths().upload_staging_directory(),
             fs::canonicalize(&elsewhere)?
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn projection_follows_a_dangling_absolute_symlink() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TempDir::new()?;
+        let link = temporary.path().join("link");
+        symlink(temporary.path().join("data/sub"), &link)?;
+
+        assert_eq!(
+            project_physical_path(&link.join("leaf"), Dangling::Follow)?,
+            fs::canonicalize(temporary.path())?.join("data/sub/leaf")
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn projection_follows_a_dangling_relative_symlink() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TempDir::new()?;
+        fs::create_dir(temporary.path().join("links"))?;
+        let link = temporary.path().join("links/link");
+        symlink("../data/sub", &link)?;
+
+        assert_eq!(
+            project_physical_path(&link.join("leaf"), Dangling::Follow)?,
+            fs::canonicalize(temporary.path())?.join("data/sub/leaf")
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn projection_leaves_a_missing_component_on_parent() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TempDir::new()?;
+        let expected = fs::canonicalize(temporary.path())?.join("data/leaf");
+        fs::create_dir(temporary.path().join("links"))?;
+        let link = temporary.path().join("links/link");
+        symlink("../missing/../data", &link)?;
+
+        assert_eq!(
+            project_physical_path(&link.join("leaf"), Dangling::Follow)?,
+            expected
+        );
+        assert_eq!(
+            project_physical_path(
+                &temporary.path().join("missing/../data/leaf"),
+                Dangling::Refuse
+            )?,
+            expected
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn projection_refuses_a_symlink_loop() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TempDir::new()?;
+        let first = temporary.path().join("first");
+        symlink(temporary.path().join("second"), &first)?;
+        symlink(&first, temporary.path().join("second"))?;
+
+        let error = project_physical_path(&first, Dangling::Follow)
+            .err()
+            .ok_or("a symlink loop was projected")?;
+        assert!(
+            matches!(
+                &error,
+                ConfigError::InspectPath { source, .. }
+                    if source.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error())
+            ),
+            "unexpected error: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refusing_projection_fails_on_a_dangling_symlink() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TempDir::new()?;
+        let link = temporary.path().join("link");
+        symlink(temporary.path().join("data"), &link)?;
+
+        let error = project_physical_path(&link.join("leaf"), Dangling::Refuse)
+            .err()
+            .ok_or("a dangling symlink was followed")?;
+        assert!(
+            matches!(error, ConfigError::InspectPath { .. }),
+            "unexpected error: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_refuses_state_below_a_dangling_root_target() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TempDir::new()?;
+        let root = temporary.path().join("root");
+        let data = temporary.path().join("data");
+        symlink(&data, &root)?;
+        let xdg = XdgDirectories::new(temporary.path().join("config"), data.join("state"))?;
+        let paths = Paths::resolve_private(&xdg)?;
+
+        let error = paths
+            .prepare(&root)
+            .err()
+            .ok_or("state below the root's target was accepted")?;
+        assert!(
+            matches!(error, ConfigError::ProtectedPathInsideSyncRoot { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert!(!data.exists());
         Ok(())
     }
 
