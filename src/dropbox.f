@@ -90,19 +90,21 @@ STRUCTURE config DERIVE addr
 ;STRUCTURE
 
 \ The buffers are BUF headers in the arena: token holds the refresh token,
-\ access the access token, body a route's JSON body, line a URL or header line being built, answer
-\ the body received, heads its header block, values the strings decoded from
-\ it. root-line is the Path-Root header line, empty for none. route names the
-\ request for the log; quiet marks the token route, whose body is never
-\ logged. status is the answer's HTTP status, 0 when curl failed with
-\ failure. outer, leaf-name and leaf are an error body's tags; wait its
-\ retry_after in seconds, -1 for none; correct its correct_offset, -1 for
-\ none; issued a token answer's access_token and granted its refresh_token.
-\ sent holds a listing's cursor, the one sent and then its page's, and mark
-\ the cursor of the last listing that answered done; page is a page's
-\ cursor, more its has_more, got the members an answer must hold, one bit
-\ each; changes and backoff are a long poll's answer. tagged marks the
-\ `.tag` of the Metadata union being read into entry.
+\ access the access token, body a route's JSON body, line a URL or header
+\ line being built, answer the body received, heads its header block,
+\ values the strings decoded from it. holds names what answer holds, for
+\ the log: body, or result once a download's Dropbox-API-Result replaced
+\ it. root-line is the Path-Root header line, empty for none. route names
+\ the request for the log; quiet marks the token route, whose body is
+\ never logged. status is the answer's HTTP status, 0 when curl failed
+\ with failure. outer, leaf-name and leaf are an error body's tags; wait
+\ its retry_after in seconds, -1 for none; correct its correct_offset,
+\ -1 for none; issued a token answer's access_token and granted its
+\ refresh_token. sent holds a listing's cursor, the one sent and then
+\ its page's, and mark the cursor of the last listing that answered done;
+\ page is a page's cursor, more its has_more, got the members an answer
+\ must hold, one bit each; changes and backoff are a long poll's answer.
+\ tagged marks the `.tag` of the Metadata union being read into entry.
 STRUCTURE client OPAQUE DERIVE addr
    FIELD handle CURL:handle
    FIELD key SPAN:span<u8>
@@ -115,6 +117,7 @@ STRUCTURE client OPAQUE DERIVE addr
    FIELD body ptr n
    FIELD line ptr n
    FIELD answer ptr n
+   FIELD holds SPAN:span<u8>
    FIELD heads ptr n
    FIELD values ptr n
    FIELD writer JSON:writer
@@ -176,15 +179,18 @@ ENUM verdict
    ANSWER$ EXCERPT min ;
 
 
-\ One line: the route, the status, why, and the body's start unless the
-\ route is quiet.
+\ One line: the route, the status, why, and the answer buffer's start,
+\ labelled by what it holds, unless the route is quiet.
 : REPORT ( ptr client ptr u8 n -- )
    {: c why:ptr why-u:n :}
    LOG-OPEN
    c CLIENT-ROUTE @ SPAN:$ LOG:TEXT+
    s"  answered " LOG:TEXT+ c CLIENT-STATUS @ LOG:INT+
    s" : " LOG:TEXT+ why why-u LOG:TEXT+
-   c CLIENT-QUIET @ 0= if s" ; body: " LOG:TEXT+ c EXCERPT$ LOG:TEXT+ then
+   c CLIENT-QUIET @ 0= if
+      s" ; " LOG:TEXT+ c CLIENT-HOLDS @ SPAN:$ LOG:TEXT+
+      s" : " LOG:TEXT+ c EXCERPT$ LOG:TEXT+
+   then
    LOG:;LINE ;
 
 
@@ -277,6 +283,7 @@ ENUM verdict
    ar BUFFER c CLIENT-BODY !
    ar BUFFER c CLIENT-LINE !
    ar BUFFER c CLIENT-ANSWER !
+   s" body" SPAN:MAKE c CLIENT-HOLDS !
    ar BUFFER c CLIENT-HEADS !
    ar BUFFER c CLIENT-VALUES !
    ar BUFFER c CLIENT-SENT !
@@ -359,6 +366,7 @@ ENUM verdict
    {: c :}
    0 c CLIENT-STATUS ! 0 c CLIENT-FAILURE !
    c CLIENT-ANSWER @ BUF:CLEAR
+   s" body" SPAN:MAKE c CLIENT-HOLDS !
    c CLIENT-HEADS @ BUF:CLEAR
    c CLIENT-HANDLE @ {: h:CURL:handle :}
    h CURL:STREAM-START s" stream" OK
@@ -958,11 +966,13 @@ ENUM verdict
 
 
 \ The metadata the Dropbox-API-Result header holds, read into the entry.
-\ It replaces the answer buffer, so a 2xx chunk lands in the body buffer.
+\ It replaces the answer buffer, so a 2xx chunk lands in the body buffer
+\ and a failed check logs the result, never a byte of the file.
 : RESULT-READ ( ptr client -- )
    {: c :}
    c s" Dropbox-API-Result" HEADER$ BUF:N>BLEN
    c CLIENT-ANSWER @ BUF:REPLACE
+   s" result" SPAN:MAKE c CLIENT-HOLDS !
    c FILE-READ ;
 
 
