@@ -151,8 +151,8 @@ STRUCTURE config
   - `DELETE` refused `not-found` is `done` without asking: the path is
     absent, which is what a delete intends.
   - Every other refusal stands. A mutation never answers "unknown".
-- **`UPLOAD` checks what Dropbox committed.** The entry's lower path must be
-  the upload's, else it throws `E-ANSWER`. Its content hash must be the
+- **`UPLOAD` checks what Dropbox committed.** The entry's `path_lower` must be
+  the upload path's full Unicode lowercase, else it throws `E-ANSWER`. Its content hash must be the
   upload's, else it answers `refused content-hash-mismatch`, the tag Dropbox
   gives a single upload whose bytes do not match.
 

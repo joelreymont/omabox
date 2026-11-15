@@ -1395,6 +1395,17 @@ TYPED-VARIABLE FAULT fault
 : SEND-LOGGED ( -- n ) [: SEND DONE? drop ;] LOGGED ;
 
 
+\ The fake lowers ASCII alone, so its path_lower folds equal to the upload
+\ path but is not its full lowercase.
+: OTHER-CASE-CASE ( -- )
+   s" committed path of another case" T-LABEL
+   TEST-DROPBOX:RESET -1 FAULT-AT !
+   s" cafe.txt" STAGE! s" hello cafe" S\" /Docs/CAF\xc3\x89.txt" s" " STAGED
+   SEND-LOGGED DROPBOX:E-ANSWER T=
+   s" an entry of another path" LOGGED? TTRUE
+   UNSTAGED ;
+
+
 \ ERR$ holds the line UPLOAD logs for a failure of UP's stage.
 : STAGE-LOGGED? ( ptr u8 n -- bool )
    {: why:ptr wu:n :}
@@ -1529,9 +1540,9 @@ TYPED-VARIABLE FAULT fault
 
 
 : SINGLE-CASES ( -- )
-   SINGLE-CASE CONFLICT-CASE HELD-CASE NON-ASCII-CASE CUT-SINGLE-CASE
-   DENIED-SINGLE-CASE LOST-SINGLE-CASE SHORT-STAGE-CASE REFUSED-STAGE-CASE
-   FULL-READ-CASE ENTERED-READ-CASE TIMED-OUT-READ-CASE
+   SINGLE-CASE CONFLICT-CASE HELD-CASE NON-ASCII-CASE OTHER-CASE-CASE
+   CUT-SINGLE-CASE DENIED-SINGLE-CASE LOST-SINGLE-CASE SHORT-STAGE-CASE
+   REFUSED-STAGE-CASE FULL-READ-CASE ENTERED-READ-CASE TIMED-OUT-READ-CASE
    CANCELLED-READ-CASE ;
 
 

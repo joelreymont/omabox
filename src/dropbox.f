@@ -2152,8 +2152,8 @@ HEAP RUNS run
 
 \ ---- the answers
 
-\ The committed entry is the upload's: the same path up to case, else
-\ E-ANSWER, and its content hash, else last is refused
+\ The committed entry is the upload's: its path_lower is the upload path's
+\ full lowercase, else E-ANSWER, and its content hash, else last is refused
 \ content-hash-mismatch.
 : COMMITTED? ( ptr run -- bool )
    {: r :}
@@ -2161,8 +2161,8 @@ HEAP RUNS run
    r RUN-UP @ {: up :}
    c FILE-READ
    c CLIENT-ENTRY {: e :}
-   e DROPBOX-ENTRY:LOWER @ SPAN:$
-   up DROPBOX-UPLOAD:PATH @ SPAN:$ UNICODE:CASEFOLD=
+   up DROPBOX-UPLOAD:PATH @ SPAN:$
+   e DROPBOX-ENTRY:LOWER @ SPAN:$ UNICODE:LOWERS-TO?
    0= if c s" an entry of another path" E-ANSWER FAILED then
    e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$
    up DROPBOX-UPLOAD:CONTENT-HASH @ SPAN:$ STR= if true exit then
