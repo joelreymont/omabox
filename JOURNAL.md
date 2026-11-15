@@ -774,3 +774,39 @@ with seven such names. In Rust, `Path::join` comes from the standard
 library, so no lane writes one. The two STAGE-IN words were helpers the
 workers named; the Rust functions they serve, stage_upload_at and
 stage_download_at, already had distinct names.
+
+## 2026-11-16: JOURNAL lands, and a refusal that was right
+
+JOURNAL landed as a stack: five lanes, their merge, the recoveries and
+four review folds. It ports fifty-one of journal.rs's tests and two of
+daemon.rs's under their Rust names. One fold dropped a plan's delete
+from RETIRE, and no test noticed. The next fold added checks of the
+live plan rows, and a run with the delete removed showed they fail.
+A passing suite said nothing about that line until a test looked at it.
+
+Habu's jj config marks no commit immutable. Retiring a workspace
+abandoned its working-copy commit, which had already landed, and jj
+rewrote fourteen commits, master among them, in the local repository.
+Nothing had been pushed, and `jj op revert` undid it. Now a workspace's
+commit is abandoned only after `jj log -r '<ws>@ & ::master@origin'`
+comes back empty.
+
+A Habu test had to wrap `OPTION:NONE` in a word declared
+`( -- option<edapw> )` before passing it where a two-cell payload's
+option was wanted; inline, the checker refused it. A worker traced the
+refusal and found it sound. Habu fixes a value's width where the value
+is built, and `none` has no payload to size it, so only the enclosing
+word's declared output can. Binding the type later only moved the
+refusal to a stack underflow. Rust sizes `None` from the whole
+function's inference, and the question never comes up. The fix belongs
+to Habu's one-pass compiler work, whose dot now holds the trace. Until
+then a one-line typed word is the way to write it.
+
+Rust's exclusions are thirty lines in their own module. The scan lane
+ported them as private LOCAL words. REPLAY and RECONCILE need them on
+plan paths, so they moved to MODEL ahead of LOCAL's landing, and REPLAY
+could start without waiting for LOCAL.
+
+Lane times: the LOCAL merge 9.6 min with its decisions in the brief
+(the first merge worker, without them, stopped on seven names); the
+checker hunt 7.3 min.
