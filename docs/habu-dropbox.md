@@ -164,11 +164,14 @@ FSM:DEFINE SESSION ( ptr upload ) upload-step
    IN finishing   FINISH-SENSE ( finish-event )
       committed   ANSWER-DONE     >ended
       lost        -               >confirming
-      gone        -               >restarting
+      gone        -               >verifying
       refused     ANSWER-REFUSED  >ended
    IN confirming  CONFIRM-SENSE ( confirm-event )
       same        ANSWER-DONE     >ended
       other       ANSWER-RETRY    >ended
+   IN verifying   CONFIRM-SENSE ( confirm-event )
+      same        ANSWER-DONE     >ended
+      other       -               >restarting
    IN restarting  RESTART-SENSE ( restart-event )
       again       REWIND          >starting    \ once per UPLOAD
       twice       ANSWER-RETRY    >ended
@@ -180,6 +183,10 @@ FSM:DEFINE SESSION ( ptr upload ) upload-step
   the chunk's end: a resent chunk Dropbox already had. Any other correct
   offset, or a closed or missing session, is **`gone`**, and the upload starts
   over once.
+- **A finish whose session is gone is verified first.** A resent finish
+  Dropbox already applied answers `lookup_failed/not_found`, so the upload
+  asks `get_metadata` and starts over only when Dropbox does not hold the
+  upload's content hash.
 - **`finish` carries no content hash.** It sends no bytes, and Dropbox
   checks that field against the bytes of the call. The upload is checked
   instead by the content hash of the entry Dropbox commits. The Rust version
@@ -226,7 +233,9 @@ The sync code builds these from the words above:
 A call's deadlines need nothing new: `CURL:LOW-SPEED!` bounds the connect by
 the same seconds as a stalled body, so a call has `TIMEOUT!` for the whole
 call and `LOW-SPEED!` for a stall. A long poll, whose body is silent until it
-answers, sets `LOW-SPEED!` to zero and only `TIMEOUT!`.
+answers, sets `LOW-SPEED!` to zero and only `TIMEOUT!`. So does
+`upload_session/finish`, silent while Dropbox commits: 3600 s, as the Rust
+version's `SESSION_FINISH_SECONDS`.
 
 A client reads every answer through curl's streaming words, so no buffer caps
 its size. A program that uses `DROPBOX` therefore starts the CURL loop first
@@ -250,6 +259,8 @@ The tests run against a fake Dropbox on `net/http.f`, in the style of
   - `incorrect_offset` at the chunk's end;
   - a closed session, restarted once;
   - a lost finish, confirmed;
+  - a finish whose session is gone: confirmed when Dropbox holds it, else
+    restarted;
 - **delete and create-folder:** a conflict, not found, and a conflict whose
   path is already gone;
 - **auth and transport:**

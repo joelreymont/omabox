@@ -1857,10 +1857,29 @@ HEAP RUNS run
    s" close" false JSON:WRITE-FIELD-BOOL ;
 
 
-\ The argument the fields write, the bytes, and the content deadlines: a
-\ stall ends the call, a long body does not.
-: ARGUED ( CURL:handle ptr client ptr u8 n [ ptr JSON:writer -- ptr JSON:writer ] -- )
-   {: h:CURL:handle c b:ptr bu:n fields :}
+\ The content deadlines: a stall ends the call, a long body does not.
+: STALLED ( CURL:handle -- )
+   {: h:CURL:handle :}
+   h 0 >MS CURL:TIMEOUT! s" timeout" OK
+   h 1 IDLE CURL:LOW-SPEED! s" low speed" OK ;
+
+
+\ transport.rs SESSION_FINISH_SECONDS: the longest a finish, which commits
+\ every appended byte, may take to answer.
+3600 constant FINISH-WAIT
+
+
+\ A finish sends no byte and is silent until Dropbox commits, so only the
+\ whole call is bounded.
+: PATIENT ( CURL:handle -- )
+   {: h:CURL:handle :}
+   h FINISH-WAIT 1000 * >MS CURL:TIMEOUT! s" timeout" OK
+   h 0 0 CURL:LOW-SPEED! s" low speed" OK ;
+
+
+\ The argument the fields write, the bytes, and the deadlines.
+: ARGUED ( CURL:handle ptr client ptr u8 n [ ptr JSON:writer -- ptr JSON:writer ] [ CURL:handle -- ] -- )
+   {: h:CURL:handle c b:ptr bu:n fields deadline :}
    c BODY-OPEN JSON:WRITE-OBJECT-START fields execute
    JSON:WRITE-OBJECT-END JSON:WRITE-CLOSE
    c LINE-CLEAR c s" Dropbox-API-Arg: " LINE+
@@ -1868,16 +1887,15 @@ HEAP RUNS run
    h c LINE$ CURL:HEADER+ s" header" OK
    h s" Content-Type: application/octet-stream" CURL:HEADER+ s" header" OK
    h b bu CURL:BODY! s" body" OK
-   h 0 >MS CURL:TIMEOUT! s" timeout" OK
-   h 1 IDLE CURL:LOW-SPEED! s" low speed" OK ;
+   h deadline execute ;
 
 
-\ A POST of the bytes to <content>/2/<route>.
-: SENT ( ptr run ptr u8 n ptr u8 n [ ptr JSON:writer -- ptr JSON:writer ] -- reply )
-   {: r rt:ptr ru:n b:ptr bu:n fields :}
+\ A POST of the bytes to <content>/2/<route>, under the deadlines.
+: SENT ( ptr run ptr u8 n ptr u8 n [ ptr JSON:writer -- ptr JSON:writer ] [ CURL:handle -- ] -- reply )
+   {: r rt:ptr ru:n b:ptr bu:n fields deadline :}
    r RUN-CLIENT @ {: c :}
    c c CLIENT-CONTENT @ rt ru
-   [: b bu fields ARGUED ;] [: RECEIVED ;] CALL-AT ;
+   [: b bu fields deadline ARGUED ;] [: RECEIVED ;] CALL-AT ;
 
 
 : SINGLE-SENT ( ptr run -- reply )
@@ -1886,17 +1904,19 @@ HEAP RUNS run
    r s" files/upload" r CHUNK$
    [: up COMMIT+ JSON:WRITE-COMMA s" content_hash"
       up DROPBOX-UPLOAD:CONTENT-HASH @ SPAN:$ JSON:WRITE-FIELD-S ;]
-   SENT ;
+   [: STALLED ;] SENT ;
 
 
 : START-SENT ( ptr run -- reply )
-   s" files/upload_session/start" s" " [: CLOSE+ ;] SENT ;
+   s" files/upload_session/start" s" " [: CLOSE+ ;] [: STALLED ;]
+   SENT ;
 
 
 : APPEND-SENT ( ptr run -- reply )
    {: r :}
    r s" files/upload_session/append_v2" r CHUNK$
-   [: r r RUN-ACCEPTED @ CURSOR+ JSON:WRITE-COMMA CLOSE+ ;] SENT ;
+   [: r r RUN-ACCEPTED @ CURSOR+ JSON:WRITE-COMMA CLOSE+ ;]
+   [: STALLED ;] SENT ;
 
 
 : FINISH-SENT ( ptr run -- reply )
@@ -1905,7 +1925,7 @@ HEAP RUNS run
    [: r r SIZE CURSOR+ JSON:WRITE-COMMA
       s" commit" JSON:WRITE-KEY JSON:WRITE-OBJECT-START
       r RUN-UP @ COMMIT+ JSON:WRITE-OBJECT-END ;]
-   SENT ;
+   [: PATIENT ;] SENT ;
 
 
 \ ---- the answers
@@ -1995,7 +2015,8 @@ HEAP RUNS run
 \ ---- the machine
 
 ENUM upload-step
-   single starting appending finishing confirming restarting ended ;ENUM
+   single starting appending finishing confirming verifying restarting
+   ended ;ENUM
 ENUM send-event committed lost conflict failed ;ENUM
 ENUM start-event opened lost failed ;ENUM
 ENUM append-event stored complete lost cut gone failed ;ENUM
@@ -2116,6 +2137,9 @@ ENUM restart-event once twice ;ENUM
    0 r RUN-ACCEPTED ! false r RUN-RESENT ! ;
 
 
+\ confirming asks whether an answer it cannot trust took effect; verifying
+\ asks whether a finish whose session is gone was a resend Dropbox already
+\ committed, and starts over only when it was not.
 FSM:DEFINE SESSION ( ptr run ) upload-step send-event
    IN single  SEND-SENSE
       committed  ANSWER-DONE   >ended
@@ -2137,11 +2161,14 @@ FSM:DEFINE SESSION ( ptr run ) upload-step send-event
       committed  ANSWER-DONE   >ended
       lost       -             >confirming
       conflict   -             >confirming
-      gone       -             >restarting
+      gone       -             >verifying
       failed     ANSWER-REPLY  >ended
    IN confirming  CONFIRM-SENSE ( confirm-event )
       same   ANSWER-DONE   >ended
       other  ANSWER-REPLY  >ended
+   IN verifying  CONFIRM-SENSE ( confirm-event )
+      same   ANSWER-DONE   >ended
+      other  -             >restarting
    IN restarting  RESTART-SENSE ( restart-event )
       once   REWIND        >starting
       twice  ANSWER-RETRY  >ended

@@ -696,7 +696,7 @@ variable SHOWS
 \ the strikes left there.
 variable FAULT-AT
 variable STRIKES
-ENUM fault cut cut-twice lose close ;ENUM
+ENUM fault cut cut-twice lose close unfound applied ;ENUM
 TYPED-VARIABLE FAULT fault
 
 
@@ -765,12 +765,28 @@ TYPED-VARIABLE FAULT fault
 : EXPECTED$ ( -- ptr u8 n ) EXPECTED 64 ;
 
 
+\ The next call answers lookup_failed/not_found, as Dropbox answers a
+\ finish whose session it no longer holds, or one it already applied.
+: UNFOUND ( -- )
+   409 s" " s" "
+   S\" {\qerror_summary\q:\qlookup_failed/not_found/...\q,\qerror\q:{\q.tag\q:\qlookup_failed\q,\qlookup_failed\q:{\q.tag\q:\qnot_found\q}}}"
+   TEST-DROPBOX:SCRIPT! ;
+
+
+\ Dropbox holds the big file, as a finish it applied leaves it.
+: APPLIED ( -- )
+   s" /big.bin" s" /Big.bin" s" rev-applied" EXPECTED$ CHUNK 1+
+   TEST-DROPBOX:FILE! ;
+
+
 : STRIKE ( -- )
    FAULT @ MATCH fault
       cut OF TEST-DROPBOX:CUT ENDOF
       cut-twice OF TEST-DROPBOX:CUT TEST-DROPBOX:CUT ENDOF
       lose OF TEST-DROPBOX:LOSE ENDOF
       close OF TEST-DROPBOX:CLOSE-SESSIONS ENDOF
+      unfound OF UNFOUND ENDOF
+      applied OF UNFOUND APPLIED ENDOF
    ;MATCH ;
 
 
@@ -1087,12 +1103,32 @@ TYPED-VARIABLE FAULT fault
    CHUNK 1+ UP DROPBOX-UPLOAD:SIZE ! ;
 
 
+\ FAULTED's expected calls would not survive: the fake builds a FILE!'s
+\ metadata in the same string buffer.
+: APPLIED-FINISH-CASE ( -- )
+   s" finish gone, already applied" T-LABEL
+   CHUNK 1+ construct fault applied 1 STRUCK DONE? ASSERT
+   ENTRY-HASH$ EXPECTED$ T$=
+   MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:SIZE @ CHUNK 1+ T=
+   SB-RESET S-START S-APPEND S-APPEND S-FINISH
+   s"  /2/files/get_metadata" SB-APPEND
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
+
+
+: UNFOUND-FINISH-CASE ( -- )
+   s" finish gone, not applied" T-LABEL
+   SB-RESET S-START S-APPEND S-APPEND S-FINISH
+   s"  /2/files/get_metadata" SB-APPEND
+   S-RESTART S-APPEND S-APPEND S-FINISH
+   CHUNK 1+ construct fault unfound FAULTED ;
+
+
 : UPLOAD-CASES ( -- )
    HASH-CASE SINGLE-CASES
    BIG-STAGED
    SESSION-CASE LOST-APPEND-CASE HELD-APPEND-CASE CLOSED-CASE
-   LOST-FINISH-CASE CUT-APPEND-CASE CLOSED-TWICE-CASE MISMATCH-CASE
-   ENDED-EARLY-CASE
+   LOST-FINISH-CASE APPLIED-FINISH-CASE UNFOUND-FINISH-CASE CUT-APPEND-CASE
+   CLOSED-TWICE-CASE MISMATCH-CASE ENDED-EARLY-CASE
    UNSTAGED ;
 
 
