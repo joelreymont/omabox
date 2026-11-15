@@ -773,12 +773,13 @@ pub(crate) fn create_owner_only(path: &Path) -> Result<(), io::Error> {
 
 /// The held kernel lock for one daemon instance.
 ///
-/// Dropping this value closes the file and releases the lock. The lock file is
-/// intentionally not deleted: its presence does not indicate ownership, so no
+/// Dropping this value unlocks the file before closing it, so the lock is
+/// released even while a child forked meanwhile still holds a copy of its
+/// descriptor. The lock file is intentionally not deleted: its presence does not indicate ownership, so no
 /// stale-file cleanup or recovery protocol is needed.
 #[derive(Debug)]
 pub struct InstanceLock {
-    _file: File,
+    file: File,
     path: PathBuf,
 }
 
@@ -801,7 +802,7 @@ impl InstanceLock {
             })?;
         match file.try_lock() {
             Ok(()) => Ok(Self {
-                _file: file,
+                file,
                 path: path.to_path_buf(),
             }),
             Err(fs::TryLockError::WouldBlock) => Err(LockError::AlreadyRunning {
@@ -818,6 +819,18 @@ impl InstanceLock {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.file.unlock() {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %error,
+                "could not unlock the daemon lock file; closing it instead"
+            );
+        }
     }
 }
 
@@ -1559,6 +1572,24 @@ mod tests {
         let second = InstanceLock::acquire(&path)?;
         assert_eq!(second.path(), path);
         assert!(path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_the_lock_releases_it_while_a_descriptor_copy_is_open()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = TempDir::new()?;
+        let path = temporary.path().join("daemon.lock");
+        let first = InstanceLock::acquire(&path)?;
+        // The duplicate shares the open file description, as a forked child's
+        // copy of the descriptor does.
+        let copy = rustix::io::dup(&first.file)?;
+
+        drop(first);
+        let second = InstanceLock::acquire(&path)?;
+
+        assert_eq!(second.path(), path);
+        drop(copy);
         Ok(())
     }
 }
