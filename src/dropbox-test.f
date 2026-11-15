@@ -24,6 +24,58 @@ require src/lib/net/curl.f
 require src/dropbox.f
 require src/test-dropbox.f
 
+\ DROPBOX reopened for the throws no answer of the fake reaches: a reader
+\ that faults, and an OPEN that fails once its buffers exist.
+package DROPBOX
+private
+
+TYPED-VARIABLE PROBE config
+
+
+\ A client on an arena of its own, with PROBE's root and no origins.
+: PROBED ( ptr u8 n ptr ARENA:arena -- ptr client )
+   {: r:ptr ru:n ar :}
+   r ru SPAN:MAKE PROBE DROPBOX-CONFIG:ROOT !
+   PROBE ar OPEN ;
+
+
+\ A reader's memory fault reaches PARSE's caller as itself.
+: FAULT-CASE ( -- )
+   s" a reader's own code" T-LABEL
+   ARENA:NEW {: ar :}
+   s" " ar PROBED {: c :}
+   s\" {\"a\":1}" BUF:N>BLEN c CLIENT-ANSWER @ BUF:REPLACE
+   [: c [: drop ENGINE-ERROR:MEMORY-FAULT throw ;] PARSE ;]
+   ENGINE-ERROR:MEMORY-FAULT TTHROWSQ
+   c CLOSE
+   ar ARENA:RELEASE ;
+
+
+\ A root that is not UTF-8 fails the Path-Root line after the buffers
+\ exist; none of them stays live.
+: UNDONE-CASE ( -- )
+   s" an OPEN that fails" T-LABEL
+   ARENA:NEW {: ar :}
+   s\" \xFF" SPAN:MAKE PROBE DROPBOX-CONFIG:ROOT !
+   ar CLIENTS-NEW {: c :}
+   [: c PROBE ar FILLED ;] E-JSON-WRITE-BYTE TTHROWSQ
+   c CLIENT-TOKEN @ BUF:LIVE? 0= T-ASSERT
+   c CLIENT-ACCESS @ BUF:LIVE? 0= T-ASSERT
+   c CLIENT-BODY @ BUF:LIVE? 0= T-ASSERT
+   c CLIENT-LINE @ BUF:LIVE? 0= T-ASSERT
+   c CLIENT-ANSWER @ BUF:LIVE? 0= T-ASSERT
+   c CLIENT-HEADS @ BUF:LIVE? 0= T-ASSERT
+   c CLIENT-VALUES @ BUF:LIVE? 0= T-ASSERT
+   c CLIENT-SENT @ BUF:LIVE? 0= T-ASSERT
+   c CLIENT-MARK @ BUF:LIVE? 0= T-ASSERT
+   ar ARENA:RELEASE ;
+
+public
+
+: THROW-CASES ( -- ) FAULT-CASE UNDONE-CASE ;
+
+;package
+
 package DROPBOX-TEST
 public
 
@@ -1272,7 +1324,7 @@ TYPED-VARIABLE FAULT fault
    DELETE-CONFLICT-CASE DELETE-MISSING-CASE DELETE-GONE-CASE
    LOST-DELETE-CASE
    FOLDER-CONFLICT-CASE LOST-FOLDER-CASE EXCHANGE-CASE DEAD-CODE-CASE
-   UPLOAD-CASES
+   UPLOAD-CASES DROPBOX:THROW-CASES
    MAIN @ DROPBOX:CLOSE ;
 
 

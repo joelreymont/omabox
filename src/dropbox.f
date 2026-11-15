@@ -486,13 +486,22 @@ ENUM verdict
    JSON:READ-FINISH c ;
 
 
+\ Whether code says the answer does not parse: a JSON read code or
+\ E-ANSWER.
+: UNPARSED? ( n -- bool )
+   {: code:n :}
+   code E-ANSWER = if true exit then
+   code E-JSON-READ-LAST >= code E-JSON-READ-FIRST <= and ;
+
+
 \ Whether the answer is one JSON object `member` reads; a failure leaves
-\ the cursor disposed.
+\ the cursor disposed, and any other code, such as a memory fault, goes on.
 : PARSES? ( ptr client [ JSON:reader ptr client -- JSON:reader ] -- bool )
    {: c member :}
    c [: member READ-ANSWER ;] catch {: code:n :} drop
    code 0= if true exit then
    c CLIENT-CURSOR JSON:READ-DISPOSE
+   code UNPARSED? 0= if code throw then
    false ;
 
 
@@ -1127,6 +1136,42 @@ ENUM verdict
    r ru 0 c sink [: UNSATISFIABLE ;] FROM ;
 
 
+\ Disposes buf unless it is null, a buffer OPEN never made: the arena
+\ zeroes the record.
+: DISCARD ( ptr n -- )
+   {: buf :}
+   buf NULL-PTR = if exit then
+   buf BUF:DISPOSE ;
+
+
+\ The buffers BUFFERED made, before a throw part-way or after them all.
+: UNBUFFERED ( ptr client -- )
+   {: c :}
+   c CLIENT-TOKEN @ DISCARD
+   c CLIENT-ACCESS @ DISCARD
+   c CLIENT-BODY @ DISCARD
+   c CLIENT-LINE @ DISCARD
+   c CLIENT-ANSWER @ DISCARD
+   c CLIENT-HEADS @ DISCARD
+   c CLIENT-VALUES @ DISCARD
+   c CLIENT-SENT @ DISCARD
+   c CLIENT-MARK @ DISCARD ;
+
+
+\ What OPEN keeps in c. A throw part-way disposes the buffers made and
+\ goes on; the rest is the arena's, and the handle, made last, exists only
+\ when nothing threw.
+: FILLED ( ptr client ptr config ptr ARENA:arena -- )
+   {: c cfg ar :}
+   [: c ar BUFFERED
+      c cfg ar CONFIGURED
+      c cfg DROPBOX-CONFIG:ROOT @ SPAN:$ ar ROOT-LINE c CLIENT-ROOT-LINE !
+      NEW-HANDLE c CLIENT-HANDLE ! ;] catch {: code:n :}
+   code 0= if exit then
+   c UNBUFFERED
+   code throw ;
+
+
 public
 
 \ Sets the three origins to Dropbox's.
@@ -1140,10 +1185,7 @@ public
 : OPEN ( ptr config ptr ARENA:arena -- ptr client )
    {: cfg ar :}
    ar CLIENTS-NEW {: c :}
-   c ar BUFFERED
-   c cfg ar CONFIGURED
-   c cfg DROPBOX-CONFIG:ROOT @ SPAN:$ ar ROOT-LINE c CLIENT-ROOT-LINE !
-   NEW-HANDLE c CLIENT-HANDLE !
+   c cfg ar FILLED
    c ;
 
 
