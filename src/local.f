@@ -1,8 +1,9 @@
 \ local.f - package LOCAL: the local half of a sync (docs/habu-rewrite.md,
 \ the LOCAL row) on Habu's anchored file words: its errors, the opens it
 \ confines below the sync root, Dropbox content hashes of local files, the
-\ verified stages a download writes, with their xattr markers, and the
-\ slots in the state home where a download's partial bytes resume.
+\ verified stages a download writes, with their xattr markers, the slots
+\ in the state home where a download's partial bytes resume, and the
+\ partials themselves, checkpointed and promoted into their stages.
 \ A relative path splits as Rust's Path::components splits it: empty and "."
 \ components past the first are skipped, and an empty, absolute or leading "."
 \ path, or one with a ".." component, is unsafe. Each component opens
@@ -15,10 +16,11 @@
 \ Habu word that failed keeps none.
 \ STORAGE CLASS. PROCESS-WIDE: the content hasher, its read buffer, the
 \ name hasher, the marker and slot state buffers, the slot name and path
-\ buffers and a lease's slot table; one task syncs, so one uses them at a
-\ time. CALLER-OWNED: every descriptor answered, the hashes, names and
-\ partials laid in the caller's arena, the paths a stage's result names
-\ and a lease's slot directory.
+\ buffers, a lease's slot table and the byte a partial's end is probed
+\ with; one task syncs, so one uses them at a time. CALLER-OWNED: every
+\ descriptor answered, the hashes, names and partials laid in the
+\ caller's arena, the paths a stage's result names and a lease's slot
+\ directory.
 
 require src/lib/error.f
 require src/lib/string.f
@@ -1200,15 +1202,11 @@ STRUCTURE download-partial OPAQUE DERIVE addr
    FIELD aggregate DROPBOX:hasher
 ;STRUCTURE
 
-\ A stage a preparation found complete, its stage 0 for Rust's (); an
-\ ENUM payload names no applied family, a field does.
-STRUCTURE completed-stage FIELD outcome stage-outcome<n> ;STRUCTURE
-
 \ What preparing a download came to: a partial ready for bytes, a stage
-\ complete already, or no slot to resume in.
+\ complete already, its stage 0 for Rust's (), or no slot to resume in.
 ENUM download-preparation
    VARIANT ready FIELD partial ^download-partial ;VARIANT
-   VARIANT complete FIELD stage completed-stage ;VARIANT
+   VARIANT complete FIELD stage stage-outcome<n> ;VARIANT
    VARIANT ephemeral ;VARIANT
 ;ENUM
 
@@ -1737,22 +1735,31 @@ private
    [: s" position resumed download" p u IO-FAILURE ;] FS-FAILS ;
 
 : DROP-PREPARATION ( download-preparation -- ) drop ;
+: DROP-OUTCOME ( stage-outcome<n> -- ) drop ;
 
-: COMPLETE ( stage-outcome<n> -- download-preparation )
-   LOCAL-COMPLETED--STAGE:MAKE LOCAL-DOWNLOAD--PREPARATION:complete ;
+: READY ( ^download-partial -- download-preparation )
+   LOCAL-DOWNLOAD--PREPARATION:ready ;
+: EPHEMERAL ( -- download-preparation )
+   LOCAL-DOWNLOAD--PREPARATION:ephemeral ;
 
-\ What a stage already at the download's name makes of it, none when
-\ there is none; a verified stage's descriptor is closed.
-: STAGE-PREPARATION ( download-stage -- option<download-preparation> )
+\ What a stage already at the download's name comes to, none when there
+\ is none; a verified stage's descriptor is closed.
+: EXISTING-OUTCOME ( download-stage -- option<stage-outcome<n>> )
    MATCH download-stage
       missing OF OPTION:NONE ENDOF
       verified OF VERIFIED-DOWNLOAD-STAGE-UNMAKE
          {: f:fd print:MODEL:fingerprint :} f DISCARD
-         0 LOCAL-STAGE--OUTCOME:already-staged COMPLETE OPTION:SOME
+         0 LOCAL-STAGE--OUTCOME:already-staged OPTION:SOME
       ENDOF
       destination-occupied OF LOCAL-STAGE--OUTCOME:destination-occupied
-         COMPLETE OPTION:SOME
+         OPTION:SOME
       ENDOF
+   ;MATCH ;
+
+: STAGE-PREPARATION ( download-stage -- option<download-preparation> )
+   EXISTING-OUTCOME MATCH option
+      none OF OPTION:NONE ENDOF
+      some OF LOCAL-DOWNLOAD--PREPARATION:complete OPTION:SOME ENDOF
    ;MATCH ;
 
 \ The download's stage name for target t, and its path below root path r
@@ -1805,7 +1812,7 @@ private
    loc LOCATION-PATH {: p:^ u:n :}
    [: staging p u s" create disposable download stage" UNNAMED-FILE ;]
    [: staging DISCARD ;] finally {: f:fd :}
-   loc f ar NEW-PARTIAL LOCAL-DOWNLOAD--PREPARATION:ready ;
+   loc f ar NEW-PARTIAL READY ;
 
 : DISPOSABLE
    ( download-location ^u8 n ^ARENA:arena -- download-preparation )
@@ -1831,10 +1838,654 @@ public
       none OF t tu UNSAFE ENDOF
       some OF ENDOF
    ;MATCH PARENT-DIR-UNMAKE {: dir:fd last:str rel:str :}
-   LOCAL-DOWNLOAD--PREPARATION:ephemeral dir
+   EPHEMERAL dir
    [: DROP-PREPARATION
       s su s" <unnamed-download>" ar JOIN >str DOWNLOAD-SOURCE-DISPOSABLE
       dir r ru rel str> t tu want ar NEW-LOCATION s su ar DISPOSABLE ;]
    CLOSING ;
+
+private
+
+\ ---- partial ownership
+
+\ Dropbox's content-hash block: a partial grows a whole block at a time.
+$400000 constant DROPBOX-BLOCK
+
+: TARGET-DIR@ ( ^download-location -- fd )
+   DOWNLOAD-LOCATION-TARGET-DIRECTORY @ ;
+: STAGE-NAME@ ( ^download-location -- ^u8 n )
+   DOWNLOAD-LOCATION-STAGE-NAME @ str> ;
+: STAGE-PATH@ ( ^download-location -- ^u8 n )
+   DOWNLOAD-LOCATION-STAGE-PATH @ str> ;
+: TARGET@ ( ^download-location -- ^u8 n )
+   DOWNLOAD-LOCATION-TARGET @ str> ;
+: EXPECTED@ ( ^download-location -- DROPBOX:hash )
+   DOWNLOAD-LOCATION-EXPECTED @ ;
+: SOURCE@ ( ^download-location -- download-source )
+   DOWNLOAD-LOCATION-SOURCE @ ;
+
+: LOCATION-SOURCE ( download-location -- download-source )
+   DOWNLOAD-LOCATION-UNMAKE
+   {: src:download-source dir:fd name:str sp:str t:str want:DROPBOX:hash :}
+   src ;
+
+: RESUMABLE? ( download-source -- bool )
+   MATCH download-source
+      resumable OF {: dir:fd name:str path:str b:binding :} true ENDOF
+      disposable OF {: path:str :} false ENDOF
+   ;MATCH ;
+
+: PARTIAL-FILE ( ^download-partial -- fd ) DOWNLOAD-PARTIAL-FILE @ ;
+
+\ The partial's file's path: its slot's, or its unnamed file's.
+: PARTIAL-PATH ( ^download-partial -- ^u8 n )
+   DOWNLOAD-PARTIAL-LOCATION SOURCE@ SOURCE-PATH ;
+
+\ Closes the location's directories: the target's and a slot's.
+: CLOSE-LOCATION ( download-location -- )
+   DOWNLOAD-LOCATION-UNMAKE
+   {: src:download-source dir:fd name:str sp:str t:str want:DROPBOX:hash :}
+   dir DISCARD
+   src MATCH download-source
+      resumable OF {: slots:fd n:str p:str b:binding :} slots DISCARD ENDOF
+      disposable OF {: p:str :} ENDOF
+   ;MATCH ;
+
+\ Rust's drop of a partial: its file and its location's directories.
+: CLOSE-PARTIAL ( ^download-partial -- )
+   {: x :}
+   x PARTIAL-FILE DISCARD x DOWNLOAD-PARTIAL-LOCATION @ CLOSE-LOCATION ;
+
+\ Closes the file the partial held and keeps f in its place.
+: SWAP-FILE ( fd ^download-partial -- )
+   {: f:fd x :}
+   x PARTIAL-FILE DISCARD f x DOWNLOAD-PARTIAL-FILE ! ;
+
+: READY? ( download-preparation -- bool )
+   MATCH download-preparation
+      ready OF drop true ENDOF
+      complete OF DROP-OUTCOME false ENDOF
+      ephemeral OF false ENDOF
+   ;MATCH ;
+
+: UNLESS-READY ( download-preparation [ -- ] -- download-preparation )
+   {: p:download-preparation close :}
+   p READY? 0= if close execute then
+   p ;
+
+\ Runs q; close frees what a ready partial would hold, when q throws or
+\ answers no partial.
+: PREPARING ( [ -- download-preparation ] [ -- ] -- download-preparation )
+   {: q close :}
+   EPHEMERAL [: DROP-PREPARATION q execute ;] catch {: code:n :}
+   code 0= if close UNLESS-READY exit then
+   close execute code throw ;
+
+\ Runs q; a stage read's failure becomes an io failure, as Rust's
+\ From<StageIoError> for LocalError makes it.
+: LOCAL-ERRORS ( R [ R -- R ] -- R )
+   {: q :}
+   [: q execute ;] catch {: code:n :}
+   code 0= if exit then
+   code LOCAL-CODE throw ;
+
+: OCCUPIED-AT ( ^u8 n -- stage-outcome<n> )
+   >str LOCAL-STAGE--OUTCOME:destination-occupied ;
+
+: STAGED? ( stage-outcome<n> -- bool )
+   MATCH stage-outcome
+      staged OF drop true ENDOF
+      already-staged OF drop true ENDOF
+      content-changed OF DROP-HASH false ENDOF
+      destination-occupied OF {: p:str :} false ENDOF
+   ;MATCH ;
+
+\ ---- slot promotion
+
+\ Rust's copy_completed_slot's copy: the file's bytes, from its start,
+\ staged when they hash to the location's content.
+: COPY-INTO-STAGE ( fd ^download-location ^ARENA:arena -- stage-outcome<n> )
+   {: f:fd loc ar:^ARENA:arena :}
+   loc TARGET@ loc EXPECTED@ ar STAGE-MARKER >str OPTION:SOME
+   {: marker:option<str> :}
+   loc TARGET-DIR@ loc STAGE-NAME@ loc STAGE-PATH@ loc EXPECTED@
+   [: f -rot FD-READ ;] marker s" copy completed download slot" ar
+   WRITE-VERIFIED-STAGE [: 0 ;] MAP-STAGE-WRITE ;
+
+\ Rust's copy_completed_slot: the completed file copied and rehashed into
+\ the stage; a slot staged from is emptied and keeps its binding.
+: COPY-COMPLETED-SLOT
+   ( fd ^download-location ^ARENA:arena -- stage-outcome<n> )
+   {: f:fd loc ar:^ARENA:arena :}
+   loc SOURCE@ SOURCE-PATH {: p:^ u:n :}
+   [: f 0 FD:SEEK ;]
+   [: s" rewind completed download slot" p u IO-FAILURE ;] FS-FAILS
+   0 LOCAL-STAGE--OUTCOME:staged
+   [: DROP-OUTCOME f loc ar COPY-INTO-STAGE ;] LOCAL-ERRORS
+   {: out:stage-outcome<n> :}
+   out STAGED? if f loc RESET-DOWNLOAD-SLOT TAKEN? drop then
+   out ;
+
+\ The entry already at the stage's name: a verified stage, whose
+\ descriptor closes, runs q and is staged already; o names the operation.
+: RACED-STAGE
+   ( ^download-location ^u8 n [ -- ] ^ARENA:arena -- stage-outcome<n> )
+   {: loc o:^ ou:n q ar:^ARENA:arena :}
+   loc @ ar INSPECT-LOCATION MATCH download-stage
+      missing OF o ou loc TARGET@ CHANGED ENDOF
+      verified OF VERIFIED-DOWNLOAD-STAGE-UNMAKE
+         {: s:fd print:MODEL:fingerprint :} s DISCARD
+         q execute 0 LOCAL-STAGE--OUTCOME:already-staged
+      ENDOF
+      destination-occupied OF LOCAL-STAGE--OUTCOME:destination-occupied
+      ENDOF
+   ;MATCH ;
+
+\ After the move into the stage failed with errno e: an entry at the
+\ stage's name is inspected, q running for a verified one; another
+\ filesystem is copied across; else the failure, o's for path p.
+: MOVE-FAILED
+   ( fd ^download-location ^ARENA:arena n ^u8 n ^u8 n [ -- ]
+     -- stage-outcome<n> )
+   {: f:fd loc ar:^ARENA:arena e:n o:^ ou:n p:^ u:n q :}
+   e FS:EEXIST = if loc o ou q ar RACED-STAGE exit then
+   e FS:EXDEV = if f loc ar COPY-COMPLETED-SLOT exit then
+   e o ou p u SYSCALL-FAILURE ;
+
+\ The stage made read-only by m and synced by s.
+: SEAL-PROMOTED ( fd ^download-location ^u8 n ^u8 n -- stage-outcome<n> )
+   {: f:fd loc m:^ mu:n s:^ su:n :}
+   f loc STAGE-PATH@ m mu READ-ONLY
+   f loc STAGE-PATH@ s su SYNC-FILE
+   0 LOCAL-STAGE--OUTCOME:staged ;
+
+\ Where the swapped stage went: the slot's name, or, when an entry took
+\ that, the stage's, where it stays.
+: RESTORED-PATH ( ^download-location fd ^u8 n ^u8 n -- ^u8 n )
+   {: loc slots:fd name:^ nu:n p:^ u:n :}
+   loc TARGET-DIR@ loc STAGE-NAME@ slots name nu FS:TRY-RENAME-NEW-AT if
+      p u exit
+   then
+   FS:ERRNO FS:EEXIST <> if
+      FS:ERRNO s" restore swapped resumed download" loc STAGE-PATH@
+      SYSCALL-FAILURE
+   then
+   loc STAGE-PATH@ ;
+
+\ Another inode took the slot's name before the move: it goes back.
+: RESTORE-SWAPPED ( ^download-location fd ^u8 n ^u8 n -- stage-outcome<n> )
+   {: loc slots:fd name:^ nu:n p:^ u:n :}
+   loc slots name nu p u RESTORED-PATH {: at:^ atu:n :}
+   slots p u s" sync restored download slot" SYNC-DIRECTORY
+   loc TARGET-DIR@ loc STAGE-PATH@ s" sync restored download stage"
+   SYNC-DIRECTORY
+   at atu OCCUPIED-AT ;
+
+\ The slot named the stage: sealed, when it is still the file held.
+: PROMOTED-SLOT
+   ( fd ^download-location fd ^u8 n ^u8 n -- stage-outcome<n> )
+   {: f:fd loc slots:fd name:^ nu:n p:^ u:n :}
+   f loc TARGET-DIR@ loc STAGE-NAME@ loc STAGE-PATH@ NAMED-INODE-MATCHES
+   0= if loc slots name nu p u RESTORE-SWAPPED exit then
+   slots p u s" sync consumed download slot" SYNC-DIRECTORY
+   loc TARGET-DIR@ loc STAGE-PATH@ s" sync promoted download stage"
+   SYNC-DIRECTORY
+   f loc s" make resumed download stage immutable"
+   s" sync completed download stage" SEAL-PROMOTED ;
+
+\ Renames the slot, still bound to the download, to the stage's name;
+\ before runs just ahead of the rename.
+: MOVE-SLOT
+   ( fd ^download-location [ -- ] ^ARENA:arena fd ^u8 n ^u8 n
+     -- stage-outcome<n> )
+   {: f:fd loc before ar:^ARENA:arena slots:fd name:^ nu:n p:^ u:n :}
+   s" recover completed resumed download" {: o:^ ou:n :}
+   f loc DOWNLOAD-SLOT-MATCHES 0= if p u OCCUPIED-AT exit then
+   before [: s" promote completed download slot" p u IO-FAILURE ;] FS-FAILS
+   slots name nu loc TARGET-DIR@ loc STAGE-NAME@ FS:TRY-RENAME-NEW-AT if
+      f loc slots name nu p u PROMOTED-SLOT exit
+   then
+   f loc ar FS:ERRNO o ou p u [: f loc RESET-DOWNLOAD-SLOT TAKEN? drop ;]
+   MOVE-FAILED ;
+
+: LINKED-DISPOSABLE ( fd ^download-location -- stage-outcome<n> )
+   {: f:fd loc :}
+   loc TARGET-DIR@ loc STAGE-PATH@ s" sync promoted disposable download"
+   SYNC-DIRECTORY
+   f loc s" make disposable download stage immutable"
+   s" sync disposable download stage" SEAL-PROMOTED ;
+
+\ Rust's promote_completed_disposable: the unnamed file linked at the
+\ stage's name; before runs just ahead of the link.
+: PROMOTE-COMPLETED-DISPOSABLE
+   ( fd ^download-location [ -- ] ^ARENA:arena -- stage-outcome<n> )
+   {: f:fd loc before ar:^ARENA:arena :}
+   s" promote completed disposable download" {: o:^ ou:n :}
+   loc SOURCE@ SOURCE-PATH {: p:^ u:n :}
+   before [: o ou p u IO-FAILURE ;] FS-FAILS
+   f loc TARGET-DIR@ loc STAGE-NAME@ FS:TRY-LINK-AT if
+      f loc LINKED-DISPOSABLE exit
+   then
+   f loc ar FS:ERRNO o ou p u [: ;] MOVE-FAILED ;
+
+\ Rust's promote_completed_slot_with: the completed, marked file f moved
+\ into the location's stage, before running just ahead of the move.
+: PROMOTE-COMPLETED-SLOT-WITH
+   ( fd ^download-location [ -- ] ^ARENA:arena -- stage-outcome<n> )
+   {: f:fd loc before ar:^ARENA:arena :}
+   loc SOURCE@ MATCH download-source
+      resumable OF {: slots:fd name:str path:str b:binding :}
+         f loc before ar slots name str> path str> MOVE-SLOT
+      ENDOF
+      disposable OF {: p:str :}
+         f loc before ar PROMOTE-COMPLETED-DISPOSABLE
+      ENDOF
+   ;MATCH ;
+
+: PROMOTE-COMPLETED-SLOT
+   ( fd ^download-location ^ARENA:arena -- stage-outcome<n> )
+   {: f:fd loc ar:^ARENA:arena :}
+   f loc [: ;] ar PROMOTE-COMPLETED-SLOT-WITH ;
+
+\ ---- partial downloads
+
+1 BUFFER: EXTRA
+
+\ Fills the span from read; a failure, or an end before the span is
+\ full, is a stage read's.
+: STAGE-READ-EXACT ( ^u8 n [ ^u8 n -- n ] ^u8 n ^u8 n -- )
+   {: dst:^ cap:n read p:^ u:n o:^ ou:n :}
+   0 begin dup cap < while
+      {: done:n :}
+      dst done + cap done - read p u o ou STAGE-READ-INTO {: k:n :}
+      k 0= if 0 FS:CAUSE! o ou p u STAGE-READ then
+      done k +
+   repeat drop ;
+
+\ Rust's discard_uncommitted_block: the file cut back to the offset.
+: DISCARD-UNCOMMITTED-BLOCK ( ^download-partial -- )
+   {: x :}
+   x PARTIAL-PATH {: p:^ u:n :}
+   [: x PARTIAL-FILE x DOWNLOAD-PARTIAL-OFFSET @ FD:RESIZE ;]
+   [: s" discard incomplete resumed download block" p u IO-FAILURE ;]
+   FS-FAILS ;
+
+\ Runs q; a throw first discards the block it was writing.
+: UNCOMMITTED ( ^download-partial [ -- ] -- )
+   {: x q :}
+   [: q execute ;] catch {: code:n :}
+   code 0= if exit then
+   x DISCARD-UNCOMMITTED-BLOCK code throw ;
+
+: WRITE-DOWNLOAD ( ^download-partial ^u8 n -- )
+   {: x b:^ k:n :}
+   x PARTIAL-PATH {: p:^ u:n :}
+   [: x PARTIAL-FILE b k FD:WRITE-FULL ;]
+   [: s" write resumed download" p u IO-FAILURE ;] FS-FAILS ;
+
+\ Reads k bytes, writes them to the file and feeds them to the hash.
+: APPEND-CHUNK ( ^download-partial n [ ^u8 n -- n ] -- )
+   {: x k:n read :}
+   IO-BUF k read x DOWNLOAD-PARTIAL-LOCATION TARGET@
+   s" read resumed download" STAGE-READ-EXACT
+   x IO-BUF k WRITE-DOWNLOAD
+   IO-BUF k x DOWNLOAD-PARTIAL-AGGREGATE DROPBOX:HASH-FEED ;
+
+: COPY-BLOCK ( ^download-partial n [ ^u8 n -- n ] -- )
+   {: x len:n read :}
+   0 begin dup len < while
+      {: done:n :}
+      len done - IO-SIZE min {: k:n :}
+      x k read APPEND-CHUNK
+      done k +
+   repeat drop ;
+
+\ Appends a block of len bytes, then counts it in the offset.
+: APPEND-BLOCK ( ^download-partial n [ ^u8 n -- n ] -- )
+   {: x len:n read :}
+   x [: x len read COPY-BLOCK ;] UNCOMMITTED
+   len x DOWNLOAD-PARTIAL-OFFSET +! ;
+
+\ Rust's persist_checkpoint: the offset recorded in a slot's state once
+\ the bytes before it are durable.
+: PERSIST-CHECKPOINT ( ^download-partial -- )
+   {: x :}
+   x PARTIAL-FILE {: f:fd :}
+   x DOWNLOAD-PARTIAL-LOCATION SOURCE@ MATCH download-source
+      resumable OF {: slots:fd name:str path:str b:binding :}
+         f path str> s" sync resumed download checkpoint" SYNC-FILE
+         f DOWNLOAD-PARTIAL-XATTR
+         b x DOWNLOAD-PARTIAL-OFFSET @ DOWNLOAD-SLOT-STATE-MAKE
+         ENCODE-DOWNLOAD-SLOT-STATE false path str>
+         s" record resumed download checkpoint" SET-XATTR
+         f path str> s" sync resumed download checkpoint marker" SYNC-FILE
+      ENDOF
+      disposable OF {: p:str :} ENDOF
+   ;MATCH ;
+
+: CHECKPOINT? ( n n -- bool )
+   {: at:n total:n :}
+   at DOWNLOAD-CHECKPOINT-BYTES mod 0= at total < and ;
+
+: APPEND-BLOCKS ( ^download-partial n [ ^u8 n -- n ] -- )
+   {: x total:n read :}
+   begin x DOWNLOAD-PARTIAL-OFFSET @ total < while
+      x total x DOWNLOAD-PARTIAL-OFFSET @ - DROPBOX-BLOCK min read
+      APPEND-BLOCK
+      x DOWNLOAD-PARTIAL-OFFSET @ total CHECKPOINT? if
+         x PERSIST-CHECKPOINT
+      then
+   repeat ;
+
+\ A partial whose bytes hash to another content: a slot still bound to
+\ it restarts, else its path is occupied.
+: MISMATCHED ( ^download-partial DROPBOX:hash -- stage-outcome<n> )
+   {: x actual:DROPBOX:hash :}
+   x DOWNLOAD-PARTIAL-LOCATION {: loc :}
+   loc SOURCE@ RESUMABLE? if
+      x PARTIAL-FILE loc RESET-DOWNLOAD-SLOT TAKEN? 0= if
+         x PARTIAL-PATH OCCUPIED-AT exit
+      then
+   then
+   actual LOCAL-STAGE--OUTCOME:content-changed ;
+
+\ Syncs the verified file, marks it complete and promotes it.
+: COMPLETE-PARTIAL ( ^download-partial ^ARENA:arena -- stage-outcome<n> )
+   {: x ar:^ARENA:arena :}
+   x PARTIAL-FILE {: f:fd :}
+   x PARTIAL-PATH {: p:^ u:n :}
+   x DOWNLOAD-PARTIAL-LOCATION {: loc :}
+   f p u s" sync completed resumed download data" SYNC-FILE
+   f DOWNLOAD-STAGE-XATTR loc TARGET@ loc EXPECTED@ ar STAGE-MARKER true
+   p u s" mark completed resumed download" SET-XATTR
+   f p u s" sync completed resumed download marker" SYNC-FILE
+   f loc ar PROMOTE-COMPLETED-SLOT ;
+
+\ Rust's DownloadPartial::finish.
+: FINISH-PARTIAL ( ^download-partial ^ARENA:arena -- stage-outcome<n> )
+   {: x ar:^ARENA:arena :}
+   x DOWNLOAD-PARTIAL-AGGREGATE DROPBOX:HASH-END ar KEEP DROPBOX:>HASH
+   {: actual:DROPBOX:hash :}
+   actual x DOWNLOAD-PARTIAL-LOCATION EXPECTED@ SAME-CONTENT? 0= if
+      x actual MISMATCHED exit
+   then
+   x ar COMPLETE-PARTIAL ;
+
+: APPENDED
+   ( ^download-partial n [ ^u8 n -- n ] ^ARENA:arena -- stage-outcome<n> )
+   {: x total:n read ar:^ARENA:arena :}
+   x DOWNLOAD-PARTIAL-LOCATION TARGET@ {: t:^ tu:n :}
+   x DOWNLOAD-PARTIAL-OFFSET @ total > if
+      s" validate resumed download size" t tu CHANGED
+   then
+   x total read APPEND-BLOCKS
+   EXTRA 1 read t tu s" finish resumed download" STAGE-READ-INTO 0<> if
+      s" validate resumed download length" t tu CHANGED
+   then
+   x ar FINISH-PARTIAL ;
+
+: RESTARTED ( ^download-partial -- download-preparation )
+   {: x :}
+   x PARTIAL-FILE x DOWNLOAD-PARTIAL-LOCATION RESET-DOWNLOAD-SLOT
+   MATCH option
+      none OF x PARTIAL-PATH OCCUPIED-AT LOCAL-DOWNLOAD--PREPARATION:complete
+      ENDOF
+      some OF x SWAP-FILE
+         0 x DOWNLOAD-PARTIAL-OFFSET !
+         x DOWNLOAD-PARTIAL-AGGREGATE DROPBOX:HASH-BEGIN x READY
+      ENDOF
+   ;MATCH ;
+
+public
+
+\ Rust's DownloadPartial::restart: the partial's slot, still bound to its
+\ download, emptied to start over; else its path is occupied. Anything
+\ but a ready partial frees the partial.
+: RESTART-PARTIAL ( ^download-partial -- download-preparation )
+   {: x :}
+   [: x RESTARTED ;] [: x CLOSE-PARTIAL ;] PREPARING ;
+
+\ Rust's DownloadPartial::offset: the bytes the partial holds.
+: PARTIAL-OFFSET@ ( ^download-partial -- n ) DOWNLOAD-PARTIAL-OFFSET @ ;
+
+\ Rust's DownloadPartial::append: read's bytes up to total appended a
+\ block at a time, a slot's offset recorded at each checkpoint, then the
+\ whole verified and promoted into its stage. A failed read throws
+\ E-STAGE-READ, its partial block discarded. It frees the partial.
+: APPEND-PARTIAL
+   ( ^download-partial n [ ^u8 n -- n ] ^ARENA:arena -- stage-outcome<n> )
+   {: x total:n read ar:^ARENA:arena :}
+   [: x total read ar APPENDED ;] [: x CLOSE-PARTIAL ;] finally ;
+
+private
+
+\ ---- slot preparation
+
+\ The lease's slot directory opened, its slot's name and path laid in
+\ the arena, bound to the lease's download; a throw closes dir.
+: SLOT-SOURCE ( fd download-slot-lease ^ARENA:arena -- download-source )
+   {: dir:fd lease:download-slot-lease ar:^ARENA:arena :}
+   lease DOWNLOAD-SLOT-LEASE-UNMAKE {: d:str slot:n b:binding :}
+   -1 >FD dir
+   [: drop d str> s" open resumable download slot directory"
+      OPEN-PRIVATE-DIRECTORY ;] CLOSING
+   {: slots:fd :}
+   slot DOWNLOAD-SLOT-NAME ar KEEP {: name:str :}
+   slots name d str> name str> ar JOIN >str b DOWNLOAD-SOURCE-RESUMABLE ;
+
+\ The source's slot opened; an unnamed file has none.
+: SLOT-OPEN ( download-source -- download-slot-open )
+   MATCH download-source
+      resumable OF {: slots:fd name:str path:str b:binding :}
+         slots name str> path str> OPEN-DOWNLOAD-SLOT
+      ENDOF
+      disposable OF {: p:str :} DOWNLOAD-SLOT-OPEN-MISSING ENDOF
+   ;MATCH ;
+
+\ The location's slot as a partial at offset 0, not yet checked.
+: OPEN-SLOT ( download-location ^ARENA:arena -- download-preparation )
+   {: loc:download-location ar:^ARENA:arena :}
+   loc LOCATION-SOURCE SLOT-OPEN MATCH download-slot-open
+      missing OF EPHEMERAL ENDOF
+      file OF {: f:fd :} loc f ar NEW-PARTIAL READY ENDOF
+      occupied OF EPHEMERAL ENDOF
+   ;MATCH ;
+
+: SLOT-PREPARATION ( download-location ^ARENA:arena -- download-preparation )
+   {: loc:download-location ar:^ARENA:arena :}
+   loc ar INSPECT-LOCATION STAGE-PREPARATION MATCH option
+      none OF loc ar OPEN-SLOT ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+: SLOT-LENGTH ( stat ^u8 n -- n )
+   {: st:stat p:^ u:n :}
+   st STAT-UNMAKE {: d i m s ms mn cs cn :}
+   s 0 < if 0 s" inspect resumed download size" p u SYSCALL-FAILURE then
+   s ;
+
+: TRUNCATE-TAIL ( ^download-partial n -- )
+   {: x at:n :}
+   x PARTIAL-PATH {: p:^ u:n :}
+   [: x PARTIAL-FILE at FD:RESIZE ;]
+   [: s" truncate resumed download tail" p u IO-FAILURE ;] FS-FAILS
+   x PARTIAL-FILE p u s" sync truncated resumed download" SYNC-FILE ;
+
+\ The partial resumed at the checkpoint at, its file length bytes long
+\ cut back to it and its hash fed the bytes before it.
+: RESUME-AT ( ^download-partial n n -- download-preparation )
+   {: x at:n length:n :}
+   length at <> if x at TRUNCATE-TAIL then
+   x PARTIAL-FILE at x PARTIAL-PATH x DOWNLOAD-PARTIAL-AGGREGATE
+   HASH-DOWNLOAD-PREFIX
+   at x DOWNLOAD-PARTIAL-OFFSET !
+   x READY ;
+
+: RESET-THEN-RESUME ( ^download-partial -- download-preparation )
+   {: x :}
+   x PARTIAL-FILE x DOWNLOAD-PARTIAL-LOCATION RESET-DOWNLOAD-SLOT
+   MATCH option
+      none OF EPHEMERAL ENDOF
+      some OF x SWAP-FILE x 0 0 RESUME-AT ENDOF
+   ;MATCH ;
+
+\ Resumes at the checkpoint at, or from an emptied slot when reset says
+\ so or at is no checkpoint inside the file's length.
+: RESUME-FROM ( ^download-partial n n bool -- download-preparation )
+   {: x at:n length:n reset:bool :}
+   reset at DOWNLOAD-CHECKPOINT-BYTES mod 0<> or at length > or if
+      x RESET-THEN-RESUME exit
+   then
+   x at length RESUME-AT ;
+
+\ A slot marked complete: promoted when its bytes hash to the content,
+\ else reset.
+: RESUME-COMPLETED
+   ( ^download-partial n n ^ARENA:arena -- download-preparation )
+   {: x at:n length:n ar:^ARENA:arena :}
+   x DOWNLOAD-PARTIAL-LOCATION {: loc :}
+   x PARTIAL-FILE x PARTIAL-PATH s" verify completed resumed download" ar
+   HASH-STABLE-FILE loc EXPECTED@ SAME-CONTENT? if
+      x PARTIAL-FILE loc ar PROMOTE-COMPLETED-SLOT
+      LOCAL-DOWNLOAD--PREPARATION:complete exit
+   then
+   x at length true RESUME-FROM ;
+
+: SLOT-MARKER ( ^download-partial ^ARENA:arena -- download-marker )
+   {: x ar:^ARENA:arena :}
+   x DOWNLOAD-PARTIAL-LOCATION {: loc :}
+   loc TARGET@ loc EXPECTED@ ar STAGE-MARKER {: m:^ mu:n :}
+   x PARTIAL-FILE m mu x PARTIAL-PATH READ-DOWNLOAD-MARKER ;
+
+: RESUME-MARKED ( ^download-partial n n ^ARENA:arena -- download-preparation )
+   {: x at:n length:n ar:^ARENA:arena :}
+   x ar SLOT-MARKER MATCH download-marker
+      missing OF x at length false RESUME-FROM ENDOF
+      expected OF x at length ar RESUME-COMPLETED ENDOF
+      other OF x at length true RESUME-FROM ENDOF
+   ;MATCH ;
+
+: RESUME-BOUND
+   ( ^download-partial download-slot-state binding n ^ARENA:arena
+     -- download-preparation )
+   {: x s:download-slot-state b:binding length:n ar:^ARENA:arena :}
+   s DOWNLOAD-SLOT-STATE-UNMAKE {: held:binding at:n :}
+   held b BINDING= 0= if EPHEMERAL exit then
+   x at length ar RESUME-MARKED ;
+
+\ The opened slot checked: a regular file bound to b, resumed.
+: RESUME-SLOT
+   ( ^download-partial binding ^ARENA:arena -- download-preparation )
+   {: x b:binding ar:^ARENA:arena :}
+   x PARTIAL-FILE x PARTIAL-PATH s" inspect resumed download" STAT-FD
+   {: st:stat :}
+   st REGULAR? 0= if EPHEMERAL exit then
+   st x PARTIAL-PATH SLOT-LENGTH {: length:n :}
+   x PARTIAL-FILE x PARTIAL-PATH READ-DOWNLOAD-SLOT-STATE MATCH option
+      none OF EPHEMERAL ENDOF
+      some OF x swap b length ar RESUME-BOUND ENDOF
+   ;MATCH ;
+
+: RESUMED
+   ( download-preparation download-slot-lease ^ARENA:arena
+     -- download-preparation )
+   {: p:download-preparation lease:download-slot-lease ar:^ARENA:arena :}
+   lease DOWNLOAD-SLOT-LEASE-UNMAKE {: d:str slot:n b:binding :}
+   p MATCH download-preparation
+      ready OF {: x :}
+         [: x b ar RESUME-SLOT ;] [: x CLOSE-PARTIAL ;] PREPARING
+      ENDOF
+      complete OF LOCAL-DOWNLOAD--PREPARATION:complete ENDOF
+      ephemeral OF EPHEMERAL ENDOF
+   ;MATCH ;
+
+\ Rust's open_parent with create; none is an unsafe path.
+: OPEN-TARGET-PARENT ( fd ^u8 n -- parent-dir )
+   {: root:fd t:^ tu:n :}
+   root t tu true OPEN-PARENT MATCH option
+      none OF t tu UNSAFE ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+public
+
+\ Rust's prepare_download_slot_with_access_at: the stage below root path
+\ r for target t holding want when one is complete or the lease's slot
+\ holds a verified completed partial, which it promotes; else the slot's
+\ partial resumed from its last durable checkpoint, or from an emptied
+\ slot; ephemeral when the slot is not the lease's. A ready partial holds
+\ the target's parent and the slot directory; paths go in the arena.
+: PREPARE-DOWNLOAD-SLOT-AT
+   ( fd ^u8 n ^u8 n DROPBOX:hash download-slot-lease ^ARENA:arena
+     -- download-preparation )
+   {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash
+      lease:download-slot-lease ar:^ARENA:arena :}
+   want s" prepare resumed download" REQUIRE-CONTENT-HASH
+   root t tu OPEN-TARGET-PARENT PARENT-DIR-UNMAKE
+   {: dir:fd last:str rel:str :}
+   dir lease ar SLOT-SOURCE dir r ru rel str> t tu want ar NEW-LOCATION
+   {: loc:download-location :}
+   [: loc ar SLOT-PREPARATION ;] [: loc CLOSE-LOCATION ;] PREPARING
+   lease ar RESUMED ;
+
+private
+
+\ ---- staged downloads
+
+: STAGE-IN
+   ( fd ^u8 n ^u8 n ^u8 n DROPBOX:hash [ ^u8 n -- n ] ^ARENA:arena
+     -- stage-outcome<n> )
+   {: dir:fd r:^ ru:n rel:^ relu:n t:^ tu:n want:DROPBOX:hash read
+      ar:^ARENA:arena :}
+   r ru rel relu t tu want ar STAGE-PATHS {: name:^ nu:n sp:^ spu:n :}
+   t tu want ar STAGE-MARKER >str OPTION:SOME {: marker:option<str> :}
+   dir name nu sp spu want read marker s" stage download" ar
+   WRITE-VERIFIED-STAGE [: 0 ;] MAP-STAGE-WRITE ;
+
+: EXISTING-IN
+   ( fd ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+     -- option<stage-outcome<n>> )
+   {: dir:fd r:^ ru:n rel:^ relu:n t:^ tu:n want:DROPBOX:hash
+      ar:^ARENA:arena :}
+   r ru rel relu t tu want ar STAGE-PATHS {: name:^ nu:n sp:^ spu:n :}
+   dir name nu sp spu t tu want ar INSPECT-DOWNLOAD-STAGE EXISTING-OUTCOME ;
+
+public
+
+\ Rust's stage_download_at: read's bytes staged beside target t below
+\ root path r when they hash to want, marked as its owned download. A
+\ failed read throws E-STAGE-READ.
+: STAGE-DOWNLOAD-AT
+   ( fd ^u8 n ^u8 n DROPBOX:hash [ ^u8 n -- n ] ^ARENA:arena
+     -- stage-outcome<n> )
+   {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash read ar:^ARENA:arena :}
+   want s" stage download" REQUIRE-CONTENT-HASH
+   root t tu OPEN-TARGET-PARENT PARENT-DIR-UNMAKE
+   {: dir:fd last:str rel:str :}
+   [: dir r ru rel str> t tu want read ar STAGE-IN ;] [: dir DISCARD ;]
+   finally ;
+
+\ Rust's stage_download: STAGE-DOWNLOAD-AT below the root at path r, a
+\ failed read an io failure.
+: STAGE-DOWNLOAD
+   ( ^u8 n ^u8 n DROPBOX:hash [ ^u8 n -- n ] ^ARENA:arena
+     -- stage-outcome<n> )
+   {: r:^ ru:n t:^ tu:n want:DROPBOX:hash read ar:^ARENA:arena :}
+   r ru s" open sync root for download staging" OPEN-ROOT {: root:fd :}
+   [: 0 LOCAL-STAGE--OUTCOME:staged
+      [: DROP-OUTCOME root r ru t tu want read ar STAGE-DOWNLOAD-AT ;]
+      LOCAL-ERRORS ;]
+   [: root DISCARD ;] finally ;
+
+\ Rust's existing_download_stage_at: what the stage for target t holding
+\ want below root path r already comes to, none when it is missing.
+: EXISTING-DOWNLOAD-STAGE-AT
+   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- option<stage-outcome<n>> )
+   {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
+   want s" inspect download stage" REQUIRE-CONTENT-HASH
+   root t tu OPEN-TARGET-PARENT PARENT-DIR-UNMAKE
+   {: dir:fd last:str rel:str :}
+   [: dir r ru rel str> t tu want ar EXISTING-IN ;] [: dir DISCARD ;]
+   finally ;
 
 ;package

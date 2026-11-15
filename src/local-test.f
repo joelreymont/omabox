@@ -6,8 +6,12 @@
 \ download stage, a stage marker set, read and removed, and each parent a
 \ download opens; then that a slot's state keeps its last checkpoint, a
 \ reset never touches a replacement swapped in, the pool's four fixed
-\ slots, a protected slot kept and a stale one rebound. A case that makes
-\ files works in its own directory under TMPDIR and removes it.
+\ slots, a protected slot kept and a stale one rebound; then that a cut
+\ download resumes from its last durable checkpoint, a completed partial
+\ is promoted before or after its rename, a corrupt one restarts only in
+\ its own slot, a promotion keeps a swapped replacement, a copy across
+\ filesystems frees its slot, and a reset slot replays to offset 0. A case
+\ that makes files works in its own directory under TMPDIR and removes it.
 \ Run from the repository root: hb --load src/local-test.f </dev/null
 require src/lib/test.f
 require src/lib/fmt.f
@@ -17,6 +21,7 @@ require src/lib/property.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
 require src/lib/fd.f
+require src/lib/xattr.f
 require src/lib/adt/option.f
 require src/dropbox.f
 require src/model.f
@@ -106,7 +111,82 @@ private
       occupied OF -1 >FD false ENDOF
    ;MATCH ;
 
+\ The preparation's partial; anything else ends the run, as Rust's test
+\ returns an error.
+: READY-PARTIAL ( download-preparation -- ^download-partial )
+   MATCH download-preparation
+      ready OF ENDOF
+      complete OF DROP-OUTCOME
+         s" test expected a ready download partial" 1 die
+      ENDOF
+      ephemeral OF s" test expected a ready download partial" 1 die ENDOF
+   ;MATCH ;
+
+: LEASED ( option<download-slot-lease> -- download-slot-lease )
+   MATCH option
+      none OF s" test expected a download slot lease" 1 die ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+\ Rust's tests' raw fsetxattr of the partial's stage marker, then fsync.
+: MARK-PARTIAL ( ^download-partial ^ARENA:arena -- )
+   {: x ar:^ARENA:arena :}
+   x DOWNLOAD-PARTIAL-LOCATION {: loc :}
+   x PARTIAL-FILE DOWNLOAD-STAGE-XATTR
+   loc TARGET@ loc EXPECTED@ ar STAGE-MARKER XATTR:ADD
+   x PARTIAL-FILE FD:SYNC ;
+
+\ Moves the partial's slot to its stage's name, as renameat NOREPLACE.
+: RENAME-TO-STAGE ( ^download-partial -- bool )
+   {: x :}
+   x DOWNLOAD-PARTIAL-LOCATION {: loc :}
+   loc SOURCE@ MATCH download-source
+      resumable OF {: slots:fd name:str path:str b:binding :}
+         slots name str> loc TARGET-DIR@ loc STAGE-NAME@
+         FS:TRY-RENAME-NEW-AT
+      ENDOF
+      disposable OF {: p:str :} false ENDOF
+   ;MATCH ;
+
+\ Empties the partial's slot and records offset 0 for its binding.
+: ZERO-CHECKPOINT ( ^download-partial -- )
+   {: x :}
+   x PARTIAL-FILE 0 FD:RESIZE
+   x DOWNLOAD-PARTIAL-LOCATION SOURCE@ MATCH download-source
+      resumable OF {: slots:fd name:str path:str b:binding :}
+         x PARTIAL-FILE DOWNLOAD-PARTIAL-XATTR
+         b 0 DOWNLOAD-SLOT-STATE-MAKE ENCODE-DOWNLOAD-SLOT-STATE XATTR:SET
+      ENDOF
+      disposable OF {: p:str :} ENDOF
+   ;MATCH
+   x PARTIAL-FILE FD:SYNC ;
+
+: PROMOTE-WITH
+   ( ^download-partial [ -- ] ^ARENA:arena -- stage-outcome<n> )
+   {: x before ar:^ARENA:arena :}
+   x PARTIAL-FILE x DOWNLOAD-PARTIAL-LOCATION before ar
+   PROMOTE-COMPLETED-SLOT-WITH ;
+
+: COPY-PARTIAL ( ^download-partial ^ARENA:arena -- stage-outcome<n> )
+   {: x ar:^ARENA:arena :}
+   x PARTIAL-FILE x DOWNLOAD-PARTIAL-LOCATION ar COPY-COMPLETED-SLOT ;
+
+: PARTIAL-STAGE-PATH ( ^download-partial -- ^u8 n )
+   DOWNLOAD-PARTIAL-LOCATION STAGE-PATH@ ;
+
 public
+EXPORT READY-PARTIAL
+EXPORT LEASED
+EXPORT MARK-PARTIAL
+EXPORT RENAME-TO-STAGE
+EXPORT ZERO-CHECKPOINT
+EXPORT PROMOTE-WITH
+EXPORT COPY-PARTIAL
+EXPORT PARTIAL-STAGE-PATH
+EXPORT CLOSE-PARTIAL
+EXPORT PARTIAL-FILE
+EXPORT PARTIAL-PATH
+EXPORT DOWNLOAD-PARTIAL-XATTR
 EXPORT DOWNLOAD-CHECKPOINT-BYTES
 EXPORT DOWNLOAD-SLOT-NAME
 EXPORT RESET-DOWNLOAD-SLOT-FILE-WITH
@@ -690,6 +770,236 @@ variable SLOT-PATH-U
    s" partial_reset_never_mutates_a_swapped_replacement" T-LABEL
    [: SWAPPED ;] IN-CASE-DIR ;
 
+\ ---- resumed downloads
+
+FS:PATHZ-CAP BUFFER: SYNC-BUF
+variable SYNC-U
+
+: SYNC$ ( -- ^u8 n ) SYNC-BUF SYNC-U @ ;
+
+: WITH-SYNC-ROOT ( fd [ fd -- ] -- )
+   {: case:fd q :}
+   s" sync" AT FS:MAKE-DIR
+   s" sync" AT {: p:^ u:n :}
+   p SYNC-BUF u BYTE-COPY u SYNC-U !
+   SYNC$ s" open test sync root" LOCAL:OPEN-ROOT {: root:fd :}
+   [: root q execute ;] [: root FS:CLOSE-DIR ;] finally ;
+
+\ Runs q on a sync root in the case directory, which holds the slots as
+\ Rust's staging TempDir does.
+: IN-SYNC-ROOT ( [ fd -- ] -- )
+   {: q :}
+   [: q WITH-SYNC-ROOT ;] IN-CASE-DIR ;
+
+\ Rust's test_download_lease: the slot leased for target t's download
+\ of c, root generation 1, operation 1.
+: TEST-LEASE ( ^u8 n DROPBOX:hash -- LOCAL:download-slot-lease )
+   {: t:^ tu:n c:DROPBOX:hash :}
+   t tu c 1 1 SLOT-IDENTITY {: id:LOCAL:download-slot-identity :}
+   ROOT$ id [: UNPROTECTED ;] LOCAL:LEASE-DOWNLOAD-SLOT LOCAL:LEASED ;
+
+: PREPARE
+   ( fd ^u8 n DROPBOX:hash LOCAL:download-slot-lease
+     -- LOCAL:download-preparation )
+   {: root:fd t:^ tu:n c:DROPBOX:hash lease:LOCAL:download-slot-lease :}
+   root SYNC$ t tu c lease AR @ LOCAL:PREPARE-DOWNLOAD-SLOT-AT ;
+
+: DROP-OUTCOME ( LOCAL:stage-outcome<n> -- ) drop ;
+
+\ The preparation's variant, a complete one's outcome and its path; a
+\ ready partial is freed.
+: PREPARATION$ ( LOCAL:download-preparation -- ^u8 n ^u8 n )
+   MATCH LOCAL:download-preparation
+      ready OF LOCAL:CLOSE-PARTIAL s" ready" s" " ENDOF
+      complete OF OUTCOME$ ENDOF
+      ephemeral OF s" ephemeral" s" " ENDOF
+   ;MATCH ;
+
+: PREPARED-AS ( LOCAL:download-preparation ^u8 n -- )
+   {: p:LOCAL:download-preparation want:^ wu:n :}
+   p PREPARATION$ s" " T$= want wu T$= ;
+
+104 constant ECONNRESET
+variable REMAINING
+
+\ Rust's FailingBytes: "x" bytes until none remain, then a reset
+\ connection.
+: FAILING ( ^u8 n -- n )
+   {: dst:^ cap:n :}
+   REMAINING @ 0= if ECONNRESET FS:CAUSE! E-FS-IO throw then
+   REMAINING @ cap min {: k:n :}
+   k 0 ?do $78 dst i + c! loop
+   k negate REMAINING +!
+   k ;
+
+: TOTAL ( -- n ) LOCAL:DOWNLOAD-CHECKPOINT-BYTES BLOCK 2 * + ;
+
+: BOUNDARY ( -- ^u8 n ) s" boundary.bin" ;
+
+: SIZE-OF ( fd -- n ) FS:FD-STAT FS:STAT-SIZE@ ;
+
+\ A download cut after cut bytes leaves written bytes and resumes at
+\ durable.
+: INTERRUPTED ( fd n n n -- )
+   {: root:fd cut:n written:n durable:n :}
+   s" download never reaches verification" HASH-OF {: c:DROPBOX:hash :}
+   BOUNDARY c TEST-LEASE {: lease:LOCAL:download-slot-lease :}
+   root BOUNDARY c lease PREPARE LOCAL:READY-PARTIAL {: x :}
+   x LOCAL:PARTIAL-PATH {: p:^ u:n :}
+   cut REMAINING !
+   [: x TOTAL [: FAILING ;] AR @ LOCAL:APPEND-PARTIAL DROP-OUTCOME ;]
+   LOCAL:E-STAGE-READ TTHROWSQ
+   p u FS:FILE-SIZE written T=
+   root BOUNDARY c lease PREPARE LOCAL:READY-PARTIAL {: y :}
+   y LOCAL:PARTIAL-OFFSET@ durable T=
+   y LOCAL:PARTIAL-FILE SIZE-OF durable T=
+   y LOCAL:CLOSE-PARTIAL ;
+
+: INTERRUPTED-DOWNLOADS-RESUME-FROM-DURABLE-BOUNDARIES ( -- )
+   s" interrupted_downloads_resume_from_durable_boundaries" T-LABEL
+   LOCAL:DOWNLOAD-CHECKPOINT-BYTES {: cp:n :}
+   [: cp 1- cp BLOCK - 0 INTERRUPTED ;] IN-SYNC-ROOT
+   [: cp cp cp INTERRUPTED ;] IN-SYNC-ROOT
+   [: cp 1+ cp cp INTERRUPTED ;] IN-SYNC-ROOT
+   [: cp BLOCK + 1+ cp BLOCK + cp INTERRUPTED ;] IN-SYNC-ROOT ;
+
+\ The prepared partial of target.txt's download of c, its bytes written.
+: WRITTEN
+   ( fd DROPBOX:hash LOCAL:download-slot-lease ^u8 n
+     -- ^LOCAL:download-partial )
+   {: root:fd c:DROPBOX:hash lease:LOCAL:download-slot-lease b:^ bu:n :}
+   root TARGET c lease PREPARE LOCAL:READY-PARTIAL {: x :}
+   x LOCAL:PARTIAL-FILE b bu FD:WRITE-FULL
+   x ;
+
+: STAGE-HOLDS ( ^LOCAL:download-partial ^u8 n -- )
+   {: x b:^ bu:n :}
+   x LOCAL:PARTIAL-STAGE-PATH b bu HOLDS ;
+
+\ install_download is not ported yet: Rust's test then installs the
+\ stage and reads the bytes back at the target.
+: RECOVERED ( fd bool -- )
+   {: root:fd renamed:bool :}
+   s" completed bytes" {: b:^ bu:n :}
+   b bu HASH-OF {: c:DROPBOX:hash :}
+   TARGET c TEST-LEASE {: lease:LOCAL:download-slot-lease :}
+   root c lease b bu WRITTEN {: x :}
+   x AR @ LOCAL:MARK-PARTIAL
+   renamed if x LOCAL:RENAME-TO-STAGE TTRUE then
+   x LOCAL:CLOSE-PARTIAL
+   root TARGET c lease PREPARE
+   renamed if s" already-staged" else s" staged" then PREPARED-AS
+   root TARGET c lease PREPARE s" already-staged" PREPARED-AS
+   x b bu STAGE-HOLDS ;
+
+: COMPLETED-PARTIAL-RECOVERS-BEFORE-AND-AFTER-RENAME ( -- )
+   s" completed_partial_recovers_before_and_after_rename" T-LABEL
+   [: false RECOVERED ;] IN-SYNC-ROOT
+   [: true RECOVERED ;] IN-SYNC-ROOT ;
+
+: RESTARTED-EMPTY ( LOCAL:download-preparation -- )
+   LOCAL:READY-PARTIAL {: y :}
+   y LOCAL:PARTIAL-OFFSET@ 0 T=
+   y LOCAL:PARTIAL-FILE SIZE-OF 0 T=
+   y LOCAL:CLOSE-PARTIAL ;
+
+: CORRUPT ( fd bool -- )
+   {: root:fd owned:bool :}
+   s" complete bytes" HASH-OF {: c:DROPBOX:hash :}
+   TARGET c TEST-LEASE {: lease:LOCAL:download-slot-lease :}
+   root c lease s" incomplete" WRITTEN {: x :}
+   owned 0= if
+      x LOCAL:PARTIAL-FILE LOCAL:DOWNLOAD-PARTIAL-XATTR s" foreign owner"
+      XATTR:SET
+   then
+   x LOCAL:PARTIAL-PATH {: p:^ u:n :}
+   x AR @ LOCAL:MARK-PARTIAL
+   x LOCAL:CLOSE-PARTIAL
+   root TARGET c lease PREPARE {: prep:LOCAL:download-preparation :}
+   owned if prep RESTARTED-EMPTY exit then
+   prep s" ephemeral" PREPARED-AS
+   p u s" incomplete" HOLDS ;
+
+: CORRUPT-COMPLETED-PARTIAL-RESTARTS-ONLY-WHEN-OWNED ( -- )
+   s" corrupt_completed_partial_restarts_only_when_owned" T-LABEL
+   [: true CORRUPT ;] IN-SYNC-ROOT
+   [: false CORRUPT ;] IN-SYNC-ROOT ;
+
+\ Rust's before_move here: the slot moves to held-slot and a new file
+\ takes its name.
+: SWAP-PARTIAL ( ^u8 n -- )
+   {: p:^ u:n :}
+   p u s" held-slot" AT FS:RENAME-FILE
+   p u s" replacement" FS:WRITE-ALL ;
+
+: SWAPPED-PROMOTION ( fd -- )
+   {: root:fd :}
+   s" complete bytes" {: b:^ bu:n :}
+   b bu HASH-OF {: c:DROPBOX:hash :}
+   TARGET c TEST-LEASE {: lease:LOCAL:download-slot-lease :}
+   root c lease b bu WRITTEN {: x :}
+   x AR @ LOCAL:MARK-PARTIAL
+   x LOCAL:PARTIAL-PATH {: p:^ u:n :}
+   [: x [: p u SWAP-PARTIAL ;] AR @ LOCAL:PROMOTE-WITH OUTCOME$
+      p u T$= s" destination-occupied" T$= ;]
+   [: x LOCAL:CLOSE-PARTIAL ;] finally
+   p u s" replacement" HOLDS
+   s" held-slot" AT b bu HOLDS
+   x LOCAL:PARTIAL-STAGE-PATH FS:TRY-LSTAT TFALSE ;
+
+: COMPLETED-PARTIAL-PROMOTION-PRESERVES-A-SWAPPED-REPLACEMENT ( -- )
+   s" completed_partial_promotion_preserves_a_swapped_replacement" T-LABEL
+   [: SWAPPED-PROMOTION ;] IN-SYNC-ROOT ;
+
+\ install_download is not ported yet: Rust's test then installs the
+\ stage and reads the bytes back at the target.
+: CROSS-FILESYSTEM ( fd -- )
+   {: root:fd :}
+   s" complete bytes" {: b:^ bu:n :}
+   b bu HASH-OF {: c:DROPBOX:hash :}
+   TARGET c TEST-LEASE {: lease:LOCAL:download-slot-lease :}
+   root c lease b bu WRITTEN {: x :}
+   x AR @ LOCAL:MARK-PARTIAL
+   [: x AR @ LOCAL:COPY-PARTIAL OUTCOME$ s" " T$= s" staged" T$= ;]
+   [: x LOCAL:CLOSE-PARTIAL ;] finally
+   x LOCAL:PARTIAL-PATH FS:FILE-SIZE 0 T=
+   x b bu STAGE-HOLDS ;
+
+: CROSS-FILESYSTEM-SLOT-COMPLETION-COPIES-REHASHES-AND-FREES-THE-SLOT
+   ( -- )
+   s" cross_filesystem_slot_completion_copies_rehashes_and_frees_the_slot"
+   T-LABEL
+   [: CROSS-FILESYSTEM ;] IN-SYNC-ROOT ;
+
+\ Rust's staged_download(stage_download(...)): b staged from a reader.
+: STAGE-BYTES ( ^u8 n DROPBOX:hash -- )
+   {: b:^ bu:n c:DROPBOX:hash :}
+   b bu START 0 SCHEDULE
+   SYNC$ TARGET c [: FRAGMENT ;] AR @ LOCAL:STAGE-DOWNLOAD OUTCOME$
+   s" " T$= s" staged" T$= ;
+
+\ install_download is not ported yet: Rust's test then installs the
+\ stage and reads the bytes back at the target.
+: ZERO-REPLAY ( fd -- )
+   {: root:fd :}
+   s" complete bytes" {: b:^ bu:n :}
+   b bu HASH-OF {: c:DROPBOX:hash :}
+   TARGET c TEST-LEASE {: lease:LOCAL:download-slot-lease :}
+   root c lease b bu WRITTEN {: x :}
+   x AR @ LOCAL:MARK-PARTIAL
+   x LOCAL:ZERO-CHECKPOINT
+   b bu c STAGE-BYTES
+   x LOCAL:PARTIAL-PATH {: p:^ u:n :}
+   x LOCAL:CLOSE-PARTIAL
+   root TARGET c lease PREPARE s" already-staged" PREPARED-AS
+   p u FS:FILE-SIZE 0 T=
+   root TARGET c lease PREPARE s" already-staged" PREPARED-AS ;
+
+: INTERRUPTED-PARTIAL-RESET-REPLAYS-TO-A-REUSABLE-ZERO-CHECKPOINT ( -- )
+   s" interrupted_partial_reset_replays_to_a_reusable_zero_checkpoint"
+   T-LABEL
+   [: ZERO-REPLAY ;] IN-SYNC-ROOT ;
+
 \ ---- parents
 
 : INODE ( fd -- n ) FS:FD-STAT FS:STAT-INO@ ;
@@ -817,7 +1127,13 @@ variable SLOT-PATH-U
    PARTIAL-RESET-NEVER-MUTATES-A-SWAPPED-REPLACEMENT
    DOWNLOAD-SLOT-POOL-HAS-FOUR-FIXED-PATHS-WITHOUT-OVERFLOW
    PROTECTED-DOWNLOAD-SLOT-KEEPS-ITS-BINDING-AND-BYTES
-   STALE-SLOT-IS-REBOUND-ACROSS-ROOT-AND-OPERATION-IDENTITY ;
+   STALE-SLOT-IS-REBOUND-ACROSS-ROOT-AND-OPERATION-IDENTITY
+   INTERRUPTED-DOWNLOADS-RESUME-FROM-DURABLE-BOUNDARIES
+   COMPLETED-PARTIAL-RECOVERS-BEFORE-AND-AFTER-RENAME
+   CORRUPT-COMPLETED-PARTIAL-RESTARTS-ONLY-WHEN-OWNED
+   COMPLETED-PARTIAL-PROMOTION-PRESERVES-A-SWAPPED-REPLACEMENT
+   CROSS-FILESYSTEM-SLOT-COMPLETION-COPIES-REHASHES-AND-FREES-THE-SLOT
+   INTERRUPTED-PARTIAL-RESET-REPLAYS-TO-A-REUSABLE-ZERO-CHECKPOINT ;
 
 public
 
