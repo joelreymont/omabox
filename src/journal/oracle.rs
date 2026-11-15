@@ -4,8 +4,11 @@
 //! `plan.tsv`, and `fold.tsv` into `<dir>`: one line per case, fields
 //! separated by one tab, lines in byte order. The Habu tests read them to
 //! show that the port writes the journal's JSON byte for byte as serde does
-//! and decides as the planner decides. This module lives under `journal` so
-//! it can serialise the private hash-cache value itself.
+//! and decides as the planner decides. It also writes `schema.tsv`, a fresh
+//! journal's `sqlite_master` in `rowid` order, and `journal.sqlite3`, a
+//! journal written through `Journal`, with `journal.tsv`, its public reads.
+//! This module lives under `journal` so it can serialise the private
+//! hash-cache value and read `sqlite_master` itself.
 
 use std::error::Error;
 use std::fmt::Write as _;
@@ -14,11 +17,16 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use super::{BlockReason, LocalFileFingerprint, LocalHashValue};
+use super::{
+    BirthTime, BlockReason, DropboxBinding, DropboxBindingWrite, Journal, LocalFileFingerprint,
+    LocalHashRecord, LocalHashValue, LocalObservationRecord, LocalRootActivation, LocalRootBinding,
+    NoOpWrite, OperationCompletion, PlanBlock, PlanRecord, PlanWrite, RecoveryWrite,
+    RemoteObservationRecord,
+};
 use crate::model::{
     Baseline, BlockedReason, CanonicalPath, Conflict, ContentIdentity, Decision,
-    DirectoryCollision, DropboxRevision, LocalFile, LocalObservation, Observation, Operation,
-    RemoteFile, RemoteObservation, RemoteSubtree, UnknownReason,
+    DirectoryCollision, DropboxRevision, LocalFile, LocalObservation, NoOpDecision, Observation,
+    Operation, OperationPlan, RemoteFile, RemoteObservation, RemoteSubtree, UnknownReason,
 };
 use crate::planner::plan;
 
@@ -76,23 +84,34 @@ fn remote_files() -> Vec<RemoteFile> {
     files
 }
 
+/// The output directory `OMABOX_ORACLE` names.
+fn oracle_dir() -> Result<PathBuf, Box<dyn Error>> {
+    let dir =
+        std::env::var_os("OMABOX_ORACLE").ok_or("set OMABOX_ORACLE to the output directory")?;
+    Ok(PathBuf::from(dir))
+}
+
 /// Write `lines` to `<OMABOX_ORACLE>/<name>` in byte order, each ending in a
 /// newline.
 fn write_lines(name: &str, mut lines: Vec<String>) -> Outcome {
-    let dir =
-        std::env::var_os("OMABOX_ORACLE").ok_or("set OMABOX_ORACLE to the output directory")?;
     lines.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
     for pair in lines.windows(2) {
         if pair[0] == pair[1] {
             return Err(format!("{name}: duplicate line {}", pair[0]).into());
         }
     }
+    write_ordered(name, &lines)
+}
+
+/// Write `lines` to `<OMABOX_ORACLE>/<name>` in the order given, each ending
+/// in a newline.
+fn write_ordered(name: &str, lines: &[String]) -> Outcome {
     let mut text = String::new();
-    for line in &lines {
+    for line in lines {
         text.push_str(line);
         text.push('\n');
     }
-    std::fs::write(PathBuf::from(dir).join(name), text)?;
+    std::fs::write(oracle_dir()?.join(name), text)?;
     Ok(())
 }
 
@@ -474,4 +493,339 @@ fn oracle_fold() -> Outcome {
         lines.push(format!("{}\t{}", hex(input), hex(folded.as_bytes())));
     }
     write_lines("fold.tsv", lines)
+}
+
+/// One `sqlite_master` field: NULL as empty, with newline, tab, and
+/// backslash escaped.
+fn schema_field(value: Option<String>) -> String {
+    value.map_or_else(String::new, |text| {
+        text.replace('\\', "\\\\")
+            .replace('\n', "\\n")
+            .replace('\t', "\\t")
+    })
+}
+
+#[test]
+#[ignore = "writes the Habu port's test answers; run with OMABOX_ORACLE=<dir>"]
+fn oracle_schema() -> Outcome {
+    let dir = tempfile::TempDir::new()?;
+    let journal = Journal::open(dir.path().join("journal.sqlite3"))?;
+    let mut statement = journal
+        .connection
+        .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY rowid")?;
+    let rows = statement.query_map([], |row| {
+        Ok([
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ])
+    })?;
+    let mut lines = Vec::new();
+    for row in rows {
+        let fields: Vec<String> = row?.into_iter().map(schema_field).collect();
+        lines.push(fields.join("\t"));
+    }
+    let version = journal
+        .connection
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+    lines.push(format!("user_version\t{version}"));
+    write_ordered("schema.tsv", &lines)
+}
+
+/// The no-op the planner decides for these observations.
+fn planned_noop(
+    baseline: &Baseline,
+    local: &LocalObservation,
+    remote: &RemoteObservation,
+) -> Result<NoOpDecision, Box<dyn Error>> {
+    match plan(baseline, local, remote, RemoteSubtree::Empty) {
+        Decision::NoOp(noop) => Ok(noop),
+        other => Err(format!("expected a no-op, planned {other:?}").into()),
+    }
+}
+
+/// The operations the planner decides for these observations.
+fn planned_operations(
+    baseline: &Baseline,
+    local: &LocalObservation,
+    remote: &RemoteObservation,
+) -> Result<OperationPlan, Box<dyn Error>> {
+    match plan(baseline, local, remote, RemoteSubtree::Empty) {
+        Decision::Operations(operations) => Ok(operations),
+        other => Err(format!("expected operations, planned {other:?}").into()),
+    }
+}
+
+fn recorded(write: PlanWrite) -> Result<PlanRecord, Box<dyn Error>> {
+    match write {
+        PlanWrite::Recorded(plan) => Ok(plan),
+        PlanWrite::AlreadyLive(plan) => Err(format!("plan already live: {plan:?}").into()),
+    }
+}
+
+fn expect<T: std::fmt::Debug + PartialEq>(what: &str, got: T, want: T) -> Outcome {
+    if got == want {
+        Ok(())
+    } else {
+        Err(format!("{what}: expected {want:?}, got {got:?}").into())
+    }
+}
+
+/// The local root `journal.sqlite3` is bound to.
+fn oracle_root() -> LocalRootBinding {
+    LocalRootBinding {
+        canonical_path: PathBuf::from("/home/user/Dropbox"),
+        inode: 4242,
+        birth: Some(BirthTime {
+            seconds: 1_700_000_000,
+            nanoseconds: 123_456_789,
+        }),
+        subvolume: Some(256),
+    }
+}
+
+/// Write `journal.sqlite3` through `Journal` alone.
+fn write_journal(path: &Path) -> Outcome {
+    let mut journal = Journal::open(path)?;
+    let binding = DropboxBinding {
+        account_id: "dbid:FAKE-ACCOUNT-0000".to_owned(),
+        root_namespace_id: "1234567890".to_owned(),
+        remote_root: "/Omabox".to_owned(),
+    };
+    expect(
+        "bind_dropbox_root",
+        journal.bind_dropbox_root(&binding)?,
+        DropboxBindingWrite::Bound,
+    )?;
+    let root = oracle_root();
+    let activation = journal.activate_local_root(&root)?;
+    if !matches!(activation, LocalRootActivation::Activated(_)) {
+        return Err(format!("activate_local_root: {activation:?}").into());
+    }
+
+    let (docs, file_a) = (Path::new("Docs"), Path::new("Docs/A.txt"));
+    let locals = [
+        (docs, Observation::Directory),
+        (file_a, Observation::Present(LocalFile::new(hash(0)))),
+        (
+            Path::new("Docs/Locked"),
+            Observation::Unknown(UnknownReason::Inaccessible),
+        ),
+    ];
+    let locals: Vec<LocalObservationRecord> = locals
+        .into_iter()
+        .map(|(path, observation)| LocalObservationRecord {
+            path: path.to_path_buf(),
+            observation,
+        })
+        .collect();
+    let hashes = [LocalHashRecord {
+        path: file_a.to_path_buf(),
+        fingerprint: LocalFileFingerprint {
+            inode: 4243,
+            size: 0,
+            modified_seconds: 1_700_000_100,
+            modified_nanoseconds: 500,
+            changed_seconds: 1_700_000_200,
+            changed_nanoseconds: 600,
+        },
+        content: hash(0),
+    }];
+    expect(
+        "publish_local_scan",
+        journal.publish_local_scan(&root, &locals, &hashes)?,
+        true,
+    )?;
+
+    let remotes = [
+        (docs, Observation::Directory),
+        (
+            file_a,
+            Observation::Present(RemoteFile::new(hash(0), revision(0))),
+        ),
+        (
+            Path::new("Restricted"),
+            Observation::Unknown(UnknownReason::Inaccessible),
+        ),
+    ];
+    let remotes: Vec<RemoteObservationRecord> = remotes
+        .into_iter()
+        .map(|(path, observation)| RemoteObservationRecord {
+            canonical_path: CanonicalPath::from_display(path),
+            path: path.to_path_buf(),
+            observation,
+        })
+        .collect();
+    journal.publish_remote_inventory("AAFakeCursor0001", &remotes)?;
+
+    // Baselines: Directory and Present by no-op; Absent by completing a
+    // remote deletion, which removes the path's row.
+    let local_a: LocalObservation = Observation::Present(LocalFile::new(hash(0)));
+    let remote_a: RemoteObservation = Observation::Present(RemoteFile::new(hash(0), revision(0)));
+    for (path, local, remote) in [
+        (docs, Observation::Directory, Observation::Directory),
+        (file_a, local_a, remote_a),
+    ] {
+        let noop = planned_noop(&Baseline::Absent, &local, &remote)?;
+        expect(
+            "record_noop",
+            journal.record_noop(path, &noop)?,
+            NoOpWrite::Recorded,
+        )?;
+    }
+    let gone = Path::new("Old/Gone.txt");
+    let gone_file = RemoteFile::new(hash(1), revision(1));
+    let noop = planned_noop(
+        &Baseline::Absent,
+        &Observation::Present(LocalFile::new(hash(1))),
+        &Observation::Present(gone_file.clone()),
+    )?;
+    journal.record_noop(gone, &noop)?;
+    let delete = planned_operations(
+        &Baseline::Present(gone_file.clone()),
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(gone_file),
+    )?;
+    let delete = recorded(journal.record_plan(gone, &delete)?)?;
+    expect(
+        "complete Old/Gone.txt",
+        journal.complete_operation(delete.operations[0].id, Some(&Baseline::Absent))?,
+        OperationCompletion::PlanCompleted,
+    )?;
+
+    // A pending upload and a blocked download.
+    let upload = planned_operations(
+        &Baseline::Absent,
+        &Observation::Present(LocalFile::new(hash(1))),
+        &Observation::ConfirmedAbsent,
+    )?;
+    recorded(journal.record_plan(Path::new("Docs/New.txt"), &upload)?)?;
+    let download = planned_operations(
+        &Baseline::Absent,
+        &Observation::ConfirmedAbsent,
+        &Observation::Present(RemoteFile::new(hash(1), revision(1))),
+    )?;
+    let download = recorded(journal.record_plan(Path::new("Docs/Big.bin"), &download)?)?;
+    expect(
+        "block_plan",
+        journal.block_plan(
+            download.id,
+            &BlockReason::DownloadUnavailable { status: 409 },
+            1_700_003_600,
+        )?,
+        PlanBlock::Blocked,
+    )?;
+
+    journal.record_conflict(
+        Path::new("Docs/Both.txt"),
+        &Conflict::DivergentEdits {
+            local: LocalFile::new(hash(0)),
+            remote: RemoteFile::new(hash(1), revision(1)),
+        },
+    )?;
+
+    // Legacy recoveries: one pending behind a completed preservation, one
+    // completed with its plan.
+    let kept = RemoteFile::new(hash(0), revision(0));
+    let pending = OperationPlan::new(vec![
+        Operation::PreserveRemote { file: kept },
+        Operation::DeleteRemote {
+            expected_revision: revision(0),
+        },
+    ]);
+    let pending = recorded(journal.record_plan(Path::new("Trash/Old1.txt"), &pending)?)?;
+    let intent = journal.record_recovery_intent(
+        pending.operations[1].id,
+        Path::new(".omabox-recovery/Trash/Old1.txt"),
+    )?;
+    if !matches!(intent, RecoveryWrite::Recorded(_)) {
+        return Err(format!("record_recovery_intent: {intent:?}").into());
+    }
+    expect(
+        "complete Trash/Old1.txt preservation",
+        journal.complete_operation(pending.operations[0].id, None)?,
+        OperationCompletion::OperationCompleted,
+    )?;
+    let done = OperationPlan::new(vec![
+        Operation::PreserveLocal {
+            file: LocalFile::new(hash(1)),
+        },
+        Operation::DeleteLocal {
+            expected_content: hash(1),
+        },
+    ]);
+    let done = recorded(journal.record_plan(Path::new("Trash/Old2.txt"), &done)?)?;
+    let intent = journal.record_recovery_intent(
+        done.operations[1].id,
+        Path::new(".omabox-recovery/Trash/Old2.txt"),
+    )?;
+    if !matches!(intent, RecoveryWrite::Recorded(_)) {
+        return Err(format!("record_recovery_intent: {intent:?}").into());
+    }
+    expect(
+        "complete Trash/Old2.txt preservation",
+        journal.complete_operation(done.operations[0].id, None)?,
+        OperationCompletion::OperationCompleted,
+    )?;
+    expect(
+        "complete Trash/Old2.txt deletion",
+        journal.complete_operation(done.operations[1].id, Some(&Baseline::Absent))?,
+        OperationCompletion::PlanCompleted,
+    )?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "writes the Habu port's test answers; run with OMABOX_ORACLE=<dir>"]
+fn oracle_journal() -> Outcome {
+    let path = oracle_dir()?.join("journal.sqlite3");
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        let mut name = path.clone().into_os_string();
+        name.push(suffix);
+        if let Err(error) = std::fs::remove_file(&name)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error.into());
+        }
+    }
+    write_journal(&path)?;
+
+    // Read back what the closed journal holds, without changing it.
+    let mut journal = Journal::open_read_only(&path)?;
+    let mut lines = vec![
+        format!("dropbox_binding\t{:?}", journal.dropbox_binding()?),
+        format!("local_root_binding\t{:?}", journal.local_root_binding()?),
+        format!("local_inventory\t{:?}", journal.local_inventory()?),
+        format!("remote_inventory\t{:?}", journal.remote_inventory()?),
+        format!("remote_cursor\t{:?}", journal.remote_cursor()?),
+        format!("baseline_paths\t{:?}", journal.baseline_paths()?),
+        format!("pending_plans\t{:?}", journal.pending_plans()?),
+        format!("blocked_plans\t{:?}", journal.blocked_plans()?),
+        format!("conflicts\t{:?}", journal.conflicts()?),
+        format!("pending_recoveries\t{:?}", journal.pending_recoveries()?),
+        format!(
+            "completed_recoveries\t{:?}",
+            journal.completed_recoveries()?
+        ),
+        format!(
+            "pending_upload_content\t{:?}",
+            journal.pending_upload_content()?
+        ),
+    ];
+    for name in ["Docs", "Docs/A.txt", "Old/Gone.txt"] {
+        lines.push(format!(
+            "baseline({name})\t{:?}",
+            journal.baseline(Path::new(name))?
+        ));
+    }
+    drop(journal);
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let mut name = path.clone().into_os_string();
+        name.push(suffix);
+        if Path::new(&name).exists() {
+            return Err(format!("{} outlived the journal", Path::new(&name).display()).into());
+        }
+    }
+    write_lines("journal.tsv", lines)
 }
