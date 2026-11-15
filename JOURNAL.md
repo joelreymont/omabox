@@ -665,3 +665,50 @@ sync root and every path inside it refuse them.
 
 Lane times: STATUS fold 5.5 min, CONFIG lock 8.5 min, MODEL JSON 16 min
 (stalled on the engine), the anchored walk 3.5 min.
+
+## 2026-11-16: Workers that read the source, and one namespace again
+
+Briefs name the Rust lines to port and the Habu words to use. Twice the
+worker found the brief wrong before writing code. A Habu lane sent to
+widen a stat field found the field already as wide as the kernel gives
+it, and stopped; the lane was retired unchanged. The rotation lane found
+its brief had no room in the fake Dropbox server for a rotated token,
+and stopped to ask. Stopping costs a round trip; guessing would have
+cost a review.
+
+Rust's `str::to_lowercase` applies Unicode's Final_Sigma rule: a capital
+sigma at the end of a word lowers to `ς`, elsewhere to `σ`. The C library
+Habu lowers with, libunistring 1.4.2, picks the wrong one after an
+apostrophe, so `ΓΙΑΝΝΗΣ'S.doc` got a different journal key than the
+Rust daemon stored. Habu's `UNICODE:LOWER` now applies Rust's rule
+itself. The MODEL review found it by reading the journal's keys against
+Rust's, not by a failing test.
+
+Habu folds case in names, so `FD:DUP` was the same name as the
+primitive `dup`; it became `FD:DUPLICATE`. JOURNAL's five lanes then
+merged into one file with three private words defined twice
+(`ENCODED`, `DIRECTORY?`, `HOLDS?`), two JSON encoders and two
+decoders. Rust would have kept both encoders apart in separate modules
+or as methods on different types, and the duplication would have stayed
+hidden. Habu refuses a second definition in one wordlist, so the merge
+did not load until one encoder and one decoder were chosen. That is
+the fourth rename forced by Habu's single namespace, and the first time
+it caught duplicated logic.
+
+The rotation review compared the Habu state machine against Rust's,
+transition by transition. Rust ends `Rejected` only by building a new
+`TokenState` at a new login, so Habu's code exchange now resets the
+phase to ready. A token store that calls back into its own client
+deadlocks on Rust's mutex; in Habu it read a buffer the inner call had
+regrown and died with a memory fault. Neither daemon does that, and the
+doc now says the store must not use the client.
+
+Habu's file words leave errno for the caller to log; its xattr, statx
+and SQLite words log the failure themselves, as the card says. LOCAL
+logs what FS hands it, so an xattr failure was logged twice.
+
+Lane times: FD errno 4 min, the directory open 2 min, the lock file 5.6
+min, final sigma 4.8 min, STATUS fold 2.6 min, JOURNAL parts 4 and 5
+6.8 and 6.4 min, MODEL fold 1.5 min, LOCAL stage 9.8 min, AUTH 8.7 min,
+CONFIG fold 8.6 min, the JOURNAL merge 11 min over two rounds. Reviews
+take longer than lanes: CONFIG 16 min, MODEL 17 min, rotation 14.6 min.
