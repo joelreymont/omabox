@@ -21,9 +21,8 @@ require src/journal.f
 package JOURNAL
 public
 
-\ What recording a recovery intent answered. already-recorded: the
-\ operation's intent, committed before; operation-not-destructive: the
-\ operation neither replaces nor deletes content.
+\ already-recorded: the intent committed before; operation-not-
+\ destructive: the operation neither replaces nor deletes content.
 ENUM recovery-write
    VARIANT recorded FIELD record recovery-record ;VARIANT
    VARIANT already-recorded FIELD record recovery-record ;VARIANT
@@ -37,7 +36,7 @@ ENUM recovery-completion not-found already-completed completed ;ENUM
 private
 
 
-\ ---- complete_recovery ---------------------------------------------
+\ ---- completing a recovery ----
 
 : NO-RECORD-STATUS ( -- option<record-status> ) OPTION:NONE ;
 

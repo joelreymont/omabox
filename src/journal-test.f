@@ -47,6 +47,7 @@ $1A4 constant MODE-SHARED
 
 TYPED-VARIABLE ACTION [ -- ]
 TYPED-VARIABLE SUBJECT str
+TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
 
 
 \ ---- a case's directory ------------------------------------------
@@ -91,6 +92,17 @@ TYPED-VARIABLE SUBJECT str
    f str> FS:REMOVE-FILE
    ERR u 10 COUNT-CHAR 1 T=
    ERR u t tu CONTAINS? TTRUE ;
+
+\ The action runs with fd 2 sent to dir/stderr.txt, which then is empty
+\ and is removed.
+: SILENT ( [ -- ] str ^ARENA:arena -- )
+   {: dir:str ar :}
+   ACTION !
+   dir s" stderr.txt" ar INSIDE {: f:str :}
+   f str> STDERR:CAPTURE
+   [: ACTION @ execute ;] [: STDERR:;CAPTURE ;] finally
+   f str> ERR CAP FS:READ-ALL 0 T=
+   f str> FS:REMOVE-FILE ;
 
 
 \ ---- the oracle files --------------------------------------------
@@ -764,6 +776,72 @@ variable SCANNED       \ query plan rows that scan the table
    legacy s" /sync/root" >str 2 STOOD-IN-BY? TFALSE
    s" /sync/other" BIRTH-5 OPTION:SOME RECORDED {: elsewhere :}
    elsewhere s" /sync/root" >str 9 STOOD-IN-BY? TFALSE ;
+
+\ A directory whose filesystem reports no birth time.
+: SYS-KERNEL ( -- str ) s" /sys/kernel" >str ;
+
+: SYS-INODE ( -- n ) SYS-KERNEL str> FS:TRY-STAT TTRUE FS:STAT-INO@ ;
+
+: SYS-REFUSAL ( -- ^u8 n ) s" sync root `/sys/kernel` is on" ;
+
+: SYS-ROOT ( n option<birth-time> -- local-root-binding )
+   {: inode birth :}
+   SYS-KERNEL inode birth NO-SUBVOLUME
+   JOURNAL-LOCAL--ROOT--BINDING:MAKE ;
+
+: INSPECT-SYS ( -- option<local-root-binding> )
+   SYS-KERNEL THE-JOURNAL @ SUBJECT-ARENA @ INSPECT-ROOT ;
+
+: NO-ROOT? ( option<local-root-binding> -- bool )
+   MATCH option
+      none OF true ENDOF
+      some OF drop false ENDOF
+   ;MATCH ;
+
+: STANDS-IN ( -- ) INSPECT-SYS NO-ROOT? TTRUE ;
+
+: REFUSES ( -- ) INSPECT-SYS drop ;
+
+\ The root /sys/kernel stands in for, recorded at inode n.
+: SYS-RECORDED ( journal n option<birth-time> -- )
+   {: j inode birth :}
+   inode birth SYS-ROOT 1 JOURNAL-LOCAL--ROOT--RECORD:MAKE {: r :}
+   j >CONNECTION r WRITE-LOCAL-ROOT ;
+
+\ The Rust test's dispositions and public statuses are DAEMON's, left
+\ out.
+: ROOT-INSPECTION-FAILURE-IS-UNAVAILABLE-ONLY-FOR-A-STAND-IN
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" root_inspection_failure_is_unavailable_only_for_a_stand_in"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j THE-JOURNAL !  ar SUBJECT-ARENA !
+   SYS-INODE {: inode :}
+   [: REFUSES ;] E-NO-BIRTH-TIME d SYS-REFUSAL ar LOGGED
+   j inode BIRTH-5 OPTION:SOME SYS-RECORDED
+   [: STANDS-IN ;] d ar SILENT
+   j inode NO-BIRTH SYS-RECORDED
+   [: REFUSES ;] E-NO-BIRTH-TIME d SYS-REFUSAL ar LOGGED
+   j CLOSE
+   d GONE ;
+
+\ The Rust test's configuration and daemon error are DAEMON's, left
+\ out: INSPECT-ROOT's none is the root unavailable.
+: STAND-IN-WITHOUT-BIRTH-TIME-LEAVES-THE-ROOT-UNAVAILABLE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" stand_in_without_birth_time_leaves_the_root_unavailable" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   SYS-KERNEL SUBJECT !
+   [: SUBJECT @ INSPECT drop ;] E-NO-BIRTH-TIME d SYS-REFUSAL ar LOGGED
+   p OPEN {: j :}
+   j THE-JOURNAL !  ar SUBJECT-ARENA !
+   j 1 BIRTH-5 OPTION:SOME SYS-ROOT ar ACTIVATE-LOCAL-ROOT drop
+   [: STANDS-IN ;] d ar SILENT
+   j CLOSE
+   d GONE ;
 
 : JOURNAL-DROPBOX-BINDING-SURVIVES-REOPEN ( ^ARENA:arena -- )
    {: ar :}
@@ -2575,6 +2653,8 @@ variable CRAFT
    ar LOCAL-ROOT-INSPECTION-USES-DIRECTORY-FILESYSTEM-IDENTITY
    ar ROOT-IDENTITY-REQUIRES-A-RECORDED-BIRTH-TIME
    STAND-IN-NEEDS-THE-ROOT-PATH-AND-A-BIRTH-TIME-OR-ANOTHER-INODE
+   ar ROOT-INSPECTION-FAILURE-IS-UNAVAILABLE-ONLY-FOR-A-STAND-IN
+   ar STAND-IN-WITHOUT-BIRTH-TIME-LEAVES-THE-ROOT-UNAVAILABLE
    ar VERSION-SIX-ROOT-BINDING-UPGRADES-IN-PLACE-WHEN-PATH-AND-INODE-MATCH
    ar VERSION-SIX-ROOT-BINDING-WITH-ANOTHER-INODE-IS-UNAVAILABLE-WITHOUT-CHANGES
    ar ADOPTING-A-MATCHING-VERSION-SIX-ROOT-KEEPS-ITS-GENERATION

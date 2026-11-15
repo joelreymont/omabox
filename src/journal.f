@@ -124,10 +124,8 @@ $7FFFFFFFFFFFFFFF constant INT-MAX  \ SQLite's largest integer
 
 \ ---- migrations ----------------------------------------------------
 
-\ Lays a migration's length, then its bytes, in the body of the word just
-\ created, read as this file loads from where a require would find the
-\ name, so a built program carries the text. The name is on the stack
-\ before the create: a top-level string is laid at here.
+\ Lays the file's length, then its bytes, in the word just created. Its
+\ name precedes the create: a top-level string is itself laid at here.
 : LAY ( ^u8 n -- )
    SOURCE-ROOT:RESOLVE drop {: at:^ u :}
    at u FS:FILE-SIZE {: size :}
@@ -272,7 +270,8 @@ private
       s" SQLite did not enable FULL synchronization" >str INVALID
    then ;
 
-\ migrate_canonical_paths of the Rust version on empty tables.
+\ The indexes and version the step after migration 4 leaves on
+\ empty tables.
 : CANONICAL-PATHS ( SQLITE:connection -- )
    s" CREATE UNIQUE INDEX baselines_by_canonical_path
          ON baselines(canonical_path);
@@ -283,7 +282,7 @@ private
          ON conflicts(canonical_path);
       PRAGMA user_version = 4;" SQLITE:EXEC ;
 
-\ migrate_blocked_plans of the Rust version on empty tables.
+\ What the step around migration 6 leaves on empty tables.
 : MIGRATE-BLOCKED-PLANS ( SQLITE:connection -- )
    {: c :}
    c s" DROP INDEX baselines_by_canonical_path;
@@ -291,7 +290,7 @@ private
    c V6 RUN
    c s" PRAGMA user_version = 6" SQLITE:EXEC ;
 
-\ Schema 8 in a new file, by the Rust version's steps from version 0.
+\ Schema 8 in a new file: every migration in order.
 : CREATE-SCHEMA ( SQLITE:connection -- )
    {: c :}
    c V1 RUN  c V2 RUN  c V3 RUN  c V4 RUN
@@ -311,10 +310,8 @@ private
    j CONFIGURE-WRITABLE
    v 0= if c [: c CREATE-SCHEMA ;] SQLITE:WITH-TRANSACTION then ;
 
-\ Deletes each completed plan, and its operations, that no pending or
-\ unretained recovery record of its operations holds. The plans' delete
-\ selects the plans the operations' did: a held plan keeps the operation
-\ its record names.
+\ Deletes each completed plan no pending or unretained recovery record
+\ holds, operations first: both deletes select the same plans.
 : PRUNE ( SQLITE:connection -- n )
    {: c :}
    c s" DELETE FROM operations WHERE plan_id IN (
@@ -360,9 +357,8 @@ private
 
 public
 
-\ The journal at path, schema 8 created in a new or empty file, its
-\ completed work pruned. Another version is E-UNSUPPORTED-VERSION, the
-\ file unchanged.
+\ The journal at path, schema 8 created in a new or empty file and its
+\ completed work pruned; another version is refused, the file unchanged.
 : OPEN ( str -- journal )
    {: path:str :}
    path OWNER-ONLY
@@ -572,7 +568,11 @@ private
    code 0= if exit then
    drop INSPECTING path code FS:ERRNO FILE-FAILED ;
 
-public
+: BORN-BINDING ( str n birth-time n bool -- local-root-binding )
+   {: path:str inode birth sub has:bool :}
+   path inode birth OPTION:SOME
+   has if sub OPTION:SOME else NO-SUBVOLUME then
+   JOURNAL-LOCAL--ROOT--BINDING:MAKE ;
 
 \ The identity statx gave: a birth time unreported is E-NO-BIRTH-TIME,
 \ a subvolume unreported is none.
@@ -580,40 +580,55 @@ public
    ( str n birth-time bool n bool -- local-root-binding )
    {: path:str inode birth born:bool sub has:bool :}
    born 0= if path REFUSE-UNBORN then
-   path inode birth OPTION:SOME
-   has if sub OPTION:SOME else NO-SUBVOLUME then
-   JOURNAL-LOCAL--ROOT--BINDING:MAKE ;
+   path inode birth sub has BORN-BINDING ;
 
-\ The identity of the root the descriptor names, path its canonical path.
-: FROM-STATX ( str fd -- local-root-binding )
+\ STATX's fields, the birth time as one; a failure is E-FILE for path.
+: IDENTITY ( str fd -- n birth-time bool n bool )
    {: path:str dir:fd :}
    FS:CAUSE-CLEAR
    0 0 0 false 0 false [: 2drop 2drop 2drop dir STATX ;] catch
    {: code :}
    code 0= if
       {: inode s ns born:bool sub has:bool :}
-      path inode s ns JOURNAL-BIRTH--TIME:MAKE born sub has
-      FROM-STATX-FIELDS exit
+      inode s ns JOURNAL-BIRTH--TIME:MAKE born sub has exit
    then
    2drop 2drop 2drop INSPECTING path code FS:ERRNO FILE-FAILED ;
 
-\ The identity of the directory at the canonical path, opened without
-\ following a link; any failure but a birth time's is E-FILE.
-: INSPECT ( str -- local-root-binding )
+\ IDENTITY of the directory at the canonical path, opened without
+\ following a link.
+: IDENTITY-AT ( str -- n birth-time bool n bool )
    {: path:str :}
    path OPENED {: dir:fd :}
-   [: path dir FROM-STATX ;] [: dir FS:CLOSE-DIR ;] finally ;
+   [: path dir IDENTITY ;] [: dir FS:CLOSE-DIR ;] finally ;
 
-\ Whether a refusal for missing birth times of the directory at path,
-\ whose inode is n, means another directory stands at this root's path,
-\ as the mount point under an absent mount does: the recorded root had a
-\ birth time or, recorded before schema 7, another inode.
+\ Whether a missing-birth-time refusal of path, inode n, means another
+\ directory stands in for the root: it had a birth time or another inode.
 : STOOD-IN-BY? ( local-root-record str n -- bool )
    {: r path:str inode :}
    r >BINDING {: b :}
    b ROOT-PATH path SAME? 0= if false exit then
    b ROOT-BIRTH BIRTHLESS? 0= if true exit then
    b ROOT-INODE inode <> ;
+
+: STAND-IN? ( option<local-root-record> str n -- bool )
+   {: path:str inode :}
+   MATCH option
+      none OF false ENDOF
+      some OF path inode STOOD-IN-BY? ENDOF
+   ;MATCH ;
+
+public
+
+\ The identity of the root the descriptor names, path its canonical path.
+: FROM-STATX ( str fd -- local-root-binding )
+   {: path:str dir:fd :}
+   path path dir IDENTITY FROM-STATX-FIELDS ;
+
+\ The identity of the directory at the canonical path, opened without
+\ following a link; any failure but a birth time's is E-FILE.
+: INSPECT ( str -- local-root-binding )
+   {: path:str :}
+   path path IDENTITY-AT FROM-STATX-FIELDS ;
 
 private
 
@@ -751,6 +766,27 @@ public
    {: j ar :}
    ar j >PATH j >CONNECTION SELECT-ROOT [: ROOT-ROW ;]
    SQLITE:WITH-STATEMENT ;
+
+private
+
+: NO-ROOT ( -- option<local-root-binding> ) OPTION:NONE ;
+
+: UNBORN
+   ( journal ^ARENA:arena str n -- option<local-root-binding> )
+   {: j ar path:str inode :}
+   j ar LOCAL-ROOT-BINDING path inode STAND-IN? if NO-ROOT exit then
+   path REFUSE-UNBORN ;
+
+public
+
+\ INSPECT's identity of the directory at path, or none where its
+\ filesystem reports no birth time and it stands in for the root.
+: INSPECT-ROOT
+   ( str journal ^ARENA:arena -- option<local-root-binding> )
+   {: path:str j ar :}
+   path IDENTITY-AT {: inode birth born:bool sub has:bool :}
+   born 0= if j ar path inode UNBORN exit then
+   path inode birth sub has BORN-BINDING OPTION:SOME ;
 
 private
 
@@ -936,10 +972,8 @@ STRUCTURE remote-inventory
    FIELD observations ^VEC:vector<MODEL:remote-record>
 ;STRUCTURE
 
-\ One step of a validated cursor continuation. upsert writes a key's
-\ path and observation; ensure-directory adds a missing ancestor, a
-\ stored one keeping its path, and its observation when that is unknown;
-\ delete-subtree removes a key and every key beneath it.
+\ One step of a cursor continuation. ensure-directory adds a missing
+\ ancestor and never replaces a stored path or an unknown observation.
 ENUM remote-inventory-change
    VARIANT upsert FIELD record MODEL:remote-record ;VARIANT
    VARIANT ensure-directory FIELD record MODEL:remote-record ;VARIANT
@@ -1791,12 +1825,8 @@ private
 
 public
 
-\ Forgets the common history a case-collision rename of the display
-\ path would leave stale: each baseline at its canonical path or beneath
-\ it, judged by its own display path, goes when that path is the renamed
-\ one or beneath it, or exists answers false. Forgetting never plans a
-\ Dropbox deletion. exists runs inside the transaction; its throw
-\ forgets nothing and goes on.
+\ Forgets each baseline at renamed's key or beneath it that renamed
+\ covers or exists denies; a throw of exists forgets none.
 : INVALIDATE-CASE-COLLISION-BASELINES
    ( journal MODEL:path [ MODEL:path -- bool ] ^ARENA:arena -- )
    {: j renamed exists ar :}
@@ -2391,12 +2421,8 @@ public
 
 public
 
-\ What completing one operation answered. waiting-for-earlier-operation:
-\ id, an earlier operation of the plan, is pending. baseline-required:
-\ a final operation needs its resulting baseline; unexpected-baseline: a
-\ non-final one takes none; baseline-mismatch: the baseline is not the
-\ final operation's result. plan-completed: the final operation, its
-\ plan and baseline committed together.
+\ What completing one operation answered: a final operation takes its
+\ resulting baseline, a non-final one none; id is the pending earlier one.
 ENUM operation-completion
    VARIANT not-found ;VARIANT
    VARIANT already-completed ;VARIANT
@@ -2468,7 +2494,7 @@ STRUCTURE operation-state
    ;MATCH ;
 
 
-\ ---- operation_matches_baseline ------------------------------------
+\ ---- a final operation's baseline ----
 
 : HASH= ( DROPBOX:hash DROPBOX:hash -- bool )
    DROPBOX:HASH>STR str> {: b:^ bu :}
@@ -2565,7 +2591,7 @@ STRUCTURE operation-state
    c SQLITE:LAST-ROWID ;
 
 
-\ ---- complete_operation_in -----------------------------------------
+\ ---- completing an operation ----
 
 : STEP-QUERY ( -- ^u8 n )
    s" SELECT operations.plan_id, operations.ordinal, operations.status,
@@ -2763,9 +2789,8 @@ STRUCTURE operation-state
 
 public
 
-\ Completes one operation in its plan's order. The final one completes
-\ its plan and writes its actual resulting baseline in the same
-\ transaction; an interruption before the commit changes neither.
+\ Completes one operation in its plan's order; the final one completes
+\ its plan and writes its resulting baseline in the same transaction.
 : COMPLETE-OPERATION
    ( journal operation-id option<MODEL:baseline> ^ARENA:arena
      -- operation-completion )
@@ -2830,9 +2855,8 @@ public
 
 DEFTYPE RECOVERY-ID
 
-\ A recovery copy an older Omabox version retained. retained-at: when its
-\ retention started, seconds since the epoch, set as the destructive work
-\ committed.
+\ A recovery copy an older Omabox version kept. retained-at: seconds
+\ since the epoch at which its destructive work committed.
 STRUCTURE recovery-record
    FIELD id recovery-id
    FIELD operation-id operation-id
@@ -2875,8 +2899,8 @@ private
       ENDOF
    ;MATCH ;
 
-\ The record in a row of READ-RECOVERY's query; a value that does not
-\ read is invalid state at its original path.
+\ The record in a row of READ-RECOVERY's query; a failure names its
+\ original path.
 : RECOVERY-COLS
    ( SQLITE:statement recovery-id ^ARENA:arena
      -- SQLITE:statement recovery-record )
