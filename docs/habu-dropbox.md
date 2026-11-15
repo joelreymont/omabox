@@ -64,11 +64,11 @@ SUMTYPE reply
 
 \ files/get_metadata, download, upload (+ session), delete_v2,
 \ create_folder_v2; each answers the entry Dropbox reports
-: METADATA      ( ptr u8 n ptr client -- reply )
+: METADATA      ( ptr u8 n ptr client -- reply )  \ path
 : DOWNLOAD      ( ptr u8 n n ptr client [ ptr u8 n -- ] -- reply )  \ rev, offset, bytes
 : UPLOAD        ( ptr upload ptr client [ n -- ] -- reply )  \ bytes accepted
 : DELETE        ( ptr u8 n ptr u8 n ptr client -- reply )  \ path, rev
-: CREATE-FOLDER ( ptr u8 n ptr client -- reply )
+: CREATE-FOLDER ( ptr u8 n ptr client -- reply )  \ path
 : ENTRY         ( ptr client -- ptr entry )
 
 STRUCTURE entry
