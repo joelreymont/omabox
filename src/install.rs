@@ -14,6 +14,7 @@ use miette::Diagnostic;
 use rustix::fs::{CWD, RenameFlags, renameat_with};
 use thiserror::Error;
 
+use crate::config::resolve_config_home;
 use crate::service::{ServiceCommands, ServiceError, ServiceGoal, UnitState};
 use crate::spawn::Launch;
 
@@ -56,9 +57,10 @@ pub enum InstallAction {
 
 /// Apply a lifecycle operation to the current user's documented install paths.
 pub fn execute(action: InstallAction) -> Result<String, InstallError> {
-    let layout = Layout::new(PathBuf::from(
-        env::var_os("HOME").ok_or(InstallError::HomeUnavailable)?,
-    ))?;
+    let layout = Layout::new(
+        PathBuf::from(env::var_os("HOME").ok_or(InstallError::HomeUnavailable)?),
+        env::var_os("XDG_CONFIG_HOME"),
+    )?;
     let omabox = env::current_exe().map_err(fs_error(
         "locate the running executable",
         Path::new("omabox"),
@@ -85,15 +87,21 @@ struct Layout {
 }
 
 impl Layout {
-    fn new(home: PathBuf) -> Result<Self, InstallError> {
+    /// Resolve install paths for an absolute `home`.
+    ///
+    /// systemd reads user units from the XDG config home, resolved from
+    /// `xdg_config_home` as for the Omabox config. Omarchy reads plugins only
+    /// from `~/.config/omarchy/plugins`, whatever `XDG_CONFIG_HOME` is.
+    fn new(home: PathBuf, xdg_config_home: Option<OsString>) -> Result<Self, InstallError> {
         if !home.is_absolute() {
             return Err(InstallError::HomeNotAbsolute { path: home });
         }
         let omarchy_root = home.join(".config/omarchy");
+        let config_home = resolve_config_home(&home, xdg_config_home);
         Ok(Self {
             omabox: home.join(".local/bin/omabox"),
             omaboxd: home.join(".local/bin/omaboxd"),
-            unit: home.join(".config/systemd/user/omabox.service"),
+            unit: config_home.join("systemd/user/omabox.service"),
             plugin: omarchy_root.join("plugins").join(PLUGIN_ID),
             home,
             omarchy_root,
@@ -940,7 +948,7 @@ mod tests {
             let omarchy_shell = temporary.path().join("omarchy-shell");
             fs::write(&omarchy_shell, "printf 'false\\n'\n")?;
             Ok(Self {
-                layout: Layout::new(home)?,
+                layout: Layout::new(home, None)?,
                 sources,
                 commands: Commands {
                     services: ServiceCommands::scripts(&systemctl, "/unused/journalctl"),
@@ -987,6 +995,30 @@ mod tests {
             }
         }
         Ok(artifacts)
+    }
+
+    #[test]
+    fn unit_follows_xdg_config_home_but_plugin_stays_in_omarchy() -> Result<(), Box<dyn Error>> {
+        let home = PathBuf::from("/home/user");
+        let plugin = home.join(".config/omarchy/plugins").join(PLUGIN_ID);
+
+        let layout = Layout::new(home.clone(), Some(OsString::from("/xdg/config")))?;
+        assert_eq!(
+            layout.unit,
+            Path::new("/xdg/config/systemd/user/omabox.service")
+        );
+        assert_eq!(layout.plugin, plugin);
+        assert_eq!(layout.omarchy_root, home.join(".config/omarchy"));
+
+        for ignored in [OsString::new(), OsString::from("relative/config")] {
+            let layout = Layout::new(home.clone(), Some(ignored))?;
+            assert_eq!(
+                layout.unit,
+                home.join(".config/systemd/user/omabox.service")
+            );
+            assert_eq!(layout.plugin, plugin);
+        }
+        Ok(())
     }
 
     #[test]

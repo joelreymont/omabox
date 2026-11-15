@@ -636,8 +636,10 @@ would remove the adapters above; they are candidate upstream changes to
   before publishing, the staged `omaboxd` is executed with `--self-check`
   (prints version, exits 0 without touching state); symlinked destinations and
   source-equals-destination are refused with typed errors; uninstall disables
-  the plugin through `omarchy-shell` before removal; `Layout` honors
-  `XDG_CONFIG_HOME`; every `InstallError` has help; `RollbackFailed` and
+  the plugin through `omarchy-shell` before removal; `Layout` puts the unit
+  under `XDG_CONFIG_HOME`, where systemd reads it, and the plugin under
+  `~/.config/omarchy`, the only place Omarchy reads plugins; every
+  `InstallError` has help; `RollbackFailed` and
   `CleanupFailed` expose both chains via `#[related]`; stale
   `.omabox*.install.*` and `.config.toml.*.tmp` siblings whose PID is dead are
   swept before each transaction.

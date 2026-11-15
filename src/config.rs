@@ -872,10 +872,7 @@ fn resolve_xdg_directories(
 
     let config_home = match config_home {
         Some(path) => path,
-        None => home
-            .as_ref()
-            .ok_or(ConfigError::HomeDirectoryUnavailable)?
-            .join(".config"),
+        None => default_config_home(home.as_ref().ok_or(ConfigError::HomeDirectoryUnavailable)?),
     };
     let state_home = match state_home {
         Some(path) => path,
@@ -889,6 +886,21 @@ fn resolve_xdg_directories(
         config_home,
         state_home,
     })
+}
+
+/// Resolve the XDG config home for an absolute `home`.
+///
+/// An empty or relative `XDG_CONFIG_HOME` is ignored and `home/.config` is
+/// used, as for [`XdgDirectories::from_environment`].
+pub(crate) fn resolve_config_home(home: &Path, configured: Option<OsString>) -> PathBuf {
+    match valid_xdg_home(configured) {
+        Some(path) => path,
+        None => default_config_home(home),
+    }
+}
+
+fn default_config_home(home: &Path) -> PathBuf {
+    home.join(".config")
 }
 
 fn valid_xdg_home(value: Option<OsString>) -> Option<PathBuf> {
