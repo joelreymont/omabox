@@ -510,3 +510,52 @@ The fix is five lines: a row lays a layout type out as a signature does.
 Observation for the blog: Rust's errors point near their cause; here a
 silent consistency check turned a type-layout mismatch into a missing word.
 A check that drops data on a mismatch should say so.
+
+## 2026-11-15: Seven libraries landed
+
+All seven of step 2's Habu libraries are on Habu's master, each after one
+review and one or two rounds of fixes. The reviews caught things the lanes'
+own tests passed over:
+- once secret writing worked on Linux, the old secret test would have left
+  four dummy items in the user's real keyring when run by hand;
+- SQLite's statement finalizer dropped its result, but an `INSERT ...
+  RETURNING` commits there, so a caller could hold the id of a row SQLite had
+  rolled back;
+- two suites were gated on a target predicate that is false on x86-64 Linux,
+  so they would never have run there.
+
+The lanes kept copying private facts from `fs.f`: errno numbers, the stat
+layout fix-up, directory open flags, a file mode. A sealed package cannot
+reach another's private words, and the names were not public, so each lane
+grew its own copy. The fix was to publish them once in `FS` and swap every
+lane onto them, which cost a second round per lane. Rust's `libc` crate has
+every errno; nobody writes `17 constant EEXIST`.
+
+One port turned up a hazard in Habu's FFI. A foreign function's symbol is
+resolved at its first call, which happens after the caller has cleared errno
+and before the C call runs. Habu's own FFI notes that the loader may set
+errno even when it succeeds, so code that reads a failure from errno could
+misread a successful first call. The fix keeps errno across the lookup.
+This machine's glibc never set it, so no test here can fail without the
+fix. Rust binds its symbols when the program loads, so it has no such
+window.
+
+A build-tool bug showed up the same way. When a build died while its link
+was opening, hb-build reported "the build ended the process before its
+first file" and named no stage. That was filed as a bug, and within the hour
+the first staged `str` build printed exactly that line. The cause was an
+engine that did not yet know the new type: the commit has to be built in
+two stages.
+
+## 2026-11-15: Rows first, landed as a stack
+
+The `str` plan above changed in two places. Its step 6 moved files over
+callees first. Instead, one mechanical commit flips every signature,
+literal and string keyword to `str`, and marks every file with `split-str`.
+Then any file can move in any order, in parallel, because a move changes no
+signature. Its step 7 said nothing on master ever carried the marker. The
+user chose to land the line as a stack, each commit built by the engine of
+the one before it, so the marker appears in master's history but never at
+its tip. A pair that is a buffer and its capacity stays `^u8 n`, and so do C
+bindings. The `str` type and the wide `NEWTYPE`, `DEFTYPE` and `CAST:` land
+first, on their own.
