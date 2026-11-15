@@ -1,9 +1,10 @@
 ---
 title: Port the domain values as MODEL
-status: active
+status: closed
 priority: 2
 issue-type: task
 created-at: "2026-11-15T20:22:00.958146+02:00"
+closed-at: "2026-11-16T00:09:03.855562+02:00"
 blocks:
   - omabox-move-omabox-s-12e4286b
 ---

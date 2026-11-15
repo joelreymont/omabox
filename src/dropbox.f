@@ -36,6 +36,7 @@ require src/lib/aio.f
 require src/lib/fsm.f
 require src/lib/unicode.f
 require src/lib/date.f
+require src/lib/type/deftype.f
 
 package DROPBOX
 public
@@ -69,6 +70,17 @@ ENUM reply
 ;ENUM
 
 ENUM kind DERIVE eq file folder deleted ;ENUM
+
+\ Dropbox's content hash of a file's bytes.
+DEFTYPE HASH str
+\ A file's revision, which a conditional write names.
+DEFTYPE REV str
+\ A listing's cursor, which list_folder/continue resumes from.
+DEFTYPE CURSOR str
+
+: HASH= ( hash hash -- bool )
+   {: a:hash b:hash :}
+   a HASH>STR str> b HASH>STR str> STR= ;
 
 \ rev, content-hash and size are a file's alone, empty and 0 for a
 \ folder; lower and display are path_lower and path_display.
