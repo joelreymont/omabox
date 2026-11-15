@@ -25,14 +25,15 @@
 \ string; the keys are sync_root and dropbox_app_key, once each; a value is
 \ any of the four TOML strings with every TOML escape. Anything else is
 \ E-PARSE; a file that is not UTF-8 is E-READ.
-\ A refusal logs one line, the Rust error's text with the path or field it
-\ names, then throws. E-READ, E-RESOLVE-SYNC-ROOT, E-INSPECT-PATH,
-\ E-CREATE-DIRECTORY, E-SECURE-DIRECTORY, E-LOCK-OPEN and E-LOCK-ACQUIRE
-\ leave the host errno in FS:ERRNO, 0 where the Rust error has none; the
-\ other codes leave 0.
+\ A refusal logs two lines, the Rust error's text with the path or field it
+\ names and then its help, and throws. E-READ, E-RESOLVE-SYNC-ROOT,
+\ E-INSPECT-PATH, E-CREATE-DIRECTORY, E-SECURE-DIRECTORY, E-LOCK-OPEN and
+\ E-LOCK-ACQUIRE leave the host errno in FS:ERRNO, 0 where the Rust error
+\ has none; the other codes leave 0.
 \ STORAGE CLASS. CALLER-OWNED: every record and path a word answers is laid
-\ in the arena its caller passes; a lock's path stays in its config's.
-\ PREPARE's projections live in an arena of its own, released on return.
+\ in the arena its caller passes; a lock's path stays in its paths'.
+\ PREPARE-PATHS's projections live in an arena of its own, released on
+\ return.
 \ TASK-LOCAL: the row realpath and readlink answer into.
 
 require src/lib/error.f
@@ -42,6 +43,8 @@ require src/lib/arena.f
 require src/lib/adt/option.f
 require src/lib/type/deftype.f
 require src/lib/fs.f
+require src/lib/fs-mutate.f
+require src/lib/fs-lock.f
 require src/lib/ffi-abi.f
 require src/lib/log.f
 require src/lib/task.f
@@ -131,8 +134,6 @@ ENUM projection
    VARIANT followed FIELD next abs-path ;VARIANT
 ;ENUM
 
-$2F constant SLASH
-$2E constant DOT
 \ Linux's MAXSYMLINKS.
 40 constant MAX-HOPS
 4 constant EINTR
@@ -155,20 +156,20 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
 : ABSOLUTE? ( str -- bool )
    str> {: a:^ u:n :}
    u 0= if false exit then
-   a c@ SLASH = ;
+   a c@ FS:SLASH = ;
 
 \ The last separator in a[from..u), else -1.
 : LAST-SLASH ( ^u8 n n -- n )
    {: a:^ from:n u:n :}
    u begin dup from > while
-      1 - dup a + c@ SLASH = if exit then
+      1 - dup a + c@ FS:SLASH = if exit then
    repeat drop -1 ;
 
 \ The first separator in a[from..u), else u.
 : NEXT-SLASH ( ^u8 n n -- n )
    {: a:^ u:n from:n :}
    from begin dup u < while
-      dup a + c@ SLASH = if exit then
+      dup a + c@ FS:SLASH = if exit then
       1 +
    repeat ;
 
@@ -176,11 +177,12 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
 : SKIPPED? ( ^u8 n -- bool )
    {: c:^ cu:n :}
    cu 0= if true exit then
-   cu 1 = c c@ DOT = and ;
+   cu 1 = c c@ FS:DOT = and ;
 
 : DOTS? ( ^u8 n -- bool )
    {: c:^ cu:n :}
-   cu 2 = if c c@ DOT = c 1 + c@ DOT = and else false then ;
+   cu 2 <> if false exit then
+   c c@ FS:DOT = c 1 + c@ FS:DOT = and ;
 
 \ For an absolute a u past its root: the length left before its last
 \ separator-led piece, and where that piece starts.
@@ -200,7 +202,7 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
    c cu DOTS? if rest COMPONENT-PARENT c cu exit then
    rest COMPONENT-NORMAL c cu ;
 
-\ Components::as_path's trim: trailing separators and `.` dropped.
+\ Trailing separators and `.` dropped.
 : TRIM ( ^u8 n -- n )
    {: a:^ u:n :}
    u 1 <= if u exit then
@@ -208,7 +210,7 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
    a start + u start - SKIPPED? if a rest RECURSE exit then
    u ;
 
-\ PathBuf::pop of an absolute path below the root: its parent's length.
+\ The parent's length of an absolute path below the root.
 : POP ( ^u8 n -- n )
    {: a:^ u:n :}
    a u BACK 2drop drop {: rest:n :}
@@ -225,9 +227,9 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
 : SEP ( ^u8 n -- n )
    {: a:^ u:n :}
    u 0= if 0 exit then
-   a u + 1 - c@ SLASH = if 0 else 1 then ;
+   a u + 1 - c@ FS:SLASH = if 0 else 1 then ;
 
-\ Path::join: an absolute name replaces the base.
+\ An absolute name replaces the base.
 : JOIN ( abs-path str ^ARENA:arena -- abs-path )
    {: base name ar :}
    name ABSOLUTE? if name ar COPY >ABS-PATH exit then
@@ -236,7 +238,7 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
    b bu SEP {: sep:n :}
    ar bu sep + nu + ARENA:ALLOC drop {: d:^ :}
    b d bu BYTE-COPY
-   sep 0<> if SLASH d bu + c! then
+   sep 0<> if FS:SLASH d bu + c! then
    n d bu + sep + nu BYTE-COPY
    d bu sep + nu + >str >ABS-PATH ;
 
@@ -251,7 +253,7 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
       k 1 +
    repeat drop ;
 
-\ PathBuf::pop of normalized o ol: never past the root.
+\ The parent's length of normalized o ol, never past the root.
 : UP ( ^u8 n -- n )
    {: o:^ ol:n :}
    o 1 ol LAST-SLASH {: j:n :}
@@ -262,16 +264,16 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
    {: o:^ ol:n c:^ cu:n :}
    c cu SKIPPED? if ol exit then
    c cu DOTS? if o ol UP exit then
-   ol 1 > if SLASH o ol + c! ol 1 + else ol then {: at:n :}
+   ol 1 > if FS:SLASH o ol + c! ol 1 + else ol then {: at:n :}
    c o at + cu BYTE-COPY
    at cu + ;
 
-\ lexical_normalize: the root, then each component, `..` popping.
+\ The root, then each component, `..` popping.
 : NORMALIZE ( str ^ARENA:arena -- abs-path )
    {: s ar :}
    s str> {: a:^ u:n :}
    ar u 1 + ARENA:ALLOC drop {: o:^ :}
-   SLASH o c!
+   FS:SLASH o c!
    1 1 begin dup u < while
       {: ol:n at:n :}
       a u at NEXT-SLASH {: k:n :}
@@ -280,7 +282,7 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
    repeat drop
    o swap >str >ABS-PATH ;
 
-\ Path::starts_with for normalized paths: p is root or below it.
+\ Whether normalized p is root or below it.
 : INSIDE? ( abs-path abs-path -- bool )
    {: p root :}
    p ABS-PATH>STR str> {: a:^ u:n :}
@@ -289,7 +291,7 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
    u ru < if false exit then
    a ru r ru STR= 0= if false exit then
    u ru = if true exit then
-   a ru + c@ SLASH = ;
+   a ru + c@ FS:SLASH = ;
 
 
 \ ---- refusals
@@ -299,13 +301,20 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
 : QUOTED+ ( abs-path -- )
    s" `" LOG:TEXT+ ABS-PATH>STR str> LOG:TEXT+ s" `" LOG:TEXT+ ;
 
-\ Ends the line, then throws code with cause as FS:ERRNO.
+\ Ends the error's line and opens its help line with the text.
+: HELP ( ^u8 n -- )
+   {: h:^ hu:n :}
+   LOG:;LINE LOG-OPEN s" help: " LOG:TEXT+ h hu LOG:TEXT+ ;
+
+\ Ends the help line, then throws code with cause as FS:ERRNO.
 : FAIL ( n n -- )
    {: code:n cause:n :}
    LOG:;LINE cause FS:CAUSE! code throw ;
 
 : HOME-UNAVAILABLE ( -- )
    LOG-OPEN s" HOME is not set" LOG:TEXT+
+   s" Set HOME, or set both XDG_CONFIG_HOME and XDG_STATE_HOME" HELP
+   s"  to absolute paths." LOG:TEXT+
    E-HOME-UNAVAILABLE 0 FAIL ;
 
 \ The name of the variable or key, and the path it held.
@@ -313,6 +322,8 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
    {: name:^ nameu:n s :}
    LOG-OPEN name nameu LOG:TEXT+
    s"  must be an absolute path, but was " LOG:TEXT+ s >ABS-PATH QUOTED+
+   s" Use an absolute path so the unattended service resolves it" HELP
+   s"  consistently." LOG:TEXT+
    E-PATH-NOT-ABSOLUTE 0 FAIL ;
 
 \ The cause is FS:ERRNO's on entry, as for every refusal below with one.
@@ -320,27 +331,38 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
    {: p :}
    FS:ERRNO {: cause:n :}
    LOG-OPEN s" could not read Omabox configuration at " LOG:TEXT+
-   p QUOTED+ E-READ cause FAIL ;
+   p QUOTED+
+   s" Create a readable file containing an absolute `sync_root`" HELP
+   s"  and a `dropbox_app_key`." LOG:TEXT+
+   E-READ cause FAIL ;
 
 : PARSE-FAILED ( abs-path -- )
    {: p :}
    LOG-OPEN s" could not parse Omabox configuration at " LOG:TEXT+
-   p QUOTED+ E-PARSE 0 FAIL ;
+   p QUOTED+
+   s" The file may contain only `sync_root` and `dropbox_app_key`;" HELP
+   s"  credentials do not belong in configuration." LOG:TEXT+
+   E-PARSE 0 FAIL ;
 
 : EMPTY-APP-KEY ( -- )
    LOG-OPEN s" Dropbox application key is empty" LOG:TEXT+
+   s" Set `dropbox_app_key` to the public app key from the Dropbox" HELP
+   s"  developer console." LOG:TEXT+
    E-EMPTY-APP-KEY 0 FAIL ;
 
 : RESOLVE-FAILED ( abs-path -- )
    {: p :}
    FS:ERRNO {: cause:n :}
    LOG-OPEN s" could not resolve sync root " LOG:TEXT+ p QUOTED+
+   s" Create the sync root as a local directory and ensure it is" HELP
+   s"  accessible." LOG:TEXT+
    E-RESOLVE-SYNC-ROOT cause FAIL ;
 
 : NOT-DIRECTORY ( abs-path -- )
    {: p :}
    LOG-OPEN s" sync root " LOG:TEXT+ p QUOTED+
    s"  is not a directory" LOG:TEXT+
+   s" Set `sync_root` to an existing local directory." HELP
    E-SYNC-ROOT-NOT-DIRECTORY 0 FAIL ;
 
 : INSPECT-FAILED ( abs-path -- )
@@ -348,6 +370,7 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
    FS:ERRNO {: cause:n :}
    LOG-OPEN s" could not inspect " LOG:TEXT+ p QUOTED+
    s"  while validating configuration paths" LOG:TEXT+
+   s" Ensure every parent directory is accessible and retry." HELP
    E-INSPECT-PATH cause FAIL ;
 
 : ROLE$ ( path-role -- ^u8 n )
@@ -360,10 +383,23 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
       daemon-lock OF s" daemon lock" ENDOF
    ;MATCH ;
 
+\ The XDG variable that places the role's path.
+: XDG-VARIABLE$ ( path-role -- ^u8 n )
+   MATCH path-role
+      configuration OF s" XDG_CONFIG_HOME" ENDOF
+      state OF s" XDG_STATE_HOME" ENDOF
+      journal OF s" XDG_STATE_HOME" ENDOF
+      staging OF s" XDG_STATE_HOME" ENDOF
+      recovery OF s" XDG_STATE_HOME" ENDOF
+      daemon-lock OF s" XDG_STATE_HOME" ENDOF
+   ;MATCH ;
+
 : INSIDE-ROOT ( path-role abs-path abs-path -- )
    {: role p root :}
    LOG-OPEN role ROLE$ LOG:TEXT+ s"  " LOG:TEXT+ p QUOTED+
    s"  must not be inside sync root " LOG:TEXT+ root QUOTED+
+   s" Set " HELP role XDG-VARIABLE$ LOG:TEXT+
+   s"  to a local directory outside the sync root." LOG:TEXT+
    E-INSIDE-SYNC-ROOT 0 FAIL ;
 
 : REQUIRE-ABSOLUTE ( ^u8 n str ^ARENA:arena -- abs-path )
@@ -421,8 +457,8 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
    b d len BYTE-COPY
    d cap 2 * ;
 
-\ fd read to its end into the arena; a failed read closes fd: E-READ.
-: DRAIN ( abs-path n ^ARENA:arena -- str )
+\ fd read to its end into the arena, or E-READ.
+: READ-TO-END ( abs-path n ^ARENA:arena -- str )
    {: p fd:n ar :}
    ar CHUNK ARENA:ALLOC drop 0 CHUNK
    begin
@@ -430,18 +466,18 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
       b len cap ar GROWN {: d:^ dcap:n :}
       fd d len + dcap len - read {: got:n :}
       got 0= if d len >str exit then
-      got 0 < if FS:ERRNO EINTR <> if
-         FS:ERRNO {: cause:n :} fd close cause FS:CAUSE! p READ-FAILED
-      then then
+      got 0 < if FS:ERRNO EINTR <> if p READ-FAILED then then
       d len got 0 max + dcap
    again ;
 
-\ fs::read_to_string: the whole file as UTF-8, or E-READ.
+: DRAIN ( abs-path n ^ARENA:arena -- str )
+   {: p fd:n ar :}
+   [: p fd ar READ-TO-END ;] [: fd close ;] finally ;
+
+\ The whole file as UTF-8, or E-READ.
 : READ-FILE ( abs-path ^ARENA:arena -- str )
    {: p ar :}
-   p OPENED {: fd:n :}
-   p fd ar DRAIN {: s :}
-   fd close
+   p p OPENED ar DRAIN {: s :}
    s str> UTF8:VALID? 0= if 0 FS:CAUSE! p READ-FAILED then
    s ;
 
@@ -491,7 +527,7 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
       ENDOF
    ;MATCH ;
 
-\ project_once: the nearest existing ancestor, resolved.
+\ The nearest existing ancestor, resolved.
 : PROJECT-ONCE ( abs-path dangling ^ARENA:arena -- projection )
    {: p d ar :}
    p ABS-PATH>STR str> {: a:^ u:n :}
@@ -511,12 +547,11 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
       ENDOF
    ;MATCH ;
 
-\ project_physical_path.
 : PROJECT ( abs-path dangling ^ARENA:arena -- abs-path )
    {: p d ar :}
    p p d 0 ar PROJECT-HOPS ;
 
-\ canonicalize_sync_root: the canonical root, a directory.
+\ The canonical root, a directory.
 : CANONICAL-ROOT ( abs-path ^ARENA:arena -- abs-path )
    {: root ar :}
    root ABS-PATH>STR ar CANONICAL MATCH option
@@ -532,7 +567,7 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
 
 \ ---- XDG and the private paths
 
-\ valid_xdg_home: a configured home counts when absolute.
+\ A configured home counts when absolute.
 : VALID-HOME ( option<str> ^ARENA:arena -- option<abs-path> )
    {: o ar :}
    o MATCH option
@@ -558,7 +593,7 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
       none OF home ar HOME sub subu >str ar JOIN ENDOF
    ;MATCH ;
 
-\ resolve_xdg_directories: HOME, XDG_CONFIG_HOME, XDG_STATE_HOME.
+\ From HOME, XDG_CONFIG_HOME and XDG_STATE_HOME.
 : RESOLVE-XDG ( option<str> option<str> option<str> ^ARENA:arena -- ^xdg )
    {: home config state ar :}
    config ar VALID-HOME {: ch :}
@@ -576,7 +611,6 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
    {: x ar :}
    x XDG-CONFIG-HOME @ s" omabox" >str ar JOIN ;
 
-\ application_state_directory.
 : XDG-STATE-DIRECTORY ( ^xdg ^ARENA:arena -- abs-path )
    {: x ar :}
    x XDG-STATE-HOME @ s" omabox" >str ar JOIN ;
@@ -605,7 +639,7 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
       role at root INSIDE-ROOT
    then ;
 
-\ validate_outside: every private path outside the root.
+\ Every private path outside the root.
 : OUTSIDE ( ^paths abs-path ^ARENA:arena -- )
    {: p root ar :}
    root DANGLING-FOLLOW ar PROJECT {: ph :}
@@ -688,12 +722,6 @@ ARENA READERS reader
 : BASIC-CHAR? ( n -- bool )
    {: b:n :}
    b WS? b $21 = or b $23 $5B IN? or b $5D $7E IN? or b $80 >= or ;
-
-\ A bare key's bytes: A-Z a-z 0-9 - _.
-: KEY-CHAR? ( n -- bool )
-   {: b:n :}
-   b $41 $5A IN? b $61 $7A IN? or b $30 $39 IN? or
-   b $2D = or b $5F = or ;
 
 : ONE-OF? ( n ^u8 n -- bool )
    {: b:n a:^ u:n :}
@@ -837,9 +865,8 @@ ARENA READERS reader
    {: r b:n k:n :}
    k 0 ?do r b EMIT loop ;
 
-\ A run of a multi-line string's delimiter byte q: up to two of its
-\ bytes are content, and three end the string, so a run of k from 3 to 5
-\ ends it after k-3 more; true when it ended.
+\ A run of k delimiter bytes q: up to two are content, and 3 to 5 end
+\ the multi-line string after k-3 more; true when it ended.
 : QUOTES ( ^reader n -- bool )
    {: r q:n :}
    r q RUN {: k:n :}
@@ -927,12 +954,11 @@ ARENA READERS reader
    r PEEK $27 = if r LITERAL exit then
    r BAD ;
 
-\ A bare key: the lexer's atom, which holds only key bytes.
+\ A bare key: the lexer's atom, which ASSIGN refuses unless a known key.
 : ATOM ( ^reader -- str )
    {: r :}
    r READER-POS @ {: start:n :}
    begin r PEEK ATOM-END? 0= while
-      r PEEK KEY-CHAR? 0= if r BAD then
       r 1 SKIP
    repeat
    r READER-POS @ start - {: u:n :}
@@ -994,7 +1020,7 @@ ARENA READERS reader
       none OF r BAD ENDOF
    ;MATCH ;
 
-\ read_config_document: the stored root and key, unchecked.
+\ The stored root and key, unchecked.
 : READ-DOCUMENT ( ^xdg ^ARENA:arena -- str str )
    {: x ar :}
    x ar XDG-CONFIG-DIRECTORY s" config.toml" >str ar JOIN {: file :}
@@ -1008,7 +1034,7 @@ ARENA READERS reader
    begin r PEEK -1 <> while r EXPRESSION repeat
    r r READER-ROOT FILLED r r READER-KEY FILLED ;
 
-\ str::trim().is_empty(): every scalar Unicode White_Space.
+\ Every scalar Unicode White_Space.
 : BLANK-KEY? ( str -- bool )
    str> {: a:^ u:n :}
    0 begin dup u < while
@@ -1022,7 +1048,6 @@ ARENA READERS reader
       ;MATCH
    repeat drop true ;
 
-\ ConfigDocument::checked.
 : CHECKED ( str str ^ARENA:arena -- ^document )
    {: root key ar :}
    s" sync_root" root ar REQUIRE-ABSOLUTE {: p :}
@@ -1034,15 +1059,14 @@ ARENA READERS reader
 
 public
 
-\ ---- XdgDirectories
+\ ---- the XDG directories
 
-\ from_environment.
 : XDG-ENV ( ^ARENA:arena -- ^xdg )
    {: ar :}
    s" HOME" ENV s" XDG_CONFIG_HOME" ENV s" XDG_STATE_HOME" ENV
    ar RESOLVE-XDG ;
 
-\ new: the config home, then the state home.
+\ The config home, then the state home.
 : XDG-NEW ( abs-path abs-path ^ARENA:arena -- ^xdg )
    {: ch sh ar :}
    s" XDG_CONFIG_HOME" ch ABS-PATH>STR ar REQUIRE-ABSOLUTE {: c :}
@@ -1057,9 +1081,9 @@ public
    x ar XDG-CONFIG-DIRECTORY s" config.toml" >str ar JOIN ;
 
 
-\ ---- Paths
+\ ---- the paths
 
-\ resolve_private: the paths, not checked against a sync root.
+\ The paths, not checked against a sync root.
 : RESOLVE-PRIVATE ( ^xdg ^ARENA:arena -- ^paths )
    {: x ar :}
    x ar XDG-STATE-DIRECTORY {: state :}
@@ -1085,7 +1109,7 @@ public
 : LOCK-FILE ( ^paths -- abs-path ) PATHS-LOCK @ ;
 
 
-\ ---- ConfigDocument
+\ ---- the document
 
 : DOCUMENT-LOAD-FROM ( ^xdg ^ARENA:arena -- ^document )
    {: x ar :}
@@ -1099,9 +1123,9 @@ public
 : DOCUMENT-KEY ( ^document -- str ) DOCUMENT-DROPBOX-APP-KEY @ ;
 
 
-\ ---- Config
+\ ---- the config
 
-\ validate_with: the document against paths already resolved.
+\ The document against paths already resolved.
 : VALIDATE-WITH ( ^document ^paths ^ARENA:arena -- ^config )
    {: d p ar :}
    d DOCUMENT-SYNC-ROOT @ ar CANONICAL-ROOT {: root :}
@@ -1124,7 +1148,7 @@ public
    {: ar :}
    ar XDG-ENV ar LOAD-FROM ;
 
-\ from_values: a root and key a setup or settings command supplies.
+\ A root and key a setup or settings command supplies.
 : FROM-VALUES ( ^xdg abs-path str ^ARENA:arena -- ^config )
    {: x root key ar :}
    root ABS-PATH>STR key ar CHECKED x ar VALIDATE ;
@@ -1138,41 +1162,10 @@ private
 
 \ ---- the runtime directories and the daemon lock
 
-PROCESS-SYMBOLS
-FUNCTION: MKDIR-CALL mkdir ( ^u8 n -- i32 ) ;FUNCTION
-FUNCTION: CHMOD-CALL chmod ( ^u8 n -- i32 ) ;FUNCTION
-FUNCTION: OPEN-CALL open ( ^u8 n n -- i32 ) 2 VARIADIC ;FUNCTION
-FUNCTION: FLOCK-CALL flock ( n n -- i32 ) ;FUNCTION
-
-\ Modes 0700 and 0600.
-$1C0 constant OWNER-DIR
-$180 constant OWNER-FILE
-
-\ Linux's open flags; arm64 moves O_NOFOLLOW.
-1 constant O-WRONLY
-2 constant O-RDWR
-$40 constant O-CREAT
-$80 constant O-EXCL
-$80000 constant O-CLOEXEC
-: O-NOFOLLOW ( -- n )
-   HB-TARGET-LINUX-X86-64? if $20000 else $8000 then ;
-
-\ flock's operations, and Linux's EWOULDBLOCK.
-2 constant LOCK-EX
-4 constant LOCK-NB
-8 constant LOCK-UN
-11 constant EWOULDBLOCK
-
-\ A libc call's answer: true for 0, else false with its errno in FS:ERRNO.
-: CALLED? ( n -- bool )
-   {: rc:n :}
-   rc 0= if 0 FS:CAUSE! true exit then
-   FFI:ERRNO FS:CAUSE! false ;
-
 : MKDIR? ( ^u8 n -- bool )
    {: a:^ u:n :}
    a u >str PASSABLE? 0= if false exit then
-   a u FS:>PATHZ OWNER-DIR MKDIR-CALL CALLED? ;
+   a u FS:>PATHZ FS:MODE-PRIVATE-DIR mkdir 0= ;
 
 \ A failed mkdir stands unless a directory is there now, links followed.
 : PRESENT? ( ^u8 n -- bool )
@@ -1183,7 +1176,7 @@ $80000 constant O-CLOEXEC
    then
    cause FS:CAUSE! false ;
 
-\ DirBuilder's recursive create, mode 0700: each missing ancestor first.
+\ Each missing ancestor made first, mode 0700.
 : MAKE-ALL? ( ^u8 n -- bool )
    {: a:^ u:n :}
    a u MKDIR? if true exit then
@@ -1197,13 +1190,19 @@ $80000 constant O-CLOEXEC
    {: role p :}
    FS:ERRNO {: cause:n :}
    LOG-OPEN s" could not create Omabox " LOG:TEXT+ role ROLE$ LOG:TEXT+
-   s"  at " LOG:TEXT+ p QUOTED+ E-CREATE-DIRECTORY cause FAIL ;
+   s"  at " LOG:TEXT+ p QUOTED+
+   s" Ensure the XDG state location is writable and has sufficient" HELP
+   s"  space." LOG:TEXT+
+   E-CREATE-DIRECTORY cause FAIL ;
 
 : SECURE-FAILED ( path-role abs-path -- )
    {: role p :}
    FS:ERRNO {: cause:n :}
    LOG-OPEN s" could not secure Omabox " LOG:TEXT+ role ROLE$ LOG:TEXT+
-   s"  at " LOG:TEXT+ p QUOTED+ E-SECURE-DIRECTORY cause FAIL ;
+   s"  at " LOG:TEXT+ p QUOTED+
+   s" Ensure the XDG state location is owned by this user and" HELP
+   s"  retry." LOG:TEXT+
+   E-SECURE-DIRECTORY cause FAIL ;
 
 \ One runtime directory made, then set 0700 whatever the umask left.
 : MAKE-PRIVATE ( ^paths path-role -- )
@@ -1211,13 +1210,13 @@ $80000 constant O-CLOEXEC
    p role ROLE-PATH {: at :}
    at ABS-PATH>STR str> {: a:^ u:n :}
    a u MAKE-ALL? 0= if role at CREATE-FAILED then
-   a u FS:>PATHZ OWNER-DIR CHMOD-CALL CALLED? 0= if
+   a u FS:>PATHZ FS:MODE-PRIVATE-DIR chmod 0<> if
       role at SECURE-FAILED
    then ;
 
-\ Paths::prepare: checked outside the root again once the directories
-\ exist, so a symlinked ancestor cannot redirect them into it unseen.
-: PREPARE-PATHS ( ^paths abs-path ^ARENA:arena -- )
+\ Checked outside the root again once the directories exist, so a
+\ symlinked ancestor cannot redirect them into it unseen.
+: PREPARE-IN ( ^paths abs-path ^ARENA:arena -- )
    {: p root ar :}
    p root ar OUTSIDE
    p PATH-ROLE-STATE MAKE-PRIVATE
@@ -1225,51 +1224,68 @@ $80000 constant O-CLOEXEC
    p PATH-ROLE-RECOVERY MAKE-PRIVATE
    p root ar OUTSIDE ;
 
-: PREPARE-IN ( ^config ^ARENA:arena -- )
-   {: c ar :}
-   c CONFIG-PATHS @ c CONFIG-SYNC-ROOT @ ar PREPARE-PATHS ;
-
 : OPEN-FAILED ( abs-path -- )
    {: p :}
    FS:ERRNO {: cause:n :}
    LOG-OPEN s" could not open daemon lock file " LOG:TEXT+ p QUOTED+
+   s" Ensure the Omabox state directory is writable and retry." HELP
    E-LOCK-OPEN cause FAIL ;
 
 : ALREADY-RUNNING ( -- )
    LOG-OPEN s" another Omabox daemon is already running" LOG:TEXT+
+   s" Use the existing daemon instance; no lock-file cleanup is" HELP
+   s"  required." LOG:TEXT+
    E-ALREADY-RUNNING 0 FAIL ;
 
 : ACQUIRE-FAILED ( abs-path -- )
    {: p :}
    FS:ERRNO {: cause:n :}
    LOG-OPEN s" could not acquire daemon lock on " LOG:TEXT+ p QUOTED+
+   s" Check filesystem lock support and retry." HELP
    E-LOCK-ACQUIRE cause FAIL ;
 
-\ create_owner_only: a regular file at s, made 0600 if missing. O_EXCL
-\ takes a dangling symlink for a file, so the entry itself is checked.
-\ False leaves the cause in FS:ERRNO, 0 for an entry that is no file.
+\ A new file at s, mode 0600; false leaves the cause in FS:ERRNO.
+: CREATED? ( str -- bool )
+   {: s :}
+   [: s str> FS:MODE-PRIVATE-FILE FS:CREATE-NEW FD>N close ;] catch {: code:n :}
+   code 0= if true exit then
+   code E-FS-OPEN <> if code throw then
+   false ;
+
+\ s a regular file, made 0600 if missing; false leaves the cause in
+\ FS:ERRNO, 0 for an entry that is no file, a dangling link included.
 : OWNER-ONLY? ( str -- bool )
    {: s :}
    s PASSABLE? 0= if false exit then
-   O-WRONLY O-CREAT or O-EXCL or O-CLOEXEC or {: flags:n :}
-   s str> FS:>PATHZ flags OWNER-FILE OPEN-CALL {: fd:n :}
-   fd 0 >= if fd close true exit then
-   FFI:ERRNO FS:CAUSE!
+   s CREATED? if true exit then
    FS:ERRNO FS:EEXIST <> if false exit then
    s str> FS:TRY-LSTAT 0= if false exit then
    FS:STAT-MODE@ FS:S-IFMT and FS:S-IFREG = if true exit then
    0 FS:CAUSE! false ;
 
+\ A code FS's open threw: E-FS-OPEN is E-LOCK-OPEN, any other goes on.
+: OPEN-CAUGHT ( n abs-path -- )
+   {: code:n p :}
+   code E-FS-OPEN <> if code throw then
+   p OPEN-FAILED ;
+
 \ The lock file opened for reading and writing, never through a symlink.
-: OPEN-LOCK ( abs-path -- n )
+: OPEN-LOCK ( abs-path -- fd )
    {: p :}
    p ABS-PATH>STR OWNER-ONLY? 0= if p OPEN-FAILED then
-   O-RDWR O-NOFOLLOW or O-CLOEXEC or {: flags:n :}
-   p ABS-PATH>STR str> FS:>PATHZ flags 0 OPEN-CALL {: fd:n :}
-   fd 0 < if FFI:ERRNO FS:CAUSE! p OPEN-FAILED then
-   fd ;
+   -1 >FD [: drop p ABS-PATH>STR str> FS:OPEN-RDWR-NOFOLLOW ;] catch
+   {: code:n :}
+   code 0<> if code p OPEN-CAUGHT then ;
 
-\ InstanceLock's Drop logs this as a warning and closes the file anyway.
+\ A code FS-LOCK:TRY threw, fd closed: E-FS-IO is E-LOCK-ACQUIRE, any
+\ other goes on.
+: TRY-CAUGHT ( n fd abs-path -- )
+   {: code:n f:fd p :}
+   f FD>N close
+   code E-FS-IO <> if code throw then
+   p ACQUIRE-FAILED ;
+
+\ A warning: UNLOCK closes the file anyway.
 : UNLOCK-FAILED ( n abs-path -- )
    {: cause:n p :}
    LOG:WARN s" config" LOG:LINE
@@ -1281,28 +1297,32 @@ public
 
 \ ---- prepare and the instance lock
 
-\ Config::prepare: the state, upload-staging and recovery directories made
-\ and set 0700 between two checks that every private path lies outside.
-: PREPARE ( ^config -- )
+\ The state, upload-staging and recovery directories made and set 0700
+\ between two checks that every private path lies outside the sync root.
+: PREPARE-PATHS ( ^paths abs-path -- )
    [: PREPARE-IN ;] ARENA:WITH ;
 
-\ InstanceLock::acquire on the config's daemon.lock, never waiting. flock is
-\ per open file description, so a second LOCK in this process contends as
-\ another process's does, the Rust daemon's included.
-: LOCK ( ^config -- lock )
-   CONFIG-PATHS @ PATHS-LOCK @ {: p :}
-   p OPEN-LOCK {: fd:n :}
-   fd LOCK-EX LOCK-NB or FLOCK-CALL 0= if fd >FD p LOCK-MAKE exit then
-   FFI:ERRNO {: cause:n :}
-   fd close
-   cause EWOULDBLOCK = if ALREADY-RUNNING then
-   cause FS:CAUSE! p ACQUIRE-FAILED ;
+: PREPARE ( ^config -- )
+   {: c :}
+   c CONFIG-PATHS @ c CONFIG-SYNC-ROOT @ PREPARE-PATHS ;
+
+\ The paths' daemon.lock, never waiting. flock binds the open file
+\ description, so a second LOCK here contends as another process's does.
+: LOCK ( ^paths -- lock )
+   PATHS-LOCK @ {: p :}
+   p OPEN-LOCK {: f:fd :}
+   false [: drop f FS-LOCK:TRY ;] catch {: code:n :}
+   code 0<> if code f p TRY-CAUGHT then
+   if f p LOCK-MAKE exit then
+   f FD>N close ALREADY-RUNNING ;
 
 \ Unlocks before closing, so a forked copy of the descriptor does not keep
 \ the lock. The file stays: its presence claims nothing.
 : UNLOCK ( lock -- )
    LOCK-UNMAKE {: f:fd p :}
-   f FD>N LOCK-UN FLOCK-CALL 0<> if FFI:ERRNO p UNLOCK-FAILED then
-   f FD>N close ;
+   [: f FS-LOCK:RELEASE ;] catch {: code:n :}
+   code E-FS-IO = if FS:ERRNO p UNLOCK-FAILED then
+   f FD>N close
+   code 0<> code E-FS-IO <> and if code throw then ;
 
 ;package

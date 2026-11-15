@@ -6,11 +6,13 @@
 \ through /usr/bin/flock. Then config.toml as the toml crate
 \ reads it: each string form, each escape, comments, whitespace, CRLF, a
 \ BOM and quoted keys, and each refusal with the code the Rust error maps
-\ to. Every case runs in a directory of its own under TMPDIR, sets its own
-\ XDG and HOME values and removes the directory after. CONFIG's log lines
-\ go to stderr, but those a case checks, which are captured in the case's
-\ directory, checked and removed. White-box: CONFIG is reopened for the
-\ private words a Rust test calls.
+\ to. A refusal's two log lines, its text and Rust's help, are checked;
+\ so are the failures of prepare and the lock. Every case runs in a
+\ directory of its own under TMPDIR, sets its own XDG and HOME values and
+\ removes the directory after. CONFIG's log lines go to stderr, but those
+\ a case checks, which are captured in the case's directory, checked and
+\ removed. White-box: CONFIG is reopened for the private words a Rust
+\ test calls and two failure words no case reaches.
 \ Run from the repository root: hb --load src/config-test.f </dev/null
 require src/lib/arena.f
 require src/lib/string.f
@@ -28,9 +30,8 @@ package CONFIG-TEST
 ;package
 
 
-\ CONFIG reopened for project_physical_path, resolve_xdg_directories,
-\ the XDG fields, fs::canonicalize, Paths::prepare and a lock's descriptor.
-\ Each name lands in CONFIG-TEST, so CONFIG gains none.
+\ CONFIG reopened for projection, XDG resolution and fields, realpath, two
+\ failure words and a lock's descriptor; each name lands in CONFIG-TEST.
 package CONFIG
 
 : CONFIG-TEST:FOLLOW ( abs-path ^ARENA:arena -- abs-path )
@@ -49,7 +50,6 @@ package CONFIG
 : CONFIG-TEST:CONFIG-HOME ( ^xdg -- abs-path ) XDG-CONFIG-HOME @ ;
 : CONFIG-TEST:STATE-HOME ( ^xdg -- abs-path ) XDG-STATE-HOME @ ;
 
-\ application_state_directory.
 : CONFIG-TEST:STATE-APP ( ^xdg ^ARENA:arena -- abs-path ) XDG-STATE-DIRECTORY ;
 
 : CANON-FAILED ( -- ) E-INSPECT-PATH throw ;
@@ -60,8 +60,11 @@ package CONFIG
       none OF CANON-FAILED ENDOF
    ;MATCH ;
 
-: CONFIG-TEST:PREPARE-PATHS ( ^paths abs-path ^ARENA:arena -- )
-   PREPARE-PATHS ;
+: CONFIG-TEST:SECURE-FAILED ( abs-path -- )
+   {: p :}
+   PATH-ROLE-STATE p SECURE-FAILED ;
+
+: CONFIG-TEST:ACQUIRE-FAILED ( abs-path -- ) ACQUIRE-FAILED ;
 
 : CONFIG-TEST:LOCK-FD ( lock -- lock n )
    LOCK-UNMAKE {: f:fd p :}
@@ -175,21 +178,69 @@ variable CAUSE
    {: a:^ u:n :}
    0 u 0 ?do a i + c@ 10 = if 1+ then loop ;
 
-\ ERR$ is one line that ends in CONFIG's tag and the text.
+\ The text a u ends in CONFIG's tag, t and a newline.
+: ENDS? ( ^u8 n str -- bool )
+   {: a:^ u:n t :}
+   s" config: " >str t CAT s\" \n" S+ str> {: w:^ wu:n :}
+   u wu < if false exit then
+   a u wu - + wu w wu T-STR= ;
+
+\ ERR$'s first line's length, its newline included.
+: FIRST-LINE ( -- n )
+   ERR-U @ 0 ?do ERR i + c@ 10 = if i 1+ unloop exit then loop
+   ERR-U @ ;
+
+\ ERR$ is one line, t.
 : LINE? ( str -- bool )
    {: t :}
-   s" config: " >str t CAT s\" \n" S+ str> {: w:^ wu:n :}
    ERR$ LINES 1 <> if false exit then
-   ERR-U @ wu < if false exit then
-   ERR ERR-U @ wu - + wu w wu T-STR= ;
+   ERR$ t ENDS? ;
 
-\ The action throws the code and logs the line.
+\ ERR$ is the line t, then the help line h.
+: HELPED? ( str str -- bool )
+   {: t h :}
+   ERR$ LINES 2 <> if false exit then
+   ERR FIRST-LINE t ENDS? 0= if false exit then
+   ERR FIRST-LINE + ERR-U @ FIRST-LINE -
+   s" help: " >str h CAT ENDS? ;
+
+\ Asserts the flag, showing what ERR$ should have held.
+: ASSERT-LOG ( bool str -- )
+   {: ok:bool t :}
+   ok T-ASSERT ok if exit then
+   s" want: " type t str> type cr s" got: " type ERR$ type ;
+
+\ The action throws the code and logs the line t and the help line h.
+: REFUSED-WITH ( [ -- ] n str str -- )
+   {: xt want:n t h :}
+   xt LOGGED want T=
+   t h HELPED? t s"  / help: " S+ h CAT ASSERT-LOG ;
+
+\ Rust's help for each code a case expects; a protected path's names
+\ XDG_STATE_HOME, as every role's but the configuration directory's.
+: HELP$ ( n -- ^u8 n )
+   case
+      CONFIG:E-PATH-NOT-ABSOLUTE of s" Use an absolute path so the unattended service resolves it consistently." endof
+      CONFIG:E-READ of s" Create a readable file containing an absolute `sync_root` and a `dropbox_app_key`." endof
+      CONFIG:E-PARSE of s" The file may contain only `sync_root` and `dropbox_app_key`; credentials do not belong in configuration." endof
+      CONFIG:E-EMPTY-APP-KEY of s" Set `dropbox_app_key` to the public app key from the Dropbox developer console." endof
+      CONFIG:E-RESOLVE-SYNC-ROOT of s" Create the sync root as a local directory and ensure it is accessible." endof
+      CONFIG:E-SYNC-ROOT-NOT-DIRECTORY of s" Set `sync_root` to an existing local directory." endof
+      CONFIG:E-INSPECT-PATH of s" Ensure every parent directory is accessible and retry." endof
+      CONFIG:E-INSIDE-SYNC-ROOT of s" Set XDG_STATE_HOME to a local directory outside the sync root." endof
+      CONFIG:E-CREATE-DIRECTORY of s" Ensure the XDG state location is writable and has sufficient space." endof
+      CONFIG:E-SECURE-DIRECTORY of s" Ensure the XDG state location is owned by this user and retry." endof
+      CONFIG:E-LOCK-OPEN of s" Ensure the Omabox state directory is writable and retry." endof
+      CONFIG:E-ALREADY-RUNNING of s" Use the existing daemon instance; no lock-file cleanup is required." endof
+      CONFIG:E-LOCK-ACQUIRE of s" Check filesystem lock support and retry." endof
+      CONFIG:E-HOME-UNAVAILABLE of s" Set HOME, or set both XDG_CONFIG_HOME and XDG_STATE_HOME to absolute paths." endof
+      s" " rot
+   endcase ;
+
+\ The action throws the code and logs the line t and the code's help.
 : REFUSED ( [ -- ] n str -- )
    {: xt want:n t :}
-   xt LOGGED want T=
-   t LINE? dup T-ASSERT 0= if
-      s" want: " type t str> type cr s" got: " type ERR$ type
-   then ;
+   xt want t want HELP$ >str REFUSED-WITH ;
 
 
 \ ---- the Rust fixture
@@ -217,7 +268,7 @@ variable CAUSE
 
 : ROOT-LINE ( -- str ) s\" sync_root = \"" >str ROOT @ CAT s\" \"\n" S+ ;
 
-\ write_config: the root and test-app-key.
+\ The root and test-app-key.
 : STANDARD ( -- )
    ROOT-LINE s\" dropbox_app_key = \"test-app-key\"\n" S+ WRITE-CONFIG ;
 
@@ -359,18 +410,16 @@ variable CAUSE
 
 : FROM-ROOT ( -- ) XDG @ ROOT @ CONFIG:>ABS-PATH s" test-app-key" >str AR @ CONFIG:FROM-VALUES drop ;
 
-\ The Rust test also checks the miette help, "Set XDG_CONFIG_HOME to a
-\ local directory outside the sync root."; CONFIG ports no help, so the
-\ line's role stands for it.
 : ROOT-HOLDS-CONFIG ( -- )
    s" Dropbox" UNDER ROOT !
    ROOT @ MKDIR
    s" Dropbox" s" state" XDG-AT
    ['] FROM-ROOT CONFIG:E-INSIDE-SYNC-ROOT
    s" configuration directory" s" Dropbox/omabox" UNDER
-   s" Dropbox" REAL-UNDER INSIDE-TEXT REFUSED ;
+   s" Dropbox" REAL-UNDER INSIDE-TEXT
+   s" Set XDG_CONFIG_HOME to a local directory outside the sync root." >str
+   REFUSED-WITH ;
 
-\ As ROOT-HOLDS-CONFIG, the help (XDG_STATE_HOME) is not ported.
 : LOCK-INSIDE ( -- )
    FIXTURE
    s" Dropbox/stolen.lock" UNDER str> s" " FS:WRITE-ALL
@@ -398,6 +447,13 @@ variable CAUSE
    ERR$ s" local-path-sentinel" CONTAINS? TFALSE ;
 
 : SOME ( str -- option<str> ) OPTION:SOME ;
+
+: NO-HOME ( -- )
+   CONFIG-TEST:ABSENT CONFIG-TEST:ABSENT CONFIG-TEST:ABSENT
+   AR @ CONFIG-TEST:RESOLVE drop ;
+
+: HOME-MISSING ( -- )
+   ['] NO-HOME CONFIG:E-HOME-UNAVAILABLE s" HOME is not set" >str REFUSED ;
 
 : EMPTY-VALUES ( -- )
    DIR @ SOME s" " >str SOME s" " >str SOME AR @ CONFIG-TEST:RESOLVE {: x :}
@@ -449,7 +505,7 @@ variable CAUSE
    p RUNTIME-MODES ;
 
 : PREPARE-ROOT ( -- )
-   SET @ ROOT @ CONFIG:>ABS-PATH AR @ CONFIG-TEST:PREPARE-PATHS ;
+   SET @ ROOT @ CONFIG:>ABS-PATH CONFIG:PREPARE-PATHS ;
 
 \ ROOT is DIR/root, a link to the missing DIR/data, which holds the state.
 : DANGLING-ROOT-TARGET ( -- )
@@ -472,7 +528,8 @@ variable CAUSE
 
 : LOCK-PATH ( -- str )
    HELD @ CONFIG:PATHS CONFIG:LOCK-FILE CONFIG:ABS-PATH>STR ;
-: LOCK-DROP ( -- ) HELD @ CONFIG:LOCK CONFIG:UNLOCK ;
+: HELD-LOCK ( -- CONFIG:lock ) HELD @ CONFIG:PATHS CONFIG:LOCK ;
+: LOCK-DROP ( -- ) HELD-LOCK CONFIG:UNLOCK ;
 
 : OPEN-TEXT ( -- str )
    s" could not open daemon lock file `" >str LOCK-PATH CAT s" `" S+ ;
@@ -485,7 +542,7 @@ variable CAUSE
 
 : LOCK-OWNER-ONLY ( -- )
    LOCKABLE HELD !
-   HELD @ CONFIG:LOCK {: l :}
+   HELD-LOCK {: l :}
    LOCK-PATH str> FS:TRY-STAT TTRUE
    FS:STAT-MODE@ $1FF and $180 T=
    l CONFIG:UNLOCK ;
@@ -508,14 +565,14 @@ variable CAUSE
 \ is the file's presence. flock(1) contends as the Rust daemon would.
 : LOCK-CONTENTION ( -- )
    LOCKABLE HELD !
-   HELD @ CONFIG:LOCK {: first :}
+   HELD-LOCK {: first :}
    ['] LOCK-DROP CONFIG:E-ALREADY-RUNNING
    s" another Omabox daemon is already running" >str REFUSED
    CAUSE @ 0 T=
    FLOCK-RC 1 T=
    first CONFIG:UNLOCK
    FLOCK-RC 0 T=
-   HELD @ CONFIG:LOCK {: second :}
+   HELD-LOCK {: second :}
    LOCK-PATH EXISTS? TTRUE
    second CONFIG:UNLOCK ;
 
@@ -523,14 +580,82 @@ variable CAUSE
 \ copy of the descriptor does.
 : LOCK-COPY ( -- )
    LOCKABLE HELD !
-   HELD @ CONFIG:LOCK CONFIG-TEST:LOCK-FD {: first copy:n :}
+   HELD-LOCK CONFIG-TEST:LOCK-FD {: first copy:n :}
    copy FD:F-DUPFD-CLOEXEC 0 fcntl {: twin:n :}
    twin 0 >= TTRUE
    first CONFIG:UNLOCK
-   HELD @ CONFIG:LOCK {: second :}
+   HELD-LOCK {: second :}
    FLOCK-RC 1 T=
    twin close
    second CONFIG:UNLOCK ;
+
+
+\ ---- the failures of prepare and the lock
+
+\ Both targets' fcntl.h.
+1 constant F-GETFD
+
+: PREPARE-HELD ( -- ) HELD @ CONFIG:PREPARE ;
+
+: STATE-PATH ( -- str )
+   HELD @ CONFIG:PATHS CONFIG:STATE-DIRECTORY CONFIG:ABS-PATH>STR ;
+
+\ The state home made 0555, so its omabox directory cannot be made.
+: PREPARE-DENIED ( -- )
+   FIXTURE STANDARD
+   s" state" UNDER {: home :}
+   home MKDIR
+   home str> $16D FS:CHMOD-MODE
+   LOAD HELD !
+   ['] PREPARE-HELD CONFIG:E-CREATE-DIRECTORY
+   s" could not create Omabox state directory at `" >str STATE-PATH CAT
+   s" `" S+ REFUSED
+   CAUSE @ FS:EACCES T=
+   home str> $1ED FS:CHMOD-MODE ;
+
+\ LOCK before PREPARE, which makes the state directory.
+: LOCK-NO-STATE ( -- )
+   FIXTURE STANDARD
+   LOAD HELD !
+   ['] LOCK-DROP CONFIG:E-LOCK-OPEN OPEN-TEXT REFUSED
+   CAUSE @ FS:ENOENT T= ;
+
+\ The lock's descriptor closed under it, then the lock dropped.
+: UNLOCK-CLOSED ( -- )
+   HELD-LOCK CONFIG-TEST:LOCK-FD close CONFIG:UNLOCK ;
+
+: UNLOCK-WARNS ( -- )
+   LOCKABLE HELD !
+   ['] UNLOCK-CLOSED LOGGED 0 T=
+   s" could not unlock the daemon lock file `" >str LOCK-PATH CAT
+   s" `; closing it instead: " S+ FS:EBADF FS:ERRNO$ S+ {: t :}
+   t LINE? t ASSERT-LOG ;
+
+: LOCK-CLOEXEC ( -- )
+   LOCKABLE HELD !
+   HELD-LOCK CONFIG-TEST:LOCK-FD {: l fd:n :}
+   fd F-GETFD 0 fcntl FD:FD-CLOEXEC and FD:FD-CLOEXEC T=
+   l CONFIG:UNLOCK ;
+
+: SECURE-DENIED ( -- )
+   FS:EPERM FS:CAUSE!
+   s" state" P CONFIG-TEST:SECURE-FAILED ;
+
+: SECURE-FAILS ( -- )
+   ['] SECURE-DENIED CONFIG:E-SECURE-DIRECTORY
+   s" could not secure Omabox state directory at `" >str s" state" UNDER CAT
+   s" `" S+ REFUSED
+   CAUSE @ FS:EPERM T= ;
+
+: ACQUIRE-DENIED ( -- )
+   FS:EINVAL FS:CAUSE!
+   s" daemon.lock" P CONFIG-TEST:ACQUIRE-FAILED ;
+
+: ACQUIRE-FAILS ( -- )
+   ['] ACQUIRE-DENIED CONFIG:E-LOCK-ACQUIRE
+   s" could not acquire daemon lock on `" >str s" daemon.lock" UNDER CAT
+   s" `" S+ REFUSED
+   CAUSE @ FS:EINVAL T= ;
 
 
 \ ---- config.toml
@@ -609,6 +734,19 @@ variable CAUSE
    ['] DOCUMENT-DROP CONFIG:E-READ READ-TEXT REFUSED
    CAUSE @ FS:ENOENT T= ;
 
+\ The lowest free descriptor.
+: NEXT-FD ( -- n )
+   s" /dev/null" FS:>PATHZ 0 0 open {: fd:n :}
+   fd close fd ;
+
+: CONFIG-DIRECTORY-FILE ( -- )
+   FIXTURE
+   CONFIG-FILE MKDIR
+   NEXT-FD {: free:n :}
+   ['] DOCUMENT-DROP CONFIG:E-READ READ-TEXT REFUSED
+   CAUSE @ FS:EISDIR T=
+   NEXT-FD free T= ;
+
 : RELATIVE-ROOT ( -- )
    FIXTURE
    s\" sync_root = \"Dropbox\"\ndropbox_app_key = \"k\"\n" >str WRITE-CONFIG
@@ -621,7 +759,7 @@ variable CAUSE
    ROOT @ str> s" " FS:WRITE-ALL
    STANDARD
    ['] LOAD-DROP CONFIG:E-SYNC-ROOT-NOT-DIRECTORY
-   s" sync root `" >str s" Dropbox" REAL-UNDER CAT s" ` is not a directory" S+
+   s" sync root `" >str ROOT @ CAT s" ` is not a directory" S+
    REFUSED ;
 
 public
@@ -652,11 +790,18 @@ public
    s" xdg_empty_values_use_home_defaults" ['] EMPTY-VALUES RUN-CASE
    s" xdg_relative_values_use_home_defaults" ['] RELATIVE-VALUES RUN-CASE
    s" xdg_absolute_values_do_not_require_home" ['] ABSOLUTE-VALUES RUN-CASE
+   s" no HOME" ['] HOME-MISSING RUN-CASE
    s" daemon_lock_file_is_created_for_its_owner_only" ['] LOCK-OWNER-ONLY RUN-CASE
    s" daemon_lock_refuses_a_symlinked_lock_file" ['] LOCK-SYMLINKED RUN-CASE
    s" lock_contention_is_clean_and_release_is_automatic" ['] LOCK-CONTENTION RUN-CASE
    s" dropping_the_lock_releases_it_while_a_descriptor_copy_is_open"
    ['] LOCK-COPY RUN-CASE
+   s" prepare under a read-only state home" ['] PREPARE-DENIED RUN-CASE
+   s" a lock with no state directory" ['] LOCK-NO-STATE RUN-CASE
+   s" an unlock of a closed descriptor" ['] UNLOCK-WARNS RUN-CASE
+   s" a close-on-exec lock descriptor" ['] LOCK-CLOEXEC RUN-CASE
+   s" a directory that cannot be secured" ['] SECURE-FAILS RUN-CASE
+   s" a lock that cannot be acquired" ['] ACQUIRE-FAILS RUN-CASE
    s" a basic string" ['] BASIC RUN-CASE
    s" a literal string" ['] LITERAL RUN-CASE
    s" a multi-line basic string" ['] ML-BASIC RUN-CASE
@@ -690,6 +835,7 @@ public
    s" six closing quotes" ['] SIX-QUOTES RUN-CASE
    s" two keys on a line" ['] TWO-ON-A-LINE RUN-CASE
    s" no config.toml" ['] NO-FILE RUN-CASE
+   s" config.toml a directory" ['] CONFIG-DIRECTORY-FILE RUN-CASE
    s" a relative root" ['] RELATIVE-ROOT RUN-CASE
    s" a root that is a file" ['] NOT-DIRECTORY RUN-CASE
    s" config-test: " type T-CASES FMT:.INT s"  checks" type cr
