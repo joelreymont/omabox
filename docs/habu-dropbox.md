@@ -16,12 +16,12 @@ ENUM error
    insufficient-space locked reset invalid-root
    content-hash-mismatch unsupported-file other ;ENUM
 
-SUMTYPE reply
-   VARIANT done ;VARIANT          \ the client holds the answer
-   VARIANT refused error ;VARIANT \ Dropbox said no, and why
-   VARIANT retry n ;VARIANT       \ ms Dropbox asked to wait, else 0
-   VARIANT unlinked ;VARIANT      \ the refresh token is dead
-;SUMTYPE
+ENUM reply
+   VARIANT done ;VARIANT                    \ the client holds the answer
+   VARIANT refused FIELD why error ;VARIANT \ Dropbox said no, and why
+   VARIANT retry FIELD ms n ;VARIANT        \ ms Dropbox asked to wait, else 0
+   VARIANT unlinked ;VARIANT                \ the refresh token is dead
+;ENUM
 ```
 
 - `retry` covers 429, 5xx, 408, `too_many_write_operations`, a timeout or a
@@ -71,13 +71,15 @@ SUMTYPE reply
 : CREATE-FOLDER ( ptr u8 n ptr client -- reply )  \ path
 : ENTRY         ( ptr client -- ptr entry )
 
+ENUM kind file folder deleted ;ENUM
+
 STRUCTURE entry
-   FIELD kind ...       \ file, folder or deleted
-   FIELD lower ...      \ path_lower
-   FIELD display ...    \ path_display
-   FIELD rev ...        \ files only
-   FIELD hash ...       \ content_hash, files only
-   FIELD size n         \ files only
+   FIELD kind kind
+   FIELD lower ...         \ path_lower
+   FIELD display ...       \ path_display
+   FIELD rev ...           \ files only
+   FIELD content-hash ...  \ files only
+   FIELD size n            \ files only
 ;STRUCTURE
 
 STRUCTURE upload
