@@ -5,7 +5,8 @@
 \ code exchange, Dropbox's content hash and uploads, whose stages are written
 \ under TMPDIR and removed once open, so no run leaves one. One server and
 \ one main client serve every case; a case that needs another config opens
-\ its own client. DROPBOX's log lines go to stderr. The first failed
+\ its own client. DROPBOX's log lines go to stderr, but a stage failure's
+\ line, which is captured under TMPDIR and checked. The first failed
 \ assertion ends the run.
 \ Run from the repository root: hb --load src/dropbox-test.f </dev/null
 require src/lib/aio.f
@@ -13,6 +14,7 @@ require src/lib/arena.f
 require src/lib/span.f
 require src/lib/string.f
 require src/lib/test.f
+require src/lib/test/stderr.f
 require src/lib/memory.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
@@ -557,11 +559,17 @@ TYPED-VARIABLE UP DROPBOX:upload
 create STAGE 256 allot
 variable STAGE-U
 create EXPECTED 64 allot
+create ERR-PATH 256 allot
+variable ERR-PATH-U
+create ERR 512 allot
+variable ERR-U
 variable SHOWN
 variable SHOWS
-\ The count of accepted bytes at which FAULT strikes, -1 for none.
+\ The count of accepted bytes at which FAULT strikes, -1 for none, and
+\ the strikes left there.
 variable FAULT-AT
-ENUM fault cut lose close ;ENUM
+variable STRIKES
+ENUM fault cut cut-twice lose close ;ENUM
 TYPED-VARIABLE FAULT fault
 
 
@@ -598,14 +606,18 @@ TYPED-VARIABLE FAULT fault
 : STAGE$ ( -- ptr u8 n ) STAGE STAGE-U @ ;
 
 
-\ TMPDIR/<name>, made fresh.
-: STAGE! ( ptr u8 n -- )
-   {: nm:ptr nu:n :}
+\ TMPDIR/<name> at dst; answers its length.
+: IN-TMP ( ptr u8 n ptr u8 -- n )
+   {: nm:ptr nu:n dst:ptr :}
    s" TMPDIR" GETENV {: d:ptr du:n :}
-   d STAGE du BYTE-COPY
-   47 STAGE du + c!
-   nm STAGE du + 1+ nu BYTE-COPY
-   du 1+ nu + STAGE-U ! ;
+   d dst du BYTE-COPY
+   47 dst du + c!
+   nm dst du + 1+ nu BYTE-COPY
+   du 1+ nu + ;
+
+
+\ TMPDIR/<name>, made fresh.
+: STAGE! ( ptr u8 n -- ) STAGE IN-TMP STAGE-U ! ;
 
 
 \ Writes the bytes as the stage, opens it and removes its name before any
@@ -629,17 +641,20 @@ TYPED-VARIABLE FAULT fault
 : STRIKE ( -- )
    FAULT @ MATCH fault
       cut OF TEST-DROPBOX:CUT ENDOF
+      cut-twice OF TEST-DROPBOX:CUT TEST-DROPBOX:CUT ENDOF
       lose OF TEST-DROPBOX:LOSE ENDOF
       close OF TEST-DROPBOX:CLOSE-SESSIONS ENDOF
    ;MATCH ;
 
 
-\ UPLOAD's progress: the last count and the calls, and the fault once.
+\ UPLOAD's progress: the last count and the calls, and the fault while
+\ strikes are left.
 : PROGRESSED ( n -- )
    {: n:n :}
    n SHOWN ! 1 SHOWS +!
    n FAULT-AT @ <> if exit then
-   -1 FAULT-AT !
+   -1 STRIKES +!
+   STRIKES @ 0= if -1 FAULT-AT ! then
    STRIKE ;
 
 
@@ -713,8 +728,56 @@ TYPED-VARIABLE FAULT fault
    UNSTAGED ;
 
 
+: ERR-PATH$ ( -- ptr u8 n ) ERR-PATH ERR-PATH-U @ ;
+: ERR$ ( -- ptr u8 n ) ERR ERR-U @ ;
+
+
+\ The code SEND throws, 0 for none, with fd 2 sent to TMPDIR/stderr.txt,
+\ which ERR$ then holds and which is then removed.
+: LOGGED ( -- n )
+   s" stderr.txt" ERR-PATH IN-TMP ERR-PATH-U !
+   ERR-PATH$ STDERR:CAPTURE
+   [: [: SEND DONE? drop ;] catch ;] [: STDERR:;CAPTURE ;] finally
+   ERR-PATH$ ERR 512 FS:READ-ALL ERR-U !
+   ERR-PATH$ FS:REMOVE-FILE ;
+
+
+\ ERR$ holds the line UPLOAD logs for a failure of UP's stage.
+: STAGE-LOGGED? ( ptr u8 n -- bool )
+   {: why:ptr wu:n :}
+   SB-RESET s" error dropbox: upload of " SB-APPEND
+   UP DROPBOX-UPLOAD:PATH @ SPAN:$ SB-APPEND
+   s" : " SB-APPEND why wu SB-APPEND
+   ERR$ SB$ CONTAINS? ;
+
+
+\ A stage shorter than the size UPLOAD was given.
+: SHORT-STAGE-CASE ( -- )
+   s" stage shorter than its size" T-LABEL
+   TEST-DROPBOX:RESET -1 FAULT-AT !
+   s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
+   20 UP DROPBOX-UPLOAD:SIZE !
+   LOGGED DROPBOX:E-STAGE T=
+   s" the stage is shorter than its size" STAGE-LOGGED? TTRUE
+   TEST-DROPBOX:SEEN$ s" " T$=
+   UNSTAGED ;
+
+
+\ A stage open for writing alone, whose read the kernel refuses: EBADF.
+: REFUSED-STAGE-CASE ( -- )
+   s" stage read refused" T-LABEL
+   TEST-DROPBOX:RESET -1 FAULT-AT !
+   s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
+   UNSTAGED STAGE$ FS:OPEN-APPEND-FD >FD UP DROPBOX-UPLOAD:FD !
+   LOGGED DROPBOX:E-STAGE T=
+   s" the stage's read was refused, errno 9" STAGE-LOGGED? TTRUE
+   TEST-DROPBOX:SEEN$ s" " T$=
+   UNSTAGED ;
+
+
 : SINGLE-CASES ( -- )
-   SINGLE-CASE CONFLICT-CASE HELD-CASE NON-ASCII-CASE ;
+   SINGLE-CASE CONFLICT-CASE HELD-CASE NON-ASCII-CASE
+   SHORT-STAGE-CASE REFUSED-STAGE-CASE ;
 
 
 \ A file one byte over a chunk: two appends.
@@ -732,12 +795,17 @@ TYPED-VARIABLE FAULT fault
 : S-FINISH ( -- ) s"  /2/files/upload_session/finish" SB-APPEND ;
 
 
-\ An upload with the fault at the count, done with the entry Dropbox
+\ UPLOAD's reply, with the fault striking times at the count.
+: STRUCK ( n fault n -- DROPBOX:reply )
+   STRIKES ! FAULT ! FAULT-AT !
+   TEST-DROPBOX:RESET
+   SEND ;
+
+
+\ An upload with the fault once at the count, done with the entry Dropbox
 \ committed.
 : FAULTED ( n fault -- )
-   FAULT ! FAULT-AT !
-   TEST-DROPBOX:RESET
-   SEND DONE? ASSERT
+   1 STRUCK DONE? ASSERT
    ENTRY-HASH$ EXPECTED$ T$=
    MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:SIZE @ CHUNK 1+ T=
    TEST-DROPBOX:SEEN$ SB$ T$= ;
@@ -781,11 +849,40 @@ TYPED-VARIABLE FAULT fault
    CHUNK 1+ construct fault lose FAULTED ;
 
 
+\ The second chunk's answer lost on its append and again on the resend.
+: CUT-APPEND-CASE ( -- )
+   s" append lost twice" T-LABEL
+   CHUNK construct fault cut-twice 1 STRUCK RETRY-MS 0 T=
+   SB-RESET S-START S-APPEND S-APPEND S-APPEND
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
+
+
+\ The session closed after its first chunk, and its restart's too.
+: CLOSED-TWICE-CASE ( -- )
+   s" session gone twice" T-LABEL
+   CHUNK construct fault close 2 STRUCK RETRY-MS 0 T=
+   SB-RESET S-START S-APPEND S-APPEND S-RESTART S-APPEND S-APPEND
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
+
+
+\ The upload's content hash is not that of the bytes Dropbox commits.
+: MISMATCH-CASE ( -- )
+   s" committed content hash mismatch" T-LABEL
+   s" 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+   SPAN:MAKE UP DROPBOX-UPLOAD:CONTENT-HASH !
+   -1 construct fault cut 1 STRUCK
+   DROPBOX-ERROR:content-hash-mismatch REFUSED? ASSERT
+   ENTRY-HASH$ EXPECTED$ T$=
+   SB-RESET S-START S-APPEND S-APPEND S-FINISH
+   TEST-DROPBOX:SEEN$ SB$ T$=
+   EXPECTED$ SPAN:MAKE UP DROPBOX-UPLOAD:CONTENT-HASH ! ;
+
+
 : UPLOAD-CASES ( -- )
    HASH-CASE SINGLE-CASES
    BIG-STAGED
    SESSION-CASE LOST-APPEND-CASE HELD-APPEND-CASE CLOSED-CASE
-   LOST-FINISH-CASE
+   LOST-FINISH-CASE CUT-APPEND-CASE CLOSED-TWICE-CASE MISMATCH-CASE
    UNSTAGED ;
 
 

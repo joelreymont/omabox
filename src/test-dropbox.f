@@ -6,10 +6,10 @@
 \ the shapes tests/dropbox_fake.rs gives them. It accepts one app key and
 \ refresh token, and one code GRANT! sets; it issues the access tokens
 \ sl.fake-1, sl.fake-2 and on, and EXPIRE expires every token issued so far.
-\ LOSE applies the next API call and loses its answer; CUT loses it before
-\ the call takes effect. A call must carry the Path-Root ROOT! expects,
-\ none when that is empty, else it answers 422. Scripted answers go out in
-\ order before any route's own. It records each request's path, and the last
+\ LOSE applies the next API call and loses its answer; each CUT loses one
+\ more API call's answer, before the call takes effect. A call must carry
+\ the Path-Root ROOT! expects, none when that is empty, else it answers
+\ 422. Scripted answers go out in order before any route's own. It records each request's path, and the last
 \ API call's Authorization, Path-Root and Content-Type.
 \ STORAGE CLASS. PROCESS-WIDE: one worker serves every request, so its handler
 \ alone writes the state while a test waits on its call, and the test sets it
@@ -86,7 +86,7 @@ create ASKED PATH-CAP allot
 variable ASKED-U
 TYPED-VARIABLE PARSER JSON:cursor
 TYPED-VARIABLE LOSING bool
-TYPED-VARIABLE CUTTING bool
+variable CUTS
 
 
 \ Copies a span into a buffer of cap bytes and answers its length.
@@ -462,13 +462,14 @@ variable HELD-U
    q SEVER ;
 
 
-\ After CUT, an API call's body is read and its answer severed before its
-\ route runs: read, so no unread byte turns the close into a reset.
+\ While CUTS counts answers to lose, an API call's body is read and its
+\ answer severed before its route runs: read, so no unread byte turns the
+\ close into a reset.
 : CUT? ( HTTP:request -- bool )
    {: q:HTTP:request :}
-   CUTTING @ 0= if false exit then
+   CUTS @ 0= if false exit then
    q API? 0= if false exit then
-   false CUTTING !
+   -1 CUTS +!
    q HTTP:BODY$ 2drop
    q SEVER true ;
 
@@ -972,15 +973,15 @@ $2100000 constant UPLOAD-CAP
 
 
 \ Forgets the script, the entries, the kept bytes, the pages, the long
-\ poll's answer, the sessions, the revs uploads took, a SKEW, LOSE or CUT, a
-\ code GRANT! set and what was sent; the tokens and the root stay.
+\ poll's answer, the sessions, the revs uploads took, a SKEW, a LOSE, the
+\ CUTs, a code GRANT! set and what was sent; the tokens and the root stay.
 : RESET ( -- )
    0 SCRIPTS ! 0 SCRIPTED ! 0 FILES ! 0 CONTENTS ! 0 SESSIONS ! 0 REVS !
    0 GRANT-CODE-U !
    0 SEEN-U ! 0 AUTH-U ! 0 ROOT-SENT-U ! 0 TYPE-SENT-U !
    0 ARG-SENT-U ! 0 RANGE-SENT-U !
    false ROOTED ! false TYPED ! false LEAKED ! false RANGED !
-   false SKEWED ! false LOSING ! false CUTTING !
+   false SKEWED ! false LOSING ! 0 CUTS !
    LISTING-RESET ;
 
 
@@ -1102,8 +1103,9 @@ $2100000 constant UPLOAD-CAP
 
 \ ---- files/upload and upload sessions
 
-\ The next API call's answer is lost as LOSE's is, before its route runs.
-: CUT ( -- ) true CUTTING ! ;
+\ One more of the next API calls' answers is lost as LOSE's is, before
+\ its route runs: CUT twice loses the next two.
+: CUT ( -- ) 1 CUTS +! ;
 \ Closes every open session: an append to one answers closed.
 : CLOSE-SESSIONS ( -- )
    SESSIONS @ 0 ?do false i SESSION-OPEN ! loop ;
