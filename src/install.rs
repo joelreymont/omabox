@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -374,6 +374,23 @@ enum ArtifactKind {
     Directory,
 }
 
+/// What `path_kind` found at a path, which may be a kind no artifact has.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Observed {
+    File,
+    Directory,
+    Symlink,
+}
+
+impl From<ArtifactKind> for Observed {
+    fn from(kind: ArtifactKind) -> Self {
+        match kind {
+            ArtifactKind::File => Self::File,
+            ArtifactKind::Directory => Self::Directory,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum TransactionMode {
     Replace,
@@ -425,6 +442,21 @@ impl Entry {
         self.state = next;
         sync_rename(&source, &destination)
     }
+
+    /// Refuse a destination that is a symlink or another kind than this artifact, returning whether it exists.
+    fn check_destination(&self) -> Result<bool, InstallError> {
+        match path_kind(&self.destination)? {
+            None => Ok(false),
+            Some(Observed::Symlink) => Err(InstallError::DestinationSymlink {
+                path: self.destination.clone(),
+            }),
+            Some(kind) if kind != Observed::from(self.kind) => Err(invalid(
+                &self.destination,
+                "an install destination has an unexpected file type",
+            )),
+            Some(_) => Ok(true),
+        }
+    }
 }
 
 struct Transaction {
@@ -440,11 +472,17 @@ impl Transaction {
         sources: &Sources,
         commands: &Commands,
     ) -> Result<Self, InstallError> {
-        prepare_parents(layout)?;
-        let leftovers = sweep_stale(layout)?;
         let token = temporary_token();
         let staged = staged_paths(layout, &token)?;
-        let transaction = Self::new(layout, staged.clone(), TransactionMode::Replace, leftovers);
+        let mut transaction =
+            Self::new(layout, staged.clone(), TransactionMode::Replace, Vec::new());
+        // Refuse before creating any directory or staged copy, and before the
+        // sweep removes anything.
+        refuse_self_install(&sources.omabox, &layout.omabox)?;
+        refuse_self_install(&sources.omaboxd, &layout.omaboxd)?;
+        transaction.check_destinations()?;
+        prepare_parents(layout)?;
+        transaction.leftovers = sweep_stale(layout)?;
         let [omabox, omaboxd, unit, plugin] = &staged;
         let result = (|| {
             copy_file(&sources.omabox, omabox, 0o755)?;
@@ -510,18 +548,20 @@ impl Transaction {
         }
     }
 
-    fn preflight(&self) -> Result<(), InstallError> {
+    fn check_destinations(&self) -> Result<(), InstallError> {
         for entry in &self.entries {
-            if let Some(kind) = path_kind(&entry.destination)?
-                && kind != entry.kind
-            {
-                return Err(invalid(
-                    &entry.destination,
-                    "an install destination has an unexpected file type",
-                ));
-            }
+            entry.check_destination()?;
+        }
+        Ok(())
+    }
+
+    fn preflight(&self) -> Result<(), InstallError> {
+        self.check_destinations()?;
+        for entry in &self.entries {
             let staged_kind = path_kind(&entry.staged)?;
-            if matches!(self.mode, TransactionMode::Replace) && staged_kind != Some(entry.kind) {
+            if matches!(self.mode, TransactionMode::Replace)
+                && staged_kind != Some(Observed::from(entry.kind))
+            {
                 return Err(invalid(
                     &entry.staged,
                     "a prepared artifact has an unexpected file type",
@@ -540,10 +580,11 @@ impl Transaction {
     fn apply(&mut self, commands: &Commands) -> Result<(), InstallError> {
         self.preflight()?;
         for entry in &mut self.entries {
-            let destination_exists = path_kind(&entry.destination)?.is_some();
             if entry.kind == ArtifactKind::Directory {
                 ensure_shell_unlocked(commands)?;
             }
+            // Read after the lock check, which runs another program that may change the destination.
+            let destination_exists = entry.check_destination()?;
             match (self.mode, destination_exists) {
                 (TransactionMode::Replace, true) => {
                     entry.transition(EntryState::Swapped)?;
@@ -592,6 +633,26 @@ impl Transaction {
         }
         Ok(())
     }
+}
+
+/// Refuse a source that is its own destination, such as the installed `omabox` upgrading itself.
+fn refuse_self_install(source: &Path, destination: &Path) -> Result<(), InstallError> {
+    let installed = match fs::symlink_metadata(destination) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(fs_error("inspect an install destination", destination)(
+                source,
+            ));
+        }
+    };
+    let running = fs::metadata(source).map_err(fs_error("inspect an executable source", source))?;
+    if (running.dev(), running.ino()) == (installed.dev(), installed.ino()) {
+        return Err(InstallError::SourceIsDestination {
+            path: destination.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 fn prepare_parents(layout: &Layout) -> Result<(), InstallError> {
@@ -769,10 +830,11 @@ fn sync_rename(source: &Path, destination: &Path) -> Result<(), InstallError> {
     Ok(())
 }
 
-fn path_kind(path: &Path) -> Result<Option<ArtifactKind>, InstallError> {
+fn path_kind(path: &Path) -> Result<Option<Observed>, InstallError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_dir() => Ok(Some(ArtifactKind::Directory)),
-        Ok(_) => Ok(Some(ArtifactKind::File)),
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(Some(Observed::Directory)),
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(Some(Observed::Symlink)),
+        Ok(_) => Ok(Some(Observed::File)),
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(fs_error("inspect an artifact path", path)(source)),
     }
@@ -782,7 +844,7 @@ fn remove_if_present(path: &Path, expected: ArtifactKind) -> Result<(), InstallE
     let Some(actual) = path_kind(path)? else {
         return Ok(());
     };
-    if actual != expected {
+    if actual != Observed::from(expected) {
         return Err(invalid(path, "a transaction artifact changed file type"));
     }
     match expected {
@@ -847,6 +909,22 @@ pub enum InstallError {
         )
     )]
     InvalidArtifact { path: PathBuf, detail: &'static str },
+    #[error("the install destination `{path}` is a symbolic link")]
+    #[diagnostic(
+        code(omabox::install::destination_symlink),
+        help(
+            "Omabox installs real files at this path. Remove the link, or replace it with the file or directory it points to, then retry."
+        )
+    )]
+    DestinationSymlink { path: PathBuf },
+    #[error("the install source is the installed file `{path}`")]
+    #[diagnostic(
+        code(omabox::install::source_is_destination),
+        help(
+            "Run this command from the new build, such as `target/release/omabox`, rather than from the installed copy."
+        )
+    )]
+    SourceIsDestination { path: PathBuf },
     #[error("could not {operation} at `{path}`")]
     #[diagnostic(
         code(omabox::install::filesystem),
@@ -1876,6 +1954,248 @@ mod tests {
     }
 
     #[test]
+    fn symlinked_destinations_are_refused_and_kept() -> Result<(), Box<dyn Error>> {
+        for action in [InstallAction::Upgrade, InstallAction::Uninstall] {
+            for plugin in [false, true] {
+                let case = format!("{action:?} plugin={plugin}");
+                let fixture = Fixture::new("active", true, false, false)?;
+                fixture.old_install()?;
+                let shell_log = fixture.layout.home.join("omarchy-shell.log");
+                fs::write(
+                    fixture.commands.omarchy_shell.path(),
+                    format!(
+                        "printf '%s\\n' \"$*\" >> '{}'\nprintf 'false\\n'\n",
+                        shell_log.display()
+                    ),
+                )?;
+                let dotfiles = fixture.layout.home.join("dotfiles");
+                fs::create_dir(&dotfiles)?;
+                let (link, target) = if plugin {
+                    let target = dotfiles.join(PLUGIN_ID);
+                    fs::rename(&fixture.layout.plugin, &target)?;
+                    (&fixture.layout.plugin, target)
+                } else {
+                    let target = dotfiles.join("omabox");
+                    fs::rename(&fixture.layout.omabox, &target)?;
+                    (&fixture.layout.omabox, target)
+                };
+                std::os::unix::fs::symlink(&target, link)?;
+
+                let result =
+                    execute_with(action, &fixture.layout, &fixture.sources, &fixture.commands);
+
+                let Err(error) = result else {
+                    return Err(io::Error::other(format!("{case}: symlink accepted")).into());
+                };
+                assert!(
+                    matches!(&error, InstallError::DestinationSymlink { path } if path == link),
+                    "{case}: {error:?}"
+                );
+                let Some(help) = error.help() else {
+                    return Err(io::Error::other(format!("{case}: no help")).into());
+                };
+                assert!(help.to_string().contains("real files"), "{case}");
+                assert_eq!(fs::read_link(link)?, target, "{case}");
+                if plugin {
+                    assert_eq!(fs::read(target.join("old.qml"))?, b"old", "{case}");
+                } else {
+                    assert_eq!(fs::read(&target)?, b"old", "{case}");
+                }
+                assert!(!fixture.systemctl_log.exists(), "{case}");
+                assert!(!shell_log.exists(), "{case}");
+                let Some(bin) = fixture.layout.omabox.parent() else {
+                    return Err(io::Error::other("test path had no parent").into());
+                };
+                assert!(transaction_artifacts(bin, ".omabox")?.is_empty(), "{case}");
+                assert!(
+                    transaction_artifacts(&fixture.layout.omarchy_root, ".")?.is_empty(),
+                    "{case}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn plugin_installs_through_a_symlinked_omarchy_root() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new("inactive", false, false, false)?;
+        let dotfiles = fixture.layout.home.join("dotfiles/omarchy");
+        fs::create_dir_all(&dotfiles)?;
+        fs::create_dir(fixture.layout.home.join(".config"))?;
+        std::os::unix::fs::symlink(&dotfiles, &fixture.layout.omarchy_root)?;
+
+        execute_with(
+            InstallAction::Install,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        )?;
+
+        assert_eq!(fs::read_link(&fixture.layout.omarchy_root)?, dotfiles);
+        for (name, contents) in PLUGIN {
+            assert_eq!(
+                fs::read(dotfiles.join("plugins").join(PLUGIN_ID).join(name))?,
+                contents
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn installing_from_the_installed_copy_is_refused() -> Result<(), Box<dyn Error>> {
+        for daemon in [false, true] {
+            for hard_link in [false, true] {
+                let case = format!("daemon={daemon} hard_link={hard_link}");
+                let fixture = Fixture::new("active", true, false, false)?;
+                fixture.old_install()?;
+                let installed = if daemon {
+                    &fixture.layout.omaboxd
+                } else {
+                    &fixture.layout.omabox
+                };
+                let source = if hard_link {
+                    let source = fixture.layout.home.join("linked");
+                    fs::hard_link(installed, &source)?;
+                    source
+                } else {
+                    installed.clone()
+                };
+                let sources = if daemon {
+                    Sources {
+                        omabox: fixture.sources.omabox.clone(),
+                        omaboxd: source,
+                    }
+                } else {
+                    Sources {
+                        omabox: source,
+                        omaboxd: fixture.sources.omaboxd.clone(),
+                    }
+                };
+
+                let result = execute_with(
+                    InstallAction::Upgrade,
+                    &fixture.layout,
+                    &sources,
+                    &fixture.commands,
+                );
+
+                let Err(error) = result else {
+                    return Err(io::Error::other(format!("{case}: self install accepted")).into());
+                };
+                assert!(
+                    matches!(&error, InstallError::SourceIsDestination { path } if path == installed),
+                    "{case}: {error:?}"
+                );
+                let Some(help) = error.help() else {
+                    return Err(io::Error::other(format!("{case}: no help")).into());
+                };
+                assert!(help.to_string().contains("new build"), "{case}");
+                for path in [
+                    &fixture.layout.omabox,
+                    &fixture.layout.omaboxd,
+                    &fixture.layout.unit,
+                ] {
+                    assert_eq!(fs::read(path)?, b"old", "{case}");
+                }
+                assert_eq!(
+                    fs::read(fixture.layout.plugin.join("old.qml"))?,
+                    b"old",
+                    "{case}"
+                );
+                assert!(!fixture.systemctl_log.exists(), "{case}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn symlink_refusal_precedes_any_directory_or_staged_copy() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new("inactive", false, false, false)?;
+        let Some(bin) = fixture.layout.omabox.parent() else {
+            return Err(io::Error::other("test path had no parent").into());
+        };
+        fs::create_dir_all(bin)?;
+        let target = fixture.layout.home.join("omabox-elsewhere");
+        fs::write(&target, b"old")?;
+        std::os::unix::fs::symlink(&target, &fixture.layout.omabox)?;
+        let Some(unit_dir) = fixture.layout.unit.parent() else {
+            return Err(io::Error::other("test path had no parent").into());
+        };
+        assert!(!unit_dir.exists());
+        assert!(!fixture.layout.omarchy_root.exists());
+
+        let result = execute_with(
+            InstallAction::Install,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        assert!(
+            matches!(&result, Err(InstallError::DestinationSymlink { path }) if *path == fixture.layout.omabox),
+            "{result:?}"
+        );
+        assert!(!unit_dir.exists());
+        assert!(!fixture.layout.omarchy_root.exists());
+        assert!(transaction_artifacts(bin, ".omabox")?.is_empty());
+        assert_eq!(fs::read_link(&fixture.layout.omabox)?, target);
+        assert_eq!(fs::read(&target)?, b"old");
+        assert!(!fixture.systemctl_log.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn plugin_symlinked_during_the_lock_check_rolls_back() -> Result<(), Box<dyn Error>> {
+        let fixture = Fixture::new("active", true, false, false)?;
+        fixture.old_install()?;
+        let lock_checks = fixture._temporary.path().join("lock-checks");
+        let target = fixture.layout.home.join("dotfiles-plugin");
+        // The third lock check is the one apply runs before the plugin entry.
+        fs::write(
+            fixture.commands.omarchy_shell.path(),
+            format!(
+                "count=0\nif [ -f '{checks}' ]; then read count < '{checks}'; fi\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > '{checks}'\nif [ \"$count\" -eq 3 ]; then mv '{plugin}' '{target}' && ln -s '{target}' '{plugin}'; fi\nprintf 'false\\n'\n",
+                checks = lock_checks.display(),
+                plugin = fixture.layout.plugin.display(),
+                target = target.display(),
+            ),
+        )?;
+
+        let result = execute_with(
+            InstallAction::Upgrade,
+            &fixture.layout,
+            &fixture.sources,
+            &fixture.commands,
+        );
+
+        assert!(
+            matches!(&result, Err(InstallError::DestinationSymlink { path }) if *path == fixture.layout.plugin),
+            "{result:?}"
+        );
+        assert_eq!(fs::read_to_string(&lock_checks)?, "3\n");
+        assert_eq!(fs::read_link(&fixture.layout.plugin)?, target);
+        assert_eq!(fs::read(target.join("old.qml"))?, b"old");
+        assert_eq!(fs::read_dir(&target)?.count(), 1);
+        for path in [
+            &fixture.layout.omabox,
+            &fixture.layout.omaboxd,
+            &fixture.layout.unit,
+        ] {
+            assert_eq!(fs::read(path)?, b"old");
+        }
+        let Some(bin) = fixture.layout.omabox.parent() else {
+            return Err(io::Error::other("test path had no parent").into());
+        };
+        let Some(unit_dir) = fixture.layout.unit.parent() else {
+            return Err(io::Error::other("test path had no parent").into());
+        };
+        assert!(transaction_artifacts(bin, ".omabox")?.is_empty());
+        assert!(transaction_artifacts(unit_dir, ".")?.is_empty());
+        assert!(transaction_artifacts(&fixture.layout.omarchy_root, ".")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn lock_before_plugin_restores_earlier_artifacts_and_service() -> Result<(), Box<dyn Error>> {
         let fixture = Fixture::new("active", true, false, false)?;
         fixture.old_install()?;
@@ -2215,6 +2535,12 @@ mod tests {
                 path: PathBuf::from("/artifact"),
                 detail: "detail",
             },
+            InstallError::DestinationSymlink {
+                path: PathBuf::from("/artifact"),
+            },
+            InstallError::SourceIsDestination {
+                path: PathBuf::from("/artifact"),
+            },
             InstallError::Filesystem {
                 operation: "read",
                 path: PathBuf::from("/artifact"),
@@ -2250,13 +2576,16 @@ mod tests {
                 cleanup: Box::new([*inner()]),
             },
         ];
-        // The exhaustive match makes a new variant fail to compile until it joins `errors`.
+        // A new variant fails to compile here until it gets an arm, but nothing forces it
+        // into `errors`: add it there with its arm. Equal lengths mean no variant is listed twice.
         let names: std::collections::BTreeSet<&str> = errors
             .iter()
             .map(|error| match error {
                 InstallError::HomeUnavailable => "HomeUnavailable",
                 InstallError::HomeNotAbsolute { .. } => "HomeNotAbsolute",
                 InstallError::InvalidArtifact { .. } => "InvalidArtifact",
+                InstallError::DestinationSymlink { .. } => "DestinationSymlink",
+                InstallError::SourceIsDestination { .. } => "SourceIsDestination",
                 InstallError::Filesystem { .. } => "Filesystem",
                 InstallError::CommandStart { .. } => "CommandStart",
                 InstallError::CommandFailed { .. } => "CommandFailed",
