@@ -963,8 +963,15 @@ ENUM verdict
    c LINE$ ;
 
 
+\ The content deadlines: a stall ends the call, a long body does not.
+: STALLED ( CURL:handle -- )
+   {: h:CURL:handle :}
+   h 0 >MS CURL:TIMEOUT! s" timeout" OK
+   h 1 IDLE CURL:LOW-SPEED! s" low speed" OK ;
+
+
 \ An empty body, the rev's argument, a Range from a nonzero offset, and the
-\ content deadlines: a stall ends the call, a long body does not.
+\ content deadlines.
 : ASKED ( CURL:handle ptr client ptr u8 n n -- )
    {: h:CURL:handle c r:ptr ru:n at:n :}
    h c NO-BODY
@@ -973,8 +980,7 @@ ENUM verdict
       c LINE-CLEAR c s" Range: bytes=" LINE+ c at INT+ c s" -" LINE+
       h c LINE$ CURL:HEADER+ s" header" OK
    then
-   h 0 >MS CURL:TIMEOUT! s" timeout" OK
-   h 1 IDLE CURL:LOW-SPEED! s" low speed" OK ;
+   h STALLED ;
 
 
 \ The metadata the Dropbox-API-Result header holds, read into the entry.
@@ -1326,15 +1332,7 @@ public
    {: c :}
    c CLIENT-HANDLE @ CURL:CLEANUP
    c CLIENT-CURSOR JSON:READ-DISPOSE
-   c CLIENT-TOKEN @ BUF:DISPOSE
-   c CLIENT-ACCESS @ BUF:DISPOSE
-   c CLIENT-BODY @ BUF:DISPOSE
-   c CLIENT-LINE @ BUF:DISPOSE
-   c CLIENT-ANSWER @ BUF:DISPOSE
-   c CLIENT-HEADS @ BUF:DISPOSE
-   c CLIENT-VALUES @ BUF:DISPOSE
-   c CLIENT-SENT @ BUF:DISPOSE
-   c CLIENT-MARK @ BUF:DISPOSE ;
+   c UNBUFFERED ;
 
 
 \ users/get_current_account
@@ -1576,8 +1574,9 @@ public
 \ ends the transfer and throws E-ANSWER with sink handed nothing. Each chunk
 \ then goes to sink with its file offset. A 416 from a nonzero offset starts
 \ over once from 0 with no Range, so sink sees offset 0; a 416 from 0 throws
-\ E-ANSWER. Every done answer carried Dropbox-API-Result, and ENTRY is its
-\ entry.
+\ E-ANSWER. What sink throws ends the transfer and is rethrown once it has
+\ ended, so the client stays usable. Every done answer carried
+\ Dropbox-API-Result, and ENTRY is its entry.
 : DOWNLOAD ( ptr u8 n n ptr client [ ptr u8 n n -- ] -- reply )
    {: r:ptr ru:n at:n c sink :}
    at 0= if c r ru sink AFRESH exit then
@@ -2030,13 +2029,6 @@ HEAP RUNS run
 
 : CLOSE+ ( ptr JSON:writer -- ptr JSON:writer )
    s" close" false JSON:WRITE-FIELD-BOOL ;
-
-
-\ The content deadlines: a stall ends the call, a long body does not.
-: STALLED ( CURL:handle -- )
-   {: h:CURL:handle :}
-   h 0 >MS CURL:TIMEOUT! s" timeout" OK
-   h 1 IDLE CURL:LOW-SPEED! s" low speed" OK ;
 
 
 \ transport.rs SESSION_FINISH_SECONDS: the longest a finish, which commits
