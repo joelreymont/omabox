@@ -17,7 +17,8 @@
 \ is promoted before or after its rename, a corrupt one restarts only in
 \ its own slot, a promotion keeps a swapped replacement, a copy across
 \ filesystems frees its slot, and a reset slot replays to offset 0; then
-\ local.rs's install tests and each install outcome and replacement
+\ local.rs's install tests, each install outcome, an install a directory
+\ or an unreadable file at its stage's name blocks, and each replacement
 \ preparation; then that directory effects never overwrite or recurse,
 \ that a delete's replay keeps a raced edit, and each delete, directory
 \ and conflict outcome. A case that makes files works in its own
@@ -2084,6 +2085,32 @@ variable REMAINING
    s" each install outcome is reached" T-LABEL
    [: INSTALL-CASES ;] IN-CASE-DIR ;
 
+\ A directory at the stage's name blocks the install and stays.
+: DIRECTORY-STAGE ( fd -- )
+   {: root:fd :}
+   s" dir.txt" STAGE-NAME$ {: sn:^ snu:n :}
+   sn snu AT FS:MAKE-DIR
+   root s" dir.txt" NO-CONTENT INSTALL
+   sn snu AT T$= s" stage-destination-occupied" T$=
+   sn snu AT KIND FS:S-IFDIR T= ;
+
+\ A file Omabox cannot read at the stage's name blocks the install and
+\ keeps its bytes.
+: UNREADABLE-STAGE ( fd -- )
+   {: root:fd :}
+   s" denied.txt" STAGE-NAME$ {: sn:^ snu:n :}
+   sn snu s" mutant" PUT-FILE
+   sn snu AT 0 FS:CHMOD-MODE
+   [: root s" denied.txt" NO-CONTENT INSTALL
+      sn snu AT T$= s" stage-destination-occupied" T$= ;]
+   [: sn snu AT MODE-0700 FS:CHMOD-MODE ;] finally
+   sn snu READ$ s" mutant" T$= ;
+
+\ Rust's inspect_download_stage throws for both, failing the pass.
+: OBJECT-AT-STAGE-NAME-BLOCKS-ONLY-ITS-INSTALL ( -- )
+   s" an object at a stage's name blocks only its install" T-LABEL
+   [: dup DIRECTORY-STAGE UNREADABLE-STAGE ;] IN-CASE-DIR ;
+
 : PREPARE-CASES ( fd -- )
    {: root:fd :}
    s" prep.txt" s" old" PUT-FILE
@@ -2430,6 +2457,7 @@ variable OPEN-FDS
    INSTALLED-DOWNLOAD-CLEANUP-REPLAYS-AROUND-PARTIAL-MARKER-REMOVAL
    RENAMED-DOWNLOAD-REQUIRES-ITS-OWNERSHIP-MARKER
    EACH-INSTALL-OUTCOME-IS-REACHED
+   OBJECT-AT-STAGE-NAME-BLOCKS-ONLY-ITS-INSTALL
    EACH-REPLACEMENT-PREPARATION-IS-REACHED
    COMPLETE-DISPOSABLE-DOWNLOAD-CLOSES-ITS-PARENT
    DIRECTORY-EFFECTS-ARE-NONOVERWRITING-AND-NONRECURSIVE

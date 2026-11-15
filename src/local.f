@@ -716,38 +716,70 @@ private
       some OF ENDOF
    ;MATCH ;
 
-\ True when a regular file is at the name, false when nothing is.
-: PROBE ( fd ^u8 n ^u8 n ^u8 n -- bool )
-   {: dir:fd name:^ nu:n p:^ u:n o:^ ou:n :}
-   dir name nu FS:TRY-OPEN-ENTRY-AT MATCH option
-      none OF FS:ERRNO FS:ENOENT <> if o ou p u IO-FAILURE then false
-      ENDOF
-      some OF {: probe:fd :}
-         probe p u o ou E-IO E-UNSUPPORTED REGULAR-STAT DROP-STAT
-         probe DISCARD true
-      ENDOF
-   ;MATCH ;
+\ What a name holds: nothing, a regular file open for reading, an object
+\ not a regular file, or a file Omabox cannot read.
+ENUM name-entry
+   VARIANT absent ;VARIANT
+   VARIANT regular FIELD file opened ;VARIANT
+   VARIANT unsupported ;VARIANT
+   VARIANT unreadable ;VARIANT
+;ENUM
 
-: OPEN-READ ( fd ^u8 n ^u8 n ^u8 n -- option<opened> )
+\ A failed open is an io failure unless nothing is at the name.
+: MISSING-OR-FAILS ( ^u8 n ^u8 n -- )
+   {: p:^ u:n o:^ ou:n :}
+   FS:ERRNO FS:ENOENT <> if o ou p u IO-FAILURE then ;
+
+\ The stat of the open entry; a failed stat closes it.
+: STAT-CLOSING ( fd ^u8 n ^u8 n -- stat )
+   {: f:fd p:^ u:n o:^ ou:n :}
+   NO-STAT f [: DROP-STAT f p u o ou STAT-FD ;] CLOSING ;
+
+\ Whether the probed entry is a regular file; closes the probe.
+: PROBED-REGULAR? ( fd ^u8 n ^u8 n -- bool )
+   {: probe:fd p:^ u:n o:^ ou:n :}
+   probe p u o ou STAT-CLOSING probe DISCARD REGULAR? ;
+
+\ The entry open for reading, closed unless it is a regular file.
+: OPENED-ENTRY ( fd ^u8 n ^u8 n -- name-entry )
+   {: f:fd p:^ u:n o:^ ou:n :}
+   f p u o ou STAT-CLOSING {: st:stat :}
+   st REGULAR? 0= if f DISCARD NAME-ENTRY-UNSUPPORTED exit then
+   f st OPENED-MAKE NAME-ENTRY-REGULAR ;
+
+: OPEN-READ ( fd ^u8 n ^u8 n ^u8 n -- name-entry )
    {: dir:fd name:^ nu:n p:^ u:n o:^ ou:n :}
    dir name nu FS:TRY-OPEN-READ-AT MATCH option
-      none OF FS:ERRNO {: e:n :}
-         e FS:EACCES = if p u UNREADABLE then
-         e FS:ENOENT <> if o ou p u IO-FAILURE then
-         OPTION:NONE
+      none OF FS:ERRNO FS:EACCES = if NAME-ENTRY-UNREADABLE
+         else p u o ou MISSING-OR-FAILS NAME-ENTRY-ABSENT then
       ENDOF
-      some OF {: f:fd :}
-         f f p u o ou E-IO E-UNSUPPORTED REGULAR-STAT OPENED-MAKE
-         OPTION:SOME
+      some OF p u o ou OPENED-ENTRY ENDOF
+   ;MATCH ;
+
+\ What the name holds, probed without following a symlink, then opened
+\ for reading when a regular file is there.
+: OPEN-NAMED ( fd ^u8 n ^u8 n ^u8 n -- name-entry )
+   {: dir:fd name:^ nu:n p:^ u:n o:^ ou:n :}
+   dir name nu FS:TRY-OPEN-ENTRY-AT MATCH option
+      none OF p u o ou MISSING-OR-FAILS NAME-ENTRY-ABSENT ENDOF
+      some OF {: probe:fd :}
+         probe p u o ou PROBED-REGULAR? if
+            dir name nu p u o ou OPEN-READ
+         else NAME-ENTRY-UNSUPPORTED then
       ENDOF
    ;MATCH ;
 
-\ The regular file at the name, none when nothing is there.
+\ The regular file at the name, none when nothing is there; another
+\ object throws E-UNSUPPORTED, a file Omabox cannot read E-UNREADABLE.
 : OPEN-REGULAR-AT-IF-PRESENT
    ( fd ^u8 n ^u8 n ^u8 n -- option<opened> )
    {: dir:fd name:^ nu:n p:^ u:n o:^ ou:n :}
-   dir name nu p u o ou PROBE 0= if OPTION:NONE exit then
-   dir name nu p u o ou OPEN-READ ;
+   dir name nu p u o ou OPEN-NAMED MATCH name-entry
+      absent OF OPTION:NONE ENDOF
+      regular OF OPTION:SOME ENDOF
+      unsupported OF p u E-UNSUPPORTED UNSUPPORTED-FAILS ENDOF
+      unreadable OF p u UNREADABLE ENDOF
+   ;MATCH ;
 
 \ Hashes the opened file, closing it on a throw.
 : HASH-OPENED ( opened ^u8 n ^u8 n ^ARENA:arena -- hashed )
@@ -1953,15 +1985,21 @@ $100 constant MODE-READ-ONLY
    f after VERIFIED-DOWNLOAD-STAGE-MAKE DOWNLOAD-STAGE-VERIFIED ;
 
 \ The stage at the name in dir for target's content want: none, an owned
-\ stage verified and left open, or another file, kept as it was.
+\ stage verified and left open, or, kept as it was, another file, an
+\ object not a regular file or a file Omabox cannot read. Rust's throws
+\ for the last two and fails the pass; here they block only this plan.
 : INSPECT-DOWNLOAD-STAGE
    ( fd ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- download-stage )
    {: dir:fd name:^ nu:n p:^ u:n t:^ tu:n want:DROPBOX:hash
       ar:^ARENA:arena :}
-   dir name nu p u s" verify owned download stage" ar
-   OPEN-AND-HASH-IF-PRESENT MATCH option
-      none OF DOWNLOAD-STAGE-MISSING ENDOF
-      some OF p u t tu want ar INSPECT-HASHED ENDOF
+   s" verify owned download stage" {: o:^ ou:n :}
+   dir name nu p u o ou OPEN-NAMED MATCH name-entry
+      absent OF DOWNLOAD-STAGE-MISSING ENDOF
+      regular OF p u o ou ar HASH-OPENED
+         p u t tu want ar INSPECT-HASHED
+      ENDOF
+      unsupported OF p u >str DOWNLOAD-STAGE-DESTINATION-OCCUPIED ENDOF
+      unreadable OF p u >str DOWNLOAD-STAGE-DESTINATION-OCCUPIED ENDOF
    ;MATCH ;
 
 \ ---- changed guards
