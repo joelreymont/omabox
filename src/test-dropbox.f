@@ -7,11 +7,12 @@
 \ refresh token, and one code GRANT! sets; it issues the access tokens
 \ sl.fake-1, sl.fake-2 and on, and EXPIRE expires every token issued so far.
 \ LOSE applies the next API call and loses its answer; each CUT loses one
-\ more API call's answer, before the call takes effect. REVOKE refuses every
-\ access token, issued or yet to be, as invalid until RESET; the refresh
-\ still issues them. A call must carry the Path-Root ROOT! expects, none
-\ when that is empty, else it answers 422. Scripted answers go out in order
-\ before any route's own. It records each request's path, and the last
+\ more API call's answer, before the call takes effect; GARBLE answers the
+\ next, before it takes effect, with a line that is not HTTP. REVOKE refuses
+\ every access token, issued or yet to be, as invalid until RESET; the
+\ refresh still issues them. A call must carry the Path-Root ROOT! expects,
+\ none when that is empty, else it answers 422. Scripted answers go out in
+\ order before any route's own. It records each request's path, and the last
 \ API call's Authorization, Path-Root and Content-Type.
 \ STORAGE CLASS. PROCESS-WIDE: one worker serves every request, so its handler
 \ alone writes the state while a test waits on its call, and the test sets it
@@ -91,6 +92,7 @@ variable ASKED-U
 TYPED-VARIABLE PARSER JSON:cursor
 TYPED-VARIABLE LOSING bool
 variable CUTS
+TYPED-VARIABLE GARBLING bool
 
 
 \ Copies a span into a buffer of cap bytes and answers its length.
@@ -480,11 +482,27 @@ variable HELD-U
    q SEVER true ;
 
 
+\ After GARBLE, an API call's body is read, as CUT's is, and its answer is
+\ one line that is not HTTP, then a close. libcurl, which takes no
+\ HTTP/0.9 answer, fails it with CURLE_UNSUPPORTED_PROTOCOL, a code
+\ CURL:LOST? does not take.
+: GARBLED? ( HTTP:request -- bool )
+   {: q:HTTP:request :}
+   GARBLING @ 0= if false exit then
+   q API? 0= if false exit then
+   false GARBLING !
+   q HTTP:BODY$ 2drop
+   q HTTP:TAKE-OVER 2drop {: conn:TCP4:connection :}
+   conn S\" not http\r\n" TCP4:TRANSFER-BYTES TCP4:WRITE CLOSED
+   conn TCP4:CLOSE CLOSED true ;
+
+
 : SERVE ( HTTP:request HTTP:response [ HTTP:request HTTP:response -- ] -- )
    {: q:HTTP:request a:HTTP:response route :}
    q RECORD
    a SCRIPTED? if exit then
    q CUT? if exit then
+   q GARBLED? if exit then
    q a route execute
    q LOSE? ;
 
@@ -980,15 +998,15 @@ $2100000 constant UPLOAD-CAP
 
 \ Forgets the script, the entries, the kept bytes, the pages, the long
 \ poll's answer, the sessions, the revs uploads took, a SKEW, a LOSE, the
-\ CUTs, a code GRANT! set, a REVOKE and what was sent; the tokens and the
-\ root stay.
+\ CUTs, a GARBLE, a code GRANT! set, a REVOKE and what was sent; the tokens
+\ and the root stay.
 : RESET ( -- )
    0 SCRIPTS ! 0 SCRIPTED ! 0 FILES ! 0 CONTENTS ! 0 SESSIONS ! 0 REVS !
    0 GRANT-CODE-U !
    0 SEEN-U ! 0 AUTH-U ! 0 ROOT-SENT-U ! 0 TYPE-SENT-U !
    0 ARG-SENT-U ! 0 RANGE-SENT-U !
    false ROOTED ! false TYPED ! false LEAKED ! false RANGED !
-   false SKEWED ! false LOSING ! 0 CUTS ! false REVOKED !
+   false SKEWED ! false LOSING ! 0 CUTS ! false REVOKED ! false GARBLING !
    LISTING-RESET ;
 
 
@@ -1118,6 +1136,9 @@ $2100000 constant UPLOAD-CAP
 \ One more of the next API calls' answers is lost as LOSE's is, before
 \ its route runs: CUT twice loses the next two.
 : CUT ( -- ) 1 CUTS +! ;
+\ The next API call's answer is a line that is not HTTP, before its route
+\ runs.
+: GARBLE ( -- ) true GARBLING ! ;
 \ Closes every open session: an append to one answers closed.
 : CLOSE-SESSIONS ( -- )
    SESSIONS @ 0 ?do false i SESSION-OPEN ! loop ;

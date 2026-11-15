@@ -6,9 +6,9 @@
 \ hash and uploads, whose stages are written under TMPDIR and removed once
 \ open, so no run leaves one. One server and one main client serve every
 \ case; a case that needs another config opens its own client. DROPBOX's
-\ log lines go to stderr, but a stage failure's line, which is captured
-\ under TMPDIR and checked. A stub in place of AIO's transfer fails the
-\ stage's reads. The first failed assertion ends the run.
+\ log lines go to stderr, but a stage or classifier failure's, which is
+\ captured in TMPDIR, checked and removed. A stub in place of AIO's
+\ transfer fails the stage's reads. The first failed assertion ends the run.
 \ Run from the repository root: hb --load src/dropbox-test.f </dev/null
 require src/lib/aio.f
 require src/lib/arena.f
@@ -315,6 +315,146 @@ TYPED-VARIABLE MAIN ptr DROPBOX:client
    [: ACCOUNT-DROPPED ;] DROPBOX:E-BAD-REQUEST TTHROWSQ ;
 
 
+\ ---- the classifier's other answers
+
+create ERR-PATH 256 allot
+variable ERR-PATH-U
+create ERR 512 allot
+variable ERR-U
+TYPED-VARIABLE ACTION [ -- ]
+TYPED-VARIABLE OUTCOME bool
+
+
+: ERR-PATH$ ( -- ptr u8 n ) ERR-PATH ERR-PATH-U @ ;
+: ERR$ ( -- ptr u8 n ) ERR ERR-U @ ;
+
+
+\ TMPDIR/<name> at dst; answers its length.
+: IN-TMP ( ptr u8 n ptr u8 -- n )
+   {: nm:ptr nu:n dst:ptr :}
+   s" TMPDIR" GETENV {: d:ptr du:n :}
+   d dst du BYTE-COPY
+   47 dst du + c!
+   nm dst du + 1+ nu BYTE-COPY
+   du 1+ nu + ;
+
+
+\ The code xt throws, 0 for none, with fd 2 sent to TMPDIR/stderr.txt,
+\ which ERR$ then holds and which is removed.
+: LOGGED ( [ -- ] -- n )
+   ACTION !
+   s" stderr.txt" ERR-PATH IN-TMP ERR-PATH-U !
+   ERR-PATH$ STDERR:CAPTURE
+   [: ACTION @ catch ;] [: STDERR:;CAPTURE ;] finally
+   ERR-PATH$ ERR 512 FS:READ-ALL ERR-U !
+   ERR-PATH$ FS:REMOVE-FILE ;
+
+
+: LINES ( ptr u8 n -- n )
+   {: a:ptr u:n :}
+   0 u 0 ?do a i + c@ 10 = if 1+ then loop ;
+
+
+\ ERR$ is one line that holds the text.
+: LOGGED? ( ptr u8 n -- bool )
+   {: t:ptr tu:n :}
+   ERR$ LINES 1 = ERR$ t tu CONTAINS? and ;
+
+
+: METADATA-DROPPED ( -- ) s" /docs/a.txt" MAIN @ DROPBOX:METADATA DONE? drop ;
+
+
+\ A write Dropbox is too busy to take is retried at once.
+: WRITE-BUSY-CASE ( -- )
+   s" too many write operations" T-LABEL
+   TEST-DROPBOX:RESET
+   409 s" " s" "
+   S\" {\qerror_summary\q:\qpath_write/too_many_write_operations/...\q,\qerror\q:{\q.tag\q:\qpath_write\q,\qpath_write\q:{\q.tag\q:\qtoo_many_write_operations\q}}}"
+   TEST-DROPBOX:SCRIPT!
+   s" /busy.txt" s" " MAIN @ DROPBOX:DELETE RETRY-MS 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2" T$= ;
+
+
+: METADATA-OTHER ( -- )
+   s" /docs/a.txt" MAIN @ DROPBOX:METADATA
+   DROPBOX-ERROR:other REFUSED? OUTCOME ! ;
+
+
+: UNKNOWN-TAG-CASE ( -- )
+   s" refusal of an unknown tag" T-LABEL
+   TEST-DROPBOX:RESET
+   409 s" " s" "
+   S\" {\qerror_summary\q:\qpath/new_tag/\q,\qerror\q:{\q.tag\q:\qpath\q,\qpath\q:{\q.tag\q:\qnew_tag\q}}}"
+   TEST-DROPBOX:SCRIPT!
+   false OUTCOME !
+   [: METADATA-OTHER ;] LOGGED 0 T=
+   OUTCOME @ TTRUE
+   s" warn dropbox: files/get_metadata refused: new_tag" LOGGED? TTRUE ;
+
+
+: UNPARSED-ERROR-CASE ( -- )
+   s" refusal that does not parse" T-LABEL
+   TEST-DROPBOX:RESET
+   409 s" " s" " s" not json" TEST-DROPBOX:SCRIPT!
+   [: METADATA-DROPPED ;] LOGGED DROPBOX:E-ANSWER T=
+   s" error dropbox: files/get_metadata answered 409: an error that does not parse"
+   LOGGED? TTRUE ;
+
+
+\ The fake answers 422 to a call whose Path-Root is not the one it expects.
+: WRONG-ROOT-CASE ( -- )
+   s" path root refused" T-LABEL
+   TEST-DROPBOX:RESET
+   s" live-token" s" ns-wrong" OPENED {: off :}
+   off DROPBOX:ACCOUNT DROPBOX-ERROR:invalid-root REFUSED? ASSERT
+   TEST-DROPBOX:SEEN$ s" /oauth2/token /2/users/get_current_account" T$=
+   off DROPBOX:CLOSE ;
+
+
+: TIMEOUT-CASE ( -- )
+   s" request timeout" T-LABEL
+   TEST-DROPBOX:RESET
+   408 s" " s" " s" " TEST-DROPBOX:SCRIPT!
+   MAIN @ DROPBOX:ACCOUNT RETRY-MS 0 T= ;
+
+
+: TEAPOT-CASE ( -- )
+   s" unexpected status" T-LABEL
+   TEST-DROPBOX:RESET
+   418 s" " s" " s" " TEST-DROPBOX:SCRIPT!
+   [: ACCOUNT-DROPPED ;] LOGGED DROPBOX:E-STATUS T=
+   s" error dropbox: users/get_current_account answered 418: an unexpected status"
+   LOGGED? TTRUE ;
+
+
+: UNPARSED-ANSWER-CASE ( -- )
+   s" answer that does not parse" T-LABEL
+   TEST-DROPBOX:RESET
+   200 s" " s" " s" not json" TEST-DROPBOX:SCRIPT!
+   [: METADATA-DROPPED ;] LOGGED DROPBOX:E-ANSWER T=
+   s" error dropbox: files/get_metadata answered 200: an answer that does not parse"
+   LOGGED? TTRUE ;
+
+
+\ libcurl takes no HTTP/0.9 answer: CURLE_UNSUPPORTED_PROTOCOL, 1, which
+\ is not a lost exchange.
+: GARBLED-CASE ( -- )
+   s" transport failure" T-LABEL
+   TEST-DROPBOX:RESET
+   TEST-DROPBOX:GARBLE
+   [: METADATA-DROPPED ;] LOGGED DROPBOX:E-TRANSPORT T=
+   1 CURL:>CODE CURL:LOST? TFALSE
+   SB-RESET s" error dropbox: curl files/get_metadata: " SB-APPEND
+   1 CURL:>CODE CURL:ERROR$ SB-APPEND
+   SB$ LOGGED? TTRUE
+   TEST-DROPBOX:SEEN$ s" /2/files/get_metadata" T$= ;
+
+
+: CLASSIFY-CASES ( -- )
+   WRITE-BUSY-CASE UNKNOWN-TAG-CASE UNPARSED-ERROR-CASE WRONG-ROOT-CASE
+   TIMEOUT-CASE TEAPOT-CASE UNPARSED-ANSWER-CASE GARBLED-CASE ;
+
+
 \ ---- list_folder, list_folder/continue and list_folder/longpoll
 
 256 constant GOT-CAP
@@ -434,6 +574,17 @@ variable GOT-U
    true 5 WAITED
    MAIN @ DROPBOX:CHANGED? TTRUE
    MAIN @ DROPBOX:BACKOFF 5 T= ;
+
+
+\ A long poll on a cursor Dropbox no longer takes is refused, unread.
+: POLL-RESET-CASE ( -- )
+   s" long poll reset" T-LABEL
+   LISTING
+   409 s" " s" "
+   S\" {\qerror_summary\q:\qreset/\q,\qerror\q:{\q.tag\q:\qreset\q}}"
+   TEST-DROPBOX:SCRIPT!
+   s" c3" 30 MAIN @ DROPBOX:WAIT DROPBOX-ERROR:reset REFUSED? ASSERT
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder/longpoll" T$= ;
 
 
 \ ---- files/download
@@ -686,10 +837,6 @@ TYPED-VARIABLE UP DROPBOX:upload
 create STAGE 256 allot
 variable STAGE-U
 create EXPECTED 64 allot
-create ERR-PATH 256 allot
-variable ERR-PATH-U
-create ERR 512 allot
-variable ERR-U
 variable SHOWN
 variable SHOWS
 \ The count of accepted bytes at which FAULT strikes, -1 for none, and
@@ -731,16 +878,6 @@ TYPED-VARIABLE FAULT fault
 
 
 : STAGE$ ( -- ptr u8 n ) STAGE STAGE-U @ ;
-
-
-\ TMPDIR/<name> at dst; answers its length.
-: IN-TMP ( ptr u8 n ptr u8 -- n )
-   {: nm:ptr nu:n dst:ptr :}
-   s" TMPDIR" GETENV {: d:ptr du:n :}
-   d dst du BYTE-COPY
-   47 dst du + c!
-   nm dst du + 1+ nu BYTE-COPY
-   du 1+ nu + ;
 
 
 \ TMPDIR/<name>, made fresh.
@@ -883,18 +1020,8 @@ TYPED-VARIABLE FAULT fault
    UNSTAGED ;
 
 
-: ERR-PATH$ ( -- ptr u8 n ) ERR-PATH ERR-PATH-U @ ;
-: ERR$ ( -- ptr u8 n ) ERR ERR-U @ ;
-
-
-\ The code SEND throws, 0 for none, with fd 2 sent to TMPDIR/stderr.txt,
-\ which ERR$ then holds and which is then removed.
-: LOGGED ( -- n )
-   s" stderr.txt" ERR-PATH IN-TMP ERR-PATH-U !
-   ERR-PATH$ STDERR:CAPTURE
-   [: [: SEND DONE? drop ;] catch ;] [: STDERR:;CAPTURE ;] finally
-   ERR-PATH$ ERR 512 FS:READ-ALL ERR-U !
-   ERR-PATH$ FS:REMOVE-FILE ;
+\ The code SEND throws, 0 for none, with what it logged in ERR$.
+: SEND-LOGGED ( -- n ) [: SEND DONE? drop ;] LOGGED ;
 
 
 \ ERR$ holds the line UPLOAD logs for a failure of UP's stage.
@@ -912,7 +1039,7 @@ TYPED-VARIABLE FAULT fault
    TEST-DROPBOX:RESET -1 FAULT-AT !
    s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
    20 UP DROPBOX-UPLOAD:SIZE !
-   LOGGED DROPBOX:E-STAGE T=
+   SEND-LOGGED DROPBOX:E-STAGE T=
    s" the stage is shorter than its size" STAGE-LOGGED? TTRUE
    TEST-DROPBOX:SEEN$ s" " T$=
    UNSTAGED ;
@@ -924,7 +1051,7 @@ TYPED-VARIABLE FAULT fault
    TEST-DROPBOX:RESET -1 FAULT-AT !
    s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
    UNSTAGED STAGE$ FS:OPEN-APPEND-FD >FD UP DROPBOX-UPLOAD:FD !
-   LOGGED DROPBOX:E-STAGE T=
+   SEND-LOGGED DROPBOX:E-STAGE T=
    s" the stage's read was refused, errno 9" STAGE-LOGGED? TTRUE
    TEST-DROPBOX:SEEN$ s" " T$=
    UNSTAGED ;
@@ -934,7 +1061,7 @@ TYPED-VARIABLE FAULT fault
 \ says, and its log in ERR$; the real transfer is back however SEND ends.
 : READ-FAILED ( read-fault -- n )
    UP DROPBOX-UPLOAD:FD @ FD>N swap FAIL-READS
-   [: LOGGED ;] [: ;FAIL-READS ;] finally ;
+   [: SEND-LOGGED ;] [: ;FAIL-READS ;] finally ;
 
 
 \ The stage, readied for a single upload with no fault from the fake.
@@ -1096,7 +1223,7 @@ TYPED-VARIABLE FAULT fault
    s" session stage shorter than its size" T-LABEL
    TEST-DROPBOX:RESET -1 FAULT-AT !
    CHUNK 2 + UP DROPBOX-UPLOAD:SIZE !
-   LOGGED DROPBOX:E-STAGE T=
+   SEND-LOGGED DROPBOX:E-STAGE T=
    s" the stage is shorter than its size" STAGE-LOGGED? TTRUE
    SB-RESET S-START S-APPEND S-APPEND
    TEST-DROPBOX:SEEN$ SB$ T$=
@@ -1139,7 +1266,8 @@ TYPED-VARIABLE FAULT fault
    ACCOUNT-CASE FILE-CASE MISSING-CASE ROOT-CASE EXPIRED-CASE
    UNLINKED-CASE REVOKED-CASE DENIED-CASE REFUSED-AGAIN-CASE
    RATE-CASE BUSY-CASE REDIRECT-CASE BAD-REQUEST-CASE
-   PAGES-CASE RESET-CASE STALL-CASE UNTAGGED-CASE POLL-CASE
+   CLASSIFY-CASES
+   PAGES-CASE RESET-CASE STALL-CASE UNTAGGED-CASE POLL-CASE POLL-RESET-CASE
    DOWNLOAD-CASES
    DELETE-CONFLICT-CASE DELETE-MISSING-CASE DELETE-GONE-CASE
    LOST-DELETE-CASE
