@@ -712,3 +712,65 @@ min, final sigma 4.8 min, STATUS fold 2.6 min, JOURNAL parts 4 and 5
 6.8 and 6.4 min, MODEL fold 1.5 min, LOCAL stage 9.8 min, AUTH 8.7 min,
 CONFIG fold 8.6 min, the JOURNAL merge 11 min over two rounds. Reviews
 take longer than lanes: CONFIG 16 min, MODEL 17 min, rotation 14.6 min.
+
+## 2026-11-16: Option payloads, error codes and one lock fewer
+
+Rust's `InstallOutcome::PreconditionChanged { actual: Option<ContentIdentity> }`
+could not be written. A Habu STRUCTURE field takes `option<DROPBOX:hash>`,
+but an ENUM payload does not: its declaration parser resolves only bare
+names, while STRUCTURE has a full parser for applied types. Two LOCAL
+lanes hit this within minutes of each other. Both stopped to report it
+and offered the same three workarounds: wrap the option in a structure,
+add a type parameter with only one use, or split the variant in two.
+Instead, Habu now lets ENUM call STRUCTURE's type parser, so the outcome
+stays one variant with an option payload, as in Rust. The first worker
+on that change also stopped. The parser it was told to reuse was
+private, and it read STRUCTURE's own declaration state, so reusing it
+needed an entry point nobody had named. Rust never hits this, because
+an enum variant takes any type a struct field takes.
+
+Rust's reconcile asks `upload_source_changed(&error, path)`. That
+function matches the error's variant, its path and the name of the
+operation that failed, and it decides whether a failure means "look
+again" or "report it". A Habu throw carries only a number. Two stage
+races share E-CHANGED with a source race, so no test on the code could
+tell them apart. In Habu the throw site decides: the source's open and
+the race checks on the source now throw E-SOURCE-CHANGED, and the
+caller compares that one code. Rust reconstructs the classification
+after the fact from data carried in the error. Habu picks it where the
+failure happens, so the classifier function goes away.
+
+Habu's card says the library that sees an external failure logs it
+once, just before it throws. Rust logs at the boundary, so a race the
+caller handles leaves no trace. In Habu the same race leaves one error
+line before the caller treats it as routine. The two daemons'
+journalctl output differs here, by design on each side.
+
+`SyncRootAccess` is an `RwLock` that keeps Rust's parallel download
+workers out of the way of a scan or a root mutation. Habu syncs on one
+task, so nothing can run beside a mutation, and the lock was not
+ported. Its six `_with_access` functions became the plain ones, and two
+Rust tests of the lock have nothing left to test.
+
+Rust marks test-only journal methods `#[cfg(test)]`. The Habu port put
+two of them in production code, because a Forth file has no such mark.
+They now live in `src/test-journal.f`, beside the fake Dropbox server
+in `src/test-dropbox.f`, and REPLAY's tests will share them.
+
+MODEL and AUTH each built serde's struct read: an object's member must
+be present exactly once, and unknown members, repeated ones included,
+are skipped. Habu's JSON library had two of the three pieces, but its
+repeated-key check refuses unknown repeats, which serde accepts. That
+whole rule is now one JSON word, and both packages call it.
+
+Five LOCAL lanes started from one base and ran in parallel. Each one
+wrote its own private JOIN for paths, so there were five definitions
+with four behaviours. One of them, borrowed from a Habu file-system
+word, turned an empty parent into an absolute path. Two lanes also
+named two unrelated words STAGE-IN. Each lane loaded and passed its
+tests alone. The merge is where it showed: a package has one wordlist,
+so a second definition of a name is refused. The merge worker stopped
+with seven such names. In Rust, `Path::join` comes from the standard
+library, so no lane writes one. The two STAGE-IN words were helpers the
+workers named; the Rust functions they serve, stage_upload_at and
+stage_download_at, already had distinct names.
