@@ -68,7 +68,9 @@ impl XdgDirectories {
     }
 }
 
-/// Validated paths used by one Omabox instance.
+/// Paths owned by one Omabox instance. [`Config`] holds them only after
+/// checking they lie outside its sync root; [`Paths::resolve_private`] does not
+/// check.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Paths {
     config_directory: PathBuf,
@@ -80,7 +82,14 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// Resolve every path this instance owns.
+    /// Resolve every path this instance owns and check each lies outside `sync_root`.
+    fn resolve(xdg: &XdgDirectories, sync_root: &Path) -> Result<Self, ConfigError> {
+        let paths = Self::resolve_private(xdg)?;
+        paths.validate_outside(sync_root)?;
+        Ok(paths)
+    }
+
+    /// Resolve every path this instance owns, without checking them against a sync root.
     ///
     /// The staging and recovery directories are the ones opened with
     /// `RESOLVE_NO_SYMLINKS`, so a symlinked XDG ancestor or leaf would make
@@ -93,13 +102,7 @@ impl Paths {
     /// ancestor. The configuration directory stays lexical: it is read and
     /// written with symlink-following calls, so a user may keep it in a
     /// dotfiles tree.
-    fn resolve(xdg: &XdgDirectories, sync_root: &Path) -> Result<Self, ConfigError> {
-        let paths = Self::resolve_private(xdg)?;
-        paths.validate_outside(sync_root)?;
-        Ok(paths)
-    }
-
-    fn resolve_private(xdg: &XdgDirectories) -> Result<Self, ConfigError> {
+    pub fn resolve_private(xdg: &XdgDirectories) -> Result<Self, ConfigError> {
         let state = xdg.application_state_directory();
         Ok(Self {
             config_directory: lexical_normalize(&xdg.config_directory()),
@@ -216,11 +219,60 @@ pub struct Config {
     paths: Paths,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ConfigDocument {
+/// Stored non-secret configuration, read without touching the sync root.
+///
+/// Loading checks only that `sync_root` is absolute and `dropbox_app_key` is
+/// non-empty, so the stored settings stay readable while the root is
+/// unavailable. [`Config::validate`] resolves the root and the state paths.
+/// Built only through `checked`, so every value passed those checks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigDocument {
     sync_root: PathBuf,
     dropbox_app_key: String,
+}
+
+/// On-disk form of the configuration file, unchecked.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredDocument {
+    sync_root: PathBuf,
+    dropbox_app_key: String,
+}
+
+impl ConfigDocument {
+    /// Load the stored configuration using the process XDG environment.
+    pub fn load() -> Result<Self, ConfigError> {
+        Self::load_from(&XdgDirectories::from_environment()?)
+    }
+
+    /// Load the stored configuration from explicit XDG base directories.
+    pub fn load_from(xdg: &XdgDirectories) -> Result<Self, ConfigError> {
+        let document = read_config_document(xdg)?;
+        Self::checked(document.sync_root, document.dropbox_app_key)
+    }
+
+    fn checked(sync_root: PathBuf, dropbox_app_key: String) -> Result<Self, ConfigError> {
+        let sync_root = require_absolute("sync_root", sync_root)?;
+        if dropbox_app_key.trim().is_empty() {
+            return Err(ConfigError::EmptyDropboxAppKey);
+        }
+        Ok(Self {
+            sync_root,
+            dropbox_app_key,
+        })
+    }
+
+    /// Stored local sync root, absolute and lexically normalized but not resolved.
+    #[must_use]
+    pub fn sync_root(&self) -> &Path {
+        &self.sync_root
+    }
+
+    /// Public Dropbox application key used for OAuth.
+    #[must_use]
+    pub fn dropbox_app_key(&self) -> &str {
+        &self.dropbox_app_key
+    }
 }
 
 impl Config {
@@ -231,26 +283,7 @@ impl Config {
 
     /// Load configuration from explicit XDG base directories.
     pub fn load_from(xdg: &XdgDirectories) -> Result<Self, ConfigError> {
-        let document = read_config_document(xdg)?;
-        Self::from_values(xdg, document.sync_root, document.dropbox_app_key)
-    }
-
-    /// Load settings needed to replace an unavailable configured sync root.
-    ///
-    /// The stored root remains unresolved because the caller will validate a
-    /// selected replacement before writing it. XDG state paths and all other
-    /// configuration fields are still validated.
-    pub fn load_for_root_change_from(xdg: &XdgDirectories) -> Result<Self, ConfigError> {
-        let document = read_config_document(xdg)?;
-        let sync_root = require_absolute("sync_root", document.sync_root)?;
-        if document.dropbox_app_key.trim().is_empty() {
-            return Err(ConfigError::EmptyDropboxAppKey);
-        }
-        Ok(Self {
-            sync_root,
-            dropbox_app_key: document.dropbox_app_key,
-            paths: Paths::resolve_private(xdg)?,
-        })
+        Self::validate(&ConfigDocument::load_from(xdg)?, xdg)
     }
 
     /// Validate a configuration supplied by a setup or settings command.
@@ -259,16 +292,17 @@ impl Config {
         sync_root: impl Into<PathBuf>,
         dropbox_app_key: impl Into<String>,
     ) -> Result<Self, ConfigError> {
-        let requested_root = require_absolute("sync_root", sync_root.into())?;
-        let dropbox_app_key = dropbox_app_key.into();
-        if dropbox_app_key.trim().is_empty() {
-            return Err(ConfigError::EmptyDropboxAppKey);
-        }
-        let sync_root = canonicalize_sync_root(&requested_root)?;
+        let document = ConfigDocument::checked(sync_root.into(), dropbox_app_key.into())?;
+        Self::validate(&document, xdg)
+    }
+
+    /// Resolve a stored configuration's sync root and check the state paths lie outside it.
+    pub fn validate(document: &ConfigDocument, xdg: &XdgDirectories) -> Result<Self, ConfigError> {
+        let sync_root = canonicalize_sync_root(document.sync_root())?;
         let paths = Paths::resolve(xdg, &sync_root)?;
         Ok(Self {
             sync_root,
-            dropbox_app_key,
+            dropbox_app_key: document.dropbox_app_key.clone(),
             paths,
         })
     }
@@ -307,7 +341,7 @@ impl Config {
     }
 
     fn write_with_replacement(&self, replace_existing: bool) -> Result<(), ConfigError> {
-        let document = ConfigDocument {
+        let document = StoredDocument {
             sync_root: self.sync_root.clone(),
             dropbox_app_key: self.dropbox_app_key.clone(),
         };
@@ -320,13 +354,13 @@ impl Config {
     }
 }
 
-fn read_config_document(xdg: &XdgDirectories) -> Result<ConfigDocument, ConfigError> {
+fn read_config_document(xdg: &XdgDirectories) -> Result<StoredDocument, ConfigError> {
     let config_file = xdg.config_file();
     let contents = fs::read_to_string(&config_file).map_err(|source| ConfigError::Read {
         path: config_file.clone(),
         source,
     })?;
-    toml::from_str::<ConfigDocument>(&contents).map_err(|mut source| {
+    toml::from_str::<StoredDocument>(&contents).map_err(|mut source| {
         source.set_input(None);
         ConfigError::Parse {
             path: config_file,
@@ -1036,7 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn root_change_loads_settings_when_the_recorded_root_is_unavailable()
+    fn document_loads_when_the_recorded_root_is_unavailable()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_temporary, xdg, sync_root) = fixture()?;
         write_config(&xdg, &sync_root)?;
@@ -1047,10 +1081,10 @@ mod tests {
             Config::load_from(&xdg),
             Err(ConfigError::ResolveSyncRoot { .. })
         ));
-        let settings = Config::load_for_root_change_from(&xdg)?;
-        assert_eq!(settings.sync_root(), sync_root);
-        assert_eq!(settings.dropbox_app_key(), "test-app-key");
-        assert_eq!(settings.paths(), available.paths());
+        let document = ConfigDocument::load_from(&xdg)?;
+        assert_eq!(document.sync_root(), sync_root);
+        assert_eq!(document.dropbox_app_key(), "test-app-key");
+        assert_eq!(&Paths::resolve_private(&xdg)?, available.paths());
         Ok(())
     }
 

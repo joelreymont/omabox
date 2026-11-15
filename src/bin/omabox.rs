@@ -3,13 +3,15 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{self, BufRead, Write as _};
+use std::io::{self, BufRead, Write};
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 
 use miette::Diagnostic;
 use omabox::auth::{AuthError, AuthorizationGrant, OAuthClient, RefreshToken, RefreshTokenStore};
-use omabox::config::{Config, ConfigError, InstanceLock, LockError, XdgDirectories};
+use omabox::config::{
+    Config, ConfigDocument, ConfigError, InstanceLock, LockError, Paths, XdgDirectories,
+};
 use omabox::dropbox::{DropboxClient, DropboxError, DropboxLink, DropboxRoot};
 use omabox::install::{InstallAction, InstallError};
 use omabox::journal::{
@@ -39,15 +41,19 @@ fn main() -> miette::Result<()> {
 fn run(arguments: impl IntoIterator<Item = OsString>) -> Result<(), CliError> {
     let command = parse(arguments)?;
     match command {
-        Command::Help => write_stdout(HELP),
-        Command::Version => write_stdout(concat!("omabox ", env!("CARGO_PKG_VERSION"), "\n")),
+        Command::Help => write_to(io::stdout().lock(), HELP, "write command output"),
+        Command::Version => write_to(
+            io::stdout().lock(),
+            concat!("omabox ", env!("CARGO_PKG_VERSION"), "\n"),
+            "write command output",
+        ),
         Command::Setup(options) => setup(options, &ServiceCommands::default()),
         Command::Status => show_status(),
         Command::Settings { json } => show_settings(json),
         Command::SetRoot(path) => set_sync_root_from_environment(&path),
         Command::Install(action) => {
             let report = omabox::install::execute(action).map_err(CliError::Install)?;
-            write_stdout(&report)
+            write_to(io::stdout().lock(), &report, "write command output")
         }
         Command::Service(action) => run_service(action, &ServiceCommands::default()),
         Command::Logs => ServiceCommands::default().logs().map_err(CliError::Service),
@@ -306,10 +312,14 @@ fn authorize(config: &Config, remote_root: &str) -> Result<Authorized, CliError>
         operation: "start Dropbox authorization",
         source,
     })?;
-    write_stdout(&format!(
-        "Open this URL in a browser:\n{}\n\nPaste the authorization code: ",
-        pending.authorization_url()
-    ))?;
+    write_to(
+        io::stdout().lock(),
+        &format!(
+            "Open this URL in a browser:\n{}\n\nPaste the authorization code: ",
+            pending.authorization_url()
+        ),
+        "write command output",
+    )?;
     let code = read_authorization_code(io::stdin().lock())?;
     let AuthorizationGrant {
         access_token,
@@ -406,9 +416,36 @@ where
 }
 
 fn show_status() -> Result<(), CliError> {
-    let config = Config::load().map_err(config_error("load configuration"))?;
-    let output = status::render(config.paths().journal_file()).map_err(CliError::Status)?;
-    write_stdout(&output)
+    let xdg = XdgDirectories::from_environment().map_err(config_error("resolve XDG paths"))?;
+    write_to(
+        io::stdout().lock(),
+        &status_output(&xdg)?,
+        "write command output",
+    )
+}
+
+/// Explain the journal's state; an unusable sync root is reported, not fatal.
+fn status_output(xdg: &XdgDirectories) -> Result<String, CliError> {
+    let document = ConfigDocument::load_from(xdg).map_err(config_error("load configuration"))?;
+    let paths = Paths::resolve_private(xdg).map_err(config_error("resolve state paths"))?;
+    let mut output = status::render(paths.journal_file()).map_err(CliError::Status)?;
+    if let Some(line) = unusable_root_line(&document, xdg) {
+        output.push_str(&line);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+/// Why the stored sync root fails validation, with its whole cause chain.
+fn unusable_root_line(document: &ConfigDocument, xdg: &XdgDirectories) -> Option<String> {
+    let error = Config::validate(document, xdg).err()?;
+    let mut line = format!("Sync root unusable: {error}");
+    let mut reason: &(dyn std::error::Error + 'static) = &error;
+    while let Some(source) = reason.source() {
+        line.push_str(&format!(": {source}"));
+        reason = source;
+    }
+    Some(line)
 }
 
 #[derive(Serialize)]
@@ -418,11 +455,30 @@ struct SettingsDocument<'config> {
 }
 
 fn show_settings(json: bool) -> Result<(), CliError> {
-    let config = Config::load().map_err(config_error("load configuration"))?;
-    let output = if json {
+    let xdg = XdgDirectories::from_environment().map_err(config_error("resolve XDG paths"))?;
+    let (output, unusable) = settings_output(&xdg, json)?;
+    write_to(io::stdout().lock(), &output, "write command output")?;
+    match unusable {
+        Some(line) => write_to(
+            io::stderr().lock(),
+            &format!("{line}\n"),
+            "write command diagnostics",
+        ),
+        None => Ok(()),
+    }
+}
+
+/// Show the stored settings; an unusable sync root is reported, not fatal.
+///
+/// Returns the stdout text and, in JSON mode, the unusable-root line for
+/// stderr, so stdout stays exactly one JSON document. In text mode the line
+/// follows the settings on stdout.
+fn settings_output(xdg: &XdgDirectories, json: bool) -> Result<(String, Option<String>), CliError> {
+    let document = ConfigDocument::load_from(xdg).map_err(config_error("load configuration"))?;
+    let mut output = if json {
         let mut serialized = serde_json::to_string_pretty(&SettingsDocument {
-            sync_root: config.sync_root(),
-            dropbox_app_key: config.dropbox_app_key(),
+            sync_root: document.sync_root(),
+            dropbox_app_key: document.dropbox_app_key(),
         })
         .map_err(CliError::SerializeOutput)?;
         serialized.push('\n');
@@ -430,11 +486,19 @@ fn show_settings(json: bool) -> Result<(), CliError> {
     } else {
         format!(
             "Sync root: {}\nDropbox app key: {}\n",
-            config.sync_root().display(),
-            config.dropbox_app_key()
+            document.sync_root().display(),
+            document.dropbox_app_key()
         )
     };
-    write_stdout(&output)
+    let unusable = unusable_root_line(&document, xdg);
+    if json {
+        return Ok((output, unusable));
+    }
+    if let Some(line) = unusable {
+        output.push_str(&line);
+        output.push('\n');
+    }
+    Ok((output, None))
 }
 
 fn set_sync_root_from_environment(path: &Path) -> Result<(), CliError> {
@@ -447,8 +511,10 @@ fn set_sync_root(
     xdg: &XdgDirectories,
     services: &ServiceCommands,
 ) -> Result<(), CliError> {
-    let current = Config::load_for_root_change_from(xdg)
+    let current = ConfigDocument::load_from(xdg)
         .map_err(config_error("load configuration for sync-root change"))?;
+    let paths = Paths::resolve_private(xdg)
+        .map_err(config_error("resolve state paths for sync-root change"))?;
     let replacement = Config::from_values(xdg, path, current.dropbox_app_key())
         .map_err(config_error("validate the new sync root"))?;
 
@@ -457,7 +523,7 @@ fn set_sync_root(
         replacement.sync_root().display()
     );
     change_while_released(services, "the sync-root change", &done, || {
-        change_sync_root_while_stopped(&current, &replacement)
+        change_sync_root_while_stopped(&paths, &replacement)
     })
 }
 
@@ -505,17 +571,21 @@ where
             } else {
                 ""
             };
-            write_stdout(&format!("{done}.{note}\n"))
+            write_to(
+                io::stdout().lock(),
+                &format!("{done}.{note}\n"),
+                "write command output",
+            )
         }
     }
 }
 
-fn change_sync_root_while_stopped(current: &Config, replacement: &Config) -> Result<(), CliError> {
-    let _lock = InstanceLock::acquire(current.paths().lock_file())
-        .map_err(|source| CliError::Lock { source })?;
+fn change_sync_root_while_stopped(paths: &Paths, replacement: &Config) -> Result<(), CliError> {
+    let _lock =
+        InstanceLock::acquire(paths.lock_file()).map_err(|source| CliError::Lock { source })?;
     let binding = LocalRootBinding::inspect(replacement.sync_root())
         .map_err(|source| CliError::SyncRoot { source })?;
-    let journal_path = current.paths().journal_file();
+    let journal_path = paths.journal_file();
     let mut journal = if journal_path
         .try_exists()
         .map_err(|source| CliError::InspectJournal { source })?
@@ -575,16 +645,11 @@ fn read_authorization_code(input: impl BufRead) -> Result<String, CliError> {
     Ok(code.to_owned())
 }
 
-fn write_stdout(value: &str) -> Result<(), CliError> {
-    let stdout = io::stdout();
-    let mut output = stdout.lock();
+fn write_to(mut output: impl Write, value: &str, operation: &'static str) -> Result<(), CliError> {
     output
         .write_all(value.as_bytes())
         .and_then(|()| output.flush())
-        .map_err(|source| CliError::Io {
-            operation: "write command output",
-            source,
-        })
+        .map_err(|source| CliError::Io { operation, source })
 }
 
 #[derive(Debug, Diagnostic, Error)]
@@ -1671,5 +1736,101 @@ mod tests {
                 Err(CliError::InvalidAuthorizationCode)
             ));
         }
+    }
+
+    /// The line status and settings report when the stored root is missing.
+    fn unavailable_line(root: &Path) -> String {
+        format!(
+            "Sync root unusable: could not resolve sync root `{}`: \
+             No such file or directory (os error 2)",
+            root.display()
+        )
+    }
+
+    /// Check settings JSON is one document holding exactly the stored settings.
+    fn assert_settings_json(json: &str, stored: &Path) -> Result<(), Box<dyn Error>> {
+        let value = serde_json::from_str::<serde_json::Value>(json)?;
+        let Some(object) = value.as_object() else {
+            return Err("settings JSON was not an object".into());
+        };
+        let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(keys, ["dropbox_app_key", "sync_root"]);
+        assert_eq!(
+            object.get("sync_root").and_then(serde_json::Value::as_str),
+            stored.to_str()
+        );
+        assert_eq!(
+            object
+                .get("dropbox_app_key")
+                .and_then(serde_json::Value::as_str),
+            Some("public-app-key")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn status_reports_the_journal_when_the_root_is_unavailable() -> Result<(), Box<dyn Error>> {
+        let (_temporary, xdg, first, _second) = fixture()?;
+        let config = Config::load_from(&xdg)?;
+        let stored = ConfigDocument::load_from(&xdg)?.sync_root().to_path_buf();
+        let mut journal = Journal::open(config.paths().journal_file())?;
+        let _ = journal.bind_dropbox_root(&omabox::journal::DropboxBinding {
+            account_id: String::from("account"),
+            root_namespace_id: String::from("namespace"),
+            remote_root: String::from("/remote"),
+        })?;
+        journal.publish_remote_inventory(
+            "remote-cursor",
+            &[omabox::journal::RemoteObservationRecord {
+                canonical_path: CanonicalPath::from_display(Path::new("stale.txt")),
+                path: PathBuf::from("stale.txt"),
+                observation: Observation::Unknown(omabox::model::UnknownReason::Stale),
+            }],
+        )?;
+        drop(journal);
+        fs::remove_dir(&first)?;
+
+        let journal_status = status::render(config.paths().journal_file())?;
+        assert!(journal_status.contains("stale.txt"), "{journal_status}");
+        let output = status_output(&xdg)?;
+        assert_eq!(
+            output,
+            format!("{journal_status}{}\n", unavailable_line(&stored))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn settings_show_the_stored_root_when_it_is_unavailable() -> Result<(), Box<dyn Error>> {
+        let (_temporary, xdg, first, _second) = fixture()?;
+        let stored = ConfigDocument::load_from(&xdg)?.sync_root().to_path_buf();
+        fs::remove_dir(&first)?;
+        let line = unavailable_line(&stored);
+
+        let (text, text_line) = settings_output(&xdg, false)?;
+        assert_eq!(
+            text,
+            format!(
+                "Sync root: {}\nDropbox app key: public-app-key\n{line}\n",
+                stored.display()
+            )
+        );
+        assert_eq!(text_line, None);
+
+        let (json, json_line) = settings_output(&xdg, true)?;
+        assert_eq!(json_line.as_deref(), Some(line.as_str()));
+        assert!(!json.contains(&line), "{json}");
+        assert_settings_json(&json, &stored)
+    }
+
+    #[test]
+    fn settings_json_is_one_document_when_the_root_is_available() -> Result<(), Box<dyn Error>> {
+        let (_temporary, xdg, _first, _second) = fixture()?;
+        let stored = ConfigDocument::load_from(&xdg)?.sync_root().to_path_buf();
+
+        let (json, line) = settings_output(&xdg, true)?;
+        assert_eq!(line, None);
+        assert_settings_json(&json, &stored)
     }
 }
