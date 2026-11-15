@@ -1,13 +1,27 @@
-\ local-test.f - LOCAL's shared words, download and upload stages: local.rs's
-\ tests that an entry's existence below the root never follows a symlink
-\ and takes a failed probe as unconfirmed, that the content hash composes
-\ block hashes, that neither the hash nor a stage's copy depends on how a
-\ reader fragments the bytes, and that upload stage collection removes only
-\ verified unreferenced content; then each stage outcome, each inspected
-\ download stage, a stage marker set, read and removed, each upload stage
-\ outcome, an upload source that vanished or is a directory, and each
-\ parent a download opens. A case that makes files works in its own directory
-\ under TMPDIR and removes it.
+\ local-test.f - LOCAL's shared words, scan, upload and download stages,
+\ download slots and partials, installs, deletes, directories and
+\ conflicts: local.rs's tests that an entry's existence below the root
+\ never follows a symlink and takes a failed probe as unconfirmed, that
+\ the content hash composes block hashes, and that neither the hash nor a
+\ stage's copy depends on how a reader fragments the bytes; its scan
+\ tests but the parallel one, each journal test keeping the half without
+\ the journal, in the part LOCAL SCAN-TEST, which sees LOCAL's private
+\ types; that upload stage collection removes only verified unreferenced
+\ content; then each stage outcome, each inspected download stage, a
+\ stage marker set, read and removed, each upload stage outcome, an
+\ upload source that vanished or is a directory, and each parent a
+\ download opens; then that a slot's state keeps its last checkpoint, a
+\ reset never touches a replacement swapped in, the pool's four fixed
+\ slots, a protected slot kept and a stale one rebound; then that a cut
+\ download resumes from its last durable checkpoint, a completed partial
+\ is promoted before or after its rename, a corrupt one restarts only in
+\ its own slot, a promotion keeps a swapped replacement, a copy across
+\ filesystems frees its slot, and a reset slot replays to offset 0; then
+\ local.rs's install tests and each install outcome and replacement
+\ preparation; then that directory effects never overwrite or recurse,
+\ that a delete's replay keeps a raced edit, and each delete, directory
+\ and conflict outcome. A case that makes files works in its own
+\ directory under TMPDIR and removes it.
 \ Run from the repository root: hb --load src/local-test.f </dev/null
 require src/lib/test.f
 require src/lib/fmt.f
@@ -16,9 +30,12 @@ require src/lib/memory.f
 require src/lib/property.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
+require src/lib/fs-anchored.f
 require src/lib/fd.f
+require src/lib/xattr.f
 require src/lib/adt/option.f
 require src/dropbox.f
+require src/model.f
 require src/local.f
 
 \ LOCAL reopened for the stream a fragmenting reader feeds, its stage
@@ -63,7 +80,198 @@ private
       ENDOF
    ;MATCH ;
 
+\ The lease's slot, its binding and true; for none, -1, a zero binding
+\ and false.
+: LEASE-OF ( option<download-slot-lease> -- n binding bool )
+   MATCH option
+      none OF -1 0 0 0 0 BINDING-MAKE false ENDOF
+      some OF DOWNLOAD-SLOT-LEASE-UNMAKE {: d:str slot:n b:binding :}
+         slot b true
+      ENDOF
+   ;MATCH ;
+
+: STATE-APART ( option<download-slot-state> -- binding n bool )
+   MATCH option
+      none OF 0 0 0 0 BINDING-MAKE 0 false ENDOF
+      some OF DOWNLOAD-SLOT-STATE-UNMAKE true ENDOF
+   ;MATCH ;
+
+\ The slot's state apart: its binding, its offset and true.
+: SLOT-STATE-OF ( fd ^u8 n -- binding n bool )
+   READ-DOWNLOAD-SLOT-STATE STATE-APART ;
+
+\ The state encoded and decoded again, apart.
+: STATE-ROUND-TRIP ( binding n -- binding n bool )
+   DOWNLOAD-SLOT-STATE-MAKE ENCODE-DOWNLOAD-SLOT-STATE
+   DECODE-DOWNLOAD-SLOT-STATE STATE-APART ;
+
+32 BUFFER: FILLED
+
+\ The binding whose 32 bytes are all c.
+: FILLED-BINDING ( n -- binding )
+   {: c:n :}
+   32 0 ?do c FILLED i + c! loop
+   FILLED BYTES>BINDING ;
+
+\ The slot opened for writing and true; for a missing or occupied one,
+\ -1 and false.
+: OPENED-SLOT ( fd ^u8 n ^u8 n -- fd bool )
+   OPEN-DOWNLOAD-SLOT MATCH download-slot-open
+      missing OF -1 >FD false ENDOF
+      file OF true ENDOF
+      occupied OF -1 >FD false ENDOF
+   ;MATCH ;
+
+\ The preparation's partial; anything else ends the run, as Rust's test
+\ returns an error.
+: READY-PARTIAL ( download-preparation -- ^download-partial )
+   MATCH download-preparation
+      ready OF ENDOF
+      complete OF DROP-STAGE-OUTCOME
+         s" test expected a ready download partial" 1 die
+      ENDOF
+      ephemeral OF s" test expected a ready download partial" 1 die ENDOF
+   ;MATCH ;
+
+: LEASED ( option<download-slot-lease> -- download-slot-lease )
+   MATCH option
+      none OF s" test expected a download slot lease" 1 die ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+\ Rust's tests' raw fsetxattr of the partial's stage marker, then fsync.
+: MARK-PARTIAL ( ^download-partial ^ARENA:arena -- )
+   {: x ar:^ARENA:arena :}
+   x DOWNLOAD-PARTIAL-LOCATION {: loc :}
+   x PARTIAL-FILE DOWNLOAD-STAGE-XATTR
+   loc TARGET@ loc EXPECTED@ ar STAGE-MARKER XATTR:ADD
+   x PARTIAL-FILE FD:SYNC ;
+
+\ Moves the partial's slot to its stage's name, as renameat NOREPLACE.
+: RENAME-TO-STAGE ( ^download-partial -- bool )
+   {: x :}
+   x DOWNLOAD-PARTIAL-LOCATION {: loc :}
+   loc SOURCE@ MATCH download-source
+      resumable OF {: slots:fd name:str path:str b:binding :}
+         slots name str> loc TARGET-DIR@ loc STAGE-NAME@
+         FS:TRY-RENAME-NEW-AT
+      ENDOF
+      disposable OF {: p:str :} false ENDOF
+   ;MATCH ;
+
+\ Empties the partial's slot and records offset 0 for its binding.
+: ZERO-CHECKPOINT ( ^download-partial -- )
+   {: x :}
+   x PARTIAL-FILE 0 FD:RESIZE
+   x DOWNLOAD-PARTIAL-LOCATION SOURCE@ MATCH download-source
+      resumable OF {: slots:fd name:str path:str b:binding :}
+         x PARTIAL-FILE DOWNLOAD-PARTIAL-XATTR
+         b 0 DOWNLOAD-SLOT-STATE-MAKE ENCODE-DOWNLOAD-SLOT-STATE XATTR:SET
+      ENDOF
+      disposable OF {: p:str :} ENDOF
+   ;MATCH
+   x PARTIAL-FILE FD:SYNC ;
+
+: PROMOTE-WITH
+   ( ^download-partial [ -- ] ^ARENA:arena -- stage-outcome<n> )
+   {: x before ar:^ARENA:arena :}
+   x PARTIAL-FILE x DOWNLOAD-PARTIAL-LOCATION before ar
+   PROMOTE-COMPLETED-SLOT-WITH ;
+
+: COPY-PARTIAL ( ^download-partial ^ARENA:arena -- stage-outcome<n> )
+   {: x ar:^ARENA:arena :}
+   x PARTIAL-FILE x DOWNLOAD-PARTIAL-LOCATION ar COPY-COMPLETED-SLOT ;
+
+: PARTIAL-STAGE-PATH ( ^download-partial -- ^u8 n )
+   DOWNLOAD-PARTIAL-LOCATION STAGE-PATH@ ;
+
+\ The name target t's stage of want takes.
+: STAGE-NAME ( ^u8 n DROPBOX:hash ^ARENA:arena -- ^u8 n )
+   {: t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
+   s" download" t tu want ar INTERNAL-NAME ;
+
+: DROP-INSTALL-OUTCOME ( install-outcome -- ) drop ;
+
+\ The stage INSPECT-DOWNLOAD-STAGE verified for x; any other fails the
+\ run.
+: VERIFIED-STAGE ( install -- verified-download-stage )
+   INSPECT-INSTALL-STAGE MATCH download-stage
+      missing OF E-CHANGED throw ENDOF
+      verified OF ENDOF
+      destination-occupied OF {: p:str :} E-OCCUPIED throw ENDOF
+   ;MATCH ;
+
+\ Writes "mutant" over the sealed stage through w, opened before it.
+: MUTATE ( fd -- )
+   {: w:fd :}
+   w FS:MODE-PRIVATE-FILE FD:MODE! w 0 FD:SEEK
+   w s" mutant" FD:WRITE-FULL w FD:SYNC ;
+
+: RENAME-REFUSED ( install verified-download-stage -- )
+   {: x:install s:verified-download-stage :}
+   [: x s RENAME-STAGE-INTO-ABSENT-TARGET DROP-INSTALL-OUTCOME ;]
+   E-CHANGED TTHROWSQ ;
+
+\ Verifies x's stage, mutates it through w, then renames it.
+: RENAME-MUTATED ( install fd -- )
+   {: x:install w:fd :}
+   x VERIFIED-STAGE {: s:verified-download-stage :}
+   s VERIFIED-DOWNLOAD-STAGE-UNMAKE {: f:fd print:MODEL:fingerprint :}
+   [: w MUTATE x s RENAME-REFUSED ;] [: f DISCARD ;] finally ;
+
+\ RENAME-MUTATED on target t's install below the root fd at r, its
+\ parent opened as INSTALL-DOWNLOAD-AT opens it.
+: INSTALL-RENAME-MUTATED
+   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena fd -- )
+   {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena
+      w:fd :}
+   root t tu false OPEN-PARENT MATCH option
+      none OF E-CHANGED throw ENDOF
+      some OF PARENT-DIR-UNMAKE {: f:fd name:str rel:str :}
+         [: f name rel r ru t tu want ar INSTALL-OF w RENAME-MUTATED ;]
+         [: f DISCARD ;] finally
+      ENDOF
+   ;MATCH ;
+
+\ SYNC-RENAMED-DOWNLOAD of the file at t in dir, as a stage verified
+\ now, refuses it: it carries no marker.
+: RENAMED-WITHOUT-MARKER
+   ( fd fd ^u8 n DROPBOX:hash ^ARENA:arena -- )
+   {: f:fd dir:fd t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
+   f t tu s" inspect test download" STAT-FD t tu FILE-FINGERPRINT
+   {: print:MODEL:fingerprint :}
+   f print VERIFIED-DOWNLOAD-STAGE-MAKE {: s:verified-download-stage :}
+   [: s dir t tu t tu want ar SYNC-RENAMED-DOWNLOAD ;]
+   E-CHANGED TTHROWSQ ;
+
 public
+EXPORT READY-PARTIAL
+EXPORT LEASED
+EXPORT MARK-PARTIAL
+EXPORT RENAME-TO-STAGE
+EXPORT ZERO-CHECKPOINT
+EXPORT PROMOTE-WITH
+EXPORT COPY-PARTIAL
+EXPORT PARTIAL-STAGE-PATH
+EXPORT CLOSE-PARTIAL
+EXPORT PARTIAL-FILE
+EXPORT PARTIAL-PATH
+EXPORT DOWNLOAD-PARTIAL-XATTR
+EXPORT DOWNLOAD-CHECKPOINT-BYTES
+EXPORT DOWNLOAD-SLOT-NAME
+EXPORT RESET-DOWNLOAD-SLOT-FILE-WITH
+EXPORT TAKEN?
+EXPORT LEASE-OF
+EXPORT SLOT-STATE-OF
+EXPORT STATE-ROUND-TRIP
+EXPORT FILLED-BINDING
+EXPORT OPENED-SLOT
+EXPORT STAGE-NAME
+EXPORT GUARD-NAME
+EXPORT SYNC-INSTALLED-DOWNLOAD
+EXPORT INSTALL-RENAME-MUTATED
+EXPORT RENAMED-WITHOUT-MARKER
+EXPORT INTERNAL-NAME
 EXPORT PARENT-OF
 EXPORT HASH-STREAM
 EXPORT COPY-AND-HASH
@@ -74,6 +282,555 @@ EXPORT REMOVE-XATTR
 EXPORT MARKER$
 EXPORT INSPECTED$
 EXPORT WRITE-STAGE-OUTCOME
+;package
+
+\ LOCAL reopened for its scan's cases, which name its private types.
+package LOCAL
+private
+package SCAN-TEST
+
+TYPED-VARIABLE AR ^ARENA:arena
+
+448 constant MODE-0700
+-100 constant AT-FDCWD
+
+\ ---- the case's tree
+
+FS:PATHZ-CAP BUFFER: ROOT-BUF
+variable ROOT-U
+FS:PATHZ-CAP BUFFER: JOINED
+
+: ROOT$ ( -- ^u8 n ) ROOT-BUF ROOT-U @ ;
+
+\ The name below the case's root, valid until the next AT.
+: AT ( ^u8 n -- ^u8 n )
+   {: p:^ u:n :}
+   ROOT$ p u JOINED FS:JOIN-PATH JOINED swap ;
+
+: WRITE ( ^u8 n ^u8 n -- ) {: p:^ u:n b:^ bu:n :} p u AT b bu FS:WRITE-ALL ;
+: MKDIR ( ^u8 n -- ) AT FS:MAKE-DIR ;
+: REMOVE ( ^u8 n -- ) AT FS:REMOVE-FILE ;
+: DENY ( ^u8 n -- ) AT 0 FS:CHMOD-MODE ;
+: ALLOW ( ^u8 n -- ) AT MODE-0700 FS:CHMOD-MODE ;
+
+\ Runs q in a new root under TMPDIR, which it then removes.
+: IN-CASE ( [ -- ] -- )
+   {: q :}
+   s" local-scan-test" FS:MKTEMP-DIR {: p:^ u:n :}
+   p ROOT-BUF u BYTE-COPY u ROOT-U !
+   [: q execute ;] [: ROOT$ FS:REMOVE-TREE ;] finally ;
+
+64 BUFFER: READ-BUF
+
+: CONTENT-OF ( ^u8 n -- ^u8 n ) AT READ-BUF 64 FS:READ-ALL READ-BUF swap ;
+
+PROCESS-SYMBOLS
+FUNCTION: UTIMENSAT-CALL utimensat ( n ^u8 ^u8 n -- i32 ) ;FUNCTION
+FUNCTION: READLINK-CALL readlink ( ^u8 ^u8 n -- n ) ;FUNCTION
+
+create TIMES 32 allot
+
+\ Rust's force_changed: access and modification one second past the epoch.
+: FORCE-CHANGED ( ^u8 n -- )
+   AT FS:>PATHZ {: z:^ :}
+   1 TIMES ! 0 TIMES 8 + ! 1 TIMES 16 + ! 0 TIMES 24 + !
+   AT-FDCWD z TIMES 0 UTIMENSAT-CALL 0 T= ;
+
+: LINK-OF ( ^u8 n -- ^u8 n )
+   AT FS:>PATHZ READ-BUF 64 READLINK-CALL READ-BUF swap ;
+
+\ ---- the scan's values
+
+: ZEROS ( -- ^u8 n )
+   s" 0000000000000000000000000000000000000000000000000000000000000000" ;
+
+: STABLE ( -- option<cutoff> )
+   $7FFFFFFFFFFFFFFF 999999999 CUTOFF-MAKE OPTION:SOME ;
+
+: NO-CACHE ( -- ^VEC:vector<MODEL:hash-record> )
+   AR @ [type] MODEL:hash-record NEW-VEC ;
+
+: TEST-CACHE
+   ( ^u8 n MODEL:fingerprint ^u8 n -- ^VEC:vector<MODEL:hash-record> )
+   {: p:^ u:n f:MODEL:fingerprint c:^ cu:n :}
+   NO-CACHE {: v :}
+   p u >str MODEL:>PATH f c cu >str DROPBOX:>HASH MODEL-HASH--RECORD:MAKE
+   v VEC:PUSH !
+   v ;
+
+\ Rust's fingerprint: the file's below the case's root.
+: FINGERPRINT-AT ( ^u8 n -- MODEL:fingerprint )
+   {: p:^ u:n :}
+   ROOT$ s" open test scan root" OPEN-ROOT {: root:fd :}
+   root p u s" open test scan file" E-IO E-UNSUPPORTED
+   OPEN-RELATIVE-REGULAR {: f:fd :}
+   f p u s" inspect test scan file" STAT-FD p u FILE-FINGERPRINT
+   f DISCARD root DISCARD ;
+
+\ Rust's identity: the content hash of the bytes, read from a pipe.
+: IDENTITY ( ^u8 n -- ^u8 n )
+   {: p:^ u:n :}
+   FD:PIPE {: r:fd w:fd :}
+   w p u FD:WRITE-FULL w DISCARD
+   r AR @ DROPBOX-CONTENT-HASH r DISCARD
+   DROPBOX:HASH>STR str> ;
+
+: ROOT-SCAN ( -- complete-scan ) ROOT$ AR @ SCAN ;
+
+: CACHED-SCAN ( ^VEC:vector<MODEL:hash-record> option<cutoff>
+     [ -- option<cutoff> ] -- complete-scan )
+   {: cache cut:option<cutoff> q :}
+   ROOT$ cache cut q AR @ SCAN-WITH-CACHE-COMPLETED-AT ;
+
+: ENUMERATE ( ^VEC:vector<MODEL:hash-record> option<cutoff>
+     -- pending-scan )
+   {: cache cut:option<cutoff> :}
+   ROOT$ cache cut AR @ ENUMERATE-SCAN ;
+
+: REUSABLE ( complete-scan -- ^VEC:vector<MODEL:hash-record> )
+   COMPLETE-SCAN-UNMAKE nip ;
+
+: PUBLISHED ( complete-scan -- n ) SCAN-OBSERVATIONS VEC:COUNT ;
+
+: PENDING-ENTRIES ( pending-scan -- scan-entries )
+   PENDING-SCAN-UNMAKE {: r:str f:fd b:stat en:scan-entries ar :} en ;
+
+\ Closes the root a pending scan holds, as Rust's drop of one.
+: RELEASE ( pending-scan -- )
+   PENDING-SCAN-UNMAKE {: r:str f:fd b:stat en:scan-entries ar :}
+   f DISCARD ;
+
+\ The kind each observation is, and unknown's reason after it.
+-1 constant MISSING
+0 constant PRESENT
+1 constant DIRECTORY
+2 constant ABSENT
+3 constant INCOMPLETE
+4 constant INACCESSIBLE
+5 constant UNSUPPORTED-KIND
+
+: REASON-KIND ( MODEL:unknown-reason -- n )
+   MATCH MODEL:unknown-reason
+      incomplete OF INCOMPLETE ENDOF
+      inaccessible OF INACCESSIBLE ENDOF
+      unavailable OF 10 ENDOF
+      stale OF 11 ENDOF
+      cursor-reset OF 12 ENDOF
+      unsupported OF UNSUPPORTED-KIND ENDOF
+   ;MATCH ;
+
+: KIND ( MODEL:observation<MODEL:local> -- n )
+   MATCH MODEL:observation
+      present OF {: l:MODEL:local :} PRESENT ENDOF
+      directory OF DIRECTORY ENDOF
+      absent OF ABSENT ENDOF
+      unknown OF REASON-KIND ENDOF
+   ;MATCH ;
+
+: RECORD-OBSERVATION
+   ( MODEL:local-record -- MODEL:observation<MODEL:local> )
+   MODEL-LOCAL--RECORD:UNMAKE
+   {: p:MODEL:path o:MODEL:observation<MODEL:local> :} o ;
+
+\ The observation of the path, none where the scan published none.
+: FIND ( complete-scan ^u8 n -- option<MODEL:local-record> )
+   {: s:complete-scan p:^ u:n :}
+   s SCAN-OBSERVATIONS {: v :}
+   v VEC:COUNT 0 ?do
+      v i VEC:AT @ {: r:MODEL:local-record :}
+      r OBSERVATION-PATH p u STR= if r OPTION:SOME unloop exit then
+   loop OPTION:NONE ;
+
+: KIND-AT ( complete-scan ^u8 n -- n )
+   FIND MATCH option
+      none OF MISSING ENDOF
+      some OF RECORD-OBSERVATION KIND ENDOF
+   ;MATCH ;
+
+: SEEN ( complete-scan ^u8 n n -- )
+   {: s:complete-scan p:^ u:n want:n :}
+   s p u KIND-AT want T= ;
+
+\ Rust's scanned_content: a present file's content hash, else empty.
+: SCANNED-CONTENT ( complete-scan ^u8 n -- ^u8 n )
+   FIND MATCH option
+      none OF s" " ENDOF
+      some OF RECORD-OBSERVATION MATCH MODEL:observation
+            present OF MODEL-LOCAL:UNMAKE DROPBOX:HASH>STR str> ENDOF
+            directory OF s" " ENDOF
+            absent OF s" " ENDOF
+            unknown OF {: why:MODEL:unknown-reason :} s" " ENDOF
+         ;MATCH
+      ENDOF
+   ;MATCH ;
+
+\ Rust's observed_paths refuses a path published twice; the observations
+\ are also in strictly increasing byte order.
+: ORDERED ( complete-scan -- )
+   SCAN-OBSERVATIONS {: v :}
+   true v VEC:COUNT 1 max 1 ?do
+      v i 1- VEC:AT OBSERVATION-PATH@ v i VEC:AT OBSERVATION-PATH@ STR< and
+   loop TTRUE ;
+
+: SAME-RECORDS
+   ( ^VEC:vector<MODEL:hash-record> ^VEC:vector<MODEL:hash-record> -- )
+   {: a b :}
+   a VEC:COUNT b VEC:COUNT T=
+   a VEC:COUNT b VEC:COUNT min 0 ?do
+      a i VEC:AT @ {: x:MODEL:hash-record :}
+      b i VEC:AT @ {: y:MODEL:hash-record :}
+      x RECORD-PATH y RECORD-PATH T$=
+      x RECORD-FINGERPRINT y RECORD-FINGERPRINT SAME-FINGERPRINT TTRUE
+      x RECORD-CONTENT DROPBOX:HASH>STR str>
+      y RECORD-CONTENT DROPBOX:HASH>STR str> T$=
+   loop ;
+
+\ ---- cases
+
+: SCAN-PUBLISHES-EMPTY-AND-NESTED-DIRECTORIES ( -- )
+   s" scan_publishes_empty_and_nested_directories" T-LABEL
+   s" parent" MKDIR s" parent/child" MKDIR s" empty" MKDIR
+   ROOT-SCAN {: s:complete-scan :}
+   s ORDERED
+   s s" empty" DIRECTORY SEEN
+   s s" parent" DIRECTORY SEEN
+   s s" parent/child" DIRECTORY SEEN ;
+
+: FILES-REMOVED-DURING-HASHING-PUBLISH-AN-INCOMPLETE-DIRECTORY ( -- )
+   s" files_removed_during_hashing_publish_an_incomplete_directory" T-LABEL
+   s" nested" MKDIR
+   s" kept" s" kept" WRITE
+   s" nested/a-missing" s" a" WRITE
+   s" nested/b-missing" s" b" WRITE
+   NO-CACHE NO-CUTOFF ENUMERATE {: ps:pending-scan :}
+   s" nested/a-missing" REMOVE s" nested/b-missing" REMOVE
+   s" nested" FORCE-CHANGED
+   ps FINISH-SCAN {: s:complete-scan :}
+   s ORDERED
+   s s" nested" INCOMPLETE SEEN
+   s s" nested/a-missing" MISSING SEEN
+   s s" nested/b-missing" MISSING SEEN
+   s s" kept" PRESENT SEEN
+   s PUBLISHED 2 T= ;
+
+\ The half without the journal: the first scan's reusable hashes stand for
+\ the cache it would publish, and the check that a failed scan leaves the
+\ published inventory and cache alone is JOURNAL's. The throw carries no
+\ path; only the root's change escapes FINISH-SCAN.
+: CHANGED-ROOT-FAILS-THE-SCAN-AND-PRESERVES-THE-PUBLICATION ( -- )
+   s" changed_root_fails_the_scan_and_preserves_the_publication" T-LABEL
+   s" kept" s" kept" WRITE
+   NO-CACHE STABLE [: STABLE ;] CACHED-SCAN REUSABLE {: cache :}
+   s" a-missing" s" a" WRITE
+   cache STABLE ENUMERATE {: ps:pending-scan :}
+   s" a-missing" REMOVE
+   [: ps FINISH-SCAN drop ;] E-CHANGED TTHROWSQ ;
+
+: OBJECTS-ON-ANOTHER-DEVICE-ARE-UNSUPPORTED-AND-UNSCANNED ( -- )
+   s" objects_on_another_device_are_unsupported_and_unscanned" T-LABEL
+   s" volume" MKDIR
+   s" volume/inside.txt" s" inside" WRITE
+   s" outside.txt" s" outside" WRITE
+   ROOT$ AR @ ENUMERATE-SCAN-ACROSS-DEVICES FINISH-SCAN
+   {: across:complete-scan :}
+   across ORDERED
+   across s" volume" UNSUPPORTED-KIND SEEN
+   across s" outside.txt" UNSUPPORTED-KIND SEEN
+   across s" volume/inside.txt" MISSING SEEN
+   across PUBLISHED 2 T=
+   across REUSABLE VEC:COUNT 0 T=
+   ROOT-SCAN {: same:complete-scan :}
+   same s" volume" DIRECTORY SEEN
+   same s" volume/inside.txt" PRESENT SEEN
+   same s" outside.txt" PRESENT SEEN
+   same PUBLISHED 3 T= ;
+
+: CHANGING-FILES-ARE-UNKNOWN-WITHOUT-HIDING-STABLE-FILES ( -- )
+   s" changing_files_are_unknown_without_hiding_stable_files" T-LABEL
+   s" cached" s" before" WRITE
+   NO-CACHE NO-CUTOFF [: STABLE ;] CACHED-SCAN REUSABLE {: cache :}
+   s" hashing" s" before" WRITE
+   s" stable" s" stable" WRITE
+   cache STABLE ENUMERATE {: ps:pending-scan :}
+   ps PENDING-ENTRIES JOBS VEC:COUNT 2 T=
+   ps PENDING-ENTRIES CACHED VEC:COUNT 1 T=
+   s" cached" s" changed after enumeration" WRITE
+   s" hashing" s" also changed" WRITE
+   ps FINISH-SCAN {: s:complete-scan :}
+   s s" cached" INCOMPLETE SEEN
+   s s" hashing" INCOMPLETE SEEN
+   s s" stable" PRESENT SEEN ;
+
+: UNCHANGED-SCAN-FILE-REUSES-CACHED-HASH-WITHOUT-READING-BYTES ( -- )
+   s" unchanged_scan_file_reuses_cached_hash_without_reading_bytes" T-LABEL
+   s" cached.txt" s" bytes that would hash differently" WRITE
+   s" cached.txt" s" cached.txt" FINGERPRINT-AT ZEROS TEST-CACHE {: cache :}
+   ROOT$ cache STABLE AR @ SCAN-WITH-CACHE-AT {: s:complete-scan :}
+   s s" cached.txt" SCANNED-CONTENT ZEROS T$= ;
+
+\ The half without the journal: the first scan's reusable hashes stand for
+\ the cache JOURNAL would store and answer in path-byte order.
+: FILE-BESIDE-A-SAME-NAMED-DIRECTORY-KEEPS-ITS-CACHED-HASH ( -- )
+   s" file_beside_a_same_named_directory_keeps_its_cached_hash" T-LABEL
+   s" x" MKDIR
+   s" x.txt" s" beside the directory" WRITE
+   s" x/y.txt" s" under the directory" WRITE
+   NO-CACHE NO-CUTOFF [: STABLE ;] CACHED-SCAN REUSABLE {: cache :}
+   cache VEC:COUNT 2 T=
+   cache STABLE ENUMERATE {: ps:pending-scan :}
+   ps PENDING-ENTRIES JOBS VEC:COUNT 0 T=
+   ps PENDING-ENTRIES CACHED VEC:COUNT 2 T=
+   ps RELEASE
+   NO-CACHE NO-CUTOFF [: STABLE ;] CACHED-SCAN REUSABLE cache SAME-RECORDS ;
+
+: RECENT-CACHE-ENTRY-IS-REHASHED-AND-OMITTED ( -- )
+   s" recent_cache_entry_is_rehashed_and_omitted" T-LABEL
+   s" recent.txt" s" actual bytes" WRITE
+   s" recent.txt" FINGERPRINT-AT {: f:MODEL:fingerprint :}
+   f MODEL-FINGERPRINT:UNMAKE {: i sz ms mn cs cn :}
+   ms mn CUTOFF-MAKE OPTION:SOME {: cut:option<cutoff> :}
+   s" recent.txt" f ZEROS TEST-CACHE cut [: NO-CUTOFF ;] CACHED-SCAN
+   {: s:complete-scan :}
+   s s" recent.txt" SCANNED-CONTENT s" actual bytes" IDENTITY T$=
+   s REUSABLE VEC:COUNT 0 T= ;
+
+\ The fingerprint with the field at idx flipped in its lowest bit.
+: FLIPPED ( MODEL:fingerprint n -- MODEL:fingerprint )
+   {: f:MODEL:fingerprint at:n :}
+   f MODEL-FINGERPRINT:UNMAKE {: i sz ms mn cs cn :}
+   i at 0 = if 1 xor then
+   sz at 1 = if 1 xor then
+   ms at 2 = if 1 xor then
+   mn at 3 = if 1 xor then
+   cs at 4 = if 1 xor then
+   cn at 5 = if 1 xor then
+   MODEL-FINGERPRINT:MAKE ;
+
+: EVERY-FINGERPRINT-FIELD-MISMATCH-REHASHES-THE-FILE ( -- )
+   s" every_fingerprint_field_mismatch_rehashes_the_file" T-LABEL
+   s" changed.txt" s" actual bytes" WRITE
+   s" changed.txt" FINGERPRINT-AT {: f:MODEL:fingerprint :}
+   6 0 ?do
+      s" changed.txt" f i FLIPPED ZEROS TEST-CACHE {: cache :}
+      ROOT$ cache STABLE AR @ SCAN-WITH-CACHE-AT
+      s" changed.txt" SCANNED-CONTENT s" actual bytes" IDENTITY T$=
+   loop ;
+
+: ZEROED ( MODEL:hash-record -- MODEL:hash-record )
+   MODEL-HASH--RECORD:UNMAKE
+   {: p:MODEL:path f:MODEL:fingerprint c:DROPBOX:hash :}
+   p f ZEROS >str DROPBOX:>HASH MODEL-HASH--RECORD:MAKE ;
+
+\ The half without the journal: a stored row with a device and its JSON
+\ are JOURNAL's and MODEL's; here the first scan's record, its content
+\ replaced by one only the cache could supply, is reused.
+: CACHED-HASH-WITH-A-STORED-DEVICE-IS-REUSED ( -- )
+   s" cached_hash_with_a_stored_device_is_reused" T-LABEL
+   s" kept.txt" s" actual bytes" WRITE
+   NO-CACHE NO-CUTOFF [: STABLE ;] CACHED-SCAN REUSABLE {: first :}
+   first VEC:COUNT 1 T=
+   NO-CACHE {: cache :}
+   first 0 VEC:AT @ ZEROED cache VEC:PUSH !
+   cache STABLE [: STABLE ;] CACHED-SCAN
+   s" kept.txt" SCANNED-CONTENT ZEROS T$= ;
+
+\ The half without the journal: the scan's reusable hashes are the cache
+\ the publication stores.
+: SCAN-PUBLICATION-USES-COMPLETION-CUTOFF-FOR-NEW-HASHES ( -- )
+   s" scan_publication_uses_completion_cutoff_for_new_hashes" T-LABEL
+   s" slow.txt" s" newly hashed" WRITE
+   NO-CACHE NO-CUTOFF [: STABLE ;] CACHED-SCAN REUSABLE VEC:COUNT 1 T= ;
+
+: EXCLUDED-TREE ( -- )
+   s" kept.txt" s" kept" WRITE
+   s" .DS_Store" s" Finder metadata" WRITE
+   s" ~$private" MKDIR
+   s" ~$private/child.txt" s" private" WRITE
+   s" missing" s" .dropbox" AT FS:MAKE-SYMLINK ;
+
+\ The half without the journal: the scan's reusable hashes are the cache
+\ the publication stores.
+: EXCLUDED-ENTRIES-ARE-NOT-OPENED-HASHED-OR-PUBLISHED ( -- )
+   s" excluded_entries_are_not_opened_hashed_or_published" T-LABEL
+   EXCLUDED-TREE
+   s" ~$private" DENY
+   [: NO-CACHE STABLE [: STABLE ;] CACHED-SCAN ;]
+   [: s" ~$private" ALLOW ;] finally {: s:complete-scan :}
+   s PUBLISHED 1 T=
+   s s" kept.txt" PRESENT SEEN
+   s REUSABLE VEC:COUNT 1 T=
+   s" .DS_Store" CONTENT-OF s" Finder metadata" T$=
+   s" ~$private/child.txt" CONTENT-OF s" private" T$=
+   s" .dropbox" LINK-OF s" missing" T$= ;
+
+: INACCESSIBLE-FILE-IS-UNKNOWN-BESIDE-A-READABLE-FILE ( -- )
+   s" inaccessible_file_is_unknown_beside_a_readable_file" T-LABEL
+   s" locked.txt" s" locked" WRITE
+   s" open.txt" s" open" WRITE
+   s" locked.txt" DENY
+   ROOT-SCAN {: s:complete-scan :}
+   s s" locked.txt" INACCESSIBLE SEEN
+   s s" open.txt" PRESENT SEEN
+   s PUBLISHED 2 T= ;
+
+: DIRECTORY-CHANGED-DURING-THE-SCAN-HIDES-ITS-CONTENTS ( -- )
+   s" directory_changed_during_the_scan_hides_its_contents" T-LABEL
+   s" nested" MKDIR
+   s" nested/file" s" bytes" WRITE
+   s" stable.txt" s" stable" WRITE
+   NO-CACHE NO-CUTOFF ENUMERATE {: ps:pending-scan :}
+   s" nested/appeared" s" new" WRITE
+   ps FINISH-SCAN {: s:complete-scan :}
+   s s" nested" INCOMPLETE SEEN
+   s s" nested/file" MISSING SEEN
+   s s" nested/appeared" MISSING SEEN
+   s s" stable.txt" PRESENT SEEN
+   s PUBLISHED 2 T= ;
+
+: NESTED-TREE ( -- )
+   s" nested" MKDIR
+   s" nested/kept.txt" s" kept below" WRITE
+   s" stable.txt" s" stable" WRITE ;
+
+\ The rescan Rust's two retained-hash cases end with.
+: RESCAN-REUSES ( complete-scan -- )
+   {: s:complete-scan :}
+   s REUSABLE VEC:COUNT 2 T=
+   s REUSABLE STABLE ENUMERATE {: ps:pending-scan :}
+   ps PENDING-ENTRIES JOBS VEC:COUNT 0 T=
+   ps PENDING-ENTRIES CACHED VEC:COUNT 2 T=
+   ps RELEASE ;
+
+\ The half without the journal: the first scan's reusable hashes stand for
+\ the cache it would publish.
+: A-DISCARDED-SUBTREE-KEEPS-ITS-VALIDATED-HASHES ( -- )
+   s" a_discarded_subtree_keeps_its_validated_hashes" T-LABEL
+   NESTED-TREE
+   NO-CACHE NO-CUTOFF [: STABLE ;] CACHED-SCAN REUSABLE {: cache :}
+   cache VEC:COUNT 2 T=
+   cache STABLE ENUMERATE {: ps:pending-scan :}
+   ps PENDING-ENTRIES JOBS VEC:COUNT 0 T=
+   s" nested" FORCE-CHANGED
+   ps [: STABLE ;] FINISH-SCAN-AT {: s:complete-scan :}
+   s s" nested" INCOMPLETE SEEN
+   s s" nested/kept.txt" MISSING SEEN
+   s RESCAN-REUSES ;
+
+: NESTED? ( ^u8 n -- bool )
+   {: p:^ u:n :}
+   p u s" nested" STR= if true exit then
+   p u s" nested/" PREFIX? ;
+
+\ Moves the cached hashes beneath "nested" to retained.
+: RETAIN-NESTED ( scan-entries -- )
+   {: en:scan-entries :}
+   en SCAN-ENTRIES-UNMAKE {: o c r d j :}
+   AR @ [type] MODEL:hash-record NEW-VEC {: kept :}
+   c VEC:COUNT 0 ?do
+      c i VEC:AT @ {: x:MODEL:hash-record :}
+      x RECORD-PATH NESTED? if x r VEC:PUSH ! else x kept VEC:PUSH ! then
+   loop
+   r VEC:COUNT 1 T=
+   c 0 VEC:RESIZE
+   kept VEC:COUNT 0 ?do kept i VEC:AT @ c VEC:PUSH ! loop ;
+
+\ Drops the observations and directories at or beneath "nested".
+: DROP-NESTED ( scan-entries -- )
+   {: en:scan-entries :}
+   en SCAN-ENTRIES-UNMAKE {: o c r d j :}
+   AR @ [type] MODEL:local-record NEW-VEC {: seen :}
+   o VEC:COUNT 0 ?do
+      o i VEC:AT @ {: x:MODEL:local-record :}
+      x OBSERVATION-PATH NESTED? 0= if x seen VEC:PUSH ! then
+   loop
+   o 0 VEC:RESIZE
+   seen VEC:COUNT 0 ?do seen i VEC:AT @ o VEC:PUSH ! loop
+   AR @ [type] scanned-directory NEW-VEC {: kept :}
+   d VEC:COUNT 0 ?do
+      d i VEC:AT @ {: x:scanned-directory :}
+      x SCANNED-DIRECTORY-UNMAKE {: p:str b:stat :}
+      p str> NESTED? 0= if x kept VEC:PUSH ! then
+   loop
+   d 0 VEC:RESIZE
+   kept VEC:COUNT 0 ?do kept i VEC:AT @ d VEC:PUSH ! loop ;
+
+\ The half without the journal: the first scan's reusable hashes stand for
+\ the cache it would publish. The enumeration is shaped as TRUNCATE leaves
+\ it when an entry fails after its subtree was validated, which only a
+\ concurrent writer reaches through the walk.
+: HASHES-THE-WALK-RETAINED-REACH-THE-PUBLICATION ( -- )
+   s" hashes_the_walk_retained_reach_the_publication" T-LABEL
+   NESTED-TREE
+   NO-CACHE NO-CUTOFF [: STABLE ;] CACHED-SCAN REUSABLE {: cache :}
+   cache VEC:COUNT 2 T=
+   cache STABLE ENUMERATE {: ps:pending-scan :}
+   ps PENDING-ENTRIES {: en:scan-entries :}
+   en JOBS VEC:COUNT 0 T=
+   en RETAIN-NESTED
+   en DROP-NESTED
+   en s" nested" >str MODEL-UNKNOWN--REASON:incomplete UNKNOWN
+   ps [: STABLE ;] FINISH-SCAN-AT {: s:complete-scan :}
+   s s" nested" INCOMPLETE SEEN
+   s s" nested/kept.txt" MISSING SEEN
+   s RESCAN-REUSES ;
+
+: TEST-RECORD ( ^u8 n DROPBOX:hash -- MODEL:hash-record )
+   {: p:^ u:n c:DROPBOX:hash :}
+   p u >str MODEL:>PATH 2 5 3 0 3 0 MODEL-FINGERPRINT:MAKE c
+   MODEL-HASH--RECORD:MAKE ;
+
+: TRUNCATING-A-FAILED-ENTRY-KEEPS-ITS-VALIDATED-HASHES ( -- )
+   s" truncating_a_failed_entry_keeps_its_validated_hashes" T-LABEL
+   s" bytes" IDENTITY >str DROPBOX:>HASH {: c:DROPBOX:hash :}
+   AR @ NEW-ENTRIES {: en:scan-entries :}
+   en SCAN-ENTRIES-UNMAKE {: o cf r d j :}
+   s" before.txt" c TEST-RECORD cf VEC:PUSH !
+   en MARK {: mk:scan-mark :}
+   s" sub" >str MODEL:>PATH DIRECTORY-OBSERVATION MODEL-LOCAL--RECORD:MAKE
+   o VEC:PUSH !
+   s" sub/kept.txt" c TEST-RECORD cf VEC:PUSH !
+   s" sub/fresh.txt" >str 2 5 3 0 3 0 MODEL-FINGERPRINT:MAKE HASH-JOB-MAKE
+   j VEC:PUSH !
+   en mk TRUNCATE
+   en s" sub" >str MODEL-UNKNOWN--REASON:incomplete UNKNOWN
+   cf VEC:COUNT 1 T=
+   cf 0 VEC:AT RECORD-PATH@ s" before.txt" T$=
+   r VEC:COUNT 1 T=
+   r 0 VEC:AT RECORD-PATH@ s" sub/kept.txt" T$=
+   j VEC:COUNT 0 T=
+   o VEC:COUNT 1 T=
+   o 0 VEC:AT @ {: x:MODEL:local-record :}
+   x OBSERVATION-PATH s" sub" T$=
+   x RECORD-OBSERVATION KIND INCOMPLETE T= ;
+
+: CASES ( -- )
+   [: SCAN-PUBLISHES-EMPTY-AND-NESTED-DIRECTORIES ;] IN-CASE
+   [: FILES-REMOVED-DURING-HASHING-PUBLISH-AN-INCOMPLETE-DIRECTORY ;]
+   IN-CASE
+   [: CHANGED-ROOT-FAILS-THE-SCAN-AND-PRESERVES-THE-PUBLICATION ;] IN-CASE
+   [: OBJECTS-ON-ANOTHER-DEVICE-ARE-UNSUPPORTED-AND-UNSCANNED ;] IN-CASE
+   [: CHANGING-FILES-ARE-UNKNOWN-WITHOUT-HIDING-STABLE-FILES ;] IN-CASE
+   [: UNCHANGED-SCAN-FILE-REUSES-CACHED-HASH-WITHOUT-READING-BYTES ;]
+   IN-CASE
+   [: FILE-BESIDE-A-SAME-NAMED-DIRECTORY-KEEPS-ITS-CACHED-HASH ;] IN-CASE
+   [: RECENT-CACHE-ENTRY-IS-REHASHED-AND-OMITTED ;] IN-CASE
+   [: EVERY-FINGERPRINT-FIELD-MISMATCH-REHASHES-THE-FILE ;] IN-CASE
+   [: CACHED-HASH-WITH-A-STORED-DEVICE-IS-REUSED ;] IN-CASE
+   [: SCAN-PUBLICATION-USES-COMPLETION-CUTOFF-FOR-NEW-HASHES ;] IN-CASE
+   [: EXCLUDED-ENTRIES-ARE-NOT-OPENED-HASHED-OR-PUBLISHED ;] IN-CASE
+   [: INACCESSIBLE-FILE-IS-UNKNOWN-BESIDE-A-READABLE-FILE ;] IN-CASE
+   [: DIRECTORY-CHANGED-DURING-THE-SCAN-HIDES-ITS-CONTENTS ;] IN-CASE
+   [: A-DISCARDED-SUBTREE-KEEPS-ITS-VALIDATED-HASHES ;] IN-CASE
+   [: HASHES-THE-WALK-RETAINED-REACH-THE-PUBLICATION ;] IN-CASE
+   TRUNCATING-A-FAILED-ENTRY-KEEPS-ITS-VALIDATED-HASHES ;
+
+public
+
+: SCAN-CASES ( ^ARENA:arena -- ) AR ! CASES ;
+
+;package
+public
+EXPORT SCAN-TEST:SCAN-CASES
 ;package
 
 package LOCAL-TEST
@@ -575,6 +1332,691 @@ SHA256-CTX-BYTES BUFFER: PART
    s" vanished or directory source is source-changed" T-LABEL
    [: SOURCE-CHANGED-CASES ;] IN-CASE-DIR ;
 
+\ ---- download slots
+
+\ One case of Rust's property: the checkpoint at or below x round-trips,
+\ is the last at or before x, and is a whole number of blocks.
+: CHECKPOINT ( n -- )
+   {: x:n :}
+   LOCAL:DOWNLOAD-CHECKPOINT-BYTES {: cp:n :}
+   x cp / cp * {: offset:n :}
+   7 LOCAL:FILLED-BINDING {: seven:LOCAL:binding :}
+   seven offset LOCAL:STATE-ROUND-TRIP
+   {: b:LOCAL:binding at:n found:bool :}
+   found TTRUE at offset T= b seven LOCAL:BINDING= TTRUE
+   offset x <= TTRUE x offset cp + < TTRUE offset BLOCK mod 0 T= ;
+
+\ Rust's range is 0 to 1024 checkpoints and a block; its boundaries are
+\ 0, each checkpoint and the bytes either side of it, and the last.
+: DOWNLOAD-CHECKPOINT-STATE-ENCODES-THE-LAST-COMPLETE-BOUNDARY ( -- )
+   s" download_checkpoint_state_encodes_the_last_complete_boundary"
+   T-LABEL
+   LOCAL:DOWNLOAD-CHECKPOINT-BYTES {: cp:n :}
+   0 CHECKPOINT
+   1025 1 ?do
+      i cp * 1- CHECKPOINT i cp * CHECKPOINT i cp * 1+ CHECKPOINT
+   loop
+   1024 cp * BLOCK + CHECKPOINT ;
+
+32 BUFFER: TEXT-BUF
+
+\ The prefix and n's digits, valid until the next.
+: NUMBERED ( ^u8 n n -- ^u8 n )
+   {: x:^ xu:n k:n :}
+   x TEXT-BUF xu BYTE-COPY
+   k FMT:INT$ {: d:^ du:n :}
+   d TEXT-BUF xu + du BYTE-COPY
+   TEXT-BUF xu du + ;
+
+\ Rust's test_slot_identity: target t's download of c at "revision-<op>".
+: SLOT-IDENTITY
+   ( ^u8 n DROPBOX:hash n n -- LOCAL:download-slot-identity )
+   {: t:^ tu:n c:DROPBOX:hash generation:n op:n :}
+   c s" revision-" op NUMBERED >str DROPBOX:>REV MODEL-REMOTE:MAKE
+   {: r:MODEL:remote :}
+   generation op t tu r LOCAL:NEW-SLOT-IDENTITY ;
+
+: DOWNLOAD ( -- DROPBOX:hash ) s" download" HASH-OF ;
+
+\ The lease of the case directory's slots for the identity, apart.
+: LEASE
+   ( ^u8 n DROPBOX:hash n n [ LOCAL:binding -- bool ]
+     -- n LOCAL:binding bool )
+   {: t:^ tu:n c:DROPBOX:hash generation:n op:n protected :}
+   t tu c generation op SLOT-IDENTITY {: id:LOCAL:download-slot-identity :}
+   ROOT$ id protected LOCAL:LEASE-DOWNLOAD-SLOT LOCAL:LEASE-OF ;
+
+: UNPROTECTED ( LOCAL:binding -- bool ) drop false ;
+
+TYPED-VARIABLE HELD-BINDING LOCAL:binding
+: HELD? ( LOCAL:binding -- bool ) HELD-BINDING @ LOCAL:BINDING= ;
+
+4 TYPED-BUFFER LEASED LOCAL:binding
+variable LEASED-COUNT
+
+: LEASED? ( LOCAL:binding -- bool )
+   {: b:LOCAL:binding :}
+   LEASED-COUNT @ 0 ?do
+      i LEASED @ b LOCAL:BINDING= if true unloop exit then
+   loop false ;
+
+: SLOT-AT ( n -- ^u8 n ) LOCAL:DOWNLOAD-SLOT-NAME AT ;
+
+64 BUFFER: HELD-BYTES
+
+\ The file at the path holds exactly the bytes.
+: HOLDS ( ^u8 n ^u8 n -- )
+   {: p:^ u:n b:^ bu:n :}
+   p u HELD-BYTES 64 FS:READ-ALL {: k:n :}
+   HELD-BYTES k b bu T$= ;
+
+\ The open file carries the binding at offset at.
+: STATE-IS ( fd ^u8 n LOCAL:binding n -- )
+   {: f:fd name:^ nu:n want:LOCAL:binding offset:n :}
+   f name nu LOCAL:SLOT-STATE-OF {: b:LOCAL:binding at:n found:bool :}
+   found TTRUE b want LOCAL:BINDING= TTRUE at offset T= ;
+
+\ The file at name below the root carries the binding at offset at.
+: STATE-AT ( fd ^u8 n LOCAL:binding n -- )
+   {: root:fd name:^ nu:n want:LOCAL:binding offset:n :}
+   root name nu OPEN-AT {: f:fd :}
+   [: f name nu want offset STATE-IS ;] [: f FS:CLOSE-DIR ;] finally ;
+
+variable FILES
+
+: POOL-LEASE ( n -- )
+   {: op:n :}
+   s" target-" op NUMBERED DOWNLOAD 1 op 1+ [: LEASED? ;] LEASE
+   {: slot:n b:LOCAL:binding found:bool :}
+   found if b LEASED-COUNT @ LEASED ! 1 LEASED-COUNT +! then ;
+
+\ A one-slot lease takes a slot per call, so the leases already held
+\ are protected, as one Rust call's leases are from each other.
+: POOL ( fd -- )
+   {: root:fd :}
+   0 LEASED-COUNT !
+   5 0 ?do i POOL-LEASE loop
+   LEASED-COUNT @ 4 T=
+   0 FILES ! ROOT$ [: 2drop 1 FILES +! ;] FS:WALK-FILES FILES @ 4 T=
+   4 0 ?do i SLOT-AT FS:FILE? TTRUE loop ;
+
+: DOWNLOAD-SLOT-POOL-HAS-FOUR-FIXED-PATHS-WITHOUT-OVERFLOW ( -- )
+   s" download_slot_pool_has_four_fixed_paths_without_overflow" T-LABEL
+   [: POOL ;] IN-CASE-DIR ;
+
+: PROTECTED ( fd -- )
+   {: root:fd :}
+   s" held.bin" DOWNLOAD 1 20 [: UNPROTECTED ;] LEASE
+   {: hs:n hb:LOCAL:binding held:bool :}
+   held TTRUE hb HELD-BINDING !
+   hs SLOT-AT s" partial download bytes" FS:WRITE-ALL
+   s" other.bin" DOWNLOAD 1 21 [: HELD? ;] LEASE
+   {: os:n ob:LOCAL:binding other:bool :}
+   other TTRUE os hs <> TTRUE
+   hs SLOT-AT s" partial download bytes" HOLDS
+   root hs LOCAL:DOWNLOAD-SLOT-NAME hb 0 STATE-AT ;
+
+: PROTECTED-DOWNLOAD-SLOT-KEEPS-ITS-BINDING-AND-BYTES ( -- )
+   s" protected_download_slot_keeps_its_binding_and_bytes" T-LABEL
+   [: PROTECTED ;] IN-CASE-DIR ;
+
+: STALE ( n -- ) SLOT-AT s" stale bytes" FS:WRITE-ALL ;
+
+\ The slot is empty and carries the binding at offset 0.
+: EMPTY-SLOT ( fd n LOCAL:binding -- )
+   {: root:fd slot:n b:LOCAL:binding :}
+   slot SLOT-AT FS:FILE-SIZE 0 T=
+   root slot LOCAL:DOWNLOAD-SLOT-NAME b 0 STATE-AT ;
+
+\ A one-slot lease has no empty form to free a stale slot with, so a
+\ second stale slot shows the freeing: the rebinding lease claims the
+\ first and empties the second, its binding kept.
+: STALE-SLOTS ( fd -- )
+   {: root:fd :}
+   TARGET DOWNLOAD 1 10 [: UNPROTECTED ;] LEASE
+   {: old:n ob:LOCAL:binding f0:bool :}
+   f0 TTRUE ob HELD-BINDING ! old STALE
+   s" other.bin" DOWNLOAD 1 30 [: HELD? ;] LEASE
+   {: other:n xb:LOCAL:binding f1:bool :}
+   f1 TTRUE other STALE
+   TARGET DOWNLOAD 2 10 SLOT-IDENTITY LOCAL:SLOT-BINDING
+   ob LOCAL:BINDING= TFALSE
+   TARGET DOWNLOAD 1 11 SLOT-IDENTITY LOCAL:SLOT-BINDING
+   ob LOCAL:BINDING= TFALSE
+   TARGET DOWNLOAD 2 10 [: UNPROTECTED ;] LEASE
+   {: new:n nb:LOCAL:binding f2:bool :}
+   f2 TTRUE
+   root new nb EMPTY-SLOT
+   root other xb EMPTY-SLOT ;
+
+: STALE-SLOT-IS-REBOUND-ACROSS-ROOT-AND-OPERATION-IDENTITY ( -- )
+   s" stale_slot_is_rebound_across_root_and_operation_identity" T-LABEL
+   [: STALE-SLOTS ;] IN-CASE-DIR ;
+
+FS:PATHZ-CAP BUFFER: JOINED2
+32 BUFFER: SLOT-NAME-BUF
+variable SLOT-NAME-U
+FS:PATHZ-CAP BUFFER: SLOT-PATH-BUF
+variable SLOT-PATH-U
+
+\ AT into a buffer of its own.
+: AT2 ( ^u8 n -- ^u8 n )
+   {: p:^ u:n :}
+   ROOT$ p u JOINED2 FS:JOIN-PATH JOINED2 swap ;
+
+: SLOT$ ( -- ^u8 n ) SLOT-NAME-BUF SLOT-NAME-U @ ;
+: SLOT-PATH$ ( -- ^u8 n ) SLOT-PATH-BUF SLOT-PATH-U @ ;
+
+\ Keeps the slot's name and path where only the case reads them.
+: KEEP-SLOT ( n -- )
+   {: slot:n :}
+   slot LOCAL:DOWNLOAD-SLOT-NAME {: p:^ u:n :}
+   p SLOT-NAME-BUF u BYTE-COPY u SLOT-NAME-U !
+   SLOT$ AT {: q:^ qu:n :}
+   q SLOT-PATH-BUF qu BYTE-COPY qu SLOT-PATH-U ! ;
+
+\ Rust's before_reset here: the slot moves to held-slot and a new file
+\ takes its name.
+: SWAP-SLOT ( -- )
+   SLOT$ AT2 s" held-slot" AT FS:RENAME-FILE
+   SLOT$ AT s" replacement" FS:WRITE-ALL ;
+
+: EXPECTED ( -- DROPBOX:hash ) s" expected bytes" HASH-OF ;
+
+\ The reset of the slot open at f, with the swap before its truncate.
+: SWAP-RESET ( fd fd LOCAL:binding -- bool )
+   {: f:fd root:fd b:LOCAL:binding :}
+   f root SLOT$ SLOT-PATH$ b [: SWAP-SLOT ;]
+   LOCAL:RESET-DOWNLOAD-SLOT-FILE-WITH LOCAL:TAKEN? ;
+
+\ prepare_download_slot_at answers a fresh lease's slot opened, which
+\ this case opens itself: it leaves prepare_download_slot_at out.
+: SWAPPED ( fd -- )
+   {: root:fd :}
+   TARGET EXPECTED 1 1 [: UNPROTECTED ;] LEASE
+   {: slot:n b:LOCAL:binding found:bool :}
+   found TTRUE slot KEEP-SLOT
+   root SLOT$ SLOT-PATH$ LOCAL:OPENED-SLOT {: f:fd opened:bool :}
+   opened TTRUE
+   [: f root b SWAP-RESET TFALSE ;] [: f FS:CLOSE-DIR ;] finally
+   SLOT$ AT s" replacement" HOLDS
+   s" held-slot" AT FS:FILE-SIZE 0 T=
+   root s" held-slot" b 0 STATE-AT
+   root s" held-slot" OPEN-AT {: moved:fd :}
+   [: moved TARGET EXPECTED AR @ LOCAL:STAGE-MARKER s" held-slot"
+      LOCAL:MARKER$ s" missing" T$= ;]
+   [: moved FS:CLOSE-DIR ;] finally ;
+
+: PARTIAL-RESET-NEVER-MUTATES-A-SWAPPED-REPLACEMENT ( -- )
+   s" partial_reset_never_mutates_a_swapped_replacement" T-LABEL
+   [: SWAPPED ;] IN-CASE-DIR ;
+
+\ ---- resumed downloads
+
+FS:PATHZ-CAP BUFFER: SYNC-BUF
+variable SYNC-U
+
+: SYNC$ ( -- ^u8 n ) SYNC-BUF SYNC-U @ ;
+
+: WITH-SYNC-ROOT ( fd [ fd -- ] -- )
+   {: case:fd q :}
+   s" sync" AT FS:MAKE-DIR
+   s" sync" AT {: p:^ u:n :}
+   p SYNC-BUF u BYTE-COPY u SYNC-U !
+   SYNC$ s" open test sync root" LOCAL:OPEN-ROOT {: root:fd :}
+   [: root q execute ;] [: root FS:CLOSE-DIR ;] finally ;
+
+\ Runs q on a sync root in the case directory, which holds the slots as
+\ Rust's staging TempDir does.
+: IN-SYNC-ROOT ( [ fd -- ] -- )
+   {: q :}
+   [: q WITH-SYNC-ROOT ;] IN-CASE-DIR ;
+
+\ Rust's test_download_lease: the slot leased for target t's download
+\ of c, root generation 1, operation 1.
+: TEST-LEASE ( ^u8 n DROPBOX:hash -- LOCAL:download-slot-lease )
+   {: t:^ tu:n c:DROPBOX:hash :}
+   t tu c 1 1 SLOT-IDENTITY {: id:LOCAL:download-slot-identity :}
+   ROOT$ id [: UNPROTECTED ;] LOCAL:LEASE-DOWNLOAD-SLOT LOCAL:LEASED ;
+
+: DOWNLOAD-PREPARE
+   ( fd ^u8 n DROPBOX:hash LOCAL:download-slot-lease
+     -- LOCAL:download-preparation )
+   {: root:fd t:^ tu:n c:DROPBOX:hash lease:LOCAL:download-slot-lease :}
+   root SYNC$ t tu c lease AR @ LOCAL:PREPARE-DOWNLOAD-SLOT-AT ;
+
+: DROP-OUTCOME ( LOCAL:stage-outcome<n> -- ) drop ;
+
+\ The preparation's variant, a complete one's outcome and its path; a
+\ ready partial is freed.
+: DOWNLOAD-PREPARATION$ ( LOCAL:download-preparation -- ^u8 n ^u8 n )
+   MATCH LOCAL:download-preparation
+      ready OF LOCAL:CLOSE-PARTIAL s" ready" s" " ENDOF
+      complete OF OUTCOME$ ENDOF
+      ephemeral OF s" ephemeral" s" " ENDOF
+   ;MATCH ;
+
+: PREPARED-AS ( LOCAL:download-preparation ^u8 n -- )
+   {: p:LOCAL:download-preparation want:^ wu:n :}
+   p DOWNLOAD-PREPARATION$ s" " T$= want wu T$= ;
+
+104 constant ECONNRESET
+variable REMAINING
+
+\ Rust's FailingBytes: "x" bytes until none remain, then a reset
+\ connection.
+: FAILING ( ^u8 n -- n )
+   {: dst:^ cap:n :}
+   REMAINING @ 0= if ECONNRESET FS:CAUSE! E-FS-IO throw then
+   REMAINING @ cap min {: k:n :}
+   k 0 ?do $78 dst i + c! loop
+   k negate REMAINING +!
+   k ;
+
+: TOTAL ( -- n ) LOCAL:DOWNLOAD-CHECKPOINT-BYTES BLOCK 2 * + ;
+
+: BOUNDARY ( -- ^u8 n ) s" boundary.bin" ;
+
+: SIZE-OF ( fd -- n ) FS:FD-STAT FS:STAT-SIZE@ ;
+
+\ A download cut after cut bytes leaves written bytes and resumes at
+\ durable.
+: INTERRUPTED ( fd n n n -- )
+   {: root:fd cut:n written:n durable:n :}
+   s" download never reaches verification" HASH-OF {: c:DROPBOX:hash :}
+   BOUNDARY c TEST-LEASE {: lease:LOCAL:download-slot-lease :}
+   root BOUNDARY c lease DOWNLOAD-PREPARE LOCAL:READY-PARTIAL {: x :}
+   x LOCAL:PARTIAL-PATH {: p:^ u:n :}
+   cut REMAINING !
+   [: x TOTAL [: FAILING ;] AR @ LOCAL:APPEND-PARTIAL DROP-OUTCOME ;]
+   LOCAL:E-STAGE-READ TTHROWSQ
+   p u FS:FILE-SIZE written T=
+   root BOUNDARY c lease DOWNLOAD-PREPARE LOCAL:READY-PARTIAL {: y :}
+   y LOCAL:PARTIAL-OFFSET@ durable T=
+   y LOCAL:PARTIAL-FILE SIZE-OF durable T=
+   y LOCAL:CLOSE-PARTIAL ;
+
+: INTERRUPTED-DOWNLOADS-RESUME-FROM-DURABLE-BOUNDARIES ( -- )
+   s" interrupted_downloads_resume_from_durable_boundaries" T-LABEL
+   LOCAL:DOWNLOAD-CHECKPOINT-BYTES {: cp:n :}
+   [: cp 1- cp BLOCK - 0 INTERRUPTED ;] IN-SYNC-ROOT
+   [: cp cp cp INTERRUPTED ;] IN-SYNC-ROOT
+   [: cp 1+ cp cp INTERRUPTED ;] IN-SYNC-ROOT
+   [: cp BLOCK + 1+ cp BLOCK + cp INTERRUPTED ;] IN-SYNC-ROOT ;
+
+\ The prepared partial of target.txt's download of c, its bytes written.
+: WRITTEN
+   ( fd DROPBOX:hash LOCAL:download-slot-lease ^u8 n
+     -- ^LOCAL:download-partial )
+   {: root:fd c:DROPBOX:hash lease:LOCAL:download-slot-lease b:^ bu:n :}
+   root TARGET c lease DOWNLOAD-PREPARE LOCAL:READY-PARTIAL {: x :}
+   x LOCAL:PARTIAL-FILE b bu FD:WRITE-FULL
+   x ;
+
+: STAGE-HOLDS ( ^LOCAL:download-partial ^u8 n -- )
+   {: x b:^ bu:n :}
+   x LOCAL:PARTIAL-STAGE-PATH b bu HOLDS ;
+
+\ install_download is not ported yet: Rust's test then installs the
+\ stage and reads the bytes back at the target.
+: RECOVERED ( fd bool -- )
+   {: root:fd renamed:bool :}
+   s" completed bytes" {: b:^ bu:n :}
+   b bu HASH-OF {: c:DROPBOX:hash :}
+   TARGET c TEST-LEASE {: lease:LOCAL:download-slot-lease :}
+   root c lease b bu WRITTEN {: x :}
+   x AR @ LOCAL:MARK-PARTIAL
+   renamed if x LOCAL:RENAME-TO-STAGE TTRUE then
+   x LOCAL:CLOSE-PARTIAL
+   root TARGET c lease DOWNLOAD-PREPARE
+   renamed if s" already-staged" else s" staged" then PREPARED-AS
+   root TARGET c lease DOWNLOAD-PREPARE s" already-staged" PREPARED-AS
+   x b bu STAGE-HOLDS ;
+
+: COMPLETED-PARTIAL-RECOVERS-BEFORE-AND-AFTER-RENAME ( -- )
+   s" completed_partial_recovers_before_and_after_rename" T-LABEL
+   [: false RECOVERED ;] IN-SYNC-ROOT
+   [: true RECOVERED ;] IN-SYNC-ROOT ;
+
+: RESTARTED-EMPTY ( LOCAL:download-preparation -- )
+   LOCAL:READY-PARTIAL {: y :}
+   y LOCAL:PARTIAL-OFFSET@ 0 T=
+   y LOCAL:PARTIAL-FILE SIZE-OF 0 T=
+   y LOCAL:CLOSE-PARTIAL ;
+
+: CORRUPT ( fd bool -- )
+   {: root:fd owned:bool :}
+   s" complete bytes" HASH-OF {: c:DROPBOX:hash :}
+   TARGET c TEST-LEASE {: lease:LOCAL:download-slot-lease :}
+   root c lease s" incomplete" WRITTEN {: x :}
+   owned 0= if
+      x LOCAL:PARTIAL-FILE LOCAL:DOWNLOAD-PARTIAL-XATTR s" foreign owner"
+      XATTR:SET
+   then
+   x LOCAL:PARTIAL-PATH {: p:^ u:n :}
+   x AR @ LOCAL:MARK-PARTIAL
+   x LOCAL:CLOSE-PARTIAL
+   root TARGET c lease DOWNLOAD-PREPARE
+   {: prep:LOCAL:download-preparation :}
+   owned if prep RESTARTED-EMPTY exit then
+   prep s" ephemeral" PREPARED-AS
+   p u s" incomplete" HOLDS ;
+
+: CORRUPT-COMPLETED-PARTIAL-RESTARTS-ONLY-WHEN-OWNED ( -- )
+   s" corrupt_completed_partial_restarts_only_when_owned" T-LABEL
+   [: true CORRUPT ;] IN-SYNC-ROOT
+   [: false CORRUPT ;] IN-SYNC-ROOT ;
+
+\ Rust's before_move here: the slot moves to held-slot and a new file
+\ takes its name.
+: SWAP-PARTIAL ( ^u8 n -- )
+   {: p:^ u:n :}
+   p u s" held-slot" AT FS:RENAME-FILE
+   p u s" replacement" FS:WRITE-ALL ;
+
+: SWAPPED-PROMOTION ( fd -- )
+   {: root:fd :}
+   s" complete bytes" {: b:^ bu:n :}
+   b bu HASH-OF {: c:DROPBOX:hash :}
+   TARGET c TEST-LEASE {: lease:LOCAL:download-slot-lease :}
+   root c lease b bu WRITTEN {: x :}
+   x AR @ LOCAL:MARK-PARTIAL
+   x LOCAL:PARTIAL-PATH {: p:^ u:n :}
+   [: x [: p u SWAP-PARTIAL ;] AR @ LOCAL:PROMOTE-WITH OUTCOME$
+      p u T$= s" destination-occupied" T$= ;]
+   [: x LOCAL:CLOSE-PARTIAL ;] finally
+   p u s" replacement" HOLDS
+   s" held-slot" AT b bu HOLDS
+   x LOCAL:PARTIAL-STAGE-PATH FS:TRY-LSTAT TFALSE ;
+
+: COMPLETED-PARTIAL-PROMOTION-PRESERVES-A-SWAPPED-REPLACEMENT ( -- )
+   s" completed_partial_promotion_preserves_a_swapped_replacement" T-LABEL
+   [: SWAPPED-PROMOTION ;] IN-SYNC-ROOT ;
+
+\ install_download is not ported yet: Rust's test then installs the
+\ stage and reads the bytes back at the target.
+: CROSS-FILESYSTEM ( fd -- )
+   {: root:fd :}
+   s" complete bytes" {: b:^ bu:n :}
+   b bu HASH-OF {: c:DROPBOX:hash :}
+   TARGET c TEST-LEASE {: lease:LOCAL:download-slot-lease :}
+   root c lease b bu WRITTEN {: x :}
+   x AR @ LOCAL:MARK-PARTIAL
+   [: x AR @ LOCAL:COPY-PARTIAL OUTCOME$ s" " T$= s" staged" T$= ;]
+   [: x LOCAL:CLOSE-PARTIAL ;] finally
+   x LOCAL:PARTIAL-PATH FS:FILE-SIZE 0 T=
+   x b bu STAGE-HOLDS ;
+
+: CROSS-FILESYSTEM-SLOT-COMPLETION-COPIES-REHASHES-AND-FREES-THE-SLOT
+   ( -- )
+   s" cross_filesystem_slot_completion_copies_rehashes_and_frees_the_slot"
+   T-LABEL
+   [: CROSS-FILESYSTEM ;] IN-SYNC-ROOT ;
+
+\ Rust's staged_download(stage_download(...)): b staged from a reader.
+: STAGE-BYTES ( ^u8 n DROPBOX:hash -- )
+   {: b:^ bu:n c:DROPBOX:hash :}
+   b bu START 0 SCHEDULE
+   SYNC$ TARGET c [: FRAGMENT ;] AR @ LOCAL:STAGE-DOWNLOAD OUTCOME$
+   s" " T$= s" staged" T$= ;
+
+\ install_download is not ported yet: Rust's test then installs the
+\ stage and reads the bytes back at the target.
+: ZERO-REPLAY ( fd -- )
+   {: root:fd :}
+   s" complete bytes" {: b:^ bu:n :}
+   b bu HASH-OF {: c:DROPBOX:hash :}
+   TARGET c TEST-LEASE {: lease:LOCAL:download-slot-lease :}
+   root c lease b bu WRITTEN {: x :}
+   x AR @ LOCAL:MARK-PARTIAL
+   x LOCAL:ZERO-CHECKPOINT
+   b bu c STAGE-BYTES
+   x LOCAL:PARTIAL-PATH {: p:^ u:n :}
+   x LOCAL:CLOSE-PARTIAL
+   root TARGET c lease DOWNLOAD-PREPARE s" already-staged" PREPARED-AS
+   p u FS:FILE-SIZE 0 T=
+   root TARGET c lease DOWNLOAD-PREPARE s" already-staged" PREPARED-AS ;
+
+: INTERRUPTED-PARTIAL-RESET-REPLAYS-TO-A-REUSABLE-ZERO-CHECKPOINT ( -- )
+   s" interrupted_partial_reset_replays_to_a_reusable_zero_checkpoint"
+   T-LABEL
+   [: ZERO-REPLAY ;] IN-SYNC-ROOT ;
+
+\ ---- installs
+
+64 BUFFER: READ-BUF
+
+\ The bytes of the file at the name below the case's directory.
+: READ$ ( ^u8 n -- ^u8 n )
+   AT READ-BUF 64 FS:READ-ALL READ-BUF swap ;
+
+: NO-CONTENT ( -- option<DROPBOX:hash> ) OPTION:NONE ;
+: HELD ( ^u8 n -- option<DROPBOX:hash> ) HASH-OF OPTION:SOME ;
+
+: ACTUAL$ ( option<DROPBOX:hash> -- ^u8 n )
+   MATCH option
+      none OF s" none" ENDOF
+      some OF DROPBOX:HASH>STR str> ENDOF
+   ;MATCH ;
+
+\ The outcome's variant, and its path or actual content, else empty.
+: INSTALL$ ( LOCAL:install-outcome -- ^u8 n ^u8 n )
+   MATCH LOCAL:install-outcome
+      installed OF s" installed" s" " ENDOF
+      already-installed OF s" already-installed" s" " ENDOF
+      download-required OF s" download-required" s" " ENDOF
+      stage-destination-occupied OF {: p:str :}
+         s" stage-destination-occupied" p str>
+      ENDOF
+      precondition-changed OF {: a:option<DROPBOX:hash> :}
+         s" precondition-changed" a ACTUAL$
+      ENDOF
+   ;MATCH ;
+
+: REPLACEMENT-PREPARATION$
+   ( LOCAL:replacement-preparation -- ^u8 n ^u8 n )
+   MATCH LOCAL:replacement-preparation
+      prepared OF s" prepared" s" " ENDOF
+      already-prepared OF s" already-prepared" s" " ENDOF
+      precondition-changed OF {: a:option<DROPBOX:hash> :}
+         s" precondition-changed" a ACTUAL$
+      ENDOF
+   ;MATCH ;
+
+: STAGE-NAME$ ( ^u8 n -- ^u8 n ) WANT AR @ LOCAL:STAGE-NAME ;
+
+\ Stages "remote" as t's owned download, as stage_download does for a
+\ top-level target; stage_download is not LOCAL's yet.
+: STAGE-REMOTE ( fd ^u8 n -- )
+   {: root:fd t:^ tu:n :}
+   t tu STAGE-NAME$ {: sn:^ snu:n :}
+   s" remote" START 0 SCHEDULE
+   root sn snu sn snu WANT [: FRAGMENT ;]
+   t tu WANT AR @ LOCAL:STAGE-MARKER >str OPTION:SOME
+   s" stage download" AR @ LOCAL:WRITE-STAGE-OUTCOME OUTCOME$
+   s" " T$= s" staged" T$= ;
+
+\ INSTALL-DOWNLOAD of "remote" at t below the case's directory.
+: INSTALL ( ^u8 n option<DROPBOX:hash> -- ^u8 n ^u8 n )
+   {: t:^ tu:n expected:option<DROPBOX:hash> :}
+   t tu T-LABEL
+   ROOT$ t tu WANT expected AR @ LOCAL:INSTALL-DOWNLOAD INSTALL$ ;
+
+: REPLACEMENT-PREPARE ( ^u8 n ^u8 n -- ^u8 n ^u8 n )
+   {: t:^ tu:n c:^ cu:n :}
+   t tu T-LABEL
+   ROOT$ t tu c cu HASH-OF AR @ LOCAL:PREPARE-REPLACEMENT
+   REPLACEMENT-PREPARATION$ ;
+
+: ABSENT-INSTALL ( fd -- )
+   {: root:fd :}
+   root TARGET STAGE-REMOTE
+   TARGET s" local" PUT-FILE
+   TARGET NO-CONTENT INSTALL
+   s" local" IDENTITY T$= s" precondition-changed" T$=
+   TARGET READ$ s" local" T$= ;
+
+: ABSENT-INSTALL-NEVER-OVERWRITES-AN-EXISTING-FILE ( -- )
+   s" absent_install_never_overwrites_an_existing_file" T-LABEL
+   [: ABSENT-INSTALL ;] IN-CASE-DIR ;
+
+: OPEN-WRITE-AT ( fd ^u8 n -- fd )
+   FS:TRY-OPEN-WRITE-AT MATCH option
+      none OF E-FS-OPEN throw ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+: MUTATED-STAGE ( fd -- )
+   {: root:fd :}
+   root TARGET STAGE-REMOTE
+   TARGET STAGE-NAME$ {: sn:^ snu:n :}
+   sn snu AT FS:MODE-PRIVATE-FILE FS:CHMOD-MODE
+   root sn snu OPEN-WRITE-AT {: w:fd :}
+   [: root ROOT$ TARGET WANT AR @ w LOCAL:INSTALL-RENAME-MUTATED ;]
+   [: w FS:CLOSE-DIR ;] finally
+   root TARGET LOCAL:ENTRY-EXISTS-AT TFALSE
+   sn snu READ$ s" mutant" T$= ;
+
+\ The stage is verified, then changed through a writer opened before it
+\ was sealed; the rename refuses it and leaves both names as they are.
+: INSTALL-REJECTS-STAGE-CHANGED-THROUGH-A-PREEXISTING-WRITER ( -- )
+   s" install_rejects_stage_changed_through_a_preexisting_writer" T-LABEL
+   [: MUTATED-STAGE ;] IN-CASE-DIR ;
+
+64 BUFFER: XATTR-BUF
+
+: PARTIAL? ( fd -- bool )
+   LOCAL:DOWNLOAD-PARTIAL-XATTR XATTR-BUF 64 SPAN:MAKE XATTR:GET
+   MATCH XATTR:got
+      absent OF false ENDOF
+      value OF drop true ENDOF
+      oversize OF true ENDOF
+   ;MATCH ;
+
+: INSTALLED-BYTES ( -- ^u8 n ) s" installed bytes" ;
+: INSTALLED-MARKER ( -- ^u8 n )
+   TARGET INSTALLED-BYTES HASH-OF AR @ LOCAL:STAGE-MARKER ;
+
+\ The download slot words are not LOCAL's yet: the partial marker holds
+\ bytes no slot state decodes, which cleanup removes all the same.
+: MARK-INSTALLED ( fd -- )
+   {: f:fd :}
+   f LOCAL:DOWNLOAD-PARTIAL-XATTR s" slot state" true TARGET
+   s" test mark" LOCAL:SET-XATTR
+   f LOCAL:DOWNLOAD-STAGE-XATTR INSTALLED-MARKER true TARGET
+   s" test mark" LOCAL:SET-XATTR
+   f $100 FD:MODE! f FD:SYNC ;
+
+: REMOVE-PARTIAL ( fd -- )
+   {: f:fd :}
+   f FS:MODE-PRIVATE-FILE FD:MODE!
+   f LOCAL:DOWNLOAD-PARTIAL-XATTR XATTR:ERASE f FD:SYNC ;
+
+: SYNC-INSTALLED ( fd -- )
+   TARGET TARGET INSTALLED-BYTES HASH-OF AR @
+   LOCAL:SYNC-INSTALLED-DOWNLOAD ;
+
+: CLEANED-UP ( fd fd -- )
+   {: root:fd f:fd :}
+   root SYNC-INSTALLED
+   f INSTALLED-MARKER TARGET LOCAL:MARKER$ s" missing" T$=
+   f PARTIAL? TFALSE
+   f FS:FD-STAT FS:STAT-MODE@ FS:MODE-PRIVATE-FILE and
+   FS:MODE-PRIVATE-FILE T=
+   root SYNC-INSTALLED ;
+
+: PARTIAL-CLEANUP ( fd bool -- )
+   {: root:fd removed:bool :}
+   TARGET INSTALLED-BYTES PUT-FILE
+   root TARGET OPEN-WRITE-AT {: f:fd :}
+   [: f MARK-INSTALLED
+      removed if f REMOVE-PARTIAL else f PARTIAL? TTRUE then
+      f INSTALLED-MARKER TARGET LOCAL:MARKER$ s" expected" T$=
+      root f CLEANED-UP ;]
+   [: f FS:CLOSE-DIR ;] finally ;
+
+: INSTALLED-DOWNLOAD-CLEANUP-REPLAYS-AROUND-PARTIAL-MARKER-REMOVAL ( -- )
+   s" installed_download_cleanup_replays_around_partial_marker_removal"
+   T-LABEL
+   [: false PARTIAL-CLEANUP ;] IN-CASE-DIR
+   [: true PARTIAL-CLEANUP ;] IN-CASE-DIR ;
+
+: UNMARKED-RENAME ( fd -- )
+   {: root:fd :}
+   TARGET s" remote" PUT-FILE
+   root TARGET OPEN-AT {: f:fd :}
+   [: f root TARGET WANT AR @ LOCAL:RENAMED-WITHOUT-MARKER
+      root TARGET TARGET WANT AR @ LOCAL:SYNC-INSTALLED-DOWNLOAD ;]
+   [: f FS:CLOSE-DIR ;] finally ;
+
+: RENAMED-DOWNLOAD-REQUIRES-ITS-OWNERSHIP-MARKER ( -- )
+   s" renamed_download_requires_its_ownership_marker" T-LABEL
+   [: UNMARKED-RENAME ;] IN-CASE-DIR ;
+
+\ An absent target: none staged, then installed and installed again.
+: ABSENT-OUTCOMES ( fd -- )
+   {: root:fd :}
+   TARGET NO-CONTENT INSTALL s" " T$= s" download-required" T$=
+   s" missing/target.txt" NO-CONTENT INSTALL
+   s" " T$= s" download-required" T$=
+   root TARGET STAGE-REMOTE
+   TARGET NO-CONTENT INSTALL s" " T$= s" installed" T$=
+   TARGET READ$ s" remote" T$=
+   root TARGET STAGE-NAME$ LOCAL:ENTRY-EXISTS-AT TFALSE
+   TARGET AT FS:TRY-LSTAT TTRUE
+   FS:STAT-MODE@ $1FF and FS:MODE-PRIVATE-FILE T=
+   TARGET NO-CONTENT INSTALL s" " T$= s" already-installed" T$= ;
+
+: OCCUPIED-STAGE ( -- )
+   s" other.txt" STAGE-NAME$ {: sn:^ snu:n :}
+   sn snu s" mutant" PUT-FILE
+   s" other.txt" NO-CONTENT INSTALL
+   sn snu AT T$= s" stage-destination-occupied" T$= ;
+
+\ A replacement installs over the content expected and keeps any other.
+: REPLACEMENT-OUTCOMES ( fd -- )
+   {: root:fd :}
+   s" old.txt" s" local" PUT-FILE
+   root s" old.txt" STAGE-REMOTE
+   s" old.txt" s" local" HELD INSTALL s" " T$= s" installed" T$=
+   s" old.txt" READ$ s" remote" T$=
+   root s" old.txt" s" local" HASH-OF AR @ LOCAL:GUARD-NAME
+   LOCAL:ENTRY-EXISTS-AT TFALSE
+   s" edited.txt" s" edit" PUT-FILE
+   root s" edited.txt" STAGE-REMOTE
+   s" edited.txt" s" local" HELD INSTALL
+   s" edit" IDENTITY T$= s" precondition-changed" T$=
+   s" edited.txt" READ$ s" edit" T$= ;
+
+: INSTALL-CASES ( fd -- )
+   {: root:fd :}
+   root ABSENT-OUTCOMES OCCUPIED-STAGE root REPLACEMENT-OUTCOMES ;
+
+: EACH-INSTALL-OUTCOME-IS-REACHED ( -- )
+   s" each install outcome is reached" T-LABEL
+   [: INSTALL-CASES ;] IN-CASE-DIR ;
+
+: PREPARE-CASES ( fd -- )
+   {: root:fd :}
+   s" prep.txt" s" old" PUT-FILE
+   s" prep.txt" s" old" REPLACEMENT-PREPARE s" " T$= s" prepared" T$=
+   root s" prep.txt" LOCAL:ENTRY-EXISTS-AT TFALSE
+   s" prep.txt" s" old" HASH-OF AR @ LOCAL:GUARD-NAME READ$ s" old" T$=
+   s" prep.txt" s" old" REPLACEMENT-PREPARE
+   s" " T$= s" already-prepared" T$=
+   s" other.txt" s" new" PUT-FILE
+   s" other.txt" s" old" REPLACEMENT-PREPARE
+   s" new" IDENTITY T$= s" precondition-changed" T$=
+   s" other.txt" READ$ s" new" T$=
+   s" absent.txt" s" old" REPLACEMENT-PREPARE
+   s" none" T$= s" precondition-changed" T$=
+   s" missing/file.txt" s" old" REPLACEMENT-PREPARE
+   s" none" T$= s" precondition-changed" T$= ;
+
+: EACH-REPLACEMENT-PREPARATION-IS-REACHED ( -- )
+   s" each replacement preparation is reached" T-LABEL
+   [: PREPARE-CASES ;] IN-CASE-DIR ;
+
 \ ---- parents
 
 : INODE ( fd -- n ) FS:FD-STAT FS:STAT-INO@ ;
@@ -684,10 +2126,167 @@ SHA256-CTX-BYTES BUFFER: PART
    s" unsafe parent path fails" T-LABEL
    [: UNSAFE-PARENTS ;] IN-CASE-DIR ;
 
+\ ---- deletes
+
+: OLD ( -- DROPBOX:hash ) s" old" HASH-OF ;
+
+\ The outcome's variant, and its actual hash, else empty.
+: DELETED$ ( LOCAL:delete-outcome -- ^u8 n ^u8 n )
+   MATCH LOCAL:delete-outcome
+      deleted OF s" deleted" s" " ENDOF
+      already-deleted OF s" already-deleted" s" " ENDOF
+      precondition-changed OF {: c:option<DROPBOX:hash> :}
+         s" precondition-changed" c ACTUAL$
+      ENDOF
+   ;MATCH ;
+
+\ Deletes target.txt below the case directory while it holds "old".
+: DELETE ( -- ^u8 n ^u8 n )
+   ROOT$ TARGET OLD AR @ LOCAL:DELETE-LOCAL DELETED$ ;
+
+: GUARD ( -- ^u8 n ) s" deleted" TARGET OLD AR @ LOCAL:INTERNAL-NAME ;
+
+64 BUFFER: BACK
+
+\ The bytes of the file at the name below the case directory.
+: BYTES ( ^u8 n -- ^u8 n ) AT BACK 64 FS:READ-ALL BACK swap ;
+
+: PRESENT? ( ^u8 n -- bool ) AT FS:TRY-LSTAT ;
+
+: DELETE-REPLAY ( fd -- )
+   {: root:fd :}
+   TARGET s" old" PUT-FILE
+   root TARGET root GUARD FS:TRY-RENAME-AT TTRUE
+   TARGET s" raced edit" PUT-FILE
+   DELETE s" raced edit" IDENTITY T$= s" precondition-changed" T$=
+   TARGET BYTES s" raced edit" T$=
+   GUARD PRESENT? TFALSE ;
+
+: DELETE-REPLAY-PRESERVES-A-RACED-EDIT-AND-REMOVES-ITS-GUARD ( -- )
+   s" delete_replay_preserves_a_raced_edit_and_removes_its_guard" T-LABEL
+   [: DELETE-REPLAY ;] IN-CASE-DIR ;
+
+\ An interrupted delete's guard holding other bytes goes back.
+: GUARD-RESTORED ( -- )
+   s" guard restored" T-LABEL
+   GUARD s" edited" PUT-FILE
+   DELETE s" edited" IDENTITY T$= s" precondition-changed" T$=
+   TARGET BYTES s" edited" T$=
+   GUARD PRESENT? TFALSE ;
+
+: DELETE-CASES ( fd -- )
+   {: root:fd :}
+   s" deleted" T-LABEL
+   TARGET s" old" PUT-FILE
+   DELETE s" " T$= s" deleted" T$=
+   TARGET PRESENT? TFALSE GUARD PRESENT? TFALSE
+   s" already deleted" T-LABEL
+   DELETE s" " T$= s" already-deleted" T$=
+   s" precondition changed" T-LABEL
+   TARGET s" new" PUT-FILE
+   DELETE s" new" IDENTITY T$= s" precondition-changed" T$=
+   TARGET BYTES s" new" T$=
+   TARGET AT FS:REMOVE-FILE
+   GUARD-RESTORED ;
+
+\ precondition-changed with none needs the guard to vanish between its
+\ hash and its restore, a race a scratch tree cannot stage; left out.
+: EACH-DELETE-OUTCOME-IS-REACHED ( -- )
+   s" each delete outcome is reached" T-LABEL
+   [: DELETE-CASES ;] IN-CASE-DIR ;
+
+\ ---- directories
+
+: CREATED$ ( LOCAL:create-directory-outcome -- ^u8 n )
+   MATCH LOCAL:create-directory-outcome
+      created OF s" created" ENDOF
+      already-present OF s" already-present" ENDOF
+      fresh-observation OF s" fresh-observation" ENDOF
+   ;MATCH ;
+
+: REMOVED$ ( LOCAL:delete-directory-outcome -- ^u8 n )
+   MATCH LOCAL:delete-directory-outcome
+      deleted OF s" deleted" ENDOF
+      already-absent OF s" already-absent" ENDOF
+      fresh-observation OF s" fresh-observation" ENDOF
+   ;MATCH ;
+
+: MKDIR ( fd ^u8 n ^u8 n -- )
+   {: root:fd p:^ u:n want:^ wu:n :}
+   p u T-LABEL
+   root p u LOCAL:CREATE-DIRECTORY-AT CREATED$ want wu T$= ;
+
+: RMDIR ( fd ^u8 n ^u8 n -- )
+   {: root:fd p:^ u:n want:^ wu:n :}
+   p u T-LABEL
+   root p u LOCAL:DELETE-DIRECTORY-AT REMOVED$ want wu T$= ;
+
+: DIRECTORY-EFFECTS ( fd -- )
+   {: root:fd :}
+   root s" parent/child" s" created" MKDIR
+   root s" parent/child" s" already-present" MKDIR
+   root s" parent" s" fresh-observation" RMDIR
+   root s" parent/child" s" deleted" RMDIR
+   root s" parent" s" deleted" RMDIR
+   s" occupied" s" preserved bytes" PUT-FILE
+   root s" occupied" s" fresh-observation" MKDIR
+   root s" occupied" s" fresh-observation" RMDIR
+   s" occupied" BYTES s" preserved bytes" T$=
+   root s" parent" s" already-absent" RMDIR ;
+
+\ local.rs's test, then the absent directory's outcome.
+: DIRECTORY-EFFECTS-ARE-NONOVERWRITING-AND-NONRECURSIVE ( -- )
+   s" directory_effects_are_nonoverwriting_and_nonrecursive" T-LABEL
+   [: DIRECTORY-EFFECTS ;] IN-CASE-DIR ;
+
+\ ---- conflicts
+
+\ The outcome's variant, and its path or actual hash.
+: CONFLICT$ ( LOCAL:conflict-outcome -- ^u8 n ^u8 n )
+   MATCH LOCAL:conflict-outcome
+      created OF {: p:str :} s" created" p str> ENDOF
+      already-present OF {: p:str :} s" already-present" p str> ENDOF
+      content-changed OF {: c:DROPBOX:hash :}
+         s" content-changed" c DROPBOX:HASH>STR str>
+      ENDOF
+   ;MATCH ;
+
+: ORIGINAL ( -- ^u8 n ) s" dir/original.txt" ;
+
+\ Materializes the bytes as ORIGINAL's remote conflict copy of "remote".
+: MATERIALIZED ( ^u8 n -- ^u8 n ^u8 n )
+   {: b:^ bu:n :}
+   b bu START 0 SCHEDULE
+   ROOT$ ORIGINAL LOCAL-CONFLICT--SIDE:remote WANT [: FRAGMENT ;] AR @
+   LOCAL:MATERIALIZE-CONFLICT CONFLICT$ ;
+
+: COPY-PATH ( -- ^u8 n )
+   ORIGINAL LOCAL-CONFLICT--SIDE:remote WANT AR @
+   LOCAL:CONFLICT-RELATIVE-PATH ;
+
+: CONFLICT-CASES ( fd -- )
+   {: root:fd :}
+   s" created" T-LABEL
+   s" remote" MATERIALIZED COPY-PATH T$= s" created" T$=
+   COPY-PATH BYTES s" remote" T$=
+   COPY-PATH drop 4 s" dir/" T$=
+   s" already present" T-LABEL
+   s" remote" MATERIALIZED COPY-PATH T$= s" already-present" T$=
+   s" content changed" T-LABEL
+   COPY-PATH AT FS:REMOVE-FILE
+   s" mutant" MATERIALIZED s" mutant" IDENTITY T$=
+   s" content-changed" T$=
+   COPY-PATH PRESENT? TFALSE ;
+
+: EACH-CONFLICT-OUTCOME-IS-REACHED ( -- )
+   s" each conflict outcome is reached" T-LABEL
+   [: CONFLICT-CASES ;] IN-CASE-DIR ;
+
 : CASES ( -- )
    ENTRY-EXISTENCE-NEVER-FOLLOWS-SYMLINKS-AND-TREATS-PROBE-FAILURES-AS-UNCONFIRMED
    DROPBOX-HASH-USES-BLOCK-HASH-COMPOSITION
    DROPBOX-HASH-AND-COPY-ARE-INDEPENDENT-OF-READER-FRAGMENTATION
+   AR @ LOCAL:SCAN-CASES
    MARKER-IS-RUSTS
    STAGE-MARKER-IS-SET-READ-AND-REMOVED
    EACH-DOWNLOAD-STAGE-IS-INSPECTED
@@ -700,7 +2299,28 @@ SHA256-CTX-BYTES BUFFER: PART
    MISSING-PARENT-IS-NONE-WITHOUT-CREATE
    CREATE-MAKES-PRIVATE-PARENTS
    SYMLINK-PARENT-IS-REFUSED
-   UNSAFE-PARENT-PATH-FAILS ;
+   UNSAFE-PARENT-PATH-FAILS
+   DOWNLOAD-CHECKPOINT-STATE-ENCODES-THE-LAST-COMPLETE-BOUNDARY
+   PARTIAL-RESET-NEVER-MUTATES-A-SWAPPED-REPLACEMENT
+   DOWNLOAD-SLOT-POOL-HAS-FOUR-FIXED-PATHS-WITHOUT-OVERFLOW
+   PROTECTED-DOWNLOAD-SLOT-KEEPS-ITS-BINDING-AND-BYTES
+   STALE-SLOT-IS-REBOUND-ACROSS-ROOT-AND-OPERATION-IDENTITY
+   INTERRUPTED-DOWNLOADS-RESUME-FROM-DURABLE-BOUNDARIES
+   COMPLETED-PARTIAL-RECOVERS-BEFORE-AND-AFTER-RENAME
+   CORRUPT-COMPLETED-PARTIAL-RESTARTS-ONLY-WHEN-OWNED
+   COMPLETED-PARTIAL-PROMOTION-PRESERVES-A-SWAPPED-REPLACEMENT
+   CROSS-FILESYSTEM-SLOT-COMPLETION-COPIES-REHASHES-AND-FREES-THE-SLOT
+   INTERRUPTED-PARTIAL-RESET-REPLAYS-TO-A-REUSABLE-ZERO-CHECKPOINT
+   ABSENT-INSTALL-NEVER-OVERWRITES-AN-EXISTING-FILE
+   INSTALL-REJECTS-STAGE-CHANGED-THROUGH-A-PREEXISTING-WRITER
+   INSTALLED-DOWNLOAD-CLEANUP-REPLAYS-AROUND-PARTIAL-MARKER-REMOVAL
+   RENAMED-DOWNLOAD-REQUIRES-ITS-OWNERSHIP-MARKER
+   EACH-INSTALL-OUTCOME-IS-REACHED
+   EACH-REPLACEMENT-PREPARATION-IS-REACHED
+   DIRECTORY-EFFECTS-ARE-NONOVERWRITING-AND-NONRECURSIVE
+   DELETE-REPLAY-PRESERVES-A-RACED-EDIT-AND-REMOVES-ITS-GUARD
+   EACH-DELETE-OUTCOME-IS-REACHED
+   EACH-CONFLICT-OUTCOME-IS-REACHED ;
 
 public
 

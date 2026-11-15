@@ -1,9 +1,14 @@
 \ local.f - package LOCAL: the local half of a sync (docs/habu-rewrite.md,
 \ the LOCAL row) on Habu's anchored file words: its errors, the opens it
 \ confines below the sync root, Dropbox content hashes of local files, the
-\ verified stages a download writes, with their xattr markers, and the
-\ upload stages named by their content's hash, which a Habu and a Rust
-\ daemon share.
+\ scan that observes every entry below the root, the upload stages named
+\ by their content's hash, which a Habu and a Rust daemon share, the
+\ verified stages a download writes, with their xattr markers, the slots
+\ in the state home where a download's partial bytes resume, the partials
+\ themselves, checkpointed and promoted into their stages, their installs
+\ over a target that still holds what the journal expects, and the
+\ conditional deletes of local files, the directories a sync creates and
+\ deletes, and the conflict copies it writes.
 \ A relative path splits as Rust's Path::components splits it: empty and "."
 \ components past the first are skipped, and an empty, absolute or leading "."
 \ path, or one with a ".." component, is unsafe. Each component opens
@@ -11,14 +16,28 @@
 \ is followed: a last component that is one fails ELOOP, as openat2's
 \ RESOLVE_NO_SYMLINKS does, and a parent that is one fails ENOTDIR where
 \ openat2 answers ELOOP. A parent in a path opens by O_PATH, so it needs
-\ search permission only. A failure is logged once with its text before LOCAL
-\ throws its code; an io failure's errno stays in FS:ERRNO, 0 where the
-\ Habu word that failed keeps none.
+\ search permission only. An io failure's errno stays in FS:ERRNO, 0 where
+\ the Habu word that failed keeps none.
+\ LOCAL logs a failure once, with its text, where it throws, unless the
+\ failure is the outcome of an entry the scan observes: inside an
+\ observation a failure logs nothing, except one whose errno is
+\ exhaustion, which ends the scan; so a file that changes while it is
+\ hashed logs nothing on every pass.
+\ The scan walks the root depth first, each directory's names in byte order,
+\ and collects observations, cached hashes it may reuse and files to hash; a
+\ failure that concerns one entry publishes that entry as unknown and drops
+\ everything collected beneath it. It then hashes the files, revalidates the
+\ cached ones and every directory, drops the subtree of a directory that
+\ changed, and checks the root is the one it opened.
 \ STORAGE CLASS. PROCESS-WIDE: the content hasher, its read buffer, the
-\ name hasher, the marker read buffer, and a collection's listing buffer
-\ and names; one task syncs, so one uses them at a time. CALLER-OWNED:
-\ every descriptor answered, the hashes, names and staged uploads laid in
-\ the caller's arena, and the paths a stage's result names.
+\ name hasher, the marker and slot state buffers, the slot name and path
+\ buffers, a lease's slot table, the byte a partial's end is probed with,
+\ an upload collection's listing buffer and names, the scan's directory
+\ listing context and the depth of the entry observations open; one task
+\ syncs, so one uses them at a time. CALLER-OWNED: every descriptor
+\ answered, the hashes, names, paths, vectors, staged uploads and partials
+\ laid in the caller's arena, the paths a stage's result names and a
+\ lease's slot directory.
 
 require src/lib/error.f
 require src/lib/string.f
@@ -27,11 +46,14 @@ require src/lib/arena.f
 require src/lib/log.f
 require src/lib/adt/option.f
 require src/lib/fs.f
+require src/lib/fs-mutate.f
 require src/lib/fs-anchored.f
 require src/lib/fs-list.f
 require src/lib/allocator.f
 require src/lib/fd.f
 require src/lib/xattr.f
+require src/lib/vector.f
+require src/lib/sort.f
 require src/dropbox.f
 require src/model.f
 
@@ -82,11 +104,41 @@ $2E constant DOT
    e 0= if exit then
    s" : errno " LOG:TEXT+ e LOG:INT+ ;
 
+\ Out of descriptors, memory or space, the next entry would fail the same
+\ way: Rust's EXHAUSTION, which says nothing about the object observed.
+: EXHAUSTED? ( n -- bool )
+   {: e:n :}
+   e FS:EMFILE = e FS:ENFILE = or e FS:ENOMEM = or e FS:ENOSPC = or ;
+
+\ Rust's REPLACED: the walk resolved the path moments ago, so a missing
+\ component, one no longer a directory, a symlink where none was or a
+\ stale handle mean the object moved under the scan.
+: REPLACED? ( n -- bool )
+   {: e:n :}
+   e FS:ENOENT = e FS:ENOTDIR = or e FS:ELOOP = or e FS:ESTALE = or ;
+
+\ How many entry observations OBSERVING has open; inside one, a failure
+\ is the entry's outcome unless its errno, 0 for none, is exhaustion.
+variable OBSERVING-DEPTH
+
+: OUTCOME? ( n -- bool )
+   {: e:n :}
+   OBSERVING-DEPTH @ 0 > e EXHAUSTED? 0= and ;
+
+\ Runs q, which observes one entry, and answers what it threw, 0 for none.
+: OBSERVING ( [ -- ] -- n )
+   {: q :}
+   1 OBSERVING-DEPTH +!
+   [: q execute ;] catch
+   -1 OBSERVING-DEPTH +! ;
+
 \ Logs "local path `p`" and the text after it, then throws code.
 : PATH-FAILS ( ^u8 n ^u8 n n -- )
    {: p:^ u:n t:^ tu:n code:n :}
-   LOG-OPEN s" local path " LOG:TEXT+ p u QUOTED+
-   t tu LOG:TEXT+ LOG:;LINE
+   0 OUTCOME? 0= if
+      LOG-OPEN s" local path " LOG:TEXT+ p u QUOTED+
+      t tu LOG:TEXT+ LOG:;LINE
+   then
    code throw ;
 
 : UNSAFE ( ^u8 n -- )
@@ -103,29 +155,37 @@ $2E constant DOT
 \ The operation, then the path, as every word below takes them.
 : CHANGED-FAILS ( ^u8 n ^u8 n n -- )
    {: o:^ ou:n p:^ u:n code:n :}
-   LOG-OPEN s" local path " LOG:TEXT+ p u QUOTED+
-   s"  changed during " LOG:TEXT+ o ou QUOTED+ LOG:;LINE
+   0 OUTCOME? 0= if
+      LOG-OPEN s" local path " LOG:TEXT+ p u QUOTED+
+      s"  changed during " LOG:TEXT+ o ou QUOTED+ LOG:;LINE
+   then
    code throw ;
 
 : CHANGED ( ^u8 n ^u8 n -- ) E-CHANGED CHANGED-FAILS ;
 
 : INVALID-HASH ( ^u8 n -- )
    {: o:^ ou:n :}
-   LOG-OPEN s" operation " LOG:TEXT+ o ou QUOTED+
-   s"  requires a lowercase Dropbox content hash" LOG:TEXT+ LOG:;LINE
+   0 OUTCOME? 0= if
+      LOG-OPEN s" operation " LOG:TEXT+ o ou QUOTED+
+      s"  requires a lowercase Dropbox content hash" LOG:TEXT+ LOG:;LINE
+   then
    E-CONTENT-HASH throw ;
 
 : CORRUPT ( ^u8 n ^u8 n -- )
    {: o:^ ou:n p:^ u:n :}
-   LOG-OPEN s" private local file for " LOG:TEXT+ o ou QUOTED+
-   s"  at " LOG:TEXT+ p u QUOTED+
-   s"  failed content verification" LOG:TEXT+ LOG:;LINE
+   0 OUTCOME? 0= if
+      LOG-OPEN s" private local file for " LOG:TEXT+ o ou QUOTED+
+      s"  at " LOG:TEXT+ p u QUOTED+
+      s"  failed content verification" LOG:TEXT+ LOG:;LINE
+   then
    E-CORRUPT throw ;
 
 : OCCUPIED ( ^u8 n ^u8 n -- )
    {: o:^ ou:n p:^ u:n :}
-   LOG-OPEN s" non-overwriting operation " LOG:TEXT+ o ou QUOTED+
-   s"  found unrelated bytes at " LOG:TEXT+ p u QUOTED+ LOG:;LINE
+   0 OUTCOME? 0= if
+      LOG-OPEN s" non-overwriting operation " LOG:TEXT+ o ou QUOTED+
+      s"  found unrelated bytes at " LOG:TEXT+ p u QUOTED+ LOG:;LINE
+   then
    E-OCCUPIED throw ;
 
 \ Rust's io_failure, throwing code: FS:ERRNO holds the errno, kept across
@@ -133,8 +193,10 @@ $2E constant DOT
 : IO-FAILS ( ^u8 n ^u8 n n -- )
    {: o:^ ou:n p:^ u:n code:n :}
    FS:ERRNO {: e:n :}
-   LOG-OPEN s" local filesystem operation " LOG:TEXT+ o ou QUOTED+
-   s"  failed for " LOG:TEXT+ p u QUOTED+ e ERRNO+ LOG:;LINE
+   e OUTCOME? 0= if
+      LOG-OPEN s" local filesystem operation " LOG:TEXT+ o ou QUOTED+
+      s"  failed for " LOG:TEXT+ p u QUOTED+ e ERRNO+ LOG:;LINE
+   then
    e FS:CAUSE! code throw ;
 
 : IO-FAILURE ( ^u8 n ^u8 n -- ) E-IO IO-FAILS ;
@@ -148,8 +210,10 @@ $2E constant DOT
 : STAGE-READ ( ^u8 n ^u8 n -- )
    {: o:^ ou:n p:^ u:n :}
    FS:ERRNO {: e:n :}
-   LOG-OPEN s" could not read stage input during " LOG:TEXT+ o ou QUOTED+
-   s"  for " LOG:TEXT+ p u QUOTED+ e ERRNO+ LOG:;LINE
+   e OUTCOME? 0= if
+      LOG-OPEN s" could not read stage input during " LOG:TEXT+
+      o ou QUOTED+ s"  for " LOG:TEXT+ p u QUOTED+ e ERRNO+ LOG:;LINE
+   then
    e FS:CAUSE! E-STAGE-READ throw ;
 
 \ Rust's From<StageIoError> for LocalError: a stage read is an io failure.
@@ -160,9 +224,11 @@ $2E constant DOT
 
 : HASH-READ ( -- )
    FS:ERRNO {: e:n :}
-   LOG-OPEN
-   s" could not read bytes while computing the Dropbox content hash"
-   LOG:TEXT+ e ERRNO+ LOG:;LINE
+   e OUTCOME? 0= if
+      LOG-OPEN
+      s" could not read bytes while computing the Dropbox content hash"
+      LOG:TEXT+ e ERRNO+ LOG:;LINE
+   then
    e FS:CAUSE! E-HASH-READ throw ;
 
 \ The codes Habu's file and xattr words throw.
@@ -496,10 +562,6 @@ SHA256-CTX-BYTES BUFFER: NAME-CTX
 
 \ ---- opens
 
-: EXHAUSTED? ( n -- bool )
-   {: e:n :}
-   e FS:EMFILE = e FS:ENFILE = or e FS:ENOMEM = or e FS:ENOSPC = or ;
-
 \ Opens the components of p before u from dir, which it then closes, each
 \ by O_PATH: some, or none with FS:ERRNO set; and the offset past the
 \ last component it tried.
@@ -724,6 +786,829 @@ private
    [: f FD:SYNC ;] [: o ou p u IO-FAILURE ;] FS-FAILS ;
 
 : SYNC-FILE ( fd ^u8 n ^u8 n -- ) SYNC-DIRECTORY ;
+
+\ Syncs the regular file at the name and its entry; none there is a
+\ change.
+: SYNC-INSTALLED-FILE ( fd ^u8 n ^u8 n -- )
+   {: dir:fd name:^ nu:n p:^ u:n :}
+   s" open installed file for sync" {: o:^ ou:n :}
+   dir name nu p u o ou OPEN-REGULAR-AT-IF-PRESENT MATCH option
+      none OF o ou p u CHANGED ENDOF
+      some OF OPENED-UNMAKE {: f:fd st:stat :}
+         [: f p u s" sync installed file" SYNC-FILE ;] [: f DISCARD ;]
+         finally
+      ENDOF
+   ;MATCH
+   dir p u s" sync installed file entry" SYNC-DIRECTORY ;
+
+\ ---- the scan
+
+\ Seconds a hash's file must have kept still before the cache may reuse
+\ the hash: more than FAT's two-second mtime tick. The cache needs coherent
+\ local metadata; stale network metadata is not supported.
+3 constant RACY-WINDOW
+1000000000 constant NS-PER-S
+
+\ The time a reusable hash's file was last changed before.
+STRUCTURE cutoff
+   FIELD seconds n
+   FIELD nanoseconds n
+;STRUCTURE
+
+\ A directory the walk listed, and its stat before the listing.
+STRUCTURE scanned-directory
+   FIELD path str
+   FIELD before stat
+;STRUCTURE
+
+\ A file the walk found and no cached hash covers.
+STRUCTURE hash-job
+   FIELD path str
+   FIELD fingerprint MODEL:fingerprint
+;STRUCTURE
+
+STRUCTURE scanned-hash
+   FIELD record MODEL:hash-record
+   FIELD reusable bool
+;STRUCTURE
+
+\ The hashes a stage confirmed, and the files it could not observe again.
+STRUCTURE scan-hash-results
+   FIELD records ^VEC:vector<scanned-hash>
+   FIELD unknown ^VEC:vector<MODEL:local-record>
+;STRUCTURE
+
+\ Every collection's count before one entry was scanned. The walk is depth
+\ first, so what an entry adds is a suffix of each, which one truncation
+\ discards.
+STRUCTURE scan-mark
+   FIELD observations n
+   FIELD cached-files n
+   FIELD directories n
+   FIELD hash-jobs n
+;STRUCTURE
+
+\ What the walk collects; retained holds cached hashes it validated beneath
+\ an entry it later discarded.
+STRUCTURE scan-entries
+   FIELD observations ^VEC:vector<MODEL:local-record>
+   FIELD cached-files ^VEC:vector<MODEL:hash-record>
+   FIELD retained ^VEC:vector<MODEL:hash-record>
+   FIELD directories ^VEC:vector<scanned-directory>
+   FIELD hash-jobs ^VEC:vector<hash-job>
+;STRUCTURE
+
+\ What every step of the walk reads and none changes. A directory on a
+\ device other than root-device, the sync root's, is out of scope.
+STRUCTURE scan-context
+   FIELD cache ^VEC:vector<MODEL:hash-record>
+   FIELD cutoff option<cutoff>
+   FIELD root-device n
+   FIELD arena ^ARENA:arena
+;STRUCTURE
+
+\ An enumerated root whose files are still to hash; it owns root-fd.
+STRUCTURE pending-scan
+   FIELD root str
+   FIELD root-fd fd
+   FIELD root-before stat
+   FIELD entries scan-entries
+   FIELD arena ^ARENA:arena
+;STRUCTURE
+
+public
+
+\ A complete local inventory, safe to publish for absence decisions: its
+\ observations and the hashes a later scan may reuse, each in path-byte
+\ order. The root binding the journal stores beside it is JOURNAL's.
+STRUCTURE complete-scan OPAQUE
+   FIELD observations ^VEC:vector<MODEL:local-record>
+   FIELD reusable-hashes ^VEC:vector<MODEL:hash-record>
+;STRUCTURE
+
+\ Published while the scanned root still is the active journal
+\ generation's; root-changed when the configured path names another.
+ENUM scan-publication
+   VARIANT published FIELD scan complete-scan ;VARIANT
+   VARIANT root-changed ;VARIANT
+;ENUM
+
+: SCAN-OBSERVATIONS ( complete-scan -- ^VEC:vector<MODEL:local-record> )
+   COMPLETE-SCAN-UNMAKE drop ;
+
+private
+
+\ ---- the hash cache's cutoff
+
+\ Rust's hash_cache_cutoff, from seconds since the epoch: Habu's clock reads
+\ no finer, and the second's start only makes fewer hashes reusable.
+: HASH-CACHE-CUTOFF ( n -- option<cutoff> )
+   {: now:n :}
+   now RACY-WINDOW - {: s:n :}
+   s 0 < if OPTION:NONE exit then
+   s 0 CUTOFF-MAKE OPTION:SOME ;
+
+: TIMESTAMP-IS-BEFORE ( n n cutoff -- bool )
+   {: s:n ns:n c:cutoff :}
+   c CUTOFF-UNMAKE {: cs:n cns:n :}
+   ns 0 < ns NS-PER-S >= or if false exit then
+   s cs < if true exit then
+   s cs = ns cns < and ;
+
+: RECORD-FINGERPRINT ( MODEL:hash-record -- MODEL:fingerprint )
+   MODEL-HASH--RECORD:UNMAKE
+   {: p:MODEL:path f:MODEL:fingerprint c:DROPBOX:hash :} f ;
+
+: RECORD-CONTENT ( MODEL:hash-record -- DROPBOX:hash )
+   MODEL-HASH--RECORD:UNMAKE
+   {: p:MODEL:path f:MODEL:fingerprint c:DROPBOX:hash :} c ;
+
+: RECORD-PATH ( MODEL:hash-record -- ^u8 n )
+   MODEL-HASH--RECORD:UNMAKE
+   {: p:MODEL:path f:MODEL:fingerprint c:DROPBOX:hash :}
+   p MODEL:PATH>STR str> ;
+
+: HASH-IS-REUSABLE ( MODEL:hash-record option<cutoff> -- bool )
+   {: r:MODEL:hash-record o:option<cutoff> :}
+   r RECORD-FINGERPRINT MODEL-FINGERPRINT:UNMAKE {: i s ms mn cs cn :}
+   o MATCH option
+      none OF false ENDOF
+      some OF {: c:cutoff :}
+         ms mn c TIMESTAMP-IS-BEFORE cs cn c TIMESTAMP-IS-BEFORE and
+      ENDOF
+   ;MATCH ;
+
+: NO-CUTOFF ( -- option<cutoff> ) OPTION:NONE ;
+
+: CURRENT-HASH-CACHE-CUTOFF ( -- option<cutoff> )
+   epoch-seconds HASH-CACHE-CUTOFF ;
+
+\ ---- the walk's collections
+
+: NEW-VEC ( ^ARENA:arena width<t> -- ^VEC:vector<t> )
+   {: ar:^ARENA:arena w :}
+   ar ARENA:ALLOCATOR 0 w VEC:NEW ;
+
+: NEW-ENTRIES ( ^ARENA:arena -- scan-entries )
+   {: ar:^ARENA:arena :}
+   ar [type] MODEL:local-record NEW-VEC
+   ar [type] MODEL:hash-record NEW-VEC
+   ar [type] MODEL:hash-record NEW-VEC
+   ar [type] scanned-directory NEW-VEC
+   ar [type] hash-job NEW-VEC
+   SCAN-ENTRIES-MAKE ;
+
+: OBSERVED ( scan-entries -- ^VEC:vector<MODEL:local-record> )
+   SCAN-ENTRIES-UNMAKE {: o c r d j :} o ;
+
+: CACHED ( scan-entries -- ^VEC:vector<MODEL:hash-record> )
+   SCAN-ENTRIES-UNMAKE {: o c r d j :} c ;
+
+: DIRECTORIES ( scan-entries -- ^VEC:vector<scanned-directory> )
+   SCAN-ENTRIES-UNMAKE {: o c r d j :} d ;
+
+: JOBS ( scan-entries -- ^VEC:vector<hash-job> )
+   SCAN-ENTRIES-UNMAKE {: o c r d j :} j ;
+
+: MARK ( scan-entries -- scan-mark )
+   SCAN-ENTRIES-UNMAKE {: o c r d j :}
+   o VEC:COUNT c VEC:COUNT d VEC:COUNT j VEC:COUNT SCAN-MARK-MAKE ;
+
+\ A cached hash was validated against the file it names before the walk
+\ met the entry that failed, so it moves to retained: dropping it would
+\ rehash an untouched subtree on every later pass.
+: TRUNCATE ( scan-entries scan-mark -- )
+   {: en:scan-entries mk:scan-mark :}
+   en SCAN-ENTRIES-UNMAKE {: o c r d j :}
+   mk SCAN-MARK-UNMAKE {: mo:n mc:n md:n mj:n :}
+   o mo VEC:RESIZE
+   mc c VEC:COUNT min {: kept:n :}
+   c VEC:COUNT kept ?do c i VEC:AT @ r VEC:PUSH ! loop
+   c kept VEC:RESIZE
+   d md VEC:RESIZE
+   j mj VEC:RESIZE ;
+
+: UNKNOWN-OBSERVATION
+   ( MODEL:unknown-reason -- MODEL:observation<MODEL:local> )
+   MODEL-OBSERVATION:unknown ;
+
+: DIRECTORY-OBSERVATION ( -- MODEL:observation<MODEL:local> )
+   MODEL-OBSERVATION:directory ;
+
+: PRESENT-OBSERVATION ( MODEL:local -- MODEL:observation<MODEL:local> )
+   MODEL-OBSERVATION:present ;
+
+: UNKNOWN-RECORD ( str MODEL:unknown-reason -- MODEL:local-record )
+   {: p:str why:MODEL:unknown-reason :}
+   p MODEL:>PATH why UNKNOWN-OBSERVATION MODEL-LOCAL--RECORD:MAKE ;
+
+: UNKNOWN ( scan-entries str MODEL:unknown-reason -- )
+   {: en:scan-entries p:str why:MODEL:unknown-reason :}
+   p why UNKNOWN-RECORD en OBSERVED VEC:PUSH ! ;
+
+\ ---- order
+
+: KEY-LESS ( n n [ n -- ^u8 n ] -- bool )
+   {: a:n b:n key :}
+   a key execute b key execute STR< ;
+
+\ The indices below count in the byte order of the keys key answers for
+\ them.
+: ORDER ( n [ n -- ^u8 n ] ^ARENA:arena -- ^VEC:vector<n> )
+   {: count:n key ar:^ARENA:arena :}
+   ar ARENA:ALLOCATOR count [type] n VEC:NEW {: idx :}
+   count 0 ?do i idx i VEC:AT ! loop
+   count 2 < if idx exit then
+   idx 0 VEC:AT count [: key KEY-LESS ;] SORT:SORT!
+   idx ;
+
+: OBSERVATION-PATH ( MODEL:local-record -- ^u8 n )
+   MODEL-LOCAL--RECORD:UNMAKE
+   {: p:MODEL:path o:MODEL:observation<MODEL:local> :}
+   p MODEL:PATH>STR str> ;
+
+: OBSERVATION-PATH@ ( ^MODEL:local-record -- ^u8 n ) @ OBSERVATION-PATH ;
+
+: RECORD-PATH@ ( ^MODEL:hash-record -- ^u8 n ) @ RECORD-PATH ;
+
+: STR@ ( ^str -- ^u8 n ) @ str> ;
+
+\ Rust's order_observations: path bytes, the order SQLite keeps.
+: ORDER-OBSERVATIONS
+   ( ^VEC:vector<MODEL:local-record> ^ARENA:arena
+     -- ^VEC:vector<MODEL:local-record> )
+   {: v ar:^ARENA:arena :}
+   v VEC:COUNT [: v swap VEC:AT OBSERVATION-PATH@ ;] ar ORDER {: idx :}
+   ar [type] MODEL:local-record NEW-VEC {: out :}
+   idx VEC:COUNT 0 ?do v idx i VEC:AT @ VEC:AT @ out VEC:PUSH ! loop
+   out ;
+
+\ Rust's order_hash_records: path bytes, the order of SQLite and
+\ CACHED-HASH.
+: ORDER-HASH-RECORDS
+   ( ^VEC:vector<MODEL:hash-record> ^ARENA:arena
+     -- ^VEC:vector<MODEL:hash-record> )
+   {: v ar:^ARENA:arena :}
+   v VEC:COUNT [: v swap VEC:AT RECORD-PATH@ ;] ar ORDER {: idx :}
+   ar [type] MODEL:hash-record NEW-VEC {: out :}
+   idx VEC:COUNT 0 ?do v idx i VEC:AT @ VEC:AT @ out VEC:PUSH ! loop
+   out ;
+
+\ Rust's cached_hash: the cache arrives in path-byte order, as JOURNAL's
+\ LOCAL-HASH-CACHE answers it, so the search compares bytes.
+: CACHED-HASH
+   ( ^VEC:vector<MODEL:hash-record> ^u8 n -- option<MODEL:hash-record> )
+   {: v p:^ u:n :}
+   0 v VEC:COUNT [: v swap VEC:AT @ RECORD-PATH p u STR< ;]
+   SORT:PARTITION-POINT {: at:n :}
+   at v VEC:COUNT >= if OPTION:NONE exit then
+   v at VEC:AT @ {: r:MODEL:hash-record :}
+   r RECORD-PATH p u STR= 0= if OPTION:NONE exit then
+   r OPTION:SOME ;
+
+\ ---- the walk
+
+\ Dropbox's documented metadata suffixes and temporary-file prefixes
+\ (help.dropbox.com/en-en/sync/files-not-syncing), as Rust's
+\ is_excluded_name.
+: PREFIX? ( ^u8 n ^u8 n -- bool )
+   {: p:^ u:n x:^ xu:n :}
+   u xu < if false exit then
+   p xu x xu STR= ;
+
+: SUFFIX-CI? ( ^u8 n ^u8 n -- bool )
+   {: p:^ u:n x:^ xu:n :}
+   u xu < if false exit then
+   p u + xu - xu x xu STR=CI ;
+
+: EXCLUDED-NAME? ( ^u8 n -- bool )
+   {: p:^ u:n :}
+   p u s" ~$" PREFIX? if true exit then
+   p u s" .~" PREFIX? if true exit then
+   p u s" desktop.ini" SUFFIX-CI? if true exit then
+   p u s" thumbs.db" SUFFIX-CI? if true exit then
+   p u s" .ds_store" SUFFIX-CI? if true exit then
+   p u s\" icon\r" SUFFIX-CI? if true exit then
+   p u s" .dropbox" SUFFIX-CI? if true exit then
+   p u s" .dropbox.attr" SUFFIX-CI? ;
+
+: STAT-DEV ( stat -- n ) STAT-UNMAKE {: d i m s ms mn cs cn :} d ;
+
+: DIRECTORY? ( stat -- bool )
+   STAT-UNMAKE {: d i m s ms mn cs cn :}
+   m FS:S-IFMT and FS:S-IFDIR = ;
+
+: SAME-FINGERPRINT ( MODEL:fingerprint MODEL:fingerprint -- bool )
+   {: a:MODEL:fingerprint b:MODEL:fingerprint :}
+   a b SAME-HASHED-CONTENT 0= if false exit then
+   a MODEL-FINGERPRINT:UNMAKE {: i s ms mn cs cn :}
+   b MODEL-FINGERPRINT:UNMAKE {: i2 s2 ms2 mn2 cs2 cn2 :}
+   cs cs2 = cn cn2 = and ;
+
+\ Rust's Path::join of the relative q onto p, laid anew in the arena: a
+\ "/" between them unless either is empty or p ends in one.
+: JOIN ( ^u8 n ^u8 n ^ARENA:arena -- ^u8 n )
+   {: p:^ u:n q:^ qu:n ar:^ARENA:arena :}
+   u 0= qu 0= or p u FS:JOIN-SEPARATED? or {: bare:bool :}
+   bare if 0 else 1 then {: sep:n :}
+   ar u sep + qu + ARENA:ALLOC {: dst:^ size:n :}
+   p u dst 0 PUT {: at:n :}
+   s" /" drop sep dst at PUT {: at2:n :}
+   q qu dst at2 PUT drop
+   dst size ;
+
+\ The name, the last component of a path below parent.
+: NAME-OF ( str str -- ^u8 n )
+   {: path:str parent:str :}
+   path str> {: p:^ u:n :}
+   parent str> nip {: pu:n :}
+   pu 0= if p u exit then
+   p pu 1+ + u pu 1+ - ;
+
+\ The one directory listing open at a time: the walk lists a directory
+\ whole before it scans any entry in it.
+create LISTING FS-LIST:STORAGE-BYTES allot
+
+: LISTED ( fd str ^ARENA:arena ^VEC:vector<str> -- )
+   {: dir:fd parent:str ar:^ARENA:arena v :}
+   LISTING FS-LIST:STORAGE-BYTES SPAN:MAKE FS-LIST:INIT
+   dir [: drop parent str> 2swap ar JOIN >str v VEC:PUSH ! ;]
+   FS-LIST:EACH-TYPED-AT ;
+
+: LIST-FAILURE ( n ^u8 n -- )
+   {: code:n p:^ u:n :}
+   code FS-LIST:E-OPEN = if s" open directory stream" p u IO-FAILURE then
+   code E-FS-LIST-LAST >= code E-FS-LIST-FIRST <= and if
+      s" read directory" p u IO-FAILURE
+   then
+   code throw ;
+
+\ The paths of the entries in dir, but . and .., in the order listed.
+: LIST-PATHS ( fd str ^ARENA:arena -- ^VEC:vector<str> )
+   {: dir:fd parent:str ar:^ARENA:arena :}
+   ar [type] str NEW-VEC {: v :}
+   0 FS:CAUSE!
+   [: dir parent ar v LISTED ;] catch {: code:n :}
+   code 0<> if code parent str> LIST-FAILURE then
+   v ;
+
+: REUSABLE-CONTENT
+   ( scan-context str MODEL:fingerprint -- option<DROPBOX:hash> )
+   {: cx:scan-context path:str print:MODEL:fingerprint :}
+   cx SCAN-CONTEXT-UNMAKE {: cache cut:option<cutoff> dev:n ar :}
+   cache path str> CACHED-HASH MATCH option
+      none OF OPTION:NONE ENDOF
+      some OF {: r:MODEL:hash-record :}
+         r RECORD-FINGERPRINT print SAME-FINGERPRINT
+         r cut HASH-IS-REUSABLE and if
+            r RECORD-CONTENT OPTION:SOME
+         else OPTION:NONE then
+      ENDOF
+   ;MATCH ;
+
+\ The file at f, opened where the probe found it, as a cached hash or a
+\ file to hash.
+: COLLECT-FILE ( fd str stat scan-context scan-entries -- )
+   {: f:fd path:str probe:stat cx:scan-context en:scan-entries :}
+   path str> {: p:^ u:n :}
+   f p u s" inspect opened scan file" STAT-FD {: opened:stat :}
+   probe opened SAME-INODE 0= if s" open scanned file" p u CHANGED then
+   opened p u FILE-FINGERPRINT {: print:MODEL:fingerprint :}
+   cx path print REUSABLE-CONTENT MATCH option
+      some OF {: c:DROPBOX:hash :}
+         path MODEL:>PATH print c MODEL-HASH--RECORD:MAKE
+         en CACHED VEC:PUSH !
+      ENDOF
+      none OF path print HASH-JOB-MAKE en JOBS VEC:PUSH ! ENDOF
+   ;MATCH ;
+
+\ A special file put where the probe found a regular one would block a
+\ plain read forever, so the open never waits and the inode check rejects
+\ it.
+: SCAN-FILE ( fd ^u8 n str stat scan-context scan-entries -- )
+   {: dir:fd name:^ nu:n path:str probe:stat cx:scan-context
+      en:scan-entries :}
+   name nu RESERVED-ARTIFACT? if
+      en path MODEL-UNKNOWN--REASON:unsupported UNKNOWN exit
+   then
+   dir name nu path str> OPEN-RELATIVE-AT {: f:fd :}
+   [: f path probe cx en COLLECT-FILE ;] [: f DISCARD ;] finally ;
+
+\ SCAN-DIRECTORY, which the walk reaches again below a directory.
+defer SCAN-SUBTREE ( fd str scan-context scan-entries -- )
+
+\ The directory's observation follows its subtree's, so a failure below
+\ leaves it unpublished.
+: COLLECT-DIRECTORY ( fd str stat scan-context scan-entries -- )
+   {: child:fd path:str probe:stat cx:scan-context en:scan-entries :}
+   path str> {: p:^ u:n :}
+   child p u s" inspect opened scan directory" STAT-FD {: opened:stat :}
+   probe opened SAME-INODE 0= if s" open scanned directory" p u CHANGED then
+   child path cx en SCAN-SUBTREE
+   path MODEL:>PATH DIRECTORY-OBSERVATION MODEL-LOCAL--RECORD:MAKE
+   en OBSERVED VEC:PUSH ! ;
+
+: SCAN-SUBDIRECTORY ( fd ^u8 n str stat scan-context scan-entries -- )
+   {: dir:fd name:^ nu:n path:str probe:stat cx:scan-context
+      en:scan-entries :}
+   dir name nu path str> OPEN-DIRECTORY-AT {: child:fd :}
+   [: child path probe cx en COLLECT-DIRECTORY ;] [: child DISCARD ;]
+   finally ;
+
+\ Content on another volume is never synchronized, so an object there is
+\ published as a symlink is and nothing beneath it is observed.
+: SCAN-PROBED ( fd fd ^u8 n str scan-context scan-entries -- )
+   {: probe:fd dir:fd name:^ nu:n path:str cx:scan-context
+      en:scan-entries :}
+   probe path str> s" inspect directory entry type" STAT-FD {: st:stat :}
+   cx SCAN-CONTEXT-UNMAKE {: cache cut:option<cutoff> dev:n ar :}
+   st STAT-DEV dev <> if
+      en path MODEL-UNKNOWN--REASON:unsupported UNKNOWN exit
+   then
+   st REGULAR? if dir name nu path st cx en SCAN-FILE exit then
+   st DIRECTORY? if dir name nu path st cx en SCAN-SUBDIRECTORY exit then
+   path str> E-UNSUPPORTED UNSUPPORTED-FAILS ;
+
+\ Rust's scan_entry: collects one entry, or throws why it cannot be
+\ observed, which SCAN-NAME publishes.
+: SCAN-ENTRY ( fd ^u8 n str scan-context scan-entries -- )
+   {: dir:fd name:^ nu:n path:str cx:scan-context en:scan-entries :}
+   dir name nu FS:TRY-OPEN-ENTRY-AT MATCH option
+      none OF s" inspect directory entry" path str> IO-FAILURE ENDOF
+      some OF {: probe:fd :}
+         [: probe dir name nu path cx en SCAN-PROBED ;]
+         [: probe DISCARD ;] finally
+      ENDOF
+   ;MATCH ;
+
+\ Rust's io_unknown_reason: none for exhaustion, which fails the scan; a
+\ failure with no errno still concerns the one object, so it is
+\ inaccessible.
+: IO-UNKNOWN-REASON ( n -- option<MODEL:unknown-reason> )
+   {: e:n :}
+   e EXHAUSTED? if OPTION:NONE exit then
+   e REPLACED? if MODEL-UNKNOWN--REASON:incomplete OPTION:SOME exit then
+   MODEL-UNKNOWN--REASON:inaccessible OPTION:SOME ;
+
+\ Rust's entry_unknown: the reason code, thrown while one entry was
+\ observed, publishes; wrong is what an object that is not a regular file
+\ means to the caller. Any other code is the scan's, rethrown.
+: ENTRY-UNKNOWN ( n MODEL:unknown-reason -- MODEL:unknown-reason )
+   {: code:n wrong:MODEL:unknown-reason :}
+   code E-UNSUPPORTED = if wrong exit then
+   code E-CHANGED = if MODEL-UNKNOWN--REASON:incomplete exit then
+   code E-UNREADABLE = if MODEL-UNKNOWN--REASON:inaccessible exit then
+   code E-IO <> if code throw then
+   FS:ERRNO IO-UNKNOWN-REASON MATCH option
+      none OF code throw ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+\ Rust's walk_unknown: an entry the walk meets.
+: WALK-UNKNOWN ( n -- MODEL:unknown-reason )
+   MODEL-UNKNOWN--REASON:unsupported ENTRY-UNKNOWN ;
+
+\ Rust's revisited_unknown: an object whose type the walk recorded, so a
+\ different one now is a replacement.
+: REVISITED-UNKNOWN ( n -- MODEL:unknown-reason )
+   MODEL-UNKNOWN--REASON:incomplete ENTRY-UNKNOWN ;
+
+\ One entry never fails the pass: it publishes as unknown, and all the walk
+\ collected beneath it leaves this publication.
+: SCAN-NAME ( fd str str scan-context scan-entries -- )
+   {: dir:fd path:str parent:str cx:scan-context en:scan-entries :}
+   path parent NAME-OF {: name:^ nu:n :}
+   name nu EXCLUDED-NAME? if exit then
+   en MARK {: mk:scan-mark :}
+   [: dir name nu path cx en SCAN-ENTRY ;] OBSERVING {: code:n :}
+   code 0= if exit then
+   code WALK-UNKNOWN {: why:MODEL:unknown-reason :}
+   en mk TRUNCATE
+   en path why UNKNOWN ;
+
+: SCAN-DIRECTORY ( fd str scan-context scan-entries -- )
+   {: dir:fd path:str cx:scan-context en:scan-entries :}
+   path str> {: p:^ u:n :}
+   cx SCAN-CONTEXT-UNMAKE {: cache cut:option<cutoff> dev:n ar :}
+   dir p u s" inspect directory before scan" STAT-FD {: before:stat :}
+   dir path ar LIST-PATHS {: names :}
+   names VEC:COUNT [: names swap VEC:AT STR@ ;] ar ORDER {: idx :}
+   idx VEC:COUNT 0 ?do
+      dir names idx i VEC:AT @ VEC:AT @ path cx en SCAN-NAME
+   loop
+   dir p u s" inspect directory after scan" STAT-FD
+   before SAME-OBSERVATION 0= if s" scan directory" p u CHANGED then
+   path before SCANNED-DIRECTORY-MAKE en DIRECTORIES VEC:PUSH ! ;
+
+: SUBTREE-INSTALL ( -- ) [: SCAN-DIRECTORY ;] is SCAN-SUBTREE ;
+SUBTREE-INSTALL
+
+\ ---- the hash stage
+
+: NEW-RESULTS ( ^ARENA:arena -- scan-hash-results )
+   {: ar:^ARENA:arena :}
+   ar [type] scanned-hash NEW-VEC
+   ar [type] MODEL:local-record NEW-VEC
+   SCAN-HASH-RESULTS-MAKE ;
+
+: RESULT-RECORDS ( scan-hash-results -- ^VEC:vector<scanned-hash> )
+   SCAN-HASH-RESULTS-UNMAKE drop ;
+
+: RESULT-UNKNOWN ( scan-hash-results -- ^VEC:vector<MODEL:local-record> )
+   SCAN-HASH-RESULTS-UNMAKE nip ;
+
+: STILL-UNKNOWN ( scan-hash-results str MODEL:unknown-reason -- )
+   {: res:scan-hash-results p:str why:MODEL:unknown-reason :}
+   p why UNKNOWN-RECORD res RESULT-UNKNOWN VEC:PUSH ! ;
+
+\ The open file's hash, which must match the fingerprint the walk took.
+: HASH-OPENED-FILE
+   ( fd str MODEL:fingerprint stat [ -- option<cutoff> ] ^ARENA:arena
+     -- scanned-hash )
+   {: f:fd path:str want:MODEL:fingerprint opened:stat q
+      ar:^ARENA:arena :}
+   path str> {: p:^ u:n :}
+   opened p u FILE-FINGERPRINT want SAME-FINGERPRINT 0= if
+      s" open enumerated scan file" p u CHANGED
+   then
+   f p u s" hash local scan file" opened ar E-UNSUPPORTED E-CHANGED
+   HASH-STABLE-FILE-FROM-STAT
+   {: c:DROPBOX:hash print:MODEL:fingerprint :}
+   print want SAME-FINGERPRINT 0= if
+      s" hash enumerated scan file" p u CHANGED
+   then
+   path MODEL:>PATH print c MODEL-HASH--RECORD:MAKE
+   {: r:MODEL:hash-record :}
+   r r q execute HASH-IS-REUSABLE SCANNED-HASH-MAKE ;
+
+: HASH-SCAN-FILE
+   ( fd hash-job [ -- option<cutoff> ] ^ARENA:arena -- scanned-hash )
+   {: root:fd job:hash-job q ar:^ARENA:arena :}
+   job HASH-JOB-UNMAKE {: path:str want:MODEL:fingerprint :}
+   root path str> s" open enumerated scan file" E-IO E-UNSUPPORTED
+   OPEN-RELATIVE-REGULAR-WITH-STAT {: f:fd opened:stat :}
+   [: f path want opened q ar HASH-OPENED-FILE ;] [: f DISCARD ;] finally ;
+
+\ Every failure here concerns the job's own path.
+: HASH-JOB
+   ( fd hash-job [ -- option<cutoff> ] ^ARENA:arena scan-hash-results -- )
+   {: root:fd job:hash-job q ar:^ARENA:arena res:scan-hash-results :}
+   [: root job q ar HASH-SCAN-FILE res RESULT-RECORDS VEC:PUSH ! ;]
+   OBSERVING {: code:n :}
+   code 0= if exit then
+   code REVISITED-UNKNOWN {: why:MODEL:unknown-reason :}
+   job HASH-JOB-UNMAKE {: path:str want:MODEL:fingerprint :}
+   res path why STILL-UNKNOWN ;
+
+\ Rust's hash_scan_files, one job at a time.
+: HASH-SCAN-FILES
+   ( fd ^VEC:vector<hash-job> [ -- option<cutoff> ] ^ARENA:arena
+     -- scan-hash-results )
+   {: root:fd jobs q ar:^ARENA:arena :}
+   ar NEW-RESULTS {: res:scan-hash-results :}
+   jobs VEC:COUNT 0 ?do root jobs i VEC:AT @ q ar res HASH-JOB loop
+   res ;
+
+: CHECK-CACHED ( fd MODEL:hash-record scan-hash-results -- )
+   {: root:fd r:MODEL:hash-record res:scan-hash-results :}
+   r RECORD-PATH {: p:^ u:n :}
+   root p u s" reopen cached scan file" E-IO E-UNSUPPORTED
+   OPEN-RELATIVE-REGULAR-WITH-STAT {: f:fd before:stat :}
+   f DISCARD
+   before p u FILE-FINGERPRINT r RECORD-FINGERPRINT SAME-FINGERPRINT 0= if
+      res p u >str MODEL-UNKNOWN--REASON:incomplete STILL-UNKNOWN exit
+   then
+   r true SCANNED-HASH-MAKE res RESULT-RECORDS VEC:PUSH ! ;
+
+: REVALIDATE-CACHED ( fd MODEL:hash-record scan-hash-results -- )
+   {: root:fd r:MODEL:hash-record res:scan-hash-results :}
+   [: root r res CHECK-CACHED ;] OBSERVING {: code:n :}
+   code 0= if exit then
+   code REVISITED-UNKNOWN {: why:MODEL:unknown-reason :}
+   res r RECORD-PATH >str why STILL-UNKNOWN ;
+
+: REVALIDATE-CACHED-FILES
+   ( fd ^VEC:vector<MODEL:hash-record> ^ARENA:arena -- scan-hash-results )
+   {: root:fd cached ar:^ARENA:arena :}
+   ar NEW-RESULTS {: res:scan-hash-results :}
+   cached VEC:COUNT 0 ?do root cached i VEC:AT @ res REVALIDATE-CACHED loop
+   res ;
+
+\ ---- directories
+
+: REOPEN-SCANNED-DIRECTORY ( fd ^u8 n -- stat )
+   {: root:fd p:^ u:n :}
+   p u SAFE-COMPONENTS drop
+   root p u FS:TRY-OPEN-DIR-AT MATCH option
+      none OF s" reopen scanned directory" p u IO-FAILURE ENDOF
+      some OF {: d:fd :}
+         [: d p u s" revalidate scanned directory" STAT-FD ;]
+         [: d DISCARD ;] finally
+      ENDOF
+   ;MATCH ;
+
+\ Only the root failing revalidation fails the scan.
+: REVALIDATE-ROOT ( fd stat -- )
+   {: root:fd before:stat :}
+   root s" " s" revalidate scanned directory" STAT-FD
+   before SAME-OBSERVATION 0= if
+      s" revalidate scanned directory" s" " CHANGED
+   then ;
+
+: CHECK-DIRECTORY
+   ( fd str stat ^VEC:vector<MODEL:local-record> -- )
+   {: root:fd path:str before:stat unknown :}
+   root path str> REOPEN-SCANNED-DIRECTORY
+   before SAME-OBSERVATION if exit then
+   path MODEL-UNKNOWN--REASON:incomplete UNKNOWN-RECORD unknown VEC:PUSH ! ;
+
+: REVALIDATE-DIRECTORY
+   ( fd scanned-directory ^VEC:vector<MODEL:local-record> -- )
+   {: root:fd d:scanned-directory unknown :}
+   d SCANNED-DIRECTORY-UNMAKE {: path:str before:stat :}
+   path str> nip 0= if root before REVALIDATE-ROOT exit then
+   [: root path before unknown CHECK-DIRECTORY ;] OBSERVING {: code:n :}
+   code 0= if exit then
+   path code REVISITED-UNKNOWN UNKNOWN-RECORD unknown VEC:PUSH ! ;
+
+\ Rust's revalidate_directories: every scanned directory that moved,
+\ changed or became unreadable, with its reason.
+: REVALIDATE-DIRECTORIES
+   ( fd ^VEC:vector<scanned-directory> ^ARENA:arena
+     -- ^VEC:vector<MODEL:local-record> )
+   {: root:fd dirs ar:^ARENA:arena :}
+   ar [type] MODEL:local-record NEW-VEC {: unknown :}
+   dirs VEC:COUNT 0 ?do
+      root dirs i VEC:AT @ unknown REVALIDATE-DIRECTORY
+   loop
+   unknown ;
+
+\ Whether the path is among the roots, which are in byte order.
+: AMONG? ( ^u8 n ^VEC:vector<str> -- bool )
+   {: p:^ u:n roots :}
+   0 roots VEC:COUNT [: roots swap VEC:AT @ str> p u STR< ;]
+   SORT:PARTITION-POINT {: at:n :}
+   at roots VEC:COUNT >= if false exit then
+   roots at VEC:AT @ str> p u STR= ;
+
+\ Whether an ancestor of the path, the bytes before one of its "/", is
+\ among the roots.
+: BENEATH-ANY? ( ^u8 n ^VEC:vector<str> -- bool )
+   {: p:^ u:n roots :}
+   u 0 ?do
+      p i + c@ SLASH = if
+         p i roots AMONG? if true unloop exit then
+      then
+   loop false ;
+
+: ROOT-PATHS
+   ( ^VEC:vector<MODEL:local-record> ^ARENA:arena -- ^VEC:vector<str> )
+   {: unknown ar:^ARENA:arena :}
+   unknown VEC:COUNT [: unknown swap VEC:AT OBSERVATION-PATH@ ;]
+   ar ORDER {: idx :}
+   ar [type] str NEW-VEC {: roots :}
+   idx VEC:COUNT 0 ?do
+      unknown idx i VEC:AT @ VEC:AT @ OBSERVATION-PATH >str roots VEC:PUSH !
+   loop
+   roots ;
+
+\ Rust's discard_unknown_subtrees: a directory that changed or became
+\ unreadable proves nothing below it, so its descendants leave and it
+\ publishes as unknown.
+: DISCARD-UNKNOWN-SUBTREES
+   ( ^VEC:vector<MODEL:local-record> ^VEC:vector<MODEL:local-record>
+     ^ARENA:arena -- ^VEC:vector<MODEL:local-record> )
+   {: observations unknown ar:^ARENA:arena :}
+   unknown VEC:COUNT 0= if observations exit then
+   unknown ar ROOT-PATHS {: roots :}
+   ar [type] MODEL:local-record NEW-VEC {: kept :}
+   observations VEC:COUNT 0 ?do
+      observations i VEC:AT @ {: r:MODEL:local-record :}
+      r OBSERVATION-PATH {: p:^ u:n :}
+      p u roots AMONG? p u roots BENEATH-ANY? or
+      0= if r kept VEC:PUSH ! then
+   loop
+   unknown VEC:COUNT 0 ?do
+      unknown i VEC:AT @ {: r:MODEL:local-record :}
+      r OBSERVATION-PATH roots BENEATH-ANY? 0= if r kept VEC:PUSH ! then
+   loop
+   kept ;
+
+\ ---- finishing
+
+\ The hashes a stage confirmed, published present, the reusable ones kept;
+\ then the files it could not observe again, published unknown.
+: PUBLISH-HASHES
+   ( scan-hash-results ^VEC:vector<MODEL:local-record>
+     ^VEC:vector<MODEL:hash-record> -- )
+   {: res:scan-hash-results observations reusable :}
+   res RESULT-RECORDS {: records :}
+   records VEC:COUNT 0 ?do
+      records i VEC:AT @ SCANNED-HASH-UNMAKE
+      {: r:MODEL:hash-record ok:bool :}
+      r MODEL-HASH--RECORD:UNMAKE
+      {: p:MODEL:path f:MODEL:fingerprint c:DROPBOX:hash :}
+      p c MODEL-LOCAL:MAKE PRESENT-OBSERVATION MODEL-LOCAL--RECORD:MAKE
+      observations VEC:PUSH !
+      ok if r reusable VEC:PUSH ! then
+   loop
+   res RESULT-UNKNOWN {: unknown :}
+   unknown VEC:COUNT 0 ?do unknown i VEC:AT @ observations VEC:PUSH ! loop ;
+
+\ The configured path must still name the root the scan opened.
+: VERIFY-ROOT ( str stat -- )
+   {: root:str before:stat :}
+   root str> {: p:^ u:n :}
+   p u s" reopen sync root after scan" OPEN-ABSOLUTE-DIRECTORY {: f:fd :}
+   [: f p u s" verify sync root binding after scan" STAT-FD ;]
+   [: f DISCARD ;] finally
+   before SAME-INODE
+   0= if s" verify complete local scan root" p u CHANGED then ;
+
+: FINISH
+   ( str fd stat scan-entries [ -- option<cutoff> ] ^ARENA:arena
+     -- complete-scan )
+   {: root:str rfd:fd before:stat en:scan-entries q ar:^ARENA:arena :}
+   en SCAN-ENTRIES-UNMAKE {: observations cached reusable dirs jobs :}
+   rfd jobs q ar HASH-SCAN-FILES {: hashed:scan-hash-results :}
+   rfd cached ar REVALIDATE-CACHED-FILES {: again:scan-hash-results :}
+   hashed observations reusable PUBLISH-HASHES
+   again observations reusable PUBLISH-HASHES
+   rfd dirs ar REVALIDATE-DIRECTORIES {: unscanned :}
+   observations unscanned ar DISCARD-UNKNOWN-SUBTREES {: kept :}
+   root before VERIFY-ROOT
+   kept ar ORDER-OBSERVATIONS reusable ar ORDER-HASH-RECORDS
+   COMPLETE-SCAN-MAKE ;
+
+\ Rust's finish_scan_at: the reusable hashes start as the ones the walk
+\ retained. It closes the pending scan's root.
+: FINISH-SCAN-AT ( pending-scan [ -- option<cutoff> ] -- complete-scan )
+   {: ps:pending-scan q :}
+   ps PENDING-SCAN-UNMAKE
+   {: root:str rfd:fd before:stat en:scan-entries ar:^ARENA:arena :}
+   [: root rfd before en q ar FINISH ;] [: rfd DISCARD ;] finally ;
+
+: FINISH-SCAN ( pending-scan -- complete-scan )
+   [: CURRENT-HASH-CACHE-CUTOFF ;] FINISH-SCAN-AT ;
+
+\ ---- enumerating
+
+\ Rust's enumerate_scan_on_device: every entry on device; any other device
+\ is an unsupported subtree. The walk's collections stay in walk order:
+\ FINISH sorts what it publishes. A throw closes the root.
+: ENUMERATE-SCAN-ON-DEVICE
+   ( ^u8 n fd stat ^VEC:vector<MODEL:hash-record> option<cutoff> n
+     ^ARENA:arena -- pending-scan )
+   {: p:^ u:n rfd:fd before:stat cache cut:option<cutoff> dev:n
+      ar:^ARENA:arena :}
+   cache cut dev ar SCAN-CONTEXT-MAKE {: cx:scan-context :}
+   ar NEW-ENTRIES {: en:scan-entries :}
+   rfd [: rfd s" " >str cx en SCAN-DIRECTORY ;] CLOSING
+   p u ar KEEP rfd before en ar PENDING-SCAN-MAKE ;
+
+: ROOT-STAT ( fd ^u8 n -- stat )
+   {: rfd:fd p:^ u:n :}
+   NO-STAT rfd
+   [: DROP-STAT rfd p u s" inspect sync root before scan" STAT-FD ;]
+   CLOSING ;
+
+: ENUMERATE-SCAN
+   ( ^u8 n ^VEC:vector<MODEL:hash-record> option<cutoff> ^ARENA:arena
+     -- pending-scan )
+   {: p:^ u:n cache cut:option<cutoff> ar:^ARENA:arena :}
+   p u s" open sync root for scan" OPEN-ABSOLUTE-DIRECTORY {: rfd:fd :}
+   rfd p u ROOT-STAT {: before:stat :}
+   p u rfd before cache cut before STAT-DEV ar ENUMERATE-SCAN-ON-DEVICE ;
+
+\ A root whose every entry is treated as on a foreign volume.
+: ENUMERATE-SCAN-ACROSS-DEVICES ( ^u8 n ^ARENA:arena -- pending-scan )
+   {: p:^ u:n ar:^ARENA:arena :}
+   p u s" open sync root for scan" OPEN-ABSOLUTE-DIRECTORY {: rfd:fd :}
+   rfd p u ROOT-STAT {: before:stat :}
+   p u rfd before ar [type] MODEL:hash-record NEW-VEC NO-CUTOFF
+   before STAT-DEV 1 xor ar ENUMERATE-SCAN-ON-DEVICE ;
+
+: SCAN-WITH-CACHE-COMPLETED-AT
+   ( ^u8 n ^VEC:vector<MODEL:hash-record> option<cutoff>
+     [ -- option<cutoff> ] ^ARENA:arena -- complete-scan )
+   {: p:^ u:n cache cut:option<cutoff> q ar:^ARENA:arena :}
+   p u cache cut ar ENUMERATE-SCAN q FINISH-SCAN-AT ;
+
+: SCAN-WITH-CACHE-AT
+   ( ^u8 n ^VEC:vector<MODEL:hash-record> option<cutoff> ^ARENA:arena
+     -- complete-scan )
+   {: p:^ u:n cache cut:option<cutoff> ar:^ARENA:arena :}
+   p u cache cut [: CURRENT-HASH-CACHE-CUTOFF ;] ar
+   SCAN-WITH-CACHE-COMPLETED-AT ;
+
+\ The complete root through no-follow, descriptor-relative opens. An
+\ inaccessible, changing, symlinked or special entry publishes as unknown
+\ with nothing beneath it, so a partial walk never passes for confirmed
+\ absence; only the root's own failures fail the scan.
+: SCAN ( ^u8 n ^ARENA:arena -- complete-scan )
+   {: p:^ u:n ar:^ARENA:arena :}
+   p u ar [type] MODEL:hash-record NEW-VEC NO-CUTOFF ar
+   SCAN-WITH-CACHE-AT ;
 
 \ ---- parents
 
@@ -1154,13 +2039,6 @@ $100 constant MODE-READ-ONLY
 
 \ ---- upload stages
 
-\ The path of name in the directory, laid in the arena.
-: JOIN ( ^u8 n ^u8 n ^ARENA:arena -- ^u8 n )
-   {: d:^ du:n name:^ nu:n ar:^ARENA:arena :}
-   ar du nu + 1+ ARENA:ALLOC {: dst:^ size:n :}
-   d du name nu dst size SPAN:MAKE FS:JOIN-PATH-INTO {: k:n :}
-   dst k ;
-
 : SEEK-START ( fd ^u8 n ^u8 n -- )
    {: f:fd p:^ u:n o:^ ou:n :}
    [: f 0 FD:SEEK ;] [: o ou p u IO-FAILURE ;] FS-FAILS ;
@@ -1226,7 +2104,7 @@ private
 
 : NO-HASHED ( -- option<hashed> ) OPTION:NONE ;
 : DROP-HASHED ( option<hashed> -- ) drop ;
-\ An upload stage carries no marker.
+\ An upload stage or a conflict copy carries no stage marker.
 : NO-MARKER ( -- option<str> ) OPTION:NONE ;
 
 \ The entry at the stage's path hashed, none when nothing is there; an
@@ -1308,8 +2186,8 @@ private
 
 \ The stage in the open staging directory: one already there is reused
 \ or replaced, and an occupied path is kept.
-: STAGE-IN ( fd ^u8 n fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
-   -- stage-write )
+: STAGE-UPLOAD-IN
+   ( fd ^u8 n fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- stage-write )
    {: root:fd r:^ ru:n dir:fd name:^ nu:n p:^ u:n want:DROPBOX:hash
       ar:^ARENA:arena :}
    dir name nu p u ar HASH-UPLOAD-STAGE if
@@ -1340,7 +2218,7 @@ public
    want DROPBOX:HASH>STR str> {: name:^ nu:n :}
    s su name nu ar JOIN {: p:^ u:n :}
    STAGE-WRITE-CREATED dir [: DROP-STAGE-WRITE
-      root r ru dir name nu p u want ar STAGE-IN ;] CLOSING
+      root r ru dir name nu p u want ar STAGE-UPLOAD-IN ;] CLOSING
    dir DISCARD
    [: s su want ar NEW-STAGED-UPLOAD ;] MAP-STAGE-WRITE ;
 
@@ -1557,5 +2435,2273 @@ public
          dir s su s" sync upload stage collection" SYNC-DIRECTORY
       then ;] CLOSING
    dir DISCARD ;
+
+private
+
+
+\ ---- download slots
+
+\ The Rust daemon's names and sizes, so either resumes the other's
+\ partials.
+: DOWNLOAD-PARTIAL-XATTR ( -- ^u8 n ) s" user.omabox.download-partial-v1" ;
+\ 64 MiB, a whole number of Dropbox's 4 MiB blocks.
+$4000000 constant DOWNLOAD-CHECKPOINT-BYTES
+: DOWNLOAD-SLOT-OWNER-PREFIX ( -- ^u8 n ) s" omabox-download-slot-v1" ;
+\ The owner prefix, the binding's 32 bytes, then the offset big-endian.
+DOWNLOAD-SLOT-OWNER-PREFIX nip 32 + 8 + constant DOWNLOAD-SLOT-STATE-LENGTH
+\ The slots are this many fixed files, so a partial either daemon left in
+\ any of them is found.
+4 constant MAX-PARALLEL-DOWNLOADS
+
+public
+
+\ A slot's owner, Rust's 32-byte binding: four cells of eight of its
+\ bytes, each read most significant first.
+STRUCTURE binding OPAQUE
+   FIELD b0 n
+   FIELD b1 n
+   FIELD b2 n
+   FIELD b3 n
+;STRUCTURE
+
+\ The download a slot is bound to.
+STRUCTURE download-slot-identity OPAQUE FIELD binding binding ;STRUCTURE
+
+\ A slot leased to one download: the caller's slot directory, the slot's
+\ number and the download's binding.
+STRUCTURE download-slot-lease OPAQUE
+   FIELD directory str
+   FIELD slot n
+   FIELD binding binding
+;STRUCTURE
+
+private
+
+\ Where a download's bytes go before they are staged: a slot in its
+\ directory, bound to the download, or an unnamed file shown as path.
+ENUM download-source
+   VARIANT resumable
+      FIELD directory fd
+      FIELD name str
+      FIELD path str
+      FIELD binding binding
+   ;VARIANT
+   VARIANT disposable FIELD path str ;VARIANT
+;ENUM
+
+\ A download's source and the stage it becomes: the target's directory,
+\ the stage's name and path there, the target and its content.
+STRUCTURE download-location DERIVE addr
+   FIELD source download-source
+   FIELD target-directory fd
+   FIELD stage-name str
+   FIELD stage-path str
+   FIELD target str
+   FIELD expected DROPBOX:hash
+;STRUCTURE
+
+public
+
+\ A download in progress: where it goes, its file, the bytes in it, and
+\ the Dropbox hash of those bytes so far.
+STRUCTURE download-partial OPAQUE DERIVE addr
+   FIELD location download-location
+   FIELD file fd
+   FIELD offset n
+   FIELD aggregate DROPBOX:hasher
+;STRUCTURE
+
+\ What preparing a download came to: a partial ready for bytes, a stage
+\ complete already, its stage 0 for Rust's (), or no slot to resume in.
+ENUM download-preparation
+   VARIANT ready FIELD partial ^download-partial ;VARIANT
+   VARIANT complete FIELD stage stage-outcome<n> ;VARIANT
+   VARIANT ephemeral ;VARIANT
+;ENUM
+
+private
+
+\ A slot's owner and the bytes of its partial known durable.
+STRUCTURE download-slot-state
+   FIELD binding binding
+   FIELD offset n
+;STRUCTURE
+
+ARENA PARTIALS download-partial
+
+\ The source's path: a slot's, or an unnamed file's display path.
+: SOURCE-PATH ( download-source -- ^u8 n )
+   MATCH download-source
+      resumable OF {: dir:fd name:str path:str b:binding :} path str>
+      ENDOF
+      disposable OF str> ENDOF
+   ;MATCH ;
+
+\ ---- slot bindings
+
+\ Eight bytes at p as one cell, the first most significant.
+: BE@ ( ^u8 -- n )
+   {: p:^ :}
+   0 8 0 ?do 8 lshift p i + c@ or loop ;
+
+: BE! ( n ^u8 -- )
+   {: v:n p:^ :}
+   8 0 ?do v 7 i - 8 * rshift $FF and p i + c! loop ;
+
+: BYTES>BINDING ( ^u8 -- binding )
+   {: p:^ :}
+   p BE@ p 8 + BE@ p 16 + BE@ p 24 + BE@ BINDING-MAKE ;
+
+: BINDING>BYTES ( binding ^u8 -- )
+   {: b:binding p:^ :}
+   b BINDING-UNMAKE {: b0:n b1:n b2:n b3:n :}
+   b0 p BE! b1 p 8 + BE! b2 p 16 + BE! b3 p 24 + BE! ;
+
+8 BUFFER: BE-BUF
+
+: FEED-BE ( n -- ) BE-BUF BE! BE-BUF 8 FEED ;
+
+public
+
+: BINDING= ( binding binding -- bool )
+   {: a:binding b:binding :}
+   a BINDING-UNMAKE {: a0:n a1:n a2:n a3:n :}
+   b BINDING-UNMAKE {: b0:n b1:n b2:n b3:n :}
+   a0 b0 = a1 b1 = and a2 b2 = and a3 b3 = and ;
+
+\ Rust's DownloadSlotIdentity::new for a root's generation, an operation
+\ and its target: the SHA-256 of the lease's tag, the generation and the
+\ operation big-endian, the target, the rev and the content, the last
+\ three NUL-separated.
+: NEW-SLOT-IDENTITY
+   ( n n ^u8 n MODEL:remote -- download-slot-identity )
+   {: generation:n operation:n t:^ tu:n r:MODEL:remote :}
+   r MODEL-REMOTE:UNMAKE {: c:DROPBOX:hash rev:DROPBOX:rev :}
+   NAME-CTX SHA256-BEGIN
+   s" omabox-download-slot-lease-v1" FEED
+   generation FEED-BE operation FEED-BE
+   t tu FEED NUL 1 FEED rev DROPBOX:REV>STR str> FEED
+   NUL 1 FEED c DROPBOX:HASH>STR str> FEED
+   NAME-CTX NAME-DIGEST SHA256-END
+   NAME-DIGEST BYTES>BINDING DOWNLOAD-SLOT-IDENTITY-MAKE ;
+
+: SLOT-BINDING ( download-slot-identity -- binding )
+   DOWNLOAD-SLOT-IDENTITY-UNMAKE ;
+
+private
+
+\ ---- slot state
+
+DOWNLOAD-SLOT-STATE-LENGTH BUFFER: STATE-BUF
+
+\ The xattr's bytes, valid until the next encode or read.
+: ENCODE-DOWNLOAD-SLOT-STATE ( download-slot-state -- ^u8 n )
+   DOWNLOAD-SLOT-STATE-UNMAKE {: b:binding offset:n :}
+   DOWNLOAD-SLOT-OWNER-PREFIX {: x:^ xu:n :}
+   x STATE-BUF xu BYTE-COPY
+   b STATE-BUF xu + BINDING>BYTES
+   offset STATE-BUF xu + 32 + BE!
+   STATE-BUF DOWNLOAD-SLOT-STATE-LENGTH ;
+
+: DECODE-DOWNLOAD-SLOT-STATE ( ^u8 n -- option<download-slot-state> )
+   {: p:^ u:n :}
+   DOWNLOAD-SLOT-OWNER-PREFIX {: x:^ xu:n :}
+   u DOWNLOAD-SLOT-STATE-LENGTH <> if OPTION:NONE exit then
+   p xu x xu STR= 0= if OPTION:NONE exit then
+   p xu + BYTES>BINDING p xu + 32 + BE@
+   DOWNLOAD-SLOT-STATE-MAKE OPTION:SOME ;
+
+: STATE-GOT ( XATTR:got -- option<download-slot-state> )
+   MATCH XATTR:got
+      absent OF OPTION:NONE ENDOF
+      value OF STATE-BUF swap DECODE-DOWNLOAD-SLOT-STATE ENDOF
+      oversize OF OPTION:NONE ENDOF
+   ;MATCH ;
+
+: DROP-SLOT-STATE ( option<download-slot-state> -- ) drop ;
+
+\ The slot's state, none when it carries none in this format.
+: READ-DOWNLOAD-SLOT-STATE ( fd ^u8 n -- option<download-slot-state> )
+   {: f:fd p:^ u:n :}
+   OPTION:NONE
+   [: DROP-SLOT-STATE f DOWNLOAD-PARTIAL-XATTR
+      STATE-BUF DOWNLOAD-SLOT-STATE-LENGTH SPAN:MAKE XATTR:GET STATE-GOT ;]
+   [: s" inspect resumed download slot marker" p u IO-FAILURE ;] FS-FAILS ;
+
+: SLOT-BOUND? ( option<download-slot-state> binding -- bool )
+   {: s:option<download-slot-state> b:binding :}
+   s MATCH option
+      none OF false ENDOF
+      some OF DOWNLOAD-SLOT-STATE-UNMAKE {: held:binding at:n :}
+         held b BINDING=
+      ENDOF
+   ;MATCH ;
+
+\ Whether the file is a slot still bound to the location's download.
+: DOWNLOAD-SLOT-MATCHES ( fd ^download-location -- bool )
+   {: f:fd loc :}
+   loc DOWNLOAD-LOCATION-SOURCE @ MATCH download-source
+      resumable OF {: dir:fd name:str path:str b:binding :}
+         f path str> READ-DOWNLOAD-SLOT-STATE b SLOT-BOUND?
+      ENDOF
+      disposable OF {: path:str :} false ENDOF
+   ;MATCH ;
+
+\ ---- slot files
+
+\ ".omabox-download-slot-" and the slot's digit; the slots are 0 to 3.
+24 BUFFER: SLOT-NAME
+FS:PATHZ-CAP BUFFER: SLOT-PATH
+
+\ The slot's name, valid until the next.
+: DOWNLOAD-SLOT-NAME ( n -- ^u8 n )
+   {: slot:n :}
+   s" .omabox-download-slot-" {: p:^ u:n :}
+   p SLOT-NAME u BYTE-COPY
+   slot $30 + SLOT-NAME u + c!
+   SLOT-NAME u 1+ ;
+
+\ The slot's path in the directory, for logs; valid until the next.
+: DOWNLOAD-SLOT-PATH ( ^u8 n n -- ^u8 n )
+   {: d:^ du:n slot:n :}
+   d du slot DOWNLOAD-SLOT-NAME SLOT-PATH FS:JOIN-PATH SLOT-PATH swap ;
+
+ENUM download-slot-open
+   VARIANT missing ;VARIANT
+   VARIANT file FIELD file fd ;VARIANT
+   VARIANT occupied ;VARIANT
+;ENUM
+: DROP-SLOT-OPEN ( download-slot-open -- ) drop ;
+
+\ The opened file, when it is the regular file probed.
+: CHECK-SLOT-FILE ( fd stat ^u8 n -- download-slot-open )
+   {: f:fd probed:stat p:^ u:n :}
+   NO-STAT f
+   [: DROP-STAT f p u s" inspect opened download slot" STAT-FD ;] CLOSING
+   {: opened:stat :}
+   opened REGULAR? opened probed SAME-INODE and if
+      f DOWNLOAD-SLOT-OPEN-FILE exit
+   then
+   f DISCARD DOWNLOAD-SLOT-OPEN-OCCUPIED ;
+
+\ After the open for writing failed: missing, occupied by another inode
+\ or one Omabox may not write, else the failure.
+: SLOT-OPEN-FAILED ( fd fd ^u8 n ^u8 n -- download-slot-open )
+   {: probe:fd dir:fd name:^ nu:n p:^ u:n :}
+   FS:ERRNO {: e:n :}
+   e FS:ENOENT = if DOWNLOAD-SLOT-OPEN-MISSING exit then
+   probe dir name nu p u NAMED-INODE-MATCHES 0= if
+      DOWNLOAD-SLOT-OPEN-OCCUPIED exit
+   then
+   e FS:EACCES = e FS:EPERM = or if DOWNLOAD-SLOT-OPEN-OCCUPIED exit then
+   e s" open resumed download" p u SYSCALL-FAILURE ;
+
+\ Opens the probed name for writing when the probe found a regular file.
+: OPEN-PROBED-SLOT ( fd fd ^u8 n ^u8 n -- download-slot-open )
+   {: probe:fd dir:fd name:^ nu:n p:^ u:n :}
+   probe p u s" inspect resumed download slot" STAT-FD {: probed:stat :}
+   probed REGULAR? 0= if DOWNLOAD-SLOT-OPEN-OCCUPIED exit then
+   dir name nu FS:TRY-OPEN-WRITE-AT MATCH option
+      none OF probe dir name nu p u SLOT-OPEN-FAILED ENDOF
+      some OF probed p u CHECK-SLOT-FILE ENDOF
+   ;MATCH ;
+
+: SLOT-PROBE-FAILED ( ^u8 n -- download-slot-open )
+   {: p:^ u:n :}
+   FS:ERRNO {: e:n :}
+   e FS:ENOENT = if DOWNLOAD-SLOT-OPEN-MISSING exit then
+   e FS:ELOOP = if DOWNLOAD-SLOT-OPEN-OCCUPIED exit then
+   e s" inspect resumed download slot" p u SYSCALL-FAILURE ;
+
+\ The slot at the name in dir, open for writing when it is a regular file
+\ that stays the inode its name held; a symlink there is occupied.
+: OPEN-DOWNLOAD-SLOT ( fd ^u8 n ^u8 n -- download-slot-open )
+   {: dir:fd name:^ nu:n p:^ u:n :}
+   dir name nu FS:TRY-OPEN-ENTRY-AT MATCH option
+      none OF p u SLOT-PROBE-FAILED ENDOF
+      some OF {: probe:fd :}
+         DOWNLOAD-SLOT-OPEN-MISSING probe
+         [: DROP-SLOT-OPEN probe dir name nu p u OPEN-PROBED-SLOT ;]
+         CLOSING probe DISCARD
+      ENDOF
+   ;MATCH ;
+
+\ A new unnamed file in dir; o names the operation that makes it.
+: UNNAMED-FILE ( fd ^u8 n ^u8 n -- fd )
+   {: dir:fd p:^ u:n o:^ ou:n :}
+   -1 >FD [: drop dir FS:TEMP-AT ;] [: o ou p u IO-FAILURE ;] FS-FAILS ;
+
+\ Binds the unnamed file at offset 0 and names it; false when the name
+\ is taken.
+: INSTALL-SLOT ( fd fd ^u8 n ^u8 n binding -- bool )
+   {: f:fd dir:fd name:^ nu:n p:^ u:n b:binding :}
+   f DOWNLOAD-PARTIAL-XATTR b 0 DOWNLOAD-SLOT-STATE-MAKE
+   ENCODE-DOWNLOAD-SLOT-STATE true p u s" mark resumed download slot"
+   SET-XATTR
+   f p u s" sync new resumed download slot" SYNC-FILE
+   f dir name nu FS:TRY-LINK-AT if
+      dir p u s" sync new resumed download slot entry" SYNC-DIRECTORY
+      true exit
+   then
+   FS:ERRNO FS:EEXIST <> if
+      s" install new resumed download slot" p u IO-FAILURE
+   then false ;
+
+\ A new slot at the name in dir bound to b; none when the name is taken.
+: CREATE-DOWNLOAD-SLOT ( fd ^u8 n ^u8 n binding -- option<fd> )
+   {: dir:fd name:^ nu:n p:^ u:n b:binding :}
+   dir p u s" create resumed download slot" UNNAMED-FILE {: f:fd :}
+   false f [: drop f dir name nu p u b INSTALL-SLOT ;] CLOSING
+   if f OPTION:SOME exit then
+   f DISCARD OPTION:NONE ;
+
+\ Empties the open slot c and binds it to b at offset 0, its stage marker
+\ cleared; true when its name still holds it then.
+: CLEAR-SLOT ( fd fd ^u8 n ^u8 n binding -- bool )
+   {: c:fd dir:fd name:^ nu:n p:^ u:n b:binding :}
+   [: c 0 FD:RESIZE ;]
+   [: s" truncate resumed download slot for reuse" p u IO-FAILURE ;]
+   FS-FAILS
+   c DOWNLOAD-PARTIAL-XATTR b 0 DOWNLOAD-SLOT-STATE-MAKE
+   ENCODE-DOWNLOAD-SLOT-STATE false p u
+   s" reset resumed download slot checkpoint" SET-XATTR
+   c p u s" sync reset resumed download slot" SYNC-FILE
+   c DOWNLOAD-STAGE-XATTR p u
+   s" clear resumed download slot completion marker" REMOVE-XATTR
+   c p u s" sync reusable resumed download slot" SYNC-FILE
+   c dir name nu p u NAMED-INODE-MATCHES ;
+
+\ Runs before, then clears c, when c is held's inode.
+: REBIND-SLOT ( fd fd fd ^u8 n ^u8 n binding [ -- ] -- bool )
+   {: held:fd c:fd dir:fd name:^ nu:n p:^ u:n b:binding before :}
+   held p u s" inspect held resumed download slot" STAT-FD
+   c p u s" inspect reusable resumed download slot" STAT-FD
+   SAME-INODE 0= if false exit then
+   before [: s" reset resumed download slot" p u IO-FAILURE ;] FS-FAILS
+   c dir name nu p u b CLEAR-SLOT ;
+
+\ The slot named again, rebound, when it is still held's inode; a throw
+\ closes it.
+: REBIND-OPENED ( fd fd fd ^u8 n ^u8 n binding [ -- ] -- option<fd> )
+   {: held:fd c:fd dir:fd name:^ nu:n p:^ u:n b:binding before :}
+   false c
+   [: drop held c dir name nu p u b before REBIND-SLOT ;] CLOSING
+   if c OPTION:SOME exit then
+   c DISCARD OPTION:NONE ;
+
+: REBIND-NAMED ( fd fd ^u8 n ^u8 n binding [ -- ] -- option<fd> )
+   {: held:fd dir:fd name:^ nu:n p:^ u:n b:binding before :}
+   dir name nu p u OPEN-DOWNLOAD-SLOT MATCH download-slot-open
+      missing OF OPTION:NONE ENDOF
+      file OF {: c:fd :} held c dir name nu p u b before REBIND-OPENED
+      ENDOF
+      occupied OF OPTION:NONE ENDOF
+   ;MATCH ;
+
+\ Rust's reset_download_slot_file_with: the slot held, a partial whose
+\ name in dir still names it, reopened, emptied and bound to b at offset
+\ 0; before runs just ahead of the truncate. None when held carries no
+\ state or its name holds another entry, which stays as it is.
+: RESET-DOWNLOAD-SLOT-FILE-WITH
+   ( fd fd ^u8 n ^u8 n binding [ -- ] -- option<fd> )
+   {: held:fd dir:fd name:^ nu:n p:^ u:n b:binding before :}
+   held p u READ-DOWNLOAD-SLOT-STATE MATCH option
+      none OF OPTION:NONE ENDOF
+      some OF DOWNLOAD-SLOT-STATE-UNMAKE {: was:binding at:n :}
+         held dir name nu p u b before REBIND-NAMED
+      ENDOF
+   ;MATCH ;
+
+\ The location's slot reset for its own binding; none for an unnamed
+\ file.
+: RESET-DOWNLOAD-SLOT ( fd ^download-location -- option<fd> )
+   {: f:fd loc :}
+   loc DOWNLOAD-LOCATION-SOURCE @ MATCH download-source
+      resumable OF {: dir:fd name:str path:str b:binding :}
+         f dir name str> path str> b [: ;] RESET-DOWNLOAD-SLOT-FILE-WITH
+      ENDOF
+      disposable OF {: path:str :} OPTION:NONE ENDOF
+   ;MATCH ;
+
+\ ---- slot leases
+
+\ A slot's file and state, Rust's (File, DownloadSlotState).
+STRUCTURE owned-slot
+   FIELD file fd
+   FIELD state download-slot-state
+;STRUCTURE
+
+\ A slot as the lease found it: its file and state when it holds a
+\ partial, and whether the lease may claim it.
+STRUCTURE available-download-slot DERIVE addr
+   FIELD slot n
+   FIELD owned option<owned-slot>
+   FIELD usable bool
+;STRUCTURE
+
+\ One lease runs at a time; it closes every file it holds here.
+MAX-PARALLEL-DOWNLOADS TYPED-BUFFER SLOTS available-download-slot
+
+: DROP-AVAILABLE ( available-download-slot -- ) drop ;
+
+: NOT-OWNED ( -- option<owned-slot> ) OPTION:NONE ;
+
+: UNOWNED ( n bool -- available-download-slot )
+   {: slot:n usable:bool :}
+   slot NOT-OWNED usable AVAILABLE-DOWNLOAD-SLOT-MAKE ;
+
+\ The open slot's state, usable unless protected says its binding is.
+: SLOT-STATE ( n fd ^u8 n [ binding -- bool ] -- available-download-slot )
+   {: slot:n f:fd p:^ u:n protected :}
+   f p u s" inspect resumed download slot" STAT-FD REGULAR? 0= if
+      f DISCARD slot false UNOWNED exit
+   then
+   f p u READ-DOWNLOAD-SLOT-STATE MATCH option
+      none OF f DISCARD slot false UNOWNED ENDOF
+      some OF {: s:download-slot-state :}
+         s DOWNLOAD-SLOT-STATE-UNMAKE {: b:binding at:n :}
+         b protected execute 0= {: usable:bool :}
+         slot f s OWNED-SLOT-MAKE OPTION:SOME usable
+         AVAILABLE-DOWNLOAD-SLOT-MAKE
+      ENDOF
+   ;MATCH ;
+
+: OWNED ( n fd ^u8 n [ binding -- bool ] -- available-download-slot )
+   {: slot:n f:fd p:^ u:n protected :}
+   slot false UNOWNED f
+   [: DROP-AVAILABLE slot f p u protected SLOT-STATE ;] CLOSING ;
+
+: SCAN-SLOT ( fd ^u8 n n [ binding -- bool ] -- available-download-slot )
+   {: dir:fd d:^ du:n slot:n protected :}
+   d du slot DOWNLOAD-SLOT-PATH {: p:^ u:n :}
+   dir slot DOWNLOAD-SLOT-NAME p u OPEN-DOWNLOAD-SLOT
+   MATCH download-slot-open
+      missing OF slot true UNOWNED ENDOF
+      file OF {: f:fd :} slot f p u protected OWNED ENDOF
+      occupied OF slot false UNOWNED ENDOF
+   ;MATCH ;
+
+: SLOT-OWNED@ ( n -- option<owned-slot> )
+   SLOTS AVAILABLE-DOWNLOAD-SLOT-OWNED @ ;
+
+: SLOT-USABLE@ ( n -- bool ) SLOTS AVAILABLE-DOWNLOAD-SLOT-USABLE @ ;
+
+: CLAIMED ( n -- ) false swap SLOTS AVAILABLE-DOWNLOAD-SLOT-USABLE ! ;
+
+: CLEAR-SLOTS ( -- )
+   MAX-PARALLEL-DOWNLOADS 0 ?do i false UNOWNED i SLOTS ! loop ;
+
+: CLOSE-OWNED ( option<owned-slot> -- )
+   MATCH option
+      none OF ENDOF
+      some OF OWNED-SLOT-UNMAKE {: f:fd s:download-slot-state :} f DISCARD
+      ENDOF
+   ;MATCH ;
+
+: CLOSE-SLOTS ( -- )
+   MAX-PARALLEL-DOWNLOADS 0 ?do i SLOT-OWNED@ CLOSE-OWNED loop
+   CLEAR-SLOTS ;
+
+: SCAN-SLOTS ( fd ^u8 n [ binding -- bool ] -- )
+   {: dir:fd d:^ du:n protected :}
+   MAX-PARALLEL-DOWNLOADS 0 ?do
+      dir d du i protected SCAN-SLOT i SLOTS !
+   loop ;
+
+: OWNED-BY? ( option<owned-slot> binding -- bool )
+   {: o:option<owned-slot> b:binding :}
+   o MATCH option
+      none OF false ENDOF
+      some OF OWNED-SLOT-UNMAKE {: f:fd s:download-slot-state :}
+         s OPTION:SOME b SLOT-BOUND?
+      ENDOF
+   ;MATCH ;
+
+: NEW-LEASE ( ^u8 n n binding -- option<download-slot-lease> )
+   {: d:^ du:n slot:n b:binding :}
+   d du >str slot b DOWNLOAD-SLOT-LEASE-MAKE OPTION:SOME ;
+
+\ The first slot whose partial is bound to b, claimed.
+: BOUND-SLOT ( ^u8 n binding -- option<download-slot-lease> )
+   {: d:^ du:n b:binding :}
+   MAX-PARALLEL-DOWNLOADS 0 ?do
+      i SLOT-OWNED@ b OWNED-BY? if
+         i CLAIMED d du i b NEW-LEASE unloop exit
+      then
+   loop OPTION:NONE ;
+
+\ Closes the slot a reset or create answered; whether there was one.
+: TAKEN? ( option<fd> -- bool )
+   MATCH option
+      none OF false ENDOF
+      some OF DISCARD true ENDOF
+   ;MATCH ;
+
+\ Rebinds the slot's partial to b, or makes the slot bound to b.
+: TAKE-SLOT ( fd ^u8 n n binding -- bool )
+   {: dir:fd d:^ du:n slot:n b:binding :}
+   d du slot DOWNLOAD-SLOT-PATH {: p:^ u:n :}
+   slot SLOT-OWNED@ MATCH option
+      none OF dir slot DOWNLOAD-SLOT-NAME p u b CREATE-DOWNLOAD-SLOT ENDOF
+      some OF OWNED-SLOT-UNMAKE {: f:fd s:download-slot-state :}
+         f dir slot DOWNLOAD-SLOT-NAME p u b [: ;]
+         RESET-DOWNLOAD-SLOT-FILE-WITH
+      ENDOF
+   ;MATCH TAKEN? ;
+
+\ The first usable slot that takes b; each one tried is used up.
+: CLAIM-SLOT ( fd ^u8 n binding -- option<download-slot-lease> )
+   {: dir:fd d:^ du:n b:binding :}
+   MAX-PARALLEL-DOWNLOADS 0 ?do
+      i SLOT-USABLE@ if
+         i CLAIMED
+         dir d du i b TAKE-SLOT if d du i b NEW-LEASE unloop exit then
+      then
+   loop OPTION:NONE ;
+
+\ Empties a usable slot's partial, its binding kept.
+: FREE-SLOT ( fd ^u8 n n -- )
+   {: dir:fd d:^ du:n slot:n :}
+   d du slot DOWNLOAD-SLOT-PATH {: p:^ u:n :}
+   slot SLOT-OWNED@ MATCH option
+      none OF ENDOF
+      some OF OWNED-SLOT-UNMAKE {: f:fd s:download-slot-state :}
+         s DOWNLOAD-SLOT-STATE-UNMAKE {: b:binding at:n :}
+         f dir slot DOWNLOAD-SLOT-NAME p u b [: ;]
+         RESET-DOWNLOAD-SLOT-FILE-WITH TAKEN? drop
+      ENDOF
+   ;MATCH ;
+
+: FREE-SLOTS ( fd ^u8 n -- )
+   {: dir:fd d:^ du:n :}
+   MAX-PARALLEL-DOWNLOADS 0 ?do
+      i SLOT-USABLE@ if dir d du i FREE-SLOT then
+   loop ;
+
+: LEASE-IN
+   ( fd ^u8 n binding [ binding -- bool ] -- option<download-slot-lease> )
+   {: dir:fd d:^ du:n b:binding protected :}
+   dir d du protected SCAN-SLOTS
+   d du b BOUND-SLOT MATCH option
+      none OF dir d du b CLAIM-SLOT ENDOF
+      some OF OPTION:SOME ENDOF
+   ;MATCH
+   dir d du FREE-SLOTS ;
+
+public
+
+\ Rust's lease_download_slots for one download: the slot in directory d
+\ whose partial is bound to it, else the first free or unprotected one,
+\ rebound to it; none when no slot can be. Every other unprotected partial
+\ is emptied, its binding kept. The lease holds d's span.
+: LEASE-DOWNLOAD-SLOT
+   ( ^u8 n download-slot-identity [ binding -- bool ]
+     -- option<download-slot-lease> )
+   {: d:^ du:n id:download-slot-identity protected :}
+   d du s" open resumable download slot directory" OPEN-PRIVATE-DIRECTORY
+   {: dir:fd :}
+   CLEAR-SLOTS
+   [: dir d du id SLOT-BINDING protected LEASE-IN ;]
+   [: CLOSE-SLOTS dir DISCARD ;] finally ;
+
+private
+
+\ ---- download preparation
+
+\ Feeds the next bytes of f, at most IO-SIZE of the left ones, to h;
+\ answers the bytes left after them. A short file fails as a read.
+: REHASH-CHUNK ( fd n ^u8 n ^DROPBOX:hasher -- n )
+   {: f:fd left:n p:^ u:n h :}
+   s" rehash resumed download checkpoint" {: o:^ ou:n :}
+   left IO-SIZE min {: k:n :}
+   0 [: drop f IO-BUF k FD-READ ;] [: o ou p u IO-FAILURE ;] FS-FAILS
+   k < if 0 FS:CAUSE! o ou p u IO-FAILURE then
+   IO-BUF k h DROPBOX:HASH-FEED
+   left k - ;
+
+\ Rust's hash_download_prefix: h begun and fed the slot's first offset
+\ bytes, a whole number of checkpoints, and f left at offset.
+: HASH-DOWNLOAD-PREFIX ( fd n ^u8 n ^DROPBOX:hasher -- )
+   {: f:fd offset:n p:^ u:n h :}
+   [: f 0 FD:SEEK ;] [: s" rewind resumed download" p u IO-FAILURE ;]
+   FS-FAILS
+   h DROPBOX:HASH-BEGIN
+   offset begin dup 0 > while f swap p u h REHASH-CHUNK repeat drop
+   [: f offset FD:SEEK ;]
+   [: s" position resumed download" p u IO-FAILURE ;] FS-FAILS ;
+
+: DROP-PREPARATION ( download-preparation -- ) drop ;
+: DROP-STAGE-OUTCOME ( stage-outcome<n> -- ) drop ;
+
+: READY ( ^download-partial -- download-preparation )
+   LOCAL-DOWNLOAD--PREPARATION:ready ;
+: EPHEMERAL ( -- download-preparation )
+   LOCAL-DOWNLOAD--PREPARATION:ephemeral ;
+
+\ What a stage already at the download's name comes to, none when there
+\ is none; a verified stage's descriptor is closed.
+: EXISTING-OUTCOME ( download-stage -- option<stage-outcome<n>> )
+   MATCH download-stage
+      missing OF OPTION:NONE ENDOF
+      verified OF VERIFIED-DOWNLOAD-STAGE-UNMAKE
+         {: f:fd print:MODEL:fingerprint :} f DISCARD
+         0 LOCAL-STAGE--OUTCOME:already-staged OPTION:SOME
+      ENDOF
+      destination-occupied OF LOCAL-STAGE--OUTCOME:destination-occupied
+         OPTION:SOME
+      ENDOF
+   ;MATCH ;
+
+: STAGE-PREPARATION ( download-stage -- option<download-preparation> )
+   EXISTING-OUTCOME MATCH option
+      none OF OPTION:NONE ENDOF
+      some OF LOCAL-DOWNLOAD--PREPARATION:complete OPTION:SOME ENDOF
+   ;MATCH ;
+
+\ The download's stage name for target t, and its path below root path r
+\ through the parent's path rel, laid in the arena.
+: STAGE-PATHS
+   ( ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- ^u8 n ^u8 n )
+   {: r:^ ru:n rel:^ relu:n t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
+   s" download" t tu want ar INTERNAL-NAME {: name:^ nu:n :}
+   r ru rel relu ar JOIN name nu ar JOIN {: sp:^ spu:n :}
+   name nu sp spu ;
+
+\ The location of target t's download from src into dir, its stage
+\ named and the target kept in the arena.
+: NEW-LOCATION
+   ( download-source fd ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+     -- download-location )
+   {: src:download-source dir:fd r:^ ru:n rel:^ relu:n t:^ tu:n
+      want:DROPBOX:hash ar:^ARENA:arena :}
+   r ru rel relu t tu want ar STAGE-PATHS {: name:^ nu:n sp:^ spu:n :}
+   src dir name nu >str sp spu >str t tu ar KEEP want
+   DOWNLOAD-LOCATION-MAKE ;
+
+: LOCATION-PATH ( download-location -- ^u8 n )
+   DOWNLOAD-LOCATION-UNMAKE
+   {: src:download-source dir:fd name:str sp:str t:str want:DROPBOX:hash :}
+   src SOURCE-PATH ;
+
+: INSPECT-LOCATION ( download-location ^ARENA:arena -- download-stage )
+   {: loc:download-location ar:^ARENA:arena :}
+   loc DOWNLOAD-LOCATION-UNMAKE
+   {: src:download-source dir:fd name:str sp:str t:str want:DROPBOX:hash :}
+   dir name str> sp str> t str> want ar INSPECT-DOWNLOAD-STAGE ;
+
+\ The partial of the location's download in f, at offset 0.
+: NEW-PARTIAL ( download-location fd ^ARENA:arena -- ^download-partial )
+   {: loc:download-location f:fd ar:^ARENA:arena :}
+   ar PARTIALS-NEW {: x :}
+   loc x DOWNLOAD-PARTIAL-LOCATION !
+   f x DOWNLOAD-PARTIAL-FILE !
+   0 x DOWNLOAD-PARTIAL-OFFSET !
+   x DOWNLOAD-PARTIAL-AGGREGATE DROPBOX:HASH-BEGIN
+   x ;
+
+\ A partial in a new unnamed file in the staging directory s.
+: DISPOSABLE-PARTIAL
+   ( download-location ^u8 n ^ARENA:arena -- download-preparation )
+   {: loc:download-location s:^ su:n ar:^ARENA:arena :}
+   s su s" open disposable download staging directory"
+   OPEN-PRIVATE-DIRECTORY {: staging:fd :}
+   loc LOCATION-PATH {: p:^ u:n :}
+   [: staging p u s" create disposable download stage" UNNAMED-FILE ;]
+   [: staging DISCARD ;] finally {: f:fd :}
+   loc f ar NEW-PARTIAL READY ;
+
+: DISPOSABLE
+   ( download-location ^u8 n ^ARENA:arena -- download-preparation )
+   {: loc:download-location s:^ su:n ar:^ARENA:arena :}
+   loc ar INSPECT-LOCATION STAGE-PREPARATION MATCH option
+      none OF loc s su ar DISPOSABLE-PARTIAL ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+public
+
+\ Rust's prepare_disposable_download_with_access_at: the stage below root
+\ path r for target t holding want when one is complete, else a partial
+\ in an unnamed file in the staging directory s, its paths in the arena.
+\ The partial holds the target's parent directory.
+: PREPARE-DISPOSABLE-DOWNLOAD-AT
+   ( fd ^u8 n ^u8 n DROPBOX:hash ^u8 n ^ARENA:arena
+     -- download-preparation )
+   {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash s:^ su:n
+      ar:^ARENA:arena :}
+   want s" prepare disposable download" REQUIRE-CONTENT-HASH
+   root t tu true OPEN-PARENT MATCH option
+      none OF t tu UNSAFE ENDOF
+      some OF ENDOF
+   ;MATCH PARENT-DIR-UNMAKE {: dir:fd last:str rel:str :}
+   EPHEMERAL dir
+   [: DROP-PREPARATION
+      s su s" <unnamed-download>" ar JOIN >str DOWNLOAD-SOURCE-DISPOSABLE
+      dir r ru rel str> t tu want ar NEW-LOCATION s su ar DISPOSABLE ;]
+   CLOSING ;
+
+private
+
+\ ---- partial ownership
+
+\ Dropbox's content-hash block: a partial grows a whole block at a time.
+$400000 constant DROPBOX-BLOCK
+
+: TARGET-DIR@ ( ^download-location -- fd )
+   DOWNLOAD-LOCATION-TARGET-DIRECTORY @ ;
+: STAGE-NAME@ ( ^download-location -- ^u8 n )
+   DOWNLOAD-LOCATION-STAGE-NAME @ str> ;
+: STAGE-PATH@ ( ^download-location -- ^u8 n )
+   DOWNLOAD-LOCATION-STAGE-PATH @ str> ;
+: TARGET@ ( ^download-location -- ^u8 n )
+   DOWNLOAD-LOCATION-TARGET @ str> ;
+: EXPECTED@ ( ^download-location -- DROPBOX:hash )
+   DOWNLOAD-LOCATION-EXPECTED @ ;
+: SOURCE@ ( ^download-location -- download-source )
+   DOWNLOAD-LOCATION-SOURCE @ ;
+
+: LOCATION-SOURCE ( download-location -- download-source )
+   DOWNLOAD-LOCATION-UNMAKE
+   {: src:download-source dir:fd name:str sp:str t:str want:DROPBOX:hash :}
+   src ;
+
+: RESUMABLE? ( download-source -- bool )
+   MATCH download-source
+      resumable OF {: dir:fd name:str path:str b:binding :} true ENDOF
+      disposable OF {: path:str :} false ENDOF
+   ;MATCH ;
+
+: PARTIAL-FILE ( ^download-partial -- fd ) DOWNLOAD-PARTIAL-FILE @ ;
+
+\ The partial's file's path: its slot's, or its unnamed file's.
+: PARTIAL-PATH ( ^download-partial -- ^u8 n )
+   DOWNLOAD-PARTIAL-LOCATION SOURCE@ SOURCE-PATH ;
+
+\ Closes the location's directories: the target's and a slot's.
+: CLOSE-LOCATION ( download-location -- )
+   DOWNLOAD-LOCATION-UNMAKE
+   {: src:download-source dir:fd name:str sp:str t:str want:DROPBOX:hash :}
+   dir DISCARD
+   src MATCH download-source
+      resumable OF {: slots:fd n:str p:str b:binding :} slots DISCARD ENDOF
+      disposable OF {: p:str :} ENDOF
+   ;MATCH ;
+
+\ Rust's drop of a partial: its file and its location's directories.
+: CLOSE-PARTIAL ( ^download-partial -- )
+   {: x :}
+   x PARTIAL-FILE DISCARD x DOWNLOAD-PARTIAL-LOCATION @ CLOSE-LOCATION ;
+
+\ Closes the file the partial held and keeps f in its place.
+: SWAP-FILE ( fd ^download-partial -- )
+   {: f:fd x :}
+   x PARTIAL-FILE DISCARD f x DOWNLOAD-PARTIAL-FILE ! ;
+
+: READY? ( download-preparation -- bool )
+   MATCH download-preparation
+      ready OF drop true ENDOF
+      complete OF DROP-STAGE-OUTCOME false ENDOF
+      ephemeral OF false ENDOF
+   ;MATCH ;
+
+: UNLESS-READY ( download-preparation [ -- ] -- download-preparation )
+   {: p:download-preparation close :}
+   p READY? 0= if close execute then
+   p ;
+
+\ Runs q; close frees what a ready partial would hold, when q throws or
+\ answers no partial.
+: PREPARING ( [ -- download-preparation ] [ -- ] -- download-preparation )
+   {: q close :}
+   EPHEMERAL [: DROP-PREPARATION q execute ;] catch {: code:n :}
+   code 0= if close UNLESS-READY exit then
+   close execute code throw ;
+
+\ Runs q; a stage read's failure becomes an io failure, as Rust's
+\ From<StageIoError> for LocalError makes it.
+: LOCAL-ERRORS ( R [ R -- R ] -- R )
+   {: q :}
+   [: q execute ;] catch {: code:n :}
+   code 0= if exit then
+   code LOCAL-CODE throw ;
+
+: OCCUPIED-AT ( ^u8 n -- stage-outcome<n> )
+   >str LOCAL-STAGE--OUTCOME:destination-occupied ;
+
+: STAGED? ( stage-outcome<n> -- bool )
+   MATCH stage-outcome
+      staged OF drop true ENDOF
+      already-staged OF drop true ENDOF
+      content-changed OF DROP-HASH false ENDOF
+      destination-occupied OF {: p:str :} false ENDOF
+   ;MATCH ;
+
+\ ---- slot promotion
+
+\ Rust's copy_completed_slot's copy: the file's bytes, from its start,
+\ staged when they hash to the location's content.
+: COPY-INTO-STAGE ( fd ^download-location ^ARENA:arena -- stage-outcome<n> )
+   {: f:fd loc ar:^ARENA:arena :}
+   loc TARGET@ loc EXPECTED@ ar STAGE-MARKER >str OPTION:SOME
+   {: marker:option<str> :}
+   loc TARGET-DIR@ loc STAGE-NAME@ loc STAGE-PATH@ loc EXPECTED@
+   [: f -rot FD-READ ;] marker s" copy completed download slot" ar
+   WRITE-VERIFIED-STAGE [: 0 ;] MAP-STAGE-WRITE ;
+
+\ Rust's copy_completed_slot: the completed file copied and rehashed into
+\ the stage; a slot staged from is emptied and keeps its binding.
+: COPY-COMPLETED-SLOT
+   ( fd ^download-location ^ARENA:arena -- stage-outcome<n> )
+   {: f:fd loc ar:^ARENA:arena :}
+   loc SOURCE@ SOURCE-PATH {: p:^ u:n :}
+   [: f 0 FD:SEEK ;]
+   [: s" rewind completed download slot" p u IO-FAILURE ;] FS-FAILS
+   0 LOCAL-STAGE--OUTCOME:staged
+   [: DROP-STAGE-OUTCOME f loc ar COPY-INTO-STAGE ;] LOCAL-ERRORS
+   {: out:stage-outcome<n> :}
+   out STAGED? if f loc RESET-DOWNLOAD-SLOT TAKEN? drop then
+   out ;
+
+\ The entry already at the stage's name: a verified stage, whose
+\ descriptor closes, runs q and is staged already; o names the operation.
+: RACED-STAGE
+   ( ^download-location ^u8 n [ -- ] ^ARENA:arena -- stage-outcome<n> )
+   {: loc o:^ ou:n q ar:^ARENA:arena :}
+   loc @ ar INSPECT-LOCATION MATCH download-stage
+      missing OF o ou loc TARGET@ CHANGED ENDOF
+      verified OF VERIFIED-DOWNLOAD-STAGE-UNMAKE
+         {: s:fd print:MODEL:fingerprint :} s DISCARD
+         q execute 0 LOCAL-STAGE--OUTCOME:already-staged
+      ENDOF
+      destination-occupied OF LOCAL-STAGE--OUTCOME:destination-occupied
+      ENDOF
+   ;MATCH ;
+
+\ After the move into the stage failed with errno e: an entry at the
+\ stage's name is inspected, q running for a verified one; another
+\ filesystem is copied across; else the failure, o's for path p.
+: MOVE-FAILED
+   ( fd ^download-location ^ARENA:arena n ^u8 n ^u8 n [ -- ]
+     -- stage-outcome<n> )
+   {: f:fd loc ar:^ARENA:arena e:n o:^ ou:n p:^ u:n q :}
+   e FS:EEXIST = if loc o ou q ar RACED-STAGE exit then
+   e FS:EXDEV = if f loc ar COPY-COMPLETED-SLOT exit then
+   e o ou p u SYSCALL-FAILURE ;
+
+\ The stage made read-only by m and synced by s.
+: SEAL-PROMOTED ( fd ^download-location ^u8 n ^u8 n -- stage-outcome<n> )
+   {: f:fd loc m:^ mu:n s:^ su:n :}
+   f loc STAGE-PATH@ m mu READ-ONLY
+   f loc STAGE-PATH@ s su SYNC-FILE
+   0 LOCAL-STAGE--OUTCOME:staged ;
+
+\ Where the swapped stage went: the slot's name, or, when an entry took
+\ that, the stage's, where it stays.
+: RESTORED-PATH ( ^download-location fd ^u8 n ^u8 n -- ^u8 n )
+   {: loc slots:fd name:^ nu:n p:^ u:n :}
+   loc TARGET-DIR@ loc STAGE-NAME@ slots name nu FS:TRY-RENAME-NEW-AT if
+      p u exit
+   then
+   FS:ERRNO FS:EEXIST <> if
+      FS:ERRNO s" restore swapped resumed download" loc STAGE-PATH@
+      SYSCALL-FAILURE
+   then
+   loc STAGE-PATH@ ;
+
+\ Another inode took the slot's name before the move: it goes back.
+: RESTORE-SWAPPED ( ^download-location fd ^u8 n ^u8 n -- stage-outcome<n> )
+   {: loc slots:fd name:^ nu:n p:^ u:n :}
+   loc slots name nu p u RESTORED-PATH {: at:^ atu:n :}
+   slots p u s" sync restored download slot" SYNC-DIRECTORY
+   loc TARGET-DIR@ loc STAGE-PATH@ s" sync restored download stage"
+   SYNC-DIRECTORY
+   at atu OCCUPIED-AT ;
+
+\ The slot named the stage: sealed, when it is still the file held.
+: PROMOTED-SLOT
+   ( fd ^download-location fd ^u8 n ^u8 n -- stage-outcome<n> )
+   {: f:fd loc slots:fd name:^ nu:n p:^ u:n :}
+   f loc TARGET-DIR@ loc STAGE-NAME@ loc STAGE-PATH@ NAMED-INODE-MATCHES
+   0= if loc slots name nu p u RESTORE-SWAPPED exit then
+   slots p u s" sync consumed download slot" SYNC-DIRECTORY
+   loc TARGET-DIR@ loc STAGE-PATH@ s" sync promoted download stage"
+   SYNC-DIRECTORY
+   f loc s" make resumed download stage immutable"
+   s" sync completed download stage" SEAL-PROMOTED ;
+
+\ Renames the slot, still bound to the download, to the stage's name;
+\ before runs just ahead of the rename.
+: MOVE-SLOT
+   ( fd ^download-location [ -- ] ^ARENA:arena fd ^u8 n ^u8 n
+     -- stage-outcome<n> )
+   {: f:fd loc before ar:^ARENA:arena slots:fd name:^ nu:n p:^ u:n :}
+   s" recover completed resumed download" {: o:^ ou:n :}
+   f loc DOWNLOAD-SLOT-MATCHES 0= if p u OCCUPIED-AT exit then
+   before [: s" promote completed download slot" p u IO-FAILURE ;] FS-FAILS
+   slots name nu loc TARGET-DIR@ loc STAGE-NAME@ FS:TRY-RENAME-NEW-AT if
+      f loc slots name nu p u PROMOTED-SLOT exit
+   then
+   f loc ar FS:ERRNO o ou p u [: f loc RESET-DOWNLOAD-SLOT TAKEN? drop ;]
+   MOVE-FAILED ;
+
+: LINKED-DISPOSABLE ( fd ^download-location -- stage-outcome<n> )
+   {: f:fd loc :}
+   loc TARGET-DIR@ loc STAGE-PATH@ s" sync promoted disposable download"
+   SYNC-DIRECTORY
+   f loc s" make disposable download stage immutable"
+   s" sync disposable download stage" SEAL-PROMOTED ;
+
+\ Rust's promote_completed_disposable: the unnamed file linked at the
+\ stage's name; before runs just ahead of the link.
+: PROMOTE-COMPLETED-DISPOSABLE
+   ( fd ^download-location [ -- ] ^ARENA:arena -- stage-outcome<n> )
+   {: f:fd loc before ar:^ARENA:arena :}
+   s" promote completed disposable download" {: o:^ ou:n :}
+   loc SOURCE@ SOURCE-PATH {: p:^ u:n :}
+   before [: o ou p u IO-FAILURE ;] FS-FAILS
+   f loc TARGET-DIR@ loc STAGE-NAME@ FS:TRY-LINK-AT if
+      f loc LINKED-DISPOSABLE exit
+   then
+   f loc ar FS:ERRNO o ou p u [: ;] MOVE-FAILED ;
+
+\ Rust's promote_completed_slot_with: the completed, marked file f moved
+\ into the location's stage, before running just ahead of the move.
+: PROMOTE-COMPLETED-SLOT-WITH
+   ( fd ^download-location [ -- ] ^ARENA:arena -- stage-outcome<n> )
+   {: f:fd loc before ar:^ARENA:arena :}
+   loc SOURCE@ MATCH download-source
+      resumable OF {: slots:fd name:str path:str b:binding :}
+         f loc before ar slots name str> path str> MOVE-SLOT
+      ENDOF
+      disposable OF {: p:str :}
+         f loc before ar PROMOTE-COMPLETED-DISPOSABLE
+      ENDOF
+   ;MATCH ;
+
+: PROMOTE-COMPLETED-SLOT
+   ( fd ^download-location ^ARENA:arena -- stage-outcome<n> )
+   {: f:fd loc ar:^ARENA:arena :}
+   f loc [: ;] ar PROMOTE-COMPLETED-SLOT-WITH ;
+
+\ ---- partial downloads
+
+1 BUFFER: EXTRA
+
+\ Fills the span from read; a failure, or an end before the span is
+\ full, is a stage read's.
+: STAGE-READ-EXACT ( ^u8 n [ ^u8 n -- n ] ^u8 n ^u8 n -- )
+   {: dst:^ cap:n read p:^ u:n o:^ ou:n :}
+   0 begin dup cap < while
+      {: done:n :}
+      dst done + cap done - read p u o ou STAGE-READ-INTO {: k:n :}
+      k 0= if 0 FS:CAUSE! o ou p u STAGE-READ then
+      done k +
+   repeat drop ;
+
+\ Rust's discard_uncommitted_block: the file cut back to the offset.
+: DISCARD-UNCOMMITTED-BLOCK ( ^download-partial -- )
+   {: x :}
+   x PARTIAL-PATH {: p:^ u:n :}
+   [: x PARTIAL-FILE x DOWNLOAD-PARTIAL-OFFSET @ FD:RESIZE ;]
+   [: s" discard incomplete resumed download block" p u IO-FAILURE ;]
+   FS-FAILS ;
+
+\ Runs q; a throw first discards the block it was writing.
+: UNCOMMITTED ( ^download-partial [ -- ] -- )
+   {: x q :}
+   [: q execute ;] catch {: code:n :}
+   code 0= if exit then
+   x DISCARD-UNCOMMITTED-BLOCK code throw ;
+
+: WRITE-DOWNLOAD ( ^download-partial ^u8 n -- )
+   {: x b:^ k:n :}
+   x PARTIAL-PATH {: p:^ u:n :}
+   [: x PARTIAL-FILE b k FD:WRITE-FULL ;]
+   [: s" write resumed download" p u IO-FAILURE ;] FS-FAILS ;
+
+\ Reads k bytes, writes them to the file and feeds them to the hash.
+: APPEND-CHUNK ( ^download-partial n [ ^u8 n -- n ] -- )
+   {: x k:n read :}
+   IO-BUF k read x DOWNLOAD-PARTIAL-LOCATION TARGET@
+   s" read resumed download" STAGE-READ-EXACT
+   x IO-BUF k WRITE-DOWNLOAD
+   IO-BUF k x DOWNLOAD-PARTIAL-AGGREGATE DROPBOX:HASH-FEED ;
+
+: COPY-BLOCK ( ^download-partial n [ ^u8 n -- n ] -- )
+   {: x len:n read :}
+   0 begin dup len < while
+      {: done:n :}
+      len done - IO-SIZE min {: k:n :}
+      x k read APPEND-CHUNK
+      done k +
+   repeat drop ;
+
+\ Appends a block of len bytes, then counts it in the offset.
+: APPEND-BLOCK ( ^download-partial n [ ^u8 n -- n ] -- )
+   {: x len:n read :}
+   x [: x len read COPY-BLOCK ;] UNCOMMITTED
+   len x DOWNLOAD-PARTIAL-OFFSET +! ;
+
+\ Rust's persist_checkpoint: the offset recorded in a slot's state once
+\ the bytes before it are durable.
+: PERSIST-CHECKPOINT ( ^download-partial -- )
+   {: x :}
+   x PARTIAL-FILE {: f:fd :}
+   x DOWNLOAD-PARTIAL-LOCATION SOURCE@ MATCH download-source
+      resumable OF {: slots:fd name:str path:str b:binding :}
+         f path str> s" sync resumed download checkpoint" SYNC-FILE
+         f DOWNLOAD-PARTIAL-XATTR
+         b x DOWNLOAD-PARTIAL-OFFSET @ DOWNLOAD-SLOT-STATE-MAKE
+         ENCODE-DOWNLOAD-SLOT-STATE false path str>
+         s" record resumed download checkpoint" SET-XATTR
+         f path str> s" sync resumed download checkpoint marker" SYNC-FILE
+      ENDOF
+      disposable OF {: p:str :} ENDOF
+   ;MATCH ;
+
+: CHECKPOINT? ( n n -- bool )
+   {: at:n total:n :}
+   at DOWNLOAD-CHECKPOINT-BYTES mod 0= at total < and ;
+
+: APPEND-BLOCKS ( ^download-partial n [ ^u8 n -- n ] -- )
+   {: x total:n read :}
+   begin x DOWNLOAD-PARTIAL-OFFSET @ total < while
+      x total x DOWNLOAD-PARTIAL-OFFSET @ - DROPBOX-BLOCK min read
+      APPEND-BLOCK
+      x DOWNLOAD-PARTIAL-OFFSET @ total CHECKPOINT? if
+         x PERSIST-CHECKPOINT
+      then
+   repeat ;
+
+\ A partial whose bytes hash to another content: a slot still bound to
+\ it restarts, else its path is occupied.
+: MISMATCHED ( ^download-partial DROPBOX:hash -- stage-outcome<n> )
+   {: x actual:DROPBOX:hash :}
+   x DOWNLOAD-PARTIAL-LOCATION {: loc :}
+   loc SOURCE@ RESUMABLE? if
+      x PARTIAL-FILE loc RESET-DOWNLOAD-SLOT TAKEN? 0= if
+         x PARTIAL-PATH OCCUPIED-AT exit
+      then
+   then
+   actual LOCAL-STAGE--OUTCOME:content-changed ;
+
+\ Syncs the verified file, marks it complete and promotes it.
+: COMPLETE-PARTIAL ( ^download-partial ^ARENA:arena -- stage-outcome<n> )
+   {: x ar:^ARENA:arena :}
+   x PARTIAL-FILE {: f:fd :}
+   x PARTIAL-PATH {: p:^ u:n :}
+   x DOWNLOAD-PARTIAL-LOCATION {: loc :}
+   f p u s" sync completed resumed download data" SYNC-FILE
+   f DOWNLOAD-STAGE-XATTR loc TARGET@ loc EXPECTED@ ar STAGE-MARKER true
+   p u s" mark completed resumed download" SET-XATTR
+   f p u s" sync completed resumed download marker" SYNC-FILE
+   f loc ar PROMOTE-COMPLETED-SLOT ;
+
+\ Rust's DownloadPartial::finish.
+: FINISH-PARTIAL ( ^download-partial ^ARENA:arena -- stage-outcome<n> )
+   {: x ar:^ARENA:arena :}
+   x DOWNLOAD-PARTIAL-AGGREGATE DROPBOX:HASH-END ar KEEP DROPBOX:>HASH
+   {: actual:DROPBOX:hash :}
+   actual x DOWNLOAD-PARTIAL-LOCATION EXPECTED@ SAME-CONTENT? 0= if
+      x actual MISMATCHED exit
+   then
+   x ar COMPLETE-PARTIAL ;
+
+: APPENDED
+   ( ^download-partial n [ ^u8 n -- n ] ^ARENA:arena -- stage-outcome<n> )
+   {: x total:n read ar:^ARENA:arena :}
+   x DOWNLOAD-PARTIAL-LOCATION TARGET@ {: t:^ tu:n :}
+   x DOWNLOAD-PARTIAL-OFFSET @ total > if
+      s" validate resumed download size" t tu CHANGED
+   then
+   x total read APPEND-BLOCKS
+   EXTRA 1 read t tu s" finish resumed download" STAGE-READ-INTO 0<> if
+      s" validate resumed download length" t tu CHANGED
+   then
+   x ar FINISH-PARTIAL ;
+
+: RESTARTED ( ^download-partial -- download-preparation )
+   {: x :}
+   x PARTIAL-FILE x DOWNLOAD-PARTIAL-LOCATION RESET-DOWNLOAD-SLOT
+   MATCH option
+      none OF x PARTIAL-PATH OCCUPIED-AT LOCAL-DOWNLOAD--PREPARATION:complete
+      ENDOF
+      some OF x SWAP-FILE
+         0 x DOWNLOAD-PARTIAL-OFFSET !
+         x DOWNLOAD-PARTIAL-AGGREGATE DROPBOX:HASH-BEGIN x READY
+      ENDOF
+   ;MATCH ;
+
+public
+
+\ Rust's DownloadPartial::restart: the partial's slot, still bound to its
+\ download, emptied to start over; else its path is occupied. Anything
+\ but a ready partial frees the partial.
+: RESTART-PARTIAL ( ^download-partial -- download-preparation )
+   {: x :}
+   [: x RESTARTED ;] [: x CLOSE-PARTIAL ;] PREPARING ;
+
+\ Rust's DownloadPartial::offset: the bytes the partial holds.
+: PARTIAL-OFFSET@ ( ^download-partial -- n ) DOWNLOAD-PARTIAL-OFFSET @ ;
+
+\ Rust's DownloadPartial::append: read's bytes up to total appended a
+\ block at a time, a slot's offset recorded at each checkpoint, then the
+\ whole verified and promoted into its stage. A failed read throws
+\ E-STAGE-READ, its partial block discarded. It frees the partial.
+: APPEND-PARTIAL
+   ( ^download-partial n [ ^u8 n -- n ] ^ARENA:arena -- stage-outcome<n> )
+   {: x total:n read ar:^ARENA:arena :}
+   [: x total read ar APPENDED ;] [: x CLOSE-PARTIAL ;] finally ;
+
+private
+
+\ ---- slot preparation
+
+\ The lease's slot directory opened, its slot's name and path laid in
+\ the arena, bound to the lease's download; a throw closes dir.
+: SLOT-SOURCE ( fd download-slot-lease ^ARENA:arena -- download-source )
+   {: dir:fd lease:download-slot-lease ar:^ARENA:arena :}
+   lease DOWNLOAD-SLOT-LEASE-UNMAKE {: d:str slot:n b:binding :}
+   -1 >FD dir
+   [: drop d str> s" open resumable download slot directory"
+      OPEN-PRIVATE-DIRECTORY ;] CLOSING
+   {: slots:fd :}
+   slot DOWNLOAD-SLOT-NAME ar KEEP {: name:str :}
+   slots name d str> name str> ar JOIN >str b DOWNLOAD-SOURCE-RESUMABLE ;
+
+\ The source's slot opened; an unnamed file has none.
+: SLOT-OPEN ( download-source -- download-slot-open )
+   MATCH download-source
+      resumable OF {: slots:fd name:str path:str b:binding :}
+         slots name str> path str> OPEN-DOWNLOAD-SLOT
+      ENDOF
+      disposable OF {: p:str :} DOWNLOAD-SLOT-OPEN-MISSING ENDOF
+   ;MATCH ;
+
+\ The location's slot as a partial at offset 0, not yet checked.
+: OPEN-SLOT ( download-location ^ARENA:arena -- download-preparation )
+   {: loc:download-location ar:^ARENA:arena :}
+   loc LOCATION-SOURCE SLOT-OPEN MATCH download-slot-open
+      missing OF EPHEMERAL ENDOF
+      file OF {: f:fd :} loc f ar NEW-PARTIAL READY ENDOF
+      occupied OF EPHEMERAL ENDOF
+   ;MATCH ;
+
+: SLOT-PREPARATION ( download-location ^ARENA:arena -- download-preparation )
+   {: loc:download-location ar:^ARENA:arena :}
+   loc ar INSPECT-LOCATION STAGE-PREPARATION MATCH option
+      none OF loc ar OPEN-SLOT ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+: SLOT-LENGTH ( stat ^u8 n -- n )
+   {: st:stat p:^ u:n :}
+   st STAT-UNMAKE {: d i m s ms mn cs cn :}
+   s 0 < if 0 s" inspect resumed download size" p u SYSCALL-FAILURE then
+   s ;
+
+: TRUNCATE-TAIL ( ^download-partial n -- )
+   {: x at:n :}
+   x PARTIAL-PATH {: p:^ u:n :}
+   [: x PARTIAL-FILE at FD:RESIZE ;]
+   [: s" truncate resumed download tail" p u IO-FAILURE ;] FS-FAILS
+   x PARTIAL-FILE p u s" sync truncated resumed download" SYNC-FILE ;
+
+\ The partial resumed at the checkpoint at, its file length bytes long
+\ cut back to it and its hash fed the bytes before it.
+: RESUME-AT ( ^download-partial n n -- download-preparation )
+   {: x at:n length:n :}
+   length at <> if x at TRUNCATE-TAIL then
+   x PARTIAL-FILE at x PARTIAL-PATH x DOWNLOAD-PARTIAL-AGGREGATE
+   HASH-DOWNLOAD-PREFIX
+   at x DOWNLOAD-PARTIAL-OFFSET !
+   x READY ;
+
+: RESET-THEN-RESUME ( ^download-partial -- download-preparation )
+   {: x :}
+   x PARTIAL-FILE x DOWNLOAD-PARTIAL-LOCATION RESET-DOWNLOAD-SLOT
+   MATCH option
+      none OF EPHEMERAL ENDOF
+      some OF x SWAP-FILE x 0 0 RESUME-AT ENDOF
+   ;MATCH ;
+
+\ Resumes at the checkpoint at, or from an emptied slot when reset says
+\ so or at is no checkpoint inside the file's length.
+: RESUME-FROM ( ^download-partial n n bool -- download-preparation )
+   {: x at:n length:n reset:bool :}
+   reset at DOWNLOAD-CHECKPOINT-BYTES mod 0<> or at length > or if
+      x RESET-THEN-RESUME exit
+   then
+   x at length RESUME-AT ;
+
+\ A slot marked complete: promoted when its bytes hash to the content,
+\ else reset.
+: RESUME-COMPLETED
+   ( ^download-partial n n ^ARENA:arena -- download-preparation )
+   {: x at:n length:n ar:^ARENA:arena :}
+   x DOWNLOAD-PARTIAL-LOCATION {: loc :}
+   x PARTIAL-FILE x PARTIAL-PATH s" verify completed resumed download" ar
+   E-UNSUPPORTED E-CHANGED HASH-STABLE-FILE
+   loc EXPECTED@ SAME-CONTENT? if
+      x PARTIAL-FILE loc ar PROMOTE-COMPLETED-SLOT
+      LOCAL-DOWNLOAD--PREPARATION:complete exit
+   then
+   x at length true RESUME-FROM ;
+
+: SLOT-MARKER ( ^download-partial ^ARENA:arena -- download-marker )
+   {: x ar:^ARENA:arena :}
+   x DOWNLOAD-PARTIAL-LOCATION {: loc :}
+   loc TARGET@ loc EXPECTED@ ar STAGE-MARKER {: m:^ mu:n :}
+   x PARTIAL-FILE m mu x PARTIAL-PATH READ-DOWNLOAD-MARKER ;
+
+: RESUME-MARKED ( ^download-partial n n ^ARENA:arena -- download-preparation )
+   {: x at:n length:n ar:^ARENA:arena :}
+   x ar SLOT-MARKER MATCH download-marker
+      missing OF x at length false RESUME-FROM ENDOF
+      expected OF x at length ar RESUME-COMPLETED ENDOF
+      other OF x at length true RESUME-FROM ENDOF
+   ;MATCH ;
+
+: RESUME-BOUND
+   ( ^download-partial download-slot-state binding n ^ARENA:arena
+     -- download-preparation )
+   {: x s:download-slot-state b:binding length:n ar:^ARENA:arena :}
+   s DOWNLOAD-SLOT-STATE-UNMAKE {: held:binding at:n :}
+   held b BINDING= 0= if EPHEMERAL exit then
+   x at length ar RESUME-MARKED ;
+
+\ The opened slot checked: a regular file bound to b, resumed.
+: RESUME-SLOT
+   ( ^download-partial binding ^ARENA:arena -- download-preparation )
+   {: x b:binding ar:^ARENA:arena :}
+   x PARTIAL-FILE x PARTIAL-PATH s" inspect resumed download" STAT-FD
+   {: st:stat :}
+   st REGULAR? 0= if EPHEMERAL exit then
+   st x PARTIAL-PATH SLOT-LENGTH {: length:n :}
+   x PARTIAL-FILE x PARTIAL-PATH READ-DOWNLOAD-SLOT-STATE MATCH option
+      none OF EPHEMERAL ENDOF
+      some OF x swap b length ar RESUME-BOUND ENDOF
+   ;MATCH ;
+
+: RESUMED
+   ( download-preparation download-slot-lease ^ARENA:arena
+     -- download-preparation )
+   {: p:download-preparation lease:download-slot-lease ar:^ARENA:arena :}
+   lease DOWNLOAD-SLOT-LEASE-UNMAKE {: d:str slot:n b:binding :}
+   p MATCH download-preparation
+      ready OF {: x :}
+         [: x b ar RESUME-SLOT ;] [: x CLOSE-PARTIAL ;] PREPARING
+      ENDOF
+      complete OF LOCAL-DOWNLOAD--PREPARATION:complete ENDOF
+      ephemeral OF EPHEMERAL ENDOF
+   ;MATCH ;
+
+\ Rust's open_parent with create; none is an unsafe path.
+: OPEN-TARGET-PARENT ( fd ^u8 n -- parent-dir )
+   {: root:fd t:^ tu:n :}
+   root t tu true OPEN-PARENT MATCH option
+      none OF t tu UNSAFE ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+public
+
+\ Rust's prepare_download_slot_with_access_at: the stage below root path
+\ r for target t holding want when one is complete or the lease's slot
+\ holds a verified completed partial, which it promotes; else the slot's
+\ partial resumed from its last durable checkpoint, or from an emptied
+\ slot; ephemeral when the slot is not the lease's. A ready partial holds
+\ the target's parent and the slot directory; paths go in the arena.
+: PREPARE-DOWNLOAD-SLOT-AT
+   ( fd ^u8 n ^u8 n DROPBOX:hash download-slot-lease ^ARENA:arena
+     -- download-preparation )
+   {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash
+      lease:download-slot-lease ar:^ARENA:arena :}
+   want s" prepare resumed download" REQUIRE-CONTENT-HASH
+   root t tu OPEN-TARGET-PARENT PARENT-DIR-UNMAKE
+   {: dir:fd last:str rel:str :}
+   dir lease ar SLOT-SOURCE dir r ru rel str> t tu want ar NEW-LOCATION
+   {: loc:download-location :}
+   [: loc ar SLOT-PREPARATION ;] [: loc CLOSE-LOCATION ;] PREPARING
+   lease ar RESUMED ;
+
+private
+
+\ ---- staged downloads
+
+: STAGE-DOWNLOAD-IN
+   ( fd ^u8 n ^u8 n ^u8 n DROPBOX:hash [ ^u8 n -- n ] ^ARENA:arena
+     -- stage-outcome<n> )
+   {: dir:fd r:^ ru:n rel:^ relu:n t:^ tu:n want:DROPBOX:hash read
+      ar:^ARENA:arena :}
+   r ru rel relu t tu want ar STAGE-PATHS {: name:^ nu:n sp:^ spu:n :}
+   t tu want ar STAGE-MARKER >str OPTION:SOME {: marker:option<str> :}
+   dir name nu sp spu want read marker s" stage download" ar
+   WRITE-VERIFIED-STAGE [: 0 ;] MAP-STAGE-WRITE ;
+
+: EXISTING-IN
+   ( fd ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+     -- option<stage-outcome<n>> )
+   {: dir:fd r:^ ru:n rel:^ relu:n t:^ tu:n want:DROPBOX:hash
+      ar:^ARENA:arena :}
+   r ru rel relu t tu want ar STAGE-PATHS {: name:^ nu:n sp:^ spu:n :}
+   dir name nu sp spu t tu want ar INSPECT-DOWNLOAD-STAGE EXISTING-OUTCOME ;
+
+public
+
+\ Rust's stage_download_at: read's bytes staged beside target t below
+\ root path r when they hash to want, marked as its owned download. A
+\ failed read throws E-STAGE-READ.
+: STAGE-DOWNLOAD-AT
+   ( fd ^u8 n ^u8 n DROPBOX:hash [ ^u8 n -- n ] ^ARENA:arena
+     -- stage-outcome<n> )
+   {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash read ar:^ARENA:arena :}
+   want s" stage download" REQUIRE-CONTENT-HASH
+   root t tu OPEN-TARGET-PARENT PARENT-DIR-UNMAKE
+   {: dir:fd last:str rel:str :}
+   [: dir r ru rel str> t tu want read ar STAGE-DOWNLOAD-IN ;]
+   [: dir DISCARD ;] finally ;
+
+\ Rust's stage_download: STAGE-DOWNLOAD-AT below the root at path r, a
+\ failed read an io failure.
+: STAGE-DOWNLOAD
+   ( ^u8 n ^u8 n DROPBOX:hash [ ^u8 n -- n ] ^ARENA:arena
+     -- stage-outcome<n> )
+   {: r:^ ru:n t:^ tu:n want:DROPBOX:hash read ar:^ARENA:arena :}
+   r ru s" open sync root for download staging" OPEN-ROOT {: root:fd :}
+   [: 0 LOCAL-STAGE--OUTCOME:staged
+      [: DROP-STAGE-OUTCOME root r ru t tu want read ar STAGE-DOWNLOAD-AT ;]
+      LOCAL-ERRORS ;]
+   [: root DISCARD ;] finally ;
+
+\ Rust's existing_download_stage_at: what the stage for target t holding
+\ want below root path r already comes to, none when it is missing.
+: EXISTING-DOWNLOAD-STAGE-AT
+   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- option<stage-outcome<n>> )
+   {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
+   want s" inspect download stage" REQUIRE-CONTENT-HASH
+   root t tu OPEN-TARGET-PARENT PARENT-DIR-UNMAKE
+   {: dir:fd last:str rel:str :}
+   [: dir r ru rel str> t tu want ar EXISTING-IN ;] [: dir DISCARD ;]
+   finally ;
+
+\ ---- installs
+
+public
+
+\ What installing a verified download came to: installed, installed by an
+\ earlier attempt, no verified stage to install, other bytes at the
+\ stage's path, kept as they were, or a target that no longer holds what
+\ was expected, with what it holds, none when it is absent.
+ENUM install-outcome
+   VARIANT installed ;VARIANT
+   VARIANT already-installed ;VARIANT
+   VARIANT download-required ;VARIANT
+   VARIANT stage-destination-occupied FIELD path str ;VARIANT
+   VARIANT precondition-changed FIELD actual option<DROPBOX:hash> ;VARIANT
+;ENUM
+
+\ What moving an expected target to its guard came to: moved, moved by an
+\ earlier attempt, or a target that no longer holds what was expected,
+\ with what it or the guard holds, none when neither is there.
+ENUM replacement-preparation
+   VARIANT prepared ;VARIANT
+   VARIANT already-prepared ;VARIANT
+   VARIANT precondition-changed FIELD actual option<DROPBOX:hash> ;VARIANT
+;ENUM
+
+private
+
+ENUM stage-cleanup
+   VARIANT removed-or-absent ;VARIANT
+   VARIANT destination-occupied FIELD path str ;VARIANT
+;ENUM
+
+\ An install in its open parent: the parent's descriptor and path, the
+\ stage's name and path, the target's last component and path, the
+\ content installed and the arena the names are laid in.
+STRUCTURE install
+   FIELD parent fd
+   FIELD parent-path str
+   FIELD stage-name str
+   FIELD stage-path str
+   FIELD target-name str
+   FIELD target str
+   FIELD desired DROPBOX:hash
+   FIELD arena ^ARENA:arena
+;STRUCTURE
+
+: INSTALLED ( -- install-outcome ) LOCAL-INSTALL--OUTCOME:installed ;
+: ALREADY-INSTALLED ( -- install-outcome )
+   LOCAL-INSTALL--OUTCOME:already-installed ;
+: DOWNLOAD-REQUIRED ( -- install-outcome )
+   LOCAL-INSTALL--OUTCOME:download-required ;
+: STAGE-OCCUPIED ( str -- install-outcome )
+   LOCAL-INSTALL--OUTCOME:stage-destination-occupied ;
+: INSTALL-CHANGED ( option<DROPBOX:hash> -- install-outcome )
+   LOCAL-INSTALL--OUTCOME:precondition-changed ;
+: PREPARED ( -- replacement-preparation )
+   LOCAL-REPLACEMENT--PREPARATION:prepared ;
+: ALREADY-PREPARED ( -- replacement-preparation )
+   LOCAL-REPLACEMENT--PREPARATION:already-prepared ;
+: PREPARE-CHANGED ( option<DROPBOX:hash> -- replacement-preparation )
+   LOCAL-REPLACEMENT--PREPARATION:precondition-changed ;
+
+\ No content: nothing is at the path.
+: ABSENT ( -- option<DROPBOX:hash> ) OPTION:NONE ;
+
+: PRESENT? ( option<DROPBOX:hash> -- bool )
+   MATCH option
+      none OF false ENDOF
+      some OF DROP-HASH true ENDOF
+   ;MATCH ;
+
+: GUARD-NAME ( ^u8 n DROPBOX:hash ^ARENA:arena -- ^u8 n )
+   {: t:^ tu:n c:DROPBOX:hash ar:^ARENA:arena :}
+   s" displaced" t tu c ar INTERNAL-NAME ;
+
+\ Removes the name in dir; o names the operation and p the path.
+: REMOVE-AT ( fd ^u8 n ^u8 n ^u8 n -- )
+   {: dir:fd name:^ nu:n o:^ ou:n p:^ u:n :}
+   dir name nu FS:TRY-REMOVE-FILE-AT 0= if o ou p u IO-FAILURE then ;
+
+: WRITABLE ( fd ^u8 n ^u8 n -- )
+   {: f:fd p:^ u:n o:^ ou:n :}
+   [: f FS:MODE-PRIVATE-FILE FD:MODE! ;] [: o ou p u IO-FAILURE ;]
+   FS-FAILS ;
+
+\ The stage's file is as it was verified.
+: VERIFY-DOWNLOAD-STAGE-BEFORE-RENAME ( verified-download-stage ^u8 n -- )
+   {: s:verified-download-stage p:^ u:n :}
+   s VERIFIED-DOWNLOAD-STAGE-UNMAKE {: f:fd print:MODEL:fingerprint :}
+   s" verify download stage before rename" {: o:^ ou:n :}
+   f p u o ou STAT-FD p u FILE-FINGERPRINT
+   print SAME-FINGERPRINT? 0= if o ou p u CHANGED then ;
+
+\ Makes the owned download at f a plain file: writable, unmarked.
+: RELEASE-OWNED-DOWNLOAD ( fd ^u8 n -- )
+   {: f:fd p:^ u:n :}
+   f p u s" make installed download writable" WRITABLE
+   f DOWNLOAD-PARTIAL-XATTR p u s" clear resumed download marker"
+   REMOVE-XATTR
+   f p u s" sync installed download cleanup" SYNC-FILE
+   f DOWNLOAD-STAGE-XATTR p u s" clear installed download marker"
+   REMOVE-XATTR ;
+
+\ Syncs the installed file; one still marked as LOCAL's is released first.
+: FINISH-INSTALLED-DOWNLOAD ( fd ^u8 n bool -- )
+   {: f:fd p:^ u:n owned:bool :}
+   owned if f p u RELEASE-OWNED-DOWNLOAD then
+   f p u s" sync installed download" SYNC-FILE ;
+
+\ Whether the stage's file holds its verified bytes under the name.
+: BOUND? ( verified-download-stage fd ^u8 n ^u8 n ^u8 n -- bool )
+   {: s:verified-download-stage dir:fd name:^ nu:n p:^ u:n o:^ ou:n :}
+   s VERIFIED-DOWNLOAD-STAGE-UNMAKE {: f:fd print:MODEL:fingerprint :}
+   f p u o ou STAT-FD p u FILE-FINGERPRINT
+   print SAME-HASHED-CONTENT 0= if false exit then
+   f dir name nu p u NAMED-INODE-MATCHES ;
+
+\ Whether the renamed stage is the owned download of want at the name.
+: OWNED-RENAME?
+   ( verified-download-stage fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+     -- bool )
+   {: s:verified-download-stage dir:fd name:^ nu:n p:^ u:n
+      want:DROPBOX:hash ar:^ARENA:arena :}
+   p u want ar STAGE-MARKER {: m:^ mu:n :}
+   s dir name nu p u s" verify renamed download content" BOUND?
+   0= if false exit then
+   s VERIFIED-DOWNLOAD-STAGE-UNMAKE {: f:fd print:MODEL:fingerprint :}
+   f m mu p u READ-DOWNLOAD-MARKER EXPECTED? ;
+
+\ Releases and syncs the stage renamed to the name, which must be the
+\ owned download of want before and after.
+: SYNC-RENAMED-DOWNLOAD
+   ( verified-download-stage fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- )
+   {: s:verified-download-stage dir:fd name:^ nu:n p:^ u:n
+      want:DROPBOX:hash ar:^ARENA:arena :}
+   s dir name nu p u want ar OWNED-RENAME? 0= if
+      s" verify renamed download ownership" p u CHANGED
+   then
+   dir p u s" sync installed download rename" SYNC-DIRECTORY
+   s VERIFIED-DOWNLOAD-STAGE-UNMAKE {: f:fd print:MODEL:fingerprint :}
+   f p u true FINISH-INSTALLED-DOWNLOAD
+   s dir name nu p u s" verify installed download content" BOUND? 0= if
+      s" verify installed download binding" p u CHANGED
+   then ;
+
+\ Finishes the open installed file when its content actual is want.
+: FINISH-IF-WANTED
+   ( fd DROPBOX:hash ^u8 n DROPBOX:hash ^ARENA:arena -- )
+   {: f:fd actual:DROPBOX:hash p:^ u:n want:DROPBOX:hash
+      ar:^ARENA:arena :}
+   actual want SAME-CONTENT? 0= if
+      s" verify installed download" p u CHANGED
+   then
+   p u want ar STAGE-MARKER {: m:^ mu:n :}
+   f m mu p u READ-DOWNLOAD-MARKER EXPECTED? {: owned:bool :}
+   f p u owned FINISH-INSTALLED-DOWNLOAD ;
+
+\ Syncs the download installed at the name, which must hold want, and
+\ its entry; a file still marked as LOCAL's is released first.
+: SYNC-INSTALLED-DOWNLOAD
+   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- )
+   {: dir:fd name:^ nu:n p:^ u:n want:DROPBOX:hash ar:^ARENA:arena :}
+   s" verify installed download" {: o:^ ou:n :}
+   dir name nu p u o ou ar OPEN-AND-HASH-IF-PRESENT MATCH option
+      none OF o ou p u CHANGED ENDOF
+      some OF HASHED-UNMAKE
+         {: f:fd c:DROPBOX:hash print:MODEL:fingerprint :}
+         [: f c p u want ar FINISH-IF-WANTED ;] [: f DISCARD ;] finally
+      ENDOF
+   ;MATCH
+   dir p u s" sync installed download entry" SYNC-DIRECTORY ;
+
+\ Removes the owned stage of want at the name in dir; another file
+\ there is kept.
+: REMOVE-VERIFIED-STAGE
+   ( fd ^u8 n DROPBOX:hash ^u8 n ^u8 n ^ARENA:arena -- stage-cleanup )
+   {: dir:fd name:^ nu:n want:DROPBOX:hash p:^ u:n t:^ tu:n
+      ar:^ARENA:arena :}
+   dir name nu p u t tu want ar INSPECT-DOWNLOAD-STAGE
+   MATCH download-stage
+      missing OF STAGE-CLEANUP-REMOVED-OR-ABSENT ENDOF
+      verified OF VERIFIED-DOWNLOAD-STAGE-UNMAKE
+         {: f:fd print:MODEL:fingerprint :} f DISCARD
+         dir name nu s" remove verified staging file" p u REMOVE-AT
+         STAGE-CLEANUP-REMOVED-OR-ABSENT
+      ENDOF
+      destination-occupied OF STAGE-CLEANUP-DESTINATION-OCCUPIED ENDOF
+   ;MATCH ;
+
+\ Removes target's guard for c when it holds c; other bytes are kept.
+: REMOVE-GUARD-IF-VERIFIED ( fd ^u8 n DROPBOX:hash ^ARENA:arena -- )
+   {: dir:fd t:^ tu:n c:DROPBOX:hash ar:^ARENA:arena :}
+   t tu c ar GUARD-NAME {: g:^ gu:n :}
+   dir g gu t tu s" verify stale install guard" ar HASH-AT-IF-PRESENT
+   MATCH option
+      none OF ENDOF
+      some OF c SAME-CONTENT? 0= if
+            s" clean completed replacement" t tu OCCUPIED
+         then
+         dir g gu s" remove stale install guard" t tu REMOVE-AT
+      ENDOF
+   ;MATCH ;
+
+\ The guard at path gp holds held: prepared when that is c.
+: EXISTING-GUARD
+   ( option<DROPBOX:hash> DROPBOX:hash ^u8 n -- replacement-preparation )
+   {: held:option<DROPBOX:hash> c:DROPBOX:hash gp:^ gpu:n :}
+   held c HOLDS? 0= if
+      s" prepare download replacement" gp gpu OCCUPIED
+   then
+   ALREADY-PREPARED ;
+
+\ The target is at its guard g, at path gp, now: prepared when the guard
+\ holds c, else the guard goes back or is kept as a local conflict.
+: VERIFY-DISPLACED
+   ( fd ^u8 n ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+     -- replacement-preparation )
+   {: dir:fd g:^ gu:n gp:^ gpu:n tn:^ tnu:n t:^ tu:n c:DROPBOX:hash
+      ar:^ARENA:arena :}
+   dir t tu s" sync replacement displacement guard" SYNC-DIRECTORY
+   dir g gu gp gpu s" verify displaced replacement file" ar
+   HASH-AT-IF-PRESENT {: held:option<DROPBOX:hash> :}
+   held c HOLDS? if PREPARED exit then
+   dir g gu tn tnu t tu held ar RESTORE-OR-PRESERVE-CHANGED-GUARD
+   held PREPARE-CHANGED ;
+
+\ Renames the target to its guard g, at path gp, never over an entry.
+: MOVE-TO-GUARD
+   ( fd ^u8 n ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+     -- replacement-preparation )
+   {: dir:fd g:^ gu:n gp:^ gpu:n tn:^ tnu:n t:^ tu:n c:DROPBOX:hash
+      ar:^ARENA:arena :}
+   dir tn tnu dir g gu FS:TRY-RENAME-NEW-AT if
+      dir g gu gp gpu tn tnu t tu c ar VERIFY-DISPLACED exit
+   then
+   FS:ERRNO {: e:n :}
+   e FS:ENOENT = if ABSENT PREPARE-CHANGED exit then
+   e FS:EEXIST <> if
+      s" move replaced file to displacement guard" t tu IO-FAILURE
+   then
+   dir g gu gp gpu s" verify raced replacement displacement" ar
+   HASH-AT-IF-PRESENT c gp gpu EXISTING-GUARD ;
+
+\ Moves the target at the name in dir, whose path is dp, to its guard
+\ when it holds c; a guard already there holding c was moved before.
+: PREPARE-REPLACEMENT-AT
+   ( fd ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+     -- replacement-preparation )
+   {: dir:fd dp:^ du:n tn:^ tnu:n t:^ tu:n c:DROPBOX:hash
+      ar:^ARENA:arena :}
+   t tu c ar GUARD-NAME {: g:^ gu:n :}
+   dp du g gu ar JOIN {: gp:^ gpu:n :}
+   dir tn tnu t tu s" check replacement preparation precondition" ar
+   HASH-AT-IF-PRESENT {: current:option<DROPBOX:hash> :}
+   dir g gu gp gpu s" inspect replacement displacement guard" ar
+   HASH-AT-IF-PRESENT {: held:option<DROPBOX:hash> :}
+   held PRESENT? if held c gp gpu EXISTING-GUARD exit then
+   current c HOLDS? 0= if current PREPARE-CHANGED exit then
+   dir g gu gp gpu tn tnu t tu c ar MOVE-TO-GUARD ;
+
+\ The parent f opened at rel below the root at r, as OPEN-PARENT gives it.
+: PREPARE-IN-PARENT
+   ( fd str str ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+     -- replacement-preparation )
+   {: f:fd name:str rel:str r:^ ru:n t:^ tu:n c:DROPBOX:hash
+      ar:^ARENA:arena :}
+   r ru rel str> ar JOIN {: dp:^ du:n :}
+   f dp du name str> t tu c ar PREPARE-REPLACEMENT-AT ;
+
+: PREPARE-BELOW-ROOT
+   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- replacement-preparation )
+   {: root:fd r:^ ru:n t:^ tu:n c:DROPBOX:hash ar:^ARENA:arena :}
+   root t tu false OPEN-PARENT MATCH option
+      none OF ABSENT PREPARE-CHANGED ENDOF
+      some OF PARENT-DIR-UNMAKE {: f:fd name:str rel:str :}
+         [: f name rel r ru t tu c ar PREPARE-IN-PARENT ;]
+         [: f DISCARD ;] finally
+      ENDOF
+   ;MATCH ;
+
+public
+
+\ Moves target t below the sync root at r to its guard, a name in the
+\ same directory, when it holds c, and syncs the directory: the bytes are
+\ then at the target or at the guard. A replay finds them at the guard.
+: PREPARE-REPLACEMENT
+   ( ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- replacement-preparation )
+   {: r:^ ru:n t:^ tu:n c:DROPBOX:hash ar:^ARENA:arena :}
+   c s" prepare replacement" REQUIRE-CONTENT-HASH
+   r ru s" open sync root for replacement preparation"
+   OPEN-ABSOLUTE-DIRECTORY {: root:fd :}
+   [: root r ru t tu c ar PREPARE-BELOW-ROOT ;] [: root DISCARD ;]
+   finally ;
+
+private
+
+\ ---- an install's steps
+
+: DESIRED ( install -- DROPBOX:hash )
+   INSTALL-UNMAKE {: dir dp sn sp tn t want ar :} want ;
+
+\ The content at x's target now; o names the operation.
+: TARGET-HASH ( install ^u8 n -- option<DROPBOX:hash> )
+   {: x:install o:^ ou:n :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   dir tn str> t str> o ou ar HASH-AT-IF-PRESENT ;
+
+\ Syncs x's parent; o names the operation.
+: SYNC-PARENT ( install ^u8 n -- )
+   {: x:install o:^ ou:n :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   dir t str> o ou SYNC-DIRECTORY ;
+
+\ Removes the name in x's parent; o names the operation.
+: REMOVE-IN-PARENT ( install ^u8 n ^u8 n -- )
+   {: x:install g:^ gu:n o:^ ou:n :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   dir g gu o ou t str> REMOVE-AT ;
+
+: INSPECT-INSTALL-STAGE ( install -- download-stage )
+   INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   dir sn str> sp str> t str> want ar INSPECT-DOWNLOAD-STAGE ;
+
+\ Runs q on x's verified stage, closing it after; with none, or other
+\ bytes at the stage's name, the install answers that.
+: WITH-STAGE
+   ( install [ install verified-download-stage -- install-outcome ]
+     -- install-outcome )
+   {: x:install q :}
+   x INSPECT-INSTALL-STAGE MATCH download-stage
+      missing OF DOWNLOAD-REQUIRED ENDOF
+      verified OF {: s:verified-download-stage :}
+         s VERIFIED-DOWNLOAD-STAGE-UNMAKE
+         {: f:fd print:MODEL:fingerprint :}
+         [: x s q execute ;] [: f DISCARD ;] finally
+      ENDOF
+      destination-occupied OF STAGE-OCCUPIED ENDOF
+   ;MATCH ;
+
+\ x's target holds its content: syncs it and removes the stage.
+: CLEAN-INSTALLED ( install -- stage-cleanup )
+   INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   dir tn str> t str> want ar SYNC-INSTALLED-DOWNLOAD
+   dir sn str> want sp str> t str> ar REMOVE-VERIFIED-STAGE ;
+
+\ Runs q once the stage is gone; other bytes at its name answer the
+\ install.
+: CLEANED
+   ( stage-cleanup [ -- install-outcome ] -- install-outcome )
+   {: c:stage-cleanup q :}
+   c MATCH stage-cleanup
+      removed-or-absent OF q execute ENDOF
+      destination-occupied OF STAGE-OCCUPIED ENDOF
+   ;MATCH ;
+
+: REMOVE-INSTALL-GUARD ( install DROPBOX:hash -- )
+   {: x:install c:DROPBOX:hash :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   dir t str> c ar REMOVE-GUARD-IF-VERIFIED ;
+
+: DROP-INSTALLED-GUARD ( install option<DROPBOX:hash> -- )
+   {: x:install expected:option<DROPBOX:hash> :}
+   expected MATCH option
+      none OF ENDOF
+      some OF {: c:DROPBOX:hash :}
+         c s" clean replacement guard" REQUIRE-CONTENT-HASH
+         x c REMOVE-INSTALL-GUARD
+      ENDOF
+   ;MATCH ;
+
+\ An earlier attempt installed x: cleans up after it.
+: FINISH-EARLIER-INSTALL
+   ( install option<DROPBOX:hash> -- install-outcome )
+   {: x:install expected:option<DROPBOX:hash> :}
+   x CLEAN-INSTALLED
+   [: x expected DROP-INSTALLED-GUARD
+      x s" sync already-installed download" SYNC-PARENT
+      ALREADY-INSTALLED ;] CLEANED ;
+
+\ The target x's stage was renamed to exists: x's content there was
+\ installed by another attempt.
+: RACED-INITIAL-INSTALL ( install -- install-outcome )
+   {: x:install :}
+   x s" inspect raced initial install" TARGET-HASH
+   {: actual:option<DROPBOX:hash> :}
+   actual x DESIRED HOLDS? 0= if actual INSTALL-CHANGED exit then
+   x CLEAN-INSTALLED
+   [: x s" sync raced initial install cleanup" SYNC-PARENT
+      ALREADY-INSTALLED ;] CLEANED ;
+
+\ Renames x's verified stage to its target, never over an entry.
+: RENAME-STAGE-INTO-ABSENT-TARGET
+   ( install verified-download-stage -- install-outcome )
+   {: x:install s:verified-download-stage :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   s sp str> VERIFY-DOWNLOAD-STAGE-BEFORE-RENAME
+   dir sn str> dir tn str> FS:TRY-RENAME-NEW-AT if
+      s dir tn str> t str> want ar SYNC-RENAMED-DOWNLOAD
+      INSTALLED exit
+   then
+   FS:ERRNO {: e:n :}
+   e FS:ENOENT = if DOWNLOAD-REQUIRED exit then
+   e FS:EEXIST <> if
+      s" install download into absent path" t str> IO-FAILURE
+   then
+   x RACED-INITIAL-INSTALL ;
+
+: INSTALL-ABSENT ( install option<DROPBOX:hash> -- install-outcome )
+   {: x:install current:option<DROPBOX:hash> :}
+   current PRESENT? if current INSTALL-CHANGED exit then
+   x [: RENAME-STAGE-INTO-ABSENT-TARGET ;] WITH-STAGE ;
+
+\ The guard of c is cleaned after a raced target whose content is actual.
+: SETTLE-PREPARED
+   ( install DROPBOX:hash DROPBOX:hash -- install-outcome )
+   {: x:install c:DROPBOX:hash actual:DROPBOX:hash :}
+   x c REMOVE-INSTALL-GUARD
+   actual x DESIRED SAME-CONTENT? if
+      x s" sync raced prepared replacement cleanup" SYNC-PARENT
+      ALREADY-INSTALLED exit
+   then
+   x s" sync raced prepared replacement" SYNC-PARENT
+   actual OPTION:SOME INSTALL-CHANGED ;
+
+\ After the target moved to its guard, an entry holding actual raced in.
+: RACED-PREPARED
+   ( DROPBOX:hash install DROPBOX:hash -- install-outcome )
+   {: actual:DROPBOX:hash x:install c:DROPBOX:hash :}
+   actual x DESIRED SAME-CONTENT? 0= if
+      x c actual SETTLE-PREPARED exit
+   then
+   x CLEAN-INSTALLED [: x c actual SETTLE-PREPARED ;] CLEANED ;
+
+\ The guard g is removed after the rename found an entry at the target.
+: SETTLE-RACED
+   ( install ^u8 n option<DROPBOX:hash> -- install-outcome )
+   {: x:install g:^ gu:n actual:option<DROPBOX:hash> :}
+   x g gu s" remove recovered displacement guard" REMOVE-IN-PARENT
+   actual x DESIRED HOLDS? if
+      x s" sync raced replacement cleanup" SYNC-PARENT
+      ALREADY-INSTALLED exit
+   then
+   x s" sync raced replacement" SYNC-PARENT
+   actual INSTALL-CHANGED ;
+
+: RACED-REPLACEMENT ( install ^u8 n -- install-outcome )
+   {: x:install g:^ gu:n :}
+   x s" inspect raced install destination" TARGET-HASH
+   {: actual:option<DROPBOX:hash> :}
+   actual x DESIRED HOLDS? 0= if x g gu actual SETTLE-RACED exit then
+   x CLEAN-INSTALLED [: x g gu actual SETTLE-RACED ;] CLEANED ;
+
+\ The stage renamed to the target; the guard g it displaced is removed.
+: REPLACED
+   ( verified-download-stage install ^u8 n -- install-outcome )
+   {: s:verified-download-stage x:install g:^ gu:n :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   s dir tn str> t str> want ar SYNC-RENAMED-DOWNLOAD
+   x g gu s" remove displaced install guard" REMOVE-IN-PARENT
+   x s" sync completed replacement" SYNC-PARENT
+   INSTALLED ;
+
+\ Renames the stage to the target, now at its guard for c.
+: RENAME-REPLACEMENT
+   ( verified-download-stage install DROPBOX:hash -- install-outcome )
+   {: s:verified-download-stage x:install c:DROPBOX:hash :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   t str> c ar GUARD-NAME {: g:^ gu:n :}
+   s sp str> VERIFY-DOWNLOAD-STAGE-BEFORE-RENAME
+   dir sn str> dir tn str> FS:TRY-RENAME-NEW-AT if
+      s x g gu REPLACED exit
+   then
+   FS:ERRNO FS:EEXIST <> if
+      s" install verified replacement" t str> IO-FAILURE
+   then
+   x g gu RACED-REPLACEMENT ;
+
+\ The target is at its guard for c, unless an entry raced in after.
+: RESUME-REPLACEMENT
+   ( verified-download-stage install DROPBOX:hash -- install-outcome )
+   {: s:verified-download-stage x:install c:DROPBOX:hash :}
+   x s" resume prepared replacement" TARGET-HASH MATCH option
+      none OF s x c RENAME-REPLACEMENT ENDOF
+      some OF x c RACED-PREPARED ENDOF
+   ;MATCH ;
+
+: PREPARE-INSTALL ( install DROPBOX:hash -- replacement-preparation )
+   {: x:install c:DROPBOX:hash :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   dir dp str> tn str> t str> c ar PREPARE-REPLACEMENT-AT ;
+
+: REPLACE-WITH-STAGE
+   ( install verified-download-stage DROPBOX:hash -- install-outcome )
+   {: x:install s:verified-download-stage c:DROPBOX:hash :}
+   x c PREPARE-INSTALL MATCH replacement-preparation
+      prepared OF s x c RESUME-REPLACEMENT ENDOF
+      already-prepared OF s x c RESUME-REPLACEMENT ENDOF
+      precondition-changed OF INSTALL-CHANGED ENDOF
+   ;MATCH ;
+
+\ Replaces x's target, which held c, with the verified stage.
+: INSTALL-REPLACEMENT ( install DROPBOX:hash -- install-outcome )
+   {: x:install c:DROPBOX:hash :}
+   c s" install replacement" REQUIRE-CONTENT-HASH
+   x [: c REPLACE-WITH-STAGE ;] WITH-STAGE ;
+
+: INSTALL-IN-PARENT ( install option<DROPBOX:hash> -- install-outcome )
+   {: x:install expected:option<DROPBOX:hash> :}
+   x s" check install precondition" TARGET-HASH
+   {: current:option<DROPBOX:hash> :}
+   current x DESIRED HOLDS? if x expected FINISH-EARLIER-INSTALL exit then
+   expected MATCH option
+      none OF x current INSTALL-ABSENT ENDOF
+      some OF {: c:DROPBOX:hash :} x c INSTALL-REPLACEMENT ENDOF
+   ;MATCH ;
+
+\ The install of t's content want in the parent f, opened at rel below
+\ the root at r.
+: INSTALL-OF
+   ( fd str str ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- install )
+   {: f:fd tn:str rel:str r:^ ru:n t:^ tu:n want:DROPBOX:hash
+      ar:^ARENA:arena :}
+   r ru rel str> ar JOIN {: dp:^ du:n :}
+   s" download" t tu want ar INTERNAL-NAME {: sn:^ snu:n :}
+   dp du sn snu ar JOIN {: sp:^ spu:n :}
+   f dp du >str sn snu >str sp spu >str tn t tu >str want ar
+   INSTALL-MAKE ;
+
+public
+
+\ Renames the verified stage of want over target t below the root fd,
+\ whose path is r, only while t holds expected, or is absent when
+\ expected is none; a target that changed is kept, never overwritten.
+: INSTALL-DOWNLOAD-AT
+   ( fd ^u8 n ^u8 n DROPBOX:hash option<DROPBOX:hash> ^ARENA:arena
+     -- install-outcome )
+   {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash
+      expected:option<DROPBOX:hash> ar:^ARENA:arena :}
+   want s" install download" REQUIRE-CONTENT-HASH
+   root t tu false OPEN-PARENT MATCH option
+      none OF DOWNLOAD-REQUIRED ENDOF
+      some OF PARENT-DIR-UNMAKE {: f:fd name:str rel:str :}
+         [: f name rel r ru t tu want ar INSTALL-OF
+            expected INSTALL-IN-PARENT ;]
+         [: f DISCARD ;] finally
+      ENDOF
+   ;MATCH ;
+
+\ INSTALL-DOWNLOAD-AT below the sync root at r.
+: INSTALL-DOWNLOAD
+   ( ^u8 n ^u8 n DROPBOX:hash option<DROPBOX:hash> ^ARENA:arena
+     -- install-outcome )
+   {: r:^ ru:n t:^ tu:n want:DROPBOX:hash
+      expected:option<DROPBOX:hash> ar:^ARENA:arena :}
+   r ru s" open sync root for download install" OPEN-ABSOLUTE-DIRECTORY
+   {: root:fd :}
+   [: root r ru t tu want expected ar INSTALL-DOWNLOAD-AT ;]
+   [: root DISCARD ;] finally ;
+
+\ ---- deletes
+
+public
+
+\ What a conditional delete of a local file came to: the expected file
+\ removed now or by an earlier attempt, or other content found, none
+\ when nothing is there.
+ENUM delete-outcome
+   VARIANT deleted ;VARIANT
+   VARIANT already-deleted ;VARIANT
+   VARIANT precondition-changed FIELD actual option<DROPBOX:hash> ;VARIANT
+;ENUM
+
+private
+
+\ A delete in its open parent: the descriptor, the target's last component,
+\ the target, the guard's name and the path a failure names for it, and the
+\ content the delete expects.
+STRUCTURE deletion
+   FIELD dir fd
+   FIELD name str
+   FIELD target str
+   FIELD guard str
+   FIELD guard-path str
+   FIELD want DROPBOX:hash
+;STRUCTURE
+
+: DELETION-WANT ( deletion -- DROPBOX:hash )
+   DELETION-UNMAKE {: d:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
+   want ;
+
+\ The content of the guard, none when it is absent; o names the read.
+: GUARD-CONTENT
+   ( deletion ^u8 n ^ARENA:arena -- option<DROPBOX:hash> )
+   {: x:deletion o:^ ou:n ar:^ARENA:arena :}
+   x DELETION-UNMAKE {: dir:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
+   dir g str> gp str> o ou ar HASH-AT-IF-PRESENT ;
+
+\ Whether a guard holding the expected content is there; other bytes are
+\ kept and stop the operation oc names. i names the read.
+: GUARD-HELD? ( deletion ^u8 n ^u8 n ^ARENA:arena -- bool )
+   {: x:deletion i:^ iu:n oc:^ ocu:n ar:^ARENA:arena :}
+   x i iu ar GUARD-CONTENT MATCH option
+      none OF false ENDOF
+      some OF x DELETION-WANT SAME-CONTENT? 0= if
+            x DELETION-UNMAKE
+            {: d:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
+            oc ocu gp str> OCCUPIED
+         then true
+      ENDOF
+   ;MATCH ;
+
+\ Removes the guard, then syncs its directory; o names the removal, sy
+\ the sync.
+: REMOVE-GUARD ( deletion ^u8 n ^u8 n -- )
+   {: x:deletion o:^ ou:n sy:^ syu:n :}
+   x DELETION-UNMAKE {: dir:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
+   dir g str> FS:TRY-REMOVE-FILE-AT 0= if o ou t str> IO-FAILURE then
+   dir t str> sy syu SYNC-DIRECTORY ;
+
+\ The guard holds other content than expected: it goes back to the target,
+\ or is kept beside an entry raced in there.
+: GUARD-CHANGED
+   ( deletion option<DROPBOX:hash> ^ARENA:arena -- delete-outcome )
+   {: x:deletion c:option<DROPBOX:hash> ar:^ARENA:arena :}
+   x DELETION-UNMAKE {: dir:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
+   dir g str> n str> t str> c ar RESTORE-OR-PRESERVE-CHANGED-GUARD
+   c LOCAL-DELETE--OUTCOME:precondition-changed ;
+
+\ The target is absent: a guard holding the expected content finishes an
+\ interrupted delete.
+: FINISH-INTERRUPTED ( deletion ^ARENA:arena -- delete-outcome )
+   {: x:deletion ar:^ARENA:arena :}
+   x s" inspect interrupted deletion" ar GUARD-CONTENT
+   {: c:option<DROPBOX:hash> :}
+   c x DELETION-WANT HOLDS? if
+      x s" finish interrupted deletion" s" sync interrupted deletion"
+      REMOVE-GUARD LOCAL-DELETE--OUTCOME:deleted exit
+   then
+   c MATCH option
+      none OF LOCAL-DELETE--OUTCOME:already-deleted ENDOF
+      some OF drop x c ar GUARD-CHANGED ENDOF
+   ;MATCH ;
+
+\ Other content is at the target: a guard holding the expected content is
+\ removed, and the outcome names what is there.
+: RACED-DELETE ( deletion DROPBOX:hash ^ARENA:arena -- delete-outcome )
+   {: x:deletion c:DROPBOX:hash ar:^ARENA:arena :}
+   x s" inspect raced deletion guard" s" clean raced local deletion" ar
+   GUARD-HELD? if
+      x s" remove raced deletion guard"
+      s" sync raced deletion guard removal" REMOVE-GUARD
+   then
+   c OPTION:SOME LOCAL-DELETE--OUTCOME:precondition-changed ;
+
+\ Moves the target to the guard's name and syncs; false when the target
+\ is gone by now.
+: DISPLACE ( deletion -- bool )
+   {: x:deletion :}
+   x DELETION-UNMAKE {: dir:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
+   dir n str> dir g str> FS:TRY-RENAME-NEW-AT if
+      dir t str> s" sync deletion displacement" SYNC-DIRECTORY true exit
+   then
+   FS:ERRNO FS:ENOENT = if false exit then
+   s" move deleted file to displacement guard" t str> IO-FAILURE ;
+
+\ The target holds the expected content: it moves aside to the guard and
+\ is removed there only while the guard still holds it.
+: DELETE-EXPECTED ( deletion ^ARENA:arena -- delete-outcome )
+   {: x:deletion ar:^ARENA:arena :}
+   x s" inspect deletion guard" s" prepare local deletion" ar
+   GUARD-HELD? if
+      x s" remove stale deletion guard"
+      s" sync stale deletion guard removal" REMOVE-GUARD
+   then
+   x DISPLACE 0= if LOCAL-DELETE--OUTCOME:already-deleted exit then
+   x s" verify deletion displacement" ar GUARD-CONTENT
+   {: c:option<DROPBOX:hash> :}
+   c x DELETION-WANT HOLDS? 0= if x c ar GUARD-CHANGED exit then
+   x s" delete verified displaced file" s" sync local deletion"
+   REMOVE-GUARD LOCAL-DELETE--OUTCOME:deleted ;
+
+: DELETE-IN ( deletion ^ARENA:arena -- delete-outcome )
+   {: x:deletion ar:^ARENA:arena :}
+   x DELETION-UNMAKE {: dir:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
+   dir n str> t str> s" check delete precondition" ar HASH-AT-IF-PRESENT
+   {: c:option<DROPBOX:hash> :}
+   c MATCH option
+      none OF x ar FINISH-INTERRUPTED ENDOF
+      some OF {: h:DROPBOX:hash :}
+         h want SAME-CONTENT? if x ar DELETE-EXPECTED exit then
+         x h ar RACED-DELETE
+      ENDOF
+   ;MATCH ;
+
+\ The delete in the open parent, which closes after it; r is the root's
+\ path, which failures name.
+: DELETE-BELOW
+   ( parent-dir ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- delete-outcome )
+   {: pd:parent-dir r:^ ru:n t:^ tu:n want:DROPBOX:hash
+      ar:^ARENA:arena :}
+   pd PARENT-DIR-UNMAKE {: dir:fd name:str path:str :}
+   s" deleted" t tu want ar INTERNAL-NAME {: g:^ gu:n :}
+   r ru path str> ar JOIN g gu ar JOIN {: gp:^ gpu:n :}
+   dir name t tu >str g gu >str gp gpu >str want DELETION-MAKE
+   {: x:deletion :}
+   [: x ar DELETE-IN ;] [: dir DISCARD ;] finally ;
+
+public
+
+\ Rust's delete_local_at: deletes the target below the root, whose path is
+\ r, while it holds want. It moves aside under a guard name first, and a
+\ guard left by an interrupted attempt is finished or put back.
+: DELETE-LOCAL-AT
+   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- delete-outcome )
+   {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
+   want s" delete local file" REQUIRE-CONTENT-HASH
+   root t tu false OPEN-PARENT MATCH option
+      none OF LOCAL-DELETE--OUTCOME:already-deleted ENDOF
+      some OF r ru t tu want ar DELETE-BELOW ENDOF
+   ;MATCH ;
+
+\ DELETE-LOCAL-AT below the root at the absolute path r.
+: DELETE-LOCAL
+   ( ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- delete-outcome )
+   {: r:^ ru:n t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
+   r ru s" open sync root for local deletion" OPEN-ABSOLUTE-DIRECTORY
+   {: root:fd :}
+   [: root r ru t tu want ar DELETE-LOCAL-AT ;] [: root DISCARD ;]
+   finally ;
+
+\ ---- directories
+
+\ What making a directory came to: made, already there, or another entry
+\ or a change at its path, which a fresh scan observes.
+ENUM create-directory-outcome
+   created already-present fresh-observation
+;ENUM
+
+\ What removing an empty directory came to: removed, already absent, or
+\ an entry that is not one or not empty, which a fresh scan observes.
+ENUM delete-directory-outcome
+   deleted already-absent fresh-observation
+;ENUM
+
+private
+
+\ A directory open at the name in dir is synced with its entry; a missing
+\ name, a non-directory or a symlink there is a fresh observation.
+: EXISTING-DIRECTORY ( fd ^u8 n ^u8 n -- create-directory-outcome )
+   {: dir:fd name:^ nu:n p:^ u:n :}
+   dir name nu FS:TRY-OPEN-DIR-AT MATCH option
+      none OF FS:ERRNO {: e:n :}
+         e FS:ENOENT = e FS:ENOTDIR = or e FS:ELOOP = or 0= if
+            s" inspect occupied local directory path" p u IO-FAILURE
+         then LOCAL-CREATE--DIRECTORY--OUTCOME:fresh-observation
+      ENDOF
+      some OF {: d:fd :}
+         [: d p u s" sync existing local directory" SYNC-DIRECTORY ;]
+         [: d DISCARD ;] finally
+         dir p u s" sync existing local directory entry" SYNC-DIRECTORY
+         LOCAL-CREATE--DIRECTORY--OUTCOME:already-present
+      ENDOF
+   ;MATCH ;
+
+\ Opens the directory just made at the name in dir and syncs it.
+: SYNC-MADE-DIRECTORY ( fd ^u8 n ^u8 n -- )
+   {: dir:fd name:^ nu:n p:^ u:n :}
+   dir name nu p u OPEN-DIRECTORY-AT {: d:fd :}
+   [: d p u s" sync created local directory" SYNC-DIRECTORY ;]
+   [: d DISCARD ;] finally ;
+
+: MAKE-DIRECTORY-IN ( fd ^u8 n ^u8 n -- create-directory-outcome )
+   {: dir:fd name:^ nu:n p:^ u:n :}
+   dir name nu MODE-PRIVATE-DIR FS:TRY-MAKE-DIR-AT if
+      dir p u s" sync created local directory entry" SYNC-DIRECTORY
+      dir name nu p u SYNC-MADE-DIRECTORY
+      LOCAL-CREATE--DIRECTORY--OUTCOME:created exit
+   then
+   FS:ERRNO FS:EEXIST <> if s" create local directory" p u IO-FAILURE then
+   dir name nu p u EXISTING-DIRECTORY ;
+
+\ Whether a failed rmdir found an entry that is not an empty directory.
+: OCCUPIED-DIRECTORY? ( n -- bool )
+   {: e:n :}
+   e FS:ENOTEMPTY = e FS:EEXIST = or e FS:ENOTDIR = or e FS:EISDIR = or ;
+
+: REMOVE-DIRECTORY-IN ( fd ^u8 n ^u8 n -- delete-directory-outcome )
+   {: dir:fd name:^ nu:n p:^ u:n :}
+   dir name nu FS:TRY-REMOVE-DIR-AT if
+      dir p u s" sync deleted local directory" SYNC-DIRECTORY
+      LOCAL-DELETE--DIRECTORY--OUTCOME:deleted exit
+   then
+   FS:ERRNO {: e:n :}
+   e FS:ENOENT = if LOCAL-DELETE--DIRECTORY--OUTCOME:already-absent exit then
+   e OCCUPIED-DIRECTORY? if
+      LOCAL-DELETE--DIRECTORY--OUTCOME:fresh-observation exit
+   then
+   s" delete empty local directory" p u IO-FAILURE ;
+
+public
+
+\ Makes the directory at p below the root, its missing parents as well;
+\ it never follows a link or replaces an entry.
+: CREATE-DIRECTORY-AT ( fd ^u8 n -- create-directory-outcome )
+   {: root:fd p:^ u:n :}
+   root p u true OPEN-PARENT MATCH option
+      none OF p u UNSAFE ENDOF
+      some OF PARENT-DIR-UNMAKE {: dir:fd name:str path:str :}
+         [: dir name str> p u MAKE-DIRECTORY-IN ;] [: dir DISCARD ;]
+         finally
+      ENDOF
+   ;MATCH ;
+
+\ Removes the directory at p below the root only while it is empty.
+: DELETE-DIRECTORY-AT ( fd ^u8 n -- delete-directory-outcome )
+   {: root:fd p:^ u:n :}
+   root p u false OPEN-PARENT MATCH option
+      none OF LOCAL-DELETE--DIRECTORY--OUTCOME:already-absent ENDOF
+      some OF PARENT-DIR-UNMAKE {: dir:fd name:str path:str :}
+         [: dir name str> p u REMOVE-DIRECTORY-IN ;] [: dir DISCARD ;]
+         finally
+      ENDOF
+   ;MATCH ;
+
+\ ---- conflicts
+
+\ What writing one side of a conflict came to: a new copy at path,
+\ relative to the root, the same bytes already there, or supplied bytes
+\ whose hash is actual.
+ENUM conflict-outcome
+   VARIANT created FIELD path str ;VARIANT
+   VARIANT already-present FIELD path str ;VARIANT
+   VARIANT content-changed FIELD actual DROPBOX:hash ;VARIANT
+;ENUM
+
+\ The path, relative to the root, of p's conflict copy for side holding c.
+: CONFLICT-RELATIVE-PATH
+   ( ^u8 n conflict-side DROPBOX:hash ^ARENA:arena -- ^u8 n )
+   {: p:^ u:n side:conflict-side c:DROPBOX:hash ar:^ARENA:arena :}
+   p u PARENT-PATH p u side c ar CONFLICT-NAME ar JOIN ;
+
+private
+
+\ The stage written at the conflict's path rel, which shown names in
+\ full; another file there is kept.
+: CONFLICT-RESULT ( stage-write ^u8 n ^u8 n -- conflict-outcome )
+   {: w:stage-write rel:^ relu:n shown:^ shownu:n :}
+   w MATCH stage-write
+      created OF rel relu >str LOCAL-CONFLICT--OUTCOME:created ENDOF
+      reused OF rel relu >str LOCAL-CONFLICT--OUTCOME:already-present
+      ENDOF
+      mismatch OF LOCAL-CONFLICT--OUTCOME:content-changed ENDOF
+      destination-occupied OF {: q:str :}
+         s" materialize conflict" q str> OCCUPIED
+      ENDOF
+   ;MATCH ;
+
+\ The conflict copy written in the open parent, which closes after it.
+: CONFLICT-BELOW
+   ( parent-dir ^u8 n ^u8 n conflict-side DROPBOX:hash [ ^u8 n -- n ]
+     ^ARENA:arena -- conflict-outcome )
+   {: pd:parent-dir r:^ ru:n p:^ u:n side:conflict-side
+      want:DROPBOX:hash read ar:^ARENA:arena :}
+   pd PARENT-DIR-UNMAKE {: dir:fd name:str path:str :}
+   p u side want ar CONFLICT-NAME {: cn:^ cnu:n :}
+   p u side want ar CONFLICT-RELATIVE-PATH {: rel:^ relu:n :}
+   r ru rel relu ar JOIN {: shown:^ shownu:n :}
+   [: dir cn cnu shown shownu want read NO-MARKER
+      s" materialize conflict" ar WRITE-VERIFIED-STAGE ;]
+   [: dir DISCARD ;] finally
+   rel relu shown shownu CONFLICT-RESULT ;
+
+public
+
+\ Writes read's bytes as p's conflict copy for side below the root, whose
+\ path is r, when they hash to want; it never overwrites a file.
+: MATERIALIZE-CONFLICT-AT
+   ( fd ^u8 n ^u8 n conflict-side DROPBOX:hash [ ^u8 n -- n ]
+     ^ARENA:arena -- conflict-outcome )
+   {: root:fd r:^ ru:n p:^ u:n side:conflict-side want:DROPBOX:hash
+      read ar:^ARENA:arena :}
+   want s" materialize conflict" REQUIRE-CONTENT-HASH
+   root p u true OPEN-PARENT MATCH option
+      none OF p u UNSAFE ENDOF
+      some OF r ru p u side want read ar CONFLICT-BELOW ENDOF
+   ;MATCH ;
+
+\ MATERIALIZE-CONFLICT-AT below the root at the absolute path r.
+: MATERIALIZE-CONFLICT
+   ( ^u8 n ^u8 n conflict-side DROPBOX:hash [ ^u8 n -- n ]
+     ^ARENA:arena -- conflict-outcome )
+   {: r:^ ru:n p:^ u:n side:conflict-side want:DROPBOX:hash read
+      ar:^ARENA:arena :}
+   r ru s" open sync root for conflict" OPEN-ABSOLUTE-DIRECTORY
+   {: root:fd :}
+   [: root r ru p u side want read ar MATERIALIZE-CONFLICT-AT ;]
+   [: root DISCARD ;] finally ;
+
+\ ---- recovery copies
+
+\ The name of a private recovery copy of p holding c, laid in the arena.
+: RECOVERY-FILE-NAME ( ^u8 n DROPBOX:hash ^ARENA:arena -- ^u8 n )
+   {: p:^ u:n c:DROPBOX:hash ar:^ARENA:arena :}
+   s" recovery" p u c ar INTERNAL-NAME ;
+
+\ Whether the copy at the name in dir, whose path is p, is there; one
+\ there holds want and is synced, else it is corrupt.
+: VERIFY-PRIVATE-COPY
+   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- bool )
+   {: dir:fd p:^ u:n name:^ nu:n want:DROPBOX:hash ar:^ARENA:arena :}
+   s" verify recovery copy" {: o:^ ou:n :}
+   p u name nu ar JOIN {: at:^ atu:n :}
+   dir name nu at atu o ou ar HASH-AT-IF-PRESENT MATCH option
+      none OF false ENDOF
+      some OF want SAME-CONTENT? 0= if o ou at atu CORRUPT then
+         dir name nu at atu SYNC-INSTALLED-FILE true
+      ENDOF
+   ;MATCH ;
 
 ;package
