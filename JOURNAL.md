@@ -559,3 +559,31 @@ the one before it, so the marker appears in master's history but never at
 its tip. A pair that is a buffer and its capacity stays `^u8 n`, and so do C
 bindings. The `str` type and the wide `NEWTYPE`, `DEFTYPE` and `CAST:` land
 first, on their own.
+
+## 2026-11-15: Wide types, and where a file ends
+
+`NEWTYPE path str` reads its base from the rest of the name's line. Eight
+test lines already put a statement after a `NEWTYPE` name, so each got a
+line break. Reading a base needs the structure declarer's field code, which
+loads after the file that held `NEWTYPE`, so the word moved files. A Forth
+word sees only what loaded before it; Rust resolves a module's names in any
+order. `DEFTYPE REV str` makes `>REV` and `REV>STR`; the buffer that spells
+those names was 512 bytes, which a long name over a base would overrun, so
+its size now comes from the name limit.
+
+The `split-str` marker was to last "to the end of the file". The engine had
+no such unit: the linker runs a file in parts, and a file can evaluate a
+string that loads another. Saving the marker per evaluated frame lost it
+between parts and let a nested load clear its caller's. The rule now reads
+it from the file's first line, for every part, and an evaluated string reads
+with its file's marker. The verifier, which scans sources rather than loading
+them, does the same.
+
+Making `str` a type broke one test in the `str` commit itself: `NEWTYPE
+str<a>` now meets a duplicate rather than a reserved name. That lane ran
+only the suites its brief named, so the next lane found it.
+
+Observation for the blog: in Rust a wrapper over a string is `struct
+Path(String)`. Here it took four commits (the type, a cast of any width,
+`NEWTYPE` and `DEFTYPE` over a base) and a marker so that code written for
+the old pair still checks. Each lane took five to eight minutes.
