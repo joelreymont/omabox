@@ -254,11 +254,22 @@ The plan runs in steps, each built by the engine of the step before:
 6. the files move over callees first, each dropping its marker;
 7. the marker goes, and nothing on master ever carried it.
 
-A role is a one-field record over `str`: `STRUCTURE rev FIELD text str
-;STRUCTURE`. Making one is a cast that emits no code, so the role costs
-nothing at run time, and the checker refuses a rev where a path goes.
+A role is Haskell's `newtype`: the same bytes under a type of their own.
+
+```forth
+NEWTYPE path str   \ only DROPBOX makes one
+DEFTYPE REV str    \ anyone converts: >REV, REV>STR
+```
+
+Making one emits no code, and the checker refuses a rev where a path goes.
+The first design wrapped a string in a one-field record instead, because
+Habu's `NEWTYPE` wrapped only one-cell values. The user asked why a role was
+a record, and the answer showed the workaround: a role over a number and a
+role over a string would have been spelled two ways. `NEWTYPE` and `DEFTYPE`
+now get to wrap a value of any width.
 
 Observation for the blog: in Rust, `struct Rev(String)` is one line and the
 compiler already knows strings. Here the language learns what a string is
-before the application can say which one it holds.
+before the application can say which one it holds. And again a person
+reading the notation found what the agents had settled around.
 
