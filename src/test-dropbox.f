@@ -49,8 +49,13 @@ variable EXPIRED
 
 SLOTS PATH-CAP * BUFFER: PATHS
 SLOTS TYPED-BUFFER PATH-US n
+\ An entry is held as its plain FileMetadata or FolderMetadata, the shape
+\ upload, download and create_folder_v2 answer, and FOLDERS marks a
+\ folder's. TAGGED+ builds the Metadata union get_metadata and delete_v2
+\ answer.
 SLOTS TEXT-CAP * BUFFER: ENTRIES
 SLOTS TYPED-BUFFER ENTRY-US n
+SLOTS TYPED-BUFFER FOLDERS bool
 variable FILES
 
 SLOTS TYPED-BUFFER STATUSES n
@@ -110,6 +115,19 @@ TYPED-VARIABLE CUTTING bool
 : BUILT ( -- ptr u8 n )
    SB$ OUT TEXT-CAP STORE OUT-U !
    OUT$ ;
+
+
+\ Entry i appended as a Metadata union: its `.tag`, then the plain
+\ record's members after its `{`.
+: TAGGED+ ( n -- )
+   {: i:n :}
+   i FOLDERS @ if S\" {\q.tag\q:\qfolder\q," else S\" {\q.tag\q:\qfile\q," then
+   SB-APPEND
+   i ENTRY$ {: e:ptr eu:n :}
+   e 1 + eu 1 - SB-APPEND ;
+
+
+: TAGGED$ ( n -- ptr u8 n ) SB-RESET TAGGED+ BUILT ;
 
 
 : ANSWER! ( HTTP:response ptr u8 n -- )
@@ -279,7 +297,7 @@ TYPED-VARIABLE CUTTING bool
    q a ADMITTED? 0= if exit then
    q ASK
    FOUND {: i:n :}
-   i 0 >= if a i ENTRY$ ANSWER! exit then
+   i 0 >= if a i TAGGED$ ANSWER! exit then
    a 409 HTTP:STATUS!
    a S\" {\qerror_summary\q:\qpath/not_found/...\q,\qerror\q:{\q.tag\q:\qpath\q,\qpath\q:{\q.tag\q:\qnot_found\q}}}" ANSWER! ;
 
@@ -348,7 +366,8 @@ variable HELD-U
    -1 FILES +!
    i last = if exit then
    last PATH$ PATHS PATH-CAP i AT STORE i PATH-US !
-   last ENTRY$ ENTRIES TEXT-CAP i AT STORE i ENTRY-US ! ;
+   last ENTRY$ ENTRIES TEXT-CAP i AT STORE i ENTRY-US !
+   last FOLDERS @ i FOLDERS ! ;
 
 
 \ A folder at the path, which serves as path_lower and path_display.
@@ -356,14 +375,23 @@ variable HELD-U
    {: p:ptr pu:n :}
    FILES @ {: i:n :}
    p pu PATHS PATH-CAP i AT STORE i PATH-US !
-   SB-RESET S\" {\q.tag\q:\qfolder\q,\qname\q:\qa\q,\qid\q:\qid:a\q" SB-APPEND
+   SB-RESET S\" {\qname\q:\qa\q,\qid\q:\qid:a\q" SB-APPEND
    S\" ,\qpath_lower\q:\q" SB-APPEND p pu SB-APPEND
    S\" \q,\qpath_display\q:\q" SB-APPEND p pu SB-APPEND S\" \q}" SB-APPEND
    SB$ ENTRIES TEXT-CAP i AT STORE i ENTRY-US !
+   true i FOLDERS !
    1 FILES +! ;
 
 
-: WRAPPED! ( HTTP:response n -- )
+\ delete_v2's answer: entry i as `metadata`, a Metadata union.
+: DELETED! ( HTTP:response n -- )
+   {: a:HTTP:response i:n :}
+   SB-RESET S\" {\qmetadata\q:" SB-APPEND i TAGGED+ s" }" SB-APPEND
+   a BUILT ANSWER! ;
+
+
+\ create_folder_v2's answer: entry i as `metadata`, a plain FolderMetadata.
+: MADE! ( HTTP:response n -- )
    {: a:HTTP:response i:n :}
    SB-RESET S\" {\qmetadata\q:" SB-APPEND i ENTRY$ SB-APPEND s" }" SB-APPEND
    a BUILT ANSWER! ;
@@ -387,7 +415,7 @@ variable HELD-U
          a S\" {\qerror_summary\q:\qpath_write/conflict/file/...\q,\qerror\q:{\q.tag\q:\qpath_write\q,\qpath_write\q:{\q.tag\q:\qconflict\q,\qconflict\q:{\q.tag\q:\qfile\q}}}}" REFUSED! exit
       then
    then
-   a i WRAPPED!
+   a i DELETED!
    i FORGET ;
 
 
@@ -399,7 +427,7 @@ variable HELD-U
       a S\" {\qerror_summary\q:\qpath/conflict/folder/...\q,\qerror\q:{\q.tag\q:\qpath\q,\qpath\q:{\q.tag\q:\qconflict\q,\qconflict\q:{\q.tag\q:\qfolder\q}}}}" REFUSED! exit
    then
    ASKED ASKED-U @ FOLDER+
-   a FILES @ 1- WRAPPED! ;
+   a FILES @ 1- MADE! ;
 
 
 : CLOSED ( TCP4:status -- )
@@ -469,9 +497,10 @@ variable HELD-U
 : FILE-AT! ( ptr u8 n ptr u8 n ptr u8 n ptr u8 n n n -- )
    {: l:ptr lu:n d:ptr du:n r:ptr ru:n h:ptr hu:n size:n i:n :}
    l lu PATHS PATH-CAP i AT STORE i PATH-US !
-   SB-RESET S\" {\q.tag\q:\qfile\q," SB-APPEND
+   SB-RESET s" {" SB-APPEND
    l lu d du r ru h hu size FIELDS+
-   SB$ ENTRIES TEXT-CAP i AT STORE i ENTRY-US ! ;
+   SB$ ENTRIES TEXT-CAP i AT STORE i ENTRY-US !
+   false i FOLDERS ! ;
 
 
 \ ---- list_folder, list_folder/continue and list_folder/longpoll
@@ -804,9 +833,7 @@ variable SESSIONS
    i 0< if FILES @ 1 FILES +! else i then {: j:n :}
    REV-TAKE
    ASKED ASKED-U @ ARG-PATH$ REV-NEW$ h hu size j FILE-AT!
-   SB-RESET s" {" SB-APPEND
-   ASKED ASKED-U @ ARG-PATH$ REV-NEW$ h hu size FIELDS+
-   a BUILT ANSWER! ;
+   a j ENTRY$ ANSWER! ;
 
 
 : UPLOAD-FILE ( HTTP:request HTTP:response -- )

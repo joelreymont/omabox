@@ -101,7 +101,8 @@ STRUCTURE config DERIVE addr
 \ sent holds a listing's cursor, the one sent and then its page's, and mark
 \ the cursor of the last listing that answered done; page is a page's
 \ cursor, more its has_more, got the members an answer must hold, one bit
-\ each; changes and backoff are a long poll's answer.
+\ each; changes and backoff are a long poll's answer. tagged marks the
+\ `.tag` of the Metadata union being read into entry.
 STRUCTURE client OPAQUE DERIVE addr
    FIELD handle CURL:handle
    FIELD key SPAN:span<u8>
@@ -139,6 +140,7 @@ STRUCTURE client OPAQUE DERIVE addr
    FIELD got n
    FIELD changes bool
    FIELD backoff n
+   FIELD tagged bool
 ;STRUCTURE
 
 private
@@ -825,18 +827,6 @@ ENUM verdict
    E-ANSWER throw ;
 
 
-: ENTRY-MEMBER ( JSON:reader ptr client -- JSON:reader )
-   {: c :}
-   c CLIENT-ENTRY {: e :}
-   s" .tag" JSON:READ-STR-EQ? if KIND-OF e DROPBOX-ENTRY:KIND ! exit then
-   s" path_lower" JSON:READ-STR-EQ? if c STRING e DROPBOX-ENTRY:LOWER ! exit then
-   s" path_display" JSON:READ-STR-EQ? if c STRING e DROPBOX-ENTRY:DISPLAY ! exit then
-   s" rev" JSON:READ-STR-EQ? if c STRING e DROPBOX-ENTRY:REV ! exit then
-   s" content_hash" JSON:READ-STR-EQ? if c STRING e DROPBOX-ENTRY:CONTENT-HASH ! exit then
-   s" size" JSON:READ-STR-EQ? if INT e DROPBOX-ENTRY:SIZE ! exit then
-   SKIP ;
-
-
 : ENTRY-CLEAR ( ptr entry -- )
    {: e :}
    construct kind deleted e DROPBOX-ENTRY:KIND !
@@ -859,18 +849,76 @@ ENUM verdict
    e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:LEN 0<> and ;
 
 
-\ The answer's entry, as `member` finds it. A deleted entry is a listing's
-\ alone; any other route answers a file or folder.
-: ENTRY-PARSE ( ptr client [ JSON:reader ptr client -- JSON:reader ] -- )
-   {: c member :}
+\ A route answers its entry in one shape. A plain FileMetadata or
+\ FolderMetadata takes its kind from the route and skips a `.tag` as any
+\ member it does not know, as the SDK does; a Metadata union takes its kind
+\ from its `.tag`.
+
+\ The members both shapes hold.
+: FIELD-MEMBER ( JSON:reader ptr client -- JSON:reader )
+   {: c :}
    c CLIENT-ENTRY {: e :}
-   e ENTRY-CLEAR
+   s" path_lower" JSON:READ-STR-EQ? if c STRING e DROPBOX-ENTRY:LOWER ! exit then
+   s" path_display" JSON:READ-STR-EQ? if c STRING e DROPBOX-ENTRY:DISPLAY ! exit then
+   s" rev" JSON:READ-STR-EQ? if c STRING e DROPBOX-ENTRY:REV ! exit then
+   s" content_hash" JSON:READ-STR-EQ? if c STRING e DROPBOX-ENTRY:CONTENT-HASH ! exit then
+   s" size" JSON:READ-STR-EQ? if INT e DROPBOX-ENTRY:SIZE ! exit then
+   SKIP ;
+
+
+: TAGGED-MEMBER ( JSON:reader ptr client -- JSON:reader )
+   {: c :}
+   s" .tag" JSON:READ-STR-EQ? if
+      KIND-OF c CLIENT-ENTRY DROPBOX-ENTRY:KIND ! true c CLIENT-TAGGED ! exit
+   then
+   c FIELD-MEMBER ;
+
+
+\ The entry cleared to read one of kind k, with no `.tag` read yet.
+: ENTRY-OPEN ( ptr client kind -- )
+   {: c k:kind :}
+   c CLIENT-ENTRY {: e :}
+   e ENTRY-CLEAR k e DROPBOX-ENTRY:KIND !
+   false c CLIENT-TAGGED ! ;
+
+
+\ A plain record of kind k, its object just opened, read into the entry.
+: PLAIN-OBJECT ( JSON:reader ptr client kind -- JSON:reader )
+   {: c k:kind :}
+   c k ENTRY-OPEN
+   c [: FIELD-MEMBER ;] MEMBERS ;
+
+
+\ A Metadata union, its object just opened, read into the entry: one with
+\ no `.tag` has no kind, and is never taken for a deleted entry.
+: TAGGED-OBJECT ( JSON:reader ptr client -- JSON:reader )
+   {: c :}
+   c construct kind deleted ENTRY-OPEN
+   c [: TAGGED-MEMBER ;] MEMBERS
+   c CLIENT-TAGGED @ 0= if E-ANSWER throw then ;
+
+
+\ The answer's entry, as `member` finds it with the entry open at kind k.
+\ A deleted entry is a listing's alone; any other route answers a file or
+\ folder, so an entry left at deleted, as a union with no `.tag` is, fails.
+: ENTRY-PARSE ( ptr client kind [ JSON:reader ptr client -- JSON:reader ] -- )
+   {: c k:kind member :}
+   c k ENTRY-OPEN
    c member PARSE
+   c CLIENT-ENTRY {: e :}
    e DROPBOX-ENTRY:KIND @ construct kind deleted DROPBOX-KIND:EQ
    e WHOLE? 0= or if c s" an incomplete entry" E-ANSWER FAILED then ;
 
 
-: ENTRY-READ ( ptr client -- ) [: ENTRY-MEMBER ;] ENTRY-PARSE ;
+\ get_metadata's answer, a Metadata union.
+: ENTRY-READ ( ptr client -- )
+   construct kind deleted [: TAGGED-MEMBER ;] ENTRY-PARSE ;
+
+
+\ The answer of upload and upload_session/finish, and download's
+\ Dropbox-API-Result: a plain FileMetadata.
+: FILE-READ ( ptr client -- )
+   construct kind file [: FIELD-MEMBER ;] ENTRY-PARSE ;
 
 
 \ ---- files/download
@@ -915,7 +963,7 @@ ENUM verdict
    {: c :}
    c s" Dropbox-API-Result" HEADER$ BUF:N>BLEN
    c CLIENT-ANSWER @ BUF:REPLACE
-   c ENTRY-READ ;
+   c FILE-READ ;
 
 
 \ The Content-Range a ranged answer of the entry must carry, in the line.
@@ -1170,15 +1218,9 @@ private
    JSON:T-ARR-END <> if E-ANSWER throw then ;
 
 
-: ENTRY-OBJECT ( JSON:reader ptr client -- JSON:reader )
-   {: c :}
-   c CLIENT-ENTRY ENTRY-CLEAR
-   c [: ENTRY-MEMBER ;] MEMBERS ;
-
-
 : LISTED ( JSON:reader ptr client -- JSON:reader )
    {: c :}
-   c ENTRY-OBJECT
+   c TAGGED-OBJECT
    c CLIENT-ENTRY WHOLE? 0= if E-ANSWER throw then ;
 
 
@@ -1209,7 +1251,7 @@ private
 
 : HANDED ( JSON:reader ptr client [ ptr entry -- ] -- JSON:reader )
    {: c each :}
-   c ENTRY-OBJECT
+   c TAGGED-OBJECT
    c CLIENT-ENTRY each execute ;
 
 
@@ -1361,14 +1403,27 @@ public
 \ ---- delete_v2, create_folder_v2 and the code exchange
 private
 
-\ delete_v2 and create_folder_v2 answer the entry as `metadata`.
-: WRAPPED-MEMBER ( JSON:reader ptr client -- JSON:reader )
+\ delete_v2 and create_folder_v2 answer the entry as `metadata`: delete_v2
+\ a Metadata union, create_folder_v2 a plain FolderMetadata. The entry
+\ opens at deleted, so an answer with no `metadata` fails.
+: DELETED-MEMBER ( JSON:reader ptr client -- JSON:reader )
    {: c :}
    s" metadata" JSON:READ-STR-EQ? 0= if SKIP exit then
-   VALUE OBJECT c [: ENTRY-MEMBER ;] MEMBERS ;
+   VALUE OBJECT c TAGGED-OBJECT ;
 
 
-: WRAPPED-READ ( ptr client -- ) [: WRAPPED-MEMBER ;] ENTRY-PARSE ;
+: MADE-MEMBER ( JSON:reader ptr client -- JSON:reader )
+   {: c :}
+   s" metadata" JSON:READ-STR-EQ? 0= if SKIP exit then
+   VALUE OBJECT c construct kind folder PLAIN-OBJECT ;
+
+
+: DELETED-READ ( ptr client -- )
+   construct kind deleted [: DELETED-MEMBER ;] ENTRY-PARSE ;
+
+
+: MADE-READ ( ptr client -- )
+   construct kind deleted [: MADE-MEMBER ;] ENTRY-PARSE ;
 
 
 \ Whether the last request was the route's and its answer was lost: a
@@ -1448,16 +1503,16 @@ private
    e construct reply refused ;
 
 
-\ A mutation's call: done reads the entry. A lost answer goes to `lost`
-\ and a refusal to `refusal`, which confirm what Dropbox now holds, since
-\ either may come from a call Dropbox applied.
-: MUTATE ( ptr client ptr u8 n [ ptr client -- reply ]
+\ A mutation's call: done reads the entry with `read`. A lost answer goes
+\ to `lost` and a refusal to `refusal`, which confirm what Dropbox now
+\ holds, since either may come from a call Dropbox applied.
+: MUTATE ( ptr client ptr u8 n [ ptr client -- ] [ ptr client -- reply ]
            [ error ptr client -- reply ] -- reply )
-   {: c rt:ptr rtu:n lost refusal :}
+   {: c rt:ptr rtu:n read lost refusal :}
    c rt rtu [: JSON-BODY ;] CALL {: r:reply :}
    c rt rtu LOST-ON? if c lost execute exit then
    r MATCH reply
-      done OF c WRAPPED-READ construct reply done ENDOF
+      done OF c read execute construct reply done ENDOF
       refused OF c refusal execute ENDOF
       retry OF RETRY ENDOF
       unlinked OF construct reply unlinked ENDOF
@@ -1524,7 +1579,7 @@ public
 : DELETE ( ptr u8 n ptr u8 n ptr client -- reply )
    {: p:ptr pu:n r:ptr ru:n c :}
    p pu r ru c DELETE-BODY
-   c s" files/delete_v2" [: drop p pu c GONE ;]
+   c s" files/delete_v2" [: DELETED-READ ;] [: drop p pu c GONE ;]
    [: drop p pu c DELETE-REFUSED ;] MUTATE ;
 
 
@@ -1532,7 +1587,7 @@ public
 : CREATE-FOLDER ( ptr u8 n ptr client -- reply )
    {: p:ptr pu:n c :}
    p pu c FOLDER-BODY
-   c s" files/create_folder_v2" [: drop p pu c MADE ;]
+   c s" files/create_folder_v2" [: MADE-READ ;] [: drop p pu c MADE ;]
    [: drop p pu c FOLDER-REFUSED ;] MUTATE ;
 
 
@@ -1855,16 +1910,6 @@ HEAP RUNS run
 
 \ ---- the answers
 
-\ The FileMetadata an upload commits, which may carry no `.tag`.
-: COMMITTED-READ ( ptr client -- )
-   {: c :}
-   c CLIENT-ENTRY {: e :}
-   e ENTRY-CLEAR
-   construct kind file e DROPBOX-ENTRY:KIND !
-   c [: ENTRY-MEMBER ;] PARSE
-   e FILE? e WHOLE? and 0= if c s" an incomplete entry" E-ANSWER FAILED then ;
-
-
 \ The committed entry is the upload's: the same path up to case, else
 \ E-ANSWER, and its content hash, else last is refused
 \ content-hash-mismatch.
@@ -1872,7 +1917,7 @@ HEAP RUNS run
    {: r :}
    r RUN-CLIENT @ {: c :}
    r RUN-UP @ {: up :}
-   c COMMITTED-READ
+   c FILE-READ
    c CLIENT-ENTRY {: e :}
    e DROPBOX-ENTRY:LOWER @ SPAN:$
    up DROPBOX-UPLOAD:PATH @ SPAN:$ UNICODE:CASEFOLD=

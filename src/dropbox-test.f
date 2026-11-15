@@ -266,6 +266,22 @@ variable GOT-U
    TEST-DROPBOX:ARGS$ S\" {\qcursor\q:\qc3\q} {\qcursor\q:\qc4\q}" T$= ;
 
 
+\ A listing's entry is a Metadata union: one with no `.tag` has no kind,
+\ and is never handed on as a deleted entry.
+: UNTAGGED-LISTED ( -- )
+   s" /sync" MAIN @ [: SAW ;] DROPBOX:LIST DONE? drop ;
+
+
+: UNTAGGED-CASE ( -- )
+   s" listing entry with no .tag" T-LABEL
+   LISTING
+   S\" [{\qname\q:\qb\q,\qpath_lower\q:\q/sync/b\q,\qpath_display\q:\q/Sync/b\q}]"
+   s" u1" false TEST-DROPBOX:PAGE!
+   [: UNTAGGED-LISTED ;] DROPBOX:E-ANSWER TTHROWSQ
+   GOT$ s" " T$=
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$= ;
+
+
 : WAITED ( bool n -- )
    LISTING TEST-DROPBOX:POLL!
    s" c3" 30 MAIN @ DROPBOX:WAIT DONE? ASSERT
@@ -768,7 +784,7 @@ TYPED-VARIABLE FAULT fault
    s" live-token" s" ns-root" OPENED MAIN !
    ACCOUNT-CASE FILE-CASE MISSING-CASE ROOT-CASE EXPIRED-CASE
    UNLINKED-CASE RATE-CASE BUSY-CASE REDIRECT-CASE BAD-REQUEST-CASE
-   PAGES-CASE RESET-CASE STALL-CASE POLL-CASE
+   PAGES-CASE RESET-CASE STALL-CASE UNTAGGED-CASE POLL-CASE
    DOWNLOAD-CASES
    DELETE-CONFLICT-CASE DELETE-MISSING-CASE DELETE-GONE-CASE
    LOST-DELETE-CASE
