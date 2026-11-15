@@ -1,10 +1,12 @@
-\ local-test.f - LOCAL's shared words and download stages: local.rs's tests
-\ that an entry's existence below the root never follows a symlink and
-\ takes a failed probe as unconfirmed, that the content hash composes block
-\ hashes, and that neither the hash nor a stage's copy depends on how a
-\ reader fragments the bytes; then each stage outcome, each inspected
-\ download stage, a stage marker set, read and removed, and each parent a
-\ download opens. A case that makes files works in its own directory
+\ local-test.f - LOCAL's shared words, download and upload stages: local.rs's
+\ tests that an entry's existence below the root never follows a symlink
+\ and takes a failed probe as unconfirmed, that the content hash composes
+\ block hashes, that neither the hash nor a stage's copy depends on how a
+\ reader fragments the bytes, and that upload stage collection removes only
+\ verified unreferenced content; then each stage outcome, each inspected
+\ download stage, a stage marker set, read and removed, each upload stage
+\ outcome, an upload source that vanished or is a directory, and each
+\ parent a download opens. A case that makes files works in its own directory
 \ under TMPDIR and removes it.
 \ Run from the repository root: hb --load src/local-test.f </dev/null
 require src/lib/test.f
@@ -417,6 +419,162 @@ SHA256-CTX-BYTES BUFFER: PART
    s" each stage outcome is reached" T-LABEL
    [: STAGE-CASES ;] IN-CASE-DIR ;
 
+\ ---- upload stages
+
+\ The bytes laid in the arena, so they outlive the next AT.
+: HOLD ( ^u8 n -- ^u8 n )
+   {: p:^ u:n :}
+   AR @ u ARENA:ALLOC {: dst:^ size:n :}
+   p dst u BYTE-COPY dst u ;
+
+: UPLOAD-ROOT ( -- ^u8 n ) s" root" AT HOLD ;
+: STAGING ( -- ^u8 n ) s" staging" AT HOLD ;
+
+: UPLOAD-DIRS ( -- ) s" root" AT FS:MAKE-DIR s" staging" AT FS:MAKE-DIR ;
+
+\ The stage path of content c, valid until the next AT.
+: STAGE-PATH ( DROPBOX:hash -- ^u8 n )
+   {: c:DROPBOX:hash :}
+   STAGING c DROPBOX:HASH>STR str> JOINED FS:JOIN-PATH JOINED swap ;
+
+\ The entry's file type bits, 0 when nothing is there.
+: KIND ( ^u8 n -- n )
+   FS:TRY-LSTAT 0= if 0 exit then
+   FS:STAT-MODE@ FS:S-IFMT and ;
+
+64 BUFFER: CONTENTS-BUF
+
+: CONTENTS ( ^u8 n -- ^u8 n )
+   CONTENTS-BUF 64 FS:READ-ALL CONTENTS-BUF swap ;
+
+\ Stages the file at name below the upload root as content want.
+: UPLOAD-STAGE
+   ( ^u8 n DROPBOX:hash -- LOCAL:stage-outcome<^LOCAL:staged-upload> )
+   {: name:^ nu:n want:DROPBOX:hash :}
+   UPLOAD-ROOT name nu STAGING want AR @ LOCAL:STAGE-UPLOAD ;
+
+\ The hash of what the stage's verified descriptor reads.
+: VERIFIED$ ( ^LOCAL:staged-upload -- ^u8 n )
+   AR @ LOCAL:OPEN-VERIFIED-UPLOAD {: f:fd :}
+   f AR @ LOCAL:DROPBOX-CONTENT-HASH f FS:CLOSE-DIR
+   DROPBOX:HASH>STR str> ;
+
+\ The outcome's variant, and the stage's verified hash, the actual hash
+\ or the path.
+: UPLOAD-OUTCOME$
+   ( LOCAL:stage-outcome<^LOCAL:staged-upload> -- ^u8 n ^u8 n )
+   MATCH LOCAL:stage-outcome
+      staged OF {: rec:^ :} s" staged" rec VERIFIED$ ENDOF
+      already-staged OF {: rec:^ :} s" already-staged" rec VERIFIED$
+      ENDOF
+      content-changed OF {: c:DROPBOX:hash :}
+         s" content-changed" c DROPBOX:HASH>STR str>
+      ENDOF
+      destination-occupied OF {: p:str :}
+         s" destination-occupied" p str>
+      ENDOF
+   ;MATCH ;
+
+: SAME-HASH? ( DROPBOX:hash DROPBOX:hash -- bool )
+   {: a:DROPBOX:hash b:DROPBOX:hash :}
+   a DROPBOX:HASH>STR str> b DROPBOX:HASH>STR str> STR= ;
+
+\ The entries local.rs's collection test lays in the staging directory.
+: COLLECTION-ENTRIES ( DROPBOX:hash DROPBOX:hash DROPBOX:hash -- )
+   {: corrupt:DROPBOX:hash directory:DROPBOX:hash link:DROPBOX:hash :}
+   corrupt STAGE-PATH s" different bytes" FS:WRITE-ALL
+   directory STAGE-PATH FS:MAKE-DIR
+   s" root/retained" AT HOLD link STAGE-PATH FS:MAKE-SYMLINK
+   s" staging/unrecognized" s" leave me" PUT-FILE ;
+
+: COLLECTION-CHECKS
+   ( DROPBOX:hash DROPBOX:hash DROPBOX:hash DROPBOX:hash DROPBOX:hash -- )
+   {: retained:DROPBOX:hash orphan:DROPBOX:hash corrupt:DROPBOX:hash
+      directory:DROPBOX:hash link:DROPBOX:hash :}
+   retained STAGE-PATH KIND FS:S-IFREG T=
+   orphan STAGE-PATH KIND 0 T=
+   corrupt STAGE-PATH CONTENTS s" different bytes" T$=
+   directory STAGE-PATH KIND FS:S-IFDIR T=
+   link STAGE-PATH KIND FS-ABI:S-IFLNK T=
+   s" staging/unrecognized" AT CONTENTS s" leave me" T$= ;
+
+: COLLECTION-CASE ( -- )
+   UPLOAD-DIRS
+   s" root/retained" s" pending bytes" PUT-FILE
+   s" root/orphan" s" completed bytes" PUT-FILE
+   s" pending bytes" HASH-OF {: retained:DROPBOX:hash :}
+   s" completed bytes" HASH-OF {: orphan:DROPBOX:hash :}
+   s" claimed bytes" HASH-OF {: corrupt:DROPBOX:hash :}
+   s" directory entry" HASH-OF {: directory:DROPBOX:hash :}
+   s" symlink entry" HASH-OF {: link:DROPBOX:hash :}
+   s" retained" retained UPLOAD-STAGE UPLOAD-OUTCOME$ 2drop
+   s" staged" T$=
+   s" orphan" orphan UPLOAD-STAGE UPLOAD-OUTCOME$ 2drop s" staged" T$=
+   corrupt directory link COLLECTION-ENTRIES
+   STAGING [: retained SAME-HASH? ;] AR @
+   LOCAL:REMOVE-UNREFERENCED-UPLOAD-STAGES 1 T=
+   retained orphan corrupt directory link COLLECTION-CHECKS ;
+
+: UPLOAD-STAGE-COLLECTION-REMOVES-ONLY-VERIFIED-UNREFERENCED-CONTENT
+   ( -- )
+   s" upload_stage_collection_removes_only_verified_unreferenced_content"
+   T-LABEL
+   [: drop COLLECTION-CASE ;] IN-CASE-DIR ;
+
+\ Each outcome STAGE-UPLOAD answers, from one source file.
+: UPLOAD-OUTCOME-CASES ( -- )
+   UPLOAD-DIRS
+   s" root/source" s" source bytes" PUT-FILE
+   s" source bytes" HASH-OF {: want:DROPBOX:hash :}
+   want DROPBOX:HASH>STR str> {: w:^ wu:n :}
+   s" staged" T-LABEL
+   s" source" want UPLOAD-STAGE UPLOAD-OUTCOME$ w wu T$= s" staged" T$=
+   s" already staged" T-LABEL
+   s" source" want UPLOAD-STAGE UPLOAD-OUTCOME$
+   w wu T$= s" already-staged" T$=
+   s" content changed" T-LABEL
+   s" other bytes" HASH-OF {: other:DROPBOX:hash :}
+   s" source" other UPLOAD-STAGE UPLOAD-OUTCOME$
+   w wu T$= s" content-changed" T$=
+   other STAGE-PATH KIND 0 T=
+   s" destination occupied" T-LABEL
+   s" root/occupied" s" occupied bytes" PUT-FILE
+   s" occupied bytes" HASH-OF {: occupied:DROPBOX:hash :}
+   occupied STAGE-PATH FS:MAKE-DIR
+   s" occupied" occupied UPLOAD-STAGE UPLOAD-OUTCOME$ HOLD
+   occupied STAGE-PATH T$= s" destination-occupied" T$= ;
+
+: EACH-UPLOAD-STAGE-OUTCOME-IS-REACHED ( -- )
+   s" each upload stage outcome is reached" T-LABEL
+   [: drop UPLOAD-OUTCOME-CASES ;] IN-CASE-DIR ;
+
+\ STAGE-UPLOAD-AT of r below the root as content want, its outcome
+\ dropped.
+: STAGE-AT ( fd ^u8 n DROPBOX:hash -- )
+   {: root:fd r:^ ru:n want:DROPBOX:hash :}
+   root r ru STAGING want AR @ LOCAL:STAGE-UPLOAD-AT
+   UPLOAD-OUTCOME$ 2drop 2drop ;
+
+: OBSERVE-AT ( fd ^u8 n -- )
+   AR @ LOCAL:OBSERVE-UPLOAD-SOURCE-AT DROPBOX:HASH>STR str> 2drop ;
+
+: SOURCE-CHANGED-CASES ( fd -- )
+   {: root:fd :}
+   UPLOAD-DIRS
+   s" source bytes" HASH-OF {: want:DROPBOX:hash :}
+   s" vanished source stages" T-LABEL
+   [: root s" vanished" want STAGE-AT ;] LOCAL:E-SOURCE-CHANGED TTHROWSQ
+   FS:ERRNO FS:ENOENT T=
+   s" vanished source is observed" T-LABEL
+   [: root s" vanished" OBSERVE-AT ;] LOCAL:E-SOURCE-CHANGED TTHROWSQ
+   s" directory source stages" T-LABEL
+   s" directory" AT FS:MAKE-DIR
+   [: root s" directory" want STAGE-AT ;] LOCAL:E-SOURCE-CHANGED TTHROWSQ ;
+
+: VANISHED-OR-DIRECTORY-SOURCE-IS-SOURCE-CHANGED ( -- )
+   s" vanished or directory source is source-changed" T-LABEL
+   [: SOURCE-CHANGED-CASES ;] IN-CASE-DIR ;
+
 \ ---- parents
 
 : INODE ( fd -- n ) FS:FD-STAT FS:STAT-INO@ ;
@@ -534,6 +692,9 @@ SHA256-CTX-BYTES BUFFER: PART
    STAGE-MARKER-IS-SET-READ-AND-REMOVED
    EACH-DOWNLOAD-STAGE-IS-INSPECTED
    EACH-STAGE-OUTCOME-IS-REACHED
+   UPLOAD-STAGE-COLLECTION-REMOVES-ONLY-VERIFIED-UNREFERENCED-CONTENT
+   EACH-UPLOAD-STAGE-OUTCOME-IS-REACHED
+   VANISHED-OR-DIRECTORY-SOURCE-IS-SOURCE-CHANGED
    ONE-COMPONENT-PARENT-IS-A-DUPLICATE-ROOT
    EXISTING-PARENT-OPENS
    MISSING-PARENT-IS-NONE-WITHOUT-CREATE
