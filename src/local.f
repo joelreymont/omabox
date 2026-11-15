@@ -1098,7 +1098,7 @@ private
    STAT-UNMAKE {: d i m s ms mn cs cn :}
    m FS:S-IFMT and FS:S-IFDIR = ;
 
-: SAME-FINGERPRINT ( MODEL:fingerprint MODEL:fingerprint -- bool )
+: SAME-FINGERPRINT? ( MODEL:fingerprint MODEL:fingerprint -- bool )
    {: a:MODEL:fingerprint b:MODEL:fingerprint :}
    a b SAME-HASHED-CONTENT 0= if false exit then
    a MODEL-FINGERPRINT:UNMAKE {: i s ms mn cs cn :}
@@ -1160,7 +1160,7 @@ create LISTING FS-LIST:STORAGE-BYTES allot
    cache path str> CACHED-HASH MATCH option
       none OF OPTION:NONE ENDOF
       some OF {: r:MODEL:hash-record :}
-         r RECORD-FINGERPRINT print SAME-FINGERPRINT
+         r RECORD-FINGERPRINT print SAME-FINGERPRINT?
          r cut HASH-IS-REUSABLE and if
             r RECORD-CONTENT OPTION:SOME
          else OPTION:NONE then
@@ -1321,13 +1321,13 @@ SUBTREE-INSTALL
    {: f:fd path:str want:MODEL:fingerprint opened:stat q
       ar:^ARENA:arena :}
    path str> {: p:^ u:n :}
-   opened p u FILE-FINGERPRINT want SAME-FINGERPRINT 0= if
+   opened p u FILE-FINGERPRINT want SAME-FINGERPRINT? 0= if
       s" open enumerated scan file" p u CHANGED
    then
    f p u s" hash local scan file" opened ar E-UNSUPPORTED E-CHANGED
    HASH-STABLE-FILE-FROM-STAT
    {: c:DROPBOX:hash print:MODEL:fingerprint :}
-   print want SAME-FINGERPRINT 0= if
+   print want SAME-FINGERPRINT? 0= if
       s" hash enumerated scan file" p u CHANGED
    then
    path MODEL:>PATH print c MODEL-HASH--RECORD:MAKE
@@ -1368,7 +1368,8 @@ SUBTREE-INSTALL
    root p u s" reopen cached scan file" E-IO E-UNSUPPORTED
    OPEN-RELATIVE-REGULAR-WITH-STAT {: f:fd before:stat :}
    f DISCARD
-   before p u FILE-FINGERPRINT r RECORD-FINGERPRINT SAME-FINGERPRINT 0= if
+   before p u FILE-FINGERPRINT r RECORD-FINGERPRINT
+   SAME-FINGERPRINT? 0= if
       res p u >str MODEL-UNKNOWN--REASON:incomplete STILL-UNKNOWN exit
    then
    r true SCANNED-HASH-MAKE res RESULT-RECORDS VEC:PUSH ! ;
@@ -1575,15 +1576,6 @@ SUBTREE-INSTALL
    root en rfd before cache cut before STAT-DEV ar
    ENUMERATE-SCAN-ON-DEVICE ;
 
-\ A root whose every entry is treated as on a foreign volume.
-: ENUMERATE-SCAN-ACROSS-DEVICES ( ^u8 n ^ARENA:arena -- pending-scan )
-   {: p:^ u:n ar:^ARENA:arena :}
-   p u ar KEEP ar NEW-ENTRIES {: root:str en:scan-entries :}
-   p u s" open sync root for scan" OPEN-ABSOLUTE-DIRECTORY {: rfd:fd :}
-   rfd p u ROOT-STAT {: before:stat :}
-   root en rfd before ar [type] MODEL:hash-record NEW-VEC NO-CUTOFF
-   before STAT-DEV 1 xor ar ENUMERATE-SCAN-ON-DEVICE ;
-
 : SCAN-WITH-CACHE-COMPLETED-AT
    ( ^u8 n ^VEC:vector<MODEL:hash-record> option<cutoff>
      [ -- option<cutoff> ] ^ARENA:arena -- complete-scan )
@@ -1742,13 +1734,6 @@ $100 constant MODE-READ-ONLY
 : SAME-CONTENT? ( DROPBOX:hash DROPBOX:hash -- bool )
    {: a:DROPBOX:hash b:DROPBOX:hash :}
    a DROPBOX:HASH>STR str> b DROPBOX:HASH>STR str> STR= ;
-
-: SAME-FINGERPRINT? ( MODEL:fingerprint MODEL:fingerprint -- bool )
-   {: a:MODEL:fingerprint b:MODEL:fingerprint :}
-   a b SAME-HASHED-CONTENT 0= if false exit then
-   a MODEL-FINGERPRINT:UNMAKE {: i s ms mn cs cn :}
-   b MODEL-FINGERPRINT:UNMAKE {: i2 s2 ms2 mn2 cs2 cn2 :}
-   cs cs2 = cn cn2 = and ;
 
 : READ-ONLY ( fd ^u8 n ^u8 n -- )
    {: f:fd p:^ u:n o:^ ou:n :}
@@ -3721,18 +3706,6 @@ public
    [: dir r ru rel str> t tu want read ar STAGE-DOWNLOAD-IN ;]
    [: dir DISCARD ;] finally ;
 
-\ Rust's stage_download: STAGE-DOWNLOAD-AT below the root at path r, a
-\ failed read an io failure.
-: STAGE-DOWNLOAD
-   ( ^u8 n ^u8 n DROPBOX:hash [ ^u8 n -- n ] ^ARENA:arena
-     -- stage-outcome<n> )
-   {: r:^ ru:n t:^ tu:n want:DROPBOX:hash read ar:^ARENA:arena :}
-   r ru s" open sync root for download staging" OPEN-ROOT {: root:fd :}
-   [: 0 LOCAL-STAGE--OUTCOME:staged
-      [: DROP-STAGE-OUTCOME root r ru t tu want read ar STAGE-DOWNLOAD-AT ;]
-      LOCAL-ERRORS ;]
-   [: root DISCARD ;] finally ;
-
 \ Rust's existing_download_stage_at: what the stage for target t holding
 \ want below root path r already comes to, none when it is missing.
 : EXISTING-DOWNLOAD-STAGE-AT
@@ -4004,42 +3977,6 @@ STRUCTURE install
    current c HOLDS? 0= if current PREPARE-CHANGED exit then
    dir g gu gp gpu tn tnu t tu c ar MOVE-TO-GUARD ;
 
-\ The parent f opened at rel below the root at r, as OPEN-PARENT gives it.
-: PREPARE-IN-PARENT
-   ( fd str str ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
-     -- replacement-preparation )
-   {: f:fd name:str rel:str r:^ ru:n t:^ tu:n c:DROPBOX:hash
-      ar:^ARENA:arena :}
-   r ru rel str> ar JOIN {: dp:^ du:n :}
-   f dp du name str> t tu c ar PREPARE-REPLACEMENT-AT ;
-
-: PREPARE-BELOW-ROOT
-   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- replacement-preparation )
-   {: root:fd r:^ ru:n t:^ tu:n c:DROPBOX:hash ar:^ARENA:arena :}
-   root t tu false OPEN-PARENT MATCH option
-      none OF ABSENT PREPARE-CHANGED ENDOF
-      some OF PARENT-DIR-UNMAKE {: f:fd name:str rel:str :}
-         [: f name rel r ru t tu c ar PREPARE-IN-PARENT ;]
-         [: f DISCARD ;] finally
-      ENDOF
-   ;MATCH ;
-
-public
-
-\ Moves target t below the sync root at r to its guard, a name in the
-\ same directory, when it holds c, and syncs the directory: the bytes are
-\ then at the target or at the guard. A replay finds them at the guard.
-: PREPARE-REPLACEMENT
-   ( ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- replacement-preparation )
-   {: r:^ ru:n t:^ tu:n c:DROPBOX:hash ar:^ARENA:arena :}
-   c s" prepare replacement" REQUIRE-CONTENT-HASH
-   r ru s" open sync root for replacement preparation"
-   OPEN-ABSOLUTE-DIRECTORY {: root:fd :}
-   [: root r ru t tu c ar PREPARE-BELOW-ROOT ;] [: root DISCARD ;]
-   finally ;
-
-private
-
 \ ---- an install's steps
 
 : DESIRED ( install -- DROPBOX:hash )
@@ -4292,17 +4229,6 @@ public
       ENDOF
    ;MATCH ;
 
-\ INSTALL-DOWNLOAD-AT below the sync root at r.
-: INSTALL-DOWNLOAD
-   ( ^u8 n ^u8 n DROPBOX:hash option<DROPBOX:hash> ^ARENA:arena
-     -- install-outcome )
-   {: r:^ ru:n t:^ tu:n want:DROPBOX:hash
-      expected:option<DROPBOX:hash> ar:^ARENA:arena :}
-   r ru s" open sync root for download install" OPEN-ABSOLUTE-DIRECTORY
-   {: root:fd :}
-   [: root r ru t tu want expected ar INSTALL-DOWNLOAD-AT ;]
-   [: root DISCARD ;] finally ;
-
 \ ---- deletes
 
 public
@@ -4472,15 +4398,6 @@ public
       some OF r ru t tu want ar DELETE-BELOW ENDOF
    ;MATCH ;
 
-\ DELETE-LOCAL-AT below the root at the absolute path r.
-: DELETE-LOCAL
-   ( ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- delete-outcome )
-   {: r:^ ru:n t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
-   r ru s" open sync root for local deletion" OPEN-ABSOLUTE-DIRECTORY
-   {: root:fd :}
-   [: root r ru t tu want ar DELETE-LOCAL-AT ;] [: root DISCARD ;]
-   finally ;
-
 \ ---- directories
 
 \ What making a directory came to: made, already there, or another entry
@@ -4594,10 +4511,10 @@ ENUM conflict-outcome
 
 private
 
-\ The stage written at the conflict's path rel, which shown names in
-\ full; another file there is kept.
-: CONFLICT-RESULT ( stage-write ^u8 n ^u8 n -- conflict-outcome )
-   {: w:stage-write rel:^ relu:n shown:^ shownu:n :}
+\ The stage written at the conflict's path rel; another file there is
+\ kept.
+: CONFLICT-RESULT ( stage-write ^u8 n -- conflict-outcome )
+   {: w:stage-write rel:^ relu:n :}
    w MATCH stage-write
       created OF rel relu >str LOCAL-CONFLICT--OUTCOME:created ENDOF
       reused OF rel relu >str LOCAL-CONFLICT--OUTCOME:already-present
@@ -4620,7 +4537,7 @@ private
    r ru rel relu ar JOIN {: shown:^ shownu:n :}
    dir cn cnu shown shownu want read NO-MARKER
    s" materialize conflict" ar WRITE-VERIFIED-STAGE
-   rel relu shown shownu CONFLICT-RESULT ;
+   rel relu CONFLICT-RESULT ;
 
 \ The conflict copy written in the open parent, which closes after it.
 : CONFLICT-BELOW
@@ -4646,17 +4563,6 @@ public
       none OF p u UNSAFE ENDOF
       some OF r ru p u side want read ar CONFLICT-BELOW ENDOF
    ;MATCH ;
-
-\ MATERIALIZE-CONFLICT-AT below the root at the absolute path r.
-: MATERIALIZE-CONFLICT
-   ( ^u8 n ^u8 n conflict-side DROPBOX:hash [ ^u8 n -- n ]
-     ^ARENA:arena -- conflict-outcome )
-   {: r:^ ru:n p:^ u:n side:conflict-side want:DROPBOX:hash read
-      ar:^ARENA:arena :}
-   r ru s" open sync root for conflict" OPEN-ABSOLUTE-DIRECTORY
-   {: root:fd :}
-   [: root r ru p u side want read ar MATERIALIZE-CONFLICT-AT ;]
-   [: root DISCARD ;] finally ;
 
 \ ---- recovery copies
 

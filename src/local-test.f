@@ -240,6 +240,20 @@ private
       ENDOF
    ;MATCH ;
 
+\ PREPARE-REPLACEMENT-AT on target t below the root fd at r, its parent
+\ opened as INSTALL-DOWNLOAD-AT opens it.
+: PREPARE-BELOW
+   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- replacement-preparation )
+   {: root:fd r:^ ru:n t:^ tu:n c:DROPBOX:hash ar:^ARENA:arena :}
+   root t tu false OPEN-PARENT MATCH option
+      none OF E-CHANGED throw ENDOF
+      some OF PARENT-DIR-UNMAKE {: f:fd name:str rel:str :}
+         r ru rel str> ar JOIN {: dp:^ du:n :}
+         [: f dp du name str> t tu c ar PREPARE-REPLACEMENT-AT ;]
+         [: f DISCARD ;] finally
+      ENDOF
+   ;MATCH ;
+
 \ SYNC-RENAMED-DOWNLOAD of the file at t in dir, as a stage verified
 \ now, refuses it: it carries no marker.
 : RENAMED-WITHOUT-MARKER
@@ -277,6 +291,7 @@ EXPORT STAGE-NAME
 EXPORT GUARD-NAME
 EXPORT SYNC-INSTALLED-DOWNLOAD
 EXPORT INSTALL-RENAME-MUTATED
+EXPORT PREPARE-BELOW
 EXPORT RENAMED-WITHOUT-MARKER
 EXPORT INTERNAL-NAME
 EXPORT PARENT-OF
@@ -487,7 +502,7 @@ create TIMES 32 allot
       a i VEC:AT @ {: x:MODEL:hash-record :}
       b i VEC:AT @ {: y:MODEL:hash-record :}
       x RECORD-PATH y RECORD-PATH T$=
-      x RECORD-FINGERPRINT y RECORD-FINGERPRINT SAME-FINGERPRINT TTRUE
+      x RECORD-FINGERPRINT y RECORD-FINGERPRINT SAME-FINGERPRINT? TTRUE
       x RECORD-CONTENT DROPBOX:HASH>STR str>
       y RECORD-CONTENT DROPBOX:HASH>STR str> T$=
    loop ;
@@ -532,6 +547,14 @@ create TIMES 32 allot
    cache STABLE ENUMERATE {: ps:pending-scan :}
    s" a-missing" REMOVE
    [: ps FINISH-SCAN drop ;] E-CHANGED TTHROWSQ ;
+
+: ENUMERATE-SCAN-ACROSS-DEVICES ( ^u8 n ^ARENA:arena -- pending-scan )
+   {: p:^ u:n ar:^ARENA:arena :}
+   p u ar KEEP ar NEW-ENTRIES {: root:str en:scan-entries :}
+   p u s" open sync root for scan" OPEN-ABSOLUTE-DIRECTORY {: rfd:fd :}
+   rfd p u ROOT-STAT {: before:stat :}
+   root en rfd before ar [type] MODEL:hash-record NEW-VEC NO-CUTOFF
+   before STAT-DEV 1 xor ar ENUMERATE-SCAN-ON-DEVICE ;
 
 : OBJECTS-ON-ANOTHER-DEVICE-ARE-UNSUPPORTED-AND-UNSCANNED ( -- )
    s" objects_on_another_device_are_unsupported_and_unscanned" T-LABEL
@@ -1813,11 +1836,13 @@ variable REMAINING
    T-LABEL
    [: CROSS-FILESYSTEM ;] IN-SYNC-ROOT ;
 
-\ Rust's staged_download(stage_download(...)): b staged from a reader.
-: STAGE-BYTES ( ^u8 n DROPBOX:hash -- )
-   {: b:^ bu:n c:DROPBOX:hash :}
+\ Rust's staged_download(stage_download(...)): b staged from a reader
+\ below the sync root fd.
+: STAGE-BYTES ( fd ^u8 n DROPBOX:hash -- )
+   {: root:fd b:^ bu:n c:DROPBOX:hash :}
    b bu START 0 SCHEDULE
-   SYNC$ TARGET c [: FRAGMENT ;] AR @ LOCAL:STAGE-DOWNLOAD OUTCOME$
+   root SYNC$ TARGET c [: FRAGMENT ;] AR @ LOCAL:STAGE-DOWNLOAD-AT
+   OUTCOME$
    s" " T$= s" staged" T$= ;
 
 \ install_download is not ported yet: Rust's test then installs the
@@ -1830,7 +1855,7 @@ variable REMAINING
    root c lease b bu WRITTEN {: x :}
    x AR @ LOCAL:MARK-PARTIAL
    x LOCAL:ZERO-CHECKPOINT
-   b bu c STAGE-BYTES
+   root b bu c STAGE-BYTES
    x LOCAL:PARTIAL-PATH {: p:^ u:n :}
    x LOCAL:CLOSE-PARTIAL
    root TARGET c lease DOWNLOAD-PREPARE s" already-staged" PREPARED-AS
@@ -1896,23 +1921,25 @@ variable REMAINING
    s" stage download" AR @ LOCAL:WRITE-STAGE-OUTCOME OUTCOME$
    s" " T$= s" staged" T$= ;
 
-\ INSTALL-DOWNLOAD of "remote" at t below the case's directory.
-: INSTALL ( ^u8 n option<DROPBOX:hash> -- ^u8 n ^u8 n )
-   {: t:^ tu:n expected:option<DROPBOX:hash> :}
+\ INSTALL-DOWNLOAD-AT of "remote" at t below the case's directory, whose
+\ fd is root.
+: INSTALL ( fd ^u8 n option<DROPBOX:hash> -- ^u8 n ^u8 n )
+   {: root:fd t:^ tu:n expected:option<DROPBOX:hash> :}
    t tu T-LABEL
-   ROOT$ t tu WANT expected AR @ LOCAL:INSTALL-DOWNLOAD INSTALL$ ;
+   root ROOT$ t tu WANT expected AR @ LOCAL:INSTALL-DOWNLOAD-AT
+   INSTALL$ ;
 
-: REPLACEMENT-PREPARE ( ^u8 n ^u8 n -- ^u8 n ^u8 n )
-   {: t:^ tu:n c:^ cu:n :}
+: REPLACEMENT-PREPARE ( fd ^u8 n ^u8 n -- ^u8 n ^u8 n )
+   {: root:fd t:^ tu:n c:^ cu:n :}
    t tu T-LABEL
-   ROOT$ t tu c cu HASH-OF AR @ LOCAL:PREPARE-REPLACEMENT
+   root ROOT$ t tu c cu HASH-OF AR @ LOCAL:PREPARE-BELOW
    REPLACEMENT-PREPARATION$ ;
 
 : ABSENT-INSTALL ( fd -- )
    {: root:fd :}
    root TARGET STAGE-REMOTE
    TARGET s" local" PUT-FILE
-   TARGET NO-CONTENT INSTALL
+   root TARGET NO-CONTENT INSTALL
    s" local" IDENTITY T$= s" precondition-changed" T$=
    TARGET READ$ s" local" T$= ;
 
@@ -2016,21 +2043,22 @@ variable REMAINING
 \ An absent target: none staged, then installed and installed again.
 : ABSENT-OUTCOMES ( fd -- )
    {: root:fd :}
-   TARGET NO-CONTENT INSTALL s" " T$= s" download-required" T$=
-   s" missing/target.txt" NO-CONTENT INSTALL
+   root TARGET NO-CONTENT INSTALL s" " T$= s" download-required" T$=
+   root s" missing/target.txt" NO-CONTENT INSTALL
    s" " T$= s" download-required" T$=
    root TARGET STAGE-REMOTE
-   TARGET NO-CONTENT INSTALL s" " T$= s" installed" T$=
+   root TARGET NO-CONTENT INSTALL s" " T$= s" installed" T$=
    TARGET READ$ s" remote" T$=
    root TARGET STAGE-NAME$ LOCAL:ENTRY-EXISTS-AT TFALSE
    TARGET AT FS:TRY-LSTAT TTRUE
    FS:STAT-MODE@ $1FF and FS:MODE-PRIVATE-FILE T=
-   TARGET NO-CONTENT INSTALL s" " T$= s" already-installed" T$= ;
+   root TARGET NO-CONTENT INSTALL s" " T$= s" already-installed" T$= ;
 
-: OCCUPIED-STAGE ( -- )
+: OCCUPIED-STAGE ( fd -- )
+   {: root:fd :}
    s" other.txt" STAGE-NAME$ {: sn:^ snu:n :}
    sn snu s" mutant" PUT-FILE
-   s" other.txt" NO-CONTENT INSTALL
+   root s" other.txt" NO-CONTENT INSTALL
    sn snu AT T$= s" stage-destination-occupied" T$= ;
 
 \ A replacement installs over the content expected and keeps any other.
@@ -2038,19 +2066,19 @@ variable REMAINING
    {: root:fd :}
    s" old.txt" s" local" PUT-FILE
    root s" old.txt" STAGE-REMOTE
-   s" old.txt" s" local" HELD INSTALL s" " T$= s" installed" T$=
+   root s" old.txt" s" local" HELD INSTALL s" " T$= s" installed" T$=
    s" old.txt" READ$ s" remote" T$=
    root s" old.txt" s" local" HASH-OF AR @ LOCAL:GUARD-NAME
    LOCAL:ENTRY-EXISTS-AT TFALSE
    s" edited.txt" s" edit" PUT-FILE
    root s" edited.txt" STAGE-REMOTE
-   s" edited.txt" s" local" HELD INSTALL
+   root s" edited.txt" s" local" HELD INSTALL
    s" edit" IDENTITY T$= s" precondition-changed" T$=
    s" edited.txt" READ$ s" edit" T$= ;
 
 : INSTALL-CASES ( fd -- )
    {: root:fd :}
-   root ABSENT-OUTCOMES OCCUPIED-STAGE root REPLACEMENT-OUTCOMES ;
+   root ABSENT-OUTCOMES root OCCUPIED-STAGE root REPLACEMENT-OUTCOMES ;
 
 : EACH-INSTALL-OUTCOME-IS-REACHED ( -- )
    s" each install outcome is reached" T-LABEL
@@ -2059,18 +2087,17 @@ variable REMAINING
 : PREPARE-CASES ( fd -- )
    {: root:fd :}
    s" prep.txt" s" old" PUT-FILE
-   s" prep.txt" s" old" REPLACEMENT-PREPARE s" " T$= s" prepared" T$=
+   root s" prep.txt" s" old" REPLACEMENT-PREPARE
+   s" " T$= s" prepared" T$=
    root s" prep.txt" LOCAL:ENTRY-EXISTS-AT TFALSE
    s" prep.txt" s" old" HASH-OF AR @ LOCAL:GUARD-NAME READ$ s" old" T$=
-   s" prep.txt" s" old" REPLACEMENT-PREPARE
+   root s" prep.txt" s" old" REPLACEMENT-PREPARE
    s" " T$= s" already-prepared" T$=
    s" other.txt" s" new" PUT-FILE
-   s" other.txt" s" old" REPLACEMENT-PREPARE
+   root s" other.txt" s" old" REPLACEMENT-PREPARE
    s" new" IDENTITY T$= s" precondition-changed" T$=
    s" other.txt" READ$ s" new" T$=
-   s" absent.txt" s" old" REPLACEMENT-PREPARE
-   s" none" T$= s" precondition-changed" T$=
-   s" missing/file.txt" s" old" REPLACEMENT-PREPARE
+   root s" absent.txt" s" old" REPLACEMENT-PREPARE
    s" none" T$= s" precondition-changed" T$= ;
 
 : EACH-REPLACEMENT-PREPARATION-IS-REACHED ( -- )
@@ -2223,9 +2250,10 @@ variable OPEN-FDS
       ENDOF
    ;MATCH ;
 
-\ Deletes target.txt below the case directory while it holds "old".
-: DELETE ( -- ^u8 n ^u8 n )
-   ROOT$ TARGET OLD AR @ LOCAL:DELETE-LOCAL DELETED$ ;
+\ Deletes target.txt below the case directory, whose fd is root, while
+\ it holds "old".
+: DELETE ( fd -- ^u8 n ^u8 n )
+   ROOT$ TARGET OLD AR @ LOCAL:DELETE-LOCAL-AT DELETED$ ;
 
 : GUARD ( -- ^u8 n ) s" deleted" TARGET OLD AR @ LOCAL:INTERNAL-NAME ;
 
@@ -2241,7 +2269,7 @@ variable OPEN-FDS
    TARGET s" old" PUT-FILE
    root TARGET root GUARD FS:TRY-RENAME-AT TTRUE
    TARGET s" raced edit" PUT-FILE
-   DELETE s" raced edit" IDENTITY T$= s" precondition-changed" T$=
+   root DELETE s" raced edit" IDENTITY T$= s" precondition-changed" T$=
    TARGET BYTES s" raced edit" T$=
    GUARD PRESENT? TFALSE ;
 
@@ -2250,10 +2278,11 @@ variable OPEN-FDS
    [: DELETE-REPLAY ;] IN-CASE-DIR ;
 
 \ An interrupted delete's guard holding other bytes goes back.
-: GUARD-RESTORED ( -- )
+: GUARD-RESTORED ( fd -- )
+   {: root:fd :}
    s" guard restored" T-LABEL
    GUARD s" edited" PUT-FILE
-   DELETE s" edited" IDENTITY T$= s" precondition-changed" T$=
+   root DELETE s" edited" IDENTITY T$= s" precondition-changed" T$=
    TARGET BYTES s" edited" T$=
    GUARD PRESENT? TFALSE ;
 
@@ -2261,16 +2290,16 @@ variable OPEN-FDS
    {: root:fd :}
    s" deleted" T-LABEL
    TARGET s" old" PUT-FILE
-   DELETE s" " T$= s" deleted" T$=
+   root DELETE s" " T$= s" deleted" T$=
    TARGET PRESENT? TFALSE GUARD PRESENT? TFALSE
    s" already deleted" T-LABEL
-   DELETE s" " T$= s" already-deleted" T$=
+   root DELETE s" " T$= s" already-deleted" T$=
    s" precondition changed" T-LABEL
    TARGET s" new" PUT-FILE
-   DELETE s" new" IDENTITY T$= s" precondition-changed" T$=
+   root DELETE s" new" IDENTITY T$= s" precondition-changed" T$=
    TARGET BYTES s" new" T$=
    TARGET AT FS:REMOVE-FILE
-   GUARD-RESTORED ;
+   root GUARD-RESTORED ;
 
 \ precondition-changed with none needs the guard to vanish between its
 \ hash and its restore, a race a scratch tree cannot stage; left out.
@@ -2336,12 +2365,13 @@ variable OPEN-FDS
 
 : ORIGINAL ( -- ^u8 n ) s" dir/original.txt" ;
 
-\ Materializes the bytes as ORIGINAL's remote conflict copy of "remote".
-: MATERIALIZED ( ^u8 n -- ^u8 n ^u8 n )
-   {: b:^ bu:n :}
+\ Materializes the bytes as ORIGINAL's remote conflict copy of "remote"
+\ below the case directory, whose fd is root.
+: MATERIALIZED ( fd ^u8 n -- ^u8 n ^u8 n )
+   {: root:fd b:^ bu:n :}
    b bu START 0 SCHEDULE
-   ROOT$ ORIGINAL LOCAL-CONFLICT--SIDE:remote WANT [: FRAGMENT ;] AR @
-   LOCAL:MATERIALIZE-CONFLICT CONFLICT$ ;
+   root ROOT$ ORIGINAL LOCAL-CONFLICT--SIDE:remote WANT [: FRAGMENT ;]
+   AR @ LOCAL:MATERIALIZE-CONFLICT-AT CONFLICT$ ;
 
 : COPY-PATH ( -- ^u8 n )
    ORIGINAL LOCAL-CONFLICT--SIDE:remote WANT AR @
@@ -2350,14 +2380,14 @@ variable OPEN-FDS
 : CONFLICT-CASES ( fd -- )
    {: root:fd :}
    s" created" T-LABEL
-   s" remote" MATERIALIZED COPY-PATH T$= s" created" T$=
+   root s" remote" MATERIALIZED COPY-PATH T$= s" created" T$=
    COPY-PATH BYTES s" remote" T$=
    COPY-PATH drop 4 s" dir/" T$=
    s" already present" T-LABEL
-   s" remote" MATERIALIZED COPY-PATH T$= s" already-present" T$=
+   root s" remote" MATERIALIZED COPY-PATH T$= s" already-present" T$=
    s" content changed" T-LABEL
    COPY-PATH AT FS:REMOVE-FILE
-   s" mutant" MATERIALIZED s" mutant" IDENTITY T$=
+   root s" mutant" MATERIALIZED s" mutant" IDENTITY T$=
    s" content-changed" T$=
    COPY-PATH PRESENT? TFALSE ;
 
