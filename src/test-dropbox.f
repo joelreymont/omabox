@@ -971,13 +971,16 @@ $2100000 constant UPLOAD-CAP
 : ORIGIN$ ( -- ptr u8 n ) ORIGIN ORIGIN-U @ ;
 
 
-\ Forgets the script, the entries, the pages, the long poll's answer, the
-\ sessions, a LOSE or CUT and what was sent; the tokens stay.
+\ Forgets the script, the entries, the kept bytes, the pages, the long
+\ poll's answer, the sessions, the revs uploads took, a SKEW, LOSE or CUT, a
+\ code GRANT! set and what was sent; the tokens and the root stay.
 : RESET ( -- )
-   0 SCRIPTS ! 0 SCRIPTED ! 0 FILES ! 0 SESSIONS !
+   0 SCRIPTS ! 0 SCRIPTED ! 0 FILES ! 0 CONTENTS ! 0 SESSIONS ! 0 REVS !
+   0 GRANT-CODE-U !
    0 SEEN-U ! 0 AUTH-U ! 0 ROOT-SENT-U ! 0 TYPE-SENT-U !
-   false ROOTED ! false TYPED ! false LEAKED !
-   false LOSING ! false CUTTING !
+   0 ARG-SENT-U ! 0 RANGE-SENT-U !
+   false ROOTED ! false TYPED ! false LEAKED ! false RANGED !
+   false SKEWED ! false LOSING ! false CUTTING !
    LISTING-RESET ;
 
 

@@ -3,9 +3,10 @@
 \ header, the token's refresh, rate limits, outages, a redirect, a malformed
 \ request, the listing, the long poll, downloads, delete, create-folder, the
 \ code exchange, Dropbox's content hash and uploads, whose stages are written
-\ under TMPDIR. One server and one main client serve every case; a case
-\ that needs another config opens its own client. DROPBOX's log lines go to
-\ stderr. The first failed assertion ends the run.
+\ under TMPDIR and removed once open, so no run leaves one. One server and
+\ one main client serve every case; a case that needs another config opens
+\ its own client. DROPBOX's log lines go to stderr. The first failed
+\ assertion ends the run.
 \ Run from the repository root: hb --load src/dropbox-test.f </dev/null
 require src/lib/aio.f
 require src/lib/arena.f
@@ -14,6 +15,7 @@ require src/lib/string.f
 require src/lib/test.f
 require src/lib/memory.f
 require src/lib/fs.f
+require src/lib/fs-mutate.f
 require src/lib/net/curl.f
 require src/dropbox.f
 require src/test-dropbox.f
@@ -606,12 +608,12 @@ TYPED-VARIABLE FAULT fault
    du 1+ nu + STAGE-U ! ;
 
 
-\ Writes the bytes as the stage and readies UP to upload them to path
-\ over rev.
+\ Writes the bytes as the stage, opens it and removes its name before any
+\ check can end the run, and readies UP to upload them to path over rev.
 : STAGED ( ptr u8 n ptr u8 n ptr u8 n -- )
    {: b:ptr bu:n p:ptr pu:n r:ptr ru:n :}
    STAGE$ b bu FS:WRITE-ALL
-   STAGE$ FS:OPEN-SIZED ASSERT {: f:fd size:n :}
+   STAGE$ FS:OPEN-SIZED STAGE$ FS:REMOVE-FILE ASSERT {: f:fd size:n :}
    f UP DROPBOX-UPLOAD:FD !
    size UP DROPBOX-UPLOAD:SIZE !
    b bu HASHED EXPECTED swap BYTE-COPY
