@@ -28,8 +28,8 @@ creation, later local or remote edits, local or remote deletion, divergent
 edits, deletion/edit conflicts, and initial collisions. It requires a fair
 daemon wakeup, durable intent before effects, verified uploads and downloads,
 convergence for ordinary changes, and preservation of every present conflict
-side. The corresponding fake-Dropbox tests exercise these cases through Rust;
-TLC does not prove that the implementation conforms to the model.
+side. The corresponding fake-Dropbox tests exercise these cases; TLC does not
+prove that the implementation conforms to the model.
 
 `DirectoryDeletion` checks one locally deleted directory holding one
 synchronized file while another Dropbox client may rewrite or re-create that

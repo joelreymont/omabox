@@ -20,7 +20,7 @@ EXTENDS TLC
  cannot know, and planning on that stale inventory is the case the probe
  exists for.
 
- Each action names the Rust function it abstracts. Effects and their journal
+ Each action abstracts one step of the daemon. Effects and their journal
  completions are separate steps, so every run also covers replay after a
  crash between an applied Dropbox effect and its journal completion.
  ***************************************************************************)

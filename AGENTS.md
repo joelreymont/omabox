@@ -1,10 +1,8 @@
 # Omabox
 
-Native, ARM64-first Dropbox sync for Omarchy against Dropbox's documented API
-and OAuth flow. The nightly Rust implementation (`src/`, `tests/`), built on
-pinned `dropbox-sdk` generated types and routes with a local `ureq` transport
-adapter, is being rewritten in Habu as a drop-in replacement; `JOURNAL.md`
-records the rewrite.
+Native, ARM64-first Dropbox sync for Omarchy in Habu, against Dropbox's
+documented API and OAuth flow. `docs/habu-rewrite.md` is the plan for the
+rewrite and `JOURNAL.md` records it.
 
 ## Scope
 
@@ -24,15 +22,14 @@ records the rewrite.
 
 ## Changes
 
-- Astra owns design, complex implementation, and integration. Delegate bounded
-  implementation to Sol after interfaces and acceptance are clear; use a
-  separate Astra reviewer before landing.
-- Follow `~/.agents/docs/rust.md` in Rust; repository rules may be stricter.
+- Write Habu as Habu's `docs/forth-card.md` says; repository rules may be
+  stricter.
 - Use `jj`. Make one commit per feature or significant fix and include its dot
   closure in that commit.
 - Rebase every open line of work onto `master` periodically, and before it
   merges, so it never drifts far from `master`.
-- Run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` before landing Rust changes.
+- Before landing, run the tests (`src/*-test.f`) of every package the change
+  touches.
 - Run the relevant TLC model after changing durable replay or concurrency.
 - Keep real Dropbox tests opt-in and separate from unit tests.
 - Classify and test every external/filesystem failure. Repeated bad input must

@@ -22,8 +22,7 @@ stopped on a failure shows why. Logs and setup help remain one click away.
 Install the release build while the desktop session is unlocked:
 
 ```bash
-cargo +nightly build --release
-target/release/omabox install
+omabox install
 omarchy plugin enable local.omabox --section right --after omarchy.tray
 ```
 

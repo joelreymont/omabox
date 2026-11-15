@@ -3,7 +3,8 @@
 Everything above the Dropbox vocabulary (`docs/habu-dropbox.md`). The Habu
 `omaboxd` and `omabox` replace the Rust ones in place. They keep the
 journal, credential record, `config.toml`, CLI, `status.json` v3, unit and
-widget.
+widget. The Rust version is on the `rust` branch, and every `.rs` path here
+names a file there.
 
 ## Habu libraries
 
@@ -23,8 +24,8 @@ General code goes into Habu's `src/lib`; sync policy stays here.
   (`src/auth.rs:30`).
 
 SHA-256 is already in Habu core (`src/core/sha256.f`). Inotify is not added:
-the Rust daemon rescans after each 30 s long poll, and a watcher waits for the
-rule in `docs/remediation-2026-09.md` K.
+the daemon rescans after each 30 s long poll, as the Rust one does, and a
+watcher comes only for a measured need.
 
 ## Omabox packages
 
@@ -62,6 +63,7 @@ rule in `docs/remediation-2026-09.md` K.
 - A Habu-made schema against a Rust-made one (`sqlite_master`), and a journal
   the Rust daemon wrote, read back.
 - Startup and crash tests of the built `omaboxd`.
+- The widget's QML tests, through Qt 6's `qmltestrunner` (README, "Develop").
 
 ## Order
 
@@ -73,4 +75,4 @@ rule in `docs/remediation-2026-09.md` K.
 6. `DAEMON`, `omaboxd`, `build.f`.
 7. Cutover of the daemon; the Rust CLI keeps working. Reinstalling the Rust
    `omaboxd` is the way back.
-8. CLI, installer, service; then the Rust tree goes.
+8. CLI, installer, service.

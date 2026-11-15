@@ -1,9 +1,8 @@
 # The Dropbox vocabulary in Habu
 
-Package `DROPBOX`, in `src/dropbox.f` beside `src/dropbox.rs`. It has one word
-for each Dropbox route omabox calls, and it speaks Dropbox's own terms:
-entry, rev, content hash, cursor and upload session. The signatures below are
-not checked yet.
+Package `DROPBOX`, in `src/dropbox.f`. It has one word for each Dropbox route
+omabox calls, and it speaks Dropbox's own terms: entry, rev, content hash,
+cursor and upload session. The signatures below are not checked yet.
 
 ## What a call answers
 
@@ -236,7 +235,7 @@ its size. A program that uses `DROPBOX` therefore starts the CURL loop first
 
 The tests run against a fake Dropbox on `net/http.f`, in the style of
 `net/test-model.f`, with scenarios ported from the wire-level cases in
-`tests/dropbox_fake.rs`:
+`tests/dropbox_fake.rs` on the `rust` branch:
 - **listing:** many pages, a reset mid-listing, and a cursor that does not
   advance;
 - **long poll:** changes, a timeout and a backoff;

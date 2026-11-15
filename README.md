@@ -1,12 +1,8 @@
 # Omabox
 
-Omabox is a local-first Dropbox client for Omarchy. A headless Rust daemon syncs
-ordinary files and directories through Dropbox's documented API; a CLI and an
-optional QuickShell widget provide setup, control, and status.
-
-Dropbox requests, responses, route errors, and OAuth use pinned `dropbox-sdk`
-0.20.3. Omabox's `ureq` adapter supplies connection pools, request deadlines,
-verified ranges, and coordinated token refresh with durable credential rotation.
+Omabox is a local-first Dropbox client for Omarchy, written in Habu. A headless
+daemon syncs ordinary files and directories through Dropbox's documented API; a
+CLI and an optional QuickShell widget provide setup, control, and status.
 
 It supports one Dropbox account, one remote root, and one local root. It does
 not implement a virtual filesystem, selective sync, or Dropbox Paper documents.
@@ -19,13 +15,15 @@ untouched locally and skips syncing them: names ending in `.DS_Store`,
 
 ## Install
 
-Install Rust nightly, create a Dropbox API app, and copy its public app key.
-Omabox neither needs nor accepts the app secret. Then, while the desktop is
+There is no release build yet: the rewrite in Habu is under way, and
+`docs/habu-rewrite.md` lists what remains.
+
+Create a Dropbox API app and copy its public app key. Omabox neither needs nor
+accepts the app secret. Then, from a release build and while the desktop is
 unlocked:
 
 ```bash
-cargo build --release
-target/release/omabox install
+omabox install
 omabox setup --app-key YOUR_APP_KEY
 omabox service enable
 omabox service start
@@ -72,12 +70,8 @@ re-created locally.
 
 ## Upgrade or remove
 
-After building a new release:
-
-```bash
-target/release/omabox upgrade
-omabox uninstall
-```
+Run a new release's `omabox upgrade` to replace the installed one, and
+`omabox uninstall` to remove it.
 
 Upgrade validates the complete replacement and rolls back if the new daemon
 cannot replace a running one. A service that was still starting is restarted
@@ -91,21 +85,12 @@ Commands that replace the live QuickShell plugin refuse to run while locked.
 
 ## Develop
 
-```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-```
+The Omarchy plugin's QML tests need Qt 6's `qmltestrunner`, from
+`qt6-declarative`. Find it through `qmake6 -query QT_INSTALL_BINS` rather than
+`PATH`, because Qt 5 ships a `qmltestrunner` of its own that `PATH` may well
+find first and that cannot run these tests at all: it rejects the plugin's
+versionless imports with `Library import requires a version` and exits before
+a single case runs.
 
-`cargo test` runs the Omarchy plugin's QML tests through Qt 6's
-`qmltestrunner`, so `qt6-declarative` must be installed. The runner is located
-through `qmake6 -query QT_INSTALL_BINS` rather than `PATH`, because Qt 5 ships
-a `qmltestrunner` of its own that `PATH` may well find first and that cannot
-run these tests at all: it rejects the plugin's versionless imports with
-`Library import requires a version` and exits before a single case runs.
-
-See [`formal/README.md`](formal/README.md) for TLC checks. Real Dropbox tests are
-opt-in: `OMABOX_DROPBOX_APP_KEY=... cargo test --features dropbox-live --
---ignored` runs them against a dedicated test account whose refresh token
-`omabox setup` stored. They must use uncommitted test credentials. Omabox is
-MIT licensed.
+See [`formal/README.md`](formal/README.md) for TLC checks. Omabox is MIT
+licensed.
