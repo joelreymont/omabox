@@ -161,7 +161,7 @@ $4000 constant CHUNK
 
 ENUM verdict
    VARIANT answer FIELD r reply ;VARIANT
-   VARIANT expired ;VARIANT
+   VARIANT rejected ;VARIANT
 ;ENUM
 
 : EMPTY ( -- SPAN:span<u8> ) s" " SPAN:MAKE ;
@@ -629,7 +629,7 @@ ENUM verdict
    c CLIENT-STATUS @ {: s:n :}
    s 0= if c LOST ANSWER exit then
    s 200 = if construct reply done ANSWER exit then
-   s 401 = if construct verdict expired exit then
+   s 401 = if construct verdict rejected exit then
    s 403 = if construct reply unlinked ANSWER exit then
    s 409 = if c REFUSED ANSWER exit then
    s 422 = if construct error invalid-root construct reply refused ANSWER exit then
@@ -759,7 +759,7 @@ ENUM verdict
    again DONE? 0= if again exit then
    c o r ru body send ATTEMPT MATCH verdict
       answer OF ENDOF
-      expired OF construct reply unlinked ENDOF
+      rejected OF construct reply unlinked ENDOF
    ;MATCH ;
 
 
@@ -775,7 +775,7 @@ ENUM verdict
    first DONE? 0= if first exit then
    c o r ru body send ATTEMPT MATCH verdict
       answer OF ENDOF
-      expired OF c o r ru body send RESEND ENDOF
+      rejected OF c o r ru body send RESEND ENDOF
    ;MATCH ;
 
 
@@ -1247,7 +1247,7 @@ FSM:DEFINE DOWNLOADING ( ptr fetch ) download-step open-event
    c SORTED {: v:verdict :}
    v MATCH verdict
       answer OF DONE? if c r ru at got VERIFIED then ENDOF
-      expired OF ENDOF
+      rejected OF ENDOF
    ;MATCH
    v ;
 
@@ -1556,7 +1556,7 @@ public
    k ku secs c POLL-BODY
    c secs LONG-POLL MATCH verdict
       answer OF ENDOF
-      expired OF c s" a long poll refused a token" E-AUTH FAILED ENDOF
+      rejected OF c s" a long poll refused a token" E-AUTH FAILED ENDOF
    ;MATCH
    c [: POLL-READ ;] ANSWERED ;
 
