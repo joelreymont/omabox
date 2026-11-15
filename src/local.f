@@ -1,6 +1,7 @@
 \ local.f - package LOCAL: the local half of a sync (docs/habu-rewrite.md,
 \ the LOCAL row) on Habu's anchored file words: its errors, the opens it
-\ confines below the sync root, and Dropbox content hashes of local files.
+\ confines below the sync root, Dropbox content hashes of local files, and
+\ the verified stages a download writes, with their xattr markers.
 \ A relative path splits as Rust's Path::components splits it: empty and "."
 \ components past the first are skipped, and an empty, absolute or leading "."
 \ path, or one with a ".." component, is unsafe. Each component opens
@@ -11,9 +12,10 @@
 \ search permission only. A failure is logged once with its text before LOCAL
 \ throws its code; an io failure's errno stays in FS:ERRNO, 0 where the
 \ Habu word that failed keeps none.
-\ STORAGE CLASS. PROCESS-WIDE: the content hasher, its read buffer and the
-\ name hasher; one task syncs, so one hashes at a time. CALLER-OWNED: every
-\ descriptor answered, and the hashes and names laid in the caller's arena.
+\ STORAGE CLASS. PROCESS-WIDE: the content hasher, its read buffer, the
+\ name hasher and the marker read buffer; one task syncs, so one uses them
+\ at a time. CALLER-OWNED: every descriptor answered, the hashes and names
+\ laid in the caller's arena, and the paths a stage's result names.
 
 require src/lib/error.f
 require src/lib/string.f
@@ -24,6 +26,7 @@ require src/lib/adt/option.f
 require src/lib/fs.f
 require src/lib/fs-anchored.f
 require src/lib/fd.f
+require src/lib/xattr.f
 require src/dropbox.f
 require src/model.f
 
@@ -149,10 +152,11 @@ $2E constant DOT
    LOG:TEXT+ e ERRNO+ LOG:;LINE
    e FS:CAUSE! E-HASH-READ throw ;
 
-\ The codes Habu's file words throw.
+\ The codes Habu's file and xattr words throw.
 : FS-CODE? ( n -- bool )
    {: code:n :}
    code E-FFI-NUL = if true exit then
+   code XATTR:E-XATTR = if true exit then
    code E-FS-LAST >= code E-FS-FIRST <= and ;
 
 \ Runs q from a clear FS:ERRNO; an FS code it throws runs fail, which
@@ -688,5 +692,347 @@ private
    [: f FD:SYNC ;] [: o ou p u IO-FAILURE ;] FS-FAILS ;
 
 : SYNC-FILE ( fd ^u8 n ^u8 n -- ) SYNC-DIRECTORY ;
+
+\ ---- download stages
+
+public
+
+\ What supplying bytes for an immutable stage came to: new verified bytes
+\ staged, a verified stage reused, bytes whose hash is actual, or another
+\ file at the stage's path, kept as it was.
+ENUM stage-outcome<a>
+   VARIANT staged FIELD stage a ;VARIANT
+   VARIANT already-staged FIELD stage a ;VARIANT
+   VARIANT content-changed FIELD actual DROPBOX:hash ;VARIANT
+   VARIANT destination-occupied FIELD path str ;VARIANT
+;ENUM
+
+private
+
+ENUM stage-write
+   VARIANT created ;VARIANT
+   VARIANT reused ;VARIANT
+   VARIANT mismatch FIELD actual DROPBOX:hash ;VARIANT
+   VARIANT destination-occupied FIELD path str ;VARIANT
+;ENUM
+: DROP-STAGE-WRITE ( stage-write -- ) drop ;
+
+\ An owned stage made read-only, open, and its fingerprint after that.
+STRUCTURE verified-download-stage
+   FIELD file fd
+   FIELD fingerprint MODEL:fingerprint
+;STRUCTURE
+
+ENUM download-stage
+   VARIANT missing ;VARIANT
+   VARIANT verified FIELD stage verified-download-stage ;VARIANT
+   VARIANT destination-occupied FIELD path str ;VARIANT
+;ENUM
+
+ENUM download-marker missing expected other ;ENUM
+: DROP-MARKER ( download-marker -- ) drop ;
+
+\ The Rust daemon's names and sizes, so either reads the other's stages.
+: DOWNLOAD-STAGE-XATTR ( -- ^u8 n ) s" user.omabox.download-stage-v1" ;
+96 constant MARKER-CAP
+MARKER-CAP BUFFER: MARKER-BUF
+\ S_IRUSR: a verified stage's only permission.
+$100 constant MODE-READ-ONLY
+
+\ The marker an owned download stage of target's content carries.
+: STAGE-MARKER ( ^u8 n DROPBOX:hash ^ARENA:arena -- ^u8 n )
+   {: t:^ tu:n c:DROPBOX:hash ar:^ARENA:arena :}
+   s" download-marker-v1" t tu c ar INTERNAL-NAME ;
+
+: SAME-CONTENT? ( DROPBOX:hash DROPBOX:hash -- bool )
+   {: a:DROPBOX:hash b:DROPBOX:hash :}
+   a DROPBOX:HASH>STR str> b DROPBOX:HASH>STR str> STR= ;
+
+: SAME-FINGERPRINT? ( MODEL:fingerprint MODEL:fingerprint -- bool )
+   {: a:MODEL:fingerprint b:MODEL:fingerprint :}
+   a b SAME-HASHED-CONTENT 0= if false exit then
+   a MODEL-FINGERPRINT:UNMAKE {: i s ms mn cs cn :}
+   b MODEL-FINGERPRINT:UNMAKE {: i2 s2 ms2 mn2 cs2 cn2 :}
+   cs cs2 = cn cn2 = and ;
+
+: READ-ONLY ( fd ^u8 n ^u8 n -- )
+   {: f:fd p:^ u:n o:^ ou:n :}
+   [: f MODE-READ-ONLY FD:MODE! ;] [: o ou p u IO-FAILURE ;] FS-FAILS ;
+
+\ ---- xattrs
+
+\ create refuses an attribute that exists, as XATTR_CREATE does.
+: SET-XATTR ( fd ^u8 n ^u8 n bool ^u8 n ^u8 n -- )
+   {: f:fd name:^ nu:n v:^ vu:n create:bool p:^ u:n o:^ ou:n :}
+   [: create if f name nu v vu XATTR:ADD exit then
+      f name nu v vu XATTR:SET ;]
+   [: o ou p u IO-FAILURE ;] FS-FAILS ;
+
+\ An absent attribute is already removed.
+: REMOVE-XATTR ( fd ^u8 n ^u8 n ^u8 n -- )
+   {: f:fd name:^ nu:n p:^ u:n o:^ ou:n :}
+   [: f name nu XATTR:ERASE ;] [: o ou p u IO-FAILURE ;] FS-FAILS ;
+
+: MARKER-GOT ( XATTR:got ^u8 n -- download-marker )
+   {: g:XATTR:got want:^ wu:n :}
+   g MATCH XATTR:got
+      absent OF DOWNLOAD-MARKER-MISSING ENDOF
+      value OF {: k:n :}
+         MARKER-BUF k want wu STR= if DOWNLOAD-MARKER-EXPECTED
+         else DOWNLOAD-MARKER-OTHER then
+      ENDOF
+      oversize OF DOWNLOAD-MARKER-OTHER ENDOF
+   ;MATCH ;
+
+\ The stage marker on the file, compared with want's bytes.
+: READ-DOWNLOAD-MARKER ( fd ^u8 n ^u8 n -- download-marker )
+   {: f:fd want:^ wu:n p:^ u:n :}
+   DOWNLOAD-MARKER-MISSING
+   [: DROP-MARKER f DOWNLOAD-STAGE-XATTR MARKER-BUF MARKER-CAP SPAN:MAKE
+      XATTR:GET want wu MARKER-GOT ;]
+   [: s" verify download stage marker" p u IO-FAILURE ;] FS-FAILS ;
+
+: EXPECTED? ( download-marker -- bool )
+   MATCH download-marker
+      missing OF false ENDOF
+      expected OF true ENDOF
+      other OF false ENDOF
+   ;MATCH ;
+
+\ ---- staging
+
+\ Fills the span from read; a file failure there is a stage read's.
+: STAGE-READ-INTO ( ^u8 n [ ^u8 n -- n ] ^u8 n ^u8 n -- n )
+   {: dst:^ cap:n read p:^ u:n o:^ ou:n :}
+   0 [: drop dst cap read execute ;] [: o ou p u STAGE-READ ;] FS-FAILS ;
+
+: WRITE-PRIVATE ( fd ^u8 n ^u8 n -- )
+   {: w:fd b:^ k:n p:^ u:n :}
+   [: w b k FD:WRITE-FULL ;]
+   [: s" write private stage" p u IO-FAILURE ;] FS-FAILS ;
+
+\ Reads into the span, writes what came to w and answers its count.
+: COPY-CHUNK ( ^u8 n [ ^u8 n -- n ] fd ^u8 n ^u8 n -- n )
+   {: dst:^ cap:n read w:fd p:^ u:n o:^ ou:n :}
+   dst cap read p u o ou STAGE-READ-INTO {: k:n :}
+   k 0 > if w dst k p u WRITE-PRIVATE then
+   k ;
+
+\ Copies what read gives to w; answers its Dropbox content hash.
+: COPY-AND-HASH
+   ( [ ^u8 n -- n ] fd ^u8 n ^u8 n ^ARENA:arena -- DROPBOX:hash )
+   {: read w:fd p:^ u:n o:^ ou:n ar:^ARENA:arena :}
+   [: read w p u o ou COPY-CHUNK ;] ar HASH-STREAM ;
+
+: MAP-STAGE-WRITE ( stage-write [ -- a ] -- stage-outcome<a> )
+   {: w:stage-write stage :}
+   w MATCH stage-write
+      created OF stage execute LOCAL-STAGE--OUTCOME:staged ENDOF
+      reused OF stage execute LOCAL-STAGE--OUTCOME:already-staged ENDOF
+      mismatch OF LOCAL-STAGE--OUTCOME:content-changed ENDOF
+      destination-occupied OF LOCAL-STAGE--OUTCOME:destination-occupied
+      ENDOF
+   ;MATCH ;
+
+\ Whether the file carries marker, true when there is none to carry.
+: MARKED? ( fd option<str> ^u8 n -- bool )
+   {: f:fd marker:option<str> p:^ u:n :}
+   marker MATCH option
+      none OF true ENDOF
+      some OF {: m:str :} f m str> p u READ-DOWNLOAD-MARKER EXPECTED?
+      ENDOF
+   ;MATCH ;
+
+\ Syncs the file and its entry when it holds want and carries the marker.
+: REUSE-VERIFIED-STAGE
+   ( fd DROPBOX:hash DROPBOX:hash option<str> fd ^u8 n -- bool )
+   {: f:fd actual:DROPBOX:hash want:DROPBOX:hash marker:option<str>
+      dir:fd p:^ u:n :}
+   actual want SAME-CONTENT? 0= if false exit then
+   f marker p u MARKED? 0= if false exit then
+   f p u s" sync verified stage" SYNC-FILE
+   dir p u s" sync verified stage entry" SYNC-DIRECTORY
+   true ;
+
+\ An entry at the stage's name is reused or kept; it closes the file.
+: EXISTING-STAGE
+   ( hashed DROPBOX:hash option<str> fd ^u8 n -- stage-write )
+   {: h:hashed want:DROPBOX:hash marker:option<str> dir:fd p:^ u:n :}
+   h HASHED-UNMAKE {: f:fd actual:DROPBOX:hash print:MODEL:fingerprint :}
+   false f
+   [: drop f actual want marker dir p u REUSE-VERIFIED-STAGE ;] CLOSING
+   f DISCARD
+   if STAGE-WRITE-REUSED exit then
+   p u >str STAGE-WRITE-DESTINATION-OCCUPIED ;
+
+: MARK-STAGE ( fd option<str> ^u8 n -- )
+   {: f:fd marker:option<str> p:^ u:n :}
+   marker MATCH option
+      none OF ENDOF
+      some OF {: m:str :}
+         f DOWNLOAD-STAGE-XATTR m str> true p u
+         s" mark owned download stage" SET-XATTR
+      ENDOF
+   ;MATCH ;
+
+\ Names the file in dir; another entry already there is reused or kept.
+: LINK-STAGE
+   ( fd fd ^u8 n ^u8 n DROPBOX:hash option<str> ^u8 n ^ARENA:arena
+     -- stage-write )
+   {: f:fd dir:fd name:^ nu:n p:^ u:n want:DROPBOX:hash
+      marker:option<str> o:^ ou:n ar:^ARENA:arena :}
+   f dir name nu FS:TRY-LINK-AT if
+      dir p u s" sync staged file entry" SYNC-DIRECTORY
+      STAGE-WRITE-CREATED exit
+   then
+   FS:ERRNO FS:EEXIST <> if
+      s" install verified private stage" p u IO-FAILURE
+   then
+   dir name nu p u s" verify raced stage" ar OPEN-AND-HASH-IF-PRESENT
+   MATCH option
+      none OF o ou p u CHANGED ENDOF
+      some OF want marker dir p u EXISTING-STAGE ENDOF
+   ;MATCH ;
+
+\ Copies read's bytes into the unnamed file f and names it when they hash
+\ to want, marked, read-only and synced.
+: FILL-STAGE
+   ( fd fd ^u8 n ^u8 n DROPBOX:hash [ ^u8 n -- n ] option<str> ^u8 n
+     ^ARENA:arena -- stage-write )
+   {: f:fd dir:fd name:^ nu:n p:^ u:n want:DROPBOX:hash read
+      marker:option<str> o:^ ou:n ar:^ARENA:arena :}
+   read f p u o ou ar COPY-AND-HASH {: actual:DROPBOX:hash :}
+   actual want SAME-CONTENT? 0= if actual STAGE-WRITE-MISMATCH exit then
+   f marker p u MARK-STAGE
+   f p u s" make staged bytes immutable" READ-ONLY
+   f p u s" sync verified staged bytes" SYNC-FILE
+   f dir name nu p u want marker o ou ar LINK-STAGE ;
+
+: TEMP-FILE ( fd ^u8 n -- fd )
+   {: dir:fd p:^ u:n :}
+   -1 >FD [: drop dir FS:TEMP-AT ;]
+   [: s" create unnamed staging file" p u IO-FAILURE ;] FS-FAILS ;
+
+: WRITE-NEW-STAGE
+   ( fd ^u8 n ^u8 n DROPBOX:hash [ ^u8 n -- n ] option<str> ^u8 n
+     ^ARENA:arena -- stage-write )
+   {: dir:fd name:^ nu:n p:^ u:n want:DROPBOX:hash read
+      marker:option<str> o:^ ou:n ar:^ARENA:arena :}
+   dir p u TEMP-FILE {: f:fd :}
+   STAGE-WRITE-CREATED f
+   [: DROP-STAGE-WRITE
+      f dir name nu p u want read marker o ou ar FILL-STAGE ;]
+   CLOSING
+   f DISCARD ;
+
+\ Stages read's bytes at the name in dir when they hash to want; an
+\ entry already there is reused when it holds want and, given a marker,
+\ carries it, and is kept otherwise. o names the operation.
+: WRITE-VERIFIED-STAGE
+   ( fd ^u8 n ^u8 n DROPBOX:hash [ ^u8 n -- n ] option<str> ^u8 n
+     ^ARENA:arena -- stage-write )
+   {: dir:fd name:^ nu:n p:^ u:n want:DROPBOX:hash read
+      marker:option<str> o:^ ou:n ar:^ARENA:arena :}
+   dir name nu p u o ou ar OPEN-AND-HASH-IF-PRESENT MATCH option
+      none OF dir name nu p u want read marker o ou ar WRITE-NEW-STAGE
+      ENDOF
+      some OF want marker dir p u EXISTING-STAGE ENDOF
+   ;MATCH ;
+
+\ ---- owned download stages
+
+: OWNED? ( fd DROPBOX:hash DROPBOX:hash ^u8 n ^u8 n -- bool )
+   {: f:fd actual:DROPBOX:hash want:DROPBOX:hash m:^ mu:n p:^ u:n :}
+   actual want SAME-CONTENT? 0= if false exit then
+   f m mu p u READ-DOWNLOAD-MARKER EXPECTED? ;
+
+\ Makes the hashed file read-only and synced; answers its fingerprint.
+: SEAL-STAGE ( fd MODEL:fingerprint ^u8 n -- MODEL:fingerprint )
+   {: f:fd print:MODEL:fingerprint p:^ u:n :}
+   s" revalidate owned download stage" {: r:^ ru:n :}
+   s" make verified download stage immutable" {: m:^ mu:n :}
+   f p u r ru STAT-FD p u FILE-FINGERPRINT
+   print SAME-FINGERPRINT? 0= if r ru p u CHANGED then
+   f p u m mu READ-ONLY
+   f p u s" sync immutable download stage" SYNC-FILE
+   f p u s" inspect immutable download stage" STAT-FD
+   p u FILE-FINGERPRINT {: after:MODEL:fingerprint :}
+   print after SAME-HASHED-CONTENT 0= if m mu p u CHANGED then
+   after ;
+
+: INSPECT-HASHED
+   ( hashed ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- download-stage )
+   {: h:hashed p:^ u:n t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
+   h HASHED-UNMAKE {: f:fd actual:DROPBOX:hash print:MODEL:fingerprint :}
+   t tu want ar STAGE-MARKER {: m:^ mu:n :}
+   false f [: drop f actual want m mu p u OWNED? ;] CLOSING 0= if
+      f DISCARD p u >str DOWNLOAD-STAGE-DESTINATION-OCCUPIED exit
+   then
+   NO-FINGERPRINT f [: DROP-FINGERPRINT f print p u SEAL-STAGE ;] CLOSING
+   {: after:MODEL:fingerprint :}
+   f after VERIFIED-DOWNLOAD-STAGE-MAKE DOWNLOAD-STAGE-VERIFIED ;
+
+\ The stage at the name in dir for target's content want: none, an owned
+\ stage verified and left open, or another file, kept as it was.
+: INSPECT-DOWNLOAD-STAGE
+   ( fd ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- download-stage )
+   {: dir:fd name:^ nu:n p:^ u:n t:^ tu:n want:DROPBOX:hash
+      ar:^ARENA:arena :}
+   dir name nu p u s" verify owned download stage" ar
+   OPEN-AND-HASH-IF-PRESENT MATCH option
+      none OF DOWNLOAD-STAGE-MISSING ENDOF
+      some OF p u t tu want ar INSPECT-HASHED ENDOF
+   ;MATCH ;
+
+\ ---- changed guards
+
+: HOLDS? ( option<DROPBOX:hash> DROPBOX:hash -- bool )
+   {: o:option<DROPBOX:hash> c:DROPBOX:hash :}
+   o MATCH option
+      none OF false ENDOF
+      some OF c SAME-CONTENT? ENDOF
+   ;MATCH ;
+
+\ The conflict name holds the guard's bytes already: drops the guard.
+: DROP-DUPLICATE-GUARD
+   ( fd ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- )
+   {: dir:fd g:^ gu:n cn:^ cnu:n t:^ tu:n c:DROPBOX:hash
+      ar:^ARENA:arena :}
+   dir cn cnu t tu s" verify raced conflict destination" ar
+   HASH-AT-IF-PRESENT c HOLDS? 0= if
+      s" preserve raced local destination" t tu OCCUPIED
+   then
+   dir g gu FS:TRY-REMOVE-FILE-AT 0= if
+      s" remove duplicate raced local copy" t tu IO-FAILURE
+   then
+   dir t tu s" sync duplicate raced local cleanup" SYNC-DIRECTORY ;
+
+\ Renames the guard to target's local conflict name for content c.
+: PRESERVE-GUARD ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- )
+   {: dir:fd g:^ gu:n t:^ tu:n c:DROPBOX:hash ar:^ARENA:arena :}
+   s" preserve raced local destination" {: o:^ ou:n :}
+   t tu LOCAL-CONFLICT--SIDE:local c ar CONFLICT-NAME {: cn:^ cnu:n :}
+   dir g gu dir cn cnu FS:TRY-RENAME-NEW-AT if
+      dir t tu s" sync preserved raced local destination" SYNC-DIRECTORY
+      exit
+   then
+   FS:ERRNO FS:EEXIST <> if o ou t tu IO-FAILURE then
+   dir g gu cn cnu t tu c ar DROP-DUPLICATE-GUARD ;
+
+\ Puts the guard back at target_name; when an entry raced in there, keeps
+\ the guard's bytes, whose hash is actual, under a local conflict name.
+: RESTORE-OR-PRESERVE-CHANGED-GUARD
+   ( fd ^u8 n ^u8 n ^u8 n option<DROPBOX:hash> ^ARENA:arena -- )
+   {: dir:fd g:^ gu:n tn:^ tnu:n t:^ tu:n actual:option<DROPBOX:hash>
+      ar:^ARENA:arena :}
+   s" restore changed local destination" {: o:^ ou:n :}
+   dir g gu dir tn tnu FS:TRY-RENAME-NEW-AT if
+      dir t tu o ou SYNC-DIRECTORY exit
+   then
+   FS:ERRNO FS:EEXIST <> if o ou t tu IO-FAILURE then
+   actual MATCH option
+      none OF s" preserve raced local destination" t tu CHANGED ENDOF
+      some OF {: c:DROPBOX:hash :} dir g gu t tu c ar PRESERVE-GUARD ENDOF
+   ;MATCH ;
 
 ;package

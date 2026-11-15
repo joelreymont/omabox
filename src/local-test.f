@@ -1,9 +1,10 @@
-\ local-test.f - LOCAL's shared words: local.rs's tests that an entry's
-\ existence below the root never follows a symlink and takes a failed probe
-\ as unconfirmed, that the content hash composes block hashes, and the
-\ hashing half of its test that the hash does not depend on how a reader
-\ fragments the bytes. The case that makes files works in its own
-\ directory under TMPDIR and removes it.
+\ local-test.f - LOCAL's shared words and download stages: local.rs's tests
+\ that an entry's existence below the root never follows a symlink and
+\ takes a failed probe as unconfirmed, that the content hash composes block
+\ hashes, and that neither the hash nor a stage's copy depends on how a
+\ reader fragments the bytes; then each stage outcome, each inspected
+\ download stage, and a stage marker set, read and removed. A case that
+\ makes files works in its own directory under TMPDIR and removes it.
 \ Run from the repository root: hb --load src/local-test.f </dev/null
 require src/lib/test.f
 require src/lib/fmt.f
@@ -13,13 +14,52 @@ require src/lib/property.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
 require src/lib/fd.f
+require src/lib/adt/option.f
 require src/dropbox.f
 require src/local.f
 
-\ LOCAL reopened for the stream a fragmenting reader feeds.
+\ LOCAL reopened for the stream a fragmenting reader feeds, its stage
+\ words, and the names of its private results' variants.
 package LOCAL
+private
+
+\ The variant's name; a verified stage's descriptor is closed.
+: DOWNLOAD-STAGE$ ( download-stage -- ^u8 n )
+   MATCH download-stage
+      missing OF s" missing" ENDOF
+      verified OF VERIFIED-DOWNLOAD-STAGE-UNMAKE
+         {: f:fd print:MODEL:fingerprint :} f DISCARD s" verified"
+      ENDOF
+      destination-occupied OF {: p:str :} s" destination-occupied" ENDOF
+   ;MATCH ;
+
+: INSPECTED$
+   ( fd ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- ^u8 n )
+   INSPECT-DOWNLOAD-STAGE DOWNLOAD-STAGE$ ;
+
+: MARKER$ ( fd ^u8 n ^u8 n -- ^u8 n )
+   READ-DOWNLOAD-MARKER MATCH download-marker
+      missing OF s" missing" ENDOF
+      expected OF s" expected" ENDOF
+      other OF s" other" ENDOF
+   ;MATCH ;
+
+\ WRITE-VERIFIED-STAGE's result as its caller sees it, the stage 0.
+: WRITE-STAGE-OUTCOME
+   ( fd ^u8 n ^u8 n DROPBOX:hash [ ^u8 n -- n ] option<str> ^u8 n
+     ^ARENA:arena -- stage-outcome<n> )
+   WRITE-VERIFIED-STAGE [: 0 ;] MAP-STAGE-WRITE ;
+
 public
 EXPORT HASH-STREAM
+EXPORT COPY-AND-HASH
+EXPORT DOWNLOAD-STAGE-XATTR
+EXPORT STAGE-MARKER
+EXPORT SET-XATTR
+EXPORT REMOVE-XATTR
+EXPORT MARKER$
+EXPORT INSPECTED$
+EXPORT WRITE-STAGE-OUTCOME
 ;package
 
 package LOCAL-TEST
@@ -46,6 +86,13 @@ FS:PATHZ-CAP BUFFER: JOINED
 : CASE-DIR ( -- )
    s" local-test" FS:MKTEMP-DIR {: p:^ u:n :}
    p ROOT-BUF u BYTE-COPY u ROOT-U ! ;
+
+\ Runs q on the case directory's fd, then removes the directory.
+: IN-CASE-DIR ( [ fd -- ] -- )
+   {: q :}
+   CASE-DIR ROOT$ s" open test root" LOCAL:OPEN-ROOT {: root:fd :}
+   [: root q execute ;]
+   [: root FS:CLOSE-DIR ROOT$ FS:REMOVE-TREE ;] finally ;
 
 : ENTRY-TREE ( -- )
    s" dir" AT FS:MAKE-DIR
@@ -184,31 +231,188 @@ SHA256-CTX-BYTES BUFFER: PART
    count 0 ?do 131072 PROP:RND% 1+ i PUT loop
    count FRAGMENT-COUNT ! ;
 
+1 BUFFER: ONE
+
+: FULL? ( FD:fill -- bool )
+   MATCH FD:fill
+      full OF true ENDOF
+      eof OF {: k:n :} false ENDOF
+   ;MATCH ;
+
+\ What COPY-AND-HASH gives an unnamed file in dir from the fragments.
+: COPY ( fd -- ^u8 n fd )
+   {: dir:fd :}
+   dir FS:TEMP-AT {: f:fd :}
+   [: FRAGMENT ;] f s" fragmented-download"
+   s" test fragmented download copy" AR @ LOCAL:COPY-AND-HASH
+   DROPBOX:HASH>STR str> f ;
+
+\ The file's bytes from its start fill back, and nothing follows them.
+: READ-BACK ( fd ^u8 n -- )
+   {: f:fd back:^ u:n :}
+   f 0 FD:SEEK
+   f back u SPAN:MAKE FD:READ-EXACT FULL? TTRUE
+   f ONE 1 SPAN:MAKE FD:READ-EXACT FULL? TFALSE ;
+
+\ The bytes copied hash as want and read back as they were.
+: COPIED ( ^u8 n ^u8 n fd ^u8 -- )
+   {: bytes:^ u:n want:^ wu:n dir:fd back:^ :}
+   bytes u START
+   dir COPY {: c:^ cu:n f:fd :}
+   [: c cu want wu T$= f back u READ-BACK bytes u back u STR= TTRUE ;]
+   [: f FS:CLOSE-DIR ;] finally ;
+
 \ Case i takes length arm i mod 9 and schedule arm i mod 3.
-: FRAGMENTED ( ^u8 n -- )
-   {: bytes:^ i:n :}
+: FRAGMENTED ( ^u8 ^u8 fd n -- )
+   {: bytes:^ back:^ dir:fd i:n :}
    i 9 mod LENGTH {: u:n :}
    i 3 mod SCHEDULE
    bytes u 256 PROP:RND% PATTERNED
    bytes u REFERENCE {: want:^ wu:n :}
    bytes u START
    [: FRAGMENT ;] AR @ LOCAL:HASH-STREAM DROPBOX:HASH>STR str>
-   want wu T$= ;
+   want wu T$=
+   bytes u want wu dir back COPIED ;
 
-\ The hashing half of local.rs's property; its copy half waits for
-\ copy_and_hash. Twelve cases, as proptest's, from a fixed seed.
+: FRAGMENT-CASES ( fd ^u8 ^u8 -- )
+   {: dir:fd bytes:^ back:^ :}
+   12 0 ?do bytes back dir i FRAGMENTED loop ;
+
+\ Twelve cases, as proptest's, from a fixed seed.
 : DROPBOX-HASH-AND-COPY-ARE-INDEPENDENT-OF-READER-FRAGMENTATION ( -- )
    s" dropbox_hash_and_copy_are_independent_of_reader_fragmentation" T-LABEL
    1 PROP:SEED!
-   BLOCK 2 * 1+ MEM:BYTES-ALLOC-LEN MEM:ALLOC-BYTES
-   {: bytes:^ cap:NUM:alloc-byte-len :}
-   [: 12 0 ?do bytes i FRAGMENTED loop ;]
-   [: bytes cap MEM:RELEASE-BYTES ;] finally ;
+   BLOCK 2 * 1+ MEM:BYTES-ALLOC-LEN {: len:NUM:alloc-byte-len :}
+   len MEM:ALLOC-BYTES {: bytes:^ cap:NUM:alloc-byte-len :}
+   len MEM:ALLOC-BYTES {: back:^ cap2:NUM:alloc-byte-len :}
+   [: [: bytes back FRAGMENT-CASES ;] IN-CASE-DIR ;]
+   [: bytes cap MEM:RELEASE-BYTES back cap2 MEM:RELEASE-BYTES ;]
+   finally ;
+
+\ ---- download stages
+
+: HASH-OF ( ^u8 n -- DROPBOX:hash ) IDENTITY >str DROPBOX:>HASH ;
+: TARGET ( -- ^u8 n ) s" target.txt" ;
+: WANT ( -- DROPBOX:hash ) s" remote" HASH-OF ;
+: MARKER ( -- ^u8 n ) TARGET WANT AR @ LOCAL:STAGE-MARKER ;
+
+: PUT-FILE ( ^u8 n ^u8 n -- )
+   {: name:^ nu:n b:^ bu:n :}
+   name nu AT b bu FS:WRITE-ALL ;
+
+: OPEN-AT ( fd ^u8 n -- fd )
+   FS:TRY-OPEN-READ-AT MATCH option
+      none OF E-FS-OPEN throw ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+: MARK ( fd ^u8 n -- )
+   {: f:fd p:^ u:n :}
+   f LOCAL:DOWNLOAD-STAGE-XATTR MARKER true p u s" test mark"
+   LOCAL:SET-XATTR ;
+
+\ The Rust daemon's marker for target.txt holding "remote".
+: MARKER-IS-RUSTS ( -- )
+   s" stage marker is the Rust daemon's" T-LABEL
+   MARKER
+   s" .omabox-download-marker-v1-650b14d6787578d77de1e8b7f15a0de414baf0aa96888b334fb9a1b1dd9fe93a"
+   T$= ;
+
+: UNMARK ( fd -- )
+   LOCAL:DOWNLOAD-STAGE-XATTR s" marked" s" test unmark"
+   LOCAL:REMOVE-XATTR ;
+
+: MARKER-CHECKS ( fd -- )
+   {: f:fd :}
+   f s" marked" MARK
+   f MARKER s" marked" LOCAL:MARKER$ s" expected" T$=
+   f s" other" s" marked" LOCAL:MARKER$ s" other" T$=
+   [: f s" marked" MARK ;] LOCAL:E-IO TTHROWSQ
+   FS:ERRNO FS:EEXIST T=
+   f UNMARK
+   f MARKER s" marked" LOCAL:MARKER$ s" missing" T$=
+   f UNMARK ;
+
+: MARKER-ROUND-TRIP ( fd -- )
+   {: root:fd :}
+   s" marked" s" remote" PUT-FILE
+   root s" marked" OPEN-AT {: f:fd :}
+   [: f MARKER-CHECKS ;] [: f FS:CLOSE-DIR ;] finally ;
+
+: STAGE-MARKER-IS-SET-READ-AND-REMOVED ( -- )
+   s" stage marker is set, read and removed" T-LABEL
+   [: MARKER-ROUND-TRIP ;] IN-CASE-DIR ;
+
+: INSPECTED ( fd ^u8 n ^u8 n -- )
+   {: root:fd p:^ u:n want:^ wu:n :}
+   p u T-LABEL
+   root p u p u TARGET WANT AR @ LOCAL:INSPECTED$ want wu T$= ;
+
+: OWNED-STAGE ( fd -- )
+   {: root:fd :}
+   s" owned" s" remote" PUT-FILE
+   root s" owned" OPEN-AT {: f:fd :}
+   [: f s" owned" MARK ;] [: f FS:CLOSE-DIR ;] finally ;
+
+: INSPECT-CASES ( fd -- )
+   {: root:fd :}
+   s" foreign" s" mutant" PUT-FILE
+   s" unmarked" s" remote" PUT-FILE
+   root OWNED-STAGE
+   root s" absent" s" missing" INSPECTED
+   root s" foreign" s" destination-occupied" INSPECTED
+   root s" unmarked" s" destination-occupied" INSPECTED
+   root s" owned" s" verified" INSPECTED ;
+
+: EACH-DOWNLOAD-STAGE-IS-INSPECTED ( -- )
+   s" each download stage is inspected" T-LABEL
+   [: INSPECT-CASES ;] IN-CASE-DIR ;
+
+\ The outcome's variant, and its actual hash or path, else empty.
+: OUTCOME$ ( LOCAL:stage-outcome<n> -- ^u8 n ^u8 n )
+   MATCH LOCAL:stage-outcome
+      staged OF drop s" staged" s" " ENDOF
+      already-staged OF drop s" already-staged" s" " ENDOF
+      content-changed OF {: c:DROPBOX:hash :}
+         s" content-changed" c DROPBOX:HASH>STR str>
+      ENDOF
+      destination-occupied OF {: p:str :}
+         s" destination-occupied" p str>
+      ENDOF
+   ;MATCH ;
+
+\ Stages bytes at name, marked as target's owned download of "remote".
+: STAGED ( fd ^u8 n ^u8 n -- ^u8 n ^u8 n )
+   {: root:fd name:^ nu:n b:^ bu:n :}
+   name nu T-LABEL
+   b bu START 0 SCHEDULE
+   root name nu name nu WANT [: FRAGMENT ;] MARKER >str OPTION:SOME
+   s" test stage" AR @ LOCAL:WRITE-STAGE-OUTCOME OUTCOME$ ;
+
+: STAGE-CASES ( fd -- )
+   {: root:fd :}
+   root s" fresh" s" remote" STAGED s" " T$= s" staged" T$=
+   root s" fresh" s" remote" STAGED s" " T$= s" already-staged" T$=
+   root s" fresh" s" verified" INSPECTED
+   root s" changed" s" mutant" STAGED
+   s" mutant" IDENTITY T$= s" content-changed" T$=
+   root s" changed" LOCAL:ENTRY-EXISTS-AT TFALSE
+   s" foreign" s" mutant" PUT-FILE
+   root s" foreign" s" remote" STAGED
+   s" foreign" T$= s" destination-occupied" T$= ;
+
+: EACH-STAGE-OUTCOME-IS-REACHED ( -- )
+   s" each stage outcome is reached" T-LABEL
+   [: STAGE-CASES ;] IN-CASE-DIR ;
 
 : CASES ( -- )
    ENTRY-EXISTENCE-NEVER-FOLLOWS-SYMLINKS-AND-TREATS-PROBE-FAILURES-AS-UNCONFIRMED
    DROPBOX-HASH-USES-BLOCK-HASH-COMPOSITION
-   DROPBOX-HASH-AND-COPY-ARE-INDEPENDENT-OF-READER-FRAGMENTATION ;
+   DROPBOX-HASH-AND-COPY-ARE-INDEPENDENT-OF-READER-FRAGMENTATION
+   MARKER-IS-RUSTS
+   STAGE-MARKER-IS-SET-READ-AND-REMOVED
+   EACH-DOWNLOAD-STAGE-IS-INSPECTED
+   EACH-STAGE-OUTCOME-IS-REACHED ;
 
 public
 
