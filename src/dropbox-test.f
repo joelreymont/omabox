@@ -250,6 +250,21 @@ TYPED-VARIABLE MAIN ptr DROPBOX:client
    TEST-DROPBOX:TYPE-SENT$ s" application/json" T$= ;
 
 
+\ FILE! keeps a path that lives in the string builder, which it leaves as
+\ it was.
+: BUILT-PATH-CASE ( -- )
+   s" metadata of a built path" T-LABEL
+   TEST-DROPBOX:RESET
+   SB-RESET s" /docs/built.txt" SB-APPEND
+   SB$ s" /Docs/Built.txt" s" 015f0c1d2e3b"
+   s" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+   0 TEST-DROPBOX:FILE!
+   SB$ s" /docs/built.txt" T$=
+   s" /docs/built.txt" MAIN @ DROPBOX:METADATA DONE? ASSERT
+   MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:LOWER @ SPAN:$
+   s" /docs/built.txt" T$= ;
+
+
 : MISSING-CASE ( -- )
    s" metadata not found" T-LABEL
    TEST-DROPBOX:RESET
@@ -301,7 +316,9 @@ TYPED-VARIABLE MAIN ptr DROPBOX:client
    TEST-DROPBOX:REVOKE
    MAIN @ DROPBOX:ACCOUNT UNLINKED? ASSERT
    TEST-DROPBOX:SEEN$
-   s" /2/users/get_current_account /oauth2/token /2/users/get_current_account" T$= ;
+   s" /2/users/get_current_account /oauth2/token /2/users/get_current_account" T$=
+   SB-RESET s" Bearer " SB-APPEND TEST-DROPBOX:ISSUED$ SB-APPEND
+   TEST-DROPBOX:AUTH$ SB$ T$= ;
 
 
 : DENIED-CASE ( -- )
@@ -314,30 +331,16 @@ TYPED-VARIABLE MAIN ptr DROPBOX:client
    TEST-DROPBOX:SEEN$ s" /2/users/get_current_account" T$= ;
 
 
-: EXPIRED! ( -- )
-   401 s" " s" "
-   S\" {\qerror_summary\q:\qexpired_access_token/...\q,\qerror\q:{\q.tag\q:\qexpired_access_token\q}}"
-   TEST-DROPBOX:SCRIPT! ;
-
-
-\ Its own client, as the refresh it is scripted keeps a token the fake
-\ never issued.
-: REFUSED-AGAIN-CASE ( -- )
-   s" refreshed token refused" T-LABEL
+\ A client that holds no access token refreshes first; the answer
+\ scripted before the call passes the token request by.
+: SCRIPTED-REFRESH-CASE ( -- )
+   s" scripted answer after a refresh" T-LABEL
    TEST-DROPBOX:RESET
-   s" live-token" s" ns-root" OPENED {: again :}
-   again DROPBOX:ACCOUNT DONE? ASSERT
-   TEST-DROPBOX:RESET
-   EXPIRED!
-   200 s" " s" "
-   S\" {\qaccess_token\q:\qsl.fake-scripted\q,\qtoken_type\q:\qbearer\q,\qexpires_in\q:14400}"
-   TEST-DROPBOX:SCRIPT!
-   EXPIRED!
-   again DROPBOX:ACCOUNT UNLINKED? ASSERT
-   TEST-DROPBOX:SEEN$
-   s" /2/users/get_current_account /oauth2/token /2/users/get_current_account" T$=
-   TEST-DROPBOX:AUTH$ s" Bearer sl.fake-scripted" T$=
-   again DROPBOX:CLOSE ;
+   s" live-token" s" ns-root" OPENED {: fresh :}
+   503 s" " s" " s" " TEST-DROPBOX:SCRIPT!
+   fresh DROPBOX:ACCOUNT RETRY-MS 0 T=
+   TEST-DROPBOX:SEEN$ s" /oauth2/token /2/users/get_current_account" T$=
+   fresh DROPBOX:CLOSE ;
 
 
 : RATE-CASE ( -- )
@@ -1485,16 +1488,11 @@ TYPED-VARIABLE FAULT fault
    CHUNK 1+ UP DROPBOX-UPLOAD:SIZE ! ;
 
 
-\ FAULTED's expected calls would not survive: the fake builds a FILE!'s
-\ metadata in the same string buffer.
 : APPLIED-FINISH-CASE ( -- )
    s" finish gone, already applied" T-LABEL
-   CHUNK 1+ construct fault applied 1 STRUCK DONE? ASSERT
-   ENTRY-HASH$ EXPECTED$ T$=
-   MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:SIZE @ CHUNK 1+ T=
    SB-RESET S-START S-APPEND S-APPEND S-FINISH
    s"  /2/files/get_metadata" SB-APPEND
-   TEST-DROPBOX:SEEN$ SB$ T$= ;
+   CHUNK 1+ construct fault applied FAULTED ;
 
 
 : UNFOUND-FINISH-CASE ( -- )
@@ -1519,8 +1517,9 @@ TYPED-VARIABLE FAULT fault
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
    s" ns-root" TEST-DROPBOX:ROOT!
    s" live-token" s" ns-root" OPENED MAIN !
-   ACCOUNT-CASE FILE-CASE MISSING-CASE ROOT-CASE LOST-READ-CASE EXPIRED-CASE
-   UNLINKED-CASE REVOKED-CASE DENIED-CASE REFUSED-AGAIN-CASE
+   ACCOUNT-CASE FILE-CASE BUILT-PATH-CASE MISSING-CASE ROOT-CASE
+   LOST-READ-CASE EXPIRED-CASE
+   UNLINKED-CASE REVOKED-CASE DENIED-CASE SCRIPTED-REFRESH-CASE
    RATE-CASE BUSY-CASE REDIRECT-CASE BAD-REQUEST-CASE
    CLASSIFY-CASES
    PAGES-CASE RESET-CASE STALL-CASE UNTAGGED-CASE POLL-CASE POLL-RESET-CASE

@@ -12,9 +12,9 @@
 \ line that is not HTTP. REVOKE refuses every access token, issued or yet to
 \ be, as invalid until RESET; the refresh still issues them. A call must
 \ carry the Path-Root ROOT! expects, none when that is empty, else it answers
-\ 422. Scripted answers go out in order before any route's own. It records
-\ each request's path, and the last API call's Authorization, Path-Root and
-\ Content-Type.
+\ 422. Scripted answers go out in order, each before its route's own, to API
+\ calls only: a token request leaves them queued. It records each request's
+\ path, and the last API call's Authorization, Path-Root and Content-Type.
 \ STORAGE CLASS. PROCESS-WIDE: one worker serves every request, so its handler
 \ alone writes the state while a test waits on its call, and the test sets it
 \ between calls. A body stays in its buffer, as HTTP:BODY! borrows it, until
@@ -176,9 +176,13 @@ TYPED-VARIABLE TOKEN-CUTTING bool
    q s" Content-Type" TYPE-SENT NAME-CAP SENT TYPED ! TYPE-SENT-U ! ;
 
 
-\ Sends the next scripted answer, if one is left.
-: SCRIPTED? ( HTTP:response -- bool )
-   {: a:HTTP:response :}
+: API? ( HTTP:request -- bool ) HTTP:PATH$ s" /oauth2/token" STR= 0= ;
+
+
+\ Sends an API call the next scripted answer, if one is left.
+: SCRIPTED? ( HTTP:request HTTP:response -- bool )
+   {: q:HTTP:request a:HTTP:response :}
+   q API? 0= if false exit then
    SCRIPTED @ SCRIPTS @ >= if false exit then
    SCRIPTED @ {: i:n :}
    1 SCRIPTED +!
@@ -452,15 +456,21 @@ variable HELD-U
    last FOLDERS @ i FOLDERS ! ;
 
 
+\ Appends a span to entry i in its slot, so no argument shares a buffer
+\ with it.
+: ENTRY+ ( ptr u8 n n -- )
+   {: a:ptr u:n i:n :}
+   a u i ENTRY$ + TEXT-CAP i ENTRY-US @ - STORE i ENTRY-US +! ;
+
+
 \ A folder at the path, which serves as path_lower and path_display.
 : FOLDER+ ( ptr u8 n -- )
    {: p:ptr pu:n :}
    FILES @ {: i:n :}
    p pu PATHS PATH-CAP i AT STORE i PATH-US !
-   SB-RESET S\" {\qname\q:\qa\q,\qid\q:\qid:a\q" SB-APPEND
-   S\" ,\qpath_lower\q:\q" SB-APPEND p pu SB-APPEND
-   S\" \q,\qpath_display\q:\q" SB-APPEND p pu SB-APPEND S\" \q}" SB-APPEND
-   SB$ ENTRIES TEXT-CAP i AT STORE i ENTRY-US !
+   0 i ENTRY-US ! S\" {\qname\q:\qa\q,\qid\q:\qid:a\q" i ENTRY+
+   S\" ,\qpath_lower\q:\q" i ENTRY+ p pu i ENTRY+
+   S\" \q,\qpath_display\q:\q" i ENTRY+ p pu i ENTRY+ S\" \q}" i ENTRY+
    true i FOLDERS !
    1 FILES +! ;
 
@@ -531,9 +541,6 @@ variable HELD-U
    conn TCP4:CLOSE CLOSED ;
 
 
-: API? ( HTTP:request -- bool ) HTTP:PATH$ s" /oauth2/token" STR= 0= ;
-
-
 \ After LOSE, an API call's route runs and takes effect, then its answer is
 \ severed.
 : LOSE? ( HTTP:request -- )
@@ -582,31 +589,30 @@ variable HELD-U
 : SERVE ( HTTP:request HTTP:response [ HTTP:request HTTP:response -- ] -- )
    {: q:HTTP:request a:HTTP:response route :}
    q RECORD
-   a SCRIPTED? if exit then
+   q a SCRIPTED? if exit then
    q CUT? if exit then
    q GARBLED? if exit then
    q a route execute
    q LOSE? ;
 
-\ A file's FileMetadata after its `{`: path_lower, path_display, rev,
-\ content_hash and size.
-: FIELDS+ ( ptr u8 n ptr u8 n ptr u8 n ptr u8 n n -- )
-   {: l:ptr lu:n d:ptr du:n r:ptr ru:n h:ptr hu:n size:n :}
-   S\" \qname\q:\qa\q,\qid\q:\qid:a\q,\qpath_lower\q:\q" SB-APPEND
-   l lu SB-APPEND S\" \q,\qpath_display\q:\q" SB-APPEND d du SB-APPEND
-   S\" \q,\qrev\q:\q" SB-APPEND r ru SB-APPEND
-   S\" \q,\qsize\q:" SB-APPEND size FMT:SB-INT
-   S\" ,\qcontent_hash\q:\q" SB-APPEND h hu SB-APPEND
-   S\" \q,\qis_downloadable\q:true}" SB-APPEND ;
+\ A file's FileMetadata after its `{`, appended to entry i: path_lower,
+\ path_display, rev, content_hash and size.
+: FIELDS+ ( ptr u8 n ptr u8 n ptr u8 n ptr u8 n n n -- )
+   {: l:ptr lu:n d:ptr du:n r:ptr ru:n h:ptr hu:n size:n i:n :}
+   S\" \qname\q:\qa\q,\qid\q:\qid:a\q,\qpath_lower\q:\q" i ENTRY+
+   l lu i ENTRY+ S\" \q,\qpath_display\q:\q" i ENTRY+ d du i ENTRY+
+   S\" \q,\qrev\q:\q" i ENTRY+ r ru i ENTRY+
+   S\" \q,\qsize\q:" i ENTRY+ size FMT:INT$ i ENTRY+
+   S\" ,\qcontent_hash\q:\q" i ENTRY+ h hu i ENTRY+
+   S\" \q,\qis_downloadable\q:true}" i ENTRY+ ;
 
 
 \ The file get_metadata finds in slot i.
 : FILE-AT! ( ptr u8 n ptr u8 n ptr u8 n ptr u8 n n n -- )
    {: l:ptr lu:n d:ptr du:n r:ptr ru:n h:ptr hu:n size:n i:n :}
    l lu PATHS PATH-CAP i AT STORE i PATH-US !
-   SB-RESET s" {" SB-APPEND
-   l lu d du r ru h hu size FIELDS+
-   SB$ ENTRIES TEXT-CAP i AT STORE i ENTRY-US !
+   0 i ENTRY-US ! s" {" i ENTRY+
+   l lu d du r ru h hu size i FIELDS+
    false i FOLDERS ! ;
 
 
@@ -1170,8 +1176,8 @@ $2100000 constant UPLOAD-CAP
    FILES @ FILE-AT! 1 FILES +! ;
 
 
-\ An answer sent before any route's own: status, one header (an empty name
-\ for none) and a body.
+\ An answer an API call gets before its route's own: status, one header
+\ (an empty name for none) and a body. A token request leaves it queued.
 : SCRIPT! ( n ptr u8 n ptr u8 n ptr u8 n -- )
    {: s:n nm:ptr nu:n v:ptr vu:n b:ptr bu:n :}
    SCRIPTS @ {: i:n :}
@@ -1186,6 +1192,8 @@ $2100000 constant UPLOAD-CAP
 : SEEN$ ( -- ptr u8 n ) SEEN SEEN-U @ ;
 \ The last API call's Authorization value.
 : AUTH$ ( -- ptr u8 n ) AUTH AUTH-U @ ;
+\ The access token the fake issued last.
+: ISSUED$ ( -- ptr u8 n ) ISSUED ISSUED-U @ ;
 \ The last API call's Path-Root value, and whether it sent one.
 : ROOT-SENT$ ( -- ptr u8 n ) ROOT-SENT ROOT-SENT-U @ ;
 : ROOT-SENT? ( -- bool ) ROOTED @ ;
