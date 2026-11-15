@@ -61,12 +61,13 @@ watcher comes only for a measured need.
 
 - **Journal.** Opens schema 8, or creates it from `migrations/`; refuses 1 to
   7. Schema 8 is frozen while the Rust upload-session work stays parked.
-- **Values.** `MODEL` holds types, equality and JSON, no state. A display
-  path and its Dropbox identity, `FOLD`'s answer, are `DEFTYPE`s over `str`; the hash, revision
-  and cursor roles are `DROPBOX`'s. A value travels by value; its strings are
-  borrowed, and a reader copies them into the arena the caller passes, one per
-  pass. Each stored column type has a writer and a reader of serde's bytes; a
-  stored value this version cannot read throws `MODEL:E-STORED`.
+- **Values.** `MODEL` holds types, equality and JSON, no state. A display path
+  and its Dropbox identity, `FOLD`'s answer, are `DEFTYPE`s over `str`; the
+  hash, revision and cursor roles are `DROPBOX`'s. A value travels by value;
+  its strings are borrowed, and a reader copies them into the arena the caller
+  passes, one per pass. Each stored column type has a writer and a reader of
+  serde's bytes; a stored value this version cannot read throws
+  `MODEL:E-STORED`.
 - **Decisions.** A no-op carries only its baseline, a block is unknown or
   occupied, and an operating decision carries one operation: production reads
   no more (`src/reconcile.rs:1085-1300`). `PLAN` is a nested `MATCH`, its
