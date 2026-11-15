@@ -1,14 +1,16 @@
-\ journal-test.f - JOURNAL's open, schema 8 and bindings on journals under
-\ TMPDIR: a new journal's sqlite_master and user_version against
-\ src/oracle/schema.tsv as a set; versions 1, 7 and 9 refused unchanged;
-\ src/oracle/journal.sqlite3, copied and opened, giving journal.tsv's
-\ Dropbox and local root bindings; and twelve tests of the Rust version
-\ (rust src/journal.rs) under their names. Habu opens no schema-6 file, so
-\ the version-six tests start from a schema-8 journal holding the row
-\ migration 7 leaves for a schema-6 root, birth and subvolume NULL, and
-\ one baseline row; their inventory and conflict halves wait for the words
-\ that write those. Each case removes its directory; a refusal's log line
-\ is captured in it, checked and removed.
+\ journal-test.f - JOURNAL's open, schema 8, bindings, baselines and plans
+\ on journals under TMPDIR: a new journal's sqlite_master and user_version
+\ against src/oracle/schema.tsv as a set; versions 1, 7 and 9 refused
+\ unchanged; src/oracle/journal.sqlite3, copied and opened, giving
+\ journal.tsv's Dropbox and local root bindings, baselines and baseline
+\ paths; and nineteen tests of the Rust version (rust src/journal.rs)
+\ under their names, which build each decision the Rust ones ask the
+\ planner for as src/oracle/plan.tsv holds it. Habu opens no schema-6
+\ file, so the version-six tests start from a schema-8 journal holding the
+\ row migration 7 leaves for a schema-6 root, birth and subvolume NULL,
+\ and one baseline row; their inventory and conflict halves wait for the
+\ words that write those. Each case removes its directory; a refusal's
+\ log line is captured in it, checked and removed.
 \ Run from the repository root: hb --load src/journal-test.f </dev/null
 require src/lib/arena.f
 require src/lib/string.f
@@ -20,6 +22,8 @@ require src/lib/fs-mutate.f
 require src/lib/fs-anchored.f
 require src/lib/fs-statx.f
 require src/lib/sqlite.f
+require src/lib/vector.f
+require src/model.f
 require src/journal.f
 
 \ JOURNAL reopened: a case reads the journal's connection, its rows and
@@ -560,6 +564,414 @@ TYPED-VARIABLE SUBJECT str
    d GONE ;
 
 
+\ ---- baselines and plans -----------------------------------------
+
+TYPED-VARIABLE HELD-JOURNAL journal
+TYPED-VARIABLE HELD-ARENA ^ARENA:arena
+TYPED-VARIABLE NOOPS ^VEC:vector<path-baseline>
+TYPED-VARIABLE PLANS ^VEC:vector<path-plan>
+
+: AT-PATH ( ^u8 n -- MODEL:path ) >str MODEL:>PATH ;
+
+: CANONICAL ( ^u8 n ^ARENA:arena -- MODEL:key )
+   {: a:^ u ar :}
+   a u AT-PATH ar MODEL:FOLD ;
+
+: CONTENT ( ^u8 n -- DROPBOX:hash ) >str DROPBOX:>HASH ;
+
+: REMOTE-FILE ( ^u8 n ^u8 n -- MODEL:remote )
+   {: c:^ cu r:^ ru :}
+   c cu CONTENT r ru >str DROPBOX:>REV MODEL-REMOTE:MAKE ;
+
+: PATH= ( MODEL:path MODEL:path -- bool )
+   PATH-BYTES {: b:^ bu :}
+   PATH-BYTES b bu STR= ;
+
+\ The planner's decisions for the Rust tests' plan() calls, built here
+\ as src/oracle/plan.tsv holds them. An upload: a new local file, no
+\ remote one, no baseline.
+: UPLOAD-DECISION ( ^u8 n -- MODEL:decision )
+   CONTENT MODEL-OPERATION:create-remote MODEL-DECISION:operate ;
+
+\ Both sides present with the remote file's content, whatever the
+\ baseline: the remote file becomes the baseline.
+: MATCH-DECISION ( MODEL:remote -- MODEL:decision )
+   MODEL-BASELINE:present MODEL-DECISION:noop ;
+
+\ Both sides confirmed absent.
+: ABSENT-DECISION ( -- MODEL:decision )
+   MODEL-BASELINE:absent MODEL-DECISION:noop ;
+
+\ A directory on both sides and in the baseline.
+: DIRECTORY-DECISION ( -- MODEL:decision )
+   MODEL-BASELINE:directory MODEL-DECISION:noop ;
+
+: TEST-PATH ( -- str ) s" test" >str ;
+
+: ONE-PLAN ( MODEL:operation ^ARENA:arena -- operation-plan )
+   {: o ar :}
+   ar [type] MODEL:operation NEW-VECTOR {: ops :}
+   o ops VEC:PUSH !
+   ops JOURNAL-OPERATION--PLAN:MAKE ;
+
+: NOT-OPERATIONS ( -- )
+   s" extract test operation plan" >str TEST-PATH
+   s" test expected planner operations" >str INVALID ;
+
+\ The Rust tests' operations(decision).
+: OPERATIONS ( MODEL:decision ^ARENA:arena -- operation-plan )
+   {: ar :}
+   MATCH MODEL:decision
+      operate OF ar ONE-PLAN ENDOF
+      noop OF drop NOT-OPERATIONS ENDOF
+      blocked OF drop NOT-OPERATIONS ENDOF
+      conflicted OF drop NOT-OPERATIONS ENDOF
+      collided OF drop NOT-OPERATIONS ENDOF
+   ;MATCH ;
+
+: NOT-NOOP ( -- )
+   s" extract test no-op" >str TEST-PATH
+   s" test expected a planner no-op" >str INVALID ;
+
+\ The Rust tests' noop(decision): the baseline it records.
+: NOOP ( MODEL:decision -- MODEL:baseline )
+   MATCH MODEL:decision
+      noop OF ENDOF
+      operate OF drop NOT-NOOP ENDOF
+      blocked OF drop NOT-NOOP ENDOF
+      conflicted OF drop NOT-NOOP ENDOF
+      collided OF drop NOT-NOOP ENDOF
+   ;MATCH ;
+
+\ The Rust tests' recorded_plan(write).
+: RECORDED-PLAN ( plan-write -- plan-record )
+   MATCH plan-write
+      recorded OF ENDOF
+      already-live OF
+         drop s" extract recorded test plan" >str TEST-PATH
+         s" test expected a newly recorded plan" >str INVALID
+      ENDOF
+   ;MATCH ;
+
+: NOOP-RECORDED? ( noop-write -- bool )
+   MATCH noop-write
+      recorded OF true ENDOF
+      live-plan OF drop false ENDOF
+   ;MATCH ;
+
+: OWNED-BY? ( noop-write plan-id -- bool )
+   {: id :}
+   MATCH noop-write
+      recorded OF false ENDOF
+      live-plan OF id ID= ENDOF
+   ;MATCH ;
+
+: NO-BASELINE? ( option<MODEL:baseline> -- bool )
+   MATCH option
+      none OF true ENDOF
+      some OF drop false ENDOF
+   ;MATCH ;
+
+: BASELINE-HELD? ( option<MODEL:baseline> MODEL:baseline -- bool )
+   {: want :}
+   MATCH option
+      none OF false ENDOF
+      some OF want MODEL:BASELINE= ENDOF
+   ;MATCH ;
+
+: STATUS-N ( record-status -- n )
+   MATCH record-status
+      pending OF 0 ENDOF
+      completed OF 1 ENDOF
+   ;MATCH ;
+
+: PENDING? ( plan-status -- bool )
+   MATCH plan-status
+      pending OF true ENDOF
+      blocked OF 2drop false ENDOF
+      completed OF false ENDOF
+   ;MATCH ;
+
+: PLANNED= ( planned-operation planned-operation -- bool )
+   JOURNAL-PLANNED--OPERATION:UNMAKE {: i o x s :}
+   JOURNAL-PLANNED--OPERATION:UNMAKE {: j p y t :}
+   i OPERATION-ID>N j OPERATION-ID>N = o p = and
+   x y MODEL:OPERATION= and s STATUS-N t STATUS-N = and ;
+
+: OPERATIONS= ( ^VEC:vector<planned-operation>
+     ^VEC:vector<planned-operation> -- bool )
+   {: a b :}
+   a VEC:COUNT b VEC:COUNT <> if false exit then
+   a VEC:COUNT 0 ?do
+      a i VEC:AT @ b i VEC:AT @ PLANNED= 0= if unloop false exit then
+   loop
+   true ;
+
+\ Two plans equal and both pending, as every plan these tests compare is.
+: PENDING-PLAN= ( plan-record plan-record -- bool )
+   JOURNAL-PLAN--RECORD:UNMAKE {: i p o s :}
+   JOURNAL-PLAN--RECORD:UNMAKE {: j q r t :}
+   i j ID= p q PATH= and o r OPERATIONS= and
+   s PENDING? and t PENDING? and ;
+
+: FIRST-OPERATION ( plan-record -- MODEL:operation )
+   >OPERATIONS 0 VEC:AT @ JOURNAL-PLANNED--OPERATION:UNMAKE
+   {: i o x s :} x ;
+
+: PATHS= ( ^VEC:vector<MODEL:path> ^VEC:vector<MODEL:path> -- bool )
+   {: a b :}
+   a VEC:COUNT b VEC:COUNT <> if false exit then
+   a VEC:COUNT 0 ?do
+      a i VEC:AT @ b i VEC:AT @ PATH= 0= if unloop false exit then
+   loop
+   true ;
+
+\ The paths' vector holds the two paths, in order.
+: TWO-PATHS? ( ^VEC:vector<MODEL:path> ^u8 n ^u8 n -- bool )
+   {: v a:^ au b:^ bu :}
+   v VEC:COUNT 2 <> if false exit then
+   v 0 VEC:AT @ a au AT-PATH PATH=
+   v 1 VEC:AT @ b bu AT-PATH PATH= and ;
+
+: ROWS-AT ( journal MODEL:path -- n )
+   {: j path :}
+   j >CONNECTION s" SELECT COUNT(*) FROM baselines WHERE path = ?1"
+   [: path PATH-BYTES 1 SQLITE:BIND-BLOB INT-ROW ;]
+   SQLITE:WITH-STATEMENT ;
+
+: AGREE ( journal ^u8 n ^u8 n ^u8 n ^ARENA:arena -- )
+   {: j p:^ pu c:^ cu r:^ ru ar :}
+   j p pu AT-PATH c cu r ru REMOTE-FILE MATCH-DECISION NOOP ar
+   RECORD-NOOP drop ;
+
+: DIRECTORY ( journal ^u8 n ^ARENA:arena -- )
+   {: j p:^ pu ar :}
+   j p pu AT-PATH DIRECTORY-DECISION NOOP ar RECORD-NOOP drop ;
+
+: RECONCILE ( -- )
+   HELD-JOURNAL @ NOOPS @ PLANS @ HELD-ARENA @ RECORD-RECONCILIATION
+   drop ;
+
+: EXISTS? ( MODEL:path -- bool ) drop true ;
+
+: PROBE-FAILS ( MODEL:path -- bool ) drop E-INVALID-STATE throw ;
+
+: NOT-GONE? ( MODEL:path -- bool ) s" Foo/gone.txt" AT-PATH PATH= 0= ;
+
+: RECORD-IS? ( MODEL:baseline-record ^u8 n ^u8 n ^ARENA:arena -- bool )
+   {: r k:^ ku p:^ pu ar :}
+   r MODEL-BASELINE--RECORD:UNMAKE {: key path b :}
+   key k ku ar CANONICAL MODEL:KEY= path p pu AT-PATH PATH= and ;
+
+
+\ ---- the oracle's baselines as the Rust version prints them ------
+
+: REMOTE-DEBUG ( MODEL:remote n -- n )
+   {: r at :}
+   r MODEL-REMOTE:UNMAKE {: c rev :}
+   s" RemoteFile { content: ContentIdentity(" at PUT
+   c DROPBOX:HASH>STR swap PUT-QUOTED
+   s" ), revision: DropboxRevision(" rot PUT
+   rev DROPBOX:REV>STR swap PUT-QUOTED
+   s" ) }" rot PUT ;
+
+: VALUE-DEBUG ( MODEL:baseline n -- n )
+   {: at :}
+   MATCH MODEL:baseline
+      absent OF s" Absent" at PUT ENDOF
+      present OF
+         {: r :} s" Present(" at PUT {: at2 :}
+         r at2 REMOTE-DEBUG s" )" rot PUT
+      ENDOF
+      directory OF s" Directory" at PUT ENDOF
+   ;MATCH ;
+
+: BASELINE-DEBUG ( option<MODEL:baseline> n -- n )
+   {: at :}
+   MATCH option
+      none OF s" None" at PUT ENDOF
+      some OF
+         {: b :} s" Some(" at PUT {: at2 :}
+         b at2 VALUE-DEBUG s" )" rot PUT
+      ENDOF
+   ;MATCH ;
+
+\ The line baseline(path) answers.
+: BASELINE-LINE ( journal ^u8 n ^ARENA:arena -- ^u8 n )
+   {: j a:^ u ar :}
+   s" baseline(" 0 PUT  a u rot PUT  s\" )\t" rot PUT {: at :}
+   j a u AT-PATH ar BASELINE at BASELINE-DEBUG {: v :}
+   WANT v ;
+
+: PATHS-LINE ( ^VEC:vector<MODEL:path> -- ^u8 n )
+   {: paths :}
+   s\" baseline_paths\t[" 0 PUT
+   paths VEC:COUNT 0 ?do
+      i 0<> if s" , " rot PUT then
+      paths i VEC:AT @ MODEL:PATH>STR swap PUT-QUOTED
+   loop
+   s" ]" rot PUT {: u :}
+   WANT u ;
+
+: ORACLE-JOURNAL-HOLDS-ITS-BASELINES ( ^ARENA:arena -- )
+   {: ar :}
+   s" the oracle journal's baselines are journal.tsv's" T-LABEL
+   s" src/oracle/journal.tsv" ORACLE
+   ar JOURNAL-AT {: d:str p:str :}
+   s" src/oracle/journal.sqlite3" p str> FS:COPY-FILE-STREAM
+   p OPEN-READ {: j :}
+   j s" Docs" ar BASELINE-LINE HELD? TTRUE
+   j s" Docs/A.txt" ar BASELINE-LINE HELD? TTRUE
+   j s" Old/Gone.txt" ar BASELINE-LINE HELD? TTRUE
+   j ar BASELINE-PATHS PATHS-LINE HELD? TTRUE
+   j CLOSE
+   d GONE ;
+
+
+\ ---- the Rust version's baseline and plan tests ------------------
+
+: JOURNAL-REOPEN-EXPOSES-INTENT-WITHOUT-ADVANCING-BASELINE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" journal_reopen_exposes_intent_without_advancing_baseline" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   s" notes/report.txt" AT-PATH {: path :}
+   s" new" CONTENT MODEL-OPERATION:create-remote {: operation :}
+   s" new" UPLOAD-DECISION ar OPERATIONS {: plan :}
+   p OPEN {: j :}
+   j path plan ar RECORD-PLAN RECORDED-PLAN {: recorded :}
+   j CLOSE
+   p OPEN {: k :}
+   k path ar BASELINE NO-BASELINE? TTRUE
+   recorded FIRST-OPERATION operation MODEL:OPERATION= TTRUE
+   k ar PENDING-PLANS {: pending :}
+   pending VEC:COUNT 1 T=
+   pending 0 VEC:AT @ recorded PENDING-PLAN= TTRUE
+   k CLOSE
+   d GONE ;
+
+\ The rejected plan's SQLite failure is logged once, with the trigger's
+\ text.
+: RECONCILIATION-DECISIONS-COMMIT-ATOMICALLY ( ^ARENA:arena -- )
+   {: ar :}
+   s" reconciliation_decisions_commit_atomically" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j >CONNECTION
+   s" CREATE TRIGGER reject_test_plan BEFORE INSERT ON plans
+      WHEN hex(NEW.path) = hex('reject.txt')
+      BEGIN SELECT RAISE(ABORT, 'test rejection'); END;" SQLITE:EXEC
+   s" same" s" rev-same" REMOTE-FILE MATCH-DECISION NOOP {: agreed :}
+   s" upload" UPLOAD-DECISION ar OPERATIONS {: upload :}
+   ar [type] path-baseline NEW-VECTOR {: noops :}
+   s" same.txt" AT-PATH agreed JOURNAL-PATH--BASELINE:MAKE
+   noops VEC:PUSH !
+   ar [type] path-plan NEW-VECTOR {: plans :}
+   s" safe.txt" AT-PATH upload JOURNAL-PATH--PLAN:MAKE plans VEC:PUSH !
+   s" reject.txt" AT-PATH upload JOURNAL-PATH--PLAN:MAKE plans VEC:PUSH !
+   j HELD-JOURNAL !  ar HELD-ARENA !  noops NOOPS !  plans PLANS !
+   [: RECONCILE ;] SQLITE:E-SQL d s" test rejection" ar LOGGED
+   j s" same.txt" AT-PATH ar BASELINE NO-BASELINE? TTRUE
+   j ar PENDING-PLANS VEC:COUNT 0 T=
+   j CLOSE
+   d GONE ;
+
+: JOURNAL-NOOP-REFRESHES-REVISION-BUT-CANNOT-CROSS-A-PENDING-PLAN
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" journal_noop_refreshes_revision_but_cannot_cross_a_pending_plan"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   s" matching.txt" AT-PATH {: path :}
+   s" same" s" rev-current" REMOTE-FILE {: observed :}
+   observed MATCH-DECISION NOOP {: noop :}
+   j path noop ar RECORD-NOOP NOOP-RECORDED? TTRUE
+   j path ar BASELINE observed MODEL-BASELINE:present BASELINE-HELD?
+   TTRUE
+   j CHANGED {: unchanged :}
+   j path noop ar RECORD-NOOP NOOP-RECORDED? TTRUE
+   j CHANGED unchanged T=
+   s" new" UPLOAD-DECISION ar OPERATIONS {: upload :}
+   j path upload ar RECORD-PLAN RECORDED-PLAN {: pending :}
+   ABSENT-DECISION NOOP {: absent :}
+   j path absent ar RECORD-NOOP pending >ID OWNED-BY? TTRUE
+   j path ar BASELINE
+   s" same" s" rev-current" REMOTE-FILE MODEL-BASELINE:present
+   BASELINE-HELD? TTRUE
+   j CLOSE
+   d GONE ;
+
+: ABSENT-BASELINE-REMOVES-ITS-ROW ( ^ARENA:arena -- )
+   {: ar :}
+   s" absent_baseline_removes_its_row" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   s" removed.txt" AT-PATH {: path :}
+   j s" removed.txt" s" old" s" rev-old" ar AGREE
+   ar [type] MODEL:path NEW-VECTOR {: want :}
+   path want VEC:PUSH !
+   j ar BASELINE-PATHS want PATHS= TTRUE
+   j path ABSENT-DECISION NOOP ar RECORD-NOOP drop
+   j path ar BASELINE NO-BASELINE? TTRUE
+   j ar BASELINE-PATHS VEC:COUNT 0 T=
+   j path ROWS-AT 0 T=
+   j CLOSE
+   d GONE ;
+
+: CASE-COLLISION-INVALIDATION-COVERS-A-CHILD-NAMED-WITH-A-HIGH-BYTE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" case_collision_invalidation_covers_a_child_named_with_a_high_byte"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j s" p" ar DIRECTORY
+   j s\" p/\xFFchild" s" old" s" rev-old" ar AGREE
+   j ar BASELINES VEC:COUNT 2 T=
+   j s" p" AT-PATH [: EXISTS? ;] ar INVALIDATE-CASE-COLLISION-BASELINES
+   j ar BASELINES VEC:COUNT 0 T=
+   j CLOSE
+   d GONE ;
+
+: CASE-COLLISION-INVALIDATION-JUDGES-EACH-RECORDED-SPELLING
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" case_collision_invalidation_judges_each_recorded_spelling" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j s" Foo" ar DIRECTORY
+   j s" Foo/kept.txt" s" old" s" rev-old" ar AGREE
+   j s" Foo/gone.txt" s" old" s" rev-old" ar AGREE
+   j s" foo/renamed.txt" s" old" s" rev-old" ar AGREE
+   j ar BASELINE-PATHS {: all :}
+   [: j s" foo" AT-PATH [: PROBE-FAILS ;] ar
+      INVALIDATE-CASE-COLLISION-BASELINES ;] E-INVALID-STATE TTHROWSQ
+   j ar BASELINE-PATHS all PATHS= TTRUE
+   j s" foo" AT-PATH [: NOT-GONE? ;] ar
+   INVALIDATE-CASE-COLLISION-BASELINES
+   j ar BASELINE-PATHS s" Foo" s" Foo/kept.txt" TWO-PATHS? TTRUE
+   j CLOSE
+   d GONE ;
+
+: BASELINE-SNAPSHOT-IS-CANONICAL-SORTED ( ^ARENA:arena -- )
+   {: ar :}
+   s" baseline_snapshot_is_canonical_sorted" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j s" Zulu.TXT" s" zulu" s" rev-zulu" ar AGREE
+   j s" alpha.txt" s" alpha" s" rev-alpha" ar AGREE
+   j ar BASELINES {: records :}
+   records VEC:COUNT 2 T=
+   records 0 VEC:AT @ s" alpha.txt" s" alpha.txt" ar RECORD-IS? TTRUE
+   records 1 VEC:AT @ s" zulu.txt" s" Zulu.TXT" ar RECORD-IS? TTRUE
+   records 1 VEC:AT @ MODEL-BASELINE--RECORD:UNMAKE {: k path b :}
+   b s" zulu" s" rev-zulu" REMOTE-FILE MODEL-BASELINE:present
+   MODEL:BASELINE= TTRUE
+   j CLOSE
+   d GONE ;
+
+
 : CASES ( ^ARENA:arena -- )
    {: ar :}
    ar NEW-JOURNAL-HAS-THE-ORACLE-SCHEMA
@@ -576,7 +988,15 @@ TYPED-VARIABLE SUBJECT str
    ar JOURNAL-DROPBOX-BINDING-SURVIVES-REOPEN
    ar JOURNAL-DROPBOX-BINDING-MISMATCH-NEVER-REPLACES-EXISTING
    ar JOURNAL-REJECTS-NEWER-SCHEMA-WITHOUT-CHANGING-ITS-VERSION
-   ar JOURNAL-SCHEMA-AND-PAYLOAD-COLUMNS-ARE-NOT-SECRET-BEARING ;
+   ar JOURNAL-SCHEMA-AND-PAYLOAD-COLUMNS-ARE-NOT-SECRET-BEARING
+   ar ORACLE-JOURNAL-HOLDS-ITS-BASELINES
+   ar JOURNAL-REOPEN-EXPOSES-INTENT-WITHOUT-ADVANCING-BASELINE
+   ar RECONCILIATION-DECISIONS-COMMIT-ATOMICALLY
+   ar JOURNAL-NOOP-REFRESHES-REVISION-BUT-CANNOT-CROSS-A-PENDING-PLAN
+   ar ABSENT-BASELINE-REMOVES-ITS-ROW
+   ar CASE-COLLISION-INVALIDATION-COVERS-A-CHILD-NAMED-WITH-A-HIGH-BYTE
+   ar CASE-COLLISION-INVALIDATION-JUDGES-EACH-RECORDED-SPELLING
+   ar BASELINE-SNAPSHOT-IS-CANONICAL-SORTED ;
 
 
 : TESTS ( -- )
