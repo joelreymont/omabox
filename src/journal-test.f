@@ -13,9 +13,12 @@
 \ schema-6 file, so the version-six tests start from a schema-8 journal
 \ holding the row migration 7 leaves for a schema-6 root, birth and
 \ subvolume NULL, and the baseline the Rust tests' version_six_with_root
-\ writes. Each case removes its directory; a refusal's log line is
-\ captured in it, checked and removed.
+\ writes. A copy of the oracle journal with a value MODEL cannot read
+\ in one row of each stored family is refused by the word that reads
+\ it, as E-JSON naming the row's path. Each case removes its directory;
+\ a refusal's log line is captured in it, checked and removed.
 \ Run from the repository root: hb --load src/journal-test.f </dev/null
+require src/lib/error.f
 require src/lib/arena.f
 require src/lib/string.f
 require src/lib/fmt.f
@@ -3054,6 +3057,134 @@ variable CRAFT
    d GONE ;
 
 
+\ ---- stored values MODEL cannot read -----------------------------
+
+\ The oracle journal, copied into a case's directory and opened, with
+\ the SQL run on it; the journal and arena are held for a reader.
+: PLANTED ( ^u8 n ^ARENA:arena -- str )
+   {: sql:^ su ar :}
+   ar JOURNAL-AT {: d:str p:str :}
+   s" src/oracle/journal.sqlite3" p str> FS:COPY-FILE-STREAM
+   p OPEN {: j :}
+   j >CONNECTION sql su SQLITE:EXEC
+   j HELD-JOURNAL !  ar HELD-ARENA !
+   d ;
+
+: PLANTED-GONE ( str -- ) HELD-JOURNAL @ CLOSE GONE ;
+
+\ `op` could not process the record for `path`, as MODEL:E-STORED.
+: STORED-LINE ( ^u8 n ^u8 n -- ^u8 n )
+   {: op:^ ou path:^ pu :}
+   s" `" 0 PUT  op ou rot PUT
+   s" ` could not process the record for `" rot PUT
+   path pu rot PUT  s" `: " rot PUT
+   MODEL:E-STORED swap PUT-N  s"  " rot PUT
+   MODEL:E-STORED ERROR:NAME$ rot PUT {: u :}
+   WANT u ;
+
+\ The reader throws E-JSON after one line naming op, path and cause.
+: UNREADABLE ( [ -- ] str ^u8 n ^u8 n ^ARENA:arena -- )
+   {: reader d:str op:^ ou path:^ pu ar :}
+   op ou path pu STORED-LINE {: a:^ u :}
+   reader E-JSON d a u ar LOGGED ;
+
+: HELD-BASELINES ( -- ) HELD-JOURNAL @ HELD-ARENA @ BASELINES drop ;
+
+: HELD-PENDING-PLANS ( -- )
+   HELD-JOURNAL @ HELD-ARENA @ PENDING-PLANS drop ;
+
+: HELD-BLOCKED-PLANS ( -- )
+   HELD-JOURNAL @ HELD-ARENA @ BLOCKED-PLANS drop ;
+
+: HELD-LOCAL-INVENTORY ( -- )
+   HELD-JOURNAL @ HELD-ARENA @ LOCAL-INVENTORY drop ;
+
+: HELD-REMOTE-INVENTORY ( -- )
+   HELD-JOURNAL @ HELD-ARENA @ REMOTE-INVENTORY drop ;
+
+: HELD-CONFLICTS ( -- ) HELD-JOURNAL @ HELD-ARENA @ CONFLICTS drop ;
+
+: HELD-HASH-CACHE ( -- )
+   HELD-JOURNAL @ HELD-ARENA @ LOCAL-HASH-CACHE drop ;
+
+: HELD-PENDING-RECOVERIES ( -- )
+   HELD-JOURNAL @ HELD-ARENA @ PENDING-RECOVERIES drop ;
+
+: AN-UNKNOWN-BASELINE-IS-REFUSED ( ^ARENA:arena -- )
+   {: ar :}
+   s" an unknown stored baseline is refused" T-LABEL
+   s\" UPDATE baselines SET baseline_json = '{\"Future\":1}'
+      WHERE hex(path) = hex('Docs')" ar PLANTED {: d:str :}
+   [: HELD-BASELINES ;] d s" deserialize baseline" s" Docs" ar
+   UNREADABLE
+   d PLANTED-GONE ;
+
+\ Plan 2's only operation, which PENDING-PLANS reads.
+: AN-UNKNOWN-OPERATION-IS-REFUSED ( ^ARENA:arena -- )
+   {: ar :}
+   s" an unknown stored operation is refused" T-LABEL
+   s\" UPDATE operations SET operation_json = '{\"Future\":1}'
+      WHERE id = 2" ar PLANTED {: d:str :}
+   [: HELD-PENDING-PLANS ;] d s" deserialize operation"
+   s" Docs/New.txt" ar UNREADABLE
+   d PLANTED-GONE ;
+
+: AN-UNKNOWN-OBSERVATION-IS-REFUSED ( ^ARENA:arena -- )
+   {: ar :}
+   s" an unknown stored observation is refused" T-LABEL
+   s\" UPDATE local_observations
+      SET observation_json = '{\"Future\":1}'
+      WHERE hex(path) = hex('Docs');
+      UPDATE remote_observations
+      SET observation_json = '{\"Future\":1}'
+      WHERE hex(path) = hex('Docs')" ar PLANTED {: d:str :}
+   [: HELD-LOCAL-INVENTORY ;] d s" deserialize local observation"
+   s" Docs" ar UNREADABLE
+   [: HELD-REMOTE-INVENTORY ;] d s" deserialize remote observation"
+   s" Docs" ar UNREADABLE
+   d PLANTED-GONE ;
+
+\ Plan 3, the oracle's blocked one.
+: AN-UNKNOWN-BLOCKAGE-IS-REFUSED ( ^ARENA:arena -- )
+   {: ar :}
+   s" an unknown stored blockage is refused" T-LABEL
+   s\" UPDATE plans SET blocked_json = '{\"Future\":1}' WHERE id = 3"
+   ar PLANTED {: d:str :}
+   [: HELD-BLOCKED-PLANS ;] d s" deserialize block reason"
+   s" Docs/Big.bin" ar UNREADABLE
+   d PLANTED-GONE ;
+
+: AN-UNKNOWN-CONFLICT-IS-REFUSED ( ^ARENA:arena -- )
+   {: ar :}
+   s" an unknown stored conflict is refused" T-LABEL
+   s\" UPDATE conflicts SET conflict_json = '{\"Future\":1}'
+      WHERE id = 1" ar PLANTED {: d:str :}
+   [: HELD-CONFLICTS ;] d s" deserialize conflict" s" Docs/Both.txt"
+   ar UNREADABLE
+   d PLANTED-GONE ;
+
+\ A hash value is an object with a fingerprint and content, not a sum.
+: AN-UNREADABLE-HASH-VALUE-IS-REFUSED ( ^ARENA:arena -- )
+   {: ar :}
+   s" an unreadable stored hash value is refused" T-LABEL
+   s\" UPDATE local_hash_cache SET hash_json = '{\"Future\":1}'
+      WHERE hex(path) = hex('Docs/A.txt')" ar PLANTED {: d:str :}
+   [: HELD-HASH-CACHE ;] d s" deserialize local hash cache"
+   s" Docs/A.txt" ar UNREADABLE
+   d PLANTED-GONE ;
+
+\ Recovery 1, the pending one, whose content is a JSON string; the line
+\ names its original path.
+: AN-UNREADABLE-RECOVERY-CONTENT-IS-REFUSED ( ^ARENA:arena -- )
+   {: ar :}
+   s" an unreadable stored recovery content is refused" T-LABEL
+   s\" UPDATE recovery_records SET content_json = '{\"Future\":1}'
+      WHERE id = 1" ar PLANTED {: d:str :}
+   [: HELD-PENDING-RECOVERIES ;] d s" deserialize recovery content"
+   s" Trash/Old1.txt" ar UNREADABLE
+   d PLANTED-GONE ;
+
+
 : CASES ( ^ARENA:arena -- )
    {: ar :}
    ar NEW-JOURNAL-HAS-THE-ORACLE-SCHEMA
@@ -3117,7 +3248,14 @@ variable CRAFT
    ar JOURNAL-DESTRUCTIVE-COMPLETION-RETIRES-LEGACY-RECOVERY-ACROSS-REOPEN
    ar BLOCKING-REPORTS-MISSING-AND-FINISHED-PLANS-WITHOUT-CHANGING-THEM
    ar BLOCKED-PLAN-UPLOAD-PAYLOADS-STAY-REFERENCED
-   ar JOURNAL-PLAN-CONFLICT-COMPLETES-ONCE-WITHOUT-ADVANCING-BASELINE ;
+   ar JOURNAL-PLAN-CONFLICT-COMPLETES-ONCE-WITHOUT-ADVANCING-BASELINE
+   ar AN-UNKNOWN-BASELINE-IS-REFUSED
+   ar AN-UNKNOWN-OPERATION-IS-REFUSED
+   ar AN-UNKNOWN-OBSERVATION-IS-REFUSED
+   ar AN-UNKNOWN-BLOCKAGE-IS-REFUSED
+   ar AN-UNKNOWN-CONFLICT-IS-REFUSED
+   ar AN-UNREADABLE-HASH-VALUE-IS-REFUSED
+   ar AN-UNREADABLE-RECOVERY-CONTENT-IS-REFUSED ;
 
 
 : TESTS ( -- )
