@@ -1,0 +1,430 @@
+\ status-test.f - STATUS on runtime directories under TMPDIR: the six
+\ tests of the Rust version under their names, each reading status.json back and comparing its bytes with what
+\ the Rust version writes for the snapshot, updated_at the status's own;
+\ and the heartbeat, which rewrites the file on a short period and stops
+\ at once on a long one. The snapshot holds one transfer, so the
+\ finished-transfer test follows one transfer at a time. Then a link at
+\ status.json or at the temporary's name, a restart over loosened modes,
+\ the transfer path's display rules, NEW's refusals and a runtime
+\ directory reached through a link. Each case removes its directory; the log
+\ lines of the failed replace and of the refusals are captured in TMPDIR,
+\ checked and removed.
+\ Run from the repository root: hb --load src/status-test.f </dev/null
+require src/lib/arena.f
+require src/lib/string.f
+require src/lib/fmt.f
+require src/lib/test.f
+require src/lib/test/stderr.f
+require src/lib/fs.f
+require src/lib/fs-mutate.f
+require src/lib/fs-list.f
+require src/lib/task.f
+require src/lib/time.f
+require src/status.f
+
+\ STATUS reopened: a case reads a status's updated_at and passes the
+\ heartbeat its period.
+package STATUS
+private
+
+4096 constant CAP
+CAP BUFFER: BODY
+CAP BUFFER: WANT
+CAP BUFFER: NAMES
+CAP BUFFER: PRE
+CAP BUFFER: PATHS
+512 constant LONG-U
+LONG-U BUFFER: LONG
+100 constant SHORT-MS
+60000 constant LONG-MS
+$1C0 constant DIR-MODE
+$180 constant FILE-MODE
+$1ED constant LOOSE-DIR
+$1A4 constant LOOSE-FILE
+
+
+\ ---- a runtime directory -----------------------------------------
+
+: RUNTIME ( ^ARENA:arena -- str )
+   {: ar :}
+   s" status-test" FS:MKTEMP-DIR {: p:^ u :}
+   ar u ARENA:ALLOC drop {: dst:^ :}
+   p dst u BYTE-COPY
+   dst u >str ;
+
+
+: GONE ( str -- )
+   str> FS:REMOVE-TREE ;
+
+
+\ ---- the file ----------------------------------------------------
+
+\ status.json's path, in PATHS.
+: FILE-PATH ( ^status -- ^u8 n )
+   STATUS-DIR @ str> FILE$ PATHS CAP SPAN:MAKE
+   FS:JOIN-PATH-INTO {: u :}
+   PATHS u ;
+
+
+: READ ( ^status -- ^u8 n )
+   FILE-PATH BODY CAP FS:READ-ALL {: u :}
+   BODY u ;
+
+
+: PUT ( ^u8 n n -- n )
+   {: a:^ u at :}
+   a WANT at + u BYTE-COPY
+   at u + ;
+
+
+\ want's prefix, then s's updated_at and the closing brace.
+: WANTED ( ^status ^u8 n -- ^u8 n )
+   {: s want:^ wu :}
+   want wu 0 PUT
+   s STATUS-UPDATED @ FMT:INT$ rot PUT
+   s" }" rot PUT {: u :}
+   WANT u ;
+
+
+: READS ( ^status ^u8 n -- )
+   {: s want:^ wu :}
+   s READ s want wu WANTED T$= ;
+
+
+: LISTED ( ^status -- ^u8 n )
+   STATUS-DIR @ str> NAMES CAP FS-LIST:NAMES {: u :}
+   NAMES u ;
+
+
+: PROGRESS ( ^status direction ^u8 n n option<n> -- )
+   {: s d:direction a:^ u done total :}
+   d a u >str done total STATUS-TRANSFER:MAKE
+   STATUS-EVENT:PROGRESS s TRANSFER ;
+
+
+: FINISH ( ^status direction ^u8 n n option<n> -- )
+   {: s d:direction a:^ u done total :}
+   d a u >str done total STATUS-TRANSFER:MAKE
+   STATUS-EVENT:FINISHED s TRANSFER ;
+
+
+: UP ( -- direction ) construct direction upload ;
+: DOWN ( -- direction ) construct direction download ;
+: OF-N ( n -- option<n> ) OPTION:SOME ;
+: UNKNOWN ( -- option<n> ) OPTION:NONE ;
+
+
+\ ---- the Rust version's tests -----------------------------------
+
+: STATUS-IS-PRIVATE-VERSIONED-AND-ATOMICALLY-REPLACED ( ^ARENA:arena -- )
+   {: ar :}
+   s" status_is_private_versioned_and_atomically_replaced" T-LABEL
+   ar RUNTIME {: rt:str :}
+   rt ar NEW {: s :}
+   construct phase waiting s PHASE
+   s HEARTBEAT
+   s STATUS-DIR @ str> FS:STAT-MODE MODE-BITS and DIR-MODE T=
+   s FILE-PATH FS:STAT-MODE MODE-BITS and FILE-MODE T=
+   s s\" {\"version\":3,\"phase\":\"waiting\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
+   s LISTED FILE$ T$=
+   rt GONE ;
+
+
+: TRANSFER-PATH-IS-RELATIVE-AND-ERROR-IS-FIXED-TEXT ( ^ARENA:arena -- )
+   {: ar :}
+   s" transfer_path_is_relative_and_error_is_fixed_text" T-LABEL
+   ar RUNTIME {: rt:str :}
+   rt ar NEW {: s :}
+   s DOWN s" folder/report.txt" 4 10 OF-N PROGRESS
+   s HEARTBEAT
+   s s\" {\"version\":3,\"phase\":\"starting\",\"transfers\":[{\"direction\":\"download\",\"path\":\"folder/report.txt\",\"bytes_done\":4,\"bytes_total\":10}],\"last_error\":null,\"updated_at\":" READS
+   s DOWN s" folder/report.txt" 0 UNKNOWN FINISH
+   s" Dropbox authentication is unavailable." >str s ERROR
+   s s\" {\"version\":3,\"phase\":\"error\",\"transfers\":[],\"last_error\":\"Dropbox authentication is unavailable.\",\"updated_at\":" READS
+   rt GONE ;
+
+
+: STOPPED-STATUS-CLEARS-TRANSFERS-AND-KEEPS-THE-FATAL-TEXT ( ^ARENA:arena -- )
+   {: ar :}
+   s" stopped_status_clears_transfers_and_keeps_the_fatal_text" T-LABEL
+   ar RUNTIME {: rt:str :}
+   rt ar NEW {: s :}
+   s UP s" folder/report.txt" 4 10 OF-N PROGRESS
+   s" Omabox setup is required." >str s STOPPED
+   s s\" {\"version\":3,\"phase\":\"stopped\",\"transfers\":[],\"last_error\":\"Omabox setup is required.\",\"updated_at\":" READS
+   rt GONE ;
+
+
+: SYNC-ERROR-SURVIVES-PHASE-CHANGES-UNTIL-A-CLEAN-PASS ( ^ARENA:arena -- )
+   {: ar :}
+   s" sync_error_survives_phase_changes_until_a_clean_pass" T-LABEL
+   ar RUNTIME {: rt:str :}
+   rt ar NEW {: s :}
+   construct phase syncing s PHASE
+   s UP s" good.txt" 4 10 OF-N PROGRESS
+   s SYNC-ERROR
+   s s\" {\"version\":3,\"phase\":\"error\",\"transfers\":[{\"direction\":\"upload\",\"path\":\"good.txt\",\"bytes_done\":4,\"bytes_total\":10}],\"last_error\":\"One or more files could not be synchronized.\",\"updated_at\":" READS
+   construct phase waiting s PHASE
+   s s\" {\"version\":3,\"phase\":\"waiting\",\"transfers\":[],\"last_error\":\"One or more files could not be synchronized.\",\"updated_at\":" READS
+   s CLEAR-ERROR
+   s s\" {\"version\":3,\"phase\":\"waiting\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
+   rt GONE ;
+
+
+\ One transfer: a second's progress replaces the first, whose finish
+\ then changes nothing.
+: FINISHED-TRANSFER-REMAINS-VISIBLE-UNTIL-ACTIVITY-OR-PHASE-CHANGES ( ^ARENA:arena -- )
+   {: ar :}
+   s" finished_transfer_remains_visible_until_activity_or_phase_changes" T-LABEL
+   ar RUNTIME {: rt:str :}
+   rt ar NEW {: s :}
+   construct phase syncing s PHASE
+   s DOWN s" first.txt" 3 10 OF-N PROGRESS
+   s s\" {\"version\":3,\"phase\":\"syncing\",\"transfers\":[{\"direction\":\"download\",\"path\":\"first.txt\",\"bytes_done\":3,\"bytes_total\":10}],\"last_error\":null,\"updated_at\":" READS
+   s DOWN s" second.txt" 7 20 OF-N PROGRESS
+   s DOWN s" first.txt" 3 10 OF-N FINISH
+   s s\" {\"version\":3,\"phase\":\"syncing\",\"transfers\":[{\"direction\":\"download\",\"path\":\"second.txt\",\"bytes_done\":7,\"bytes_total\":20}],\"last_error\":null,\"updated_at\":" READS
+   s DOWN s" second.txt" 20 20 OF-N FINISH
+   s s\" {\"version\":3,\"phase\":\"syncing\",\"transfers\":[{\"direction\":\"download\",\"path\":\"second.txt\",\"bytes_done\":20,\"bytes_total\":20}],\"last_error\":null,\"updated_at\":" READS
+   construct phase syncing s PHASE
+   s s\" {\"version\":3,\"phase\":\"syncing\",\"transfers\":[{\"direction\":\"download\",\"path\":\"second.txt\",\"bytes_done\":20,\"bytes_total\":20}],\"last_error\":null,\"updated_at\":" READS
+   s UP s" third.txt" 2 9 OF-N PROGRESS
+   s s\" {\"version\":3,\"phase\":\"syncing\",\"transfers\":[{\"direction\":\"upload\",\"path\":\"third.txt\",\"bytes_done\":2,\"bytes_total\":9}],\"last_error\":null,\"updated_at\":" READS
+   construct phase waiting s PHASE
+   s s\" {\"version\":3,\"phase\":\"waiting\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
+   rt GONE ;
+
+
+: FAILED-REPLACEMENT-DOES-NOT-LEAVE-A-TEMPORARY-FILE ( ^ARENA:arena -- )
+   {: ar :}
+   s" failed_replacement_does_not_leave_a_temporary_file" T-LABEL
+   ar RUNTIME {: rt:str :}
+   rt ar NEW {: s :}
+   s FILE-PATH FS:REMOVE-FILE
+   s FILE-PATH FS:MAKE-DIR
+   ar RUNTIME {: log:str :}
+   log s" status.log" ar JOINED {: path:str :}
+   path str> STDERR:CAPTURE
+   construct phase syncing s PHASE
+   STDERR:;CAPTURE
+   s LISTED FILE$ T$=
+   path str> BODY CAP FS:READ-ALL {: u :}
+   BODY u s" status: could not replace the status file: " CONTAINS?
+   TTRUE
+   log GONE
+   rt GONE ;
+
+
+\ ---- status.json's entry, a restart, paths and refusals -----------
+
+\ status.json is a regular 0600 file, never a link.
+: PRIVATE-FILE ( ^status -- )
+   FILE-PATH {: file:^ fu :}
+   file fu FS:SYMLINK? TFALSE
+   file fu FS:FILE? TTRUE
+   file fu FS:STAT-MODE MODE-BITS and FILE-MODE T= ;
+
+
+: LINK-AT-STATUS-IS-REPLACED-NEVER-FOLLOWED ( ^ARENA:arena -- )
+   {: ar :}
+   s" a link at status.json is replaced, never followed" T-LABEL
+   ar RUNTIME {: rt:str :}
+   rt ar NEW {: s :}
+   s STATUS-DIR @ FILE$ ar JOINED {: file:str :}
+   rt s" missing" ar JOINED {: gone:str :}
+   rt s" target" ar JOINED {: kept:str :}
+   kept str> s" keep" FS:WRITE-ALL
+   kept str> LOOSE-FILE FS:CHMOD-MODE
+   file str> FS:REMOVE-FILE
+   gone str> file str> FS:MAKE-SYMLINK
+   construct phase waiting s PHASE
+   s PRIVATE-FILE
+   s s\" {\"version\":3,\"phase\":\"waiting\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
+   gone str> FS:TRY-STAT TFALSE
+   file str> FS:REMOVE-FILE
+   kept str> file str> FS:MAKE-SYMLINK
+   construct phase syncing s PHASE
+   s PRIVATE-FILE
+   s s\" {\"version\":3,\"phase\":\"syncing\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
+   kept str> BODY CAP FS:READ-ALL {: u :}
+   BODY u s" keep" T$=
+   kept str> FS:STAT-MODE MODE-BITS and LOOSE-FILE T=
+   s LISTED FILE$ T$=
+   rt GONE ;
+
+
+: STALE-TEMPORARY-LINK-IS-SWEPT ( ^ARENA:arena -- )
+   {: ar :}
+   s" a link at the temporary's name is swept" T-LABEL
+   ar RUNTIME {: rt:str :}
+   rt ar NEW {: s :}
+   s STATUS-DIR @ s STATUS-TEMP @ str> ar JOINED {: temp:str :}
+   rt s" outside" ar JOINED {: kept:str :}
+   rt s" missing" ar JOINED {: gone:str :}
+   kept str> s" keep" FS:WRITE-ALL
+   kept str> LOOSE-FILE FS:CHMOD-MODE
+   kept str> temp str> FS:MAKE-SYMLINK
+   construct phase waiting s PHASE
+   s s\" {\"version\":3,\"phase\":\"waiting\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
+   s LISTED FILE$ T$=
+   kept str> BODY CAP FS:READ-ALL {: u :}
+   BODY u s" keep" T$=
+   kept str> FS:STAT-MODE MODE-BITS and LOOSE-FILE T=
+   gone str> temp str> FS:MAKE-SYMLINK
+   construct phase syncing s PHASE
+   s s\" {\"version\":3,\"phase\":\"syncing\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
+   s LISTED FILE$ T$=
+   gone str> FS:TRY-STAT TFALSE
+   rt GONE ;
+
+
+: RESTART-SECURES-THE-DIRECTORY-AND-FILE-AGAIN ( ^ARENA:arena -- )
+   {: ar :}
+   s" a restart secures the directory and status.json again" T-LABEL
+   ar RUNTIME {: rt:str :}
+   rt ar NEW {: s :}
+   s STATUS-DIR @ str> LOOSE-DIR FS:CHMOD-MODE
+   s FILE-PATH LOOSE-FILE FS:CHMOD-MODE
+   s STATUS-DIR @ str> FS:STAT-MODE MODE-BITS and LOOSE-DIR T=
+   s FILE-PATH FS:STAT-MODE MODE-BITS and LOOSE-FILE T=
+   rt ar NEW {: again :}
+   again STATUS-DIR @ str> FS:STAT-MODE MODE-BITS and DIR-MODE T=
+   again PRIVATE-FILE
+   again s\" {\"version\":3,\"phase\":\"starting\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
+   again LISTED FILE$ T$=
+   rt GONE ;
+
+
+\ a's bytes at PRE's offset at.
+: APPEND ( ^u8 n n -- n )
+   {: a:^ u at :}
+   a PRE at + u BYTE-COPY
+   at u + ;
+
+
+\ An upload of path shows as shown, byte for byte.
+: SHOWS ( ^status ^u8 n ^u8 n -- )
+   {: s p:^ pu w:^ wu :}
+   s UP p pu 1 2 OF-N PROGRESS
+   s\" {\"version\":3,\"phase\":\"starting\",\"transfers\":[{\"direction\":\"upload\",\"path\":\"" 0 APPEND
+   w wu rot APPEND
+   s\" \",\"bytes_done\":1,\"bytes_total\":2}],\"last_error\":null,\"updated_at\":" rot APPEND {: u :}
+   s PRE u READS ;
+
+
+\ deep/ and x up to LONG-U bytes, past the shown buffers' first 256.
+: LONG-PATH ( -- ^u8 n )
+   s" deep/" {: a:^ u :}
+   a LONG u BYTE-COPY
+   LONG-U u ?do $78 LONG i + c! loop
+   LONG LONG-U ;
+
+
+\ Rust's display_path and to_string_lossy: one U+FFFD per maximal invalid
+\ subpart ($FF alone, $E2 $82 cut short), which serde_json writes unescaped.
+: TRANSFER-PATHS-DISPLAY-AS-RUST-DISPLAYS-THEM ( ^ARENA:arena -- )
+   {: ar :}
+   s" transfer paths display as the Rust version displays them" T-LABEL
+   ar RUNTIME {: rt:str :}
+   rt ar NEW {: s :}
+   s s" /home/user/Dropbox/a.txt" s" (invalid synchronized path)" SHOWS
+   s s" " s" ." SHOWS
+   s s\" a\xFFb\xE2\x82c" s\" a\xEF\xBF\xBDb\xEF\xBF\xBDc" SHOWS
+   s LONG-PATH LONG-PATH SHOWS
+   rt GONE ;
+
+
+: NEW-REFUSES-A-RELATIVE-OR-MISSING-RUNTIME ( ^ARENA:arena -- )
+   {: ar :}
+   s" new refuses a relative or missing runtime directory" T-LABEL
+   ar RUNTIME {: rt:str :}
+   rt s" absent" ar JOINED {: absent:str :}
+   ar RUNTIME {: log:str :}
+   log s" status.log" ar JOINED {: path:str :}
+   path str> STDERR:CAPTURE
+   [: s" run/user" >str ar NEW drop ;] E-RUNTIME-NOT-ABSOLUTE TTHROWS
+   [: absent ar NEW drop ;] E-RUNTIME-UNAVAILABLE TTHROWS
+   STDERR:;CAPTURE
+   path str> BODY CAP FS:READ-ALL {: u :}
+   BODY u s" STATUS:E-RUNTIME-NOT-ABSOLUTE: XDG_RUNTIME_DIR must be absolute"
+   CONTAINS?
+   TTRUE
+   BODY u s" STATUS:E-RUNTIME-UNAVAILABLE: XDG_RUNTIME_DIR is unavailable"
+   CONTAINS? TTRUE
+   absent str> FS:TRY-STAT TFALSE
+   log GONE
+   rt GONE ;
+
+
+: RUNTIME-THROUGH-A-LINK-PUBLISHES-INTO-ITS-TARGET ( ^ARENA:arena -- )
+   {: ar :}
+   s" a runtime directory reached through a link is followed" T-LABEL
+   ar RUNTIME {: rt:str :}
+   ar RUNTIME {: base:str :}
+   base s" runtime" ar JOINED {: link:str :}
+   rt str> link str> FS:MAKE-SYMLINK
+   link ar NEW {: s :}
+   rt s" omabox" ar JOINED FILE$ ar JOINED {: file:str :}
+   link str> FS:SYMLINK? TTRUE
+   file str> FS:FILE? TTRUE
+   file str> FS:STAT-MODE MODE-BITS and FILE-MODE T=
+   s s\" {\"version\":3,\"phase\":\"starting\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
+   base GONE
+   rt GONE ;
+
+
+\ ---- the heartbeat -----------------------------------------------
+
+: BEATS ( ^status n -- )
+   {: s first :}
+   30 0 ?do
+      s STATUS-UPDATED @ first > if unloop exit then
+      SHORT-MS >MS TASK:SLEEP
+   loop ;
+
+
+: HEARTBEAT-REWRITES-AND-STOPS ( ^ARENA:arena -- )
+   {: ar :}
+   s" the heartbeat rewrites status.json and stops" T-LABEL
+   ar RUNTIME {: rt:str :}
+   rt ar NEW {: s :}
+   s STATUS-UPDATED @ {: first :}
+   SHORT-MS s HEARTBEAT-EVERY
+   s first BEATS
+   s HEARTBEAT-STOP
+   s STATUS-UPDATED @ first > TTRUE
+   s s\" {\"version\":3,\"phase\":\"starting\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
+   TIME:MONO-NS {: t0 :}
+   LONG-MS s HEARTBEAT-EVERY
+   s HEARTBEAT-STOP
+   TIME:MONO-NS t0 - 1000000000 < TTRUE
+   rt GONE ;
+
+
+: CASES ( ^ARENA:arena -- )
+   {: ar :}
+   ar STATUS-IS-PRIVATE-VERSIONED-AND-ATOMICALLY-REPLACED
+   ar TRANSFER-PATH-IS-RELATIVE-AND-ERROR-IS-FIXED-TEXT
+   ar STOPPED-STATUS-CLEARS-TRANSFERS-AND-KEEPS-THE-FATAL-TEXT
+   ar SYNC-ERROR-SURVIVES-PHASE-CHANGES-UNTIL-A-CLEAN-PASS
+   ar FINISHED-TRANSFER-REMAINS-VISIBLE-UNTIL-ACTIVITY-OR-PHASE-CHANGES
+   ar FAILED-REPLACEMENT-DOES-NOT-LEAVE-A-TEMPORARY-FILE
+   ar LINK-AT-STATUS-IS-REPLACED-NEVER-FOLLOWED
+   ar STALE-TEMPORARY-LINK-IS-SWEPT
+   ar RESTART-SECURES-THE-DIRECTORY-AND-FILE-AGAIN
+   ar TRANSFER-PATHS-DISPLAY-AS-RUST-DISPLAYS-THEM
+   ar NEW-REFUSES-A-RELATIVE-OR-MISSING-RUNTIME
+   ar RUNTIME-THROUGH-A-LINK-PUBLISHES-INTO-ITS-TARGET
+   ar HEARTBEAT-REWRITES-AND-STOPS ;
+
+
+: RUN ( -- )
+   T-RESET
+   ARENA:NEW {: ar :}
+   [: ar CASES ;] [: ar ARENA:RELEASE ;] finally
+   s" status-test: " type T-CASES FMT:.INT s"  checks" type cr
+   T-REPORT ;
+
+RUN
+
+;package

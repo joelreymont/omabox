@@ -657,7 +657,11 @@ root check; the kernel's own lookup needs only search permission. The
 walk now opens the directories in between with `O_PATH`. Habu also
 refuses a symlink anywhere in an anchored path. Rust's status file
 follows one in `$XDG_RUNTIME_DIR`; its sync root, opened with
-`RESOLVE_NO_SYMLINKS`, does not. Habu keeps the stricter rule for both.
+`RESOLVE_NO_SYMLINKS`, does not. I first kept the stricter rule for both;
+the STATUS review showed that a runtime directory reached through a link
+(`/var/run` links to `/run`) would then publish no status at all. Habu now
+does as Rust does: the runtime directory opens through its links, and the
+sync root and every path inside it refuse them.
 
 Lane times: STATUS fold 5.5 min, CONFIG lock 8.5 min, MODEL JSON 16 min
 (stalled on the engine), the anchored walk 3.5 min.
