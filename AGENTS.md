@@ -30,6 +30,8 @@ records the rewrite.
 - Follow `~/.agents/docs/rust.md` in Rust; repository rules may be stricter.
 - Use `jj`. Make one commit per feature or significant fix and include its dot
   closure in that commit.
+- Rebase every open line of work onto `master` periodically, and before it
+  merges, so it never drifts far from `master`.
 - Run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` before landing Rust changes.
 - Run the relevant TLC model after changing durable replay or concurrency.
 - Keep real Dropbox tests opt-in and separate from unit tests.
