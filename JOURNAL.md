@@ -587,3 +587,33 @@ Observation for the blog: in Rust a wrapper over a string is `struct
 Path(String)`. Here it took four commits (the type, a cast of any width,
 `NEWTYPE` and `DEFTYPE` over a base) and a marker so that code written for
 the old pair still checks. Each lane took five to eight minutes.
+
+## 2026-11-15: Lanes in parallel, and names that collide
+
+omabox had been waiting for the `str` stack to land. Now its lanes run on
+that stack's engine before it lands: MODEL, CONFIG, STATUS and the Rust
+journal sample ran at once, then JOURNAL and MODEL's JSON. The STATUS lane
+took 12.5 minutes, MODEL 10, and the journal sample 5.
+
+Building the rebased stack failed with `E-EXPORT-UNDEFINED`: master's new
+`export` rule needed an engine that already had it. Habu builds itself, so
+a language change needs a staged host: an engine for the export change, one
+for `str`, then the tip. Cargo builds any tree with the pinned compiler.
+
+Habu refused three of MODEL's names. A `VARIANT` may not share a name with
+a type, and Rust's `Decision::Conflict(Conflict)` and
+`Observation::Unknown(UnknownReason)` do just that, since Rust keeps types
+and variants apart. The types became `unknown-reason` and `blocked-reason`,
+after Rust's, and the decision's variants `conflicted` and `collided`. Two
+`ENUM`s may share a variant name.
+
+`DERIVE eq` refuses a record holding a `str`. A derived equality compares
+cells, and a `str`'s cells are an address and a length, so it would compare
+identity, not bytes. Rust's `#[derive(PartialEq)]` on a `String` compares
+bytes. MODEL writes its six `=` words by hand.
+
+An independent review of the `str` stack found no unsound case. It found
+comments that told history, a marker saved and restored twice, a test that
+read an internal cell rather than behaviour, and two limits of `split-str`:
+a marked file's diagnostics print a `str` as `^u8 n`, and a file read from
+stdin cannot carry the marker.
