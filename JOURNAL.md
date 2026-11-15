@@ -273,3 +273,69 @@ compiler already knows strings. Here the language learns what a string is
 before the application can say which one it holds. And again a person
 reading the notation found what the agents had settled around.
 
+
+## 2026-11-15: What a fake hides
+
+Three of the five Dropbox lanes found something only because a test or a
+review pushed past the happy path, and one found something no test could:
+- **A shape the fake never sends.** Dropbox answers `upload` and
+  `download` with a file's metadata and no `.tag`, because the route's result
+  is a plain record, not a union. The fake always sent `.tag`, so the core's
+  entry reader, which refuses an entry without one, passed every scenario.
+  The upload lane noticed only because it read the route's documentation for
+  its own reader. A fake written from the client's point of view agrees with
+  the client.
+- **A server that cut the body.** A 32 MiB session append reached Habu's
+  HTTP server slower than its 1 s body deadline, so the server closed without
+  answering. libcurl then resent the append by itself, which the test read as
+  an append Dropbox had stored twice. Raising the fake's deadline fixed the
+  test. libcurl's quiet resend had already cost a lane once that day.
+- **A rule copied from the wrong side.** Habu's curl wrapper decided where a
+  header block ends by its own rule (a blank line), libcurl by another (any
+  line whose first byte is CR). The reviewer checked libcurl with the curl
+  CLI against a raw server and found the reply that both accept and Habu
+  throws on. Rust never met this, because Rust's HTTP stack parses its own
+  headers.
+- **A race the tests won by luck.** The review measured `HEADERS` throwing
+  after the first chunk of a stream that failed early, in 29 of 30 runs. The
+  loop reaped a finished transfer before it serviced the chunk, so the
+  stream's early headers were already gone. The test that should have caught
+  it passed, because its first transfer on a fresh loop was the one in 30
+  that won the race.
+
+Observation for the blog: the Rust version leaned on crates that had met
+these cases before it did. Each Habu library meets them for the first time,
+in the application that needs them.
+
+## 2026-11-15: The language gaps a port finds
+
+Porting the content hasher hit a gap in Habu itself. Dropbox's content hash
+runs two SHA-256 contexts at once, and Habu's SHA-256 runs in a context
+span the caller owns, 784 bytes. A record cannot hold 784 bytes: a field is
+a scalar, a pointer or another record. The worker padded the hasher with
+nested records of eight cells each and cast them to bytes. It works, and it
+is a workaround, so Habu gets fixed-size inline fields instead. The same need
+is waiting in statx results, sqlite and openat2 buffers, and path buffers.
+
+Smaller collisions came from names:
+- `hash`, `at` and `again` are reserved inside a record or a machine, so a
+  field became `content-hash` and an input became `once`.
+- A word named `DROP` in the fake's package shadowed `drop` there, so the
+  fake's way to cut an answer before it takes effect is called `CUT`.
+
+## 2026-11-15: Master moves while you work
+
+Habu's master moved 41 commits while the `^T` change was in flight, through
+the same checker files. The user's answer was a rule: rebase every open line
+onto master periodically. Moving the work showed what drift costs here:
+- the installed `hb` could no longer build master, and neither could the
+  engine built that morning;
+- master held two changes that each needed a staged host, so reaching it
+  took two intermediate engines before the `^T` stage could build at all;
+- the 21,000-line respell was not rebased but redone, because rerunning a
+  mechanical rewrite over the new tree is cheaper and surer than resolving
+  its conflicts.
+
+The same day the Rust version left master for a `rust` branch. Master now
+holds only what the Habu daemon is built from, and the port docs cite the
+branch where they compare.
