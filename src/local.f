@@ -1,7 +1,8 @@
 \ local.f - package LOCAL: the local half of a sync (docs/habu-rewrite.md,
 \ the LOCAL row) on Habu's anchored file words: its errors, the opens it
 \ confines below the sync root, Dropbox content hashes of local files, and
-\ the verified stages a download writes, with their xattr markers.
+\ the verified stages a download writes, with their xattr markers, and
+\ their installs over a target that still holds what the journal expects.
 \ A relative path splits as Rust's Path::components splits it: empty and "."
 \ components past the first are skipped, and an empty, absolute or leading "."
 \ path, or one with a ".." component, is unsafe. Each component opens
@@ -24,6 +25,7 @@ require src/lib/arena.f
 require src/lib/log.f
 require src/lib/adt/option.f
 require src/lib/fs.f
+require src/lib/fs-mutate.f
 require src/lib/fs-anchored.f
 require src/lib/fd.f
 require src/lib/xattr.f
@@ -697,6 +699,20 @@ private
 
 : SYNC-FILE ( fd ^u8 n ^u8 n -- ) SYNC-DIRECTORY ;
 
+\ Syncs the regular file at the name and its entry; none there is a
+\ change.
+: SYNC-INSTALLED-FILE ( fd ^u8 n ^u8 n -- )
+   {: dir:fd name:^ nu:n p:^ u:n :}
+   s" open installed file for sync" {: o:^ ou:n :}
+   dir name nu p u o ou OPEN-REGULAR-AT-IF-PRESENT MATCH option
+      none OF o ou p u CHANGED ENDOF
+      some OF OPENED-UNMAKE {: f:fd st:stat :}
+         [: f p u s" sync installed file" SYNC-FILE ;] [: f DISCARD ;]
+         finally
+      ENDOF
+   ;MATCH
+   dir p u s" sync installed file entry" SYNC-DIRECTORY ;
+
 \ ---- parents
 
 \ S_IRWXU: a parent directory a download makes.
@@ -823,6 +839,8 @@ ENUM download-marker missing expected other ;ENUM
 
 \ The Rust daemon's names and sizes, so either reads the other's stages.
 : DOWNLOAD-STAGE-XATTR ( -- ^u8 n ) s" user.omabox.download-stage-v1" ;
+: DOWNLOAD-PARTIAL-XATTR ( -- ^u8 n )
+   s" user.omabox.download-partial-v1" ;
 96 constant MARKER-CAP
 MARKER-CAP BUFFER: MARKER-BUF
 \ S_IRUSR: a verified stage's only permission.
@@ -1123,5 +1141,570 @@ $100 constant MODE-READ-ONLY
       none OF s" preserve raced local destination" t tu CHANGED ENDOF
       some OF {: c:DROPBOX:hash :} dir g gu t tu c ar PRESERVE-GUARD ENDOF
    ;MATCH ;
+
+\ ---- installs
+
+public
+
+\ What installing a verified download came to: installed, installed by an
+\ earlier attempt, no verified stage to install, other bytes at the
+\ stage's path, kept as they were, or a target that no longer holds what
+\ was expected, with what it holds, none when it is absent.
+ENUM install-outcome
+   VARIANT installed ;VARIANT
+   VARIANT already-installed ;VARIANT
+   VARIANT download-required ;VARIANT
+   VARIANT stage-destination-occupied FIELD path str ;VARIANT
+   VARIANT precondition-changed FIELD actual option<DROPBOX:hash> ;VARIANT
+;ENUM
+
+\ What moving an expected target to its guard came to: moved, moved by an
+\ earlier attempt, or a target that no longer holds what was expected,
+\ with what it or the guard holds, none when neither is there.
+ENUM replacement-preparation
+   VARIANT prepared ;VARIANT
+   VARIANT already-prepared ;VARIANT
+   VARIANT precondition-changed FIELD actual option<DROPBOX:hash> ;VARIANT
+;ENUM
+
+private
+
+ENUM stage-cleanup
+   VARIANT removed-or-absent ;VARIANT
+   VARIANT destination-occupied FIELD path str ;VARIANT
+;ENUM
+
+\ An install in its open parent: the parent's descriptor and path, the
+\ stage's name and path, the target's last component and path, the
+\ content installed and the arena the names are laid in.
+STRUCTURE install
+   FIELD parent fd
+   FIELD parent-path str
+   FIELD stage-name str
+   FIELD stage-path str
+   FIELD target-name str
+   FIELD target str
+   FIELD desired DROPBOX:hash
+   FIELD arena ^ARENA:arena
+;STRUCTURE
+
+: INSTALLED ( -- install-outcome ) LOCAL-INSTALL--OUTCOME:installed ;
+: ALREADY-INSTALLED ( -- install-outcome )
+   LOCAL-INSTALL--OUTCOME:already-installed ;
+: DOWNLOAD-REQUIRED ( -- install-outcome )
+   LOCAL-INSTALL--OUTCOME:download-required ;
+: STAGE-OCCUPIED ( str -- install-outcome )
+   LOCAL-INSTALL--OUTCOME:stage-destination-occupied ;
+: INSTALL-CHANGED ( option<DROPBOX:hash> -- install-outcome )
+   LOCAL-INSTALL--OUTCOME:precondition-changed ;
+: PREPARED ( -- replacement-preparation )
+   LOCAL-REPLACEMENT--PREPARATION:prepared ;
+: ALREADY-PREPARED ( -- replacement-preparation )
+   LOCAL-REPLACEMENT--PREPARATION:already-prepared ;
+: PREPARE-CHANGED ( option<DROPBOX:hash> -- replacement-preparation )
+   LOCAL-REPLACEMENT--PREPARATION:precondition-changed ;
+
+\ No content: nothing is at the path.
+: ABSENT ( -- option<DROPBOX:hash> ) OPTION:NONE ;
+
+: PRESENT? ( option<DROPBOX:hash> -- bool )
+   MATCH option
+      none OF false ENDOF
+      some OF DROP-HASH true ENDOF
+   ;MATCH ;
+
+\ a joined to b in the arena, as Rust's Path::join.
+: JOIN ( ^u8 n ^u8 n ^ARENA:arena -- ^u8 n )
+   {: a:^ au:n b:^ bu:n ar:^ARENA:arena :}
+   ar au bu + 1+ ARENA:ALLOC {: dst:^ size:n :}
+   a au b bu dst size SPAN:MAKE FS:JOIN-PATH-INTO dst swap ;
+
+: GUARD-NAME ( ^u8 n DROPBOX:hash ^ARENA:arena -- ^u8 n )
+   {: t:^ tu:n c:DROPBOX:hash ar:^ARENA:arena :}
+   s" displaced" t tu c ar INTERNAL-NAME ;
+
+\ Removes the name in dir; o names the operation and p the path.
+: REMOVE-AT ( fd ^u8 n ^u8 n ^u8 n -- )
+   {: dir:fd name:^ nu:n o:^ ou:n p:^ u:n :}
+   dir name nu FS:TRY-REMOVE-FILE-AT 0= if o ou p u IO-FAILURE then ;
+
+: WRITABLE ( fd ^u8 n ^u8 n -- )
+   {: f:fd p:^ u:n o:^ ou:n :}
+   [: f FS:MODE-PRIVATE-FILE FD:MODE! ;] [: o ou p u IO-FAILURE ;]
+   FS-FAILS ;
+
+\ The stage's file is as it was verified.
+: VERIFY-DOWNLOAD-STAGE-BEFORE-RENAME ( verified-download-stage ^u8 n -- )
+   {: s:verified-download-stage p:^ u:n :}
+   s VERIFIED-DOWNLOAD-STAGE-UNMAKE {: f:fd print:MODEL:fingerprint :}
+   s" verify download stage before rename" {: o:^ ou:n :}
+   f p u o ou STAT-FD p u FILE-FINGERPRINT
+   print SAME-FINGERPRINT? 0= if o ou p u CHANGED then ;
+
+\ Makes the owned download at f a plain file: writable, unmarked.
+: RELEASE-OWNED-DOWNLOAD ( fd ^u8 n -- )
+   {: f:fd p:^ u:n :}
+   f p u s" make installed download writable" WRITABLE
+   f DOWNLOAD-PARTIAL-XATTR p u s" clear resumed download marker"
+   REMOVE-XATTR
+   f p u s" sync installed download cleanup" SYNC-FILE
+   f DOWNLOAD-STAGE-XATTR p u s" clear installed download marker"
+   REMOVE-XATTR ;
+
+\ Syncs the installed file; one still marked as LOCAL's is released first.
+: FINISH-INSTALLED-DOWNLOAD ( fd ^u8 n bool -- )
+   {: f:fd p:^ u:n owned:bool :}
+   owned if f p u RELEASE-OWNED-DOWNLOAD then
+   f p u s" sync installed download" SYNC-FILE ;
+
+\ Whether the stage's file holds its verified bytes under the name.
+: BOUND? ( verified-download-stage fd ^u8 n ^u8 n ^u8 n -- bool )
+   {: s:verified-download-stage dir:fd name:^ nu:n p:^ u:n o:^ ou:n :}
+   s VERIFIED-DOWNLOAD-STAGE-UNMAKE {: f:fd print:MODEL:fingerprint :}
+   f p u o ou STAT-FD p u FILE-FINGERPRINT
+   print SAME-HASHED-CONTENT 0= if false exit then
+   f dir name nu p u NAMED-INODE-MATCHES ;
+
+\ Whether the renamed stage is the owned download of want at the name.
+: OWNED-RENAME?
+   ( verified-download-stage fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+     -- bool )
+   {: s:verified-download-stage dir:fd name:^ nu:n p:^ u:n
+      want:DROPBOX:hash ar:^ARENA:arena :}
+   p u want ar STAGE-MARKER {: m:^ mu:n :}
+   s dir name nu p u s" verify renamed download content" BOUND?
+   0= if false exit then
+   s VERIFIED-DOWNLOAD-STAGE-UNMAKE {: f:fd print:MODEL:fingerprint :}
+   f m mu p u READ-DOWNLOAD-MARKER EXPECTED? ;
+
+\ Releases and syncs the stage renamed to the name, which must be the
+\ owned download of want before and after.
+: SYNC-RENAMED-DOWNLOAD
+   ( verified-download-stage fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- )
+   {: s:verified-download-stage dir:fd name:^ nu:n p:^ u:n
+      want:DROPBOX:hash ar:^ARENA:arena :}
+   s dir name nu p u want ar OWNED-RENAME? 0= if
+      s" verify renamed download ownership" p u CHANGED
+   then
+   dir p u s" sync installed download rename" SYNC-DIRECTORY
+   s VERIFIED-DOWNLOAD-STAGE-UNMAKE {: f:fd print:MODEL:fingerprint :}
+   f p u true FINISH-INSTALLED-DOWNLOAD
+   s dir name nu p u s" verify installed download content" BOUND? 0= if
+      s" verify installed download binding" p u CHANGED
+   then ;
+
+\ Finishes the open installed file when its content actual is want.
+: FINISH-IF-WANTED
+   ( fd DROPBOX:hash ^u8 n DROPBOX:hash ^ARENA:arena -- )
+   {: f:fd actual:DROPBOX:hash p:^ u:n want:DROPBOX:hash
+      ar:^ARENA:arena :}
+   actual want SAME-CONTENT? 0= if
+      s" verify installed download" p u CHANGED
+   then
+   p u want ar STAGE-MARKER {: m:^ mu:n :}
+   f m mu p u READ-DOWNLOAD-MARKER EXPECTED? {: owned:bool :}
+   f p u owned FINISH-INSTALLED-DOWNLOAD ;
+
+\ Syncs the download installed at the name, which must hold want, and
+\ its entry; a file still marked as LOCAL's is released first.
+: SYNC-INSTALLED-DOWNLOAD
+   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- )
+   {: dir:fd name:^ nu:n p:^ u:n want:DROPBOX:hash ar:^ARENA:arena :}
+   s" verify installed download" {: o:^ ou:n :}
+   dir name nu p u o ou ar OPEN-AND-HASH-IF-PRESENT MATCH option
+      none OF o ou p u CHANGED ENDOF
+      some OF HASHED-UNMAKE
+         {: f:fd c:DROPBOX:hash print:MODEL:fingerprint :}
+         [: f c p u want ar FINISH-IF-WANTED ;] [: f DISCARD ;] finally
+      ENDOF
+   ;MATCH
+   dir p u s" sync installed download entry" SYNC-DIRECTORY ;
+
+\ Removes the owned stage of want at the name in dir; another file
+\ there is kept.
+: REMOVE-VERIFIED-STAGE
+   ( fd ^u8 n DROPBOX:hash ^u8 n ^u8 n ^ARENA:arena -- stage-cleanup )
+   {: dir:fd name:^ nu:n want:DROPBOX:hash p:^ u:n t:^ tu:n
+      ar:^ARENA:arena :}
+   dir name nu p u t tu want ar INSPECT-DOWNLOAD-STAGE
+   MATCH download-stage
+      missing OF STAGE-CLEANUP-REMOVED-OR-ABSENT ENDOF
+      verified OF VERIFIED-DOWNLOAD-STAGE-UNMAKE
+         {: f:fd print:MODEL:fingerprint :} f DISCARD
+         dir name nu s" remove verified staging file" p u REMOVE-AT
+         STAGE-CLEANUP-REMOVED-OR-ABSENT
+      ENDOF
+      destination-occupied OF STAGE-CLEANUP-DESTINATION-OCCUPIED ENDOF
+   ;MATCH ;
+
+\ Removes target's guard for c when it holds c; other bytes are kept.
+: REMOVE-GUARD-IF-VERIFIED ( fd ^u8 n DROPBOX:hash ^ARENA:arena -- )
+   {: dir:fd t:^ tu:n c:DROPBOX:hash ar:^ARENA:arena :}
+   t tu c ar GUARD-NAME {: g:^ gu:n :}
+   dir g gu t tu s" verify stale install guard" ar HASH-AT-IF-PRESENT
+   MATCH option
+      none OF ENDOF
+      some OF c SAME-CONTENT? 0= if
+            s" clean completed replacement" t tu OCCUPIED
+         then
+         dir g gu s" remove stale install guard" t tu REMOVE-AT
+      ENDOF
+   ;MATCH ;
+
+\ The guard at path gp holds held: prepared when that is c.
+: EXISTING-GUARD
+   ( option<DROPBOX:hash> DROPBOX:hash ^u8 n -- replacement-preparation )
+   {: held:option<DROPBOX:hash> c:DROPBOX:hash gp:^ gpu:n :}
+   held c HOLDS? 0= if
+      s" prepare download replacement" gp gpu OCCUPIED
+   then
+   ALREADY-PREPARED ;
+
+\ The target is at its guard g, at path gp, now: prepared when the guard
+\ holds c, else the guard goes back or is kept as a local conflict.
+: VERIFY-DISPLACED
+   ( fd ^u8 n ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+     -- replacement-preparation )
+   {: dir:fd g:^ gu:n gp:^ gpu:n tn:^ tnu:n t:^ tu:n c:DROPBOX:hash
+      ar:^ARENA:arena :}
+   dir t tu s" sync replacement displacement guard" SYNC-DIRECTORY
+   dir g gu gp gpu s" verify displaced replacement file" ar
+   HASH-AT-IF-PRESENT {: held:option<DROPBOX:hash> :}
+   held c HOLDS? if PREPARED exit then
+   dir g gu tn tnu t tu held ar RESTORE-OR-PRESERVE-CHANGED-GUARD
+   held PREPARE-CHANGED ;
+
+\ Renames the target to its guard g, at path gp, never over an entry.
+: MOVE-TO-GUARD
+   ( fd ^u8 n ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+     -- replacement-preparation )
+   {: dir:fd g:^ gu:n gp:^ gpu:n tn:^ tnu:n t:^ tu:n c:DROPBOX:hash
+      ar:^ARENA:arena :}
+   dir tn tnu dir g gu FS:TRY-RENAME-NEW-AT if
+      dir g gu gp gpu tn tnu t tu c ar VERIFY-DISPLACED exit
+   then
+   FS:ERRNO {: e:n :}
+   e FS:ENOENT = if ABSENT PREPARE-CHANGED exit then
+   e FS:EEXIST <> if
+      s" move replaced file to displacement guard" t tu IO-FAILURE
+   then
+   dir g gu gp gpu s" verify raced replacement displacement" ar
+   HASH-AT-IF-PRESENT c gp gpu EXISTING-GUARD ;
+
+\ Moves the target at the name in dir, whose path is dp, to its guard
+\ when it holds c; a guard already there holding c was moved before.
+: PREPARE-REPLACEMENT-AT
+   ( fd ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+     -- replacement-preparation )
+   {: dir:fd dp:^ du:n tn:^ tnu:n t:^ tu:n c:DROPBOX:hash
+      ar:^ARENA:arena :}
+   t tu c ar GUARD-NAME {: g:^ gu:n :}
+   dp du g gu ar JOIN {: gp:^ gpu:n :}
+   dir tn tnu t tu s" check replacement preparation precondition" ar
+   HASH-AT-IF-PRESENT {: current:option<DROPBOX:hash> :}
+   dir g gu gp gpu s" inspect replacement displacement guard" ar
+   HASH-AT-IF-PRESENT {: held:option<DROPBOX:hash> :}
+   held PRESENT? if held c gp gpu EXISTING-GUARD exit then
+   current c HOLDS? 0= if current PREPARE-CHANGED exit then
+   dir g gu gp gpu tn tnu t tu c ar MOVE-TO-GUARD ;
+
+\ The parent f opened at rel below the root at r, as OPEN-PARENT gives it.
+: PREPARE-IN-PARENT
+   ( fd str str ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+     -- replacement-preparation )
+   {: f:fd name:str rel:str r:^ ru:n t:^ tu:n c:DROPBOX:hash
+      ar:^ARENA:arena :}
+   r ru rel str> ar JOIN {: dp:^ du:n :}
+   f dp du name str> t tu c ar PREPARE-REPLACEMENT-AT ;
+
+: PREPARE-BELOW-ROOT
+   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- replacement-preparation )
+   {: root:fd r:^ ru:n t:^ tu:n c:DROPBOX:hash ar:^ARENA:arena :}
+   root t tu false OPEN-PARENT MATCH option
+      none OF ABSENT PREPARE-CHANGED ENDOF
+      some OF PARENT-DIR-UNMAKE {: f:fd name:str rel:str :}
+         [: f name rel r ru t tu c ar PREPARE-IN-PARENT ;]
+         [: f DISCARD ;] finally
+      ENDOF
+   ;MATCH ;
+
+public
+
+\ Moves target t below the sync root at r to its guard, a name in the
+\ same directory, when it holds c, and syncs the directory: the bytes are
+\ then at the target or at the guard. A replay finds them at the guard.
+: PREPARE-REPLACEMENT
+   ( ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- replacement-preparation )
+   {: r:^ ru:n t:^ tu:n c:DROPBOX:hash ar:^ARENA:arena :}
+   c s" prepare replacement" REQUIRE-CONTENT-HASH
+   r ru s" open sync root for replacement preparation"
+   OPEN-ABSOLUTE-DIRECTORY {: root:fd :}
+   [: root r ru t tu c ar PREPARE-BELOW-ROOT ;] [: root DISCARD ;]
+   finally ;
+
+private
+
+\ ---- an install's steps
+
+: DESIRED ( install -- DROPBOX:hash )
+   INSTALL-UNMAKE {: dir dp sn sp tn t want ar :} want ;
+
+\ The content at x's target now; o names the operation.
+: TARGET-HASH ( install ^u8 n -- option<DROPBOX:hash> )
+   {: x:install o:^ ou:n :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   dir tn str> t str> o ou ar HASH-AT-IF-PRESENT ;
+
+\ Syncs x's parent; o names the operation.
+: SYNC-PARENT ( install ^u8 n -- )
+   {: x:install o:^ ou:n :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   dir t str> o ou SYNC-DIRECTORY ;
+
+\ Removes the name in x's parent; o names the operation.
+: REMOVE-IN-PARENT ( install ^u8 n ^u8 n -- )
+   {: x:install g:^ gu:n o:^ ou:n :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   dir g gu o ou t str> REMOVE-AT ;
+
+: INSPECT-INSTALL-STAGE ( install -- download-stage )
+   INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   dir sn str> sp str> t str> want ar INSPECT-DOWNLOAD-STAGE ;
+
+\ Runs q on x's verified stage, closing it after; with none, or other
+\ bytes at the stage's name, the install answers that.
+: WITH-STAGE
+   ( install [ install verified-download-stage -- install-outcome ]
+     -- install-outcome )
+   {: x:install q :}
+   x INSPECT-INSTALL-STAGE MATCH download-stage
+      missing OF DOWNLOAD-REQUIRED ENDOF
+      verified OF {: s:verified-download-stage :}
+         s VERIFIED-DOWNLOAD-STAGE-UNMAKE
+         {: f:fd print:MODEL:fingerprint :}
+         [: x s q execute ;] [: f DISCARD ;] finally
+      ENDOF
+      destination-occupied OF STAGE-OCCUPIED ENDOF
+   ;MATCH ;
+
+\ x's target holds its content: syncs it and removes the stage.
+: CLEAN-INSTALLED ( install -- stage-cleanup )
+   INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   dir tn str> t str> want ar SYNC-INSTALLED-DOWNLOAD
+   dir sn str> want sp str> t str> ar REMOVE-VERIFIED-STAGE ;
+
+\ Runs q once the stage is gone; other bytes at its name answer the
+\ install.
+: CLEANED
+   ( stage-cleanup [ -- install-outcome ] -- install-outcome )
+   {: c:stage-cleanup q :}
+   c MATCH stage-cleanup
+      removed-or-absent OF q execute ENDOF
+      destination-occupied OF STAGE-OCCUPIED ENDOF
+   ;MATCH ;
+
+: REMOVE-INSTALL-GUARD ( install DROPBOX:hash -- )
+   {: x:install c:DROPBOX:hash :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   dir t str> c ar REMOVE-GUARD-IF-VERIFIED ;
+
+: DROP-INSTALLED-GUARD ( install option<DROPBOX:hash> -- )
+   {: x:install expected:option<DROPBOX:hash> :}
+   expected MATCH option
+      none OF ENDOF
+      some OF {: c:DROPBOX:hash :}
+         c s" clean replacement guard" REQUIRE-CONTENT-HASH
+         x c REMOVE-INSTALL-GUARD
+      ENDOF
+   ;MATCH ;
+
+\ An earlier attempt installed x: cleans up after it.
+: FINISH-EARLIER-INSTALL
+   ( install option<DROPBOX:hash> -- install-outcome )
+   {: x:install expected:option<DROPBOX:hash> :}
+   x CLEAN-INSTALLED
+   [: x expected DROP-INSTALLED-GUARD
+      x s" sync already-installed download" SYNC-PARENT
+      ALREADY-INSTALLED ;] CLEANED ;
+
+\ The target x's stage was renamed to exists: x's content there was
+\ installed by another attempt.
+: RACED-INITIAL-INSTALL ( install -- install-outcome )
+   {: x:install :}
+   x s" inspect raced initial install" TARGET-HASH
+   {: actual:option<DROPBOX:hash> :}
+   actual x DESIRED HOLDS? 0= if actual INSTALL-CHANGED exit then
+   x CLEAN-INSTALLED
+   [: x s" sync raced initial install cleanup" SYNC-PARENT
+      ALREADY-INSTALLED ;] CLEANED ;
+
+\ Renames x's verified stage to its target, never over an entry.
+: RENAME-STAGE-INTO-ABSENT-TARGET
+   ( install verified-download-stage -- install-outcome )
+   {: x:install s:verified-download-stage :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   s sp str> VERIFY-DOWNLOAD-STAGE-BEFORE-RENAME
+   dir sn str> dir tn str> FS:TRY-RENAME-NEW-AT if
+      s dir tn str> t str> want ar SYNC-RENAMED-DOWNLOAD
+      INSTALLED exit
+   then
+   FS:ERRNO {: e:n :}
+   e FS:ENOENT = if DOWNLOAD-REQUIRED exit then
+   e FS:EEXIST <> if
+      s" install download into absent path" t str> IO-FAILURE
+   then
+   x RACED-INITIAL-INSTALL ;
+
+: INSTALL-ABSENT ( install option<DROPBOX:hash> -- install-outcome )
+   {: x:install current:option<DROPBOX:hash> :}
+   current PRESENT? if current INSTALL-CHANGED exit then
+   x [: RENAME-STAGE-INTO-ABSENT-TARGET ;] WITH-STAGE ;
+
+\ The guard of c is cleaned after a raced target whose content is actual.
+: SETTLE-PREPARED
+   ( install DROPBOX:hash DROPBOX:hash -- install-outcome )
+   {: x:install c:DROPBOX:hash actual:DROPBOX:hash :}
+   x c REMOVE-INSTALL-GUARD
+   actual x DESIRED SAME-CONTENT? if
+      x s" sync raced prepared replacement cleanup" SYNC-PARENT
+      ALREADY-INSTALLED exit
+   then
+   x s" sync raced prepared replacement" SYNC-PARENT
+   actual OPTION:SOME INSTALL-CHANGED ;
+
+\ After the target moved to its guard, an entry holding actual raced in.
+: RACED-PREPARED
+   ( DROPBOX:hash install DROPBOX:hash -- install-outcome )
+   {: actual:DROPBOX:hash x:install c:DROPBOX:hash :}
+   actual x DESIRED SAME-CONTENT? 0= if
+      x c actual SETTLE-PREPARED exit
+   then
+   x CLEAN-INSTALLED [: x c actual SETTLE-PREPARED ;] CLEANED ;
+
+\ The guard g is removed after the rename found an entry at the target.
+: SETTLE-RACED
+   ( install ^u8 n option<DROPBOX:hash> -- install-outcome )
+   {: x:install g:^ gu:n actual:option<DROPBOX:hash> :}
+   x g gu s" remove recovered displacement guard" REMOVE-IN-PARENT
+   actual x DESIRED HOLDS? if
+      x s" sync raced replacement cleanup" SYNC-PARENT
+      ALREADY-INSTALLED exit
+   then
+   x s" sync raced replacement" SYNC-PARENT
+   actual INSTALL-CHANGED ;
+
+: RACED-REPLACEMENT ( install ^u8 n -- install-outcome )
+   {: x:install g:^ gu:n :}
+   x s" inspect raced install destination" TARGET-HASH
+   {: actual:option<DROPBOX:hash> :}
+   actual x DESIRED HOLDS? 0= if x g gu actual SETTLE-RACED exit then
+   x CLEAN-INSTALLED [: x g gu actual SETTLE-RACED ;] CLEANED ;
+
+\ The stage renamed to the target; the guard g it displaced is removed.
+: REPLACED
+   ( verified-download-stage install ^u8 n -- install-outcome )
+   {: s:verified-download-stage x:install g:^ gu:n :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   s dir tn str> t str> want ar SYNC-RENAMED-DOWNLOAD
+   x g gu s" remove displaced install guard" REMOVE-IN-PARENT
+   x s" sync completed replacement" SYNC-PARENT
+   INSTALLED ;
+
+\ Renames the stage to the target, now at its guard for c.
+: RENAME-REPLACEMENT
+   ( verified-download-stage install DROPBOX:hash -- install-outcome )
+   {: s:verified-download-stage x:install c:DROPBOX:hash :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   t str> c ar GUARD-NAME {: g:^ gu:n :}
+   s sp str> VERIFY-DOWNLOAD-STAGE-BEFORE-RENAME
+   dir sn str> dir tn str> FS:TRY-RENAME-NEW-AT if
+      s x g gu REPLACED exit
+   then
+   FS:ERRNO FS:EEXIST <> if
+      s" install verified replacement" t str> IO-FAILURE
+   then
+   x g gu RACED-REPLACEMENT ;
+
+\ The target is at its guard for c, unless an entry raced in after.
+: RESUME-REPLACEMENT
+   ( verified-download-stage install DROPBOX:hash -- install-outcome )
+   {: s:verified-download-stage x:install c:DROPBOX:hash :}
+   x s" resume prepared replacement" TARGET-HASH MATCH option
+      none OF s x c RENAME-REPLACEMENT ENDOF
+      some OF x c RACED-PREPARED ENDOF
+   ;MATCH ;
+
+: PREPARE-INSTALL ( install DROPBOX:hash -- replacement-preparation )
+   {: x:install c:DROPBOX:hash :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   dir dp str> tn str> t str> c ar PREPARE-REPLACEMENT-AT ;
+
+: REPLACE-WITH-STAGE
+   ( install verified-download-stage DROPBOX:hash -- install-outcome )
+   {: x:install s:verified-download-stage c:DROPBOX:hash :}
+   x c PREPARE-INSTALL MATCH replacement-preparation
+      prepared OF s x c RESUME-REPLACEMENT ENDOF
+      already-prepared OF s x c RESUME-REPLACEMENT ENDOF
+      precondition-changed OF INSTALL-CHANGED ENDOF
+   ;MATCH ;
+
+\ Replaces x's target, which held c, with the verified stage.
+: INSTALL-REPLACEMENT ( install DROPBOX:hash -- install-outcome )
+   {: x:install c:DROPBOX:hash :}
+   c s" install replacement" REQUIRE-CONTENT-HASH
+   x [: c REPLACE-WITH-STAGE ;] WITH-STAGE ;
+
+: INSTALL-IN-PARENT ( install option<DROPBOX:hash> -- install-outcome )
+   {: x:install expected:option<DROPBOX:hash> :}
+   x s" check install precondition" TARGET-HASH
+   {: current:option<DROPBOX:hash> :}
+   current x DESIRED HOLDS? if x expected FINISH-EARLIER-INSTALL exit then
+   expected MATCH option
+      none OF x current INSTALL-ABSENT ENDOF
+      some OF {: c:DROPBOX:hash :} x c INSTALL-REPLACEMENT ENDOF
+   ;MATCH ;
+
+\ The install of t's content want in the parent f, opened at rel below
+\ the root at r.
+: INSTALL-OF
+   ( fd str str ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- install )
+   {: f:fd tn:str rel:str r:^ ru:n t:^ tu:n want:DROPBOX:hash
+      ar:^ARENA:arena :}
+   r ru rel str> ar JOIN {: dp:^ du:n :}
+   s" download" t tu want ar INTERNAL-NAME {: sn:^ snu:n :}
+   dp du sn snu ar JOIN {: sp:^ spu:n :}
+   f dp du >str sn snu >str sp spu >str tn t tu >str want ar
+   INSTALL-MAKE ;
+
+public
+
+\ Renames the verified stage of want over target t below the root fd,
+\ whose path is r, only while t holds expected, or is absent when
+\ expected is none; a target that changed is kept, never overwritten.
+: INSTALL-DOWNLOAD-AT
+   ( fd ^u8 n ^u8 n DROPBOX:hash option<DROPBOX:hash> ^ARENA:arena
+     -- install-outcome )
+   {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash
+      expected:option<DROPBOX:hash> ar:^ARENA:arena :}
+   want s" install download" REQUIRE-CONTENT-HASH
+   root t tu false OPEN-PARENT MATCH option
+      none OF DOWNLOAD-REQUIRED ENDOF
+      some OF PARENT-DIR-UNMAKE {: f:fd name:str rel:str :}
+         [: f name rel r ru t tu want ar INSTALL-OF
+            expected INSTALL-IN-PARENT ;]
+         [: f DISCARD ;] finally
+      ENDOF
+   ;MATCH ;
+
+\ INSTALL-DOWNLOAD-AT below the sync root at r.
+: INSTALL-DOWNLOAD
+   ( ^u8 n ^u8 n DROPBOX:hash option<DROPBOX:hash> ^ARENA:arena
+     -- install-outcome )
+   {: r:^ ru:n t:^ tu:n want:DROPBOX:hash
+      expected:option<DROPBOX:hash> ar:^ARENA:arena :}
+   r ru s" open sync root for download install" OPEN-ABSOLUTE-DIRECTORY
+   {: root:fd :}
+   [: root r ru t tu want expected ar INSTALL-DOWNLOAD-AT ;]
+   [: root DISCARD ;] finally ;
 
 ;package

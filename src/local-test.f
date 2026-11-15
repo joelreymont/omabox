@@ -4,8 +4,9 @@
 \ hashes, and that neither the hash nor a stage's copy depends on how a
 \ reader fragments the bytes; then each stage outcome, each inspected
 \ download stage, a stage marker set, read and removed, and each parent a
-\ download opens. A case that makes files works in its own directory
-\ under TMPDIR and removes it.
+\ download opens; then local.rs's install tests and each install outcome
+\ and replacement preparation. A case that makes files works in its own
+\ directory under TMPDIR and removes it.
 \ Run from the repository root: hb --load src/local-test.f </dev/null
 require src/lib/test.f
 require src/lib/fmt.f
@@ -14,8 +15,10 @@ require src/lib/memory.f
 require src/lib/property.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
+require src/lib/fs-anchored.f
 require src/lib/fd.f
 require src/lib/adt/option.f
+require src/lib/xattr.f
 require src/dropbox.f
 require src/local.f
 
@@ -61,7 +64,72 @@ private
       ENDOF
    ;MATCH ;
 
+\ The name target t's stage of want takes.
+: STAGE-NAME ( ^u8 n DROPBOX:hash ^ARENA:arena -- ^u8 n )
+   {: t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
+   s" download" t tu want ar INTERNAL-NAME ;
+
+: DROP-OUTCOME ( install-outcome -- ) drop ;
+
+\ The stage INSPECT-DOWNLOAD-STAGE verified for x; any other fails the
+\ run.
+: VERIFIED-STAGE ( install -- verified-download-stage )
+   INSPECT-INSTALL-STAGE MATCH download-stage
+      missing OF E-CHANGED throw ENDOF
+      verified OF ENDOF
+      destination-occupied OF {: p:str :} E-OCCUPIED throw ENDOF
+   ;MATCH ;
+
+\ Writes "mutant" over the sealed stage through w, opened before it.
+: MUTATE ( fd -- )
+   {: w:fd :}
+   w FS:MODE-PRIVATE-FILE FD:MODE! w 0 FD:SEEK
+   w s" mutant" FD:WRITE-FULL w FD:SYNC ;
+
+: RENAME-REFUSED ( install verified-download-stage -- )
+   {: x:install s:verified-download-stage :}
+   [: x s RENAME-STAGE-INTO-ABSENT-TARGET DROP-OUTCOME ;]
+   E-CHANGED TTHROWSQ ;
+
+\ Verifies x's stage, mutates it through w, then renames it.
+: RENAME-MUTATED ( install fd -- )
+   {: x:install w:fd :}
+   x VERIFIED-STAGE {: s:verified-download-stage :}
+   s VERIFIED-DOWNLOAD-STAGE-UNMAKE {: f:fd print:MODEL:fingerprint :}
+   [: w MUTATE x s RENAME-REFUSED ;] [: f DISCARD ;] finally ;
+
+\ RENAME-MUTATED on target t's install below the root fd at r, its
+\ parent opened as INSTALL-DOWNLOAD-AT opens it.
+: INSTALL-RENAME-MUTATED
+   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena fd -- )
+   {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena
+      w:fd :}
+   root t tu false OPEN-PARENT MATCH option
+      none OF E-CHANGED throw ENDOF
+      some OF PARENT-DIR-UNMAKE {: f:fd name:str rel:str :}
+         [: f name rel r ru t tu want ar INSTALL-OF w RENAME-MUTATED ;]
+         [: f DISCARD ;] finally
+      ENDOF
+   ;MATCH ;
+
+\ SYNC-RENAMED-DOWNLOAD of the file at t in dir, as a stage verified
+\ now, refuses it: it carries no marker.
+: RENAMED-WITHOUT-MARKER
+   ( fd fd ^u8 n DROPBOX:hash ^ARENA:arena -- )
+   {: f:fd dir:fd t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
+   f t tu s" inspect test download" STAT-FD t tu FILE-FINGERPRINT
+   {: print:MODEL:fingerprint :}
+   f print VERIFIED-DOWNLOAD-STAGE-MAKE {: s:verified-download-stage :}
+   [: s dir t tu t tu want ar SYNC-RENAMED-DOWNLOAD ;]
+   E-CHANGED TTHROWSQ ;
+
 public
+EXPORT STAGE-NAME
+EXPORT GUARD-NAME
+EXPORT DOWNLOAD-PARTIAL-XATTR
+EXPORT SYNC-INSTALLED-DOWNLOAD
+EXPORT INSTALL-RENAME-MUTATED
+EXPORT RENAMED-WITHOUT-MARKER
 EXPORT PARENT-OF
 EXPORT HASH-STREAM
 EXPORT COPY-AND-HASH
@@ -417,6 +485,238 @@ SHA256-CTX-BYTES BUFFER: PART
    s" each stage outcome is reached" T-LABEL
    [: STAGE-CASES ;] IN-CASE-DIR ;
 
+\ ---- installs
+
+64 BUFFER: READ-BUF
+
+\ The bytes of the file at the name below the case's directory.
+: READ$ ( ^u8 n -- ^u8 n )
+   AT READ-BUF 64 FS:READ-ALL READ-BUF swap ;
+
+: NO-CONTENT ( -- option<DROPBOX:hash> ) OPTION:NONE ;
+: HELD ( ^u8 n -- option<DROPBOX:hash> ) HASH-OF OPTION:SOME ;
+
+: ACTUAL$ ( option<DROPBOX:hash> -- ^u8 n )
+   MATCH option
+      none OF s" none" ENDOF
+      some OF DROPBOX:HASH>STR str> ENDOF
+   ;MATCH ;
+
+\ The outcome's variant, and its path or actual content, else empty.
+: INSTALL$ ( LOCAL:install-outcome -- ^u8 n ^u8 n )
+   MATCH LOCAL:install-outcome
+      installed OF s" installed" s" " ENDOF
+      already-installed OF s" already-installed" s" " ENDOF
+      download-required OF s" download-required" s" " ENDOF
+      stage-destination-occupied OF {: p:str :}
+         s" stage-destination-occupied" p str>
+      ENDOF
+      precondition-changed OF {: a:option<DROPBOX:hash> :}
+         s" precondition-changed" a ACTUAL$
+      ENDOF
+   ;MATCH ;
+
+: PREPARATION$ ( LOCAL:replacement-preparation -- ^u8 n ^u8 n )
+   MATCH LOCAL:replacement-preparation
+      prepared OF s" prepared" s" " ENDOF
+      already-prepared OF s" already-prepared" s" " ENDOF
+      precondition-changed OF {: a:option<DROPBOX:hash> :}
+         s" precondition-changed" a ACTUAL$
+      ENDOF
+   ;MATCH ;
+
+: STAGE-NAME$ ( ^u8 n -- ^u8 n ) WANT AR @ LOCAL:STAGE-NAME ;
+
+\ Stages "remote" as t's owned download, as stage_download does for a
+\ top-level target; stage_download is not LOCAL's yet.
+: STAGE-REMOTE ( fd ^u8 n -- )
+   {: root:fd t:^ tu:n :}
+   t tu STAGE-NAME$ {: sn:^ snu:n :}
+   s" remote" START 0 SCHEDULE
+   root sn snu sn snu WANT [: FRAGMENT ;]
+   t tu WANT AR @ LOCAL:STAGE-MARKER >str OPTION:SOME
+   s" stage download" AR @ LOCAL:WRITE-STAGE-OUTCOME OUTCOME$
+   s" " T$= s" staged" T$= ;
+
+\ INSTALL-DOWNLOAD of "remote" at t below the case's directory.
+: INSTALL ( ^u8 n option<DROPBOX:hash> -- ^u8 n ^u8 n )
+   {: t:^ tu:n expected:option<DROPBOX:hash> :}
+   t tu T-LABEL
+   ROOT$ t tu WANT expected AR @ LOCAL:INSTALL-DOWNLOAD INSTALL$ ;
+
+: PREPARE ( ^u8 n ^u8 n -- ^u8 n ^u8 n )
+   {: t:^ tu:n c:^ cu:n :}
+   t tu T-LABEL
+   ROOT$ t tu c cu HASH-OF AR @ LOCAL:PREPARE-REPLACEMENT PREPARATION$ ;
+
+: ABSENT-INSTALL ( fd -- )
+   {: root:fd :}
+   root TARGET STAGE-REMOTE
+   TARGET s" local" PUT-FILE
+   TARGET NO-CONTENT INSTALL
+   s" local" IDENTITY T$= s" precondition-changed" T$=
+   TARGET READ$ s" local" T$= ;
+
+: ABSENT-INSTALL-NEVER-OVERWRITES-AN-EXISTING-FILE ( -- )
+   s" absent_install_never_overwrites_an_existing_file" T-LABEL
+   [: ABSENT-INSTALL ;] IN-CASE-DIR ;
+
+: OPEN-WRITE-AT ( fd ^u8 n -- fd )
+   FS:TRY-OPEN-WRITE-AT MATCH option
+      none OF E-FS-OPEN throw ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+: MUTATED-STAGE ( fd -- )
+   {: root:fd :}
+   root TARGET STAGE-REMOTE
+   TARGET STAGE-NAME$ {: sn:^ snu:n :}
+   sn snu AT FS:MODE-PRIVATE-FILE FS:CHMOD-MODE
+   root sn snu OPEN-WRITE-AT {: w:fd :}
+   [: root ROOT$ TARGET WANT AR @ w LOCAL:INSTALL-RENAME-MUTATED ;]
+   [: w FS:CLOSE-DIR ;] finally
+   root TARGET LOCAL:ENTRY-EXISTS-AT TFALSE
+   sn snu READ$ s" mutant" T$= ;
+
+\ The stage is verified, then changed through a writer opened before it
+\ was sealed; the rename refuses it and leaves both names as they are.
+: INSTALL-REJECTS-STAGE-CHANGED-THROUGH-A-PREEXISTING-WRITER ( -- )
+   s" install_rejects_stage_changed_through_a_preexisting_writer" T-LABEL
+   [: MUTATED-STAGE ;] IN-CASE-DIR ;
+
+64 BUFFER: XATTR-BUF
+
+: PARTIAL? ( fd -- bool )
+   LOCAL:DOWNLOAD-PARTIAL-XATTR XATTR-BUF 64 SPAN:MAKE XATTR:GET
+   MATCH XATTR:got
+      absent OF false ENDOF
+      value OF drop true ENDOF
+      oversize OF true ENDOF
+   ;MATCH ;
+
+: INSTALLED-BYTES ( -- ^u8 n ) s" installed bytes" ;
+: INSTALLED-MARKER ( -- ^u8 n )
+   TARGET INSTALLED-BYTES HASH-OF AR @ LOCAL:STAGE-MARKER ;
+
+\ The download slot words are not LOCAL's yet: the partial marker holds
+\ bytes no slot state decodes, which cleanup removes all the same.
+: MARK-INSTALLED ( fd -- )
+   {: f:fd :}
+   f LOCAL:DOWNLOAD-PARTIAL-XATTR s" slot state" true TARGET
+   s" test mark" LOCAL:SET-XATTR
+   f LOCAL:DOWNLOAD-STAGE-XATTR INSTALLED-MARKER true TARGET
+   s" test mark" LOCAL:SET-XATTR
+   f $100 FD:MODE! f FD:SYNC ;
+
+: REMOVE-PARTIAL ( fd -- )
+   {: f:fd :}
+   f FS:MODE-PRIVATE-FILE FD:MODE!
+   f LOCAL:DOWNLOAD-PARTIAL-XATTR XATTR:ERASE f FD:SYNC ;
+
+: SYNC-INSTALLED ( fd -- )
+   TARGET TARGET INSTALLED-BYTES HASH-OF AR @
+   LOCAL:SYNC-INSTALLED-DOWNLOAD ;
+
+: CLEANED-UP ( fd fd -- )
+   {: root:fd f:fd :}
+   root SYNC-INSTALLED
+   f INSTALLED-MARKER TARGET LOCAL:MARKER$ s" missing" T$=
+   f PARTIAL? TFALSE
+   f FS:FD-STAT FS:STAT-MODE@ FS:MODE-PRIVATE-FILE and
+   FS:MODE-PRIVATE-FILE T=
+   root SYNC-INSTALLED ;
+
+: PARTIAL-CLEANUP ( fd bool -- )
+   {: root:fd removed:bool :}
+   TARGET INSTALLED-BYTES PUT-FILE
+   root TARGET OPEN-WRITE-AT {: f:fd :}
+   [: f MARK-INSTALLED
+      removed if f REMOVE-PARTIAL else f PARTIAL? TTRUE then
+      f INSTALLED-MARKER TARGET LOCAL:MARKER$ s" expected" T$=
+      root f CLEANED-UP ;]
+   [: f FS:CLOSE-DIR ;] finally ;
+
+: INSTALLED-DOWNLOAD-CLEANUP-REPLAYS-AROUND-PARTIAL-MARKER-REMOVAL ( -- )
+   s" installed_download_cleanup_replays_around_partial_marker_removal"
+   T-LABEL
+   [: false PARTIAL-CLEANUP ;] IN-CASE-DIR
+   [: true PARTIAL-CLEANUP ;] IN-CASE-DIR ;
+
+: UNMARKED-RENAME ( fd -- )
+   {: root:fd :}
+   TARGET s" remote" PUT-FILE
+   root TARGET OPEN-AT {: f:fd :}
+   [: f root TARGET WANT AR @ LOCAL:RENAMED-WITHOUT-MARKER
+      root TARGET TARGET WANT AR @ LOCAL:SYNC-INSTALLED-DOWNLOAD ;]
+   [: f FS:CLOSE-DIR ;] finally ;
+
+: RENAMED-DOWNLOAD-REQUIRES-ITS-OWNERSHIP-MARKER ( -- )
+   s" renamed_download_requires_its_ownership_marker" T-LABEL
+   [: UNMARKED-RENAME ;] IN-CASE-DIR ;
+
+\ An absent target: none staged, then installed and installed again.
+: ABSENT-OUTCOMES ( fd -- )
+   {: root:fd :}
+   TARGET NO-CONTENT INSTALL s" " T$= s" download-required" T$=
+   s" missing/target.txt" NO-CONTENT INSTALL
+   s" " T$= s" download-required" T$=
+   root TARGET STAGE-REMOTE
+   TARGET NO-CONTENT INSTALL s" " T$= s" installed" T$=
+   TARGET READ$ s" remote" T$=
+   root TARGET STAGE-NAME$ LOCAL:ENTRY-EXISTS-AT TFALSE
+   TARGET AT FS:TRY-LSTAT TTRUE
+   FS:STAT-MODE@ $1FF and FS:MODE-PRIVATE-FILE T=
+   TARGET NO-CONTENT INSTALL s" " T$= s" already-installed" T$= ;
+
+: OCCUPIED-STAGE ( -- )
+   s" other.txt" STAGE-NAME$ {: sn:^ snu:n :}
+   sn snu s" mutant" PUT-FILE
+   s" other.txt" NO-CONTENT INSTALL
+   sn snu AT T$= s" stage-destination-occupied" T$= ;
+
+\ A replacement installs over the content expected and keeps any other.
+: REPLACEMENT-OUTCOMES ( fd -- )
+   {: root:fd :}
+   s" old.txt" s" local" PUT-FILE
+   root s" old.txt" STAGE-REMOTE
+   s" old.txt" s" local" HELD INSTALL s" " T$= s" installed" T$=
+   s" old.txt" READ$ s" remote" T$=
+   root s" old.txt" s" local" HASH-OF AR @ LOCAL:GUARD-NAME
+   LOCAL:ENTRY-EXISTS-AT TFALSE
+   s" edited.txt" s" edit" PUT-FILE
+   root s" edited.txt" STAGE-REMOTE
+   s" edited.txt" s" local" HELD INSTALL
+   s" edit" IDENTITY T$= s" precondition-changed" T$=
+   s" edited.txt" READ$ s" edit" T$= ;
+
+: INSTALL-CASES ( fd -- )
+   {: root:fd :}
+   root ABSENT-OUTCOMES OCCUPIED-STAGE root REPLACEMENT-OUTCOMES ;
+
+: EACH-INSTALL-OUTCOME-IS-REACHED ( -- )
+   s" each install outcome is reached" T-LABEL
+   [: INSTALL-CASES ;] IN-CASE-DIR ;
+
+: PREPARE-CASES ( fd -- )
+   {: root:fd :}
+   s" prep.txt" s" old" PUT-FILE
+   s" prep.txt" s" old" PREPARE s" " T$= s" prepared" T$=
+   root s" prep.txt" LOCAL:ENTRY-EXISTS-AT TFALSE
+   s" prep.txt" s" old" HASH-OF AR @ LOCAL:GUARD-NAME READ$ s" old" T$=
+   s" prep.txt" s" old" PREPARE s" " T$= s" already-prepared" T$=
+   s" other.txt" s" new" PUT-FILE
+   s" other.txt" s" old" PREPARE
+   s" new" IDENTITY T$= s" precondition-changed" T$=
+   s" other.txt" READ$ s" new" T$=
+   s" absent.txt" s" old" PREPARE
+   s" none" T$= s" precondition-changed" T$=
+   s" missing/file.txt" s" old" PREPARE
+   s" none" T$= s" precondition-changed" T$= ;
+
+: EACH-REPLACEMENT-PREPARATION-IS-REACHED ( -- )
+   s" each replacement preparation is reached" T-LABEL
+   [: PREPARE-CASES ;] IN-CASE-DIR ;
+
 \ ---- parents
 
 : INODE ( fd -- n ) FS:FD-STAT FS:STAT-INO@ ;
@@ -539,7 +839,13 @@ SHA256-CTX-BYTES BUFFER: PART
    MISSING-PARENT-IS-NONE-WITHOUT-CREATE
    CREATE-MAKES-PRIVATE-PARENTS
    SYMLINK-PARENT-IS-REFUSED
-   UNSAFE-PARENT-PATH-FAILS ;
+   UNSAFE-PARENT-PATH-FAILS
+   ABSENT-INSTALL-NEVER-OVERWRITES-AN-EXISTING-FILE
+   INSTALL-REJECTS-STAGE-CHANGED-THROUGH-A-PREEXISTING-WRITER
+   INSTALLED-DOWNLOAD-CLEANUP-REPLAYS-AROUND-PARTIAL-MARKER-REMOVAL
+   RENAMED-DOWNLOAD-REQUIRES-ITS-OWNERSHIP-MARKER
+   EACH-INSTALL-OUTCOME-IS-REACHED
+   EACH-REPLACEMENT-PREPARATION-IS-REACHED ;
 
 public
 
