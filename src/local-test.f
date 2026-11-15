@@ -3,8 +3,9 @@
 \ takes a failed probe as unconfirmed, that the content hash composes block
 \ hashes, and that neither the hash nor a stage's copy depends on how a
 \ reader fragments the bytes; then each stage outcome, each inspected
-\ download stage, and a stage marker set, read and removed. A case that
-\ makes files works in its own directory under TMPDIR and removes it.
+\ download stage, a stage marker set, read and removed, and each parent a
+\ download opens. A case that makes files works in its own directory
+\ under TMPDIR and removes it.
 \ Run from the repository root: hb --load src/local-test.f </dev/null
 require src/lib/test.f
 require src/lib/fmt.f
@@ -50,7 +51,18 @@ private
      ^ARENA:arena -- stage-outcome<n> )
    WRITE-VERIFIED-STAGE [: 0 ;] MAP-STAGE-WRITE ;
 
+\ OPEN-PARENT's answer apart: its descriptor, name, parent path and true;
+\ for none, -1, empty spans and false.
+: PARENT-OF ( fd ^u8 n bool -- fd ^u8 n ^u8 n bool )
+   OPEN-PARENT MATCH option
+      none OF -1 >FD s" " s" " false ENDOF
+      some OF PARENT-DIR-UNMAKE {: f:fd name:str path:str :}
+         f name str> path str> true
+      ENDOF
+   ;MATCH ;
+
 public
+EXPORT PARENT-OF
 EXPORT HASH-STREAM
 EXPORT COPY-AND-HASH
 EXPORT DOWNLOAD-STAGE-XATTR
@@ -405,6 +417,115 @@ SHA256-CTX-BYTES BUFFER: PART
    s" each stage outcome is reached" T-LABEL
    [: STAGE-CASES ;] IN-CASE-DIR ;
 
+\ ---- parents
+
+: INODE ( fd -- n ) FS:FD-STAT FS:STAT-INO@ ;
+
+: PATH-INODE ( ^u8 n -- n ) AT FS:TRY-LSTAT TTRUE FS:STAT-INO@ ;
+
+: SAME-ADDRESS ( ^u8 ^u8 -- )
+   {: a:^ b:^ :}
+   a NULL-PTR - b NULL-PTR - T= ;
+
+\ p's parent opens, its name and path spans of p; answers the descriptor.
+: PARENT ( fd ^u8 n bool ^u8 n ^u8 n -- fd )
+   {: root:fd p:^ u:n create:bool name:^ nu:n path:^ pu:n :}
+   p u T-LABEL
+   root p u create LOCAL:PARENT-OF TTRUE
+   {: f:fd got:^ gu:n gp:^ gpu:n :}
+   got gu name nu T$= gp gpu path pu T$=
+   got p u + nu - SAME-ADDRESS gp p SAME-ADDRESS
+   f ;
+
+\ Closes the descriptor PARENT-OF answers, if any.
+: TRY-PARENT ( fd ^u8 n bool -- )
+   LOCAL:PARENT-OF {: f:fd n:^ nu:n pp:^ pu:n found:bool :}
+   found if f FS:CLOSE-DIR then ;
+
+: ROOT-PARENT ( fd -- )
+   {: root:fd :}
+   s" present" s" bytes" PUT-FILE
+   root s" present" false s" present" s" " PARENT {: f:fd :}
+   f FD>N root FD>N <> TTRUE
+   f INODE root INODE T=
+   f FS:CLOSE-DIR
+   root s" present" LOCAL:ENTRY-EXISTS-AT TTRUE ;
+
+: EXISTING-PARENT ( fd -- )
+   {: root:fd :}
+   s" a/b" AT FS:MAKE-DIRS
+   root s" a/b/file" false s" file" s" a/b" PARENT {: f:fd :}
+   f INODE s" a/b" PATH-INODE T=
+   f FS:CLOSE-DIR ;
+
+: MISSING-PARENT ( fd -- )
+   {: root:fd :}
+   s" a" AT FS:MAKE-DIR
+   s" a/missing/file" T-LABEL
+   root s" a/missing/file" false LOCAL:PARENT-OF TFALSE
+   {: f:fd n:^ nu:n pp:^ pu:n :}
+   root s" a/missing" LOCAL:ENTRY-EXISTS-AT TFALSE ;
+
+: PRIVATE-DIR ( ^u8 n -- )
+   {: p:^ u:n :}
+   p u T-LABEL
+   p u AT FS:TRY-LSTAT TTRUE
+   FS:STAT-MODE@ FS:S-IFMT and FS:S-IFDIR T=
+   FS:STAT-MODE@ $1FF and MODE-0700 T= ;
+
+: CREATED-PARENTS ( fd -- )
+   {: root:fd :}
+   root s" x/y/z/file" true s" file" s" x/y/z" PARENT {: f:fd :}
+   s" x" PRIVATE-DIR s" x/y" PRIVATE-DIR s" x/y/z" PRIVATE-DIR
+   f INODE s" x/y/z" PATH-INODE T=
+   f FS:CLOSE-DIR
+   root s" x/y/z/file" LOCAL:ENTRY-EXISTS-AT TFALSE ;
+
+: SYMLINK-PARENT ( fd -- )
+   {: root:fd :}
+   s" real" AT FS:MAKE-DIR
+   s" real" s" link" AT FS:MAKE-SYMLINK
+   s" link/sub/file" T-LABEL
+   [: root s" link/sub/file" true TRY-PARENT ;] LOCAL:E-IO TTHROWSQ
+   FS:ERRNO FS:ENOTDIR T=
+   root s" real/sub" LOCAL:ENTRY-EXISTS-AT TFALSE ;
+
+: UNSAFE-PARENT ( fd ^u8 n -- )
+   {: root:fd p:^ u:n :}
+   p u T-LABEL
+   [: root p u false TRY-PARENT ;] LOCAL:E-UNSAFE-PATH TTHROWSQ ;
+
+: UNSAFE-PARENTS ( fd -- )
+   {: root:fd :}
+   root s" " UNSAFE-PARENT
+   root s" /absolute" UNSAFE-PARENT
+   root s" ./file" UNSAFE-PARENT
+   root s" a/../file" UNSAFE-PARENT ;
+
+: ONE-COMPONENT-PARENT-IS-A-DUPLICATE-ROOT ( -- )
+   s" one component's parent is a duplicate root" T-LABEL
+   [: ROOT-PARENT ;] IN-CASE-DIR ;
+
+: EXISTING-PARENT-OPENS ( -- )
+   s" existing parent opens" T-LABEL
+   [: EXISTING-PARENT ;] IN-CASE-DIR ;
+
+: MISSING-PARENT-IS-NONE-WITHOUT-CREATE ( -- )
+   s" missing parent is none without create" T-LABEL
+   [: MISSING-PARENT ;] IN-CASE-DIR ;
+
+: CREATE-MAKES-PRIVATE-PARENTS ( -- )
+   s" create makes private parents" T-LABEL
+   [: CREATED-PARENTS ;] IN-CASE-DIR ;
+
+: SYMLINK-PARENT-IS-REFUSED ( -- )
+   s" symlink parent is refused" T-LABEL
+   [: SYMLINK-PARENT ;] IN-CASE-DIR ;
+
+: UNSAFE-PARENT-PATH-FAILS ( -- )
+   s" unsafe parent path fails" T-LABEL
+   [: UNSAFE-PARENTS ;] IN-CASE-DIR ;
+
 : CASES ( -- )
    ENTRY-EXISTENCE-NEVER-FOLLOWS-SYMLINKS-AND-TREATS-PROBE-FAILURES-AS-UNCONFIRMED
    DROPBOX-HASH-USES-BLOCK-HASH-COMPOSITION
@@ -412,7 +533,13 @@ SHA256-CTX-BYTES BUFFER: PART
    MARKER-IS-RUSTS
    STAGE-MARKER-IS-SET-READ-AND-REMOVED
    EACH-DOWNLOAD-STAGE-IS-INSPECTED
-   EACH-STAGE-OUTCOME-IS-REACHED ;
+   EACH-STAGE-OUTCOME-IS-REACHED
+   ONE-COMPONENT-PARENT-IS-A-DUPLICATE-ROOT
+   EXISTING-PARENT-OPENS
+   MISSING-PARENT-IS-NONE-WITHOUT-CREATE
+   CREATE-MAKES-PRIVATE-PARENTS
+   SYMLINK-PARENT-IS-REFUSED
+   UNSAFE-PARENT-PATH-FAILS ;
 
 public
 

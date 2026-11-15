@@ -594,10 +594,14 @@ private
       some OF ENDOF
    ;MATCH ;
 
+: NO-DIRECTORY ( ^u8 n -- )
+   {: p:^ u:n :}
+   s" open root-confined directory" p u IO-FAILURE ;
+
 : OPEN-DIRECTORY-AT ( fd ^u8 n ^u8 n -- fd )
    {: dir:fd name:^ nu:n p:^ u:n :}
    dir name nu FS:TRY-OPEN-DIR-AT MATCH option
-      none OF s" open root-confined directory" p u IO-FAILURE ENDOF
+      none OF p u NO-DIRECTORY ENDOF
       some OF ENDOF
    ;MATCH ;
 
@@ -692,6 +696,91 @@ private
    [: f FD:SYNC ;] [: o ou p u IO-FAILURE ;] FS-FAILS ;
 
 : SYNC-FILE ( fd ^u8 n ^u8 n -- ) SYNC-DIRECTORY ;
+
+\ ---- parents
+
+\ S_IRWXU: a parent directory a download makes.
+$1C0 constant MODE-PRIVATE-DIR
+
+\ An open parent below the root, as Rust's (OwnedFd, OsString, PathBuf):
+\ its descriptor, then the last component and the parent's path, both
+\ spans of the path opened.
+STRUCTURE parent-dir
+   FIELD fd fd
+   FIELD name str
+   FIELD path str
+;STRUCTURE
+
+: DROP-DIR ( option<fd> -- ) drop ;
+
+: DUPLICATE-ROOT ( fd ^u8 n -- fd )
+   {: root:fd p:^ u:n :}
+   -1 >FD [: drop root FD:DUPLICATE ;]
+   [: s" duplicate sync root descriptor" p u IO-FAILURE ;] FS-FAILS ;
+
+\ Makes the directory p names in dir and syncs dir's entry; one that
+\ exists by now is used as it is.
+: MAKE-PARENT ( fd ^u8 n ^u8 n -- )
+   {: dir:fd name:^ nu:n p:^ u:n :}
+   dir name nu MODE-PRIVATE-DIR FS:TRY-MAKE-DIR-AT if
+      dir p u s" sync newly created parent directory entry"
+      SYNC-DIRECTORY exit
+   then
+   FS:ERRNO FS:EEXIST = if exit then
+   s" create download parent directory" p u IO-FAILURE ;
+
+\ The directory made and opened, then synced; a throw closes it.
+: MADE-DIRECTORY ( fd ^u8 n ^u8 n -- fd )
+   {: dir:fd name:^ nu:n p:^ u:n :}
+   dir name nu p u MAKE-PARENT
+   dir name nu p u OPEN-DIRECTORY-AT {: next:fd :}
+   next [: next p u s" sync newly created directory" SYNC-DIRECTORY ;]
+   CLOSING next ;
+
+\ After an open in dir failed: none for a missing name without create,
+\ else the directory made.
+: MISSING-DIRECTORY ( fd ^u8 n ^u8 n bool -- option<fd> )
+   {: dir:fd name:^ nu:n p:^ u:n create:bool :}
+   FS:ERRNO FS:ENOENT <> if p u NO-DIRECTORY then
+   create 0= if OPTION:NONE exit then
+   dir name nu p u MADE-DIRECTORY OPTION:SOME ;
+
+: OPEN-COMPONENT ( fd ^u8 n ^u8 n bool -- option<fd> )
+   {: dir:fd name:^ nu:n p:^ u:n create:bool :}
+   dir name nu FS:TRY-OPEN-DIR-AT MATCH option
+      none OF dir name nu p u create MISSING-DIRECTORY ENDOF
+      some OF OPTION:SOME ENDOF
+   ;MATCH ;
+
+\ Opens each component of p before u from at on in the directory before
+\ it, dir first; each closes once the next opens or a throw passes.
+: DESCEND-PARENTS ( fd ^u8 n n bool -- option<fd> )
+   {: dir:fd p:^ u:n at:n create:bool :}
+   p u at NEXT-COMPONENT {: from:n to:n found:bool :}
+   found 0= if dir OPTION:SOME exit then
+   OPTION:NONE dir
+   [: DROP-DIR dir p from + to from - p to create OPEN-COMPONENT ;]
+   CLOSING dir DISCARD
+   MATCH option
+      none OF OPTION:NONE ENDOF
+      some OF p u to create RECURSE ENDOF
+   ;MATCH ;
+
+\ Rust's open_parent: the parent of p's last component below the root,
+\ none when a directory on the way is missing; create makes those
+\ directories, each synced with its entry.
+: OPEN-PARENT ( fd ^u8 n bool -- option<parent-dir> )
+   {: root:fd p:^ u:n create:bool :}
+   p u SAFE-COMPONENTS drop
+   p u SPLIT-LAST {: parent:n from:n to:n :}
+   root p u DUPLICATE-ROOT p parent 0 create DESCEND-PARENTS
+   MATCH option
+      none OF OPTION:NONE ENDOF
+      some OF {: f:fd :}
+         f p from + to from - >str p parent >str PARENT-DIR-MAKE
+         OPTION:SOME
+      ENDOF
+   ;MATCH ;
 
 \ ---- download stages
 
