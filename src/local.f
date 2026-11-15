@@ -33,12 +33,11 @@
 \ STORAGE CLASS. PROCESS-WIDE: the content hasher, its read buffer, the
 \ name hasher, the marker and slot state buffers, the slot name and path
 \ buffers, a lease's slot table, the byte a partial's end is probed with,
-\ an upload collection's listing buffer and names, the scan's directory
-\ listing context and the predicate of the innermost CONVERTING; one task
-\ syncs, so one uses them at a time. CALLER-OWNED: every descriptor
-\ answered, the hashes, names, paths, vectors, staged uploads and partials
-\ laid in the caller's arena, the paths a stage's result names and a
-\ lease's slot directory.
+\ the directory listing context and the predicate of the innermost
+\ CONVERTING; one task syncs, so one uses them at a time. CALLER-OWNED:
+\ every descriptor answered, the hashes, names, paths, vectors, staged
+\ uploads and partials laid in the caller's arena, the paths a stage's
+\ result names and a lease's slot directory.
 
 require src/lib/error.f
 require src/lib/string.f
@@ -1126,8 +1125,8 @@ private
    pu 0= if p u exit then
    p pu 1+ + u pu 1+ - ;
 
-\ The one directory listing open at a time: the walk lists a directory
-\ whole before it scans any entry in it.
+\ The one directory listing open at a time: LIST-PATHS reads a directory
+\ whole before its caller uses any entry in it.
 create LISTING FS-LIST:STORAGE-BYTES allot
 
 : LISTED ( fd str ^ARENA:arena ^VEC:vector<str> -- )
@@ -1136,21 +1135,22 @@ create LISTING FS-LIST:STORAGE-BYTES allot
    dir [: drop parent str> 2swap ar JOIN >str v VEC:PUSH ! ;]
    FS-LIST:EACH-TYPED-AT ;
 
-: LIST-FAILURE ( n ^u8 n -- )
-   {: code:n p:^ u:n :}
-   code FS-LIST:E-OPEN = if s" open directory stream" p u IO-FAILURE then
+: LIST-FAILURE ( n ^u8 n ^u8 n ^u8 n -- )
+   {: code:n open:^ ou:n read:^ ru:n p:^ u:n :}
+   code FS-LIST:E-OPEN = if open ou p u IO-FAILURE then
    code E-FS-LIST-LAST >= code E-FS-LIST-FIRST <= and if
-      s" read directory" p u IO-FAILURE
+      read ru p u IO-FAILURE
    then
    code throw ;
 
-\ The paths of the entries in dir, but . and .., in the order listed.
-: LIST-PATHS ( fd str ^ARENA:arena -- ^VEC:vector<str> )
-   {: dir:fd parent:str ar:^ARENA:arena :}
+\ The paths of the entries in dir, but . and .., in the order listed; a
+\ failed listing is an io failure named by the open or the read text.
+: LIST-PATHS ( fd str ^u8 n ^u8 n ^ARENA:arena -- ^VEC:vector<str> )
+   {: dir:fd parent:str open:^ ou:n read:^ ru:n ar:^ARENA:arena :}
    ar [type] str NEW-VEC {: v :}
    0 FS:CAUSE!
    [: dir parent ar v LISTED ;] catch {: code:n :}
-   code 0<> if code parent str> LIST-FAILURE then
+   code 0<> if code open ou read ru parent str> LIST-FAILURE then
    v ;
 
 : REUSABLE-CONTENT
@@ -1283,7 +1283,8 @@ defer SCAN-SUBTREE ( fd str scan-context scan-entries -- )
    path str> {: p:^ u:n :}
    cx SCAN-CONTEXT-UNMAKE {: cache cut:option<cutoff> dev:n ar :}
    dir p u s" inspect directory before scan" STAT-FD {: before:stat :}
-   dir path ar LIST-PATHS {: names :}
+   dir path s" open directory stream" s" read directory" ar LIST-PATHS
+   {: names :}
    names VEC:COUNT [: names swap VEC:AT STR@ ;] ar ORDER {: idx :}
    idx VEC:COUNT 0 ?do
       dir names idx i VEC:AT @ VEC:AT @ path cx en SCAN-NAME
@@ -2332,89 +2333,37 @@ private
       ENDOF
    ;MATCH ;
 
-\ The names a collection considers, 64-byte hashes in byte order, in an
-\ arena block that doubles as it fills.
-PTR-VARIABLE UPLOAD-NAMES
-variable UPLOAD-NAME-COUNT
-variable UPLOAD-NAME-CAP
-64 constant UPLOAD-NAME-LEN
-FS-LIST:STORAGE-BYTES BUFFER: LIST-BUF
-
-: UPLOAD-NAME ( n -- ^u8 n )
-   {: idx:n :}
-   UPLOAD-NAMES @ idx UPLOAD-NAME-LEN * + UPLOAD-NAME-LEN ;
-
-: GROW-UPLOAD-NAMES ( ^ARENA:arena -- )
-   {: ar:^ARENA:arena :}
-   UPLOAD-NAME-COUNT @ UPLOAD-NAME-CAP @ < if exit then
-   UPLOAD-NAME-CAP @ 2 * 8 max {: cap:n :}
-   ar ARENA:ALLOCATOR UPLOAD-NAMES @
-   UPLOAD-NAME-CAP @ UPLOAD-NAME-LEN * cap UPLOAD-NAME-LEN *
-   ALLOC:RESIZE drop UPLOAD-NAMES !
-   cap UPLOAD-NAME-CAP ! ;
-
-\ The index of the first kept name after the one given, else the count.
-: UPLOAD-NAME-SLOT ( ^u8 n -- n )
-   {: name:^ nu:n :}
-   UPLOAD-NAME-COUNT @ 0 ?do
-      name nu i UPLOAD-NAME STR< if i unloop exit then
-   loop UPLOAD-NAME-COUNT @ ;
-
-: MOVE-UP ( n -- )
-   {: idx:n :}
-   idx UPLOAD-NAME drop idx 1+ UPLOAD-NAME drop UPLOAD-NAME-LEN BYTE-COPY ;
-
-\ Moves the names from idx on up one place, the last first.
-: OPEN-UPLOAD-NAME ( n -- )
-   {: idx:n :}
-   UPLOAD-NAME-COUNT @ begin dup idx > while 1- dup MOVE-UP repeat drop ;
-
-\ Keeps the name in order when it names an upload stage's content.
-: KEEP-UPLOAD-NAME ( ^u8 n ^ARENA:arena -- )
-   {: name:^ nu:n ar:^ARENA:arena :}
-   name nu VALID-CONTENT-HASH? 0= if exit then
-   ar GROW-UPLOAD-NAMES
-   name nu UPLOAD-NAME-SLOT {: idx:n :}
-   idx OPEN-UPLOAD-NAME
-   name idx UPLOAD-NAME drop nu BYTE-COPY
-   1 UPLOAD-NAME-COUNT +! ;
-
-: LIST-OPERATION ( n -- ^u8 n )
-   FS-LIST:E-OPEN = if s" open upload staging directory stream" exit then
-   s" read upload staging directory" ;
-
-\ Gathers dir's upload stage names; a failed listing is an io failure.
-: LIST-UPLOAD-NAMES ( fd ^u8 n ^ARENA:arena -- )
-   {: dir:fd s:^ su:n ar:^ARENA:arena :}
-   0 UPLOAD-NAME-COUNT ! 0 UPLOAD-NAME-CAP ! NULL-PTR UPLOAD-NAMES !
-   0 FS:CAUSE!
-   LIST-BUF FS-LIST:STORAGE-BYTES SPAN:MAKE FS-LIST:INIT {: ctx :}
-   [: ctx dir [: drop ar KEEP-UPLOAD-NAME ;] FS-LIST:EACH-TYPED-AT ;]
-   catch {: code:n :}
-   code 0= if exit then
-   code FS-LIST:E-OPEN = code FS-LIST:E-READ = or if
-      code LIST-OPERATION s su IO-FAILURE
-   then
-   code throw ;
-
-\ Removes the stage when it verifies; answers how many it removed.
+\ Removes the stage at the listed path when it verifies; answers how
+\ many it removed.
 : COLLECT-UPLOAD-STAGE ( fd ^u8 n ^u8 n ^ARENA:arena -- n )
-   {: dir:fd name:^ nu:n s:^ su:n ar:^ARENA:arena :}
-   s su name nu ar JOIN {: p:^ u:n :}
+   {: dir:fd name:^ nu:n p:^ u:n ar:^ARENA:arena :}
    dir name nu p u ar VERIFIED-UPLOAD-STAGE-ENTRY? 0= if 0 exit then
    dir name nu FS:TRY-REMOVE-FILE-AT if 1 exit then
    FS:ERRNO FS:ENOENT <> if
       s" remove unreferenced upload stage" p u IO-FAILURE
    then 0 ;
 
+\ Collects the path's stage when its name is a content hash retained
+\ does not keep; answers how many it removed.
+: COLLECT-LISTED-STAGE
+   ( fd str str [ DROPBOX:hash -- bool ] ^ARENA:arena -- n )
+   {: dir:fd path:str s:str retained ar:^ARENA:arena :}
+   path s NAME-OF {: name:^ nu:n :}
+   name nu VALID-CONTENT-HASH? 0= if 0 exit then
+   name nu >str DROPBOX:>HASH retained execute if 0 exit then
+   dir name nu path str> ar COLLECT-UPLOAD-STAGE ;
+
+\ The stages in s visited in name byte order, the whole listing read
+\ before any is removed.
 : COLLECT-UPLOAD-STAGES
-   ( fd ^u8 n [ DROPBOX:hash -- bool ] ^ARENA:arena -- n )
-   {: dir:fd s:^ su:n retained ar:^ARENA:arena :}
-   0 UPLOAD-NAME-COUNT @ 0 ?do
-      i UPLOAD-NAME >str DROPBOX:>HASH {: c:DROPBOX:hash :}
-      c retained execute 0= if
-         dir c DROPBOX:HASH>STR str> s su ar COLLECT-UPLOAD-STAGE +
-      then
+   ( fd str [ DROPBOX:hash -- bool ] ^ARENA:arena -- n )
+   {: dir:fd s:str retained ar:^ARENA:arena :}
+   dir s s" open upload staging directory stream"
+   s" read upload staging directory" ar LIST-PATHS {: paths :}
+   paths VEC:COUNT [: paths swap VEC:AT STR@ ;] ar ORDER {: idx :}
+   0 idx VEC:COUNT 0 ?do
+      dir paths idx i VEC:AT @ VEC:AT @ s retained ar
+      COLLECT-LISTED-STAGE +
    loop ;
 
 public
@@ -2428,8 +2377,7 @@ public
    {: s:^ su:n retained ar:^ARENA:arena :}
    s su s" open upload staging directory for collection"
    OPEN-PRIVATE-DIRECTORY {: dir:fd :}
-   0 dir [: drop dir s su ar LIST-UPLOAD-NAMES
-      dir s su retained ar COLLECT-UPLOAD-STAGES
+   0 dir [: drop dir s su >str retained ar COLLECT-UPLOAD-STAGES
       dup 0<> if
          dir s su s" sync upload stage collection" SYNC-DIRECTORY
       then ;] CLOSING
