@@ -24,7 +24,11 @@ ENUM reply
 ```
 
 - `retry` covers 429, 5xx, 408, `too_many_write_operations`, a timeout or a
-  lost connection.
+  lost connection. Its wait is `Retry-After`, in seconds (any number of
+  digits) or as an HTTP date (a passed date asks for none); on a 429, the
+  larger of that and the body's `error.retry_after`; else 0. No wait is over
+  15 minutes. A 408 is retried as HTTP lets a client repeat a request the
+  server timed out; the Rust version stops on one as an unexpected status.
 - `unlinked` is logged once, where it is decided: a 403, a refreshed token
   refused, or `invalid_grant` on the refresh. A confirmation that answers
   `unlinked` answers it in its call's place. A code exchange's `unlinked`

@@ -35,6 +35,7 @@ require src/lib/memory.f
 require src/lib/aio.f
 require src/lib/fsm.f
 require src/lib/unicode.f
+require src/lib/date.f
 
 package DROPBOX
 public
@@ -458,11 +459,30 @@ ENUM verdict
    repeat drop a 0 ;
 
 
-\ Retry-After in delta-seconds as ms, false when absent or not a number.
+\ The longest wait in seconds, 15 minutes.
+900 constant WAIT-CAP
+
+
+\ Delta-seconds: digits only, any number of them, at most WAIT-CAP.
+: DELTA-SECONDS ( ptr u8 n -- option<n> )
+   {: a:ptr u:n :}
+   a u STR-DIGITS? 0= if OPTION:NONE exit then
+   0 0 begin dup u < while
+      swap STR-BASE * over a + c@ STR-DIGIT-VALUE +
+      WAIT-CAP min swap 1+
+   repeat drop OPTION:SOME ;
+
+
+\ Retry-After in seconds: delta-seconds, else an HTTP date less now and at
+\ least 0 (a passed date asks for no wait); 0 false when absent or neither.
 : RETRY-AFTER ( ptr client -- n bool )
-   s" Retry-After" HEADER$ STR-PARSE-POS MATCH option
-      none OF 0 false ENDOF
-      some OF 1000 * true ENDOF
+   s" Retry-After" HEADER$ epoch-seconds {: a:ptr u:n now:n :}
+   a u DELTA-SECONDS MATCH option
+      some OF true ENDOF
+      none OF a u now DATE:PARSE-HTTP MATCH option
+         none OF 0 false ENDOF
+         some OF now - 0 max true ENDOF
+      ;MATCH ENDOF
    ;MATCH ;
 
 
@@ -627,13 +647,16 @@ ENUM verdict
    c CLIENT-STATUS @ 0= c CLIENT-QUIET @ 0= and ;
 
 
-\ 429, 408 or 5xx: Retry-After, else a 429 body's error.retry_after, else 0.
+\ 429: the larger of Retry-After and the body's error.retry_after; 408 or
+\ 5xx: Retry-After; 0 when neither gives one. Each wait is at most WAIT-CAP
+\ seconds.
 : WAITED ( ptr client -- reply )
    {: c :}
-   c RETRY-AFTER if RETRY exit then drop
-   c CLIENT-STATUS @ 429 <> if 0 RETRY exit then
-   c ERROR-READ? 0= if 0 RETRY exit then
-   c CLIENT-WAIT @ 0 max 1000 * RETRY ;
+   c RETRY-AFTER 0= if drop 0 then
+   c CLIENT-STATUS @ 429 = if
+      c ERROR-READ? if c CLIENT-WAIT @ max then
+   then
+   0 max WAIT-CAP min 1000 * RETRY ;
 
 
 : UNEXPECTED ( ptr client n -- )

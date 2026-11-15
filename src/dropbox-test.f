@@ -419,6 +419,53 @@ TYPED-VARIABLE OWN ptr DROPBOX:client
    MAIN @ DROPBOX:ACCOUNT RETRY-MS 7000 T= ;
 
 
+\ A 429 waits the larger of Retry-After and the body's retry_after.
+: RATE-BODY-CASE ( -- )
+   s" rate limited longer in the body" T-LABEL
+   TEST-DROPBOX:RESET
+   429 s" Retry-After" s" 2"
+   S\" {\qerror_summary\q:\qtoo_many_requests/...\q,\qerror\q:{\qreason\q:{\q.tag\q:\qtoo_many_requests\q},\qretry_after\q:3}}"
+   TEST-DROPBOX:SCRIPT!
+   MAIN @ DROPBOX:ACCOUNT RETRY-MS 3000 T= ;
+
+
+\ A Retry-After date waits until it, at most 15 minutes.
+: RATE-DATE-CASE ( -- )
+   s" unavailable until a far date" T-LABEL
+   TEST-DROPBOX:RESET
+   503 s" Retry-After" s" Fri, 31 Dec 9999 23:59:59 GMT" s" "
+   TEST-DROPBOX:SCRIPT!
+   MAIN @ DROPBOX:ACCOUNT RETRY-MS 900000 T= ;
+
+
+\ A body's retry_after alone waits at most 15 minutes.
+: RATE-CAP-CASE ( -- )
+   s" rate limited past the cap" T-LABEL
+   TEST-DROPBOX:RESET
+   429 s" " s" "
+   S\" {\qerror_summary\q:\qtoo_many_requests/...\q,\qerror\q:{\qreason\q:{\q.tag\q:\qtoo_many_requests\q},\qretry_after\q:100000}}"
+   TEST-DROPBOX:SCRIPT!
+   MAIN @ DROPBOX:ACCOUNT RETRY-MS 900000 T= ;
+
+
+\ Retry-After seconds may carry more digits than an i64 holds.
+: RATE-ZEROS-CASE ( -- )
+   s" unavailable for zero-padded seconds" T-LABEL
+   TEST-DROPBOX:RESET
+   503 s" Retry-After" s" 00000000000000000002" s" "
+   TEST-DROPBOX:SCRIPT!
+   MAIN @ DROPBOX:ACCOUNT RETRY-MS 2000 T= ;
+
+
+\ Retry-After seconds past an i64 wait at most 15 minutes.
+: RATE-HUGE-CASE ( -- )
+   s" unavailable for seconds past an i64" T-LABEL
+   TEST-DROPBOX:RESET
+   503 s" Retry-After" s" 99999999999999999999999999" s" "
+   TEST-DROPBOX:SCRIPT!
+   MAIN @ DROPBOX:ACCOUNT RETRY-MS 900000 T= ;
+
+
 : BUSY-CASE ( -- )
    s" unavailable" T-LABEL
    TEST-DROPBOX:RESET
@@ -1663,7 +1710,9 @@ TYPED-VARIABLE FAULT fault
    ACCOUNT-CASE FILE-CASE BUILT-PATH-CASE MISSING-CASE ROOT-CASE
    LOST-READ-CASE EXPIRED-CASE
    UNLINKED-CASE REVOKED-CASE DENIED-CASE SCRIPTED-REFRESH-CASE
-   RATE-CASE BUSY-CASE REDIRECT-CASE BAD-REQUEST-CASE
+   RATE-CASE RATE-BODY-CASE RATE-DATE-CASE RATE-CAP-CASE
+   RATE-ZEROS-CASE RATE-HUGE-CASE
+   BUSY-CASE REDIRECT-CASE BAD-REQUEST-CASE
    CLASSIFY-CASES
    PAGES-CASE RESET-CASE STALL-CASE UNTAGGED-CASE POLL-CASE POLL-RESET-CASE
    DOWNLOAD-CASES
