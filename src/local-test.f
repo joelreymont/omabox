@@ -4,30 +4,32 @@
 \ never follows a symlink and takes a failed probe as unconfirmed, that
 \ the content hash composes block hashes, and that neither the hash nor a
 \ stage's copy depends on how a reader fragments the bytes; its scan
-\ tests but the parallel one, each journal test keeping the half without
-\ the journal, in the part LOCAL SCAN-TEST, which sees LOCAL's private
-\ types; that upload stage collection removes only verified unreferenced
-\ content; then each stage outcome, each inspected download stage, a
-\ stage marker set, read and removed, a second mark failing with one
-\ xattr line on stderr, each upload stage outcome, an upload source that
-\ vanished or is a directory, and each parent a download opens; then
-\ that a slot's state keeps its last checkpoint, that slot identity and
-\ state bytes are the Rust daemon's, a reset never touches a replacement
-\ swapped in, the pool's four fixed slots, a protected slot kept and a
-\ stale one rebound; then that a cut download resumes from its last
-\ durable checkpoint, a completed partial is promoted before or after its
-\ rename, a corrupt one restarts only in its own slot, a promotion keeps
-\ a swapped replacement, a copy across filesystems frees its slot, and a
-\ reset slot replays to offset 0, each completed stage installed and read
-\ back at its target; then local.rs's install tests, each install
-\ outcome, an install a directory or an unreadable file at its stage's
-\ name blocks, each replacement preparation, that a complete disposable
-\ download closes its parent, and the scan lock test's half without the
-\ lock: a disposable partial appended is staged and leaves its staging
-\ directory empty; then that directory effects never overwrite or
-\ recurse, that a delete's replay keeps a raced edit, and each delete,
-\ directory and conflict outcome. A case that makes files works in its
-\ own directory under TMPDIR and removes it.
+\ tests, the reason each failure one entry raises publishes among them,
+\ but those the comment on CASES names, each journal test keeping the
+\ half without the journal, in the part LOCAL SCAN-TEST, which sees
+\ LOCAL's private types; that upload stage collection removes only
+\ verified unreferenced content; then each stage outcome, each inspected
+\ download stage, a stage marker set, read and removed, a second mark
+\ failing with one xattr line on stderr, each upload stage outcome, an
+\ upload source that vanished or is a directory, and each parent a
+\ download opens; then that a slot's state keeps its last checkpoint,
+\ that slot identity and state bytes are the Rust daemon's, a reset never
+\ touches a replacement swapped in, the pool's four fixed slots, a
+\ protected slot kept and a stale one rebound; then that a cut download
+\ resumes from its last durable checkpoint, a completed partial is
+\ promoted before or after its rename, a corrupt one restarts only in its
+\ own slot, a promotion keeps a swapped replacement, a copy across
+\ filesystems frees its slot, and a reset slot replays to offset 0, each
+\ completed stage installed and read back at its target; then local.rs's
+\ install tests, each install outcome, an install a directory or an
+\ unreadable file at its stage's name blocks, each replacement
+\ preparation, that a complete disposable download closes its parent, and
+\ the scan lock test's half without the lock: a disposable partial
+\ appended is staged and leaves its staging directory empty; then that
+\ directory effects never overwrite or recurse, that a delete's replay
+\ keeps a raced edit, and each delete, directory and conflict outcome. A
+\ case that makes files works in its own directory under TMPDIR and
+\ removes it.
 \ Run from the repository root: hb --load src/local-test.f </dev/null
 require src/lib/test.f
 require src/lib/test/stderr.f
@@ -347,12 +349,29 @@ FS:PATHZ-CAP BUFFER: JOINED
 : DENY ( ^u8 n -- ) AT 0 FS:CHMOD-MODE ;
 : ALLOW ( ^u8 n -- ) AT MODE-0700 FS:CHMOD-MODE ;
 
+\ A new directory under TMPDIR, its path copied to buf; the path's length.
+: TEMP-DIR ( ^u8 n ^u8 -- n )
+   {: pre:^ pu:n buf:^ :}
+   pre pu FS:MKTEMP-DIR {: p:^ u:n :}
+   p buf u BYTE-COPY u ;
+
 \ Runs q in a new root under TMPDIR, which it then removes.
 : IN-CASE ( [ -- ] -- )
    {: q :}
-   s" local-scan-test" FS:MKTEMP-DIR {: p:^ u:n :}
-   p ROOT-BUF u BYTE-COPY u ROOT-U !
+   s" local-scan-test" ROOT-BUF TEMP-DIR ROOT-U !
    [: q execute ;] [: ROOT$ FS:REMOVE-TREE ;] finally ;
+
+FS:PATHZ-CAP BUFFER: OUTSIDE-BUF
+variable OUTSIDE-U
+
+: OUTSIDE$ ( -- ^u8 n ) OUTSIDE-BUF OUTSIDE-U @ ;
+
+\ Runs q beside a new directory under TMPDIR, outside the case's root,
+\ which it then removes.
+: BESIDE-OUTSIDE ( [ -- ] -- )
+   {: q :}
+   s" local-scan-outside" OUTSIDE-BUF TEMP-DIR OUTSIDE-U !
+   [: q execute ;] [: OUTSIDE$ FS:REMOVE-TREE ;] finally ;
 
 64 BUFFER: READ-BUF
 
@@ -372,6 +391,51 @@ create TIMES 32 allot
 
 : LINK-OF ( ^u8 n -- ^u8 n )
    AT FS:>PATHZ READ-BUF 64 READLINK-CALL READ-BUF swap ;
+
+FUNCTION: MKFIFO-CALL mkfifo ( ^u8 n -- i32 ) ;FUNCTION
+FUNCTION: SOCKET-CALL socket ( n n n -- i32 ) ;FUNCTION
+FUNCTION: BIND-CALL bind ( n ^u8 n -- i32 ) ;FUNCTION
+FUNCTION: GETEUID-CALL geteuid ( -- i32 ) ;FUNCTION
+
+384 constant MODE-0600
+1 constant AF-UNIX
+1 constant SOCK-STREAM
+\ Linux sockaddr_un: a u16 sun_family, then a 108-byte sun_path.
+110 BUFFER: SOCKADDR
+
+\ A socket bound at the name below the case's root, as Rust's
+\ UnixListener::bind leaves one; its descriptor.
+: BOUND ( ^u8 n -- fd )
+   AT {: p:^ u:n :}
+   u 108 < TTRUE
+   AF-UNIX SOCKADDR c! 0 SOCKADDR 1 + c!
+   p SOCKADDR 2 + u BYTE-COPY 0 SOCKADDR 2 + u + c!
+   AF-UNIX SOCK-STREAM 0 SOCKET-CALL {: s:n :}
+   s 0 >= TTRUE
+   s SOCKADDR u 3 + BIND-CALL 0 T=
+   s >FD ;
+
+FS:PATHZ-CAP BUFFER: TARGET
+
+\ The name below the case's root, valid until the next TARGET-AT.
+: TARGET-AT ( ^u8 n -- ^u8 n )
+   {: p:^ u:n :}
+   ROOT$ p u TARGET FS:JOIN-PATH TARGET swap ;
+
+\ Root opens a file and searches a directory whatever its mode.
+: ROOT-USER? ( -- bool ) GETEUID-CALL 0 = ;
+
+256 BUFFER: ERR
+
+\ Runs q with fd 2 sent to stderr.txt below the case's root; what that
+\ file then holds, after which it is removed.
+: STDERR-OF ( [ -- ] -- ^u8 n )
+   {: q :}
+   s" stderr.txt" AT STDERR:CAPTURE
+   [: q execute ;] [: STDERR:;CAPTURE ;] finally
+   s" stderr.txt" AT ERR 256 FS:READ-ALL {: n :}
+   s" stderr.txt" AT FS:REMOVE-FILE
+   ERR n ;
 
 \ ---- the scan's values
 
@@ -547,6 +611,16 @@ create TIMES 32 allot
    s s" kept" PRESENT SEEN
    s PUBLISHED 2 T= ;
 
+: FILE-LOCKED-AFTER-ENUMERATION-IS-INACCESSIBLE ( -- )
+   s" file_locked_after_enumeration_is_inaccessible" T-LABEL
+   s" locked.txt" s" locked" WRITE
+   s" stable.txt" s" stable" WRITE
+   NO-CACHE NO-CUTOFF ENUMERATE {: ps:pending-scan :}
+   s" locked.txt" DENY
+   ps FINISH-SCAN {: s:complete-scan :}
+   s s" locked.txt" INACCESSIBLE SEEN
+   s s" stable.txt" PRESENT SEEN ;
+
 \ The half without the journal: the first scan's reusable hashes stand for
 \ the cache it would publish, and the check that a failed scan leaves the
 \ published inventory and cache alone is JOURNAL's. The throw carries no
@@ -705,6 +779,38 @@ create TIMES 32 allot
    s" ~$private/child.txt" CONTENT-OF s" private" T$=
    s" .dropbox" LINK-OF s" missing" T$= ;
 
+: LINKED-OUTSIDE ( -- )
+   s" kept.txt" s" kept" WRITE
+   NO-CACHE STABLE [: STABLE ;] CACHED-SCAN REUSABLE {: cache :}
+   cache VEC:COUNT 1 T=
+   OUTSIDE$ s" unsupported-link" AT FS:MAKE-SYMLINK
+   cache STABLE [: STABLE ;] CACHED-SCAN {: s:complete-scan :}
+   s s" unsupported-link" UNSUPPORTED-KIND SEEN
+   s s" kept.txt" PRESENT SEEN
+   s PUBLISHED 2 T=
+   s REUSABLE VEC:COUNT 1 T= ;
+
+\ The half without the journal: the first scan's reusable hashes stand for
+\ the cache it would publish, and the second's observations and reusable
+\ hashes for the inventory and cache it publishes.
+: SYMLINK-IS-PUBLISHED-AS-UNSUPPORTED-BESIDE-A-SYNCHRONIZED-FILE ( -- )
+   s" symlink_is_published_as_unsupported_beside_a_synchronized_file"
+   T-LABEL
+   [: LINKED-OUTSIDE ;] BESIDE-OUTSIDE ;
+
+: SPECIAL-ENTRIES-ARE-PUBLISHED-AS-UNSUPPORTED ( -- )
+   s" special_entries_are_published_as_unsupported" T-LABEL
+   s" regular.txt" s" regular" WRITE
+   s" regular.txt" TARGET-AT s" link" AT FS:MAKE-SYMLINK
+   s" fifo" AT FS:>PATHZ MODE-0600 MKFIFO-CALL 0 T=
+   s" socket" BOUND {: sock:fd :}
+   [: ROOT-SCAN ;] [: sock DISCARD ;] finally {: s:complete-scan :}
+   s s" fifo" UNSUPPORTED-KIND SEEN
+   s s" link" UNSUPPORTED-KIND SEEN
+   s s" socket" UNSUPPORTED-KIND SEEN
+   s s" regular.txt" PRESENT SEEN
+   s PUBLISHED 4 T= ;
+
 : INACCESSIBLE-FILE-IS-UNKNOWN-BESIDE-A-READABLE-FILE ( -- )
    s" inaccessible_file_is_unknown_beside_a_readable_file" T-LABEL
    s" locked.txt" s" locked" WRITE
@@ -714,6 +820,61 @@ create TIMES 32 allot
    s s" locked.txt" INACCESSIBLE SEEN
    s s" open.txt" PRESENT SEEN
    s PUBLISHED 2 T= ;
+
+: HASH-LOCKED ( fd -- )
+   s" locked.txt" s" locked.txt" s" hash unreadable test file" AR @
+   HASH-AT-IF-PRESENT drop ;
+
+\ The throw carries no path; the one line it logs names it.
+: UNREADABLE-REGULAR-FILE-IS-REPORTED-AS-UNREADABLE ( -- )
+   s" unreadable_regular_file_is_reported_as_unreadable" T-LABEL
+   ROOT-USER? if exit then
+   s" locked.txt" s" locked" WRITE
+   ROOT$ s" open test root" OPEN-ROOT {: root:fd :}
+   s" locked.txt" DENY
+   [: [: root HASH-LOCKED ;] E-UNREADABLE TTHROWSQ ;] STDERR-OF
+   s" local path `locked.txt` is a file Omabox cannot read" CONTAINS?
+   TTRUE
+   root DISCARD ;
+
+variable CAUGHT
+
+: HASH-BELOW ( fd -- )
+   s" file.txt" s" closed/file.txt"
+   s" hash file below unsearchable parent" AR @
+   HASH-AT-IF-PRESENT drop ;
+
+\ The errno is read before the parent is searchable again.
+: UNSEARCHABLE-PARENT-IS-AN-IO-FAILURE ( -- )
+   s" unsearchable_parent_is_an_io_failure" T-LABEL
+   ROOT-USER? if exit then
+   s" closed" MKDIR
+   s" closed/file.txt" s" inside" WRITE
+   s" closed" AT s" open test parent" OPEN-ROOT {: parent:fd :}
+   s" closed" AT MODE-0600 FS:CHMOD-MODE
+   [: [: parent HASH-BELOW ;]
+      [: FS:ERRNO CAUGHT ! s" closed" ALLOW ;] finally
+   ;] E-IO TTHROWSQ
+   CAUGHT @ FS:EACCES T=
+   parent DISCARD ;
+
+\ "earlier" is walked before "locked", so discarding the unreadable
+\ subtree must not reach back into a sibling already collected.
+: INACCESSIBLE-DIRECTORY-PUBLISHES-NOTHING-BENEATH-ITSELF ( -- )
+   s" inaccessible_directory_publishes_nothing_beneath_itself" T-LABEL
+   s" earlier" MKDIR
+   s" earlier/inner.txt" s" inner" WRITE
+   s" locked" MKDIR
+   s" locked/secret.txt" s" secret" WRITE
+   s" open.txt" s" open" WRITE
+   s" locked" DENY
+   [: ROOT-SCAN ;] [: s" locked" ALLOW ;] finally {: s:complete-scan :}
+   s s" locked" INACCESSIBLE SEEN
+   s s" locked/secret.txt" MISSING SEEN
+   s s" earlier" DIRECTORY SEEN
+   s s" earlier/inner.txt" PRESENT SEEN
+   s s" open.txt" PRESENT SEEN
+   s PUBLISHED 4 T= ;
 
 : DIRECTORY-CHANGED-DURING-THE-SCAN-HIDES-ITS-CONTENTS ( -- )
    s" directory_changed_during_the_scan_hides_its_contents" T-LABEL
@@ -728,6 +889,42 @@ create TIMES 32 allot
    s s" nested/appeared" MISSING SEEN
    s s" stable.txt" PRESENT SEEN
    s PUBLISHED 2 T= ;
+
+: WRITE-OVER ( ^u8 n -- ) s" no longer a directory" WRITE ;
+
+: LINK-OVER ( ^u8 n -- )
+   {: p:^ u:n :}
+   s" elsewhere" p u AT FS:MAKE-SYMLINK ;
+
+\ Replaces an enumerated directory with what put makes at its name. The
+\ reopen fails ENOTDIR or ELOOP, which the scan owes that one path; the
+\ removal changed the parent, which carries the reason, so the whole
+\ subtree beneath it leaves the publication.
+: SWAPPED-SUBTREE-IS-INCOMPLETE ( [ ^u8 n -- ] -- )
+   {: put :}
+   s" outer" MKDIR s" outer/swapped" MKDIR
+   s" outer/swapped/inside.txt" s" inside" WRITE
+   s" outer/sibling.txt" s" sibling" WRITE
+   s" kept.txt" s" kept" WRITE
+   NO-CACHE NO-CUTOFF ENUMERATE {: ps:pending-scan :}
+   s" outer/swapped/inside.txt" REMOVE
+   s" outer/swapped" AT FS:REMOVE-DIR
+   s" outer/swapped" put execute
+   ps FINISH-SCAN {: s:complete-scan :}
+   s s" outer" INCOMPLETE SEEN
+   s s" outer/swapped" MISSING SEEN
+   s s" outer/swapped/inside.txt" MISSING SEEN
+   s s" outer/sibling.txt" MISSING SEEN
+   s s" kept.txt" PRESENT SEEN
+   s PUBLISHED 2 T= ;
+
+: A-DIRECTORY-REPLACED-BY-A-FILE-IS-INCOMPLETE ( -- )
+   s" a_directory_replaced_by_a_file_is_incomplete" T-LABEL
+   [: WRITE-OVER ;] SWAPPED-SUBTREE-IS-INCOMPLETE ;
+
+: A-DIRECTORY-REPLACED-BY-A-SYMLINK-IS-INCOMPLETE ( -- )
+   s" a_directory_replaced_by_a_symlink_is_incomplete" T-LABEL
+   [: LINK-OVER ;] SWAPPED-SUBTREE-IS-INCOMPLETE ;
 
 : NESTED-TREE ( -- )
    s" nested" MKDIR
@@ -845,10 +1042,56 @@ create TIMES 32 allot
    x OBSERVATION-PATH s" sub" T$=
    x RECORD-OBSERVATION KIND INCOMPLETE T= ;
 
+\ Linux asm-generic errnos FS does not name.
+5 constant EIO
+6 constant ENXIO
+19 constant ENODEV
+110 constant ETIMEDOUT
+
+\ What a failure with the errno, raised against one entry, throws.
+: RAISED ( n -- n )
+   {: e:n :}
+   [: e s" observe scanned entry" s" subject.txt" SYSCALL-FAILURE ;]
+   ['] ENTRY-CODE? CONVERTING ;
+
+: WALK-KIND ( n -- n ) WALK-UNKNOWN REASON-KIND ;
+
+: ESCAPES ( n -- )
+   RAISED {: code:n :}
+   [: code WALK-KIND drop ;] E-IO TTHROWSQ ;
+
+: READS-AS ( n n -- )
+   {: e:n want:n :}
+   e RAISED WALK-KIND want T= ;
+
+\ A reason carries no path: the caller holds the one it observed.
+: ONLY-EXHAUSTION-ESCAPES-A-FAILURE-RAISED-AGAINST-ONE-ENTRY ( -- )
+   s" only_exhaustion_escapes_a_failure_raised_against_one_entry" T-LABEL
+   FS:EMFILE ESCAPES FS:ENFILE ESCAPES
+   FS:ENOMEM ESCAPES FS:ENOSPC ESCAPES
+   FS:ENOENT INCOMPLETE READS-AS FS:ENOTDIR INCOMPLETE READS-AS
+   FS:ELOOP INCOMPLETE READS-AS FS:ESTALE INCOMPLETE READS-AS
+   \ Anticipated or not, an errno raised against one object concerns that
+   \ object: the default is an unknown path, never a scan that stops.
+   FS:EACCES INACCESSIBLE READS-AS FS:EPERM INACCESSIBLE READS-AS
+   EIO INACCESSIBLE READS-AS ENXIO INACCESSIBLE READS-AS
+   ETIMEDOUT INACCESSIBLE READS-AS ENODEV INACCESSIBLE READS-AS
+   \ The walk meets an object it cannot synchronize; the hash stage
+   \ already saw a regular file, so a different type there is a change.
+   [: s" subject.txt" E-UNSUPPORTED UNSUPPORTED-FAILS ;]
+   ['] ENTRY-CODE? CONVERTING {: odd:n :}
+   odd WALK-KIND UNSUPPORTED-KIND T=
+   odd REVISITED-UNKNOWN REASON-KIND INCOMPLETE T=
+   \ A failure that is not about an object still stops the scan.
+   [: s" subject.txt" UNSAFE ;] ['] ENTRY-CODE? CONVERTING
+   {: bad:n :}
+   [: bad WALK-KIND drop ;] E-UNSAFE-PATH TTHROWSQ ;
+
 : CASES ( -- )
    [: SCAN-PUBLISHES-EMPTY-AND-NESTED-DIRECTORIES ;] IN-CASE
    [: FILES-REMOVED-DURING-HASHING-PUBLISH-AN-INCOMPLETE-DIRECTORY ;]
    IN-CASE
+   [: FILE-LOCKED-AFTER-ENUMERATION-IS-INACCESSIBLE ;] IN-CASE
    [: CHANGED-ROOT-FAILS-THE-SCAN-AND-PRESERVES-THE-PUBLICATION ;] IN-CASE
    [: OBJECTS-ON-ANOTHER-DEVICE-ARE-UNSUPPORTED-AND-UNSCANNED ;] IN-CASE
    [: CHANGING-FILES-ARE-UNKNOWN-WITHOUT-HIDING-STABLE-FILES ;] IN-CASE
@@ -860,11 +1103,20 @@ create TIMES 32 allot
    [: CACHED-HASH-WITH-A-STORED-DEVICE-IS-REUSED ;] IN-CASE
    [: SCAN-PUBLICATION-USES-COMPLETION-CUTOFF-FOR-NEW-HASHES ;] IN-CASE
    [: EXCLUDED-ENTRIES-ARE-NOT-OPENED-HASHED-OR-PUBLISHED ;] IN-CASE
+   [: SYMLINK-IS-PUBLISHED-AS-UNSUPPORTED-BESIDE-A-SYNCHRONIZED-FILE ;]
+   IN-CASE
+   [: SPECIAL-ENTRIES-ARE-PUBLISHED-AS-UNSUPPORTED ;] IN-CASE
    [: INACCESSIBLE-FILE-IS-UNKNOWN-BESIDE-A-READABLE-FILE ;] IN-CASE
+   [: UNREADABLE-REGULAR-FILE-IS-REPORTED-AS-UNREADABLE ;] IN-CASE
+   [: UNSEARCHABLE-PARENT-IS-AN-IO-FAILURE ;] IN-CASE
+   [: INACCESSIBLE-DIRECTORY-PUBLISHES-NOTHING-BENEATH-ITSELF ;] IN-CASE
    [: DIRECTORY-CHANGED-DURING-THE-SCAN-HIDES-ITS-CONTENTS ;] IN-CASE
+   [: A-DIRECTORY-REPLACED-BY-A-FILE-IS-INCOMPLETE ;] IN-CASE
+   [: A-DIRECTORY-REPLACED-BY-A-SYMLINK-IS-INCOMPLETE ;] IN-CASE
    [: A-DISCARDED-SUBTREE-KEEPS-ITS-VALIDATED-HASHES ;] IN-CASE
    [: HASHES-THE-WALK-RETAINED-REACH-THE-PUBLICATION ;] IN-CASE
-   TRUNCATING-A-FAILED-ENTRY-KEEPS-ITS-VALIDATED-HASHES ;
+   TRUNCATING-A-FAILED-ENTRY-KEEPS-ITS-VALIDATED-HASHES
+   ONLY-EXHAUSTION-ESCAPES-A-FAILURE-RAISED-AGAINST-ONE-ENTRY ;
 
 public
 
@@ -2478,6 +2730,15 @@ variable ENTRIES
    s" each conflict outcome is reached" T-LABEL
    [: CONFLICT-CASES ;] IN-CASE-DIR ;
 
+\ Dropped: parallel_cold_scan_matches_single_worker_scan compares hash
+\ workers and download_promotion_cannot_invalidate_complete_scan holds the
+\ scan lock; one task has neither. With their words, on a later lane:
+\ case_variant_rename_preserves_tree_and_retries_races,
+\ case_variant_rename_preserves_a_swapped_source,
+\ scan_of_a_stand_in_publishes_nothing,
+\ unchanged_tree_beside_a_same_named_directory_republishes_nothing,
+\ switching_local_root_clears_the_hash_cache (JOURNAL) and
+\ slots_lease_through_a_symlinked_state_home (CONFIG).
 : CASES ( -- )
    ENTRY-EXISTENCE-NEVER-FOLLOWS-SYMLINKS-AND-TREATS-PROBE-FAILURES-AS-UNCONFIRMED
    DROPBOX-HASH-USES-BLOCK-HASH-COMPOSITION
