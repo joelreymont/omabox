@@ -530,13 +530,11 @@ pub enum ConfigError {
     },
 
     /// A failed write also left its private temporary file behind.
-    #[error("the configuration write failed and cleanup also failed: {}", .cleanup[0])]
-    #[diagnostic(
-        code(omabox::config::cleanup_after_write),
-        help(
-            "The incomplete owner-only temporary file is ignored; fix directory access and retry."
-        )
+    #[error(
+        "the configuration write failed and cleanup also failed: {}; the incomplete owner-only temporary file is ignored",
+        .cleanup[0]
     )]
+    #[diagnostic(code(omabox::config::cleanup_after_write), forward(write))]
     CleanupAfterWrite {
         /// Original write failure.
         #[source]
@@ -1401,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_after_write_renders_both_chains_and_cleanup_help() {
+    fn cleanup_after_write_renders_both_chains_and_both_helps() {
         let write = ConfigError::Write {
             operation: "write a temporary",
             path: PathBuf::from("/config.tmp"),
@@ -1415,13 +1413,17 @@ mod tests {
         // miette wraps help at the terminal width; compare word sequences.
         let rendered = format!("{:?}", miette::Report::new(error));
         let report = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
-        for text in [
-            "write-inner-cause",
-            "cleanup-inner-cause",
-            "Ensure the XDG configuration location is owned by this user and writable.",
-        ] {
+        for text in ["write-inner-cause", "cleanup-inner-cause"] {
             assert!(report.contains(text), "missing {text:?} in:\n{report}");
         }
+        // Both failures are `Write`, so the primary's forwarded help and the
+        // related cleanup's help are the same text, rendered twice.
+        let help = "Ensure the XDG configuration location is owned by this user and writable.";
+        assert_eq!(
+            report.matches(help).count(),
+            2,
+            "want both helps in:\n{report}"
+        );
     }
 
     #[test]

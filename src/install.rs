@@ -1260,13 +1260,11 @@ pub enum InstallError {
         #[source]
         source: Box<InstallError>,
     },
-    #[error("the lifecycle operation failed and rollback also failed: {}", .restore[0])]
-    #[diagnostic(
-        code(omabox::install::rollback_failed),
-        help(
-            "Run `omabox status` and `omabox logs` to see the service state, then rerun the same install, upgrade, or uninstall command."
-        )
+    #[error(
+        "the lifecycle operation failed and rollback also failed: {}; once both are fixed, rerun the same install, upgrade or uninstall command",
+        .restore[0]
     )]
+    #[diagnostic(code(omabox::install::rollback_failed), forward(source))]
     RollbackFailed {
         #[source]
         source: Box<InstallError>,
@@ -1274,11 +1272,11 @@ pub enum InstallError {
         #[related]
         restore: Box<[InstallError; 1]>,
     },
-    #[error("the lifecycle operation failed and cleanup also failed: {}", .cleanup[0])]
-    #[diagnostic(
-        code(omabox::install::cleanup_failed),
-        help("Address the first error, then run the install or upgrade again from the new build.")
+    #[error(
+        "the lifecycle operation failed and cleanup also failed: {}; once both are fixed, run the install or upgrade again from the new build",
+        .cleanup[0]
     )]
+    #[diagnostic(code(omabox::install::cleanup_failed), forward(source))]
     CleanupFailed {
         #[source]
         source: Box<InstallError>,
@@ -2099,7 +2097,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_failure_renders_both_chains_and_restore_help() {
+    fn rollback_failure_renders_both_chains_and_both_helps() {
         let restore = InstallError::DaemonSelfCheckStart {
             source: io::Error::other("restore-inner-cause"),
         };
@@ -2108,13 +2106,14 @@ mod tests {
             &[
                 "primary-inner-cause",
                 "restore-inner-cause",
+                "Ensure the path is accessible and its filesystem has free space, then retry.",
                 "Rebuild Omabox and retry the installation.",
             ],
         );
     }
 
     #[test]
-    fn cleanup_failure_renders_both_chains_and_cleanup_help() {
+    fn cleanup_failure_renders_both_chains_and_both_helps() {
         let cleanup = InstallError::DaemonSelfCheckStart {
             source: io::Error::other("cleanup-inner-cause"),
         };
@@ -2123,6 +2122,7 @@ mod tests {
             &[
                 "primary-inner-cause",
                 "cleanup-inner-cause",
+                "Ensure the path is accessible and its filesystem has free space, then retry.",
                 "Rebuild Omabox and retry the installation.",
             ],
         );

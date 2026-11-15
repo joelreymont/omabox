@@ -675,8 +675,9 @@ would remove the adapters above; they are candidate upstream changes to
   the plugin through `omarchy-shell` before removal; `Layout` puts the unit
   under `XDG_CONFIG_HOME`, where systemd reads it, and the plugin under
   `~/.config/omarchy`, the only place Omarchy reads plugins; every
-  `InstallError` has help; `RollbackFailed` and
-  `CleanupFailed` expose both chains via `#[related]`; stale
+  `InstallError` has help; `RollbackFailed`,
+  `CleanupFailed` and `CleanupAfterWrite` forward the primary failure's help
+  and render the second failure, with its help, as a related diagnostic; stale
   `.omabox.install.*`, `.omaboxd.install.*`, `.omabox.service.install.*`,
   `.local.omabox.install.*` and `.config.toml.*.tmp` siblings whose PID is dead
   are swept before each transaction and config write. The sweep never fails
