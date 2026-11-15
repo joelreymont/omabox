@@ -3,13 +3,14 @@
 \ A client owns one curl handle. Every request resets it, sets all it needs,
 \ streams the answer whole into a growing buffer and captures the final header
 \ block, so no option or header outlives its request. A call is a POST to
-\ <api>/2/<route>; a client with no access token refreshes first, and a 401
-\ expired_access_token refreshes and resends the call once. The long poll is a
-\ POST to <notify>/2/files/list_folder/longpoll with neither token nor root.
-\ An answer is classified once: 200 done, 409 refused by its error tag, 422
-\ refused invalid-root, 429, 408 and 5xx retry, a timeout or lost connection
-\ retry 0; anything else logs one line (route, status, at most EXCERPT bytes of
-\ the body, never a token) and throws a DROPBOX code.
+\ <api>/2/<route>; a client with no access token refreshes first, and any 401
+\ refreshes and resends the call once, which answers unlinked if refused
+\ again. The long poll is a POST to <notify>/2/files/list_folder/longpoll
+\ with neither token nor root.
+\ An answer is classified once: 200 done, 403 unlinked, 409 refused by its
+\ error tag, 422 refused invalid-root, 429, 408 and 5xx retry, a timeout or
+\ lost connection retry 0; anything else logs one line (route, status, at
+\ most EXCERPT bytes of the body, never a token) and throws a DROPBOX code.
 \ A 409's error is a Dropbox union: its leaf tag is the `.tag` of the member
 \ named by the outer `.tag`, or of `reason` in an upload's error, when that
 \ member is an object, else the outer `.tag` itself, so path/not_found reads
@@ -56,7 +57,8 @@ ENUM error DERIVE eq
 
 \ What a call answers: done, the client holds the answer; refused, Dropbox
 \ said no and why; retry, the ms Dropbox asked to wait, else 0; unlinked,
-\ the refresh token is dead.
+\ Dropbox refuses this app until the user acts: the refresh token is dead,
+\ a refreshed token was refused too, or Dropbox answered 403.
 ENUM reply
    VARIANT done ;VARIANT
    VARIANT refused FIELD why error ;VARIANT
@@ -613,20 +615,13 @@ ENUM verdict
    construct reply refused ;
 
 
-: UNAUTHORIZED ( ptr client -- verdict )
-   {: c :}
-   c ERROR-READ? if
-      c TAG$ s" expired_access_token" STR= if construct verdict expired exit then
-   then
-   c s" an unauthorized request" E-AUTH FAILED ;
-
-
 : CLASSIFY ( ptr client -- verdict )
    {: c :}
    c CLIENT-STATUS @ {: s:n :}
    s 0= if c LOST ANSWER exit then
    s 200 = if construct reply done ANSWER exit then
-   s 401 = if c UNAUTHORIZED exit then
+   s 401 = if construct verdict expired exit then
+   s 403 = if construct reply unlinked ANSWER exit then
    s 409 = if c REFUSED ANSWER exit then
    s 422 = if construct error invalid-root construct reply refused ANSWER exit then
    s CURL:>HTTP-STATUS CURL:UNAVAILABLE? if c WAITED ANSWER exit then
@@ -755,7 +750,7 @@ ENUM verdict
    again DONE? 0= if again exit then
    c o r ru body send ATTEMPT MATCH verdict
       answer OF ENDOF
-      expired OF c s" a refreshed token that expired" E-AUTH FAILED ENDOF
+      expired OF construct reply unlinked ENDOF
    ;MATCH ;
 
 

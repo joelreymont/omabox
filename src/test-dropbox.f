@@ -7,9 +7,11 @@
 \ refresh token, and one code GRANT! sets; it issues the access tokens
 \ sl.fake-1, sl.fake-2 and on, and EXPIRE expires every token issued so far.
 \ LOSE applies the next API call and loses its answer; each CUT loses one
-\ more API call's answer, before the call takes effect. A call must carry
-\ the Path-Root ROOT! expects, none when that is empty, else it answers
-\ 422. Scripted answers go out in order before any route's own. It records each request's path, and the last
+\ more API call's answer, before the call takes effect. REVOKE refuses every
+\ access token, issued or yet to be, as invalid until RESET; the refresh
+\ still issues them. A call must carry the Path-Root ROOT! expects, none
+\ when that is empty, else it answers 422. Scripted answers go out in order
+\ before any route's own. It records each request's path, and the last
 \ API call's Authorization, Path-Root and Content-Type.
 \ STORAGE CLASS. PROCESS-WIDE: one worker serves every request, so its handler
 \ alone writes the state while a test waits on its call, and the test sets it
@@ -46,6 +48,8 @@ variable ISSUED-U
 variable ISSUES
 \ Tokens numbered up to this one are expired.
 variable EXPIRED
+\ Every access token is refused as invalid.
+variable REVOKED
 
 SLOTS PATH-CAP * BUFFER: PATHS
 SLOTS TYPED-BUFFER PATH-US n
@@ -235,7 +239,9 @@ variable CUTS
    {: q:HTTP:request a:HTTP:response :}
    q s" Authorization" HTTP:HEADER-OF$ 0= if 2drop -1 else TOKEN-NUMBER then
    {: k:n :}
-   k 1 < k ISSUES @ > or if a s" invalid_access_token" UNAUTHORIZED! false exit then
+   k 1 < k ISSUES @ > or REVOKED @ or if
+      a s" invalid_access_token" UNAUTHORIZED! false exit
+   then
    k EXPIRED @ <= if a s" expired_access_token" UNAUTHORIZED! false exit then
    true ;
 
@@ -940,7 +946,7 @@ $2100000 constant UPLOAD-CAP
 
 \ Starts the server on a free port with one worker.
 : START ( -- )
-   0 ISSUES ! 0 EXPIRED !
+   0 ISSUES ! 0 EXPIRED ! false REVOKED !
    HTTP:ROUTES-RESET
    s" POST" s" /oauth2/token" [: [: GRANT ;] SERVE ;] HTTP:ROUTE
    s" POST" s" /2/users/get_current_account" [: [: ACCOUNT ;] SERVE ;] HTTP:ROUTE
@@ -974,14 +980,15 @@ $2100000 constant UPLOAD-CAP
 
 \ Forgets the script, the entries, the kept bytes, the pages, the long
 \ poll's answer, the sessions, the revs uploads took, a SKEW, a LOSE, the
-\ CUTs, a code GRANT! set and what was sent; the tokens and the root stay.
+\ CUTs, a code GRANT! set, a REVOKE and what was sent; the tokens and the
+\ root stay.
 : RESET ( -- )
    0 SCRIPTS ! 0 SCRIPTED ! 0 FILES ! 0 CONTENTS ! 0 SESSIONS ! 0 REVS !
    0 GRANT-CODE-U !
    0 SEEN-U ! 0 AUTH-U ! 0 ROOT-SENT-U ! 0 TYPE-SENT-U !
    0 ARG-SENT-U ! 0 RANGE-SENT-U !
    false ROOTED ! false TYPED ! false LEAKED ! false RANGED !
-   false SKEWED ! false LOSING ! 0 CUTS !
+   false SKEWED ! false LOSING ! 0 CUTS ! false REVOKED !
    LISTING-RESET ;
 
 
@@ -998,6 +1005,11 @@ $2100000 constant UPLOAD-CAP
 
 \ Expires every access token issued so far.
 : EXPIRE ( -- ) ISSUES @ EXPIRED ! ;
+
+
+\ Refuses every access token, issued or yet to be, as Dropbox does once the
+\ user disconnects the app, until RESET.
+: REVOKE ( -- ) true REVOKED ! ;
 
 
 \ A file get_metadata finds: path_lower, path_display, rev, content_hash and

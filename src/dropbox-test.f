@@ -1,13 +1,14 @@
 \ dropbox-test.f - DROPBOX's client core against the fake Dropbox of
 \ test-dropbox.f on a loopback port: the account, metadata, the Path-Root
-\ header, the token's refresh, rate limits, outages, a redirect, a malformed
-\ request, the listing, the long poll, downloads, delete, create-folder, the
-\ code exchange, Dropbox's content hash and uploads, whose stages are written
-\ under TMPDIR and removed once open, so no run leaves one. One server and
-\ one main client serve every case; a case that needs another config opens
-\ its own client. DROPBOX's log lines go to stderr, but a stage failure's
-\ line, which is captured under TMPDIR and checked. A stub in place of AIO's
-\ transfer fails the stage's reads. The first failed assertion ends the run.
+\ header, the token's refresh, a revoked token, access denied, rate limits,
+\ outages, a redirect, a malformed request, the listing, the long poll,
+\ downloads, delete, create-folder, the code exchange, Dropbox's content
+\ hash and uploads, whose stages are written under TMPDIR and removed once
+\ open, so no run leaves one. One server and one main client serve every
+\ case; a case that needs another config opens its own client. DROPBOX's
+\ log lines go to stderr, but a stage failure's line, which is captured
+\ under TMPDIR and checked. A stub in place of AIO's transfer fails the
+\ stage's reads. The first failed assertion ends the run.
 \ Run from the repository root: hb --load src/dropbox-test.f </dev/null
 require src/lib/aio.f
 require src/lib/arena.f
@@ -231,6 +232,51 @@ TYPED-VARIABLE MAIN ptr DROPBOX:client
    dead DROPBOX:ACCOUNT UNLINKED? ASSERT
    TEST-DROPBOX:SEEN$ s" /oauth2/token" T$=
    dead DROPBOX:CLOSE ;
+
+
+: REVOKED-CASE ( -- )
+   s" revoked token" T-LABEL
+   TEST-DROPBOX:RESET
+   TEST-DROPBOX:REVOKE
+   MAIN @ DROPBOX:ACCOUNT UNLINKED? ASSERT
+   TEST-DROPBOX:SEEN$
+   s" /2/users/get_current_account /oauth2/token /2/users/get_current_account" T$= ;
+
+
+: DENIED-CASE ( -- )
+   s" access denied" T-LABEL
+   TEST-DROPBOX:RESET
+   403 s" " s" "
+   S\" {\qerror_summary\q:\qno_permission/...\q,\qerror\q:{\q.tag\q:\qno_permission\q}}"
+   TEST-DROPBOX:SCRIPT!
+   MAIN @ DROPBOX:ACCOUNT UNLINKED? ASSERT
+   TEST-DROPBOX:SEEN$ s" /2/users/get_current_account" T$= ;
+
+
+: EXPIRED! ( -- )
+   401 s" " s" "
+   S\" {\qerror_summary\q:\qexpired_access_token/...\q,\qerror\q:{\q.tag\q:\qexpired_access_token\q}}"
+   TEST-DROPBOX:SCRIPT! ;
+
+
+\ Its own client, as the refresh it is scripted keeps a token the fake
+\ never issued.
+: REFUSED-AGAIN-CASE ( -- )
+   s" refreshed token refused" T-LABEL
+   TEST-DROPBOX:RESET
+   s" live-token" s" ns-root" OPENED {: again :}
+   again DROPBOX:ACCOUNT DONE? ASSERT
+   TEST-DROPBOX:RESET
+   EXPIRED!
+   200 s" " s" "
+   S\" {\qaccess_token\q:\qsl.fake-scripted\q,\qtoken_type\q:\qbearer\q,\qexpires_in\q:14400}"
+   TEST-DROPBOX:SCRIPT!
+   EXPIRED!
+   again DROPBOX:ACCOUNT UNLINKED? ASSERT
+   TEST-DROPBOX:SEEN$
+   s" /2/users/get_current_account /oauth2/token /2/users/get_current_account" T$=
+   TEST-DROPBOX:AUTH$ s" Bearer sl.fake-scripted" T$=
+   again DROPBOX:CLOSE ;
 
 
 : RATE-CASE ( -- )
@@ -1055,7 +1101,8 @@ TYPED-VARIABLE FAULT fault
    s" ns-root" TEST-DROPBOX:ROOT!
    s" live-token" s" ns-root" OPENED MAIN !
    ACCOUNT-CASE FILE-CASE MISSING-CASE ROOT-CASE EXPIRED-CASE
-   UNLINKED-CASE RATE-CASE BUSY-CASE REDIRECT-CASE BAD-REQUEST-CASE
+   UNLINKED-CASE REVOKED-CASE DENIED-CASE REFUSED-AGAIN-CASE
+   RATE-CASE BUSY-CASE REDIRECT-CASE BAD-REQUEST-CASE
    PAGES-CASE RESET-CASE STALL-CASE UNTAGGED-CASE POLL-CASE
    DOWNLOAD-CASES
    DELETE-CONFLICT-CASE DELETE-MISSING-CASE DELETE-GONE-CASE

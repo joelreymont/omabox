@@ -19,7 +19,7 @@ ENUM reply
    VARIANT done ;VARIANT                    \ the client holds the answer
    VARIANT refused FIELD why error ;VARIANT \ Dropbox said no, and why
    VARIANT retry FIELD ms n ;VARIANT        \ ms Dropbox asked to wait, else 0
-   VARIANT unlinked ;VARIANT                \ the refresh token is dead
+   VARIANT unlinked ;VARIANT                \ refused until the user acts
 ;ENUM
 ```
 
@@ -200,10 +200,11 @@ The sync code builds these from the words above:
 ## Simplified from the Rust version
 
 - **Token refresh.** Each client refreshes its own access token when Dropbox
-  answers `expired_access_token`, then resends the request once. The Rust
-  version shares one token across tasks behind a single-flight refresh.
-  Dropbox tokens last four hours, so a few workers each refreshing on their
-  own costs a few extra calls a day.
+  answers any 401, then resends the request once; a second 401, like a 403
+  or `invalid_grant`, answers `unlinked`, as Rust reports them as needing
+  the user. The Rust version shares one token across tasks behind a
+  single-flight refresh. Dropbox tokens last four hours, so a few workers
+  each refreshing on their own costs a few extra calls a day.
 - **No SDK.** The generated `dropbox-sdk` and the `ureq` adapter give way to
   `net/curl.f` and `json.f` directly.
 
@@ -253,6 +254,8 @@ The tests run against a fake Dropbox on `net/http.f`, in the style of
   path is already gone;
 - **auth and transport:**
   - an expired token, refreshed and resent;
+  - a revoked token, refreshed and resent once, which answers `unlinked`;
+  - a refreshed token refused again, and a 403, which answer `unlinked`;
   - `invalid_grant`, which answers `unlinked`;
   - 429 with `Retry-After`, and 5xx;
   - a 3xx, which is not followed;
