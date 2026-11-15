@@ -1081,6 +1081,7 @@ const fn mutation_rejection_tag(rejection: MutationRejection) -> &'static str {
         MutationRejection::PermissionDenied => "permission_denied",
         MutationRejection::InsufficientSpace => "insufficient_space",
         MutationRejection::OperationNotAllowed => "operation_not_allowed",
+        MutationRejection::PathMismatch => "path_mismatch",
         MutationRejection::RejectedByDropbox => "rejected_by_dropbox",
     }
 }

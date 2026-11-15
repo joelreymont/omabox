@@ -5176,6 +5176,46 @@ fn explicit_conflict_uses_current_metadata_without_inventing_retry_safety()
 }
 
 #[test]
+fn verification_without_a_lowercase_path_is_invalid_metadata() -> Result<(), Box<dyn Error>> {
+    let fixture = upload_fixture(b"moved bytes")?;
+    let content = fixture.staged.content().clone();
+    let mut unpathed = file_metadata("/bad.txt", "/bad.txt", "bad-rev", &content);
+    if let serde_json::Value::Object(fields) = &mut unpathed {
+        fields.remove("path_lower");
+        fields.remove("path_display");
+    }
+    let server = FakeServer::start(vec![
+        FakeResponse::json(file_metadata(
+            "/moved.txt",
+            "/moved.txt",
+            "moved-rev",
+            &content,
+        ))
+        .for_path("/2/files/upload"),
+        FakeResponse::json(unpathed).for_path("/2/files/get_metadata"),
+    ])?;
+    let client = fake_client(&server, "opaque-access-unpathed")?;
+
+    let result = client.create_file("bad.txt", &fixture.staged);
+    assert!(
+        matches!(
+            &result,
+            Err(DropboxError::UnverifiedMutation { verification, .. })
+                if matches!(verification.as_ref(), DropboxError::InvalidMutationMetadata)
+        ),
+        "{result:?}"
+    );
+
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&requests[1].body)?,
+        json!({"path": "/bad.txt", "include_deleted": true})
+    );
+    Ok(())
+}
+
+#[test]
 fn ambiguous_mutations_are_verified_once_and_preserve_the_original_failure()
 -> Result<(), Box<dyn Error>> {
     let fixture = upload_fixture(b"desired bytes")?;
@@ -5276,8 +5316,57 @@ fn ambiguous_mutations_are_verified_once_and_preserve_the_original_failure()
 
 #[test]
 fn rejected_paths_do_not_stop_unrelated_sync_or_report_progress() -> Result<(), Box<dyn Error>> {
-    rejected_path_case("disallowed_name", "disallowed_name")?;
-    rejected_path_case("future_write_error", "rejected_by_dropbox")
+    for (wire_tag, recorded_tag) in [
+        ("disallowed_name", "disallowed_name"),
+        ("future_write_error", "rejected_by_dropbox"),
+    ] {
+        let _ = rejected_path_case(
+            &|_| {
+                vec![
+                    FakeResponse::status_json(409, upload_error(json!({".tag": wire_tag})))
+                        .for_path("/2/files/upload"),
+                ]
+            },
+            recorded_tag,
+        )?;
+    }
+    let requests = rejected_path_case(
+        &|content| {
+            let moved = file_metadata("/moved.txt", "/moved.txt", "moved-revision", content);
+            vec![
+                FakeResponse::json(moved.clone()).for_path("/2/files/upload"),
+                FakeResponse::json(moved).for_path("/2/files/get_metadata"),
+            ]
+        },
+        "path_mismatch",
+    )?;
+    let bad_uploads = requests
+        .iter()
+        .filter(|request| request.path == "/2/files/upload")
+        .map(|request| {
+            Ok(serde_json::from_str::<serde_json::Value>(required_header(
+                request,
+                "dropbox-api-arg",
+            )?)?)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?
+        .into_iter()
+        .filter(|argument| argument["path"] != json!("/good.txt"))
+        .collect::<Vec<_>>();
+    assert_eq!(bad_uploads.len(), 2);
+    for argument in bad_uploads {
+        assert_eq!(argument["path"], json!("/bad.txt"));
+    }
+    let verifications = requests
+        .iter()
+        .filter(|request| request.path == "/2/files/get_metadata")
+        .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        verifications,
+        vec![json!({"path": "/bad.txt", "include_deleted": true}); 2]
+    );
+    Ok(())
 }
 
 #[test]
@@ -5642,7 +5731,10 @@ fn excluded_pending_and_blocked_work_is_retired_across_reopen_without_effects()
     Ok(())
 }
 
-fn rejected_path_case(wire_tag: &str, recorded_tag: &str) -> Result<(), Box<dyn Error>> {
+fn rejected_path_case(
+    rejection: &dyn Fn(&ContentIdentity) -> Vec<FakeResponse>,
+    recorded_tag: &str,
+) -> Result<Vec<FakeRequest>, Box<dyn Error>> {
     let invalid_path = PathBuf::from(OsString::from_vec(b"invalid-\xff.txt".to_vec()));
     let invalid_bytes = b"invalid path bytes";
     let rejected_bytes = b"rejected bytes";
@@ -5656,12 +5748,12 @@ fn rejected_path_case(wire_tag: &str, recorded_tag: &str) -> Result<(), Box<dyn 
         dropbox_content_hash(download_bytes.as_slice())?,
         DropboxRevision::new("download-sibling-revision"),
     );
-    let rejection = || {
-        FakeResponse::status_json(409, upload_error(json!({".tag": wire_tag})))
-            .for_path("/2/files/upload")
-    };
-    let server = FakeServer::start(vec![
-        rejection(),
+    let mut responses = rejection(&rejected_content);
+    let rejection_paths = responses
+        .iter()
+        .map(|response| response.request_path.clone())
+        .collect::<Vec<_>>();
+    responses.extend([
         FakeResponse::json(file_metadata(
             "/good.txt",
             "/good.txt",
@@ -5719,8 +5811,9 @@ fn rejected_path_case(wire_tag: &str, recorded_tag: &str) -> Result<(), Box<dyn 
             "has_more": false
         }))
         .for_path("/2/files/list_folder/continue"),
-        rejection(),
-    ])?;
+    ]);
+    responses.extend(rejection(&rejected_content));
+    let server = FakeServer::start(responses)?;
     let client = Arc::new(fake_client(&server, "opaque-access-rejected-path")?);
     let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
     let directory = TempDir::new()?;
@@ -5828,7 +5921,25 @@ fn rejected_path_case(wire_tag: &str, recorded_tag: &str) -> Result<(), Box<dyn 
     assert!(reopened.pending_plans()?.is_empty());
     assert_eq!(reopened.blocked_plans()?.len(), 2);
     let requests = server.finish()?;
-    assert_eq!(requests.len(), 7);
+    let mut expected_paths = rejection_paths.clone();
+    expected_paths.extend(
+        [
+            "/2/files/upload",
+            "/2/users/get_current_account",
+            "/2/files/list_folder",
+            "/2/files/download",
+            "/2/files/list_folder/continue",
+        ]
+        .map(|path| Some(String::from(path))),
+    );
+    expected_paths.extend(rejection_paths);
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| Some(request.path.clone()))
+            .collect::<Vec<_>>(),
+        expected_paths
+    );
     let upload_bodies = requests
         .iter()
         .filter(|request| request.path == "/2/files/upload")
@@ -5842,7 +5953,7 @@ fn rejected_path_case(wire_tag: &str, recorded_tag: &str) -> Result<(), Box<dyn 
             rejected_bytes.as_slice(),
         ]
     );
-    Ok(())
+    Ok(requests)
 }
 
 #[test]

@@ -351,7 +351,7 @@ pub enum MutationOutcome {
     Pending,
     /// A different confirmed state replaced the mutation's precondition.
     PreconditionChanged(RemotePathState),
-    /// Dropbox permanently rejected this path or payload without applying it.
+    /// Dropbox rejected this path or payload, or confirmed it at a path this client cannot track.
     Rejected(MutationRejection),
 }
 
@@ -379,6 +379,10 @@ pub enum MutationRejection {
     /// Dropbox does not allow this operation at the selected path.
     #[error("Dropbox does not allow this operation at this path")]
     OperationNotAllowed,
+    /// Dropbox's lowercase form of the confirmed path differs from this client's, so the change
+    /// cannot be tracked at the requested path.
+    #[error("Dropbox reported this change at a path that does not match the requested one")]
+    PathMismatch,
     /// Dropbox rejected the path for a reason this client cannot classify more narrowly.
     #[error("Dropbox rejected this path")]
     RejectedByDropbox,
@@ -1289,8 +1293,8 @@ impl DropboxClient {
         target: &str,
         expectation: &MutationExpectation,
     ) -> Result<MutationOutcome, DropboxError> {
-        match self.metadata_state(target) {
-            Ok(state) => Ok(expectation.classify(state)),
+        match self.verify(target, expectation) {
+            Ok(outcome) => Ok(outcome),
             Err(error) if matches!(error.api_outcome(), ApiOutcome::Unavailable) => Ok(
                 MutationOutcome::Rejected(MutationRejection::RejectedByDropbox),
             ),
@@ -1304,8 +1308,8 @@ impl DropboxClient {
         expectation: &MutationExpectation,
         original: DropboxError,
     ) -> Result<MutationOutcome, DropboxError> {
-        match self.metadata_state(target) {
-            Ok(state) => Ok(expectation.classify(state)),
+        match self.verify(target, expectation) {
+            Ok(outcome) => Ok(outcome),
             Err(source) => Err(DropboxError::UnverifiedMutation {
                 original: Box::new(original),
                 verification: Box::new(source),
@@ -1313,15 +1317,36 @@ impl DropboxClient {
         }
     }
 
-    fn metadata_state(&self, target: &str) -> Result<RemotePathState, DropboxError> {
+    fn verify(
+        &self,
+        target: &str,
+        expectation: &MutationExpectation,
+    ) -> Result<MutationOutcome, DropboxError> {
         let argument = files::GetMetadataArg::new(target.to_owned()).with_include_deleted(true);
-        match self.call(|| files::get_metadata(&self.transport, &argument)) {
-            Ok(metadata) => metadata_remote_state(target, metadata),
+        let metadata = match self.call(|| files::get_metadata(&self.transport, &argument)) {
+            Ok(metadata) => metadata,
             Err(SdkError::Api(files::GetMetadataError::Path(files::LookupError::NotFound))) => {
-                Ok(RemotePathState::Absent)
+                return Ok(expectation.classify(RemotePathState::Absent));
             }
-            Err(error) => Err(DropboxError::sdk("verify Dropbox mutation", error)),
+            Err(error) => return Err(DropboxError::sdk("verify Dropbox mutation", error)),
+        };
+        let Some(lower) = metadata_paths(&metadata).0 else {
+            return Err(DropboxError::InvalidMutationMetadata);
+        };
+        if validate_mutation_path(target, Some(lower)).is_err() {
+            return Ok(MutationOutcome::Rejected(MutationRejection::PathMismatch));
         }
+        let state = match metadata {
+            files::Metadata::Deleted(_) => RemotePathState::Absent,
+            files::Metadata::Folder(_) => RemotePathState::Folder,
+            files::Metadata::File(file) if !file.is_downloadable || file.symlink_info.is_some() => {
+                RemotePathState::Unsupported
+            }
+            files::Metadata::File(file) => complete_remote_file(file)
+                .map(RemotePathState::File)
+                .ok_or(DropboxError::InvalidMutationMetadata)?,
+        };
+        Ok(expectation.classify(state))
     }
 
     fn mutation_target(&self, relative: &Path) -> Result<String, MutationRejection> {
@@ -1732,23 +1757,6 @@ fn validate_deleted_folder(
         files::Metadata::Folder(_) => Ok(DeletedObject::Folder),
         files::Metadata::File(file) => Ok(DeletedObject::File { revision: file.rev }),
         files::Metadata::Deleted(_) => Err(DropboxError::InvalidMutationMetadata),
-    }
-}
-
-fn metadata_remote_state(
-    target: &str,
-    metadata: files::Metadata,
-) -> Result<RemotePathState, DropboxError> {
-    validate_mutation_path(target, metadata_paths(&metadata).0)?;
-    match metadata {
-        files::Metadata::Deleted(_) => Ok(RemotePathState::Absent),
-        files::Metadata::Folder(_) => Ok(RemotePathState::Folder),
-        files::Metadata::File(file) if !file.is_downloadable || file.symlink_info.is_some() => {
-            Ok(RemotePathState::Unsupported)
-        }
-        files::Metadata::File(file) => complete_remote_file(file)
-            .map(RemotePathState::File)
-            .ok_or(DropboxError::InvalidMutationMetadata),
     }
 }
 
