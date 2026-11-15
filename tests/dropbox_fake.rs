@@ -32,7 +32,7 @@ use omabox::local::{
 };
 use omabox::model::{
     Baseline, CanonicalPath, Conflict, ContentIdentity, Decision, DropboxRevision, LocalFile,
-    Observation, OperationPlan, RemoteFile, RemoteSubtree, UnknownReason,
+    Observation, Operation, OperationPlan, RemoteFile, RemoteSubtree, UnknownReason,
 };
 use omabox::planner::plan;
 use omabox::reconcile::{
@@ -3766,6 +3766,240 @@ fn local_case_collision_preserves_both_directory_trees() -> Result<(), Box<dyn E
             .all(|record| canonical_paths.insert(record.path.to_string_lossy().to_lowercase()))
     );
     assert_eq!(server.finish()?.len(), 0);
+    Ok(())
+}
+
+#[test]
+fn case_collision_keeps_the_baselined_spelling_and_its_history() -> Result<(), Box<dyn Error>> {
+    let kept_bytes = b"kept local bytes";
+    let variant_bytes = b"variant local bytes";
+    let remote_bytes = b"newer remote bytes";
+    let kept_content = dropbox_content_hash(kept_bytes.as_slice())?;
+    let variant_content = dropbox_content_hash(variant_bytes.as_slice())?;
+    let remote_content = dropbox_content_hash(remote_bytes.as_slice())?;
+    let download = FakeResponse::bytes(remote_bytes.to_vec())
+        .header(
+            "Dropbox-API-Result",
+            download_metadata("Foo.txt", "rev-new", &remote_content, remote_bytes.len()),
+        )
+        .for_path("/2/files/download");
+    let (download, gate) = download.gated();
+    let server = FakeServer::start(vec![
+        account().for_path("/2/users/get_current_account"),
+        FakeResponse::json(json!({
+            "entries": [file_metadata("/foo.txt", "/Foo.txt", "rev-new", &remote_content)],
+            "cursor": "kept-spelling",
+            "has_more": false,
+        }))
+        .for_path("/2/files/list_folder"),
+        FakeResponse::json(file_metadata(
+            "/foo.txt (case variant)",
+            "/foo.txt (case variant)",
+            "rev-variant",
+            &variant_content,
+        ))
+        .for_path("/2/files/upload"),
+        download,
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-kept-spelling")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("Foo.txt"), kept_bytes)?;
+    std::fs::write(root.join("foo.txt"), variant_bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    let recorded = RemoteFile::new(kept_content.clone(), DropboxRevision::new("rev-old"));
+    seed_baseline(&mut journal, Path::new("Foo.txt"), &recorded)?;
+
+    assert_eq!(
+        reconcile_once(
+            &mut journal,
+            &client,
+            &mut downloads,
+            &root,
+            &staging,
+            &recovery,
+        )?,
+        ReconcileOutcome::FreshObservationRequired {
+            path: PathBuf::from("foo.txt")
+        }
+    );
+    assert_eq!(journal.baseline_paths()?, [PathBuf::from("Foo.txt")]);
+    assert_eq!(std::fs::read(root.join("Foo.txt"))?, kept_bytes);
+    assert_eq!(
+        std::fs::read(root.join("foo.txt (case variant)"))?,
+        variant_bytes
+    );
+
+    let report = match reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )? {
+        ReconcileOutcome::Complete(report) => report,
+        ReconcileOutcome::FreshObservationRequired { .. } => {
+            return Err(io::Error::other("renamed case variant did not converge").into());
+        }
+        ReconcileOutcome::LocalRootChanged => {
+            return Err(io::Error::other("stable kept-spelling fixture changed its root").into());
+        }
+    };
+    gate.request_received.recv().map_err(|_| {
+        io::Error::other("fake Dropbox server stopped before the kept-spelling download")
+    })?;
+    assert_eq!(report.planned, 2);
+    assert_eq!(report.conflicts, 0);
+    let replace = journal
+        .pending_plans()?
+        .into_iter()
+        .find(|pending| pending.path == Path::new("Foo.txt"));
+    let Some(replace) = replace else {
+        return Err(io::Error::other("kept spelling had no pending plan").into());
+    };
+    assert!(matches!(
+        replace.operations.as_slice(),
+        [planned] if planned.operation == Operation::ReplaceLocal {
+            source: RemoteFile::new(remote_content.clone(), DropboxRevision::new("rev-new")),
+            expected_content: kept_content.clone(),
+        }
+    ));
+    gate.release_response.send(()).map_err(|_| {
+        io::Error::other("fake Dropbox server stopped before releasing the download")
+    })?;
+    let replay = drive_replay(&mut journal, &client, &mut downloads, &root, &staging)??;
+    assert!(replay.blocked.is_empty());
+    assert!(journal.conflicts()?.is_empty());
+    assert!(journal.pending_plans()?.is_empty());
+    assert_eq!(std::fs::read(root.join("Foo.txt"))?, remote_bytes);
+    assert_eq!(
+        std::fs::read(root.join("foo.txt (case variant)"))?,
+        variant_bytes
+    );
+    assert_eq!(server.finish()?.len(), 4);
+    Ok(())
+}
+
+#[test]
+fn case_collision_spares_the_recorded_greater_spelling() -> Result<(), Box<dyn Error>> {
+    let upper_bytes = b"upper local bytes";
+    let lower_bytes = b"lower local bytes";
+    let lower_content = dropbox_content_hash(lower_bytes.as_slice())?;
+    let server = FakeServer::start(Vec::new())?;
+    let client = Arc::new(fake_client(&server, "opaque-access-lower-spelling")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("Foo.txt"), upper_bytes)?;
+    std::fs::write(root.join("foo.txt"), lower_bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    let recorded = RemoteFile::new(lower_content, DropboxRevision::new("rev-old"));
+    seed_baseline(&mut journal, Path::new("foo.txt"), &recorded)?;
+
+    assert_eq!(
+        reconcile_once(
+            &mut journal,
+            &client,
+            &mut downloads,
+            &root,
+            &staging,
+            &recovery,
+        )?,
+        ReconcileOutcome::FreshObservationRequired {
+            path: PathBuf::from("Foo.txt")
+        }
+    );
+    assert_eq!(journal.baseline_paths()?, [PathBuf::from("foo.txt")]);
+    assert_eq!(std::fs::read(root.join("foo.txt"))?, lower_bytes);
+    assert_eq!(
+        std::fs::read(root.join("Foo.txt (case variant)"))?,
+        upper_bytes
+    );
+    assert!(!root.join("Foo.txt").exists());
+    assert!(server.finish()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn case_collision_beside_a_symlink_renames_the_baselined_file() -> Result<(), Box<dyn Error>> {
+    let bytes = b"synced notes";
+    let content = dropbox_content_hash(bytes.as_slice())?;
+    let server = FakeServer::start(vec![
+        account().for_path("/2/users/get_current_account"),
+        FakeResponse::json(json!({
+            "entries": [file_metadata("/notes.txt", "/notes.txt", "rev-synced", &content)],
+            "cursor": "symlink-variant",
+            "has_more": false,
+        }))
+        .for_path("/2/files/list_folder"),
+        FakeResponse::json(file_metadata(
+            "/notes.txt (case variant)",
+            "/notes.txt (case variant)",
+            "rev-variant",
+            &content,
+        ))
+        .for_path("/2/files/upload"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-symlink-variant")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("notes.txt"), bytes)?;
+    std::os::unix::fs::symlink("symlink-target", root.join("Notes.txt"))?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    let recorded = RemoteFile::new(content.clone(), DropboxRevision::new("rev-synced"));
+    seed_baseline(&mut journal, Path::new("notes.txt"), &recorded)?;
+
+    assert_eq!(
+        reconcile_once(
+            &mut journal,
+            &client,
+            &mut downloads,
+            &root,
+            &staging,
+            &recovery,
+        )?,
+        ReconcileOutcome::FreshObservationRequired {
+            path: PathBuf::from("notes.txt")
+        }
+    );
+    assert!(journal.baseline_paths()?.is_empty());
+    assert_eq!(std::fs::read(root.join("notes.txt (case variant)"))?, bytes);
+    assert!(!root.join("notes.txt").exists());
+
+    let second = reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?;
+    assert!(
+        !matches!(second, ReconcileOutcome::FreshObservationRequired { .. }),
+        "{second:?}"
+    );
+    server.finish()?;
     Ok(())
 }
 

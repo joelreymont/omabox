@@ -17,7 +17,7 @@ use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{
     AtFlags, CWD, Dir, FileType, Mode, OFlags, RenameFlags, ResolveFlags, XattrFlags, fchmod,
     fgetxattr, fremovexattr, fsetxattr, fstat, fstatvfs, fsync, linkat, mkdirat, openat2,
-    renameat_with, unlinkat,
+    renameat_with, statat, unlinkat,
 };
 use rustix::io::Errno;
 use sha2::{Digest, Sha256};
@@ -3457,6 +3457,51 @@ fn open_parent(
     Ok(Some((current, name.clone(), parent_relative)))
 }
 
+/// Whether an entry is confirmed present at a root-relative path now, without
+/// following symlinks.
+///
+/// An unsafe `relative` is returned as an error, as are resource exhaustion
+/// and a failure to duplicate the root descriptor, which say nothing about the
+/// entry. Any other probe failure, such as a missing component, a parent
+/// component that is not a directory (a symlink included), or a directory that
+/// cannot be searched, means the entry is not confirmed present and yields
+/// `false`.
+pub(crate) fn entry_exists_at(root: &OwnedFd, relative: &Path) -> Result<bool, LocalError> {
+    const OPERATION: &str = "probe local entry existence";
+    let components = safe_components(relative)?;
+    let Some((name, parents)) = components.split_last() else {
+        return Err(LocalError::UnsafeRelativePath {
+            path: relative.to_path_buf(),
+        });
+    };
+    let mut current = rustix::io::dup(root)
+        .map_err(|source| syscall_failure("duplicate sync root descriptor", relative, source))?;
+    let mut parent_relative = PathBuf::new();
+    for component in parents {
+        parent_relative.push(component);
+        match openat2(
+            &current,
+            component,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+            BELOW_ROOT,
+        ) {
+            Ok(next) => current = next,
+            Err(source) if EXHAUSTION.contains(&source) => {
+                return Err(syscall_failure(OPERATION, &parent_relative, source));
+            }
+            Err(_) => return Ok(false),
+        }
+    }
+    match statat(&current, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(_) => Ok(true),
+        Err(source) if EXHAUSTION.contains(&source) => {
+            Err(syscall_failure(OPERATION, relative, source))
+        }
+        Err(_) => Ok(false),
+    }
+}
+
 fn parent_path(path: &Path) -> Result<&Path, LocalError> {
     safe_components(path)?;
     path.parent().ok_or_else(|| LocalError::UnsafeRelativePath {
@@ -4592,6 +4637,44 @@ mod tests {
             rename_case_variant(&root_fd, source, destination)?,
             LocalRenameOutcome::Retry
         );
+        Ok(())
+    }
+
+    #[test]
+    fn entry_existence_never_follows_symlinks_and_treats_probe_failures_as_unconfirmed()
+    -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new()?;
+        std::fs::create_dir(root.path().join("dir"))?;
+        std::fs::write(root.path().join("dir/file.txt"), b"bytes")?;
+        std::fs::write(root.path().join("file.txt"), b"bytes")?;
+        symlink("missing", root.path().join("dangling"))?;
+        symlink("dir", root.path().join("linked"))?;
+        std::fs::create_dir(root.path().join("denied"))?;
+        let root_fd = open_absolute_directory(root.path(), "open test root")?;
+
+        for (path, expected) in [
+            ("dir", true),
+            ("dir/file.txt", true),
+            ("dangling", true),
+            ("linked", true),
+            ("missing.txt", false),
+            ("missing/file.txt", false),
+            ("file.txt/child", false),
+            ("linked/file.txt", false),
+        ] {
+            assert_eq!(
+                entry_exists_at(&root_fd, Path::new(path))?,
+                expected,
+                "{path}"
+            );
+        }
+
+        deny_all_access(&root.path().join("denied"))?;
+        let denied = entry_exists_at(&root_fd, Path::new("denied/file.txt"));
+        allow_owner_access(&root.path().join("denied"))?;
+        assert!(matches!(denied, Ok(false)), "{denied:?}");
         Ok(())
     }
 

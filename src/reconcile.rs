@@ -23,9 +23,9 @@ use crate::journal::{
 use crate::local::{
     DownloadSlotIdentity, DownloadSlotLease, LocalError, LocalRenameOutcome,
     MAX_PARALLEL_DOWNLOADS, ScanPublication, StageOutcome, StagedUpload, SyncRootAccess,
-    configured_root_is_active, lease_download_slots, observe_upload_source, open_active_root,
-    parent_name_max, remove_unreferenced_upload_stages, rename_case_variant, rename_file_copy,
-    scan_and_publish, stage_upload, upload_source_changed,
+    configured_root_is_active, entry_exists_at, lease_download_slots, observe_upload_source,
+    open_active_root, parent_name_max, remove_unreferenced_upload_stages, rename_case_variant,
+    rename_file_copy, scan_and_publish, stage_upload, upload_source_changed,
 };
 use crate::model::{
     Baseline, BlockedReason, CanonicalPath, Conflict, ContentIdentity, Decision,
@@ -996,7 +996,10 @@ fn resolve_case_collision(
     sync_root: &Path,
     observations: &[LocalObservationRecord],
 ) -> Result<CaseCollisionResolution, ReconcileError> {
-    let Some(source) = case_variant_source(observations) else {
+    let Some(source) = case_variant_source(observations, |canonical| {
+        journal.baseline_spelling(canonical)
+    })?
+    else {
         return Ok(CaseCollisionResolution::None);
     };
     let Some(root) = open_active_root(journal, sync_root)? else {
@@ -1016,7 +1019,9 @@ fn resolve_case_collision(
             supersede_pending_plan(journal, &pending)?;
         }
     }
-    journal.invalidate_case_collision_baselines(&rename.source)?;
+    journal.invalidate_case_collision_baselines(&rename.source, |path| {
+        entry_exists_at(&root, path).map_err(ReconcileError::from)
+    })?;
     match rename_case_variant(&root, &rename.source, &rename.destination)? {
         LocalRenameOutcome::Renamed => Ok(CaseCollisionResolution::Renamed(rename.source)),
         LocalRenameOutcome::Retry => Ok(CaseCollisionResolution::Changed(rename.source)),
@@ -1884,19 +1889,45 @@ struct CaseVariantMove {
     destination: PathBuf,
 }
 
-fn case_variant_source(records: &[LocalObservationRecord]) -> Option<PathBuf> {
-    let mut spellings = BTreeMap::<CanonicalPath, BTreeSet<PathBuf>>::new();
+/// Choose the spelling to rename in the first local case collision.
+///
+/// The rename moves only a regular file or a directory, so a spelling the scan
+/// published as unsupported (a symlink, a special file, a reserved name or an
+/// entry on another volume) is a candidate only when every spelling is.
+/// `recorded` reads the spelling a baseline at the colliding canonical path
+/// was recorded under. The greatest candidate other than that one is renamed,
+/// so the history stays attached to the file it was recorded for; when the
+/// recorded spelling is the only candidate, it is renamed itself.
+fn case_variant_source(
+    records: &[LocalObservationRecord],
+    recorded: impl FnOnce(&CanonicalPath) -> Result<Option<PathBuf>, JournalError>,
+) -> Result<Option<PathBuf>, JournalError> {
+    let mut spellings = BTreeMap::<CanonicalPath, BTreeMap<&PathBuf, bool>>::new();
     for record in records.iter().filter(|record| !is_excluded(&record.path)) {
         let canonical = CanonicalPath::from_display(&record.path);
+        let renamable = !matches!(
+            record.observation,
+            Observation::Unknown(UnknownReason::Unsupported)
+        );
         spellings
             .entry(canonical)
             .or_default()
-            .insert(record.path.clone());
+            .insert(&record.path, renamable);
     }
-    spellings
-        .values()
-        .find(|paths| paths.len() > 1)
-        .and_then(|variants| variants.last().cloned())
+    let Some((canonical, variants)) = spellings.iter().find(|(_, paths)| paths.len() > 1) else {
+        return Ok(None);
+    };
+    let kept = recorded(canonical)?;
+    let any_renamable = variants.values().any(|renamable| *renamable);
+    let mut candidates = variants
+        .iter()
+        .filter(|(_, renamable)| **renamable || !any_renamable)
+        .map(|(path, _)| *path)
+        .rev();
+    let preferred = candidates
+        .clone()
+        .find(|variant| kept.as_ref() != Some(*variant));
+    Ok(preferred.or_else(|| candidates.next()).cloned())
 }
 
 fn case_variant_move(
@@ -2335,6 +2366,10 @@ mod tests {
         Ok(())
     }
 
+    fn no_baseline(_: &CanonicalPath) -> Result<Option<PathBuf>, JournalError> {
+        Ok(None)
+    }
+
     fn local_records(paths: impl IntoIterator<Item = PathBuf>) -> Vec<LocalObservationRecord> {
         paths
             .into_iter()
@@ -2359,14 +2394,14 @@ mod tests {
             };
             prop_assert!(collision);
 
-            let Some(forward_source) = case_variant_source(&records) else {
+            let Ok(Some(forward_source)) = case_variant_source(&records, no_baseline) else {
                 return Err(TestCaseError::fail("case collision had no source"));
             };
             let Ok(forward) = case_variant_move(&records, forward_source, 255) else {
                 return Err(TestCaseError::fail("case collision had no automatic rename"));
             };
             records.reverse();
-            let Some(reversed_source) = case_variant_source(&records) else {
+            let Ok(Some(reversed_source)) = case_variant_source(&records, no_baseline) else {
                 return Err(TestCaseError::fail("reversed case collision had no source"));
             };
             let Ok(reversed) = case_variant_move(&records, reversed_source, 255) else {
@@ -2576,7 +2611,7 @@ mod tests {
             ]
             .map(PathBuf::from),
         );
-        let Some(source) = case_variant_source(&records) else {
+        let Some(source) = case_variant_source(&records, no_baseline)? else {
             return Err(io::Error::other("expected a case-variant rename").into());
         };
         let rename = case_variant_move(&records, source, 255)?;
@@ -2589,7 +2624,7 @@ mod tests {
     #[test]
     fn case_variant_name_fits_a_maximum_length_component() -> Result<(), Box<dyn Error>> {
         let records = local_records(["A".repeat(255).into(), "a".repeat(255).into()]);
-        let Some(source) = case_variant_source(&records) else {
+        let Some(source) = case_variant_source(&records, no_baseline)? else {
             return Err(io::Error::other("expected a maximum-length collision").into());
         };
 
@@ -2626,7 +2661,7 @@ mod tests {
         let records = local_records(
             ["Credit", "credit", "credit/Expenses", "credit/expenses"].map(PathBuf::from),
         );
-        let Some(parent_source) = case_variant_source(&records) else {
+        let Some(parent_source) = case_variant_source(&records, no_baseline)? else {
             return Err(io::Error::other("expected a parent collision").into());
         };
         let parent = case_variant_move(&records, parent_source, 255)?;
@@ -2642,7 +2677,7 @@ mod tests {
             ]
             .map(PathBuf::from),
         );
-        let Some(child_source) = case_variant_source(&after_parent) else {
+        let Some(child_source) = case_variant_source(&after_parent, no_baseline)? else {
             return Err(io::Error::other("expected a child collision").into());
         };
         let child = case_variant_move(&after_parent, child_source, 255)?;
@@ -2658,7 +2693,40 @@ mod tests {
             PathBuf::from("credit (case variant)/Expenses"),
             child.destination,
         ]);
-        assert_eq!(case_variant_source(&converged), None);
+        assert_eq!(case_variant_source(&converged, no_baseline)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn case_variant_source_keeps_the_recorded_spelling() -> Result<(), Box<dyn Error>> {
+        let recorded = |spelling: &'static str| {
+            move |_: &CanonicalPath| -> Result<Option<PathBuf>, JournalError> {
+                Ok(Some(PathBuf::from(spelling)))
+            }
+        };
+
+        let records = local_records(["Foo.txt", "foo.txt"].map(PathBuf::from));
+        assert_eq!(
+            case_variant_source(&records, recorded("FOO.txt"))?,
+            Some(PathBuf::from("foo.txt"))
+        );
+
+        // An unreadable spelling can still be renamed, so it moves and the
+        // recorded one keeps its history.
+        let records = vec![
+            LocalObservationRecord {
+                path: PathBuf::from("Notes.txt"),
+                observation: Observation::Unknown(UnknownReason::Inaccessible),
+            },
+            LocalObservationRecord {
+                path: PathBuf::from("notes.txt"),
+                observation: Observation::Present(LocalFile::new(identity(b"notes")?)),
+            },
+        ];
+        assert_eq!(
+            case_variant_source(&records, recorded("notes.txt"))?,
+            Some(PathBuf::from("Notes.txt"))
+        );
         Ok(())
     }
 

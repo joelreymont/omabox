@@ -1533,33 +1533,89 @@ impl Journal {
         Ok(records)
     }
 
-    /// Forget common history beneath an automatically renamed case-collision path.
+    /// Forget the common history a case-collision rename would leave stale.
+    ///
+    /// Judges every baseline at the canonical path of `renamed` and beneath it
+    /// by its own recorded display path. One recorded at `renamed` or beneath
+    /// it is forgotten, as is one whose display path `exists` does not confirm
+    /// present; every other baseline stays with the spelling it was recorded
+    /// for. Forgetting a baseline never plans a Dropbox deletion, so a probe
+    /// that cannot confirm presence reports `false` rather than failing; only
+    /// a failure that says nothing about the entry, such as resource
+    /// exhaustion, is an error. The probe runs inside the transaction: its
+    /// first error is returned and nothing is forgotten.
     ///
     /// This is committed before the local rename so the resulting absence can
     /// never be interpreted as a user-requested Dropbox deletion, including
     /// after a crash between the two phases.
-    pub(crate) fn invalidate_case_collision_baselines(
+    pub(crate) fn invalidate_case_collision_baselines<E: From<JournalError>>(
         &mut self,
-        path: &Path,
-    ) -> Result<(), JournalError> {
-        let canonical = CanonicalPath::from_display(path);
+        renamed: &Path,
+        mut exists: impl FnMut(&Path) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        const OPERATION: &str = "invalidate case-collision history";
+        let canonical = CanonicalPath::from_display(renamed);
         let exact = canonical.as_bytes().to_vec();
         if exact.is_empty() {
             return Err(JournalError::InvalidState {
-                operation: "invalidate case-collision history",
-                path: path.to_path_buf(),
+                operation: OPERATION,
+                path: renamed.to_path_buf(),
                 detail: "case-collision path is empty",
-            });
+            }
+            .into());
         }
         let (descendants, descendants_end) = canonical.subtree_range();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite(OPERATION, renamed, source))?;
+        let recorded = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT canonical_path, path FROM baselines WHERE canonical_path = ?1 \
+                     OR (canonical_path >= ?2 AND canonical_path < ?3)",
+                )
+                .map_err(|source| sqlite(OPERATION, renamed, source))?;
+            let rows = statement
+                .query_map(params![exact, descendants, descendants_end], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(|source| sqlite(OPERATION, renamed, source))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|source| sqlite(OPERATION, renamed, source))?
+        };
+        for (canonical_path, raw_path) in recorded {
+            let path = bytes_path(raw_path);
+            if path.starts_with(renamed) || !exists(&path)? {
+                transaction
+                    .execute(
+                        "DELETE FROM baselines WHERE canonical_path = ?1",
+                        params![canonical_path],
+                    )
+                    .map_err(|source| sqlite(OPERATION, &path, source))?;
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite(OPERATION, renamed, source))?;
+        Ok(())
+    }
+
+    /// Read the display path a durable common baseline was recorded under.
+    pub(crate) fn baseline_spelling(
+        &self,
+        canonical: &CanonicalPath,
+    ) -> Result<Option<PathBuf>, JournalError> {
         self.connection
-            .execute(
-                "DELETE FROM baselines WHERE canonical_path = ?1 \
-                 OR (canonical_path >= ?2 AND canonical_path < ?3)",
-                params![exact, descendants, descendants_end],
+            .query_row(
+                "SELECT path FROM baselines \
+                 WHERE canonical_path = ?1 AND baseline_json != '\"Absent\"'",
+                [canonical.as_bytes()],
+                |row| row.get::<_, Vec<u8>>(0),
             )
-            .map(|_| ())
-            .map_err(|source| sqlite("invalidate case-collision history", path, source))
+            .optional()
+            .map(|path| path.map(bytes_path))
+            .map_err(|source| sqlite("read baseline spelling", &self.database_path, source))
     }
 
     /// Record a planner-approved common baseline that requires no effect.
@@ -4630,9 +4686,53 @@ mod tests {
         journal.record_noop(&child, &agreed)?;
         assert_eq!(journal.baselines()?.len(), 2);
 
-        journal.invalidate_case_collision_baselines(&parent)?;
+        journal.invalidate_case_collision_baselines(&parent, |_| Ok::<_, JournalError>(true))?;
 
         assert!(journal.baselines()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn case_collision_invalidation_judges_each_recorded_spelling() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let mut journal = Journal::open(journal_path(&directory))?;
+        let directories = noop(plan(
+            &Baseline::Directory,
+            &Observation::Directory,
+            &Observation::Directory,
+            RemoteSubtree::Empty,
+        ))?;
+        journal.record_noop(Path::new("Foo"), &directories)?;
+        let agreed = noop(plan(
+            &Baseline::Absent,
+            &Observation::Present(LocalFile::new(content("old"))),
+            &Observation::Present(remote_file("old", "rev-old")),
+            RemoteSubtree::Empty,
+        ))?;
+        for path in ["Foo/kept.txt", "Foo/gone.txt", "foo/renamed.txt"] {
+            journal.record_noop(Path::new(path), &agreed)?;
+        }
+        let all = journal.baseline_paths()?;
+        let failure = || JournalError::InvalidState {
+            operation: "probe test entry",
+            path: PathBuf::from("Foo"),
+            detail: "probe failed",
+        };
+
+        let refused = journal
+            .invalidate_case_collision_baselines(Path::new("foo"), |_| Err::<bool, _>(failure()));
+
+        assert!(matches!(refused, Err(JournalError::InvalidState { .. })));
+        assert_eq!(journal.baseline_paths()?, all);
+
+        journal.invalidate_case_collision_baselines(Path::new("foo"), |path| {
+            Ok::<_, JournalError>(path != Path::new("Foo/gone.txt"))
+        })?;
+
+        assert_eq!(
+            journal.baseline_paths()?,
+            [PathBuf::from("Foo"), PathBuf::from("Foo/kept.txt")]
+        );
         Ok(())
     }
 
