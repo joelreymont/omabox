@@ -1547,18 +1547,17 @@ SUBTREE-INSTALL
 
 \ ---- enumerating
 
-\ Rust's enumerate_scan_on_device: every entry on device; any other device
-\ is an unsupported subtree. The walk's collections stay in walk order:
-\ FINISH sorts what it publishes. A throw closes the root.
+\ Rust's enumerate_scan_on_device: every entry on device into en; any
+\ other device is an unsupported subtree. The walk's collections stay in
+\ walk order: FINISH sorts what it publishes. A throw closes the root.
 : ENUMERATE-SCAN-ON-DEVICE
-   ( ^u8 n fd stat ^VEC:vector<MODEL:hash-record> option<cutoff> n
-     ^ARENA:arena -- pending-scan )
-   {: p:^ u:n rfd:fd before:stat cache cut:option<cutoff> dev:n
-      ar:^ARENA:arena :}
+   ( str scan-entries fd stat ^VEC:vector<MODEL:hash-record>
+     option<cutoff> n ^ARENA:arena -- pending-scan )
+   {: root:str en:scan-entries rfd:fd before:stat cache
+      cut:option<cutoff> dev:n ar:^ARENA:arena :}
    cache cut dev ar SCAN-CONTEXT-MAKE {: cx:scan-context :}
-   ar NEW-ENTRIES {: en:scan-entries :}
    rfd [: rfd s" " >str cx en SCAN-DIRECTORY ;] CLOSING
-   p u ar KEEP rfd before en ar PENDING-SCAN-MAKE ;
+   root rfd before en ar PENDING-SCAN-MAKE ;
 
 : ROOT-STAT ( fd ^u8 n -- stat )
    {: rfd:fd p:^ u:n :}
@@ -1570,16 +1569,19 @@ SUBTREE-INSTALL
    ( ^u8 n ^VEC:vector<MODEL:hash-record> option<cutoff> ^ARENA:arena
      -- pending-scan )
    {: p:^ u:n cache cut:option<cutoff> ar:^ARENA:arena :}
+   p u ar KEEP ar NEW-ENTRIES {: root:str en:scan-entries :}
    p u s" open sync root for scan" OPEN-ABSOLUTE-DIRECTORY {: rfd:fd :}
    rfd p u ROOT-STAT {: before:stat :}
-   p u rfd before cache cut before STAT-DEV ar ENUMERATE-SCAN-ON-DEVICE ;
+   root en rfd before cache cut before STAT-DEV ar
+   ENUMERATE-SCAN-ON-DEVICE ;
 
 \ A root whose every entry is treated as on a foreign volume.
 : ENUMERATE-SCAN-ACROSS-DEVICES ( ^u8 n ^ARENA:arena -- pending-scan )
    {: p:^ u:n ar:^ARENA:arena :}
+   p u ar KEEP ar NEW-ENTRIES {: root:str en:scan-entries :}
    p u s" open sync root for scan" OPEN-ABSOLUTE-DIRECTORY {: rfd:fd :}
    rfd p u ROOT-STAT {: before:stat :}
-   p u rfd before ar [type] MODEL:hash-record NEW-VEC NO-CUTOFF
+   root en rfd before ar [type] MODEL:hash-record NEW-VEC NO-CUTOFF
    before STAT-DEV 1 xor ar ENUMERATE-SCAN-ON-DEVICE ;
 
 : SCAN-WITH-CACHE-COMPLETED-AT
@@ -2208,10 +2210,10 @@ public
      -- stage-outcome<^staged-upload> )
    {: root:fd r:^ ru:n s:^ su:n want:DROPBOX:hash ar:^ARENA:arena :}
    want s" stage upload" REQUIRE-CONTENT-HASH
-   s su s" open upload staging directory" OPEN-PRIVATE-DIRECTORY
-   {: dir:fd :}
    want DROPBOX:HASH>STR str> {: name:^ nu:n :}
    s su name nu ar JOIN {: p:^ u:n :}
+   s su s" open upload staging directory" OPEN-PRIVATE-DIRECTORY
+   {: dir:fd :}
    STAGE-WRITE-CREATED dir [: DROP-STAGE-WRITE
       root r ru dir name nu p u want ar STAGE-UPLOAD-IN ;] CLOSING
    dir DISCARD
@@ -3034,16 +3036,23 @@ private
    r ru rel relu ar JOIN name nu ar JOIN {: sp:^ spu:n :}
    name nu sp spu ;
 
-\ The location of target t's download from src into dir, its stage
-\ named and the target kept in the arena.
+\ The location of target t's download into dir from the source src
+\ answers, its stage named and the target kept in the arena before src
+\ runs.
 : NEW-LOCATION
-   ( download-source fd ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
-     -- download-location )
-   {: src:download-source dir:fd r:^ ru:n rel:^ relu:n t:^ tu:n
-      want:DROPBOX:hash ar:^ARENA:arena :}
+   ( [ -- download-source ] fd ^u8 n ^u8 n ^u8 n DROPBOX:hash
+     ^ARENA:arena -- download-location )
+   {: src dir:fd r:^ ru:n rel:^ relu:n t:^ tu:n want:DROPBOX:hash
+      ar:^ARENA:arena :}
    r ru rel relu t tu want ar STAGE-PATHS {: name:^ nu:n sp:^ spu:n :}
-   src dir name nu >str sp spu >str t tu ar KEEP want
+   t tu ar KEEP {: target:str :}
+   src execute dir name nu >str sp spu >str target want
    DOWNLOAD-LOCATION-MAKE ;
+
+: NO-LOCATION ( -- download-location )
+   s" " >str DOWNLOAD-SOURCE-DISPOSABLE -1 >FD
+   s" " >str s" " >str s" " >str NO-HASH DOWNLOAD-LOCATION-MAKE ;
+: DROP-LOCATION ( download-location -- ) drop ;
 
 : LOCATION-PATH ( download-location -- ^u8 n )
    DOWNLOAD-LOCATION-UNMAKE
@@ -3101,7 +3110,8 @@ public
       none OF t tu UNSAFE ENDOF
       some OF ENDOF
    ;MATCH PARENT-DIR-UNMAKE {: dir:fd last:str rel:str :}
-   [: s su s" <unnamed-download>" ar JOIN >str DOWNLOAD-SOURCE-DISPOSABLE
+   [: [: s su s" <unnamed-download>" ar JOIN >str
+         DOWNLOAD-SOURCE-DISPOSABLE ;]
       dir r ru rel str> t tu want ar NEW-LOCATION s su ar DISPOSABLE ;]
    [: dir DISCARD ;] PREPARING ;
 
@@ -3504,17 +3514,15 @@ private
 
 \ ---- slot preparation
 
-\ The lease's slot directory opened, its slot's name and path laid in
-\ the arena, bound to the lease's download; a throw closes dir.
-: SLOT-SOURCE ( fd download-slot-lease ^ARENA:arena -- download-source )
-   {: dir:fd lease:download-slot-lease ar:^ARENA:arena :}
+\ The lease's slot directory opened, bound to the lease's download, its
+\ slot's name and path laid in the arena before it opens.
+: SLOT-SOURCE ( download-slot-lease ^ARENA:arena -- download-source )
+   {: lease:download-slot-lease ar:^ARENA:arena :}
    lease DOWNLOAD-SLOT-LEASE-UNMAKE {: d:str slot:n b:binding :}
-   -1 >FD dir
-   [: drop d str> s" open resumable download slot directory"
-      OPEN-PRIVATE-DIRECTORY ;] CLOSING
-   {: slots:fd :}
    slot DOWNLOAD-SLOT-NAME ar KEEP {: name:str :}
-   slots name d str> name str> ar JOIN >str b DOWNLOAD-SOURCE-RESUMABLE ;
+   d str> name str> ar JOIN >str {: path:str :}
+   d str> s" open resumable download slot directory"
+   OPEN-PRIVATE-DIRECTORY name path b DOWNLOAD-SOURCE-RESUMABLE ;
 
 \ The source's slot opened; an unnamed file has none.
 : SLOT-OPEN ( download-source -- download-slot-open )
@@ -3530,7 +3538,10 @@ private
    {: loc:download-location ar:^ARENA:arena :}
    loc LOCATION-SOURCE SLOT-OPEN MATCH download-slot-open
       missing OF EPHEMERAL ENDOF
-      file OF {: f:fd :} loc f ar NEW-PARTIAL READY ENDOF
+      file OF {: f:fd :}
+         EPHEMERAL f [: DROP-PREPARATION loc f ar NEW-PARTIAL READY ;]
+         CLOSING
+      ENDOF
       occupied OF EPHEMERAL ENDOF
    ;MATCH ;
 
@@ -3667,7 +3678,8 @@ public
    want s" prepare resumed download" REQUIRE-CONTENT-HASH
    root t tu OPEN-TARGET-PARENT PARENT-DIR-UNMAKE
    {: dir:fd last:str rel:str :}
-   dir lease ar SLOT-SOURCE dir r ru rel str> t tu want ar NEW-LOCATION
+   NO-LOCATION dir [: DROP-LOCATION [: lease ar SLOT-SOURCE ;]
+      dir r ru rel str> t tu want ar NEW-LOCATION ;] CLOSING
    {: loc:download-location :}
    [: loc ar SLOT-PREPARATION ;] [: loc CLOSE-LOCATION ;] PREPARING
    lease ar RESUMED ;
@@ -4426,6 +4438,16 @@ STRUCTURE deletion
       ENDOF
    ;MATCH ;
 
+\ The deletion of t in the parent f, opened at rel below the root at r,
+\ its guard named in the arena.
+: DELETION-OF
+   ( fd str str ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- deletion )
+   {: f:fd tn:str rel:str r:^ ru:n t:^ tu:n want:DROPBOX:hash
+      ar:^ARENA:arena :}
+   s" deleted" t tu want ar INTERNAL-NAME {: g:^ gu:n :}
+   r ru rel str> ar JOIN g gu ar JOIN {: gp:^ gpu:n :}
+   f tn t tu >str g gu >str gp gpu >str want DELETION-MAKE ;
+
 \ The delete in the open parent, which closes after it; r is the root's
 \ path, which failures name.
 : DELETE-BELOW
@@ -4433,11 +4455,8 @@ STRUCTURE deletion
    {: pd:parent-dir r:^ ru:n t:^ tu:n want:DROPBOX:hash
       ar:^ARENA:arena :}
    pd PARENT-DIR-UNMAKE {: dir:fd name:str path:str :}
-   s" deleted" t tu want ar INTERNAL-NAME {: g:^ gu:n :}
-   r ru path str> ar JOIN g gu ar JOIN {: gp:^ gpu:n :}
-   dir name t tu >str g gu >str gp gpu >str want DELETION-MAKE
-   {: x:deletion :}
-   [: x ar DELETE-IN ;] [: dir DISCARD ;] finally ;
+   [: dir name path r ru t tu want ar DELETION-OF ar DELETE-IN ;]
+   [: dir DISCARD ;] finally ;
 
 public
 
@@ -4589,6 +4608,20 @@ private
       ENDOF
    ;MATCH ;
 
+\ The conflict copy written in p's parent dir, its names laid in the
+\ arena; r is the root's path.
+: CONFLICT-IN
+   ( fd ^u8 n ^u8 n conflict-side DROPBOX:hash [ ^u8 n -- n ]
+     ^ARENA:arena -- conflict-outcome )
+   {: dir:fd r:^ ru:n p:^ u:n side:conflict-side want:DROPBOX:hash read
+      ar:^ARENA:arena :}
+   p u side want ar CONFLICT-NAME {: cn:^ cnu:n :}
+   p u side want ar CONFLICT-RELATIVE-PATH {: rel:^ relu:n :}
+   r ru rel relu ar JOIN {: shown:^ shownu:n :}
+   dir cn cnu shown shownu want read NO-MARKER
+   s" materialize conflict" ar WRITE-VERIFIED-STAGE
+   rel relu shown shownu CONFLICT-RESULT ;
+
 \ The conflict copy written in the open parent, which closes after it.
 : CONFLICT-BELOW
    ( parent-dir ^u8 n ^u8 n conflict-side DROPBOX:hash [ ^u8 n -- n ]
@@ -4596,13 +4629,8 @@ private
    {: pd:parent-dir r:^ ru:n p:^ u:n side:conflict-side
       want:DROPBOX:hash read ar:^ARENA:arena :}
    pd PARENT-DIR-UNMAKE {: dir:fd name:str path:str :}
-   p u side want ar CONFLICT-NAME {: cn:^ cnu:n :}
-   p u side want ar CONFLICT-RELATIVE-PATH {: rel:^ relu:n :}
-   r ru rel relu ar JOIN {: shown:^ shownu:n :}
-   [: dir cn cnu shown shownu want read NO-MARKER
-      s" materialize conflict" ar WRITE-VERIFIED-STAGE ;]
-   [: dir DISCARD ;] finally
-   rel relu shown shownu CONFLICT-RESULT ;
+   [: dir r ru p u side want read ar CONFLICT-IN ;]
+   [: dir DISCARD ;] finally ;
 
 public
 
