@@ -352,9 +352,14 @@ gains `conflicts: Vec<String>` (bounded to 20 display paths) and
   never overwrites an `Unknown` observation, in the listing accumulator and in
   `apply_remote_inventory_delta` alike; otherwise a restricted folder with one
   listable child would read as `Directory` and its invisible children as
-  absent. A mutation whose confirmed identity differs from the requested path
+  absent. A restricted folder's entry replaces its subtree, as a file's does,
+  so records observed beneath it before the restriction are dropped and
+  inherit its uncertainty; entries listed after it are kept. Its spelling is
+  authoritative for its descendants, like a folder's. A mutation whose confirmed identity differs from the requested path
   is a dedicated `MutationRejection` variant, not an error.
-- Downloadable file without `content_hash` or `rev`: `Unknown(Incomplete)`.
+- Downloadable file without `content_hash`, or with an empty `rev`:
+  `Unknown(Incomplete)`. The API requires `rev`, so an entry that omits it
+  fails the page's decoding like any malformed response.
 - `display.to_lowercase() != path_lower`: `Unknown(Unsupported)` record keyed
   by Dropbox's `path_lower`, logged once per path; never an error.
   `validate_mutation_path` compares against the canonical form the same way and

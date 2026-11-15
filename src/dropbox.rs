@@ -1616,15 +1616,9 @@ pub enum DropboxError {
     /// Dropbox does not permit complete traversal of the configured root.
     #[error("configured Dropbox root cannot be traversed completely")]
     RemoteRootRestricted,
-    /// A folder inside the listing cannot be traversed completely.
-    #[error("Dropbox listing contains a folder that cannot be traversed completely")]
-    RestrictedRemoteInventory,
     /// An entry did not carry a path confined to the configured Dropbox root.
     #[error("Dropbox listing contained an invalid or out-of-root path")]
     InvalidEntryPath,
-    /// A downloadable file omitted required revision or content-hash metadata.
-    #[error("Dropbox listing returned incomplete metadata for a downloadable file")]
-    IncompleteFileMetadata,
     /// Dropbox claimed more pages without advancing its cursor.
     #[error("Dropbox listing cursor did not advance while more pages remained")]
     CursorDidNotAdvance,
@@ -1806,7 +1800,11 @@ fn apply_entries(
             }
             RemoteInventoryChange::EnsureDirectory(record) => {
                 if let Some(existing) = records.get_mut(&record.canonical_path) {
-                    existing.observation = Observation::Directory;
+                    // An ancestor seen through a listed child never hides an
+                    // inaccessible or otherwise unknown folder.
+                    if !matches!(existing.observation, Observation::Unknown(_)) {
+                        existing.observation = Observation::Directory;
+                    }
                 } else {
                     records.insert(record.canonical_path.clone(), record);
                 }
@@ -1849,7 +1847,10 @@ fn append_entry_changes(
                 continue;
             }
             files::Metadata::Folder(folder) if folder_restricted(&folder) => {
-                return Err(DropboxError::RestrictedRemoteInventory);
+                changes.push(RemoteInventoryChange::DeleteSubtree {
+                    canonical_path: CanonicalPath::from_bytes(key.clone().into_bytes()),
+                });
+                Observation::Unknown(UnknownReason::Inaccessible)
             }
             files::Metadata::Folder(_) => Observation::Directory,
             files::Metadata::File(file) => {
@@ -1859,8 +1860,9 @@ fn append_entry_changes(
                 if !file.is_downloadable || file.symlink_info.is_some() {
                     Observation::Unknown(UnknownReason::Unsupported)
                 } else {
-                    Observation::Present(
-                        complete_remote_file(file).ok_or(DropboxError::IncompleteFileMetadata)?,
+                    complete_remote_file(file).map_or(
+                        Observation::Unknown(UnknownReason::Incomplete),
+                        Observation::Present,
                     )
                 }
             }
@@ -1894,8 +1896,7 @@ fn normalize_inventory_records(
     records: &mut BTreeMap<CanonicalPath, RemoteObservationRecord>,
 ) -> Result<(), DropboxError> {
     let directories = directory_casing(records.values().filter_map(|record| {
-        (record.observation == Observation::Directory)
-            .then_some((&record.canonical_path, &record.path))
+        spells_folder(&record.observation).then_some((&record.canonical_path, &record.path))
     }))?;
     for record in records.values_mut() {
         record.path = normalized_remote_path(&record.canonical_path, &record.path, &directories)?;
@@ -1919,7 +1920,7 @@ fn normalize_inventory_changes(
         match change {
             RemoteInventoryChange::Upsert(record)
             | RemoteInventoryChange::EnsureDirectory(record) => {
-                if record.observation == Observation::Directory
+                if spells_folder(&record.observation)
                     && !directories.contains_key(&record.canonical_path)
                 {
                     insert_directory_casing(
@@ -1945,6 +1946,15 @@ fn normalize_inventory_changes(
         }
     }
     Ok(())
+}
+
+/// Whether a record's spelling is authoritative for its descendants: a
+/// folder's, or a restricted folder's.
+fn spells_folder(observation: &Observation<RemoteFile>) -> bool {
+    matches!(
+        observation,
+        Observation::Directory | Observation::Unknown(UnknownReason::Inaccessible)
+    )
 }
 
 fn directory_casing<'a>(
@@ -2547,13 +2557,17 @@ mod tests {
     enum TreeMutation {
         File(TinyPath),
         Folder(TinyPath),
+        Restricted(TinyPath),
         Delete(TinyPath),
     }
 
     impl TreeMutation {
         fn path(self) -> TinyPath {
             match self {
-                Self::File(path) | Self::Folder(path) | Self::Delete(path) => path,
+                Self::File(path)
+                | Self::Folder(path)
+                | Self::Restricted(path)
+                | Self::Delete(path) => path,
             }
         }
 
@@ -2562,6 +2576,11 @@ mod tests {
             match self {
                 Self::File(_) => files::Metadata::File(file_metadata(path, path)),
                 Self::Folder(_) => files::Metadata::Folder(folder_metadata(path, path)),
+                Self::Restricted(_) => {
+                    files::Metadata::Folder(folder_metadata(path, path).with_sharing_info(
+                        files::FolderSharingInfo::new(false).with_no_access(true),
+                    ))
+                }
                 Self::Delete(_) => files::Metadata::Deleted(
                     files::DeletedMetadata::new(String::from("deleted"))
                         .with_path_lower(path.to_owned())
@@ -2575,6 +2594,7 @@ mod tests {
     enum OracleNode {
         File,
         Folder,
+        Inaccessible,
     }
 
     fn tree_mutation_strategy() -> impl Strategy<Value = TreeMutation> {
@@ -2584,9 +2604,10 @@ mod tests {
             Just(TinyPath::Ab),
             Just(TinyPath::AbChild),
         ];
-        (path, 0_u8..3).prop_map(|(path, kind)| match kind {
+        (path, 0_u8..4).prop_map(|(path, kind)| match kind {
             0 => TreeMutation::File(path),
             1 => TreeMutation::Folder(path),
+            2 => TreeMutation::Restricted(path),
             _ => TreeMutation::Delete(path),
         })
     }
@@ -2601,6 +2622,8 @@ mod tests {
             TreeMutation::File(TinyPath::A),
             TreeMutation::Delete(TinyPath::AbChild),
             TreeMutation::Delete(TinyPath::AChild),
+            TreeMutation::Restricted(TinyPath::A),
+            TreeMutation::File(TinyPath::AChild),
         ]
     }
 
@@ -2613,7 +2636,12 @@ mod tests {
 
         let components = key.split('/').collect::<Vec<_>>();
         for depth in 1..components.len() {
-            records.insert(components[..depth].join("/"), OracleNode::Folder);
+            let ancestor = records
+                .entry(components[..depth].join("/"))
+                .or_insert(OracleNode::Folder);
+            if *ancestor != OracleNode::Inaccessible {
+                *ancestor = OracleNode::Folder;
+            }
         }
         let node = match mutation {
             TreeMutation::File(_) => {
@@ -2621,6 +2649,10 @@ mod tests {
                 OracleNode::File
             }
             TreeMutation::Folder(_) => OracleNode::Folder,
+            TreeMutation::Restricted(_) => {
+                records.retain(|candidate, _| !Path::new(candidate).starts_with(key));
+                OracleNode::Inaccessible
+            }
             TreeMutation::Delete(_) => return,
         };
         records.insert(String::from(key), node);
@@ -2638,6 +2670,7 @@ mod tests {
                         DropboxRevision::new(TEST_REVISION),
                     )),
                     OracleNode::Folder => Observation::Directory,
+                    OracleNode::Inaccessible => Observation::Unknown(UnknownReason::Inaccessible),
                 };
                 let canonical_path = CanonicalPath::from_bytes(key.clone().into_bytes());
                 (

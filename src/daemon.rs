@@ -895,10 +895,8 @@ fn dropbox_policy(error: &DropboxError) -> FailurePolicy {
         DropboxError::RemoteRootUnavailable
         | DropboxError::RemoteRootNotFolder
         | DropboxError::RemoteRootRestricted
-        | DropboxError::RestrictedRemoteInventory
         | DropboxError::IncorrectUploadSessionOffset { .. }
         | DropboxError::InvalidEntryPath
-        | DropboxError::IncompleteFileMetadata
         | DropboxError::CursorDidNotAdvance
         | DropboxError::ResetDuringFreshListing
         | DropboxError::MissingDownloadMetadata

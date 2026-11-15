@@ -1318,7 +1318,10 @@ impl Journal {
                              ) VALUES (?1, ?2, ?3) \
                              ON CONFLICT(canonical_path) DO UPDATE SET \
                                  observation_json = excluded.observation_json \
-                             WHERE observation_json != excluded.observation_json",
+                             WHERE observation_json != excluded.observation_json \
+                               AND json_type(\
+                                   remote_observations.observation_json, '$.Unknown'\
+                               ) IS NULL",
                             params![path, observation, canonical_path],
                         )
                         .map_err(|source| {
@@ -1384,7 +1387,8 @@ impl Journal {
             .connection
             .prepare(
                 "SELECT canonical_path, path FROM remote_observations \
-                 WHERE observation_json = '\"Directory\"' ORDER BY canonical_path",
+                 WHERE observation_json IN ('\"Directory\"', '{\"Unknown\":\"Inaccessible\"}') \
+                 ORDER BY canonical_path",
             )
             .map_err(|source| {
                 sqlite(
@@ -3593,7 +3597,7 @@ mod tests {
 
     use super::*;
     use crate::model::{
-        Decision, DropboxRevision, LocalFile, Observation, RemoteFile, RemoteSubtree,
+        Decision, DropboxRevision, LocalFile, Observation, RemoteFile, RemoteSubtree, UnknownReason,
     };
     use crate::planner::plan;
 
@@ -4931,6 +4935,80 @@ mod tests {
                 Path::new("a-file.txt"),
                 Path::new("ab"),
                 Path::new("ab/child.txt")
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn remote_delta_ensured_directory_keeps_an_unknown_folder() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let mut journal = Journal::open(journal_path(&directory))?;
+        let record = |observation| RemoteObservationRecord {
+            canonical_path: canonical("shared"),
+            path: PathBuf::from("Shared"),
+            observation,
+        };
+        let stored = |journal: &mut Journal| -> Result<Vec<_>, JournalError> {
+            Ok(journal
+                .remote_inventory()?
+                .observations
+                .into_iter()
+                .map(|record| record.observation)
+                .collect())
+        };
+        let inaccessible = Observation::Unknown(UnknownReason::Inaccessible);
+        journal.publish_remote_inventory("cursor-old", &[record(inaccessible.clone())])?;
+
+        journal.apply_remote_inventory_delta(
+            "cursor-ensure",
+            &[RemoteInventoryChange::EnsureDirectory(record(
+                Observation::Directory,
+            ))],
+        )?;
+        assert_eq!(stored(&mut journal)?, [inaccessible]);
+
+        journal.apply_remote_inventory_delta(
+            "cursor-upsert",
+            &[RemoteInventoryChange::Upsert(record(
+                Observation::Directory,
+            ))],
+        )?;
+        assert_eq!(stored(&mut journal)?, [Observation::Directory]);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_directory_paths_include_restricted_folders() -> Result<(), Box<dyn Error>> {
+        let directory = TempDir::new()?;
+        let mut journal = Journal::open(journal_path(&directory))?;
+        let record = |key: &str, path: &str, observation| RemoteObservationRecord {
+            canonical_path: canonical(key),
+            path: PathBuf::from(path),
+            observation,
+        };
+        journal.publish_remote_inventory(
+            "cursor",
+            &[
+                record("docs", "Docs", Observation::Directory),
+                record(
+                    "docs/a.txt",
+                    "Docs/A.txt",
+                    Observation::Present(remote_file("a", "rev-a")),
+                ),
+                record(
+                    "shared",
+                    "Shared",
+                    Observation::Unknown(UnknownReason::Inaccessible),
+                ),
+            ],
+        )?;
+
+        assert_eq!(
+            journal.remote_directory_paths()?,
+            [
+                (canonical("docs"), PathBuf::from("Docs")),
+                (canonical("shared"), PathBuf::from("Shared")),
             ]
         );
         Ok(())

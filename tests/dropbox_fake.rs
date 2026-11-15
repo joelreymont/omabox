@@ -6904,7 +6904,7 @@ fn failed_later_page_cannot_publish_partial_listing_as_absence() -> Result<(), B
 }
 
 #[test]
-fn incomplete_downloadable_metadata_cannot_replace_durable_inventory() -> Result<(), Box<dyn Error>>
+fn incomplete_downloadable_metadata_publishes_as_unknown_incomplete() -> Result<(), Box<dyn Error>>
 {
     let changed = dropbox_content_hash(b"validated first page".as_slice())?;
     let server = FakeServer::start(vec![
@@ -6941,13 +6941,32 @@ fn incomplete_downloadable_metadata_cannot_replace_durable_inventory() -> Result
 
     assert!(matches!(
         client.refresh_inventory(&mut journal),
-        Err(DropboxError::IncompleteFileMetadata)
+        Ok(InventoryRefresh::Published)
     ));
+    let mut inventory = journal.remote_inventory()?;
+    inventory
+        .observations
+        .sort_by(|left, right| left.canonical_path.cmp(&right.canonical_path));
     assert_eq!(
-        journal.remote_inventory()?,
+        inventory,
         RemoteInventory {
-            cursor: Some(String::from("durable")),
-            observations: vec![old]
+            cursor: Some(String::from("new")),
+            observations: vec![
+                RemoteObservationRecord {
+                    canonical_path: CanonicalPath::from_display(Path::new("incomplete.txt")),
+                    path: Path::new("Incomplete.txt").to_path_buf(),
+                    observation: Observation::Unknown(UnknownReason::Incomplete),
+                },
+                old,
+                RemoteObservationRecord {
+                    canonical_path: CanonicalPath::from_display(Path::new("partial.txt")),
+                    path: Path::new("Partial.txt").to_path_buf(),
+                    observation: Observation::Present(RemoteFile::new(
+                        changed,
+                        DropboxRevision::new("rev-partial"),
+                    )),
+                },
+            ]
         }
     );
     assert_eq!(server.finish()?.len(), 3);
@@ -6955,7 +6974,7 @@ fn incomplete_downloadable_metadata_cannot_replace_durable_inventory() -> Result
 }
 
 #[test]
-fn restricted_later_page_cannot_replace_durable_inventory() -> Result<(), Box<dyn Error>> {
+fn restricted_later_page_publishes_as_unknown_inaccessible() -> Result<(), Box<dyn Error>> {
     let identity = dropbox_content_hash(b"partial tree".as_slice())?;
     let server = FakeServer::start(vec![
         account(),
@@ -6991,16 +7010,243 @@ fn restricted_later_page_cannot_replace_durable_inventory() -> Result<(), Box<dy
 
     assert!(matches!(
         client.refresh_inventory(&mut journal),
-        Err(DropboxError::RestrictedRemoteInventory)
+        Ok(InventoryRefresh::Published)
     ));
+    let mut inventory = journal.remote_inventory()?;
+    inventory
+        .observations
+        .sort_by(|left, right| left.canonical_path.cmp(&right.canonical_path));
     assert_eq!(
-        journal.remote_inventory()?,
+        inventory,
         RemoteInventory {
-            cursor: Some(String::from("durable")),
-            observations: vec![durable]
+            cursor: Some(String::from("restricted")),
+            observations: vec![
+                durable,
+                RemoteObservationRecord {
+                    canonical_path: CanonicalPath::from_display(Path::new("partial.txt")),
+                    path: Path::new("Partial.txt").to_path_buf(),
+                    observation: Observation::Present(RemoteFile::new(
+                        identity,
+                        DropboxRevision::new("partial-revision"),
+                    )),
+                },
+                RemoteObservationRecord {
+                    canonical_path: CanonicalPath::from_display(Path::new("restricted")),
+                    path: Path::new("Restricted").to_path_buf(),
+                    observation: Observation::Unknown(UnknownReason::Inaccessible),
+                },
+            ]
         }
     );
     assert_eq!(server.finish()?.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn inaccessible_folder_deletes_nothing_beneath_it() -> Result<(), Box<dyn Error>> {
+    let bytes = b"notes kept beneath an inaccessible folder";
+    let notes = RemoteFile::new(
+        dropbox_content_hash(bytes.as_slice())?,
+        DropboxRevision::new("rev-notes"),
+    );
+    let server = FakeServer::start(vec![
+        account(),
+        FakeResponse::json(json!({
+            "entries": [restricted_folder_metadata(
+                "/shared",
+                "/Shared",
+                json!({"no_access": true}),
+            )],
+            "cursor": "cursor-inaccessible",
+            "has_more": false
+        })),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-inaccessible")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(root.join("Shared"))?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("Shared/notes.txt"), bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_baseline(&mut journal, Path::new("Shared/notes.txt"), &notes)?;
+
+    let _ = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+
+    assert_eq!(std::fs::read(root.join("Shared/notes.txt"))?, bytes);
+    assert_eq!(
+        journal.baseline(Path::new("Shared/notes.txt"))?,
+        Some(Baseline::Present(notes))
+    );
+    assert!(journal.pending_plans()?.is_empty());
+    let requests = server.finish()?;
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect::<Vec<_>>(),
+        ["/2/users/get_current_account", "/2/files/list_folder"]
+    );
+    Ok(())
+}
+
+#[test]
+fn newly_restricted_folder_drops_stale_child_records() -> Result<(), Box<dyn Error>> {
+    let notes_bytes = b"notes observed before the restriction";
+    let keep_bytes = b"keep observed before the restriction";
+    let notes = RemoteFile::new(
+        dropbox_content_hash(notes_bytes.as_slice())?,
+        DropboxRevision::new("rev-notes"),
+    );
+    let keep = RemoteFile::new(
+        dropbox_content_hash(keep_bytes.as_slice())?,
+        DropboxRevision::new("rev-keep"),
+    );
+    let server = FakeServer::start(vec![
+        account(),
+        FakeResponse::json(json!({
+            "entries": [restricted_folder_metadata(
+                "/shared",
+                "/Shared",
+                json!({"no_access": true}),
+            )],
+            "cursor": "cursor-restricted",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder/continue"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-newly-restricted")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(root.join("Shared"))?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    std::fs::write(root.join("Shared/notes.txt"), notes_bytes)?;
+    std::fs::write(root.join("Shared/keep.txt"), keep_bytes)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+    seed_directory_baseline(&mut journal, Path::new("Shared"))?;
+    seed_baseline(&mut journal, Path::new("Shared/notes.txt"), &notes)?;
+    seed_baseline(&mut journal, Path::new("Shared/keep.txt"), &keep)?;
+    let record = |path: &str, observation| RemoteObservationRecord {
+        canonical_path: CanonicalPath::from_display(Path::new(path)),
+        path: Path::new(path).to_path_buf(),
+        observation,
+    };
+    journal.publish_remote_inventory(
+        "cursor-accessible",
+        &[
+            record("Shared", Observation::Directory),
+            record("Shared/notes.txt", Observation::Present(notes.clone())),
+            record("Shared/keep.txt", Observation::Present(keep.clone())),
+        ],
+    )?;
+    std::fs::remove_file(root.join("Shared/notes.txt"))?;
+    std::fs::write(root.join("Shared/keep.txt"), b"keep edited locally")?;
+
+    let _ = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+
+    assert_eq!(
+        journal.baseline(Path::new("Shared/notes.txt"))?,
+        Some(Baseline::Present(notes))
+    );
+    assert_eq!(
+        journal.baseline(Path::new("Shared/keep.txt"))?,
+        Some(Baseline::Present(keep))
+    );
+    assert!(!root.join("Shared/notes.txt").exists());
+    assert_eq!(
+        std::fs::read(root.join("Shared/keep.txt"))?,
+        b"keep edited locally"
+    );
+    let requests = server.finish()?;
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "/2/users/get_current_account",
+            "/2/files/list_folder/continue"
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn restricted_folder_spells_its_listed_children() -> Result<(), Box<dyn Error>> {
+    let server = FakeServer::start(vec![
+        account(),
+        FakeResponse::json(json!({
+            "entries": [
+                restricted_folder_metadata(
+                    "/shared",
+                    "/Shared",
+                    json!({"traverse_only": true}),
+                ),
+                folder_metadata("/shared/a", "/shared/A"),
+                folder_metadata("/shared/b", "/SHARED/B"),
+            ],
+            "cursor": "cursor-spelled",
+            "has_more": false
+        }))
+        .for_path("/2/files/list_folder"),
+    ])?;
+    let client = Arc::new(fake_client(&server, "opaque-access-restricted-spelling")?);
+    let mut downloads = ExactDownloadPool::new(Arc::clone(&client))?;
+    let directory = TempDir::new()?;
+    let root = directory.path().join("root");
+    let staging = directory.path().join("staging");
+    let recovery = directory.path().join("recovery");
+    std::fs::create_dir_all(&root)?;
+    std::fs::create_dir_all(&staging)?;
+    std::fs::create_dir_all(&recovery)?;
+    let mut journal = Journal::open(directory.path().join("journal.sqlite3"))?;
+    let _ = journal.activate_local_root(&LocalRootBinding::inspect(&root)?)?;
+
+    let _ = complete_report(reconcile_once(
+        &mut journal,
+        &client,
+        &mut downloads,
+        &root,
+        &staging,
+        &recovery,
+    )?)?;
+
+    let names = |path: &Path| -> Result<Vec<_>, io::Error> {
+        let mut names = std::fs::read_dir(path)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<Vec<_>, _>>()?;
+        names.sort();
+        Ok(names)
+    };
+    assert_eq!(names(&root)?, ["Shared"]);
+    assert!(root.join("Shared").is_dir());
+    assert_eq!(names(&root.join("Shared"))?, ["A", "B"]);
+    assert!(root.join("Shared/A").is_dir());
+    assert!(root.join("Shared/B").is_dir());
+    assert_eq!(server.finish()?.len(), 2);
     Ok(())
 }
 
