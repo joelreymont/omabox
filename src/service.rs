@@ -2,7 +2,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::process::{Command, Output, Stdio};
 
 use miette::Diagnostic;
 use thiserror::Error;
@@ -80,8 +80,10 @@ pub struct Driven {
     pub first: Option<UnitState>,
     /// The state last observed; `None` when the goal observes nothing.
     pub last: Option<UnitState>,
-    /// Whether the goal ran start or restart.
+    /// Whether start or restart completed successfully.
     pub launched: bool,
+    /// Whether a stop, reset-failed, start or restart command was spawned, and so may have changed the unit.
+    pub acted: bool,
 }
 
 /// Where [`ServiceCommands::drive`] is on the way to its goal.
@@ -165,6 +167,13 @@ const fn next(goal: ServiceGoal, phase: Phase) -> Step {
     }
 }
 
+fn acting(driven: &mut Driven, result: Result<(), ServiceError>) -> Result<(), ServiceError> {
+    if !matches!(result, Err(ServiceError::StartCommand { .. })) {
+        driven.acted = true;
+    }
+    result
+}
+
 /// Programs used to control and inspect the user service.
 #[derive(Clone, Debug)]
 pub struct ServiceCommands {
@@ -202,17 +211,15 @@ impl ServiceCommands {
 
     /// Read the user service's `ActiveState` from systemd.
     pub fn state(&self) -> Result<UnitState, ServiceError> {
-        let output = self
-            .systemctl
-            .command()
-            .args(["--user", "show", "--property=ActiveState", "--value", UNIT])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .map_err(|source| ServiceError::StartCommand {
-                command: "systemctl show",
-                source,
-            })?;
+        let output = run(
+            self.systemctl
+                .command()
+                .args(["--user", "show", "--property=ActiveState", "--value", UNIT])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null()),
+            "systemctl show",
+        )?;
         status_result(output.status, "systemctl show")?;
         match String::from_utf8_lossy(&output.stdout).trim() {
             "active" | "reloading" | "refreshing" => Ok(UnitState::Running),
@@ -238,14 +245,15 @@ impl ServiceCommands {
         command: &'static str,
         errors: &mut impl Write,
     ) -> Result<(), ServiceError> {
-        let output = self
-            .systemctl
-            .command()
-            .args(["--user", verb, UNIT])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|source| ServiceError::StartCommand { command, source })?;
+        let output = run(
+            self.systemctl
+                .command()
+                .args(["--user", verb, UNIT])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped()),
+            command,
+        )?;
         match status_result(output.status, command) {
             // Checked after the failure: systemd can unload the unit between two calls.
             Err(ServiceError::Unsuccessful { .. }) if self.unloaded() => Ok(()),
@@ -282,57 +290,65 @@ impl ServiceCommands {
     /// Drive the user service toward `goal` through systemctl, observing its
     /// state only where the goal's steps, tabled at `next`, call for it.
     pub fn drive(&self, goal: ServiceGoal) -> Result<Driven, ServiceError> {
+        let (driven, result) = self.drive_recorded(goal);
+        result.map(|()| driven)
+    }
+
+    /// Drive the user service toward `goal` as [`Self::drive`] does, and
+    /// return what was observed and done even when a step fails, together
+    /// with the first step error, which ends the drive.
+    pub fn drive_recorded(&self, goal: ServiceGoal) -> (Driven, Result<(), ServiceError>) {
         let mut phase = Phase::Begin;
         let mut driven = Driven {
             first: None,
             last: None,
             launched: false,
+            acted: false,
         };
-        loop {
-            let outcome = match next(goal, phase) {
-                Step::Observe => {
-                    let state = self.state()?;
+        let result = loop {
+            let step = match next(goal, phase) {
+                Step::Observe => self.state().map(|state| {
                     if phase == Phase::Begin {
                         driven.first = Some(state);
                     }
                     driven.last = Some(state);
                     Outcome::Observed(state)
-                }
-                Step::Stop => {
-                    self.settle("stop", "systemctl stop", &mut std::io::stderr())?;
-                    Outcome::Stopped
-                }
-                Step::Clear => {
+                }),
+                Step::Stop => acting(
+                    &mut driven,
+                    self.settle("stop", "systemctl stop", &mut std::io::stderr()),
+                )
+                .map(|()| Outcome::Stopped),
+                Step::Clear => acting(
+                    &mut driven,
                     self.settle(
                         "reset-failed",
                         "systemctl reset-failed",
                         &mut std::io::stderr(),
-                    )?;
-                    Outcome::Cleared
-                }
-                Step::Launch(action) => {
-                    self.control(action)?;
+                    ),
+                )
+                .map(|()| Outcome::Cleared),
+                Step::Launch(action) => acting(&mut driven, self.control(action)).map(|()| {
                     driven.launched = true;
                     Outcome::Launched
-                }
-                Step::Done => return Ok(driven),
+                }),
+                Step::Done => break Ok(()),
             };
-            phase = advance(phase, outcome);
-        }
+            match step {
+                Ok(outcome) => phase = advance(phase, outcome),
+                Err(source) => break Err(source),
+            }
+        };
+        (driven, result)
     }
 
     /// Reload user service unit files after installation changes.
     pub fn daemon_reload(&self) -> Result<(), ServiceError> {
-        let status = self
-            .systemctl
-            .command()
-            .args(["--user", "daemon-reload"])
-            .status()
-            .map_err(|source| ServiceError::StartCommand {
-                command: "systemctl daemon-reload",
-                source,
-            })?;
-        status_result(status, "systemctl daemon-reload")
+        let output = run(
+            self.systemctl.command().args(["--user", "daemon-reload"]),
+            "systemctl daemon-reload",
+        )?;
+        status_result(output.status, "systemctl daemon-reload")
     }
 
     /// Run one direct systemctl operation.
@@ -343,13 +359,8 @@ impl ServiceCommands {
             command.arg("--no-pager");
         }
         command.arg(UNIT);
-        let status = command
-            .status()
-            .map_err(|source| ServiceError::StartCommand {
-                command: "systemctl",
-                source,
-            })?;
-        match status.code() {
+        let output = run(&mut command, "systemctl")?;
+        match output.status.code() {
             Some(0) => Ok(()),
             Some(3) if action == ServiceAction::Status => Ok(()),
             Some(code) => Err(ServiceError::Unsuccessful {
@@ -379,16 +390,13 @@ impl ServiceCommands {
 
     /// Show recent logs from the Omabox user service.
     pub fn logs(&self) -> Result<(), ServiceError> {
-        let status = self
-            .journalctl
-            .command()
-            .args(["--user-unit", UNIT, "--no-pager", "--lines", "200"])
-            .status()
-            .map_err(|source| ServiceError::StartCommand {
-                command: "journalctl",
-                source,
-            })?;
-        match status.code() {
+        let output = run(
+            self.journalctl
+                .command()
+                .args(["--user-unit", UNIT, "--no-pager", "--lines", "200"]),
+            "journalctl",
+        )?;
+        match output.status.code() {
             Some(0) => Ok(()),
             Some(code) => Err(ServiceError::Unsuccessful {
                 command: "journalctl",
@@ -405,18 +413,15 @@ impl ServiceCommands {
         argument: &'static str,
         command_name: &'static str,
     ) -> Result<bool, ServiceError> {
-        let status = self
-            .systemctl
-            .command()
-            .args(["--user", argument, "--quiet", UNIT])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|source| ServiceError::StartCommand {
-                command: command_name,
-                source,
-            })?;
-        match status.code() {
+        let output = run(
+            self.systemctl
+                .command()
+                .args(["--user", argument, "--quiet", UNIT])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+            command_name,
+        )?;
+        match output.status.code() {
             Some(0) => Ok(true),
             Some(1 | 3 | 4) => Ok(false),
             Some(code) => Err(ServiceError::Unsuccessful {
@@ -428,6 +433,21 @@ impl ServiceCommands {
             }),
         }
     }
+}
+
+/// A spawn failure ran nothing; a wait failure follows a command that ran.
+fn run(command: &mut Command, name: &'static str) -> Result<Output, ServiceError> {
+    command
+        .spawn()
+        .map_err(|source| ServiceError::StartCommand {
+            command: name,
+            source,
+        })?
+        .wait_with_output()
+        .map_err(|source| ServiceError::WaitCommand {
+            command: name,
+            source,
+        })
 }
 
 fn status_result(
@@ -448,13 +468,27 @@ fn status_result(
 #[derive(Debug, Diagnostic, Error)]
 #[non_exhaustive]
 pub enum ServiceError {
-    /// A system command could not be started.
+    /// A system command could not be spawned.
     #[error("could not run `{command}`")]
     #[diagnostic(
         code(omabox::service::start_command),
         help("Ensure systemd user services and the system journal are available, then retry.")
     )]
     StartCommand {
+        /// Stable command description without arguments or user paths.
+        command: &'static str,
+        /// Underlying process error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A system command was started but could not be waited for.
+    #[error("`{command}` was started but could not be waited for")]
+    #[diagnostic(
+        code(omabox::service::wait_command),
+        help("Retry the command; inspect the user session if it happens repeatedly.")
+    )]
+    WaitCommand {
         /// Stable command description without arguments or user paths.
         command: &'static str,
         /// Underlying process error.
@@ -783,7 +817,8 @@ mod tests {
             Driven {
                 first: Some(UnitState::Running),
                 last: Some(UnitState::Failed),
-                launched: false
+                launched: false,
+                acted: true
             }
         );
         assert_eq!(
@@ -799,7 +834,8 @@ mod tests {
             Driven {
                 first: Some(UnitState::Failed),
                 last: Some(UnitState::Failed),
-                launched: true
+                launched: true,
+                acted: true
             }
         );
         assert_eq!(fs::read_to_string(&log)?, "show\nreset-failed\nstart\n");
@@ -898,7 +934,8 @@ mod tests {
             Driven {
                 first: None,
                 last: None,
-                launched: true
+                launched: true,
+                acted: true
             }
         );
         assert_eq!(
@@ -928,10 +965,41 @@ mod tests {
             Driven {
                 first: Some(UnitState::Running),
                 last: Some(UnitState::Stopped),
-                launched: false
+                launched: false,
+                acted: true
             }
         );
         assert_eq!(fs::read_to_string(&log)?, "show\nstop\nlist-units\nshow\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_systemctl_that_cannot_spawn_has_not_acted() {
+        let commands = ServiceCommands {
+            systemctl: Launch::Program(PathBuf::from("/nonexistent/omabox-test/systemctl")),
+            journalctl: Launch::Program(PathBuf::from("/nonexistent/omabox-test/journalctl")),
+        };
+        let (driven, result) = commands.drive_recorded(ServiceGoal::Restart);
+        assert!(!driven.acted);
+        assert!(matches!(result, Err(ServiceError::StartCommand { .. })));
+    }
+
+    #[test]
+    fn a_systemctl_that_ran_and_failed_has_acted() -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let systemctl = temporary.path().join("systemctl");
+        // The unit stays listed, so the refusal is not an unloaded unit's.
+        fs::write(
+            &systemctl,
+            "case \"$2\" in\n\
+             reset-failed) exit 1;;\n\
+             list-units) printf 'omabox.service loaded failed failed Omabox\\n';;\n\
+             esac\n",
+        )?;
+        let commands = ServiceCommands::scripts(&systemctl, "/unused/journalctl");
+        let (driven, result) = commands.drive_recorded(ServiceGoal::Restart);
+        assert!(driven.acted);
+        assert!(matches!(result, Err(ServiceError::Unsuccessful { .. })));
         Ok(())
     }
 

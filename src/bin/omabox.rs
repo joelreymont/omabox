@@ -17,7 +17,7 @@ use omabox::install::{InstallAction, InstallError};
 use omabox::journal::{
     DropboxBinding, DropboxBindingWrite, Journal, JournalError, LocalRootBinding,
 };
-use omabox::service::{ServiceAction, ServiceCommands, ServiceError, ServiceGoal};
+use omabox::service::{Driven, ServiceAction, ServiceCommands, ServiceError, ServiceGoal};
 use omabox::stale::{self, Leftover};
 use omabox::status::{self, StatusError};
 use serde::Serialize;
@@ -531,8 +531,10 @@ fn set_sync_root(
 /// Stop a service that can hold the instance lock, run `change`, then start
 /// the service again if it was running, or start a failed one the change may
 /// have fixed. `name` names the change, as in "setup"; `done` states the
-/// finished change, as in "Omabox setup is complete". A successful command's
-/// report also names each stale temporary the change left in place.
+/// finished change, as in "Omabox setup is complete". A failed release skips
+/// the change and restores the state it observed, unless no stop command
+/// was spawned. A successful command's report also names each stale
+/// temporary the change left in place.
 fn change_while_released<Change>(
     services: &ServiceCommands,
     name: &'static str,
@@ -542,11 +544,15 @@ fn change_while_released<Change>(
 where
     Change: FnOnce() -> Result<Vec<Leftover>, CliError>,
 {
-    let released = services
-        .drive(ServiceGoal::Release)
-        .map_err(CliError::Service)?;
-    let change = change();
-    let restored = services.drive(ServiceGoal::Restore(released.first));
+    let (released, release) = services.drive_recorded(ServiceGoal::Release);
+    let change = match release {
+        Ok(()) => change(),
+        Err(source) => Err(CliError::Service(source)),
+    };
+    let restored = match restore_goal(&released) {
+        Some(goal) => services.drive(goal).map(|restored| restored.launched),
+        None => Ok(false),
+    };
     match (change, restored) {
         (Err(source), Err(restore)) => Err(CliError::ChangeAndRestore {
             change: name,
@@ -560,7 +566,7 @@ where
         }),
         (Ok(leftovers), Ok(restored)) => {
             // The change may fix the fatal cause of a unit Release left failed.
-            let recovered = !restored.launched
+            let recovered = !restored
                 && services
                     .drive(ServiceGoal::Recover)
                     .map_err(|source| CliError::StartAfterChange {
@@ -580,6 +586,13 @@ where
             )
         }
     }
+}
+
+/// The drive that puts back what a release changed.
+fn restore_goal(released: &Driven) -> Option<ServiceGoal> {
+    released
+        .acted
+        .then_some(ServiceGoal::Restore(released.first))
 }
 
 fn change_sync_root_while_stopped(
@@ -863,7 +876,25 @@ mod tests {
         Baseline, CanonicalPath, ContentIdentity, Decision, LocalFile, Observation, RemoteSubtree,
     };
 
+    use omabox::service::UnitState;
+
     use super::*;
+
+    #[test]
+    fn restore_goal_restores_only_after_a_spawned_release() {
+        let mut released = Driven {
+            first: Some(UnitState::Running),
+            last: Some(UnitState::Running),
+            launched: false,
+            acted: false,
+        };
+        assert_eq!(restore_goal(&released), None);
+        released.acted = true;
+        assert_eq!(
+            restore_goal(&released),
+            Some(ServiceGoal::Restore(Some(UnitState::Running)))
+        );
+    }
 
     fn arguments(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
@@ -1259,11 +1290,14 @@ mod tests {
     /// Write a `systemctl` stand-in that keeps the unit state in a file:
     /// `show` prints it, `stop` and `reset-failed` leave the unit inactive,
     /// and `start` makes it active, or exits with `start_exit` when nonzero.
+    /// `stop` exits with `stop_exit` after leaving the unit inactive, and
+    /// `list-units` lists the unit as loaded, so a failed stop stays failed.
     /// Every command is logged to `service.log` in `directory`.
     fn stateful_systemctl(
         directory: &Path,
         initial: &str,
         start_exit: i32,
+        stop_exit: i32,
     ) -> Result<ServiceCommands, Box<dyn Error>> {
         let state = directory.join("unit-state");
         fs::write(&state, format!("{initial}\n"))?;
@@ -1274,7 +1308,9 @@ mod tests {
                 "printf '%s\\n' \"$2\" >> '{log}'\n\
                  case \"$2\" in\n\
                  show) cat '{state}' ;;\n\
-                 stop | reset-failed) printf '%s\\n' inactive > '{state}' ;;\n\
+                 stop) printf '%s\\n' inactive > '{state}'; exit {stop_exit} ;;\n\
+                 reset-failed) printf '%s\\n' inactive > '{state}' ;;\n\
+                 list-units) printf '%s\\n' 'omabox.service loaded inactive dead Omabox' ;;\n\
                  start) [ {start_exit} = 0 ] || exit {start_exit}; printf '%s\\n' active > '{state}' ;;\n\
                  esac\n\
                  exit 0\n",
@@ -1310,7 +1346,7 @@ mod tests {
             ),
         ] {
             let temporary = tempfile::TempDir::new()?;
-            let services = stateful_systemctl(temporary.path(), initial, 0)?;
+            let services = stateful_systemctl(temporary.path(), initial, 0, 0)?;
             let mut during = None;
 
             change_while_released(&services, "setup", "Omabox setup is complete", || {
@@ -1333,7 +1369,7 @@ mod tests {
     #[test]
     fn a_failed_change_still_restores_the_service() -> Result<(), Box<dyn Error>> {
         let temporary = tempfile::TempDir::new()?;
-        let services = stateful_systemctl(temporary.path(), "active", 0)?;
+        let services = stateful_systemctl(temporary.path(), "active", 0, 0)?;
 
         let result = change_while_released(&services, "setup", "Omabox setup is complete", || {
             Err(CliError::InvalidAuthorizationCode)
@@ -1353,11 +1389,35 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_release_skips_the_change_and_restores() -> Result<(), Box<dyn Error>> {
+        let temporary = tempfile::TempDir::new()?;
+        let services = stateful_systemctl(temporary.path(), "active", 0, 1)?;
+        let mut changed = false;
+
+        let result = change_while_released(&services, "setup", "Omabox setup is complete", || {
+            changed = true;
+            Ok(Vec::new())
+        });
+        assert!(!changed, "the change ran after a failed release");
+        assert!(matches!(result, Err(CliError::Service(_))), "{result:?}");
+        // `list-units` runs once the stop fails, to tell an unloaded unit
+        // from a failed stop.
+        assert_eq!(
+            service_trace(temporary.path())?,
+            (
+                "show\nstop\nlist-units\nreset-failed\nstart\n".into(),
+                "active\n".into()
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
     fn setup_reports_a_held_lock_and_restores_the_service() -> Result<(), Box<dyn Error>> {
         let (temporary, xdg, _first, _second) = fixture()?;
         let config = Config::load_from(&xdg)?;
         let _held_lock = InstanceLock::acquire(config.paths().lock_file())?;
-        let services = stateful_systemctl(temporary.path(), "active", 0)?;
+        let services = stateful_systemctl(temporary.path(), "active", 0, 0)?;
 
         let result = change_while_released(&services, "setup", "Omabox setup is complete", || {
             complete_setup(&config, false, || Ok(()))
@@ -1378,7 +1438,7 @@ mod tests {
         let (temporary, xdg, _first, _second) = fixture()?;
         let config = Config::load_from(&xdg)?;
         let _held_lock = InstanceLock::acquire(config.paths().lock_file())?;
-        let services = stateful_systemctl(temporary.path(), "active", 1)?;
+        let services = stateful_systemctl(temporary.path(), "active", 1, 0)?;
 
         let Err(error) =
             change_while_released(&services, "setup", "Omabox setup is complete", || {
