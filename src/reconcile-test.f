@@ -67,6 +67,12 @@
 \   refreshes and sends again once before it answers unlinked
 \ - occupied_download_stage_is_durably_blocked_without_overwrite_or_request
 \ - completed_download_batch_is_installed_before_the_next_batch_fails
+\ - unknown_download_slots_are_preserved_with_disposable_fallback
+\ - root_swap_after_replay_validation_never_touches_the_replacement, the
+\   fake swapping the root on its task as the download arrives
+\ - later_planned_download_does_not_reclaim_an_active_slot, plan a held
+\   blocked an hour where Rust holds its download, its slot holding a
+\   checkpoint that a second step resumes once a is unblocked
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -2394,12 +2400,376 @@ READ-CAP BUFFER: READ-BUF
    TEST-DROPBOX:SEEN$ DOWNLOAD-COUNT DOWNLOADS$ T$=
    d x STEP-GONE ;
 
+: FALLBACK$ ( -- ^u8 n ) s" fallback download" ;
+
+PROCESS-SYMBOLS
+FUNCTION: SOCKET-CALL socket ( n n n -- i32 ) ;FUNCTION
+FUNCTION: BIND-CALL bind ( n ^u8 n -- i32 ) ;FUNCTION
+
+1 constant AF-UNIX
+1 constant SOCK-STREAM
+\ Linux sockaddr_un: a u16 sun_family, then a 108-byte sun_path.
+110 BUFFER: SOCKADDR
+\ S_IFSOCK, the file type of a socket.
+$C000 constant S-IFSOCK
+\ Mode 0400, read-only to its owner.
+$100 constant MODE-0400
+\ LOCAL's slots, 0 to 3.
+4 constant SLOTS
+
+\ A socket bound at the path, as Rust's UnixListener::bind leaves one;
+\ its descriptor.
+: SOCKET-AT ( str -- fd )
+   str> {: p:^ u:n :}
+   u 108 < TTRUE
+   AF-UNIX SOCKADDR c! 0 SOCKADDR 1 + c!
+   p SOCKADDR 2 + u BYTE-COPY 0 SOCKADDR 2 + u + c!
+   AF-UNIX SOCK-STREAM 0 SOCKET-CALL {: s:n :}
+   s 0 >= TTRUE
+   s SOCKADDR u 3 + BIND-CALL 0 T=
+   s >FD ;
+
+\ The run's slot k, as LOCAL names it.
+: SLOT-AT ( ^run n -- str )
+   {: x k:n :}
+   x RUN-ARENA @ {: ar :}
+   s" .omabox-download-slot-" k ar NUMBERED {: nm:str :}
+   x RUN-STAGING @ nm str> ar INSIDE ;
+
+: UNKNOWN$ ( n ^ARENA:arena -- str )
+   {: k:n ar :}
+   s" unknown-" k ar NUMBERED ;
+
+\ Rust's unknown slots: a bound socket at slot 0, files holding
+\ unknown-<k> at the others, slot 1 read-only; the socket.
+: UNKNOWN-SLOTS ( ^run -- fd )
+   {: x :}
+   SLOTS 1 ?do
+      x i SLOT-AT str> i x RUN-ARENA @ UNKNOWN$ str> FS:WRITE-ALL
+   loop
+   x 1 SLOT-AT str> MODE-0400 FS:CHMOD-MODE
+   x 0 SLOT-AT SOCKET-AT ;
+
+\ Slot 0 is still a socket, and the others hold their bytes.
+: SLOTS-KEPT ( ^run -- )
+   {: x :}
+   x 0 SLOT-AT str> FS:TRY-LSTAT TTRUE
+   FS:STAT-MODE@ FS:S-IFMT and S-IFSOCK T=
+   SLOTS 1 ?do
+      x i SLOT-AT i x RUN-ARENA @ UNKNOWN$ str> HOLDS-BYTES
+   loop ;
+
+: UNKNOWN-DOWNLOAD-SLOTS-ARE-PRESERVED-WITH-DISPOSABLE-FALLBACK
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" unknown_download_slots_are_preserved_with_disposable_fallback"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   x UNKNOWN-SLOTS {: sock:fd :}
+   s" fallback.txt" s" fallback-revision" FALLBACK$ ar SERVES
+   FALLBACK$ s" fallback-revision" ar REMOTE-FILE {: rem :}
+   x s" fallback.txt" rem INSTALLING drop
+   x REPLAY-STEP REPORTED COMPLETED 1 T=
+   x RUN-ROOT @ s" fallback.txt" ar INSIDE FALLBACK$ HOLDS-BYTES
+   x SLOTS-KEPT
+   TEST-DROPBOX:SEEN$ 1 DOWNLOADS$ T$=
+   TEST-DROPBOX:RANGE-SENT? TFALSE
+   sock FS:CLOSE-DIR
+   d x STEP-GONE ;
+
+\ The root swap's paths: it runs on the fake's task.
+TYPED-VARIABLE LIVE-ROOT str
+TYPED-VARIABLE OLD-ROOT str
+TYPED-VARIABLE CANARY str
+
+: CANARY$ ( -- ^u8 n ) s" replacement bytes" ;
+: SWAPPED$ ( -- ^u8 n ) s" descriptor-bound download" ;
+
+\ Rust's swap: the root renamed old-root, and a new root holding
+\ canary.txt.
+: SWAP-ROOT ( -- )
+   LIVE-ROOT @ str> OLD-ROOT @ str> FS:RENAME-FILE
+   LIVE-ROOT @ str> FS:MAKE-DIR
+   CANARY @ str> CANARY$ FS:WRITE-ALL ;
+
+\ The swap's paths for the run x in the case directory d.
+: SWAP-AT ( str ^run -- )
+   {: d:str x :}
+   x RUN-ARENA @ {: ar :}
+   x RUN-ROOT @ LIVE-ROOT !
+   d s" old-root" ar INSIDE OLD-ROOT !
+   x RUN-ROOT @ s" canary.txt" ar INSIDE CANARY ! ;
+
+: ROOT-CHANGED? ( replay-step -- bool )
+   MATCH replay-step
+      root-changed OF true ENDOF
+      report OF drop false ENDOF
+   ;MATCH ;
+
+\ The new root holds canary.txt alone, with its bytes.
+: REPLACEMENT-KEPT ( ^run -- )
+   {: x :}
+   x ROOT$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
+   READ-BUF u s" canary.txt" T$=
+   CANARY @ CANARY$ HOLDS-BYTES ;
+
+\ Whether a name in the list starts with .omabox-download-.
+: STAGE-LISTED? ( ^u8 n -- bool )
+   {: l:^ u:n :}
+   l u s" .omabox-download-" STARTS-WITH? if true exit then
+   l u 10 INDEX-OF MATCH option
+      none OF false ENDOF
+      some OF IDX>N 1+ {: k:n :} l k + u k - RECURSE ENDOF
+   ;MATCH ;
+
+\ old-root holds no download.txt, and a download's stage.
+: OLD-ROOT-STAGED ( ^ARENA:arena -- )
+   {: ar :}
+   OLD-ROOT @ s" download.txt" ar INSIDE str> FS:EXISTS? TFALSE
+   OLD-ROOT @ str> READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
+   READ-BUF u STAGE-LISTED? TTRUE ;
+
+: NO-BASELINE? ( ^run ^u8 n -- bool )
+   {: x p:^ u:n :}
+   x RUN-JOURNAL @ p u DISPLAY x RUN-ARENA @ JOURNAL:BASELINE
+   MATCH option
+      none OF true ENDOF
+      some OF drop false ENDOF
+   ;MATCH ;
+
+: ROOT-SWAP-AFTER-REPLAY-VALIDATION-NEVER-TOUCHES-THE-REPLACEMENT
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" root_swap_after_replay_validation_never_touches_the_replacement"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x SWAP-AT
+   s" download.txt" s" root-swap-revision" SWAPPED$ ar SERVES
+   SWAPPED$ s" root-swap-revision" ar REMOTE-FILE {: rem :}
+   x s" download.txt" rem INSTALLING drop
+   [: SWAP-ROOT ;] TEST-DROPBOX:DURING-DOWNLOAD!
+   x REPLAY-STEP ROOT-CHANGED? TTRUE
+   x REPLACEMENT-KEPT
+   x PENDING-OF VEC:COUNT 1 T=
+   x s" download.txt" NO-BASELINE? TTRUE
+   ar OLD-ROOT-STAGED
+   TEST-DROPBOX:SEEN$ 1 DOWNLOADS$ T$=
+   d x STEP-GONE ;
+
+public
+EXPORT LOCAL:DOWNLOAD-CHECKPOINT-BYTES
+private
+
+TYPED-VARIABLE HASHING DROPBOX:hasher
+variable REMAINING
+$10000 constant XS-SIZE
+XS-SIZE BUFFER: XS
+
+: FILL-XS ( -- ) XS-SIZE 0 ?do $78 XS i + c! loop ;
+
+: CHECKPOINT ( -- n ) DOWNLOAD-CHECKPOINT-BYTES ;
+
+\ Rust's FailingBytes: "x" bytes until none remain, then a reset
+\ connection.
+: FAILING ( ^u8 n -- n )
+   {: dst:^ cap:n :}
+   REMAINING @ 0= if 104 FS:CAUSE! E-FS-IO throw then
+   REMAINING @ cap min XS-SIZE min {: k:n :}
+   XS dst k BYTE-COPY
+   k negate REMAINING +!
+   k ;
+
+: READY-PARTIAL
+   ( LOCAL:download-preparation -- ^LOCAL:download-partial )
+   MATCH LOCAL:download-preparation
+      ready OF ENDOF
+      complete OF drop s" reconcile-test: no partial" FAILED ENDOF
+      ephemeral OF s" reconcile-test: no partial" FAILED ENDOF
+   ;MATCH ;
+
+\ The lease's slot holding a durable checkpoint of CHECKPOINT "x"
+\ bytes for target t, as a transfer lost just past it leaves it.
+: CHECKPOINTED
+   ( fd str ^u8 n DROPBOX:hash LOCAL:download-slot-lease ^ARENA:arena
+     -- )
+   {: root:fd r:str t:^ tu:n c:DROPBOX:hash
+      l:LOCAL:download-slot-lease ar :}
+   root r str> t tu c l ar LOCAL:PREPARE-DOWNLOAD-SLOT-AT READY-PARTIAL
+   {: x :}
+   CHECKPOINT 1+ REMAINING !
+   [: x CHECKPOINT DROPBOX:BLOCK + [: FAILING ;] ar
+      LOCAL:APPEND-PARTIAL drop ;]
+   [: 2drop true ;] LOCAL:CONVERTING LOCAL:E-STAGE-READ T= ;
+
+\ The content hash of CHECKPOINT "x" bytes, then t.
+: PAST-HASH ( ^u8 n ^ARENA:arena -- DROPBOX:hash )
+   {: t:^ tu:n ar :}
+   HASHING DROPBOX:HASH-BEGIN
+   CHECKPOINT XS-SIZE / 0 ?do XS XS-SIZE HASHING DROPBOX:HASH-FEED loop
+   t tu HASHING DROPBOX:HASH-FEED
+   HASHING DROPBOX:HASH-END ar COPIED DROPBOX:>HASH ;
+
+\ The fake's /<p> at rev v, of content c: CHECKPOINT bytes it does not
+\ keep, then t, so its download from the start answers 500.
+: SERVES-PAST ( ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- )
+   {: p:^ pu:n v:^ vu:n t:^ tu:n c:DROPBOX:hash ar :}
+   SB-RESET s" /" SB-APPEND p pu SB-APPEND SB$ ar COPIED {: l:str :}
+   c DROPBOX:HASH>STR str> {: h:^ hu:n :}
+   l str> l str> v vu h hu CHECKPOINT tu + TEST-DROPBOX:FILE!
+   v vu CHECKPOINT t tu TEST-DROPBOX:CONTENT-TAIL! ;
+
+: HELD$ ( -- ^u8 n ) s" first download held open by the fake server" ;
+: NEXT$ ( -- ^u8 n ) s" download introduced by the next pass" ;
+
+: UNPROTECTED ( LOCAL:binding -- bool ) drop false ;
+
+: LEASED
+   ( option<LOCAL:download-slot-lease> -- LOCAL:download-slot-lease )
+   MATCH option
+      none OF s" reconcile-test: no download slot leased" FAILED ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+: GENERATION ( ^run -- n )
+   {: x :}
+   x RUN-JOURNAL @ x RUN-ARENA @ JOURNAL:LOCAL-ROOT-BINDING
+   MATCH option
+      none OF s" reconcile-test: the root is not bound" FAILED ENDOF
+      some OF JOURNAL-LOCAL--ROOT--RECORD:UNMAKE {: b gen:n :} gen ENDOF
+   ;MATCH ;
+
+\ The slot identity the step computes for plan p's download.
+: STEP-IDENTITY
+   ( ^run JOURNAL:plan-record -- LOCAL:download-slot-identity )
+   {: x p :}
+   x GENERATION {: gen:n :}
+   p PENDING-DOWNLOAD MATCH option
+      none OF s" reconcile-test: no download" FAILED ENDOF
+      some OF {: d :} gen p PLAN-PATH d SLOT-IDENTITY ENDOF
+   ;MATCH ;
+
+\ Plan p's slot, leased as the step leases it, holding a checkpoint of
+\ its content c.
+: HELD-SLOT ( ^run JOURNAL:plan-record DROPBOX:hash -- )
+   {: x p c:DROPBOX:hash :}
+   x p STEP-IDENTITY {: id :}
+   x STAGING$ id [: UNPROTECTED ;] LOCAL:LEASE-DOWNLOAD-SLOT LEASED
+   {: l :}
+   x ROOT$ s" open test root" LOCAL:OPEN-ROOT {: root:fd :}
+   [: root x RUN-ROOT @ s" a.bin" c l x RUN-ARENA @ CHECKPOINTED ;]
+   [: root FS:CLOSE-DIR ;] finally ;
+
+\ Holds plan p live, blocked until an hour from now.
+: BLOCKED-AHEAD ( ^run JOURNAL:plan-record -- )
+   {: x p :}
+   x RUN-JOURNAL @ p ID-OF 503 MODEL-BLOCKAGE:DOWNLOAD-UNAVAILABLE
+   epoch-seconds JOURNAL:BLOCK-RETRY-SECONDS + x RUN-ARENA @
+   JOURNAL:BLOCK-PLAN MATCH JOURNAL:plan-block
+      not-found OF false ENDOF
+      already-completed OF false ENDOF
+      blocked OF true ENDOF
+   ;MATCH TTRUE ;
+
+: UNBLOCKED ( ^run JOURNAL:plan-record -- )
+   {: x p :}
+   x RUN-JOURNAL @ p ID-OF x RUN-ARENA @ JOURNAL:UNBLOCK-PLAN
+   MATCH JOURNAL:plan-unblock
+      not-found OF false ENDOF
+      not-blocked OF false ENDOF
+      unblocked OF true ENDOF
+   ;MATCH TTRUE ;
+
+\ Plan a, served past a checkpoint, blocked, and its slot holding the
+\ checkpoint; its content.
+: HELD-PLAN ( ^run -- JOURNAL:plan-record DROPBOX:hash )
+   {: x :}
+   x RUN-ARENA @ {: ar :}
+   HELD$ ar PAST-HASH {: c:DROPBOX:hash :}
+   s" a.bin" s" rev-held-slot" HELD$ c ar SERVES-PAST
+   c s" rev-held-slot" >str DROPBOX:>REV MODEL-REMOTE:MAKE {: rem :}
+   x s" a.bin" rem INSTALLING {: p :}
+   x p BLOCKED-AHEAD
+   x p c HELD-SLOT
+   p c ;
+
+\ The staging directory's one entry, the slot HELD-SLOT leased.
+: HELD-SLOT-PATH ( ^run -- str )
+   {: x :}
+   x STAGING$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
+   READ-BUF u ONE-NAME? TTRUE
+   READ-BUF u s" .omabox-download-slot-" STARTS-WITH? TTRUE
+   x RUN-STAGING @ READ-BUF u x RUN-ARENA @ INSIDE ;
+
+: IN-ROOT ( ^run ^u8 n -- str )
+   {: x p:^ u:n :}
+   x RUN-ROOT @ p u x RUN-ARENA @ INSIDE ;
+
+\ Plan b pending, and one step installing it, from the start.
+: NEXT-STEPPED ( ^run -- )
+   {: x :}
+   x RUN-ARENA @ {: ar :}
+   s" b.bin" s" rev-next-slot" NEXT$ ar SERVES
+   NEXT$ s" rev-next-slot" ar REMOTE-FILE {: rem :}
+   x s" b.bin" rem INSTALLING drop
+   x STEPPED
+   x s" b.bin" IN-ROOT NEXT$ HOLDS-BYTES
+   TEST-DROPBOX:SEEN$ 1 DOWNLOADS$ T$=
+   TEST-DROPBOX:RANGE-SENT? TFALSE ;
+
+: RESUMED-RANGE ( -- )
+   TEST-DROPBOX:RANGE-SENT? TTRUE
+   SB-RESET s" bytes=" SB-APPEND CHECKPOINT FMT:SB-INT s" -" SB-APPEND
+   SB$ TEST-DROPBOX:RANGE-SENT$ T$= ;
+
+\ The file f holds content c, of size u.
+: HOLDS-CONTENT ( str DROPBOX:hash n ^ARENA:arena -- )
+   {: f:str c:DROPBOX:hash u:n ar :}
+   f str> FS:FILE-SIZE u T=
+   f str> FS:OPEN-SIZED TTRUE drop {: h:fd :}
+   h ar LOCAL:DROPBOX-CONTENT-HASH h FS:CLOSE-DIR {: got:DROPBOX:hash :}
+   got DROPBOX:HASH>STR str> c DROPBOX:HASH>STR str> T$= ;
+
+\ Whether f is a file of u bytes.
+: SIZED? ( str n -- bool )
+   {: f:str u:n :}
+   f str> FS:FILE? 0= if false exit then
+   f str> FS:FILE-SIZE u = ;
+
+\ Plan a unblocked, and a step resuming its download from its slot.
+: HELD-STEPPED ( ^run JOURNAL:plan-record DROPBOX:hash -- )
+   {: x p c:DROPBOX:hash :}
+   x p UNBLOCKED
+   x STEPPED
+   x s" a.bin" IN-ROOT c CHECKPOINT HELD$ nip + x RUN-ARENA @
+   HOLDS-CONTENT
+   RESUMED-RANGE
+   TEST-DROPBOX:SEEN$ 2 DOWNLOADS$ T$= ;
+
+: LATER-PLANNED-DOWNLOAD-DOES-NOT-RECLAIM-AN-ACTIVE-SLOT
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" later_planned_download_does_not_reclaim_an_active_slot" T-LABEL
+   TEST-DROPBOX:RESET FILL-XS
+   ar STEP-RUN {: d:str x :}
+   x HELD-PLAN {: p c:DROPBOX:hash :}
+   x HELD-SLOT-PATH {: slot:str :}
+   x NEXT-STEPPED
+   x s" a.bin" IN-ROOT str> FS:EXISTS? TFALSE
+   slot CHECKPOINT SIZED? TTRUE
+   x p c HELD-STEPPED
+   d x STEP-GONE ;
+
 : STEP-CASES ( ^ARENA:arena -- )
    {: ar :}
    ar WORKER-VERIFICATION-MISMATCH-DURABLY-BLOCKS-ITS-PLAN
    ar WORKER-AUTH-RATE-LIMIT-AND-SERVER-FAILURES-REMAIN-GLOBAL
    ar OCCUPIED-DOWNLOAD-STAGE-IS-DURABLY-BLOCKED-WITHOUT-OVERWRITE-OR-REQUEST
-   ar COMPLETED-DOWNLOAD-BATCH-IS-INSTALLED-BEFORE-THE-NEXT-BATCH-FAILS ;
+   ar COMPLETED-DOWNLOAD-BATCH-IS-INSTALLED-BEFORE-THE-NEXT-BATCH-FAILS
+   ar UNKNOWN-DOWNLOAD-SLOTS-ARE-PRESERVED-WITH-DISPOSABLE-FALLBACK
+   ar ROOT-SWAP-AFTER-REPLAY-VALIDATION-NEVER-TOUCHES-THE-REPLACEMENT
+   ar LATER-PLANNED-DOWNLOAD-DOES-NOT-RECLAIM-AN-ACTIVE-SLOT ;
 
 : SERVED ( ^ARENA:arena -- )
    {: ar :}

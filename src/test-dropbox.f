@@ -15,13 +15,15 @@
 \ be, as invalid until RESET; the refresh still issues them. DENY refuses
 \ every call that carries a token 403 until RESET. A call must carry the
 \ Path-Root ROOT! expects, none when that is empty, else it answers 422.
+\ DURING-DOWNLOAD! hooks a quotation into the next download.
 \ Scripted answers go before a route's own: a call takes the first left
 \ bound to its path, else, an API call only, the first left bound to none.
 \ It records each request's path, and the last API call's Authorization,
 \ Path-Root and Content-Type.
 \ STORAGE CLASS. PROCESS-WIDE: one worker serves every request, so its handler
 \ alone writes the state while a test waits on its call, and the test sets it
-\ between calls; only RESUME-BODY sets it during one. A body stays in its
+\ between calls; only RESUME-BODY sets it during one, and the
+\ DURING-DOWNLOAD! hook runs on the fake's task. A body stays in its
 \ buffer, as HTTP:BODY! borrows it, until the next request.
 
 require src/lib/string.f
@@ -788,6 +790,10 @@ variable ARG-SENT-U
 create RANGE-SENT NAME-CAP allot
 variable RANGE-SENT-U
 TYPED-VARIABLE RANGED bool
+TYPED-VARIABLE DURING [ -- ]
+
+: NO-HOOK ( -- ) ;
+' NO-HOOK DURING !
 
 
 : CONTENT-REV$ ( n -- ^u8 n )
@@ -1081,9 +1087,14 @@ private
    conn TCP4:CLOSE CLOSED ;
 
 
+\ Runs the DURING-DOWNLOAD! hook, cleared first, so once.
+: HOOKED ( -- ) DURING @ ['] NO-HOOK DURING ! execute ;
+
+
 : DOWNLOAD ( HTTP:request HTTP:response -- )
    {: q:HTTP:request a:HTTP:response :}
    q a ADMITTED? 0= if exit then
+   HOOKED
    q RANGE-OF SERVED-AT {: from:n :}
    q REV-ASK
    SERVED-REV$ {: r:^ ru:n :}
@@ -1359,8 +1370,8 @@ $2100000 constant UPLOAD-CAP
 \ Forgets the script, the entries, the kept bytes, the pages, the long
 \ poll's answer, the sessions, the revs uploads took, a download's fault, a
 \ SKEW, a LOSE, the CUTs, a CUT-TOKEN, a GARBLE, a code GRANT! set, a
-\ ROTATE!, a REVOKE, a DENY and what was sent; the tokens and the root
-\ stay.
+\ ROTATE!, a REVOKE, a DENY, a DURING-DOWNLOAD! hook and what was sent;
+\ the tokens and the root stay.
 : RESET ( -- )
    0 SCRIPTS ! 0 FILES ! 0 CONTENTS ! 0 SESSIONS ! 0 REVS !
    0 GRANT-CODE-U ! 0 ROTATED-U !
@@ -1373,6 +1384,7 @@ $2100000 constant UPLOAD-CAP
    false PARTED ! false BREAKING ! false LOSING ! 0 CUTS !
    false HOLDING ! false PAUSING ! 0 RESUMING atomic!
    false TOKEN-CUTTING ! false REVOKED ! false DENIED ! false GARBLING !
+   ['] NO-HOOK DURING !
    SLOTS 0 ?do 0 i CONTENT-SKIPS ! loop
    LISTING-RESET ;
 
@@ -1531,12 +1543,16 @@ $2100000 constant UPLOAD-CAP
 : PAUSE-BODY ( -- ) 0 RESUMING atomic! true PAUSING ! ;
 \ The paused download's server sends the rest of its body.
 : RESUME-BODY ( -- ) 1 RESUMING atomic! ;
+\ The next download runs the quotation once, on the fake's task, once it
+\ is admitted and before it answers.
+: DURING-DOWNLOAD! ( [ -- ] -- ) DURING ! ;
 \ The next download answers the whole file, whatever Range it asked.
 : IGNORE-RANGE ( -- ) true WHOLED ! ;
 \ The next download answers a 206 with its Content-Range, even with no
 \ Range asked.
 : FORCE-RANGE ( -- ) true PARTED ! ;
-\ The last download's Dropbox-API-Arg value.
+\ The Dropbox-API-Arg value of the last download, upload, or upload
+\ session append or finish.
 : ARG-SENT$ ( -- ^u8 n ) ARG-SENT ARG-SENT-U @ ;
 \ The last download's Range value, and whether it sent one.
 : RANGE-SENT$ ( -- ^u8 n ) RANGE-SENT RANGE-SENT-U @ ;
