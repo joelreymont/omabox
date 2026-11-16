@@ -169,7 +169,7 @@ ARENA FIXTURES fixture
    {: x root ar :}
    x FIXTURE-CONFIG-HOME @ CONFIG:>ABS-PATH
    x FIXTURE-STATE-HOME @ CONFIG:>ABS-PATH ar CONFIG:XDG-NEW {: xdg :}
-   xdg root CONFIG:>ABS-PATH s" test-app-key" >str ar CONFIG:FROM-VALUES
+   xdg root s" test-app-key" >str ar CONFIG:FROM-VALUES
    x FIXTURE-CONFIG !
    x ar WRITE-CONFIG ;
 

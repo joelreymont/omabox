@@ -236,7 +236,7 @@ variable DROPPED
    {: d root ar :}
    d s" config" ar TEST-CLIENT:INSIDE CONFIG:>ABS-PATH
    d s" state" ar TEST-CLIENT:INSIDE CONFIG:>ABS-PATH ar CONFIG:XDG-NEW
-   root s" test-app-key" >str ar CONFIG:FROM-VALUES ;
+   root CONFIG:ABS-PATH>STR s" test-app-key" >str ar CONFIG:FROM-VALUES ;
 
 \ The second wait releases the journal path a directory held.
 : LOCK-NAP ( n -- )

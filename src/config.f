@@ -1180,10 +1180,11 @@ public
    {: ar :}
    ar XDG-ENV ar LOAD-FROM ;
 
-\ A root and key a setup or settings command supplies.
-: FROM-VALUES ( ^xdg abs-path str ^ARENA:arena -- ^config )
+\ A root and key a setup or settings command supplies; the root is
+\ refused, as a stored one is, unless absolute.
+: FROM-VALUES ( ^xdg str str ^ARENA:arena -- ^config )
    {: x root key ar :}
-   root ABS-PATH>STR key ar CHECKED x ar VALIDATE ;
+   root key ar CHECKED x ar VALIDATE ;
 
 : SYNC-ROOT ( ^config -- abs-path ) CONFIG-SYNC-ROOT @ ;
 : APP-KEY ( ^config -- str ) CONFIG-DROPBOX-APP-KEY @ ;

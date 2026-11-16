@@ -3268,7 +3268,7 @@ FS:PATHZ-CAP BUFFER: SLOT-FILE-BUF
    s" physical-state" AT HOLD s" state-link" AT FS:MAKE-SYMLINK
    s" Dropbox" AT FS:MAKE-DIR
    s" config" CASE-PATH s" state-link" CASE-PATH AR @ CONFIG:XDG-NEW
-   s" Dropbox" CASE-PATH s" test-app-key" >str AR @ CONFIG:FROM-VALUES ;
+   s" Dropbox" AT HOLD >str s" test-app-key" >str AR @ CONFIG:FROM-VALUES ;
 
 : PATHS-PROJECTED ( ^CONFIG:paths -- )
    {: p :}

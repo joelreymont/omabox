@@ -425,7 +425,7 @@ variable CAUSE
    s" could not inspect `" >str s" link" UNDER CAT
    s" ` while validating configuration paths" S+ REFUSED ;
 
-: FROM-ROOT ( -- ) XDG @ ROOT @ CONFIG:>ABS-PATH s" test-app-key" >str AR @ CONFIG:FROM-VALUES drop ;
+: FROM-ROOT ( -- ) XDG @ ROOT @ s" test-app-key" >str AR @ CONFIG:FROM-VALUES drop ;
 
 : ROOT-HOLDS-CONFIG ( -- )
    s" Dropbox" UNDER ROOT !
@@ -800,7 +800,7 @@ variable CAUSE
 \ A config from XDG, the root and the key.
 : FROM ( str ^u8 n -- ^CONFIG:config )
    {: root k:^ ku:n :}
-   XDG @ root CONFIG:>ABS-PATH k ku >str AR @ CONFIG:FROM-VALUES ;
+   XDG @ root k ku >str AR @ CONFIG:FROM-VALUES ;
 
 : NO-LEFTOVERS ( ^VEC:vector<STALE:leftover> -- ) VEC:COUNT 0 T= ;
 
