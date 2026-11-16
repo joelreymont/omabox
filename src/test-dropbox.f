@@ -18,6 +18,8 @@
 \ DURING-DOWNLOAD! hooks a quotation into the next download.
 \ Scripted answers go before a route's own: a call takes the first left
 \ bound to its path, else, an API call only, the first left bound to none.
+\ ARG-SCRIPT! also binds one to a text the call's Dropbox-API-Arg must
+\ contain.
 \ It records each request's path, and the last API call's Authorization,
 \ Path-Root and Content-Type.
 \ STORAGE CLASS. PROCESS-WIDE: one worker serves every request, so its handler
@@ -87,6 +89,8 @@ SLOTS TEXT-CAP * BUFFER: BODIES
 SLOTS TYPED-BUFFER BODY-US n
 SLOTS PATH-CAP * BUFFER: ROUTES
 SLOTS TYPED-BUFFER ROUTE-US n
+SLOTS PATH-CAP * BUFFER: NEEDLES
+SLOTS TYPED-BUFFER NEEDLE-US n
 SLOTS TYPED-BUFFER SPENT bool
 variable SCRIPTS
 
@@ -134,6 +138,7 @@ TYPED-VARIABLE TOKEN-CUTTING bool
 : VALUE$ ( n -- ^u8 n ) {: i:n :} VALUES i NAME-CAP * + i VALUE-US @ ;
 : BODY$ ( n -- ^u8 n ) {: i:n :} BODIES i TEXT-CAP * + i BODY-US @ ;
 : ROUTE$ ( n -- ^u8 n ) {: i:n :} ROUTES i PATH-CAP * + i ROUTE-US @ ;
+: NEEDLE$ ( n -- ^u8 n ) {: i:n :} NEEDLES i PATH-CAP * + i NEEDLE-US @ ;
 
 
 \ The builder's text into OUT, which outlives the handler.
@@ -196,12 +201,19 @@ TYPED-VARIABLE TOKEN-CUTTING bool
 : API? ( HTTP:request -- bool ) HTTP:PATH$ s" /oauth2/token" STR= 0= ;
 
 
-\ The first scripted answer left bound to the route path, the empty path
-\ standing for none; -1 when no answer is.
-: LEFT-FOR ( ^u8 n -- n )
-   {: p:^ pu:n :}
+\ The request's Dropbox-API-Arg, empty when it sends none.
+: ARG-OF ( HTTP:request -- ^u8 n )
+   s" Dropbox-API-Arg" HTTP:HEADER-OF$ 0= if drop 0 then ;
+
+
+\ The first scripted answer left bound to the route path, the empty
+\ path standing for none, whose text q's argument contains; -1 when no
+\ answer is.
+: LEFT-FOR ( HTTP:request ^u8 n -- n )
+   {: q:HTTP:request p:^ pu:n :}
+   q ARG-OF {: a:^ au:n :}
    SCRIPTS @ 0 ?do
-      i SPENT @ 0= i ROUTE$ p pu STR= and
+      i SPENT @ 0= i ROUTE$ p pu STR= and a au i NEEDLE$ CONTAINS? and
       if i unloop exit then
    loop -1 ;
 
@@ -210,8 +222,8 @@ TYPED-VARIABLE TOKEN-CUTTING bool
 \ only, the first left bound to none, if there is one.
 : SCRIPTED? ( HTTP:request HTTP:response -- bool )
    {: q:HTTP:request a:HTTP:response :}
-   q HTTP:PATH$ LEFT-FOR {: bound:n :}
-   bound 0 < q API? and if s" " LEFT-FOR else bound then {: i:n :}
+   q q HTTP:PATH$ LEFT-FOR {: bound:n :}
+   bound 0 < q API? and if q s" " LEFT-FOR else bound then {: i:n :}
    i 0 < if false exit then
    true i SPENT !
    a i STATUSES @ HTTP:STATUS!
@@ -1437,7 +1449,7 @@ $2100000 constant UPLOAD-CAP
    nm nu NAMES NAME-CAP i AT STORE i NAME-US !
    v vu VALUES NAME-CAP i AT STORE i VALUE-US !
    b bu BODIES TEXT-CAP i AT STORE i BODY-US !
-   0 i ROUTE-US ! false i SPENT !
+   0 i ROUTE-US ! 0 i NEEDLE-US ! false i SPENT !
    1 SCRIPTS +! ;
 
 
@@ -1445,6 +1457,15 @@ $2100000 constant UPLOAD-CAP
 : ROUTE-SCRIPT! ( ^u8 n n ^u8 n ^u8 n ^u8 n -- )
    SCRIPT! SCRIPTS @ 1 - {: r:^ ru:n i:n :}
    r ru ROUTES PATH-CAP i AT STORE i ROUTE-US ! ;
+
+
+\ ROUTE-SCRIPT!'s answer, which only a call whose Dropbox-API-Arg
+\ contains the text t gets: route, t, status, header, body.
+: ARG-SCRIPT! ( ^u8 n ^u8 n n ^u8 n ^u8 n ^u8 n -- )
+   {: r:^ ru:n t:^ tu:n s:n nm:^ nu:n v:^ vu:n b:^ bu:n :}
+   r ru s nm nu v vu b bu ROUTE-SCRIPT!
+   SCRIPTS @ 1 - {: i:n :}
+   t tu NEEDLES PATH-CAP i AT STORE i NEEDLE-US ! ;
 
 
 \ The paths requested since RESET, joined by spaces.

@@ -85,6 +85,15 @@
 \   the upload's argument, whose hash the fake checks, for its body
 \ - an_unknown_observation_does_not_retire_a_stale_install
 \ - a_pending_only_path_retires_without_fetching_obsolete_bytes
+\ Download blocks against the fake Dropbox, Rust's tests of the same
+\ names, each download installing in the pass and no account request:
+\ - unavailable_download_blocks_only_its_plan_while_siblings_finish
+\ - rejected_download_request_blocks_only_its_plan_while_siblings_finish
+\ - unmapped_download_status_blocks_only_its_plan_while_siblings_finish
+\ - due_unchanged_download_retries_after_fresh_observation
+\ - due_download_stays_blocked_when_the_fresh_local_path_is_unknown
+\ - changed_revision_supersedes_blocked_plan_before_or_after_deadline
+\ - blocked_plan_is_retired_when_both_sides_are_absent
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -3033,6 +3042,299 @@ XS-SIZE BUFFER: XS
    ar AN-UNKNOWN-OBSERVATION-DOES-NOT-RETIRE-A-STALE-INSTALL
    ar A-PENDING-ONLY-PATH-RETIRES-WITHOUT-FETCHING-OBSOLETE-BYTES ;
 
+\ ---- download blocks against the fake Dropbox ----------------------
+
+: REPLAYED-IN ( report -- n )
+   RECONCILE-REPORT:UNMAKE {: r:n o:n p:n b:n e:n c:n :} r ;
+: PLANNED-IN ( report -- n )
+   RECONCILE-REPORT:UNMAKE {: r:n o:n p:n b:n e:n c:n :} p ;
+: BLOCKED-IN ( report -- n )
+   RECONCILE-REPORT:UNMAKE {: r:n o:n p:n b:n e:n c:n :} b ;
+
+: PLAN-BLOCKED? ( JOURNAL:plan-block -- bool )
+   MATCH JOURNAL:plan-block
+      not-found OF false ENDOF
+      already-completed OF false ENDOF
+      blocked OF true ENDOF
+   ;MATCH ;
+
+: BLOCKED-STATUS? ( JOURNAL:plan-record -- bool )
+   STATUS-OF MATCH JOURNAL:plan-status
+      pending OF false ENDOF
+      blocked OF drop drop true ENDOF
+      completed OF false ENDOF
+   ;MATCH ;
+
+\ Rust's record_blocked_install: INSTALLING's plan at path a, held as
+\ download-unavailable 409 until at, in seconds since the epoch.
+: RECORD-BLOCKED-INSTALL
+   ( ^run ^u8 n MODEL:remote n -- JOURNAL:plan-record )
+   {: x a:^ u:n rem at:n :}
+   x a u rem INSTALLING {: p :}
+   x RUN-JOURNAL @ p ID-OF 409 MODEL-BLOCKAGE:DOWNLOAD-UNAVAILABLE at
+   x RUN-ARENA @ JOURNAL:BLOCK-PLAN PLAN-BLOCKED? TTRUE
+   p ;
+
+\ The one listing page, cursor k: /<p> at rev v with b's identity.
+: LISTED-ALONE ( ^u8 n ^u8 n ^u8 n ^u8 n ^ARENA:arena -- )
+   {: p:^ pu:n v:^ vu:n b:^ bu:n k:^ ku:n ar :}
+   b bu ar IDENTITY {: h:DROPBOX:hash :}
+   SB-RESET s" /" SB-APPEND p pu SB-APPEND SB$ ar COPIED {: l:str :}
+   [: l str> l str> v vu h FILE-JSON+ ;] ar ENTRIES k ku false PAGE ;
+
+: INDEPENDENT-UPLOAD$ ( -- ^u8 n ) s" independent upload" ;
+: INDEPENDENT-DOWNLOAD$ ( -- ^u8 n ) s" independent download" ;
+: UNAVAILABLE-DOWNLOAD$ ( -- ^u8 n ) s" unavailable download" ;
+
+\ Rust's lookup_error("not_found").
+: LOOKUP-NOT-FOUND$ ( -- ^u8 n )
+   S\" {\qerror_summary\q:\qpath/not_found/...\q,\qerror\q:{\q.tag\q:\qpath\q,\qpath\q:{\q.tag\q:\qnot_found\q}}}" ;
+
+: UNDECODABLE-ARG$ ( -- ^u8 n )
+   S\" Error in call to API function \qfiles/download\q: HTTP header \qDropbox-API-Arg\q: could not decode input as JSON" ;
+
+\ Rust's failure, status st with body b, which only the download of
+\ rev-blocked gets.
+: BLOCKED-ANSWER ( n ^u8 n -- )
+   {: st:n b:^ bu:n :}
+   DOWNLOAD$ s" rev-blocked" st s" " s" " b bu
+   TEST-DROPBOX:ARG-SCRIPT! ;
+
+\ Rust's listing: blocked.txt and good.txt, each at its own rev.
+: ISOLATION-PAGE ( ^ARENA:arena -- )
+   {: ar :}
+   UNAVAILABLE-DOWNLOAD$ ar IDENTITY {: hb:DROPBOX:hash :}
+   INDEPENDENT-DOWNLOAD$ ar IDENTITY {: hg:DROPBOX:hash :}
+   [: s" /blocked.txt" s" /blocked.txt" s" rev-blocked" hb FILE-JSON+
+      COMMA+ s" /good.txt" s" /good.txt" s" rev-good" hg FILE-JSON+ ;]
+   ar ENTRIES s" cursor-download-isolation" false PAGE ;
+
+\ Rust's fixture: upload.txt in the root, good.txt served, both
+\ downloads listed; answers the recovery directory.
+: ISOLATED ( str ^run -- str )
+   {: d:str x :}
+   x RUN-ARENA @ {: ar :}
+   d x PASS-READY {: rec:str :}
+   x s" upload.txt" IN-ROOT str> INDEPENDENT-UPLOAD$ FS:WRITE-ALL
+   s" good.txt" s" rev-good" INDEPENDENT-DOWNLOAD$ ar SERVES
+   ar ISOLATION-PAGE
+   rec ;
+
+: ISOLATION-FILES ( ^run -- )
+   {: x :}
+   x s" good.txt" IN-ROOT INDEPENDENT-DOWNLOAD$ HOLDS-BYTES
+   x s" upload.txt" IN-ROOT INDEPENDENT-UPLOAD$ HOLDS-BYTES
+   x s" blocked.txt" IN-ROOT str> FS:EXISTS? TFALSE ;
+
+\ No plan pending, and blocked.txt's alone blocked for status st.
+: BLOCKED-ALONE ( ^run n -- )
+   {: x st:n :}
+   x PENDING-OF VEC:COUNT 0 T=
+   x BLOCKED-OF {: held :}
+   held VEC:COUNT 1 T=
+   held 0 PLAN-PATH$ s" blocked.txt" T$=
+   s" download-unavailable " st x RUN-ARENA @ NUMBERED {: w:str :}
+   held 0 VEC:AT @ HELD-FOR$ w str> T$= ;
+
+: UNAVAILABLE-ENTRY ( n ^ARENA:arena -- str )
+   {: st:n ar :}
+   s" durable-plan blocked.txt download-unavailable " st ar NUMBERED ;
+
+\ Rust's five requests but the account call; the fake serves good.txt's
+\ bytes only to an argument naming rev-good.
+: ISOLATION-SEEN$ ( -- ^u8 n )
+   s" /2/files/list_folder /2/files/download /2/files/download /2/files/upload" ;
+
+\ The run's journal closed and opened again from its file in d.
+: REOPENED ( str ^run -- )
+   {: d:str x :}
+   x RUN-JOURNAL @ JOURNAL:CLOSE
+   d s" journal.sqlite3" x RUN-ARENA @ INSIDE JOURNAL:OPEN
+   x RUN-JOURNAL ! ;
+
+\ Over a reopened journal, a step reports the block and sends nothing.
+: BLOCK-KEPT ( str ^run n -- )
+   {: d:str x st:n :}
+   d x REOPENED
+   TEST-DROPBOX:RESET
+   x REPLAY-STEP REPORTED st x RUN-ARENA @ UNAVAILABLE-ENTRY str>
+   REPORTS? TTRUE
+   TEST-DROPBOX:SEEN$ s" " T$= ;
+
+\ Rust's assert_download_failure_blocks_only_its_plan: the answer q
+\ scripts blocks blocked.txt for status st while its siblings finish.
+: ASSERT-DOWNLOAD-FAILURE-BLOCKS-ONLY-ITS-PLAN
+   ( n [ -- ] ^ARENA:arena -- )
+   {: st:n q ar :}
+   TEST-DROPBOX:RESET q execute
+   ar STEP-RUN {: d:str x :}
+   d x ISOLATED {: rec:str :}
+   \ Rust counts the upload; good.txt's download installs in the pass.
+   x rec PASSED COMPLETE REPLAYED-IN 2 T=
+   x REPLAY-STEP REPORTED {: settled :}
+   x ISOLATION-FILES
+   x st BLOCKED-ALONE
+   settled st ar UNAVAILABLE-ENTRY str> REPORTS? TTRUE
+   TEST-DROPBOX:SEEN$ ISOLATION-SEEN$ T$=
+   d x st BLOCK-KEPT
+   d x STEP-GONE ;
+
+: UNAVAILABLE-DOWNLOAD-BLOCKS-ONLY-ITS-PLAN-WHILE-SIBLINGS-FINISH
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" unavailable_download_blocks_only_its_plan_while_siblings_finish"
+   T-LABEL
+   409 [: 409 LOOKUP-NOT-FOUND$ BLOCKED-ANSWER ;] ar
+   ASSERT-DOWNLOAD-FAILURE-BLOCKS-ONLY-ITS-PLAN ;
+
+: REJECTED-DOWNLOAD-REQUEST-BLOCKS-ONLY-ITS-PLAN-WHILE-SIBLINGS-FINISH
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" rejected_download_request_blocks_only_its_plan_while_siblings_finish"
+   T-LABEL
+   400 [: 400 UNDECODABLE-ARG$ BLOCKED-ANSWER ;] ar
+   ASSERT-DOWNLOAD-FAILURE-BLOCKS-ONLY-ITS-PLAN ;
+
+: UNMAPPED-DOWNLOAD-STATUS-BLOCKS-ONLY-ITS-PLAN-WHILE-SIBLINGS-FINISH
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" unmapped_download_status_blocks_only_its_plan_while_siblings_finish"
+   T-LABEL
+   418 [: 418 s" {}" BLOCKED-ANSWER ;] ar
+   ASSERT-DOWNLOAD-FAILURE-BLOCKS-ONLY-ITS-PLAN ;
+
+: DUE$ ( -- ^u8 n ) s" download available on retry" ;
+
+\ due.txt served and listed, and its plan blocked with its retry due.
+: DUE-BLOCKED ( ^run -- )
+   {: x :}
+   x RUN-ARENA @ {: ar :}
+   s" due.txt" s" rev-due" DUE$ ar SERVES
+   s" due.txt" s" rev-due" DUE$ s" cursor-due" ar LISTED-ALONE
+   DUE$ s" rev-due" ar REMOTE-FILE {: rem :}
+   x s" due.txt" rem 0 RECORD-BLOCKED-INSTALL drop ;
+
+: DUE-UNCHANGED-DOWNLOAD-RETRIES-AFTER-FRESH-OBSERVATION
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" due_unchanged_download_retries_after_fresh_observation" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x DUE-BLOCKED
+   \ Rust's later replay completes it; it installs in the pass.
+   x rec PASSED COMPLETE REPLAYED-IN 1 T=
+   x REPLAY-STEP REPORTED COMPLETED 0 T=
+   x s" due.txt" IN-ROOT DUE$ HOLDS-BYTES
+   x BLOCKED-OF VEC:COUNT 0 T=
+   x PENDING-OF VEC:COUNT 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/download" T$=
+   d x STEP-GONE ;
+
+: UNKNOWN-REMOTE$ ( -- ^u8 n ) s" remote bytes" ;
+
+\ unknown.txt listed, a dangling symlink in the root, and its plan
+\ blocked with its retry due.
+: UNKNOWN-BLOCKED ( ^run -- JOURNAL:plan-record )
+   {: x :}
+   x RUN-ARENA @ {: ar :}
+   s" unknown.txt" s" rev-unknown" UNKNOWN-REMOTE$ s" cursor-unknown" ar
+   LISTED-ALONE
+   s" missing-target" x s" unknown.txt" IN-ROOT str> FS:MAKE-SYMLINK
+   UNKNOWN-REMOTE$ s" rev-unknown" ar REMOTE-FILE {: rem :}
+   x s" unknown.txt" rem 0 RECORD-BLOCKED-INSTALL ;
+
+: DUE-DOWNLOAD-STAYS-BLOCKED-WHEN-THE-FRESH-LOCAL-PATH-IS-UNKNOWN
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" due_download_stays_blocked_when_the_fresh_local_path_is_unknown"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x UNKNOWN-BLOCKED {: p :}
+   x rec PASSED COMPLETE drop
+   x BLOCKED-OF {: held :}
+   held VEC:COUNT 1 T=
+   held 0 VEC:AT @ ID-OF JOURNAL:PLAN-ID>N p ID-OF JOURNAL:PLAN-ID>N T=
+   held 0 VEC:AT @ BLOCKED-STATUS? TTRUE
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$=
+   d x STEP-GONE ;
+
+: NEW-REMOTE$ ( -- ^u8 n ) s" new remote bytes" ;
+
+\ changed.txt served and listed at rev-new-current, and the plan for
+\ rev-old-blocked held until at.
+: CHANGED-BLOCKED ( ^run n -- )
+   {: x at:n :}
+   x RUN-ARENA @ {: ar :}
+   s" changed.txt" s" rev-new-current" NEW-REMOTE$ ar SERVES
+   s" changed.txt" s" rev-new-current" NEW-REMOTE$ s" cursor-changed" ar
+   LISTED-ALONE
+   s" old remote bytes" s" rev-old-blocked" ar REMOTE-FILE {: old :}
+   x s" changed.txt" old at RECORD-BLOCKED-INSTALL drop ;
+
+: NEW-REV-ARG$ ( -- ^u8 n ) S\" {\qpath\q:\qrev:rev-new-current\q}" ;
+
+\ Rust's changed_revision_supersedes_blocked_download.
+: CHANGED-REVISION-SUPERSEDES-BLOCKED-DOWNLOAD ( n ^ARENA:arena -- )
+   {: at:n ar :}
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x at CHANGED-BLOCKED
+   x rec PASSED COMPLETE {: rep :}
+   \ Rust's one pending plan, not the old one: a plan recorded in its
+   \ place, its download installed in the pass.
+   rep PLANNED-IN 1 T= rep REPLAYED-IN 1 T=
+   x REPLAY-STEP REPORTED drop
+   x s" changed.txt" IN-ROOT NEW-REMOTE$ HOLDS-BYTES
+   x PENDING-OF VEC:COUNT 0 T=
+   x BLOCKED-OF VEC:COUNT 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/download" T$=
+   TEST-DROPBOX:ARG-SENT$ NEW-REV-ARG$ T$=
+   d x STEP-GONE ;
+
+: CHANGED-REVISION-SUPERSEDES-BLOCKED-PLAN-BEFORE-OR-AFTER-DEADLINE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" changed_revision_supersedes_blocked_plan_before_or_after_deadline"
+   T-LABEL
+   0 ar CHANGED-REVISION-SUPERSEDES-BLOCKED-DOWNLOAD
+   4000000000 ar CHANGED-REVISION-SUPERSEDES-BLOCKED-DOWNLOAD ;
+
+\ vanished.txt on neither side, and its plan held far ahead.
+: VANISHED-BLOCKED ( ^run -- )
+   {: x :}
+   x RUN-ARENA @ {: ar :}
+   [: ;] ar ENTRIES s" cursor-absent" false PAGE
+   s" vanished bytes" s" rev-vanished" ar REMOTE-FILE {: old :}
+   x s" vanished.txt" old 4000000000 RECORD-BLOCKED-INSTALL drop ;
+
+: BLOCKED-PLAN-IS-RETIRED-WHEN-BOTH-SIDES-ARE-ABSENT
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" blocked_plan_is_retired_when_both_sides_are_absent" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x VANISHED-BLOCKED
+   x rec PASSED COMPLETE BLOCKED-IN 0 T=
+   x PENDING-OF VEC:COUNT 0 T=
+   x BLOCKED-OF VEC:COUNT 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$=
+   d x STEP-GONE ;
+
+: DOWNLOAD-BLOCKS-CASES ( ^ARENA:arena -- )
+   {: ar :}
+   ar UNAVAILABLE-DOWNLOAD-BLOCKS-ONLY-ITS-PLAN-WHILE-SIBLINGS-FINISH
+   ar REJECTED-DOWNLOAD-REQUEST-BLOCKS-ONLY-ITS-PLAN-WHILE-SIBLINGS-FINISH
+   ar UNMAPPED-DOWNLOAD-STATUS-BLOCKS-ONLY-ITS-PLAN-WHILE-SIBLINGS-FINISH
+   ar DUE-UNCHANGED-DOWNLOAD-RETRIES-AFTER-FRESH-OBSERVATION
+   ar DUE-DOWNLOAD-STAYS-BLOCKED-WHEN-THE-FRESH-LOCAL-PATH-IS-UNKNOWN
+   ar CHANGED-REVISION-SUPERSEDES-BLOCKED-PLAN-BEFORE-OR-AFTER-DEADLINE
+   ar BLOCKED-PLAN-IS-RETIRED-WHEN-BOTH-SIDES-ARE-ABSENT ;
+
 : SERVED ( ^ARENA:arena -- )
    {: ar :}
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
@@ -3040,7 +3342,7 @@ XS-SIZE BUFFER: XS
    ar OPENED MAIN !
    ACCOUNTED
    [: ar REFRESH-CASES ar STEP-CASES ar PASS-CASES
-      ar STALE-CASES ;]
+      ar STALE-CASES ar DOWNLOAD-BLOCKS-CASES ;]
    [: MAIN @ DROPBOX:CLOSE ;]
    finally ;
 
