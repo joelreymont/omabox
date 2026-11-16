@@ -3,7 +3,8 @@
 \ - parser_accepts_documented_forms
 \ - parser_rejects_incomplete_or_secret_bearing_forms and
 \   parser_names_the_setup_option_fault, each refusal's two log lines
-\   checked in a file under TMPDIR; setup's forms through PARSE-SETUP
+\   checked in a file under TMPDIR; setup's forms through PARSE, their
+\   options compared with OPTIONS=
 \ - default_sync_root_is_a_private_home_dropbox_created_once, the home a
 \   directory under TMPDIR
 \ - failed_initial_setup_leaves_no_config_and_same_command_can_retry,
@@ -42,11 +43,18 @@
 \   set_root_explicitly_adopts_a_replacement_at_the_same_path, each over
 \   Rust's fixture with its systemctl script in the fixture's directory,
 \   the journal seeded through JOURNAL and PLANNER
+\ - setup_reports_a_held_lock_and_restores_the_service,
+\   a_failed_change_and_restore_render_both,
+\   setup_releases_the_lock_before_starting_a_failed_service and the
+\   setup half of a_completed_change_reports_a_failed_start, each over
+\   Rust's fixture with COMPLETE-SETUP and a bind that does nothing as
+\   the change, systemctl Rust's script for the test under TMPDIR, and
+\   the log captured in a file there
 \ and the program built with README's command into a directory under
 \ TMPDIR, whose --version prints its name and version and exits 0.
-\ White-box: OMABOX is reopened for PARSE, PARSE-SETUP, HOME-ROOT,
-\ COMPLETE-SETUP, READ-CODE, RUN-SERVICE, STATUS-TEXT, SETTINGS-TEXT,
-\ RESTORE-GOAL, RELEASED and SET-ROOT.
+\ White-box: OMABOX is reopened for PARSE, HOME-ROOT, COMPLETE-SETUP,
+\ READ-CODE, RUN-SERVICE, STATUS-TEXT, SETTINGS-TEXT, RESTORE-GOAL,
+\ RELEASED and SET-ROOT.
 \ Run from the repository root: hb --load src/omabox-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -159,6 +167,9 @@ variable CHANGES
       ENDOF
       logs OF s" logs" SB-APPEND ENDOF
       set-root OF s" set-root " SB-APPEND str> SB-APPEND ENDOF
+      setup OF
+         SETUP-OPTIONS-UNMAKE drop s" setup " SB-APPEND str> SB-APPEND
+      ENDOF
    ;MATCH SB$ ;
 
 : ACCEPTS-IN ( command ^ARENA:arena -- )
@@ -167,7 +178,22 @@ variable CHANGES
 
 : ACCEPTS ( command -- ) {: c :} [: c swap ACCEPTS-IN ;] ARENA:WITH ;
 
-: SETUP-PARSED ( -- setup-options ) ARGC @ [: ARG ;] PARSE-SETUP ;
+\ Options no setup form parses to, for a command other than setup.
+: NOT-SETUP ( -- setup-options )
+   s" not setup" >str NO-INITIAL SETUP-OPTIONS-MAKE ;
+
+\ The setup options PARSE answers for the arguments.
+: SETUP-PARSED ( -- setup-options )
+   PARSED MATCH command
+      setup OF ENDOF
+      help OF NOT-SETUP ENDOF
+      version OF NOT-SETUP ENDOF
+      status OF NOT-SETUP ENDOF
+      settings OF drop NOT-SETUP ENDOF
+      set-root OF drop NOT-SETUP ENDOF
+      service OF drop NOT-SETUP ENDOF
+      logs OF NOT-SETUP ENDOF
+   ;MATCH ;
 
 \ The bytes and whether there are any.
 : SOME$ ( option<str> -- ^u8 n bool )
@@ -265,11 +291,6 @@ variable CHANGES
    {: m:^ mu:n p ar :}
    [: PARSED drop ;] p str> ar STDERR:CAPTURING m mu USAGE-LOGGED ;
 
-\ REJECTS of setup's arguments, through PARSE-SETUP.
-: SETUP-REJECTS ( ^u8 n str ^ARENA:arena -- )
-   {: m:^ mu:n p ar :}
-   [: SETUP-PARSED drop ;] p str> ar STDERR:CAPTURING m mu USAGE-LOGGED ;
-
 : PARSER-REJECTS-INCOMPLETE-OR-SECRET-BEARING-FORMS
    ( ^ARENA:arena -- )
    {: ar :}
@@ -287,11 +308,11 @@ variable CHANGES
    s" settings" s" --yaml" TWO s" invalid settings command" p ar REJECTS
    s" service" s" unknown" TWO s" unknown service action" p ar REJECTS
    s" setup" s" --sync-root" TWO s" /tmp/Dropbox" ARG+
-   s" flag-driven setup requires --app-key" p ar SETUP-REJECTS
+   s" flag-driven setup requires --app-key" p ar REJECTS
    s" setup" s" --sync-root" TWO s" /tmp/Dropbox" ARG+
    s" --app-key" ARG+ s" key" ARG+
    s" --app-secret" ARG+ s" secret" ARG+
-   s" unknown setup option" p ar SETUP-REJECTS
+   s" unknown setup option" p ar REJECTS
    d str> FS:REMOVE-TREE ;
 
 : ROOT-FAULT$ ( -- ^u8 n )
@@ -302,20 +323,20 @@ variable CHANGES
    s" parser_names_the_setup_option_fault" T-LABEL
    ar TEMPORARY {: d :}
    d s" stderr.txt" ar INSIDE {: p :}
-   s" setup" s" --help" TWO s" unknown setup option" p ar SETUP-REJECTS
+   s" setup" s" --help" TWO s" unknown setup option" p ar REJECTS
    s" setup" s" --sync-root" TWO s" /tmp/Dropbox" ARG+ s" --bogus" ARG+
-   s" unknown setup option" p ar SETUP-REJECTS
+   s" unknown setup option" p ar REJECTS
    s" setup" s" --app-key" TWO
-   s" a setup option is missing its value" p ar SETUP-REJECTS
+   s" a setup option is missing its value" p ar REJECTS
    s" setup" s" --app-key" TWO s" key" ARG+ s" --app-key" ARG+
-   s" a setup option was provided more than once" p ar SETUP-REJECTS
-   s" setup" s" -h" TWO ROOT-FAULT$ p ar SETUP-REJECTS
-   s" setup" s" Work" TWO ROOT-FAULT$ p ar SETUP-REJECTS
-   s" setup" s" /Work/" TWO ROOT-FAULT$ p ar SETUP-REJECTS
-   s" setup" s" /Work/../Home" TWO ROOT-FAULT$ p ar SETUP-REJECTS
+   s" a setup option was provided more than once" p ar REJECTS
+   s" setup" s" -h" TWO ROOT-FAULT$ p ar REJECTS
+   s" setup" s" Work" TWO ROOT-FAULT$ p ar REJECTS
+   s" setup" s" /Work/" TWO ROOT-FAULT$ p ar REJECTS
+   s" setup" s" /Work/../Home" TWO ROOT-FAULT$ p ar REJECTS
    s" setup" s" --sync-root" TWO s" /tmp/Dropbox" ARG+
    s" --app-key" ARG+ s" key" ARG+ s" --remote-root" ARG+ s" Work" ARG+
-   ROOT-FAULT$ p ar SETUP-REJECTS
+   ROOT-FAULT$ p ar REJECTS
    d str> FS:REMOVE-TREE ;
 
 
@@ -1114,7 +1135,7 @@ variable CHANGES
 
 \ set-root from a unit in the state whose start fails: the change is
 \ kept and reported as E-START-AFTER-CHANGE.
-: START-FAILS ( ^u8 n ^ARENA:arena -- )
+: SET-ROOT-START-FAILS ( ^u8 n ^ARENA:arena -- )
    {: s:^ su:n ar :}
    ar FIXTURE {: d x first :}
    d s" second" ar INSIDE {: second :}
@@ -1124,12 +1145,6 @@ variable CHANGES
    code E-START-AFTER-CHANGE T=
    x ar STORED-ROOT second str> T$=
    d str> FS:REMOVE-TREE ;
-
-: A-COMPLETED-CHANGE-REPORTS-A-FAILED-START ( ^ARENA:arena -- )
-   {: ar :}
-   s" a_completed_change_reports_a_failed_start" T-LABEL
-   s" failed" ar START-FAILS
-   s" active" ar START-FAILS ;
 
 : SET-ROOT-REQUIRES-THE-DAEMON-LOCK-BEFORE-WRITING-CONFIG
    ( ^ARENA:arena -- )
@@ -1310,6 +1325,129 @@ variable CHANGES
    d str> FS:REMOVE-TREE ;
 
 
+\ ---- setup with the service released
+
+\ Rust's change in these tests: COMPLETE-SETUP of the config c, writing
+\ no config, with a bind that does nothing.
+: SETUP-CHANGE ( ^CONFIG:config ^ARENA:arena
+     -- ^VEC:vector<STALE:leftover> )
+   {: c ar :}
+   c false [: ;] ar COMPLETE-SETUP ;
+
+\ Setup released from s around SETUP-CHANGE of c: its code and the log,
+\ captured in p.
+: SETUP-RUN ( ^SERVICE:commands ^CONFIG:config str ^ARENA:arena
+     -- n ^u8 n )
+   {: s c p ar :}
+   [: s [: c swap SETUP-CHANGE ;] ar SETUP-RELEASED ;]
+   p str> ar STDERR:CAPTURING ;
+
+\ Rust's fixture's config, loaded, and the log file in its directory.
+: LOADED-FIXTURE ( ^ARENA:arena -- str ^CONFIG:config str )
+   {: ar :}
+   ar FIXTURE {: d x first :}
+   x ar CONFIG:LOAD-FROM {: c :}
+   d c d s" stderr.txt" ar INSIDE ;
+
+: SETUP-REPORTS-A-HELD-LOCK-AND-RESTORES-THE-SERVICE ( ^ARENA:arena -- )
+   {: ar :}
+   s" setup_reports_a_held_lock_and_restores_the_service" T-LABEL
+   ar LOADED-FIXTURE {: d c p :}
+   c CONFIG:PATHS CONFIG:LOCK {: held :}
+   s" active" 0 0 ar STATEFUL {: sd s :}
+   s c p ar SETUP-RUN {: code:n e:^ eu:n :}
+   held CONFIG:UNLOCK
+   code E-LOCK T=
+   sd ar TRACE {: log state :}
+   log str> S\" show\nstop\nreset-failed\nstart\n" T$=
+   state str> S\" active\n" T$=
+   sd str> FS:REMOVE-TREE
+   d str> FS:REMOVE-TREE ;
+
+\ The offset past the line t in the log from at, -1 where it is not
+\ there or at is.
+: PAST ( ^u8 n n ^u8 n -- n )
+   {: a:^ u:n at:n t:^ tu:n :}
+   at 0 < if -1 exit then
+   a u t tu at FIND-SUB-FROM MATCH option
+      none OF -1 ENDOF
+      some OF IDX>N tu + ENDOF
+   ;MATCH ;
+
+: LOGGED-AFTER ( ^u8 n n ^u8 n -- ^u8 n n )
+   {: a:^ u:n at:n t:^ tu:n :}
+   a u a u at t tu PAST ;
+
+\ The lines of the failed change, then the failed restore's, then the
+\ error that names both, in the order they print.
+: RENDERED-BOTH ( ^u8 n -- )
+   0 S\" omabox: could not acquire the Omabox daemon lock\n" LOGGED-AFTER
+   S\" omabox: help: Stop any manually started Omabox daemon, then retry.\n"
+   LOGGED-AFTER
+   S\" service: `systemctl` failed with status Some(1)\n" LOGGED-AFTER
+   S\" service: help: Review the command output and `omabox logs`, then retry.\n"
+   LOGGED-AFTER
+   S\" omabox: setup failed, and the Omabox service could not be restarted; run `omabox resume` once the errors above are fixed\n"
+   LOGGED-AFTER
+   0 >= TTRUE 2drop ;
+
+: A-FAILED-CHANGE-AND-RESTORE-RENDER-BOTH ( ^ARENA:arena -- )
+   {: ar :}
+   s" a_failed_change_and_restore_render_both" T-LABEL
+   ar LOADED-FIXTURE {: d c p :}
+   c CONFIG:PATHS CONFIG:LOCK {: held :}
+   s" active" 1 0 ar STATEFUL {: sd s :}
+   s c p ar SETUP-RUN {: code:n e:^ eu:n :}
+   held CONFIG:UNLOCK
+   code E-CHANGE-AND-RESTORE T=
+   e eu RENDERED-BOTH
+   sd str> FS:REMOVE-TREE
+   d str> FS:REMOVE-TREE ;
+
+\ A systemctl in d that logs each verb to d/service.log, then runs the
+\ case arms.
+: CASED ( str ^u8 n ^ARENA:arena -- ^SERVICE:commands )
+   {: d arms:^ au:n ar :}
+   d s" systemctl" ar INSIDE {: sys :}
+   d s" service.log" ar INSIDE {: log :}
+   SB-RESET S\" printf '%s\\n' \"$2\" >> " SB-APPEND log QUOTED+
+   S\" \ncase \"$2\" in\n" SB-APPEND arms au SB-APPEND
+   S\" esac\nexit 0\n" SB-APPEND
+   sys str> SB$ FS:WRITE-ALL
+   sys s" /unused/journalctl" >str ar SERVICE:SCRIPTS ;
+
+\ Rust's arms: show answers failed, start takes the lock file l.
+: FLOCK-ARMS ( str ^ARENA:arena -- str )
+   {: l ar :}
+   SB-RESET S\"   show) printf '%s\\n' failed ;;\n" SB-APPEND
+   s"   start) exec flock -n " SB-APPEND l QUOTED+
+   S\"  true ;;\n" SB-APPEND SB$ ar COPIED ;
+
+: SETUP-RELEASES-THE-LOCK-BEFORE-STARTING-A-FAILED-SERVICE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" setup_releases_the_lock_before_starting_a_failed_service" T-LABEL
+   ar LOADED-FIXTURE {: d c p :}
+   c CONFIG:PATHS CONFIG:LOCK-FILE CONFIG:ABS-PATH>STR {: l :}
+   d l ar FLOCK-ARMS str> ar CASED {: s :}
+   s c p ar SETUP-RUN {: code:n e:^ eu:n :}
+   code 0 T=
+   d s" service.log" ar INSIDE FILE-TEXT
+   S\" show\nshow\nreset-failed\nstart\n" T$=
+   d str> FS:REMOVE-TREE ;
+
+: A-COMPLETED-CHANGE-REPORTS-A-FAILED-START ( ^ARENA:arena -- )
+   {: ar :}
+   s" a_completed_change_reports_a_failed_start" T-LABEL
+   ar LOADED-FIXTURE {: d c p :}
+   d s" failed" ar FAILING-START {: s :}
+   s c p ar SETUP-RUN {: code:n e:^ eu:n :}
+   code E-START-AFTER-CHANGE T=
+   d str> FS:REMOVE-TREE
+   s" failed" ar SET-ROOT-START-FAILS
+   s" active" ar SET-ROOT-START-FAILS ;
+
+
 \ ---- the built program
 
 : BUILD-ARGS ( str -- )
@@ -1388,6 +1526,9 @@ variable CHANGES
    ar A-FAILED-CHANGE-AND-RESTART-REPORT-BOTH
    ar SET-ROOT-WORKS-WHEN-THE-PRIOR-ROOT-IS-UNAVAILABLE
    ar SET-ROOT-EXPLICITLY-ADOPTS-A-REPLACEMENT-AT-THE-SAME-PATH
+   ar SETUP-REPORTS-A-HELD-LOCK-AND-RESTORES-THE-SERVICE
+   ar A-FAILED-CHANGE-AND-RESTORE-RENDER-BOTH
+   ar SETUP-RELEASES-THE-LOCK-BEFORE-STARTING-A-FAILED-SERVICE
    ar PROGRAM ;
 
 : RUN-SUITE ( -- )

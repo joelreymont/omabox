@@ -1,8 +1,8 @@
 \ omabox.f - the omabox program (rust src/bin/omabox.rs), whose global
 \ MAIN is the build's entry. PARSE reads the arguments as Rust's parse
 \ does: help, version, status, pause, resume, settings [--json], settings
-\ set-root PATH, service ACTION and logs. A command that fails exits 1,
-\ as Rust's main returning an error does.
+\ set-root PATH, service ACTION, logs and setup. A command that fails
+\ exits 1, as Rust's main returning an error does.
 \ A failure logs as CONFIG's refusals do: the library that failed logs
 \ its own lines, then OMABOX logs Rust's CliError text and, where the
 \ error has one, its help line; a SERVICE or ATTENTION failure is that
@@ -11,17 +11,21 @@
 \ status and settings check the stored sync root once their text is
 \ built: CONFIG logs its refusal of an unusable root, and the command
 \ still writes its text and succeeds.
-\ setup's local steps are Rust's: its options parsed whole, the default
-\ sync root made, the authorization code read, and the config written
-\ under the daemon lock.
 \ settings set-root is Rust's: the replacement config validated, then,
 \ while the service is released and under the daemon lock, the new root
 \ inspected, the config written and the journal, where there is one,
 \ made to adopt the root.
+\ setup is Rust's: its options parsed whole, the config made or loaded
+\ and its state prepared, a browser login exchanged and checked against
+\ the account and remote root while the service still syncs, then,
+\ with the service released and under the daemon lock, the journal
+\ bound, the refresh token stored and a new config written. DROPBOX's
+\ calls run under AIO's and CURL's loops, started for them alone.
 \ STORAGE CLASS. CALLER-OWNED: a command's service commands, drive
 \ record, configuration, text, lock, default root, authorization code,
-\ root binding and journal live in an arena the run holds; help and the
-\ version line are built in string.f's task-local builder.
+\ root binding, Dropbox client, login and journal live in an arena the
+\ run holds; help and the version line are built in string.f's
+\ task-local builder.
 require src/lib/error.f
 require src/lib/string.f
 require src/lib/arena.f
@@ -34,7 +38,10 @@ require src/lib/utf8-scalar.f
 require src/lib/unicode/class.f
 require src/lib/vector.f
 require src/lib/json.f
+require src/lib/aio.f
+require src/lib/net/curl.f
 require src/config.f
+require src/auth.f
 require src/journal.f
 require src/dropbox.f
 require src/attention.f
@@ -68,6 +75,13 @@ public
 -101110 s" could not create the default sync root"
    ERROR:CODE E-CREATE-DEFAULT-ROOT
 -101111 s" an Omabox journal operation failed" ERROR:CODE E-JOURNAL
+-101112 s" a Dropbox authorization step failed" ERROR:CODE E-AUTH
+-101113 s" a Dropbox account or root check failed" ERROR:CODE E-DROPBOX
+-101114 s" Dropbox authorization returned a different account"
+   ERROR:CODE E-ACCOUNT-CHANGED
+-101115
+   s" this Omabox journal is already bound to a different Dropbox account or root"
+   ERROR:CODE E-BINDING-MISMATCH
 -101116 s" could not inspect the sync folder" ERROR:CODE E-SYNC-ROOT
 -101117
    s" could not inspect the Omabox journal before changing the sync root"
@@ -84,6 +98,9 @@ private
    s" Omabox synchronizes a local directory with Dropbox." LINE+
    s" " LINE+
    s" Usage:" LINE+
+   s"   omabox setup [REMOTE_ROOT]" LINE+
+   s"   omabox setup --app-key KEY [--sync-root PATH]" SB-APPEND
+   s"  [--remote-root ROOT]" LINE+
    s"   omabox status" LINE+
    s"   omabox pause|resume" LINE+
    s"   omabox settings [--json]" LINE+
@@ -92,6 +109,12 @@ private
    s"   omabox logs" LINE+
    s"   omabox --help" LINE+
    s"   omabox --version" LINE+
+   s" " LINE+
+   s" Setup with --app-key syncs ~/Dropbox, creating it if missing,"
+   SB-APPEND s"  unless --sync-root" LINE+
+   s" names another existing directory. The Dropbox app key is"
+   SB-APPEND s"  public. Omabox never" LINE+
+   s" requests or stores an app secret." LINE+
    SB$ ;
 
 : VERSION-LINE ( -- ^u8 n )
@@ -99,18 +122,6 @@ private
 
 \ Rust's Settings { json }: how settings shows the stored settings.
 ENUM form DERIVE eq text json ;ENUM
-
-\ Rust's Command, the forms this program parses. It derives no eq: a
-\ str or option payload has none.
-ENUM command
-   VARIANT help ;VARIANT
-   VARIANT version ;VARIANT
-   VARIANT status ;VARIANT
-   VARIANT settings FIELD shown form ;VARIANT
-   VARIANT set-root FIELD path str ;VARIANT
-   VARIANT service FIELD action SERVICE:action ;VARIANT
-   VARIANT logs ;VARIANT
-;ENUM
 
 \ Rust's InitialConfig: the sync root, none for ~/Dropbox, and the app
 \ key.
@@ -126,12 +137,34 @@ STRUCTURE setup-options
    FIELD initial option<initial-config>
 ;STRUCTURE
 
+\ Rust's Command, the forms this program parses. It derives no eq: a
+\ str or option payload has none.
+ENUM command
+   VARIANT help ;VARIANT
+   VARIANT version ;VARIANT
+   VARIANT status ;VARIANT
+   VARIANT settings FIELD shown form ;VARIANT
+   VARIANT set-root FIELD path str ;VARIANT
+   VARIANT service FIELD action SERVICE:action ;VARIANT
+   VARIANT logs ;VARIANT
+   VARIANT setup FIELD options setup-options ;VARIANT
+;ENUM
+
+\ Rust's Authorized: a Dropbox login checked against the account and
+\ root, not yet stored.
+STRUCTURE authorized DERIVE addr
+   FIELD binding JOURNAL:dropbox-binding
+   FIELD refresh-token str
+;STRUCTURE
+
 \ Rust's AUTHORIZATION_CODE_LIMIT, in bytes.
 8192 constant CODE-LIMIT
 ARENA DRIVENS SERVICE:driven
 ARENA WRITERS JSON:writer
 ARENA LOCKS CONFIG:lock
 ARENA BINDINGS JOURNAL:local-root-binding
+ARENA LOGINS authorized
+ARENA CLIENT-CONFIGS DROPBOX:config
 ARENA JOURNALS JOURNAL:journal
 
 
@@ -264,6 +297,66 @@ ARENA JOURNALS JOURNAL:journal
    s" Create the directory, or pass --sync-root PATH." HELP
    E-CREATE-DEFAULT-ROOT cause FAIL ;
 
+\ Whether code lies in the block from first down to last.
+: IN? ( n n n -- bool )
+   {: code:n first:n last:n :}
+   code first <= code last >= and ;
+
+\ AUTH's codes and the SECRET codes AUTH passes on: Rust's AuthError.
+: AUTH-CODE? ( n -- bool )
+   {: c:n :}
+   c AUTH:E-FIRST AUTH:E-LAST IN?
+   c SECRET:E-FIRST SECRET:E-LAST IN? or ;
+
+: DROPBOX-CODE? ( n -- bool ) DROPBOX:E-FIRST DROPBOX:E-LAST IN? ;
+
+\ Rust's Auth for the operation, after the lines its cause logged.
+: AUTH-FAILED ( ^u8 n -- )
+   {: op:^ opu:n :}
+   FS:ERRNO {: cause:n :}
+   LOG-OPEN s" could not " LOG:TEXT+ op opu LOG:TEXT+
+   s" Check the network connection and Dropbox app key," HELP
+   s"  then retry setup." LOG:TEXT+
+   E-AUTH cause FAIL ;
+
+: EXCHANGE-FAILED ( -- )
+   s" exchange the Dropbox authorization code" AUTH-FAILED ;
+
+\ Rust's AuthError::Sdk, a line of its own where DROPBOX logged none.
+: NOT-ISSUED ( -- )
+   LOG-OPEN s" Dropbox OAuth could not issue an access token"
+   LOG:TEXT+ LOG:;LINE ;
+
+\ Rust's Dropbox validating the account and root, after the lines its
+\ cause logged.
+: VALIDATE-FAILED ( -- )
+   FS:ERRNO {: cause:n :}
+   LOG-OPEN s" could not validate the Dropbox account and root"
+   LOG:TEXT+
+   s" Check the selected Dropbox root and account permissions," HELP
+   s"  then retry setup." LOG:TEXT+
+   E-DROPBOX cause FAIL ;
+
+\ Rust's line for a remote root LINK refused, then VALIDATE-FAILED.
+: ROOT-REFUSED ( ^u8 n -- )
+   {: m:^ mu:n :}
+   LOG-OPEN s" configured Dropbox root " LOG:TEXT+ m mu LOG:TEXT+
+   LOG:;LINE VALIDATE-FAILED ;
+
+: ACCOUNT-CHANGED ( -- )
+   LOG-OPEN s" Dropbox authorization returned a different account"
+   LOG:TEXT+
+   s" Restart setup and authorize one Dropbox account for the" HELP
+   s"  entire flow." LOG:TEXT+
+   E-ACCOUNT-CHANGED 0 FAIL ;
+
+: BINDING-MISMATCH ( -- )
+   LOG-OPEN s" this Omabox journal is already bound to a different"
+   LOG:TEXT+ s"  Dropbox account or root" LOG:TEXT+
+   s" Use the Dropbox account and remote root originally" HELP
+   s"  selected for this sync root." LOG:TEXT+
+   E-BINDING-MISMATCH 0 FAIL ;
+
 \ Rust's SyncRoot, in place of the code it caught, after the lines its
 \ cause logged, all Rust's JournalError.
 : SYNC-ROOT-FAILED ( n -- )
@@ -379,18 +472,6 @@ ARENA JOURNALS JOURNAL:journal
       none OF s" unknown command" USAGE ENDOF
    ;MATCH ;
 
-\ Rust's parse over argc arguments, arg answering the one at an index.
-: PARSE ( n [ n -- ^u8 n ] -- command )
-   {: argc:n arg :}
-   argc 0= if s" a command is required" USAGE then
-   0 arg execute {: c:^ cu:n :}
-   c cu UTF8:VALID? 0= if
-      s" the command must be valid UTF-8" USAGE
-   then
-   c cu s" settings" STR= if argc arg PARSE-SETTINGS exit then
-   c cu s" service" STR= if argc arg PARSE-SERVICE exit then
-   c cu ALONE argc SOLE ;
-
 \ Rust's is_option.
 : OPTION-ARG? ( ^u8 n -- bool ) 2 min s" --" STR= ;
 
@@ -477,6 +558,19 @@ ARENA JOURNALS JOURNAL:journal
       then
    then
    argc arg SETUP-FLAGS FLAGGED ;
+
+\ Rust's parse over argc arguments, arg answering the one at an index.
+: PARSE ( n [ n -- ^u8 n ] -- command )
+   {: argc:n arg :}
+   argc 0= if s" a command is required" USAGE then
+   0 arg execute {: c:^ cu:n :}
+   c cu UTF8:VALID? 0= if
+      s" the command must be valid UTF-8" USAGE
+   then
+   c cu s" settings" STR= if argc arg PARSE-SETTINGS exit then
+   c cu s" service" STR= if argc arg PARSE-SERVICE exit then
+   c cu s" setup" STR= if argc arg PARSE-SETUP COMMAND-SETUP exit then
+   c cu ALONE argc SOLE ;
 
 
 \ ---- the configuration
@@ -817,14 +911,13 @@ ARENA JOURNALS JOURNAL:journal
    dup if exit then
    FS:ERRNO FS:ENOENT <> if FS:ERRNO INSPECT-JOURNAL-FAILED then ;
 
-: JOURNAL-OPENED ( str ^ARENA:arena -- JOURNAL:journal )
-   {: p ar :}
+\ Rust's Journal::open of the file p, failing as Journal for the
+\ operation.
+: JOURNAL-OPENED ( str ^u8 n ^ARENA:arena -- JOURNAL:journal )
+   {: p op:^ opu:n ar :}
    ar JOURNALS-NEW {: slot :}
    [: p JOURNAL:OPEN slot ! ;] catch {: code:n :}
-   code 0<> if
-      code s" open the sync journal before changing the sync root"
-      JOURNAL-FAILED
-   then
+   code 0<> if code op opu JOURNAL-FAILED then
    slot @ ;
 
 \ The replacement written over config.toml: the stale temporaries the
@@ -852,7 +945,8 @@ ARENA JOURNALS JOURNAL:journal
    r ar ROOT-BINDING {: b :}
    p CONFIG:JOURNAL-FILE CONFIG:ABS-PATH>STR {: jp :}
    jp JOURNAL-THERE? 0= if r ar ROOT-WRITTEN exit then
-   jp ar JOURNAL-OPENED {: j :}
+   jp s" open the sync journal before changing the sync root" ar
+   JOURNAL-OPENED {: j :}
    [: j b r ar ADOPTED ;] [: j JOURNAL:CLOSE ;] finally ;
 
 \ Rust's change_sync_root_while_stopped: under the daemon lock, the
@@ -865,12 +959,13 @@ ARENA JOURNALS JOURNAL:journal
    p ar LOCKED {: l :}
    [: p r ar ROOT-CHANGED ;] [: l CONFIG:UNLOCK ;] finally ;
 
-\ The replacement config: the root and the stored app key.
-: REPLACEMENT ( ^CONFIG:xdg str str ^ARENA:arena -- ^CONFIG:config )
-   {: x root key ar :}
-   NULL-PTR [: drop x root key ar CONFIG:FROM-VALUES ;] catch {: r code :}
-   code 0= if r exit then
-   code s" validate the new sync root" CONFIG-FAILED ;
+\ Rust's Config::from_values of the root and key, failing as Config for
+\ the operation.
+: VALIDATED ( ^CONFIG:xdg str str ^u8 n ^ARENA:arena -- ^CONFIG:config )
+   {: x root key op:^ opu:n ar :}
+   NULL-PTR [: drop x root key ar CONFIG:FROM-VALUES ;] catch {: c code :}
+   code 0= if c exit then
+   code op opu CONFIG-FAILED ;
 
 \ "Omabox sync root is now {root}", kept in the arena.
 : ROOT-DONE ( ^CONFIG:config ^ARENA:arena -- str )
@@ -884,10 +979,251 @@ ARENA JOURNALS JOURNAL:journal
    {: root x c ar :}
    x s" load configuration for sync-root change" ar DOCUMENT {: d :}
    x s" resolve state paths for sync-root change" ar STATE-PATHS {: p :}
-   x root d CONFIG:DOCUMENT-KEY ar REPLACEMENT {: r :}
+   x root d CONFIG:DOCUMENT-KEY s" validate the new sync root" ar
+   VALIDATED {: r :}
    r ar ROOT-DONE {: done :}
    c s" the sync-root change" done str> [: p r rot CHANGE-ROOT ;] ar
    RELEASED ;
+
+
+\ ---- the login
+
+\ AUTH:START for the app key k, Rust's Auth starting authorization.
+: STARTED ( str ^ARENA:arena -- ^AUTH:pending )
+   {: k ar :}
+   NULL-PTR [: drop k str> ar AUTH:START ;] catch {: p code:n :}
+   code 0= if p exit then
+   code AUTH-CODE? 0= if code throw then
+   s" start Dropbox authorization" AUTH-FAILED ;
+
+\ Rust's prompt for the login p, on stdout.
+: PROMPT ( ^AUTH:pending -- )
+   {: p :}
+   SB-RESET s" Open this URL in a browser:" LINE+
+   p AUTH:URL LINE+ s" " LINE+
+   s" Paste the authorization code: " SB-APPEND SB$ WRITE-OUT ;
+
+\ A client for the app key k: Dropbox's origins, no token yet, the
+\ account's own root, and a store that keeps nothing, as the client
+\ holds a rotated refresh token itself.
+: CLIENT ( str ^ARENA:arena -- ^DROPBOX:client )
+   {: k ar :}
+   ar CLIENT-CONFIGS-NEW {: cfg :}
+   cfg DROPBOX:PRODUCTION
+   k str> SPAN:MAKE cfg DROPBOX-CONFIG:KEY !
+   s" " SPAN:MAKE cfg DROPBOX-CONFIG:TOKEN !
+   [: 2drop ;] cfg DROPBOX-CONFIG:STORE !
+   s" " SPAN:MAKE cfg DROPBOX-CONFIG:ROOT !
+   cfg ar DROPBOX:OPEN ;
+
+: EXCHANGE-DONE ( str ^AUTH:pending ^DROPBOX:client -- )
+   {: ac p cl :}
+   ac str> p AUTH:VERIFIER cl DROPBOX:EXCHANGE DROPBOX:DONE?
+   if exit then
+   NOT-ISSUED EXCHANGE-FAILED ;
+
+\ DROPBOX:EXCHANGE of the code ac and the login p's verifier.
+: EXCHANGED ( str ^AUTH:pending ^DROPBOX:client -- )
+   {: ac p cl :}
+   [: ac p cl EXCHANGE-DONE ;] catch {: code:n :}
+   code 0= if exit then
+   code DROPBOX-CODE? 0= if code throw then
+   EXCHANGE-FAILED ;
+
+: LINK-CHECKED ( str ^DROPBOX:client ^ARENA:arena -- )
+   {: r cl ar :}
+   r str> cl ar DROPBOX:LINK MATCH DROPBOX:root-check
+      valid OF ENDOF
+      failed OF drop VALIDATE-FAILED ENDOF
+      unbound OF ACCOUNT-CHANGED ENDOF
+      unavailable OF s" is unavailable" ROOT-REFUSED ENDOF
+      not-folder OF s" is not a folder" ROOT-REFUSED ENDOF
+      restricted OF
+         s" cannot be traversed completely" ROOT-REFUSED
+      ENDOF
+   ;MATCH ;
+
+\ Rust's link_authorized of the client to the remote root r.
+: LINKED ( str ^DROPBOX:client ^ARENA:arena -- )
+   {: r cl ar :}
+   [: r cl ar LINK-CHECKED ;] catch {: code:n :}
+   code 0= if exit then
+   code DROPBOX-CODE? 0= if code throw then
+   VALIDATE-FAILED ;
+
+\ The client's binding for the remote root r and its refresh token,
+\ copied into a, as CLOSE discards the client's.
+: KEEP-LOGIN ( str ^DROPBOX:client ^authorized ^ARENA:arena -- )
+   {: r cl a ar :}
+   cl DROPBOX:ACCOUNT-ID ar KEPT
+   cl DROPBOX:ROOT-NAMESPACE ar KEPT
+   r JOURNAL-DROPBOX--BINDING:MAKE a AUTHORIZED-BINDING !
+   cl DROPBOX:REFRESH-TOKEN ar KEPT a AUTHORIZED-REFRESH-TOKEN ! ;
+
+\ The code ac exchanged for the login p and checked against the remote
+\ root r on a client for the config c, kept in a; the client is closed
+\ on every path out.
+: LINK-LOGIN ( ^CONFIG:config str ^AUTH:pending str ^authorized
+     ^ARENA:arena -- )
+   {: c ac p r a ar :}
+   c CONFIG:APP-KEY ar CLIENT {: cl :}
+   [: ac p cl EXCHANGED
+      r cl ar LINKED
+      r cl a ar KEEP-LOGIN ;] [: cl DROPBOX:CLOSE ;] finally ;
+
+\ A curl loop that would not start, as the exchange's transport.
+: LOOP-FAILED ( CURL:code -- )
+   {: rc :}
+   LOG-OPEN s" could not start the curl loop: curl code " LOG:TEXT+
+   rc CURL:CODE>N LOG:INT+ LOG:;LINE
+   EXCHANGE-FAILED ;
+
+\ The step under AIO's and CURL's loops, which DROPBOX's calls need.
+: CURLING ( [ -- ] -- )
+   {: step :}
+   AIO:START
+   [: CURL:LOOP-START MATCH CURL:status
+         ok OF step [: CURL:LOOP-STOP ;] finally ENDOF
+         failed OF LOOP-FAILED ENDOF
+      ;MATCH ;] [: AIO:STOP ;] finally ;
+
+\ Rust's authorize: a browser login for the config c's app key, its
+\ code read from stdin, exchanged and checked against the remote root
+\ r; answers the login, kept in ar.
+: AUTHORIZE ( ^CONFIG:config str ^ARENA:arena -- ^authorized )
+   {: c r ar :}
+   AUTH:BIND
+   c CONFIG:APP-KEY ar STARTED {: p :}
+   p PROMPT
+   FD:STDIN ar READ-CODE {: ac :}
+   ar LOGINS-NEW {: a :}
+   [: c ac p r a ar LINK-LOGIN ;] CURLING
+   a ;
+
+
+\ ---- binding the journal
+
+\ What the journal held before setup: no binding, the new one, or
+\ another.
+ENUM prior none same other ;ENUM
+ARENA PRIORS prior
+
+: PRIOR-OF ( JOURNAL:journal JOURNAL:dropbox-binding ^ARENA:arena
+     -- prior )
+   {: j b ar :}
+   j ar JOURNAL:DROPBOX-BINDING MATCH option
+      none OF construct prior none ENDOF
+      some OF
+         b JOURNAL:BINDING= if construct prior same
+         else construct prior other then
+      ENDOF
+   ;MATCH ;
+
+\ The journal's binding against the new one b.
+: PRIOR-READ ( JOURNAL:journal JOURNAL:dropbox-binding ^ARENA:arena
+     -- prior )
+   {: j b ar :}
+   ar PRIORS-NEW {: slot :}
+   [: j b ar PRIOR-OF slot ! ;] catch {: code:n :}
+   code 0<> if code s" read the Dropbox journal binding" JOURNAL-FAILED then
+   slot @ ;
+
+: MISMATCH? ( JOURNAL:dropbox-binding-write -- bool )
+   MATCH JOURNAL:dropbox-binding-write
+      bound OF false ENDOF
+      already-bound OF false ENDOF
+      mismatch OF drop true ENDOF
+   ;MATCH ;
+
+\ Rust's bind_dropbox_root of b.
+: ROOT-BOUND ( JOURNAL:journal JOURNAL:dropbox-binding ^ARENA:arena -- )
+   {: j b ar :}
+   false [: drop j b ar JOURNAL:BIND-DROPBOX-ROOT MISMATCH? ;] catch
+   {: m code:n :}
+   code 0= if m if BINDING-MISMATCH then exit then
+   code s" bind the journal to Dropbox" JOURNAL-FAILED ;
+
+\ AUTH:STORE of the binding and refresh token in a.
+: TOKEN-STORED ( ^authorized -- )
+   {: a :}
+   [: a AUTHORIZED-BINDING @ a AUTHORIZED-REFRESH-TOKEN @ AUTH:STORE ;]
+   catch {: code:n :}
+   code 0= if exit then
+   code AUTH-CODE? 0= if code throw then
+   s" store the Dropbox refresh token" AUTH-FAILED ;
+
+: BOUND-IN ( JOURNAL:journal ^authorized ^ARENA:arena -- )
+   {: j a ar :}
+   a AUTHORIZED-BINDING @ {: b :}
+   j b ar PRIOR-READ MATCH prior
+      other OF BINDING-MISMATCH ENDOF
+      same OF a TOKEN-STORED ENDOF
+      none OF a TOKEN-STORED j b ar ROOT-BOUND ENDOF
+   ;MATCH ;
+
+\ Rust's bind: the login a's refresh token stored and the config c's
+\ journal bound to its account and root, refusing a journal bound to
+\ another; the journal is closed on every path out.
+: BIND ( ^CONFIG:config ^authorized ^ARENA:arena -- )
+   {: c a ar :}
+   c CONFIG:PATHS CONFIG:JOURNAL-FILE CONFIG:ABS-PATH>STR
+   s" open the journal" ar JOURNAL-OPENED {: j :}
+   [: j a ar BOUND-IN ;] [: j JOURNAL:CLOSE ;] finally ;
+
+
+\ ---- setup
+
+\ The config of a setup driven by flags: refused where one exists,
+\ before any login or default root; the root given, else ~/Dropbox.
+: FRESH-CONFIG ( initial-config ^ARENA:arena -- ^CONFIG:config )
+   {: i ar :}
+   ar XDG {: x :}
+   x ar CONFIG:XDG-CONFIG-FILE REFUSE-EXISTING
+   i INITIAL-CONFIG-UNMAKE {: root key :}
+   root MATCH option
+      some OF ENDOF
+      none OF ar DEFAULT-ROOT ENDOF
+   ;MATCH {: r :}
+   x r key s" validate initial configuration" ar VALIDATED ;
+
+\ Rust's Config::load: the XDG paths and the stored config.
+: LOADED ( ^ARENA:arena -- ^CONFIG:config )
+   {: ar :}
+   NULL-PTR [: drop ar CONFIG:LOAD ;] catch {: c code :}
+   code 0= if c exit then
+   code s" load configuration" CONFIG-FAILED ;
+
+\ The config and whether setup writes it new.
+: SETUP-CONFIG ( option<initial-config> ^ARENA:arena
+     -- ^CONFIG:config bool )
+   {: i ar :}
+   i MATCH option
+      some OF ar FRESH-CONFIG true ENDOF
+      none OF ar LOADED false ENDOF
+   ;MATCH ;
+
+: STATE-PREPARED ( ^CONFIG:config -- )
+   {: c :}
+   [: c CONFIG:PREPARE ;] catch {: code:n :}
+   code 0<> if code s" prepare state directories" CONFIG-FAILED then ;
+
+\ COMPLETE-SETUP of the config c, w asking for a new config file, with
+\ BIND of the login a as its bind.
+: COMPLETED ( ^CONFIG:config bool ^authorized ^ARENA:arena
+     -- ^VEC:vector<STALE:leftover> )
+   {: c w:bool a ar :}
+   c w [: c a ar BIND ;] ar COMPLETE-SETUP ;
+
+\ Rust's setup: the login runs while the service syncs, as it waits on
+\ the browser; the bind and the config's write run with it released.
+: SETUP ( setup-options ^SERVICE:commands ^ARENA:arena -- )
+   {: o s ar :}
+   o SETUP-OPTIONS-UNMAKE {: r i :}
+   i ar SETUP-CONFIG {: c w:bool :}
+   c STATE-PREPARED
+   c r ar AUTHORIZE {: a :}
+   s s" setup" s" Omabox setup is complete"
+   [: >r c w a r> COMPLETED ;] ar RELEASED ;
 
 
 \ ---- running
@@ -921,6 +1257,7 @@ ARENA JOURNALS JOURNAL:journal
       ENDOF
       service OF {: act :} ar SERVICE:COMMANDS act ar RUN-SERVICE ENDOF
       logs OF ar SERVICE:COMMANDS SERVICE:LOGS ENDOF
+      setup OF {: o :} o ar SERVICE:COMMANDS ar SETUP ENDOF
    ;MATCH ;
 
 : RUN ( -- )
