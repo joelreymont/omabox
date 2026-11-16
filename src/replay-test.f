@@ -6,6 +6,8 @@
 \ - Retention removes and forgets a verified payload only once its
 \   retention runs out, keeps pending, blocked, corrupt, non-regular and
 \   unknown entries, and forgets a record whose payload is already gone.
+\ - Retention keeps an expired payload it cannot read and its record,
+\   logging nothing, and forgets the next verified one; skipped as root.
 \ - REPLAY-LOCAL-PLANS-AT below a sync root: Rust's
 \   legacy_local_preservation_replays_without_creating_a_copy, and a
 \   directory at one plan's install target blocking only that plan,
@@ -310,6 +312,7 @@ private
 
 PROCESS-SYMBOLS
 FUNCTION: UTIMENSAT-CALL utimensat ( n ^u8 ^u8 n -- i32 ) ;FUNCTION
+FUNCTION: GETEUID-CALL geteuid ( -- i32 ) ;FUNCTION
 
 -100 constant AT-FDCWD
 $3FFFFFFE constant UTIME-OMIT
@@ -320,6 +323,9 @@ create TIMES 32 allot
    FS:>PATHZ {: z:^ :}
    0 TIMES ! UTIME-OMIT TIMES 8 + ! 0 TIMES 16 + ! 0 TIMES 24 + !
    AT-FDCWD z TIMES 0 UTIMENSAT-CALL 0 T= ;
+
+\ Root reads a mode-000 file, so its cases skip.
+: ROOT-USER? ( -- bool ) GETEUID-CALL 0 = ;
 
 
 \ ---- cases ---------------------------------------------------------
@@ -434,6 +440,43 @@ create TIMES 32 allot
    nonregular COPY-PATH$ FS:DIR? TTRUE
    orphan str> FS:FILE? TTRUE
    j pending corrupt nonregular ar ELIGIBLE-KEPT
+   j JOURNAL:CLOSE
+   d GONE ;
+
+\ A completed recovery of its own bytes, expired.
+: VERIFIED
+   ( JOURNAL:journal str ^u8 n ^u8 n ^ARENA:arena
+     -- JOURNAL:recovery-record )
+   {: j r:str a:^ u:n b:^ bu:n ar :}
+   j r a u b bu b bu ar WRITTEN {: plan rec :}
+   j plan rec ar COMPLETE-RECOVERY-AND-PLAN
+   rec ;
+
+\ Prunes at the end of retention, quietly, while locked is mode 000.
+: PRUNE-LOCKED
+   ( JOURNAL:journal str str JOURNAL:recovery-record ^ARENA:arena
+     -- )
+   {: j d:str r:str locked ar :}
+   locked COPY-PATH$ 0 FS:CHMOD-MODE
+   [: d [: j r str> epoch-seconds REPLAY:COMPLETED-RECOVERY-RETENTION +
+      REPLAY:PRUNE-COMPLETED-RECOVERIES-AT 1 T= ;] ar QUIETLY ;]
+   [: locked COPY-PATH$ FS:MODE-PRIVATE-FILE FS:CHMOD-MODE ;] finally ;
+
+: RETENTION-KEEPS-AN-UNREADABLE-PAYLOAD ( ^ARENA:arena -- )
+   {: ar :}
+   s" retention keeps an unreadable payload" T-LABEL
+   ROOT-USER? if exit then
+   ar FIXTURE {: d:str p:str r:str :}
+   p JOURNAL:OPEN {: j :}
+   j r s" locked.txt" s" locked bytes" ar VERIFIED {: locked :}
+   j r s" verified.txt" s" verified bytes" ar VERIFIED {: verified :}
+   j d r locked ar PRUNE-LOCKED
+   locked COPY-PATH$ FS:FILE? TTRUE
+   verified COPY-PATH$ FS:EXISTS? TFALSE
+   j verified FORGOTTEN
+   j ar JOURNAL:COMPLETED-RECOVERIES {: kept :}
+   kept VEC:COUNT 1 T=
+   kept locked ID-OF HOLDS? TTRUE
    j JOURNAL:CLOSE
    d GONE ;
 
@@ -697,6 +740,7 @@ $140 constant MODE-NO-WRITE
    ar RETIRE-EXCLUDED-PLANS-SUPERSEDES-ONLY-EXCLUDED-PLANS
    ar RETENTION-EXPIRES-VERIFIED-PAYLOAD-ONLY-AT-BOUNDARY
    ar RETENTION-KEEPS-PENDING-CORRUPT-NONREGULAR-AND-ORPHAN-ENTRIES
+   ar RETENTION-KEEPS-AN-UNREADABLE-PAYLOAD
    ar RETENTION-FINISHES-METADATA-CLEANUP-AFTER-PAYLOAD-DELETION
    ar LEGACY-LOCAL-PRESERVATION-REPLAYS-WITHOUT-CREATING-A-COPY
    ar A-LOCAL-OBJECT-BLOCKS-ONLY-ITS-PLAN

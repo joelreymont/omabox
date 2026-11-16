@@ -476,7 +476,8 @@ STRUCTURE retention
    {: code:n e:n :}
    code LOCAL:E-CORRUPT = code LOCAL:E-UNSUPPORTED = or
    code LOCAL:E-CHANGED = or code LOCAL:E-OCCUPIED = or
-   code LOCAL:E-CONTENT-HASH = or code LOCAL:E-UNSAFE-PATH = or ;
+   code LOCAL:E-CONTENT-HASH = or code LOCAL:E-UNSAFE-PATH = or
+   code LOCAL:E-UNREADABLE = or ;
 
 \ Whether the payload at the name holds the record's content.
 : VERIFY ( retention JOURNAL:recovery-record ^u8 n -- bool )
