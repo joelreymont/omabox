@@ -4,12 +4,14 @@
 \ rejected grant, a revoked token, access denied, rate limits, outages, a
 \ redirect, a malformed request, the listing, the long poll, downloads,
 \ whose body reads through READ-BODY (whole, resumed, a 416 at the end, a
-\ body that throws before or after its end, one left unread, one cut
-\ mid-body, an empty file, and ones refused unverified: another rev, range
-\ or length, a 416 from 0, a Dropbox-API-Result or an error that does not
-\ parse), delete, create-folder, the code exchange, Dropbox's content hash
-\ and uploads, whose stages are written under TMPDIR and removed once
-\ open, so no run leaves one; a mutation or session finish Dropbox answers
+\ body that throws before or after its end, one left unread while the
+\ server holds the rest, one in two chunks read 7 or 64 bytes a read, one
+\ cut mid-body, whether or not its body catches the loss, an empty file,
+\ and ones refused unverified: another rev, range or length, a 416 from 0,
+\ a Dropbox-API-Result or an error that does not parse), delete,
+\ create-folder, the code exchange, Dropbox's content hash and uploads,
+\ whose stages are written under TMPDIR and removed once open, so no run
+\ leaves one; a mutation or session finish Dropbox answers
 \ at another path, an upload's or finish's that get_metadata then does not
 \ find, an upload confirmation Dropbox asks to wait on, a delete or
 \ create-folder conflict whose confirmation it asks to wait on, a conflict
@@ -862,22 +864,38 @@ variable SUNK-AT
 variable SUNK-SIZE
 variable BODIES
 variable BODY-CODE
+16 constant READ-CAP
+READ-CAP TYPED-BUFFER READS n
+variable READ-COUNT
 
 
 : SUNK-CLEAR ( -- )
-   0 SUNK-U ! -1 SUNK-AT ! -1 SUNK-SIZE ! 0 BODIES ! 0 BODY-CODE ! ;
+   0 SUNK-U ! -1 SUNK-AT ! -1 SUNK-SIZE ! 0 BODIES ! 0 BODY-CODE !
+   0 READ-COUNT ! ;
 
 
-\ A download's body: read whole into SUNK, at most 7 bytes a read so
-\ reads end inside a chunk; BODIES counts its calls.
-: SUNK-BODY ( n n ^DROPBOX:fetch -- )
-   {: at:n size:n f :}
+\ A read's answer into READS, those past its room dropped; once PART bytes
+\ are in, a paused server sends the rest.
+: TOOK ( n -- )
+   {: k:n :}
+   READ-COUNT @ {: j:n :}
+   j READ-CAP < if k j READS ! 1 READ-COUNT +! then
+   SUNK-U @ TEST-DROPBOX:PART >= if TEST-DROPBOX:RESUME-BODY then ;
+
+
+\ A download's body: read whole into SUNK, at most step bytes a read;
+\ BODIES counts its calls.
+: PACED ( n n ^DROPBOX:fetch n -- )
+   {: at:n size:n f step:n :}
    1 BODIES +! at SUNK-AT ! size SUNK-SIZE !
    begin
-      SUNK SUNK-U @ + 64 SUNK-U @ - 7 min f DROPBOX:READ-BODY
-      dup 0 > while
-      SUNK-U +!
-   repeat drop ;
+      SUNK SUNK-U @ + 64 SUNK-U @ - step min f DROPBOX:READ-BODY
+      dup SUNK-U +! dup TOOK
+   0= until ;
+
+
+\ PACED at most 7 bytes a read, so reads end inside a chunk.
+: SUNK-BODY ( n n ^DROPBOX:fetch -- ) 7 PACED ;
 
 
 : SUNK$ ( -- ^u8 n ) SUNK SUNK-U @ ;
@@ -1079,6 +1097,10 @@ variable BODY-CODE
    USABLE ;
 
 
+\ The text of the code READ-BODY throws for a transfer lost in the body.
+: LOST$ ( -- ^u8 n ) s" a download's transfer ended inside its body" ;
+
+
 \ SUNK-BODY, keeping in BODY-CODE the code it ended with.
 : CODED-BODY ( n n ^DROPBOX:fetch -- )
    {: at:n size:n f :}
@@ -1102,10 +1124,31 @@ variable BODY-CODE
    [: CUT-FETCH ;] LOGGED 0 T=
    ERR-U @ 0 T=
    BODIES @ 1 T=
-   BODY-CODE @ ERROR:TEXT$
-   s" a download's transfer ended inside its body" T$=
+   BODY-CODE @ ERROR:TEXT$ LOST$ T$=
    SUNK-U @ 10 <= TTRUE
    SUNK$ s" abcdefghij" SUNK-U @ min STR= TTRUE
+   USABLE ;
+
+
+\ CODED-BODY, ending normally where READ-BODY threw E-BODY-LOST.
+: SWALLOWING ( n n ^DROPBOX:fetch -- )
+   {: at:n size:n f :}
+   [: at size f CODED-BODY ;] catch {: code:n :}
+   code 0= if exit then
+   code ERROR:TEXT$ LOST$ STR= 0= if code throw then ;
+
+
+\ A body that catches the transfer lost inside it and returns: the answer
+\ is still a retry, and the client usable.
+: SWALLOWED-CASE ( -- )
+   s" download cut mid-body, its loss caught" T-LABEL
+   TEST-DROPBOX:RESET ALPHABET
+   TEST-DROPBOX:CUT-BODY
+   SUNK-CLEAR
+   s" 0160a1b2c3d4" 0 MAIN @ [: SWALLOWING ;] DROPBOX:DOWNLOAD
+   RETRY-MS 0 T=
+   BODIES @ 1 T=
+   BODY-CODE @ ERROR:TEXT$ LOST$ T$=
    USABLE ;
 
 
@@ -1138,24 +1181,50 @@ variable BODY-CODE
    USABLE ;
 
 
-\ A body that reads one chunk of at most 5 bytes and returns.
+\ A body that makes one read of at most 5 bytes and returns.
 : GLANCING ( n n ^DROPBOX:fetch -- )
    {: f :} 2drop
    1 BODIES +!
    SUNK 5 f DROPBOX:READ-BODY SUNK-U ! ;
 
 
-\ A body left unread is cancelled; the answer is done and the client
-\ usable.
+\ A body left unread while the server holds the rest is cancelled; the
+\ answer is done and the client usable.
 : UNREAD-CASE ( -- )
    s" download body left unread" T-LABEL
-   TEST-DROPBOX:RESET ALPHABET
+   TEST-DROPBOX:RESET ALPHABET TEST-DROPBOX:HOLD-BODY
    SUNK-CLEAR
    s" 0160a1b2c3d4" 0 MAIN @ [: GLANCING ;] DROPBOX:DOWNLOAD
    DONE? ASSERT
    BODIES @ 1 T=
    SUNK$ s" abcde" T$=
    USABLE ;
+
+
+\ A download whose server sends the rest of the body once PART bytes are
+\ taken, read step bytes a read.
+: PAUSED-FETCH ( n -- DROPBOX:reply )
+   {: step:n :}
+   TEST-DROPBOX:RESET ALPHABET TEST-DROPBOX:PAUSE-BODY
+   SUNK-CLEAR
+   s" 0160a1b2c3d4" 0 MAIN @ [: step PACED ;] DROPBOX:DOWNLOAD ;
+
+
+\ Read 7 bytes a read, a body in two chunks is taken whole.
+: PAUSED-CASE ( -- )
+   s" download body in two chunks, 7 bytes a read" T-LABEL
+   7 PAUSED-FETCH DONE? ASSERT
+   BODIES @ 1 T=
+   SUNK$ s" abcdefghijklmnopqrstuvwxyz" T$= ;
+
+
+\ Read 64 bytes a read, each read answers one chunk whole.
+: CHUNKED-CASE ( -- )
+   s" download body in two chunks, 64 bytes a read" T-LABEL
+   64 PAUSED-FETCH DONE? ASSERT
+   SUNK$ s" abcdefghijklmnopqrstuvwxyz" T$=
+   READ-COUNT @ 3 T=
+   0 READS @ 10 T= 1 READS @ 16 T= 2 READS @ 0 T= ;
 
 
 \ An empty file: the body reads its end at once.
@@ -1178,7 +1247,8 @@ variable BODY-CODE
    UNSATISFIABLE-CASE FIRST-UNSATISFIABLE-CASE UNKNOWN-REV-CASE
    OTHER-REV-CASE SHORT-CASE WHOLE-FOR-RANGE-CASE UNASKED-RANGE-CASE
    UNPARSED-RESULT-CASE UNPARSED-REFUSAL-CASE
-   BROKEN-CASE BODY-THROWS-CASE LATE-THROW-CASE UNREAD-CASE EMPTY-CASE ;
+   BROKEN-CASE SWALLOWED-CASE BODY-THROWS-CASE LATE-THROW-CASE UNREAD-CASE
+   PAUSED-CASE CHUNKED-CASE EMPTY-CASE ;
 
 
 \ ---- delete_v2, create_folder_v2 and the code exchange

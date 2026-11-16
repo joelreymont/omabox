@@ -82,7 +82,8 @@ ENUM reply
 : BACKOFF  ( ^client -- n )                 \ seconds
 
 \ files/get_metadata, download, upload (+ session), delete_v2,
-\ create_folder_v2; each answers the entry Dropbox reports
+\ create_folder_v2; each answers the entry Dropbox reports, but a
+\ download a 416 completes; READ-BODY reads a download's body
 : METADATA      ( ^u8 n ^client -- reply )  \ path
 : DOWNLOAD      ( ^u8 n n ^client [ n n ^fetch -- ] -- reply )
                 \ rev, offset; the body: its offset, the size, the fetch
@@ -152,13 +153,13 @@ STRUCTURE config
   and metadata before any byte reaches the quotation. On a done answer it
   then calls the quotation once with the file offset the body starts at, the
   file's size and the download's `fetch`, an opaque record that lives until
-  the quotation returns. `READ-BODY` fills the buffer it is given with the
-  body's next bytes and answers how many, 0 at the body's end, as Rust's
-  `impl Read` does; the caller wraps it as `[: f READ-BODY ;]` for a word that
-  takes a reader, and writes and hashes what it reads. A reader that reads a
-  local cannot be handed to a quotation, which might keep it, so the fetch is
-  handed instead. On any other answer the quotation is not called; an empty
-  body calls it with a fetch at its end.
+  the quotation returns. `READ-BODY` copies the body's next bytes into the
+  buffer it is given, at most the rest of the chunk it holds, and answers how
+  many, 0 at the body's end, as Rust's `impl Read` does; the caller wraps it
+  as `[: f READ-BODY ;]` for a word that takes a reader, and writes and hashes
+  what it reads. A reader that reads a local cannot be handed to a quotation,
+  which might keep it, so the fetch is handed instead. On any other answer the
+  quotation is not called; an empty body calls it with a fetch at its end.
   - The body's length is checked once `READ-BODY` reached its end. A body the
     quotation leaves unread is cancelled as a throw cancels it, and the
     answer is done without that check.

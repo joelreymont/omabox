@@ -20,14 +20,16 @@
 \ path, and the last API call's Authorization, Path-Root and Content-Type.
 \ STORAGE CLASS. PROCESS-WIDE: one worker serves every request, so its handler
 \ alone writes the state while a test waits on its call, and the test sets it
-\ between calls. A body stays in its buffer, as HTTP:BODY! borrows it, until
-\ the next request.
+\ between calls; only RESUME-BODY sets it during one. A body stays in its
+\ buffer, as HTTP:BODY! borrows it, until the next request.
 
 require src/lib/string.f
 require src/lib/span.f
 require src/lib/fmt.f
 require src/lib/json.f
 require src/lib/adt/option.f
+require src/lib/task.f
+require src/lib/time.f
 require src/lib/net/tcp4.f
 require src/lib/net/http.f
 require src/dropbox.f
@@ -710,7 +712,9 @@ variable ARGS-U
 \ alone: SKEWED shifts its Content-Range's start by one, MISFILED answers
 \ another rev's file, SHORTED drops its body's last byte, WHOLED answers
 \ the whole file whatever Range it asked, PARTED answers a 206 with a
-\ Content-Range though it asked none, and BREAKING cuts its body.
+\ Content-Range though it asked none, BREAKING cuts its body, HOLDING
+\ stops it after PART bytes and holds the connection until the client
+\ closes it, and PAUSING stops it there until RESUME-BODY.
 SLOTS NAME-CAP * BUFFER: CONTENT-REVS
 SLOTS TYPED-BUFFER CONTENT-REV-US n
 SLOTS TEXT-CAP * BUFFER: CONTENT-BYTES
@@ -723,6 +727,10 @@ TYPED-VARIABLE SHORTED bool
 TYPED-VARIABLE WHOLED bool
 TYPED-VARIABLE PARTED bool
 TYPED-VARIABLE BREAKING bool
+TYPED-VARIABLE HOLDING bool
+TYPED-VARIABLE PAUSING bool
+\ Set by the test's task while the worker reads it, so atomic.
+variable RESUMING
 create REV-SEEN NAME-CAP allot
 variable REV-SEEN-U
 create ARG-SENT TEXT-CAP allot
@@ -859,24 +867,101 @@ TYPED-VARIABLE RANGED bool
    false WHOLED ! ;
 
 
-\ The bytes a cut download sends of its body.
+public
+\ The bytes a cut, held or paused download sends of its body first.
 10 constant PART
+private
+
+\ How long, in ms, a paused download waits for RESUME-BODY, and a held one
+\ for the client to send or close.
+5000 constant HOLD-MS
+16 BUFFER: SINK
 
 
 \ The file in slot i with the bytes in slot k from the offset, cut: a 200
-\ head promising them all, PART of them, and a close, which libcurl
-\ answers CURLE_PARTIAL_FILE.
-: BROKEN ( HTTP:request n n n -- )
-   {: q:HTTP:request i:n k:n from:n :}
-   false BREAKING !
+\ head promising them all, and PART of them.
+: CUT$ ( n n n -- ^u8 n )
+   {: i:n k:n from:n :}
    k CONTENT$ {: b:^ size:n :}
-   q HTTP:BODY$ 2drop
-   q HTTP:TAKE-OVER 2drop {: conn:TCP4:connection :}
    SB-RESET S\" HTTP/1.1 200 OK\r\nDropbox-API-Result: " SB-APPEND
    i ENTRY$ SB-APPEND S\" \r\nContent-Length: " SB-APPEND
    size from - FMT:SB-INT S\" \r\n\r\n" SB-APPEND
    b from + size from - PART min SB-APPEND
-   conn SB$ TCP4:TRANSFER-BYTES TCP4:WRITE CLOSED
+   SB$ ;
+
+
+\ The request's connection, its body read and CUT$ sent on it.
+: CUT-SENT ( HTTP:request n n n -- TCP4:connection )
+   {: q:HTTP:request i:n k:n from:n :}
+   q HTTP:BODY$ 2drop
+   q HTTP:TAKE-OVER 2drop {: conn:TCP4:connection :}
+   conn i k from CUT$ TCP4:TRANSFER-BYTES TCP4:WRITE CLOSED
+   conn ;
+
+
+\ CUT-SENT and a close, which libcurl answers CURLE_PARTIAL_FILE.
+: BROKEN ( HTTP:request n n n -- )
+   {: q:HTTP:request i:n k:n from:n :}
+   false BREAKING !
+   q i k from CUT-SENT TCP4:CLOSE CLOSED ;
+
+
+\ One read; true once the client closed the connection or it failed.
+: SHUT? ( TCP4:connection -- bool )
+   {: conn:TCP4:connection :}
+   conn SINK 16 TCP4:TRANSFER-BYTES TCP4:READ MATCH TCP4:read-result
+      data OF drop false ENDOF
+      closed OF drop true ENDOF
+      failed OF drop true ENDOF
+   ;MATCH ;
+
+
+\ True once the client closed the connection, or sent nothing for HOLD-MS.
+: GONE? ( TCP4:connection -- bool )
+   {: conn:TCP4:connection :}
+   conn HOLD-MS >MS TCP4:READABLE-WITHIN? MATCH TCP4:ready-result
+      ready OF conn SHUT? ENDOF
+      idle OF true ENDOF
+      failed OF drop true ENDOF
+   ;MATCH ;
+
+
+\ CUT-SENT, then the connection held until GONE?, and a close.
+: HELD-OPEN ( HTTP:request n n n -- )
+   {: q:HTTP:request i:n k:n from:n :}
+   false HOLDING !
+   q i k from CUT-SENT {: conn:TCP4:connection :}
+   begin conn GONE? until
+   conn TCP4:CLOSE CLOSED ;
+
+
+\ Whether RESUME-BODY came before HOLD-MS passed; the worker yields
+\ between its reads of the flag.
+: RESUMED? ( -- bool )
+   TIME:MONO-NS HOLD-MS 1000000 * + {: end:n :}
+   begin
+      RESUMING atomic@ 0<> if true exit then
+      TIME:MONO-NS end <
+   while TASK:PAUSE repeat
+   false ;
+
+
+\ The bytes r of the body's rest, sent once RESUMED?.
+: REST-SENT ( TCP4:connection ^u8 n -- )
+   {: conn:TCP4:connection r:^ ru:n :}
+   ru 0= if exit then
+   RESUMED? 0= if exit then
+   conn r ru TCP4:TRANSFER-BYTES TCP4:WRITE CLOSED ;
+
+
+\ CUT-SENT, then the bytes after PART once RESUMED?, and a close.
+: PAUSED ( HTTP:request n n n -- )
+   {: q:HTTP:request i:n k:n from:n :}
+   false PAUSING !
+   q i k from CUT-SENT {: conn:TCP4:connection :}
+   k CONTENT$ {: b:^ size:n :}
+   from PART + size min {: at:n :}
+   conn b at + size at - REST-SENT
    conn TCP4:CLOSE CLOSED ;
 
 
@@ -890,6 +975,8 @@ TYPED-VARIABLE RANGED bool
    i 0< k 0< or if a NOT-FOUND! exit then
    from 0< if a 400 HTTP:STATUS! a s" bad range" HTTP:BODY! exit then
    BREAKING @ if q i k from BROKEN exit then
+   HOLDING @ if q i k from HELD-OPEN exit then
+   PAUSING @ if q i k from PAUSED exit then
    a i k from FILE-SENT ;
 
 
@@ -1165,6 +1252,7 @@ $2100000 constant UPLOAD-CAP
    false ROOTED ! false TYPED ! false LEAKED ! false RANGED !
    false SKEWED ! 0 MISFILED-U ! false SHORTED ! false WHOLED !
    false PARTED ! false BREAKING ! false LOSING ! 0 CUTS !
+   false HOLDING ! false PAUSING ! 0 RESUMING atomic!
    false TOKEN-CUTTING ! false REVOKED ! false DENIED ! false GARBLING !
    LISTING-RESET ;
 
@@ -1289,6 +1377,13 @@ $2100000 constant UPLOAD-CAP
 : SHORTEN ( -- ) true SHORTED ! ;
 \ The next download's body is cut after PART bytes.
 : CUT-BODY ( -- ) true BREAKING ! ;
+\ The next download's body stops after PART bytes, its connection held
+\ until the client closes it.
+: HOLD-BODY ( -- ) true HOLDING ! ;
+\ The next download's body stops after PART bytes until RESUME-BODY.
+: PAUSE-BODY ( -- ) 0 RESUMING atomic! true PAUSING ! ;
+\ The paused download's server sends the rest of its body.
+: RESUME-BODY ( -- ) 1 RESUMING atomic! ;
 \ The next download answers the whole file, whatever Range it asked.
 : IGNORE-RANGE ( -- ) true WHOLED ! ;
 \ The next download answers a 206 with its Content-Range, even with no
