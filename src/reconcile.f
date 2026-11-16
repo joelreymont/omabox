@@ -248,16 +248,25 @@ STRUCTURE pending-plan
       p u i RANK q v i RANK CMP dup 0<> if unloop exit then drop
    loop 0 ;
 
-\ Entry x sorts before y by key, then path, then index.
-: ENTRY< ( n n ^VEC:vector<local-entry> -- bool )
+\ Rust's sort_by is stable: equal items keep their order.
+: STABLE< ( n n n -- bool )
+   {: x:n y:n c:n :}
+   c 0<> if c 0 < exit then
+   x y < ;
+
+\ The indices 0 to n-1 in the order cmp gives.
+: STABLE-ORDER ( n [ n n -- n ] ^ARENA:arena -- ^VEC:vector<n> )
+   {: k:n cmp ar :}
+   k [: 2dup cmp execute STABLE< ;] ar ORDER ;
+
+\ Entry x against y by key, then path.
+: ENTRY-CMP ( n n ^VEC:vector<local-entry> -- n )
    {: x:n y:n v :}
    v x VEC:AT @ LOCAL-ENTRY-UNMAKE {: k r :}
    v y VEC:AT @ LOCAL-ENTRY-UNMAKE {: k2 r2 :}
    k k2 MODEL:KEY-CMP {: c:n :}
-   c 0<> if c 0 < exit then
-   r RECORD-PATH r2 RECORD-PATH PATH-CMP {: d:n :}
-   d 0<> if d 0 < exit then
-   x y < ;
+   c 0<> if c exit then
+   r RECORD-PATH r2 RECORD-PATH PATH-CMP ;
 
 : KEY-INTO
    ( MODEL:local-record ^VEC:vector<local-entry> ^ARENA:arena -- )
@@ -349,7 +358,7 @@ STRUCTURE pending-plan
      -- ^VEC:vector<local-entry> )
    {: records ar :}
    records ar KEYED {: v :}
-   v VEC:COUNT [: v ENTRY< ;] ar ORDER {: idx :}
+   v VEC:COUNT [: v ENTRY-CMP ;] ar STABLE-ORDER {: idx :}
    v idx ar ENTRIES-IN {: sorted :}
    ar ARENA:ALLOCATOR 0 [type] local-entry VEC:NEW {: out :}
    0 begin dup sorted VEC:COUNT < while
@@ -393,13 +402,21 @@ STRUCTURE pending-plan
       some OF MODEL-OBSERVATION:UNKNOWN ENDOF
    ;MATCH ;
 
+\ The index of the last separator in the bytes.
+: LAST-SEPARATOR ( ^u8 n -- option<n> )
+   {: p:^ u:n :}
+   u begin dup 0 > while
+      1- dup p + c@ SEPARATOR = if OPTION:SOME exit then
+   repeat
+   drop OPTION:NONE ;
+
 \ Rust's parent_bytes: the bytes before the last separator.
 : PARENT-BYTES ( str -- option<str> )
    str> {: p:^ u:n :}
-   u begin dup 0 > while
-      1- dup p + c@ SEPARATOR = if p swap >str OPTION:SOME exit then
-   repeat
-   drop OPTION:NONE ;
+   p u LAST-SEPARATOR MATCH option
+      none OF OPTION:NONE ENDOF
+      some OF p swap >str OPTION:SOME ENDOF
+   ;MATCH ;
 
 \ The index of the record of n, sorted by key, that key reads as
 \ these bytes, or n when none does.
@@ -565,19 +582,16 @@ STRUCTURE pending-plan
    loop
    parts ar JOINED MODEL:>PATH ;
 
-\ Remote record x sorts before y by key, then index, as a stable sort.
-: REMOTE< ( n n ^VEC:vector<MODEL:remote-record> -- bool )
+\ Remote record x against y by key.
+: REMOTE-CMP ( n n ^VEC:vector<MODEL:remote-record> -- n )
    {: x:n y:n v :}
-   v x VEC:AT @ REMOTE-KEY v y VEC:AT @ REMOTE-KEY MODEL:KEY-CMP
-   {: c:n :}
-   c 0<> if c 0 < exit then
-   x y < ;
+   v x VEC:AT @ REMOTE-KEY v y VEC:AT @ REMOTE-KEY MODEL:KEY-CMP ;
 
 : REMOTE-MAP
    ( ^VEC:vector<MODEL:remote-record> ^ARENA:arena
      -- ^VEC:vector<MODEL:remote-record> )
    {: v ar :}
-   v VEC:COUNT [: v REMOTE< ;] ar ORDER {: idx :}
+   v VEC:COUNT [: v REMOTE-CMP ;] ar STABLE-ORDER {: idx :}
    ar ARENA:ALLOCATOR 0 [type] MODEL:remote-record VEC:NEW {: out :}
    idx VEC:COUNT 0 ?do
       v idx i VEC:AT @ VEC:AT @ out VEC:PUSH !
@@ -826,15 +840,16 @@ STRUCTURE case-variant-move
    v VEC:COUNT 0 ?do out v i VEC:AT @ ar PUSH-SPELLING loop
    out ;
 
-\ Key bytes, then path bytes, then the record's place.
-: BEFORE? ( n n ^VEC:vector<spelling> -- bool )
+\ Spelling a against b by key bytes, then path bytes.
+: SPELLING-CMP ( n n ^VEC:vector<spelling> -- n )
    {: a b v :}
    v a SPELLING-AT {: x:spelling :}
    v b SPELLING-AT {: y:spelling :}
    x SPELLING-KEY y SPELLING-KEY MODEL:KEY-CMP {: c :}
-   c 0<> if c 0 < exit then
-   x SPELLING-PATH y SPELLING-PATH PATH= if a b < exit then
-   x SPELLING-PATH PATH$ y SPELLING-PATH PATH$ STR< ;
+   c 0<> if c exit then
+   x SPELLING-PATH y SPELLING-PATH PATH= if 0 exit then
+   x SPELLING-PATH PATH$ y SPELLING-PATH PATH$ STR<
+   if -1 else 1 then ;
 
 : SAME-AS-LAST? ( ^VEC:vector<spelling> spelling -- bool )
    {: out s :}
@@ -852,7 +867,7 @@ STRUCTURE case-variant-move
 : ORDERED
    ( ^VEC:vector<spelling> ^ARENA:arena -- ^VEC:vector<spelling> )
    {: v ar :}
-   v VEC:COUNT [: v BEFORE? ;] ar ORDER {: idx :}
+   v VEC:COUNT [: v SPELLING-CMP ;] ar STABLE-ORDER {: idx :}
    ar ARENA:ALLOCATOR 0 [type] spelling VEC:NEW {: out :}
    idx VEC:COUNT 0 ?do out v idx i VEC:AT @ SPELLING-AT ADD-DISTINCT loop
    out ;
@@ -970,10 +985,10 @@ STRUCTURE case-variant-move
 \ The path's parent, empty at the top, and its last name.
 : SPLIT-NAME ( ^u8 n -- ^u8 n ^u8 n )
    {: p:^ u:n :}
-   u 0 ?do
-      p u 1- i - + c@ 47 = if p u u 1- i - SPLIT-AT unloop exit then
-   loop
-   p 0 p u ;
+   p u LAST-SEPARATOR MATCH option
+      none OF p 0 p u ENDOF
+      some OF p u rot SPLIT-AT ENDOF
+   ;MATCH ;
 
 : FINAL? ( ^u8 n -- bool )
    {: p:^ u:n :}
@@ -1609,13 +1624,10 @@ STRUCTURE casing
       some OF REMOTE-OBSERVATION SPELLS-FOLDER? ENDOF
    ;MATCH ;
 
-\ Change x sorts before y by key, then number.
-: CHANGE< ( n n ^VEC:vector<JOURNAL:remote-inventory-change> -- bool )
+\ Change x against y by key.
+: CHANGE-CMP ( n n ^VEC:vector<JOURNAL:remote-inventory-change> -- n )
    {: x:n y:n cs :}
-   cs x VEC:AT @ CHANGE-KEY cs y VEC:AT @ CHANGE-KEY MODEL:KEY-CMP
-   {: c:n :}
-   c 0<> if c 0 < exit then
-   x y < ;
+   cs x VEC:AT @ CHANGE-KEY cs y VEC:AT @ CHANGE-KEY MODEL:KEY-CMP ;
 
 \ The numbers of the changes q accepts, by key, then number.
 : KEYED-NUMBERS
@@ -1628,7 +1640,7 @@ STRUCTURE casing
       cs i VEC:AT @ q execute if i v VEC:PUSH ! then
    loop
    v VEC:COUNT 1 > if
-      v 0 VEC:AT v VEC:COUNT [: cs CHANGE< ;] SORT:SORT!
+      v 0 VEC:AT v VEC:COUNT [: 2dup cs CHANGE-CMP STABLE< ;] SORT:SORT!
    then
    v ;
 
@@ -1882,13 +1894,10 @@ STRUCTURE casing
    at end < if cs ws at VEC:AT @ VEC:AT @ cv ar WRITE-CASING then
    end ;
 
-\ Casing x sorts before y by key, then index.
-: CASING< ( n n ^VEC:vector<casing> -- bool )
+\ Casing x against y by key.
+: CASING-CMP ( n n ^VEC:vector<casing> -- n )
    {: x:n y:n cv :}
-   cv x VEC:AT @ CASING-KEY cv y VEC:AT @ CASING-KEY MODEL:KEY-CMP
-   {: c:n :}
-   c 0<> if c 0 < exit then
-   x y < ;
+   cv x VEC:AT @ CASING-KEY cv y VEC:AT @ CASING-KEY MODEL:KEY-CMP ;
 
 : FIRST-CASING+ ( casing ^VEC:vector<casing> -- )
    {: c out :}
@@ -1902,7 +1911,7 @@ STRUCTURE casing
 : UNIQUE-CASINGS
    ( ^VEC:vector<casing> ^ARENA:arena -- ^VEC:vector<casing> )
    {: cv ar :}
-   cv VEC:COUNT [: cv CASING< ;] ar ORDER {: idx :}
+   cv VEC:COUNT [: cv CASING-CMP ;] ar STABLE-ORDER {: idx :}
    ar NO-CASINGS {: out :}
    idx VEC:COUNT 0 ?do cv idx i VEC:AT @ VEC:AT @ out FIRST-CASING+ loop
    out ;
@@ -2960,17 +2969,6 @@ ARENA PLANNINGS planning
 : NEW-VECTOR ( ^ARENA:arena width<t> -- ^VEC:vector<t> )
    {: ar w :}
    ar ARENA:ALLOCATOR 0 w VEC:NEW ;
-
-\ Rust's sort_by is stable: equal items keep their order.
-: STABLE< ( n n n -- bool )
-   {: x:n y:n c:n :}
-   c 0<> if c 0 < exit then
-   x y < ;
-
-\ The indices 0 to n-1 in the order cmp gives.
-: STABLE-ORDER ( n [ n n -- n ] ^ARENA:arena -- ^VEC:vector<n> )
-   {: k:n cmp ar :}
-   k [: 2dup cmp execute STABLE< ;] ar ORDER ;
 
 \ Runs q on each index in turn.
 : GATHER ( ^VEC:vector<n> [ n -- ] -- )
