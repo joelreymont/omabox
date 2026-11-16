@@ -1244,7 +1244,12 @@ ARENA UPLOADS DROPBOX:upload
    {: l t:^ tu:n x ar :}
    t tu l CLIENT DROPBOX:METADATA {: r:DROPBOX:reply :}
    r MATCH DROPBOX:reply
-      done OF l CLIENT DROPBOX:ENTRY ar FOUND x CLASSIFY ENDOF
+      done OF l CLIENT DROPBOX:ENTRY {: m :}
+         m DROPBOX-ENTRY:KIND @ DROPBOX-KIND:FILE DROPBOX-KIND:EQ
+         m DROPBOX-ENTRY:DOWNLOADABLE @ and m DROPBOX:COMPLETE? 0= and
+         \ An incomplete file rejects this plan alone; the others go on.
+         if BY-DROPBOX REJECT else m ar FOUND x CLASSIFY then
+      ENDOF
       refused OF {: e:DROPBOX:error :}
          e DROPBOX-ERROR:NOT-FOUND IS?
          if ABSENT x CLASSIFY else e l REJECTED then
@@ -1359,8 +1364,12 @@ ARENA UPLOADS DROPBOX:upload
 
 : UPLOADED ( ^sending -- mutation-outcome )
    {: s :}
-   s SENDING-LINK @ CLIENT DROPBOX:ENTRY s SENDING-ARENA @ REMOTE-OF
-   REPLAY-REMOTE--PATH--STATE:FILE APPLIED ;
+   s SENDING-LINK @ CLIENT DROPBOX:ENTRY {: e :}
+   e DROPBOX:COMPLETE? 0= if
+      s SENDING-LINK @ s SENDING-TARGET @ str> s EXPECTED
+      s SENDING-ARENA @ STATE exit
+   then
+   e s SENDING-ARENA @ REMOTE-OF REPLAY-REMOTE--PATH--STATE:FILE APPLIED ;
 
 : SEND ( ^sending -- mutation-outcome )
    {: s :}

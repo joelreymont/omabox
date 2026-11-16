@@ -45,7 +45,8 @@
 \ - REMOTE-UPLOAD of a new file sends its progress, then a finished
 \   transfer to a STATUS in TMPDIR; one Dropbox refuses as a conflict
 \   with other bytes at the path is read back as changed, and its
-\   finished transfer is sent.
+\   finished transfer is sent; a read-back incomplete file is rejected,
+\   and an incomplete upload answer is read back.
 \ - STAGE-EXACT-DOWNLOAD-AT against the fake Dropbox: Rust's
 \   exact_download_retry_reuses_a_stage_without_consuming_the_body,
 \   exact_download_stage_race_preserves_verified_stage, with the stage
@@ -1202,6 +1203,43 @@ LOG-CAP BUFFER: LOG-TEXT
    s" /2/files/upload /2/files/get_metadata /2/files/get_metadata" T$=
    d GONE rt GONE ;
 
+: A-READ-BACK-INCOMPLETE-FILE-IS-REJECTED ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   s" a read-back incomplete file is rejected" T-LABEL
+   TEST-DROPBOX:RESET
+   s" /notes.txt" s" /notes.txt" s" 0150"
+   s" E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
+   0 TEST-DROPBOX:FILE!
+   ar RUNTIME-STATUS {: rt:str st :}
+   st l REPLAY-LINK:STATUS !
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r s s" notes.txt" ar STAGED {: up :}
+   l up ar UPLOAD-NOTES s" rejected" s" rejected-by-dropbox" GIVES
+   TEST-DROPBOX:SEEN$
+   s" /2/files/upload /2/files/get_metadata /2/files/get_metadata" T$=
+   d GONE rt GONE ;
+
+: AN-INCOMPLETE-UPLOAD-ANSWER-IS-READ-BACK
+   ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   s" an incomplete upload answer is read back" T-LABEL
+   TEST-DROPBOX:RESET
+   ar RUNTIME-STATUS {: rt:str st :}
+   st l REPLAY-LINK:STATUS !
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r s s" notes.txt" ar STAGED {: up :}
+   up LOCAL:UPLOAD-CONTENT DROPBOX:HASH>STR str> {: h:^ hu:n :}
+   SB-RESET
+   S\" {\qname\q:\qnotes.txt\q,\qid\q:\qid:n\q,\qpath_lower\q:\q/notes.txt\q,\qpath_display\q:\q/notes.txt\q,\qrev\q:\q01701\q,\qsize\q:10,\qcontent_hash\q:\q"
+   SB-APPEND h hu SB-APPEND S\" \q,\qis_downloadable\q:false}" SB-APPEND
+   200 s" " s" " SB$ TEST-DROPBOX:SCRIPT!
+   s" /notes.txt" s" /notes.txt" s" 01702" h hu 10 TEST-DROPBOX:FILE!
+   l up ar UPLOAD-NOTES APPLIED-FILE MODEL-REMOTE:UNMAKE {: c v :}
+   c DROPBOX:HASH>STR str> h hu T$=
+   v DROPBOX:REV>STR str> s" 01702" T$=
+   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
+   d GONE rt GONE ;
+
 : REMOTE-CASES ( ^ARENA:arena -- )
    {: ar :}
    MAIN @ s" " ar NEW-LINK {: l :}
@@ -1211,7 +1249,9 @@ LOG-CAP BUFFER: LOG-TEXT
    l ar A-RESET-PROBE-LEAVES-THE-DELETE-PENDING
    l ar A-FILE-THE-FOLDER-DELETE-FINDS-IS-LOGGED
    l ar AN-UPLOAD-SENDS-ITS-TRANSFER
-   l ar A-REFUSED-UPLOAD-FINISHES-ITS-TRANSFER ;
+   l ar A-REFUSED-UPLOAD-FINISHES-ITS-TRANSFER
+   l ar A-READ-BACK-INCOMPLETE-FILE-IS-REJECTED
+   l ar AN-INCOMPLETE-UPLOAD-ANSWER-IS-READ-BACK ;
 
 
 \ ---- remote replay's blocks and folder applies
