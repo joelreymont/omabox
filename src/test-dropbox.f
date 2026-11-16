@@ -15,10 +15,10 @@
 \ be, as invalid until RESET; the refresh still issues them. DENY refuses
 \ every call that carries a token 403 until RESET. A call must carry the
 \ Path-Root ROOT! expects, none when that is empty, else it answers 422.
-\ Scripted answers go to API calls only, each before its route's own: a
-\ call takes the first left bound to its path, else the first left bound to
-\ none, and a token request leaves them queued. It records each request's
-\ path, and the last API call's Authorization, Path-Root and Content-Type.
+\ Scripted answers go before a route's own: a call takes the first left
+\ bound to its path, else, an API call only, the first left bound to none.
+\ It records each request's path, and the last API call's Authorization,
+\ Path-Root and Content-Type.
 \ STORAGE CLASS. PROCESS-WIDE: one worker serves every request, so its handler
 \ alone writes the state while a test waits on its call, and the test sets it
 \ between calls; only RESUME-BODY sets it during one. A body stays in its
@@ -201,13 +201,12 @@ TYPED-VARIABLE TOKEN-CUTTING bool
    loop -1 ;
 
 
-\ Sends an API call the first answer left bound to its path, else the
-\ first left bound to none, if there is one.
+\ Sends a call the first answer left bound to its path, else, an API call
+\ only, the first left bound to none, if there is one.
 : SCRIPTED? ( HTTP:request HTTP:response -- bool )
    {: q:HTTP:request a:HTTP:response :}
-   q API? 0= if false exit then
    q HTTP:PATH$ LEFT-FOR {: bound:n :}
-   bound 0 < if s" " LEFT-FOR else bound then {: i:n :}
+   bound 0 < q API? and if s" " LEFT-FOR else bound then {: i:n :}
    i 0 < if false exit then
    true i SPENT !
    a i STATUSES @ HTTP:STATUS!
@@ -1326,8 +1325,8 @@ $2100000 constant UPLOAD-CAP
    FILES @ FILE-AT! 1 FILES +! ;
 
 
-\ An answer an API call gets before its route's own: status, one header
-\ (an empty name for none) and a body. A token request leaves it queued.
+\ An answer bound to none, which an API call gets before its route's own
+\ and a token request leaves queued: status, header (empty for none), body.
 : SCRIPT! ( n ^u8 n ^u8 n ^u8 n -- )
    {: s:n nm:^ nu:n v:^ vu:n b:^ bu:n :}
    SCRIPTS @ {: i:n :}

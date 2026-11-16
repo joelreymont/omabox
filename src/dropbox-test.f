@@ -33,6 +33,7 @@
 \ an_unrotated_refresh_never_touches_secret_service,
 \ sdk_expiry_refresh_reissues_the_route_with_the_same_client,
 \ long_poll_exposes_reset_and_rate_limit_outcomes,
+\ oauth_rate_limit_preserves_retry_after_header,
 \ oauth_listing_longpoll_and_exact_download_use_documented_protocol,
 \ conditional_mutations_use_strict_documented_requests and
 \ verification_without_a_lowercase_path_is_invalid_metadata. One server
@@ -614,6 +615,20 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    503 s" " s" " s" " TEST-DROPBOX:SCRIPT!
    fresh DROPBOX:ACCOUNT RETRY-MS 0 T=
    TEST-DROPBOX:SEEN$ s" /oauth2/token /2/users/get_current_account" T$=
+   fresh DROPBOX:CLOSE ;
+
+
+\ A refresh Dropbox rate limits waits Retry-After, longer than the body's
+\ retry_after; the account call is never sent.
+: OAUTH-RATE-LIMIT-PRESERVES-RETRY-AFTER-HEADER ( -- )
+   s" oauth_rate_limit_preserves_retry_after_header" T-LABEL
+   TEST-DROPBOX:RESET
+   s" live-token" s" ns-root" OPENED {: fresh :}
+   s" /oauth2/token" 429 s" Retry-After" s" 23"
+   S\" {\qerror_summary\q:\qtoo_many_requests/...\q,\qerror\q:{\qreason\q:{\q.tag\q:\qtoo_many_requests\q},\qretry_after\q:1}}"
+   TEST-DROPBOX:ROUTE-SCRIPT!
+   fresh DROPBOX:ACCOUNT RETRY-MS 23000 T=
+   TEST-DROPBOX:SEEN$ s" /oauth2/token" T$=
    fresh DROPBOX:CLOSE ;
 
 
@@ -2544,7 +2559,7 @@ TYPED-VARIABLE FAULT fault
    SDK-EXPIRY-REFRESH-REISSUES-THE-ROUTE-WITH-THE-SAME-CLIENT
    REJECTED-GRANT-CASE REVOKED-CASE DENIED-CASE
    STORED-FIRST-CASE UNSTORED-CASE UNROTATED-CASE SCRIPTED-REFRESH-CASE
-   ROUTED-SCRIPT-CASE
+   OAUTH-RATE-LIMIT-PRESERVES-RETRY-AFTER-HEADER ROUTED-SCRIPT-CASE
    RATE-CASE RATE-BODY-CASE RATE-DATE-CASE RATE-CAP-CASE
    RATE-ZEROS-CASE RATE-HUGE-CASE
    BUSY-CASE REDIRECT-CASE BAD-REQUEST-CASE
