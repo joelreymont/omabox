@@ -230,8 +230,6 @@ private
 : GONE ( str JOURNAL:journal -- )
    JOURNAL:CLOSE str> FS:REMOVE-TREE ;
 
-: DISPLAY ( ^u8 n -- MODEL:path ) >str MODEL:>PATH ;
-
 \ Rust's CanonicalPath::from_display of the bytes.
 : CANONICAL ( ^u8 n ^ARENA:arena -- MODEL:key )
    {: p:^ u:n ar :}
@@ -354,12 +352,6 @@ private
 \ A plan of the one operation, or of two.
 : OPERATIONS ( ^ARENA:arena -- ^VEC:vector<MODEL:operation> )
    ARENA:ALLOCATOR 0 [type] MODEL:operation VEC:NEW ;
-
-: ONE-PLAN ( MODEL:operation ^ARENA:arena -- JOURNAL:operation-plan )
-   {: o ar :}
-   ar OPERATIONS {: ops :}
-   o ops VEC:PUSH !
-   ops JOURNAL-OPERATION--PLAN:MAKE ;
 
 : TWO-PLAN
    ( MODEL:operation MODEL:operation ^ARENA:arena
@@ -1228,18 +1220,6 @@ variable SEED
    v s" dir" DIR+
    v s" dir/b.txt" s" b" ar FILE+
    v ;
-
-: RECORDED? ( JOURNAL:plan-write -- bool )
-   MATCH JOURNAL:plan-write
-      recorded OF drop true ENDOF
-      already-live OF drop false ENDOF
-   ;MATCH ;
-
-\ A pending plan creating the local directory at path.
-: RECORD ( JOURNAL:journal ^u8 n ^ARENA:arena -- )
-   {: j a:^ u ar :}
-   MODEL-OPERATION:CREATE-LOCAL-DIRECTORY ar ONE-PLAN {: plan :}
-   j a u DISPLAY plan ar JOURNAL:RECORD-PLAN RECORDED? TTRUE ;
 
 \ The journal in the case's directory d, bound to the root r, with a
 \ pending plan below each spelling and one beside them.
@@ -2115,13 +2095,6 @@ READ-CAP BUFFER: READ-BUF
 
 : DOWNLOAD$ ( -- ^u8 n ) s" /2/files/download" ;
 
-\ The fake's record of u downloads.
-: DOWNLOADS$ ( n -- ^u8 n )
-   {: u:n :}
-   SB-RESET
-   u 0 ?do i 0<> if s"  " SB-APPEND then DOWNLOAD$ SB-APPEND loop
-   SB$ ;
-
 : REPORTED ( replay-step -- ^REPLAY:replay-report )
    MATCH replay-step
       root-changed OF s" the replay step lost its root" FAILED ENDOF
@@ -2596,15 +2569,6 @@ TYPED-VARIABLE CANARY str
 
 : HELD$ ( -- ^u8 n ) s" first download held open by the fake server" ;
 : NEXT$ ( -- ^u8 n ) s" download introduced by the next pass" ;
-
-: UNPROTECTED ( LOCAL:binding -- bool ) drop false ;
-
-: LEASED
-   ( option<LOCAL:download-slot-lease> -- LOCAL:download-slot-lease )
-   MATCH option
-      none OF s" reconcile-test: no download slot leased" FAILED ENDOF
-      some OF ENDOF
-   ;MATCH ;
 
 : GENERATION ( ^run -- n )
    {: x :}

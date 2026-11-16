@@ -73,6 +73,7 @@ require src/lib/test/stderr.f
 require src/lib/net/curl.f
 require src/dropbox.f
 require src/test-dropbox.f
+require src/test-client.f
 
 \ DROPBOX reopened for the throws no answer of the fake reaches: a reader
 \ that faults, and an OPEN that fails once its buffers exist.
@@ -208,12 +209,11 @@ TYPED-VARIABLE DROPBOX-TEST:OFFERED-CAP NUM:alloc-byte-len
 ;package
 
 
+using TEST-CLIENT
 package DROPBOX-TEST
 private
 
-TYPED-VARIABLE CFG DROPBOX:config
 TYPED-VARIABLE AR ^ARENA:arena
-TYPED-VARIABLE MAIN ^DROPBOX:client
 
 
 : ASSERT ( bool -- ) dup T-ASSERT 0= if T-REPORT then ;
@@ -277,7 +277,7 @@ variable REFUSALS
    u KEPT-U +! ;
 
 
-: RECORD ( ^u8 n -- )
+: RECORD-TOKEN ( ^u8 n -- )
    {: t:^ tu:n :}
    KEPT-U @ 0<> if s"  " KEPT+ then
    t tu KEPT+
@@ -292,19 +292,11 @@ variable REFUSALS
 : RECORDING ( n -- ) REFUSALS ! 0 KEPT-U ! 0 WITNESS-U ! ;
 
 
-\ A client on the fake with the refresh token and root, and the
+\ A client on the fake with the refresh token t and root r, and the
 \ recording store.
-: OPENED ( ^u8 n ^u8 n -- ^DROPBOX:client )
+: RECORDED-CLIENT ( ^u8 n ^u8 n -- ^DROPBOX:client )
    {: t:^ tu:n r:^ ru:n :}
-   [: RECORD ;] CFG DROPBOX-CONFIG:STORE !
-   CFG DROPBOX:PRODUCTION
-   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:API !
-   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:NOTIFY !
-   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:CONTENT !
-   s" fake-key" SPAN:MAKE CFG DROPBOX-CONFIG:KEY !
-   t tu SPAN:MAKE CFG DROPBOX-CONFIG:TOKEN !
-   r ru SPAN:MAKE CFG DROPBOX-CONFIG:ROOT !
-   CFG AR @ DROPBOX:OPEN ;
+   [: RECORD-TOKEN ;] t tu r ru AR @ CLIENT-ON ;
 
 
 : ACCOUNT-CASE ( -- )
@@ -428,7 +420,7 @@ variable REFUSALS
    TEST-DROPBOX:ROOT-SENT$ S\" {\q.tag\q:\qroot\q,\qroot\q:\qns-root\q}" T$=
    s" " TEST-DROPBOX:ROOT!
    TEST-DROPBOX:RESET
-   s" live-token" s" " OPENED {: home :}
+   s" live-token" s" " RECORDED-CLIENT {: home :}
    home DROPBOX:ACCOUNT DONE? ASSERT
    TEST-DROPBOX:ROOT-SENT? TFALSE
    home DROPBOX:CLOSE
@@ -516,7 +508,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
 : REJECTED-GRANT-CASE ( -- )
    s" a_refused_grant_becomes_a_rejected_token" T-LABEL
    TEST-DROPBOX:RESET
-   s" dead-token" s" ns-root" OPENED {: dead :}
+   s" dead-token" s" ns-root" RECORDED-CLIENT {: dead :}
    dead UNLINKED-LOGGED
    s" error dropbox: oauth2/token unlinked: the refresh token was refused"
    LOGGED? TTRUE
@@ -531,7 +523,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
 : REJECTED-POLL-CASE ( -- )
    s" rejected client after a failed long poll" T-LABEL
    TEST-DROPBOX:RESET
-   s" dead-token" s" ns-root" OPENED {: dead :}
+   s" dead-token" s" ns-root" RECORDED-CLIENT {: dead :}
    dead UNLINKED-LOGGED
    503 s" " s" " s" " TEST-DROPBOX:SCRIPT!
    s" c5" 30 dead DROPBOX:WAIT RETRY-MS 0 T=
@@ -544,7 +536,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
 : REVOKED-CASE ( -- )
    s" revoked token" T-LABEL
    TEST-DROPBOX:RESET
-   s" live-token" s" ns-root" OPENED {: gone :}
+   s" live-token" s" ns-root" RECORDED-CLIENT {: gone :}
    gone DROPBOX:ACCOUNT DONE? ASSERT
    TEST-DROPBOX:RESET
    TEST-DROPBOX:REVOKE
@@ -583,7 +575,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    T-LABEL
    TEST-DROPBOX:RESET 0 RECORDING
    s" refresh-2" TEST-DROPBOX:ROTATE!
-   s" live-token" s" ns-root" OPENED {: c :}
+   s" live-token" s" ns-root" RECORDED-CLIENT {: c :}
    c DROPBOX:ACCOUNT DONE? ASSERT
    KEPT$ s" refresh-2" T$=
    WITNESS$ s" /oauth2/token" T$=
@@ -603,7 +595,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    s" an_unstored_rotation_stays_usable_and_is_retried" T-LABEL
    TEST-DROPBOX:RESET 1 RECORDING
    s" refresh-2" TEST-DROPBOX:ROTATE!
-   s" live-token" s" ns-root" OPENED {: c :}
+   s" live-token" s" ns-root" RECORDED-CLIENT {: c :}
    c OWN ! false OUTCOME !
    [: ACCOUNT-DONE ;] LOGGED DROPBOX:E-NOT-STORED T=
    SB-RESET
@@ -623,12 +615,12 @@ TYPED-VARIABLE OWN ^DROPBOX:client
 : UNROTATED-CASE ( -- )
    s" an_unrotated_refresh_never_touches_secret_service" T-LABEL
    TEST-DROPBOX:RESET 0 RECORDING
-   s" live-token" s" ns-root" OPENED {: c :}
+   s" live-token" s" ns-root" RECORDED-CLIENT {: c :}
    c DROPBOX:ACCOUNT DONE? ASSERT
    TEST-DROPBOX:SEEN$ s" /oauth2/token /2/users/get_current_account" T$=
    c DROPBOX:CLOSE
    s" live-token" TEST-DROPBOX:ROTATE!
-   s" live-token" s" ns-root" OPENED {: same :}
+   s" live-token" s" ns-root" RECORDED-CLIENT {: same :}
    same DROPBOX:ACCOUNT DONE? ASSERT
    same DROPBOX:CLOSE
    KEPT-U @ 0 T= ;
@@ -639,7 +631,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
 : SCRIPTED-REFRESH-CASE ( -- )
    s" scripted answer after a refresh" T-LABEL
    TEST-DROPBOX:RESET
-   s" live-token" s" ns-root" OPENED {: fresh :}
+   s" live-token" s" ns-root" RECORDED-CLIENT {: fresh :}
    503 s" " s" " s" " TEST-DROPBOX:SCRIPT!
    fresh DROPBOX:ACCOUNT RETRY-MS 0 T=
    TEST-DROPBOX:SEEN$ s" /oauth2/token /2/users/get_current_account" T$=
@@ -651,7 +643,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
 : OAUTH-RATE-LIMIT-PRESERVES-RETRY-AFTER-HEADER ( -- )
    s" oauth_rate_limit_preserves_retry_after_header" T-LABEL
    TEST-DROPBOX:RESET
-   s" live-token" s" ns-root" OPENED {: fresh :}
+   s" live-token" s" ns-root" RECORDED-CLIENT {: fresh :}
    s" /oauth2/token" 429 s" Retry-After" s" 23"
    S\" {\qerror_summary\q:\qtoo_many_requests/...\q,\qerror\q:{\qreason\q:{\q.tag\q:\qtoo_many_requests\q},\qretry_after\q:1}}"
    TEST-DROPBOX:ROUTE-SCRIPT!
@@ -672,7 +664,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
 : REFRESH-FAILED ( n ^u8 n n -- )
    {: s:n b:^ bu:n code:n :}
    TEST-DROPBOX:RESET
-   s" live-token" s" ns-root" OPENED OWN !
+   s" live-token" s" ns-root" RECORDED-CLIENT OWN !
    s" /oauth2/token" s s" " s" " b bu TEST-DROPBOX:ROUTE-SCRIPT!
    [: ABC-REV ABC-HASH 0 OWN @ [: 2drop drop ;] DROPBOX:DOWNLOAD
       DONE? drop ;] LOGGED code T=
@@ -855,7 +847,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
 : WRONG-ROOT-CASE ( -- )
    s" path root refused" T-LABEL
    TEST-DROPBOX:RESET
-   s" live-token" s" ns-wrong" OPENED {: off :}
+   s" live-token" s" ns-wrong" RECORDED-CLIENT {: off :}
    off DROPBOX:ACCOUNT DROPBOX-ERROR:INVALID-ROOT REFUSED? ASSERT
    TEST-DROPBOX:SEEN$ s" /oauth2/token /2/users/get_current_account" T$=
    off DROPBOX:CLOSE ;
@@ -1976,7 +1968,7 @@ TYPED-VARIABLE ZEROED bool
    TEST-DROPBOX:RESET
    MAIN @ DROPBOX:REFRESH-TOKEN s" live-token" T$=
    s" fake-code" s" fake-verifier" TEST-DROPBOX:GRANT!
-   s" " s" ns-root" OPENED {: link :}
+   s" " s" ns-root" RECORDED-CLIENT {: link :}
    s" fake-code" s" fake-verifier" link DROPBOX:EXCHANGE DONE? ASSERT
    link DROPBOX:REFRESH-TOKEN s" fake-refresh-granted" T$=
    link DROPBOX:ACCOUNT DONE? ASSERT
@@ -1993,7 +1985,7 @@ TYPED-VARIABLE ZEROED bool
    s" refresh token with reserved bytes" T-LABEL
    TEST-DROPBOX:RESET
    s" fake-key" RESERVED$ TEST-DROPBOX:ACCEPT!
-   RESERVED$ s" ns-root" OPENED {: odd :}
+   RESERVED$ s" ns-root" RECORDED-CLIENT {: odd :}
    odd DROPBOX:ACCOUNT DONE? ASSERT
    TEST-DROPBOX:SEEN$ s" /oauth2/token /2/users/get_current_account" T$=
    odd DROPBOX:CLOSE
@@ -2004,7 +1996,7 @@ TYPED-VARIABLE ZEROED bool
    s" code with reserved bytes" T-LABEL
    TEST-DROPBOX:RESET
    RESERVED$ s" fake-verifier" TEST-DROPBOX:GRANT!
-   s" " s" ns-root" OPENED {: link :}
+   s" " s" ns-root" RECORDED-CLIENT {: link :}
    RESERVED$ s" fake-verifier" link DROPBOX:EXCHANGE DONE? ASSERT
    link DROPBOX:REFRESH-TOKEN s" fake-refresh-granted" T$=
    link DROPBOX:CLOSE ;
@@ -2020,7 +2012,7 @@ TYPED-VARIABLE ZEROED bool
 : DEAD-CODE-CASE ( -- )
    s" exchange invalid grant" T-LABEL
    TEST-DROPBOX:RESET
-   s" " s" ns-root" OPENED {: link :}
+   s" " s" ns-root" RECORDED-CLIENT {: link :}
    link OWN ! false OUTCOME !
    [: DEAD-EXCHANGE ;] LOGGED 0 T=
    OUTCOME @ TTRUE
@@ -2039,7 +2031,7 @@ TYPED-VARIABLE ZEROED bool
    T-LABEL
    LISTING s" " TEST-DROPBOX:ROOT!
    s" fake-code" s" fake-verifier" TEST-DROPBOX:GRANT!
-   s" " s" " OPENED {: link :}
+   s" " s" " RECORDED-CLIENT {: link :}
    s" fake-code" s" fake-verifier" link DROPBOX:EXCHANGE DONE? ASSERT
    link DROPBOX:ACCOUNT DONE? ASSERT
    link DROPBOX:ACCOUNT-ID s" dbid:account" T$=
@@ -2723,7 +2715,7 @@ TYPED-VARIABLE FAULT fault
 : CASES ( -- )
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
    s" ns-root" TEST-DROPBOX:ROOT!
-   s" live-token" s" ns-root" OPENED MAIN !
+   s" live-token" s" ns-root" RECORDED-CLIENT MAIN !
    ACCOUNT-CASE FILE-CASE BUILT-PATH-CASE MISSING-CASE ROOT-CASE
    LOST-READ-CASE UNDOWNLOADABLE-CASE SYMLINK-CASE INCOMPLETE-CASE
    METADATA-ELSEWHERE-CASE
@@ -2758,7 +2750,8 @@ TYPED-VARIABLE FAULT fault
    [: CASES ;] [: TEST-DROPBOX:STOP ;] finally ;
 
 
-: CURL-READY ( CURL:status -- )
+\ The curl loop started; the run goes on and fails at its end if not.
+: CURL-STARTED ( CURL:status -- )
    MATCH CURL:status
       ok OF ENDOF
       failed OF drop false ASSERT ENDOF
@@ -2769,12 +2762,13 @@ public
 : RUN ( -- )
    T-RESET
    ARENA:NEW AR !
-   AIO:START CURL:LOOP-START CURL-READY
+   AIO:START CURL:LOOP-START CURL-STARTED
    [: SERVED ;] [: CURL:LOOP-STOP AIO:STOP ;] finally
    AR @ ARENA:RELEASE
    s" dropbox-test: " type T-CASES FMT:.INT s"  checks" type cr
    T-REPORT ;
 
 ;package
+;using
 
 DROPBOX-TEST:RUN

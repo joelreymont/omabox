@@ -235,26 +235,6 @@ private
 
 \ ---- plans ---------------------------------------------------------
 
-: DISPLAY ( ^u8 n -- MODEL:path ) >str MODEL:>PATH ;
-
-: ONE-PLAN ( MODEL:operation ^ARENA:arena -- JOURNAL:operation-plan )
-   {: o ar :}
-   ar ARENA:ALLOCATOR 0 [type] MODEL:operation VEC:NEW {: ops :}
-   o ops VEC:PUSH !
-   ops JOURNAL-OPERATION--PLAN:MAKE ;
-
-: RECORDED? ( JOURNAL:plan-write -- bool )
-   MATCH JOURNAL:plan-write
-      recorded OF drop true ENDOF
-      already-live OF drop false ENDOF
-   ;MATCH ;
-
-\ A pending plan creating the local directory at path.
-: RECORD ( JOURNAL:journal ^u8 n ^ARENA:arena -- )
-   {: j a:^ u ar :}
-   MODEL-OPERATION:CREATE-LOCAL-DIRECTORY ar ONE-PLAN {: plan :}
-   j a u DISPLAY plan ar JOURNAL:RECORD-PLAN RECORDED? TTRUE ;
-
 : PATH-OF ( ^VEC:vector<JOURNAL:plan-record> n -- ^u8 n )
    VEC:AT @ JOURNAL-PLAN--RECORD:UNMAKE {: id p o s :}
    p MODEL:PATH>STR str> ;
@@ -2059,8 +2039,6 @@ CAP BUFFER: TEXT
 
 : NO-LEASE ( -- option<LOCAL:download-slot-lease> ) OPTION:NONE ;
 
-: UNPROTECTED ( LOCAL:binding -- bool ) drop false ;
-
 \ The case directory d's slot for target t's download of the remote.
 : LEASE-FOR
    ( str ^u8 n MODEL:remote -- option<LOCAL:download-slot-lease> )
@@ -2068,13 +2046,6 @@ CAP BUFFER: TEXT
    1 1 t tu rem LOCAL:NEW-SLOT-IDENTITY
    {: id:LOCAL:download-slot-identity :}
    d str> id [: UNPROTECTED ;] LOCAL:LEASE-DOWNLOAD-SLOT ;
-
-: LEASED
-   ( option<LOCAL:download-slot-lease> -- LOCAL:download-slot-lease )
-   MATCH option
-      none OF s" replay-test: no download slot leased" FAILED ENDOF
-      some OF ENDOF
-   ;MATCH ;
 
 \ STAGE-EXACT-DOWNLOAD-AT of p's remote below the root r, open as root.
 : STAGED-AT
@@ -2121,13 +2092,6 @@ CAP BUFFER: TEXT
    [: root r p pu rem lease ar STAGED-AT DROP-STAGE ;]
    REPLAY:E-DROPBOX TTHROWSQ
    LINK REPLAY-LINK:REPLY @ RETRY? TTRUE ;
-
-: DOWNLOADS$ ( n -- ^u8 n )
-   {: k:n :}
-   SB-RESET
-   k 0 ?do
-      i 0 > if s"  " SB-APPEND then s" /2/files/download" SB-APPEND
-   loop SB$ ;
 
 : SEEN ( n -- ) DOWNLOADS$ TEST-DROPBOX:SEEN$ 2swap T$= ;
 

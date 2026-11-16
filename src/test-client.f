@@ -1,24 +1,33 @@
-\ test-client.f - the fake Dropbox's client and its checkpointed partial
-\ downloads, for tests, never production.
-\ OPENED opens a client on test-dropbox.f's fake, MAIN holds it while it
-\ serves, ACCOUNTED takes its first access token, and NEW-LINK makes a
-\ REPLAY link on a client below a root. CHECKPOINTED leaves a slot
-\ holding a durable checkpoint of CHECKPOINT "x" bytes, FILL-XS writes
-\ those bytes, and PAST-HASH and SERVES-PAST give the fake a file of them
-\ followed by a tail. SOCKET-AT binds a socket at a path. Tests alone
-\ load this file; nothing in the program calls these words.
+\ test-client.f - the fake Dropbox's client, journal plans, download
+\ slot leases and checkpointed partial downloads, for tests, never
+\ production.
+\ CLIENT-ON opens a client on test-dropbox.f's fake with a store, a token
+\ and a root, OPENED one keeping no rotated token, MAIN holds it while it
+\ serves, ACCOUNTED takes its first access token, NEW-LINK makes a
+\ REPLAY link on a client below a root, and DOWNLOADS$ is the fake's
+\ record of downloads. RECORD journals a pending plan at a path.
+\ UNPROTECTED protects no binding and LEASED takes a lease that must
+\ exist. CHECKPOINTED leaves a slot holding a durable checkpoint of
+\ CHECKPOINT "x" bytes, FILL-XS writes those bytes, and PAST-HASH and
+\ SERVES-PAST give the fake a file of them followed by a tail. SOCKET-AT
+\ binds a socket at a path. Tests alone load this file; nothing in the
+\ program calls these words.
 \ STORAGE CLASS. PROCESS-WIDE: CFG, MAIN, the "x" bytes, their hasher and
 \ the socket address are one each, for one case at a time.
 
 require src/lib/error.f
 require src/lib/arena.f
 require src/lib/span.f
+require src/lib/string.f
+require src/lib/vector.f
 require src/lib/test.f
 require src/lib/fs.f
 require src/lib/adt/option.f
 require src/lib/net/curl.f
 require src/dropbox.f
 require src/test-dropbox.f
+require src/model.f
+require src/journal.f
 require src/local.f
 require src/replay.f
 
@@ -41,18 +50,24 @@ TYPED-VARIABLE CFG DROPBOX:config
 \ The client on the fake, while it serves.
 TYPED-VARIABLE MAIN ^DROPBOX:client
 
-\ A client on the fake, no root, keeping no rotated token.
-: OPENED ( ^ARENA:arena -- ^DROPBOX:client )
-   {: ar :}
-   [: 2drop ;] CFG DROPBOX-CONFIG:STORE !
+\ A client on the fake with the store s, refresh token t and root r.
+: CLIENT-ON
+   ( [ ^u8 n -- ] ^u8 n ^u8 n ^ARENA:arena -- ^DROPBOX:client )
+   {: s t:^ tu:n r:^ ru:n ar :}
+   s CFG DROPBOX-CONFIG:STORE !
    CFG DROPBOX:PRODUCTION
    TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:API !
    TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:NOTIFY !
    TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:CONTENT !
    s" fake-key" SPAN:MAKE CFG DROPBOX-CONFIG:KEY !
-   s" live-token" SPAN:MAKE CFG DROPBOX-CONFIG:TOKEN !
-   s" " SPAN:MAKE CFG DROPBOX-CONFIG:ROOT !
+   t tu SPAN:MAKE CFG DROPBOX-CONFIG:TOKEN !
+   r ru SPAN:MAKE CFG DROPBOX-CONFIG:ROOT !
    CFG ar DROPBOX:OPEN ;
+
+\ A client on the fake, no root, keeping no rotated token.
+: OPENED ( ^ARENA:arena -- ^DROPBOX:client )
+   {: ar :}
+   [: 2drop ;] s" live-token" s" " ar CLIENT-ON ;
 
 : CURL-READY ( CURL:status -- )
    MATCH CURL:status
@@ -89,6 +104,49 @@ public
       refused OF drop false ENDOF
       retry OF drop true ENDOF
       unlinked OF false ENDOF
+   ;MATCH ;
+
+\ The fake's record of k downloads.
+: DOWNLOADS$ ( n -- ^u8 n )
+   {: k:n :}
+   SB-RESET
+   k 0 ?do
+      i 0 > if s"  " SB-APPEND then s" /2/files/download" SB-APPEND
+   loop SB$ ;
+
+
+\ ---- journal plans
+
+: DISPLAY ( ^u8 n -- MODEL:path ) >str MODEL:>PATH ;
+
+: ONE-PLAN ( MODEL:operation ^ARENA:arena -- JOURNAL:operation-plan )
+   {: o ar :}
+   ar ARENA:ALLOCATOR 0 [type] MODEL:operation VEC:NEW {: ops :}
+   o ops VEC:PUSH !
+   ops JOURNAL-OPERATION--PLAN:MAKE ;
+
+: RECORDED? ( JOURNAL:plan-write -- bool )
+   MATCH JOURNAL:plan-write
+      recorded OF drop true ENDOF
+      already-live OF drop false ENDOF
+   ;MATCH ;
+
+\ A pending plan creating the local directory at path.
+: RECORD ( JOURNAL:journal ^u8 n ^ARENA:arena -- )
+   {: j a:^ u ar :}
+   MODEL-OPERATION:CREATE-LOCAL-DIRECTORY ar ONE-PLAN {: plan :}
+   j a u DISPLAY plan ar JOURNAL:RECORD-PLAN RECORDED? TTRUE ;
+
+
+\ ---- download slot leases
+
+: UNPROTECTED ( LOCAL:binding -- bool ) drop false ;
+
+: LEASED
+   ( option<LOCAL:download-slot-lease> -- LOCAL:download-slot-lease )
+   MATCH option
+      none OF s" test-client: no download slot leased" FAILED ENDOF
+      some OF ENDOF
    ;MATCH ;
 
 
