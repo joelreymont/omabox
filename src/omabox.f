@@ -1,13 +1,19 @@
 \ omabox.f - the omabox program (rust src/bin/omabox.rs), whose global
 \ MAIN is the build's entry. PARSE reads the arguments as Rust's parse
-\ does: help, version, pause, resume, service ACTION and logs. A command
-\ that fails exits 1, as Rust's main returning an error does.
+\ does: help, version, status, pause, resume, settings [--json], service
+\ ACTION and logs. A command that fails exits 1, as Rust's main
+\ returning an error does.
 \ A failure logs as CONFIG's refusals do: the library that failed logs
 \ its own lines, then OMABOX logs Rust's CliError text and, where the
-\ error has one, its help line; a SERVICE failure is SERVICE's alone.
-\ STORAGE CLASS. CALLER-OWNED: a command's service commands and drive
-\ record live in an arena the run holds; help and the version line are
-\ built in string.f's task-local builder.
+\ error has one, its help line; a SERVICE or ATTENTION failure is that
+\ package's alone. A CONFIG refusal of an operation keeps CONFIG's code,
+\ help and FS:ERRNO, as Rust's Config forwards its source's.
+\ status and settings check the stored sync root once their text is
+\ built: CONFIG logs its refusal of an unusable root, and the command
+\ still writes its text and succeeds.
+\ STORAGE CLASS. CALLER-OWNED: a command's service commands, drive
+\ record, configuration and text live in an arena the run holds; help
+\ and the version line are built in string.f's task-local builder.
 require src/lib/error.f
 require src/lib/string.f
 require src/lib/arena.f
@@ -16,6 +22,9 @@ require src/lib/log.f
 require src/lib/fd.f
 require src/lib/fs.f
 require src/lib/utf8-scalar.f
+require src/lib/json.f
+require src/config.f
+require src/attention.f
 require src/service.f
 require src/version.f
 
@@ -27,6 +36,8 @@ public
 -101100 s" the command line is not one omabox accepts"
    ERROR:CODE E-USAGE
 -101101 s" omabox could not read or write the terminal" ERROR:CODE E-IO
+-101102 s" could not serialize settings output"
+   ERROR:CODE E-SERIALIZE-OUTPUT
 
 private
 
@@ -39,7 +50,9 @@ private
    s" Omabox synchronizes a local directory with Dropbox." LINE+
    s" " LINE+
    s" Usage:" LINE+
+   s"   omabox status" LINE+
    s"   omabox pause|resume" LINE+
+   s"   omabox settings [--json]" LINE+
    s"   omabox service start|stop|restart|enable|disable|status" LINE+
    s"   omabox logs" LINE+
    s"   omabox --help" LINE+
@@ -49,15 +62,21 @@ private
 : VERSION-LINE ( -- ^u8 n )
    SB-RESET s" omabox " SB-APPEND RELEASE:VERSION$ LINE+ SB$ ;
 
+\ Rust's Settings { json }: how settings shows the stored settings.
+ENUM form DERIVE eq text json ;ENUM
+
 \ Rust's Command, the forms this program parses.
 ENUM command DERIVE eq
    VARIANT help ;VARIANT
    VARIANT version ;VARIANT
+   VARIANT status ;VARIANT
+   VARIANT settings FIELD shown form ;VARIANT
    VARIANT service FIELD action SERVICE:action ;VARIANT
    VARIANT logs ;VARIANT
 ;ENUM
 
 ARENA DRIVENS SERVICE:driven
+ARENA WRITERS JSON:writer
 
 
 \ ---- errors
@@ -83,6 +102,24 @@ ARENA DRIVENS SERVICE:driven
    LOG-OPEN s" could not " LOG:TEXT+ op opu LOG:TEXT+
    s" Check the terminal input and output, then retry." HELP
    LOG:;LINE cause FS:CAUSE! E-IO throw ;
+
+: CONFIG-CODE? ( n -- bool )
+   {: c:n :}
+   c CONFIG:E-LAST >= c CONFIG:E-FIRST <= and ;
+
+\ Rust's Config for the operation, after CONFIG's own lines; a code of
+\ another package goes on.
+: CONFIG-FAILED ( n ^u8 n -- )
+   {: code:n op:^ opu:n :}
+   code CONFIG-CODE? 0= if code throw then
+   FS:ERRNO {: cause:n :}
+   LOG-OPEN s" could not " LOG:TEXT+ op opu LOG:TEXT+
+   LOG:;LINE cause FS:CAUSE! code throw ;
+
+: SERIALIZE-FAILED ( -- )
+   LOG-OPEN s" could not serialize settings output" LOG:TEXT+
+   s" Use `omabox settings` for human-readable output." HELP
+   LOG:;LINE 0 FS:CAUSE! E-SERIALIZE-OUTPUT throw ;
 
 
 \ ---- output
@@ -123,6 +160,7 @@ ARENA DRIVENS SERVICE:driven
    a u s" resume" STR= if
       SERVICE-ACTION:START ACTION-COMMAND exit
    then
+   a u s" status" STR= if construct command status OPTION:SOME exit then
    a u s" logs" STR= if construct command logs OPTION:SOME exit then
    OPTION:NONE ;
 
@@ -142,6 +180,17 @@ ARENA DRIVENS SERVICE:driven
    argc 2 <> if s" service requires exactly one action" USAGE then
    1 arg execute ACTION COMMAND-SERVICE ;
 
+\ Rust's parse_settings, but for set-root.
+: PARSE-SETTINGS ( n [ n -- ^u8 n ] -- command )
+   {: argc:n arg :}
+   argc 1 = if construct form text COMMAND-SETTINGS exit then
+   argc 2 = if
+      1 arg execute s" --json" STR= if
+         construct form json COMMAND-SETTINGS exit
+      then
+   then
+   s" invalid settings command" USAGE ;
+
 \ The command a name alone selects, refusing further arguments.
 : SOLE ( option<command> n -- command )
    {: argc:n :}
@@ -160,8 +209,101 @@ ARENA DRIVENS SERVICE:driven
    c cu UTF8:VALID? 0= if
       s" the command must be valid UTF-8" USAGE
    then
+   c cu s" settings" STR= if argc arg PARSE-SETTINGS exit then
    c cu s" service" STR= if argc arg PARSE-SERVICE exit then
    c cu ALONE argc SOLE ;
+
+
+\ ---- the configuration
+
+: XDG ( ^ARENA:arena -- ^CONFIG:xdg )
+   {: ar :}
+   NULL-PTR [: drop ar CONFIG:XDG-ENV ;] catch {: x code :}
+   code 0= if x exit then
+   code s" resolve XDG paths" CONFIG-FAILED ;
+
+: DOCUMENT ( ^CONFIG:xdg ^ARENA:arena -- ^CONFIG:document )
+   {: x ar :}
+   NULL-PTR [: drop x ar CONFIG:DOCUMENT-LOAD-FROM ;] catch {: d code :}
+   code 0= if d exit then
+   code s" load configuration" CONFIG-FAILED ;
+
+: STATE-PATHS ( ^CONFIG:xdg ^ARENA:arena -- ^CONFIG:paths )
+   {: x ar :}
+   NULL-PTR [: drop x ar CONFIG:RESOLVE-PRIVATE ;] catch {: p code :}
+   code 0= if p exit then
+   code s" resolve state paths" CONFIG-FAILED ;
+
+\ Rust's unusable_root_line: CONFIG logs its refusal of the stored root,
+\ which leaves the command's text standing; any other code goes on.
+: ROOT-CHECKED ( ^CONFIG:document ^CONFIG:xdg ^ARENA:arena -- )
+   {: d x ar :}
+   [: d x ar CONFIG:VALIDATE drop ;] catch {: code:n :}
+   code 0= if exit then
+   code CONFIG-CODE? 0= if code throw then ;
+
+
+\ ---- status and settings
+
+\ The bytes copied into the arena.
+: KEPT ( ^u8 n ^ARENA:arena -- str )
+   {: a:^ u:n ar :}
+   ar u ARENA:ALLOC {: d:^ du:n :}
+   a d u BYTE-COPY
+   d du >str ;
+
+\ Rust's status_output: the journal's text.
+: STATUS-TEXT ( ^CONFIG:xdg ^ARENA:arena -- str )
+   {: x ar :}
+   x ar DOCUMENT {: d :}
+   x ar STATE-PATHS {: p :}
+   p CONFIG:JOURNAL-FILE CONFIG:ABS-PATH>STR ar ATTENTION:RENDER {: t :}
+   d x ar ROOT-CHECKED
+   t ;
+
+: SETTINGS-LINES ( ^CONFIG:document ^ARENA:arena -- str )
+   {: d ar :}
+   SB-RESET s" Sync root: " SB-APPEND
+   d CONFIG:DOCUMENT-ROOT CONFIG:ABS-PATH>STR str> LINE+
+   s" Dropbox app key: " SB-APPEND d CONFIG:DOCUMENT-KEY str> LINE+
+   SB$ ar KEPT ;
+
+: SETTINGS-FIELDS ( ^CONFIG:document ^JSON:writer -- )
+   {: d w :}
+   w 2 JSON:WRITE-INDENT! JSON:WRITE-OBJECT-START
+   s" sync_root" d CONFIG:DOCUMENT-ROOT CONFIG:ABS-PATH>STR str>
+   JSON:WRITE-FIELD-S JSON:WRITE-COMMA
+   s" dropbox_app_key" d CONFIG:DOCUMENT-KEY str> JSON:WRITE-FIELD-S
+   JSON:WRITE-OBJECT-END drop ;
+
+\ serde_json's to_string_pretty of the document, then LF, in a buffer
+\ every byte escaped to six fits; text that is not UTF-8 is Rust's
+\ SerializeOutput.
+: SETTINGS-JSON ( ^CONFIG:document ^ARENA:arena -- str )
+   {: d ar :}
+   d CONFIG:DOCUMENT-ROOT CONFIG:ABS-PATH>STR str> nip
+   d CONFIG:DOCUMENT-KEY str> nip + 6 * 64 + {: cap:n :}
+   ar cap 1+ ARENA:ALLOC drop {: buf:^ :}
+   ar WRITERS-NEW {: w :}
+   w buf cap JSON:WRITE-OPEN drop
+   [: d w SETTINGS-FIELDS ;] catch {: code:n :}
+   code E-JSON-WRITE-BYTE = if SERIALIZE-FAILED then
+   code 0<> if code throw then
+   w JSON:WRITTEN$ {: r:^ ru:n :}
+   w JSON:WRITE-CLOSE
+   10 r ru + c!
+   r ru 1+ >str ;
+
+\ Rust's settings_output: the stored settings, as text or JSON.
+: SETTINGS-TEXT ( ^CONFIG:xdg form ^ARENA:arena -- str )
+   {: x f ar :}
+   x ar DOCUMENT {: d :}
+   f MATCH form
+      text OF d ar SETTINGS-LINES ENDOF
+      json OF d ar SETTINGS-JSON ENDOF
+   ;MATCH {: t :}
+   d x ar ROOT-CHECKED
+   t ;
 
 
 \ ---- running
@@ -186,6 +328,10 @@ ARENA DRIVENS SERVICE:driven
    cmd MATCH command
       help OF HELP-TEXT WRITE-OUT ENDOF
       version OF VERSION-LINE WRITE-OUT ENDOF
+      status OF ar XDG ar STATUS-TEXT str> WRITE-OUT ENDOF
+      settings OF
+         {: f :} ar XDG f ar SETTINGS-TEXT str> WRITE-OUT
+      ENDOF
       service OF {: act :} ar SERVICE:COMMANDS act ar RUN-SERVICE ENDOF
       logs OF ar SERVICE:COMMANDS SERVICE:LOGS ENDOF
    ;MATCH ;

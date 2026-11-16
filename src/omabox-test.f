@@ -3,12 +3,21 @@
 \ - parser_accepts_documented_forms
 \ - parser_rejects_incomplete_or_secret_bearing_forms, each refusal's
 \   two log lines checked in a file under TMPDIR
+\ - config_errors_show_their_own_help: status over a config.toml that
+\   does not parse logs CONFIG's error and help, then OMABOX's Config
+\   line with no help of its own
+\ - status_reports_the_journal_when_the_root_is_unavailable,
+\   settings_show_the_stored_root_when_it_is_unavailable and
+\   settings_json_is_one_document_when_the_root_is_available, where
+\   Rust's stdout line is CONFIG's refusal on stderr; each over Rust's
+\   fixture, XDG homes and sync root in a directory under TMPDIR
 \ - service_commands_reset_the_start_limit_before_a_start, each row's
 \   systemctl a script in a directory of its own under TMPDIR, which
 \   logs each verb and answers show with the row's state
 \ and the program built with README's command into a directory under
 \ TMPDIR, whose --version prints its name and version and exits 0.
-\ White-box: OMABOX is reopened for PARSE and RUN-SERVICE.
+\ White-box: OMABOX is reopened for PARSE, RUN-SERVICE, STATUS-TEXT and
+\ SETTINGS-TEXT.
 \ Run from the repository root: hb --load src/omabox-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -22,6 +31,12 @@ require src/lib/process.f
 require src/lib/process-argv.f
 require src/lib/process-env.f
 require src/lib/engine-candidate.f
+require src/lib/vector.f
+require src/dropbox.f
+require src/model.f
+require src/journal.f
+require src/config.f
+require src/attention.f
 require src/service.f
 require src/version.f
 require src/omabox.f
@@ -38,6 +53,9 @@ CAP BUFFER: OUT
 CAP BUFFER: ERR
 CAP BUFFER: SEEN
 PATH-CAP BUFFER: JOINED
+
+\ The text a command answered under a capture.
+TYPED-VARIABLE SHOWN str
 
 600000 constant BUILD-MS
 10000 constant RUN-MS
@@ -100,7 +118,11 @@ PATH-CAP BUFFER: JOINED
    SERVICE-ACTION:START SERVICE-COMMAND ACCEPTS
    s" service" s" restart" TWO
    SERVICE-ACTION:RESTART SERVICE-COMMAND ACCEPTS
-   s" logs" ONE construct command logs ACCEPTS ;
+   s" logs" ONE construct command logs ACCEPTS
+   s" status" ONE construct command status ACCEPTS
+   s" settings" ONE construct form text COMMAND-SETTINGS ACCEPTS
+   s" settings" s" --json" TWO
+   construct form json COMMAND-SETTINGS ACCEPTS ;
 
 : LINES ( ^u8 n -- n )
    {: a:^ u:n :}
@@ -130,12 +152,177 @@ PATH-CAP BUFFER: JOINED
    d s" stderr.txt" ar INSIDE {: p :}
    ARGS-RESET s" a command is required" p ar REJECTS
    s" unknown" ONE s" unknown command" p ar REJECTS
-   s" status" s" extra" TWO s" unknown command" p ar REJECTS
+   s" status" s" extra" TWO s" too many arguments" p ar REJECTS
    s" pause" s" extra" TWO s" too many arguments" p ar REJECTS
    s" resume" s" extra" TWO s" too many arguments" p ar REJECTS
    s" install" s" extra" TWO s" unknown command" p ar REJECTS
-   s" settings" s" set-root" TWO s" unknown command" p ar REJECTS
+   s" settings" s" set-root" TWO
+   s" invalid settings command" p ar REJECTS
+   s" settings" s" --yaml" TWO s" invalid settings command" p ar REJECTS
    s" service" s" unknown" TWO s" unknown service action" p ar REJECTS
+   d str> FS:REMOVE-TREE ;
+
+
+\ ---- status and settings
+
+\ Rust's fixture: DIR/first the sync root, XDG over DIR/config and
+\ DIR/state, the config written with public-app-key; answers DIR, the
+\ XDG and first.
+: FIXTURE ( ^ARENA:arena -- str ^CONFIG:xdg str )
+   {: ar :}
+   ar TEMPORARY {: d :}
+   d s" first" ar INSIDE {: first :}
+   first str> FS:MAKE-DIRS
+   d s" config" ar INSIDE CONFIG:>ABS-PATH
+   d s" state" ar INSIDE CONFIG:>ABS-PATH ar CONFIG:XDG-NEW {: x :}
+   x first s" public-app-key" >str ar CONFIG:FROM-VALUES
+   {: c :}
+   c CONFIG:PREPARE
+   c ar CONFIG:WRITE drop
+   d x first ;
+
+: STORED ( ^CONFIG:xdg ^ARENA:arena -- str )
+   CONFIG:DOCUMENT-LOAD-FROM CONFIG:DOCUMENT-ROOT CONFIG:ABS-PATH>STR ;
+
+\ Whether the log ends with "omabox: " t and LF.
+: ENDS-LOGGED? ( ^u8 n ^u8 n -- bool )
+   {: a:^ u:n t:^ tu:n :}
+   SB-RESET s" omabox: " SB-APPEND t tu SB-APPEND 10 SB-APPEND-C
+   SB$ {: w:^ wu:n :}
+   u wu < if false exit then
+   a u + wu - wu w wu STR= ;
+
+\ Whether the log holds "config: " t and LF.
+: CONFIG-LOGGED? ( ^u8 n ^u8 n -- bool )
+   {: a:^ u:n t:^ tu:n :}
+   SB-RESET s" config: " SB-APPEND t tu SB-APPEND 10 SB-APPEND-C
+   a u SB$ CONTAINS? ;
+
+\ Whether the log holds "config: " t, the path p in backticks, and LF.
+: PATH-LOGGED? ( ^u8 n ^u8 n str -- bool )
+   {: a:^ u:n t:^ tu:n p :}
+   SB-RESET s" config: " SB-APPEND t tu SB-APPEND s" `" SB-APPEND
+   p str> SB-APPEND s" `" SB-APPEND 10 SB-APPEND-C
+   a u SB$ CONTAINS? ;
+
+\ CONFIG's refusal of the stored root once it is gone: its two lines
+\ alone, Rust's unavailable_line.
+: UNAVAILABLE ( ^u8 n str -- )
+   {: e:^ eu:n root :}
+   e eu LINES 2 T=
+   e eu s" could not resolve sync root " root PATH-LOGGED? TTRUE
+   e eu
+   s" help: Create the sync root as a local directory and ensure it is accessible."
+   CONFIG-LOGGED? TTRUE ;
+
+: CONFIG-ERRORS-SHOW-THEIR-OWN-HELP ( ^ARENA:arena -- )
+   {: ar :}
+   s" config_errors_show_their_own_help" T-LABEL
+   ar FIXTURE {: d x first :}
+   x ar CONFIG:XDG-CONFIG-FILE CONFIG:ABS-PATH>STR {: file :}
+   file str> s" app_secret = 'secret'" FS:WRITE-ALL
+   d s" stderr.txt" ar INSIDE {: p :}
+   [: x ar STATUS-TEXT drop ;] p str> ar STDERR:CAPTURING
+   {: code:n e:^ eu:n :}
+   code CONFIG:E-PARSE T=
+   e eu LINES 3 T=
+   e eu s" could not parse Omabox configuration at " file PATH-LOGGED?
+   TTRUE
+   e eu
+   s" help: The file may contain only `sync_root` and `dropbox_app_key`; credentials do not belong in configuration."
+   CONFIG-LOGGED? TTRUE
+   e eu s" could not load configuration" ENDS-LOGGED? TTRUE
+   e eu s" omabox: help:" CONTAINS? TFALSE
+   d str> FS:REMOVE-TREE ;
+
+: BOUND? ( JOURNAL:dropbox-binding-write -- bool )
+   MATCH JOURNAL:dropbox-binding-write
+      bound OF true ENDOF
+      already-bound OF false ENDOF
+      mismatch OF drop false ENDOF
+   ;MATCH ;
+
+: REMOTE-UNKNOWN
+   ( MODEL:unknown-reason -- MODEL:observation<MODEL:remote> )
+   MODEL-OBSERVATION:UNKNOWN ;
+
+\ Rust's journal: bound, and stale.txt published as stale.
+: STALE-JOURNAL ( str ^ARENA:arena -- )
+   {: jp ar :}
+   jp JOURNAL:OPEN {: j :}
+   s" account" >str s" namespace" >str s" /remote" >str
+   JOURNAL-DROPBOX--BINDING:MAKE {: b :}
+   j b ar JOURNAL:BIND-DROPBOX-ROOT BOUND? TTRUE
+   s" stale.txt" >str MODEL:>PATH {: sp :}
+   ar ARENA:ALLOCATOR 0 [type] MODEL:remote-record VEC:NEW {: v :}
+   sp ar MODEL:FOLD sp MODEL-UNKNOWN--REASON:STALE REMOTE-UNKNOWN
+   MODEL-REMOTE--RECORD:MAKE v VEC:PUSH !
+   j s" remote-cursor" >str DROPBOX:>CURSOR v
+   JOURNAL:PUBLISH-REMOTE-INVENTORY
+   j JOURNAL:CLOSE ;
+
+: STATUS-REPORTS-THE-JOURNAL-WHEN-THE-ROOT-IS-UNAVAILABLE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" status_reports_the_journal_when_the_root_is_unavailable" T-LABEL
+   ar FIXTURE {: d x first :}
+   x ar STORED {: stored :}
+   x ar CONFIG:RESOLVE-PRIVATE CONFIG:JOURNAL-FILE CONFIG:ABS-PATH>STR
+   {: jp :}
+   jp ar STALE-JOURNAL
+   first str> FS:REMOVE-DIR
+   jp ar ATTENTION:RENDER {: journal :}
+   journal str> s" stale.txt" CONTAINS? TTRUE
+   d s" stderr.txt" ar INSIDE {: p :}
+   [: x ar STATUS-TEXT SHOWN ! ;] p str> ar STDERR:CAPTURING
+   {: code:n e:^ eu:n :}
+   code 0 T=
+   SHOWN @ str> journal str> T$=
+   e eu stored UNAVAILABLE
+   d str> FS:REMOVE-TREE ;
+
+\ Rust's assert_settings_json, as serde_json's exact bytes.
+: SETTINGS-JSON? ( str str -- )
+   {: json stored :}
+   SB-RESET S\" {\n  \"sync_root\": \"" SB-APPEND stored str> SB-APPEND
+   S\" \",\n  \"dropbox_app_key\": \"public-app-key\"\n}\n" SB-APPEND
+   json str> SB$ T$= ;
+
+\ The settings in the form, captured in p: the text, then the log.
+: SETTINGS ( ^CONFIG:xdg form str ^ARENA:arena -- str ^u8 n )
+   {: x f p ar :}
+   [: x f ar SETTINGS-TEXT SHOWN ! ;] p str> ar STDERR:CAPTURING
+   {: code:n e:^ eu:n :}
+   code 0 T=
+   SHOWN @ e eu ;
+
+: SETTINGS-SHOW-THE-STORED-ROOT-WHEN-IT-IS-UNAVAILABLE ( ^ARENA:arena -- )
+   {: ar :}
+   s" settings_show_the_stored_root_when_it_is_unavailable" T-LABEL
+   ar FIXTURE {: d x first :}
+   x ar STORED {: stored :}
+   first str> FS:REMOVE-DIR
+   d s" stderr.txt" ar INSIDE {: p :}
+   x construct form text p ar SETTINGS {: text e:^ eu:n :}
+   e eu stored UNAVAILABLE
+   SB-RESET s" Sync root: " SB-APPEND stored str> SB-APPEND
+   S\" \nDropbox app key: public-app-key\n" SB-APPEND
+   text str> SB$ T$=
+   x construct form json p ar SETTINGS {: json je:^ jeu:n :}
+   je jeu stored UNAVAILABLE
+   json stored SETTINGS-JSON?
+   d str> FS:REMOVE-TREE ;
+
+: SETTINGS-JSON-IS-ONE-DOCUMENT-WHEN-THE-ROOT-IS-AVAILABLE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" settings_json_is_one_document_when_the_root_is_available" T-LABEL
+   ar FIXTURE {: d x first :}
+   x ar STORED {: stored :}
+   d s" stderr.txt" ar INSIDE {: p :}
+   x construct form json p ar SETTINGS {: json e:^ eu:n :}
+   eu 0 T=
+   json stored SETTINGS-JSON?
    d str> FS:REMOVE-TREE ;
 
 
@@ -234,6 +421,10 @@ PATH-CAP BUFFER: JOINED
    {: ar :}
    PARSER-ACCEPTS-DOCUMENTED-FORMS
    ar PARSER-REJECTS-INCOMPLETE-OR-SECRET-BEARING-FORMS
+   ar CONFIG-ERRORS-SHOW-THEIR-OWN-HELP
+   ar STATUS-REPORTS-THE-JOURNAL-WHEN-THE-ROOT-IS-UNAVAILABLE
+   ar SETTINGS-SHOW-THE-STORED-ROOT-WHEN-IT-IS-UNAVAILABLE
+   ar SETTINGS-JSON-IS-ONE-DOCUMENT-WHEN-THE-ROOT-IS-AVAILABLE
    ar SERVICE-COMMANDS-RESET-THE-START-LIMIT-BEFORE-A-START
    ar PROGRAM ;
 
