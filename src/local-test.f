@@ -10,8 +10,10 @@
 \ journal but four that publish to a journal in their case's directory,
 \ in the part LOCAL SCAN-TEST, which sees LOCAL's private types, and
 \ there too that a denied write's line gives its directory's and entry's
-\ facts, a denied rename's names both directories, and one on a directory
-\ already closed gives none of its facts; that upload stage collection
+\ facts, a denied rename's names both directories, one on a directory
+\ already closed gives none of its facts, a denied directory creation's
+\ names its parent and no entry, an existing directory's denial gives its
+\ entry, and a converted denial logs nothing; that upload stage collection
 \ removes only verified unreferenced content; then each stage outcome,
 \ each inspected download stage, a stage marker set, read and removed, a
 \ second mark failing with one xattr line on stderr, each upload stage
@@ -23,8 +25,9 @@
 \ a stale one rebound; then that a cut download resumes from its last
 \ durable checkpoint, a completed partial is promoted before or after
 \ its rename, a corrupt one restarts only in its own slot, a promotion
-\ keeps a swapped replacement, a copy across filesystems frees its
-\ slot, and a reset slot replays to offset 0, each completed stage
+\ keeps a swapped replacement, a refused slot promotion names both
+\ sides, a copy across filesystems frees its slot, and a reset slot
+\ replays to offset 0, each completed stage
 \ installed and read back at its target; that a restart empties its
 \ partial, keeps a swapped replacement and fails in a slot directory it
 \ cannot search; that slots lease through a symlinked state home; then
@@ -51,6 +54,7 @@ require src/lib/property.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
 require src/lib/fs-anchored.f
+require src/lib/fs-statx.f
 require src/lib/fs-list.f
 require src/lib/fd.f
 require src/lib/xattr.f
@@ -1127,6 +1131,8 @@ variable RAISED-ERRNO
 
 488 constant MODE-0750
 416 constant MODE-0640
+320 constant MODE-0500
+192 constant MODE-0300
 
 \ SB holds the clause of kind k for the name p, through its mode's label.
 : CLAUSE ( ^u8 n ^u8 n -- )
@@ -1137,6 +1143,15 @@ variable RAISED-ERRNO
 : DIRECTORY? ( ^u8 n ^u8 n -- bool )
    {: e:^ u:n p:^ pu:n :}
    s" ; directory" p pu CLAUSE e u SB$ CONTAINS? ;
+
+\ Where the directory clause for the name p starts in the log, -1 when
+\ it holds none.
+: CLAUSE-AT ( ^u8 n ^u8 n -- n )
+   {: e:^ u:n p:^ pu:n :}
+   s" ; directory" p pu CLAUSE e u SB$ FIND-SUB MATCH option
+      none OF -1 ENDOF
+      some OF IDX>N ENDOF
+   ;MATCH ;
 
 \ Whether the log holds the clause, the mode m, and Omabox's uid as owner.
 : OWNED? ( ^u8 n ^u8 n ^u8 n ^u8 n -- bool )
@@ -1183,13 +1198,16 @@ variable RAISED-ERRNO
    s" from" MKDIR s" to" MKDIR s" from/file.txt" s" held" WRITE
    s" from" AT FS:OPEN-DIR {: from:fd :}
    s" to" AT FS:OPEN-DIR {: to:fd :}
-   [: [: from to RENAME-DENIED ;] E-IO TTHROWSQ ;] STDERR-OF
-   {: e:^ u:n :}
+   [: [: from to RENAME-DENIED ;] E-IO TTHROWSQ
+      FS:ERRNO CAUGHT ! ;] STDERR-OF {: e:^ u:n :}
    from DISCARD to DISCARD
+   CAUGHT @ FS:EACCES T=
    e u 1 LOGGED
    e u s" : Permission denied;" CONTAINS? TTRUE
    e u s" from" AT DIRECTORY? TTRUE
    e u s" to" AT DIRECTORY? TTRUE
+   s" ; entry" s" file.txt" CLAUSE e u SB$ CONTAINS? TTRUE
+   e u s" from" AT CLAUSE-AT e u s" to" AT CLAUSE-AT < TTRUE
    e u RUNS-AS? TTRUE ;
 
 \ The descriptor closes inside the capture, so no open there takes its
@@ -1210,6 +1228,60 @@ variable RAISED-ERRNO
    b bu s" local: " CONTAINS? TTRUE
    b bu s" : Permission denied; directory; Omabox runs as uid "
    CONTAINS? TTRUE ;
+
+\ The errno is read before ro is writable again.
+: CREATE-DIRECTORY-DENIED-GIVES-ITS-DIRECTORY ( -- )
+   s" create_directory_denied_gives_its_directory" T-LABEL
+   ROOT-USER? if exit then
+   s" root" MKDIR s" root/ro" MKDIR
+   s" root/ro" AT MODE-0500 FS:CHMOD-MODE
+   s" root" AT FS:OPEN-DIR {: root:fd :}
+   [: [: [: root s" ro/new" CREATE-DIRECTORY-AT drop ;]
+         [: FS:ERRNO CAUGHT ! s" root/ro" ALLOW ;] finally
+      ;] E-IO TTHROWSQ ;] STDERR-OF {: e:^ u:n :}
+   root DISCARD
+   CAUGHT @ FS:EACCES T=
+   e u 1 LOGGED
+   e u s" ; directory" s" root/ro" AT s" 0500" OWNED? TTRUE
+   e u s" ; entry" CONTAINS? TFALSE
+   e u RUNS-AS? TTRUE ;
+
+\ held exists but cannot be opened to read; root's mode is set, not left
+\ to the umask, and the errno is read before held is readable again.
+: EXISTING-DIRECTORY-DENIED-GIVES-ITS-ENTRY ( -- )
+   s" existing_directory_denied_gives_its_entry" T-LABEL
+   ROOT-USER? if exit then
+   s" root" MKDIR s" root/held" MKDIR
+   s" root" AT MODE-0700 FS:CHMOD-MODE
+   s" root/held" AT MODE-0300 FS:CHMOD-MODE
+   s" root" AT FS:OPEN-DIR {: root:fd :}
+   [: [: [: root s" held" CREATE-DIRECTORY-AT drop ;]
+         [: FS:ERRNO CAUGHT ! s" root/held" ALLOW ;] finally
+      ;] E-IO TTHROWSQ ;] STDERR-OF {: e:^ u:n :}
+   root DISCARD
+   CAUGHT @ FS:EACCES T=
+   e u 1 LOGGED
+   e u s" ; directory" s" root" AT s" 0700" OWNED? TTRUE
+   e u s" ; entry" s" held" s" 0300" OWNED? TTRUE
+   e u RUNS-AS? TTRUE ;
+
+\ A denial the scan converts into an entry's outcome logs no line.
+: CONVERTED-DENIAL-LOGS-NOTHING ( -- )
+   s" converted_denial_logs_nothing" T-LABEL
+   ROOT$ FS:OPEN-DIR {: dir:fd :}
+   [: FS:EACCES FS:CAUSE! dir s" file.txt" s" write test file"
+      s" file.txt" IO-FAILURE-AT ;] 0 ENTRY-RAISES {: code:n :}
+   FS:ERRNO FS:EACCES T=
+   dir DISCARD
+   code E-IO T= ;
+
+\ Immutable and append-only need privilege to set, so the facts are made.
+: ATTRIBUTES-ARE-LABELLED ( -- )
+   s" attributes_are_labelled" T-LABEL
+   [: LOG-OPEN MODE-0640 0 FS-STATX:IMMUTABLE FS-STATX:APPEND or
+      FACTS-MAKE OPTION:SOME FACTS+ LOG:;LINE ;] STDERR-OF
+   {: e:^ u:n :}
+   e u s"  mode 0640 owner uid 0 immutable append-only" CONTAINS? TTRUE ;
 
 \ ---- publication
 
@@ -1357,7 +1429,11 @@ variable RAISED-ERRNO
    IN-CASE
    [: DENIED-WRITE-GIVES-ITS-DIRECTORY-AND-ENTRY ;] IN-CASE
    [: DENIED-RENAME-GIVES-BOTH-DIRECTORIES ;] IN-CASE
-   [: DENIED-WRITE-ON-A-CLOSED-DIRECTORY ;] IN-CASE ;
+   [: DENIED-WRITE-ON-A-CLOSED-DIRECTORY ;] IN-CASE
+   [: CREATE-DIRECTORY-DENIED-GIVES-ITS-DIRECTORY ;] IN-CASE
+   [: EXISTING-DIRECTORY-DENIED-GIVES-ITS-ENTRY ;] IN-CASE
+   [: CONVERTED-DENIAL-LOGS-NOTHING ;] IN-CASE
+   [: ATTRIBUTES-ARE-LABELLED ;] IN-CASE ;
 
 public
 
@@ -1367,6 +1443,12 @@ public
 public
 EXPORT SCAN-TEST:SCAN-CASES
 EXPORT SCAN-TEST:ROOT-USER?
+EXPORT SCAN-TEST:OWNED?
+EXPORT SCAN-TEST:RUNS-AS?
+EXPORT SCAN-TEST:CLAUSE-AT
+EXPORT SCAN-TEST:LOGGED
+EXPORT SCAN-TEST:MODE-0500
+EXPORT SCAN-TEST:CAUGHT
 ;package
 
 package LOCAL-TEST
@@ -2363,6 +2445,43 @@ variable REMAINING
    s" completed_partial_promotion_preserves_a_swapped_replacement" T-LABEL
    [: SWAPPED-PROMOTION ;] IN-SYNC-ROOT ;
 
+\ The errno is read before the sync root is writable again.
+: REFUSED-PROMOTION ( ^LOCAL:download-partial -- )
+   {: x :}
+   [: [: x [: SYNC$ LOCAL:MODE-0500 FS:CHMOD-MODE ;] AR @
+         LOCAL:PROMOTE-WITH DROP-OUTCOME ;]
+      [: FS:ERRNO LOCAL:CAUGHT ! SYNC$ MODE-0700 FS:CHMOD-MODE ;]
+      finally ;] LOCAL:E-IO TTHROWSQ ;
+
+\ The slot is in the case directory and the stage in the sync root.
+: REFUSED-PROMOTION-LOGS ( ^LOCAL:download-partial -- )
+   {: x :}
+   [: x REFUSED-PROMOTION ;]
+   LOG-PATH AR @ STDERR:CAPTURING {: code:n e:^ u:n :}
+   code 0<> if code throw then
+   LOCAL:CAUGHT @ FS:EACCES T=
+   e u 1 LOCAL:LOGGED
+   e u s" ; directory" ROOT$ s" 0700" LOCAL:OWNED? TTRUE
+   e u s" ; directory" SYNC$ s" 0500" LOCAL:OWNED? TTRUE
+   e u ROOT$ LOCAL:CLAUSE-AT e u SYNC$ LOCAL:CLAUSE-AT < TTRUE
+   e u s" ; entry" s" .omabox-download-slot-0" s" 0600" LOCAL:OWNED?
+   TTRUE
+   e u LOCAL:RUNS-AS? TTRUE ;
+
+: DENIED-PROMOTION ( fd -- )
+   {: root:fd :}
+   s" complete bytes" {: b:^ bu:n :}
+   b bu HASH-OF {: c:DROPBOX:hash :}
+   TARGET c TEST-LEASE {: lease:LOCAL:download-slot-lease :}
+   root c lease b bu WRITTEN {: x :}
+   x AR @ LOCAL:MARK-PARTIAL
+   [: x REFUSED-PROMOTION-LOGS ;] [: x LOCAL:CLOSE-PARTIAL ;] finally ;
+
+: DENIED-SLOT-PROMOTION-NAMES-BOTH-SIDES ( -- )
+   s" denied_slot_promotion_names_both_sides" T-LABEL
+   LOCAL:ROOT-USER? if exit then
+   [: DENIED-PROMOTION ;] IN-SYNC-ROOT ;
+
 : CROSS-FILESYSTEM ( fd -- )
    {: root:fd :}
    s" complete bytes" {: b:^ bu:n :}
@@ -3310,6 +3429,7 @@ FS:PATHZ-CAP BUFFER: SLOT-FILE-BUF
    COMPLETED-PARTIAL-RECOVERS-BEFORE-AND-AFTER-RENAME
    CORRUPT-COMPLETED-PARTIAL-RESTARTS-ONLY-WHEN-OWNED
    COMPLETED-PARTIAL-PROMOTION-PRESERVES-A-SWAPPED-REPLACEMENT
+   DENIED-SLOT-PROMOTION-NAMES-BOTH-SIDES
    CROSS-FILESYSTEM-SLOT-COMPLETION-COPIES-REHASHES-AND-FREES-THE-SLOT
    INTERRUPTED-PARTIAL-RESET-REPLAYS-TO-A-REUSABLE-ZERO-CHECKPOINT
    RESTARTED-PARTIAL-IS-EMPTY-OR-FAILS

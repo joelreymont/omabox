@@ -3472,7 +3472,8 @@ variable SIDES
    d GONE ;
 
 \ The pass below the root r throws LOCAL's E-IO, its errno EACCES,
-\ read before the root's close clears it.
+\ read before the root's close clears it; its one line gives r's mode
+\ and owner and the uid Omabox runs as.
 : COPY-DENIED ( JOURNAL:journal str str ^ARENA:arena -- )
    {: j r:str s:str ar :}
    r OPEN-ROOT {: f:fd :}
@@ -3480,6 +3481,14 @@ variable SIDES
          drop ;] LOCAL:E-IO TTHROWSQ
       FS:ERRNO FS:EACCES T= ;]
    [: f FS:CLOSE-DIR ;] finally ;
+
+: READ-ONLY-CLAUSE$ ( str -- ^u8 n )
+   {: r:str :}
+   SB-RESET s" ; directory `" SB-APPEND r str> SB-APPEND
+   s" ` mode 0500 owner uid " SB-APPEND FS:EUID FMT:SB-INT SB$ ;
+
+: RUNS-AS$ ( -- ^u8 n )
+   SB-RESET s" ; Omabox runs as uid " SB-APPEND FS:EUID FMT:SB-INT SB$ ;
 
 : REPLAY-DOES-NOT-BLOCK-A-CONFLICT-WHOSE-COPY-PARENT-IS-READ-ONLY
    ( ^ARENA:arena -- )
@@ -3491,8 +3500,12 @@ variable SIDES
    ar UPLOAD-DIRS {: d:str r:str s:str j :}
    j r ar REPLACE-PLAN
    r str> MODE-NO-WRITE FS:CHMOD-MODE
-   [: j r s ar COPY-DENIED ;]
-   [: r str> FS:MODE-PRIVATE-DIR FS:CHMOD-MODE ;] finally
+   [: d [: j r s ar COPY-DENIED ;] ar LOGGED ;]
+   [: r str> FS:MODE-PRIVATE-DIR FS:CHMOD-MODE ;] finally {: t:^ tu:n :}
+   t tu LINE-COUNT 1 T=
+   t tu s" Permission denied" CONTAINS? TTRUE
+   t tu r READ-ONLY-CLAUSE$ CONTAINS? TTRUE
+   t tu RUNS-AS$ CONTAINS? TTRUE
    j ar JOURNAL:BLOCKED-PLANS VEC:COUNT 0 T=
    j ar JOURNAL:PENDING-PLANS VEC:COUNT 1 T=
    r ar LOCAL-SIDE ar INSIDE str> FS:TRY-STAT TFALSE

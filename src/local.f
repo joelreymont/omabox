@@ -26,9 +26,10 @@
 \ predicate naming the codes and errnos its caller converts, and QUIET?
 \ asks the innermost one. A scan's observation converts what ENTRY-CODE?
 \ names and rethrows the rest, which logs and ends the scan; a failure
-\ XATTR logged gets no second line. On EACCES or EPERM an io failure's
-\ line also gives the mode, owner and attributes of the call's directory
-\ and entry, and the uid Omabox runs as.
+\ XATTR logged gets no second line. On EACCES or EPERM, the line of a call
+\ that makes, links, renames or removes a name in a directory, or opens it
+\ as a directory, also gives the mode, owner and attributes of that
+\ directory and of the entry, and the uid Omabox runs as.
 \ The scan walks the root depth first, each directory's names in byte order,
 \ and collects observations, cached hashes it may reuse and files to hash; a
 \ failure that concerns one entry publishes that entry as unknown and drops
@@ -833,14 +834,12 @@ private
       some OF ENDOF
    ;MATCH ;
 
-: NO-DIRECTORY ( ^u8 n -- )
-   {: p:^ u:n :}
-   s" open root-confined directory" p u IO-FAILURE ;
-
 : OPEN-DIRECTORY-AT ( fd ^u8 n ^u8 n -- fd )
    {: dir:fd name:^ nu:n p:^ u:n :}
    dir name nu FS:TRY-OPEN-DIR-AT MATCH option
-      none OF p u NO-DIRECTORY ENDOF
+      none OF
+         dir name nu s" open root-confined directory" p u IO-FAILURE-AT
+      ENDOF
       some OF ENDOF
    ;MATCH ;
 
@@ -1869,7 +1868,7 @@ STRUCTURE parent-dir
       SYNC-DIRECTORY exit
    then
    FS:ERRNO FS:EEXIST = if exit then
-   s" create download parent directory" p u IO-FAILURE ;
+   dir name nu s" create download parent directory" p u IO-FAILURE-AT ;
 
 \ The directory made and opened, then synced; a throw closes it.
 : MADE-DIRECTORY ( fd ^u8 n ^u8 n -- fd )
@@ -1883,7 +1882,9 @@ STRUCTURE parent-dir
 \ else the directory made.
 : MISSING-DIRECTORY ( fd ^u8 n ^u8 n bool -- option<fd> )
    {: dir:fd name:^ nu:n p:^ u:n create:bool :}
-   FS:ERRNO FS:ENOENT <> if p u NO-DIRECTORY then
+   FS:ERRNO FS:ENOENT <> if
+      dir name nu s" open root-confined directory" p u IO-FAILURE-AT
+   then
    create 0= if OPTION:NONE exit then
    dir name nu p u MADE-DIRECTORY OPTION:SOME ;
 
@@ -2110,7 +2111,8 @@ $100 constant MODE-READ-ONLY
       STAGE-WRITE-CREATED exit
    then
    FS:ERRNO FS:EEXIST <> if
-      s" install verified private stage" p u IO-FAILURE
+      dir name nu s" install verified private stage" p u
+      IO-FAILURE-AT
    then
    dir name nu p u s" verify raced stage" ar OPEN-AND-HASH-IF-PRESENT
    MATCH option
@@ -2135,7 +2137,8 @@ $100 constant MODE-READ-ONLY
 : TEMP-FILE ( fd ^u8 n -- fd )
    {: dir:fd p:^ u:n :}
    -1 >FD [: drop dir FS:TEMP-AT ;]
-   [: s" create unnamed staging file" p u IO-FAILURE ;] FS-FAILS ;
+   [: dir s" " s" create unnamed staging file" p u IO-FAILURE-AT ;]
+   FS-FAILS ;
 
 : WRITE-NEW-STAGE
    ( fd ^u8 n ^u8 n DROPBOX:hash [ ^u8 n -- n ] option<str> ^u8 n
@@ -2234,7 +2237,7 @@ $100 constant MODE-READ-ONLY
       s" preserve raced local destination" t tu OCCUPIED
    then
    dir g gu FS:TRY-REMOVE-FILE-AT 0= if
-      s" remove duplicate raced local copy" t tu IO-FAILURE
+      dir g gu s" remove duplicate raced local copy" t tu IO-FAILURE-AT
    then
    dir t tu s" sync duplicate raced local cleanup" SYNC-DIRECTORY ;
 
@@ -2247,7 +2250,7 @@ $100 constant MODE-READ-ONLY
       dir t tu s" sync preserved raced local destination" SYNC-DIRECTORY
       exit
    then
-   FS:ERRNO FS:EEXIST <> if o ou t tu IO-FAILURE then
+   FS:ERRNO FS:EEXIST <> if dir g gu o ou t tu IO-FAILURE-AT then
    dir g gu cn cnu t tu c ar DROP-DUPLICATE-GUARD ;
 
 \ Puts the guard back at target_name; when an entry raced in there, keeps
@@ -2260,7 +2263,7 @@ $100 constant MODE-READ-ONLY
    dir g gu dir tn tnu FS:TRY-RENAME-NEW-AT if
       dir t tu o ou SYNC-DIRECTORY exit
    then
-   FS:ERRNO FS:EEXIST <> if o ou t tu IO-FAILURE then
+   FS:ERRNO FS:EEXIST <> if dir g gu o ou t tu IO-FAILURE-AT then
    actual MATCH option
       none OF s" preserve raced local destination" t tu CHANGED ENDOF
       some OF {: c:DROPBOX:hash :} dir g gu t tu c ar PRESERVE-GUARD ENDOF
@@ -2354,7 +2357,9 @@ private
    {: f:fd dir:fd name:^ nu:n p:^ u:n :}
    s" remove corrupt upload stage" {: o:^ ou:n :}
    f dir name nu p u NAMED-INODE-MATCHES 0= if o ou p u CHANGED then
-   dir name nu FS:TRY-REMOVE-FILE-AT 0= if o ou p u IO-FAILURE then
+   dir name nu FS:TRY-REMOVE-FILE-AT 0= if
+      dir name nu o ou p u IO-FAILURE-AT
+   then
    dir p u s" sync corrupt upload stage removal" SYNC-DIRECTORY ;
 
 \ Reuses the hashed stage when it holds want, else removes it: true
@@ -2578,7 +2583,8 @@ private
    dir name nu p u ar VERIFIED-UPLOAD-STAGE-ENTRY? 0= if 0 exit then
    dir name nu FS:TRY-REMOVE-FILE-AT if 1 exit then
    FS:ERRNO FS:ENOENT <> if
-      s" remove unreferenced upload stage" p u IO-FAILURE
+      dir name nu s" remove unreferenced upload stage" p u
+      IO-FAILURE-AT
    then 0 ;
 
 \ Collects the path's stage when its name is a content hash retained
@@ -2914,7 +2920,8 @@ ENUM download-slot-open
 \ A new unnamed file in dir; o names the operation that makes it.
 : UNNAMED-FILE ( fd ^u8 n ^u8 n -- fd )
    {: dir:fd p:^ u:n o:^ ou:n :}
-   -1 >FD [: drop dir FS:TEMP-AT ;] [: o ou p u IO-FAILURE ;] FS-FAILS ;
+   -1 >FD [: drop dir FS:TEMP-AT ;]
+   [: dir s" " o ou p u IO-FAILURE-AT ;] FS-FAILS ;
 
 \ Binds the unnamed file at offset 0 and names it; false when the name
 \ is taken.
@@ -2929,7 +2936,8 @@ ENUM download-slot-open
       true exit
    then
    FS:ERRNO FS:EEXIST <> if
-      s" install new resumed download slot" p u IO-FAILURE
+      dir name nu s" install new resumed download slot" p u
+      IO-FAILURE-AT
    then false ;
 
 \ A new slot at the name in dir bound to b; none when the name is taken.
@@ -3473,14 +3481,15 @@ private
 
 \ After the move into the stage failed with errno e: an entry at the
 \ stage's name is inspected, q running for a verified one; another
-\ filesystem is copied across; else the failure, o's for path p.
+\ filesystem is copied across; else fail, which throws, runs with
+\ FS:ERRNO set to e.
 : MOVE-FAILED
-   ( fd ^download-location ^ARENA:arena n ^u8 n ^u8 n [ -- ]
+   ( fd ^download-location ^ARENA:arena n ^u8 n [ -- ] [ -- ]
      -- stage-outcome<n> )
-   {: f:fd loc ar:^ARENA:arena e:n o:^ ou:n p:^ u:n q :}
+   {: f:fd loc ar:^ARENA:arena e:n o:^ ou:n q fail :}
    e FS:EEXIST = if loc o ou q ar RACED-STAGE exit then
    e FS:EXDEV = if f loc ar COPY-COMPLETED-SLOT exit then
-   e o ou p u SYSCALL-FAILURE ;
+   e FS:CAUSE! fail execute E-IO throw ;
 
 \ The stage made read-only by m and synced by s.
 : SEAL-PROMOTED ( fd ^download-location ^u8 n ^u8 n -- stage-outcome<n> )
@@ -3497,8 +3506,9 @@ private
       p u exit
    then
    FS:ERRNO FS:EEXIST <> if
-      FS:ERRNO s" restore swapped resumed download" loc STAGE-PATH@
-      SYSCALL-FAILURE
+      loc TARGET-DIR@ loc STAGE-NAME@ slots name nu
+      s" restore swapped resumed download" loc STAGE-PATH@
+      IO-FAILURE-ACROSS
    then
    loc STAGE-PATH@ ;
 
@@ -3535,7 +3545,9 @@ private
    slots name nu loc TARGET-DIR@ loc STAGE-NAME@ FS:TRY-RENAME-NEW-AT if
       f loc slots name nu p u PROMOTED-SLOT exit
    then
-   f loc ar FS:ERRNO o ou p u [: f loc RESET-DOWNLOAD-SLOT TAKEN? drop ;]
+   f loc ar FS:ERRNO o ou [: f loc RESET-DOWNLOAD-SLOT TAKEN? drop ;]
+   [: slots name nu loc TARGET-DIR@ loc STAGE-NAME@ o ou p u
+      IO-FAILURE-ACROSS ;]
    MOVE-FAILED ;
 
 : LINKED-DISPOSABLE ( fd ^download-location -- stage-outcome<n> )
@@ -3556,7 +3568,9 @@ private
    f loc TARGET-DIR@ loc STAGE-NAME@ FS:TRY-LINK-AT if
       f loc LINKED-DISPOSABLE exit
    then
-   f loc ar FS:ERRNO o ou p u [: ;] MOVE-FAILED ;
+   f loc ar FS:ERRNO o ou [: ;]
+   [: loc TARGET-DIR@ loc STAGE-NAME@ o ou p u IO-FAILURE-AT ;]
+   MOVE-FAILED ;
 
 \ Rust's promote_completed_slot_with: the completed, marked file f moved
 \ into the location's stage, before running just ahead of the move.
@@ -4047,7 +4061,9 @@ STRUCTURE install
 \ Removes the name in dir; o names the operation and p the path.
 : REMOVE-AT ( fd ^u8 n ^u8 n ^u8 n -- )
    {: dir:fd name:^ nu:n o:^ ou:n p:^ u:n :}
-   dir name nu FS:TRY-REMOVE-FILE-AT 0= if o ou p u IO-FAILURE then ;
+   dir name nu FS:TRY-REMOVE-FILE-AT 0= if
+      dir name nu o ou p u IO-FAILURE-AT
+   then ;
 
 : WRITABLE ( fd ^u8 n ^u8 n -- )
    {: f:fd p:^ u:n o:^ ou:n :}
@@ -4207,7 +4223,8 @@ STRUCTURE install
    FS:ERRNO {: e:n :}
    e FS:ENOENT = if ABSENT PREPARE-CHANGED exit then
    e FS:EEXIST <> if
-      s" move replaced file to displacement guard" t tu IO-FAILURE
+      dir tn tnu s" move replaced file to displacement guard" t tu
+      IO-FAILURE-AT
    then
    dir g gu gp gpu s" verify raced replacement displacement" ar
    HASH-AT-IF-PRESENT c gp gpu EXISTING-GUARD ;
@@ -4336,7 +4353,8 @@ STRUCTURE install
    FS:ERRNO {: e:n :}
    e FS:ENOENT = if DOWNLOAD-REQUIRED exit then
    e FS:EEXIST <> if
-      s" install download into absent path" t str> IO-FAILURE
+      dir sn str> s" install download into absent path" t str>
+      IO-FAILURE-AT
    then
    x RACED-INITIAL-INSTALL ;
 
@@ -4406,7 +4424,8 @@ STRUCTURE install
       s x g gu REPLACED exit
    then
    FS:ERRNO FS:EEXIST <> if
-      s" install verified replacement" t str> IO-FAILURE
+      dir sn str> s" install verified replacement" t str>
+      IO-FAILURE-AT
    then
    x g gu RACED-REPLACEMENT ;
 
@@ -4540,7 +4559,9 @@ STRUCTURE deletion
 : REMOVE-GUARD ( deletion ^u8 n ^u8 n -- )
    {: x:deletion o:^ ou:n sy:^ syu:n :}
    x DELETION-UNMAKE {: dir:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
-   dir g str> FS:TRY-REMOVE-FILE-AT 0= if o ou t str> IO-FAILURE then
+   dir g str> FS:TRY-REMOVE-FILE-AT 0= if
+      dir g str> o ou t str> IO-FAILURE-AT
+   then
    dir t str> sy syu SYNC-DIRECTORY ;
 
 \ The guard holds other content than expected: it goes back to the target,
@@ -4587,7 +4608,8 @@ STRUCTURE deletion
       dir t str> s" sync deletion displacement" SYNC-DIRECTORY true exit
    then
    FS:ERRNO FS:ENOENT = if false exit then
-   s" move deleted file to displacement guard" t str> IO-FAILURE ;
+   dir n str> s" move deleted file to displacement guard" t str>
+   IO-FAILURE-AT ;
 
 \ The target holds the expected content: it moves aside to the guard and
 \ is removed there only while the guard still holds it.
@@ -4675,7 +4697,8 @@ private
    dir name nu FS:TRY-OPEN-DIR-AT MATCH option
       none OF FS:ERRNO {: e:n :}
          e FS:ENOENT = e FS:ENOTDIR = or e FS:ELOOP = or 0= if
-            s" inspect occupied local directory path" p u IO-FAILURE
+            dir name nu s" inspect occupied local directory path"
+            p u IO-FAILURE-AT
          then LOCAL-CREATE--DIRECTORY--OUTCOME:FRESH-OBSERVATION
       ENDOF
       some OF {: d:fd :}
@@ -4700,7 +4723,9 @@ private
       dir name nu p u SYNC-MADE-DIRECTORY
       LOCAL-CREATE--DIRECTORY--OUTCOME:CREATED exit
    then
-   FS:ERRNO FS:EEXIST <> if s" create local directory" p u IO-FAILURE then
+   FS:ERRNO FS:EEXIST <> if
+      dir name nu s" create local directory" p u IO-FAILURE-AT
+   then
    dir name nu p u EXISTING-DIRECTORY ;
 
 \ Whether a failed rmdir found an entry that is not an empty directory.
@@ -4719,7 +4744,7 @@ private
    e OCCUPIED-DIRECTORY? if
       LOCAL-DELETE--DIRECTORY--OUTCOME:FRESH-OBSERVATION exit
    then
-   s" delete empty local directory" p u IO-FAILURE ;
+   dir name nu s" delete empty local directory" p u IO-FAILURE-AT ;
 
 public
 
@@ -4922,7 +4947,7 @@ private
       src dir dn dnu d du SETTLE-RENAME exit
    then
    FS:EEXIST RACED? if LOCAL-RENAME--OUTCOME:RETRY exit then
-   s" rename local entry" p u IO-FAILURE ;
+   dir name nu s" rename local entry" p u IO-FAILURE-AT ;
 
 : RENAME-IN ( fd ^u8 n ^u8 n ^u8 n bool [ -- ] -- rename-outcome )
    {: dir:fd name:^ nu:n p:^ u:n d:^ du:n dirs:bool hook :}
