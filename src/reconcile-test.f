@@ -145,6 +145,17 @@
 \ - case_collision_spares_the_recorded_greater_spelling
 \ - case_collision_beside_a_symlink_renames_the_baselined_file
 \ - case_collision_of_symlinks_stays_in_place
+\ Directory collisions in the pass against the fake Dropbox, Rust's
+\ tests of the same names, with no account request and a fresh
+\ observation naming no path:
+\ - remote_directory_preserves_a_local_file_under_a_synchronized_name
+\ - local_directory_preserves_a_dropbox_file_under_a_synchronized_name
+\ - directory_collision_copy_stays_bound_to_the_verified_root, the
+\   fake swapping the root on its task as the download arrives
+\ - directory_collision_destination_race_requests_a_fresh_scan, the
+\   fake writing the copy's destination as the download arrives
+\ - occupied_collision_stage_uses_the_next_synchronized_name
+\ - changed_dropbox_file_during_directory_conversion_replans_without_a_conflict_row
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -5271,6 +5282,316 @@ $1C0 constant OWNER-ACCESS
    ar CASE-COLLISION-BESIDE-A-SYMLINK-RENAMES-THE-BASELINED-FILE
    ar CASE-COLLISION-OF-SYMLINKS-STAYS-IN-PLACE ;
 
+\ ---- directory collisions against the fake Dropbox ----------------
+
+\ Rust's file-copy name for node: node (<origin> <the first 12
+\ characters of the bytes' identity><suffix>).
+: NODE-COPY ( ^u8 n ^u8 n ^u8 n ^ARENA:arena -- str )
+   {: o:^ ou:n b:^ bu:n s:^ su:n ar :}
+   b bu ar IDENTITY DROPBOX:HASH>STR str> drop 12 {: h:^ hu:n :}
+   SB-RESET s" node (" SB-APPEND o ou SB-APPEND s"  " SB-APPEND
+   h hu SB-APPEND s su SB-APPEND s" )" SB-APPEND SB$ ar COPIED ;
+
+: NODE-DIR ( ^run -- ) s" node" IN-ROOT str> FS:MAKE-DIR ;
+
+\ Dropbox's file /node, served as rev v of the bytes b and alone on
+\ the next listing page, at cursor k.
+: NODE-LISTED ( ^u8 n ^u8 n ^u8 n ^ARENA:arena -- )
+   {: v:^ vu:n b:^ bu:n k:^ ku:n ar :}
+   s" node" v vu b bu ar SERVES
+   b bu ar IDENTITY {: h:DROPBOX:hash :}
+   [: s" /node" s" /node" v vu h FILE-JSON+ ;] ar ENTRIES
+   k ku false PAGE ;
+
+\ The next listing page, at cursor k, holding Dropbox's folder /node.
+: NODE-FOLDER-PAGE ( ^u8 n ^ARENA:arena -- )
+   {: k:^ ku:n ar :}
+   [: s" /node" s" /node" FOLDER-JSON+ ;] ar ENTRIES k ku false PAGE ;
+
+: OUTCOME-KIND$ ( outcome -- ^u8 n )
+   MATCH outcome
+      complete OF {: rep :} s" complete" ENDOF
+      fresh OF s" fresh" ENDOF
+      root-changed OF s" root-changed" ENDOF
+   ;MATCH ;
+
+\ The complete pass's replayed and planned counts.
+: REPLAYED-PLANNED ( outcome -- n n )
+   COMPLETE RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   replayed planned ;
+
+: KIND-OF ( MODEL:baseline -- ^u8 n )
+   MATCH MODEL:baseline
+      absent OF s" absent" ENDOF
+      present OF {: rem :} s" present" ENDOF
+      directory OF s" directory" ENDOF
+   ;MATCH ;
+
+\ The baseline's variant at path p, none for no row.
+: BASELINE-KIND$ ( ^run ^u8 n -- ^u8 n )
+   {: x p:^ u:n :}
+   x RUN-JOURNAL @ p u DISPLAY x RUN-ARENA @ JOURNAL:BASELINE
+   MATCH option
+      none OF s" none" ENDOF
+      some OF KIND-OF ENDOF
+   ;MATCH ;
+
+: CONFLICT-COUNT ( ^run -- n )
+   {: x :}
+   x RUN-JOURNAL @ x RUN-ARENA @ JOURNAL:CONFLICTS VEC:COUNT ;
+
+: LOCAL-FILE$ ( -- ^u8 n ) s" local file preserved beside directory" ;
+
+: REMOTE-DIRECTORY-PRESERVES-A-LOCAL-FILE-UNDER-A-SYNCHRONIZED-NAME
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" remote_directory_preserves_a_local_file_under_a_synchronized_name"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   s" local file" LOCAL-FILE$ s" " ar NODE-COPY {: v:str :}
+   s" directory-file-collision" ar NODE-FOLDER-PAGE
+   [: ;] ar ENTRIES s" directory-file-collision" false PAGE
+   x s" node" IN-ROOT str> LOCAL-FILE$ FS:WRITE-ALL
+   x rec PASSED OUTCOME-KIND$ s" fresh" T$=
+   x s" node" IN-ROOT str> FS:EXISTS? TFALSE
+   x v str> IN-ROOT LOCAL-FILE$ HOLDS-BYTES
+   x PENDING-OF VEC:COUNT 0 T=
+   x CONFLICT-COUNT 0 T=
+   x rec PASSED REPLAYED-PLANNED {: replayed:n planned:n :}
+   planned 2 T= replayed 2 T=
+   x s" node" IN-ROOT str> FS:DIR? TTRUE
+   x v str> IN-ROOT LOCAL-FILE$ HOLDS-BYTES
+   x s" node" BASELINE-KIND$ s" directory" T$=
+   x v str> BASELINE-KIND$ s" present" T$=
+   x CONFLICT-COUNT 0 T=
+   TEST-DROPBOX:SEEN$
+   s" /2/files/list_folder /2/files/list_folder/continue /2/files/upload"
+   T$=
+   d x STEP-GONE ;
+
+: DROPBOX-FILE$ ( -- ^u8 n ) s" Dropbox file preserved beside directory" ;
+
+\ The first pass: Dropbox's file copied beside the local directory,
+\ then deleted there and replaced by a directory.
+: DROPBOX-FILE-COPIED ( ^run str str -- )
+   {: x rec:str v:str :}
+   x RUN-ARENA @ {: ar :}
+   x rec PASSED REPLAYED-PLANNED {: replayed:n planned:n :}
+   planned 1 T= replayed 2 T=
+   x s" node" IN-ROOT str> FS:DIR? TTRUE
+   x v str> IN-ROOT DROPBOX-FILE$ HOLDS-BYTES
+   x s" node" BASELINE-KIND$ s" directory" T$=
+   x PENDING-OF VEC:COUNT 0 T=
+   x CONFLICT-COUNT 0 T=
+   x RUN-JOURNAL @ ar JOURNAL:COMPLETED-RECOVERIES VEC:COUNT 0 T= ;
+
+\ Rust's server answers in order, so its upload of the copy gets a
+\ listing page, which does not parse, and get_metadata finds the copy.
+: COPY-UPLOAD-UNREAD ( ^ARENA:arena -- )
+   {: ar :}
+   s" dropbox file" DROPBOX-FILE$ s" " ar NODE-COPY {: low:str :}
+   s" Dropbox file" DROPBOX-FILE$ s" " ar NODE-COPY {: v:str :}
+   DROPBOX-FILE$ ar IDENTITY DROPBOX:HASH>STR str> {: h:^ hu:n :}
+   SB-RESET S\" {\qentries\q:[" SB-APPEND
+   s" /node" s" /node" FOLDER-JSON+
+   S\" ],\qcursor\q:\qremote-directory\q,\qhas_more\q:false}" SB-APPEND
+   SB$ ar COPIED {: page:str :}
+   s" /2/files/upload" 200 s" " s" " page str> TEST-DROPBOX:ROUTE-SCRIPT!
+   s" /" low str> ar JOIN-BYTES s" /" v str> ar JOIN-BYTES
+   s" rev-dropbox-copy" h hu DROPBOX-FILE$ nip TEST-DROPBOX:FILE! ;
+
+: LOCAL-DIRECTORY-PRESERVES-A-DROPBOX-FILE-UNDER-A-SYNCHRONIZED-NAME
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" local_directory_preserves_a_dropbox_file_under_a_synchronized_name"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x NODE-DIR
+   s" Dropbox file" DROPBOX-FILE$ s" " ar NODE-COPY {: v:str :}
+   s" rev-remote-file" DROPBOX-FILE$ s" remote-file" ar NODE-LISTED
+   s" remote-directory" ar NODE-FOLDER-PAGE
+   ar COPY-UPLOAD-UNREAD
+   x rec v DROPBOX-FILE-COPIED
+   x rec PASSED REPLAYED-PLANNED {: replayed:n planned:n :}
+   planned 1 T= replayed 1 T=
+   x v str> IN-ROOT DROPBOX-FILE$ HOLDS-BYTES
+   x v str> BASELINE-KIND$ s" present" T$=
+   x CONFLICT-COUNT 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/download "
+   s" /2/files/delete_v2 /2/files/create_folder_v2 " ar JOIN-BYTES
+   s" /2/files/list_folder/continue /2/files/upload " ar JOIN-BYTES
+   s" /2/files/get_metadata" ar JOIN-BYTES T$=
+   d x STEP-GONE ;
+
+: BOUND-COPY$ ( -- ^u8 n ) s" descriptor-bound Dropbox file copy" ;
+
+: DIRECTORY-COLLISION-COPY-STAYS-BOUND-TO-THE-VERIFIED-ROOT
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" directory_collision_copy_stays_bound_to_the_verified_root" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x NODE-DIR
+   d x SWAP-AT
+   s" Dropbox file" BOUND-COPY$ s" " ar NODE-COPY {: v:str :}
+   s" rev-root-swap" BOUND-COPY$ s" root-swap-directory-copy" ar
+   NODE-LISTED
+   [: SWAP-ROOT ;] TEST-DROPBOX:DURING-DOWNLOAD!
+   x rec PASSED OUTCOME-KIND$ s" root-changed" T$=
+   OLD-ROOT @ v str> ar INSIDE BOUND-COPY$ HOLDS-BYTES
+   x v str> IN-ROOT str> FS:EXISTS? TFALSE
+   CANARY @ CANARY$ HOLDS-BYTES
+   x PENDING-OF VEC:COUNT 0 T=
+   x s" node" BASELINE-KIND$ s" none" T$=
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/download" T$=
+   d x STEP-GONE ;
+
+: EXACT$ ( -- ^u8 n ) s" Dropbox bytes that must remain exact" ;
+: RACED$ ( -- ^u8 n ) s" local file created after observation" ;
+
+\ The copy's destination the race writes; it runs on the fake's task.
+TYPED-VARIABLE RACED-COPY str
+
+: RACE-COPY ( -- ) RACED-COPY @ str> RACED$ FS:WRITE-ALL ;
+
+: DIRECTORY-COLLISION-DESTINATION-RACE-REQUESTS-A-FRESH-SCAN
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" directory_collision_destination_race_requests_a_fresh_scan"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x NODE-DIR
+   s" Dropbox file" EXACT$ s" " ar NODE-COPY {: v:str :}
+   x v str> IN-ROOT RACED-COPY !
+   s" rev-destination-race" EXACT$ s" directory-copy-destination-race"
+   ar NODE-LISTED
+   [: RACE-COPY ;] TEST-DROPBOX:DURING-DOWNLOAD!
+   x rec PASSED OUTCOME-KIND$ s" fresh" T$=
+   x v str> IN-ROOT RACED$ HOLDS-BYTES
+   x s" node" IN-ROOT str> FS:DIR? TTRUE
+   x PENDING-OF VEC:COUNT 0 T=
+   x s" node" BASELINE-KIND$ s" none" T$=
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/download" T$=
+   d x STEP-GONE ;
+
+: OCCUPIED-COPY$ ( -- ^u8 n )
+   s" Dropbox bytes preserved beside an occupied stage" ;
+\ Mode 0600, read and write to its owner.
+$180 constant MODE-0600
+
+\ The first name in the newline-separated list l that starts with
+\ .omabox-download-, else its last name.
+: STAGE-NAMED ( ^u8 n -- ^u8 n )
+   {: l:^ u:n :}
+   l u 10 INDEX-OF MATCH option
+      none OF l u ENDOF
+      some OF IDX>N {: k:n :}
+         l k s" .omabox-download-" STARTS-WITH? if l k
+         else l k 1+ + u k 1+ - RECURSE then
+      ENDOF
+   ;MATCH ;
+
+\ The root's stage PRESTAGED made, beside node.
+: STAGE-AMONG ( ^run -- str )
+   {: x :}
+   x ROOT$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
+   READ-BUF u STAGE-NAMED {: s:^ su:n :}
+   s su s" .omabox-download-" STARTS-WITH? TTRUE
+   x RUN-ROOT @ s su x RUN-ARENA @ INSIDE ;
+
+\ The first variant's stage, staged with the copy's bytes, then
+\ holding other bytes; its path.
+: OCCUPIED-COPY-STAGE ( ^run str -- str )
+   {: x v:str :}
+   x ROOT$ s" open test root" LOCAL:OPEN-ROOT {: root:fd :}
+   [: root x v str> OCCUPIED-COPY$ PRESTAGED ;]
+   [: root FS:CLOSE-DIR ;] finally
+   x STAGE-AMONG {: sp:str :}
+   sp str> MODE-0600 FS:CHMOD-MODE
+   sp str> UNRELATED-STAGE$ FS:WRITE-ALL
+   sp ;
+
+: OCCUPIED-COLLISION-STAGE-USES-THE-NEXT-SYNCHRONIZED-NAME
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" occupied_collision_stage_uses_the_next_synchronized_name" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x NODE-DIR
+   s" Dropbox file" OCCUPIED-COPY$ s" " ar NODE-COPY {: first:str :}
+   s" Dropbox file" OCCUPIED-COPY$ s"  2" ar NODE-COPY {: second:str :}
+   s" rev-occupied-stage" OCCUPIED-COPY$
+   s" occupied-directory-copy-stage" ar NODE-LISTED
+   x first OCCUPIED-COPY-STAGE {: sp:str :}
+   x rec PASSED REPLAYED-PLANNED {: replayed:n planned:n :}
+   planned 1 T= replayed 2 T=
+   x first str> IN-ROOT str> FS:EXISTS? TFALSE
+   x second str> IN-ROOT OCCUPIED-COPY$ HOLDS-BYTES
+   sp UNRELATED-STAGE$ HOLDS-BYTES
+   x s" node" BASELINE-KIND$ s" directory" T$=
+   x PENDING-OF VEC:COUNT 0 T=
+   x CONFLICT-COUNT 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/download "
+   s" /2/files/delete_v2 /2/files/create_folder_v2" ar JOIN-BYTES T$=
+   d x STEP-GONE ;
+
+: OLD-FILE$ ( -- ^u8 n ) s" old Dropbox file" ;
+: NEW-FILE$ ( -- ^u8 n ) s" new Dropbox file" ;
+
+\ The first entry of the newline-separated list l in the directory r
+\ that is a file, else its last entry.
+: FILE-NAMED ( str ^u8 n ^ARENA:arena -- str )
+   {: r:str l:^ u:n ar :}
+   l u 10 INDEX-OF MATCH option
+      none OF r l u ar INSIDE ENDOF
+      some OF IDX>N {: k:n :}
+         r l k ar INSIDE {: f:str :}
+         f str> FS:FILE? if f
+         else r l k 1+ + u k 1+ - ar RECURSE then
+      ENDOF
+   ;MATCH ;
+
+: CHANGED-DROPBOX-FILE-DURING-DIRECTORY-CONVERSION-REPLANS-WITHOUT-A-CONFLICT-ROW
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" changed_dropbox_file_during_directory_conversion_replans_without_a_conflict_row"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x NODE-DIR
+   \ Dropbox's /node is at rev-new, and rev-old stays downloadable.
+   s" node" s" rev-new" NEW-FILE$ ar FILE-AT
+   s" rev-old" OLD-FILE$ s" old-file" ar NODE-LISTED
+   x rec PASSED OUTCOME-KIND$ s" fresh" T$=
+   x s" node" IN-ROOT str> FS:DIR? TTRUE
+   x ROOT$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
+   x RUN-ROOT @ READ-BUF u ar FILE-NAMED OLD-FILE$ HOLDS-BYTES
+   x PENDING-OF VEC:COUNT 0 T=
+   x CONFLICT-COUNT 0 T=
+   x s" node" BASELINE-KIND$ s" none" T$=
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/download "
+   s" /2/files/delete_v2 /2/files/get_metadata" ar JOIN-BYTES T$=
+   d x STEP-GONE ;
+
+: DIRECTORY-COLLISION-CASES ( ^ARENA:arena -- )
+   {: ar :}
+   ar REMOTE-DIRECTORY-PRESERVES-A-LOCAL-FILE-UNDER-A-SYNCHRONIZED-NAME
+   ar LOCAL-DIRECTORY-PRESERVES-A-DROPBOX-FILE-UNDER-A-SYNCHRONIZED-NAME
+   ar DIRECTORY-COLLISION-COPY-STAYS-BOUND-TO-THE-VERIFIED-ROOT
+   ar DIRECTORY-COLLISION-DESTINATION-RACE-REQUESTS-A-FRESH-SCAN
+   ar OCCUPIED-COLLISION-STAGE-USES-THE-NEXT-SYNCHRONIZED-NAME
+   ar CHANGED-DROPBOX-FILE-DURING-DIRECTORY-CONVERSION-REPLANS-WITHOUT-A-CONFLICT-ROW ;
+
 : SERVED ( ^ARENA:arena -- )
    {: ar :}
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
@@ -5280,7 +5601,8 @@ $1C0 constant OWNER-ACCESS
    [: ar REFRESH-CASES ar STEP-CASES ar PASS-CASES
       ar STALE-CASES ar DOWNLOAD-BLOCKS-CASES ar UPLOADS-CASES
       ar CONFLICTS-CASES ar RESTRICTED-CASES
-      ar EDITS-AND-DIRECTORIES-CASES ar CASE-COLLISION-PASS-CASES ;]
+      ar EDITS-AND-DIRECTORIES-CASES ar CASE-COLLISION-PASS-CASES
+      ar DIRECTORY-COLLISION-CASES ;]
    [: MAIN @ DROPBOX:CLOSE ;]
    finally ;
 
