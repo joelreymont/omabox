@@ -52,11 +52,13 @@
 \   the log captured in a file there
 \ - settings_show_a_root_of_any_length, Omabox's own: Rust's fixture
 \   with config.toml naming a root of over 1024 bytes that is made nowhere
+\ - an_unexpected_code_is_logged, Omabox's own: UNEXPECTED of a Habu
+\   library code and of an OMABOX code, its log in a file under TMPDIR
 \ and the program built with README's command into a directory under
 \ TMPDIR, whose --version prints its name and version and exits 0.
 \ White-box: OMABOX is reopened for PARSE, HOME-ROOT, COMPLETE-SETUP,
 \ READ-CODE, RUN-SERVICE, STATUS-TEXT, SETTINGS-TEXT, RESTORE-GOAL,
-\ RELEASED and SET-ROOT.
+\ RELEASED, SET-ROOT and UNEXPECTED.
 \ Run from the repository root: hb --load src/omabox-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -1486,6 +1488,35 @@ variable CHANGES
    s" active" ar SET-ROOT-START-FAILS ;
 
 
+\ ---- an unexpected code
+
+\ The log UNEXPECTED of the code wrote, captured in DIR/stderr.txt.
+: UNEXPECTED-LOG ( n str ^ARENA:arena -- ^u8 n )
+   {: code:n d ar :}
+   d s" stderr.txt" ar INSIDE {: p :}
+   [: code UNEXPECTED ;] p str> ar STDERR:CAPTURING
+   {: rc:n e:^ eu:n :}
+   rc 0 T=
+   e eu ;
+
+\ "the command failed unexpectedly (", LOG:CODE+ of E-FS-IO, ")".
+: UNEXPECTED-LINE ( ^ARENA:arena -- str )
+   {: ar :}
+   s" the command failed unexpectedly (" ar KEPT
+   E-FS-IO FMT:INT$ ar FOLLOWED s"  E-FS-IO: " ar FOLLOWED
+   E-FS-IO ERROR:TEXT$ ar FOLLOWED s" )" ar FOLLOWED ;
+
+: AN-UNEXPECTED-CODE-IS-LOGGED ( ^ARENA:arena -- )
+   {: ar :}
+   s" an_unexpected_code_is_logged" T-LABEL
+   ar TEMPORARY {: d :}
+   E-FS-IO d ar UNEXPECTED-LOG {: e:^ eu:n :}
+   e eu LINES 1 T=
+   e eu ar UNEXPECTED-LINE str> LOGGED? TTRUE
+   E-USAGE d ar UNEXPECTED-LOG nip 0 T=
+   d str> FS:REMOVE-TREE ;
+
+
 \ ---- the built program
 
 : BUILD-ARGS ( str -- )
@@ -1568,6 +1599,7 @@ variable CHANGES
    ar SETUP-REPORTS-A-HELD-LOCK-AND-RESTORES-THE-SERVICE
    ar A-FAILED-CHANGE-AND-RESTORE-RENDER-BOTH
    ar SETUP-RELEASES-THE-LOCK-BEFORE-STARTING-A-FAILED-SERVICE
+   ar AN-UNEXPECTED-CODE-IS-LOGGED
    ar PROGRAM ;
 
 : RUN-SUITE ( -- )

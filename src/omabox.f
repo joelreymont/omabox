@@ -267,9 +267,8 @@ ARENA JOURNALS JOURNAL:journal
    s" Stop any manually started Omabox daemon, then retry." HELP
    E-LOCK cause FAIL ;
 
-\ Rust's Journal for the operation, in place of the code it caught, after
-\ the lines its cause logged: JOURNAL's, SQLITE's or the file system's,
-\ all Rust's JournalError.
+\ Rust's Journal for the operation, in place of the code caught,
+\ after the lines its cause logged.
 : JOURNAL-FAILED ( n ^u8 n -- )
    {: op:^ opu:n :} drop
    FS:ERRNO {: cause:n :}
@@ -645,11 +644,11 @@ ARENA JOURNALS JOURNAL:journal
    s" dropbox_app_key" d CONFIG:DOCUMENT-KEY str> JSON:WRITE-FIELD-S
    JSON:WRITE-OBJECT-END drop ;
 
-\ serde_json's to_string_pretty of the document, then LF, in a buffer
-\ every byte escaped to six fits; text that is not UTF-8 is Rust's
-\ SerializeOutput.
+\ serde_json's to_string_pretty of the document, then LF; text that
+\ is not UTF-8 is Rust's SerializeOutput.
 : SETTINGS-JSON ( ^CONFIG:document ^ARENA:arena -- str )
    {: d ar :}
+   \ Every byte escaped to six fits.
    d CONFIG:DOCUMENT-ROOT CONFIG:ABS-PATH>STR str> nip
    d CONFIG:DOCUMENT-KEY str> nip + 6 * 64 + {: cap:n :}
    ar cap 1+ ARENA:ALLOC drop {: buf:^ :}
@@ -738,9 +737,8 @@ ARENA JOURNALS JOURNAL:journal
    c launched d du ar RECOVERED {: recovered:bool :}
    d du recovered left ar DONE-OUT ;
 
-\ Rust's change_while_released: releases a unit that can hold the
-\ instance lock, runs the change, the name n's, and restores what the
-\ release changed; the done text d states the finished change.
+\ Rust's change_while_released: releases the unit, runs the change
+\ named n, restores the unit; d states the finished change.
 : RELEASED ( ^SERVICE:commands ^u8 n ^u8 n
      [ ^ARENA:arena -- ^VEC:vector<STALE:leftover> ] ^ARENA:arena -- )
    {: c n:^ nu:n d:^ du:n change ar :}
@@ -761,14 +759,20 @@ ARENA JOURNALS JOURNAL:journal
    code E-FFI-NUL = if 0 exit then
    code throw ;
 
-\ Rust's refuse_existing_config: Path::try_exists is false only where
-\ stat answers ENOENT.
+\ Rust's Path::try_exists of p: false only where stat answers ENOENT;
+\ fail, which throws, takes the errno of any other failure.
+: EXISTS? ( str [ n -- ] -- bool )
+   {: p fail :}
+   false [: drop p str> FS:TRY-STAT ;] catch {: there code:n :}
+   code 0<> if code STAT-CAUSE fail execute code throw then
+   there if true exit then
+   FS:ERRNO FS:ENOENT <> if FS:ERRNO fail execute then
+   false ;
+
+\ Rust's refuse_existing_config.
 : REFUSE-EXISTING ( CONFIG:abs-path -- )
-   CONFIG:ABS-PATH>STR {: p :}
-   false [: drop p str> FS:TRY-STAT ;] catch {: code:n :}
-   code 0<> if code STAT-CAUSE INSPECT-FAILED then
-   if CONFIG-EXISTS then
-   FS:ERRNO FS:ENOENT <> if FS:ERRNO INSPECT-FAILED then ;
+   CONFIG:ABS-PATH>STR [: INSPECT-FAILED ;] EXISTS?
+   if CONFIG-EXISTS then ;
 
 \ Rust's Path::is_absolute.
 : ABSOLUTE? ( str -- bool )
@@ -911,15 +915,6 @@ ARENA JOURNALS JOURNAL:journal
    code 0<> if code SYNC-ROOT-FAILED then
    slot @ ;
 
-\ Whether the journal file exists: Path::try_exists is false only where
-\ stat answers ENOENT.
-: JOURNAL-THERE? ( str -- bool )
-   {: p :}
-   false [: drop p str> FS:TRY-STAT ;] catch {: code:n :}
-   code 0<> if code STAT-CAUSE INSPECT-JOURNAL-FAILED then
-   dup if exit then
-   FS:ERRNO FS:ENOENT <> if FS:ERRNO INSPECT-JOURNAL-FAILED then ;
-
 \ Rust's Journal::open of the file p, failing as Journal for the
 \ operation.
 : JOURNAL-OPENED ( str ^u8 n ^ARENA:arena -- JOURNAL:journal )
@@ -953,15 +948,15 @@ ARENA JOURNALS JOURNAL:journal
    {: p r ar :}
    r ar ROOT-BINDING {: b :}
    p CONFIG:JOURNAL-FILE CONFIG:ABS-PATH>STR {: jp :}
-   jp JOURNAL-THERE? 0= if r ar ROOT-WRITTEN exit then
+   jp [: INSPECT-JOURNAL-FAILED ;] EXISTS? 0= if
+      r ar ROOT-WRITTEN exit
+   then
    jp s" open the sync journal before changing the sync root" ar
    JOURNAL-OPENED {: j :}
    [: j b r ar ADOPTED ;] [: j JOURNAL:CLOSE ;] finally ;
 
-\ Rust's change_sync_root_while_stopped: under the daemon lock, the
-\ replacement r's root inspected, the config written, then the journal,
-\ where there is one, adopts the root; the lock is released on every
-\ path out.
+\ Rust's change_sync_root_while_stopped under the daemon lock, which
+\ is released on every path out.
 : CHANGE-ROOT ( ^CONFIG:paths ^CONFIG:config ^ARENA:arena
      -- ^VEC:vector<STALE:leftover> )
    {: p r ar :}
@@ -1011,9 +1006,8 @@ ARENA JOURNALS JOURNAL:journal
    S\" Open this URL in a browser:\n" ar KEPT p AUTH:URL ar FOLLOWED
    S\" \n\nPaste the authorization code: " ar FOLLOWED str> WRITE-OUT ;
 
-\ A client for the app key k: Dropbox's origins, no token yet, the
-\ account's own root, and a store that keeps nothing, as the client
-\ holds a rotated refresh token itself.
+\ A client for the app key k on Dropbox's origins: no token yet, the
+\ account's own root, and a store that keeps nothing.
 : CLIENT ( str ^ARENA:arena -- ^DROPBOX:client )
    {: k ar :}
    ar CLIENT-CONFIGS-NEW {: cfg :}
@@ -1059,18 +1053,16 @@ ARENA JOURNALS JOURNAL:journal
    code DROPBOX-CODE? 0= if code throw then
    VALIDATE-FAILED ;
 
-\ The client's binding for the remote root r and its refresh token,
-\ copied into a, as CLOSE discards the client's.
+\ The client's binding for the remote root r and its refresh token
+\ in a; the token is copied, as CLOSE discards the client's.
 : KEEP-LOGIN ( str ^DROPBOX:client ^authorized ^ARENA:arena -- )
    {: r cl a ar :}
-   cl DROPBOX:ACCOUNT-ID ar KEPT
-   cl DROPBOX:ROOT-NAMESPACE ar KEPT
+   cl DROPBOX:ACCOUNT-ID >str cl DROPBOX:ROOT-NAMESPACE >str
    r JOURNAL-DROPBOX--BINDING:MAKE a AUTHORIZED-BINDING !
    cl DROPBOX:REFRESH-TOKEN ar KEPT a AUTHORIZED-REFRESH-TOKEN ! ;
 
-\ The code ac exchanged for the login p and checked against the remote
-\ root r on a client for the config c, kept in a; the client is closed
-\ on every path out.
+\ The code ac exchanged for the login p and checked against the root
+\ r, kept in a; the client is closed on every path out.
 : LINK-LOGIN ( ^CONFIG:config str ^AUTH:pending str ^authorized
      ^ARENA:arena -- )
    {: c ac p r a ar :}
@@ -1079,12 +1071,10 @@ ARENA JOURNALS JOURNAL:journal
       r cl ar LINKED
       r cl a ar KEEP-LOGIN ;] [: cl DROPBOX:CLOSE ;] finally ;
 
-\ Rust's authorize: a browser login for the config c's app key, its
-\ code read from stdin, exchanged and checked against the remote root
-\ r; answers the login, kept in ar.
+\ Rust's authorize: a browser login whose code, read from stdin, is
+\ exchanged and checked against the remote root r.
 : AUTHORIZE ( ^CONFIG:config str ^ARENA:arena -- ^authorized )
    {: c r ar :}
-   AUTH:BIND
    c CONFIG:APP-KEY ar STARTED {: p :}
    p ar PROMPT
    FD:STDIN ar READ-CODE {: ac :}
@@ -1153,9 +1143,8 @@ ARENA PRIORS prior
       none OF a TOKEN-STORED j b ar ROOT-BOUND ENDOF
    ;MATCH ;
 
-\ Rust's bind: the login a's refresh token stored and the config c's
-\ journal bound to its account and root, refusing a journal bound to
-\ another; the journal is closed on every path out.
+\ Rust's bind: the login a's token stored and the journal bound to
+\ its account and root; the journal is closed on every path out.
 : BIND ( ^CONFIG:config ^authorized ^ARENA:arena -- )
    {: c a ar :}
    c CONFIG:PATHS CONFIG:JOURNAL-FILE CONFIG:ABS-PATH>STR
@@ -1210,6 +1199,7 @@ ARENA PRIORS prior
 \ the browser; the bind and the config's write run with it released.
 : SETUP ( setup-options ^SERVICE:commands ^ARENA:arena -- )
    {: o s ar :}
+   AUTH:BIND
    o SETUP-OPTIONS-UNMAKE {: r i :}
    i ar SETUP-CONFIG {: c w:bool :}
    c STATE-PREPARED
@@ -1256,10 +1246,18 @@ ARENA PRIORS prior
    SCRIPT-ARGC [: SCRIPT-ARGV$ ;] PARSE {: cmd :}
    [: cmd swap PERFORM ;] ARENA:WITH ;
 
+\ A code outside the application block -999999..-100000, which no
+\ omabox word logged, on a line of its own.
+: UNEXPECTED ( n -- )
+   {: code:n :}
+   code -100000 -999999 IN? if exit then
+   LOG-OPEN s" the command failed unexpectedly (" LOG:TEXT+
+   code LOG:CODE+ s" )" LOG:TEXT+ LOG:;LINE ;
+
 global
 
 : MAIN ( -- )
    [: RUN ;] catch {: code:n :}
-   code 0<> if s" " 1 die then ;
+   code 0<> if code UNEXPECTED s" " 1 die then ;
 
 ;package
