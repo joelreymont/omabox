@@ -62,6 +62,7 @@ public
 ENUM error DERIVE eq
    not-found not-file not-folder malformed-path disallowed-name
    conflict no-write-permission restricted-content
+   access-restricted team-folder operation-suppressed
    insufficient-space locked reset invalid-root
    content-hash-mismatch unsupported-file path-mismatch unverified
    other ;ENUM
@@ -90,8 +91,8 @@ DEFTYPE CURSOR str
    {: a:hash b:hash :}
    a HASH>STR str> b HASH>STR str> STR= ;
 
-\ rev, content-hash and size are a file's alone, empty and 0 for a
-\ folder; lower and display are path_lower and path_display.
+\ rev, content-hash, size and downloadable are a file's alone: empty, 0 and
+\ true for any other kind; lower and display are path_lower and path_display.
 STRUCTURE entry DERIVE addr
    FIELD kind kind
    FIELD lower SPAN:span<u8>
@@ -99,6 +100,7 @@ STRUCTURE entry DERIVE addr
    FIELD rev SPAN:span<u8>
    FIELD content-hash SPAN:span<u8>
    FIELD size n
+   FIELD downloadable bool
 ;STRUCTURE
 
 \ What OPEN copies: key is the app key, Dropbox's client_id; token the
@@ -555,6 +557,12 @@ ENUM verdict
    JSON:READ-INT ;
 
 
+: BOOLEAN ( JSON:reader -- JSON:reader bool )
+   VALUE dup JSON:T-TRUE = if drop true exit then
+   JSON:T-FALSE <> if E-ANSWER throw then
+   false ;
+
+
 \ The members of the object just opened, each read by `member` at its key.
 : MEMBERS ( JSON:reader ^client [ JSON:reader ^client -- JSON:reader ] -- JSON:reader )
    {: c member :}
@@ -652,6 +660,9 @@ ENUM verdict
    2dup s" conflict" STR= if 2drop construct error conflict true exit then
    2dup s" no_write_permission" STR= if 2drop construct error no-write-permission true exit then
    2dup s" restricted_content" STR= if 2drop construct error restricted-content true exit then
+   2dup s" access_restricted" STR= if 2drop construct error access-restricted true exit then
+   2dup s" team_folder" STR= if 2drop construct error team-folder true exit then
+   2dup s" operation_suppressed" STR= if 2drop construct error operation-suppressed true exit then
    2dup s" insufficient_space" STR= if 2drop construct error insufficient-space true exit then
    2dup s" locked" STR= if 2drop construct error locked true exit then
    2dup s" reset" STR= if 2drop construct error reset true exit then
@@ -1039,19 +1050,19 @@ ENUM verdict
    construct kind deleted e DROPBOX-ENTRY:KIND !
    EMPTY e DROPBOX-ENTRY:LOWER ! EMPTY e DROPBOX-ENTRY:DISPLAY !
    EMPTY e DROPBOX-ENTRY:REV ! EMPTY e DROPBOX-ENTRY:CONTENT-HASH !
-   0 e DROPBOX-ENTRY:SIZE ! ;
+   0 e DROPBOX-ENTRY:SIZE ! true e DROPBOX-ENTRY:DOWNLOADABLE ! ;
 
 
 : FILE? ( ^entry -- bool )
    DROPBOX-ENTRY:KIND @ construct kind file DROPBOX-KIND:EQ ;
 
 
-\ Whether the entry holds what its kind needs: both paths, and for a file
-\ its rev and hash.
+\ Whether the entry holds what its kind needs: both paths, and for a
+\ downloadable file its rev and hash.
 : WHOLE? ( ^entry -- bool )
    {: e :}
    e DROPBOX-ENTRY:LOWER @ SPAN:LEN 0<> e DROPBOX-ENTRY:DISPLAY @ SPAN:LEN 0<> and
-   e FILE? 0= if exit then
+   e FILE? e DROPBOX-ENTRY:DOWNLOADABLE @ and 0= if exit then
    e DROPBOX-ENTRY:REV @ SPAN:LEN 0<> and
    e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:LEN 0<> and ;
 
@@ -1060,6 +1071,14 @@ ENUM verdict
 \ FolderMetadata takes its kind from the route and skips a `.tag` as any
 \ member it does not know, as the SDK does; a Metadata union takes its kind
 \ from its `.tag`.
+
+\ is_downloadable into the entry; a symlink_info read before it keeps
+\ it false.
+: DOWNLOADABLE ( JSON:reader ^entry -- JSON:reader )
+   {: e :}
+   BOOLEAN e DROPBOX-ENTRY:DOWNLOADABLE @ and
+   e DROPBOX-ENTRY:DOWNLOADABLE ! ;
+
 
 \ The members both shapes hold.
 : FIELD-MEMBER ( JSON:reader ^client -- JSON:reader )
@@ -1070,6 +1089,8 @@ ENUM verdict
    s" rev" JSON:READ-STR-EQ? if c STRING e DROPBOX-ENTRY:REV ! exit then
    s" content_hash" JSON:READ-STR-EQ? if c STRING e DROPBOX-ENTRY:CONTENT-HASH ! exit then
    s" size" JSON:READ-STR-EQ? if INT e DROPBOX-ENTRY:SIZE ! exit then
+   s" is_downloadable" JSON:READ-STR-EQ? if e DOWNLOADABLE exit then
+   s" symlink_info" JSON:READ-STR-EQ? if SKIP false e DROPBOX-ENTRY:DOWNLOADABLE ! exit then
    SKIP ;
 
 
@@ -1126,6 +1147,20 @@ ENUM verdict
 \ Dropbox-API-Result: a plain FileMetadata.
 : FILE-READ ( ^client -- )
    construct kind file [: FIELD-MEMBER ;] ENTRY-PARSE ;
+
+
+\ Whether the entry's path_lower is the path's full lowercase.
+: AT? ( ^u8 n ^client -- bool )
+   CLIENT-ENTRY DROPBOX-ENTRY:LOWER @ SPAN:$ UNICODE:LOWERS-TO? ;
+
+
+\ done stands for an entry at the path; one elsewhere is refused
+\ path-mismatch.
+: PLACED ( reply ^u8 n ^client -- reply )
+   {: m:reply p:^ pu:n c :}
+   m DONE? 0= if m exit then
+   p pu c AT? if m exit then
+   construct error path-mismatch construct reply refused ;
 
 
 \ ---- files/download
@@ -1652,7 +1687,7 @@ public
    s" path" p pu JSON:WRITE-FIELD-S
    JSON:WRITE-OBJECT-END JSON:WRITE-CLOSE
    c s" files/get_metadata" [: JSON-BODY ;] CALL
-   c [: ENTRY-READ ;] ANSWERED ;
+   c [: ENTRY-READ ;] ANSWERED p pu c PLACED ;
 
 
 : ENTRY ( ^client -- ^entry ) CLIENT-ENTRY ;
@@ -1679,12 +1714,6 @@ private
 : GOT ( ^client n -- )
    {: c bit:n :}
    c CLIENT-GOT @ bit or c CLIENT-GOT ! ;
-
-
-: BOOLEAN ( JSON:reader -- JSON:reader bool )
-   VALUE dup JSON:T-TRUE = if drop true exit then
-   JSON:T-FALSE <> if E-ANSWER throw then
-   false ;
 
 
 \ Each object of the array that opens next, read by `entry` once opened.
@@ -1896,11 +1925,6 @@ private
    VALUE OBJECT c construct kind folder PLAIN-OBJECT ;
 
 
-\ Whether the entry's path_lower is the path's full lowercase.
-: AT? ( ^u8 n ^client -- bool )
-   CLIENT-ENTRY DROPBOX-ENTRY:LOWER @ SPAN:$ UNICODE:LOWERS-TO? ;
-
-
 \ Each reads the answer's entry and answers whether it is at the path;
 \ DELETED-READ, given a rev, also whether it is a file at that rev.
 : DELETED-READ ( ^u8 n ^u8 n ^client -- bool )
@@ -1916,16 +1940,6 @@ private
    {: p:^ pu:n c :}
    c construct kind deleted [: MADE-MEMBER ;] ENTRY-PARSE
    p pu c AT? ;
-
-
-\ A confirmation's get_metadata of the path: an entry at another path is
-\ refused path-mismatch.
-: CONFIRMED ( ^u8 n ^client -- reply )
-   {: p:^ pu:n c :}
-   p pu c METADATA {: m:reply :}
-   m DONE? 0= if m exit then
-   p pu c AT? if m exit then
-   construct error path-mismatch construct reply refused ;
 
 
 : MISMATCH? ( reply -- bool )
@@ -1997,7 +2011,7 @@ private
 \ A lost delete took effect only if the path is now not found.
 : GONE ( ^u8 n ^client -- reply )
    {: p:^ pu:n c :}
-   p pu c CONFIRMED {: r:reply :}
+   p pu c METADATA {: r:reply :}
    r NOT-FOUND? if c ABSENT exit then
    r UNCONFIRMED ;
 
@@ -2008,7 +2022,7 @@ private
    {: e:error p:^ pu:n c :}
    e construct error not-found DROPBOX-ERROR:EQ if c ABSENT exit then
    e construct error conflict DROPBOX-ERROR:EQ if
-      p pu c CONFIRMED {: m:reply :}
+      p pu c METADATA {: m:reply :}
       m NOT-FOUND? if c ABSENT exit then
       m STANDS? if m exit then
    then
@@ -2018,7 +2032,7 @@ private
 \ A lost create-folder took effect only if the path is now a folder.
 : MADE ( ^u8 n ^client -- reply )
    {: p:^ pu:n c :}
-   p pu c CONFIRMED {: r:reply :}
+   p pu c METADATA {: r:reply :}
    r DONE? c CLIENT-ENTRY FOLDER? and if r exit then
    r UNCONFIRMED ;
 
@@ -2028,7 +2042,7 @@ private
 : FOLDER-REFUSED ( error ^u8 n ^client -- reply )
    {: e:error p:^ pu:n c :}
    e construct error conflict DROPBOX-ERROR:EQ if
-      p pu c CONFIRMED {: m:reply :}
+      p pu c METADATA {: m:reply :}
       m DONE? c CLIENT-ENTRY FOLDER? and
       if construct reply done exit then
       m STANDS? if m exit then
@@ -2632,7 +2646,7 @@ ENUM restart-event once twice ;ENUM
    {: r :}
    r RUN-CLIENT @ {: c :}
    r RUN-UP @ {: up :}
-   up DROPBOX-UPLOAD:PATH @ SPAN:$ c CONFIRMED {: m:reply :}
+   up DROPBOX-UPLOAD:PATH @ SPAN:$ c METADATA {: m:reply :}
    m UNLINKED? if construct confirm-event unlinked exit then
    m MISMATCH? if construct confirm-event elsewhere exit then
    m RETRY? if m r RUN-LAST ! construct confirm-event wait exit then

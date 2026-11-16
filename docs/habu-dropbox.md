@@ -15,6 +15,7 @@ cursor and upload session. The signatures below are not checked yet.
 ENUM error
    not-found not-file not-folder malformed-path disallowed-name
    conflict no-write-permission restricted-content
+   access-restricted team-folder operation-suppressed
    insufficient-space locked reset invalid-root
    content-hash-mismatch unsupported-file path-mismatch unverified
    other ;ENUM
@@ -85,6 +86,7 @@ ENUM reply
 \ create_folder_v2; each answers the entry Dropbox reports, but a
 \ download a 416 completes; READ-BODY reads a download's body
 : METADATA      ( ^u8 n ^client -- reply )  \ path
+                \ an entry at another path: refused path-mismatch
 : DOWNLOAD      ( ^u8 n n ^client [ n n ^fetch -- ] -- reply )
                 \ rev, offset; the body: its offset, the size, the fetch
 : READ-BODY     ( ^u8 n ^fetch -- n )       \ bytes read, 0 at the end
@@ -102,6 +104,8 @@ STRUCTURE entry
    FIELD rev ...           \ files only
    FIELD content-hash ...  \ files only
    FIELD size n            \ files only
+   FIELD downloadable bool \ is_downloadable, false with symlink_info;
+                           \ true for a folder or deleted entry
 ;STRUCTURE
 
 STRUCTURE upload

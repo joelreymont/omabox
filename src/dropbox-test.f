@@ -1,8 +1,11 @@
 \ dropbox-test.f - DROPBOX's client core against the fake Dropbox of
-\ test-dropbox.f on a loopback port: the account, metadata, the Path-Root
-\ header, the token's refresh, its rotation and the store that keeps it, a
-\ rejected grant, a revoked token, access denied, rate limits, outages, a
-\ redirect, a malformed request, the listing, the long poll, downloads,
+\ test-dropbox.f on a loopback port: the account, metadata (of a file that
+\ is not downloadable, of a symlink and of an entry at another path among
+\ them), the Path-Root header, the token's refresh, its rotation and the
+\ store that keeps it, a rejected grant, a revoked token, access denied,
+\ rate limits, outages, a redirect, a malformed request, a write refused
+\ access_restricted, team_folder or operation_suppressed, the listing (one
+\ holding a file that is not downloadable among them), the long poll, downloads,
 \ whose body reads through READ-BODY (whole, resumed, a 416 at the end, a
 \ body that throws before or after its end, one left unread while the
 \ server holds the rest, one in two chunks read 7 or 64 bytes a read, one
@@ -298,6 +301,7 @@ variable REFUSALS
    e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$
    s" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" T$=
    e DROPBOX-ENTRY:SIZE @ 12 T=
+   e DROPBOX-ENTRY:DOWNLOADABLE @ TTRUE
    TEST-DROPBOX:SEEN$ s" /2/files/get_metadata" T$=
    TEST-DROPBOX:TYPE-SENT$ s" application/json" T$= ;
 
@@ -328,6 +332,44 @@ variable REFUSALS
    TEST-DROPBOX:RESET
    TEST-DROPBOX:CUT
    s" /docs/a.txt" MAIN @ DROPBOX:METADATA RETRY-MS 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/get_metadata" T$= ;
+
+
+\ get_metadata answers /paper with the body; the entry is a file that is
+\ not downloadable.
+: UNDOWNLOADABLE ( ^u8 n -- )
+   {: b:^ bu:n :}
+   TEST-DROPBOX:RESET
+   200 s" " s" " b bu TEST-DROPBOX:SCRIPT!
+   s" /paper" MAIN @ DROPBOX:METADATA DONE? ASSERT
+   MAIN @ DROPBOX:ENTRY {: e :}
+   e DROPBOX-ENTRY:KIND @ DROPBOX-KIND:file DROPBOX-KIND:EQ TTRUE
+   e DROPBOX-ENTRY:LOWER @ SPAN:$ s" /paper" T$=
+   e DROPBOX-ENTRY:DOWNLOADABLE @ TFALSE ;
+
+
+\ A file that is not downloadable needs no content hash.
+: UNDOWNLOADABLE-CASE ( -- )
+   s" metadata of a file that is not downloadable" T-LABEL
+   S\" {\q.tag\q:\qfile\q,\qname\q:\qPaper\q,\qid\q:\qid:p\q,\qpath_lower\q:\q/paper\q,\qpath_display\q:\q/Paper\q,\qrev\q:\q015f0c1d2e3c\q,\qsize\q:0,\qis_downloadable\q:false}"
+   UNDOWNLOADABLE ;
+
+
+\ symlink_info read before is_downloadable true still marks the file.
+: SYMLINK-CASE ( -- )
+   s" metadata of a symlink" T-LABEL
+   S\" {\q.tag\q:\qfile\q,\qname\q:\qPaper\q,\qid\q:\qid:p\q,\qpath_lower\q:\q/paper\q,\qpath_display\q:\q/Paper\q,\qrev\q:\q015f0c1d2e3d\q,\qsize\q:0,\qsymlink_info\q:{\qtarget\q:\q/docs\q},\qis_downloadable\q:true}"
+   UNDOWNLOADABLE ;
+
+
+: METADATA-ELSEWHERE-CASE ( -- )
+   s" metadata of an entry at another path" T-LABEL
+   TEST-DROPBOX:RESET
+   200 s" " s" "
+   S\" {\q.tag\q:\qfolder\q,\qname\q:\qb\q,\qid\q:\qid:b\q,\qpath_lower\q:\q/docs/b\q,\qpath_display\q:\q/Docs/b\q}"
+   TEST-DROPBOX:SCRIPT!
+   s" /docs/a" MAIN @ DROPBOX:METADATA
+   DROPBOX-ERROR:path-mismatch REFUSED? ASSERT
    TEST-DROPBOX:SEEN$ s" /2/files/get_metadata" T$= ;
 
 
@@ -633,6 +675,25 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2" T$= ;
 
 
+\ A delete refused 409 with the WriteError tag answers refused with e.
+: WRITE-REFUSED ( ^u8 n DROPBOX:error -- )
+   {: t:^ tu:n e:DROPBOX:error :}
+   TEST-DROPBOX:RESET
+   SB-RESET S\" {\qerror_summary\q:\qpath_write/" SB-APPEND t tu SB-APPEND
+   S\" /\q,\qerror\q:{\q.tag\q:\qpath_write\q,\qpath_write\q:{\q.tag\q:\q"
+   SB-APPEND t tu SB-APPEND S\" \q}}}" SB-APPEND
+   409 s" " s" " SB$ TEST-DROPBOX:SCRIPT!
+   s" /held.txt" s" " MAIN @ DROPBOX:DELETE e REFUSED? ASSERT
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2" T$= ;
+
+
+: WRITE-TAGS-CASE ( -- )
+   s" write refused by tag" T-LABEL
+   s" access_restricted" DROPBOX-ERROR:access-restricted WRITE-REFUSED
+   s" team_folder" DROPBOX-ERROR:team-folder WRITE-REFUSED
+   s" operation_suppressed" DROPBOX-ERROR:operation-suppressed WRITE-REFUSED ;
+
+
 : METADATA-OTHER ( -- )
    s" /docs/a.txt" MAIN @ DROPBOX:METADATA
    DROPBOX-ERROR:other REFUSED? OUTCOME ! ;
@@ -709,7 +770,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
 
 
 : CLASSIFY-CASES ( -- )
-   WRITE-BUSY-CASE UNKNOWN-TAG-CASE UNPARSED-ERROR-CASE WRONG-ROOT-CASE
+   WRITE-BUSY-CASE WRITE-TAGS-CASE UNKNOWN-TAG-CASE UNPARSED-ERROR-CASE WRONG-ROOT-CASE
    TIMEOUT-CASE TEAPOT-CASE UNPARSED-ANSWER-CASE GARBLED-CASE ;
 
 
@@ -820,6 +881,24 @@ variable GOT-U
    [: UNTAGGED-LISTED ;] DROPBOX:E-ANSWER TTHROWSQ
    GOT$ s" " T$=
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$= ;
+
+
+\ As SAW, each entry marked + if downloadable, else -.
+: SAW-DOWNLOADABLE ( ^DROPBOX:entry -- )
+   {: e :}
+   e SAW
+   e DROPBOX-ENTRY:DOWNLOADABLE @ if s" +" else s" -" then GOT+ ;
+
+
+\ A file that is not downloadable has no content hash; one with no
+\ is_downloadable is downloadable.
+: UNDOWNLOADABLE-LISTED-CASE ( -- )
+   s" listing a file that is not downloadable" T-LABEL
+   LISTING
+   S\" [{\q.tag\q:\qfile\q,\qpath_lower\q:\q/sync/paper\q,\qpath_display\q:\q/Sync/Paper\q,\qrev\q:\q015e\q,\qsize\q:0,\qis_downloadable\q:false},{\q.tag\q:\qfile\q,\qpath_lower\q:\q/sync/a.txt\q,\qpath_display\q:\q/Sync/A.txt\q,\qrev\q:\q015f\q,\qsize\q:3,\qcontent_hash\q:\qabc\q}]"
+   s" p1" false TEST-DROPBOX:PAGE!
+   s" /sync" MAIN @ [: SAW-DOWNLOADABLE ;] DROPBOX:LIST DONE? ASSERT
+   GOT$ s" f/sync/paper- f/sync/a.txt+" T$= ;
 
 
 : WAITED ( bool n -- )
@@ -2200,14 +2279,16 @@ TYPED-VARIABLE FAULT fault
    s" ns-root" TEST-DROPBOX:ROOT!
    s" live-token" s" ns-root" OPENED MAIN !
    ACCOUNT-CASE FILE-CASE BUILT-PATH-CASE MISSING-CASE ROOT-CASE
-   LOST-READ-CASE EXPIRED-CASE
+   LOST-READ-CASE UNDOWNLOADABLE-CASE SYMLINK-CASE METADATA-ELSEWHERE-CASE
+   EXPIRED-CASE
    REJECTED-GRANT-CASE REVOKED-CASE DENIED-CASE
    STORED-FIRST-CASE UNSTORED-CASE UNROTATED-CASE SCRIPTED-REFRESH-CASE
    RATE-CASE RATE-BODY-CASE RATE-DATE-CASE RATE-CAP-CASE
    RATE-ZEROS-CASE RATE-HUGE-CASE
    BUSY-CASE REDIRECT-CASE BAD-REQUEST-CASE
    CLASSIFY-CASES
-   PAGES-CASE RESET-CASE STALL-CASE UNTAGGED-CASE POLL-CASE POLL-RESET-CASE
+   PAGES-CASE RESET-CASE STALL-CASE UNTAGGED-CASE UNDOWNLOADABLE-LISTED-CASE
+   POLL-CASE POLL-RESET-CASE
    DOWNLOAD-CASES
    DELETE-CONFLICT-CASE DELETE-MISSING-CASE DELETE-GONE-CASE
    LOST-DELETE-CASE CUT-DELETE-CASE DELETE-ELSEWHERE-CASE
