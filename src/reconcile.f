@@ -875,7 +875,7 @@ STRUCTURE case-variant-move
    false ;
 
 \ The run from `from`, and whether two spellings collide in it.
-: RUN-AT ( ^VEC:vector<spelling> n -- n n bool )
+: SPELLING-RUN-AT ( ^VEC:vector<spelling> n -- n n bool )
    {: v from :}
    v from SPELLING-RUN-END {: to :}
    from to
@@ -887,7 +887,7 @@ STRUCTURE case-variant-move
 : FIRST-COLLISION ( ^VEC:vector<spelling> -- n n )
    {: v :}
    0 begin dup v VEC:COUNT < while
-      v swap RUN-AT if exit then nip
+      v swap SPELLING-RUN-AT if exit then nip
    repeat
    dup ;
 
@@ -2077,6 +2077,18 @@ FSM:DEFINE INVENTORY-PUBLICATION ( ^refresh ) listing-state listing-event
 
 \ ---- prepare words -------------------------------------------------
 
+\ The pass's context; a prepare word reads what it needs.
+STRUCTURE run DERIVE addr
+   FIELD journal JOURNAL:journal
+   FIELD link ^REPLAY:link
+   FIELD root str
+   FIELD staging str
+   FIELD arena ^ARENA:arena
+;STRUCTURE
+
+: ROOT$ ( ^run -- ^u8 n ) RUN-ROOT @ str> ;
+: STAGING$ ( ^run -- ^u8 n ) RUN-STAGING @ str> ;
+
 \ Rust's Prepared<StagedUpload>; occupied is its
 \ StageDestinationOccupied error, which every caller acts on at once.
 ENUM prepared-upload
@@ -2101,26 +2113,26 @@ ENUM prepared ready fresh ;ENUM
 \ LOCAL:STAGE-UPLOAD of path's content c, and the code it threw,
 \ else 0.
 : STAGE-LOCAL
-   ( str str MODEL:path DROPBOX:hash ^ARENA:arena
+   ( ^run MODEL:path DROPBOX:hash
      -- LOCAL:stage-outcome<^LOCAL:staged-upload> n )
-   {: root:str staging:str path c ar :}
-   NO-STAGE [: DROP-STAGE root str> path PATH$ staging str> c ar
-      LOCAL:STAGE-UPLOAD ;]
+   {: r path c :}
+   NO-STAGE [: DROP-STAGE r ROOT$ path PATH$ r STAGING$ c
+      r RUN-ARENA @ LOCAL:STAGE-UPLOAD ;]
    ['] STAGE-CONVERTS? LOCAL:CONVERTING ;
 
 \ The upload source's content now, and the code it threw, else 0.
-: OBSERVE-SOURCE ( str MODEL:path ^ARENA:arena -- DROPBOX:hash n )
-   {: root:str path ar :}
-   NO-HASH [: DROP-HASH root str> path PATH$ ar
+: OBSERVE-SOURCE ( ^run MODEL:path -- DROPBOX:hash n )
+   {: r path :}
+   NO-HASH [: DROP-HASH r ROOT$ path PATH$ r RUN-ARENA @
       LOCAL:OBSERVE-UPLOAD-SOURCE ;]
    ['] SOURCE-CHANGED? LOCAL:CONVERTING ;
 
 \ An already staged upload is ready while its source still holds c.
 : RECHECK
-   ( ^LOCAL:staged-upload str MODEL:path DROPBOX:hash ^ARENA:arena
+   ( ^LOCAL:staged-upload ^run MODEL:path DROPBOX:hash
      -- prepared-upload )
-   {: stage root:str path c ar :}
-   root path ar OBSERVE-SOURCE {: code:n :}
+   {: stage r path c :}
+   r path OBSERVE-SOURCE {: code:n :}
    code 0= if
       c DROPBOX:HASH= 0= if construct prepared-upload fresh exit then
       stage construct prepared-upload ready exit
@@ -2131,14 +2143,13 @@ ENUM prepared ready fresh ;ENUM
    code throw ;
 
 \ Rust's prepare_local: path's content staged for upload.
-: PREPARE-LOCAL
-   ( str str MODEL:path DROPBOX:hash ^ARENA:arena -- prepared-upload )
-   {: root:str staging:str path c ar :}
-   root staging path c ar STAGE-LOCAL {: code:n :}
+: PREPARE-LOCAL ( ^run MODEL:path DROPBOX:hash -- prepared-upload )
+   {: r path c :}
+   r path c STAGE-LOCAL {: code:n :}
    code 0= if
       MATCH LOCAL:stage-outcome
          staged OF construct prepared-upload ready ENDOF
-         already-staged OF root path c ar RECHECK ENDOF
+         already-staged OF r path c RECHECK ENDOF
          content-changed OF drop construct prepared-upload fresh ENDOF
          destination-occupied OF
             drop construct prepared-upload occupied
@@ -2155,8 +2166,7 @@ ENUM prepared ready fresh ;ENUM
    code throw ;
 
 \ An occupied stage path still records the plan.
-: PREPARE-UPLOAD
-   ( str str MODEL:path DROPBOX:hash ^ARENA:arena -- prepared )
+: PREPARE-UPLOAD ( ^run MODEL:path DROPBOX:hash -- prepared )
    PREPARE-LOCAL MATCH prepared-upload
       ready OF drop construct prepared ready ENDOF
       fresh OF construct prepared fresh ENDOF
@@ -2164,16 +2174,15 @@ ENUM prepared ready fresh ;ENUM
    ;MATCH ;
 
 \ Rust's prepare_plan for a decision's one operation.
-: PREPARE-OPERATION
-   ( str str MODEL:path MODEL:operation ^ARENA:arena -- prepared )
-   {: root:str staging:str path op ar :}
+: PREPARE-OPERATION ( ^run MODEL:path MODEL:operation -- prepared )
+   {: r path op :}
    op MATCH MODEL:operation
       create-local-directory OF construct prepared ready ENDOF
       create-remote-directory OF construct prepared ready ENDOF
       delete-local-directory OF construct prepared ready ENDOF
       delete-remote-directory OF construct prepared ready ENDOF
       create-remote OF
-         {: c :} root staging path c ar PREPARE-UPLOAD
+         {: c :} r path c PREPARE-UPLOAD
       ENDOF
       \ A download is fetched only after its plan is durable: the
       \ replay step runs it.
@@ -2184,7 +2193,7 @@ ENUM prepared ready fresh ;ENUM
       delete-local OF drop construct prepared ready ENDOF
       delete-remote OF drop construct prepared ready ENDOF
       replace-remote OF
-         drop {: c :} root staging path c ar PREPARE-UPLOAD
+         drop {: c :} r path c PREPARE-UPLOAD
       ENDOF
    ;MATCH ;
 
@@ -2209,12 +2218,11 @@ ENUM prepared ready fresh ;ENUM
 \ The local copy from the prepared stage; another entry at the stage
 \ path blocks it.
 : STAGED-COPY
-   ( prepared-upload str MODEL:path ^ARENA:arena
-     -- REPLAY:copy-outcome )
-   {: root:str path ar :}
+   ( prepared-upload ^run MODEL:path -- REPLAY:copy-outcome )
+   {: r path :}
    MATCH prepared-upload
       ready OF
-         {: stage :} root str> path stage ar
+         {: stage :} r ROOT$ path stage r RUN-ARENA @
          REPLAY:MATERIALIZE-LOCAL-CONFLICT
       ENDOF
       fresh OF REPLAY-COPY--OUTCOME:SOURCE-CHANGED ENDOF
@@ -2225,40 +2233,190 @@ ENUM prepared ready fresh ;ENUM
 
 \ The conflict's local copy, ready when it has no local side.
 : LOCAL-SIDE
-   ( str str MODEL:path MODEL:conflict ^ARENA:arena
-     -- REPLAY:copy-outcome )
-   {: root:str staging:str path c ar :}
+   ( ^run MODEL:path MODEL:conflict -- REPLAY:copy-outcome )
+   {: r path c :}
    c CONFLICT-LOCAL MATCH option
       none OF REPLAY-COPY--OUTCOME:READY ENDOF
       some OF
          MODEL-LOCAL:UNMAKE {: want :}
-         root staging path want ar PREPARE-LOCAL
-         root path ar STAGED-COPY
+         r path want PREPARE-LOCAL r path STAGED-COPY
       ENDOF
    ;MATCH ;
 
 \ The conflict's remote copy, ready when it has no remote side.
 : REMOTE-SIDE
-   ( ^REPLAY:link str MODEL:path MODEL:conflict ^ARENA:arena
-     -- REPLAY:copy-outcome )
-   {: k root:str path c ar :}
+   ( ^run MODEL:path MODEL:conflict -- REPLAY:copy-outcome )
+   {: r path c :}
    c CONFLICT-REMOTE MATCH option
       none OF REPLAY-COPY--OUTCOME:READY ENDOF
       some OF
-         {: rem :} k root str> path rem ar
+         {: rem :} r RUN-LINK @ r ROOT$ path rem r RUN-ARENA @
          REPLAY:MATERIALIZE-REMOTE-CONFLICT
       ENDOF
    ;MATCH ;
 
 \ Rust's prepare_conflict: the local copy first, then the remote one.
 : PREPARE-CONFLICT
-   ( ^REPLAY:link str str MODEL:path MODEL:conflict ^ARENA:arena
-     -- REPLAY:copy-outcome )
-   {: k root:str staging:str path c ar :}
-   root staging path c ar LOCAL-SIDE MATCH REPLAY:copy-outcome
-      ready OF k root path c ar REMOTE-SIDE ENDOF
+   ( ^run MODEL:path MODEL:conflict -- REPLAY:copy-outcome )
+   {: r path c :}
+   r path c LOCAL-SIDE MATCH REPLAY:copy-outcome
+      ready OF r path c REMOTE-SIDE ENDOF
       blocked OF REPLAY-COPY--OUTCOME:BLOCKED ENDOF
       source-changed OF REPLAY-COPY--OUTCOME:SOURCE-CHANGED ENDOF
+   ;MATCH ;
+
+\ Rust's PreparedDirectoryCollision; root-changed is its
+\ LocalRootChanged error, an answer here as in
+\ case-collision-resolution.
+ENUM prepared-collision
+   VARIANT root-changed ;VARIANT
+   VARIANT fresh ;VARIANT
+   VARIANT blocked FIELD reason MODEL:blockage ;VARIANT
+   VARIANT plan FIELD plan JOURNAL:operation-plan ;VARIANT
+;ENUM
+
+: FRESH-COLLISION ( -- prepared-collision )
+   construct prepared-collision fresh ;
+
+\ prepare_directory_collision's local file, renamed aside to its
+\ file-copy name; the path is observed again.
+: RENAME-ASIDE
+   ( fd ^run sides MODEL:path MODEL:local n -- prepared-collision )
+   {: root:fd r s path file max:n :}
+   file MODEL-LOCAL:UNMAKE {: c :}
+   s path c construct file-copy-origin local max r RUN-ARENA @
+   FILE-COPY-PATH {: dst :}
+   root path PATH$ dst PATH$ LOCAL:RENAME-FILE-COPY
+   MATCH LOCAL:rename-outcome
+      renamed OF FRESH-COLLISION ENDOF
+      retry OF FRESH-COLLISION ENDOF
+   ;MATCH ;
+
+\ prepare_directory_collision's plan once Dropbox's file is copied: its
+\ delete on Dropbox, then the directory there.
+: DIRECTORY-PLAN
+   ( MODEL:remote ^ARENA:arena -- prepared-collision )
+   {: rem ar :}
+   rem MODEL-REMOTE:UNMAKE {: c v :}
+   ar ARENA:ALLOCATOR 0 [type] MODEL:operation VEC:NEW {: ops :}
+   v MODEL-OPERATION:DELETE-REMOTE ops VEC:PUSH !
+   MODEL-OPERATION:CREATE-REMOTE-DIRECTORY ops VEC:PUSH !
+   \ Rust's prepare_plan stages nothing for these two operations.
+   ops JOURNAL-OPERATION--PLAN:MAKE
+   construct prepared-collision plan ;
+
+: NO-COLLISION ( -- option<prepared-collision> ) OPTION:NONE ;
+: SOME-COLLISION ( prepared-collision -- option<prepared-collision> )
+   OPTION:SOME ;
+
+\ A copy's answer; none: other bytes hold its stage.
+: COPY-ANSWER
+   ( REPLAY:exact-copy-outcome MODEL:remote ^ARENA:arena
+     -- option<prepared-collision> )
+   {: rem ar :}
+   MATCH REPLAY:exact-copy-outcome
+      ready OF rem ar DIRECTORY-PLAN SOME-COLLISION ENDOF
+      destination-changed OF FRESH-COLLISION SOME-COLLISION ENDOF
+      stage-occupied OF NO-COLLISION ENDOF
+      content-changed OF
+         MODEL-BLOCKAGE:DOWNLOAD-VERIFICATION-FAILED
+         construct prepared-collision blocked SOME-COLLISION
+      ENDOF
+   ;MATCH ;
+
+\ A copy's failure that blocks its path, as REPLAY's conflict copy
+\ classifies one; any other passes up.
+: COPY-FAILED ( n ^REPLAY:link -- option<prepared-collision> )
+   {: code:n k :}
+   code k REPLAY:DOWNLOAD-BLOCKAGE MATCH option
+      none OF code throw ENDOF
+      some OF
+         construct prepared-collision blocked SOME-COLLISION
+      ENDOF
+   ;MATCH ;
+
+: NOTHING-CONVERTED? ( n n -- bool ) 2drop false ;
+: NO-EXACT ( -- REPLAY:exact-copy-outcome )
+   REPLAY-EXACT--COPY--OUTCOME:READY ;
+: DROP-EXACT ( REPLAY:exact-copy-outcome -- ) drop ;
+
+\ Rust's materialize_remote_copy_at of rem at dst, shown as path, and
+\ the code it threw, else 0.
+: COPY-REMOTE
+   ( fd ^run MODEL:path MODEL:path MODEL:remote
+     -- REPLAY:exact-copy-outcome n )
+   {: root:fd r dst path rem :}
+   NO-EXACT [: DROP-EXACT r RUN-LINK @ root r ROOT$ dst path rem
+      r RUN-ARENA @ REPLAY:MATERIALIZE-REMOTE-COPY-AT ;]
+   ['] NOTHING-CONVERTED? LOCAL:CONVERTING ;
+
+\ One try at Dropbox's file copied to dst; none: excluded now
+\ holds dst.
+: COPY-TRY
+   ( fd ^run MODEL:path MODEL:remote ^VEC:vector<MODEL:path>
+     MODEL:path -- option<prepared-collision> )
+   {: root:fd r path rem ex dst :}
+   root r dst path rem COPY-REMOTE {: code:n :}
+   code 0<> if drop code r RUN-LINK @ COPY-FAILED exit then
+   rem r RUN-ARENA @ COPY-ANSWER MATCH option
+      none OF dst ex VEC:PUSH ! NO-COLLISION ENDOF
+      some OF SOME-COLLISION ENDOF
+   ;MATCH ;
+
+\ prepare_directory_collision's Dropbox file copy path, skipping the
+\ excluded paths.
+: DROPBOX-COPY-PATH
+   ( sides MODEL:path MODEL:remote ^VEC:vector<MODEL:path> n ^run
+     -- MODEL:path )
+   {: s path rem ex max:n r :}
+   rem MODEL-REMOTE:UNMAKE {: c v :}
+   s path c ex construct file-copy-origin dropbox max r RUN-ARENA @
+   FILE-COPY-PATH ;
+
+\ prepare_directory_collision's Dropbox file, placed locally under its
+\ file-copy name, a name whose stage other bytes hold skipped.
+: PLACE-COPY
+   ( fd ^run sides MODEL:path MODEL:remote n -- prepared-collision )
+   {: root:fd r s path rem max:n :}
+   r RUN-ARENA @ ARENA:ALLOCATOR 0 [type] MODEL:path VEC:NEW {: ex :}
+   begin
+      root r path rem ex s path rem ex max r DROPBOX-COPY-PATH
+      COPY-TRY MATCH option
+         none OF ENDOF
+         some OF exit ENDOF
+      ;MATCH
+   again ;
+
+: BY-SIDE
+   ( fd ^run sides MODEL:path MODEL:collision n
+     -- prepared-collision )
+   {: root:fd r s path col max:n :}
+   col MATCH MODEL:collision
+      local-file OF
+         {: file :} root r s path file max RENAME-ASIDE
+      ENDOF
+      local-dir OF {: rem :} root r s path rem max PLACE-COPY ENDOF
+   ;MATCH ;
+
+: COLLIDE-BELOW
+   ( fd ^run sides MODEL:path MODEL:collision -- prepared-collision )
+   {: root:fd r s path col :}
+   root path PATH$ LOCAL:PARENT-NAME-MAX MATCH option
+      none OF FRESH-COLLISION ENDOF
+      some OF {: max:n :} root r s path col max BY-SIDE ENDOF
+   ;MATCH ;
+
+\ Rust's prepare_directory_collision: the directory wins, the file
+\ kept under its file-copy name.
+: PREPARE-DIRECTORY-COLLISION
+   ( ^run sides MODEL:path MODEL:collision -- prepared-collision )
+   {: r s path col :}
+   r RUN-JOURNAL @ r ROOT$ LOCAL:OPEN-ACTIVE-ROOT MATCH option
+      none OF construct prepared-collision root-changed ENDOF
+      some OF {: root:fd :}
+         [: root r s path col COLLIDE-BELOW ;]
+         [: root FS:CLOSE-DIR ;] finally
+      ENDOF
    ;MATCH ;
 
 ;package
