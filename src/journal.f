@@ -5,7 +5,8 @@
 \ this file lays in the program as it loads; any version but 0 and 8 is
 \ refused unchanged, and OPEN-READ refuses any but 8. A SQLite failure is
 \ SQLITE's throw, passed up unchanged. JOURNAL's own failures are logged
-\ once with the Rust version's text, then thrown as its codes.
+\ once with the Rust version's text, then thrown as its codes. E-FILE and
+\ E-ROOT leave the host errno in FS:ERRNO, 0 where there is none.
 \ A root binding is the root's inode, birth time and subvolume: btrfs gives
 \ a subvolume a new device number at every mount, so the device is none
 \ of it. A binding with no birth time is one a version-6 journal recorded;
@@ -170,7 +171,7 @@ s" migrations/0008.sql" create V8 LAY
    {: op:str path:str code errno :}
    op path FAILED-FOR
    errno 0= if code LOG:CODE+ else errno FS:ERRNO$ LOG:TEXT+ then
-   LOG:;LINE ;
+   LOG:;LINE errno FS:CAUSE! ;
 
 : FILE-FAILED ( str str n n -- ) LOG-FAILED E-FILE throw ;
 
@@ -180,7 +181,7 @@ s" migrations/0008.sql" create V8 LAY
 : FILE-REFUSED ( str str str -- )
    {: op:str path:str why:str :}
    op path FAILED-FOR why STR+ LOG:;LINE
-   E-FILE throw ;
+   0 FS:CAUSE! E-FILE throw ;
 
 : INVALID ( str str str -- )
    {: op:str path:str detail:str :}
@@ -429,10 +430,14 @@ private
    swap {: ar :}
    SQLITE:STEP drop ar BINDING-COLS swap ;
 
+public
+
 : BINDING= ( dropbox-binding dropbox-binding -- bool )
    JOURNAL-DROPBOX--BINDING:UNMAKE {: a:str b:str c:str :}
    JOURNAL-DROPBOX--BINDING:UNMAKE {: d:str e:str f:str :}
    a d SAME? b e SAME? and c f SAME? and ;
+
+private
 
 : INSERT-BINDING ( SQLITE:connection dropbox-binding -- )
    {: c b :}

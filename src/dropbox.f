@@ -15,11 +15,12 @@
 \ lost connection retry 0; anything else logs one line (route, status, at
 \ most EXCERPT bytes of the body, never a token) and throws a DROPBOX code,
 \ a bug on one side of the wire. An answer that does not parse logs one
-\ line too and throws E-ANSWER, but a 200 to upload, finish, delete or
-\ create-folder answers refused unverified. A mutation lost, or answered
-\ 408 or 5xx with no wait, may have been applied, so it answers refused
-\ unverified; a wait Dropbox asks for stays retry. E-NOT-STORED is
-\ environmental instead: the store failed, and the next call retries it.
+\ line too and throws E-ANSWER, and one that parses but cannot be used
+\ E-UNUSABLE, but a 200 to upload, finish, delete or create-folder answers
+\ refused unverified. A mutation lost, or answered 408 or 5xx with no wait,
+\ may have been applied, so it answers refused unverified; a wait Dropbox
+\ asks for stays retry. E-NOT-STORED is environmental instead: the store
+\ failed, and the next call retries it.
 \ A 409's error is a Dropbox union: its leaf tag is the `.tag` of the member
 \ named by the outer `.tag`, or of `reason` in an upload's error, when that
 \ member is an object, else the outer `.tag` itself, so path/not_found reads
@@ -60,6 +61,7 @@ public
 -100005 s" the transfer to Dropbox failed" ERROR:CODE E-TRANSPORT
 -100007 s" the rotated Dropbox refresh token could not be stored"
    ERROR:CODE E-NOT-STORED
+-100010 s" Dropbox's answer cannot be used" ERROR:CODE E-UNUSABLE
 
 \ Dropbox's 409 tags omabox decides on, else other; no tag: path-mismatch, an
 \ entry elsewhere, and unverified, an answer omabox cannot trust.
@@ -602,6 +604,12 @@ ENUM verdict
    code E-JSON-READ-LAST >= code E-JSON-READ-FIRST <= and ;
 
 
+\ Whether code is E-ANSWER or E-UNUSABLE, logged where it was thrown.
+: BAD-ANSWER? ( n -- bool )
+   {: code:n :}
+   code E-ANSWER = code E-UNUSABLE = or ;
+
+
 \ Whether the answer is one JSON object `member` reads; a failure leaves
 \ the cursor disposed, and any other code, such as a memory fault, goes on.
 : PARSES? ( ^client [ JSON:reader ^client -- JSON:reader ] -- bool )
@@ -937,6 +945,8 @@ ENUM verdict
 
 \ ---- a call
 
+public
+
 : DONE? ( reply -- bool )
    MATCH reply
       done OF true ENDOF
@@ -944,6 +954,8 @@ ENUM verdict
       retry OF drop false ENDOF
       unlinked OF false ENDOF
    ;MATCH ;
+
+private
 
 
 \ A POST to <origin>/2/<route>; body sets the route's headers and body, and
@@ -1242,7 +1254,8 @@ private
    c member PARSE c ENTRY-CLOSE
    c CLIENT-ENTRY {: e :}
    e DELETED? c CLIENT-TAGGED @ 0= and
-   e PATHS? 0= or if c s" an incomplete entry" E-ANSWER FAILED then ;
+   if c s" an incomplete entry" E-ANSWER FAILED then
+   e PATHS? 0= if c s" an incomplete entry" E-UNUSABLE FAILED then ;
 
 
 \ As ENTRY-FOUND for a mutation's answer, a file or folder: fails a deleted
@@ -1252,7 +1265,7 @@ private
    c k member ENTRY-FOUND
    c CLIENT-ENTRY {: e :}
    e DELETED? e FILLED? 0= or
-   if c s" an incomplete entry" E-ANSWER FAILED then ;
+   if c s" an incomplete entry" E-UNUSABLE FAILED then ;
 
 
 \ get_metadata's answer, a Metadata union, a deleted entry among them; a
@@ -1328,12 +1341,12 @@ private
 
 
 \ Runs a parse of the download's answer, which replaces its seed as catch
-\ keeps the stack's shape; its E-ANSWER, logged already, is E-UNVERIFIED.
+\ keeps the stack's shape; a bad answer, logged already, is E-UNVERIFIED.
 : VERIFIED ( R [ R -- R ] -- R )
    {: parse :}
    [: parse execute ;] catch {: code:n :}
    code 0= if exit then
-   code E-ANSWER = if E-UNVERIFIED throw then
+   code BAD-ANSWER? if E-UNVERIFIED throw then
    code throw ;
 
 
@@ -1906,7 +1919,10 @@ private
 : LISTED ( JSON:reader ^client -- JSON:reader )
    {: c :}
    c TAGGED-OBJECT
-   c CLIENT-ENTRY PATHS? 0= if E-ANSWER throw then ;
+   c CLIENT-ENTRY PATHS? 0= if
+      c s" Dropbox listing contained an invalid or out-of-root path"
+      E-UNUSABLE FAILED
+   then ;
 
 
 : PAGE-MEMBER ( JSON:reader ^client -- JSON:reader )
@@ -1942,7 +1958,7 @@ private
    {: c :}
    c PAGE-PARSE
    c CLIENT-MORE @ 0= if exit then
-   c STALE? if c s" a cursor that did not advance" E-ANSWER FAILED then ;
+   c STALE? if c s" a cursor that did not advance" E-UNUSABLE FAILED then ;
 
 
 : HANDED ( JSON:reader ^client [ ^entry -- ] -- JSON:reader )
@@ -2230,7 +2246,7 @@ private
    {: c read :}
    false [: drop c read execute ;] catch {: code:n :}
    code 0= if exit then
-   drop code E-ANSWER <> if code throw then
+   drop code BAD-ANSWER? 0= if code throw then
    false ;
 
 
@@ -2655,7 +2671,7 @@ HEAP RUNS run
    r RUN-CLIENT @ {: c :}
    [: c FILE-READ ;] catch {: code:n :}
    code 0= if true exit then
-   code E-ANSWER <> if code throw then
+   code BAD-ANSWER? 0= if code throw then
    false ;
 
 

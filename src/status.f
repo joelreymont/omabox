@@ -12,11 +12,13 @@
 \ LOCK guards every snapshot, which the sync task and BEAT share.
 \ The heartbeat is one task per process, BEAT, which refreshes
 \ updated_at every 20 s from HEARTBEAT-START to HEARTBEAT-STOP.
-\ STORAGE CLASS. CALLER-OWNED: NEW lays the status, its paths and its
-\ buffers in the caller's arena, whose release disposes them and closes
-\ the directory's descriptor, so HEARTBEAT-STOP precedes that release;
-\ an error text a status holds is the caller's, which outlives the
-\ status.
+\ A status DETACHED makes has no file: no change publishes, and its
+\ heartbeat neither starts nor stops a task.
+\ STORAGE CLASS. CALLER-OWNED: NEW and DETACHED lay the status in the
+\ caller's arena, NEW its paths and buffers too, whose release disposes
+\ them and closes the directory's descriptor, so HEARTBEAT-STOP precedes
+\ that release; an error text a status holds is the caller's, which
+\ outlives the status.
 \ PROCESS-WIDE: LOCK, BEAT and the cells BEAT reads.
 
 require src/lib/error.f
@@ -84,6 +86,7 @@ STRUCTURE status OPAQUE DERIVE addr
    FIELD spare ^n
    FIELD out ^n
    FIELD writer JSON:writer
+   FIELD detached bool
 ;STRUCTURE
 
 private
@@ -520,6 +523,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
 
 : UPDATE ( ^status [ ^status -- bool ] -- )
    {: s change :}
+   s STATUS-DETACHED @ if exit then
    s [: change CHANGED ;] LOCKED ;
 
 
@@ -552,6 +556,16 @@ public
    s" XDG_RUNTIME_DIR" GETENV {: v:^ vu :}
    v NULL-PTR = if E-RUNTIME-MISSING REFUSED then
    v vu >str ar NEW ;
+
+
+\ A status that writes nothing, for a daemon with no runtime directory.
+: DETACHED ( ^ARENA:arena -- ^status )
+   STATUSES-NEW {: s :}
+   true s STATUS-DETACHED !
+   construct phase starting s STATUS-NOW !
+   s CLEARED
+   NO-TEXT s STATUS-ERROR !
+   s ;
 
 
 : PHASE ( phase ^status -- )
@@ -628,13 +642,16 @@ private
 public
 
 : HEARTBEAT-START ( ^status -- )
-   BEAT-MS swap HEARTBEAT-EVERY ;
+   {: s :}
+   s STATUS-DETACHED @ if exit then
+   BEAT-MS s HEARTBEAT-EVERY ;
 
 
 \ Ends BEAT and waits for it; what ended it otherwise is rethrown. A
 \ status BEAT does not refresh is E-TASK-STATE.
 : HEARTBEAT-STOP ( ^status -- )
    {: s :}
+   s STATUS-DETACHED @ if exit then
    BEAT-LIVE @ 0= if E-TASK-STATE throw then
    BEATING @ s - 0<> if E-TASK-STATE throw then
    0 BEAT-LIVE !

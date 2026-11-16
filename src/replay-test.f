@@ -195,16 +195,6 @@ private
 
 \ ---- a case's directory ------------------------------------------
 
-\ dir/name.
-: INSIDE ( str ^u8 n ^ARENA:arena -- str )
-   {: d:str a:^ u ar :}
-   d str> {: p:^ pu :}
-   ar pu u + 1+ ARENA:ALLOC drop {: dst:^ :}
-   p dst pu BYTE-COPY
-   47 dst pu + c!
-   a dst pu + 1+ u BYTE-COPY
-   dst pu u + 1+ >str ;
-
 \ A case's directory and the journal path in it.
 : JOURNAL-AT ( ^ARENA:arena -- str str )
    {: ar :}
@@ -963,15 +953,6 @@ $140 constant MODE-NO-WRITE
    {: e l want:^ wu:n :}
    e l REPLAY:REJECTION REJECTION$ want wu T$= ;
 
-: REFUSAL? ( DROPBOX:reply DROPBOX:error -- bool )
-   {: e:DROPBOX:error :}
-   MATCH DROPBOX:reply
-      done OF false ENDOF
-      refused OF e DROPBOX-ERROR:EQ ENDOF
-      retry OF drop false ENDOF
-      unlinked OF false ENDOF
-   ;MATCH ;
-
 \ The refusal stops the pass, kept whole in the link.
 : STOPS ( DROPBOX:error ^REPLAY:link -- )
    {: e l :}
@@ -1456,7 +1437,7 @@ STATUS-CAP BUFFER: STATUS-BUF
    ar CONFLICT-DIRS {: d:str r:str s:str :}
    r s s" bad.txt" ar STAGED {: up :}
    up LOCAL:UPLOAD-CONTENT DROPBOX:HASH>STR str> MOVED-AND-UNPATHED
-   d [: [: l up ar UPLOAD-BAD ;] DROPBOX:E-ANSWER TTHROWSQ ;] ar LOGGED
+   d [: [: l up ar UPLOAD-BAD ;] DROPBOX:E-UNUSABLE TTHROWSQ ;] ar LOGGED
    {: t:^ tu:n :}
    t tu LINE-COUNT 1 T=
    t tu s" files/get_metadata answered 200: an incomplete entry"
@@ -2062,14 +2043,6 @@ CAP BUFFER: TEXT
 : AS ( LOCAL:stage-outcome<n> ^u8 n -- )
    {: o w:^ wu:n :}
    o STAGE$ 2drop w wu T$= ;
-
-: DONE? ( DROPBOX:reply -- bool )
-   MATCH DROPBOX:reply
-      done OF true ENDOF
-      refused OF drop false ENDOF
-      retry OF drop false ENDOF
-      unlinked OF false ENDOF
-   ;MATCH ;
 
 \ The stage of p's remote throws E-DROPBOX, its reply a retry.
 : STOPPED
@@ -3092,7 +3065,7 @@ ARENA FILE-CASES file-case
 
 \ The fake holds a folder at p.
 : FOLDER-AT ( ^u8 n -- )
-   MAIN @ DROPBOX:METADATA DONE? TTRUE
+   MAIN @ DROPBOX:METADATA DROPBOX:DONE? TTRUE
    MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:KIND @ DROPBOX-KIND:FOLDER
    DROPBOX-KIND:EQ TTRUE ;
 
@@ -3549,7 +3522,7 @@ variable SIDES
    s" " >str LINK REPLAY-LINK:ROOT !
    s" replay-status" FS:MKTEMP-DIR ar COPIED RUNTIME !
    RUNTIME @ ar STATUS:NEW LINK REPLAY-LINK:STATUS !
-   MAIN @ DROPBOX:ACCOUNT DONE? TTRUE ;
+   MAIN @ DROPBOX:ACCOUNT DROPBOX:DONE? TTRUE ;
 
 : BRIDGE-SERVED ( ^ARENA:arena -- )
    {: ar :}

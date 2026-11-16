@@ -7,8 +7,9 @@
 \ cursor, baselines, baseline paths, pending and blocked plans, pending
 \ upload content, conflicts and pending and completed recoveries, each in
 \ the line's own form; a file of other bytes refused as corrupt by both
-\ opens, unchanged; and fifty-one tests of the Rust version's
-\ src/journal.rs and two of its src/daemon.rs under their names, which
+\ opens, unchanged; a failed open's E-FILE leaving EACCES in FS:ERRNO;
+\ and fifty-one tests of the Rust version's src/journal.rs and two of
+\ its src/daemon.rs under their names, which
 \ build each decision the Rust ones ask the planner for as
 \ src/oracle/plan.tsv holds it. Habu opens no
 \ schema-6 file, so the version-six tests start from a schema-8 journal
@@ -782,6 +783,24 @@ variable SCANNED       \ query plan rows that scan the table
    sealed str> MODE-SEALED FS:CHMOD-MODE
    sealed s" journal.sqlite3" ar INSIDE {: path:str :}
    path d CREATE-FAILED ar OPEN-REFUSED
+   sealed str> MODE-DIR-OWNER FS:CHMOD-MODE
+   d GONE ;
+
+variable SEEN          \ FS:ERRNO as OPEN's throw left it
+
+: OPEN-NOTING ( -- )
+   [: SUBJECT @ OPEN CLOSE ;] catch FS:ERRNO SEEN ! throw ;
+
+: A-FAILED-OPEN-KEEPS-THE-HOST-ERRNO ( ^ARENA:arena -- )
+   {: ar :}
+   s" a failed open keeps the host errno" T-LABEL
+   ar SCRATCH {: d:str :}
+   d s" sealed" ar INSIDE {: sealed:str :}
+   sealed str> FS:MAKE-DIR
+   sealed str> MODE-SEALED FS:CHMOD-MODE
+   sealed s" journal.sqlite3" ar INSIDE SUBJECT !
+   [: OPEN-NOTING ;] E-FILE d CREATE-FAILED ar LOGGED
+   SEEN @ FS:EACCES T=
    sealed str> MODE-DIR-OWNER FS:CHMOD-MODE
    d GONE ;
 
@@ -3192,6 +3211,7 @@ variable CRAFT
    ar EVERY-CONNECTION-WAITS-OUT-A-CONCURRENT-COMMIT
    ar WRITABLE-JOURNAL-USES-FULL-SYNCHRONOUS-ROLLBACK-MODE
    ar JOURNAL-CREATION-REPORTS-ITS-OWN-FILESYSTEM-FAILURE
+   ar A-FAILED-OPEN-KEEPS-THE-HOST-ERRNO
    ar WRITABLE-JOURNAL-NEVER-TRUNCATES-AN-EXISTING-DATABASE
    ar JOURNAL-REFUSES-A-SYMLINKED-DATABASE
    ar GARBAGE-FILE-IS-CORRUPT

@@ -5,10 +5,11 @@
 \ at once on a long one. The snapshot holds one transfer, so the
 \ finished-transfer test follows one transfer at a time. Then a link at
 \ status.json or at the temporary's name, a restart over loosened modes,
-\ the transfer path's display rules, NEW's refusals and a runtime
-\ directory reached through a link. Each case removes its directory; the log
-\ lines of the failed replace and of the refusals are captured in TMPDIR,
-\ checked and removed.
+\ the transfer path's display rules, NEW's refusals, a runtime
+\ directory reached through a link and a detached status, which logs
+\ nothing. Each case removes its directory; the log lines of the failed
+\ replace, of the refusals and of the detached status are captured in
+\ TMPDIR, checked and removed.
 \ Run from the repository root: hb --load src/status-test.f </dev/null
 require src/lib/arena.f
 require src/lib/string.f
@@ -371,6 +372,43 @@ $1A4 constant LOOSE-FILE
    rt GONE ;
 
 
+\ ---- a detached status ------------------------------------------
+
+\ Every change a detached status takes; a publish would log, as it has
+\ no buffer to encode into.
+: CHANGES ( ^status -- )
+   {: s :}
+   construct phase syncing s PHASE
+   s HEARTBEAT
+   s UP s" folder/report.txt" 4 10 OF-N PROGRESS
+   s UP s" folder/report.txt" 10 10 OF-N FINISH
+   s SYNC-ERROR
+   s CLEAR-ERROR
+   s" Dropbox is temporarily unavailable." >str s ERROR
+   s" Omabox setup is required." >str s STOPPED ;
+
+
+: UNBEATING ( ^status -- )
+   {: s :}
+   s HEARTBEAT-START
+   BEAT-LIVE @ 0 T=
+   s HEARTBEAT-STOP
+   BEAT-LIVE @ 0 T= ;
+
+
+: DETACHED-STATUS-PUBLISHES-NOTHING-AND-RUNS-NO-HEARTBEAT
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" a detached status publishes nothing and runs no heartbeat" T-LABEL
+   ar DETACHED {: s :}
+   ar RUNTIME {: log:str :}
+   log s" status.log" ar JOINED {: path:str :}
+   [: s CHANGES s UNBEATING ;] path str> ar STDERR:CAPTURING
+   {: code:n e:^ u:n :}
+   code 0 T= u 0 T=
+   log GONE ;
+
+
 \ ---- the heartbeat -----------------------------------------------
 
 : BEATS ( ^status n -- )
@@ -413,6 +451,7 @@ $1A4 constant LOOSE-FILE
    ar TRANSFER-PATHS-DISPLAY-AS-RUST-DISPLAYS-THEM
    ar NEW-REFUSES-A-RELATIVE-OR-MISSING-RUNTIME
    ar RUNTIME-THROUGH-A-LINK-PUBLISHES-INTO-ITS-TARGET
+   ar DETACHED-STATUS-PUBLISHES-NOTHING-AND-RUNS-NO-HEARTBEAT
    ar HEARTBEAT-REWRITES-AND-STOPS ;
 
 

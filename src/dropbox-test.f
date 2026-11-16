@@ -220,15 +220,6 @@ TYPED-VARIABLE AR ^ARENA:arena
 : ASSERT ( bool -- ) dup T-ASSERT 0= if T-REPORT then ;
 
 
-: DONE? ( DROPBOX:reply -- bool )
-   MATCH DROPBOX:reply
-      done OF true ENDOF
-      refused OF drop false ENDOF
-      retry OF drop false ENDOF
-      unlinked OF false ENDOF
-   ;MATCH ;
-
-
 : UNLINKED? ( DROPBOX:reply -- bool )
    MATCH DROPBOX:reply
       done OF false ENDOF
@@ -303,7 +294,7 @@ variable REFUSALS
 : ACCOUNT-CASE ( -- )
    s" account" T-LABEL
    TEST-DROPBOX:RESET
-   MAIN @ DROPBOX:ACCOUNT DONE? ASSERT
+   MAIN @ DROPBOX:ACCOUNT DROPBOX:DONE? ASSERT
    MAIN @ DROPBOX:ACCOUNT-ID s" dbid:account" T$=
    MAIN @ DROPBOX:ROOT-NAMESPACE s" namespace" T$=
    TEST-DROPBOX:SEEN$ s" /oauth2/token /2/users/get_current_account" T$=
@@ -320,7 +311,7 @@ variable REFUSALS
    s" /2/users/get_current_account" 200 s" " s" "
    S\" {\qaccount_id\q:\qdbid:account\q,\qroot_info\q:{\qroot_namespace_id\q:\qnamespace\q,\q.tag\q:\qother\q}}"
    TEST-DROPBOX:ROUTE-SCRIPT!
-   MAIN @ DROPBOX:ACCOUNT DONE? ASSERT
+   MAIN @ DROPBOX:ACCOUNT DROPBOX:DONE? ASSERT
    MAIN @ DROPBOX:ACCOUNT-ID s" dbid:account" T$=
    MAIN @ DROPBOX:ROOT-NAMESPACE s" " T$= ;
 
@@ -331,7 +322,7 @@ variable REFUSALS
    s" /docs/a.txt" s" /Docs/A.txt" s" 015f0c1d2e3a"
    s" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
    12 TEST-DROPBOX:FILE!
-   s" /docs/a.txt" MAIN @ DROPBOX:METADATA DONE? ASSERT
+   s" /docs/a.txt" MAIN @ DROPBOX:METADATA DROPBOX:DONE? ASSERT
    MAIN @ DROPBOX:ENTRY {: e :}
    e DROPBOX-ENTRY:KIND @ DROPBOX-KIND:FILE DROPBOX-KIND:EQ TTRUE
    e DROPBOX-ENTRY:LOWER @ SPAN:$ s" /docs/a.txt" T$=
@@ -357,7 +348,7 @@ variable REFUSALS
    s" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
    0 TEST-DROPBOX:FILE!
    SB$ s" /docs/built.txt" T$=
-   s" /docs/built.txt" MAIN @ DROPBOX:METADATA DONE? ASSERT
+   s" /docs/built.txt" MAIN @ DROPBOX:METADATA DROPBOX:DONE? ASSERT
    MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:LOWER @ SPAN:$
    s" /docs/built.txt" T$= ;
 
@@ -382,7 +373,7 @@ variable REFUSALS
    {: b:^ bu:n :}
    TEST-DROPBOX:RESET
    200 s" " s" " b bu TEST-DROPBOX:SCRIPT!
-   s" /paper" MAIN @ DROPBOX:METADATA DONE? ASSERT
+   s" /paper" MAIN @ DROPBOX:METADATA DROPBOX:DONE? ASSERT
    MAIN @ DROPBOX:ENTRY {: e :}
    e DROPBOX-ENTRY:KIND @ DROPBOX-KIND:FILE DROPBOX-KIND:EQ TTRUE
    e DROPBOX-ENTRY:LOWER @ SPAN:$ s" /paper" T$=
@@ -411,7 +402,7 @@ variable REFUSALS
    200 s" " s" "
    S\" {\q.tag\q:\qfile\q,\qname\q:\qIncomplete.txt\q,\qid\q:\qid:i\q,\qclient_modified\q:\q2024-01-02T03:04:05Z\q,\qserver_modified\q:\q2024-01-02T03:04:05Z\q,\qpath_lower\q:\q/incomplete.txt\q,\qpath_display\q:\q/Incomplete.txt\q,\qrev\q:\qrev-incomplete\q,\qsize\q:0,\qis_downloadable\q:true}"
    TEST-DROPBOX:SCRIPT!
-   s" /incomplete.txt" MAIN @ DROPBOX:METADATA DONE? ASSERT
+   s" /incomplete.txt" MAIN @ DROPBOX:METADATA DROPBOX:DONE? ASSERT
    MAIN @ DROPBOX:ENTRY {: e :}
    e DROPBOX-ENTRY:KIND @ DROPBOX-KIND:FILE DROPBOX-KIND:EQ TTRUE
    e DROPBOX:COMPLETE? TFALSE ;
@@ -435,7 +426,7 @@ variable REFUSALS
    s" " TEST-DROPBOX:ROOT!
    TEST-DROPBOX:RESET
    s" live-token" s" " RECORDED-CLIENT {: home :}
-   home DROPBOX:ACCOUNT DONE? ASSERT
+   home DROPBOX:ACCOUNT DROPBOX:DONE? ASSERT
    TEST-DROPBOX:ROOT-SENT? TFALSE
    home DROPBOX:CLOSE
    s" ns-root" TEST-DROPBOX:ROOT! ;
@@ -447,13 +438,13 @@ variable REFUSALS
    s" sdk_expiry_refresh_reissues_the_route_with_the_same_client" T-LABEL
    TEST-DROPBOX:RESET
    TEST-DROPBOX:EXPIRE
-   MAIN @ DROPBOX:ACCOUNT DONE? ASSERT
+   MAIN @ DROPBOX:ACCOUNT DROPBOX:DONE? ASSERT
    TEST-DROPBOX:SEEN$
    s" /2/users/get_current_account /oauth2/token /2/users/get_current_account" T$=
    SB-RESET s" Bearer " SB-APPEND TEST-DROPBOX:ISSUED$ SB-APPEND
    TEST-DROPBOX:AUTH$ SB$ T$=
    false 0 TEST-DROPBOX:POLL!
-   s" c3" 30 MAIN @ DROPBOX:WAIT DONE? ASSERT
+   s" c3" 30 MAIN @ DROPBOX:WAIT DROPBOX:DONE? ASSERT
    MAIN @ DROPBOX:CHANGED? TFALSE
    TEST-DROPBOX:SEEN$
    s" /2/users/get_current_account /oauth2/token /2/users/get_current_account /2/files/list_folder/longpoll" T$=
@@ -551,7 +542,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    s" revoked token" T-LABEL
    TEST-DROPBOX:RESET
    s" live-token" s" ns-root" RECORDED-CLIENT {: gone :}
-   gone DROPBOX:ACCOUNT DONE? ASSERT
+   gone DROPBOX:ACCOUNT DROPBOX:DONE? ASSERT
    TEST-DROPBOX:RESET
    TEST-DROPBOX:REVOKE
    gone UNLINKED-LOGGED
@@ -590,7 +581,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    TEST-DROPBOX:RESET 0 RECORDING
    s" refresh-2" TEST-DROPBOX:ROTATE!
    s" live-token" s" ns-root" RECORDED-CLIENT {: c :}
-   c DROPBOX:ACCOUNT DONE? ASSERT
+   c DROPBOX:ACCOUNT DROPBOX:DONE? ASSERT
    KEPT$ s" refresh-2" T$=
    WITNESS$ s" /oauth2/token" T$=
    c DROPBOX:REFRESH-TOKEN s" refresh-2" T$=
@@ -600,7 +591,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
 
 
 \ OUTCOME: OWN's account call answered done.
-: ACCOUNT-DONE ( -- ) OWN @ DROPBOX:ACCOUNT DONE? OUTCOME ! ;
+: ACCOUNT-DONE ( -- ) OWN @ DROPBOX:ACCOUNT DROPBOX:DONE? OUTCOME ! ;
 
 
 \ The refused store throws from the call, which keeps both tokens; the
@@ -616,7 +607,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    s" the rotated Dropbox refresh token could not be stored; the store threw "
    SB-APPEND E-FS-IO FMT:SB-INT SB$ LOGGED? TTRUE
    c DROPBOX:REFRESH-TOKEN s" refresh-2" T$=
-   c DROPBOX:ACCOUNT DONE? ASSERT
+   c DROPBOX:ACCOUNT DROPBOX:DONE? ASSERT
    KEPT$ s" refresh-2 refresh-2" T$=
    TEST-DROPBOX:SEEN$ s" /oauth2/token /2/users/get_current_account" T$=
    TEST-DROPBOX:AUTH$ BEARER$ T$=
@@ -630,12 +621,12 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    s" an_unrotated_refresh_never_touches_secret_service" T-LABEL
    TEST-DROPBOX:RESET 0 RECORDING
    s" live-token" s" ns-root" RECORDED-CLIENT {: c :}
-   c DROPBOX:ACCOUNT DONE? ASSERT
+   c DROPBOX:ACCOUNT DROPBOX:DONE? ASSERT
    TEST-DROPBOX:SEEN$ s" /oauth2/token /2/users/get_current_account" T$=
    c DROPBOX:CLOSE
    s" live-token" TEST-DROPBOX:ROTATE!
    s" live-token" s" ns-root" RECORDED-CLIENT {: same :}
-   same DROPBOX:ACCOUNT DONE? ASSERT
+   same DROPBOX:ACCOUNT DROPBOX:DONE? ASSERT
    same DROPBOX:CLOSE
    KEPT-U @ 0 T= ;
 
@@ -681,7 +672,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    s" live-token" s" ns-root" RECORDED-CLIENT OWN !
    s" /oauth2/token" s s" " s" " b bu TEST-DROPBOX:ROUTE-SCRIPT!
    [: ABC-REV ABC-HASH 0 OWN @ [: 2drop drop ;] DROPBOX:DOWNLOAD
-      DONE? drop ;] LOGGED code T=
+      DROPBOX:DONE? drop ;] LOGGED code T=
    OWN @ DROPBOX:HTTP-STATUS 0 T=
    TEST-DROPBOX:SEEN$ s" /oauth2/token" T$=
    OWN @ DROPBOX:CLOSE ;
@@ -705,7 +696,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    500 s" " s" " s" " TEST-DROPBOX:SCRIPT!
    s" []" s" c1" false TEST-DROPBOX:PAGE!
    s" /docs/a.txt" MAIN @ DROPBOX:METADATA RETRY-MS 0 T=
-   s" /sync" MAIN @ [: drop ;] DROPBOX:LIST DONE? ASSERT
+   s" /sync" MAIN @ [: drop ;] DROPBOX:LIST DROPBOX:DONE? ASSERT
    MAIN @ DROPBOX:CURSOR s" c1" T$=
    ABC-REV ABC-HASH 0 MAIN @ [: drop 2drop ;] DROPBOX:DOWNLOAD
    DROPBOX-ERROR:RESTRICTED-CONTENT REFUSED? ASSERT
@@ -776,7 +767,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    MAIN @ DROPBOX:ACCOUNT RETRY-MS 0 T= ;
 
 
-: ACCOUNT-DROPPED ( -- ) MAIN @ DROPBOX:ACCOUNT DONE? drop ;
+: ACCOUNT-DROPPED ( -- ) MAIN @ DROPBOX:ACCOUNT DROPBOX:DONE? drop ;
 
 
 : REDIRECT-CASE ( -- )
@@ -798,7 +789,8 @@ TYPED-VARIABLE OWN ^DROPBOX:client
 
 \ ---- the classifier's other answers
 
-: METADATA-DROPPED ( -- ) s" /docs/a.txt" MAIN @ DROPBOX:METADATA DONE? drop ;
+: METADATA-DROPPED ( -- )
+   s" /docs/a.txt" MAIN @ DROPBOX:METADATA DROPBOX:DONE? drop ;
 
 
 \ A write Dropbox is too busy to take is retried at once.
@@ -898,7 +890,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
 : GARBLED-CASE ( -- )
    s" transport failure" T-LABEL
    TEST-DROPBOX:RESET
-   MAIN @ DROPBOX:ACCOUNT DONE? TTRUE
+   MAIN @ DROPBOX:ACCOUNT DROPBOX:DONE? TTRUE
    TEST-DROPBOX:RESET
    TEST-DROPBOX:GARBLE
    [: METADATA-DROPPED ;] LOGGED DROPBOX:E-TRANSPORT T=
@@ -957,7 +949,7 @@ variable GOT-U
    s" c2" true TEST-DROPBOX:PAGE!
    S\" [{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/sync/b\q,\qpath_display\q:\q/Sync/b\q}]"
    s" c3" false TEST-DROPBOX:PAGE!
-   s" /sync" MAIN @ [: SAW ;] DROPBOX:LIST DONE? ASSERT
+   s" /sync" MAIN @ [: SAW ;] DROPBOX:LIST DROPBOX:DONE? ASSERT
    GOT$ s" d/sync f/sync/a.txt d/sync/b" T$=
    MAIN @ DROPBOX:CURSOR s" c3" T$=
    TEST-DROPBOX:SEEN$
@@ -1030,7 +1022,7 @@ variable WIDEST
    LISTING 0 HANDED ! 0 ASTRAY ! 0 WIDEST !
    0 LONG-PAGES 0 ?do i LONG-PAGE loop {: total:n :}
    WIDEST @ 65536 > TTRUE
-   s" /sync" MAIN @ [: TALLIED ;] DROPBOX:LIST DONE? ASSERT
+   s" /sync" MAIN @ [: TALLIED ;] DROPBOX:LIST DROPBOX:DONE? ASSERT
    HANDED @ total T=
    ASTRAY @ 0 T=
    MAIN @ DROPBOX:CURSOR s" c11" T$= ;
@@ -1044,7 +1036,7 @@ variable WIDEST
    LISTING
    S\" [{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/sync\q,\qpath_display\q:\q/Sync\q}]"
    k ku false TEST-DROPBOX:PAGE!
-   s" /sync" MAIN @ [: SAW ;] DROPBOX:LIST DONE? ASSERT
+   s" /sync" MAIN @ [: SAW ;] DROPBOX:LIST DROPBOX:DONE? ASSERT
    LISTING ;
 
 
@@ -1062,7 +1054,7 @@ variable WIDEST
 
 
 : CHANGES-DROPPED ( -- )
-   MAIN @ DROPBOX:CURSOR MAIN @ [: SAW ;] DROPBOX:CHANGES DONE? drop ;
+   MAIN @ DROPBOX:CURSOR MAIN @ [: SAW ;] DROPBOX:CHANGES DROPBOX:DONE? drop ;
 
 
 : STALL-CASE ( -- )
@@ -1071,7 +1063,7 @@ variable WIDEST
    S\" [{\q.tag\q:\qdeleted\q,\qname\q:\qb\q,\qpath_lower\q:\q/sync/b\q,\qpath_display\q:\q/Sync/b\q}]"
    s" c4" true TEST-DROPBOX:PAGE!
    s" []" s" c4" true TEST-DROPBOX:PAGE!
-   [: CHANGES-DROPPED ;] DROPBOX:E-ANSWER TTHROWSQ
+   [: CHANGES-DROPPED ;] DROPBOX:E-UNUSABLE TTHROWSQ
    GOT$ s" x/sync/b" T$=
    TEST-DROPBOX:SEEN$
    s" /2/files/list_folder/continue /2/files/list_folder/continue" T$=
@@ -1082,7 +1074,7 @@ variable WIDEST
 \ A listing's entry is a Metadata union: one with no `.tag` has no kind,
 \ and is never handed on as a deleted entry.
 : UNTAGGED-LISTED ( -- )
-   s" /sync" MAIN @ [: SAW ;] DROPBOX:LIST DONE? drop ;
+   s" /sync" MAIN @ [: SAW ;] DROPBOX:LIST DROPBOX:DONE? drop ;
 
 
 : UNTAGGED-CASE ( -- )
@@ -1091,6 +1083,16 @@ variable WIDEST
    S\" [{\qname\q:\qb\q,\qpath_lower\q:\q/sync/b\q,\qpath_display\q:\q/Sync/b\q}]"
    s" u1" false TEST-DROPBOX:PAGE!
    [: UNTAGGED-LISTED ;] DROPBOX:E-ANSWER TTHROWSQ
+   GOT$ s" " T$=
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$= ;
+
+
+: PATHLESS-CASE ( -- )
+   s" listing entry with no path_display" T-LABEL
+   LISTING
+   S\" [{\q.tag\q:\qfolder\q,\qname\q:\qb\q,\qpath_lower\q:\q/sync/b\q}]"
+   s" u1" false TEST-DROPBOX:PAGE!
+   [: UNTAGGED-LISTED ;] DROPBOX:E-UNUSABLE TTHROWSQ
    GOT$ s" " T$=
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$= ;
 
@@ -1109,7 +1111,7 @@ variable WIDEST
    s" []" s" p1" true TEST-DROPBOX:PAGE!
    s" []" s" p1" true TEST-DROPBOX:PAGE!
    s" /sync" MAIN @ DROPBOX:PROBE PROBE$ s" interrupted" T$=
-   DONE? ASSERT
+   DROPBOX:DONE? ASSERT
    TEST-DROPBOX:SEEN$
    s" /2/files/list_folder /2/files/list_folder/continue" T$= ;
 
@@ -1122,7 +1124,7 @@ variable WIDEST
    s" p1" true TEST-DROPBOX:PAGE!
    s" []" s" p2" false TEST-DROPBOX:PAGE!
    s" /Sync" MAIN @ DROPBOX:PROBE PROBE$ s" occupied" T$=
-   DONE? ASSERT
+   DROPBOX:DONE? ASSERT
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$= ;
 
 
@@ -1140,7 +1142,7 @@ variable WIDEST
    LISTING
    S\" [{\q.tag\q:\qfile\q,\qpath_lower\q:\q/sync/paper\q,\qpath_display\q:\q/Sync/Paper\q,\qrev\q:\q015e\q,\qsize\q:0,\qis_downloadable\q:false},{\q.tag\q:\qfile\q,\qpath_lower\q:\q/sync/a.txt\q,\qpath_display\q:\q/Sync/A.txt\q,\qrev\q:\q015f\q,\qsize\q:3,\qcontent_hash\q:\qabc\q}]"
    s" p1" false TEST-DROPBOX:PAGE!
-   s" /sync" MAIN @ [: SAW-DOWNLOADABLE ;] DROPBOX:LIST DONE? ASSERT
+   s" /sync" MAIN @ [: SAW-DOWNLOADABLE ;] DROPBOX:LIST DROPBOX:DONE? ASSERT
    GOT$ s" f/sync/paper- f/sync/a.txt+" T$= ;
 
 
@@ -1167,7 +1169,7 @@ variable WIDEST
    s" i4" true TEST-DROPBOX:PAGE!
    S\" [{\q.tag\q:\qfile\q,\qpath_lower\q:\q/sync/e\q,\qpath_display\q:\q/Sync/e\q,\qrev\q:\q015e\q,\qsize\q:0,\qcontent_hash\q:\qe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\q}]"
    s" i5" false TEST-DROPBOX:PAGE!
-   s" /sync" MAIN @ [: SAW-COMPLETE ;] DROPBOX:LIST DONE? ASSERT
+   s" /sync" MAIN @ [: SAW-COMPLETE ;] DROPBOX:LIST DROPBOX:DONE? ASSERT
    GOT$ s" f/sync/a- f/sync/b- f/sync/c- f/sync/d- f/sync/e+" T$=
    MAIN @ DROPBOX:CURSOR s" i5" T$= ;
 
@@ -1190,7 +1192,7 @@ variable WIDEST
    s" s2" true TEST-DROPBOX:PAGE!
    S\" [{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/sync/d\q,\qpath_display\q:\q/Sync/d\q},{\q.tag\q:\qfile\q,\qpath_lower\q:\q/sync/e\q,\qpath_display\q:\q/Sync/e\q,\qrev\q:\q015e\q,\qsize\q:0,\qsharing_info\q:{\qread_only\q:false}}]"
    s" s3" false TEST-DROPBOX:PAGE!
-   s" /sync" MAIN @ [: SAW-RESTRICTED ;] DROPBOX:LIST DONE? ASSERT
+   s" /sync" MAIN @ [: SAW-RESTRICTED ;] DROPBOX:LIST DROPBOX:DONE? ASSERT
    GOT$ s" d/sync- d/sync/a+ d/sync/b+ d/sync/c- d/sync/d- f/sync/e-" T$= ;
 
 
@@ -1203,13 +1205,13 @@ variable WIDEST
    s" k1" true TEST-DROPBOX:PAGE!
    S\" [{\q.tag\q:\qfile\q,\qpath_lower\q:\q/sync/paper\q,\qpath_display\q:\q/Sync/Paper\q,\qrev\q:\q015f\q,\qsize\q:0,\qcontent_hash\q:\qe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\q,\qis_downloadable\q:false}]"
    s" k2" false TEST-DROPBOX:PAGE!
-   s" /sync" MAIN @ [: SAW-COMPLETE ;] DROPBOX:LIST DONE? ASSERT
+   s" /sync" MAIN @ [: SAW-COMPLETE ;] DROPBOX:LIST DROPBOX:DONE? ASSERT
    GOT$ s" d/sync- f/sync/paper-" T$= ;
 
 
 : WAITED ( bool n -- )
    LISTING TEST-DROPBOX:POLL!
-   s" c3" 30 MAIN @ DROPBOX:WAIT DONE? ASSERT
+   s" c3" 30 MAIN @ DROPBOX:WAIT DROPBOX:DONE? ASSERT
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder/longpoll" T$=
    s" /2/files/list_folder/longpoll" TEST-DROPBOX:BODIES-TO$
    S\" {\qcursor\q:\qc3\q,\qtimeout\q:30}" T$=
@@ -1311,7 +1313,7 @@ variable READ-COUNT
 : WHOLE-CASE ( -- )
    s" download whole" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
-   0 FETCH DONE? ASSERT
+   0 FETCH DROPBOX:DONE? ASSERT
    BODIES @ 1 T=
    SUNK$ s" abcdefghijklmnopqrstuvwxyz" T$=
    SUNK-AT @ 0 T= SUNK-SIZE @ 26 T=
@@ -1327,7 +1329,7 @@ variable READ-COUNT
 : RESUME-CASE ( -- )
    s" download resumed" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
-   10 FETCH DONE? ASSERT
+   10 FETCH DROPBOX:DONE? ASSERT
    BODIES @ 1 T=
    SUNK$ s" klmnopqrstuvwxyz" T$=
    SUNK-AT @ 10 T= SUNK-SIZE @ 26 T=
@@ -1340,7 +1342,7 @@ variable READ-COUNT
 
 \ The main client still answers a call after a download.
 : USABLE ( -- )
-   s" /docs/abc.txt" MAIN @ DROPBOX:METADATA DONE? ASSERT ;
+   s" /docs/abc.txt" MAIN @ DROPBOX:METADATA DROPBOX:DONE? ASSERT ;
 
 
 \ A download answered status s throws code as any call does,
@@ -1349,7 +1351,7 @@ variable READ-COUNT
    {: s:n code:n :}
    TEST-DROPBOX:RESET ALPHABET
    s s" " s" " s" bad" TEST-DROPBOX:SCRIPT!
-   [: 0 FETCH DONE? drop ;] LOGGED code T=
+   [: 0 FETCH DROPBOX:DONE? drop ;] LOGGED code T=
    MAIN @ DROPBOX:HTTP-STATUS s T=
    USABLE ;
 
@@ -1387,8 +1389,8 @@ variable READ-COUNT
 : COMPLETE-CASE ( -- )
    s" download 416 at the end is complete" T-LABEL
    TEST-DROPBOX:RESET ALPHABET EMPTY-FILE
-   s" /docs/none.txt" MAIN @ DROPBOX:METADATA DONE? ASSERT
-   26 FETCH DONE? ASSERT
+   s" /docs/none.txt" MAIN @ DROPBOX:METADATA DROPBOX:DONE? ASSERT
+   26 FETCH DROPBOX:DONE? ASSERT
    BODIES @ 1 T= SUNK-U @ 0 T=
    SUNK-AT @ 26 T= SUNK-SIZE @ 26 T=
    TEST-DROPBOX:SEEN$ s" /2/files/get_metadata /2/files/download" T$=
@@ -1398,7 +1400,7 @@ variable READ-COUNT
 : RESTART-CASE ( -- )
    s" download 416 of another size" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
-   30 FETCH DONE? ASSERT
+   30 FETCH DROPBOX:DONE? ASSERT
    BODIES @ 1 T=
    SUNK$ s" abcdefghijklmnopqrstuvwxyz" T$=
    SUNK-AT @ 0 T=
@@ -1686,7 +1688,7 @@ TYPED-VARIABLE ZEROED bool
    s" download body throws" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
    [: ABC-REV ABC-HASH 0 MAIN @ [: REFUSING ;]
-      DROPBOX:DOWNLOAD DONE? drop ;] 77 TTHROWSQ
+      DROPBOX:DOWNLOAD DROPBOX:DONE? drop ;] 77 TTHROWSQ
    USABLE ;
 
 
@@ -1701,7 +1703,7 @@ TYPED-VARIABLE ZEROED bool
    TEST-DROPBOX:RESET ALPHABET
    SUNK-CLEAR
    [: ABC-REV ABC-HASH 0 MAIN @ [: DISOWNING ;]
-      DROPBOX:DOWNLOAD DONE? drop ;] 78 TTHROWSQ
+      DROPBOX:DOWNLOAD DROPBOX:DONE? drop ;] 78 TTHROWSQ
    SUNK$ s" abcdefghijklmnopqrstuvwxyz" T$=
    USABLE ;
 
@@ -1720,7 +1722,7 @@ TYPED-VARIABLE ZEROED bool
    TEST-DROPBOX:RESET ALPHABET TEST-DROPBOX:HOLD-BODY
    SUNK-CLEAR
    ABC-REV ABC-HASH 0 MAIN @ [: GLANCING ;] DROPBOX:DOWNLOAD
-   DONE? ASSERT
+   DROPBOX:DONE? ASSERT
    BODIES @ 1 T=
    SUNK$ s" abcde" T$=
    USABLE ;
@@ -1738,7 +1740,7 @@ TYPED-VARIABLE ZEROED bool
 \ Read 7 bytes a read, a body in two chunks is taken whole.
 : PAUSED-CASE ( -- )
    s" download body in two chunks, 7 bytes a read" T-LABEL
-   7 PAUSED-FETCH DONE? ASSERT
+   7 PAUSED-FETCH DROPBOX:DONE? ASSERT
    BODIES @ 1 T=
    SUNK$ s" abcdefghijklmnopqrstuvwxyz" T$= ;
 
@@ -1746,7 +1748,7 @@ TYPED-VARIABLE ZEROED bool
 \ Read 64 bytes a read, each read answers one chunk whole.
 : CHUNKED-CASE ( -- )
    s" download body in two chunks, 64 bytes a read" T-LABEL
-   64 PAUSED-FETCH DONE? ASSERT
+   64 PAUSED-FETCH DROPBOX:DONE? ASSERT
    SUNK$ s" abcdefghijklmnopqrstuvwxyz" T$=
    READ-COUNT @ 3 T=
    0 READS @ 10 T= 1 READS @ 16 T= 2 READS @ 0 T= ;
@@ -1760,7 +1762,7 @@ TYPED-VARIABLE ZEROED bool
    s" 0160e0e0e0e0" >str DROPBOX:>REV
    s" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
    >str DROPBOX:>HASH 0 MAIN @ [: SUNK-BODY ;] DROPBOX:DOWNLOAD
-   DONE? ASSERT
+   DROPBOX:DONE? ASSERT
    BODIES @ 1 T= SUNK-U @ 0 T=
    SUNK-AT @ 0 T= SUNK-SIZE @ 0 T= ;
 
@@ -1822,7 +1824,7 @@ TYPED-VARIABLE ZEROED bool
    s" /del.txt" s" rev-del" DELETED-FILE
    s" /del.txt" s" rev-other" MAIN @ DROPBOX:DELETE
    DROPBOX-ERROR:CONFLICT REFUSED? ASSERT
-   s" /del.txt" s" rev-del" MAIN @ DROPBOX:DELETE DONE? ASSERT
+   s" /del.txt" s" rev-del" MAIN @ DROPBOX:DELETE DROPBOX:DONE? ASSERT
    DROPBOX-KIND:FILE KIND? TTRUE
    LOWER$ s" /del.txt" T$=
    MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:REV @ SPAN:$ s" rev-del" T$=
@@ -1833,7 +1835,7 @@ TYPED-VARIABLE ZEROED bool
 : DELETE-MISSING-CASE ( -- )
    s" delete not found" T-LABEL
    TEST-DROPBOX:RESET
-   s" /absent" s" " MAIN @ DROPBOX:DELETE DONE? ASSERT
+   s" /absent" s" " MAIN @ DROPBOX:DELETE DROPBOX:DONE? ASSERT
    DROPBOX-KIND:DELETED KIND? TTRUE
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2" T$= ;
 
@@ -1885,7 +1887,7 @@ TYPED-VARIABLE ZEROED bool
 : FOLDER-CONFLICT-CASE ( -- )
    s" create-folder conflict" T-LABEL
    TEST-DROPBOX:RESET
-   s" /made" MAIN @ DROPBOX:CREATE-FOLDER DONE? ASSERT
+   s" /made" MAIN @ DROPBOX:CREATE-FOLDER DROPBOX:DONE? ASSERT
    DROPBOX-KIND:FOLDER KIND? TTRUE
    LOWER$ s" /made" T$=
    TEST-DROPBOX:TYPE-SENT$ s" application/json" T$=
@@ -1971,7 +1973,7 @@ TYPED-VARIABLE ZEROED bool
    TEST-DROPBOX:EXPIRE TEST-DROPBOX:CUT-TOKEN
    s" /held.txt" s" " MAIN @ DROPBOX:DELETE RETRY-MS 0 T=
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /oauth2/token" T$=
-   s" /held.txt" MAIN @ DROPBOX:METADATA DONE? ASSERT
+   s" /held.txt" MAIN @ DROPBOX:METADATA DROPBOX:DONE? ASSERT
    TEST-DROPBOX:SEEN$
    s" /2/files/delete_v2 /oauth2/token /oauth2/token /2/files/get_metadata"
    T$= ;
@@ -1983,9 +1985,9 @@ TYPED-VARIABLE ZEROED bool
    MAIN @ DROPBOX:REFRESH-TOKEN s" live-token" T$=
    s" fake-code" s" fake-verifier" TEST-DROPBOX:GRANT!
    s" " s" ns-root" RECORDED-CLIENT {: link :}
-   s" fake-code" s" fake-verifier" link DROPBOX:EXCHANGE DONE? ASSERT
+   s" fake-code" s" fake-verifier" link DROPBOX:EXCHANGE DROPBOX:DONE? ASSERT
    link DROPBOX:REFRESH-TOKEN s" fake-refresh-granted" T$=
-   link DROPBOX:ACCOUNT DONE? ASSERT
+   link DROPBOX:ACCOUNT DROPBOX:DONE? ASSERT
    TEST-DROPBOX:SEEN$ s" /oauth2/token /2/users/get_current_account" T$=
    TEST-DROPBOX:LEAKED? TFALSE
    link DROPBOX:CLOSE ;
@@ -2000,7 +2002,7 @@ TYPED-VARIABLE ZEROED bool
    TEST-DROPBOX:RESET
    s" fake-key" RESERVED$ TEST-DROPBOX:ACCEPT!
    RESERVED$ s" ns-root" RECORDED-CLIENT {: odd :}
-   odd DROPBOX:ACCOUNT DONE? ASSERT
+   odd DROPBOX:ACCOUNT DROPBOX:DONE? ASSERT
    TEST-DROPBOX:SEEN$ s" /oauth2/token /2/users/get_current_account" T$=
    odd DROPBOX:CLOSE
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT! ;
@@ -2011,7 +2013,7 @@ TYPED-VARIABLE ZEROED bool
    TEST-DROPBOX:RESET
    RESERVED$ s" fake-verifier" TEST-DROPBOX:GRANT!
    s" " s" ns-root" RECORDED-CLIENT {: link :}
-   RESERVED$ s" fake-verifier" link DROPBOX:EXCHANGE DONE? ASSERT
+   RESERVED$ s" fake-verifier" link DROPBOX:EXCHANGE DROPBOX:DONE? ASSERT
    link DROPBOX:REFRESH-TOKEN s" fake-refresh-granted" T$=
    link DROPBOX:CLOSE ;
 
@@ -2046,8 +2048,8 @@ TYPED-VARIABLE ZEROED bool
    LISTING s" " TEST-DROPBOX:ROOT!
    s" fake-code" s" fake-verifier" TEST-DROPBOX:GRANT!
    s" " s" " RECORDED-CLIENT {: link :}
-   s" fake-code" s" fake-verifier" link DROPBOX:EXCHANGE DONE? ASSERT
-   link DROPBOX:ACCOUNT DONE? ASSERT
+   s" fake-code" s" fake-verifier" link DROPBOX:EXCHANGE DROPBOX:DONE? ASSERT
+   link DROPBOX:ACCOUNT DROPBOX:DONE? ASSERT
    link DROPBOX:ACCOUNT-ID s" dbid:account" T$=
    link DROPBOX:ROOT-NAMESPACE s" namespace" T$=
    TEST-DROPBOX:AUTH$ BEARER$ T$=
@@ -2057,22 +2059,22 @@ TYPED-VARIABLE ZEROED bool
    200 s" " s" "
    S\" {\q.tag\q:\qfolder\q,\qname\q:\qSync\q,\qid\q:\qid:s\q,\qpath_lower\q:\q/sync\q,\qpath_display\q:\q/Sync\q}"
    TEST-DROPBOX:SCRIPT!
-   s" /sync" MAIN @ DROPBOX:METADATA DONE? ASSERT
+   s" /sync" MAIN @ DROPBOX:METADATA DROPBOX:DONE? ASSERT
    DROPBOX-KIND:FOLDER KIND? TTRUE
    TEST-DROPBOX:ROOT-SENT$ S\" {\q.tag\q:\qroot\q,\qroot\q:\qns-root\q}" T$=
    S\" [{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/sync\q,\qpath_display\q:\q/Sync\q},{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/sync/folder\q,\qpath_display\q:\q/Sync/Folder\q},{\q.tag\q:\qfile\q,\qpath_lower\q:\q/sync/alpha.txt\q,\qpath_display\q:\q/Sync/Alpha.txt\q,\qrev\q:\qrev-a\q,\qsize\q:0,\qcontent_hash\q:\qe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\q,\qis_downloadable\q:true}]"
    s" cursor-a" true TEST-DROPBOX:PAGE!
    S\" [{\q.tag\q:\qfile\q,\qpath_lower\q:\q/sync/paper\q,\qpath_display\q:\q/Sync/Paper\q,\qrev\q:\qrev-paper\q,\qsize\q:0,\qis_downloadable\q:false,\qexport_info\q:{\qexport_as\q:\qhtml\q}}]"
    s" cursor-b" false TEST-DROPBOX:PAGE!
-   s" /sync" MAIN @ [: SAW-DOWNLOADABLE ;] DROPBOX:LIST DONE? ASSERT
+   s" /sync" MAIN @ [: SAW-DOWNLOADABLE ;] DROPBOX:LIST DROPBOX:DONE? ASSERT
    GOT$ s" d/sync+ d/sync/folder+ f/sync/alpha.txt+ f/sync/paper-" T$=
    MAIN @ DROPBOX:CURSOR s" cursor-b" T$=
    true 2 TEST-DROPBOX:POLL!
-   s" cursor-b" 30 MAIN @ DROPBOX:WAIT DONE? ASSERT
+   s" cursor-b" 30 MAIN @ DROPBOX:WAIT DROPBOX:DONE? ASSERT
    MAIN @ DROPBOX:CHANGED? TTRUE
    MAIN @ DROPBOX:BACKOFF 2 T=
    ALPHABET
-   0 FETCH DONE? ASSERT
+   0 FETCH DROPBOX:DONE? ASSERT
    SUNK$ s" abcdefghijklmnopqrstuvwxyz" T$=
    TEST-DROPBOX:ARG-SENT$ S\" {\qpath\q:\qrev:0160a1b2c3d4\q}" T$=
    TEST-DROPBOX:SEEN$
@@ -2235,7 +2237,7 @@ TYPED-VARIABLE FAULT fault
    s" conditional_mutations_use_strict_documented_requests" T-LABEL
    TEST-DROPBOX:RESET -1 FAULT-AT !
    s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
-   SEND DONE? ASSERT
+   SEND DROPBOX:DONE? ASSERT
    MAIN @ DROPBOX:ENTRY {: e :}
    e DROPBOX-ENTRY:LOWER @ SPAN:$ s" /docs/up.txt" T$=
    e DROPBOX-ENTRY:SIZE @ 12 T=
@@ -2250,7 +2252,7 @@ TYPED-VARIABLE FAULT fault
    UNSTAGED
    s" cafe.txt" STAGE!
    s" hello cafe" S\" /Caf\xc3\xa9/\xe9\x9b\xaa.txt" s" " STAGED
-   SEND DONE? ASSERT
+   SEND DROPBOX:DONE? ASSERT
    SB-RESET S\" {\qpath\q:\q/Caf\\u00e9/\\u96ea.txt\q,\qmode\q:\qadd\q," SB-APPEND
    S\" \qautorename\q:false,\qstrict_conflict\q:true," SB-APPEND
    S\" \qcontent_hash\q:\q" SB-APPEND EXPECTED$ SB-APPEND S\" \q}" SB-APPEND
@@ -2259,7 +2261,7 @@ TYPED-VARIABLE FAULT fault
    s" /replace.txt" s" /Replace.txt" s" expected-rev" EXPECTED$ 12
    TEST-DROPBOX:FILE!
    s" up.txt" STAGE! s" hello upload" s" /Replace.txt" s" expected-rev" STAGED
-   SEND DONE? ASSERT
+   SEND DROPBOX:DONE? ASSERT
    ENTRY-HASH$ EXPECTED$ T$=
    MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:REV @ SPAN:$ s" expected-rev" STR= TFALSE
    SB-RESET S\" {\qpath\q:\q/Replace.txt\q,\qmode\q:" SB-APPEND
@@ -2269,9 +2271,9 @@ TYPED-VARIABLE FAULT fault
    TEST-DROPBOX:ARG-SENT$ SB$ T$=
    UNSTAGED
    s" /delete.txt" s" delete-rev" DELETED-FILE
-   s" /delete.txt" s" delete-rev" MAIN @ DROPBOX:DELETE DONE? ASSERT
+   s" /delete.txt" s" delete-rev" MAIN @ DROPBOX:DELETE DROPBOX:DONE? ASSERT
    LOWER$ s" /delete.txt" T$=
-   s" /folder" MAIN @ DROPBOX:CREATE-FOLDER DONE? ASSERT
+   s" /folder" MAIN @ DROPBOX:CREATE-FOLDER DROPBOX:DONE? ASSERT
    DROPBOX-KIND:FOLDER KIND? TTRUE
    LOWER$ s" /folder" T$=
    TEST-DROPBOX:SEEN$
@@ -2315,7 +2317,7 @@ TYPED-VARIABLE FAULT fault
    s" non-ascii path" T-LABEL
    TEST-DROPBOX:RESET -1 FAULT-AT !
    s" cafe.txt" STAGE! s" hello cafe" S\" /Docs/Caf\xc3\xa9.txt" s" " STAGED
-   SEND DONE? ASSERT
+   SEND DROPBOX:DONE? ASSERT
    MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:LOWER @ SPAN:$
    S\" /docs/caf\xc3\xa9.txt" T$=
    S\" {\qpath\q:\q/Docs/Caf\\u00e9.txt\q," {: x:^ xu:n :}
@@ -2324,7 +2326,7 @@ TYPED-VARIABLE FAULT fault
 
 
 \ The code SEND throws, 0 for none, with what it logged in ERR$.
-: SEND-LOGGED ( -- n ) [: SEND DONE? drop ;] LOGGED ;
+: SEND-LOGGED ( -- n ) [: SEND DROPBOX:DONE? drop ;] LOGGED ;
 
 
 \ The fake lowers ASCII alone, so its path_lower folds equal to the upload
@@ -2504,7 +2506,7 @@ TYPED-VARIABLE FAULT fault
 \ An upload with the fault once at the count, done with the entry Dropbox
 \ committed.
 : FAULTED ( n fault -- )
-   1 STRUCK DONE? ASSERT
+   1 STRUCK DROPBOX:DONE? ASSERT
    ENTRY-HASH$ EXPECTED$ T$=
    MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:SIZE @ CHUNK 1+ T=
    TEST-DROPBOX:SEEN$ SB$ T$= ;
@@ -2743,7 +2745,7 @@ TYPED-VARIABLE FAULT fault
    RATE-ZEROS-CASE RATE-HUGE-CASE
    BUSY-CASE REDIRECT-CASE BAD-REQUEST-CASE
    CLASSIFY-CASES
-   PAGES-CASE LONG-CASE RESET-CASE STALL-CASE UNTAGGED-CASE
+   PAGES-CASE LONG-CASE RESET-CASE STALL-CASE UNTAGGED-CASE PATHLESS-CASE
    PROBE-STALL-CASE PROBE-FIRST-CASE UNDOWNLOADABLE-LISTED-CASE
    INCOMPLETE-LISTED-CASE RESTRICTED-LISTED-CASE INCOMPLETE-KINDS-CASE
    POLL-CASE LONG-POLL-EXPOSES-RESET-AND-RATE-LIMIT-OUTCOMES

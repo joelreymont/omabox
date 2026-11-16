@@ -10,7 +10,9 @@
 \ exist. CHECKPOINTED leaves a slot holding a durable checkpoint of
 \ CHECKPOINT "x" bytes, FILL-XS writes those bytes, and PAST-HASH and
 \ SERVES-PAST give the fake a file of them followed by a tail. SOCKET-AT
-\ binds a socket at a path. Tests alone load this file; nothing in the
+\ binds a socket at a path. INSIDE names a file in a directory, REFUSAL?
+\ tells a refusal of one error, and QUOTED+ appends bytes between double
+\ quotes to the string builder. Tests alone load this file; nothing in the
 \ program calls these words.
 \ STORAGE CLASS. PROCESS-WIDE: CFG, MAIN, the "x" bytes, their hasher and
 \ the socket address are one each, for one case at a time.
@@ -42,6 +44,27 @@ public
    ar u ARENA:ALLOC drop {: dst:^ :}
    a dst u BYTE-COPY
    dst u >str ;
+
+\ dir/name.
+: INSIDE ( str ^u8 n ^ARENA:arena -- str )
+   {: d:str a:^ u ar :}
+   d str> {: p:^ pu :}
+   ar pu u + 1+ ARENA:ALLOC drop {: dst:^ :}
+   p dst pu BYTE-COPY
+   47 dst pu + c!
+   a dst pu + 1+ u BYTE-COPY
+   dst pu u + 1+ >str ;
+
+: REFUSAL? ( DROPBOX:reply DROPBOX:error -- bool )
+   {: e:DROPBOX:error :}
+   MATCH DROPBOX:reply
+      done OF false ENDOF
+      refused OF e DROPBOX-ERROR:EQ ENDOF
+      retry OF drop false ENDOF
+      unlinked OF false ENDOF
+   ;MATCH ;
+
+: QUOTED+ ( ^u8 n -- ) S\" \q" SB-APPEND SB-APPEND S\" \q" SB-APPEND ;
 
 
 \ ---- the fake's client

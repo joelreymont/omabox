@@ -1182,11 +1182,6 @@ variable SEED
 
 \ ---- RESOLVE-CASE-COLLISION
 
-\ dir/name.
-: INSIDE ( str ^u8 n ^ARENA:arena -- str )
-   {: d:str a:^ u ar :}
-   d str> s" /" ar JOIN-BYTES a u ar JOIN-BYTES >str ;
-
 : TREE-GONE ( str -- ) str> FS:REMOVE-TREE ;
 
 : MAKE-AT ( str ^u8 n ^ARENA:arena -- )
@@ -1556,8 +1551,6 @@ ARENA LISTED DROPBOX:entry
    d str> FS:REMOVE-TREE ;
 
 \ ---- the listing against the fake Dropbox ---------------------------
-
-: QUOTED+ ( ^u8 n -- ) S\" \q" SB-APPEND SB-APPEND S\" \q" SB-APPEND ;
 
 : PATHS+ ( ^u8 n ^u8 n -- )
    {: l:^ lu:n d:^ du:n :}
