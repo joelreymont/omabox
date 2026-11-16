@@ -63,9 +63,9 @@
 \   unsatisfiable_resume_restarts_only_the_owned_partial, from a lost
 \   answer sent with its Range, and
 \   interrupted_exact_download_resumes_only_from_a_valid_range, whose
-\   late Content-Range or other rev is refused unverified, logged once,
-\   the slot at its checkpoint; a download's progress, then finished,
-\   in a status under TMPDIR.
+\   eight bad answers are each refused unverified, logged once, the slot
+\   at its checkpoint; a download's progress, then finished, in a status
+\   under TMPDIR.
 \ - MATERIALIZE-REMOTE-CONFLICT downloads the copy once, then is ready
 \   with no request; a directory or other bytes at the copy's name
 \   block it conflict-copy-occupied, logging nothing; other bytes at
@@ -2338,17 +2338,27 @@ variable HELD
    r s" resume.bin" ar INSIDE str> FS:TRY-STAT TFALSE
    RESUMED-RANGE s" resume-revision" ASKED-REV ;
 
-\ Resumes whose answer does not verify: a Content-Range a byte late
-\ and another rev's file.
+\ Rust's eight bad answers in its order: a 200 with no range or body, a
+\ Content-Range a byte late, a byte short or totalling a byte more,
+\ another rev, another hash, another size, a valid range with no body.
 : BAD-RESUMES
    ( fd str str MODEL:remote option<LOCAL:download-slot-lease>
      DROPBOX:hash ^ARENA:arena -- )
    {: root:fd d:str r:str rem:MODEL:remote
       l:option<LOCAL:download-slot-lease> c:DROPBOX:hash ar :}
+   TEST-DROPBOX:IGNORE-RANGE TEST-DROPBOX:EMPTY
+   root d r rem l ar REFUSED-RESUME
    TEST-DROPBOX:SKEW root d r rem l ar REFUSED-RESUME
+   TEST-DROPBOX:CLIP root d r rem l ar REFUSED-RESUME
+   TEST-DROPBOX:INFLATE root d r rem l ar REFUSED-RESUME
    s" /resume.bin" s" different-revision" ALPHABET c SERVES-PAST
    s" different-revision" TEST-DROPBOX:MISFILE
-   root d r rem l ar REFUSED-RESUME ;
+   root d r rem l ar REFUSED-RESUME
+   s" different resumed bytes" ar HASH-OF DROPBOX:HASH>STR str>
+   TEST-DROPBOX:MISHASH root d r rem l ar REFUSED-RESUME
+   CHECKPOINT 1- TEST-DROPBOX:MISSIZE
+   root d r rem l ar REFUSED-RESUME
+   TEST-DROPBOX:EMPTY root d r rem l ar REFUSED-RESUME ;
 
 : INTERRUPTED-EXACT-DOWNLOAD-RESUMES-ONLY-FROM-A-VALID-RANGE
    ( ^ARENA:arena -- )
@@ -2371,7 +2381,7 @@ variable HELD
    root r s" resume.bin" rem l ar STAGED-AT s" staged" AS
    RESUMED-RANGE s" resume-revision" ASKED-REV
    r c ar STAGE-HOLDS
-   4 SEEN
+   10 SEEN
    root FS:CLOSE-DIR
    d GONE ;
 

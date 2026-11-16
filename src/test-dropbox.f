@@ -730,14 +730,21 @@ SLOTS TYPED-BUFFER CONTENT-REV-US n
 SLOTS TEXT-CAP * BUFFER: CONTENT-BYTES
 SLOTS TYPED-BUFFER CONTENT-US n
 \ The bytes each slot's content holds before those it keeps; a download
-\ from before them answers 500.
+\ that sends bytes from before them answers 500.
 SLOTS TYPED-BUFFER CONTENT-SKIPS n
 variable CONTENTS
 TYPED-VARIABLE SKEWED bool
+TYPED-VARIABLE CLIPPED bool
+TYPED-VARIABLE INFLATED bool
+create MISHASHED NAME-CAP allot
+variable MISHASHED-U
+TYPED-VARIABLE MISSIZED bool
+variable MISSIZE-TO
 create MISFILED NAME-CAP allot
 variable MISFILED-U
 TYPED-VARIABLE SHORTED bool
 TYPED-VARIABLE LENGTHENED bool
+TYPED-VARIABLE EMPTIED bool
 TYPED-VARIABLE WHOLED bool
 TYPED-VARIABLE PARTED bool
 TYPED-VARIABLE BREAKING bool
@@ -846,13 +853,21 @@ TYPED-VARIABLE RANGED bool
    a S\" {\qerror_summary\q:\qpath/not_found/...\q,\qerror\q:{\q.tag\q:\qpath\q,\qpath\q:{\q.tag\q:\qnot_found\q}}}" ANSWER! ;
 
 
-\ bytes <from>-<size-1>/<size>, from shifted by one once when skewed.
+\ bytes <first>-<last>/<total>.
+: RANGE-TEXT$ ( n n n -- ^u8 n )
+   {: first:n last:n total:n :}
+   SB-RESET s" bytes " SB-APPEND first FMT:SB-INT s" -" SB-APPEND
+   last FMT:SB-INT s" /" SB-APPEND total FMT:SB-INT SB$ ;
+
+
+\ bytes <from>-<size-1>/<size>, bent once by SKEWED, CLIPPED and INFLATED.
 : CONTENT-RANGE$ ( n n -- ^u8 n )
    {: from:n size:n :}
-   SKEWED @ if from 1+ else from then {: shown:n :}
-   false SKEWED !
-   SB-RESET s" bytes " SB-APPEND shown FMT:SB-INT s" -" SB-APPEND
-   size 1- FMT:SB-INT s" /" SB-APPEND size FMT:SB-INT SB$ ;
+   SKEWED @ if from 1+ else from then
+   CLIPPED @ if size 2 - else size 1- then
+   INFLATED @ if size 1+ else size then
+   false SKEWED ! false CLIPPED ! false INFLATED !
+   RANGE-TEXT$ ;
 
 
 : UNSATISFIABLE! ( HTTP:response n -- )
@@ -866,21 +881,61 @@ TYPED-VARIABLE RANGED bool
 : LONGER$ ( ^u8 n -- ^u8 n ) SB-RESET SB-APPEND 33 SB-APPEND-C BUILT ;
 
 
+\ The text e with its bytes from at up to the byte c as v, into OUT.
+: REPLACED ( ^u8 n n n ^u8 n -- ^u8 n )
+   {: e:^ eu:n at:n c:n v:^ vu:n :}
+   e at + eu at - {: t:^ tu:n :}
+   t tu c INDEX-OF MATCH option
+      none OF tu ENDOF
+      some OF IDX>N ENDOF
+   ;MATCH {: len:n :}
+   SB-RESET e at SB-APPEND v vu SB-APPEND
+   t len + tu len - SB-APPEND BUILT ;
+
+
+\ The text e with the value after its member m, up to the byte c, as v.
+: SPLICED ( ^u8 n ^u8 n n ^u8 n -- ^u8 n )
+   {: e:^ eu:n m:^ mu:n c:n v:^ vu:n :}
+   e eu m mu FIND-SUB MATCH option
+      none OF e eu ENDOF
+      some OF IDX>N mu + {: at:n :} e eu at c v vu REPLACED ENDOF
+   ;MATCH ;
+
+
+: HASH-SWAPPED ( ^u8 n -- ^u8 n )
+   MISHASHED-U @ 0= if exit then
+   S\" \qcontent_hash\q:\q" 34 MISHASHED MISHASHED-U @ SPLICED
+   0 MISHASHED-U ! ;
+
+
+: SIZE-SWAPPED ( ^u8 n -- ^u8 n )
+   MISSIZED @ if
+      S\" \qsize\q:" 44 MISSIZE-TO @ FMT:INT$ SPLICED
+   then
+   false MISSIZED ! ;
+
+
+\ Entry i as the next download's Dropbox-API-Result.
+: RESULT$ ( n -- ^u8 n ) ENTRY$ HASH-SWAPPED SIZE-SWAPPED ;
+
+
 \ The file in slot i with the bytes in slot k, from the offset.
 : FILE-SENT ( HTTP:response n n n -- )
    {: a:HTTP:response i:n k:n from:n :}
    k CONTENT-SIZE {: size:n :}
    from size >= from 0 > and if a size UNSATISFIABLE! exit then
-   a s" Dropbox-API-Result" i ENTRY$ HTTP:HEADER!
+   a s" Dropbox-API-Result" i RESULT$ HTTP:HEADER!
    a s" Content-Type" s" application/octet-stream" HTTP:HEADER!
    from 0 > PARTED @ or if
       a 206 HTTP:STATUS!
       a s" Content-Range" from size CONTENT-RANGE$ HTTP:HEADER!
    then
    false PARTED !
-   k from CONTENT-FROM SHORTED @ if 1- then
-   LENGTHENED @ if LONGER$ then {: b:^ len:n :}
-   false SHORTED ! false LENGTHENED !
+   EMPTIED @ if s" " else
+      k from CONTENT-FROM SHORTED @ if 1- then
+      LENGTHENED @ if LONGER$ then
+   then {: b:^ len:n :}
+   false SHORTED ! false LENGTHENED ! false EMPTIED !
    a b len HTTP:BODY! ;
 
 
@@ -914,11 +969,12 @@ private
    {: i:n k:n from:n :}
    k CONTENT-SIZE from - LENGTHENED @ {: rest:n extra:bool :}
    false LENGTHENED !
-   k from CONTENT-FROM extra if LONGER$ then {: b:^ len:n :}
+   i RESULT$ {: e:^ eu:n :}
    SB-RESET S\" HTTP/1.1 200 OK\r\nDropbox-API-Result: " SB-APPEND
-   i ENTRY$ SB-APPEND S\" \r\nContent-Length: " SB-APPEND
+   e eu SB-APPEND S\" \r\nContent-Length: " SB-APPEND
    rest extra if 2 + then FMT:SB-INT S\" \r\n\r\n" SB-APPEND
-   b len PART min SB-APPEND
+   k from CONTENT-FROM PART min SB-APPEND
+   extra rest PART < and if 33 SB-APPEND-C then
    SB$ ;
 
 
@@ -1005,7 +1061,7 @@ private
    r ru FILE-OF r ru CONTENT-OF {: i:n k:n :}
    i 0< k 0< or if a NOT-FOUND! exit then
    from 0< if a 400 HTTP:STATUS! a s" bad range" HTTP:BODY! exit then
-   from k CONTENT-SKIPS @ < if a 500 HTTP:STATUS! exit then
+   from k CONTENT-SKIPS @ < EMPTIED @ 0= and if a 500 HTTP:STATUS! exit then
    BREAKING @ if q i k from BROKEN exit then
    HOLDING @ if q i k from HELD-OPEN exit then
    PAUSING @ if q i k from PAUSED exit then
@@ -1282,9 +1338,11 @@ $2100000 constant UPLOAD-CAP
    0 SEEN-U ! 0 AUTH-U ! 0 ROOT-SENT-U ! 0 TYPE-SENT-U !
    0 ARG-SENT-U ! 0 RANGE-SENT-U !
    false ROOTED ! false TYPED ! false LEAKED ! false RANGED !
-   false SKEWED ! 0 MISFILED-U ! false SHORTED ! false LENGTHENED !
-   false WHOLED ! false PARTED ! false BREAKING ! false LOSING !
-   0 CUTS ! false HOLDING ! false PAUSING ! 0 RESUMING atomic!
+   false SKEWED ! false CLIPPED ! false INFLATED !
+   0 MISHASHED-U ! false MISSIZED ! 0 MISFILED-U !
+   false SHORTED ! false LENGTHENED ! false EMPTIED ! false WHOLED !
+   false PARTED ! false BREAKING ! false LOSING ! 0 CUTS !
+   false HOLDING ! false PAUSING ! 0 RESUMING atomic!
    false TOKEN-CUTTING ! false REVOKED ! false DENIED ! false GARBLING !
    SLOTS 0 ?do 0 i CONTENT-SKIPS ! loop
    LISTING-RESET ;
@@ -1419,6 +1477,14 @@ $2100000 constant UPLOAD-CAP
 
 \ Shifts the next download's Content-Range start by one.
 : SKEW ( -- ) true SKEWED ! ;
+\ The next download's Content-Range ends a byte early.
+: CLIP ( -- ) true CLIPPED ! ;
+\ The next download's Content-Range totals a byte more than the file.
+: INFLATE ( -- ) true INFLATED ! ;
+\ The next download's Dropbox-API-Result carries this content hash.
+: MISHASH ( ^u8 n -- ) MISHASHED NAME-CAP STORE MISHASHED-U ! ;
+\ The next download's Dropbox-API-Result carries this size.
+: MISSIZE ( n -- ) MISSIZE-TO ! true MISSIZED ! ;
 \ The next download answers the file at this rev, whatever rev it asked.
 : MISFILE ( ^u8 n -- ) MISFILED NAME-CAP STORE MISFILED-U ! ;
 \ The next download's body lacks its last byte.
@@ -1426,6 +1492,8 @@ $2100000 constant UPLOAD-CAP
 \ The next download's body carries one byte past the file's end; a held
 \ one's head promises one byte more than that.
 : LENGTHEN ( -- ) true LENGTHENED ! ;
+\ The next download's body is empty, with Content-Length 0.
+: EMPTY ( -- ) true EMPTIED ! ;
 \ The next download's body is cut after PART bytes.
 : CUT-BODY ( -- ) true BREAKING ! ;
 \ The next download's body stops after PART bytes, its connection held
