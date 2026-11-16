@@ -64,6 +64,11 @@
 \   its stage block it stage-occupied with no request.
 \   MATERIALIZE-REMOTE-COPY-AT installs at a target apart from the
 \   source path, and answers destination-changed for other bytes there.
+\ - APPLY-FILE-MUTATION and APPLY-DELETE-MUTATION over every mutation
+\   outcome, a staged upload below a sync root and the fake serving the
+\   remote side: the event, the block, the plan pending, held,
+\   completed, retired or finished as its conflict, the count, the
+\   conflict copies on disk, the downloads and the one line logged.
 \ Run from the repository root: hb --load src/replay-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -89,10 +94,7 @@ require src/local.f
 require src/status.f
 require src/replay.f
 
-\ REPLAY reopened for the retention words the Rust tests call, the
-\ Dropbox mutations' steps, the checkpoint a slot resumes from, remote
-\ replay's blocks and folder applies, a pass over a plan's first
-\ operation and the name of an apply event.
+\ REPLAY reopened for the private words the tests call.
 package REPLAY
 private
 
@@ -140,6 +142,11 @@ EXPORT UNPLACED-COPY
 EXPORT PREPARE-UPLOAD
 EXPORT APPLY-FOLDER-MUTATION
 EXPORT APPLY-FOLDER-DELETE-MUTATION
+EXPORT PASS-LINK
+EXPORT FILE-MUTATION-CREATE
+EXPORT FILE-MUTATION-REPLACE
+EXPORT APPLY-FILE-MUTATION
+EXPORT APPLY-DELETE-MUTATION
 ;package
 
 package REPLAY-TEST
@@ -1504,11 +1511,11 @@ LOG-CAP BUFFER: LOG-TEXT
    REPLAY-MUTATION--OUTCOME:REJECTED ;
 : H1-FILE ( -- REPLAY:remote-path-state ) s" h1" s" r1" FILE-STATE ;
 
-\ f's baseline before a folder case: a file, which superseding the plan
-\ keeps and completing it replaces.
-: SEEDED ( JOURNAL:journal ^ARENA:arena -- )
-   {: j ar :}
-   j s" f" DISPLAY OLD-REMOTE MODEL-BASELINE:PRESENT ar
+\ p's baseline before a case: a file, which superseding the plan keeps
+\ and completing it replaces.
+: SEEDED ( JOURNAL:journal ^u8 n ^ARENA:arena -- )
+   {: j p:^ pu:n ar :}
+   j p pu DISPLAY OLD-REMOTE MODEL-BASELINE:PRESENT ar
    JOURNAL:RECORD-NOOP MATCH JOURNAL:noop-write
       recorded OF true ENDOF
       live-plan OF drop false ENDOF
@@ -1521,7 +1528,7 @@ LOG-CAP BUFFER: LOG-TEXT
    {: del:bool ar :}
    ar JOURNAL-AT {: d:str p:str :}
    p JOURNAL:OPEN {: j :}
-   j ar SEEDED
+   j s" f" ar SEEDED
    del if MODEL-OPERATION:DELETE-REMOTE-DIRECTORY else MAKE-F then
    {: o :}
    d j j s" f" o ar PLANNED ;
@@ -2355,6 +2362,401 @@ variable HELD
    root FS:CLOSE-DIR
    d GONE ;
 
+\ ---- file and delete applies --------------------------------------
+
+\ What a case's plan does at notes.txt; keeping deletes rev-old, then
+\ makes a folder there.
+ENUM plan-kind DERIVE eq
+   creating replacing deleting keeping ;ENUM
+
+\ A case: its directory, sync root and open journal, notes.txt staged
+\ for upload, and the plan of its kind.
+STRUCTURE file-case DERIVE addr
+   FIELD dir str
+   FIELD root str
+   FIELD journal JOURNAL:journal
+   FIELD upload ^LOCAL:staged-upload
+   FIELD plan JOURNAL:plan-record
+   FIELD kind plan-kind
+;STRUCTURE
+
+ARENA FILE-CASES file-case
+
+: OLD-REV ( -- DROPBOX:rev ) s" rev-old" AS-REV ;
+
+: KIND-OPS
+   ( plan-kind ^LOCAL:staged-upload ^ARENA:arena
+     -- ^VEC:vector<MODEL:operation> )
+   {: up ar :}
+   ar OPS {: ops :}
+   up LOCAL:UPLOAD-CONTENT {: c :}
+   MATCH plan-kind
+      creating OF c MODEL-OPERATION:CREATE-REMOTE ops OP+ ENDOF
+      replacing OF
+         c OLD-REV MODEL-OPERATION:REPLACE-REMOTE ops OP+
+      ENDOF
+      deleting OF OLD-REV MODEL-OPERATION:DELETE-REMOTE ops OP+ ENDOF
+      keeping OF
+         OLD-REV MODEL-OPERATION:DELETE-REMOTE ops OP+ MAKE-F ops OP+
+      ENDOF
+   ;MATCH ops ;
+
+: NOTES-PLAN
+   ( JOURNAL:journal plan-kind ^LOCAL:staged-upload ^ARENA:arena
+     -- JOURNAL:plan-record )
+   {: j k up ar :}
+   k up ar KIND-OPS JOURNAL-OPERATION--PLAN:MAKE {: plan :}
+   j s" notes.txt" DISPLAY plan ar JOURNAL:RECORD-PLAN NEW-PLAN ;
+
+\ A case of the kind: notes.txt written and staged below a fresh root
+\ over SEEDED's baseline, and the kind's plan for it.
+: NEW-CASE ( plan-kind ^ARENA:arena -- ^file-case )
+   {: k ar :}
+   ar FILE-CASES-NEW {: c :}
+   ar UPLOAD-DIRS {: d:str r:str s:str j :}
+   d c FILE-CASE-DIR ! r c FILE-CASE-ROOT ! k c FILE-CASE-KIND !
+   j c FILE-CASE-JOURNAL ! j s" notes.txt" ar SEEDED
+   r s s" notes.txt" ar STAGED {: up :} up c FILE-CASE-UPLOAD !
+   j k up ar NOTES-PLAN c FILE-CASE-PLAN !
+   c ;
+
+: ENDED ( ^file-case -- )
+   {: c :}
+   c FILE-CASE-JOURNAL @ JOURNAL:CLOSE
+   c FILE-CASE-DIR @ GONE ;
+
+: KIND$ ( MODEL:conflict -- ^u8 n )
+   MATCH MODEL:conflict
+      initial OF 2drop s" initial" ENDOF
+      divergent OF 2drop s" divergent" ENDOF
+      local-deleted OF drop s" local-deleted" ENDOF
+      remote-deleted OF drop s" remote-deleted" ENDOF
+   ;MATCH ;
+
+: RECORDED$ ( JOURNAL:conflict-record -- ^u8 n )
+   JOURNAL-CONFLICT--RECORD:UNMAKE {: id p x :} x KIND$ ;
+
+: REV$ ( option<MODEL:baseline> -- ^u8 n )
+   MATCH option
+      none OF s" absent" ENDOF
+      some OF
+         MATCH MODEL:baseline
+            absent OF s" absent" ENDOF
+            present OF
+               MODEL-REMOTE:UNMAKE {: h v :} v DROPBOX:REV>STR str>
+            ENDOF
+            directory OF s" directory" ENDOF
+         ;MATCH
+      ENDOF
+   ;MATCH ;
+
+\ notes.txt's plan pending or blocked; once retired, the kind of the
+\ conflict it recorded, else the rev of its baseline.
+: NOTES$ ( JOURNAL:journal ^ARENA:arena -- ^u8 n )
+   {: j ar :}
+   j ar JOURNAL:PENDING-PLANS VEC:COUNT 0<> if s" pending" exit then
+   j ar JOURNAL:BLOCKED-PLANS VEC:COUNT 0<> if s" blocked" exit then
+   j ar JOURNAL:CONFLICTS {: v :}
+   v VEC:COUNT 0<> if v 0 VEC:AT @ RECORDED$ exit then
+   j s" notes.txt" DISPLAY ar JOURNAL:BASELINE REV$ ;
+
+\ Whether the case's plan is the kind k.
+: KIND? ( ^file-case plan-kind -- bool )
+   swap FILE-CASE-KIND @ PLAN-KIND-EQ ;
+
+: UPLOADS? ( ^file-case -- bool )
+   {: c :}
+   c PLAN-KIND-CREATING KIND? c PLAN-KIND-REPLACING KIND? or ;
+
+\ The event, the block, notes.txt's journal state and the count.
+: AFTER$
+   ( ^u8 n REPLAY:replay-blocked ^REPLAY:replay-report ^file-case
+     ^ARENA:arena -- ^u8 n )
+   {: e:^ eu:n b r c ar :}
+   e eu b c FILE-CASE-JOURNAL @ ar NOTES$ r COMPLETED SUMMARY$ ;
+
+\ o applied to the case's plan by its kind's apply word; the summary.
+\ A word naming the pass's type in its effect is refused outside REPLAY.
+: CASE-APPLIED$
+   ( REPLAY:mutation-outcome ^file-case ^ARENA:arena -- ^u8 n )
+   {: o c ar :}
+   c FILE-CASE-ROOT @ OPEN-ROOT {: root:fd :}
+   c FILE-CASE-JOURNAL @ root c FILE-CASE-ROOT @ str>
+   c FILE-CASE-PLAN @ ar REPLAY:PASS-OVER {: p :}
+   LINK p REPLAY:PASS-LINK !
+   c FILE-CASE-UPLOAD @ {: up :}
+   [: o c UPLOADS? if
+         up c PLAN-KIND-REPLACING KIND?
+         if REPLAY:FILE-MUTATION-REPLACE
+         else REPLAY:FILE-MUTATION-CREATE then
+         p REPLAY:APPLY-FILE-MUTATION
+      else p REPLAY:APPLY-DELETE-MUTATION then
+      REPLAY:EVENT$ p REPLAY:PASS-BLOCKED @ p REPLAY:PASS-REPORT @
+      c ar AFTER$ ;] [: root FS:CLOSE-DIR ;] finally ;
+
+\ The case's arm: o gives the summary want and logs the line, or
+\ nothing when the line is empty.
+: ARMED
+   ( REPLAY:mutation-outcome ^file-case ^u8 n ^u8 n ^ARENA:arena -- )
+   {: o c w:^ wu:n line:^ lu:n ar :}
+   c FILE-CASE-DIR @ [: o c ar CASE-APPLIED$ w wu T$= ;] ar LOGGED
+   {: t:^ tu:n :}
+   lu 0= if tu 0 T= exit then
+   t tu LINE-COUNT 1 T= t tu line lu CONTAINS? TTRUE ;
+
+\ The local conflict copy of the upload, relative to the root.
+: LOCAL-NAME ( ^ARENA:arena -- ^u8 n )
+   {: ar :}
+   s" notes.txt" LOCAL-CONFLICT--SIDE:LOCAL s" local edit" ar HASH-OF
+   ar LOCAL:CONFLICT-RELATIVE-PATH ;
+
+\ The remote conflict copy of THEIRS, relative to the root.
+: REMOTE-NAME ( ^ARENA:arena -- ^u8 n )
+   {: ar :}
+   s" notes.txt" THEIRS ar HASH-OF ar REMOTE-COPY ;
+
+\ The file at p below the case's root holds b when set, else nothing
+\ is at p.
+: COPY? ( ^file-case ^u8 n ^u8 n bool ^ARENA:arena -- )
+   {: c p:^ pu:n b:^ bu:n there:bool ar :}
+   c FILE-CASE-ROOT @ {: r:str :}
+   there if r p pu b bu ar HOLDS exit then
+   r p pu ar INSIDE str> FS:TRY-STAT TFALSE ;
+
+\ The case's local copy holds the upload when l is set, and its
+\ remote copy THEIRS when m is set; an unset one is not on disk.
+: COPIES ( ^file-case bool bool ^ARENA:arena -- )
+   {: c l:bool m:bool ar :}
+   c ar LOCAL-NAME s" local edit" l ar COPY?
+   c ar REMOTE-NAME THEIRS m ar COPY? ;
+
+\ The case's journal recorded x at notes.txt, its one conflict.
+: RECORDED ( ^file-case MODEL:conflict ^ARENA:arena -- )
+   {: c x ar :}
+   c FILE-CASE-JOURNAL @ ar JOURNAL:CONFLICTS {: v :}
+   v VEC:COUNT 1 T=
+   v VEC:COUNT 1 <> if exit then
+   v 0 VEC:AT @ JOURNAL-CONFLICT--RECORD:UNMAKE {: id p y :}
+   p MODEL:PATH>STR str> s" notes.txt" T$=
+   y x MODEL:CONFLICT= TTRUE ;
+
+: OURS ( ^file-case -- MODEL:local )
+   FILE-CASE-UPLOAD @ LOCAL:UPLOAD-CONTENT MODEL-LOCAL:MAKE ;
+
+\ A fresh case's arm, which places no copy.
+: CASE-ARM
+   ( REPLAY:mutation-outcome plan-kind ^u8 n ^u8 n ^ARENA:arena -- )
+   {: o k w:^ wu:n line:^ lu:n ar :}
+   k ar NEW-CASE {: c :}
+   o c w wu line lu ar ARMED
+   c false false ar COPIES
+   c ENDED ;
+
+\ A fresh case's arm that throws E-INVALID-STATE, logging the line,
+\ leaving the plan pending and placing no copy.
+: REFUSED-ARM
+   ( REPLAY:mutation-outcome plan-kind ^u8 n ^ARENA:arena -- )
+   {: o k line:^ lu:n ar :}
+   k ar NEW-CASE {: c :}
+   c FILE-CASE-DIR @
+   [: [: o c ar CASE-APPLIED$ 2drop ;] REPLAY:E-INVALID-STATE
+      TTHROWSQ ;] ar LOGGED {: t:^ tu:n :}
+   t tu LINE-COUNT 1 T= t tu line lu CONTAINS? TTRUE
+   c FILE-CASE-JOURNAL @ ar NOTES$ s" pending" T$=
+   c false false ar COPIES
+   c ENDED ;
+
+: QUIET-ARM
+   ( REPLAY:mutation-outcome plan-kind ^u8 n ^ARENA:arena -- )
+   {: o k w:^ wu:n ar :}
+   o k w wu s" " ar CASE-ARM ;
+
+: STALE-CASE ( REPLAY:mutation-outcome plan-kind ^ARENA:arena -- )
+   {: o k ar :}
+   o k s" blocked fresh-observation-required - rev-old 0" ar
+   QUIET-ARM ;
+
+: OBJECT-CASE ( REPLAY:mutation-outcome plan-kind ^ARENA:arena -- )
+   {: o k ar :}
+   o k s" blocked remote-object - pending 0" ar QUIET-ARM ;
+
+: PENDING-CASE ( plan-kind ^ARENA:arena -- )
+   {: k ar :}
+   STILL-PENDING k s" blocked remote-pending - pending 0" ar
+   QUIET-ARM ;
+
+: REJECTED-CASE ( plan-kind ^ARENA:arena -- )
+   {: k ar :}
+   NO-SPACE k s" blocked sync-error insufficient-space pending 0"
+   s" Dropbox rejected sync path `notes.txt`: insufficient_space" ar
+   CASE-ARM ;
+
+\ notes.txt uploaded as "local edit", at rev-new.
+: STORED ( ^ARENA:arena -- REPLAY:mutation-outcome )
+   {: ar :}
+   s" local edit" ar HASH-OF s" rev-new" REMOTE-OF
+   REPLAY-REMOTE--PATH--STATE:FILE APPLIED-AS ;
+
+: THEIRS-AS ( MODEL:remote -- REPLAY:remote-path-state )
+   REPLAY-REMOTE--PATH--STATE:FILE ;
+
+: UPLOAD-IMPOSSIBLE
+   ( REPLAY:mutation-outcome plan-kind ^ARENA:arena -- )
+   {: o k ar :}
+   o k s" for `notes.txt`: file mutation returned an impossible"
+   ar REFUSED-ARM ;
+
+: DELETE-IMPOSSIBLE
+   ( REPLAY:mutation-outcome plan-kind ^ARENA:arena -- )
+   {: o k ar :}
+   o k s" for `notes.txt`: delete mutation returned an impossible"
+   ar REFUSED-ARM ;
+
+: APPLY-FILE-MUTATION-COVERS-EVERY-OUTCOME ( ^ARENA:arena -- )
+   {: ar :}
+   s" apply file mutation covers every outcome" T-LABEL
+   ar THEIRS-SERVED {: h rem :}
+   ar STORED PLAN-KIND-CREATING s" done - - rev-new 1" ar QUIET-ARM
+   GONE-STATE APPLIED-AS PLAN-KIND-CREATING ar UPLOAD-IMPOSSIBLE
+   FOLDER-STATE APPLIED-AS PLAN-KIND-REPLACING ar UPLOAD-IMPOSSIBLE
+   ODD-STATE APPLIED-AS PLAN-KIND-CREATING ar UPLOAD-IMPOSSIBLE
+   PLAN-KIND-REPLACING ar PENDING-CASE
+   FOLDER-STATE CHANGED-AS PLAN-KIND-CREATING ar OBJECT-CASE
+   ODD-STATE CHANGED-AS PLAN-KIND-REPLACING ar OBJECT-CASE
+   GONE-STATE CHANGED-AS PLAN-KIND-CREATING
+   s" for `notes.txt`: create precondition changed to an impossible"
+   ar REFUSED-ARM
+   PLAN-KIND-CREATING ar REJECTED-CASE
+   0 SEEN ;
+
+\ A file changed at notes.txt under the kind's upload: both copies
+\ placed, THEIRS downloaded once; the case and the remote.
+: COLLIDED ( plan-kind ^u8 n ^ARENA:arena -- ^file-case MODEL:remote )
+   {: k w:^ wu:n ar :}
+   ar THEIRS-SERVED {: h rem :}
+   k ar NEW-CASE {: c :}
+   rem THEIRS-AS CHANGED-AS c w wu s" " ar ARMED
+   c true true ar COPIES
+   1 SEEN
+   c rem ;
+
+: A-CHANGED-FILE-KEEPS-BOTH-SIDES ( ^ARENA:arena -- )
+   {: ar :}
+   s" a changed file keeps both sides as its conflict" T-LABEL
+   PLAN-KIND-CREATING s" done - - initial 1" ar COLLIDED {: c rem :}
+   c c OURS rem MODEL-CONFLICT:INITIAL ar RECORDED
+   c ENDED
+   PLAN-KIND-REPLACING s" done - - divergent 1" ar COLLIDED
+   {: e theirs :}
+   e e OURS theirs MODEL-CONFLICT:DIVERGENT ar RECORDED
+   e ENDED ;
+
+: A-DELETED-REMOTE-KEEPS-THE-LOCAL-SIDE ( ^ARENA:arena -- )
+   {: ar :}
+   s" a remote deletion keeps the upload as its conflict" T-LABEL
+   ar THEIRS-SERVED {: h rem :}
+   PLAN-KIND-REPLACING ar NEW-CASE {: c :}
+   GONE-STATE CHANGED-AS c s" done - - remote-deleted 1" s" " ar ARMED
+   c true false ar COPIES
+   0 SEEN
+   c c OURS MODEL-CONFLICT:REMOTE-DELETED ar RECORDED
+   c ENDED ;
+
+: A-REMOTE-EDIT-KEEPS-THE-DELETED-FILE ( ^ARENA:arena -- )
+   {: ar :}
+   s" a remote edit keeps the deleted file as its conflict" T-LABEL
+   ar THEIRS-SERVED {: h rem :}
+   PLAN-KIND-DELETING ar NEW-CASE {: c :}
+   rem THEIRS-AS CHANGED-AS c s" done - - local-deleted 1" s" " ar
+   ARMED
+   c false true ar COPIES
+   1 SEEN
+   c rem MODEL-CONFLICT:LOCAL-DELETED ar RECORDED
+   c ENDED ;
+
+\ A directory at the copy p below the case's root.
+: TAKEN ( ^file-case ^u8 n ^ARENA:arena -- str )
+   {: c p:^ pu:n ar :}
+   c FILE-CASE-ROOT @ p pu ar INSIDE {: k:str :}
+   k str> FS:MAKE-DIR
+   k ;
+
+\ A fresh case's arm with the copy p taken: the plan is held, nothing
+\ is placed in p, and the local copy only when l is set.
+: HELD-ARM
+   ( REPLAY:mutation-outcome plan-kind ^u8 n bool ^ARENA:arena -- )
+   {: o k p:^ pu:n l:bool ar :}
+   k ar NEW-CASE {: c :}
+   c p pu ar TAKEN {: t:str :}
+   o c s" blocked durable-plan conflict-copy-occupied blocked 0" s" "
+   ar ARMED
+   c FILE-CASE-JOURNAL @ s" conflict-copy-occupied" ar HELD-AS drop
+   t str> FS:REMOVE-DIR
+   c l false ar COPIES
+   c ENDED ;
+
+: AN-OCCUPIED-COPY-NAME-HOLDS-THE-PLAN ( ^ARENA:arena -- )
+   {: ar :}
+   s" an occupied copy name holds the plan" T-LABEL
+   ar THEIRS-SERVED {: h rem :}
+   ar LOCAL-NAME {: l:^ lu:n :}
+   rem THEIRS-AS CHANGED-AS PLAN-KIND-REPLACING l lu false ar HELD-ARM
+   GONE-STATE CHANGED-AS PLAN-KIND-REPLACING l lu false ar HELD-ARM
+   0 SEEN
+   ar REMOTE-NAME {: m:^ mu:n :}
+   rem THEIRS-AS CHANGED-AS PLAN-KIND-CREATING m mu true ar HELD-ARM
+   rem THEIRS-AS CHANGED-AS PLAN-KIND-DELETING m mu false ar HELD-ARM ;
+
+: APPLY-DELETE-MUTATION-COVERS-EVERY-OUTCOME ( ^ARENA:arena -- )
+   {: ar :}
+   s" apply delete mutation covers every outcome" T-LABEL
+   ar THEIRS-SERVED {: h rem :}
+   GONE-STATE APPLIED-AS PLAN-KIND-DELETING s" done - - absent 1" ar
+   QUIET-ARM
+   rem THEIRS-AS APPLIED-AS PLAN-KIND-DELETING ar DELETE-IMPOSSIBLE
+   FOLDER-STATE APPLIED-AS PLAN-KIND-KEEPING ar DELETE-IMPOSSIBLE
+   ODD-STATE APPLIED-AS PLAN-KIND-DELETING ar DELETE-IMPOSSIBLE
+   PLAN-KIND-DELETING ar PENDING-CASE
+   rem THEIRS-AS CHANGED-AS PLAN-KIND-KEEPING ar STALE-CASE
+   FOLDER-STATE CHANGED-AS PLAN-KIND-KEEPING ar STALE-CASE
+   ODD-STATE CHANGED-AS PLAN-KIND-KEEPING ar STALE-CASE
+   FOLDER-STATE CHANGED-AS PLAN-KIND-DELETING ar OBJECT-CASE
+   ODD-STATE CHANGED-AS PLAN-KIND-DELETING ar OBJECT-CASE
+   GONE-STATE CHANGED-AS PLAN-KIND-DELETING
+   s" for `notes.txt`: delete precondition changed to an impossible"
+   ar REFUSED-ARM
+   PLAN-KIND-KEEPING ar REJECTED-CASE
+   0 SEEN ;
+
+: OP-STATUS ( ^VEC:vector<JOURNAL:planned-operation> n -- n )
+   VEC:AT @ JOURNAL-PLANNED--OPERATION:UNMAKE {: id at o st :}
+   st STATUS>N ;
+
+\ The case's plan is pending, its delete done and its folder not.
+: DELETE-DONE ( ^file-case ^ARENA:arena -- )
+   {: c ar :}
+   c FILE-CASE-JOURNAL @ ar JOURNAL:PENDING-PLANS {: v :}
+   v VEC:COUNT 1 T=
+   v VEC:COUNT 1 <> if exit then
+   v 0 VEC:AT @ JOURNAL-PLAN--RECORD:UNMAKE {: id p ops s :}
+   ops 0 OP-STATUS 1 T= ops 1 OP-STATUS 0 T= ;
+
+\ A fresh keeping case's arm completes the delete alone.
+: DELETE-PASSED ( REPLAY:mutation-outcome ^ARENA:arena -- )
+   {: o ar :}
+   PLAN-KIND-KEEPING ar NEW-CASE {: c :}
+   o c s" done - - pending 1" s" " ar ARMED
+   c ar DELETE-DONE
+   c false false ar COPIES
+   c ENDED ;
+
+: A-DELETE-BEFORE-A-FOLDER-LEAVES-ITS-PLAN-PENDING ( ^ARENA:arena -- )
+   {: ar :}
+   s" a delete before a folder leaves its plan pending" T-LABEL
+   GONE-STATE APPLIED-AS ar DELETE-PASSED
+   GONE-STATE CHANGED-AS ar DELETE-PASSED ;
+
+
 : BRIDGE-CASES ( ^ARENA:arena -- )
    {: ar :}
    ar EXACT-DOWNLOAD-RETRY-REUSES-A-STAGE-WITHOUT-CONSUMING-THE-BODY
@@ -2368,7 +2770,14 @@ variable HELD
    ar A-REMOTE-CONFLICT-COPY-DOWNLOADS-ONCE
    ar AN-OCCUPIED-REMOTE-COPY-NAME-BLOCKS-IT
    ar AN-OCCUPIED-REMOTE-COPY-STAGE-BLOCKS-IT
-   ar A-REMOTE-COPY-INSTALLS-AT-ITS-TARGET ;
+   ar A-REMOTE-COPY-INSTALLS-AT-ITS-TARGET
+   ar APPLY-FILE-MUTATION-COVERS-EVERY-OUTCOME
+   ar A-CHANGED-FILE-KEEPS-BOTH-SIDES
+   ar A-DELETED-REMOTE-KEEPS-THE-LOCAL-SIDE
+   ar A-REMOTE-EDIT-KEEPS-THE-DELETED-FILE
+   ar AN-OCCUPIED-COPY-NAME-HOLDS-THE-PLAN
+   ar APPLY-DELETE-MUTATION-COVERS-EVERY-OUTCOME
+   ar A-DELETE-BEFORE-A-FOLDER-LEAVES-ITS-PLAN-PENDING ;
 
 \ The link: the main client, its token fetched, and a status in a
 \ runtime directory of its own.

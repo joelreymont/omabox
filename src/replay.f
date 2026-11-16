@@ -798,8 +798,9 @@ ENUM apply-event done blocked ;ENUM
    code 0= if r DELETED exit then
    drop r code LOCAL-OBJECT ;
 
-\ A preservation completes at once and leaves the plan pending.
-: PRESERVE ( ^pass -- apply-event )
+\ The run's operation completes at once, counted; the plan stays
+\ pending.
+: COMPLETED-NONFINAL ( ^pass -- apply-event )
    {: r :}
    r PASS-JOURNAL @ r PASS-OPERATION @ r RUN-PATH
    r PASS-ARENA @ COMPLETE-NONFINAL
@@ -816,7 +817,7 @@ ENUM apply-event done blocked ;ENUM
       install-local OF NO-CONTENT r INSTALL ENDOF
       replace-local OF OPTION:SOME r INSTALL ENDOF
       delete-local OF r DELETE-FILE ENDOF
-      preserve-local OF drop r PRESERVE ENDOF
+      preserve-local OF drop r COMPLETED-NONFINAL ENDOF
       create-remote-directory OF r REMOTE ENDOF
       delete-remote-directory OF r REMOTE ENDOF
       create-remote OF drop r REMOTE ENDOF
@@ -2114,6 +2115,224 @@ private
       applied OF r FOLDER-GONE ENDOF
       pending OF r PENDING-REMOTE ENDOF
       precondition-changed OF r FOLDER-CHANGED ENDOF
+      rejected OF r SYNC-ERROR ENDOF
+   ;MATCH ;
+
+
+\ ---- file outcomes
+
+\ Rust's FileMutation: the upload creates the file or replaces a rev.
+ENUM file-mutation create replace ;ENUM
+
+\ The plan finishes as the conflict, counted; the baseline stays.
+: CONFLICTED ( MODEL:conflict ^pass -- apply-event )
+   {: x r :}
+   r PASS-JOURNAL @ r PASS-PLAN @ PLAN-ID r RUN-PATH x
+   r PASS-ARENA @ FINISH-CONFLICT
+   1 r COUNTED construct apply-event done ;
+
+\ next runs once the copy is placed; an unplaced one blocks the plan.
+: PLACED
+   ( option<replay-blocked> ^pass [ -- apply-event ] -- apply-event )
+   {: r next :}
+   MATCH option
+      none OF next execute ENDOF
+      some OF r BLOCKED ENDOF
+   ;MATCH ;
+
+\ The upload's bytes as the run's local conflict copy.
+: KEEP-LOCAL ( ^LOCAL:staged-upload ^pass -- option<replay-blocked> )
+   {: up r :}
+   r RUN-ROOT r RUN-PATH up r PASS-ARENA @ COPY-FROM-UPLOAD
+   r UNPLACED-COPY ;
+
+\ The remote's bytes as the run's remote conflict copy.
+: KEEP-REMOTE ( MODEL:remote ^pass -- option<replay-blocked> )
+   {: rem r :}
+   r PASS-LINK @ r RUN-ROOT r RUN-PATH rem r PASS-ARENA @
+   REMOTE-CONFLICT-AT r UNPLACED-COPY ;
+
+: LOCAL-SIDE ( ^LOCAL:staged-upload -- MODEL:local )
+   LOCAL:UPLOAD-CONTENT MODEL-LOCAL:MAKE ;
+
+: COLLISION
+   ( MODEL:local MODEL:remote file-mutation -- MODEL:conflict )
+   MATCH file-mutation
+      create OF MODEL-CONFLICT:INITIAL ENDOF
+      replace OF MODEL-CONFLICT:DIVERGENT ENDOF
+   ;MATCH ;
+
+: COLLIDED
+   ( MODEL:remote ^LOCAL:staged-upload file-mutation ^pass
+     -- apply-event )
+   {: rem up m r :}
+   rem r KEEP-REMOTE r
+   [: up LOCAL-SIDE rem m COLLISION r CONFLICTED ;] PLACED ;
+
+\ Both sides are placed, the local one first, before the plan
+\ finishes.
+: FILE-CONFLICT
+   ( MODEL:remote ^LOCAL:staged-upload file-mutation ^pass
+     -- apply-event )
+   {: rem up m r :}
+   up r KEEP-LOCAL r [: rem up m r COLLIDED ;] PLACED ;
+
+\ Dropbox deleted the file the upload replaces.
+: LOCAL-EDITED ( ^LOCAL:staged-upload ^pass -- apply-event )
+   {: up r :}
+   up r KEEP-LOCAL r
+   [: up LOCAL-SIDE MODEL-CONFLICT:REMOTE-DELETED r CONFLICTED ;]
+   PLACED ;
+
+\ Dropbox's answer contradicts the run's journaled state.
+: CONTRADICTED ( ^u8 n ^pass -- )
+   {: t:^ tu:n r :}
+   r RUN-PATH t tu INVALID ;
+
+: REMOTE-GONE
+   ( ^LOCAL:staged-upload file-mutation ^pass -- apply-event )
+   {: up m r :}
+   m MATCH file-mutation
+      replace OF up r LOCAL-EDITED ENDOF
+      create OF
+         s" create precondition changed to an impossible absent state"
+         r CONTRADICTED
+      ENDOF
+   ;MATCH ;
+
+: REMOTE-OBJECT ( ^pass -- apply-event )
+   {: r :}
+   r RUN-PATH REPLAY-REPLAY--BLOCKED:REMOTE-OBJECT r BLOCKED ;
+
+: IMPOSSIBLE-UPLOAD ( ^pass -- )
+   {: r :}
+   s" file mutation returned an impossible applied state"
+   r CONTRADICTED ;
+
+: FILE-STORED ( remote-path-state ^pass -- apply-event )
+   {: r :}
+   MATCH remote-path-state
+      file OF MODEL-BASELINE:PRESENT r COMPLETED ENDOF
+      absent OF r IMPOSSIBLE-UPLOAD ENDOF
+      folder OF r IMPOSSIBLE-UPLOAD ENDOF
+      unsupported OF r IMPOSSIBLE-UPLOAD ENDOF
+   ;MATCH ;
+
+: FILE-CHANGED
+   ( remote-path-state ^LOCAL:staged-upload file-mutation ^pass
+     -- apply-event )
+   {: up m r :}
+   MATCH remote-path-state
+      file OF up m r FILE-CONFLICT ENDOF
+      absent OF up m r REMOTE-GONE ENDOF
+      folder OF r REMOTE-OBJECT ENDOF
+      unsupported OF r REMOTE-OBJECT ENDOF
+   ;MATCH ;
+
+\ Rust's apply_file_mutation: a changed file keeps both sides before
+\ the plan finishes as a conflict.
+: APPLY-FILE-MUTATION
+   ( mutation-outcome ^LOCAL:staged-upload file-mutation ^pass
+     -- apply-event )
+   {: up m r :}
+   MATCH mutation-outcome
+      applied OF r FILE-STORED ENDOF
+      pending OF r PENDING-REMOTE ENDOF
+      precondition-changed OF up m r FILE-CHANGED ENDOF
+      rejected OF r SYNC-ERROR ENDOF
+   ;MATCH ;
+
+
+\ ---- delete outcomes
+
+: OPERATION-OF ( JOURNAL:planned-operation -- MODEL:operation )
+   JOURNAL-PLANNED--OPERATION:UNMAKE {: id at o s :} o ;
+
+: MAKES-FOLDER? ( MODEL:operation -- bool )
+   MATCH MODEL:operation
+      create-remote-directory OF true ENDOF
+      create-local-directory OF false ENDOF
+      delete-local-directory OF false ENDOF
+      delete-remote-directory OF false ENDOF
+      create-remote OF drop false ENDOF
+      install-local OF drop false ENDOF
+      preserve-local OF drop false ENDOF
+      replace-local OF drop drop false ENDOF
+      delete-local OF drop false ENDOF
+      preserve-remote OF drop false ENDOF
+      replace-remote OF drop drop false ENDOF
+      delete-remote OF drop false ENDOF
+   ;MATCH ;
+
+\ Rust's keeps_directory: the plan makes a folder where the file was.
+: KEEPS-FOLDER? ( ^pass -- bool )
+   PASS-PLAN @ PLAN-OPERATIONS {: ops :}
+   false ops VEC:COUNT 0 ?do
+      ops i VEC:AT @ OPERATION-OF MAKES-FOLDER? or
+   loop ;
+
+\ Whether the run's operation is its plan's last.
+: LAST? ( ^pass -- bool )
+   {: r :}
+   r PASS-PLAN @ PLAN-OPERATIONS {: ops :}
+   ops ops VEC:COUNT 1- VEC:AT @ OPERATION-ID JOURNAL:OPERATION-ID>N
+   r PASS-OPERATION @ OPERATION-ID JOURNAL:OPERATION-ID>N = ;
+
+: IMPOSSIBLE-DELETE ( ^pass -- )
+   {: r :}
+   s" delete mutation returned an impossible applied state"
+   r CONTRADICTED ;
+
+\ Only the plan's last operation writes the absent baseline.
+: FILE-DELETED ( ^pass -- apply-event )
+   {: r :}
+   r LAST? if MODEL-BASELINE:ABSENT r COMPLETED exit then
+   r COMPLETED-NONFINAL ;
+
+: FILE-GONE ( remote-path-state ^pass -- apply-event )
+   {: r :}
+   MATCH remote-path-state
+      absent OF r FILE-DELETED ENDOF
+      file OF drop r IMPOSSIBLE-DELETE ENDOF
+      folder OF r IMPOSSIBLE-DELETE ENDOF
+      unsupported OF r IMPOSSIBLE-DELETE ENDOF
+   ;MATCH ;
+
+\ Dropbox's edit of the file the plan deletes keeps the remote side.
+: REMOTE-EDITED ( MODEL:remote ^pass -- apply-event )
+   {: rem r :}
+   r KEEPS-FOLDER? if r STALE exit then
+   rem r KEEP-REMOTE r
+   [: rem MODEL-CONFLICT:LOCAL-DELETED r CONFLICTED ;] PLACED ;
+
+: OBJECT-THERE ( ^pass -- apply-event )
+   {: r :}
+   r KEEPS-FOLDER? if r STALE exit then
+   r REMOTE-OBJECT ;
+
+\ A plan that makes a folder there needs the file gone, which it is.
+: ALREADY-GONE ( ^pass -- apply-event )
+   {: r :}
+   r KEEPS-FOLDER? if r COMPLETED-NONFINAL exit then
+   s" delete precondition changed to an impossible absent state"
+   r CONTRADICTED ;
+
+: DELETE-CHANGED ( remote-path-state ^pass -- apply-event )
+   {: r :}
+   MATCH remote-path-state
+      file OF r REMOTE-EDITED ENDOF
+      folder OF r OBJECT-THERE ENDOF
+      unsupported OF r OBJECT-THERE ENDOF
+      absent OF r ALREADY-GONE ENDOF
+   ;MATCH ;
+
+\ Rust's apply_delete_mutation.
+: APPLY-DELETE-MUTATION ( mutation-outcome ^pass -- apply-event )
+   {: r :}
+   MATCH mutation-outcome
+      applied OF r FILE-GONE ENDOF
+      pending OF r PENDING-REMOTE ENDOF
+      precondition-changed OF r DELETE-CHANGED ENDOF
       rejected OF r SYNC-ERROR ENDOF
    ;MATCH ;
 
