@@ -30,6 +30,7 @@ require src/dropbox.f
 require src/model.f
 require src/journal.f
 require src/local.f
+require src/status.f
 
 package REPLAY
 public
@@ -38,6 +39,24 @@ public
 -100799 constant E-LAST
 -100700 s" journaled recovery state is invalid"
    ERROR:CODE E-INVALID-STATE
+-100701 s" a Dropbox answer ended the replay"
+   ERROR:CODE E-DROPBOX
+
+\ How a pass reaches Dropbox: root is the binding's remote root, status
+\ takes the transfers; reply holds the answer E-DROPBOX was thrown for.
+STRUCTURE link DERIVE addr
+   FIELD client ^DROPBOX:client
+   FIELD root str
+   FIELD status ^STATUS:status
+   FIELD reply DROPBOX:reply
+;STRUCTURE
+
+private
+
+\ Ends the pass on a Dropbox answer that is not one path's verdict.
+: STOP-PASS ( DROPBOX:reply ^link -- ) REPLAY-LINK:REPLY ! E-DROPBOX throw ;
+
+public
 
 \ destination-changed: the chosen path changed after it was observed;
 \ stage-occupied: other bytes hold its download stage.
