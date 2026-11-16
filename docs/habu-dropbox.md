@@ -11,7 +11,8 @@ cursor and upload session. The signatures below are not checked yet.
 \ is `other`, and its text goes in the log line. `path-mismatch`
 \ is no tag: an entry whose path_lower is not the path's full lowercase.
 \ Nor is `unverified`: a download whose answer fails its checks or does
-\ not parse.
+\ not parse, or a mutation whose answer was lost or is not its intended
+\ entry.
 ENUM error
    not-found not-file not-folder malformed-path disallowed-name
    conflict no-write-permission restricted-content
@@ -29,11 +30,13 @@ ENUM reply
 ```
 
 - `retry` covers 429, 5xx, 408, `too_many_write_operations`, a timeout or a
-  lost connection. Its wait is `Retry-After`, in seconds (any number of
-  digits) or as an HTTP date (a passed date asks for none); on a 429, the
-  larger of that and the body's `error.retry_after`; else 0. No wait is over
-  15 minutes. A 408 is retried as HTTP lets a client repeat a request the
-  server timed out; the Rust version stops on one as an unexpected status.
+  lost connection, except that a lost answer to an upload's commit, a
+  delete or a create-folder is `refused unverified` (below). Its wait is
+  `Retry-After`, in seconds (any number of digits) or as an HTTP date (a
+  passed date asks for none); on a 429, the larger of that and the body's
+  `error.retry_after`; else 0. No wait is over 15 minutes. A 408 is
+  retried as HTTP lets a client repeat a request the server timed out; the
+  Rust version stops on one as an unexpected status.
 - `unlinked` is logged once, where it is decided: a 403, a refreshed token
   refused, or `invalid_grant` on the refresh. A confirmation that answers
   `unlinked` answers it in its call's place. A code exchange's `unlinked`
@@ -217,24 +220,22 @@ STRUCTURE config
     and its checks answer `refused unverified`, with the handle already free.
 - **`DELETE`** sends the rev as `parent_rev`. With an empty rev it deletes
   unconditionally, which sync uses only for a folder it has just seen empty.
-- **A mutation confirms an answer it cannot trust.** libcurl resends a POST
-  on a new connection when a reused one closes before any answer byte, so a
-  mutation Dropbox applied can come back lost. `UPLOAD`, `DELETE` and
-  `CREATE-FOLDER` then ask `get_metadata`, deleted entries included,
-  whether Dropbox holds the intended result: a file with the upload's
-  content hash, no entry or a deleted one, or a folder.
+- **A mutation answers `refused unverified` for an answer it cannot
+  trust.** libcurl resends a POST on a new connection when a reused one
+  closes before any answer byte, so a mutation Dropbox applied can come
+  back lost. `UPLOAD`, `DELETE` and `CREATE-FOLDER` ask no `get_metadata`;
+  REPLAY reads the path back once and classifies that one path, as the
+  Rust version's `resolve_ambiguous` does, so an answer that keeps failing
+  never stops the pass.
   - A lost answer, or a `done` whose entry's `path_lower` is not the
-    path's full Unicode lowercase: `done` if it holds, else `retry`.
-    `DELETE` given a rev treats a `done` whose entry is not a file at that
-    rev the same way, and `UPLOAD` any 2xx answer that is not its complete
-    entry with its content hash, one that does not parse included.
-  - A `conflict` refusal stands without asking: REPLAY reads the path back
-    once, as the Rust version's `resolve_explicit_conflict` does.
-  - `DELETE` refused `not-found` is `done` without asking: the path is
-    absent, which is what a delete intends.
-  - A confirmation whose entry's `path_lower` is not the path's full
-    Unicode lowercase answers `refused path-mismatch`, for that path alone.
-  - A confirmation that must wait answers its `retry`, with its wait.
+    path's full Unicode lowercase, answers `refused unverified`. `DELETE`
+    given a rev treats a `done` whose entry is not a file at that rev the
+    same way, and `UPLOAD` any 2xx answer that is not its complete entry
+    with its content hash, one that does not parse included.
+  - A `conflict` refusal stands: REPLAY reads the path back once, as the
+    Rust version's `resolve_explicit_conflict` does.
+  - `DELETE` refused `not-found` is `done`: the path is absent, which is
+    what a delete intends.
   - Every other refusal stands. A mutation never answers "unknown".
 
 ## The upload, as a state machine
@@ -244,10 +245,10 @@ Files up to 32 MiB go in one `upload` call; larger ones go through a session.
 ```forth
 FSM:DEFINE SESSION ( ^run ) upload-step send-event
    IN single  SEND-SENSE
-      committed  ANSWER-DONE   >ended
-      untrusted  DISTRUST      >confirming   \ not its entry
-      lost       -             >confirming
-      failed     ANSWER-REPLY  >ended
+      committed  ANSWER-DONE        >ended
+      untrusted  ANSWER-UNVERIFIED  >ended   \ not its entry
+      lost       ANSWER-UNVERIFIED  >ended
+      failed     ANSWER-REPLY       >ended
    IN starting  START-SENSE ( start-event )
       opened  -             >appending
       lost    ANSWER-RETRY  >ended
@@ -260,21 +261,15 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
       gone      -              >restarting
       failed    ANSWER-REPLY   >ended
    IN finishing  FINISH-SENSE ( finish-event )
-      committed  ANSWER-DONE   >ended
-      untrusted  DISTRUST      >confirming
-      lost       -             >confirming
-      gone       -             >verifying
-      failed     ANSWER-REPLY  >ended
-   IN confirming  CONFIRM-SENSE ( confirm-event )
-      same       ANSWER-DONE      >ended
+      committed  ANSWER-DONE        >ended
+      untrusted  ANSWER-UNVERIFIED  >ended
+      lost       ANSWER-UNVERIFIED  >ended
+      gone       -                  >verifying
+      failed     ANSWER-REPLY       >ended
+   IN verifying  CONFIRM-SENSE ( confirm-event )
+      same       ANSWER-DONE      >ended      \ its complete entry
       elsewhere  ANSWER-MISMATCH  >ended
       wait       ANSWER-REPLY     >ended      \ get_metadata's retry
-      other      ANSWER-REPLY     >ended
-      unlinked   ANSWER-UNLINKED  >ended
-   IN verifying  CONFIRM-SENSE ( confirm-event )
-      same       ANSWER-DONE      >ended
-      elsewhere  ANSWER-MISMATCH  >ended
-      wait       ANSWER-REPLY     >ended
       other      -                >restarting
       unlinked   ANSWER-UNLINKED  >ended
    IN restarting  RESTART-SENSE ( restart-event )
@@ -291,7 +286,8 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
 - **A finish whose session is gone is verified first.** A resent finish
   Dropbox already applied answers `lookup_failed/not_found`, so the upload
   asks `get_metadata` and starts over only when Dropbox does not hold the
-  upload's content hash.
+  upload's complete entry with its content hash: a downloadable file with
+  a rev.
 - **`finish` carries no content hash.** It sends no bytes, and Dropbox
   checks that field against the bytes of the call. The upload is checked
   instead by the content hash of the entry Dropbox commits. The Rust version
@@ -359,25 +355,28 @@ The tests run against a fake Dropbox on `net/http.f`, in the style of
 - **download:** a resume by range, a Content-Range mismatch, and a 416;
 - **content hash:** empty, one byte, exactly 4 MiB, and 4 MiB plus one;
 - **single upload:** add; an update that conflicts and an upload Dropbox
-  already holds, both refused as a conflict with no `get_metadata`; and an
-  answer that does not parse, confirmed;
+  already holds, both refused as a conflict with no `get_metadata`; and a
+  lost upload, one answered at another path and one whose answer does
+  not parse, each refused unverified with no `get_metadata`;
 - **session upload:**
   - a lost append, resent;
   - `incorrect_offset` at the chunk's end;
   - a closed session, restarted once;
-  - a lost finish, confirmed;
-  - a finish whose session is gone: confirmed when Dropbox holds it, else
-    restarted;
+  - a lost finish, and one answered at another path, with another
+    content hash or with an answer that does not parse, each refused
+    unverified with no `get_metadata`;
+  - a finish whose session is gone: confirmed when Dropbox holds its
+    complete entry, else restarted; a confirmation that must wait answers
+    its `retry`, and one refused 403 `unlinked`;
 - **delete and create-folder:** a conflict, refused with no `get_metadata`
   even where the path is already gone or a folder; not found; and a lost
-  delete whose confirmation finds the path deleted;
+  one, one answered at another path and a delete answered at another rev,
+  each refused unverified with no `get_metadata`;
 - **auth and transport:**
   - an expired token, refreshed and resent;
   - a revoked token, refreshed and resent once, which answers `unlinked`,
     and again with no request;
   - a refreshed token refused again, and a 403, which answer `unlinked`;
-  - a lost delete, a lost upload, and a lost create-folder whose
-    confirmation is refused 403, which answer `unlinked`;
   - `invalid_grant`, which answers `unlinked`, and again with no request;
   - a rotated refresh token, stored before its access token goes out; one
     the store refuses, which stays usable and is stored by the next call;

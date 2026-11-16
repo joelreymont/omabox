@@ -15,8 +15,8 @@
 \ lost connection retry 0; anything else logs one line (route, status, at
 \ most EXCERPT bytes of the body, never a token) and throws a DROPBOX code,
 \ a bug on one side of the wire. An answer that does not parse logs one
-\ line too and throws E-ANSWER, but an upload's or a finish's 200, which
-\ get_metadata confirms. E-NOT-STORED is environmental instead:
+\ line too and throws E-ANSWER, but an upload's or a finish's 200 answers
+\ refused unverified. E-NOT-STORED is environmental instead:
 \ the store failed, and the next call retries it.
 \ A 409's error is a Dropbox union: its leaf tag is the `.tag` of the member
 \ named by the outer `.tag`, or of `reason` in an upload's error, when that
@@ -60,7 +60,8 @@ public
    ERROR:CODE E-NOT-STORED
 
 \ Dropbox's 409 tags omabox decides on, else other; no tag: path-mismatch,
-\ an entry elsewhere, and unverified, a download that fails a check or parse.
+\ an entry elsewhere, and unverified, a download that fails a check or
+\ parse, or a mutation answer lost or not its intended entry.
 ENUM error DERIVE eq
    not-found not-file not-folder malformed-path disallowed-name
    conflict no-write-permission restricted-content
@@ -2154,28 +2155,6 @@ private
    ;MATCH ;
 
 
-\ A confirmation that failed: retry, after the ms get_metadata asked for;
-\ unlinked and path-mismatch stand.
-: UNCONFIRMED ( reply -- reply )
-   {: m:reply :}
-   m MISMATCH? if m exit then
-   m MATCH reply
-      done OF 0 RETRY ENDOF
-      refused OF drop 0 RETRY ENDOF
-      retry OF RETRY ENDOF
-      unlinked OF construct reply unlinked ENDOF
-   ;MATCH ;
-
-
-: NOT-FOUND? ( reply -- bool )
-   MATCH reply
-      done OF false ENDOF
-      refused OF construct error not-found DROPBOX-ERROR:EQ ENDOF
-      retry OF drop false ENDOF
-      unlinked OF false ENDOF
-   ;MATCH ;
-
-
 : UNLINKED? ( reply -- bool )
    MATCH reply
       done OF false ENDOF
@@ -2195,23 +2174,10 @@ private
    ;MATCH ;
 
 
-: FOLDER? ( ^entry -- bool )
-   DROPBOX-ENTRY:KIND @ construct kind folder DROPBOX-KIND:EQ ;
-
-
 \ The path is absent, as a delete intends: done, with the entry cleared,
 \ as Dropbox holds none.
 : ABSENT ( ^client -- reply )
    CLIENT-ENTRY ENTRY-CLEAR construct reply done ;
-
-
-\ A lost delete took effect only if the path is now not found or deleted.
-: GONE ( ^u8 n ^client -- reply )
-   {: p:^ pu:n c :}
-   p pu c METADATA {: r:reply :}
-   r NOT-FOUND? r DONE? c CLIENT-ENTRY DELETED? and or
-   if c ABSENT exit then
-   r UNCONFIRMED ;
 
 
 \ not-found is done: Dropbox holds nothing at the path.
@@ -2221,25 +2187,21 @@ private
    e construct reply refused ;
 
 
-\ A lost create-folder took effect only if the path is now a folder.
-: MADE ( ^u8 n ^client -- reply )
-   {: p:^ pu:n c :}
-   p pu c METADATA {: r:reply :}
-   r DONE? c CLIENT-ENTRY FOLDER? and if r exit then
-   r UNCONFIRMED ;
+: UNVERIFIED ( -- reply )
+   construct error unverified construct reply refused ;
 
 
-\ done stands if `read` finds its entry at the path; a lost answer or one
-\ elsewhere goes to `lost`, which confirms it; a refusal to `refusal`.
-: MUTATE ( ^client ^u8 n [ ^client -- bool ] [ ^client -- reply ]
+\ done stands if `read` finds its intended entry at the path; a lost
+\ answer or another entry is unverified; a refusal goes to `refusal`.
+: MUTATE ( ^client ^u8 n [ ^client -- bool ]
            [ error ^client -- reply ] -- reply )
-   {: c rt:^ rtu:n read lost refusal :}
+   {: c rt:^ rtu:n read refusal :}
    c rt rtu [: JSON-BODY ;] CALL {: r:reply :}
-   c LOST? if c lost execute exit then
+   c LOST? if UNVERIFIED exit then
    r MATCH reply
       done OF
          c read execute
-         if construct reply done else c lost execute then
+         if construct reply done else UNVERIFIED then
       ENDOF
       refused OF c refusal execute ENDOF
       retry OF RETRY ENDOF
@@ -2298,7 +2260,6 @@ public
    {: p:^ pu:n r:^ ru:n c :}
    p pu r ru c DELETE-BODY
    c s" files/delete_v2" [: drop p pu r ru c DELETED-READ ;]
-   [: drop p pu c GONE ;]
    [: DELETE-REFUSED ;] MUTATE ;
 
 
@@ -2307,7 +2268,6 @@ public
    {: p:^ pu:n c :}
    p pu c FOLDER-BODY
    c s" files/create_folder_v2" [: drop p pu c MADE-READ ;]
-   [: drop p pu c MADE ;]
    [: drop construct reply refused ;] MUTATE ;
 
 
@@ -2330,8 +2290,8 @@ public
 \ no content_hash, as Dropbox checks that field against the call's own
 \ bytes. A lost answer to the upload or the finish, or a 2xx answer that
 \ is not the upload's complete entry at its path with its content hash,
-\ is confirmed by get_metadata; a conflict is answered as refused. A
-\ run's chunk buffer is MEM's, released before UPLOAD answers or throws.
+\ is refused unverified; a conflict is answered as refused. A run's chunk
+\ buffer is MEM's, released before UPLOAD answers or throws.
 
 public
 
@@ -2725,8 +2685,7 @@ HEAP RUNS run
 \ ---- the machine
 
 ENUM upload-step
-   single starting appending finishing confirming verifying restarting
-   ended ;ENUM
+   single starting appending finishing verifying restarting ended ;ENUM
 ENUM send-event committed untrusted lost failed ;ENUM
 ENUM start-event opened lost failed ;ENUM
 ENUM append-event stored complete lost cut gone failed ;ENUM
@@ -2806,8 +2765,8 @@ ENUM restart-event once twice ;ENUM
    construct finish-event failed ;
 
 
-\ get_metadata of the path: same for a file with the upload's content hash;
-\ a retry it answers becomes the last reply.
+\ get_metadata of the path: same for a complete file with the upload's
+\ content hash; a retry it answers becomes the last reply.
 : CONFIRM-SENSE ( ^run -- confirm-event )
    {: r :}
    r RUN-CLIENT @ {: c :}
@@ -2819,7 +2778,7 @@ ENUM restart-event once twice ;ENUM
    m DONE? 0= if construct confirm-event other exit then
    c CLIENT-ENTRY {: e :}
    e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$
-   up DROPBOX-UPLOAD:CONTENT-HASH @ SPAN:$ STR= e FILE? and
+   up DROPBOX-UPLOAD:CONTENT-HASH @ SPAN:$ STR= e COMPLETE? and
    if construct confirm-event same exit then
    construct confirm-event other ;
 
@@ -2851,13 +2810,12 @@ ENUM restart-event once twice ;ENUM
    r RUN-ANSWER ! ;
 
 
-\ A done answer that is not the upload's entry, as a lost one: retry
-\ unless confirmed.
-: DISTRUST ( ^run -- ) {: r :} 0 RETRY r RUN-LAST ! ;
+: ANSWER-UNVERIFIED ( ^run -- )
+   {: r :}
+   UNVERIFIED r RUN-ANSWER ! ;
 
 
-\ Answers the last call's reply as it came, or as DISTRUST or
-\ CONFIRM-SENSE set it.
+\ Answers the last call's reply as it came, or as CONFIRM-SENSE set it.
 : ANSWER-REPLY ( ^run -- ) {: r :} r RUN-LAST @ r RUN-ANSWER ! ;
 
 
@@ -2872,16 +2830,14 @@ ENUM restart-event once twice ;ENUM
    0 r RUN-ACCEPTED ! false r RUN-RESENT ! ;
 
 
-\ confirming asks whether an upload whose answer was lost or not its entry
-\ took effect; verifying asks whether a finish whose session is gone was
-\ a resend Dropbox already committed, and starts over only when it was
-\ not.
+\ verifying asks whether a finish whose session is gone was a resend
+\ Dropbox already committed, and starts over only when it was not.
 FSM:DEFINE SESSION ( ^run ) upload-step send-event
    IN single  SEND-SENSE
-      committed  ANSWER-DONE   >ended
-      untrusted  DISTRUST      >confirming
-      lost       -             >confirming
-      failed     ANSWER-REPLY  >ended
+      committed  ANSWER-DONE        >ended
+      untrusted  ANSWER-UNVERIFIED  >ended
+      lost       ANSWER-UNVERIFIED  >ended
+      failed     ANSWER-REPLY       >ended
    IN starting  START-SENSE ( start-event )
       opened  -             >appending
       lost    ANSWER-RETRY  >ended
@@ -2894,17 +2850,11 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
       gone      -              >restarting
       failed    ANSWER-REPLY   >ended
    IN finishing  FINISH-SENSE ( finish-event )
-      committed  ANSWER-DONE   >ended
-      untrusted  DISTRUST      >confirming
-      lost       -             >confirming
-      gone       -             >verifying
-      failed     ANSWER-REPLY  >ended
-   IN confirming  CONFIRM-SENSE ( confirm-event )
-      same       ANSWER-DONE      >ended
-      elsewhere  ANSWER-MISMATCH  >ended
-      wait       ANSWER-REPLY     >ended
-      other      ANSWER-REPLY     >ended
-      unlinked   ANSWER-UNLINKED  >ended
+      committed  ANSWER-DONE        >ended
+      untrusted  ANSWER-UNVERIFIED  >ended
+      lost       ANSWER-UNVERIFIED  >ended
+      gone       -                  >verifying
+      failed     ANSWER-REPLY       >ended
    IN verifying  CONFIRM-SENSE ( confirm-event )
       same       ANSWER-DONE      >ended
       elsewhere  ANSWER-MISMATCH  >ended

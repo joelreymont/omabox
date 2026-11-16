@@ -27,15 +27,15 @@
 \ Dropbox-API-Result or an error that does not parse), delete,
 \ create-folder, the code exchange, Dropbox's content hash and uploads,
 \ whose stages are written under TMPDIR and removed once open, so no run
-\ leaves one; a mutation or session finish Dropbox answers
-\ at another path, an upload's or finish's that get_metadata then does not
-\ find, an upload's or finish's answer that does not parse, which it
-\ finds, an upload confirmation Dropbox asks to wait on, a delete,
+\ leaves one; a lost mutation or session finish, one Dropbox answers at
+\ another path, a delete it answers with a file at another rev, and an
+\ upload's or finish's answer that does not parse or carries another
+\ content hash, each refused unverified with no get_metadata; a finish
+\ whose session is gone and whose get_metadata finds the upload's content
+\ hash on a file with no rev, restarted, not done; a delete,
 \ create-folder or upload conflict answered as refused with no
-\ get_metadata, even where Dropbox already holds what it asked for, a
-\ delete it answers with a folder or a file at another rev, and a lost
-\ delete whose confirmation finds the path deleted. Tests of
-\ tests/dropbox_fake.rs run
+\ get_metadata, even where Dropbox already holds what it asked for.
+\ Tests of tests/dropbox_fake.rs run
 \ under their names: a_refused_grant_becomes_a_rejected_token,
 \ a_rotated_refresh_token_is_stored_before_the_new_token_is_published,
 \ an_unstored_rotation_stays_usable_and_is_retried,
@@ -43,9 +43,8 @@
 \ sdk_expiry_refresh_reissues_the_route_with_the_same_client,
 \ long_poll_exposes_reset_and_rate_limit_outcomes,
 \ oauth_rate_limit_preserves_retry_after_header,
-\ oauth_listing_longpoll_and_exact_download_use_documented_protocol,
-\ conditional_mutations_use_strict_documented_requests and
-\ verification_without_a_lowercase_path_is_invalid_metadata. One server
+\ oauth_listing_longpoll_and_exact_download_use_documented_protocol and
+\ conditional_mutations_use_strict_documented_requests. One server
 \ and one main client serve every case; a case that needs another config
 \ opens its own client.
 \ DROPBOX's log lines go to stderr, but those a case checks, which are
@@ -1773,6 +1772,10 @@ TYPED-VARIABLE ZEROED bool
 : BUSY! ( -- ) 503 s" Retry-After" s" 3" s" " TEST-DROPBOX:SCRIPT! ;
 
 
+\ No get_metadata went out since RESET.
+: NO-LOOKUP ( -- ) s" /2/files/get_metadata" TEST-DROPBOX:CALLS 0 T= ;
+
+
 \ The next call answers path_write/conflict, as delete_v2 does.
 : DELETE-CONFLICT! ( -- )
    409 s" " s" "
@@ -1817,38 +1820,12 @@ TYPED-VARIABLE ZEROED bool
    TEST-DROPBOX:RESET
    s" /lost.txt" s" rev-lost" DELETED-FILE
    TEST-DROPBOX:LOSE
-   s" /lost.txt" s" " MAIN @ DROPBOX:DELETE DONE? ASSERT
-   DROPBOX-KIND:DELETED KIND? TTRUE
-   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
-
-
-\ A lost delete whose confirmation finds the path's entry deleted, where
-\ the fake alone would still find the file.
-: DELETED-ENTRY-CASE ( -- )
-   s" lost delete, confirmation deleted" T-LABEL
-   TEST-DROPBOX:RESET
-   s" /went.txt" s" rev-went" DELETED-FILE
-   s" /2/files/get_metadata" 200 s" " s" "
-   S\" {\q.tag\q:\qdeleted\q,\qname\q:\qwent.txt\q,\qpath_lower\q:\q/went.txt\q,\qpath_display\q:\q/went.txt\q}"
-   TEST-DROPBOX:ROUTE-SCRIPT!
-   TEST-DROPBOX:CUT
-   s" /went.txt" s" " MAIN @ DROPBOX:DELETE DONE? ASSERT
-   DROPBOX-KIND:DELETED KIND? TTRUE
-   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
-
-
-\ A delete lost before Dropbox applied it: the path is still there.
-: CUT-DELETE-CASE ( -- )
-   s" lost delete not applied" T-LABEL
-   TEST-DROPBOX:RESET
-   s" /kept.txt" s" rev-kept" DELETED-FILE
-   TEST-DROPBOX:CUT
-   s" /kept.txt" s" " MAIN @ DROPBOX:DELETE RETRY-MS 0 T=
-   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
+   s" /lost.txt" s" " MAIN @ DROPBOX:DELETE UNVERIFIED? ASSERT
+   NO-LOOKUP ;
 
 
 \ A delete answered with the entry at /Ä.txt as its path_lower, not the
-\ full lowercase, which get_metadata then finds too.
+\ full lowercase.
 : DELETE-ELSEWHERE-CASE ( -- )
    s" delete answered at another path" T-LABEL
    TEST-DROPBOX:RESET
@@ -1856,13 +1833,11 @@ TYPED-VARIABLE ZEROED bool
    200 s" " s" "
    S\" {\qmetadata\q:{\q.tag\q:\qfile\q,\qpath_lower\q:\q/\xc3\x84.txt\q,\qpath_display\q:\q/\xc3\x84.txt\q,\qrev\q:\qrev-a\q,\qsize\q:0,\qcontent_hash\q:\qe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\q}}"
    TEST-DROPBOX:SCRIPT!
-   S\" /\xc3\x84.txt" s" rev-a" MAIN @ DROPBOX:DELETE
-   DROPBOX-ERROR:PATH-MISMATCH REFUSED? ASSERT
-   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
+   S\" /\xc3\x84.txt" s" rev-a" MAIN @ DROPBOX:DELETE UNVERIFIED? ASSERT
+   NO-LOOKUP ;
 
 
-\ A delete answered with the file at another rev, which get_metadata
-\ finds still there at the rev asked.
+\ A delete answered with the file at another rev than the one asked.
 : DELETE-REV-CASE ( -- )
    s" delete answered at another rev" T-LABEL
    TEST-DROPBOX:RESET
@@ -1870,37 +1845,8 @@ TYPED-VARIABLE ZEROED bool
    200 s" " s" "
    S\" {\qmetadata\q:{\q.tag\q:\qfile\q,\qpath_lower\q:\q/rev.txt\q,\qpath_display\q:\q/rev.txt\q,\qrev\q:\qrev-old\q,\qsize\q:0,\qcontent_hash\q:\qe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\q}}"
    TEST-DROPBOX:SCRIPT!
-   s" /rev.txt" s" rev-new" MAIN @ DROPBOX:DELETE RETRY-MS 0 T=
-   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
-
-
-\ A delete answered with a folder, which get_metadata finds gone.
-: DELETE-AS-FOLDER-CASE ( -- )
-   s" delete answered with a folder" T-LABEL
-   TEST-DROPBOX:RESET
-   200 s" " s" "
-   S\" {\qmetadata\q:{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/dir\q,\qpath_display\q:\q/dir\q}}"
-   TEST-DROPBOX:SCRIPT!
-   s" /dir" s" rev-dir" MAIN @ DROPBOX:DELETE DONE? ASSERT
-   DROPBOX-KIND:DELETED KIND? TTRUE
-   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
-
-
-: DELETE-UNLINKED ( -- )
-   s" /kept.txt" s" " MAIN @ DROPBOX:DELETE UNLINKED? OUTCOME ! ;
-
-
-\ A lost delete whose confirmation Dropbox refuses 403: unlinked.
-: DENIED-DELETE-CASE ( -- )
-   s" lost delete, confirmation denied" T-LABEL
-   TEST-DROPBOX:RESET
-   s" /kept.txt" s" rev-kept" DELETED-FILE
-   TEST-DROPBOX:CUT TEST-DROPBOX:DENY
-   false OUTCOME !
-   [: DELETE-UNLINKED ;] LOGGED 0 T=
-   OUTCOME @ TTRUE
-   s" error dropbox: files/get_metadata unlinked: 403" LOGGED? TTRUE
-   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
+   s" /rev.txt" s" rev-new" MAIN @ DROPBOX:DELETE UNVERIFIED? ASSERT
+   NO-LOOKUP ;
 
 
 : FOLDER-CONFLICT-CASE ( -- )
@@ -1924,54 +1870,21 @@ TYPED-VARIABLE ZEROED bool
    s" lost create-folder" T-LABEL
    TEST-DROPBOX:RESET
    TEST-DROPBOX:LOSE
-   s" /lost-made" MAIN @ DROPBOX:CREATE-FOLDER DONE? ASSERT
-   DROPBOX-KIND:FOLDER KIND? TTRUE
-   LOWER$ s" /lost-made" T$=
-   TEST-DROPBOX:SEEN$
-   s" /2/files/create_folder_v2 /2/files/get_metadata" T$= ;
+   s" /lost-made" MAIN @ DROPBOX:CREATE-FOLDER UNVERIFIED? ASSERT
+   NO-LOOKUP ;
 
 
 \ The fake answers the folder's path as its path_lower, which for /Ä is
-\ not the full lowercase, and get_metadata confirms it.
+\ not the full lowercase.
 : FOLDER-ELSEWHERE-CASE ( -- )
    s" create-folder answered at another path" T-LABEL
    TEST-DROPBOX:RESET
-   S\" /\xc3\x84" MAIN @ DROPBOX:CREATE-FOLDER
-   DROPBOX-ERROR:PATH-MISMATCH REFUSED? ASSERT
-   TEST-DROPBOX:SEEN$
-   s" /2/files/create_folder_v2 /2/files/get_metadata" T$= ;
+   S\" /\xc3\x84" MAIN @ DROPBOX:CREATE-FOLDER UNVERIFIED? ASSERT
+   NO-LOOKUP ;
 
 
-\ A create-folder lost before Dropbox applied it: no folder is there.
-: CUT-FOLDER-CASE ( -- )
-   s" lost create-folder not applied" T-LABEL
-   TEST-DROPBOX:RESET
-   TEST-DROPBOX:CUT
-   s" /cut-made" MAIN @ DROPBOX:CREATE-FOLDER RETRY-MS 0 T=
-   TEST-DROPBOX:SEEN$
-   s" /2/files/create_folder_v2 /2/files/get_metadata" T$= ;
-
-
-: CUT-FOLDER-UNLINKED ( -- )
-   s" /cut-made" MAIN @ DROPBOX:CREATE-FOLDER UNLINKED? OUTCOME ! ;
-
-
-\ A create-folder lost before Dropbox applied it whose confirmation Dropbox
-\ refuses 403: unlinked.
-: DENIED-CUT-FOLDER-CASE ( -- )
-   s" lost create-folder, confirmation denied" T-LABEL
-   TEST-DROPBOX:RESET
-   TEST-DROPBOX:CUT TEST-DROPBOX:DENY
-   false OUTCOME !
-   [: CUT-FOLDER-UNLINKED ;] LOGGED 0 T=
-   OUTCOME @ TTRUE
-   s" error dropbox: files/get_metadata unlinked: 403" LOGGED? TTRUE
-   TEST-DROPBOX:SEEN$
-   s" /2/files/create_folder_v2 /2/files/get_metadata" T$= ;
-
-
-\ A delete refused for an expired token, whose refresh is lost: retried,
-\ and neither resent nor confirmed, so the path is still there.
+\ A delete refused for an expired token, whose refresh is lost: retry 0,
+\ not resent, so the path is still there.
 : LOST-REFRESH-CASE ( -- )
    s" refresh lost during a delete" T-LABEL
    TEST-DROPBOX:RESET
@@ -2104,8 +2017,8 @@ variable SHOWS
 variable FAULT-AT
 variable STRIKES
 ENUM fault
-   cut cut-twice lose close unfound applied offset denied elsewhere busy
-   garbled
+   cut cut-twice lose close unfound applied offset denied busy garbled
+   revless
 ;ENUM
 TYPED-VARIABLE FAULT fault
 
@@ -2181,11 +2094,15 @@ TYPED-VARIABLE FAULT fault
    TEST-DROPBOX:FILE! ;
 
 
-\ The next call answers done with a file at /other.bin.
-: ELSEWHERE! ( -- )
-   200 s" " s" "
-   S\" {\qname\q:\qother.bin\q,\qid\q:\qid:o\q,\qpath_lower\q:\q/other.bin\q,\qpath_display\q:\q/other.bin\q,\qrev\q:\q0180a\q,\qsize\q:12,\qcontent_hash\q:\q0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\q,\qis_downloadable\q:true}"
-   TEST-DROPBOX:SCRIPT! ;
+\ The next call finds the big file with the upload's content hash and no
+\ rev, which Dropbox does not answer for a file it committed.
+: REVLESS! ( -- )
+   SB-RESET
+   S\" {\q.tag\q:\qfile\q,\qname\q:\qBig.bin\q,\qid\q:\qid:b\q,\qpath_lower\q:\q/big.bin\q,\qpath_display\q:\q/Big.bin\q,\qsize\q:"
+   SB-APPEND CHUNK 1+ FMT:INT$ SB-APPEND
+   S\" ,\qcontent_hash\q:\q" SB-APPEND EXPECTED$ SB-APPEND
+   S\" \q,\qis_downloadable\q:true}" SB-APPEND
+   200 s" " s" " SB$ TEST-DROPBOX:SCRIPT! ;
 
 
 \ The next call answers done with a body that does not parse.
@@ -2209,9 +2126,9 @@ TYPED-VARIABLE FAULT fault
       applied OF UNFOUND APPLIED ENDOF
       offset OF OFFSET! ENDOF
       denied OF UNFOUND TEST-DROPBOX:DENY ENDOF
-      elsewhere OF ELSEWHERE! ENDOF
       busy OF UNFOUND BUSY! ENDOF
       garbled OF GARBLED! APPLIED ENDOF
+      revless OF UNFOUND REVLESS! ENDOF
    ;MATCH ;
 
 
@@ -2335,63 +2252,13 @@ TYPED-VARIABLE FAULT fault
 
 
 \ The fake lowers ASCII alone, so its path_lower folds equal to the upload
-\ path but is not its full lowercase, and get_metadata confirms it.
+\ path but is not its full lowercase.
 : OTHER-CASE-CASE ( -- )
    s" committed path of another case" T-LABEL
    TEST-DROPBOX:RESET -1 FAULT-AT !
    s" cafe.txt" STAGE! s" hello cafe" S\" /Docs/CAF\xc3\x89.txt" s" " STAGED
-   SEND DROPBOX-ERROR:PATH-MISMATCH REFUSED? ASSERT
-   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
-   UNSTAGED ;
-
-
-\ An upload answered at another path that get_metadata does not find:
-\ retry, as a lost upload is.
-: UNFOUND-ELSEWHERE-CASE ( -- )
-   s" upload answered at another path, not found" T-LABEL
-   TEST-DROPBOX:RESET -1 FAULT-AT !
-   s" cafe.txt" STAGE! s" hello cafe" S\" /Docs/CAF\xc3\x89.txt" s" " STAGED
-   200 s" " s" "
-   S\" {\qname\q:\qCAF\xc3\x89.txt\q,\qid\q:\qid:a\q,\qpath_lower\q:\q/docs/caf\xc3\x89.txt\q,\qpath_display\q:\q/Docs/CAF\xc3\x89.txt\q,\qrev\q:\q0170a\q,\qsize\q:10,\qcontent_hash\q:\q0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\q,\qis_downloadable\q:true}"
-   TEST-DROPBOX:SCRIPT!
-   SEND RETRY-MS 0 T=
-   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
-   UNSTAGED ;
-
-
-\ An upload answered at another path whose confirmation answers the file
-\ with no path_lower: the entry does not parse, and nothing is confirmed.
-: VERIFICATION-WITHOUT-A-LOWERCASE-PATH-IS-INVALID-METADATA ( -- )
-   s" verification_without_a_lowercase_path_is_invalid_metadata" T-LABEL
-   TEST-DROPBOX:RESET -1 FAULT-AT !
-   s" bad.txt" STAGE! s" moved bytes" s" /bad.txt" s" " STAGED
-   200 s" " s" "
-   SB-RESET S\" {\qname\q:\qmoved.txt\q,\qid\q:\qid:m\q,\qpath_lower\q:\q/moved.txt\q," SB-APPEND
-   S\" \qpath_display\q:\q/moved.txt\q,\qrev\q:\qmoved-rev\q,\qsize\q:11," SB-APPEND
-   S\" \qcontent_hash\q:\q" SB-APPEND EXPECTED$ SB-APPEND
-   S\" \q,\qis_downloadable\q:true}" SB-APPEND SB$
-   TEST-DROPBOX:SCRIPT!
-   200 s" " s" "
-   SB-RESET S\" {\q.tag\q:\qfile\q,\qname\q:\qbad.txt\q,\qid\q:\qid:b\q," SB-APPEND
-   S\" \qrev\q:\qbad-rev\q,\qsize\q:11,\qcontent_hash\q:\q" SB-APPEND
-   EXPECTED$ SB-APPEND S\" \q,\qis_downloadable\q:true}" SB-APPEND SB$
-   TEST-DROPBOX:SCRIPT!
-   SEND-LOGGED DROPBOX:E-ANSWER T=
-   s" error dropbox: files/get_metadata answered 200: an incomplete entry"
-   LOGGED? TTRUE
-   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
-   UNSTAGED ;
-
-
-\ An upload answered at another path whose confirmation asks to wait:
-\ the confirmation's retry.
-: BUSY-ELSEWHERE-CASE ( -- )
-   s" upload answered at another path, confirmation busy" T-LABEL
-   TEST-DROPBOX:RESET -1 FAULT-AT !
-   s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
-   ELSEWHERE! BUSY!
-   SEND RETRY-MS 3000 T=
-   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
+   SEND UNVERIFIED? ASSERT
+   NO-LOOKUP
    UNSTAGED ;
 
 
@@ -2483,78 +2350,44 @@ TYPED-VARIABLE FAULT fault
    UNSTAGED ;
 
 
-\ A single upload lost before Dropbox committed it: the confirmation finds
-\ no file, so the lost call's retry stands.
-: CUT-SINGLE-CASE ( -- )
-   s" lost upload not applied" T-LABEL
-   TEST-DROPBOX:RESET -1 FAULT-AT !
-   s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
-   TEST-DROPBOX:CUT
-   SEND RETRY-MS 0 T=
-   SHOWS @ 0 T=
-   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
-   UNSTAGED ;
-
-
 : SEND-UNLINKED ( -- ) SEND UNLINKED? OUTCOME ! ;
 
 
-: SEND-APPLIED ( -- ) SEND DONE? OUTCOME ! ;
+: SEND-UNVERIFIED ( -- ) SEND UNVERIFIED? OUTCOME ! ;
 
 
-\ An upload whose answer does not parse, logged, and get_metadata finds
-\ the file with its content hash.
+\ An upload whose answer does not parse, logged, though Dropbox holds the
+\ file with its content hash.
 : GARBLED-SINGLE-CASE ( -- )
-   s" upload answer that does not parse, applied" T-LABEL
+   s" upload answer that does not parse" T-LABEL
    TEST-DROPBOX:RESET -1 FAULT-AT !
    s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
    s" /docs/up.txt" s" /Docs/Up.txt" s" 0160a" EXPECTED$ 12 TEST-DROPBOX:FILE!
    GARBLED!
    false OUTCOME !
-   [: SEND-APPLIED ;] LOGGED 0 T=
+   [: SEND-UNVERIFIED ;] LOGGED 0 T=
    OUTCOME @ TTRUE
    s" error dropbox: files/upload answered 200: an answer that does not parse"
    LOGGED? TTRUE
-   ENTRY-HASH$ EXPECTED$ T$=
-   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
+   NO-LOOKUP
    UNSTAGED ;
 
 
-\ A lost single upload whose confirmation Dropbox refuses 403: unlinked.
-: DENIED-SINGLE-CASE ( -- )
-   s" lost upload, confirmation denied" T-LABEL
-   TEST-DROPBOX:RESET -1 FAULT-AT !
-   s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
-   TEST-DROPBOX:CUT TEST-DROPBOX:DENY
-   false OUTCOME !
-   [: SEND-UNLINKED ;] LOGGED 0 T=
-   OUTCOME @ TTRUE
-   s" error dropbox: files/get_metadata unlinked: 403" LOGGED? TTRUE
-   SHOWS @ 0 T=
-   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
-   UNSTAGED ;
-
-
-\ A single upload lost after Dropbox committed it: the confirmation finds
-\ the file with its content hash.
+\ A single upload lost after Dropbox committed it: no progress shows.
 : LOST-SINGLE-CASE ( -- )
-   s" lost upload applied" T-LABEL
+   s" lost upload" T-LABEL
    TEST-DROPBOX:RESET -1 FAULT-AT !
    s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
    TEST-DROPBOX:LOSE
-   SEND DONE? ASSERT
-   ENTRY-HASH$ EXPECTED$ T$=
-   SHOWN @ 12 T=
-   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
+   SEND UNVERIFIED? ASSERT
+   SHOWS @ 0 T=
+   NO-LOOKUP
    UNSTAGED ;
 
 
 : SINGLE-CASES ( -- )
    CONDITIONAL-MUTATIONS-USE-STRICT-DOCUMENTED-REQUESTS
    CONFLICT-CASE HELD-CASE NON-ASCII-CASE OTHER-CASE-CASE
-   UNFOUND-ELSEWHERE-CASE
-   VERIFICATION-WITHOUT-A-LOWERCASE-PATH-IS-INVALID-METADATA
-   BUSY-ELSEWHERE-CASE CUT-SINGLE-CASE DENIED-SINGLE-CASE
    GARBLED-SINGLE-CASE LOST-SINGLE-CASE SHORT-STAGE-CASE REFUSED-STAGE-CASE FULL-READ-CASE
    ENTERED-READ-CASE TIMED-OUT-READ-CASE CANCELLED-READ-CASE ;
 
@@ -2640,9 +2473,9 @@ TYPED-VARIABLE FAULT fault
 
 : LOST-FINISH-CASE ( -- )
    s" lost finish" T-LABEL
+   CHUNK 1+ construct fault lose 1 STRUCK UNVERIFIED? ASSERT
    SB-RESET S-START S-APPEND S-APPEND S-FINISH
-   s"  /2/files/get_metadata" SB-APPEND
-   CHUNK 1+ construct fault lose FAULTED ;
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
 
 
 \ The second chunk's answer lost on its append and again on the resend.
@@ -2661,29 +2494,24 @@ TYPED-VARIABLE FAULT fault
    TEST-DROPBOX:SEEN$ SB$ T$= ;
 
 
-\ The upload's content hash is not that of the bytes Dropbox commits:
-\ get_metadata finds those bytes, so the finish's retry 0 stands.
+\ The upload's content hash is not that of the bytes Dropbox commits.
 : MISMATCH-CASE ( -- )
    s" committed content hash mismatch" T-LABEL
    s" 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
    SPAN:MAKE UP DROPBOX-UPLOAD:CONTENT-HASH !
-   -1 construct fault cut 1 STRUCK RETRY-MS 0 T=
-   ENTRY-HASH$ EXPECTED$ T$=
+   -1 construct fault cut 1 STRUCK UNVERIFIED? ASSERT
    SB-RESET S-START S-APPEND S-APPEND S-FINISH
-   s"  /2/files/get_metadata" SB-APPEND
    TEST-DROPBOX:SEEN$ SB$ T$=
    EXPECTED$ SPAN:MAKE UP DROPBOX-UPLOAD:CONTENT-HASH ! ;
 
 
 \ The fake lowers ASCII alone, so the finish's path_lower is not /É.bin's
-\ full lowercase, and get_metadata confirms it.
+\ full lowercase.
 : FINISH-ELSEWHERE-CASE ( -- )
    s" finish answered at another path" T-LABEL
    S\" /\xc3\x89.bin" SPAN:MAKE UP DROPBOX-UPLOAD:PATH !
-   -1 construct fault cut 1 STRUCK
-   DROPBOX-ERROR:PATH-MISMATCH REFUSED? ASSERT
+   -1 construct fault cut 1 STRUCK UNVERIFIED? ASSERT
    SB-RESET S-START S-APPEND S-APPEND S-FINISH
-   s"  /2/files/get_metadata" SB-APPEND
    TEST-DROPBOX:SEEN$ SB$ T$=
    s" /Big.bin" SPAN:MAKE UP DROPBOX-UPLOAD:PATH ! ;
 
@@ -2716,30 +2544,30 @@ TYPED-VARIABLE FAULT fault
    CHUNK 1+ construct fault unfound FAULTED ;
 
 
-\ A finish answered at another path that get_metadata does not find:
-\ retry 0, as a lost finish is.
-: UNFOUND-ELSEWHERE-FINISH-CASE ( -- )
-   s" finish answered at another path, not found" T-LABEL
-   CHUNK 1+ construct fault elsewhere 1 STRUCK RETRY-MS 0 T=
+\ A finish gone twice, each time with the file Dropbox holds incomplete:
+\ not the upload's entry, so it restarts, and then retries.
+: REVLESS-FINISH-CASE ( -- )
+   s" finish gone, held with no rev" T-LABEL
+   CHUNK 1+ construct fault revless 2 STRUCK RETRY-MS 0 T=
    SB-RESET S-START S-APPEND S-APPEND S-FINISH
+   s"  /2/files/get_metadata" SB-APPEND
+   S-RESTART S-APPEND S-APPEND S-FINISH
    s"  /2/files/get_metadata" SB-APPEND
    TEST-DROPBOX:SEEN$ SB$ T$= ;
 
 
-\ A finish whose answer does not parse, logged, and get_metadata finds
-\ the file Dropbox committed.
+\ A finish whose answer does not parse, logged, though Dropbox holds the
+\ file it committed.
 : GARBLED-FINISH-CASE ( -- )
-   s" finish answer that does not parse, applied" T-LABEL
+   s" finish answer that does not parse" T-LABEL
    1 STRIKES ! construct fault garbled FAULT ! CHUNK 1+ FAULT-AT !
    TEST-DROPBOX:RESET
    false OUTCOME !
-   [: SEND-APPLIED ;] LOGGED 0 T=
+   [: SEND-UNVERIFIED ;] LOGGED 0 T=
    OUTCOME @ TTRUE
    s" error dropbox: files/upload_session/finish answered 200: an answer that does not parse"
    LOGGED? TTRUE
-   ENTRY-HASH$ EXPECTED$ T$=
    SB-RESET S-START S-APPEND S-APPEND S-FINISH
-   s"  /2/files/get_metadata" SB-APPEND
    TEST-DROPBOX:SEEN$ SB$ T$= ;
 
 
@@ -2772,9 +2600,9 @@ TYPED-VARIABLE FAULT fault
    BIG-STAGED
    SESSION-CASE LOST-APPEND-CASE HELD-APPEND-CASE OFFSET-APPEND-CASE
    CLOSED-CASE LOST-START-CASE LOST-FINISH-CASE APPLIED-FINISH-CASE
-   UNFOUND-FINISH-CASE DENIED-FINISH-CASE CUT-APPEND-CASE CLOSED-TWICE-CASE
-   MISMATCH-CASE FINISH-ELSEWHERE-CASE UNFOUND-ELSEWHERE-FINISH-CASE
-   GARBLED-FINISH-CASE BUSY-FINISH-CASE
+   UNFOUND-FINISH-CASE REVLESS-FINISH-CASE DENIED-FINISH-CASE
+   CUT-APPEND-CASE CLOSED-TWICE-CASE
+   MISMATCH-CASE FINISH-ELSEWHERE-CASE GARBLED-FINISH-CASE BUSY-FINISH-CASE
    ENDED-EARLY-CASE
    UNSTAGED ;
 
@@ -2801,10 +2629,8 @@ TYPED-VARIABLE FAULT fault
    POLL-CASE LONG-POLL-EXPOSES-RESET-AND-RATE-LIMIT-OUTCOMES
    DOWNLOAD-CASES
    DELETE-CONFLICT-CASE DELETE-MISSING-CASE DELETE-GONE-CASE
-   LOST-DELETE-CASE DELETED-ENTRY-CASE CUT-DELETE-CASE DELETE-ELSEWHERE-CASE
-   DELETE-REV-CASE DELETE-AS-FOLDER-CASE DENIED-DELETE-CASE
+   LOST-DELETE-CASE DELETE-ELSEWHERE-CASE DELETE-REV-CASE
    FOLDER-CONFLICT-CASE LOST-FOLDER-CASE FOLDER-ELSEWHERE-CASE
-   CUT-FOLDER-CASE DENIED-CUT-FOLDER-CASE
    LOST-REFRESH-CASE
    EXCHANGE-CASE DEAD-CODE-CASE RESERVED-REFRESH-CASE RESERVED-CODE-CASE
    OAUTH-LISTING-LONGPOLL-AND-EXACT-DOWNLOAD-USE-DOCUMENTED-PROTOCOL

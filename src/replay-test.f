@@ -55,7 +55,8 @@
 \   with other bytes at the path is read back as changed, and its
 \   finished transfer is sent; one refused as a conflict with its own
 \   bytes at the path is read back as applied; a read-back incomplete
-\   file is rejected, and an incomplete upload answer is read back.
+\   file is rejected, and an incomplete upload answer is read back;
+\   Rust's verification_without_a_lowercase_path_is_invalid_metadata.
 \ - REMOTE-DELETE-FILE without a rev throws E-INVALID-STATE, logging
 \   once, with no request; one refused as a conflict for a path now gone
 \   is read back as applied.
@@ -95,9 +96,9 @@
 \   already_absent_dropbox_directory_completes_its_replayed_delete,
 \   dropbox_file_at_a_deleted_directory_path_retires_the_replayed_delete
 \   and remote_delete_skips_backup_download_and_ambiguous_create_stays_pending,
-\   whose create's lost answer throws E-DROPBOX with a retry in the link
-\   and leaves its plan pending; a plan whose next operation is local is
-\   left pending, unblocked, with no request; Rust's
+\   whose create's lost answer is read back absent, blocking its plan
+\   remote-pending as the pass goes on; a plan whose next operation is
+\   local is left pending, unblocked, with no request; Rust's
 \   remote_replay_preserves_conflict_sides_without_a_backup_download,
 \   folder_delete_probe_failures_keep_the_plan_retry_safe_or_block_only_its_path,
 \   whose 503 throws E-DROPBOX with a retry and leaves its plan pending,
@@ -1473,6 +1474,44 @@ STATUS-CAP BUFFER: STATUS-BUF
 
 : DROP-OUTCOME ( REPLAY:mutation-outcome -- ) drop ;
 
+\ The upload answers the file h at /moved.txt, and get_metadata the file
+\ h at bad.txt with no path_lower, as Rust's fixture does.
+: MOVED-AND-UNPATHED ( ^u8 n -- )
+   {: h:^ hu:n :}
+   SB-RESET
+   S\" {\qname\q:\qmoved.txt\q,\qid\q:\qid:m\q,\qpath_lower\q:\q/moved.txt\q,\qpath_display\q:\q/moved.txt\q,\qrev\q:\qmoved-rev\q,\qsize\q:10,\qcontent_hash\q:\q"
+   SB-APPEND h hu SB-APPEND S\" \q,\qis_downloadable\q:true}" SB-APPEND
+   200 s" " s" " SB$ TEST-DROPBOX:SCRIPT!
+   SB-RESET
+   S\" {\q.tag\q:\qfile\q,\qname\q:\qbad.txt\q,\qid\q:\qid:b\q,\qrev\q:\qbad-rev\q,\qsize\q:10,\qcontent_hash\q:\q"
+   SB-APPEND h hu SB-APPEND S\" \q,\qis_downloadable\q:true}" SB-APPEND
+   200 s" " s" " SB$ TEST-DROPBOX:SCRIPT! ;
+
+: UPLOAD-BAD ( ^REPLAY:link ^LOCAL:staged-upload ^ARENA:arena -- )
+   {: l up ar :}
+   l s" bad.txt" DISPLAY up s" " AS-REV ar REPLAY:REMOTE-UPLOAD
+   DROP-OUTCOME ;
+
+: VERIFICATION-WITHOUT-A-LOWERCASE-PATH-IS-INVALID-METADATA
+   ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   s" verification_without_a_lowercase_path_is_invalid_metadata" T-LABEL
+   TEST-DROPBOX:RESET
+   ar RUNTIME-STATUS {: rt:str st :}
+   st l REPLAY-LINK:STATUS !
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r s s" bad.txt" ar STAGED {: up :}
+   up LOCAL:UPLOAD-CONTENT DROPBOX:HASH>STR str> MOVED-AND-UNPATHED
+   d [: [: l up ar UPLOAD-BAD ;] DROPBOX:E-ANSWER TTHROWSQ ;] ar LOGGED
+   {: t:^ tu:n :}
+   t tu LINE-COUNT 1 T=
+   t tu s" files/get_metadata answered 200: an incomplete entry"
+   CONTAINS? TTRUE
+   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
+   s" /2/files/get_metadata" TEST-DROPBOX:BODIES-TO$
+   S\" {\qpath\q:\q/bad.txt\q,\qinclude_deleted\q:true}" T$=
+   d GONE rt GONE ;
+
 : A-FILE-DELETE-WITHOUT-A-REV-IS-REFUSED ( ^REPLAY:link ^ARENA:arena -- )
    {: l ar :}
    s" a file delete without a revision is refused" T-LABEL
@@ -1511,6 +1550,7 @@ STATUS-CAP BUFFER: STATUS-BUF
    l ar A-HELD-UPLOAD-IS-READ-BACK
    l ar A-READ-BACK-INCOMPLETE-FILE-IS-REJECTED
    l ar AN-INCOMPLETE-UPLOAD-ANSWER-IS-READ-BACK
+   l ar VERIFICATION-WITHOUT-A-LOWERCASE-PATH-IS-INVALID-METADATA
    l ar A-FILE-DELETE-WITHOUT-A-REV-IS-REFUSED
    l ar A-GONE-FILE-IS-READ-BACK ;
 
@@ -3296,6 +3336,21 @@ ARENA FILE-CASES file-case
       sync-error OF drop drop false ENDOF
    ;MATCH ;
 
+: PENDING-AT? ( REPLAY:replay-blocked ^u8 n -- bool )
+   {: b a:^ u :}
+   b MATCH REPLAY:replay-blocked
+      remote-pending OF MODEL:PATH>STR str> a u STR= ENDOF
+      durable-plan OF drop drop false ENDOF
+      local-object OF drop false ENDOF
+      fresh-observation-required OF drop false ENDOF
+      download-required OF drop drop false ENDOF
+      stage-destination-occupied OF drop drop false ENDOF
+      precondition-changed OF drop drop false ENDOF
+      remote-operation OF drop false ENDOF
+      remote-object OF drop false ENDOF
+      sync-error OF drop drop false ENDOF
+   ;MATCH ;
+
 : DROPBOX-FILE-AT-A-DELETED-DIRECTORY-PATH-RETIRES-THE-REPLAYED-DELETE
    ( ^ARENA:arena -- )
    {: ar :}
@@ -3335,17 +3390,19 @@ ARENA FILE-CASES file-case
    j ar JOURNAL:COMPLETED-RECOVERIES VEC:COUNT 0 T=
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2" T$= ;
 
-\ The create of create.txt's "desired bytes", its upload's answer lost
-\ before it took effect, ends the pass on a retry.
-: CREATE-STOPPED ( str str JOURNAL:journal ^ARENA:arena -- )
+\ create.txt's upload of "desired bytes", lost before it took effect, is
+\ read back absent: the plan stays pending and the pass goes on.
+: CREATE-PENDING ( str str JOURNAL:journal ^ARENA:arena -- )
    {: r:str s:str j ar :}
    r s" create.txt" ar INSIDE str> s" desired bytes" FS:WRITE-ALL
    s" desired bytes" ar HASH-OF {: want:DROPBOX:hash :}
    j s" create.txt" want MODEL-OPERATION:CREATE-REMOTE ar PLANNED drop
    TEST-DROPBOX:RESET TEST-DROPBOX:CUT
-   [: j r s ar REMOTE-REPLAYED drop ;] REPLAY:E-DROPBOX TTHROWSQ
-   LINK REPLAY-LINK:REPLY @ RETRY? TTRUE
-   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$= ;
+   j r s ar REMOTE-REPLAYED BLOCKS {: v :}
+   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
+   v VEC:COUNT 1 T=
+   v VEC:COUNT 1 <> if exit then
+   v 0 VEC:AT @ s" create.txt" PENDING-AT? TTRUE ;
 
 : REMOTE-DELETE-SKIPS-BACKUP-DOWNLOAD-AND-AMBIGUOUS-CREATE-STAYS-PENDING
    ( ^ARENA:arena -- )
@@ -3356,7 +3413,7 @@ ARENA FILE-CASES file-case
    ar UPLOAD-DIRS {: d:str r:str s:str j :}
    d s" recovery" ar INSIDE {: rec:str :} rec str> FS:MAKE-DIR
    d r s rec j ar DELETE-REPLAYED
-   r s j ar CREATE-STOPPED
+   r s j ar CREATE-PENDING
    j JOURNAL:CLOSE
    d s" journal.sqlite3" ar INSIDE JOURNAL:OPEN {: again :}
    again ar JOURNAL:PENDING-PLANS VEC:COUNT 1 T=

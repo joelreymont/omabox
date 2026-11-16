@@ -1253,8 +1253,14 @@ private
       unlinked OF r l STOP-PASS ENDOF
    ;MATCH ;
 
-\ One mutation's reply: done answers `applied`; a conflict reads the
-\ path back.
+\ Rust's resolve_explicit_conflict and resolve_ambiguous: Dropbox may
+\ hold the mutation's result.
+: READ-BACK? ( DROPBOX:error -- bool )
+   {: e:DROPBOX:error :}
+   e DROPBOX-ERROR:CONFLICT IS? e DROPBOX-ERROR:UNVERIFIED IS? or ;
+
+\ One mutation's reply: done answers `applied`; a conflict or an
+\ unverified answer reads the path back once.
 : ANSWERED
    ( DROPBOX:reply ^link ^u8 n expectation ^ARENA:arena
      [ -- mutation-outcome ] -- mutation-outcome )
@@ -1262,7 +1268,7 @@ private
    r MATCH DROPBOX:reply
       done OF applied execute ENDOF
       refused OF {: e:DROPBOX:error :}
-         e DROPBOX-ERROR:CONFLICT IS?
+         e READ-BACK?
          if l t tu x ar STATE else e l REJECTED then
       ENDOF
       retry OF drop r l STOP-PASS ENDOF
@@ -1362,12 +1368,8 @@ private
 
 : UPLOADED ( ^sending -- mutation-outcome )
    {: s :}
-   s SENDING-LINK @ CLIENT DROPBOX:ENTRY {: e :}
-   e DROPBOX:COMPLETE? 0= if
-      s SENDING-LINK @ s SENDING-TARGET @ str> s EXPECTED
-      s SENDING-ARENA @ STATE exit
-   then
-   e s SENDING-ARENA @ REMOTE-OF REPLAY-REMOTE--PATH--STATE:FILE APPLIED ;
+   s SENDING-LINK @ CLIENT DROPBOX:ENTRY s SENDING-ARENA @ REMOTE-OF
+   REPLAY-REMOTE--PATH--STATE:FILE APPLIED ;
 
 : SEND ( ^sending -- mutation-outcome )
    {: s :}
