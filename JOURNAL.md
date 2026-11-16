@@ -965,3 +965,36 @@ from the right root had no conflicts.
 Lane times: the renames review's fold-ins 1.4 min; the Nagle hunt
 4.5 min; the three-commit DROPBOX review 13.1 min; the renames review
 8.4 min.
+
+## 2026-11-16: A clean rebase that was wrong
+
+REPLAY's line, fourteen commits, was rebased onto master. Master had
+gained seven commits in the meantime. The rebase had no conflicts, and
+all 474 of REPLAY's checks passed. It was still wrong. One of master's
+commits had DROPBOX hand an incomplete file to the caller, so METADATA
+now answers `done` for a file without a rev or a well-formed hash.
+REPLAY's state read took that entry as a whole file. Neither the checker
+nor a test said so. The lead found it by reading the doc lines that
+commit changed and then each REPLAY word that reads an entry.
+
+Rust puts the same fact in a type. complete_remote_file answers
+`Option<RemoteFile>`, so every caller handles `None`, and a change in
+what may be missing shows up as a compile error at each caller. In
+Habu, the entry is a record of spans, and COMPLETE? is a predicate the
+caller has to remember to ask. The fix is two checks. A read-back
+incomplete file blocks only its plan; Rust ends the pass there, which
+under this repository's rule would meet the same entry on every pass.
+An incomplete upload answer is read back, as Rust does.
+
+The rebase itself ran while a worker was still building on the old
+line. `jj duplicate` put a copy of the fourteen commits onto master
+without touching the originals. The copy was checked and taken as the
+new base. The worker's one commit then moves onto it when it reports.
+
+Merging REPLAY's five lanes also brought back the namespace collisions
+of earlier days. Lanes wrote private helpers with short, generic names:
+SAMPLE, STATUS-OF, FINISHED, NO-STAGE, HELD. Two of them collided in
+one package. Each was renamed at the merge (FETCH-SAMPLE,
+NO-UPLOAD-STAGE, BLOCK-OF). Rust scopes a private function to its
+module. Habu scopes one to its package, and REPLAY's package is 2,100
+lines long.
