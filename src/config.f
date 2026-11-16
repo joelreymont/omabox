@@ -1526,9 +1526,8 @@ ENUM encoding basic literal ml-basic ml-literal ;ENUM
 \ The temporaries' sequence; atomic-add numbers them across tasks.
 variable SEQUENCE
 
-\ A write under way: its directory and that directory's descriptor, the
-\ temporary's name and path, the file's path, the text, and whether it
-\ replaces a config.toml there.
+\ A write under way. anchor is parent's descriptor, name the temporary's
+\ name under it; replace says a config.toml is already there.
 STRUCTURE writing DERIVE addr
    FIELD parent abs-path
    FIELD anchor fd

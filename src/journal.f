@@ -375,9 +375,8 @@ public
    path OWNER-ONLY
    path str> SQLITE:OPEN path JOURNAL-MAKE [: READY ;] SET-UP ;
 
-\ The schema-8 journal at path, never created or changed, named
-\ `[Omabox journal]` in the lines it and the words on it log, as Rust's
-\ status redacts its journal's path.
+\ The schema-8 journal at path, never created or changed. Its log lines
+\ name it `[Omabox journal]`, as Rust's status redacts the path.
 : OPEN-READ ( str -- journal )
    {: path:str :}
    path str> SQLITE:OPEN-READ s" [Omabox journal]" >str JOURNAL-MAKE

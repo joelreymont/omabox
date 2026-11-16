@@ -493,12 +493,8 @@ private
 
 public
 
-\ Rust's Path::cmp: below zero, zero or above zero as the first path's
-\ components sort before, equal or after the second's. A leading "/" is
-\ the root, a leading "." alone or before "/" is ".", ".." is "..", any
-\ other component a name by its bytes; empty and other "." components
-\ are skipped. The root, ".", ".." and a name sort in that order, and a
-\ path that runs out first is less. It allocates nothing.
+\ Rust's Path::cmp by components: the root, ".", ".." and a name sort in
+\ that order, and a path that runs out first is less. Allocates nothing.
 : PATH-CMP ( path path -- n )
    {: a:path b:path :}
    a PATH>STR str> {: p:^ u:n :}
