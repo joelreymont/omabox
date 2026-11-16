@@ -51,6 +51,12 @@
 \ - failed_rebuild_after_cursor_reset_preserves_durable_inventory
 \ - listing_applies_ordered_tree_mutations_across_pages
 \ - failed_later_page_cannot_publish_partial_listing_as_absence
+\ - one_file_cursor_delta_updates_a_large_inventory_without_a_full_listing,
+\   over 10 000 records
+\ - large_full_listing_builds_its_inventory_in_linear_time: 20 000
+\   entries in pages of 2 000 within 5 s, the time printed
+\ - incomplete_downloadable_metadata_publishes_as_unknown_incomplete
+\ - restricted_later_page_publishes_as_unknown_inaccessible
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -65,6 +71,7 @@ require src/lib/vector.f
 require src/lib/adt/option.f
 require src/lib/fs-anchored.f
 require src/lib/aio.f
+require src/lib/time.f
 require src/lib/net/curl.f
 require src/dropbox.f
 require src/test-dropbox.f
@@ -1683,12 +1690,258 @@ ARENA LINKS REPLAY:link
    s" /2/files/list_folder/continue /2/files/list_folder/continue" T$=
    d j GONE ;
 
+\ ---- the listing against the fake Dropbox: large and partial pages --
+
+20000 constant BULK-SIZE
+2000 constant BULK-PAGE-SIZE
+BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
+\ Rust's bound: a linear listing takes about 1 s, a quadratic one 13 s.
+5000000000 constant LISTING-BOUND-NS
+
+\ Rust's RemoteObservationRecord at the display path.
+: RECORD-AT
+   ( ^u8 n MODEL:observation<MODEL:remote> ^ARENA:arena
+     -- MODEL:remote-record )
+   {: p:^ u:n o ar :}
+   p u ar CANONICAL p u DISPLAY o MODEL-REMOTE--RECORD:MAKE ;
+
+: STALE ( -- MODEL:observation<MODEL:remote> )
+   MODEL-UNKNOWN--REASON:STALE REMOTE-UNKNOWN ;
+
+: PRESENT-AT
+   ( DROPBOX:hash ^u8 n -- MODEL:observation<MODEL:remote> )
+   {: h:DROPBOX:hash r:^ ru:n :}
+   h r ru >str DROPBOX:>REV MODEL-REMOTE:MAKE REMOTE-PRESENT ;
+
+\ Rust's {index:05}, appended to SB.
+: INDEX+ ( n -- )
+   {: x:n :}
+   10000 begin dup 0 > while
+      x over / 10 mod [char] 0 + SB-APPEND-C 10 /
+   repeat drop ;
+
+\ The bulk name at the index below the prefix: <prefix>/00042.txt.
+: BULK$ ( ^u8 n n -- ^u8 n )
+   {: p:^ u:n x:n :}
+   SB-RESET p u SB-APPEND s" /" SB-APPEND x INDEX+
+   s" .txt" SB-APPEND SB$ ;
+
+\ Rust's large inventory: Bulk, then Bulk/00001.txt on at rev-old with
+\ the identity h, u records in all.
+: BULK-RECORDS
+   ( DROPBOX:hash n ^ARENA:arena -- ^VEC:vector<MODEL:remote-record> )
+   {: h:DROPBOX:hash u:n ar :}
+   ar REMOTE-RECORDS {: rs :}
+   s" Bulk" REMOTE-DIRECTORY ar RECORD-AT rs VEC:PUSH !
+   u 1 ?do
+      s" Bulk" i BULK$ ar COPIED str> h s" rev-old" PRESENT-AT
+      ar RECORD-AT rs VEC:PUSH !
+   loop
+   rs ;
+
+\ Rust's observation: the record at the display path is o.
+: OBSERVED?
+   ( ^VEC:vector<MODEL:remote-record> ^u8 n
+     MODEL:observation<MODEL:remote> -- bool )
+   {: rs p:^ u:n o :}
+   rs VEC:COUNT 0 ?do
+      rs i VEC:AT @ MODEL-REMOTE--RECORD:UNMAKE {: k q w :}
+      q PATH$ p u STR= if w o MODEL:REMOTE-OBSERVATION= unloop exit then
+   loop
+   false ;
+
+\ The journal's inventory, sorted by key as Rust sorts it, is the
+\ cursor k and the records want.
+: HOLDS
+   ( JOURNAL:journal ^u8 n ^VEC:vector<MODEL:remote-record>
+     ^ARENA:arena -- )
+   {: j k:^ ku:n want ar :}
+   j ar JOURNAL:REMOTE-INVENTORY
+   JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur rs :}
+   cur k ku CURSOR-IS? TTRUE
+   rs VEC:COUNT want VEC:COUNT T=
+   rs VEC:COUNT want VEC:COUNT min 0 ?do
+      rs i VEC:AT @ want i VEC:AT @ MODEL:REMOTE-RECORD= TTRUE
+   loop ;
+
+\ A text that grows in the arena.
+: NO-TEXT ( ^ARENA:arena -- ^VEC:vector<u8> )
+   ARENA:ALLOCATOR 0 [type] u8 VEC:NEW ;
+
+: TEXT+ ( ^VEC:vector<u8> ^u8 n -- )
+   {: v a:^ u:n :}
+   v VEC:COUNT {: at:n :}
+   v at u + VEC:RESIZE
+   a v at VEC:AT u BYTE-COPY ;
+
+: TEXT>STR ( ^VEC:vector<u8> -- str )
+   {: v :}
+   v 0 VEC:AT v VEC:COUNT >str ;
+
+\ Rust's large listing's entry at the index: the folder /bulk, then
+\ /bulk/00001.txt on at rev-bulk with the identity h; in SB.
+: BULK-ENTRY ( n DROPBOX:hash ^ARENA:arena -- ^u8 n )
+   {: x:n h:DROPBOX:hash ar :}
+   x 0= if SB-RESET s" /bulk" s" /Bulk" FOLDER-JSON+ SB$ exit then
+   s" /bulk" x BULK$ ar COPIED {: l:str :}
+   s" /Bulk" x BULK$ ar COPIED {: d:str :}
+   SB-RESET l str> d str> s" rev-bulk" h FILE-JSON+ SB$ ;
+
+\ Rust's page k of the large listing: its entries' JSON array.
+: BULK-PAGE ( n DROPBOX:hash ^ARENA:arena -- str )
+   {: k:n h:DROPBOX:hash ar :}
+   k BULK-PAGE-SIZE * {: from:n :}
+   ar NO-TEXT {: v :}
+   v s" [" TEXT+
+   from BULK-PAGE-SIZE + from ?do
+      i from <> if v s" ," TEXT+ then
+      v i h ar BULK-ENTRY TEXT+
+   loop
+   v s" ]" TEXT+
+   v TEXT>STR ;
+
+\ The fake's pages: the large listing's, cursor-0 on.
+: BULK-PAGES! ( DROPBOX:hash ^ARENA:arena -- )
+   {: h:DROPBOX:hash ar :}
+   BULK-PAGES 0 ?do
+      i h ar BULK-PAGE
+      SB-RESET s" cursor-" SB-APPEND i FMT:SB-INT SB$
+      i 1+ BULK-PAGES < PAGE
+   loop ;
+
+\ A full listing's requests: list_folder, then its continuations.
+: LISTED$ ( n -- ^u8 n )
+   {: u:n :}
+   SB-RESET s" /2/files/list_folder" SB-APPEND
+   u 1 ?do s"  " SB-APPEND CONTINUE$ SB-APPEND loop
+   SB$ ;
+
+\ Rust's incomplete_file_metadata: downloadable, with no content hash.
+: INCOMPLETE-JSON+ ( ^u8 n ^u8 n ^u8 n -- )
+   {: l:^ lu:n d:^ du:n r:^ ru:n :}
+   S\" {\q.tag\q:\qfile\q" SB-APPEND l lu d du PATHS+
+   S\" ,\qrev\q:" SB-APPEND r ru QUOTED+
+   S\" ,\qsize\q:0,\qis_downloadable\q:true}" SB-APPEND ;
+
+\ Rust's restricted_folder_metadata with traverse_only.
+: TRAVERSE-ONLY-JSON+ ( ^u8 n ^u8 n -- )
+   S\" {\q.tag\q:\qfolder\q" SB-APPEND PATHS+
+   S\" ,\qsharing_info\q:{\qread_only\q:false," SB-APPEND
+   S\" \qtraverse_only\q:true}}" SB-APPEND ;
+
+: ONE-FILE-CURSOR-DELTA-UPDATES-A-LARGE-INVENTORY-WITHOUT-A-FULL-LISTING
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" one_file_cursor_delta_updates_a_large_inventory_without_a_full_listing"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   s" old inventory bytes" ar IDENTITY {: old:DROPBOX:hash :}
+   s" new inventory bytes" ar IDENTITY {: h:DROPBOX:hash :}
+   ar CASE-JOURNAL {: d:str j :}
+   j s" cursor-old" >str DROPBOX:>CURSOR old 10000 ar BULK-RECORDS
+   JOURNAL:PUBLISH-REMOTE-INVENTORY
+   [: s" /bulk/05000.txt" s" /Bulk/05000.txt" s" rev-new" h
+      FILE-JSON+ ;] ar ENTRIES
+   s" cursor-new" false PAGE
+   j ar NEW-LINK ar REFRESHED
+   j ar JOURNAL:REMOTE-INVENTORY
+   JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur rs :}
+   cur s" cursor-new" CURSOR-IS? TTRUE
+   rs VEC:COUNT 10000 T=
+   rs s" Bulk/05000.txt" h s" rev-new" PRESENT-AT OBSERVED? TTRUE
+   \ Rust's Published: one continuation and no full listing.
+   TEST-DROPBOX:SEEN$ CONTINUE$ T$=
+   d j GONE ;
+
+: LARGE-FULL-LISTING-BUILDS-ITS-INVENTORY-IN-LINEAR-TIME
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" large_full_listing_builds_its_inventory_in_linear_time" T-LABEL
+   TEST-DROPBOX:RESET
+   s" bulk listing bytes" ar IDENTITY {: h:DROPBOX:hash :}
+   ar CASE-JOURNAL {: d:str j :}
+   h ar BULK-PAGES!
+   ar NEW-LINK {: l :}
+   TIME:MONO-NS {: t0:n :}
+   j l ar REFRESHED
+   TIME:MONO-NS t0 - {: took:n :}
+   s" a " type BULK-SIZE FMT:.INT s" -entry listing took " type
+   took 1000000 / FMT:.INT s"  ms" type cr
+   took LISTING-BOUND-NS < TTRUE
+   j ar JOURNAL:REMOTE-INVENTORY
+   JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur rs :}
+   rs VEC:COUNT BULK-SIZE T=
+   rs s" Bulk/19999.txt" h s" rev-bulk" PRESENT-AT OBSERVED? TTRUE
+   \ Rust's Published: one full listing.
+   TEST-DROPBOX:SEEN$ BULK-PAGES LISTED$ T$=
+   d j GONE ;
+
+: INCOMPLETE-DOWNLOADABLE-METADATA-PUBLISHES-AS-UNKNOWN-INCOMPLETE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" incomplete_downloadable_metadata_publishes_as_unknown_incomplete"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   s" validated first page" ar IDENTITY {: h:DROPBOX:hash :}
+   s" Old.txt" STALE ar RECORD-AT {: old :}
+   ar CASE-JOURNAL {: d:str j :}
+   j s" durable" old ar PUBLISHED
+   [: s" /partial.txt" s" /Partial.txt" s" rev-partial" h
+      FILE-JSON+ ;] ar ENTRIES
+   s" partial" true PAGE
+   [: s" /incomplete.txt" s" /Incomplete.txt" s" rev-incomplete"
+      INCOMPLETE-JSON+ ;] ar ENTRIES
+   s" new" false PAGE
+   j ar NEW-LINK ar REFRESHED
+   ar REMOTE-RECORDS {: want :}
+   s" Incomplete.txt" MODEL-UNKNOWN--REASON:INCOMPLETE REMOTE-UNKNOWN
+   ar RECORD-AT want VEC:PUSH !
+   old want VEC:PUSH !
+   s" Partial.txt" h s" rev-partial" PRESENT-AT ar RECORD-AT
+   want VEC:PUSH !
+   j s" new" want ar HOLDS
+   \ Rust's Published: the delta's two pages.
+   TEST-DROPBOX:SEEN$
+   s" /2/files/list_folder/continue /2/files/list_folder/continue" T$=
+   d j GONE ;
+
+: RESTRICTED-LATER-PAGE-PUBLISHES-AS-UNKNOWN-INACCESSIBLE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" restricted_later_page_publishes_as_unknown_inaccessible" T-LABEL
+   TEST-DROPBOX:RESET
+   s" partial tree" ar IDENTITY {: h:DROPBOX:hash :}
+   s" Durable.txt" STALE ar RECORD-AT {: durable :}
+   ar CASE-JOURNAL {: d:str j :}
+   j s" durable" durable ar PUBLISHED
+   [: s" /partial.txt" s" /Partial.txt" s" partial-revision" h
+      FILE-JSON+ ;] ar ENTRIES
+   s" partial" true PAGE
+   [: s" /restricted" s" /Restricted" TRAVERSE-ONLY-JSON+ ;] ar ENTRIES
+   s" restricted" false PAGE
+   j ar NEW-LINK ar REFRESHED
+   ar REMOTE-RECORDS {: want :}
+   durable want VEC:PUSH !
+   s" Partial.txt" h s" partial-revision" PRESENT-AT ar RECORD-AT
+   want VEC:PUSH !
+   s" Restricted" MODEL-UNKNOWN--REASON:INACCESSIBLE REMOTE-UNKNOWN
+   ar RECORD-AT want VEC:PUSH !
+   j s" restricted" want ar HOLDS
+   \ Rust's Published: the delta's two pages.
+   TEST-DROPBOX:SEEN$
+   s" /2/files/list_folder/continue /2/files/list_folder/continue" T$=
+   d j GONE ;
+
 : REFRESH-CASES ( ^ARENA:arena -- )
    {: ar :}
    ar CURSOR-RESET-REBUILDS-BEFORE-ONE-COMPLETE-PUBLICATION
    ar FAILED-REBUILD-AFTER-CURSOR-RESET-PRESERVES-DURABLE-INVENTORY
    ar LISTING-APPLIES-ORDERED-TREE-MUTATIONS-ACROSS-PAGES
-   ar FAILED-LATER-PAGE-CANNOT-PUBLISH-PARTIAL-LISTING-AS-ABSENCE ;
+   ar FAILED-LATER-PAGE-CANNOT-PUBLISH-PARTIAL-LISTING-AS-ABSENCE
+   ar ONE-FILE-CURSOR-DELTA-UPDATES-A-LARGE-INVENTORY-WITHOUT-A-FULL-LISTING
+   ar LARGE-FULL-LISTING-BUILDS-ITS-INVENTORY-IN-LINEAR-TIME
+   ar INCOMPLETE-DOWNLOADABLE-METADATA-PUBLISHES-AS-UNKNOWN-INCOMPLETE
+   ar RESTRICTED-LATER-PAGE-PUBLISHES-AS-UNKNOWN-INACCESSIBLE ;
 
 : SERVED ( ^ARENA:arena -- )
    {: ar :}
