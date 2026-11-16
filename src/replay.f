@@ -71,9 +71,10 @@ private
 public
 
 \ destination-changed: the chosen path changed after it was observed;
-\ stage-occupied: other bytes hold its download stage.
+\ stage-occupied: other bytes hold its download stage;
+\ content-changed: the downloaded bytes did not verify.
 ENUM exact-copy-outcome
-   ready destination-changed stage-occupied
+   ready destination-changed stage-occupied content-changed
 ;ENUM
 
 \ A conflict copy: blocked leaves every payload where it is;
@@ -1297,6 +1298,9 @@ ARENA UPLOADS DROPBOX:upload
 : REMOTE-DELETE-FILE
    ( ^link MODEL:path DROPBOX:rev ^ARENA:arena -- mutation-outcome )
    {: l path rev:DROPBOX:rev ar :}
+   rev DROPBOX:REV>STR str> nip 0= if
+      path s" remote delete has no revision" INVALID
+   then
    l path ar [: l rev ar UNLINK ;] TARGETED ;
 
 
@@ -1783,7 +1787,7 @@ private
       staged OF drop NO-EXACT ENDOF
       already-staged OF drop NO-EXACT ENDOF
       content-changed OF
-         drop path s" exact Dropbox download changed content" INVALID
+         drop construct exact-copy-outcome content-changed SOME-EXACT
       ENDOF
       destination-occupied OF drop EXACT-OCCUPIED SOME-EXACT ENDOF
    ;MATCH ;
@@ -1842,6 +1846,10 @@ private
       stage-occupied OF
          MODEL-BLOCKAGE:STAGE-OCCUPIED REPLAY-COPY--OUTCOME:BLOCKED
       ENDOF
+      content-changed OF
+         MODEL-BLOCKAGE:DOWNLOAD-VERIFICATION-FAILED
+         REPLAY-COPY--OUTCOME:BLOCKED
+      ENDOF
    ;MATCH ;
 
 \ The path of path's conflict copy holding the remote's bytes.
@@ -1854,8 +1862,56 @@ private
 
 : NAME-HELD? ( n n -- bool ) drop COPY-NAME-OCCUPIED? ;
 
-\ Rust's materialize_remote_conflict_at; an occupied copy name blocks
-\ the copy, another failure passes up.
+: NO-BLOCKAGE ( -- option<MODEL:blockage> ) OPTION:NONE ;
+: UNAVAILABLE ( -- option<MODEL:blockage> )
+   409 MODEL-BLOCKAGE:DOWNLOAD-UNAVAILABLE OPTION:SOME ;
+: UNVERIFIED ( -- option<MODEL:blockage> )
+   MODEL-BLOCKAGE:DOWNLOAD-VERIFICATION-FAILED OPTION:SOME ;
+
+\ Rust's download_block_reason for Dropbox's refusals; none: the
+\ refusal is about the pass, not the path.
+: DOWNLOAD-BLOCKAGE ( DROPBOX:error -- option<MODEL:blockage> )
+   MATCH DROPBOX:error
+      not-found OF UNAVAILABLE ENDOF
+      not-file OF UNAVAILABLE ENDOF
+      not-folder OF UNAVAILABLE ENDOF
+      malformed-path OF UNAVAILABLE ENDOF
+      disallowed-name OF UNAVAILABLE ENDOF
+      conflict OF NO-BLOCKAGE ENDOF
+      no-write-permission OF UNAVAILABLE ENDOF
+      restricted-content OF UNAVAILABLE ENDOF
+      access-restricted OF UNAVAILABLE ENDOF
+      team-folder OF UNAVAILABLE ENDOF
+      operation-suppressed OF UNAVAILABLE ENDOF
+      insufficient-space OF UNAVAILABLE ENDOF
+      locked OF UNAVAILABLE ENDOF
+      reset OF NO-BLOCKAGE ENDOF
+      invalid-root OF NO-BLOCKAGE ENDOF
+      content-hash-mismatch OF NO-BLOCKAGE ENDOF
+      unsupported-file OF UNAVAILABLE ENDOF
+      path-mismatch OF UNAVAILABLE ENDOF
+      unverified OF UNVERIFIED ENDOF
+      other OF UNAVAILABLE ENDOF
+   ;MATCH ;
+
+: REPLY-BLOCKAGE ( DROPBOX:reply -- option<MODEL:blockage> )
+   MATCH DROPBOX:reply
+      done OF NO-BLOCKAGE ENDOF
+      refused OF DOWNLOAD-BLOCKAGE ENDOF
+      retry OF drop NO-BLOCKAGE ENDOF
+      unlinked OF NO-BLOCKAGE ENDOF
+   ;MATCH ;
+
+\ A download Dropbox refused for the path blocks the copy; any other
+\ answer ends the pass, its reply still in the link.
+: DOWNLOAD-BLOCKED ( ^link -- copy-outcome )
+   REPLAY-LINK:REPLY @ REPLY-BLOCKAGE MATCH option
+      none OF E-DROPBOX throw ENDOF
+      some OF REPLAY-COPY--OUTCOME:BLOCKED ENDOF
+   ;MATCH ;
+
+\ Rust's materialize_remote_conflict_at; an occupied copy name or a
+\ path's refused download blocks the copy, another failure passes up.
 : REMOTE-CONFLICT-AT
    ( ^link fd ^u8 n MODEL:path MODEL:remote ^ARENA:arena
      -- copy-outcome )
@@ -1866,6 +1922,7 @@ private
    ['] NAME-HELD? LOCAL:CONVERTING {: code:n :}
    code 0= if exit then
    drop code FS:ERRNO NAME-HELD? if COPY-OCCUPIED exit then
+   code E-DROPBOX = if k DOWNLOAD-BLOCKED exit then
    code throw ;
 
 public
@@ -2021,8 +2078,7 @@ private
 : STAGE-HELD ( str ^pass -- apply-event )
    {: p:str r :}
    r PASS-PLAN @ PLAN-ID p
-   REPLAY-REPLAY--BLOCKED:STAGE-DESTINATION-OCCUPIED
-   r PERSIST-REMOTE-BLOCK r BLOCKED ;
+   REPLAY-REPLAY--BLOCKED:STAGE-DESTINATION-OCCUPIED r BLOCKED ;
 
 : STAGED
    ( LOCAL:stage-outcome<^LOCAL:staged-upload> ^pass

@@ -36,7 +36,8 @@
 \   mutation outcome: the event, the block, the plan pending, retired
 \   or completed, the count, and a rejection's one log line.
 \ - PREPARE-UPLOAD sends a stage once; bytes other than the plan's
-\   retire it; a directory at the stage holds it stage-occupied; a
+\   retire it; a directory at the stage blocks it
+\   stage-destination-occupied at the stage's path, the plan pending; a
 \   directory at the target retires it, logging nothing.
 \ Against the fake Dropbox of test-dropbox.f, root empty:
 \ - REMOTE-DELETE-FOLDER of an empty folder deletes it; of an occupied
@@ -47,6 +48,8 @@
 \   with other bytes at the path is read back as changed, and its
 \   finished transfer is sent; a read-back incomplete file is rejected,
 \   and an incomplete upload answer is read back.
+\ - REMOTE-DELETE-FILE without a rev throws E-INVALID-STATE, logging
+\   once, with no request.
 \ - STAGE-EXACT-DOWNLOAD-AT against the fake Dropbox: Rust's
 \   exact_download_retry_reuses_a_stage_without_consuming_the_body,
 \   exact_download_stage_race_preserves_verified_stage, with the stage
@@ -68,7 +71,9 @@
 \   outcome, a staged upload below a sync root and the fake serving the
 \   remote side: the event, the block, the plan pending, held,
 \   completed, retired or finished as its conflict, the count, the
-\   conflict copies on disk, the downloads and the one line logged.
+\   conflict copies on disk, the downloads and the one line logged; a
+\   replace whose remote side's download Dropbox refuses, or whose bytes
+\   do not verify, holds only its plan, its local copy placed.
 \ - REPLAY-REMOTE-OPERATIONS-AT against the fake Dropbox: Rust's
 \   remote_replay_creates_nested_parents_before_the_file,
 \   already_absent_dropbox_directory_completes_its_replayed_delete,
@@ -80,7 +85,10 @@
 \   remote_replay_preserves_conflict_sides_without_a_backup_download,
 \   folder_delete_probe_failures_keep_the_plan_retry_safe_or_block_only_its_path,
 \   whose 503 throws E-DROPBOX with a retry and leaves its plan pending,
-\   and replay_does_not_block_a_conflict_whose_copy_parent_is_read_only.
+\   and replay_does_not_block_a_conflict_whose_copy_parent_is_read_only;
+\   a pass over two plans, the first blocked at its delete, sends none of
+\   its later operations and completes the second; a directory at a
+\   replace's stage holds its plan stage-occupied, in the report.
 \ Run from the repository root: hb --load src/replay-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -141,6 +149,7 @@ EXPORT EXPECTATION-DELETE-FOLDER
 EXPORT REMOTE-CREATE-FOLDER
 EXPORT REMOTE-UPLOAD
 EXPORT REMOTE-DELETE-FOLDER
+EXPORT REMOTE-DELETE-FILE
 EXPORT LOCAL:DOWNLOAD-CHECKPOINT-BYTES
 EXPORT PASS-OVER
 EXPORT PASS-STAGING
@@ -1259,6 +1268,22 @@ LOG-CAP BUFFER: LOG-TEXT
    TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
    d GONE rt GONE ;
 
+: DROP-OUTCOME ( REPLAY:mutation-outcome -- ) drop ;
+
+: A-FILE-DELETE-WITHOUT-A-REV-IS-REFUSED ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   s" a file delete without a revision is refused" T-LABEL
+   TEST-DROPBOX:RESET
+   s" replay-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
+   d [: [: l s" notes.txt" DISPLAY s" " AS-REV ar
+         REPLAY:REMOTE-DELETE-FILE DROP-OUTCOME ;]
+      REPLAY:E-INVALID-STATE TTHROWSQ ;] ar LOGGED {: t:^ tu:n :}
+   t tu LINE-COUNT 1 T=
+   t tu s" for `notes.txt`: remote delete has no revision" CONTAINS?
+   TTRUE
+   TEST-DROPBOX:SEEN$ s" " T$=
+   d GONE ;
+
 : REMOTE-CASES ( ^ARENA:arena -- )
    {: ar :}
    MAIN @ s" " ar NEW-LINK {: l :}
@@ -1270,7 +1295,8 @@ LOG-CAP BUFFER: LOG-TEXT
    l ar AN-UPLOAD-SENDS-ITS-TRANSFER
    l ar A-REFUSED-UPLOAD-FINISHES-ITS-TRANSFER
    l ar A-READ-BACK-INCOMPLETE-FILE-IS-REJECTED
-   l ar AN-INCOMPLETE-UPLOAD-ANSWER-IS-READ-BACK ;
+   l ar AN-INCOMPLETE-UPLOAD-ANSWER-IS-READ-BACK
+   l ar A-FILE-DELETE-WITHOUT-A-REV-IS-REFUSED ;
 
 
 \ ---- remote replay's blocks and folder applies
@@ -1319,7 +1345,8 @@ LOG-CAP BUFFER: LOG-TEXT
    ;MATCH ;
 
 \ The block's variant and its detail: a durable plan's blockage, a
-\ remote rejection's tag, a sync error's rejection, else "-".
+\ remote rejection's tag, a sync error's rejection, an occupied stage's
+\ path, else "-".
 : BLOCK$ ( REPLAY:replay-blocked -- ^u8 n ^u8 n )
    MATCH REPLAY:replay-blocked
       durable-plan OF {: p why :} s" durable-plan" why BLOCKAGE$ ENDOF
@@ -1330,8 +1357,8 @@ LOG-CAP BUFFER: LOG-TEXT
       download-required OF
          drop drop s" download-required" s" -"
       ENDOF
-      stage-destination-occupied OF
-         drop drop s" stage-destination-occupied" s" -"
+      stage-destination-occupied OF {: id at:str :}
+         s" stage-destination-occupied" at str>
       ENDOF
       precondition-changed OF
          drop drop s" precondition-changed" s" -"
@@ -1362,6 +1389,7 @@ LOG-CAP BUFFER: LOG-TEXT
    {: j w:^ wu:n ar :}
    j ar JOURNAL:BLOCKED-PLANS {: held :}
    held VEC:COUNT 1 T=
+   held VEC:COUNT 1 <> if 0 exit then
    held 0 VEC:AT @ BLOCK-OF {: at:n :} w wu T$=
    at ;
 
@@ -1722,12 +1750,14 @@ TYPED-VARIABLE SENT ^LOCAL:staged-upload
    ar UPLOAD-DIRS {: d:str r:str s:str j :}
    r ar EDITED
    r str> s" notes.txt" ar LOCAL:OBSERVE-UPLOAD-SOURCE {: want :}
-   s want DROPBOX:HASH>STR str> ar INSIDE str> FS:MAKE-DIR
+   s want DROPBOX:HASH>STR str> ar INSIDE {: k:str :}
+   k str> FS:MAKE-DIR
    j want ar UPLOAD-PLAN {: plan :}
    j plan r s want ar PREPARED
-   s" stage-occupied" T$= s" durable-plan" T$= s" blocked" T$=
+   k str> T$= s" stage-destination-occupied" T$= s" blocked" T$=
    SENDS @ 0 T=
-   j s" stage-occupied" ar HELD-AS drop
+   j ar JOURNAL:PENDING-PLANS VEC:COUNT 1 T=
+   j ar JOURNAL:BLOCKED-PLANS VEC:COUNT 0 T=
    j JOURNAL:CLOSE
    d GONE ;
 
@@ -2293,6 +2323,7 @@ variable HELD
       ready OF s" ready" ENDOF
       destination-changed OF s" destination-changed" ENDOF
       stage-occupied OF s" stage-occupied" ENDOF
+      content-changed OF s" content-changed" ENDOF
    ;MATCH ;
 
 \ The remote's exact copy at t below the root r, shown as p.
@@ -2719,6 +2750,73 @@ ARENA FILE-CASES file-case
    rem THEIRS-AS CHANGED-AS PLAN-KIND-CREATING m mu true ar HELD-ARM
    rem THEIRS-AS CHANGED-AS PLAN-KIND-DELETING m mu false ar HELD-ARM ;
 
+\ The next API call is refused 409 with the union tag u's leaf tag t.
+: REFUSAL ( ^u8 n ^u8 n -- )
+   {: u:^ uu:n t:^ tu:n :}
+   SB-RESET S\" {\qerror_summary\q:\q" SB-APPEND u uu SB-APPEND
+   s" /" SB-APPEND t tu SB-APPEND
+   S\" /...\q,\qerror\q:{\q.tag\q:\q" SB-APPEND u uu SB-APPEND
+   S\" \q,\q" SB-APPEND u uu SB-APPEND
+   S\" \q:{\q.tag\q:\q" SB-APPEND t tu SB-APPEND S\" \q}}}" SB-APPEND
+   409 s" " s" " SB$ TEST-DROPBOX:SCRIPT! ;
+
+: STATUS-OF ( MODEL:blockage -- n )
+   MATCH MODEL:blockage
+      unsupported-file-size OF 0 ENDOF
+      remote-rejected OF drop 0 ENDOF
+      download-unavailable OF ENDOF
+      download-verification-failed OF 0 ENDOF
+      stage-occupied OF 0 ENDOF
+      local-object-in-way OF 0 ENDOF
+      remote-object OF 0 ENDOF
+      conflict-copy-occupied OF 0 ENDOF
+   ;MATCH ;
+
+\ The status of the journal's first blocked plan's unavailable
+\ download, else 0.
+: HELD-STATUS ( JOURNAL:journal ^ARENA:arena -- n )
+   JOURNAL:BLOCKED-PLANS {: held :}
+   held VEC:COUNT 0= if 0 exit then
+   held 0 VEC:AT @ JOURNAL-PLAN--RECORD:UNMAKE {: id p o st :}
+   st MATCH JOURNAL:plan-status
+      pending OF 0 ENDOF
+      blocked OF {: why at:n :} why STATUS-OF ENDOF
+      completed OF 0 ENDOF
+   ;MATCH ;
+
+\ A replace collided with THEIRS, whose copy fails: the summary want,
+\ the plan held as w, no conflict recorded and only the local copy
+\ placed, after one download; the case.
+: UNCOPIED
+   ( MODEL:remote ^u8 n ^u8 n ^ARENA:arena -- ^file-case )
+   {: rem want:^ wu:n w:^ u:n ar :}
+   PLAN-KIND-REPLACING ar NEW-CASE {: c :}
+   rem THEIRS-AS CHANGED-AS c want wu s" " ar ARMED
+   c FILE-CASE-JOURNAL @ w u ar HELD-AS drop
+   c FILE-CASE-JOURNAL @ ar JOURNAL:CONFLICTS VEC:COUNT 0 T=
+   c true false ar COPIES
+   1 SEEN
+   c ;
+
+: A-REFUSED-REMOTE-SIDE-HOLDS-ONLY-ITS-PLAN ( ^ARENA:arena -- )
+   {: ar :}
+   s" a refused download of the remote side holds only its plan" T-LABEL
+   ar THEIRS-SERVED {: h rem :}
+   s" path" s" restricted_content" REFUSAL
+   rem s" blocked durable-plan download-unavailable blocked 0"
+   s" download-unavailable" ar UNCOPIED {: c :}
+   c FILE-CASE-JOURNAL @ ar HELD-STATUS 409 T=
+   c ENDED ;
+
+: AN-UNVERIFIED-REMOTE-SIDE-HOLDS-ONLY-ITS-PLAN ( ^ARENA:arena -- )
+   {: ar :}
+   s" unverified bytes of the remote side hold only its plan" T-LABEL
+   ar THEIRS-SERVED {: h rem :}
+   s" theirs-revision" s" Dropbox's side of the CONFLICT"
+   TEST-DROPBOX:CONTENT!
+   rem s" blocked durable-plan download-verification-failed blocked 0"
+   s" download-verification-failed" ar UNCOPIED ENDED ;
+
 : APPLY-DELETE-MUTATION-COVERS-EVERY-OUTCOME ( ^ARENA:arena -- )
    {: ar :}
    s" apply delete mutation covers every outcome" T-LABEL
@@ -2781,12 +2879,7 @@ ARENA FILE-CASES file-case
    [: f FS:CLOSE-DIR ;] finally ;
 
 \ The next API call is refused 409 with Rust's lookup_error of the tag.
-: LOOKUP-ERROR ( ^u8 n -- )
-   {: t:^ tu:n :}
-   SB-RESET S\" {\qerror_summary\q:\qpath/" SB-APPEND t tu SB-APPEND
-   S\" /...\q,\qerror\q:{\q.tag\q:\qpath\q,\qpath\q:{\q.tag\q:\q" SB-APPEND
-   t tu SB-APPEND S\" \q}}}" SB-APPEND
-   409 s" " s" " SB$ TEST-DROPBOX:SCRIPT! ;
+: LOOKUP-ERROR ( ^u8 n -- ) s" path" 2swap REFUSAL ;
 
 : NO-BASELINE? ( option<MODEL:baseline> -- bool )
    MATCH option
@@ -3058,8 +3151,8 @@ variable SIDES
    j JOURNAL:CLOSE
    d GONE ;
 
-\ Whether b is the durable plan at p, rejected by Dropbox with tag t.
-: REJECTED-AT? ( REPLAY:replay-blocked ^u8 n ^u8 n -- bool )
+\ Whether b is the durable plan at p, held with the blockage t.
+: HELD-AT? ( REPLAY:replay-blocked ^u8 n ^u8 n -- bool )
    {: b p:^ pu:n t:^ tu:n :}
    b MATCH REPLAY:replay-blocked
       durable-plan OF {: at why :}
@@ -3092,7 +3185,7 @@ variable SIDES
    j r s ar REMOTE-REPLAYED {: rep :}
    rep COMPLETED 0 T=
    rep BLOCKS VEC:COUNT 1 T=
-   rep BLOCKS 0 VEC:AT @ s" gone" s" rejected_by_dropbox" REJECTED-AT?
+   rep BLOCKS 0 VEC:AT @ s" gone" s" rejected_by_dropbox" HELD-AT?
    TTRUE
    j ar JOURNAL:PENDING-PLANS VEC:COUNT 0 T=
    j ar JOURNAL:BLOCKED-PLANS VEC:COUNT 1 T=
@@ -3132,6 +3225,58 @@ variable SIDES
    j JOURNAL:CLOSE
    d GONE ;
 
+\ The journal's one blocked plan is at a, its two operations pending.
+: HELD-AT-A ( JOURNAL:journal ^ARENA:arena -- )
+   JOURNAL:BLOCKED-PLANS {: v :}
+   v VEC:COUNT 1 <> if exit then
+   v 0 VEC:AT @ JOURNAL-PLAN--RECORD:UNMAKE {: id p o st :}
+   p MODEL:PATH>STR str> s" a" T$=
+   o 0 OP-STATUS 0 T= o 1 OP-STATUS 0 T= ;
+
+\ Plan A at a: delete rev-old, then make the folder a; plan B makes
+\ the folder b. Dropbox refuses A's delete for its path alone.
+: A-BLOCKED-PLAN-LEAVES-THE-NEXT-TO-RUN ( ^ARENA:arena -- )
+   {: ar :}
+   s" a blocked plan sends no more and leaves the next to run" T-LABEL
+   TEST-DROPBOX:RESET
+   ar UPLOAD-DIRS {: d:str r:str s:str j :}
+   ar OPS {: ops :}
+   OLD-REV MODEL-OPERATION:DELETE-REMOTE ops OP+ MAKE-F ops OP+
+   j s" a" ops ar RECORD-OPS
+   j s" b" MAKE-F ar PLANNED drop
+   s" path_lookup" s" restricted_content" REFUSAL
+   j r s ar REMOTE-REPLAYED {: rep :}
+   rep COMPLETED 1 T=
+   rep BLOCKS VEC:COUNT 1 T=
+   rep BLOCKS 0 VEC:AT @ s" a" s" rejected_by_dropbox" HELD-AT? TTRUE
+   j s" rejected_by_dropbox" ar HELD-AS drop
+   j ar HELD-AT-A
+   j ar JOURNAL:PENDING-PLANS VEC:COUNT 0 T=
+   j s" b" DISPLAY ar JOURNAL:BASELINE DIRECTORY? TTRUE
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/create_folder_v2"
+   T$=
+   j JOURNAL:CLOSE
+   d GONE ;
+
+\ A directory at the stage of replace.txt's upload.
+: A-HELD-STAGE-HOLDS-ITS-PLAN ( ^ARENA:arena -- )
+   {: ar :}
+   s" a held upload stage holds its plan, in the report" T-LABEL
+   TEST-DROPBOX:RESET
+   ar UPLOAD-DIRS {: d:str r:str s:str j :}
+   j r ar REPLACE-PLAN
+   s" new local bytes" ar HASH-OF DROPBOX:HASH>STR str> {: h:^ hu:n :}
+   s h hu ar INSIDE str> FS:MAKE-DIR
+   j r s ar REMOTE-REPLAYED {: rep :}
+   rep COMPLETED 0 T=
+   rep BLOCKS VEC:COUNT 1 T=
+   rep BLOCKS 0 VEC:AT @ s" replace.txt" s" stage-occupied" HELD-AT?
+   TTRUE
+   j s" stage-occupied" ar HELD-AS drop
+   TEST-DROPBOX:SEEN$ s" " T$=
+   j JOURNAL:CLOSE
+   d GONE ;
+
 : LOOP-CASES ( ^ARENA:arena -- )
    {: ar :}
    ar REMOTE-REPLAY-CREATES-NESTED-PARENTS-BEFORE-THE-FILE
@@ -3141,7 +3286,9 @@ variable SIDES
    ar A-LOCAL-OPERATION-WAITS-FOR-LOCAL-REPLAY
    ar REMOTE-REPLAY-PRESERVES-CONFLICT-SIDES-WITHOUT-A-BACKUP-DOWNLOAD
    ar FOLDER-DELETE-PROBE-FAILURES-KEEP-THE-PLAN-RETRY-SAFE-OR-BLOCK-ONLY-ITS-PATH
-   ar REPLAY-DOES-NOT-BLOCK-A-CONFLICT-WHOSE-COPY-PARENT-IS-READ-ONLY ;
+   ar REPLAY-DOES-NOT-BLOCK-A-CONFLICT-WHOSE-COPY-PARENT-IS-READ-ONLY
+   ar A-BLOCKED-PLAN-LEAVES-THE-NEXT-TO-RUN
+   ar A-HELD-STAGE-HOLDS-ITS-PLAN ;
 
 
 : BRIDGE-CASES ( ^ARENA:arena -- )
@@ -3163,6 +3310,8 @@ variable SIDES
    ar A-DELETED-REMOTE-KEEPS-THE-LOCAL-SIDE
    ar A-REMOTE-EDIT-KEEPS-THE-DELETED-FILE
    ar AN-OCCUPIED-COPY-NAME-HOLDS-THE-PLAN
+   ar A-REFUSED-REMOTE-SIDE-HOLDS-ONLY-ITS-PLAN
+   ar AN-UNVERIFIED-REMOTE-SIDE-HOLDS-ONLY-ITS-PLAN
    ar APPLY-DELETE-MUTATION-COVERS-EVERY-OUTCOME
    ar A-DELETE-BEFORE-A-FOLDER-LEAVES-ITS-PLAN-PENDING ;
 
