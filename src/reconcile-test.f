@@ -156,6 +156,17 @@
 \   fake writing the copy's destination as the download arrives
 \ - occupied_collision_stage_uses_the_next_synchronized_name
 \ - changed_dropbox_file_during_directory_conversion_replans_without_a_conflict_row
+\ Directory deletions against the fake Dropbox, Rust's tests of the same
+\ names, with no account request:
+\ - remote_directory_deletion_removes_local_directories_deepest_first
+\ - local_directory_deletion_removes_dropbox_directories_after_their_entries,
+\   the listing and probe pages in one queue in the order Rust's requests
+\   take them
+\ - local_directory_deletion_waits_for_unsynchronized_dropbox_entries
+\ - dropbox_directory_that_gained_an_entry_is_not_deleted_from_a_stale_inventory
+\ - child_created_after_scan_forces_an_immediate_directory_rescan, the
+\   fake's listing hook writing the child where Rust's gate does
+\ - nonempty_directory_delete_reobserves_and_syncs_the_new_child
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -4134,7 +4145,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    NOOP-RECORDED? TTRUE ;
 
 \ Rust's seed_directory_baseline.
-: SEEDED-FOLDER ( ^run ^u8 n -- )
+: SEED-DIRECTORY-BASELINE ( ^run ^u8 n -- )
    {: x p:^ u:n :}
    MODEL-BASELINE:DIRECTORY LOCAL-DIRECTORY REMOTE-DIRECTORY
    MODEL-SUBTREE:EMPTY PLANNER:PLAN {: dec :}
@@ -4210,7 +4221,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x s" Shared" FOLDER-MADE-IN
    x s" Shared/notes.txt" BEFORE-NOTES$ BYTES-WRITTEN-IN
    x s" Shared/keep.txt" BEFORE-KEEP$ BYTES-WRITTEN-IN
-   x s" Shared" SEEDED-FOLDER
+   x s" Shared" SEED-DIRECTORY-BASELINE
    x s" Shared/notes.txt" notes SEED-BASELINE
    x s" Shared/keep.txt" keep SEED-BASELINE
    x notes keep ACCESSIBLE
@@ -4275,7 +4286,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    d x PASS-READY {: rec:str :}
    x s" report" FOLDER-MADE-IN
    x s" report.txt" SHARED-SIBLING$ BYTES-WRITTEN-IN
-   x s" report" SEEDED-FOLDER
+   x s" report" SEED-DIRECTORY-BASELINE
    x s" report.txt" shared SEED-BASELINE
    x s" report/x" shared SEED-BASELINE
    rec ;
@@ -4403,7 +4414,7 @@ $1C0 constant OWNER-ACCESS
    x s" locked" FOLDER-MADE-IN
    x s" locked/secret.txt" SECRET$ BYTES-WRITTEN-IN
    x s" open.txt" OPEN-UPLOAD$ BYTES-WRITTEN-IN
-   x s" locked" SEEDED-FOLDER
+   x s" locked" SEED-DIRECTORY-BASELINE
    x s" locked/secret.txt" secret SEED-BASELINE ;
 
 : LOCKED-REPORTS ( report -- )
@@ -5592,6 +5603,346 @@ $180 constant MODE-0600
    ar OCCUPIED-COLLISION-STAGE-USES-THE-NEXT-SYNCHRONIZED-NAME
    ar CHANGED-DROPBOX-FILE-DURING-DIRECTORY-CONVERSION-REPLANS-WITHOUT-A-CONFLICT-ROW ;
 
+\ ---- directory deletions against the fake Dropbox -----------------
+
+: LIST$ ( -- ^u8 n ) s" /2/files/list_folder" ;
+: DELETE$ ( -- ^u8 n ) s" /2/files/delete_v2" ;
+
+: PRESENT-BASELINE? ( MODEL:baseline -- bool )
+   MATCH MODEL:baseline
+      absent OF false ENDOF
+      present OF drop true ENDOF
+      directory OF false ENDOF
+   ;MATCH ;
+
+: FRESH? ( outcome -- bool )
+   MATCH outcome
+      complete OF drop false ENDOF
+      fresh OF true ENDOF
+      root-changed OF false ENDOF
+   ;MATCH ;
+
+\ The report's planned, replayed and blocked counts are p, r and b.
+: COUNTED ( report n n n -- )
+   {: p:n r:n b:n :}
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   planned p T= replayed r T= blocked b T= ;
+
+\ Rust's unsupported_file_metadata, appended to SB.
+: UNSUPPORTED-FILE-JSON+ ( ^u8 n ^u8 n ^u8 n -- )
+   {: l:^ lu:n d:^ du:n r:^ ru:n :}
+   S\" {\q.tag\q:\qfile\q" SB-APPEND l lu d du PATHS+
+   S\" ,\qrev\q:" SB-APPEND r ru QUOTED+
+   S\" ,\qsize\q:0,\qis_downloadable\q:false," SB-APPEND
+   S\" \qexport_info\q:{\qexport_as\q:\qhtml\q}}" SB-APPEND ;
+
+: EMPTY-PAGE ( ^u8 n ^ARENA:arena -- )
+   {: k:^ ku:n ar :}
+   [: ;] ar ENTRIES k ku false PAGE ;
+
+\ Rust's FakeResponse::json for the route r, any API call when r is
+\ empty: the JSON q appends.
+: ANSWERS ( [ -- ] ^u8 n -- )
+   {: q r:^ ru:n :}
+   SB-RESET q execute
+   r ru 200 s" " s" " SB$ TEST-DROPBOX:ROUTE-SCRIPT! ;
+
+\ ANSWERS of {"metadata": the entry q appends}.
+: METADATA-ANSWERS ( [ -- ] ^u8 n -- )
+   {: q r:^ ru:n :}
+   [: S\" {\qmetadata\q:" SB-APPEND q execute s" }" SB-APPEND ;]
+   r ru ANSWERS ;
+
+\ The words of a, which single spaces part: the first, then the rest.
+: FIRST-WORD ( ^u8 n -- ^u8 n )
+   {: a:^ u:n :}
+   a u 32 INDEX-OF MATCH option
+      none OF a u ENDOF
+      some OF IDX>N a swap ENDOF
+   ;MATCH ;
+
+: REST-WORDS ( ^u8 n -- ^u8 n )
+   {: a:^ u:n :}
+   a u 32 INDEX-OF MATCH option
+      none OF a u + 0 ENDOF
+      some OF IDX>N 1+ {: k:n :} a k + u k - ENDOF
+   ;MATCH ;
+
+: WORD-AT ( ^u8 n n -- ^u8 n )
+   {: k:n :}
+   k 0 ?do REST-WORDS loop FIRST-WORD ;
+
+: WORD-COUNT ( ^u8 n -- n ) 32 COUNT-CHAR 1+ ;
+
+: CALL$ ( n -- ^u8 n ) {: k:n :} TEST-DROPBOX:SEEN$ k WORD-AT ;
+
+: LISTING-CALL? ( ^u8 n -- bool )
+   {: a:^ u:n :}
+   a u LIST$ STR= a u CONTINUE$ STR= or ;
+
+\ How many of the first k requests' paths q holds for.
+: CALLS-BEFORE ( n [ ^u8 n -- bool ] -- n )
+   {: k:n q :}
+   0 k 0 ?do i CALL$ q execute if 1+ then loop ;
+
+\ Rust's probes: the list_folder requests after the first.
+: PROBE? ( n -- bool )
+   {: k:n :}
+   k CALL$ LIST$ STR= k [: LIST$ STR= ;] CALLS-BEFORE 0 > and ;
+
+\ The probes' bodies, ARGS$ holding one per listing call.
+: PROBE-ARGS ( ^ARENA:arena -- ^VEC:vector<str> )
+   {: ar :}
+   ar [type] str NEW-VECTOR {: v :}
+   TEST-DROPBOX:SEEN$ WORD-COUNT 0 ?do
+      i PROBE? if
+         TEST-DROPBOX:ARGS$ i [: LISTING-CALL? ;] CALLS-BEFORE WORD-AT
+         ar COPIED v VEC:PUSH !
+      then
+   loop
+   v ;
+
+\ The JSON value at the pointer p in b, null for none, as Rust's
+\ value[...] reads it.
+: MEMBER$ ( ^u8 n ^u8 n -- ^u8 n )
+   {: b:^ bu:n p:^ pu:n :}
+   b bu p pu JSON:POINTER-SPAN 0= if 2drop s" null" exit then
+   {: off:n len:n :}
+   b off + len ;
+
+: MEMBER= ( str ^u8 n ^u8 n -- bool )
+   {: b:str p:^ pu:n v:^ vu:n :}
+   b str> p pu MEMBER$ v vu JSON:VALUE= ;
+
+\ Rust's probe of the folder p: at most one entry, neither recursive
+\ nor with deleted entries.
+: PROBED-AS ( str ^u8 n -- )
+   {: b:str p:^ pu:n :}
+   SB-RESET p pu QUOTED+
+   b s" /path" SB$ MEMBER= TTRUE
+   b s" /limit" s" 1" MEMBER= TTRUE
+   b s" /recursive" s" true" MEMBER= TFALSE
+   b s" /include_deleted" s" true" MEMBER= TFALSE ;
+
+: REMOTE-DIRECTORY-DELETION-REMOVES-LOCAL-DIRECTORIES-DEEPEST-FIRST
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" remote_directory_deletion_removes_local_directories_deepest_first"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" gone" IN-ROOT str> FS:MAKE-DIR
+   x s" gone/child" IN-ROOT str> FS:MAKE-DIR
+   x s" gone" SEED-DIRECTORY-BASELINE
+   x s" gone/child" SEED-DIRECTORY-BASELINE
+   s" directories-deleted" ar EMPTY-PAGE
+   x rec PASSED COMPLETE RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   planned 2 T= replayed 2 T=
+   x s" gone" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" gone" NO-BASELINE? TTRUE
+   x s" gone/child" NO-BASELINE? TTRUE
+   x PENDING-OF VEC:COUNT 0 T=
+   TEST-DROPBOX:SEEN$ LIST$ T$=
+   d x STEP-GONE ;
+
+: LEAF-JSON+ ( DROPBOX:hash -- )
+   {: h:DROPBOX:hash :}
+   s" /gone/child/leaf.txt" s" /Gone/Child/leaf.txt" s" rev-leaf" h
+   FILE-JSON+ ;
+
+\ Rust's first pass over the tree: its listing, then the leaf's delete.
+: TREE-LISTED ( DROPBOX:hash ^ARENA:arena -- )
+   {: h:DROPBOX:hash ar :}
+   [: s" /gone" s" /Gone" FOLDER-JSON+ COMMA+
+      s" /gone/child" s" /Gone/Child" FOLDER-JSON+ COMMA+
+      h LEAF-JSON+ ;] ar ENTRIES s" cursor-tree" false PAGE
+   [: h LEAF-JSON+ ;] DELETE$ METADATA-ANSWERS ;
+
+\ The second: the delta shows the leaf gone, so the child folder is
+\ probed and deleted.
+: LEAF-GONE ( ^ARENA:arena -- )
+   {: ar :}
+   [: s" /gone/child/leaf.txt" s" /Gone/Child/leaf.txt" DELETED-JSON+ ;]
+   ar ENTRIES s" cursor-after-leaf" false PAGE
+   s" probe-child" ar EMPTY-PAGE
+   [: s" /gone/child" s" /Gone/Child" FOLDER-JSON+ ;]
+   DELETE$ METADATA-ANSWERS ;
+
+\ The third: the delta shows the child gone, so the parent is probed
+\ and deleted.
+: CHILD-GONE ( ^ARENA:arena -- )
+   {: ar :}
+   [: s" /gone/child" s" /Gone/Child" DELETED-JSON+ ;]
+   ar ENTRIES s" cursor-after-child" false PAGE
+   s" probe-gone" ar EMPTY-PAGE
+   [: s" /gone" s" /Gone" FOLDER-JSON+ ;] DELETE$ METADATA-ANSWERS ;
+
+\ Whether the k-th delete_v2 body holds the JSON value v.
+: DELETED-AS? ( n ^u8 n -- bool )
+   {: k:n v:^ vu:n :}
+   TEST-DROPBOX:DELETES$ k WORD-AT v vu JSON:VALUE= ;
+
+: TREE-DELETED ( -- )
+   TEST-DROPBOX:DELETES$ WORD-COUNT 3 T=
+   0 S\" {\qpath\q:\q/Gone/Child/leaf.txt\q,\qparent_rev\q:\qrev-leaf\q}"
+   DELETED-AS? TTRUE
+   1 S\" {\qpath\q:\q/Gone/Child\q}" DELETED-AS? TTRUE
+   2 S\" {\qpath\q:\q/Gone\q}" DELETED-AS? TTRUE ;
+
+: TREE-PROBED ( ^ARENA:arena -- )
+   PROBE-ARGS {: v :}
+   v VEC:COUNT 2 T=
+   v 0 VEC:AT @ s" /Gone/Child" PROBED-AS
+   v 1 VEC:AT @ s" /Gone" PROBED-AS ;
+
+: LOCAL-DIRECTORY-DELETION-REMOVES-DROPBOX-DIRECTORIES-AFTER-THEIR-ENTRIES
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" local_directory_deletion_removes_dropbox_directories_after_their_entries"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   s" leaf payload" ar IDENTITY ar TREE-LISTED
+   ar LEAF-GONE ar CHILD-GONE
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" Gone" SEED-DIRECTORY-BASELINE
+   x s" Gone/Child" SEED-DIRECTORY-BASELINE
+   x s" Gone/Child/leaf.txt" s" leaf payload" s" rev-leaf" ar REMOTE-FILE
+   SEED-BASELINE
+   x rec PASSED COMPLETE 1 1 2 COUNTED
+   x rec PASSED COMPLETE 1 1 1 COUNTED
+   x rec PASSED COMPLETE 1 1 0 COUNTED
+   x s" Gone" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" Gone" NO-BASELINE? TTRUE
+   x s" Gone/Child" NO-BASELINE? TTRUE
+   x s" Gone/Child/leaf.txt" NO-BASELINE? TTRUE
+   x PENDING-OF VEC:COUNT 0 T=
+   x BLOCKED-OF VEC:COUNT 0 T=
+   TREE-DELETED
+   ar TREE-PROBED
+   TEST-DROPBOX:SEEN$ s" /2/files/create_folder_v2" CONTAINS? TFALSE
+   d x STEP-GONE ;
+
+: LOCAL-DIRECTORY-DELETION-WAITS-FOR-UNSYNCHRONIZED-DROPBOX-ENTRIES
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" local_directory_deletion_waits_for_unsynchronized_dropbox_entries"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   [: s" /docs" s" /docs" FOLDER-JSON+ COMMA+
+      s" /docs/note.paper" s" /docs/note.paper" s" rev-paper"
+      UNSUPPORTED-FILE-JSON+ ;] ar ENTRIES s" cursor-paper" false PAGE
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" docs" SEED-DIRECTORY-BASELINE
+   x rec PASSED COMPLETE 0 0 2 COUNTED
+   x s" docs" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" docs" DIRECTORY-AT
+   x PENDING-OF VEC:COUNT 0 T=
+   TEST-DROPBOX:SEEN$ LIST$ T$=
+   d x STEP-GONE ;
+
+\ The listing, then the probe, with no delete between or after.
+: TWO-LISTS$ ( -- ^u8 n ) s" /2/files/list_folder /2/files/list_folder" ;
+
+: DROPBOX-DIRECTORY-THAT-GAINED-AN-ENTRY-IS-NOT-DELETED-FROM-A-STALE-INVENTORY
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" dropbox_directory_that_gained_an_entry_is_not_deleted_from_a_stale_inventory"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   s" late arrival" ar IDENTITY {: late:DROPBOX:hash :}
+   [: s" /gone" s" /gone" FOLDER-JSON+ ;]
+   ar ENTRIES s" cursor-empty" false PAGE
+   [: s" /gone/late.txt" s" /gone/late.txt" s" rev-late" late
+      FILE-JSON+ ;] ar ENTRIES s" probe-late" false PAGE
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" gone" SEED-DIRECTORY-BASELINE
+   x rec PASSED FRESH? TTRUE
+   x s" gone" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" gone" DIRECTORY-AT
+   x PENDING-OF VEC:COUNT 0 T=
+   TEST-DROPBOX:SEEN$ TWO-LISTS$ T$=
+   d x STEP-GONE ;
+
+\ The file the listing's hook writes, Rust's gated write.
+TYPED-VARIABLE RACED str
+: AFTER-SCAN$ ( -- ^u8 n ) s" created after scan" ;
+: RACE ( -- ) RACED @ str> AFTER-SCAN$ FS:WRITE-ALL ;
+
+: CHILD-CREATED-AFTER-SCAN-FORCES-AN-IMMEDIATE-DIRECTORY-RESCAN
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" child_created_after_scan_forces_an_immediate_directory_rescan"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   s" directory-raced-after-scan" ar EMPTY-PAGE
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" gone" IN-ROOT str> FS:MAKE-DIR
+   x s" gone" SEED-DIRECTORY-BASELINE
+   x s" gone/new.txt" IN-ROOT RACED !
+   [: RACE ;] TEST-DROPBOX:DURING-LISTING!
+   x rec PASSED FRESH? TTRUE
+   RACED @ AFTER-SCAN$ HOLDS-BYTES
+   x s" gone" DIRECTORY-AT
+   x PENDING-OF VEC:COUNT 0 T=
+   TEST-DROPBOX:SEEN$ LIST$ T$=
+   d x STEP-GONE ;
+
+: NEW-CHILD$ ( -- ^u8 n ) s" new child" ;
+
+\ Rust's answers in order, whatever the route: the empty listing, the
+\ parent's folder, then the new child's file.
+: PARENT-DELETED ( DROPBOX:hash -- )
+   {: h:DROPBOX:hash :}
+   [: S\" {\qentries\q:[],\qcursor\q:\qparent-deleted\q," SB-APPEND
+      S\" \qhas_more\q:false}" SB-APPEND ;] s" " ANSWERS
+   [: s" /parent" s" /parent" FOLDER-JSON+ ;] s" " METADATA-ANSWERS
+   [: s" /parent/new.txt" s" /parent/new.txt" s" rev-new-child" h
+      FILE-JSON+ ;] s" " ANSWERS ;
+
+: CHILD-SYNCED-SEEN$ ( -- ^u8 n )
+   s" /2/files/list_folder /2/files/create_folder_v2 /2/files/upload" ;
+
+: CHILD-PRESENT? ( ^run -- bool )
+   {: x :}
+   x RUN-JOURNAL @ s" parent/new.txt" DISPLAY x RUN-ARENA @
+   JOURNAL:BASELINE STORED-BASELINE PRESENT-BASELINE? ;
+
+: NONEMPTY-DIRECTORY-DELETE-REOBSERVES-AND-SYNCS-THE-NEW-CHILD
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" nonempty_directory_delete_reobserves_and_syncs_the_new_child"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   NEW-CHILD$ ar IDENTITY PARENT-DELETED
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" parent" IN-ROOT str> FS:MAKE-DIR
+   x s" parent/new.txt" IN-ROOT str> NEW-CHILD$ FS:WRITE-ALL
+   x s" parent" SEED-DIRECTORY-BASELINE
+   x rec PASSED FRESH? TTRUE
+   x s" parent/new.txt" IN-ROOT NEW-CHILD$ HOLDS-BYTES
+   x s" parent" DIRECTORY-AT
+   x CHILD-PRESENT? TTRUE
+   x PENDING-OF VEC:COUNT 0 T=
+   TEST-DROPBOX:SEEN$ CHILD-SYNCED-SEEN$ T$=
+   d x STEP-GONE ;
+
+: DIRECTORY-DELETION-CASES ( ^ARENA:arena -- )
+   {: ar :}
+   ar REMOTE-DIRECTORY-DELETION-REMOVES-LOCAL-DIRECTORIES-DEEPEST-FIRST
+   ar LOCAL-DIRECTORY-DELETION-REMOVES-DROPBOX-DIRECTORIES-AFTER-THEIR-ENTRIES
+   ar LOCAL-DIRECTORY-DELETION-WAITS-FOR-UNSYNCHRONIZED-DROPBOX-ENTRIES
+   ar DROPBOX-DIRECTORY-THAT-GAINED-AN-ENTRY-IS-NOT-DELETED-FROM-A-STALE-INVENTORY
+   ar CHILD-CREATED-AFTER-SCAN-FORCES-AN-IMMEDIATE-DIRECTORY-RESCAN
+   ar NONEMPTY-DIRECTORY-DELETE-REOBSERVES-AND-SYNCS-THE-NEW-CHILD ;
+
 : SERVED ( ^ARENA:arena -- )
    {: ar :}
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
@@ -5602,7 +5953,7 @@ $180 constant MODE-0600
       ar STALE-CASES ar DOWNLOAD-BLOCKS-CASES ar UPLOADS-CASES
       ar CONFLICTS-CASES ar RESTRICTED-CASES
       ar EDITS-AND-DIRECTORIES-CASES ar CASE-COLLISION-PASS-CASES
-      ar DIRECTORY-COLLISION-CASES ;]
+      ar DIRECTORY-COLLISION-CASES ar DIRECTORY-DELETION-CASES ;]
    [: MAIN @ DROPBOX:CLOSE ;]
    finally ;
 

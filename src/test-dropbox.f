@@ -15,20 +15,23 @@
 \ be, as invalid until RESET; the refresh still issues them. DENY refuses
 \ every call that carries a token 403 until RESET. A call must carry the
 \ Path-Root ROOT! expects, none when that is empty, else it answers 422.
-\ DURING-DOWNLOAD! hooks a quotation into the next download.
+\ DURING-DOWNLOAD! hooks a quotation into the next download, and
+\ DURING-LISTING! into the next listing call.
 \ Scripted answers go before a route's own: a call takes the first left
 \ bound to its path, else, an API call only, the first left bound to none.
 \ ARG-SCRIPT! also binds one to a text the call's Dropbox-API-Arg must
 \ contain.
-\ It records each request's path, the last API call's Authorization,
-\ Path-Root and Content-Type, and the body of the last delete_v2 or single
-\ upload its route answered, BODY-SENT$. ARGS-SENT$ joins every
-\ Dropbox-API-Arg sent, and DELETE-SENT$ is the last delete_v2's body.
+\ It records each request's path, each delete_v2 call's body (DELETES$),
+\ the last API call's Authorization, Path-Root and Content-Type, and the
+\ body of the last delete_v2 or single upload its route answered,
+\ BODY-SENT$. ARGS-SENT$ joins every Dropbox-API-Arg sent, and
+\ DELETE-SENT$ is the last delete_v2's body.
 \ STORAGE CLASS. PROCESS-WIDE: one worker serves every request, so its handler
 \ alone writes the state while a test waits on its call, and the test sets it
 \ between calls; only RESUME-BODY sets it during one, and the
-\ DURING-DOWNLOAD! hook runs on the fake's task. A body stays in its
-\ buffer, as HTTP:BODY! borrows it, until the next request.
+\ DURING-DOWNLOAD! and DURING-LISTING! hooks run on the fake's task. A
+\ body stays in its buffer, as HTTP:BODY! borrows it, until the next
+\ request.
 
 require src/lib/string.f
 require src/lib/span.f
@@ -98,6 +101,8 @@ variable SCRIPTS
 
 create SEEN TEXT-CAP allot
 variable SEEN-U
+create DELETES TEXT-CAP allot
+variable DELETES-U
 create AUTH NAME-CAP allot
 variable AUTH-U
 create ROOT-SENT TEXT-CAP allot
@@ -175,6 +180,17 @@ TYPED-VARIABLE TOKEN-CUTTING bool
    a u SEEN SEEN-U @ + TEXT-CAP SEEN-U @ - STORE SEEN-U +! ;
 
 
+: DELETE+ ( ^u8 n -- )
+   {: a:^ u:n :}
+   a u DELETES DELETES-U @ + TEXT-CAP DELETES-U @ - STORE DELETES-U +! ;
+
+
+: RECORD-DELETE ( HTTP:request -- )
+   {: q:HTTP:request :}
+   DELETES-U @ 0<> if s"  " DELETE+ then
+   q HTTP:BODY$ DELETE+ ;
+
+
 : SENT ( HTTP:request ^u8 n ^u8 n -- n bool )
    {: q:HTTP:request nm:^ nu:n dst:^ cap:n :}
    q nm nu HTTP:HEADER-OF$ if dst cap STORE true exit then
@@ -192,6 +208,7 @@ TYPED-VARIABLE TOKEN-CUTTING bool
    {: q:HTTP:request :}
    SEEN-U @ 0<> if s"  " SEEN+ then
    q HTTP:PATH$ SEEN+
+   q HTTP:PATH$ s" /2/files/delete_v2" STR= if q RECORD-DELETE then
    q HTTP:PATH$ s" /oauth2/token" STR= if q TOKEN-HEADERS exit then
    q HTTP:PATH$ s" /2/files/list_folder/longpoll" STR=
    if q TOKEN-HEADERS exit then
@@ -702,6 +719,10 @@ variable POLLED-U
 create ARGS TEXT-CAP allot
 variable ARGS-U
 
+: NO-HOOK ( -- ) ;
+TYPED-VARIABLE ON-LISTING [ -- ]
+' NO-HOOK ON-LISTING !
+
 
 : PAGES-MADE ( -- )
    PAGE-TEXT TEXT-CAP BUF:N>BLEN BUF:INIT
@@ -739,6 +760,7 @@ PAGES-MADE
    {: q:HTTP:request a:HTTP:response :}
    q a ADMITTED? 0= if exit then
    q ARGUED
+   ON-LISTING @ ['] NO-HOOK ON-LISTING ! execute
    PAGE-SERVED @ {: i:n :}
    i PAGE-COUNT >= if a UNSET! exit then
    1 PAGE-SERVED +!
@@ -755,7 +777,8 @@ PAGES-MADE
 
 : LISTING-RESET ( -- )
    PAGE-TEXT BUF:CLEAR PAGES @ 0 VEC:RESIZE
-   0 PAGE-SERVED ! 0 POLLED-U ! 0 ARGS-U ! ;
+   0 PAGE-SERVED ! 0 POLLED-U ! 0 ARGS-U !
+   ['] NO-HOOK ON-LISTING ! ;
 
 
 \ Opens the next page, with this status, at the end of PAGE-TEXT.
@@ -817,8 +840,6 @@ create RANGE-SENT NAME-CAP allot
 variable RANGE-SENT-U
 TYPED-VARIABLE RANGED bool
 TYPED-VARIABLE DURING [ -- ]
-
-: NO-HOOK ( -- ) ;
 ' NO-HOOK DURING !
 
 
@@ -1413,12 +1434,12 @@ $2100000 constant UPLOAD-CAP
 \ Forgets the script, the entries, the kept bytes, the pages, the long
 \ poll's answer, the sessions, the revs uploads took, a download's fault, a
 \ SKEW, a LOSE, the CUTs, a CUT-TOKEN, a GARBLE, a code GRANT! set, a
-\ ROTATE!, a REVOKE, a DENY, a DURING-DOWNLOAD! hook and what was sent;
-\ the tokens and the root stay.
+\ ROTATE!, a REVOKE, a DENY, a DURING-DOWNLOAD! or DURING-LISTING! hook
+\ and what was sent; the tokens and the root stay.
 : RESET ( -- )
    0 SCRIPTS ! 0 FILES ! 0 CONTENTS ! 0 SESSIONS ! 0 REVS !
    0 GRANT-CODE-U ! 0 ROTATED-U !
-   0 SEEN-U ! 0 AUTH-U ! 0 ROOT-SENT-U ! 0 TYPE-SENT-U !
+   0 SEEN-U ! 0 DELETES-U ! 0 AUTH-U ! 0 ROOT-SENT-U ! 0 TYPE-SENT-U !
    0 ARG-SENT-U ! 0 ARGS-SENT-U ! 0 DELETE-SENT-U ! 0 RANGE-SENT-U !
    0 BODY-SENT-U !
    false ROOTED ! false TYPED ! false LEAKED ! false RANGED !
@@ -1548,6 +1569,11 @@ $2100000 constant UPLOAD-CAP
 : ARGS$ ( -- ^u8 n ) ARGS ARGS-U @ ;
 
 
+\ The next listing call runs the quotation once, on the fake's task,
+\ once it is admitted and before it answers.
+: DURING-LISTING! ( [ -- ] -- ) ON-LISTING ! ;
+
+
 \ ---- files/download
 
 \ CONTENT! of skip bytes the fake does not keep, then the tail t; the size
@@ -1633,7 +1659,9 @@ $2100000 constant UPLOAD-CAP
 \ The last delete_v2's body since RESET.
 : DELETE-SENT$ ( -- ^u8 n ) DELETE-SENT DELETE-SENT-U @ ;
 
-
+\ The bodies of the delete_v2 calls since RESET, scripted ones included,
+\ joined by spaces.
+: DELETES$ ( -- ^u8 n ) DELETES DELETES-U @ ;
 \ The next API call's route runs and takes effect, and its answer is lost:
 \ the connection sends a 200 head and closes before its body.
 : LOSE ( -- ) true LOSING ! ;
