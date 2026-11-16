@@ -13,6 +13,9 @@ require src/lib/log.f
 require src/lib/adt/option.f
 require src/lib/vector.f
 require src/lib/sort.f
+require src/lib/utf8-scalar.f
+require src/lib/fmt.f
+require src/lib/fs-anchored.f
 require src/model.f
 require src/journal.f
 require src/local.f
@@ -742,5 +745,390 @@ STRUCTURE cursor
    0 0 0 0 CURSOR-MAKE
    begin s swap visit MERGE-STEP 0= until
    drop ;
+
+
+\ ---- case collisions ------------------------------------------------
+
+\ Rust's CaseCollisionResolution; root-changed is its LocalRootChanged:
+\ the configured path no longer names the journal's active root.
+ENUM case-collision-resolution
+   VARIANT none ;VARIANT
+   VARIANT renamed FIELD path MODEL:path ;VARIANT
+   VARIANT changed FIELD path MODEL:path ;VARIANT
+   VARIANT root-changed ;VARIANT
+;ENUM
+
+\ A local spelling, its Dropbox identity and whether a rename may move
+\ it.
+STRUCTURE spelling
+   FIELD key MODEL:key
+   FIELD path MODEL:path
+   FIELD renamable bool
+;STRUCTURE
+
+STRUCTURE case-variant-move
+   FIELD source MODEL:path
+   FIELD destination MODEL:path
+;STRUCTURE
+
+: NO-PATH ( -- option<MODEL:path> ) OPTION:NONE ;
+: NO-NAME ( -- option<str> ) OPTION:NONE ;
+
+: PATH$ ( MODEL:path -- ^u8 n ) MODEL:PATH>STR str> ;
+
+: PATH= ( MODEL:path MODEL:path -- bool )
+   {: a:MODEL:path b:MODEL:path :}
+   a PATH$ b PATH$ STR= ;
+
+: SPELLING-KEY ( spelling -- MODEL:key )
+   SPELLING-UNMAKE {: k p r :} k ;
+
+: SPELLING-PATH ( spelling -- MODEL:path )
+   SPELLING-UNMAKE {: k p r :} p ;
+
+: RENAMABLE ( spelling -- bool )
+   SPELLING-UNMAKE {: k p r :} r ;
+
+: SPELLING-AT ( ^VEC:vector<spelling> n -- spelling ) VEC:AT @ ;
+
+\ The rename moves only a regular file or a directory, never what the
+\ scan published as unsupported.
+: RENAMABLE? ( MODEL:observation<MODEL:local> -- bool )
+   MATCH MODEL:observation
+      present OF drop true ENDOF
+      directory OF true ENDOF
+      absent OF true ENDOF
+      unknown OF UNSUPPORTED-REASON? 0= ENDOF
+   ;MATCH ;
+
+: PUSH-SPELLING
+   ( ^VEC:vector<spelling> MODEL:local-record ^ARENA:arena -- )
+   {: out r ar :}
+   r MODEL-LOCAL--RECORD:UNMAKE {: p o :}
+   p MODEL:EXCLUDED? if exit then
+   p ar MODEL:FOLD p o RENAMABLE? SPELLING-MAKE out VEC:PUSH ! ;
+
+\ The records' spellings, in their order, excluded paths left out.
+: SPELLINGS
+   ( ^VEC:vector<MODEL:local-record> ^ARENA:arena
+     -- ^VEC:vector<spelling> )
+   {: v ar :}
+   ar ARENA:ALLOCATOR 0 [type] spelling VEC:NEW {: out :}
+   v VEC:COUNT 0 ?do out v i VEC:AT @ ar PUSH-SPELLING loop
+   out ;
+
+\ Key bytes, then path bytes, then the record's place.
+: BEFORE? ( n n ^VEC:vector<spelling> -- bool )
+   {: a b v :}
+   v a SPELLING-AT {: x:spelling :}
+   v b SPELLING-AT {: y:spelling :}
+   x SPELLING-KEY y SPELLING-KEY MODEL:KEY-CMP {: c :}
+   c 0<> if c 0 < exit then
+   x SPELLING-PATH y SPELLING-PATH PATH= if a b < exit then
+   x SPELLING-PATH PATH$ y SPELLING-PATH PATH$ STR< ;
+
+: SAME-AS-LAST? ( ^VEC:vector<spelling> spelling -- bool )
+   {: out s :}
+   out VEC:COUNT 0= if false exit then
+   out out VEC:COUNT 1- SPELLING-AT SPELLING-PATH
+   s SPELLING-PATH PATH= ;
+
+\ A repeated path keeps its last record's spelling, as a map would.
+: ADD-DISTINCT ( ^VEC:vector<spelling> spelling -- )
+   {: out s :}
+   out s SAME-AS-LAST? if s out out VEC:COUNT 1- VEC:AT ! exit then
+   s out VEC:PUSH ! ;
+
+\ The distinct spellings, in key order, each key's in path order.
+: ORDERED
+   ( ^VEC:vector<spelling> ^ARENA:arena -- ^VEC:vector<spelling> )
+   {: v ar :}
+   v VEC:COUNT [: v BEFORE? ;] ar ORDER {: idx :}
+   ar ARENA:ALLOCATOR 0 [type] spelling VEC:NEW {: out :}
+   idx VEC:COUNT 0 ?do out v idx i VEC:AT @ SPELLING-AT ADD-DISTINCT loop
+   out ;
+
+\ The index past the run of spellings from `from` that share its key.
+: SPELLING-RUN-END ( ^VEC:vector<spelling> n -- n )
+   {: v from :}
+   v from SPELLING-AT SPELLING-KEY {: k :}
+   from 1+
+   begin
+      dup v VEC:COUNT < if
+         v over SPELLING-AT SPELLING-KEY k MODEL:KEY=
+      else false then
+   while 1+ repeat ;
+
+: ANY-RENAMABLE? ( ^VEC:vector<spelling> n n -- bool )
+   {: v from to :}
+   to from ?do
+      v i SPELLING-AT RENAMABLE if true unloop exit then
+   loop
+   false ;
+
+\ The run from `from`, and whether two spellings collide in it.
+: RUN-AT ( ^VEC:vector<spelling> n -- n n bool )
+   {: v from :}
+   v from SPELLING-RUN-END {: to :}
+   from to
+   to from - 1 > if v from to ANY-RENAMABLE? exit then
+   false ;
+
+\ The first colliding run with a renamable spelling; an empty run when
+\ none.
+: FIRST-COLLISION ( ^VEC:vector<spelling> -- n n )
+   {: v :}
+   0 begin dup v VEC:COUNT < while
+      v swap RUN-AT if exit then nip
+   repeat
+   dup ;
+
+: KEPT? ( MODEL:path option<MODEL:path> -- bool )
+   MATCH option
+      none OF drop false ENDOF
+      some OF PATH= ENDOF
+   ;MATCH ;
+
+: OTHER? ( spelling option<MODEL:path> -- bool )
+   {: s kept :}
+   s RENAMABLE 0= if false exit then
+   s SPELLING-PATH kept KEPT? 0= ;
+
+\ The run's greatest renamable spelling other than kept.
+: PREFERRED
+   ( ^VEC:vector<spelling> n n option<MODEL:path>
+     -- option<MODEL:path> )
+   {: v from to kept :}
+   to from - 0 ?do
+      v to 1- i - SPELLING-AT kept OTHER? if
+         v to 1- i - SPELLING-AT SPELLING-PATH OPTION:SOME
+         unloop exit
+      then
+   loop
+   NO-PATH ;
+
+\ Rust's case_variant_source: the greatest renamable spelling of the
+\ first collision in key order other than the one recorded keeps a
+\ baseline under, so the history stays with its file; the recorded one
+\ itself when it is the only candidate. A collision of unsupported
+\ spellings only is left as it is.
+: CASE-VARIANT-SOURCE
+   ( ^VEC:vector<MODEL:local-record> [ MODEL:key -- option<MODEL:path> ]
+     ^ARENA:arena -- option<MODEL:path> )
+   {: records recorded ar :}
+   records ar SPELLINGS ar ORDERED {: v :}
+   v FIRST-COLLISION {: from:n to:n :}
+   from to = if NO-PATH exit then
+   v from SPELLING-AT SPELLING-KEY recorded execute {: kept :}
+   v from to kept PREFERRED MATCH option
+      none OF v from to NO-PATH PREFERRED ENDOF
+      some OF OPTION:SOME ENDOF
+   ;MATCH ;
+
+\ Rust's truncate_component: the name cut to limit bytes, at a character
+\ boundary when the name is UTF-8.
+: TRUNCATE-COMPONENT ( ^u8 n n -- ^u8 n )
+   {: p:^ u:n limit:n :}
+   u limit <= if p u exit then
+   p u UTF8:VALID? if p p u limit UTF8:FIT exit then
+   p limit ;
+
+: JOIN-BYTES ( ^u8 n ^u8 n ^ARENA:arena -- ^u8 n )
+   {: a:^ au:n b:^ bu:n ar :}
+   ar au bu + ARENA:ALLOC drop {: dst:^ :}
+   a dst au BYTE-COPY
+   b dst au + bu BYTE-COPY
+   dst au bu + ;
+
+: SUFFIX ( n ^ARENA:arena -- ^u8 n )
+   {: attempt:n ar :}
+   attempt 0= if s"  (case variant)" exit then
+   s"  (case variant " attempt 1+ FMT:INT$ ar JOIN-BYTES
+   s" )" ar JOIN-BYTES ;
+
+\ Rust's case_variant_name; none when the suffix alone passes name-max.
+: CASE-VARIANT-NAME ( ^u8 n n n ^ARENA:arena -- option<str> )
+   {: name:^ nu:n attempt:n max:n ar :}
+   attempt ar SUFFIX {: s:^ su:n :}
+   max su < if NO-NAME exit then
+   name nu max su - TRUNCATE-COMPONENT s su ar JOIN-BYTES >str OPTION:SOME ;
+
+\ The bytes before and after the "/" at k.
+: SPLIT-AT ( ^u8 n n -- ^u8 n ^u8 n )
+   {: p:^ u:n k:n :}
+   p k p k + 1+ u k - 1- ;
+
+\ The path's parent, empty at the top, and its last name.
+: SPLIT-NAME ( ^u8 n -- ^u8 n ^u8 n )
+   {: p:^ u:n :}
+   u 0 ?do
+      p u 1- i - + c@ 47 = if p u u 1- i - SPLIT-AT unloop exit then
+   loop
+   p 0 p u ;
+
+: FINAL? ( ^u8 n -- bool )
+   {: p:^ u:n :}
+   u 0= if false exit then
+   p u s" ." STR= if false exit then
+   p u s" .." STR= 0= ;
+
+: UNDER ( ^u8 n str ^ARENA:arena -- MODEL:path )
+   {: dir:^ du:n name:str ar :}
+   du 0= if name MODEL:>PATH exit then
+   dir du s" /" ar JOIN-BYTES name str> ar JOIN-BYTES >str MODEL:>PATH ;
+
+: KEYS
+   ( ^VEC:vector<MODEL:local-record> ^ARENA:arena
+     -- ^VEC:vector<MODEL:key> )
+   {: v ar :}
+   ar ARENA:ALLOCATOR 0 [type] MODEL:key VEC:NEW {: out :}
+   v VEC:COUNT 0 ?do
+      v i VEC:AT @ RECORD-PATH ar MODEL:FOLD out VEC:PUSH !
+   loop
+   out ;
+
+: TAKEN? ( ^VEC:vector<MODEL:key> MODEL:key -- bool )
+   {: keys k :}
+   keys VEC:COUNT 0 ?do
+      keys i VEC:AT @ k MODEL:KEY= if true unloop exit then
+   loop
+   false ;
+
+\ The attempt's destination, unless no name fits or a record holds its
+\ identity.
+: DESTINATION
+   ( ^VEC:vector<MODEL:key> ^u8 n ^u8 n n n ^ARENA:arena
+     -- option<MODEL:path> bool )
+   {: keys dir:^ du:n name:^ nu:n attempt:n max:n ar :}
+   name nu attempt max ar CASE-VARIANT-NAME MATCH option
+      none OF NO-PATH true ENDOF
+      some OF dir du rot ar UNDER {: d :}
+         keys d ar MODEL:FOLD TAKEN? if NO-PATH false exit then
+         d OPTION:SOME true
+      ENDOF
+   ;MATCH ;
+
+: NO-UNIQUE ( MODEL:path -- )
+   s" could not select a unique local case-variant path" INVALID ;
+
+\ Rust's case_variant_move: the source's first case-variant name whose
+\ identity no record holds, trying one more name than there are records.
+: CASE-VARIANT-MOVE
+   ( ^VEC:vector<MODEL:local-record> MODEL:path n ^ARENA:arena
+     -- case-variant-move )
+   {: records source max:n ar :}
+   records ar KEYS {: keys :}
+   source PATH$ SPLIT-NAME {: dir:^ du:n name:^ nu:n :}
+   name nu FINAL? 0= if
+      source s" local case collision has no final path component"
+      INVALID
+   then
+   records VEC:COUNT 1+ 0 ?do
+      keys dir du name nu i max ar DESTINATION if
+         MATCH option
+            none OF source NO-UNIQUE ENDOF
+            some OF source swap CASE-VARIANT-MOVE-MAKE unloop exit ENDOF
+         ;MATCH
+      else drop then
+   loop
+   source NO-UNIQUE ;
+
+\ Rust's supersede_pending_plan: retires a stale live plan; one that
+\ already completed needs nothing.
+: SUPERSEDE-PENDING-PLAN
+   ( JOURNAL:journal JOURNAL:plan-record ^ARENA:arena -- )
+   {: j plan ar :}
+   plan JOURNAL-PLAN--RECORD:UNMAKE {: id p o s :}
+   j id ar JOURNAL:SUPERSEDE-PLAN
+   MATCH JOURNAL:plan-supersede
+      superseded OF ENDOF
+      already-completed OF ENDOF
+      not-found OF p s" stale pending plan disappeared" INVALID ENDOF
+   ;MATCH ;
+
+: SUPERSEDE-IF-UNDER
+   ( JOURNAL:journal JOURNAL:plan-record MODEL:key ^ARENA:arena -- )
+   {: j plan k ar :}
+   plan JOURNAL-PLAN--RECORD:UNMAKE {: id p o s :}
+   p ar MODEL:FOLD {: pk :}
+   pk k MODEL:KEY= pk k MODEL:BENEATH? or 0= if exit then
+   j plan ar SUPERSEDE-PENDING-PLAN ;
+
+: SUPERSEDE-ALL-UNDER
+   ( JOURNAL:journal ^VEC:vector<JOURNAL:plan-record> MODEL:key
+     ^ARENA:arena -- )
+   {: j plans k ar :}
+   plans VEC:COUNT 0 ?do j plans i VEC:AT @ k ar SUPERSEDE-IF-UNDER loop ;
+
+\ Retires every live plan, pending or blocked, at the source's identity
+\ or beneath it, both read before any is retired.
+: SUPERSEDE-BENEATH ( JOURNAL:journal MODEL:path ^ARENA:arena -- )
+   {: j source ar :}
+   source ar MODEL:FOLD {: k :}
+   j ar JOURNAL:PENDING-PLANS {: pending :}
+   j ar JOURNAL:BLOCKED-PLANS {: blocked :}
+   j pending k ar SUPERSEDE-ALL-UNDER
+   j blocked k ar SUPERSEDE-ALL-UNDER ;
+
+: RENAMED ( MODEL:path -- case-collision-resolution )
+   construct case-collision-resolution renamed ;
+
+: CHANGED ( MODEL:path -- case-collision-resolution )
+   construct case-collision-resolution changed ;
+
+: MOVE-VARIANT
+   ( fd JOURNAL:journal case-variant-move ^ARENA:arena
+     -- case-collision-resolution )
+   {: root:fd j mv ar :}
+   mv CASE-VARIANT-MOVE-UNMAKE {: src dst :}
+   j src ar SUPERSEDE-BENEATH
+   j src [: PATH$ root -rot LOCAL:ENTRY-EXISTS-AT ;] ar
+   JOURNAL:INVALIDATE-CASE-COLLISION-BASELINES
+   root src PATH$ dst PATH$ LOCAL:RENAME-CASE-VARIANT
+   MATCH LOCAL:rename-outcome
+      renamed OF src RENAMED ENDOF
+      retry OF src CHANGED ENDOF
+   ;MATCH ;
+
+: RESOLVE-BELOW
+   ( fd MODEL:path JOURNAL:journal ^VEC:vector<MODEL:local-record>
+     ^ARENA:arena -- case-collision-resolution )
+   {: root:fd source j records ar :}
+   root source PATH$ LOCAL:PARENT-NAME-MAX MATCH option
+      none OF source CHANGED ENDOF
+      some OF {: max:n :}
+         root j records source max ar CASE-VARIANT-MOVE ar MOVE-VARIANT
+      ENDOF
+   ;MATCH ;
+
+: RESOLVE-AT
+   ( MODEL:path JOURNAL:journal ^u8 n ^VEC:vector<MODEL:local-record>
+     ^ARENA:arena -- case-collision-resolution )
+   {: source j p:^ u:n records ar :}
+   j p u LOCAL:OPEN-ACTIVE-ROOT MATCH option
+      none OF construct case-collision-resolution root-changed ENDOF
+      some OF {: root:fd :}
+         [: root source j records ar RESOLVE-BELOW ;]
+         [: root FS:CLOSE-DIR ;] finally
+      ENDOF
+   ;MATCH ;
+
+: RECORDED-SPELLING
+   ( MODEL:key JOURNAL:journal ^ARENA:arena -- option<MODEL:path> )
+   {: k j ar :}
+   j k ar JOURNAL:BASELINE-SPELLING ;
+
+\ Rust's resolve_case_collision: renames one spelling of the first
+\ collision below the sync root at p apart, retiring the plans at its
+\ identity and forgetting the baselines the rename leaves stale.
+: RESOLVE-CASE-COLLISION
+   ( JOURNAL:journal ^u8 n ^VEC:vector<MODEL:local-record> ^ARENA:arena
+     -- case-collision-resolution )
+   {: j p:^ u:n records ar :}
+   records [: j ar RECORDED-SPELLING ;] ar
+   CASE-VARIANT-SOURCE MATCH option
+      none OF construct case-collision-resolution none ENDOF
+      some OF j p u records ar RESOLVE-AT ENDOF
+   ;MATCH ;
 
 ;package

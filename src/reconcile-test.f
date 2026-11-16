@@ -3,7 +3,8 @@
 \ Known paths, Rust's tests of the same names:
 \ - absent_paths_are_spelled_with_local_ancestor_casing
 \ - local_case_variants_never_collapse_into_one_observation, over
-\   sampled names, the collision logged once naming both spellings
+\   sampled names, the collision logged once naming both spellings and
+\   renamed alike in either order, to a path neither spelling holds
 \ - known_path_merge_matches_set_union, over sampled path sets
 \ - remaining_operation_comparison_ignores_a_completed_prefix
 \ - pending_only_paths_are_visited_as_absent_without_creating_a_baseline
@@ -18,6 +19,19 @@
 \   pair of strings of up to three bytes from 00 . / 0 FF
 \ - ORDER-PATH-DECISIONS puts an upload at depth 3 first, then local
 \   directory deletes at depths 2 and 1, deepest first.
+\ Case collisions:
+\ - Rust's case_variant_name_skips_existing_suffixes,
+\   case_variant_name_fits_a_maximum_length_component,
+\   case_variant_moves_converge_from_parent_to_child,
+\   case_variant_source_keeps_the_recorded_spelling,
+\   case_variant_source_leaves_unsupported_spellings and
+\   case_variant_source_skips_an_unsupported_collision.
+\ - RESOLVE-CASE-COLLISION below a bound root holding Dir/a.txt and
+\   dir/b.txt renames dir, the spelling CASE-VARIANT-SOURCE picks, to
+\   its case-variant name and retires the plans at both spellings,
+\   which share its identity, leaving one at another path pending.
+\ - With the root replaced by another directory it answers
+\   root-changed, renaming nothing and retiring no plan.
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -30,8 +44,11 @@ require src/lib/fs-mutate.f
 require src/lib/fd.f
 require src/lib/vector.f
 require src/lib/adt/option.f
+require src/lib/fs-anchored.f
+require src/dropbox.f
 require src/model.f
 require src/journal.f
+require src/test-journal.f
 require src/local.f
 require src/planner.f
 require src/reconcile.f
@@ -64,8 +81,6 @@ private
 : CANONICAL ( ^u8 n ^ARENA:arena -- MODEL:key )
    {: p:^ u:n ar :}
    p u DISPLAY ar MODEL:FOLD ;
-
-: PATH$ ( MODEL:path -- ^u8 n ) MODEL:PATH>STR str> ;
 
 \ Rust's identity: dropbox_content_hash of the bytes, from a pipe.
 : IDENTITY ( ^u8 n ^ARENA:arena -- DROPBOX:hash )
@@ -309,6 +324,45 @@ variable SEED
    code 0<> if code throw then
    t u ;
 
+: NO-SPELLING ( MODEL:key -- option<MODEL:path> ) drop NO-PATH ;
+
+\ Rust's case_variant_move, max 255, of case_variant_source's pick
+\ with no baseline; a collision with no source fails the case.
+: RENAME
+   ( ^VEC:vector<MODEL:local-record> ^ARENA:arena
+     -- case-variant-move )
+   {: rs ar :}
+   rs [: NO-SPELLING ;] ar CASE-VARIANT-SOURCE MATCH option
+      none OF
+         false TTRUE s" " DISPLAY dup CASE-VARIANT-MOVE-MAKE
+      ENDOF
+      some OF rs swap 255 ar CASE-VARIANT-MOVE ENDOF
+   ;MATCH ;
+
+: MOVES= ( case-variant-move case-variant-move -- )
+   CASE-VARIANT-MOVE-UNMAKE {: s2 d2 :}
+   CASE-VARIANT-MOVE-UNMAKE {: s1 d1 :}
+   s1 PATH$ s2 PATH$ T$=
+   d1 PATH$ d2 PATH$ T$= ;
+
+\ Neither spelling's identity is the destination's.
+: UNIQUE ( case-variant-move str str ^ARENA:arena -- )
+   {: mv a:str b:str ar :}
+   mv CASE-VARIANT-MOVE-UNMAKE {: s d :}
+   d ar MODEL:FOLD {: k :}
+   k a str> ar CANONICAL MODEL:KEY= TFALSE
+   k b str> ar CANONICAL MODEL:KEY= TFALSE ;
+
+\ The records in reverse order rename alike, to a unique path.
+: RENAMES-AGREE
+   ( ^VEC:vector<MODEL:local-record> str str ^ARENA:arena -- )
+   {: rs lower:str upper:str ar :}
+   ar LOCAL-RECORDS {: sr :}
+   sr upper str> DIRECTORY+ sr lower str> DIRECTORY+
+   rs ar RENAME {: fwd :}
+   fwd sr ar RENAME MOVES=
+   fwd lower upper ar UNIQUE ;
+
 \ One sample of the proptest: a lowercase name and its uppercase.
 : CASE-VARIANTS ( str ^ARENA:arena -- )
    {: d:str ar :}
@@ -322,7 +376,8 @@ variable SEED
    d [: [: rs ar LOCAL-MAP drop ;] E-CASE-COLLISION TTHROWSQ ;] ar
    LOGGED {: t:^ tu:n :}
    t tu 10 COUNT-CHAR 1 T=
-   t tu upper str> lower str> COLLISION$ CONTAINS? TTRUE ;
+   t tu upper str> lower str> COLLISION$ CONTAINS? TTRUE
+   rs lower upper ar RENAMES-AGREE ;
 
 : LOCAL-CASE-VARIANTS-NEVER-COLLAPSE-INTO-ONE-OBSERVATION
    ( ^ARENA:arena -- )
@@ -790,6 +845,301 @@ variable SEED
    v idx 1 VEC:AT @ VEC:AT @ DECISION-PATH s" a/b" T$=
    v idx 2 VEC:AT @ VEC:AT @ DECISION-PATH s" a" T$= ;
 
+
+\ ---- case collisions ------------------------------------------------
+
+: NEW-RECORDS ( ^ARENA:arena -- ^VEC:vector<MODEL:local-record> )
+   ARENA:ALLOCATOR 0 [type] MODEL:local-record VEC:NEW ;
+
+: DIRECTORY ( -- MODEL:observation<MODEL:local> )
+   MODEL-OBSERVATION:DIRECTORY ;
+
+: UNKNOWN ( MODEL:unknown-reason -- MODEL:observation<MODEL:local> )
+   MODEL-OBSERVATION:UNKNOWN ;
+
+: PRESENT ( MODEL:local -- MODEL:observation<MODEL:local> )
+   MODEL-OBSERVATION:PRESENT ;
+
+: OBSERVED
+   ( ^VEC:vector<MODEL:local-record> ^u8 n
+     MODEL:observation<MODEL:local> -- )
+   {: v p:^ u:n o :}
+   p u DISPLAY o MODEL-LOCAL--RECORD:MAKE v VEC:PUSH ! ;
+
+\ Rust's local_records: each path a directory.
+: DIR+ ( ^VEC:vector<MODEL:local-record> ^u8 n -- )
+   DIRECTORY OBSERVED ;
+
+: UNSUPPORTED-SPELLING+ ( ^VEC:vector<MODEL:local-record> ^u8 n -- )
+   MODEL-UNKNOWN--REASON:UNSUPPORTED UNKNOWN OBSERVED ;
+
+: INACCESSIBLE+ ( ^VEC:vector<MODEL:local-record> ^u8 n -- )
+   MODEL-UNKNOWN--REASON:INACCESSIBLE UNKNOWN OBSERVED ;
+
+\ Rust's identity: dropbox_content_hash of the bytes, read from a pipe.
+: HASH-OF ( ^u8 n ^ARENA:arena -- DROPBOX:hash )
+   {: b:^ u:n ar :}
+   FD:PIPE {: r:fd w:fd :}
+   w b u FD:WRITE-FULL w FS:CLOSE-DIR
+   r ar LOCAL:DROPBOX-CONTENT-HASH r FS:CLOSE-DIR ;
+
+\ A file at the path holding the bytes b.
+: FILE+
+   ( ^VEC:vector<MODEL:local-record> ^u8 n ^u8 n ^ARENA:arena -- )
+   {: v p:^ u:n b:^ bu:n ar :}
+   b bu ar HASH-OF MODEL-LOCAL:MAKE PRESENT {: o :}
+   v p u o OBSERVED ;
+
+: RECORDED-FOO ( MODEL:key -- option<MODEL:path> )
+   drop s" FOO.txt" DISPLAY OPTION:SOME ;
+
+: RECORDED-NOTES ( MODEL:key -- option<MODEL:path> )
+   drop s" notes.txt" DISPLAY OPTION:SOME ;
+
+: SOURCE$ ( option<MODEL:path> -- ^u8 n )
+   MATCH option
+      none OF s" (none)" ENDOF
+      some OF PATH$ ENDOF
+   ;MATCH ;
+
+\ The source, failing the case when there is none.
+: SOME-PATH ( option<MODEL:path> -- MODEL:path )
+   MATCH option
+      none OF false TTRUE s" " DISPLAY ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+: UNBASED-SOURCE
+   ( ^VEC:vector<MODEL:local-record> ^ARENA:arena -- MODEL:path )
+   [: NO-SPELLING ;] swap CASE-VARIANT-SOURCE SOME-PATH ;
+
+: MOVE-SOURCE$ ( case-variant-move -- ^u8 n )
+   CASE-VARIANT-MOVE-UNMAKE {: s d :} s PATH$ ;
+
+: MOVE-DESTINATION ( case-variant-move -- MODEL:path )
+   CASE-VARIANT-MOVE-UNMAKE {: s d :} d ;
+
+: CASE-VARIANT-NAME-SKIPS-EXISTING-SUFFIXES ( ^ARENA:arena -- )
+   {: ar :}
+   s" case_variant_name_skips_existing_suffixes" T-LABEL
+   ar NEW-RECORDS {: v :}
+   v s" Credit" DIR+
+   v s" credit" DIR+
+   v s" credit (case variant)" DIR+
+   v s" CREDIT (CASE VARIANT 2)" DIR+
+   v v ar UNBASED-SOURCE 255 ar CASE-VARIANT-MOVE {: mv :}
+   mv MOVE-SOURCE$ s" credit" T$=
+   mv MOVE-DESTINATION PATH$ s" credit (case variant 3)" T$= ;
+
+: REPEATED ( u8 n ^ARENA:arena -- ^u8 n )
+   {: c:u8 u:n ar :}
+   ar u ARENA:ALLOC drop {: p:^ :}
+   u 0 ?do c p i + c! loop
+   p u ;
+
+: CASE-VARIANT-NAME-FITS-A-MAXIMUM-LENGTH-COMPONENT ( ^ARENA:arena -- )
+   {: ar :}
+   s" case_variant_name_fits_a_maximum_length_component" T-LABEL
+   ar NEW-RECORDS {: v :}
+   v 65 255 ar REPEATED DIR+
+   v 97 255 ar REPEATED DIR+
+   v v ar UNBASED-SOURCE 255 ar CASE-VARIANT-MOVE MOVE-DESTINATION
+   PATH$ SPLIT-NAME {: dir:^ du:n name:^ nu:n :}
+   nu 255 T=
+   name nu s"  (case variant)" ENDS-WITH? TTRUE ;
+
+: CASE-VARIANT-MOVES-CONVERGE-FROM-PARENT-TO-CHILD ( ^ARENA:arena -- )
+   {: ar :}
+   s" case_variant_moves_converge_from_parent_to_child" T-LABEL
+   ar NEW-RECORDS {: v :}
+   v s" Credit" DIR+
+   v s" credit" DIR+
+   v s" credit/Expenses" DIR+
+   v s" credit/expenses" DIR+
+   v v ar UNBASED-SOURCE 255 ar CASE-VARIANT-MOVE {: parent :}
+   parent MOVE-SOURCE$ s" credit" T$=
+   parent MOVE-DESTINATION PATH$ s" credit (case variant)" T$=
+   ar NEW-RECORDS {: after :}
+   after s" Credit" DIR+
+   after s" credit (case variant)" DIR+
+   after s" credit (case variant)/Expenses" DIR+
+   after s" credit (case variant)/expenses" DIR+
+   after after ar UNBASED-SOURCE 255 ar CASE-VARIANT-MOVE {: child :}
+   child MOVE-SOURCE$ s" credit (case variant)/expenses" T$=
+   child MOVE-DESTINATION PATH$
+   s" credit (case variant)/expenses (case variant)" T$=
+   ar NEW-RECORDS {: converged :}
+   converged s" Credit" DIR+
+   converged s" credit (case variant)" DIR+
+   converged s" credit (case variant)/Expenses" DIR+
+   converged child MOVE-DESTINATION PATH$ DIR+
+   converged [: NO-SPELLING ;] ar CASE-VARIANT-SOURCE SOURCE$
+   s" (none)" T$= ;
+
+: CASE-VARIANT-SOURCE-KEEPS-THE-RECORDED-SPELLING ( ^ARENA:arena -- )
+   {: ar :}
+   s" case_variant_source_keeps_the_recorded_spelling" T-LABEL
+   ar NEW-RECORDS {: v :}
+   v s" Foo.txt" DIR+
+   v s" foo.txt" DIR+
+   v [: RECORDED-FOO ;] ar CASE-VARIANT-SOURCE SOURCE$ s" foo.txt" T$=
+   \ An unreadable spelling can still be renamed, so it moves and the
+   \ recorded one keeps its history.
+   ar NEW-RECORDS {: w :}
+   w s" Notes.txt" INACCESSIBLE+
+   w s" notes.txt" s" notes" ar FILE+
+   w [: RECORDED-NOTES ;] ar CASE-VARIANT-SOURCE SOURCE$
+   s" Notes.txt" T$= ;
+
+: UNSUPPORTED-RECORDS ( ^ARENA:arena -- ^VEC:vector<MODEL:local-record> )
+   NEW-RECORDS {: v :}
+   v s" Link" UNSUPPORTED-SPELLING+
+   v s" link" UNSUPPORTED-SPELLING+
+   v ;
+
+: CASE-VARIANT-SOURCE-LEAVES-UNSUPPORTED-SPELLINGS ( ^ARENA:arena -- )
+   {: ar :}
+   s" case_variant_source_leaves_unsupported_spellings" T-LABEL
+   ar UNSUPPORTED-RECORDS [: NO-SPELLING ;] ar CASE-VARIANT-SOURCE
+   SOURCE$ s" (none)" T$= ;
+
+: CASE-VARIANT-SOURCE-SKIPS-AN-UNSUPPORTED-COLLISION ( ^ARENA:arena -- )
+   {: ar :}
+   s" case_variant_source_skips_an_unsupported_collision" T-LABEL
+   ar UNSUPPORTED-RECORDS {: v :}
+   v s" Notes.txt" s" Notes.txt" ar FILE+
+   v s" notes.txt" s" notes.txt" ar FILE+
+   v [: NO-SPELLING ;] ar CASE-VARIANT-SOURCE SOURCE$ s" notes.txt" T$= ;
+
+\ ---- RESOLVE-CASE-COLLISION
+
+\ dir/name.
+: INSIDE ( str ^u8 n ^ARENA:arena -- str )
+   {: d:str a:^ u ar :}
+   d str> s" /" ar JOIN-BYTES a u ar JOIN-BYTES >str ;
+
+: TREE-GONE ( str -- ) str> FS:REMOVE-TREE ;
+
+: MAKE-AT ( str ^u8 n ^ARENA:arena -- )
+   INSIDE str> FS:MAKE-DIR ;
+
+: WRITE-AT ( str ^u8 n ^u8 n ^ARENA:arena -- )
+   {: r:str p:^ u:n b:^ bu:n ar :}
+   r p u ar INSIDE str> b bu FS:WRITE-ALL ;
+
+: THERE? ( str ^u8 n ^ARENA:arena -- bool ) INSIDE str> FS:EXISTS? ;
+
+\ A case's directory under TMPDIR and the sync root in it, holding
+\ Dir/a.txt and dir/b.txt.
+: FIXTURE ( ^ARENA:arena -- str str )
+   {: ar :}
+   s" reconcile-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
+   d s" root" ar INSIDE {: r:str :}
+   r str> FS:MAKE-DIR
+   r s" Dir" ar MAKE-AT
+   r s" dir" ar MAKE-AT
+   r s" Dir/a.txt" s" a" ar WRITE-AT
+   r s" dir/b.txt" s" b" ar WRITE-AT
+   d r ;
+
+\ The fixture's tree as a scan observes it.
+: TREE ( ^ARENA:arena -- ^VEC:vector<MODEL:local-record> )
+   {: ar :}
+   ar NEW-RECORDS {: v :}
+   v s" Dir" DIR+
+   v s" Dir/a.txt" s" a" ar FILE+
+   v s" dir" DIR+
+   v s" dir/b.txt" s" b" ar FILE+
+   v ;
+
+: RECORDED? ( JOURNAL:plan-write -- bool )
+   MATCH JOURNAL:plan-write
+      recorded OF drop true ENDOF
+      already-live OF drop false ENDOF
+   ;MATCH ;
+
+\ A pending plan creating the local directory at path.
+: RECORD ( JOURNAL:journal ^u8 n ^ARENA:arena -- )
+   {: j a:^ u ar :}
+   MODEL-OPERATION:CREATE-LOCAL-DIRECTORY ar ONE-PLAN {: plan :}
+   j a u DISPLAY plan ar JOURNAL:RECORD-PLAN RECORDED? TTRUE ;
+
+\ The journal in the case's directory d, bound to the root r, with a
+\ pending plan below each spelling and one beside them.
+: BOUND ( str str ^ARENA:arena -- JOURNAL:journal )
+   {: d:str r:str ar :}
+   d s" journal.sqlite3" ar INSIDE JOURNAL:OPEN {: j :}
+   j r JOURNAL:INSPECT ar JOURNAL:ACTIVATE-LOCAL-ROOT drop
+   j s" Dir/a.txt" ar RECORD
+   j s" dir/b.txt" ar RECORD
+   j s" other.txt" ar RECORD
+   j ;
+
+: RESOLUTION$ ( case-collision-resolution ^ARENA:arena -- ^u8 n )
+   {: ar :}
+   MATCH case-collision-resolution
+      none OF s" none" ENDOF
+      renamed OF s" renamed " rot PATH$ ar JOIN-BYTES ENDOF
+      changed OF s" changed " rot PATH$ ar JOIN-BYTES ENDOF
+      root-changed OF s" root-changed" ENDOF
+   ;MATCH ;
+
+: PLAN-PATH$ ( ^VEC:vector<JOURNAL:plan-record> n -- ^u8 n )
+   VEC:AT @ JOURNAL-PLAN--RECORD:UNMAKE {: id p o s :} p PATH$ ;
+
+: RENAMES-ONE ( str str ^ARENA:arena -- )
+   {: d:str r:str ar :}
+   d r ar BOUND {: j :}
+   ar TREE {: v :}
+   v ar UNBASED-SOURCE PATH$ s" dir" T$=
+   j r str> v ar RESOLVE-CASE-COLLISION ar RESOLUTION$
+   s" renamed dir" T$=
+   r s" dir (case variant)/b.txt" ar THERE? TTRUE
+   r s" dir" ar THERE? TFALSE
+   r s" Dir/a.txt" ar THERE? TTRUE
+   j ar JOURNAL:PENDING-PLANS {: pending :}
+   pending VEC:COUNT 1 T=
+   pending 0 PLAN-PATH$ s" other.txt" T$=
+   j JOURNAL:CLOSE ;
+
+: RESOLVE-CASE-COLLISION-RENAMES-ONE-SPELLING ( ^ARENA:arena -- )
+   {: ar :}
+   s" resolve case collision renames one spelling" T-LABEL
+   ar FIXTURE {: d:str r:str :}
+   [: d r ar RENAMES-ONE ;] [: d TREE-GONE ;] finally ;
+
+: KEEPS-A-REPLACED-ROOT ( str str ^ARENA:arena -- )
+   {: d:str r:str ar :}
+   d r ar BOUND {: j :}
+   d s" old" ar INSIDE {: old:str :}
+   r str> old str> FS:RENAME-FILE
+   r str> FS:MAKE-DIR
+   j r str> ar TREE ar RESOLVE-CASE-COLLISION ar RESOLUTION$
+   s" root-changed" T$=
+   old s" dir/b.txt" ar THERE? TTRUE
+   old s" dir (case variant)" ar THERE? TFALSE
+   r s" dir (case variant)" ar THERE? TFALSE
+   j ar JOURNAL:PENDING-PLANS VEC:COUNT 3 T=
+   j JOURNAL:CLOSE ;
+
+: RESOLVE-CASE-COLLISION-ANSWERS-A-REPLACED-ROOT ( ^ARENA:arena -- )
+   {: ar :}
+   s" resolve case collision answers a replaced root" T-LABEL
+   ar FIXTURE {: d:str r:str :}
+   [: d r ar KEEPS-A-REPLACED-ROOT ;] [: d TREE-GONE ;] finally ;
+
+: CASE-COLLISION-CASES ( ^ARENA:arena -- )
+   {: ar :}
+   ar CASE-VARIANT-NAME-SKIPS-EXISTING-SUFFIXES
+   ar CASE-VARIANT-NAME-FITS-A-MAXIMUM-LENGTH-COMPONENT
+   ar CASE-VARIANT-MOVES-CONVERGE-FROM-PARENT-TO-CHILD
+   ar CASE-VARIANT-SOURCE-KEEPS-THE-RECORDED-SPELLING
+   ar CASE-VARIANT-SOURCE-LEAVES-UNSUPPORTED-SPELLINGS
+   ar CASE-VARIANT-SOURCE-SKIPS-AN-UNSUPPORTED-COLLISION
+   ar RESOLVE-CASE-COLLISION-RENAMES-ONE-SPELLING
+   ar RESOLVE-CASE-COLLISION-ANSWERS-A-REPLACED-ROOT ;
+
+
 : CASES ( ^ARENA:arena -- )
    {: ar :}
    ar ABSENT-PATHS-ARE-SPELLED-WITH-LOCAL-ANCESTOR-CASING
@@ -805,7 +1155,8 @@ variable SEED
    ar BASELINE-ONLY-PATHS-ARE-INCLUDED-IN-CONFIRMED-ABSENCE
    ar REMOTE-SUBTREE-HOLDS-ONLY-TRUE-DESCENDANTS
    ar CHILD-PREFIX-ORDER-MATCHES-THE-MATERIALIZED-PREFIX
-   ar PATH-DECISIONS-ORDER-DELETES-LAST-AND-DEEPEST-FIRST ;
+   ar PATH-DECISIONS-ORDER-DELETES-LAST-AND-DEEPEST-FIRST
+   ar CASE-COLLISION-CASES ;
 
 
 : RUN ( -- )
