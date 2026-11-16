@@ -50,6 +50,8 @@
 \   Rust's fixture with COMPLETE-SETUP and a bind that does nothing as
 \   the change, systemctl Rust's script for the test under TMPDIR, and
 \   the log captured in a file there
+\ - settings_show_a_root_of_any_length, Omabox's own: Rust's fixture
+\   with config.toml naming a root of over 1024 bytes that is made nowhere
 \ and the program built with README's command into a directory under
 \ TMPDIR, whose --version prints its name and version and exits 0.
 \ White-box: OMABOX is reopened for PARSE, HOME-ROOT, COMPLETE-SETUP,
@@ -649,6 +651,42 @@ variable CHANGES
    x construct form json p ar SETTINGS {: json e:^ eu:n :}
    eu 0 T=
    json stored SETTINGS-JSON?
+   d str> FS:REMOVE-TREE ;
+
+\ The str s, then the bytes, laid in the arena.
+: APPENDED ( str ^u8 n ^ARENA:arena -- str )
+   {: s a:^ u:n ar :}
+   s str> {: sa:^ su:n :}
+   ar su u + ARENA:ALLOC drop {: b:^ :}
+   sa b su BYTE-COPY
+   a b su + u BYTE-COPY
+   b su u + >str ;
+
+\ DIR and five components of 255 bytes each, made nowhere.
+: LONG-ROOT ( str ^ARENA:arena -- str )
+   {: d ar :}
+   ar 255 ARENA:ALLOC drop {: part:^ :}
+   255 0 ?do [char] x part i + c! loop
+   d 5 0 ?do s" /" ar APPENDED part 255 ar APPENDED loop ;
+
+\ A sync root longer than string.f's builder holds shows whole.
+: SETTINGS-SHOW-A-ROOT-OF-ANY-LENGTH ( ^ARENA:arena -- )
+   {: ar :}
+   s" settings_show_a_root_of_any_length" T-LABEL
+   ar FIXTURE {: d x first :}
+   d ar LONG-ROOT {: root :}
+   root str> nip 1024 > TTRUE
+   S\" sync_root = \"" >str root str> ar APPENDED
+   S\" \"\ndropbox_app_key = \"public-app-key\"\n" ar APPENDED {: toml :}
+   x ar CONFIG:XDG-CONFIG-FILE CONFIG:ABS-PATH>STR str> toml str>
+   FS:WRITE-ALL
+   d s" stderr.txt" ar INSIDE {: p :}
+   x construct form text p ar SETTINGS {: text e:^ eu:n :}
+   e eu s" could not resolve sync root " CONTAINS? TTRUE
+   e eu root str> CONTAINS? TTRUE
+   s" Sync root: " >str root str> ar APPENDED
+   S\" \nDropbox app key: public-app-key\n" ar APPENDED {: want :}
+   text str> want str> T$=
    d str> FS:REMOVE-TREE ;
 
 
@@ -1510,6 +1548,7 @@ variable CHANGES
    ar STATUS-REPORTS-THE-JOURNAL-WHEN-THE-ROOT-IS-UNAVAILABLE
    ar SETTINGS-SHOW-THE-STORED-ROOT-WHEN-IT-IS-UNAVAILABLE
    ar SETTINGS-JSON-IS-ONE-DOCUMENT-WHEN-THE-ROOT-IS-AVAILABLE
+   ar SETTINGS-SHOW-A-ROOT-OF-ANY-LENGTH
    ar SERVICE-COMMANDS-RESET-THE-START-LIMIT-BEFORE-A-START
    ar RESTORE-GOAL-RESTORES-ONLY-AFTER-A-SPAWNED-RELEASE
    ar A-CHANGE-RUNS-WHILE-THE-SERVICE-IS-RELEASED

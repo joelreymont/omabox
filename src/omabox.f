@@ -24,8 +24,9 @@
 \ STORAGE CLASS. CALLER-OWNED: a command's service commands, drive
 \ record, configuration, text, lock, default root, authorization code,
 \ root binding, Dropbox client, login and journal live in an arena the
-\ run holds; help and the version line are built in string.f's
-\ task-local builder.
+\ run holds, as does every text holding a path, the app key or the
+\ login URL; help and the version line alone, whose text is fixed, are
+\ built in string.f's task-local builder.
 require src/lib/error.f
 require src/lib/string.f
 require src/lib/arena.f
@@ -612,6 +613,16 @@ ARENA JOURNALS JOURNAL:journal
    a d u BYTE-COPY
    d du >str ;
 
+\ The str s, then the bytes, copied into the arena as KEPT copies; s
+\ stays as it was.
+: FOLLOWED ( str ^u8 n ^ARENA:arena -- str )
+   {: s a:^ u:n ar :}
+   s str> {: sa:^ su:n :}
+   ar su u + ARENA:ALLOC drop {: d:^ :}
+   sa d su BYTE-COPY
+   a d su + u BYTE-COPY
+   d su u + >str ;
+
 \ Rust's status_output: the journal's text.
 : STATUS-TEXT ( ^CONFIG:xdg ^ARENA:arena -- str )
    {: x ar :}
@@ -623,10 +634,10 @@ ARENA JOURNALS JOURNAL:journal
 
 : SETTINGS-LINES ( ^CONFIG:document ^ARENA:arena -- str )
    {: d ar :}
-   SB-RESET s" Sync root: " SB-APPEND
-   d CONFIG:DOCUMENT-ROOT CONFIG:ABS-PATH>STR str> LINE+
-   s" Dropbox app key: " SB-APPEND d CONFIG:DOCUMENT-KEY str> LINE+
-   SB$ ar KEPT ;
+   s" Sync root: " ar KEPT
+   d CONFIG:DOCUMENT-ROOT CONFIG:ABS-PATH>STR str> ar FOLLOWED
+   S\" \nDropbox app key: " ar FOLLOWED
+   d CONFIG:DOCUMENT-KEY str> ar FOLLOWED S\" \n" ar FOLLOWED ;
 
 : SETTINGS-FIELDS ( ^CONFIG:document ^JSON:writer -- )
    {: d w :}
@@ -710,11 +721,12 @@ ARENA JOURNALS JOURNAL:journal
 : NOTE ( bool -- ^u8 n )
    if s"  The stopped service has been started again." exit then s" " ;
 
-\ "{done}.{note}", LF and the leftovers' lines on stdout.
-: DONE-OUT ( ^u8 n bool ^VEC:vector<STALE:leftover> -- )
-   {: d:^ du:n recovered:bool left :}
-   SB-RESET d du SB-APPEND s" ." SB-APPEND recovered NOTE LINE+
-   SB$ left REPORT-OUT ;
+\ "{done}.{note}", LF and the leftovers' lines on stdout, the text
+\ built in ar.
+: DONE-OUT ( ^u8 n bool ^VEC:vector<STALE:leftover> ^ARENA:arena -- )
+   {: d:^ du:n recovered:bool left ar :}
+   d du ar KEPT s" ." ar FOLLOWED recovered NOTE ar FOLLOWED
+   S\" \n" ar FOLLOWED str> left REPORT-OUT ;
 
 \ Rust's match on the change's outcome and the restore's: c the
 \ commands, n the change's name, d its done text.
@@ -726,7 +738,7 @@ ARENA JOURNALS JOURNAL:journal
    changed 0<> if changed throw then
    restored 0<> if d du START-AFTER-CHANGE then
    c launched d du ar RECOVERED {: recovered:bool :}
-   d du recovered left DONE-OUT ;
+   d du recovered left ar DONE-OUT ;
 
 \ Rust's change_while_released: releases a unit that can hold the
 \ instance lock, runs the change, the name n's, and restores what the
@@ -769,9 +781,8 @@ ARENA JOURNALS JOURNAL:journal
 \ dir/Dropbox, joined as PathBuf::join: no second separator.
 : DROPBOX-IN ( str ^ARENA:arena -- str )
    {: h ar :}
-   SB-RESET h str> SB-APPEND
-   h str> + 1- c@ [char] / <> if [char] / SB-APPEND-C then
-   s" Dropbox" SB-APPEND SB$ ar KEPT ;
+   h h str> + 1- c@ [char] / <> if s" /" ar FOLLOWED then
+   s" Dropbox" ar FOLLOWED ;
 
 \ The directory made 0700, under the umask; an entry already there
 \ stays, as Rust's AlreadyExists does.
@@ -970,8 +981,8 @@ ARENA JOURNALS JOURNAL:journal
 \ "Omabox sync root is now {root}", kept in the arena.
 : ROOT-DONE ( ^CONFIG:config ^ARENA:arena -- str )
    {: r ar :}
-   SB-RESET s" Omabox sync root is now " SB-APPEND
-   r CONFIG:SYNC-ROOT CONFIG:ABS-PATH>STR str> SB-APPEND SB$ ar KEPT ;
+   s" Omabox sync root is now " ar KEPT
+   r CONFIG:SYNC-ROOT CONFIG:ABS-PATH>STR str> ar FOLLOWED ;
 
 \ Rust's set_sync_root: the root validated against the stored config,
 \ then changed while the service c is released.
@@ -996,12 +1007,11 @@ ARENA JOURNALS JOURNAL:journal
    code AUTH-CODE? 0= if code throw then
    s" start Dropbox authorization" AUTH-FAILED ;
 
-\ Rust's prompt for the login p, on stdout.
-: PROMPT ( ^AUTH:pending -- )
-   {: p :}
-   SB-RESET s" Open this URL in a browser:" LINE+
-   p AUTH:URL LINE+ s" " LINE+
-   s" Paste the authorization code: " SB-APPEND SB$ WRITE-OUT ;
+\ Rust's prompt for the login p, on stdout, built in ar.
+: PROMPT ( ^AUTH:pending ^ARENA:arena -- )
+   {: p ar :}
+   S\" Open this URL in a browser:\n" ar KEPT p AUTH:URL ar FOLLOWED
+   S\" \n\nPaste the authorization code: " ar FOLLOWED str> WRITE-OUT ;
 
 \ A client for the app key k: Dropbox's origins, no token yet, the
 \ account's own root, and a store that keeps nothing, as the client
@@ -1094,7 +1104,7 @@ ARENA JOURNALS JOURNAL:journal
    {: c r ar :}
    AUTH:BIND
    c CONFIG:APP-KEY ar STARTED {: p :}
-   p PROMPT
+   p ar PROMPT
    FD:STDIN ar READ-CODE {: ac :}
    ar LOGINS-NEW {: a :}
    [: c ac p r a ar LINK-LOGIN ;] CURLING
