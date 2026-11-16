@@ -1,35 +1,40 @@
 \ local-test.f - LOCAL's shared words, scan, upload and download stages,
-\ download slots and partials, installs, deletes, directories and
-\ conflicts: local.rs's tests that an entry's existence below the root
-\ never follows a symlink and takes a failed probe as unconfirmed, that
-\ the content hash composes block hashes, and that neither the hash nor a
-\ stage's copy depends on how a reader fragments the bytes; its scan
-\ tests, the reason each failure one entry raises publishes among them,
-\ but those the comment on CASES names, each journal test keeping the
-\ half without the journal, in the part LOCAL SCAN-TEST, which sees
-\ LOCAL's private types; that upload stage collection removes only
-\ verified unreferenced content; then each stage outcome, each inspected
-\ download stage, a stage marker set, read and removed, a second mark
-\ failing with one xattr line on stderr, each upload stage outcome, an
-\ upload source that vanished or is a directory, and each parent a
-\ download opens; then that a slot's state keeps its last checkpoint,
-\ that slot identity and state bytes are the Rust daemon's, a reset never
-\ touches a replacement swapped in, the pool's four fixed slots, a
-\ protected slot kept and a stale one rebound; then that a cut download
-\ resumes from its last durable checkpoint, a completed partial is
-\ promoted before or after its rename, a corrupt one restarts only in its
-\ own slot, a promotion keeps a swapped replacement, a copy across
+\ download slots and partials, installs, deletes, directories, conflicts
+\ and recovery copies: local.rs's tests that an entry's existence below
+\ the root never follows a symlink and takes a failed probe as
+\ unconfirmed, that the content hash composes block hashes, and that
+\ neither the hash nor a stage's copy depends on how a reader fragments
+\ the bytes; its scan tests, the reason each failure one entry raises
+\ publishes and the lines LOCAL logs for it among them, but those the
+\ comment on CASES names, each journal test keeping the half without the
+\ journal, in the part LOCAL SCAN-TEST, which sees LOCAL's private types;
+\ that upload stage collection removes only verified unreferenced
+\ content; then each stage outcome, each inspected download stage, a
+\ stage marker set, read and removed, a second mark failing with one
+\ xattr line on stderr, each upload stage outcome, an upload source that
+\ vanished or is a directory, each parent a download opens and an
+\ unreadable hash input failing; then that a slot's state keeps its last
+\ checkpoint, that slot identity and state bytes are the Rust daemon's,
+\ a reset never touches a replacement swapped in, the pool's four fixed
+\ slots, a protected slot kept and a stale one rebound; then that a cut
+\ download resumes from its last durable checkpoint, a completed partial
+\ is promoted before or after its rename, a corrupt one restarts only in
+\ its own slot, a promotion keeps a swapped replacement, a copy across
 \ filesystems frees its slot, and a reset slot replays to offset 0, each
-\ completed stage installed and read back at its target; then local.rs's
-\ install tests, each install outcome, an install a directory or an
-\ unreadable file at its stage's name blocks, each replacement
-\ preparation, that a complete disposable download closes its parent, and
-\ the scan lock test's half without the lock: a disposable partial
-\ appended is staged and leaves its staging directory empty; then that
-\ directory effects never overwrite or recurse, that a delete's replay
-\ keeps a raced edit, and each delete, directory and conflict outcome. A
-\ case that makes files works in its own directory under TMPDIR and
-\ removes it.
+\ completed stage installed and read back at its target; that a restart
+\ empties its partial, keeps a swapped replacement and fails in a slot
+\ directory it cannot search; that slots lease through a symlinked state
+\ home; then local.rs's install tests, each install outcome, an install a
+\ directory or an unreadable file at its stage's name blocks, each
+\ replacement preparation, that a complete disposable download closes
+\ its parent, and the scan lock test's half without the lock: a
+\ disposable partial appended is staged and leaves its staging directory
+\ empty; then that directory effects never overwrite or recurse, that a
+\ delete's replay keeps a raced edit, each delete outcome, a delete of an
+\ uppercase hash failing, each arm of a changed guard's restore, each
+\ directory and conflict outcome, a recovery copy's name the Rust
+\ daemon's and each verification of one. A case that makes files works
+\ in its own directory under TMPDIR and removes it.
 \ Run from the repository root: hb --load src/local-test.f </dev/null
 require src/lib/test.f
 require src/lib/test/stderr.f
@@ -46,6 +51,7 @@ require src/lib/xattr.f
 require src/lib/adt/option.f
 require src/dropbox.f
 require src/model.f
+require src/config.f
 require src/local.f
 
 \ LOCAL reopened for the stream a fragmenting reader feeds, its stage
@@ -318,6 +324,8 @@ EXPORT REMOVE-XATTR
 EXPORT MARKER$
 EXPORT INSPECTED$
 EXPORT WRITE-STAGE-OUTCOME
+EXPORT RESTORE-OR-PRESERVE-CHANGED-GUARD
+EXPORT CONFLICT-NAME
 ;package
 
 \ LOCAL reopened for its scan's cases, which name its private types.
@@ -1048,21 +1056,40 @@ variable CAUGHT
 19 constant ENODEV
 110 constant ETIMEDOUT
 
+variable RAISED-CODE
+variable RAISED-ERRNO
+
+\ The log holds lines lines: none for a failure its catcher converts, one
+\ for one it rethrows.
+: LOGGED ( ^u8 n n -- )
+   {: p:^ u:n lines:n :}
+   lines 0= if u 0 T= exit then
+   p u 10 COUNT-CHAR lines T= ;
+
+\ What q throws under the scan's predicate, LOCAL's log of it holding
+\ lines lines; FS:ERRNO is q's again after the log's file calls.
+: ENTRY-RAISES ( [ -- ] n -- n )
+   {: q lines:n :}
+   [: q ['] ENTRY-CODE? CONVERTING RAISED-CODE !
+      FS:ERRNO RAISED-ERRNO ! ;] STDERR-OF
+   lines LOGGED
+   RAISED-ERRNO @ FS:CAUSE! RAISED-CODE @ ;
+
 \ What a failure with the errno, raised against one entry, throws.
-: RAISED ( n -- n )
-   {: e:n :}
+: RAISED ( n n -- n )
+   {: e:n lines:n :}
    [: e s" observe scanned entry" s" subject.txt" SYSCALL-FAILURE ;]
-   ['] ENTRY-CODE? CONVERTING ;
+   lines ENTRY-RAISES ;
 
 : WALK-KIND ( n -- n ) WALK-UNKNOWN REASON-KIND ;
 
 : ESCAPES ( n -- )
-   RAISED {: code:n :}
+   1 RAISED {: code:n :}
    [: code WALK-KIND drop ;] E-IO TTHROWSQ ;
 
 : READS-AS ( n n -- )
    {: e:n want:n :}
-   e RAISED WALK-KIND want T= ;
+   e 0 RAISED WALK-KIND want T= ;
 
 \ A reason carries no path: the caller holds the one it observed.
 : ONLY-EXHAUSTION-ESCAPES-A-FAILURE-RAISED-AGAINST-ONE-ENTRY ( -- )
@@ -1078,13 +1105,12 @@ variable CAUGHT
    ETIMEDOUT INACCESSIBLE READS-AS ENODEV INACCESSIBLE READS-AS
    \ The walk meets an object it cannot synchronize; the hash stage
    \ already saw a regular file, so a different type there is a change.
-   [: s" subject.txt" E-UNSUPPORTED UNSUPPORTED-FAILS ;]
-   ['] ENTRY-CODE? CONVERTING {: odd:n :}
+   [: s" subject.txt" E-UNSUPPORTED UNSUPPORTED-FAILS ;] 0 ENTRY-RAISES
+   {: odd:n :}
    odd WALK-KIND UNSUPPORTED-KIND T=
    odd REVISITED-UNKNOWN REASON-KIND INCOMPLETE T=
    \ A failure that is not about an object still stops the scan.
-   [: s" subject.txt" UNSAFE ;] ['] ENTRY-CODE? CONVERTING
-   {: bad:n :}
+   [: s" subject.txt" UNSAFE ;] 1 ENTRY-RAISES {: bad:n :}
    [: bad WALK-KIND drop ;] E-UNSAFE-PATH TTHROWSQ ;
 
 : CASES ( -- )
@@ -1116,7 +1142,8 @@ variable CAUGHT
    [: A-DISCARDED-SUBTREE-KEEPS-ITS-VALIDATED-HASHES ;] IN-CASE
    [: HASHES-THE-WALK-RETAINED-REACH-THE-PUBLICATION ;] IN-CASE
    TRUNCATING-A-FAILED-ENTRY-KEEPS-ITS-VALIDATED-HASHES
-   ONLY-EXHAUSTION-ESCAPES-A-FAILURE-RAISED-AGAINST-ONE-ENTRY ;
+   [: ONLY-EXHAUSTION-ESCAPES-A-FAILURE-RAISED-AGAINST-ONE-ENTRY ;]
+   IN-CASE ;
 
 public
 
@@ -1213,6 +1240,14 @@ FS:PATHZ-CAP BUFFER: JOINED
    s" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" T$=
    s" abc" IDENTITY
    s" 4f8b42c22dd3729b519ba6f68d2da7cc5b2d606d05daed5ad5128cc03e6c6358" T$= ;
+
+\ A pipe's write end cannot be read.
+: UNREADABLE-HASH-INPUT-FAILS ( -- )
+   s" unreadable hash input fails" T-LABEL
+   FD:PIPE {: r:fd w:fd :}
+   [: [: w AR @ LOCAL:DROPBOX-CONTENT-HASH DROPBOX:HASH>STR str> 2drop ;]
+      LOCAL:E-HASH-READ TTHROWSQ ;]
+   [: r FS:CLOSE-DIR w FS:CLOSE-DIR ;] finally ;
 
 \ The bytes a FRAGMENT reader answers from, and the schedule of the most
 \ each of its reads gives, taken in turn.
@@ -2162,6 +2197,47 @@ variable REMAINING
    T-LABEL
    [: ZERO-REPLAY ;] IN-SYNC-ROOT ;
 
+\ The written partial of target.txt's download of "complete bytes".
+: RESTARTABLE ( fd -- ^LOCAL:download-partial )
+   {: root:fd :}
+   s" complete bytes" HASH-OF {: c:DROPBOX:hash :}
+   TARGET c TEST-LEASE {: lease:LOCAL:download-slot-lease :}
+   root c lease s" partial bytes" WRITTEN ;
+
+: RESTARTS ( fd -- )
+   RESTARTABLE {: x :}
+   x LOCAL:PARTIAL-PATH {: p:^ u:n :}
+   x LOCAL:RESTART-PARTIAL RESTARTED-EMPTY
+   p u FS:FILE-SIZE 0 T= ;
+
+\ A replacement swapped in for the slot keeps its bytes, and so does the
+\ slot.
+: RESTART-SWAPPED ( fd -- )
+   RESTARTABLE {: x :}
+   x LOCAL:PARTIAL-PATH {: p:^ u:n :}
+   p u SWAP-PARTIAL
+   x LOCAL:RESTART-PARTIAL DOWNLOAD-PREPARATION$
+   p u T$= s" destination-occupied" T$=
+   p u s" replacement" HOLDS
+   s" held-slot" AT s" partial bytes" HOLDS ;
+
+\ The slot directory, unsearchable, fails the slot's reopen.
+: RESTART-DENIED ( fd -- )
+   LOCAL:ROOT-USER? if drop exit then
+   RESTARTABLE {: x :}
+   ROOT$ 0 FS:CHMOD-MODE
+   [: [: x LOCAL:RESTART-PARTIAL DOWNLOAD-PREPARATION$ 2drop 2drop ;]
+      LOCAL:E-IO TTHROWSQ ;]
+   [: ROOT$ MODE-0700 FS:CHMOD-MODE ;] finally ;
+
+: RESTARTED-PARTIAL-IS-EMPTY-OR-FAILS ( -- )
+   s" restarted partial is empty or fails" T-LABEL
+   [: RESTARTS ;] IN-SYNC-ROOT
+   s" swapped slot" T-LABEL
+   [: RESTART-SWAPPED ;] IN-SYNC-ROOT
+   s" unsearchable slot directory" T-LABEL
+   [: RESTART-DENIED ;] IN-SYNC-ROOT ;
+
 \ ---- installs
 
 64 BUFFER: READ-BUF
@@ -2641,6 +2717,73 @@ variable ENTRIES
    s" each delete outcome is reached" T-LABEL
    [: DELETE-CASES ;] IN-CASE-DIR ;
 
+\ The empty content's hash in uppercase, which is no content hash.
+: UPPERCASE ( -- DROPBOX:hash )
+   s" E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
+   >str DROPBOX:>HASH ;
+
+\ The delete fails before it looks at the target.
+: UPPERCASE-DELETE ( fd -- )
+   {: root:fd :}
+   TARGET s" old" PUT-FILE
+   [: root ROOT$ TARGET UPPERCASE AR @ LOCAL:DELETE-LOCAL-AT
+      DELETED$ 2drop 2drop ;]
+   LOCAL:E-CONTENT-HASH TTHROWSQ
+   TARGET BYTES s" old" T$= ;
+
+: DELETE-OF-AN-UPPERCASE-HASH-FAILS ( -- )
+   s" delete of an uppercase hash fails" T-LABEL
+   [: UPPERCASE-DELETE ;] IN-CASE-DIR ;
+
+\ ---- changed guards
+
+: RACED ( -- DROPBOX:hash ) s" raced bytes" HASH-OF ;
+
+: RACED-GUARD ( -- ^u8 n )
+   s" displaced" TARGET RACED AR @ LOCAL:INTERNAL-NAME ;
+
+: RACED-COPY ( -- ^u8 n )
+   TARGET LOCAL-CONFLICT--SIDE:local RACED AR @ LOCAL:CONFLICT-NAME ;
+
+\ The guard holds "raced bytes" and target.txt an edit raced in.
+: GUARD-RACE ( -- )
+   RACED-GUARD s" raced bytes" PUT-FILE
+   TARGET s" edit" PUT-FILE ;
+
+: RESTORE-GUARD ( fd option<DROPBOX:hash> -- )
+   {: root:fd actual:option<DROPBOX:hash> :}
+   root RACED-GUARD TARGET TARGET actual AR @
+   LOCAL:RESTORE-OR-PRESERVE-CHANGED-GUARD ;
+
+: RACE-KEPT ( ^u8 n -- )
+   {: copy:^ cu:n :}
+   TARGET BYTES s" edit" T$=
+   RACED-COPY BYTES copy cu T$= ;
+
+: PRESERVE-CASES ( fd -- )
+   {: root:fd :}
+   s" raced guard preserved" T-LABEL
+   GUARD-RACE
+   root s" raced bytes" HELD RESTORE-GUARD
+   s" raced bytes" RACE-KEPT RACED-GUARD PRESENT? TFALSE
+   s" duplicate raced guard removed" T-LABEL
+   GUARD-RACE
+   root s" raced bytes" HELD RESTORE-GUARD
+   s" raced bytes" RACE-KEPT RACED-GUARD PRESENT? TFALSE
+   s" conflict name occupied" T-LABEL
+   RACED-COPY s" other copy" PUT-FILE
+   GUARD-RACE
+   [: root s" raced bytes" HELD RESTORE-GUARD ;]
+   LOCAL:E-OCCUPIED TTHROWSQ
+   s" other copy" RACE-KEPT RACED-GUARD BYTES s" raced bytes" T$=
+   s" unknown raced guard" T-LABEL
+   [: root NO-CONTENT RESTORE-GUARD ;] LOCAL:E-CHANGED TTHROWSQ
+   s" other copy" RACE-KEPT RACED-GUARD BYTES s" raced bytes" T$= ;
+
+: EACH-CHANGED-GUARD-ARM-IS-REACHED ( -- )
+   s" each changed guard arm is reached" T-LABEL
+   [: PRESERVE-CASES ;] IN-CASE-DIR ;
+
 \ ---- directories
 
 : CREATED$ ( LOCAL:create-directory-outcome -- ^u8 n )
@@ -2740,15 +2883,116 @@ variable ENTRIES
    s" each conflict outcome is reached" T-LABEL
    [: CONFLICT-CASES ;] IN-CASE-DIR ;
 
+\ ---- recovery copies
+
+: RECOVERY ( -- ^u8 n ) TARGET WANT AR @ LOCAL:RECOVERY-FILE-NAME ;
+
+\ The Rust daemon's name for target.txt's copy holding "remote".
+: RECOVERY-NAME-IS-RUSTS ( -- )
+   s" recovery name is the Rust daemon's" T-LABEL
+   RECOVERY
+   s" .omabox-recovery-09e159a5cdb6c4db7c02b9aebdb2458b1d3b2774003e7b1474494282cbe4faef"
+   T$= ;
+
+: VERIFIED-COPY? ( fd -- bool )
+   ROOT$ RECOVERY WANT AR @ LOCAL:VERIFY-PRIVATE-COPY ;
+
+: COPY-FAILS ( fd n -- )
+   {: root:fd code:n :}
+   [: root VERIFIED-COPY? drop ;] code TTHROWSQ ;
+
+: RECOVERY-CASES ( fd -- )
+   {: root:fd :}
+   s" absent copy" T-LABEL
+   root VERIFIED-COPY? TFALSE
+   s" verified copy" T-LABEL
+   RECOVERY s" remote" PUT-FILE
+   root VERIFIED-COPY? TTRUE
+   s" corrupt copy" T-LABEL
+   RECOVERY s" mutant" PUT-FILE
+   root LOCAL:E-CORRUPT COPY-FAILS
+   RECOVERY BYTES s" mutant" T$=
+   LOCAL:ROOT-USER? if exit then
+   s" unreadable copy" T-LABEL
+   RECOVERY AT 0 FS:CHMOD-MODE
+   root LOCAL:E-UNREADABLE COPY-FAILS ;
+
+: EACH-RECOVERY-COPY-OUTCOME-IS-REACHED ( -- )
+   s" each recovery copy outcome is reached" T-LABEL
+   [: RECOVERY-CASES ;] IN-CASE-DIR ;
+
+\ ---- a symlinked state home
+
+FS:PATHZ-CAP BUFFER: PHYSICAL-BUF
+variable PHYSICAL-U
+FS:PATHZ-CAP BUFFER: STAGING-BUF
+FS:PATHZ-CAP BUFFER: SLOT-FILE-BUF
+
+: PHYSICAL$ ( -- ^u8 n ) PHYSICAL-BUF PHYSICAL-U @ ;
+
+\ The name below the case directory, kept, as CONFIG takes it.
+: CASE-PATH ( ^u8 n -- CONFIG:abs-path ) AT HOLD >str CONFIG:>ABS-PATH ;
+
+\ Rust's physical_state canonicalized: beside the sync root, which
+\ CONFIG canonicalizes.
+: KEEP-PHYSICAL ( ^CONFIG:config -- )
+   CONFIG:SYNC-ROOT CONFIG:ABS-PATH>STR str> {: p:^ u:n :}
+   p u s" /Dropbox" nip - s" physical-state" PHYSICAL-BUF FS:JOIN-PATH
+   PHYSICAL-U ! ;
+
+\ Rust's starts_with: the path names physical-state's descendant.
+: PROJECTED ( CONFIG:abs-path -- )
+   CONFIG:ABS-PATH>STR str> {: p:^ u:n :}
+   PHYSICAL-U @ {: k:n :}
+   u k > if p k PHYSICAL$ STR= p k + c@ $2F = and else false then
+   TTRUE ;
+
+: STAGED-SLOT? ( n -- bool )
+   {: slot:n :}
+   PHYSICAL$ s" omabox/upload-staging" STAGING-BUF FS:JOIN-PATH {: k:n :}
+   STAGING-BUF k slot LOCAL:DOWNLOAD-SLOT-NAME SLOT-FILE-BUF FS:JOIN-PATH
+   SLOT-FILE-BUF swap FS:FILE? ;
+
+\ Rust's test's config: its state home a link to physical-state.
+: LINKED-CONFIG ( -- ^CONFIG:config )
+   s" physical-state" AT FS:MAKE-DIR
+   s" physical-state" AT HOLD s" state-link" AT FS:MAKE-SYMLINK
+   s" Dropbox" AT FS:MAKE-DIR
+   s" config" CASE-PATH s" state-link" CASE-PATH AR @ CONFIG:XDG-NEW
+   s" Dropbox" CASE-PATH s" test-app-key" >str AR @ CONFIG:FROM-VALUES ;
+
+: PATHS-PROJECTED ( ^CONFIG:paths -- )
+   {: p :}
+   p CONFIG:STATE-DIRECTORY PROJECTED
+   p CONFIG:JOURNAL-FILE PROJECTED
+   p CONFIG:UPLOAD-STAGING-DIRECTORY PROJECTED
+   p CONFIG:RECOVERY-DIRECTORY PROJECTED
+   p CONFIG:LOCK-FILE PROJECTED ;
+
+: LINKED-STATE ( -- )
+   LINKED-CONFIG {: c :}
+   c CONFIG:PREPARE c KEEP-PHYSICAL
+   c CONFIG:PATHS {: p :}
+   TARGET DOWNLOAD 1 1 SLOT-IDENTITY {: id:LOCAL:download-slot-identity :}
+   p CONFIG:UPLOAD-STAGING-DIRECTORY CONFIG:ABS-PATH>STR str>
+   id [: UNPROTECTED ;] LOCAL:LEASE-DOWNLOAD-SLOT LOCAL:LEASE-OF
+   {: slot:n b:LOCAL:binding found:bool :}
+   found TTRUE
+   p PATHS-PROJECTED
+   slot STAGED-SLOT? TTRUE ;
+
+: SLOTS-LEASE-THROUGH-A-SYMLINKED-STATE-HOME ( -- )
+   s" slots_lease_through_a_symlinked_state_home" T-LABEL
+   [: drop LINKED-STATE ;] IN-CASE-DIR ;
+
 \ Dropped: parallel_cold_scan_matches_single_worker_scan compares hash
 \ workers and download_promotion_cannot_invalidate_complete_scan holds the
 \ scan lock; one task has neither. With their words, on a later lane:
 \ case_variant_rename_preserves_tree_and_retries_races,
 \ case_variant_rename_preserves_a_swapped_source,
 \ scan_of_a_stand_in_publishes_nothing,
-\ unchanged_tree_beside_a_same_named_directory_republishes_nothing,
-\ switching_local_root_clears_the_hash_cache (JOURNAL) and
-\ slots_lease_through_a_symlinked_state_home (CONFIG).
+\ unchanged_tree_beside_a_same_named_directory_republishes_nothing and
+\ switching_local_root_clears_the_hash_cache (JOURNAL).
 : CASES ( -- )
    ENTRY-EXISTENCE-NEVER-FOLLOWS-SYMLINKS-AND-TREATS-PROBE-FAILURES-AS-UNCONFIRMED
    DROPBOX-HASH-USES-BLOCK-HASH-COMPOSITION
@@ -2767,6 +3011,7 @@ variable ENTRIES
    CREATE-MAKES-PRIVATE-PARENTS
    SYMLINK-PARENT-IS-REFUSED
    UNSAFE-PARENT-PATH-FAILS
+   UNREADABLE-HASH-INPUT-FAILS
    DOWNLOAD-CHECKPOINT-STATE-ENCODES-THE-LAST-COMPLETE-BOUNDARY
    SLOT-BYTES-ARE-RUSTS
    PARTIAL-RESET-NEVER-MUTATES-A-SWAPPED-REPLACEMENT
@@ -2779,6 +3024,8 @@ variable ENTRIES
    COMPLETED-PARTIAL-PROMOTION-PRESERVES-A-SWAPPED-REPLACEMENT
    CROSS-FILESYSTEM-SLOT-COMPLETION-COPIES-REHASHES-AND-FREES-THE-SLOT
    INTERRUPTED-PARTIAL-RESET-REPLAYS-TO-A-REUSABLE-ZERO-CHECKPOINT
+   RESTARTED-PARTIAL-IS-EMPTY-OR-FAILS
+   SLOTS-LEASE-THROUGH-A-SYMLINKED-STATE-HOME
    ABSENT-INSTALL-NEVER-OVERWRITES-AN-EXISTING-FILE
    INSTALL-REJECTS-STAGE-CHANGED-THROUGH-A-PREEXISTING-WRITER
    INSTALLED-DOWNLOAD-CLEANUP-REPLAYS-AROUND-PARTIAL-MARKER-REMOVAL
@@ -2791,7 +3038,11 @@ variable ENTRIES
    DIRECTORY-EFFECTS-ARE-NONOVERWRITING-AND-NONRECURSIVE
    DELETE-REPLAY-PRESERVES-A-RACED-EDIT-AND-REMOVES-ITS-GUARD
    EACH-DELETE-OUTCOME-IS-REACHED
-   EACH-CONFLICT-OUTCOME-IS-REACHED ;
+   DELETE-OF-AN-UPPERCASE-HASH-FAILS
+   EACH-CHANGED-GUARD-ARM-IS-REACHED
+   EACH-CONFLICT-OUTCOME-IS-REACHED
+   RECOVERY-NAME-IS-RUSTS
+   EACH-RECOVERY-COPY-OUTCOME-IS-REACHED ;
 
 public
 
