@@ -122,6 +122,16 @@
 \ - file_beside_a_same_named_directory_still_deletes_locally
 \ - file_beside_a_same_named_directory_still_uploads_a_local_edit
 \ - inaccessible_directory_never_deletes_its_dropbox_contents
+\ Edits and directories against the fake Dropbox, Rust's tests of the
+\ same names, each download installed in its pass and no account
+\ request:
+\ - later_edits_sync_and_divergence_preserves_both_sides, the upload
+\   taking the fake's rev
+\ - later_deletions_sync_in_both_directions
+\ - one_reconciliation_pass_synchronizes_empty_and_nested_directories,
+\   create_folder_v2 answered as Rust scripts it
+\ - fresh_download_uses_parent_directory_casing_without_remote_writes
+\ - delta_folder_with_miscased_parents_is_created_inside_the_local_tree
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -4415,6 +4425,397 @@ $1C0 constant OWNER-ACCESS
    ar FILE-BESIDE-A-SAME-NAMED-DIRECTORY-STILL-UPLOADS-A-LOCAL-EDIT
    ar INACCESSIBLE-DIRECTORY-NEVER-DELETES-ITS-DROPBOX-CONTENTS ;
 
+\ ---- edits and directories against the fake Dropbox ---------------
+
+: EDIT-BASE$ ( -- ^u8 n ) s" shared baseline" ;
+: LOCAL-EDIT$ ( -- ^u8 n ) s" later local edit" ;
+: REMOTE-EDIT$ ( -- ^u8 n ) s" later Dropbox edit" ;
+
+\ For CONFLICT-BYTES: the name from at in the root's names ns, its
+\ bytes kept in v when it is a conflict copy; the index after it, or
+\ -1 past the last.
+: CONFLICT-COPY+ ( ^u8 n n ^run ^VEC:vector<str> -- n )
+   {: ns:^ nu:n at:n x v :}
+   ns nu 10 at SPLIT-NEXT 0= if 2drop drop -1 exit then
+   {: q:^ w:n next:n :}
+   q w s" .omabox-conflict-" STARTS-WITH? if
+      x RUN-ROOT @ q w x RUN-ARENA @ INSIDE str>
+      READ-BUF READ-CAP FS:READ-ALL READ-BUF swap
+      x RUN-ARENA @ COPIED v VEC:PUSH !
+   then
+   next ;
+
+: BYTES-BEFORE? ( str str -- bool )
+   {: a:str b:str :}
+   a str> b str> STR< ;
+
+\ Swaps the strings at k-1 and k if they are out of byte order; whether
+\ it did.
+: COPY-SWAPPED? ( ^VEC:vector<str> n -- bool )
+   {: v k:n :}
+   v k 1 - VEC:AT {: a:^ :}
+   v k VEC:AT {: b:^ :}
+   b @ a @ BYTES-BEFORE? 0= if false exit then
+   a @ b @ a ! b ! true ;
+
+\ Moves the string at k down to its place among those before it.
+: COPY-SETTLE ( ^VEC:vector<str> n -- )
+   {: v k:n :}
+   k 0 > if v k COPY-SWAPPED? if v k 1 - RECURSE then then ;
+
+\ Sorts the strings in byte order, by insertion.
+: COPIES-SORTED ( ^VEC:vector<str> -- )
+   {: v :}
+   v VEC:COUNT 1 ?do v i COPY-SETTLE loop ;
+
+\ Rust's conflict_bytes: the bytes of each conflict copy in the root,
+\ sorted.
+: CONFLICT-BYTES ( ^run -- ^VEC:vector<str> )
+   {: x :}
+   x RUN-ARENA @ {: ar :}
+   ar ARENA:ALLOCATOR 0 [type] str VEC:NEW {: v :}
+   x ROOT$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
+   READ-BUF u ar COPIED str> {: ns:^ nu:n :}
+   0 begin ns nu rot x v CONFLICT-COPY+ dup 0< until drop
+   v COPIES-SORTED v ;
+
+\ The requests the fake saw since RESET, and those to the path p.
+: REQUESTS ( -- n )
+   TEST-DROPBOX:SEEN$ {: s:^ u:n :}
+   u 0= if 0 exit then
+   s u s"  " COUNT-SUB 1 + ;
+
+: SENT-TO ( ^u8 n -- n ) TEST-DROPBOX:SEEN$ 2swap COUNT-SUB ;
+
+\ The directory d holds no entry.
+: NOTHING-IN ( str -- ) str> READ-BUF READ-CAP FS-LIST:NAMES 0 T= ;
+
+\ No request created, uploaded or deleted on Dropbox.
+: UNWRITTEN ( -- )
+   s" /2/files/create_folder_v2" SENT-TO 0 T=
+   s" /2/files/upload" SENT-TO 0 T=
+   s" /2/files/delete_v2" SENT-TO 0 T= ;
+
+\ The baseline at path p is a directory.
+: DIRECTORY-AT ( ^run ^u8 n -- )
+   {: x p:^ u:n :}
+   x RUN-JOURNAL @ p u DISPLAY x RUN-ARENA @ JOURNAL:BASELINE
+   STORED-BASELINE MODEL-BASELINE:DIRECTORY MODEL:BASELINE= TTRUE ;
+
+\ Rust's local files: a edited here, b as the baseline, c diverged;
+\ each path's baseline the shared one at rev-old.
+: EDITS-LOCAL ( ^run -- )
+   {: x :}
+   x RUN-ARENA @ {: ar :}
+   x s" a-local-update.txt" IN-ROOT str> LOCAL-EDIT$ FS:WRITE-ALL
+   x s" b-remote-update.txt" IN-ROOT str> EDIT-BASE$ FS:WRITE-ALL
+   x s" c-diverged.txt" IN-ROOT str> DIVERGED-LOCAL$ FS:WRITE-ALL
+   EDIT-BASE$ s" rev-old" ar REMOTE-FILE {: old :}
+   x s" a-local-update.txt" old SEED-BASELINE
+   x s" b-remote-update.txt" old SEED-BASELINE
+   x s" c-diverged.txt" old SEED-BASELINE ;
+
+\ Rust's Dropbox: a as the baseline, b edited, c diverged, on the one
+\ listing page; b and c served.
+: EDITS-REMOTE ( ^ARENA:arena -- )
+   {: ar :}
+   s" a-local-update.txt" s" rev-old" EDIT-BASE$ ar FILE-AT
+   s" b-remote-update.txt" s" rev-remote-update" REMOTE-EDIT$ ar SERVES
+   s" c-diverged.txt" s" rev-remote-conflict" DIVERGED-REMOTE$ ar SERVES
+   EDIT-BASE$ ar IDENTITY {: ho:DROPBOX:hash :}
+   REMOTE-EDIT$ ar IDENTITY {: hb:DROPBOX:hash :}
+   DIVERGED-REMOTE$ ar IDENTITY {: hc:DROPBOX:hash :}
+   [: s" /a-local-update.txt" 2dup s" rev-old" ho FILE-JSON+ COMMA+
+      s" /b-remote-update.txt" 2dup s" rev-remote-update" hb FILE-JSON+
+      COMMA+
+      s" /c-diverged.txt" 2dup s" rev-remote-conflict" hc FILE-JSON+ ;]
+   ar ENTRIES s" cursor-after-edits" false PAGE ;
+
+: EDITS-REPORTED ( report -- )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   planned 2 T=
+   \ Departure 2: b's download installs in the pass, so it is replayed
+   \ and not blocked.
+   replayed 2 T= blocked 0 T= conflicts 1 T= ;
+
+\ The one conflict, Rust's DivergentEdits at c-diverged.txt.
+: DIVERGENT-CONFLICT ( ^run -- )
+   {: x :}
+   x RUN-ARENA @ {: ar :}
+   x RUN-JOURNAL @ ar JOURNAL:CONFLICTS {: cs :}
+   cs VEC:COUNT 1 T=
+   cs 0 VEC:AT @ JOURNAL-CONFLICT--RECORD:UNMAKE {: id p c :}
+   p PATH$ s" c-diverged.txt" T$=
+   DIVERGED-LOCAL$ ar IDENTITY MODEL-LOCAL:MAKE
+   DIVERGED-REMOTE$ s" rev-remote-conflict" ar REMOTE-FILE
+   MODEL-CONFLICT:DIVERGENT c MODEL:CONFLICT= TTRUE ;
+
+\ Both conflict copies: Dropbox's side sorts before the local one.
+: BOTH-SIDES ( ^run -- )
+   CONFLICT-BYTES {: v :}
+   v VEC:COUNT 2 T=
+   v 0 VEC:AT @ str> DIVERGED-REMOTE$ T$=
+   v 1 VEC:AT @ str> DIVERGED-LOCAL$ T$= ;
+
+\ The upload's argument as DROPBOX writes it: a over rev-old.
+: UPDATE-ARG$ ( DROPBOX:hash -- ^u8 n )
+   {: h:DROPBOX:hash :}
+   SB-RESET S\" {\qpath\q:\q/a-local-update.txt\q," SB-APPEND
+   S\" \qmode\q:{\q.tag\q:\qupdate\q,\qupdate\q:\qrev-old\q}," SB-APPEND
+   S\" \qautorename\q:false,\qstrict_conflict\q:true," SB-APPEND
+   S\" \qcontent_hash\q:\q" SB-APPEND
+   h DROPBOX:HASH>STR str> SB-APPEND S\" \q}" SB-APPEND SB$ ;
+
+\ Rust's requests, the account's aside: one listing, two downloads and
+\ the upload, nothing deleted.
+: EDITS-SENT ( ^ARENA:arena -- )
+   {: ar :}
+   REQUESTS 4 T=
+   s" /2/files/delete_v2" SENT-TO 0 T=
+   s" /2/files/upload" SENT-TO 1 T=
+   TEST-DROPBOX:ARGS-SENT$ LOCAL-EDIT$ ar IDENTITY UPDATE-ARG$ CONTAINS?
+   TTRUE
+   DOWNLOAD$ SENT-TO 2 T=
+   TEST-DROPBOX:ARGS-SENT$ S\" {\qpath\q:\qrev:rev-remote-update\q}"
+   CONTAINS? TTRUE
+   TEST-DROPBOX:ARGS-SENT$ S\" {\qpath\q:\qrev:rev-remote-conflict\q}"
+   CONTAINS? TTRUE ;
+
+: LATER-EDITS-SYNC-AND-DIVERGENCE-PRESERVES-BOTH-SIDES
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" later_edits_sync_and_divergence_preserves_both_sides" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x EDITS-LOCAL ar EDITS-REMOTE
+   x rec PASSED COMPLETE EDITS-REPORTED
+   \ Departure 2: no download is left for a later step to complete.
+   x REPLAY-STEP REPORTED COMPLETED 0 T=
+   x s" a-local-update.txt" IN-ROOT LOCAL-EDIT$ HOLDS-BYTES
+   x s" b-remote-update.txt" IN-ROOT REMOTE-EDIT$ HOLDS-BYTES
+   x s" c-diverged.txt" IN-ROOT DIVERGED-LOCAL$ HOLDS-BYTES
+   \ The fake's upload takes the rev 01701.
+   x s" a-local-update.txt" LOCAL-EDIT$ s" 01701" ar REMOTE-FILE
+   BASELINE-AT
+   x s" b-remote-update.txt" REMOTE-EDIT$ s" rev-remote-update" ar
+   REMOTE-FILE BASELINE-AT
+   x s" c-diverged.txt" EDIT-BASE$ s" rev-old" ar REMOTE-FILE BASELINE-AT
+   x DIVERGENT-CONFLICT x BOTH-SIDES
+   x PENDING-OF VEC:COUNT 0 T=
+   x RUN-JOURNAL @ ar JOURNAL:PENDING-RECOVERIES VEC:COUNT 0 T=
+   x RUN-JOURNAL @ ar JOURNAL:COMPLETED-RECOVERIES VEC:COUNT 0 T=
+   rec NOTHING-IN
+   ar EDITS-SENT
+   d x STEP-GONE ;
+
+: DELETE-BASE$ ( -- ^u8 n ) s" shared deletion baseline" ;
+
+\ Rust's fixture: dropbox-deleted.txt here, local-deleted.txt on
+\ Dropbox and its one listing page, both with the shared baseline.
+: DELETIONS ( ^run -- )
+   {: x :}
+   x RUN-ARENA @ {: ar :}
+   x s" dropbox-deleted.txt" IN-ROOT str> DELETE-BASE$ FS:WRITE-ALL
+   DELETE-BASE$ s" rev-delete-baseline" ar REMOTE-FILE {: old :}
+   x s" local-deleted.txt" old SEED-BASELINE
+   x s" dropbox-deleted.txt" old SEED-BASELINE
+   s" local-deleted.txt" s" rev-delete-baseline" DELETE-BASE$ ar FILE-AT
+   DELETE-BASE$ ar IDENTITY {: h:DROPBOX:hash :}
+   [: s" /local-deleted.txt" 2dup s" rev-delete-baseline" h
+      FILE-JSON+ ;]
+   ar ENTRIES s" cursor-after-deletions" false PAGE ;
+
+: DELETIONS-REPORTED ( report -- )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   planned 2 T= replayed 2 T= blocked 0 T= conflicts 0 T= ;
+
+: DELETE-BODY$ ( -- ^u8 n )
+   SB-RESET S\" {\qpath\q:\q/local-deleted.txt\q," SB-APPEND
+   S\" \qparent_rev\q:\qrev-delete-baseline\q}" SB-APPEND SB$ ;
+
+: LATER-DELETIONS-SYNC-IN-BOTH-DIRECTIONS ( ^ARENA:arena -- )
+   {: ar :}
+   s" later_deletions_sync_in_both_directions" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x DELETIONS
+   x rec PASSED COMPLETE DELETIONS-REPORTED
+   x s" local-deleted.txt" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" dropbox-deleted.txt" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" local-deleted.txt" NO-BASELINE? TTRUE
+   x s" dropbox-deleted.txt" NO-BASELINE? TTRUE
+   x PENDING-OF VEC:COUNT 0 T=
+   x RUN-JOURNAL @ ar JOURNAL:CONFLICTS VEC:COUNT 0 T=
+   rec NOTHING-IN
+   \ Rust's three requests less the account's.
+   REQUESTS 2 T=
+   TEST-DROPBOX:DELETE-SENT$ DELETE-BODY$ T$=
+   s" /2/files/delete_v2" SENT-TO 1 T=
+   d x STEP-GONE ;
+
+: NESTED-REPORTED ( report -- )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   planned 4 T= replayed 4 T= blocked 0 T= ;
+
+\ Rust's create_folder_v2 answer: the folder p as its metadata.
+: FOLDER-MADE ( ^u8 n -- )
+   {: p:^ u:n :}
+   SB-RESET S\" {\qmetadata\q:" SB-APPEND p u 2dup FOLDER-JSON+
+   s" }" SB-APPEND
+   s" /2/files/create_folder_v2" 200 s" " s" " SB$
+   TEST-DROPBOX:ROUTE-SCRIPT! ;
+
+\ The directory p is in the root, with a directory baseline.
+: SYNCED-DIRECTORY ( ^run ^u8 n -- )
+   {: x p:^ u:n :}
+   x p u IN-ROOT str> FS:DIR? TTRUE
+   x p u DIRECTORY-AT ;
+
+: ONE-RECONCILIATION-PASS-SYNCHRONIZES-EMPTY-AND-NESTED-DIRECTORIES
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" one_reconciliation_pass_synchronizes_empty_and_nested_directories"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" local" IN-ROOT str> FS:MAKE-DIR
+   x s" local/child" IN-ROOT str> FS:MAKE-DIR
+   [: s" /remote" 2dup FOLDER-JSON+ COMMA+
+      s" /remote/child" 2dup FOLDER-JSON+ ;]
+   ar ENTRIES s" directories" false PAGE
+   s" /local" FOLDER-MADE s" /local" FOLDER-MADE
+   s" /local/child" FOLDER-MADE
+   x rec PASSED COMPLETE NESTED-REPORTED
+   x s" local" SYNCED-DIRECTORY
+   x s" local/child" SYNCED-DIRECTORY
+   x s" remote" SYNCED-DIRECTORY
+   x s" remote/child" SYNCED-DIRECTORY
+   x PENDING-OF VEC:COUNT 0 T=
+   \ Rust's five requests less the account's.
+   REQUESTS 4 T=
+   s" /2/files/create_folder_v2" SENT-TO 3 T=
+   d x STEP-GONE ;
+
+: ENTRY-BYTES$ ( -- ^u8 n ) s" Dropbox source bytes" ;
+
+\ The fake's file at path_lower l and path_display p, rev v, holding
+\ ENTRY-BYTES$.
+: ENTRY-SERVED ( ^u8 n ^u8 n ^u8 n ^ARENA:arena -- )
+   {: l:^ lu:n p:^ pu:n v:^ vu:n ar :}
+   ENTRY-BYTES$ ar IDENTITY DROPBOX:HASH>STR str> {: h:^ hu:n :}
+   l lu p pu v vu h hu ENTRY-BYTES$ nip TEST-DROPBOX:FILE!
+   v vu ENTRY-BYTES$ TEST-DROPBOX:CONTENT! ;
+
+\ Rust's two pages, each a file below /apps that Dropbox spells /Apps,
+\ and their downloads, which spell the folder apps.
+: FRESH-CASED ( ^ARENA:arena -- )
+   {: ar :}
+   ENTRY-BYTES$ ar IDENTITY {: h:DROPBOX:hash :}
+   s" /apps/entry.doentry" s" /apps/Entry.doentry" s" remote-rev" ar
+   ENTRY-SERVED
+   s" /apps/second.doentry" s" /apps/Second.doentry" s" remote-rev-2"
+   ar ENTRY-SERVED
+   [: s" /apps" 2dup FOLDER-JSON+ COMMA+
+      s" /apps/entry.doentry" s" /Apps/Entry.doentry" s" remote-rev" h
+      FILE-JSON+ ;]
+   ar ENTRIES s" fresh-case" false PAGE
+   [: s" /apps/second.doentry" s" /Apps/Second.doentry" s" remote-rev-2"
+      h FILE-JSON+ ;]
+   ar ENTRIES s" fresh-case-2" false PAGE ;
+
+: PASS-ANY ( outcome -- )
+   MATCH outcome
+      complete OF drop ENDOF
+      fresh OF ENDOF
+      root-changed OF ENDOF
+   ;MATCH ;
+
+: FRESH-DOWNLOAD-USES-PARENT-DIRECTORY-CASING-WITHOUT-REMOTE-WRITES
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" fresh_download_uses_parent_directory_casing_without_remote_writes"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   ar FRESH-CASED
+   x rec PASSED PASS-ANY
+   \ Departure 2: the download installed in the pass, so the step that
+   \ follows completes none.
+   x REPLAY-STEP REPORTED COMPLETED 0 T=
+   x s" apps/Entry.doentry" IN-ROOT ENTRY-BYTES$ HOLDS-BYTES
+   x s" Apps" IN-ROOT str> FS:EXISTS? TFALSE
+   x rec PASSED COMPLETE drop
+   \ Departure 2, as above.
+   x REPLAY-STEP REPORTED COMPLETED 0 T=
+   x s" apps/Second.doentry" IN-ROOT ENTRY-BYTES$ HOLDS-BYTES
+   x PENDING-OF VEC:COUNT 0 T=
+   UNWRITTEN
+   d x STEP-GONE ;
+
+\ Rust's three pages: /apps and /apps/day one as Dropbox spells them,
+\ then day one re-created with its child spelled in lower case, then
+\ none.
+: MISCASED ( ^ARENA:arena -- )
+   {: ar :}
+   [: s" /apps" s" /Apps" FOLDER-JSON+ COMMA+
+      s" /apps/day one" s" /Apps/Day One" FOLDER-JSON+ ;]
+   ar ENTRIES s" miscased-parents" false PAGE
+   [: s" /apps/day one" 2dup DELETED-JSON+ COMMA+
+      s" /apps/day one" 2dup FOLDER-JSON+ COMMA+
+      s" /apps/day one/journal" s" /apps/day one/Journal" FOLDER-JSON+ ;]
+   ar ENTRIES s" miscased-parents-2" false PAGE
+   [: ;] ar ENTRIES s" miscased-parents-2" false PAGE ;
+
+\ A pass that planned nothing and left k paths as they were.
+: SETTLED ( report n -- )
+   {: k:n :}
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   noops k T= planned 0 T= ;
+
+: JOURNAL-CREATED ( report -- )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   planned 1 T= replayed 1 T= ;
+
+: DELTA-FOLDER-WITH-MISCASED-PARENTS-IS-CREATED-INSIDE-THE-LOCAL-TREE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" delta_folder_with_miscased_parents_is_created_inside_the_local_tree"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" Apps" IN-ROOT str> FS:MAKE-DIR
+   x s" Apps/Day One" IN-ROOT str> FS:MAKE-DIR
+   ar MISCASED
+   x rec PASSED COMPLETE 2 SETTLED
+   x rec PASSED COMPLETE JOURNAL-CREATED
+   x s" Apps/Day One/Journal" IN-ROOT str> FS:DIR? TTRUE
+   x s" Apps/day one" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" Apps" IN-ROOT str> READ-BUF READ-CAP FS-LIST:NAMES
+   READ-BUF swap s" Day One" T$=
+   x s" apps/day one/journal" DIRECTORY-AT
+   x rec PASSED COMPLETE 3 SETTLED
+   x PENDING-OF VEC:COUNT 0 T=
+   UNWRITTEN
+   d x STEP-GONE ;
+
+: EDITS-AND-DIRECTORIES-CASES ( ^ARENA:arena -- )
+   {: ar :}
+   ar LATER-EDITS-SYNC-AND-DIVERGENCE-PRESERVES-BOTH-SIDES
+   ar LATER-DELETIONS-SYNC-IN-BOTH-DIRECTIONS
+   ar ONE-RECONCILIATION-PASS-SYNCHRONIZES-EMPTY-AND-NESTED-DIRECTORIES
+   ar FRESH-DOWNLOAD-USES-PARENT-DIRECTORY-CASING-WITHOUT-REMOTE-WRITES
+   ar DELTA-FOLDER-WITH-MISCASED-PARENTS-IS-CREATED-INSIDE-THE-LOCAL-TREE ;
+
 : SERVED ( ^ARENA:arena -- )
    {: ar :}
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
@@ -4423,7 +4824,8 @@ $1C0 constant OWNER-ACCESS
    ACCOUNTED
    [: ar REFRESH-CASES ar STEP-CASES ar PASS-CASES
       ar STALE-CASES ar DOWNLOAD-BLOCKS-CASES ar UPLOADS-CASES
-      ar CONFLICTS-CASES ar RESTRICTED-CASES ;]
+      ar CONFLICTS-CASES ar RESTRICTED-CASES
+      ar EDITS-AND-DIRECTORIES-CASES ;]
    [: MAIN @ DROPBOX:CLOSE ;]
    finally ;
 

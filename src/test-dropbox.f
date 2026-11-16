@@ -22,7 +22,8 @@
 \ contain.
 \ It records each request's path, the last API call's Authorization,
 \ Path-Root and Content-Type, and the body of the last delete_v2 or single
-\ upload its route answered, BODY-SENT$.
+\ upload its route answered, BODY-SENT$. ARGS-SENT$ joins every
+\ Dropbox-API-Arg sent, and DELETE-SENT$ is the last delete_v2's body.
 \ STORAGE CLASS. PROCESS-WIDE: one worker serves every request, so its handler
 \ alone writes the state while a test waits on its call, and the test sets it
 \ between calls; only RESUME-BODY sets it during one, and the
@@ -454,6 +455,8 @@ create HELD NAME-CAP allot
 variable HELD-U
 create BODY-SENT TEXT-CAP allot
 variable BODY-SENT-U
+create DELETE-SENT TEXT-CAP allot
+variable DELETE-SENT-U
 
 
 \ The code grant's names and values, as FIELDS$ decodes them.
@@ -563,6 +566,7 @@ variable BODY-SENT-U
    {: q:HTTP:request a:HTTP:response :}
    q a ADMITTED? 0= if exit then
    q BODY-KEPT
+   q HTTP:BODY$ DELETE-SENT TEXT-CAP STORE DELETE-SENT-U !
    q ASK
    FOUND {: i:n :}
    i 0< if a S\" {\qerror_summary\q:\qpath_lookup/not_found/...\q,\qerror\q:{\q.tag\q:\qpath_lookup\q,\qpath_lookup\q:{\q.tag\q:\qnot_found\q}}}" REFUSED! exit then
@@ -808,6 +812,8 @@ create REV-SEEN NAME-CAP allot
 variable REV-SEEN-U
 create ARG-SENT TEXT-CAP allot
 variable ARG-SENT-U
+create ARGS-SENT TEXT-CAP allot
+variable ARGS-SENT-U
 create RANGE-SENT NAME-CAP allot
 variable RANGE-SENT-U
 TYPED-VARIABLE RANGED bool
@@ -815,6 +821,22 @@ TYPED-VARIABLE DURING [ -- ]
 
 : NO-HOOK ( -- ) ;
 ' NO-HOOK DURING !
+
+
+: ARGS-SENT+ ( ^u8 n -- )
+   {: a:^ u:n :}
+   a u ARGS-SENT ARGS-SENT-U @ + TEXT-CAP ARGS-SENT-U @ - STORE
+   ARGS-SENT-U +! ;
+
+
+\ The argument into ARG-SENT, and joined to ARGS-SENT unless it is
+\ empty or would not fit.
+: ARG-SENT! ( ^u8 n -- )
+   {: v:^ vu:n :}
+   v vu ARG-SENT TEXT-CAP STORE ARG-SENT-U !
+   vu 0= ARGS-SENT-U @ vu + 1 + TEXT-CAP > or if exit then
+   ARGS-SENT-U @ 0<> if s"  " ARGS-SENT+ then
+   v vu ARGS-SENT+ ;
 
 
 : CONTENT-REV$ ( n -- ^u8 n )
@@ -846,7 +868,7 @@ TYPED-VARIABLE DURING [ -- ]
 : REV-ASK ( HTTP:request -- )
    {: q:HTTP:request :}
    q s" Dropbox-API-Arg" HTTP:HEADER-OF$ {: v:^ vu:n sent:bool :}
-   v vu ARG-SENT TEXT-CAP STORE ARG-SENT-U !
+   v vu ARG-SENT!
    0 ASKED-U !
    sent if
       PARSER v vu JSON:READ-INIT
@@ -1203,7 +1225,7 @@ variable SESSIONS
    0 ARG-PATH-U ! 0 ARG-MODE-U ! 0 ARG-REV-U ! 0 ARG-HASH-U !
    0 ARG-SESSION-U ! -1 ARG-OFFSET !
    q s" Dropbox-API-Arg" HTTP:HEADER-OF$ {: v:^ vu:n sent:bool :}
-   v vu ARG-SENT TEXT-CAP STORE ARG-SENT-U !
+   v vu ARG-SENT!
    sent 0= if exit then
    PARSER v vu JSON:READ-INIT
    JSON:READ-NEXT JSON:T-OBJ = if ARG-MEMBERS then
@@ -1398,7 +1420,8 @@ $2100000 constant UPLOAD-CAP
    0 SCRIPTS ! 0 FILES ! 0 CONTENTS ! 0 SESSIONS ! 0 REVS !
    0 GRANT-CODE-U ! 0 ROTATED-U !
    0 SEEN-U ! 0 AUTH-U ! 0 ROOT-SENT-U ! 0 TYPE-SENT-U !
-   0 ARG-SENT-U ! 0 RANGE-SENT-U ! 0 BODY-SENT-U !
+   0 ARG-SENT-U ! 0 ARGS-SENT-U ! 0 DELETE-SENT-U ! 0 RANGE-SENT-U !
+   0 BODY-SENT-U !
    false ROOTED ! false TYPED ! false LEAKED ! false RANGED !
    false SKEWED ! false CLIPPED ! false INFLATED !
    0 MISHASHED-U ! false MISSIZED ! 0 MISFILED-U !
@@ -1585,6 +1608,10 @@ $2100000 constant UPLOAD-CAP
 \ The Dropbox-API-Arg value of the last download, upload, or upload
 \ session append or finish.
 : ARG-SENT$ ( -- ^u8 n ) ARG-SENT ARG-SENT-U @ ;
+\ The Dropbox-API-Arg values of the downloads, uploads, and upload
+\ session appends and finishes since RESET, joined by spaces; one that
+\ would not fit in 1024 bytes is left out.
+: ARGS-SENT$ ( -- ^u8 n ) ARGS-SENT ARGS-SENT-U @ ;
 \ The last download's Range value, and whether it sent one.
 : RANGE-SENT$ ( -- ^u8 n ) RANGE-SENT RANGE-SENT-U @ ;
 : RANGE-SENT? ( -- bool ) RANGED @ ;
@@ -1603,6 +1630,9 @@ $2100000 constant UPLOAD-CAP
 \ The body of the last delete_v2 or single upload its route answered, its
 \ first KiB.
 : BODY-SENT$ ( -- ^u8 n ) BODY-SENT BODY-SENT-U @ ;
+
+\ The last delete_v2's body since RESET.
+: DELETE-SENT$ ( -- ^u8 n ) DELETE-SENT DELETE-SENT-U @ ;
 
 
 \ The next API call's route runs and takes effect, and its answer is lost:
