@@ -878,3 +878,53 @@ its brief.
 Lane times: the path-mismatch fold 4.2 min; REPLAY's local conflict
 copy 4.8 min; REPLAY's local replay 6.6 min; the pull lane's first
 worker 3.9 min before it stopped on the cancel question.
+
+## 2026-11-16: A state the machine did not have, and decisions made low
+
+A review of the pulled download reproduced a defect with a fake fault:
+the server sends the head and 10 of 26 bytes, then holds the
+connection. A body that returns without reading made DOWNLOAD throw
+curl's E-STATE where it should answer done. The body's caller had
+cancelled the transfer, but the machine stayed at `streaming`, so the
+receive step went on to capture the headers of a transfer the cancel
+had released. The answer step then inferred "cancelled" from
+`streaming`. The existing test passed only because its whole body had
+already arrived inside curl. The fix is one final state, `cancelled`,
+and one row. The inferred state was the smell CLAUDE.md names, a flag
+read in one place and set in another. Once the table named it, the
+fix was obvious. No test had sent a body in two chunks, so a mutant
+that dropped a reset of the bytes taken survived every case; a fault
+that pauses after 10 bytes now kills it.
+
+A download that fails its range, length or result checks used to
+throw E-ANSWER, the code every other unparseable answer throws. Rust
+maps those to DownloadVerificationFailed, which the caller turns into
+a block on that path. A Habu throw carries only its code, so a private
+code, E-UNVERIFIED, marks this case. DOWNLOAD catches only that code
+and answers `refused unverified`, a reply the caller can match. This is
+the third time the code-only throw has turned a Rust error variant into
+an outcome. The stage name in LOCAL and the upload source were the
+first two.
+
+The same limit stopped the lane that binds LOCAL's scan to the active
+root. Rust's root_stood_in takes JOURNAL's missing-birth-time error
+late and compares the inode it carries. Habu's JOURNAL logs that
+refusal before it throws, and the throw holds no inode. Porting the
+Rust shape would have logged an error for every stand-in that LOCAL
+then calls a root change. JOURNAL now has a descriptor form of its root
+inspection that decides the stand-in before anything logs, so LOCAL
+asks one question and gets an option. Rust passes structured errors up
+and decides late. Habu's rule that only failures nobody converts get
+logged pushes each decision down to where the data is. The API came
+out smaller.
+
+Testing every failure turned up a gap the Rust version has too: its
+prune of expired recovery payloads skips a corrupt payload but stops on
+an unreadable one, and it runs inside every reconcile pass, so one
+unreadable file would end every pass. The Habu port keeps it like a
+corrupt one. This is a deliberate departure, and AGENTS.md's rule
+requires it.
+
+Lane times: the cancelled state 8.8 min; downloadability and the path
+check 5.1 min; case-variant renames 5.4 min; root binding 1.4 min to
+its stop, then 5.6 min; LOCAL's failure tests 9.1 min.
