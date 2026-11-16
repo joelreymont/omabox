@@ -103,6 +103,15 @@
 \ - changed_upload_supersedes_a_rejected_plan_before_deadline
 \ - unknown_local_state_keeps_a_rejected_upload_blocked
 \ - stale_upload_is_superseded_and_current_bytes_sync
+\ Conflicts against the fake Dropbox, Rust's tests of the same names,
+\ d-unrelated.txt's rev the one the fake's upload answers:
+\ - replay_blocks_a_conflict_whose_local_copy_name_is_occupied
+\ - replay_blocks_a_conflict_whose_local_copy_name_is_unreadable,
+\   skipped as root, who opens any file
+\ - recorded_conflict_leaves_an_edited_copy_alone
+\ - occupied_dropbox_conflict_copy_name_blocks_only_its_path
+\ - conflict_on_a_plan_blocked_for_its_size_is_prepared_at_once
+\ - directory_at_dropbox_conflict_copy_name_blocks_only_its_path
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -3695,6 +3704,382 @@ XS-SIZE BUFFER: XS
    ar UNKNOWN-LOCAL-STATE-KEEPS-A-REJECTED-UPLOAD-BLOCKED
    ar STALE-UPLOAD-IS-SUPERSEDED-AND-CURRENT-BYTES-SYNC ;
 
+\ ---- conflicts against the fake Dropbox ----------------------------
+
+: COMMON$ ( -- ^u8 n ) s" common bytes" ;
+: NEW-LOCAL$ ( -- ^u8 n ) s" new local bytes" ;
+: USER-FILE$ ( -- ^u8 n ) s" a file the user made" ;
+: SHARED$ ( -- ^u8 n ) s" shared baseline" ;
+: DIVERGED-LOCAL$ ( -- ^u8 n ) s" divergent local edit" ;
+: DIVERGED-REMOTE$ ( -- ^u8 n ) s" divergent Dropbox edit" ;
+: EDITED-COPY$ ( -- ^u8 n ) s" the user edited the Dropbox copy" ;
+: UNRELATED$ ( -- ^u8 n ) s" an unrelated new file" ;
+
+\ Rust's CopyOccupant: what sits at a local conflict copy's name.
+ENUM copy-occupant different-file unreadable-file ;ENUM
+
+: UNREADABLE? ( copy-occupant -- bool )
+   MATCH copy-occupant
+      different-file OF false ENDOF
+      unreadable-file OF true ENDOF
+   ;MATCH ;
+
+\ Rust's seed_baseline: path p in sync at rem.
+: SEED-BASELINE ( ^run ^u8 n MODEL:remote -- )
+   {: x p:^ u:n rem :}
+   rem MODEL-REMOTE:UNMAKE {: c v :}
+   rem MODEL-BASELINE:PRESENT c MODEL-LOCAL:MAKE LOCAL-PRESENT
+   rem REMOTE-PRESENT MODEL-SUBTREE:EMPTY PLANNER:PLAN NOOP-BASELINE
+   {: b :}
+   x RUN-JOURNAL @ p u DISPLAY b x RUN-ARENA @ JOURNAL:RECORD-NOOP
+   NOOP-RECORDED? TTRUE ;
+
+\ Rust's plan(Present(old), Present(local c), Present(old), Empty),
+\ recorded at path p: one upload over old.
+: UPLOAD-OVER
+   ( ^run ^u8 n MODEL:remote DROPBOX:hash -- JOURNAL:plan-record )
+   {: x p:^ u:n old c:DROPBOX:hash :}
+   x p u old MODEL-BASELINE:PRESENT c MODEL-LOCAL:MAKE LOCAL-PRESENT
+   old REMOTE-PRESENT RECORD-FIXTURE-PLAN ;
+
+\ Rust's conflict_copy_path: p's copy of bytes b for side, relative to
+\ the root.
+: CONFLICT-COPY-PATH
+   ( ^u8 n LOCAL:conflict-side ^u8 n ^ARENA:arena -- ^u8 n )
+   {: p:^ u:n side b:^ bu:n ar :}
+   p u side b bu ar IDENTITY ar LOCAL:CONFLICT-RELATIVE-PATH ;
+
+\ The copy CONFLICT-COPY-PATH names, below the run's root.
+: COPY-IN-ROOT ( ^run ^u8 n LOCAL:conflict-side ^u8 n -- str )
+   {: x p:^ u:n side b:^ bu:n :}
+   x p u side b bu x RUN-ARENA @ CONFLICT-COPY-PATH IN-ROOT ;
+
+\ Rust's replay_remote_operations over the run's pending plans.
+: REMOTE-OPERATIONS-REPLAYED ( ^run -- ^REPLAY:replay-report )
+   {: x :}
+   x ROOT$ s" open test root" LOCAL:OPEN-ROOT {: root:fd :}
+   [: x RUN-JOURNAL @ x RUN-LINK @ root x ROOT$ x STAGING$
+      x RUN-ARENA @ REPLAY:REPLAY-REMOTE-OPERATIONS-AT ;]
+   [: root FS:CLOSE-DIR ;] finally ;
+
+: COPY-CONFLICTS ( report -- n )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   conflicts ;
+
+: COPY-BLOCKED ( report -- n )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   blocked ;
+
+: CONFLICTS-OF ( ^run -- ^VEC:vector<JOURNAL:conflict-record> )
+   {: x :}
+   x RUN-JOURNAL @ x RUN-ARENA @ JOURNAL:CONFLICTS ;
+
+: CONFLICT-RECORD= ( JOURNAL:conflict-record JOURNAL:conflict-record
+     -- bool )
+   {: a b :}
+   a JOURNAL-CONFLICT--RECORD:UNMAKE {: id path c :}
+   b JOURNAL-CONFLICT--RECORD:UNMAKE {: id2 path2 c2 :}
+   id id2 = path PATH$ path2 PATH$ STR= and
+   c c2 MODEL:CONFLICT= and ;
+
+\ Rust's == of two conflicts() answers.
+: CONFLICTS= ( ^VEC:vector<JOURNAL:conflict-record>
+     ^VEC:vector<JOURNAL:conflict-record> -- bool )
+   {: v w :}
+   v VEC:COUNT w VEC:COUNT <> if false exit then
+   v VEC:COUNT 0 ?do
+      v i VEC:AT @ w i VEC:AT @ CONFLICT-RECORD= 0= if
+         false unloop exit
+      then
+   loop
+   true ;
+
+\ The one conflict recorded is at replace.txt.
+: REPLACE-CONFLICTED ( ^run -- )
+   CONFLICTS-OF {: recorded :}
+   recorded VEC:COUNT 1 T=
+   recorded 0 VEC:AT @ JOURNAL-CONFLICT--RECORD:UNMAKE
+   {: id path c :}
+   path PATH$ s" replace.txt" T$= ;
+
+\ The one blocked plan, held for its occupied copy name.
+: COPY-HELD ( ^run -- JOURNAL:plan-record )
+   BLOCKED-OF {: held :}
+   held VEC:COUNT 1 T=
+   held 0 VEC:AT @ {: p :}
+   p HELD-FOR$ s" conflict-copy-occupied" T$=
+   p ;
+
+\ Plan id blocked for why until the epoch second at.
+: HELD-UNTIL ( ^run JOURNAL:plan-id MODEL:blockage n -- )
+   {: x id why at:n :}
+   x RUN-JOURNAL @ id why at x RUN-ARENA @ JOURNAL:BLOCK-PLAN
+   PLAN-BLOCKED? TTRUE ;
+
+\ Whether the request q is the one at offset at of the requests p.
+: TOKEN-AT? ( ^u8 n n ^u8 n -- bool )
+   {: p:^ u:n at:n q:^ qu:n :}
+   p at + u at - q qu STARTS-WITH? 0= if false exit then
+   at qu + {: e:n :}
+   e u = if true exit then
+   p e + c@ 32 = ;
+
+\ How many of the fake's requests went to the path q.
+: SEEN-COUNT ( ^u8 n -- n )
+   {: q:^ qu:n :}
+   TEST-DROPBOX:SEEN$ {: p:^ u:n :}
+   0 u 0 ?do p u i q qu TOKEN-AT? if 1+ then loop ;
+
+\ The fake serves new remote bytes as replace.txt's current-rev, on one
+\ listing page with the cursor k.
+: REPLACE-LISTED ( ^u8 n ^ARENA:arena -- )
+   {: k:^ ku:n ar :}
+   s" replace.txt" s" current-rev" NEW-REMOTE$ ar SERVES
+   NEW-REMOTE$ ar IDENTITY {: h:DROPBOX:hash :}
+   [: s" /replace.txt" s" /replace.txt" s" current-rev" h FILE-JSON+ ;]
+   ar ENTRIES k ku false PAGE ;
+
+\ replace.txt holds new local bytes over a baseline at old-rev, and its
+\ upload is planned; the plan.
+: REPLACE-PLANNED ( ^run -- JOURNAL:plan-record )
+   {: x :}
+   x RUN-ARENA @ {: ar :}
+   x s" replace.txt" IN-ROOT str> NEW-LOCAL$ FS:WRITE-ALL
+   COMMON$ s" old-rev" ar REMOTE-FILE {: old :}
+   x s" replace.txt" old SEED-BASELINE
+   x s" replace.txt" old NEW-LOCAL$ ar IDENTITY UPLOAD-OVER ;
+
+: LOCAL-COPY ( ^run -- str )
+   s" replace.txt" LOCAL-CONFLICT--SIDE:LOCAL NEW-LOCAL$
+   COPY-IN-ROOT ;
+
+: REMOTE-COPY ( ^run -- str )
+   s" replace.txt" LOCAL-CONFLICT--SIDE:REMOTE NEW-REMOTE$
+   COPY-IN-ROOT ;
+
+\ replace.txt's conflict prepared: both copies placed beside its local
+\ bytes, recorded, and no plan left.
+: REPLACE-PREPARED ( ^run -- )
+   {: x :}
+   x LOCAL-COPY NEW-LOCAL$ HOLDS-BYTES
+   x REMOTE-COPY NEW-REMOTE$ HOLDS-BYTES
+   x s" replace.txt" IN-ROOT NEW-LOCAL$ HOLDS-BYTES
+   x REPLACE-CONFLICTED
+   x PENDING-OF VEC:COUNT 0 T=
+   x BLOCKED-OF VEC:COUNT 0 T= ;
+
+\ The occupant at the local copy's name, unreadable for
+\ unreadable-file.
+: OCCUPANT-PLACED ( ^run copy-occupant -- )
+   {: x o :}
+   x LOCAL-COPY str> USER-FILE$ FS:WRITE-ALL
+   o UNREADABLE? if x LOCAL-COPY str> 0 FS:CHMOD-MODE then ;
+
+\ The remote replay blocks replace.txt for its local copy's name; the
+\ occupant and replace.txt are kept.
+: COPY-REPLAY-BLOCKED ( ^run copy-occupant -- JOURNAL:plan-record )
+   {: x o :}
+   x REMOTE-OPERATIONS-REPLAYED {: rep :}
+   rep COMPLETED 0 T=
+   rep BLOCKS VEC:COUNT 1 T=
+   rep s" durable-plan replace.txt conflict-copy-occupied" REPORTS?
+   TTRUE
+   x COPY-HELD
+   x CONFLICTS-OF VEC:COUNT 0 T=
+   o UNREADABLE? if x LOCAL-COPY str> $180 FS:CHMOD-MODE then
+   x LOCAL-COPY USER-FILE$ HOLDS-BYTES
+   x s" replace.txt" IN-ROOT NEW-LOCAL$ HOLDS-BYTES ;
+
+\ The occupant is gone, but the block is not yet due.
+: COPY-WAITS ( ^run str -- )
+   {: x rec:str :}
+   x LOCAL-COPY str> FS:REMOVE-FILE
+   x rec PASSED COMPLETE {: waiting :}
+   waiting COPY-CONFLICTS 0 T=
+   waiting COPY-BLOCKED 1 T=
+   x COPY-HELD drop
+   x LOCAL-COPY str> FS:EXISTS? TFALSE
+   x CONFLICTS-OF VEC:COUNT 0 T= ;
+
+\ Rust's replay_blocks_an_occupied_copy_name.
+: REPLAY-BLOCKS-AN-OCCUPIED-COPY-NAME
+   ( copy-occupant ^ARENA:arena -- )
+   {: o ar :}
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   s" cursor-retry" ar REPLACE-LISTED
+   [: ;] ar ENTRIES s" cursor-retry" false PAGE
+   x o OCCUPANT-PLACED
+   x REPLACE-PLANNED drop
+   x o COPY-REPLAY-BLOCKED ID-OF {: id :}
+   x rec COPY-WAITS
+   \ A due block is prepared again and places both copies.
+   x id MODEL-BLOCKAGE:CONFLICT-COPY-OCCUPIED 0 HELD-UNTIL
+   x rec PASSED COMPLETE COPY-CONFLICTS 1 T=
+   x REPLACE-PREPARED
+   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata "
+   STARTS-WITH? TTRUE
+   DOWNLOAD$ SEEN-COUNT 1 T=
+   d x STEP-GONE ;
+
+: REPLAY-BLOCKS-A-CONFLICT-WHOSE-LOCAL-COPY-NAME-IS-OCCUPIED
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" replay_blocks_a_conflict_whose_local_copy_name_is_occupied"
+   T-LABEL
+   construct copy-occupant different-file ar
+   REPLAY-BLOCKS-AN-OCCUPIED-COPY-NAME ;
+
+: REPLAY-BLOCKS-A-CONFLICT-WHOSE-LOCAL-COPY-NAME-IS-UNREADABLE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" replay_blocks_a_conflict_whose_local_copy_name_is_unreadable"
+   T-LABEL
+   \ Root opens a file whatever its mode.
+   FS:EUID 0 = if exit then
+   construct copy-occupant unreadable-file ar
+   REPLAY-BLOCKS-AN-OCCUPIED-COPY-NAME ;
+
+\ c-diverged.txt holds a local edit over a baseline at rev-old, and the
+\ fake lists Dropbox's edit at rev-remote on one page with cursor k.
+: DIVERGED ( ^run ^u8 n -- )
+   {: x k:^ ku:n :}
+   x RUN-ARENA @ {: ar :}
+   s" c-diverged.txt" s" rev-remote" DIVERGED-REMOTE$ ar FILE-AT
+   DIVERGED-REMOTE$ ar IDENTITY {: h:DROPBOX:hash :}
+   [: s" /c-diverged.txt" s" /c-diverged.txt" s" rev-remote" h
+      FILE-JSON+ ;] ar ENTRIES k ku false PAGE
+   x s" c-diverged.txt" IN-ROOT str> DIVERGED-LOCAL$ FS:WRITE-ALL
+   x s" c-diverged.txt" SHARED$ s" rev-old" ar REMOTE-FILE
+   SEED-BASELINE ;
+
+: DIVERGED-COPY ( ^run LOCAL:conflict-side ^u8 n -- str )
+   {: x side b:^ bu:n :}
+   x s" c-diverged.txt" side b bu COPY-IN-ROOT ;
+
+: UNRELATED-WRITTEN ( ^run -- )
+   s" d-unrelated.txt" IN-ROOT str> UNRELATED$ FS:WRITE-ALL ;
+
+\ d-unrelated.txt's baseline at rev v, the rev the fake's upload
+\ answered; it numbers revs in upload order.
+: UNRELATED-SYNCED ( ^run ^u8 n -- )
+   {: x v:^ vu:n :}
+   x s" d-unrelated.txt" UNRELATED$ v vu x RUN-ARENA @ REMOTE-FILE
+   BASELINE-AT ;
+
+: RECORDED-CONFLICT-LEAVES-AN-EDITED-COPY-ALONE ( ^ARENA:arena -- )
+   {: ar :}
+   s" recorded_conflict_leaves_an_edited_copy_alone" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" cursor-conflict" DIVERGED
+   s" rev-remote" DIVERGED-REMOTE$ TEST-DROPBOX:CONTENT!
+   [: ;] ar ENTRIES s" cursor-conflict" false PAGE
+   x LOCAL-CONFLICT--SIDE:LOCAL DIVERGED-LOCAL$ DIVERGED-COPY
+   {: lc:str :}
+   x LOCAL-CONFLICT--SIDE:REMOTE DIVERGED-REMOTE$ DIVERGED-COPY
+   {: rc:str :}
+   x rec PASSED COMPLETE COPY-CONFLICTS 1 T=
+   x CONFLICTS-OF {: recorded :}
+   recorded VEC:COUNT 1 T=
+   rc DIVERGED-REMOTE$ HOLDS-BYTES
+   rc str> EDITED-COPY$ FS:WRITE-ALL
+   x UNRELATED-WRITTEN
+   x rec PASSED COMPLETE {: second :}
+   second COPY-CONFLICTS 0 T=
+   second COPY-BLOCKED 0 T=
+   rc EDITED-COPY$ HOLDS-BYTES
+   lc DIVERGED-LOCAL$ HOLDS-BYTES
+   x CONFLICTS-OF recorded CONFLICTS= TTRUE
+   \ The two copies' uploads come first.
+   x s" 01703" UNRELATED-SYNCED
+   x PENDING-OF VEC:COUNT 0 T=
+   x BLOCKED-OF VEC:COUNT 0 T=
+   DOWNLOAD$ SEEN-COUNT 1 T=
+   d x STEP-GONE ;
+
+\ c-diverged.txt blocked alone: its bytes and baseline kept and no
+\ conflict recorded, while d-unrelated.txt syncs as rev v.
+: DIVERGED-HELD ( ^run report ^u8 n -- )
+   {: x rep v:^ vu:n :}
+   rep COPY-BLOCKED 1 T=
+   x CONFLICTS-OF VEC:COUNT 0 T=
+   x s" c-diverged.txt" IN-ROOT DIVERGED-LOCAL$ HOLDS-BYTES
+   x s" c-diverged.txt" SHARED$ s" rev-old" x RUN-ARENA @ REMOTE-FILE
+   BASELINE-AT
+   x v vu UNRELATED-SYNCED
+   DOWNLOAD$ SEEN-COUNT 0 T= ;
+
+: OCCUPIED-DROPBOX-CONFLICT-COPY-NAME-BLOCKS-ONLY-ITS-PATH
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" occupied_dropbox_conflict_copy_name_blocks_only_its_path" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" cursor-occupied" DIVERGED
+   x LOCAL-CONFLICT--SIDE:REMOTE DIVERGED-REMOTE$ DIVERGED-COPY
+   {: rc:str :}
+   rc str> USER-FILE$ FS:WRITE-ALL
+   x UNRELATED-WRITTEN
+   x rec PASSED COMPLETE {: rep :}
+   rep COPY-CONFLICTS 0 T=
+   rc USER-FILE$ HOLDS-BYTES
+   \ The occupant's upload comes first.
+   x rep s" 01702" DIVERGED-HELD
+   d x STEP-GONE ;
+
+: CONFLICT-ON-A-PLAN-BLOCKED-FOR-ITS-SIZE-IS-PREPARED-AT-ONCE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" conflict_on_a_plan_blocked_for_its_size_is_prepared_at_once"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   s" cursor-size" ar REPLACE-LISTED
+   x REPLACE-PLANNED ID-OF {: id :}
+   x id MODEL-BLOCKAGE:UNSUPPORTED-FILE-SIZE $7FFFFFFFFFFFFFFF
+   HELD-UNTIL
+   x rec PASSED COMPLETE {: rep :}
+   rep COPY-CONFLICTS 1 T=
+   rep COPY-BLOCKED 0 T=
+   x REPLACE-PREPARED
+   s" /2/files/upload" SEEN-COUNT 0 T=
+   d x STEP-GONE ;
+
+: DIRECTORY-AT-DROPBOX-CONFLICT-COPY-NAME-BLOCKS-ONLY-ITS-PATH
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" directory_at_dropbox_conflict_copy_name_blocks_only_its_path"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" cursor-occupied-directory" DIVERGED
+   x LOCAL-CONFLICT--SIDE:REMOTE DIVERGED-REMOTE$ DIVERGED-COPY
+   {: rc:str :}
+   rc str> FS:MAKE-DIR
+   x UNRELATED-WRITTEN
+   x rec PASSED COMPLETE {: rep :}
+   rc str> FS:DIR? TTRUE
+   rc str> READ-BUF READ-CAP FS-LIST:NAMES 0 T=
+   x rep s" 01701" DIVERGED-HELD
+   d x STEP-GONE ;
+
+: CONFLICTS-CASES ( ^ARENA:arena -- )
+   {: ar :}
+   ar REPLAY-BLOCKS-A-CONFLICT-WHOSE-LOCAL-COPY-NAME-IS-OCCUPIED
+   ar REPLAY-BLOCKS-A-CONFLICT-WHOSE-LOCAL-COPY-NAME-IS-UNREADABLE
+   ar RECORDED-CONFLICT-LEAVES-AN-EDITED-COPY-ALONE
+   ar OCCUPIED-DROPBOX-CONFLICT-COPY-NAME-BLOCKS-ONLY-ITS-PATH
+   ar CONFLICT-ON-A-PLAN-BLOCKED-FOR-ITS-SIZE-IS-PREPARED-AT-ONCE
+   ar DIRECTORY-AT-DROPBOX-CONFLICT-COPY-NAME-BLOCKS-ONLY-ITS-PATH ;
+
 : SERVED ( ^ARENA:arena -- )
    {: ar :}
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
@@ -3702,7 +4087,8 @@ XS-SIZE BUFFER: XS
    ar OPENED MAIN !
    ACCOUNTED
    [: ar REFRESH-CASES ar STEP-CASES ar PASS-CASES
-      ar STALE-CASES ar DOWNLOAD-BLOCKS-CASES ar UPLOADS-CASES ;]
+      ar STALE-CASES ar DOWNLOAD-BLOCKS-CASES ar UPLOADS-CASES
+      ar CONFLICTS-CASES ;]
    [: MAIN @ DROPBOX:CLOSE ;]
    finally ;
 
