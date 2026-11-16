@@ -3,21 +3,22 @@
 \ answer, the journal steps that finish, supersede or complete a plan,
 \ the replay of the plans' local operations, a staged upload's local
 \ conflict copy, the bridge that stages a Dropbox revision's bytes
-\ through LOCAL, the retention of legacy recovery payloads, and each
-\ Dropbox mutation's outcome. A LOCAL call whose failures REPLAY
-\ converts into outcomes runs under LOCAL:CONVERTING, so nothing logs
-\ those; any other LOCAL, JOURNAL or DROPBOX failure passes up with its
-\ own code, which that library logged where it saw it. A Dropbox answer
-\ that ends the pass, not one path's verdict, is kept in the link and
-\ thrown as E-DROPBOX. A journal answer the replay contract refuses is
-\ logged once with the Rust version's text, naming the plan's path, then
-\ thrown as E-INVALID-STATE. A failed retention or upload-stage syscall
-\ is logged once, as LOCAL logs one, and thrown as LOCAL's E-IO.
+\ through LOCAL, a revision's exact copy and remote conflict copy, the
+\ retention of legacy recovery payloads, and each Dropbox mutation's
+\ outcome. A LOCAL call whose failures REPLAY converts into outcomes
+\ runs under LOCAL:CONVERTING, so nothing logs those; any other LOCAL,
+\ JOURNAL or DROPBOX failure passes up with its own code, which that
+\ library logged where it saw it. A Dropbox answer that ends the pass,
+\ not one path's verdict, is kept in the link and thrown as E-DROPBOX.
+\ A journal answer the replay contract refuses is logged once with the
+\ Rust version's text, naming the plan's path, then thrown as
+\ E-INVALID-STATE. A failed retention or upload-stage syscall is
+\ logged once, as LOCAL logs one, and thrown as LOCAL's E-IO.
 \ STORAGE CLASS. No state of its own. CALLER-OWNED: a report, its
 \ vector, a local replay's run, a download's bridge, and every value a
 \ journal step or a conflict copy reads lie in the arena the caller
 \ passes. A retention pass lays its values in an arena of its own.
-\ Retention, the conflict copy, an upload and the bridge close every
+\ Retention, the conflict copies, an upload and the bridge close every
 \ descriptor they open, on every exit.
 
 require src/lib/error.f
@@ -1727,5 +1728,144 @@ public
    {: k root:fd r:^ ru:n path rem lease s:^ su:n ar :}
    k root r ru path path rem lease s su ar
    STAGE-EXACT-DOWNLOAD-FOR-AT ;
+
+\ ---- remote conflict copies ------------------------------------------
+
+private
+
+: EXACT-READY ( -- exact-copy-outcome )
+   construct exact-copy-outcome ready ;
+: EXACT-OCCUPIED ( -- exact-copy-outcome )
+   construct exact-copy-outcome stage-occupied ;
+: SOME-EXACT ( exact-copy-outcome -- option<exact-copy-outcome> )
+   OPTION:SOME ;
+: NO-EXACT ( -- option<exact-copy-outcome> ) OPTION:NONE ;
+: NO-LEASE ( -- option<LOCAL:download-slot-lease> ) OPTION:NONE ;
+
+\ An install's answer; none: no verified stage to install.
+: INSTALL-ANSWER
+   ( LOCAL:install-outcome -- option<exact-copy-outcome> )
+   MATCH LOCAL:install-outcome
+      installed OF EXACT-READY SOME-EXACT ENDOF
+      already-installed OF EXACT-READY SOME-EXACT ENDOF
+      download-required OF NO-EXACT ENDOF
+      stage-destination-occupied OF drop EXACT-OCCUPIED SOME-EXACT ENDOF
+      precondition-changed OF
+         drop construct exact-copy-outcome destination-changed
+         SOME-EXACT
+      ENDOF
+   ;MATCH ;
+
+\ A stage's answer for path; none: staged, to install.
+: STAGE-ANSWER
+   ( LOCAL:stage-outcome<n> MODEL:path -- option<exact-copy-outcome> )
+   {: path :}
+   MATCH LOCAL:stage-outcome
+      staged OF drop NO-EXACT ENDOF
+      already-staged OF drop NO-EXACT ENDOF
+      content-changed OF
+         drop path s" exact Dropbox download changed content" INVALID
+      ENDOF
+      destination-occupied OF drop EXACT-OCCUPIED SOME-EXACT ENDOF
+   ;MATCH ;
+
+: REQUIRED
+   ( option<exact-copy-outcome> MODEL:path -- exact-copy-outcome )
+   {: path :}
+   MATCH option
+      none OF
+         path s" verified exact Dropbox download disappeared" INVALID
+      ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+\ Installs t's verified stage of c; nothing at t is replaced.
+: INSTALLED-COPY
+   ( fd ^u8 n MODEL:path DROPBOX:hash ^ARENA:arena
+     -- option<exact-copy-outcome> )
+   {: root:fd r:^ ru:n t c ar :}
+   root r ru t MODEL:PATH>STR str> c NO-CONTENT ar
+   LOCAL:INSTALL-DOWNLOAD-AT INSTALL-ANSWER ;
+
+: STAGED-COPY
+   ( ^link fd ^u8 n MODEL:path MODEL:path MODEL:remote ^ARENA:arena
+     -- option<exact-copy-outcome> )
+   {: k root:fd r:^ ru:n t path rem ar :}
+   k root r ru t path rem NO-LEASE s" " ar
+   STAGE-EXACT-DOWNLOAD-FOR-AT path STAGE-ANSWER ;
+
+: STAGED-THEN-INSTALLED
+   ( ^link fd ^u8 n MODEL:path MODEL:path MODEL:remote ^ARENA:arena
+     -- exact-copy-outcome )
+   {: k root:fd r:^ ru:n t path rem ar :}
+   rem MODEL-REMOTE:UNMAKE {: c v :}
+   k root r ru t path rem ar STAGED-COPY MATCH option
+      none OF root r ru t c ar INSTALLED-COPY path REQUIRED ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+\ Rust's ensure_exact_copy_at: the remote's exact bytes at target t,
+\ staged when no verified stage is there, its transfer shown as path.
+: EXACT-COPY-AT
+   ( ^link fd ^u8 n MODEL:path MODEL:path MODEL:remote ^ARENA:arena
+     -- exact-copy-outcome )
+   {: k root:fd r:^ ru:n t path rem ar :}
+   rem MODEL-REMOTE:UNMAKE {: c v :}
+   root r ru t c ar INSTALLED-COPY MATCH option
+      none OF k root r ru t path rem ar STAGED-THEN-INSTALLED ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+: >CONFLICT-OUTCOME ( exact-copy-outcome -- copy-outcome )
+   MATCH exact-copy-outcome
+      ready OF REPLAY-COPY--OUTCOME:READY ENDOF
+      destination-changed OF COPY-OCCUPIED ENDOF
+      stage-occupied OF
+         MODEL-BLOCKAGE:STAGE-OCCUPIED REPLAY-COPY--OUTCOME:BLOCKED
+      ENDOF
+   ;MATCH ;
+
+\ The path of path's conflict copy holding the remote's bytes.
+: REMOTE-COPY-PATH
+   ( MODEL:path MODEL:remote ^ARENA:arena -- MODEL:path )
+   {: path rem ar :}
+   rem MODEL-REMOTE:UNMAKE {: c v :}
+   path MODEL:PATH>STR str> LOCAL-CONFLICT--SIDE:REMOTE c ar
+   LOCAL:CONFLICT-RELATIVE-PATH >str MODEL:>PATH ;
+
+: NAME-HELD? ( n n -- bool ) drop COPY-NAME-OCCUPIED? ;
+
+\ Rust's materialize_remote_conflict_at; an occupied copy name blocks
+\ the copy, another failure passes up.
+: REMOTE-CONFLICT-AT
+   ( ^link fd ^u8 n MODEL:path MODEL:remote ^ARENA:arena
+     -- copy-outcome )
+   {: k root:fd r:^ ru:n path rem ar :}
+   path rem ar REMOTE-COPY-PATH {: copy :}
+   COPY-OCCUPIED [: DROP-COPY k root r ru copy path rem ar
+      EXACT-COPY-AT >CONFLICT-OUTCOME ;]
+   ['] NAME-HELD? LOCAL:CONVERTING {: code:n :}
+   code 0= if exit then
+   drop code FS:ERRNO NAME-HELD? if COPY-OCCUPIED exit then
+   code throw ;
+
+public
+
+\ Rust's materialize_remote_copy_at: the remote's bytes at target t, its
+\ transfer shown as path; a file at t is never replaced.
+: MATERIALIZE-REMOTE-COPY-AT
+   ( ^link fd ^u8 n MODEL:path MODEL:path MODEL:remote ^ARENA:arena
+     -- exact-copy-outcome )
+   EXACT-COPY-AT ;
+
+\ Writes the remote's bytes as path's remote conflict copy below the
+\ sync root, whose absolute path is r; it never overwrites a file.
+: MATERIALIZE-REMOTE-CONFLICT
+   ( ^link ^u8 n MODEL:path MODEL:remote ^ARENA:arena -- copy-outcome )
+   {: k r:^ ru:n path rem ar :}
+   r ru s" open sync root for remote conflict" LOCAL:OPEN-ROOT
+   {: root:fd :}
+   [: k root r ru path rem ar REMOTE-CONFLICT-AT ;] [: root DISCARD ;]
+   finally ;
 
 ;package

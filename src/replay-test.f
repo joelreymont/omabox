@@ -43,6 +43,12 @@
 \   checkpoint: a 416 at its length finishes the stage, a lost answer
 \   keeps it, sent with its Range, and another 416 restarts it; a
 \   download's progress, then finished, in a status under TMPDIR.
+\ - MATERIALIZE-REMOTE-CONFLICT downloads the copy once, then is ready
+\   with no request; a directory or other bytes at the copy's name
+\   block it conflict-copy-occupied, logging nothing; other bytes at
+\   its stage block it stage-occupied with no request.
+\   MATERIALIZE-REMOTE-COPY-AT installs at a target apart from the
+\   source path, and answers destination-changed for other bytes there.
 \ Run from the repository root: hb --load src/replay-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -711,7 +717,7 @@ $140 constant MODE-NO-WRITE
       remote-rejected OF drop s" other" ENDOF
       download-unavailable OF drop s" other" ENDOF
       download-verification-failed OF s" other" ENDOF
-      stage-occupied OF s" other" ENDOF
+      stage-occupied OF s" stage-occupied" ENDOF
       local-object-in-way OF s" other" ENDOF
       remote-object OF s" other" ENDOF
       conflict-copy-occupied OF s" conflict-copy-occupied" ENDOF
@@ -1625,6 +1631,107 @@ variable HELD
    root FS:CLOSE-DIR
    d GONE ;
 
+
+\ ---- remote conflict copies -----------------------------------------
+
+\ p's remote conflict copy holding c, relative to the root.
+: REMOTE-COPY ( ^u8 n DROPBOX:hash ^ARENA:arena -- ^u8 n )
+   {: p:^ u:n c:DROPBOX:hash ar :}
+   p u LOCAL-CONFLICT--SIDE:REMOTE c ar LOCAL:CONFLICT-RELATIVE-PATH ;
+
+\ p's remote conflict copy, written below the root r.
+: REMOTE-COPY$
+   ( str ^u8 n MODEL:remote ^ARENA:arena -- ^u8 n ^u8 n )
+   {: r:str p:^ u:n rem:MODEL:remote ar :}
+   LINK r str> p u DISPLAY rem ar REPLAY:MATERIALIZE-REMOTE-CONFLICT
+   OUTCOME$ ;
+
+: EXACT$ ( REPLAY:exact-copy-outcome -- ^u8 n )
+   MATCH REPLAY:exact-copy-outcome
+      ready OF s" ready" ENDOF
+      destination-changed OF s" destination-changed" ENDOF
+      stage-occupied OF s" stage-occupied" ENDOF
+   ;MATCH ;
+
+\ The remote's exact copy at t below the root r, shown as p.
+: COPY-AT$
+   ( fd str ^u8 n ^u8 n MODEL:remote ^ARENA:arena -- ^u8 n )
+   {: root:fd r:str t:^ tu:n p:^ pu:n rem:MODEL:remote ar :}
+   LINK root r str> t tu DISPLAY p pu DISPLAY rem ar
+   REPLAY:MATERIALIZE-REMOTE-COPY-AT EXACT$ ;
+
+: THEIRS ( -- ^u8 n ) s" Dropbox's side of the conflict" ;
+
+\ THEIRS served at /notes.txt, and its remote.
+: THEIRS-SERVED ( ^ARENA:arena -- DROPBOX:hash MODEL:remote )
+   {: ar :}
+   TEST-DROPBOX:RESET
+   THEIRS ar HASH-OF {: c:DROPBOX:hash :}
+   s" /notes.txt" s" theirs-revision" THEIRS c SERVES
+   c c s" theirs-revision" REMOTE-OF ;
+
+: A-REMOTE-CONFLICT-COPY-DOWNLOADS-ONCE ( ^ARENA:arena -- )
+   {: ar :}
+   s" a remote conflict copy downloads once, then is ready" T-LABEL
+   ar THEIRS-SERVED {: c:DROPBOX:hash rem:MODEL:remote :}
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r s" notes.txt" rem ar REMOTE-COPY$ s" " T$= s" ready" T$=
+   r s" notes.txt" rem ar REMOTE-COPY$ s" " T$= s" ready" T$=
+   1 SEEN
+   r s" notes.txt" c ar REMOTE-COPY THEIRS ar HOLDS
+   d GONE ;
+
+: AN-OCCUPIED-REMOTE-COPY-NAME-BLOCKS-IT ( ^ARENA:arena -- )
+   {: ar :}
+   s" a directory or other bytes at the copy's name block it" T-LABEL
+   ar THEIRS-SERVED {: c:DROPBOX:hash rem:MODEL:remote :}
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r s" notes.txt" c ar REMOTE-COPY ar INSIDE {: k:str :}
+   k str> FS:MAKE-DIR
+   d [: r s" notes.txt" rem ar REMOTE-COPY$ BLOCKED-OCCUPIED ;] ar
+   QUIETLY
+   k str> FS:REMOVE-DIR
+   k str> s" other bytes" FS:WRITE-ALL
+   d [: r s" notes.txt" rem ar REMOTE-COPY$ BLOCKED-OCCUPIED ;] ar
+   QUIETLY
+   r s" notes.txt" c ar REMOTE-COPY s" other bytes" ar HOLDS
+   d GONE ;
+
+: AN-OCCUPIED-REMOTE-COPY-STAGE-BLOCKS-IT ( ^ARENA:arena -- )
+   {: ar :}
+   s" other bytes at the copy's stage block it" T-LABEL
+   ar THEIRS-SERVED {: c:DROPBOX:hash rem:MODEL:remote :}
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r OPEN-ROOT {: root:fd :}
+   s" notes.txt" c ar REMOTE-COPY {: k:^ ku:n :}
+   root r k ku THEIRS c ar PRESTAGED s" staged" AS
+   root FS:CLOSE-DIR
+   d r ar SET-ASIDE
+   STAGE-AT @ str> s" other bytes" FS:WRITE-ALL
+   r s" notes.txt" rem ar REMOTE-COPY$
+   s" stage-occupied" T$= s" blocked" T$=
+   0 SEEN
+   STAGE-AT @ str> TEXT CAP FS:READ-ALL {: u:n :}
+   TEXT u s" other bytes" T$=
+   d GONE ;
+
+: A-REMOTE-COPY-INSTALLS-AT-ITS-TARGET ( ^ARENA:arena -- )
+   {: ar :}
+   s" a remote copy installs at its target, never over a file" T-LABEL
+   ar THEIRS-SERVED {: c:DROPBOX:hash rem:MODEL:remote :}
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r OPEN-ROOT {: root:fd :}
+   root r s" moved.txt" s" notes.txt" rem ar COPY-AT$ s" ready" T$=
+   r s" moved.txt" THEIRS ar HOLDS
+   r s" notes.txt" ar INSIDE str> FS:TRY-STAT TFALSE
+   r s" taken.txt" ar INSIDE str> s" other bytes" FS:WRITE-ALL
+   root r s" taken.txt" s" notes.txt" rem ar COPY-AT$
+   s" destination-changed" T$=
+   r s" taken.txt" s" other bytes" ar HOLDS
+   1 SEEN
+   root FS:CLOSE-DIR
+   d GONE ;
+
 : BRIDGE-CASES ( ^ARENA:arena -- )
    {: ar :}
    ar EXACT-DOWNLOAD-RETRY-REUSES-A-STAGE-WITHOUT-CONSUMING-THE-BODY
@@ -1633,7 +1740,11 @@ variable HELD
    ar A-DOWNLOAD-LOST-MID-BODY-KEEPS-ITS-PARTIAL
    ar A-COMPLETE-416-FINISHES-THE-STAGE
    ar ANOTHER-416-RESTARTS-THE-SLOT
-   ar A-DOWNLOAD-REPORTS-ITS-TRANSFER ;
+   ar A-DOWNLOAD-REPORTS-ITS-TRANSFER
+   ar A-REMOTE-CONFLICT-COPY-DOWNLOADS-ONCE
+   ar AN-OCCUPIED-REMOTE-COPY-NAME-BLOCKS-IT
+   ar AN-OCCUPIED-REMOTE-COPY-STAGE-BLOCKS-IT
+   ar A-REMOTE-COPY-INSTALLS-AT-ITS-TARGET ;
 
 \ The link: the main client, its token fetched, and a status in a
 \ runtime directory of its own.
