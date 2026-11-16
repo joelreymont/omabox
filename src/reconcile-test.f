@@ -2902,6 +2902,13 @@ XS-SIZE BUFFER: XS
    x RUN-JOURNAL @ x RUN-LINK @ x RUN-ROOT @ x RUN-STAGING @ rec
    x RUN-ARENA @ PASS ;
 
+\ The one listing page, cursor k: /<p> at rev v with b's identity.
+: LISTED-ALONE ( ^u8 n ^u8 n ^u8 n ^u8 n ^ARENA:arena -- )
+   {: p:^ pu:n v:^ vu:n b:^ bu:n k:^ ku:n ar :}
+   b bu ar IDENTITY {: h:DROPBOX:hash :}
+   SB-RESET s" /" SB-APPEND p pu SB-APPEND SB$ ar COPIED {: l:str :}
+   [: l str> l str> v vu h FILE-JSON+ ;] ar ENTRIES k ku false PAGE ;
+
 \ Rust's fixture: upload.txt in the root, download.txt served and on
 \ the one listing page; answers the recovery directory.
 : BOTH-WAYS ( str ^run -- str )
@@ -2910,9 +2917,8 @@ XS-SIZE BUFFER: XS
    d x PASS-READY {: rec:str :}
    x s" upload.txt" IN-ROOT str> UPLOAD$ FS:WRITE-ALL
    s" download.txt" s" rev-download" REMOTE$ ar SERVES
-   REMOTE$ ar IDENTITY {: h:DROPBOX:hash :}
-   [: s" /download.txt" s" /download.txt" s" rev-download" h FILE-JSON+ ;]
-   ar ENTRIES s" cursor-complete" false PAGE
+   s" download.txt" s" rev-download" REMOTE$ s" cursor-complete" ar
+   LISTED-ALONE
    rec ;
 
 : REPORTS ( report -- )
@@ -2926,13 +2932,16 @@ XS-SIZE BUFFER: XS
    x RUN-JOURNAL @ p u DISPLAY x RUN-ARENA @ JOURNAL:BASELINE
    STORED-BASELINE rem MODEL-BASELINE:PRESENT MODEL:BASELINE= TTRUE ;
 
-\ The upload's argument as DROPBOX writes it, for content h.
-: UPLOAD-ARG$ ( DROPBOX:hash -- ^u8 n )
-   {: h:DROPBOX:hash :}
-   SB-RESET S\" {\qpath\q:\q/upload.txt\q,\qmode\q:\qadd\q," SB-APPEND
-   S\" \qautorename\q:false,\qstrict_conflict\q:true," SB-APPEND
-   S\" \qcontent_hash\q:\q" SB-APPEND
-   h DROPBOX:HASH>STR str> SB-APPEND S\" \q}" SB-APPEND SB$ ;
+\ The last upload's argument as DROPBOX writes it for b at path p. The
+\ fake commits only a body that hashes to it: Rust's body assert.
+: UPLOAD-SENT ( ^u8 n ^u8 n ^ARENA:arena -- )
+   {: p:^ u:n b:^ bu:n ar :}
+   b bu ar IDENTITY DROPBOX:HASH>STR str> {: h:^ hu:n :}
+   SB-RESET S\" {\qpath\q:\q" SB-APPEND p u SB-APPEND
+   S\" \q,\qmode\q:\qadd\q,\qautorename\q:false," SB-APPEND
+   S\" \qstrict_conflict\q:true,\qcontent_hash\q:\q" SB-APPEND
+   h hu SB-APPEND S\" \q}" SB-APPEND
+   TEST-DROPBOX:ARG-SENT$ SB$ T$= ;
 
 : PASS-SEEN$ ( -- ^u8 n )
    s" /2/files/list_folder /2/files/download /2/files/upload" ;
@@ -2953,7 +2962,7 @@ XS-SIZE BUFFER: XS
    x PENDING-OF VEC:COUNT 0 T=
    x RUN-JOURNAL @ ar JOURNAL:CONFLICTS VEC:COUNT 0 T=
    TEST-DROPBOX:SEEN$ PASS-SEEN$ T$=
-   TEST-DROPBOX:ARG-SENT$ UPLOAD$ ar IDENTITY UPLOAD-ARG$ T$=
+   s" /upload.txt" UPLOAD$ ar UPLOAD-SENT
    d x STEP-GONE ;
 
 : PASS-CASES ( ^ARENA:arena -- )
@@ -2963,7 +2972,7 @@ XS-SIZE BUFFER: XS
 
 : OBSOLETE$ ( -- ^u8 n ) s" obsolete Dropbox bytes" ;
 : MATCHING$ ( -- ^u8 n ) s" matching current bytes" ;
-: LATER-EDIT$ ( -- ^u8 n ) s" later local edit" ;
+: LOCAL-EDIT$ ( -- ^u8 n ) s" later local edit" ;
 : STALE-LOCAL$ ( -- ^u8 n ) s" current local bytes" ;
 : UNRELATED-STAGE$ ( -- ^u8 n ) s" unrelated stage bytes" ;
 
@@ -2987,12 +2996,12 @@ XS-SIZE BUFFER: XS
    x s" file.txt" STALE-INSTALL
    d x rec ;
 
-: STALE-EMPTY-PAGE ( ^u8 n -- )
-   {: k:^ ku:n :}
-   s" []" >str k ku false PAGE ;
+: EMPTY-PAGE ( ^u8 n ^ARENA:arena -- )
+   {: k:^ ku:n ar :}
+   [: ;] ar ENTRIES k ku false PAGE ;
 
 \ Rust's unsupported_file_metadata: not downloadable, export only.
-: UNSUPPORTED-JSON+ ( ^u8 n ^u8 n ^u8 n -- )
+: UNSUPPORTED-FILE-JSON+ ( ^u8 n ^u8 n ^u8 n -- )
    {: l:^ lu:n d:^ du:n r:^ ru:n :}
    S\" {\q.tag\q:\qfile\q" SB-APPEND l lu d du PATHS+
    S\" ,\qrev\q:" SB-APPEND r ru QUOTED+
@@ -3004,10 +3013,12 @@ XS-SIZE BUFFER: XS
    {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
    noops 1 T= blocked 0 T= ;
 
-: STALE-UPLOADED ( report -- )
+\ The report's planned, replayed and blocked counts are p, r and b.
+: COUNTED ( report n n n -- )
+   {: p:n r:n b:n :}
    RECONCILE-REPORT:UNMAKE
    {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
-   planned 1 T= replayed 1 T= blocked 0 T= ;
+   planned p T= replayed r T= blocked b T= ;
 
 : STALE-BLOCKED ( report -- )
    RECONCILE-REPORT:UNMAKE
@@ -3018,11 +3029,10 @@ XS-SIZE BUFFER: XS
 \ empty continuations; the fake holds it for the upload.
 : MATCHING-PAGES ( ^ARENA:arena -- )
    {: ar :}
-   MATCHING$ ar IDENTITY {: h:DROPBOX:hash :}
-   [: s" /file.txt" s" /file.txt" s" current-revision" h FILE-JSON+ ;]
-   ar ENTRIES s" matching-current" false PAGE
-   s" matching-stable" STALE-EMPTY-PAGE
-   s" after-local-edit" STALE-EMPTY-PAGE
+   s" file.txt" s" current-revision" MATCHING$ s" matching-current" ar
+   LISTED-ALONE
+   s" matching-stable" ar EMPTY-PAGE
+   s" after-local-edit" ar EMPTY-PAGE
    s" file.txt" s" current-revision" MATCHING$ ar FILE-AT ;
 
 : MATCHING-SEEN$ ( -- ^u8 n )
@@ -3043,20 +3053,12 @@ XS-SIZE BUFFER: XS
    x s" file.txt" MATCHING$ s" current-revision" ar REMOTE-FILE
    BASELINE-AT
    x rec PASSED COMPLETE STALE-NOOPED
-   x s" file.txt" IN-ROOT str> LATER-EDIT$ FS:WRITE-ALL
-   x rec PASSED COMPLETE STALE-UPLOADED
+   x s" file.txt" IN-ROOT str> LOCAL-EDIT$ FS:WRITE-ALL
+   x rec PASSED COMPLETE 1 1 0 COUNTED
    x PENDING-OF VEC:COUNT 0 T=
-   x s" file.txt" LATER-EDIT$ s" 01701" ar REMOTE-FILE BASELINE-AT
+   x s" file.txt" LOCAL-EDIT$ s" 01701" ar REMOTE-FILE BASELINE-AT
    TEST-DROPBOX:SEEN$ MATCHING-SEEN$ T$=
    d x STEP-GONE ;
-
-\ The upload's argument for file.txt as DROPBOX writes it, content h.
-: STALE-UPLOAD-ARG$ ( DROPBOX:hash -- ^u8 n )
-   {: h:DROPBOX:hash :}
-   SB-RESET S\" {\qpath\q:\q/file.txt\q,\qmode\q:\qadd\q," SB-APPEND
-   S\" \qautorename\q:false,\qstrict_conflict\q:true," SB-APPEND
-   S\" \qcontent_hash\q:\q" SB-APPEND
-   h DROPBOX:HASH>STR str> SB-APPEND S\" \q}" SB-APPEND SB$ ;
 
 : A-CHANGED-SAFE-OPERATION-REPLACES-A-STALE-INSTALL-IN-THE-SAME-PASS
    ( ^ARENA:arena -- )
@@ -3065,12 +3067,12 @@ XS-SIZE BUFFER: XS
    T-LABEL
    TEST-DROPBOX:RESET
    STALE-LOCAL$ ar STALE-FILE {: d:str x rec:str :}
-   s" remote-absent" STALE-EMPTY-PAGE
-   x rec PASSED COMPLETE STALE-UPLOADED
+   s" remote-absent" ar EMPTY-PAGE
+   x rec PASSED COMPLETE 1 1 0 COUNTED
    x PENDING-OF VEC:COUNT 0 T=
    x s" file.txt" STALE-LOCAL$ s" 01701" ar REMOTE-FILE BASELINE-AT
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/upload" T$=
-   TEST-DROPBOX:ARG-SENT$ STALE-LOCAL$ ar IDENTITY STALE-UPLOAD-ARG$ T$=
+   s" /file.txt" STALE-LOCAL$ ar UPLOAD-SENT
    d x STEP-GONE ;
 
 : AN-UNKNOWN-OBSERVATION-DOES-NOT-RETIRE-A-STALE-INSTALL
@@ -3080,7 +3082,7 @@ XS-SIZE BUFFER: XS
    TEST-DROPBOX:RESET
    STALE-LOCAL$ ar STALE-FILE {: d:str x rec:str :}
    [: s" /file.txt" s" /file.txt" s" unsupported-revision"
-      UNSUPPORTED-JSON+ ;]
+      UNSUPPORTED-FILE-JSON+ ;]
    ar ENTRIES s" remote-unknown" false PAGE
    x rec PASSED COMPLETE STALE-BLOCKED
    x PENDING-OF VEC:COUNT 1 T=
@@ -3109,7 +3111,7 @@ XS-SIZE BUFFER: XS
    d x PASS-READY {: rec:str :}
    x OBSOLETE-STAGE {: sp:str :}
    x s" removed.txt" STALE-INSTALL
-   s" both-absent" STALE-EMPTY-PAGE
+   s" both-absent" ar EMPTY-PAGE
    x rec PASSED COMPLETE drop
    x PENDING-OF VEC:COUNT 0 T=
    x s" removed.txt" NO-BASELINE? TTRUE
@@ -3141,6 +3143,12 @@ XS-SIZE BUFFER: XS
       blocked OF true ENDOF
    ;MATCH ;
 
+\ Plan id blocked for the reason until the second at.
+: BLOCKED-UNTIL ( ^run JOURNAL:plan-id MODEL:blockage n -- )
+   {: x id why at:n :}
+   x RUN-JOURNAL @ id why at x RUN-ARENA @ JOURNAL:BLOCK-PLAN
+   PLAN-BLOCKED? TTRUE ;
+
 : BLOCKED-STATUS? ( JOURNAL:plan-record -- bool )
    STATUS-OF MATCH JOURNAL:plan-status
       pending OF false ENDOF
@@ -3154,16 +3162,8 @@ XS-SIZE BUFFER: XS
    ( ^run ^u8 n MODEL:remote n -- JOURNAL:plan-record )
    {: x a:^ u:n rem at:n :}
    x a u rem INSTALLING {: p :}
-   x RUN-JOURNAL @ p ID-OF 409 MODEL-BLOCKAGE:DOWNLOAD-UNAVAILABLE at
-   x RUN-ARENA @ JOURNAL:BLOCK-PLAN PLAN-BLOCKED? TTRUE
+   x p ID-OF 409 MODEL-BLOCKAGE:DOWNLOAD-UNAVAILABLE at BLOCKED-UNTIL
    p ;
-
-\ The one listing page, cursor k: /<p> at rev v with b's identity.
-: LISTED-ALONE ( ^u8 n ^u8 n ^u8 n ^u8 n ^ARENA:arena -- )
-   {: p:^ pu:n v:^ vu:n b:^ bu:n k:^ ku:n ar :}
-   b bu ar IDENTITY {: h:DROPBOX:hash :}
-   SB-RESET s" /" SB-APPEND p pu SB-APPEND SB$ ar COPIED {: l:str :}
-   [: l str> l str> v vu h FILE-JSON+ ;] ar ENTRIES k ku false PAGE ;
 
 : INDEPENDENT-UPLOAD$ ( -- ^u8 n ) s" independent upload" ;
 : INDEPENDENT-DOWNLOAD$ ( -- ^u8 n ) s" independent download" ;
@@ -3420,22 +3420,6 @@ XS-SIZE BUFFER: XS
 
 \ ---- uploads against the fake Dropbox ------------------------------
 
-\ An empty listing page with the cursor k.
-: EMPTY-LISTING ( ^u8 n ^ARENA:arena -- )
-   {: k:^ ku:n ar :}
-   [: ;] ar ENTRIES k ku false PAGE ;
-
-\ The last upload's argument as DROPBOX writes it for b at path p. The
-\ fake commits only a body that hashes to it: Rust's body assert.
-: UPLOAD-SENT ( ^u8 n ^u8 n ^ARENA:arena -- )
-   {: p:^ u:n b:^ bu:n ar :}
-   b bu ar IDENTITY DROPBOX:HASH>STR str> {: h:^ hu:n :}
-   SB-RESET S\" {\qpath\q:\q" SB-APPEND p u SB-APPEND
-   S\" \q,\qmode\q:\qadd\q,\qautorename\q:false," SB-APPEND
-   S\" \qstrict_conflict\q:true,\qcontent_hash\q:\q" SB-APPEND
-   h hu SB-APPEND S\" \q}" SB-APPEND
-   TEST-DROPBOX:ARG-SENT$ SB$ T$= ;
-
 \ Rust's planned_operations: the decision's operation as a plan.
 : PLANNED-OPERATIONS
    ( MODEL:decision ^ARENA:arena -- JOURNAL:operation-plan )
@@ -3467,20 +3451,9 @@ XS-SIZE BUFFER: XS
    x p u MODEL-BASELINE:ABSENT c MODEL-LOCAL:MAKE LOCAL-PRESENT
    REMOTE-ABSENT RECORD-FIXTURE-PLAN ;
 
-\ Holds plan p blocked for the reason w until at, seconds since the
-\ epoch.
-: BLOCKED-FOR ( ^run JOURNAL:plan-record MODEL:blockage n -- )
-   {: x p w at:n :}
-   x RUN-JOURNAL @ p ID-OF w at x RUN-ARENA @ JOURNAL:BLOCK-PLAN
-   MATCH JOURNAL:plan-block
-      not-found OF false ENDOF
-      already-completed OF false ENDOF
-      blocked OF true ENDOF
-   ;MATCH TTRUE ;
-
-\ Rust's RemoteRejected { tag: "disallowed_name" }.
-: DISALLOWED ( -- MODEL:blockage )
-   s" disallowed_name" >str MODEL-BLOCKAGE:REMOTE-REJECTED ;
+\ Rust's RemoteRejected { tag }.
+: REJECTED-AS ( ^u8 n -- MODEL:blockage )
+   >str MODEL-BLOCKAGE:REMOTE-REJECTED ;
 
 : UPLOAD-STAGED? ( LOCAL:stage-outcome<^LOCAL:staged-upload> -- bool )
    MATCH LOCAL:stage-outcome
@@ -3507,10 +3480,9 @@ XS-SIZE BUFFER: XS
 \ upload commits it.
 : REPAIR-PAGES ( ^ARENA:arena -- )
    {: ar :}
-   s" occupied-upload-stage" ar EMPTY-LISTING
-   REPAIR$ ar IDENTITY {: h:DROPBOX:hash :}
-   [: s" /occupied.txt" s" /occupied.txt" s" 01701" h FILE-JSON+ ;]
-   ar ENTRIES s" repaired-upload-stage" false PAGE ;
+   s" occupied-upload-stage" ar EMPTY-PAGE
+   s" occupied.txt" s" 01701" REPAIR$ s" repaired-upload-stage" ar
+   LISTED-ALONE ;
 
 \ occupied.txt in the root, its upload stage holding other bytes.
 : CORRUPT-STAGED ( ^run -- )
@@ -3526,7 +3498,7 @@ XS-SIZE BUFFER: XS
    {: d:str x :}
    x s" occupied.txt" REPAIR$ x RUN-ARENA @ IDENTITY UPLOAD-PLANNED
    {: p :}
-   x p MODEL-BLOCKAGE:STAGE-OCCUPIED 0 BLOCKED-FOR
+   x p ID-OF MODEL-BLOCKAGE:STAGE-OCCUPIED 0 BLOCKED-UNTIL
    d x REOPENED
    x BLOCKED-OF VEC:COUNT 1 T= ;
 
@@ -3602,7 +3574,7 @@ XS-SIZE BUFFER: XS
 : SPECIAL-UPLOAD-STAGE-BLOCKS-ONLY-ITS-PLAN ( ^ARENA:arena -- )
    {: ar :}
    s" special_upload_stage_blocks_only_its_plan" T-LABEL
-   TEST-DROPBOX:RESET s" special-upload-stage" ar EMPTY-LISTING
+   TEST-DROPBOX:RESET s" special-upload-stage" ar EMPTY-PAGE
    ar STEP-RUN {: d:str x :}
    d x PASS-READY {: rec:str :}
    x SPECIAL-STAGED {: sp:str :}
@@ -3626,7 +3598,8 @@ XS-SIZE BUFFER: XS
    f str> OLD-UPLOAD$ FS:WRITE-ALL
    x s" changed.txt" OLD-UPLOAD$ x RUN-ARENA @ IDENTITY UPLOAD-PLANNED
    {: p :}
-   x p DISALLOWED 4000000000 BLOCKED-FOR
+   x p ID-OF s" disallowed_name" REJECTED-AS 4000000000
+   BLOCKED-UNTIL
    f str> NEW-UPLOAD$ FS:WRITE-ALL ;
 
 : CHANGED-REPORT ( report -- )
@@ -3638,7 +3611,7 @@ XS-SIZE BUFFER: XS
    ( ^ARENA:arena -- )
    {: ar :}
    s" changed_upload_supersedes_a_rejected_plan_before_deadline" T-LABEL
-   TEST-DROPBOX:RESET s" changed-upload" ar EMPTY-LISTING
+   TEST-DROPBOX:RESET s" changed-upload" ar EMPTY-PAGE
    ar STEP-RUN {: d:str x :}
    d x PASS-READY {: rec:str :}
    x REJECTED-CHANGE
@@ -3657,22 +3630,17 @@ XS-SIZE BUFFER: XS
    s" missing-target" x s" unknown.txt" IN-ROOT str> FS:MAKE-SYMLINK
    x s" unknown.txt" s" unreadable upload" x RUN-ARENA @ IDENTITY
    UPLOAD-PLANNED {: p :}
-   x p DISALLOWED 0 BLOCKED-FOR
+   x p ID-OF s" disallowed_name" REJECTED-AS 0 BLOCKED-UNTIL
    p ;
-
-: UNKNOWN-REPORT ( report -- )
-   RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
-   blocked 1 T= ;
 
 : UNKNOWN-LOCAL-STATE-KEEPS-A-REJECTED-UPLOAD-BLOCKED ( ^ARENA:arena -- )
    {: ar :}
    s" unknown_local_state_keeps_a_rejected_upload_blocked" T-LABEL
-   TEST-DROPBOX:RESET s" unknown-rejected-upload" ar EMPTY-LISTING
+   TEST-DROPBOX:RESET s" unknown-rejected-upload" ar EMPTY-PAGE
    ar STEP-RUN {: d:str x :}
    d x PASS-READY {: rec:str :}
    x UNKNOWN-REJECTED {: p :}
-   x rec PASSED COMPLETE UNKNOWN-REPORT
+   x rec PASSED COMPLETE STALE-BLOCKED
    x BLOCKED-OF 0 VEC:AT @ ID-OF JOURNAL:PLAN-ID>N
    p ID-OF JOURNAL:PLAN-ID>N T=
    x PENDING-OF VEC:COUNT 0 T=
@@ -3690,9 +3658,8 @@ XS-SIZE BUFFER: XS
 \ it.
 : STALE-PAGE ( ^ARENA:arena -- )
    {: ar :}
-   OTHER-BYTES$ ar IDENTITY {: h:DROPBOX:hash :}
-   [: s" /other.txt" s" /other.txt" s" 01701" h FILE-JSON+ ;]
-   ar ENTRIES s" stale-upload" false PAGE ;
+   s" other.txt" s" 01701" OTHER-BYTES$ s" stale-upload" ar
+   LISTED-ALONE ;
 
 \ file.txt and other.txt in the root, each with an upload plan,
 \ file.txt's for bytes it no longer holds.
@@ -3704,8 +3671,8 @@ XS-SIZE BUFFER: XS
    x s" file.txt" PLANNED-BYTES$ ar IDENTITY UPLOAD-PLANNED drop
    x s" other.txt" OTHER-BYTES$ ar IDENTITY UPLOAD-PLANNED drop ;
 
-\ Rust's replay_remote_operations over the run.
-: REMOTE-REPLAY ( ^run -- ^REPLAY:replay-report )
+\ Rust's replay_remote_operations below the run's root.
+: REMOTE-REPLAYED ( ^run -- ^REPLAY:replay-report )
    {: x :}
    x ROOT$ s" open test root" LOCAL:OPEN-ROOT {: root:fd :}
    [: x RUN-JOURNAL @ x RUN-LINK @ root x ROOT$ x STAGING$
@@ -3732,17 +3699,12 @@ XS-SIZE BUFFER: XS
 : STALE-REPLAYED ( ^run -- )
    {: x :}
    x RUN-ARENA @ {: ar :}
-   x REMOTE-REPLAY {: rep :}
+   x REMOTE-REPLAYED {: rep :}
    rep COMPLETED 1 T=
    rep BLOCKS VEC:COUNT 1 T=
    rep BLOCKS 0 VEC:AT @ FRESH-AT$ s" file.txt" T$=
    x PENDING-OF VEC:COUNT 0 T=
    x s" other.txt" OTHER-BYTES$ s" 01701" ar REMOTE-FILE BASELINE-AT ;
-
-: STALE-REPORT ( report -- )
-   RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
-   planned 1 T= replayed 1 T= blocked 0 T= ;
 
 : STALE-UPLOAD-IS-SUPERSEDED-AND-CURRENT-BYTES-SYNC ( ^ARENA:arena -- )
    {: ar :}
@@ -3753,7 +3715,7 @@ XS-SIZE BUFFER: XS
    x STALE-PLANNED
    x STALE-REPLAYED
    s" /other.txt" OTHER-BYTES$ ar UPLOAD-SENT
-   x rec PASSED COMPLETE STALE-REPORT
+   x rec PASSED COMPLETE 1 1 0 COUNTED
    x PENDING-OF VEC:COUNT 0 T=
    x s" file.txt" CHANGED-BYTES$ s" 01702" ar REMOTE-FILE BASELINE-AT
    TEST-DROPBOX:SEEN$ STALE-SEEN$ T$=
@@ -3789,15 +3751,20 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
       unreadable-file OF true ENDOF
    ;MATCH ;
 
+\ The no-op decision's baseline, recorded at p.
+: SEEDED-NOOP ( ^run ^u8 n MODEL:decision -- )
+   {: x p:^ u:n dec :}
+   dec NOOP-BASELINE {: b :}
+   x RUN-JOURNAL @ p u DISPLAY b x RUN-ARENA @ JOURNAL:RECORD-NOOP
+   NOOP-RECORDED? TTRUE ;
+
 \ Rust's seed_baseline: path p in sync at rem.
 : SEED-BASELINE ( ^run ^u8 n MODEL:remote -- )
    {: x p:^ u:n rem :}
    rem MODEL-REMOTE:UNMAKE {: c v :}
    rem MODEL-BASELINE:PRESENT c MODEL-LOCAL:MAKE LOCAL-PRESENT
-   rem REMOTE-PRESENT MODEL-SUBTREE:EMPTY PLANNER:PLAN NOOP-BASELINE
-   {: b :}
-   x RUN-JOURNAL @ p u DISPLAY b x RUN-ARENA @ JOURNAL:RECORD-NOOP
-   NOOP-RECORDED? TTRUE ;
+   rem REMOTE-PRESENT MODEL-SUBTREE:EMPTY PLANNER:PLAN {: dec :}
+   x p u dec SEEDED-NOOP ;
 
 \ Rust's plan(Present(old), Present(local c), Present(old), Empty),
 \ recorded at path p: one upload over old.
@@ -3819,23 +3786,10 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    {: x p:^ u:n side b:^ bu:n :}
    x p u side b bu x RUN-ARENA @ CONFLICT-COPY-PATH IN-ROOT ;
 
-\ Rust's replay_remote_operations over the run's pending plans.
-: REMOTE-OPERATIONS-REPLAYED ( ^run -- ^REPLAY:replay-report )
-   {: x :}
-   x ROOT$ s" open test root" LOCAL:OPEN-ROOT {: root:fd :}
-   [: x RUN-JOURNAL @ x RUN-LINK @ root x ROOT$ x STAGING$
-      x RUN-ARENA @ REPLAY:REPLAY-REMOTE-OPERATIONS-AT ;]
-   [: root FS:CLOSE-DIR ;] finally ;
-
 : COPY-CONFLICTS ( report -- n )
    RECONCILE-REPORT:UNMAKE
    {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
    conflicts ;
-
-: COPY-BLOCKED ( report -- n )
-   RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
-   blocked ;
 
 : CONFLICTS-OF ( ^run -- ^VEC:vector<JOURNAL:conflict-record> )
    {: x :}
@@ -3877,12 +3831,6 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    p HELD-FOR$ s" conflict-copy-occupied" T$=
    p ;
 
-\ Plan id blocked for why until the epoch second at.
-: HELD-UNTIL ( ^run JOURNAL:plan-id MODEL:blockage n -- )
-   {: x id why at:n :}
-   x RUN-JOURNAL @ id why at x RUN-ARENA @ JOURNAL:BLOCK-PLAN
-   PLAN-BLOCKED? TTRUE ;
-
 \ Whether the request q is the one at offset at of the requests p.
 : TOKEN-AT? ( ^u8 n n ^u8 n -- bool )
    {: p:^ u:n at:n q:^ qu:n :}
@@ -3902,9 +3850,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
 : REPLACE-LISTED ( ^u8 n ^ARENA:arena -- )
    {: k:^ ku:n ar :}
    s" replace.txt" s" current-rev" NEW-REMOTE$ ar SERVES
-   NEW-REMOTE$ ar IDENTITY {: h:DROPBOX:hash :}
-   [: s" /replace.txt" s" /replace.txt" s" current-rev" h FILE-JSON+ ;]
-   ar ENTRIES k ku false PAGE ;
+   s" replace.txt" s" current-rev" NEW-REMOTE$ k ku ar LISTED-ALONE ;
 
 \ replace.txt holds new local bytes over a baseline at old-rev, and its
 \ upload is planned; the plan.
@@ -3946,7 +3892,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
 \ occupant and replace.txt are kept.
 : COPY-REPLAY-BLOCKED ( ^run copy-occupant -- JOURNAL:plan-record )
    {: x o :}
-   x REMOTE-OPERATIONS-REPLAYED {: rep :}
+   x REMOTE-REPLAYED {: rep :}
    rep COMPLETED 0 T=
    rep BLOCKS VEC:COUNT 1 T=
    rep s" durable-plan replace.txt conflict-copy-occupied" REPORTS?
@@ -3963,7 +3909,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x LOCAL-COPY str> FS:REMOVE-FILE
    x rec PASSED COMPLETE {: waiting :}
    waiting COPY-CONFLICTS 0 T=
-   waiting COPY-BLOCKED 1 T=
+   waiting BLOCKED-IN 1 T=
    x COPY-HELD drop
    x LOCAL-COPY str> FS:EXISTS? TFALSE
    x CONFLICTS-OF VEC:COUNT 0 T= ;
@@ -3982,7 +3928,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x o COPY-REPLAY-BLOCKED ID-OF {: id :}
    x rec COPY-WAITS
    \ A due block is prepared again and places both copies.
-   x id MODEL-BLOCKAGE:CONFLICT-COPY-OCCUPIED 0 HELD-UNTIL
+   x id MODEL-BLOCKAGE:CONFLICT-COPY-OCCUPIED 0 BLOCKED-UNTIL
    x rec PASSED COMPLETE COPY-CONFLICTS 1 T=
    x REPLACE-PREPARED
    TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata "
@@ -4014,9 +3960,8 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    {: x k:^ ku:n :}
    x RUN-ARENA @ {: ar :}
    s" c-diverged.txt" s" rev-remote" DIVERGED-REMOTE$ ar FILE-AT
-   DIVERGED-REMOTE$ ar IDENTITY {: h:DROPBOX:hash :}
-   [: s" /c-diverged.txt" s" /c-diverged.txt" s" rev-remote" h
-      FILE-JSON+ ;] ar ENTRIES k ku false PAGE
+   s" c-diverged.txt" s" rev-remote" DIVERGED-REMOTE$ k ku ar
+   LISTED-ALONE
    x s" c-diverged.txt" IN-ROOT str> DIVERGED-LOCAL$ FS:WRITE-ALL
    x s" c-diverged.txt" SHARED$ s" rev-old" ar REMOTE-FILE
    SEED-BASELINE ;
@@ -4056,7 +4001,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x UNRELATED-WRITTEN
    x rec PASSED COMPLETE {: second :}
    second COPY-CONFLICTS 0 T=
-   second COPY-BLOCKED 0 T=
+   second BLOCKED-IN 0 T=
    rc EDITED-COPY$ HOLDS-BYTES
    lc DIVERGED-LOCAL$ HOLDS-BYTES
    x CONFLICTS-OF recorded CONFLICTS= TTRUE
@@ -4071,7 +4016,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
 \ conflict recorded, while d-unrelated.txt syncs as rev v.
 : DIVERGED-HELD ( ^run report ^u8 n -- )
    {: x rep v:^ vu:n :}
-   rep COPY-BLOCKED 1 T=
+   rep BLOCKED-IN 1 T=
    x CONFLICTS-OF VEC:COUNT 0 T=
    x s" c-diverged.txt" IN-ROOT DIVERGED-LOCAL$ HOLDS-BYTES
    x s" c-diverged.txt" SHARED$ s" rev-old" x RUN-ARENA @ REMOTE-FILE
@@ -4109,10 +4054,10 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    s" cursor-size" ar REPLACE-LISTED
    x REPLACE-PLANNED ID-OF {: id :}
    x id MODEL-BLOCKAGE:UNSUPPORTED-FILE-SIZE $7FFFFFFFFFFFFFFF
-   HELD-UNTIL
+   BLOCKED-UNTIL
    x rec PASSED COMPLETE {: rep :}
    rep COPY-CONFLICTS 1 T=
-   rep COPY-BLOCKED 0 T=
+   rep BLOCKED-IN 0 T=
    x REPLACE-PREPARED
    s" /2/files/upload" SEEN-COUNT 0 T=
    d x STEP-GONE ;
@@ -4147,13 +4092,6 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
 
 \ ---- restricted and same-named entries against the fake Dropbox ----
 
-\ The no-op decision's baseline, recorded at p.
-: SEEDED-NOOP ( ^run ^u8 n MODEL:decision -- )
-   {: x p:^ u:n dec :}
-   dec NOOP-BASELINE {: b :}
-   x RUN-JOURNAL @ p u DISPLAY b x RUN-ARENA @ JOURNAL:RECORD-NOOP
-   NOOP-RECORDED? TTRUE ;
-
 \ Rust's seed_directory_baseline.
 : SEED-DIRECTORY-BASELINE ( ^run ^u8 n -- )
    {: x p:^ u:n :}
@@ -4167,8 +4105,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    STORED-BASELINE MODEL-BASELINE:DIRECTORY MODEL:BASELINE= TTRUE ;
 
 : NO-CONFLICT-RECORD ( ^run -- )
-   {: x :}
-   x RUN-JOURNAL @ x RUN-ARENA @ JOURNAL:CONFLICTS VEC:COUNT 0 T= ;
+   CONFLICTS-OF VEC:COUNT 0 T= ;
 
 \ Rust's restricted_folder_metadata with no_access.
 : NO-ACCESS-JSON+ ( ^u8 n ^u8 n -- )
@@ -4182,9 +4119,9 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    [: s" /shared" s" /Shared" NO-ACCESS-JSON+ ;] ar ENTRIES
    k ku false PAGE ;
 
-: FOLDER-MADE-IN ( ^run ^u8 n -- ) IN-ROOT str> FS:MAKE-DIR ;
+: MKDIR-IN ( ^run ^u8 n -- ) IN-ROOT str> FS:MAKE-DIR ;
 
-: BYTES-WRITTEN-IN ( ^run ^u8 n ^u8 n -- )
+: WRITE-IN ( ^run ^u8 n ^u8 n -- )
    {: x p:^ u:n b:^ bu:n :}
    x p u IN-ROOT str> b bu FS:WRITE-ALL ;
 
@@ -4198,8 +4135,8 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    s" cursor-inaccessible" ar NO-ACCESS-PAGE
    ar STEP-RUN {: d:str x :}
    d x PASS-READY {: rec:str :}
-   x s" Shared" FOLDER-MADE-IN
-   x s" Shared/notes.txt" BENEATH$ BYTES-WRITTEN-IN
+   x s" Shared" MKDIR-IN
+   x s" Shared/notes.txt" BENEATH$ WRITE-IN
    x s" Shared/notes.txt" notes SEED-BASELINE
    x rec PASSED COMPLETE drop
    x s" Shared/notes.txt" IN-ROOT BENEATH$ HOLDS-BYTES
@@ -4228,15 +4165,15 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
 \ and keep edited in the root.
 : OBSERVED-BEFORE ( ^run MODEL:remote MODEL:remote -- )
    {: x notes keep :}
-   x s" Shared" FOLDER-MADE-IN
-   x s" Shared/notes.txt" BEFORE-NOTES$ BYTES-WRITTEN-IN
-   x s" Shared/keep.txt" BEFORE-KEEP$ BYTES-WRITTEN-IN
+   x s" Shared" MKDIR-IN
+   x s" Shared/notes.txt" BEFORE-NOTES$ WRITE-IN
+   x s" Shared/keep.txt" BEFORE-KEEP$ WRITE-IN
    x s" Shared" SEED-DIRECTORY-BASELINE
    x s" Shared/notes.txt" notes SEED-BASELINE
    x s" Shared/keep.txt" keep SEED-BASELINE
    x notes keep ACCESSIBLE
    x s" Shared/notes.txt" IN-ROOT str> FS:REMOVE-FILE
-   x s" Shared/keep.txt" EDITED-KEEP$ BYTES-WRITTEN-IN ;
+   x s" Shared/keep.txt" EDITED-KEEP$ WRITE-IN ;
 
 : NEWLY-RESTRICTED-FOLDER-DROPS-STALE-CHILD-RECORDS ( ^ARENA:arena -- )
    {: ar :}
@@ -4294,8 +4231,8 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
 : SIBLINGS ( str ^run MODEL:remote -- str )
    {: d:str x shared :}
    d x PASS-READY {: rec:str :}
-   x s" report" FOLDER-MADE-IN
-   x s" report.txt" SHARED-SIBLING$ BYTES-WRITTEN-IN
+   x s" report" MKDIR-IN
+   x s" report.txt" SHARED-SIBLING$ WRITE-IN
    x s" report" SEED-DIRECTORY-BASELINE
    x s" report.txt" shared SEED-BASELINE
    x s" report/x" shared SEED-BASELINE
@@ -4351,7 +4288,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    SHARED-SIBLING$ ar IDENTITY false ar SIBLING-PAGE
    ar STEP-RUN {: d:str x :}
    d x shared SIBLINGS {: rec:str :}
-   x s" report/x" SHARED-SIBLING$ BYTES-WRITTEN-IN
+   x s" report/x" SHARED-SIBLING$ WRITE-IN
    x rec PASSED COMPLETE SIBLING-REPORTS
    x s" report/x" IN-ROOT str> FS:EXISTS? TFALSE
    x s" report/x" NO-BASELINE? TTRUE
@@ -4390,7 +4327,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    s" report/x" s" rev-sibling" SHARED-SIBLING$ ar FILE-AT
    ar STEP-RUN {: d:str x :}
    d x shared SIBLINGS {: rec:str :}
-   x s" report/x" SIBLING-EDIT$ BYTES-WRITTEN-IN
+   x s" report/x" SIBLING-EDIT$ WRITE-IN
    x rec PASSED COMPLETE SIBLING-REPORTS
    x NO-CONFLICT-RECORD
    x NO-CONFLICT-COPY
@@ -4401,7 +4338,6 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    d x STEP-GONE ;
 
 : SECRET$ ( -- ^u8 n ) s" secret baseline bytes" ;
-: OPEN-UPLOAD$ ( -- ^u8 n ) s" sibling upload" ;
 \ 0700, Rust's allow_owner_access.
 $1C0 constant OWNER-ACCESS
 
@@ -4421,9 +4357,9 @@ $1C0 constant OWNER-ACCESS
    [: s" /locked" s" /locked" FOLDER-JSON+ COMMA+
       s" /locked/secret.txt" s" /locked/secret.txt" s" rev-secret" h
       FILE-JSON+ ;] ar ENTRIES s" cursor-locked" false PAGE
-   x s" locked" FOLDER-MADE-IN
-   x s" locked/secret.txt" SECRET$ BYTES-WRITTEN-IN
-   x s" open.txt" OPEN-UPLOAD$ BYTES-WRITTEN-IN
+   x s" locked" MKDIR-IN
+   x s" locked/secret.txt" SECRET$ WRITE-IN
+   x s" open.txt" SIBLING$ WRITE-IN
    x s" locked" SEED-DIRECTORY-BASELINE
    x s" locked/secret.txt" secret SEED-BASELINE ;
 
@@ -4445,7 +4381,7 @@ $1C0 constant OWNER-ACCESS
    x s" locked" FOLDER-BASELINE-AT
    x s" locked/secret.txt" secret BASELINE-AT
    \ The fake's upload answers rev 01701 for Rust's scripted rev-open.
-   x s" open.txt" OPEN-UPLOAD$ s" 01701" ar REMOTE-FILE BASELINE-AT
+   x s" open.txt" SIBLING$ s" 01701" ar REMOTE-FILE BASELINE-AT
    x s" locked/secret.txt" IN-ROOT SECRET$ HOLDS-BYTES
    x NO-CONFLICT-RECORD
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2" CONTAINS? TFALSE
@@ -4464,8 +4400,6 @@ $1C0 constant OWNER-ACCESS
 
 \ ---- edits and directories against the fake Dropbox ---------------
 
-: EDIT-BASE$ ( -- ^u8 n ) s" shared baseline" ;
-: LOCAL-EDIT$ ( -- ^u8 n ) s" later local edit" ;
 : REMOTE-EDIT$ ( -- ^u8 n ) s" later Dropbox edit" ;
 
 \ For CONFLICT-BYTES: the name from at in the root's names ns, its
@@ -4533,21 +4467,15 @@ $1C0 constant OWNER-ACCESS
    s" /2/files/upload" SENT-TO 0 T=
    s" /2/files/delete_v2" SENT-TO 0 T= ;
 
-\ The baseline at path p is a directory.
-: DIRECTORY-AT ( ^run ^u8 n -- )
-   {: x p:^ u:n :}
-   x RUN-JOURNAL @ p u DISPLAY x RUN-ARENA @ JOURNAL:BASELINE
-   STORED-BASELINE MODEL-BASELINE:DIRECTORY MODEL:BASELINE= TTRUE ;
-
 \ Rust's local files: a edited here, b as the baseline, c diverged;
 \ each path's baseline the shared one at rev-old.
 : EDITS-LOCAL ( ^run -- )
    {: x :}
    x RUN-ARENA @ {: ar :}
    x s" a-local-update.txt" IN-ROOT str> LOCAL-EDIT$ FS:WRITE-ALL
-   x s" b-remote-update.txt" IN-ROOT str> EDIT-BASE$ FS:WRITE-ALL
+   x s" b-remote-update.txt" IN-ROOT str> SHARED$ FS:WRITE-ALL
    x s" c-diverged.txt" IN-ROOT str> DIVERGED-LOCAL$ FS:WRITE-ALL
-   EDIT-BASE$ s" rev-old" ar REMOTE-FILE {: old :}
+   SHARED$ s" rev-old" ar REMOTE-FILE {: old :}
    x s" a-local-update.txt" old SEED-BASELINE
    x s" b-remote-update.txt" old SEED-BASELINE
    x s" c-diverged.txt" old SEED-BASELINE ;
@@ -4556,10 +4484,10 @@ $1C0 constant OWNER-ACCESS
 \ listing page; b and c served.
 : EDITS-REMOTE ( ^ARENA:arena -- )
    {: ar :}
-   s" a-local-update.txt" s" rev-old" EDIT-BASE$ ar FILE-AT
+   s" a-local-update.txt" s" rev-old" SHARED$ ar FILE-AT
    s" b-remote-update.txt" s" rev-remote-update" REMOTE-EDIT$ ar SERVES
    s" c-diverged.txt" s" rev-remote-conflict" DIVERGED-REMOTE$ ar SERVES
-   EDIT-BASE$ ar IDENTITY {: ho:DROPBOX:hash :}
+   SHARED$ ar IDENTITY {: ho:DROPBOX:hash :}
    REMOTE-EDIT$ ar IDENTITY {: hb:DROPBOX:hash :}
    DIVERGED-REMOTE$ ar IDENTITY {: hc:DROPBOX:hash :}
    [: s" /a-local-update.txt" 2dup s" rev-old" ho FILE-JSON+ COMMA+
@@ -4638,7 +4566,7 @@ $1C0 constant OWNER-ACCESS
    BASELINE-AT
    x s" b-remote-update.txt" REMOTE-EDIT$ s" rev-remote-update" ar
    REMOTE-FILE BASELINE-AT
-   x s" c-diverged.txt" EDIT-BASE$ s" rev-old" ar REMOTE-FILE BASELINE-AT
+   x s" c-diverged.txt" SHARED$ s" rev-old" ar REMOTE-FILE BASELINE-AT
    x DIVERGENT-CONFLICT x BOTH-SIDES
    x PENDING-OF VEC:COUNT 0 T=
    x RUN-JOURNAL @ ar JOURNAL:PENDING-RECOVERIES VEC:COUNT 0 T=
@@ -4659,15 +4587,8 @@ $1C0 constant OWNER-ACCESS
    x s" local-deleted.txt" old SEED-BASELINE
    x s" dropbox-deleted.txt" old SEED-BASELINE
    s" local-deleted.txt" s" rev-delete-baseline" DELETE-BASE$ ar FILE-AT
-   DELETE-BASE$ ar IDENTITY {: h:DROPBOX:hash :}
-   [: s" /local-deleted.txt" 2dup s" rev-delete-baseline" h
-      FILE-JSON+ ;]
-   ar ENTRIES s" cursor-after-deletions" false PAGE ;
-
-: DELETIONS-REPORTED ( report -- )
-   RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
-   planned 2 T= replayed 2 T= blocked 0 T= conflicts 0 T= ;
+   s" local-deleted.txt" s" rev-delete-baseline" DELETE-BASE$
+   s" cursor-after-deletions" ar LISTED-ALONE ;
 
 : DELETE-BODY$ ( -- ^u8 n )
    SB-RESET S\" {\qpath\q:\q/local-deleted.txt\q," SB-APPEND
@@ -4680,7 +4601,7 @@ $1C0 constant OWNER-ACCESS
    ar STEP-RUN {: d:str x :}
    d x PASS-READY {: rec:str :}
    x DELETIONS
-   x rec PASSED COMPLETE DELETIONS-REPORTED
+   x rec PASSED COMPLETE REPORTS
    x s" local-deleted.txt" IN-ROOT str> FS:EXISTS? TFALSE
    x s" dropbox-deleted.txt" IN-ROOT str> FS:EXISTS? TFALSE
    x s" local-deleted.txt" NO-BASELINE? TTRUE
@@ -4694,11 +4615,6 @@ $1C0 constant OWNER-ACCESS
    s" /2/files/delete_v2" SENT-TO 1 T=
    d x STEP-GONE ;
 
-: NESTED-REPORTED ( report -- )
-   RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
-   planned 4 T= replayed 4 T= blocked 0 T= ;
-
 \ Rust's create_folder_v2 answer: the folder p as its metadata.
 : FOLDER-MADE ( ^u8 n -- )
    {: p:^ u:n :}
@@ -4711,7 +4627,7 @@ $1C0 constant OWNER-ACCESS
 : SYNCED-DIRECTORY ( ^run ^u8 n -- )
    {: x p:^ u:n :}
    x p u IN-ROOT str> FS:DIR? TTRUE
-   x p u DIRECTORY-AT ;
+   x p u FOLDER-BASELINE-AT ;
 
 : ONE-RECONCILIATION-PASS-SYNCHRONIZES-EMPTY-AND-NESTED-DIRECTORIES
    ( ^ARENA:arena -- )
@@ -4728,7 +4644,7 @@ $1C0 constant OWNER-ACCESS
    ar ENTRIES s" directories" false PAGE
    s" /local" FOLDER-MADE s" /local" FOLDER-MADE
    s" /local/child" FOLDER-MADE
-   x rec PASSED COMPLETE NESTED-REPORTED
+   x rec PASSED COMPLETE 4 4 0 COUNTED
    x s" local" SYNCED-DIRECTORY
    x s" local/child" SYNCED-DIRECTORY
    x s" remote" SYNCED-DIRECTORY
@@ -4839,7 +4755,7 @@ $1C0 constant OWNER-ACCESS
    x s" Apps/day one" IN-ROOT str> FS:EXISTS? TFALSE
    x s" Apps" IN-ROOT str> READ-BUF READ-CAP FS-LIST:NAMES
    READ-BUF swap s" Day One" T$=
-   x s" apps/day one/journal" DIRECTORY-AT
+   x s" apps/day one/journal" FOLDER-BASELINE-AT
    x rec PASSED COMPLETE 3 SETTLED
    x PENDING-OF VEC:COUNT 0 T=
    UNWRITTEN
@@ -4855,28 +4771,12 @@ $1C0 constant OWNER-ACCESS
 
 \ ---- case collisions against the fake Dropbox ----------------------
 
-\ Rust's planned_operations: an operating decision's one operation.
-: PLANNED-OPERATION ( MODEL:decision -- MODEL:operation )
-   MATCH MODEL:decision
-      noop OF drop s" the decision was a no-op" FAILED ENDOF
-      operate OF ENDOF
-      blocked OF drop s" the decision was blocked" FAILED ENDOF
-      conflicted OF drop s" the decision was a conflict" FAILED ENDOF
-      collided OF drop s" the decision was a collision" FAILED ENDOF
-   ;MATCH ;
-
 : OUTCOME-FRESH? ( outcome -- bool )
    MATCH outcome
       complete OF {: rep :} false ENDOF
       fresh OF true ENDOF
       root-changed OF false ENDOF
    ;MATCH ;
-
-: MKDIR-IN ( ^run ^u8 n -- ) IN-ROOT str> FS:MAKE-DIR ;
-
-: WRITE-IN ( ^run ^u8 n ^u8 n -- )
-   {: x p:^ u:n b:^ bu:n :}
-   x p u IN-ROOT str> b bu FS:WRITE-ALL ;
 
 : EXISTS-IN? ( ^run ^u8 n -- bool ) IN-ROOT str> FS:EXISTS? ;
 
@@ -4930,9 +4830,7 @@ $1C0 constant OWNER-ACCESS
 : CASE-ONLY ( ^run ^ARENA:arena -- MODEL:remote )
    {: x ar :}
    SAME$ s" rev-same" ar REMOTE-FILE {: rem :}
-   SAME$ ar IDENTITY {: h:DROPBOX:hash :}
-   [: s" /report.txt" s" /report.txt" s" rev-same" h FILE-JSON+ ;]
-   ar ENTRIES s" case-only" false PAGE
+   s" report.txt" s" rev-same" SAME$ s" case-only" ar LISTED-ALONE
    x s" Report.TXT" SAME$ WRITE-IN
    x s" Report.TXT" rem SEED-BASELINE
    rem ;
@@ -4991,11 +4889,6 @@ $1C0 constant OWNER-ACCESS
    x s" foo.txt" EXISTS-IN? TFALSE
    x s" foo.txt (case variant)" IN-ROOT SECOND$ HOLDS-BYTES ;
 
-: SYNCED-REPORTS ( report -- )
-   RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
-   planned 2 T= replayed 2 T= blocked 0 T= ;
-
 : TWO-UPLOADS$ ( -- ^u8 n )
    s" /2/files/list_folder /2/files/upload /2/files/upload" ;
 
@@ -5011,7 +4904,7 @@ $1C0 constant OWNER-ACCESS
    x rec PASSED OUTCOME-FRESH? TTRUE
    x VARIANT-RENAMED
    d x REOPENED
-   x rec PASSED COMPLETE SYNCED-REPORTS
+   x rec PASSED COMPLETE 2 2 0 COUNTED
    x PENDING-OF VEC:COUNT 0 T=
    TEST-DROPBOX:SEEN$ TWO-UPLOADS$ T$=
    d x STEP-GONE ;
@@ -5047,12 +4940,8 @@ $1C0 constant OWNER-ACCESS
 \ under baseline and remote rem, recorded at Apps/entry.doentry.
 : STALE-DELETE ( ^run MODEL:remote -- )
    {: x rem :}
-   x RUN-ARENA @ {: ar :}
-   rem MODEL-BASELINE:PRESENT LOCAL-ABSENT rem REMOTE-PRESENT
-   MODEL-SUBTREE:EMPTY PLANNER:PLAN PLANNED-OPERATION ar ONE-PLAN
-   {: plan :}
-   x RUN-JOURNAL @ s" Apps/entry.doentry" DISPLAY plan ar
-   JOURNAL:RECORD-PLAN WRITTEN TTRUE drop ;
+   x s" Apps/entry.doentry" rem MODEL-BASELINE:PRESENT LOCAL-ABSENT
+   rem REMOTE-PRESENT RECORD-FIXTURE-PLAN drop ;
 
 \ Rust's two folder creations, its upload and its download.
 : APPS-SEEN$ ( -- ^u8 n )
@@ -5231,9 +5120,8 @@ $1C0 constant OWNER-ACCESS
 \ symlink Notes.txt beside it.
 : NOTES-BESIDE-LINK ( ^run ^ARENA:arena -- )
    {: x ar :}
-   NOTES$ ar IDENTITY {: h:DROPBOX:hash :}
-   [: s" /notes.txt" s" /notes.txt" s" rev-synced" h FILE-JSON+ ;]
-   ar ENTRIES s" symlink-variant" false PAGE
+   s" notes.txt" s" rev-synced" NOTES$ s" symlink-variant" ar
+   LISTED-ALONE
    x s" notes.txt" NOTES$ WRITE-IN
    x s" Notes.txt" s" symlink-target" LINKS-TO
    x s" notes.txt" NOTES$ s" rev-synced" ar REMOTE-FILE SEED-BASELINE ;
@@ -5320,9 +5208,7 @@ $1C0 constant OWNER-ACCESS
 : NODE-LISTED ( ^u8 n ^u8 n ^u8 n ^ARENA:arena -- )
    {: v:^ vu:n b:^ bu:n k:^ ku:n ar :}
    s" node" v vu b bu ar SERVES
-   b bu ar IDENTITY {: h:DROPBOX:hash :}
-   [: s" /node" s" /node" v vu h FILE-JSON+ ;] ar ENTRIES
-   k ku false PAGE ;
+   s" node" v vu b bu k ku ar LISTED-ALONE ;
 
 \ The next listing page, at cursor k, holding Dropbox's folder /node.
 : NODE-FOLDER-PAGE ( ^u8 n ^ARENA:arena -- )
@@ -5358,10 +5244,6 @@ $1C0 constant OWNER-ACCESS
       some OF KIND-OF ENDOF
    ;MATCH ;
 
-: CONFLICT-COUNT ( ^run -- n )
-   {: x :}
-   x RUN-JOURNAL @ x RUN-ARENA @ JOURNAL:CONFLICTS VEC:COUNT ;
-
 : LOCAL-FILE$ ( -- ^u8 n ) s" local file preserved beside directory" ;
 
 : REMOTE-DIRECTORY-PRESERVES-A-LOCAL-FILE-UNDER-A-SYNCHRONIZED-NAME
@@ -5380,14 +5262,14 @@ $1C0 constant OWNER-ACCESS
    x s" node" IN-ROOT str> FS:EXISTS? TFALSE
    x v str> IN-ROOT LOCAL-FILE$ HOLDS-BYTES
    x PENDING-OF VEC:COUNT 0 T=
-   x CONFLICT-COUNT 0 T=
+   x CONFLICTS-OF VEC:COUNT 0 T=
    x rec PASSED REPLAYED-PLANNED {: replayed:n planned:n :}
    planned 2 T= replayed 2 T=
    x s" node" IN-ROOT str> FS:DIR? TTRUE
    x v str> IN-ROOT LOCAL-FILE$ HOLDS-BYTES
    x s" node" BASELINE-KIND$ s" directory" T$=
    x v str> BASELINE-KIND$ s" present" T$=
-   x CONFLICT-COUNT 0 T=
+   x CONFLICTS-OF VEC:COUNT 0 T=
    TEST-DROPBOX:SEEN$
    s" /2/files/list_folder /2/files/list_folder/continue /2/files/upload"
    T$=
@@ -5406,7 +5288,7 @@ $1C0 constant OWNER-ACCESS
    x v str> IN-ROOT DROPBOX-FILE$ HOLDS-BYTES
    x s" node" BASELINE-KIND$ s" directory" T$=
    x PENDING-OF VEC:COUNT 0 T=
-   x CONFLICT-COUNT 0 T=
+   x CONFLICTS-OF VEC:COUNT 0 T=
    x RUN-JOURNAL @ ar JOURNAL:COMPLETED-RECOVERIES VEC:COUNT 0 T= ;
 
 \ Rust's server answers in order, so its upload of the copy gets a
@@ -5442,7 +5324,7 @@ $1C0 constant OWNER-ACCESS
    planned 1 T= replayed 1 T=
    x v str> IN-ROOT DROPBOX-FILE$ HOLDS-BYTES
    x v str> BASELINE-KIND$ s" present" T$=
-   x CONFLICT-COUNT 0 T=
+   x CONFLICTS-OF VEC:COUNT 0 T=
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/download "
    s" /2/files/delete_v2 /2/files/create_folder_v2 " ar JOIN-BYTES
    s" /2/files/list_folder/continue /2/files/upload " ar JOIN-BYTES
@@ -5560,7 +5442,7 @@ $180 constant MODE-0600
    sp UNRELATED-STAGE$ HOLDS-BYTES
    x s" node" BASELINE-KIND$ s" directory" T$=
    x PENDING-OF VEC:COUNT 0 T=
-   x CONFLICT-COUNT 0 T=
+   x CONFLICTS-OF VEC:COUNT 0 T=
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/download "
    s" /2/files/delete_v2 /2/files/create_folder_v2" ar JOIN-BYTES T$=
    d x STEP-GONE ;
@@ -5598,7 +5480,7 @@ $180 constant MODE-0600
    x ROOT$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
    x RUN-ROOT @ READ-BUF u ar FILE-NAMED OLD-FILE$ HOLDS-BYTES
    x PENDING-OF VEC:COUNT 0 T=
-   x CONFLICT-COUNT 0 T=
+   x CONFLICTS-OF VEC:COUNT 0 T=
    x s" node" BASELINE-KIND$ s" none" T$=
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/download "
    s" /2/files/delete_v2 /2/files/get_metadata" ar JOIN-BYTES T$=
@@ -5624,32 +5506,6 @@ $180 constant MODE-0600
       present OF drop true ENDOF
       directory OF false ENDOF
    ;MATCH ;
-
-: FRESH? ( outcome -- bool )
-   MATCH outcome
-      complete OF drop false ENDOF
-      fresh OF true ENDOF
-      root-changed OF false ENDOF
-   ;MATCH ;
-
-\ The report's planned, replayed and blocked counts are p, r and b.
-: COUNTED ( report n n n -- )
-   {: p:n r:n b:n :}
-   RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
-   planned p T= replayed r T= blocked b T= ;
-
-\ Rust's unsupported_file_metadata, appended to SB.
-: UNSUPPORTED-FILE-JSON+ ( ^u8 n ^u8 n ^u8 n -- )
-   {: l:^ lu:n d:^ du:n r:^ ru:n :}
-   S\" {\q.tag\q:\qfile\q" SB-APPEND l lu d du PATHS+
-   S\" ,\qrev\q:" SB-APPEND r ru QUOTED+
-   S\" ,\qsize\q:0,\qis_downloadable\q:false," SB-APPEND
-   S\" \qexport_info\q:{\qexport_as\q:\qhtml\q}}" SB-APPEND ;
-
-: EMPTY-PAGE ( ^u8 n ^ARENA:arena -- )
-   {: k:^ ku:n ar :}
-   [: ;] ar ENTRIES k ku false PAGE ;
 
 \ Rust's FakeResponse::json for the route r, any API call when r is
 \ empty: the JSON q appends.
@@ -5850,7 +5706,7 @@ $180 constant MODE-0600
    x s" docs" SEED-DIRECTORY-BASELINE
    x rec PASSED COMPLETE 0 0 2 COUNTED
    x s" docs" IN-ROOT str> FS:EXISTS? TFALSE
-   x s" docs" DIRECTORY-AT
+   x s" docs" FOLDER-BASELINE-AT
    x PENDING-OF VEC:COUNT 0 T=
    TEST-DROPBOX:SEEN$ LIST$ T$=
    d x STEP-GONE ;
@@ -5872,9 +5728,9 @@ $180 constant MODE-0600
    ar STEP-RUN {: d:str x :}
    d x PASS-READY {: rec:str :}
    x s" gone" SEED-DIRECTORY-BASELINE
-   x rec PASSED FRESH? TTRUE
+   x rec PASSED OUTCOME-FRESH? TTRUE
    x s" gone" IN-ROOT str> FS:EXISTS? TFALSE
-   x s" gone" DIRECTORY-AT
+   x s" gone" FOLDER-BASELINE-AT
    x PENDING-OF VEC:COUNT 0 T=
    TEST-DROPBOX:SEEN$ TWO-LISTS$ T$=
    d x STEP-GONE ;
@@ -5897,9 +5753,9 @@ TYPED-VARIABLE RACED str
    x s" gone" SEED-DIRECTORY-BASELINE
    x s" gone/new.txt" IN-ROOT RACED !
    [: RACE ;] TEST-DROPBOX:DURING-LISTING!
-   x rec PASSED FRESH? TTRUE
+   x rec PASSED OUTCOME-FRESH? TTRUE
    RACED @ AFTER-SCAN$ HOLDS-BYTES
-   x s" gone" DIRECTORY-AT
+   x s" gone" FOLDER-BASELINE-AT
    x PENDING-OF VEC:COUNT 0 T=
    TEST-DROPBOX:SEEN$ LIST$ T$=
    d x STEP-GONE ;
@@ -5936,9 +5792,9 @@ TYPED-VARIABLE RACED str
    x s" parent" IN-ROOT str> FS:MAKE-DIR
    x s" parent/new.txt" IN-ROOT str> NEW-CHILD$ FS:WRITE-ALL
    x s" parent" SEED-DIRECTORY-BASELINE
-   x rec PASSED FRESH? TTRUE
+   x rec PASSED OUTCOME-FRESH? TTRUE
    x s" parent/new.txt" IN-ROOT NEW-CHILD$ HOLDS-BYTES
-   x s" parent" DIRECTORY-AT
+   x s" parent" FOLDER-BASELINE-AT
    x CHILD-PRESENT? TTRUE
    x PENDING-OF VEC:COUNT 0 T=
    TEST-DROPBOX:SEEN$ CHILD-SYNCED-SEEN$ T$=
@@ -5968,14 +5824,6 @@ TYPED-VARIABLE RACED str
    {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
    replayed errors ;
 
-\ Rust's replay_remote_operations below the run's root.
-: REMOTE-REPLAYED ( ^run -- ^REPLAY:replay-report )
-   {: x :}
-   x ROOT$ s" open test root" LOCAL:OPEN-ROOT {: root:fd :}
-   [: x RUN-JOURNAL @ x RUN-LINK @ root x ROOT$ x STAGING$
-      x RUN-ARENA @ REPLAY:REPLAY-REMOTE-OPERATIONS-AT ;]
-   [: root FS:CLOSE-DIR ;] finally ;
-
 \ Rust's replay_local_operations: the pending plans' local operations
 \ below the run's root.
 : LOCAL-REPLAYED ( ^run -- ^REPLAY:replay-report )
@@ -5984,19 +5832,6 @@ TYPED-VARIABLE RACED str
    [: x RUN-JOURNAL @ root x ROOT$ x PENDING-OF x RUN-ARENA @
       REPLAY:REPLAY-LOCAL-PLANS-AT ;]
    [: root FS:CLOSE-DIR ;] finally ;
-
-\ Plan id blocked for the reason until the second at.
-: BLOCKED-UNTIL ( ^run JOURNAL:plan-id MODEL:blockage n -- )
-   {: x id why at:n :}
-   x RUN-JOURNAL @ id why at x RUN-ARENA @ JOURNAL:BLOCK-PLAN
-   MATCH JOURNAL:plan-block
-      not-found OF false ENDOF
-      already-completed OF false ENDOF
-      blocked OF true ENDOF
-   ;MATCH TTRUE ;
-
-: REJECTED-AS ( ^u8 n -- MODEL:blockage )
-   >str MODEL-BLOCKAGE:REMOTE-REJECTED ;
 
 : REJECTION$ ( MODEL:blockage -- ^u8 n )
    MATCH MODEL:blockage
@@ -6121,11 +5956,8 @@ TYPED-VARIABLE RACED str
 \ The local file p holding b, and its upload recorded pending.
 : UPLOAD-PENDING ( ^run ^u8 n ^u8 n -- )
    {: x p:^ u:n b:^ bu:n :}
-   x RUN-ARENA @ {: ar :}
-   x p u IN-ROOT str> b bu FS:WRITE-ALL
-   x p u MODEL-BASELINE:ABSENT
-   b bu ar IDENTITY MODEL-LOCAL:MAKE LOCAL-PRESENT REMOTE-ABSENT
-   RECORD-FIXTURE-PLAN drop ;
+   x p u b bu WRITE-IN
+   x p u b bu x RUN-ARENA @ IDENTITY UPLOAD-PLANNED drop ;
 
 \ The first pass uploads good.txt, installs download.txt and blocks the
 \ invalid path and bad.txt, the second as tag t; bad.txt's plan id.
@@ -6230,7 +6062,7 @@ TYPED-VARIABLE RACED str
 
 : EXCLUDED-WRITE ( ^u8 n ^u8 n ^run -- )
    {: p:^ u:n b:^ bu:n x :}
-   x p u IN-ROOT str> b bu FS:WRITE-ALL ;
+   x p u b bu WRITE-IN ;
 
 : EXCLUDED-KEPT ( ^u8 n ^u8 n ^run -- )
    {: p:^ u:n b:^ bu:n x :}
