@@ -28,10 +28,11 @@
 \ leaves one; a mutation or session finish Dropbox answers
 \ at another path, an upload's or finish's that get_metadata then does not
 \ find, an upload's or finish's answer that does not parse, which it
-\ finds, an upload confirmation Dropbox asks to wait on, a delete or
-\ create-folder conflict whose confirmation it asks to wait on, a conflict
-\ whose confirmation is at another path, and a delete it answers with a
-\ folder or a file at another rev. Tests of tests/dropbox_fake.rs run
+\ finds, an upload confirmation Dropbox asks to wait on, a delete,
+\ create-folder or upload conflict answered as refused with no
+\ get_metadata, even where Dropbox already holds what it asked for, and a
+\ delete it answers with a folder or a file at another rev. Tests of
+\ tests/dropbox_fake.rs run
 \ under their names: a_refused_grant_becomes_a_rejected_token,
 \ a_rotated_refresh_token_is_stored_before_the_new_token_is_published,
 \ an_unstored_rotation_stays_usable_and_is_retried,
@@ -1766,9 +1767,9 @@ TYPED-VARIABLE ZEROED bool
    s" delete conflict on a gone path" T-LABEL
    TEST-DROPBOX:RESET
    DELETE-CONFLICT!
-   s" /gone.txt" s" rev-gone" MAIN @ DROPBOX:DELETE DONE? ASSERT
-   DROPBOX-KIND:DELETED KIND? TTRUE
-   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
+   s" /gone.txt" s" rev-gone" MAIN @ DROPBOX:DELETE
+   DROPBOX-ERROR:CONFLICT REFUSED? ASSERT
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2" T$= ;
 
 
 : LOST-DELETE-CASE ( -- )
@@ -1801,17 +1802,6 @@ TYPED-VARIABLE ZEROED bool
    S\" {\qmetadata\q:{\q.tag\q:\qfile\q,\qpath_lower\q:\q/\xc3\x84.txt\q,\qpath_display\q:\q/\xc3\x84.txt\q,\qrev\q:\qrev-a\q,\qsize\q:0,\qcontent_hash\q:\qe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\q}}"
    TEST-DROPBOX:SCRIPT!
    S\" /\xc3\x84.txt" s" rev-a" MAIN @ DROPBOX:DELETE
-   DROPBOX-ERROR:PATH-MISMATCH REFUSED? ASSERT
-   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
-
-
-\ A delete refused as a conflict whose confirmation finds the file with
-\ /Ä.txt as its path_lower.
-: CONFLICT-ELSEWHERE-CASE ( -- )
-   s" delete conflict confirmed at another path" T-LABEL
-   TEST-DROPBOX:RESET
-   S\" /\xc3\x84.txt" s" rev-a" DELETED-FILE
-   S\" /\xc3\x84.txt" s" rev-b" MAIN @ DROPBOX:DELETE
    DROPBOX-ERROR:PATH-MISMATCH REFUSED? ASSERT
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
 
@@ -1858,34 +1848,6 @@ TYPED-VARIABLE ZEROED bool
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
 
 
-: CONFLICT-UNLINKED ( -- )
-   s" /gone.txt" s" rev-gone" MAIN @ DROPBOX:DELETE UNLINKED? OUTCOME ! ;
-
-
-\ A delete refused as a conflict whose confirmation asks to wait: the
-\ confirmation's retry.
-: BUSY-CONFLICT-CASE ( -- )
-   s" delete conflict, confirmation busy" T-LABEL
-   TEST-DROPBOX:RESET
-   DELETE-CONFLICT! BUSY!
-   s" /gone.txt" s" rev-gone" MAIN @ DROPBOX:DELETE RETRY-MS 3000 T=
-   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
-
-
-\ A delete refused as a conflict whose confirmation Dropbox refuses 403:
-\ unlinked.
-: DENIED-CONFLICT-CASE ( -- )
-   s" delete conflict, confirmation denied" T-LABEL
-   TEST-DROPBOX:RESET
-   DELETE-CONFLICT!
-   TEST-DROPBOX:DENY
-   false OUTCOME !
-   [: CONFLICT-UNLINKED ;] LOGGED 0 T=
-   OUTCOME @ TTRUE
-   s" error dropbox: files/get_metadata unlinked: 403" LOGGED? TTRUE
-   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
-
-
 : FOLDER-CONFLICT-CASE ( -- )
    s" create-folder conflict" T-LABEL
    TEST-DROPBOX:RESET
@@ -1893,26 +1855,14 @@ TYPED-VARIABLE ZEROED bool
    DROPBOX-KIND:FOLDER KIND? TTRUE
    LOWER$ s" /made" T$=
    TEST-DROPBOX:TYPE-SENT$ s" application/json" T$=
-   s" /made" MAIN @ DROPBOX:CREATE-FOLDER DONE? ASSERT
-   DROPBOX-KIND:FOLDER KIND? TTRUE
+   s" /made" MAIN @ DROPBOX:CREATE-FOLDER
+   DROPBOX-ERROR:CONFLICT REFUSED? ASSERT
    s" /taken" s" rev-taken" DELETED-FILE
    s" /taken" MAIN @ DROPBOX:CREATE-FOLDER
    DROPBOX-ERROR:CONFLICT REFUSED? ASSERT
    TEST-DROPBOX:SEEN$
-   s" /2/files/create_folder_v2 /2/files/create_folder_v2 /2/files/get_metadata /2/files/create_folder_v2 /2/files/get_metadata"
+   s" /2/files/create_folder_v2 /2/files/create_folder_v2 /2/files/create_folder_v2"
    T$= ;
-
-
-\ A create-folder refused as a conflict whose confirmation asks to wait:
-\ the confirmation's retry.
-: BUSY-FOLDER-CASE ( -- )
-   s" create-folder conflict, confirmation busy" T-LABEL
-   TEST-DROPBOX:RESET
-   409 s" " s" "
-   S\" {\qerror_summary\q:\qpath/conflict/folder/...\q,\qerror\q:{\q.tag\q:\qpath\q,\qpath\q:{\q.tag\q:\qconflict\q,\qconflict\q:{\q.tag\q:\qfolder\q}}}}"
-   TEST-DROPBOX:SCRIPT! BUSY!
-   s" /taken" MAIN @ DROPBOX:CREATE-FOLDER RETRY-MS 3000 T=
-   TEST-DROPBOX:SEEN$ s" /2/files/create_folder_v2 /2/files/get_metadata" T$= ;
 
 
 : LOST-FOLDER-CASE ( -- )
@@ -1937,45 +1887,12 @@ TYPED-VARIABLE ZEROED bool
    s" /2/files/create_folder_v2 /2/files/get_metadata" T$= ;
 
 
-\ A create-folder refused as a conflict with a file whose confirmation
-\ finds it with /Ä as its path_lower.
-: FOLDER-TAKEN-ELSEWHERE-CASE ( -- )
-   s" create-folder conflict confirmed at another path" T-LABEL
-   TEST-DROPBOX:RESET
-   S\" /\xc3\x84" s" rev-a" DELETED-FILE
-   S\" /\xc3\x84" MAIN @ DROPBOX:CREATE-FOLDER
-   DROPBOX-ERROR:PATH-MISMATCH REFUSED? ASSERT
-   TEST-DROPBOX:SEEN$
-   s" /2/files/create_folder_v2 /2/files/get_metadata" T$= ;
-
-
 \ A create-folder lost before Dropbox applied it: no folder is there.
 : CUT-FOLDER-CASE ( -- )
    s" lost create-folder not applied" T-LABEL
    TEST-DROPBOX:RESET
    TEST-DROPBOX:CUT
    s" /cut-made" MAIN @ DROPBOX:CREATE-FOLDER RETRY-MS 0 T=
-   TEST-DROPBOX:SEEN$
-   s" /2/files/create_folder_v2 /2/files/get_metadata" T$= ;
-
-
-: FOLDER-UNLINKED ( -- )
-   s" /denied" MAIN @ DROPBOX:CREATE-FOLDER UNLINKED? OUTCOME ! ;
-
-
-\ A create-folder refused as a conflict whose confirmation Dropbox refuses
-\ 403: unlinked.
-: DENIED-FOLDER-CASE ( -- )
-   s" create-folder conflict, confirmation denied" T-LABEL
-   TEST-DROPBOX:RESET
-   409 s" " s" "
-   S\" {\qerror_summary\q:\qpath/conflict/folder/...\q,\qerror\q:{\q.tag\q:\qpath\q,\qpath\q:{\q.tag\q:\qconflict\q,\qconflict\q:{\q.tag\q:\qfolder\q}}}}"
-   TEST-DROPBOX:SCRIPT!
-   TEST-DROPBOX:DENY
-   false OUTCOME !
-   [: FOLDER-UNLINKED ;] LOGGED 0 T=
-   OUTCOME @ TTRUE
-   s" error dropbox: files/get_metadata unlinked: 403" LOGGED? TTRUE
    TEST-DROPBOX:SEEN$
    s" /2/files/create_folder_v2 /2/files/get_metadata" T$= ;
 
@@ -2326,7 +2243,7 @@ TYPED-VARIABLE FAULT fault
    5 TEST-DROPBOX:FILE!
    s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" 0160b" STAGED
    SEND DROPBOX-ERROR:CONFLICT REFUSED? ASSERT
-   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
+   TEST-DROPBOX:SEEN$ s" /2/files/upload" T$=
    SB-RESET S\" {\qpath\q:\q/Docs/Up.txt\q,\qmode\q:" SB-APPEND
    S\" {\q.tag\q:\qupdate\q,\qupdate\q:\q0160b\q}," SB-APPEND
    S\" \qautorename\q:false,\qstrict_conflict\q:true," SB-APPEND
@@ -2341,9 +2258,8 @@ TYPED-VARIABLE FAULT fault
    TEST-DROPBOX:RESET -1 FAULT-AT !
    s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
    s" /docs/up.txt" s" /Docs/Up.txt" s" 0160a" EXPECTED$ 12 TEST-DROPBOX:FILE!
-   SEND DONE? ASSERT
-   ENTRY-HASH$ EXPECTED$ T$=
-   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
+   SEND DROPBOX-ERROR:CONFLICT REFUSED? ASSERT
+   TEST-DROPBOX:SEEN$ s" /2/files/upload" T$=
    UNSTAGED ;
 
 
@@ -2830,11 +2746,9 @@ TYPED-VARIABLE FAULT fault
    DOWNLOAD-CASES
    DELETE-CONFLICT-CASE DELETE-MISSING-CASE DELETE-GONE-CASE
    LOST-DELETE-CASE CUT-DELETE-CASE DELETE-ELSEWHERE-CASE
-   CONFLICT-ELSEWHERE-CASE DELETE-REV-CASE DELETE-AS-FOLDER-CASE
-   DENIED-DELETE-CASE BUSY-CONFLICT-CASE DENIED-CONFLICT-CASE
-   FOLDER-CONFLICT-CASE BUSY-FOLDER-CASE LOST-FOLDER-CASE FOLDER-ELSEWHERE-CASE
-   FOLDER-TAKEN-ELSEWHERE-CASE CUT-FOLDER-CASE DENIED-FOLDER-CASE
-   DENIED-CUT-FOLDER-CASE
+   DELETE-REV-CASE DELETE-AS-FOLDER-CASE DENIED-DELETE-CASE
+   FOLDER-CONFLICT-CASE LOST-FOLDER-CASE FOLDER-ELSEWHERE-CASE
+   CUT-FOLDER-CASE DENIED-CUT-FOLDER-CASE
    LOST-REFRESH-CASE
    EXCHANGE-CASE DEAD-CODE-CASE RESERVED-REFRESH-CASE RESERVED-CODE-CASE
    OAUTH-LISTING-LONGPOLL-AND-EXACT-DOWNLOAD-USE-DOCUMENTED-PROTOCOL

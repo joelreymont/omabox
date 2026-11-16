@@ -213,24 +213,23 @@ STRUCTURE config
   unconditionally, which sync uses only for a folder it has just seen empty.
 - **A mutation confirms an answer it cannot trust.** libcurl resends a POST
   on a new connection when a reused one closes before any answer byte, so a
-  mutation Dropbox applied can come back lost or refused. `UPLOAD`, `DELETE`
-  and `CREATE-FOLDER` then ask `get_metadata` whether Dropbox holds the
-  intended result: the same content hash, no entry, or a folder.
+  mutation Dropbox applied can come back lost. `UPLOAD`, `DELETE` and
+  `CREATE-FOLDER` then ask `get_metadata` whether Dropbox holds the
+  intended result: a file with the upload's content hash, no entry, or a
+  folder.
   - A lost answer, or a `done` whose entry's `path_lower` is not the
     path's full Unicode lowercase: `done` if it holds, else `retry`.
     `DELETE` given a rev treats a `done` whose entry is not a file at that
-    rev the same way.
-  - A `conflict` refusal: `done` if it holds, else the refusal stands.
+    rev the same way, and `UPLOAD` any 2xx answer that is not its complete
+    entry with its content hash, one that does not parse included.
+  - A `conflict` refusal stands without asking: REPLAY reads the path back
+    once, as the Rust version's `resolve_explicit_conflict` does.
   - `DELETE` refused `not-found` is `done` without asking: the path is
     absent, which is what a delete intends.
   - A confirmation whose entry's `path_lower` is not the path's full
     Unicode lowercase answers `refused path-mismatch`, for that path alone.
   - A confirmation that must wait answers its `retry`, with its wait.
   - Every other refusal stands. A mutation never answers "unknown".
-- **`UPLOAD` checks what Dropbox committed.** An entry at another path is
-  confirmed, as above. Its content hash must be the upload's, else it
-  answers `refused content-hash-mismatch`, the tag Dropbox gives a single
-  upload whose bytes do not match.
 
 ## The upload, as a state machine
 
@@ -240,9 +239,8 @@ Files up to 32 MiB go in one `upload` call; larger ones go through a session.
 FSM:DEFINE SESSION ( ^run ) upload-step send-event
    IN single  SEND-SENSE
       committed  ANSWER-DONE   >ended
-      elsewhere  DISTRUST      >confirming   \ at another path
+      untrusted  DISTRUST      >confirming   \ not its entry
       lost       -             >confirming
-      conflict   -             >confirming
       failed     ANSWER-REPLY  >ended
    IN starting  START-SENSE ( start-event )
       opened  -             >appending
@@ -257,9 +255,8 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
       failed    ANSWER-REPLY   >ended
    IN finishing  FINISH-SENSE ( finish-event )
       committed  ANSWER-DONE   >ended
-      elsewhere  DISTRUST      >confirming
+      untrusted  DISTRUST      >confirming
       lost       -             >confirming
-      conflict   -             >confirming
       gone       -             >verifying
       failed     ANSWER-REPLY  >ended
    IN confirming  CONFIRM-SENSE ( confirm-event )
@@ -355,8 +352,9 @@ The tests run against a fake Dropbox on `net/http.f`, in the style of
 - **metadata:** found and not found;
 - **download:** a resume by range, a Content-Range mismatch, and a 416;
 - **content hash:** empty, one byte, exactly 4 MiB, and 4 MiB plus one;
-- **single upload:** add, an update that conflicts, and an upload Dropbox
-  already holds, refused as a conflict and confirmed;
+- **single upload:** add; an update that conflicts and an upload Dropbox
+  already holds, both refused as a conflict with no `get_metadata`; and an
+  answer that does not parse, confirmed;
 - **session upload:**
   - a lost append, resent;
   - `incorrect_offset` at the chunk's end;
@@ -364,14 +362,14 @@ The tests run against a fake Dropbox on `net/http.f`, in the style of
   - a lost finish, confirmed;
   - a finish whose session is gone: confirmed when Dropbox holds it, else
     restarted;
-- **delete and create-folder:** a conflict, not found, and a conflict whose
-  path is already gone;
+- **delete and create-folder:** a conflict, refused with no `get_metadata`
+  even where the path is already gone or a folder; and not found;
 - **auth and transport:**
   - an expired token, refreshed and resent;
   - a revoked token, refreshed and resent once, which answers `unlinked`,
     and again with no request;
   - a refreshed token refused again, and a 403, which answer `unlinked`;
-  - a lost delete, a lost upload, and a create-folder conflict whose
+  - a lost delete, a lost upload, and a lost create-folder whose
     confirmation is refused 403, which answer `unlinked`;
   - `invalid_grant`, which answers `unlinked`, and again with no request;
   - a rotated refresh token, stored before its access token goes out; one

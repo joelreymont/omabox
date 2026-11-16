@@ -44,6 +44,8 @@
 \   stage-destination-occupied at the stage's path, the plan pending; a
 \   directory at the target retires it, logging nothing.
 \ Against the fake Dropbox of test-dropbox.f, root empty:
+\ - REMOTE-CREATE-FOLDER of a folder Dropbox already holds, refused as a
+\   conflict, is read back as applied.
 \ - REMOTE-DELETE-FOLDER of an empty folder deletes it; of an occupied
 \   one, or one the listing answers not_found, deletes nothing; Rust's
 \   folder_delete_probe_outcomes_are_classified_per_path, whose 503
@@ -52,10 +54,12 @@
 \ - REMOTE-UPLOAD of a new file sends its progress, then a finished
 \   transfer to a STATUS in TMPDIR; one Dropbox refuses as a conflict
 \   with other bytes at the path is read back as changed, and its
-\   finished transfer is sent; a read-back incomplete file is rejected,
-\   and an incomplete upload answer is read back.
+\   finished transfer is sent; one refused as a conflict with its own
+\   bytes at the path is read back as applied; a read-back incomplete
+\   file is rejected, and an incomplete upload answer is read back.
 \ - REMOTE-DELETE-FILE without a rev throws E-INVALID-STATE, logging
-\   once, with no request.
+\   once, with no request; one refused as a conflict for a path now gone
+\   is read back as applied.
 \ - STAGE-EXACT-DOWNLOAD-AT against the fake Dropbox: Rust's
 \   exact_download_retry_reuses_a_stage_without_consuming_the_body,
 \   exact_download_stage_race_preserves_verified_stage, with the stage
@@ -1218,6 +1222,18 @@ ARENA LINKS REPLAY:link
    s" /2/files/create_folder_v2 /2/files/list_folder /2/files/delete_v2"
    T$= ;
 
+: A-HELD-FOLDER-IS-READ-BACK ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   s" a held folder is read back" T-LABEL
+   TEST-DROPBOX:RESET
+   l s" f" DISPLAY ar REPLAY:REMOTE-CREATE-FOLDER
+   s" applied" s" folder" GIVES
+   l s" f" DISPLAY ar REPLAY:REMOTE-CREATE-FOLDER
+   s" applied" s" folder" GIVES
+   TEST-DROPBOX:SEEN$
+   s" /2/files/create_folder_v2 /2/files/create_folder_v2 /2/files/get_metadata"
+   T$= ;
+
 : AN-OCCUPIED-FOLDER-IS-KEPT ( ^REPLAY:link ^ARENA:arena -- )
    {: l ar :}
    s" an occupied folder is kept" T-LABEL
@@ -1405,8 +1421,23 @@ STATUS-CAP BUFFER: STATUS-BUF
    rt ar
    S\" {\qdirection\q:\qupload\q,\qpath\q:\qnotes.txt\q,\qbytes_done\q:0,\qbytes_total\q:10}"
    SHOWS
-   TEST-DROPBOX:SEEN$
-   s" /2/files/upload /2/files/get_metadata /2/files/get_metadata" T$=
+   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
+   d GONE rt GONE ;
+
+: A-HELD-UPLOAD-IS-READ-BACK ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   s" a held upload is read back" T-LABEL
+   TEST-DROPBOX:RESET
+   ar RUNTIME-STATUS {: rt:str st :}
+   st l REPLAY-LINK:STATUS !
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r s s" notes.txt" ar STAGED {: up :}
+   up LOCAL:UPLOAD-CONTENT DROPBOX:HASH>STR str> {: h:^ hu:n :}
+   s" /notes.txt" s" /notes.txt" s" 0150" h hu 10 TEST-DROPBOX:FILE!
+   l up ar UPLOAD-NOTES APPLIED-FILE MODEL-REMOTE:UNMAKE {: c v :}
+   c DROPBOX:HASH>STR str> h hu T$=
+   v DROPBOX:REV>STR str> s" 0150" T$=
+   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
    d GONE rt GONE ;
 
 : A-READ-BACK-INCOMPLETE-FILE-IS-REJECTED ( ^REPLAY:link ^ARENA:arena -- )
@@ -1421,8 +1452,7 @@ STATUS-CAP BUFFER: STATUS-BUF
    ar CONFLICT-DIRS {: d:str r:str s:str :}
    r s s" notes.txt" ar STAGED {: up :}
    l up ar UPLOAD-NOTES s" rejected" s" rejected-by-dropbox" GIVES
-   TEST-DROPBOX:SEEN$
-   s" /2/files/upload /2/files/get_metadata /2/files/get_metadata" T$=
+   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
    d GONE rt GONE ;
 
 : AN-INCOMPLETE-UPLOAD-ANSWER-IS-READ-BACK
@@ -1462,18 +1492,32 @@ STATUS-CAP BUFFER: STATUS-BUF
    TEST-DROPBOX:SEEN$ s" " T$=
    d GONE ;
 
+: A-GONE-FILE-IS-READ-BACK ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   s" a gone file is read back" T-LABEL
+   TEST-DROPBOX:RESET
+   409 s" " s" "
+   S\" {\qerror_summary\q:\qpath_write/conflict/file/...\q,\qerror\q:{\q.tag\q:\qpath_write\q,\qpath_write\q:{\q.tag\q:\qconflict\q,\qconflict\q:{\q.tag\q:\qfile\q}}}}"
+   TEST-DROPBOX:SCRIPT!
+   l s" notes.txt" DISPLAY s" 0150" AS-REV ar REPLAY:REMOTE-DELETE-FILE
+   s" applied" s" absent" GIVES
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
+
 : REMOTE-CASES ( ^ARENA:arena -- )
    {: ar :}
    MAIN @ s" " ar NEW-LINK {: l :}
    l ar AN-EMPTY-FOLDER-IS-DELETED
+   l ar A-HELD-FOLDER-IS-READ-BACK
    l ar AN-OCCUPIED-FOLDER-IS-KEPT
    l ar A-MISSING-FOLDER-IS-ALREADY-DELETED
    l ar FOLDER-DELETE-PROBE-OUTCOMES-ARE-CLASSIFIED-PER-PATH
    l ar AN-UPLOAD-SENDS-ITS-TRANSFER
    l ar A-REFUSED-UPLOAD-FINISHES-ITS-TRANSFER
+   l ar A-HELD-UPLOAD-IS-READ-BACK
    l ar A-READ-BACK-INCOMPLETE-FILE-IS-REJECTED
    l ar AN-INCOMPLETE-UPLOAD-ANSWER-IS-READ-BACK
-   l ar A-FILE-DELETE-WITHOUT-A-REV-IS-REFUSED ;
+   l ar A-FILE-DELETE-WITHOUT-A-REV-IS-REFUSED
+   l ar A-GONE-FILE-IS-READ-BACK ;
 
 
 \ ---- remote replay's blocks and folder applies
@@ -3422,7 +3466,7 @@ variable SIDES
    r s" replace.txt" s" new remote bytes" ar HASH-OF ar REMOTE-COPY
    s" new remote bytes" ar HOLDS
    TEST-DROPBOX:SEEN$
-   s" /2/files/upload /2/files/get_metadata /2/files/get_metadata /2/files/download"
+   s" /2/files/upload /2/files/get_metadata /2/files/download"
    T$=
    TEST-DROPBOX:ARG-SENT$ S\" {\qpath\q:\qrev:current-rev\q}" T$=
    j JOURNAL:CLOSE

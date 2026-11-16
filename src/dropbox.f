@@ -2125,12 +2125,6 @@ private
    ;MATCH ;
 
 
-\ A confirmation that answers in its call's place.
-: STANDS? ( reply -- bool )
-   {: r:reply :}
-   r UNLINKED? r MISMATCH? or r RETRY? or ;
-
-
 : FOLDER? ( ^entry -- bool )
    DROPBOX-ENTRY:KIND @ construct kind folder DROPBOX-KIND:EQ ;
 
@@ -2149,16 +2143,10 @@ private
    r UNCONFIRMED ;
 
 
-\ not-found is done, and a conflict once the path is gone, as a resent
-\ applied delete answers; else a confirmation that STANDS? answers.
-: DELETE-REFUSED ( error ^u8 n ^client -- reply )
-   {: e:error p:^ pu:n c :}
+\ not-found is done: Dropbox holds nothing at the path.
+: DELETE-REFUSED ( error ^client -- reply )
+   {: e:error c :}
    e construct error not-found DROPBOX-ERROR:EQ if c ABSENT exit then
-   e construct error conflict DROPBOX-ERROR:EQ if
-      p pu c METADATA {: m:reply :}
-      m NOT-FOUND? if c ABSENT exit then
-      m STANDS? if m exit then
-   then
    e construct reply refused ;
 
 
@@ -2170,21 +2158,8 @@ private
    r UNCONFIRMED ;
 
 
-\ A conflict is done once the path holds a folder, as a resent applied
-\ create-folder answers; else a confirmation that STANDS? answers.
-: FOLDER-REFUSED ( error ^u8 n ^client -- reply )
-   {: e:error p:^ pu:n c :}
-   e construct error conflict DROPBOX-ERROR:EQ if
-      p pu c METADATA {: m:reply :}
-      m DONE? c CLIENT-ENTRY FOLDER? and
-      if construct reply done exit then
-      m STANDS? if m exit then
-   then
-   e construct reply refused ;
-
-
 \ done stands if `read` finds its entry at the path; a lost answer or one
-\ elsewhere goes to `lost`, a refusal to `refusal`, which confirm it.
+\ elsewhere goes to `lost`, which confirms it; a refusal to `refusal`.
 : MUTATE ( ^client ^u8 n [ ^client -- bool ] [ ^client -- reply ]
            [ error ^client -- reply ] -- reply )
    {: c rt:^ rtu:n read lost refusal :}
@@ -2253,7 +2228,7 @@ public
    p pu r ru c DELETE-BODY
    c s" files/delete_v2" [: drop p pu r ru c DELETED-READ ;]
    [: drop p pu c GONE ;]
-   [: drop p pu c DELETE-REFUSED ;] MUTATE ;
+   [: DELETE-REFUSED ;] MUTATE ;
 
 
 \ files/create_folder_v2, which never renames.
@@ -2262,7 +2237,7 @@ public
    p pu c FOLDER-BODY
    c s" files/create_folder_v2" [: drop p pu c MADE-READ ;]
    [: drop p pu c MADE ;]
-   [: drop p pu c FOLDER-REFUSED ;] MUTATE ;
+   [: drop construct reply refused ;] MUTATE ;
 
 
 \ oauth2/token's authorization_code grant of the code and its PKCE
@@ -2282,11 +2257,10 @@ public
 \ A file up to CHUNK-SIZE bytes goes in one files/upload; a larger one
 \ through an upload session: CHUNK-SIZE appends, then a finish that carries
 \ no content_hash, as Dropbox checks that field against the call's own
-\ bytes. A lost answer to the upload or the finish, a 2xx answer that is
-\ not the upload's complete entry at its path with its content hash, or a
-\ conflict, which a POST libcurl resent can answer for an upload already
-\ applied, is confirmed by get_metadata. A run's chunk
-\ buffer is MEM's, released before UPLOAD answers or throws.
+\ bytes. A lost answer to the upload or the finish, or a 2xx answer that
+\ is not the upload's complete entry at its path with its content hash,
+\ is confirmed by get_metadata; a conflict is answered as refused. A
+\ run's chunk buffer is MEM's, released before UPLOAD answers or throws.
 
 public
 
@@ -2632,15 +2606,6 @@ HEAP RUNS run
    ;MATCH ;
 
 
-: CONFLICT? ( reply -- bool )
-   MATCH reply
-      done OF false ENDOF
-      refused OF construct error conflict DROPBOX-ERROR:EQ ENDOF
-      retry OF drop false ENDOF
-      unlinked OF false ENDOF
-   ;MATCH ;
-
-
 \ A session Dropbox no longer takes chunks for.
 : GONE-TAG? ( ^u8 n -- bool )
    {: t:^ tu:n :}
@@ -2691,10 +2656,10 @@ HEAP RUNS run
 ENUM upload-step
    single starting appending finishing confirming verifying restarting
    ended ;ENUM
-ENUM send-event committed untrusted lost conflict failed ;ENUM
+ENUM send-event committed untrusted lost failed ;ENUM
 ENUM start-event opened lost failed ;ENUM
 ENUM append-event stored complete lost cut gone failed ;ENUM
-ENUM finish-event committed untrusted lost conflict gone failed ;ENUM
+ENUM finish-event committed untrusted lost gone failed ;ENUM
 ENUM confirm-event same elsewhere wait other unlinked ;ENUM
 ENUM restart-event once twice ;ENUM
 
@@ -2713,7 +2678,6 @@ ENUM restart-event once twice ;ENUM
    rep r RUN-LAST !
    rep DONE? if r SEND-DONE exit then
    r RUN-CLIENT @ LOST? if construct send-event lost exit then
-   rep CONFLICT? if construct send-event conflict exit then
    construct send-event failed ;
 
 
@@ -2767,7 +2731,6 @@ ENUM restart-event once twice ;ENUM
    rep r RUN-LAST !
    rep DONE? if r FINISH-DONE exit then
    c LOST? if construct finish-event lost exit then
-   rep CONFLICT? if construct finish-event conflict exit then
    rep c FINISH-GONE? if construct finish-event gone exit then
    construct finish-event failed ;
 
@@ -2838,16 +2801,15 @@ ENUM restart-event once twice ;ENUM
    0 r RUN-ACCEPTED ! false r RUN-RESENT ! ;
 
 
-\ confirming asks whether an upload whose answer was lost, a conflict or
-\ not its entry took effect; verifying asks whether a finish whose session
-\ is gone was a resend Dropbox already committed, and starts over only
-\ when it was not.
+\ confirming asks whether an upload whose answer was lost or not its entry
+\ took effect; verifying asks whether a finish whose session is gone was
+\ a resend Dropbox already committed, and starts over only when it was
+\ not.
 FSM:DEFINE SESSION ( ^run ) upload-step send-event
    IN single  SEND-SENSE
       committed  ANSWER-DONE   >ended
       untrusted  DISTRUST      >confirming
       lost       -             >confirming
-      conflict   -             >confirming
       failed     ANSWER-REPLY  >ended
    IN starting  START-SENSE ( start-event )
       opened  -             >appending
@@ -2864,7 +2826,6 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
       committed  ANSWER-DONE   >ended
       untrusted  DISTRUST      >confirming
       lost       -             >confirming
-      conflict   -             >confirming
       gone       -             >verifying
       failed     ANSWER-REPLY  >ended
    IN confirming  CONFIRM-SENSE ( confirm-event )
