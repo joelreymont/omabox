@@ -132,6 +132,19 @@
 \   create_folder_v2 answered as Rust scripts it
 \ - fresh_download_uses_parent_directory_casing_without_remote_writes
 \ - delta_folder_with_miscased_parents_is_created_inside_the_local_tree
+\ Case collisions against the fake Dropbox, Rust's tests of the same
+\ names, the fake's requests standing for Rust's finish, with no account
+\ request, and fresh for FreshObservationRequired, which names a path:
+\ - case_only_remote_spelling_change_is_a_stable_noop
+\ - local_case_collision_is_renamed_before_planning_and_then_syncs, its
+\   journal closed and opened again between the passes
+\ - automatic_case_rename_never_becomes_a_dropbox_delete and
+\   case_collision_keeps_the_baselined_spelling_and_its_history, each
+\   download installed in the pass that plans it
+\ - local_case_collision_preserves_both_directory_trees
+\ - case_collision_spares_the_recorded_greater_spelling
+\ - case_collision_beside_a_symlink_renames_the_baselined_file
+\ - case_collision_of_symlinks_stays_in_place
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -4109,14 +4122,6 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x RUN-JOURNAL @ p u DISPLAY b x RUN-ARENA @ JOURNAL:RECORD-NOOP
    NOOP-RECORDED? TTRUE ;
 
-\ Rust's seed_baseline: rem at p alike on both sides.
-: SEEDED-FILE ( ^run ^u8 n MODEL:remote -- )
-   {: x p:^ u:n rem :}
-   rem MODEL-REMOTE:UNMAKE {: c rev :}
-   rem MODEL-BASELINE:PRESENT c MODEL-LOCAL:MAKE LOCAL-PRESENT
-   rem REMOTE-PRESENT MODEL-SUBTREE:EMPTY PLANNER:PLAN {: dec :}
-   x p u dec SEEDED-NOOP ;
-
 \ Rust's seed_directory_baseline.
 : SEEDED-FOLDER ( ^run ^u8 n -- )
    {: x p:^ u:n :}
@@ -4163,7 +4168,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    d x PASS-READY {: rec:str :}
    x s" Shared" FOLDER-MADE-IN
    x s" Shared/notes.txt" BENEATH$ BYTES-WRITTEN-IN
-   x s" Shared/notes.txt" notes SEEDED-FILE
+   x s" Shared/notes.txt" notes SEED-BASELINE
    x rec PASSED COMPLETE drop
    x s" Shared/notes.txt" IN-ROOT BENEATH$ HOLDS-BYTES
    x s" Shared/notes.txt" notes BASELINE-AT
@@ -4195,8 +4200,8 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x s" Shared/notes.txt" BEFORE-NOTES$ BYTES-WRITTEN-IN
    x s" Shared/keep.txt" BEFORE-KEEP$ BYTES-WRITTEN-IN
    x s" Shared" SEEDED-FOLDER
-   x s" Shared/notes.txt" notes SEEDED-FILE
-   x s" Shared/keep.txt" keep SEEDED-FILE
+   x s" Shared/notes.txt" notes SEED-BASELINE
+   x s" Shared/keep.txt" keep SEED-BASELINE
    x notes keep ACCESSIBLE
    x s" Shared/notes.txt" IN-ROOT str> FS:REMOVE-FILE
    x s" Shared/keep.txt" EDITED-KEEP$ BYTES-WRITTEN-IN ;
@@ -4260,8 +4265,8 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x s" report" FOLDER-MADE-IN
    x s" report.txt" SHARED-SIBLING$ BYTES-WRITTEN-IN
    x s" report" SEEDED-FOLDER
-   x s" report.txt" shared SEEDED-FILE
-   x s" report/x" shared SEEDED-FILE
+   x s" report.txt" shared SEED-BASELINE
+   x s" report/x" shared SEED-BASELINE
    rec ;
 
 : SIBLING-FILE+ ( ^u8 n DROPBOX:hash -- )
@@ -4388,7 +4393,7 @@ $1C0 constant OWNER-ACCESS
    x s" locked/secret.txt" SECRET$ BYTES-WRITTEN-IN
    x s" open.txt" OPEN-UPLOAD$ BYTES-WRITTEN-IN
    x s" locked" SEEDED-FOLDER
-   x s" locked/secret.txt" secret SEEDED-FILE ;
+   x s" locked/secret.txt" secret SEED-BASELINE ;
 
 : LOCKED-REPORTS ( report -- )
    RECONCILE-REPORT:UNMAKE
@@ -4816,6 +4821,456 @@ $1C0 constant OWNER-ACCESS
    ar FRESH-DOWNLOAD-USES-PARENT-DIRECTORY-CASING-WITHOUT-REMOTE-WRITES
    ar DELTA-FOLDER-WITH-MISCASED-PARENTS-IS-CREATED-INSIDE-THE-LOCAL-TREE ;
 
+\ ---- case collisions against the fake Dropbox ----------------------
+
+\ Rust's planned_operations: an operating decision's one operation.
+: PLANNED-OPERATION ( MODEL:decision -- MODEL:operation )
+   MATCH MODEL:decision
+      noop OF drop s" the decision was a no-op" FAILED ENDOF
+      operate OF ENDOF
+      blocked OF drop s" the decision was blocked" FAILED ENDOF
+      conflicted OF drop s" the decision was a conflict" FAILED ENDOF
+      collided OF drop s" the decision was a collision" FAILED ENDOF
+   ;MATCH ;
+
+: OUTCOME-FRESH? ( outcome -- bool )
+   MATCH outcome
+      complete OF {: rep :} false ENDOF
+      fresh OF true ENDOF
+      root-changed OF false ENDOF
+   ;MATCH ;
+
+: MKDIR-IN ( ^run ^u8 n -- ) IN-ROOT str> FS:MAKE-DIR ;
+
+: WRITE-IN ( ^run ^u8 n ^u8 n -- )
+   {: x p:^ u:n b:^ bu:n :}
+   x p u IN-ROOT str> b bu FS:WRITE-ALL ;
+
+: EXISTS-IN? ( ^run ^u8 n -- bool ) IN-ROOT str> FS:EXISTS? ;
+
+\ The symlink at path p in the root points at the text t.
+: LINKS-TO ( ^run ^u8 n ^u8 n -- )
+   {: x p:^ u:n t:^ tu:n :}
+   t tu x p u IN-ROOT str> FS:MAKE-SYMLINK ;
+
+\ The target the symlink at f holds.
+: LINK-TARGET$ ( str -- ^u8 n )
+   str> FS:>PATHZ READ-BUF READ-CAP readlink {: u:n :}
+   u 0< if s" the symlink did not read" FAILED then
+   READ-BUF u ;
+
+\ The root's names in byte order, one per line.
+: ROOT-NAMES$ ( ^run -- ^u8 n )
+   ROOT$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
+   READ-BUF u ;
+
+\ The journal's baseline paths, joined by spaces.
+: BASELINED$ ( ^run -- ^u8 n )
+   {: x :}
+   x RUN-JOURNAL @ x RUN-ARENA @ JOURNAL:BASELINE-PATHS {: ps :}
+   SB-RESET
+   ps VEC:COUNT 0 ?do
+      i 0<> if s"  " SB-APPEND then ps i VEC:AT @ PATH$ SB-APPEND
+   loop
+   SB$ ;
+
+\ Rust's scan_and_publish of the run's root, which publishes.
+: SCAN-PUBLISHED ( ^run -- ^VEC:vector<MODEL:local-record> )
+   {: x :}
+   x RUN-JOURNAL @ x ROOT$ x RUN-ARENA @ LOCAL:SCAN-AND-PUBLISH
+   MATCH LOCAL:scan-publication
+      published OF LOCAL:SCAN-OBSERVATIONS ENDOF
+      root-changed OF
+         s" the stable fixture changed its root" FAILED
+      ENDOF
+   ;MATCH ;
+
+: UPLOAD-ROUTE$ ( -- ^u8 n ) s" /2/files/upload" ;
+
+\ The last replay step's report holds no blocked entry.
+: STEP-UNBLOCKED ( ^run -- )
+   REPLAY-STEP REPORTED BLOCKS VEC:COUNT 0 T= ;
+
+: SAME$ ( -- ^u8 n ) s" same bytes across a case-only change" ;
+
+\ Rust's fixture: Report.TXT in the root and baselined, report.txt on
+\ the one listing page; answers the remote file.
+: CASE-ONLY ( ^run ^ARENA:arena -- MODEL:remote )
+   {: x ar :}
+   SAME$ s" rev-same" ar REMOTE-FILE {: rem :}
+   SAME$ ar IDENTITY {: h:DROPBOX:hash :}
+   [: s" /report.txt" s" /report.txt" s" rev-same" h FILE-JSON+ ;]
+   ar ENTRIES s" case-only" false PAGE
+   x s" Report.TXT" SAME$ WRITE-IN
+   x s" Report.TXT" rem SEED-BASELINE
+   rem ;
+
+: NOOP-REPORTS ( report -- )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   noops 1 T= planned 0 T= replayed 0 T= ;
+
+\ The inventory's one record, keyed and spelled report.txt.
+: REPORT-LISTED ( ^run -- )
+   {: x :}
+   x RUN-ARENA @ {: ar :}
+   x RUN-JOURNAL @ ar JOURNAL:REMOTE-INVENTORY
+   JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur rs :}
+   rs VEC:COUNT 1 <> if
+      s" expected one canonical remote observation" FAILED
+   then
+   rs 0 VEC:AT @ MODEL-REMOTE--RECORD:UNMAKE {: k p o :}
+   k s" report.txt" ar CANONICAL MODEL:KEY= TTRUE
+   p PATH$ s" report.txt" T$= ;
+
+: CASE-ONLY-REMOTE-SPELLING-CHANGE-IS-A-STABLE-NOOP
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" case_only_remote_spelling_change_is_a_stable_noop" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x ar CASE-ONLY {: rem :}
+   x rec PASSED COMPLETE NOOP-REPORTS
+   x PENDING-OF VEC:COUNT 0 T=
+   x s" report.txt" rem BASELINE-AT
+   x s" Report.TXT" IN-ROOT str> FS:FILE? TTRUE
+   x s" report.txt" EXISTS-IN? TFALSE
+   x REPORT-LISTED
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$=
+   d x STEP-GONE ;
+
+: FIRST$ ( -- ^u8 n ) s" first" ;
+: SECOND$ ( -- ^u8 n ) s" second" ;
+
+\ Rust's fixture: Foo.txt and foo.txt in the root, an empty listing.
+: TWO-SPELLINGS ( ^run ^ARENA:arena -- )
+   {: x ar :}
+   [: ;] ar ENTRIES s" empty" false PAGE
+   x s" Foo.txt" FIRST$ WRITE-IN
+   x s" foo.txt" SECOND$ WRITE-IN ;
+
+\ The first pass renamed foo.txt apart and recorded nothing.
+: VARIANT-RENAMED ( ^run -- )
+   {: x :}
+   x PENDING-OF VEC:COUNT 0 T=
+   x BASELINED$ s" " T$=
+   x s" Foo.txt" IN-ROOT FIRST$ HOLDS-BYTES
+   x s" foo.txt" EXISTS-IN? TFALSE
+   x s" foo.txt (case variant)" IN-ROOT SECOND$ HOLDS-BYTES ;
+
+: SYNCED-REPORTS ( report -- )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   planned 2 T= replayed 2 T= blocked 0 T= ;
+
+: TWO-UPLOADS$ ( -- ^u8 n )
+   s" /2/files/list_folder /2/files/upload /2/files/upload" ;
+
+: LOCAL-CASE-COLLISION-IS-RENAMED-BEFORE-PLANNING-AND-THEN-SYNCS
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" local_case_collision_is_renamed_before_planning_and_then_syncs"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x ar TWO-SPELLINGS
+   x rec PASSED OUTCOME-FRESH? TTRUE
+   x VARIANT-RENAMED
+   d x REOPENED
+   x rec PASSED COMPLETE SYNCED-REPORTS
+   x PENDING-OF VEC:COUNT 0 T=
+   TEST-DROPBOX:SEEN$ TWO-UPLOADS$ T$=
+   d x STEP-GONE ;
+
+: ASSOCIATED$ ( -- ^u8 n ) s" remote-associated local bytes" ;
+
+\ Rust's two answers creating /apps (case variant), as FolderMetadata.
+: VARIANT-MADE ( -- )
+   2 0 do
+      s" /2/files/create_folder_v2" 200 s" " s" "
+      S\" {\qmetadata\q:{\qname\q:\qapps (case variant)\q,\qid\q:\qid:fixture_apps (case variant)\q,\qpath_lower\q:\q/apps (case variant)\q,\qpath_display\q:\q/apps (case variant)\q}}"
+      TEST-DROPBOX:ROUTE-SCRIPT!
+   loop ;
+
+\ Rust's fixture: Apps and apps/entry.doentry in the root, the file's
+\ baseline at Apps/entry.doentry, Apps listed with it and served.
+: TWO-APPS ( ^run ^ARENA:arena -- MODEL:remote )
+   {: x ar :}
+   ASSOCIATED$ s" rev-original" ar REMOTE-FILE {: rem :}
+   ASSOCIATED$ ar IDENTITY {: h:DROPBOX:hash :}
+   s" Apps/entry.doentry" s" rev-original" ASSOCIATED$ ar SERVES
+   [: s" /apps" s" /Apps" FOLDER-JSON+ COMMA+
+      s" /apps/entry.doentry" s" /Apps/entry.doentry"
+      s" rev-original" h FILE-JSON+ ;]
+   ar ENTRIES s" case-collision" false PAGE
+   VARIANT-MADE
+   x s" Apps" MKDIR-IN x s" apps" MKDIR-IN
+   x s" apps/entry.doentry" ASSOCIATED$ WRITE-IN
+   x s" Apps/entry.doentry" rem SEED-BASELINE
+   rem ;
+
+\ Rust's stale_delete: the plan for the local file confirmed absent
+\ under baseline and remote rem, recorded at Apps/entry.doentry.
+: STALE-DELETE ( ^run MODEL:remote -- )
+   {: x rem :}
+   x RUN-ARENA @ {: ar :}
+   rem MODEL-BASELINE:PRESENT LOCAL-ABSENT rem REMOTE-PRESENT
+   MODEL-SUBTREE:EMPTY PLANNER:PLAN PLANNED-OPERATION ar ONE-PLAN
+   {: plan :}
+   x RUN-JOURNAL @ s" Apps/entry.doentry" DISPLAY plan ar
+   JOURNAL:RECORD-PLAN WRITTEN TTRUE drop ;
+
+\ Rust's two folder creations, its upload and its download.
+: APPS-SEEN$ ( -- ^u8 n )
+   SB-RESET s" /2/files/list_folder /2/files/download " SB-APPEND
+   s" /2/files/create_folder_v2 /2/files/create_folder_v2 " SB-APPEND
+   s" /2/files/upload" SB-APPEND SB$ ;
+
+\ Both spellings' files hold the bytes, and no third spelling is made.
+: APPS-KEPT ( ^run -- )
+   {: x :}
+   x s" Apps/entry.doentry" IN-ROOT ASSOCIATED$ HOLDS-BYTES
+   x s" apps (case variant)/entry.doentry" IN-ROOT ASSOCIATED$
+   HOLDS-BYTES
+   x s" apps" EXISTS-IN? TFALSE
+   x s" apps (case variant 2)" EXISTS-IN? TFALSE ;
+
+: AUTOMATIC-CASE-RENAME-NEVER-BECOMES-A-DROPBOX-DELETE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" automatic_case_rename_never_becomes_a_dropbox_delete" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x ar TWO-APPS {: rem :}
+   x SCAN-PUBLISHED drop
+   x rem STALE-DELETE
+   x rec PASSED OUTCOME-FRESH? TTRUE
+   x rec PASSED drop
+   \ The download installs in the second pass, so the step finds none.
+   x STEP-UNBLOCKED
+   x APPS-KEPT
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2" CONTAINS? TFALSE
+   TEST-DROPBOX:SEEN$ APPS-SEEN$ T$=
+   d x STEP-GONE ;
+
+\ Rust's fixture: Credit/statements/april.pdf, credit/Expenses/
+\ invoice.pdf and credit/expenses/receipt.pdf in the root.
+: CREDIT-TREES ( ^run -- )
+   {: x :}
+   x s" Credit" MKDIR-IN x s" Credit/statements" MKDIR-IN
+   x s" credit" MKDIR-IN x s" credit/Expenses" MKDIR-IN
+   x s" credit/expenses" MKDIR-IN
+   x s" Credit/statements/april.pdf" s" statement" WRITE-IN
+   x s" credit/Expenses/invoice.pdf" s" invoice" WRITE-IN
+   x s" credit/expenses/receipt.pdf" s" receipt" WRITE-IN ;
+
+\ The first pass renames credit apart.
+: CREDIT-RENAMED ( ^run str -- )
+   {: x rec:str :}
+   x rec PASSED OUTCOME-FRESH? TTRUE
+   x s" Credit/statements/april.pdf" IN-ROOT s" statement" HOLDS-BYTES
+   x s" credit (case variant)/expenses/receipt.pdf" IN-ROOT
+   s" receipt" HOLDS-BYTES
+   x s" credit" EXISTS-IN? TFALSE
+   x PENDING-OF VEC:COUNT 0 T= ;
+
+\ The second pass renames credit (case variant)/expenses apart.
+: EXPENSES-RENAMED ( ^run str -- )
+   {: x rec:str :}
+   x rec PASSED OUTCOME-FRESH? TTRUE
+   x s" credit (case variant)/Expenses/invoice.pdf" IN-ROOT
+   s" invoice" HOLDS-BYTES
+   x s" credit (case variant)/expenses (case variant)/receipt.pdf"
+   IN-ROOT s" receipt" HOLDS-BYTES ;
+
+\ Rust's to_lowercase of each path is its key here: no two records'
+\ paths fold to one.
+: FOLDS-APART?
+   ( ^VEC:vector<MODEL:local-record> ^ARENA:arena -- bool )
+   {: rs ar :}
+   ar [type] str NEW-VECTOR {: v :}
+   rs VEC:COUNT 0 ?do
+      rs i VEC:AT @ MODEL-LOCAL--RECORD:UNMAKE {: p o :}
+      p ar MODEL:FOLD MODEL:KEY>STR v VEC:PUSH !
+   loop
+   v ar DISTINCT rs VEC:COUNT = ;
+
+: LOCAL-CASE-COLLISION-PRESERVES-BOTH-DIRECTORY-TREES
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" local_case_collision_preserves_both_directory_trees" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x CREDIT-TREES
+   x rec CREDIT-RENAMED
+   x rec EXPENSES-RENAMED
+   x SCAN-PUBLISHED ar FOLDS-APART? TTRUE
+   TEST-DROPBOX:SEEN$ s" " T$=
+   d x STEP-GONE ;
+
+: KEPT$ ( -- ^u8 n ) s" kept local bytes" ;
+: VARIANT$ ( -- ^u8 n ) s" variant local bytes" ;
+: NEWER$ ( -- ^u8 n ) s" newer remote bytes" ;
+
+\ Rust's fixture: Foo.txt baselined at rev-old and foo.txt in the root,
+\ foo.txt listed as Foo.txt at rev-new and served.
+: KEPT-SPELLING ( ^run ^ARENA:arena -- )
+   {: x ar :}
+   NEWER$ ar IDENTITY {: h:DROPBOX:hash :}
+   s" Foo.txt" s" rev-new" NEWER$ ar SERVES
+   [: s" /foo.txt" s" /Foo.txt" s" rev-new" h FILE-JSON+ ;]
+   ar ENTRIES s" kept-spelling" false PAGE
+   x s" Foo.txt" KEPT$ WRITE-IN
+   x s" foo.txt" VARIANT$ WRITE-IN
+   x s" Foo.txt" KEPT$ s" rev-old" ar REMOTE-FILE SEED-BASELINE ;
+
+\ The first pass renames foo.txt apart and keeps Foo.txt's baseline.
+: VARIANT-APART ( ^run str -- )
+   {: x rec:str :}
+   x rec PASSED OUTCOME-FRESH? TTRUE
+   x BASELINED$ s" Foo.txt" T$=
+   x s" Foo.txt" IN-ROOT KEPT$ HOLDS-BYTES
+   x s" foo.txt (case variant)" IN-ROOT VARIANT$ HOLDS-BYTES ;
+
+: KEPT-REPORTS ( report -- )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   planned 2 T= conflicts 0 T= ;
+
+\ Foo.txt replaced by the newer bytes, the variant kept.
+: KEPT-REPLACED ( ^run -- )
+   {: x :}
+   x RUN-JOURNAL @ x RUN-ARENA @ JOURNAL:CONFLICTS VEC:COUNT 0 T=
+   x PENDING-OF VEC:COUNT 0 T=
+   x s" Foo.txt" IN-ROOT NEWER$ HOLDS-BYTES
+   x s" foo.txt (case variant)" IN-ROOT VARIANT$ HOLDS-BYTES ;
+
+: UPLOAD-DOWNLOAD$ ( -- ^u8 n )
+   s" /2/files/list_folder /2/files/download /2/files/upload" ;
+
+: CASE-COLLISION-KEEPS-THE-BASELINED-SPELLING-AND-ITS-HISTORY
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" case_collision_keeps_the_baselined_spelling_and_its_history"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x ar KEPT-SPELLING
+   x rec VARIANT-APART
+   x rec PASSED COMPLETE KEPT-REPORTS
+   \ Rust's pending ReplaceLocal of rev-new over the kept bytes runs in
+   \ this pass: rev-new downloaded, then installed with no conflict.
+   TEST-DROPBOX:ARGS-SENT$ S\" {\qpath\q:\qrev:rev-new\q}" CONTAINS?
+   TTRUE
+   x STEP-UNBLOCKED
+   x KEPT-REPLACED
+   TEST-DROPBOX:SEEN$ UPLOAD-DOWNLOAD$ T$=
+   d x STEP-GONE ;
+
+: UPPER$ ( -- ^u8 n ) s" upper local bytes" ;
+: LOWER$ ( -- ^u8 n ) s" lower local bytes" ;
+
+: CASE-COLLISION-SPARES-THE-RECORDED-GREATER-SPELLING
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" case_collision_spares_the_recorded_greater_spelling" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" Foo.txt" UPPER$ WRITE-IN
+   x s" foo.txt" LOWER$ WRITE-IN
+   x s" foo.txt" LOWER$ s" rev-old" ar REMOTE-FILE SEED-BASELINE
+   x rec PASSED OUTCOME-FRESH? TTRUE
+   x BASELINED$ s" foo.txt" T$=
+   x s" foo.txt" IN-ROOT LOWER$ HOLDS-BYTES
+   x s" Foo.txt (case variant)" IN-ROOT UPPER$ HOLDS-BYTES
+   x s" Foo.txt" EXISTS-IN? TFALSE
+   TEST-DROPBOX:SEEN$ s" " T$=
+   d x STEP-GONE ;
+
+: NOTES$ ( -- ^u8 n ) s" synced notes" ;
+
+\ Rust's fixture: notes.txt baselined and listed at rev-synced, and the
+\ symlink Notes.txt beside it.
+: NOTES-BESIDE-LINK ( ^run ^ARENA:arena -- )
+   {: x ar :}
+   NOTES$ ar IDENTITY {: h:DROPBOX:hash :}
+   [: s" /notes.txt" s" /notes.txt" s" rev-synced" h FILE-JSON+ ;]
+   ar ENTRIES s" symlink-variant" false PAGE
+   x s" notes.txt" NOTES$ WRITE-IN
+   x s" Notes.txt" s" symlink-target" LINKS-TO
+   x s" notes.txt" NOTES$ s" rev-synced" ar REMOTE-FILE SEED-BASELINE ;
+
+: CASE-COLLISION-BESIDE-A-SYMLINK-RENAMES-THE-BASELINED-FILE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" case_collision_beside_a_symlink_renames_the_baselined_file"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x ar NOTES-BESIDE-LINK
+   x rec PASSED OUTCOME-FRESH? TTRUE
+   x BASELINED$ s" " T$=
+   x s" notes.txt (case variant)" IN-ROOT NOTES$ HOLDS-BYTES
+   x s" notes.txt" EXISTS-IN? TFALSE
+   x rec PASSED OUTCOME-FRESH? TFALSE
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/upload" T$=
+   d x STEP-GONE ;
+
+: OTHER$ ( -- ^u8 n ) s" other notes" ;
+
+\ Rust's fixture: other.txt and the symlinks Link and link in the root,
+\ an empty listing, then a continuation listing other.txt as its
+\ upload answers it.
+: TWO-LINKS ( ^run ^ARENA:arena -- )
+   {: x ar :}
+   OTHER$ ar IDENTITY {: h:DROPBOX:hash :}
+   [: s" /other.txt" s" /other.txt" s" rev-other" h FILE-JSON+ ;]
+   ar ENTRIES {: up:str :}
+   [: ;] ar ENTRIES s" symlink-collision" false PAGE
+   SB-RESET s" /other.txt" s" /other.txt" s" rev-other" h FILE-JSON+
+   UPLOAD-ROUTE$ 200 s" " s" " SB$ TEST-DROPBOX:ROUTE-SCRIPT!
+   up s" symlink-collision-after" false PAGE
+   x s" other.txt" OTHER$ WRITE-IN
+   x s" Link" s" upper-target" LINKS-TO
+   x s" link" s" lower-target" LINKS-TO ;
+
+: LINKS-SEEN$ ( -- ^u8 n )
+   SB-RESET s" /2/files/list_folder /2/files/upload " SB-APPEND
+   s" /2/files/list_folder/continue" SB-APPEND SB$ ;
+
+: CASE-COLLISION-OF-SYMLINKS-STAYS-IN-PLACE ( ^ARENA:arena -- )
+   {: ar :}
+   s" case_collision_of_symlinks_stays_in_place" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x ar TWO-LINKS
+   x rec PASSED OUTCOME-FRESH? TFALSE
+   x rec PASSED OUTCOME-FRESH? TFALSE
+   TEST-DROPBOX:SEEN$ LINKS-SEEN$ T$=
+   x s" Link" IN-ROOT LINK-TARGET$ s" upper-target" T$=
+   x s" link" IN-ROOT LINK-TARGET$ s" lower-target" T$=
+   x ROOT-NAMES$ S\" Link\nlink\nother.txt" T$=
+   d x STEP-GONE ;
+
+: CASE-COLLISION-PASS-CASES ( ^ARENA:arena -- )
+   {: ar :}
+   ar CASE-ONLY-REMOTE-SPELLING-CHANGE-IS-A-STABLE-NOOP
+   ar LOCAL-CASE-COLLISION-IS-RENAMED-BEFORE-PLANNING-AND-THEN-SYNCS
+   ar AUTOMATIC-CASE-RENAME-NEVER-BECOMES-A-DROPBOX-DELETE
+   ar LOCAL-CASE-COLLISION-PRESERVES-BOTH-DIRECTORY-TREES
+   ar CASE-COLLISION-KEEPS-THE-BASELINED-SPELLING-AND-ITS-HISTORY
+   ar CASE-COLLISION-SPARES-THE-RECORDED-GREATER-SPELLING
+   ar CASE-COLLISION-BESIDE-A-SYMLINK-RENAMES-THE-BASELINED-FILE
+   ar CASE-COLLISION-OF-SYMLINKS-STAYS-IN-PLACE ;
+
 : SERVED ( ^ARENA:arena -- )
    {: ar :}
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
@@ -4825,7 +5280,7 @@ $1C0 constant OWNER-ACCESS
    [: ar REFRESH-CASES ar STEP-CASES ar PASS-CASES
       ar STALE-CASES ar DOWNLOAD-BLOCKS-CASES ar UPLOADS-CASES
       ar CONFLICTS-CASES ar RESTRICTED-CASES
-      ar EDITS-AND-DIRECTORIES-CASES ;]
+      ar EDITS-AND-DIRECTORIES-CASES ar CASE-COLLISION-PASS-CASES ;]
    [: MAIN @ DROPBOX:CLOSE ;]
    finally ;
 
