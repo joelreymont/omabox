@@ -1066,3 +1066,42 @@ from `READ-BODY`. Each gap was a whole class of answer that Habu's own
 tests never sent. Rust's test suite was a better specification than
 the Rust code's comments, and porting it name by name is what found
 these gaps.
+
+## 2026-11-16: a check the port's timing dropped
+
+Rust's replay step hands each download to a background pool and
+installs it at the next step, after that step has checked that the
+configured root is still the one the journal knows. The port runs each
+download inside the step and installs it at once, which the design
+chose so that nothing is in flight between passes. That choice
+silently dropped the check: the root was checked once, before the
+downloads, and a download can run for minutes. I found it while
+reading Rust's root-swap test to brief its port, before any test had
+run. In Rust the check lives in the timing of the control flow; in the
+port it had to become explicit, and the fix was two rows of the
+download machine's table: a staged state that senses the root, and a
+final state for a root that changed.
+
+Porting tests written for a background pool to one task needs a new
+form for each, not a translation. Rust's `drive_replay` polls until
+the pool settles; one REPLAY-STEP call does the same work. A download
+held open by a gated fake becomes a plan whose binding is still live.
+A root swapped while the gate is held needs the fake to run the swap
+on its own task during the download.
+
+The six-input limit on a word shaped a data structure. The worker
+could not build one record per download (seven fields), so it built
+one record per step and set the plan and operation before each run.
+Rust's struct literal has no such limit; Habu's rule pushed the code
+toward one mutable context, which the machine then owns.
+
+The private namespace clashed again, this time between the code and
+its test file: the test file reopens the package, so a new `PATH-OF`
+in reconcile.f met one already in reconcile-test.f. And a brief I
+wrote from the design left out an export the design had settled; the
+worker got the addition mid-lane. Briefs written from memory keep
+costing a round.
+
+Refreshing the shared engine to Habu master took 9 seconds to reach a
+fixpoint (generation 2 matched generation 1), then 114 seconds for
+Habu's 285 suites to qualify it.
