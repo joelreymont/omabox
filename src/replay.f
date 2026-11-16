@@ -3,10 +3,12 @@
 \ answer, the journal steps that finish, supersede or complete a plan,
 \ the replay of the plans' local operations, a staged upload's local
 \ conflict copy, and the retention of legacy recovery payloads. A
-\ LOCAL, JOURNAL or DROPBOX failure passes up with its own code, which
-\ that library logged where it saw it. A journal answer the replay
-\ contract refuses is logged once with the Rust version's text, naming
-\ the plan's path, then thrown as E-INVALID-STATE. A failed retention
+\ LOCAL call whose failures REPLAY converts into outcomes runs under
+\ LOCAL:CONVERTING, so nothing logs those; any other LOCAL, JOURNAL or
+\ DROPBOX failure passes up with its own code, which that library
+\ logged where it saw it. A journal answer the replay contract
+\ refuses is logged once with the Rust version's text, naming the
+\ plan's path, then thrown as E-INVALID-STATE. A failed retention
 \ syscall is logged once, as LOCAL logs one, and thrown as LOCAL's E-IO.
 \ STORAGE CLASS. No state of its own. CALLER-OWNED: a report, its
 \ vector, a local replay's run, and every value a journal step or a
@@ -20,7 +22,6 @@ require src/lib/arena.f
 require src/lib/log.f
 require src/lib/adt/option.f
 require src/lib/vector.f
-require src/lib/span.f
 require src/lib/fs.f
 require src/lib/fs-anchored.f
 require src/lib/fd.f
@@ -362,8 +363,9 @@ STRUCTURE retention
    LOG:;LINE
    e FS:CAUSE! LOCAL:E-IO throw ;
 
-\ As Rust's drop of an OwnedFd, it ignores close's own failure.
-: CLOSE-DIRECTORY ( fd -- ) FD>N close ;
+\ Closes a descriptor; as Rust's drop of an OwnedFd or a File, it
+\ ignores close's own failure.
+: DISCARD ( fd -- ) FD>N close ;
 
 : SYNC-DIRECTORY ( fd str -- )
    {: dir:fd d:str :}
@@ -444,14 +446,15 @@ STRUCTURE retention
 
 \ Forgets the record once the directory's entries are on disk, so an
 \ interrupted pass retries the same cleanup.
-: FORGET ( retention JOURNAL:recovery-record -- n )
+: SYNC-THEN-FORGET ( retention JOURNAL:recovery-record -- n )
    {: x r :}
    x DIR-OF x PATH-OF SYNC-DIRECTORY
    x JOURNAL-OF r FORGET-RECOVERY ;
 
-\ VERIFY-PRIVATE-COPY's failures that keep the payload where it is.
-: KEEPS? ( n -- bool )
-   {: code:n :}
+\ VERIFY-PRIVATE-COPY's failures that keep the payload where it is,
+\ by code alone.
+: KEEPS? ( n n -- bool )
+   {: code:n e:n :}
    code LOCAL:E-CORRUPT = code LOCAL:E-UNSUPPORTED = or
    code LOCAL:E-CHANGED = or code LOCAL:E-OCCUPIED = or
    code LOCAL:E-CONTENT-HASH = or code LOCAL:E-UNSAFE-PATH = or ;
@@ -463,7 +466,7 @@ STRUCTURE retention
    LOCAL:VERIFY-PRIVATE-COPY ;
 
 \ Removes the payload, gone already or not, then forgets the record.
-: REMOVE ( retention JOURNAL:recovery-record ^u8 n -- n )
+: REMOVE-PAYLOAD ( retention JOURNAL:recovery-record ^u8 n -- n )
    {: x r nm:^ nu:n :}
    x DIR-OF nm nu FS:TRY-REMOVE-FILE-AT 0= if
       FS:ERRNO FS:ENOENT <> if
@@ -471,17 +474,17 @@ STRUCTURE retention
          r COPY-PATH MODEL:PATH>STR str> RETENTION-IO
       then
    then
-   x r FORGET ;
+   x r SYNC-THEN-FORGET ;
 
 \ The verified payload, removed while it is the file inspected before.
 : REINSPECT ( retention JOURNAL:recovery-record ^u8 n stat -- n )
    {: x r nm:^ nu:n before :}
    x DIR-OF nm nu s" reinspect retained recovery payload" r COPY-PATH
    STAT-AT MATCH option
-      none OF x r FORGET ENDOF
+      none OF x r SYNC-THEN-FORGET ENDOF
       some OF {: after :}
          after REGULAR? before after SAME-INODE? and
-         if x r nm nu REMOVE else 0 then
+         if x r nm nu REMOVE-PAYLOAD else 0 then
       ENDOF
    ;MATCH ;
 
@@ -489,11 +492,13 @@ STRUCTURE retention
 \ kept on a failure that concerns it alone.
 : CHECKED ( retention JOURNAL:recovery-record ^u8 n stat -- n )
    {: x r nm:^ nu:n before :}
-   false [: drop x r nm nu VERIFY ;] catch {: code:n :}
+   false [: drop x r nm nu VERIFY ;]
+   ['] KEEPS? LOCAL:CONVERTING {: code:n :}
    code 0= if
-      if x r nm nu before REINSPECT else x r FORGET then exit
+      if x r nm nu before REINSPECT exit then
+      x r SYNC-THEN-FORGET exit
    then
-   drop code KEEPS? if 0 exit then
+   drop code FS:ERRNO KEEPS? if 0 exit then
    code throw ;
 
 \ The payload at the name: forgotten when gone, kept when it is not a
@@ -502,7 +507,7 @@ STRUCTURE retention
    {: x r nm:^ nu:n :}
    x DIR-OF nm nu s" inspect retained recovery payload" r COPY-PATH
    STAT-AT MATCH option
-      none OF x r FORGET ENDOF
+      none OF x r SYNC-THEN-FORGET ENDOF
       some OF {: before :}
          before REGULAR? r RETAINED x NOW-OF EXPIRED? and
          if x r nm nu before CHECKED else 0 then
@@ -530,7 +535,7 @@ STRUCTURE retention
    d du s" open recovery directory for retention"
    LOCAL:OPEN-PRIVATE-DIRECTORY {: dir:fd :}
    j dir d du >str now ar RETENTION-MAKE {: x :}
-   [: x PRUNE-ALL ;] [: dir CLOSE-DIRECTORY ;] finally ;
+   [: x PRUNE-ALL ;] [: dir DISCARD ;] finally ;
 
 \ PRUNE-COMPLETED-RECOVERIES at now, in seconds since the epoch.
 : PRUNE-COMPLETED-RECOVERIES-AT ( JOURNAL:journal ^u8 n n -- n )
@@ -629,18 +634,18 @@ ENUM apply-event done blocked ;ENUM
    r RUN-PATH REPLAY-REPLAY--BLOCKED:FRESH-OBSERVATION-REQUIRED
    r BLOCKED ;
 
-\ Rust's local_object_blocks_replay: an object at the path that
-\ replay cannot act on blocks the plan; any other failure passes up.
-: LOCAL-OBJECT? ( n -- bool )
-   {: code:n :}
+\ Rust's local_object_blocks_replay, of a code and its errno: an object
+\ at the path that replay cannot act on blocks the plan; any other
+\ failure passes up.
+: LOCAL-OBJECT? ( n n -- bool )
+   {: code:n e:n :}
    code LOCAL:E-UNSUPPORTED = if true exit then
    code LOCAL:E-IO <> if false exit then
-   FS:ERRNO {: e:n :}
    e FS:ELOOP = e FS:ENOTDIR = or ;
 
 : LOCAL-OBJECT ( ^local-run n -- apply-event )
    {: r code:n :}
-   code LOCAL-OBJECT? 0= if code throw then
+   code FS:ERRNO LOCAL-OBJECT? 0= if code throw then
    r RUN-PATH REPLAY-REPLAY--BLOCKED:LOCAL-OBJECT r BLOCKED ;
 
 : REMOTE ( ^local-run -- apply-event )
@@ -671,7 +676,8 @@ ENUM apply-event done blocked ;ENUM
    {: r :}
    LOCAL-CREATE--DIRECTORY--OUTCOME:CREATED
    [: DROP-MADE r LOCAL-RUN-ROOT @ r RUN-TARGET
-      LOCAL:CREATE-DIRECTORY-AT ;] catch {: code:n :}
+      LOCAL:CREATE-DIRECTORY-AT ;]
+   ['] LOCAL-OBJECT? LOCAL:CONVERTING {: code:n :}
    code 0= if r MADE exit then
    drop r code LOCAL-OBJECT ;
 
@@ -688,7 +694,8 @@ ENUM apply-event done blocked ;ENUM
    {: r :}
    LOCAL-DELETE--DIRECTORY--OUTCOME:DELETED
    [: DROP-REMOVED r LOCAL-RUN-ROOT @ r RUN-TARGET
-      LOCAL:DELETE-DIRECTORY-AT ;] catch {: code:n :}
+      LOCAL:DELETE-DIRECTORY-AT ;]
+   ['] LOCAL-OBJECT? LOCAL:CONVERTING {: code:n :}
    code 0= if r REMOVED exit then
    drop r code LOCAL-OBJECT ;
 
@@ -700,7 +707,7 @@ ENUM apply-event done blocked ;ENUM
 : PRESENT ( MODEL:remote ^local-run -- apply-event )
    swap MODEL-BASELINE:PRESENT swap FINAL ;
 
-: OCCUPIED ( JOURNAL:plan-id str ^local-run -- apply-event )
+: STAGE-OCCUPIED ( JOURNAL:plan-id str ^local-run -- apply-event )
    {: id p:str r :}
    id p REPLAY-REPLAY--BLOCKED:STAGE-DESTINATION-OCCUPIED
    r BLOCKED ;
@@ -718,7 +725,7 @@ ENUM apply-event done blocked ;ENUM
          REPLAY-REPLAY--BLOCKED:DOWNLOAD-REQUIRED r BLOCKED
       ENDOF
       stage-destination-occupied OF {: p:str :}
-         r LOCAL-RUN-PLAN @ PLAN-ID p r OCCUPIED
+         r LOCAL-RUN-PLAN @ PLAN-ID p r STAGE-OCCUPIED
       ENDOF
       precondition-changed OF r CHANGED ENDOF
    ;MATCH ;
@@ -732,7 +739,7 @@ ENUM apply-event done blocked ;ENUM
    LOCAL-INSTALL--OUTCOME:INSTALLED
    [: DROP-INSTALLED r RUN-ROOT r RUN-TARGET want expected
       r LOCAL-RUN-ARENA @ LOCAL:INSTALL-DOWNLOAD-AT ;]
-   catch {: code:n :}
+   ['] LOCAL-OBJECT? LOCAL:CONVERTING {: code:n :}
    code 0= if src r INSTALLED exit then
    drop r code LOCAL-OBJECT ;
 
@@ -749,7 +756,7 @@ ENUM apply-event done blocked ;ENUM
    LOCAL-DELETE--OUTCOME:DELETED
    [: DROP-DELETED r RUN-ROOT r RUN-TARGET want
       r LOCAL-RUN-ARENA @ LOCAL:DELETE-LOCAL-AT ;]
-   catch {: code:n :}
+   ['] LOCAL-OBJECT? LOCAL:CONVERTING {: code:n :}
    code 0= if r DELETED exit then
    drop r code LOCAL-OBJECT ;
 
@@ -858,18 +865,6 @@ public
 
 private
 
-\ Closes a descriptor; as Rust's drop of a File, it ignores close's own
-\ failure.
-: DISCARD ( fd -- ) FD>N close ;
-
-\ The span filled from the open upload, or the bytes before its end.
-: UPLOAD-READ ( fd ^u8 n -- n )
-   {: f:fd p:^ u:n :}
-   f p u SPAN:MAKE FD:READ-EXACT MATCH FD:fill
-      full OF u ENDOF
-      eof OF ENDOF
-   ;MATCH ;
-
 : COPY-OCCUPIED ( -- copy-outcome )
    MODEL-BLOCKAGE:CONFLICT-COPY-OCCUPIED REPLAY-COPY--OUTCOME:BLOCKED ;
 : DROP-COPY ( copy-outcome -- ) drop ;
@@ -890,10 +885,10 @@ private
    {: code:n :}
    code LOCAL:E-UNSUPPORTED = code LOCAL:E-UNREADABLE = or ;
 
-\ Whether a failed copy found its name held: by other bytes, or by an
-\ entry Omabox cannot replace.
-: OCCUPIED? ( n -- bool )
-   {: code:n :}
+\ Whether a failed copy found its name held, by code alone: by other
+\ bytes, or by an entry Omabox cannot replace.
+: OCCUPIED? ( n n -- bool )
+   {: code:n e:n :}
    code LOCAL:E-OCCUPIED = if true exit then
    code COPY-NAME-OCCUPIED? ;
 
@@ -904,7 +899,7 @@ private
    {: root:fd r:^ ru:n path:MODEL:path up:^LOCAL:staged-upload f:fd
       ar:^ARENA:arena :}
    root r ru path MODEL:PATH>STR str> LOCAL-CONFLICT--SIDE:LOCAL
-   up LOCAL:UPLOAD-CONTENT [: f -rot UPLOAD-READ ;] ar
+   up LOCAL:UPLOAD-CONTENT [: f -rot LOCAL:FD-READ ;] ar
    LOCAL:MATERIALIZE-CONFLICT-AT ;
 
 \ An occupied copy name blocks the copy; another failure passes up.
@@ -914,9 +909,10 @@ private
    {: root:fd r:^ ru:n path:MODEL:path up:^LOCAL:staged-upload f:fd
       ar:^ARENA:arena :}
    COPY-OCCUPIED [: DROP-COPY root r ru path up f ar WRITE-COPY
-      >COPY-OUTCOME ;] catch {: code:n :}
+      >COPY-OUTCOME ;]
+   ['] OCCUPIED? LOCAL:CONVERTING {: code:n :}
    code 0= if exit then
-   drop code OCCUPIED? if COPY-OCCUPIED exit then
+   drop code FS:ERRNO OCCUPIED? if COPY-OCCUPIED exit then
    code throw ;
 
 \ COPY-IN from the verified upload, which closes after it.

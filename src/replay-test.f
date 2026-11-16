@@ -8,19 +8,21 @@
 \   unknown entries, and forgets a record whose payload is already gone.
 \ - REPLAY-LOCAL-PLANS-AT below a sync root: Rust's
 \   legacy_local_preservation_replays_without_creating_a_copy, and a
-\   directory at one plan's install target blocking only that plan, the
-\   next plan's directory made and its baseline written.
+\   directory at one plan's install target blocking only that plan,
+\   logging nothing, the next plan's directory made and its baseline
+\   written.
 \ - MATERIALIZE-LOCAL-CONFLICT, given a staged upload in a fresh sync
-\   root, answers blocked conflict-copy-occupied for a directory or an
-\   unreadable file at the copy's name and ready beside a directory
-\   elsewhere, and passes up LOCAL's E-IO when the copy's parent denies
-\   writes.
+\   root, answers blocked conflict-copy-occupied for a directory at the
+\   copy's name, logging nothing, or an unreadable file there, and ready
+\   beside a directory elsewhere, and passes up LOCAL's E-IO when the
+\   copy's parent denies writes.
 \ Run from the repository root: hb --load src/replay-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
 require src/lib/string.f
 require src/lib/fmt.f
 require src/lib/test.f
+require src/lib/test/stderr.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
 require src/lib/fs-anchored.f
@@ -79,6 +81,16 @@ private
    d p r ;
 
 : GONE ( str -- ) str> FS:REMOVE-TREE ;
+
+\ Runs q with fd 2 sent to stderr.txt in the case's directory d, which
+\ q must leave empty: q logs nothing.
+: QUIETLY ( str [ -- ] ^ARENA:arena -- )
+   {: d:str q ar :}
+   d s" stderr.txt" ar INSIDE str> {: e:^ eu:n :}
+   e eu STDERR:CAPTURE
+   [: q execute ;] [: STDERR:;CAPTURE ;] finally
+   e eu FS:FILE-SIZE 0 T=
+   e eu FS:REMOVE-FILE ;
 
 
 \ ---- plans ---------------------------------------------------------
@@ -262,6 +274,25 @@ private
    loop
    false ;
 
+: STATUS>N ( JOURNAL:record-status -- n )
+   MATCH JOURNAL:record-status
+      pending OF 0 ENDOF
+      completed OF 1 ENDOF
+   ;MATCH ;
+
+\ 1 and the time a retention started, 0 0 when it has not.
+: START>N ( option<n> -- n n )
+   MATCH option
+      none OF 0 0 ENDOF
+      some OF 1 swap ENDOF
+   ;MATCH ;
+
+: SAME-START? ( option<n> option<n> -- bool )
+   {: a b :}
+   a START>N {: af:n at:n :}
+   b START>N {: bf:n bt:n :}
+   af bf = at bt = and ;
+
 \ The fields of two recovery records agree, path and content bytes
 \ compared.
 : SAME-RECORD?
@@ -273,7 +304,9 @@ private
    o JOURNAL:OPERATION-ID>N o2 JOURNAL:OPERATION-ID>N = and
    p MODEL:PATH>STR str> p2 MODEL:PATH>STR str> STR= and
    q MODEL:PATH>STR str> q2 MODEL:PATH>STR str> STR= and
-   c DROPBOX:HASH>STR str> c2 DROPBOX:HASH>STR str> STR= and ;
+   c DROPBOX:HASH>STR str> c2 DROPBOX:HASH>STR str> STR= and
+   s STATUS>N s2 STATUS>N = and
+   t t2 SAME-START? and ;
 
 PROCESS-SYMBOLS
 FUNCTION: UTIMENSAT-CALL utimensat ( n ^u8 ^u8 n -- i32 ) ;FUNCTION
@@ -519,6 +552,14 @@ create TIMES 32 allot
    j JOURNAL:CLOSE
    d GONE ;
 
+\ The replay completed the other plan's one operation and blocked
+\ only the plan at taken.txt, on the local object there.
+: TAKEN-BLOCKED ( ^REPLAY:replay-report -- )
+   {: r :}
+   r COMPLETED 1 T=
+   r BLOCKS VEC:COUNT 1 T=
+   r BLOCKS 0 VEC:AT @ s" taken.txt" LOCAL-OBJECT-AT? TTRUE ;
+
 : A-LOCAL-OBJECT-BLOCKS-ONLY-ITS-PLAN ( ^ARENA:arena -- )
    {: ar :}
    s" a local object blocks only its plan" T-LABEL
@@ -530,10 +571,7 @@ create TIMES 32 allot
    p JOURNAL:OPEN {: j :}
    j s" taken.txt" ops ar RECORD-OPS
    j s" made" ar RECORD
-   j root ar REPLAYED {: r :}
-   r COMPLETED 1 T=
-   r BLOCKS VEC:COUNT 1 T=
-   r BLOCKS 0 VEC:AT @ s" taken.txt" LOCAL-OBJECT-AT? TTRUE
+   d [: j root ar REPLAYED TAKEN-BLOCKED ;] ar QUIETLY
    root s" made" ar INSIDE str> FS:EXISTS? TTRUE
    j s" made" DISPLAY ar JOURNAL:BASELINE DIRECTORY? TTRUE
    j ar JOURNAL:PENDING-PLANS s" taken.txt" ONLY-AT
@@ -625,7 +663,8 @@ $140 constant MODE-NO-WRITE
    r s s" notes.txt" ar STAGED {: up :}
    r s" notes.txt" up ar COPY-NAME {: c:str :}
    c str> FS:MAKE-DIR
-   r s" notes.txt" up ar LOCAL-COPY$ BLOCKED-OCCUPIED
+   d [: r s" notes.txt" up ar LOCAL-COPY$ BLOCKED-OCCUPIED ;] ar
+   QUIETLY
    c str> FS:REMOVE-DIR
    r up c ar UNREADABLE-COPY
    r s" notes.d" ar INSIDE str> FS:MAKE-DIR
