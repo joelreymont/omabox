@@ -15,9 +15,11 @@
 \ lost connection retry 0; anything else logs one line (route, status, at
 \ most EXCERPT bytes of the body, never a token) and throws a DROPBOX code,
 \ a bug on one side of the wire. An answer that does not parse logs one
-\ line too and throws E-ANSWER, but an upload's or a finish's 200 answers
-\ refused unverified. E-NOT-STORED is environmental instead:
-\ the store failed, and the next call retries it.
+\ line too and throws E-ANSWER, but a 200 to upload, finish, delete or
+\ create-folder answers refused unverified. A mutation lost, or answered
+\ 408 or 5xx with no wait, may have been applied, so it answers refused
+\ unverified; a wait Dropbox asks for stays retry. E-NOT-STORED is
+\ environmental instead: the store failed, and the next call retries it.
 \ A 409's error is a Dropbox union: its leaf tag is the `.tag` of the member
 \ named by the outer `.tag`, or of `reason` in an upload's error, when that
 \ member is an object, else the outer `.tag` itself, so path/not_found reads
@@ -59,9 +61,8 @@ public
 -100007 s" the rotated Dropbox refresh token could not be stored"
    ERROR:CODE E-NOT-STORED
 
-\ Dropbox's 409 tags omabox decides on, else other; no tag: path-mismatch,
-\ an entry elsewhere, and unverified, a download that fails a check or
-\ parse, or a mutation answer lost or not its intended entry.
+\ Dropbox's 409 tags omabox decides on, else other; no tag: path-mismatch, an
+\ entry elsewhere, and unverified, an answer omabox cannot trust.
 ENUM error DERIVE eq
    not-found not-file not-folder malformed-path disallowed-name
    conflict no-write-permission restricted-content
@@ -695,12 +696,25 @@ ENUM verdict
    code r ru CURL-FAILED ;
 
 
-\ Whether the last call's own answer was lost: its route's transfer failed,
-\ so LOST answered retry 0. A lost refresh is the quiet token route's, so
-\ the call never went out.
-: LOST? ( ^client -- bool )
-   {: c :}
-   c CLIENT-STATUS @ 0= c CLIENT-QUIET @ 0= and ;
+\ Whether the reply is a retry asking no wait.
+: RETRY-NOW? ( reply -- bool )
+   MATCH reply
+      done OF false ENDOF
+      refused OF drop false ENDOF
+      retry OF 0= ENDOF
+      unlinked OF false ENDOF
+   ;MATCH ;
+
+
+\ Whether Dropbox may have applied the call r answers, a retry asking no
+\ wait; never after a refresh's failure, as the call never went out.
+: UNSURE? ( reply ^client -- bool )
+   {: r:reply c :}
+   r RETRY-NOW? 0= if false exit then
+   c CLIENT-QUIET @ if false exit then
+   c CLIENT-STATUS @ {: s:n :}
+   s 0= if true exit then
+   s 429 <> s CURL:>HTTP-STATUS CURL:UNAVAILABLE? and ;
 
 
 \ 429: the larger of Retry-After and the body's error.retry_after; 408 or
@@ -2191,16 +2205,26 @@ private
    construct error unverified construct reply refused ;
 
 
-\ done stands if `read` finds its intended entry at the path; a lost
-\ answer or another entry is unverified; a refusal goes to `refusal`.
+\ Whether `read` finds the intended entry; an answer that does not parse or
+\ is incomplete, which it logged, is not. Other codes go on.
+: INTENDED? ( ^client [ ^client -- bool ] -- bool )
+   {: c read :}
+   false [: drop c read execute ;] catch {: code:n :}
+   code 0= if exit then
+   drop code E-ANSWER <> if code throw then
+   false ;
+
+
+\ done stands if `read` finds its intended entry at the path, else
+\ unverified, as is any answer UNSURE? flags; a refusal goes to `refusal`.
 : MUTATE ( ^client ^u8 n [ ^client -- bool ]
            [ error ^client -- reply ] -- reply )
    {: c rt:^ rtu:n read refusal :}
    c rt rtu [: JSON-BODY ;] CALL {: r:reply :}
-   c LOST? if UNVERIFIED exit then
+   r c UNSURE? if UNVERIFIED exit then
    r MATCH reply
       done OF
-         c read execute
+         c read INTENDED?
          if construct reply done else UNVERIFIED then
       ENDOF
       refused OF c refusal execute ENDOF
@@ -2288,10 +2312,11 @@ public
 \ A file up to CHUNK-SIZE bytes goes in one files/upload; a larger one
 \ through an upload session: CHUNK-SIZE appends, then a finish that carries
 \ no content_hash, as Dropbox checks that field against the call's own
-\ bytes. A lost answer to the upload or the finish, or a 2xx answer that
-\ is not the upload's complete entry at its path with its content hash,
-\ is refused unverified; a conflict is answered as refused. A run's chunk
-\ buffer is MEM's, released before UPLOAD answers or throws.
+\ bytes. A call Dropbox may have applied, or a 2xx answer that is not the
+\ upload's complete entry at its path with its content hash, is refused
+\ unverified, but an append is resent once; a conflict is answered as
+\ refused. A run's chunk buffer is MEM's, released before UPLOAD answers
+\ or throws.
 
 public
 
@@ -2686,10 +2711,10 @@ HEAP RUNS run
 
 ENUM upload-step
    single starting appending finishing verifying restarting ended ;ENUM
-ENUM send-event committed untrusted lost failed ;ENUM
-ENUM start-event opened lost failed ;ENUM
-ENUM append-event stored complete lost cut gone failed ;ENUM
-ENUM finish-event committed untrusted lost gone failed ;ENUM
+ENUM send-event committed untrusted unsure failed ;ENUM
+ENUM start-event opened unsure failed ;ENUM
+ENUM append-event stored complete unsure cut gone failed ;ENUM
+ENUM finish-event committed untrusted unsure gone failed ;ENUM
 ENUM confirm-event same elsewhere wait other unlinked ;ENUM
 ENUM restart-event once twice ;ENUM
 
@@ -2707,7 +2732,7 @@ ENUM restart-event once twice ;ENUM
    r SINGLE-SENT {: rep:reply :}
    rep r RUN-LAST !
    rep DONE? if r SEND-DONE exit then
-   r RUN-CLIENT @ LOST? if construct send-event lost exit then
+   rep r RUN-CLIENT @ UNSURE? if construct send-event unsure exit then
    construct send-event failed ;
 
 
@@ -2716,7 +2741,7 @@ ENUM restart-event once twice ;ENUM
    r START-SENT {: rep:reply :}
    rep r RUN-LAST !
    rep DONE? if r SESSION-READ construct start-event opened exit then
-   r RUN-CLIENT @ LOST? if construct start-event lost exit then
+   rep r RUN-CLIENT @ UNSURE? if construct start-event unsure exit then
    construct start-event failed ;
 
 
@@ -2727,11 +2752,11 @@ ENUM restart-event once twice ;ENUM
    construct append-event stored ;
 
 
-: LOST-AGAIN ( ^run -- append-event )
+: UNSURE-AGAIN ( ^run -- append-event )
    {: r :}
    r RUN-RESENT @ if construct append-event cut exit then
    true r RUN-RESENT !
-   construct append-event lost ;
+   construct append-event unsure ;
 
 
 : APPEND-SENSE ( ^run -- append-event )
@@ -2743,7 +2768,7 @@ ENUM restart-event once twice ;ENUM
    r APPEND-SENT {: rep:reply :}
    rep r RUN-LAST !
    rep DONE? if r ACCEPTED exit then
-   c LOST? if r LOST-AGAIN exit then
+   rep c UNSURE? if r UNSURE-AGAIN exit then
    rep r HELD? if r ACCEPTED exit then
    rep c APPEND-GONE? if construct append-event gone exit then
    construct append-event failed ;
@@ -2760,7 +2785,7 @@ ENUM restart-event once twice ;ENUM
    r FINISH-SENT {: rep:reply :}
    rep r RUN-LAST !
    rep DONE? if r FINISH-DONE exit then
-   c LOST? if construct finish-event lost exit then
+   rep c UNSURE? if construct finish-event unsure exit then
    rep c FINISH-GONE? if construct finish-event gone exit then
    construct finish-event failed ;
 
@@ -2794,9 +2819,6 @@ ENUM restart-event once twice ;ENUM
    {: r :}
    construct reply done r RUN-ANSWER !
    r SIZE r RUN-ACCEPTED ! ;
-
-
-: ANSWER-RETRY ( ^run -- ) {: r :} 0 RETRY r RUN-ANSWER ! ;
 
 
 : ANSWER-UNLINKED ( ^run -- )
@@ -2836,23 +2858,23 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
    IN single  SEND-SENSE
       committed  ANSWER-DONE        >ended
       untrusted  ANSWER-UNVERIFIED  >ended
-      lost       ANSWER-UNVERIFIED  >ended
+      unsure     ANSWER-UNVERIFIED  >ended
       failed     ANSWER-REPLY       >ended
    IN starting  START-SENSE ( start-event )
-      opened  -             >appending
-      lost    ANSWER-RETRY  >ended
-      failed  ANSWER-REPLY  >ended
+      opened  -                  >appending
+      unsure  ANSWER-UNVERIFIED  >ended
+      failed  ANSWER-REPLY       >ended
    IN appending  APPEND-SENSE ( append-event )
-      stored    CHUNK-ADVANCE  >appending
-      complete  CHUNK-ADVANCE  >finishing
-      lost      -              >appending
-      cut       ANSWER-RETRY   >ended
-      gone      -              >restarting
-      failed    ANSWER-REPLY   >ended
+      stored    CHUNK-ADVANCE      >appending
+      complete  CHUNK-ADVANCE      >finishing
+      unsure    -                  >appending
+      cut       ANSWER-UNVERIFIED  >ended
+      gone      -                  >restarting
+      failed    ANSWER-REPLY       >ended
    IN finishing  FINISH-SENSE ( finish-event )
       committed  ANSWER-DONE        >ended
       untrusted  ANSWER-UNVERIFIED  >ended
-      lost       ANSWER-UNVERIFIED  >ended
+      unsure     ANSWER-UNVERIFIED  >ended
       gone       -                  >verifying
       failed     ANSWER-REPLY       >ended
    IN verifying  CONFIRM-SENSE ( confirm-event )
@@ -2862,8 +2884,8 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
       other      -                >restarting
       unlinked   ANSWER-UNLINKED  >ended
    IN restarting  RESTART-SENSE ( restart-event )
-      once   REWIND        >starting
-      twice  ANSWER-RETRY  >ended
+      once   REWIND             >starting
+      twice  ANSWER-UNVERIFIED  >ended
    FINAL ended  -
 ;DEFINE
 

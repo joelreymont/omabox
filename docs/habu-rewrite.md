@@ -106,7 +106,8 @@ watcher comes only for a measured need.
   word. The four-worker pool's three (:846, :4081, :4194) do not apply; four
   (:7330, :8053, :8073, :8137) are `DAEMON`'s. Three (:3313, :5113, :5220)
   assert what `docs/habu-dropbox.md` changes on purpose: an upload session
-  restarts, a held conflict is done and a 5xx is retried.
+  restarts, and REPLAY, not `DROPBOX`, reads back a mutation's conflict or
+  5xx.
 - The planner's table, every value's JSON and `FOLD` over a case corpus,
   against what the Rust version prints (`src/oracle/`).
 - A Habu-made schema against a Rust-made one (`sqlite_master`), and a journal

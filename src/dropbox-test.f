@@ -3,7 +3,8 @@
 \ is not downloadable, of a symlink, of a file with no content hash and of
 \ an entry at another path among them), the Path-Root header, the token's
 \ refresh, its rotation and the store that keeps it, a refresh that fails
-\ a download and leaves no status, a rejected grant, a revoked token,
+\ a download and leaves no status, a rejected grant, a rejected client's
+\ delete after a long poll answered 503, a revoked token,
 \ access denied, a scripted answer bound to its route, rate limits,
 \ outages, a redirect, a malformed request, a write refused
 \ access_restricted, team_folder or
@@ -27,13 +28,17 @@
 \ Dropbox-API-Result or an error that does not parse), delete,
 \ create-folder, the code exchange, Dropbox's content hash and uploads,
 \ whose stages are written under TMPDIR and removed once open, so no run
-\ leaves one; a lost mutation or session finish, one Dropbox answers at
-\ another path, a delete it answers with a file at another rev, and an
-\ upload's or finish's answer that does not parse or carries another
-\ content hash, each refused unverified with no get_metadata; a finish
-\ whose session is gone and whose get_metadata finds the upload's content
-\ hash on a file with no rev, restarted, not done; a delete,
-\ create-folder or upload conflict answered as refused with no
+\ leaves one; a mutation, session start or finish lost or answered 503
+\ with no wait, an append lost twice, a session gone twice, a mutation
+\ Dropbox answers at another path, a delete it answers with a file at
+\ another rev, a delete's answer that does not parse, and an upload's or
+\ finish's that does not parse or carries another content hash, each
+\ refused unverified with no get_metadata; a finish whose session is gone
+\ and whose get_metadata finds the upload's content hash on a file with no
+\ rev, restarted and then unverified; an append answered 503 with no
+\ wait, resent; a delete answered 429, and a delete or an append answered
+\ 503 with a wait, each answering retry with that wait, not resent; a
+\ delete, create-folder or upload conflict answered as refused with no
 \ get_metadata, even where Dropbox already holds what it asked for.
 \ Tests of tests/dropbox_fake.rs run
 \ under their names: a_refused_grant_becomes_a_rejected_token,
@@ -518,6 +523,20 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    dead UNLINKED-LOGGED
    ERR-U @ 0 T=
    TEST-DROPBOX:SEEN$ s" /oauth2/token" T$=
+   dead DROPBOX:CLOSE ;
+
+
+\ A rejected client still long-polls, which needs no token. A delete after
+\ a poll answered 503 is unlinked, unsent, never unverified by that 503.
+: REJECTED-POLL-CASE ( -- )
+   s" rejected client after a failed long poll" T-LABEL
+   TEST-DROPBOX:RESET
+   s" dead-token" s" ns-root" OPENED {: dead :}
+   dead UNLINKED-LOGGED
+   503 s" " s" " s" " TEST-DROPBOX:SCRIPT!
+   s" c5" 30 dead DROPBOX:WAIT RETRY-MS 0 T=
+   s" /x.txt" s" " dead DROPBOX:DELETE UNLINKED? ASSERT
+   TEST-DROPBOX:SEEN$ s" /oauth2/token /2/files/list_folder/longpoll" T$=
    dead DROPBOX:CLOSE ;
 
 
@@ -1772,6 +1791,14 @@ TYPED-VARIABLE ZEROED bool
 : BUSY! ( -- ) 503 s" Retry-After" s" 3" s" " TEST-DROPBOX:SCRIPT! ;
 
 
+\ Queues a 503 that asks no wait.
+: UNAVAILABLE! ( -- ) 503 s" " s" " s" " TEST-DROPBOX:SCRIPT! ;
+
+
+\ The next call answers done with a body that does not parse.
+: GARBLED! ( -- ) 200 s" " s" " s" []" TEST-DROPBOX:SCRIPT! ;
+
+
 \ No get_metadata went out since RESET.
 : NO-LOOKUP ( -- ) s" /2/files/get_metadata" TEST-DROPBOX:CALLS 0 T= ;
 
@@ -1881,6 +1908,52 @@ TYPED-VARIABLE ZEROED bool
    TEST-DROPBOX:RESET
    S\" /\xc3\x84" MAIN @ DROPBOX:CREATE-FOLDER UNVERIFIED? ASSERT
    NO-LOOKUP ;
+
+
+: UNAVAILABLE-DELETE-CASE ( -- )
+   s" delete answered 503" T-LABEL
+   TEST-DROPBOX:RESET UNAVAILABLE!
+   s" /down.txt" s" " MAIN @ DROPBOX:DELETE UNVERIFIED? ASSERT
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2" T$= ;
+
+
+: UNAVAILABLE-FOLDER-CASE ( -- )
+   s" create-folder answered 503" T-LABEL
+   TEST-DROPBOX:RESET UNAVAILABLE!
+   s" /down-made" MAIN @ DROPBOX:CREATE-FOLDER UNVERIFIED? ASSERT
+   TEST-DROPBOX:SEEN$ s" /2/files/create_folder_v2" T$= ;
+
+
+\ Dropbox may have applied it, but asks to wait: the delete waits.
+: WAITED-DELETE-CASE ( -- )
+   s" delete answered 503 with a wait" T-LABEL
+   TEST-DROPBOX:RESET BUSY!
+   s" /busy.txt" s" " MAIN @ DROPBOX:DELETE RETRY-MS 3000 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2" T$= ;
+
+
+: GARBLED-DELETE ( -- )
+   s" /garbled.txt" s" " MAIN @ DROPBOX:DELETE UNVERIFIED? OUTCOME ! ;
+
+
+: GARBLED-DELETE-CASE ( -- )
+   s" delete answer that does not parse" T-LABEL
+   TEST-DROPBOX:RESET GARBLED!
+   false OUTCOME !
+   [: GARBLED-DELETE ;] LOGGED 0 T=
+   OUTCOME @ TTRUE
+   s" error dropbox: files/delete_v2 answered 200: an answer that does not parse"
+   LOGGED? TTRUE
+   NO-LOOKUP ;
+
+
+\ A rate limit applies nothing, so the delete waits it out.
+: RATED-DELETE-CASE ( -- )
+   s" delete rate limited" T-LABEL
+   TEST-DROPBOX:RESET
+   429 s" Retry-After" s" 3" s" " TEST-DROPBOX:SCRIPT!
+   s" /rated.txt" s" " MAIN @ DROPBOX:DELETE RETRY-MS 3000 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2" T$= ;
 
 
 \ A delete refused for an expired token, whose refresh is lost: retry 0,
@@ -2018,8 +2091,7 @@ variable FAULT-AT
 variable STRIKES
 ENUM fault
    cut cut-twice lose close unfound applied offset denied busy garbled
-   revless
-;ENUM
+   revless unavailable backoff ;ENUM
 TYPED-VARIABLE FAULT fault
 
 
@@ -2105,10 +2177,6 @@ TYPED-VARIABLE FAULT fault
    200 s" " s" " SB$ TEST-DROPBOX:SCRIPT! ;
 
 
-\ The next call answers done with a body that does not parse.
-: GARBLED! ( -- ) 200 s" " s" " s" []" TEST-DROPBOX:SCRIPT! ;
-
-
 \ The next call refused with incorrect_offset at 0, short of any chunk's end.
 : OFFSET! ( -- )
    409 s" " s" "
@@ -2129,6 +2197,8 @@ TYPED-VARIABLE FAULT fault
       busy OF UNFOUND BUSY! ENDOF
       garbled OF GARBLED! APPLIED ENDOF
       revless OF UNFOUND REVLESS! ENDOF
+      unavailable OF UNAVAILABLE! ENDOF
+      backoff OF BUSY! ENDOF
    ;MATCH ;
 
 
@@ -2385,10 +2455,21 @@ TYPED-VARIABLE FAULT fault
    UNSTAGED ;
 
 
+: UNAVAILABLE-SINGLE-CASE ( -- )
+   s" upload answered 503" T-LABEL
+   TEST-DROPBOX:RESET -1 FAULT-AT !
+   s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
+   UNAVAILABLE!
+   SEND UNVERIFIED? ASSERT
+   TEST-DROPBOX:SEEN$ s" /2/files/upload" T$=
+   UNSTAGED ;
+
+
 : SINGLE-CASES ( -- )
    CONDITIONAL-MUTATIONS-USE-STRICT-DOCUMENTED-REQUESTS
    CONFLICT-CASE HELD-CASE NON-ASCII-CASE OTHER-CASE-CASE
-   GARBLED-SINGLE-CASE LOST-SINGLE-CASE SHORT-STAGE-CASE REFUSED-STAGE-CASE FULL-READ-CASE
+   GARBLED-SINGLE-CASE LOST-SINGLE-CASE UNAVAILABLE-SINGLE-CASE
+   SHORT-STAGE-CASE REFUSED-STAGE-CASE FULL-READ-CASE
    ENTERED-READ-CASE TIMED-OUT-READ-CASE CANCELLED-READ-CASE ;
 
 
@@ -2466,9 +2547,39 @@ TYPED-VARIABLE FAULT fault
    s" lost session start" T-LABEL
    TEST-DROPBOX:RESET -1 FAULT-AT !
    TEST-DROPBOX:CUT
-   SEND RETRY-MS 0 T=
+   SEND UNVERIFIED? ASSERT
    SHOWS @ 0 T=
    TEST-DROPBOX:SEEN$ s" /2/files/upload_session/start" T$= ;
+
+
+: UNAVAILABLE-START-CASE ( -- )
+   s" session start answered 503" T-LABEL
+   TEST-DROPBOX:RESET -1 FAULT-AT !
+   UNAVAILABLE!
+   SEND UNVERIFIED? ASSERT
+   TEST-DROPBOX:SEEN$ s" /2/files/upload_session/start" T$= ;
+
+
+\ The second chunk's append answered 503 once: resent.
+: UNAVAILABLE-APPEND-CASE ( -- )
+   s" append answered 503" T-LABEL
+   SB-RESET S-START S-APPEND S-APPEND S-APPEND S-FINISH
+   CHUNK construct fault unavailable FAULTED ;
+
+
+\ The second chunk's append answered 503 asking a wait: not resent.
+: WAITED-APPEND-CASE ( -- )
+   s" append answered 503 with a wait" T-LABEL
+   CHUNK construct fault backoff 1 STRUCK RETRY-MS 3000 T=
+   SB-RESET S-START S-APPEND S-APPEND
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
+
+
+: UNAVAILABLE-FINISH-CASE ( -- )
+   s" finish answered 503" T-LABEL
+   CHUNK 1+ construct fault unavailable 1 STRUCK UNVERIFIED? ASSERT
+   SB-RESET S-START S-APPEND S-APPEND S-FINISH
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
 
 
 : LOST-FINISH-CASE ( -- )
@@ -2481,7 +2592,7 @@ TYPED-VARIABLE FAULT fault
 \ The second chunk's answer lost on its append and again on the resend.
 : CUT-APPEND-CASE ( -- )
    s" append lost twice" T-LABEL
-   CHUNK construct fault cut-twice 1 STRUCK RETRY-MS 0 T=
+   CHUNK construct fault cut-twice 1 STRUCK UNVERIFIED? ASSERT
    SB-RESET S-START S-APPEND S-APPEND S-APPEND
    TEST-DROPBOX:SEEN$ SB$ T$= ;
 
@@ -2489,7 +2600,7 @@ TYPED-VARIABLE FAULT fault
 \ The session closed after its first chunk, and its restart's too.
 : CLOSED-TWICE-CASE ( -- )
    s" session gone twice" T-LABEL
-   CHUNK construct fault close 2 STRUCK RETRY-MS 0 T=
+   CHUNK construct fault close 2 STRUCK UNVERIFIED? ASSERT
    SB-RESET S-START S-APPEND S-APPEND S-RESTART S-APPEND S-APPEND
    TEST-DROPBOX:SEEN$ SB$ T$= ;
 
@@ -2545,10 +2656,10 @@ TYPED-VARIABLE FAULT fault
 
 
 \ A finish gone twice, each time with the file Dropbox holds incomplete:
-\ not the upload's entry, so it restarts, and then retries.
+\ not the upload's entry, so it restarts, and then is unverified.
 : REVLESS-FINISH-CASE ( -- )
    s" finish gone, held with no rev" T-LABEL
-   CHUNK 1+ construct fault revless 2 STRUCK RETRY-MS 0 T=
+   CHUNK 1+ construct fault revless 2 STRUCK UNVERIFIED? ASSERT
    SB-RESET S-START S-APPEND S-APPEND S-FINISH
    s"  /2/files/get_metadata" SB-APPEND
    S-RESTART S-APPEND S-APPEND S-FINISH
@@ -2603,6 +2714,8 @@ TYPED-VARIABLE FAULT fault
    UNFOUND-FINISH-CASE REVLESS-FINISH-CASE DENIED-FINISH-CASE
    CUT-APPEND-CASE CLOSED-TWICE-CASE
    MISMATCH-CASE FINISH-ELSEWHERE-CASE GARBLED-FINISH-CASE BUSY-FINISH-CASE
+   UNAVAILABLE-START-CASE UNAVAILABLE-APPEND-CASE UNAVAILABLE-FINISH-CASE
+   WAITED-APPEND-CASE
    ENDED-EARLY-CASE
    UNSTAGED ;
 
@@ -2615,7 +2728,7 @@ TYPED-VARIABLE FAULT fault
    LOST-READ-CASE UNDOWNLOADABLE-CASE SYMLINK-CASE INCOMPLETE-CASE
    METADATA-ELSEWHERE-CASE
    SDK-EXPIRY-REFRESH-REISSUES-THE-ROUTE-WITH-THE-SAME-CLIENT
-   REJECTED-GRANT-CASE REVOKED-CASE DENIED-CASE
+   REJECTED-GRANT-CASE REJECTED-POLL-CASE REVOKED-CASE DENIED-CASE
    STORED-FIRST-CASE UNSTORED-CASE UNROTATED-CASE SCRIPTED-REFRESH-CASE
    OAUTH-RATE-LIMIT-PRESERVES-RETRY-AFTER-HEADER FAILED-REFRESH-CASE
    ROUTED-SCRIPT-CASE
@@ -2631,6 +2744,8 @@ TYPED-VARIABLE FAULT fault
    DELETE-CONFLICT-CASE DELETE-MISSING-CASE DELETE-GONE-CASE
    LOST-DELETE-CASE DELETE-ELSEWHERE-CASE DELETE-REV-CASE
    FOLDER-CONFLICT-CASE LOST-FOLDER-CASE FOLDER-ELSEWHERE-CASE
+   UNAVAILABLE-DELETE-CASE UNAVAILABLE-FOLDER-CASE RATED-DELETE-CASE
+   WAITED-DELETE-CASE GARBLED-DELETE-CASE
    LOST-REFRESH-CASE
    EXCHANGE-CASE DEAD-CODE-CASE RESERVED-REFRESH-CASE RESERVED-CODE-CASE
    OAUTH-LISTING-LONGPOLL-AND-EXACT-DOWNLOAD-USE-DOCUMENTED-PROTOCOL
