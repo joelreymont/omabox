@@ -64,12 +64,8 @@ STRUCTURE link DERIVE addr
    FIELD reply DROPBOX:reply
 ;STRUCTURE
 
-private
-
 \ Ends the pass on a Dropbox answer that is not one path's verdict.
 : STOP-PASS ( DROPBOX:reply ^link -- ) REPLAY-LINK:REPLY ! E-DROPBOX throw ;
-
-public
 
 \ destination-changed: the chosen path changed after it was observed;
 \ stage-occupied: other bytes hold its download stage;

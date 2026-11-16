@@ -45,6 +45,12 @@
 \ - LISTING-REJECTS-AN-ENTRY-WITHOUT-PATHS and
 \   LISTING-REJECTS-A-PATH-THAT-IS-NOT-UTF-8, an 0xFF byte: E-LISTING,
 \   one line logged, naming no path for the first.
+\ The listing against the fake Dropbox, Rust's tests of the same names,
+\ the fake's requests standing for Rust's refresh result:
+\ - cursor_reset_rebuilds_before_one_complete_publication
+\ - failed_rebuild_after_cursor_reset_preserves_durable_inventory
+\ - listing_applies_ordered_tree_mutations_across_pages
+\ - failed_later_page_cannot_publish_partial_listing_as_absence
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -58,12 +64,16 @@ require src/lib/fd.f
 require src/lib/vector.f
 require src/lib/adt/option.f
 require src/lib/fs-anchored.f
+require src/lib/aio.f
+require src/lib/net/curl.f
 require src/dropbox.f
+require src/test-dropbox.f
 require src/model.f
 require src/journal.f
 require src/test-journal.f
 require src/local.f
 require src/planner.f
+require src/replay.f
 require src/reconcile.f
 
 \ RECONCILE reopened for the private words the tests call.
@@ -1410,6 +1420,292 @@ ARENA LISTED DROPBOX:entry
    s" configured Dropbox root is not a folder" d ar ROOT-REFUSED
    d str> FS:REMOVE-TREE ;
 
+\ ---- the listing against the fake Dropbox ---------------------------
+
+TYPED-VARIABLE CFG DROPBOX:config
+\ The client on the fake, while it serves.
+TYPED-VARIABLE MAIN ^DROPBOX:client
+ARENA LINKS REPLAY:link
+
+\ A client on the fake, no root, keeping no rotated token.
+: OPENED ( ^ARENA:arena -- ^DROPBOX:client )
+   {: ar :}
+   [: 2drop ;] CFG DROPBOX-CONFIG:STORE !
+   CFG DROPBOX:PRODUCTION
+   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:API !
+   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:NOTIFY !
+   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:CONTENT !
+   s" fake-key" SPAN:MAKE CFG DROPBOX-CONFIG:KEY !
+   s" live-token" SPAN:MAKE CFG DROPBOX-CONFIG:TOKEN !
+   s" " SPAN:MAKE CFG DROPBOX-CONFIG:ROOT !
+   CFG ar DROPBOX:OPEN ;
+
+\ Ends the run: the case cannot go on.
+: FAILED ( ^u8 n -- ) T-EX-FAIL die ;
+
+: CURL-READY ( CURL:status -- )
+   MATCH CURL:status
+      ok OF ENDOF
+      failed OF drop s" the curl loop did not start" FAILED ENDOF
+   ;MATCH ;
+
+\ The account call takes the client's first access token, so no case's
+\ requests start with a refresh.
+: ACCOUNTED ( -- )
+   MAIN @ DROPBOX:ACCOUNT MATCH DROPBOX:reply
+      done OF ENDOF
+      refused OF drop s" the account was refused" FAILED ENDOF
+      retry OF drop s" the account asked a retry" FAILED ENDOF
+      unlinked OF s" the account was unlinked" FAILED ENDOF
+   ;MATCH ;
+
+: NEW-LINK ( ^ARENA:arena -- ^REPLAY:link )
+   LINKS-NEW {: l :} MAIN @ l REPLAY-LINK:CLIENT ! l ;
+
+: RETRY? ( DROPBOX:reply -- bool )
+   MATCH DROPBOX:reply
+      done OF false ENDOF
+      refused OF drop false ENDOF
+      retry OF drop true ENDOF
+      unlinked OF false ENDOF
+   ;MATCH ;
+
+: QUOTED+ ( ^u8 n -- ) S\" \q" SB-APPEND SB-APPEND S\" \q" SB-APPEND ;
+
+: PATHS+ ( ^u8 n ^u8 n -- )
+   {: l:^ lu:n d:^ du:n :}
+   S\" ,\qpath_lower\q:" SB-APPEND l lu QUOTED+
+   S\" ,\qpath_display\q:" SB-APPEND d du QUOTED+ ;
+
+\ Rust's folder_metadata, deleted_metadata and file_metadata, each
+\ appended to SB.
+: FOLDER-JSON+ ( ^u8 n ^u8 n -- )
+   S\" {\q.tag\q:\qfolder\q" SB-APPEND PATHS+ s" }" SB-APPEND ;
+
+: DELETED-JSON+ ( ^u8 n ^u8 n -- )
+   S\" {\q.tag\q:\qdeleted\q" SB-APPEND PATHS+ s" }" SB-APPEND ;
+
+: FILE-JSON+ ( ^u8 n ^u8 n ^u8 n DROPBOX:hash -- )
+   {: l:^ lu:n d:^ du:n r:^ ru:n h:DROPBOX:hash :}
+   S\" {\q.tag\q:\qfile\q" SB-APPEND l lu d du PATHS+
+   S\" ,\qrev\q:" SB-APPEND r ru QUOTED+
+   S\" ,\qsize\q:0,\qcontent_hash\q:" SB-APPEND
+   h DROPBOX:HASH>STR str> QUOTED+ s" }" SB-APPEND ;
+
+: COMMA+ ( -- ) s" ," SB-APPEND ;
+
+\ The entries q appends, as a JSON array in the arena.
+: ENTRIES ( [ -- ] ^ARENA:arena -- str )
+   {: q ar :}
+   SB-RESET s" [" SB-APPEND q execute s" ]" SB-APPEND SB$ ar COPIED ;
+
+: PAGE ( str ^u8 n bool -- )
+   {: e:str k:^ ku:n more:bool :}
+   e str> k ku more TEST-DROPBOX:PAGE! ;
+
+: CONTINUE$ ( -- ^u8 n ) s" /2/files/list_folder/continue" ;
+
+\ Rust's 503 answer, which only a continuation gets.
+: UNAVAILABLE! ( -- )
+   CONTINUE$ 503 s" " s" "
+   S\" {\qerror\q:{\q.tag\q:\qother\q}}" TEST-DROPBOX:ROUTE-SCRIPT! ;
+
+\ Rust's Old.txt at rev-old with the identity h.
+: OLD-RECORD ( DROPBOX:hash ^ARENA:arena -- MODEL:remote-record )
+   {: h:DROPBOX:hash ar :}
+   s" old.txt" ar CANONICAL s" Old.txt" DISPLAY
+   h s" rev-old" >str DROPBOX:>REV MODEL-REMOTE:MAKE REMOTE-PRESENT
+   MODEL-REMOTE--RECORD:MAKE ;
+
+\ The journal's inventory: the record o, published with the cursor.
+: PUBLISHED
+   ( JOURNAL:journal ^u8 n MODEL:remote-record ^ARENA:arena -- )
+   {: j k:^ ku:n o ar :}
+   ar REMOTE-RECORDS {: rs :} o rs VEC:PUSH !
+   j k ku >str DROPBOX:>CURSOR rs JOURNAL:PUBLISH-REMOTE-INVENTORY ;
+
+: CURSOR-IS? ( option<DROPBOX:cursor> ^u8 n -- bool )
+   {: a:^ u :}
+   MATCH option
+      none OF false ENDOF
+      some OF DROPBOX:CURSOR>STR str> a u STR= ENDOF
+   ;MATCH ;
+
+: KIND$ ( MODEL:observation<MODEL:remote> -- ^u8 n )
+   MATCH MODEL:observation
+      present OF drop s" present" ENDOF
+      directory OF s" directory" ENDOF
+      absent OF s" absent" ENDOF
+      unknown OF drop s" unknown" ENDOF
+   ;MATCH ;
+
+\ Rust's observation: the kind of the record at the display path, else
+\ none.
+: OBSERVED$ ( ^VEC:vector<MODEL:remote-record> ^u8 n -- ^u8 n )
+   {: rs p:^ u:n :}
+   rs VEC:COUNT 0 ?do
+      rs i VEC:AT @ MODEL-REMOTE--RECORD:UNMAKE {: k q o :}
+      q PATH$ p u STR= if o KIND$ unloop exit then
+   loop
+   s" none" ;
+
+: REFRESHED ( JOURNAL:journal ^REPLAY:link ^ARENA:arena -- )
+   {: j l ar :}
+   j l s" " ar LISTING-AT ar REFRESH-INVENTORY ;
+
+\ The journal's one record is o, with the cursor k.
+: KEPT ( JOURNAL:journal ^u8 n MODEL:remote-record ^ARENA:arena -- )
+   {: j k:^ ku:n o ar :}
+   j ar JOURNAL:REMOTE-INVENTORY
+   JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur rs :}
+   cur k ku CURSOR-IS? TTRUE
+   rs VEC:COUNT 1 T=
+   rs 0 VEC:AT @ o MODEL:REMOTE-RECORD= TTRUE ;
+
+: CURSOR-RESET-REBUILDS-BEFORE-ONE-COMPLETE-PUBLICATION
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" cursor_reset_rebuilds_before_one_complete_publication" T-LABEL
+   TEST-DROPBOX:RESET
+   s" replacement" ar IDENTITY {: h:DROPBOX:hash :}
+   ar CASE-JOURNAL {: d:str j :}
+   j s" stale" s" old" >str DROPBOX:>HASH ar OLD-RECORD ar
+   PUBLISHED
+   TEST-DROPBOX:PAGE-RESET!
+   [: s" /folder" s" /Folder" FOLDER-JSON+ ;] ar ENTRIES
+   s" fresh-a" true PAGE
+   [: s" /new.txt" s" /New.txt" s" rev-new" h FILE-JSON+ ;] ar ENTRIES
+   s" fresh-b" false PAGE
+   j ar NEW-LINK ar REFRESHED
+   j ar JOURNAL:REMOTE-INVENTORY
+   JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur rs :}
+   cur s" fresh-b" CURSOR-IS? TTRUE
+   rs s" Old.txt" OBSERVED$ s" none" T$=
+   rs s" New.txt" OBSERVED$ s" present" T$=
+   rs s" Folder" OBSERVED$ s" directory" T$=
+   \ Rust's RebuiltAfterCursorReset: the reset, then a full listing.
+   TEST-DROPBOX:SEEN$
+   s" /2/files/list_folder/continue /2/files/list_folder /2/files/list_folder/continue"
+   T$=
+   d j GONE ;
+
+: FAILED-REBUILD-AFTER-CURSOR-RESET-PRESERVES-DURABLE-INVENTORY
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" failed_rebuild_after_cursor_reset_preserves_durable_inventory"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   s" durable old bytes" ar IDENTITY ar OLD-RECORD {: old :}
+   s" uncommitted replacement" ar IDENTITY {: h:DROPBOX:hash :}
+   ar CASE-JOURNAL {: d:str j :}
+   j s" durable-cursor" old ar PUBLISHED
+   \ The continuations take the scripts in order; list_folder the page.
+   CONTINUE$ 409 s" " s" "
+   S\" {\qerror_summary\q:\qreset/\q,\qerror\q:{\q.tag\q:\qreset\q}}"
+   TEST-DROPBOX:ROUTE-SCRIPT!
+   UNAVAILABLE!
+   [: s" /replacement.txt" s" /Replacement.txt" s" rev-partial" h
+      FILE-JSON+ ;] ar ENTRIES
+   s" fresh-partial" true PAGE
+   ar NEW-LINK {: l :}
+   [: j l ar REFRESHED ;] REPLAY:E-DROPBOX TTHROWSQ
+   l REPLAY-LINK:REPLY @ RETRY? TTRUE
+   j s" durable-cursor" old ar KEPT
+   TEST-DROPBOX:SEEN$
+   s" /2/files/list_folder/continue /2/files/list_folder /2/files/list_folder/continue"
+   T$=
+   d j GONE ;
+
+: TREE-JSON+ ( ^u8 n ^u8 n DROPBOX:hash -- )
+   {: l:^ lu:n d:^ du:n h:DROPBOX:hash :}
+   l lu d du s" tree-revision" h FILE-JSON+ ;
+
+: LISTING-APPLIES-ORDERED-TREE-MUTATIONS-ACROSS-PAGES
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" listing_applies_ordered_tree_mutations_across_pages" T-LABEL
+   TEST-DROPBOX:RESET
+   s" tree payload" ar IDENTITY {: h:DROPBOX:hash :}
+   ar CASE-JOURNAL {: d:str j :}
+   [: s" /node" s" /Node" FOLDER-JSON+ COMMA+
+      s" /node/child" s" /Node/Child" h TREE-JSON+ COMMA+
+      s" /gone" s" /Gone" FOLDER-JSON+ COMMA+
+      s" /gone/child" s" /Gone/Child" h TREE-JSON+ COMMA+
+      s" /ancestor" s" /Ancestor" h TREE-JSON+ COMMA+
+      s" /keep/child" s" /Keep/Child" h TREE-JSON+ ;] ar ENTRIES
+   s" tree-a" true PAGE
+   [: s" /node" s" /Node" h TREE-JSON+ COMMA+
+      s" /gone" s" /Gone" DELETED-JSON+ COMMA+
+      s" /ancestor/leaf" s" /Ancestor/Leaf" h TREE-JSON+ COMMA+
+      s" /keep" s" /Keep" FOLDER-JSON+ COMMA+
+      s" /phantom/leaf" s" /Phantom/Leaf" DELETED-JSON+ ;] ar ENTRIES
+   s" tree-b" false PAGE
+   j ar NEW-LINK ar REFRESHED
+   j ar JOURNAL:REMOTE-INVENTORY
+   JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur rs :}
+   rs VEC:COUNT 5 T=
+   rs s" Node" OBSERVED$ s" present" T$=
+   rs s" Node/Child" OBSERVED$ s" none" T$=
+   rs s" Gone" OBSERVED$ s" none" T$=
+   rs s" Gone/Child" OBSERVED$ s" none" T$=
+   rs s" Ancestor" OBSERVED$ s" directory" T$=
+   rs s" Keep" OBSERVED$ s" directory" T$=
+   rs s" Ancestor/Leaf" OBSERVED$ s" present" T$=
+   rs s" Keep/Child" OBSERVED$ s" present" T$=
+   rs s" Phantom" OBSERVED$ s" none" T$=
+   \ Rust's Published: one full listing.
+   TEST-DROPBOX:SEEN$
+   s" /2/files/list_folder /2/files/list_folder/continue" T$=
+   d j GONE ;
+
+: FAILED-LATER-PAGE-CANNOT-PUBLISH-PARTIAL-LISTING-AS-ABSENCE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" failed_later_page_cannot_publish_partial_listing_as_absence"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   s" changed" ar IDENTITY {: h:DROPBOX:hash :}
+   s" durable-old" >str DROPBOX:>HASH ar OLD-RECORD {: old :}
+   ar CASE-JOURNAL {: d:str j :}
+   j s" durable-cursor" old ar PUBLISHED
+   [: s" /old.txt" s" /Old.txt" s" rev-changed" h FILE-JSON+ ;] ar ENTRIES
+   {: e:str :}
+   \ Both pages are continuations, so the first is a script too.
+   SB-RESET S\" {\qentries\q:" SB-APPEND e str> SB-APPEND
+   S\" ,\qcursor\q:\qnext\q,\qhas_more\q:true}" SB-APPEND
+   CONTINUE$ 200 s" " s" " SB$ TEST-DROPBOX:ROUTE-SCRIPT!
+   UNAVAILABLE!
+   ar NEW-LINK {: l :}
+   [: j l ar REFRESHED ;] REPLAY:E-DROPBOX TTHROWSQ
+   l REPLAY-LINK:REPLY @ RETRY? TTRUE
+   j s" durable-cursor" old ar KEPT
+   TEST-DROPBOX:SEEN$
+   s" /2/files/list_folder/continue /2/files/list_folder/continue" T$=
+   d j GONE ;
+
+: REFRESH-CASES ( ^ARENA:arena -- )
+   {: ar :}
+   ar CURSOR-RESET-REBUILDS-BEFORE-ONE-COMPLETE-PUBLICATION
+   ar FAILED-REBUILD-AFTER-CURSOR-RESET-PRESERVES-DURABLE-INVENTORY
+   ar LISTING-APPLIES-ORDERED-TREE-MUTATIONS-ACROSS-PAGES
+   ar FAILED-LATER-PAGE-CANNOT-PUBLISH-PARTIAL-LISTING-AS-ABSENCE ;
+
+: SERVED ( ^ARENA:arena -- )
+   {: ar :}
+   s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
+   s" " TEST-DROPBOX:ROOT!
+   ar OPENED MAIN !
+   ACCOUNTED
+   [: ar REFRESH-CASES ;] [: MAIN @ DROPBOX:CLOSE ;] finally ;
+
+\ The refresh cases against one fake Dropbox, under curl's loop.
+: DROPBOX-SERVED ( ^ARENA:arena -- )
+   {: ar :}
+   AIO:START CURL:LOOP-START CURL-READY
+   [: TEST-DROPBOX:START
+      [: ar SERVED ;] [: TEST-DROPBOX:STOP ;] finally ;]
+   [: CURL:LOOP-STOP AIO:STOP ;] finally ;
+
 : LISTING-CASES ( ^ARENA:arena -- )
    {: ar :}
    ar FOLDERS-ARE-DIRECTORIES-AND-NON-DOWNLOADABLE-FILES-ARE-UNKNOWN
@@ -1419,7 +1715,8 @@ ARENA LISTED DROPBOX:entry
    ar LISTING-REJECTS-AN-INVALID-CONFIGURED-ROOT
    ar LISTING-REJECTS-AN-ENTRY-WITHOUT-PATHS
    ar LISTING-REJECTS-A-PATH-THAT-IS-NOT-UTF-8
-   ar LISTING-CLASSIFIES-THE-REMOTE-ROOTS-OWN-ENTRY ;
+   ar LISTING-CLASSIFIES-THE-REMOTE-ROOTS-OWN-ENTRY
+   ar DROPBOX-SERVED ;
 
 
 : CASES ( ^ARENA:arena -- )

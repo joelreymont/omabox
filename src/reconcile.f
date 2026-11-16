@@ -1776,4 +1776,137 @@ STRUCTURE casing
    loop
    out ;
 
+
+\ ---- the listing ---------------------------------------------------
+
+\ One refresh of the remote inventory: cursor is the journal's, changes
+\ the current listing's entries.
+STRUCTURE refresh DERIVE addr
+   FIELD journal JOURNAL:journal
+   FIELD link ^REPLAY:link
+   FIELD root listing-root
+   FIELD arena ^ARENA:arena
+   FIELD cursor DROPBOX:cursor
+   FIELD changes ^VEC:vector<JOURNAL:remote-inventory-change>
+;STRUCTURE
+
+ARENA REFRESHES refresh
+
+ENUM listing-state starting delta full published ;ENUM
+ENUM listing-event done reset ;ENUM
+ENUM stored-cursor some none ;ENUM
+ENUM listed done ;ENUM
+
+: NEW-REFRESH
+   ( JOURNAL:journal ^REPLAY:link listing-root ^ARENA:arena
+     -- ^refresh )
+   {: j l root ar :}
+   ar REFRESHES-NEW {: r :}
+   j r REFRESH-JOURNAL ! l r REFRESH-LINK !
+   root r REFRESH-ROOT ! ar r REFRESH-ARENA !
+   r ;
+
+: CLIENT ( ^refresh -- ^DROPBOX:client )
+   REFRESH-LINK @ REPLAY-LINK:CLIENT @ ;
+
+: LISTING-PATH ( listing-root -- ^u8 n )
+   LISTING-ROOT-UNMAKE {: p:str l:str depth:n :} p str> ;
+
+\ The cursor of the listing the client finished last.
+: LISTED-CURSOR ( ^refresh -- DROPBOX:cursor )
+   CLIENT DROPBOX:CURSOR >str DROPBOX:>CURSOR ;
+
+\ Every listing starts with no changes, so a reset drops the delta's.
+: FRESH ( ^refresh -- )
+   {: r :}
+   r REFRESH-ARENA @ ARENA:ALLOCATOR 0
+   [type] JOURNAL:remote-inventory-change VEC:NEW
+   r REFRESH-CHANGES ! ;
+
+: ENTRY+ ( ^DROPBOX:entry ^refresh -- )
+   {: e r :}
+   e r REFRESH-ROOT @ r REFRESH-CHANGES @ r REFRESH-ARENA @
+   APPEND-ENTRY-CHANGES ;
+
+: STORED ( ^refresh -- stored-cursor )
+   {: r :}
+   r REFRESH-JOURNAL @ r REFRESH-ARENA @ JOURNAL:REMOTE-CURSOR
+   MATCH option
+      none OF construct stored-cursor none ENDOF
+      some OF r REFRESH-CURSOR ! construct stored-cursor some ENDOF
+   ;MATCH ;
+
+: DELTA-REPLY ( DROPBOX:reply ^refresh -- listing-event )
+   {: y:DROPBOX:reply r :}
+   y MATCH DROPBOX:reply
+      done OF construct listing-event done ENDOF
+      refused OF
+         DROPBOX-ERROR:RESET DROPBOX-ERROR:EQ 0=
+         if y r REFRESH-LINK @ REPLAY:STOP-PASS then
+         construct listing-event reset
+      ENDOF
+      retry OF drop y r REFRESH-LINK @ REPLAY:STOP-PASS ENDOF
+      unlinked OF y r REFRESH-LINK @ REPLAY:STOP-PASS ENDOF
+   ;MATCH ;
+
+\ A reset here is another reply: the full listing cannot restart.
+: FULL-REPLY ( DROPBOX:reply ^refresh -- listed )
+   {: y:DROPBOX:reply r :}
+   y MATCH DROPBOX:reply
+      done OF construct listed done ENDOF
+      refused OF drop y r REFRESH-LINK @ REPLAY:STOP-PASS ENDOF
+      retry OF drop y r REFRESH-LINK @ REPLAY:STOP-PASS ENDOF
+      unlinked OF y r REFRESH-LINK @ REPLAY:STOP-PASS ENDOF
+   ;MATCH ;
+
+: CONTINUED ( ^refresh -- listing-event )
+   {: r :}
+   r FRESH
+   r REFRESH-CURSOR @ DROPBOX:CURSOR>STR str> r CLIENT
+   [: r ENTRY+ ;] DROPBOX:CHANGES r DELTA-REPLY ;
+
+: LISTED ( ^refresh -- listed )
+   {: r :}
+   r FRESH
+   r REFRESH-ROOT @ LISTING-PATH r CLIENT
+   [: r ENTRY+ ;] DROPBOX:LIST r FULL-REPLY ;
+
+: APPLY-DELTA ( ^refresh -- )
+   {: r :}
+   r REFRESH-JOURNAL @ r REFRESH-ARENA @ JOURNAL:REMOTE-DIRECTORY-PATHS
+   {: dirs :}
+   r REFRESH-CHANGES @ dirs r REFRESH-ARENA @
+   NORMALIZE-INVENTORY-CHANGES {: cs :}
+   r REFRESH-JOURNAL @ r LISTED-CURSOR cs
+   JOURNAL:APPLY-REMOTE-INVENTORY-DELTA ;
+
+: PUBLISH ( ^refresh -- )
+   {: r :}
+   r REFRESH-CHANGES @ r REFRESH-ARENA @ INVENTORY-RECORDS {: rs :}
+   r REFRESH-JOURNAL @ r LISTED-CURSOR rs
+   JOURNAL:PUBLISH-REMOTE-INVENTORY ;
+
+\ Rust's refresh_inventory, after formal/InventoryPublication.tla: a
+\ stored cursor's changes apply as one delta, else a full listing
+\ replaces the inventory; the journal changes only on the way to
+\ published.
+FSM:DEFINE INVENTORY-PUBLICATION ( ^refresh ) listing-state listing-event
+   IN starting  STORED ( stored-cursor )
+      some  -  >delta
+      none  -  >full
+   IN delta  CONTINUED
+      done   APPLY-DELTA  >published
+      reset  -            >full
+   IN full  LISTED ( listed )
+      done  PUBLISH  >published
+   FINAL published  -
+;DEFINE
+
+\ Brings the journal's remote inventory up to date with the link's
+\ client; a reply that ends it is in the link.
+: REFRESH-INVENTORY
+   ( JOURNAL:journal ^REPLAY:link listing-root ^ARENA:arena -- )
+   NEW-REFRESH construct listing-state starting
+   INVENTORY-PUBLICATION ;
+
 ;package
