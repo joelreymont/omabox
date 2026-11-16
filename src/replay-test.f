@@ -25,6 +25,19 @@
 \ - TARGET of a valid path below the link's root, and each invalid form
 \   rejected invalid-path with no request reaching the fake.
 \ - OVERSIZE? at 350 000 000 000 bytes and one more.
+\ Remote replay's steps on a pass over a journal's one plan:
+\ - Rust's unsupported_size_stays_blocked_across_reopen.
+\ - BLOCK-DURABLY holds a plan an hour from now, and throws
+\   E-INVALID-STATE, logging once, for a completed plan.
+\ - PERSIST-REMOTE-BLOCK holds the plan for a sync error, an occupied
+\   stage or a remote object, and answers every other block unchanged.
+\ - UNPLACED-COPY of each copy outcome.
+\ - APPLY-FOLDER-MUTATION and APPLY-FOLDER-DELETE-MUTATION over every
+\   mutation outcome: the event, the block, the plan pending, retired
+\   or completed, the count, and a rejection's one log line.
+\ - PREPARE-UPLOAD sends a stage once; bytes other than the plan's
+\   retire it; a directory at the stage holds it stage-occupied; a
+\   directory at the target retires it, logging nothing.
 \ Against the fake Dropbox of test-dropbox.f, root empty:
 \ - REMOTE-DELETE-FOLDER of an empty folder deletes it; of an occupied
 \   one, or one the listing answers not_found or reset, deletes nothing;
@@ -76,8 +89,28 @@ require src/status.f
 require src/replay.f
 
 \ REPLAY reopened for the retention words the Rust tests call, the
-\ Dropbox mutations' steps, and the checkpoint a slot resumes from.
+\ Dropbox mutations' steps, the checkpoint a slot resumes from, remote
+\ replay's blocks and folder applies, a pass over a plan's first
+\ operation and the name of an apply event.
 package REPLAY
+private
+
+\ A pass below the root over the plan's first operation.
+: PASS-OVER
+   ( JOURNAL:journal fd ^u8 n JOURNAL:plan-record ^ARENA:arena
+     -- ^pass )
+   {: j root:fd p:^ u:n plan ar :}
+   j root p u ar NEW-PASS {: r :}
+   plan r PASS-PLAN !
+   plan PLAN-OPERATIONS 0 VEC:AT @ r PASS-OPERATION !
+   r ;
+
+: EVENT$ ( apply-event -- ^u8 n )
+   MATCH apply-event
+      done OF s" done" ENDOF
+      blocked OF s" blocked" ENDOF
+   ;MATCH ;
+
 public
 EXPORT PRUNE-COMPLETED-RECOVERIES-AT
 EXPORT DESTINATION
@@ -94,6 +127,18 @@ EXPORT REMOTE-CREATE-FOLDER
 EXPORT REMOTE-UPLOAD
 EXPORT REMOTE-DELETE-FOLDER
 EXPORT LOCAL:DOWNLOAD-CHECKPOINT-BYTES
+EXPORT PASS-OVER
+EXPORT PASS-STAGING
+EXPORT PASS-BLOCKED
+EXPORT PASS-REPORT
+EXPORT EVENT$
+EXPORT APPLY-EVENT-DONE
+EXPORT BLOCK-DURABLY
+EXPORT PERSIST-REMOTE-BLOCK
+EXPORT UNPLACED-COPY
+EXPORT PREPARE-UPLOAD
+EXPORT APPLY-FOLDER-MUTATION
+EXPORT APPLY-FOLDER-DELETE-MUTATION
 ;package
 
 package REPLAY-TEST
@@ -1169,6 +1214,494 @@ LOG-CAP BUFFER: LOG-TEXT
    l ar A-REFUSED-UPLOAD-FINISHES-ITS-TRANSFER ;
 
 
+\ ---- remote replay's blocks and folder applies
+
+: PLAN-PATH ( JOURNAL:plan-record -- MODEL:path )
+   JOURNAL-PLAN--RECORD:UNMAKE {: id p o s :} p ;
+
+: FIRST-ID ( JOURNAL:plan-record -- JOURNAL:operation-id )
+   JOURNAL-PLAN--RECORD:UNMAKE {: id p ops s :}
+   ops 0 VEC:AT @ JOURNAL-PLANNED--OPERATION:UNMAKE {: i o x st :} i ;
+
+\ A pending plan of the one operation o at path a.
+: PLANNED
+   ( JOURNAL:journal ^u8 n MODEL:operation ^ARENA:arena
+     -- JOURNAL:plan-record )
+   {: j a:^ u:n o ar :}
+   j a u DISPLAY o ar ONE-PLAN ar JOURNAL:RECORD-PLAN NEW-PLAN ;
+
+\ A case's directory and its open journal, holding one plan of o at a.
+: CASE-PLAN
+   ( ^u8 n MODEL:operation ^ARENA:arena
+     -- str JOURNAL:journal JOURNAL:plan-record )
+   {: a:^ u:n o ar :}
+   ar JOURNAL-AT {: d:str p:str :}
+   p JOURNAL:OPEN {: j :}
+   d j j a u o ar PLANNED ;
+
+: MAKE-F ( -- MODEL:operation )
+   MODEL-OPERATION:CREATE-REMOTE-DIRECTORY ;
+
+\ No descriptor: the words under test never read the pass's root.
+: NO-ROOT ( -- fd ) -1 >FD ;
+
+: BLOCKAGE$ ( MODEL:blockage -- ^u8 n )
+   MATCH MODEL:blockage
+      unsupported-file-size OF s" unsupported-file-size" ENDOF
+      remote-rejected OF str> ENDOF
+      download-unavailable OF drop s" download-unavailable" ENDOF
+      download-verification-failed OF
+         s" download-verification-failed"
+      ENDOF
+      stage-occupied OF s" stage-occupied" ENDOF
+      local-object-in-way OF s" local-object-in-way" ENDOF
+      remote-object OF s" remote-object" ENDOF
+      conflict-copy-occupied OF s" conflict-copy-occupied" ENDOF
+   ;MATCH ;
+
+\ The block's variant and its detail: a durable plan's blockage, a
+\ remote rejection's tag, a sync error's rejection, else "-".
+: BLOCK$ ( REPLAY:replay-blocked -- ^u8 n ^u8 n )
+   MATCH REPLAY:replay-blocked
+      durable-plan OF {: p why :} s" durable-plan" why BLOCKAGE$ ENDOF
+      local-object OF drop s" local-object" s" -" ENDOF
+      fresh-observation-required OF
+         drop s" fresh-observation-required" s" -"
+      ENDOF
+      download-required OF
+         drop drop s" download-required" s" -"
+      ENDOF
+      stage-destination-occupied OF
+         drop drop s" stage-destination-occupied" s" -"
+      ENDOF
+      precondition-changed OF
+         drop drop s" precondition-changed" s" -"
+      ENDOF
+      remote-operation OF drop s" remote-operation" s" -" ENDOF
+      remote-pending OF drop s" remote-pending" s" -" ENDOF
+      remote-object OF drop s" remote-object" s" -" ENDOF
+      sync-error OF {: p why :} s" sync-error" why REJECTION$ ENDOF
+   ;MATCH ;
+
+: SOME-BLOCK$ ( option<REPLAY:replay-blocked> -- ^u8 n ^u8 n )
+   MATCH option
+      none OF s" none" s" -" ENDOF
+      some OF BLOCK$ ENDOF
+   ;MATCH ;
+
+\ A blocked plan's blockage and retry time; another's status and 0.
+: BLOCK-OF ( JOURNAL:plan-record -- ^u8 n n )
+   JOURNAL-PLAN--RECORD:UNMAKE {: id p o s :}
+   s MATCH JOURNAL:plan-status
+      pending OF s" pending" 0 ENDOF
+      blocked OF {: why at:n :} why BLOCKAGE$ at ENDOF
+      completed OF s" completed" 0 ENDOF
+   ;MATCH ;
+
+\ The journal's one plan is blocked with the blockage w; its retry time.
+: HELD-AS ( JOURNAL:journal ^u8 n ^ARENA:arena -- n )
+   {: j w:^ wu:n ar :}
+   j ar JOURNAL:BLOCKED-PLANS {: held :}
+   held VEC:COUNT 1 T=
+   held 0 VEC:AT @ BLOCK-OF {: at:n :} w wu T$=
+   at ;
+
+: BASELINE$ ( option<MODEL:baseline> -- ^u8 n )
+   MATCH option
+      none OF s" absent" ENDOF
+      some OF
+         MATCH MODEL:baseline
+            absent OF s" absent" ENDOF
+            present OF drop s" present" ENDOF
+            directory OF s" directory" ENDOF
+         ;MATCH
+      ENDOF
+   ;MATCH ;
+
+\ The plan at f pending or blocked; once it is retired, f's baseline.
+: JOURNAL$ ( JOURNAL:journal ^ARENA:arena -- ^u8 n )
+   {: j ar :}
+   j ar JOURNAL:PENDING-PLANS VEC:COUNT 0<> if s" pending" exit then
+   j ar JOURNAL:BLOCKED-PLANS VEC:COUNT 0<> if s" blocked" exit then
+   j s" f" DISPLAY ar JOURNAL:BASELINE BASELINE$ ;
+
+: UNSUPPORTED-SIZE-STAYS-BLOCKED-ACROSS-REOPEN ( ^ARENA:arena -- )
+   {: ar :}
+   s" unsupported_size_stays_blocked_across_reopen" T-LABEL
+   s" oversized source identity" ar HASH-OF {: c :}
+   s" oversized.bin" c MODEL-OPERATION:CREATE-REMOTE ar CASE-PLAN
+   {: d:str j plan :}
+   j NO-ROOT s" " plan ar REPLAY:PASS-OVER {: r :}
+   plan PLAN-PATH REPLAY-MUTATION--REJECTION:UNSUPPORTED-FILE-SIZE
+   REPLAY-REPLAY--BLOCKED:SYNC-ERROR r REPLAY:PERSIST-REMOTE-BLOCK
+   BLOCK$ s" unsupported-file-size" T$= s" durable-plan" T$=
+   j JOURNAL:CLOSE
+   d s" journal.sqlite3" ar INSIDE JOURNAL:OPEN {: again :}
+   again s" unsupported-file-size" ar HELD-AS MEM-MAX-N T=
+   again ar JOURNAL:PENDING-PLANS VEC:COUNT 0 T=
+   again JOURNAL:CLOSE
+   d GONE ;
+
+: BLOCK-DURABLY-HOLDS-A-PLAN-FOR-AN-HOUR ( ^ARENA:arena -- )
+   {: ar :}
+   s" block durably holds a plan for an hour" T-LABEL
+   s" f" MAKE-F ar CASE-PLAN {: d:str j plan :}
+   j NO-ROOT s" " plan ar REPLAY:PASS-OVER {: r :}
+   epoch-seconds 3600 + {: early:n :}
+   MODEL-BLOCKAGE:REMOTE-OBJECT r REPLAY:BLOCK-DURABLY
+   epoch-seconds 3600 + {: late:n :}
+   BLOCK$ s" remote-object" T$= s" durable-plan" T$=
+   j s" remote-object" ar HELD-AS {: at:n :}
+   at early >= TTRUE at late <= TTRUE
+   j JOURNAL:CLOSE
+   d GONE ;
+
+\ The plan's one operation completes it, creating the folder.
+: COMPLETE-F ( JOURNAL:journal JOURNAL:plan-record ^ARENA:arena -- )
+   {: j plan ar :}
+   j plan FIRST-ID MODEL-BASELINE:DIRECTORY OPTION:SOME ar
+   JOURNAL:COMPLETE-OPERATION PLAN-COMPLETED? TTRUE ;
+
+: BLOCK-DURABLY-REFUSES-A-COMPLETED-PLAN ( ^ARENA:arena -- )
+   {: ar :}
+   s" block durably refuses a completed plan" T-LABEL
+   s" f" MAKE-F ar CASE-PLAN {: d:str j plan :}
+   j NO-ROOT s" " plan ar REPLAY:PASS-OVER {: r :}
+   j plan ar COMPLETE-F
+   d [: [: MODEL-BLOCKAGE:REMOTE-OBJECT r REPLAY:BLOCK-DURABLY drop ;]
+      REPLAY:E-INVALID-STATE TTHROWSQ ;] ar LOGGED {: t:^ tu:n :}
+   t tu LINE-COUNT 1 T=
+   t tu s" for `f`: mutation blocker lost its owning plan" CONTAINS?
+   TTRUE
+   j JOURNAL:CLOSE
+   d GONE ;
+
+: PERSIST-REMOTE-BLOCK-KEEPS-OTHER-BLOCKS ( ^ARENA:arena -- )
+   {: ar :}
+   s" persist remote block keeps other blocks" T-LABEL
+   s" f" MAKE-F ar CASE-PLAN {: d:str j plan :}
+   j NO-ROOT s" " plan ar REPLAY:PASS-OVER {: r :}
+   plan PLAN-PATH {: p :}
+   p MODEL-BLOCKAGE:LOCAL-OBJECT-IN-WAY
+   REPLAY-REPLAY--BLOCKED:DURABLE-PLAN
+   r REPLAY:PERSIST-REMOTE-BLOCK BLOCK$
+   s" local-object-in-way" T$= s" durable-plan" T$=
+   p REPLAY-REPLAY--BLOCKED:LOCAL-OBJECT r REPLAY:PERSIST-REMOTE-BLOCK
+   BLOCK$ s" -" T$= s" local-object" T$=
+   p REPLAY-REPLAY--BLOCKED:FRESH-OBSERVATION-REQUIRED
+   r REPLAY:PERSIST-REMOTE-BLOCK BLOCK$
+   s" -" T$= s" fresh-observation-required" T$=
+   p OLD REPLAY-REPLAY--BLOCKED:DOWNLOAD-REQUIRED
+   r REPLAY:PERSIST-REMOTE-BLOCK BLOCK$
+   s" -" T$= s" download-required" T$=
+   p OLD OPTION:SOME REPLAY-REPLAY--BLOCKED:PRECONDITION-CHANGED
+   r REPLAY:PERSIST-REMOTE-BLOCK BLOCK$
+   s" -" T$= s" precondition-changed" T$=
+   p REPLAY-REPLAY--BLOCKED:REMOTE-OPERATION
+   r REPLAY:PERSIST-REMOTE-BLOCK BLOCK$
+   s" -" T$= s" remote-operation" T$=
+   p REPLAY-REPLAY--BLOCKED:REMOTE-PENDING r REPLAY:PERSIST-REMOTE-BLOCK
+   BLOCK$ s" -" T$= s" remote-pending" T$=
+   j ar JOURNAL$ s" pending" T$=
+   j JOURNAL:CLOSE
+   d GONE ;
+
+: PERSIST-REMOTE-BLOCK-HOLDS-REMOTE-CAUSES ( ^ARENA:arena -- )
+   {: ar :}
+   s" persist remote block holds remote causes" T-LABEL
+   s" f" MAKE-F ar CASE-PLAN {: d:str j plan :}
+   j NO-ROOT s" " plan ar REPLAY:PASS-OVER {: r :}
+   plan PLAN-PATH {: p :}
+   p REPLAY-MUTATION--REJECTION:UNSUPPORTED-FILE-SIZE
+   REPLAY-REPLAY--BLOCKED:SYNC-ERROR r REPLAY:PERSIST-REMOTE-BLOCK
+   BLOCK$ s" unsupported-file-size" T$= s" durable-plan" T$=
+   j s" unsupported-file-size" ar HELD-AS MEM-MAX-N T=
+   p REPLAY-MUTATION--REJECTION:PATH-MISMATCH
+   REPLAY-REPLAY--BLOCKED:SYNC-ERROR r REPLAY:PERSIST-REMOTE-BLOCK
+   BLOCK$ s" path_mismatch" T$= s" durable-plan" T$=
+   j s" path_mismatch" ar HELD-AS drop
+   plan JOURNAL-PLAN--RECORD:UNMAKE {: id q o s :}
+   id s" stage" >str REPLAY-REPLAY--BLOCKED:STAGE-DESTINATION-OCCUPIED
+   r REPLAY:PERSIST-REMOTE-BLOCK BLOCK$
+   s" stage-occupied" T$= s" durable-plan" T$=
+   j s" stage-occupied" ar HELD-AS drop
+   p REPLAY-REPLAY--BLOCKED:REMOTE-OBJECT r REPLAY:PERSIST-REMOTE-BLOCK
+   BLOCK$ s" remote-object" T$= s" durable-plan" T$=
+   j s" remote-object" ar HELD-AS drop
+   j JOURNAL:CLOSE
+   d GONE ;
+
+: UNPLACED-COPY-COVERS-EVERY-COPY-OUTCOME ( ^ARENA:arena -- )
+   {: ar :}
+   s" unplaced copy covers every copy outcome" T-LABEL
+   s" f" MAKE-F ar CASE-PLAN {: d:str j plan :}
+   j NO-ROOT s" " plan ar REPLAY:PASS-OVER {: r :}
+   REPLAY-COPY--OUTCOME:READY r REPLAY:UNPLACED-COPY SOME-BLOCK$
+   s" -" T$= s" none" T$=
+   j ar JOURNAL$ s" pending" T$=
+   MODEL-BLOCKAGE:CONFLICT-COPY-OCCUPIED REPLAY-COPY--OUTCOME:BLOCKED
+   r REPLAY:UNPLACED-COPY SOME-BLOCK$
+   s" conflict-copy-occupied" T$= s" durable-plan" T$=
+   j s" conflict-copy-occupied" ar HELD-AS drop
+   REPLAY-COPY--OUTCOME:SOURCE-CHANGED r REPLAY:UNPLACED-COPY
+   SOME-BLOCK$
+   s" -" T$= s" fresh-observation-required" T$=
+   j ar JOURNAL$ s" absent" T$=
+   j JOURNAL:CLOSE
+   d GONE ;
+
+
+\ ---- folder applies
+
+: APPLIED-AS ( REPLAY:remote-path-state -- REPLAY:mutation-outcome )
+   REPLAY-MUTATION--OUTCOME:APPLIED ;
+: CHANGED-AS ( REPLAY:remote-path-state -- REPLAY:mutation-outcome )
+   REPLAY-MUTATION--OUTCOME:PRECONDITION-CHANGED ;
+: STILL-PENDING ( -- REPLAY:mutation-outcome )
+   REPLAY-MUTATION--OUTCOME:PENDING ;
+: NO-SPACE ( -- REPLAY:mutation-outcome )
+   REPLAY-MUTATION--REJECTION:INSUFFICIENT-SPACE
+   REPLAY-MUTATION--OUTCOME:REJECTED ;
+: H1-FILE ( -- REPLAY:remote-path-state ) s" h1" s" r1" FILE-STATE ;
+
+\ f's baseline before a folder case: a file, which superseding the plan
+\ keeps and completing it replaces.
+: SEEDED ( JOURNAL:journal ^ARENA:arena -- )
+   {: j ar :}
+   j s" f" DISPLAY OLD-REMOTE MODEL-BASELINE:PRESENT ar
+   JOURNAL:RECORD-NOOP MATCH JOURNAL:noop-write
+      recorded OF true ENDOF
+      live-plan OF drop false ENDOF
+   ;MATCH TTRUE ;
+
+\ A case's directory and journal holding a plan at f over SEEDED's
+\ baseline: a folder delete when del is set, else a folder create.
+: FOLDER-PLAN
+   ( bool ^ARENA:arena -- str JOURNAL:journal JOURNAL:plan-record )
+   {: del:bool ar :}
+   ar JOURNAL-AT {: d:str p:str :}
+   p JOURNAL:OPEN {: j :}
+   j ar SEEDED
+   del if MODEL-OPERATION:DELETE-REMOTE-DIRECTORY else MAKE-F then
+   {: o :}
+   d j j s" f" o ar PLANNED ;
+
+\ The event, the block's variant and detail, "- -" when done, the
+\ journal's plan and the count, spaced.
+: SUMMARY$
+   ( ^u8 n REPLAY:replay-blocked ^u8 n n -- ^u8 n )
+   {: e:^ eu:n b j:^ ju:n k:n :}
+   e eu s" blocked" STR= if b BLOCK$ else s" -" s" -" then
+   {: v:^ vu:n x:^ xu:n :}
+   SB-RESET e eu SB-APPEND 32 SB-APPEND-C v vu SB-APPEND 32 SB-APPEND-C
+   x xu SB-APPEND 32 SB-APPEND-C j ju SB-APPEND 32 SB-APPEND-C
+   k FMT:SB-INT SB$ ;
+
+\ o applied to f's plan, by the folder delete when del is set; the
+\ summary.
+: APPLIED$
+   ( REPLAY:mutation-outcome bool JOURNAL:journal JOURNAL:plan-record
+     ^ARENA:arena -- ^u8 n )
+   {: o del:bool j plan ar :}
+   j NO-ROOT s" " plan ar REPLAY:PASS-OVER {: r :}
+   del if o r REPLAY:APPLY-FOLDER-DELETE-MUTATION
+   else o r REPLAY:APPLY-FOLDER-MUTATION then
+   REPLAY:EVENT$ r REPLAY:PASS-BLOCKED @ j ar JOURNAL$
+   r REPLAY:PASS-REPORT @ COMPLETED SUMMARY$ ;
+
+\ One arm: its summary is want; it logs the line, or nothing when the
+\ line is empty.
+: ARM
+   ( REPLAY:mutation-outcome bool ^u8 n ^u8 n ^ARENA:arena -- )
+   {: o del:bool w:^ wu:n line:^ lu:n ar :}
+   del ar FOLDER-PLAN {: d:str j plan :}
+   d [: o del j plan ar APPLIED$ w wu T$= ;] ar LOGGED {: t:^ tu:n :}
+   lu 0= if tu 0 T= else
+      t tu LINE-COUNT 1 T= t tu line lu CONTAINS? TTRUE
+   then
+   j JOURNAL:CLOSE
+   d GONE ;
+
+\ A folder delete arm that throws E-INVALID-STATE, logging the line
+\ and leaving the plan pending.
+: IMPOSSIBLE ( REPLAY:mutation-outcome ^u8 n ^ARENA:arena -- )
+   {: o line:^ lu:n ar :}
+   true ar FOLDER-PLAN {: d:str j plan :}
+   j NO-ROOT s" " plan ar REPLAY:PASS-OVER {: r :}
+   d [: [: o r REPLAY:APPLY-FOLDER-DELETE-MUTATION drop ;]
+      REPLAY:E-INVALID-STATE TTHROWSQ ;] ar LOGGED {: t:^ tu:n :}
+   t tu LINE-COUNT 1 T= t tu line lu CONTAINS? TTRUE
+   j ar JOURNAL$ s" pending" T$=
+   j JOURNAL:CLOSE
+   d GONE ;
+
+: STALE-ARM ( REPLAY:mutation-outcome bool ^ARENA:arena -- )
+   {: o del:bool ar :}
+   o del s" blocked fresh-observation-required - present 0" s" " ar
+   ARM ;
+
+: REJECTED-ARM ( bool ^ARENA:arena -- )
+   {: del:bool ar :}
+   NO-SPACE del s" blocked sync-error insufficient-space pending 0"
+   s" Dropbox rejected sync path `f`: insufficient_space" ar ARM ;
+
+: PENDING-ARM ( bool ^ARENA:arena -- )
+   {: del:bool ar :}
+   STILL-PENDING del s" blocked remote-pending - pending 0" s" " ar
+   ARM ;
+
+: APPLY-FOLDER-MUTATION-COVERS-EVERY-OUTCOME ( ^ARENA:arena -- )
+   {: ar :}
+   s" apply folder mutation covers every outcome" T-LABEL
+   FOLDER-STATE APPLIED-AS false s" done - - directory 1" s" " ar ARM
+   GONE-STATE APPLIED-AS false ar STALE-ARM
+   H1-FILE APPLIED-AS false ar STALE-ARM
+   ODD-STATE APPLIED-AS false ar STALE-ARM
+   false ar PENDING-ARM
+   GONE-STATE CHANGED-AS false ar STALE-ARM
+   H1-FILE CHANGED-AS false ar STALE-ARM
+   FOLDER-STATE CHANGED-AS false ar STALE-ARM
+   ODD-STATE CHANGED-AS false ar STALE-ARM
+   false ar REJECTED-ARM ;
+
+: IMPOSSIBLE-APPLIED ( REPLAY:mutation-outcome ^ARENA:arena -- )
+   {: o ar :}
+   o s" for `f`: folder delete returned an impossible applied state"
+   ar IMPOSSIBLE ;
+
+: APPLY-FOLDER-DELETE-MUTATION-COVERS-EVERY-OUTCOME ( ^ARENA:arena -- )
+   {: ar :}
+   s" apply folder delete mutation covers every outcome" T-LABEL
+   GONE-STATE APPLIED-AS true s" done - - absent 1" s" " ar ARM
+   H1-FILE APPLIED-AS ar IMPOSSIBLE-APPLIED
+   FOLDER-STATE APPLIED-AS ar IMPOSSIBLE-APPLIED
+   ODD-STATE APPLIED-AS ar IMPOSSIBLE-APPLIED
+   true ar PENDING-ARM
+   FOLDER-STATE CHANGED-AS true ar STALE-ARM
+   H1-FILE CHANGED-AS true ar STALE-ARM
+   ODD-STATE CHANGED-AS true ar STALE-ARM
+   GONE-STATE CHANGED-AS
+   s" for `f`: folder delete precondition changed to an impossible"
+   ar IMPOSSIBLE
+   true ar REJECTED-ARM ;
+
+
+\ ---- upload stages
+
+variable SENDS
+TYPED-VARIABLE SENT ^LOCAL:staged-upload
+
+: SEND ( ^LOCAL:staged-upload -- ) SENT ! 1 SENDS +! ;
+
+\ A case's directory with its root and staging, and its open journal.
+: UPLOAD-DIRS ( ^ARENA:arena -- str str str JOURNAL:journal )
+   {: ar :}
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   d s" journal.sqlite3" ar INSIDE JOURNAL:OPEN {: j :}
+   d r s j ;
+
+: UPLOAD-PLAN
+   ( JOURNAL:journal DROPBOX:hash ^ARENA:arena -- JOURNAL:plan-record )
+   {: j c ar :}
+   j s" notes.txt" c MODEL-OPERATION:CREATE-REMOTE ar PLANNED ;
+
+\ The event and the block, "- -" when done.
+: EVENT-BLOCK$ ( ^u8 n REPLAY:replay-blocked -- ^u8 n ^u8 n ^u8 n )
+   {: e:^ eu:n b :}
+   e eu s" blocked" STR= if e eu b BLOCK$ exit then
+   e eu s" -" s" -" ;
+
+\ PREPARE-UPLOAD of want for the plan, below the root r with staging s.
+: PREPARED
+   ( JOURNAL:journal JOURNAL:plan-record str str DROPBOX:hash
+     ^ARENA:arena -- ^u8 n ^u8 n ^u8 n )
+   {: j plan r:str s:str want ar :}
+   0 SENDS !
+   r str> s" open test root" LOCAL:OPEN-ROOT {: f:fd :}
+   j f r str> plan ar REPLAY:PASS-OVER {: p :}
+   s p REPLAY:PASS-STAGING !
+   [: want p [: SEND REPLAY:APPLY-EVENT-DONE ;] REPLAY:PREPARE-UPLOAD
+      REPLAY:EVENT$ p REPLAY:PASS-BLOCKED @ EVENT-BLOCK$ ;]
+   [: f FS:CLOSE-DIR ;] finally ;
+
+\ The target's bytes, "local edit", written below the root r.
+: EDITED ( str ^ARENA:arena -- )
+   s" notes.txt" rot INSIDE str> s" local edit" FS:WRITE-ALL ;
+
+: PREPARE-UPLOAD-SENDS-THE-STAGE ( ^ARENA:arena -- )
+   {: ar :}
+   s" prepare upload sends the stage" T-LABEL
+   ar UPLOAD-DIRS {: d:str r:str s:str j :}
+   r ar EDITED
+   r str> s" notes.txt" ar LOCAL:OBSERVE-UPLOAD-SOURCE {: want :}
+   j want ar UPLOAD-PLAN {: plan :}
+   j plan r s want ar PREPARED s" -" T$= s" -" T$= s" done" T$=
+   SENDS @ 1 T=
+   SENT @ LOCAL:UPLOAD-CONTENT DROPBOX:HASH>STR str>
+   want DROPBOX:HASH>STR str> T$=
+   j ar JOURNAL:PENDING-PLANS VEC:COUNT 1 T=
+   j JOURNAL:CLOSE
+   d GONE ;
+
+: PREPARE-UPLOAD-RETIRES-CHANGED-BYTES ( ^ARENA:arena -- )
+   {: ar :}
+   s" prepare upload retires changed bytes" T-LABEL
+   ar UPLOAD-DIRS {: d:str r:str s:str j :}
+   r ar EDITED
+   j OLD ar UPLOAD-PLAN {: plan :}
+   j plan r s OLD ar PREPARED
+   s" -" T$= s" fresh-observation-required" T$= s" blocked" T$=
+   SENDS @ 0 T=
+   j ar JOURNAL:PENDING-PLANS VEC:COUNT 0 T=
+   j ar JOURNAL:BLOCKED-PLANS VEC:COUNT 0 T=
+   j JOURNAL:CLOSE
+   d GONE ;
+
+: PREPARE-UPLOAD-HOLDS-AN-OCCUPIED-STAGE ( ^ARENA:arena -- )
+   {: ar :}
+   s" prepare upload holds an occupied stage" T-LABEL
+   ar UPLOAD-DIRS {: d:str r:str s:str j :}
+   r ar EDITED
+   r str> s" notes.txt" ar LOCAL:OBSERVE-UPLOAD-SOURCE {: want :}
+   s want DROPBOX:HASH>STR str> ar INSIDE str> FS:MAKE-DIR
+   j want ar UPLOAD-PLAN {: plan :}
+   j plan r s want ar PREPARED
+   s" stage-occupied" T$= s" durable-plan" T$= s" blocked" T$=
+   SENDS @ 0 T=
+   j s" stage-occupied" ar HELD-AS drop
+   j JOURNAL:CLOSE
+   d GONE ;
+
+: PREPARE-UPLOAD-RETIRES-A-SOURCE-THAT-WILL-NOT-OPEN ( ^ARENA:arena -- )
+   {: ar :}
+   s" prepare upload retires a source that will not open" T-LABEL
+   ar UPLOAD-DIRS {: d:str r:str s:str j :}
+   r s" notes.txt" ar INSIDE str> FS:MAKE-DIR
+   j OLD ar UPLOAD-PLAN {: plan :}
+   d [: j plan r s OLD ar PREPARED
+      s" -" T$= s" fresh-observation-required" T$= s" blocked" T$= ;]
+   ar QUIETLY
+   SENDS @ 0 T=
+   j ar JOURNAL:PENDING-PLANS VEC:COUNT 0 T=
+   j JOURNAL:CLOSE
+   d GONE ;
+
+: REMOTE-REPLAY-CASES ( ^ARENA:arena -- )
+   {: ar :}
+   ar UNSUPPORTED-SIZE-STAYS-BLOCKED-ACROSS-REOPEN
+   ar BLOCK-DURABLY-HOLDS-A-PLAN-FOR-AN-HOUR
+   ar BLOCK-DURABLY-REFUSES-A-COMPLETED-PLAN
+   ar PERSIST-REMOTE-BLOCK-KEEPS-OTHER-BLOCKS
+   ar PERSIST-REMOTE-BLOCK-HOLDS-REMOTE-CAUSES
+   ar UNPLACED-COPY-COVERS-EVERY-COPY-OUTCOME
+   ar APPLY-FOLDER-MUTATION-COVERS-EVERY-OUTCOME
+   ar APPLY-FOLDER-DELETE-MUTATION-COVERS-EVERY-OUTCOME
+   ar PREPARE-UPLOAD-SENDS-THE-STAGE
+   ar PREPARE-UPLOAD-RETIRES-CHANGED-BYTES
+   ar PREPARE-UPLOAD-HOLDS-AN-OCCUPIED-STAGE
+   ar PREPARE-UPLOAD-RETIRES-A-SOURCE-THAT-WILL-NOT-OPEN ;
+
+
 \ ---- the fake's client
 
 \ A client on the fake, no root, keeping no rotated token.
@@ -1843,6 +2376,7 @@ variable HELD
    CLASSIFY-COVERS-EVERY-EXPECTATION-AND-STATE
    ar REJECTION-COVERS-EVERY-DROPBOX-ERROR
    UPLOAD-SIZE-STOPS-AT-THE-SESSION-LIMIT
+   ar REMOTE-REPLAY-CASES
    ar DROPBOX-CASES ;
 
 

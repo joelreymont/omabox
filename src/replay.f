@@ -4,19 +4,21 @@
 \ the replay of the plans' local operations, a staged upload's local
 \ conflict copy, the bridge that stages a Dropbox revision's bytes
 \ through LOCAL, a revision's exact copy and remote conflict copy, the
-\ retention of legacy recovery payloads, and each Dropbox mutation's
-\ outcome. A LOCAL call whose failures REPLAY converts into outcomes
-\ runs under LOCAL:CONVERTING, so nothing logs those; any other LOCAL,
-\ JOURNAL or DROPBOX failure passes up with its own code, which that
-\ library logged where it saw it. A Dropbox answer that ends the pass,
-\ not one path's verdict, is kept in the link and thrown as E-DROPBOX.
-\ A journal answer the replay contract refuses is logged once with the
-\ Rust version's text, naming the plan's path, then thrown as
-\ E-INVALID-STATE. A failed retention or upload-stage syscall is
-\ logged once, as LOCAL logs one, and thrown as LOCAL's E-IO.
+\ retention of legacy recovery payloads, each Dropbox mutation's
+\ outcome, and the remote replay steps that record it. A LOCAL call
+\ whose failures REPLAY converts into outcomes runs under
+\ LOCAL:CONVERTING, so nothing logs those; any other LOCAL, JOURNAL or
+\ DROPBOX failure passes up with its own code, which that library
+\ logged where it saw it. A path Dropbox rejects is logged once with its
+\ tag. A Dropbox answer that ends the pass, not one path's verdict, is
+\ kept in the link and thrown as E-DROPBOX. A journal answer the replay
+\ contract refuses is logged once with the Rust version's text, naming
+\ the plan's path, then thrown as E-INVALID-STATE. A failed retention or
+\ upload-stage syscall is logged once, as LOCAL logs one, and thrown as
+\ LOCAL's E-IO.
 \ STORAGE CLASS. No state of its own. CALLER-OWNED: a report, its
-\ vector, a local replay's run, a download's bridge, and every value a
-\ journal step or a conflict copy reads lie in the arena the caller
+\ vector, a replay pass's context, a download's bridge, and every value
+\ a journal step or a conflict copy reads lie in the arena the caller
 \ passes. A retention pass lays its values in an arena of its own.
 \ Retention, the conflict copies, an upload and the bridge close every
 \ descriptor they open, on every exit.
@@ -27,6 +29,7 @@ require src/lib/span.f
 require src/lib/unicode.f
 require src/lib/utf8-scalar.f
 require src/lib/arena.f
+require src/lib/memory.f
 require src/lib/log.f
 require src/lib/adt/option.f
 require src/lib/vector.f
@@ -585,11 +588,12 @@ public
 
 private
 
-\ A pass's local replay, LOCAL-LIFECYCLE's context: the journal,
-\ the root's descriptor and path, and the arena; the plan and the
-\ operation it runs; the final completions and the report it adds
-\ to; and blocked, why the apply step stopped the plan.
-STRUCTURE local-run DERIVE addr
+\ A replay pass, LOCAL-LIFECYCLE's context: the journal, the root's
+\ descriptor and path, and the arena; the plan and the operation it
+\ runs; the final completions and the report it adds to; blocked, why
+\ the apply step stopped the plan; the link and the upload staging
+\ directory. Local replay leaves link and staging unset, unread.
+STRUCTURE pass DERIVE addr
    FIELD journal JOURNAL:journal
    FIELD root fd
    FIELD root-path str
@@ -599,9 +603,11 @@ STRUCTURE local-run DERIVE addr
    FIELD report ^replay-report
    FIELD arena ^ARENA:arena
    FIELD blocked replay-blocked
+   FIELD link ^link
+   FIELD staging str
 ;STRUCTURE
 
-ARENA LOCAL-RUNS local-run
+ARENA PASSES pass
 
 ENUM local-state DERIVE eq
    recorded applying passed stopped ;ENUM
@@ -612,56 +618,59 @@ ENUM apply-event done blocked ;ENUM
      -- ^VEC:vector<JOURNAL:planned-operation> )
    JOURNAL-PLAN--RECORD:UNMAKE {: id p o s :} o ;
 
-: RUN-PATH ( ^local-run -- MODEL:path )
-   LOCAL-RUN-PLAN @ PLAN-PATH ;
+: RUN-PATH ( ^pass -- MODEL:path )
+   PASS-PLAN @ PLAN-PATH ;
 
-: RUN-TARGET ( ^local-run -- ^u8 n )
+: RUN-TARGET ( ^pass -- ^u8 n )
    RUN-PATH MODEL:PATH>STR str> ;
 
 \ The root's descriptor and path.
-: RUN-ROOT ( ^local-run -- fd ^u8 n )
+: RUN-ROOT ( ^pass -- fd ^u8 n )
    {: r :}
-   r LOCAL-RUN-ROOT @ r LOCAL-RUN-ROOT-PATH @ str> ;
+   r PASS-ROOT @ r PASS-ROOT-PATH @ str> ;
 
-: RUN-OPERATION ( ^local-run -- MODEL:operation )
-   LOCAL-RUN-OPERATION @
+: RUN-OPERATION ( ^pass -- MODEL:operation )
+   PASS-OPERATION @
    JOURNAL-PLANNED--OPERATION:UNMAKE {: id at o s :} o ;
 
-: NEW-RUN
-   ( JOURNAL:journal fd ^u8 n ^ARENA:arena -- ^local-run )
+: NEW-PASS
+   ( JOURNAL:journal fd ^u8 n ^ARENA:arena -- ^pass )
    {: j root:fd p:^ u:n ar :}
-   ar LOCAL-RUNS-NEW {: r :}
-   j r LOCAL-RUN-JOURNAL ! root r LOCAL-RUN-ROOT !
-   p u >str r LOCAL-RUN-ROOT-PATH ! ar r LOCAL-RUN-ARENA !
+   ar PASSES-NEW {: r :}
+   j r PASS-JOURNAL ! root r PASS-ROOT !
+   p u >str r PASS-ROOT-PATH ! ar r PASS-ARENA !
    ar ARENA:ALLOCATOR 0 [type] final-completion VEC:NEW
-   r LOCAL-RUN-FINALS !
-   ar NEW-REPORT r LOCAL-RUN-REPORT !
+   r PASS-FINALS !
+   ar NEW-REPORT r PASS-REPORT !
    r ;
 
 
 \ ---- apply outcomes
 
-: COUNTED ( n ^local-run -- )
-   LOCAL-RUN-REPORT @
+: COUNTED ( n ^pass -- )
+   PASS-REPORT @
    REPLAY-REPLAY--REPORT:COMPLETED-OPERATIONS +! ;
 
-: BLOCKED ( replay-blocked ^local-run -- apply-event )
-   LOCAL-RUN-BLOCKED ! construct apply-event blocked ;
+: BLOCKED ( replay-blocked ^pass -- apply-event )
+   PASS-BLOCKED ! construct apply-event blocked ;
 
 \ The operation completes with the pass's others, writing b.
-: FINAL ( MODEL:baseline ^local-run -- apply-event )
+: FINAL ( MODEL:baseline ^pass -- apply-event )
    {: b r :}
-   r LOCAL-RUN-OPERATION @ OPERATION-ID r RUN-PATH b
-   FINAL-COMPLETION-MAKE r LOCAL-RUN-FINALS @ VEC:PUSH !
+   r PASS-OPERATION @ OPERATION-ID r RUN-PATH b
+   FINAL-COMPLETION-MAKE r PASS-FINALS @ VEC:PUSH !
    construct apply-event done ;
 
 \ The plan is retired; a fresh scan observes its path again.
-: STALE ( ^local-run -- apply-event )
+: SUPERSEDED ( ^pass -- replay-blocked )
    {: r :}
-   r LOCAL-RUN-JOURNAL @ r LOCAL-RUN-PLAN @
-   r LOCAL-RUN-ARENA @ SUPERSEDE-PLAN
-   r RUN-PATH REPLAY-REPLAY--BLOCKED:FRESH-OBSERVATION-REQUIRED
-   r BLOCKED ;
+   r PASS-JOURNAL @ r PASS-PLAN @
+   r PASS-ARENA @ SUPERSEDE-PLAN
+   r RUN-PATH REPLAY-REPLAY--BLOCKED:FRESH-OBSERVATION-REQUIRED ;
+
+: STALE ( ^pass -- apply-event )
+   {: r :}
+   r SUPERSEDED r BLOCKED ;
 
 \ Rust's local_object_blocks_replay, of a code and its errno: an object
 \ at the path that replay cannot act on blocks the plan; any other
@@ -672,12 +681,12 @@ ENUM apply-event done blocked ;ENUM
    code LOCAL:E-IO <> if false exit then
    e FS:ELOOP = e FS:ENOTDIR = or ;
 
-: LOCAL-OBJECT ( ^local-run n -- apply-event )
+: LOCAL-OBJECT ( ^pass n -- apply-event )
    {: r code:n :}
    code FS:ERRNO LOCAL-OBJECT? 0= if code throw then
    r RUN-PATH REPLAY-REPLAY--BLOCKED:LOCAL-OBJECT r BLOCKED ;
 
-: REMOTE ( ^local-run -- apply-event )
+: REMOTE ( ^pass -- apply-event )
    {: r :}
    r RUN-PATH REPLAY-REPLAY--BLOCKED:REMOTE-OPERATION
    r BLOCKED ;
@@ -693,7 +702,7 @@ ENUM apply-event done blocked ;ENUM
 : DROP-DELETED ( LOCAL:delete-outcome -- ) drop ;
 
 : MADE
-   ( LOCAL:create-directory-outcome ^local-run -- apply-event )
+   ( LOCAL:create-directory-outcome ^pass -- apply-event )
    {: r :}
    MATCH LOCAL:create-directory-outcome
       created OF MODEL-BASELINE:DIRECTORY r FINAL ENDOF
@@ -701,17 +710,17 @@ ENUM apply-event done blocked ;ENUM
       fresh-observation OF r STALE ENDOF
    ;MATCH ;
 
-: CREATE-DIRECTORY ( ^local-run -- apply-event )
+: CREATE-DIRECTORY ( ^pass -- apply-event )
    {: r :}
    LOCAL-CREATE--DIRECTORY--OUTCOME:CREATED
-   [: DROP-MADE r LOCAL-RUN-ROOT @ r RUN-TARGET
+   [: DROP-MADE r PASS-ROOT @ r RUN-TARGET
       LOCAL:CREATE-DIRECTORY-AT ;]
    ['] LOCAL-OBJECT? LOCAL:CONVERTING {: code:n :}
    code 0= if r MADE exit then
    drop r code LOCAL-OBJECT ;
 
 : REMOVED
-   ( LOCAL:delete-directory-outcome ^local-run -- apply-event )
+   ( LOCAL:delete-directory-outcome ^pass -- apply-event )
    {: r :}
    MATCH LOCAL:delete-directory-outcome
       deleted OF MODEL-BASELINE:ABSENT r FINAL ENDOF
@@ -719,31 +728,31 @@ ENUM apply-event done blocked ;ENUM
       fresh-observation OF r STALE ENDOF
    ;MATCH ;
 
-: DELETE-DIRECTORY ( ^local-run -- apply-event )
+: DELETE-DIRECTORY ( ^pass -- apply-event )
    {: r :}
    LOCAL-DELETE--DIRECTORY--OUTCOME:DELETED
-   [: DROP-REMOVED r LOCAL-RUN-ROOT @ r RUN-TARGET
+   [: DROP-REMOVED r PASS-ROOT @ r RUN-TARGET
       LOCAL:DELETE-DIRECTORY-AT ;]
    ['] LOCAL-OBJECT? LOCAL:CONVERTING {: code:n :}
    code 0= if r REMOVED exit then
    drop r code LOCAL-OBJECT ;
 
-: CHANGED ( option<DROPBOX:hash> ^local-run -- apply-event )
+: CHANGED ( option<DROPBOX:hash> ^pass -- apply-event )
    {: actual r :}
    r RUN-PATH actual REPLAY-REPLAY--BLOCKED:PRECONDITION-CHANGED
    r BLOCKED ;
 
-: PRESENT ( MODEL:remote ^local-run -- apply-event )
+: PRESENT ( MODEL:remote ^pass -- apply-event )
    swap MODEL-BASELINE:PRESENT swap FINAL ;
 
-: STAGE-OCCUPIED ( JOURNAL:plan-id str ^local-run -- apply-event )
+: STAGE-OCCUPIED ( JOURNAL:plan-id str ^pass -- apply-event )
    {: id p:str r :}
    id p REPLAY-REPLAY--BLOCKED:STAGE-DESTINATION-OCCUPIED
    r BLOCKED ;
 
 \ What installing src came to.
 : INSTALLED
-   ( LOCAL:install-outcome MODEL:remote ^local-run
+   ( LOCAL:install-outcome MODEL:remote ^pass
      -- apply-event )
    {: src r :}
    MATCH LOCAL:install-outcome
@@ -754,7 +763,7 @@ ENUM apply-event done blocked ;ENUM
          REPLAY-REPLAY--BLOCKED:DOWNLOAD-REQUIRED r BLOCKED
       ENDOF
       stage-destination-occupied OF {: p:str :}
-         r LOCAL-RUN-PLAN @ PLAN-ID p r STAGE-OCCUPIED
+         r PASS-PLAN @ PLAN-ID p r STAGE-OCCUPIED
       ENDOF
       precondition-changed OF r CHANGED ENDOF
    ;MATCH ;
@@ -762,17 +771,17 @@ ENUM apply-event done blocked ;ENUM
 \ Installs src's verified download while the target holds
 \ expected, or is absent when expected is none.
 : INSTALL
-   ( MODEL:remote option<DROPBOX:hash> ^local-run -- apply-event )
+   ( MODEL:remote option<DROPBOX:hash> ^pass -- apply-event )
    {: src expected r :}
    src MODEL-REMOTE:UNMAKE {: want v :}
    LOCAL-INSTALL--OUTCOME:INSTALLED
    [: DROP-INSTALLED r RUN-ROOT r RUN-TARGET want expected
-      r LOCAL-RUN-ARENA @ LOCAL:INSTALL-DOWNLOAD-AT ;]
+      r PASS-ARENA @ LOCAL:INSTALL-DOWNLOAD-AT ;]
    ['] LOCAL-OBJECT? LOCAL:CONVERTING {: code:n :}
    code 0= if src r INSTALLED exit then
    drop r code LOCAL-OBJECT ;
 
-: DELETED ( LOCAL:delete-outcome ^local-run -- apply-event )
+: DELETED ( LOCAL:delete-outcome ^pass -- apply-event )
    {: r :}
    MATCH LOCAL:delete-outcome
       deleted OF MODEL-BASELINE:ABSENT r FINAL ENDOF
@@ -780,26 +789,26 @@ ENUM apply-event done blocked ;ENUM
       precondition-changed OF r CHANGED ENDOF
    ;MATCH ;
 
-: DELETE-FILE ( DROPBOX:hash ^local-run -- apply-event )
+: DELETE-FILE ( DROPBOX:hash ^pass -- apply-event )
    {: want r :}
    LOCAL-DELETE--OUTCOME:DELETED
    [: DROP-DELETED r RUN-ROOT r RUN-TARGET want
-      r LOCAL-RUN-ARENA @ LOCAL:DELETE-LOCAL-AT ;]
+      r PASS-ARENA @ LOCAL:DELETE-LOCAL-AT ;]
    ['] LOCAL-OBJECT? LOCAL:CONVERTING {: code:n :}
    code 0= if r DELETED exit then
    drop r code LOCAL-OBJECT ;
 
 \ A preservation completes at once and leaves the plan pending.
-: PRESERVE ( ^local-run -- apply-event )
+: PRESERVE ( ^pass -- apply-event )
    {: r :}
-   r LOCAL-RUN-JOURNAL @ r LOCAL-RUN-OPERATION @ r RUN-PATH
-   r LOCAL-RUN-ARENA @ COMPLETE-NONFINAL
+   r PASS-JOURNAL @ r PASS-OPERATION @ r RUN-PATH
+   r PASS-ARENA @ COMPLETE-NONFINAL
    1 r COUNTED construct apply-event done ;
 
 : NO-CONTENT ( -- option<DROPBOX:hash> ) OPTION:NONE ;
 
 \ The apply step of the run's operation; a remote one blocks.
-: APPLY ( ^local-run -- apply-event )
+: APPLY ( ^pass -- apply-event )
    {: r :}
    r RUN-OPERATION MATCH MODEL:operation
       create-local-directory OF r CREATE-DIRECTORY ENDOF
@@ -816,15 +825,15 @@ ENUM apply-event done blocked ;ENUM
       delete-remote OF drop r REMOTE ENDOF
    ;MATCH ;
 
-: STATUS ( ^local-run -- JOURNAL:record-status )
-   LOCAL-RUN-OPERATION @
+: STATUS ( ^pass -- JOURNAL:record-status )
+   PASS-OPERATION @
    JOURNAL-PLANNED--OPERATION:UNMAKE {: id at o s :} s ;
 
 \ The block goes in the report; the plan's later operations wait.
-: STOP ( ^local-run -- )
+: STOP ( ^pass -- )
    {: r :}
-   r LOCAL-RUN-REPORT @ REPLAY-REPLAY--REPORT:BLOCKED @ {: v :}
-   r LOCAL-RUN-BLOCKED @ v VEC:PUSH ! ;
+   r PASS-REPORT @ REPLAY-REPLAY--REPORT:BLOCKED @ {: v :}
+   r PASS-BLOCKED @ v VEC:PUSH ! ;
 
 
 \ ---- the operation's machine
@@ -832,7 +841,7 @@ ENUM apply-event done blocked ;ENUM
 \ One local operation's replay, after formal/MutationLifecycle.tla:
 \ a completed operation passes; a pending one is applied, and passes
 \ or stops its plan.
-FSM:DEFINE LOCAL-LIFECYCLE ( ^local-run ) local-state apply-event
+FSM:DEFINE LOCAL-LIFECYCLE ( ^pass ) local-state apply-event
    IN recorded  STATUS ( JOURNAL:record-status )
       completed  -  >passed
       pending    -  >applying
@@ -844,7 +853,7 @@ FSM:DEFINE LOCAL-LIFECYCLE ( ^local-run ) local-state apply-event
 ;DEFINE
 
 \ Runs the machine on r's operation; answers its final state.
-: LIFECYCLE ( ^local-run -- local-state )
+: LIFECYCLE ( ^pass -- local-state )
    {: r :}
    construct local-state recorded
    begin r swap LOCAL-LIFECYCLE-STEP until ;
@@ -854,24 +863,24 @@ FSM:DEFINE LOCAL-LIFECYCLE ( ^local-run ) local-state apply-event
 
 \ An excluded plan is retired; another's operations run in order
 \ until one stops it.
-: REPLAY-PLAN ( JOURNAL:plan-record ^local-run -- )
+: REPLAY-PLAN ( JOURNAL:plan-record ^pass -- )
    {: p r :}
-   p r LOCAL-RUN-PLAN !
+   p r PASS-PLAN !
    p PLAN-PATH MODEL:EXCLUDED? if
-      r LOCAL-RUN-JOURNAL @ p r LOCAL-RUN-ARENA @ SUPERSEDE-PLAN
+      r PASS-JOURNAL @ p r PASS-ARENA @ SUPERSEDE-PLAN
       exit
    then
    p PLAN-OPERATIONS {: ops :}
    ops VEC:COUNT 0 ?do
-      ops i VEC:AT @ r LOCAL-RUN-OPERATION !
+      ops i VEC:AT @ r PASS-OPERATION !
       r LIFECYCLE STOPPED? if leave then
    loop ;
 
 \ Commits the pass's final completions and counts them.
-: COMMIT-RUN ( ^local-run -- )
+: COMMIT-PASS ( ^pass -- )
    {: r :}
-   r LOCAL-RUN-FINALS @ {: finals :}
-   r LOCAL-RUN-JOURNAL @ finals r LOCAL-RUN-ARENA @
+   r PASS-FINALS @ {: finals :}
+   r PASS-JOURNAL @ finals r PASS-ARENA @
    COMMIT-FINAL-COMPLETIONS
    finals VEC:COUNT r COUNTED ;
 
@@ -884,10 +893,10 @@ public
    ( JOURNAL:journal fd ^u8 n ^VEC:vector<JOURNAL:plan-record>
      ^ARENA:arena -- ^replay-report )
    {: j root:fd r:^ ru:n plans ar :}
-   j root r ru ar NEW-RUN {: run :}
+   j root r ru ar NEW-PASS {: run :}
    plans VEC:COUNT 0 ?do plans i VEC:AT @ run REPLAY-PLAN loop
-   run COMMIT-RUN
-   run LOCAL-RUN-REPORT @ ;
+   run COMMIT-PASS
+   run PASS-REPORT @ ;
 
 
 \ ---- local conflict copies ------------------------------------------
@@ -1867,5 +1876,236 @@ public
    {: root:fd :}
    [: k root r ru path rem ar REMOTE-CONFLICT-AT ;] [: root DISCARD ;]
    finally ;
+
+
+\ ---- remote replay -------------------------------------------------
+
+private
+
+\ ---- blocks
+
+\ Rust's mutation_rejection_tag.
+: REJECTION-TAG ( mutation-rejection -- ^u8 n )
+   MATCH mutation-rejection
+      unsupported-file-size OF s" unsupported_file_size" ENDOF
+      invalid-path OF s" invalid_path" ENDOF
+      disallowed-name OF s" disallowed_name" ENDOF
+      permission-denied OF s" permission_denied" ENDOF
+      insufficient-space OF s" insufficient_space" ENDOF
+      operation-not-allowed OF s" operation_not_allowed" ENDOF
+      path-mismatch OF s" path_mismatch" ENDOF
+      rejected-by-dropbox OF s" rejected_by_dropbox" ENDOF
+   ;MATCH ;
+
+\ Rust's sync_error: the rejection, logged, blocks the plan.
+: SYNC-ERROR ( mutation-rejection ^pass -- apply-event )
+   {: why r :}
+   LOG:ERROR s" replay" LOG:LINE
+   s" Dropbox rejected sync path `" LOG:TEXT+
+   r RUN-TARGET LOG:TEXT+ s" `: " LOG:TEXT+
+   why REJECTION-TAG LOG:TEXT+ LOG:;LINE
+   r RUN-PATH why REPLAY-REPLAY--BLOCKED:SYNC-ERROR r BLOCKED ;
+
+: LATER ( -- n ) epoch-seconds JOURNAL:BLOCK-RETRY-SECONDS + ;
+
+\ An oversize stage is never retried: waiting does not shrink it.
+: RETRY-AT ( MODEL:blockage -- n )
+   MATCH MODEL:blockage
+      unsupported-file-size OF MEM-MAX-N ENDOF
+      remote-rejected OF drop LATER ENDOF
+      download-unavailable OF drop LATER ENDOF
+      download-verification-failed OF LATER ENDOF
+      stage-occupied OF LATER ENDOF
+      local-object-in-way OF LATER ENDOF
+      remote-object OF LATER ENDOF
+      conflict-copy-occupied OF LATER ENDOF
+   ;MATCH ;
+
+: LOST ( MODEL:path -- )
+   s" mutation blocker lost its owning plan" INVALID ;
+
+\ Rust's block_durably: the plan is held until its retry time.
+: BLOCK-DURABLY ( MODEL:blockage ^pass -- replay-blocked )
+   {: why r :}
+   r PASS-JOURNAL @ r PASS-PLAN @ PLAN-ID why why RETRY-AT
+   r PASS-ARENA @ JOURNAL:BLOCK-PLAN
+   MATCH JOURNAL:plan-block
+      blocked OF
+         r RUN-PATH why REPLAY-REPLAY--BLOCKED:DURABLE-PLAN
+      ENDOF
+      already-completed OF r RUN-PATH LOST ENDOF
+      not-found OF r RUN-PATH LOST ENDOF
+   ;MATCH ;
+
+: REMOTE-REJECTED ( mutation-rejection -- MODEL:blockage )
+   REJECTION-TAG >str MODEL-BLOCKAGE:REMOTE-REJECTED ;
+
+: REJECTED-BLOCKAGE ( mutation-rejection -- MODEL:blockage )
+   {: why :}
+   why MATCH mutation-rejection
+      unsupported-file-size OF
+         MODEL-BLOCKAGE:UNSUPPORTED-FILE-SIZE
+      ENDOF
+      invalid-path OF why REMOTE-REJECTED ENDOF
+      disallowed-name OF why REMOTE-REJECTED ENDOF
+      permission-denied OF why REMOTE-REJECTED ENDOF
+      insufficient-space OF why REMOTE-REJECTED ENDOF
+      operation-not-allowed OF why REMOTE-REJECTED ENDOF
+      path-mismatch OF why REMOTE-REJECTED ENDOF
+      rejected-by-dropbox OF why REMOTE-REJECTED ENDOF
+   ;MATCH ;
+
+\ Rust's persist_remote_block: a block Dropbox or the stage caused
+\ holds the plan durably; any other answers itself.
+: PERSIST-REMOTE-BLOCK ( replay-blocked ^pass -- replay-blocked )
+   {: b r :}
+   b MATCH replay-blocked
+      sync-error OF {: p why :}
+         why REJECTED-BLOCKAGE r BLOCK-DURABLY
+      ENDOF
+      stage-destination-occupied OF drop drop
+         MODEL-BLOCKAGE:STAGE-OCCUPIED r BLOCK-DURABLY
+      ENDOF
+      remote-object OF
+         drop MODEL-BLOCKAGE:REMOTE-OBJECT r BLOCK-DURABLY
+      ENDOF
+      durable-plan OF drop drop b ENDOF
+      local-object OF drop b ENDOF
+      fresh-observation-required OF drop b ENDOF
+      download-required OF drop drop b ENDOF
+      precondition-changed OF drop drop b ENDOF
+      remote-operation OF drop b ENDOF
+      remote-pending OF drop b ENDOF
+   ;MATCH ;
+
+: NO-BLOCK ( -- option<replay-blocked> ) OPTION:NONE ;
+
+\ Rust's unplaced_copy: none when the conflict copy was placed.
+: UNPLACED-COPY ( copy-outcome ^pass -- option<replay-blocked> )
+   {: r :}
+   MATCH copy-outcome
+      ready OF NO-BLOCK ENDOF
+      blocked OF r BLOCK-DURABLY OPTION:SOME ENDOF
+      source-changed OF r SUPERSEDED OPTION:SOME ENDOF
+   ;MATCH ;
+
+
+\ ---- upload stage
+
+: SOURCE-CHANGED? ( n n -- bool ) drop LOCAL:E-SOURCE-CHANGED = ;
+
+: NO-UPLOAD-STAGE ( -- LOCAL:stage-outcome<^LOCAL:staged-upload> )
+   s" " >str LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED ;
+: DROP-STAGE ( LOCAL:stage-outcome<^LOCAL:staged-upload> -- ) drop ;
+
+\ The run's target staged for upload as want, and the code a changed
+\ source threw, else 0.
+: STAGE
+   ( DROPBOX:hash ^pass -- LOCAL:stage-outcome<^LOCAL:staged-upload> n )
+   {: want r :}
+   NO-UPLOAD-STAGE [: DROP-STAGE r PASS-ROOT @ r RUN-TARGET
+      r PASS-STAGING @ str> want r PASS-ARENA @ LOCAL:STAGE-UPLOAD-AT ;]
+   ['] SOURCE-CHANGED? LOCAL:CONVERTING ;
+
+\ Other bytes hold the stage's path p.
+: STAGE-HELD ( str ^pass -- apply-event )
+   {: p:str r :}
+   r PASS-PLAN @ PLAN-ID p
+   REPLAY-REPLAY--BLOCKED:STAGE-DESTINATION-OCCUPIED
+   r PERSIST-REMOTE-BLOCK r BLOCKED ;
+
+: STAGED
+   ( LOCAL:stage-outcome<^LOCAL:staged-upload> ^pass
+     [ ^LOCAL:staged-upload -- apply-event ] -- apply-event )
+   {: r send :}
+   MATCH LOCAL:stage-outcome
+      staged OF send execute ENDOF
+      already-staged OF send execute ENDOF
+      content-changed OF drop r STALE ENDOF
+      destination-occupied OF r STAGE-HELD ENDOF
+   ;MATCH ;
+
+\ Rust's prepare_upload: send runs on the target's stage; a target
+\ changed since its plan retires the plan.
+: PREPARE-UPLOAD
+   ( DROPBOX:hash ^pass [ ^LOCAL:staged-upload -- apply-event ]
+     -- apply-event )
+   {: want r send :}
+   want r STAGE {: code:n :}
+   code 0= if r send STAGED exit then
+   drop code LOCAL:E-SOURCE-CHANGED = if r STALE exit then
+   code throw ;
+
+
+\ ---- folder outcomes
+
+\ The completion is written at once and counted.
+: COMPLETED ( MODEL:baseline ^pass -- apply-event )
+   {: b r :}
+   r PASS-JOURNAL @ r PASS-OPERATION @ r RUN-PATH b r PASS-ARENA @
+   COMPLETE-FINAL
+   1 r COUNTED construct apply-event done ;
+
+: PENDING-REMOTE ( ^pass -- apply-event )
+   {: r :}
+   r RUN-PATH REPLAY-REPLAY--BLOCKED:REMOTE-PENDING r BLOCKED ;
+
+: FOLDER-MADE ( remote-path-state ^pass -- apply-event )
+   {: r :}
+   MATCH remote-path-state
+      folder OF MODEL-BASELINE:DIRECTORY r COMPLETED ENDOF
+      absent OF r STALE ENDOF
+      file OF drop r STALE ENDOF
+      unsupported OF r STALE ENDOF
+   ;MATCH ;
+
+\ Rust's apply_folder_mutation.
+: APPLY-FOLDER-MUTATION ( mutation-outcome ^pass -- apply-event )
+   {: r :}
+   MATCH mutation-outcome
+      applied OF r FOLDER-MADE ENDOF
+      pending OF r PENDING-REMOTE ENDOF
+      precondition-changed OF drop r STALE ENDOF
+      rejected OF r SYNC-ERROR ENDOF
+   ;MATCH ;
+
+: IMPOSSIBLE-APPLIED ( ^pass -- )
+   RUN-PATH s" folder delete returned an impossible applied state"
+   INVALID ;
+
+: IMPOSSIBLE-ABSENT ( ^pass -- )
+   RUN-PATH
+   s" folder delete precondition changed to an impossible absent state"
+   INVALID ;
+
+: FOLDER-GONE ( remote-path-state ^pass -- apply-event )
+   {: r :}
+   MATCH remote-path-state
+      absent OF MODEL-BASELINE:ABSENT r COMPLETED ENDOF
+      file OF drop r IMPOSSIBLE-APPLIED ENDOF
+      folder OF r IMPOSSIBLE-APPLIED ENDOF
+      unsupported OF r IMPOSSIBLE-APPLIED ENDOF
+   ;MATCH ;
+
+: FOLDER-CHANGED ( remote-path-state ^pass -- apply-event )
+   {: r :}
+   MATCH remote-path-state
+      folder OF r STALE ENDOF
+      file OF drop r STALE ENDOF
+      unsupported OF r STALE ENDOF
+      absent OF r IMPOSSIBLE-ABSENT ENDOF
+   ;MATCH ;
+
+\ Rust's apply_folder_delete_mutation: only an absent folder completes
+\ the plan, so a replay after a crash stays idempotent.
+: APPLY-FOLDER-DELETE-MUTATION
+   ( mutation-outcome ^pass -- apply-event )
+   {: r :}
+   MATCH mutation-outcome
+      applied OF r FOLDER-GONE ENDOF
+      pending OF r PENDING-REMOTE ENDOF
+      precondition-changed OF r FOLDER-CHANGED ENDOF
+      rejected OF r SYNC-ERROR ENDOF
+   ;MATCH ;
 
 ;package

@@ -2396,6 +2396,9 @@ private
 
 public
 
+\ How long a blocked plan waits for its next attempt, in seconds.
+3600 constant BLOCK-RETRY-SECONDS
+
 \ Holds a live plan until its classified cause is worth retrying, at
 \ retry-at, seconds since the epoch.
 : BLOCK-PLAN
