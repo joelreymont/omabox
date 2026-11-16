@@ -616,7 +616,7 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
    x XDG-STATE-HOME @ s" omabox" >str ar JOIN ;
 
 \ A file or directory of the state directory, projected.
-: PRIVATE ( abs-path ^u8 n ^ARENA:arena -- abs-path )
+: PRIVATE-PATH ( abs-path ^u8 n ^ARENA:arena -- abs-path )
    {: state name:^ nameu:n ar :}
    state name nameu >str ar JOIN DANGLING-REFUSE ar PROJECT ;
 
@@ -1090,10 +1090,10 @@ public
    ar PATH-SETS-NEW {: p :}
    x ar XDG-CONFIG-DIRECTORY ABS-PATH>STR ar NORMALIZE p PATHS-CONFIG !
    state DANGLING-REFUSE ar PROJECT p PATHS-STATE !
-   state s" journal.sqlite3" ar PRIVATE p PATHS-JOURNAL !
-   state s" upload-staging" ar PRIVATE p PATHS-STAGING !
-   state s" recovery" ar PRIVATE p PATHS-RECOVERY !
-   state s" daemon.lock" ar PRIVATE p PATHS-LOCK !
+   state s" journal.sqlite3" ar PRIVATE-PATH p PATHS-JOURNAL !
+   state s" upload-staging" ar PRIVATE-PATH p PATHS-STAGING !
+   state s" recovery" ar PRIVATE-PATH p PATHS-RECOVERY !
+   state s" daemon.lock" ar PRIVATE-PATH p PATHS-LOCK !
    p ;
 
 : CONFIG-DIRECTORY ( ^paths -- abs-path ) PATHS-CONFIG @ ;

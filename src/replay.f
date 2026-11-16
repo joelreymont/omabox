@@ -2232,7 +2232,7 @@ private
 \ ---- file outcomes
 
 \ Rust's FileMutation: the upload creates the file or replaces a rev.
-ENUM file-mutation create replace ;ENUM
+ENUM file-mutation add replace ;ENUM
 
 \ The plan finishes as the conflict, counted; the baseline stays.
 : CONFLICTED ( MODEL:conflict ^pass -- apply-event )
@@ -2268,7 +2268,7 @@ ENUM file-mutation create replace ;ENUM
 : COLLISION
    ( MODEL:local MODEL:remote file-mutation -- MODEL:conflict )
    MATCH file-mutation
-      create OF MODEL-CONFLICT:INITIAL ENDOF
+      add OF MODEL-CONFLICT:INITIAL ENDOF
       replace OF MODEL-CONFLICT:DIVERGENT ENDOF
    ;MATCH ;
 
@@ -2304,7 +2304,7 @@ ENUM file-mutation create replace ;ENUM
    {: up m r :}
    m MATCH file-mutation
       replace OF up r LOCAL-EDITED ENDOF
-      create OF
+      add OF
          s" create precondition changed to an impossible absent state"
          r CONTRADICTED
       ENDOF
@@ -2521,7 +2521,7 @@ ENUM file-mutation create replace ;ENUM
 : SEND-NEW ( ^LOCAL:staged-upload ^pass -- apply-event )
    {: up r :}
    r [: r PASS-LINK @ r RUN-PATH up NO-REV r PASS-ARENA @
-      REMOTE-UPLOAD up FILE-MUTATION-CREATE r APPLY-FILE-MUTATION ;]
+      REMOTE-UPLOAD up FILE-MUTATION-ADD r APPLY-FILE-MUTATION ;]
    ENSURE-REMOTE-PARENTS ;
 
 : FILE-CREATE ( DROPBOX:hash ^pass -- apply-event )
