@@ -96,6 +96,7 @@ ENUM reply
 : DELETE        ( ^u8 n ^u8 n ^client -- reply )  \ path, rev
 : CREATE-FOLDER ( ^u8 n ^client -- reply )  \ path
 : ENTRY         ( ^client -- ^entry )
+: HTTP-STATUS   ( ^client -- n )    \ the last answer's status, 0 if none
 : CONTENT-HASH? ( ^u8 n -- bool )   \ 64 lowercase hex digits
 : COMPLETE?     ( ^entry -- bool )  \ a downloadable file with a
                 \ rev and a 64-lowercase-hex-digit content hash
@@ -111,6 +112,8 @@ STRUCTURE entry
    FIELD size n            \ files only
    FIELD downloadable bool \ is_downloadable, false with symlink_info;
                            \ true for a folder or deleted entry
+   FIELD restricted bool   \ folders only: sharing_info no_access or
+                           \ traverse_only
 ;STRUCTURE
 
 STRUCTURE upload

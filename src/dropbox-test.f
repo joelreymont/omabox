@@ -6,14 +6,16 @@
 \ revoked token, access denied, rate limits, outages, a redirect, a
 \ malformed request, a write refused access_restricted, team_folder or
 \ operation_suppressed, the listing (one holding a file that is not
-\ downloadable, and one holding files Dropbox described incompletely,
-\ handed on, among them), COMPLETE? of each kind of entry, the long poll,
+\ downloadable, one holding files Dropbox described incompletely, handed
+\ on, and one holding restricted folders, among them), COMPLETE? of each
+\ kind of entry, the long poll,
 \ downloads, whose body reads through READ-BODY (whole, resumed, a 416
 \ at the end, a body that throws before or after its end, one left
 \ unread while the server holds the rest, one in two chunks read 7 or
 \ 64 bytes a read, one
 \ cut mid-body, whether or not its body catches the loss, an empty file,
-\ one answered 400, and ones refused unverified: another rev, range or
+\ one answered 400 and one 404, each keeping its status, and ones refused
+\ unverified: another rev, range or
 \ length, a 416 from 0, a Dropbox-API-Result or an error that does not
 \ parse), delete,
 \ create-folder, the code exchange, Dropbox's content hash and uploads,
@@ -947,6 +949,28 @@ variable GOT-U
    MAIN @ DROPBOX:CURSOR s" i5" T$= ;
 
 
+\ As SAW, each entry marked + if restricted, else -.
+: SAW-RESTRICTED ( ^DROPBOX:entry -- )
+   {: e :}
+   e SAW
+   e DROPBOX-ENTRY:RESTRICTED @ if s" +" else s" -" then GOT+ ;
+
+
+\ A folder whose sharing_info has no_access or traverse_only is
+\ restricted, its `.tag` before or after it; no other entry is.
+: RESTRICTED-LISTED-CASE ( -- )
+   s" listing restricted folders" T-LABEL
+   LISTING
+   S\" [{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/sync\q,\qpath_display\q:\q/Sync\q},{\qpath_lower\q:\q/sync/a\q,\qpath_display\q:\q/Sync/a\q,\qsharing_info\q:{\qread_only\q:false,\qno_access\q:true},\q.tag\q:\qfolder\q}]"
+   s" s1" true TEST-DROPBOX:PAGE!
+   S\" [{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/sync/b\q,\qpath_display\q:\q/Sync/b\q,\qsharing_info\q:{\qread_only\q:false,\qtraverse_only\q:true}},{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/sync/c\q,\qpath_display\q:\q/Sync/c\q,\qsharing_info\q:{\qno_access\q:false,\qtraverse_only\q:false}}]"
+   s" s2" true TEST-DROPBOX:PAGE!
+   S\" [{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/sync/d\q,\qpath_display\q:\q/Sync/d\q},{\q.tag\q:\qfile\q,\qpath_lower\q:\q/sync/e\q,\qpath_display\q:\q/Sync/e\q,\qrev\q:\q015e\q,\qsize\q:0,\qsharing_info\q:{\qread_only\q:false}}]"
+   s" s3" false TEST-DROPBOX:PAGE!
+   s" /sync" MAIN @ [: SAW-RESTRICTED ;] DROPBOX:LIST DONE? ASSERT
+   GOT$ s" d/sync- d/sync/a+ d/sync/b+ d/sync/c- d/sync/d- f/sync/e-" T$= ;
+
+
 \ Only a downloadable file can be complete: not a folder, nor a file
 \ that is not downloadable, whatever its rev and hash.
 : INCOMPLETE-KINDS-CASE ( -- )
@@ -1088,13 +1112,26 @@ variable READ-COUNT
    s" /docs/abc.txt" MAIN @ DROPBOX:METADATA DONE? ASSERT ;
 
 
-\ A download answered 400 throws as any call does, unconverted.
+\ A download answered status s throws code as any call does,
+\ unconverted, and HTTP-STATUS answers s.
+: THROWN-DOWNLOAD ( n n -- )
+   {: s:n code:n :}
+   TEST-DROPBOX:RESET ALPHABET
+   s s" " s" " s" bad" TEST-DROPBOX:SCRIPT!
+   [: 0 FETCH DONE? drop ;] LOGGED code T=
+   MAIN @ DROPBOX:HTTP-STATUS s T=
+   USABLE ;
+
+
 : BAD-REQUEST-DOWNLOAD-CASE ( -- )
    s" download answered 400" T-LABEL
-   TEST-DROPBOX:RESET ALPHABET
-   400 s" " s" " s" bad" TEST-DROPBOX:SCRIPT!
-   [: 0 FETCH DONE? drop ;] LOGGED DROPBOX:E-BAD-REQUEST T=
-   USABLE ;
+   400 DROPBOX:E-BAD-REQUEST THROWN-DOWNLOAD ;
+
+
+\ 404 is a status no route expects; 403 would answer unlinked.
+: UNEXPECTED-DOWNLOAD-CASE ( -- )
+   s" download answered 404" T-LABEL
+   404 DROPBOX:E-STATUS THROWN-DOWNLOAD ;
 
 
 : SKEW-CASE ( -- )
@@ -1395,7 +1432,8 @@ variable READ-COUNT
    OTHER-REV-CASE SHORT-CASE WHOLE-FOR-RANGE-CASE UNASKED-RANGE-CASE
    UNPARSED-RESULT-CASE UNPARSED-REFUSAL-CASE
    BROKEN-CASE SWALLOWED-CASE BODY-THROWS-CASE LATE-THROW-CASE UNREAD-CASE
-   PAUSED-CASE CHUNKED-CASE EMPTY-CASE BAD-REQUEST-DOWNLOAD-CASE ;
+   PAUSED-CASE CHUNKED-CASE EMPTY-CASE BAD-REQUEST-DOWNLOAD-CASE
+   UNEXPECTED-DOWNLOAD-CASE ;
 
 
 \ ---- delete_v2, create_folder_v2 and the code exchange
@@ -2357,7 +2395,7 @@ TYPED-VARIABLE FAULT fault
    BUSY-CASE REDIRECT-CASE BAD-REQUEST-CASE
    CLASSIFY-CASES
    PAGES-CASE RESET-CASE STALL-CASE UNTAGGED-CASE UNDOWNLOADABLE-LISTED-CASE
-   INCOMPLETE-LISTED-CASE INCOMPLETE-KINDS-CASE
+   INCOMPLETE-LISTED-CASE RESTRICTED-LISTED-CASE INCOMPLETE-KINDS-CASE
    POLL-CASE POLL-RESET-CASE
    DOWNLOAD-CASES
    DELETE-CONFLICT-CASE DELETE-MISSING-CASE DELETE-GONE-CASE

@@ -93,6 +93,7 @@ DEFTYPE CURSOR str
 
 \ rev, content-hash, size and downloadable are a file's alone: empty, 0 and
 \ true for any other kind; lower and display are path_lower and path_display.
+\ restricted: a folder whose sharing_info has no_access or traverse_only.
 STRUCTURE entry DERIVE addr
    FIELD kind kind
    FIELD lower SPAN:span<u8>
@@ -101,6 +102,7 @@ STRUCTURE entry DERIVE addr
    FIELD content-hash SPAN:span<u8>
    FIELD size n
    FIELD downloadable bool
+   FIELD restricted bool
 ;STRUCTURE
 
 \ What OPEN copies: key is the app key, Dropbox's client_id; token the
@@ -1050,7 +1052,8 @@ ENUM verdict
    construct kind deleted e DROPBOX-ENTRY:KIND !
    EMPTY e DROPBOX-ENTRY:LOWER ! EMPTY e DROPBOX-ENTRY:DISPLAY !
    EMPTY e DROPBOX-ENTRY:REV ! EMPTY e DROPBOX-ENTRY:CONTENT-HASH !
-   0 e DROPBOX-ENTRY:SIZE ! true e DROPBOX-ENTRY:DOWNLOADABLE ! ;
+   0 e DROPBOX-ENTRY:SIZE ! true e DROPBOX-ENTRY:DOWNLOADABLE !
+   false e DROPBOX-ENTRY:RESTRICTED ! ;
 
 
 : FILE? ( ^entry -- bool )
@@ -1114,6 +1117,25 @@ private
    e DROPBOX-ENTRY:DOWNLOADABLE ! ;
 
 
+\ Whether the key is FolderSharingInfo's no_access or traverse_only.
+: BARRED? ( JSON:reader -- JSON:reader bool )
+   s" no_access" JSON:READ-STR-EQ? if true exit then
+   s" traverse_only" JSON:READ-STR-EQ? ;
+
+
+\ Either member true marks the entry; any other is skipped.
+: SHARING-MEMBER ( JSON:reader ^client -- JSON:reader )
+   {: c :}
+   BARRED? 0= if SKIP exit then
+   c CLIENT-ENTRY {: e :}
+   BOOLEAN e DROPBOX-ENTRY:RESTRICTED @ or e DROPBOX-ENTRY:RESTRICTED ! ;
+
+
+: SHARING ( JSON:reader ^client -- JSON:reader )
+   {: c :}
+   VALUE OBJECT c [: SHARING-MEMBER ;] MEMBERS ;
+
+
 \ The members both shapes hold.
 : FIELD-MEMBER ( JSON:reader ^client -- JSON:reader )
    {: c :}
@@ -1125,6 +1147,7 @@ private
    s" size" JSON:READ-STR-EQ? if INT e DROPBOX-ENTRY:SIZE ! exit then
    s" is_downloadable" JSON:READ-STR-EQ? if e DOWNLOADABLE exit then
    s" symlink_info" JSON:READ-STR-EQ? if SKIP false e DROPBOX-ENTRY:DOWNLOADABLE ! exit then
+   s" sharing_info" JSON:READ-STR-EQ? if c SHARING exit then
    SKIP ;
 
 
@@ -1134,6 +1157,14 @@ private
       KIND-OF c CLIENT-ENTRY DROPBOX-ENTRY:KIND ! true c CLIENT-TAGGED ! exit
    then
    c FIELD-MEMBER ;
+
+
+\ restricted kept for a folder alone, once its members are read: a
+\ union's `.tag` may follow its sharing_info.
+: ENTRY-CLOSE ( ^client -- )
+   CLIENT-ENTRY {: e :}
+   e DROPBOX-ENTRY:KIND @ construct kind folder DROPBOX-KIND:EQ
+   e DROPBOX-ENTRY:RESTRICTED @ and e DROPBOX-ENTRY:RESTRICTED ! ;
 
 
 \ The entry cleared to read one of kind k, with no `.tag` read yet.
@@ -1148,7 +1179,7 @@ private
 : PLAIN-OBJECT ( JSON:reader ^client kind -- JSON:reader )
    {: c k:kind :}
    c k ENTRY-OPEN
-   c [: FIELD-MEMBER ;] MEMBERS ;
+   c [: FIELD-MEMBER ;] MEMBERS c ENTRY-CLOSE ;
 
 
 \ A Metadata union, its object just opened, read into the entry: one with
@@ -1156,7 +1187,7 @@ private
 : TAGGED-OBJECT ( JSON:reader ^client -- JSON:reader )
    {: c :}
    c construct kind deleted ENTRY-OPEN
-   c [: TAGGED-MEMBER ;] MEMBERS
+   c [: TAGGED-MEMBER ;] MEMBERS c ENTRY-CLOSE
    c CLIENT-TAGGED @ 0= if E-ANSWER throw then ;
 
 
@@ -1167,7 +1198,7 @@ private
 : ENTRY-FOUND ( ^client kind [ JSON:reader ^client -- JSON:reader ] -- )
    {: c k:kind member :}
    c k ENTRY-OPEN
-   c member PARSE
+   c member PARSE c ENTRY-CLOSE
    c CLIENT-ENTRY {: e :}
    e DROPBOX-ENTRY:KIND @ construct kind deleted DROPBOX-KIND:EQ
    e PATHS? 0= or if c s" an incomplete entry" E-ANSWER FAILED then ;
@@ -1735,6 +1766,10 @@ public
 
 
 : ENTRY ( ^client -- ^entry ) CLIENT-ENTRY ;
+
+\ The status of the last answer, 0 when none came; an E-STATUS or
+\ E-BAD-REQUEST call leaves its own.
+: HTTP-STATUS ( ^client -- n ) CLIENT-STATUS @ ;
 
 
 \ ---- list_folder, list_folder/continue and list_folder/longpoll
