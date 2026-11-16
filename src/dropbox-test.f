@@ -1,20 +1,22 @@
 \ dropbox-test.f - DROPBOX's client core against the fake Dropbox of
 \ test-dropbox.f on a loopback port: the account, metadata, the Path-Root
 \ header, the token's refresh, its rotation and the store that keeps it, a
-\ rejected grant, a revoked token, access denied, rate limits,
-\ outages, a redirect, a malformed request, the listing, the long poll,
-\ downloads, whose body reads through READ-BODY (whole, resumed, a 416
-\ at the end, a body that throws before or after its end, one left
-\ unread, one cut mid-body, an empty file), delete, create-folder, the code exchange, Dropbox's content
-\ hash and uploads, whose stages are written under TMPDIR and removed once
+\ rejected grant, a revoked token, access denied, rate limits, outages, a
+\ redirect, a malformed request, the listing, the long poll, downloads,
+\ whose body reads through READ-BODY (whole, resumed, a 416 at the end, a
+\ body that throws before or after its end, one left unread, one cut
+\ mid-body, an empty file, and ones refused unverified: another rev, range
+\ or length, a 416 from 0, a Dropbox-API-Result or an error that does not
+\ parse), delete, create-folder, the code exchange, Dropbox's content hash
+\ and uploads, whose stages are written under TMPDIR and removed once
 \ open, so no run leaves one; a mutation or session finish Dropbox answers
 \ at another path, an upload's that get_metadata then does not find, a
 \ conflict whose confirmation is at another path, and a delete it answers
 \ with a folder or a file at another rev. One server and one main client
-\ serve every case; a case that needs another config opens its own
-\ client. DROPBOX's log lines go to stderr, but those a case checks,
-\ which are captured in TMPDIR, checked and removed. A stub in place of
-\ AIO's transfer fails the stage's reads. Each failed assertion prints its
+\ serve every case; a case that needs another config opens its own client.
+\ DROPBOX's log lines go to stderr, but those a case checks, which are
+\ captured in TMPDIR, checked and removed. A stub in place of AIO's
+\ transfer fails the stage's reads. Each failed assertion prints its
 \ label; the run goes on and fails at its end.
 \ Run from the repository root: hb --load src/dropbox-test.f </dev/null
 require src/lib/aio.f
@@ -920,15 +922,21 @@ variable BODY-CODE
    MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:SIZE @ 26 T= ;
 
 
-: FETCH-DROPPED ( -- ) 10 FETCH DONE? drop ;
+: UNVERIFIED? ( DROPBOX:reply -- bool ) DROPBOX-ERROR:unverified REFUSED? ;
+
+
+\ The main client still answers a call after a download.
+: USABLE ( -- )
+   s" /docs/abc.txt" MAIN @ DROPBOX:METADATA DONE? ASSERT ;
 
 
 : SKEW-CASE ( -- )
    s" download range mismatch" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
    TEST-DROPBOX:SKEW
-   [: FETCH-DROPPED ;] DROPBOX:E-ANSWER TTHROWSQ
-   BODIES @ 0 T= ;
+   10 FETCH UNVERIFIED? ASSERT
+   BODIES @ 0 T=
+   USABLE ;
 
 
 \ A 416 whose length is the offset asked: the bytes before it are the
@@ -963,18 +971,20 @@ variable BODY-CODE
    s" download 416 on the restart" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
    UNSATISFIABLE! UNSATISFIABLE!
-   [: FETCH-DROPPED ;] DROPBOX:E-ANSWER TTHROWSQ
+   10 FETCH UNVERIFIED? ASSERT
    TEST-DROPBOX:SEEN$ s" /2/files/download /2/files/download" T$=
-   BODIES @ 0 T= ;
+   BODIES @ 0 T=
+   USABLE ;
 
 
 : FIRST-UNSATISFIABLE-CASE ( -- )
    s" download 416 from 0" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
    UNSATISFIABLE!
-   [: 0 FETCH DONE? drop ;] DROPBOX:E-ANSWER TTHROWSQ
+   0 FETCH UNVERIFIED? ASSERT
    TEST-DROPBOX:SEEN$ s" /2/files/download" T$=
-   BODIES @ 0 T= ;
+   BODIES @ 0 T=
+   USABLE ;
 
 
 : UNKNOWN-REV-CASE ( -- )
@@ -986,12 +996,19 @@ variable BODY-CODE
    BODIES @ 0 T= ;
 
 
-\ A download refused as a bad answer leaves the client usable.
-: USABLE ( -- )
-   s" /docs/abc.txt" MAIN @ DROPBOX:METADATA DONE? ASSERT ;
+\ OUTCOME: the download from 0, or from 10, answered refused unverified.
+: WHOLE-UNVERIFIED ( -- ) 0 FETCH UNVERIFIED? OUTCOME ! ;
+: RESUME-UNVERIFIED ( -- ) 10 FETCH UNVERIFIED? OUTCOME ! ;
 
 
-: WHOLE-DROPPED ( -- ) 0 FETCH DONE? drop ;
+\ The download fetch makes answers refused unverified, logging one line
+\ that holds the text.
+: REFUSED-LOGGED ( [ -- ] ^u8 n -- )
+   {: fetch t:^ tu:n :}
+   false OUTCOME !
+   fetch LOGGED 0 T=
+   OUTCOME @ TTRUE
+   t tu LOGGED? TTRUE ;
 
 
 : OTHER-REV-CASE ( -- )
@@ -1002,8 +1019,7 @@ variable BODY-CODE
    26 TEST-DROPBOX:FILE!
    s" 0160aaaaaaaa" s" ABCDEFGHIJKLMNOPQRSTUVWXYZ" TEST-DROPBOX:CONTENT!
    s" 0160aaaaaaaa" TEST-DROPBOX:MISFILE
-   [: WHOLE-DROPPED ;] LOGGED DROPBOX:E-ANSWER T=
-   s" another rev" LOGGED? TTRUE
+   [: WHOLE-UNVERIFIED ;] s" another rev" REFUSED-LOGGED
    BODIES @ 0 T=
    USABLE ;
 
@@ -1014,8 +1030,7 @@ variable BODY-CODE
    s" download of another length" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
    TEST-DROPBOX:SHORTEN
-   [: WHOLE-DROPPED ;] LOGGED DROPBOX:E-ANSWER T=
-   s" a body of another length" LOGGED? TTRUE
+   [: WHOLE-UNVERIFIED ;] s" a body of another length" REFUSED-LOGGED
    USABLE ;
 
 
@@ -1023,8 +1038,7 @@ variable BODY-CODE
    s" download whole for a range" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
    TEST-DROPBOX:IGNORE-RANGE
-   [: FETCH-DROPPED ;] LOGGED DROPBOX:E-ANSWER T=
-   s" a whole file for a range" LOGGED? TTRUE
+   [: RESUME-UNVERIFIED ;] s" a whole file for a range" REFUSED-LOGGED
    TEST-DROPBOX:RANGE-SENT$ s" bytes=10-" T$=
    BODIES @ 0 T=
    USABLE ;
@@ -1034,9 +1048,31 @@ variable BODY-CODE
    s" download range nobody asked for" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
    TEST-DROPBOX:FORCE-RANGE
-   [: WHOLE-DROPPED ;] LOGGED DROPBOX:E-ANSWER T=
-   s" a range nobody asked for" LOGGED? TTRUE
+   [: WHOLE-UNVERIFIED ;] s" a range nobody asked for" REFUSED-LOGGED
    TEST-DROPBOX:RANGE-SENT? TFALSE
+   BODIES @ 0 T=
+   USABLE ;
+
+
+\ A 200 whose Dropbox-API-Result is not JSON: the body never sees it.
+: UNPARSED-RESULT-CASE ( -- )
+   s" download whose result does not parse" T-LABEL
+   TEST-DROPBOX:RESET ALPHABET
+   200 s" Dropbox-API-Result" s" not json" s" abc" TEST-DROPBOX:SCRIPT!
+   [: WHOLE-UNVERIFIED ;]
+   s" files/download answered 200: an answer that does not parse"
+   REFUSED-LOGGED
+   BODIES @ 0 T=
+   USABLE ;
+
+
+: UNPARSED-REFUSAL-CASE ( -- )
+   s" download whose error does not parse" T-LABEL
+   TEST-DROPBOX:RESET ALPHABET
+   409 s" " s" " s" not json" TEST-DROPBOX:SCRIPT!
+   [: WHOLE-UNVERIFIED ;]
+   s" files/download answered 409: an error that does not parse"
+   REFUSED-LOGGED
    BODIES @ 0 T=
    USABLE ;
 
@@ -1139,6 +1175,7 @@ variable BODY-CODE
    WHOLE-CASE RESUME-CASE SKEW-CASE COMPLETE-CASE RESTART-CASE
    UNSATISFIABLE-CASE FIRST-UNSATISFIABLE-CASE UNKNOWN-REV-CASE
    OTHER-REV-CASE SHORT-CASE WHOLE-FOR-RANGE-CASE UNASKED-RANGE-CASE
+   UNPARSED-RESULT-CASE UNPARSED-REFUSAL-CASE
    BROKEN-CASE BODY-THROWS-CASE LATE-THROW-CASE UNREAD-CASE EMPTY-CASE ;
 
 

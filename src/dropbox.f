@@ -57,13 +57,14 @@ public
 -100007 s" the rotated Dropbox refresh token could not be stored"
    ERROR:CODE E-NOT-STORED
 
-\ Dropbox's 409 error tags omabox decides on; any other tag is other.
-\ path-mismatch: an entry whose path_lower is not the path's full lowercase.
+\ Dropbox's 409 tags omabox decides on, else other; no tag: path-mismatch,
+\ an entry elsewhere, and unverified, a download that fails a check or parse.
 ENUM error DERIVE eq
    not-found not-file not-folder malformed-path disallowed-name
    conflict no-write-permission restricted-content
    insufficient-space locked reset invalid-root
-   content-hash-mismatch unsupported-file path-mismatch other ;ENUM
+   content-hash-mismatch unsupported-file path-mismatch unverified
+   other ;ENUM
 
 \ What a call answers: done, the client holds the answer; refused, Dropbox
 \ said no and why; retry, the ms Dropbox asked to wait, else 0; unlinked,
@@ -1171,6 +1172,20 @@ ENUM verdict
    h STALLED ;
 
 
+-100009 s" a download's answer failed its checks"
+   ERROR:CODE E-UNVERIFIED
+
+
+\ Runs a parse of the download's answer, which replaces its seed as catch
+\ keeps the stack's shape; its E-ANSWER, logged already, is E-UNVERIFIED.
+: VERIFIED ( R [ R -- R ] -- R )
+   {: parse :}
+   [: parse execute ;] catch {: code:n :}
+   code 0= if exit then
+   code E-ANSWER = if E-UNVERIFIED throw then
+   code throw ;
+
+
 \ The metadata the Dropbox-API-Result header holds, read into the entry.
 \ It replaces the answer buffer, so a 2xx chunk lands in the body buffer
 \ and a failed check logs the result, never a byte of the file.
@@ -1179,7 +1194,7 @@ ENUM verdict
    c s" Dropbox-API-Result" HEADER$ BUF:N>BLEN
    c CLIENT-ANSWER @ BUF:REPLACE
    s" result" SPAN:MAKE c CLIENT-HOLDS !
-   c FILE-READ ;
+   [: c FILE-READ ;] VERIFIED ;
 
 
 \ The Content-Range a ranged answer of the entry must carry, in the line.
@@ -1197,13 +1212,14 @@ ENUM verdict
    {: c at:n e :}
    c CLIENT-STATUS @ {: s:n :}
    at 0= if
-      s 200 <> if c s" a range nobody asked for" E-ANSWER FAILED then
+      s 200 <> if c s" a range nobody asked for" E-UNVERIFIED FAILED then
       exit
    then
-   s 206 <> if c s" a whole file for a range" E-ANSWER FAILED then
-   at e DROPBOX-ENTRY:SIZE @ >= if c s" a range past the file" E-ANSWER FAILED then
+   s 206 <> if c s" a whole file for a range" E-UNVERIFIED FAILED then
+   at e DROPBOX-ENTRY:SIZE @ >=
+   if c s" a range past the file" E-UNVERIFIED FAILED then
    c s" Content-Range" HEADER$ c at e RANGE-LINE STR=
-   0= if c s" another Content-Range" E-ANSWER FAILED then ;
+   0= if c s" another Content-Range" E-UNVERIFIED FAILED then ;
 
 
 \ The status, metadata and Content-Range of a 2xx answer, from the captured
@@ -1213,7 +1229,7 @@ ENUM verdict
    c RESULT-READ
    c CLIENT-ENTRY {: e :}
    e DROPBOX-ENTRY:REV @ SPAN:$ r ru STR=
-   0= if c s" another rev" E-ANSWER FAILED then
+   0= if c s" another rev" E-UNVERIFIED FAILED then
    c at e RANGED ;
 
 
@@ -1444,18 +1460,22 @@ private
    code E-BODY-LOST <> if code throw then ;
 
 
+\ A seed's typed drop, which types the classification that replaces it.
+: DROP-VERDICT ( verdict -- ) drop ;
+
+
 \ A 206 is a download's done too; RANGED checks it was asked for.
 : SORTED ( ^client -- verdict )
    {: c :}
    c CLIENT-STATUS @ 206 = if construct reply done ANSWER exit then
-   c CLASSIFY ;
+   construct verdict rejected [: DROP-VERDICT c CLASSIFY ;] VERIFIED ;
 
 
 \ A body of every byte after the offset.
 : SIZED ( ^client n n -- )
    {: c at:n got:n :}
    c FILE-SIZE at - got <>
-   if c s" a body of another length" E-ANSWER FAILED then ;
+   if c s" a body of another length" E-UNVERIFIED FAILED then ;
 
 
 \ A done answer no chunk came with: the rev and range asked and an empty
@@ -1471,7 +1491,7 @@ private
 
 \ A 416 from offset 0, where no Range was sent.
 : UNSATISFIABLE ( ^fetch -- reply )
-   FETCH-CLIENT @ s" a range it cannot satisfy from 0" E-ANSWER FAILED ;
+   FETCH-CLIENT @ s" a range it cannot satisfy from 0" E-UNVERIFIED FAILED ;
 
 
 \ An answer that arrived with no chunk handed to body. A 416,
@@ -1549,6 +1569,17 @@ private
    0= if c f FETCH-REV @ SPAN:$ body AFRESH exit then
    at at f body execute
    construct reply done ;
+
+
+\ A seed's typed drop, which types the download that replaces it.
+: DROP-REPLY ( reply -- ) drop ;
+
+
+\ files/download from the offset: from 0 afresh, else through RESUMED.
+: REQUESTED ( ^u8 n n ^client [ n n ^fetch -- ] -- reply )
+   {: r:^ ru:n at:n c body :}
+   at 0= if c r ru body AFRESH exit then
+   r ru at c body [: body RESUMED ;] FROM ;
 
 
 \ Disposes buf unless it is null, a buffer OPEN never made: the arena
@@ -1846,23 +1877,28 @@ public
 
 \ files/download of rev:<rev>, that exact revision, from the offset. The
 \ status, metadata and Content-Range are checked from the headers curl answers
-\ at the first chunk, before any byte reaches body: an answer that fails them
-\ throws E-ANSWER and body is never called. A done answer calls body once
-\ with the offset its bytes start at, the file's size and the fetch, which
-\ READ-BODY reads until body returns; the length is checked once READ-BODY
-\ reached the end. A body left unread is cancelled and the answer is done.
-\ A transfer lost inside the body throws E-BODY-LOST from READ-BODY, and the
-\ answer is the lost transfer's. A 416 from a nonzero offset with the
-\ offset for its length calls body with the offset, that size and a fetch
-\ at its end, and ENTRY is not this answer's; any other starts over once
-\ from 0 with no Range; a 416 from 0 throws E-ANSWER. A throw while the
-\ transfer is in flight, body's and READ-BODY's included, cancels it and
-\ reads it to its end before it goes on, so the client stays usable. Every
-\ other done answer carried Dropbox-API-Result, and ENTRY is its entry.
+\ at the first chunk, before any byte reaches body. A done answer calls body
+\ once with the offset its bytes start at, the file's size and the fetch,
+\ which READ-BODY reads until body returns; the length is checked once
+\ READ-BODY reached the end. A body left unread is cancelled and the answer
+\ is done. A transfer lost inside the body throws E-BODY-LOST from
+\ READ-BODY, and the answer is the lost transfer's. A 416 from a nonzero
+\ offset with the offset for its length calls body with the offset, that
+\ size and a fetch at its end, and ENTRY is not this answer's; any other
+\ starts over once from 0 with no Range. An answer that fails a check, a
+\ 416 from 0 and an error that does not parse answer refused unverified,
+\ logged once. A throw while the transfer is in flight, body's and
+\ READ-BODY's included, cancels it and reads it to its end before it goes
+\ on, so the client stays usable. Every other done answer carried
+\ Dropbox-API-Result, and ENTRY is its entry.
 : DOWNLOAD ( ^u8 n n ^client [ n n ^fetch -- ] -- reply )
    {: r:^ ru:n at:n c body :}
-   at 0= if c r ru body AFRESH exit then
-   r ru at c body [: body RESUMED ;] FROM ;
+   construct reply done [: DROP-REPLY r ru at c body REQUESTED ;] catch
+   {: code:n :}
+   code 0= if exit then
+   drop
+   code E-UNVERIFIED <> if code throw then
+   construct error unverified construct reply refused ;
 
 \ ---- delete_v2, create_folder_v2 and the code exchange
 private

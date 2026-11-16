@@ -10,11 +10,14 @@ cursor and upload session. The signatures below are not checked yet.
 \ Dropbox's 409 error tags that omabox decides on; any other tag
 \ is `other`, and its text goes in the log line. `path-mismatch`
 \ is no tag: an entry whose path_lower is not the path's full lowercase.
+\ Nor is `unverified`: a download whose answer fails its checks or does
+\ not parse.
 ENUM error
    not-found not-file not-folder malformed-path disallowed-name
    conflict no-write-permission restricted-content
    insufficient-space locked reset invalid-root
-   content-hash-mismatch unsupported-file path-mismatch other ;ENUM
+   content-hash-mismatch unsupported-file path-mismatch unverified
+   other ;ENUM
 
 ENUM reply
    VARIANT done ;VARIANT                    \ the client holds the answer
@@ -40,8 +43,8 @@ ENUM reply
   `EXCHANGE`, or a new client.
 - Anything else throws a `DROPBOX:E-` code after one log line, because it
   means a bug on one side of the wire. That includes 400, a 3xx (redirects are
-  never followed), an answer that does not parse, and a cursor that did not
-  advance.
+  never followed), an answer that does not parse (a download's answers
+  `refused unverified`), and a cursor that did not advance.
 - `E-NOT-STORED` is not such a bug: the config's store refused a rotated
   refresh token (below). The cause is local and may clear, as when a keyring
   is locked, so the caller waits and calls again; the next call retries the
@@ -169,16 +172,24 @@ STRUCTURE config
     that offset, that size and a fetch at its end, and the answer is done.
     That answer carries no Dropbox-API-Result, so `ENTRY` is not its entry.
     Any other 416 from a nonzero offset starts over once from 0, as the Rust
-    version does, so the quotation sees offset 0. A 416 from 0 throws
-    `E-ANSWER`. Every other `done` carries the entry Dropbox reported.
+    version does, so the quotation sees offset 0. Every other `done`
+    carries the entry Dropbox reported.
+  - An answer whose rev, Content-Range or length is not the one asked, a
+    whole file for a range or a range nobody asked for, a 416 from 0, and
+    an answer whose Dropbox-API-Result or error does not parse answer
+    `refused unverified`, logged once with its reason, so the caller can
+    block that plan alone, as the Rust version's
+    `DownloadVerificationFailed` does. The client stays usable for its
+    next call.
   - A throw while the transfer is in flight, from a failed check, the
     quotation, `READ-BODY` or an allocation, ends it in one place: the client
     cancels the transfer and reads it to its end into a region laid out at
-    `OPEN`, so ending it allocates nothing, then rethrows the code. The
-    client's handle is then free for its next call. A throw after the read
-    that ended the transfer, such as the quotation's once `READ-BODY` reached
-    the body's end, cancels nothing; the header capture and checks after the
-    transfer may throw, with the handle already free.
+    `OPEN`, so ending it allocates nothing. A failed check then answers
+    `refused unverified`; any other code is rethrown. The client's handle is
+    then free for its next call. A throw after the read that ended the
+    transfer, such as the quotation's once `READ-BODY` reached the body's
+    end, cancels nothing; the header capture after the transfer may throw,
+    and its checks answer `refused unverified`, with the handle already free.
 - **`DELETE`** sends the rev as `parent_rev`. With an empty rev it deletes
   unconditionally, which sync uses only for a folder it has just seen empty.
 - **A mutation confirms an answer it cannot trust.** libcurl resends a POST
