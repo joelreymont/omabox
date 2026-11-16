@@ -1057,13 +1057,48 @@ ENUM verdict
    DROPBOX-ENTRY:KIND @ construct kind file DROPBOX-KIND:EQ ;
 
 
-\ Whether the entry holds what its kind needs: both paths, and for a
-\ downloadable file its rev and hash.
-: WHOLE? ( ^entry -- bool )
+: DOWNLOADS? ( ^entry -- bool )
    {: e :}
-   e DROPBOX-ENTRY:LOWER @ SPAN:LEN 0<> e DROPBOX-ENTRY:DISPLAY @ SPAN:LEN 0<> and
-   e FILE? e DROPBOX-ENTRY:DOWNLOADABLE @ and 0= if exit then
-   e DROPBOX-ENTRY:REV @ SPAN:LEN 0<> and
+   e FILE? e DROPBOX-ENTRY:DOWNLOADABLE @ and ;
+
+
+: HEX-DIGIT? ( u8 -- bool )
+   {: b :}
+   b 48 >= b 57 <= and b 97 >= b 102 <= and or ;
+
+
+\ Dropbox's content hash: 64 lowercase hex digits.
+: HASH? ( ^u8 n -- bool )
+   {: p:^ u:n :}
+   u 64 <> if false exit then
+   true u 0 ?do p i + c@ HEX-DIGIT? and loop ;
+
+
+public
+
+\ Whether a downloadable file has a rev and a well-formed content hash.
+: COMPLETE? ( ^entry -- bool )
+   {: e :}
+   e DOWNLOADS? 0= if false exit then
+   e DROPBOX-ENTRY:REV @ SPAN:LEN 0<>
+   e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$ HASH? and ;
+
+private
+
+
+\ Whether the entry holds both its paths.
+: PATHS? ( ^entry -- bool )
+   {: e :}
+   e DROPBOX-ENTRY:LOWER @ SPAN:LEN 0<>
+   e DROPBOX-ENTRY:DISPLAY @ SPAN:LEN 0<> and ;
+
+
+\ Whether a downloadable file holds a rev and a hash; any other entry
+\ needs neither.
+: FILLED? ( ^entry -- bool )
+   {: e :}
+   e DOWNLOADS? 0= if true exit then
+   e DROPBOX-ENTRY:REV @ SPAN:LEN 0<>
    e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:LEN 0<> and ;
 
 
@@ -1126,21 +1161,31 @@ ENUM verdict
    c CLIENT-TAGGED @ 0= if E-ANSWER throw then ;
 
 
-\ The answer's entry, as `member` finds it with the entry open at kind k.
-\ A deleted entry is a listing's alone; any other route answers a file or
-\ folder, so an entry left at deleted, as a union with no `.tag` is, fails.
-: ENTRY-PARSE ( ^client kind [ JSON:reader ^client -- JSON:reader ] -- )
+\ The answer's entry, as `member` finds it with the entry open at kind k,
+\ with both its paths. A deleted entry is a listing's alone; any other
+\ route answers a file or folder, so an entry left at deleted, as a union
+\ with no `.tag` is, fails.
+: ENTRY-FOUND ( ^client kind [ JSON:reader ^client -- JSON:reader ] -- )
    {: c k:kind member :}
    c k ENTRY-OPEN
    c member PARSE
    c CLIENT-ENTRY {: e :}
    e DROPBOX-ENTRY:KIND @ construct kind deleted DROPBOX-KIND:EQ
-   e WHOLE? 0= or if c s" an incomplete entry" E-ANSWER FAILED then ;
+   e PATHS? 0= or if c s" an incomplete entry" E-ANSWER FAILED then ;
 
 
-\ get_metadata's answer, a Metadata union.
+\ As ENTRY-FOUND, failing a downloadable file without its rev or hash.
+: ENTRY-PARSE ( ^client kind [ JSON:reader ^client -- JSON:reader ] -- )
+   {: c k:kind member :}
+   c k member ENTRY-FOUND
+   c CLIENT-ENTRY FILLED? 0=
+   if c s" an incomplete entry" E-ANSWER FAILED then ;
+
+
+\ get_metadata's answer, a Metadata union; a file Dropbox described
+\ incompletely is handed as it is, and COMPLETE? tells.
 : ENTRY-READ ( ^client -- )
-   construct kind deleted [: TAGGED-MEMBER ;] ENTRY-PARSE ;
+   construct kind deleted [: TAGGED-MEMBER ;] ENTRY-FOUND ;
 
 
 \ The answer of upload and upload_session/finish, and download's
@@ -1726,10 +1771,12 @@ private
    JSON:T-ARR-END <> if E-ANSWER throw then ;
 
 
+\ A listing's entry needs both its paths; a file Dropbox described
+\ incompletely is handed as it is.
 : LISTED ( JSON:reader ^client -- JSON:reader )
    {: c :}
    c TAGGED-OBJECT
-   c CLIENT-ENTRY WHOLE? 0= if E-ANSWER throw then ;
+   c CLIENT-ENTRY PATHS? 0= if E-ANSWER throw then ;
 
 
 : PAGE-MEMBER ( JSON:reader ^client -- JSON:reader )

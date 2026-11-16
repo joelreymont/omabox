@@ -71,8 +71,9 @@ ENUM reply
 : ROOT-NAMESPACE ( ^client -- ^u8 n )
 
 \ files/list_folder (recursive) and list_folder/continue, every
-\ page, each entry handed to the quotation; `reset` mid-way
-\ means nothing seen may be published
+\ page, each entry handed to the quotation, a file Dropbox
+\ described incompletely too, which COMPLETE? tells; `reset`
+\ mid-way means nothing seen may be published
 : LIST    ( ^u8 n ^client [ ^entry -- ] -- reply )  \ path
 : CHANGES ( ^u8 n ^client [ ^entry -- ] -- reply )  \ cursor
 : CURSOR  ( ^client -- ^u8 n )
@@ -86,7 +87,8 @@ ENUM reply
 \ create_folder_v2; each answers the entry Dropbox reports, but a
 \ download a 416 completes; READ-BODY reads a download's body
 : METADATA      ( ^u8 n ^client -- reply )  \ path
-                \ an entry at another path: refused path-mismatch
+                \ an entry at another path: refused path-mismatch;
+                \ a file described incompletely: done, COMPLETE? tells
 : DOWNLOAD      ( ^u8 n n ^client [ n n ^fetch -- ] -- reply )
                 \ rev, offset; the body: its offset, the size, the fetch
 : READ-BODY     ( ^u8 n ^fetch -- n )       \ bytes read, 0 at the end
@@ -94,6 +96,8 @@ ENUM reply
 : DELETE        ( ^u8 n ^u8 n ^client -- reply )  \ path, rev
 : CREATE-FOLDER ( ^u8 n ^client -- reply )  \ path
 : ENTRY         ( ^client -- ^entry )
+: COMPLETE?     ( ^entry -- bool )  \ a downloadable file with a
+                \ rev and a 64-lowercase-hex-digit content hash
 
 ENUM kind file folder deleted ;ENUM
 

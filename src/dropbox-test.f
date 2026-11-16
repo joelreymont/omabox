@@ -1,14 +1,17 @@
 \ dropbox-test.f - DROPBOX's client core against the fake Dropbox of
 \ test-dropbox.f on a loopback port: the account, metadata (of a file that
-\ is not downloadable, of a symlink and of an entry at another path among
-\ them), the Path-Root header, the token's refresh, its rotation and the
-\ store that keeps it, a rejected grant, a revoked token, access denied,
-\ rate limits, outages, a redirect, a malformed request, a write refused
-\ access_restricted, team_folder or operation_suppressed, the listing (one
-\ holding a file that is not downloadable among them), the long poll, downloads,
-\ whose body reads through READ-BODY (whole, resumed, a 416 at the end, a
-\ body that throws before or after its end, one left unread while the
-\ server holds the rest, one in two chunks read 7 or 64 bytes a read, one
+\ is not downloadable, of a symlink, of a file with no content hash and of
+\ an entry at another path among them), the Path-Root header, the token's
+\ refresh, its rotation and the store that keeps it, a rejected grant, a
+\ revoked token, access denied, rate limits, outages, a redirect, a
+\ malformed request, a write refused access_restricted, team_folder or
+\ operation_suppressed, the listing (one holding a file that is not
+\ downloadable, and one holding files Dropbox described incompletely,
+\ handed on, among them), COMPLETE? of each kind of entry, the long poll,
+\ downloads, whose body reads through READ-BODY (whole, resumed, a 416
+\ at the end, a body that throws before or after its end, one left
+\ unread while the server holds the rest, one in two chunks read 7 or
+\ 64 bytes a read, one
 \ cut mid-body, whether or not its body catches the loss, an empty file,
 \ one answered 400, and ones refused unverified: another rev, range or
 \ length, a 416 from 0, a Dropbox-API-Result or an error that does not
@@ -361,6 +364,20 @@ variable REFUSALS
    s" metadata of a symlink" T-LABEL
    S\" {\q.tag\q:\qfile\q,\qname\q:\qPaper\q,\qid\q:\qid:p\q,\qpath_lower\q:\q/paper\q,\qpath_display\q:\q/Paper\q,\qrev\q:\q015f0c1d2e3d\q,\qsize\q:0,\qsymlink_info\q:{\qtarget\q:\q/docs\q},\qis_downloadable\q:true}"
    UNDOWNLOADABLE ;
+
+
+\ A downloadable file with a rev and no content hash is handed as Dropbox
+\ sent it, incomplete.
+: INCOMPLETE-CASE ( -- )
+   s" metadata of a file with no content hash" T-LABEL
+   TEST-DROPBOX:RESET
+   200 s" " s" "
+   S\" {\q.tag\q:\qfile\q,\qname\q:\qIncomplete.txt\q,\qid\q:\qid:i\q,\qclient_modified\q:\q2024-01-02T03:04:05Z\q,\qserver_modified\q:\q2024-01-02T03:04:05Z\q,\qpath_lower\q:\q/incomplete.txt\q,\qpath_display\q:\q/Incomplete.txt\q,\qrev\q:\qrev-incomplete\q,\qsize\q:0,\qis_downloadable\q:true}"
+   TEST-DROPBOX:SCRIPT!
+   s" /incomplete.txt" MAIN @ DROPBOX:METADATA DONE? ASSERT
+   MAIN @ DROPBOX:ENTRY {: e :}
+   e DROPBOX-ENTRY:KIND @ DROPBOX-KIND:file DROPBOX-KIND:EQ TTRUE
+   e DROPBOX:COMPLETE? TFALSE ;
 
 
 : METADATA-ELSEWHERE-CASE ( -- )
@@ -900,6 +917,47 @@ variable GOT-U
    s" p1" false TEST-DROPBOX:PAGE!
    s" /sync" MAIN @ [: SAW-DOWNLOADABLE ;] DROPBOX:LIST DONE? ASSERT
    GOT$ s" f/sync/paper- f/sync/a.txt+" T$= ;
+
+
+\ As SAW, each entry marked + if COMPLETE?, else -.
+: SAW-COMPLETE ( ^DROPBOX:entry -- )
+   {: e :}
+   e SAW
+   e DROPBOX:COMPLETE? if s" +" else s" -" then GOT+ ;
+
+
+\ A downloadable file with no content hash, one whose hash has 63 digits,
+\ one whose hash has an uppercase digit and one with an empty rev are
+\ each handed on incomplete beside a whole one; none ends the listing.
+: INCOMPLETE-LISTED-CASE ( -- )
+   s" listing files described incompletely" T-LABEL
+   LISTING
+   S\" [{\q.tag\q:\qfile\q,\qpath_lower\q:\q/sync/a\q,\qpath_display\q:\q/Sync/a\q,\qrev\q:\q015a\q,\qsize\q:0,\qis_downloadable\q:true}]"
+   s" i1" true TEST-DROPBOX:PAGE!
+   S\" [{\q.tag\q:\qfile\q,\qpath_lower\q:\q/sync/b\q,\qpath_display\q:\q/Sync/b\q,\qrev\q:\q015b\q,\qsize\q:0,\qcontent_hash\q:\qe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85\q}]"
+   s" i2" true TEST-DROPBOX:PAGE!
+   S\" [{\q.tag\q:\qfile\q,\qpath_lower\q:\q/sync/c\q,\qpath_display\q:\q/Sync/c\q,\qrev\q:\q015c\q,\qsize\q:0,\qcontent_hash\q:\qE3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\q}]"
+   s" i3" true TEST-DROPBOX:PAGE!
+   S\" [{\q.tag\q:\qfile\q,\qpath_lower\q:\q/sync/d\q,\qpath_display\q:\q/Sync/d\q,\qrev\q:\q\q,\qsize\q:0,\qcontent_hash\q:\qe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\q}]"
+   s" i4" true TEST-DROPBOX:PAGE!
+   S\" [{\q.tag\q:\qfile\q,\qpath_lower\q:\q/sync/e\q,\qpath_display\q:\q/Sync/e\q,\qrev\q:\q015e\q,\qsize\q:0,\qcontent_hash\q:\qe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\q}]"
+   s" i5" false TEST-DROPBOX:PAGE!
+   s" /sync" MAIN @ [: SAW-COMPLETE ;] DROPBOX:LIST DONE? ASSERT
+   GOT$ s" f/sync/a- f/sync/b- f/sync/c- f/sync/d- f/sync/e+" T$=
+   MAIN @ DROPBOX:CURSOR s" i5" T$= ;
+
+
+\ Only a downloadable file can be complete: not a folder, nor a file
+\ that is not downloadable, whatever its rev and hash.
+: INCOMPLETE-KINDS-CASE ( -- )
+   s" COMPLETE? of a folder and of a file not downloadable" T-LABEL
+   LISTING
+   S\" [{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/sync\q,\qpath_display\q:\q/Sync\q}]"
+   s" k1" true TEST-DROPBOX:PAGE!
+   S\" [{\q.tag\q:\qfile\q,\qpath_lower\q:\q/sync/paper\q,\qpath_display\q:\q/Sync/Paper\q,\qrev\q:\q015f\q,\qsize\q:0,\qcontent_hash\q:\qe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\q,\qis_downloadable\q:false}]"
+   s" k2" false TEST-DROPBOX:PAGE!
+   s" /sync" MAIN @ [: SAW-COMPLETE ;] DROPBOX:LIST DONE? ASSERT
+   GOT$ s" d/sync- f/sync/paper-" T$= ;
 
 
 : WAITED ( bool n -- )
@@ -2289,7 +2347,8 @@ TYPED-VARIABLE FAULT fault
    s" ns-root" TEST-DROPBOX:ROOT!
    s" live-token" s" ns-root" OPENED MAIN !
    ACCOUNT-CASE FILE-CASE BUILT-PATH-CASE MISSING-CASE ROOT-CASE
-   LOST-READ-CASE UNDOWNLOADABLE-CASE SYMLINK-CASE METADATA-ELSEWHERE-CASE
+   LOST-READ-CASE UNDOWNLOADABLE-CASE SYMLINK-CASE INCOMPLETE-CASE
+   METADATA-ELSEWHERE-CASE
    EXPIRED-CASE
    REJECTED-GRANT-CASE REVOKED-CASE DENIED-CASE
    STORED-FIRST-CASE UNSTORED-CASE UNROTATED-CASE SCRIPTED-REFRESH-CASE
@@ -2298,6 +2357,7 @@ TYPED-VARIABLE FAULT fault
    BUSY-CASE REDIRECT-CASE BAD-REQUEST-CASE
    CLASSIFY-CASES
    PAGES-CASE RESET-CASE STALL-CASE UNTAGGED-CASE UNDOWNLOADABLE-LISTED-CASE
+   INCOMPLETE-LISTED-CASE INCOMPLETE-KINDS-CASE
    POLL-CASE POLL-RESET-CASE
    DOWNLOAD-CASES
    DELETE-CONFLICT-CASE DELETE-MISSING-CASE DELETE-GONE-CASE
