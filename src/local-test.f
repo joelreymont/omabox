@@ -1125,6 +1125,7 @@ public
 ;package
 public
 EXPORT SCAN-TEST:SCAN-CASES
+EXPORT SCAN-TEST:ROOT-USER?
 ;package
 
 package LOCAL-TEST
@@ -2183,16 +2184,13 @@ variable REMAINING
 
 : STAGE-NAME$ ( ^u8 n -- ^u8 n ) WANT AR @ LOCAL:STAGE-NAME ;
 
-\ Stages "remote" as t's owned download, as stage_download does for a
-\ top-level target; stage_download is not LOCAL's yet.
+\ STAGE-DOWNLOAD-AT of "remote" as t's owned download below the case's
+\ directory, whose fd is root.
 : STAGE-REMOTE ( fd ^u8 n -- )
    {: root:fd t:^ tu:n :}
-   t tu STAGE-NAME$ {: sn:^ snu:n :}
    s" remote" START 0 SCHEDULE
-   root sn snu sn snu WANT [: FRAGMENT ;]
-   t tu WANT AR @ LOCAL:STAGE-MARKER >str OPTION:SOME
-   s" stage download" AR @ LOCAL:WRITE-STAGE-OUTCOME OUTCOME$
-   s" " T$= s" staged" T$= ;
+   root ROOT$ t tu WANT [: FRAGMENT ;] AR @ LOCAL:STAGE-DOWNLOAD-AT
+   OUTCOME$ s" " T$= s" staged" T$= ;
 
 \ INSTALL-DOWNLOAD-AT of "remote" at t below the case's directory, whose
 \ fd is root.
@@ -2370,6 +2368,7 @@ variable REMAINING
 \ keeps its bytes.
 : UNREADABLE-STAGE ( fd -- )
    {: root:fd :}
+   LOCAL:ROOT-USER? if exit then
    s" denied.txt" STAGE-NAME$ {: sn:^ snu:n :}
    sn snu s" mutant" PUT-FILE
    sn snu AT 0 FS:CHMOD-MODE
@@ -2378,7 +2377,7 @@ variable REMAINING
    [: sn snu AT MODE-0700 FS:CHMOD-MODE ;] finally
    sn snu READ$ s" mutant" T$= ;
 
-\ Rust's inspect_download_stage throws for both, failing the pass.
+\ Rust's inspect_download_stage throws for both.
 : OBJECT-AT-STAGE-NAME-BLOCKS-ONLY-ITS-INSTALL ( -- )
    s" an object at a stage's name blocks only its install" T-LABEL
    [: dup DIRECTORY-STAGE UNREADABLE-STAGE ;] IN-CASE-DIR ;
@@ -2712,6 +2711,14 @@ variable ENTRIES
    ORIGINAL LOCAL-CONFLICT--SIDE:remote WANT AR @
    LOCAL:CONFLICT-RELATIVE-PATH ;
 
+\ A conflict copy whose reader fails with a file failure throws E-IO.
+: FAILED-CONFLICT-READ ( fd -- )
+   {: root:fd :}
+   0 REMAINING !
+   [: root ROOT$ ORIGINAL LOCAL-CONFLICT--SIDE:remote WANT [: FAILING ;]
+      AR @ LOCAL:MATERIALIZE-CONFLICT-AT CONFLICT$ 2drop 2drop ;]
+   LOCAL:E-IO TTHROWSQ ;
+
 : CONFLICT-CASES ( fd -- )
    {: root:fd :}
    s" created" T-LABEL
@@ -2724,6 +2731,9 @@ variable ENTRIES
    COPY-PATH AT FS:REMOVE-FILE
    root s" mutant" MATERIALIZED s" mutant" IDENTITY T$=
    s" content-changed" T$=
+   COPY-PATH PRESENT? TFALSE
+   s" failed read" T-LABEL
+   root FAILED-CONFLICT-READ
    COPY-PATH PRESENT? TFALSE ;
 
 : EACH-CONFLICT-OUTCOME-IS-REACHED ( -- )

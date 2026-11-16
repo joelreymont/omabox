@@ -130,22 +130,28 @@ $2E constant DOT
 
 : NONE-CONVERTED ( n n -- bool ) 2drop false ;
 
-\ The predicate of the innermost CONVERTING: the code and errno of each
-\ failure its caller turns into an outcome.
+\ The predicate of the innermost CONVERTING, true for the code and errno
+\ of each failure its caller turns into an outcome; NONE-CONVERTED
+\ outside any.
 TYPED-VARIABLE CONVERTS [ n n -- bool ]
 ' NONE-CONVERTED CONVERTS !
 
 \ Whether LOCAL logs nothing for a failure: its catcher converts it.
 : QUIET? ( n n -- bool ) CONVERTS @ execute ;
 
+public
+
 \ Runs q with converted? as the predicate QUIET? asks, the outer one back
-\ on every exit; answers what q threw, 0 for none.
+\ on every exit; answers what q threw, 0 for none. LOCAL logs no failure
+\ converted? names: the caller converts it into an outcome.
 : CONVERTING ( R [ R -- R ] [ n n -- bool ] -- R n )
    {: q converted? :}
    CONVERTS @ {: outer :}
    converted? CONVERTS !
    [: q execute ;] catch
    outer CONVERTS ! ;
+
+private
 
 \ Logs "local path `p`" and the text after it, then throws code.
 : PATH-FAILS ( ^u8 n ^u8 n n -- )
@@ -380,13 +386,18 @@ IO-SIZE BUFFER: IO-BUF
    repeat drop
    HASHER DROPBOX:HASH-END ar KEEP DROPBOX:>HASH ;
 
-\ The span filled from fd, or the bytes before its end.
+public
+
+\ Fills the span from fd and answers its length, or at fd's end the bytes
+\ read before it: the read HASH-STREAM and the stage words take.
 : FD-READ ( fd ^u8 n -- n )
    {: f:fd p:^ u:n :}
    f p u SPAN:MAKE FD:READ-EXACT MATCH FD:fill
       full OF u ENDOF
       eof OF ENDOF
    ;MATCH ;
+
+private
 
 : HASH-FD ( fd ^ARENA:arena -- DROPBOX:hash )
    {: f:fd ar:^ARENA:arena :}
@@ -1976,8 +1987,8 @@ $100 constant MODE-READ-ONLY
    ( hashed ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- download-stage )
    {: h:hashed p:^ u:n t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
    h HASHED-UNMAKE {: f:fd actual:DROPBOX:hash print:MODEL:fingerprint :}
-   t tu want ar STAGE-MARKER {: m:^ mu:n :}
-   false f [: drop f actual want m mu p u OWNED? ;] CLOSING 0= if
+   false f [: drop f actual want t tu want ar STAGE-MARKER p u OWNED? ;]
+   CLOSING 0= if
       f DISCARD p u >str DOWNLOAD-STAGE-DESTINATION-OCCUPIED exit
    then
    NO-FINGERPRINT f [: DROP-FINGERPRINT f print p u SEAL-STAGE ;] CLOSING
@@ -1986,8 +1997,9 @@ $100 constant MODE-READ-ONLY
 
 \ The stage at the name in dir for target's content want: none, an owned
 \ stage verified and left open, or, kept as it was, another file, an
-\ object not a regular file or a file Omabox cannot read. Rust's throws
-\ for the last two and fails the pass; here they block only this plan.
+\ object not a regular file or a file Omabox cannot read. Rust throws for
+\ the last two; a Habu throw names no path, so its callers could not tell
+\ the stage's name from the target's.
 : INSPECT-DOWNLOAD-STAGE
    ( fd ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- download-stage )
    {: dir:fd name:^ nu:n p:^ u:n t:^ tu:n want:DROPBOX:hash
@@ -2112,7 +2124,7 @@ private
 
 \ Whether a stage's failure, its code and errno, means another entry
 \ holds its path: one not a regular file, or a symlink. Its callers catch
-\ only throws whose path is the stage's, so the code alone tells.
+\ only throws whose path is the stage's, so no path is needed.
 : UPLOAD-STAGE-OCCUPIED? ( n n -- bool )
    {: code:n e:n :}
    code E-UNSUPPORTED = if true exit then
@@ -3107,7 +3119,8 @@ private
    loc LOCATION-PATH {: p:^ u:n :}
    [: staging p u s" create disposable download stage" UNNAMED-FILE ;]
    [: staging DISCARD ;] finally {: f:fd :}
-   loc f ar NEW-PARTIAL READY ;
+   EPHEMERAL f [: DROP-PREPARATION loc f ar NEW-PARTIAL READY ;]
+   CLOSING ;
 
 : DISPOSABLE
    ( download-location ^u8 n ^ARENA:arena -- download-preparation )
@@ -4252,6 +4265,8 @@ public
 \ Renames the verified stage of want over target t below the root fd,
 \ whose path is r, only while t holds expected, or is absent when
 \ expected is none; a target that changed is kept, never overwritten.
+\ With expected none, E-UNSUPPORTED or E-UNREADABLE is about t's own
+\ name; a replacement's guard or local conflict name can throw them too.
 : INSTALL-DOWNLOAD-AT
    ( fd ^u8 n ^u8 n DROPBOX:hash option<DROPBOX:hash> ^ARENA:arena
      -- install-outcome )
@@ -4573,8 +4588,9 @@ private
    p u side want ar CONFLICT-NAME {: cn:^ cnu:n :}
    p u side want ar CONFLICT-RELATIVE-PATH {: rel:^ relu:n :}
    r ru rel relu ar JOIN {: shown:^ shownu:n :}
-   dir cn cnu shown shownu want read NO-MARKER
-   s" materialize conflict" ar WRITE-VERIFIED-STAGE
+   STAGE-WRITE-CREATED [: DROP-STAGE-WRITE
+      dir cn cnu shown shownu want read NO-MARKER
+      s" materialize conflict" ar WRITE-VERIFIED-STAGE ;] LOCAL-ERRORS
    rel relu CONFLICT-RESULT ;
 
 \ The conflict copy written in the open parent, which closes after it.
@@ -4590,7 +4606,8 @@ private
 public
 
 \ Writes read's bytes as p's conflict copy for side below the root, whose
-\ path is r, when they hash to want; it never overwrites a file.
+\ path is r, when they hash to want; it never overwrites a file. A failed
+\ read throws E-IO.
 : MATERIALIZE-CONFLICT-AT
    ( fd ^u8 n ^u8 n conflict-side DROPBOX:hash [ ^u8 n -- n ]
      ^ARENA:arena -- conflict-outcome )
