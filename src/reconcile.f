@@ -1139,6 +1139,171 @@ STRUCTURE case-variant-move
       some OF j p u records ar RESOLVE-AT ENDOF
    ;MATCH ;
 
+\ ---- file-copy names ----------------------------------------------
+
+\ Rust's FileCopyOrigin with what its callers pass beside it: a Dropbox
+\ copy reuses a name holding its content and skips the excluded paths.
+ENUM file-copy-origin
+   VARIANT local ;VARIANT
+   VARIANT dropbox FIELD excluded ^VEC:vector<MODEL:path> ;VARIANT
+;ENUM
+
+\ The k kept bytes, c appended while k is below 12 and c alphanumeric.
+: KEEP-ALNUM ( n ^u8 u8 -- n )
+   {: k:n dst:^ c:u8 :}
+   k 12 < c STR-ALNUM? and 0= if k exit then
+   c dst k + c!
+   k 1+ ;
+
+\ The hash's first 12 ASCII letters and digits, else "content".
+: COPY-IDENTITY ( DROPBOX:hash ^ARENA:arena -- ^u8 n )
+   {: h ar :}
+   h DROPBOX:HASH>STR str> {: p:^ u:n :}
+   ar 12 ARENA:ALLOC drop {: dst:^ :}
+   0 u 0 ?do dst p i + c@ KEEP-ALNUM loop {: k:n :}
+   k 0= if s" content" exit then
+   dst k ;
+
+: ORIGIN$ ( file-copy-origin -- ^u8 n )
+   MATCH file-copy-origin
+      local OF s" local file" ENDOF
+      dropbox OF drop s" Dropbox file" ENDOF
+   ;MATCH ;
+
+: COPY-SUFFIX
+   ( file-copy-origin DROPBOX:hash n ^ARENA:arena -- ^u8 n )
+   {: o h attempt:n ar :}
+   s"  (" o ORIGIN$ ar JOIN-BYTES s"  " ar JOIN-BYTES
+   h ar COPY-IDENTITY ar JOIN-BYTES
+   attempt 0<> if
+      s"  " ar JOIN-BYTES attempt 1+ FMT:INT$ ar JOIN-BYTES
+   then
+   s" )" ar JOIN-BYTES ;
+
+\ Rust's file_copy_name; none when the suffix alone passes name-max.
+: FILE-COPY-NAME
+   ( str DROPBOX:hash file-copy-origin n n ^ARENA:arena -- option<str> )
+   {: name:str h o attempt:n max:n ar :}
+   o h attempt ar COPY-SUFFIX {: s:^ su:n :}
+   max su < if NO-NAME exit then
+   name str> max su - TRUNCATE-COMPONENT s su ar JOIN-BYTES >str
+   OPTION:SOME ;
+
+: LISTED? ( ^VEC:vector<MODEL:path> MODEL:path -- bool )
+   {: v p :}
+   v VEC:COUNT 0 ?do
+      v i VEC:AT @ p PATH= if true unloop exit then
+   loop
+   false ;
+
+: EXCLUDED-COPY? ( file-copy-origin MODEL:path -- bool )
+   {: o p :}
+   o MATCH file-copy-origin
+      local OF false ENDOF
+      dropbox OF p LISTED? ENDOF
+   ;MATCH ;
+
+: REUSES? ( file-copy-origin -- bool )
+   MATCH file-copy-origin
+      local OF false ENDOF
+      dropbox OF drop true ENDOF
+   ;MATCH ;
+
+: LOCAL-HOLDS? ( MODEL:observation<MODEL:local> DROPBOX:hash -- bool )
+   {: o h :}
+   o MATCH MODEL:observation
+      present OF MODEL-LOCAL:UNMAKE h DROPBOX:HASH= ENDOF
+      directory OF false ENDOF
+      absent OF false ENDOF
+      unknown OF drop false ENDOF
+   ;MATCH ;
+
+: REMOTE-HOLDS? ( MODEL:observation<MODEL:remote> DROPBOX:hash -- bool )
+   {: o h :}
+   o MATCH MODEL:observation
+      present OF MODEL-REMOTE:UNMAKE drop h DROPBOX:HASH= ENDOF
+      directory OF false ENDOF
+      absent OF false ENDOF
+      unknown OF drop false ENDOF
+   ;MATCH ;
+
+: LOCAL-MATCHES? ( option<MODEL:local-record> DROPBOX:hash -- bool )
+   {: found h :}
+   found MATCH option
+      none OF true ENDOF
+      some OF MODEL-LOCAL--RECORD:UNMAKE nip h LOCAL-HOLDS? ENDOF
+   ;MATCH ;
+
+: REMOTE-MATCHES? ( option<MODEL:remote-record> DROPBOX:hash -- bool )
+   {: found h :}
+   found MATCH option
+      none OF true ENDOF
+      some OF REMOTE-OBSERVATION h REMOTE-HOLDS? ENDOF
+   ;MATCH ;
+
+: NO-REMOTE? ( option<MODEL:remote-record> -- bool )
+   MATCH option
+      none OF true ENDOF
+      some OF drop false ENDOF
+   ;MATCH ;
+
+\ Whether neither side holds a record at the key.
+: FREE?
+   ( option<MODEL:local-record> option<MODEL:remote-record> -- bool )
+   {: l r :}
+   l MATCH option
+      none OF r NO-REMOTE? ENDOF
+      some OF drop false ENDOF
+   ;MATCH ;
+
+\ Whether the copy may take candidate c: no record holds its identity,
+\ or a Dropbox copy finds this content in each record that does.
+: USABLE?
+   ( sides MODEL:path DROPBOX:hash file-copy-origin ^ARENA:arena
+     -- bool )
+   {: s c h o ar :}
+   o c EXCLUDED-COPY? if false exit then
+   c ar MODEL:FOLD {: k :}
+   s SIDES-UNMAKE {: bs ls rs ps :}
+   ls k FIND-LOCAL {: l :}
+   rs k FIND-REMOTE {: r :}
+   l r FREE? if true exit then
+   o REUSES? 0= if false exit then
+   l h LOCAL-MATCHES? r h REMOTE-MATCHES? and ;
+
+: COPY-NAME ( MODEL:path ^ARENA:arena -- str )
+   {: source ar :}
+   source ar FILE-NAME MATCH option
+      none OF
+         source s" directory collision has no final path component"
+         INVALID
+      ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+\ Rust's file_copy_path: the source's first file-copy name under its
+\ parent the copy may take; the names grow until one no longer fits.
+: FILE-COPY-PATH
+   ( sides MODEL:path DROPBOX:hash file-copy-origin n ^ARENA:arena
+     -- MODEL:path )
+   {: s source h o max:n ar :}
+   source ar COPY-NAME {: name:str :}
+   source PATH$ SPLIT-NAME {: dir:^ du:n x:^ xu:n :}
+   0 begin
+      dup >r name h o r> max ar FILE-COPY-NAME MATCH option
+         none OF
+            source
+            s" could not select a unique synchronized file-copy path"
+            INVALID
+         ENDOF
+         some OF
+            dir du rot ar UNDER
+            s over h o ar USABLE? if nip exit then drop
+         ENDOF
+      ;MATCH
+      1+
+   again ;
+
 \ ---- listing changes -----------------------------------------------
 
 \ Rust's DropboxRoot: the configured root, lowercase, and its count of

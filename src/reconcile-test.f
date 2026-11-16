@@ -22,6 +22,7 @@
 \ Case collisions:
 \ - Rust's case_variant_name_skips_existing_suffixes,
 \   case_variant_name_fits_a_maximum_length_component,
+\   file_copy_name_is_deterministic_and_fits_the_parent_limit,
 \   case_variant_moves_converge_from_parent_to_child,
 \   case_variant_source_keeps_the_recorded_spelling,
 \   case_variant_source_leaves_unsupported_spellings and
@@ -978,6 +979,28 @@ variable SEED
    nu 255 T=
    name nu s"  (case variant)" ENDS-WITH? TTRUE ;
 
+\ The name, failing the case when none fits.
+: SOME-NAME ( option<str> -- str )
+   MATCH option
+      none OF false TTRUE s" " >str ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+: FILE-COPY-NAME-IS-DETERMINISTIC-AND-FITS-THE-PARENT-LIMIT
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" file_copy_name_is_deterministic_and_fits_the_parent_limit"
+   T-LABEL
+   97 255 ar REPEATED >str {: name:str :}
+   98 64 ar REPEATED >str DROPBOX:>HASH {: h :}
+   ar ARENA:ALLOCATOR 0 [type] MODEL:path VEC:NEW {: none :}
+   none construct file-copy-origin dropbox {: o :}
+   name h o 0 255 ar FILE-COPY-NAME SOME-NAME str> {: a:^ au:n :}
+   name h o 0 255 ar FILE-COPY-NAME SOME-NAME str> {: b:^ bu:n :}
+   a au b bu T$=
+   au 255 T=
+   a au s"  (Dropbox file bbbbbbbbbbbb)" ENDS-WITH? TTRUE ;
+
 : CASE-VARIANT-MOVES-CONVERGE-FROM-PARENT-TO-CHILD ( ^ARENA:arena -- )
    {: ar :}
    s" case_variant_moves_converge_from_parent_to_child" T-LABEL
@@ -1162,6 +1185,7 @@ variable SEED
    {: ar :}
    ar CASE-VARIANT-NAME-SKIPS-EXISTING-SUFFIXES
    ar CASE-VARIANT-NAME-FITS-A-MAXIMUM-LENGTH-COMPONENT
+   ar FILE-COPY-NAME-IS-DETERMINISTIC-AND-FITS-THE-PARENT-LIMIT
    ar CASE-VARIANT-MOVES-CONVERGE-FROM-PARENT-TO-CHILD
    ar CASE-VARIANT-SOURCE-KEEPS-THE-RECORDED-SPELLING
    ar CASE-VARIANT-SOURCE-LEAVES-UNSUPPORTED-SPELLINGS
