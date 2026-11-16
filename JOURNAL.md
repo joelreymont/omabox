@@ -1148,3 +1148,168 @@ Name clashes cost three more rounds in one day:
 
 None of these is a defect. They are what one flat namespace per
 package costs, where Rust has modules, scoping and case.
+
+
+## 2026-11-16: ten test lanes, and the four defects they found
+
+RECONCILE's pass is one word, PASS. A machine of six states runs it:
+settle, recover, observe, list, decide and apply. Rust's evidence for
+the pass is its tests that run `reconcile_once` against a fake Dropbox
+server. I split them by theme into ten lanes, and ran them all at
+once. Each lane took 7 to 12 minutes. Seven came back green. Three
+stopped, each on a defect in code that had already landed with its
+own tests. Sixty tests came across under their Rust names. One has no
+port: it checks that a download still in flight does not stop the
+next poll, and in Habu no download is in flight between passes.
+
+The four defects were in DROPBOX and REPLAY, not in RECONCILE:
+- Before deleting a folder, REPLAY listed it recursively, with no
+  limit, reading every page. Rust lists one entry and stops.
+- get_metadata never asked for deleted entries, where Rust's
+  verification does.
+- A refused conflict was verified twice, once in each layer. Rust
+  verifies it once.
+- An upload answer that did not parse threw out of the upload. Rust
+  takes such an answer as an upload that may have applied, and checks
+  it.
+
+DROPBOX's and REPLAY's own tests passed throughout. They check what
+each word answers. Rust's fake-server tests check the requests
+themselves: each body, and how many of each. The port kept those
+asserts, so the defects showed. When a rewrite splits one Rust module
+into two layers, each layer's tests can pass while the two together
+send what Rust never sent.
+
+Merging was the cost. Habu gives each package one flat namespace, and
+the test file reopens the package. So every lane's helpers met every
+other lane's at the merge:
+- Rust's `seed_baseline` came back four times, under four names.
+- REOPENED came back three times, PLANNED-OPERATIONS twice.
+- The fake gained seven overlapping recorders of request bodies.
+
+In Rust these helpers sit once at the top of the test file, and every
+test shares them. Here, the lanes could not see one another's
+helpers. Identical copies were deleted, and copies of a different
+shape were renamed within their lane. A cleanup lane will fold what
+remains.
+
+Two clashes compiled without a word. One lane's DELETE-SENT, a word
+that records a request, met another lane's DELETE-SENT, a buffer.
+Habu takes the later definition for every word compiled after it and
+keeps the earlier one for the words before, so the fake ran
+correctly with two meanings for one name. Only a script that lists
+every name defined twice caught it. Rust would have refused to
+compile.
+
+The merges were scripted, and the script had its own bug. jj writes
+the same kind of conflict in two marker orders, so the script had to
+read both. Its test for SERVED's list of cases matched any block
+holding "PASS-CASES" and a quotation. One block held a whole lane's
+section, and the script swapped 2,600 lines for six. The file's line
+count gave it away before a run did; the run would have stopped on
+the first group of cases that no longer existed.
+
+Departure 2 (a download installs within the step that plans it)
+changed what one Rust assert could see. Rust holds the download open
+and reads the pending plan's operation. Here the plan has already run
+by the time the pass returns, so the port asserts what it did instead:
+it downloaded rev-new, then installed over the kept bytes without a
+conflict.
+
+## 2026-11-16: the feature review, and a one-second stall
+
+One Fable review read all 3,870 lines of RECONCILE against Rust and the
+design. It found nothing critical: no deletion inferred from uncertain
+state, no conflict payload dropped, no crash window that loses data. It
+found six low issues, and they show what this port's mistakes look like:
+
+- **Two comments were Rust's, copied word for word.** One praised a
+  "bounded batch" shared by startup and replay. Habu has no pool, so it
+  has no batch. A port can carry over the explanation without the
+  thing it explains.
+- **Two layers classified the same answer.** DROPBOX confirmed an
+  upload answer it could not trust with its own get_metadata. When that
+  check failed, it answered `retry`, and REPLAY then stopped the whole
+  pass. Rust verifies once and classifies that one path. So one path
+  whose answers kept failing that check would stop every pass, against
+  the rule that bad input must not stop unrelated work. The fix deletes
+  DROPBOX's confirmation (GONE, MADE and the `confirming` state) and
+  lets REPLAY read the path back once, as it already did for a
+  conflict.
+- **Each lane wrote its own tie-break.** Five sort comparators each
+  spelled out "then by index", although a word for it already existed
+  2,700 lines further down the file. That is the same thing the test
+  lanes did, here in production code.
+- **A lookup grew with the square of the account.** Every download
+  scanned every pending plan, which costs nothing in the tests and
+  everything on a first sync. Rust used a map. The Habu version now
+  sorts once and searches.
+
+The slowest suite, dropbox-test, took 27 s where every other suite takes
+1 to 4 s. A worker hunted the cause with timers instead of guesses:
+- the client read its stage in 7 ms;
+- the fake hashed a 32 MiB chunk in 25 ms;
+- the server took 1,207 ms to read the body, and one wait inside that
+  took exactly 1,000 ms.
+
+libcurl sends `Expect: 100-continue` on any body over 1 MiB, then waits
+up to a second for the server's `100 Continue`. Habu's HTTP server never
+sent one. Rust never saw this: its HTTP client never sends Expect, and
+its fake ran on a server that answers it.
+
+The fix belongs in Habu: answer the expectation when the handler first
+asks for the body, as RFC 9110 says. A 32 MiB POST went from 1,180 ms
+to 153 ms. The same measurement turned up a second cost. The server
+parked on its event loop before every 8 KiB read, even with data
+already waiting. Reading first cut a call from about 125 ms to about
+47 ms.
+
+With both fixes in Habu, dropbox-test fell from 26.7 s to 2.9 s.
+
+Habu's review of the read-first change found one cost. The server used
+to wait before every read, and each wait was also the point where a
+halted worker stopped. Reading first skipped those waits, and with them
+the stop. A peer that kept the socket full could then hold a halted
+worker until its body deadline. The fix checks for a pending halt after
+each read that finds data. Remove a wait, and you may remove a place
+where the program stops.
+
+Rewriting onto your own HTTP stack finds the corners a mature one
+already covers. Here the find came from a timer, not from a
+stack trace.
+
+The review's classifier finding came back twice more. Once DROPBOX
+stopped confirming a lost answer, the worker noticed a 5xx was still
+`retry`. Rust counts every failed mutation but a rate limit as maybe
+applied, and reads the path back. So did a lost session start, an append
+lost twice and a session gone twice. Each stopped every pass. One rule
+now covers them all: a mutation answers `retry` only when Dropbox asks
+it to wait. A rule that names its exceptions is easier to port than
+a list of cases.
+
+The fix's review then showed the rule was still too narrow. A 503 can
+carry Retry-After, and Rust sleeps that wait out before it reads the
+path back. The first version of the rule counted only a 429 as a
+request to wait, so the 503 dropped its wait. Habu's DROPBOX never
+sleeps, so a wait Dropbox asks for now answers `retry`. The daemon
+waits between passes, and the next pass's conditional replay finds
+whatever Dropbox applied. The same review found a third path to a
+stopped pass: a delete answered 200 with a body that does not parse.
+Three reviews in, the rule has its final form: count every answer
+Dropbox might have acted on.
+
+The same review found a deleted check whose premise one path broke.
+REPLAY had dropped its test for an incomplete entry, because DROPBOX
+answers `done` only for the upload's complete entry. But a finish whose
+session was gone was confirmed by content hash alone, so a file with
+that hash and no rev passed. Deleting a check hands its job to a
+premise, and the premise then needs a test of its own.
+
+The collision lane also showed what a departure from Rust costs. Rust
+ends the whole pass when a collision's copy fails. Habu holds that one
+path, so the rest of the pass can go on. But a hold is one key, and
+the directory had children. Their decisions assumed the collision was
+resolved, so the pass tried to create a folder over Dropbox's file and
+parked a file's upload for an hour. Rust never met this, because
+ending the pass also ended the subtree. A departure must carry every
+consequence of the behaviour it replaces.
