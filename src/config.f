@@ -1,7 +1,6 @@
 \ config.f - package CONFIG: the paths one omabox instance owns and its
-\ config.toml, resolved, loaded and refused as the Rust version's config.rs
-\ does, its state directories prepared and its daemon locked. Writing the
-\ file is not here.
+\ config.toml, resolved, loaded, written and refused as the Rust version's
+\ config.rs does, its state directories prepared and its daemon locked.
 \ XDG: XDG_CONFIG_HOME and XDG_STATE_HOME count when absolute, else
 \ HOME/.config and HOME/.local/state; HOME is read only then. The config
 \ directory, XDG_CONFIG_HOME/omabox, stays lexical. The state directory,
@@ -25,18 +24,30 @@
 \ string; the keys are sync_root and dropbox_app_key, once each; a value is
 \ any of the four TOML strings with every TOML escape. Anything else is
 \ E-PARSE; a file that is not UTF-8 is E-READ.
+\ config.toml is written as toml 0.9.12 writes the stored document: a
+\ `sync_root = ` line, then a `dropbox_app_key = ` line, each string in the
+\ form toml_writer 1.1.2 picks for it. The text is staged in an owner-only
+\ .config.toml.<pid>.<seq>.tmp beside the file, synced, renamed over it
+\ (WRITE) or into its place only while none is there (WRITE-NEW), and the
+\ directory synced. A failed write removes its temporary; each write first
+\ sweeps the temporaries of processes that are gone.
 \ A refusal logs two lines, the Rust error's text with the path or field it
 \ names and then its help, and throws. E-READ, E-MISSING,
 \ E-RESOLVE-SYNC-ROOT, E-INSPECT-PATH, E-CREATE-DIRECTORY,
-\ E-SECURE-DIRECTORY, E-LOCK-OPEN, E-LOCK-ACQUIRE and E-DISK-FULL leave the
-\ host errno in FS:ERRNO, 0 where the Rust error has none; the other codes
-\ leave 0. E-MISSING is E-READ on ENOENT, and E-DISK-FULL is
-\ E-CREATE-DIRECTORY, E-SECURE-DIRECTORY or E-LOCK-OPEN on ENOSPC.
+\ E-SECURE-DIRECTORY, E-LOCK-OPEN, E-LOCK-ACQUIRE, E-DISK-FULL,
+\ E-PREPARE-CONFIGURATION-DIRECTORY and E-WRITE leave the host errno in
+\ FS:ERRNO, 0 where the Rust error has none; E-CLEANUP-AFTER-WRITE leaves
+\ the failed write's; the other codes leave 0. E-MISSING is E-READ on
+\ ENOENT, and E-DISK-FULL is E-CREATE-DIRECTORY, E-SECURE-DIRECTORY or
+\ E-LOCK-OPEN on ENOSPC.
+\ E-CLEANUP-AFTER-WRITE logs the failed write's two lines, then its own.
 \ STORAGE CLASS. CALLER-OWNED: every record and path a word answers is laid
 \ in the arena its caller passes; a lock's path stays in its paths'.
 \ PREPARE-PATHS's projections live in an arena of its own, released on
 \ return.
+\ A write's text, temporary and leftovers are laid in its caller's arena.
 \ TASK-LOCAL: the row realpath and readlink answer into.
+\ PROCESS-WIDE: the sequence numbering the temporaries.
 
 require src/lib/error.f
 require src/lib/string.f
@@ -52,6 +63,11 @@ require src/lib/log.f
 require src/lib/task.f
 require src/lib/utf8-scalar.f
 require src/lib/unicode/class.f
+require src/lib/fs-anchored.f
+require src/lib/fd.f
+require src/lib/fmt.f
+require src/lib/vector.f
+require src/stale.f
 
 package CONFIG
 public
@@ -83,6 +99,13 @@ public
 -100214 s" Omabox configuration does not exist" ERROR:CODE E-MISSING
 -100215 s" could not write Omabox state: the disk is full"
    ERROR:CODE E-DISK-FULL
+-100216 s" Omabox configuration already exists" ERROR:CODE E-ALREADY-EXISTS
+-100217 s" could not serialize Omabox configuration" ERROR:CODE E-SERIALIZE
+-100218 s" could not prepare Omabox configuration directory"
+   ERROR:CODE E-PREPARE-CONFIGURATION-DIRECTORY
+-100219 s" could not write Omabox configuration" ERROR:CODE E-WRITE
+-100220 s" the configuration write failed and cleanup also failed"
+   ERROR:CODE E-CLEANUP-AFTER-WRITE
 
 \ An absolute path's bytes as Rust's PathBuf holds them.
 DEFTYPE ABS-PATH str
@@ -1085,6 +1108,10 @@ public
    {: x ar :}
    x ar XDG-CONFIG-DIRECTORY s" config.toml" >str ar JOIN ;
 
+\ XDG_CONFIG_HOME when absolute, else HOME/.config, as Rust's
+\ resolve_config_home answers it.
+: CONFIG-HOME ( ^xdg -- abs-path ) XDG-CONFIG-HOME @ ;
+
 
 \ ---- the paths
 
@@ -1331,5 +1358,379 @@ public
    code E-FS-IO = if FS:ERRNO p UNLOCK-FAILED then
    f FD>N close
    code 0<> code E-FS-IO <> and if code throw then ;
+
+
+private
+
+\ ---- config.toml's text
+
+ENUM encoding basic literal ml-basic ml-literal ;ENUM
+
+\ src copied to dst+at: the offset after it.
+: PUT ( ^u8 n ^u8 n -- n )
+   {: src:^ u:n dst:^ at:n :}
+   src dst at + u BYTE-COPY
+   at u + ;
+
+: BYTE+ ( n ^u8 n -- n )
+   {: b:n dst:^ at:n :}
+   b dst at + c!
+   at 1 + ;
+
+\ Whether a byte is b.
+: ANY? ( ^u8 n n -- bool )
+   {: a:^ u:n b:n :}
+   u 0 ?do a i + c@ b = if true unloop exit then loop
+   false ;
+
+\ The longest run of byte b.
+: LONGEST ( ^u8 n n -- n )
+   {: a:^ u:n b:n :}
+   0 0 u 0 ?do
+      a i + c@ b = if 1 + else drop 0 then
+      tuck max swap
+   loop drop ;
+
+\ A control byte only an escape code writes: not tab, not newline.
+: CODE? ( n -- bool )
+   {: b:n :}
+   b $1F <= b 9 <> and b $0A <> and b $7F = or ;
+
+: CODES? ( ^u8 n -- bool )
+   {: a:^ u:n :}
+   u 0 ?do a i + c@ CODE? if true unloop exit then loop
+   false ;
+
+\ The form toml_writer's TomlStringBuilder::as_default picks.
+: FORM ( ^u8 n -- encoding )
+   {: a:^ u:n :}
+   a u CODES? {: codes:bool :}
+   a u $5C ANY? {: esc:bool :}
+   a u $0A ANY? {: nl:bool :}
+   a u $27 LONGEST {: sq:n :}
+   a u $22 LONGEST {: dq:n :}
+   codes esc or dq 0 > or nl or 0= if ENCODING-BASIC exit then
+   codes sq 0 > or nl or 0= if ENCODING-LITERAL exit then
+   codes esc or dq 2 > or 0= if ENCODING-ML-BASIC exit then
+   codes sq 2 > or 0= if ENCODING-ML-LITERAL exit then
+   nl if ENCODING-ML-BASIC else ENCODING-BASIC then ;
+
+: HEX-DIGIT ( n -- n )
+   {: d:n :}
+   d 10 < if d [char] 0 + else d 55 + then ;
+
+\ \u00XX, upper-case, for a control byte.
+: UNICODE ( n ^u8 n -- n )
+   {: b:n dst:^ at:n :}
+   s" \u00" dst at PUT {: k:n :}
+   b 4 rshift HEX-DIGIT dst k BYTE+ {: j:n :}
+   b 15 and HEX-DIGIT dst j BYTE+ ;
+
+\ One byte but a quote of an escaped string, as toml_writer writes it.
+: ESCAPED ( n bool ^u8 n -- n )
+   {: b:n ml:bool dst:^ at:n :}
+   b 8 = if s" \b" dst at PUT exit then
+   b 9 = if s" \t" dst at PUT exit then
+   b $0A = ml and if b dst at BYTE+ exit then
+   b $0A = if s" \n" dst at PUT exit then
+   b $0C = if s" \f" dst at PUT exit then
+   b $0D = if s" \r" dst at PUT exit then
+   b $5C = if s" \\" dst at PUT exit then
+   b CODE? if b dst at UNICODE exit then
+   b dst at BYTE+ ;
+
+\ A quote extends a run of quotes: past the run allowed (none, two in a
+\ multi-line string) it is escaped and the run starts again.
+: QUOTE ( n n ^u8 n -- n n )
+   {: run:n most:n dst:^ at:n :}
+   run 1 + most > if s\" \\\"" dst at PUT 0 exit then
+   $22 dst at BYTE+ run 1 + ;
+
+: ESCAPED-BODY ( ^u8 n bool ^u8 n -- n )
+   {: a:^ u:n ml:bool dst:^ at:n :}
+   ml if 2 else 0 then {: most:n :}
+   at 0 u 0 ?do
+      {: o:n run:n :}
+      a i + c@ {: b:n :}
+      b $22 = if run most dst o QUOTE swap
+      else b ml dst o ESCAPED 0 then
+   loop drop ;
+
+: DELIMITER ( encoding -- ^u8 n )
+   MATCH encoding
+      basic OF s\" \"" ENDOF
+      literal OF s" '" ENDOF
+      ml-basic OF s\" \"\"\"" ENDOF
+      ml-literal OF s" '''" ENDOF
+   ;MATCH ;
+
+: ESCAPES? ( encoding -- bool )
+   MATCH encoding
+      basic OF true ENDOF
+      literal OF false ENDOF
+      ml-basic OF true ENDOF
+      ml-literal OF false ENDOF
+   ;MATCH ;
+
+: MULTI-LINE? ( encoding -- bool )
+   MATCH encoding
+      basic OF false ENDOF
+      literal OF false ENDOF
+      ml-basic OF true ENDOF
+      ml-literal OF true ENDOF
+   ;MATCH ;
+
+\ A string as toml_writer writes a value, at dst+at: the offset after it.
+: STRING ( str ^u8 n -- n )
+   {: v dst:^ at:n :}
+   v str> {: a:^ u:n :}
+   a u FORM {: e :}
+   e MULTI-LINE? a u $0A ANY? and {: lead:bool :}
+   e DELIMITER dst at PUT {: k:n :}
+   lead if $0A dst k BYTE+ else k then {: j:n :}
+   e ESCAPES? if a u e MULTI-LINE? dst j ESCAPED-BODY
+   else a u dst j PUT then {: m:n :}
+   e DELIMITER dst m PUT ;
+
+\ One `key = value` line.
+: ENTRY ( ^u8 n str ^u8 n -- n )
+   {: k:^ ku:n v dst:^ at:n :}
+   k ku dst at PUT {: j:n :}
+   s"  = " dst j PUT {: m:n :}
+   v dst m STRING {: e:n :}
+   $0A dst e BYTE+ ;
+
+: SERIALIZE-FAILED ( -- )
+   LOG-OPEN s" could not serialize Omabox configuration" LOG:TEXT+
+   s" Use a sync-root path representable in TOML and retry." HELP
+   E-SERIALIZE 0 FAIL ;
+
+: UTF-8? ( str -- bool ) str> UTF8:VALID? ;
+
+\ The stored document's text; a string that is not UTF-8 is E-SERIALIZE.
+\ No byte takes more than the six of an escape code.
+: DOCUMENT-TEXT ( abs-path str ^ARENA:arena -- str )
+   {: root key ar :}
+   root ABS-PATH>STR {: r :}
+   r UTF-8? key UTF-8? and 0= if SERIALIZE-FAILED then
+   r str> nip key str> nip + 6 * 64 + {: cap:n :}
+   ar cap ARENA:ALLOC drop {: dst:^ :}
+   s" sync_root" r dst 0 ENTRY {: k:n :}
+   s" dropbox_app_key" key dst k ENTRY {: u:n :}
+   dst u >str ;
+
+
+\ ---- writing config.toml
+
+\ The temporaries' sequence; atomic-add numbers them across tasks.
+variable SEQUENCE
+
+\ A write under way: its directory and that directory's descriptor, the
+\ temporary's name and path, the file's path, the text, and whether it
+\ replaces a config.toml there.
+STRUCTURE writing DERIVE addr
+   FIELD parent abs-path
+   FIELD anchor fd
+   FIELD name str
+   FIELD temporary abs-path
+   FIELD file abs-path
+   FIELD text str
+   FIELD replace bool
+;STRUCTURE
+
+ARENA WRITINGS writing
+
+\ Ends the error's line with the help every write error shares.
+: WRITE-HELP ( -- )
+   s" Ensure the XDG configuration location is owned by this user and" HELP
+   s"  writable." LOG:TEXT+ ;
+
+: PREPARE-FAILED ( abs-path -- )
+   {: p :}
+   FS:ERRNO {: cause:n :}
+   LOG-OPEN s" could not prepare Omabox configuration directory at "
+   LOG:TEXT+ p QUOTED+ WRITE-HELP
+   E-PREPARE-CONFIGURATION-DIRECTORY cause FAIL ;
+
+\ The operation that failed and the path it names.
+: WRITE-FAILED ( ^u8 n abs-path -- )
+   {: op:^ opu:n p :}
+   FS:ERRNO {: cause:n :}
+   LOG-OPEN s" could not " LOG:TEXT+ op opu LOG:TEXT+
+   s"  Omabox configuration at " LOG:TEXT+ p QUOTED+ WRITE-HELP
+   E-WRITE cause FAIL ;
+
+: ALREADY-EXISTS ( abs-path -- )
+   {: p :}
+   LOG-OPEN s" Omabox configuration already exists at " LOG:TEXT+
+   p QUOTED+
+   s" Use Omabox settings commands to change existing configuration." HELP
+   E-ALREADY-EXISTS 0 FAIL ;
+
+\ The temporary a failed write left, and that write's cause.
+: CLEANUP-AFTER-WRITE ( abs-path n -- )
+   {: t cause:n :}
+   LOG-OPEN
+   s" the configuration write failed and cleanup also failed: " LOG:TEXT+
+   s" could not remove the temporary Omabox configuration at " LOG:TEXT+
+   t QUOTED+
+   s" ; the incomplete owner-only temporary file is ignored" LOG:TEXT+
+   WRITE-HELP
+   E-CLEANUP-AFTER-WRITE cause FAIL ;
+
+\ The directory made, each missing ancestor too, and set 0700.
+: PREPARED ( abs-path -- )
+   {: p :}
+   p ABS-PATH>STR str> {: a:^ u:n :}
+   a u MAKE-ALL? 0= if p PREPARE-FAILED then
+   a u FS:>PATHZ FS:MODE-PRIVATE-DIR chmod 0<> if p PREPARE-FAILED then ;
+
+\ The directory's descriptor, which names the renames' entries.
+: ANCHOR ( abs-path -- fd )
+   {: p :}
+   -1 >FD [: drop p ABS-PATH>STR str> FS:OPEN-DIR-FOLLOW ;] catch
+   {: code:n :}
+   code 0= if exit then
+   code E-FS-OPEN <> if code throw then
+   p PREPARE-FAILED ;
+
+\ ".config.toml.<pid>.<seq>.tmp" in the arena.
+: TEMPORARY-NAME ( ^ARENA:arena -- str )
+   {: ar :}
+   1 SEQUENCE atomic-add {: seq:n :}
+   ar 64 ARENA:ALLOC drop {: dst:^ :}
+   s" .config.toml." dst 0 PUT {: k:n :}
+   getpid FMT:INT$ dst k PUT {: j:n :}
+   [char] . dst j BYTE+ {: m:n :}
+   seq FMT:INT$ dst m PUT {: e:n :}
+   s" .tmp" dst e PUT {: u:n :}
+   dst u >str ;
+
+: CREATE-CAUGHT ( n abs-path -- )
+   {: code:n t :}
+   code E-FS-OPEN <> if code throw then
+   s" create a temporary" t WRITE-FAILED ;
+
+\ The temporary, new and owner-only.
+: CREATED ( abs-path -- fd )
+   {: t :}
+   t ABS-PATH>STR PASSABLE? 0= if s" create a temporary" t WRITE-FAILED then
+   -1 >FD
+   [: drop t ABS-PATH>STR str> FS:MODE-PRIVATE-FILE FS:CREATE-NEW ;]
+   catch {: code:n :}
+   code 0<> if code t CREATE-CAUGHT then ;
+
+\ The text written and synced, the file closed whatever happened.
+: WRITTEN ( fd str abs-path -- )
+   {: f:fd body t :}
+   0 FS:CAUSE!
+   [: f body str> FD:WRITE-FULL f FD:SYNC ;] catch {: code:n :}
+   FS:ERRNO {: cause:n :}
+   f FD>N close
+   cause FS:CAUSE!
+   code 0= if exit then
+   code E-FS-IO <> if code throw then
+   s" write a temporary" t WRITE-FAILED ;
+
+\ The temporary renamed over config.toml, or into its place only while
+\ none is there.
+: INSTALLED ( ^writing -- )
+   {: w :}
+   w WRITING-ANCHOR @ {: dir:fd :}
+   w WRITING-NAME @ str> {: n:^ nu:n :}
+   w WRITING-FILE @ {: file :}
+   w WRITING-REPLACE @ if
+      dir n nu dir s" config.toml" FS:TRY-RENAME-AT if exit then
+      s" install the new" file WRITE-FAILED
+   then
+   dir n nu dir s" config.toml" FS:TRY-RENAME-NEW-AT if exit then
+   FS:ERRNO FS:EEXIST = if file ALREADY-EXISTS then
+   s" install the initial" file WRITE-FAILED ;
+
+\ The directory synced, so the rename lasts.
+: DIRECTORY-SYNCED ( ^writing -- )
+   {: w :}
+   w WRITING-FILE @ {: file :}
+   w WRITING-PARENT @ ABS-PATH>STR str> FS:>PATHZ 0 0 open {: d:n :}
+   d 0 < if s" make the new" file WRITE-FAILED then
+   [: d >FD FD:SYNC ;] catch {: code:n :}
+   FS:ERRNO {: cause:n :}
+   d close
+   cause FS:CAUSE!
+   code 0= if exit then
+   code E-FS-IO <> if code throw then
+   s" make the new" file WRITE-FAILED ;
+
+: PHASES ( ^writing -- )
+   {: w :}
+   w WRITING-TEMPORARY @ {: t :}
+   t CREATED w WRITING-TEXT @ t WRITTEN
+   w INSTALLED
+   w DIRECTORY-SYNCED ;
+
+\ Removed or gone already; false leaves the cause in FS:ERRNO.
+: TEMPORARY-REMOVED? ( ^writing -- bool )
+   {: w :}
+   w WRITING-ANCHOR @ w WRITING-NAME @ str> FS:TRY-REMOVE-FILE-AT if
+      true exit
+   then
+   FS:ERRNO FS:ENOENT = ;
+
+\ A failed write's temporary removed before its code goes on.
+: ATTEMPT ( ^writing -- )
+   {: w :}
+   [: w PHASES ;] catch {: code:n :}
+   code 0= if exit then
+   FS:ERRNO {: cause:n :}
+   w TEMPORARY-REMOVED? if cause FS:CAUSE! code throw then
+   w WRITING-TEMPORARY @ cause CLEANUP-AFTER-WRITE ;
+
+: STAGED ( ^paths str bool fd ^ARENA:arena -- ^writing )
+   {: p body replace:bool dir:fd ar :}
+   ar WRITINGS-NEW {: w :}
+   p PATHS-CONFIG @ w WRITING-PARENT !
+   dir w WRITING-ANCHOR !
+   ar TEMPORARY-NAME {: n :}
+   n w WRITING-NAME !
+   p PATHS-CONFIG @ n ar JOIN w WRITING-TEMPORARY !
+   p ar CONFIG-FILE w WRITING-FILE !
+   body w WRITING-TEXT !
+   replace w WRITING-REPLACE !
+   w ;
+
+\ The sweep, then the write, under the directory's descriptor.
+: WRITE-IN ( ^paths str bool fd ^ARENA:arena
+     -- ^VEC:vector<STALE:leftover> )
+   {: p body replace:bool dir:fd ar :}
+   p PATHS-CONFIG @ ABS-PATH>STR s" .config.toml." s" .tmp" ar STALE:SWEEP
+   {: v :}
+   p body replace dir ar STAGED ATTEMPT
+   v ;
+
+: WRITE-WITH ( ^config bool ^ARENA:arena -- ^VEC:vector<STALE:leftover> )
+   {: c replace:bool ar :}
+   c CONFIG-SYNC-ROOT @ c CONFIG-DROPBOX-APP-KEY @ ar DOCUMENT-TEXT
+   {: body :}
+   c CONFIG-PATHS @ {: p :}
+   p PATHS-CONFIG @ {: parent :}
+   parent PREPARED
+   parent ANCHOR {: dir:fd :}
+   [: p body replace dir ar WRITE-IN ;] [: dir FD>N close ;] finally ;
+
+public
+
+\ ---- writing config.toml
+
+\ The config written over any config.toml, owner-only: the stale
+\ temporaries the write's sweep left in place.
+: WRITE ( ^config ^ARENA:arena -- ^VEC:vector<STALE:leftover> )
+   {: c ar :}
+   c true ar WRITE-WITH ;
+
+\ The config written only where no config.toml is, else
+\ E-ALREADY-EXISTS: the stale temporaries the write's sweep left in place.
+: WRITE-NEW ( ^config ^ARENA:arena -- ^VEC:vector<STALE:leftover> )
+   {: c ar :}
+   c false ar WRITE-WITH ;
 
 ;package

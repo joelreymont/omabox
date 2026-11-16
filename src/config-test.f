@@ -6,13 +6,15 @@
 \ through /usr/bin/flock. Then config.toml as the toml crate
 \ reads it: each string form, each escape, comments, whitespace, CRLF, a
 \ BOM and quoted keys, and each refusal with the code the Rust error maps
-\ to. A refusal's two log lines, its text and Rust's help, are checked;
-\ so are the failures of prepare and the lock. Every case runs in a
+\ to; then config.toml written as the toml crate writes it, replacing a
+\ file or refusing to, sweeping only dead processes' temporaries. A
+\ refusal's two log lines, its text and Rust's help, are checked; so are
+\ the failures of prepare and the lock. Every case runs in a
 \ directory of its own under TMPDIR, sets its own XDG and HOME values and
 \ removes the directory after. CONFIG's log lines go to stderr, but those
 \ a case checks, which are captured in the case's directory, checked and
 \ removed. White-box: CONFIG is reopened for the private words a Rust
-\ test calls and two failure words no case reaches.
+\ test calls and the failure words no case reaches.
 \ Run from the repository root: hb --load src/config-test.f </dev/null
 require src/lib/arena.f
 require src/lib/string.f
@@ -24,6 +26,10 @@ require src/lib/fs.f
 require src/lib/fs-mutate.f
 require src/lib/fd.f
 require src/lib/process.f
+require src/lib/fs-list.f
+require src/lib/fmt.f
+require src/lib/vector.f
+require src/stale.f
 require src/config.f
 
 package CONFIG-TEST
@@ -31,7 +37,8 @@ package CONFIG-TEST
 
 
 \ CONFIG reopened for projection, XDG resolution and fields, realpath, three
-\ failure words and a lock's descriptor; each name lands in CONFIG-TEST.
+\ failure words, a write's failed cleanup and a lock's descriptor; each name
+\ lands in CONFIG-TEST.
 package CONFIG
 
 : CONFIG-TEST:FOLLOW ( abs-path ^ARENA:arena -- abs-path )
@@ -47,7 +54,6 @@ package CONFIG
 : CONFIG-TEST:RESOLVE ( option<str> option<str> option<str> ^ARENA:arena -- ^xdg )
    RESOLVE-XDG ;
 
-: CONFIG-TEST:CONFIG-HOME ( ^xdg -- abs-path ) XDG-CONFIG-HOME @ ;
 : CONFIG-TEST:STATE-HOME ( ^xdg -- abs-path ) XDG-STATE-HOME @ ;
 
 : CONFIG-TEST:STATE-APP ( ^xdg ^ARENA:arena -- abs-path ) XDG-STATE-DIRECTORY ;
@@ -67,6 +73,14 @@ package CONFIG
 : CONFIG-TEST:ACQUIRE-FAILED ( abs-path -- ) ACQUIRE-FAILED ;
 
 : CONFIG-TEST:OPEN-FAILED ( abs-path -- ) OPEN-FAILED ;
+
+\ A write of a temporary that failed EPERM, then its failed removal.
+: CONFIG-TEST:CLEANUP-FAILS ( abs-path -- )
+   {: p :}
+   FS:EPERM FS:CAUSE!
+   [: s" write a temporary" p WRITE-FAILED ;] catch {: code:n :}
+   code E-WRITE <> if code throw then
+   p FS:ERRNO CLEANUP-AFTER-WRITE ;
 
 : CONFIG-TEST:LOCK-FD ( lock -- lock n )
    LOCK-UNMAKE {: f:fd p :}
@@ -234,6 +248,8 @@ variable CAUSE
       CONFIG:E-LOCK-OPEN of s" Ensure the Omabox state directory is writable and retry." endof
       CONFIG:E-ALREADY-RUNNING of s" Use the existing daemon instance; no lock-file cleanup is required." endof
       CONFIG:E-LOCK-ACQUIRE of s" Check filesystem lock support and retry." endof
+      CONFIG:E-ALREADY-EXISTS of s" Use Omabox settings commands to change existing configuration." endof
+      CONFIG:E-WRITE of s" Ensure the XDG configuration location is owned by this user and writable." endof
       CONFIG:E-HOME-UNAVAILABLE of s" Set HOME, or set both XDG_CONFIG_HOME and XDG_STATE_HOME to absolute paths." endof
       s" " rot
    endcase ;
@@ -458,19 +474,19 @@ variable CAUSE
 
 : EMPTY-VALUES ( -- )
    DIR @ SOME s" " >str SOME s" " >str SOME AR @ CONFIG-TEST:RESOLVE {: x :}
-   x CONFIG-TEST:CONFIG-HOME s" .config" UNDER PATH=
+   x CONFIG:CONFIG-HOME s" .config" UNDER PATH=
    x CONFIG-TEST:STATE-HOME s" .local/state" UNDER PATH= ;
 
 : RELATIVE-VALUES ( -- )
    DIR @ SOME s" relative-config" >str SOME s" relative-state" >str SOME
    AR @ CONFIG-TEST:RESOLVE {: x :}
-   x CONFIG-TEST:CONFIG-HOME s" .config" UNDER PATH=
+   x CONFIG:CONFIG-HOME s" .config" UNDER PATH=
    x CONFIG-TEST:STATE-HOME s" .local/state" UNDER PATH= ;
 
 : ABSOLUTE-VALUES ( -- )
    CONFIG-TEST:ABSENT s" /configured/config" >str SOME
    s" /configured/state" >str SOME AR @ CONFIG-TEST:RESOLVE {: x :}
-   x CONFIG-TEST:CONFIG-HOME s" /configured/config" >str PATH=
+   x CONFIG:CONFIG-HOME s" /configured/config" >str PATH=
    x CONFIG-TEST:STATE-HOME s" /configured/state" >str PATH= ;
 
 
@@ -776,6 +792,157 @@ variable CAUSE
    s" sync root `" >str ROOT @ CAT s" ` is not a directory" S+
    REFUSED ;
 
+
+\ ---- writing config.toml
+
+: REPLACEMENT ( -- str ) s" Replacement" UNDER ;
+
+\ A config from XDG, the root and the key.
+: FROM ( str ^u8 n -- ^CONFIG:config )
+   {: root k:^ ku:n :}
+   XDG @ root CONFIG:>ABS-PATH k ku >str AR @ CONFIG:FROM-VALUES ;
+
+: NO-LEFTOVERS ( ^VEC:vector<STALE:leftover> -- ) VEC:COUNT 0 T= ;
+
+variable ENTRIES
+: COUNT-ENTRY ( ^u8 n -- ) 2drop 1 ENTRIES +! ;
+
+: ENTRY-COUNT ( str -- n )
+   0 ENTRIES ! str> [: COUNT-ENTRY ;] FS-LIST:EACH ENTRIES @ ;
+
+4096 constant TEXT-CAP
+TEXT-CAP BUFFER: TEXT
+
+\ The bytes of a file, laid in AR.
+: CONTENTS ( str -- str )
+   str> TEXT TEXT-CAP FS:READ-ALL {: u:n :}
+   TEXT u KEEP ;
+
+: WRITE-REPLACES ( -- )
+   FIXTURE
+   REPLACEMENT MKDIR
+   STANDARD
+   CONFIG-FILE str> $1A4 FS:CHMOD-MODE
+   REPLACEMENT s" replacement-app-key" FROM {: r :}
+   r AR @ CONFIG:WRITE NO-LEFTOVERS
+   CONFIG-FILE CONFIG:>ABS-PATH MODE $180 T=
+   LOAD {: c :}
+   c CONFIG:SYNC-ROOT r CONFIG:SYNC-ROOT CONFIG:ABS-PATH>STR PATH=
+   c CONFIG:APP-KEY str> r CONFIG:APP-KEY str> T$=
+   c CONFIG:PATHS r CONFIG:PATHS SAME-PATHS
+   CONFIG-DIR ENTRY-COUNT 1 T= ;
+
+: NEW-AGAIN ( -- ) HELD @ AR @ CONFIG:WRITE-NEW drop ;
+
+\ Also checks that the refused write left no temporary.
+: WRITE-NEW-KEEPS ( -- )
+   FIXTURE
+   REPLACEMENT MKDIR
+   ROOT @ s" existing-app-key" FROM AR @ CONFIG:WRITE-NEW NO-LEFTOVERS
+   CONFIG-FILE CONTENTS {: original :}
+   REPLACEMENT s" replacement-app-key" FROM HELD !
+   ['] NEW-AGAIN CONFIG:E-ALREADY-EXISTS
+   s" Omabox configuration already exists at `" >str CONFIG-FILE CAT
+   s" `" S+ REFUSED
+   CONFIG-FILE CONTENTS str> original str> T$=
+   CONFIG-DIR ENTRY-COUNT 1 T= ;
+
+\ The offset past the line that starts at or after at.
+: PAST-LINE ( n -- n )
+   {: at:n :}
+   ERR-U @ at ?do ERR @ i + c@ 10 = if i 1+ unloop exit then loop
+   ERR-U @ ;
+
+\ ERR$'s line k, its newline included.
+: LINE-AT ( n -- ^u8 n )
+   {: k:n :}
+   0 k 0 ?do PAST-LINE loop {: s:n :}
+   s PAST-LINE {: e:n :}
+   ERR @ s + e s - ;
+
+: LINE-IS ( n ^u8 n -- )
+   {: k:n t:^ tu:n :}
+   k LINE-AT t tu >str ENDS? t tu >str ASSERT-LOG ;
+
+: CLEANUP-FAILS ( -- )
+   s" /config.tmp" >str CONFIG:>ABS-PATH CONFIG-TEST:CLEANUP-FAILS ;
+
+\ Both failures are writes, so both helps are the same text.
+: CLEANUP-RENDERS ( -- )
+   ['] CLEANUP-FAILS LOGGED CONFIG:E-CLEANUP-AFTER-WRITE T=
+   CAUSE @ FS:EPERM T=
+   ERR$ LINES 4 T=
+   0 s" could not write a temporary Omabox configuration at `/config.tmp`"
+   LINE-IS
+   s" help: " >str CONFIG:E-WRITE HELP$ S+ str> {: h:^ hu:n :}
+   1 h hu LINE-IS
+   s" the configuration write failed and cleanup also failed: " >str
+   s" could not remove the temporary Omabox configuration at" S+
+   s"  `/config.tmp`; the incomplete owner-only temporary file is" S+
+   s"  ignored" S+ {: c :}
+   2 c str> LINE-IS
+   3 h hu LINE-IS ;
+
+\ The decimal at the start of a u.
+: LEADING ( ^u8 n -- n )
+   {: a:^ u:n :}
+   0 u 0 ?do
+      a i + c@ {: b:n :}
+      b [char] 0 < b [char] 9 > or if unloop exit then
+      10 * b [char] 0 - +
+   loop ;
+
+: PID-MAX ( -- n )
+   s" /proc/sys/kernel/pid_max" >str CONTENTS str> LEADING ;
+
+: N$ ( n -- str ) FMT:INT$ KEEP ;
+
+\ CONFIG-DIR/.config.toml.<t>
+: TEMPORARY ( str -- str )
+   {: t :}
+   CONFIG-DIR s" /.config.toml." S+ t CAT ;
+
+: LSTAT? ( str -- bool ) str> FS:TRY-LSTAT ;
+
+\ The config half of install.rs's
+\ upgrade_and_config_write_sweep_only_dead_temporaries: no process has a
+\ PID above pid_max.
+: SWEEPS-DEAD ( -- )
+   FIXTURE
+   PID-MAX 1 + N$ {: dead :}
+   s" outside-file" UNDER {: outside :}
+   outside str> s" outside" FS:WRITE-ALL
+   dead s" .0.tmp" S+ TEMPORARY {: file :}
+   dead s" .1.tmp" S+ TEMPORARY {: link :}
+   getpid N$ s" .999999999.tmp" S+ TEMPORARY {: live :}
+   dead s" .0" S+ TEMPORARY {: miss :}
+   file str> s" stale" FS:WRITE-ALL
+   live str> s" stale" FS:WRITE-ALL
+   miss str> s" stale" FS:WRITE-ALL
+   outside link SYMLINK
+   ROOT @ s" test-app-key" FROM AR @ CONFIG:WRITE NO-LEFTOVERS
+   file LSTAT? TFALSE
+   link LSTAT? TFALSE
+   live LSTAT? TTRUE
+   miss LSTAT? TTRUE
+   outside CONTENTS str> s" outside" T$= ;
+
+\ `"`, `\` and `'` rule out every form toml_writer prefers to a
+\ multi-line literal string.
+: AWKWARD ( -- ^u8 n ) s\" a\"b\\c'd\xC3\xA9" ;
+
+: WRITES-TOML ( -- )
+   FIXTURE
+   AWKWARD UNDER {: root :}
+   root MKDIR
+   root s" test-app-key" FROM AR @ CONFIG:WRITE NO-LEFTOVERS
+   s" sync_root = '''" >str REAL @ CAT s" /" S+ AWKWARD S+
+   s\" '''\ndropbox_app_key = \"test-app-key\"\n" S+ {: want :}
+   CONFIG-FILE CONTENTS str> want str> T$=
+   LOAD {: c :}
+   c CONFIG:SYNC-ROOT AWKWARD REAL-UNDER PATH=
+   c CONFIG:APP-KEY str> s" test-app-key" T$= ;
+
 public
 
 : RUN ( -- )
@@ -854,6 +1021,16 @@ public
    s" config.toml a directory" ['] CONFIG-DIRECTORY-FILE RUN-CASE
    s" a relative root" ['] RELATIVE-ROOT RUN-CASE
    s" a root that is a file" ['] NOT-DIRECTORY RUN-CASE
+   s" config_write_atomically_replaces_with_owner_only_file"
+   ['] WRITE-REPLACES RUN-CASE
+   s" initial_config_write_never_replaces_an_existing_file"
+   ['] WRITE-NEW-KEEPS RUN-CASE
+   s" cleanup_after_write_renders_both_chains_and_both_helps"
+   ['] CLEANUP-RENDERS RUN-CASE
+   s" upgrade_and_config_write_sweep_only_dead_temporaries"
+   ['] SWEEPS-DEAD RUN-CASE
+   s" a sync root toml_writer writes as a multi-line literal"
+   ['] WRITES-TOML RUN-CASE
    s" config-test: " type T-CASES FMT:.INT s"  checks" type cr
    T-REPORT ;
 
