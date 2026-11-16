@@ -1,8 +1,18 @@
 \ omabox-test.f - the omabox program against the Rust version's
 \ src/bin/omabox.rs tests, under their names, for the forms it parses:
 \ - parser_accepts_documented_forms
-\ - parser_rejects_incomplete_or_secret_bearing_forms, each refusal's
-\   two log lines checked in a file under TMPDIR
+\ - parser_rejects_incomplete_or_secret_bearing_forms and
+\   parser_names_the_setup_option_fault, each refusal's two log lines
+\   checked in a file under TMPDIR; setup's forms through PARSE-SETUP
+\ - default_sync_root_is_a_private_home_dropbox_created_once, the home a
+\   directory under TMPDIR
+\ - failed_initial_setup_leaves_no_config_and_same_command_can_retry,
+\   the sync root and XDG homes in a directory under TMPDIR
+\ - an_overlong_authorization_code_is_rejected_within_the_bound,
+\   an_authorization_code_at_the_limit_is_accepted,
+\   an_authorization_code_is_trimmed and
+\   a_blank_or_non_utf8_authorization_code_is_rejected, each code read
+\   from a pipe
 \ - config_errors_show_their_own_help: status over a config.toml that
 \   does not parse logs CONFIG's error and help, then OMABOX's Config
 \   line with no help of its own
@@ -22,8 +32,9 @@
 \   stateful script in a directory of its own under TMPDIR
 \ and the program built with README's command into a directory under
 \ TMPDIR, whose --version prints its name and version and exits 0.
-\ White-box: OMABOX is reopened for PARSE, RUN-SERVICE, STATUS-TEXT,
-\ SETTINGS-TEXT, RESTORE-GOAL and RELEASED.
+\ White-box: OMABOX is reopened for PARSE, PARSE-SETUP, HOME-ROOT,
+\ COMPLETE-SETUP, READ-CODE, RUN-SERVICE, STATUS-TEXT, SETTINGS-TEXT,
+\ RESTORE-GOAL and RELEASED.
 \ Run from the repository root: hb --load src/omabox-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -33,6 +44,8 @@ require src/lib/test.f
 require src/lib/test/stderr.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
+require src/lib/fd.f
+require src/lib/adt/option.f
 require src/lib/process.f
 require src/lib/process-argv.f
 require src/lib/process-env.f
@@ -41,6 +54,7 @@ require src/lib/vector.f
 require src/dropbox.f
 require src/model.f
 require src/journal.f
+require src/stale.f
 require src/config.f
 require src/attention.f
 require src/service.f
@@ -92,7 +106,7 @@ variable CHANGES
    s" omabox-test-" FS:MKTEMP-DIR rot COPIED ;
 
 \ The file's text, empty where there is no file.
-: READ ( str -- ^u8 n )
+: FILE-TEXT ( str -- ^u8 n )
    {: p :}
    p str> FS:TRY-STAT 0= if s" " exit then
    p str> SEEN CAP FS:READ-ALL {: u:n :}
@@ -117,7 +131,73 @@ variable CHANGES
 
 \ ---- the parser
 
-: ACCEPTS ( command -- ) PARSED COMMAND-EQ TTRUE ;
+\ The command as text, its variant and payload, for a test to compare.
+: COMMAND$ ( command -- ^u8 n )
+   SB-RESET
+   MATCH command
+      help OF s" help" SB-APPEND ENDOF
+      version OF s" version" SB-APPEND ENDOF
+      status OF s" status" SB-APPEND ENDOF
+      settings OF
+         s" settings " SB-APPEND FORM-TAG FMT:INT$ SB-APPEND
+      ENDOF
+      service OF
+         s" service " SB-APPEND SERVICE-ACTION:TAG FMT:INT$ SB-APPEND
+      ENDOF
+      logs OF s" logs" SB-APPEND ENDOF
+   ;MATCH SB$ ;
+
+: ACCEPTS-IN ( command ^ARENA:arena -- )
+   {: c ar :}
+   c COMMAND$ ar COPIED str> PARSED COMMAND$ T$= ;
+
+: ACCEPTS ( command -- ) {: c :} [: c swap ACCEPTS-IN ;] ARENA:WITH ;
+
+: SETUP-PARSED ( -- setup-options ) ARGC @ [: ARG ;] PARSE-SETUP ;
+
+\ The bytes and whether there are any.
+: SOME$ ( option<str> -- ^u8 n bool )
+   MATCH option
+      some OF str> true ENDOF
+      none OF s" " false ENDOF
+   ;MATCH ;
+
+: SAME-BOOL? ( bool bool -- bool ) bool>n swap bool>n = ;
+
+: STRS= ( option<str> option<str> -- bool )
+   SOME$ {: b:^ bu:n bf:bool :} SOME$ {: a:^ au:n af:bool :}
+   af bf SAME-BOOL? a au b bu STR= and ;
+
+\ The sync root, the key and whether there is an initial config.
+: INITIAL$ ( option<initial-config> -- option<str> ^u8 n bool )
+   MATCH option
+      some OF INITIAL-CONFIG-UNMAKE str> true ENDOF
+      none OF NO-STR s" " false ENDOF
+   ;MATCH ;
+
+: INITIALS= ( option<initial-config> option<initial-config> -- bool )
+   INITIAL$ {: bs bk:^ bku:n bf:bool :}
+   INITIAL$ {: as ak:^ aku:n af:bool :}
+   af bf SAME-BOOL? ak aku bk bku STR= and as bs STRS= and ;
+
+\ Rust's derived PartialEq of SetupOptions.
+: OPTIONS= ( setup-options setup-options -- bool )
+   SETUP-OPTIONS-UNMAKE {: br bi :}
+   SETUP-OPTIONS-UNMAKE {: ar ai :}
+   ar str> br str> STR= ai bi INITIALS= and ;
+
+: SETUP-ACCEPTS ( setup-options -- ) SETUP-PARSED OPTIONS= TTRUE ;
+
+\ The remote root and initial config.
+: OPTIONS ( ^u8 n option<initial-config> -- setup-options )
+   {: r:^ ru:n i :}
+   r ru >str i SETUP-OPTIONS-MAKE ;
+
+\ The sync root and app key of a setup driven by flags.
+: FLAGS ( option<str> ^u8 n -- option<initial-config> )
+   >str INITIAL-CONFIG-MAKE OPTION:SOME ;
+
+: SOME-STR ( ^u8 n -- option<str> ) >str OPTION:SOME ;
 
 : SERVICE-COMMAND ( SERVICE:action -- command ) COMMAND-SERVICE ;
 
@@ -128,6 +208,15 @@ variable CHANGES
    s" pause" ONE SERVICE-ACTION:STOP SERVICE-COMMAND ACCEPTS
    s" resume" ONE
    SERVICE-ACTION:START SERVICE-COMMAND ACCEPTS
+   s" setup" ONE s" " NO-INITIAL OPTIONS SETUP-ACCEPTS
+   s" setup" s" /Work" TWO s" /Work" NO-INITIAL OPTIONS SETUP-ACCEPTS
+   s" setup" s" --remote-root" TWO s" /Work" ARG+
+   s" --app-key" ARG+ s" key" ARG+
+   s" --sync-root" ARG+ s" /tmp/Dropbox" ARG+
+   s" /Work" s" /tmp/Dropbox" SOME-STR s" key" FLAGS OPTIONS
+   SETUP-ACCEPTS
+   s" setup" s" --app-key" TWO s" key" ARG+
+   s" " NO-STR s" key" FLAGS OPTIONS SETUP-ACCEPTS
    s" service" s" restart" TWO
    SERVICE-ACTION:RESTART SERVICE-COMMAND ACCEPTS
    s" logs" ONE construct command logs ACCEPTS
@@ -146,15 +235,24 @@ variable CHANGES
    SB-RESET s" omabox: " SB-APPEND t tu SB-APPEND 10 SB-APPEND-C
    a u SB$ CONTAINS? ;
 
-\ The arguments are refused as Usage: the fault m's line, then the help
-\ line, captured in the file at p.
-: REJECTS ( ^u8 n str ^ARENA:arena -- )
-   {: m:^ mu:n p ar :}
-   [: PARSED drop ;] p str> ar STDERR:CAPTURING {: code:n e:^ eu:n :}
+\ A Usage refusal: the fault m's line, then the help line.
+: USAGE-LOGGED ( n ^u8 n ^u8 n -- )
+   {: code:n e:^ eu:n m:^ mu:n :}
    code E-USAGE T=
    e eu LINES 2 T=
    e eu m mu LOGGED? TTRUE
    e eu s" help: Run `omabox --help` for usage." LOGGED? TTRUE ;
+
+\ The arguments are refused as Usage with the fault m, captured in the
+\ file at p.
+: REJECTS ( ^u8 n str ^ARENA:arena -- )
+   {: m:^ mu:n p ar :}
+   [: PARSED drop ;] p str> ar STDERR:CAPTURING m mu USAGE-LOGGED ;
+
+\ REJECTS of setup's arguments, through PARSE-SETUP.
+: SETUP-REJECTS ( ^u8 n str ^ARENA:arena -- )
+   {: m:^ mu:n p ar :}
+   [: SETUP-PARSED drop ;] p str> ar STDERR:CAPTURING m mu USAGE-LOGGED ;
 
 : PARSER-REJECTS-INCOMPLETE-OR-SECRET-BEARING-FORMS
    ( ^ARENA:arena -- )
@@ -172,6 +270,205 @@ variable CHANGES
    s" invalid settings command" p ar REJECTS
    s" settings" s" --yaml" TWO s" invalid settings command" p ar REJECTS
    s" service" s" unknown" TWO s" unknown service action" p ar REJECTS
+   s" setup" s" --sync-root" TWO s" /tmp/Dropbox" ARG+
+   s" flag-driven setup requires --app-key" p ar SETUP-REJECTS
+   s" setup" s" --sync-root" TWO s" /tmp/Dropbox" ARG+
+   s" --app-key" ARG+ s" key" ARG+
+   s" --app-secret" ARG+ s" secret" ARG+
+   s" unknown setup option" p ar SETUP-REJECTS
+   d str> FS:REMOVE-TREE ;
+
+: ROOT-FAULT$ ( -- ^u8 n )
+   s" the Dropbox root must be empty or an absolute folder path such as /Work, with no trailing slash and no empty, . or .. parts" ;
+
+: PARSER-NAMES-THE-SETUP-OPTION-FAULT ( ^ARENA:arena -- )
+   {: ar :}
+   s" parser_names_the_setup_option_fault" T-LABEL
+   ar TEMPORARY {: d :}
+   d s" stderr.txt" ar INSIDE {: p :}
+   s" setup" s" --help" TWO s" unknown setup option" p ar SETUP-REJECTS
+   s" setup" s" --sync-root" TWO s" /tmp/Dropbox" ARG+ s" --bogus" ARG+
+   s" unknown setup option" p ar SETUP-REJECTS
+   s" setup" s" --app-key" TWO
+   s" a setup option is missing its value" p ar SETUP-REJECTS
+   s" setup" s" --app-key" TWO s" key" ARG+ s" --app-key" ARG+
+   s" a setup option was provided more than once" p ar SETUP-REJECTS
+   s" setup" s" -h" TWO ROOT-FAULT$ p ar SETUP-REJECTS
+   s" setup" s" Work" TWO ROOT-FAULT$ p ar SETUP-REJECTS
+   s" setup" s" /Work/" TWO ROOT-FAULT$ p ar SETUP-REJECTS
+   s" setup" s" /Work/../Home" TWO ROOT-FAULT$ p ar SETUP-REJECTS
+   s" setup" s" --sync-root" TWO s" /tmp/Dropbox" ARG+
+   s" --app-key" ARG+ s" key" ARG+ s" --remote-root" ARG+ s" Work" ARG+
+   ROOT-FAULT$ p ar SETUP-REJECTS
+   d str> FS:REMOVE-TREE ;
+
+
+\ ---- setup's local steps
+
+\ HOME-ROOT of the home, refused with the code, captured in p.
+: NO-ROOT ( option<str> str ^ARENA:arena -- )
+   {: home p ar :}
+   [: home ar HOME-ROOT drop ;] p str> ar STDERR:CAPTURING
+   {: code:n e:^ eu:n :}
+   code E-NO-DEFAULT-ROOT T=
+   e eu LINES 2 T= ;
+
+\ HOME-ROOT of the home is root, a directory of mode 0700.
+: PRIVATE-ROOT ( str str ^ARENA:arena -- )
+   {: home root ar :}
+   home OPTION:SOME ar HOME-ROOT str> root str> T$=
+   root str> FS:STAT-MODE $1FF and FS:MODE-PRIVATE-DIR T= ;
+
+: DEFAULT-SYNC-ROOT-IS-A-PRIVATE-HOME-DROPBOX-CREATED-ONCE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" default_sync_root_is_a_private_home_dropbox_created_once" T-LABEL
+   ar TEMPORARY {: d :}
+   d s" home" ar INSIDE {: home :}
+   home str> FS:MAKE-DIR
+   home s" Dropbox" ar INSIDE {: root :}
+   home root ar PRIVATE-ROOT
+   home root ar PRIVATE-ROOT
+   d s" stderr.txt" ar INSIDE {: p :}
+   NO-STR p ar NO-ROOT
+   s" relative/home" SOME-STR p ar NO-ROOT
+   d str> FS:REMOVE-TREE ;
+
+\ setup --sync-root root --app-key public-app-key.
+: SETUP-ARGS ( str -- )
+   {: root :}
+   s" setup" s" --sync-root" TWO root str> ARG+
+   s" --app-key" ARG+ s" public-app-key" ARG+ ;
+
+\ The documented setup form parsed, its config made and prepared, and
+\ COMPLETE-SETUP run with bind: the code, the log captured in p.
+: ATTEMPT ( str ^CONFIG:xdg [ -- ] str ^ARENA:arena -- n )
+   {: root x bind p ar :}
+   root SETUP-ARGS
+   SETUP-PARSED s" " root str> SOME-STR s" public-app-key" FLAGS OPTIONS
+   OPTIONS= TTRUE
+   x root s" public-app-key" >str ar CONFIG:FROM-VALUES {: c :}
+   c CONFIG:PREPARE
+   [: c true bind ar COMPLETE-SETUP drop ;] p str> ar STDERR:CAPTURING
+   {: code:n e:^ eu:n :}
+   code ;
+
+: FAILED-INITIAL-SETUP-LEAVES-NO-CONFIG-AND-SAME-COMMAND-CAN-RETRY
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" failed_initial_setup_leaves_no_config_and_same_command_can_retry"
+   T-LABEL
+   ar TEMPORARY {: d :}
+   d s" Dropbox" ar INSIDE {: root :}
+   root str> FS:MAKE-DIR
+   d s" config" ar INSIDE CONFIG:>ABS-PATH
+   d s" state" ar INSIDE CONFIG:>ABS-PATH ar CONFIG:XDG-NEW {: x :}
+   x ar CONFIG:XDG-CONFIG-FILE CONFIG:ABS-PATH>STR {: file :}
+   d s" stderr.txt" ar INSIDE {: p :}
+   root x [: E-INVALID-CODE throw ;] p ar ATTEMPT E-INVALID-CODE T=
+   file str> FS:TRY-STAT TFALSE
+   root x [: ;] p ar ATTEMPT 0 T=
+   x ar CONFIG:LOAD-FROM CONFIG:APP-KEY str> s" public-app-key" T$=
+   d str> FS:REMOVE-TREE ;
+
+\ A pipe holding the bytes, its write end closed: the read end.
+: PIPED ( ^u8 n -- fd )
+   {: a:^ u:n :}
+   FD:PIPE {: r:fd w:fd :}
+   w a u FD:WRITE-FULL
+   w FD>N close
+   r ;
+
+\ The bytes left in the pipe; closes it.
+: REST ( fd -- n )
+   {: f:fd :}
+   0 begin f FD>N SEEN CAP read dup 0 > while + repeat drop
+   f FD>N close ;
+
+\ READ-CODE of the bytes from a pipe, captured in p: the code, the text
+\ read in SHOWN, and the pipe's read end.
+: CODE-READ ( ^u8 n str ^ARENA:arena -- n fd )
+   {: a:^ u:n p ar :}
+   a u PIPED {: f:fd :}
+   [: f ar READ-CODE SHOWN ! ;] p str> ar STDERR:CAPTURING
+   {: code:n e:^ eu:n :}
+   code f ;
+
+\ The bytes read as the code c.
+: CODE-ACCEPTED ( ^u8 n ^u8 n str ^ARENA:arena -- )
+   {: a:^ u:n c:^ cu:n p ar :}
+   a u p ar CODE-READ {: code:n f:fd :}
+   code 0 T=
+   SHOWN @ str> c cu T$=
+   f REST drop ;
+
+\ The bytes refused as E-INVALID-CODE: the bytes left unread.
+: CODE-REFUSED ( ^u8 n str ^ARENA:arena -- n )
+   {: a:^ u:n p ar :}
+   a u p ar CODE-READ {: code:n f:fd :}
+   code E-INVALID-CODE T=
+   f REST ;
+
+\ n bytes a in the arena.
+: AS ( n ^ARENA:arena -- ^u8 n )
+   {: n:n ar :}
+   ar n ARENA:ALLOC {: b:^ u:n :}
+   u 0 ?do 97 b i + c! loop
+   b u ;
+
+\ n bytes a, then LF.
+: AS-LINE ( n ^ARENA:arena -- ^u8 n )
+   {: n:n ar :}
+   n 1+ ar AS {: b:^ u:n :}
+   10 b n + c!
+   b u ;
+
+\ The file at p, under a new directory: the directory and p.
+: LOG-FILE ( ^ARENA:arena -- str str )
+   {: ar :}
+   ar TEMPORARY {: d :}
+   d d s" stderr.txt" ar INSIDE ;
+
+\ The read stops within the bound: the bytes it took are total less
+\ those left.
+: OVERLONG ( n str ^ARENA:arena -- )
+   {: extra:n p ar :}
+   CODE-LIMIT extra + {: total:n :}
+   total ar AS p ar CODE-REFUSED {: left:n :}
+   total left - CODE-LIMIT 1+ <= TTRUE ;
+
+: AN-OVERLONG-AUTHORIZATION-CODE-IS-REJECTED-WITHIN-THE-BOUND
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" an_overlong_authorization_code_is_rejected_within_the_bound" T-LABEL
+   ar LOG-FILE {: d p :}
+   1 p ar OVERLONG
+   2 p ar OVERLONG
+   4096 p ar OVERLONG
+   d str> FS:REMOVE-TREE ;
+
+: AN-AUTHORIZATION-CODE-AT-THE-LIMIT-IS-ACCEPTED ( ^ARENA:arena -- )
+   {: ar :}
+   s" an_authorization_code_at_the_limit_is_accepted" T-LABEL
+   ar LOG-FILE {: d p :}
+   CODE-LIMIT ar AS-LINE CODE-LIMIT ar AS p ar CODE-ACCEPTED
+   SHOWN @ str> nip CODE-LIMIT T=
+   d str> FS:REMOVE-TREE ;
+
+: AN-AUTHORIZATION-CODE-IS-TRIMMED ( ^ARENA:arena -- )
+   {: ar :}
+   s" an_authorization_code_is_trimmed" T-LABEL
+   ar LOG-FILE {: d p :}
+   S\" \x20\tcode \r\n" s" code" p ar CODE-ACCEPTED
+   s" code" s" code" p ar CODE-ACCEPTED
+   d str> FS:REMOVE-TREE ;
+
+: A-BLANK-OR-NON-UTF8-AUTHORIZATION-CODE-IS-REJECTED ( ^ARENA:arena -- )
+   {: ar :}
+   s" a_blank_or_non_utf8_authorization_code_is_rejected" T-LABEL
+   ar LOG-FILE {: d p :}
+   S\" \x20\x20\n" p ar CODE-REFUSED 0 T=
+   S\" \xff\n" p ar CODE-REFUSED 0 T=
    d str> FS:REMOVE-TREE ;
 
 
@@ -359,7 +656,7 @@ variable CHANGES
    sys s su log FAKE-SYSTEMCTL
    sys s" /unused/journalctl" >str ar SERVICE:SCRIPTS {: c :}
    [: c act ar RUN-SERVICE ;] catch 0 T=
-   log READ w wu T$=
+   log FILE-TEXT w wu T$=
    d str> FS:REMOVE-TREE ;
 
 : SERVICE-COMMANDS-RESET-THE-START-LIMIT-BEFORE-A-START
@@ -466,8 +763,8 @@ variable CHANGES
 \ Rust's service_trace: the service log and the unit state.
 : TRACE ( str ^ARENA:arena -- str str )
    {: d ar :}
-   d s" service.log" ar INSIDE READ ar COPIED
-   d s" unit-state" ar INSIDE READ ar COPIED ;
+   d s" service.log" ar INSIDE FILE-TEXT ar COPIED
+   d s" unit-state" ar INSIDE FILE-TEXT ar COPIED ;
 
 : NO-LEFTOVERS ( ^ARENA:arena -- ^VEC:vector<STALE:leftover> )
    ARENA:ALLOCATOR 0 [type] STALE:leftover VEC:NEW ;
@@ -592,6 +889,13 @@ variable CHANGES
    {: ar :}
    PARSER-ACCEPTS-DOCUMENTED-FORMS
    ar PARSER-REJECTS-INCOMPLETE-OR-SECRET-BEARING-FORMS
+   ar PARSER-NAMES-THE-SETUP-OPTION-FAULT
+   ar DEFAULT-SYNC-ROOT-IS-A-PRIVATE-HOME-DROPBOX-CREATED-ONCE
+   ar FAILED-INITIAL-SETUP-LEAVES-NO-CONFIG-AND-SAME-COMMAND-CAN-RETRY
+   ar AN-OVERLONG-AUTHORIZATION-CODE-IS-REJECTED-WITHIN-THE-BOUND
+   ar AN-AUTHORIZATION-CODE-AT-THE-LIMIT-IS-ACCEPTED
+   ar AN-AUTHORIZATION-CODE-IS-TRIMMED
+   ar A-BLANK-OR-NON-UTF8-AUTHORIZATION-CODE-IS-REJECTED
    ar CONFIG-ERRORS-SHOW-THEIR-OWN-HELP
    ar STATUS-REPORTS-THE-JOURNAL-WHEN-THE-ROOT-IS-UNAVAILABLE
    ar SETTINGS-SHOW-THE-STORED-ROOT-WHEN-IT-IS-UNAVAILABLE

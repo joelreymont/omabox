@@ -11,9 +11,13 @@
 \ status and settings check the stored sync root once their text is
 \ built: CONFIG logs its refusal of an unusable root, and the command
 \ still writes its text and succeeds.
+\ setup's local steps are Rust's: its options parsed whole, the default
+\ sync root made, the authorization code read, and the config written
+\ under the daemon lock.
 \ STORAGE CLASS. CALLER-OWNED: a command's service commands, drive
-\ record, configuration and text live in an arena the run holds; help
-\ and the version line are built in string.f's task-local builder.
+\ record, configuration, text, lock, default root and authorization
+\ code live in an arena the run holds; help and the version line are
+\ built in string.f's task-local builder.
 require src/lib/error.f
 require src/lib/string.f
 require src/lib/arena.f
@@ -21,10 +25,14 @@ require src/lib/adt/option.f
 require src/lib/log.f
 require src/lib/fd.f
 require src/lib/fs.f
+require src/lib/fs-mutate.f
 require src/lib/utf8-scalar.f
-require src/lib/json.f
+require src/lib/unicode/class.f
 require src/lib/vector.f
+require src/lib/json.f
 require src/config.f
+require src/journal.f
+require src/dropbox.f
 require src/attention.f
 require src/service.f
 require src/stale.f
@@ -44,6 +52,18 @@ public
    ERROR:CODE E-CHANGE-AND-RESTORE
 -101104 s" a change was made, but the Omabox service could not be started or checked"
    ERROR:CODE E-START-AFTER-CHANGE
+-101105 s" could not inspect the Omabox configuration path"
+   ERROR:CODE E-INSPECT-CONFIG
+-101106 s" Omabox configuration already exists" ERROR:CODE E-CONFIG-EXISTS
+-101107 s" could not acquire the Omabox daemon lock" ERROR:CODE E-LOCK
+-101108 s" the Dropbox authorization code was empty or too long"
+   ERROR:CODE E-INVALID-CODE
+-101109
+   s" HOME must be an absolute path to find the default sync root ~/Dropbox"
+   ERROR:CODE E-NO-DEFAULT-ROOT
+-101110 s" could not create the default sync root"
+   ERROR:CODE E-CREATE-DEFAULT-ROOT
+-101111 s" an Omabox journal operation failed" ERROR:CODE E-JOURNAL
 
 private
 
@@ -71,8 +91,9 @@ private
 \ Rust's Settings { json }: how settings shows the stored settings.
 ENUM form DERIVE eq text json ;ENUM
 
-\ Rust's Command, the forms this program parses.
-ENUM command DERIVE eq
+\ Rust's Command, the forms this program parses. It derives no eq: a
+\ str or option payload has none.
+ENUM command
    VARIANT help ;VARIANT
    VARIANT version ;VARIANT
    VARIANT status ;VARIANT
@@ -81,8 +102,25 @@ ENUM command DERIVE eq
    VARIANT logs ;VARIANT
 ;ENUM
 
+\ Rust's InitialConfig: the sync root, none for ~/Dropbox, and the app
+\ key.
+STRUCTURE initial-config
+   FIELD sync-root option<str>
+   FIELD app-key str
+;STRUCTURE
+
+\ Rust's SetupOptions: the remote root, empty for the account's own, and
+\ the initial config of a setup driven by flags.
+STRUCTURE setup-options
+   FIELD remote-root str
+   FIELD initial option<initial-config>
+;STRUCTURE
+
+\ Rust's AUTHORIZATION_CODE_LIMIT, in bytes.
+8192 constant CODE-LIMIT
 ARENA DRIVENS SERVICE:driven
 ARENA WRITERS JSON:writer
+ARENA LOCKS CONFIG:lock
 
 
 \ ---- errors
@@ -94,12 +132,22 @@ ARENA WRITERS JSON:writer
    {: h:^ hu:n :}
    LOG:;LINE LOG-OPEN s" help: " LOG:TEXT+ h hu LOG:TEXT+ ;
 
+\ Ends Rust's Usage after its fault: the pointer to --help.
+: USAGE-END ( -- )
+   s" Run `omabox --help` for usage." HELP
+   LOG:;LINE E-USAGE throw ;
+
 \ Rust's Usage: the fault, then the pointer to --help.
 : USAGE ( ^u8 n -- )
    {: m:^ mu:n :}
-   LOG-OPEN m mu LOG:TEXT+
-   s" Run `omabox --help` for usage." HELP
-   LOG:;LINE E-USAGE throw ;
+   LOG-OPEN m mu LOG:TEXT+ USAGE-END ;
+
+\ Rust's dropbox_root fault, a Usage.
+: ROOT-FAULT ( -- )
+   LOG-OPEN
+   s" the Dropbox root must be empty or an absolute folder path" LOG:TEXT+
+   s"  such as /Work, with no trailing slash and no empty, . or .."
+   LOG:TEXT+ s"  parts" LOG:TEXT+ USAGE-END ;
 
 \ Rust's Io for the operation; the cause stays FS:ERRNO's on entry.
 : IO-FAILED ( ^u8 n -- )
@@ -146,6 +194,63 @@ ARENA WRITERS JSON:writer
    LOG:TEXT+
    s" The change is kept. Run `omabox status` and `omabox logs` to see why, then `omabox resume`."
    HELP LOG:;LINE cause FS:CAUSE! E-START-AFTER-CHANGE throw ;
+
+\ Ends the help line, then throws code with cause as FS:ERRNO.
+: FAIL ( n n -- )
+   {: code:n cause:n :}
+   LOG:;LINE cause FS:CAUSE! code throw ;
+
+: INSPECT-FAILED ( n -- )
+   {: cause:n :}
+   LOG-OPEN s" could not inspect the Omabox configuration path" LOG:TEXT+
+   s" Ensure the XDG configuration location is accessible" HELP
+   s"  and retry." LOG:TEXT+
+   E-INSPECT-CONFIG cause FAIL ;
+
+: CONFIG-EXISTS ( -- )
+   LOG-OPEN s" Omabox configuration already exists" LOG:TEXT+
+   s" Use `omabox settings` or `omabox settings set-root PATH`" HELP
+   s"  to change configuration." LOG:TEXT+
+   E-CONFIG-EXISTS 0 FAIL ;
+
+\ Rust's Lock, after CONFIG's own lines; a code of another package goes
+\ on.
+: LOCK-FAILED ( n -- )
+   {: code:n :}
+   code CONFIG-CODE? 0= if code throw then
+   FS:ERRNO {: cause:n :}
+   LOG-OPEN s" could not acquire the Omabox daemon lock" LOG:TEXT+
+   s" Stop any manually started Omabox daemon, then retry." HELP
+   E-LOCK cause FAIL ;
+
+\ Rust's Journal for the operation, in place of the code it caught, after
+\ the lines its cause logged: JOURNAL's, SQLITE's or the file system's,
+\ all Rust's JournalError.
+: JOURNAL-FAILED ( n ^u8 n -- )
+   {: op:^ opu:n :} drop
+   FS:ERRNO {: cause:n :}
+   LOG-OPEN s" could not " LOG:TEXT+ op opu LOG:TEXT+
+   s" Ensure the Omabox state directory is accessible and retry." HELP
+   E-JOURNAL cause FAIL ;
+
+: INVALID-CODE ( -- )
+   LOG-OPEN
+   s" the Dropbox authorization code was empty or too long" LOG:TEXT+
+   s" Paste the short-lived code shown by Dropbox and retry setup." HELP
+   E-INVALID-CODE 0 FAIL ;
+
+: NO-DEFAULT-ROOT ( -- )
+   LOG-OPEN s" HOME must be an absolute path to find the default" LOG:TEXT+
+   s"  sync root ~/Dropbox" LOG:TEXT+
+   s" Set HOME, or pass --sync-root PATH." HELP
+   E-NO-DEFAULT-ROOT 0 FAIL ;
+
+: CREATE-ROOT-FAILED ( str n -- )
+   {: root cause:n :}
+   LOG-OPEN s" could not create the default sync root " LOG:TEXT+
+   root str> LOG:TEXT+
+   s" Create the directory, or pass --sync-root PATH." HELP
+   E-CREATE-DEFAULT-ROOT cause FAIL ;
 
 
 \ ---- output
@@ -251,6 +356,93 @@ ARENA WRITERS JSON:writer
    c cu s" settings" STR= if argc arg PARSE-SETTINGS exit then
    c cu s" service" STR= if argc arg PARSE-SERVICE exit then
    c cu ALONE argc SOLE ;
+
+\ Rust's is_option.
+: OPTION-ARG? ( ^u8 n -- bool ) 2 min s" --" STR= ;
+
+\ Rust's utf8: the bytes, or Usage with the fault m.
+: VALID-ARG ( ^u8 n ^u8 n -- str )
+   {: a:^ u:n m:^ mu:n :}
+   a u UTF8:VALID? 0= if m mu USAGE then
+   a u >str ;
+
+\ Rust's dropbox_root, refused before setup sends the user through the
+\ browser.
+: REMOTE-ROOT ( ^u8 n -- str )
+   s" the Dropbox root must be valid UTF-8" VALID-ARG {: r :}
+   r str> DROPBOX:ROOT-PATH? 0= if ROOT-FAULT then
+   r ;
+
+: NO-STR ( -- option<str> ) OPTION:NONE ;
+
+\ The value after the option at index at.
+: VALUE ( n [ n -- ^u8 n ] n -- ^u8 n )
+   {: argc:n arg at:n :}
+   at 1+ argc >= if s" a setup option is missing its value" USAGE then
+   at 1+ arg execute ;
+
+\ Refuses an option given before.
+: UNSET ( option<str> -- )
+   MATCH option
+      some OF
+         drop s" a setup option was provided more than once" USAGE
+      ENDOF
+      none OF ENDOF
+   ;MATCH ;
+
+\ The option at index at and its value taken into the sync root, app
+\ key and remote root given so far.
+: STEP ( option<str> option<str> option<str> n [ n -- ^u8 n ] n
+     -- option<str> option<str> option<str> )
+   {: sync key remote argc:n arg at:n :}
+   at arg execute {: o:^ ou:n :}
+   o ou UTF8:VALID? 0= if s" setup options must be valid UTF-8" USAGE then
+   o ou s" --sync-root" STR= if
+      sync UNSET argc arg at VALUE >str OPTION:SOME key remote exit
+   then
+   o ou s" --app-key" STR= if
+      key UNSET sync argc arg at VALUE
+      s" the Dropbox app key must be valid UTF-8" VALID-ARG OPTION:SOME
+      remote exit
+   then
+   o ou s" --remote-root" STR= if
+      remote UNSET sync key argc arg at VALUE REMOTE-ROOT OPTION:SOME exit
+   then
+   s" unknown setup option" USAGE ;
+
+\ The sync root, app key and remote root the options from index 1 give.
+: SETUP-FLAGS ( n [ n -- ^u8 n ] -- option<str> option<str> option<str> )
+   {: argc:n arg :}
+   NO-STR NO-STR NO-STR
+   argc 1 ?do argc arg i STEP 2 +loop ;
+
+: FLAGGED ( option<str> option<str> option<str> -- setup-options )
+   {: sync key remote :}
+   key MATCH option
+      some OF ENDOF
+      none OF s" flag-driven setup requires --app-key" USAGE ENDOF
+   ;MATCH {: k :}
+   remote MATCH option
+      some OF ENDOF
+      none OF s" " >str ENDOF
+   ;MATCH
+   sync k INITIAL-CONFIG-MAKE OPTION:SOME SETUP-OPTIONS-MAKE ;
+
+: NO-INITIAL ( -- option<initial-config> ) OPTION:NONE ;
+
+\ Setup of the stored configuration, for the remote root.
+: STORED-SETUP ( str -- setup-options ) NO-INITIAL SETUP-OPTIONS-MAKE ;
+
+\ Rust's parse_setup over the whole argument list, index 0 being setup.
+: PARSE-SETUP ( n [ n -- ^u8 n ] -- setup-options )
+   {: argc:n arg :}
+   argc 1 = if s" " >str STORED-SETUP exit then
+   argc 2 = if
+      1 arg execute OPTION-ARG? 0= if
+         1 arg execute REMOTE-ROOT STORED-SETUP exit
+      then
+   then
+   argc arg SETUP-FLAGS FLAGGED ;
 
 
 \ ---- the configuration
@@ -418,6 +610,155 @@ ARENA WRITERS JSON:writer
    change ar CHANGED {: left changed:n :}
    c v ar RESTORED {: launched:bool restored:n :}
    c n nu d du left changed launched restored ar DECIDED ;
+
+
+\ ---- setup's local steps
+
+\ A path FS refuses before stat: too long, or holding a NUL byte.
+: STAT-CAUGHT ( n -- )
+   {: code:n :}
+   code E-FS-PATH = if FS:ENAMETOOLONG INSPECT-FAILED then
+   code E-FFI-NUL = if 0 INSPECT-FAILED then
+   code throw ;
+
+\ Rust's refuse_existing_config: Path::try_exists is false only where
+\ stat answers ENOENT.
+: REFUSE-EXISTING ( CONFIG:abs-path -- )
+   CONFIG:ABS-PATH>STR {: p :}
+   false [: drop p str> FS:TRY-STAT ;] catch {: code:n :}
+   code 0<> if code STAT-CAUGHT then
+   if CONFIG-EXISTS then
+   FS:ERRNO FS:ENOENT <> if FS:ERRNO INSPECT-FAILED then ;
+
+\ Rust's Path::is_absolute.
+: ABSOLUTE? ( str -- bool )
+   str> {: a:^ u:n :}
+   u 0= if false exit then
+   a c@ [char] / = ;
+
+\ dir/Dropbox, joined as PathBuf::join: no second separator.
+: DROPBOX-IN ( str ^ARENA:arena -- str )
+   {: h ar :}
+   SB-RESET h str> SB-APPEND
+   h str> + 1- c@ [char] / <> if [char] / SB-APPEND-C then
+   s" Dropbox" SB-APPEND SB$ ar KEPT ;
+
+\ The directory made 0700, under the umask; an entry already there
+\ stays, as Rust's AlreadyExists does.
+: MADE ( str -- )
+   {: root :}
+   [: root str> FS:MODE-PRIVATE-DIR FS:MKDIR-MODE ;] catch {: code:n :}
+   code 0= if exit then
+   code E-FS-IO = FS:ERRNO FS:EEXIST = and if exit then
+   code E-FS-PATH = if root FS:ENAMETOOLONG CREATE-ROOT-FAILED then
+   code E-FFI-NUL = if root 0 CREATE-ROOT-FAILED then
+   code E-FS-IO = if root FS:ERRNO CREATE-ROOT-FAILED then
+   code throw ;
+
+\ Rust's create_default_sync_root for the home: home/Dropbox.
+: HOME-ROOT ( option<str> ^ARENA:arena -- str )
+   {: home ar :}
+   home MATCH option
+      some OF ENDOF
+      none OF NO-DEFAULT-ROOT ENDOF
+   ;MATCH {: h :}
+   h ABSOLUTE? 0= if NO-DEFAULT-ROOT then
+   h ar DROPBOX-IN {: root :}
+   root MADE
+   root ;
+
+\ HOME/Dropbox, made where missing; a root named with --sync-root
+\ must already exist, so a mistyped one fails instead.
+: DEFAULT-ROOT ( ^ARENA:arena -- str )
+   {: ar :}
+   s" HOME" GETENV {: a:^ u:n :}
+   a NULL-PTR = if NO-STR else a u >str OPTION:SOME then
+   ar HOME-ROOT ;
+
+\ The index of the first LF in the bytes from..to, or -1.
+: LF-AT ( ^u8 n n -- n )
+   {: b:^ from:n to:n :}
+   to from ?do b i + c@ 10 = if i unloop exit then loop -1 ;
+
+\ Reads into the buffer through the first LF, at most cap bytes: the
+\ bytes read up to and including that LF.
+: READ-LINE ( fd ^u8 n -- n )
+   {: f:fd b:^ cap:n :}
+   0 begin dup cap < while
+      {: len:n :}
+      f FD>N b len + cap len - read {: k:n :}
+      k 0= if len exit then
+      k 0 < if
+         FS:ERRNO FD:EINTR# <> if s" read the authorization code" IO-FAILED then
+         len
+      else
+         b len len k + LF-AT {: lf:n :}
+         lf 0 >= if lf 1+ exit then
+         len k +
+      then
+   repeat ;
+
+\ Rust's str::trim: the bytes inside the leading and trailing Unicode
+\ White_Space.
+: TRIMMED ( ^u8 n -- ^u8 n )
+   {: a:^ u:n :}
+   u 0 0 begin dup u < while
+      {: start:n end:n at:n :}
+      a u at UTF8:NEXT MATCH UTF8:scalar-step
+         scalar OF {: cp:n next:n :}
+            cp UNICODE-CLASS:WHITE-SPACE? if start end next
+            else start at min next next then
+         ENDOF
+         raw-byte OF {: byte:n next:n :} start at min next next ENDOF
+      ;MATCH
+   repeat drop {: start:n end:n :}
+   start end >= if a 0 exit then
+   a start + end start - ;
+
+\ Rust's read_authorization_code: one line of at most CODE-LIMIT bytes
+\ and its LF, read from f and trimmed.
+: READ-CODE ( fd ^ARENA:arena -- str )
+   {: f:fd ar :}
+   ar CODE-LIMIT 1+ ARENA:ALLOC drop {: b:^ :}
+   f b CODE-LIMIT 1+ READ-LINE {: u:n :}
+   u CODE-LIMIT 1+ = if b u + 1- c@ 10 <> if INVALID-CODE then then
+   b u UTF8:VALID? 0= if INVALID-CODE then
+   b u TRIMMED {: c:^ cu:n :}
+   cu 0= cu CODE-LIMIT > or if INVALID-CODE then
+   c cu >str ;
+
+\ Rust's InstanceLock::acquire for the paths.
+: LOCKED ( ^CONFIG:paths ^ARENA:arena -- CONFIG:lock )
+   {: p ar :}
+   ar LOCKS-NEW {: slot :}
+   [: p CONFIG:LOCK slot ! ;] catch {: code:n :}
+   code 0<> if code LOCK-FAILED then
+   slot @ ;
+
+\ CONFIG:WRITE-NEW, whose refusal of an existing file is Rust's
+\ InitialConfigExists.
+: WRITTEN ( ^CONFIG:config ^ARENA:arena -- ^VEC:vector<STALE:leftover> )
+   {: c ar :}
+   NULL-PTR [: drop c ar CONFIG:WRITE-NEW ;] catch {: v code:n :}
+   code 0= if v exit then
+   code CONFIG:E-ALREADY-EXISTS = if CONFIG-EXISTS then
+   code s" write initial configuration" CONFIG-FAILED ;
+
+: HELD ( ^CONFIG:config bool [ -- ] ^ARENA:arena
+     -- ^VEC:vector<STALE:leftover> )
+   {: c w:bool bind ar :}
+   w if c CONFIG:PATHS ar CONFIG:CONFIG-FILE REFUSE-EXISTING then
+   bind execute
+   w 0= if ar ARENA:ALLOCATOR 0 [type] STALE:leftover VEC:NEW exit then
+   c ar WRITTEN ;
+
+\ Rust's complete_setup: under the daemon lock, bind, then write a new
+\ config where w asks for one and none appeared since setup began.
+: COMPLETE-SETUP ( ^CONFIG:config bool [ -- ] ^ARENA:arena
+     -- ^VEC:vector<STALE:leftover> )
+   {: c w:bool bind ar :}
+   c CONFIG:PATHS ar LOCKED {: l :}
+   [: c w bind ar HELD ;] [: l CONFIG:UNLOCK ;] finally ;
 
 
 \ ---- running
