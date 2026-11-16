@@ -73,6 +73,10 @@
 \ - later_planned_download_does_not_reclaim_an_active_slot, plan a held
 \   blocked an hour where Rust holds its download, its slot holding a
 \   checkpoint that a second step resumes once a is unblocked
+\ The pass against the fake Dropbox, Rust's test of the same name:
+\ - one_reconciliation_pass_synchronizes_files_in_both_directions, with
+\   replayed 2 and blocked 0 as its download installs in the pass, no
+\   account request, and the upload's argument as DROPBOX writes it
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -1989,7 +1993,6 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
 
 \ ---- the replay step against the fake Dropbox ---------------------
 
-ARENA RUNS run
 4096 constant READ-CAP
 READ-CAP BUFFER: READ-BUF
 
@@ -2771,13 +2774,99 @@ XS-SIZE BUFFER: XS
    ar ROOT-SWAP-AFTER-REPLAY-VALIDATION-NEVER-TOUCHES-THE-REPLACEMENT
    ar LATER-PLANNED-DOWNLOAD-DOES-NOT-RECLAIM-AN-ACTIVE-SLOT ;
 
+\ ---- the pass against the fake Dropbox -----------------------------
+
+: UPLOAD$ ( -- ^u8 n ) s" local upload" ;
+: REMOTE$ ( -- ^u8 n ) s" remote download" ;
+
+\ The pass's report; any other outcome ends the run.
+: COMPLETE ( outcome -- report )
+   MATCH outcome
+      complete OF ENDOF
+      fresh OF s" the stable fixture asked a fresh observation" FAILED ENDOF
+      root-changed OF s" the stable fixture changed its root" FAILED ENDOF
+   ;MATCH ;
+
+\ The recovery directory made in the case's directory d, and the link's
+\ Dropbox root set to the whole account, as every pass test needs.
+: PASS-READY ( str ^run -- str )
+   {: d:str x :}
+   d s" recovery" x RUN-ARENA @ INSIDE {: rec:str :}
+   rec str> FS:MAKE-DIR
+   s" " >str x RUN-LINK @ REPLAY-LINK:ROOT !
+   rec ;
+
+\ PASS over the run, with the recovery directory rec.
+: PASSED ( ^run str -- outcome )
+   {: x rec:str :}
+   x RUN-JOURNAL @ x RUN-LINK @ x RUN-ROOT @ x RUN-STAGING @ rec
+   x RUN-ARENA @ PASS ;
+
+\ Rust's fixture: upload.txt in the root, download.txt served and on
+\ the one listing page; answers the recovery directory.
+: BOTH-WAYS ( str ^run -- str )
+   {: d:str x :}
+   x RUN-ARENA @ {: ar :}
+   d x PASS-READY {: rec:str :}
+   x s" upload.txt" IN-ROOT str> UPLOAD$ FS:WRITE-ALL
+   s" download.txt" s" rev-download" REMOTE$ ar SERVES
+   REMOTE$ ar IDENTITY {: h:DROPBOX:hash :}
+   [: s" /download.txt" s" /download.txt" s" rev-download" h FILE-JSON+ ;]
+   ar ENTRIES s" cursor-complete" false PAGE
+   rec ;
+
+: REPORTS ( report -- )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   replayed 2 T= planned 2 T= blocked 0 T= conflicts 0 T= ;
+
+\ The baseline at path p is present as rem.
+: BASELINE-AT ( ^run ^u8 n MODEL:remote -- )
+   {: x p:^ u:n rem :}
+   x RUN-JOURNAL @ p u DISPLAY x RUN-ARENA @ JOURNAL:BASELINE
+   STORED-BASELINE rem MODEL-BASELINE:PRESENT MODEL:BASELINE= TTRUE ;
+
+\ The upload's argument as DROPBOX writes it, for content h.
+: UPLOAD-ARG$ ( DROPBOX:hash -- ^u8 n )
+   {: h:DROPBOX:hash :}
+   SB-RESET S\" {\qpath\q:\q/upload.txt\q,\qmode\q:\qadd\q," SB-APPEND
+   S\" \qautorename\q:false,\qstrict_conflict\q:true," SB-APPEND
+   S\" \qcontent_hash\q:\q" SB-APPEND
+   h DROPBOX:HASH>STR str> SB-APPEND S\" \q}" SB-APPEND SB$ ;
+
+: PASS-SEEN$ ( -- ^u8 n )
+   s" /2/files/list_folder /2/files/download /2/files/upload" ;
+
+: ONE-RECONCILIATION-PASS-SYNCHRONIZES-FILES-IN-BOTH-DIRECTIONS
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" one_reconciliation_pass_synchronizes_files_in_both_directions"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x BOTH-WAYS {: rec:str :}
+   x rec PASSED COMPLETE REPORTS
+   x REPLAY-STEP REPORTED COMPLETED 0 T=
+   x s" download.txt" IN-ROOT REMOTE$ HOLDS-BYTES
+   x s" download.txt" REMOTE$ s" rev-download" ar REMOTE-FILE BASELINE-AT
+   x s" upload.txt" UPLOAD$ s" 01701" ar REMOTE-FILE BASELINE-AT
+   x PENDING-OF VEC:COUNT 0 T=
+   x RUN-JOURNAL @ ar JOURNAL:CONFLICTS VEC:COUNT 0 T=
+   TEST-DROPBOX:SEEN$ PASS-SEEN$ T$=
+   TEST-DROPBOX:ARG-SENT$ UPLOAD$ ar IDENTITY UPLOAD-ARG$ T$=
+   d x STEP-GONE ;
+
+: PASS-CASES ( ^ARENA:arena -- )
+   ONE-RECONCILIATION-PASS-SYNCHRONIZES-FILES-IN-BOTH-DIRECTIONS ;
+
 : SERVED ( ^ARENA:arena -- )
    {: ar :}
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
    s" " TEST-DROPBOX:ROOT!
    ar OPENED MAIN !
    ACCOUNTED
-   [: ar REFRESH-CASES ar STEP-CASES ;] [: MAIN @ DROPBOX:CLOSE ;]
+   [: ar REFRESH-CASES ar STEP-CASES ar PASS-CASES ;]
+   [: MAIN @ DROPBOX:CLOSE ;]
    finally ;
 
 

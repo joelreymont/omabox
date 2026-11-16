@@ -3541,4 +3541,332 @@ ENUM live-step held superseded fresh ;ENUM
    pl pl DECIDE-EACH dup OK? 0= if exit then
    drop pl RECORD-PLANNING construct pass-event ok ;
 
+
+\ ---- the pass ------------------------------------------------------
+
+public
+
+\ Rust's ReconcileReport: blocked counts the distinct live paths,
+\ sync-errors the distinct paths replay could not settle.
+STRUCTURE report
+   FIELD replayed n
+   FIELD noops n
+   FIELD planned n
+   FIELD blocked n
+   FIELD sync-errors n
+   FIELD conflicts n
+;STRUCTURE
+
+\ Rust's ReconcileOutcome: fresh asks for a new scan at once,
+\ root-changed says the configured root is not the journal's.
+ENUM outcome
+   VARIANT complete FIELD report report ;VARIANT
+   VARIANT fresh ;VARIANT
+   VARIANT root-changed ;VARIANT
+;ENUM
+
+private
+
+ARENA RUNS run
+
+\ One pass; each field is set by the state that makes it.
+STRUCTURE pass DERIVE addr
+   FIELD run ^run
+   FIELD recovery str
+   FIELD records ^VEC:vector<MODEL:local-record>
+   FIELD recovered ^REPLAY:replay-report
+   FIELD planning ^planning
+   FIELD applied ^REPLAY:replay-report
+   FIELD report report
+;STRUCTURE
+
+ARENA PASSES pass
+
+\ The answers of RECOVER and LIST-REMOTE, which never ask a new scan.
+ENUM step-event ok root-changed ;ENUM
+
+ENUM pass-state DERIVE eq
+   settling recovering observing listing deciding applying
+   complete stale unrooted ;ENUM
+
+: JOURNAL@ ( ^pass -- JOURNAL:journal ) PASS-RUN @ RUN-JOURNAL @ ;
+: ARENA@ ( ^pass -- ^ARENA:arena ) PASS-RUN @ RUN-ARENA @ ;
+
+\ A case collision's answer before the scan: changed only names a
+\ path the scan observes again.
+: PUBLISHED-SETTLED ( case-collision-resolution -- pass-event )
+   MATCH case-collision-resolution
+      none OF construct pass-event ok ENDOF
+      renamed OF drop construct pass-event fresh ENDOF
+      changed OF drop construct pass-event ok ENDOF
+      root-changed OF construct pass-event root-changed ENDOF
+   ;MATCH ;
+
+: SCAN-SETTLED ( case-collision-resolution -- pass-event )
+   MATCH case-collision-resolution
+      none OF construct pass-event ok ENDOF
+      renamed OF drop construct pass-event fresh ENDOF
+      changed OF drop construct pass-event fresh ENDOF
+      root-changed OF construct pass-event root-changed ENDOF
+   ;MATCH ;
+
+: RESOLVED
+   ( ^pass ^VEC:vector<MODEL:local-record>
+     -- case-collision-resolution )
+   {: x records :}
+   x JOURNAL@ x PASS-RUN @ ROOT$ records x ARENA@
+   RESOLVE-CASE-COLLISION ;
+
+: SETTLE-PUBLISHED ( ^pass -- pass-event )
+   {: x :}
+   x x JOURNAL@ x ARENA@ JOURNAL:LOCAL-INVENTORY RESOLVED
+   PUBLISHED-SETTLED ;
+
+: RECOVER ( ^pass -- step-event )
+   {: x :}
+   x PASS-RUN @ REPLAY-STEP MATCH replay-step
+      root-changed OF construct step-event root-changed ENDOF
+      report OF x PASS-RECOVERED ! construct step-event ok ENDOF
+   ;MATCH ;
+
+: NO-SCAN ( -- LOCAL:scan-publication )
+   LOCAL-SCAN--PUBLICATION:ROOT-CHANGED ;
+: DROP-SCAN ( LOCAL:scan-publication -- ) drop ;
+: SCAN-CONVERTS? ( n n -- bool ) drop LOCAL:E-CHANGED = ;
+
+\ LOCAL:SCAN-AND-PUBLISH of the root, and the code it threw, else 0.
+: SCANNED ( ^pass -- LOCAL:scan-publication n )
+   {: x :}
+   x PASS-RUN @ {: r :}
+   NO-SCAN [: DROP-SCAN r RUN-JOURNAL @ r ROOT$ r RUN-ARENA @
+      LOCAL:SCAN-AND-PUBLISH ;]
+   ['] SCAN-CONVERTS? LOCAL:CONVERTING ;
+
+: SCAN-OBSERVED ( LOCAL:scan-publication ^pass -- pass-event )
+   {: x :}
+   MATCH LOCAL:scan-publication
+      published OF LOCAL:SCAN-OBSERVATIONS {: records :}
+         records x PASS-RECORDS !
+         x records RESOLVED SCAN-SETTLED
+      ENDOF
+      root-changed OF construct pass-event root-changed ENDOF
+   ;MATCH ;
+
+\ A file that changes while it is read asks for a new scan.
+: OBSERVE ( ^pass -- pass-event )
+   {: x :}
+   x SCANNED {: code:n :}
+   code 0= if x SCAN-OBSERVED exit then
+   DROP-SCAN
+   code LOCAL:E-CHANGED = if construct pass-event fresh exit then
+   code throw ;
+
+: LIST-REMOTE ( ^pass -- step-event )
+   {: x :}
+   x PASS-RUN @ {: r :}
+   r RUN-LINK @ REPLAY-LINK:ROOT @ r RUN-ARENA @ NEW-LISTING-ROOT
+   {: root :}
+   r RUN-JOURNAL @ r RUN-LINK @ root r RUN-ARENA @ REFRESH-INVENTORY
+   r ROOT-ACTIVE? if construct step-event ok exit then
+   construct step-event root-changed ;
+
+: PLAN ( ^pass -- pass-event )
+   {: x :}
+   x PASS-RUN @ x PASS-RECORDS @ PLAN-PATHS {: pl ev :}
+   pl x PASS-PLANNING ! ev ;
+
+: FRESH-REQUIRED? ( REPLAY:replay-blocked -- bool )
+   MATCH REPLAY:replay-blocked
+      durable-plan OF drop drop false ENDOF
+      local-object OF drop false ENDOF
+      fresh-observation-required OF drop true ENDOF
+      download-required OF drop drop false ENDOF
+      stage-destination-occupied OF drop drop false ENDOF
+      precondition-changed OF drop drop false ENDOF
+      remote-operation OF drop false ENDOF
+      remote-pending OF drop false ENDOF
+      remote-object OF drop false ENDOF
+      sync-error OF drop drop false ENDOF
+   ;MATCH ;
+
+: ASKS-FRESH? ( ^REPLAY:replay-report -- bool )
+   BLOCKS {: bs :}
+   bs VEC:COUNT 0 ?do
+      bs i VEC:AT @ FRESH-REQUIRED? if true unloop exit then
+   loop
+   false ;
+
+: APPLY ( ^pass -- pass-event )
+   {: x :}
+   x PASS-RUN @ REPLAY-STEP MATCH replay-step
+      root-changed OF construct pass-event root-changed ENDOF
+      report OF {: rep :}
+         rep x PASS-APPLIED !
+         rep ASKS-FRESH? if
+            construct pass-event fresh
+         else
+            construct pass-event ok
+         then
+      ENDOF
+   ;MATCH ;
+
+\ Rust's replay_sync_error_path.
+: SYNC-ERROR-PATH ( REPLAY:replay-blocked -- option<MODEL:path> )
+   MATCH REPLAY:replay-blocked
+      durable-plan OF drop OPTION:SOME ENDOF
+      local-object OF drop NO-PATH ENDOF
+      fresh-observation-required OF drop NO-PATH ENDOF
+      download-required OF drop drop NO-PATH ENDOF
+      stage-destination-occupied OF drop drop NO-PATH ENDOF
+      precondition-changed OF drop drop NO-PATH ENDOF
+      remote-operation OF drop NO-PATH ENDOF
+      remote-pending OF drop NO-PATH ENDOF
+      remote-object OF drop NO-PATH ENDOF
+      sync-error OF drop OPTION:SOME ENDOF
+   ;MATCH ;
+
+: NTH$ ( ^VEC:vector<str> n -- ^u8 n ) VEC:AT @ str> ;
+
+: NTH< ( n n ^VEC:vector<str> -- bool )
+   {: x:n y:n v :}
+   v x NTH$ v y NTH$ STR< ;
+
+\ How many distinct byte strings v holds, counted in STR< order.
+: DISTINCT ( ^VEC:vector<str> ^ARENA:arena -- n )
+   {: v ar :}
+   v VEC:COUNT {: k:n :}
+   k 0= if 0 exit then
+   k [: v NTH< ;] ar ORDER {: idx :}
+   1 k 1 ?do
+      v idx i 1- VEC:AT @ NTH$ v idx i VEC:AT @ NTH$ STR= 0= if 1+ then
+   loop ;
+
+: HELD-COUNT ( ^pass -- n )
+   {: x :}
+   x ARENA@ [type] str NEW-VECTOR {: v :}
+   x PASS-PLANNING @ PLANNING-HELD @ {: held :}
+   held VEC:COUNT 0 ?do
+      held i VEC:AT @ MODEL:KEY>STR v VEC:PUSH !
+   loop
+   v x ARENA@ DISTINCT ;
+
+: ERROR-PATHS+ ( ^REPLAY:replay-report ^VEC:vector<str> -- )
+   {: rep v :}
+   rep BLOCKS {: bs :}
+   bs VEC:COUNT 0 ?do
+      bs i VEC:AT @ SYNC-ERROR-PATH MATCH option
+         none OF ENDOF
+         some OF MODEL:PATH>STR v VEC:PUSH ! ENDOF
+      ;MATCH
+   loop ;
+
+: SYNC-ERROR-COUNT ( ^pass -- n )
+   {: x :}
+   x ARENA@ [type] str NEW-VECTOR {: v :}
+   x PASS-RECOVERED @ v ERROR-PATHS+
+   x PASS-APPLIED @ v ERROR-PATHS+
+   v x ARENA@ DISTINCT ;
+
+: REPLAYED ( ^pass -- n )
+   {: x :}
+   x PASS-RECOVERED @ REPLAY-REPLAY--REPORT:COMPLETED-OPERATIONS @
+   x PASS-APPLIED @ REPLAY-REPLAY--REPORT:COMPLETED-OPERATIONS @ + ;
+
+: FILL-REPORT ( ^pass -- )
+   {: x :}
+   x PASS-PLANNING @ {: pl :}
+   x REPLAYED pl PLANNING-NOOP-COUNT @ pl PLANNING-PLANNED @
+   x HELD-COUNT x SYNC-ERROR-COUNT pl PLANNING-CONFLICT-COUNT @
+   RECONCILE-REPORT:MAKE x PASS-REPORT ! ;
+
+\ Every live plan's path is held, the ones planning kept included.
+: HOLD-LIVE ( ^pass -- )
+   {: x :}
+   x PASS-PLANNING @ {: pl :}
+   x PASS-RUN @ LIVE-PLANS {: v :}
+   v VEC:COUNT 0 ?do pl v i VEC:AT @ PENDING-KEY HELD+ loop ;
+
+: RETAINED? ( DROPBOX:hash ^VEC:vector<DROPBOX:hash> -- bool )
+   {: h:DROPBOX:hash kept :}
+   kept VEC:COUNT 0 ?do
+      kept i VEC:AT @ h DROPBOX:HASH= if true unloop exit then
+   loop
+   false ;
+
+\ Rust's reconcile_published after its last replay: the journal
+\ pruned, the report filled, then the unreferenced stages removed.
+: FINISH ( ^pass -- )
+   {: x :}
+   x JOURNAL@ {: j :}
+   j JOURNAL:PRUNE-COMPLETED-WORK drop
+   j x PASS-RECOVERY @ str> REPLAY:PRUNE-COMPLETED-RECOVERIES drop
+   j x ARENA@ JOURNAL:PENDING-UPLOAD-CONTENT {: kept :}
+   x HOLD-LIVE
+   x FILL-REPORT
+   x PASS-RUN @ STAGING$ [: kept RETAINED? ;] x ARENA@
+   LOCAL:REMOVE-UNREFERENCED-UPLOAD-STAGES drop ;
+
+\ One pass, after formal/SyncBehavior.tla. A pass that ends early
+\ leaves the journal's plans for the next pass to replay.
+FSM:DEFINE SYNC-BEHAVIOR ( ^pass ) pass-state pass-event
+   IN settling  SETTLE-PUBLISHED
+      ok            -  >recovering
+      fresh         -  >stale
+      root-changed  -  >unrooted
+   IN recovering  RECOVER ( step-event )
+      ok            -  >observing
+      root-changed  -  >unrooted
+   IN observing  OBSERVE
+      ok            -  >listing
+      fresh         -  >stale
+      root-changed  -  >unrooted
+   IN listing  LIST-REMOTE ( step-event )
+      ok            -  >deciding
+      root-changed  -  >unrooted
+   IN deciding  PLAN
+      ok            -  >applying
+      fresh         -  >stale
+      root-changed  -  >unrooted
+   IN applying  APPLY
+      ok            -  >complete
+      fresh         -  >stale
+      root-changed  -  >unrooted
+   FINAL complete  FINISH
+   FINAL stale     -
+   FINAL unrooted  -
+;DEFINE
+
+: NEW-RUN
+   ( JOURNAL:journal ^REPLAY:link str str ^ARENA:arena -- ^run )
+   {: j l root:str staging:str ar :}
+   ar RUNS-NEW {: r :}
+   j r RUN-JOURNAL ! l r RUN-LINK !
+   root r RUN-ROOT ! staging r RUN-STAGING ! ar r RUN-ARENA !
+   r ;
+
+\ SYNC-BEHAVIOR stops only in a final state.
+: ANSWER ( pass-state ^pass -- outcome )
+   {: s x :}
+   s construct pass-state complete PASS-STATE-EQ if
+      x PASS-REPORT @ construct outcome complete exit
+   then
+   s construct pass-state stale PASS-STATE-EQ if
+      construct outcome fresh exit
+   then
+   construct outcome root-changed ;
+
+public
+
+\ Rust's reconcile_once: replays the plans of earlier passes,
+\ publishes both complete inventories and plans every known path once.
+: PASS
+   ( JOURNAL:journal ^REPLAY:link str str str ^ARENA:arena -- outcome )
+   {: j l root:str staging:str recovery:str ar :}
+   j l root staging ar NEW-RUN {: r :}
+   ar PASSES-NEW {: x :}
+   r x PASS-RUN ! recovery x PASS-RECOVERY !
+   construct pass-state settling
+   begin x swap SYNC-BEHAVIOR-STEP until
+   x ANSWER ;
+
 ;package
