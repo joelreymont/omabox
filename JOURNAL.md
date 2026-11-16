@@ -810,3 +810,71 @@ could start without waiting for LOCAL.
 Lane times: the LOCAL merge 9.6 min with its decisions in the brief
 (the first merge worker, without them, stopped on seven names); the
 checker hunt 7.3 min.
+
+## 2026-11-16: An answer at another path, and a body pulled
+
+Dropbox can answer an upload with an entry whose `path_lower` is not
+the path's lowercase. Rust reads that as an answer it cannot trust. It
+asks get_metadata, and if the path still differs it rejects that one
+path with PathMismatch. The Habu port threw E-ANSWER, which ends the
+sync pass. The next pass meets the same plan, so one such file would
+stop all unrelated work. It is now confirmed the way a lost answer is,
+and a mismatch refuses only that path. The review of that fix found a
+hole in the machine. A `done` at another path moved to `confirming`
+through a row with no action, so the run's last reply was still
+`done`. When the confirmation then failed to find the file, the upload
+answered done. One action that sets the reply to retry closed it. In
+a table the gap shows as a `-` where an action belongs. In Rust the
+same mistake would be a match arm returning a stale variable.
+
+Rust's DROPBOX answers a mutation with MutationOutcome: applied,
+precondition changed, pending or rejected, each with the remote path's
+state. Habu's DROPBOX answers a reply (done, refused, retry,
+unlinked), and the design document leaves mapping a Dropbox tag to
+sync behaviour to the sync code. So REPLAY owns Rust's mutation
+vocabulary and builds it from DROPBOX's reply and its last entry. The
+client knows nothing of plans.
+
+Habu's DOWNLOAD pushed each chunk to a sink. LOCAL's stage words pull,
+through a reader `[ ^u8 n -- n ]`, as Rust's do through `Read`. LOCAL's
+words had four other callers and DOWNLOAD's sink had one, so DOWNLOAD
+now pulls too. Two things surfaced. The body now runs inside the
+transfer, so it can throw after the read that ended it. The one place
+that cancels a transfer on a throw would then cancel a finished one,
+and curl answers that with E-STATE in place of the body's code. It now
+cancels only a transfer still in flight. The second is a transfer lost
+mid-body. A Rust `read` returns `Err`, and the stage words keep that
+apart from end of file. A Habu reader answers a count, and 0 means the
+end. A lost transfer answered as 0 would reach LOCAL as a short file
+and fail its hash check, logged as a content mismatch. So the reader
+throws a private code, LOCAL's cleanup passes it through, and DOWNLOAD
+answers a lost transfer, as Rust's DownloadBody does.
+
+The pulled body then met the checker. DOWNLOAD handed its body
+quotation a reader quotation that read the fetch from a local. Habu
+refuses to pass such a quotation into a quotation parameter that is
+executed, because it cannot know the callee will not keep it. Passing
+one to a named word is allowed, because a word's use of its input is
+inferred. So the body now receives the fetch itself. The reader is a
+public word, READ-BODY, and the caller wraps it in a quotation in its
+own named word. That is Rust's shape too, where the body is a value
+that implements `Read`. The language has no way to declare a callback's
+quotation input borrowed, and that is what cost the extra public type.
+
+The stage-name fold hit the same limit as `upload_source_changed`
+before it. LOCAL threw E-OCCUPIED both for an object at a stage's name
+and for one at the destination. A Habu throw carries only its code, so
+the caller could not tell which was blocked. Rust's plan blocks the
+stage alone and goes on. The stage name's case is now an outcome,
+destination-occupied, and no longer a throw.
+
+LOCAL's review found tests the port had weakened or never ported, and
+two lanes restored them in parallel with the five code folds. One
+restored the weakened checks (eighteen), and the other ported nine
+scan tests Rust has. Seven lanes ran at once from one base; their merge
+is a separate lane, with the interactions each pair has written into
+its brief.
+
+Lane times: the path-mismatch fold 4.2 min; REPLAY's local conflict
+copy 4.8 min; REPLAY's local replay 6.6 min; the pull lane's first
+worker 3.9 min before it stopped on the cancel question.
