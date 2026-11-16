@@ -76,7 +76,11 @@
 \   and remote_delete_skips_backup_download_and_ambiguous_create_stays_pending,
 \   whose create's lost answer throws E-DROPBOX with a retry in the link
 \   and leaves its plan pending; a plan whose next operation is local is
-\   left pending, unblocked, with no request.
+\   left pending, unblocked, with no request; Rust's
+\   remote_replay_preserves_conflict_sides_without_a_backup_download,
+\   folder_delete_probe_failures_keep_the_plan_retry_safe_or_block_only_its_path,
+\   whose 503 throws E-DROPBOX with a retry and leaves its plan pending,
+\   and replay_does_not_block_a_conflict_whose_copy_parent_is_read_only.
 \ Run from the repository root: hb --load src/replay-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -2970,13 +2974,174 @@ ARENA FILE-CASES file-case
    j JOURNAL:CLOSE
    d GONE ;
 
+\ Rust's replace.txt below the root r: its baseline "common bytes" at
+\ old-rev, its local bytes, and the plan replacing old-rev with them.
+: REPLACE-PLAN ( JOURNAL:journal str ^ARENA:arena -- )
+   {: j r:str ar :}
+   s" common bytes" ar HASH-OF s" old-rev" REMOTE-OF {: old :}
+   j s" replace.txt" DISPLAY old MODEL-BASELINE:PRESENT ar
+   JOURNAL:RECORD-NOOP NOOP-RECORDED? TTRUE
+   r s" replace.txt" ar INSIDE str> s" new local bytes" FS:WRITE-ALL
+   j s" replace.txt" s" new local bytes" ar HASH-OF s" old-rev" AS-REV
+   MODEL-OPERATION:REPLACE-REMOTE ar PLANNED drop ;
+
+\ Dropbox's replace.txt, shown as v: "new remote bytes" at current-rev.
+: CURRENT-AT ( ^u8 n ^ARENA:arena -- MODEL:remote )
+   {: v:^ vu:n ar :}
+   s" new remote bytes" {: b:^ bu:n :}
+   b bu ar HASH-OF {: c:DROPBOX:hash :}
+   s" /replace.txt" v vu s" current-rev" c DROPBOX:HASH>STR str> bu
+   TEST-DROPBOX:FILE!
+   c s" current-rev" REMOTE-OF ;
+
+\ replace.txt's local conflict copy, relative to the root.
+: LOCAL-SIDE ( ^ARENA:arena -- ^u8 n )
+   {: ar :}
+   s" replace.txt" LOCAL-CONFLICT--SIDE:LOCAL s" new local bytes" ar
+   HASH-OF ar LOCAL:CONFLICT-RELATIVE-PATH ;
+
+\ The journal's one conflict: x at replace.txt, numbered 1.
+: CONFLICTED-AS ( JOURNAL:journal MODEL:conflict ^ARENA:arena -- )
+   {: j x ar :}
+   j ar JOURNAL:CONFLICTS {: v :}
+   v VEC:COUNT 1 T=
+   v VEC:COUNT 1 <> if exit then
+   v 0 VEC:AT @ JOURNAL-CONFLICT--RECORD:UNMAKE {: id p y :}
+   id 1 T=
+   p MODEL:PATH>STR str> s" replace.txt" T$=
+   y x MODEL:CONFLICT= TTRUE ;
+
+variable SIDES
+
+: SIDE? ( ^u8 n -- )
+   s" .omabox-conflict-" STARTS-WITH? if 1 SIDES +! then ;
+
+\ Rust's conflict_bytes: how many conflict copies the root r holds.
+: SIDES-IN ( str -- n )
+   {: r:str :}
+   0 SIDES !
+   r str> TEXT CAP FS-LIST:NAMES {: k:n :}
+   TEXT k begin dup 0 > while NEXT-NAME SIDE? repeat 2drop SIDES @ ;
+
+: REMOTE-REPLAY-PRESERVES-CONFLICT-SIDES-WITHOUT-A-BACKUP-DOWNLOAD
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" remote_replay_preserves_conflict_sides_without_a_backup_download"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   s" /Replace.txt" ar CURRENT-AT {: cur :}
+   s" current-rev" s" new remote bytes" TEST-DROPBOX:CONTENT!
+   ar UPLOAD-DIRS {: d:str r:str s:str j :}
+   j r ar REPLACE-PLAN
+   j r s ar REMOTE-REPLAYED {: rep :}
+   rep COMPLETED 1 T=
+   rep BLOCKS VEC:COUNT 0 T=
+   j ar JOURNAL:PENDING-PLANS VEC:COUNT 0 T=
+   j s" replace.txt" DISPLAY ar JOURNAL:BASELINE BASELINE-FILE
+   MODEL-REMOTE:UNMAKE {: h v :}
+   h DROPBOX:HASH>STR str>
+   s" common bytes" ar HASH-OF DROPBOX:HASH>STR str> T$=
+   v DROPBOX:REV>STR str> s" old-rev" T$=
+   s" new local bytes" ar HASH-OF MODEL-LOCAL:MAKE cur
+   MODEL-CONFLICT:DIVERGENT {: x :}
+   j x ar CONFLICTED-AS
+   j ar JOURNAL:PENDING-RECOVERIES VEC:COUNT 0 T=
+   j ar JOURNAL:COMPLETED-RECOVERIES VEC:COUNT 0 T=
+   r SIDES-IN 2 T=
+   r ar LOCAL-SIDE s" new local bytes" ar HOLDS
+   r s" replace.txt" s" new remote bytes" ar HASH-OF ar REMOTE-COPY
+   s" new remote bytes" ar HOLDS
+   TEST-DROPBOX:SEEN$
+   s" /2/files/upload /2/files/get_metadata /2/files/get_metadata /2/files/download"
+   T$=
+   TEST-DROPBOX:ARG-SENT$ S\" {\qpath\q:\qrev:current-rev\q}" T$=
+   j JOURNAL:CLOSE
+   d GONE ;
+
+\ Whether b is the durable plan at p, rejected by Dropbox with tag t.
+: REJECTED-AT? ( REPLAY:replay-blocked ^u8 n ^u8 n -- bool )
+   {: b p:^ pu:n t:^ tu:n :}
+   b MATCH REPLAY:replay-blocked
+      durable-plan OF {: at why :}
+         at MODEL:PATH>STR str> p pu STR= why BLOCKAGE$ t tu STR= and
+      ENDOF
+      local-object OF drop false ENDOF
+      fresh-observation-required OF drop false ENDOF
+      download-required OF drop drop false ENDOF
+      stage-destination-occupied OF drop drop false ENDOF
+      precondition-changed OF drop drop false ENDOF
+      remote-operation OF drop false ENDOF
+      remote-pending OF drop false ENDOF
+      remote-object OF drop false ENDOF
+      sync-error OF drop drop false ENDOF
+   ;MATCH ;
+
+: FOLDER-DELETE-PROBE-FAILURES-KEEP-THE-PLAN-RETRY-SAFE-OR-BLOCK-ONLY-ITS-PATH
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" folder_delete_probe_failures_keep_the_plan_retry_safe_or_block_only_its_path"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   503 s" " s" " s" {}" TEST-DROPBOX:SCRIPT!
+   ar GONE-PLAN {: d:str r:str s:str j :}
+   [: j r s ar REMOTE-REPLAYED drop ;] REPLAY:E-DROPBOX TTHROWSQ
+   LINK REPLAY-LINK:REPLY @ RETRY? TTRUE
+   j ar JOURNAL:PENDING-PLANS VEC:COUNT 1 T=
+   j ar JOURNAL:BLOCKED-PLANS VEC:COUNT 0 T=
+   s" restricted_content" LOOKUP-ERROR
+   j r s ar REMOTE-REPLAYED {: rep :}
+   rep COMPLETED 0 T=
+   rep BLOCKS VEC:COUNT 1 T=
+   rep BLOCKS 0 VEC:AT @ s" gone" s" rejected_by_dropbox" REJECTED-AT?
+   TTRUE
+   j ar JOURNAL:PENDING-PLANS VEC:COUNT 0 T=
+   j ar JOURNAL:BLOCKED-PLANS VEC:COUNT 1 T=
+   j s" gone" DISPLAY ar JOURNAL:BASELINE DIRECTORY? TTRUE
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/list_folder" T$=
+   j JOURNAL:CLOSE
+   d GONE ;
+
+\ The pass below the root r throws LOCAL's E-IO, its errno EACCES,
+\ read before the root's close clears it.
+: COPY-DENIED ( JOURNAL:journal str str ^ARENA:arena -- )
+   {: j r:str s:str ar :}
+   r OPEN-ROOT {: f:fd :}
+   [: [: j LINK f r str> s str> ar REPLAY:REPLAY-REMOTE-OPERATIONS-AT
+         drop ;] LOCAL:E-IO TTHROWSQ
+      FS:ERRNO FS:EACCES T= ;]
+   [: f FS:CLOSE-DIR ;] finally ;
+
+: REPLAY-DOES-NOT-BLOCK-A-CONFLICT-WHOSE-COPY-PARENT-IS-READ-ONLY
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" replay_does_not_block_a_conflict_whose_copy_parent_is_read_only"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   s" /replace.txt" ar CURRENT-AT {: cur :}
+   ar UPLOAD-DIRS {: d:str r:str s:str j :}
+   j r ar REPLACE-PLAN
+   r str> MODE-NO-WRITE FS:CHMOD-MODE
+   [: j r s ar COPY-DENIED ;]
+   [: r str> FS:MODE-PRIVATE-DIR FS:CHMOD-MODE ;] finally
+   j ar JOURNAL:BLOCKED-PLANS VEC:COUNT 0 T=
+   j ar JOURNAL:PENDING-PLANS VEC:COUNT 1 T=
+   r ar LOCAL-SIDE ar INSIDE str> FS:TRY-STAT TFALSE
+   r s" replace.txt" s" new local bytes" ar HOLDS
+   s" /2/files/upload /2/files/get_metadata" {: w:^ wu:n :}
+   TEST-DROPBOX:SEEN$ wu min w wu T$=
+   j JOURNAL:CLOSE
+   d GONE ;
+
 : LOOP-CASES ( ^ARENA:arena -- )
    {: ar :}
    ar REMOTE-REPLAY-CREATES-NESTED-PARENTS-BEFORE-THE-FILE
    ar ALREADY-ABSENT-DROPBOX-DIRECTORY-COMPLETES-ITS-REPLAYED-DELETE
    ar DROPBOX-FILE-AT-A-DELETED-DIRECTORY-PATH-RETIRES-THE-REPLAYED-DELETE
    ar REMOTE-DELETE-SKIPS-BACKUP-DOWNLOAD-AND-AMBIGUOUS-CREATE-STAYS-PENDING
-   ar A-LOCAL-OPERATION-WAITS-FOR-LOCAL-REPLAY ;
+   ar A-LOCAL-OPERATION-WAITS-FOR-LOCAL-REPLAY
+   ar REMOTE-REPLAY-PRESERVES-CONFLICT-SIDES-WITHOUT-A-BACKUP-DOWNLOAD
+   ar FOLDER-DELETE-PROBE-FAILURES-KEEP-THE-PLAN-RETRY-SAFE-OR-BLOCK-ONLY-ITS-PATH
+   ar REPLAY-DOES-NOT-BLOCK-A-CONFLICT-WHOSE-COPY-PARENT-IS-READ-ONLY ;
 
 
 : BRIDGE-CASES ( ^ARENA:arena -- )
