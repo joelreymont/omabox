@@ -26,8 +26,18 @@
 \ find, an upload confirmation Dropbox asks to wait on, a delete or
 \ create-folder conflict whose confirmation it asks to wait on, a conflict
 \ whose confirmation is at another path, and a delete it answers with a
-\ folder or a file at another rev. One server and one main client
-\ serve every case; a case that needs another config opens its own client.
+\ folder or a file at another rev. Tests of tests/dropbox_fake.rs run
+\ under their names: a_refused_grant_becomes_a_rejected_token,
+\ a_rotated_refresh_token_is_stored_before_the_new_token_is_published,
+\ an_unstored_rotation_stays_usable_and_is_retried,
+\ an_unrotated_refresh_never_touches_secret_service,
+\ sdk_expiry_refresh_reissues_the_route_with_the_same_client,
+\ long_poll_exposes_reset_and_rate_limit_outcomes,
+\ oauth_listing_longpoll_and_exact_download_use_documented_protocol,
+\ conditional_mutations_use_strict_documented_requests and
+\ verification_without_a_lowercase_path_is_invalid_metadata. One server
+\ and one main client serve every case; a case that needs another config
+\ opens its own client.
 \ DROPBOX's log lines go to stderr, but those a case checks, which are
 \ captured in TMPDIR, checked and removed. A stub in place of AIO's
 \ transfer fails the stage's reads. Each failed assertion prints its
@@ -407,13 +417,23 @@ variable REFUSALS
    s" ns-root" TEST-DROPBOX:ROOT! ;
 
 
-: EXPIRED-CASE ( -- )
-   s" expired token" T-LABEL
+\ The expired token's route is resent on the same client with the new
+\ token; neither the refresh nor the long poll after it carries a token.
+: SDK-EXPIRY-REFRESH-REISSUES-THE-ROUTE-WITH-THE-SAME-CLIENT ( -- )
+   s" sdk_expiry_refresh_reissues_the_route_with_the_same_client" T-LABEL
    TEST-DROPBOX:RESET
    TEST-DROPBOX:EXPIRE
    MAIN @ DROPBOX:ACCOUNT DONE? ASSERT
    TEST-DROPBOX:SEEN$
-   s" /2/users/get_current_account /oauth2/token /2/users/get_current_account" T$= ;
+   s" /2/users/get_current_account /oauth2/token /2/users/get_current_account" T$=
+   SB-RESET s" Bearer " SB-APPEND TEST-DROPBOX:ISSUED$ SB-APPEND
+   TEST-DROPBOX:AUTH$ SB$ T$=
+   false 0 TEST-DROPBOX:POLL!
+   s" c3" 30 MAIN @ DROPBOX:WAIT DONE? ASSERT
+   MAIN @ DROPBOX:CHANGED? TFALSE
+   TEST-DROPBOX:SEEN$
+   s" /2/users/get_current_account /oauth2/token /2/users/get_current_account /2/files/list_folder/longpoll" T$=
+   TEST-DROPBOX:LEAKED? TFALSE ;
 
 
 \ ---- the log a case checks
@@ -1027,15 +1047,22 @@ variable GOT-U
    MAIN @ DROPBOX:BACKOFF 5 T= ;
 
 
-\ A long poll on a cursor Dropbox no longer takes is refused, unread.
-: POLL-RESET-CASE ( -- )
-   s" long poll reset" T-LABEL
+\ A long poll on a cursor Dropbox no longer takes is refused, unread; one
+\ rate limited waits the larger of Retry-After and the body's retry_after.
+: LONG-POLL-EXPOSES-RESET-AND-RATE-LIMIT-OUTCOMES ( -- )
+   s" long_poll_exposes_reset_and_rate_limit_outcomes" T-LABEL
    LISTING
    409 s" " s" "
    S\" {\qerror_summary\q:\qreset/\q,\qerror\q:{\q.tag\q:\qreset\q}}"
    TEST-DROPBOX:SCRIPT!
+   429 s" Retry-After" s" 17"
+   S\" {\qerror_summary\q:\qtoo_many_requests/...\q,\qerror\q:{\qreason\q:{\q.tag\q:\qtoo_many_requests\q},\qretry_after\q:1}}"
+   TEST-DROPBOX:SCRIPT!
    s" c3" 30 MAIN @ DROPBOX:WAIT DROPBOX-ERROR:RESET REFUSED? ASSERT
-   TEST-DROPBOX:SEEN$ s" /2/files/list_folder/longpoll" T$= ;
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder/longpoll" T$=
+   s" c4" 30 MAIN @ DROPBOX:WAIT RETRY-MS 17000 T=
+   TEST-DROPBOX:SEEN$
+   s" /2/files/list_folder/longpoll /2/files/list_folder/longpoll" T$= ;
 
 
 \ ---- files/download
@@ -1816,6 +1843,51 @@ variable READ-COUNT
    link DROPBOX:CLOSE ;
 
 
+\ The documented protocol in order: a code exchange and the account on a
+\ client with no root, as linking has none yet; then the root's metadata
+\ under its Path-Root, two pages, the second a file that is not
+\ downloadable, a long poll and an exact download.
+: OAUTH-LISTING-LONGPOLL-AND-EXACT-DOWNLOAD-USE-DOCUMENTED-PROTOCOL ( -- )
+   s" oauth_listing_longpoll_and_exact_download_use_documented_protocol"
+   T-LABEL
+   LISTING s" " TEST-DROPBOX:ROOT!
+   s" fake-code" s" fake-verifier" TEST-DROPBOX:GRANT!
+   s" " s" " OPENED {: link :}
+   s" fake-code" s" fake-verifier" link DROPBOX:EXCHANGE DONE? ASSERT
+   link DROPBOX:ACCOUNT DONE? ASSERT
+   link DROPBOX:ACCOUNT-ID s" dbid:account" T$=
+   link DROPBOX:ROOT-NAMESPACE s" namespace" T$=
+   TEST-DROPBOX:AUTH$ BEARER$ T$=
+   TEST-DROPBOX:ROOT-SENT? TFALSE
+   link DROPBOX:CLOSE
+   s" ns-root" TEST-DROPBOX:ROOT!
+   200 s" " s" "
+   S\" {\q.tag\q:\qfolder\q,\qname\q:\qSync\q,\qid\q:\qid:s\q,\qpath_lower\q:\q/sync\q,\qpath_display\q:\q/Sync\q}"
+   TEST-DROPBOX:SCRIPT!
+   s" /sync" MAIN @ DROPBOX:METADATA DONE? ASSERT
+   DROPBOX-KIND:FOLDER KIND? TTRUE
+   TEST-DROPBOX:ROOT-SENT$ S\" {\q.tag\q:\qroot\q,\qroot\q:\qns-root\q}" T$=
+   S\" [{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/sync\q,\qpath_display\q:\q/Sync\q},{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/sync/folder\q,\qpath_display\q:\q/Sync/Folder\q},{\q.tag\q:\qfile\q,\qpath_lower\q:\q/sync/alpha.txt\q,\qpath_display\q:\q/Sync/Alpha.txt\q,\qrev\q:\qrev-a\q,\qsize\q:0,\qcontent_hash\q:\qe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\q,\qis_downloadable\q:true}]"
+   s" cursor-a" true TEST-DROPBOX:PAGE!
+   S\" [{\q.tag\q:\qfile\q,\qpath_lower\q:\q/sync/paper\q,\qpath_display\q:\q/Sync/Paper\q,\qrev\q:\qrev-paper\q,\qsize\q:0,\qis_downloadable\q:false,\qexport_info\q:{\qexport_as\q:\qhtml\q}}]"
+   s" cursor-b" false TEST-DROPBOX:PAGE!
+   s" /sync" MAIN @ [: SAW-DOWNLOADABLE ;] DROPBOX:LIST DONE? ASSERT
+   GOT$ s" d/sync+ d/sync/folder+ f/sync/alpha.txt+ f/sync/paper-" T$=
+   MAIN @ DROPBOX:CURSOR s" cursor-b" T$=
+   true 2 TEST-DROPBOX:POLL!
+   s" cursor-b" 30 MAIN @ DROPBOX:WAIT DONE? ASSERT
+   MAIN @ DROPBOX:CHANGED? TTRUE
+   MAIN @ DROPBOX:BACKOFF 2 T=
+   ALPHABET
+   0 FETCH DONE? ASSERT
+   SUNK$ s" abcdefghijklmnopqrstuvwxyz" T$=
+   TEST-DROPBOX:ARG-SENT$ S\" {\qpath\q:\qrev:0160a1b2c3d4\q}" T$=
+   TEST-DROPBOX:SEEN$
+   s" /oauth2/token /2/users/get_current_account /2/files/get_metadata /2/files/list_folder /2/files/list_folder/continue /2/files/list_folder/longpoll /2/files/download"
+   T$=
+   TEST-DROPBOX:LEAKED? TFALSE ;
+
+
 \ ---- files/upload and upload sessions
 
 $2000000 constant CHUNK
@@ -1956,8 +2028,11 @@ TYPED-VARIABLE FAULT fault
    MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$ ;
 
 
-: SINGLE-CASE ( -- )
-   s" single upload" T-LABEL
+\ Each mutation of the four sent once, conditional where it can be: an add,
+\ an add at a path Dropbox-API-Arg escapes to ASCII, an update over the
+\ rev held, a delete of the rev held and a folder.
+: CONDITIONAL-MUTATIONS-USE-STRICT-DOCUMENTED-REQUESTS ( -- )
+   s" conditional_mutations_use_strict_documented_requests" T-LABEL
    TEST-DROPBOX:RESET -1 FAULT-AT !
    s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
    SEND DONE? ASSERT
@@ -1972,7 +2047,39 @@ TYPED-VARIABLE FAULT fault
    S\" \qautorename\q:false,\qstrict_conflict\q:true," SB-APPEND
    S\" \qcontent_hash\q:\q" SB-APPEND EXPECTED$ SB-APPEND S\" \q}" SB-APPEND
    TEST-DROPBOX:ARG-SENT$ SB$ T$=
-   UNSTAGED ;
+   UNSTAGED
+   s" cafe.txt" STAGE!
+   s" hello cafe" S\" /Caf\xc3\xa9/\xe9\x9b\xaa.txt" s" " STAGED
+   SEND DONE? ASSERT
+   SB-RESET S\" {\qpath\q:\q/Caf\\u00e9/\\u96ea.txt\q,\qmode\q:\qadd\q," SB-APPEND
+   S\" \qautorename\q:false,\qstrict_conflict\q:true," SB-APPEND
+   S\" \qcontent_hash\q:\q" SB-APPEND EXPECTED$ SB-APPEND S\" \q}" SB-APPEND
+   TEST-DROPBOX:ARG-SENT$ SB$ T$=
+   UNSTAGED
+   s" /replace.txt" s" /Replace.txt" s" expected-rev" EXPECTED$ 12
+   TEST-DROPBOX:FILE!
+   s" up.txt" STAGE! s" hello upload" s" /Replace.txt" s" expected-rev" STAGED
+   SEND DONE? ASSERT
+   ENTRY-HASH$ EXPECTED$ T$=
+   MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:REV @ SPAN:$ s" expected-rev" STR= TFALSE
+   SB-RESET S\" {\qpath\q:\q/Replace.txt\q,\qmode\q:" SB-APPEND
+   S\" {\q.tag\q:\qupdate\q,\qupdate\q:\qexpected-rev\q}," SB-APPEND
+   S\" \qautorename\q:false,\qstrict_conflict\q:true," SB-APPEND
+   S\" \qcontent_hash\q:\q" SB-APPEND EXPECTED$ SB-APPEND S\" \q}" SB-APPEND
+   TEST-DROPBOX:ARG-SENT$ SB$ T$=
+   UNSTAGED
+   s" /delete.txt" s" delete-rev" DELETED-FILE
+   s" /delete.txt" s" delete-rev" MAIN @ DROPBOX:DELETE DONE? ASSERT
+   LOWER$ s" /delete.txt" T$=
+   s" /folder" MAIN @ DROPBOX:CREATE-FOLDER DONE? ASSERT
+   DROPBOX-KIND:FOLDER KIND? TTRUE
+   LOWER$ s" /folder" T$=
+   TEST-DROPBOX:SEEN$
+   s" /2/files/upload /2/files/upload /2/files/upload /2/files/delete_v2 /2/files/create_folder_v2"
+   T$=
+   s" Bearer sl.fake-" {: b:^ bu:n :}
+   TEST-DROPBOX:AUTH$ bu min b bu T$=
+   TEST-DROPBOX:ROOT-SENT$ S\" {\q.tag\q:\qroot\q,\qroot\q:\qns-root\q}" T$= ;
 
 
 \ The path holds other bytes at rev 0160a; an update over rev 0160b.
@@ -2042,6 +2149,30 @@ TYPED-VARIABLE FAULT fault
    S\" {\qname\q:\qCAF\xc3\x89.txt\q,\qid\q:\qid:a\q,\qpath_lower\q:\q/docs/caf\xc3\x89.txt\q,\qpath_display\q:\q/Docs/CAF\xc3\x89.txt\q,\qrev\q:\q0170a\q,\qsize\q:10,\qcontent_hash\q:\q0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\q,\qis_downloadable\q:true}"
    TEST-DROPBOX:SCRIPT!
    SEND RETRY-MS 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
+   UNSTAGED ;
+
+
+\ An upload answered at another path whose confirmation answers the file
+\ with no path_lower: the entry does not parse, and nothing is confirmed.
+: VERIFICATION-WITHOUT-A-LOWERCASE-PATH-IS-INVALID-METADATA ( -- )
+   s" verification_without_a_lowercase_path_is_invalid_metadata" T-LABEL
+   TEST-DROPBOX:RESET -1 FAULT-AT !
+   s" bad.txt" STAGE! s" moved bytes" s" /bad.txt" s" " STAGED
+   200 s" " s" "
+   SB-RESET S\" {\qname\q:\qmoved.txt\q,\qid\q:\qid:m\q,\qpath_lower\q:\q/moved.txt\q," SB-APPEND
+   S\" \qpath_display\q:\q/moved.txt\q,\qrev\q:\qmoved-rev\q,\qsize\q:11," SB-APPEND
+   S\" \qcontent_hash\q:\q" SB-APPEND EXPECTED$ SB-APPEND
+   S\" \q,\qis_downloadable\q:true}" SB-APPEND SB$
+   TEST-DROPBOX:SCRIPT!
+   200 s" " s" "
+   SB-RESET S\" {\q.tag\q:\qfile\q,\qname\q:\qbad.txt\q,\qid\q:\qid:b\q," SB-APPEND
+   S\" \qrev\q:\qbad-rev\q,\qsize\q:11,\qcontent_hash\q:\q" SB-APPEND
+   EXPECTED$ SB-APPEND S\" \q,\qis_downloadable\q:true}" SB-APPEND SB$
+   TEST-DROPBOX:SCRIPT!
+   SEND-LOGGED DROPBOX:E-ANSWER T=
+   s" error dropbox: files/get_metadata answered 200: an incomplete entry"
+   LOGGED? TTRUE
    TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
    UNSTAGED ;
 
@@ -2192,8 +2323,11 @@ TYPED-VARIABLE FAULT fault
 
 
 : SINGLE-CASES ( -- )
-   SINGLE-CASE CONFLICT-CASE HELD-CASE NON-ASCII-CASE OTHER-CASE-CASE
-   UNFOUND-ELSEWHERE-CASE BUSY-ELSEWHERE-CASE CUT-SINGLE-CASE DENIED-SINGLE-CASE
+   CONDITIONAL-MUTATIONS-USE-STRICT-DOCUMENTED-REQUESTS
+   CONFLICT-CASE HELD-CASE NON-ASCII-CASE OTHER-CASE-CASE
+   UNFOUND-ELSEWHERE-CASE
+   VERIFICATION-WITHOUT-A-LOWERCASE-PATH-IS-INVALID-METADATA
+   BUSY-ELSEWHERE-CASE CUT-SINGLE-CASE DENIED-SINGLE-CASE
    LOST-SINGLE-CASE SHORT-STAGE-CASE REFUSED-STAGE-CASE FULL-READ-CASE
    ENTERED-READ-CASE TIMED-OUT-READ-CASE CANCELLED-READ-CASE ;
 
@@ -2407,7 +2541,7 @@ TYPED-VARIABLE FAULT fault
    ACCOUNT-CASE FILE-CASE BUILT-PATH-CASE MISSING-CASE ROOT-CASE
    LOST-READ-CASE UNDOWNLOADABLE-CASE SYMLINK-CASE INCOMPLETE-CASE
    METADATA-ELSEWHERE-CASE
-   EXPIRED-CASE
+   SDK-EXPIRY-REFRESH-REISSUES-THE-ROUTE-WITH-THE-SAME-CLIENT
    REJECTED-GRANT-CASE REVOKED-CASE DENIED-CASE
    STORED-FIRST-CASE UNSTORED-CASE UNROTATED-CASE SCRIPTED-REFRESH-CASE
    ROUTED-SCRIPT-CASE
@@ -2417,7 +2551,7 @@ TYPED-VARIABLE FAULT fault
    CLASSIFY-CASES
    PAGES-CASE RESET-CASE STALL-CASE UNTAGGED-CASE UNDOWNLOADABLE-LISTED-CASE
    INCOMPLETE-LISTED-CASE RESTRICTED-LISTED-CASE INCOMPLETE-KINDS-CASE
-   POLL-CASE POLL-RESET-CASE
+   POLL-CASE LONG-POLL-EXPOSES-RESET-AND-RATE-LIMIT-OUTCOMES
    DOWNLOAD-CASES
    DELETE-CONFLICT-CASE DELETE-MISSING-CASE DELETE-GONE-CASE
    LOST-DELETE-CASE CUT-DELETE-CASE DELETE-ELSEWHERE-CASE
@@ -2428,6 +2562,7 @@ TYPED-VARIABLE FAULT fault
    DENIED-CUT-FOLDER-CASE
    LOST-REFRESH-CASE
    EXCHANGE-CASE DEAD-CODE-CASE RESERVED-REFRESH-CASE RESERVED-CODE-CASE
+   OAUTH-LISTING-LONGPOLL-AND-EXACT-DOWNLOAD-USE-DOCUMENTED-PROTOCOL
    UPLOAD-CASES DROPBOX:THROW-CASES
    MAIN @ DROPBOX:CLOSE ;
 
