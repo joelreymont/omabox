@@ -161,6 +161,8 @@
 \   refused 409 or its bytes failing the listing's hash hold the local
 \   directory for the pass, untouched, unplanned and with no copy, its one
 \   line logged, while other.txt syncs in the same pass.
+\ - A-HELD-COLLISION-HOLDS-THE-PATHS-BENEATH-IT: the refused copy also
+\   holds the local file node/inner.txt, unplanned and unstaged.
 \ Directory deletions against the fake Dropbox, Rust's tests of the same
 \ names, with no account request:
 \ - remote_directory_deletion_removes_local_directories_deepest_first
@@ -5511,14 +5513,12 @@ $180 constant MODE-0600
 
 \ The pass held node, its copy blocked for the reason r and logged
 \ once, and synced other.txt.
-: NODE-HELD ( str ^run str ^u8 n -- )
+: COLLISION-HELD ( str ^run str ^u8 n -- )
    {: d:str x rec:str r:^ ru:n :}
    x RUN-ARENA @ {: ar :}
    d [: x rec OTHER-SYNCED ;] ar LOGGED {: t:^ tu:n :}
    t tu 10 COUNT-CHAR 1 T=
    t tu r ru HELD-LINE CONTAINS? TTRUE
-   x s" node" IN-ROOT str> READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
-   u 0 T=
    s" Dropbox file" COLLIDED$ s" " ar NODE-COPY {: v:str :}
    x v str> IN-ROOT str> FS:EXISTS? TFALSE
    x PENDING-OF VEC:COUNT 0 T=
@@ -5529,6 +5529,12 @@ $180 constant MODE-0600
    x s" other.txt" BASELINE-KIND$ s" present" T$=
    TEST-DROPBOX:SEEN$
    s" /2/files/list_folder /2/files/download /2/files/download" T$= ;
+
+\ COLLISION-HELD, with node left empty.
+: NODE-HELD ( str ^run str ^u8 n -- )
+   {: d:str x rec:str r:^ ru:n :}
+   d x rec r ru COLLISION-HELD
+   x s" node" IN-ROOT str> READ-BUF READ-CAP FS-LIST:NAMES 0 T= ;
 
 \ Dropbox's 409 for the next API call, the copy's download.
 : REFUSE-COPY ( -- )
@@ -5557,6 +5563,23 @@ $180 constant MODE-0600
    d x rec s" download_verification_failed" NODE-HELD
    d x STEP-GONE ;
 
+: INNER$ ( -- ^u8 n ) s" local file beneath a held collision" ;
+
+: A-HELD-COLLISION-HOLDS-THE-PATHS-BENEATH-IT ( ^ARENA:arena -- )
+   {: ar :}
+   s" a held collision holds the paths beneath it" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x HELD-COLLISION
+   x RUN-ROOT @ s" node/inner.txt" INNER$ ar WRITE-AT
+   s" rev-held" COLLIDED$ TEST-DROPBOX:CONTENT!
+   [: REFUSE-COPY ;] TEST-DROPBOX:DURING-LISTING!
+   d x rec s" download_unavailable 409" COLLISION-HELD
+   x STAGING$ READ-BUF READ-CAP FS-LIST:NAMES 0 T=
+   x s" node/inner.txt" IN-ROOT INNER$ HOLDS-BYTES
+   d x STEP-GONE ;
+
 : DIRECTORY-COLLISION-CASES ( ^ARENA:arena -- )
    {: ar :}
    ar REMOTE-DIRECTORY-PRESERVES-A-LOCAL-FILE-UNDER-A-SYNCHRONIZED-NAME
@@ -5566,7 +5589,8 @@ $180 constant MODE-0600
    ar OCCUPIED-COLLISION-STAGE-USES-THE-NEXT-SYNCHRONIZED-NAME
    ar CHANGED-DROPBOX-FILE-DURING-DIRECTORY-CONVERSION-REPLANS-WITHOUT-A-CONFLICT-ROW
    ar A-REFUSED-COLLISION-COPY-HOLDS-ITS-PATH
-   ar AN-UNVERIFIED-COLLISION-COPY-HOLDS-ITS-PATH ;
+   ar AN-UNVERIFIED-COLLISION-COPY-HOLDS-ITS-PATH
+   ar A-HELD-COLLISION-HOLDS-THE-PATHS-BENEATH-IT ;
 
 \ ---- directory deletions against the fake Dropbox -----------------
 

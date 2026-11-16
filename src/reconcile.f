@@ -2974,8 +2974,8 @@ STRUCTURE known-conflict
    FIELD conflict MODEL:conflict
 ;STRUCTURE
 
-\ One planning pass. noop-count, planned and conflict-count are Rust's
-\ report; held is its blocked_paths, where a key may appear twice.
+\ One planning pass: Rust's report (noop-count, planned, conflict-count) and
+\ blocked_paths (held, keys may repeat); collisions are the held collisions.
 STRUCTURE planning DERIVE addr
    FIELD run ^run
    FIELD sides sides
@@ -2985,6 +2985,7 @@ STRUCTURE planning DERIVE addr
    FIELD planned n
    FIELD conflict-count n
    FIELD held ^VEC:vector<MODEL:key>
+   FIELD collisions ^VEC:vector<MODEL:key>
    FIELD noops ^VEC:vector<JOURNAL:path-baseline>
    FIELD plans ^VEC:vector<JOURNAL:path-plan>
    FIELD decisions ^VEC:vector<path-decision>
@@ -3071,6 +3072,7 @@ ARENA PLANNINGS planning
    r LIVE-PLANS {: ps :}
    j ar JOURNAL:BASELINES ls rs ps SIDES-MAKE ;
 
+\ A pass's planning over the merge's sides and the known conflicts.
 : NEW-PLANNING
    ( ^run ^VEC:vector<MODEL:local-record> -- ^planning )
    {: r records :}
@@ -3080,6 +3082,7 @@ ARENA PLANNINGS planning
    r pl PLANNING-RUN ! s pl PLANNING-SIDES !
    r KNOWN-CONFLICTS pl PLANNING-CONFLICTS !
    ar [type] MODEL:key NEW-VECTOR pl PLANNING-HELD !
+   ar [type] MODEL:key NEW-VECTOR pl PLANNING-COLLISIONS !
    ar [type] JOURNAL:path-baseline NEW-VECTOR pl PLANNING-NOOPS !
    ar [type] JOURNAL:path-plan NEW-VECTOR pl PLANNING-PLANS !
    ar [type] path-decision NEW-VECTOR pl PLANNING-DECISIONS !
@@ -3482,6 +3485,7 @@ ENUM live-step held superseded fresh ;ENUM
       source-changed OF construct pass-event fresh ENDOF
    ;MATCH ;
 
+\ A collision whose copy is blocked holds its path and its subtree.
 : NEW-COLLISION
    ( ^planning MODEL:key MODEL:path MODEL:collision -- pass-event )
    {: pl k path col :}
@@ -3489,7 +3493,10 @@ ENUM live-step held superseded fresh ;ENUM
    PREPARE-DIRECTORY-COLLISION MATCH prepared-collision
       root-changed OF construct pass-event root-changed ENDOF
       fresh OF construct pass-event fresh ENDOF
-      blocked OF drop pl k HELD+ construct pass-event ok ENDOF
+      blocked OF
+         drop k pl PLANNING-COLLISIONS @ VEC:PUSH !
+         pl k HELD+ construct pass-event ok
+      ENDOF
       plan OF {: plan :} pl path plan PUSH-PLAN ENDOF
    ;MATCH ;
 
@@ -3518,8 +3525,21 @@ ENUM live-step held superseded fresh ;ENUM
 : DECISION-KEY ( path-decision -- MODEL:key )
    PATH-DECISION-UNMAKE {: k path same d :} k ;
 
+\ Whether the key is beneath a collision held this pass.
+: UNDER-HELD? ( ^planning MODEL:key -- bool )
+   {: pl k :}
+   pl PLANNING-COLLISIONS @ {: v :}
+   v VEC:COUNT 0 ?do
+      k v i VEC:AT @ MODEL:BENEATH? if true unloop exit then
+   loop
+   false ;
+
+\ A path beneath a held collision is held, its live plan kept.
 : DECIDE ( ^planning path-decision -- pass-event )
    {: pl pd :}
+   pl pd DECISION-KEY UNDER-HELD? if
+      pl pd DECISION-KEY HELD+ construct pass-event ok exit
+   then
    pl pd DECISION-KEY FIND-LIVE MATCH option
       none OF pl pd NEW-DECISION ENDOF
       some OF {: plan :} pl pd pl pd plan LIVE-DECISION AFTER-LIVE ENDOF

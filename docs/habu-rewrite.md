@@ -93,9 +93,9 @@ watcher comes only for a measured need.
   `root-changed`; a Dropbox answer that ends it is in the link, as `REPLAY`'s.
   `DAEMON` validates the account, not the pass. Apart from Rust, a download
   refused `locked` blocks its path, and so does a directory collision's copy
-  that Dropbox refuses or that fails verification, for that pass, unplanned,
-  and so does a replayed conflict's remote copy whose download fails for its
-  path.
+  that Dropbox refuses or that fails verification, with every path beneath
+  it, for that pass, unplanned, and so does a replayed conflict's remote copy
+  whose download fails for its path.
 - **Upload progress.** `DROPBOX:UPLOAD` takes a quotation `[ n -- ]`, called
   with the bytes Dropbox has accepted.
 
