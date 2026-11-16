@@ -8,37 +8,39 @@
 \ publishes and the lines LOCAL logs for it among them, but those the
 \ comment on CASES names, each journal test keeping the half without the
 \ journal but four that publish to a journal in their case's directory,
-\ in the part LOCAL SCAN-TEST, which sees LOCAL's private types;
-\ that upload stage collection removes only verified unreferenced
-\ content; then each stage outcome, each inspected download stage, a
-\ stage marker set, read and removed, a second mark failing with one
-\ xattr line on stderr, each upload stage outcome, an upload source that
-\ vanished or is a directory, each parent a download opens and an
-\ unreadable hash input failing; then that a slot's state keeps its last
-\ checkpoint, that slot identity and state bytes are the Rust daemon's,
-\ a reset never touches a replacement swapped in, the pool's four fixed
-\ slots, a protected slot kept and a stale one rebound; then that a cut
-\ download resumes from its last durable checkpoint, a completed partial
-\ is promoted before or after its rename, a corrupt one restarts only in
-\ its own slot, a promotion keeps a swapped replacement, a copy across
-\ filesystems frees its slot, and a reset slot replays to offset 0, each
-\ completed stage installed and read back at its target; that a restart
-\ empties its partial, keeps a swapped replacement and fails in a slot
-\ directory it cannot search; that slots lease through a symlinked state
-\ home; then local.rs's install tests, each install outcome, an install a
-\ directory or an unreadable file at its stage's name blocks, each
-\ replacement preparation, that a complete disposable download closes
-\ its parent, and the scan lock test's half without the lock: a
-\ disposable partial appended is staged and leaves its staging directory
-\ empty; then that directory effects never overwrite or recurse, that a
-\ delete's replay keeps a raced edit, each delete outcome, a delete of an
-\ uppercase hash failing, each arm of a changed guard's restore, each
-\ directory and conflict outcome, a recovery copy's name the Rust
-\ daemon's and each verification of one; then local.rs's tests that a
-\ case-variant rename keeps the tree, retries a race and keeps a swapped
-\ source, and that a parent's name limit is none when it is missing. A
-\ case that makes files works in its own directory under TMPDIR and
-\ removes it.
+\ in the part LOCAL SCAN-TEST, which sees LOCAL's private types, and
+\ there too that a denied write's line gives its directory's and entry's
+\ facts, a denied rename's names both directories, and one on a directory
+\ already closed gives none of its facts; that upload stage collection
+\ removes only verified unreferenced content; then each stage outcome,
+\ each inspected download stage, a stage marker set, read and removed, a
+\ second mark failing with one xattr line on stderr, each upload stage
+\ outcome, an upload source that vanished or is a directory, each parent
+\ a download opens and an unreadable hash input failing; then that a
+\ slot's state keeps its last checkpoint, that slot identity and state
+\ bytes are the Rust daemon's, a reset never touches a replacement
+\ swapped in, the pool's four fixed slots, a protected slot kept and
+\ a stale one rebound; then that a cut download resumes from its last
+\ durable checkpoint, a completed partial is promoted before or after
+\ its rename, a corrupt one restarts only in its own slot, a promotion
+\ keeps a swapped replacement, a copy across filesystems frees its
+\ slot, and a reset slot replays to offset 0, each completed stage
+\ installed and read back at its target; that a restart empties its
+\ partial, keeps a swapped replacement and fails in a slot directory it
+\ cannot search; that slots lease through a symlinked state home; then
+\ local.rs's install tests, each install outcome, an install a directory
+\ or an unreadable file at its stage's name blocks, each replacement
+\ preparation, that a complete disposable download closes its parent,
+\ and the scan lock test's half without the lock: a disposable partial
+\ appended is staged and leaves its staging directory empty; then that
+\ directory effects never overwrite or recurse, that a delete's replay
+\ keeps a raced edit, each delete outcome, a delete of an uppercase hash
+\ failing, each arm of a changed guard's restore, each directory and
+\ conflict outcome, a recovery copy's name the Rust daemon's and each
+\ verification of one; then local.rs's tests that a case-variant rename
+\ keeps the tree, retries a race and keeps a swapped source, and that
+\ a parent's name limit is none when it is missing. A case that makes
+\ files works in its own directory under TMPDIR and removes it.
 \ Run from the repository root: hb --load src/local-test.f </dev/null
 require src/lib/test.f
 require src/lib/test/stderr.f
@@ -410,7 +412,6 @@ create TIMES 32 allot
 FUNCTION: MKFIFO-CALL mkfifo ( ^u8 n -- i32 ) ;FUNCTION
 FUNCTION: SOCKET-CALL socket ( n n n -- i32 ) ;FUNCTION
 FUNCTION: BIND-CALL bind ( n ^u8 n -- i32 ) ;FUNCTION
-FUNCTION: GETEUID-CALL geteuid ( -- i32 ) ;FUNCTION
 
 384 constant MODE-0600
 1 constant AF-UNIX
@@ -438,7 +439,7 @@ FS:PATHZ-CAP BUFFER: TARGET
    ROOT$ p u TARGET FS:JOIN-PATH TARGET swap ;
 
 \ Root opens a file and searches a directory whatever its mode.
-: ROOT-USER? ( -- bool ) GETEUID-CALL 0 = ;
+: ROOT-USER? ( -- bool ) FS:EUID 0 = ;
 
 FS:PATHZ-CAP BUFFER: LOG-AT
 
@@ -1122,6 +1123,94 @@ variable RAISED-ERRNO
    [: s" subject.txt" UNSAFE ;] 1 ENTRY-RAISES {: bad:n :}
    [: bad WALK-KIND drop ;] E-UNSAFE-PATH TTHROWSQ ;
 
+\ ---- denied writes
+
+488 constant MODE-0750
+416 constant MODE-0640
+
+\ SB holds the clause of kind k for the name p, through its mode's label.
+: CLAUSE ( ^u8 n ^u8 n -- )
+   {: k:^ ku:n p:^ pu:n :}
+   SB-RESET k ku SB-APPEND s"  `" SB-APPEND p pu SB-APPEND
+   s" ` mode " SB-APPEND ;
+
+: DIRECTORY? ( ^u8 n ^u8 n -- bool )
+   {: e:^ u:n p:^ pu:n :}
+   s" ; directory" p pu CLAUSE e u SB$ CONTAINS? ;
+
+\ Whether the log holds the clause, the mode m, and Omabox's uid as owner.
+: OWNED? ( ^u8 n ^u8 n ^u8 n ^u8 n -- bool )
+   {: e:^ u:n k:^ ku:n p:^ pu:n m:^ mu:n :}
+   k ku p pu CLAUSE m mu SB-APPEND
+   s"  owner uid " SB-APPEND FS:EUID FMT:INT$ SB-APPEND
+   e u SB$ CONTAINS? ;
+
+: RUNS-AS? ( ^u8 n -- bool )
+   {: e:^ u:n :}
+   SB-RESET s" ; Omabox runs as uid " SB-APPEND
+   FS:EUID FMT:INT$ SB-APPEND 10 SB-APPEND-C
+   e u SB$ CONTAINS? ;
+
+\ EPERM raised against a file: the one line gives the facts of the file
+\ and of its directory, and FS:ERRNO keeps EPERM.
+: DENIED-WRITE-GIVES-ITS-DIRECTORY-AND-ENTRY ( -- )
+   s" denied_write_gives_its_directory_and_entry" T-LABEL
+   ROOT-USER? if exit then
+   s" denied" MKDIR s" denied/file.txt" s" held" WRITE
+   s" denied/file.txt" AT MODE-0640 FS:CHMOD-MODE
+   s" denied" AT MODE-0750 FS:CHMOD-MODE
+   s" denied" AT FS:OPEN-DIR {: dir:fd :}
+   [: [: FS:EPERM FS:CAUSE! dir s" file.txt" s" write test file"
+         s" denied/file.txt" IO-FAILURE-AT ;] E-IO TTHROWSQ
+      FS:ERRNO CAUGHT ! ;] STDERR-OF {: e:^ u:n :}
+   dir DISCARD
+   CAUGHT @ FS:EPERM T=
+   e u 1 LOGGED
+   e u s" : Operation not permitted;" CONTAINS? TTRUE
+   e u s" ; directory" s" denied" AT s" 0750" OWNED? TTRUE
+   e u s" ; entry" s" file.txt" s" 0640" OWNED? TTRUE
+   e u RUNS-AS? TTRUE ;
+
+: RENAME-DENIED ( fd fd -- )
+   {: from:fd to:fd :}
+   FS:EACCES FS:CAUSE! from s" file.txt" to s" file.txt"
+   s" rename test file" s" from/file.txt" IO-FAILURE-ACROSS ;
+
+\ EACCES raised for a rename: the one line names both directories.
+: DENIED-RENAME-GIVES-BOTH-DIRECTORIES ( -- )
+   s" denied_rename_gives_both_directories" T-LABEL
+   ROOT-USER? if exit then
+   s" from" MKDIR s" to" MKDIR s" from/file.txt" s" held" WRITE
+   s" from" AT FS:OPEN-DIR {: from:fd :}
+   s" to" AT FS:OPEN-DIR {: to:fd :}
+   [: [: from to RENAME-DENIED ;] E-IO TTHROWSQ ;] STDERR-OF
+   {: e:^ u:n :}
+   from DISCARD to DISCARD
+   e u 1 LOGGED
+   e u s" : Permission denied;" CONTAINS? TTRUE
+   e u s" from" AT DIRECTORY? TTRUE
+   e u s" to" AT DIRECTORY? TTRUE
+   e u RUNS-AS? TTRUE ;
+
+\ The descriptor closes inside the capture, so no open there takes its
+\ number: statx logs its own line, then LOCAL's has no path or facts.
+: DENIED-WRITE-ON-A-CLOSED-DIRECTORY ( -- )
+   s" denied_write_on_a_closed_directory" T-LABEL
+   ROOT-USER? if exit then
+   s" closed" MKDIR
+   s" closed" AT FS:OPEN-DIR {: dir:fd :}
+   [: [: dir DISCARD FS:EACCES FS:CAUSE! dir s" file.txt"
+         s" write test file" s" closed/file.txt" IO-FAILURE-AT ;]
+      E-IO TTHROWSQ FS:ERRNO CAUGHT ! ;] STDERR-OF {: e:^ u:n :}
+   CAUGHT @ FS:EACCES T=
+   e u 2 LOGGED
+   e u 10 0 SPLIT-NEXT {: a:^ au:n next:n ok:bool :}
+   a au s" fs-statx: " CONTAINS? TTRUE
+   e u 10 next SPLIT-NEXT {: b:^ bu:n end:n more:bool :}
+   b bu s" local: " CONTAINS? TTRUE
+   b bu s" : Permission denied; directory; Omabox runs as uid "
+   CONTAINS? TTRUE ;
+
 \ ---- publication
 
 : STAND-IN$ ( -- ^u8 n ) s" /sys/class/mem" ;
@@ -1265,7 +1354,10 @@ variable RAISED-ERRNO
    [: ONLY-THE-ACTIVE-ROOT-OPENS ;] IN-CASE
    TRUNCATING-A-FAILED-ENTRY-KEEPS-ITS-VALIDATED-HASHES
    [: ONLY-EXHAUSTION-ESCAPES-A-FAILURE-RAISED-AGAINST-ONE-ENTRY ;]
-   IN-CASE ;
+   IN-CASE
+   [: DENIED-WRITE-GIVES-ITS-DIRECTORY-AND-ENTRY ;] IN-CASE
+   [: DENIED-RENAME-GIVES-BOTH-DIRECTORIES ;] IN-CASE
+   [: DENIED-WRITE-ON-A-CLOSED-DIRECTORY ;] IN-CASE ;
 
 public
 

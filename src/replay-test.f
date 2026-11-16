@@ -450,7 +450,6 @@ private
 
 PROCESS-SYMBOLS
 FUNCTION: UTIMENSAT-CALL utimensat ( n ^u8 ^u8 n -- i32 ) ;FUNCTION
-FUNCTION: GETEUID-CALL geteuid ( -- i32 ) ;FUNCTION
 
 -100 constant AT-FDCWD
 $3FFFFFFE constant UTIME-OMIT
@@ -463,7 +462,7 @@ create TIMES 32 allot
    AT-FDCWD z TIMES 0 UTIMENSAT-CALL 0 T= ;
 
 \ Root reads a mode-000 file, so its cases skip.
-: ROOT-USER? ( -- bool ) GETEUID-CALL 0 = ;
+: ROOT-USER? ( -- bool ) FS:EUID 0 = ;
 
 
 \ ---- cases ---------------------------------------------------------

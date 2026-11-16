@@ -16,7 +16,7 @@
 \ answer the replay contract refuses is logged once with the Rust
 \ version's text, naming the plan's path, then thrown as
 \ E-INVALID-STATE. A failed retention or upload-stage syscall is logged
-\ once, as LOCAL logs one, and thrown as LOCAL's E-IO.
+\ once, by LOCAL, and thrown as LOCAL's E-IO.
 \ STORAGE CLASS. No state of its own. CALLER-OWNED: a report, its
 \ vector, a replay pass's context, a download's bridge, and every value
 \ a journal step or a conflict copy reads lie in the arena the caller
@@ -384,18 +384,6 @@ STRUCTURE retention
 : RETAINED ( JOURNAL:recovery-record -- option<n> )
    JOURNAL-RECOVERY--RECORD:UNMAKE {: id op p q c s at :} at ;
 
-\ Rust's LocalError::Io for operation o on path p: FS:ERRNO holds the
-\ errno, kept across the log.
-: IO-FAILED ( ^u8 n ^u8 n -- )
-   {: o:^ ou:n p:^ u:n :}
-   FS:ERRNO {: e:n :}
-   LOG:ERROR s" replay" LOG:LINE
-   s" local filesystem operation `" LOG:TEXT+ o ou LOG:TEXT+
-   s" ` failed for `" LOG:TEXT+ p u LOG:TEXT+ s" `" LOG:TEXT+
-   e 0<> if s" : errno " LOG:TEXT+ e LOG:INT+ then
-   LOG:;LINE
-   e FS:CAUSE! LOCAL:E-IO throw ;
-
 \ Closes a descriptor; as Rust's drop of an OwnedFd or a File, it
 \ ignores close's own failure.
 : DISCARD ( fd -- ) FD>N close ;
@@ -405,7 +393,7 @@ STRUCTURE retention
    [: dir FD:SYNC ;] catch {: code:n :}
    code 0= if exit then
    code E-FS-IO <> if code throw then
-   s" sync recovery retention" d str> IO-FAILED ;
+   s" sync recovery retention" d str> LOCAL:IO-FAILURE ;
 
 \ statat of the name, never a symlink's target; none once it is gone.
 \ o names the operation, p the payload's path.
@@ -416,7 +404,7 @@ STRUCTURE retention
       exit
    then
    FS:ERRNO FS:ENOENT = if NO-STAT exit then
-   o ou p MODEL:PATH>STR str> IO-FAILED ;
+   o ou p MODEL:PATH>STR str> LOCAL:IO-FAILURE ;
 
 : REGULAR? ( stat -- bool )
    STAT-UNMAKE {: d i m :}
@@ -504,8 +492,8 @@ STRUCTURE retention
    {: x r nm:^ nu:n :}
    x DIR-OF nm nu FS:TRY-REMOVE-FILE-AT 0= if
       FS:ERRNO FS:ENOENT <> if
-         s" remove expired recovery payload"
-         r COPY-PATH MODEL:PATH>STR str> IO-FAILED
+         x DIR-OF nm nu s" remove expired recovery payload"
+         r COPY-PATH MODEL:PATH>STR str> LOCAL:IO-FAILURE-AT
       then
    then
    x r SYNC-THEN-FORGET ;
@@ -1314,7 +1302,7 @@ ARENA UPLOADS DROPBOX:upload
    code 0= if FS:STAT-SIZE@ exit then
    code E-FS-STAT <> if code throw then
    s" read upload stage metadata"
-   s SENDING-PATH @ MODEL:PATH>STR str> IO-FAILED ;
+   s SENDING-PATH @ MODEL:PATH>STR str> LOCAL:IO-FAILURE ;
 
 \ Rust's validate_upload_size.
 : OVERSIZE? ( n -- bool ) UPLOAD-MAX > ;

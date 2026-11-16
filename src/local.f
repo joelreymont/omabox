@@ -17,15 +17,18 @@
 \ relative to its parent's descriptor with O_NOFOLLOW, so no symlink
 \ is followed: a last component that is one fails ELOOP, as openat2's
 \ RESOLVE_NO_SYMLINKS does, and a parent that is one fails ENOTDIR where
-\ openat2 answers ELOOP. A parent in a path opens by O_PATH, so it needs
-\ search permission only. An io failure's errno stays in FS:ERRNO, 0 where
-\ the Habu word that failed keeps none.
+\ openat2 answers ELOOP. A read's parents open by O_PATH, so they need
+\ search permission only; a write's open O_RDONLY, so they need read
+\ permission too. An io failure's errno stays in FS:ERRNO, 0 where the
+\ Habu word that failed keeps none.
 \ LOCAL logs a failure once, with its text, where it throws, unless the
 \ catch around it turns it into an outcome: CONVERTING runs a word under a
 \ predicate naming the codes and errnos its caller converts, and QUIET?
 \ asks the innermost one. A scan's observation converts what ENTRY-CODE?
 \ names and rethrows the rest, which logs and ends the scan; a failure
-\ XATTR logged gets no second line.
+\ XATTR logged gets no second line. On EACCES or EPERM an io failure's
+\ line also gives the mode, owner and attributes of the call's directory
+\ and entry, and the uid Omabox runs as.
 \ The scan walks the root depth first, each directory's names in byte order,
 \ and collects observations, cached hashes it may reuse and files to hash; a
 \ failure that concerns one entry publishes that entry as unknown and drops
@@ -35,21 +38,23 @@
 \ STORAGE CLASS. PROCESS-WIDE: the content hasher, its read buffer, the
 \ name hasher, the marker and slot state buffers, the slot name and path
 \ buffers, a lease's slot table, the byte a partial's end is probed with,
-\ the directory listing context and the predicate of the innermost
-\ CONVERTING; one task syncs, so one uses them at a time. CALLER-OWNED:
-\ every descriptor answered, the hashes, names, paths, vectors, staged
-\ uploads and partials laid in the caller's arena, the paths a stage's
-\ result names and a lease's slot directory.
+\ the directory listing context, the predicate of the innermost
+\ CONVERTING and DENIED-PATH; one task syncs, so one uses them at a
+\ time. CALLER-OWNED: every descriptor answered, the hashes, names,
+\ paths, vectors, staged uploads and partials laid in the caller's arena,
+\ the paths a stage's result names and a lease's slot directory.
 
 require src/lib/error.f
 require src/lib/string.f
 require src/lib/span.f
 require src/lib/arena.f
 require src/lib/log.f
+require src/lib/fmt.f
 require src/lib/adt/option.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
 require src/lib/fs-anchored.f
+require src/lib/fs-statx.f
 require src/lib/fs-list.f
 require src/lib/allocator.f
 require src/lib/fd.f
@@ -105,7 +110,7 @@ $2E constant DOT
 : ERRNO+ ( n -- )
    {: e:n :}
    e 0= if exit then
-   s" : errno " LOG:TEXT+ e LOG:INT+ ;
+   s" : " LOG:TEXT+ e FS:ERRNO$ LOG:TEXT+ ;
 
 \ Out of descriptors, memory or space, the next entry would fail the same
 \ way: Rust's EXHAUSTION, which says nothing about the object observed.
@@ -212,18 +217,141 @@ private
    then
    E-OCCUPIED throw ;
 
+\ Opens the line of operation o failing for p with errno e.
+: FAILED+ ( ^u8 n ^u8 n n -- )
+   {: o:^ ou:n p:^ u:n e:n :}
+   LOG-OPEN s" local filesystem operation " LOG:TEXT+ o ou QUOTED+
+   s"  failed for " LOG:TEXT+ p u QUOTED+ e ERRNO+ ;
+
 \ Rust's io_failure, throwing code: FS:ERRNO holds the errno, kept across
 \ the log.
 : IO-FAILS ( ^u8 n ^u8 n n -- )
    {: o:^ ou:n p:^ u:n code:n :}
    FS:ERRNO {: e:n :}
-   code e QUIET? 0= if
-      LOG-OPEN s" local filesystem operation " LOG:TEXT+ o ou QUOTED+
-      s"  failed for " LOG:TEXT+ p u QUOTED+ e ERRNO+ LOG:;LINE
-   then
+   code e QUIET? 0= if o ou p u e FAILED+ LOG:;LINE then
    e FS:CAUSE! code throw ;
 
+public
+
 : IO-FAILURE ( ^u8 n ^u8 n -- ) E-IO IO-FAILS ;
+
+private
+
+\ Closes a descriptor, keeping FS:ERRNO; as Rust's drop of a File, it
+\ ignores close's own failure.
+: DISCARD ( fd -- ) FD>N close ;
+
+\ What statx says of an entry: its permission bits with the type, its
+\ owner's uid and the attributes the filesystem reports.
+STRUCTURE facts
+   FIELD mode n
+   FIELD owner n
+   FIELD flags n
+;STRUCTURE
+
+\ None when statx fails, which FS-STATX logs.
+: FACTS ( fd -- option<facts> )
+   {: f:fd :}
+   0 0 0 [: 2drop drop f FS-STATX:PERMISSIONS ;] catch {: code:n :}
+   code 0= if FACTS-MAKE OPTION:SOME exit then
+   2drop drop code E-FS-STAT <> if code throw then
+   OPTION:NONE ;
+
+\ The facts of the entry named in dir, not of a symlink's target; none
+\ for an empty name or an entry that does not open.
+: ENTRY-FACTS ( fd ^u8 n -- option<facts> )
+   {: dir:fd name:^ nu:n :}
+   nu 0= if OPTION:NONE exit then
+   dir name nu FS:TRY-OPEN-ENTRY-AT MATCH option
+      none OF OPTION:NONE ENDOF
+      some OF {: f:fd :} f FACTS f DISCARD ENDOF
+   ;MATCH ;
+
+\ The errnos a permission check or an immutable or append-only
+\ attribute answers.
+: DENIED? ( n -- bool )
+   {: e:n :}
+   e FS:EACCES = e FS:EPERM = or ;
+
+FS:PATHZ-CAP BUFFER: DENIED-PATH
+
+: FACTS+ ( option<facts> -- )
+   MATCH option
+      none OF ENDOF
+      some OF FACTS-UNMAKE {: m:n o:n a:n :}
+         s"  mode " LOG:TEXT+ m $FFF and 4 FMT:OCT-WIDTH$ LOG:TEXT+
+         s"  owner uid " LOG:TEXT+ o LOG:INT+
+         a FS-STATX:IMMUTABLE and 0<> if s"  immutable" LOG:TEXT+ then
+         a FS-STATX:APPEND and 0<> if s"  append-only" LOG:TEXT+ then
+      ENDOF
+   ;MATCH ;
+
+\ The directory's path, left out when FD-PATH, which logs nothing,
+\ cannot give it.
+: PATH+ ( fd -- )
+   {: dir:fd :}
+   0 [: drop dir DENIED-PATH FS:PATHZ-CAP FS:FD-PATH ;] catch
+   {: code:n :}
+   code 0= if s"  " LOG:TEXT+ DENIED-PATH swap QUOTED+ exit then
+   drop code E-FS-STAT = code E-FS-CAPACITY = or if exit then
+   code throw ;
+
+: DIRECTORY+ ( fd option<facts> -- )
+   {: dir:fd known :}
+   s" ; directory" LOG:TEXT+ dir PATH+ known FACTS+ ;
+
+: ENTRY+ ( ^u8 n option<facts> -- )
+   {: name:^ nu:n known :}
+   known MATCH option
+      none OF ENDOF
+      some OF drop s" ; entry " LOG:TEXT+ name nu QUOTED+ known FACTS+
+      ENDOF
+   ;MATCH ;
+
+: RUNS-AS+ ( -- )
+   s" ; Omabox runs as uid " LOG:TEXT+ FS:EUID LOG:INT+ ;
+
+\ IO-FAILURE for any errno but a denial LOCAL logs.
+: UNLESS-DENIED ( ^u8 n ^u8 n n -- )
+   {: o:^ ou:n p:^ u:n e:n :}
+   E-IO e QUIET? e DENIED? 0= or if o ou p u IO-FAILURE then ;
+
+\ The facts of dir and of the entry named in it, read before the line
+\ opens: a failing statx logs a line of its own.
+: SIDE ( fd ^u8 n -- option<facts> option<facts> )
+   {: dir:fd name:^ nu:n :}
+   dir FACTS dir name nu ENTRY-FACTS ;
+
+: SIDE+ ( fd ^u8 n option<facts> option<facts> -- )
+   {: dir:fd name:^ nu:n df ef :}
+   dir df DIRECTORY+ name nu ef ENTRY+ ;
+
+: DENIED-THROW ( n -- )
+   {: e:n :}
+   RUNS-AS+ LOG:;LINE e FS:CAUSE! E-IO throw ;
+
+public
+
+\ IO-FAILURE for a call on the name in dir, or on dir for an empty name;
+\ a denial's line also gives their facts.
+: IO-FAILURE-AT ( fd ^u8 n ^u8 n ^u8 n -- )
+   {: dir:fd name:^ nu:n o:^ ou:n p:^ u:n :}
+   FS:ERRNO {: e:n :}
+   o ou p u e UNLESS-DENIED
+   dir name nu SIDE {: df ef :}
+   o ou p u e FAILED+ dir name nu df ef SIDE+ e DENIED-THROW ;
+
+private
+
+\ IO-FAILURE-AT for a call from a name in one directory to a name in
+\ another: a denial's line gives both sides, the source first.
+: IO-FAILURE-ACROSS ( fd ^u8 n fd ^u8 n ^u8 n ^u8 n -- )
+   {: from:fd fn:^ fu:n to:fd tn:^ tu:n o:^ ou:n p:^ u:n :}
+   FS:ERRNO {: e:n :}
+   o ou p u e UNLESS-DENIED
+   from fn fu SIDE {: sd se :} to tn tu SIDE {: td te :}
+   o ou p u e FAILED+
+   from fn fu sd se SIDE+ to tn tu td te SIDE+ e DENIED-THROW ;
 
 \ Rust's syscall_failure: io_failure with the errno given.
 : SYSCALL-FAILURE ( n ^u8 n ^u8 n -- )
@@ -280,10 +408,6 @@ private
       else fail execute then
    then
    code throw ;
-
-\ Closes a descriptor, keeping FS:ERRNO; as Rust's drop of a File, it
-\ ignores close's own failure.
-: DISCARD ( fd -- ) FD>N close ;
 
 \ Runs q; a throw closes fd before it goes on, a return leaves it open.
 : CLOSING ( R fd [ R -- R ] -- R )
