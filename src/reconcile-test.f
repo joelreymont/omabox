@@ -58,6 +58,15 @@
 \   entries in pages of 2 000 within 5 s, the time printed
 \ - incomplete_downloadable_metadata_publishes_as_unknown_incomplete
 \ - restricted_later_page_publishes_as_unknown_inaccessible
+\ The replay step against the fake Dropbox, Rust's tests of the same
+\ names, one REPLAY-STEP standing for one drive_replay:
+\ - worker_verification_mismatch_durably_blocks_its_plan
+\ - worker_auth_rate_limit_and_server_failures_remain_global, its 401,
+\   429 and 500 answers, the code thrown and the reply kept in the link
+\   standing for the SDK error; the 401 on a client of its own, which
+\   refreshes and sends again once before it answers unlinked
+\ - occupied_download_stage_is_durably_blocked_without_overwrite_or_request
+\ - completed_download_batch_is_installed_before_the_next_batch_fails
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -71,6 +80,7 @@ require src/lib/fd.f
 require src/lib/vector.f
 require src/lib/adt/option.f
 require src/lib/fs-anchored.f
+require src/lib/fs-list.f
 require src/lib/aio.f
 require src/lib/time.f
 require src/lib/net/curl.f
@@ -81,6 +91,7 @@ require src/journal.f
 require src/test-journal.f
 require src/local.f
 require src/planner.f
+require src/status.f
 require src/replay.f
 require src/reconcile.f
 
@@ -1482,13 +1493,15 @@ ARENA LINKS REPLAY:link
 
 \ The account call takes the client's first access token, so no case's
 \ requests start with a refresh.
-: ACCOUNTED ( -- )
-   MAIN @ DROPBOX:ACCOUNT MATCH DROPBOX:reply
+: ACCOUNT-OF ( ^DROPBOX:client -- )
+   DROPBOX:ACCOUNT MATCH DROPBOX:reply
       done OF ENDOF
       refused OF drop s" the account was refused" FAILED ENDOF
       retry OF drop s" the account asked a retry" FAILED ENDOF
       unlinked OF s" the account was unlinked" FAILED ENDOF
    ;MATCH ;
+
+: ACCOUNTED ( -- ) MAIN @ ACCOUNT-OF ;
 
 : NEW-LINK ( ^ARENA:arena -- ^REPLAY:link )
    LINKS-NEW {: l :} MAIN @ l REPLAY-LINK:CLIENT ! l ;
@@ -1967,13 +1980,436 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
    ar INCOMPLETE-DOWNLOADABLE-METADATA-PUBLISHES-AS-UNKNOWN-INCOMPLETE
    ar RESTRICTED-LATER-PAGE-PUBLISHES-AS-UNKNOWN-INACCESSIBLE ;
 
+
+\ ---- the replay step against the fake Dropbox ---------------------
+
+ARENA RUNS run
+4096 constant READ-CAP
+READ-CAP BUFFER: READ-BUF
+
+\ A link whose transfers a status below the directory d shows.
+: STEP-LINK ( str ^ARENA:arena -- ^REPLAY:link )
+   {: d:str ar :}
+   ar NEW-LINK {: l :}
+   d ar STATUS:NEW l REPLAY-LINK:STATUS !
+   l ;
+
+\ A case's directory under TMPDIR, holding root, staging and a journal
+\ bound to the root, and a pass over them.
+: STEP-RUN ( ^ARENA:arena -- str ^run )
+   {: ar :}
+   s" reconcile-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
+   d s" root" ar INSIDE {: r:str :}
+   d s" staging" ar INSIDE {: s:str :}
+   r str> FS:MAKE-DIR s str> FS:MAKE-DIR
+   d s" journal.sqlite3" ar INSIDE JOURNAL:OPEN {: j :}
+   j r JOURNAL:INSPECT ar JOURNAL:ACTIVATE-LOCAL-ROOT drop
+   ar RUNS-NEW {: x :}
+   j x RUN-JOURNAL ! d ar STEP-LINK x RUN-LINK !
+   r x RUN-ROOT ! s x RUN-STAGING ! ar x RUN-ARENA !
+   d x ;
+
+: STEP-GONE ( str ^run -- ) RUN-JOURNAL @ GONE ;
+
+: PENDING-OF ( ^run -- ^VEC:vector<JOURNAL:plan-record> )
+   {: x :}
+   x RUN-JOURNAL @ x RUN-ARENA @ JOURNAL:PENDING-PLANS ;
+
+: BLOCKED-OF ( ^run -- ^VEC:vector<JOURNAL:plan-record> )
+   {: x :}
+   x RUN-JOURNAL @ x RUN-ARENA @ JOURNAL:BLOCKED-PLANS ;
+
+: WRITTEN ( JOURNAL:plan-write -- JOURNAL:plan-record bool )
+   MATCH JOURNAL:plan-write
+      recorded OF true ENDOF
+      already-live OF false ENDOF
+   ;MATCH ;
+
+\ Rust's plan(Absent, ConfirmedAbsent, Present(remote), Empty): one
+\ install-local operation, recorded pending at path a.
+: INSTALLING ( ^run ^u8 n MODEL:remote -- JOURNAL:plan-record )
+   {: x a:^ u:n rem :}
+   x RUN-ARENA @ {: ar :}
+   rem MODEL-OPERATION:INSTALL-LOCAL ar ONE-PLAN {: plan :}
+   x RUN-JOURNAL @ a u DISPLAY plan ar JOURNAL:RECORD-PLAN
+   WRITTEN TTRUE ;
+
+: NUMBERED ( ^u8 n n ^ARENA:arena -- str )
+   {: a:^ u:n k:n ar :}
+   SB-RESET a u SB-APPEND k FMT:SB-INT SB$ ar COPIED ;
+
+\ The fake's file /<p> at rev v with b's identity and size.
+: FILE-AT ( ^u8 n ^u8 n ^u8 n ^ARENA:arena -- )
+   {: p:^ pu:n v:^ vu:n b:^ bu:n ar :}
+   b bu ar IDENTITY DROPBOX:HASH>STR str> {: h:^ hu:n :}
+   SB-RESET s" /" SB-APPEND p pu SB-APPEND SB$ ar COPIED {: l:str :}
+   l str> l str> v vu h hu bu TEST-DROPBOX:FILE! ;
+
+\ The fake serves b as rev v of /<p>.
+: SERVES ( ^u8 n ^u8 n ^u8 n ^ARENA:arena -- )
+   {: p:^ pu:n v:^ vu:n b:^ bu:n ar :}
+   p pu v vu b bu ar FILE-AT
+   v vu b bu TEST-DROPBOX:CONTENT! ;
+
+: DOWNLOAD$ ( -- ^u8 n ) s" /2/files/download" ;
+
+\ The fake's record of u downloads.
+: DOWNLOADS$ ( n -- ^u8 n )
+   {: u:n :}
+   SB-RESET
+   u 0 ?do i 0<> if s"  " SB-APPEND then DOWNLOAD$ SB-APPEND loop
+   SB$ ;
+
+: REPORTED ( replay-step -- ^REPLAY:replay-report )
+   MATCH replay-step
+      root-changed OF s" the replay step lost its root" FAILED ENDOF
+      report OF ENDOF
+   ;MATCH ;
+
+: STEPPED ( ^run -- ) REPLAY-STEP REPORTED drop ;
+
+: COMPLETED ( ^REPLAY:replay-report -- n )
+   REPLAY-REPLAY--REPORT:COMPLETED-OPERATIONS @ ;
+
+\ A blockage's variant, then an unavailable download's status, in SB.
+: REASON+ ( MODEL:blockage -- )
+   MATCH MODEL:blockage
+      unsupported-file-size OF s" unsupported-file-size" SB-APPEND ENDOF
+      remote-rejected OF drop s" remote-rejected" SB-APPEND ENDOF
+      download-unavailable OF {: st:n :}
+         s" download-unavailable " SB-APPEND st FMT:SB-INT
+      ENDOF
+      download-verification-failed OF
+         s" download-verification-failed" SB-APPEND
+      ENDOF
+      stage-occupied OF s" stage-occupied" SB-APPEND ENDOF
+      local-object-in-way OF s" local-object-in-way" SB-APPEND ENDOF
+      remote-object OF s" remote-object" SB-APPEND ENDOF
+      conflict-copy-occupied OF
+         s" conflict-copy-occupied" SB-APPEND
+      ENDOF
+   ;MATCH ;
+
+\ A plan's status: pending, completed, or the reason it is blocked.
+: HELD-FOR$ ( JOURNAL:plan-record -- ^u8 n )
+   JOURNAL-PLAN--RECORD:UNMAKE {: id p o s :}
+   SB-RESET
+   s MATCH JOURNAL:plan-status
+      pending OF s" pending" SB-APPEND ENDOF
+      blocked OF drop REASON+ ENDOF
+      completed OF s" completed" SB-APPEND ENDOF
+   ;MATCH SB$ ;
+
+\ A report entry in SB: durable-plan <path> <reason>, or
+\ stage-destination-occupied <plan id> <stage>, else its variant.
+: BLOCKED+ ( REPLAY:replay-blocked -- )
+   MATCH REPLAY:replay-blocked
+      durable-plan OF {: p why :}
+         s" durable-plan " SB-APPEND p PATH$ SB-APPEND
+         s"  " SB-APPEND why REASON+
+      ENDOF
+      local-object OF drop s" local-object" SB-APPEND ENDOF
+      fresh-observation-required OF
+         drop s" fresh-observation-required" SB-APPEND
+      ENDOF
+      download-required OF drop drop s" download-required" SB-APPEND ENDOF
+      stage-destination-occupied OF {: id p:str :}
+         s" stage-destination-occupied " SB-APPEND
+         id JOURNAL:PLAN-ID>N FMT:SB-INT
+         s"  " SB-APPEND p str> SB-APPEND
+      ENDOF
+      precondition-changed OF
+         drop drop s" precondition-changed" SB-APPEND
+      ENDOF
+      remote-operation OF drop s" remote-operation" SB-APPEND ENDOF
+      remote-pending OF drop s" remote-pending" SB-APPEND ENDOF
+      remote-object OF drop s" remote-object" SB-APPEND ENDOF
+      sync-error OF drop drop s" sync-error" SB-APPEND ENDOF
+   ;MATCH ;
+
+\ Whether the report holds the entry e, which is not in SB.
+: REPORTS? ( ^REPLAY:replay-report ^u8 n -- bool )
+   {: rep e:^ eu:n :}
+   rep BLOCKS {: bs :}
+   bs VEC:COUNT 0 ?do
+      SB-RESET bs i VEC:AT @ BLOCKED+
+      SB$ e eu STR= if true unloop exit then
+   loop
+   false ;
+
+\ The reply's variant, then a retry's wait, else 0.
+: REPLY$ ( DROPBOX:reply -- ^u8 n n )
+   MATCH DROPBOX:reply
+      done OF s" done" 0 ENDOF
+      refused OF drop s" refused" 0 ENDOF
+      retry OF {: ms:n :} s" retry" ms ENDOF
+      unlinked OF s" unlinked" 0 ENDOF
+   ;MATCH ;
+
+: MISMATCH$ ( -- ^u8 n ) s" correct body with mismatched metadata" ;
+
+\ Rust's wrong_revision: the bytes answered as another rev.
+: MISREVISED ( ^ARENA:arena -- )
+   {: ar :}
+   s" mismatch.txt" s" different-revision" MISMATCH$ ar SERVES
+   s" different-revision" TEST-DROPBOX:MISFILE ;
+
+: UNPARSABLE ( -- )
+   DOWNLOAD$ 200 s" Dropbox-API-Result" s" {invalid metadata"
+   MISMATCH$ TEST-DROPBOX:ROUTE-SCRIPT! ;
+
+: FUTURE-ERROR ( -- )
+   DOWNLOAD$ 409 s" " s" "
+   S\" {\qerror_summary\q:\qfuture/...\q,\qerror\q:{\q.tag\q:\qfuture_download_error\q}}"
+   TEST-DROPBOX:ROUTE-SCRIPT! ;
+
+\ The answer q scripts blocks mismatch.txt durably for the reason w,
+\ and a second step sends nothing.
+: BLOCKS-MISMATCH ( [ -- ] ^u8 n ^ARENA:arena -- )
+   {: q w:^ wu:n ar :}
+   TEST-DROPBOX:RESET q execute
+   ar STEP-RUN {: d:str x :}
+   MISMATCH$ s" expected-revision" ar REMOTE-FILE {: rem :}
+   x s" mismatch.txt" rem INSTALLING drop
+   SB-RESET s" durable-plan mismatch.txt " SB-APPEND w wu SB-APPEND
+   SB$ ar COPIED {: e:str :}
+   x REPLAY-STEP REPORTED e str> REPORTS? TTRUE
+   x PENDING-OF VEC:COUNT 0 T=
+   x BLOCKED-OF {: held :}
+   held VEC:COUNT 1 T=
+   held 0 VEC:AT @ HELD-FOR$ w wu T$=
+   x REPLAY-STEP REPORTED COMPLETED 0 T=
+   TEST-DROPBOX:SEEN$ DOWNLOAD$ T$=
+   d x STEP-GONE ;
+
+: WORKER-VERIFICATION-MISMATCH-DURABLY-BLOCKS-ITS-PLAN
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" worker_verification_mismatch_durably_blocks_its_plan" T-LABEL
+   [: ar MISREVISED ;] s" download-verification-failed" ar
+   BLOCKS-MISMATCH
+   [: UNPARSABLE ;] s" download-verification-failed" ar
+   BLOCKS-MISMATCH
+   [: FUTURE-ERROR ;] s" download-unavailable 409" ar BLOCKS-MISMATCH ;
+
+: RATE-LIMITED ( -- )
+   DOWNLOAD$ 429 s" Retry-After" s" 7"
+   S\" {\qerror_summary\q:\qtoo_many_requests/...\q,\qerror\q:{\qreason\q:{\q.tag\q:\qtoo_many_requests\q},\qretry_after\q:1}}"
+   TEST-DROPBOX:ROUTE-SCRIPT! ;
+
+: SERVER-ERROR ( -- )
+   DOWNLOAD$ 500 s" " s" " s" {}" TEST-DROPBOX:ROUTE-SCRIPT! ;
+
+\ A case's pass on the client c over a pending plan of status st's
+\ file.
+: GLOBAL-RUN ( ^DROPBOX:client n ^ARENA:arena -- str ^run )
+   {: c st:n ar :}
+   ar STEP-RUN {: d:str x :}
+   c x RUN-LINK @ REPLAY-LINK:CLIENT !
+   s" global-" st ar NUMBERED str>
+   s" revision-" st ar NUMBERED str> ar REMOTE-FILE {: rem :}
+   x s" global.txt" rem INSTALLING drop
+   d x ;
+
+\ The step ends with E-DROPBOX, the reply w with the wait ms kept in
+\ the link and the plan still pending; the fake saw the requests s.
+: ENDS-STEP ( ^run ^u8 n n ^u8 n -- )
+   {: x w:^ wu:n ms:n s:^ su:n :}
+   [: x STEPPED ;] REPLAY:E-DROPBOX TTHROWSQ
+   x RUN-LINK @ REPLAY-LINK:REPLY @ REPLY$ ms T= w wu T$=
+   x PENDING-OF VEC:COUNT 1 T=
+   x BLOCKED-OF VEC:COUNT 0 T=
+   TEST-DROPBOX:SEEN$ s su T$= ;
+
+\ The answer q scripts for status st ends the step.
+: STAYS-GLOBAL ( [ -- ] n ^u8 n n ^ARENA:arena -- )
+   {: q st:n w:^ wu:n ms:n ar :}
+   TEST-DROPBOX:RESET q execute
+   MAIN @ st ar GLOBAL-RUN {: d:str x :}
+   x w wu ms DOWNLOAD$ ENDS-STEP
+   d x STEP-GONE ;
+
+\ The client c, holding its first token, refreshes on a 401 and sends
+\ again once, so a revoked token ends the step unlinked.
+: REVOKED ( ^DROPBOX:client ^ARENA:arena -- )
+   {: c ar :}
+   c ACCOUNT-OF
+   TEST-DROPBOX:RESET TEST-DROPBOX:REVOKE
+   c 401 ar GLOBAL-RUN {: d:str x :}
+   x s" unlinked" 0
+   s" /2/files/download /oauth2/token /2/files/download" ENDS-STEP
+   d x STEP-GONE ;
+
+\ A client of its own, so MAIN stays linked.
+: UNAUTHORIZED ( ^ARENA:arena -- )
+   {: ar :}
+   ar OPENED {: c :}
+   [: c ar REVOKED ;] [: c DROPBOX:CLOSE ;] finally ;
+
+: WORKER-AUTH-RATE-LIMIT-AND-SERVER-FAILURES-REMAIN-GLOBAL
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" worker_auth_rate_limit_and_server_failures_remain_global" T-LABEL
+   ar UNAUTHORIZED
+   [: RATE-LIMITED ;] 429 s" retry" 7000 ar STAYS-GLOBAL
+   [: SERVER-ERROR ;] 500 s" retry" 0 ar STAYS-GLOBAL ;
+
+: EXPECTED$ ( -- ^u8 n ) s" expected download bytes" ;
+: OCCUPANT$ ( -- ^u8 n ) s" unrelated occupant bytes" ;
+
+: STAGED? ( LOCAL:stage-outcome<n> -- bool )
+   MATCH LOCAL:stage-outcome
+      staged OF drop true ENDOF
+      already-staged OF drop false ENDOF
+      content-changed OF drop false ENDOF
+      destination-occupied OF drop false ENDOF
+   ;MATCH ;
+
+\ The pipe's bytes, of identity c, staged as target t's download.
+: STAGE-FROM ( fd ^run ^u8 n DROPBOX:hash fd -- bool )
+   {: root:fd x t:^ tu:n c:DROPBOX:hash rd:fd :}
+   root x ROOT$ t tu c [: rd -rot LOCAL:FD-READ ;] x RUN-ARENA @
+   LOCAL:STAGE-DOWNLOAD-AT STAGED? ;
+
+\ Rust's stage_download: b staged as target t's download.
+: PRESTAGED ( fd ^run ^u8 n ^u8 n -- )
+   {: root:fd x t:^ tu:n b:^ bu:n :}
+   b bu x RUN-ARENA @ IDENTITY {: c:DROPBOX:hash :}
+   FD:PIPE {: rd:fd w:fd :}
+   w b bu FD:WRITE-FULL w FS:CLOSE-DIR
+   [: root x t tu c rd STAGE-FROM TTRUE ;] [: rd FS:CLOSE-DIR ;]
+   finally ;
+
+: ONE-NAME? ( ^u8 n -- bool )
+   10 INDEX-OF MATCH option
+      none OF true ENDOF
+      some OF drop false ENDOF
+   ;MATCH ;
+
+\ The root's one entry, the stage PRESTAGED made.
+: STAGE-PATH ( ^run -- str )
+   {: x :}
+   x ROOT$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
+   READ-BUF u ONE-NAME? TTRUE
+   READ-BUF u s" .omabox-download-" STARTS-WITH? TTRUE
+   x RUN-ROOT @ READ-BUF u x RUN-ARENA @ INSIDE ;
+
+: HOLDS-BYTES ( str ^u8 n -- )
+   {: f:str b:^ bu:n :}
+   f str> READ-BUF READ-CAP FS:READ-ALL {: u:n :}
+   READ-BUF u b bu T$= ;
+
+\ The stage of occupied.txt's download, holding other bytes, and the
+\ plan to install it.
+: OCCUPIED ( ^run -- str JOURNAL:plan-record )
+   {: x :}
+   x ROOT$ s" open test root" LOCAL:OPEN-ROOT {: root:fd :}
+   [: root x s" occupied.txt" EXPECTED$ PRESTAGED ;]
+   [: root FS:CLOSE-DIR ;] finally
+   x STAGE-PATH {: sp:str :}
+   sp str> FS:REMOVE-FILE sp str> OCCUPANT$ FS:WRITE-ALL
+   EXPECTED$ s" occupied-stage-revision" x RUN-ARENA @ REMOTE-FILE
+   {: rem :}
+   sp x s" occupied.txt" rem INSTALLING ;
+
+\ Rust's StageDestinationOccupied for the plan p at the stage sp.
+: OCCUPIED-ENTRY ( JOURNAL:plan-record str ^ARENA:arena -- str )
+   {: p sp:str ar :}
+   SB-RESET s" stage-destination-occupied " SB-APPEND
+   p ID-OF JOURNAL:PLAN-ID>N FMT:SB-INT
+   s"  " SB-APPEND sp str> SB-APPEND SB$ ar COPIED ;
+
+: OCCUPIED-DOWNLOAD-STAGE-IS-DURABLY-BLOCKED-WITHOUT-OVERWRITE-OR-REQUEST
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" occupied_download_stage_is_durably_blocked_without_overwrite_or_request"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   x OCCUPIED {: sp:str p :}
+   p sp ar OCCUPIED-ENTRY {: e:str :}
+   x REPLAY-STEP REPORTED e str> REPORTS? TTRUE
+   sp OCCUPANT$ HOLDS-BYTES
+   x PENDING-OF VEC:COUNT 0 T=
+   x BLOCKED-OF {: held :}
+   held VEC:COUNT 1 T=
+   held 0 VEC:AT @ HELD-FOR$ s" stage-occupied" T$=
+   TEST-DROPBOX:SEEN$ s" " T$=
+   d x STEP-GONE ;
+
+5 constant DOWNLOAD-COUNT
+4 constant COMPLETED-BATCH
+
+: BATCH$ ( -- ^u8 n ) s" install each bounded batch" ;
+
+\ batch-<k>.txt and its own rev, batch-<k>.
+: BATCH ( n ^ARENA:arena -- str str )
+   {: k:n ar :}
+   s" batch-" k ar NUMBERED {: v:str :}
+   SB-RESET v str> SB-APPEND s" .txt" SB-APPEND SB$ ar COPIED v ;
+
+\ The fake serves batch file k's bytes, the last's only past a byte it
+\ does not keep, so its download from the start answers 500.
+: BATCH-SERVED ( str str n ^ARENA:arena -- )
+   {: p:str v:str k:n ar :}
+   p str> v str> BATCH$ ar FILE-AT
+   BATCH$ {: b:^ bu:n :}
+   k COMPLETED-BATCH < if v str> b bu TEST-DROPBOX:CONTENT! exit then
+   v str> 1 b 1 + bu 1 - TEST-DROPBOX:CONTENT-TAIL! ;
+
+\ Batch file k, served, and its pending plan.
+: BATCHED ( ^run n -- )
+   {: x k:n :}
+   x RUN-ARENA @ {: ar :}
+   k ar BATCH {: p:str v:str :}
+   p v k ar BATCH-SERVED
+   BATCH$ v str> ar REMOTE-FILE {: rem :}
+   x p str> rem INSTALLING drop ;
+
+\ Whether batch file k is installed, holding the batch's bytes.
+: INSTALLED? ( ^run n -- bool )
+   {: x k:n :}
+   k x RUN-ARENA @ BATCH drop {: p:str :}
+   x RUN-ROOT @ p str> x RUN-ARENA @ INSIDE {: f:str :}
+   f str> FS:FILE? 0= if false exit then
+   f BATCH$ HOLDS-BYTES true ;
+
+: INSTALLED ( ^run -- n )
+   {: x :}
+   0 DOWNLOAD-COUNT 0 ?do x i INSTALLED? if 1+ then loop ;
+
+: COMPLETED-DOWNLOAD-BATCH-IS-INSTALLED-BEFORE-THE-NEXT-BATCH-FAILS
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" completed_download_batch_is_installed_before_the_next_batch_fails"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   DOWNLOAD-COUNT 0 ?do x i BATCHED loop
+   [: x STEPPED ;] REPLAY:E-DROPBOX TTHROWSQ
+   x INSTALLED COMPLETED-BATCH T=
+   x PENDING-OF {: pending :}
+   pending VEC:COUNT 1 T=
+   x RUN-ROOT @ pending 0 PLAN-PATH$ ar INSIDE str> FS:EXISTS? TFALSE
+   TEST-DROPBOX:SEEN$ DOWNLOAD-COUNT DOWNLOADS$ T$=
+   d x STEP-GONE ;
+
+: STEP-CASES ( ^ARENA:arena -- )
+   {: ar :}
+   ar WORKER-VERIFICATION-MISMATCH-DURABLY-BLOCKS-ITS-PLAN
+   ar WORKER-AUTH-RATE-LIMIT-AND-SERVER-FAILURES-REMAIN-GLOBAL
+   ar OCCUPIED-DOWNLOAD-STAGE-IS-DURABLY-BLOCKED-WITHOUT-OVERWRITE-OR-REQUEST
+   ar COMPLETED-DOWNLOAD-BATCH-IS-INSTALLED-BEFORE-THE-NEXT-BATCH-FAILS ;
+
 : SERVED ( ^ARENA:arena -- )
    {: ar :}
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
    s" " TEST-DROPBOX:ROOT!
    ar OPENED MAIN !
    ACCOUNTED
-   [: ar REFRESH-CASES ;] [: MAIN @ DROPBOX:CLOSE ;] finally ;
+   [: ar REFRESH-CASES ar STEP-CASES ;] [: MAIN @ DROPBOX:CLOSE ;]
+   finally ;
+
 
 \ The refresh cases against one fake Dropbox, under curl's loop.
 : DROPBOX-SERVED ( ^ARENA:arena -- )
