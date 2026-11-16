@@ -308,16 +308,6 @@ ENUM account-check
       failed OF drop false ENDOF
    ;MATCH ;
 
-\ METADATA answers an entry whose path_lower is not the path's lowercase
-\ refused path-mismatch.
-: ELSEWHERE? ( DROPBOX:reply -- bool )
-   MATCH DROPBOX:reply
-      done OF false ENDOF
-      refused OF DROPBOX-ERROR:PATH-MISMATCH DROPBOX-ERROR:EQ ENDOF
-      retry OF drop false ENDOF
-      unlinked OF false ENDOF
-   ;MATCH ;
-
 : BOUND? ( JOURNAL:dropbox-binding-write -- bool )
    MATCH JOURNAL:dropbox-binding-write
       bound OF true ENDOF
@@ -337,24 +327,19 @@ ENUM account-check
    SESSION-BINDING @ JOURNAL-DROPBOX--BINDING:UNMAKE
    {: a:str n:str r:str :} r str> ;
 
-: USABLE? ( ^DROPBOX:entry -- bool )
-   {: e :}
-   e DROPBOX-ENTRY:KIND @ DROPBOX-KIND:FOLDER DROPBOX-KIND:EQ
-   e DROPBOX-ENTRY:RESTRICTED @ 0= and ;
-
-\ An empty remote root is the account's home, which needs no check.
+\ DROPBOX's check of the binding's remote root, its three refusals
+\ root-unavailable; unbound, which only LINK answers, a root that changed.
 : VALIDATE-REMOTE-ROOT ( ^session -- account-check )
    {: s :}
-   s REMOTE-ROOT$ {: p:^ pu:n :}
-   pu 0= if construct account-check valid exit then
-   s SESSION-CLIENT @ {: c :}
-   p pu c DROPBOX:METADATA {: r :}
-   r ELSEWHERE? if construct account-check root-unavailable exit then
-   r DROPBOX:DONE? 0= if r construct account-check failed exit then
-   c DROPBOX:ENTRY USABLE? 0= if
-      construct account-check root-unavailable exit
-   then
-   construct account-check valid ;
+   s REMOTE-ROOT$ s SESSION-CLIENT @ DROPBOX:CHECK-ROOT
+   MATCH DROPBOX:root-check
+      valid OF construct account-check valid ENDOF
+      failed OF construct account-check failed ENDOF
+      unbound OF construct account-check root-changed ENDOF
+      unavailable OF construct account-check root-unavailable ENDOF
+      not-folder OF construct account-check root-unavailable ENDOF
+      restricted OF construct account-check root-unavailable ENDOF
+   ;MATCH ;
 
 : VALIDATE-CLIENT ( ^session -- account-check )
    {: s :}

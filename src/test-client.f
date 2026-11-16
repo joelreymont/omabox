@@ -12,8 +12,10 @@
 \ SERVES-PAST give the fake a file of them followed by a tail. SOCKET-AT
 \ binds a socket at a path. INSIDE names a file in a directory, REFUSAL?
 \ tells a refusal of one error, and QUOTED+ appends bytes between double
-\ quotes to the string builder. Tests alone load this file; nothing in the
-\ program calls these words.
+\ quotes to the string builder; SYNC-PATHS+ appends /sync's paths and
+\ RESTRICTED$ makes a restricted /Sync folder there. TOKENED opens a
+\ client that holds its first access token. Tests alone load this file;
+\ nothing in the program calls these words.
 \ STORAGE CLASS. PROCESS-WIDE: CFG, MAIN, the "x" bytes, their hasher and
 \ the socket address are one each, for one case at a time.
 
@@ -66,6 +68,17 @@ public
 
 : QUOTED+ ( ^u8 n -- ) S\" \q" SB-APPEND SB-APPEND S\" \q" SB-APPEND ;
 
+\ Appends path_lower /sync and path_display /Sync, after a member.
+: SYNC-PATHS+ ( -- )
+   S\" ,\qpath_lower\q:\q/sync\q,\qpath_display\q:\q/Sync\q" SB-APPEND ;
+
+\ Rust's restricted_folder_metadata("/sync", "/Sync", {r: true}).
+: RESTRICTED$ ( ^u8 n -- ^u8 n )
+   {: r:^ ru:n :}
+   SB-RESET S\" {\q.tag\q:\qfolder\q" SB-APPEND SYNC-PATHS+
+   S\" ,\qsharing_info\q:{" SB-APPEND r ru QUOTED+
+   S\" :true,\qread_only\q:false}}" SB-APPEND SB$ ;
+
 
 \ ---- the fake's client
 
@@ -109,6 +122,11 @@ TYPED-VARIABLE MAIN ^DROPBOX:client
    ;MATCH ;
 
 : ACCOUNTED ( -- ) MAIN @ ACCOUNT-OF ;
+
+\ A client on the fake, no root, holding its first access token.
+: TOKENED ( ^ARENA:arena -- ^DROPBOX:client )
+   OPENED {: c :}
+   c ACCOUNT-OF c ;
 
 private
 ARENA LINKS REPLAY:link

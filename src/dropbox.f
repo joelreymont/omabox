@@ -2342,6 +2342,113 @@ public
 : REFRESH-TOKEN ( ^client -- ^u8 n ) CLIENT-TOKEN @ BUF$ ;
 
 
+\ ---- linking a login
+
+private
+
+$2F constant SEPARATOR
+
+\ Rust's invalid_dropbox_component: empty, . or .., or holding a NUL.
+: INVALID-COMPONENT? ( ^u8 n -- bool )
+   {: p:^ u:n :}
+   u 0= if true exit then
+   p u s" ." STR= p u s" .." STR= or if true exit then
+   p u 0 COUNT-CHAR 0<> ;
+
+\ Whether the separated part from at is invalid; the index after it,
+\ or -1 past the last.
+: PART-INVALID ( ^u8 n n -- bool n )
+   {: p:^ u:n at:n :}
+   p u SEPARATOR at SPLIT-NEXT 0= if 2drop drop false -1 exit then
+   {: s:^ su:n next:n :}
+   s su INVALID-COMPONENT? next ;
+
+public
+
+-100011
+   s" configured Dropbox root must be empty or a normalized absolute Dropbox path"
+   ERROR:CODE E-ROOT-PATH
+
+\ Whether any part of split('/') is invalid; the empty bytes are one
+\ empty part.
+: INVALID-PARTS? ( ^u8 n -- bool )
+   {: p:^ u:n :}
+   0 begin dup 0 >= while
+      p u rot PART-INVALID swap if drop true exit then
+   repeat drop false ;
+
+\ Rust's DropboxRoot::is_valid_path, valid UTF-8 as a Rust string is.
+: ROOT-PATH? ( ^u8 n -- bool )
+   {: p:^ u:n :}
+   u 0= if true exit then
+   p u UTF8:VALID? 0= if false exit then
+   p c@ SEPARATOR <> if false exit then
+   p u + 1- c@ SEPARATOR = if false exit then
+   p 1+ u 1- INVALID-PARTS? 0= ;
+
+\ What linking or checking a remote root found. failed: a call did not
+\ answer done, its reply; unbound: the account's root_info is neither
+\ user nor team (Rust's AccountBindingChanged from namespace_id);
+\ unavailable, not-folder and restricted: Rust's RemoteRootUnavailable,
+\ RemoteRootNotFolder and RemoteRootRestricted.
+ENUM root-check
+   VARIANT valid ;VARIANT
+   VARIANT failed FIELD r reply ;VARIANT
+   VARIANT unbound ;VARIANT
+   VARIANT unavailable ;VARIANT
+   VARIANT not-folder ;VARIANT
+   VARIANT restricted ;VARIANT
+;ENUM
+
+private
+
+\ The root's entry as Rust's validate_remote_root judges it: a folder,
+\ unless folder_restricted, a sharing_info of no_access or traverse_only.
+: ENTRY-CHECK ( ^entry -- root-check )
+   {: e :}
+   e DROPBOX-ENTRY:KIND @ construct kind folder DROPBOX-KIND:EQ 0= if
+      construct root-check not-folder exit
+   then
+   e DROPBOX-ENTRY:RESTRICTED @ if construct root-check restricted exit then
+   construct root-check valid ;
+
+\ One line with Rust's InvalidRootPath text, then E-ROOT-PATH.
+: ROOT-REFUSED ( -- )
+   LOG-OPEN E-ROOT-PATH ERROR:TEXT$ LOG:TEXT+ LOG:;LINE
+   E-ROOT-PATH throw ;
+
+public
+
+\ Rust's validate_remote_root of the remote root p under the client's
+\ Path-Root: empty, the root's own top, needs no call; an entry whose
+\ path_lower is not p's lowercase is unavailable, a deleted entry or a
+\ file not-folder.
+: CHECK-ROOT ( ^u8 n ^client -- root-check )
+   {: p:^ pu:n c :}
+   pu 0= if construct root-check valid exit then
+   p pu c METADATA {: r:reply :}
+   r MISMATCH? if construct root-check unavailable exit then
+   r DONE? 0= if r construct root-check failed exit then
+   c CLIENT-ENTRY ENTRY-CHECK ;
+
+\ Rust's link_inner with no expected account, on a client whose access
+\ token an EXCHANGE set and whose Path-Root line is empty, the account's
+\ home: the account, then the client rooted at its namespace from then
+\ on and CHECK-ROOT of the remote root p. A p ROOT-PATH? refuses throws
+\ E-ROOT-PATH before any call. After valid, ACCOUNT-ID and ROOT-NAMESPACE
+\ name the binding, kept in ar with the Path-Root line.
+: LINK ( ^u8 n ^client ^ARENA:arena -- root-check )
+   {: p:^ pu:n c ar :}
+   p pu ROOT-PATH? 0= if ROOT-REFUSED then
+   c ACCOUNT {: r:reply :}
+   r DONE? 0= if r construct root-check failed exit then
+   c CLIENT-NAMESPACE @ SPAN:LEN 0= if construct root-check unbound exit then
+   c CLIENT-ACCOUNT @ SPAN:$ ar KEEP c CLIENT-ACCOUNT !
+   c CLIENT-NAMESPACE @ SPAN:$ ar KEEP c CLIENT-NAMESPACE !
+   c c ROOT-NAMESPACE ar ROOT-LINE c CLIENT-ROOT-LINE !
+   p pu c CHECK-ROOT ;
+
+
 \ ---- files/upload and upload sessions
 
 \ A file up to CHUNK-SIZE bytes goes in one files/upload; a larger one

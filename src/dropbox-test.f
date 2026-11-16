@@ -27,7 +27,9 @@
 \ not its body catches the short one's failure, a held body one byte
 \ long whose body catches it in flight, a 416 from 0, a
 \ Dropbox-API-Result or an error that does not parse), delete,
-\ create-folder, the code exchange, Dropbox's content hash and uploads,
+\ create-folder, the code exchange, linking a login (of a folder, and
+\ of an account whose root_info carries a tag other than user or team),
+\ Dropbox's content hash and uploads,
 \ whose stages are written under TMPDIR and removed once open, so no run
 \ leaves one; a mutation, session start or finish lost or answered 503
 \ with no wait, an append lost twice, a session gone twice, a mutation
@@ -48,6 +50,7 @@
 \ an_unrotated_refresh_never_touches_secret_service,
 \ sdk_expiry_refresh_reissues_the_route_with_the_same_client,
 \ long_poll_exposes_reset_and_rate_limit_outcomes,
+\ link_rejects_unavailable_file_and_restricted_roots,
 \ oauth_rate_limit_preserves_retry_after_header,
 \ oauth_listing_longpoll_and_exact_download_use_documented_protocol and
 \ conditional_mutations_use_strict_documented_requests. One server
@@ -2728,6 +2731,125 @@ TYPED-VARIABLE FAULT fault
    UNSTAGED ;
 
 
+\ ---- linking a login
+
+\ A client on the fake with no root, holding its first access token as
+\ an EXCHANGE leaves one, nothing seen yet.
+: LINKABLE ( -- ^DROPBOX:client )
+   TEST-DROPBOX:RESET
+   AR @ TOKENED
+   TEST-DROPBOX:RESET ;
+
+
+: CHECK$ ( DROPBOX:root-check -- ^u8 n )
+   MATCH DROPBOX:root-check
+      valid OF s" valid" ENDOF
+      failed OF drop s" failed" ENDOF
+      unbound OF s" unbound" ENDOF
+      unavailable OF s" unavailable" ENDOF
+      not-folder OF s" not-folder" ENDOF
+      restricted OF s" restricted" ENDOF
+   ;MATCH ;
+
+
+\ Whether the check failed on a call Dropbox refused with e.
+: CHECK-REFUSED? ( DROPBOX:root-check DROPBOX:error -- bool )
+   {: e:DROPBOX:error :}
+   MATCH DROPBOX:root-check
+      valid OF false ENDOF
+      failed OF e REFUSED? ENDOF
+      unbound OF false ENDOF
+      unavailable OF false ENDOF
+      not-folder OF false ENDOF
+      restricted OF false ENDOF
+   ;MATCH ;
+
+
+\ Rust's root_link_failure: LINK of /Sync on a client whose get_metadata
+\ answers status st and the body b builds, after its two requests.
+: ROOT-LINKED ( n [ -- ^u8 n ] -- DROPBOX:root-check )
+   {: st:n b :}
+   LINKABLE {: c :}
+   s" /2/files/get_metadata" st s" " s" " b execute
+   TEST-DROPBOX:ROUTE-SCRIPT!
+   s" /Sync" c AR @ DROPBOX:LINK
+   TEST-DROPBOX:SEEN$
+   s" /2/users/get_current_account /2/files/get_metadata" T$=
+   c DROPBOX:CLOSE ;
+
+
+\ Rust's lookup_error("not_found").
+: NOT-FOUND$ ( -- ^u8 n )
+   SB-RESET S\" {\qerror_summary\q:\qpath/not_found/...\q," SB-APPEND
+   S\" \qerror\q:{\q.tag\q:\qpath\q,\qpath\q:{\q.tag\q:\qnot_found\q}}}"
+   SB-APPEND SB$ ;
+
+
+\ Rust's file_metadata("/sync", "/Sync", "root-file-revision") of the
+\ bytes "root file".
+: ROOT-FILE$ ( -- ^u8 n )
+   HASHER DROPBOX:HASH-BEGIN
+   s" root file" HASHER DROPBOX:HASH-FEED
+   HASHER DROPBOX:HASH-END {: h:^ hu:n :}
+   SB-RESET S\" {\q.tag\q:\qfile\q" SB-APPEND SYNC-PATHS+
+   S\" ,\qrev\q:\qroot-file-revision\q,\qsize\q:0" SB-APPEND
+   S\" ,\qcontent_hash\q:" SB-APPEND h hu QUOTED+
+   S\" ,\qis_downloadable\q:true}" SB-APPEND SB$ ;
+
+
+\ A LINK that answers valid keeps the fake's account and namespace past
+\ the get_metadata call, which carried the namespace's Path-Root.
+: VALID-LINK-CASE ( -- )
+   s" link of a folder" T-LABEL
+   LINKABLE {: c :}
+   s" /2/files/get_metadata" 200 s" " s" "
+   SB-RESET S\" {\q.tag\q:\qfolder\q" SB-APPEND SYNC-PATHS+
+   s" }" SB-APPEND SB$
+   TEST-DROPBOX:ROUTE-SCRIPT!
+   s" /Sync" c AR @ DROPBOX:LINK CHECK$ s" valid" T$=
+   c DROPBOX:ACCOUNT-ID s" dbid:account" T$=
+   c DROPBOX:ROOT-NAMESPACE s" namespace" T$=
+   TEST-DROPBOX:SEEN$
+   s" /2/users/get_current_account /2/files/get_metadata" T$=
+   TEST-DROPBOX:ROOT-SENT? TTRUE
+   TEST-DROPBOX:ROOT-SENT$ S\" {\q.tag\q:\qroot\q,\qroot\q:\qnamespace\q}" T$=
+   c DROPBOX:CLOSE ;
+
+
+: LINK-REJECTS-UNAVAILABLE-FILE-AND-RESTRICTED-ROOTS ( -- )
+   s" link_rejects_unavailable_file_and_restricted_roots" T-LABEL
+   409 [: NOT-FOUND$ ;] ROOT-LINKED
+   DROPBOX-ERROR:NOT-FOUND CHECK-REFUSED? TTRUE
+   200 [: ROOT-FILE$ ;] ROOT-LINKED CHECK$ s" not-folder" T$=
+   200 [: s" no_access" RESTRICTED$ ;] ROOT-LINKED CHECK$
+   s" restricted" T$=
+   200 [: s" traverse_only" RESTRICTED$ ;] ROOT-LINKED CHECK$
+   s" restricted" T$= ;
+
+
+\ A root_info under a tag other than user or team binds no namespace:
+\ unbound after the account alone.
+: UNBOUND-LINK-CASE ( -- )
+   s" link under another root tag" T-LABEL
+   LINKABLE {: c :}
+   s" /2/users/get_current_account" 200 s" " s" "
+   S\" {\qaccount_id\q:\qdbid:account\q,\qroot_info\q:{\qroot_namespace_id\q:\qnamespace\q,\q.tag\q:\qother\q}}"
+   TEST-DROPBOX:ROUTE-SCRIPT!
+   s" /Sync" c AR @ DROPBOX:LINK CHECK$ s" unbound" T$=
+   TEST-DROPBOX:SEEN$ s" /2/users/get_current_account" T$=
+   c DROPBOX:CLOSE ;
+
+
+\ Linking starts at the account's home, so the fake expects no Path-Root;
+\ the get_metadata under the namespace's is scripted, and a scripted
+\ answer passes no root check.
+: LINK-CASES ( -- )
+   s" " TEST-DROPBOX:ROOT!
+   VALID-LINK-CASE
+   LINK-REJECTS-UNAVAILABLE-FILE-AND-RESTRICTED-ROOTS UNBOUND-LINK-CASE
+   s" ns-root" TEST-DROPBOX:ROOT! ;
+
+
 : CASES ( -- )
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
    s" ns-root" TEST-DROPBOX:ROOT!
@@ -2758,6 +2880,7 @@ TYPED-VARIABLE FAULT fault
    LOST-REFRESH-CASE
    EXCHANGE-CASE DEAD-CODE-CASE RESERVED-REFRESH-CASE RESERVED-CODE-CASE
    OAUTH-LISTING-LONGPOLL-AND-EXACT-DOWNLOAD-USE-DOCUMENTED-PROTOCOL
+   LINK-CASES
    UPLOAD-CASES DROPBOX:THROW-CASES
    MAIN @ DROPBOX:CLOSE ;
 

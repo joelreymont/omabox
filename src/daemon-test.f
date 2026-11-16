@@ -14,8 +14,7 @@
 \ - local_root_failures_name_their_own_cause, a removed root inspected
 \ Account validation, against the fake Dropbox of test-dropbox.f on
 \ test-client.f's clients, each holding its first access token:
-\ - Rust's link_rejects_unavailable_file_and_restricted_roots, each root
-\   through VALIDATE's remote-root check.
+\ - a restricted remote root, root-unavailable through VALIDATE.
 \ - Rust's journal_binding_mismatch_blocks_inventory_before_listing.
 \ - Rust's
 \   account_validation_is_cached_per_client_but_every_journal_is_checked.
@@ -68,18 +67,6 @@ private
       journal-binding-changed OF s" journal-binding-changed" ENDOF
       root-unavailable OF s" root-unavailable" ENDOF
       failed OF drop s" failed" ENDOF
-   ;MATCH ;
-
-\ Whether the check failed on a call Dropbox refused with e.
-: REFUSED? ( account-check DROPBOX:error -- bool )
-   {: e:DROPBOX:error :}
-   MATCH account-check
-      valid OF false ENDOF
-      account-changed OF false ENDOF
-      root-changed OF false ENDOF
-      journal-binding-changed OF false ENDOF
-      root-unavailable OF false ENDOF
-      failed OF e TEST-CLIENT:REFUSAL? ENDOF
    ;MATCH ;
 
 \ ---- failure policy ----------------------------------------------
@@ -576,7 +563,6 @@ public
 EXPORT OWNED-SESSION
 EXPORT VALIDATE
 EXPORT CHECK$
-EXPORT REFUSED?
 EXPORT POLICY-CASES
 EXPORT RUN-CASES
 ;package
@@ -600,10 +586,6 @@ private
    s" different-account" >str s" namespace" >str s" " >str
    JOURNAL-DROPBOX--BINDING:MAKE ;
 
-: TOKENED ( ^ARENA:arena -- ^DROPBOX:client )
-   OPENED {: c :}
-   c ACCOUNT-OF c ;
-
 \ A case's directory and the journal opened in it.
 : CASE-JOURNAL ( ^ARENA:arena -- str JOURNAL:journal )
    {: ar :}
@@ -618,70 +600,19 @@ private
 
 : ACCOUNT-ROUTE$ ( -- ^u8 n ) s" /2/users/get_current_account" ;
 
-\ Rust's root_link_failure: a client whose get_metadata answers status
-\ st and the body b builds, nothing seen yet.
-: ROOT-ANSWERS ( n [ -- ^u8 n ] ^ARENA:arena -- ^DROPBOX:client )
-   {: st:n b ar :}
+\ A restricted remote root through VALIDATE is unavailable, so the
+\ daemon never syncs a root it cannot list completely.
+: RESTRICTED-ROOT-IS-UNAVAILABLE ( ^ARENA:arena -- )
+   {: ar :}
+   s" a restricted root is unavailable" T-LABEL
+   ar CASE-JOURNAL {: d:str j :}
    ar TOKENED {: c :}
    TEST-DROPBOX:RESET
-   s" /2/files/get_metadata" st s" " s" " b execute
+   s" /2/files/get_metadata" 200 s" " s" " s" no_access" RESTRICTED$
    TEST-DROPBOX:ROUTE-SCRIPT!
-   c ;
-
-\ Rust's root_link_failure's two requests.
-: ROOT-SEEN ( -- )
-   s" /2/users/get_current_account /2/files/get_metadata" SEEN ;
-
-: PATHS+ ( -- )
-   S\" ,\qpath_lower\q:\q/sync\q,\qpath_display\q:\q/Sync\q" SB-APPEND ;
-
-\ Rust's lookup_error("not_found").
-: NOT-FOUND$ ( -- ^u8 n )
-   SB-RESET S\" {\qerror_summary\q:\qpath/not_found/...\q," SB-APPEND
-   S\" \qerror\q:{\q.tag\q:\qpath\q,\qpath\q:{\q.tag\q:\qnot_found\q}}}"
-   SB-APPEND SB$ ;
-
-TYPED-VARIABLE HASHING DROPBOX:hasher
-
-\ Rust's file_metadata("/sync", "/Sync", "root-file-revision") of the
-\ bytes "root file".
-: ROOT-FILE$ ( -- ^u8 n )
-   HASHING DROPBOX:HASH-BEGIN
-   s" root file" HASHING DROPBOX:HASH-FEED
-   HASHING DROPBOX:HASH-END {: h:^ hu:n :}
-   SB-RESET S\" {\q.tag\q:\qfile\q" SB-APPEND PATHS+
-   S\" ,\qrev\q:\qroot-file-revision\q,\qsize\q:0" SB-APPEND
-   S\" ,\qcontent_hash\q:" SB-APPEND h hu QUOTED+
-   S\" ,\qis_downloadable\q:true}" SB-APPEND SB$ ;
-
-\ Rust's restricted_folder_metadata("/sync", "/Sync", {r: true}).
-: RESTRICTED$ ( ^u8 n -- ^u8 n )
-   {: r:^ ru:n :}
-   SB-RESET S\" {\q.tag\q:\qfolder\q" SB-APPEND PATHS+
-   S\" ,\qsharing_info\q:{" SB-APPEND r ru QUOTED+
-   S\" :true,\qread_only\q:false}}" SB-APPEND SB$ ;
-
-: LINK-REJECTS-UNAVAILABLE-FILE-AND-RESTRICTED-ROOTS ( ^ARENA:arena -- )
-   {: ar :}
-   s" link_rejects_unavailable_file_and_restricted_roots" T-LABEL
-   s" /Sync" BINDING-AT {: b :}
-   ar CASE-JOURNAL {: d:str j :}
-   409 [: NOT-FOUND$ ;] ar ROOT-ANSWERS {: c1 :}
-   j c1 b ar DAEMON:OWNED-SESSION ar DAEMON:VALIDATE
-   DROPBOX-ERROR:NOT-FOUND DAEMON:REFUSED? TTRUE
-   ROOT-SEEN
-   200 [: ROOT-FILE$ ;] ar ROOT-ANSWERS {: c2 :}
-   j c2 b ar DAEMON:OWNED-SESSION ar DAEMON:VALIDATE DAEMON:CHECK$
-   s" root-unavailable" T$=
-   ROOT-SEEN
-   200 [: s" no_access" RESTRICTED$ ;] ar ROOT-ANSWERS {: c3 :}
-   j c3 b ar DAEMON:OWNED-SESSION ar DAEMON:VALIDATE DAEMON:CHECK$
-   s" root-unavailable" T$=
-   ROOT-SEEN
-   200 [: s" traverse_only" RESTRICTED$ ;] ar ROOT-ANSWERS {: c4 :}
-   j c4 b ar DAEMON:OWNED-SESSION ar DAEMON:VALIDATE DAEMON:CHECK$
-   s" root-unavailable" T$=
-   ROOT-SEEN
+   j c s" /Sync" BINDING-AT ar DAEMON:OWNED-SESSION ar DAEMON:VALIDATE
+   DAEMON:CHECK$ s" root-unavailable" T$=
+   s" /2/users/get_current_account /2/files/get_metadata" SEEN
    d j CASE-GONE ;
 
 : JOURNAL-BINDING-MISMATCH-BLOCKS-INVENTORY-BEFORE-LISTING
@@ -741,7 +672,7 @@ TYPED-VARIABLE HASHING DROPBOX:hasher
    {: ar :}
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
    s" " TEST-DROPBOX:ROOT!
-   ar LINK-REJECTS-UNAVAILABLE-FILE-AND-RESTRICTED-ROOTS
+   ar RESTRICTED-ROOT-IS-UNAVAILABLE
    ar JOURNAL-BINDING-MISMATCH-BLOCKS-INVENTORY-BEFORE-LISTING
    ar ACCOUNT-VALIDATION-IS-CACHED-PER-CLIENT-BUT-EVERY-JOURNAL-IS-CHECKED
    ar FAILED-ACCOUNT-VALIDATION-IS-RETRIED-BY-THE-SAME-CLIENT ;

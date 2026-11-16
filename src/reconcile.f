@@ -1350,37 +1350,6 @@ STRUCTURE casing
    du 0<> if s"  `" LOG:TEXT+ d du LOG:TEXT+ s" `" LOG:TEXT+ then
    LOG:;LINE E-LISTING throw ;
 
-: INVALID-COMPONENT? ( ^u8 n -- bool )
-   {: p:^ u:n :}
-   u 0= if true exit then
-   p u s" ." STR= p u s" .." STR= or if true exit then
-   p u 0 COUNT-CHAR 0<> ;
-
-\ Whether the separated part from at is invalid; the index after it,
-\ or -1 past the last.
-: PART-INVALID ( ^u8 n n -- bool n )
-   {: p:^ u:n at:n :}
-   p u SEPARATOR at SPLIT-NEXT 0= if 2drop drop false -1 exit then
-   {: s:^ su:n next:n :}
-   s su INVALID-COMPONENT? next ;
-
-\ Whether any part of split('/') is invalid; the empty bytes are one
-\ empty part.
-: INVALID-PARTS? ( ^u8 n -- bool )
-   {: p:^ u:n :}
-   0 begin dup 0 >= while
-      p u rot PART-INVALID swap if drop true exit then
-   repeat drop false ;
-
-\ Rust's is_valid_path, valid UTF-8 as a Rust string is.
-: ROOT-PATH? ( ^u8 n -- bool )
-   {: p:^ u:n :}
-   u 0= if true exit then
-   p u UTF8:VALID? 0= if false exit then
-   p c@ SEPARATOR <> if false exit then
-   p u + 1- c@ SEPARATOR = if false exit then
-   p 1+ u 1- INVALID-PARTS? 0= ;
-
 : SAVED ( ^u8 n ^ARENA:arena -- str )
    {: p:^ u:n ar :}
    u 0= if s" " >str exit then
@@ -1400,7 +1369,7 @@ STRUCTURE casing
 \ Rust's DropboxRoot::new over the binding's remote root.
 : NEW-LISTING-ROOT ( str ^ARENA:arena -- listing-root )
    {: s:str ar :}
-   s str> ROOT-PATH? 0= if
+   s str> DROPBOX:ROOT-PATH? 0= if
       s" configured Dropbox root must be empty or a normalized absolute Dropbox path"
       LISTING-FAILED
    then
@@ -1443,7 +1412,7 @@ STRUCTURE casing
    {: k:^ ku:n p:^ pu:n :}
    k ku SEPARATOR COUNT-CHAR p pu SEPARATOR COUNT-CHAR <>
    if false exit then
-   k ku INVALID-PARTS? p pu INVALID-PARTS? or 0= ;
+   k ku DROPBOX:INVALID-PARTS? p pu DROPBOX:INVALID-PARTS? or 0= ;
 
 \ Rust's relative_paths: the key and display path beneath the root of
 \ the entry's lower and display paths, in the arena.
