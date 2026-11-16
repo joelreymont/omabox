@@ -43,7 +43,8 @@
 \   retire it; a directory at the stage blocks it
 \   stage-destination-occupied at the stage's path, the plan pending; a
 \   directory at the target retires it, logging nothing.
-\ Against the fake Dropbox of test-dropbox.f, root empty:
+\ Against the fake Dropbox of test-dropbox.f, on test-client.f's
+\ client, root empty:
 \ - REMOTE-CREATE-FOLDER of a folder Dropbox already holds, refused as a
 \   conflict, is read back as applied.
 \ - REMOTE-DELETE-FOLDER of an empty folder deletes it; of an occupied
@@ -130,6 +131,7 @@ require src/test-journal.f
 require src/local.f
 require src/status.f
 require src/replay.f
+require src/test-client.f
 
 \ REPLAY reopened for the private words the tests call.
 package REPLAY
@@ -167,7 +169,6 @@ EXPORT REMOTE-CREATE-FOLDER
 EXPORT REMOTE-UPLOAD
 EXPORT REMOTE-DELETE-FOLDER
 EXPORT REMOTE-DELETE-FILE
-EXPORT LOCAL:DOWNLOAD-CHECKPOINT-BYTES
 EXPORT PASS-OVER
 EXPORT PASS-STAGING
 EXPORT PASS-BLOCKED
@@ -187,17 +188,12 @@ EXPORT APPLY-FILE-MUTATION
 EXPORT APPLY-DELETE-MUTATION
 ;package
 
+using TEST-CLIENT
 package REPLAY-TEST
 private
 
 
 \ ---- a case's directory ------------------------------------------
-
-: COPIED ( ^u8 n ^ARENA:arena -- str )
-   {: a:^ u ar :}
-   ar u ARENA:ALLOC drop {: dst:^ :}
-   a dst u BYTE-COPY
-   dst u >str ;
 
 \ dir/name.
 : INSIDE ( str ^u8 n ^ARENA:arena -- str )
@@ -271,8 +267,6 @@ private
 
 
 \ ---- recoveries ----------------------------------------------------
-
-: FAILED ( ^u8 n -- ) T-EX-FAIL die ;
 
 \ Rust's dropbox_content_hash of the bytes, read from a pipe.
 : HASH-OF ( ^u8 n ^ARENA:arena -- DROPBOX:hash )
@@ -878,10 +872,6 @@ $140 constant MODE-NO-WRITE
 
 \ ---- Dropbox mutations ---------------------------------------------
 
-TYPED-VARIABLE CFG DROPBOX:config
-\ The client on the fake, while it serves.
-TYPED-VARIABLE MAIN ^DROPBOX:client
-
 : STATE$ ( REPLAY:remote-path-state -- ^u8 n )
    MATCH REPLAY:remote-path-state
       absent OF s" absent" ENDOF
@@ -988,14 +978,6 @@ TYPED-VARIABLE MAIN ^DROPBOX:client
    CREATE-FOLDER-ROWS DELETE-FOLDER-ROWS ;
 
 
-ARENA LINKS REPLAY:link
-
-\ A link on the client below root, with no status.
-: NEW-LINK ( ^DROPBOX:client ^u8 n ^ARENA:arena -- ^REPLAY:link )
-   {: c r:^ ru:n ar :}
-   ar LINKS-NEW {: l :}
-   c l REPLAY-LINK:CLIENT ! r ru ar COPIED l REPLAY-LINK:ROOT !
-   l ;
 
 : REJECTS ( DROPBOX:error ^REPLAY:link ^u8 n -- )
    {: e l want:^ wu:n :}
@@ -1007,14 +989,6 @@ ARENA LINKS REPLAY:link
       done OF false ENDOF
       refused OF e DROPBOX-ERROR:EQ ENDOF
       retry OF drop false ENDOF
-      unlinked OF false ENDOF
-   ;MATCH ;
-
-: RETRY? ( DROPBOX:reply -- bool )
-   MATCH DROPBOX:reply
-      done OF false ENDOF
-      refused OF drop false ENDOF
-      retry OF drop true ENDOF
       unlinked OF false ENDOF
    ;MATCH ;
 
@@ -2035,35 +2009,6 @@ TYPED-VARIABLE SENT ^LOCAL:staged-upload
 
 \ ---- the fake's client
 
-\ A client on the fake, no root, keeping no rotated token.
-: OPENED ( ^ARENA:arena -- ^DROPBOX:client )
-   {: ar :}
-   [: 2drop ;] CFG DROPBOX-CONFIG:STORE !
-   CFG DROPBOX:PRODUCTION
-   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:API !
-   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:NOTIFY !
-   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:CONTENT !
-   s" fake-key" SPAN:MAKE CFG DROPBOX-CONFIG:KEY !
-   s" live-token" SPAN:MAKE CFG DROPBOX-CONFIG:TOKEN !
-   s" " SPAN:MAKE CFG DROPBOX-CONFIG:ROOT !
-   CFG ar DROPBOX:OPEN ;
-
-: CURL-READY ( CURL:status -- )
-   MATCH CURL:status
-      ok OF ENDOF
-      failed OF drop s" the curl loop did not start" FAILED ENDOF
-   ;MATCH ;
-
-\ The account call takes the client's first access token, so no case's
-\ requests start with a refresh.
-: ACCOUNTED ( -- )
-   MAIN @ DROPBOX:ACCOUNT MATCH DROPBOX:reply
-      done OF ENDOF
-      refused OF drop s" the account was refused" FAILED ENDOF
-      retry OF drop s" the account asked a retry" FAILED ENDOF
-      unlinked OF s" the account was unlinked" FAILED ENDOF
-   ;MATCH ;
-
 : SERVED ( ^ARENA:arena -- )
    {: ar :}
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
@@ -2081,15 +2026,9 @@ TYPED-VARIABLE LINK REPLAY:link
 TYPED-VARIABLE RUNTIME str
 TYPED-VARIABLE ASIDE str
 TYPED-VARIABLE STAGE-AT str
-TYPED-VARIABLE HASHING DROPBOX:hasher
-variable REMAINING
 
 4096 constant CAP
 CAP BUFFER: TEXT
-$10000 constant XS-SIZE
-XS-SIZE BUFFER: XS
-
-: FILL-XS ( -- ) XS-SIZE 0 ?do $78 XS i + c! loop ;
 
 
 \ A client on the fake with the refresh token t, as CFG's store has it.
@@ -2234,62 +2173,6 @@ variable HELD
    TEXT k begin dup 0 > while
       NEXT-NAME dev ino SAME-FILE? if 1 HELD +! then
    repeat 2drop HELD @ ;
-
-\ Rust's FailingBytes: "x" bytes until none remain, then a reset
-\ connection.
-: FAILING ( ^u8 n -- n )
-   {: dst:^ cap:n :}
-   REMAINING @ 0= if 104 FS:CAUSE! E-FS-IO throw then
-   REMAINING @ cap min XS-SIZE min {: k:n :}
-   XS dst k BYTE-COPY
-   k negate REMAINING +!
-   k ;
-
-: READY-PARTIAL ( LOCAL:download-preparation -- ^LOCAL:download-partial )
-   MATCH LOCAL:download-preparation
-      ready OF ENDOF
-      complete OF DROP-STAGE s" replay-test: no partial" FAILED ENDOF
-      ephemeral OF s" replay-test: no partial" FAILED ENDOF
-   ;MATCH ;
-
-: CHECKPOINT ( -- n ) REPLAY:DOWNLOAD-CHECKPOINT-BYTES ;
-
-\ The lease's slot holding a durable checkpoint of CHECKPOINT "x"
-\ bytes for target t, as a transfer lost just past it leaves it.
-: CHECKPOINTED
-   ( fd str ^u8 n DROPBOX:hash LOCAL:download-slot-lease ^ARENA:arena
-     -- )
-   {: root:fd r:str t:^ tu:n c:DROPBOX:hash
-      l:LOCAL:download-slot-lease ar :}
-   root r str> t tu c l ar LOCAL:PREPARE-DOWNLOAD-SLOT-AT READY-PARTIAL
-   {: x :}
-   CHECKPOINT 1+ REMAINING !
-   [: x CHECKPOINT DROPBOX:BLOCK + [: FAILING ;] ar
-      LOCAL:APPEND-PARTIAL DROP-STAGE ;]
-   [: 2drop true ;] LOCAL:CONVERTING LOCAL:E-STAGE-READ T= ;
-
-\ HASHING begun and fed CHECKPOINT "x" bytes.
-: XS-FED ( -- )
-   HASHING DROPBOX:HASH-BEGIN
-   CHECKPOINT XS-SIZE / 0 ?do XS XS-SIZE HASHING DROPBOX:HASH-FEED loop ;
-
-: HASHED ( ^ARENA:arena -- DROPBOX:hash )
-   {: ar :}
-   HASHING DROPBOX:HASH-END ar COPIED DROPBOX:>HASH ;
-
-\ The content hash of CHECKPOINT "x" bytes.
-: CHECKPOINT-HASH ( ^ARENA:arena -- DROPBOX:hash ) XS-FED HASHED ;
-
-\ The content hash of CHECKPOINT "x" bytes, then ALPHABET.
-: RESUMED-HASH ( ^ARENA:arena -- DROPBOX:hash )
-   XS-FED ALPHABET HASHING DROPBOX:HASH-FEED HASHED ;
-
-\ SERVES of CHECKPOINT bytes the fake does not keep, then b.
-: SERVES-PAST ( ^u8 n ^u8 n ^u8 n DROPBOX:hash -- )
-   {: p:^ pu:n v:^ vu:n b:^ bu:n c:DROPBOX:hash :}
-   c DROPBOX:HASH>STR str> {: h:^ hu:n :}
-   p pu p pu v vu h hu CHECKPOINT bu + TEST-DROPBOX:FILE!
-   v vu CHECKPOINT b bu TEST-DROPBOX:CONTENT-TAIL! ;
 
 \ The content hash of the root r's one file, the stage.
 : STAGE-HASH ( str ^ARENA:arena -- DROPBOX:hash )
@@ -2445,7 +2328,7 @@ variable HELD
    {: ar :}
    s" a 416 at the partial's length finishes the stage, unread" T-LABEL
    TEST-DROPBOX:RESET
-   ar CHECKPOINT-HASH {: c:DROPBOX:hash :}
+   s" " ar PAST-HASH {: c:DROPBOX:hash :}
    c s" full-revision" REMOTE-OF {: rem:MODEL:remote :}
    ar CONFLICT-DIRS {: d:str r:str s:str :}
    r OPEN-ROOT {: root:fd :}
@@ -2542,7 +2425,7 @@ variable HELD
    {: ar :}
    s" interrupted_exact_download_resumes_only_from_a_valid_range" T-LABEL
    TEST-DROPBOX:RESET
-   ar RESUMED-HASH {: c:DROPBOX:hash :}
+   ALPHABET ar PAST-HASH {: c:DROPBOX:hash :}
    s" /resume.bin" s" resume-revision" ALPHABET c SERVES-PAST
    c s" resume-revision" REMOTE-OF {: rem:MODEL:remote :}
    ar CONFLICT-DIRS {: d:str r:str s:str :}
@@ -3767,3 +3650,4 @@ variable SIDES
 RUN
 
 ;package
+;using

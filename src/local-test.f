@@ -65,6 +65,7 @@ require src/config.f
 require src/journal.f
 require src/test-journal.f
 require src/local.f
+require src/test-client.f
 
 \ LOCAL reopened for the stream a fragmenting reader feeds, its stage
 \ words, and the names of its private results' variants.
@@ -414,26 +415,8 @@ create TIMES 32 allot
    AT FS:>PATHZ READ-BUF 64 READLINK-CALL READ-BUF swap ;
 
 FUNCTION: MKFIFO-CALL mkfifo ( ^u8 n -- i32 ) ;FUNCTION
-FUNCTION: SOCKET-CALL socket ( n n n -- i32 ) ;FUNCTION
-FUNCTION: BIND-CALL bind ( n ^u8 n -- i32 ) ;FUNCTION
 
 384 constant MODE-0600
-1 constant AF-UNIX
-1 constant SOCK-STREAM
-\ Linux sockaddr_un: a u16 sun_family, then a 108-byte sun_path.
-110 BUFFER: SOCKADDR
-
-\ A socket bound at the name below the case's root, as Rust's
-\ UnixListener::bind leaves one; its descriptor.
-: BOUND ( ^u8 n -- fd )
-   AT {: p:^ u:n :}
-   u 108 < TTRUE
-   AF-UNIX SOCKADDR c! 0 SOCKADDR 1 + c!
-   p SOCKADDR 2 + u BYTE-COPY 0 SOCKADDR 2 + u + c!
-   AF-UNIX SOCK-STREAM 0 SOCKET-CALL {: s:n :}
-   s 0 >= TTRUE
-   s SOCKADDR u 3 + BIND-CALL 0 T=
-   s >FD ;
 
 FS:PATHZ-CAP BUFFER: TARGET
 
@@ -825,7 +808,7 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    s" regular.txt" s" regular" WRITE
    s" regular.txt" TARGET-AT s" link" AT FS:MAKE-SYMLINK
    s" fifo" AT FS:>PATHZ MODE-0600 MKFIFO-CALL 0 T=
-   s" socket" BOUND {: sock:fd :}
+   s" socket" AT TEST-CLIENT:SOCKET-AT {: sock:fd :}
    [: ROOT-SCAN ;] [: sock DISCARD ;] finally {: s:complete-scan :}
    s s" fifo" UNSUPPORTED-KIND SEEN
    s s" link" UNSUPPORTED-KIND SEEN

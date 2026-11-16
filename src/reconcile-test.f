@@ -211,18 +211,14 @@ require src/planner.f
 require src/status.f
 require src/replay.f
 require src/reconcile.f
+require src/test-client.f
 
+using TEST-CLIENT
 \ RECONCILE reopened for the private words the tests call.
 package RECONCILE
 private
 
 \ ---- known paths: helpers -----------------------------------------
-
-: COPIED ( ^u8 n ^ARENA:arena -- str )
-   {: a:^ u ar :}
-   ar u ARENA:ALLOC drop {: dst:^ :}
-   a dst u BYTE-COPY
-   dst u >str ;
 
 \ A case's directory, made under TMPDIR, and its journal.
 : CASE-JOURNAL ( ^ARENA:arena -- str JOURNAL:journal )
@@ -1581,56 +1577,6 @@ ARENA LISTED DROPBOX:entry
 
 \ ---- the listing against the fake Dropbox ---------------------------
 
-TYPED-VARIABLE CFG DROPBOX:config
-\ The client on the fake, while it serves.
-TYPED-VARIABLE MAIN ^DROPBOX:client
-ARENA LINKS REPLAY:link
-
-\ A client on the fake, no root, keeping no rotated token.
-: OPENED ( ^ARENA:arena -- ^DROPBOX:client )
-   {: ar :}
-   [: 2drop ;] CFG DROPBOX-CONFIG:STORE !
-   CFG DROPBOX:PRODUCTION
-   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:API !
-   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:NOTIFY !
-   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:CONTENT !
-   s" fake-key" SPAN:MAKE CFG DROPBOX-CONFIG:KEY !
-   s" live-token" SPAN:MAKE CFG DROPBOX-CONFIG:TOKEN !
-   s" " SPAN:MAKE CFG DROPBOX-CONFIG:ROOT !
-   CFG ar DROPBOX:OPEN ;
-
-\ Ends the run: the case cannot go on.
-: FAILED ( ^u8 n -- ) T-EX-FAIL die ;
-
-: CURL-READY ( CURL:status -- )
-   MATCH CURL:status
-      ok OF ENDOF
-      failed OF drop s" the curl loop did not start" FAILED ENDOF
-   ;MATCH ;
-
-\ The account call takes the client's first access token, so no case's
-\ requests start with a refresh.
-: ACCOUNT-OF ( ^DROPBOX:client -- )
-   DROPBOX:ACCOUNT MATCH DROPBOX:reply
-      done OF ENDOF
-      refused OF drop s" the account was refused" FAILED ENDOF
-      retry OF drop s" the account asked a retry" FAILED ENDOF
-      unlinked OF s" the account was unlinked" FAILED ENDOF
-   ;MATCH ;
-
-: ACCOUNTED ( -- ) MAIN @ ACCOUNT-OF ;
-
-: NEW-LINK ( ^ARENA:arena -- ^REPLAY:link )
-   LINKS-NEW {: l :} MAIN @ l REPLAY-LINK:CLIENT ! l ;
-
-: RETRY? ( DROPBOX:reply -- bool )
-   MATCH DROPBOX:reply
-      done OF false ENDOF
-      refused OF drop false ENDOF
-      retry OF drop true ENDOF
-      unlinked OF false ENDOF
-   ;MATCH ;
-
 : QUOTED+ ( ^u8 n -- ) S\" \q" SB-APPEND SB-APPEND S\" \q" SB-APPEND ;
 
 : PATHS+ ( ^u8 n ^u8 n -- )
@@ -1737,7 +1683,7 @@ ARENA LINKS REPLAY:link
    s" fresh-a" true PAGE
    [: s" /new.txt" s" /New.txt" s" rev-new" h FILE-JSON+ ;] ar ENTRIES
    s" fresh-b" false PAGE
-   j ar NEW-LINK ar REFRESHED
+   j MAIN @ s" " ar NEW-LINK ar REFRESHED
    j ar JOURNAL:REMOTE-INVENTORY
    JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur rs :}
    cur s" fresh-b" CURSOR-IS? TTRUE
@@ -1768,7 +1714,7 @@ ARENA LINKS REPLAY:link
    [: s" /replacement.txt" s" /Replacement.txt" s" rev-partial" h
       FILE-JSON+ ;] ar ENTRIES
    s" fresh-partial" true PAGE
-   ar NEW-LINK {: l :}
+   MAIN @ s" " ar NEW-LINK {: l :}
    [: j l ar REFRESHED ;] REPLAY:E-DROPBOX TTHROWSQ
    l REPLAY-LINK:REPLY @ RETRY? TTRUE
    j s" durable-cursor" old ar KEPT
@@ -1801,7 +1747,7 @@ ARENA LINKS REPLAY:link
       s" /keep" s" /Keep" FOLDER-JSON+ COMMA+
       s" /phantom/leaf" s" /Phantom/Leaf" DELETED-JSON+ ;] ar ENTRIES
    s" tree-b" false PAGE
-   j ar NEW-LINK ar REFRESHED
+   j MAIN @ s" " ar NEW-LINK ar REFRESHED
    j ar JOURNAL:REMOTE-INVENTORY
    JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur rs :}
    rs VEC:COUNT 5 T=
@@ -1836,7 +1782,7 @@ ARENA LINKS REPLAY:link
    S\" ,\qcursor\q:\qnext\q,\qhas_more\q:true}" SB-APPEND
    CONTINUE$ 200 s" " s" " SB$ TEST-DROPBOX:ROUTE-SCRIPT!
    UNAVAILABLE!
-   ar NEW-LINK {: l :}
+   MAIN @ s" " ar NEW-LINK {: l :}
    [: j l ar REFRESHED ;] REPLAY:E-DROPBOX TTHROWSQ
    l REPLAY-LINK:REPLY @ RETRY? TTRUE
    j s" durable-cursor" old ar KEPT
@@ -1997,7 +1943,7 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
    [: s" /bulk/05000.txt" s" /Bulk/05000.txt" s" rev-new" h
       FILE-JSON+ ;] ar ENTRIES
    s" cursor-new" false PAGE
-   j ar NEW-LINK ar REFRESHED
+   j MAIN @ s" " ar NEW-LINK ar REFRESHED
    j ar JOURNAL:REMOTE-INVENTORY
    JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur rs :}
    cur s" cursor-new" CURSOR-IS? TTRUE
@@ -2015,7 +1961,7 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
    s" bulk listing bytes" ar IDENTITY {: h:DROPBOX:hash :}
    ar CASE-JOURNAL {: d:str j :}
    h ar BULK-PAGES!
-   ar NEW-LINK {: l :}
+   MAIN @ s" " ar NEW-LINK {: l :}
    TIME:MONO-NS {: t0:n :}
    j l ar REFRESHED
    TIME:MONO-NS t0 - {: took:n :}
@@ -2046,7 +1992,7 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
    [: s" /incomplete.txt" s" /Incomplete.txt" s" rev-incomplete"
       INCOMPLETE-JSON+ ;] ar ENTRIES
    s" new" false PAGE
-   j ar NEW-LINK ar REFRESHED
+   j MAIN @ s" " ar NEW-LINK ar REFRESHED
    ar REMOTE-RECORDS {: want :}
    s" Incomplete.txt" MODEL-UNKNOWN--REASON:INCOMPLETE REMOTE-UNKNOWN
    ar RECORD-AT want VEC:PUSH !
@@ -2073,7 +2019,7 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
    s" partial" true PAGE
    [: s" /restricted" s" /Restricted" TRAVERSE-ONLY-JSON+ ;] ar ENTRIES
    s" restricted" false PAGE
-   j ar NEW-LINK ar REFRESHED
+   j MAIN @ s" " ar NEW-LINK ar REFRESHED
    ar REMOTE-RECORDS {: want :}
    durable want VEC:PUSH !
    s" Partial.txt" h s" partial-revision" PRESENT-AT ar RECORD-AT
@@ -2106,7 +2052,7 @@ READ-CAP BUFFER: READ-BUF
 \ A link whose transfers a status below the directory d shows.
 : STEP-LINK ( str ^ARENA:arena -- ^REPLAY:link )
    {: d:str ar :}
-   ar NEW-LINK {: l :}
+   MAIN @ s" " ar NEW-LINK {: l :}
    d ar STATUS:NEW l REPLAY-LINK:STATUS !
    l ;
 
@@ -2512,32 +2458,12 @@ READ-CAP BUFFER: READ-BUF
 
 : FALLBACK$ ( -- ^u8 n ) s" fallback download" ;
 
-PROCESS-SYMBOLS
-FUNCTION: SOCKET-CALL socket ( n n n -- i32 ) ;FUNCTION
-FUNCTION: BIND-CALL bind ( n ^u8 n -- i32 ) ;FUNCTION
-
-1 constant AF-UNIX
-1 constant SOCK-STREAM
-\ Linux sockaddr_un: a u16 sun_family, then a 108-byte sun_path.
-110 BUFFER: SOCKADDR
 \ S_IFSOCK, the file type of a socket.
 $C000 constant S-IFSOCK
 \ Mode 0400, read-only to its owner.
 $100 constant MODE-0400
 \ LOCAL's slots, 0 to 3.
 4 constant SLOTS
-
-\ A socket bound at the path, as Rust's UnixListener::bind leaves one;
-\ its descriptor.
-: SOCKET-AT ( str -- fd )
-   str> {: p:^ u:n :}
-   u 108 < TTRUE
-   AF-UNIX SOCKADDR c! 0 SOCKADDR 1 + c!
-   p SOCKADDR 2 + u BYTE-COPY 0 SOCKADDR 2 + u + c!
-   AF-UNIX SOCK-STREAM 0 SOCKET-CALL {: s:n :}
-   s 0 >= TTRUE
-   s SOCKADDR u 3 + BIND-CALL 0 T=
-   s >FD ;
 
 \ The run's slot k, as LOCAL names it.
 : SLOT-AT ( ^run n -- str )
@@ -2558,7 +2484,7 @@ $100 constant MODE-0400
       x i SLOT-AT str> i x RUN-ARENA @ UNKNOWN$ str> FS:WRITE-ALL
    loop
    x 1 SLOT-AT str> MODE-0400 FS:CHMOD-MODE
-   x 0 SLOT-AT SOCKET-AT ;
+   x 0 SLOT-AT str> SOCKET-AT ;
 
 \ Slot 0 is still a socket, and the others hold their bytes.
 : SLOTS-KEPT ( ^run -- )
@@ -2668,68 +2594,6 @@ TYPED-VARIABLE CANARY str
    TEST-DROPBOX:SEEN$ 1 DOWNLOADS$ T$=
    d x STEP-GONE ;
 
-public
-EXPORT LOCAL:DOWNLOAD-CHECKPOINT-BYTES
-private
-
-TYPED-VARIABLE HASHING DROPBOX:hasher
-variable REMAINING
-$10000 constant XS-SIZE
-XS-SIZE BUFFER: XS
-
-: FILL-XS ( -- ) XS-SIZE 0 ?do $78 XS i + c! loop ;
-
-: CHECKPOINT ( -- n ) DOWNLOAD-CHECKPOINT-BYTES ;
-
-\ Rust's FailingBytes: "x" bytes until none remain, then a reset
-\ connection.
-: FAILING ( ^u8 n -- n )
-   {: dst:^ cap:n :}
-   REMAINING @ 0= if 104 FS:CAUSE! E-FS-IO throw then
-   REMAINING @ cap min XS-SIZE min {: k:n :}
-   XS dst k BYTE-COPY
-   k negate REMAINING +!
-   k ;
-
-: READY-PARTIAL
-   ( LOCAL:download-preparation -- ^LOCAL:download-partial )
-   MATCH LOCAL:download-preparation
-      ready OF ENDOF
-      complete OF drop s" reconcile-test: no partial" FAILED ENDOF
-      ephemeral OF s" reconcile-test: no partial" FAILED ENDOF
-   ;MATCH ;
-
-\ The lease's slot holding a durable checkpoint of CHECKPOINT "x"
-\ bytes for target t, as a transfer lost just past it leaves it.
-: CHECKPOINTED
-   ( fd str ^u8 n DROPBOX:hash LOCAL:download-slot-lease ^ARENA:arena
-     -- )
-   {: root:fd r:str t:^ tu:n c:DROPBOX:hash
-      l:LOCAL:download-slot-lease ar :}
-   root r str> t tu c l ar LOCAL:PREPARE-DOWNLOAD-SLOT-AT READY-PARTIAL
-   {: x :}
-   CHECKPOINT 1+ REMAINING !
-   [: x CHECKPOINT DROPBOX:BLOCK + [: FAILING ;] ar
-      LOCAL:APPEND-PARTIAL drop ;]
-   [: 2drop true ;] LOCAL:CONVERTING LOCAL:E-STAGE-READ T= ;
-
-\ The content hash of CHECKPOINT "x" bytes, then t.
-: PAST-HASH ( ^u8 n ^ARENA:arena -- DROPBOX:hash )
-   {: t:^ tu:n ar :}
-   HASHING DROPBOX:HASH-BEGIN
-   CHECKPOINT XS-SIZE / 0 ?do XS XS-SIZE HASHING DROPBOX:HASH-FEED loop
-   t tu HASHING DROPBOX:HASH-FEED
-   HASHING DROPBOX:HASH-END ar COPIED DROPBOX:>HASH ;
-
-\ The fake's /<p> at rev v, of content c: CHECKPOINT bytes it does not
-\ keep, then t, so its download from the start answers 500.
-: SERVES-PAST ( ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- )
-   {: p:^ pu:n v:^ vu:n t:^ tu:n c:DROPBOX:hash ar :}
-   SB-RESET s" /" SB-APPEND p pu SB-APPEND SB$ ar COPIED {: l:str :}
-   c DROPBOX:HASH>STR str> {: h:^ hu:n :}
-   l str> l str> v vu h hu CHECKPOINT tu + TEST-DROPBOX:FILE!
-   v vu CHECKPOINT t tu TEST-DROPBOX:CONTENT-TAIL! ;
-
 : HELD$ ( -- ^u8 n ) s" first download held open by the fake server" ;
 : NEXT$ ( -- ^u8 n ) s" download introduced by the next pass" ;
 
@@ -2805,7 +2669,7 @@ XS-SIZE BUFFER: XS
    {: x :}
    x RUN-ARENA @ {: ar :}
    HELD$ ar PAST-HASH {: c:DROPBOX:hash :}
-   s" a.bin" s" rev-held-slot" HELD$ c ar SERVES-PAST
+   s" /a.bin" s" rev-held-slot" HELD$ c SERVES-PAST
    c s" rev-held-slot" >str DROPBOX:>REV MODEL-REMOTE:MAKE {: rem :}
    x s" a.bin" rem INSTALLING {: p :}
    x p BLOCKED-AHEAD
@@ -6406,3 +6270,4 @@ TYPED-VARIABLE RACED str
 RUN
 
 ;package
+;using
