@@ -77,6 +77,14 @@
 \ - one_reconciliation_pass_synchronizes_files_in_both_directions, with
 \   replayed 2 and blocked 0 as its download installs in the pass, no
 \   account request, and the upload's argument as DROPBOX writes it
+\ Stale installs against the fake Dropbox, Rust's tests of the same
+\ names, with no account request and the fake's upload taking rev 01701
+\ where Rust scripts one:
+\ - matching_observations_retire_a_stale_install_and_later_edits_sync
+\ - a_changed_safe_operation_replaces_a_stale_install_in_the_same_pass,
+\   the upload's argument, whose hash the fake checks, for its body
+\ - an_unknown_observation_does_not_retire_a_stale_install
+\ - a_pending_only_path_retires_without_fetching_obsolete_bytes
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -2859,13 +2867,180 @@ XS-SIZE BUFFER: XS
 : PASS-CASES ( ^ARENA:arena -- )
    ONE-RECONCILIATION-PASS-SYNCHRONIZES-FILES-IN-BOTH-DIRECTIONS ;
 
+\ ---- stale installs against the fake Dropbox -----------------------
+
+: OBSOLETE$ ( -- ^u8 n ) s" obsolete Dropbox bytes" ;
+: MATCHING$ ( -- ^u8 n ) s" matching current bytes" ;
+: LATER-EDIT$ ( -- ^u8 n ) s" later local edit" ;
+: STALE-LOCAL$ ( -- ^u8 n ) s" current local bytes" ;
+: UNRELATED-STAGE$ ( -- ^u8 n ) s" unrelated stage bytes" ;
+
+\ Rust's stale: the obsolete bytes at stale-revision.
+: STALE-REMOTE ( ^ARENA:arena -- MODEL:remote )
+   {: ar :}
+   OBSOLETE$ s" stale-revision" ar REMOTE-FILE ;
+
+\ Rust's stale_install, recorded pending at path p.
+: STALE-INSTALL ( ^run ^u8 n -- )
+   {: x p:^ u:n :}
+   x p u x RUN-ARENA @ STALE-REMOTE INSTALLING drop ;
+
+\ A case's run with file.txt holding b and a stale install pending
+\ there; answers the recovery directory.
+: STALE-FILE ( ^u8 n ^ARENA:arena -- str ^run str )
+   {: b:^ bu:n ar :}
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" file.txt" IN-ROOT str> b bu FS:WRITE-ALL
+   x s" file.txt" STALE-INSTALL
+   d x rec ;
+
+: STALE-EMPTY-PAGE ( ^u8 n -- )
+   {: k:^ ku:n :}
+   s" []" >str k ku false PAGE ;
+
+\ Rust's unsupported_file_metadata: not downloadable, export only.
+: UNSUPPORTED-JSON+ ( ^u8 n ^u8 n ^u8 n -- )
+   {: l:^ lu:n d:^ du:n r:^ ru:n :}
+   S\" {\q.tag\q:\qfile\q" SB-APPEND l lu d du PATHS+
+   S\" ,\qrev\q:" SB-APPEND r ru QUOTED+
+   S\" ,\qsize\q:0,\qis_downloadable\q:false," SB-APPEND
+   S\" \qexport_info\q:{\qexport_as\q:\qhtml\q}}" SB-APPEND ;
+
+: STALE-NOOPED ( report -- )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   noops 1 T= blocked 0 T= ;
+
+: STALE-UPLOADED ( report -- )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   planned 1 T= replayed 1 T= blocked 0 T= ;
+
+: STALE-BLOCKED ( report -- )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   blocked 1 T= ;
+
+\ Rust's listings: file.txt current on the first page, then two
+\ empty continuations; the fake holds it for the upload.
+: MATCHING-PAGES ( ^ARENA:arena -- )
+   {: ar :}
+   MATCHING$ ar IDENTITY {: h:DROPBOX:hash :}
+   [: s" /file.txt" s" /file.txt" s" current-revision" h FILE-JSON+ ;]
+   ar ENTRIES s" matching-current" false PAGE
+   s" matching-stable" STALE-EMPTY-PAGE
+   s" after-local-edit" STALE-EMPTY-PAGE
+   s" file.txt" s" current-revision" MATCHING$ ar FILE-AT ;
+
+: MATCHING-SEEN$ ( -- ^u8 n )
+   SB-RESET s" /2/files/list_folder " SB-APPEND
+   CONTINUE$ SB-APPEND s"  " SB-APPEND CONTINUE$ SB-APPEND
+   s"  /2/files/upload" SB-APPEND SB$ ;
+
+: MATCHING-OBSERVATIONS-RETIRE-A-STALE-INSTALL-AND-LATER-EDITS-SYNC
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" matching_observations_retire_a_stale_install_and_later_edits_sync"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   MATCHING$ ar STALE-FILE {: d:str x rec:str :}
+   ar MATCHING-PAGES
+   x rec PASSED COMPLETE STALE-NOOPED
+   x PENDING-OF VEC:COUNT 0 T=
+   x s" file.txt" MATCHING$ s" current-revision" ar REMOTE-FILE
+   BASELINE-AT
+   x rec PASSED COMPLETE STALE-NOOPED
+   x s" file.txt" IN-ROOT str> LATER-EDIT$ FS:WRITE-ALL
+   x rec PASSED COMPLETE STALE-UPLOADED
+   x PENDING-OF VEC:COUNT 0 T=
+   x s" file.txt" LATER-EDIT$ s" 01701" ar REMOTE-FILE BASELINE-AT
+   TEST-DROPBOX:SEEN$ MATCHING-SEEN$ T$=
+   d x STEP-GONE ;
+
+\ The upload's argument for file.txt as DROPBOX writes it, content h.
+: STALE-UPLOAD-ARG$ ( DROPBOX:hash -- ^u8 n )
+   {: h:DROPBOX:hash :}
+   SB-RESET S\" {\qpath\q:\q/file.txt\q,\qmode\q:\qadd\q," SB-APPEND
+   S\" \qautorename\q:false,\qstrict_conflict\q:true," SB-APPEND
+   S\" \qcontent_hash\q:\q" SB-APPEND
+   h DROPBOX:HASH>STR str> SB-APPEND S\" \q}" SB-APPEND SB$ ;
+
+: A-CHANGED-SAFE-OPERATION-REPLACES-A-STALE-INSTALL-IN-THE-SAME-PASS
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" a_changed_safe_operation_replaces_a_stale_install_in_the_same_pass"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   STALE-LOCAL$ ar STALE-FILE {: d:str x rec:str :}
+   s" remote-absent" STALE-EMPTY-PAGE
+   x rec PASSED COMPLETE STALE-UPLOADED
+   x PENDING-OF VEC:COUNT 0 T=
+   x s" file.txt" STALE-LOCAL$ s" 01701" ar REMOTE-FILE BASELINE-AT
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/upload" T$=
+   TEST-DROPBOX:ARG-SENT$ STALE-LOCAL$ ar IDENTITY STALE-UPLOAD-ARG$ T$=
+   d x STEP-GONE ;
+
+: AN-UNKNOWN-OBSERVATION-DOES-NOT-RETIRE-A-STALE-INSTALL
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" an_unknown_observation_does_not_retire_a_stale_install" T-LABEL
+   TEST-DROPBOX:RESET
+   STALE-LOCAL$ ar STALE-FILE {: d:str x rec:str :}
+   [: s" /file.txt" s" /file.txt" s" unsupported-revision"
+      UNSUPPORTED-JSON+ ;]
+   ar ENTRIES s" remote-unknown" false PAGE
+   x rec PASSED COMPLETE STALE-BLOCKED
+   x PENDING-OF VEC:COUNT 1 T=
+   x s" file.txt" NO-BASELINE? TTRUE
+   TEST-DROPBOX:SEEN$ 1 LISTED$ T$=
+   d x STEP-GONE ;
+
+\ The stage of removed.txt's obsolete download, holding other bytes.
+: OBSOLETE-STAGE ( ^run -- str )
+   {: x :}
+   x ROOT$ s" open test root" LOCAL:OPEN-ROOT {: root:fd :}
+   [: root x s" removed.txt" OBSOLETE$ PRESTAGED ;]
+   [: root FS:CLOSE-DIR ;] finally
+   x STAGE-PATH {: sp:str :}
+   sp str> $180 FS:CHMOD-MODE
+   sp str> UNRELATED-STAGE$ FS:WRITE-ALL
+   sp ;
+
+: A-PENDING-ONLY-PATH-RETIRES-WITHOUT-FETCHING-OBSOLETE-BYTES
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" a_pending_only_path_retires_without_fetching_obsolete_bytes"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x OBSOLETE-STAGE {: sp:str :}
+   x s" removed.txt" STALE-INSTALL
+   s" both-absent" STALE-EMPTY-PAGE
+   x rec PASSED COMPLETE drop
+   x PENDING-OF VEC:COUNT 0 T=
+   x s" removed.txt" NO-BASELINE? TTRUE
+   sp str> FS:EXISTS? TTRUE
+   TEST-DROPBOX:SEEN$ 1 LISTED$ T$=
+   TEST-DROPBOX:SEEN$ DOWNLOAD$ CONTAINS? TFALSE
+   d x STEP-GONE ;
+
+: STALE-CASES ( ^ARENA:arena -- )
+   {: ar :}
+   ar MATCHING-OBSERVATIONS-RETIRE-A-STALE-INSTALL-AND-LATER-EDITS-SYNC
+   ar A-CHANGED-SAFE-OPERATION-REPLACES-A-STALE-INSTALL-IN-THE-SAME-PASS
+   ar AN-UNKNOWN-OBSERVATION-DOES-NOT-RETIRE-A-STALE-INSTALL
+   ar A-PENDING-ONLY-PATH-RETIRES-WITHOUT-FETCHING-OBSOLETE-BYTES ;
+
 : SERVED ( ^ARENA:arena -- )
    {: ar :}
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
    s" " TEST-DROPBOX:ROOT!
    ar OPENED MAIN !
    ACCOUNTED
-   [: ar REFRESH-CASES ar STEP-CASES ar PASS-CASES ;]
+   [: ar REFRESH-CASES ar STEP-CASES ar PASS-CASES
+      ar STALE-CASES ;]
    [: MAIN @ DROPBOX:CLOSE ;]
    finally ;
 
