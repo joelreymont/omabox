@@ -2419,4 +2419,510 @@ ENUM prepared-collision
       ENDOF
    ;MATCH ;
 
+
+\ ---- replay step ---------------------------------------------------
+
+\ A plan's download: its operation and the Dropbox file it installs.
+STRUCTURE download-operation
+   FIELD id JOURNAL:operation-id
+   FIELD source MODEL:remote
+;STRUCTURE
+
+: NO-DOWNLOAD ( -- option<download-operation> ) OPTION:NONE ;
+: SOME-DOWNLOAD
+   ( JOURNAL:operation-id MODEL:remote -- option<download-operation> )
+   DOWNLOAD-OPERATION-MAKE OPTION:SOME ;
+
+\ The operation's download, while it is pending.
+: DOWNLOAD-OF
+   ( JOURNAL:planned-operation -- option<download-operation> )
+   JOURNAL-PLANNED--OPERATION:UNMAKE {: id at o s :}
+   s PENDING? 0= if NO-DOWNLOAD exit then
+   o MATCH MODEL:operation
+      create-local-directory OF NO-DOWNLOAD ENDOF
+      create-remote-directory OF NO-DOWNLOAD ENDOF
+      delete-local-directory OF NO-DOWNLOAD ENDOF
+      delete-remote-directory OF NO-DOWNLOAD ENDOF
+      create-remote OF drop NO-DOWNLOAD ENDOF
+      install-local OF {: src :} id src SOME-DOWNLOAD ENDOF
+      preserve-local OF drop NO-DOWNLOAD ENDOF
+      replace-local OF drop {: src :} id src SOME-DOWNLOAD ENDOF
+      delete-local OF drop NO-DOWNLOAD ENDOF
+      preserve-remote OF drop NO-DOWNLOAD ENDOF
+      replace-remote OF drop drop NO-DOWNLOAD ENDOF
+      delete-remote OF drop NO-DOWNLOAD ENDOF
+   ;MATCH ;
+
+\ Rust's pending_download_operation: the plan's first operation not
+\ completed that installs a Dropbox file.
+: PENDING-DOWNLOAD
+   ( JOURNAL:plan-record -- option<download-operation> )
+   JOURNAL-PLAN--RECORD:UNMAKE {: id p ops s :}
+   ops VEC:COUNT 0 ?do
+      ops i VEC:AT @ DOWNLOAD-OF MATCH option
+         none OF ENDOF
+         some OF OPTION:SOME unloop exit ENDOF
+      ;MATCH
+   loop
+   NO-DOWNLOAD ;
+
+: DOWNLOADS? ( JOURNAL:plan-record -- bool )
+   PENDING-DOWNLOAD MATCH option
+      none OF false ENDOF
+      some OF drop true ENDOF
+   ;MATCH ;
+
+: ID-OF ( JOURNAL:plan-record -- JOURNAL:plan-id )
+   JOURNAL-PLAN--RECORD:UNMAKE {: id p ops s :} id ;
+: PLAN-PATH ( JOURNAL:plan-record -- MODEL:path )
+   JOURNAL-PLAN--RECORD:UNMAKE {: id p ops s :} p ;
+
+: PATH-PLAN? ( JOURNAL:plan-record MODEL:path -- bool )
+   {: p path :}
+   p PLAN-PATH path PATH= ;
+
+: DOWNLOAD-PLAN? ( JOURNAL:plan-record JOURNAL:plan-id -- bool )
+   {: p id :}
+   p ID-OF JOURNAL:PLAN-ID>N id JOURNAL:PLAN-ID>N =
+   p DOWNLOADS? and ;
+
+\ The first of the plans q accepts.
+: FIND-PLAN
+   ( ^VEC:vector<JOURNAL:plan-record> [ JOURNAL:plan-record -- bool ]
+     -- option<JOURNAL:plan-record> )
+   {: plans q :}
+   plans VEC:COUNT 0 ?do
+      plans i VEC:AT @ q execute if
+         plans i VEC:AT @ OPTION:SOME unloop exit
+      then
+   loop
+   OPTION:NONE ;
+
+\ Rust's pending_download_slot_identity, for a root of generation gen.
+: SLOT-IDENTITY
+   ( n MODEL:path download-operation
+     -- LOCAL:download-slot-identity )
+   {: gen:n path d :}
+   d DOWNLOAD-OPERATION-UNMAKE {: id src :}
+   gen id JOURNAL:OPERATION-ID>N path PATH$ src
+   LOCAL:NEW-SLOT-IDENTITY ;
+
+: ADD-BINDING
+   ( ^VEC:vector<LOCAL:binding> n JOURNAL:plan-record -- )
+   {: live gen:n p :}
+   p PENDING-DOWNLOAD MATCH option
+      none OF ENDOF
+      some OF {: d :}
+         gen p PLAN-PATH d SLOT-IDENTITY LOCAL:SLOT-BINDING
+         live VEC:PUSH !
+      ENDOF
+   ;MATCH ;
+
+: ADD-BINDINGS
+   ( ^VEC:vector<LOCAL:binding> n ^VEC:vector<JOURNAL:plan-record> -- )
+   {: live gen:n plans :}
+   plans VEC:COUNT 0 ?do live gen plans i VEC:AT @ ADD-BINDING loop ;
+
+\ The slot bindings of the pending and the blocked plans' downloads,
+\ which no other download's lease may take (replay_pending_at).
+: LIVE-BINDINGS
+   ( n ^VEC:vector<JOURNAL:plan-record>
+     ^VEC:vector<JOURNAL:plan-record> ^ARENA:arena
+     -- ^VEC:vector<LOCAL:binding> )
+   {: gen:n pending blocked ar :}
+   ar ARENA:ALLOCATOR 0 [type] LOCAL:binding VEC:NEW {: live :}
+   live gen pending ADD-BINDINGS
+   live gen blocked ADD-BINDINGS
+   live ;
+
+: LIVE? ( LOCAL:binding ^VEC:vector<LOCAL:binding> -- bool )
+   {: b live :}
+   live VEC:COUNT 0 ?do
+      live i VEC:AT @ b LOCAL:BINDING= if true unloop exit then
+   loop
+   false ;
+
+\ Holds the plan until its retry time; Rust accepts every answer.
+: BLOCK-UNTIL-RETRY ( ^run JOURNAL:plan-id MODEL:blockage -- )
+   {: r id why :}
+   r RUN-JOURNAL @ id why epoch-seconds JOURNAL:BLOCK-RETRY-SECONDS +
+   r RUN-ARENA @ JOURNAL:BLOCK-PLAN MATCH JOURNAL:plan-block
+      not-found OF ENDOF
+      already-completed OF ENDOF
+      blocked OF ENDOF
+   ;MATCH ;
+
+: BLOCK-FOUND
+   ( ^run option<JOURNAL:plan-record> MODEL:blockage -- )
+   {: r found why :}
+   found MATCH option
+      none OF ENDOF
+      some OF {: p :} r p ID-OF why BLOCK-UNTIL-RETRY ENDOF
+   ;MATCH ;
+
+: RECORD-BLOCK
+   ( ^run ^VEC:vector<JOURNAL:plan-record> REPLAY:replay-blocked -- )
+   {: r plans b :}
+   b MATCH REPLAY:replay-blocked
+      stage-destination-occupied OF drop {: id :}
+         r plans [: id DOWNLOAD-PLAN? ;] FIND-PLAN
+         MODEL-BLOCKAGE:STAGE-OCCUPIED BLOCK-FOUND
+      ENDOF
+      local-object OF {: path :}
+         r plans [: path PATH-PLAN? ;] FIND-PLAN
+         MODEL-BLOCKAGE:LOCAL-OBJECT-IN-WAY BLOCK-FOUND
+      ENDOF
+      durable-plan OF drop drop ENDOF
+      fresh-observation-required OF drop ENDOF
+      download-required OF drop drop ENDOF
+      precondition-changed OF drop drop ENDOF
+      remote-operation OF drop ENDOF
+      remote-pending OF drop ENDOF
+      remote-object OF drop ENDOF
+      sync-error OF drop drop ENDOF
+   ;MATCH ;
+
+: BLOCKS
+   ( ^REPLAY:replay-report -- ^VEC:vector<REPLAY:replay-blocked> )
+   REPLAY-REPLAY--REPORT:BLOCKED @ ;
+
+\ Rust's record_local_replay_blocks: the plans an occupied stage or a
+\ local object blocked are held durably.
+: RECORD-LOCAL-BLOCKS
+   ( ^run ^VEC:vector<JOURNAL:plan-record> ^REPLAY:replay-report -- )
+   {: r plans rep :}
+   rep BLOCKS {: bs :}
+   bs VEC:COUNT 0 ?do r plans bs i VEC:AT @ RECORD-BLOCK loop ;
+
+: ADD-REPORT ( ^REPLAY:replay-report ^REPLAY:replay-report -- )
+   {: from into :}
+   from REPLAY-REPLAY--REPORT:COMPLETED-OPERATIONS @
+   into REPLAY-REPLAY--REPORT:COMPLETED-OPERATIONS +!
+   from BLOCKS {: bs :}
+   bs VEC:COUNT 0 ?do bs i VEC:AT @ into BLOCKS VEC:PUSH ! loop ;
+
+: ADD-DURABLE ( MODEL:path MODEL:blockage ^REPLAY:replay-report -- )
+   {: path why rep :}
+   path why REPLAY-REPLAY--BLOCKED:DURABLE-PLAN rep BLOCKS VEC:PUSH ! ;
+
+\ A blocked plan's entry in the report.
+: ADD-BLOCKED ( JOURNAL:plan-record ^REPLAY:replay-report -- )
+   {: p rep :}
+   p JOURNAL-PLAN--RECORD:UNMAKE {: id path ops s :}
+   s MATCH JOURNAL:plan-status
+      pending OF ENDOF
+      blocked OF drop {: why :} path why rep ADD-DURABLE ENDOF
+      completed OF ENDOF
+   ;MATCH ;
+
+\ The step's download, one at a time; reason is why FETCH blocked it.
+STRUCTURE download DERIVE addr
+   FIELD run ^run
+   FIELD root fd
+   FIELD generation n
+   FIELD plan JOURNAL:plan-record
+   FIELD wanted download-operation
+   FIELD live ^VEC:vector<LOCAL:binding>
+   FIELD report ^REPLAY:replay-report
+   FIELD reason MODEL:blockage
+;STRUCTURE
+
+ARENA DOWNLOADS download
+
+ENUM download-state DERIVE eq
+   queued staged blocked installed unrooted ;ENUM
+ENUM fetched staged blocked ;ENUM
+ENUM root-check active changed ;ENUM
+
+: NEW-DOWNLOAD
+   ( ^run fd n ^VEC:vector<LOCAL:binding> ^REPLAY:replay-report
+     -- ^download )
+   {: r root:fd gen:n live rep :}
+   r RUN-ARENA @ DOWNLOADS-NEW {: x :}
+   r x DOWNLOAD-RUN ! root x DOWNLOAD-ROOT !
+   gen x DOWNLOAD-GENERATION ! live x DOWNLOAD-LIVE !
+   rep x DOWNLOAD-REPORT ! x ;
+
+: WANTED-SOURCE ( ^download -- MODEL:remote )
+   DOWNLOAD-WANTED @ DOWNLOAD-OPERATION-UNMAKE {: id src :} src ;
+
+\ The slot the download's partial is kept in, if one can be leased.
+: LEASE ( ^download -- option<LOCAL:download-slot-lease> )
+   {: x :}
+   x DOWNLOAD-GENERATION @ x DOWNLOAD-PLAN @ PLAN-PATH
+   x DOWNLOAD-WANTED @ SLOT-IDENTITY {: id :}
+   x DOWNLOAD-RUN @ STAGING$ id
+   [: x DOWNLOAD-LIVE @ LIVE? ;] LOCAL:LEASE-DOWNLOAD-SLOT ;
+
+: NO-FETCH ( -- LOCAL:stage-outcome<n> )
+   s" " >str LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED ;
+: DROP-FETCH ( LOCAL:stage-outcome<n> -- ) drop ;
+
+\ The codes FETCH blocks on, other than DOWNLOAD-BLOCKAGE's.
+: FETCH-CONVERTS? ( n n -- bool )
+   {: code:n e:n :}
+   code LOCAL:E-OCCUPIED = code e REPLAY:LOCAL-OBJECT? or ;
+
+\ The download staged through the lease, and the code it threw, else 0.
+: STAGE
+   ( ^download option<LOCAL:download-slot-lease>
+     -- LOCAL:stage-outcome<n> n )
+   {: x lease :}
+   x DOWNLOAD-RUN @ {: r :}
+   NO-FETCH [: DROP-FETCH r RUN-LINK @ x DOWNLOAD-ROOT @ r ROOT$
+      x DOWNLOAD-PLAN @ PLAN-PATH x WANTED-SOURCE lease r STAGING$
+      r RUN-ARENA @ REPLAY:STAGE-EXACT-DOWNLOAD-AT ;]
+   ['] FETCH-CONVERTS? LOCAL:CONVERTING ;
+
+: BLOCKED-AS ( MODEL:blockage ^download -- fetched )
+   DOWNLOAD-REASON ! construct fetched blocked ;
+
+: STAGED-AS ( LOCAL:stage-outcome<n> ^download -- fetched )
+   {: x :}
+   MATCH LOCAL:stage-outcome
+      staged OF drop construct fetched staged ENDOF
+      already-staged OF drop construct fetched staged ENDOF
+      content-changed OF drop
+         MODEL-BLOCKAGE:DOWNLOAD-VERIFICATION-FAILED x BLOCKED-AS
+      ENDOF
+      destination-occupied OF drop
+         MODEL-BLOCKAGE:STAGE-OCCUPIED x BLOCKED-AS
+      ENDOF
+   ;MATCH ;
+
+\ Rust's download_block_reason: a code that blocks the path, else
+\ rethrown.
+: THROWN-AS ( n ^download -- fetched )
+   {: code:n x :}
+   code LOCAL:E-OCCUPIED = if
+      MODEL-BLOCKAGE:STAGE-OCCUPIED x BLOCKED-AS exit
+   then
+   code FS:ERRNO REPLAY:LOCAL-OBJECT? if
+      MODEL-BLOCKAGE:LOCAL-OBJECT-IN-WAY x BLOCKED-AS exit
+   then
+   code x DOWNLOAD-RUN @ RUN-LINK @ REPLAY:DOWNLOAD-BLOCKAGE
+   MATCH option
+      none OF code throw ENDOF
+      some OF x BLOCKED-AS ENDOF
+   ;MATCH ;
+
+\ Rust's run_download_job: the download staged, or why it blocks.
+: FETCH ( ^download -- fetched )
+   {: x :}
+   x x LEASE STAGE {: code:n :}
+   code 0= if x STAGED-AS exit then
+   DROP-FETCH code x THROWN-AS ;
+
+\ The staged download installed at once.
+: INSTALL ( ^download -- )
+   {: x :}
+   x DOWNLOAD-RUN @ {: r :}
+   r RUN-ARENA @ ARENA:ALLOCATOR 0 [type] JOURNAL:plan-record
+   VEC:NEW {: one :}
+   x DOWNLOAD-PLAN @ one VEC:PUSH !
+   r RUN-JOURNAL @ x DOWNLOAD-ROOT @ r ROOT$ one r RUN-ARENA @
+   REPLAY:REPLAY-LOCAL-PLANS-AT {: rep :}
+   r one rep RECORD-LOCAL-BLOCKS
+   rep x DOWNLOAD-REPORT @ ADD-REPORT ;
+
+: BLOCK ( ^download -- )
+   {: x :}
+   x DOWNLOAD-PLAN @ {: p :}
+   x DOWNLOAD-RUN @ p ID-OF x DOWNLOAD-REASON @ BLOCK-UNTIL-RETRY
+   p PLAN-PATH x DOWNLOAD-REASON @ x DOWNLOAD-REPORT @ ADD-DURABLE ;
+
+: ROOT-ACTIVE? ( ^run -- bool )
+   {: r :}
+   r RUN-JOURNAL @ r ROOT$ LOCAL:CONFIGURED-ROOT-IS-ACTIVE? ;
+
+: ROOT-NOW ( ^download -- root-check )
+   DOWNLOAD-RUN @ ROOT-ACTIVE? if
+      construct root-check active
+   else
+      construct root-check changed
+   then ;
+
+\ One download, after formal/DownloadExecutor.tla: a staged download
+\ is installed only while its root is still the active one; otherwise
+\ it stays staged and its plan pending. A blocked one is held; any
+\ other failure passes up.
+FSM:DEFINE DOWNLOAD-EXECUTOR ( ^download ) download-state fetched
+   IN queued  FETCH
+      staged   -  >staged
+      blocked  -  >blocked
+   IN staged  ROOT-NOW ( root-check )
+      active   -  >installed
+      changed  -  >unrooted
+   FINAL installed  INSTALL
+   FINAL blocked    BLOCK
+   FINAL unrooted   -
+;DEFINE
+
+\ The step's answer; root-changed is Rust's LocalRootChanged error.
+ENUM replay-step
+   VARIANT root-changed ;VARIANT
+   VARIANT report FIELD report ^REPLAY:replay-report ;VARIANT
+;ENUM
+
+: UNROOTED ( -- replay-step ) construct replay-step root-changed ;
+
+\ The plans' excluded ones retired.
+: RETIRED
+   ( ^run ^VEC:vector<JOURNAL:plan-record>
+     -- ^VEC:vector<JOURNAL:plan-record> )
+   {: r plans :}
+   r RUN-JOURNAL @ plans r RUN-ARENA @ REPLAY:RETIRE-EXCLUDED-PLANS
+   plans ;
+
+: BLOCKED-NOW ( ^run -- ^VEC:vector<JOURNAL:plan-record> )
+   {: r :}
+   r r RUN-JOURNAL @ r RUN-ARENA @ JOURNAL:BLOCKED-PLANS RETIRED ;
+
+: PENDING-NOW ( ^run -- ^VEC:vector<JOURNAL:plan-record> )
+   {: r :}
+   r r RUN-JOURNAL @ r RUN-ARENA @ JOURNAL:PENDING-PLANS RETIRED ;
+
+: DOWNLOAD-PATH ( REPLAY:replay-blocked -- option<MODEL:path> )
+   MATCH REPLAY:replay-blocked
+      download-required OF drop OPTION:SOME ENDOF
+      durable-plan OF drop drop NO-PATH ENDOF
+      local-object OF drop NO-PATH ENDOF
+      fresh-observation-required OF drop NO-PATH ENDOF
+      stage-destination-occupied OF drop drop NO-PATH ENDOF
+      precondition-changed OF drop drop NO-PATH ENDOF
+      remote-operation OF drop NO-PATH ENDOF
+      remote-pending OF drop NO-PATH ENDOF
+      remote-object OF drop NO-PATH ENDOF
+      sync-error OF drop drop NO-PATH ENDOF
+   ;MATCH ;
+
+\ The entry at index at kept at index w, or its download's path taken
+\ to paths; the next free index.
+: SET-ASIDE
+   ( n ^VEC:vector<REPLAY:replay-blocked> n ^VEC:vector<MODEL:path>
+     -- n )
+   {: w bs at paths :}
+   bs at VEC:AT @ {: b :}
+   b DOWNLOAD-PATH MATCH option
+      none OF b bs w VEC:AT ! w 1+ ENDOF
+      some OF paths VEC:PUSH ! w ENDOF
+   ;MATCH ;
+
+\ The paths of the report's download-required entries, taken out of
+\ it; the rest keep their order.
+: TAKE-DOWNLOADS
+   ( ^REPLAY:replay-report ^ARENA:arena -- ^VEC:vector<MODEL:path> )
+   {: rep ar :}
+   rep BLOCKS {: bs :}
+   ar ARENA:ALLOCATOR 0 [type] MODEL:path VEC:NEW {: paths :}
+   0 bs VEC:COUNT 0 ?do bs i paths SET-ASIDE loop
+   bs swap VEC:RESIZE
+   paths ;
+
+: NO-LOCAL-OPERATION ( MODEL:path -- )
+   s" pending download blocker has no matching local operation"
+   INVALID ;
+
+\ Runs plan p's download d until it is installed, blocked or left
+\ staged by a changed root; answers its final state.
+: EXECUTE-DOWNLOAD
+   ( ^download JOURNAL:plan-record download-operation
+     -- download-state )
+   {: x p d :}
+   p x DOWNLOAD-PLAN ! d x DOWNLOAD-WANTED !
+   construct download-state queued
+   begin x swap DOWNLOAD-EXECUTOR-STEP until ;
+
+: UNROOTED? ( download-state -- bool )
+   construct download-state unrooted DOWNLOAD-STATE-EQ ;
+
+\ The download of the pending plan at path, which a download-required
+\ entry names; answers its final state.
+: RUN-DOWNLOAD
+   ( ^download ^VEC:vector<JOURNAL:plan-record> MODEL:path
+     -- download-state )
+   {: x pending path :}
+   pending [: path PATH-PLAN? ;] FIND-PLAN MATCH option
+      none OF
+         path s" pending download blocker has no matching plan" INVALID
+      ENDOF
+      some OF {: p :}
+         p PENDING-DOWNLOAD MATCH option
+            none OF path NO-LOCAL-OPERATION ENDOF
+            some OF {: d :} x p d EXECUTE-DOWNLOAD ENDOF
+         ;MATCH
+      ENDOF
+   ;MATCH ;
+
+\ The downloads in order, the root checked first and again before
+\ each install; false: the root changed, and no later download ran.
+: RUN-DOWNLOADS
+   ( ^download ^VEC:vector<JOURNAL:plan-record> ^VEC:vector<MODEL:path>
+     -- bool )
+   {: x pending paths :}
+   paths VEC:COUNT 0= if true exit then
+   x DOWNLOAD-RUN @ ROOT-ACTIVE? 0= if false exit then
+   paths VEC:COUNT 0 ?do
+      x pending paths i VEC:AT @ RUN-DOWNLOAD UNROOTED? if
+         false unloop exit
+      then
+   loop
+   true ;
+
+\ The pending plans' local replay with its blocks recorded, then an
+\ entry for each blocked plan.
+: LOCAL-REPORT
+   ( ^run fd ^VEC:vector<JOURNAL:plan-record>
+     ^VEC:vector<JOURNAL:plan-record> -- ^REPLAY:replay-report )
+   {: r root:fd pending blocked :}
+   r RUN-JOURNAL @ root r ROOT$ pending r RUN-ARENA @
+   REPLAY:REPLAY-LOCAL-PLANS-AT {: rep :}
+   r pending rep RECORD-LOCAL-BLOCKS
+   blocked VEC:COUNT 0 ?do blocked i VEC:AT @ rep ADD-BLOCKED loop
+   rep ;
+
+\ The pending plans' Dropbox operations, once the root is checked.
+: REMOTE-REPORT ( ^run fd ^REPLAY:replay-report -- replay-step )
+   {: r root:fd rep :}
+   r ROOT-ACTIVE? 0= if UNROOTED exit then
+   r RUN-JOURNAL @ r RUN-LINK @ root r ROOT$ r STAGING$
+   r RUN-ARENA @ REPLAY:REPLAY-REMOTE-OPERATIONS-AT rep ADD-REPORT
+   rep construct replay-step report ;
+
+\ The step below the root's descriptor, of generation gen.
+: STEP-AT
+   ( ^run fd n ^VEC:vector<JOURNAL:plan-record> -- replay-step )
+   {: r root:fd gen:n blocked :}
+   r PENDING-NOW {: pending :}
+   gen pending blocked r RUN-ARENA @ LIVE-BINDINGS {: live :}
+   r root pending blocked LOCAL-REPORT {: rep :}
+   rep r RUN-ARENA @ TAKE-DOWNLOADS {: paths :}
+   r root gen live rep NEW-DOWNLOAD {: x :}
+   x pending paths RUN-DOWNLOADS 0= if UNROOTED exit then
+   r root rep REMOTE-REPORT ;
+
+: STEP-BELOW
+   ( ^run fd ^VEC:vector<JOURNAL:plan-record> -- replay-step )
+   {: r root:fd blocked :}
+   r RUN-JOURNAL @ r RUN-ARENA @ JOURNAL:LOCAL-ROOT-BINDING
+   MATCH option
+      none OF UNROOTED ENDOF
+      some OF JOURNAL-LOCAL--ROOT--RECORD:UNMAKE {: b gen:n :}
+         r root gen blocked STEP-AT
+      ENDOF
+   ;MATCH ;
+
+\ Rust's replay_pending_at: the plans of earlier passes replayed and
+\ their downloads run one at a time, then their Dropbox operations.
+: REPLAY-STEP ( ^run -- replay-step )
+   {: r :}
+   r BLOCKED-NOW {: blocked :}
+   r RUN-JOURNAL @ r ROOT$ LOCAL:OPEN-ACTIVE-ROOT MATCH option
+      none OF UNROOTED ENDOF
+      some OF {: root:fd :}
+         [: r root blocked STEP-BELOW ;]
+         [: root FS:CLOSE-DIR ;] finally
+      ENDOF
+   ;MATCH ;
+
 ;package

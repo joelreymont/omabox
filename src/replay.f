@@ -655,6 +655,8 @@ ENUM apply-event done blocked ;ENUM
    {: r :}
    r SUPERSEDED r BLOCKED ;
 
+public
+
 \ Rust's local_object_blocks_replay, of a code and its errno: an object
 \ at the path that replay cannot act on blocks the plan; any other
 \ failure passes up.
@@ -663,6 +665,8 @@ ENUM apply-event done blocked ;ENUM
    code LOCAL:E-UNSUPPORTED = if true exit then
    code LOCAL:E-IO <> if false exit then
    e FS:ELOOP = e FS:ENOTDIR = or ;
+
+private
 
 : LOCAL-OBJECT ( ^pass n -- apply-event )
    {: r code:n :}
