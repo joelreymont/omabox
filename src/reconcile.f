@@ -2496,17 +2496,54 @@ STRUCTURE download-operation
    p ID-OF JOURNAL:PLAN-ID>N id JOURNAL:PLAN-ID>N =
    p DOWNLOADS? and ;
 
-\ The first of the plans q accepts.
-: FIND-PLAN
-   ( ^VEC:vector<JOURNAL:plan-record> [ JOURNAL:plan-record -- bool ]
-     -- option<JOURNAL:plan-record> )
-   {: plans q :}
-   plans VEC:COUNT 0 ?do
-      plans i VEC:AT @ q execute if
-         plans i VEC:AT @ OPTION:SOME unloop exit
-      then
-   loop
+\ Plan x against plan y by path.
+: PLAN-PATH-CMP ( n n ^VEC:vector<JOURNAL:plan-record> -- n )
+   {: x:n y:n plans :}
+   plans x VEC:AT @ PLAN-PATH plans y VEC:AT @ PLAN-PATH PATH-CMP ;
+
+\ The plans' indices sorted by path, which FIND-PATH-PLAN searches.
+: PATH-ORDER
+   ( ^VEC:vector<JOURNAL:plan-record> ^ARENA:arena -- ^VEC:vector<n> )
+   {: plans ar :}
+   plans VEC:COUNT [: plans PLAN-PATH-CMP ;] ar STABLE-ORDER ;
+
+: SOME-PLAN
+   ( JOURNAL:plan-record bool -- option<JOURNAL:plan-record> )
+   {: p ok:bool :}
+   ok if p OPTION:SOME exit then
    OPTION:NONE ;
+
+\ The plan by-path's at-th index names.
+: PLAN-AT
+   ( ^VEC:vector<JOURNAL:plan-record> ^VEC:vector<n> n
+     -- JOURNAL:plan-record )
+   {: plans by-path at:n :}
+   plans by-path at VEC:AT @ VEC:AT @ ;
+
+\ The plan at path, by-path ordering the plans as PATH-ORDER does.
+: FIND-PATH-PLAN
+   ( ^VEC:vector<JOURNAL:plan-record> ^VEC:vector<n> MODEL:path
+     -- option<JOURNAL:plan-record> )
+   {: plans by-path path :}
+   0 by-path VEC:COUNT
+   [: plans by-path rot PLAN-AT PLAN-PATH path PATH-CMP 0 < ;]
+   SORT:PARTITION-POINT {: at:n :}
+   at by-path VEC:COUNT >= if OPTION:NONE exit then
+   plans by-path at PLAN-AT {: p :}
+   p p path PATH-PLAN? SOME-PLAN ;
+
+\ The plan of this id if it downloads, among plans sorted by id.
+: FIND-DOWNLOAD-PLAN
+   ( ^VEC:vector<JOURNAL:plan-record> JOURNAL:plan-id
+     -- option<JOURNAL:plan-record> )
+   {: plans id :}
+   0 plans VEC:COUNT
+   [: plans swap VEC:AT @ ID-OF JOURNAL:PLAN-ID>N
+      id JOURNAL:PLAN-ID>N < ;]
+   SORT:PARTITION-POINT {: at:n :}
+   at plans VEC:COUNT >= if OPTION:NONE exit then
+   plans at VEC:AT @ {: p :}
+   p p id DOWNLOAD-PLAN? SOME-PLAN ;
 
 \ Rust's pending_download_slot_identity, for a root of generation gen.
 : SLOT-IDENTITY
@@ -2570,16 +2607,18 @@ STRUCTURE download-operation
       some OF {: p :} r p ID-OF why BLOCK-UNTIL-RETRY ENDOF
    ;MATCH ;
 
+\ The plans are sorted by id; by-path is their PATH-ORDER.
 : RECORD-BLOCK
-   ( ^run ^VEC:vector<JOURNAL:plan-record> REPLAY:replay-blocked -- )
-   {: r plans b :}
+   ( ^run ^VEC:vector<JOURNAL:plan-record> ^VEC:vector<n>
+     REPLAY:replay-blocked -- )
+   {: r plans by-path b :}
    b MATCH REPLAY:replay-blocked
       stage-destination-occupied OF drop {: id :}
-         r plans [: id DOWNLOAD-PLAN? ;] FIND-PLAN
+         r plans id FIND-DOWNLOAD-PLAN
          MODEL-BLOCKAGE:STAGE-OCCUPIED BLOCK-FOUND
       ENDOF
       local-object OF {: path :}
-         r plans [: path PATH-PLAN? ;] FIND-PLAN
+         r plans by-path path FIND-PATH-PLAN
          MODEL-BLOCKAGE:LOCAL-OBJECT-IN-WAY BLOCK-FOUND
       ENDOF
       durable-plan OF drop drop ENDOF
@@ -2599,10 +2638,13 @@ STRUCTURE download-operation
 \ Rust's record_local_replay_blocks: the plans an occupied stage or a
 \ local object blocked are held durably.
 : RECORD-LOCAL-BLOCKS
-   ( ^run ^VEC:vector<JOURNAL:plan-record> ^REPLAY:replay-report -- )
-   {: r plans rep :}
+   ( ^run ^VEC:vector<JOURNAL:plan-record> ^VEC:vector<n>
+     ^REPLAY:replay-report -- )
+   {: r plans by-path rep :}
    rep BLOCKS {: bs :}
-   bs VEC:COUNT 0 ?do r plans bs i VEC:AT @ RECORD-BLOCK loop ;
+   bs VEC:COUNT 0 ?do
+      r plans by-path bs i VEC:AT @ RECORD-BLOCK
+   loop ;
 
 : ADD-REPORT ( ^REPLAY:replay-report ^REPLAY:replay-report -- )
    {: from into :}
@@ -2732,7 +2774,7 @@ ENUM root-check active changed ;ENUM
    x DOWNLOAD-PLAN @ one VEC:PUSH !
    r RUN-JOURNAL @ x DOWNLOAD-ROOT @ r ROOT$ one r RUN-ARENA @
    REPLAY:REPLAY-LOCAL-PLANS-AT {: rep :}
-   r one rep RECORD-LOCAL-BLOCKS
+   r one one r RUN-ARENA @ PATH-ORDER rep RECORD-LOCAL-BLOCKS
    rep x DOWNLOAD-REPORT @ ADD-REPORT ;
 
 : BLOCK ( ^download -- )
@@ -2847,12 +2889,12 @@ ENUM replay-step
    construct download-state unrooted DOWNLOAD-STATE-EQ ;
 
 \ The download of the pending plan at path, which a download-required
-\ entry names; answers its final state.
+\ entry names; answers its final state. by-path is PATH-ORDER's.
 : RUN-DOWNLOAD
-   ( ^download ^VEC:vector<JOURNAL:plan-record> MODEL:path
-     -- download-state )
-   {: x pending path :}
-   pending [: path PATH-PLAN? ;] FIND-PLAN MATCH option
+   ( ^download ^VEC:vector<JOURNAL:plan-record> ^VEC:vector<n>
+     MODEL:path -- download-state )
+   {: x pending by-path path :}
+   pending by-path path FIND-PATH-PLAN MATCH option
       none OF
          path s" pending download blocker has no matching plan" INVALID
       ENDOF
@@ -2867,13 +2909,13 @@ ENUM replay-step
 \ The downloads in order, the root checked first and again before
 \ each install; false: the root changed, and no later download ran.
 : RUN-DOWNLOADS
-   ( ^download ^VEC:vector<JOURNAL:plan-record> ^VEC:vector<MODEL:path>
-     -- bool )
-   {: x pending paths :}
+   ( ^download ^VEC:vector<JOURNAL:plan-record> ^VEC:vector<n>
+     ^VEC:vector<MODEL:path> -- bool )
+   {: x pending by-path paths :}
    paths VEC:COUNT 0= if true exit then
    x DOWNLOAD-RUN @ ROOT-ACTIVE? 0= if false exit then
    paths VEC:COUNT 0 ?do
-      x pending paths i VEC:AT @ RUN-DOWNLOAD UNROOTED? if
+      x pending by-path paths i VEC:AT @ RUN-DOWNLOAD UNROOTED? if
          false unloop exit
       then
    loop
@@ -2882,12 +2924,12 @@ ENUM replay-step
 \ The pending plans' local replay with its blocks recorded, then an
 \ entry for each blocked plan.
 : LOCAL-REPORT
-   ( ^run fd ^VEC:vector<JOURNAL:plan-record>
+   ( ^run fd ^VEC:vector<JOURNAL:plan-record> ^VEC:vector<n>
      ^VEC:vector<JOURNAL:plan-record> -- ^REPLAY:replay-report )
-   {: r root:fd pending blocked :}
+   {: r root:fd pending by-path blocked :}
    r RUN-JOURNAL @ root r ROOT$ pending r RUN-ARENA @
    REPLAY:REPLAY-LOCAL-PLANS-AT {: rep :}
-   r pending rep RECORD-LOCAL-BLOCKS
+   r pending by-path rep RECORD-LOCAL-BLOCKS
    blocked VEC:COUNT 0 ?do blocked i VEC:AT @ rep ADD-BLOCKED loop
    rep ;
 
@@ -2904,11 +2946,12 @@ ENUM replay-step
    ( ^run fd n ^VEC:vector<JOURNAL:plan-record> -- replay-step )
    {: r root:fd gen:n blocked :}
    r PENDING-NOW {: pending :}
+   pending r RUN-ARENA @ PATH-ORDER {: by-path :}
    gen pending blocked r RUN-ARENA @ LIVE-BINDINGS {: live :}
-   r root pending blocked LOCAL-REPORT {: rep :}
+   r root pending by-path blocked LOCAL-REPORT {: rep :}
    rep r RUN-ARENA @ TAKE-DOWNLOADS {: paths :}
    r root gen live rep NEW-DOWNLOAD {: x :}
-   x pending paths RUN-DOWNLOADS 0= if UNROOTED exit then
+   x pending by-path paths RUN-DOWNLOADS 0= if UNROOTED exit then
    r root rep REMOTE-REPORT ;
 
 : STEP-BELOW
