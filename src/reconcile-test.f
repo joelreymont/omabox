@@ -94,6 +94,15 @@
 \ - due_download_stays_blocked_when_the_fresh_local_path_is_unknown
 \ - changed_revision_supersedes_blocked_plan_before_or_after_deadline
 \ - blocked_plan_is_retired_when_both_sides_are_absent
+\ Uploads against the fake Dropbox, Rust's tests of the same names, with
+\ no account request and the revs the fake's uploads take, 0170<n>, for
+\ the ones Rust scripts:
+\ - corrupt_upload_stage_is_rebuilt_and_uploaded
+\ - corrupt_upload_stage_recovers_from_durable_block_after_reopen
+\ - special_upload_stage_blocks_only_its_plan
+\ - changed_upload_supersedes_a_rejected_plan_before_deadline
+\ - unknown_local_state_keeps_a_rejected_upload_blocked
+\ - stale_upload_is_superseded_and_current_bytes_sync
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -3335,6 +3344,357 @@ XS-SIZE BUFFER: XS
    ar CHANGED-REVISION-SUPERSEDES-BLOCKED-PLAN-BEFORE-OR-AFTER-DEADLINE
    ar BLOCKED-PLAN-IS-RETIRED-WHEN-BOTH-SIDES-ARE-ABSENT ;
 
+\ ---- uploads against the fake Dropbox ------------------------------
+
+\ An empty listing page with the cursor k.
+: EMPTY-LISTING ( ^u8 n ^ARENA:arena -- )
+   {: k:^ ku:n ar :}
+   [: ;] ar ENTRIES k ku false PAGE ;
+
+\ The last upload's argument as DROPBOX writes it for b at path p. The
+\ fake commits only a body that hashes to it: Rust's body assert.
+: UPLOAD-SENT ( ^u8 n ^u8 n ^ARENA:arena -- )
+   {: p:^ u:n b:^ bu:n ar :}
+   b bu ar IDENTITY DROPBOX:HASH>STR str> {: h:^ hu:n :}
+   SB-RESET S\" {\qpath\q:\q" SB-APPEND p u SB-APPEND
+   S\" \q,\qmode\q:\qadd\q,\qautorename\q:false," SB-APPEND
+   S\" \qstrict_conflict\q:true,\qcontent_hash\q:\q" SB-APPEND
+   h hu SB-APPEND S\" \q}" SB-APPEND
+   TEST-DROPBOX:ARG-SENT$ SB$ T$= ;
+
+\ Rust's planned_operations: the decision's operation as a plan.
+: PLANNED-OPERATIONS
+   ( MODEL:decision ^ARENA:arena -- JOURNAL:operation-plan )
+   {: ar :}
+   MATCH MODEL:decision
+      noop OF drop s" test expected planned operations" FAILED ENDOF
+      operate OF ar ONE-PLAN ENDOF
+      blocked OF drop s" test expected planned operations" FAILED ENDOF
+      conflicted OF
+         drop s" test expected planned operations" FAILED
+      ENDOF
+      collided OF drop s" test expected planned operations" FAILED ENDOF
+   ;MATCH ;
+
+\ Rust's record_fixture_plan: plan(b, l, r, Empty) recorded at path p.
+: RECORD-FIXTURE-PLAN
+   ( ^run ^u8 n MODEL:baseline MODEL:observation<MODEL:local>
+     MODEL:observation<MODEL:remote> -- JOURNAL:plan-record )
+   {: x p:^ u:n b l r :}
+   x RUN-ARENA @ {: ar :}
+   b l r MODEL-SUBTREE:EMPTY PLANNER:PLAN ar PLANNED-OPERATIONS
+   {: plan :}
+   x RUN-JOURNAL @ p u DISPLAY plan ar JOURNAL:RECORD-PLAN
+   WRITTEN TTRUE ;
+
+\ Rust's plan(Absent, Present(c), ConfirmedAbsent, Empty) at path p.
+: UPLOAD-PLANNED ( ^run ^u8 n DROPBOX:hash -- JOURNAL:plan-record )
+   {: x p:^ u:n c:DROPBOX:hash :}
+   x p u MODEL-BASELINE:ABSENT c MODEL-LOCAL:MAKE LOCAL-PRESENT
+   REMOTE-ABSENT RECORD-FIXTURE-PLAN ;
+
+\ Holds plan p blocked for the reason w until at, seconds since the
+\ epoch.
+: BLOCKED-FOR ( ^run JOURNAL:plan-record MODEL:blockage n -- )
+   {: x p w at:n :}
+   x RUN-JOURNAL @ p ID-OF w at x RUN-ARENA @ JOURNAL:BLOCK-PLAN
+   MATCH JOURNAL:plan-block
+      not-found OF false ENDOF
+      already-completed OF false ENDOF
+      blocked OF true ENDOF
+   ;MATCH TTRUE ;
+
+\ Rust's RemoteRejected { tag: "disallowed_name" }.
+: DISALLOWED ( -- MODEL:blockage )
+   s" disallowed_name" >str MODEL-BLOCKAGE:REMOTE-REJECTED ;
+
+: UPLOAD-STAGED? ( LOCAL:stage-outcome<^LOCAL:staged-upload> -- bool )
+   MATCH LOCAL:stage-outcome
+      staged OF drop true ENDOF
+      already-staged OF drop false ENDOF
+      content-changed OF drop false ENDOF
+      destination-occupied OF drop false ENDOF
+   ;MATCH ;
+
+\ Rust's stage_upload of path p's content c; answers the stage.
+: UPLOAD-STAGE ( ^run ^u8 n DROPBOX:hash -- str )
+   {: x p:^ u:n c:DROPBOX:hash :}
+   x ROOT$ p u x STAGING$ c x RUN-ARENA @ LOCAL:STAGE-UPLOAD
+   UPLOAD-STAGED? TTRUE
+   x RUN-STAGING @ c DROPBOX:HASH>STR str> x RUN-ARENA @ INSIDE ;
+
+: REPAIR$ ( -- ^u8 n ) s" expected upload bytes" ;
+: CORRUPT$ ( -- ^u8 n ) s" corrupt private cache bytes" ;
+
+: REPAIR-SEEN$ ( -- ^u8 n )
+   s" /2/files/list_folder /2/files/upload /2/files/list_folder/continue" ;
+
+\ The listing's pages: none, then occupied.txt as the fake's first
+\ upload commits it.
+: REPAIR-PAGES ( ^ARENA:arena -- )
+   {: ar :}
+   s" occupied-upload-stage" ar EMPTY-LISTING
+   REPAIR$ ar IDENTITY {: h:DROPBOX:hash :}
+   [: s" /occupied.txt" s" /occupied.txt" s" 01701" h FILE-JSON+ ;]
+   ar ENTRIES s" repaired-upload-stage" false PAGE ;
+
+\ occupied.txt in the root, its upload stage holding other bytes.
+: CORRUPT-STAGED ( ^run -- )
+   {: x :}
+   x s" occupied.txt" IN-ROOT str> REPAIR$ FS:WRITE-ALL
+   x s" occupied.txt" REPAIR$ x RUN-ARENA @ IDENTITY UPLOAD-STAGE
+   {: sp:str :}
+   sp str> FS:REMOVE-FILE sp str> CORRUPT$ FS:WRITE-ALL ;
+
+\ occupied.txt's upload plan, blocked for its occupied stage and due,
+\ as a journal opened again finds it.
+: STAGE-BLOCKED ( str ^run -- )
+   {: d:str x :}
+   x s" occupied.txt" REPAIR$ x RUN-ARENA @ IDENTITY UPLOAD-PLANNED
+   {: p :}
+   x p MODEL-BLOCKAGE:STAGE-OCCUPIED 0 BLOCKED-FOR
+   d x REOPENED
+   x BLOCKED-OF VEC:COUNT 1 T= ;
+
+\ The first pass rebuilds the stage, uploads and settles occupied.txt.
+: REPAIRED ( ^run str -- )
+   {: x rec:str :}
+   x RUN-ARENA @ {: ar :}
+   x rec PASSED COMPLETE drop
+   x s" occupied.txt" IN-ROOT REPAIR$ HOLDS-BYTES
+   x PENDING-OF VEC:COUNT 0 T=
+   x BLOCKED-OF VEC:COUNT 0 T=
+   x s" occupied.txt" REPAIR$ s" 01701" ar REMOTE-FILE BASELINE-AT ;
+
+: SETTLED-REPORT ( report -- )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   blocked 0 T= errors 0 T= ;
+
+\ Rust's assert_corrupt_upload_stage_recovers, the plan blocked before
+\ the pass when before is true.
+: ASSERT-CORRUPT-UPLOAD-STAGE-RECOVERS ( bool ^ARENA:arena -- )
+   {: before:bool ar :}
+   TEST-DROPBOX:RESET ar REPAIR-PAGES
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x CORRUPT-STAGED
+   before if d x STAGE-BLOCKED then
+   x rec REPAIRED
+   x rec PASSED COMPLETE SETTLED-REPORT
+   TEST-DROPBOX:SEEN$ REPAIR-SEEN$ T$=
+   s" /occupied.txt" REPAIR$ ar UPLOAD-SENT
+   d x STEP-GONE ;
+
+: CORRUPT-UPLOAD-STAGE-IS-REBUILT-AND-UPLOADED ( ^ARENA:arena -- )
+   s" corrupt_upload_stage_is_rebuilt_and_uploaded" T-LABEL
+   false swap ASSERT-CORRUPT-UPLOAD-STAGE-RECOVERS ;
+
+: CORRUPT-UPLOAD-STAGE-RECOVERS-FROM-DURABLE-BLOCK-AFTER-REOPEN
+   ( ^ARENA:arena -- )
+   s" corrupt_upload_stage_recovers_from_durable_block_after_reopen"
+   T-LABEL
+   true swap ASSERT-CORRUPT-UPLOAD-STAGE-RECOVERS ;
+
+: BLOCKED-UPLOAD$ ( -- ^u8 n ) s" blocked upload" ;
+: SIBLING$ ( -- ^u8 n ) s" sibling upload" ;
+: UPLOAD-SEEN$ ( -- ^u8 n ) s" /2/files/list_folder /2/files/upload" ;
+
+\ blocked.txt and good.txt in the root, and a symlink at blocked.txt's
+\ upload stage; answers the stage.
+: SPECIAL-STAGED ( ^run -- str )
+   {: x :}
+   x RUN-ARENA @ {: ar :}
+   x s" blocked.txt" IN-ROOT str> BLOCKED-UPLOAD$ FS:WRITE-ALL
+   x s" good.txt" IN-ROOT str> SIBLING$ FS:WRITE-ALL
+   BLOCKED-UPLOAD$ ar IDENTITY DROPBOX:HASH>STR str> {: h:^ hu:n :}
+   x RUN-STAGING @ h hu ar INSIDE {: sp:str :}
+   s" foreign-stage-target" sp str> FS:MAKE-SYMLINK
+   sp ;
+
+: SPECIAL-REPORT ( report -- )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   blocked 1 T= errors 1 T= ;
+
+\ The one blocked plan is blocked.txt's, for its occupied stage.
+: STAGE-HELD ( ^run -- )
+   {: x :}
+   x BLOCKED-OF {: held :}
+   held VEC:COUNT 1 T=
+   held 0 VEC:AT @ PLAN-PATH PATH$ s" blocked.txt" T$=
+   held 0 VEC:AT @ HELD-FOR$ s" stage-occupied" T$= ;
+
+: SPECIAL-UPLOAD-STAGE-BLOCKS-ONLY-ITS-PLAN ( ^ARENA:arena -- )
+   {: ar :}
+   s" special_upload_stage_blocks_only_its_plan" T-LABEL
+   TEST-DROPBOX:RESET s" special-upload-stage" ar EMPTY-LISTING
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x SPECIAL-STAGED {: sp:str :}
+   x rec PASSED COMPLETE SPECIAL-REPORT
+   sp str> FS:SYMLINK? TTRUE
+   x s" good.txt" SIBLING$ s" 01701" ar REMOTE-FILE BASELINE-AT
+   x PENDING-OF VEC:COUNT 0 T=
+   x STAGE-HELD
+   TEST-DROPBOX:SEEN$ UPLOAD-SEEN$ T$=
+   s" /good.txt" SIBLING$ ar UPLOAD-SENT
+   d x STEP-GONE ;
+
+: OLD-UPLOAD$ ( -- ^u8 n ) s" old rejected upload" ;
+: NEW-UPLOAD$ ( -- ^u8 n ) s" new upload decision" ;
+
+\ changed.txt's upload of its old bytes, rejected until long after the
+\ pass, and the new bytes in its place.
+: REJECTED-CHANGE ( ^run -- )
+   {: x :}
+   x s" changed.txt" IN-ROOT {: f:str :}
+   f str> OLD-UPLOAD$ FS:WRITE-ALL
+   x s" changed.txt" OLD-UPLOAD$ x RUN-ARENA @ IDENTITY UPLOAD-PLANNED
+   {: p :}
+   x p DISALLOWED 4000000000 BLOCKED-FOR
+   f str> NEW-UPLOAD$ FS:WRITE-ALL ;
+
+: CHANGED-REPORT ( report -- )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   replayed 1 T= ;
+
+: CHANGED-UPLOAD-SUPERSEDES-A-REJECTED-PLAN-BEFORE-DEADLINE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" changed_upload_supersedes_a_rejected_plan_before_deadline" T-LABEL
+   TEST-DROPBOX:RESET s" changed-upload" ar EMPTY-LISTING
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x REJECTED-CHANGE
+   x rec PASSED COMPLETE CHANGED-REPORT
+   x PENDING-OF VEC:COUNT 0 T=
+   x BLOCKED-OF VEC:COUNT 0 T=
+   x s" changed.txt" NEW-UPLOAD$ s" 01701" ar REMOTE-FILE BASELINE-AT
+   TEST-DROPBOX:SEEN$ UPLOAD-SEEN$ T$=
+   s" /changed.txt" NEW-UPLOAD$ ar UPLOAD-SENT
+   d x STEP-GONE ;
+
+\ unknown.txt a dangling symlink, and its upload's plan rejected and
+\ due; answers the plan.
+: UNKNOWN-REJECTED ( ^run -- JOURNAL:plan-record )
+   {: x :}
+   s" missing-target" x s" unknown.txt" IN-ROOT str> FS:MAKE-SYMLINK
+   x s" unknown.txt" s" unreadable upload" x RUN-ARENA @ IDENTITY
+   UPLOAD-PLANNED {: p :}
+   x p DISALLOWED 0 BLOCKED-FOR
+   p ;
+
+: UNKNOWN-REPORT ( report -- )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   blocked 1 T= ;
+
+: UNKNOWN-LOCAL-STATE-KEEPS-A-REJECTED-UPLOAD-BLOCKED ( ^ARENA:arena -- )
+   {: ar :}
+   s" unknown_local_state_keeps_a_rejected_upload_blocked" T-LABEL
+   TEST-DROPBOX:RESET s" unknown-rejected-upload" ar EMPTY-LISTING
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x UNKNOWN-REJECTED {: p :}
+   x rec PASSED COMPLETE UNKNOWN-REPORT
+   x BLOCKED-OF 0 VEC:AT @ ID-OF JOURNAL:PLAN-ID>N
+   p ID-OF JOURNAL:PLAN-ID>N T=
+   x PENDING-OF VEC:COUNT 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$=
+   d x STEP-GONE ;
+
+: PLANNED-BYTES$ ( -- ^u8 n ) s" planned bytes" ;
+: CHANGED-BYTES$ ( -- ^u8 n ) s" changed bytes" ;
+: OTHER-BYTES$ ( -- ^u8 n ) s" other bytes" ;
+
+: STALE-SEEN$ ( -- ^u8 n )
+   s" /2/files/upload /2/files/list_folder /2/files/upload" ;
+
+\ The listing's one page: other.txt as the fake's first upload commits
+\ it.
+: STALE-PAGE ( ^ARENA:arena -- )
+   {: ar :}
+   OTHER-BYTES$ ar IDENTITY {: h:DROPBOX:hash :}
+   [: s" /other.txt" s" /other.txt" s" 01701" h FILE-JSON+ ;]
+   ar ENTRIES s" stale-upload" false PAGE ;
+
+\ file.txt and other.txt in the root, each with an upload plan,
+\ file.txt's for bytes it no longer holds.
+: STALE-PLANNED ( ^run -- )
+   {: x :}
+   x RUN-ARENA @ {: ar :}
+   x s" file.txt" IN-ROOT str> CHANGED-BYTES$ FS:WRITE-ALL
+   x s" other.txt" IN-ROOT str> OTHER-BYTES$ FS:WRITE-ALL
+   x s" file.txt" PLANNED-BYTES$ ar IDENTITY UPLOAD-PLANNED drop
+   x s" other.txt" OTHER-BYTES$ ar IDENTITY UPLOAD-PLANNED drop ;
+
+\ Rust's replay_remote_operations over the run.
+: REMOTE-REPLAY ( ^run -- ^REPLAY:replay-report )
+   {: x :}
+   x ROOT$ s" open test root" LOCAL:OPEN-ROOT {: root:fd :}
+   [: x RUN-JOURNAL @ x RUN-LINK @ root x ROOT$ x STAGING$
+      x RUN-ARENA @ REPLAY:REPLAY-REMOTE-OPERATIONS-AT ;]
+   [: root FS:CLOSE-DIR ;] finally ;
+
+\ The path a fresh-observation entry names, else the empty string.
+: FRESH-AT$ ( REPLAY:replay-blocked -- ^u8 n )
+   MATCH REPLAY:replay-blocked
+      durable-plan OF drop drop s" " ENDOF
+      local-object OF drop s" " ENDOF
+      fresh-observation-required OF PATH$ ENDOF
+      download-required OF drop drop s" " ENDOF
+      stage-destination-occupied OF drop drop s" " ENDOF
+      precondition-changed OF drop drop s" " ENDOF
+      remote-operation OF drop s" " ENDOF
+      remote-pending OF drop s" " ENDOF
+      remote-object OF drop s" " ENDOF
+      sync-error OF drop drop s" " ENDOF
+   ;MATCH ;
+
+\ The remote replay uploads other.txt and asks a fresh look at
+\ file.txt.
+: STALE-REPLAYED ( ^run -- )
+   {: x :}
+   x RUN-ARENA @ {: ar :}
+   x REMOTE-REPLAY {: rep :}
+   rep COMPLETED 1 T=
+   rep BLOCKS VEC:COUNT 1 T=
+   rep BLOCKS 0 VEC:AT @ FRESH-AT$ s" file.txt" T$=
+   x PENDING-OF VEC:COUNT 0 T=
+   x s" other.txt" OTHER-BYTES$ s" 01701" ar REMOTE-FILE BASELINE-AT ;
+
+: STALE-REPORT ( report -- )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   planned 1 T= replayed 1 T= blocked 0 T= ;
+
+: STALE-UPLOAD-IS-SUPERSEDED-AND-CURRENT-BYTES-SYNC ( ^ARENA:arena -- )
+   {: ar :}
+   s" stale_upload_is_superseded_and_current_bytes_sync" T-LABEL
+   TEST-DROPBOX:RESET ar STALE-PAGE
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x STALE-PLANNED
+   x STALE-REPLAYED
+   s" /other.txt" OTHER-BYTES$ ar UPLOAD-SENT
+   x rec PASSED COMPLETE STALE-REPORT
+   x PENDING-OF VEC:COUNT 0 T=
+   x s" file.txt" CHANGED-BYTES$ s" 01702" ar REMOTE-FILE BASELINE-AT
+   TEST-DROPBOX:SEEN$ STALE-SEEN$ T$=
+   s" /file.txt" CHANGED-BYTES$ ar UPLOAD-SENT
+   d x STEP-GONE ;
+
+: UPLOADS-CASES ( ^ARENA:arena -- )
+   {: ar :}
+   ar CORRUPT-UPLOAD-STAGE-IS-REBUILT-AND-UPLOADED
+   ar CORRUPT-UPLOAD-STAGE-RECOVERS-FROM-DURABLE-BLOCK-AFTER-REOPEN
+   ar SPECIAL-UPLOAD-STAGE-BLOCKS-ONLY-ITS-PLAN
+   ar CHANGED-UPLOAD-SUPERSEDES-A-REJECTED-PLAN-BEFORE-DEADLINE
+   ar UNKNOWN-LOCAL-STATE-KEEPS-A-REJECTED-UPLOAD-BLOCKED
+   ar STALE-UPLOAD-IS-SUPERSEDED-AND-CURRENT-BYTES-SYNC ;
+
 : SERVED ( ^ARENA:arena -- )
    {: ar :}
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
@@ -3342,7 +3702,7 @@ XS-SIZE BUFFER: XS
    ar OPENED MAIN !
    ACCOUNTED
    [: ar REFRESH-CASES ar STEP-CASES ar PASS-CASES
-      ar STALE-CASES ar DOWNLOAD-BLOCKS-CASES ;]
+      ar STALE-CASES ar DOWNLOAD-BLOCKS-CASES ar UPLOADS-CASES ;]
    [: MAIN @ DROPBOX:CLOSE ;]
    finally ;
 
