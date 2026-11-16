@@ -40,6 +40,11 @@
 \   line logged
 \ - listing_classifies_the_remote_roots_own_entry, each refusal's one
 \   line logged
+\ - LISTING-REJECTS-AN-INVALID-CONFIGURED-ROOT: a/b, /a/, /a//b and a
+\   root that is not UTF-8 each throw E-LISTING, one line logged.
+\ - LISTING-REJECTS-AN-ENTRY-WITHOUT-PATHS and
+\   LISTING-REJECTS-A-PATH-THAT-IS-NOT-UTF-8, an 0xFF byte: E-LISTING,
+\   one line logged, naming no path for the first.
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -1312,6 +1317,56 @@ ARENA LISTED DROPBOX:entry
    v ar INVENTORY-RECORDS VEC:COUNT 0 T=
    d str> FS:REMOVE-TREE ;
 
+\ The configured root p refused: E-LISTING and its one line.
+: ROOT-PATH-REFUSED ( ^u8 n str ^ARENA:arena -- )
+   {: p:^ u:n d:str ar :}
+   d [: [: p u ar LISTING-AT ROOT-DEPTH drop ;] E-LISTING TTHROWSQ ;]
+   ar LOGGED {: t:^ tu:n :}
+   t tu 10 COUNT-CHAR 1 T=
+   t tu
+   s" configured Dropbox root must be empty or a normalized absolute Dropbox path"
+   CONTAINS? TTRUE ;
+
+: LISTING-REJECTS-AN-INVALID-CONFIGURED-ROOT ( ^ARENA:arena -- )
+   {: ar :}
+   s" listing rejects an invalid configured root" T-LABEL
+   s" reconcile-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
+   s" a/b" d ar ROOT-PATH-REFUSED
+   s" /a/" d ar ROOT-PATH-REFUSED
+   s" /a//b" d ar ROOT-PATH-REFUSED
+   s\" /a\xFF" d ar ROOT-PATH-REFUSED
+   d str> FS:REMOVE-TREE ;
+
+\ The entry e refused as an invalid path: E-LISTING, its one line,
+\ nothing listed; the line's text.
+: ENTRY-REFUSED ( ^DROPBOX:entry str ^ARENA:arena -- ^u8 n )
+   {: e d:str ar :}
+   s" " ar LISTING-AT {: root :}
+   ar NO-CHANGES {: v :}
+   d [: [: e root v ar APPEND-ENTRY-CHANGES ;] E-LISTING TTHROWSQ ;]
+   ar LOGGED {: t:^ tu:n :}
+   t tu 10 COUNT-CHAR 1 T=
+   t tu s" Dropbox listing contained an invalid or out-of-root path"
+   CONTAINS? TTRUE
+   v ar INVENTORY-RECORDS VEC:COUNT 0 T=
+   t tu ;
+
+: LISTING-REJECTS-AN-ENTRY-WITHOUT-PATHS ( ^ARENA:arena -- )
+   {: ar :}
+   s" listing rejects an entry without paths" T-LABEL
+   s" reconcile-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
+   s" " s" " ar FILE-ENTRY d ar ENTRY-REFUSED {: t:^ tu:n :}
+   t tu s" `" CONTAINS? TFALSE
+   d str> FS:REMOVE-TREE ;
+
+: LISTING-REJECTS-A-PATH-THAT-IS-NOT-UTF-8 ( ^ARENA:arena -- )
+   {: ar :}
+   s" listing rejects a path that is not UTF-8" T-LABEL
+   s" reconcile-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
+   s\" /report\xFF.txt" s\" /report\xFF.txt" ar FILE-ENTRY
+   d ar ENTRY-REFUSED 2drop
+   d str> FS:REMOVE-TREE ;
+
 \ The root's own entry e refused with its text t: E-LISTING, one line
 \ naming t, and nothing listed after Old.
 : ROOT-REFUSED ( ^DROPBOX:entry ^u8 n str ^ARENA:arena -- )
@@ -1361,6 +1416,9 @@ ARENA LISTED DROPBOX:entry
    ar DIRECTORY-RECORDS-NORMALIZE-INCONSISTENT-CHILD-ANCESTOR-CASING
    ar DELTA-NEVER-RESPELLS-A-DIRECTORY-THAT-STILL-EXISTS
    ar LISTING-REJECTS-MISMATCHED-CANONICAL-AND-DISPLAY-PATHS
+   ar LISTING-REJECTS-AN-INVALID-CONFIGURED-ROOT
+   ar LISTING-REJECTS-AN-ENTRY-WITHOUT-PATHS
+   ar LISTING-REJECTS-A-PATH-THAT-IS-NOT-UTF-8
    ar LISTING-CLASSIFIES-THE-REMOTE-ROOTS-OWN-ENTRY ;
 
 
