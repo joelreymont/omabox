@@ -152,7 +152,8 @@ public
 \ its page's, and mark the cursor of the last listing that answered done;
 \ page is a page's cursor, more its has_more, got the members an answer
 \ must hold, one bit each; changes and backoff are a long poll's answer.
-\ tagged marks the `.tag` of the Metadata union being read into entry.
+\ tagged marks the `.tag` of the union being read: a Metadata entry or an
+\ account's root_info, whose tag is root-tag.
 \ drain takes the reads of a transfer ABANDONED ends; laid out at OPEN
 \ and never grown, so ending a transfer allocates nothing. store and
 \ phase are the config's store and the refresh token's phase.
@@ -188,6 +189,7 @@ STRUCTURE client OPAQUE DERIVE addr
    FIELD granted SPAN:span<u8>
    FIELD account SPAN:span<u8>
    FIELD namespace SPAN:span<u8>
+   FIELD root-tag SPAN:span<u8>
    FIELD entry entry
    FIELD sent ^n
    FIELD mark ^n
@@ -1041,6 +1043,9 @@ ENUM verdict
 
 : ROOT-MEMBER ( JSON:reader ^client -- JSON:reader )
    {: c :}
+   s" .tag" JSON:READ-STR-EQ? if
+      c STRING c CLIENT-ROOT-TAG ! true c CLIENT-TAGGED ! exit
+   then
    s" root_namespace_id" JSON:READ-STR-EQ? 0= if SKIP exit then
    c STRING c CLIENT-NAMESPACE ! ;
 
@@ -1052,12 +1057,24 @@ ENUM verdict
    VALUE OBJECT c [: ROOT-MEMBER ;] MEMBERS ;
 
 
+\ Whether root_info's tag is user or team, the roots that carry a namespace.
+: NAMED-ROOT? ( ^client -- bool )
+   CLIENT-ROOT-TAG @ SPAN:$ {: t:^ tu:n :}
+   t tu s" user" STR= t tu s" team" STR= or ;
+
+
+\ A root under any other tag, which Dropbox's open union may add, answers
+\ no namespace, so it never matches a binding, as Rust refuses it.
 : ACCOUNT-READ ( ^client -- )
    {: c :}
    EMPTY c CLIENT-ACCOUNT ! EMPTY c CLIENT-NAMESPACE !
+   EMPTY c CLIENT-ROOT-TAG ! false c CLIENT-TAGGED !
    c [: ACCOUNT-MEMBER ;] PARSE
-   c CLIENT-ACCOUNT @ SPAN:LEN 0= c CLIENT-NAMESPACE @ SPAN:LEN 0= or
-   if c s" no account_id or root_namespace_id" E-ANSWER FAILED then ;
+   c CLIENT-ACCOUNT @ SPAN:LEN 0= c CLIENT-TAGGED @ 0= or
+   if c s" no account_id or root_info tag" E-ANSWER FAILED then
+   c NAMED-ROOT? 0= if EMPTY c CLIENT-NAMESPACE ! exit then
+   c CLIENT-NAMESPACE @ SPAN:LEN 0=
+   if c s" no root_namespace_id" E-ANSWER FAILED then ;
 
 
 : KIND-OF ( JSON:reader -- JSON:reader kind )
@@ -1824,6 +1841,8 @@ public
 
 
 : ACCOUNT-ID ( ^client -- ^u8 n ) CLIENT-ACCOUNT @ SPAN:$ ;
+\ Empty under a root_info tag other than user or team: a root no binding
+\ may take.
 : ROOT-NAMESPACE ( ^client -- ^u8 n ) CLIENT-NAMESPACE @ SPAN:$ ;
 
 

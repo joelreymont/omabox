@@ -1,5 +1,6 @@
 \ dropbox-test.f - DROPBOX's client core against the fake Dropbox of
-\ test-dropbox.f on a loopback port: the account, metadata (of a file that
+\ test-dropbox.f on a loopback port: the account (one whose root_info
+\ carries a tag other than user or team), metadata (of a file that
 \ is not downloadable, of a symlink, of a file with no content hash and of
 \ an entry at another path among them), the Path-Root header, the token's
 \ refresh, its rotation and the store that keeps it, a refresh that fails
@@ -309,6 +310,19 @@ variable REFUSALS
    TEST-DROPBOX:AUTH$ s" Bearer sl.fake-1" T$=
    TEST-DROPBOX:TYPE-SENT? TFALSE
    TEST-DROPBOX:LEAKED? TFALSE ;
+
+
+\ A root_info under a tag other than user or team answers no namespace,
+\ though it carries one ahead of its tag.
+: OTHER-ROOT-CASE ( -- )
+   s" account under another root tag" T-LABEL
+   TEST-DROPBOX:RESET
+   s" /2/users/get_current_account" 200 s" " s" "
+   S\" {\qaccount_id\q:\qdbid:account\q,\qroot_info\q:{\qroot_namespace_id\q:\qnamespace\q,\q.tag\q:\qother\q}}"
+   TEST-DROPBOX:ROUTE-SCRIPT!
+   MAIN @ DROPBOX:ACCOUNT DONE? ASSERT
+   MAIN @ DROPBOX:ACCOUNT-ID s" dbid:account" T$=
+   MAIN @ DROPBOX:ROOT-NAMESPACE s" " T$= ;
 
 
 : FILE-CASE ( -- )
@@ -2716,7 +2730,8 @@ TYPED-VARIABLE FAULT fault
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
    s" ns-root" TEST-DROPBOX:ROOT!
    s" live-token" s" ns-root" RECORDED-CLIENT MAIN !
-   ACCOUNT-CASE FILE-CASE BUILT-PATH-CASE MISSING-CASE ROOT-CASE
+   ACCOUNT-CASE OTHER-ROOT-CASE FILE-CASE BUILT-PATH-CASE MISSING-CASE
+   ROOT-CASE
    LOST-READ-CASE UNDOWNLOADABLE-CASE SYMLINK-CASE INCOMPLETE-CASE
    METADATA-ELSEWHERE-CASE
    SDK-EXPIRY-REFRESH-REISSUES-THE-ROUTE-WITH-THE-SAME-CLIENT
