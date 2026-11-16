@@ -2074,4 +2074,191 @@ FSM:DEFINE INVENTORY-PUBLICATION ( ^refresh ) listing-state listing-event
    NEW-REFRESH construct listing-state starting
    INVENTORY-PUBLICATION ;
 
+
+\ ---- prepare words -------------------------------------------------
+
+\ Rust's Prepared<StagedUpload>; occupied is its
+\ StageDestinationOccupied error, which every caller acts on at once.
+ENUM prepared-upload
+   VARIANT ready FIELD stage ^LOCAL:staged-upload ;VARIANT
+   VARIANT fresh ;VARIANT
+   VARIANT occupied ;VARIANT
+;ENUM
+
+\ Rust's Prepared<()>.
+ENUM prepared ready fresh ;ENUM
+
+: NO-STAGE ( -- LOCAL:stage-outcome<^LOCAL:staged-upload> )
+   s" " >str LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED ;
+: DROP-STAGE ( LOCAL:stage-outcome<^LOCAL:staged-upload> -- ) drop ;
+: NO-HASH ( -- DROPBOX:hash ) s" " >str DROPBOX:>HASH ;
+: DROP-HASH ( DROPBOX:hash -- ) drop ;
+
+: STAGE-CONVERTS? ( n n -- bool )
+   drop dup LOCAL:E-OCCUPIED = swap LOCAL:E-SOURCE-CHANGED = or ;
+: SOURCE-CHANGED? ( n n -- bool ) drop LOCAL:E-SOURCE-CHANGED = ;
+
+\ LOCAL:STAGE-UPLOAD of path's content c, and the code it threw,
+\ else 0.
+: STAGE-LOCAL
+   ( str str MODEL:path DROPBOX:hash ^ARENA:arena
+     -- LOCAL:stage-outcome<^LOCAL:staged-upload> n )
+   {: root:str staging:str path c ar :}
+   NO-STAGE [: DROP-STAGE root str> path PATH$ staging str> c ar
+      LOCAL:STAGE-UPLOAD ;]
+   ['] STAGE-CONVERTS? LOCAL:CONVERTING ;
+
+\ The upload source's content now, and the code it threw, else 0.
+: OBSERVE-SOURCE ( str MODEL:path ^ARENA:arena -- DROPBOX:hash n )
+   {: root:str path ar :}
+   NO-HASH [: DROP-HASH root str> path PATH$ ar
+      LOCAL:OBSERVE-UPLOAD-SOURCE ;]
+   ['] SOURCE-CHANGED? LOCAL:CONVERTING ;
+
+\ An already staged upload is ready while its source still holds c.
+: RECHECK
+   ( ^LOCAL:staged-upload str MODEL:path DROPBOX:hash ^ARENA:arena
+     -- prepared-upload )
+   {: stage root:str path c ar :}
+   root path ar OBSERVE-SOURCE {: code:n :}
+   code 0= if
+      c DROPBOX:HASH= 0= if construct prepared-upload fresh exit then
+      stage construct prepared-upload ready exit
+   then
+   drop code LOCAL:E-SOURCE-CHANGED = if
+      construct prepared-upload fresh exit
+   then
+   code throw ;
+
+\ Rust's prepare_local: path's content staged for upload.
+: PREPARE-LOCAL
+   ( str str MODEL:path DROPBOX:hash ^ARENA:arena -- prepared-upload )
+   {: root:str staging:str path c ar :}
+   root staging path c ar STAGE-LOCAL {: code:n :}
+   code 0= if
+      MATCH LOCAL:stage-outcome
+         staged OF construct prepared-upload ready ENDOF
+         already-staged OF root path c ar RECHECK ENDOF
+         content-changed OF drop construct prepared-upload fresh ENDOF
+         destination-occupied OF
+            drop construct prepared-upload occupied
+         ENDOF
+      ;MATCH exit
+   then
+   DROP-STAGE
+   code LOCAL:E-OCCUPIED = if
+      construct prepared-upload occupied exit
+   then
+   code LOCAL:E-SOURCE-CHANGED = if
+      construct prepared-upload fresh exit
+   then
+   code throw ;
+
+\ An occupied stage path still records the plan.
+: PREPARE-UPLOAD
+   ( str str MODEL:path DROPBOX:hash ^ARENA:arena -- prepared )
+   PREPARE-LOCAL MATCH prepared-upload
+      ready OF drop construct prepared ready ENDOF
+      fresh OF construct prepared fresh ENDOF
+      occupied OF construct prepared ready ENDOF
+   ;MATCH ;
+
+\ Rust's prepare_plan for a decision's one operation.
+: PREPARE-OPERATION
+   ( str str MODEL:path MODEL:operation ^ARENA:arena -- prepared )
+   {: root:str staging:str path op ar :}
+   op MATCH MODEL:operation
+      create-local-directory OF construct prepared ready ENDOF
+      create-remote-directory OF construct prepared ready ENDOF
+      delete-local-directory OF construct prepared ready ENDOF
+      delete-remote-directory OF construct prepared ready ENDOF
+      create-remote OF
+         {: c :} root staging path c ar PREPARE-UPLOAD
+      ENDOF
+      \ A download is fetched only after its plan is durable: the
+      \ replay step runs it.
+      install-local OF drop construct prepared ready ENDOF
+      replace-local OF drop drop construct prepared ready ENDOF
+      preserve-local OF drop construct prepared ready ENDOF
+      preserve-remote OF drop construct prepared ready ENDOF
+      delete-local OF drop construct prepared ready ENDOF
+      delete-remote OF drop construct prepared ready ENDOF
+      replace-remote OF
+         drop {: c :} root staging path c ar PREPARE-UPLOAD
+      ENDOF
+   ;MATCH ;
+
+\ Rust's Conflict::local.
+: CONFLICT-LOCAL ( MODEL:conflict -- option<MODEL:local> )
+   MATCH MODEL:conflict
+      initial OF drop OPTION:SOME ENDOF
+      divergent OF drop OPTION:SOME ENDOF
+      local-deleted OF drop OPTION:NONE ENDOF
+      remote-deleted OF OPTION:SOME ENDOF
+   ;MATCH ;
+
+\ Rust's Conflict::remote.
+: CONFLICT-REMOTE ( MODEL:conflict -- option<MODEL:remote> )
+   MATCH MODEL:conflict
+      initial OF {: l r :} r OPTION:SOME ENDOF
+      divergent OF {: l r :} r OPTION:SOME ENDOF
+      local-deleted OF OPTION:SOME ENDOF
+      remote-deleted OF drop OPTION:NONE ENDOF
+   ;MATCH ;
+
+\ The local copy from the prepared stage; another entry at the stage
+\ path blocks it.
+: STAGED-COPY
+   ( prepared-upload str MODEL:path ^ARENA:arena
+     -- REPLAY:copy-outcome )
+   {: root:str path ar :}
+   MATCH prepared-upload
+      ready OF
+         {: stage :} root str> path stage ar
+         REPLAY:MATERIALIZE-LOCAL-CONFLICT
+      ENDOF
+      fresh OF REPLAY-COPY--OUTCOME:SOURCE-CHANGED ENDOF
+      occupied OF
+         MODEL-BLOCKAGE:STAGE-OCCUPIED REPLAY-COPY--OUTCOME:BLOCKED
+      ENDOF
+   ;MATCH ;
+
+\ The conflict's local copy, ready when it has no local side.
+: LOCAL-SIDE
+   ( str str MODEL:path MODEL:conflict ^ARENA:arena
+     -- REPLAY:copy-outcome )
+   {: root:str staging:str path c ar :}
+   c CONFLICT-LOCAL MATCH option
+      none OF REPLAY-COPY--OUTCOME:READY ENDOF
+      some OF
+         MODEL-LOCAL:UNMAKE {: want :}
+         root staging path want ar PREPARE-LOCAL
+         root path ar STAGED-COPY
+      ENDOF
+   ;MATCH ;
+
+\ The conflict's remote copy, ready when it has no remote side.
+: REMOTE-SIDE
+   ( ^REPLAY:link str MODEL:path MODEL:conflict ^ARENA:arena
+     -- REPLAY:copy-outcome )
+   {: k root:str path c ar :}
+   c CONFLICT-REMOTE MATCH option
+      none OF REPLAY-COPY--OUTCOME:READY ENDOF
+      some OF
+         {: rem :} k root str> path rem ar
+         REPLAY:MATERIALIZE-REMOTE-CONFLICT
+      ENDOF
+   ;MATCH ;
+
+\ Rust's prepare_conflict: the local copy first, then the remote one.
+: PREPARE-CONFLICT
+   ( ^REPLAY:link str str MODEL:path MODEL:conflict ^ARENA:arena
+     -- REPLAY:copy-outcome )
+   {: k root:str staging:str path c ar :}
+   root staging path c ar LOCAL-SIDE MATCH REPLAY:copy-outcome
+      ready OF k root path c ar REMOTE-SIDE ENDOF
+      blocked OF REPLAY-COPY--OUTCOME:BLOCKED ENDOF
+      source-changed OF REPLAY-COPY--OUTCOME:SOURCE-CHANGED ENDOF
+   ;MATCH ;
+
 ;package
