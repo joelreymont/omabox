@@ -50,7 +50,7 @@ variable TOKEN-U           \ the bytes of FILLER a too-large token takes
 
 PATH-CAP BUFFER: DIR       variable DIR-U
 PATH-CAP BUFFER: LOG-PATH  variable LOG-PATH-U
-CAP BUFFER: ERR
+TYPED-VARIABLE AR ^ARENA:arena    \ holds the captured logs
 
 TYPED-VARIABLE ACTION [ -- ]
 
@@ -137,13 +137,12 @@ FILL-FILLER
 : LOGGED ( [ -- ] n ^u8 n -- )
    {: want t:^ tu :}
    ACTION !
-   LOG-PATH LOG-PATH-U @ STDERR:CAPTURE
-   [: ACTION @ want TTHROWSQ ;] [: STDERR:;CAPTURE ;] finally
-   LOG-PATH LOG-PATH-U @ ERR CAP FS:READ-ALL {: u :}
-   LOG-PATH LOG-PATH-U @ FS:REMOVE-FILE
-   ERR u 10 COUNT-CHAR 1 T=
-   ERR u t tu CONTAINS? TTRUE
-   ERR u s" sentinel" CONTAINS? TFALSE ;
+   ACTION @ LOG-PATH LOG-PATH-U @ AR @ STDERR:CAPTURING
+   {: code:n e:^ u:n :}
+   code want T=
+   e u 10 COUNT-CHAR 1 T=
+   e u t tu CONTAINS? TTRUE
+   e u s" sentinel" CONTAINS? TFALSE ;
 
 : SCRATCH-OPEN ( -- )
    s" auth-test" FS:MKTEMP-DIR {: d:^ du :}
@@ -269,6 +268,7 @@ FILL-FILLER
    BIND
    SCRATCH-OPEN
    ARENA:NEW {: ar :}
+   ar AR !
    [: ar CASES ;] [: ar ARENA:RELEASE SCRATCH-CLOSE ;] finally
    s" auth-test: " type T-CASES FMT:.INT s"  checks" type cr
    T-REPORT ;

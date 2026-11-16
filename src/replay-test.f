@@ -1238,18 +1238,14 @@ ARENA LINKS REPLAY:link
    l ar DELETE-F s" applied" s" absent" GIVES
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$= ;
 
-4096 constant LOG-CAP
-LOG-CAP BUFFER: LOG-TEXT
-
-\ Runs q with fd 2 sent to a file in the case's directory d; its text.
+\ Runs q with fd 2 sent to a file in the case's directory d; its text,
+\ in the arena.
 : LOGGED ( str [ -- ] ^ARENA:arena -- ^u8 n )
    {: d:str q ar :}
-   d s" stderr.txt" ar INSIDE str> {: e:^ eu:n :}
-   e eu STDERR:CAPTURE
-   [: q execute ;] [: STDERR:;CAPTURE ;] finally
-   e eu LOG-TEXT LOG-CAP FS:READ-ALL {: u:n :}
-   e eu FS:REMOVE-FILE
-   LOG-TEXT u ;
+   q d s" stderr.txt" ar INSIDE str> ar STDERR:CAPTURING
+   {: code:n t:^ u:n :}
+   code 0<> if code throw then
+   t u ;
 
 : LINE-COUNT ( ^u8 n -- n ) 10 COUNT-CHAR ;
 
@@ -1336,11 +1332,14 @@ LOG-CAP BUFFER: LOG-TEXT
    s" replay-test" FS:MKTEMP-DIR ar COPIED {: rt:str :}
    rt rt ar STATUS:NEW ;
 
+4096 constant STATUS-CAP
+STATUS-CAP BUFFER: STATUS-BUF
+
 \ status.json's text below the runtime directory rt.
 : STATUS-TEXT ( str ^ARENA:arena -- ^u8 n )
    {: rt:str ar :}
-   rt s" omabox/status.json" ar INSIDE str> LOG-TEXT LOG-CAP FS:READ-ALL
-   {: u:n :} LOG-TEXT u ;
+   rt s" omabox/status.json" ar INSIDE str>
+   STATUS-BUF STATUS-CAP FS:READ-ALL {: u:n :} STATUS-BUF u ;
 
 : SHOWS ( str ^ARENA:arena ^u8 n -- )
    {: rt:str ar want:^ wu:n :}

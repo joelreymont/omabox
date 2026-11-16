@@ -46,7 +46,6 @@ private
 CAP BUFFER: BODY       \ an oracle file, after a newline
 CAP BUFFER: LINE       \ a line looked for in BODY
 CAP BUFFER: WANT       \ a binding as the Rust version prints it
-CAP BUFFER: ERR        \ a captured log
 variable BODY-U
 $1A4 constant MODE-SHARED
 $140 constant MODE-SEALED          \ 0500
@@ -93,12 +92,10 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    {: want dir:str t:^ tu ar :}
    ACTION !
    dir s" stderr.txt" ar INSIDE {: f:str :}
-   f str> STDERR:CAPTURE
-   [: ACTION @ want TTHROWSQ ;] [: STDERR:;CAPTURE ;] finally
-   f str> ERR CAP FS:READ-ALL {: u :}
-   f str> FS:REMOVE-FILE
-   ERR u 10 COUNT-CHAR 1 T=
-   ERR u t tu CONTAINS? TTRUE ;
+   ACTION @ f str> ar STDERR:CAPTURING {: code:n e:^ u:n :}
+   code want T=
+   e u 10 COUNT-CHAR 1 T=
+   e u t tu CONTAINS? TTRUE ;
 
 \ The action runs with fd 2 sent to dir/stderr.txt, which then is empty
 \ and is removed.
@@ -106,10 +103,9 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    {: dir:str ar :}
    ACTION !
    dir s" stderr.txt" ar INSIDE {: f:str :}
-   f str> STDERR:CAPTURE
-   [: ACTION @ execute ;] [: STDERR:;CAPTURE ;] finally
-   f str> ERR CAP FS:READ-ALL 0 T=
-   f str> FS:REMOVE-FILE ;
+   ACTION @ f str> ar STDERR:CAPTURING nip {: code:n u:n :}
+   code 0<> if code throw then
+   u 0 T= ;
 
 
 \ ---- the oracle files --------------------------------------------

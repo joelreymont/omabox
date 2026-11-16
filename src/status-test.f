@@ -204,12 +204,11 @@ $1A4 constant LOOSE-FILE
    s FILE-PATH FS:MAKE-DIR
    ar RUNTIME {: log:str :}
    log s" status.log" ar JOINED {: path:str :}
-   path str> STDERR:CAPTURE
-   construct phase syncing s PHASE
-   STDERR:;CAPTURE
+   [: construct phase syncing s PHASE ;] path str> ar STDERR:CAPTURING
+   {: code:n e:^ u:n :}
+   code 0<> if code throw then
    s LISTED FILE$ T$=
-   path str> BODY CAP FS:READ-ALL {: u :}
-   BODY u s" status: could not replace the status file: " CONTAINS?
+   e u s" status: could not replace the status file: " CONTAINS?
    TTRUE
    log GONE
    rt GONE ;
@@ -341,15 +340,14 @@ $1A4 constant LOOSE-FILE
    rt s" absent" ar JOINED {: absent:str :}
    ar RUNTIME {: log:str :}
    log s" status.log" ar JOINED {: path:str :}
-   path str> STDERR:CAPTURE
-   [: s" run/user" >str ar NEW drop ;] E-RUNTIME-NOT-ABSOLUTE TTHROWS
-   [: absent ar NEW drop ;] E-RUNTIME-UNAVAILABLE TTHROWS
-   STDERR:;CAPTURE
-   path str> BODY CAP FS:READ-ALL {: u :}
-   BODY u s" STATUS:E-RUNTIME-NOT-ABSOLUTE: XDG_RUNTIME_DIR must be absolute"
+   [: [: s" run/user" >str ar NEW drop ;] E-RUNTIME-NOT-ABSOLUTE TTHROWS
+      [: absent ar NEW drop ;] E-RUNTIME-UNAVAILABLE TTHROWS ;]
+   path str> ar STDERR:CAPTURING {: code:n e:^ u:n :}
+   code 0<> if code throw then
+   e u s" STATUS:E-RUNTIME-NOT-ABSOLUTE: XDG_RUNTIME_DIR must be absolute"
    CONTAINS?
    TTRUE
-   BODY u s" STATUS:E-RUNTIME-UNAVAILABLE: XDG_RUNTIME_DIR is unavailable"
+   e u s" STATUS:E-RUNTIME-UNAVAILABLE: XDG_RUNTIME_DIR is unavailable"
    CONTAINS? TTRUE
    absent str> FS:TRY-STAT TFALSE
    log GONE

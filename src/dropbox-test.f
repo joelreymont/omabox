@@ -444,14 +444,14 @@ variable REFUSALS
 
 create ERR-PATH 256 allot
 variable ERR-PATH-U
-create ERR 512 allot
+PTR-VARIABLE ERR         \ the captured log, in AR
 variable ERR-U
 TYPED-VARIABLE ACTION [ -- ]
 TYPED-VARIABLE OUTCOME bool
 
 
 : ERR-PATH$ ( -- ^u8 n ) ERR-PATH ERR-PATH-U @ ;
-: ERR$ ( -- ^u8 n ) ERR ERR-U @ ;
+: ERR$ ( -- ^u8 n ) ERR @ ERR-U @ ;
 
 
 \ TMPDIR/<name> at dst; answers its length.
@@ -469,10 +469,7 @@ TYPED-VARIABLE OUTCOME bool
 : LOGGED ( [ -- ] -- n )
    ACTION !
    s" stderr.txt" ERR-PATH IN-TMP ERR-PATH-U !
-   ERR-PATH$ STDERR:CAPTURE
-   [: ACTION @ catch ;] [: STDERR:;CAPTURE ;] finally
-   ERR-PATH$ ERR 512 FS:READ-ALL ERR-U !
-   ERR-PATH$ FS:REMOVE-FILE ;
+   ACTION @ ERR-PATH$ AR @ STDERR:CAPTURING ERR-U ! ERR ! ;
 
 
 : LINES ( ^u8 n -- n )

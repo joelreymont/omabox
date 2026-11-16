@@ -86,7 +86,7 @@ TYPED-VARIABLE XDG ^CONFIG:xdg
 TYPED-VARIABLE ROOT str
 TYPED-VARIABLE SET ^CONFIG:paths
 TYPED-VARIABLE HELD ^CONFIG:config
-create ERR 1024 allot
+PTR-VARIABLE ERR         \ the captured log, in AR
 variable ERR-U
 \ FS:ERRNO as the logged action left it.
 variable CAUSE
@@ -162,17 +162,15 @@ variable CAUSE
 
 \ ---- the log a refusal writes
 
-: ERR$ ( -- ^u8 n ) ERR ERR-U @ ;
+: ERR$ ( -- ^u8 n ) ERR @ ERR-U @ ;
 : ERR-PATH ( -- str ) s" stderr.txt" UNDER ;
 
 \ The code the action throws, 0 for none, with fd 2 sent to the case's
 \ stderr.txt, which ERR$ then holds and which is removed.
 : LOGGED ( [ -- ] -- n )
    ACTION !
-   ERR-PATH str> STDERR:CAPTURE
-   [: ACTION @ catch FS:ERRNO CAUSE ! ;] [: STDERR:;CAPTURE ;] finally
-   ERR-PATH str> ERR 1024 FS:READ-ALL ERR-U !
-   ERR-PATH str> FS:REMOVE-FILE ;
+   [: ACTION @ [: FS:ERRNO CAUSE ! ;] finally ;]
+   ERR-PATH str> AR @ STDERR:CAPTURING ERR-U ! ERR ! ;
 
 : LINES ( ^u8 n -- n )
    {: a:^ u:n :}
@@ -187,7 +185,7 @@ variable CAUSE
 
 \ ERR$'s first line's length, its newline included.
 : FIRST-LINE ( -- n )
-   ERR-U @ 0 ?do ERR i + c@ 10 = if i 1+ unloop exit then loop
+   ERR-U @ 0 ?do ERR @ i + c@ 10 = if i 1+ unloop exit then loop
    ERR-U @ ;
 
 \ ERR$ is one line, t.
@@ -200,8 +198,8 @@ variable CAUSE
 : HELPED? ( str str -- bool )
    {: t h :}
    ERR$ LINES 2 <> if false exit then
-   ERR FIRST-LINE t ENDS? 0= if false exit then
-   ERR FIRST-LINE + ERR-U @ FIRST-LINE -
+   ERR @ FIRST-LINE t ENDS? 0= if false exit then
+   ERR @ FIRST-LINE + ERR-U @ FIRST-LINE -
    s" help: " >str h CAT ENDS? ;
 
 \ Asserts the flag, showing what ERR$ should have held.

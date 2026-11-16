@@ -440,17 +440,19 @@ FS:PATHZ-CAP BUFFER: TARGET
 \ Root opens a file and searches a directory whatever its mode.
 : ROOT-USER? ( -- bool ) GETEUID-CALL 0 = ;
 
-256 BUFFER: ERR
+FS:PATHZ-CAP BUFFER: LOG-AT
 
-\ Runs q with fd 2 sent to stderr.txt below the case's root; what that
-\ file then holds, after which it is removed.
+\ stderr.txt below the case's root, apart from AT's buffer, which a
+\ captured action may reuse.
+: LOG-PATH ( -- ^u8 n )
+   ROOT$ s" stderr.txt" LOG-AT FS:JOIN-PATH LOG-AT swap ;
+
+\ Runs q with fd 2 sent to LOG-PATH; what that file then holds, in AR,
+\ after which it is removed.
 : STDERR-OF ( [ -- ] -- ^u8 n )
-   {: q :}
-   s" stderr.txt" AT STDERR:CAPTURE
-   [: q execute ;] [: STDERR:;CAPTURE ;] finally
-   s" stderr.txt" AT ERR 256 FS:READ-ALL {: n :}
-   s" stderr.txt" AT FS:REMOVE-FILE
-   ERR n ;
+   LOG-PATH AR @ STDERR:CAPTURING {: code:n e:^ u:n :}
+   code 0<> if code throw then
+   e u ;
 
 \ ---- the scan's values
 
@@ -1543,19 +1545,22 @@ SHA256-CTX-BYTES BUFFER: PART
    LOCAL:DOWNLOAD-STAGE-XATTR s" marked" s" test unmark"
    LOCAL:REMOVE-XATTR ;
 
-256 BUFFER: ERR
+FS:PATHZ-CAP BUFFER: LOG-AT
+
+\ stderr.txt below the case's directory, apart from AT's buffer, which a
+\ captured action may reuse.
+: LOG-PATH ( -- ^u8 n )
+   ROOT$ s" stderr.txt" LOG-AT FS:JOIN-PATH LOG-AT swap ;
 
 \ Marking an attribute that exists throws LOCAL's code with EEXIST, fd 2
-\ sent to stderr.txt, which then holds XATTR's one line and is removed.
+\ sent to LOG-PATH, which then holds XATTR's one line and is removed.
 : ONE-XATTR-LINE ( fd ^u8 n -- )
    {: f:fd p:^ u:n :}
-   s" stderr.txt" AT STDERR:CAPTURE
    [: [: f p u MARK ;] LOCAL:E-IO TTHROWSQ FS:ERRNO FS:EEXIST T= ;]
-   [: STDERR:;CAPTURE ;] finally
-   s" stderr.txt" AT ERR 256 FS:READ-ALL {: n :}
-   s" stderr.txt" AT FS:REMOVE-FILE
-   ERR n 10 COUNT-CHAR 1 T=
-   ERR n s" xattr: fsetxattr" CONTAINS? TTRUE ;
+   LOG-PATH AR @ STDERR:CAPTURING {: code:n e:^ n:n :}
+   code 0<> if code throw then
+   e n 10 COUNT-CHAR 1 T=
+   e n s" xattr: fsetxattr" CONTAINS? TTRUE ;
 
 : MARKER-CHECKS ( fd -- )
    {: f:fd :}
@@ -1742,15 +1747,13 @@ SHA256-CTX-BYTES BUFFER: PART
    [: drop COLLECTION-CASE ;] IN-CASE-DIR ;
 
 \ A directory at the stage's path answers destination-occupied, a
-\ converted failure, so no LOCAL line goes to stderr.txt, which is removed.
+\ converted failure, so no LOCAL line goes to LOG-PATH, which is removed.
 : OCCUPIED-QUIETLY ( ^u8 n DROPBOX:hash -- )
    {: name:^ nu:n want:DROPBOX:hash :}
-   s" stderr.txt" AT STDERR:CAPTURE
    [: name nu want UPLOAD-STAGE UPLOAD-OUTCOME$ HOLD
       want STAGE-PATH T$= s" destination-occupied" T$= ;]
-   [: STDERR:;CAPTURE ;] finally
-   s" stderr.txt" AT ERR 256 FS:READ-ALL {: n :}
-   s" stderr.txt" AT FS:REMOVE-FILE
+   LOG-PATH AR @ STDERR:CAPTURING nip {: code:n n:n :}
+   code 0<> if code throw then
    n 0 T= ;
 
 \ Each outcome STAGE-UPLOAD answers, from one source file.
