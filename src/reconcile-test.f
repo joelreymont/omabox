@@ -112,6 +112,16 @@
 \ - occupied_dropbox_conflict_copy_name_blocks_only_its_path
 \ - conflict_on_a_plan_blocked_for_its_size_is_prepared_at_once
 \ - directory_at_dropbox_conflict_copy_name_blocks_only_its_path
+\ Restricted and same-named entries against the fake Dropbox, Rust's
+\ tests of the same names, with no account request and the fake's own
+\ delete_v2 and upload answers, its upload at rev 01701:
+\ - inaccessible_folder_deletes_nothing_beneath_it
+\ - newly_restricted_folder_drops_stale_child_records
+\ - restricted_folder_spells_its_listed_children
+\ - file_beside_a_same_named_directory_still_deletes_on_dropbox
+\ - file_beside_a_same_named_directory_still_deletes_locally
+\ - file_beside_a_same_named_directory_still_uploads_a_local_edit
+\ - inaccessible_directory_never_deletes_its_dropbox_contents
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -4080,6 +4090,331 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    ar CONFLICT-ON-A-PLAN-BLOCKED-FOR-ITS-SIZE-IS-PREPARED-AT-ONCE
    ar DIRECTORY-AT-DROPBOX-CONFLICT-COPY-NAME-BLOCKS-ONLY-ITS-PATH ;
 
+\ ---- restricted and same-named entries against the fake Dropbox ----
+
+\ The no-op decision's baseline, recorded at p.
+: SEEDED-NOOP ( ^run ^u8 n MODEL:decision -- )
+   {: x p:^ u:n dec :}
+   dec NOOP-BASELINE {: b :}
+   x RUN-JOURNAL @ p u DISPLAY b x RUN-ARENA @ JOURNAL:RECORD-NOOP
+   NOOP-RECORDED? TTRUE ;
+
+\ Rust's seed_baseline: rem at p alike on both sides.
+: SEEDED-FILE ( ^run ^u8 n MODEL:remote -- )
+   {: x p:^ u:n rem :}
+   rem MODEL-REMOTE:UNMAKE {: c rev :}
+   rem MODEL-BASELINE:PRESENT c MODEL-LOCAL:MAKE LOCAL-PRESENT
+   rem REMOTE-PRESENT MODEL-SUBTREE:EMPTY PLANNER:PLAN {: dec :}
+   x p u dec SEEDED-NOOP ;
+
+\ Rust's seed_directory_baseline.
+: SEEDED-FOLDER ( ^run ^u8 n -- )
+   {: x p:^ u:n :}
+   MODEL-BASELINE:DIRECTORY LOCAL-DIRECTORY REMOTE-DIRECTORY
+   MODEL-SUBTREE:EMPTY PLANNER:PLAN {: dec :}
+   x p u dec SEEDED-NOOP ;
+
+: FOLDER-BASELINE-AT ( ^run ^u8 n -- )
+   {: x p:^ u:n :}
+   x RUN-JOURNAL @ p u DISPLAY x RUN-ARENA @ JOURNAL:BASELINE
+   STORED-BASELINE MODEL-BASELINE:DIRECTORY MODEL:BASELINE= TTRUE ;
+
+: NO-CONFLICT-RECORD ( ^run -- )
+   {: x :}
+   x RUN-JOURNAL @ x RUN-ARENA @ JOURNAL:CONFLICTS VEC:COUNT 0 T= ;
+
+\ Rust's restricted_folder_metadata with no_access.
+: NO-ACCESS-JSON+ ( ^u8 n ^u8 n -- )
+   S\" {\q.tag\q:\qfolder\q" SB-APPEND PATHS+
+   S\" ,\qsharing_info\q:{\qread_only\q:false," SB-APPEND
+   S\" \qno_access\q:true}}" SB-APPEND ;
+
+\ The listing's one page: /Shared, which the user cannot access.
+: NO-ACCESS-PAGE ( ^u8 n ^ARENA:arena -- )
+   {: k:^ ku:n ar :}
+   [: s" /shared" s" /Shared" NO-ACCESS-JSON+ ;] ar ENTRIES
+   k ku false PAGE ;
+
+: FOLDER-MADE-IN ( ^run ^u8 n -- ) IN-ROOT str> FS:MAKE-DIR ;
+
+: BYTES-WRITTEN-IN ( ^run ^u8 n ^u8 n -- )
+   {: x p:^ u:n b:^ bu:n :}
+   x p u IN-ROOT str> b bu FS:WRITE-ALL ;
+
+: BENEATH$ ( -- ^u8 n ) s" notes kept beneath an inaccessible folder" ;
+
+: INACCESSIBLE-FOLDER-DELETES-NOTHING-BENEATH-IT ( ^ARENA:arena -- )
+   {: ar :}
+   s" inaccessible_folder_deletes_nothing_beneath_it" T-LABEL
+   TEST-DROPBOX:RESET
+   BENEATH$ s" rev-notes" ar REMOTE-FILE {: notes :}
+   s" cursor-inaccessible" ar NO-ACCESS-PAGE
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" Shared" FOLDER-MADE-IN
+   x s" Shared/notes.txt" BENEATH$ BYTES-WRITTEN-IN
+   x s" Shared/notes.txt" notes SEEDED-FILE
+   x rec PASSED COMPLETE drop
+   x s" Shared/notes.txt" IN-ROOT BENEATH$ HOLDS-BYTES
+   x s" Shared/notes.txt" notes BASELINE-AT
+   x PENDING-OF VEC:COUNT 0 T=
+   \ Departure 5: no account request.
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$=
+   d x STEP-GONE ;
+
+: BEFORE-NOTES$ ( -- ^u8 n ) s" notes observed before the restriction" ;
+: BEFORE-KEEP$ ( -- ^u8 n ) s" keep observed before the restriction" ;
+: EDITED-KEEP$ ( -- ^u8 n ) s" keep edited locally" ;
+
+\ Shared, its notes and keep, published with cursor-accessible.
+: ACCESSIBLE ( ^run MODEL:remote MODEL:remote -- )
+   {: x notes keep :}
+   x RUN-ARENA @ {: ar :}
+   ar REMOTE-RECORDS {: rs :}
+   rs s" Shared" REMOTE-DIRECTORY ar REMOTE+
+   rs s" Shared/notes.txt" notes REMOTE-PRESENT ar REMOTE+
+   rs s" Shared/keep.txt" keep REMOTE-PRESENT ar REMOTE+
+   x RUN-JOURNAL @ s" cursor-accessible" >str DROPBOX:>CURSOR rs
+   JOURNAL:PUBLISH-REMOTE-INVENTORY ;
+
+\ Shared's notes and keep, observed on both sides, then notes removed
+\ and keep edited in the root.
+: OBSERVED-BEFORE ( ^run MODEL:remote MODEL:remote -- )
+   {: x notes keep :}
+   x s" Shared" FOLDER-MADE-IN
+   x s" Shared/notes.txt" BEFORE-NOTES$ BYTES-WRITTEN-IN
+   x s" Shared/keep.txt" BEFORE-KEEP$ BYTES-WRITTEN-IN
+   x s" Shared" SEEDED-FOLDER
+   x s" Shared/notes.txt" notes SEEDED-FILE
+   x s" Shared/keep.txt" keep SEEDED-FILE
+   x notes keep ACCESSIBLE
+   x s" Shared/notes.txt" IN-ROOT str> FS:REMOVE-FILE
+   x s" Shared/keep.txt" EDITED-KEEP$ BYTES-WRITTEN-IN ;
+
+: NEWLY-RESTRICTED-FOLDER-DROPS-STALE-CHILD-RECORDS ( ^ARENA:arena -- )
+   {: ar :}
+   s" newly_restricted_folder_drops_stale_child_records" T-LABEL
+   TEST-DROPBOX:RESET
+   BEFORE-NOTES$ s" rev-notes" ar REMOTE-FILE {: notes :}
+   BEFORE-KEEP$ s" rev-keep" ar REMOTE-FILE {: keep :}
+   \ The journal's cursor makes the page a continuation's.
+   s" cursor-restricted" ar NO-ACCESS-PAGE
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x notes keep OBSERVED-BEFORE
+   x rec PASSED COMPLETE drop
+   x s" Shared/notes.txt" notes BASELINE-AT
+   x s" Shared/keep.txt" keep BASELINE-AT
+   x s" Shared/notes.txt" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" Shared/keep.txt" IN-ROOT EDITED-KEEP$ HOLDS-BYTES
+   \ Departure 5: no account request.
+   TEST-DROPBOX:SEEN$ CONTINUE$ T$=
+   d x STEP-GONE ;
+
+\ The directory's names, newline-separated in byte order, are w.
+: NAMES-ARE ( ^u8 n ^u8 n -- )
+   {: p:^ u:n w:^ wu:n :}
+   p u READ-BUF READ-CAP FS-LIST:NAMES {: k:n :}
+   READ-BUF k w wu T$= ;
+
+: FOLDER-IN? ( ^run ^u8 n -- bool ) IN-ROOT str> FS:DIR? ;
+
+: RESTRICTED-FOLDER-SPELLS-ITS-LISTED-CHILDREN ( ^ARENA:arena -- )
+   {: ar :}
+   s" restricted_folder_spells_its_listed_children" T-LABEL
+   TEST-DROPBOX:RESET
+   [: s" /shared" s" /Shared" TRAVERSE-ONLY-JSON+ COMMA+
+      s" /shared/a" s" /shared/A" FOLDER-JSON+ COMMA+
+      s" /shared/b" s" /SHARED/B" FOLDER-JSON+ ;] ar ENTRIES
+   s" cursor-spelled" false PAGE
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x rec PASSED COMPLETE drop
+   x ROOT$ s" Shared" NAMES-ARE
+   x s" Shared" FOLDER-IN? TTRUE
+   x s" Shared" IN-ROOT str> S\" A\nB" NAMES-ARE
+   x s" Shared/A" FOLDER-IN? TTRUE
+   x s" Shared/B" FOLDER-IN? TTRUE
+   \ Departure 5: Rust's two requests but the account's.
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$=
+   d x STEP-GONE ;
+
+: SHARED-SIBLING$ ( -- ^u8 n ) s" shared sibling baseline" ;
+: SIBLING-EDIT$ ( -- ^u8 n ) s" sibling child edited locally" ;
+
+\ Rust's sibling_fixture: report/ and report.txt in the root, and the
+\ baselines report, report.txt and report/x; answers the recovery.
+: SIBLINGS ( str ^run MODEL:remote -- str )
+   {: d:str x shared :}
+   d x PASS-READY {: rec:str :}
+   x s" report" FOLDER-MADE-IN
+   x s" report.txt" SHARED-SIBLING$ BYTES-WRITTEN-IN
+   x s" report" SEEDED-FOLDER
+   x s" report.txt" shared SEEDED-FILE
+   x s" report/x" shared SEEDED-FILE
+   rec ;
+
+: SIBLING-FILE+ ( ^u8 n DROPBOX:hash -- )
+   {: p:^ u:n h:DROPBOX:hash :}
+   p u p u s" rev-sibling" h FILE-JSON+ ;
+
+\ Rust's sibling_listing, its files' identity h; with child, report/x.
+: SIBLING-PAGE ( DROPBOX:hash bool ^ARENA:arena -- )
+   {: h:DROPBOX:hash child:bool ar :}
+   [: s" /report" s" /report" FOLDER-JSON+ COMMA+
+      s" /report.txt" h SIBLING-FILE+
+      child if COMMA+ s" /report/x" h SIBLING-FILE+ then ;]
+   ar ENTRIES s" cursor-after-sibling" false PAGE ;
+
+: SIBLING-REPORTS ( report -- )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   planned 1 T= replayed 1 T= conflicts 0 T= blocked 0 T= ;
+
+: SIBLING-DELETE$ ( -- ^u8 n )
+   S\" {\qpath\q:\q/report/x\q,\qparent_rev\q:\qrev-sibling\q}" ;
+
+: FILE-BESIDE-A-SAME-NAMED-DIRECTORY-STILL-DELETES-ON-DROPBOX
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" file_beside_a_same_named_directory_still_deletes_on_dropbox"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   SHARED-SIBLING$ s" rev-sibling" ar REMOTE-FILE {: shared :}
+   SHARED-SIBLING$ ar IDENTITY true ar SIBLING-PAGE
+   \ The fake's delete_v2 answers report/x as Rust's script does.
+   s" report/x" s" rev-sibling" SHARED-SIBLING$ ar FILE-AT
+   ar STEP-RUN {: d:str x :}
+   d x shared SIBLINGS {: rec:str :}
+   x rec PASSED COMPLETE SIBLING-REPORTS
+   x s" report/x" NO-BASELINE? TTRUE
+   x s" report.txt" shared BASELINE-AT
+   x s" report/x" IN-ROOT str> FS:EXISTS? TFALSE
+   x NO-CONFLICT-RECORD
+   x PENDING-OF VEC:COUNT 0 T=
+   TEST-DROPBOX:BODY-SENT$ SIBLING-DELETE$ T$=
+   d x STEP-GONE ;
+
+: FILE-BESIDE-A-SAME-NAMED-DIRECTORY-STILL-DELETES-LOCALLY
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" file_beside_a_same_named_directory_still_deletes_locally" T-LABEL
+   TEST-DROPBOX:RESET
+   SHARED-SIBLING$ s" rev-sibling" ar REMOTE-FILE {: shared :}
+   SHARED-SIBLING$ ar IDENTITY false ar SIBLING-PAGE
+   ar STEP-RUN {: d:str x :}
+   d x shared SIBLINGS {: rec:str :}
+   x s" report/x" SHARED-SIBLING$ BYTES-WRITTEN-IN
+   x rec PASSED COMPLETE SIBLING-REPORTS
+   x s" report/x" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" report/x" NO-BASELINE? TTRUE
+   x s" report.txt" shared BASELINE-AT
+   x NO-CONFLICT-RECORD
+   x PENDING-OF VEC:COUNT 0 T=
+   \ Departure 5: Rust's two requests but the account's.
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$=
+   d x STEP-GONE ;
+
+\ Rust's conflict_bytes of the root is empty.
+: NO-CONFLICT-COPY ( ^run -- )
+   ROOT$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
+   SB-RESET S\" \n" SB-APPEND READ-BUF u SB-APPEND
+   SB$ S\" \n.omabox-conflict-" CONTAINS? TFALSE ;
+
+\ report/x's update argument as DROPBOX writes it, for content h.
+: SIBLING-ARG$ ( DROPBOX:hash -- ^u8 n )
+   {: h:DROPBOX:hash :}
+   SB-RESET S\" {\qpath\q:\q/report/x\q,\qmode\q:{\q.tag\q:" SB-APPEND
+   S\" \qupdate\q,\qupdate\q:\qrev-sibling\q}," SB-APPEND
+   S\" \qautorename\q:false,\qstrict_conflict\q:true," SB-APPEND
+   S\" \qcontent_hash\q:\q" SB-APPEND
+   h DROPBOX:HASH>STR str> SB-APPEND S\" \q}" SB-APPEND SB$ ;
+
+: FILE-BESIDE-A-SAME-NAMED-DIRECTORY-STILL-UPLOADS-A-LOCAL-EDIT
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" file_beside_a_same_named_directory_still_uploads_a_local_edit"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   SHARED-SIBLING$ s" rev-sibling" ar REMOTE-FILE {: shared :}
+   SHARED-SIBLING$ ar IDENTITY true ar SIBLING-PAGE
+   \ The fake's upload updates rev-sibling and answers rev 01701, which
+   \ stands for Rust's scripted rev-sibling-upload.
+   s" report/x" s" rev-sibling" SHARED-SIBLING$ ar FILE-AT
+   ar STEP-RUN {: d:str x :}
+   d x shared SIBLINGS {: rec:str :}
+   x s" report/x" SIBLING-EDIT$ BYTES-WRITTEN-IN
+   x rec PASSED COMPLETE SIBLING-REPORTS
+   x NO-CONFLICT-RECORD
+   x NO-CONFLICT-COPY
+   x s" report/x" IN-ROOT SIBLING-EDIT$ HOLDS-BYTES
+   x s" report/x" SIBLING-EDIT$ s" 01701" ar REMOTE-FILE BASELINE-AT
+   TEST-DROPBOX:BODY-SENT$ SIBLING-EDIT$ T$=
+   TEST-DROPBOX:ARG-SENT$ SIBLING-EDIT$ ar IDENTITY SIBLING-ARG$ T$=
+   d x STEP-GONE ;
+
+: SECRET$ ( -- ^u8 n ) s" secret baseline bytes" ;
+: OPEN-UPLOAD$ ( -- ^u8 n ) s" sibling upload" ;
+\ 0700, Rust's allow_owner_access.
+$1C0 constant OWNER-ACCESS
+
+\ PASS with locked/ unsearchable, then locked/ opened to its owner
+\ whatever the pass did.
+: LOCKED-PASSED ( ^run str -- outcome )
+   {: x rec:str :}
+   x s" locked" IN-ROOT {: l:str :}
+   l str> 0 FS:CHMOD-MODE
+   [: x rec PASSED ;] [: l str> OWNER-ACCESS FS:CHMOD-MODE ;] finally ;
+
+\ locked/secret.txt and open.txt in the root and on the page, and the
+\ baselines locked and locked/secret.txt.
+: LOCKED-SIBLINGS ( ^run MODEL:remote ^ARENA:arena -- )
+   {: x secret ar :}
+   SECRET$ ar IDENTITY {: h:DROPBOX:hash :}
+   [: s" /locked" s" /locked" FOLDER-JSON+ COMMA+
+      s" /locked/secret.txt" s" /locked/secret.txt" s" rev-secret" h
+      FILE-JSON+ ;] ar ENTRIES s" cursor-locked" false PAGE
+   x s" locked" FOLDER-MADE-IN
+   x s" locked/secret.txt" SECRET$ BYTES-WRITTEN-IN
+   x s" open.txt" OPEN-UPLOAD$ BYTES-WRITTEN-IN
+   x s" locked" SEEDED-FOLDER
+   x s" locked/secret.txt" secret SEEDED-FILE ;
+
+: LOCKED-REPORTS ( report -- )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   planned 1 T= replayed 1 T= blocked 2 T= conflicts 0 T= ;
+
+: INACCESSIBLE-DIRECTORY-NEVER-DELETES-ITS-DROPBOX-CONTENTS
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" inaccessible_directory_never_deletes_its_dropbox_contents" T-LABEL
+   TEST-DROPBOX:RESET
+   SECRET$ s" rev-secret" ar REMOTE-FILE {: secret :}
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x secret ar LOCKED-SIBLINGS
+   x rec LOCKED-PASSED COMPLETE LOCKED-REPORTS
+   x s" locked" FOLDER-BASELINE-AT
+   x s" locked/secret.txt" secret BASELINE-AT
+   \ The fake's upload answers rev 01701 for Rust's scripted rev-open.
+   x s" open.txt" OPEN-UPLOAD$ s" 01701" ar REMOTE-FILE BASELINE-AT
+   x s" locked/secret.txt" IN-ROOT SECRET$ HOLDS-BYTES
+   x NO-CONFLICT-RECORD
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2" CONTAINS? TFALSE
+   TEST-DROPBOX:SEEN$ s" /2/files/upload" CONTAINS? TTRUE
+   d x STEP-GONE ;
+
+: RESTRICTED-CASES ( ^ARENA:arena -- )
+   {: ar :}
+   ar INACCESSIBLE-FOLDER-DELETES-NOTHING-BENEATH-IT
+   ar NEWLY-RESTRICTED-FOLDER-DROPS-STALE-CHILD-RECORDS
+   ar RESTRICTED-FOLDER-SPELLS-ITS-LISTED-CHILDREN
+   ar FILE-BESIDE-A-SAME-NAMED-DIRECTORY-STILL-DELETES-ON-DROPBOX
+   ar FILE-BESIDE-A-SAME-NAMED-DIRECTORY-STILL-DELETES-LOCALLY
+   ar FILE-BESIDE-A-SAME-NAMED-DIRECTORY-STILL-UPLOADS-A-LOCAL-EDIT
+   ar INACCESSIBLE-DIRECTORY-NEVER-DELETES-ITS-DROPBOX-CONTENTS ;
+
 : SERVED ( ^ARENA:arena -- )
    {: ar :}
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
@@ -4088,7 +4423,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    ACCOUNTED
    [: ar REFRESH-CASES ar STEP-CASES ar PASS-CASES
       ar STALE-CASES ar DOWNLOAD-BLOCKS-CASES ar UPLOADS-CASES
-      ar CONFLICTS-CASES ;]
+      ar CONFLICTS-CASES ar RESTRICTED-CASES ;]
    [: MAIN @ DROPBOX:CLOSE ;]
    finally ;
 

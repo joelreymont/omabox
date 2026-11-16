@@ -20,8 +20,9 @@
 \ bound to its path, else, an API call only, the first left bound to none.
 \ ARG-SCRIPT! also binds one to a text the call's Dropbox-API-Arg must
 \ contain.
-\ It records each request's path, and the last API call's Authorization,
-\ Path-Root and Content-Type.
+\ It records each request's path, the last API call's Authorization,
+\ Path-Root and Content-Type, and the body of the last delete_v2 or single
+\ upload its route answered, BODY-SENT$.
 \ STORAGE CLASS. PROCESS-WIDE: one worker serves every request, so its handler
 \ alone writes the state while a test waits on its call, and the test sets it
 \ between calls; only RESUME-BODY sets it during one, and the
@@ -451,6 +452,8 @@ create WANT NAME-CAP allot
 variable WANT-U
 create HELD NAME-CAP allot
 variable HELD-U
+create BODY-SENT TEXT-CAP allot
+variable BODY-SENT-U
 
 
 \ The code grant's names and values, as FIELDS$ decodes them.
@@ -474,6 +477,11 @@ variable HELD-U
    S\" \q,\qrefresh_token\q:\qfake-refresh-granted\q" SB-APPEND
    S\" ,\qtoken_type\q:\qbearer\q,\qexpires_in\q:14400}" SB-APPEND
    a BUILT ANSWER! ;
+
+
+\ The request body's first TEXT-CAP bytes into BODY-SENT.
+: BODY-KEPT ( HTTP:request -- )
+   HTTP:BODY$ TEXT-CAP min BODY-SENT TEXT-CAP STORE BODY-SENT-U ! ;
 
 
 \ The request body's parent_rev into WANT, and whether it sent one.
@@ -554,6 +562,7 @@ variable HELD-U
 : DELETE-PATH ( HTTP:request HTTP:response -- )
    {: q:HTTP:request a:HTTP:response :}
    q a ADMITTED? 0= if exit then
+   q BODY-KEPT
    q ASK
    FOUND {: i:n :}
    i 0< if a S\" {\qerror_summary\q:\qpath_lookup/not_found/...\q,\qerror\q:{\q.tag\q:\qpath_lookup\q,\qpath_lookup\q:{\q.tag\q:\qnot_found\q}}}" REFUSED! exit then
@@ -1248,6 +1257,7 @@ variable SESSIONS
    {: q:HTTP:request a:HTTP:response :}
    q a ADMITTED? 0= if exit then
    q ARG-READ
+   q BODY-KEPT
    q HTTP:BODY$ {: b:^ bu:n :}
    BODY-HASHER DROPBOX:HASH-BEGIN
    b bu BODY-HASHER DROPBOX:HASH-FEED
@@ -1388,7 +1398,7 @@ $2100000 constant UPLOAD-CAP
    0 SCRIPTS ! 0 FILES ! 0 CONTENTS ! 0 SESSIONS ! 0 REVS !
    0 GRANT-CODE-U ! 0 ROTATED-U !
    0 SEEN-U ! 0 AUTH-U ! 0 ROOT-SENT-U ! 0 TYPE-SENT-U !
-   0 ARG-SENT-U ! 0 RANGE-SENT-U !
+   0 ARG-SENT-U ! 0 RANGE-SENT-U ! 0 BODY-SENT-U !
    false ROOTED ! false TYPED ! false LEAKED ! false RANGED !
    false SKEWED ! false CLIPPED ! false INFLATED !
    0 MISHASHED-U ! false MISSIZED ! 0 MISFILED-U !
@@ -1588,6 +1598,11 @@ $2100000 constant UPLOAD-CAP
    {: k:^ ku:n v:^ vu:n :}
    k ku GRANT-CODE NAME-CAP STORE GRANT-CODE-U !
    v vu VERIFIER NAME-CAP STORE VERIFIER-U ! ;
+
+
+\ The body of the last delete_v2 or single upload its route answered, its
+\ first KiB.
+: BODY-SENT$ ( -- ^u8 n ) BODY-SENT BODY-SENT-U @ ;
 
 
 \ The next API call's route runs and takes effect, and its answer is lost:
