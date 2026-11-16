@@ -1,8 +1,11 @@
 \ stale-test.f - STALE against the Rust version's stale.rs test under its
 \ name: a directory the sweep cannot read is one leftover, its path, its
-\ operation and its errno. The case runs in a directory of its own under
+\ operation and its errno. Each case runs in a directory of its own under
 \ TMPDIR and removes it after; as root, which reads a directory whatever
-\ its mode, it checks nothing, as the Rust test does.
+\ its mode, that case checks nothing, as the Rust test does.
+\ - dead_directory_is_removed_whole, Omabox's own: a dead process's
+\   temporary that is a directory, holding a file and a subdirectory,
+\   goes with no leftover
 \ Run from the repository root: hb --load src/stale-test.f </dev/null
 require src/lib/arena.f
 require src/lib/string.f
@@ -59,12 +62,32 @@ TYPED-VARIABLE DIR str
    l STALE:OPERATION$ s" read a directory" T$=
    l STALE:ERRNO FS:EACCES T= ;
 
+\ No process has this PID: Linux caps pid_max at 2^22.
+: DEAD-NAME ( -- ^u8 n ) s" .omabox.install.2147483647.0" ;
+
+: REMOVED-WHOLE ( str -- )
+   {: tmp :}
+   tmp DEAD-NAME UNDER {: t :}
+   t s" sub" UNDER {: sub :}
+   t str> FS:MAKE-DIR
+   sub str> FS:MAKE-DIR
+   t s" file" UNDER str> s" stale" FS:WRITE-ALL
+   sub s" file" UNDER str> s" stale" FS:WRITE-ALL
+   tmp s" .omabox.install." s" " AR @ STALE:SWEEP VEC:COUNT 0 T=
+   t str> FS:TRY-LSTAT TFALSE ;
+
+: DEAD-DIRECTORY ( -- )
+   s" dead_directory_is_removed_whole" T-LABEL
+   s" TMPDIR" GETENV s" stale-test-" FS:MKTEMP-DIR-IN KEEP {: tmp :}
+   [: tmp REMOVED-WHOLE ;] [: tmp str> FS:REMOVE-TREE ;] finally ;
+
 public
 
 : RUN ( -- )
    T-RESET
    ARENA:NEW AR !
-   [: UNREADABLE-DIRECTORY ;] [: AR @ ARENA:RELEASE ;] finally
+   [: UNREADABLE-DIRECTORY DEAD-DIRECTORY ;]
+   [: AR @ ARENA:RELEASE ;] finally
    s" stale-test: " type T-CASES FMT:.INT s"  checks" type cr
    T-REPORT ;
 

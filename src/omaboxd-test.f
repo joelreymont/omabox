@@ -2,6 +2,8 @@
 \ a directory under TMPDIR and run as a child, as Rust's
 \ tests/daemon_startup.rs runs its binary, under their names:
 \ - self_check_ignores_unavailable_configuration_and_prints_version
+\ - self_check_fails_on_a_full_stdout, Omabox's own: --self-check
+\   writing to /dev/full
 \ - initialized_journal_and_held_lock_precede_readiness
 \ - unavailable_root_still_signals_readiness, its three fixtures
 \ A fixture is Rust's StartupFixture: config, state, runtime, an empty
@@ -115,6 +117,39 @@ $40 constant MSG-DONTWAIT
    rc 0 T=
    OUT outu LEN>N VERSION-LINE T$=
    erru LEN>N 0 T= ;
+
+\ How the child ended, its exit code or 128 + its signal; past the
+\ self-check's deadline it is killed and reaped, and -1.
+: OUTCOME ( pid -- n )
+   {: p :}
+   p SELF-CHECK-MS >MS PROCESS:WAIT-BOUNDED
+   MATCH PROCESS:ending
+      exited OF ENDOF
+      signaled OF 128 + ENDOF
+      timeout OF
+         p PROCESS:SIGKILL PROCESS:KILL-RAW drop
+         p PROCESS:WAIT drop -1
+      ENDOF
+   ;MATCH ;
+
+\ ENOSPC on the version line's write: the self-check exits nonzero,
+\ neither killed nor hung.
+: SELF-CHECK-FAILS-ON-A-FULL-STDOUT ( str -- )
+   {: bin :}
+   s" self_check_fails_on_a_full_stdout" T-LABEL
+   S\" /dev/full\z" drop O-RDWR 0 open {: full :}
+   S\" /dev/null\z" drop O-RDWR 0 open {: null :}
+   full 0 >= TTRUE
+   null 0 >= TTRUE
+   bin str> PROCESS:NEW PROCESS:HERMETIC
+   s" --self-check" PROCESS:ARG
+   0 >FD null >FD PROCESS:FD
+   1 >FD full >FD PROCESS:FD
+   2 >FD null >FD PROCESS:FD
+   PROCESS:SPAWN {: p :}
+   full close null close
+   p OUTCOME {: rc :}
+   rc 0 > rc 128 < and TTRUE ;
 
 
 \ ---- the fixture ----
@@ -367,6 +402,7 @@ ARENA FIXTURES fixture
 : CASES ( str -- )
    {: bin :}
    bin SELF-CHECK-IGNORES-UNAVAILABLE-CONFIGURATION-AND-PRINTS-VERSION
+   bin SELF-CHECK-FAILS-ON-A-FULL-STDOUT
    bin INITIALIZED-JOURNAL-AND-HELD-LOCK-PRECEDE-READINESS
    bin UNAVAILABLE-ROOT-STILL-SIGNALS-READINESS ;
 
