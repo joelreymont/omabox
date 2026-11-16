@@ -1767,9 +1767,12 @@ public
 
 : ENTRY ( ^client -- ^entry ) CLIENT-ENTRY ;
 
-\ The status of the last answer, 0 when none came; an E-STATUS or
-\ E-BAD-REQUEST call leaves its own.
-: HTTP-STATUS ( ^client -- n ) CLIENT-STATUS @ ;
+\ The status of the last call's answer, 0 when none came or a token request
+\ answered last; an E-STATUS or E-BAD-REQUEST call leaves its own.
+: HTTP-STATUS ( ^client -- n )
+   {: c :}
+   c CLIENT-QUIET @ if 0 exit then
+   c CLIENT-STATUS @ ;
 
 
 \ ---- list_folder, list_folder/continue and list_folder/longpoll

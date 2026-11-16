@@ -96,7 +96,8 @@ ENUM reply
 : DELETE        ( ^u8 n ^u8 n ^client -- reply )  \ path, rev
 : CREATE-FOLDER ( ^u8 n ^client -- reply )  \ path
 : ENTRY         ( ^client -- ^entry )
-: HTTP-STATUS   ( ^client -- n )    \ the last answer's status, 0 if none
+: HTTP-STATUS   ( ^client -- n )    \ the last call's status, 0 if none
+                \ or a token request's
 : CONTENT-HASH? ( ^u8 n -- bool )   \ 64 lowercase hex digits
 : COMPLETE?     ( ^entry -- bool )  \ a downloadable file with a
                 \ rev and a 64-lowercase-hex-digit content hash

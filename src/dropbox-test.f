@@ -2,9 +2,10 @@
 \ test-dropbox.f on a loopback port: the account, metadata (of a file that
 \ is not downloadable, of a symlink, of a file with no content hash and of
 \ an entry at another path among them), the Path-Root header, the token's
-\ refresh, its rotation and the store that keeps it, a rejected grant, a
-\ revoked token, access denied, a scripted answer bound to its route, rate
-\ limits, outages, a redirect, a malformed request, a write refused
+\ refresh, its rotation and the store that keeps it, a refresh that fails
+\ a download and leaves no status, a rejected grant, a revoked token,
+\ access denied, a scripted answer bound to its route, rate limits,
+\ outages, a redirect, a malformed request, a write refused
 \ access_restricted, team_folder or
 \ operation_suppressed, the listing (one holding a file that is not
 \ downloadable, one holding files Dropbox described incompletely, handed
@@ -630,6 +631,27 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    fresh DROPBOX:ACCOUNT RETRY-MS 23000 T=
    TEST-DROPBOX:SEEN$ s" /oauth2/token" T$=
    fresh DROPBOX:CLOSE ;
+
+
+\ A download whose refresh is answered s with body b throws code; the
+\ download is never sent, and HTTP-STATUS answers 0, not s.
+: REFRESH-FAILED ( n ^u8 n n -- )
+   {: s:n b:^ bu:n code:n :}
+   TEST-DROPBOX:RESET
+   s" live-token" s" ns-root" OPENED OWN !
+   s" /oauth2/token" s s" " s" " b bu TEST-DROPBOX:ROUTE-SCRIPT!
+   [: s" 0160a1b2c3d4" 0 OWN @ [: 2drop drop ;] DROPBOX:DOWNLOAD
+      DONE? drop ;] LOGGED code T=
+   OWN @ DROPBOX:HTTP-STATUS 0 T=
+   TEST-DROPBOX:SEEN$ s" /oauth2/token" T$=
+   OWN @ DROPBOX:CLOSE ;
+
+
+: FAILED-REFRESH-CASE ( -- )
+   s" a failed refresh leaves no status" T-LABEL
+   400 S\" {\qerror\q:\qinvalid_request\q}" DROPBOX:E-BAD-REQUEST
+   REFRESH-FAILED
+   404 s" " DROPBOX:E-STATUS REFRESH-FAILED ;
 
 
 \ An answer bound to download's route passes get_metadata and list_folder
@@ -2559,7 +2581,8 @@ TYPED-VARIABLE FAULT fault
    SDK-EXPIRY-REFRESH-REISSUES-THE-ROUTE-WITH-THE-SAME-CLIENT
    REJECTED-GRANT-CASE REVOKED-CASE DENIED-CASE
    STORED-FIRST-CASE UNSTORED-CASE UNROTATED-CASE SCRIPTED-REFRESH-CASE
-   OAUTH-RATE-LIMIT-PRESERVES-RETRY-AFTER-HEADER ROUTED-SCRIPT-CASE
+   OAUTH-RATE-LIMIT-PRESERVES-RETRY-AFTER-HEADER FAILED-REFRESH-CASE
+   ROUTED-SCRIPT-CASE
    RATE-CASE RATE-BODY-CASE RATE-DATE-CASE RATE-CAP-CASE
    RATE-ZEROS-CASE RATE-HUGE-CASE
    BUSY-CASE REDIRECT-CASE BAD-REQUEST-CASE
