@@ -1436,3 +1436,74 @@ second call. Rust's borrow checker refuses this program: a `&str` into a
 buffer cannot outlive a `&mut self` call that clears it. In Habu the rule
 is a comment ("the answer buffer, which the next call clears"), so the
 test that pins it down is the only check.
+
+## 2026-11-17: the omabox command, and what Rust does unasked
+
+The CLI port met the first write that can fail where Rust panics.
+Rust's `println!` panics when stdout is gone, so `omaboxd --version`
+piped into a closed reader fails. Habu's `type` writes and ignores the
+result: a closed pipe with SIGPIPE held off and a full disk both leave
+the program at exit status 0, and the forth-card does not say the write
+is unchecked. The port writes through `FD:WRITE-FULL`, which throws, and
+the report went to Habu's owners. Every Rust test that compared output
+passed against `type`, because a test's pipe never closes early.
+
+Rust compares a parsed command with `assert_eq!`, because `#[derive
+(PartialEq)]` reaches through `String`, `bool` and `Option`. Habu's
+`DERIVE eq` refuses a record with a `str`, `bool` or `option` field, so
+the command enum derives no equality. The parser tests compare commands
+by their printed text, and the setup options with a hand-written
+`OPTIONS=`. Forty-four lines of test code stand in for one derive.
+
+A public enum's constructors take a name the source never writes. In
+SERVICE, `ENUM action ... stop ...` makes `SERVICE-ACTION:STOP` for other
+packages, and `construct SERVICE:action stop` is refused. Rust's
+`ServiceAction::Stop` reads the way it is declared.
+
+Habu's string builder holds 1024 bytes and throws past that. The CLI
+built five texts in it that hold a path, the app key or the login URL,
+so a sync root over about a thousand bytes would have failed `omabox
+settings`, `set-root` and `setup`. Every test passed, because no
+fixture path is that long; I found it by reading the set-root diff. Rust
+cannot have this bug: `format!` makes a `String` that grows. The fix
+builds those texts in the run's arena. It needed a join word, and
+Omabox now has its sixth, because the library has no join into an
+arena. That gap went to Habu's owners.
+
+Two of the step's review findings are defaults Rust sets before `main`
+runs. Rust ignores SIGPIPE at startup, so a write to a closed stderr
+fails and the program goes on; Habu holds it off only inside
+`FD:WITH-NOSIGPIPE`, and SERVICE's one stderr write outside a hold
+could have killed `omabox` between a unit's stop and its start. Rust's
+`Command::spawn` leaves a child in the parent's process group; Habu's
+PROCESS puts it in one of its own and keeps the word that would choose
+another private, so Ctrl-C reaches `omabox` but not the `systemctl` or
+`journalctl` it waits on. Neither shows in a test; both came from
+reading the port against the Rust it replaced. The group went to Habu's
+owners as the fourth report of the step.
+
+Getting a value out of a `catch` shows where Habu's checker and Rust's
+`Result` part. `catch` takes its seed as a cell, and an enum value is
+not one, so the setup code that reads a journal's prior binding keeps
+it in a one-slot arena to carry it past the catch; the reviewer's
+simpler seed did not check. And a word that always throws cannot say
+so: the shared existence check needs an unreachable `code throw` after
+calling its failure word, or the checker reports a stale read. Rust's
+`?` and its `!` type cover both without a line.
+
+One review finding was wrong about Rust. It read the deleted-root rule
+from Rust's listing code, which maps a deleted root to "unavailable",
+and asked the root check to do the same. Rust's root check asks Dropbox
+for no deleted entries, so Dropbox answers `not_found` and the check
+fails like a missing root; the Habu port had sent `include_deleted`
+true from a word shared with replay. The fix was the request, not the
+mapping, and the lane's version was corrected before it landed.
+
+The fold-in round lost one edit of mine. I corrected a lane's file in
+its workspace after the lane reported, then rebased its commit from
+another workspace and retired the first. jj records a workspace's files
+only when a command runs there, so the commit I moved was the worker's,
+and the cleanup deleted my change. The full suite run caught it: the
+Dropbox suite counted three checks fewer than my run. The jj skill
+already says to run `jj st` in a workspace before moving its commits
+from another; I skipped it.
