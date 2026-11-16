@@ -68,9 +68,14 @@ STRUCTURE link DERIVE addr
 
 \ destination-changed: the chosen path changed after it was observed;
 \ stage-occupied: other bytes hold its download stage;
-\ content-changed: the downloaded bytes did not verify.
+\ content-changed: the downloaded bytes did not verify;
+\ blocked: Dropbox's answer blocks the download for its path.
 ENUM exact-copy-outcome
-   ready destination-changed stage-occupied content-changed
+   VARIANT ready ;VARIANT
+   VARIANT destination-changed ;VARIANT
+   VARIANT stage-occupied ;VARIANT
+   VARIANT content-changed ;VARIANT
+   VARIANT blocked FIELD reason MODEL:blockage ;VARIANT
 ;ENUM
 
 \ A conflict copy: blocked leaves every payload where it is;
@@ -1841,14 +1846,22 @@ private
       ENDOF
    ;MATCH ;
 
-\ Rust's warning for path's blocked download; the copy is blocked b.
-: DOWNLOAD-BLOCKED ( MODEL:blockage MODEL:path -- copy-outcome )
+public
+
+\ Rust's warning for path's download, blocked for reason b.
+: WARN-BLOCKED ( MODEL:blockage MODEL:path -- )
    {: b path :}
    LOG:WARN s" replay" LOG:LINE
    s" exact download blocked for its path `" LOG:TEXT+
    path MODEL:PATH>STR str> LOG:TEXT+ s" `: " LOG:TEXT+
-   b REASON+ LOG:;LINE
-   b REPLAY-COPY--OUTCOME:BLOCKED ;
+   b REASON+ LOG:;LINE ;
+
+private
+
+\ The copy of path, its download blocked b, logged once.
+: DOWNLOAD-BLOCKED ( MODEL:blockage MODEL:path -- copy-outcome )
+   {: b path :}
+   b path WARN-BLOCKED b REPLAY-COPY--OUTCOME:BLOCKED ;
 
 : >CONFLICT-OUTCOME ( exact-copy-outcome MODEL:path -- copy-outcome )
    {: path :}
@@ -1862,6 +1875,7 @@ private
          MODEL-BLOCKAGE:DOWNLOAD-VERIFICATION-FAILED
          path DOWNLOAD-BLOCKED
       ENDOF
+      blocked OF path DOWNLOAD-BLOCKED ENDOF
    ;MATCH ;
 
 \ The path of path's conflict copy holding the remote's bytes.
@@ -1925,13 +1939,6 @@ private
 
 public
 
-\ Rust's materialize_remote_copy_at: the remote's bytes at target t, its
-\ transfer shown as path; a file at t is never replaced.
-: MATERIALIZE-REMOTE-COPY-AT
-   ( ^link fd ^u8 n MODEL:path MODEL:path MODEL:remote ^ARENA:arena
-     -- exact-copy-outcome )
-   EXACT-COPY-AT ;
-
 \ Rust's download_block_reason for Dropbox's answers; none: the
 \ failure is the pass's, which the caller rethrows.
 : DOWNLOAD-BLOCKAGE ( n ^link -- option<MODEL:blockage> )
@@ -1943,6 +1950,26 @@ public
 
 private
 
+: DROP-EXACT ( exact-copy-outcome -- ) drop ;
+
+public
+
+\ Rust's materialize_remote_copy_at: the remote's bytes at t, shown as path,
+\ never over a file; blocked by any failure DOWNLOAD-BLOCKAGE classifies.
+: MATERIALIZE-REMOTE-COPY-AT
+   ( ^link fd ^u8 n MODEL:path MODEL:path MODEL:remote ^ARENA:arena
+     -- exact-copy-outcome )
+   {: k root:fd r:^ ru:n t path rem ar :}
+   EXACT-READY [: DROP-EXACT k root r ru t path rem ar
+      EXACT-COPY-AT ;] catch {: code:n :}
+   code 0= if exit then
+   drop code k DOWNLOAD-BLOCKAGE MATCH option
+      none OF code throw ENDOF
+      some OF construct exact-copy-outcome blocked ENDOF
+   ;MATCH ;
+
+private
+
 \ Rust's materialize_remote_conflict_at; an occupied copy name or a
 \ path's blocked download blocks the copy, another failure passes up.
 : REMOTE-CONFLICT-AT
@@ -1951,14 +1978,11 @@ private
    {: k root:fd r:^ ru:n path rem ar :}
    path rem ar REMOTE-COPY-PATH {: copy :}
    COPY-OCCUPIED [: DROP-COPY k root r ru copy path rem ar
-      EXACT-COPY-AT path >CONFLICT-OUTCOME ;]
+      MATERIALIZE-REMOTE-COPY-AT path >CONFLICT-OUTCOME ;]
    ['] NAME-HELD? LOCAL:CONVERTING {: code:n :}
    code 0= if exit then
    drop code FS:ERRNO NAME-HELD? if COPY-OCCUPIED exit then
-   code k DOWNLOAD-BLOCKAGE MATCH option
-      none OF code throw ENDOF
-      some OF path DOWNLOAD-BLOCKED ENDOF
-   ;MATCH ;
+   code throw ;
 
 public
 

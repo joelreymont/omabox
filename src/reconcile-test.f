@@ -156,6 +156,11 @@
 \   fake writing the copy's destination as the download arrives
 \ - occupied_collision_stage_uses_the_next_synchronized_name
 \ - changed_dropbox_file_during_directory_conversion_replans_without_a_conflict_row
+\ - A-REFUSED-COLLISION-COPY-HOLDS-ITS-PATH and
+\   AN-UNVERIFIED-COLLISION-COPY-HOLDS-ITS-PATH: the copy's download
+\   refused 409 or its bytes failing the listing's hash hold the local
+\   directory for the pass, untouched, unplanned and with no copy, its one
+\   line logged, while other.txt syncs in the same pass.
 \ Directory deletions against the fake Dropbox, Rust's tests of the same
 \ names, with no account request:
 \ - remote_directory_deletion_removes_local_directories_deepest_first
@@ -5470,6 +5475,88 @@ $180 constant MODE-0600
    s" /2/files/delete_v2 /2/files/get_metadata" ar JOIN-BYTES T$=
    d x STEP-GONE ;
 
+: BESIDE$ ( -- ^u8 n ) s" unrelated Dropbox file" ;
+\ One length: the fake serves a rev's bytes at the size FILE! gave it.
+: COLLIDED$ ( -- ^u8 n ) s" Dropbox bytes held" ;
+: FORGED$ ( -- ^u8 n ) s" forged bytes, held" ;
+
+\ The one listing page, cursor k: /node at rev-held with COLLIDED$'s
+\ identity, and /other.txt at rev-other.
+: HELD-PAGE ( ^u8 n ^ARENA:arena -- )
+   {: k:^ ku:n ar :}
+   COLLIDED$ ar IDENTITY {: h:DROPBOX:hash :}
+   BESIDE$ ar IDENTITY {: o:DROPBOX:hash :}
+   [: s" /node" s" /node" s" rev-held" h FILE-JSON+ COMMA+
+      s" /other.txt" s" /other.txt" s" rev-other" o FILE-JSON+ ;]
+   ar ENTRIES k ku false PAGE ;
+
+\ The empty local directory node; Dropbox's file /node and other.txt,
+\ served, on the one listing page.
+: HELD-COLLISION ( ^run -- )
+   {: x :}
+   x RUN-ARENA @ {: ar :}
+   x NODE-DIR
+   s" node" s" rev-held" COLLIDED$ ar FILE-AT
+   s" other.txt" s" rev-other" BESIDE$ ar SERVES
+   s" held-collision-copy" ar HELD-PAGE ;
+
+\ The pass completes, other.txt planned and replayed.
+: OTHER-SYNCED ( ^run str -- )
+   PASSED REPLAYED-PLANNED 1 T= 1 T= ;
+
+\ REPLAY's line for node's copy, blocked for the reason r.
+: HELD-LINE ( ^u8 n -- ^u8 n )
+   SB-RESET s" exact download blocked for its path `node`: "
+   SB-APPEND SB-APPEND SB$ ;
+
+\ The pass held node, its copy blocked for the reason r and logged
+\ once, and synced other.txt.
+: NODE-HELD ( str ^run str ^u8 n -- )
+   {: d:str x rec:str r:^ ru:n :}
+   x RUN-ARENA @ {: ar :}
+   d [: x rec OTHER-SYNCED ;] ar LOGGED {: t:^ tu:n :}
+   t tu 10 COUNT-CHAR 1 T=
+   t tu r ru HELD-LINE CONTAINS? TTRUE
+   x s" node" IN-ROOT str> READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
+   u 0 T=
+   s" Dropbox file" COLLIDED$ s" " ar NODE-COPY {: v:str :}
+   x v str> IN-ROOT str> FS:EXISTS? TFALSE
+   x PENDING-OF VEC:COUNT 0 T=
+   x BLOCKED-OF VEC:COUNT 0 T=
+   x CONFLICTS-OF VEC:COUNT 0 T=
+   x s" node" BASELINE-KIND$ s" none" T$=
+   x s" other.txt" IN-ROOT BESIDE$ HOLDS-BYTES
+   x s" other.txt" BASELINE-KIND$ s" present" T$=
+   TEST-DROPBOX:SEEN$
+   s" /2/files/list_folder /2/files/download /2/files/download" T$= ;
+
+\ Dropbox's 409 for the next API call, the copy's download.
+: REFUSE-COPY ( -- )
+   409 s" " s" " LOOKUP-NOT-FOUND$ TEST-DROPBOX:SCRIPT! ;
+
+: A-REFUSED-COLLISION-COPY-HOLDS-ITS-PATH ( ^ARENA:arena -- )
+   {: ar :}
+   s" a refused collision copy holds its path" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x HELD-COLLISION
+   s" rev-held" COLLIDED$ TEST-DROPBOX:CONTENT!
+   [: REFUSE-COPY ;] TEST-DROPBOX:DURING-LISTING!
+   d x rec s" download_unavailable 409" NODE-HELD
+   d x STEP-GONE ;
+
+: AN-UNVERIFIED-COLLISION-COPY-HOLDS-ITS-PATH ( ^ARENA:arena -- )
+   {: ar :}
+   s" an unverified collision copy holds its path" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x HELD-COLLISION
+   s" rev-held" FORGED$ TEST-DROPBOX:CONTENT!
+   d x rec s" download_verification_failed" NODE-HELD
+   d x STEP-GONE ;
+
 : DIRECTORY-COLLISION-CASES ( ^ARENA:arena -- )
    {: ar :}
    ar REMOTE-DIRECTORY-PRESERVES-A-LOCAL-FILE-UNDER-A-SYNCHRONIZED-NAME
@@ -5477,7 +5564,9 @@ $180 constant MODE-0600
    ar DIRECTORY-COLLISION-COPY-STAYS-BOUND-TO-THE-VERIFIED-ROOT
    ar DIRECTORY-COLLISION-DESTINATION-RACE-REQUESTS-A-FRESH-SCAN
    ar OCCUPIED-COLLISION-STAGE-USES-THE-NEXT-SYNCHRONIZED-NAME
-   ar CHANGED-DROPBOX-FILE-DURING-DIRECTORY-CONVERSION-REPLANS-WITHOUT-A-CONFLICT-ROW ;
+   ar CHANGED-DROPBOX-FILE-DURING-DIRECTORY-CONVERSION-REPLANS-WITHOUT-A-CONFLICT-ROW
+   ar A-REFUSED-COLLISION-COPY-HOLDS-ITS-PATH
+   ar AN-UNVERIFIED-COLLISION-COPY-HOLDS-ITS-PATH ;
 
 \ ---- directory deletions against the fake Dropbox -----------------
 

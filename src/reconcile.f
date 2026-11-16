@@ -2319,46 +2319,29 @@ ENUM prepared-collision
 : SOME-COLLISION ( prepared-collision -- option<prepared-collision> )
    OPTION:SOME ;
 
-\ A copy's answer; none: other bytes hold its stage.
+\ The collision at path held for this pass, its copy's download
+\ blocked b, logged once.
+: COPY-BLOCKED
+   ( MODEL:blockage MODEL:path -- option<prepared-collision> )
+   {: b path :}
+   b path REPLAY:WARN-BLOCKED
+   b construct prepared-collision blocked SOME-COLLISION ;
+
+\ The answer to path's copy; none: other bytes hold its stage.
 : COPY-ANSWER
-   ( REPLAY:exact-copy-outcome MODEL:remote ^ARENA:arena
+   ( REPLAY:exact-copy-outcome MODEL:path MODEL:remote ^ARENA:arena
      -- option<prepared-collision> )
-   {: rem ar :}
+   {: path rem ar :}
    MATCH REPLAY:exact-copy-outcome
       ready OF rem ar DIRECTORY-PLAN SOME-COLLISION ENDOF
       destination-changed OF FRESH-COLLISION SOME-COLLISION ENDOF
       stage-occupied OF NO-COLLISION ENDOF
       content-changed OF
          MODEL-BLOCKAGE:DOWNLOAD-VERIFICATION-FAILED
-         construct prepared-collision blocked SOME-COLLISION
+         path COPY-BLOCKED
       ENDOF
+      blocked OF path COPY-BLOCKED ENDOF
    ;MATCH ;
-
-\ A copy's failure that blocks its path, as REPLAY's conflict copy
-\ classifies one; any other passes up.
-: COPY-FAILED ( n ^REPLAY:link -- option<prepared-collision> )
-   {: code:n k :}
-   code k REPLAY:DOWNLOAD-BLOCKAGE MATCH option
-      none OF code throw ENDOF
-      some OF
-         construct prepared-collision blocked SOME-COLLISION
-      ENDOF
-   ;MATCH ;
-
-: NOTHING-CONVERTED? ( n n -- bool ) 2drop false ;
-: NO-EXACT ( -- REPLAY:exact-copy-outcome )
-   REPLAY-EXACT--COPY--OUTCOME:READY ;
-: DROP-EXACT ( REPLAY:exact-copy-outcome -- ) drop ;
-
-\ Rust's materialize_remote_copy_at of rem at dst, shown as path, and
-\ the code it threw, else 0.
-: COPY-REMOTE
-   ( fd ^run MODEL:path MODEL:path MODEL:remote
-     -- REPLAY:exact-copy-outcome n )
-   {: root:fd r dst path rem :}
-   NO-EXACT [: DROP-EXACT r RUN-LINK @ root r ROOT$ dst path rem
-      r RUN-ARENA @ REPLAY:MATERIALIZE-REMOTE-COPY-AT ;]
-   ['] NOTHING-CONVERTED? LOCAL:CONVERTING ;
 
 \ One try at Dropbox's file copied to dst; none: excluded now
 \ holds dst.
@@ -2366,9 +2349,9 @@ ENUM prepared-collision
    ( fd ^run MODEL:path MODEL:remote ^VEC:vector<MODEL:path>
      MODEL:path -- option<prepared-collision> )
    {: root:fd r path rem ex dst :}
-   root r dst path rem COPY-REMOTE {: code:n :}
-   code 0<> if drop code r RUN-LINK @ COPY-FAILED exit then
-   rem r RUN-ARENA @ COPY-ANSWER MATCH option
+   r RUN-LINK @ root r ROOT$ dst path rem r RUN-ARENA @
+   REPLAY:MATERIALIZE-REMOTE-COPY-AT
+   path rem r RUN-ARENA @ COPY-ANSWER MATCH option
       none OF dst ex VEC:PUSH ! NO-COLLISION ENDOF
       some OF SOME-COLLISION ENDOF
    ;MATCH ;

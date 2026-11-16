@@ -2572,6 +2572,7 @@ variable HELD
       destination-changed OF s" destination-changed" ENDOF
       stage-occupied OF s" stage-occupied" ENDOF
       content-changed OF s" content-changed" ENDOF
+      blocked OF drop s" blocked" ENDOF
    ;MATCH ;
 
 \ The remote's exact copy at t below the root r, shown as p.
