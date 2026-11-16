@@ -18,6 +18,21 @@
 \   copy's name, logging nothing, or an unreadable file there, and ready
 \   beside a directory elsewhere, and passes up LOCAL's E-IO when the
 \   copy's parent denies writes.
+\ - CLASSIFY over every pair of expectation and remote state, against
+\   Rust's MutationExpectation::classify.
+\ - REJECTION over every DROPBOX error: a path's rejection, or E-DROPBOX
+\   with the refusal kept in the link.
+\ - TARGET of a valid path below the link's root, and each invalid form
+\   rejected invalid-path with no request reaching the fake.
+\ - OVERSIZE? at 350 000 000 000 bytes and one more.
+\ Against the fake Dropbox of test-dropbox.f, root empty:
+\ - REMOTE-DELETE-FOLDER of an empty folder deletes it; of an occupied
+\   one, or one the listing answers not_found or reset, deletes nothing;
+\   a file the delete finds in the folder's place is logged once.
+\ - REMOTE-UPLOAD of a new file sends its progress, then a finished
+\   transfer to a STATUS in TMPDIR; one Dropbox refuses as a conflict
+\   with other bytes at the path is read back as changed, and its
+\   finished transfer is sent.
 \ Run from the repository root: hb --load src/replay-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -36,13 +51,30 @@ require src/model.f
 require src/journal.f
 require src/test-journal.f
 require src/local.f
+require src/status.f
+require src/lib/aio.f
+require src/lib/net/curl.f
+require src/test-dropbox.f
 require src/replay.f
 
-\ REPLAY reopened for the retention words the Rust tests call.
+\ REPLAY reopened for the retention words the Rust tests call and the
+\ Dropbox mutations' steps.
 package REPLAY
 public
 EXPORT PRUNE-COMPLETED-RECOVERIES-AT
 EXPORT DESTINATION
+EXPORT TARGET
+EXPORT CLASSIFY
+EXPORT REJECTION
+EXPORT OVERSIZE?
+EXPORT EXPECTATION-CREATE-FILE
+EXPORT EXPECTATION-REPLACE-FILE
+EXPORT EXPECTATION-DELETE-FILE
+EXPORT EXPECTATION-CREATE-FOLDER
+EXPORT EXPECTATION-DELETE-FOLDER
+EXPORT REMOTE-CREATE-FOLDER
+EXPORT REMOTE-UPLOAD
+EXPORT REMOTE-DELETE-FOLDER
 ;package
 
 package REPLAY-TEST
@@ -735,6 +767,438 @@ $140 constant MODE-NO-WRITE
    d GONE ;
 
 
+\ ---- Dropbox mutations ---------------------------------------------
+
+TYPED-VARIABLE CFG DROPBOX:config
+\ The client on the fake, while it serves.
+TYPED-VARIABLE MAIN ^DROPBOX:client
+
+: STATE$ ( REPLAY:remote-path-state -- ^u8 n )
+   MATCH REPLAY:remote-path-state
+      absent OF s" absent" ENDOF
+      file OF drop s" file" ENDOF
+      folder OF s" folder" ENDOF
+      unsupported OF s" unsupported" ENDOF
+   ;MATCH ;
+
+: REJECTION$ ( REPLAY:mutation-rejection -- ^u8 n )
+   MATCH REPLAY:mutation-rejection
+      invalid-path OF s" invalid-path" ENDOF
+      unsupported-file-size OF s" unsupported-file-size" ENDOF
+      disallowed-name OF s" disallowed-name" ENDOF
+      permission-denied OF s" permission-denied" ENDOF
+      insufficient-space OF s" insufficient-space" ENDOF
+      operation-not-allowed OF s" operation-not-allowed" ENDOF
+      path-mismatch OF s" path-mismatch" ENDOF
+      rejected-by-dropbox OF s" rejected-by-dropbox" ENDOF
+   ;MATCH ;
+
+\ The outcome's variant and its state's or rejection's name.
+: MUTATION$ ( REPLAY:mutation-outcome -- ^u8 n ^u8 n )
+   MATCH REPLAY:mutation-outcome
+      applied OF s" applied" rot STATE$ ENDOF
+      pending OF s" pending" s" " ENDOF
+      precondition-changed OF s" precondition-changed" rot STATE$ ENDOF
+      rejected OF s" rejected" rot REJECTION$ ENDOF
+   ;MATCH ;
+
+: GIVES ( REPLAY:mutation-outcome ^u8 n ^u8 n -- )
+   {: o a:^ au:n b:^ bu:n :}
+   o MUTATION$ b bu T$= a au T$= ;
+
+: AS-HASH ( ^u8 n -- DROPBOX:hash ) >str DROPBOX:>HASH ;
+: AS-REV ( ^u8 n -- DROPBOX:rev ) >str DROPBOX:>REV ;
+
+\ A file state of hash and rev.
+: FILE-STATE ( ^u8 n ^u8 n -- REPLAY:remote-path-state )
+   {: h:^ hu:n v:^ vu:n :}
+   h hu AS-HASH v vu AS-REV MODEL-REMOTE:MAKE
+   REPLAY-REMOTE--PATH--STATE:FILE ;
+
+: GONE-STATE ( -- REPLAY:remote-path-state )
+   REPLAY-REMOTE--PATH--STATE:ABSENT ;
+: FOLDER-STATE ( -- REPLAY:remote-path-state )
+   REPLAY-REMOTE--PATH--STATE:FOLDER ;
+: ODD-STATE ( -- REPLAY:remote-path-state )
+   REPLAY-REMOTE--PATH--STATE:UNSUPPORTED ;
+
+: CREATING-H1 ( REPLAY:remote-path-state -- REPLAY:mutation-outcome )
+   s" h1" AS-HASH REPLAY:EXPECTATION-CREATE-FILE REPLAY:CLASSIFY ;
+\ Replacing r1 with h2.
+: REPLACING-R1 ( REPLAY:remote-path-state -- REPLAY:mutation-outcome )
+   s" r1" AS-REV s" h2" AS-HASH REPLAY:EXPECTATION-REPLACE-FILE
+   REPLAY:CLASSIFY ;
+: DELETING-R1 ( REPLAY:remote-path-state -- REPLAY:mutation-outcome )
+   s" r1" AS-REV REPLAY:EXPECTATION-DELETE-FILE REPLAY:CLASSIFY ;
+: CREATING-DIR ( REPLAY:remote-path-state -- REPLAY:mutation-outcome )
+   REPLAY:EXPECTATION-CREATE-FOLDER REPLAY:CLASSIFY ;
+: DELETING-DIR ( REPLAY:remote-path-state -- REPLAY:mutation-outcome )
+   REPLAY:EXPECTATION-DELETE-FOLDER REPLAY:CLASSIFY ;
+
+: CHANGED ( REPLAY:mutation-outcome ^u8 n -- )
+   {: o s:^ su:n :}
+   o s" precondition-changed" s su GIVES ;
+
+: CREATE-FILE-ROWS ( -- )
+   GONE-STATE CREATING-H1 s" pending" s" " GIVES
+   s" h1" s" r1" FILE-STATE CREATING-H1 s" applied" s" file" GIVES
+   s" h2" s" r1" FILE-STATE CREATING-H1 s" file" CHANGED
+   FOLDER-STATE CREATING-H1 s" folder" CHANGED
+   ODD-STATE CREATING-H1 s" unsupported" CHANGED ;
+
+: REPLACE-FILE-ROWS ( -- )
+   GONE-STATE REPLACING-R1 s" absent" CHANGED
+   s" h2" s" r1" FILE-STATE REPLACING-R1 s" pending" s" " GIVES
+   s" h2" s" r2" FILE-STATE REPLACING-R1 s" applied" s" file" GIVES
+   s" h1" s" r2" FILE-STATE REPLACING-R1 s" file" CHANGED
+   FOLDER-STATE REPLACING-R1 s" folder" CHANGED
+   ODD-STATE REPLACING-R1 s" unsupported" CHANGED ;
+
+: DELETE-FILE-ROWS ( -- )
+   GONE-STATE DELETING-R1 s" applied" s" absent" GIVES
+   s" h1" s" r1" FILE-STATE DELETING-R1 s" pending" s" " GIVES
+   s" h1" s" r2" FILE-STATE DELETING-R1 s" file" CHANGED
+   FOLDER-STATE DELETING-R1 s" folder" CHANGED
+   ODD-STATE DELETING-R1 s" unsupported" CHANGED ;
+
+: CREATE-FOLDER-ROWS ( -- )
+   GONE-STATE CREATING-DIR s" pending" s" " GIVES
+   s" h1" s" r1" FILE-STATE CREATING-DIR s" file" CHANGED
+   FOLDER-STATE CREATING-DIR s" applied" s" folder" GIVES
+   ODD-STATE CREATING-DIR s" unsupported" CHANGED ;
+
+: DELETE-FOLDER-ROWS ( -- )
+   GONE-STATE DELETING-DIR s" applied" s" absent" GIVES
+   s" h1" s" r1" FILE-STATE DELETING-DIR s" file" CHANGED
+   FOLDER-STATE DELETING-DIR s" pending" s" " GIVES
+   ODD-STATE DELETING-DIR s" unsupported" CHANGED ;
+
+: CLASSIFY-COVERS-EVERY-EXPECTATION-AND-STATE ( -- )
+   s" classify covers every expectation and state" T-LABEL
+   CREATE-FILE-ROWS REPLACE-FILE-ROWS DELETE-FILE-ROWS
+   CREATE-FOLDER-ROWS DELETE-FOLDER-ROWS ;
+
+
+ARENA LINKS REPLAY:link
+
+\ A link on the client below root, with no status.
+: NEW-LINK ( ^DROPBOX:client ^u8 n ^ARENA:arena -- ^REPLAY:link )
+   {: c r:^ ru:n ar :}
+   ar LINKS-NEW {: l :}
+   c l REPLAY-LINK:CLIENT ! r ru ar COPIED l REPLAY-LINK:ROOT !
+   l ;
+
+: REJECTS ( DROPBOX:error ^REPLAY:link ^u8 n -- )
+   {: e l want:^ wu:n :}
+   e l REPLAY:REJECTION REJECTION$ want wu T$= ;
+
+: REFUSAL? ( DROPBOX:reply DROPBOX:error -- bool )
+   {: e:DROPBOX:error :}
+   MATCH DROPBOX:reply
+      done OF false ENDOF
+      refused OF e DROPBOX-ERROR:EQ ENDOF
+      retry OF drop false ENDOF
+      unlinked OF false ENDOF
+   ;MATCH ;
+
+\ The refusal stops the pass, kept whole in the link.
+: STOPS ( DROPBOX:error ^REPLAY:link -- )
+   {: e l :}
+   [: e l REPLAY:REJECTION drop ;] REPLAY:E-DROPBOX TTHROWSQ
+   l REPLAY-LINK:REPLY @ e REFUSAL? TTRUE ;
+
+: PATH-REFUSALS ( ^REPLAY:link -- )
+   {: l :}
+   DROPBOX-ERROR:NOT-FOUND l s" rejected-by-dropbox" REJECTS
+   DROPBOX-ERROR:NOT-FILE l s" rejected-by-dropbox" REJECTS
+   DROPBOX-ERROR:NOT-FOLDER l s" rejected-by-dropbox" REJECTS
+   DROPBOX-ERROR:MALFORMED-PATH l s" invalid-path" REJECTS
+   DROPBOX-ERROR:DISALLOWED-NAME l s" disallowed-name" REJECTS
+   DROPBOX-ERROR:NO-WRITE-PERMISSION l s" permission-denied" REJECTS
+   DROPBOX-ERROR:RESTRICTED-CONTENT l s" rejected-by-dropbox" REJECTS
+   DROPBOX-ERROR:ACCESS-RESTRICTED l s" permission-denied" REJECTS
+   DROPBOX-ERROR:TEAM-FOLDER l s" operation-not-allowed" REJECTS
+   DROPBOX-ERROR:OPERATION-SUPPRESSED l s" operation-not-allowed" REJECTS
+   DROPBOX-ERROR:INSUFFICIENT-SPACE l s" insufficient-space" REJECTS
+   DROPBOX-ERROR:LOCKED l s" rejected-by-dropbox" REJECTS
+   DROPBOX-ERROR:UNSUPPORTED-FILE l s" rejected-by-dropbox" REJECTS
+   DROPBOX-ERROR:PATH-MISMATCH l s" path-mismatch" REJECTS
+   DROPBOX-ERROR:OTHER l s" rejected-by-dropbox" REJECTS ;
+
+: REJECTION-COVERS-EVERY-DROPBOX-ERROR ( ^ARENA:arena -- )
+   {: ar :}
+   s" rejection covers every Dropbox error" T-LABEL
+   MAIN @ s" " ar NEW-LINK {: l :}
+   l PATH-REFUSALS
+   DROPBOX-ERROR:CONFLICT l STOPS
+   DROPBOX-ERROR:RESET l STOPS
+   DROPBOX-ERROR:INVALID-ROOT l STOPS
+   DROPBOX-ERROR:CONTENT-HASH-MISMATCH l STOPS
+   DROPBOX-ERROR:UNVERIFIED l STOPS ;
+
+: TARGET$ ( ^REPLAY:link ^u8 n ^ARENA:arena -- ^u8 n )
+   {: l p:^ u:n ar :}
+   l p u DISPLAY ar REPLAY:TARGET MATCH option
+      some OF str> ENDOF
+      none OF s" none" ENDOF
+   ;MATCH ;
+
+\ p is no Dropbox path: no target, and no call is made for it.
+: NO-TARGET ( ^REPLAY:link ^u8 n ^ARENA:arena -- )
+   {: l p:^ u:n ar :}
+   l p u ar TARGET$ s" none" T$=
+   TEST-DROPBOX:RESET
+   l p u DISPLAY ar REPLAY:REMOTE-CREATE-FOLDER
+   s" rejected" s" invalid-path" GIVES
+   TEST-DROPBOX:SEEN$ s" " T$= ;
+
+: INVALID-FORMS ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   l s" " ar NO-TARGET l s" /a" ar NO-TARGET l s" a/" ar NO-TARGET
+   l s" a//b" ar NO-TARGET l s" ./a" ar NO-TARGET
+   l s" a/./b" ar NO-TARGET
+   l s" a/../b" ar NO-TARGET l s" .." ar NO-TARGET
+   l s\" a\xFFb" ar NO-TARGET l s\" a\x00b" ar NO-TARGET ;
+
+: TARGET-JOINS-THE-ROOT-AND-REJECTS-INVALID-PATHS ( ^ARENA:arena -- )
+   {: ar :}
+   s" target joins the root and rejects invalid paths" T-LABEL
+   MAIN @ s" /Sync" ar NEW-LINK {: l :}
+   l s" a/B.txt" ar TARGET$ s" /Sync/a/B.txt" T$=
+   MAIN @ s" " ar NEW-LINK {: top :}
+   top s" a" ar TARGET$ s" /a" T$=
+   top s" .a/b..c/ d" ar TARGET$ s" /.a/b..c/ d" T$=
+   l ar INVALID-FORMS ;
+
+: UPLOAD-SIZE-STOPS-AT-THE-SESSION-LIMIT ( -- )
+   s" upload size stops at the session limit" T-LABEL
+   350000000000 REPLAY:OVERSIZE? TFALSE
+   350000000001 REPLAY:OVERSIZE? TTRUE ;
+
+
+\ ---- against the fake Dropbox
+
+: OWN-PAGE ( bool -- )
+   {: more:bool :}
+   S\" [{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/f\q,\qpath_display\q:\q/f\q}]"
+   s" c1" more TEST-DROPBOX:PAGE! ;
+
+: DELETE-F ( ^REPLAY:link ^ARENA:arena -- REPLAY:mutation-outcome )
+   {: l ar :}
+   l s" f" DISPLAY ar REPLAY:REMOTE-DELETE-FOLDER ;
+
+: AN-EMPTY-FOLDER-IS-DELETED ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   s" an empty folder is deleted" T-LABEL
+   TEST-DROPBOX:RESET
+   l s" f" DISPLAY ar REPLAY:REMOTE-CREATE-FOLDER
+   s" applied" s" folder" GIVES
+   false OWN-PAGE
+   l ar DELETE-F s" applied" s" absent" GIVES
+   TEST-DROPBOX:SEEN$
+   s" /2/files/create_folder_v2 /2/files/list_folder /2/files/delete_v2"
+   T$= ;
+
+: AN-OCCUPIED-FOLDER-IS-KEPT ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   s" an occupied folder is kept" T-LABEL
+   TEST-DROPBOX:RESET
+   S\" [{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/f\q,\qpath_display\q:\q/f\q},{\q.tag\q:\qfile\q,\qpath_lower\q:\q/f/a.txt\q,\qpath_display\q:\q/f/a.txt\q,\qrev\q:\q015f\q,\qsize\q:3,\qcontent_hash\q:\qabc\q}]"
+   s" c1" false TEST-DROPBOX:PAGE!
+   l ar DELETE-F s" precondition-changed" s" folder" GIVES
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$= ;
+
+: A-MISSING-FOLDER-IS-ALREADY-DELETED ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   s" a missing folder is already deleted" T-LABEL
+   TEST-DROPBOX:RESET
+   409 s" " s" "
+   S\" {\qerror_summary\q:\qpath/not_found/\q,\qerror\q:{\q.tag\q:\qpath\q,\qpath\q:{\q.tag\q:\qnot_found\q}}}"
+   TEST-DROPBOX:SCRIPT!
+   l ar DELETE-F s" applied" s" absent" GIVES
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$= ;
+
+: A-RESET-PROBE-LEAVES-THE-DELETE-PENDING ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   s" a reset probe leaves the delete pending" T-LABEL
+   TEST-DROPBOX:RESET
+   true OWN-PAGE TEST-DROPBOX:PAGE-RESET!
+   l ar DELETE-F s" pending" s" " GIVES
+   TEST-DROPBOX:SEEN$
+   s" /2/files/list_folder /2/files/list_folder/continue" T$= ;
+
+4096 constant LOG-CAP
+LOG-CAP BUFFER: LOG-TEXT
+
+\ Runs q with fd 2 sent to a file in the case's directory d; its text.
+: LOGGED ( str [ -- ] ^ARENA:arena -- ^u8 n )
+   {: d:str q ar :}
+   d s" stderr.txt" ar INSIDE str> {: e:^ eu:n :}
+   e eu STDERR:CAPTURE
+   [: q execute ;] [: STDERR:;CAPTURE ;] finally
+   e eu LOG-TEXT LOG-CAP FS:READ-ALL {: u:n :}
+   e eu FS:REMOVE-FILE
+   LOG-TEXT u ;
+
+: LINE-COUNT ( ^u8 n -- n ) 10 COUNT-CHAR ;
+
+: A-FILE-THE-FOLDER-DELETE-FINDS-IS-LOGGED
+   ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   s" a file the folder delete finds is logged" T-LABEL
+   TEST-DROPBOX:RESET
+   s" /f" s" /f" s" 015f" s" abc" 3 TEST-DROPBOX:FILE!
+   false OWN-PAGE
+   s" replay-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
+   d [: l ar DELETE-F s" applied" s" absent" GIVES ;] ar LOGGED
+   {: t:^ tu:n :}
+   t tu LINE-COUNT 1 T=
+   t tu s" Dropbox deleted a file that replaced the empty folder"
+   CONTAINS? TTRUE
+   t tu s" path=f revision=015f" CONTAINS? TTRUE
+   d GONE ;
+
+: RUNTIME-STATUS ( ^ARENA:arena -- str ^STATUS:status )
+   {: ar :}
+   s" replay-test" FS:MKTEMP-DIR ar COPIED {: rt:str :}
+   rt rt ar STATUS:NEW ;
+
+\ status.json's text below the runtime directory rt.
+: STATUS-TEXT ( str ^ARENA:arena -- ^u8 n )
+   {: rt:str ar :}
+   rt s" omabox/status.json" ar INSIDE str> LOG-TEXT LOG-CAP FS:READ-ALL
+   {: u:n :} LOG-TEXT u ;
+
+: SHOWS ( str ^ARENA:arena ^u8 n -- )
+   {: rt:str ar want:^ wu:n :}
+   rt ar STATUS-TEXT want wu CONTAINS? TTRUE ;
+
+: UPLOAD-NOTES
+   ( ^REPLAY:link ^LOCAL:staged-upload ^ARENA:arena
+     -- REPLAY:mutation-outcome )
+   {: l up ar :}
+   l s" notes.txt" DISPLAY up s" " AS-REV ar REPLAY:REMOTE-UPLOAD ;
+
+: APPLIED-FILE ( REPLAY:mutation-outcome -- MODEL:remote )
+   MATCH REPLAY:mutation-outcome
+      applied OF
+         MATCH REPLAY:remote-path-state
+            absent OF s" applied absent" FAILED ENDOF
+            file OF ENDOF
+            folder OF s" applied folder" FAILED ENDOF
+            unsupported OF s" applied unsupported" FAILED ENDOF
+         ;MATCH
+      ENDOF
+      pending OF s" pending" FAILED ENDOF
+      precondition-changed OF drop s" changed" FAILED ENDOF
+      rejected OF drop s" rejected" FAILED ENDOF
+   ;MATCH ;
+
+: AN-UPLOAD-SENDS-ITS-TRANSFER ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   s" an upload sends its transfer" T-LABEL
+   TEST-DROPBOX:RESET
+   ar RUNTIME-STATUS {: rt:str st :}
+   st l REPLAY-LINK:STATUS !
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r s s" notes.txt" ar STAGED {: up :}
+   l up ar UPLOAD-NOTES APPLIED-FILE MODEL-REMOTE:UNMAKE {: c v :}
+   c DROPBOX:HASH>STR str> up LOCAL:UPLOAD-CONTENT DROPBOX:HASH>STR str>
+   T$=
+   v DROPBOX:REV>STR str> s" 01701" T$=
+   rt ar
+   S\" {\qdirection\q:\qupload\q,\qpath\q:\qnotes.txt\q,\qbytes_done\q:10,\qbytes_total\q:10}"
+   SHOWS
+   TEST-DROPBOX:SEEN$ s" /2/files/upload" T$=
+   d GONE rt GONE ;
+
+\ A transfer of notes.txt with 3 of 10 bytes sent.
+: PART-SENT ( ^STATUS:status -- )
+   {: st :}
+   STATUS-DIRECTION:UPLOAD s" notes.txt" >str 3 10 OPTION:SOME
+   STATUS-TRANSFER:MAKE STATUS-EVENT:PROGRESS st STATUS:TRANSFER ;
+
+: A-REFUSED-UPLOAD-FINISHES-ITS-TRANSFER ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   s" a refused upload finishes its transfer" T-LABEL
+   TEST-DROPBOX:RESET
+   s" /notes.txt" s" /notes.txt" s" 0150"
+   s" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+   0 TEST-DROPBOX:FILE!
+   ar RUNTIME-STATUS {: rt:str st :}
+   st l REPLAY-LINK:STATUS !
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r s s" notes.txt" ar STAGED {: up :}
+   st PART-SENT
+   l up ar UPLOAD-NOTES s" precondition-changed" s" file" GIVES
+   rt ar
+   S\" {\qdirection\q:\qupload\q,\qpath\q:\qnotes.txt\q,\qbytes_done\q:0,\qbytes_total\q:10}"
+   SHOWS
+   TEST-DROPBOX:SEEN$
+   s" /2/files/upload /2/files/get_metadata /2/files/get_metadata" T$=
+   d GONE rt GONE ;
+
+: REMOTE-CASES ( ^ARENA:arena -- )
+   {: ar :}
+   MAIN @ s" " ar NEW-LINK {: l :}
+   l ar AN-EMPTY-FOLDER-IS-DELETED
+   l ar AN-OCCUPIED-FOLDER-IS-KEPT
+   l ar A-MISSING-FOLDER-IS-ALREADY-DELETED
+   l ar A-RESET-PROBE-LEAVES-THE-DELETE-PENDING
+   l ar A-FILE-THE-FOLDER-DELETE-FINDS-IS-LOGGED
+   l ar AN-UPLOAD-SENDS-ITS-TRANSFER
+   l ar A-REFUSED-UPLOAD-FINISHES-ITS-TRANSFER ;
+
+
+\ ---- the fake's client
+
+\ A client on the fake, no root, keeping no rotated token.
+: OPENED ( ^ARENA:arena -- ^DROPBOX:client )
+   {: ar :}
+   [: 2drop ;] CFG DROPBOX-CONFIG:STORE !
+   CFG DROPBOX:PRODUCTION
+   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:API !
+   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:NOTIFY !
+   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:CONTENT !
+   s" fake-key" SPAN:MAKE CFG DROPBOX-CONFIG:KEY !
+   s" live-token" SPAN:MAKE CFG DROPBOX-CONFIG:TOKEN !
+   s" " SPAN:MAKE CFG DROPBOX-CONFIG:ROOT !
+   CFG ar DROPBOX:OPEN ;
+
+: CURL-READY ( CURL:status -- )
+   MATCH CURL:status
+      ok OF ENDOF
+      failed OF drop s" the curl loop did not start" FAILED ENDOF
+   ;MATCH ;
+
+\ The account call takes the client's first access token, so no case's
+\ requests start with a refresh.
+: ACCOUNTED ( -- )
+   MAIN @ DROPBOX:ACCOUNT MATCH DROPBOX:reply
+      done OF ENDOF
+      refused OF drop s" the account was refused" FAILED ENDOF
+      retry OF drop s" the account asked a retry" FAILED ENDOF
+      unlinked OF s" the account was unlinked" FAILED ENDOF
+   ;MATCH ;
+
+: SERVED ( ^ARENA:arena -- )
+   {: ar :}
+   s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
+   s" " TEST-DROPBOX:ROOT!
+   ar OPENED MAIN !
+   ACCOUNTED
+   [: ar TARGET-JOINS-THE-ROOT-AND-REJECTS-INVALID-PATHS
+      ar REMOTE-CASES ;]
+   [: MAIN @ DROPBOX:CLOSE ;] finally ;
+
+: DROPBOX-CASES ( ^ARENA:arena -- )
+   {: ar :}
+   AIO:START CURL:LOOP-START CURL-READY
+   [: TEST-DROPBOX:START
+      [: ar SERVED ;] [: TEST-DROPBOX:STOP ;] finally ;]
+   [: CURL:LOOP-STOP AIO:STOP ;] finally ;
+
+
 : CASES ( ^ARENA:arena -- )
    {: ar :}
    ar RETIRE-EXCLUDED-PLANS-SUPERSEDES-ONLY-EXCLUDED-PLANS
@@ -745,7 +1209,11 @@ $140 constant MODE-NO-WRITE
    ar LEGACY-LOCAL-PRESERVATION-REPLAYS-WITHOUT-CREATING-A-COPY
    ar A-LOCAL-OBJECT-BLOCKS-ONLY-ITS-PLAN
    ar ONLY-AN-OBJECT-AT-THE-COPY-NAME-OCCUPIES-IT
-   ar A-DENIED-OPERATION-AT-THE-COPY-NAME-DOES-NOT-OCCUPY-IT ;
+   ar A-DENIED-OPERATION-AT-THE-COPY-NAME-DOES-NOT-OCCUPY-IT
+   CLASSIFY-COVERS-EVERY-EXPECTATION-AND-STATE
+   ar REJECTION-COVERS-EVERY-DROPBOX-ERROR
+   UPLOAD-SIZE-STOPS-AT-THE-SESSION-LIMIT
+   ar DROPBOX-CASES ;
 
 
 : RUN ( -- )

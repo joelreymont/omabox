@@ -2,22 +2,27 @@
 \ src/recovery.rs): what a replay pass reports, the outcomes its steps
 \ answer, the journal steps that finish, supersede or complete a plan,
 \ the replay of the plans' local operations, a staged upload's local
-\ conflict copy, and the retention of legacy recovery payloads. A
-\ LOCAL call whose failures REPLAY converts into outcomes runs under
-\ LOCAL:CONVERTING, so nothing logs those; any other LOCAL, JOURNAL or
-\ DROPBOX failure passes up with its own code, which that library
-\ logged where it saw it. A journal answer the replay contract
-\ refuses is logged once with the Rust version's text, naming the
-\ plan's path, then thrown as E-INVALID-STATE. A failed retention
-\ syscall is logged once, as LOCAL logs one, and thrown as LOCAL's E-IO.
+\ conflict copy, the retention of legacy recovery payloads, and each
+\ Dropbox mutation's outcome. A LOCAL call whose failures REPLAY
+\ converts into outcomes runs under LOCAL:CONVERTING, so nothing logs
+\ those; any other LOCAL, JOURNAL or DROPBOX failure passes up with its
+\ own code, which that library logged where it saw it. A Dropbox answer
+\ that ends the pass, not one path's verdict, is kept in the link and
+\ thrown as E-DROPBOX. A journal answer the replay contract refuses is
+\ logged once with the Rust version's text, naming the plan's path, then
+\ thrown as E-INVALID-STATE. A failed retention or upload-stage syscall
+\ is logged once, as LOCAL logs one, and thrown as LOCAL's E-IO.
 \ STORAGE CLASS. No state of its own. CALLER-OWNED: a report, its
 \ vector, a local replay's run, and every value a journal step or a
 \ conflict copy reads lie in the arena the caller passes. A retention
-\ pass lays its values in an arena of its own. Retention and the
-\ conflict copy close every descriptor they open, on every exit.
+\ pass lays its values in an arena of its own. Retention, the conflict
+\ copy and an upload close every descriptor they open, on every exit.
 
 require src/lib/error.f
 require src/lib/string.f
+require src/lib/span.f
+require src/lib/unicode.f
+require src/lib/utf8-scalar.f
 require src/lib/arena.f
 require src/lib/log.f
 require src/lib/adt/option.f
@@ -83,8 +88,8 @@ ENUM remote-path-state
 \ Dropbox's permanent refusal of one path, which leaves other work be.
 ENUM mutation-rejection
    invalid-path unsupported-file-size disallowed-name
-   restricted-content permission-denied insufficient-space
-   operation-not-allowed path-mismatch rejected-by-dropbox
+   permission-denied insufficient-space operation-not-allowed
+   path-mismatch rejected-by-dropbox
 ;ENUM
 
 \ One conditional mutation: pending keeps the precondition, so the
@@ -372,7 +377,7 @@ STRUCTURE retention
 
 \ Rust's LocalError::Io for operation o on path p: FS:ERRNO holds the
 \ errno, kept across the log.
-: RETENTION-IO ( ^u8 n ^u8 n -- )
+: IO-FAILED ( ^u8 n ^u8 n -- )
    {: o:^ ou:n p:^ u:n :}
    FS:ERRNO {: e:n :}
    LOG:ERROR s" replay" LOG:LINE
@@ -391,7 +396,7 @@ STRUCTURE retention
    [: dir FD:SYNC ;] catch {: code:n :}
    code 0= if exit then
    code E-FS-IO <> if code throw then
-   s" sync recovery retention" d str> RETENTION-IO ;
+   s" sync recovery retention" d str> IO-FAILED ;
 
 \ statat of the name, never a symlink's target; none once it is gone.
 \ o names the operation, p the payload's path.
@@ -402,7 +407,7 @@ STRUCTURE retention
       exit
    then
    FS:ERRNO FS:ENOENT = if NO-STAT exit then
-   o ou p MODEL:PATH>STR str> RETENTION-IO ;
+   o ou p MODEL:PATH>STR str> IO-FAILED ;
 
 : REGULAR? ( stat -- bool )
    STAT-UNMAKE {: d i m :}
@@ -491,7 +496,7 @@ STRUCTURE retention
    x DIR-OF nm nu FS:TRY-REMOVE-FILE-AT 0= if
       FS:ERRNO FS:ENOENT <> if
          s" remove expired recovery payload"
-         r COPY-PATH MODEL:PATH>STR str> RETENTION-IO
+         r COPY-PATH MODEL:PATH>STR str> IO-FAILED
       then
    then
    x r SYNC-THEN-FORGET ;
@@ -957,5 +962,499 @@ public
    {: root:fd :}
    [: root r ru path up ar COPY-FROM-UPLOAD ;] [: root DISCARD ;]
    finally ;
+
+
+\ ---- Dropbox mutations ---------------------------------------------
+
+private
+
+\ Dropbox's largest upload session, in bytes.
+350000000000 constant UPLOAD-MAX
+47 constant SLASH
+
+\ A mutation's precondition and intent, which a state read is
+\ classified against.
+ENUM expectation
+   VARIANT create-file FIELD desired DROPBOX:hash ;VARIANT
+   VARIANT replace-file
+      FIELD expected DROPBOX:rev FIELD desired DROPBOX:hash
+   ;VARIANT
+   VARIANT delete-file FIELD expected DROPBOX:rev ;VARIANT
+   VARIANT create-folder ;VARIANT
+   VARIANT delete-folder ;VARIANT
+;ENUM
+
+\ The probe's count of entries other than the folder itself.
+STRUCTURE probe DERIVE addr FIELD seen n ;STRUCTURE
+ARENA PROBES probe
+
+\ One upload; rev is the rev it replaces, empty to create, and done the
+\ bytes Dropbox has accepted.
+STRUCTURE sending DERIVE addr
+   FIELD link ^link
+   FIELD target str
+   FIELD path MODEL:path
+   FIELD stage ^LOCAL:staged-upload
+   FIELD rev DROPBOX:rev
+   FIELD arena ^ARENA:arena
+   FIELD fd fd
+   FIELD size n
+   FIELD done n
+;STRUCTURE
+ARENA SENDINGS sending
+ARENA UPLOADS DROPBOX:upload
+
+: CLIENT ( ^link -- ^DROPBOX:client ) REPLAY-LINK:CLIENT @ ;
+
+: COPIED ( ^u8 n ^ARENA:arena -- str )
+   {: a:^ u:n ar :}
+   ar u ARENA:ALLOC drop {: dst:^ :}
+   a dst u BYTE-COPY
+   dst u >str ;
+
+: IS? ( DROPBOX:error DROPBOX:error -- bool ) DROPBOX-ERROR:EQ ;
+
+
+\ ---- outcomes
+
+: ABSENT ( -- remote-path-state )
+   REPLAY-REMOTE--PATH--STATE:ABSENT ;
+: FOLDER ( -- remote-path-state )
+   REPLAY-REMOTE--PATH--STATE:FOLDER ;
+: PENDING ( -- mutation-outcome ) REPLAY-MUTATION--OUTCOME:PENDING ;
+: APPLIED ( remote-path-state -- mutation-outcome )
+   REPLAY-MUTATION--OUTCOME:APPLIED ;
+: CHANGED-TO ( remote-path-state -- mutation-outcome )
+   REPLAY-MUTATION--OUTCOME:PRECONDITION-CHANGED ;
+: REJECT ( mutation-rejection -- mutation-outcome )
+   REPLAY-MUTATION--OUTCOME:REJECTED ;
+: GONE ( -- mutation-outcome ) ABSENT APPLIED ;
+
+
+\ ---- the Dropbox path
+
+\ Rust's Component::Normal that invalid_dropbox_component accepts.
+: NORMAL? ( ^u8 n -- bool )
+   {: p:^ u:n :}
+   u 0= if false exit then
+   p u s" ." STR= p u s" .." STR= or if false exit then
+   p u 0 COUNT-CHAR 0<> if false exit then
+   p u UTF8:VALID? ;
+
+\ Whether every component from `at` on is NORMAL?.
+: NORMAL-FROM? ( ^u8 n n -- bool )
+   {: p:^ u:n at:n :}
+   p u SLASH at SPLIT-NEXT 0= if 2drop drop true exit then
+   {: q:^ v:n next:n :}
+   q v NORMAL? 0= if false exit then
+   p u next RECURSE ;
+
+: NO-TARGET ( -- option<str> ) OPTION:NONE ;
+
+\ The root, "/" and p, in the arena.
+: UNDER ( str ^u8 n ^ARENA:arena -- str )
+   {: root:str p:^ u:n ar :}
+   root str> {: r:^ ru:n :}
+   ar ru u + 1+ ARENA:ALLOC drop {: dst:^ :}
+   r dst ru BYTE-COPY
+   SLASH dst ru + c!
+   p dst ru + 1+ u BYTE-COPY
+   dst ru u + 1+ >str ;
+
+\ Rust's mutation_target: the path below the link's root, none for a
+\ path with no component or one Dropbox cannot name.
+: TARGET ( ^link MODEL:path ^ARENA:arena -- option<str> )
+   {: l path ar :}
+   path MODEL:PATH>STR str> {: p:^ u:n :}
+   p u 0 NORMAL-FROM? 0= if NO-TARGET exit then
+   l REPLAY-LINK:ROOT @ p u ar UNDER OPTION:SOME ;
+
+\ Runs `call` on the path's target; an invalid path makes no call.
+: TARGETED
+   ( ^link MODEL:path ^ARENA:arena [ str -- mutation-outcome ]
+     -- mutation-outcome )
+   {: l path ar call :}
+   l path ar TARGET MATCH option
+      some OF call execute ENDOF
+      none OF construct mutation-rejection invalid-path REJECT ENDOF
+   ;MATCH ;
+
+
+\ ---- classifying
+
+: REV-IS? ( DROPBOX:rev remote-path-state -- bool )
+   {: want:DROPBOX:rev s:remote-path-state :}
+   s MATCH remote-path-state
+      absent OF false ENDOF
+      file OF
+         MODEL-REMOTE:UNMAKE {: c v :}
+         v DROPBOX:REV>STR str> want DROPBOX:REV>STR str> STR=
+      ENDOF
+      folder OF false ENDOF
+      unsupported OF false ENDOF
+   ;MATCH ;
+
+: HOLDS? ( DROPBOX:hash remote-path-state -- bool )
+   {: want:DROPBOX:hash s:remote-path-state :}
+   s MATCH remote-path-state
+      absent OF false ENDOF
+      file OF
+         MODEL-REMOTE:UNMAKE {: c v :} c want DROPBOX:HASH=
+      ENDOF
+      folder OF false ENDOF
+      unsupported OF false ENDOF
+   ;MATCH ;
+
+: ABSENT? ( remote-path-state -- bool )
+   MATCH remote-path-state
+      absent OF true ENDOF
+      file OF drop false ENDOF
+      folder OF false ENDOF
+      unsupported OF false ENDOF
+   ;MATCH ;
+
+: FOLDER? ( remote-path-state -- bool )
+   MATCH remote-path-state
+      absent OF false ENDOF
+      file OF drop false ENDOF
+      folder OF true ENDOF
+      unsupported OF false ENDOF
+   ;MATCH ;
+
+\ The path still holds what the mutation expected to change.
+: UNCHANGED? ( remote-path-state expectation -- bool )
+   {: s:remote-path-state x:expectation :}
+   x MATCH expectation
+      create-file OF drop s ABSENT? ENDOF
+      replace-file OF drop s REV-IS? ENDOF
+      delete-file OF s REV-IS? ENDOF
+      create-folder OF s ABSENT? ENDOF
+      delete-folder OF s FOLDER? ENDOF
+   ;MATCH ;
+
+\ The path holds what the mutation intended.
+: INTENDED? ( remote-path-state expectation -- bool )
+   {: s:remote-path-state x:expectation :}
+   x MATCH expectation
+      create-file OF s HOLDS? ENDOF
+      replace-file OF
+         {: v:DROPBOX:rev c:DROPBOX:hash :} c s HOLDS?
+      ENDOF
+      delete-file OF drop s ABSENT? ENDOF
+      create-folder OF s FOLDER? ENDOF
+      delete-folder OF s ABSENT? ENDOF
+   ;MATCH ;
+
+\ Rust's MutationExpectation::classify.
+: CLASSIFY ( remote-path-state expectation -- mutation-outcome )
+   {: s x :}
+   s x UNCHANGED? if PENDING exit then
+   s x INTENDED? if s APPLIED exit then
+   s CHANGED-TO ;
+
+\ Ends the pass on a refusal that is not one path's verdict.
+: STOP-REFUSED ( DROPBOX:error ^link -- )
+   swap DROPBOX-REPLY:REFUSED swap STOP-PASS ;
+
+: BY-DROPBOX ( -- mutation-rejection )
+   construct mutation-rejection rejected-by-dropbox ;
+: DENIED ( -- mutation-rejection )
+   construct mutation-rejection permission-denied ;
+: NOT-ALLOWED ( -- mutation-rejection )
+   construct mutation-rejection operation-not-allowed ;
+
+\ Rust's write_outcome and lookup_outcome: one path's refusal; a
+\ refusal about the pass, not the path, stops it.
+: REJECTION ( DROPBOX:error ^link -- mutation-rejection )
+   {: e l :}
+   e MATCH DROPBOX:error
+      not-found OF BY-DROPBOX ENDOF
+      not-file OF BY-DROPBOX ENDOF
+      not-folder OF BY-DROPBOX ENDOF
+      malformed-path OF
+         construct mutation-rejection invalid-path
+      ENDOF
+      disallowed-name OF
+         construct mutation-rejection disallowed-name
+      ENDOF
+      conflict OF e l STOP-REFUSED ENDOF
+      no-write-permission OF DENIED ENDOF
+      restricted-content OF BY-DROPBOX ENDOF
+      access-restricted OF DENIED ENDOF
+      team-folder OF NOT-ALLOWED ENDOF
+      operation-suppressed OF NOT-ALLOWED ENDOF
+      insufficient-space OF
+         construct mutation-rejection insufficient-space
+      ENDOF
+      locked OF BY-DROPBOX ENDOF
+      reset OF e l STOP-REFUSED ENDOF
+      invalid-root OF e l STOP-REFUSED ENDOF
+      content-hash-mismatch OF e l STOP-REFUSED ENDOF
+      unsupported-file OF BY-DROPBOX ENDOF
+      path-mismatch OF
+         construct mutation-rejection path-mismatch
+      ENDOF
+      unverified OF e l STOP-REFUSED ENDOF
+      other OF BY-DROPBOX ENDOF
+   ;MATCH ;
+
+: REJECTED ( DROPBOX:error ^link -- mutation-outcome )
+   REJECTION REJECT ;
+
+
+\ ---- reading the path back
+
+\ The entry's file, its strings copied into the arena.
+: REMOTE-OF ( ^DROPBOX:entry ^ARENA:arena -- MODEL:remote )
+   {: e ar :}
+   e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$ ar COPIED DROPBOX:>HASH
+   e DROPBOX-ENTRY:REV @ SPAN:$ ar COPIED DROPBOX:>REV
+   MODEL-REMOTE:MAKE ;
+
+: FILE-STATE ( ^DROPBOX:entry ^ARENA:arena -- remote-path-state )
+   {: e ar :}
+   e DROPBOX-ENTRY:DOWNLOADABLE @ 0= if
+      REPLAY-REMOTE--PATH--STATE:UNSUPPORTED exit
+   then
+   e ar REMOTE-OF REPLAY-REMOTE--PATH--STATE:FILE ;
+
+: FOUND ( ^DROPBOX:entry ^ARENA:arena -- remote-path-state )
+   {: e ar :}
+   e DROPBOX-ENTRY:KIND @ MATCH DROPBOX:kind
+      file OF e ar FILE-STATE ENDOF
+      folder OF FOLDER ENDOF
+      deleted OF ABSENT ENDOF
+   ;MATCH ;
+
+\ Rust's verify: what Dropbox holds at t, classified against x.
+: STATE ( ^link ^u8 n expectation ^ARENA:arena -- mutation-outcome )
+   {: l t:^ tu:n x ar :}
+   t tu l CLIENT DROPBOX:METADATA {: r:DROPBOX:reply :}
+   r MATCH DROPBOX:reply
+      done OF l CLIENT DROPBOX:ENTRY ar FOUND x CLASSIFY ENDOF
+      refused OF {: e:DROPBOX:error :}
+         e DROPBOX-ERROR:NOT-FOUND IS?
+         if ABSENT x CLASSIFY else e l REJECTED then
+      ENDOF
+      retry OF drop r l STOP-PASS ENDOF
+      unlinked OF r l STOP-PASS ENDOF
+   ;MATCH ;
+
+\ One mutation's reply: done answers `applied`; a conflict reads the
+\ path back.
+: ANSWERED
+   ( DROPBOX:reply ^link ^u8 n expectation ^ARENA:arena
+     [ -- mutation-outcome ] -- mutation-outcome )
+   {: r:DROPBOX:reply l t:^ tu:n x ar applied :}
+   r MATCH DROPBOX:reply
+      done OF applied execute ENDOF
+      refused OF {: e:DROPBOX:error :}
+         e DROPBOX-ERROR:CONFLICT IS?
+         if l t tu x ar STATE else e l REJECTED then
+      ENDOF
+      retry OF drop r l STOP-PASS ENDOF
+      unlinked OF r l STOP-PASS ENDOF
+   ;MATCH ;
+
+
+\ ---- create folder, delete file
+
+: MAKE-FOLDER ( str ^link ^ARENA:arena -- mutation-outcome )
+   {: t:str l ar :}
+   t str> l CLIENT DROPBOX:CREATE-FOLDER
+   l t str> EXPECTATION-CREATE-FOLDER ar
+   [: FOLDER APPLIED ;] ANSWERED ;
+
+: REMOTE-CREATE-FOLDER
+   ( ^link MODEL:path ^ARENA:arena -- mutation-outcome )
+   {: l path ar :}
+   l path ar [: l ar MAKE-FOLDER ;] TARGETED ;
+
+: UNLINK ( str ^link DROPBOX:rev ^ARENA:arena -- mutation-outcome )
+   {: t:str l rev:DROPBOX:rev ar :}
+   t str> rev DROPBOX:REV>STR str> l CLIENT DROPBOX:DELETE
+   l t str> rev EXPECTATION-DELETE-FILE ar ['] GONE ANSWERED ;
+
+: REMOTE-DELETE-FILE
+   ( ^link MODEL:path DROPBOX:rev ^ARENA:arena -- mutation-outcome )
+   {: l path rev:DROPBOX:rev ar :}
+   l path ar [: l rev ar UNLINK ;] TARGETED ;
+
+
+\ ---- upload
+
+\ The open stage's size in bytes; a failed fstat ends the pass.
+: STAGE-SIZE ( ^sending -- n )
+   {: s :}
+   [: s SENDING-FD @ FS:FD-STAT ;] catch {: code:n :}
+   code 0= if FS:STAT-SIZE@ exit then
+   code E-FS-STAT <> if code throw then
+   s" read upload stage metadata"
+   s SENDING-PATH @ MODEL:PATH>STR str> IO-FAILED ;
+
+\ Rust's validate_upload_size.
+: OVERSIZE? ( n -- bool ) UPLOAD-MAX > ;
+
+: SAMPLE ( ^sending -- STATUS:transfer )
+   {: s :}
+   STATUS-DIRECTION:UPLOAD s SENDING-PATH @ MODEL:PATH>STR
+   s SENDING-DONE @ s SENDING-SIZE @ OPTION:SOME
+   STATUS-TRANSFER:MAKE ;
+
+: STATUS-OF ( ^sending -- ^STATUS:status )
+   SENDING-LINK @ REPLAY-LINK:STATUS @ ;
+
+\ UPLOAD's progress: n bytes accepted.
+: SENT ( n ^sending -- )
+   {: n s :}
+   n s SENDING-DONE !
+   s SAMPLE STATUS-EVENT:PROGRESS s STATUS-OF STATUS:TRANSFER ;
+
+: FINISHED ( ^sending -- )
+   {: s :}
+   s SAMPLE STATUS-EVENT:FINISHED s STATUS-OF STATUS:TRANSFER ;
+
+: DESIRED ( ^sending -- DROPBOX:hash )
+   SENDING-STAGE @ LOCAL:UPLOAD-CONTENT ;
+
+: EXPECTED ( ^sending -- expectation )
+   {: s :}
+   s SENDING-REV @ {: v:DROPBOX:rev :}
+   v DROPBOX:REV>STR str> nip 0= if
+      s DESIRED EXPECTATION-CREATE-FILE exit
+   then
+   v s DESIRED EXPECTATION-REPLACE-FILE ;
+
+: UPLOAD-OF ( ^sending -- ^DROPBOX:upload )
+   {: s :}
+   s SENDING-ARENA @ UPLOADS-NEW {: up :}
+   s SENDING-FD @ up DROPBOX-UPLOAD:FD !
+   s SENDING-SIZE @ up DROPBOX-UPLOAD:SIZE !
+   s DESIRED DROPBOX:HASH>STR str> SPAN:MAKE
+   up DROPBOX-UPLOAD:CONTENT-HASH !
+   s SENDING-TARGET @ str> SPAN:MAKE up DROPBOX-UPLOAD:PATH !
+   s SENDING-REV @ DROPBOX:REV>STR str> SPAN:MAKE
+   up DROPBOX-UPLOAD:REV !
+   up ;
+
+\ The upload; a finished transfer follows on every exit.
+: PUT ( ^sending -- DROPBOX:reply )
+   {: s :}
+   [: s UPLOAD-OF s SENDING-LINK @ CLIENT [: s SENT ;]
+      DROPBOX:UPLOAD ;]
+   [: s FINISHED ;] finally ;
+
+: UPLOADED ( ^sending -- mutation-outcome )
+   {: s :}
+   s SENDING-LINK @ CLIENT DROPBOX:ENTRY s SENDING-ARENA @ REMOTE-OF
+   REPLAY-REMOTE--PATH--STATE:FILE APPLIED ;
+
+: SEND ( ^sending -- mutation-outcome )
+   {: s :}
+   s PUT s SENDING-LINK @ s SENDING-TARGET @ str> s EXPECTED
+   s SENDING-ARENA @ [: s UPLOADED ;] ANSWERED ;
+
+\ A stage Dropbox cannot take is rejected before any call.
+: SIZED ( ^sending -- mutation-outcome )
+   {: s :}
+   s STAGE-SIZE s SENDING-SIZE !
+   s SENDING-SIZE @ OVERSIZE? if
+      construct mutation-rejection unsupported-file-size REJECT exit
+   then
+   s SEND ;
+
+\ The stage, opened verified, closes on every exit.
+: OPENED ( ^sending -- mutation-outcome )
+   {: s :}
+   s SENDING-STAGE @ s SENDING-ARENA @ LOCAL:OPEN-VERIFIED-UPLOAD
+   {: f:fd :}
+   f s SENDING-FD !
+   [: s SIZED ;] [: f DISCARD ;] finally ;
+
+: NEW-SENDING
+   ( str ^link MODEL:path ^LOCAL:staged-upload DROPBOX:rev
+     ^ARENA:arena -- ^sending )
+   {: t:str l path up rev:DROPBOX:rev ar :}
+   ar SENDINGS-NEW {: s :}
+   t s SENDING-TARGET ! l s SENDING-LINK ! path s SENDING-PATH !
+   up s SENDING-STAGE ! rev s SENDING-REV ! ar s SENDING-ARENA !
+   s ;
+
+\ Rust's create_file, or replace_file of the rev unless it is empty.
+: REMOTE-UPLOAD
+   ( ^link MODEL:path ^LOCAL:staged-upload DROPBOX:rev ^ARENA:arena
+     -- mutation-outcome )
+   {: l path up rev:DROPBOX:rev ar :}
+   l path ar [: l path up rev ar NEW-SENDING OPENED ;] TARGETED ;
+
+
+\ ---- delete folder
+
+\ Counts an entry whose path_lower is not t's lowercase.
+: SEEN ( ^DROPBOX:entry ^u8 n ^probe -- )
+   {: e t:^ tu:n p :}
+   t tu e DROPBOX-ENTRY:LOWER @ SPAN:$ UNICODE:LOWERS-TO?
+   if exit then
+   1 p PROBE-SEEN +! ;
+
+\ A recursive listing of the folder at t, and how many entries it
+\ holds but t itself.
+: PROBED ( ^u8 n ^link ^ARENA:arena -- DROPBOX:reply n )
+   {: t:^ tu:n l ar :}
+   ar PROBES-NEW {: p :}
+   t tu l CLIENT [: t tu p SEEN ;] DROPBOX:LIST
+   p PROBE-SEEN @ ;
+
+\ A file the delete found took the folder's place after the probe.
+: REPLACED ( ^link MODEL:path -- )
+   {: l path :}
+   l CLIENT DROPBOX:ENTRY {: e :}
+   e DROPBOX-ENTRY:KIND @ DROPBOX-KIND:FILE DROPBOX-KIND:EQ 0=
+   if exit then
+   LOG:ERROR s" replay" LOG:LINE
+   s" Dropbox deleted a file that replaced the empty folder after"
+   LOG:TEXT+
+   s"  its listing; restore it from Dropbox's deleted files if it"
+   LOG:TEXT+
+   s"  is wanted path=" LOG:TEXT+ path MODEL:PATH>STR str> LOG:TEXT+
+   s"  revision=" LOG:TEXT+ e DROPBOX-ENTRY:REV @ SPAN:$ LOG:TEXT+
+   LOG:;LINE ;
+
+\ Deletes the folder the probe found empty, whatever it holds now.
+: EMPTIED
+   ( str ^link MODEL:path ^ARENA:arena -- mutation-outcome )
+   {: t:str l path ar :}
+   t str> s" " l CLIENT DROPBOX:DELETE
+   l t str> EXPECTATION-DELETE-FOLDER ar
+   [: l path REPLACED GONE ;] ANSWERED ;
+
+: PROBE-REFUSED
+   ( DROPBOX:error str ^link ^ARENA:arena -- mutation-outcome )
+   {: e:DROPBOX:error t:str l ar :}
+   e DROPBOX-ERROR:NOT-FOUND IS? if GONE exit then
+   e DROPBOX-ERROR:NOT-FOLDER IS? if
+      l t str> EXPECTATION-DELETE-FOLDER ar STATE exit
+   then
+   e DROPBOX-ERROR:RESET IS? if PENDING exit then
+   e l REJECTED ;
+
+\ Rust's delete_folder: only a folder the listing shows empty.
+: CLEARED
+   ( str ^link MODEL:path ^ARENA:arena -- mutation-outcome )
+   {: t:str l path ar :}
+   t str> l ar PROBED {: r:DROPBOX:reply seen:n :}
+   r MATCH DROPBOX:reply
+      done OF
+         seen 0= if t l path ar EMPTIED else FOLDER CHANGED-TO then
+      ENDOF
+      refused OF t l ar PROBE-REFUSED ENDOF
+      retry OF drop r l STOP-PASS ENDOF
+      unlinked OF r l STOP-PASS ENDOF
+   ;MATCH ;
+
+: REMOTE-DELETE-FOLDER
+   ( ^link MODEL:path ^ARENA:arena -- mutation-outcome )
+   {: l path ar :}
+   l path ar [: l path ar CLEARED ;] TARGETED ;
 
 ;package
