@@ -1313,3 +1313,126 @@ resolved, so the pass tried to create a folder over Dropbox's file and
 parked a file's upload for an hour. Rust never met this, because
 ending the pass also ended the subtree. A departure must carry every
 consequence of the behaviour it replaces.
+
+## 2026-11-16: the daemon's failure table, and helpers written twice
+
+Three small lanes moved every test helper with more than one copy into
+one shared file, `src/test-client.f`. The last lane listed copies that sat
+outside its brief, and the lead folded those by hand. Minutes later, the
+first DAEMON lane wrote `COPIED` again in a new test file. The shared file
+already exports that word, but nothing in that lane's brief named it.
+A shared helper saves nothing if the next agent does not know it exists.
+Rust has the same problem in principle. In practice, an editor or
+`rust-analyzer` finds the helper as you type, and a Forth file shows no
+such completion.
+
+The DAEMON's failure table shows how the two languages carry failures.
+Rust's daemon sorts the variants of nine error enums, 115 in all, into
+four dispositions. The Habu table has 46 rows, and Habu's production
+packages define 57 codes in all. Many of Rust's variants have no Habu
+code, because Habu returns that answer as a value:
+- UnverifiedMutation, RetriedTransport and DownloadBody are `reply`
+  arms that DROPBOX returns, and DAEMON maps a reply in four lines.
+- The remote-root errors are an `account-check` arm.
+
+Rust's error channel carries the expected outcomes along with the
+exceptional ones, so its policy must name each of them. Habu throws only
+the exceptional, and the table shrinks to match.
+
+The two DAEMON lanes ran at once and wrote their tests in the repository's
+two test styles:
+- One wrote its cases inside the reopened DAEMON package, as
+  `reconcile-test.f` does.
+- The other exported DAEMON's private words to a separate DAEMON-TEST
+  package, as `replay-test.f` and `dropbox-test.f` do.
+
+Both compiled, so the merge had to choose between them. The in-package
+style had a defect that only the next lane would have hit: its test
+runner was a word called `RUN` inside DAEMON, and the next lane adds
+`DAEMON:RUN`. The test's `RUN` would have shadowed the daemon's without
+a warning. Rust has one convention, `mod tests` with `use super::*`, and
+a duplicate name would not compile.
+
+Reading the account answer, one lane noticed that Habu takes the root
+namespace from any tag of Dropbox's `root_info` union. Rust takes it only
+from `user` or `team`, and treats any other tag as a changed binding.
+No test covers this, and Dropbox sends no third tag today. It would
+still have stopped the daemon with the wrong message. A port has to read
+the original's `_ =>` arms as closely as its named ones.
+
+The libunistring defect found during the MODEL work went upstream as a
+bug report, with a C reproducer that checks its output against Python's
+and Rust's lowercasing.
+
+The review of the DAEMON stack found where one Habu code stood for two
+Rust errors. DROPBOX threw `E-ANSWER` both for an answer that does not
+parse and for a list page whose cursor did not advance. Rust calls the
+first an invariant and the second environmental, so the Habu table could
+give the pair only one disposition. One odd page would have stopped sync
+with an exit code systemd does not restart. A port that merges two errors
+into one code must check that both had the same disposition.
+
+The same review found a leak Rust cannot have. The daemon's preparing and
+configuring steps allocated in the process's arena, which nothing resets,
+so each failed attempt kept a few KB until the process ended. In Rust,
+each attempt's values drop at the end of its scope. In Habu, a lifetime
+is an arena someone chose, and a retry loop needs one of its own.
+
+The omaboxd lane ported the startup tests, which run the built program
+as a child. The brief's build command failed twice: hb reads a `--load`
+path from the directory it runs in, not from Habu's tree, and hb-build
+does not make its output directory. Cargo builds from anywhere in the
+tree. The lane also wrote `COPIED` and `INSIDE` again, an hour after the
+previous copy was removed.
+
+Its test could not load Habu's `signal.f`, and I reported that to Habu's
+owner as a library defect. It was not one: the engine carries some
+libraries built in, and those win over the source tree. Our `bin/hb`
+was built nine minutes before `at-exit.f` gained the word `signal.f`
+needs, so a current `signal.f` met an old `at-exit.f`. Cargo rebuilds
+whatever is stale; an hb binary must be rebuilt by hand whenever its
+tree moves. Rebuilding it was not one command either. Habu master had
+moved 115 commits, and the old engine could not compile a tree that
+uses the new section word `global`, so we seeded the build with the hb
+installed on another machine of the same architecture, as Habu's
+bootstrap guide says. rustup never asks this of anyone. The test now
+sends SIGKILL from `PROCESS`, as Rust's `Child::kill` does.
+
+Moving to Habu master cost two renames. Keywords such as `create` and
+`private` can no longer name a word or an enum variant, so CONFIG's
+`PRIVATE` became `PRIVATE-PATH` and REPLAY's `file-mutation create
+replace` became `add replace`. The compiler stopped at the first such
+name, and an agent renamed each by hand. Rust reserves words too, at an
+edition, and `cargo fix --edition` rewrites the code for you.
+
+The review also traced a full disk through a sync pass. Rust's error
+value carries its errno to the daemon's policy, which checks for ENOSPC.
+A Habu throw carries only its code, and the errno waits in `FS:ERRNO`, a
+global. Cleanup on the way up (closing a directory, publishing the
+status) clears that global before the policy reads it, so a full disk
+during a download would have reported the sync folder as unavailable.
+No test caught it because no test fills a disk. The fix puts the fact
+in the code: LOCAL, JOURNAL and CONFIG throw `E-DISK-FULL` where the
+errno is ENOSPC, as SQLITE already throws `E-FULL`, and the policy reads
+no global. In Rust the error and its cause travel together by
+construction; in Habu, anything the catch needs has to be in the code.
+
+Rust's `OAuthClient::begin` could not keep its name. Habu refuses `: BEGIN`
+as a definition, because it is the `begin` keyword in capitals, so the port
+says `AUTH:START`, taken from Rust's own doc line "Start one authorization
+attempt". The same lane found the second percent encoder in the tree:
+DROPBOX had written its token bodies with RFC 3986's unreserved set since
+the first port, while the SDK writes them form-urlencoded. No real token or
+key contains a byte where the two differ, so no test could have caught it.
+Two lanes wrote the same encoder because the library had none. In Rust,
+`url::form_urlencoded` is one `use` away.
+
+Moving the link into DROPBOX turned up a borrow that Habu does not check.
+ACCOUNT-ID and ROOT-NAMESPACE are spans into the client's answer buffer,
+and LINK's next request, the root's metadata, clears that buffer. Read
+after LINK, the account id would have been the folder's JSON. The worker
+caught it by reading, and copied both into the caller's arena before the
+second call. Rust's borrow checker refuses this program: a `&str` into a
+buffer cannot outlive a `&mut self` call that clears it. In Habu the rule
+is a comment ("the answer buffer, which the next call clears"), so the
+test that pins it down is the only check.
