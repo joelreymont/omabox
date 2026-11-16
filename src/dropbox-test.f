@@ -10,8 +10,9 @@
 \ body that throws before or after its end, one left unread while the
 \ server holds the rest, one in two chunks read 7 or 64 bytes a read, one
 \ cut mid-body, whether or not its body catches the loss, an empty file,
-\ and ones refused unverified: another rev, range or length, a 416 from 0,
-\ a Dropbox-API-Result or an error that does not parse), delete,
+\ one answered 400, and ones refused unverified: another rev, range or
+\ length, a 416 from 0, a Dropbox-API-Result or an error that does not
+\ parse), delete,
 \ create-folder, the code exchange, Dropbox's content hash and uploads,
 \ whose stages are written under TMPDIR and removed once open, so no run
 \ leaves one; a mutation or session finish Dropbox answers
@@ -1029,6 +1030,15 @@ variable READ-COUNT
    s" /docs/abc.txt" MAIN @ DROPBOX:METADATA DONE? ASSERT ;
 
 
+\ A download answered 400 throws as any call does, unconverted.
+: BAD-REQUEST-DOWNLOAD-CASE ( -- )
+   s" download answered 400" T-LABEL
+   TEST-DROPBOX:RESET ALPHABET
+   400 s" " s" " s" bad" TEST-DROPBOX:SCRIPT!
+   [: 0 FETCH DONE? drop ;] LOGGED DROPBOX:E-BAD-REQUEST T=
+   USABLE ;
+
+
 : SKEW-CASE ( -- )
    s" download range mismatch" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
@@ -1327,7 +1337,7 @@ variable READ-COUNT
    OTHER-REV-CASE SHORT-CASE WHOLE-FOR-RANGE-CASE UNASKED-RANGE-CASE
    UNPARSED-RESULT-CASE UNPARSED-REFUSAL-CASE
    BROKEN-CASE SWALLOWED-CASE BODY-THROWS-CASE LATE-THROW-CASE UNREAD-CASE
-   PAUSED-CASE CHUNKED-CASE EMPTY-CASE ;
+   PAUSED-CASE CHUNKED-CASE EMPTY-CASE BAD-REQUEST-DOWNLOAD-CASE ;
 
 
 \ ---- delete_v2, create_folder_v2 and the code exchange
