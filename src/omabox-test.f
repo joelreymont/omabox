@@ -50,6 +50,18 @@
 \   Rust's fixture with COMPLETE-SETUP and a bind that does nothing as
 \   the change, systemctl Rust's script for the test under TMPDIR, and
 \   the log captured in a file there
+\ - bind_stores_the_token_and_binds_an_unbound_journal,
+\   bind_stores_the_token_for_a_journal_bound_to_the_login and
+\   bind_refuses_a_journal_bound_elsewhere, Omabox's own: Rust's
+\   fixture's journal, after AUTH:BIND, with a recording store bound
+\   in place of the keyring
+\ - exchanged_passes_a_token_dropbox_issues,
+\   exchanged_refuses_a_token_dropbox_does_not_issue,
+\   linked_refuses_an_unavailable_account,
+\   linked_refuses_a_root_not_a_folder and
+\   linked_refuses_an_account_of_another_root_tag, Omabox's own:
+\   against test-dropbox.f's fake under DROPBOX:WITH-LOOPS, each log
+\   captured in a file under TMPDIR
 \ - settings_show_a_root_of_any_length, Omabox's own: Rust's fixture
 \   with config.toml naming a root of over 1024 bytes that is made nowhere
 \ - an_unexpected_code_is_logged, Omabox's own: UNEXPECTED of a Habu
@@ -58,7 +70,7 @@
 \ TMPDIR, whose --version prints its name and version and exits 0.
 \ White-box: OMABOX is reopened for PARSE, HOME-ROOT, COMPLETE-SETUP,
 \ READ-CODE, RUN-SERVICE, STATUS-TEXT, SETTINGS-TEXT, RESTORE-GOAL,
-\ RELEASED, SET-ROOT and UNEXPECTED.
+\ RELEASED, SET-ROOT, UNEXPECTED, EXCHANGED, LINKED and BIND.
 \ Run from the repository root: hb --load src/omabox-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -86,6 +98,8 @@ require src/service.f
 require src/stale.f
 require src/version.f
 require src/omabox.f
+require src/test-dropbox.f
+require src/test-client.f
 
 package OMABOX
 private
@@ -515,9 +529,8 @@ variable CHANGES
 
 \ ---- status and settings
 
-\ Rust's fixture: DIR/first the sync root, XDG over DIR/config and
-\ DIR/state, the config written with public-app-key; answers DIR, the
-\ XDG and first.
+\ Rust's fixture: answers DIR, the XDG over DIR/config and DIR/state,
+\ and the sync root DIR/first; the config holds public-app-key.
 : FIXTURE ( ^ARENA:arena -- str ^CONFIG:xdg str )
    {: ar :}
    ar TEMPORARY {: d :}
@@ -800,10 +813,8 @@ variable CHANGES
    start CODE+ S\" ; printf '%s\\n' active > " SB-APPEND
    state QUOTED+ S\"  ;;\nesac\nexit 0\n" SB-APPEND ;
 
-\ Rust's stateful_systemctl in a new directory, which it answers with
-\ the commands: the unit's state in unit-state, each verb logged to
-\ service.log; start exits with start, stop with stop once the unit is
-\ inactive, and list-units lists the unit as loaded.
+\ Rust's stateful_systemctl: answers a new directory and its commands;
+\ the unit's state is in unit-state, each verb in service.log.
 : STATEFUL ( ^u8 n n n ^ARENA:arena -- str ^SERVICE:commands )
    {: i:^ iu:n start:n stop:n ar :}
    ar TEMPORARY {: d :}
@@ -1207,9 +1218,8 @@ variable CHANGES
    log FILE-TEXT S\" show\n" T$=
    d str> FS:REMOVE-TREE ;
 
-\ A systemctl in DIR whose stop moves the config directory to
-\ DIR/saved-config and leaves a file in its place, and whose start exits
-\ with start: the commands and the service log.
+\ A systemctl whose stop replaces the config directory with a file
+\ and whose start exits with start: the commands and the service log.
 : CONFIG-BREAKING ( str ^CONFIG:paths n ^ARENA:arena
      -- ^SERVICE:commands str )
    {: d paths start:n ar :}
@@ -1517,6 +1527,220 @@ variable CHANGES
    d str> FS:REMOVE-TREE ;
 
 
+\ ---- setup's login and bind
+
+\ A recording store, bound before any SECRET call: no case reaches the
+\ keyring. REC holds the last record written.
+CAP BUFFER: REC
+variable REC-U
+variable REC-WRITES
+
+: REC-READ ( ^u8 n ^u8 n SPAN:span<u8> -- n bool )
+   {: s:^ su:n a:^ au:n dest:SPAN:span<u8> :}
+   0 false ;
+
+: REC-WRITE ( ^u8 n ^u8 n ^u8 n -- )
+   {: s:^ su:n a:^ au:n v:^ vu:n :}
+   vu CAP min {: k:n :}
+   v REC k BYTE-COPY k REC-U !
+   1 REC-WRITES +! ;
+
+: REC-ERASE ( ^u8 n ^u8 n -- bool ) 2drop 2drop false ;
+
+' REC-READ ' REC-WRITE ' REC-ERASE SECRET:STORE!
+
+\ A login for /Sync of the account, holding the token bind-refresh.
+: LOGIN ( ^u8 n ^ARENA:arena -- ^authorized )
+   {: ac:^ acu:n ar :}
+   ar LOGINS-NEW {: a :}
+   ac acu >str s" namespace" >str s" /Sync" >str
+   JOURNAL-DROPBOX--BINDING:MAKE a AUTHORIZED-BINDING !
+   s" bind-refresh" >str a AUTHORIZED-REFRESH-TOKEN !
+   a ;
+
+: JOURNAL-OF ( ^CONFIG:config -- str )
+   CONFIG:PATHS CONFIG:JOURNAL-FILE CONFIG:ABS-PATH>STR ;
+
+\ The config c's journal bound to b before setup.
+: PREBOUND ( ^CONFIG:config JOURNAL:dropbox-binding ^ARENA:arena -- )
+   {: c b ar :}
+   c JOURNAL-OF JOURNAL:OPEN {: j :}
+   j b ar JOURNAL:BIND-DROPBOX-ROOT BOUND? TTRUE
+   j JOURNAL:CLOSE ;
+
+\ Whether the config c's journal is bound to b.
+: BOUND-TO? ( ^CONFIG:config JOURNAL:dropbox-binding ^ARENA:arena
+     -- bool )
+   {: c b ar :}
+   c JOURNAL-OF JOURNAL:OPEN {: j :}
+   j ar JOURNAL:DROPBOX-BINDING MATCH option
+      none OF false ENDOF
+      some OF b JOURNAL:BINDING= ENDOF
+   ;MATCH
+   j JOURNAL:CLOSE ;
+
+\ BIND of the login a for the config c: its code and the log, captured
+\ in p; REC-WRITES counts its store writes.
+: BIND-RUN ( ^CONFIG:config ^authorized str ^ARENA:arena -- n ^u8 n )
+   {: c a p ar :}
+   0 REC-WRITES ! 0 REC-U !
+   [: c a ar BIND ;] p str> ar STDERR:CAPTURING ;
+
+: BIND-STORES-THE-TOKEN-AND-BINDS-AN-UNBOUND-JOURNAL ( ^ARENA:arena -- )
+   {: ar :}
+   s" bind_stores_the_token_and_binds_an_unbound_journal" T-LABEL
+   ar LOADED-FIXTURE {: d c p :}
+   s" account" ar LOGIN {: a :}
+   c a p ar BIND-RUN {: code:n e:^ eu:n :}
+   code 0 T=
+   REC-WRITES @ 1 T=
+   REC REC-U @ s" bind-refresh" CONTAINS? TTRUE
+   c a AUTHORIZED-BINDING @ ar BOUND-TO? TTRUE
+   d str> FS:REMOVE-TREE ;
+
+: BIND-STORES-THE-TOKEN-FOR-A-JOURNAL-BOUND-TO-THE-LOGIN
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" bind_stores_the_token_for_a_journal_bound_to_the_login" T-LABEL
+   ar LOADED-FIXTURE {: d c p :}
+   s" account" ar LOGIN {: a :}
+   c a AUTHORIZED-BINDING @ ar PREBOUND
+   c a p ar BIND-RUN {: code:n e:^ eu:n :}
+   code 0 T=
+   REC-WRITES @ 1 T=
+   REC REC-U @ s" bind-refresh" CONTAINS? TTRUE
+   c a AUTHORIZED-BINDING @ ar BOUND-TO? TTRUE
+   d str> FS:REMOVE-TREE ;
+
+: BIND-REFUSES-A-JOURNAL-BOUND-ELSEWHERE ( ^ARENA:arena -- )
+   {: ar :}
+   s" bind_refuses_a_journal_bound_elsewhere" T-LABEL
+   ar LOADED-FIXTURE {: d c p :}
+   s" other-account" ar LOGIN AUTHORIZED-BINDING @ {: other :}
+   c other ar PREBOUND
+   s" account" ar LOGIN {: a :}
+   c a p ar BIND-RUN {: code:n e:^ eu:n :}
+   code E-BINDING-MISMATCH T=
+   e eu s" omabox: this Omabox journal is already bound to a different"
+   CONTAINS? TTRUE
+   REC-WRITES @ 0 T=
+   c other ar BOUND-TO? TTRUE
+   d str> FS:REMOVE-TREE ;
+
+\ The code and log of xt, captured in a file under TMPDIR.
+: LOGGED ( [ -- ] ^ARENA:arena -- n ^u8 n )
+   {: xt ar :}
+   ar TEMPORARY {: d :}
+   xt d s" stderr.txt" ar INSIDE str> ar STDERR:CAPTURING
+   d str> FS:REMOVE-TREE ;
+
+\ A client on the fake with no token and no root, as setup's is.
+: TOKENLESS ( ^ARENA:arena -- ^DROPBOX:client )
+   {: ar :}
+   [: 2drop ;] s" " s" " ar TEST-CLIENT:CLIENT-ON ;
+
+\ A login and a client for the code the fake grants it, if any.
+: EXCHANGING ( bool ^ARENA:arena -- ^AUTH:pending ^DROPBOX:client )
+   {: granted:bool ar :}
+   TEST-DROPBOX:RESET
+   s" fake-key" ar AUTH:START {: pd :}
+   granted if s" fake-code" pd AUTH:VERIFIER TEST-DROPBOX:GRANT! then
+   pd ar TOKENLESS ;
+
+: EXCHANGED-PASSES-A-TOKEN-DROPBOX-ISSUES ( ^ARENA:arena -- )
+   {: ar :}
+   s" exchanged_passes_a_token_dropbox_issues" T-LABEL
+   true ar EXCHANGING {: pd cl :}
+   [: s" fake-code" >str pd cl EXCHANGED ;] ar LOGGED
+   {: code:n e:^ eu:n :}
+   code 0 T=
+   cl DROPBOX:REFRESH-TOKEN s" fake-refresh-granted" T$=
+   cl DROPBOX:CLOSE ;
+
+: EXCHANGED-REFUSES-A-TOKEN-DROPBOX-DOES-NOT-ISSUE ( ^ARENA:arena -- )
+   {: ar :}
+   s" exchanged_refuses_a_token_dropbox_does_not_issue" T-LABEL
+   false ar EXCHANGING {: pd cl :}
+   [: s" fake-code" >str pd cl EXCHANGED ;] ar LOGGED
+   {: code:n e:^ eu:n :}
+   code E-AUTH T=
+   e eu S\" omabox: Dropbox OAuth could not issue an access token\n"
+   CONTAINS? TTRUE
+   cl DROPBOX:CLOSE ;
+
+\ LINKED of /Sync on a client holding its first access token, nothing
+\ seen yet, after xt scripts the fake: the code and the log.
+: LINK-RUN ( [ -- ] ^ARENA:arena -- n ^u8 n )
+   {: xt ar :}
+   TEST-DROPBOX:RESET ar TEST-CLIENT:TOKENED {: cl :}
+   TEST-DROPBOX:RESET xt execute
+   [: s" /Sync" >str cl ar LINKED ;] ar LOGGED
+   cl DROPBOX:CLOSE ;
+
+: VALIDATE-LOGGED? ( ^u8 n -- bool )
+   S\" omabox: could not validate the Dropbox account and root\n"
+   CONTAINS? ;
+
+: LINKED-REFUSES-AN-UNAVAILABLE-ACCOUNT ( ^ARENA:arena -- )
+   {: ar :}
+   s" linked_refuses_an_unavailable_account" T-LABEL
+   [: s" /2/users/get_current_account" 503 s" " s" " s" "
+      TEST-DROPBOX:ROUTE-SCRIPT! ;] ar LINK-RUN {: code:n e:^ eu:n :}
+   code E-DROPBOX T=
+   e eu VALIDATE-LOGGED? TTRUE ;
+
+\ Rust's file_metadata for /Sync, empty.
+: ROOT-FILE$ ( -- ^u8 n )
+   SB-RESET S\" {\q.tag\q:\qfile\q" SB-APPEND TEST-CLIENT:SYNC-PATHS+
+   S\" ,\qrev\q:\qroot-file-revision\q,\qsize\q:0" SB-APPEND
+   S\" ,\qcontent_hash\q:\qe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\q"
+   SB-APPEND S\" ,\qis_downloadable\q:true}" SB-APPEND SB$ ;
+
+: LINKED-REFUSES-A-ROOT-NOT-A-FOLDER ( ^ARENA:arena -- )
+   {: ar :}
+   s" linked_refuses_a_root_not_a_folder" T-LABEL
+   [: s" /2/files/get_metadata" 200 s" " s" " ROOT-FILE$
+      TEST-DROPBOX:ROUTE-SCRIPT! ;] ar LINK-RUN {: code:n e:^ eu:n :}
+   code E-DROPBOX T=
+   e eu S\" omabox: configured Dropbox root is not a folder\n" CONTAINS?
+   TTRUE
+   e eu VALIDATE-LOGGED? TTRUE ;
+
+: LINKED-REFUSES-AN-ACCOUNT-OF-ANOTHER-ROOT-TAG ( ^ARENA:arena -- )
+   {: ar :}
+   s" linked_refuses_an_account_of_another_root_tag" T-LABEL
+   [: s" /2/users/get_current_account" 200 s" " s" "
+      S\" {\qaccount_id\q:\qdbid:account\q,\qroot_info\q:{\qroot_namespace_id\q:\qnamespace\q,\q.tag\q:\qother\q}}"
+      TEST-DROPBOX:ROUTE-SCRIPT! ;] ar LINK-RUN {: code:n e:^ eu:n :}
+   code E-ACCOUNT-CHANGED T=
+   e eu s" omabox: Dropbox authorization returned a different account"
+   CONTAINS? TTRUE ;
+
+\ The cases against the fake, under DROPBOX's loops; linking starts
+\ at the account's home, so the fake expects no Path-Root.
+: SERVED ( ^ARENA:arena -- )
+   {: ar :}
+   s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
+   s" " TEST-DROPBOX:ROOT!
+   [: TEST-DROPBOX:START
+      [: ar EXCHANGED-PASSES-A-TOKEN-DROPBOX-ISSUES
+         ar EXCHANGED-REFUSES-A-TOKEN-DROPBOX-DOES-NOT-ISSUE
+         ar LINKED-REFUSES-AN-UNAVAILABLE-ACCOUNT
+         ar LINKED-REFUSES-A-ROOT-NOT-A-FOLDER
+         ar LINKED-REFUSES-AN-ACCOUNT-OF-ANOTHER-ROOT-TAG ;]
+      [: TEST-DROPBOX:STOP ;] finally ;] DROPBOX:WITH-LOOPS ;
+
+\ BIND's three arms, after AUTH:BIND as setup calls it, then the
+\ login's steps against the fake.
+: LOGIN-CASES ( ^ARENA:arena -- )
+   {: ar :}
+   AUTH:BIND
+   ar BIND-STORES-THE-TOKEN-AND-BINDS-AN-UNBOUND-JOURNAL
+   ar BIND-STORES-THE-TOKEN-FOR-A-JOURNAL-BOUND-TO-THE-LOGIN
+   ar BIND-REFUSES-A-JOURNAL-BOUND-ELSEWHERE
+   ar SERVED ;
+
+
 \ ---- the built program
 
 : BUILD-ARGS ( str -- )
@@ -1600,6 +1824,7 @@ variable CHANGES
    ar A-FAILED-CHANGE-AND-RESTORE-RENDER-BOTH
    ar SETUP-RELEASES-THE-LOCK-BEFORE-STARTING-A-FAILED-SERVICE
    ar AN-UNEXPECTED-CODE-IS-LOGGED
+   ar LOGIN-CASES
    ar PROGRAM ;
 
 : RUN-SUITE ( -- )
