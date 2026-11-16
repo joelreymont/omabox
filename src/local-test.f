@@ -7,7 +7,8 @@
 \ the bytes; its scan tests, the reason each failure one entry raises
 \ publishes and the lines LOCAL logs for it among them, but those the
 \ comment on CASES names, each journal test keeping the half without the
-\ journal, in the part LOCAL SCAN-TEST, which sees LOCAL's private types;
+\ journal but four that publish to a journal in their case's directory,
+\ in the part LOCAL SCAN-TEST, which sees LOCAL's private types;
 \ that upload stage collection removes only verified unreferenced
 \ content; then each stage outcome, each inspected download stage, a
 \ stage marker set, read and removed, a second mark failing with one
@@ -55,6 +56,8 @@ require src/lib/adt/option.f
 require src/dropbox.f
 require src/model.f
 require src/config.f
+require src/journal.f
+require src/test-journal.f
 require src/local.f
 
 \ LOCAL reopened for the stream a fragmenting reader feeds, its stage
@@ -1117,6 +1120,114 @@ variable RAISED-ERRNO
    [: s" subject.txt" UNSAFE ;] 1 ENTRY-RAISES {: bad:n :}
    [: bad WALK-KIND drop ;] E-UNSAFE-PATH TTHROWSQ ;
 
+\ ---- publication
+
+: STAND-IN$ ( -- ^u8 n ) s" /sys/class/mem" ;
+
+\ Runs the action on a journal opened in the case's root, then closes it.
+: WITH-JOURNAL ( [ JOURNAL:journal -- ] -- )
+   {: q :}
+   s" journal.sqlite3" AT AR @ KEEP JOURNAL:OPEN {: j :}
+   [: j q execute ;] [: j JOURNAL:CLOSE ;] finally ;
+
+\ Activates the directory at the name below the case's root.
+: ACTIVATE ( JOURNAL:journal ^u8 n -- )
+   {: j p:^ u:n :}
+   p u AT AR @ KEEP JOURNAL:INSPECT {: b :}
+   j b AR @ JOURNAL:ACTIVATE-LOCAL-ROOT drop ;
+
+: NO-SUBVOLUME ( -- option<n> ) OPTION:NONE ;
+
+\ The root /sys/class/mem stands in for.
+: STAND-IN-ROOT ( -- JOURNAL:local-root-binding )
+   STAND-IN$ >str 1
+   1700000000 5 JOURNAL-BIRTH--TIME:MAKE OPTION:SOME NO-SUBVOLUME
+   JOURNAL-LOCAL--ROOT--BINDING:MAKE ;
+
+: ROOT-CHANGED? ( scan-publication -- bool )
+   MATCH scan-publication
+      published OF drop false ENDOF
+      root-changed OF true ENDOF
+   ;MATCH ;
+
+: NO-ROOT? ( option<fd> -- bool )
+   MATCH option
+      none OF true ENDOF
+      some OF DISCARD false ENDOF
+   ;MATCH ;
+
+: REFUSED-STAND-IN ( -- )
+   [: STAND-IN$ >str JOURNAL:INSPECT drop ;]
+   JOURNAL:E-NO-BIRTH-TIME TTHROWSQ ;
+
+\ Nothing logged: JOURNAL decides the stand-in before it refuses.
+: STAND-IN-PUBLISHES-NOTHING ( JOURNAL:journal -- )
+   {: j :}
+   j STAND-IN-ROOT AR @ JOURNAL:ACTIVATE-LOCAL-ROOT drop
+   j AR @ JOURNAL:LOCAL-INVENTORY {: before :}
+   [: j STAND-IN$ AR @ SCAN-AND-PUBLISH ROOT-CHANGED? TTRUE
+      j STAND-IN$ OPEN-ACTIVE-ROOT NO-ROOT? TTRUE ;] STDERR-OF
+   nip 0 T=
+   j AR @ JOURNAL:LOCAL-INVENTORY before JOURNAL:LOCAL-RECORDS= TTRUE ;
+
+: SCAN-OF-A-STAND-IN-PUBLISHES-NOTHING ( -- )
+   s" scan_of_a_stand_in_publishes_nothing" T-LABEL
+   [: REFUSED-STAND-IN ;] STDERR-OF
+   s" does not record creation times" CONTAINS? TTRUE
+   [: STAND-IN-PUBLISHES-NOTHING ;] WITH-JOURNAL ;
+
+\ Rust's scan_and_publish_at with all_cache_entries_stable completing.
+: PUBLISH-STABLE ( JOURNAL:journal ^u8 n option<cutoff> -- )
+   {: j p:^ u:n cut:option<cutoff> :}
+   j p u AT AR @ KEEP str> cut [: STABLE ;] AR @ SCAN-AND-PUBLISH-AT
+   ROOT-CHANGED? TFALSE ;
+
+: REPUBLISHES-NOTHING ( JOURNAL:journal -- )
+   {: j :}
+   j s" root" ACTIVATE
+   j s" root" NO-CUTOFF PUBLISH-STABLE
+   j JOURNAL:TOTAL-CHANGES {: before :}
+   j s" root" NO-CUTOFF PUBLISH-STABLE
+   j JOURNAL:TOTAL-CHANGES before T= ;
+
+: UNCHANGED-TREE-BESIDE-A-SAME-NAMED-DIRECTORY-REPUBLISHES-NOTHING
+   ( -- )
+   s" unchanged_tree_beside_a_same_named_directory_republishes_nothing"
+   T-LABEL
+   s" root" MKDIR s" root/x" MKDIR
+   s" root/x.txt" s" beside the directory" WRITE
+   s" root/x/y.txt" s" under the directory" WRITE
+   [: REPUBLISHES-NOTHING ;] WITH-JOURNAL ;
+
+: CACHE-COUNT ( JOURNAL:journal -- n )
+   AR @ JOURNAL:LOCAL-HASH-CACHE VEC:COUNT ;
+
+: CLEARS-THE-HASH-CACHE ( JOURNAL:journal -- )
+   {: j :}
+   j s" first" ACTIVATE
+   j s" first" STABLE PUBLISH-STABLE
+   j CACHE-COUNT 1 T=
+   j s" second" ACTIVATE
+   j AR @ JOURNAL:LOCAL-INVENTORY VEC:COUNT 0 T=
+   j CACHE-COUNT 0 T= ;
+
+: SWITCHING-LOCAL-ROOT-CLEARS-THE-HASH-CACHE ( -- )
+   s" switching_local_root_clears_the_hash_cache" T-LABEL
+   s" first" MKDIR s" second" MKDIR
+   s" first/cached.txt" s" cached" WRITE
+   [: CLEARS-THE-HASH-CACHE ;] WITH-JOURNAL ;
+
+: OPENS-ONLY-THE-ACTIVE-ROOT ( JOURNAL:journal -- )
+   {: j :}
+   j s" first" ACTIVATE
+   j s" second" AT OPEN-ACTIVE-ROOT NO-ROOT? TTRUE
+   j s" first" AT OPEN-ACTIVE-ROOT NO-ROOT? TFALSE ;
+
+: ONLY-THE-ACTIVE-ROOT-OPENS ( -- )
+   s" only the active root opens" T-LABEL
+   s" first" MKDIR s" second" MKDIR
+   [: OPENS-ONLY-THE-ACTIVE-ROOT ;] WITH-JOURNAL ;
+
 : CASES ( -- )
    [: SCAN-PUBLISHES-EMPTY-AND-NESTED-DIRECTORIES ;] IN-CASE
    [: FILES-REMOVED-DURING-HASHING-PUBLISH-AN-INCOMPLETE-DIRECTORY ;]
@@ -1145,6 +1256,11 @@ variable RAISED-ERRNO
    [: A-DIRECTORY-REPLACED-BY-A-SYMLINK-IS-INCOMPLETE ;] IN-CASE
    [: A-DISCARDED-SUBTREE-KEEPS-ITS-VALIDATED-HASHES ;] IN-CASE
    [: HASHES-THE-WALK-RETAINED-REACH-THE-PUBLICATION ;] IN-CASE
+   [: SCAN-OF-A-STAND-IN-PUBLISHES-NOTHING ;] IN-CASE
+   [: UNCHANGED-TREE-BESIDE-A-SAME-NAMED-DIRECTORY-REPUBLISHES-NOTHING ;]
+   IN-CASE
+   [: SWITCHING-LOCAL-ROOT-CLEARS-THE-HASH-CACHE ;] IN-CASE
+   [: ONLY-THE-ACTIVE-ROOT-OPENS ;] IN-CASE
    TRUNCATING-A-FAILED-ENTRY-KEEPS-ITS-VALIDATED-HASHES
    [: ONLY-EXHAUSTION-ESCAPES-A-FAILURE-RAISED-AGAINST-ONE-ENTRY ;]
    IN-CASE ;
@@ -3069,10 +3185,7 @@ FS:PATHZ-CAP BUFFER: SLOT-FILE-BUF
 
 \ Dropped: parallel_cold_scan_matches_single_worker_scan compares hash
 \ workers and download_promotion_cannot_invalidate_complete_scan holds the
-\ scan lock; one task has neither. These need words LOCAL lacks:
-\ scan_of_a_stand_in_publishes_nothing,
-\ unchanged_tree_beside_a_same_named_directory_republishes_nothing and
-\ switching_local_root_clears_the_hash_cache (JOURNAL).
+\ scan lock; one task has neither.
 : CASES ( -- )
    ENTRY-EXISTENCE-NEVER-FOLLOWS-SYMLINKS-AND-TREATS-PROBE-FAILURES-AS-UNCONFIRMED
    DROPBOX-HASH-USES-BLOCK-HASH-COMPOSITION

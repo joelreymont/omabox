@@ -596,7 +596,7 @@ private
 
 \ IDENTITY of the directory at the canonical path, opened without
 \ following a link.
-: IDENTITY-AT ( str -- n birth-time bool n bool )
+: PATH-IDENTITY ( str -- n birth-time bool n bool )
    {: path:str :}
    path OPENED {: dir:fd :}
    [: path dir IDENTITY ;] [: dir FS:CLOSE-DIR ;] finally ;
@@ -628,7 +628,7 @@ public
 \ following a link; any failure but a birth time's is E-FILE.
 : INSPECT ( str -- local-root-binding )
    {: path:str :}
-   path path IDENTITY-AT FROM-STATX-FIELDS ;
+   path path PATH-IDENTITY FROM-STATX-FIELDS ;
 
 private
 
@@ -779,14 +779,29 @@ private
 
 public
 
-\ INSPECT's identity of the directory at path, or none where its
+\ FROM-STATX's identity of the descriptor's directory, or none where its
 \ filesystem reports no birth time and it stands in for the root.
+: INSPECT-ROOT-AT
+   ( str fd journal ^ARENA:arena -- option<local-root-binding> )
+   {: path:str dir:fd j ar :}
+   path dir IDENTITY {: inode birth born:bool sub has:bool :}
+   born 0= if j ar path inode UNBORN exit then
+   path inode birth sub has BORN-BINDING OPTION:SOME ;
+
+\ INSPECT-ROOT-AT of the directory at path.
 : INSPECT-ROOT
    ( str journal ^ARENA:arena -- option<local-root-binding> )
    {: path:str j ar :}
-   path IDENTITY-AT {: inode birth born:bool sub has:bool :}
-   born 0= if j ar path inode UNBORN exit then
-   path inode birth sub has BORN-BINDING OPTION:SOME ;
+   path OPENED {: dir:fd :}
+   [: path dir j ar INSPECT-ROOT-AT ;] [: dir FS:CLOSE-DIR ;] finally ;
+
+\ Whether the binding is the active root's.
+: ACTIVE-ROOT? ( local-root-binding journal ^ARENA:arena -- bool )
+   {: b j ar :}
+   j ar LOCAL-ROOT-BINDING MATCH option
+      none OF false ENDOF
+      some OF >BINDING b ROOT= ENDOF
+   ;MATCH ;
 
 private
 

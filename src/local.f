@@ -1,8 +1,9 @@
 \ local.f - package LOCAL: the local half of a sync (docs/habu-rewrite.md,
 \ the LOCAL row) on Habu's anchored file words: its errors, the opens it
 \ confines below the sync root, Dropbox content hashes of local files, the
-\ scan that observes every entry below the root, the upload stages named
-\ by their content's hash, which a Habu and a Rust daemon share, the
+\ scan that observes every entry below the root and its publication while
+\ the configured path names the journal's active root, the upload stages
+\ named by their content's hash, which a Habu and a Rust daemon share, the
 \ verified stages a download writes, with their xattr markers, the slots
 \ in the state home where a download's partial bytes resume, the partials
 \ themselves, checkpointed and promoted into their stages, their installs
@@ -57,6 +58,7 @@ require src/lib/vector.f
 require src/lib/sort.f
 require src/dropbox.f
 require src/model.f
+require src/journal.f
 
 package LOCAL
 public
@@ -1587,6 +1589,18 @@ SUBTREE-INSTALL
    {: root:str rfd:fd before:stat en:scan-entries ar:^ARENA:arena :}
    [: root rfd before en q ar FINISH ;] [: rfd DISCARD ;] finally ;
 
+\ FINISH-SCAN-AT, then the root's binding, read from its descriptor while
+\ that is open: none where JOURNAL finds a stand-in there.
+: FINISH-BOUND-SCAN-AT
+   ( pending-scan [ -- option<cutoff> ] JOURNAL:journal
+     -- complete-scan option<JOURNAL:local-root-binding> )
+   {: ps:pending-scan q j :}
+   ps PENDING-SCAN-UNMAKE
+   {: root:str rfd:fd before:stat en:scan-entries ar:^ARENA:arena :}
+   [: root rfd before en q ar FINISH
+      root rfd j ar JOURNAL:INSPECT-ROOT-AT ;]
+   [: rfd DISCARD ;] finally ;
+
 : FINISH-SCAN ( pending-scan -- complete-scan )
    [: CURRENT-HASH-CACHE-CUTOFF ;] FINISH-SCAN-AT ;
 
@@ -1641,6 +1655,78 @@ SUBTREE-INSTALL
    {: p:^ u:n ar:^ARENA:arena :}
    p u ar [type] MODEL:hash-record NEW-VEC NO-CUTOFF ar
    SCAN-WITH-CACHE-AT ;
+
+\ ---- publishing
+
+: ROOT-CHANGED ( -- scan-publication )
+   LOCAL-SCAN--PUBLICATION:root-changed ;
+
+: ACTIVE-BINDING?
+   ( fd ^u8 n JOURNAL:journal ^ARENA:arena -- bool )
+   {: dir:fd p:^ u:n j ar:^ARENA:arena :}
+   p u >str dir j ar JOURNAL:INSPECT-ROOT-AT MATCH option
+      none OF false ENDOF
+      some OF j ar JOURNAL:ACTIVE-ROOT? ENDOF
+   ;MATCH ;
+
+public
+
+\ The directory at p while it is the journal's active root; none, the
+\ directory closed, where p names another.
+: OPEN-ACTIVE-ROOT ( JOURNAL:journal ^u8 n -- option<fd> )
+   {: j p:^ u:n :}
+   p u s" open sync root for identity verification"
+   OPEN-ABSOLUTE-DIRECTORY {: dir:fd :}
+   false dir
+   [: drop dir p u j [: ACTIVE-BINDING? ;] ARENA:WITH ;] CLOSING
+   if dir OPTION:SOME exit then
+   dir DISCARD OPTION:NONE ;
+
+: CONFIGURED-ROOT-IS-ACTIVE? ( JOURNAL:journal ^u8 n -- bool )
+   OPEN-ACTIVE-ROOT MATCH option
+      none OF false ENDOF
+      some OF DISCARD true ENDOF
+   ;MATCH ;
+
+private
+
+\ Rust's order: the scanned root, then the configured path, must be the
+\ active root, which the publication checks again as it writes.
+: PUBLISH-BOUND
+   ( JOURNAL:local-root-binding complete-scan JOURNAL:journal ^u8 n
+     ^ARENA:arena -- scan-publication )
+   {: b s:complete-scan j p:^ u:n ar:^ARENA:arena :}
+   b j ar JOURNAL:ACTIVE-ROOT? 0= if ROOT-CHANGED exit then
+   j p u CONFIGURED-ROOT-IS-ACTIVE? 0= if ROOT-CHANGED exit then
+   s COMPLETE-SCAN-UNMAKE {: obs hashes :}
+   j b obs hashes JOURNAL:PUBLISH-LOCAL-SCAN
+   0= if ROOT-CHANGED exit then
+   s LOCAL-SCAN--PUBLICATION:published ;
+
+\ cut decides which cached hashes the walk reuses, q which hashes it
+\ computes stay reusable.
+: SCAN-AND-PUBLISH-AT
+   ( JOURNAL:journal ^u8 n option<cutoff> [ -- option<cutoff> ]
+     ^ARENA:arena -- scan-publication )
+   {: j p:^ u:n cut:option<cutoff> q ar:^ARENA:arena :}
+   j ar JOURNAL:LOCAL-HASH-CACHE {: cache :}
+   p u cache cut ar ENUMERATE-SCAN q j FINISH-BOUND-SCAN-AT
+   {: s:complete-scan b :}
+   b MATCH option
+      none OF ROOT-CHANGED ENDOF
+      some OF s j p u ar PUBLISH-BOUND ENDOF
+   ;MATCH ;
+
+public
+
+\ p scanned with the journal's hash cache and published to it, in ar.
+: SCAN-AND-PUBLISH
+   ( JOURNAL:journal ^u8 n ^ARENA:arena -- scan-publication )
+   {: j p:^ u:n ar:^ARENA:arena :}
+   j p u CURRENT-HASH-CACHE-CUTOFF [: CURRENT-HASH-CACHE-CUTOFF ;] ar
+   SCAN-AND-PUBLISH-AT ;
+
+private
 
 \ ---- parents
 

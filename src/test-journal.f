@@ -1,10 +1,14 @@
 \ test-journal.f - JOURNAL's words for tests, never production: the Rust
-\ version's test-only recovery words (rust src/journal.rs, #[cfg(test)]).
+\ version's test-only words (rust src/journal.rs, #[cfg(test)]) and a
+\ private comparison exported.
 \ RECORD-RECOVERY-INTENT commits the recovery intent an older Omabox
 \ version recorded before a destructive operation, answering a
-\ recovery-write, and COMPLETE-RECOVERY completes a recovery record,
-\ answering a recovery-completion. Tests alone load this file; nothing in
-\ the program calls these words.
+\ recovery-write, COMPLETE-RECOVERY completes a recovery record,
+\ answering a recovery-completion, TOTAL-CHANGES answers the rows the
+\ journal's connection has changed since it opened, and LOCAL-RECORDS=
+\ answers whether two local inventories hold equal records in the same
+\ order. Tests alone load this file; nothing in the program calls these
+\ words.
 \ STORAGE CLASS. CALLER-OWNED, as JOURNAL's: a record answered lies in the
 \ arena the caller passes.
 
@@ -32,6 +36,11 @@ ENUM recovery-write
 ;ENUM
 
 ENUM recovery-completion not-found already-completed completed ;ENUM
+
+: TOTAL-CHANGES ( journal -- n )
+   >CONNECTION s" SELECT total_changes()" QUERY-INT ;
+
+EXPORT LOCAL-RECORDS=
 
 private
 

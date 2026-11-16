@@ -288,9 +288,6 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
 
 \ ---- the journal's rows ------------------------------------------
 
-: CHANGED ( journal -- n )
-   >CONNECTION s" SELECT total_changes()" QUERY-INT ;
-
 : SCHEMA-SQL ( -- ^u8 n )
    s" SELECT type || char(9) || name || char(9) || tbl_name || char(9)
          || coalesce(replace(replace(replace(sql, '\', '\\'),
@@ -1096,18 +1093,18 @@ variable SCANNED       \ query plan rows that scan the table
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
    j s" cursor-old" CURSOR ar BULK PUBLISH-REMOTE-INVENTORY
-   j CHANGED {: before-empty :}
+   j TOTAL-CHANGES {: before-empty :}
    j s" cursor-empty" CURSOR ar DELTA APPLY-REMOTE-INVENTORY-DELTA
-   j CHANGED before-empty - 1 T=
+   j TOTAL-CHANGES before-empty - 1 T=
    5000 ar NEW-FILE BULK-RECORD {: changed :}
    5000 ar BULK-PATH ar MODEL:FOLD {: key:MODEL:key :}
    ar DELTA {: changes :}
    ar BULK-DIRECTORY UPSERT changes CHANGE+
    key DELETE-SUBTREE changes CHANGE+
    changed UPSERT changes CHANGE+
-   j CHANGED {: before-change :}
+   j TOTAL-CHANGES {: before-change :}
    j s" cursor-new" CURSOR changes APPLY-REMOTE-INVENTORY-DELTA
-   j CHANGED before-change - 3 T=
+   j TOTAL-CHANGES before-change - 3 T=
    j ar REMOTE-INVENTORY JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur v :}
    cur s" cursor-new" CURSOR-IS? TTRUE
    v VEC:COUNT 10000 T=
@@ -1225,9 +1222,9 @@ variable SCANNED       \ query plan rows that scan the table
    s" old.txt" s" old" PRESENT-LOCAL LOCAL-RECORD {: old :}
    s" old.txt" 10 ar LOCAL-HASH {: old-hash :}
    j b old ar ONE-LOCAL old-hash ar ONE-HASH PUBLISH-LOCAL-SCAN TTRUE
-   j CHANGED {: unchanged :}
+   j TOTAL-CHANGES {: unchanged :}
    j b old ar ONE-LOCAL old-hash ar ONE-HASH PUBLISH-LOCAL-SCAN TTRUE
-   j CHANGED unchanged T=
+   j TOTAL-CHANGES unchanged T=
    s" new.txt" s" new" PRESENT-LOCAL LOCAL-RECORD ar ONE-LOCAL
    {: replacement :}
    ar HASHES {: dups :}
@@ -1238,10 +1235,10 @@ variable SCANNED       \ query plan rows that scan the table
    [: PUBLISH-HELD-SCAN ;] SQLITE:E-SQL d s" UNIQUE constraint failed"
    ar LOGGED
    j old old-hash ar SCAN-HELD
-   j CHANGED {: stale :}
+   j TOTAL-CHANGES {: stale :}
    j s" /stale" 4 LOCAL-ROOT replacement
    s" new.txt" 20 ar LOCAL-HASH ar ONE-HASH PUBLISH-LOCAL-SCAN TFALSE
-   j CHANGED stale T=
+   j TOTAL-CHANGES stale T=
    j old old-hash ar SCAN-HELD
    j CLOSE
    d GONE ;
@@ -1683,9 +1680,9 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    j path noop ar RECORD-NOOP NOOP-RECORDED? TTRUE
    j path ar BASELINE observed MODEL-BASELINE:present BASELINE-HELD?
    TTRUE
-   j CHANGED {: unchanged :}
+   j TOTAL-CHANGES {: unchanged :}
    j path noop ar RECORD-NOOP NOOP-RECORDED? TTRUE
-   j CHANGED unchanged T=
+   j TOTAL-CHANGES unchanged T=
    s" new" UPLOAD-DECISION ar OPERATIONS {: upload :}
    j path upload ar RECORD-PLAN RECORDED-PLAN {: pending :}
    ABSENT-DECISION NOOP {: absent :}
@@ -2311,9 +2308,9 @@ variable CRAFT
    j s" conflict.txt" DISPLAY CONFLICTED ar RECORD-CONFLICT {: conflict :}
    s" /sync/root" 2 LOCAL-ROOT {: inspected :}
    inspected 3 JOURNAL-LOCAL--ROOT--RECORD:MAKE {: upgraded :}
-   j CHANGED {: before :}
+   j TOTAL-CHANGES {: before :}
    j inspected ar ACTIVATE-LOCAL-ROOT upgraded CURRENT? TTRUE
-   j CHANGED before - 1 T=
+   j TOTAL-CHANGES before - 1 T=
    j hash conflict ar SIX-KEPT
    j ar LOCAL-ROOT-BINDING upgraded RECORD-HELD? TTRUE
    j inspected ar ACTIVATE-LOCAL-ROOT upgraded CURRENT? TTRUE
@@ -2329,14 +2326,14 @@ variable CRAFT
    p ar LEGACY
    p OPEN {: j :}
    j ar BASELINE-PATHS {: paths :}
-   j CHANGED {: before :}
+   j TOTAL-CHANGES {: before :}
    s" /sync/root" 9 LOCAL-ROOT {: actual :}
    j actual ar ACTIVATE-LOCAL-ROOT LEGACY-ROOT >BINDING actual UNAVAILABLE?
    TTRUE
    j ar LOCAL-ROOT-BINDING LEGACY-ROOT RECORD-HELD? TTRUE
    j ar BASELINE-PATHS paths PATHS= TTRUE
    j KEPT-PATH ar BASELINE KEPT BASELINE-HELD? TTRUE
-   j CHANGED before T=
+   j TOTAL-CHANGES before T=
    j CLOSE
    d GONE ;
 
@@ -2821,9 +2818,9 @@ variable CRAFT
 : UNAVAILABLE-UNCHANGED
    ( journal local-root-binding local-root-binding ^ARENA:arena -- )
    {: j recorded actual ar :}
-   j CHANGED {: before :}
+   j TOTAL-CHANGES {: before :}
    j actual ar ACTIVATE-LOCAL-ROOT recorded actual UNAVAILABLE? TTRUE
-   j CHANGED before T= ;
+   j TOTAL-CHANGES before T= ;
 
 : SAME-PATH-AND-INODE-WITH-ANOTHER-BIRTH-OR-SUBVOLUME-IS-UNAVAILABLE-WITHOUT-CHANGES
    ( ^ARENA:arena -- )
