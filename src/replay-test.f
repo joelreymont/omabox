@@ -41,8 +41,10 @@
 \   directory at the target retires it, logging nothing.
 \ Against the fake Dropbox of test-dropbox.f, root empty:
 \ - REMOTE-DELETE-FOLDER of an empty folder deletes it; of an occupied
-\   one, or one the listing answers not_found or reset, deletes nothing;
-\   a file the delete finds in the folder's place is logged once.
+\   one, or one the listing answers not_found, deletes nothing; Rust's
+\   folder_delete_probe_outcomes_are_classified_per_path, whose 503
+\   throws E-DROPBOX with a retry and whose stalled cursor throws
+\   DROPBOX's E-ANSWER, logged once.
 \ - REMOTE-UPLOAD of a new file sends its progress, then a finished
 \   transfer to a STATUS in TMPDIR; one Dropbox refuses as a conflict
 \   with other bytes at the path is read back as changed, and its
@@ -57,10 +59,13 @@
 \   corrupt_exact_download_never_leaves_installable_bytes; a download
 \   lost mid-body throws E-DROPBOX with a retry, keeps its slot and
 \   leaks no descriptor, and the next stages it; a slot holding a
-\   checkpoint: a 416 at its length finishes the stage, a lost answer
-\   keeps it, sent with its Range, and another 416 restarts it, or the
-\   next download resumes it from its Range to the remote's content; a
-\   download's progress, then finished, in a status under TMPDIR.
+\   checkpoint: a 416 at its length finishes the stage; Rust's
+\   unsatisfiable_resume_restarts_only_the_owned_partial, from a lost
+\   answer sent with its Range, and
+\   interrupted_exact_download_resumes_only_from_a_valid_range, whose
+\   late Content-Range or other rev is refused unverified, logged once,
+\   the slot at its checkpoint; a download's progress, then finished,
+\   in a status under TMPDIR.
 \ - MATERIALIZE-REMOTE-CONFLICT downloads the copy once, then is ready
 \   with no request; a directory or other bytes at the copy's name
 \   block it conflict-copy-occupied, logging nothing; other bytes at
@@ -994,6 +999,14 @@ ARENA LINKS REPLAY:link
       unlinked OF false ENDOF
    ;MATCH ;
 
+: RETRY? ( DROPBOX:reply -- bool )
+   MATCH DROPBOX:reply
+      done OF false ENDOF
+      refused OF drop false ENDOF
+      retry OF drop true ENDOF
+      unlinked OF false ENDOF
+   ;MATCH ;
+
 \ The refusal stops the pass, kept whole in the link.
 : STOPS ( DROPBOX:error ^REPLAY:link -- )
    {: e l :}
@@ -1111,15 +1124,6 @@ ARENA LINKS REPLAY:link
    l ar DELETE-F s" applied" s" absent" GIVES
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$= ;
 
-: A-RESET-PROBE-LEAVES-THE-DELETE-PENDING ( ^REPLAY:link ^ARENA:arena -- )
-   {: l ar :}
-   s" a reset probe leaves the delete pending" T-LABEL
-   TEST-DROPBOX:RESET
-   true OWN-PAGE TEST-DROPBOX:PAGE-RESET!
-   l ar DELETE-F s" pending" s" " GIVES
-   TEST-DROPBOX:SEEN$
-   s" /2/files/list_folder /2/files/list_folder/continue" T$= ;
-
 4096 constant LOG-CAP
 LOG-CAP BUFFER: LOG-TEXT
 
@@ -1135,20 +1139,82 @@ LOG-CAP BUFFER: LOG-TEXT
 
 : LINE-COUNT ( ^u8 n -- n ) 10 COUNT-CHAR ;
 
-: A-FILE-THE-FOLDER-DELETE-FINDS-IS-LOGGED
-   ( ^REPLAY:link ^ARENA:arena -- )
+\ A probe Dropbox fails 503 ends the pass; Rust reads the path back.
+: PROBE-UNREACHED ( ^REPLAY:link ^ARENA:arena -- )
    {: l ar :}
-   s" a file the folder delete finds is logged" T-LABEL
-   TEST-DROPBOX:RESET
+   503 s" " s" " s" {}" TEST-DROPBOX:SCRIPT!
+   [: l ar DELETE-F drop ;] REPLAY:E-DROPBOX TTHROWSQ
+   l REPLAY-LINK:REPLY @ RETRY? TTRUE ;
+
+: PROBE-RESTRICTED ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   409 s" " s" "
+   S\" {\qerror_summary\q:\qpath/restricted_content/\q,\qerror\q:{\q.tag\q:\qpath\q,\qpath\q:{\q.tag\q:\qrestricted_content\q}}}"
+   TEST-DROPBOX:SCRIPT!
+   l ar DELETE-F s" rejected" s" rejected-by-dropbox" GIVES ;
+
+: PROBE-RESET ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   true OWN-PAGE TEST-DROPBOX:PAGE-RESET!
+   l ar DELETE-F s" pending" s" " GIVES ;
+
+\ A cursor that does not advance throws DROPBOX's E-ANSWER, logged
+\ once; Rust leaves the delete pending.
+: PROBE-STALLED ( str ^REPLAY:link ^ARENA:arena -- )
+   {: d:str l ar :}
+   s" []" s" c1" true TEST-DROPBOX:PAGE!
+   s" []" s" c1" true TEST-DROPBOX:PAGE!
+   d [: [: l ar DELETE-F drop ;] DROPBOX:E-ANSWER TTHROWSQ ;] ar LOGGED
+   {: t:^ tu:n :}
+   t tu LINE-COUNT 1 T=
+   t tu s" a cursor that did not advance" CONTAINS? TTRUE ;
+
+: PROBE-LATER-ENTRY ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   s" []" s" c1" true TEST-DROPBOX:PAGE!
+   S\" [{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/f/inner\q,\qpath_display\q:\q/f/inner\q}]"
+   s" c2" false TEST-DROPBOX:PAGE!
+   l ar DELETE-F s" precondition-changed" s" folder" GIVES ;
+
+: PROBE-OWN-ENTRY ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   false OWN-PAGE
+   l ar DELETE-F s" applied" s" absent" GIVES ;
+
+\ A file the delete finds in the folder's place is logged once.
+: PROBE-RACED ( str ^REPLAY:link ^ARENA:arena -- )
+   {: d:str l ar :}
    s" /f" s" /f" s" 015f" s" abc" 3 TEST-DROPBOX:FILE!
    false OWN-PAGE
-   s" replay-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
    d [: l ar DELETE-F s" applied" s" absent" GIVES ;] ar LOGGED
    {: t:^ tu:n :}
    t tu LINE-COUNT 1 T=
    t tu s" Dropbox deleted a file that replaced the empty folder"
    CONTAINS? TTRUE
-   t tu s" path=f revision=015f" CONTAINS? TTRUE
+   t tu s" path=f revision=015f" CONTAINS? TTRUE ;
+
+: ROUTE+ ( ^u8 n -- ) s"  /2/files/" SB-APPEND SB-APPEND ;
+
+\ What the seven probes sent after the folder's create.
+: PROBES$ ( -- ^u8 n )
+   SB-RESET s" /2/files/create_folder_v2" SB-APPEND
+   s" list_folder" ROUTE+ s" list_folder" ROUTE+
+   3 0 ?do s" list_folder" ROUTE+ s" list_folder/continue" ROUTE+ loop
+   2 0 ?do s" list_folder" ROUTE+ s" delete_v2" ROUTE+ loop
+   SB$ ;
+
+: FOLDER-DELETE-PROBE-OUTCOMES-ARE-CLASSIFIED-PER-PATH
+   ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   s" folder_delete_probe_outcomes_are_classified_per_path" T-LABEL
+   TEST-DROPBOX:RESET
+   s" replay-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
+   l s" f" DISPLAY ar REPLAY:REMOTE-CREATE-FOLDER
+   s" applied" s" folder" GIVES
+   l ar PROBE-UNREACHED l ar PROBE-RESTRICTED l ar PROBE-RESET
+   d l ar PROBE-STALLED l ar PROBE-LATER-ENTRY l ar PROBE-OWN-ENTRY
+   d l ar PROBE-RACED
+   TEST-DROPBOX:SEEN$ PROBES$ T$=
    d GONE ;
 
 : RUNTIME-STATUS ( ^ARENA:arena -- str ^STATUS:status )
@@ -1290,8 +1356,7 @@ LOG-CAP BUFFER: LOG-TEXT
    l ar AN-EMPTY-FOLDER-IS-DELETED
    l ar AN-OCCUPIED-FOLDER-IS-KEPT
    l ar A-MISSING-FOLDER-IS-ALREADY-DELETED
-   l ar A-RESET-PROBE-LEAVES-THE-DELETE-PENDING
-   l ar A-FILE-THE-FOLDER-DELETE-FINDS-IS-LOGGED
+   l ar FOLDER-DELETE-PROBE-OUTCOMES-ARE-CLASSIFIED-PER-PATH
    l ar AN-UPLOAD-SENDS-ITS-TRANSFER
    l ar A-REFUSED-UPLOAD-FINISHES-ITS-TRANSFER
    l ar A-READ-BACK-INCOMPLETE-FILE-IS-REJECTED
@@ -1931,14 +1996,6 @@ XS-SIZE BUFFER: XS
       unlinked OF false ENDOF
    ;MATCH ;
 
-: RETRY? ( DROPBOX:reply -- bool )
-   MATCH DROPBOX:reply
-      done OF false ENDOF
-      refused OF drop false ENDOF
-      retry OF drop true ENDOF
-      unlinked OF false ENDOF
-   ;MATCH ;
-
 \ The stage of p's remote throws E-DROPBOX, its reply a retry.
 : STOPPED
    ( fd str ^u8 n MODEL:remote option<LOCAL:download-slot-lease>
@@ -2229,9 +2286,21 @@ variable HELD
    SB-RESET s" bytes=" SB-APPEND CHECKPOINT FMT:SB-INT s" -" SB-APPEND
    SB$ TEST-DROPBOX:RANGE-SENT$ T$= ;
 
-: ANOTHER-416-RESTARTS-THE-SLOT ( ^ARENA:arena -- )
+\ The last download asked for rev v.
+: ASKED-REV ( ^u8 n -- )
+   {: v:^ vu:n :}
+   SB-RESET S\" {\qpath\q:\qrev:" SB-APPEND v vu SB-APPEND
+   S\" \q}" SB-APPEND SB$ TEST-DROPBOX:ARG-SENT$ T$= ;
+
+\ The root r's one file holds the content c.
+: STAGE-HOLDS ( str DROPBOX:hash ^ARENA:arena -- )
+   {: r:str c:DROPBOX:hash ar :}
+   r ar STAGE-HASH DROPBOX:HASH>STR str> c DROPBOX:HASH>STR str> T$= ;
+
+: UNSATISFIABLE-RESUME-RESTARTS-ONLY-THE-OWNED-PARTIAL
+   ( ^ARENA:arena -- )
    {: ar :}
-   s" a lost answer keeps the partial; another 416 restarts it" T-LABEL
+   s" unsatisfiable_resume_restarts_only_the_owned_partial" T-LABEL
    TEST-DROPBOX:RESET
    ALPHABET ar HASH-OF {: c:DROPBOX:hash :}
    s" /restart.bin" s" restart-revision" ALPHABET c SERVES
@@ -2246,15 +2315,45 @@ variable HELD
    slot str> HOLDERS 0 T=
    slot str> FS:FILE-SIZE CHECKPOINT T=
    RESUMED-RANGE
+   s" restart-revision" ASKED-REV
    root r s" restart.bin" rem l ar STAGED-AT s" staged" AS
    TEST-DROPBOX:RANGE-SENT? TFALSE
+   s" restart-revision" ASKED-REV
+   r c ar STAGE-HOLDS
    3 SEEN
    root FS:CLOSE-DIR
    d GONE ;
 
-: A-LOST-ANSWER-RESUMES-FROM-THE-CHECKPOINT ( ^ARENA:arena -- )
+\ The next resume of resume.bin is refused unverified, logged once;
+\ the slot keeps its checkpoint and the target stays absent.
+: REFUSED-RESUME
+   ( fd str str MODEL:remote option<LOCAL:download-slot-lease>
+     ^ARENA:arena -- )
+   {: root:fd d:str r:str rem:MODEL:remote
+      l:option<LOCAL:download-slot-lease> ar :}
+   d [: [: root r s" resume.bin" rem l ar STAGED-AT DROP-STAGE ;]
+      REPLAY:E-DROPBOX TTHROWSQ ;] ar LOGGED LINE-COUNT 1 T=
+   LINK REPLAY-LINK:REPLY @ DROPBOX-ERROR:UNVERIFIED REFUSAL? TTRUE
+   d ar SLOT-PATH str> FS:FILE-SIZE CHECKPOINT T=
+   r s" resume.bin" ar INSIDE str> FS:TRY-STAT TFALSE
+   RESUMED-RANGE s" resume-revision" ASKED-REV ;
+
+\ Resumes whose answer does not verify: a Content-Range a byte late
+\ and another rev's file.
+: BAD-RESUMES
+   ( fd str str MODEL:remote option<LOCAL:download-slot-lease>
+     DROPBOX:hash ^ARENA:arena -- )
+   {: root:fd d:str r:str rem:MODEL:remote
+      l:option<LOCAL:download-slot-lease> c:DROPBOX:hash ar :}
+   TEST-DROPBOX:SKEW root d r rem l ar REFUSED-RESUME
+   s" /resume.bin" s" different-revision" ALPHABET c SERVES-PAST
+   s" different-revision" TEST-DROPBOX:MISFILE
+   root d r rem l ar REFUSED-RESUME ;
+
+: INTERRUPTED-EXACT-DOWNLOAD-RESUMES-ONLY-FROM-A-VALID-RANGE
+   ( ^ARENA:arena -- )
    {: ar :}
-   s" a lost answer keeps the partial; the next resumes it" T-LABEL
+   s" interrupted_exact_download_resumes_only_from_a_valid_range" T-LABEL
    TEST-DROPBOX:RESET
    ar RESUMED-HASH {: c:DROPBOX:hash :}
    s" /resume.bin" s" resume-revision" ALPHABET c SERVES-PAST
@@ -2267,10 +2366,12 @@ variable HELD
    TEST-DROPBOX:LOSE
    root r s" resume.bin" rem l ar STOPPED
    slot str> FS:FILE-SIZE CHECKPOINT T=
+   s" resume-revision" ASKED-REV
+   root d r rem l c ar BAD-RESUMES
    root r s" resume.bin" rem l ar STAGED-AT s" staged" AS
-   RESUMED-RANGE
-   r ar STAGE-HASH DROPBOX:HASH>STR str> c DROPBOX:HASH>STR str> T$=
-   2 SEEN
+   RESUMED-RANGE s" resume-revision" ASKED-REV
+   r c ar STAGE-HOLDS
+   4 SEEN
    root FS:CLOSE-DIR
    d GONE ;
 
@@ -3298,8 +3399,8 @@ variable SIDES
    ar CORRUPT-EXACT-DOWNLOAD-NEVER-LEAVES-INSTALLABLE-BYTES
    ar A-DOWNLOAD-LOST-MID-BODY-KEEPS-ITS-PARTIAL
    ar A-COMPLETE-416-FINISHES-THE-STAGE
-   ar ANOTHER-416-RESTARTS-THE-SLOT
-   ar A-LOST-ANSWER-RESUMES-FROM-THE-CHECKPOINT
+   ar UNSATISFIABLE-RESUME-RESTARTS-ONLY-THE-OWNED-PARTIAL
+   ar INTERRUPTED-EXACT-DOWNLOAD-RESUMES-ONLY-FROM-A-VALID-RANGE
    ar A-DOWNLOAD-REPORTS-ITS-TRANSFER
    ar A-REMOTE-CONFLICT-COPY-DOWNLOADS-ONCE
    ar AN-OCCUPIED-REMOTE-COPY-NAME-BLOCKS-IT
