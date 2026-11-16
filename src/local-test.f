@@ -33,8 +33,11 @@
 \ delete's replay keeps a raced edit, each delete outcome, a delete of an
 \ uppercase hash failing, each arm of a changed guard's restore, each
 \ directory and conflict outcome, a recovery copy's name the Rust
-\ daemon's and each verification of one. A case that makes files works
-\ in its own directory under TMPDIR and removes it.
+\ daemon's and each verification of one; then local.rs's tests that a
+\ case-variant rename keeps the tree, retries a race and keeps a swapped
+\ source, and that a parent's name limit is none when it is missing. A
+\ case that makes files works in its own directory under TMPDIR and
+\ removes it.
 \ Run from the repository root: hb --load src/local-test.f </dev/null
 require src/lib/test.f
 require src/lib/test/stderr.f
@@ -326,6 +329,7 @@ EXPORT INSPECTED$
 EXPORT WRITE-STAGE-OUTCOME
 EXPORT RESTORE-OR-PRESERVE-CHANGED-GUARD
 EXPORT CONFLICT-NAME
+EXPORT RENAME-CASE-VARIANT-WITH
 ;package
 
 \ LOCAL reopened for its scan's cases, which name its private types.
@@ -2985,11 +2989,87 @@ FS:PATHZ-CAP BUFFER: SLOT-FILE-BUF
    s" slots_lease_through_a_symlinked_state_home" T-LABEL
    [: drop LINKED-STATE ;] IN-CASE-DIR ;
 
+\ ---- renames
+
+: RENAMED$ ( LOCAL:rename-outcome -- ^u8 n )
+   MATCH LOCAL:rename-outcome
+      renamed OF s" renamed" ENDOF
+      retry OF s" retry" ENDOF
+   ;MATCH ;
+
+: CREDIT ( -- ^u8 n ) s" credit" ;
+: DESTINATION ( -- ^u8 n ) s" credit (case variant)" ;
+: PRESERVED ( -- ^u8 n ) s" preserved-by-racer" ;
+
+: RENAME-VARIANT ( fd -- ^u8 n )
+   CREDIT DESTINATION LOCAL:RENAME-CASE-VARIANT RENAMED$ ;
+
+: RACED-RENAME ( fd -- )
+   {: root:fd :}
+   CREDIT AT FS:MAKE-DIR
+   s" credit/receipt.pdf" s" receipt" PUT-FILE
+   DESTINATION s" raced destination" PUT-FILE
+   root RENAME-VARIANT s" retry" T$=
+   DESTINATION BYTES s" raced destination" T$=
+   s" credit/receipt.pdf" BYTES s" receipt" T$= ;
+
+: RETRIED-RENAME ( fd -- )
+   {: root:fd :}
+   DESTINATION AT FS:REMOVE-FILE
+   root RENAME-VARIANT s" renamed" T$=
+   CREDIT PRESENT? TFALSE
+   s" credit (case variant)/receipt.pdf" BYTES s" receipt" T$=
+   root RENAME-VARIANT s" retry" T$= ;
+
+: RENAME-RACES ( fd -- )
+   {: root:fd :}
+   root RACED-RENAME root RETRIED-RENAME ;
+
+: CASE-VARIANT-RENAME-PRESERVES-TREE-AND-RETRIES-RACES ( -- )
+   s" case_variant_rename_preserves_tree_and_retries_races" T-LABEL
+   [: RENAME-RACES ;] IN-CASE-DIR ;
+
+\ Runs as the hook, between the source's probe and its rename.
+: SWAP-SOURCE ( fd -- )
+   {: root:fd :}
+   root CREDIT root PRESERVED FS:TRY-RENAME-AT TTRUE
+   CREDIT s" new bytes" PUT-FILE ;
+
+: SWAPPED-SOURCE ( fd -- )
+   {: root:fd :}
+   CREDIT s" observed bytes" PUT-FILE
+   root CREDIT DESTINATION true [: root SWAP-SOURCE ;]
+   LOCAL:RENAME-CASE-VARIANT-WITH RENAMED$ s" retry" T$=
+   PRESERVED BYTES s" observed bytes" T$=
+   DESTINATION BYTES s" new bytes" T$=
+   CREDIT PRESENT? TFALSE ;
+
+: CASE-VARIANT-RENAME-PRESERVES-A-SWAPPED-SOURCE ( -- )
+   s" case_variant_rename_preserves_a_swapped_source" T-LABEL
+   [: SWAPPED-SOURCE ;] IN-CASE-DIR ;
+
+\ PARENT-NAME-MAX's answer apart: its limit and true; for none, 0 and
+\ false.
+: NAME-MAX-OF ( option<n> -- n bool )
+   MATCH option
+      none OF 0 false ENDOF
+      some OF true ENDOF
+   ;MATCH ;
+
+: PARENT-LIMIT ( fd -- )
+   {: root:fd :}
+   root s" missing/c" LOCAL:PARENT-NAME-MAX NAME-MAX-OF TFALSE drop
+   s" a/b" AT FS:MAKE-DIRS
+   root s" a/b/c" LOCAL:PARENT-NAME-MAX NAME-MAX-OF TTRUE
+   root FS:FD-NAME-MAX T= ;
+
+: PARENT-NAME-MAX-ANSWERS-ITS-PARENTS-LIMIT ( -- )
+   s" parent name max answers its parent's limit" T-LABEL
+   [: PARENT-LIMIT ;] IN-CASE-DIR ;
+
 \ Dropped: parallel_cold_scan_matches_single_worker_scan compares hash
 \ workers and download_promotion_cannot_invalidate_complete_scan holds the
-\ scan lock; one task has neither. With their words, on a later lane:
-\ case_variant_rename_preserves_tree_and_retries_races,
-\ case_variant_rename_preserves_a_swapped_source,
+\ scan lock; one task has neither. These need words LOCAL lacks:
 \ scan_of_a_stand_in_publishes_nothing,
 \ unchanged_tree_beside_a_same_named_directory_republishes_nothing and
 \ switching_local_root_clears_the_hash_cache (JOURNAL).
@@ -3042,7 +3122,10 @@ FS:PATHZ-CAP BUFFER: SLOT-FILE-BUF
    EACH-CHANGED-GUARD-ARM-IS-REACHED
    EACH-CONFLICT-OUTCOME-IS-REACHED
    RECOVERY-NAME-IS-RUSTS
-   EACH-RECOVERY-COPY-OUTCOME-IS-REACHED ;
+   EACH-RECOVERY-COPY-OUTCOME-IS-REACHED
+   CASE-VARIANT-RENAME-PRESERVES-TREE-AND-RETRIES-RACES
+   CASE-VARIANT-RENAME-PRESERVES-A-SWAPPED-SOURCE
+   PARENT-NAME-MAX-ANSWERS-ITS-PARENTS-LIMIT ;
 
 public
 

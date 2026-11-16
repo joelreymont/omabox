@@ -8,7 +8,8 @@
 \ themselves, checkpointed and promoted into their stages, their installs
 \ over a target that still holds what the journal expects, and the
 \ conditional deletes of local files, the directories a sync creates and
-\ deletes, and the conflict copies it writes.
+\ deletes, the conflict copies it writes, and the non-overwriting renames
+\ of a case variant or a file to its copy name.
 \ A relative path splits as Rust's Path::components splits it: empty and "."
 \ components past the first are skipped, and an empty, absolute or leading "."
 \ path, or one with a ".." component, is unsafe. Each component opens
@@ -4638,6 +4639,152 @@ public
       some OF want SAME-CONTENT? 0= if o ou at atu CORRUPT then
          dir name nu at atu SYNC-INSTALLED-FILE true
       ENDOF
+   ;MATCH ;
+
+\ ---- renames
+
+\ What a non-overwriting rename came to: the observed entry renamed and
+\ its parent synced, or a changed source or taken destination to rescan.
+ENUM rename-outcome renamed retry ;ENUM
+
+private
+
+\ Whether the safe paths' components from a and from b on are the same,
+\ as Rust compares paths.
+: SAME-COMPONENTS? ( ^u8 n n ^u8 n n -- bool )
+   {: p:^ u:n a:n q:^ v:n b:n :}
+   p u a NEXT-COMPONENT {: pf:n pt:n more:bool :}
+   q v b NEXT-COMPONENT {: qf:n qt:n more2:bool :}
+   more 0= more2 0= and if true exit then
+   more more2 and 0= if false exit then
+   p pf + pt pf - q qf + qt qf - STR= 0= if false exit then
+   p u pt q v qt RECURSE ;
+
+: SAME-PARENT? ( ^u8 n ^u8 n -- bool )
+   {: p:^ u:n d:^ du:n :}
+   p u PARENT-PATH 0 d du PARENT-PATH 0 SAME-COMPONENTS? ;
+
+: LAST-NAME ( ^u8 n -- ^u8 n )
+   {: p:^ u:n :}
+   p u SPLIT-LAST {: parent:n from:n to:n :}
+   p from + to from - ;
+
+\ Whether the failure just seen, ENOENT or the errno other, is a race a
+\ rescan retries.
+: RACED? ( n -- bool )
+   {: other:n :}
+   FS:ERRNO FS:ENOENT = FS:ERRNO other = or ;
+
+: RENAMEABLE? ( stat bool -- bool )
+   {: st:stat dirs:bool :}
+   st REGULAR? if true exit then
+   dirs st DIRECTORY? and ;
+
+\ The probed source held when it is a file, or with dirs a directory;
+\ else none, the probe closed.
+: KEEP-RENAMEABLE ( fd ^u8 n bool -- option<fd> )
+   {: src:fd p:^ u:n dirs:bool :}
+   src p u s" inspect local rename source type" STAT-CLOSING
+   dirs RENAMEABLE? if src OPTION:SOME exit then
+   src DISCARD OPTION:NONE ;
+
+\ The source at the name in dir, held by O_PATH without following a
+\ symlink; none when it is gone or not an entry dirs allows.
+: HELD-SOURCE ( fd ^u8 n ^u8 n bool -- option<fd> )
+   {: dir:fd name:^ nu:n p:^ u:n dirs:bool :}
+   dir name nu FS:TRY-OPEN-ENTRY-AT MATCH option
+      none OF FS:ELOOP RACED? 0= if
+            s" inspect local rename source" p u IO-FAILURE
+         then OPTION:NONE
+      ENDOF
+      some OF p u dirs KEEP-RENAMEABLE ENDOF
+   ;MATCH ;
+
+\ The rename hook, its file failures thrown as E-IO.
+: BEFORE-RENAME ( [ -- ] ^u8 n -- )
+   {: hook p:^ u:n :}
+   hook [: s" rename local entry" p u IO-FAILURE ;] FS-FAILS ;
+
+\ Renamed when d's name holds src, the source held open, once dir is
+\ synced.
+: SETTLE-RENAME ( fd fd ^u8 n ^u8 n -- rename-outcome )
+   {: src:fd dir:fd dn:^ dnu:n d:^ du:n :}
+   src dir dn dnu d du NAMED-INODE-MATCHES {: held:bool :}
+   dir d du s" sync local entry rename" SYNC-DIRECTORY
+   held if LOCAL-RENAME--OUTCOME:renamed exit then
+   LOCAL-RENAME--OUTCOME:retry ;
+
+\ Renames the name in dir to d's last name unless an entry is there.
+: RENAME-NEW ( fd fd ^u8 n ^u8 n ^u8 n -- rename-outcome )
+   {: src:fd dir:fd name:^ nu:n p:^ u:n d:^ du:n :}
+   d du LAST-NAME {: dn:^ dnu:n :}
+   dir name nu dir dn dnu FS:TRY-RENAME-NEW-AT if
+      src dir dn dnu d du SETTLE-RENAME exit
+   then
+   FS:EEXIST RACED? if LOCAL-RENAME--OUTCOME:retry exit then
+   s" rename local entry" p u IO-FAILURE ;
+
+: RENAME-IN ( fd ^u8 n ^u8 n ^u8 n bool [ -- ] -- rename-outcome )
+   {: dir:fd name:^ nu:n p:^ u:n d:^ du:n dirs:bool hook :}
+   dir name nu p u dirs HELD-SOURCE MATCH option
+      none OF LOCAL-RENAME--OUTCOME:retry ENDOF
+      some OF {: src:fd :}
+         [: hook p u BEFORE-RENAME
+            src dir name nu p u d du RENAME-NEW ;]
+         [: src DISCARD ;] finally
+      ENDOF
+   ;MATCH ;
+
+\ RENAME-IN the open parent, which closes after it.
+: RENAME-BELOW ( parent-dir ^u8 n ^u8 n bool [ -- ] -- rename-outcome )
+   {: pd:parent-dir p:^ u:n d:^ du:n dirs:bool hook :}
+   pd PARENT-DIR-UNMAKE {: dir:fd name:str path:str :}
+   [: dir name str> p u d du dirs hook RENAME-IN ;]
+   [: dir DISCARD ;] finally ;
+
+\ Renames p below the root to its sibling d, never over an entry: a file,
+\ or with dirs a directory. hook runs just before the rename.
+: RENAME-CASE-VARIANT-WITH
+   ( fd ^u8 n ^u8 n bool [ -- ] -- rename-outcome )
+   {: root:fd p:^ u:n d:^ du:n dirs:bool hook :}
+   p u d du SAME-PARENT? 0= if d du UNSAFE then
+   root p u false OPEN-PARENT MATCH option
+      none OF LOCAL-RENAME--OUTCOME:retry ENDOF
+      some OF p u d du dirs hook RENAME-BELOW ENDOF
+   ;MATCH ;
+
+public
+
+\ Renames a local case variant, a file or a directory, to its sibling d.
+: RENAME-CASE-VARIANT ( fd ^u8 n ^u8 n -- rename-outcome )
+   true [: ;] RENAME-CASE-VARIANT-WITH ;
+
+\ Renames a regular file to its synchronized copy name d.
+: RENAME-FILE-COPY ( fd ^u8 n ^u8 n -- rename-outcome )
+   false [: ;] RENAME-CASE-VARIANT-WITH ;
+
+private
+
+: NAME-MAX ( fd ^u8 n -- n )
+   {: dir:fd p:^ u:n :}
+   0 [: drop dir FS:FD-NAME-MAX ;]
+   [: s" inspect parent filename limit" p u IO-FAILURE ;] FS-FAILS ;
+
+\ NAME-MAX of the open parent, which closes after it.
+: NAME-MAX-BELOW ( parent-dir ^u8 n -- n )
+   {: pd:parent-dir p:^ u:n :}
+   pd PARENT-DIR-UNMAKE {: dir:fd name:str path:str :}
+   [: dir p u NAME-MAX ;] [: dir DISCARD ;] finally ;
+
+public
+
+\ The longest name in bytes the filesystem of p's actual parent takes;
+\ none when a directory on the way is missing. A zero limit is E-IO.
+: PARENT-NAME-MAX ( fd ^u8 n -- option<n> )
+   {: root:fd p:^ u:n :}
+   root p u false OPEN-PARENT MATCH option
+      none OF OPTION:NONE ENDOF
+      some OF p u NAME-MAX-BELOW OPTION:SOME ENDOF
    ;MATCH ;
 
 ;package
