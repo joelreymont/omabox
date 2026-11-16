@@ -640,8 +640,7 @@ variable DELETE-SENT-U
 
 
 \ After GARBLE, an API call's body is read, as CUT's is, and its answer is
-\ one line that is not HTTP, then a close. libcurl, which takes no
-\ HTTP/0.9 answer, fails it with CURLE_UNSUPPORTED_PROTOCOL, a code
+\ one line that is not HTTP, then a close. libcurl fails it with a code
 \ CURL:LOST? does not take.
 : GARBLED? ( HTTP:request -- bool )
    {: q:HTTP:request :}

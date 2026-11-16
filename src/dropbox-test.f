@@ -862,16 +862,19 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    LOGGED? TTRUE ;
 
 
-\ libcurl takes no HTTP/0.9 answer: CURLE_UNSUPPORTED_PROTOCOL, 1, which
-\ is not a lost exchange.
+\ A line that is not HTTP on a connection an answer kept open, as the
+\ client's calls reuse one: CURLE_WEIRD_SERVER_REPLY, 8, not a lost
+\ exchange. A fresh connection would give CURLE_UNSUPPORTED_PROTOCOL.
 : GARBLED-CASE ( -- )
    s" transport failure" T-LABEL
    TEST-DROPBOX:RESET
+   MAIN @ DROPBOX:ACCOUNT DONE? TTRUE
+   TEST-DROPBOX:RESET
    TEST-DROPBOX:GARBLE
    [: METADATA-DROPPED ;] LOGGED DROPBOX:E-TRANSPORT T=
-   1 CURL:>CODE CURL:LOST? TFALSE
+   8 CURL:>CODE CURL:LOST? TFALSE
    SB-RESET s" error dropbox: curl files/get_metadata: " SB-APPEND
-   1 CURL:>CODE CURL:ERROR$ SB-APPEND
+   8 CURL:>CODE CURL:ERROR$ SB-APPEND
    SB$ LOGGED? TTRUE
    TEST-DROPBOX:SEEN$ s" /2/files/get_metadata" T$= ;
 
