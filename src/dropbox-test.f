@@ -17,11 +17,11 @@
 \ 64 bytes a read, one
 \ cut mid-body, whether or not its body catches the loss, an empty file,
 \ one answered 400 and one 404, each keeping its status, and ones refused
-\ unverified: another rev or range,
-\ a resumed body one byte short or long, which fails before READ-BODY
-\ answers 0, whether or not its body catches the short one's failure, a
-\ held body one byte long whose body catches it in flight, a 416 from 0,
-\ a Dropbox-API-Result or an error that does not parse), delete,
+\ unverified: another rev, content hash or range, a resumed body one
+\ byte short or long, which fails before READ-BODY answers 0, whether or
+\ not its body catches the short one's failure, a held body one byte
+\ long whose body catches it in flight, a 416 from 0, a
+\ Dropbox-API-Result or an error that does not parse), delete,
 \ create-folder, the code exchange, Dropbox's content hash and uploads,
 \ whose stages are written under TMPDIR and removed once open, so no run
 \ leaves one; a mutation or session finish Dropbox answers
@@ -635,6 +635,13 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    fresh DROPBOX:CLOSE ;
 
 
+\ ALPHABET's rev and content hash, as DOWNLOAD takes them.
+: ABC-REV ( -- DROPBOX:rev ) s" 0160a1b2c3d4" >str DROPBOX:>REV ;
+: ABC-HASH ( -- DROPBOX:hash )
+   s" 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+   >str DROPBOX:>HASH ;
+
+
 \ A download whose refresh is answered s with body b throws code; the
 \ download is never sent, and HTTP-STATUS answers 0, not s.
 : REFRESH-FAILED ( n ^u8 n n -- )
@@ -642,7 +649,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    TEST-DROPBOX:RESET
    s" live-token" s" ns-root" OPENED OWN !
    s" /oauth2/token" s s" " s" " b bu TEST-DROPBOX:ROUTE-SCRIPT!
-   [: s" 0160a1b2c3d4" 0 OWN @ [: 2drop drop ;] DROPBOX:DOWNLOAD
+   [: ABC-REV ABC-HASH 0 OWN @ [: 2drop drop ;] DROPBOX:DOWNLOAD
       DONE? drop ;] LOGGED code T=
    OWN @ DROPBOX:HTTP-STATUS 0 T=
    TEST-DROPBOX:SEEN$ s" /oauth2/token" T$=
@@ -669,7 +676,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    s" /docs/a.txt" MAIN @ DROPBOX:METADATA RETRY-MS 0 T=
    s" /sync" MAIN @ [: drop ;] DROPBOX:LIST DONE? ASSERT
    MAIN @ DROPBOX:CURSOR s" c1" T$=
-   s" 0160a1b2c3d4" 0 MAIN @ [: drop 2drop ;] DROPBOX:DOWNLOAD
+   ABC-REV ABC-HASH 0 MAIN @ [: drop 2drop ;] DROPBOX:DOWNLOAD
    DROPBOX-ERROR:RESTRICTED-CONTENT REFUSED? ASSERT
    TEST-DROPBOX:SEEN$
    s" /2/files/get_metadata /2/files/list_folder /2/files/download" T$= ;
@@ -1160,7 +1167,7 @@ variable READ-COUNT
 : FETCH ( n -- DROPBOX:reply )
    {: at:n :}
    SUNK-CLEAR
-   s" 0160a1b2c3d4" at MAIN @ [: SUNK-BODY ;] DROPBOX:DOWNLOAD ;
+   ABC-REV ABC-HASH at MAIN @ [: SUNK-BODY ;] DROPBOX:DOWNLOAD ;
 
 
 : WHOLE-CASE ( -- )
@@ -1290,7 +1297,8 @@ variable READ-COUNT
    s" download unknown rev" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
    SUNK-CLEAR
-   s" 0160ffffffff" 0 MAIN @ [: SUNK-BODY ;] DROPBOX:DOWNLOAD
+   s" 0160ffffffff" >str DROPBOX:>REV ABC-HASH 0 MAIN @
+   [: SUNK-BODY ;] DROPBOX:DOWNLOAD
    DROPBOX-ERROR:NOT-FOUND REFUSED? ASSERT
    BODIES @ 0 T= ;
 
@@ -1323,6 +1331,24 @@ variable READ-COUNT
    USABLE ;
 
 
+\ OUTCOME: ALPHABET's rev asked with another content hash answered
+\ refused unverified.
+: OTHER-HASH-UNVERIFIED ( -- )
+   SUNK-CLEAR
+   ABC-REV
+   s" ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+   >str DROPBOX:>HASH 0 MAIN @ [: SUNK-BODY ;] DROPBOX:DOWNLOAD
+   UNVERIFIED? OUTCOME ! ;
+
+
+: OTHER-HASH-CASE ( -- )
+   s" download of another content hash" T-LABEL
+   TEST-DROPBOX:RESET ALPHABET
+   [: OTHER-HASH-UNVERIFIED ;] s" another content hash" REFUSED-LOGGED
+   BODIES @ 0 T=
+   USABLE ;
+
+
 TYPED-VARIABLE ZEROED bool
 
 
@@ -1335,7 +1361,7 @@ TYPED-VARIABLE ZEROED bool
 : BODY-UNVERIFIED ( [ n n ^DROPBOX:fetch -- ] -- )
    {: body :}
    SUNK-CLEAR false ZEROED !
-   s" 0160a1b2c3d4" 10 MAIN @ body DROPBOX:DOWNLOAD
+   ABC-REV ABC-HASH 10 MAIN @ body DROPBOX:DOWNLOAD
    UNVERIFIED? OUTCOME ! ;
 
 
@@ -1405,7 +1431,9 @@ TYPED-VARIABLE ZEROED bool
    s" 0160b1b2c3d4" s" abcde" TEST-DROPBOX:CONTENT!
    TEST-DROPBOX:HOLD-BODY TEST-DROPBOX:LENGTHEN
    SUNK-CLEAR false ZEROED !
-   [: s" 0160b1b2c3d4" 0 MAIN @ [: CAUGHT-BODY ;] DROPBOX:DOWNLOAD
+   [: s" 0160b1b2c3d4" >str DROPBOX:>REV
+      s" 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      >str DROPBOX:>HASH 0 MAIN @ [: CAUGHT-BODY ;] DROPBOX:DOWNLOAD
       UNVERIFIED? OUTCOME ! ;] s" a body of another length" REFUSED-LOGGED
    ZEROED @ TFALSE
    SUNK-U @ 5 <= ASSERT
@@ -1470,7 +1498,7 @@ TYPED-VARIABLE ZEROED bool
 
 : CUT-FETCH ( -- )
    SUNK-CLEAR
-   s" 0160a1b2c3d4" 0 MAIN @ [: CODED-BODY ;] DROPBOX:DOWNLOAD
+   ABC-REV ABC-HASH 0 MAIN @ [: CODED-BODY ;] DROPBOX:DOWNLOAD
    RETRY-MS 0 T= ;
 
 
@@ -1504,7 +1532,7 @@ TYPED-VARIABLE ZEROED bool
    TEST-DROPBOX:RESET ALPHABET
    TEST-DROPBOX:CUT-BODY
    SUNK-CLEAR
-   s" 0160a1b2c3d4" 0 MAIN @ [: SWALLOWING ;] DROPBOX:DOWNLOAD
+   ABC-REV ABC-HASH 0 MAIN @ [: SWALLOWING ;] DROPBOX:DOWNLOAD
    RETRY-MS 0 T=
    BODIES @ 1 T=
    BODY-CODE @ ERROR:TEXT$ LOST$ T$=
@@ -1519,7 +1547,7 @@ TYPED-VARIABLE ZEROED bool
 : BODY-THROWS-CASE ( -- )
    s" download body throws" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
-   [: s" 0160a1b2c3d4" 0 MAIN @ [: REFUSING ;]
+   [: ABC-REV ABC-HASH 0 MAIN @ [: REFUSING ;]
       DROPBOX:DOWNLOAD DONE? drop ;] 77 TTHROWSQ
    USABLE ;
 
@@ -1534,7 +1562,7 @@ TYPED-VARIABLE ZEROED bool
    s" download body throws after its end" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
    SUNK-CLEAR
-   [: s" 0160a1b2c3d4" 0 MAIN @ [: DISOWNING ;]
+   [: ABC-REV ABC-HASH 0 MAIN @ [: DISOWNING ;]
       DROPBOX:DOWNLOAD DONE? drop ;] 78 TTHROWSQ
    SUNK$ s" abcdefghijklmnopqrstuvwxyz" T$=
    USABLE ;
@@ -1553,7 +1581,7 @@ TYPED-VARIABLE ZEROED bool
    s" download body left unread" T-LABEL
    TEST-DROPBOX:RESET ALPHABET TEST-DROPBOX:HOLD-BODY
    SUNK-CLEAR
-   s" 0160a1b2c3d4" 0 MAIN @ [: GLANCING ;] DROPBOX:DOWNLOAD
+   ABC-REV ABC-HASH 0 MAIN @ [: GLANCING ;] DROPBOX:DOWNLOAD
    DONE? ASSERT
    BODIES @ 1 T=
    SUNK$ s" abcde" T$=
@@ -1566,7 +1594,7 @@ TYPED-VARIABLE ZEROED bool
    {: step:n :}
    TEST-DROPBOX:RESET ALPHABET TEST-DROPBOX:PAUSE-BODY
    SUNK-CLEAR
-   s" 0160a1b2c3d4" 0 MAIN @ [: step PACED ;] DROPBOX:DOWNLOAD ;
+   ABC-REV ABC-HASH 0 MAIN @ [: step PACED ;] DROPBOX:DOWNLOAD ;
 
 
 \ Read 7 bytes a read, a body in two chunks is taken whole.
@@ -1591,7 +1619,9 @@ TYPED-VARIABLE ZEROED bool
    s" download of an empty file" T-LABEL
    TEST-DROPBOX:RESET EMPTY-FILE
    SUNK-CLEAR
-   s" 0160e0e0e0e0" 0 MAIN @ [: SUNK-BODY ;] DROPBOX:DOWNLOAD
+   s" 0160e0e0e0e0" >str DROPBOX:>REV
+   s" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+   >str DROPBOX:>HASH 0 MAIN @ [: SUNK-BODY ;] DROPBOX:DOWNLOAD
    DONE? ASSERT
    BODIES @ 1 T= SUNK-U @ 0 T=
    SUNK-AT @ 0 T= SUNK-SIZE @ 0 T= ;
@@ -1600,7 +1630,7 @@ TYPED-VARIABLE ZEROED bool
 : DOWNLOAD-CASES ( -- )
    WHOLE-CASE RESUME-CASE SKEW-CASE COMPLETE-CASE RESTART-CASE
    UNSATISFIABLE-CASE FIRST-UNSATISFIABLE-CASE UNKNOWN-REV-CASE
-   OTHER-REV-CASE SHORT-READ-CASE LONG-READ-CASE
+   OTHER-REV-CASE OTHER-HASH-CASE SHORT-READ-CASE LONG-READ-CASE
    CAUGHT-SHORT-CASE CAUGHT-LONG-CASE
    WHOLE-FOR-RANGE-CASE UNASKED-RANGE-CASE
    UNPARSED-RESULT-CASE UNPARSED-REFUSAL-CASE

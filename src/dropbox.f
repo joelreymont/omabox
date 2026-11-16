@@ -1331,13 +1331,15 @@ private
 
 
 \ The status, metadata and Content-Range of a 2xx answer, from the captured
-\ headers: the rev asked and the range asked.
-: CHECKED ( ^client ^u8 n n -- )
-   {: c r:^ ru:n at:n :}
+\ headers: the rev, content hash and range asked.
+: CHECKED ( ^client ^u8 n ^u8 n n -- )
+   {: c r:^ ru:n h:^ hu:n at:n :}
    c RESULT-READ
    c CLIENT-ENTRY {: e :}
    e DROPBOX-ENTRY:REV @ SPAN:$ r ru STR=
    0= if c s" another rev" E-UNVERIFIED FAILED then
+   e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$ h hu STR=
+   0= if c s" another content hash" E-UNVERIFIED FAILED then
    c at e RANGED ;
 
 
@@ -1358,7 +1360,8 @@ public
 STRUCTURE fetch OPAQUE DERIVE addr
    FIELD client ^client
    FIELD handle CURL:handle
-   FIELD rev SPAN:span<u8>
+   FIELD rev rev
+   FIELD content-hash hash
    FIELD offset n
    FIELD step download-step
    FIELD held SPAN:span<u8>
@@ -1370,6 +1373,11 @@ STRUCTURE fetch OPAQUE DERIVE addr
 private
 
 HEAP FETCHES fetch
+
+: REV-HASH ( ^fetch -- ^u8 n ^u8 n )
+   {: f :}
+   f FETCH-REV @ REV>STR str> f FETCH-CONTENT-HASH @ HASH>STR str> ;
+
 
 -100008 s" a download's transfer ended inside its body"
    ERROR:CODE E-BODY-LOST
@@ -1411,7 +1419,7 @@ HEAP FETCHES fetch
    f FETCH-CLIENT @ {: c :}
    s c CLIENT-STATUS !
    c CAPTURE
-   c f FETCH-REV @ SPAN:$ f FETCH-OFFSET @ CHECKED
+   c f REV-HASH f FETCH-OFFSET @ CHECKED
    construct open-event passed ;
 
 
@@ -1622,13 +1630,13 @@ private
    construct verdict rejected [: DROP-VERDICT c CLASSIFY ;] VERIFIED ;
 
 
-\ A done answer no chunk came with: the rev and range asked and an empty
-\ body; body reads it from the fetch, at its end.
+\ A done answer no chunk came with: the rev, content hash and range
+\ asked and an empty body; body reads it from the fetch, at its end.
 : EMPTIED ( ^fetch [ n n ^fetch -- ] -- )
    {: f body :}
    f FETCH-CLIENT @ {: c :}
    f FETCH-OFFSET @ {: at:n :}
-   c f FETCH-REV @ SPAN:$ at CHECKED
+   c f REV-HASH at CHECKED
    c at 0 SIZED
    at c FILE-SIZE f body execute ;
 
@@ -1667,26 +1675,29 @@ private
 
 \ The fetch is made before the transfer starts and lives until the call
 \ answers, so nothing allocates in flight but what READ-OUT covers.
-: FETCHED ( ^client ^u8 n n [ n n ^fetch -- ] [ ^fetch -- reply ] -- verdict )
-   {: c r:^ ru:n at:n body unsat :}
+: FETCHED
+   ( ^client rev hash n [ n n ^fetch -- ] [ ^fetch -- reply ] -- verdict )
+   {: c v:rev h:hash at:n body unsat :}
    FETCHES-NEW {: f :}
    c f FETCH-CLIENT !
-   r ru SPAN:MAKE f FETCH-REV ! at f FETCH-OFFSET !
+   v f FETCH-REV ! h f FETCH-CONTENT-HASH !
+   at f FETCH-OFFSET !
    construct download-step opened f FETCH-STEP !
    [: f body unsat SETTLED ;] [: f FETCHES-RELEASE ;] finally ;
 
 
 \ files/download from the offset; unsat answers a 416.
-: FROM ( ^u8 n n ^client [ n n ^fetch -- ] [ ^fetch -- reply ] -- reply )
-   {: r:^ ru:n at:n c body unsat :}
+: FROM
+   ( rev hash n ^client [ n n ^fetch -- ] [ ^fetch -- reply ] -- reply )
+   {: v:rev h:hash at:n c body unsat :}
    c c CLIENT-CONTENT @ s" files/download"
-   [: r ru at ASKED ;] [: r ru at body unsat FETCHED ;] CALL-AT ;
+   [: v REV>STR str> at ASKED ;] [: v h at body unsat FETCHED ;] CALL-AT ;
 
 
 \ files/download from offset 0.
-: AFRESH ( ^client ^u8 n [ n n ^fetch -- ] -- reply )
-   {: c r:^ ru:n body :}
-   r ru 0 c body [: UNSATISFIABLE ;] FROM ;
+: AFRESH ( ^client rev hash [ n n ^fetch -- ] -- reply )
+   {: c v:rev h:hash body :}
+   v h 0 c body [: UNSATISFIABLE ;] FROM ;
 
 
 \ The Content-Range of a 416 whose length is the offset, in the line.
@@ -1703,7 +1714,7 @@ private
    f FETCH-CLIENT @ {: c :}
    f FETCH-OFFSET @ {: at:n :}
    c s" Content-Range" HEADER$ c at LENGTH-LINE STR=
-   0= if c f FETCH-REV @ SPAN:$ body AFRESH exit then
+   0= if c f FETCH-REV @ f FETCH-CONTENT-HASH @ body AFRESH exit then
    at at f body execute
    construct reply done ;
 
@@ -1713,10 +1724,10 @@ private
 
 
 \ files/download from the offset: from 0 afresh, else through RESUMED.
-: REQUESTED ( ^u8 n n ^client [ n n ^fetch -- ] -- reply )
-   {: r:^ ru:n at:n c body :}
-   at 0= if c r ru body AFRESH exit then
-   r ru at c body [: body RESUMED ;] FROM ;
+: REQUESTED ( rev hash n ^client [ n n ^fetch -- ] -- reply )
+   {: v:rev h:hash at:n c body :}
+   at 0= if c v h body AFRESH exit then
+   v h at c body [: body RESUMED ;] FROM ;
 
 
 \ Disposes buf unless it is null, a buffer OPEN never made: the arena
@@ -2017,9 +2028,10 @@ public
 
 \ files/download of rev:<rev>, that exact revision, from the offset;
 \ body reads an answer that passed its checks through READ-BODY.
-: DOWNLOAD ( ^u8 n n ^client [ n n ^fetch -- ] -- reply )
-   {: r:^ ru:n at:n c body :}
-   construct reply done [: DROP-REPLY r ru at c body REQUESTED ;] catch
+: DOWNLOAD ( rev hash n ^client [ n n ^fetch -- ] -- reply )
+   {: v:rev h:hash at:n c body :}
+   construct reply done
+   [: DROP-REPLY v h at c body REQUESTED ;] catch
    {: code:n :}
    code 0= if exit then
    drop

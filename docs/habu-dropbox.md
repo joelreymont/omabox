@@ -89,8 +89,9 @@ ENUM reply
 : METADATA      ( ^u8 n ^client -- reply )  \ path
                 \ an entry at another path: refused path-mismatch;
                 \ a file described incompletely: done, COMPLETE? tells
-: DOWNLOAD      ( ^u8 n n ^client [ n n ^fetch -- ] -- reply )
-                \ rev, offset; the body: its offset, the size, the fetch
+: DOWNLOAD      ( rev hash n ^client [ n n ^fetch -- ] -- reply )
+                \ rev, content hash, offset; the body: its offset, the
+                \ size, the fetch
 : READ-BODY     ( ^u8 n ^fetch -- n )       \ bytes read, 0 at the end
 : UPLOAD        ( ^upload ^client [ n -- ] -- reply )  \ bytes accepted
 : DELETE        ( ^u8 n ^u8 n ^client -- reply )  \ path, rev
@@ -163,10 +164,11 @@ STRUCTURE config
   root sends no header, which only linking needs before it knows the root.
 - **`DOWNLOAD`** fetches `rev:<rev>`, which is that exact revision, from
   `offset` with a Range header. It checks the answer's status, Content-Range
-  and metadata before any byte reaches the quotation. On a done answer it
-  then calls the quotation once with the file offset the body starts at, the
-  file's size and the download's `fetch`, an opaque record that lives until
-  the quotation returns. `READ-BODY` copies the body's next bytes into the
+  and metadata, whose rev and content hash are the ones asked, before any byte
+  reaches the quotation. On a done answer it then calls the quotation once
+  with the file offset the body starts at, the file's size and the
+  download's `fetch`, an opaque record that lives until the quotation
+  returns. `READ-BODY` copies the body's next bytes into the
   buffer it is given, at most the rest of the chunk it holds, and answers how
   many, 0 at the body's end, as Rust's `impl Read` does; the caller wraps it
   as `[: f READ-BODY ;]` for a word that takes a reader, and writes and hashes
@@ -191,13 +193,13 @@ STRUCTURE config
     Any other 416 from a nonzero offset starts over once from 0, as the Rust
     version does, so the quotation sees offset 0. Every other `done`
     carries the entry Dropbox reported.
-  - An answer whose rev, Content-Range or length is not the one asked, a
-    whole file for a range or a range nobody asked for, a 416 from 0, and
-    an answer whose Dropbox-API-Result or error does not parse answer
-    `refused unverified`, logged once with its reason, so the caller can
-    block that plan alone, as the Rust version's
-    `DownloadVerificationFailed` does. The client stays usable for its
-    next call.
+  - An answer whose rev, content hash, Content-Range or length is not the
+    one asked, a whole file for a range or a range nobody asked for, a 416
+    from 0, and an answer whose Dropbox-API-Result or error does not parse
+    answer `refused unverified`, logged once with its reason, so the caller
+    can block that plan alone, as the Rust version's
+    `DownloadVerificationFailed` does. The client stays usable for its next
+    call.
   - A throw while the transfer is in flight, from a failed check, the
     quotation, `READ-BODY` or an allocation, ends it in one place: the client
     cancels the transfer and reads it to its end into a region laid out at

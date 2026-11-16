@@ -1692,7 +1692,7 @@ ARENA BRIDGES bridge
    {: rem x :}
    rem MODEL-REMOTE:UNMAKE {: c v :}
    x BRIDGE-LINK @ {: k :}
-   v DROPBOX:REV>STR str> x RESUME-OFFSET k REPLAY-LINK:CLIENT @
+   v c x RESUME-OFFSET k REPLAY-LINK:CLIENT @
    [: x RECEIVED ;] DROPBOX:DOWNLOAD {: r:DROPBOX:reply :}
    r MATCH DROPBOX:reply
       done OF ENDOF
