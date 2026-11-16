@@ -1,0 +1,9 @@
+\ version.f - package RELEASE: the version omabox and omaboxd report,
+\ rust Cargo.toml's package version.
+
+package RELEASE
+public
+
+: VERSION$ ( -- ^u8 n ) s" 0.1.0" ;
+
+;package

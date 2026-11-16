@@ -31,8 +31,7 @@ require src/journal.f
 require src/test-client.f
 require src/omaboxd.f
 
-\ OMABOXD reopened for VERSION.
-package OMABOXD
+package OMABOXD-TEST
 private
 
 $10000 constant CAP
@@ -99,7 +98,7 @@ $40 constant MSG-DONTWAIT
 \ ---- the self-check ----
 
 : VERSION-LINE ( -- ^u8 n )
-   SB-RESET s" omaboxd " SB-APPEND VERSION SB-APPEND 10 SB-APPEND-C SB$ ;
+   SB-RESET s" omaboxd " SB-APPEND RELEASE:VERSION$ SB-APPEND 10 SB-APPEND-C SB$ ;
 
 : SELF-CHECK-IGNORES-UNAVAILABLE-CONFIGURATION-AND-PRINTS-VERSION
    ( str -- )

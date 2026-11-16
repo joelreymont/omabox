@@ -509,7 +509,12 @@ ARENA HELD n
 
 \ ---- direct operations
 
-ENUM action start stop restart enable disable status ;ENUM
+public
+
+\ Rust's ServiceAction.
+ENUM action DERIVE eq start stop restart enable disable status ;ENUM
+
+private
 
 : ACTION$ ( action -- ^u8 n )
    MATCH action

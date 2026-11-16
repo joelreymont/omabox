@@ -6,18 +6,16 @@
 \ status.
 require src/lib/string.f
 require src/daemon.f
+require src/version.f
 
 package OMABOXD
 private
-
-\ rust Cargo.toml's package version.
-: VERSION ( -- ^u8 n ) s" 0.1.0" ;
 
 : SELF-CHECK? ( -- bool )
    SCRIPT-ARGC 1 <> if false exit then
    0 SCRIPT-ARGV$ s" --self-check" STR= ;
 
-: SELF-CHECK ( -- ) s" omaboxd " type VERSION type cr ;
+: SELF-CHECK ( -- ) s" omaboxd " type RELEASE:VERSION$ type cr ;
 
 public
 
