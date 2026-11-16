@@ -39,8 +39,6 @@ require src/lib/utf8-scalar.f
 require src/lib/unicode/class.f
 require src/lib/vector.f
 require src/lib/json.f
-require src/lib/aio.f
-require src/lib/net/curl.f
 require src/config.f
 require src/auth.f
 require src/journal.f
@@ -1081,22 +1079,6 @@ ARENA JOURNALS JOURNAL:journal
       r cl ar LINKED
       r cl a ar KEEP-LOGIN ;] [: cl DROPBOX:CLOSE ;] finally ;
 
-\ A curl loop that would not start, as the exchange's transport.
-: LOOP-FAILED ( CURL:code -- )
-   {: rc :}
-   LOG-OPEN s" could not start the curl loop: curl code " LOG:TEXT+
-   rc CURL:CODE>N LOG:INT+ LOG:;LINE
-   EXCHANGE-FAILED ;
-
-\ The step under AIO's and CURL's loops, which DROPBOX's calls need.
-: CURLING ( [ -- ] -- )
-   {: step :}
-   AIO:START
-   [: CURL:LOOP-START MATCH CURL:status
-         ok OF step [: CURL:LOOP-STOP ;] finally ENDOF
-         failed OF LOOP-FAILED ENDOF
-      ;MATCH ;] [: AIO:STOP ;] finally ;
-
 \ Rust's authorize: a browser login for the config c's app key, its
 \ code read from stdin, exchanged and checked against the remote root
 \ r; answers the login, kept in ar.
@@ -1107,7 +1089,7 @@ ARENA JOURNALS JOURNAL:journal
    p ar PROMPT
    FD:STDIN ar READ-CODE {: ac :}
    ar LOGINS-NEW {: a :}
-   [: c ac p r a ar LINK-LOGIN ;] CURLING
+   [: c ac p r a ar LINK-LOGIN ;] DROPBOX:WITH-LOOPS
    a ;
 
 

@@ -28,8 +28,8 @@
 \ STORAGE CLASS. CALLER-OWNED: OPEN lays the client and its copies of the
 \ config in the caller's arena; the client owns its handle and buffers until
 \ CLOSE. Every span or entry it answers is borrowed until its next call. One
-\ task uses a client at a time. A program using DROPBOX starts the CURL loop
-\ (AIO:START CURL:LOOP-START) before its first call.
+\ task uses a client at a time. A program runs its DROPBOX calls inside
+\ WITH-LOOPS, which starts and stops AIO's and CURL's loops.
 
 require src/lib/error.f
 require src/lib/string.f
@@ -62,6 +62,7 @@ public
 -100007 s" the rotated Dropbox refresh token could not be stored"
    ERROR:CODE E-NOT-STORED
 -100010 s" Dropbox's answer cannot be used" ERROR:CODE E-UNUSABLE
+-100012 s" the curl loop could not start" ERROR:CODE E-LOOP
 
 \ Dropbox's 409 tags omabox decides on, else other; no tag: path-mismatch, an
 \ entry elsewhere, and unverified, an answer omabox cannot trust.
@@ -274,6 +275,33 @@ ENUM verdict
       ok OF ENDOF
       failed OF what what-u CURL-FAILED ENDOF
    ;MATCH ;
+
+
+\ ---- the loops
+
+\ One line with curl's code, then E-LOOP.
+: LOOP-REFUSED ( CURL:code -- )
+   {: rc :}
+   LOG-OPEN s" could not start the curl loop: curl code " LOG:TEXT+
+   rc CURL:CODE>N LOG:INT+ LOG:;LINE
+   E-LOOP throw ;
+
+: CURLED ( [ -- ] -- )
+   {: step :}
+   CURL:LOOP-START MATCH CURL:status
+      ok OF step [: CURL:LOOP-STOP ;] finally ENDOF
+      failed OF LOOP-REFUSED ENDOF
+   ;MATCH ;
+
+public
+
+\ The step under AIO's and CURL's loops, which DROPBOX's calls need;
+\ a CURL loop that will not start logs a line and throws E-LOOP.
+: WITH-LOOPS ( [ -- ] -- )
+   {: step :}
+   AIO:START [: step CURLED ;] [: AIO:STOP ;] finally ;
+
+private
 
 
 \ ---- opening

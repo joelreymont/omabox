@@ -24,8 +24,6 @@ require src/lib/fs.f
 require src/lib/sqlite.f
 require src/lib/log.f
 require src/lib/adt/option.f
-require src/lib/aio.f
-require src/lib/net/curl.f
 require src/lib/systemd.f
 require src/lib/task.f
 require src/lib/time.f
@@ -939,28 +937,10 @@ FSM:DEFINE DAEMON-RUN ( ^run ) daemon-state step-event
    code CAUSE+ LOG:;LINE
    ar STATUS:DETACHED ;
 
-: LOOP-FAILED ( CURL:code ^run -- )
-   {: rc x :}
-   LOG:ERROR s" daemon" LOG:LINE s" could not start the curl loop: curl code "
-   LOG:TEXT+ rc CURL:CODE>N LOG:INT+ LOG:;LINE
-   0 INTERNAL INVARIANT x FAILED
-   x construct daemon-state stopped DAEMON-RUN ;
-
-: LOOPED ( ^run -- )
-   {: x :}
-   CURL:LOOP-START MATCH CURL:status
-      ok OF
-         [: x construct daemon-state preparing DAEMON-RUN ;]
-         [: CURL:LOOP-STOP ;] finally
-      ENDOF
-      failed OF x LOOP-FAILED ENDOF
-   ;MATCH ;
-
 : MACHINE ( ^run -- )
    {: x :}
    AUTH:BIND
-   AIO:START
-   [: x LOOPED ;] [: AIO:STOP ;] finally ;
+   [: x construct daemon-state preparing DAEMON-RUN ;] DROPBOX:WITH-LOOPS ;
 
 \ A code the machine does not catch stops it as an invariant.
 : GUARDED ( ^run -- )
