@@ -23,9 +23,11 @@ require src/lib/fd.f
 require src/lib/fs.f
 require src/lib/utf8-scalar.f
 require src/lib/json.f
+require src/lib/vector.f
 require src/config.f
 require src/attention.f
 require src/service.f
+require src/stale.f
 require src/version.f
 
 package OMABOX
@@ -38,6 +40,10 @@ public
 -101101 s" omabox could not read or write the terminal" ERROR:CODE E-IO
 -101102 s" could not serialize settings output"
    ERROR:CODE E-SERIALIZE-OUTPUT
+-101103 s" a change failed and the Omabox service could not be restarted"
+   ERROR:CODE E-CHANGE-AND-RESTORE
+-101104 s" a change was made, but the Omabox service could not be started or checked"
+   ERROR:CODE E-START-AFTER-CHANGE
 
 private
 
@@ -121,6 +127,26 @@ ARENA WRITERS JSON:writer
    s" Use `omabox settings` for human-readable output." HELP
    LOG:;LINE 0 FS:CAUSE! E-SERIALIZE-OUTPUT throw ;
 
+\ Rust's ChangeAndRestore, after the change's lines and the restore's.
+: CHANGE-AND-RESTORE ( ^u8 n -- )
+   {: c:^ cu:n :}
+   FS:ERRNO {: cause:n :}
+   LOG-OPEN c cu LOG:TEXT+
+   s"  failed, and the Omabox service could not be restarted;"
+   LOG:TEXT+
+   s"  run `omabox resume` once the errors above are fixed" LOG:TEXT+
+   LOG:;LINE cause FS:CAUSE! E-CHANGE-AND-RESTORE throw ;
+
+\ Rust's StartAfterChange for the done text, after the drive's lines.
+: START-AFTER-CHANGE ( ^u8 n -- )
+   {: d:^ du:n :}
+   FS:ERRNO {: cause:n :}
+   LOG-OPEN d du LOG:TEXT+
+   s" , but the Omabox service could not be started or checked"
+   LOG:TEXT+
+   s" The change is kept. Run `omabox status` and `omabox logs` to see why, then `omabox resume`."
+   HELP LOG:;LINE cause FS:CAUSE! E-START-AFTER-CHANGE throw ;
+
 
 \ ---- output
 
@@ -132,6 +158,19 @@ ARENA WRITERS JSON:writer
 : WRITE-OUT ( ^u8 n -- )
    {: a:^ u:n :}
    [: a u WRITE-FULL ;] catch {: code:n :}
+   code 0<> if s" write command output" IO-FAILED then ;
+
+\ The text, then the leftovers' lines, with SIGPIPE held off.
+: REPORT-FULL ( ^u8 n ^VEC:vector<STALE:leftover> -- )
+   {: a:^ u:n left :}
+   FD:STDOUT [:
+      FD:STDOUT a u FD:WRITE-FULL
+      left FD:STDOUT STALE:REPORT
+   ;] FD:WITH-NOSIGPIPE ;
+
+: REPORT-OUT ( ^u8 n ^VEC:vector<STALE:leftover> -- )
+   {: a:^ u:n left :}
+   [: a u left REPORT-FULL ;] catch {: code:n :}
    code 0<> if s" write command output" IO-FAILED then ;
 
 
@@ -304,6 +343,81 @@ ARENA WRITERS JSON:writer
    ;MATCH {: t :}
    d x ar ROOT-CHECKED
    t ;
+
+
+\ ---- a change while the service is released
+
+\ Rust's restore_goal: the drive that puts back what a release changed.
+: RESTORE-GOAL ( ^SERVICE:driven -- option<SERVICE:goal> )
+   {: v :}
+   v SERVICE-DRIVEN:ACTED @ 0= if OPTION:NONE exit then
+   v SERVICE-DRIVEN:FIRST @ SERVICE-GOAL:RESTORE OPTION:SOME ;
+
+\ The change's leftovers and code, 0 for none; it runs only after the
+\ release, whose code r is the change's when it failed.
+: CHANGED ( n [ ^ARENA:arena -- ^VEC:vector<STALE:leftover> ]
+     ^ARENA:arena -- ^VEC:vector<STALE:leftover> n )
+   {: r:n change ar :}
+   r 0<> if NULL-PTR r exit then
+   NULL-PTR [: drop ar change execute ;] catch {: left code:n :}
+   code 0= if left 0 exit then
+   NULL-PTR code ;
+
+\ Whether the restore drive launched the unit, and its code; a release
+\ that spawned nothing has nothing to restore.
+: RESTORED ( ^SERVICE:commands ^SERVICE:driven ^ARENA:arena -- bool n )
+   {: c v ar :}
+   v RESTORE-GOAL MATCH option
+      none OF false 0 ENDOF
+      some OF
+         {: g :} ar DRIVENS-NEW {: r :}
+         c g r SERVICE:DRIVE-RECORDED {: code:n :}
+         r SERVICE-DRIVEN:LAUNCHED @ code
+      ENDOF
+   ;MATCH ;
+
+\ The change may fix the fatal cause of a unit the release left failed:
+\ unless the restore launched it, a recover drive answers whether it did.
+: RECOVERED ( ^SERVICE:commands bool ^u8 n ^ARENA:arena -- bool )
+   {: c launched:bool d:^ du:n ar :}
+   launched if false exit then
+   ar DRIVENS-NEW {: v :}
+   c SERVICE-GOAL:RECOVER v SERVICE:DRIVE-RECORDED
+   0<> if d du START-AFTER-CHANGE then
+   v SERVICE-DRIVEN:LAUNCHED @ ;
+
+: NOTE ( bool -- ^u8 n )
+   if s"  The stopped service has been started again." exit then s" " ;
+
+\ "{done}.{note}", LF and the leftovers' lines on stdout.
+: DONE-OUT ( ^u8 n bool ^VEC:vector<STALE:leftover> -- )
+   {: d:^ du:n recovered:bool left :}
+   SB-RESET d du SB-APPEND s" ." SB-APPEND recovered NOTE LINE+
+   SB$ left REPORT-OUT ;
+
+\ Rust's match on the change's outcome and the restore's: c the
+\ commands, n the change's name, d its done text.
+: DECIDED ( ^SERVICE:commands ^u8 n ^u8 n
+     ^VEC:vector<STALE:leftover> n bool n ^ARENA:arena -- )
+   {: c n:^ nu:n d:^ du:n left changed:n
+      launched:bool restored:n ar :}
+   changed 0<> restored 0<> and if n nu CHANGE-AND-RESTORE then
+   changed 0<> if changed throw then
+   restored 0<> if d du START-AFTER-CHANGE then
+   c launched d du ar RECOVERED {: recovered:bool :}
+   d du recovered left DONE-OUT ;
+
+\ Rust's change_while_released: releases a unit that can hold the
+\ instance lock, runs the change, the name n's, and restores what the
+\ release changed; the done text d states the finished change.
+: RELEASED ( ^SERVICE:commands ^u8 n ^u8 n
+     [ ^ARENA:arena -- ^VEC:vector<STALE:leftover> ] ^ARENA:arena -- )
+   {: c n:^ nu:n d:^ du:n change ar :}
+   ar DRIVENS-NEW {: v :}
+   c SERVICE-GOAL:RELEASE v SERVICE:DRIVE-RECORDED
+   change ar CHANGED {: left changed:n :}
+   c v ar RESTORED {: launched:bool restored:n :}
+   c n nu d du left changed launched restored ar DECIDED ;
 
 
 \ ---- running

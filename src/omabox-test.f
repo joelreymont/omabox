@@ -14,10 +14,16 @@
 \ - service_commands_reset_the_start_limit_before_a_start, each row's
 \   systemctl a script in a directory of its own under TMPDIR, which
 \   logs each verb and answers show with the row's state
+\ - restore_goal_restores_only_after_a_spawned_release
+\ - a_change_runs_while_the_service_is_released,
+\   a_failed_change_still_restores_the_service, where E-IO stands in for
+\   Rust's InvalidAuthorizationCode, and
+\   a_failed_release_skips_the_change_and_restores, each systemctl Rust's
+\   stateful script in a directory of its own under TMPDIR
 \ and the program built with README's command into a directory under
 \ TMPDIR, whose --version prints its name and version and exits 0.
-\ White-box: OMABOX is reopened for PARSE, RUN-SERVICE, STATUS-TEXT and
-\ SETTINGS-TEXT.
+\ White-box: OMABOX is reopened for PARSE, RUN-SERVICE, STATUS-TEXT,
+\ SETTINGS-TEXT, RESTORE-GOAL and RELEASED.
 \ Run from the repository root: hb --load src/omabox-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -38,6 +44,7 @@ require src/journal.f
 require src/config.f
 require src/attention.f
 require src/service.f
+require src/stale.f
 require src/version.f
 require src/omabox.f
 
@@ -56,6 +63,11 @@ PATH-CAP BUFFER: JOINED
 
 \ The text a command answered under a capture.
 TYPED-VARIABLE SHOWN str
+
+\ The service trace a change saw, and how many changes ran.
+TYPED-VARIABLE DURING-LOG str
+TYPED-VARIABLE DURING-STATE str
+variable CHANGES
 
 600000 constant BUILD-MS
 10000 constant RUN-MS
@@ -369,6 +381,165 @@ TYPED-VARIABLE SHOWN str
    S\" show\nstop\nshow\n" ar RESETS ;
 
 
+\ ---- a change while the service is released
+
+: RESTORES-RUNNING? ( option<SERVICE:goal> -- bool )
+   MATCH option
+      none OF false ENDOF
+      some OF
+         MATCH SERVICE:goal
+            restore OF
+               MATCH option
+                  none OF false ENDOF
+                  some OF
+                     SERVICE-UNIT--STATE:RUNNING SERVICE-UNIT--STATE:EQ
+                  ENDOF
+               ;MATCH
+            ENDOF
+            start OF false ENDOF
+            restart OF false ENDOF
+            recover OF false ENDOF
+            halt OF false ENDOF
+            release OF false ENDOF
+         ;MATCH
+      ENDOF
+   ;MATCH ;
+
+: NONE? ( option<SERVICE:goal> -- bool )
+   MATCH option
+      none OF true ENDOF
+      some OF drop false ENDOF
+   ;MATCH ;
+
+: RESTORE-GOAL-RESTORES-ONLY-AFTER-A-SPAWNED-RELEASE ( ^ARENA:arena -- )
+   {: ar :}
+   s" restore_goal_restores_only_after_a_spawned_release" T-LABEL
+   ar DRIVENS-NEW {: v :}
+   SERVICE-UNIT--STATE:RUNNING OPTION:SOME v SERVICE-DRIVEN:FIRST !
+   SERVICE-UNIT--STATE:RUNNING OPTION:SOME v SERVICE-DRIVEN:LAST !
+   false v SERVICE-DRIVEN:LAUNCHED !
+   false v SERVICE-DRIVEN:ACTED !
+   v RESTORE-GOAL NONE? TTRUE
+   true v SERVICE-DRIVEN:ACTED !
+   v RESTORE-GOAL RESTORES-RUNNING? TTRUE ;
+
+\ The path in single quotes.
+: QUOTED+ ( str -- ) s" '" SB-APPEND str> SB-APPEND s" '" SB-APPEND ;
+
+: CODE+ ( n -- ) FMT:INT$ SB-APPEND ;
+
+\ The script's case arms for show, stop and reset-failed.
+: SETTLING+ ( str n -- )
+   {: state stop:n :}
+   S\" case \"$2\" in\nshow) cat " SB-APPEND state QUOTED+
+   S\"  ;;\nstop) printf '%s\\n' inactive > " SB-APPEND state QUOTED+
+   s" ; exit " SB-APPEND stop CODE+
+   S\"  ;;\nreset-failed) printf '%s\\n' inactive > " SB-APPEND
+   state QUOTED+ S\"  ;;\n" SB-APPEND ;
+
+\ The script's case arms for list-units and start, and its end.
+: STARTING+ ( str n -- )
+   {: state start:n :}
+   s" list-units) printf '%s\n' " SB-APPEND
+   S\" 'omabox.service loaded inactive dead Omabox' ;;\n" SB-APPEND
+   s" start) [ " SB-APPEND start CODE+ s"  = 0 ] || exit " SB-APPEND
+   start CODE+ S\" ; printf '%s\\n' active > " SB-APPEND
+   state QUOTED+ S\"  ;;\nesac\nexit 0\n" SB-APPEND ;
+
+\ Rust's stateful_systemctl in a new directory, which it answers with
+\ the commands: the unit's state in unit-state, each verb logged to
+\ service.log; start exits with start, stop with stop once the unit is
+\ inactive, and list-units lists the unit as loaded.
+: STATEFUL ( ^u8 n n n ^ARENA:arena -- str ^SERVICE:commands )
+   {: i:^ iu:n start:n stop:n ar :}
+   ar TEMPORARY {: d :}
+   d s" unit-state" ar INSIDE {: state :}
+   d s" systemctl" ar INSIDE {: sys :}
+   d s" service.log" ar INSIDE {: log :}
+   SB-RESET i iu LINE+ state str> SB$ FS:WRITE-ALL
+   SB-RESET S\" printf '%s\\n' \"$2\" >> " SB-APPEND
+   log QUOTED+ S\" \n" SB-APPEND
+   state stop SETTLING+ state start STARTING+
+   sys str> SB$ FS:WRITE-ALL
+   d sys s" /unused/journalctl" >str ar SERVICE:SCRIPTS ;
+
+\ Rust's service_trace: the service log and the unit state.
+: TRACE ( str ^ARENA:arena -- str str )
+   {: d ar :}
+   d s" service.log" ar INSIDE READ ar COPIED
+   d s" unit-state" ar INSIDE READ ar COPIED ;
+
+: NO-LEFTOVERS ( ^ARENA:arena -- ^VEC:vector<STALE:leftover> )
+   ARENA:ALLOCATOR 0 [type] STALE:leftover VEC:NEW ;
+
+\ A change that keeps the trace it sees in d and leaves nothing behind.
+: WATCHED ( str ^ARENA:arena -- ^VEC:vector<STALE:leftover> )
+   {: d ar :}
+   CHANGES @ 1+ CHANGES !
+   d ar TRACE DURING-STATE ! DURING-LOG !
+   ar NO-LEFTOVERS ;
+
+\ A change that fails, as Rust's InvalidAuthorizationCode stands for.
+: REFUSED ( ^ARENA:arena -- ^VEC:vector<STALE:leftover> )
+   drop E-IO throw ;
+
+\ Setup, released from c around the change.
+: SETUP-RELEASED ( ^SERVICE:commands
+     [ ^ARENA:arena -- ^VEC:vector<STALE:leftover> ] ^ARENA:arena -- )
+   {: c change ar :}
+   c s" setup" s" Omabox setup is complete" change ar RELEASED ;
+
+\ From the unit's state, the trace the change saw, then the one after.
+: RUNS-RELEASED ( ^u8 n ^u8 n ^u8 n ^u8 n ^ARENA:arena -- )
+   {: i:^ iu:n b:^ bu:n s:^ su:n a:^ au:n ar :}
+   i iu 0 0 ar STATEFUL {: d c :}
+   0 CHANGES !
+   [: c [: d swap WATCHED ;] ar SETUP-RELEASED ;] catch 0 T=
+   CHANGES @ 1 T=
+   DURING-LOG @ str> b bu T$=
+   DURING-STATE @ str> s su T$=
+   d ar TRACE {: log state :}
+   log str> a au T$=
+   state str> S\" active\n" T$=
+   d str> FS:REMOVE-TREE ;
+
+: A-CHANGE-RUNS-WHILE-THE-SERVICE-IS-RELEASED ( ^ARENA:arena -- )
+   {: ar :}
+   s" a_change_runs_while_the_service_is_released" T-LABEL
+   s" active" S\" show\nstop\n" S\" inactive\n"
+   S\" show\nstop\nreset-failed\nstart\n" ar RUNS-RELEASED
+   s" failed" S\" show\n" S\" failed\n"
+   S\" show\nshow\nreset-failed\nstart\n" ar RUNS-RELEASED ;
+
+: A-FAILED-CHANGE-STILL-RESTORES-THE-SERVICE ( ^ARENA:arena -- )
+   {: ar :}
+   s" a_failed_change_still_restores_the_service" T-LABEL
+   s" active" 0 0 ar STATEFUL {: d c :}
+   [: c [: REFUSED ;] ar SETUP-RELEASED ;] catch E-IO T=
+   d ar TRACE {: log state :}
+   log str> S\" show\nstop\nreset-failed\nstart\n" T$=
+   state str> S\" active\n" T$=
+   d str> FS:REMOVE-TREE ;
+
+\ list-units runs once the stop fails, to tell an unloaded unit from a
+\ failed stop; SERVICE logs the stop's failure.
+: A-FAILED-RELEASE-SKIPS-THE-CHANGE-AND-RESTORES ( ^ARENA:arena -- )
+   {: ar :}
+   s" a_failed_release_skips_the_change_and_restores" T-LABEL
+   s" active" 0 1 ar STATEFUL {: d c :}
+   d s" stderr.txt" ar INSIDE {: p :}
+   0 CHANGES !
+   [: c [: d swap WATCHED ;] ar SETUP-RELEASED ;] p str> ar
+   STDERR:CAPTURING {: code:n e:^ eu:n :}
+   CHANGES @ 0 T=
+   code SERVICE:E-UNSUCCESSFUL T=
+   e eu s" service: " CONTAINS? TTRUE
+   d ar TRACE {: log state :}
+   log str> S\" show\nstop\nlist-units\nreset-failed\nstart\n" T$=
+   state str> S\" active\n" T$=
+   d str> FS:REMOVE-TREE ;
+
+
 \ ---- the built program
 
 : BUILD-ARGS ( str -- )
@@ -426,6 +597,10 @@ TYPED-VARIABLE SHOWN str
    ar SETTINGS-SHOW-THE-STORED-ROOT-WHEN-IT-IS-UNAVAILABLE
    ar SETTINGS-JSON-IS-ONE-DOCUMENT-WHEN-THE-ROOT-IS-AVAILABLE
    ar SERVICE-COMMANDS-RESET-THE-START-LIMIT-BEFORE-A-START
+   ar RESTORE-GOAL-RESTORES-ONLY-AFTER-A-SPAWNED-RELEASE
+   ar A-CHANGE-RUNS-WHILE-THE-SERVICE-IS-RELEASED
+   ar A-FAILED-CHANGE-STILL-RESTORES-THE-SERVICE
+   ar A-FAILED-RELEASE-SKIPS-THE-CHANGE-AND-RESTORES
    ar PROGRAM ;
 
 : RUN-SUITE ( -- )

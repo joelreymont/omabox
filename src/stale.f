@@ -23,6 +23,7 @@ require src/lib/span.f
 require src/lib/vector.f
 require src/lib/adt/option.f
 require src/lib/fmt.f
+require src/lib/fd.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
 require src/lib/fs-anchored.f
@@ -225,16 +226,22 @@ private
    ;MATCH ;
 
 \ The error as Rust's io::Error displays an OS error.
-: ERROR. ( n -- )
-   {: e:n :}
-   e FS:ERRNO$ type s"  (os error " type e FMT:INT$ type s" )" type ;
+: ERROR-OUT ( n fd -- )
+   {: e:n f:fd :}
+   f e FS:ERRNO$ FD:WRITE-FULL
+   f s"  (os error " FD:WRITE-FULL
+   f e FMT:INT$ FD:WRITE-FULL
+   f s" )" FD:WRITE-FULL ;
 
-: LINE ( ^leftover -- )
-   {: l :}
-   s" Left a stale temporary in place: could not " type
-   l LEFTOVER-OPERATION @ OPERATION-TEXT type
-   s"  `" type l LEFTOVER-PATH @ str> type s" `: " type
-   l LEFTOVER-ERRNO @ ERROR. cr ;
+: LINE ( ^leftover fd -- )
+   {: l f:fd :}
+   f s" Left a stale temporary in place: could not " FD:WRITE-FULL
+   f l LEFTOVER-OPERATION @ OPERATION-TEXT FD:WRITE-FULL
+   f s"  `" FD:WRITE-FULL
+   f l LEFTOVER-PATH @ str> FD:WRITE-FULL
+   f s" `: " FD:WRITE-FULL
+   l LEFTOVER-ERRNO @ f ERROR-OUT
+   f s\" \n" FD:WRITE-FULL ;
 
 public
 
@@ -245,10 +252,11 @@ public
 
 : ERRNO ( ^leftover -- n ) LEFTOVER-ERRNO @ ;
 
-\ One line on stdout for each leftover.
-: REPORT ( ^VEC:vector<leftover> -- )
-   {: v :}
-   v VEC:COUNT 0 ?do v i VEC:AT LINE loop ;
+\ One line on the fd for each leftover; a failed write throws FD's code,
+\ where `type` would drop it.
+: REPORT ( ^VEC:vector<leftover> fd -- )
+   {: v f:fd :}
+   v VEC:COUNT 0 ?do v i VEC:AT f LINE loop ;
 
 \ The directory, then the prefix and the suffix of the names to sweep.
 : SWEEP ( str ^u8 n ^u8 n ^ARENA:arena -- ^VEC:vector<leftover> )
