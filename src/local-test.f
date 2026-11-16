@@ -1073,9 +1073,10 @@ variable RAISED-ERRNO
 
 : WALK-KIND ( n -- n ) WALK-UNKNOWN REASON-KIND ;
 
-: ESCAPES ( n -- )
-   1 RAISED {: code:n :}
-   [: code WALK-KIND drop ;] E-IO TTHROWSQ ;
+: ESCAPES ( n n -- )
+   {: e:n want:n :}
+   e 1 RAISED {: code:n :}
+   [: code WALK-KIND drop ;] want TTHROWSQ ;
 
 : READS-AS ( n n -- )
    {: e:n want:n :}
@@ -1084,8 +1085,8 @@ variable RAISED-ERRNO
 \ A reason carries no path: the caller holds the one it observed.
 : ONLY-EXHAUSTION-ESCAPES-A-FAILURE-RAISED-AGAINST-ONE-ENTRY ( -- )
    s" only_exhaustion_escapes_a_failure_raised_against_one_entry" T-LABEL
-   FS:EMFILE ESCAPES FS:ENFILE ESCAPES
-   FS:ENOMEM ESCAPES FS:ENOSPC ESCAPES
+   FS:EMFILE E-IO ESCAPES FS:ENFILE E-IO ESCAPES
+   FS:ENOMEM E-IO ESCAPES FS:ENOSPC E-DISK-FULL ESCAPES
    FS:ENOENT INCOMPLETE READS-AS FS:ENOTDIR INCOMPLETE READS-AS
    FS:ELOOP INCOMPLETE READS-AS FS:ESTALE INCOMPLETE READS-AS
    \ Anticipated or not, an errno raised against one object concerns that

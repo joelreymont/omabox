@@ -5,8 +5,9 @@
 \ this file lays in the program as it loads; any version but 0 and 8 is
 \ refused unchanged, and OPEN-READ refuses any but 8. A SQLite failure is
 \ SQLITE's throw, passed up unchanged. JOURNAL's own failures are logged
-\ once with the Rust version's text, then thrown as its codes. E-FILE and
-\ E-ROOT leave the host errno in FS:ERRNO, 0 where there is none.
+\ once with the Rust version's text, then thrown as its codes. E-FILE,
+\ E-DISK-FULL and E-ROOT leave the host errno in FS:ERRNO, 0 where there
+\ is none; E-DISK-FULL is E-FILE on ENOSPC.
 \ A root binding is the root's inode, birth time and subvolume: btrfs gives
 \ a subvolume a new device number at every mount, so the device is none
 \ of it. A binding with no birth time is one a version-6 journal recorded;
@@ -61,6 +62,7 @@ public
    ERROR:CODE E-NO-BIRTH-TIME
 -100305 s" sync root could not be opened or inspected"
    ERROR:CODE E-ROOT
+-100306 s" journal operation found the disk full" ERROR:CODE E-DISK-FULL
 
 \ The connection and the path it was opened on, which logs name.
 STRUCTURE journal OPAQUE
@@ -173,7 +175,9 @@ s" migrations/0008.sql" create V8 LAY
    errno 0= if code LOG:CODE+ else errno FS:ERRNO$ LOG:TEXT+ then
    LOG:;LINE errno FS:CAUSE! ;
 
-: FILE-FAILED ( str str n n -- ) LOG-FAILED E-FILE throw ;
+: FILE-FAILED ( str str n n -- )
+   dup FS:ENOSPC = {: full:bool :}
+   LOG-FAILED full if E-DISK-FULL else E-FILE then throw ;
 
 \ The sync root's failure, logged as FILE-FAILED logs one.
 : ROOT-FAILED ( str str n n -- ) LOG-FAILED E-ROOT throw ;

@@ -16,7 +16,7 @@
 \ answer the replay contract refuses is logged once with the Rust
 \ version's text, naming the plan's path, then thrown as
 \ E-INVALID-STATE. A failed retention or upload-stage syscall is logged
-\ once, by LOCAL, and thrown as LOCAL's E-IO.
+\ once, by LOCAL, and thrown as LOCAL's E-IO, or E-DISK-FULL on ENOSPC.
 \ STORAGE CLASS. No state of its own. CALLER-OWNED: a report, its
 \ vector, a replay pass's context, a download's bridge, and every value
 \ a journal step or a conflict copy reads lie in the arena the caller

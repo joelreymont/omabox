@@ -30,7 +30,7 @@ package CONFIG-TEST
 ;package
 
 
-\ CONFIG reopened for projection, XDG resolution and fields, realpath, two
+\ CONFIG reopened for projection, XDG resolution and fields, realpath, three
 \ failure words and a lock's descriptor; each name lands in CONFIG-TEST.
 package CONFIG
 
@@ -65,6 +65,8 @@ package CONFIG
    PATH-ROLE-STATE p SECURE-FAILED ;
 
 : CONFIG-TEST:ACQUIRE-FAILED ( abs-path -- ) ACQUIRE-FAILED ;
+
+: CONFIG-TEST:OPEN-FAILED ( abs-path -- ) OPEN-FAILED ;
 
 : CONFIG-TEST:LOCK-FD ( lock -- lock n )
    LOCK-UNMAKE {: f:fd p :}
@@ -220,6 +222,7 @@ variable CAUSE
    case
       CONFIG:E-PATH-NOT-ABSOLUTE of s" Use an absolute path so the unattended service resolves it consistently." endof
       CONFIG:E-READ of s" Create a readable file containing an absolute `sync_root` and a `dropbox_app_key`." endof
+      CONFIG:E-MISSING of s" Create a readable file containing an absolute `sync_root` and a `dropbox_app_key`." endof
       CONFIG:E-PARSE of s" The file may contain only `sync_root` and `dropbox_app_key`; credentials do not belong in configuration." endof
       CONFIG:E-EMPTY-APP-KEY of s" Set `dropbox_app_key` to the public app key from the Dropbox developer console." endof
       CONFIG:E-RESOLVE-SYNC-ROOT of s" Create the sync root as a local directory and ensure it is accessible." endof
@@ -655,6 +658,19 @@ variable CAUSE
    s" `" S+ REFUSED
    CAUSE @ FS:EINVAL T= ;
 
+: OPEN-FULL ( -- )
+   FS:ENOSPC FS:CAUSE!
+   s" daemon.lock" P CONFIG-TEST:OPEN-FAILED ;
+
+\ E-DISK-FULL's help is the failing word's, so only the code is checked.
+: OPEN-DISK-FULL ( -- ) ['] OPEN-FULL LOGGED CONFIG:E-DISK-FULL T= ;
+
+: SECURE-FULL ( -- )
+   FS:ENOSPC FS:CAUSE!
+   s" state" P CONFIG-TEST:SECURE-FAILED ;
+
+: SECURE-DISK-FULL ( -- ) ['] SECURE-FULL LOGGED CONFIG:E-DISK-FULL T= ;
+
 
 \ ---- config.toml
 
@@ -729,7 +745,7 @@ variable CAUSE
 
 : NO-FILE ( -- )
    FIXTURE
-   ['] DOCUMENT-DROP CONFIG:E-READ READ-TEXT REFUSED
+   ['] DOCUMENT-DROP CONFIG:E-MISSING READ-TEXT REFUSED
    CAUSE @ FS:ENOENT T= ;
 
 \ The lowest free descriptor.
@@ -800,6 +816,8 @@ public
    s" a close-on-exec lock descriptor" ['] LOCK-CLOEXEC RUN-CASE
    s" a directory that cannot be secured" ['] SECURE-FAILS RUN-CASE
    s" a lock that cannot be acquired" ['] ACQUIRE-FAILS RUN-CASE
+   s" a lock file on a full disk" ['] OPEN-DISK-FULL RUN-CASE
+   s" a directory secured on a full disk" ['] SECURE-DISK-FULL RUN-CASE
    s" a basic string" ['] BASIC RUN-CASE
    s" a literal string" ['] LITERAL RUN-CASE
    s" a multi-line basic string" ['] ML-BASIC RUN-CASE

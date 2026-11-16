@@ -20,7 +20,8 @@
 \ openat2 answers ELOOP. A read's parents open by O_PATH, so they need
 \ search permission only; a write's open O_RDONLY, so they need read
 \ permission too. An io failure's errno stays in FS:ERRNO, 0 where the
-\ Habu word that failed keeps none.
+\ Habu word that failed keeps none; on ENOSPC the code is E-DISK-FULL, not
+\ E-IO.
 \ LOCAL logs a failure once, with its text, where it throws, unless the
 \ catch around it turns it into an outcome: CONVERTING runs a word under a
 \ predicate naming the codes and errnos its caller converts, and QUIET?
@@ -91,6 +92,8 @@ public
    ERROR:CODE E-HASH-READ
 -100510 s" the upload source changed or vanished while it was read"
    ERROR:CODE E-SOURCE-CHANGED
+-100511 s" a local filesystem operation found the disk full"
+   ERROR:CODE E-DISK-FULL
 
 \ The side whose bytes a conflict copy holds.
 ENUM conflict-side local remote ;ENUM
@@ -234,7 +237,8 @@ private
 
 public
 
-: IO-FAILURE ( ^u8 n ^u8 n -- ) E-IO IO-FAILS ;
+: IO-FAILURE ( ^u8 n ^u8 n -- )
+   FS:ERRNO FS:ENOSPC = if E-DISK-FULL else E-IO then IO-FAILS ;
 
 private
 
@@ -4925,7 +4929,7 @@ private
       some OF p u dirs KEEP-RENAMEABLE ENDOF
    ;MATCH ;
 
-\ The rename hook, its file failures thrown as E-IO.
+\ The rename hook, its file failures thrown by IO-FAILURE.
 : BEFORE-RENAME ( [ -- ] ^u8 n -- )
    {: hook p:^ u:n :}
    hook [: s" rename local entry" p u IO-FAILURE ;] FS-FAILS ;

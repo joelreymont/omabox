@@ -127,7 +127,16 @@ TYPED-VARIABLE LINK REPLAY:link
    f DROPBOX TEXT=
    SECRET:E-CONFIG CODE-FAILURE {: g :}
    g construct disposition environmental KIND=
-   g CREDENTIALS TEXT= ;
+   g CREDENTIALS TEXT=
+   JOURNAL:E-DISK-FULL CODE-FAILURE {: j :}
+   j construct disposition environmental KIND=
+   j DISK-FULL TEXT=
+   CONFIG:E-DISK-FULL CODE-FAILURE {: c :}
+   c construct disposition environmental KIND=
+   c DISK-FULL TEXT=
+   CONFIG:E-MISSING CODE-FAILURE {: m :}
+   m construct disposition user-action KIND=
+   m SETUP TEXT= ;
 
 : REJECTED-TOKEN-EXITS-WITHOUT-REBUILDING-THE-DOWNLOAD-POOL ( -- )
    s" rejected_token_exits_without_rebuilding_the_download_pool"
@@ -150,8 +159,7 @@ TYPED-VARIABLE LINK REPLAY:link
 
 : LOCAL-AND-NESTED-FAILURES-KEEP-THEIR-INTENDED-POLICY ( -- )
    s" local_and_nested_failures_keep_their_intended_policy" T-LABEL
-   FS:ENOSPC FS:CAUSE!
-   LOCAL:E-IO CODE-FAILURE {: f :}
+   LOCAL:E-DISK-FULL CODE-FAILURE {: f :}
    f construct disposition environmental KIND=
    f DISK-FULL TEXT=
    LOCAL:E-UNSAFE-PATH CODE-FAILURE

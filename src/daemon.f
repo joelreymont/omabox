@@ -2,10 +2,11 @@
 \ failure policy maps each code a step throws, and each Dropbox reply
 \ that ends a step, to a failure: a disposition, which decides whether
 \ the daemon waits and tries again or exits, and the status text the
-\ widget shows. A code that keeps the host errno is DISK-FULL where the
-\ Rust version checks for a full disk and FS:ERRNO is ENOSPC. A code no
-\ row names is an invariant, INTERNAL. VALIDATE checks a client's account,
-\ namespace and remote root once, and the journal's binding every time.
+\ widget shows. No row reads FS:ERRNO, which cleanup on the way up may
+\ clear: a full disk and a missing config.toml are codes of their own. A
+\ code no row names is an invariant, INTERNAL. VALIDATE checks a client's
+\ account, namespace and remote root once, and the journal's binding every
+\ time.
 \ RUN is the daemon: the machine DAEMON-RUN prepares, locks, opens the
 \ journal, tells systemd it is ready, then syncs and long-polls until a
 \ failure stops it, and RUN answers the exit status.
@@ -107,15 +108,6 @@ STRUCTURE failure
 : RETRY ( n -- failure )
    construct disposition retry DROPBOX FAILURE-MAKE ;
 
-\ Rust's disk_full: t, or DISK-FULL when the errno kept is ENOSPC.
-: SPACE-OR ( str -- failure )
-   FS:ERRNO FS:ENOSPC = if drop DISK-FULL then ENVIRONMENTAL ;
-
-\ A missing config.toml is setup not yet run.
-: CONFIG-READ ( -- failure )
-   FS:ERRNO FS:ENOENT = if SETUP USER-ACTION exit then
-   CONFIGURATION ENVIRONMENTAL ;
-
 \ Rust's config_policy and lock_policy.
 : CONFIG-POLICY ( n -- failure )
    case
@@ -123,7 +115,8 @@ STRUCTURE failure
          CONFIGURATION-INVALID USER-ACTION endof
       CONFIG:E-PATH-NOT-ABSOLUTE of
          CONFIGURATION-INVALID USER-ACTION endof
-      CONFIG:E-READ of CONFIG-READ endof
+      CONFIG:E-READ of CONFIGURATION ENVIRONMENTAL endof
+      CONFIG:E-MISSING of SETUP USER-ACTION endof
       CONFIG:E-PARSE of CONFIGURATION-INVALID USER-ACTION endof
       CONFIG:E-EMPTY-APP-KEY of
          CONFIGURATION-INVALID USER-ACTION endof
@@ -133,11 +126,12 @@ STRUCTURE failure
       CONFIG:E-INSPECT-PATH of SYNC-ROOT ENVIRONMENTAL endof
       CONFIG:E-INSIDE-SYNC-ROOT of
          CONFIGURATION-INVALID USER-ACTION endof
-      CONFIG:E-CREATE-DIRECTORY of STATE SPACE-OR endof
-      CONFIG:E-SECURE-DIRECTORY of STATE SPACE-OR endof
-      CONFIG:E-LOCK-OPEN of STATE SPACE-OR endof
+      CONFIG:E-CREATE-DIRECTORY of STATE ENVIRONMENTAL endof
+      CONFIG:E-SECURE-DIRECTORY of STATE ENVIRONMENTAL endof
+      CONFIG:E-LOCK-OPEN of STATE ENVIRONMENTAL endof
       CONFIG:E-ALREADY-RUNNING of RUNNING USER-ACTION endof
-      CONFIG:E-LOCK-ACQUIRE of STATE SPACE-OR endof
+      CONFIG:E-LOCK-ACQUIRE of STATE ENVIRONMENTAL endof
+      CONFIG:E-DISK-FULL of DISK-FULL ENVIRONMENTAL endof
       INTERNAL INVARIANT swap
    endcase ;
 
@@ -145,7 +139,8 @@ STRUCTURE failure
 \ local_root_policy's file failure.
 : JOURNAL-POLICY ( n -- failure )
    case
-      JOURNAL:E-FILE of JOURNAL SPACE-OR endof
+      JOURNAL:E-FILE of JOURNAL ENVIRONMENTAL endof
+      JOURNAL:E-DISK-FULL of DISK-FULL ENVIRONMENTAL endof
       JOURNAL:E-JSON of JOURNAL-INVALID INVARIANT endof
       JOURNAL:E-INVALID-STATE of JOURNAL-INVALID INVARIANT endof
       JOURNAL:E-UNSUPPORTED-VERSION of
@@ -198,8 +193,9 @@ STRUCTURE failure
       LOCAL:E-CONTENT-HASH of INTERNAL INVARIANT endof
       LOCAL:E-CORRUPT of SYNC-ERRORS ENVIRONMENTAL endof
       LOCAL:E-OCCUPIED of SYNC-ERRORS ENVIRONMENTAL endof
-      LOCAL:E-IO of SYNC-ROOT SPACE-OR endof
-      LOCAL:E-STAGE-READ of SYNC-ROOT SPACE-OR endof
+      LOCAL:E-IO of SYNC-ROOT ENVIRONMENTAL endof
+      LOCAL:E-STAGE-READ of SYNC-ROOT ENVIRONMENTAL endof
+      LOCAL:E-DISK-FULL of DISK-FULL ENVIRONMENTAL endof
       LOCAL:E-SOURCE-CHANGED of SYNC-ERRORS ENVIRONMENTAL endof
       INTERNAL INVARIANT swap
    endcase ;

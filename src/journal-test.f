@@ -773,6 +773,16 @@ variable SCANNED       \ query plan rows that scan the table
    path SUBJECT !
    [: SUBJECT @ OPEN CLOSE ;] E-FILE dir t tu ar LOGGED ;
 
+\ A file failure on ENOSPC throws E-DISK-FULL, logged as E-FILE is.
+: A-FULL-DISK-IS-ITS-OWN-CODE ( ^ARENA:arena -- )
+   {: ar :}
+   s" a full disk is its own code" T-LABEL
+   ar SCRATCH {: d:str :}
+   d SUBJECT !
+   [: s" create journal database" >str SUBJECT @ E-FS-OPEN FS:ENOSPC
+      FILE-FAILED ;] E-DISK-FULL d CREATE-FAILED ar LOGGED
+   d GONE ;
+
 : JOURNAL-CREATION-REPORTS-ITS-OWN-FILESYSTEM-FAILURE
    ( ^ARENA:arena -- )
    {: ar :}
@@ -3211,6 +3221,7 @@ variable CRAFT
    ar EVERY-CONNECTION-WAITS-OUT-A-CONCURRENT-COMMIT
    ar WRITABLE-JOURNAL-USES-FULL-SYNCHRONOUS-ROLLBACK-MODE
    ar JOURNAL-CREATION-REPORTS-ITS-OWN-FILESYSTEM-FAILURE
+   ar A-FULL-DISK-IS-ITS-OWN-CODE
    ar A-FAILED-OPEN-KEEPS-THE-HOST-ERRNO
    ar WRITABLE-JOURNAL-NEVER-TRUNCATES-AN-EXISTING-DATABASE
    ar JOURNAL-REFUSES-A-SYMLINKED-DATABASE

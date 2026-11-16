@@ -26,10 +26,12 @@
 \ any of the four TOML strings with every TOML escape. Anything else is
 \ E-PARSE; a file that is not UTF-8 is E-READ.
 \ A refusal logs two lines, the Rust error's text with the path or field it
-\ names and then its help, and throws. E-READ, E-RESOLVE-SYNC-ROOT,
-\ E-INSPECT-PATH, E-CREATE-DIRECTORY, E-SECURE-DIRECTORY, E-LOCK-OPEN and
-\ E-LOCK-ACQUIRE leave the host errno in FS:ERRNO, 0 where the Rust error
-\ has none; the other codes leave 0.
+\ names and then its help, and throws. E-READ, E-MISSING,
+\ E-RESOLVE-SYNC-ROOT, E-INSPECT-PATH, E-CREATE-DIRECTORY,
+\ E-SECURE-DIRECTORY, E-LOCK-OPEN, E-LOCK-ACQUIRE and E-DISK-FULL leave the
+\ host errno in FS:ERRNO, 0 where the Rust error has none; the other codes
+\ leave 0. E-MISSING is E-READ on ENOENT, and E-DISK-FULL is
+\ E-CREATE-DIRECTORY, E-SECURE-DIRECTORY or E-LOCK-OPEN on ENOSPC.
 \ STORAGE CLASS. CALLER-OWNED: every record and path a word answers is laid
 \ in the arena its caller passes; a lock's path stays in its paths'.
 \ PREPARE-PATHS's projections live in an arena of its own, released on
@@ -78,6 +80,9 @@ public
 -100212 s" another Omabox daemon is already running"
    ERROR:CODE E-ALREADY-RUNNING
 -100213 s" could not acquire daemon lock" ERROR:CODE E-LOCK-ACQUIRE
+-100214 s" Omabox configuration does not exist" ERROR:CODE E-MISSING
+-100215 s" could not write Omabox state: the disk is full"
+   ERROR:CODE E-DISK-FULL
 
 \ An absolute path's bytes as Rust's PathBuf holds them.
 DEFTYPE ABS-PATH str
@@ -334,7 +339,7 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
    p QUOTED+
    s" Create a readable file containing an absolute `sync_root`" HELP
    s"  and a `dropbox_app_key`." LOG:TEXT+
-   E-READ cause FAIL ;
+   cause FS:ENOENT = if E-MISSING else E-READ then cause FAIL ;
 
 : PARSE-FAILED ( abs-path -- )
    {: p :}
@@ -1193,7 +1198,8 @@ private
    s"  at " LOG:TEXT+ p QUOTED+
    s" Ensure the XDG state location is writable and has sufficient" HELP
    s"  space." LOG:TEXT+
-   E-CREATE-DIRECTORY cause FAIL ;
+   cause FS:ENOSPC = if E-DISK-FULL else E-CREATE-DIRECTORY then
+   cause FAIL ;
 
 : SECURE-FAILED ( path-role abs-path -- )
    {: role p :}
@@ -1202,7 +1208,8 @@ private
    s"  at " LOG:TEXT+ p QUOTED+
    s" Ensure the XDG state location is owned by this user and" HELP
    s"  retry." LOG:TEXT+
-   E-SECURE-DIRECTORY cause FAIL ;
+   cause FS:ENOSPC = if E-DISK-FULL else E-SECURE-DIRECTORY then
+   cause FAIL ;
 
 \ One runtime directory made, then set 0700 whatever the umask left.
 : MAKE-PRIVATE ( ^paths path-role -- )
@@ -1229,7 +1236,7 @@ private
    FS:ERRNO {: cause:n :}
    LOG-OPEN s" could not open daemon lock file " LOG:TEXT+ p QUOTED+
    s" Ensure the Omabox state directory is writable and retry." HELP
-   E-LOCK-OPEN cause FAIL ;
+   cause FS:ENOSPC = if E-DISK-FULL else E-LOCK-OPEN then cause FAIL ;
 
 : ALREADY-RUNNING ( -- )
    LOG-OPEN s" another Omabox daemon is already running" LOG:TEXT+
