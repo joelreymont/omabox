@@ -1105,3 +1105,46 @@ costing a round.
 Refreshing the shared engine to Habu master took 9 seconds to reach a
 fixpoint (generation 2 matched generation 1), then 114 seconds for
 Habu's 285 suites to qualify it.
+
+## 2026-11-16: a denied write explains itself
+
+A denied local write now ends the pass with one line that names the
+call, the path and the errno's text. It also gives the mode, owner and
+attributes of the directory and of the entry, and the uid Omabox runs
+as. A user reading it can see why the write was refused without
+running `ls -l` or `id`. Rust's line gives the errno alone. Habu had no
+words for any of these facts, so the work began in Habu's library:
+statx's permission fields, the effective uid, the path behind a
+descriptor, and an octal number of fixed width. Omabox then used them
+at each call in LOCAL that makes, links, renames or removes a name, and
+at REPLAY's payload removal.
+
+The checker cannot see that a quotation always throws. MOVE-FAILED
+answers a stage outcome and ends by running its `fail` quotation,
+which throws. Because the quotation is typed `[ -- ]`, the word looked
+as if it answered nothing, so a throw that never runs follows it. A
+word whose body ends in `throw` is already known not to return; a
+quotation is not. Rust has `!` for this.
+
+The feature review mutated the code and found four behaviours that
+every test would still pass with the code wrong. One was a failure the
+caller converts, which must log nothing; another was the order of the
+two directories in a refused rename. Each fix was a test that fails
+under a named mutation, and the worker ran each mutation to show it.
+The review also found a directory open on a write path still giving
+the old line, which made the file's header sentence false. My brief
+for one test put a download slot in the wrong directory. The worker
+probed the real line, found the slot and the stage in different
+directories, and stopped. That made a better test, because the order
+of two different directories can be checked.
+
+Name clashes cost three more rounds in one day:
+- Names are case-insensitive, so a planning word called `HOLD` hid
+  Forth's `hold` inside the package.
+- An enum variant cannot share a structure's name, so the pass state
+  `planning` had to become `deciding`.
+- The test file reopens the package, so `RECORD` and `RECORDED?`
+  were already taken.
+
+None of these is a defect. They are what one flat namespace per
+package costs, where Rust has modules, scoping and case.
