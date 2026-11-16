@@ -3,7 +3,9 @@
 \ header, the token's refresh, its rotation and the store that keeps it, a
 \ rejected grant, a revoked token, access denied, rate limits,
 \ outages, a redirect, a malformed request, the listing, the long poll,
-\ downloads, delete, create-folder, the code exchange, Dropbox's content
+\ downloads, whose body reads through READ-BODY (whole, resumed, a 416
+\ at the end, a body that throws before or after its end, one left
+\ unread, one cut mid-body, an empty file), delete, create-folder, the code exchange, Dropbox's content
 \ hash and uploads, whose stages are written under TMPDIR and removed once
 \ open, so no run leaves one; a mutation or session finish Dropbox answers
 \ at another path, an upload's that get_metadata then does not find, a
@@ -853,17 +855,25 @@ variable GOT-U
 create SUNK 64 allot
 variable SUNK-U
 variable SUNK-AT
+variable SUNK-SIZE
+variable BODIES
+variable BODY-CODE
 
 
-\ A download's sink: each chunk appended to SUNK, its offset the one after
-\ the last; SUNK-AT keeps the first chunk's.
-: SUNK+ ( ^u8 n n -- )
-   {: a:^ u:n off:n :}
-   SUNK-U @ 0= if off SUNK-AT ! then
-   off SUNK-AT @ SUNK-U @ + T=
-   SUNK-U @ u + 64 > if false ASSERT exit then
-   a SUNK SUNK-U @ + u BYTE-COPY
-   u SUNK-U +! ;
+: SUNK-CLEAR ( -- )
+   0 SUNK-U ! -1 SUNK-AT ! -1 SUNK-SIZE ! 0 BODIES ! 0 BODY-CODE ! ;
+
+
+\ A download's body: read whole into SUNK, at most 7 bytes a read so
+\ reads end inside a chunk; BODIES counts its calls.
+: SUNK-BODY ( n n ^DROPBOX:fetch -- )
+   {: at:n size:n f :}
+   1 BODIES +! at SUNK-AT ! size SUNK-SIZE !
+   begin
+      SUNK SUNK-U @ + 64 SUNK-U @ - 7 min f DROPBOX:READ-BODY
+      dup 0 > while
+      SUNK-U +!
+   repeat drop ;
 
 
 : SUNK$ ( -- ^u8 n ) SUNK SUNK-U @ ;
@@ -879,16 +889,17 @@ variable SUNK-AT
 
 : FETCH ( n -- DROPBOX:reply )
    {: at:n :}
-   0 SUNK-U ! -1 SUNK-AT !
-   s" 0160a1b2c3d4" at MAIN @ [: SUNK+ ;] DROPBOX:DOWNLOAD ;
+   SUNK-CLEAR
+   s" 0160a1b2c3d4" at MAIN @ [: SUNK-BODY ;] DROPBOX:DOWNLOAD ;
 
 
 : WHOLE-CASE ( -- )
    s" download whole" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
    0 FETCH DONE? ASSERT
+   BODIES @ 1 T=
    SUNK$ s" abcdefghijklmnopqrstuvwxyz" T$=
-   SUNK-AT @ 0 T=
+   SUNK-AT @ 0 T= SUNK-SIZE @ 26 T=
    MAIN @ DROPBOX:ENTRY {: e :}
    e DROPBOX-ENTRY:REV @ SPAN:$ s" 0160a1b2c3d4" T$=
    e DROPBOX-ENTRY:SIZE @ 26 T=
@@ -902,8 +913,9 @@ variable SUNK-AT
    s" download resumed" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
    10 FETCH DONE? ASSERT
+   BODIES @ 1 T=
    SUNK$ s" klmnopqrstuvwxyz" T$=
-   SUNK-AT @ 10 T=
+   SUNK-AT @ 10 T= SUNK-SIZE @ 26 T=
    TEST-DROPBOX:RANGE-SENT$ s" bytes=10-" T$=
    MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:SIZE @ 26 T= ;
 
@@ -916,24 +928,26 @@ variable SUNK-AT
    TEST-DROPBOX:RESET ALPHABET
    TEST-DROPBOX:SKEW
    [: FETCH-DROPPED ;] DROPBOX:E-ANSWER TTHROWSQ
-   SUNK-U @ 0 T= ;
+   BODIES @ 0 T= ;
 
 
-: UNSATISFIED-CASE ( -- )
-   s" download 416 from the end restarts" T-LABEL
+\ A 416 whose length is the offset asked: the bytes before it are the
+\ whole file, so the body reads its end at once and nothing restarts.
+: COMPLETE-CASE ( -- )
+   s" download 416 at the end is complete" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
    26 FETCH DONE? ASSERT
-   SUNK$ s" abcdefghijklmnopqrstuvwxyz" T$=
-   SUNK-AT @ 0 T=
-   TEST-DROPBOX:SEEN$ s" /2/files/download /2/files/download" T$=
-   TEST-DROPBOX:RANGE-SENT? TFALSE
-   MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:SIZE @ 26 T= ;
+   BODIES @ 1 T= SUNK-U @ 0 T=
+   SUNK-AT @ 26 T= SUNK-SIZE @ 26 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/download" T$=
+   TEST-DROPBOX:RANGE-SENT$ s" bytes=26-" T$= ;
 
 
 : RESTART-CASE ( -- )
    s" download 416 of another size" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
    30 FETCH DONE? ASSERT
+   BODIES @ 1 T=
    SUNK$ s" abcdefghijklmnopqrstuvwxyz" T$=
    SUNK-AT @ 0 T=
    TEST-DROPBOX:RANGE-SENT? TFALSE
@@ -951,7 +965,7 @@ variable SUNK-AT
    UNSATISFIABLE! UNSATISFIABLE!
    [: FETCH-DROPPED ;] DROPBOX:E-ANSWER TTHROWSQ
    TEST-DROPBOX:SEEN$ s" /2/files/download /2/files/download" T$=
-   SUNK-U @ 0 T= ;
+   BODIES @ 0 T= ;
 
 
 : FIRST-UNSATISFIABLE-CASE ( -- )
@@ -960,16 +974,16 @@ variable SUNK-AT
    UNSATISFIABLE!
    [: 0 FETCH DONE? drop ;] DROPBOX:E-ANSWER TTHROWSQ
    TEST-DROPBOX:SEEN$ s" /2/files/download" T$=
-   SUNK-U @ 0 T= ;
+   BODIES @ 0 T= ;
 
 
 : UNKNOWN-REV-CASE ( -- )
    s" download unknown rev" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
-   0 SUNK-U ! -1 SUNK-AT !
-   s" 0160ffffffff" 0 MAIN @ [: SUNK+ ;] DROPBOX:DOWNLOAD
+   SUNK-CLEAR
+   s" 0160ffffffff" 0 MAIN @ [: SUNK-BODY ;] DROPBOX:DOWNLOAD
    DROPBOX-ERROR:not-found REFUSED? ASSERT
-   SUNK-U @ 0 T= ;
+   BODIES @ 0 T= ;
 
 
 \ A download refused as a bad answer leaves the client usable.
@@ -990,12 +1004,12 @@ variable SUNK-AT
    s" 0160aaaaaaaa" TEST-DROPBOX:MISFILE
    [: WHOLE-DROPPED ;] LOGGED DROPBOX:E-ANSWER T=
    s" another rev" LOGGED? TTRUE
-   SUNK-U @ 0 T=
+   BODIES @ 0 T=
    USABLE ;
 
 
-\ The length is known once the body ended, so the bytes before it were
-\ handed to sink.
+\ The length is known once READ-BODY reached the body's end, so the
+\ body read the bytes before it.
 : SHORT-CASE ( -- )
    s" download of another length" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
@@ -1012,7 +1026,7 @@ variable SUNK-AT
    [: FETCH-DROPPED ;] LOGGED DROPBOX:E-ANSWER T=
    s" a whole file for a range" LOGGED? TTRUE
    TEST-DROPBOX:RANGE-SENT$ s" bytes=10-" T$=
-   SUNK-U @ 0 T=
+   BODIES @ 0 T=
    USABLE ;
 
 
@@ -1023,39 +1037,109 @@ variable SUNK-AT
    [: WHOLE-DROPPED ;] LOGGED DROPBOX:E-ANSWER T=
    s" a range nobody asked for" LOGGED? TTRUE
    TEST-DROPBOX:RANGE-SENT? TFALSE
-   SUNK-U @ 0 T=
+   BODIES @ 0 T=
    USABLE ;
 
 
-\ The next download cut mid-body: a retry, not a failure, so no log line.
+\ SUNK-BODY, keeping in BODY-CODE the code it ended with.
+: CODED-BODY ( n n ^DROPBOX:fetch -- )
+   {: at:n size:n f :}
+   [: at size f SUNK-BODY ;] catch {: code:n :}
+   code BODY-CODE !
+   code 0<> if code throw then ;
+
+
+: CUT-FETCH ( -- )
+   SUNK-CLEAR
+   s" 0160a1b2c3d4" 0 MAIN @ [: CODED-BODY ;] DROPBOX:DOWNLOAD
+   RETRY-MS 0 T= ;
+
+
+\ The next download cut mid-body: the body sees READ-BODY's throw, not an
+\ end, and the answer is a retry, not a failure, so no log line.
 : BROKEN-CASE ( -- )
    s" download cut mid-body" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
    TEST-DROPBOX:CUT-BODY
-   [: 0 FETCH RETRY-MS 0 T= ;] LOGGED 0 T=
+   [: CUT-FETCH ;] LOGGED 0 T=
    ERR-U @ 0 T=
+   BODIES @ 1 T=
+   BODY-CODE @ ERROR:TEXT$
+   s" a download's transfer ended inside its body" T$=
    SUNK-U @ 10 <= TTRUE
-   SUNK$ s" abcdefghij" SUNK-U @ min STR= TTRUE ;
+   SUNK$ s" abcdefghij" SUNK-U @ min STR= TTRUE
+   USABLE ;
 
 
-\ A sink that fails as a full disk would.
-: REFUSING ( ^u8 n n -- ) 2drop drop 77 throw ;
+\ A body that fails as a full disk would, before it reads.
+: REFUSING ( n n ^DROPBOX:fetch -- ) drop 2drop 77 throw ;
 
 
-\ DOWNLOAD rethrows its sink's throw and leaves the client usable.
-: SINK-THROWS-CASE ( -- )
-   s" download sink throws" T-LABEL
+\ DOWNLOAD rethrows its body's throw and leaves the client usable.
+: BODY-THROWS-CASE ( -- )
+   s" download body throws" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
    [: s" 0160a1b2c3d4" 0 MAIN @ [: REFUSING ;]
       DROPBOX:DOWNLOAD DONE? drop ;] 77 TTHROWSQ
-   s" /docs/abc.txt" MAIN @ DROPBOX:METADATA DONE? ASSERT ;
+   USABLE ;
+
+
+\ A body that reads to the end, then fails as a hash check would.
+: DISOWNING ( n n ^DROPBOX:fetch -- ) SUNK-BODY 78 throw ;
+
+
+\ A throw after READ-BODY reached the end finds the transfer ended:
+\ nothing is cancelled and the code is the body's own.
+: LATE-THROW-CASE ( -- )
+   s" download body throws after its end" T-LABEL
+   TEST-DROPBOX:RESET ALPHABET
+   SUNK-CLEAR
+   [: s" 0160a1b2c3d4" 0 MAIN @ [: DISOWNING ;]
+      DROPBOX:DOWNLOAD DONE? drop ;] 78 TTHROWSQ
+   SUNK$ s" abcdefghijklmnopqrstuvwxyz" T$=
+   USABLE ;
+
+
+\ A body that reads one chunk of at most 5 bytes and returns.
+: GLANCING ( n n ^DROPBOX:fetch -- )
+   {: f :} 2drop
+   1 BODIES +!
+   SUNK 5 f DROPBOX:READ-BODY SUNK-U ! ;
+
+
+\ A body left unread is cancelled; the answer is done and the client
+\ usable.
+: UNREAD-CASE ( -- )
+   s" download body left unread" T-LABEL
+   TEST-DROPBOX:RESET ALPHABET
+   SUNK-CLEAR
+   s" 0160a1b2c3d4" 0 MAIN @ [: GLANCING ;] DROPBOX:DOWNLOAD
+   DONE? ASSERT
+   BODIES @ 1 T=
+   SUNK$ s" abcde" T$=
+   USABLE ;
+
+
+\ An empty file: the body reads its end at once.
+: EMPTY-CASE ( -- )
+   s" download of an empty file" T-LABEL
+   TEST-DROPBOX:RESET
+   s" /docs/none.txt" s" /Docs/none.txt" s" 0160e0e0e0e0"
+   s" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+   0 TEST-DROPBOX:FILE!
+   s" 0160e0e0e0e0" s" " TEST-DROPBOX:CONTENT!
+   SUNK-CLEAR
+   s" 0160e0e0e0e0" 0 MAIN @ [: SUNK-BODY ;] DROPBOX:DOWNLOAD
+   DONE? ASSERT
+   BODIES @ 1 T= SUNK-U @ 0 T=
+   SUNK-AT @ 0 T= SUNK-SIZE @ 0 T= ;
 
 
 : DOWNLOAD-CASES ( -- )
-   WHOLE-CASE RESUME-CASE SKEW-CASE UNSATISFIED-CASE RESTART-CASE
+   WHOLE-CASE RESUME-CASE SKEW-CASE COMPLETE-CASE RESTART-CASE
    UNSATISFIABLE-CASE FIRST-UNSATISFIABLE-CASE UNKNOWN-REV-CASE
    OTHER-REV-CASE SHORT-CASE WHOLE-FOR-RANGE-CASE UNASKED-RANGE-CASE
-   BROKEN-CASE SINK-THROWS-CASE ;
+   BROKEN-CASE BODY-THROWS-CASE LATE-THROW-CASE UNREAD-CASE EMPTY-CASE ;
 
 
 \ ---- delete_v2, create_folder_v2 and the code exchange

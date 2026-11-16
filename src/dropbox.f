@@ -438,23 +438,24 @@ ENUM verdict
    until ;
 
 
-\ Runs reads, the reads of the transfer started on h. The one place a
-\ throw ends a transfer: whatever reads throws, ABANDONED ends the
-\ transfer and the code is rethrown. reads throws only while the
-\ transfer is in flight, never after a read that ended it.
-: READ-OUT ( CURL:handle ^client [ -- ] -- )
-   {: h:CURL:handle c reads :}
+\ Runs reads, the reads of the transfer started on h; ended answers
+\ whether a read ended it. The one place a throw ends a transfer: whatever
+\ reads throws, ABANDONED ends the transfer unless ended answers true, and
+\ the code is rethrown.
+: READ-OUT ( CURL:handle ^client [ -- ] [ -- bool ] -- )
+   {: h:CURL:handle c reads ended :}
    [: reads execute ;] catch {: code:n :}
    code 0= if exit then
-   h c ABANDONED
+   ended execute 0= if h c ABANDONED then
    code throw ;
 
 
-\ Sends the prepared request and reads its answer whole.
+\ Sends the prepared request and reads its answer whole. Nothing after the
+\ read that ended the transfer throws, so a throw finds it in flight.
 : TRANSFER ( ^client -- )
    {: c :}
    c STARTED {: h:CURL:handle :}
-   h c [: begin h c STEP until ;] READ-OUT
+   h c [: begin h c STEP until ;] [: false ;] READ-OUT
    c ENDED ;
 
 
@@ -1218,33 +1219,44 @@ ENUM verdict
 
 \ ---- the download's machine
 
+\ A step ends in streaming only with a new chunk held, none of it taken,
+\ and in drained once the reader reached the body's end.
+ENUM download-step DERIVE eq
+   opened streaming buffering answered drained lost ;ENUM
+ENUM read-event chunk response failure ;ENUM
+ENUM open-event passed other response failure ;ENUM
+
+
 \ One download's read, the machine's context: client and handle the
-\ call's; rev and offset the revision and offset asked; held the chunk read
-\ last and status its HTTP status, or a response's; failure a failed
-\ transfer's curl code; total the bytes handed to sink.
-STRUCTURE fetch DERIVE addr
+\ call's; rev and offset the revision and offset asked; step where the
+\ machine stands; held the chunk read last, taken the bytes of it the
+\ reader took, and status its HTTP status, or a response's; failure a
+\ failed transfer's curl code; total the bytes the reader took.
+public
+STRUCTURE fetch OPAQUE DERIVE addr
    FIELD client ^client
    FIELD handle CURL:handle
    FIELD rev SPAN:span<u8>
    FIELD offset n
+   FIELD step download-step
    FIELD held SPAN:span<u8>
+   FIELD taken n
    FIELD status n
    FIELD failure n
    FIELD total n
 ;STRUCTURE
+private
 
 HEAP FETCHES fetch
 
-\ A step ends in streaming only with a new chunk held, for sink.
-ENUM download-step DERIVE eq
-   opened streaming buffering answered lost ;ENUM
-ENUM read-event chunk response failure ;ENUM
-ENUM open-event passed other response failure ;ENUM
+-100008 s" a download's transfer ended inside its body"
+   ERROR:CODE E-BODY-LOST
 
 
 : HOLD ( CURL:http-status len ^u8 ^fetch -- )
    {: p:^ f :}
    LEN>N p swap SPAN:MAKE f FETCH-HELD !
+   0 f FETCH-TAKEN !
    CURL:HTTP-STATUS>N f FETCH-STATUS ! ;
 
 
@@ -1320,61 +1332,116 @@ FSM:DEFINE DOWNLOADING ( ^fetch ) download-step open-event
       failure   BROKE      >lost
    IN streaming  PULL ( read-event )
       chunk     -          >streaming
-      response  RESPONDED  >answered
+      response  RESPONDED  >drained
       failure   BROKE      >lost
    IN buffering  PULL ( read-event )
       chunk     ANSWER+    >buffering
       response  RESPONDED  >answered
       failure   BROKE      >lost
    FINAL answered  -
+   FINAL drained   -
    FINAL lost      -
 ;DEFINE
 
 
 : STREAMING? ( download-step -- bool )
    construct download-step streaming DOWNLOAD-STEP-EQ ;
+: DRAINED? ( download-step -- bool )
+   construct download-step drained DOWNLOAD-STEP-EQ ;
+: CUT? ( download-step -- bool )
+   construct download-step lost DOWNLOAD-STEP-EQ ;
 
 
-\ Hands the held chunk to sink at its file offset and counts it.
-: DELIVERED ( ^fetch [ ^u8 n n -- ] -- )
-   {: f sink :}
-   f FETCH-HELD @ SPAN:$ {: p:^ u:n :}
-   p u f FETCH-OFFSET @ f FETCH-TOTAL @ + sink execute
-   u f FETCH-TOTAL +! ;
+\ Whether the machine is at its end, so the transfer has ended.
+: FINAL? ( download-step -- bool )
+   {: s:download-step :}
+   s DRAINED? s CUT? or
+   s construct download-step answered DOWNLOAD-STEP-EQ or ;
 
 
-\ Steps the machine from opened to its end, answered or lost; each step
-\ that leaves it streaming hands its chunk to sink.
-: DRIVEN ( ^fetch [ ^u8 n n -- ] -- )
-   {: f sink :}
-   construct download-step opened
-   begin
-      f swap DOWNLOADING-STEP >r
-      dup STREAMING? if f sink DELIVERED then
-      r>
-   until drop ;
+\ Steps the machine once; true at its end.
+: STEPPED ( ^fetch -- bool )
+   {: f :}
+   f f FETCH-STEP @ DOWNLOADING-STEP {: s:download-step end:bool :}
+   s f FETCH-STEP !
+   end ;
+
+
+\ Whether the machine streams with its held chunk all taken.
+: STARVED? ( ^fetch -- bool )
+   {: f :}
+   f FETCH-STEP @ STREAMING? 0= if false exit then
+   f FETCH-TAKEN @ f FETCH-HELD @ SPAN:$ nip = ;
+
+
+\ Copies what fits in room of the held chunk's untaken bytes to p.
+: TAKEN ( ^u8 n ^fetch -- n )
+   {: p:^ room:n f :}
+   f FETCH-HELD @ SPAN:$ {: a:^ u:n :}
+   f FETCH-TAKEN @ {: at:n :}
+   u at - room min {: k:n :}
+   a at + p k BYTE-COPY
+   k f FETCH-TAKEN +! k f FETCH-TOTAL +!
+   k ;
+
+
+public
+
+\ The reader of a download's body: at most room of its next bytes into p,
+\ and how many, 0 at its end. A transfer lost inside the body throws
+\ E-BODY-LOST.
+: READ-BODY ( ^u8 n ^fetch -- n )
+   {: p:^ room:n f :}
+   begin f STARVED? while f STEPPED drop repeat
+   f FETCH-STEP @ {: s:download-step :}
+   s CUT? if E-BODY-LOST throw then
+   s STREAMING? 0= if 0 exit then
+   p room f TAKEN ;
+
+private
+
+
+: FILE-SIZE ( ^client -- n ) CLIENT-ENTRY DROPBOX-ENTRY:SIZE @ ;
+
+
+\ Hands body the offset, the file's size and the fetch to read. A body it
+\ leaves unread is cancelled, the machine left streaming; nothing throws
+\ after.
+: BODIED ( ^fetch [ n n ^fetch -- ] -- )
+   {: f body :}
+   f FETCH-CLIENT @ {: c :}
+   f FETCH-OFFSET @ c FILE-SIZE f body execute
+   f FETCH-STEP @ STREAMING? 0= if exit then
+   f FETCH-HANDLE @ c ABANDONED ;
+
+
+\ Steps the machine from opened: once the checks pass, body reads the
+\ body; otherwise the machine steps to its end.
+: DRIVEN ( ^fetch [ n n ^fetch -- ] -- )
+   {: f body :}
+   f STEPPED if exit then
+   f FETCH-STEP @ STREAMING? if f body BODIED exit then
+   begin f STEPPED until ;
 
 
 \ Sends the prepared request, reads its answer through DOWNLOADING
-\ under READ-OUT, and captures an arrived answer's header block.
-: RECEIVING ( ^client ^fetch [ ^u8 n n -- ] -- )
-   {: c f sink :}
+\ under READ-OUT, which finds the transfer ended once the machine is at its
+\ end, and captures an arrived answer's header block.
+: RECEIVING ( ^fetch [ n n ^fetch -- ] -- )
+   {: f body :}
+   f FETCH-CLIENT @ {: c :}
    c STARTED {: h:CURL:handle :}
    h f FETCH-HANDLE !
-   h c [: f sink DRIVEN ;] READ-OUT
+   h c [: f body DRIVEN ;] [: f FETCH-STEP @ FINAL? ;] READ-OUT
    c ENDED ;
 
 
-\ The prepared request's answer through RECEIVING: the bytes sink took.
-\ The fetch is made before the transfer starts, so nothing allocates
-\ while it is in flight but what READ-OUT covers.
-: STREAMED ( ^client ^u8 n n [ ^u8 n n -- ] -- n )
-   {: c r:^ ru:n at:n sink :}
-   FETCHES-NEW {: f :}
-   c f FETCH-CLIENT !
-   r ru SPAN:MAKE f FETCH-REV ! at f FETCH-OFFSET !
-   [: c f sink RECEIVING f FETCH-TOTAL @ ;]
-   [: f FETCHES-RELEASE ;] finally ;
+\ RECEIVING, where the reader's E-BODY-LOST ends: the machine is lost.
+: ABSORBED ( ^fetch [ n n ^fetch -- ] -- )
+   {: f body :}
+   [: f body RECEIVING ;] catch {: code:n :}
+   code 0= if exit then
+   code E-BODY-LOST <> if code throw then ;
 
 
 \ A 206 is a download's done too; RANGED checks it was asked for.
@@ -1384,53 +1451,104 @@ FSM:DEFINE DOWNLOADING ( ^fetch ) download-step open-event
    c CLASSIFY ;
 
 
-\ A done answer is the rev and range asked, checked here when no chunk came,
-\ and every byte after the offset.
-: VERIFIED ( ^client ^u8 n n n -- )
-   {: c r:^ ru:n at:n got:n :}
-   got 0= if c r ru at CHECKED then
-   c CLIENT-ENTRY DROPBOX-ENTRY:SIZE @ at - got <>
+\ A body of every byte after the offset.
+: SIZED ( ^client n n -- )
+   {: c at:n got:n :}
+   c FILE-SIZE at - got <>
    if c s" a body of another length" E-ANSWER FAILED then ;
 
 
+\ A done answer no chunk came with: the rev and range asked and an empty
+\ body; body reads it from the fetch, at its end.
+: EMPTIED ( ^fetch [ n n ^fetch -- ] -- )
+   {: f body :}
+   f FETCH-CLIENT @ {: c :}
+   f FETCH-OFFSET @ {: at:n :}
+   c f FETCH-REV @ SPAN:$ at CHECKED
+   c at 0 SIZED
+   at c FILE-SIZE f body execute ;
+
+
 \ A 416 from offset 0, where no Range was sent.
-: UNSATISFIABLE ( ^client -- reply )
-   s" a range it cannot satisfy from 0" E-ANSWER FAILED ;
+: UNSATISFIABLE ( ^fetch -- reply )
+   FETCH-CLIENT @ s" a range it cannot satisfy from 0" E-ANSWER FAILED ;
 
 
-\ An answer that arrived. A 416, RangeUnsatisfiable in dropbox.rs, carries
-\ no Dropbox-API-Result, so it is never done; unsat answers it, whatever
-\ size its Content-Range names.
-: ARRIVED ( ^client ^u8 n n n [ ^client -- reply ] -- verdict )
-   {: c r:^ ru:n at:n got:n unsat :}
-   c CLIENT-STATUS @ 416 = if c unsat execute ANSWER exit then
+\ An answer that arrived with no chunk handed to body. A 416,
+\ RangeUnsatisfiable in dropbox.rs, carries no Dropbox-API-Result, so it is
+\ never done; unsat answers it.
+: ARRIVED ( ^fetch [ n n ^fetch -- ] [ ^fetch -- reply ] -- verdict )
+   {: f body unsat :}
+   f FETCH-CLIENT @ {: c :}
+   c CLIENT-STATUS @ 416 = if f unsat execute ANSWER exit then
    c SORTED {: v:verdict :}
    v MATCH verdict
-      answer OF DONE? if c r ru at got VERIFIED then ENDOF
+      answer OF DONE? if f body EMPTIED then ENDOF
       rejected OF ENDOF
    ;MATCH
    v ;
 
 
-\ A lost transfer, status 0, is the core's to classify.
-: FETCHED ( ^client ^u8 n n [ ^u8 n n -- ] [ ^client -- reply ] -- verdict )
-   {: c r:^ ru:n at:n sink unsat :}
-   c r ru at sink STREAMED {: got:n :}
+\ A lost transfer, status 0, is the core's to classify, inside the body
+\ too. A body left unread is done; one read to its end is done once it is
+\ every byte after the offset.
+: SETTLED ( ^fetch [ n n ^fetch -- ] [ ^fetch -- reply ] -- verdict )
+   {: f body unsat :}
+   f body ABSORBED
+   f FETCH-CLIENT @ {: c :}
+   f FETCH-STEP @ {: s:download-step :}
    c CLIENT-STATUS @ 0= if c LOST ANSWER exit then
-   c r ru at got unsat ARRIVED ;
+   s STREAMING? if construct reply done ANSWER exit then
+   s DRAINED? if
+      c f FETCH-OFFSET @ f FETCH-TOTAL @ SIZED
+      construct reply done ANSWER exit
+   then
+   f body unsat ARRIVED ;
+
+
+\ The prepared request's answer through SETTLED. The fetch is made before
+\ the transfer starts, so nothing allocates while it is in flight but what
+\ READ-OUT covers, and lives until the call answers.
+: FETCHED ( ^client ^u8 n n [ n n ^fetch -- ] [ ^fetch -- reply ] -- verdict )
+   {: c r:^ ru:n at:n body unsat :}
+   FETCHES-NEW {: f :}
+   c f FETCH-CLIENT !
+   r ru SPAN:MAKE f FETCH-REV ! at f FETCH-OFFSET !
+   construct download-step opened f FETCH-STEP !
+   [: f body unsat SETTLED ;] [: f FETCHES-RELEASE ;] finally ;
 
 
 \ files/download from the offset; unsat answers a 416.
-: FROM ( ^u8 n n ^client [ ^u8 n n -- ] [ ^client -- reply ] -- reply )
-   {: r:^ ru:n at:n c sink unsat :}
+: FROM ( ^u8 n n ^client [ n n ^fetch -- ] [ ^fetch -- reply ] -- reply )
+   {: r:^ ru:n at:n c body unsat :}
    c c CLIENT-CONTENT @ s" files/download"
-   [: r ru at ASKED ;] [: r ru at sink unsat FETCHED ;] CALL-AT ;
+   [: r ru at ASKED ;] [: r ru at body unsat FETCHED ;] CALL-AT ;
 
 
 \ files/download from offset 0.
-: AFRESH ( ^client ^u8 n [ ^u8 n n -- ] -- reply )
-   {: c r:^ ru:n sink :}
-   r ru 0 c sink [: UNSATISFIABLE ;] FROM ;
+: AFRESH ( ^client ^u8 n [ n n ^fetch -- ] -- reply )
+   {: c r:^ ru:n body :}
+   r ru 0 c body [: UNSATISFIABLE ;] FROM ;
+
+
+\ The Content-Range of a 416 whose length is the offset, in the line.
+: LENGTH-LINE ( ^client n -- ^u8 n )
+   {: c at:n :}
+   c LINE-CLEAR c s" bytes */" LINE+ c at INT+
+   c LINE$ ;
+
+
+\ A 416 from the offset. A length of the offset says the bytes before it
+\ are the whole file: body reads the fetch at its end and the answer is
+\ done with no entry of its own. Any other starts over from 0.
+: RESUMED ( ^fetch [ n n ^fetch -- ] -- reply )
+   {: f body :}
+   f FETCH-CLIENT @ {: c :}
+   f FETCH-OFFSET @ {: at:n :}
+   c s" Content-Range" HEADER$ c at LENGTH-LINE STR=
+   0= if c f FETCH-REV @ SPAN:$ body AFRESH exit then
+   at at f body execute
+   construct reply done ;
 
 
 \ Disposes buf unless it is null, a buffer OPEN never made: the arena
@@ -1728,17 +1846,23 @@ public
 
 \ files/download of rev:<rev>, that exact revision, from the offset. The
 \ status, metadata and Content-Range are checked from the headers curl answers
-\ at the first chunk, before any byte reaches sink: an answer that fails them
-\ throws E-ANSWER with sink handed nothing. Each chunk then goes to sink with
-\ its file offset. A 416 from a nonzero offset starts over once from 0 with
-\ no Range, so sink sees offset 0; a 416 from 0 throws E-ANSWER. A throw
-\ while the transfer is in flight, sink's included, cancels it and reads it
-\ to its end before it goes on, so the client stays usable. Every done
-\ answer carried Dropbox-API-Result, and ENTRY is its entry.
-: DOWNLOAD ( ^u8 n n ^client [ ^u8 n n -- ] -- reply )
-   {: r:^ ru:n at:n c sink :}
-   at 0= if c r ru sink AFRESH exit then
-   r ru at c sink [: r ru sink AFRESH ;] FROM ;
+\ at the first chunk, before any byte reaches body: an answer that fails them
+\ throws E-ANSWER and body is never called. A done answer calls body once
+\ with the offset its bytes start at, the file's size and the fetch, which
+\ READ-BODY reads until body returns; the length is checked once READ-BODY
+\ reached the end. A body left unread is cancelled and the answer is done.
+\ A transfer lost inside the body throws E-BODY-LOST from READ-BODY, and the
+\ answer is the lost transfer's. A 416 from a nonzero offset with the
+\ offset for its length calls body with the offset, that size and a fetch
+\ at its end, and ENTRY is not this answer's; any other starts over once
+\ from 0 with no Range; a 416 from 0 throws E-ANSWER. A throw while the
+\ transfer is in flight, body's and READ-BODY's included, cancels it and
+\ reads it to its end before it goes on, so the client stays usable. Every
+\ other done answer carried Dropbox-API-Result, and ENTRY is its entry.
+: DOWNLOAD ( ^u8 n n ^client [ n n ^fetch -- ] -- reply )
+   {: r:^ ru:n at:n c body :}
+   at 0= if c r ru body AFRESH exit then
+   r ru at c body [: body RESUMED ;] FROM ;
 
 \ ---- delete_v2, create_folder_v2 and the code exchange
 private

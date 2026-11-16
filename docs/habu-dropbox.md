@@ -81,8 +81,9 @@ ENUM reply
 \ files/get_metadata, download, upload (+ session), delete_v2,
 \ create_folder_v2; each answers the entry Dropbox reports
 : METADATA      ( ^u8 n ^client -- reply )  \ path
-: DOWNLOAD      ( ^u8 n n ^client [ ^u8 n n -- ] -- reply )
-                \ rev, offset; each chunk and its offset
+: DOWNLOAD      ( ^u8 n n ^client [ n n ^fetch -- ] -- reply )
+                \ rev, offset; the body: its offset, the size, the fetch
+: READ-BODY     ( ^u8 n ^fetch -- n )       \ bytes read, 0 at the end
 : UPLOAD        ( ^upload ^client [ n -- ] -- reply )  \ bytes accepted
 : DELETE        ( ^u8 n ^u8 n ^client -- reply )  \ path, rev
 : CREATE-FOLDER ( ^u8 n ^client -- reply )  \ path
@@ -145,20 +146,39 @@ STRUCTURE config
   root sends no header, which only linking needs before it knows the root.
 - **`DOWNLOAD`** fetches `rev:<rev>`, which is that exact revision, from
   `offset` with a Range header. It checks the answer's status, Content-Range
-  and metadata before any byte reaches the quotation, then hands it each body
-  chunk with that chunk's file offset. The caller writes and hashes the
-  chunks.
-  - A 416 from a nonzero offset starts over once from 0, as the Rust version
-    does, so the quotation sees offset 0 again. A 416 from 0 throws
-    `E-ANSWER`. Every `done` therefore carries the entry Dropbox reported.
+  and metadata before any byte reaches the quotation. On a done answer it
+  then calls the quotation once with the file offset the body starts at, the
+  file's size and the download's `fetch`, an opaque record that lives until
+  the quotation returns. `READ-BODY` fills the buffer it is given with the
+  body's next bytes and answers how many, 0 at the body's end, as Rust's
+  `impl Read` does; the caller wraps it as `[: f READ-BODY ;]` for a word that
+  takes a reader, and writes and hashes what it reads. A reader that reads a
+  local cannot be handed to a quotation, which might keep it, so the fetch is
+  handed instead. On any other answer the quotation is not called; an empty
+  body calls it with a fetch at its end.
+  - The body's length is checked once `READ-BODY` reached its end. A body the
+    quotation leaves unread is cancelled as a throw cancels it, and the
+    answer is done without that check.
+  - A transfer lost inside the body throws a code of DROPBOX's own from
+    `READ-BODY`, never an early 0, which the caller would take for the body's
+    end. `DOWNLOAD` ends that code and answers as a transfer lost before the
+    body does, retry 0 for a lost connection, even when the quotation caught
+    it.
+  - A 416 from a nonzero offset whose Content-Range is `bytes */<offset>`
+    says the bytes before the offset are the whole file: the quotation gets
+    that offset, that size and a fetch at its end, and the answer is done.
+    That answer carries no Dropbox-API-Result, so `ENTRY` is not its entry.
+    Any other 416 from a nonzero offset starts over once from 0, as the Rust
+    version does, so the quotation sees offset 0. A 416 from 0 throws
+    `E-ANSWER`. Every other `done` carries the entry Dropbox reported.
   - A throw while the transfer is in flight, from a failed check, the
-    quotation or an allocation, ends it in one place: the client cancels the
-    transfer and reads it to its end into a region laid out at `OPEN`, so
-    ending it allocates nothing, then rethrows the code. The client's handle
-    is then free for its next call. In the read loop nothing after the read
-    that ended a transfer throws, so every throw there finds it in flight;
-    the header capture and checks after the loop may throw, with the handle
-    already free.
+    quotation, `READ-BODY` or an allocation, ends it in one place: the client
+    cancels the transfer and reads it to its end into a region laid out at
+    `OPEN`, so ending it allocates nothing, then rethrows the code. The
+    client's handle is then free for its next call. A throw after the read
+    that ended the transfer, such as the quotation's once `READ-BODY` reached
+    the body's end, cancels nothing; the header capture and checks after the
+    transfer may throw, with the handle already free.
 - **`DELETE`** sends the rev as `parent_rev`. With an empty rev it deletes
   unconditionally, which sync uses only for a folder it has just seen empty.
 - **A mutation confirms an answer it cannot trust.** libcurl resends a POST
