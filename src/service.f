@@ -5,6 +5,11 @@
 \ states are Rust's phases. Each state's step word is Rust's next for that
 \ state: from the goal and the unit state last observed it answers the step
 \ to run, and the step's outcome picks the next state, failed when it threw.
+\ systemd's activating includes the wait before an automatic restart, and
+\ deactivating can still end failed; systemd unloads a disabled, stopped unit.
+\ recover follows a change that may fix a fatal cause. release stops a
+\ unit that can hold the instance lock and leaves its failed state for a
+\ later recover.
 \ A child's stdio is Rust's: inherited for a control, status, logs and
 \ daemon-reload; stdout and stderr /dev/null for is-enabled; stdin and
 \ stderr /dev/null and stdout read for show and list-units; stdin and stdout
@@ -52,28 +57,19 @@ public
 -101004 s" systemd reported an ActiveState this version does not know"
    ERROR:CODE E-UNKNOWN-STATE
 
-\ How an external command starts: an installed program, found through
-\ PATH when its path holds no slash, or a script /bin/sh reads and never
-\ executes, so writing one cannot race a concurrent spawn.
+\ A program, found through PATH when its path holds no slash, or a script
+\ /bin/sh reads and never executes, so writing one cannot race a spawn.
 ENUM launch
    VARIANT program FIELD path str ;VARIANT
    VARIANT script FIELD path str ;VARIANT
 ;ENUM
 
-\ What systemd's ActiveState lets the CLI do with the unit. running:
-\ active, reloading or refreshing. starting: activating, the wait before
-\ an automatic restart included. failed: until a command clears it.
-\ stopping: deactivating, which can still end failed. stopped: inactive
-\ or maintenance, which an unloaded unit also reports.
+\ What systemd's ActiveState lets the CLI do with the unit; an unloaded
+\ unit reports inactive, so it reads stopped.
 ENUM unit-state DERIVE eq running starting failed stopping stopped ;ENUM
 
-\ What a command wants from the unit. start and restart clear a failed
-\ state and the start limit first. recover, after a change that may fix a
-\ fatal cause, starts a failed unit and stops a stopping one to look
-\ again. halt stops a running, starting or stopping unit and leaves no
-\ failed state. release stops a unit that can hold the instance lock and
-\ leaves a failed state for a later recover. restore starts again a unit
-\ observed running or starting before a change.
+\ What a command wants from the unit; each state's step word holds what a
+\ goal does there. restore carries the state observed before a change.
 ENUM goal
    VARIANT start ;VARIANT
    VARIANT restart ;VARIANT
@@ -83,11 +79,8 @@ ENUM goal
    VARIANT restore FIELD before option<unit-state> ;VARIANT
 ;ENUM
 
-\ What a drive observed and did. first: the state before any change;
-\ last: the state last observed; each none where the goal observes
-\ nothing. launched: a start or restart succeeded. acted: a stop,
-\ reset-failed, start or restart was spawned, and may have changed the
-\ unit.
+\ What a drive observed and did. acted: a stop, reset-failed, start or
+\ restart was spawned, so the unit may have changed.
 STRUCTURE driven DERIVE addr
    FIELD first option<unit-state>
    FIELD last option<unit-state>
@@ -176,9 +169,8 @@ variable PIPED-U
 
 public
 
-\ A request for the launch's program, Rust's Launch::command: a program at
-\ its path as PATH resolves it, or /bin/sh with the script as its
-\ argument. A program PATH does not hold is E-PROC-PATH.
+\ Rust's Launch::command: the program at its path as PATH resolves it, or
+\ /bin/sh with the script as its argument. E-PROC-PATH when PATH lacks it.
 : REQUEST ( launch -- PROCESS:request )
    MATCH launch
       program OF PROGRAM-REQUEST ENDOF
@@ -229,10 +221,8 @@ private
 
 \ ---- running a command
 
-\ How a run wires the child's stdin, stdout and stderr: inherited, all
-\ this process's; quiet, stdout and stderr /dev/null; output, stdin and
-\ stderr /dev/null, stdout a pipe; errors, stdin and stdout /dev/null,
-\ stderr a pipe.
+\ stdin/stdout/stderr: inherited own/own/own, quiet own/null/null,
+\ output null/pipe/null, errors null/null/pipe.
 ENUM wiring inherited quiet output errors ;ENUM
 
 -1 constant OWN          \ a slot that keeps this process's descriptor
@@ -294,12 +284,14 @@ ARENA HELD n
 
 : INHERITED ( launch [ PROCESS:request -- PROCESS:request ] ^ARENA:arena ^child -- )
    {: l args ar k :}
-   l args OWN OWN OWN SPAWN-WITH ar HELD-CELL k STARTED ;
+   ar HELD-CELL {: r:^ :}
+   l args OWN OWN OWN SPAWN-WITH r k STARTED ;
 
 : QUIET ( launch [ PROCESS:request -- PROCESS:request ] ^ARENA:arena ^child -- )
    {: l args ar k :}
    ar DEV-NULL {: z:n :}
-   l args OWN z z SPAWN-WITH ar HELD-CELL k STARTED ;
+   ar HELD-CELL {: r:^ :}
+   l args OWN z z SPAWN-WITH r k STARTED ;
 
 \ The parent closes its write end once the child holds one, so reading
 \ ends when the child's copy closes.
@@ -356,9 +348,8 @@ ARENA HELD n
    k CHILD-PID @ PROCESS:WAIT k CHILD-STATUS !
    code 0<> if code throw then ;
 
-\ Rust's run: the child wired as w with what args adds, read and waited
-\ for. A failure before it runs logs E-START-COMMAND for name, one after
-\ it E-WAIT-COMMAND.
+\ Rust's run. A failure before the child runs logs E-START-COMMAND for
+\ name, one after it E-WAIT-COMMAND.
 : RAN ( launch [ PROCESS:request -- PROCESS:request ] wiring ^u8 n ^ARENA:arena -- ^child )
    {: l args w name:^ nu:n ar :}
    ar CHILDREN-NEW {: k :}
@@ -419,9 +410,8 @@ ARENA HELD n
    dup 0 < if drop false exit then
    UNICODE-CLASS:WHITE-SPACE? ;
 
-\ Rust's trim of the lossy text: the bytes from the first scalar that is
-\ not White_Space through the last; a byte no scalar holds becomes U+FFFD
-\ in the lossy text, so it stays.
+\ Rust's trim of the lossy text: White_Space scalars off both ends; a byte
+\ no scalar holds is U+FFFD there, so it stays.
 : TRIMMED ( ^u8 n -- ^u8 n )
    {: a:^ u:n :}
    u 0 0 begin dup u < while
@@ -485,16 +475,14 @@ ARENA HELD n
 
 : UNLOADED? ( ^commands -- bool ) [: UNLOADED-IN ;] ARENA:WITH ;
 
-\ Rust's settle: stop or reset-failed, as args says. An unloaded unit has
-\ nothing to stop or clear: systemd unloads a disabled, stopped unit and
-\ then refuses both, so that refusal passes once systemd confirms it,
-\ checked after it as the unit can unload between two calls. Only that
-\ refusal's stderr is dropped; any other goes to this process's.
+\ Rust's settle. An unloaded unit refuses stop and reset-failed; that
+\ refusal passes, checked after it as the unit can unload between calls.
 : SETTLE-IN ( ^commands [ PROCESS:request -- PROCESS:request ] ^u8 n ^ARENA:arena -- )
    {: c args name:^ nu:n ar :}
    c SYSTEMCTL@ args construct wiring errors name nu ar RAN {: k :}
    k REFUSED? if c UNLOADED? if exit then then
-   FD:STDERR k CHILD-OUT @ str> FD:TRY-WRITE-FULL drop
+   FD:STDERR [: FD:STDERR k CHILD-OUT @ str> FD:TRY-WRITE-FULL drop ;]
+   FD:WITH-NOSIGPIPE
    k name nu SUCCEEDED ;
 
 : SETTLE ( ^commands [ PROCESS:request -- PROCESS:request ] ^u8 n -- )
@@ -618,11 +606,8 @@ private
 
 \ ---- the drive
 
-\ Where a drive is on its way, Rust's Phase. initial: nothing observed or
-\ changed. seen: the state observed before any change. after-stop: a stop
-\ ran. settled: the state observed after a stop. cleared: a failed state
-\ and the start limit were cleared. launched: start or restart ran.
-\ reached: the goal is reached. failed: a step threw.
+\ Where a drive is, Rust's Phase. settled: the state observed after a
+\ stop; cleared: the failed state and the start limit cleared.
 ENUM phase
    initial seen after-stop settled cleared launched reached failed
 ;ENUM
@@ -848,10 +833,8 @@ FSM:DEFINE DRIVING ( ^drive ) phase initial-step
 
 public
 
-\ Rust's drive_recorded: drives the unit toward the goal, observing it
-\ only where the goal's steps call for it, and fills the record with what
-\ was observed and done even when a step fails. Answers the code of the
-\ step that failed, which ended the drive, 0 for none.
+\ Rust's drive_recorded: the record is filled even when a step fails.
+\ Answers the code of the step that ended the drive, 0 for none.
 : DRIVE-RECORDED ( ^commands goal ^driven -- n )
    {: c g v :}
    v UNDRIVEN
