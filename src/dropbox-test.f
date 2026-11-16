@@ -332,7 +332,7 @@ variable REFUSALS
    e DROPBOX-ENTRY:SIZE @ 12 T=
    e DROPBOX-ENTRY:DOWNLOADABLE @ TTRUE
    TEST-DROPBOX:SEEN$ s" /2/files/get_metadata" T$=
-   TEST-DROPBOX:METADATA-BODIES$
+   s" /2/files/get_metadata" TEST-DROPBOX:BODIES-TO$
    S\" {\qpath\q:\q/docs/a.txt\q,\qinclude_deleted\q:true}" T$=
    TEST-DROPBOX:TYPE-SENT$ s" application/json" T$= ;
 

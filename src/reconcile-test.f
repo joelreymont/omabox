@@ -2876,6 +2876,11 @@ XS-SIZE BUFFER: XS
 
 \ ---- the pass against the fake Dropbox -----------------------------
 
+: LIST$ ( -- ^u8 n ) s" /2/files/list_folder" ;
+: UPLOAD-ROUTE$ ( -- ^u8 n ) s" /2/files/upload" ;
+: METADATA-ROUTE$ ( -- ^u8 n ) s" /2/files/get_metadata" ;
+: DELETE$ ( -- ^u8 n ) s" /2/files/delete_v2" ;
+
 : UPLOAD$ ( -- ^u8 n ) s" local upload" ;
 : REMOTE$ ( -- ^u8 n ) s" remote download" ;
 
@@ -2932,16 +2937,19 @@ XS-SIZE BUFFER: XS
    x RUN-JOURNAL @ p u DISPLAY x RUN-ARENA @ JOURNAL:BASELINE
    STORED-BASELINE rem MODEL-BASELINE:PRESENT MODEL:BASELINE= TTRUE ;
 
-\ The last upload's argument as DROPBOX writes it for b at path p. The
-\ fake commits only a body that hashes to it: Rust's body assert.
-: UPLOAD-SENT ( ^u8 n ^u8 n ^ARENA:arena -- )
+\ An add upload's argument as DROPBOX writes it for b at path p, in SB.
+: ADD-ARG$ ( ^u8 n ^u8 n ^ARENA:arena -- ^u8 n )
    {: p:^ u:n b:^ bu:n ar :}
    b bu ar IDENTITY DROPBOX:HASH>STR str> {: h:^ hu:n :}
    SB-RESET S\" {\qpath\q:\q" SB-APPEND p u SB-APPEND
    S\" \q,\qmode\q:\qadd\q,\qautorename\q:false," SB-APPEND
    S\" \qstrict_conflict\q:true,\qcontent_hash\q:\q" SB-APPEND
-   h hu SB-APPEND S\" \q}" SB-APPEND
-   TEST-DROPBOX:ARG-SENT$ SB$ T$= ;
+   h hu SB-APPEND S\" \q}" SB-APPEND SB$ ;
+
+\ The last upload's argument is ADD-ARG$'s. The fake commits only a body
+\ that hashes to it: Rust's body assert.
+: UPLOAD-SENT ( ^u8 n ^u8 n ^ARENA:arena -- )
+   ADD-ARG$ TEST-DROPBOX:ARG-SENT$ 2swap T$= ;
 
 : PASS-SEEN$ ( -- ^u8 n )
    s" /2/files/list_folder /2/files/download /2/files/upload" ;
@@ -3420,6 +3428,7 @@ XS-SIZE BUFFER: XS
 
 \ ---- uploads against the fake Dropbox ------------------------------
 
+
 \ Rust's planned_operations: the decision's operation as a plan.
 : PLANNED-OPERATIONS
    ( MODEL:decision ^ARENA:arena -- JOURNAL:operation-plan )
@@ -3831,19 +3840,6 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    p HELD-FOR$ s" conflict-copy-occupied" T$=
    p ;
 
-\ Whether the request q is the one at offset at of the requests p.
-: TOKEN-AT? ( ^u8 n n ^u8 n -- bool )
-   {: p:^ u:n at:n q:^ qu:n :}
-   p at + u at - q qu STARTS-WITH? 0= if false exit then
-   at qu + {: e:n :}
-   e u = if true exit then
-   p e + c@ 32 = ;
-
-\ How many of the fake's requests went to the path q.
-: SEEN-COUNT ( ^u8 n -- n )
-   {: q:^ qu:n :}
-   TEST-DROPBOX:SEEN$ {: p:^ u:n :}
-   0 u 0 ?do p u i q qu TOKEN-AT? if 1+ then loop ;
 
 \ The fake serves new remote bytes as replace.txt's current-rev, on one
 \ listing page with the cursor k.
@@ -3933,7 +3929,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x REPLACE-PREPARED
    TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata "
    STARTS-WITH? TTRUE
-   DOWNLOAD$ SEEN-COUNT 1 T=
+   DOWNLOAD$ TEST-DROPBOX:CALLS 1 T=
    d x STEP-GONE ;
 
 : REPLAY-BLOCKS-A-CONFLICT-WHOSE-LOCAL-COPY-NAME-IS-OCCUPIED
@@ -4009,7 +4005,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x s" 01703" UNRELATED-SYNCED
    x PENDING-OF VEC:COUNT 0 T=
    x BLOCKED-OF VEC:COUNT 0 T=
-   DOWNLOAD$ SEEN-COUNT 1 T=
+   DOWNLOAD$ TEST-DROPBOX:CALLS 1 T=
    d x STEP-GONE ;
 
 \ c-diverged.txt blocked alone: its bytes and baseline kept and no
@@ -4022,7 +4018,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x s" c-diverged.txt" SHARED$ s" rev-old" x RUN-ARENA @ REMOTE-FILE
    BASELINE-AT
    x v vu UNRELATED-SYNCED
-   DOWNLOAD$ SEEN-COUNT 0 T= ;
+   DOWNLOAD$ TEST-DROPBOX:CALLS 0 T= ;
 
 : OCCUPIED-DROPBOX-CONFLICT-COPY-NAME-BLOCKS-ONLY-ITS-PATH
    ( ^ARENA:arena -- )
@@ -4059,7 +4055,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    rep COPY-CONFLICTS 1 T=
    rep BLOCKED-IN 0 T=
    x REPLACE-PREPARED
-   s" /2/files/upload" SEEN-COUNT 0 T=
+   UPLOAD-ROUTE$ TEST-DROPBOX:CALLS 0 T=
    d x STEP-GONE ;
 
 : DIRECTORY-AT-DROPBOX-CONFLICT-COPY-NAME-BLOCKS-ONLY-ITS-PATH
@@ -4276,7 +4272,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x s" report/x" IN-ROOT str> FS:EXISTS? TFALSE
    x NO-CONFLICT-RECORD
    x PENDING-OF VEC:COUNT 0 T=
-   TEST-DROPBOX:BODY-SENT$ SIBLING-DELETE$ T$=
+   DELETE$ TEST-DROPBOX:BODIES-TO$ SIBLING-DELETE$ T$=
    d x STEP-GONE ;
 
 : FILE-BESIDE-A-SAME-NAMED-DIRECTORY-STILL-DELETES-LOCALLY
@@ -4333,7 +4329,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x NO-CONFLICT-COPY
    x s" report/x" IN-ROOT SIBLING-EDIT$ HOLDS-BYTES
    x s" report/x" SIBLING-EDIT$ s" 01701" ar REMOTE-FILE BASELINE-AT
-   TEST-DROPBOX:BODY-SENT$ SIBLING-EDIT$ T$=
+   UPLOAD-ROUTE$ TEST-DROPBOX:BODIES-TO$ SIBLING-EDIT$ T$=
    TEST-DROPBOX:ARG-SENT$ SIBLING-EDIT$ ar IDENTITY SIBLING-ARG$ T$=
    d x STEP-GONE ;
 
@@ -4450,22 +4446,14 @@ $1C0 constant OWNER-ACCESS
    0 begin ns nu rot x v CONFLICT-COPY+ dup 0< until drop
    v COPIES-SORTED v ;
 
-\ The requests the fake saw since RESET, and those to the path p.
-: REQUESTS ( -- n )
-   TEST-DROPBOX:SEEN$ {: s:^ u:n :}
-   u 0= if 0 exit then
-   s u s"  " COUNT-SUB 1 + ;
-
-: SENT-TO ( ^u8 n -- n ) TEST-DROPBOX:SEEN$ 2swap COUNT-SUB ;
-
 \ The directory d holds no entry.
 : NOTHING-IN ( str -- ) str> READ-BUF READ-CAP FS-LIST:NAMES 0 T= ;
 
 \ No request created, uploaded or deleted on Dropbox.
 : UNWRITTEN ( -- )
-   s" /2/files/create_folder_v2" SENT-TO 0 T=
-   s" /2/files/upload" SENT-TO 0 T=
-   s" /2/files/delete_v2" SENT-TO 0 T= ;
+   s" /2/files/create_folder_v2" TEST-DROPBOX:CALLS 0 T=
+   UPLOAD-ROUTE$ TEST-DROPBOX:CALLS 0 T=
+   DELETE$ TEST-DROPBOX:CALLS 0 T= ;
 
 \ Rust's local files: a edited here, b as the baseline, c diverged;
 \ each path's baseline the shared one at rev-old.
@@ -4534,18 +4522,22 @@ $1C0 constant OWNER-ACCESS
 
 \ Rust's requests, the account's aside: one listing, two downloads and
 \ the upload, nothing deleted.
+: EDITS-SEEN$ ( -- ^u8 n )
+   SB-RESET s" /2/files/list_folder /2/files/download " SB-APPEND
+   s" /2/files/download /2/files/upload" SB-APPEND SB$ ;
+
 : EDITS-SENT ( ^ARENA:arena -- )
    {: ar :}
-   REQUESTS 4 T=
-   s" /2/files/delete_v2" SENT-TO 0 T=
-   s" /2/files/upload" SENT-TO 1 T=
-   TEST-DROPBOX:ARGS-SENT$ LOCAL-EDIT$ ar IDENTITY UPDATE-ARG$ CONTAINS?
-   TTRUE
-   DOWNLOAD$ SENT-TO 2 T=
-   TEST-DROPBOX:ARGS-SENT$ S\" {\qpath\q:\qrev:rev-remote-update\q}"
-   CONTAINS? TTRUE
-   TEST-DROPBOX:ARGS-SENT$ S\" {\qpath\q:\qrev:rev-remote-conflict\q}"
-   CONTAINS? TTRUE ;
+   TEST-DROPBOX:SEEN$ EDITS-SEEN$ T$=
+   DELETE$ TEST-DROPBOX:CALLS 0 T=
+   UPLOAD-ROUTE$ TEST-DROPBOX:CALLS 1 T=
+   UPLOAD-ROUTE$ TEST-DROPBOX:ARGS-TO$
+   LOCAL-EDIT$ ar IDENTITY UPDATE-ARG$ CONTAINS? TTRUE
+   DOWNLOAD$ TEST-DROPBOX:CALLS 2 T=
+   DOWNLOAD$ TEST-DROPBOX:ARGS-TO$
+   S\" {\qpath\q:\qrev:rev-remote-update\q}" CONTAINS? TTRUE
+   DOWNLOAD$ TEST-DROPBOX:ARGS-TO$
+   S\" {\qpath\q:\qrev:rev-remote-conflict\q}" CONTAINS? TTRUE ;
 
 : LATER-EDITS-SYNC-AND-DIVERGENCE-PRESERVES-BOTH-SIDES
    ( ^ARENA:arena -- )
@@ -4610,9 +4602,9 @@ $1C0 constant OWNER-ACCESS
    x RUN-JOURNAL @ ar JOURNAL:CONFLICTS VEC:COUNT 0 T=
    rec NOTHING-IN
    \ Rust's three requests less the account's.
-   REQUESTS 2 T=
-   TEST-DROPBOX:DELETE-SENT$ DELETE-BODY$ T$=
-   s" /2/files/delete_v2" SENT-TO 1 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/delete_v2" T$=
+   DELETE$ TEST-DROPBOX:BODIES-TO$ DELETE-BODY$ T$=
+   DELETE$ TEST-DROPBOX:CALLS 1 T=
    d x STEP-GONE ;
 
 \ Rust's create_folder_v2 answer: the folder p as its metadata.
@@ -4628,6 +4620,11 @@ $1C0 constant OWNER-ACCESS
    {: x p:^ u:n :}
    x p u IN-ROOT str> FS:DIR? TTRUE
    x p u FOLDER-BASELINE-AT ;
+
+\ Rust's five requests less the account's.
+: NESTED-SEEN$ ( -- ^u8 n )
+   SB-RESET s" /2/files/list_folder /2/files/create_folder_v2 " SB-APPEND
+   s" /2/files/create_folder_v2 /2/files/create_folder_v2" SB-APPEND SB$ ;
 
 : ONE-RECONCILIATION-PASS-SYNCHRONIZES-EMPTY-AND-NESTED-DIRECTORIES
    ( ^ARENA:arena -- )
@@ -4650,9 +4647,8 @@ $1C0 constant OWNER-ACCESS
    x s" remote" SYNCED-DIRECTORY
    x s" remote/child" SYNCED-DIRECTORY
    x PENDING-OF VEC:COUNT 0 T=
-   \ Rust's five requests less the account's.
-   REQUESTS 4 T=
-   s" /2/files/create_folder_v2" SENT-TO 3 T=
+   TEST-DROPBOX:SEEN$ NESTED-SEEN$ T$=
+   s" /2/files/create_folder_v2" TEST-DROPBOX:CALLS 3 T=
    d x STEP-GONE ;
 
 : ENTRY-BYTES$ ( -- ^u8 n ) s" Dropbox source bytes" ;
@@ -4816,8 +4812,6 @@ $1C0 constant OWNER-ACCESS
          s" the stable fixture changed its root" FAILED
       ENDOF
    ;MATCH ;
-
-: UPLOAD-ROUTE$ ( -- ^u8 n ) s" /2/files/upload" ;
 
 \ The last replay step's report holds no blocked entry.
 : STEP-UNBLOCKED ( ^run -- )
@@ -5086,8 +5080,8 @@ $1C0 constant OWNER-ACCESS
    x rec PASSED COMPLETE KEPT-REPORTS
    \ Rust's pending ReplaceLocal of rev-new over the kept bytes runs in
    \ this pass: rev-new downloaded, then installed with no conflict.
-   TEST-DROPBOX:ARGS-SENT$ S\" {\qpath\q:\qrev:rev-new\q}" CONTAINS?
-   TTRUE
+   DOWNLOAD$ TEST-DROPBOX:ARGS-TO$
+   S\" {\qpath\q:\qrev:rev-new\q}" CONTAINS? TTRUE
    x STEP-UNBLOCKED
    x KEPT-REPLACED
    TEST-DROPBOX:SEEN$ UPLOAD-DOWNLOAD$ T$=
@@ -5497,9 +5491,6 @@ $180 constant MODE-0600
 
 \ ---- directory deletions against the fake Dropbox -----------------
 
-: LIST$ ( -- ^u8 n ) s" /2/files/list_folder" ;
-: DELETE$ ( -- ^u8 n ) s" /2/files/delete_v2" ;
-
 : PRESENT-BASELINE? ( MODEL:baseline -- bool )
    MATCH MODEL:baseline
       absent OF false ENDOF
@@ -5539,33 +5530,13 @@ $180 constant MODE-0600
    {: k:n :}
    k 0 ?do REST-WORDS loop FIRST-WORD ;
 
-: WORD-COUNT ( ^u8 n -- n ) 32 COUNT-CHAR 1+ ;
-
-: CALL$ ( n -- ^u8 n ) {: k:n :} TEST-DROPBOX:SEEN$ k WORD-AT ;
-
-: LISTING-CALL? ( ^u8 n -- bool )
-   {: a:^ u:n :}
-   a u LIST$ STR= a u CONTINUE$ STR= or ;
-
-\ How many of the first k requests' paths q holds for.
-: CALLS-BEFORE ( n [ ^u8 n -- bool ] -- n )
-   {: k:n q :}
-   0 k 0 ?do i CALL$ q execute if 1+ then loop ;
-
-\ Rust's probes: the list_folder requests after the first.
-: PROBE? ( n -- bool )
-   {: k:n :}
-   k CALL$ LIST$ STR= k [: LIST$ STR= ;] CALLS-BEFORE 0 > and ;
-
-\ The probes' bodies, ARGS$ holding one per listing call.
+\ Rust's probes' bodies: those of the list_folder requests after the
+\ first.
 : PROBE-ARGS ( ^ARENA:arena -- ^VEC:vector<str> )
    {: ar :}
    ar [type] str NEW-VECTOR {: v :}
-   TEST-DROPBOX:SEEN$ WORD-COUNT 0 ?do
-      i PROBE? if
-         TEST-DROPBOX:ARGS$ i [: LISTING-CALL? ;] CALLS-BEFORE WORD-AT
-         ar COPIED v VEC:PUSH !
-      then
+   LIST$ TEST-DROPBOX:CALLS 1 ?do
+      LIST$ TEST-DROPBOX:BODIES-TO$ i WORD-AT ar COPIED v VEC:PUSH !
    loop
    v ;
 
@@ -5649,10 +5620,10 @@ $180 constant MODE-0600
 \ Whether the k-th delete_v2 body holds the JSON value v.
 : DELETED-AS? ( n ^u8 n -- bool )
    {: k:n v:^ vu:n :}
-   TEST-DROPBOX:DELETES$ k WORD-AT v vu JSON:VALUE= ;
+   DELETE$ TEST-DROPBOX:BODIES-TO$ k WORD-AT v vu JSON:VALUE= ;
 
 : TREE-DELETED ( -- )
-   TEST-DROPBOX:DELETES$ WORD-COUNT 3 T=
+   DELETE$ TEST-DROPBOX:CALLS 3 T=
    0 S\" {\qpath\q:\q/Gone/Child/leaf.txt\q,\qparent_rev\q:\qrev-leaf\q}"
    DELETED-AS? TTRUE
    1 S\" {\qpath\q:\q/Gone/Child\q}" DELETED-AS? TTRUE
@@ -5889,7 +5860,6 @@ TYPED-VARIABLE RACED str
 : REJECTED-BYTES$ ( -- ^u8 n ) s" rejected bytes" ;
 : GOOD-BYTES$ ( -- ^u8 n ) s" uploaded bytes" ;
 : SIBLING-BYTES$ ( -- ^u8 n ) s" downloaded sibling bytes" ;
-: METADATA-ROUTE$ ( -- ^u8 n ) s" /2/files/get_metadata" ;
 
 : UPLOAD-SUMMARY$ ( ^u8 n -- ^u8 n )
    {: t:^ tu:n :}
@@ -6002,9 +5972,9 @@ TYPED-VARIABLE RACED str
    s"  /2/files/list_folder/continue " SB-APPEND rs ru SB-APPEND SB$ ;
 
 : REJECTED-BODIES$ ( -- ^u8 n )
-   SB-RESET REJECTED-BYTES$ SB-APPEND S\" \n" SB-APPEND
-   GOOD-BYTES$ SB-APPEND S\" \n" SB-APPEND
-   REJECTED-BYTES$ SB-APPEND S\" \n" SB-APPEND SB$ ;
+   SB-RESET REJECTED-BYTES$ SB-APPEND s"  " SB-APPEND
+   GOOD-BYTES$ SB-APPEND s"  " SB-APPEND
+   REJECTED-BYTES$ SB-APPEND SB$ ;
 
 \ Rust's rejected_path_case: the rejection q, whose requests' paths are
 \ rs, blocks bad.txt as tag t while unrelated paths sync.
@@ -6020,7 +5990,7 @@ TYPED-VARIABLE RACED str
    x rec t tu REJECTED-FIRST {: bad :}
    d x rec bad t tu REJECTED-DUE
    TEST-DROPBOX:SEEN$ rs ru REJECTED-SEEN$ T$=
-   TEST-DROPBOX:UPLOAD-BODIES$ REJECTED-BODIES$ T$=
+   UPLOAD-ROUTE$ TEST-DROPBOX:BODIES-TO$ REJECTED-BODIES$ T$=
    d x STEP-GONE ;
 
 : BAD-LOOKUPS$ ( -- ^u8 n )
@@ -6028,6 +5998,14 @@ TYPED-VARIABLE RACED str
       i 0<> if s"  " SB-APPEND then
       S\" {\qpath\q:\q/bad.txt\q,\qinclude_deleted\q:true}" SB-APPEND
    loop SB$ ;
+
+\ The uploads' arguments: bad.txt's, good.txt's, then bad.txt's again.
+: REJECTED-ARGS$ ( ^ARENA:arena -- ^u8 n )
+   {: ar :}
+   s" /bad.txt" REJECTED-BYTES$ ar ADD-ARG$ s"  " ar JOIN-BYTES
+   s" /good.txt" GOOD-BYTES$ ar ADD-ARG$ ar JOIN-BYTES
+   s"  " ar JOIN-BYTES
+   s" /bad.txt" REJECTED-BYTES$ ar ADD-ARG$ ar JOIN-BYTES ;
 
 : REJECTED-PATHS-DO-NOT-STOP-UNRELATED-SYNC-OR-REPORT-PROGRESS
    ( ^ARENA:arena -- )
@@ -6041,8 +6019,8 @@ TYPED-VARIABLE RACED str
    [: MOVED ;] s" /2/files/upload /2/files/get_metadata"
    s" path_mismatch" ar REJECTED-PATH-CASE
    \ The uploads besides good.txt's both name /bad.txt.
-   TEST-DROPBOX:UPLOAD-PATHS$ s" /bad.txt /good.txt /bad.txt" T$=
-   TEST-DROPBOX:METADATA-BODIES$ BAD-LOOKUPS$ T$= ;
+   UPLOAD-ROUTE$ TEST-DROPBOX:ARGS-TO$ ar REJECTED-ARGS$ T$=
+   METADATA-ROUTE$ TEST-DROPBOX:BODIES-TO$ BAD-LOOKUPS$ T$= ;
 
 : STALE$ ( -- ^u8 n ) s" preserve stale local metadata" ;
 : ORDINARY-UPLOAD$ ( -- ^u8 n ) s" ordinary local upload" ;

@@ -21,13 +21,9 @@
 \ bound to its path, else, an API call only, the first left bound to none.
 \ ARG-SCRIPT! also binds one to a text the call's Dropbox-API-Arg must
 \ contain.
-\ It records each request's path, each delete_v2 call's body (DELETES$),
-\ the last API call's Authorization, Path-Root and Content-Type, and the
-\ body of the last delete_v2 or single upload its route answered,
-\ BODY-SENT$. ARGS-SENT$ joins every Dropbox-API-Arg sent, and
-\ DELETE-SENT$ is the last delete_v2's body. UPLOAD-PATHS$ and
-\ UPLOAD-BODIES$ answer each upload's Dropbox-API-Arg path and body,
-\ METADATA-BODIES$ each get_metadata's body.
+\ It records each request once, in order: its route, its Dropbox-API-Arg
+\ and its body's first KiB, which SEEN$, CALLS, ARGS-TO$ and BODIES-TO$
+\ read; and the last API call's Authorization, Path-Root and Content-Type.
 \ STORAGE CLASS. PROCESS-WIDE: one worker serves every request, so its handler
 \ alone writes the state while a test waits on its call, and the test sets it
 \ between calls; only RESUME-BODY sets it during one, and the
@@ -101,10 +97,6 @@ SLOTS TYPED-BUFFER NEEDLE-US n
 SLOTS TYPED-BUFFER SPENT bool
 variable SCRIPTS
 
-create SEEN TEXT-CAP allot
-variable SEEN-U
-create DELETES TEXT-CAP allot
-variable DELETES-U
 create AUTH NAME-CAP allot
 variable AUTH-U
 create ROOT-SENT TEXT-CAP allot
@@ -114,12 +106,6 @@ create TYPE-SENT NAME-CAP allot
 variable TYPE-SENT-U
 TYPED-VARIABLE TYPED bool
 TYPED-VARIABLE LEAKED bool
-create UPLOAD-PATHS TEXT-CAP allot
-variable UPLOAD-PATHS-U
-create UPLOAD-BODIES TEXT-CAP allot
-variable UPLOAD-BODIES-U
-create METADATA-BODIES TEXT-CAP allot
-variable METADATA-BODIES-U
 
 create OUT TEXT-CAP allot
 variable OUT-U
@@ -183,20 +169,97 @@ TYPED-VARIABLE TOKEN-CUTTING bool
 
 \ ---- what was sent
 
-: SEEN+ ( ^u8 n -- )
-   {: a:^ u:n :}
-   a u SEEN SEEN-U @ + TEXT-CAP SEEN-U @ - STORE SEEN-U +! ;
+\ Each request's route, Dropbox-API-Arg and body's first KiB lie back to
+\ back in CALL-TEXT from its record's start; the fields hold their lengths.
+STRUCTURE call DERIVE addr
+   FIELD start n
+   FIELD route n
+   FIELD arg n
+   FIELD body n
+;STRUCTURE
+create CALL-TEXT BUF:HDR-BYTES allot
+TYPED-VARIABLE CALL-LOG ^VEC:vector<call>
+\ SEEN$, ARGS-TO$ and BODIES-TO$ answer their text here.
+create JOINED BUF:HDR-BYTES allot
 
 
-: DELETE+ ( ^u8 n -- )
-   {: a:^ u:n :}
-   a u DELETES DELETES-U @ + TEXT-CAP DELETES-U @ - STORE DELETES-U +! ;
+: CALLS-MADE ( -- )
+   CALL-TEXT TEXT-CAP BUF:N>BLEN BUF:INIT
+   JOINED TEXT-CAP BUF:N>BLEN BUF:INIT
+   HEAP:ALLOCATOR 0 [type] call VEC:NEW CALL-LOG ! ;
+CALLS-MADE
 
 
-: RECORD-DELETE ( HTTP:request -- )
+: CALL-COUNT ( -- n ) CALL-LOG @ VEC:COUNT ;
+: CALL-OF ( n -- ^call ) {: i:n :} CALL-LOG @ i VEC:AT ;
+
+
+\ The u bytes of call i's text from offset off.
+: CALL-SPAN ( n n n -- ^u8 n )
+   {: i:n off:n u:n :}
+   CALL-TEXT BUF:SPAN$ drop i CALL-OF CALL-START @ + off + u ;
+
+
+: ROUTE-OF$ ( n -- ^u8 n )
+   {: i:n :}
+   i 0 i CALL-OF CALL-ROUTE @ CALL-SPAN ;
+
+
+: ARG-OF$ ( n -- ^u8 n )
+   {: i:n :}
+   i CALL-OF {: c :}
+   i c CALL-ROUTE @ c CALL-ARG @ CALL-SPAN ;
+
+
+: BODY-OF$ ( n -- ^u8 n )
+   {: i:n :}
+   i CALL-OF {: c :}
+   i c CALL-ROUTE @ c CALL-ARG @ + c CALL-BODY @ CALL-SPAN ;
+
+
+: CALL-TEXT+ ( ^u8 n -- ) BUF:N>BLEN CALL-TEXT BUF:APPEND-SPAN ;
+
+
+\ The request's Dropbox-API-Arg, empty when it sends none.
+: ARG-OF ( HTTP:request -- ^u8 n )
+   s" Dropbox-API-Arg" HTTP:HEADER-OF$ 0= if drop 0 then ;
+
+
+\ The body is read first, so one that fails to arrive records nothing.
+: CALL+ ( HTTP:request -- )
    {: q:HTTP:request :}
-   DELETES-U @ 0<> if s"  " DELETE+ then
-   q HTTP:BODY$ DELETE+ ;
+   q HTTP:PATH$ q ARG-OF q HTTP:BODY$ TEXT-CAP min
+   {: p:^ pu:n a:^ au:n b:^ bu:n :}
+   CALL-LOG @ VEC:PUSH {: c :}
+   CALL-TEXT BUF:LEN@ BUF:BLEN>N c CALL-START !
+   pu c CALL-ROUTE ! au c CALL-ARG ! bu c CALL-BODY !
+   p pu CALL-TEXT+ a au CALL-TEXT+ b bu CALL-TEXT+ ;
+
+
+: CALLS-RESET ( -- ) CALL-TEXT BUF:CLEAR CALL-LOG @ 0 VEC:RESIZE ;
+
+
+\ Appends a to JOINED, after a space unless JOINED is empty.
+: JOIN+ ( ^u8 n -- )
+   {: a:^ u:n :}
+   JOINED BUF:LEN@ BUF:BLEN>N 0<> if 32 JOINED BUF:APPEND-BYTE then
+   a u BUF:N>BLEN JOINED BUF:APPEND-SPAN ;
+
+
+: JOINED$ ( -- ^u8 n ) JOINED BUF:SPAN$ BUF:BLEN>N ;
+
+
+\ What f answers for each call to the route r, joined; an empty answer
+\ adds nothing.
+: JOINED-TO$ ( ^u8 n [ n -- ^u8 n ] -- ^u8 n )
+   {: r:^ ru:n f :}
+   JOINED BUF:CLEAR
+   CALL-COUNT 0 ?do
+      i ROUTE-OF$ r ru STR= if
+         i f execute {: a:^ u:n :}
+         u 0<> if a u JOIN+ then
+      then
+   loop JOINED$ ;
 
 
 : SENT ( HTTP:request ^u8 n ^u8 n -- n bool )
@@ -212,63 +275,9 @@ TYPED-VARIABLE TOKEN-CUTTING bool
    if true LEAKED ! then ;
 
 
-: UPLOAD-BODY+ ( ^u8 n -- )
-   {: a:^ u:n :}
-   a u UPLOAD-BODIES UPLOAD-BODIES-U @ + TEXT-CAP UPLOAD-BODIES-U @ -
-   STORE UPLOAD-BODIES-U +! ;
-
-
-: METADATA-BODY+ ( ^u8 n -- )
-   {: a:^ u:n :}
-   a u METADATA-BODIES METADATA-BODIES-U @ +
-   TEXT-CAP METADATA-BODIES-U @ - STORE METADATA-BODIES-U +! ;
-
-
-\ A member's value after its key, appended to UPLOAD-PATHS when the key
-\ was path.
-: ARG-PATH-VALUE ( JSON:reader bool -- JSON:reader )
-   {: path:bool :}
-   JSON:READ-NEXT drop
-   path 0= if JSON:READ-SKIP-VALUE exit then
-   UPLOAD-PATHS UPLOAD-PATHS-U @ + TEXT-CAP UPLOAD-PATHS-U @ -
-   JSON:READ-STR UPLOAD-PATHS-U +! ;
-
-
-: ARG-PATH-MEMBERS ( JSON:reader -- JSON:reader )
-   begin JSON:READ-NEXT dup JSON:T-KEY = while
-      drop s" path" JSON:READ-STR-EQ? ARG-PATH-VALUE
-   repeat drop ;
-
-
-\ An upload's argument path and its body, recorded.
-: UPLOAD-SENT ( HTTP:request -- )
-   {: q:HTTP:request :}
-   UPLOAD-PATHS-U @ 0<> if
-      s"  " UPLOAD-PATHS UPLOAD-PATHS-U @ + TEXT-CAP UPLOAD-PATHS-U @ -
-      STORE UPLOAD-PATHS-U +!
-   then
-   q s" Dropbox-API-Arg" HTTP:HEADER-OF$ {: v:^ vu:n sent:bool :}
-   sent if
-      PARSER v vu JSON:READ-INIT
-      JSON:READ-NEXT JSON:T-OBJ = if ARG-PATH-MEMBERS then
-      JSON:READ-FINISH
-   then
-   q HTTP:BODY$ UPLOAD-BODY+ S\" \n" UPLOAD-BODY+ ;
-
-
-: METADATA-SENT ( HTTP:request -- )
-   {: q:HTTP:request :}
-   METADATA-BODIES-U @ 0<> if s"  " METADATA-BODY+ then
-   q HTTP:BODY$ METADATA-BODY+ ;
-
-
 : RECORD ( HTTP:request -- )
    {: q:HTTP:request :}
-   SEEN-U @ 0<> if s"  " SEEN+ then
-   q HTTP:PATH$ SEEN+
-   q HTTP:PATH$ s" /2/files/delete_v2" STR= if q RECORD-DELETE then
-   q HTTP:PATH$ s" /2/files/upload" STR= if q UPLOAD-SENT then
-   q HTTP:PATH$ s" /2/files/get_metadata" STR= if q METADATA-SENT then
+   q CALL+
    q HTTP:PATH$ s" /oauth2/token" STR= if q TOKEN-HEADERS exit then
    q HTTP:PATH$ s" /2/files/list_folder/longpoll" STR=
    if q TOKEN-HEADERS exit then
@@ -278,11 +287,6 @@ TYPED-VARIABLE TOKEN-CUTTING bool
 
 
 : API? ( HTTP:request -- bool ) HTTP:PATH$ s" /oauth2/token" STR= 0= ;
-
-
-\ The request's Dropbox-API-Arg, empty when it sends none.
-: ARG-OF ( HTTP:request -- ^u8 n )
-   s" Dropbox-API-Arg" HTTP:HEADER-OF$ 0= if drop 0 then ;
 
 
 \ The first scripted answer left bound to the route path, the empty
@@ -530,10 +534,6 @@ create WANT NAME-CAP allot
 variable WANT-U
 create HELD NAME-CAP allot
 variable HELD-U
-create BODY-SENT TEXT-CAP allot
-variable BODY-SENT-U
-create DELETE-SENT TEXT-CAP allot
-variable DELETE-SENT-U
 
 
 \ The code grant's names and values, as FIELDS$ decodes them.
@@ -557,11 +557,6 @@ variable DELETE-SENT-U
    S\" \q,\qrefresh_token\q:\qfake-refresh-granted\q" SB-APPEND
    S\" ,\qtoken_type\q:\qbearer\q,\qexpires_in\q:14400}" SB-APPEND
    a BUILT ANSWER! ;
-
-
-\ The request body's first TEXT-CAP bytes into BODY-SENT.
-: BODY-KEPT ( HTTP:request -- )
-   HTTP:BODY$ TEXT-CAP min BODY-SENT TEXT-CAP STORE BODY-SENT-U ! ;
 
 
 \ The request body's parent_rev into WANT, and whether it sent one.
@@ -642,8 +637,6 @@ variable DELETE-SENT-U
 : DELETE-PATH ( HTTP:request HTTP:response -- )
    {: q:HTTP:request a:HTTP:response :}
    q a ADMITTED? 0= if exit then
-   q BODY-KEPT
-   q HTTP:BODY$ DELETE-SENT TEXT-CAP STORE DELETE-SENT-U !
    q ASK
    FOUND {: i:n :}
    i 0< if a S\" {\qerror_summary\q:\qpath_lookup/not_found/...\q,\qerror\q:{\q.tag\q:\qpath_lookup\q,\qpath_lookup\q:{\q.tag\q:\qnot_found\q}}}" REFUSED! exit then
@@ -894,8 +887,6 @@ create REV-SEEN NAME-CAP allot
 variable REV-SEEN-U
 create ARG-SENT TEXT-CAP allot
 variable ARG-SENT-U
-create ARGS-SENT TEXT-CAP allot
-variable ARGS-SENT-U
 create RANGE-SENT NAME-CAP allot
 variable RANGE-SENT-U
 TYPED-VARIABLE RANGED bool
@@ -903,20 +894,7 @@ TYPED-VARIABLE DURING [ -- ]
 ' NO-HOOK DURING !
 
 
-: ARGS-SENT+ ( ^u8 n -- )
-   {: a:^ u:n :}
-   a u ARGS-SENT ARGS-SENT-U @ + TEXT-CAP ARGS-SENT-U @ - STORE
-   ARGS-SENT-U +! ;
-
-
-\ The argument into ARG-SENT, and joined to ARGS-SENT unless it is
-\ empty or would not fit.
-: ARG-SENT! ( ^u8 n -- )
-   {: v:^ vu:n :}
-   v vu ARG-SENT TEXT-CAP STORE ARG-SENT-U !
-   vu 0= ARGS-SENT-U @ vu + 1 + TEXT-CAP > or if exit then
-   ARGS-SENT-U @ 0<> if s"  " ARGS-SENT+ then
-   v vu ARGS-SENT+ ;
+: ARG-SENT! ( ^u8 n -- ) ARG-SENT TEXT-CAP STORE ARG-SENT-U ! ;
 
 
 : CONTENT-REV$ ( n -- ^u8 n )
@@ -1359,7 +1337,6 @@ variable SESSIONS
    {: q:HTTP:request a:HTTP:response :}
    q a ADMITTED? 0= if exit then
    q ARG-READ
-   q BODY-KEPT
    q HTTP:BODY$ {: b:^ bu:n :}
    BODY-HASHER DROPBOX:HASH-BEGIN
    b bu BODY-HASHER DROPBOX:HASH-FEED
@@ -1499,10 +1476,8 @@ $2100000 constant UPLOAD-CAP
 : RESET ( -- )
    0 SCRIPTS ! 0 FILES ! 0 CONTENTS ! 0 SESSIONS ! 0 REVS !
    0 GRANT-CODE-U ! 0 ROTATED-U !
-   0 SEEN-U ! 0 DELETES-U ! 0 AUTH-U ! 0 ROOT-SENT-U ! 0 TYPE-SENT-U !
-   0 ARG-SENT-U ! 0 ARGS-SENT-U ! 0 DELETE-SENT-U ! 0 RANGE-SENT-U !
-   0 BODY-SENT-U ! 0 UPLOAD-PATHS-U ! 0 UPLOAD-BODIES-U !
-   0 METADATA-BODIES-U !
+   CALLS-RESET 0 AUTH-U ! 0 ROOT-SENT-U ! 0 TYPE-SENT-U !
+   0 ARG-SENT-U ! 0 RANGE-SENT-U !
    false ROOTED ! false TYPED ! false LEAKED ! false RANGED !
    false SKEWED ! false CLIPPED ! false INFLATED !
    0 MISHASHED-U ! false MISSIZED ! 0 MISFILED-U !
@@ -1582,8 +1557,18 @@ $2100000 constant UPLOAD-CAP
    t tu NEEDLES PATH-CAP i AT STORE i NEEDLE-US ! ;
 
 
-\ The paths requested since RESET, joined by spaces.
-: SEEN$ ( -- ^u8 n ) SEEN SEEN-U @ ;
+\ The routes requested since RESET, in order, joined by single spaces.
+: SEEN$ ( -- ^u8 n )
+   JOINED BUF:CLEAR
+   CALL-COUNT 0 ?do i ROUTE-OF$ JOIN+ loop JOINED$ ;
+\ How many requests since RESET went to exactly the route.
+: CALLS ( ^u8 n -- n )
+   {: r:^ ru:n :}
+   0 CALL-COUNT 0 ?do i ROUTE-OF$ r ru STR= if 1+ then loop ;
+\ The Dropbox-API-Args and the bodies' first KiB of the requests to the
+\ route since RESET, in order, joined by single spaces.
+: ARGS-TO$ ( ^u8 n -- ^u8 n ) [: ARG-OF$ ;] JOINED-TO$ ;
+: BODIES-TO$ ( ^u8 n -- ^u8 n ) [: BODY-OF$ ;] JOINED-TO$ ;
 \ The last API call's Authorization value.
 : AUTH$ ( -- ^u8 n ) AUTH AUTH-U @ ;
 \ The access token the fake issued last.
@@ -1597,13 +1582,6 @@ $2100000 constant UPLOAD-CAP
 \ Whether a token request or long poll since RESET carried Authorization or
 \ Path-Root.
 : LEAKED? ( -- bool ) LEAKED @ ;
-\ Each files/upload's Dropbox-API-Arg path since RESET, joined by
-\ spaces.
-: UPLOAD-PATHS$ ( -- ^u8 n ) UPLOAD-PATHS UPLOAD-PATHS-U @ ;
-\ Each files/upload's body since RESET, each followed by a newline.
-: UPLOAD-BODIES$ ( -- ^u8 n ) UPLOAD-BODIES UPLOAD-BODIES-U @ ;
-\ Each get_metadata's body since RESET, joined by spaces.
-: METADATA-BODIES$ ( -- ^u8 n ) METADATA-BODIES METADATA-BODIES-U @ ;
 
 
 \ ---- list_folder, list_folder/continue and list_folder/longpoll
@@ -1701,10 +1679,6 @@ $2100000 constant UPLOAD-CAP
 \ The Dropbox-API-Arg value of the last download, upload, or upload
 \ session append or finish.
 : ARG-SENT$ ( -- ^u8 n ) ARG-SENT ARG-SENT-U @ ;
-\ The Dropbox-API-Arg values of the downloads, uploads, and upload
-\ session appends and finishes since RESET, joined by spaces; one that
-\ would not fit in 1024 bytes is left out.
-: ARGS-SENT$ ( -- ^u8 n ) ARGS-SENT ARGS-SENT-U @ ;
 \ The last download's Range value, and whether it sent one.
 : RANGE-SENT$ ( -- ^u8 n ) RANGE-SENT RANGE-SENT-U @ ;
 : RANGE-SENT? ( -- bool ) RANGED @ ;
@@ -1720,16 +1694,6 @@ $2100000 constant UPLOAD-CAP
    v vu VERIFIER NAME-CAP STORE VERIFIER-U ! ;
 
 
-\ The body of the last delete_v2 or single upload its route answered, its
-\ first KiB.
-: BODY-SENT$ ( -- ^u8 n ) BODY-SENT BODY-SENT-U @ ;
-
-\ The last delete_v2's body since RESET.
-: DELETE-SENT$ ( -- ^u8 n ) DELETE-SENT DELETE-SENT-U @ ;
-
-\ The bodies of the delete_v2 calls since RESET, scripted ones included,
-\ joined by spaces.
-: DELETES$ ( -- ^u8 n ) DELETES DELETES-U @ ;
 \ The next API call's route runs and takes effect, and its answer is lost:
 \ the connection sends a 200 head and closes before its body.
 : LOSE ( -- ) true LOSING ! ;
