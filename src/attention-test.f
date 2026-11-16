@@ -4,11 +4,9 @@
 \ - status_never_initializes_or_migrates_a_journal
 \ - status_diagnostics_redact_the_absolute_journal_path, over the lines
 \   JOURNAL and ATTENTION log, which name `[Omabox journal]`
-\ and two of its own:
+\ and one of its own:
 \ - A-JOURNAL-BELOW-A-FILE-IS-UNINSPECTABLE: ENOTDIR from stat is
 \   E-INSPECT, its two lines logged, ENOTDIR left in FS:ERRNO.
-\ - PATHS-SORT-BY-COMPONENT: a/b before a-b, as Path::cmp orders them,
-\   where their bytes order them the other way.
 \ Each case runs in a directory of its own under TMPDIR and removes it;
 \ a refusal's log lines are captured there, checked and removed.
 \ Run from the repository root: hb --load src/attention-test.f </dev/null
@@ -351,31 +349,12 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
    ru 0 T=
    d GONE ;
 
-: PATHS-SORT-BY-COMPONENT ( ^ARENA:arena -- )
-   {: ar :}
-   s" PATHS-SORT-BY-COMPONENT" T-LABEL
-   ar SCRATCH {: d:str :}
-   d s" journal.sqlite3" ar INSIDE {: p:str :}
-   p JOURNAL:OPEN {: j :}
-   j ar BIND
-   ar PATHS {: locals :}
-   s" a-b" PATH locals VEC:PUSH !
-   s" a/b" PATH locals VEC:PUSH !
-   locals j ar LOCALS
-   j JOURNAL:CLOSE
-   p ar RENDERED
-   s\" Omabox status:\n- a/b: local status unknown: path is inaccessible\n- a-b: local status unknown: path is inaccessible\n"
-   T$=
-   d GONE ;
-
-
 : CASES ( ^ARENA:arena -- )
    {: ar :}
    ar STATUS-SNAPSHOT-IS-SORTED-AND-OMITS-INTERNAL-VALUES
    ar STATUS-NEVER-INITIALIZES-OR-MIGRATES-A-JOURNAL
    ar STATUS-DIAGNOSTICS-REDACT-THE-ABSOLUTE-JOURNAL-PATH
-   ar A-JOURNAL-BELOW-A-FILE-IS-UNINSPECTABLE
-   ar PATHS-SORT-BY-COMPONENT ;
+   ar A-JOURNAL-BELOW-A-FILE-IS-UNINSPECTABLE ;
 
 : TESTS ( -- )
    T-RESET

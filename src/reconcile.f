@@ -231,23 +231,6 @@ STRUCTURE pending-plan
    k 1 > if v 0 VEC:AT k less SORT:SORT! then
    v ;
 
-\ A byte of a path for PATH-CMP: a separator below every other byte,
-\ the end below that.
-: RANK ( ^u8 n n -- n )
-   {: p:^ u:n at:n :}
-   at u >= if -2 exit then
-   p at + c@ dup SEPARATOR = if drop -1 then ;
-
-\ Rust's Path order of two relative paths with no empty or "."
-\ component, which compares their components.
-: PATH-CMP ( MODEL:path MODEL:path -- n )
-   {: a b :}
-   a MODEL:PATH>STR str> {: p:^ u:n :}
-   b MODEL:PATH>STR str> {: q:^ v:n :}
-   u v max 1+ 0 do
-      p u i RANK q v i RANK CMP dup 0<> if unloop exit then drop
-   loop 0 ;
-
 \ Rust's sort_by is stable: equal items keep their order.
 : STABLE< ( n n n -- bool )
    {: x:n y:n c:n :}
@@ -266,7 +249,7 @@ STRUCTURE pending-plan
    v y VEC:AT @ LOCAL-ENTRY-UNMAKE {: k2 r2 :}
    k k2 MODEL:KEY-CMP {: c:n :}
    c 0<> if c exit then
-   r RECORD-PATH r2 RECORD-PATH PATH-CMP ;
+   r RECORD-PATH r2 RECORD-PATH MODEL:PATH-CMP ;
 
 : KEY-INTO
    ( MODEL:local-record ^VEC:vector<local-entry> ^ARENA:arena -- )
@@ -2451,7 +2434,7 @@ STRUCTURE download-operation
 \ Plan x against plan y by path.
 : PLAN-PATH-CMP ( n n ^VEC:vector<JOURNAL:plan-record> -- n )
    {: x:n y:n plans :}
-   plans x VEC:AT @ PLAN-PATH plans y VEC:AT @ PLAN-PATH PATH-CMP ;
+   plans x VEC:AT @ PLAN-PATH plans y VEC:AT @ PLAN-PATH MODEL:PATH-CMP ;
 
 \ The plans' indices sorted by path, which FIND-PATH-PLAN searches.
 : PATH-ORDER
@@ -2478,7 +2461,7 @@ STRUCTURE download-operation
      -- option<JOURNAL:plan-record> )
    {: plans by-path path :}
    0 by-path VEC:COUNT
-   [: plans by-path rot PLAN-AT PLAN-PATH path PATH-CMP 0 < ;]
+   [: plans by-path rot PLAN-AT PLAN-PATH path MODEL:PATH-CMP 0 < ;]
    SORT:PARTITION-POINT {: at:n :}
    at by-path VEC:COUNT >= if OPTION:NONE exit then
    plans by-path at PLAN-AT {: p :}

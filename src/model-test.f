@@ -1,7 +1,7 @@
 \ model-test.f - MODEL's values: every line of src/oracle/fold.tsv, the
 \ Rust version's answers, through FOLD; model.rs's tests of a key's order,
-\ folding and BENEATH?; SUBTREE-RANGE against BENEATH?; BEGINS? on
-\ display paths; exclusions.rs's tests through EXCLUDED?; the planner's
+\ folding and BENEATH?; SUBTREE-RANGE against BENEATH?; BEGINS? and
+\ PATH-CMP on display paths; exclusions.rs's tests through EXCLUDED?; the planner's
 \ equality words on one equal and one unequal pair, and the observation,
 \ fingerprint and record ones on values that differ in one field or
 \ variant; each display word on every variant against model.rs's text;
@@ -125,6 +125,26 @@ TYPED-VARIABLE AR ^ARENA:arena
    s" /a/b" DISPLAY s" /" DISPLAY MODEL:BEGINS? TTRUE
    s" /" DISPLAY s" /" DISPLAY MODEL:BEGINS? TTRUE
    s" a/b" DISPLAY s" /" DISPLAY MODEL:BEGINS? TFALSE ;
+
+\ PATH-CMP's sign for two display paths.
+: PATH-ORDER ( ^u8 n ^u8 n -- n )
+   {: a:^ u:n b:^ v:n :}
+   a u DISPLAY b v DISPLAY MODEL:PATH-CMP {: c:n :}
+   c 0 < if -1 exit then
+   c 0 > if 1 exit then
+   0 ;
+
+\ Path::cmp's answers; each pair but the equal ones orders the other way
+\ by bytes.
+: PATHS-SORT-BY-COMPONENT ( -- )
+   s" PATHS-SORT-BY-COMPONENT" T-LABEL
+   s" a/b" s" a-b" PATH-ORDER -1 T=
+   s" a-b" s" a/b" PATH-ORDER 1 T=
+   s" /z" s" ." PATH-ORDER -1 T=
+   s" ./z" s" .." PATH-ORDER -1 T=
+   s" ../z" s" -" PATH-ORDER -1 T=
+   s" a//b" s" a/b" PATH-ORDER 0 T=
+   s" a/./b" s" a/b" PATH-ORDER 0 T= ;
 
 : EXCLUDED ( ^u8 n -- ) DISPLAY MODEL:EXCLUDED? TTRUE ;
 : SYNCED ( ^u8 n -- ) DISPLAY MODEL:EXCLUDED? TFALSE ;
@@ -775,6 +795,7 @@ TYPED-VARIABLE W JSON:writer
    SUBTREE-RANGE-HOLDS-EXACTLY-THE-PATHS-BENEATH-AN-ANCESTOR
    ONLY-TRUE-DESCENDANTS-ARE-BENEATH-AN-ANCESTOR
    PATHS-BEGIN-BY-COMPONENT
+   PATHS-SORT-BY-COMPONENT
    DOCUMENTED-NAMES-AND-DESCENDANTS-ARE-EXCLUDED
    OTHER-NAMES-STILL-SYNC
    EQUALITY-CASE

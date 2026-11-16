@@ -15,6 +15,9 @@
 \ Each component is lowered in full when it is UTF-8, else byte by byte as
 \ ASCII, and they are joined as PathBuf::push joins them: a "/" before each
 \ but when the path so far is empty or the root.
+\ PATH-CMP is Rust's Path::cmp over the same components, ".." and a
+\ leading root or "." among them; RECONCILE and ATTENTION order paths
+\ with it.
 \ Equality reads the bytes of every string a value holds. Two values of a
 \ family are equal when their forms are: the variant's number, an unknown
 \ observation's 3 plus its reason's, then the strings it holds, each in a
@@ -452,6 +455,56 @@ public
    b PATH>STR str> {: q:^ v:n :}
    p p u LEAD q q v LEAD STR= 0= if false exit then
    q v [: p u MATCH-PART ;] PARTS 0 >= ;
+
+private
+
+\ Rust's Component order after a path's end: the root, ".", "..", then
+\ a name.
+0 constant END-RANK
+1 constant ROOT-RANK
+2 constant CURRENT-RANK
+3 constant PARENT-RANK
+4 constant NAME-RANK
+
+\ The component from `at`, its rank and the index after it; END-RANK
+\ past the last. At -1, the root or leading "." comes first.
+: COMPONENT ( ^u8 n n -- ^u8 n n n )
+   {: p:^ u:n at:n :}
+   at 0 < if
+      p u ROOT? if p 1 ROOT-RANK 1 exit then
+      p u CURRENT? if p 1 CURRENT-RANK 1 exit then
+      p u 0 RECURSE exit
+   then
+   p u at NEXT-PART 0= if 2drop drop p 0 END-RANK at exit then
+   {: q:^ v:n next:n :}
+   q v s" .." STR= if q v PARENT-RANK next exit then
+   q v NAME-RANK next ;
+
+\ The components from i in p and j in q: the indices after them, their
+\ order, and true when they are equal and neither path has ended.
+: CMP-STEP ( ^u8 n ^u8 n n n -- n n n bool )
+   {: p:^ u:n q:^ v:n i:n j:n :}
+   p u i COMPONENT {: x:^ xu:n xr:n i2:n :}
+   q v j COMPONENT {: y:^ yu:n yr:n j2:n :}
+   xr yr <> if i2 j2 xr yr - false exit then
+   xr END-RANK = if i2 j2 0 false exit then
+   x xu y yu STR= if i2 j2 0 true exit then
+   i2 j2 x xu y yu STR< if -1 else 1 then false ;
+
+public
+
+\ Rust's Path::cmp: below zero, zero or above zero as the first path's
+\ components sort before, equal or after the second's. A leading "/" is
+\ the root, a leading "." alone or before "/" is ".", ".." is "..", any
+\ other component a name by its bytes; empty and other "." components
+\ are skipped. The root, ".", ".." and a name sort in that order, and a
+\ path that runs out first is less. It allocates nothing.
+: PATH-CMP ( path path -- n )
+   {: a:path b:path :}
+   a PATH>STR str> {: p:^ u:n :}
+   b PATH>STR str> {: q:^ v:n :}
+   -1 -1 0 begin drop 2>r p u q v 2r> CMP-STEP 0= until
+   nip nip ;
 
 private
 

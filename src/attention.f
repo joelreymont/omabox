@@ -45,18 +45,11 @@ public
 private
 
 $2F constant SLASH
-$2E constant DOT
 
-\ Rust's Component order: the root, ".", "..", then a name.
-1 constant ROOT-RANK
-2 constant CURRENT-RANK
-3 constant PARENT-RANK
-4 constant NAME-RANK
-
-\ key: the path's bytes in Path::cmp's order; shown: the path as the
-\ text shows it; detail: the text after it.
+\ path: what the lines sort by; shown: the path as the text shows it;
+\ detail: the text after it.
 STRUCTURE entry
-   FIELD key str
+   FIELD path MODEL:path
    FIELD shown str
    FIELD detail str
 ;STRUCTURE
@@ -192,68 +185,7 @@ ARENA SLOTS JOURNAL:journal
    ;MATCH ;
 
 
-\ ---- a path's key and how it shows ---------------------------------
-
-\ Writes the rank, then 0, at len; answers the key's length after them.
-: RANK! ( n ^u8 n -- n )
-   {: r:n dst:^ len:n :}
-   r dst len + c!  0 dst len 1+ + c!
-   len 2 + ;
-
-\ A name's rank, its bytes, then 0, which no name holds.
-: NAME! ( ^u8 n ^u8 n -- n )
-   {: q:^ v:n dst:^ len:n :}
-   NAME-RANK dst len + c!
-   q dst len 1+ + v BYTE-COPY
-   0 dst len 1+ v + + c!
-   len v + 2 + ;
-
-\ An empty or "." component, which std::path skips.
-: SKIPPED? ( ^u8 n -- bool )
-   {: q:^ v:n :}
-   v 0= if true exit then
-   v 1 = if q c@ DOT = exit then
-   false ;
-
-: PART! ( ^u8 n ^u8 n -- n )
-   {: q:^ v:n dst:^ len:n :}
-   q v SKIPPED? if len exit then
-   q v s" .." STR= if PARENT-RANK dst len RANK! exit then
-   q v dst len NAME! ;
-
-\ A leading "." alone or before "/".
-: CURRENT? ( ^u8 n -- bool )
-   {: p:^ u:n :}
-   u 0= if false exit then
-   p c@ DOT <> if false exit then
-   u 1 = if true exit then
-   p 1+ c@ SLASH = ;
-
-\ The root or the leading "." written: where the rest starts, then the
-\ key's length.
-: LEAD! ( ^u8 n ^u8 -- n n )
-   {: p:^ u:n dst:^ :}
-   u 0 > if p c@ SLASH = if 0 ROOT-RANK dst 0 RANK! exit then then
-   p u CURRENT? if 1 CURRENT-RANK dst 0 RANK! exit then
-   0 0 ;
-
-\ Writes the component from `at`: the key's length, the index after the
-\ component, and false past the last.
-: STEP ( ^u8 n ^u8 n n -- n n bool )
-   {: p:^ u:n dst:^ len:n at:n :}
-   p u SLASH at SPLIT-NEXT {: q:^ v:n next:n more:bool :}
-   more 0= if len next false exit then
-   q v dst len PART! next true ;
-
-\ Each component's rank and a name's bytes, so that byte order is
-\ Path::cmp's order.
-: KEY ( MODEL:path ^ARENA:arena -- str )
-   {: path ar :}
-   path MODEL:PATH>STR str> {: p:^ u:n :}
-   ar u 2 * 4 + ARENA:ALLOC drop {: dst:^ :}
-   p u dst LEAD! swap
-   begin 2>r p u dst 2r> STEP 0= until
-   drop dst swap >str ;
+\ ---- how a path shows ----------------------------------------------
 
 : SHOWN ( MODEL:path ^ARENA:arena -- str )
    {: path ar :}
@@ -264,7 +196,7 @@ ARENA SLOTS JOURNAL:journal
 
 : ENTRY+ ( MODEL:path str ^ARENA:arena ^VEC:vector<entry> -- )
    {: path detail:str ar v :}
-   path ar KEY path ar SHOWN detail ENTRY-MAKE v VEC:PUSH ! ;
+   path path ar SHOWN detail ENTRY-MAKE v VEC:PUSH ! ;
 
 
 \ ---- what needs attention -----------------------------------------
@@ -414,10 +346,11 @@ ARENA SLOTS JOURNAL:journal
 
 : ENTRY< ( n n ^VEC:vector<entry> -- bool )
    {: x:n y:n v :}
-   v x VEC:AT @ ENTRY-UNMAKE {: a:str sa:str da:str :}
-   v y VEC:AT @ ENTRY-UNMAKE {: b:str sb:str db:str :}
-   a str> b str> STR= if da str> db str> STR< exit then
-   a str> b str> STR< ;
+   v x VEC:AT @ ENTRY-UNMAKE {: a sa:str da:str :}
+   v y VEC:AT @ ENTRY-UNMAKE {: b sb:str db:str :}
+   a b MODEL:PATH-CMP {: c:n :}
+   c 0= if da str> db str> STR< exit then
+   c 0 < ;
 
 \ The entries' indices in the text's order.
 : ORDERED ( ^VEC:vector<entry> ^ARENA:arena -- ^VEC:vector<n> )
@@ -436,12 +369,12 @@ ARENA SLOTS JOURNAL:journal
 
 \ "- ", the path, ": ", the detail and a newline.
 : LINE-SIZE ( entry -- n )
-   ENTRY-UNMAKE {: k:str s:str d:str :}
+   ENTRY-UNMAKE {: k s:str d:str :}
    s str> nip d str> nip + 5 + ;
 
 : LINE! ( n entry ^u8 -- n )
    {: at:n e dst:^ :}
-   e ENTRY-UNMAKE {: k:str s:str d:str :}
+   e ENTRY-UNMAKE {: k s:str d:str :}
    at s" - " dst PUT s str> dst PUT s" : " dst PUT
    d str> dst PUT s\" \n" dst PUT ;
 
