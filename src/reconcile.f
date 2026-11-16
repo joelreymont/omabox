@@ -3,6 +3,11 @@
 \ and run their downloads, one at a time. A journal answer the pass
 \ refuses is logged once with the Rust version's text, naming the path,
 \ then thrown as E-INVALID-STATE.
+\ A listing's entries become inventory changes, numbered in order. The
+\ last delete over a key is the largest number among the deletes at it
+\ or an ancestor, a binary search per prefix, and a key's record or
+\ directory spelling comes from its writes numbered after that delete:
+\ no change is replayed against the whole inventory.
 \ STORAGE CLASS. No state of its own. CALLER-OWNED: every value a pass
 \ reads or makes lies in the arena the caller passes.
 
@@ -14,6 +19,7 @@ require src/lib/adt/option.f
 require src/lib/vector.f
 require src/lib/sort.f
 require src/lib/utf8-scalar.f
+require src/lib/unicode.f
 require src/lib/fmt.f
 require src/lib/fs-anchored.f
 require src/model.f
@@ -31,6 +37,8 @@ public
    ERROR:CODE E-INVALID-STATE
 -100801 s" two local paths have one Dropbox path identity"
    ERROR:CODE E-CASE-COLLISION
+-100802 s" Dropbox's listing does not fit the configured root"
+   ERROR:CODE E-LISTING
 
 private
 
@@ -1130,5 +1138,642 @@ STRUCTURE case-variant-move
       none OF construct case-collision-resolution none ENDOF
       some OF j p u records ar RESOLVE-AT ENDOF
    ;MATCH ;
+
+\ ---- listing changes -----------------------------------------------
+
+\ Rust's DropboxRoot: the configured root, lowercase, and its count of
+\ components.
+STRUCTURE listing-root
+   FIELD path str
+   FIELD lower str
+   FIELD depth n
+;STRUCTURE
+
+\ A directory's key and the spelling of its last component.
+STRUCTURE casing
+   FIELD key MODEL:key
+   FIELD name str
+;STRUCTURE
+
+: LISTING-FAILED ( ^u8 n -- )
+   {: t:^ tu:n :}
+   LOG:ERROR s" reconcile" LOG:LINE t tu LOG:TEXT+ LOG:;LINE
+   E-LISTING throw ;
+
+\ Rust's InvalidEntryPath, naming the display path when there is one.
+: BAD-PATH ( ^u8 n -- )
+   {: d:^ du:n :}
+   LOG:ERROR s" reconcile" LOG:LINE
+   s" Dropbox listing contained an invalid or out-of-root path"
+   LOG:TEXT+
+   du 0<> if s"  `" LOG:TEXT+ d du LOG:TEXT+ s" `" LOG:TEXT+ then
+   LOG:;LINE E-LISTING throw ;
+
+: INVALID-COMPONENT? ( ^u8 n -- bool )
+   {: p:^ u:n :}
+   u 0= if true exit then
+   p u s" ." STR= p u s" .." STR= or if true exit then
+   p u 0 COUNT-CHAR 0<> ;
+
+\ Whether the separated part from at is invalid; the index after it,
+\ or -1 past the last.
+: PART-INVALID ( ^u8 n n -- bool n )
+   {: p:^ u:n at:n :}
+   p u SEPARATOR at SPLIT-NEXT 0= if 2drop drop false -1 exit then
+   {: s:^ su:n next:n :}
+   s su INVALID-COMPONENT? next ;
+
+\ Whether any part of split('/') is invalid; the empty bytes are one
+\ empty part.
+: INVALID-PARTS? ( ^u8 n -- bool )
+   {: p:^ u:n :}
+   0 begin dup 0 >= while
+      p u rot PART-INVALID swap if drop true exit then
+   repeat drop false ;
+
+\ Rust's is_valid_path, valid UTF-8 as a Rust string is.
+: ROOT-PATH? ( ^u8 n -- bool )
+   {: p:^ u:n :}
+   u 0= if true exit then
+   p u UTF8:VALID? 0= if false exit then
+   p c@ SEPARATOR <> if false exit then
+   p u + 1- c@ SEPARATOR = if false exit then
+   p 1+ u 1- INVALID-PARTS? 0= ;
+
+: SAVED ( ^u8 n ^ARENA:arena -- str )
+   {: p:^ u:n ar :}
+   u 0= if s" " >str exit then
+   ar u ARENA:ALLOC drop {: dst:^ :}
+   p dst u BYTE-COPY
+   dst u >str ;
+
+\ The valid UTF-8 bytes lowercased, in the arena.
+: LOWERED ( ^u8 n ^ARENA:arena -- str )
+   {: p:^ u:n ar :}
+   u 0= if s" " >str exit then
+   p u UNICODE:LOWERED-BYTES {: size:n :}
+   ar size ARENA:ALLOC drop {: dst:^ :}
+   p u dst size UNICODE:LOWER drop
+   dst size >str ;
+
+\ Rust's DropboxRoot::new over the binding's remote root.
+: NEW-LISTING-ROOT ( str ^ARENA:arena -- listing-root )
+   {: s:str ar :}
+   s str> ROOT-PATH? 0= if
+      s" configured Dropbox root must be empty or a normalized absolute Dropbox path"
+      LISTING-FAILED
+   then
+   s s str> ar LOWERED s str> SEPARATOR COUNT-CHAR LISTING-ROOT-MAKE ;
+
+: ROOT-LOWER ( listing-root -- str )
+   LISTING-ROOT-UNMAKE {: p:str l:str depth:n :} l ;
+
+: ROOT-DEPTH ( listing-root -- n )
+   LISTING-ROOT-UNMAKE {: p:str l:str depth:n :} depth ;
+
+\ Whether the display path lowercases to the lower one, both valid
+\ UTF-8 as Rust's strings are.
+: LOWERS? ( ^u8 n ^u8 n -- bool )
+   {: l:^ lu:n d:^ du:n :}
+   l lu UTF8:VALID? d du UTF8:VALID? and 0= if false exit then
+   d du l lu UNICODE:LOWERS-TO? ;
+
+\ The index of the key in the lower path: past the root's lower path
+\ and a separator, or -1.
+: KEY-START ( ^u8 n str -- n )
+   {: l:^ lu:n rl:str :}
+   rl str> {: r:^ ru:n :}
+   l lu r ru STARTS-WITH? 0= if -1 exit then
+   lu ru <= if -1 exit then
+   l ru + c@ SEPARATOR <> if -1 exit then
+   ru 1+ ;
+
+\ The index after the k-th separator, k above 0, or -1 when fewer.
+: PAST-SEPARATORS ( ^u8 n n -- n )
+   {: p:^ u:n k:n :}
+   0 u 0 ?do
+      p i + c@ SEPARATOR = if
+         1+ dup k = if drop i 1+ unloop exit then
+      then
+   loop drop -1 ;
+
+\ Whether key and path bytes have as many components, none invalid.
+: FITTING? ( ^u8 n ^u8 n -- bool )
+   {: k:^ ku:n p:^ pu:n :}
+   k ku SEPARATOR COUNT-CHAR p pu SEPARATOR COUNT-CHAR <>
+   if false exit then
+   k ku INVALID-PARTS? p pu INVALID-PARTS? or 0= ;
+
+\ Rust's relative_paths: the key and display path beneath the root of
+\ the entry's lower and display paths, in the arena.
+: RELATIVE-PATHS
+   ( ^u8 n ^u8 n listing-root ^ARENA:arena -- MODEL:key MODEL:path )
+   {: l:^ lu:n d:^ du:n root ar :}
+   l lu root ROOT-LOWER KEY-START {: ks:n :}
+   d du root ROOT-DEPTH 1+ PAST-SEPARATORS {: ps:n :}
+   l lu d du LOWERS? ks 0 >= and ps 0 >= and 0= if d du BAD-PATH then
+   l ks + lu ks - {: k:^ ku:n :}
+   d ps + du ps - {: p:^ pu:n :}
+   k ku p pu FITTING? 0= if d du BAD-PATH then
+   k ku ar SAVED MODEL:>KEY p pu ar SAVED MODEL:>PATH ;
+
+: OWN-ENTRY? ( ^DROPBOX:entry listing-root -- bool )
+   {: e root :}
+   root ROOT-LOWER str> {: r:^ ru:n :}
+   ru 0= if false exit then
+   e DROPBOX-ENTRY:LOWER @ SPAN:$ r ru STR= ;
+
+: RESTRICTED-ROOT ( ^DROPBOX:entry -- )
+   DROPBOX-ENTRY:RESTRICTED @ if
+      s" configured Dropbox root cannot be traversed completely"
+      LISTING-FAILED
+   then ;
+
+\ A listing of a folder holds the folder; only an unrestricted one
+\ keeps the root usable.
+: ROOT-ENTRY ( ^DROPBOX:entry -- )
+   {: e :}
+   e DROPBOX-ENTRY:KIND @ MATCH DROPBOX:kind
+      file OF s" configured Dropbox root is not a folder" LISTING-FAILED
+      ENDOF
+      folder OF e RESTRICTED-ROOT ENDOF
+      deleted OF s" configured Dropbox root is unavailable" LISTING-FAILED
+      ENDOF
+   ;MATCH ;
+
+: DELETE+
+   ( MODEL:key ^VEC:vector<JOURNAL:remote-inventory-change> -- )
+   {: k v :}
+   k JOURNAL-REMOTE--INVENTORY--CHANGE:DELETE-SUBTREE v VEC:PUSH ! ;
+
+\ The index of the next separator from at, or the length.
+: NEXT-SEPARATOR ( ^u8 n n -- n )
+   {: p:^ u:n at:n :}
+   at begin dup u < while
+      dup p + c@ SEPARATOR = if exit then
+      1+
+   repeat ;
+
+: REMOTE-FOLDER ( -- MODEL:observation<MODEL:remote> )
+   MODEL-OBSERVATION:DIRECTORY ;
+
+\ Pushes the ancestor ending at the separators next from ki and pi;
+\ the indices past them, or -1 at the last component.
+: PARENT+
+   ( n n MODEL:key MODEL:path
+     ^VEC:vector<JOURNAL:remote-inventory-change> -- n n )
+   {: ki:n pi:n k p v :}
+   k KEY-BYTES {: kb:^ ku:n :}
+   p PATH$ {: pb:^ pu:n :}
+   kb ku ki NEXT-SEPARATOR {: ke:n :}
+   ke ku >= if -1 -1 exit then
+   pb pu pi NEXT-SEPARATOR {: pe:n :}
+   kb ke >str MODEL:>KEY pb pe >str MODEL:>PATH REMOTE-FOLDER
+   MODEL-REMOTE--RECORD:MAKE
+   JOURNAL-REMOTE--INVENTORY--CHANGE:ENSURE-DIRECTORY v VEC:PUSH !
+   ke 1+ pe 1+ ;
+
+\ Rust's append_parent_folders: an ensure-directory for each ancestor,
+\ outermost first.
+: APPEND-PARENT-FOLDERS
+   ( MODEL:key MODEL:path
+     ^VEC:vector<JOURNAL:remote-inventory-change> -- )
+   {: k p v :}
+   0 0 begin dup 0 >= while k p v PARENT+ repeat 2drop ;
+
+: UPSERT+
+   ( MODEL:observation<MODEL:remote> MODEL:key MODEL:path
+     ^VEC:vector<JOURNAL:remote-inventory-change> -- )
+   {: o k p v :}
+   k p v APPEND-PARENT-FOLDERS
+   k p o MODEL-REMOTE--RECORD:MAKE
+   JOURNAL-REMOTE--INVENTORY--CHANGE:UPSERT v VEC:PUSH ! ;
+
+: FILE-OBSERVATION
+   ( ^DROPBOX:entry ^ARENA:arena -- MODEL:observation<MODEL:remote> )
+   {: e ar :}
+   e DROPBOX-ENTRY:DOWNLOADABLE @ 0= if
+      MODEL-UNKNOWN--REASON:UNSUPPORTED MODEL-OBSERVATION:UNKNOWN exit
+   then
+   e DROPBOX:COMPLETE? 0= if
+      MODEL-UNKNOWN--REASON:INCOMPLETE MODEL-OBSERVATION:UNKNOWN exit
+   then
+   e ar REPLAY:REMOTE-OF MODEL-OBSERVATION:PRESENT ;
+
+\ A restricted folder's subtree is unknown: its listed contents go.
+: FOLDER-OBSERVATION
+   ( ^DROPBOX:entry MODEL:key
+     ^VEC:vector<JOURNAL:remote-inventory-change>
+     -- MODEL:observation<MODEL:remote> )
+   {: e k v :}
+   e DROPBOX-ENTRY:RESTRICTED @ 0= if
+      MODEL-OBSERVATION:DIRECTORY exit
+   then
+   k v DELETE+
+   MODEL-UNKNOWN--REASON:INACCESSIBLE MODEL-OBSERVATION:UNKNOWN ;
+
+: APPEND-OBSERVED
+   ( ^DROPBOX:entry MODEL:key MODEL:path
+     ^VEC:vector<JOURNAL:remote-inventory-change> ^ARENA:arena -- )
+   {: e k p v ar :}
+   e DROPBOX-ENTRY:KIND @ MATCH DROPBOX:kind
+      file OF k v DELETE+ e ar FILE-OBSERVATION k p v UPSERT+ ENDOF
+      folder OF e k v FOLDER-OBSERVATION k p v UPSERT+ ENDOF
+      deleted OF k v DELETE+ ENDOF
+   ;MATCH ;
+
+\ Rust's append_entry_changes for one entry, which a listing calls for
+\ each.
+: APPEND-ENTRY-CHANGES
+   ( ^DROPBOX:entry listing-root
+     ^VEC:vector<JOURNAL:remote-inventory-change> ^ARENA:arena -- )
+   {: e root v ar :}
+   e DROPBOX-ENTRY:LOWER @ SPAN:$ {: l:^ lu:n :}
+   e DROPBOX-ENTRY:DISPLAY @ SPAN:$ {: d:^ du:n :}
+   lu 0= du 0= or if d du BAD-PATH then
+   e root OWN-ENTRY? if e ROOT-ENTRY exit then
+   l lu d du root ar RELATIVE-PATHS {: k p :}
+   e k p v ar APPEND-OBSERVED ;
+
+: CHANGE-KEY ( JOURNAL:remote-inventory-change -- MODEL:key )
+   MATCH JOURNAL:remote-inventory-change
+      upsert OF REMOTE-KEY ENDOF
+      ensure-directory OF REMOTE-KEY ENDOF
+      delete-subtree OF ENDOF
+   ;MATCH ;
+
+: CHANGE-RECORD
+   ( JOURNAL:remote-inventory-change -- option<MODEL:remote-record> )
+   MATCH JOURNAL:remote-inventory-change
+      upsert OF OPTION:SOME ENDOF
+      ensure-directory OF OPTION:SOME ENDOF
+      delete-subtree OF drop OPTION:NONE ENDOF
+   ;MATCH ;
+
+: DELETE? ( JOURNAL:remote-inventory-change -- bool )
+   CHANGE-RECORD MATCH option
+      none OF true ENDOF
+      some OF drop false ENDOF
+   ;MATCH ;
+
+: WRITE? ( JOURNAL:remote-inventory-change -- bool ) DELETE? 0= ;
+
+\ Rust's spells_folder: a folder's or a restricted folder's spelling
+\ is authoritative for its descendants.
+: SPELLS-FOLDER? ( MODEL:observation<MODEL:remote> -- bool )
+   MATCH MODEL:observation
+      present OF drop false ENDOF
+      directory OF true ENDOF
+      absent OF false ENDOF
+      unknown OF
+         MATCH MODEL:unknown-reason
+            incomplete OF false ENDOF
+            inaccessible OF true ENDOF
+            unavailable OF false ENDOF
+            stale OF false ENDOF
+            cursor-reset OF false ENDOF
+            unsupported OF false ENDOF
+         ;MATCH
+      ENDOF
+   ;MATCH ;
+
+: FOLDER-WRITE? ( JOURNAL:remote-inventory-change -- bool )
+   CHANGE-RECORD MATCH option
+      none OF false ENDOF
+      some OF REMOTE-OBSERVATION SPELLS-FOLDER? ENDOF
+   ;MATCH ;
+
+\ Change x sorts before y by key, then number.
+: CHANGE< ( n n ^VEC:vector<JOURNAL:remote-inventory-change> -- bool )
+   {: x:n y:n cs :}
+   cs x VEC:AT @ CHANGE-KEY cs y VEC:AT @ CHANGE-KEY MODEL:KEY-CMP
+   {: c:n :}
+   c 0<> if c 0 < exit then
+   x y < ;
+
+\ The numbers of the changes q accepts, by key, then number.
+: KEYED-NUMBERS
+   ( ^VEC:vector<JOURNAL:remote-inventory-change>
+     [ JOURNAL:remote-inventory-change -- bool ] ^ARENA:arena
+     -- ^VEC:vector<n> )
+   {: cs q ar :}
+   ar ARENA:ALLOCATOR 0 [type] n VEC:NEW {: v :}
+   cs VEC:COUNT 0 ?do
+      cs i VEC:AT @ q execute if i v VEC:PUSH ! then
+   loop
+   v VEC:COUNT 1 > if
+      v 0 VEC:AT v VEC:COUNT [: cs CHANGE< ;] SORT:SORT!
+   then
+   v ;
+
+\ The key of the change whose number is at i.
+: NTH-KEY
+   ( ^VEC:vector<n> n ^VEC:vector<JOURNAL:remote-inventory-change>
+     -- MODEL:key )
+   {: v at:n cs :}
+   cs v at VEC:AT @ VEC:AT @ CHANGE-KEY ;
+
+\ The index after the run of numbers from i whose changes share a key.
+: KEY-RUN-END
+   ( ^VEC:vector<n> n ^VEC:vector<JOURNAL:remote-inventory-change>
+     -- n )
+   {: v from:n cs :}
+   v from cs NTH-KEY {: k :}
+   from 1+ begin dup v VEC:COUNT < while
+      v over cs NTH-KEY k MODEL:KEY= 0= if exit then
+      1+
+   repeat ;
+
+\ The deletes' numbers by key, only the last at each key.
+: LATEST-DELETES
+   ( ^VEC:vector<JOURNAL:remote-inventory-change> ^ARENA:arena
+     -- ^VEC:vector<n> )
+   {: cs ar :}
+   cs [: DELETE? ;] ar KEYED-NUMBERS {: sorted :}
+   ar ARENA:ALLOCATOR 0 [type] n VEC:NEW {: v :}
+   0 begin dup sorted VEC:COUNT < while
+      sorted over cs KEY-RUN-END nip
+      dup 1- sorted swap VEC:AT @ v VEC:PUSH !
+   repeat drop
+   v ;
+
+\ The number of the delete at these key bytes, or -1.
+: DELETE-AT
+   ( ^u8 n ^VEC:vector<n> ^VEC:vector<JOURNAL:remote-inventory-change>
+     -- n )
+   {: p:^ u:n ds cs :}
+   p u ds VEC:COUNT [: ds swap cs NTH-KEY ;] FIND-BYTES {: at:n :}
+   at ds VEC:COUNT = if -1 exit then
+   ds at VEC:AT @ ;
+
+\ The number of the last delete over the key: at it or an ancestor.
+: LAST-DELETE
+   ( MODEL:key ^VEC:vector<n>
+     ^VEC:vector<JOURNAL:remote-inventory-change> -- n )
+   {: k ds cs :}
+   k KEY-BYTES {: p:^ u:n :}
+   p u ds cs DELETE-AT
+   u 0 ?do
+      p i + c@ SEPARATOR = if p i ds cs DELETE-AT max then
+   loop ;
+
+: NO-RECORD ( -- option<MODEL:remote-record> ) OPTION:NONE ;
+
+\ An ancestor seen through a listed child never hides an unknown
+\ folder.
+: DIRECTORY-UNLESS-UNKNOWN
+   ( MODEL:observation<MODEL:remote>
+     -- MODEL:observation<MODEL:remote> )
+   MATCH MODEL:observation
+      present OF drop MODEL-OBSERVATION:DIRECTORY ENDOF
+      directory OF MODEL-OBSERVATION:DIRECTORY ENDOF
+      absent OF MODEL-OBSERVATION:DIRECTORY ENDOF
+      unknown OF MODEL-OBSERVATION:UNKNOWN ENDOF
+   ;MATCH ;
+
+: ENSURED
+   ( MODEL:remote-record option<MODEL:remote-record>
+     -- option<MODEL:remote-record> )
+   {: r held :}
+   held MATCH option
+      none OF r OPTION:SOME ENDOF
+      some OF MODEL-REMOTE--RECORD:UNMAKE DIRECTORY-UNLESS-UNKNOWN
+         MODEL-REMOTE--RECORD:MAKE OPTION:SOME
+      ENDOF
+   ;MATCH ;
+
+\ Rust's apply_entries for one write over what its key holds.
+: APPLIED
+   ( option<MODEL:remote-record> JOURNAL:remote-inventory-change
+     -- option<MODEL:remote-record> )
+   {: held c :}
+   c MATCH JOURNAL:remote-inventory-change
+      upsert OF OPTION:SOME ENDOF
+      ensure-directory OF held ENSURED ENDOF
+      delete-subtree OF drop held ENDOF
+   ;MATCH ;
+
+\ Replays the run of writes from i numbered after the last delete over
+\ their key, pushing the record they leave; the index after the run.
+: KEY-RECORD
+   ( n ^VEC:vector<n> ^VEC:vector<JOURNAL:remote-inventory-change>
+     ^VEC:vector<n> ^VEC:vector<MODEL:remote-record> -- n )
+   {: from:n ws cs ds out :}
+   ws from cs KEY-RUN-END {: end:n :}
+   ws from cs NTH-KEY ds cs LAST-DELETE {: last:n :}
+   NO-RECORD end from ?do
+      ws i VEC:AT @ dup last > if cs swap VEC:AT @ APPLIED else drop then
+   loop
+   MATCH option
+      none OF ENDOF
+      some OF out VEC:PUSH ! ENDOF
+   ;MATCH
+   end ;
+
+: CASING-KEY ( casing -- MODEL:key ) CASING-UNMAKE {: k s:str :} k ;
+
+: NO-CASINGS ( ^ARENA:arena -- ^VEC:vector<casing> )
+   ARENA:ALLOCATOR 0 [type] casing VEC:NEW ;
+
+\ Rust's insert_directory_casing: the path's last component.
+: INSERT-DIRECTORY-CASING
+   ( MODEL:key MODEL:path ^VEC:vector<casing> ^ARENA:arena -- )
+   {: k p cv ar :}
+   p ar FILE-NAME MATCH option
+      none OF p PATH$ BAD-PATH ENDOF
+      some OF {: name:str :} k name CASING-MAKE cv VEC:PUSH ! ENDOF
+   ;MATCH ;
+
+: RECORD-CASING
+   ( MODEL:remote-record ^VEC:vector<casing> ^ARENA:arena -- )
+   {: r cv ar :}
+   r MODEL-REMOTE--RECORD:UNMAKE {: k p o :}
+   o SPELLS-FOLDER? if k p cv ar INSERT-DIRECTORY-CASING then ;
+
+\ Rust's directory_casing over records sorted by key, so by key.
+: DIRECTORY-CASING
+   ( ^VEC:vector<MODEL:remote-record> ^ARENA:arena
+     -- ^VEC:vector<casing> )
+   {: rs ar :}
+   ar NO-CASINGS {: cv :}
+   rs VEC:COUNT 0 ?do rs i VEC:AT @ cv ar RECORD-CASING loop
+   cv ;
+
+\ The casing at these key bytes among casings sorted by key, if any.
+: CASING-AT ( ^u8 n ^VEC:vector<casing> -- option<str> )
+   {: p:^ u:n cv :}
+   p u cv VEC:COUNT [: cv swap VEC:AT @ CASING-KEY ;] FIND-BYTES
+   {: at:n :}
+   at cv VEC:COUNT = if OPTION:NONE exit then
+   cv at VEC:AT @ CASING-UNMAKE {: k s:str :} s OPTION:SOME ;
+
+\ Runs q on the component at ki and pi, spelled by the casing of the
+\ key up to it, else its own; the indices after them, or -1 past the
+\ last.
+: SPELL-PART
+   ( n n n MODEL:key MODEL:path ^VEC:vector<casing> [ n ^u8 n -- n ]
+     -- n n n )
+   {: acc:n ki:n pi:n k p cv q :}
+   k KEY-BYTES {: kb:^ ku:n :}
+   p PATH$ {: pb:^ pu:n :}
+   kb ku ki NEXT-SEPARATOR {: ke:n :}
+   pb pu pi NEXT-SEPARATOR {: pe:n :}
+   kb ke cv CASING-AT MATCH option
+      none OF pb pi + pe pi - ENDOF
+      some OF str> ENDOF
+   ;MATCH {: s:^ su:n :}
+   acc s su q execute
+   ke ku >= if -1 -1 exit then
+   ke 1+ pe 1+ ;
+
+: EACH-SPELLED
+   ( n MODEL:key MODEL:path ^VEC:vector<casing> [ n ^u8 n -- n ]
+     -- n )
+   {: k p cv q :}
+   0 0 begin dup 0 >= while k p cv q SPELL-PART repeat 2drop ;
+
+\ Writes the part at offset at of dst, after a separator unless
+\ first; the offset after it.
+: PUT-PART ( n ^u8 n ^u8 -- n )
+   {: at:n s:^ su:n dst:^ :}
+   at at 0 > if SEPARATOR dst at + c! 1+ then {: from:n :}
+   s dst from + su BYTE-COPY
+   from su + ;
+
+\ Rust's normalized_remote_path: each component takes the casing of
+\ its prefix's key, when there is one.
+: NORMALIZED-REMOTE-PATH
+   ( MODEL:key MODEL:path ^VEC:vector<casing> ^ARENA:arena
+     -- MODEL:path )
+   {: k p cv ar :}
+   k KEY-BYTES SEPARATOR COUNT-CHAR p PATH$ SEPARATOR COUNT-CHAR <>
+   if p PATH$ BAD-PATH then
+   0 k p cv [: nip swap dup 0 > if 1+ then + ;] EACH-SPELLED
+   {: size:n :}
+   ar size ARENA:ALLOC drop {: dst:^ :}
+   0 k p cv [: dst PUT-PART ;] EACH-SPELLED drop
+   dst size >str MODEL:>PATH ;
+
+: RESPELL-RECORD
+   ( MODEL:remote-record ^VEC:vector<casing> ^ARENA:arena
+     -- MODEL:remote-record )
+   {: r cv ar :}
+   r MODEL-REMOTE--RECORD:UNMAKE {: k p o :}
+   k k p cv ar NORMALIZED-REMOTE-PATH o MODEL-REMOTE--RECORD:MAKE ;
+
+\ Rust's normalize_inventory_records over records sorted by key.
+: NORMALIZE-INVENTORY-RECORDS
+   ( ^VEC:vector<MODEL:remote-record> ^ARENA:arena -- )
+   {: rs ar :}
+   rs ar DIRECTORY-CASING {: cv :}
+   rs VEC:COUNT 0 ?do
+      rs i VEC:AT @ cv ar RESPELL-RECORD rs i VEC:AT !
+   loop ;
+
+\ Rust's apply_entries over a full listing's changes, then
+\ normalize_inventory_records: the records by key.
+: INVENTORY-RECORDS
+   ( ^VEC:vector<JOURNAL:remote-inventory-change> ^ARENA:arena
+     -- ^VEC:vector<MODEL:remote-record> )
+   {: cs ar :}
+   cs ar LATEST-DELETES {: ds :}
+   cs [: WRITE? ;] ar KEYED-NUMBERS {: ws :}
+   ar ARENA:ALLOCATOR 0 [type] MODEL:remote-record VEC:NEW {: out :}
+   0 begin dup ws VEC:COUNT < while ws cs ds out KEY-RECORD repeat drop
+   out ar NORMALIZE-INVENTORY-RECORDS
+   out ;
+
+\ A journal directory keeps its spelling while no delete is over it.
+: KEPT-CASING
+   ( JOURNAL:remote-directory ^VEC:vector<n>
+     ^VEC:vector<JOURNAL:remote-inventory-change> ^VEC:vector<casing>
+     ^ARENA:arena -- )
+   {: d ds cs cv ar :}
+   d JOURNAL-REMOTE--DIRECTORY:UNMAKE {: k p :}
+   k ds cs LAST-DELETE 0< if k p cv ar INSERT-DIRECTORY-CASING then ;
+
+: WRITE-CASING
+   ( JOURNAL:remote-inventory-change ^VEC:vector<casing> ^ARENA:arena
+     -- )
+   {: c cv ar :}
+   c CHANGE-RECORD MATCH option
+      none OF ENDOF
+      some OF MODEL-REMOTE--RECORD:UNMAKE {: k p o :}
+         k p cv ar INSERT-DIRECTORY-CASING
+      ENDOF
+   ;MATCH ;
+
+\ The casing of the run of folder writes from i: its first numbered
+\ after the last delete over the key; the index after the run.
+: RUN-CASING
+   ( n ^VEC:vector<n> ^VEC:vector<JOURNAL:remote-inventory-change>
+     ^VEC:vector<n> ^VEC:vector<casing> ^ARENA:arena -- n )
+   {: from:n ws cs ds cv ar :}
+   ws from cs KEY-RUN-END {: end:n :}
+   ws from cs NTH-KEY ds cs LAST-DELETE {: last:n :}
+   from end [: ws swap VEC:AT @ last <= ;] SORT:PARTITION-POINT
+   {: at:n :}
+   at end < if cs ws at VEC:AT @ VEC:AT @ cv ar WRITE-CASING then
+   end ;
+
+\ Casing x sorts before y by key, then index.
+: CASING< ( n n ^VEC:vector<casing> -- bool )
+   {: x:n y:n cv :}
+   cv x VEC:AT @ CASING-KEY cv y VEC:AT @ CASING-KEY MODEL:KEY-CMP
+   {: c:n :}
+   c 0<> if c 0 < exit then
+   x y < ;
+
+: FIRST-CASING+ ( casing ^VEC:vector<casing> -- )
+   {: c out :}
+   out VEC:COUNT {: u:n :}
+   u 0 > if
+      out u 1- VEC:AT @ CASING-KEY c CASING-KEY MODEL:KEY= if exit then
+   then
+   c out VEC:PUSH ! ;
+
+\ The casings by key, the first of each key's.
+: UNIQUE-CASINGS
+   ( ^VEC:vector<casing> ^ARENA:arena -- ^VEC:vector<casing> )
+   {: cv ar :}
+   cv VEC:COUNT [: cv CASING< ;] ar ORDER {: idx :}
+   ar NO-CASINGS {: out :}
+   idx VEC:COUNT 0 ?do cv idx i VEC:AT @ VEC:AT @ out FIRST-CASING+ loop
+   out ;
+
+: RESPELL-CHANGE
+   ( JOURNAL:remote-inventory-change ^VEC:vector<casing> ^ARENA:arena
+     -- JOURNAL:remote-inventory-change )
+   {: c cv ar :}
+   c MATCH JOURNAL:remote-inventory-change
+      upsert OF cv ar RESPELL-RECORD
+         JOURNAL-REMOTE--INVENTORY--CHANGE:UPSERT
+      ENDOF
+      ensure-directory OF cv ar RESPELL-RECORD
+         JOURNAL-REMOTE--INVENTORY--CHANGE:ENSURE-DIRECTORY
+      ENDOF
+      delete-subtree OF drop c ENDOF
+   ;MATCH ;
+
+\ Rust's normalize_inventory_changes: a directory keeps the journal's
+\ spelling until a delete is over it, then takes the first after.
+: NORMALIZE-INVENTORY-CHANGES
+   ( ^VEC:vector<JOURNAL:remote-inventory-change>
+     ^VEC:vector<JOURNAL:remote-directory> ^ARENA:arena
+     -- ^VEC:vector<JOURNAL:remote-inventory-change> )
+   {: cs dirs ar :}
+   cs ar LATEST-DELETES {: ds :}
+   cs [: FOLDER-WRITE? ;] ar KEYED-NUMBERS {: ws :}
+   ar NO-CASINGS {: all :}
+   dirs VEC:COUNT 0 ?do dirs i VEC:AT @ ds cs all ar KEPT-CASING loop
+   0 begin dup ws VEC:COUNT < while ws cs ds all ar RUN-CASING repeat
+   drop
+   all ar UNIQUE-CASINGS {: cv :}
+   ar ARENA:ALLOCATOR cs VEC:COUNT
+   [type] JOURNAL:remote-inventory-change VEC:NEW {: out :}
+   cs VEC:COUNT 0 ?do
+      cs i VEC:AT @ cv ar RESPELL-CHANGE out i VEC:AT !
+   loop
+   out ;
 
 ;package

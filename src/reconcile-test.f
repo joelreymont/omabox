@@ -32,6 +32,14 @@
 \   which share its identity, leaving one at another path pending.
 \ - With the root replaced by another directory it answers
 \   root-changed, renaming nothing and retiring no plan.
+\ Listing changes, Rust's tests of the same names:
+\ - folders_are_directories_and_non_downloadable_files_are_unknown
+\ - directory_records_normalize_inconsistent_child_ancestor_casing
+\ - delta_never_respells_a_directory_that_still_exists
+\ - listing_rejects_mismatched_canonical_and_display_paths, its one
+\   line logged
+\ - listing_classifies_the_remote_roots_own_entry, each refusal's one
+\   line logged
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -1140,6 +1148,222 @@ variable SEED
    ar RESOLVE-CASE-COLLISION-ANSWERS-A-REPLACED-ROOT ;
 
 
+\ ---- listing changes -------------------------------------------------
+
+ARENA LISTED DROPBOX:entry
+
+: ENTRY-AT
+   ( DROPBOX:kind ^u8 n ^u8 n ^ARENA:arena -- ^DROPBOX:entry )
+   {: kind l:^ lu:n d:^ du:n ar :}
+   ar LISTED-NEW {: e :}
+   kind e DROPBOX-ENTRY:KIND !
+   l lu SPAN:MAKE e DROPBOX-ENTRY:LOWER !
+   d du SPAN:MAKE e DROPBOX-ENTRY:DISPLAY !
+   true e DROPBOX-ENTRY:DOWNLOADABLE !
+   e ;
+
+\ Rust's folder_metadata.
+: FOLDER-ENTRY ( ^u8 n ^u8 n ^ARENA:arena -- ^DROPBOX:entry )
+   {: l:^ lu:n d:^ du:n ar :}
+   DROPBOX-KIND:FOLDER l lu d du ar ENTRY-AT ;
+
+\ Rust's file_metadata: a revision and a well-formed content hash.
+: FILE-ENTRY ( ^u8 n ^u8 n ^ARENA:arena -- ^DROPBOX:entry )
+   {: l:^ lu:n d:^ du:n ar :}
+   DROPBOX-KIND:FILE l lu d du ar ENTRY-AT {: e :}
+   s" test-revision" SPAN:MAKE e DROPBOX-ENTRY:REV !
+   s" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+   SPAN:MAKE e DROPBOX-ENTRY:CONTENT-HASH !
+   e ;
+
+: DELETED-ENTRY ( ^u8 n ^u8 n ^ARENA:arena -- ^DROPBOX:entry )
+   {: l:^ lu:n d:^ du:n ar :}
+   DROPBOX-KIND:DELETED l lu d du ar ENTRY-AT ;
+
+: LISTING-AT ( ^u8 n ^ARENA:arena -- listing-root )
+   {: p:^ u:n ar :}
+   p u >str ar NEW-LISTING-ROOT ;
+
+: NO-CHANGES
+   ( ^ARENA:arena -- ^VEC:vector<JOURNAL:remote-inventory-change> )
+   ARENA:ALLOCATOR 0 [type] JOURNAL:remote-inventory-change VEC:NEW ;
+
+\ The record's path at the key's display bytes, else empty.
+: PATH-OF
+   ( ^VEC:vector<MODEL:remote-record> ^u8 n ^ARENA:arena -- ^u8 n )
+   {: rs p:^ u:n ar :}
+   rs p u ar CANONICAL FIND-REMOTE MATCH option
+      none OF s" " ENDOF
+      some OF MODEL-REMOTE--RECORD:UNMAKE {: k q o :} q PATH$ ENDOF
+   ;MATCH ;
+
+\ The records' paths, each followed by "|".
+: RECORD-PATHS$ ( ^VEC:vector<MODEL:remote-record> -- ^u8 n )
+   {: rs :}
+   SB-RESET
+   rs VEC:COUNT 0 ?do
+      rs i VEC:AT @ MODEL-REMOTE--RECORD:UNMAKE {: k q o :}
+      q PATH$ SB-APPEND s" |" SB-APPEND
+   loop
+   SB$ ;
+
+\ Rust's change_paths: the writes' paths, each followed by "|".
+: CHANGE-PATHS
+   ( ^VEC:vector<JOURNAL:remote-inventory-change> -- ^u8 n )
+   {: cs :}
+   SB-RESET
+   cs VEC:COUNT 0 ?do
+      cs i VEC:AT @ CHANGE-RECORD MATCH option
+         none OF ENDOF
+         some OF MODEL-REMOTE--RECORD:UNMAKE {: k q o :}
+            q PATH$ SB-APPEND s" |" SB-APPEND
+         ENDOF
+      ;MATCH
+   loop
+   SB$ ;
+
+: FOLDERS-ARE-DIRECTORIES-AND-NON-DOWNLOADABLE-FILES-ARE-UNKNOWN
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" folders_are_directories_and_non_downloadable_files_are_unknown"
+   T-LABEL
+   s" " ar LISTING-AT {: root :}
+   ar NO-CHANGES {: v :}
+   s" /folder" s" /Folder" ar FOLDER-ENTRY root v ar APPEND-ENTRY-CHANGES
+   s" /paper" s" /Paper" ar FILE-ENTRY {: paper :}
+   false paper DROPBOX-ENTRY:DOWNLOADABLE !
+   s" " SPAN:MAKE paper DROPBOX-ENTRY:CONTENT-HASH !
+   paper root v ar APPEND-ENTRY-CHANGES
+   v ar INVENTORY-RECORDS {: rs :}
+   rs VEC:COUNT 2 T=
+   rs s" folder" ar CANONICAL REMOTE-AT REMOTE-DIRECTORY
+   MODEL:REMOTE-OBSERVATION= TTRUE
+   rs s" paper" ar CANONICAL REMOTE-AT
+   MODEL-UNKNOWN--REASON:UNSUPPORTED REMOTE-UNKNOWN
+   MODEL:REMOTE-OBSERVATION= TTRUE ;
+
+: DIRECTORY-RECORDS-NORMALIZE-INCONSISTENT-CHILD-ANCESTOR-CASING
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" directory_records_normalize_inconsistent_child_ancestor_casing"
+   T-LABEL
+   s" " ar LISTING-AT {: root :}
+   ar NO-CHANGES {: v :}
+   s" /apps" s" /apps" ar FOLDER-ENTRY root v ar APPEND-ENTRY-CHANGES
+   s" /apps/day one/entry.doentry" s" /Apps/day one/Entry.doentry"
+   ar FILE-ENTRY root v ar APPEND-ENTRY-CHANGES
+   s" /apps/day one" s" /Apps/Day One" ar FOLDER-ENTRY
+   root v ar APPEND-ENTRY-CHANGES
+   v ar INVENTORY-RECORDS {: rs :}
+   rs s" apps" ar PATH-OF s" apps" T$=
+   rs s" apps/day one" ar PATH-OF s" apps/Day One" T$=
+   rs s" apps/day one/entry.doentry" ar PATH-OF
+   s" apps/Day One/Entry.doentry" T$= ;
+
+\ Rust's existing directories: Apps and Apps/Day One.
+: EXISTING ( ^ARENA:arena -- ^VEC:vector<JOURNAL:remote-directory> )
+   {: ar :}
+   ar ARENA:ALLOCATOR 0 [type] JOURNAL:remote-directory VEC:NEW {: v :}
+   s" apps" ar CANONICAL s" Apps" DISPLAY
+   JOURNAL-REMOTE--DIRECTORY:MAKE v VEC:PUSH !
+   s" apps/day one" ar CANONICAL s" Apps/Day One" DISPLAY
+   JOURNAL-REMOTE--DIRECTORY:MAKE v VEC:PUSH !
+   v ;
+
+: DELTA-PATHS
+   ( ^VEC:vector<JOURNAL:remote-inventory-change> ^ARENA:arena
+     -- ^u8 n )
+   {: v ar :}
+   v ar EXISTING ar NORMALIZE-INVENTORY-CHANGES CHANGE-PATHS ;
+
+: DELTA-NEVER-RESPELLS-A-DIRECTORY-THAT-STILL-EXISTS ( ^ARENA:arena -- )
+   {: ar :}
+   s" delta_never_respells_a_directory_that_still_exists" T-LABEL
+   s" " ar LISTING-AT {: root :}
+   ar NO-CHANGES {: v :}
+   s" /apps" s" /apps" ar FOLDER-ENTRY root v ar APPEND-ENTRY-CHANGES
+   s" /apps/day one/journal" s" /apps/day one/Journal" ar FOLDER-ENTRY
+   root v ar APPEND-ENTRY-CHANGES
+   v ar DELTA-PATHS s" Apps|Apps|Apps/Day One|Apps/Day One/Journal|" T$=
+   ar NO-CHANGES {: w :}
+   s" /apps/day one" s" /apps/day one" ar DELETED-ENTRY
+   root w ar APPEND-ENTRY-CHANGES
+   s" /apps/day one" s" /apps/DAY ONE" ar FOLDER-ENTRY
+   root w ar APPEND-ENTRY-CHANGES
+   w ar DELTA-PATHS s" Apps|Apps/DAY ONE|" T$=
+   ar NO-CHANGES {: x :}
+   s" /apps" s" /apps" ar DELETED-ENTRY root x ar APPEND-ENTRY-CHANGES
+   s" /apps/day one/journal" s" /APPS/DAY ONE/Journal" ar FOLDER-ENTRY
+   root x ar APPEND-ENTRY-CHANGES
+   x ar DELTA-PATHS s" APPS|APPS/DAY ONE|APPS/DAY ONE/Journal|" T$= ;
+
+: LISTING-REJECTS-MISMATCHED-CANONICAL-AND-DISPLAY-PATHS
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" listing_rejects_mismatched_canonical_and_display_paths" T-LABEL
+   s" reconcile-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
+   s" " ar LISTING-AT {: root :}
+   ar NO-CHANGES {: v :}
+   s" /report.txt" s" /Different.txt" ar FILE-ENTRY {: e :}
+   d [: [: e root v ar APPEND-ENTRY-CHANGES ;] E-LISTING TTHROWSQ ;]
+   ar LOGGED {: t:^ tu:n :}
+   t tu 10 COUNT-CHAR 1 T=
+   t tu s" invalid or out-of-root path `/Different.txt`" CONTAINS? TTRUE
+   v ar INVENTORY-RECORDS VEC:COUNT 0 T=
+   d str> FS:REMOVE-TREE ;
+
+\ The root's own entry e refused with its text t: E-LISTING, one line
+\ naming t, and nothing listed after Old.
+: ROOT-REFUSED ( ^DROPBOX:entry ^u8 n str ^ARENA:arena -- )
+   {: e t:^ tu:n d:str ar :}
+   s" /Sync" ar LISTING-AT {: root :}
+   ar NO-CHANGES {: v :}
+   s" /sync/old" s" /Sync/Old" ar FOLDER-ENTRY
+   root v ar APPEND-ENTRY-CHANGES
+   s" /sync/child" s" /Sync/Child" ar FOLDER-ENTRY {: child :}
+   d [: [: e root v ar APPEND-ENTRY-CHANGES
+         child root v ar APPEND-ENTRY-CHANGES ;] E-LISTING TTHROWSQ ;]
+   ar LOGGED {: g:^ gu:n :}
+   g gu 10 COUNT-CHAR 1 T=
+   g gu t tu CONTAINS? TTRUE
+   v ar INVENTORY-RECORDS {: rs :}
+   rs RECORD-PATHS$ s" Old|" T$=
+   rs s" old" ar CANONICAL REMOTE-AT REMOTE-DIRECTORY
+   MODEL:REMOTE-OBSERVATION= TTRUE ;
+
+: ROOT-ACCEPTED ( ^ARENA:arena -- )
+   {: ar :}
+   s" /Sync" ar LISTING-AT {: root :}
+   ar NO-CHANGES {: v :}
+   s" /sync" s" /Sync" ar FOLDER-ENTRY root v ar APPEND-ENTRY-CHANGES
+   s" /sync/child" s" /Sync/Child" ar FOLDER-ENTRY
+   root v ar APPEND-ENTRY-CHANGES
+   v ar INVENTORY-RECORDS RECORD-PATHS$ s" Child|" T$= ;
+
+: LISTING-CLASSIFIES-THE-REMOTE-ROOTS-OWN-ENTRY ( ^ARENA:arena -- )
+   {: ar :}
+   s" listing_classifies_the_remote_roots_own_entry" T-LABEL
+   s" reconcile-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
+   ar ROOT-ACCEPTED
+   s" /sync" s" /Sync" ar DELETED-ENTRY
+   s" configured Dropbox root is unavailable" d ar ROOT-REFUSED
+   s" /sync" s" /Sync" ar FOLDER-ENTRY {: r :}
+   true r DROPBOX-ENTRY:RESTRICTED !
+   r s" configured Dropbox root cannot be traversed completely" d ar
+   ROOT-REFUSED
+   s" /sync" s" /Sync" ar FILE-ENTRY
+   s" configured Dropbox root is not a folder" d ar ROOT-REFUSED
+   d str> FS:REMOVE-TREE ;
+
+: LISTING-CASES ( ^ARENA:arena -- )
+   {: ar :}
+   ar FOLDERS-ARE-DIRECTORIES-AND-NON-DOWNLOADABLE-FILES-ARE-UNKNOWN
+   ar DIRECTORY-RECORDS-NORMALIZE-INCONSISTENT-CHILD-ANCESTOR-CASING
+   ar DELTA-NEVER-RESPELLS-A-DIRECTORY-THAT-STILL-EXISTS
+   ar LISTING-REJECTS-MISMATCHED-CANONICAL-AND-DISPLAY-PATHS
+   ar LISTING-CLASSIFIES-THE-REMOTE-ROOTS-OWN-ENTRY ;
+
+
 : CASES ( ^ARENA:arena -- )
    {: ar :}
    ar ABSENT-PATHS-ARE-SPELLED-WITH-LOCAL-ANCESTOR-CASING
@@ -1156,7 +1380,8 @@ variable SEED
    ar REMOTE-SUBTREE-HOLDS-ONLY-TRUE-DESCENDANTS
    ar CHILD-PREFIX-ORDER-MATCHES-THE-MATERIALIZED-PREFIX
    ar PATH-DECISIONS-ORDER-DELETES-LAST-AND-DEEPEST-FIRST
-   ar CASE-COLLISION-CASES ;
+   ar CASE-COLLISION-CASES
+   ar LISTING-CASES ;
 
 
 : RUN ( -- )

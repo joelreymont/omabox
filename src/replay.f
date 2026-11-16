@@ -1208,12 +1208,16 @@ ARENA UPLOADS DROPBOX:upload
 
 \ ---- reading the path back
 
+public
+
 \ The entry's file, its strings copied into the arena.
 : REMOTE-OF ( ^DROPBOX:entry ^ARENA:arena -- MODEL:remote )
    {: e ar :}
    e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$ ar COPIED DROPBOX:>HASH
    e DROPBOX-ENTRY:REV @ SPAN:$ ar COPIED DROPBOX:>REV
    MODEL-REMOTE:MAKE ;
+
+private
 
 : FILE-STATE ( ^DROPBOX:entry ^ARENA:arena -- remote-path-state )
    {: e ar :}
