@@ -86,9 +86,9 @@ watcher comes only for a measured need.
   denies it and why. One word, `REPLAY:DOWNLOAD-BLOCKAGE`, classifies every
   Dropbox answer that fails a download. One table maps each code and
   `DROPBOX:reply` to a disposition and status text.
-- **Machines.** `DAEMON:RUN`, `RECONCILE:PASS`, its listing and its one
-  download, and a `REPLAY` operation are `fsm.f` tables named after their
-  `formal/` models.
+- **Machines.** `RECONCILE:PASS`, its listing and its one download, and a
+  `REPLAY` operation are `fsm.f` tables named after their `formal/` models.
+  `DAEMON:RUN` is an `fsm.f` table with no model.
 - **`RECONCILE:PASS`** answers `complete` with its counts, `fresh` (rescan) or
   `root-changed`; a Dropbox answer that ends it is in the link, as `REPLAY`'s.
   `DAEMON` validates the account, not the pass. Apart from Rust, a download
@@ -122,7 +122,7 @@ watcher comes only for a measured need.
 3. One Habu install.
 4. `JOURNAL`, `LOCAL`, `AUTH`.
 5. `REPLAY`, then `RECONCILE` with the ported tests.
-6. `DAEMON`, `omaboxd`, `build.f`.
+6. `DAEMON` and `omaboxd`.
 7. Cutover of the daemon; the Rust CLI keeps working. Reinstalling the Rust
    `omaboxd` is the way back.
 8. CLI, installer, service.

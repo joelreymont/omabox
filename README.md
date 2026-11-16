@@ -18,6 +18,14 @@ untouched locally and skips syncing them: names ending in `.DS_Store`,
 There is no release build yet: the rewrite in Habu is under way, and
 `docs/habu-rewrite.md` lists what remains.
 
+To build the daemon as `bin/omaboxd`, run this from the repository root, with
+`HABU` naming a Habu checkout; `bin/omaboxd --self-check` then prints its version.
+
+```bash
+mkdir -p bin
+$HABU/bin/hb --load $HABU/tools/hb-build.f -- src/omaboxd.f -o bin/omaboxd
+```
+
 Create a Dropbox API app and copy its public app key. Omabox neither needs nor
 accepts the app secret. Then, from a release build and while the desktop is
 unlocked:
