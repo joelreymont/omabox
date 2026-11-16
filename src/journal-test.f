@@ -850,7 +850,7 @@ variable SCANNED       \ query plan rows that scan the table
    d s" not-a-root" ar INSIDE {: f:str :}
    f str> s" file" FS:WRITE-ALL
    f SUBJECT !
-   [: SUBJECT @ INSPECT drop ;] E-FILE d
+   [: SUBJECT @ INSPECT drop ;] E-ROOT d
    s" journal operation `inspect local root` failed for" ar LOGGED
    d GONE ;
 

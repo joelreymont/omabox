@@ -58,6 +58,8 @@ public
 -100304
    s" sync root is on a filesystem that does not record creation times"
    ERROR:CODE E-NO-BIRTH-TIME
+-100305 s" sync root could not be opened or inspected"
+   ERROR:CODE E-ROOT
 
 \ The connection and the path it was opened on, which logs name.
 STRUCTURE journal OPAQUE
@@ -163,13 +165,17 @@ s" migrations/0008.sql" create V8 LAY
    {: op:str path:str :}
    op OPERATION s" failed for `" LOG:TEXT+ path STR+ s" `: " LOG:TEXT+ ;
 
-\ op's File failure on path, caused by errno, else by code.
-: FILE-FAILED ( str str n n -- )
+\ Logs op's failure on path, caused by errno, else by code.
+: LOG-FAILED ( str str n n -- )
    {: op:str path:str code errno :}
    op path FAILED-FOR
    errno 0= if code LOG:CODE+ else errno FS:ERRNO$ LOG:TEXT+ then
-   LOG:;LINE
-   E-FILE throw ;
+   LOG:;LINE ;
+
+: FILE-FAILED ( str str n n -- ) LOG-FAILED E-FILE throw ;
+
+\ The sync root's failure, logged as FILE-FAILED logs one.
+: ROOT-FAILED ( str str n n -- ) LOG-FAILED E-ROOT throw ;
 
 : FILE-REFUSED ( str str str -- )
    {: op:str path:str why:str :}
@@ -566,7 +572,7 @@ private
    FS:CAUSE-CLEAR
    0 >FD [: drop path str> FS:OPEN-DIR ;] catch {: code :}
    code 0= if exit then
-   drop INSPECTING path code FS:ERRNO FILE-FAILED ;
+   drop INSPECTING path code FS:ERRNO ROOT-FAILED ;
 
 : BORN-BINDING ( str n birth-time n bool -- local-root-binding )
    {: path:str inode birth sub has:bool :}
@@ -582,7 +588,7 @@ private
    born 0= if path REFUSE-UNBORN then
    path inode birth sub has BORN-BINDING ;
 
-\ STATX's fields, the birth time as one; a failure is E-FILE for path.
+\ STATX's fields, the birth time as one; a failure is E-ROOT for path.
 : IDENTITY ( str fd -- n birth-time bool n bool )
    {: path:str dir:fd :}
    FS:CAUSE-CLEAR
@@ -592,7 +598,7 @@ private
       {: inode s ns born:bool sub has:bool :}
       inode s ns JOURNAL-BIRTH--TIME:MAKE born sub has exit
    then
-   2drop 2drop 2drop INSPECTING path code FS:ERRNO FILE-FAILED ;
+   2drop 2drop 2drop INSPECTING path code FS:ERRNO ROOT-FAILED ;
 
 \ IDENTITY of the directory at the canonical path, opened without
 \ following a link.
@@ -625,7 +631,7 @@ public
    path path dir IDENTITY FROM-STATX-FIELDS ;
 
 \ The identity of the directory at the canonical path, opened without
-\ following a link; any failure but a birth time's is E-FILE.
+\ following a link; any failure but a birth time's is E-ROOT.
 : INSPECT ( str -- local-root-binding )
    {: path:str :}
    path path PATH-IDENTITY FROM-STATX-FIELDS ;
