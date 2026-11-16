@@ -3,8 +3,9 @@
 \ is not downloadable, of a symlink, of a file with no content hash and of
 \ an entry at another path among them), the Path-Root header, the token's
 \ refresh, its rotation and the store that keeps it, a rejected grant, a
-\ revoked token, access denied, rate limits, outages, a redirect, a
-\ malformed request, a write refused access_restricted, team_folder or
+\ revoked token, access denied, a scripted answer bound to its route, rate
+\ limits, outages, a redirect, a malformed request, a write refused
+\ access_restricted, team_folder or
 \ operation_suppressed, the listing (one holding a file that is not
 \ downloadable, one holding files Dropbox described incompletely, handed
 \ on, and one holding restricted folders, among them), COMPLETE? of each
@@ -594,6 +595,25 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    fresh DROPBOX:ACCOUNT RETRY-MS 0 T=
    TEST-DROPBOX:SEEN$ s" /oauth2/token /2/users/get_current_account" T$=
    fresh DROPBOX:CLOSE ;
+
+
+\ An answer bound to download's route passes get_metadata and list_folder
+\ by; the unbound one goes to get_metadata.
+: ROUTED-SCRIPT-CASE ( -- )
+   s" scripted answer bound to its route" T-LABEL
+   TEST-DROPBOX:RESET
+   s" /2/files/download" 409 s" " s" "
+   S\" {\qerror_summary\q:\qpath/restricted_content/...\q,\qerror\q:{\q.tag\q:\qpath\q,\qpath\q:{\q.tag\q:\qrestricted_content\q}}}"
+   TEST-DROPBOX:ROUTE-SCRIPT!
+   500 s" " s" " s" " TEST-DROPBOX:SCRIPT!
+   s" []" s" c1" false TEST-DROPBOX:PAGE!
+   s" /docs/a.txt" MAIN @ DROPBOX:METADATA RETRY-MS 0 T=
+   s" /sync" MAIN @ [: drop ;] DROPBOX:LIST DONE? ASSERT
+   MAIN @ DROPBOX:CURSOR s" c1" T$=
+   s" 0160a1b2c3d4" 0 MAIN @ [: drop 2drop ;] DROPBOX:DOWNLOAD
+   DROPBOX-ERROR:RESTRICTED-CONTENT REFUSED? ASSERT
+   TEST-DROPBOX:SEEN$
+   s" /2/files/get_metadata /2/files/list_folder /2/files/download" T$= ;
 
 
 : RATE-CASE ( -- )
@@ -2390,6 +2410,7 @@ TYPED-VARIABLE FAULT fault
    EXPIRED-CASE
    REJECTED-GRANT-CASE REVOKED-CASE DENIED-CASE
    STORED-FIRST-CASE UNSTORED-CASE UNROTATED-CASE SCRIPTED-REFRESH-CASE
+   ROUTED-SCRIPT-CASE
    RATE-CASE RATE-BODY-CASE RATE-DATE-CASE RATE-CAP-CASE
    RATE-ZEROS-CASE RATE-HUGE-CASE
    BUSY-CASE REDIRECT-CASE BAD-REQUEST-CASE

@@ -15,8 +15,9 @@
 \ be, as invalid until RESET; the refresh still issues them. DENY refuses
 \ every call that carries a token 403 until RESET. A call must carry the
 \ Path-Root ROOT! expects, none when that is empty, else it answers 422.
-\ Scripted answers go out in order, each before its route's own, to API
-\ calls only: a token request leaves them queued. It records each request's
+\ Scripted answers go to API calls only, each before its route's own: a
+\ call takes the first left bound to its path, else the first left bound to
+\ none, and a token request leaves them queued. It records each request's
 \ path, and the last API call's Authorization, Path-Root and Content-Type.
 \ STORAGE CLASS. PROCESS-WIDE: one worker serves every request, so its handler
 \ alone writes the state while a test waits on its call, and the test sets it
@@ -79,8 +80,10 @@ SLOTS NAME-CAP * BUFFER: VALUES
 SLOTS TYPED-BUFFER VALUE-US n
 SLOTS TEXT-CAP * BUFFER: BODIES
 SLOTS TYPED-BUFFER BODY-US n
+SLOTS PATH-CAP * BUFFER: ROUTES
+SLOTS TYPED-BUFFER ROUTE-US n
+SLOTS TYPED-BUFFER SPENT bool
 variable SCRIPTS
-variable SCRIPTED
 
 create SEEN TEXT-CAP allot
 variable SEEN-U
@@ -125,6 +128,7 @@ TYPED-VARIABLE TOKEN-CUTTING bool
 : NAME$ ( n -- ^u8 n ) {: i:n :} NAMES i NAME-CAP * + i NAME-US @ ;
 : VALUE$ ( n -- ^u8 n ) {: i:n :} VALUES i NAME-CAP * + i VALUE-US @ ;
 : BODY$ ( n -- ^u8 n ) {: i:n :} BODIES i TEXT-CAP * + i BODY-US @ ;
+: ROUTE$ ( n -- ^u8 n ) {: i:n :} ROUTES i PATH-CAP * + i ROUTE-US @ ;
 
 
 \ The builder's text into OUT, which outlives the handler.
@@ -187,13 +191,25 @@ TYPED-VARIABLE TOKEN-CUTTING bool
 : API? ( HTTP:request -- bool ) HTTP:PATH$ s" /oauth2/token" STR= 0= ;
 
 
-\ Sends an API call the next scripted answer, if one is left.
+\ The first scripted answer left bound to the route path, the empty path
+\ standing for none; -1 when no answer is.
+: LEFT-FOR ( ^u8 n -- n )
+   {: p:^ pu:n :}
+   SCRIPTS @ 0 ?do
+      i SPENT @ 0= i ROUTE$ p pu STR= and
+      if i unloop exit then
+   loop -1 ;
+
+
+\ Sends an API call the first answer left bound to its path, else the
+\ first left bound to none, if there is one.
 : SCRIPTED? ( HTTP:request HTTP:response -- bool )
    {: q:HTTP:request a:HTTP:response :}
    q API? 0= if false exit then
-   SCRIPTED @ SCRIPTS @ >= if false exit then
-   SCRIPTED @ {: i:n :}
-   1 SCRIPTED +!
+   q HTTP:PATH$ LEFT-FOR {: bound:n :}
+   bound 0 < if s" " LEFT-FOR else bound then {: i:n :}
+   i 0 < if false exit then
+   true i SPENT !
    a i STATUSES @ HTTP:STATUS!
    i NAME$ nip 0<> if a i NAME$ i VALUE$ HTTP:HEADER! then
    a i BODY$ ANSWER!
@@ -1258,7 +1274,7 @@ $2100000 constant UPLOAD-CAP
 \ ROTATE!, a REVOKE, a DENY and what was sent; the tokens and the root
 \ stay.
 : RESET ( -- )
-   0 SCRIPTS ! 0 SCRIPTED ! 0 FILES ! 0 CONTENTS ! 0 SESSIONS ! 0 REVS !
+   0 SCRIPTS ! 0 FILES ! 0 CONTENTS ! 0 SESSIONS ! 0 REVS !
    0 GRANT-CODE-U ! 0 ROTATED-U !
    0 SEEN-U ! 0 AUTH-U ! 0 ROOT-SENT-U ! 0 TYPE-SENT-U !
    0 ARG-SENT-U ! 0 RANGE-SENT-U !
@@ -1319,7 +1335,14 @@ $2100000 constant UPLOAD-CAP
    nm nu NAMES NAME-CAP i AT STORE i NAME-US !
    v vu VALUES NAME-CAP i AT STORE i VALUE-US !
    b bu BODIES TEXT-CAP i AT STORE i BODY-US !
+   0 i ROUTE-US ! false i SPENT !
    1 SCRIPTS +! ;
+
+
+\ SCRIPT!'s answer, which only a call to the route path gets.
+: ROUTE-SCRIPT! ( ^u8 n n ^u8 n ^u8 n ^u8 n -- )
+   SCRIPT! SCRIPTS @ 1 - {: r:^ ru:n i:n :}
+   r ru ROUTES PATH-CAP i AT STORE i ROUTE-US ! ;
 
 
 \ The paths requested since RESET, joined by spaces.
