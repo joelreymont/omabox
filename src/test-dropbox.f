@@ -31,6 +31,9 @@ require src/lib/json.f
 require src/lib/adt/option.f
 require src/lib/task.f
 require src/lib/time.f
+require src/lib/byte-buffer.f
+require src/lib/vector.f
+require src/lib/heap.f
 require src/lib/net/tcp4.f
 require src/lib/net/http.f
 require src/dropbox.f
@@ -658,10 +661,15 @@ variable HELD-U
 
 \ Pages go out in order, one per listing call, each with its status; the
 \ long poll answers POLLED every time. ARGS joins those calls' bodies.
-SLOTS TEXT-CAP * BUFFER: PAGES
-SLOTS TYPED-BUFFER PAGE-US n
-SLOTS TYPED-BUFFER PAGE-STATUSES n
-variable PAGE-COUNT
+STRUCTURE page DERIVE addr
+   FIELD start n
+   FIELD len n
+   FIELD status n
+;STRUCTURE
+\ Every page's bytes, back to back; each page holds its start. A test
+\ queues between calls, so the page a call answers stays put.
+create PAGE-TEXT BUF:HDR-BYTES allot
+TYPED-VARIABLE PAGES ^VEC:vector<page>
 variable PAGE-SERVED
 create POLLED TEXT-CAP allot
 variable POLLED-U
@@ -669,7 +677,19 @@ create ARGS TEXT-CAP allot
 variable ARGS-U
 
 
-: PAGE$ ( n -- ^u8 n ) {: i:n :} PAGES i TEXT-CAP * + i PAGE-US @ ;
+: PAGES-MADE ( -- )
+   PAGE-TEXT TEXT-CAP BUF:N>BLEN BUF:INIT
+   HEAP:ALLOCATOR 0 [type] page VEC:NEW PAGES ! ;
+PAGES-MADE
+
+
+: PAGE-COUNT ( -- n ) PAGES @ VEC:COUNT ;
+: PAGE-OF ( n -- ^page ) {: i:n :} PAGES @ i VEC:AT ;
+
+
+: PAGE$ ( n -- ^u8 n )
+   PAGE-OF {: p :}
+   PAGE-TEXT BUF:SPAN$ drop p PAGE-START @ + p PAGE-LEN @ ;
 
 
 : ARG+ ( ^u8 n -- )
@@ -694,9 +714,9 @@ variable ARGS-U
    q a ADMITTED? 0= if exit then
    q ARGUED
    PAGE-SERVED @ {: i:n :}
-   i PAGE-COUNT @ >= if a UNSET! exit then
+   i PAGE-COUNT >= if a UNSET! exit then
    1 PAGE-SERVED +!
-   a i PAGE-STATUSES @ HTTP:STATUS!
+   a i PAGE-OF PAGE-STATUS @ HTTP:STATUS!
    a i PAGE$ ANSWER! ;
 
 
@@ -708,18 +728,27 @@ variable ARGS-U
 
 
 : LISTING-RESET ( -- )
-   0 PAGE-COUNT ! 0 PAGE-SERVED ! 0 POLLED-U ! 0 ARGS-U ! ;
+   PAGE-TEXT BUF:CLEAR PAGES @ 0 VEC:RESIZE
+   0 PAGE-SERVED ! 0 POLLED-U ! 0 ARGS-U ! ;
 
 
-: QUEUE ( n ^u8 n -- )
-   {: s:n b:^ bu:n :}
-   PAGE-COUNT @ {: i:n :}
-   s i PAGE-STATUSES !
-   b bu PAGES TEXT-CAP i AT STORE i PAGE-US !
-   1 PAGE-COUNT +! ;
+\ Opens the next page, with this status, at the end of PAGE-TEXT.
+: QUEUE ( n -- )
+   {: s:n :}
+   PAGES @ VEC:PUSH {: p :}
+   PAGE-TEXT BUF:LEN@ BUF:BLEN>N p PAGE-START !
+   s p PAGE-STATUS ! ;
 
 
-: BOOL+ ( bool -- ) if s" true" else s" false" then SB-APPEND ;
+\ Appends to the page QUEUE opened last.
+: PAGE+ ( ^u8 n -- )
+   {: a:^ u:n :}
+   a u BUF:N>BLEN PAGE-TEXT BUF:APPEND-SPAN
+   u PAGE-COUNT 1 - PAGE-OF PAGE-LEN +! ;
+
+
+: BOOL$ ( bool -- ^u8 n ) if s" true" else s" false" then ;
+: BOOL+ ( bool -- ) BOOL$ SB-APPEND ;
 
 \ ---- files/download
 
@@ -1429,16 +1458,15 @@ $2100000 constant UPLOAD-CAP
 \ cursor and has_more.
 : PAGE! ( ^u8 n ^u8 n bool -- )
    {: e:^ eu:n k:^ ku:n more:bool :}
-   SB-RESET S\" {\qentries\q:" SB-APPEND e eu SB-APPEND
-   S\" ,\qcursor\q:\q" SB-APPEND k ku SB-APPEND
-   S\" \q,\qhas_more\q:" SB-APPEND more BOOL+
-   s" }" SB-APPEND
-   200 SB$ QUEUE ;
+   200 QUEUE S\" {\qentries\q:" PAGE+ e eu PAGE+
+   S\" ,\qcursor\q:\q" PAGE+ k ku PAGE+
+   S\" \q,\qhas_more\q:" PAGE+ more BOOL$ PAGE+ s" }" PAGE+ ;
 
 
 \ A 409 reset the listing routes answer in turn.
 : PAGE-RESET! ( -- )
-   409 S\" {\qerror_summary\q:\qreset/\q,\qerror\q:{\q.tag\q:\qreset\q}}" QUEUE ;
+   409 QUEUE
+   S\" {\qerror_summary\q:\qreset/\q,\qerror\q:{\q.tag\q:\qreset\q}}" PAGE+ ;
 
 
 \ The long poll's answer: changes, and a backoff in seconds, 0 for none.

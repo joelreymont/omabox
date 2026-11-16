@@ -7,7 +7,8 @@
 \ access denied, a scripted answer bound to its route, rate limits,
 \ outages, a redirect, a malformed request, a write refused
 \ access_restricted, team_folder or
-\ operation_suppressed, the listing (one holding a file that is not
+\ operation_suppressed, the listing (one of 12 pages, one of them over
+\ 64 KiB, one holding a file that is not
 \ downloadable, one holding files Dropbox described incompletely, handed
 \ on, and one holding restricted folders, among them), COMPLETE? of each
 \ kind of entry, the long poll,
@@ -48,6 +49,8 @@
 \ label; the run goes on and fails at its end.
 \ Run from the repository root: hb --load src/dropbox-test.f </dev/null
 require src/lib/aio.f
+require src/lib/byte-buffer.f
+require src/lib/fmt.f
 require src/lib/arena.f
 require src/lib/span.f
 require src/lib/string.f
@@ -927,6 +930,75 @@ variable GOT-U
    s" /2/files/list_folder /2/files/list_folder/continue /2/files/list_folder/continue" T$=
    TEST-DROPBOX:ARGS$
    S\" {\qpath\q:\q/sync\q,\qrecursive\q:true,\qinclude_deleted\q:false} {\qcursor\q:\qc1\q} {\qcursor\q:\qc2\q}" T$= ;
+
+
+\ A long listing: 12 pages of one folder each but page 5, whose 1200
+\ entries take over 64 KiB. Entry n is the folder /sync/d<n>.
+12 constant LONG-PAGES
+1200 constant WIDE-COUNT
+create WIDE BUF:HDR-BYTES allot
+\ The entries handed on, those not at their place, and the widest page's
+\ entries text in bytes.
+variable HANDED
+variable ASTRAY
+variable WIDEST
+
+
+: WIDE+ ( ^u8 n -- ) BUF:N>BLEN WIDE BUF:APPEND-SPAN ;
+
+
+: NTH+ ( n -- )
+   FMT:INT$ {: d:^ du:n :}
+   S\" {\q.tag\q:\qfolder\q,\qpath_lower\q:\q/sync/d" WIDE+ d du WIDE+
+   S\" \q,\qpath_display\q:\q/Sync/d" WIDE+ d du WIDE+ S\" \q}" WIDE+ ;
+
+
+\ The entries array of entries from up to to, in WIDE.
+: NTHS ( n n -- ^u8 n )
+   {: from:n to:n :}
+   WIDE 1024 BUF:N>BLEN BUF:RESET
+   s" [" WIDE+
+   to from ?do i from <> if s" ," WIDE+ then i NTH+ loop
+   s" ]" WIDE+
+   WIDE BUF:SPAN$ BUF:BLEN>N ;
+
+
+: WIDTH ( n -- n ) 5 = if WIDE-COUNT else 1 then ;
+
+
+\ Queues page j from entry from, and answers the entry after its last.
+: LONG-PAGE ( n n -- n )
+   {: from:n j:n :}
+   from j WIDTH + {: to:n :}
+   from to NTHS {: e:^ eu:n :}
+   eu WIDEST @ max WIDEST !
+   SB-RESET s" c" SB-APPEND j FMT:SB-INT
+   e eu SB$ j LONG-PAGES 1 - < TEST-DROPBOX:PAGE!
+   to ;
+
+
+: NTH? ( ^u8 n n -- bool )
+   {: p:^ u:n i:n :}
+   p u s" /sync/d" STARTS-WITH? 0= if false exit then
+   p 7 + u 7 - i FMT:INT$ STR= ;
+
+
+: TALLIED ( ^DROPBOX:entry -- )
+   {: e :}
+   e DROPBOX-ENTRY:LOWER @ SPAN:$ HANDED @ NTH? 0= if 1 ASTRAY +! then
+   1 HANDED +! ;
+
+
+: LONG-CASE ( -- )
+   s" listing of 12 pages, one over 64 KiB" T-LABEL
+   LISTING 0 HANDED ! 0 ASTRAY ! 0 WIDEST !
+   0 LONG-PAGES 0 ?do i LONG-PAGE loop {: total:n :}
+   WIDEST @ 65536 > TTRUE
+   s" /sync" MAIN @ [: TALLIED ;] DROPBOX:LIST DONE? ASSERT
+   HANDED @ total T=
+   ASTRAY @ 0 T=
+   MAIN @ DROPBOX:CURSOR s" c11" T$= ;
+
 
 
 \ A listing of one page that answers done with the cursor, so a case sets
@@ -2703,7 +2775,7 @@ TYPED-VARIABLE FAULT fault
    RATE-ZEROS-CASE RATE-HUGE-CASE
    BUSY-CASE REDIRECT-CASE BAD-REQUEST-CASE
    CLASSIFY-CASES
-   PAGES-CASE RESET-CASE STALL-CASE UNTAGGED-CASE UNDOWNLOADABLE-LISTED-CASE
+   PAGES-CASE LONG-CASE RESET-CASE STALL-CASE UNTAGGED-CASE UNDOWNLOADABLE-LISTED-CASE
    INCOMPLETE-LISTED-CASE RESTRICTED-LISTED-CASE INCOMPLETE-KINDS-CASE
    POLL-CASE LONG-POLL-EXPOSES-RESET-AND-RATE-LIMIT-OUTCOMES
    DOWNLOAD-CASES
