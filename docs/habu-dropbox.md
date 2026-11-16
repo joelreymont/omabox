@@ -96,6 +96,7 @@ ENUM reply
 : DELETE        ( ^u8 n ^u8 n ^client -- reply )  \ path, rev
 : CREATE-FOLDER ( ^u8 n ^client -- reply )  \ path
 : ENTRY         ( ^client -- ^entry )
+: CONTENT-HASH? ( ^u8 n -- bool )   \ 64 lowercase hex digits
 : COMPLETE?     ( ^entry -- bool )  \ a downloadable file with a
                 \ rev and a 64-lowercase-hex-digit content hash
 

@@ -1067,21 +1067,20 @@ ENUM verdict
    b 48 >= b 57 <= and b 97 >= b 102 <= and or ;
 
 
+public
+
 \ Dropbox's content hash: 64 lowercase hex digits.
-: HASH? ( ^u8 n -- bool )
+: CONTENT-HASH? ( ^u8 n -- bool )
    {: p:^ u:n :}
    u 64 <> if false exit then
    true u 0 ?do p i + c@ HEX-DIGIT? and loop ;
-
-
-public
 
 \ Whether a downloadable file has a rev and a well-formed content hash.
 : COMPLETE? ( ^entry -- bool )
    {: e :}
    e DOWNLOADS? 0= if false exit then
    e DROPBOX-ENTRY:REV @ SPAN:LEN 0<>
-   e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$ HASH? and ;
+   e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$ CONTENT-HASH? and ;
 
 private
 

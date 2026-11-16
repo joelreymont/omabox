@@ -452,20 +452,10 @@ private
    HASH-STABLE-FILE-WITH-FINGERPRINT
    {: c:DROPBOX:hash print:MODEL:fingerprint :} c ;
 
-: HEX-LOWER? ( n -- bool )
-   {: c:n :}
-   c $30 >= c $39 <= and c $61 >= c $66 <= and or ;
-
-: VALID-CONTENT-HASH? ( ^u8 n -- bool )
-   {: p:^ u:n :}
-   u 64 <> if false exit then
-   u 0 ?do p i + c@ HEX-LOWER? 0= if false unloop exit then loop
-   true ;
-
 \ o names the operation that needs the hash.
 : REQUIRE-CONTENT-HASH ( DROPBOX:hash ^u8 n -- )
    {: h:DROPBOX:hash o:^ ou:n :}
-   h DROPBOX:HASH>STR str> VALID-CONTENT-HASH? 0= if
+   h DROPBOX:HASH>STR str> DROPBOX:CONTENT-HASH? 0= if
       o ou INVALID-HASH
    then ;
 
@@ -500,7 +490,7 @@ SHA256-CTX-BYTES BUFFER: NAME-CTX
    {: p:^ u:n x:^ xu:n :}
    u xu < if false exit then
    p xu x xu STR= 0= if false exit then
-   p xu + u xu - VALID-CONTENT-HASH? ;
+   p xu + u xu - DROPBOX:CONTENT-HASH? ;
 
 \ A name only LOCAL makes: a download, displaced or deleted file's.
 : RESERVED-ARTIFACT? ( ^u8 n -- bool )
@@ -2473,7 +2463,7 @@ private
    ( fd str str [ DROPBOX:hash -- bool ] ^ARENA:arena -- n )
    {: dir:fd path:str s:str retained ar:^ARENA:arena :}
    path s NAME-OF {: name:^ nu:n :}
-   name nu VALID-CONTENT-HASH? 0= if 0 exit then
+   name nu DROPBOX:CONTENT-HASH? 0= if 0 exit then
    name nu >str DROPBOX:>HASH retained execute if 0 exit then
    dir name nu path str> ar COLLECT-UPLOAD-STAGE ;
 

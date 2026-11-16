@@ -1056,16 +1056,6 @@ BUF:HDR-BYTES TASK:+USERS ENCODED u8
    code MODEL:E-STORED <> if code throw then
    code op path UNPROCESSED ;
 
-: HEX-DIGIT? ( u8 -- bool )
-   {: c :}
-   c 48 >= c 57 <= and c 97 >= c 102 <= and or ;
-
-\ Dropbox's content hash: 64 lower-case hex digits.
-: DROPBOX-CONTENT-HASH? ( DROPBOX:hash -- bool )
-   DROPBOX:HASH>STR str> {: a:^ u :}
-   u 64 <> if false exit then
-   true u 0 ?do a i + c@ HEX-DIGIT? and loop ;
-
 : NOT-CONTENT-HASH ( str str -- )
    {: op:str path:str :}
    op path
@@ -1124,7 +1114,7 @@ BUF:HDR-BYTES TASK:+USERS ENCODED u8
    0 SQLITE:COL-BLOB ar BYTES-PATH {: p:MODEL:path :}
    1 SQLITE:COL-TEXT >str p MODEL:PATH>STR ar HASH-VALUE-OF
    {: f h :}
-   h DROPBOX-CONTENT-HASH? 0= if
+   h DROPBOX:HASH>STR str> DROPBOX:CONTENT-HASH? 0= if
       s" read local hash cache" >str p MODEL:PATH>STR NOT-CONTENT-HASH
    then
    p f h MODEL-HASH--RECORD:MAKE ;
@@ -1279,7 +1269,7 @@ private
      -- SQLITE:statement )
    {: g r w :}
    r MODEL-HASH--RECORD:UNMAKE {: p:MODEL:path f h :}
-   h DROPBOX-CONTENT-HASH? 0= if
+   h DROPBOX:HASH>STR str> DROPBOX:CONTENT-HASH? 0= if
       s" publish local hash cache" >str p MODEL:PATH>STR
       NOT-CONTENT-HASH
    then
