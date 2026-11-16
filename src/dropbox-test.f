@@ -17,9 +17,11 @@
 \ 64 bytes a read, one
 \ cut mid-body, whether or not its body catches the loss, an empty file,
 \ one answered 400 and one 404, each keeping its status, and ones refused
-\ unverified: another rev, range or
-\ length, a 416 from 0, a Dropbox-API-Result or an error that does not
-\ parse), delete,
+\ unverified: another rev or range,
+\ a resumed body one byte short or long, which fails before READ-BODY
+\ answers 0, whether or not its body catches the short one's failure, a
+\ held body one byte long whose body catches it in flight, a 416 from 0,
+\ a Dropbox-API-Result or an error that does not parse), delete,
 \ create-folder, the code exchange, Dropbox's content hash and uploads,
 \ whose stages are written under TMPDIR and removed once open, so no run
 \ leaves one; a mutation or session finish Dropbox answers
@@ -1227,15 +1229,24 @@ variable READ-COUNT
    USABLE ;
 
 
-\ A 416 whose length is the offset asked: the bytes before it are the
-\ whole file, so the body reads its end at once and nothing restarts.
+\ An empty file at rev 0160e0e0e0e0.
+: EMPTY-FILE ( -- )
+   s" /docs/none.txt" s" /Docs/none.txt" s" 0160e0e0e0e0"
+   s" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+   0 TEST-DROPBOX:FILE!
+   s" 0160e0e0e0e0" s" " TEST-DROPBOX:CONTENT! ;
+
+
+\ A 416 whose length is the offset asked is the whole file: the body reads
+\ its end at once, nothing restarts and the entry read first is another's.
 : COMPLETE-CASE ( -- )
    s" download 416 at the end is complete" T-LABEL
-   TEST-DROPBOX:RESET ALPHABET
+   TEST-DROPBOX:RESET ALPHABET EMPTY-FILE
+   s" /docs/none.txt" MAIN @ DROPBOX:METADATA DONE? ASSERT
    26 FETCH DONE? ASSERT
    BODIES @ 1 T= SUNK-U @ 0 T=
    SUNK-AT @ 26 T= SUNK-SIZE @ 26 T=
-   TEST-DROPBOX:SEEN$ s" /2/files/download" T$=
+   TEST-DROPBOX:SEEN$ s" /2/files/get_metadata /2/files/download" T$=
    TEST-DROPBOX:RANGE-SENT$ s" bytes=26-" T$= ;
 
 
@@ -1312,13 +1323,93 @@ variable READ-COUNT
    USABLE ;
 
 
-\ The length is known once READ-BODY reached the body's end, so the
-\ body read the bytes before it.
-: SHORT-CASE ( -- )
-   s" download of another length" T-LABEL
+TYPED-VARIABLE ZEROED bool
+
+
+\ SUNK-BODY, then ZEROED, as READ-BODY answered 0.
+: ZEROED-BODY ( n n ^DROPBOX:fetch -- ) SUNK-BODY true ZEROED ! ;
+
+
+\ OUTCOME: the download from 10, read by body, answered refused
+\ unverified.
+: BODY-UNVERIFIED ( [ n n ^DROPBOX:fetch -- ] -- )
+   {: body :}
+   SUNK-CLEAR false ZEROED !
+   s" 0160a1b2c3d4" 10 MAIN @ body DROPBOX:DOWNLOAD
+   UNVERIFIED? OUTCOME ! ;
+
+
+: READ-UNVERIFIED ( -- ) [: ZEROED-BODY ;] BODY-UNVERIFIED ;
+
+
+\ A resumed body one byte short fails at its end, before READ-BODY
+\ answers 0.
+: SHORT-READ-CASE ( -- )
+   s" download resumed one byte short" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
    TEST-DROPBOX:SHORTEN
-   [: WHOLE-UNVERIFIED ;] s" a body of another length" REFUSED-LOGGED
+   [: READ-UNVERIFIED ;] s" a body of another length" REFUSED-LOGGED
+   ZEROED @ TFALSE
+   USABLE ;
+
+
+\ A resumed body one byte long fails at the read that would take that
+\ byte, so the body gets at most the 16 bytes after the offset.
+: LONG-READ-CASE ( -- )
+   s" download resumed one byte long" T-LABEL
+   TEST-DROPBOX:RESET ALPHABET
+   TEST-DROPBOX:LENGTHEN
+   [: READ-UNVERIFIED ;] s" a body of another length" REFUSED-LOGGED
+   ZEROED @ TFALSE
+   SUNK-U @ 16 <= ASSERT
+   USABLE ;
+
+
+\ The text of the code READ-BODY throws for a body of another length.
+: UNVERIFIED$ ( -- ^u8 n ) s" a download's answer failed its checks" ;
+
+
+\ ZEROED-BODY, ending normally where READ-BODY threw E-UNVERIFIED, which
+\ BODY-CODE keeps.
+: CAUGHT-BODY ( n n ^DROPBOX:fetch -- )
+   {: at:n size:n f :}
+   [: at size f ZEROED-BODY ;] catch {: code:n :}
+   code BODY-CODE !
+   code 0= if exit then
+   code ERROR:TEXT$ UNVERIFIED$ STR= 0= if code throw then ;
+
+
+: CAUGHT-UNVERIFIED ( -- ) [: CAUGHT-BODY ;] BODY-UNVERIFIED ;
+
+
+\ A resumed body one byte short whose body catches READ-BODY's throw
+\ and returns: the answer is still refused, logged once.
+: CAUGHT-SHORT-CASE ( -- )
+   s" download one byte short, its failure caught" T-LABEL
+   TEST-DROPBOX:RESET ALPHABET
+   TEST-DROPBOX:SHORTEN
+   [: CAUGHT-UNVERIFIED ;] s" a body of another length" REFUSED-LOGGED
+   ZEROED @ TFALSE
+   BODY-CODE @ ERROR:TEXT$ UNVERIFIED$ T$=
+   USABLE ;
+
+
+\ A held body one byte long, met while its transfer is in flight, whose
+\ body catches READ-BODY's throw: the answer is still refused, logged once.
+: CAUGHT-LONG-CASE ( -- )
+   s" download one byte long, its failure caught" T-LABEL
+   TEST-DROPBOX:RESET ALPHABET
+   s" /docs/five.txt" s" /Docs/five.txt" s" 0160b1b2c3d4"
+   s" 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+   5 TEST-DROPBOX:FILE!
+   s" 0160b1b2c3d4" s" abcde" TEST-DROPBOX:CONTENT!
+   TEST-DROPBOX:HOLD-BODY TEST-DROPBOX:LENGTHEN
+   SUNK-CLEAR false ZEROED !
+   [: s" 0160b1b2c3d4" 0 MAIN @ [: CAUGHT-BODY ;] DROPBOX:DOWNLOAD
+      UNVERIFIED? OUTCOME ! ;] s" a body of another length" REFUSED-LOGGED
+   ZEROED @ TFALSE
+   SUNK-U @ 5 <= ASSERT
+   BODY-CODE @ ERROR:TEXT$ UNVERIFIED$ T$=
    USABLE ;
 
 
@@ -1498,11 +1589,7 @@ variable READ-COUNT
 \ An empty file: the body reads its end at once.
 : EMPTY-CASE ( -- )
    s" download of an empty file" T-LABEL
-   TEST-DROPBOX:RESET
-   s" /docs/none.txt" s" /Docs/none.txt" s" 0160e0e0e0e0"
-   s" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-   0 TEST-DROPBOX:FILE!
-   s" 0160e0e0e0e0" s" " TEST-DROPBOX:CONTENT!
+   TEST-DROPBOX:RESET EMPTY-FILE
    SUNK-CLEAR
    s" 0160e0e0e0e0" 0 MAIN @ [: SUNK-BODY ;] DROPBOX:DOWNLOAD
    DONE? ASSERT
@@ -1513,7 +1600,9 @@ variable READ-COUNT
 : DOWNLOAD-CASES ( -- )
    WHOLE-CASE RESUME-CASE SKEW-CASE COMPLETE-CASE RESTART-CASE
    UNSATISFIABLE-CASE FIRST-UNSATISFIABLE-CASE UNKNOWN-REV-CASE
-   OTHER-REV-CASE SHORT-CASE WHOLE-FOR-RANGE-CASE UNASKED-RANGE-CASE
+   OTHER-REV-CASE SHORT-READ-CASE LONG-READ-CASE
+   CAUGHT-SHORT-CASE CAUGHT-LONG-CASE
+   WHOLE-FOR-RANGE-CASE UNASKED-RANGE-CASE
    UNPARSED-RESULT-CASE UNPARSED-REFUSAL-CASE
    BROKEN-CASE SWALLOWED-CASE BODY-THROWS-CASE LATE-THROW-CASE UNREAD-CASE
    PAUSED-CASE CHUNKED-CASE EMPTY-CASE BAD-REQUEST-DOWNLOAD-CASE

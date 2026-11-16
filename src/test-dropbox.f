@@ -723,13 +723,8 @@ variable ARGS-U
 
 \ ---- files/download
 
-\ CONTENT! keeps each rev's bytes. Each fault applies to the next download
-\ alone: SKEWED shifts its Content-Range's start by one, MISFILED answers
-\ another rev's file, SHORTED drops its body's last byte, WHOLED answers
-\ the whole file whatever Range it asked, PARTED answers a 206 with a
-\ Content-Range though it asked none, BREAKING cuts its body, HOLDING
-\ stops it after PART bytes and holds the connection until the client
-\ closes it, and PAUSING stops it there until RESUME-BODY.
+\ CONTENT! keeps each rev's bytes. Each fault below applies to the next
+\ download alone, as the word that sets it says.
 SLOTS NAME-CAP * BUFFER: CONTENT-REVS
 SLOTS TYPED-BUFFER CONTENT-REV-US n
 SLOTS TEXT-CAP * BUFFER: CONTENT-BYTES
@@ -742,6 +737,7 @@ TYPED-VARIABLE SKEWED bool
 create MISFILED NAME-CAP allot
 variable MISFILED-U
 TYPED-VARIABLE SHORTED bool
+TYPED-VARIABLE LENGTHENED bool
 TYPED-VARIABLE WHOLED bool
 TYPED-VARIABLE PARTED bool
 TYPED-VARIABLE BREAKING bool
@@ -866,6 +862,10 @@ TYPED-VARIABLE RANGED bool
    a s" Content-Range" SB$ HTTP:HEADER! ;
 
 
+\ The bytes and one more, in OUT.
+: LONGER$ ( ^u8 n -- ^u8 n ) SB-RESET SB-APPEND 33 SB-APPEND-C BUILT ;
+
+
 \ The file in slot i with the bytes in slot k, from the offset.
 : FILE-SENT ( HTTP:response n n n -- )
    {: a:HTTP:response i:n k:n from:n :}
@@ -878,8 +878,9 @@ TYPED-VARIABLE RANGED bool
       a s" Content-Range" from size CONTENT-RANGE$ HTTP:HEADER!
    then
    false PARTED !
-   k from CONTENT-FROM SHORTED @ if 1- then {: b:^ len:n :}
-   false SHORTED !
+   k from CONTENT-FROM SHORTED @ if 1- then
+   LENGTHENED @ if LONGER$ then {: b:^ len:n :}
+   false SHORTED ! false LENGTHENED !
    a b len HTTP:BODY! ;
 
 
@@ -907,14 +908,17 @@ private
 
 
 \ The file in slot i with the bytes in slot k from the offset, cut: a 200
-\ head promising them all, and PART of them.
+\ head promising them all, and PART of them. LENGTHENED, they carry one
+\ byte more under a head promising one more still, so it arrives mid-transfer.
 : CUT$ ( n n n -- ^u8 n )
    {: i:n k:n from:n :}
-   k CONTENT-SIZE {: size:n :}
+   k CONTENT-SIZE from - LENGTHENED @ {: rest:n extra:bool :}
+   false LENGTHENED !
+   k from CONTENT-FROM extra if LONGER$ then {: b:^ len:n :}
    SB-RESET S\" HTTP/1.1 200 OK\r\nDropbox-API-Result: " SB-APPEND
    i ENTRY$ SB-APPEND S\" \r\nContent-Length: " SB-APPEND
-   size from - FMT:SB-INT S\" \r\n\r\n" SB-APPEND
-   k from CONTENT-FROM PART min SB-APPEND
+   rest extra if 2 + then FMT:SB-INT S\" \r\n\r\n" SB-APPEND
+   b len PART min SB-APPEND
    SB$ ;
 
 
@@ -1278,9 +1282,9 @@ $2100000 constant UPLOAD-CAP
    0 SEEN-U ! 0 AUTH-U ! 0 ROOT-SENT-U ! 0 TYPE-SENT-U !
    0 ARG-SENT-U ! 0 RANGE-SENT-U !
    false ROOTED ! false TYPED ! false LEAKED ! false RANGED !
-   false SKEWED ! 0 MISFILED-U ! false SHORTED ! false WHOLED !
-   false PARTED ! false BREAKING ! false LOSING ! 0 CUTS !
-   false HOLDING ! false PAUSING ! 0 RESUMING atomic!
+   false SKEWED ! 0 MISFILED-U ! false SHORTED ! false LENGTHENED !
+   false WHOLED ! false PARTED ! false BREAKING ! false LOSING !
+   0 CUTS ! false HOLDING ! false PAUSING ! 0 RESUMING atomic!
    false TOKEN-CUTTING ! false REVOKED ! false DENIED ! false GARBLING !
    SLOTS 0 ?do 0 i CONTENT-SKIPS ! loop
    LISTING-RESET ;
@@ -1419,6 +1423,9 @@ $2100000 constant UPLOAD-CAP
 : MISFILE ( ^u8 n -- ) MISFILED NAME-CAP STORE MISFILED-U ! ;
 \ The next download's body lacks its last byte.
 : SHORTEN ( -- ) true SHORTED ! ;
+\ The next download's body carries one byte past the file's end; a held
+\ one's head promises one byte more than that.
+: LENGTHEN ( -- ) true LENGTHENED ! ;
 \ The next download's body is cut after PART bytes.
 : CUT-BODY ( -- ) true BREAKING ! ;
 \ The next download's body stops after PART bytes, its connection held

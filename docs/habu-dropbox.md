@@ -173,9 +173,12 @@ STRUCTURE config
   what it reads. A reader that reads a local cannot be handed to a quotation,
   which might keep it, so the fetch is handed instead. On any other answer the
   quotation is not called; an empty body calls it with a fetch at its end.
-  - The body's length is checked once `READ-BODY` reached its end. A body the
-    quotation leaves unread is cancelled as a throw cancels it, and the
-    answer is done without that check.
+  - `READ-BODY` checks the body's length: a body that ends before every
+    byte after the offset came, or carries a byte past them, fails at the
+    read that meets it, and the answer is `refused unverified` even when
+    the quotation caught that failure. A body the quotation leaves unread
+    is cancelled as a throw cancels it, and the answer is done without
+    the check at its end.
   - A transfer lost inside the body throws a code of DROPBOX's own from
     `READ-BODY`, never an early 0, which the caller would take for the body's
     end. `DOWNLOAD` ends that code and answers as a transfer lost before the

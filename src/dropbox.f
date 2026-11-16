@@ -1343,10 +1343,11 @@ private
 
 \ ---- the download's machine
 
-\ A step ends in streaming only with a new chunk held, none of it taken;
-\ drained once the reader reached the body's end. BODIED sets cancelled.
+\ A step ends in streaming only with a new chunk held, none taken; drained
+\ at the body's end. BODIED sets cancelled, READ-BODY overran and short.
 ENUM download-step DERIVE eq
-   opened streaming buffering answered drained lost cancelled ;ENUM
+   opened streaming buffering answered drained lost cancelled
+   overran short ;ENUM
 ENUM read-event chunk response failure ;ENUM
 ENUM open-event passed other response failure ;ENUM
 
@@ -1463,6 +1464,8 @@ FSM:DEFINE DOWNLOADING ( ^fetch ) download-step open-event
    FINAL drained   -
    FINAL lost      -
    FINAL cancelled -
+   FINAL overran   -
+   FINAL short     -
 ;DEFINE
 
 
@@ -1474,12 +1477,16 @@ FSM:DEFINE DOWNLOADING ( ^fetch ) download-step open-event
    construct download-step lost DOWNLOAD-STEP-EQ ;
 : CANCELLED? ( download-step -- bool )
    construct download-step cancelled DOWNLOAD-STEP-EQ ;
+: OVERRAN? ( download-step -- bool )
+   construct download-step overran DOWNLOAD-STEP-EQ ;
+: SHORT? ( download-step -- bool )
+   construct download-step short DOWNLOAD-STEP-EQ ;
 
 
 \ Whether the machine is at its end, so the transfer has ended.
 : FINAL? ( download-step -- bool )
    {: s:download-step :}
-   s DRAINED? s CUT? or s CANCELLED? or
+   s DRAINED? s CUT? or s CANCELLED? or s OVERRAN? or s SHORT? or
    s construct download-step answered DOWNLOAD-STEP-EQ or ;
 
 
@@ -1498,33 +1505,70 @@ FSM:DEFINE DOWNLOADING ( ^fetch ) download-step open-event
    f FETCH-TAKEN @ f FETCH-HELD @ SPAN:$ nip = ;
 
 
+\ How many of the held chunk's untaken bytes fit in room.
+: TAKING ( n ^fetch -- n )
+   {: room:n f :}
+   f FETCH-HELD @ SPAN:$ nip f FETCH-TAKEN @ - room min ;
+
+
 \ Copies what fits in room of the held chunk's untaken bytes to p.
 : TAKEN ( ^u8 n ^fetch -- n )
    {: p:^ room:n f :}
-   f FETCH-HELD @ SPAN:$ {: a:^ u:n :}
-   f FETCH-TAKEN @ {: at:n :}
-   u at - room min {: k:n :}
-   a at + p k BYTE-COPY
+   room f TAKING {: k:n :}
+   f FETCH-HELD @ SPAN:$ drop f FETCH-TAKEN @ + p k BYTE-COPY
    k f FETCH-TAKEN +! k f FETCH-TOTAL +!
    k ;
 
 
+: FILE-SIZE ( ^client -- n ) CLIENT-ENTRY DROPBOX-ENTRY:SIZE @ ;
+
+
+: MISSIZED ( ^client -- )
+   s" a body of another length" E-UNVERIFIED FAILED ;
+
+
+\ A body of every byte after the offset.
+: SIZED ( ^client n n -- )
+   {: c at:n got:n :}
+   c FILE-SIZE at - got <> if c MISSIZED then ;
+
+
+\ got bytes of the body hold none past the file's end, or the transfer
+\ still in flight is ended and the machine overran.
+: BOUNDED ( ^fetch n -- )
+   {: f got:n :}
+   f FETCH-CLIENT @ {: c :}
+   c FILE-SIZE f FETCH-OFFSET @ - got < 0= if exit then
+   f FETCH-HANDLE @ c ABANDONED
+   construct download-step overran f FETCH-STEP !
+   c MISSIZED ;
+
+
+\ A streamed body at its end holds every byte after the offset, or the
+\ machine is short; a fetch handed over at its end was checked before.
+: ENDED-SIZED ( ^fetch -- )
+   {: f :}
+   f FETCH-STEP @ DRAINED? 0= if exit then
+   f FETCH-CLIENT @ {: c :}
+   c FILE-SIZE f FETCH-OFFSET @ - f FETCH-TOTAL @ = if exit then
+   construct download-step short f FETCH-STEP !
+   c MISSIZED ;
+
+
 public
 
-\ The reader of a download's body: at most room of its next bytes into
-\ p, 0 at its end; a transfer lost inside the body throws E-BODY-LOST.
+\ At most room of the body's next bytes into p, 0 at its end; a lost
+\ transfer throws E-BODY-LOST, a body of another length E-UNVERIFIED.
 : READ-BODY ( ^u8 n ^fetch -- n )
    {: p:^ room:n f :}
    begin f STARVED? while f STEPPED drop repeat
    f FETCH-STEP @ {: s:download-step :}
    s CUT? if E-BODY-LOST throw then
-   s STREAMING? 0= if 0 exit then
+   s STREAMING? 0= if f ENDED-SIZED 0 exit then
+   f room f TAKING f FETCH-TOTAL @ + BOUNDED
    p room f TAKEN ;
 
 private
-
-
-: FILE-SIZE ( ^client -- n ) CLIENT-ENTRY DROPBOX-ENTRY:SIZE @ ;
 
 
 \ Hands body the offset, the file's size and the fetch; a body it leaves
@@ -1548,14 +1592,15 @@ private
 
 
 \ Sends the request and reads it through DOWNLOADING under READ-OUT. A
-\ transfer BODIED cancelled keeps no header block for ENDED to capture.
+\ transfer cancelled or overran keeps no header block for ENDED to capture.
 : RECEIVING ( ^fetch [ n n ^fetch -- ] -- )
    {: f body :}
    f FETCH-CLIENT @ {: c :}
    c STARTED {: h:CURL:handle :}
    h f FETCH-HANDLE !
    h c [: f body DRIVEN ;] [: f FETCH-STEP @ FINAL? ;] READ-OUT
-   f FETCH-STEP @ CANCELLED? 0= if c ENDED then ;
+   f FETCH-STEP @ {: s:download-step :}
+   s CANCELLED? s OVERRAN? or 0= if c ENDED then ;
 
 
 \ RECEIVING, where the reader's E-BODY-LOST ends: the machine is lost.
@@ -1575,13 +1620,6 @@ private
    {: c :}
    c CLIENT-STATUS @ 206 = if construct reply done ANSWER exit then
    construct verdict rejected [: DROP-VERDICT c CLASSIFY ;] VERIFIED ;
-
-
-\ A body of every byte after the offset.
-: SIZED ( ^client n n -- )
-   {: c at:n got:n :}
-   c FILE-SIZE at - got <>
-   if c s" a body of another length" E-UNVERIFIED FAILED then ;
 
 
 \ A done answer no chunk came with: the rev and range asked and an empty
@@ -1614,19 +1652,16 @@ private
    v ;
 
 
-\ A lost transfer, status 0, inside the body too, is the core's; a body
-\ left unread is done, one read to its end done once its length checks.
+\ A body of another length was logged as READ-BODY met it; status 0, a
+\ lost transfer, is the core's; a body unread or read to its end is done.
 : SETTLED ( ^fetch [ n n ^fetch -- ] [ ^fetch -- reply ] -- verdict )
    {: f body unsat :}
    f body ABSORBED
    f FETCH-CLIENT @ {: c :}
    f FETCH-STEP @ {: s:download-step :}
+   s OVERRAN? s SHORT? or if E-UNVERIFIED throw then
    c CLIENT-STATUS @ 0= if c LOST ANSWER exit then
-   s CANCELLED? if construct reply done ANSWER exit then
-   s DRAINED? if
-      c f FETCH-OFFSET @ f FETCH-TOTAL @ SIZED
-      construct reply done ANSWER exit
-   then
+   s CANCELLED? s DRAINED? or if construct reply done ANSWER exit then
    f body unsat ARRIVED ;
 
 
