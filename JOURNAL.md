@@ -1020,3 +1020,49 @@ fix: each was rebased onto the swept master, and its tree was set to
 the script's output on its original tree. That took 11 seconds, with
 no conflicts beyond one JOURNAL merge, and the open lines of work
 never noticed.
+
+## 2026-11-16: a rate-limit stall, merge clashes, and what 403 means
+
+A usage limit stopped every agent mid-round. Nothing was lost: each
+worker's state was its jj workspace, so the round restarted from the
+same commits once the limit reset. The cost was wall time, not work.
+
+Two lanes wrote RECONCILE's first words at once, the known-path merge
+and the case-collision rename. Each named its private helpers well on
+its own, and the merge then refused to load: Habu keeps one namespace
+for a package's private words and refuses a second definition
+(E-DUPLICATE-DEFINITION, the first at `PATH$`). Rust would have
+accepted both as items of two modules. The fix was mechanical (drop
+the true duplicates, rename the rest), but it is a cost of parallel
+lanes in one Habu file that Rust's module system hides.
+
+A brief of mine asked for a test of a download Dropbox answers 403.
+The worker found that DROPBOX maps 403 to `unlinked` on every route,
+so it can never be a path's failure, and tested 404 instead. Habu's
+total MATCH over the reply made the mapping easy to read off; the
+mistake was the brief's, written from memory of HTTP rather than from
+the code.
+
+The checker refused a generic `observation<a>` word over local and
+remote observations, so the lanes wrote one word per side. That is
+more text than Rust's generic function, and the price of a checker
+that does not yet instantiate generic words.
+
+The user settled what a denied local write does: "it should rca and
+troubleshoot. then probably stop the whole thing, yes." The pass ends,
+as Rust's does, but only after Omabox says which directory refuses
+the write and why. Rust ends the pass with the errno alone.
+
+Porting Rust's tests under their own names, one assertion for one,
+found two gaps in DROPBOX's downloads that its own tests had missed.
+Rust checks a download's content hash against the plan's; Habu's
+DOWNLOAD was never told the hash, so a resume answered with another
+file's hash was staged. And DROPBOX checked a body's length only after
+the reader returned, so a short body reached LOCAL as an early end of
+input (a read error with errno 0) and a long one as a local change.
+I had guessed that DROPBOX threw while reading the body. A worker
+traced the throws and showed the guess was wrong: the early 0 came
+from `READ-BODY`. Each gap was a whole class of answer that Habu's own
+tests never sent. Rust's test suite was a better specification than
+the Rust code's comments, and porting it name by name is what found
+these gaps.

@@ -1,9 +1,10 @@
 ---
-title: Answer a short resumed body as unverified
-status: open
+title: "Check a download's length as it is read"
+status: closed
 priority: 2
 issue-type: task
 created-at: "2026-11-16T09:55:54.359808+02:00"
+closed-at: "2026-11-16T11:21:23.057275+02:00"
 ---
 
-Problem: a resumed download whose body is one byte short, through REPLAY's bridge, throws LOCAL:E-STAGE-READ, logged with errno 0 ('could not read stage input during read resumed download'), where docs/habu-dropbox.md and Rust's DownloadVerificationFailed say refused unverified; the plan then ends every pass instead of blocking. Reproducer: in src/replay-test.f BAD-RESUMES, TEST-DROPBOX:SHORTEN then STAGED-AT throws LOCAL:E-STAGE-READ. Acceptance: that body answers refused unverified, logged once; the 'valid range, empty body' step of interrupted_exact_download_resumes_only_from_a_valid_range is ported. Depends: none. Claim: unassigned.
+Problem: DROPBOX checks a download's body length only after its quotation returns (SETTLED, src/dropbox.f:1620). READ-BODY answers 0 at a short body's end, which LOCAL's exact read takes for a failed read (LOCAL:E-STAGE-READ, errno 0), and a long body reaches LOCAL's own length check (E-CHANGED); docs/habu-dropbox.md and Rust's DownloadVerificationFailed say refused unverified. Acceptance: a body one byte short or one byte long answers refused unverified, logged once, and READ-BODY never answers an early 0 or a byte past the file. Depends: none. Claim: lead workspace=.jj-ws.noindex/omabox-fixes.
