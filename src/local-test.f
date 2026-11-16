@@ -172,12 +172,6 @@ private
 : DISPOSABLE? ( ^download-partial -- bool )
    DOWNLOAD-PARTIAL-LOCATION SOURCE@ RESUMABLE? 0= ;
 
-: LEASED ( option<download-slot-lease> -- download-slot-lease )
-   MATCH option
-      none OF s" test expected a download slot lease" 1 die ENDOF
-      some OF ENDOF
-   ;MATCH ;
-
 \ Rust's tests' raw fsetxattr of the partial's stage marker, then fsync.
 : MARK-PARTIAL ( ^download-partial ^ARENA:arena -- )
    {: x ar:^ARENA:arena :}
@@ -300,7 +294,6 @@ private
 public
 EXPORT READY-PARTIAL
 EXPORT DISPOSABLE?
-EXPORT LEASED
 EXPORT MARK-PARTIAL
 EXPORT RENAME-TO-STAGE
 EXPORT ZERO-CHECKPOINT
@@ -2050,8 +2043,6 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    t tu c generation op SLOT-IDENTITY {: id:LOCAL:download-slot-identity :}
    ROOT$ id protected LOCAL:LEASE-DOWNLOAD-SLOT LOCAL:LEASE-OF ;
 
-: UNPROTECTED ( LOCAL:binding -- bool ) drop false ;
-
 TYPED-VARIABLE HELD-BINDING LOCAL:binding
 : HELD? ( LOCAL:binding -- bool ) HELD-BINDING @ LOCAL:BINDING= ;
 
@@ -2110,7 +2101,7 @@ variable FILES
 
 : PROTECTED ( fd -- )
    {: root:fd :}
-   s" held.bin" DOWNLOAD 1 20 [: UNPROTECTED ;] LEASE
+   s" held.bin" DOWNLOAD 1 20 [: TEST-CLIENT:UNPROTECTED ;] LEASE
    {: hs:n hb:LOCAL:binding held:bool :}
    held TTRUE hb HELD-BINDING !
    hs SLOT-AT s" partial download bytes" FS:WRITE-ALL
@@ -2137,7 +2128,7 @@ variable FILES
 \ first and empties the second, its binding kept.
 : STALE-SLOTS ( fd -- )
    {: root:fd :}
-   TARGET DOWNLOAD 1 10 [: UNPROTECTED ;] LEASE
+   TARGET DOWNLOAD 1 10 [: TEST-CLIENT:UNPROTECTED ;] LEASE
    {: old:n ob:LOCAL:binding f0:bool :}
    f0 TTRUE ob HELD-BINDING ! old STALE
    s" other.bin" DOWNLOAD 1 30 [: HELD? ;] LEASE
@@ -2147,7 +2138,7 @@ variable FILES
    ob LOCAL:BINDING= TFALSE
    TARGET DOWNLOAD 1 11 SLOT-IDENTITY LOCAL:SLOT-BINDING
    ob LOCAL:BINDING= TFALSE
-   TARGET DOWNLOAD 2 10 [: UNPROTECTED ;] LEASE
+   TARGET DOWNLOAD 2 10 [: TEST-CLIENT:UNPROTECTED ;] LEASE
    {: new:n nb:LOCAL:binding f2:bool :}
    f2 TTRUE
    root new nb EMPTY-SLOT
@@ -2197,7 +2188,7 @@ variable SLOT-PATH-U
 \ this case opens itself: it leaves prepare_download_slot_at out.
 : SWAPPED ( fd -- )
    {: root:fd :}
-   TARGET EXPECTED 1 1 [: UNPROTECTED ;] LEASE
+   TARGET EXPECTED 1 1 [: TEST-CLIENT:UNPROTECTED ;] LEASE
    {: slot:n b:LOCAL:binding found:bool :}
    found TTRUE slot KEEP-SLOT
    root SLOT$ SLOT-PATH$ LOCAL:OPENED-SLOT {: f:fd opened:bool :}
@@ -2241,7 +2232,7 @@ variable SYNC-U
 : TEST-LEASE ( ^u8 n DROPBOX:hash -- LOCAL:download-slot-lease )
    {: t:^ tu:n c:DROPBOX:hash :}
    t tu c 1 1 SLOT-IDENTITY {: id:LOCAL:download-slot-identity :}
-   ROOT$ id [: UNPROTECTED ;] LOCAL:LEASE-DOWNLOAD-SLOT LOCAL:LEASED ;
+   ROOT$ id [: TEST-CLIENT:UNPROTECTED ;] LOCAL:LEASE-DOWNLOAD-SLOT TEST-CLIENT:LEASED ;
 
 : DOWNLOAD-PREPARE
    ( fd ^u8 n DROPBOX:hash LOCAL:download-slot-lease
@@ -3292,7 +3283,7 @@ FS:PATHZ-CAP BUFFER: SLOT-FILE-BUF
    c CONFIG:PATHS {: p :}
    TARGET DOWNLOAD 1 1 SLOT-IDENTITY {: id:LOCAL:download-slot-identity :}
    p CONFIG:UPLOAD-STAGING-DIRECTORY CONFIG:ABS-PATH>STR str>
-   id [: UNPROTECTED ;] LOCAL:LEASE-DOWNLOAD-SLOT LOCAL:LEASE-OF
+   id [: TEST-CLIENT:UNPROTECTED ;] LOCAL:LEASE-DOWNLOAD-SLOT LOCAL:LEASE-OF
    {: slot:n b:LOCAL:binding found:bool :}
    found TTRUE
    p PATHS-PROJECTED

@@ -2011,18 +2011,6 @@ TYPED-VARIABLE STAGE-AT str
 CAP BUFFER: TEXT
 
 
-\ A client on the fake with the refresh token t, as CFG's store has it.
-: OPENED-WITH ( ^u8 n ^ARENA:arena -- ^DROPBOX:client )
-   {: t:^ tu:n ar :}
-   CFG DROPBOX:PRODUCTION
-   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:API !
-   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:NOTIFY !
-   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:CONTENT !
-   s" fake-key" SPAN:MAKE CFG DROPBOX-CONFIG:KEY !
-   t tu SPAN:MAKE CFG DROPBOX-CONFIG:TOKEN !
-   s" " SPAN:MAKE CFG DROPBOX-CONFIG:ROOT !
-   CFG ar DROPBOX:OPEN ;
-
 : KEPT ( ^u8 n -- ) 2drop ;
 
 : LINKED ( ^DROPBOX:client -- ) LINK REPLAY-LINK:CLIENT ! ;
@@ -2216,9 +2204,8 @@ variable HELD
 \ refresh token through RETURNED.
 : RACED ( fd str MODEL:remote ^ARENA:arena -- LOCAL:stage-outcome<n> )
    {: root:fd r:str rem:MODEL:remote ar :}
-   [: RETURNED ;] CFG DROPBOX-CONFIG:STORE !
    s" replay-refresh-2" TEST-DROPBOX:ROTATE!
-   s" replay-refresh" ar OPENED-WITH {: c :}
+   [: RETURNED ;] s" replay-refresh" s" " ar CLIENT-ON {: c :}
    c LINKED
    [: root r s" raced.txt" rem NO-LEASE ar STAGED-AT ;]
    [: c DROPBOX:CLOSE MAIN @ LINKED
@@ -3016,7 +3003,7 @@ ARENA FILE-CASES file-case
    ar THEIRS-SERVED {: h rem :}
    s" /oauth2/token" 400 s" " s" "
    S\" {\qerror\q:\qinvalid_request\q}" TEST-DROPBOX:ROUTE-SCRIPT!
-   s" replay-refresh" ar OPENED-WITH {: k :}
+   [: KEPT ;] s" replay-refresh" s" " ar CLIENT-ON {: k :}
    k LINKED
    [: rem DROPBOX:E-BAD-REQUEST ar COPY-FAILED ENDED ;]
    [: k DROPBOX:CLOSE MAIN @ LINKED ;] finally ;
@@ -3557,8 +3544,7 @@ variable SIDES
 \ runtime directory of its own.
 : LINKING ( ^ARENA:arena -- )
    {: ar :}
-   [: KEPT ;] CFG DROPBOX-CONFIG:STORE !
-   s" replay-refresh" ar OPENED-WITH MAIN !
+   [: KEPT ;] s" replay-refresh" s" " ar CLIENT-ON MAIN !
    MAIN @ LINKED
    s" " >str LINK REPLAY-LINK:ROOT !
    s" replay-status" FS:MKTEMP-DIR ar COPIED RUNTIME !
