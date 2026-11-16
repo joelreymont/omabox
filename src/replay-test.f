@@ -41,7 +41,8 @@
 \   lost mid-body throws E-DROPBOX with a retry, keeps its slot and
 \   leaks no descriptor, and the next stages it; a slot holding a
 \   checkpoint: a 416 at its length finishes the stage, a lost answer
-\   keeps it, sent with its Range, and another 416 restarts it; a
+\   keeps it, sent with its Range, and another 416 restarts it, or the
+\   next download resumes it from its Range to the remote's content; a
 \   download's progress, then finished, in a status under TMPDIR.
 \ - MATERIALIZE-REMOTE-CONFLICT downloads the copy once, then is ready
 \   with no request; a directory or other bytes at the copy's name
@@ -1411,12 +1412,35 @@ variable HELD
       LOCAL:APPEND-PARTIAL DROP-STAGE ;]
    [: 2drop true ;] LOCAL:CONVERTING LOCAL:E-STAGE-READ T= ;
 
-\ The content hash of CHECKPOINT "x" bytes.
-: CHECKPOINT-HASH ( ^ARENA:arena -- DROPBOX:hash )
-   {: ar :}
+\ HASHING begun and fed CHECKPOINT "x" bytes.
+: XS-FED ( -- )
    HASHING DROPBOX:HASH-BEGIN
-   CHECKPOINT XS-SIZE / 0 ?do XS XS-SIZE HASHING DROPBOX:HASH-FEED loop
+   CHECKPOINT XS-SIZE / 0 ?do XS XS-SIZE HASHING DROPBOX:HASH-FEED loop ;
+
+: HASHED ( ^ARENA:arena -- DROPBOX:hash )
+   {: ar :}
    HASHING DROPBOX:HASH-END ar COPIED DROPBOX:>HASH ;
+
+\ The content hash of CHECKPOINT "x" bytes.
+: CHECKPOINT-HASH ( ^ARENA:arena -- DROPBOX:hash ) XS-FED HASHED ;
+
+\ The content hash of CHECKPOINT "x" bytes, then ALPHABET.
+: RESUMED-HASH ( ^ARENA:arena -- DROPBOX:hash )
+   XS-FED ALPHABET HASHING DROPBOX:HASH-FEED HASHED ;
+
+\ SERVES of CHECKPOINT bytes the fake does not keep, then b.
+: SERVES-PAST ( ^u8 n ^u8 n ^u8 n DROPBOX:hash -- )
+   {: p:^ pu:n v:^ vu:n b:^ bu:n c:DROPBOX:hash :}
+   c DROPBOX:HASH>STR str> {: h:^ hu:n :}
+   p pu p pu v vu h hu CHECKPOINT bu + TEST-DROPBOX:FILE!
+   v vu CHECKPOINT b bu TEST-DROPBOX:CONTENT-TAIL! ;
+
+\ The content hash of the root r's one file, the stage.
+: STAGE-HASH ( str ^ARENA:arena -- DROPBOX:hash )
+   {: r:str ar :}
+   r str> TEXT CAP FS-LIST:NAMES {: u:n :}
+   r TEXT u ar INSIDE str> FS:OPEN-SIZED TTRUE drop {: f:fd :}
+   f ar LOCAL:DROPBOX-CONTENT-HASH f FS:CLOSE-DIR ;
 
 \ A reader of the pipe's bytes into LOCAL.
 : STAGE-FROM
@@ -1578,6 +1602,11 @@ variable HELD
    root FS:CLOSE-DIR
    d GONE ;
 
+\ The last download asked the bytes from CHECKPOINT on.
+: RESUMED-RANGE ( -- )
+   SB-RESET s" bytes=" SB-APPEND CHECKPOINT FMT:SB-INT s" -" SB-APPEND
+   SB$ TEST-DROPBOX:RANGE-SENT$ T$= ;
+
 : ANOTHER-416-RESTARTS-THE-SLOT ( ^ARENA:arena -- )
    {: ar :}
    s" a lost answer keeps the partial; another 416 restarts it" T-LABEL
@@ -1594,11 +1623,32 @@ variable HELD
    root r s" restart.bin" rem l ar STOPPED
    slot str> HOLDERS 0 T=
    slot str> FS:FILE-SIZE CHECKPOINT T=
-   SB-RESET s" bytes=" SB-APPEND CHECKPOINT FMT:SB-INT s" -" SB-APPEND
-   SB$ TEST-DROPBOX:RANGE-SENT$ T$=
+   RESUMED-RANGE
    root r s" restart.bin" rem l ar STAGED-AT s" staged" AS
    TEST-DROPBOX:RANGE-SENT? TFALSE
    3 SEEN
+   root FS:CLOSE-DIR
+   d GONE ;
+
+: A-LOST-ANSWER-RESUMES-FROM-THE-CHECKPOINT ( ^ARENA:arena -- )
+   {: ar :}
+   s" a lost answer keeps the partial; the next resumes it" T-LABEL
+   TEST-DROPBOX:RESET
+   ar RESUMED-HASH {: c:DROPBOX:hash :}
+   s" /resume.bin" s" resume-revision" ALPHABET c SERVES-PAST
+   c s" resume-revision" REMOTE-OF {: rem:MODEL:remote :}
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r OPEN-ROOT {: root:fd :}
+   d s" resume.bin" rem LEASE-FOR {: l:option<LOCAL:download-slot-lease> :}
+   root r s" resume.bin" c l LEASED ar CHECKPOINTED
+   d ar SLOT-PATH {: slot:str :}
+   TEST-DROPBOX:LOSE
+   root r s" resume.bin" rem l ar STOPPED
+   slot str> FS:FILE-SIZE CHECKPOINT T=
+   root r s" resume.bin" rem l ar STAGED-AT s" staged" AS
+   RESUMED-RANGE
+   r ar STAGE-HASH DROPBOX:HASH>STR str> c DROPBOX:HASH>STR str> T$=
+   2 SEEN
    root FS:CLOSE-DIR
    d GONE ;
 
@@ -1740,6 +1790,7 @@ variable HELD
    ar A-DOWNLOAD-LOST-MID-BODY-KEEPS-ITS-PARTIAL
    ar A-COMPLETE-416-FINISHES-THE-STAGE
    ar ANOTHER-416-RESTARTS-THE-SLOT
+   ar A-LOST-ANSWER-RESUMES-FROM-THE-CHECKPOINT
    ar A-DOWNLOAD-REPORTS-ITS-TRANSFER
    ar A-REMOTE-CONFLICT-COPY-DOWNLOADS-ONCE
    ar AN-OCCUPIED-REMOTE-COPY-NAME-BLOCKS-IT

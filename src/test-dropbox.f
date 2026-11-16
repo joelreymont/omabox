@@ -719,6 +719,9 @@ SLOTS NAME-CAP * BUFFER: CONTENT-REVS
 SLOTS TYPED-BUFFER CONTENT-REV-US n
 SLOTS TEXT-CAP * BUFFER: CONTENT-BYTES
 SLOTS TYPED-BUFFER CONTENT-US n
+\ The bytes each slot's content holds before those it keeps; a download
+\ from before them answers 500.
+SLOTS TYPED-BUFFER CONTENT-SKIPS n
 variable CONTENTS
 TYPED-VARIABLE SKEWED bool
 create MISFILED NAME-CAP allot
@@ -744,6 +747,16 @@ TYPED-VARIABLE RANGED bool
    {: i:n :} CONTENT-REVS NAME-CAP i AT drop i CONTENT-REV-US @ ;
 : CONTENT$ ( n -- ^u8 n )
    {: i:n :} CONTENT-BYTES TEXT-CAP i AT drop i CONTENT-US @ ;
+: CONTENT-SIZE ( n -- n )
+   {: i:n :} i CONTENT-SKIPS @ i CONTENT-US @ + ;
+
+
+\ Slot i's content from the offset, at or past its skip, to its end.
+: CONTENT-FROM ( n n -- ^u8 n )
+   {: i:n from:n :}
+   i CONTENT$ {: b:^ u:n :}
+   from i CONTENT-SKIPS @ - {: at:n :}
+   b at + u at - ;
 
 
 \ The slot holding the rev's bytes, else -1.
@@ -841,7 +854,7 @@ TYPED-VARIABLE RANGED bool
 \ The file in slot i with the bytes in slot k, from the offset.
 : FILE-SENT ( HTTP:response n n n -- )
    {: a:HTTP:response i:n k:n from:n :}
-   k CONTENT$ {: b:^ size:n :}
+   k CONTENT-SIZE {: size:n :}
    from size >= from 0 > and if a size UNSATISFIABLE! exit then
    a s" Dropbox-API-Result" i ENTRY$ HTTP:HEADER!
    a s" Content-Type" s" application/octet-stream" HTTP:HEADER!
@@ -850,9 +863,9 @@ TYPED-VARIABLE RANGED bool
       a s" Content-Range" from size CONTENT-RANGE$ HTTP:HEADER!
    then
    false PARTED !
-   size from - SHORTED @ if 1- then {: len:n :}
+   k from CONTENT-FROM SHORTED @ if 1- then {: b:^ len:n :}
    false SHORTED !
-   a b from + len HTTP:BODY! ;
+   a b len HTTP:BODY! ;
 
 
 \ The rev the next download answers: a MISFILE's once, else the one asked.
@@ -882,11 +895,11 @@ private
 \ head promising them all, and PART of them.
 : CUT$ ( n n n -- ^u8 n )
    {: i:n k:n from:n :}
-   k CONTENT$ {: b:^ size:n :}
+   k CONTENT-SIZE {: size:n :}
    SB-RESET S\" HTTP/1.1 200 OK\r\nDropbox-API-Result: " SB-APPEND
    i ENTRY$ SB-APPEND S\" \r\nContent-Length: " SB-APPEND
    size from - FMT:SB-INT S\" \r\n\r\n" SB-APPEND
-   b from + size from - PART min SB-APPEND
+   k from CONTENT-FROM PART min SB-APPEND
    SB$ ;
 
 
@@ -959,9 +972,8 @@ private
    {: q:HTTP:request i:n k:n from:n :}
    false PAUSING !
    q i k from CUT-SENT {: conn:TCP4:connection :}
-   k CONTENT$ {: b:^ size:n :}
-   from PART + size min {: at:n :}
-   conn b at + size at - REST-SENT
+   from PART + k CONTENT-SIZE min {: at:n :}
+   conn k at CONTENT-FROM REST-SENT
    conn TCP4:CLOSE CLOSED ;
 
 
@@ -974,6 +986,7 @@ private
    r ru FILE-OF r ru CONTENT-OF {: i:n k:n :}
    i 0< k 0< or if a NOT-FOUND! exit then
    from 0< if a 400 HTTP:STATUS! a s" bad range" HTTP:BODY! exit then
+   from k CONTENT-SKIPS @ < if a 500 HTTP:STATUS! exit then
    BREAKING @ if q i k from BROKEN exit then
    HOLDING @ if q i k from HELD-OPEN exit then
    PAUSING @ if q i k from PAUSED exit then
@@ -1254,6 +1267,7 @@ $2100000 constant UPLOAD-CAP
    false PARTED ! false BREAKING ! false LOSING ! 0 CUTS !
    false HOLDING ! false PAUSING ! 0 RESUMING atomic!
    false TOKEN-CUTTING ! false REVOKED ! false DENIED ! false GARBLING !
+   SLOTS 0 ?do 0 i CONTENT-SKIPS ! loop
    LISTING-RESET ;
 
 
@@ -1359,14 +1373,22 @@ $2100000 constant UPLOAD-CAP
 
 \ ---- files/download
 
+\ CONTENT! of skip bytes the fake does not keep, then the tail t; the size
+\ FILE! was given must be skip plus t's length.
+: CONTENT-TAIL! ( ^u8 n n ^u8 n -- )
+   {: r:^ ru:n skip:n t:^ tu:n :}
+   r ru CONTENT-OF {: k:n :}
+   k 0< if CONTENTS @ 1 CONTENTS +! else k then {: j:n :}
+   r ru CONTENT-REVS NAME-CAP j AT STORE j CONTENT-REV-US !
+   skip j CONTENT-SKIPS !
+   t tu CONTENT-BYTES TEXT-CAP j AT STORE j CONTENT-US ! ;
+
+
 \ The bytes files/download serves for a FILE!'s rev, which replace any kept
 \ for it; the size FILE! was given must be their length.
 : CONTENT! ( ^u8 n ^u8 n -- )
    {: r:^ ru:n b:^ bu:n :}
-   r ru CONTENT-OF {: k:n :}
-   k 0< if CONTENTS @ 1 CONTENTS +! else k then {: j:n :}
-   r ru CONTENT-REVS NAME-CAP j AT STORE j CONTENT-REV-US !
-   b bu CONTENT-BYTES TEXT-CAP j AT STORE j CONTENT-US ! ;
+   r ru 0 b bu CONTENT-TAIL! ;
 
 
 \ Shifts the next download's Content-Range start by one.
