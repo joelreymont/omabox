@@ -357,16 +357,16 @@ variable SCANNED       \ query plan rows that scan the table
    c cu CONTENT r ru >str DROPBOX:>REV MODEL-REMOTE:MAKE ;
 
 : PRESENT-REMOTE ( ^u8 n ^u8 n -- MODEL:observation<MODEL:remote> )
-   REMOTE-FILE MODEL-OBSERVATION:present ;
+   REMOTE-FILE MODEL-OBSERVATION:PRESENT ;
 
 : ABSENT-REMOTE ( -- MODEL:observation<MODEL:remote> )
-   MODEL-OBSERVATION:absent ;
+   MODEL-OBSERVATION:ABSENT ;
 
 : INACCESSIBLE ( -- MODEL:observation<MODEL:remote> )
-   MODEL-UNKNOWN--REASON:inaccessible MODEL-OBSERVATION:unknown ;
+   MODEL-UNKNOWN--REASON:INACCESSIBLE MODEL-OBSERVATION:UNKNOWN ;
 
 : PRESENT-LOCAL ( ^u8 n -- MODEL:observation<MODEL:local> )
-   CONTENT MODEL-LOCAL:MAKE MODEL-OBSERVATION:present ;
+   CONTENT MODEL-LOCAL:MAKE MODEL-OBSERVATION:PRESENT ;
 
 \ The Rust tests' record(key, path, observation).
 : REMOTE-RECORD
@@ -1260,25 +1260,25 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
 \ as src/oracle/plan.tsv holds them. An upload: a new local file, no
 \ remote one, no baseline.
 : UPLOAD-DECISION ( ^u8 n -- MODEL:decision )
-   CONTENT MODEL-OPERATION:create-remote MODEL-DECISION:operate ;
+   CONTENT MODEL-OPERATION:CREATE-REMOTE MODEL-DECISION:OPERATE ;
 
 \ Both sides present with the remote file's content, whatever the
 \ baseline: the remote file becomes the baseline.
 : MATCH-DECISION ( MODEL:remote -- MODEL:decision )
-   MODEL-BASELINE:present MODEL-DECISION:noop ;
+   MODEL-BASELINE:PRESENT MODEL-DECISION:NOOP ;
 
 \ A download: no baseline, the local side confirmed absent, the remote
 \ file present.
 : DOWNLOAD-DECISION ( MODEL:remote -- MODEL:decision )
-   MODEL-OPERATION:install-local MODEL-DECISION:operate ;
+   MODEL-OPERATION:INSTALL-LOCAL MODEL-DECISION:OPERATE ;
 
 \ Both sides confirmed absent.
 : ABSENT-DECISION ( -- MODEL:decision )
-   MODEL-BASELINE:absent MODEL-DECISION:noop ;
+   MODEL-BASELINE:ABSENT MODEL-DECISION:NOOP ;
 
 \ A directory on both sides and in the baseline.
 : DIRECTORY-DECISION ( -- MODEL:decision )
-   MODEL-BASELINE:directory MODEL-DECISION:noop ;
+   MODEL-BASELINE:DIRECTORY MODEL-DECISION:NOOP ;
 
 : TEST-PATH ( -- str ) s" test" >str ;
 
@@ -1456,7 +1456,7 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
 \ The Rust tests' DivergentEdits conflict.
 : DIVERGENT ( -- MODEL:conflict )
    s" local" CONTENT MODEL-LOCAL:MAKE
-   s" remote" s" rev-remote" REMOTE-FILE MODEL-CONFLICT:divergent ;
+   s" remote" s" rev-remote" REMOTE-FILE MODEL-CONFLICT:DIVERGENT ;
 
 : CONFLICT-RECORD= ( conflict-record conflict-record -- bool )
    JOURNAL-CONFLICT--RECORD:UNMAKE {: i p x :}
@@ -1611,7 +1611,7 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    s" journal_reopen_exposes_intent_without_advancing_baseline" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    s" notes/report.txt" DISPLAY {: path :}
-   s" new" CONTENT MODEL-OPERATION:create-remote {: operation :}
+   s" new" CONTENT MODEL-OPERATION:CREATE-REMOTE {: operation :}
    s" new" UPLOAD-DECISION ar OPERATIONS {: plan :}
    p OPEN {: j :}
    j path plan ar RECORD-PLAN RECORDED-PLAN {: recorded :}
@@ -1662,7 +1662,7 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    j path file MATCH-DECISION NOOP ar RECORD-NOOP NOOP-RECORDED? TTRUE
    j CLOSE
    p OPEN {: k :}
-   k path ar BASELINE file MODEL-BASELINE:present BASELINE-HELD? TTRUE
+   k path ar BASELINE file MODEL-BASELINE:PRESENT BASELINE-HELD? TTRUE
    p MODE-OF MODE-OWNER T=
    k CLOSE
    d GONE ;
@@ -1678,7 +1678,7 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    s" same" s" rev-current" REMOTE-FILE {: observed :}
    observed MATCH-DECISION NOOP {: noop :}
    j path noop ar RECORD-NOOP NOOP-RECORDED? TTRUE
-   j path ar BASELINE observed MODEL-BASELINE:present BASELINE-HELD?
+   j path ar BASELINE observed MODEL-BASELINE:PRESENT BASELINE-HELD?
    TTRUE
    j TOTAL-CHANGES {: unchanged :}
    j path noop ar RECORD-NOOP NOOP-RECORDED? TTRUE
@@ -1688,7 +1688,7 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    ABSENT-DECISION NOOP {: absent :}
    j path absent ar RECORD-NOOP pending >ID OWNED-BY? TTRUE
    j path ar BASELINE
-   s" same" s" rev-current" REMOTE-FILE MODEL-BASELINE:present
+   s" same" s" rev-current" REMOTE-FILE MODEL-BASELINE:PRESENT
    BASELINE-HELD? TTRUE
    j CLOSE
    d GONE ;
@@ -1757,7 +1757,7 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    records 0 VEC:AT @ s" alpha.txt" s" alpha.txt" ar RECORD-IS? TTRUE
    records 1 VEC:AT @ s" zulu.txt" s" Zulu.TXT" ar RECORD-IS? TTRUE
    records 1 VEC:AT @ MODEL-BASELINE--RECORD:UNMAKE {: k path b :}
-   b s" zulu" s" rev-zulu" REMOTE-FILE MODEL-BASELINE:present
+   b s" zulu" s" rev-zulu" REMOTE-FILE MODEL-BASELINE:PRESENT
    MODEL:BASELINE= TTRUE
    j CLOSE
    d GONE ;
@@ -1982,7 +1982,7 @@ variable CRAFT
    ar JOURNAL-AT {: d:str p:str :}
    s" blocked.txt" DISPLAY {: path :}
    s" upload" UPLOAD-DECISION ar OPERATIONS {: upload :}
-   s" insufficient_space" >str MODEL-BLOCKAGE:remote-rejected {: why :}
+   s" insufficient_space" >str MODEL-BLOCKAGE:REMOTE-REJECTED {: why :}
    p OPEN {: j :}
    j path upload ar RECORD-PLAN RECORDED-PLAN {: recorded :}
    recorded >ID {: id :}
@@ -1996,7 +1996,7 @@ variable CRAFT
    p OPEN {: k :}
    k ar PENDING-PLANS VEC:COUNT 0 T=
    k ar BLOCKED-PLANS VEC:COUNT 1 T=
-   MODEL-BLOCKAGE:stage-occupied {: stage :}
+   MODEL-BLOCKAGE:STAGE-OCCUPIED {: stage :}
    k id stage 1700003600 ar BLOCK-PLAN BLOCK-N 2 T=
    k ar BLOCKED-PLANS ONLY STATUS-OF stage 1700003600 BLOCKED-AS
    STATUS= TTRUE
@@ -2016,7 +2016,7 @@ variable CRAFT
    T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    s" upload" UPLOAD-DECISION ar OPERATIONS {: upload :}
-   MODEL-BLOCKAGE:local-object-in-way {: why :}
+   MODEL-BLOCKAGE:LOCAL-OBJECT-IN-WAY {: why :}
    p OPEN {: j :}
    j s" Contested.TXT" DISPLAY upload ar RECORD-PLAN RECORDED-PLAN
    >ID {: id :}
@@ -2069,9 +2069,9 @@ variable CRAFT
    s" upload" UPLOAD-DECISION ar OPERATIONS {: upload :}
    s" displaced" CONTENT {: displaced :}
    ar [type] MODEL:operation NEW-VECTOR {: ops :}
-   displaced MODEL-LOCAL:MAKE MODEL-OPERATION:preserve-local
+   displaced MODEL-LOCAL:MAKE MODEL-OPERATION:PRESERVE-LOCAL
    ops VEC:PUSH !
-   displaced MODEL-OPERATION:delete-local ops VEC:PUSH !
+   displaced MODEL-OPERATION:DELETE-LOCAL ops VEC:PUSH !
    ops JOURNAL-OPERATION--PLAN:MAKE {: ordered :}
    p OPEN {: j :}
    j s" a.txt" upload ar RECORD-UPLOAD
@@ -2144,7 +2144,7 @@ variable CRAFT
 \ The stage-occupied blockage's stored JSON, copied into the arena.
 : BLOCKAGE-JSON ( ^ARENA:arena ^JSON:writer -- str )
    {: ar w :}
-   MODEL-BLOCKAGE:stage-occupied w ENCODE-BLOCKAGE ar COPIED ;
+   MODEL-BLOCKAGE:STAGE-OCCUPIED w ENCODE-BLOCKAGE ar COPIED ;
 
 : PLAN-STATUS-DECODING-NAMES-THE-STATE-IT-REJECTS ( ^ARENA:arena -- )
    {: ar :}
@@ -2182,7 +2182,7 @@ variable CRAFT
    s" CREATE TRIGGER reject_test_completion BEFORE UPDATE OF status ON plans
       WHEN hex(OLD.path) = hex('second.txt') AND NEW.status = 'completed'
       BEGIN SELECT RAISE(ABORT, 'test rejection'); END;" SQLITE:EXEC
-   downloaded MODEL-BASELINE:present {: b :}
+   downloaded MODEL-BASELINE:PRESENT {: b :}
    ar [type] operation-baseline NEW-VECTOR {: finals :}
    first FIRST-ID b JOURNAL-OPERATION--BASELINE:MAKE finals VEC:PUSH !
    second FIRST-ID b JOURNAL-OPERATION--BASELINE:MAKE finals VEC:PUSH !
@@ -2201,10 +2201,10 @@ variable CRAFT
    T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    s" parent" DISPLAY {: path :}
-   MODEL-BASELINE:directory {: dir :}
+   MODEL-BASELINE:DIRECTORY {: dir :}
    p OPEN {: j :}
    j path DIRECTORY-DECISION NOOP ar RECORD-NOOP NOOP-RECORDED? TTRUE
-   MODEL-OPERATION:delete-local-directory ar ONE-PLAN {: plan :}
+   MODEL-OPERATION:DELETE-LOCAL-DIRECTORY ar ONE-PLAN {: plan :}
    j path plan ar RECORD-PLAN RECORDED-PLAN {: pending :}
    j pending >ID ar SUPERSEDE-PLAN SUPERSEDED? TTRUE
    j path ar BASELINE dir BASELINE-HELD? TTRUE
@@ -2253,7 +2253,7 @@ variable CRAFT
 : KEPT-PATH ( -- MODEL:path ) s" kept.txt" DISPLAY ;
 
 : KEPT ( -- MODEL:baseline )
-   s" kept" s" rev-kept" REMOTE-FILE MODEL-BASELINE:present ;
+   s" kept" s" rev-kept" REMOTE-FILE MODEL-BASELINE:PRESENT ;
 
 \ A schema-8 journal holding a schema-6 root's row, as migration 7
 \ copies it, and the baseline version_six_with_root writes.
@@ -2274,7 +2274,7 @@ variable CRAFT
 : CONFLICTED ( -- MODEL:conflict )
    s" local-conflict" CONTENT MODEL-LOCAL:MAKE
    s" remote-conflict" s" rev-conflict" REMOTE-FILE
-   MODEL-CONFLICT:divergent ;
+   MODEL-CONFLICT:DIVERGENT ;
 
 : ONLY-CONFLICT ( ^VEC:vector<conflict-record> -- conflict-record )
    {: found :}
@@ -2538,9 +2538,9 @@ variable CRAFT
    ( MODEL:remote ^u8 n ^ARENA:arena -- operation-plan )
    {: file c:^ cu ar :}
    ar [type] MODEL:operation NEW-VECTOR {: ops :}
-   file MODEL-OPERATION:preserve-remote ops VEC:PUSH !
+   file MODEL-OPERATION:PRESERVE-REMOTE ops VEC:PUSH !
    file MODEL-REMOTE:UNMAKE {: old rev :}
-   c cu CONTENT rev MODEL-OPERATION:replace-remote ops VEC:PUSH !
+   c cu CONTENT rev MODEL-OPERATION:REPLACE-REMOTE ops VEC:PUSH !
    ops JOURNAL-OPERATION--PLAN:MAKE ;
 
 : JOURNAL-FINAL-OPERATION-RECORDS-ONLY-ITS-ACTUAL-RESULT
@@ -2550,17 +2550,17 @@ variable CRAFT
    ar JOURNAL-AT {: d:str p:str :}
    s" created.txt" DISPLAY {: path :}
    s" created" UPLOAD-DECISION ar OPERATIONS {: plan :}
-   s" created" CONTENT MODEL-LOCAL:MAKE MODEL-CONFLICT:remote-deleted
+   s" created" CONTENT MODEL-LOCAL:MAKE MODEL-CONFLICT:REMOTE-DELETED
    {: stale :}
    p OPEN {: j :}
    j path stale ar RECORD-CONFLICT drop
    j path plan ar RECORD-PLAN RECORDED-PLAN FIRST-ID {: id :}
    j id NO-BASELINE ar COMPLETE-OPERATION COMPLETION-N 3 T=
    j path ar BASELINE NO-BASELINE? TTRUE
-   s" wrong" s" rev-server" REMOTE-FILE MODEL-BASELINE:present {: wrong :}
+   s" wrong" s" rev-server" REMOTE-FILE MODEL-BASELINE:PRESENT {: wrong :}
    j id wrong OPTION:SOME ar COMPLETE-OPERATION COMPLETION-N 5 T=
    j path ar BASELINE NO-BASELINE? TTRUE
-   s" created" s" rev-server" REMOTE-FILE MODEL-BASELINE:present
+   s" created" s" rev-server" REMOTE-FILE MODEL-BASELINE:PRESENT
    {: actual :}
    j id actual OPTION:SOME ar COMPLETE-OPERATION COMPLETION-N 7 T=
    j path ar BASELINE actual BASELINE-HELD? TTRUE
@@ -2585,7 +2585,7 @@ variable CRAFT
    j create-path s" create" UPLOAD-DECISION ar OPERATIONS ar RECORD-PLAN
    RECORDED-PLAN {: create :}
    s" replace" CONTENT s" rev-old" >str DROPBOX:>REV
-   MODEL-OPERATION:replace-remote ar ONE-PLAN {: replace :}
+   MODEL-OPERATION:REPLACE-REMOTE ar ONE-PLAN {: replace :}
    j s" replace.txt" replace ar RECORD-UPLOAD
    s" download" s" rev-download" REMOTE-FILE DOWNLOAD-DECISION
    ar OPERATIONS {: download :}
@@ -2594,7 +2594,7 @@ variable CRAFT
    two VEC:COUNT 2 T=
    two 0 s" create" UPLOAD-AT? TTRUE
    two 1 s" replace" UPLOAD-AT? TTRUE
-   s" create" s" rev-created" REMOTE-FILE MODEL-BASELINE:present
+   s" create" s" rev-created" REMOTE-FILE MODEL-BASELINE:PRESENT
    {: created :}
    j create FIRST-ID created OPTION:SOME ar COMPLETE-OPERATION
    COMPLETION-N 7 T=
@@ -2642,7 +2642,7 @@ variable CRAFT
    T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    s" replace.txt" DISPLAY {: path :}
-   s" new" s" rev-server" REMOTE-FILE MODEL-BASELINE:present {: target :}
+   s" new" s" rev-server" REMOTE-FILE MODEL-BASELINE:PRESENT {: target :}
    s" old" s" rev-current" REMOTE-FILE s" new" ar PRESERVED-REPLACE
    {: plan :}
    p OPEN {: j :}
@@ -2672,7 +2672,7 @@ variable CRAFT
    T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    s" upload" UPLOAD-DECISION ar OPERATIONS {: upload :}
-   409 MODEL-BLOCKAGE:download-unavailable {: why :}
+   409 MODEL-BLOCKAGE:DOWNLOAD-UNAVAILABLE {: why :}
    p OPEN {: j :}
    j s" finished.txt" DISPLAY upload ar RECORD-PLAN RECORDED-PLAN >ID
    {: id :}
@@ -2697,7 +2697,7 @@ variable CRAFT
    j ar PENDING-UPLOAD-CONTENT {: before :}
    before VEC:COUNT 1 T=
    before 0 s" upload" UPLOAD-AT? TTRUE
-   j id MODEL-BLOCKAGE:remote-object 1700000000 ar BLOCK-PLAN BLOCK-N
+   j id MODEL-BLOCKAGE:REMOTE-OBJECT 1700000000 ar BLOCK-PLAN BLOCK-N
    2 T=
    j ar PENDING-UPLOAD-CONTENT {: blocked :}
    blocked VEC:COUNT 1 T=
@@ -2753,7 +2753,7 @@ variable CRAFT
    j path file ar CONFLICTED-ONCE {: id :}
    j CLOSE
    p OPEN {: k :}
-   k path ar BASELINE file MODEL-BASELINE:present BASELINE-HELD? TTRUE
+   k path ar BASELINE file MODEL-BASELINE:PRESENT BASELINE-HELD? TTRUE
    k ar PENDING-PLANS VEC:COUNT 0 T=
    k >CONNECTION id ar READ-PLAN PLAN-GONE? TTRUE
    k ar CONFLICTS ONLY-CONFLICT {: found :}
@@ -2844,9 +2844,9 @@ variable CRAFT
 : PRESERVED-DELETE ( ^u8 n ^ARENA:arena -- operation-plan )
    {: c:^ cu ar :}
    ar [type] MODEL:operation NEW-VECTOR {: ops :}
-   c cu CONTENT MODEL-LOCAL:MAKE MODEL-OPERATION:preserve-local
+   c cu CONTENT MODEL-LOCAL:MAKE MODEL-OPERATION:PRESERVE-LOCAL
    ops VEC:PUSH !
-   c cu CONTENT MODEL-OPERATION:delete-local ops VEC:PUSH !
+   c cu CONTENT MODEL-OPERATION:DELETE-LOCAL ops VEC:PUSH !
    ops JOURNAL-OPERATION--PLAN:MAKE ;
 
 \ A pending destructive plan of the content, whose deletion has a
@@ -2860,7 +2860,7 @@ variable CRAFT
    s" blocked" UPLOAD-DECISION ar OPERATIONS {: upload :}
    j s" blocked.txt" DISPLAY upload ar RECORD-PLAN RECORDED-PLAN >ID
    {: id :}
-   j id MODEL-BLOCKAGE:stage-occupied 1700000000 ar BLOCK-PLAN BLOCK-N
+   j id MODEL-BLOCKAGE:STAGE-OCCUPIED 1700000000 ar BLOCK-PLAN BLOCK-N
    2 T= ;
 
 \ dir/recovery-payload and dir/staged-payload, written.
@@ -2972,7 +2972,7 @@ variable CRAFT
    j path agreed MATCH-DECISION NOOP ar RECORD-NOOP NOOP-RECORDED? TTRUE
    j s" tracked.txt" s" same" PRESENT-LOCAL LOCAL-RECORD ar ONE-LOCAL
    PUBLISH-LOCAL-INVENTORY
-   s" tracked.txt" s" tracked.txt" agreed MODEL-OBSERVATION:present ar
+   s" tracked.txt" s" tracked.txt" agreed MODEL-OBSERVATION:PRESENT ar
    REMOTE-RECORD {: remote :}
    j s" cursor-kept" CURSOR remote ar ONE-REMOTE PUBLISH-REMOTE-INVENTORY
    j s" old-root-conflict.txt" DISPLAY DIVERGENT ar RECORD-CONFLICT drop
@@ -2989,7 +2989,7 @@ variable CRAFT
    j ar TRACKED {: remote :}
    s" tracked.txt" DISPLAY {: path :}
    j first ar ACTIVATE-LOCAL-ROOT first-record CURRENT? TTRUE
-   j path ar BASELINE SAME-REV-1 MODEL-BASELINE:present BASELINE-HELD?
+   j path ar BASELINE SAME-REV-1 MODEL-BASELINE:PRESENT BASELINE-HELD?
    TTRUE
    s" /sync/second" 4 LOCAL-ROOT {: second :}
    second 2 JOURNAL-LOCAL--ROOT--RECORD:MAKE {: second-record :}

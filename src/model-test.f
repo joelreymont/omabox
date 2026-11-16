@@ -206,26 +206,26 @@ TYPED-VARIABLE AR ^ARENA:arena
    s" h1" LOCAL s" h2" LOCAL MODEL:LOCAL= TFALSE
    R1 R1 MODEL:REMOTE= TTRUE
    R1 R2 MODEL:REMOTE= TFALSE
-   R1 MODEL-BASELINE:present R1 MODEL-BASELINE:present
+   R1 MODEL-BASELINE:PRESENT R1 MODEL-BASELINE:PRESENT
    MODEL:BASELINE= TTRUE
-   R1 MODEL-BASELINE:present R2 MODEL-BASELINE:present
+   R1 MODEL-BASELINE:PRESENT R2 MODEL-BASELINE:PRESENT
    MODEL:BASELINE= TFALSE
-   R1 s" h0" HASH MODEL-OPERATION:replace-local
-   R1 s" h0" HASH MODEL-OPERATION:replace-local
+   R1 s" h0" HASH MODEL-OPERATION:REPLACE-LOCAL
+   R1 s" h0" HASH MODEL-OPERATION:REPLACE-LOCAL
    MODEL:OPERATION= TTRUE
-   R1 MODEL-OPERATION:install-local R1 MODEL-OPERATION:preserve-remote
+   R1 MODEL-OPERATION:INSTALL-LOCAL R1 MODEL-OPERATION:PRESERVE-REMOTE
    MODEL:OPERATION= TFALSE
-   s" h1" LOCAL R1 MODEL-CONFLICT:divergent
-   s" h1" LOCAL R1 MODEL-CONFLICT:divergent
+   s" h1" LOCAL R1 MODEL-CONFLICT:DIVERGENT
+   s" h1" LOCAL R1 MODEL-CONFLICT:DIVERGENT
    MODEL:CONFLICT= TTRUE
-   s" h1" LOCAL R1 MODEL-CONFLICT:divergent
-   s" h2" LOCAL R1 MODEL-CONFLICT:divergent
+   s" h1" LOCAL R1 MODEL-CONFLICT:DIVERGENT
+   s" h2" LOCAL R1 MODEL-CONFLICT:DIVERGENT
    MODEL:CONFLICT= TFALSE
-   s" h1" LOCAL R1 MODEL-CONFLICT:initial MODEL-DECISION:conflicted
-   s" h1" LOCAL R1 MODEL-CONFLICT:initial MODEL-DECISION:conflicted
+   s" h1" LOCAL R1 MODEL-CONFLICT:INITIAL MODEL-DECISION:CONFLICTED
+   s" h1" LOCAL R1 MODEL-CONFLICT:INITIAL MODEL-DECISION:CONFLICTED
    MODEL:DECISION= TTRUE
-   MODEL-BASELINE:absent MODEL-DECISION:noop
-   MODEL-BLOCKED--REASON:unknown MODEL-DECISION:blocked
+   MODEL-BASELINE:ABSENT MODEL-DECISION:NOOP
+   MODEL-BLOCKED--REASON:UNKNOWN MODEL-DECISION:BLOCKED
    MODEL:DECISION= TFALSE ;
 
 
@@ -257,13 +257,13 @@ TYPED-VARIABLE AR ^ARENA:arena
 : LOCAL-OBSERVATION-AT ( n -- MODEL:observation<MODEL:local> )
    {: k:n :}
    k 0 = if s" h1" FRESH-HASH MODEL-LOCAL:MAKE
-      MODEL-OBSERVATION:present exit then
+      MODEL-OBSERVATION:PRESENT exit then
    k 1 = if s" h2" FRESH-HASH MODEL-LOCAL:MAKE
-      MODEL-OBSERVATION:present exit then
-   k 2 = if MODEL-OBSERVATION:directory exit then
-   k 3 = if MODEL-OBSERVATION:absent exit then
-   k 4 = if MODEL-UNKNOWN--REASON:stale MODEL-OBSERVATION:unknown exit then
-   MODEL-UNKNOWN--REASON:incomplete MODEL-OBSERVATION:unknown ;
+      MODEL-OBSERVATION:PRESENT exit then
+   k 2 = if MODEL-OBSERVATION:DIRECTORY exit then
+   k 3 = if MODEL-OBSERVATION:ABSENT exit then
+   k 4 = if MODEL-UNKNOWN--REASON:STALE MODEL-OBSERVATION:UNKNOWN exit then
+   MODEL-UNKNOWN--REASON:INCOMPLETE MODEL-OBSERVATION:UNKNOWN ;
 
 : LOCAL-OBSERVATIONS= ( n n -- bool )
    {: a:n b:n :}
@@ -272,13 +272,13 @@ TYPED-VARIABLE AR ^ARENA:arena
 
 : REMOTE-OBSERVATION-AT ( n -- MODEL:observation<MODEL:remote> )
    {: k:n :}
-   k 0 = if s" h1" s" r1" FRESH-REMOTE MODEL-OBSERVATION:present exit then
-   k 1 = if s" h2" s" r1" FRESH-REMOTE MODEL-OBSERVATION:present exit then
-   k 2 = if s" h1" s" r2" FRESH-REMOTE MODEL-OBSERVATION:present exit then
-   k 3 = if MODEL-OBSERVATION:directory exit then
-   k 4 = if MODEL-OBSERVATION:absent exit then
-   k 5 = if MODEL-UNKNOWN--REASON:stale MODEL-OBSERVATION:unknown exit then
-   MODEL-UNKNOWN--REASON:incomplete MODEL-OBSERVATION:unknown ;
+   k 0 = if s" h1" s" r1" FRESH-REMOTE MODEL-OBSERVATION:PRESENT exit then
+   k 1 = if s" h2" s" r1" FRESH-REMOTE MODEL-OBSERVATION:PRESENT exit then
+   k 2 = if s" h1" s" r2" FRESH-REMOTE MODEL-OBSERVATION:PRESENT exit then
+   k 3 = if MODEL-OBSERVATION:DIRECTORY exit then
+   k 4 = if MODEL-OBSERVATION:ABSENT exit then
+   k 5 = if MODEL-UNKNOWN--REASON:STALE MODEL-OBSERVATION:UNKNOWN exit then
+   MODEL-UNKNOWN--REASON:INCOMPLETE MODEL-OBSERVATION:UNKNOWN ;
 
 : REMOTE-OBSERVATIONS= ( n n -- bool )
    {: a:n b:n :}
@@ -345,59 +345,59 @@ TYPED-VARIABLE AR ^ARENA:arena
 
 : UNKNOWN-TEXT-CASE ( -- )
    s" UNKNOWN$" T-LABEL
-   MODEL-UNKNOWN--REASON:incomplete MODEL:UNKNOWN$
+   MODEL-UNKNOWN--REASON:INCOMPLETE MODEL:UNKNOWN$
    s" observation is incomplete" TEXT=
-   MODEL-UNKNOWN--REASON:inaccessible MODEL:UNKNOWN$
+   MODEL-UNKNOWN--REASON:INACCESSIBLE MODEL:UNKNOWN$
    s" path is inaccessible" TEXT=
-   MODEL-UNKNOWN--REASON:unavailable MODEL:UNKNOWN$
+   MODEL-UNKNOWN--REASON:UNAVAILABLE MODEL:UNKNOWN$
    s" source is unavailable" TEXT=
-   MODEL-UNKNOWN--REASON:stale MODEL:UNKNOWN$
+   MODEL-UNKNOWN--REASON:STALE MODEL:UNKNOWN$
    s" inventory is stale" TEXT=
-   MODEL-UNKNOWN--REASON:cursor-reset MODEL:UNKNOWN$
+   MODEL-UNKNOWN--REASON:CURSOR-RESET MODEL:UNKNOWN$
    s" remote cursor was reset" TEXT=
-   MODEL-UNKNOWN--REASON:unsupported MODEL:UNKNOWN$
+   MODEL-UNKNOWN--REASON:UNSUPPORTED MODEL:UNKNOWN$
    s" object is unsupported" TEXT= ;
 
 : DIRECTORY-TEXT-CASE ( -- )
-   MODEL-OPERATION:create-local-directory MODEL:OPERATION$
+   MODEL-OPERATION:CREATE-LOCAL-DIRECTORY MODEL:OPERATION$
    s" create local directory if still absent" TEXT=
-   MODEL-OPERATION:create-remote-directory MODEL:OPERATION$
+   MODEL-OPERATION:CREATE-REMOTE-DIRECTORY MODEL:OPERATION$
    s" create remote directory if still absent" TEXT=
-   MODEL-OPERATION:delete-local-directory MODEL:OPERATION$
+   MODEL-OPERATION:DELETE-LOCAL-DIRECTORY MODEL:OPERATION$
    s" delete empty local directory" TEXT=
-   MODEL-OPERATION:delete-remote-directory MODEL:OPERATION$
+   MODEL-OPERATION:DELETE-REMOTE-DIRECTORY MODEL:OPERATION$
    s" delete empty remote directory" TEXT= ;
 
 : FILE-TEXT-CASE ( -- )
-   s" h1" HASH MODEL-OPERATION:create-remote MODEL:OPERATION$
+   s" h1" HASH MODEL-OPERATION:CREATE-REMOTE MODEL:OPERATION$
    s" create remote file if still absent" TEXT=
-   R1 MODEL-OPERATION:install-local MODEL:OPERATION$
+   R1 MODEL-OPERATION:INSTALL-LOCAL MODEL:OPERATION$
    s" install remote content locally" TEXT=
-   s" h1" LOCAL MODEL-OPERATION:preserve-local MODEL:OPERATION$
+   s" h1" LOCAL MODEL-OPERATION:PRESERVE-LOCAL MODEL:OPERATION$
    s" preserve displaced local payload" TEXT=
-   R1 s" h0" HASH MODEL-OPERATION:replace-local MODEL:OPERATION$
+   R1 s" h0" HASH MODEL-OPERATION:REPLACE-LOCAL MODEL:OPERATION$
    s" replace local content" TEXT=
-   s" h0" HASH MODEL-OPERATION:delete-local MODEL:OPERATION$
+   s" h0" HASH MODEL-OPERATION:DELETE-LOCAL MODEL:OPERATION$
    s" delete local file" TEXT=
-   R1 MODEL-OPERATION:preserve-remote MODEL:OPERATION$
+   R1 MODEL-OPERATION:PRESERVE-REMOTE MODEL:OPERATION$
    s" preserve displaced remote payload" TEXT=
-   s" h1" HASH s" r1" REV MODEL-OPERATION:replace-remote MODEL:OPERATION$
+   s" h1" HASH s" r1" REV MODEL-OPERATION:REPLACE-REMOTE MODEL:OPERATION$
    s" replace remote content if the expected revision still matches"
    TEXT=
-   s" r1" REV MODEL-OPERATION:delete-remote MODEL:OPERATION$
+   s" r1" REV MODEL-OPERATION:DELETE-REMOTE MODEL:OPERATION$
    s" delete remote file if the expected revision still matches" TEXT= ;
 
 : CONFLICT-TEXT-CASE ( -- )
    s" CONFLICT$" T-LABEL
-   s" h1" LOCAL R1 MODEL-CONFLICT:initial MODEL:CONFLICT$
+   s" h1" LOCAL R1 MODEL-CONFLICT:INITIAL MODEL:CONFLICT$
    s" different local and remote payloads were introduced; preserve both payloads"
    TEXT=
-   s" h1" LOCAL R1 MODEL-CONFLICT:divergent MODEL:CONFLICT$
+   s" h1" LOCAL R1 MODEL-CONFLICT:DIVERGENT MODEL:CONFLICT$
    s" local and remote payloads diverged; preserve both payloads" TEXT=
-   R1 MODEL-CONFLICT:local-deleted MODEL:CONFLICT$
+   R1 MODEL-CONFLICT:LOCAL-DELETED MODEL:CONFLICT$
    s" local deletion conflicts with a remote edit; preserve the remote payload"
    TEXT=
-   s" h1" LOCAL MODEL-CONFLICT:remote-deleted MODEL:CONFLICT$
+   s" h1" LOCAL MODEL-CONFLICT:REMOTE-DELETED MODEL:CONFLICT$
    s" remote deletion conflicts with a local edit; preserve the local payload"
    TEXT= ;
 
@@ -441,21 +441,21 @@ TYPED-VARIABLE W JSON:writer
 
 : BASELINE-OF ( ^u8 n bool -- MODEL:baseline )
    {: v:^ vu:n e:bool :}
-   v vu s" Absent" STR= if MODEL-BASELINE:absent exit then
-   v vu s" Directory" STR= if MODEL-BASELINE:directory exit then
-   e REMOTE0 MODEL-BASELINE:present ;
+   v vu s" Absent" STR= if MODEL-BASELINE:ABSENT exit then
+   v vu s" Directory" STR= if MODEL-BASELINE:DIRECTORY exit then
+   e REMOTE0 MODEL-BASELINE:PRESENT ;
 
 : REASON-OF ( ^u8 n -- MODEL:unknown-reason )
    {: v:^ vu:n :}
-   v vu s" Incomplete" STR= if MODEL-UNKNOWN--REASON:incomplete exit then
+   v vu s" Incomplete" STR= if MODEL-UNKNOWN--REASON:INCOMPLETE exit then
    v vu s" Inaccessible" STR= if
-      MODEL-UNKNOWN--REASON:inaccessible exit then
+      MODEL-UNKNOWN--REASON:INACCESSIBLE exit then
    v vu s" Unavailable" STR= if
-      MODEL-UNKNOWN--REASON:unavailable exit then
-   v vu s" Stale" STR= if MODEL-UNKNOWN--REASON:stale exit then
+      MODEL-UNKNOWN--REASON:UNAVAILABLE exit then
+   v vu s" Stale" STR= if MODEL-UNKNOWN--REASON:STALE exit then
    v vu s" CursorReset" STR= if
-      MODEL-UNKNOWN--REASON:cursor-reset exit then
-   MODEL-UNKNOWN--REASON:unsupported ;
+      MODEL-UNKNOWN--REASON:CURSOR-RESET exit then
+   MODEL-UNKNOWN--REASON:UNSUPPORTED ;
 
 \ An Unknown observation's label names its reason after a period.
 : UNKNOWN-REASON-OF ( ^u8 n -- MODEL:unknown-reason )
@@ -464,57 +464,57 @@ TYPED-VARIABLE W JSON:writer
 
 : LOCAL-OBSERVATION-OF ( ^u8 n bool -- MODEL:observation<MODEL:local> )
    {: v:^ vu:n e:bool :}
-   v vu s" ConfirmedAbsent" STR= if MODEL-OBSERVATION:absent exit then
-   v vu s" Directory" STR= if MODEL-OBSERVATION:directory exit then
-   v vu s" Present" STR= if e LOCAL0 MODEL-OBSERVATION:present exit then
-   v vu UNKNOWN-REASON-OF MODEL-OBSERVATION:unknown ;
+   v vu s" ConfirmedAbsent" STR= if MODEL-OBSERVATION:ABSENT exit then
+   v vu s" Directory" STR= if MODEL-OBSERVATION:DIRECTORY exit then
+   v vu s" Present" STR= if e LOCAL0 MODEL-OBSERVATION:PRESENT exit then
+   v vu UNKNOWN-REASON-OF MODEL-OBSERVATION:UNKNOWN ;
 
 : REMOTE-OBSERVATION-OF ( ^u8 n bool -- MODEL:observation<MODEL:remote> )
    {: v:^ vu:n e:bool :}
-   v vu s" ConfirmedAbsent" STR= if MODEL-OBSERVATION:absent exit then
-   v vu s" Directory" STR= if MODEL-OBSERVATION:directory exit then
-   v vu s" Present" STR= if e REMOTE0 MODEL-OBSERVATION:present exit then
-   v vu UNKNOWN-REASON-OF MODEL-OBSERVATION:unknown ;
+   v vu s" ConfirmedAbsent" STR= if MODEL-OBSERVATION:ABSENT exit then
+   v vu s" Directory" STR= if MODEL-OBSERVATION:DIRECTORY exit then
+   v vu s" Present" STR= if e REMOTE0 MODEL-OBSERVATION:PRESENT exit then
+   v vu UNKNOWN-REASON-OF MODEL-OBSERVATION:UNKNOWN ;
 
 : DIRECTORY-OPERATION-OF ( ^u8 n -- MODEL:operation )
    {: v:^ vu:n :}
    v vu s" CreateLocalDirectory" STR= if
-      MODEL-OPERATION:create-local-directory exit then
+      MODEL-OPERATION:CREATE-LOCAL-DIRECTORY exit then
    v vu s" CreateRemoteDirectory" STR= if
-      MODEL-OPERATION:create-remote-directory exit then
+      MODEL-OPERATION:CREATE-REMOTE-DIRECTORY exit then
    v vu s" DeleteLocalDirectory" STR= if
-      MODEL-OPERATION:delete-local-directory exit then
-   MODEL-OPERATION:delete-remote-directory ;
+      MODEL-OPERATION:DELETE-LOCAL-DIRECTORY exit then
+   MODEL-OPERATION:DELETE-REMOTE-DIRECTORY ;
 
 : OPERATION-OF ( ^u8 n bool -- MODEL:operation )
    {: v:^ vu:n e:bool :}
    v vu s" CreateRemote" STR= if
-      e C0 MODEL-OPERATION:create-remote exit then
+      e C0 MODEL-OPERATION:CREATE-REMOTE exit then
    v vu s" InstallLocal" STR= if
-      e REMOTE0 MODEL-OPERATION:install-local exit then
+      e REMOTE0 MODEL-OPERATION:INSTALL-LOCAL exit then
    v vu s" PreserveLocal" STR= if
-      e LOCAL0 MODEL-OPERATION:preserve-local exit then
+      e LOCAL0 MODEL-OPERATION:PRESERVE-LOCAL exit then
    v vu s" ReplaceLocal" STR= if
-      e REMOTE1 e C0 MODEL-OPERATION:replace-local exit then
+      e REMOTE1 e C0 MODEL-OPERATION:REPLACE-LOCAL exit then
    v vu s" DeleteLocal" STR= if
-      e C0 MODEL-OPERATION:delete-local exit then
+      e C0 MODEL-OPERATION:DELETE-LOCAL exit then
    v vu s" PreserveRemote" STR= if
-      e REMOTE0 MODEL-OPERATION:preserve-remote exit then
+      e REMOTE0 MODEL-OPERATION:PRESERVE-REMOTE exit then
    v vu s" ReplaceRemote" STR= if
-      e C1 e V0 MODEL-OPERATION:replace-remote exit then
+      e C1 e V0 MODEL-OPERATION:REPLACE-REMOTE exit then
    v vu s" DeleteRemote" STR= if
-      e V0 MODEL-OPERATION:delete-remote exit then
+      e V0 MODEL-OPERATION:DELETE-REMOTE exit then
    v vu DIRECTORY-OPERATION-OF ;
 
 : CONFLICT-OF ( ^u8 n bool -- MODEL:conflict )
    {: v:^ vu:n e:bool :}
    v vu s" InitialCollision" STR= if
-      e LOCAL0 e REMOTE1 MODEL-CONFLICT:initial exit then
+      e LOCAL0 e REMOTE1 MODEL-CONFLICT:INITIAL exit then
    v vu s" DivergentEdits" STR= if
-      e LOCAL0 e REMOTE1 MODEL-CONFLICT:divergent exit then
+      e LOCAL0 e REMOTE1 MODEL-CONFLICT:DIVERGENT exit then
    v vu s" LocalDeletionRemoteEdit" STR= if
-      e REMOTE1 MODEL-CONFLICT:local-deleted exit then
-   e LOCAL0 MODEL-CONFLICT:remote-deleted ;
+      e REMOTE1 MODEL-CONFLICT:LOCAL-DELETED exit then
+   e LOCAL0 MODEL-CONFLICT:REMOTE-DELETED ;
 
 : TAG ( bool -- str )
    {: e:bool :} s" insufficient_space" e OR-ESC >str ;
@@ -522,18 +522,18 @@ TYPED-VARIABLE W JSON:writer
 : BLOCKAGE-OF ( ^u8 n bool -- MODEL:blockage )
    {: v:^ vu:n e:bool :}
    v vu s" UnsupportedFileSize" STR= if
-      MODEL-BLOCKAGE:unsupported-file-size exit then
+      MODEL-BLOCKAGE:UNSUPPORTED-FILE-SIZE exit then
    v vu s" RemoteRejected" STR= if
-      e TAG MODEL-BLOCKAGE:remote-rejected exit then
+      e TAG MODEL-BLOCKAGE:REMOTE-REJECTED exit then
    v vu s" DownloadUnavailable" STR= if
-      409 MODEL-BLOCKAGE:download-unavailable exit then
+      409 MODEL-BLOCKAGE:DOWNLOAD-UNAVAILABLE exit then
    v vu s" DownloadVerificationFailed" STR= if
-      MODEL-BLOCKAGE:download-verification-failed exit then
-   v vu s" StageOccupied" STR= if MODEL-BLOCKAGE:stage-occupied exit then
+      MODEL-BLOCKAGE:DOWNLOAD-VERIFICATION-FAILED exit then
+   v vu s" StageOccupied" STR= if MODEL-BLOCKAGE:STAGE-OCCUPIED exit then
    v vu s" LocalObjectInWay" STR= if
-      MODEL-BLOCKAGE:local-object-in-way exit then
-   v vu s" RemoteObject" STR= if MODEL-BLOCKAGE:remote-object exit then
-   MODEL-BLOCKAGE:conflict-copy-occupied ;
+      MODEL-BLOCKAGE:LOCAL-OBJECT-IN-WAY exit then
+   v vu s" RemoteObject" STR= if MODEL-BLOCKAGE:REMOTE-OBJECT exit then
+   MODEL-BLOCKAGE:CONFLICT-COPY-OCCUPIED ;
 
 : HASH-RECORD ( MODEL:fingerprint DROPBOX:hash -- MODEL:hash-record )
    {: f:MODEL:fingerprint c:DROPBOX:hash :}

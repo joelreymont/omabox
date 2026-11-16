@@ -298,7 +298,7 @@ variable REFUSALS
    12 TEST-DROPBOX:FILE!
    s" /docs/a.txt" MAIN @ DROPBOX:METADATA DONE? ASSERT
    MAIN @ DROPBOX:ENTRY {: e :}
-   e DROPBOX-ENTRY:KIND @ DROPBOX-KIND:file DROPBOX-KIND:EQ TTRUE
+   e DROPBOX-ENTRY:KIND @ DROPBOX-KIND:FILE DROPBOX-KIND:EQ TTRUE
    e DROPBOX-ENTRY:LOWER @ SPAN:$ s" /docs/a.txt" T$=
    e DROPBOX-ENTRY:DISPLAY @ SPAN:$ s" /Docs/A.txt" T$=
    e DROPBOX-ENTRY:REV @ SPAN:$ s" 015f0c1d2e3a" T$=
@@ -328,7 +328,7 @@ variable REFUSALS
 : MISSING-CASE ( -- )
    s" metadata not found" T-LABEL
    TEST-DROPBOX:RESET
-   s" /missing" MAIN @ DROPBOX:METADATA DROPBOX-ERROR:not-found REFUSED? ASSERT ;
+   s" /missing" MAIN @ DROPBOX:METADATA DROPBOX-ERROR:NOT-FOUND REFUSED? ASSERT ;
 
 
 : LOST-READ-CASE ( -- )
@@ -347,7 +347,7 @@ variable REFUSALS
    200 s" " s" " b bu TEST-DROPBOX:SCRIPT!
    s" /paper" MAIN @ DROPBOX:METADATA DONE? ASSERT
    MAIN @ DROPBOX:ENTRY {: e :}
-   e DROPBOX-ENTRY:KIND @ DROPBOX-KIND:file DROPBOX-KIND:EQ TTRUE
+   e DROPBOX-ENTRY:KIND @ DROPBOX-KIND:FILE DROPBOX-KIND:EQ TTRUE
    e DROPBOX-ENTRY:LOWER @ SPAN:$ s" /paper" T$=
    e DROPBOX-ENTRY:DOWNLOADABLE @ TFALSE ;
 
@@ -376,7 +376,7 @@ variable REFUSALS
    TEST-DROPBOX:SCRIPT!
    s" /incomplete.txt" MAIN @ DROPBOX:METADATA DONE? ASSERT
    MAIN @ DROPBOX:ENTRY {: e :}
-   e DROPBOX-ENTRY:KIND @ DROPBOX-KIND:file DROPBOX-KIND:EQ TTRUE
+   e DROPBOX-ENTRY:KIND @ DROPBOX-KIND:FILE DROPBOX-KIND:EQ TTRUE
    e DROPBOX:COMPLETE? TFALSE ;
 
 
@@ -387,7 +387,7 @@ variable REFUSALS
    S\" {\q.tag\q:\qfolder\q,\qname\q:\qb\q,\qid\q:\qid:b\q,\qpath_lower\q:\q/docs/b\q,\qpath_display\q:\q/Docs/b\q}"
    TEST-DROPBOX:SCRIPT!
    s" /docs/a" MAIN @ DROPBOX:METADATA
-   DROPBOX-ERROR:path-mismatch REFUSED? ASSERT
+   DROPBOX-ERROR:PATH-MISMATCH REFUSED? ASSERT
    TEST-DROPBOX:SEEN$ s" /2/files/get_metadata" T$= ;
 
 
@@ -707,14 +707,14 @@ TYPED-VARIABLE OWN ^DROPBOX:client
 
 : WRITE-TAGS-CASE ( -- )
    s" write refused by tag" T-LABEL
-   s" access_restricted" DROPBOX-ERROR:access-restricted WRITE-REFUSED
-   s" team_folder" DROPBOX-ERROR:team-folder WRITE-REFUSED
-   s" operation_suppressed" DROPBOX-ERROR:operation-suppressed WRITE-REFUSED ;
+   s" access_restricted" DROPBOX-ERROR:ACCESS-RESTRICTED WRITE-REFUSED
+   s" team_folder" DROPBOX-ERROR:TEAM-FOLDER WRITE-REFUSED
+   s" operation_suppressed" DROPBOX-ERROR:OPERATION-SUPPRESSED WRITE-REFUSED ;
 
 
 : METADATA-OTHER ( -- )
    s" /docs/a.txt" MAIN @ DROPBOX:METADATA
-   DROPBOX-ERROR:other REFUSED? OUTCOME ! ;
+   DROPBOX-ERROR:OTHER REFUSED? OUTCOME ! ;
 
 
 : UNKNOWN-TAG-CASE ( -- )
@@ -743,7 +743,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    s" path root refused" T-LABEL
    TEST-DROPBOX:RESET
    s" live-token" s" ns-wrong" OPENED {: off :}
-   off DROPBOX:ACCOUNT DROPBOX-ERROR:invalid-root REFUSED? ASSERT
+   off DROPBOX:ACCOUNT DROPBOX-ERROR:INVALID-ROOT REFUSED? ASSERT
    TEST-DROPBOX:SEEN$ s" /oauth2/token /2/users/get_current_account" T$=
    off DROPBOX:CLOSE ;
 
@@ -863,7 +863,7 @@ variable GOT-U
    s" r1" true TEST-DROPBOX:PAGE!
    TEST-DROPBOX:PAGE-RESET!
    s" /sync" MAIN @ [: SAW ;] DROPBOX:LIST
-   DROPBOX-ERROR:reset REFUSED? ASSERT
+   DROPBOX-ERROR:RESET REFUSED? ASSERT
    MAIN @ DROPBOX:CURSOR s" r0" T$=
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/list_folder/continue" T$= ;
 
@@ -990,7 +990,7 @@ variable GOT-U
    409 s" " s" "
    S\" {\qerror_summary\q:\qreset/\q,\qerror\q:{\q.tag\q:\qreset\q}}"
    TEST-DROPBOX:SCRIPT!
-   s" c3" 30 MAIN @ DROPBOX:WAIT DROPBOX-ERROR:reset REFUSED? ASSERT
+   s" c3" 30 MAIN @ DROPBOX:WAIT DROPBOX-ERROR:RESET REFUSED? ASSERT
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder/longpoll" T$= ;
 
 
@@ -1080,7 +1080,7 @@ variable READ-COUNT
    MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:SIZE @ 26 T= ;
 
 
-: UNVERIFIED? ( DROPBOX:reply -- bool ) DROPBOX-ERROR:unverified REFUSED? ;
+: UNVERIFIED? ( DROPBOX:reply -- bool ) DROPBOX-ERROR:UNVERIFIED REFUSED? ;
 
 
 \ The main client still answers a call after a download.
@@ -1159,7 +1159,7 @@ variable READ-COUNT
    TEST-DROPBOX:RESET ALPHABET
    SUNK-CLEAR
    s" 0160ffffffff" 0 MAIN @ [: SUNK-BODY ;] DROPBOX:DOWNLOAD
-   DROPBOX-ERROR:not-found REFUSED? ASSERT
+   DROPBOX-ERROR:NOT-FOUND REFUSED? ASSERT
    BODIES @ 0 T= ;
 
 
@@ -1430,20 +1430,20 @@ variable READ-COUNT
    TEST-DROPBOX:RESET
    s" /del.txt" s" rev-del" DELETED-FILE
    s" /del.txt" s" rev-other" MAIN @ DROPBOX:DELETE
-   DROPBOX-ERROR:conflict REFUSED? ASSERT
+   DROPBOX-ERROR:CONFLICT REFUSED? ASSERT
    s" /del.txt" s" rev-del" MAIN @ DROPBOX:DELETE DONE? ASSERT
-   DROPBOX-KIND:file KIND? TTRUE
+   DROPBOX-KIND:FILE KIND? TTRUE
    LOWER$ s" /del.txt" T$=
    MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:REV @ SPAN:$ s" rev-del" T$=
    s" /del.txt" MAIN @ DROPBOX:METADATA
-   DROPBOX-ERROR:not-found REFUSED? ASSERT ;
+   DROPBOX-ERROR:NOT-FOUND REFUSED? ASSERT ;
 
 
 : DELETE-MISSING-CASE ( -- )
    s" delete not found" T-LABEL
    TEST-DROPBOX:RESET
    s" /absent" s" " MAIN @ DROPBOX:DELETE DONE? ASSERT
-   DROPBOX-KIND:deleted KIND? TTRUE
+   DROPBOX-KIND:DELETED KIND? TTRUE
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2" T$= ;
 
 
@@ -1453,7 +1453,7 @@ variable READ-COUNT
    TEST-DROPBOX:RESET
    DELETE-CONFLICT!
    s" /gone.txt" s" rev-gone" MAIN @ DROPBOX:DELETE DONE? ASSERT
-   DROPBOX-KIND:deleted KIND? TTRUE
+   DROPBOX-KIND:DELETED KIND? TTRUE
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
 
 
@@ -1463,7 +1463,7 @@ variable READ-COUNT
    s" /lost.txt" s" rev-lost" DELETED-FILE
    TEST-DROPBOX:LOSE
    s" /lost.txt" s" " MAIN @ DROPBOX:DELETE DONE? ASSERT
-   DROPBOX-KIND:deleted KIND? TTRUE
+   DROPBOX-KIND:DELETED KIND? TTRUE
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
 
 
@@ -1487,7 +1487,7 @@ variable READ-COUNT
    S\" {\qmetadata\q:{\q.tag\q:\qfile\q,\qpath_lower\q:\q/\xc3\x84.txt\q,\qpath_display\q:\q/\xc3\x84.txt\q,\qrev\q:\qrev-a\q,\qsize\q:0,\qcontent_hash\q:\qe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\q}}"
    TEST-DROPBOX:SCRIPT!
    S\" /\xc3\x84.txt" s" rev-a" MAIN @ DROPBOX:DELETE
-   DROPBOX-ERROR:path-mismatch REFUSED? ASSERT
+   DROPBOX-ERROR:PATH-MISMATCH REFUSED? ASSERT
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
 
 
@@ -1498,7 +1498,7 @@ variable READ-COUNT
    TEST-DROPBOX:RESET
    S\" /\xc3\x84.txt" s" rev-a" DELETED-FILE
    S\" /\xc3\x84.txt" s" rev-b" MAIN @ DROPBOX:DELETE
-   DROPBOX-ERROR:path-mismatch REFUSED? ASSERT
+   DROPBOX-ERROR:PATH-MISMATCH REFUSED? ASSERT
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
 
 
@@ -1523,7 +1523,7 @@ variable READ-COUNT
    S\" {\qmetadata\q:{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/dir\q,\qpath_display\q:\q/dir\q}}"
    TEST-DROPBOX:SCRIPT!
    s" /dir" s" rev-dir" MAIN @ DROPBOX:DELETE DONE? ASSERT
-   DROPBOX-KIND:deleted KIND? TTRUE
+   DROPBOX-KIND:DELETED KIND? TTRUE
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
 
 
@@ -1576,14 +1576,14 @@ variable READ-COUNT
    s" create-folder conflict" T-LABEL
    TEST-DROPBOX:RESET
    s" /made" MAIN @ DROPBOX:CREATE-FOLDER DONE? ASSERT
-   DROPBOX-KIND:folder KIND? TTRUE
+   DROPBOX-KIND:FOLDER KIND? TTRUE
    LOWER$ s" /made" T$=
    TEST-DROPBOX:TYPE-SENT$ s" application/json" T$=
    s" /made" MAIN @ DROPBOX:CREATE-FOLDER DONE? ASSERT
-   DROPBOX-KIND:folder KIND? TTRUE
+   DROPBOX-KIND:FOLDER KIND? TTRUE
    s" /taken" s" rev-taken" DELETED-FILE
    s" /taken" MAIN @ DROPBOX:CREATE-FOLDER
-   DROPBOX-ERROR:conflict REFUSED? ASSERT
+   DROPBOX-ERROR:CONFLICT REFUSED? ASSERT
    TEST-DROPBOX:SEEN$
    s" /2/files/create_folder_v2 /2/files/create_folder_v2 /2/files/get_metadata /2/files/create_folder_v2 /2/files/get_metadata"
    T$= ;
@@ -1606,7 +1606,7 @@ variable READ-COUNT
    TEST-DROPBOX:RESET
    TEST-DROPBOX:LOSE
    s" /lost-made" MAIN @ DROPBOX:CREATE-FOLDER DONE? ASSERT
-   DROPBOX-KIND:folder KIND? TTRUE
+   DROPBOX-KIND:FOLDER KIND? TTRUE
    LOWER$ s" /lost-made" T$=
    TEST-DROPBOX:SEEN$
    s" /2/files/create_folder_v2 /2/files/get_metadata" T$= ;
@@ -1618,7 +1618,7 @@ variable READ-COUNT
    s" create-folder answered at another path" T-LABEL
    TEST-DROPBOX:RESET
    S\" /\xc3\x84" MAIN @ DROPBOX:CREATE-FOLDER
-   DROPBOX-ERROR:path-mismatch REFUSED? ASSERT
+   DROPBOX-ERROR:PATH-MISMATCH REFUSED? ASSERT
    TEST-DROPBOX:SEEN$
    s" /2/files/create_folder_v2 /2/files/get_metadata" T$= ;
 
@@ -1630,7 +1630,7 @@ variable READ-COUNT
    TEST-DROPBOX:RESET
    S\" /\xc3\x84" s" rev-a" DELETED-FILE
    S\" /\xc3\x84" MAIN @ DROPBOX:CREATE-FOLDER
-   DROPBOX-ERROR:path-mismatch REFUSED? ASSERT
+   DROPBOX-ERROR:PATH-MISMATCH REFUSED? ASSERT
    TEST-DROPBOX:SEEN$
    s" /2/files/create_folder_v2 /2/files/get_metadata" T$= ;
 
@@ -1925,7 +1925,7 @@ TYPED-VARIABLE FAULT fault
    s" 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
    5 TEST-DROPBOX:FILE!
    s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" 0160b" STAGED
-   SEND DROPBOX-ERROR:conflict REFUSED? ASSERT
+   SEND DROPBOX-ERROR:CONFLICT REFUSED? ASSERT
    TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
    SB-RESET S\" {\qpath\q:\q/Docs/Up.txt\q,\qmode\q:" SB-APPEND
    S\" {\q.tag\q:\qupdate\q,\qupdate\q:\q0160b\q}," SB-APPEND
@@ -1969,7 +1969,7 @@ TYPED-VARIABLE FAULT fault
    s" committed path of another case" T-LABEL
    TEST-DROPBOX:RESET -1 FAULT-AT !
    s" cafe.txt" STAGE! s" hello cafe" S\" /Docs/CAF\xc3\x89.txt" s" " STAGED
-   SEND DROPBOX-ERROR:path-mismatch REFUSED? ASSERT
+   SEND DROPBOX-ERROR:PATH-MISMATCH REFUSED? ASSERT
    TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
    UNSTAGED ;
 
@@ -2248,7 +2248,7 @@ TYPED-VARIABLE FAULT fault
    s" 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
    SPAN:MAKE UP DROPBOX-UPLOAD:CONTENT-HASH !
    -1 construct fault cut 1 STRUCK
-   DROPBOX-ERROR:content-hash-mismatch REFUSED? ASSERT
+   DROPBOX-ERROR:CONTENT-HASH-MISMATCH REFUSED? ASSERT
    ENTRY-HASH$ EXPECTED$ T$=
    SB-RESET S-START S-APPEND S-APPEND S-FINISH
    TEST-DROPBOX:SEEN$ SB$ T$=
@@ -2261,7 +2261,7 @@ TYPED-VARIABLE FAULT fault
    s" finish answered at another path" T-LABEL
    S\" /\xc3\x89.bin" SPAN:MAKE UP DROPBOX-UPLOAD:PATH !
    -1 construct fault cut 1 STRUCK
-   DROPBOX-ERROR:path-mismatch REFUSED? ASSERT
+   DROPBOX-ERROR:PATH-MISMATCH REFUSED? ASSERT
    SB-RESET S-START S-APPEND S-APPEND S-FINISH
    s"  /2/files/get_metadata" SB-APPEND
    TEST-DROPBOX:SEEN$ SB$ T$=

@@ -27,30 +27,30 @@ private
    MODEL-REMOTE:UNMAKE {: c:DROPBOX:hash r:DROPBOX:rev :} r ;
 
 : BLOCKED ( -- decision )
-   MODEL-BLOCKED--REASON:unknown MODEL-DECISION:blocked ;
+   MODEL-BLOCKED--REASON:UNKNOWN MODEL-DECISION:BLOCKED ;
 
 : BOTH-ABSENT ( -- decision )
-   MODEL-BASELINE:absent MODEL-DECISION:noop ;
+   MODEL-BASELINE:ABSENT MODEL-DECISION:NOOP ;
 
 : DIRECTORIES ( -- decision )
-   MODEL-BASELINE:directory MODEL-DECISION:noop ;
+   MODEL-BASELINE:DIRECTORY MODEL-DECISION:NOOP ;
 
 \ Both sides hold this file now.
 : AGREED ( remote -- decision )
-   MODEL-BASELINE:present MODEL-DECISION:noop ;
+   MODEL-BASELINE:PRESENT MODEL-DECISION:NOOP ;
 
 : LOCAL-FILE ( local -- decision )
-   MODEL-COLLISION:local-file MODEL-DECISION:collided ;
+   MODEL-COLLISION:LOCAL-FILE MODEL-DECISION:COLLIDED ;
 
 : LOCAL-DIRECTORY ( remote -- decision )
-   MODEL-COLLISION:local-dir MODEL-DECISION:collided ;
+   MODEL-COLLISION:LOCAL-DIR MODEL-DECISION:COLLIDED ;
 
 : CREATE-REMOTE ( local -- decision )
-   LOCAL-CONTENT MODEL-OPERATION:create-remote
-   MODEL-DECISION:operate ;
+   LOCAL-CONTENT MODEL-OPERATION:CREATE-REMOTE
+   MODEL-DECISION:OPERATE ;
 
 : INSTALL ( remote -- decision )
-   MODEL-OPERATION:install-local MODEL-DECISION:operate ;
+   MODEL-OPERATION:INSTALL-LOCAL MODEL-DECISION:OPERATE ;
 
 \ Both sides hold a file and the baseline none: equal contents agree,
 \ and neither side's file may replace the other's.
@@ -58,7 +58,7 @@ private
    {: l r :}
    l LOCAL-CONTENT r REMOTE-CONTENT DROPBOX:HASH=
    if r AGREED exit then
-   l r MODEL-CONFLICT:initial MODEL-DECISION:conflicted ;
+   l r MODEL-CONFLICT:INITIAL MODEL-DECISION:CONFLICTED ;
 
 \ A local file where the baseline holds none, absent or a directory.
 : NEW-FILE ( local observation<remote> -- decision )
@@ -75,8 +75,8 @@ private
    MATCH observation
       present OF LOCAL-DIRECTORY ENDOF
       directory OF DIRECTORIES ENDOF
-      absent OF MODEL-OPERATION:create-remote-directory
-         MODEL-DECISION:operate ENDOF
+      absent OF MODEL-OPERATION:CREATE-REMOTE-DIRECTORY
+         MODEL-DECISION:OPERATE ENDOF
       unknown OF drop BLOCKED ENDOF
    ;MATCH ;
 
@@ -85,8 +85,8 @@ private
    MATCH observation
       present OF LOCAL-DIRECTORY ENDOF
       directory OF DIRECTORIES ENDOF
-      absent OF MODEL-OPERATION:delete-local-directory
-         MODEL-DECISION:operate ENDOF
+      absent OF MODEL-OPERATION:DELETE-LOCAL-DIRECTORY
+         MODEL-DECISION:OPERATE ENDOF
       unknown OF drop BLOCKED ENDOF
    ;MATCH ;
 
@@ -94,10 +94,10 @@ private
 \ one follows a local deletion.
 : DELETE-FOLDER ( subtree -- decision )
    MATCH subtree
-      empty OF MODEL-OPERATION:delete-remote-directory
-         MODEL-DECISION:operate ENDOF
-      occupied OF MODEL-BLOCKED--REASON:occupied
-         MODEL-DECISION:blocked ENDOF
+      empty OF MODEL-OPERATION:DELETE-REMOTE-DIRECTORY
+         MODEL-DECISION:OPERATE ENDOF
+      occupied OF MODEL-BLOCKED--REASON:OCCUPIED
+         MODEL-DECISION:BLOCKED ENDOF
    ;MATCH ;
 
 \ The baseline's directory, deleted locally.
@@ -114,8 +114,8 @@ private
 : STILL-ABSENT ( observation<remote> -- decision )
    MATCH observation
       present OF INSTALL ENDOF
-      directory OF MODEL-OPERATION:create-local-directory
-         MODEL-DECISION:operate ENDOF
+      directory OF MODEL-OPERATION:CREATE-LOCAL-DIRECTORY
+         MODEL-DECISION:OPERATE ENDOF
       absent OF BOTH-ABSENT ENDOF
       unknown OF drop BLOCKED ENDOF
    ;MATCH ;
@@ -130,13 +130,13 @@ private
    b REMOTE-CONTENT {: bc:DROPBOX:hash :}
    lc fc DROPBOX:HASH= if f AGREED exit then
    lc bc DROPBOX:HASH= 0= fc bc DROPBOX:HASH= and if
-      lc f REMOTE-REV MODEL-OPERATION:replace-remote
-      MODEL-DECISION:operate exit
+      lc f REMOTE-REV MODEL-OPERATION:REPLACE-REMOTE
+      MODEL-DECISION:OPERATE exit
    then
    lc bc DROPBOX:HASH= fc bc DROPBOX:HASH= 0= and if
-      f lc MODEL-OPERATION:replace-local MODEL-DECISION:operate exit
+      f lc MODEL-OPERATION:REPLACE-LOCAL MODEL-DECISION:OPERATE exit
    then
-   l f MODEL-CONFLICT:divergent MODEL-DECISION:conflicted ;
+   l f MODEL-CONFLICT:DIVERGENT MODEL-DECISION:CONFLICTED ;
 
 \ Dropbox deleted the baseline's file (first): the local copy follows
 \ only when it kept the baseline's content.
@@ -144,19 +144,19 @@ private
    {: b l :}
    l LOCAL-CONTENT {: lc:DROPBOX:hash :}
    lc b REMOTE-CONTENT DROPBOX:HASH= if
-      lc MODEL-OPERATION:delete-local MODEL-DECISION:operate exit
+      lc MODEL-OPERATION:DELETE-LOCAL MODEL-DECISION:OPERATE exit
    then
-   l MODEL-CONFLICT:remote-deleted MODEL-DECISION:conflicted ;
+   l MODEL-CONFLICT:REMOTE-DELETED MODEL-DECISION:CONFLICTED ;
 
 \ The baseline's file (first) deleted locally: Dropbox's follows only
 \ when it kept the baseline's content.
 : LOCAL-DELETED ( remote remote -- decision )
    {: b f :}
    f REMOTE-CONTENT b REMOTE-CONTENT DROPBOX:HASH= if
-      f REMOTE-REV MODEL-OPERATION:delete-remote
-      MODEL-DECISION:operate exit
+      f REMOTE-REV MODEL-OPERATION:DELETE-REMOTE
+      MODEL-DECISION:OPERATE exit
    then
-   f MODEL-CONFLICT:local-deleted MODEL-DECISION:conflicted ;
+   f MODEL-CONFLICT:LOCAL-DELETED MODEL-DECISION:CONFLICTED ;
 
 \ The baseline's file (first) and the local one.
 : KEPT-FILE ( remote local observation<remote> -- decision )
@@ -173,8 +173,8 @@ private
    {: b r :}
    r MATCH observation
       present OF {: f :} b f LOCAL-DELETED ENDOF
-      directory OF MODEL-OPERATION:create-local-directory
-         MODEL-DECISION:operate ENDOF
+      directory OF MODEL-OPERATION:CREATE-LOCAL-DIRECTORY
+         MODEL-DECISION:OPERATE ENDOF
       absent OF BOTH-ABSENT ENDOF
       unknown OF drop BLOCKED ENDOF
    ;MATCH ;

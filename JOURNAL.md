@@ -998,3 +998,25 @@ one package. Each was renamed at the merge (FETCH-SAMPLE,
 NO-UPLOAD-STAGE, BLOCK-OF). Rust scopes a private function to its
 module. Habu scopes one to its package, and REPLAY's package is 2,100
 lines long.
+
+## 2026-11-16: One example outweighed the rule
+
+The user asked why a line read `DROPBOX-ERROR:reset`. Habu's guide
+says that generated words are uppercase, and the engine itself spells
+a variant's constructor `PKG-FAMILY:MEMBER`. But the guide's only
+worked example spelled one `TCP4-READ--RESULT:data`. Every agent
+copied the example instead of the rule. Omabox had 353 lowercase
+constructors on master and more in every open commit; Habu's own
+library had 478. Nothing flagged them: Habu folds case when it looks a
+word up, so both spellings compile. Rust's compiler warns on a
+lowercase type or variant name, so the rule enforces itself there.
+
+The fix was a rule stated once in the guide, the example corrected,
+and a script. The script uppercases a `PREFIX:tail` whose prefix is a
+declared family's constructor namespace and not a package. A package
+prefix such as `DROPBOX:reply` is a type and stays lowercase, as do
+locals and stack effects. jj made the 41 unlanded commits cheap to
+fix: each was rebased onto the swept master, and its tree was set to
+the script's output on its original tree. That took 11 seconds, with
+no conflicts beyond one JOURNAL merge, and the open lines of work
+never noticed.

@@ -38,8 +38,8 @@ TYPED-VARIABLE W JSON:writer
    h hu p next + u next - 0 max ;
 
 : SUBTREE ( ^u8 n -- subtree )
-   2dup s\" \"Empty\"" STR= if 2drop MODEL-SUBTREE:empty exit then
-   s\" \"Occupied\"" T$= MODEL-SUBTREE:occupied ;
+   2dup s\" \"Empty\"" STR= if 2drop MODEL-SUBTREE:EMPTY exit then
+   s\" \"Occupied\"" T$= MODEL-SUBTREE:OCCUPIED ;
 
 \ The four inputs from a line's columns, then the columns after them.
 : INPUTS ( ^u8 n -- baseline observation<local>

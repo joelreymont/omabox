@@ -675,12 +675,12 @@ private
 
 : >REASON ( n -- unknown-reason )
    case
-      0 of MODEL-UNKNOWN--REASON:incomplete endof
-      1 of MODEL-UNKNOWN--REASON:inaccessible endof
-      2 of MODEL-UNKNOWN--REASON:unavailable endof
-      3 of MODEL-UNKNOWN--REASON:stale endof
-      4 of MODEL-UNKNOWN--REASON:cursor-reset endof
-      MODEL-UNKNOWN--REASON:unsupported swap
+      0 of MODEL-UNKNOWN--REASON:INCOMPLETE endof
+      1 of MODEL-UNKNOWN--REASON:INACCESSIBLE endof
+      2 of MODEL-UNKNOWN--REASON:UNAVAILABLE endof
+      3 of MODEL-UNKNOWN--REASON:STALE endof
+      4 of MODEL-UNKNOWN--REASON:CURSOR-RESET endof
+      MODEL-UNKNOWN--REASON:UNSUPPORTED swap
    endcase ;
 
 \ The next member's key, after a comma unless it is the first.
@@ -985,10 +985,10 @@ ARENA CURSORS JSON:cursor
 : READ-BASELINE ( ^u8 n reading -- baseline )
    {: r:reading :}
    [: BASELINE-NAME ;] r TAGGED {: i:n p:^ pu:n :}
-   i 1 = if p pu r READ-REMOTE MODEL-BASELINE:present exit then
+   i 1 = if p pu r READ-REMOTE MODEL-BASELINE:PRESENT exit then
    p pu UNIT
-   i 0 = if MODEL-BASELINE:absent exit then
-   MODEL-BASELINE:directory ;
+   i 0 = if MODEL-BASELINE:ABSENT exit then
+   MODEL-BASELINE:DIRECTORY ;
 
 : READ-REASON ( ^u8 n reading -- unknown-reason )
    {: r:reading :}
@@ -998,49 +998,49 @@ ARENA CURSORS JSON:cursor
 : READ-LOCAL-OBSERVATION ( ^u8 n reading -- observation<local> )
    {: r:reading :}
    [: OBSERVATION-NAME ;] r TAGGED {: i:n p:^ pu:n :}
-   i 0 = if p pu r READ-LOCAL MODEL-OBSERVATION:present exit then
-   i 3 = if p pu r READ-REASON MODEL-OBSERVATION:unknown exit then
+   i 0 = if p pu r READ-LOCAL MODEL-OBSERVATION:PRESENT exit then
+   i 3 = if p pu r READ-REASON MODEL-OBSERVATION:UNKNOWN exit then
    p pu UNIT
-   i 1 = if MODEL-OBSERVATION:directory exit then
-   MODEL-OBSERVATION:absent ;
+   i 1 = if MODEL-OBSERVATION:DIRECTORY exit then
+   MODEL-OBSERVATION:ABSENT ;
 
 : READ-REMOTE-OBSERVATION ( ^u8 n reading -- observation<remote> )
    {: r:reading :}
    [: OBSERVATION-NAME ;] r TAGGED {: i:n p:^ pu:n :}
-   i 0 = if p pu r READ-REMOTE MODEL-OBSERVATION:present exit then
-   i 3 = if p pu r READ-REASON MODEL-OBSERVATION:unknown exit then
+   i 0 = if p pu r READ-REMOTE MODEL-OBSERVATION:PRESENT exit then
+   i 3 = if p pu r READ-REASON MODEL-OBSERVATION:UNKNOWN exit then
    p pu UNIT
-   i 1 = if MODEL-OBSERVATION:directory exit then
-   MODEL-OBSERVATION:absent ;
+   i 1 = if MODEL-OBSERVATION:DIRECTORY exit then
+   MODEL-OBSERVATION:ABSENT ;
 
 : DIRECTORY-OPERATION ( n -- operation )
    case
-      0 of MODEL-OPERATION:create-local-directory endof
-      1 of MODEL-OPERATION:create-remote-directory endof
-      2 of MODEL-OPERATION:delete-local-directory endof
-      MODEL-OPERATION:delete-remote-directory swap
+      0 of MODEL-OPERATION:CREATE-LOCAL-DIRECTORY endof
+      1 of MODEL-OPERATION:CREATE-REMOTE-DIRECTORY endof
+      2 of MODEL-OPERATION:DELETE-LOCAL-DIRECTORY endof
+      MODEL-OPERATION:DELETE-REMOTE-DIRECTORY swap
    endcase ;
 
 \ An operation on a file, variant index 4 on, from its payload's text.
 : FILE-OPERATION ( ^u8 n n reading -- operation )
    {: t:^ u:n i:n r:reading :}
    i 4 = if t u s" content" r HASH-AT
-      MODEL-OPERATION:create-remote exit then
+      MODEL-OPERATION:CREATE-REMOTE exit then
    i 5 = if t u s" source" r REMOTE-AT
-      MODEL-OPERATION:install-local exit then
+      MODEL-OPERATION:INSTALL-LOCAL exit then
    i 6 = if t u s" file" r LOCAL-AT
-      MODEL-OPERATION:preserve-local exit then
+      MODEL-OPERATION:PRESERVE-LOCAL exit then
    i 7 = if t u s" source" r REMOTE-AT
       t u s" expected_content" r HASH-AT
-      MODEL-OPERATION:replace-local exit then
+      MODEL-OPERATION:REPLACE-LOCAL exit then
    i 8 = if t u s" expected_content" r HASH-AT
-      MODEL-OPERATION:delete-local exit then
+      MODEL-OPERATION:DELETE-LOCAL exit then
    i 9 = if t u s" file" r REMOTE-AT
-      MODEL-OPERATION:preserve-remote exit then
+      MODEL-OPERATION:PRESERVE-REMOTE exit then
    i 10 = if t u s" content" r HASH-AT
       t u s" expected_revision" r REV-AT
-      MODEL-OPERATION:replace-remote exit then
-   t u s" expected_revision" r REV-AT MODEL-OPERATION:delete-remote ;
+      MODEL-OPERATION:REPLACE-REMOTE exit then
+   t u s" expected_revision" r REV-AT MODEL-OPERATION:DELETE-REMOTE ;
 
 : READ-OPERATION ( ^u8 n reading -- operation )
    {: r:reading :}
@@ -1052,12 +1052,12 @@ ARENA CURSORS JSON:cursor
    {: r:reading :}
    [: CONFLICT-NAME ;] r TAGGED {: i:n p:^ pu:n :}
    i 2 = if p pu s" remote" r REMOTE-AT
-      MODEL-CONFLICT:local-deleted exit then
+      MODEL-CONFLICT:LOCAL-DELETED exit then
    i 3 = if p pu s" local" r LOCAL-AT
-      MODEL-CONFLICT:remote-deleted exit then
+      MODEL-CONFLICT:REMOTE-DELETED exit then
    p pu s" local" r LOCAL-AT p pu s" remote" r REMOTE-AT
-   i 0 = if MODEL-CONFLICT:initial exit then
-   MODEL-CONFLICT:divergent ;
+   i 0 = if MODEL-CONFLICT:INITIAL exit then
+   MODEL-CONFLICT:DIVERGENT ;
 
 : U64-AT ( ^u8 n ^u8 n reading -- n )
    {: r:reading :} r MEMBER r READ-U64 ;
@@ -1082,21 +1082,21 @@ ARENA CURSORS JSON:cursor
 
 : UNIT-BLOCKAGE ( n -- blockage )
    case
-      0 of MODEL-BLOCKAGE:unsupported-file-size endof
-      3 of MODEL-BLOCKAGE:download-verification-failed endof
-      4 of MODEL-BLOCKAGE:stage-occupied endof
-      5 of MODEL-BLOCKAGE:local-object-in-way endof
-      6 of MODEL-BLOCKAGE:remote-object endof
-      MODEL-BLOCKAGE:conflict-copy-occupied swap
+      0 of MODEL-BLOCKAGE:UNSUPPORTED-FILE-SIZE endof
+      3 of MODEL-BLOCKAGE:DOWNLOAD-VERIFICATION-FAILED endof
+      4 of MODEL-BLOCKAGE:STAGE-OCCUPIED endof
+      5 of MODEL-BLOCKAGE:LOCAL-OBJECT-IN-WAY endof
+      6 of MODEL-BLOCKAGE:REMOTE-OBJECT endof
+      MODEL-BLOCKAGE:CONFLICT-COPY-OCCUPIED swap
    endcase ;
 
 : READ-BLOCKAGE ( ^u8 n reading -- blockage )
    {: r:reading :}
    [: BLOCKAGE-NAME ;] r TAGGED {: i:n p:^ pu:n :}
    i 1 = if p pu s" tag" r MEMBER r READ-STRING
-      MODEL-BLOCKAGE:remote-rejected exit then
+      MODEL-BLOCKAGE:REMOTE-REJECTED exit then
    i 2 = if p pu s" status" r MEMBER r READ-U16
-      MODEL-BLOCKAGE:download-unavailable exit then
+      MODEL-BLOCKAGE:DOWNLOAD-UNAVAILABLE exit then
    p pu UNIT i UNIT-BLOCKAGE ;
 
 \ A JSON read code means the stored text is not this version's value.
@@ -1162,34 +1162,34 @@ public
 
 : JSON>BASELINE ( str ^ARENA:arena -- baseline )
    {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
-   MODEL-BASELINE:absent r
+   MODEL-BASELINE:ABSENT r
    [: DROP-BASELINE s str> r READ-BASELINE ;] GUARDED ;
 
 : JSON>UNKNOWN-REASON ( str ^ARENA:arena -- unknown-reason )
    {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
-   MODEL-UNKNOWN--REASON:stale r
+   MODEL-UNKNOWN--REASON:STALE r
    [: DROP-REASON s str> r READ-REASON ;] GUARDED ;
 
 : JSON>LOCAL-OBSERVATION ( str ^ARENA:arena -- observation<local> )
    {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
-   MODEL-OBSERVATION:directory r
+   MODEL-OBSERVATION:DIRECTORY r
    [: DROP-LOCAL-OBSERVATION s str> r READ-LOCAL-OBSERVATION ;]
    GUARDED ;
 
 : JSON>REMOTE-OBSERVATION ( str ^ARENA:arena -- observation<remote> )
    {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
-   MODEL-OBSERVATION:directory r
+   MODEL-OBSERVATION:DIRECTORY r
    [: DROP-REMOTE-OBSERVATION s str> r READ-REMOTE-OBSERVATION ;]
    GUARDED ;
 
 : JSON>OPERATION ( str ^ARENA:arena -- operation )
    {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
-   MODEL-OPERATION:create-local-directory r
+   MODEL-OPERATION:CREATE-LOCAL-DIRECTORY r
    [: DROP-OPERATION s str> r READ-OPERATION ;] GUARDED ;
 
 : JSON>CONFLICT ( str ^ARENA:arena -- conflict )
    {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
-   NO-LOCAL MODEL-CONFLICT:remote-deleted r
+   NO-LOCAL MODEL-CONFLICT:REMOTE-DELETED r
    [: DROP-CONFLICT s str> r READ-CONFLICT ;] GUARDED ;
 
 : JSON>FINGERPRINT ( str ^ARENA:arena -- fingerprint )
@@ -1205,7 +1205,7 @@ public
 
 : JSON>BLOCKAGE ( str ^ARENA:arena -- blockage )
    {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
-   MODEL-BLOCKAGE:stage-occupied r
+   MODEL-BLOCKAGE:STAGE-OCCUPIED r
    [: DROP-BLOCKAGE s str> r READ-BLOCKAGE ;] GUARDED ;
 
 ;package

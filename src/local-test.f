@@ -1022,7 +1022,7 @@ variable CAUGHT
    en JOBS VEC:COUNT 0 T=
    en RETAIN-NESTED
    en DROP-NESTED
-   en s" nested" >str MODEL-UNKNOWN--REASON:incomplete UNKNOWN
+   en s" nested" >str MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN
    ps [: STABLE ;] FINISH-SCAN-AT {: s:complete-scan :}
    s s" nested" INCOMPLETE SEEN
    s s" nested/kept.txt" MISSING SEEN
@@ -1046,7 +1046,7 @@ variable CAUGHT
    s" sub/fresh.txt" >str 2 5 3 0 3 0 MODEL-FINGERPRINT:MAKE HASH-JOB-MAKE
    j VEC:PUSH !
    en mk TRUNCATE
-   en s" sub" >str MODEL-UNKNOWN--REASON:incomplete UNKNOWN
+   en s" sub" >str MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN
    cf VEC:COUNT 1 T=
    cf 0 VEC:AT RECORD-PATH@ s" before.txt" T$=
    r VEC:COUNT 1 T=
@@ -2863,7 +2863,7 @@ variable ENTRIES
    s" displaced" TARGET RACED AR @ LOCAL:INTERNAL-NAME ;
 
 : RACED-COPY ( -- ^u8 n )
-   TARGET LOCAL-CONFLICT--SIDE:local RACED AR @ LOCAL:CONFLICT-NAME ;
+   TARGET LOCAL-CONFLICT--SIDE:LOCAL RACED AR @ LOCAL:CONFLICT-NAME ;
 
 \ The guard holds "raced bytes" and target.txt an edit raced in.
 : GUARD-RACE ( -- )
@@ -2967,18 +2967,18 @@ variable ENTRIES
 : MATERIALIZED ( fd ^u8 n -- ^u8 n ^u8 n )
    {: root:fd b:^ bu:n :}
    b bu START 0 SCHEDULE
-   root ROOT$ ORIGINAL LOCAL-CONFLICT--SIDE:remote WANT [: FRAGMENT ;]
+   root ROOT$ ORIGINAL LOCAL-CONFLICT--SIDE:REMOTE WANT [: FRAGMENT ;]
    AR @ LOCAL:MATERIALIZE-CONFLICT-AT CONFLICT$ ;
 
 : COPY-PATH ( -- ^u8 n )
-   ORIGINAL LOCAL-CONFLICT--SIDE:remote WANT AR @
+   ORIGINAL LOCAL-CONFLICT--SIDE:REMOTE WANT AR @
    LOCAL:CONFLICT-RELATIVE-PATH ;
 
 \ A conflict copy whose reader fails with a file failure throws E-IO.
 : FAILED-CONFLICT-READ ( fd -- )
    {: root:fd :}
    0 REMAINING !
-   [: root ROOT$ ORIGINAL LOCAL-CONFLICT--SIDE:remote WANT [: FAILING ;]
+   [: root ROOT$ ORIGINAL LOCAL-CONFLICT--SIDE:REMOTE WANT [: FAILING ;]
       AR @ LOCAL:MATERIALIZE-CONFLICT-AT CONFLICT$ 2drop 2drop ;]
    LOCAL:E-IO TTHROWSQ ;
 

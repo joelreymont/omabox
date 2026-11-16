@@ -1050,13 +1050,13 @@ private
 
 : UNKNOWN-OBSERVATION
    ( MODEL:unknown-reason -- MODEL:observation<MODEL:local> )
-   MODEL-OBSERVATION:unknown ;
+   MODEL-OBSERVATION:UNKNOWN ;
 
 : DIRECTORY-OBSERVATION ( -- MODEL:observation<MODEL:local> )
-   MODEL-OBSERVATION:directory ;
+   MODEL-OBSERVATION:DIRECTORY ;
 
 : PRESENT-OBSERVATION ( MODEL:local -- MODEL:observation<MODEL:local> )
-   MODEL-OBSERVATION:present ;
+   MODEL-OBSERVATION:PRESENT ;
 
 : UNKNOWN-RECORD ( str MODEL:unknown-reason -- MODEL:local-record )
    {: p:str why:MODEL:unknown-reason :}
@@ -1226,7 +1226,7 @@ create LISTING FS-LIST:STORAGE-BYTES allot
    {: dir:fd name:^ nu:n path:str probe:stat cx:scan-context
       en:scan-entries :}
    name nu RESERVED-ARTIFACT? if
-      en path MODEL-UNKNOWN--REASON:unsupported UNKNOWN exit
+      en path MODEL-UNKNOWN--REASON:UNSUPPORTED UNKNOWN exit
    then
    dir name nu path str> OPEN-RELATIVE-AT {: f:fd :}
    [: f path probe cx en COLLECT-FILE ;] [: f DISCARD ;] finally ;
@@ -1260,7 +1260,7 @@ defer SCAN-SUBTREE ( fd str scan-context scan-entries -- )
    probe path str> s" inspect directory entry type" STAT-FD {: st:stat :}
    cx SCAN-CONTEXT-UNMAKE {: cache cut:option<cutoff> dev:n ar :}
    st STAT-DEV dev <> if
-      en path MODEL-UNKNOWN--REASON:unsupported UNKNOWN exit
+      en path MODEL-UNKNOWN--REASON:UNSUPPORTED UNKNOWN exit
    then
    st REGULAR? if dir name nu path st cx en SCAN-FILE exit then
    st DIRECTORY? if dir name nu path st cx en SCAN-SUBDIRECTORY exit then
@@ -1286,19 +1286,19 @@ defer SCAN-SUBTREE ( fd str scan-context scan-entries -- )
    {: code:n wrong:MODEL:unknown-reason :}
    code FS:ERRNO ENTRY-CODE? 0= if code throw then
    code E-UNSUPPORTED = if wrong exit then
-   code E-CHANGED = if MODEL-UNKNOWN--REASON:incomplete exit then
-   code E-UNREADABLE = if MODEL-UNKNOWN--REASON:inaccessible exit then
-   FS:ERRNO REPLACED? if MODEL-UNKNOWN--REASON:incomplete exit then
-   MODEL-UNKNOWN--REASON:inaccessible ;
+   code E-CHANGED = if MODEL-UNKNOWN--REASON:INCOMPLETE exit then
+   code E-UNREADABLE = if MODEL-UNKNOWN--REASON:INACCESSIBLE exit then
+   FS:ERRNO REPLACED? if MODEL-UNKNOWN--REASON:INCOMPLETE exit then
+   MODEL-UNKNOWN--REASON:INACCESSIBLE ;
 
 \ Rust's walk_unknown: an entry the walk meets.
 : WALK-UNKNOWN ( n -- MODEL:unknown-reason )
-   MODEL-UNKNOWN--REASON:unsupported ENTRY-UNKNOWN ;
+   MODEL-UNKNOWN--REASON:UNSUPPORTED ENTRY-UNKNOWN ;
 
 \ Rust's revisited_unknown: an object whose type the walk recorded, so a
 \ different one now is a replacement.
 : REVISITED-UNKNOWN ( n -- MODEL:unknown-reason )
-   MODEL-UNKNOWN--REASON:incomplete ENTRY-UNKNOWN ;
+   MODEL-UNKNOWN--REASON:INCOMPLETE ENTRY-UNKNOWN ;
 
 \ One entry never fails the pass: it publishes as unknown, and all the walk
 \ collected beneath it leaves this publication.
@@ -1406,7 +1406,7 @@ SUBTREE-INSTALL
    f DISCARD
    before p u FILE-FINGERPRINT r RECORD-FINGERPRINT
    SAME-FINGERPRINT? 0= if
-      res p u >str MODEL-UNKNOWN--REASON:incomplete STILL-UNKNOWN exit
+      res p u >str MODEL-UNKNOWN--REASON:INCOMPLETE STILL-UNKNOWN exit
    then
    r true SCANNED-HASH-MAKE res RESULT-RECORDS VEC:PUSH ! ;
 
@@ -1450,7 +1450,7 @@ SUBTREE-INSTALL
    {: root:fd path:str before:stat unknown :}
    root path str> REOPEN-SCANNED-DIRECTORY
    before SAME-OBSERVATION if exit then
-   path MODEL-UNKNOWN--REASON:incomplete UNKNOWN-RECORD unknown VEC:PUSH ! ;
+   path MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN-RECORD unknown VEC:PUSH ! ;
 
 : REVALIDATE-DIRECTORY
    ( fd scanned-directory ^VEC:vector<MODEL:local-record> -- )
@@ -1649,7 +1649,7 @@ SUBTREE-INSTALL
 \ ---- publishing
 
 : ROOT-CHANGED ( -- scan-publication )
-   LOCAL-SCAN--PUBLICATION:root-changed ;
+   LOCAL-SCAN--PUBLICATION:ROOT-CHANGED ;
 
 : ACTIVE-BINDING?
    ( fd ^u8 n JOURNAL:journal ^ARENA:arena -- bool )
@@ -1691,7 +1691,7 @@ private
    s COMPLETE-SCAN-UNMAKE {: obs hashes :}
    j b obs hashes JOURNAL:PUBLISH-LOCAL-SCAN
    0= if ROOT-CHANGED exit then
-   s LOCAL-SCAN--PUBLICATION:published ;
+   s LOCAL-SCAN--PUBLICATION:PUBLISHED ;
 
 \ cut decides which cached hashes the walk reuses, q which hashes it
 \ computes stay reusable.
@@ -1927,10 +1927,10 @@ $100 constant MODE-READ-ONLY
 : MAP-STAGE-WRITE ( stage-write [ -- a ] -- stage-outcome<a> )
    {: w:stage-write stage :}
    w MATCH stage-write
-      created OF stage execute LOCAL-STAGE--OUTCOME:staged ENDOF
-      reused OF stage execute LOCAL-STAGE--OUTCOME:already-staged ENDOF
-      mismatch OF LOCAL-STAGE--OUTCOME:content-changed ENDOF
-      destination-occupied OF LOCAL-STAGE--OUTCOME:destination-occupied
+      created OF stage execute LOCAL-STAGE--OUTCOME:STAGED ENDOF
+      reused OF stage execute LOCAL-STAGE--OUTCOME:ALREADY-STAGED ENDOF
+      mismatch OF LOCAL-STAGE--OUTCOME:CONTENT-CHANGED ENDOF
+      destination-occupied OF LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED
       ENDOF
    ;MATCH ;
 
@@ -2118,7 +2118,7 @@ $100 constant MODE-READ-ONLY
 : PRESERVE-GUARD ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- )
    {: dir:fd g:^ gu:n t:^ tu:n c:DROPBOX:hash ar:^ARENA:arena :}
    s" preserve raced local destination" {: o:^ ou:n :}
-   t tu LOCAL-CONFLICT--SIDE:local c ar CONFLICT-NAME {: cn:^ cnu:n :}
+   t tu LOCAL-CONFLICT--SIDE:LOCAL c ar CONFLICT-NAME {: cn:^ cnu:n :}
    dir g gu dir cn cnu FS:TRY-RENAME-NEW-AT if
       dir t tu s" sync preserved raced local destination" SYNC-DIRECTORY
       exit
@@ -2309,7 +2309,7 @@ private
    root r ru dir name nu p u want ar STAGE-FROM-SOURCE ;
 
 : NO-UPLOAD-OUTCOME ( -- stage-outcome<^staged-upload> )
-   s" " >str LOCAL-STAGE--OUTCOME:destination-occupied ;
+   s" " >str LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED ;
 : DROP-UPLOAD-OUTCOME ( stage-outcome<^staged-upload> -- ) drop ;
 
 public
@@ -3095,9 +3095,9 @@ private
 : DROP-STAGE-OUTCOME ( stage-outcome<n> -- ) drop ;
 
 : READY ( ^download-partial -- download-preparation )
-   LOCAL-DOWNLOAD--PREPARATION:ready ;
+   LOCAL-DOWNLOAD--PREPARATION:READY ;
 : EPHEMERAL ( -- download-preparation )
-   LOCAL-DOWNLOAD--PREPARATION:ephemeral ;
+   LOCAL-DOWNLOAD--PREPARATION:EPHEMERAL ;
 
 : READY? ( download-preparation -- bool )
    MATCH download-preparation
@@ -3126,9 +3126,9 @@ private
       missing OF OPTION:NONE ENDOF
       verified OF VERIFIED-DOWNLOAD-STAGE-UNMAKE
          {: f:fd print:MODEL:fingerprint :} f DISCARD
-         0 LOCAL-STAGE--OUTCOME:already-staged OPTION:SOME
+         0 LOCAL-STAGE--OUTCOME:ALREADY-STAGED OPTION:SOME
       ENDOF
-      destination-occupied OF LOCAL-STAGE--OUTCOME:destination-occupied
+      destination-occupied OF LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED
          OPTION:SOME
       ENDOF
    ;MATCH ;
@@ -3136,7 +3136,7 @@ private
 : STAGE-PREPARATION ( download-stage -- option<download-preparation> )
    EXISTING-OUTCOME MATCH option
       none OF OPTION:NONE ENDOF
-      some OF LOCAL-DOWNLOAD--PREPARATION:complete OPTION:SOME ENDOF
+      some OF LOCAL-DOWNLOAD--PREPARATION:COMPLETE OPTION:SOME ENDOF
    ;MATCH ;
 
 \ The download's stage name for target t, and its path below root path r
@@ -3296,7 +3296,7 @@ private
    code LOCAL-CODE throw ;
 
 : OCCUPIED-AT ( ^u8 n -- stage-outcome<n> )
-   >str LOCAL-STAGE--OUTCOME:destination-occupied ;
+   >str LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED ;
 
 : STAGED? ( stage-outcome<n> -- bool )
    MATCH stage-outcome
@@ -3326,7 +3326,7 @@ private
    loc SOURCE@ SOURCE-PATH {: p:^ u:n :}
    [: f 0 FD:SEEK ;]
    [: s" rewind completed download slot" p u IO-FAILURE ;] FS-FAILS
-   0 LOCAL-STAGE--OUTCOME:staged
+   0 LOCAL-STAGE--OUTCOME:STAGED
    [: DROP-STAGE-OUTCOME f loc ar COPY-INTO-STAGE ;] LOCAL-ERRORS
    {: out:stage-outcome<n> :}
    out STAGED? if f loc RESET-DOWNLOAD-SLOT TAKEN? drop then
@@ -3341,9 +3341,9 @@ private
       missing OF o ou loc TARGET@ CHANGED ENDOF
       verified OF VERIFIED-DOWNLOAD-STAGE-UNMAKE
          {: s:fd print:MODEL:fingerprint :} s DISCARD
-         q execute 0 LOCAL-STAGE--OUTCOME:already-staged
+         q execute 0 LOCAL-STAGE--OUTCOME:ALREADY-STAGED
       ENDOF
-      destination-occupied OF LOCAL-STAGE--OUTCOME:destination-occupied
+      destination-occupied OF LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED
       ENDOF
    ;MATCH ;
 
@@ -3363,7 +3363,7 @@ private
    {: f:fd loc m:^ mu:n s:^ su:n :}
    f loc STAGE-PATH@ m mu READ-ONLY
    f loc STAGE-PATH@ s su SYNC-FILE
-   0 LOCAL-STAGE--OUTCOME:staged ;
+   0 LOCAL-STAGE--OUTCOME:STAGED ;
 
 \ Where the swapped stage went: the slot's name, or, when an entry took
 \ that, the stage's, where it stays.
@@ -3553,7 +3553,7 @@ private
          x PARTIAL-PATH OCCUPIED-AT exit
       then
    then
-   actual LOCAL-STAGE--OUTCOME:content-changed ;
+   actual LOCAL-STAGE--OUTCOME:CONTENT-CHANGED ;
 
 \ Syncs the verified file, marks it complete and promotes it.
 : COMPLETE-PARTIAL ( ^download-partial ^ARENA:arena -- stage-outcome<n> )
@@ -3594,7 +3594,7 @@ private
    {: x :}
    x PARTIAL-FILE x DOWNLOAD-PARTIAL-LOCATION RESET-DOWNLOAD-SLOT
    MATCH option
-      none OF x PARTIAL-PATH OCCUPIED-AT LOCAL-DOWNLOAD--PREPARATION:complete
+      none OF x PARTIAL-PATH OCCUPIED-AT LOCAL-DOWNLOAD--PREPARATION:COMPLETE
       ENDOF
       some OF x SWAP-FILE
          0 x DOWNLOAD-PARTIAL-OFFSET !
@@ -3715,7 +3715,7 @@ private
    E-UNSUPPORTED E-CHANGED HASH-STABLE-FILE
    loc EXPECTED@ SAME-CONTENT? if
       x PARTIAL-FILE loc ar PROMOTE-COMPLETED-SLOT
-      LOCAL-DOWNLOAD--PREPARATION:complete exit
+      LOCAL-DOWNLOAD--PREPARATION:COMPLETE exit
    then
    x at length true RESUME-FROM ;
 
@@ -3763,7 +3763,7 @@ private
       ready OF {: x :}
          [: x b ar RESUME-SLOT ;] [: x CLOSE-PARTIAL ;] PREPARING
       ENDOF
-      complete OF LOCAL-DOWNLOAD--PREPARATION:complete ENDOF
+      complete OF LOCAL-DOWNLOAD--PREPARATION:COMPLETE ENDOF
       ephemeral OF EPHEMERAL ENDOF
    ;MATCH ;
 
@@ -3891,21 +3891,21 @@ STRUCTURE install
    FIELD arena ^ARENA:arena
 ;STRUCTURE
 
-: INSTALLED ( -- install-outcome ) LOCAL-INSTALL--OUTCOME:installed ;
+: INSTALLED ( -- install-outcome ) LOCAL-INSTALL--OUTCOME:INSTALLED ;
 : ALREADY-INSTALLED ( -- install-outcome )
-   LOCAL-INSTALL--OUTCOME:already-installed ;
+   LOCAL-INSTALL--OUTCOME:ALREADY-INSTALLED ;
 : DOWNLOAD-REQUIRED ( -- install-outcome )
-   LOCAL-INSTALL--OUTCOME:download-required ;
+   LOCAL-INSTALL--OUTCOME:DOWNLOAD-REQUIRED ;
 : STAGE-OCCUPIED ( str -- install-outcome )
-   LOCAL-INSTALL--OUTCOME:stage-destination-occupied ;
+   LOCAL-INSTALL--OUTCOME:STAGE-DESTINATION-OCCUPIED ;
 : INSTALL-CHANGED ( option<DROPBOX:hash> -- install-outcome )
-   LOCAL-INSTALL--OUTCOME:precondition-changed ;
+   LOCAL-INSTALL--OUTCOME:PRECONDITION-CHANGED ;
 : PREPARED ( -- replacement-preparation )
-   LOCAL-REPLACEMENT--PREPARATION:prepared ;
+   LOCAL-REPLACEMENT--PREPARATION:PREPARED ;
 : ALREADY-PREPARED ( -- replacement-preparation )
-   LOCAL-REPLACEMENT--PREPARATION:already-prepared ;
+   LOCAL-REPLACEMENT--PREPARATION:ALREADY-PREPARED ;
 : PREPARE-CHANGED ( option<DROPBOX:hash> -- replacement-preparation )
-   LOCAL-REPLACEMENT--PREPARATION:precondition-changed ;
+   LOCAL-REPLACEMENT--PREPARATION:PRECONDITION-CHANGED ;
 
 \ No content: nothing is at the path.
 : ABSENT ( -- option<DROPBOX:hash> ) OPTION:NONE ;
@@ -4426,7 +4426,7 @@ STRUCTURE deletion
    {: x:deletion c:option<DROPBOX:hash> ar:^ARENA:arena :}
    x DELETION-UNMAKE {: dir:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
    dir g str> n str> t str> c ar RESTORE-OR-PRESERVE-CHANGED-GUARD
-   c LOCAL-DELETE--OUTCOME:precondition-changed ;
+   c LOCAL-DELETE--OUTCOME:PRECONDITION-CHANGED ;
 
 \ The target is absent: a guard holding the expected content finishes an
 \ interrupted delete.
@@ -4436,10 +4436,10 @@ STRUCTURE deletion
    {: c:option<DROPBOX:hash> :}
    c x DELETION-WANT HOLDS? if
       x s" finish interrupted deletion" s" sync interrupted deletion"
-      REMOVE-GUARD LOCAL-DELETE--OUTCOME:deleted exit
+      REMOVE-GUARD LOCAL-DELETE--OUTCOME:DELETED exit
    then
    c MATCH option
-      none OF LOCAL-DELETE--OUTCOME:already-deleted ENDOF
+      none OF LOCAL-DELETE--OUTCOME:ALREADY-DELETED ENDOF
       some OF drop x c ar GUARD-CHANGED ENDOF
    ;MATCH ;
 
@@ -4452,7 +4452,7 @@ STRUCTURE deletion
       x s" remove raced deletion guard"
       s" sync raced deletion guard removal" REMOVE-GUARD
    then
-   c OPTION:SOME LOCAL-DELETE--OUTCOME:precondition-changed ;
+   c OPTION:SOME LOCAL-DELETE--OUTCOME:PRECONDITION-CHANGED ;
 
 \ Moves the target to the guard's name and syncs; false when the target
 \ is gone by now.
@@ -4474,12 +4474,12 @@ STRUCTURE deletion
       x s" remove stale deletion guard"
       s" sync stale deletion guard removal" REMOVE-GUARD
    then
-   x DISPLACE 0= if LOCAL-DELETE--OUTCOME:already-deleted exit then
+   x DISPLACE 0= if LOCAL-DELETE--OUTCOME:ALREADY-DELETED exit then
    x s" verify deletion displacement" ar GUARD-CONTENT
    {: c:option<DROPBOX:hash> :}
    c x DELETION-WANT HOLDS? 0= if x c ar GUARD-CHANGED exit then
    x s" delete verified displaced file" s" sync local deletion"
-   REMOVE-GUARD LOCAL-DELETE--OUTCOME:deleted ;
+   REMOVE-GUARD LOCAL-DELETE--OUTCOME:DELETED ;
 
 : DELETE-IN ( deletion ^ARENA:arena -- delete-outcome )
    {: x:deletion ar:^ARENA:arena :}
@@ -4524,7 +4524,7 @@ public
    {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
    want s" delete local file" REQUIRE-CONTENT-HASH
    root t tu false OPEN-PARENT MATCH option
-      none OF LOCAL-DELETE--OUTCOME:already-deleted ENDOF
+      none OF LOCAL-DELETE--OUTCOME:ALREADY-DELETED ENDOF
       some OF r ru t tu want ar DELETE-BELOW ENDOF
    ;MATCH ;
 
@@ -4552,13 +4552,13 @@ private
       none OF FS:ERRNO {: e:n :}
          e FS:ENOENT = e FS:ENOTDIR = or e FS:ELOOP = or 0= if
             s" inspect occupied local directory path" p u IO-FAILURE
-         then LOCAL-CREATE--DIRECTORY--OUTCOME:fresh-observation
+         then LOCAL-CREATE--DIRECTORY--OUTCOME:FRESH-OBSERVATION
       ENDOF
       some OF {: d:fd :}
          [: d p u s" sync existing local directory" SYNC-DIRECTORY ;]
          [: d DISCARD ;] finally
          dir p u s" sync existing local directory entry" SYNC-DIRECTORY
-         LOCAL-CREATE--DIRECTORY--OUTCOME:already-present
+         LOCAL-CREATE--DIRECTORY--OUTCOME:ALREADY-PRESENT
       ENDOF
    ;MATCH ;
 
@@ -4574,7 +4574,7 @@ private
    dir name nu FS:MODE-PRIVATE-DIR FS:TRY-MAKE-DIR-AT if
       dir p u s" sync created local directory entry" SYNC-DIRECTORY
       dir name nu p u SYNC-MADE-DIRECTORY
-      LOCAL-CREATE--DIRECTORY--OUTCOME:created exit
+      LOCAL-CREATE--DIRECTORY--OUTCOME:CREATED exit
    then
    FS:ERRNO FS:EEXIST <> if s" create local directory" p u IO-FAILURE then
    dir name nu p u EXISTING-DIRECTORY ;
@@ -4588,12 +4588,12 @@ private
    {: dir:fd name:^ nu:n p:^ u:n :}
    dir name nu FS:TRY-REMOVE-DIR-AT if
       dir p u s" sync deleted local directory" SYNC-DIRECTORY
-      LOCAL-DELETE--DIRECTORY--OUTCOME:deleted exit
+      LOCAL-DELETE--DIRECTORY--OUTCOME:DELETED exit
    then
    FS:ERRNO {: e:n :}
-   e FS:ENOENT = if LOCAL-DELETE--DIRECTORY--OUTCOME:already-absent exit then
+   e FS:ENOENT = if LOCAL-DELETE--DIRECTORY--OUTCOME:ALREADY-ABSENT exit then
    e OCCUPIED-DIRECTORY? if
-      LOCAL-DELETE--DIRECTORY--OUTCOME:fresh-observation exit
+      LOCAL-DELETE--DIRECTORY--OUTCOME:FRESH-OBSERVATION exit
    then
    s" delete empty local directory" p u IO-FAILURE ;
 
@@ -4615,7 +4615,7 @@ public
 : DELETE-DIRECTORY-AT ( fd ^u8 n -- delete-directory-outcome )
    {: root:fd p:^ u:n :}
    root p u false OPEN-PARENT MATCH option
-      none OF LOCAL-DELETE--DIRECTORY--OUTCOME:already-absent ENDOF
+      none OF LOCAL-DELETE--DIRECTORY--OUTCOME:ALREADY-ABSENT ENDOF
       some OF PARENT-DIR-UNMAKE {: dir:fd name:str path:str :}
          [: dir name str> p u REMOVE-DIRECTORY-IN ;] [: dir DISCARD ;]
          finally
@@ -4646,10 +4646,10 @@ private
 : CONFLICT-RESULT ( stage-write ^u8 n -- conflict-outcome )
    {: w:stage-write rel:^ relu:n :}
    w MATCH stage-write
-      created OF rel relu >str LOCAL-CONFLICT--OUTCOME:created ENDOF
-      reused OF rel relu >str LOCAL-CONFLICT--OUTCOME:already-present
+      created OF rel relu >str LOCAL-CONFLICT--OUTCOME:CREATED ENDOF
+      reused OF rel relu >str LOCAL-CONFLICT--OUTCOME:ALREADY-PRESENT
       ENDOF
-      mismatch OF LOCAL-CONFLICT--OUTCOME:content-changed ENDOF
+      mismatch OF LOCAL-CONFLICT--OUTCOME:CONTENT-CHANGED ENDOF
       destination-occupied OF {: q:str :}
          s" materialize conflict" q str> OCCUPIED
       ENDOF
@@ -4787,8 +4787,8 @@ private
    {: src:fd dir:fd dn:^ dnu:n d:^ du:n :}
    src dir dn dnu d du NAMED-INODE-MATCHES {: held:bool :}
    dir d du s" sync local entry rename" SYNC-DIRECTORY
-   held if LOCAL-RENAME--OUTCOME:renamed exit then
-   LOCAL-RENAME--OUTCOME:retry ;
+   held if LOCAL-RENAME--OUTCOME:RENAMED exit then
+   LOCAL-RENAME--OUTCOME:RETRY ;
 
 \ Renames the name in dir to d's last name unless an entry is there.
 : RENAME-NEW ( fd fd ^u8 n ^u8 n ^u8 n -- rename-outcome )
@@ -4797,13 +4797,13 @@ private
    dir name nu dir dn dnu FS:TRY-RENAME-NEW-AT if
       src dir dn dnu d du SETTLE-RENAME exit
    then
-   FS:EEXIST RACED? if LOCAL-RENAME--OUTCOME:retry exit then
+   FS:EEXIST RACED? if LOCAL-RENAME--OUTCOME:RETRY exit then
    s" rename local entry" p u IO-FAILURE ;
 
 : RENAME-IN ( fd ^u8 n ^u8 n ^u8 n bool [ -- ] -- rename-outcome )
    {: dir:fd name:^ nu:n p:^ u:n d:^ du:n dirs:bool hook :}
    dir name nu p u dirs HELD-SOURCE MATCH option
-      none OF LOCAL-RENAME--OUTCOME:retry ENDOF
+      none OF LOCAL-RENAME--OUTCOME:RETRY ENDOF
       some OF {: src:fd :}
          [: hook p u BEFORE-RENAME
             src dir name nu p u d du RENAME-NEW ;]
@@ -4825,7 +4825,7 @@ private
    {: root:fd p:^ u:n d:^ du:n dirs:bool hook :}
    p u d du SAME-PARENT? 0= if d du UNSAFE then
    root p u false OPEN-PARENT MATCH option
-      none OF LOCAL-RENAME--OUTCOME:retry ENDOF
+      none OF LOCAL-RENAME--OUTCOME:RETRY ENDOF
       some OF p u d du dirs hook RENAME-BELOW ENDOF
    ;MATCH ;
 

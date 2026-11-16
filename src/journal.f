@@ -1080,14 +1080,14 @@ BUF:HDR-BYTES TASK:+USERS ENCODED u8
 : LOCAL-OBSERVATION-OF
    ( str str ^ARENA:arena -- MODEL:observation<MODEL:local> )
    {: json:str path:str ar :}
-   MODEL-OBSERVATION:directory
+   MODEL-OBSERVATION:DIRECTORY
    [: DROP-LOCAL json ar MODEL:JSON>LOCAL-OBSERVATION ;]
    s" deserialize local observation" >str path DECODE ;
 
 : REMOTE-OBSERVATION-OF
    ( str str ^ARENA:arena -- MODEL:observation<MODEL:remote> )
    {: json:str path:str ar :}
-   MODEL-OBSERVATION:directory
+   MODEL-OBSERVATION:DIRECTORY
    [: DROP-REMOTE json ar MODEL:JSON>REMOTE-OBSERVATION ;]
    s" deserialize remote observation" >str path DECODE ;
 
@@ -1441,7 +1441,7 @@ private
    s" canonical path does not match display path" >str DELTA-INVALID ;
 
 : REMOTE-DIRECTORY ( -- MODEL:observation<MODEL:remote> )
-   MODEL-OBSERVATION:directory ;
+   MODEL-OBSERVATION:DIRECTORY ;
 
 : RECORD-DIRECTORY? ( MODEL:remote-record -- bool )
    MODEL-REMOTE--RECORD:UNMAKE {: k:MODEL:key p:MODEL:path o :}
@@ -1631,14 +1631,14 @@ $FFFFFFFF constant U32-MAX
 
 : DECODE-BASELINE ( str MODEL:path ^ARENA:arena -- MODEL:baseline )
    {: json:str path ar :}
-   MODEL-BASELINE:absent
+   MODEL-BASELINE:ABSENT
    [: DROP-BASELINE json ar MODEL:JSON>BASELINE ;]
    s" deserialize baseline" >str path MODEL:PATH>STR DECODE ;
 
 : OPERATION-AS
    ( str MODEL:path ^ARENA:arena str -- MODEL:operation )
    {: json:str path ar op:str :}
-   MODEL-OPERATION:create-local-directory
+   MODEL-OPERATION:CREATE-LOCAL-DIRECTORY
    [: DROP-OPERATION json ar MODEL:JSON>OPERATION ;]
    op path MODEL:PATH>STR DECODE ;
 
@@ -1647,7 +1647,7 @@ $FFFFFFFF constant U32-MAX
 
 : DECODE-BLOCKAGE ( str MODEL:path ^ARENA:arena -- MODEL:blockage )
    {: json:str path ar :}
-   MODEL-BLOCKAGE:stage-occupied
+   MODEL-BLOCKAGE:STAGE-OCCUPIED
    [: DROP-BLOCKAGE json ar MODEL:JSON>BLOCKAGE ;]
    s" deserialize block reason" >str path MODEL:PATH>STR DECODE ;
 
@@ -2481,7 +2481,7 @@ STRUCTURE operation-state
 
 : DECODE-CONFLICT ( str MODEL:path ^ARENA:arena -- MODEL:conflict )
    {: json:str path ar :}
-   MODEL:NO-HASH MODEL-LOCAL:MAKE MODEL-CONFLICT:remote-deleted
+   MODEL:NO-HASH MODEL-LOCAL:MAKE MODEL-CONFLICT:REMOTE-DELETED
    [: DROP-CONFLICT json ar MODEL:JSON>CONFLICT ;]
    s" deserialize conflict" >str path MODEL:PATH>STR DECODE ;
 
