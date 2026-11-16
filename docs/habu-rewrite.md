@@ -84,8 +84,8 @@ watcher comes only for a measured need.
   meets it; a transport, journal or root failure ends the pass, and so does a
   local write the system denies, once `LOCAL` has logged the directory that
   denies it and why. One word, `REPLAY:DOWNLOAD-BLOCKAGE`, classifies every
-  download failure. One table maps each code and `DROPBOX:reply` to a
-  disposition and status text.
+  Dropbox answer that fails a download. One table maps each code and
+  `DROPBOX:reply` to a disposition and status text.
 - **Machines.** `DAEMON:RUN`, `RECONCILE:PASS`, its listing and its one
   download, and a `REPLAY` operation are `fsm.f` tables named after their
   `formal/` models.
@@ -93,7 +93,9 @@ watcher comes only for a measured need.
   `root-changed`; a Dropbox answer that ends it is in the link, as `REPLAY`'s.
   `DAEMON` validates the account, not the pass. Apart from Rust, a download
   refused `locked` blocks its path, and so does a directory collision's copy
-  that Dropbox refuses or that fails verification, for that pass, unplanned.
+  that Dropbox refuses or that fails verification, for that pass, unplanned,
+  and so does a replayed conflict's remote copy whose download fails for its
+  path.
 - **Upload progress.** `DROPBOX:UPLOAD` takes a quotation `[ n -- ]`, called
   with the bytes Dropbox has accepted.
 

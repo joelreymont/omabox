@@ -9,13 +9,14 @@
 \ whose failures REPLAY converts into outcomes runs under
 \ LOCAL:CONVERTING, so nothing logs those; any other LOCAL, JOURNAL or
 \ DROPBOX failure passes up with its own code, which that library
-\ logged where it saw it. A path Dropbox rejects is logged once with its
-\ tag. A Dropbox answer that ends the pass, not one path's verdict, is
-\ kept in the link and thrown as E-DROPBOX. A journal answer the replay
-\ contract refuses is logged once with the Rust version's text, naming
-\ the plan's path, then thrown as E-INVALID-STATE. A failed retention or
-\ upload-stage syscall is logged once, as LOCAL logs one, and thrown as
-\ LOCAL's E-IO.
+\ logged where it saw it. A mutation Dropbox rejects for its path is
+\ logged once with its tag, and a download blocked for its path once
+\ with its reason. A Dropbox answer that ends the pass, not one path's
+\ verdict, is kept in the link and thrown as E-DROPBOX. A journal
+\ answer the replay contract refuses is logged once with the Rust
+\ version's text, naming the plan's path, then thrown as
+\ E-INVALID-STATE. A failed retention or upload-stage syscall is logged
+\ once, as LOCAL logs one, and thrown as LOCAL's E-IO.
 \ STORAGE CLASS. No state of its own. CALLER-OWNED: a report, its
 \ vector, a replay pass's context, a download's bridge, and every value
 \ a journal step or a conflict copy reads lie in the arena the caller
@@ -1779,10 +1780,9 @@ private
       ENDOF
    ;MATCH ;
 
-\ A stage's answer for path; none: staged, to install.
+\ A stage's answer; none: staged, to install.
 : STAGE-ANSWER
-   ( LOCAL:stage-outcome<n> MODEL:path -- option<exact-copy-outcome> )
-   {: path :}
+   ( LOCAL:stage-outcome<n> -- option<exact-copy-outcome> )
    MATCH LOCAL:stage-outcome
       staged OF drop NO-EXACT ENDOF
       already-staged OF drop NO-EXACT ENDOF
@@ -1815,7 +1815,7 @@ private
      -- option<exact-copy-outcome> )
    {: k root:fd r:^ ru:n t path rem ar :}
    k root r ru t path rem NO-LEASE s" " ar
-   STAGE-EXACT-DOWNLOAD-FOR-AT path STAGE-ANSWER ;
+   STAGE-EXACT-DOWNLOAD-FOR-AT STAGE-ANSWER ;
 
 : STAGED-THEN-INSTALLED
    ( ^link fd ^u8 n MODEL:path MODEL:path MODEL:remote ^ARENA:arena
@@ -1839,16 +1839,48 @@ private
       some OF ENDOF
    ;MATCH ;
 
-: >CONFLICT-OUTCOME ( exact-copy-outcome -- copy-outcome )
+\ A blocked download's reason: its blockage's variant in snake case,
+\ with an unavailable download's status or a rejection's tag.
+: REASON+ ( MODEL:blockage -- )
+   MATCH MODEL:blockage
+      unsupported-file-size OF s" unsupported_file_size" LOG:TEXT+ ENDOF
+      remote-rejected OF {: t:str :}
+         s" remote_rejected " LOG:TEXT+ t str> LOG:TEXT+
+      ENDOF
+      download-unavailable OF {: st :}
+         s" download_unavailable " LOG:TEXT+ st LOG:INT+
+      ENDOF
+      download-verification-failed OF
+         s" download_verification_failed" LOG:TEXT+
+      ENDOF
+      stage-occupied OF s" stage_occupied" LOG:TEXT+ ENDOF
+      local-object-in-way OF s" local_object_in_way" LOG:TEXT+ ENDOF
+      remote-object OF s" remote_object" LOG:TEXT+ ENDOF
+      conflict-copy-occupied OF
+         s" conflict_copy_occupied" LOG:TEXT+
+      ENDOF
+   ;MATCH ;
+
+\ Rust's warning for path's blocked download; the copy is blocked b.
+: DOWNLOAD-BLOCKED ( MODEL:blockage MODEL:path -- copy-outcome )
+   {: b path :}
+   LOG:WARN s" replay" LOG:LINE
+   s" exact download blocked for its path `" LOG:TEXT+
+   path MODEL:PATH>STR str> LOG:TEXT+ s" `: " LOG:TEXT+
+   b REASON+ LOG:;LINE
+   b REPLAY-COPY--OUTCOME:BLOCKED ;
+
+: >CONFLICT-OUTCOME ( exact-copy-outcome MODEL:path -- copy-outcome )
+   {: path :}
    MATCH exact-copy-outcome
       ready OF REPLAY-COPY--OUTCOME:READY ENDOF
       destination-changed OF COPY-OCCUPIED ENDOF
       stage-occupied OF
-         MODEL-BLOCKAGE:STAGE-OCCUPIED REPLAY-COPY--OUTCOME:BLOCKED
+         MODEL-BLOCKAGE:STAGE-OCCUPIED path DOWNLOAD-BLOCKED
       ENDOF
       content-changed OF
          MODEL-BLOCKAGE:DOWNLOAD-VERIFICATION-FAILED
-         REPLAY-COPY--OUTCOME:BLOCKED
+         path DOWNLOAD-BLOCKED
       ENDOF
    ;MATCH ;
 
@@ -1868,9 +1900,9 @@ private
 : UNVERIFIED ( -- option<MODEL:blockage> )
    MODEL-BLOCKAGE:DOWNLOAD-VERIFICATION-FAILED OPTION:SOME ;
 
-\ Rust's download_block_reason for Dropbox's refusals; none: the
-\ refusal is about the pass, not the path.
-: DOWNLOAD-BLOCKAGE ( DROPBOX:error -- option<MODEL:blockage> )
+\ The blockage a download refused for e earns; none: the refusal is
+\ about the pass, not the path.
+: ERROR-BLOCKAGE ( DROPBOX:error -- option<MODEL:blockage> )
    MATCH DROPBOX:error
       not-found OF UNAVAILABLE ENDOF
       not-file OF UNAVAILABLE ENDOF
@@ -1897,33 +1929,19 @@ private
 : REPLY-BLOCKAGE ( DROPBOX:reply -- option<MODEL:blockage> )
    MATCH DROPBOX:reply
       done OF NO-BLOCKAGE ENDOF
-      refused OF DOWNLOAD-BLOCKAGE ENDOF
+      refused OF ERROR-BLOCKAGE ENDOF
       retry OF drop NO-BLOCKAGE ENDOF
       unlinked OF NO-BLOCKAGE ENDOF
    ;MATCH ;
 
-\ A download Dropbox refused for the path blocks the copy; any other
-\ answer ends the pass, its reply still in the link.
-: DOWNLOAD-BLOCKED ( ^link -- copy-outcome )
-   REPLAY-LINK:REPLY @ REPLY-BLOCKAGE MATCH option
-      none OF E-DROPBOX throw ENDOF
-      some OF REPLAY-COPY--OUTCOME:BLOCKED ENDOF
-   ;MATCH ;
+: UNAVAILABLE-AS ( n -- option<MODEL:blockage> )
+   MODEL-BLOCKAGE:DOWNLOAD-UNAVAILABLE OPTION:SOME ;
 
-\ Rust's materialize_remote_conflict_at; an occupied copy name or a
-\ path's refused download blocks the copy, another failure passes up.
-: REMOTE-CONFLICT-AT
-   ( ^link fd ^u8 n MODEL:path MODEL:remote ^ARENA:arena
-     -- copy-outcome )
-   {: k root:fd r:^ ru:n path rem ar :}
-   path rem ar REMOTE-COPY-PATH {: copy :}
-   COPY-OCCUPIED [: DROP-COPY k root r ru copy path rem ar
-      EXACT-COPY-AT >CONFLICT-OUTCOME ;]
-   ['] NAME-HELD? LOCAL:CONVERTING {: code:n :}
-   code 0= if exit then
-   drop code FS:ERRNO NAME-HELD? if COPY-OCCUPIED exit then
-   code E-DROPBOX = if k DOWNLOAD-BLOCKED exit then
-   code throw ;
+\ The client's last status, when a 4xx, blocks the download.
+: STATUS-BLOCKAGE ( ^link -- option<MODEL:blockage> )
+   REPLAY-LINK:CLIENT @ DROPBOX:HTTP-STATUS {: st:n :}
+   st 400 >= st 500 < and if st UNAVAILABLE-AS exit then
+   NO-BLOCKAGE ;
 
 public
 
@@ -1933,6 +1951,36 @@ public
    ( ^link fd ^u8 n MODEL:path MODEL:path MODEL:remote ^ARENA:arena
      -- exact-copy-outcome )
    EXACT-COPY-AT ;
+
+\ Rust's download_block_reason for Dropbox's answers; none: the
+\ failure is the pass's, which the caller rethrows.
+: DOWNLOAD-BLOCKAGE ( n ^link -- option<MODEL:blockage> )
+   {: code:n k :}
+   code E-DROPBOX = if k REPLAY-LINK:REPLY @ REPLY-BLOCKAGE exit then
+   code DROPBOX:E-BAD-REQUEST = code DROPBOX:E-STATUS = or
+   if k STATUS-BLOCKAGE exit then
+   NO-BLOCKAGE ;
+
+private
+
+\ Rust's materialize_remote_conflict_at; an occupied copy name or a
+\ path's blocked download blocks the copy, another failure passes up.
+: REMOTE-CONFLICT-AT
+   ( ^link fd ^u8 n MODEL:path MODEL:remote ^ARENA:arena
+     -- copy-outcome )
+   {: k root:fd r:^ ru:n path rem ar :}
+   path rem ar REMOTE-COPY-PATH {: copy :}
+   COPY-OCCUPIED [: DROP-COPY k root r ru copy path rem ar
+      EXACT-COPY-AT path >CONFLICT-OUTCOME ;]
+   ['] NAME-HELD? LOCAL:CONVERTING {: code:n :}
+   code 0= if exit then
+   drop code FS:ERRNO NAME-HELD? if COPY-OCCUPIED exit then
+   code k DOWNLOAD-BLOCKAGE MATCH option
+      none OF code throw ENDOF
+      some OF path DOWNLOAD-BLOCKED ENDOF
+   ;MATCH ;
+
+public
 
 \ Writes the remote's bytes as path's remote conflict copy below the
 \ sync root, whose absolute path is r; it never overwrites a file.

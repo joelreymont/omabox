@@ -22,6 +22,10 @@
 \   Rust's MutationExpectation::classify.
 \ - REJECTION over every DROPBOX error: a path's rejection, or E-DROPBOX
 \   with the refusal kept in the link.
+\ - Rust's download_failures_separate_path_blocks_from_global_errors:
+\   DOWNLOAD-BLOCKAGE of E-DROPBOX over every DROPBOX reply and error, a
+\   path's blockage or none, the reply kept in the link; of DROPBOX's
+\   E-REDIRECT and E-TRANSPORT and LOCAL's E-IO, none.
 \ - TARGET of a valid path below the link's root, and each invalid form
 \   rejected invalid-path with no request reaching the fake.
 \ - OVERSIZE? at 350 000 000 000 bytes and one more.
@@ -69,7 +73,7 @@
 \ - MATERIALIZE-REMOTE-CONFLICT downloads the copy once, then is ready
 \   with no request; a directory or other bytes at the copy's name
 \   block it conflict-copy-occupied, logging nothing; other bytes at
-\   its stage block it stage-occupied with no request.
+\   its stage block it stage-occupied, logged once, with no request.
 \   MATERIALIZE-REMOTE-COPY-AT installs at a target apart from the
 \   source path, and answers destination-changed for other bytes there.
 \ - APPLY-FILE-MUTATION and APPLY-DELETE-MUTATION over every mutation
@@ -77,8 +81,12 @@
 \   remote side: the event, the block, the plan pending, held,
 \   completed, retired or finished as its conflict, the count, the
 \   conflict copies on disk, the downloads and the one line logged; a
-\   replace whose remote side's download Dropbox refuses, or whose bytes
-\   do not verify, holds only its plan, its local copy placed.
+\   replace whose remote side's download Dropbox refuses, answers 400 or
+\   404, or whose bytes do not verify, holds only its plan, its local
+\   copy placed, logging the block once, and a 400 or 404 once more by
+\   DROPBOX; one whose remote side's download Dropbox answers 503, or
+\   whose token refresh it answers 400, throws E-DROPBOX with a retry
+\   in the link, or DROPBOX's E-BAD-REQUEST, its plan left pending.
 \ - REPLAY-REMOTE-OPERATIONS-AT against the fake Dropbox: Rust's
 \   remote_replay_creates_nested_parents_before_the_file,
 \   already_absent_dropbox_directory_completes_its_replayed_delete,
@@ -1042,6 +1050,112 @@ ARENA LINKS REPLAY:link
    DROPBOX-ERROR:CONTENT-HASH-MISMATCH l STOPS
    DROPBOX-ERROR:UNVERIFIED l STOPS ;
 
+: BLOCKAGE$ ( MODEL:blockage -- ^u8 n )
+   MATCH MODEL:blockage
+      unsupported-file-size OF s" unsupported-file-size" ENDOF
+      remote-rejected OF str> ENDOF
+      download-unavailable OF drop s" download-unavailable" ENDOF
+      download-verification-failed OF
+         s" download-verification-failed"
+      ENDOF
+      stage-occupied OF s" stage-occupied" ENDOF
+      local-object-in-way OF s" local-object-in-way" ENDOF
+      remote-object OF s" remote-object" ENDOF
+      conflict-copy-occupied OF s" conflict-copy-occupied" ENDOF
+   ;MATCH ;
+
+: STATUS-OF ( MODEL:blockage -- n )
+   MATCH MODEL:blockage
+      unsupported-file-size OF 0 ENDOF
+      remote-rejected OF drop 0 ENDOF
+      download-unavailable OF ENDOF
+      download-verification-failed OF 0 ENDOF
+      stage-occupied OF 0 ENDOF
+      local-object-in-way OF 0 ENDOF
+      remote-object OF 0 ENDOF
+      conflict-copy-occupied OF 0 ENDOF
+   ;MATCH ;
+
+\ A blockage's variant and an unavailable download's status; none is
+\ "none" 0.
+: DOWNLOAD-BLOCK$ ( option<MODEL:blockage> -- ^u8 n n )
+   MATCH option
+      none OF s" none" 0 ENDOF
+      some OF {: b :} b BLOCKAGE$ b STATUS-OF ENDOF
+   ;MATCH ;
+
+\ The reply's variant, then a retry's wait, else 0.
+: REPLY$ ( DROPBOX:reply -- ^u8 n n )
+   MATCH DROPBOX:reply
+      done OF s" done" 0 ENDOF
+      refused OF drop s" refused" 0 ENDOF
+      retry OF {: ms:n :} s" retry" ms ENDOF
+      unlinked OF s" unlinked" 0 ENDOF
+   ;MATCH ;
+
+: BLOCKS-AS ( n ^REPLAY:link ^u8 n n -- )
+   {: code:n l w:^ wu:n st:n :}
+   code l REPLAY:DOWNLOAD-BLOCKAGE DOWNLOAD-BLOCK$ {: b:^ bu:n s:n :}
+   b bu w wu T$= s st T= ;
+
+\ A download Dropbox refused for e blocks as w with status st, the
+\ refusal kept in the link.
+: REFUSED-AS ( DROPBOX:error ^REPLAY:link ^u8 n n -- )
+   {: e l w:^ wu:n st:n :}
+   e DROPBOX-REPLY:REFUSED l REPLAY-LINK:REPLY !
+   REPLAY:E-DROPBOX l w wu st BLOCKS-AS
+   l REPLAY-LINK:REPLY @ e REFUSAL? TTRUE ;
+
+: UNAVAILABLE-409 ( DROPBOX:error ^REPLAY:link -- )
+   s" download-unavailable" 409 REFUSED-AS ;
+
+: PASS-WIDE ( DROPBOX:error ^REPLAY:link -- ) s" none" 0 REFUSED-AS ;
+
+\ With the reply y, whose variant is w, E-DROPBOX blocks nothing and
+\ y stays in the link.
+: REPLY-PASSES ( DROPBOX:reply ^REPLAY:link ^u8 n -- )
+   {: y l w:^ wu:n :}
+   y l REPLAY-LINK:REPLY !
+   REPLAY:E-DROPBOX l s" none" 0 BLOCKS-AS
+   l REPLAY-LINK:REPLY @ REPLY$ 0 T= w wu T$= ;
+
+: PATH-DOWNLOADS ( ^REPLAY:link -- )
+   {: l :}
+   DROPBOX-ERROR:NOT-FOUND l UNAVAILABLE-409
+   DROPBOX-ERROR:NOT-FILE l UNAVAILABLE-409
+   DROPBOX-ERROR:NOT-FOLDER l UNAVAILABLE-409
+   DROPBOX-ERROR:MALFORMED-PATH l UNAVAILABLE-409
+   DROPBOX-ERROR:DISALLOWED-NAME l UNAVAILABLE-409
+   DROPBOX-ERROR:NO-WRITE-PERMISSION l UNAVAILABLE-409
+   DROPBOX-ERROR:RESTRICTED-CONTENT l UNAVAILABLE-409
+   DROPBOX-ERROR:ACCESS-RESTRICTED l UNAVAILABLE-409
+   DROPBOX-ERROR:TEAM-FOLDER l UNAVAILABLE-409
+   DROPBOX-ERROR:OPERATION-SUPPRESSED l UNAVAILABLE-409
+   DROPBOX-ERROR:INSUFFICIENT-SPACE l UNAVAILABLE-409
+   DROPBOX-ERROR:LOCKED l UNAVAILABLE-409
+   DROPBOX-ERROR:UNSUPPORTED-FILE l UNAVAILABLE-409
+   DROPBOX-ERROR:PATH-MISMATCH l UNAVAILABLE-409
+   DROPBOX-ERROR:OTHER l UNAVAILABLE-409
+   DROPBOX-ERROR:UNVERIFIED l s" download-verification-failed" 0
+   REFUSED-AS ;
+
+: DOWNLOAD-FAILURES-SEPARATE-PATH-BLOCKS-FROM-GLOBAL-ERRORS
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" download_failures_separate_path_blocks_from_global_errors" T-LABEL
+   MAIN @ s" " ar NEW-LINK {: l :}
+   l PATH-DOWNLOADS
+   DROPBOX-ERROR:CONFLICT l PASS-WIDE
+   DROPBOX-ERROR:RESET l PASS-WIDE
+   DROPBOX-ERROR:INVALID-ROOT l PASS-WIDE
+   DROPBOX-ERROR:CONTENT-HASH-MISMATCH l PASS-WIDE
+   DROPBOX-REPLY:DONE l s" done" REPLY-PASSES
+   0 DROPBOX-REPLY:RETRY l s" retry" REPLY-PASSES
+   DROPBOX-REPLY:UNLINKED l s" unlinked" REPLY-PASSES
+   DROPBOX:E-REDIRECT l s" none" 0 BLOCKS-AS
+   DROPBOX:E-TRANSPORT l s" none" 0 BLOCKS-AS
+   LOCAL:E-IO l s" none" 0 BLOCKS-AS ;
+
 : TARGET$ ( ^REPLAY:link ^u8 n ^ARENA:arena -- ^u8 n )
    {: l p:^ u:n ar :}
    l p u DISPLAY ar REPLAY:TARGET MATCH option
@@ -1394,20 +1508,6 @@ LOG-CAP BUFFER: LOG-TEXT
 
 \ No descriptor: the words under test never read the pass's root.
 : NO-ROOT ( -- fd ) -1 >FD ;
-
-: BLOCKAGE$ ( MODEL:blockage -- ^u8 n )
-   MATCH MODEL:blockage
-      unsupported-file-size OF s" unsupported-file-size" ENDOF
-      remote-rejected OF str> ENDOF
-      download-unavailable OF drop s" download-unavailable" ENDOF
-      download-verification-failed OF
-         s" download-verification-failed"
-      ENDOF
-      stage-occupied OF s" stage-occupied" ENDOF
-      local-object-in-way OF s" local-object-in-way" ENDOF
-      remote-object OF s" remote-object" ENDOF
-      conflict-copy-occupied OF s" conflict-copy-occupied" ENDOF
-   ;MATCH ;
 
 \ The block's variant and its detail: a durable plan's blockage, a
 \ remote rejection's tag, a sync error's rejection, an occupied stage's
@@ -2481,6 +2581,16 @@ variable HELD
    r s" notes.txt" c ar REMOTE-COPY s" other bytes" ar HOLDS
    d GONE ;
 
+\ The log t holds the line once and nothing else.
+: LOGS-ONCE ( ^u8 n ^u8 n -- )
+   {: t:^ tu:n line:^ lu:n :}
+   t tu LINE-COUNT 1 T= t tu line lu CONTAINS? TTRUE ;
+
+\ REPLAY's line for notes.txt's copy, blocked for the reason r.
+: BLOCKED-LINE ( ^u8 n -- ^u8 n )
+   SB-RESET s" exact download blocked for its path `notes.txt`: "
+   SB-APPEND SB-APPEND SB$ ;
+
 : AN-OCCUPIED-REMOTE-COPY-STAGE-BLOCKS-IT ( ^ARENA:arena -- )
    {: ar :}
    s" other bytes at the copy's stage block it" T-LABEL
@@ -2492,8 +2602,9 @@ variable HELD
    root FS:CLOSE-DIR
    d r ar SET-ASIDE
    STAGE-AT @ str> s" other bytes" FS:WRITE-ALL
-   r s" notes.txt" rem ar REMOTE-COPY$
-   s" stage-occupied" T$= s" blocked" T$=
+   d [: r s" notes.txt" rem ar REMOTE-COPY$
+      s" stage-occupied" T$= s" blocked" T$= ;] ar LOGGED
+   s" stage_occupied" BLOCKED-LINE LOGS-ONCE
    0 SEEN
    STAGE-AT @ str> TEXT CAP FS:READ-ALL {: u:n :}
    TEXT u s" other bytes" T$=
@@ -2871,18 +2982,6 @@ ARENA FILE-CASES file-case
    S\" \q:{\q.tag\q:\q" SB-APPEND t tu SB-APPEND S\" \q}}}" SB-APPEND
    409 s" " s" " SB$ TEST-DROPBOX:SCRIPT! ;
 
-: STATUS-OF ( MODEL:blockage -- n )
-   MATCH MODEL:blockage
-      unsupported-file-size OF 0 ENDOF
-      remote-rejected OF drop 0 ENDOF
-      download-unavailable OF ENDOF
-      download-verification-failed OF 0 ENDOF
-      stage-occupied OF 0 ENDOF
-      local-object-in-way OF 0 ENDOF
-      remote-object OF 0 ENDOF
-      conflict-copy-occupied OF 0 ENDOF
-   ;MATCH ;
-
 \ The status of the journal's first blocked plan's unavailable
 \ download, else 0.
 : HELD-STATUS ( JOURNAL:journal ^ARENA:arena -- n )
@@ -2897,17 +2996,19 @@ ARENA FILE-CASES file-case
 
 \ A replace collided with THEIRS, whose copy fails: the summary want,
 \ the plan held as w, no conflict recorded and only the local copy
-\ placed, after one download; the case.
+\ placed, after one download; the case and what it logged.
 : UNCOPIED
-   ( MODEL:remote ^u8 n ^u8 n ^ARENA:arena -- ^file-case )
+   ( MODEL:remote ^u8 n ^u8 n ^ARENA:arena -- ^file-case ^u8 n )
    {: rem want:^ wu:n w:^ u:n ar :}
    PLAN-KIND-REPLACING ar NEW-CASE {: c :}
-   rem THEIRS-AS CHANGED-AS c want wu s" " ar ARMED
+   rem THEIRS-AS CHANGED-AS {: o :}
+   c FILE-CASE-DIR @ [: o c ar CASE-APPLIED$ want wu T$= ;] ar LOGGED
+   {: t:^ tu:n :}
    c FILE-CASE-JOURNAL @ w u ar HELD-AS drop
    c FILE-CASE-JOURNAL @ ar JOURNAL:CONFLICTS VEC:COUNT 0 T=
    c true false ar COPIES
    1 SEEN
-   c ;
+   c t tu ;
 
 : A-REFUSED-REMOTE-SIDE-HOLDS-ONLY-ITS-PLAN ( ^ARENA:arena -- )
    {: ar :}
@@ -2915,9 +3016,37 @@ ARENA FILE-CASES file-case
    ar THEIRS-SERVED {: h rem :}
    s" path" s" restricted_content" REFUSAL
    rem s" blocked durable-plan download-unavailable blocked 0"
-   s" download-unavailable" ar UNCOPIED {: c :}
+   s" download-unavailable" ar UNCOPIED {: c t:^ tu:n :}
+   t tu s" download_unavailable 409" BLOCKED-LINE LOGS-ONCE
    c FILE-CASE-JOURNAL @ ar HELD-STATUS 409 T=
    c ENDED ;
+
+\ The copy's download Dropbox answers st with the body b: the plan
+\ is held download-unavailable st, logged once by DROPBOX as d and
+\ once by REPLAY, nothing else.
+: HELD-AT-STATUS ( n ^u8 n ^u8 n ^ARENA:arena -- )
+   {: st:n b:^ bu:n d:^ du:n ar :}
+   ar THEIRS-SERVED {: h rem :}
+   s" /2/files/download" st s" " s" " b bu TEST-DROPBOX:ROUTE-SCRIPT!
+   rem s" blocked durable-plan download-unavailable blocked 0"
+   s" download-unavailable" ar UNCOPIED {: c t:^ tu:n :}
+   t tu LINE-COUNT 2 T= t tu d du CONTAINS? TTRUE
+   s" download_unavailable " SB-RESET SB-APPEND st FMT:INT$ SB-APPEND
+   SB$ ar COPIED str> BLOCKED-LINE t tu 2swap CONTAINS? TTRUE
+   c FILE-CASE-JOURNAL @ ar HELD-STATUS st T=
+   c ENDED ;
+
+: A-REJECTED-REMOTE-SIDE-HOLDS-ONLY-ITS-PLAN ( ^ARENA:arena -- )
+   {: ar :}
+   s" a 400 download of the remote side holds only its plan" T-LABEL
+   400 s" bad request" s" answered 400: a malformed request" ar
+   HELD-AT-STATUS ;
+
+: A-MISSING-REMOTE-SIDE-HOLDS-ONLY-ITS-PLAN ( ^ARENA:arena -- )
+   {: ar :}
+   s" a 404 download of the remote side holds only its plan" T-LABEL
+   404 s" {}" s" answered 404: an unexpected status" ar
+   HELD-AT-STATUS ;
 
 : AN-UNVERIFIED-REMOTE-SIDE-HOLDS-ONLY-ITS-PLAN ( ^ARENA:arena -- )
    {: ar :}
@@ -2926,7 +3055,46 @@ ARENA FILE-CASES file-case
    s" theirs-revision" s" Dropbox's side of the CONFLICT"
    TEST-DROPBOX:CONTENT!
    rem s" blocked durable-plan download-verification-failed blocked 0"
-   s" download-verification-failed" ar UNCOPIED ENDED ;
+   s" download-verification-failed" ar UNCOPIED {: c t:^ tu:n :}
+   t tu s" download_verification_failed" BLOCKED-LINE LOGS-ONCE
+   c ENDED ;
+
+\ A replace collided with rem, whose copy's download throws code: the
+\ plan stays pending, with no conflict recorded; the case.
+: COPY-FAILED ( MODEL:remote n ^ARENA:arena -- ^file-case )
+   {: rem code:n ar :}
+   PLAN-KIND-REPLACING ar NEW-CASE {: c :}
+   rem THEIRS-AS CHANGED-AS {: o :}
+   c FILE-CASE-DIR @
+   [: [: o c ar CASE-APPLIED$ 2drop ;] code TTHROWSQ ;] ar LOGGED
+   2drop
+   c FILE-CASE-JOURNAL @ ar NOTES$ s" pending" T$=
+   c FILE-CASE-JOURNAL @ ar JOURNAL:CONFLICTS VEC:COUNT 0 T=
+   c ;
+
+: AN-UNREACHED-REMOTE-SIDE-ENDS-THE-PASS ( ^ARENA:arena -- )
+   {: ar :}
+   s" a 503 download of the remote side ends the pass" T-LABEL
+   ar THEIRS-SERVED {: h rem :}
+   s" /2/files/download" 503 s" " s" " s" " TEST-DROPBOX:ROUTE-SCRIPT!
+   rem REPLAY:E-DROPBOX ar COPY-FAILED {: c :}
+   LINK REPLAY-LINK:REPLY @ RETRY? TTRUE
+   c true false ar COPIES
+   1 SEEN
+   c ENDED ;
+
+\ The copy's download on a fresh client, whose token refresh Dropbox
+\ answers 400, ends the pass.
+: A-REFUSED-REFRESH-ENDS-THE-PASS ( ^ARENA:arena -- )
+   {: ar :}
+   s" a refresh refused 400 for the remote side ends the pass" T-LABEL
+   ar THEIRS-SERVED {: h rem :}
+   s" /oauth2/token" 400 s" " s" "
+   S\" {\qerror\q:\qinvalid_request\q}" TEST-DROPBOX:ROUTE-SCRIPT!
+   s" replay-refresh" ar OPENED-WITH {: k :}
+   k LINKED
+   [: rem DROPBOX:E-BAD-REQUEST ar COPY-FAILED ENDED ;]
+   [: k DROPBOX:CLOSE MAIN @ LINKED ;] finally ;
 
 : APPLY-DELETE-MUTATION-COVERS-EVERY-OUTCOME ( ^ARENA:arena -- )
    {: ar :}
@@ -3422,7 +3590,11 @@ variable SIDES
    ar A-REMOTE-EDIT-KEEPS-THE-DELETED-FILE
    ar AN-OCCUPIED-COPY-NAME-HOLDS-THE-PLAN
    ar A-REFUSED-REMOTE-SIDE-HOLDS-ONLY-ITS-PLAN
+   ar A-REJECTED-REMOTE-SIDE-HOLDS-ONLY-ITS-PLAN
+   ar A-MISSING-REMOTE-SIDE-HOLDS-ONLY-ITS-PLAN
    ar AN-UNVERIFIED-REMOTE-SIDE-HOLDS-ONLY-ITS-PLAN
+   ar AN-UNREACHED-REMOTE-SIDE-ENDS-THE-PASS
+   ar A-REFUSED-REFRESH-ENDS-THE-PASS
    ar APPLY-DELETE-MUTATION-COVERS-EVERY-OUTCOME
    ar A-DELETE-BEFORE-A-FOLDER-LEAVES-ITS-PLAN-PENDING ;
 
@@ -3471,6 +3643,7 @@ variable SIDES
    ar A-DENIED-OPERATION-AT-THE-COPY-NAME-DOES-NOT-OCCUPY-IT
    CLASSIFY-COVERS-EVERY-EXPECTATION-AND-STATE
    ar REJECTION-COVERS-EVERY-DROPBOX-ERROR
+   ar DOWNLOAD-FAILURES-SEPARATE-PATH-BLOCKS-FROM-GLOBAL-ERRORS
    UPLOAD-SIZE-STOPS-AT-THE-SESSION-LIMIT
    ar REMOTE-REPLAY-CASES
    ar DROPBOX-CASES ;
