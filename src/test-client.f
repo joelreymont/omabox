@@ -26,6 +26,7 @@ require src/lib/string.f
 require src/lib/vector.f
 require src/lib/test.f
 require src/lib/fs.f
+require src/lib/fmt.f
 require src/lib/adt/option.f
 require src/lib/net/curl.f
 require src/dropbox.f
@@ -272,16 +273,21 @@ FUNCTION: BIND-CALL bind ( n ^u8 n -- i32 ) ;FUNCTION
 
 public
 
-\ A socket bound at the path, as Rust's UnixListener::bind leaves one;
-\ its descriptor.
+\ A socket bound at the path, as Rust's UnixListener::bind leaves one,
+\ by /proc/self/fd/<parent>/<name>, which any depth fits; its descriptor.
 : SOCKET-AT ( ^u8 n -- fd )
    {: p:^ u:n :}
-   u 108 < TTRUE
+   p u FS:BASENAME {: b:^ bu:n :}
+   p u bu - FS:OPEN-DIR-READ {: d:n :}
+   SB-RESET s" /proc/self/fd/" SB-APPEND d FMT:SB-INT
+   s" /" SB-APPEND b bu SB-APPEND SB$ {: q:^ qu:n :}
+   qu 108 >= if d close E-FS-PATH throw then
    AF-UNIX SOCKADDR c! 0 SOCKADDR 1 + c!
-   p SOCKADDR 2 + u BYTE-COPY 0 SOCKADDR 2 + u + c!
+   q SOCKADDR 2 + qu BYTE-COPY 0 SOCKADDR 2 + qu + c!
    AF-UNIX SOCK-STREAM 0 SOCKET-CALL {: s:n :}
    s 0 >= TTRUE
-   s SOCKADDR u 3 + BIND-CALL 0 T=
+   s SOCKADDR qu 3 + BIND-CALL 0 T=
+   d close
    s >FD ;
 
 ;package
