@@ -11,8 +11,12 @@
 \ member holds a lone surrogate escape. AUTH's failures are logged once
 \ with the Rust version's text, then thrown as its codes; no log line
 \ holds a string of the record, only an unsupported version's number.
+\ START begins a browser login (rust OAuthClient::begin): a PKCE verifier
+\ of 32 random bytes, and the URL dropbox-sdk 0.20.3's AuthorizeUrlBuilder
+\ builds for it, byte for byte.
 \ STORAGE CLASS. No state of its own. CALLER-OWNED: the strings LOAD
-\ answers, and the record it read, lie in the arena the caller passes.
+\ answers, the record it read, and START's login, lie in the arena the
+\ caller passes.
 HB-TARGET-LINUX? HB-TARGET-LINUX-X86-64? or ?TARGET
 require src/lib/error.f
 require src/lib/string.f
@@ -22,6 +26,8 @@ require src/lib/log.f
 require src/lib/utf8-scalar.f
 require src/lib/json.f
 require src/lib/secret.f
+require src/lib/entropy.f
+require src/lib/base64.f
 require src/journal.f
 
 package AUTH
@@ -39,6 +45,7 @@ public
    ERROR:CODE E-TOO-LARGE
 -100603 s" Secret Service returned unsupported Omabox credential version"
    ERROR:CODE E-VERSION
+-100604 s" could not generate a secure OAuth proof" ERROR:CODE E-RANDOM
 
 \ found: the binding and the refresh token; unavailable: no item, or a
 \ Secret Service that refused or did not answer.
@@ -49,6 +56,13 @@ ENUM lookup
    ;VARIANT
    VARIANT unavailable ;VARIANT
 ;ENUM
+
+\ A browser login in progress: the URL the user opens, and the PKCE
+\ verifier the code it shows is exchanged with.
+STRUCTURE pending OPAQUE DERIVE addr
+   FIELD url str
+   FIELD verifier str
+;STRUCTURE
 
 private
 
@@ -235,6 +249,95 @@ ARENA CURSORS JSON:cursor
    code SECRET:E-CAPACITY = if E-TOO-LARGE FAIL then
    code throw ;
 
+
+\ ---- the login -----------------------------------------------------
+
+ARENA PENDINGS pending
+
+32 constant PROOF-BYTES    \ the verifier's random bytes
+43 constant PROOF-CHARS    \ 32 bytes in unpadded base64url
+
+: SCOPE ( -- ^u8 n )
+   s" account_info.read files.metadata.read files.content.read files.content.write" ;
+
+\ The URL's texts around its three values, in the SDK's order.
+: BASE$ ( -- ^u8 n )
+   s" https://www.dropbox.com/oauth2/authorize?response_type=code&client_id=" ;
+: TYPE$ ( -- ^u8 n ) s" &token_access_type=offline&scope=" ;
+: CHALLENGE$ ( -- ^u8 n ) s" &code_challenge=" ;
+: METHOD$ ( -- ^u8 n ) s" &code_challenge_method=S256" ;
+
+: FIXED ( -- n )
+   BASE$ nip TYPE$ nip + CHALLENGE$ nip + METHOD$ nip + ;
+
+\ form_urlencoded's bytes kept as they are.
+: KEPT? ( n -- bool )
+   {: b:n :}
+   b STR-ALNUM? b [char] * = or b [char] - = or
+   b [char] . = or b [char] _ = or ;
+
+: HEX ( n -- n ) dup 10 < if [char] 0 + else 55 + then ;
+
+\ Copies the bytes to p; answers the address after them.
+: PUT ( ^u8 ^u8 n -- ^u8 )
+   {: p:^ a:^ u:n :}
+   a p u BYTE-COPY p u + ;
+
+\ A byte as form_urlencoded writes it: kept, a space as +, or %XX.
+: FORM-BYTE ( ^u8 n -- ^u8 )
+   {: p:^ b:n :}
+   b KEPT? if b p c! p 1 + exit then
+   b STR-SPACE = if [char] + p c! p 1 + exit then
+   [char] % p c!
+   b 4 rshift HEX p 1 + c!
+   b 15 and HEX p 2 + c!
+   p 3 + ;
+
+: FORM ( ^u8 ^u8 n -- ^u8 )
+   {: p:^ a:^ u:n :}
+   p u 0 ?do a i + c@ FORM-BYTE loop ;
+
+\ The SDK's PKCE challenge: the verifier's SHA-256 in unpadded base64url.
+: CHALLENGE ( ^u8 n ^ARENA:arena -- ^u8 n )
+   {: v:^ vu:n ar :}
+   ar SHA256-CTX-BYTES ARENA:ALLOC drop {: ctx:^ :}
+   ar 32 ARENA:ALLOC {: d:^ du:n :}
+   ctx v vu d SHA256-IN
+   ar PROOF-CHARS ARENA:ALLOC {: c:^ cu:n :}
+   d du c cu SPAN:MAKE BASE64:ENCODE-URL {: n:n :}
+   c n ;
+
+\ The authorize URL's parameters, as AuthorizeUrlBuilder appends them
+\ for a PKCE code flow with token type ShortLivedAndRefresh and a scope.
+: QUERY ( ^u8 ^u8 n ^u8 n -- ^u8 )
+   {: p:^ k:^ ku:n c:^ cu:n :}
+   p BASE$ PUT k ku FORM TYPE$ PUT SCOPE FORM
+   CHALLENGE$ PUT c cu FORM METHOD$ PUT ;
+
+\ The URL for the app key and the verifier; a value at most triples.
+: AUTHORIZE-URL ( ^u8 n ^u8 n ^ARENA:arena -- str )
+   {: k:^ ku:n v:^ vu:n ar :}
+   v vu ar CHALLENGE {: c:^ cu:n :}
+   FIXED ku SCOPE nip + 3 * + cu + {: cap:n :}
+   ar cap ARENA:ALLOC drop {: d:^ :}
+   d k ku c cu QUERY {: e:^ :}
+   d e d - >str ;
+
+: RANDOM ( ^u8 n -- )
+   {: b:^ u:n :}
+   [: b u ENTROPY:FILL ;] catch {: code:n :}
+   code ENTROPY:E-FILL = if E-RANDOM FAIL then
+   code 0<> if code throw then ;
+
+\ rust random_urlsafe: 32 random bytes in unpadded base64url.
+: PROOF ( ^ARENA:arena -- str )
+   {: ar :}
+   ar PROOF-BYTES ARENA:ALLOC {: b:^ bu:n :}
+   b bu RANDOM
+   ar PROOF-CHARS ARENA:ALLOC {: v:^ vu:n :}
+   b bu v vu SPAN:MAKE BASE64:ENCODE-URL {: n:n :}
+   v n >str ;
+
 public
 
 \ Names the item's attributes and label as `secret-tool store` wrote
@@ -255,5 +358,21 @@ public
    dest FETCH {: u:n found:bool :}
    found 0= if construct lookup unavailable exit then
    dest SPAN:$ drop u ar CREDENTIAL ;
+
+
+\ A login for the app key with a fresh verifier, in the arena.
+: START ( ^u8 n ^ARENA:arena -- ^pending )
+   {: k:^ ku:n ar :}
+   ar PROOF {: v:str :}
+   ar PENDINGS-NEW {: p :}
+   v p PENDING-VERIFIER !
+   k ku v str> ar AUTHORIZE-URL p PENDING-URL !
+   p ;
+
+\ The URL the user opens to authorize Omabox.
+: URL ( ^pending -- ^u8 n ) PENDING-URL @ str> ;
+
+\ The verifier DROPBOX:EXCHANGE sends with the code.
+: VERIFIER ( ^pending -- ^u8 n ) PENDING-VERIFIER @ str> ;
 
 ;package

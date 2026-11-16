@@ -8,7 +8,9 @@
 \ cannot write as UTF-8; a record of 8191 bytes read back, one of 8192
 \ bytes or more, written or read; and version 2. Each refusal's log
 \ line is captured in TMPDIR, checked to be one line with its text and
-\ not the word sentinel, and removed.
+\ not the word sentinel, and removed. A login's URL for RFC 7636's
+\ example verifier, written out by dropbox-sdk 0.20.3's rules, and two
+\ STARTs' verifiers.
 \ Run from the repository root: hb --load src/auth-test.f </dev/null
 require src/lib/arena.f
 require src/lib/span.f
@@ -253,6 +255,41 @@ FILL-FILLER
    LOGGED ;
 
 
+\ RFC 7636 appendix B's verifier and its challenge. The key holds a
+\ space, a byte form_urlencoded encodes and one it keeps.
+: FIXED-URL ( ^ARENA:arena -- )
+   {: ar :}
+   s" app-key 1~*" s" dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+   ar AUTHORIZE-URL str>
+   s" https://www.dropbox.com/oauth2/authorize?response_type=code&client_id=app-key+1%7E*&token_access_type=offline&scope=account_info.read+files.metadata.read+files.content.read+files.content.write&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256"
+   T$= ;
+
+: PKCE-AUTHORIZATION-USES-OFFLINE-CODE-FLOW ( ^ARENA:arena -- )
+   {: ar :}
+   s" pkce_authorization_uses_offline_code_flow" T-LABEL
+   ar FIXED-URL
+   s" app-key" ar START {: p :}
+   p URL s" app-key" p VERIFIER ar AUTHORIZE-URL str> T$= ;
+
+: URL-SAFE? ( n -- bool )
+   {: b:n :}
+   b STR-ALNUM? b [char] - = or b [char] _ = or ;
+
+: PROOF-SHAPE ( ^u8 n -- )
+   {: v:^ u:n :}
+   u 43 T=
+   u 0 ?do v i + c@ URL-SAFE? TTRUE loop ;
+
+: START-DRAWS-A-FRESH-VERIFIER ( ^ARENA:arena -- )
+   {: ar :}
+   s" start_draws_a_fresh_verifier" T-LABEL
+   s" app-key" ar START {: a :}
+   s" app-key" ar START {: b :}
+   a VERIFIER PROOF-SHAPE
+   b VERIFIER PROOF-SHAPE
+   a VERIFIER b VERIFIER STR= TFALSE ;
+
+
 : CASES ( ^ARENA:arena -- )
    {: ar :}
    SECRET-TOOL-STORE-USES-FIXED-ARGUMENTS-AND-EXACT-JSON-STDIN
@@ -260,7 +297,9 @@ FILL-FILLER
    SECRET-TOOL-PARSER-DIAGNOSTICS-DO-NOT-ECHO-OUTPUT
    SECRET-TOOL-DATA-ERROR-DIAGNOSTICS-DO-NOT-ECHO-OUTPUT
    CREDENTIAL-OF-8192-BYTES-OR-MORE-IS-TOO-LARGE
-   STORED-CREDENTIAL-VERSION-2-IS-UNSUPPORTED ;
+   STORED-CREDENTIAL-VERSION-2-IS-UNSUPPORTED
+   ar PKCE-AUTHORIZATION-USES-OFFLINE-CODE-FLOW
+   ar START-DRAWS-A-FRESH-VERIFIER ;
 
 
 : TESTS ( -- )
