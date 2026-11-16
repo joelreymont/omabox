@@ -2,7 +2,8 @@
 \ src/recovery.rs): what a replay pass reports, the outcomes its steps
 \ answer, the journal steps that finish, supersede or complete a plan,
 \ the replay of the plans' local operations, a staged upload's local
-\ conflict copy, the retention of legacy recovery payloads, and each
+\ conflict copy, the bridge that stages a Dropbox revision's bytes
+\ through LOCAL, the retention of legacy recovery payloads, and each
 \ Dropbox mutation's outcome. A LOCAL call whose failures REPLAY
 \ converts into outcomes runs under LOCAL:CONVERTING, so nothing logs
 \ those; any other LOCAL, JOURNAL or DROPBOX failure passes up with its
@@ -13,10 +14,11 @@
 \ thrown as E-INVALID-STATE. A failed retention or upload-stage syscall
 \ is logged once, as LOCAL logs one, and thrown as LOCAL's E-IO.
 \ STORAGE CLASS. No state of its own. CALLER-OWNED: a report, its
-\ vector, a local replay's run, and every value a journal step or a
-\ conflict copy reads lie in the arena the caller passes. A retention
-\ pass lays its values in an arena of its own. Retention, the conflict
-\ copy and an upload close every descriptor they open, on every exit.
+\ vector, a local replay's run, a download's bridge, and every value a
+\ journal step or a conflict copy reads lie in the arena the caller
+\ passes. A retention pass lays its values in an arena of its own.
+\ Retention, the conflict copy, an upload and the bridge close every
+\ descriptor they open, on every exit.
 
 require src/lib/error.f
 require src/lib/string.f
@@ -31,6 +33,7 @@ require src/lib/fs.f
 require src/lib/fs-anchored.f
 require src/lib/fd.f
 require src/lib/fsm.f
+require src/lib/time.f
 require src/dropbox.f
 require src/model.f
 require src/journal.f
@@ -1456,5 +1459,273 @@ ARENA UPLOADS DROPBOX:upload
    ( ^link MODEL:path ^ARENA:arena -- mutation-outcome )
    {: l path ar :}
    l path ar [: l path ar CLEARED ;] TARGETED ;
+
+
+\ ---- the download bridge ---------------------------------------------
+
+private
+
+\ Rust's PROGRESS_INTERVAL, in nanoseconds.
+250000000 constant PROGRESS-INTERVAL
+
+\ One exact download. partial: a prepared partial no LOCAL word has taken;
+\ sampled is TIME:MONO-NS; shown: a progress went out.
+STRUCTURE bridge DERIVE addr
+   FIELD link ^link
+   FIELD root fd
+   FIELD root-path str
+   FIELD target MODEL:path
+   FIELD path MODEL:path
+   FIELD want DROPBOX:hash
+   FIELD arena ^ARENA:arena
+   FIELD partial option<^LOCAL:download-partial>
+   FIELD outcome LOCAL:stage-outcome<n>
+   FIELD done n
+   FIELD total n
+   FIELD sampled n
+   FIELD emitted n
+   FIELD shown bool
+;STRUCTURE
+
+ARENA BRIDGES bridge
+
+: NO-PARTIAL ( -- option<^LOCAL:download-partial> ) OPTION:NONE ;
+: SOME-PARTIAL
+   ( ^LOCAL:download-partial -- option<^LOCAL:download-partial> )
+   OPTION:SOME ;
+: NO-STAGE ( -- option<LOCAL:stage-outcome<n>> ) OPTION:NONE ;
+
+\ The root's descriptor and path, and the target's text.
+: TARGET-AT ( ^bridge -- fd ^u8 n ^u8 n )
+   {: x :}
+   x BRIDGE-ROOT @ x BRIDGE-ROOT-PATH @ str>
+   x BRIDGE-TARGET @ MODEL:PATH>STR str> ;
+
+: HELD? ( ^bridge -- bool )
+   BRIDGE-PARTIAL @ MATCH option
+      none OF false ENDOF
+      some OF drop true ENDOF
+   ;MATCH ;
+
+\ The partial the bridge held, now its taker's to free.
+: TAKE-PARTIAL ( ^bridge -- option<^LOCAL:download-partial> )
+   {: x :}
+   x BRIDGE-PARTIAL @ NO-PARTIAL x BRIDGE-PARTIAL ! ;
+
+
+\ ---- progress
+
+: FETCH-SAMPLE ( ^bridge -- STATUS:transfer )
+   {: x :}
+   STATUS-DIRECTION:DOWNLOAD x BRIDGE-PATH @ MODEL:PATH>STR
+   x BRIDGE-DONE @ x BRIDGE-TOTAL @ OPTION:SOME STATUS-TRANSFER:MAKE ;
+
+: FETCH-STATUS ( ^bridge -- ^STATUS:status )
+   BRIDGE-LINK @ REPLAY-LINK:STATUS @ ;
+
+: PROGRESSED ( ^bridge -- )
+   {: x :}
+   x FETCH-SAMPLE STATUS-EVENT:PROGRESS x FETCH-STATUS STATUS:TRANSFER
+   x BRIDGE-DONE @ x BRIDGE-EMITTED !
+   true x BRIDGE-SHOWN ! ;
+
+\ Rust's ProgressReader::read: a sample is due at the body's end, at
+\ its total, or PROGRESS-INTERVAL after the last, if done moved.
+: DUE? ( ^bridge n n -- bool )
+   {: x k:n now:n :}
+   x BRIDGE-DONE @ {: d:n :}
+   k 0= d x BRIDGE-TOTAL @ >= or
+   now x BRIDGE-SAMPLED @ - PROGRESS-INTERVAL >= or
+   d x BRIDGE-EMITTED @ <> and ;
+
+: TALLIED ( ^bridge n -- )
+   {: x k:n :}
+   k x BRIDGE-DONE +!
+   TIME:MONO-NS {: now:n :}
+   x k now DUE? 0= if exit then
+   x PROGRESSED now x BRIDGE-SAMPLED ! ;
+
+\ The body's reader: f's next bytes into p, counted; its first call
+\ sends a progress.
+: COUNTED-READ ( ^u8 n ^DROPBOX:fetch ^bridge -- n )
+   {: p:^ room:n f x :}
+   x BRIDGE-SHOWN @ 0= if
+      TIME:MONO-NS x BRIDGE-SAMPLED ! x PROGRESSED
+   then
+   p room f DROPBOX:READ-BODY {: k:n :}
+   x k TALLIED k ;
+
+\ Rust's drop of a ProgressReader, once a progress went out.
+: FETCH-FINISHED ( ^bridge -- )
+   {: x :}
+   x BRIDGE-SHOWN @ 0= if exit then
+   x FETCH-SAMPLE STATUS-EVENT:FINISHED x FETCH-STATUS STATUS:TRANSFER ;
+
+
+\ ---- the body
+
+\ The body appended to the partial up to size; it frees the partial.
+: RESUME-INTO
+   ( ^bridge ^LOCAL:download-partial n ^DROPBOX:fetch
+     -- LOCAL:stage-outcome<n> )
+   {: x p size:n f :}
+   p size [: f x COUNTED-READ ;] x BRIDGE-ARENA @
+   LOCAL:APPEND-PARTIAL ;
+
+: STAGE-NEW ( ^bridge ^DROPBOX:fetch -- LOCAL:stage-outcome<n> )
+   {: x f :}
+   x TARGET-AT x BRIDGE-WANT @ [: f x COUNTED-READ ;]
+   x BRIDGE-ARENA @ LOCAL:STAGE-DOWNLOAD-AT ;
+
+\ After a 416 that is not complete: the partial's slot emptied, then
+\ the body staged from 0; a complete one answers with the body unread.
+: RESTART-INTO
+   ( ^bridge ^LOCAL:download-partial n ^DROPBOX:fetch
+     -- LOCAL:stage-outcome<n> )
+   {: x p size:n f :}
+   p LOCAL:RESTART-PARTIAL MATCH LOCAL:download-preparation
+      ready OF {: q :} x q size f RESUME-INTO ENDOF
+      complete OF ENDOF
+      ephemeral OF x f STAGE-NEW ENDOF
+   ;MATCH ;
+
+\ DOWNLOAD's body. A start other than the partial's offset is a restart
+\ from 0; a 416 at the offset arrives with the fetch at its end.
+: RECEIVED ( n n ^DROPBOX:fetch ^bridge -- )
+   {: start:n size:n f x :}
+   start x BRIDGE-DONE ! size x BRIDGE-TOTAL !
+   x TAKE-PARTIAL MATCH option
+      none OF x f STAGE-NEW ENDOF
+      some OF {: p :}
+         start p LOCAL:PARTIAL-OFFSET@ = if x p size f RESUME-INTO
+         else x p size f RESTART-INTO then
+      ENDOF
+   ;MATCH x BRIDGE-OUTCOME ! ;
+
+
+\ ---- preparation and the call
+
+\ A ready partial goes to the bridge; a complete stage answers.
+: PREPARED
+   ( LOCAL:download-preparation ^bridge -- option<LOCAL:stage-outcome<n>> )
+   {: x :}
+   MATCH LOCAL:download-preparation
+      ready OF SOME-PARTIAL x BRIDGE-PARTIAL ! NO-STAGE ENDOF
+      complete OF OPTION:SOME ENDOF
+      ephemeral OF NO-STAGE ENDOF
+   ;MATCH ;
+
+\ o, else what q answers when o is none.
+: OR-ELSE
+   ( option<LOCAL:stage-outcome<n>> [ -- option<LOCAL:stage-outcome<n>> ]
+     -- option<LOCAL:stage-outcome<n>> )
+   {: o q :}
+   o MATCH option
+      none OF q execute ENDOF
+      some OF OPTION:SOME ENDOF
+   ;MATCH ;
+
+: LEASED-SLOT
+   ( option<LOCAL:download-slot-lease> ^bridge
+     -- option<LOCAL:stage-outcome<n>> )
+   {: lease x :}
+   lease MATCH option
+      none OF NO-STAGE ENDOF
+      some OF {: l:LOCAL:download-slot-lease :}
+         x TARGET-AT x BRIDGE-WANT @ l x BRIDGE-ARENA @
+         LOCAL:PREPARE-DOWNLOAD-SLOT-AT x PREPARED
+      ENDOF
+   ;MATCH ;
+
+\ An unnamed file in the staging directory s, empty for none.
+: DISPOSABLE-FILE ( ^u8 n ^bridge -- option<LOCAL:stage-outcome<n>> )
+   {: s:^ su:n x :}
+   x HELD? su 0= or if NO-STAGE exit then
+   x TARGET-AT x BRIDGE-WANT @ s su x BRIDGE-ARENA @
+   LOCAL:PREPARE-DISPOSABLE-DOWNLOAD-AT x PREPARED ;
+
+: EXISTING-STAGE ( ^bridge -- option<LOCAL:stage-outcome<n>> )
+   {: x :}
+   x HELD? if NO-STAGE exit then
+   x TARGET-AT x BRIDGE-WANT @ x BRIDGE-ARENA @
+   LOCAL:EXISTING-DOWNLOAD-STAGE-AT ;
+
+: PREPARE
+   ( option<LOCAL:download-slot-lease> ^u8 n ^bridge
+     -- option<LOCAL:stage-outcome<n>> )
+   {: lease s:^ su:n x :}
+   lease x LEASED-SLOT [: s su x DISPOSABLE-FILE ;] OR-ELSE
+   [: x EXISTING-STAGE ;] OR-ELSE ;
+
+: RESUME-OFFSET ( ^bridge -- n )
+   BRIDGE-PARTIAL @ MATCH option
+      none OF 0 ENDOF
+      some OF LOCAL:PARTIAL-OFFSET@ ENDOF
+   ;MATCH ;
+
+\ The rev's bytes from the partial's offset.
+: FETCHED ( MODEL:remote ^bridge -- LOCAL:stage-outcome<n> )
+   {: rem x :}
+   rem MODEL-REMOTE:UNMAKE {: c v :}
+   x BRIDGE-LINK @ {: k :}
+   v DROPBOX:REV>STR str> x RESUME-OFFSET k REPLAY-LINK:CLIENT @
+   [: x RECEIVED ;] DROPBOX:DOWNLOAD {: r:DROPBOX:reply :}
+   r MATCH DROPBOX:reply
+      done OF ENDOF
+      refused OF drop r k STOP-PASS ENDOF
+      retry OF drop r k STOP-PASS ENDOF
+      unlinked OF r k STOP-PASS ENDOF
+   ;MATCH
+   x BRIDGE-OUTCOME @ ;
+
+: STAGED-BY
+   ( MODEL:remote option<LOCAL:download-slot-lease> ^u8 n ^bridge
+     -- LOCAL:stage-outcome<n> )
+   {: rem lease s:^ su:n x :}
+   lease s su x PREPARE MATCH option
+      none OF rem x FETCHED ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+\ Frees a partial no LOCAL word took.
+: RELEASED ( ^bridge -- )
+   TAKE-PARTIAL MATCH option
+      none OF ENDOF
+      some OF LOCAL:CLOSE-PARTIAL ENDOF
+   ;MATCH ;
+
+: NEW-BRIDGE
+   ( ^link fd ^u8 n MODEL:path MODEL:path DROPBOX:hash ^ARENA:arena
+     -- ^bridge )
+   {: k root:fd r:^ ru:n t p c ar :}
+   ar BRIDGES-NEW {: x :}
+   k x BRIDGE-LINK ! root x BRIDGE-ROOT ! r ru >str x BRIDGE-ROOT-PATH !
+   t x BRIDGE-TARGET ! p x BRIDGE-PATH ! c x BRIDGE-WANT !
+   ar x BRIDGE-ARENA ! NO-PARTIAL x BRIDGE-PARTIAL !
+   x ;
+
+\ Rust's stage_exact_download_for_access_at: target t's stage, its
+\ transfer shown as p; s is the staging directory, empty for none.
+: STAGE-EXACT-DOWNLOAD-FOR-AT
+   ( ^link fd ^u8 n MODEL:path MODEL:path MODEL:remote
+     option<LOCAL:download-slot-lease> ^u8 n ^ARENA:arena
+     -- LOCAL:stage-outcome<n> )
+   {: k root:fd r:^ ru:n t p rem lease s:^ su:n ar :}
+   rem MODEL-REMOTE:UNMAKE {: c v :}
+   k root r ru t p c ar NEW-BRIDGE {: x :}
+   [: rem lease s su x STAGED-BY ;] [: x RELEASED x FETCH-FINISHED ;]
+   finally ;
+
+public
+
+\ Rust's stage_worker_download_at: path's stage below root path r,
+\ through the lease's slot, else an unnamed file in s.
+: STAGE-EXACT-DOWNLOAD-AT
+   ( ^link fd ^u8 n MODEL:path MODEL:remote
+     option<LOCAL:download-slot-lease> ^u8 n ^ARENA:arena
+     -- LOCAL:stage-outcome<n> )
+   {: k root:fd r:^ ru:n path rem lease s:^ su:n ar :}
+   k root r ru path path rem lease s su ar
+   STAGE-EXACT-DOWNLOAD-FOR-AT ;
 
 ;package

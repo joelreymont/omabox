@@ -33,6 +33,16 @@
 \   transfer to a STATUS in TMPDIR; one Dropbox refuses as a conflict
 \   with other bytes at the path is read back as changed, and its
 \   finished transfer is sent.
+\ - STAGE-EXACT-DOWNLOAD-AT against the fake Dropbox: Rust's
+\   exact_download_retry_reuses_a_stage_without_consuming_the_body,
+\   exact_download_stage_race_preserves_verified_stage, with the stage
+\   back while the call is in flight, and
+\   corrupt_exact_download_never_leaves_installable_bytes; a download
+\   lost mid-body throws E-DROPBOX with a retry, keeps its slot and
+\   leaks no descriptor, and the next stages it; a slot holding a
+\   checkpoint: a 416 at its length finishes the stage, a lost answer
+\   keeps it, sent with its Range, and another 416 restarts it; a
+\   download's progress, then finished, in a status under TMPDIR.
 \ Run from the repository root: hb --load src/replay-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -46,19 +56,20 @@ require src/lib/fs-anchored.f
 require src/lib/fd.f
 require src/lib/vector.f
 require src/lib/adt/option.f
+require src/lib/fs-list.f
+require src/lib/aio.f
+require src/lib/net/curl.f
 require src/dropbox.f
+require src/test-dropbox.f
 require src/model.f
 require src/journal.f
 require src/test-journal.f
 require src/local.f
 require src/status.f
-require src/lib/aio.f
-require src/lib/net/curl.f
-require src/test-dropbox.f
 require src/replay.f
 
-\ REPLAY reopened for the retention words the Rust tests call and the
-\ Dropbox mutations' steps.
+\ REPLAY reopened for the retention words the Rust tests call, the
+\ Dropbox mutations' steps, and the checkpoint a slot resumes from.
 package REPLAY
 public
 EXPORT PRUNE-COMPLETED-RECOVERIES-AT
@@ -75,6 +86,7 @@ EXPORT EXPECTATION-DELETE-FOLDER
 EXPORT REMOTE-CREATE-FOLDER
 EXPORT REMOTE-UPLOAD
 EXPORT REMOTE-DELETE-FOLDER
+EXPORT LOCAL:DOWNLOAD-CHECKPOINT-BYTES
 ;package
 
 package REPLAY-TEST
@@ -1191,11 +1203,467 @@ LOG-CAP BUFFER: LOG-TEXT
       ar REMOTE-CASES ;]
    [: MAIN @ DROPBOX:CLOSE ;] finally ;
 
+
+\ ---- the download bridge -------------------------------------------
+
+TYPED-VARIABLE LINK REPLAY:link
+TYPED-VARIABLE RUNTIME str
+TYPED-VARIABLE ASIDE str
+TYPED-VARIABLE STAGE-AT str
+TYPED-VARIABLE HASHING DROPBOX:hasher
+variable REMAINING
+
+4096 constant CAP
+CAP BUFFER: TEXT
+$10000 constant XS-SIZE
+XS-SIZE BUFFER: XS
+
+: FILL-XS ( -- ) XS-SIZE 0 ?do $78 XS i + c! loop ;
+
+
+\ A client on the fake with the refresh token t, as CFG's store has it.
+: OPENED-WITH ( ^u8 n ^ARENA:arena -- ^DROPBOX:client )
+   {: t:^ tu:n ar :}
+   CFG DROPBOX:PRODUCTION
+   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:API !
+   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:NOTIFY !
+   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:CONTENT !
+   s" fake-key" SPAN:MAKE CFG DROPBOX-CONFIG:KEY !
+   t tu SPAN:MAKE CFG DROPBOX-CONFIG:TOKEN !
+   s" " SPAN:MAKE CFG DROPBOX-CONFIG:ROOT !
+   CFG ar DROPBOX:OPEN ;
+
+: KEPT ( ^u8 n -- ) 2drop ;
+
+: LINKED ( ^DROPBOX:client -- ) LINK REPLAY-LINK:CLIENT ! ;
+
+: SERVES ( ^u8 n ^u8 n ^u8 n DROPBOX:hash -- )
+   {: p:^ pu:n v:^ vu:n b:^ bu:n c:DROPBOX:hash :}
+   p pu p pu v vu c DROPBOX:HASH>STR str> bu TEST-DROPBOX:FILE!
+   v vu b bu TEST-DROPBOX:CONTENT! ;
+
+: REMOTE-OF ( DROPBOX:hash ^u8 n -- MODEL:remote )
+   >str DROPBOX:>REV MODEL-REMOTE:MAKE ;
+
+: OPEN-ROOT ( str -- fd ) str> s" open test sync root" LOCAL:OPEN-ROOT ;
+
+: NO-LEASE ( -- option<LOCAL:download-slot-lease> ) OPTION:NONE ;
+
+: UNPROTECTED ( LOCAL:binding -- bool ) drop false ;
+
+\ The case directory d's slot for target t's download of the remote.
+: LEASE-FOR
+   ( str ^u8 n MODEL:remote -- option<LOCAL:download-slot-lease> )
+   {: d:str t:^ tu:n rem:MODEL:remote :}
+   1 1 t tu rem LOCAL:NEW-SLOT-IDENTITY
+   {: id:LOCAL:download-slot-identity :}
+   d str> id [: UNPROTECTED ;] LOCAL:LEASE-DOWNLOAD-SLOT ;
+
+: LEASED
+   ( option<LOCAL:download-slot-lease> -- LOCAL:download-slot-lease )
+   MATCH option
+      none OF s" replay-test: no download slot leased" FAILED ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+\ STAGE-EXACT-DOWNLOAD-AT of p's remote below the root r, open as root.
+: STAGED-AT
+   ( fd str ^u8 n MODEL:remote option<LOCAL:download-slot-lease>
+     ^ARENA:arena -- LOCAL:stage-outcome<n> )
+   {: root:fd r:str p:^ pu:n rem:MODEL:remote
+      lease:option<LOCAL:download-slot-lease> ar :}
+   LINK root r str> p pu DISPLAY rem lease s" " ar
+   REPLAY:STAGE-EXACT-DOWNLOAD-AT ;
+
+: DROP-STAGE ( LOCAL:stage-outcome<n> -- ) drop ;
+
+\ The outcome's variant, and its actual content or path, else empty.
+: STAGE$ ( LOCAL:stage-outcome<n> -- ^u8 n ^u8 n )
+   MATCH LOCAL:stage-outcome
+      staged OF drop s" staged" s" " ENDOF
+      already-staged OF drop s" already-staged" s" " ENDOF
+      content-changed OF {: a:DROPBOX:hash :}
+         s" content-changed" a DROPBOX:HASH>STR str>
+      ENDOF
+      destination-occupied OF {: p:str :}
+         s" destination-occupied" p str>
+      ENDOF
+   ;MATCH ;
+
+: AS ( LOCAL:stage-outcome<n> ^u8 n -- )
+   {: o w:^ wu:n :}
+   o STAGE$ 2drop w wu T$= ;
+
+: DONE? ( DROPBOX:reply -- bool )
+   MATCH DROPBOX:reply
+      done OF true ENDOF
+      refused OF drop false ENDOF
+      retry OF drop false ENDOF
+      unlinked OF false ENDOF
+   ;MATCH ;
+
+: RETRY? ( DROPBOX:reply -- bool )
+   MATCH DROPBOX:reply
+      done OF false ENDOF
+      refused OF drop false ENDOF
+      retry OF drop true ENDOF
+      unlinked OF false ENDOF
+   ;MATCH ;
+
+\ The stage of p's remote throws E-DROPBOX, its reply a retry.
+: STOPPED
+   ( fd str ^u8 n MODEL:remote option<LOCAL:download-slot-lease>
+     ^ARENA:arena -- )
+   {: root:fd r:str p:^ pu:n rem:MODEL:remote
+      lease:option<LOCAL:download-slot-lease> ar :}
+   [: root r p pu rem lease ar STAGED-AT DROP-STAGE ;]
+   REPLAY:E-DROPBOX TTHROWSQ
+   LINK REPLAY-LINK:REPLY @ RETRY? TTRUE ;
+
+: DOWNLOADS$ ( n -- ^u8 n )
+   {: k:n :}
+   SB-RESET
+   k 0 ?do
+      i 0 > if s"  " SB-APPEND then s" /2/files/download" SB-APPEND
+   loop SB$ ;
+
+: SEEN ( n -- ) DOWNLOADS$ TEST-DROPBOX:SEEN$ 2swap T$= ;
+
+: ALPHABET ( -- ^u8 n ) s" abcdefghijklmnopqrstuvwxyz" ;
+
+: FIRST-LINE ( ^u8 n -- ^u8 n )
+   {: p:^ u:n :}
+   u 0 ?do p i + c@ 10 = if p i unloop exit then loop
+   p u ;
+
+\ The case directory's download slot, listed first by its leading dot.
+: SLOT-PATH ( str ^ARENA:arena -- str )
+   {: d:str ar :}
+   d str> TEXT CAP FS-LIST:NAMES {: u:n :}
+   TEXT u FIRST-LINE {: n:^ nu:n :}
+   nu 22 >= TTRUE
+   n 22 s" .omabox-download-slot-" T$=
+   d n nu ar INSIDE ;
+
+variable HELD
+
+\ The list's first name, after the rest past its newline.
+: NEXT-NAME ( ^u8 n -- ^u8 n ^u8 n )
+   {: p:^ u:n :}
+   u 0 ?do
+      p i + c@ 10 = if p i + 1+ u i - 1- p i unloop exit then
+   loop
+   p u + 0 p u ;
+
+: SAME-FILE? ( ^u8 n n n -- bool )
+   {: nm:^ nu:n dev:n ino:n :}
+   SB-RESET s" /proc/self/fd/" SB-APPEND nm nu SB-APPEND
+   SB$ FS:TRY-STAT 0= if false exit then
+   FS:STAT-DEV@ dev = FS:STAT-INO@ ino = and ;
+
+\ How many of this process's descriptors hold the file at p.
+: HOLDERS ( ^u8 n -- n )
+   {: p:^ u:n :}
+   p u FS:TRY-STAT TTRUE
+   FS:STAT-DEV@ FS:STAT-INO@ {: dev:n ino:n :}
+   0 HELD !
+   s" /proc/self/fd" TEXT CAP FS-LIST:NAMES {: k:n :}
+   TEXT k begin dup 0 > while
+      NEXT-NAME dev ino SAME-FILE? if 1 HELD +! then
+   repeat 2drop HELD @ ;
+
+\ Rust's FailingBytes: "x" bytes until none remain, then a reset
+\ connection.
+: FAILING ( ^u8 n -- n )
+   {: dst:^ cap:n :}
+   REMAINING @ 0= if 104 FS:CAUSE! E-FS-IO throw then
+   REMAINING @ cap min XS-SIZE min {: k:n :}
+   XS dst k BYTE-COPY
+   k negate REMAINING +!
+   k ;
+
+: READY-PARTIAL ( LOCAL:download-preparation -- ^LOCAL:download-partial )
+   MATCH LOCAL:download-preparation
+      ready OF ENDOF
+      complete OF DROP-STAGE s" replay-test: no partial" FAILED ENDOF
+      ephemeral OF s" replay-test: no partial" FAILED ENDOF
+   ;MATCH ;
+
+: CHECKPOINT ( -- n ) REPLAY:DOWNLOAD-CHECKPOINT-BYTES ;
+
+\ The lease's slot holding a durable checkpoint of CHECKPOINT "x"
+\ bytes for target t, as a transfer lost just past it leaves it.
+: CHECKPOINTED
+   ( fd str ^u8 n DROPBOX:hash LOCAL:download-slot-lease ^ARENA:arena
+     -- )
+   {: root:fd r:str t:^ tu:n c:DROPBOX:hash
+      l:LOCAL:download-slot-lease ar :}
+   root r str> t tu c l ar LOCAL:PREPARE-DOWNLOAD-SLOT-AT READY-PARTIAL
+   {: x :}
+   CHECKPOINT 1+ REMAINING !
+   [: x CHECKPOINT DROPBOX:BLOCK + [: FAILING ;] ar
+      LOCAL:APPEND-PARTIAL DROP-STAGE ;]
+   [: 2drop true ;] LOCAL:CONVERTING LOCAL:E-STAGE-READ T= ;
+
+\ The content hash of CHECKPOINT "x" bytes.
+: CHECKPOINT-HASH ( ^ARENA:arena -- DROPBOX:hash )
+   {: ar :}
+   HASHING DROPBOX:HASH-BEGIN
+   CHECKPOINT XS-SIZE / 0 ?do XS XS-SIZE HASHING DROPBOX:HASH-FEED loop
+   HASHING DROPBOX:HASH-END ar COPIED DROPBOX:>HASH ;
+
+\ A reader of the pipe's bytes into LOCAL.
+: STAGE-FROM
+   ( fd str ^u8 n DROPBOX:hash fd ^ARENA:arena -- LOCAL:stage-outcome<n> )
+   {: root:fd r:str t:^ tu:n c:DROPBOX:hash rd:fd ar :}
+   root r str> t tu c [: rd -rot LOCAL:FD-READ ;] ar
+   LOCAL:STAGE-DOWNLOAD-AT ;
+
+\ The bytes b staged for target t below the root, as another download
+\ stages them.
+: PRESTAGED
+   ( fd str ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+     -- LOCAL:stage-outcome<n> )
+   {: root:fd r:str t:^ tu:n b:^ bu:n c:DROPBOX:hash ar :}
+   FD:PIPE {: rd:fd w:fd :}
+   w b bu FD:WRITE-FULL w FS:CLOSE-DIR
+   [: root r t tu c rd ar STAGE-FROM ;] [: rd FS:CLOSE-DIR ;] finally ;
+
+\ The race client's store: it runs while DOWNLOAD's call is in flight,
+\ after the bridge found no stage, and the verified stage reappears.
+: RETURNED ( ^u8 n -- )
+   2drop ASIDE @ str> STAGE-AT @ str> FS:RENAME-FILE ;
+
+: NO-CONTENT ( -- option<DROPBOX:hash> ) OPTION:NONE ;
+
+: INSTALLED? ( LOCAL:install-outcome -- bool )
+   MATCH LOCAL:install-outcome
+      installed OF true ENDOF
+      already-installed OF false ENDOF
+      download-required OF false ENDOF
+      stage-destination-occupied OF drop false ENDOF
+      precondition-changed OF drop false ENDOF
+   ;MATCH ;
+
+\ The file at p below r holds b.
+: HOLDS ( str ^u8 n ^u8 n ^ARENA:arena -- )
+   {: r:str p:^ pu:n b:^ bu:n ar :}
+   r p pu ar INSIDE str> TEXT CAP FS:READ-ALL {: u:n :}
+   TEXT u b bu T$= ;
+
+: EXACT-DOWNLOAD-RETRY-REUSES-A-STAGE-WITHOUT-CONSUMING-THE-BODY
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" exact_download_retry_reuses_a_stage_without_consuming_the_body"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   s" already staged Dropbox bytes" {: b:^ bu:n :}
+   b bu ar HASH-OF {: c:DROPBOX:hash :}
+   s" /staged.txt" s" staged-revision" b bu c SERVES
+   c s" staged-revision" REMOTE-OF {: rem:MODEL:remote :}
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r OPEN-ROOT {: root:fd :}
+   root r s" staged.txt" rem NO-LEASE ar STAGED-AT s" staged" AS
+   root r s" staged.txt" rem NO-LEASE ar STAGED-AT
+   s" already-staged" AS
+   1 SEEN
+   root FS:CLOSE-DIR
+   d GONE ;
+
+\ The verified stage moved aside, to come back while the call is in
+\ flight.
+: SET-ASIDE ( str str ^ARENA:arena -- )
+   {: d:str r:str ar :}
+   r str> TEXT CAP FS-LIST:NAMES {: u:n :}
+   r TEXT u ar INSIDE STAGE-AT !
+   d s" aside" ar INSIDE ASIDE !
+   STAGE-AT @ str> ASIDE @ str> FS:RENAME-FILE ;
+
+\ A fresh client refreshes its token first, and stores the rotated
+\ refresh token through RETURNED.
+: RACED ( fd str MODEL:remote ^ARENA:arena -- LOCAL:stage-outcome<n> )
+   {: root:fd r:str rem:MODEL:remote ar :}
+   [: RETURNED ;] CFG DROPBOX-CONFIG:STORE !
+   s" replay-refresh-2" TEST-DROPBOX:ROTATE!
+   s" replay-refresh" ar OPENED-WITH {: c :}
+   c LINKED
+   [: root r s" raced.txt" rem NO-LEASE ar STAGED-AT ;]
+   [: c DROPBOX:CLOSE MAIN @ LINKED
+      s" fake-key" s" replay-refresh" TEST-DROPBOX:ACCEPT! ;] finally ;
+
+: EXACT-DOWNLOAD-STAGE-RACE-PRESERVES-VERIFIED-STAGE ( ^ARENA:arena -- )
+   {: ar :}
+   s" exact_download_stage_race_preserves_verified_stage" T-LABEL
+   TEST-DROPBOX:RESET
+   s" complete expected Dropbox bytes" {: b:^ bu:n :}
+   b bu ar HASH-OF {: c:DROPBOX:hash :}
+   s" /raced.txt" s" raced-revision" s" ignored response body, not read"
+   c SERVES
+   c s" raced-revision" REMOTE-OF {: rem:MODEL:remote :}
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r OPEN-ROOT {: root:fd :}
+   root r s" raced.txt" b bu c ar PRESTAGED s" staged" AS
+   d r ar SET-ASIDE
+   root r rem ar RACED s" already-staged" AS
+   TEST-DROPBOX:SEEN$ s" /oauth2/token /2/files/download" T$=
+   root r str> s" raced.txt" c NO-CONTENT ar LOCAL:INSTALL-DOWNLOAD-AT
+   INSTALLED? TTRUE
+   r s" raced.txt" b bu ar HOLDS
+   root FS:CLOSE-DIR
+   d GONE ;
+
+: CORRUPT-EXACT-DOWNLOAD-NEVER-LEAVES-INSTALLABLE-BYTES ( ^ARENA:arena -- )
+   {: ar :}
+   s" corrupt_exact_download_never_leaves_installable_bytes" T-LABEL
+   TEST-DROPBOX:RESET
+   s" expected download" ar HASH-OF {: c:DROPBOX:hash :}
+   s" corrupt response" {: b:^ bu:n :}
+   b bu ar HASH-OF {: actual:DROPBOX:hash :}
+   s" /corrupt.txt" s" rev-corrupt" b bu c SERVES
+   c s" rev-corrupt" REMOTE-OF {: rem:MODEL:remote :}
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r OPEN-ROOT {: root:fd :}
+   root r s" corrupt.txt" rem NO-LEASE ar STAGED-AT STAGE$
+   actual DROPBOX:HASH>STR str> T$= s" content-changed" T$=
+   r str> TEXT CAP FS-LIST:NAMES 0 T=
+   1 SEEN
+   root FS:CLOSE-DIR
+   d GONE ;
+
+: A-DOWNLOAD-LOST-MID-BODY-KEEPS-ITS-PARTIAL ( ^ARENA:arena -- )
+   {: ar :}
+   s" a download lost mid-body keeps its partial and resumes it" T-LABEL
+   TEST-DROPBOX:RESET
+   ALPHABET ar HASH-OF {: c:DROPBOX:hash :}
+   s" /lost.txt" s" lost-revision" ALPHABET c SERVES
+   c s" lost-revision" REMOTE-OF {: rem:MODEL:remote :}
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r OPEN-ROOT {: root:fd :}
+   d s" lost.txt" rem LEASE-FOR {: l:option<LOCAL:download-slot-lease> :}
+   TEST-DROPBOX:CUT-BODY
+   root r s" lost.txt" rem l ar STOPPED
+   d ar SLOT-PATH {: slot:str :}
+   slot str> HOLDERS 0 T=
+   slot str> FS:FILE-SIZE 0 T=
+   root r s" lost.txt" rem l ar STAGED-AT s" staged" AS
+   TEST-DROPBOX:RANGE-SENT? TFALSE
+   2 SEEN
+   root FS:CLOSE-DIR
+   d GONE ;
+
+\ Content-Range bytes */n.
+: UNSATISFIED$ ( n -- ^u8 n )
+   SB-RESET s" bytes */" SB-APPEND FMT:SB-INT SB$ ;
+
+: A-COMPLETE-416-FINISHES-THE-STAGE ( ^ARENA:arena -- )
+   {: ar :}
+   s" a 416 at the partial's length finishes the stage, unread" T-LABEL
+   TEST-DROPBOX:RESET
+   ar CHECKPOINT-HASH {: c:DROPBOX:hash :}
+   c s" full-revision" REMOTE-OF {: rem:MODEL:remote :}
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r OPEN-ROOT {: root:fd :}
+   d s" full.bin" rem LEASE-FOR LEASED {: l:LOCAL:download-slot-lease :}
+   root r s" full.bin" c l ar CHECKPOINTED
+   416 s" Content-Range" CHECKPOINT UNSATISFIED$ s" "
+   TEST-DROPBOX:SCRIPT!
+   root r s" full.bin" rem l OPTION:SOME ar STAGED-AT s" staged" AS
+   1 SEEN
+   root FS:CLOSE-DIR
+   d GONE ;
+
+: ANOTHER-416-RESTARTS-THE-SLOT ( ^ARENA:arena -- )
+   {: ar :}
+   s" a lost answer keeps the partial; another 416 restarts it" T-LABEL
+   TEST-DROPBOX:RESET
+   ALPHABET ar HASH-OF {: c:DROPBOX:hash :}
+   s" /restart.bin" s" restart-revision" ALPHABET c SERVES
+   c s" restart-revision" REMOTE-OF {: rem:MODEL:remote :}
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r OPEN-ROOT {: root:fd :}
+   d s" restart.bin" rem LEASE-FOR {: l:option<LOCAL:download-slot-lease> :}
+   root r s" restart.bin" c l LEASED ar CHECKPOINTED
+   d ar SLOT-PATH {: slot:str :}
+   TEST-DROPBOX:LOSE
+   root r s" restart.bin" rem l ar STOPPED
+   slot str> HOLDERS 0 T=
+   slot str> FS:FILE-SIZE CHECKPOINT T=
+   SB-RESET s" bytes=" SB-APPEND CHECKPOINT FMT:SB-INT s" -" SB-APPEND
+   SB$ TEST-DROPBOX:RANGE-SENT$ T$=
+   root r s" restart.bin" rem l ar STAGED-AT s" staged" AS
+   TEST-DROPBOX:RANGE-SENT? TFALSE
+   3 SEEN
+   root FS:CLOSE-DIR
+   d GONE ;
+
+\ The status file's text.
+: STATUS$ ( ^ARENA:arena -- ^u8 n )
+   {: ar :}
+   RUNTIME @ s" omabox/status.json" ar INSIDE str>
+   TEXT CAP FS:READ-ALL TEXT swap ;
+
+: PART-SHOWN$ ( -- ^u8 n )
+   s\" \"path\":\"docs/progress.txt\",\"bytes_done\":10,\"bytes_total\":26}" ;
+: ALL-SHOWN$ ( -- ^u8 n )
+   s\" \"path\":\"docs/progress.txt\",\"bytes_done\":26,\"bytes_total\":26}" ;
+
+: A-DOWNLOAD-REPORTS-ITS-TRANSFER ( ^ARENA:arena -- )
+   {: ar :}
+   s" a download sends progress, then finished on every exit" T-LABEL
+   TEST-DROPBOX:RESET
+   ALPHABET ar HASH-OF {: c:DROPBOX:hash :}
+   s" /docs/progress.txt" s" progress-revision" ALPHABET c SERVES
+   c s" progress-revision" REMOTE-OF {: rem:MODEL:remote :}
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r s" docs" ar INSIDE str> FS:MAKE-DIR
+   r OPEN-ROOT {: root:fd :}
+   TEST-DROPBOX:CUT-BODY
+   root r s" docs/progress.txt" rem NO-LEASE ar STOPPED
+   ar STATUS$ PART-SHOWN$ CONTAINS? TTRUE
+   root r s" docs/progress.txt" rem NO-LEASE ar STAGED-AT s" staged" AS
+   ar STATUS$ ALL-SHOWN$ CONTAINS? TTRUE
+   root FS:CLOSE-DIR
+   d GONE ;
+
+: BRIDGE-CASES ( ^ARENA:arena -- )
+   {: ar :}
+   ar EXACT-DOWNLOAD-RETRY-REUSES-A-STAGE-WITHOUT-CONSUMING-THE-BODY
+   ar EXACT-DOWNLOAD-STAGE-RACE-PRESERVES-VERIFIED-STAGE
+   ar CORRUPT-EXACT-DOWNLOAD-NEVER-LEAVES-INSTALLABLE-BYTES
+   ar A-DOWNLOAD-LOST-MID-BODY-KEEPS-ITS-PARTIAL
+   ar A-COMPLETE-416-FINISHES-THE-STAGE
+   ar ANOTHER-416-RESTARTS-THE-SLOT
+   ar A-DOWNLOAD-REPORTS-ITS-TRANSFER ;
+
+\ The link: the main client, its token fetched, and a status in a
+\ runtime directory of its own.
+: LINKING ( ^ARENA:arena -- )
+   {: ar :}
+   [: KEPT ;] CFG DROPBOX-CONFIG:STORE !
+   s" replay-refresh" ar OPENED-WITH MAIN !
+   MAIN @ LINKED
+   s" " >str LINK REPLAY-LINK:ROOT !
+   s" replay-status" FS:MKTEMP-DIR ar COPIED RUNTIME !
+   RUNTIME @ ar STATUS:NEW LINK REPLAY-LINK:STATUS !
+   MAIN @ DROPBOX:ACCOUNT DONE? TTRUE ;
+
+: BRIDGE-SERVED ( ^ARENA:arena -- )
+   {: ar :}
+   s" fake-key" s" replay-refresh" TEST-DROPBOX:ACCEPT!
+   s" " TEST-DROPBOX:ROOT!
+   FILL-XS
+   ar LINKING
+   [: ar BRIDGE-CASES ;]
+   [: MAIN @ DROPBOX:CLOSE RUNTIME @ GONE ;] finally ;
+
+
+\ The mutation and bridge cases against one fake Dropbox, under curl's
+\ loop.
 : DROPBOX-CASES ( ^ARENA:arena -- )
    {: ar :}
    AIO:START CURL:LOOP-START CURL-READY
    [: TEST-DROPBOX:START
-      [: ar SERVED ;] [: TEST-DROPBOX:STOP ;] finally ;]
+      [: ar SERVED ar BRIDGE-SERVED ;] [: TEST-DROPBOX:STOP ;] finally ;]
    [: CURL:LOOP-STOP AIO:STOP ;] finally ;
 
 
