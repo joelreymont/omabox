@@ -220,9 +220,9 @@ STRUCTURE config
 - **A mutation confirms an answer it cannot trust.** libcurl resends a POST
   on a new connection when a reused one closes before any answer byte, so a
   mutation Dropbox applied can come back lost. `UPLOAD`, `DELETE` and
-  `CREATE-FOLDER` then ask `get_metadata` whether Dropbox holds the
-  intended result: a file with the upload's content hash, no entry, or a
-  folder.
+  `CREATE-FOLDER` then ask `get_metadata`, deleted entries included,
+  whether Dropbox holds the intended result: a file with the upload's
+  content hash, no entry or a deleted one, or a folder.
   - A lost answer, or a `done` whose entry's `path_lower` is not the
     path's full Unicode lowercase: `done` if it holds, else `retry`.
     `DELETE` given a rev treats a `done` whose entry is not a file at that
@@ -369,7 +369,8 @@ The tests run against a fake Dropbox on `net/http.f`, in the style of
   - a finish whose session is gone: confirmed when Dropbox holds it, else
     restarted;
 - **delete and create-folder:** a conflict, refused with no `get_metadata`
-  even where the path is already gone or a folder; and not found;
+  even where the path is already gone or a folder; not found; and a lost
+  delete whose confirmation finds the path deleted;
 - **auth and transport:**
   - an expired token, refreshed and resent;
   - a revoked token, refreshed and resent once, which answers `unlinked`,

@@ -1066,6 +1066,10 @@ ENUM verdict
    DROPBOX-ENTRY:KIND @ construct kind file DROPBOX-KIND:EQ ;
 
 
+: DELETED? ( ^entry -- bool )
+   DROPBOX-ENTRY:KIND @ construct kind deleted DROPBOX-KIND:EQ ;
+
+
 : DOWNLOADS? ( ^entry -- bool )
    {: e :}
    e FILE? e DROPBOX-ENTRY:DOWNLOADABLE @ and ;
@@ -1198,28 +1202,29 @@ private
 
 
 \ The answer's entry, as `member` finds it with the entry open at kind k,
-\ with both its paths. A deleted entry is a listing's alone; any other
-\ route answers a file or folder, so an entry left at deleted, as a union
-\ with no `.tag` is, fails.
+\ with both its paths. An entry left at deleted with no `.tag` read, as a
+\ union with none or an answer with no entry is, fails.
 : ENTRY-FOUND ( ^client kind [ JSON:reader ^client -- JSON:reader ] -- )
    {: c k:kind member :}
    c k ENTRY-OPEN
    c member PARSE c ENTRY-CLOSE
    c CLIENT-ENTRY {: e :}
-   e DROPBOX-ENTRY:KIND @ construct kind deleted DROPBOX-KIND:EQ
+   e DELETED? c CLIENT-TAGGED @ 0= and
    e PATHS? 0= or if c s" an incomplete entry" E-ANSWER FAILED then ;
 
 
-\ As ENTRY-FOUND, failing a downloadable file without its rev or hash.
+\ As ENTRY-FOUND for a mutation's answer, a file or folder: fails a deleted
+\ entry, and a downloadable file without its rev or hash.
 : ENTRY-PARSE ( ^client kind [ JSON:reader ^client -- JSON:reader ] -- )
    {: c k:kind member :}
    c k member ENTRY-FOUND
-   c CLIENT-ENTRY FILLED? 0=
+   c CLIENT-ENTRY {: e :}
+   e DELETED? e FILLED? 0= or
    if c s" an incomplete entry" E-ANSWER FAILED then ;
 
 
-\ get_metadata's answer, a Metadata union; a file Dropbox described
-\ incompletely is handed as it is, and COMPLETE? tells.
+\ get_metadata's answer, a Metadata union, a deleted entry among them; a
+\ file Dropbox described incompletely is handed as it is, and COMPLETE? tells.
 : ENTRY-READ ( ^client -- )
    construct kind deleted [: TAGGED-MEMBER ;] ENTRY-FOUND ;
 
@@ -1807,11 +1812,12 @@ public
 : ROOT-NAMESPACE ( ^client -- ^u8 n ) CLIENT-NAMESPACE @ SPAN:$ ;
 
 
-\ files/get_metadata of the path.
+\ files/get_metadata of the path, a deleted entry included.
 : METADATA ( ^u8 n ^client -- reply )
    {: p:^ pu:n c :}
    c BODY-OPEN JSON:WRITE-OBJECT-START
-   s" path" p pu JSON:WRITE-FIELD-S
+   s" path" p pu JSON:WRITE-FIELD-S JSON:WRITE-COMMA
+   s" include_deleted" true JSON:WRITE-FIELD-BOOL
    JSON:WRITE-OBJECT-END JSON:WRITE-CLOSE
    c s" files/get_metadata" [: JSON-BODY ;] CALL
    c [: ENTRY-READ ;] ANSWERED p pu c PLACED ;
@@ -2199,11 +2205,12 @@ private
    CLIENT-ENTRY ENTRY-CLEAR construct reply done ;
 
 
-\ A lost delete took effect only if the path is now not found.
+\ A lost delete took effect only if the path is now not found or deleted.
 : GONE ( ^u8 n ^client -- reply )
    {: p:^ pu:n c :}
    p pu c METADATA {: r:reply :}
-   r NOT-FOUND? if c ABSENT exit then
+   r NOT-FOUND? r DONE? c CLIENT-ENTRY DELETED? and or
+   if c ABSENT exit then
    r UNCONFIRMED ;
 
 

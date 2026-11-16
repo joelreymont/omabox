@@ -32,8 +32,9 @@
 \ find, an upload's or finish's answer that does not parse, which it
 \ finds, an upload confirmation Dropbox asks to wait on, a delete,
 \ create-folder or upload conflict answered as refused with no
-\ get_metadata, even where Dropbox already holds what it asked for, and a
-\ delete it answers with a folder or a file at another rev. Tests of
+\ get_metadata, even where Dropbox already holds what it asked for, a
+\ delete it answers with a folder or a file at another rev, and a lost
+\ delete whose confirmation finds the path deleted. Tests of
 \ tests/dropbox_fake.rs run
 \ under their names: a_refused_grant_becomes_a_rejected_token,
 \ a_rotated_refresh_token_is_stored_before_the_new_token_is_published,
@@ -331,6 +332,8 @@ variable REFUSALS
    e DROPBOX-ENTRY:SIZE @ 12 T=
    e DROPBOX-ENTRY:DOWNLOADABLE @ TTRUE
    TEST-DROPBOX:SEEN$ s" /2/files/get_metadata" T$=
+   TEST-DROPBOX:METADATA-BODIES$
+   S\" {\qpath\q:\q/docs/a.txt\q,\qinclude_deleted\q:true}" T$=
    TEST-DROPBOX:TYPE-SENT$ s" application/json" T$= ;
 
 
@@ -1815,6 +1818,21 @@ TYPED-VARIABLE ZEROED bool
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
 
 
+\ A lost delete whose confirmation finds the path's entry deleted, where
+\ the fake alone would still find the file.
+: DELETED-ENTRY-CASE ( -- )
+   s" lost delete, confirmation deleted" T-LABEL
+   TEST-DROPBOX:RESET
+   s" /went.txt" s" rev-went" DELETED-FILE
+   s" /2/files/get_metadata" 200 s" " s" "
+   S\" {\q.tag\q:\qdeleted\q,\qname\q:\qwent.txt\q,\qpath_lower\q:\q/went.txt\q,\qpath_display\q:\q/went.txt\q}"
+   TEST-DROPBOX:ROUTE-SCRIPT!
+   TEST-DROPBOX:CUT
+   s" /went.txt" s" " MAIN @ DROPBOX:DELETE DONE? ASSERT
+   DROPBOX-KIND:DELETED KIND? TTRUE
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
+
+
 \ A delete lost before Dropbox applied it: the path is still there.
 : CUT-DELETE-CASE ( -- )
    s" lost delete not applied" T-LABEL
@@ -2779,7 +2797,7 @@ TYPED-VARIABLE FAULT fault
    POLL-CASE LONG-POLL-EXPOSES-RESET-AND-RATE-LIMIT-OUTCOMES
    DOWNLOAD-CASES
    DELETE-CONFLICT-CASE DELETE-MISSING-CASE DELETE-GONE-CASE
-   LOST-DELETE-CASE CUT-DELETE-CASE DELETE-ELSEWHERE-CASE
+   LOST-DELETE-CASE DELETED-ENTRY-CASE CUT-DELETE-CASE DELETE-ELSEWHERE-CASE
    DELETE-REV-CASE DELETE-AS-FOLDER-CASE DENIED-DELETE-CASE
    FOLDER-CONFLICT-CASE LOST-FOLDER-CASE FOLDER-ELSEWHERE-CASE
    CUT-FOLDER-CASE DENIED-CUT-FOLDER-CASE
