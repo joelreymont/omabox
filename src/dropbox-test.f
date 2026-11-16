@@ -27,7 +27,8 @@
 \ whose stages are written under TMPDIR and removed once open, so no run
 \ leaves one; a mutation or session finish Dropbox answers
 \ at another path, an upload's or finish's that get_metadata then does not
-\ find, an upload confirmation Dropbox asks to wait on, a delete or
+\ find, an upload's or finish's answer that does not parse, which it
+\ finds, an upload confirmation Dropbox asks to wait on, a delete or
 \ create-folder conflict whose confirmation it asks to wait on, a conflict
 \ whose confirmation is at another path, and a delete it answers with a
 \ folder or a file at another rev. Tests of tests/dropbox_fake.rs run
@@ -2129,6 +2130,7 @@ variable FAULT-AT
 variable STRIKES
 ENUM fault
    cut cut-twice lose close unfound applied offset denied elsewhere busy
+   garbled
 ;ENUM
 TYPED-VARIABLE FAULT fault
 
@@ -2211,6 +2213,10 @@ TYPED-VARIABLE FAULT fault
    TEST-DROPBOX:SCRIPT! ;
 
 
+\ The next call answers done with a body that does not parse.
+: GARBLED! ( -- ) 200 s" " s" " s" []" TEST-DROPBOX:SCRIPT! ;
+
+
 \ The next call refused with incorrect_offset at 0, short of any chunk's end.
 : OFFSET! ( -- )
    409 s" " s" "
@@ -2230,6 +2236,7 @@ TYPED-VARIABLE FAULT fault
       denied OF UNFOUND TEST-DROPBOX:DENY ENDOF
       elsewhere OF ELSEWHERE! ENDOF
       busy OF UNFOUND BUSY! ENDOF
+      garbled OF GARBLED! APPLIED ENDOF
    ;MATCH ;
 
 
@@ -2518,6 +2525,27 @@ TYPED-VARIABLE FAULT fault
 : SEND-UNLINKED ( -- ) SEND UNLINKED? OUTCOME ! ;
 
 
+: SEND-APPLIED ( -- ) SEND DONE? OUTCOME ! ;
+
+
+\ An upload whose answer does not parse, logged, and get_metadata finds
+\ the file with its content hash.
+: GARBLED-SINGLE-CASE ( -- )
+   s" upload answer that does not parse, applied" T-LABEL
+   TEST-DROPBOX:RESET -1 FAULT-AT !
+   s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
+   s" /docs/up.txt" s" /Docs/Up.txt" s" 0160a" EXPECTED$ 12 TEST-DROPBOX:FILE!
+   GARBLED!
+   false OUTCOME !
+   [: SEND-APPLIED ;] LOGGED 0 T=
+   OUTCOME @ TTRUE
+   s" error dropbox: files/upload answered 200: an answer that does not parse"
+   LOGGED? TTRUE
+   ENTRY-HASH$ EXPECTED$ T$=
+   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
+   UNSTAGED ;
+
+
 \ A lost single upload whose confirmation Dropbox refuses 403: unlinked.
 : DENIED-SINGLE-CASE ( -- )
    s" lost upload, confirmation denied" T-LABEL
@@ -2553,7 +2581,7 @@ TYPED-VARIABLE FAULT fault
    UNFOUND-ELSEWHERE-CASE
    VERIFICATION-WITHOUT-A-LOWERCASE-PATH-IS-INVALID-METADATA
    BUSY-ELSEWHERE-CASE CUT-SINGLE-CASE DENIED-SINGLE-CASE
-   LOST-SINGLE-CASE SHORT-STAGE-CASE REFUSED-STAGE-CASE FULL-READ-CASE
+   GARBLED-SINGLE-CASE LOST-SINGLE-CASE SHORT-STAGE-CASE REFUSED-STAGE-CASE FULL-READ-CASE
    ENTERED-READ-CASE TIMED-OUT-READ-CASE CANCELLED-READ-CASE ;
 
 
@@ -2659,15 +2687,16 @@ TYPED-VARIABLE FAULT fault
    TEST-DROPBOX:SEEN$ SB$ T$= ;
 
 
-\ The upload's content hash is not that of the bytes Dropbox commits.
+\ The upload's content hash is not that of the bytes Dropbox commits:
+\ get_metadata finds those bytes, so the finish's retry 0 stands.
 : MISMATCH-CASE ( -- )
    s" committed content hash mismatch" T-LABEL
    s" 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
    SPAN:MAKE UP DROPBOX-UPLOAD:CONTENT-HASH !
-   -1 construct fault cut 1 STRUCK
-   DROPBOX-ERROR:CONTENT-HASH-MISMATCH REFUSED? ASSERT
+   -1 construct fault cut 1 STRUCK RETRY-MS 0 T=
    ENTRY-HASH$ EXPECTED$ T$=
    SB-RESET S-START S-APPEND S-APPEND S-FINISH
+   s"  /2/files/get_metadata" SB-APPEND
    TEST-DROPBOX:SEEN$ SB$ T$=
    EXPECTED$ SPAN:MAKE UP DROPBOX-UPLOAD:CONTENT-HASH ! ;
 
@@ -2723,6 +2752,23 @@ TYPED-VARIABLE FAULT fault
    TEST-DROPBOX:SEEN$ SB$ T$= ;
 
 
+\ A finish whose answer does not parse, logged, and get_metadata finds
+\ the file Dropbox committed.
+: GARBLED-FINISH-CASE ( -- )
+   s" finish answer that does not parse, applied" T-LABEL
+   1 STRIKES ! construct fault garbled FAULT ! CHUNK 1+ FAULT-AT !
+   TEST-DROPBOX:RESET
+   false OUTCOME !
+   [: SEND-APPLIED ;] LOGGED 0 T=
+   OUTCOME @ TTRUE
+   s" error dropbox: files/upload_session/finish answered 200: an answer that does not parse"
+   LOGGED? TTRUE
+   ENTRY-HASH$ EXPECTED$ T$=
+   SB-RESET S-START S-APPEND S-APPEND S-FINISH
+   s"  /2/files/get_metadata" SB-APPEND
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
+
+
 \ A finish answered gone whose confirmation asks to wait: the
 \ confirmation's retry, with no restart.
 : BUSY-FINISH-CASE ( -- )
@@ -2754,7 +2800,7 @@ TYPED-VARIABLE FAULT fault
    CLOSED-CASE LOST-START-CASE LOST-FINISH-CASE APPLIED-FINISH-CASE
    UNFOUND-FINISH-CASE DENIED-FINISH-CASE CUT-APPEND-CASE CLOSED-TWICE-CASE
    MISMATCH-CASE FINISH-ELSEWHERE-CASE UNFOUND-ELSEWHERE-FINISH-CASE
-   BUSY-FINISH-CASE
+   GARBLED-FINISH-CASE BUSY-FINISH-CASE
    ENDED-EARLY-CASE
    UNSTAGED ;
 

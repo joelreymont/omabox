@@ -14,7 +14,9 @@
 \ error tag, 422 refused invalid-root, 429, 408 and 5xx retry, a timeout or
 \ lost connection retry 0; anything else logs one line (route, status, at
 \ most EXCERPT bytes of the body, never a token) and throws a DROPBOX code,
-\ a bug on one side of the wire. E-NOT-STORED is environmental instead:
+\ a bug on one side of the wire. An answer that does not parse logs one
+\ line too and throws E-ANSWER, but an upload's or a finish's 200, which
+\ get_metadata confirms. E-NOT-STORED is environmental instead:
 \ the store failed, and the next call retries it.
 \ A 409's error is a Dropbox union: its leaf tag is the `.tag` of the member
 \ named by the outer `.tag`, or of `reason` in an upload's error, when that
@@ -2280,10 +2282,10 @@ public
 \ A file up to CHUNK-SIZE bytes goes in one files/upload; a larger one
 \ through an upload session: CHUNK-SIZE appends, then a finish that carries
 \ no content_hash, as Dropbox checks that field against the call's own
-\ bytes. The entry Dropbox commits must have the upload's path and content
-\ hash. A lost answer to the upload or the finish, an entry at another
-\ path, or a conflict, which a POST libcurl resent can answer for an
-\ upload already applied, is confirmed by get_metadata. A run's chunk
+\ bytes. A lost answer to the upload or the finish, a 2xx answer that is
+\ not the upload's complete entry at its path with its content hash, or a
+\ conflict, which a POST libcurl resent can answer for an upload already
+\ applied, is confirmed by get_metadata. A run's chunk
 \ buffer is MEM's, released before UPLOAD answers or throws.
 
 public
@@ -2597,25 +2599,28 @@ HEAP RUNS run
 
 \ ---- the answers
 
-\ Reads the entry Dropbox committed: whether it is at the upload's path.
-: COMMITTED-AT? ( ^run -- bool )
+\ Reads the entry Dropbox committed; false for an answer that does not
+\ parse or an incomplete entry, which FILE-READ logged. Other codes go on.
+: ANSWER-READ? ( ^run -- bool )
    {: r :}
    r RUN-CLIENT @ {: c :}
-   c FILE-READ
-   r RUN-UP @ DROPBOX-UPLOAD:PATH @ SPAN:$ c AT? ;
-
-
-\ The committed entry has the upload's content hash, else last is refused
-\ content-hash-mismatch.
-: COMMITTED? ( ^run -- bool )
-   {: r :}
-   r RUN-CLIENT @ CLIENT-ENTRY {: e :}
-   r RUN-UP @ {: up :}
-   e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$
-   up DROPBOX-UPLOAD:CONTENT-HASH @ SPAN:$ STR= if true exit then
-   construct error content-hash-mismatch construct reply refused
-   r RUN-LAST !
+   [: c FILE-READ ;] catch {: code:n :}
+   code 0= if true exit then
+   code E-ANSWER <> if code throw then
    false ;
+
+
+\ Whether the answer is the upload's complete entry, at its path and with
+\ its content hash.
+: UPLOADED? ( ^run -- bool )
+   {: r :}
+   r ANSWER-READ? 0= if false exit then
+   r RUN-CLIENT @ {: c :}
+   r RUN-UP @ {: up :}
+   c CLIENT-ENTRY COMPLETE? 0= if false exit then
+   up DROPBOX-UPLOAD:PATH @ SPAN:$ c AT? 0= if false exit then
+   c CLIENT-ENTRY DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$
+   up DROPBOX-UPLOAD:CONTENT-HASH @ SPAN:$ STR= ;
 
 
 : REFUSAL? ( reply -- bool )
@@ -2686,19 +2691,17 @@ HEAP RUNS run
 ENUM upload-step
    single starting appending finishing confirming verifying restarting
    ended ;ENUM
-ENUM send-event committed elsewhere lost conflict failed ;ENUM
+ENUM send-event committed untrusted lost conflict failed ;ENUM
 ENUM start-event opened lost failed ;ENUM
 ENUM append-event stored complete lost cut gone failed ;ENUM
-ENUM finish-event committed elsewhere lost conflict gone failed ;ENUM
+ENUM finish-event committed untrusted lost conflict gone failed ;ENUM
 ENUM confirm-event same elsewhere wait other unlinked ;ENUM
 ENUM restart-event once twice ;ENUM
 
 
 : SEND-DONE ( ^run -- send-event )
-   {: r :}
-   r COMMITTED-AT? 0= if construct send-event elsewhere exit then
-   r COMMITTED? if construct send-event committed exit then
-   construct send-event failed ;
+   UPLOADED? if construct send-event committed exit then
+   construct send-event untrusted ;
 
 
 : SEND-SENSE ( ^run -- send-event )
@@ -2753,10 +2756,8 @@ ENUM restart-event once twice ;ENUM
 
 
 : FINISH-DONE ( ^run -- finish-event )
-   {: r :}
-   r COMMITTED-AT? 0= if construct finish-event elsewhere exit then
-   r COMMITTED? if construct finish-event committed exit then
-   construct finish-event failed ;
+   UPLOADED? if construct finish-event committed exit then
+   construct finish-event untrusted ;
 
 
 : FINISH-SENSE ( ^run -- finish-event )
@@ -2816,12 +2817,13 @@ ENUM restart-event once twice ;ENUM
    r RUN-ANSWER ! ;
 
 
-\ A done answer at another path, as a lost one: retry unless confirmed.
+\ A done answer that is not the upload's entry, as a lost one: retry
+\ unless confirmed.
 : DISTRUST ( ^run -- ) {: r :} 0 RETRY r RUN-LAST ! ;
 
 
-\ Answers the last call's reply as it came, or as COMMITTED?, DISTRUST
-\ or CONFIRM-SENSE set it.
+\ Answers the last call's reply as it came, or as DISTRUST or
+\ CONFIRM-SENSE set it.
 : ANSWER-REPLY ( ^run -- ) {: r :} r RUN-LAST @ r RUN-ANSWER ! ;
 
 
@@ -2836,13 +2838,14 @@ ENUM restart-event once twice ;ENUM
    0 r RUN-ACCEPTED ! false r RUN-RESENT ! ;
 
 
-\ confirming asks whether an answer it cannot trust took effect; verifying
-\ asks whether a finish whose session is gone was a resend Dropbox already
-\ committed, and starts over only when it was not.
+\ confirming asks whether an upload whose answer was lost, a conflict or
+\ not its entry took effect; verifying asks whether a finish whose session
+\ is gone was a resend Dropbox already committed, and starts over only
+\ when it was not.
 FSM:DEFINE SESSION ( ^run ) upload-step send-event
    IN single  SEND-SENSE
       committed  ANSWER-DONE   >ended
-      elsewhere  DISTRUST      >confirming
+      untrusted  DISTRUST      >confirming
       lost       -             >confirming
       conflict   -             >confirming
       failed     ANSWER-REPLY  >ended
@@ -2859,7 +2862,7 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
       failed    ANSWER-REPLY   >ended
    IN finishing  FINISH-SENSE ( finish-event )
       committed  ANSWER-DONE   >ended
-      elsewhere  DISTRUST      >confirming
+      untrusted  DISTRUST      >confirming
       lost       -             >confirming
       conflict   -             >confirming
       gone       -             >verifying
