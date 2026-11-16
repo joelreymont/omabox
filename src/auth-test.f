@@ -3,6 +3,7 @@
 \ session bus: the item BIND names and the exact record STORE writes; a
 \ record LOAD decodes, a miss, a refused access and an unanswered
 \ service answering unavailable, and a configuration failure passed up;
+\ a store SECRET:WRITE fails with each code it throws, passed up;
 \ a malformed record, one cut off, and one not UTF-8; a wrongly typed
 \ version, a repeated one, and one out of u8's range; a token STORE
 \ cannot write as UTF-8; a record of 8191 bytes read back, one of 8192
@@ -42,6 +43,7 @@ variable HELD-U
 TYPED-VARIABLE PRESENT bool
 false PRESENT !
 variable READ-CODE         \ READ throws it when nonzero
+variable WRITE-CODE        \ WRITE throws it when nonzero
 variable WRITES
 64 BUFFER: SEEN-SERVICE  variable SEEN-SERVICE-U
 64 BUFFER: SEEN-ACCOUNT  variable SEEN-ACCOUNT-U
@@ -76,6 +78,7 @@ TYPED-VARIABLE ACTION [ -- ]
 : REC-WRITE ( ^u8 n ^u8 n ^u8 n -- )
    {: s:^ su:n a:^ au:n v:^ vu:n :}
    s su a au SEEN
+   WRITE-CODE @ 0<> if WRITE-CODE @ throw then
    v HELD vu BYTE-COPY vu HELD-U !
    1 WRITES +! ;
 
@@ -188,7 +191,8 @@ FILL-FILLER
    SECRET:E-UNAVAILABLE READ-CODE !
    ar LOAD UNAVAILABLE TTRUE
    SECRET:E-CONFIG READ-CODE !
-   [: LOADS ;] SECRET:E-CONFIG TTHROWSQ
+   [: LOADS ;] SECRET:E-CONFIG
+   s" credential operation `load Dropbox credential` could not start" LOGGED
    0 READ-CODE ! ;
 
 : SECRET-TOOL-PARSER-DIAGNOSTICS-DO-NOT-ECHO-OUTPUT ( -- )
@@ -254,6 +258,23 @@ FILL-FILLER
    s" Secret Service returned unsupported Omabox credential version 2"
    LOGGED ;
 
+\ Each code SECRET:WRITE throws is logged as the store's failure and
+\ rethrown, and the store keeps no record.
+: STORE-FAILURE-NAMES-THE-CREDENTIAL-OPERATION ( -- )
+   s" store_failure_names_the_credential_operation" T-LABEL
+   0 WRITES !
+   SECRET:E-CONFIG WRITE-CODE !
+   [: s" config-sentinel" STORE-TOKEN ;] SECRET:E-CONFIG
+   s" credential operation `store Dropbox credential` could not start" LOGGED
+   SECRET:E-ACCESS WRITE-CODE !
+   [: s" access-sentinel" STORE-TOKEN ;] SECRET:E-ACCESS
+   s" credential operation `store Dropbox credential` failed" LOGGED
+   SECRET:E-UNAVAILABLE WRITE-CODE !
+   [: s" unavailable-sentinel" STORE-TOKEN ;] SECRET:E-UNAVAILABLE
+   s" credential operation `store Dropbox credential` failed" LOGGED
+   0 WRITE-CODE !
+   WRITES @ 0 T= ;
+
 
 \ RFC 7636 appendix B's verifier and its challenge. The key holds a
 \ space, a byte form_urlencoded encodes and one it keeps.
@@ -298,6 +319,7 @@ FILL-FILLER
    SECRET-TOOL-DATA-ERROR-DIAGNOSTICS-DO-NOT-ECHO-OUTPUT
    CREDENTIAL-OF-8192-BYTES-OR-MORE-IS-TOO-LARGE
    STORED-CREDENTIAL-VERSION-2-IS-UNSUPPORTED
+   STORE-FAILURE-NAMES-THE-CREDENTIAL-OPERATION
    ar PKCE-AUTHORIZATION-USES-OFFLINE-CODE-FLOW
    ar START-DRAWS-A-FRESH-VERIFIER ;
 

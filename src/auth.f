@@ -9,8 +9,10 @@
 \ repeated or of another type refused. It refuses two records serde reads
 \ and no writer makes: one written as an array, and one whose skipped
 \ member holds a lone surrogate escape. AUTH's failures are logged once
-\ with the Rust version's text, then thrown as its codes; no log line
-\ holds a string of the record, only an unsupported version's number.
+\ with the Rust version's text, then thrown as its codes; a SECRET code
+\ it passes on is logged as the credential operation's failure, then
+\ rethrown. No log line holds a string of the record, only an
+\ unsupported version's number.
 \ START begins a browser login (rust OAuthClient::begin): a PKCE verifier
 \ of 32 random bytes, and the URL dropbox-sdk 0.20.3's AuthorizeUrlBuilder
 \ builds for it, byte for byte.
@@ -99,6 +101,23 @@ private
    s"  " LOG:TEXT+ found LOG:INT+ LOG:;LINE
    E-VERSION throw ;
 
+: STORING ( -- ^u8 n ) s" store Dropbox credential" ;
+: LOADING ( -- ^u8 n ) s" load Dropbox credential" ;
+
+\ rust CredentialSpawn and CredentialStatus for a SECRET code passed on:
+\ the operation, then what befell it; libsecret has no exit status.
+: OPERATION ( ^u8 n ^u8 n n -- )
+   {: op:^ ou:n what:^ wu:n code:n :}
+   LOG-OPEN s" credential operation `" LOG:TEXT+ op ou LOG:TEXT+
+   s" ` " LOG:TEXT+ what wu LOG:TEXT+ LOG:;LINE
+   code throw ;
+
+\ The answers secret-tool's nonzero exit gives: a locked or refused
+\ keyring, and a Secret Service that did not answer.
+: UNAVAILABLE? ( n -- bool )
+   {: code:n :}
+   code SECRET:E-ACCESS = code SECRET:E-UNAVAILABLE = or ;
+
 
 \ ---- the record written --------------------------------------------
 
@@ -138,7 +157,10 @@ ARENA WRITERS JSON:writer
 
 : WRITE-RECORD ( JOURNAL:dropbox-binding str ^ARENA:arena -- )
    RECORD {: r:^ ru:n :}
-   SERVICE ACCOUNT r ru SECRET:WRITE ;
+   [: SERVICE ACCOUNT r ru SECRET:WRITE ;] catch {: code:n :}
+   code SECRET:E-CONFIG = if STORING s" could not start" code OPERATION then
+   code UNAVAILABLE? if STORING s" failed" code OPERATION then
+   code 0<> if code throw then ;
 
 
 \ ---- the record read -----------------------------------------------
@@ -232,12 +254,6 @@ ARENA CURSORS JSON:cursor
    version VERSION <> if version WRONG-VERSION then
    b token construct lookup found ;
 
-\ The answers secret-tool's nonzero exit gives: a locked or refused
-\ keyring, and a Secret Service that did not answer.
-: UNAVAILABLE? ( n -- bool )
-   {: code:n :}
-   code SECRET:E-ACCESS = code SECRET:E-UNAVAILABLE = or ;
-
 \ The item's length in dest, and whether it was found.
 : FETCH ( SPAN:span<u8> -- n bool )
    {: dest :}
@@ -247,6 +263,7 @@ ARENA CURSORS JSON:cursor
    drop drop
    code UNAVAILABLE? if 0 false exit then
    code SECRET:E-CAPACITY = if E-TOO-LARGE FAIL then
+   code SECRET:E-CONFIG = if LOADING s" could not start" code OPERATION then
    code throw ;
 
 
