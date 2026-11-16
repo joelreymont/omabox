@@ -69,6 +69,14 @@
 \   remote side: the event, the block, the plan pending, held,
 \   completed, retired or finished as its conflict, the count, the
 \   conflict copies on disk, the downloads and the one line logged.
+\ - REPLAY-REMOTE-OPERATIONS-AT against the fake Dropbox: Rust's
+\   remote_replay_creates_nested_parents_before_the_file,
+\   already_absent_dropbox_directory_completes_its_replayed_delete,
+\   dropbox_file_at_a_deleted_directory_path_retires_the_replayed_delete
+\   and remote_delete_skips_backup_download_and_ambiguous_create_stays_pending,
+\   whose create's lost answer throws E-DROPBOX with a retry in the link
+\   and leaves its plan pending; a plan whose next operation is local is
+\   left pending, unblocked, with no request.
 \ Run from the repository root: hb --load src/replay-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -2757,6 +2765,220 @@ ARENA FILE-CASES file-case
    GONE-STATE CHANGED-AS ar DELETE-PASSED ;
 
 
+\ ---- the remote replay loop
+
+\ REPLAY-REMOTE-OPERATIONS-AT of the pending plans below the root r,
+\ staging in s, through the bridge's link.
+: REMOTE-REPLAYED
+   ( JOURNAL:journal str str ^ARENA:arena -- ^REPLAY:replay-report )
+   {: j r:str s:str ar :}
+   r OPEN-ROOT {: f:fd :}
+   [: j LINK f r str> s str> ar REPLAY:REPLAY-REMOTE-OPERATIONS-AT ;]
+   [: f FS:CLOSE-DIR ;] finally ;
+
+\ The next API call is refused 409 with Rust's lookup_error of the tag.
+: LOOKUP-ERROR ( ^u8 n -- )
+   {: t:^ tu:n :}
+   SB-RESET S\" {\qerror_summary\q:\qpath/" SB-APPEND t tu SB-APPEND
+   S\" /...\q,\qerror\q:{\q.tag\q:\qpath\q,\qpath\q:{\q.tag\q:\q" SB-APPEND
+   t tu SB-APPEND S\" \q}}}" SB-APPEND
+   409 s" " s" " SB$ TEST-DROPBOX:SCRIPT! ;
+
+: NO-BASELINE? ( option<MODEL:baseline> -- bool )
+   MATCH option
+      none OF true ENDOF
+      some OF drop false ENDOF
+   ;MATCH ;
+
+: BASELINE-FILE ( option<MODEL:baseline> -- MODEL:remote )
+   MATCH option
+      none OF s" no baseline" FAILED ENDOF
+      some OF
+         MATCH MODEL:baseline
+            absent OF s" an absent baseline" FAILED ENDOF
+            present OF ENDOF
+            directory OF s" a directory baseline" FAILED ENDOF
+         ;MATCH
+      ENDOF
+   ;MATCH ;
+
+\ The fake holds a folder at p.
+: FOLDER-AT ( ^u8 n -- )
+   MAIN @ DROPBOX:METADATA DONE? TTRUE
+   MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:KIND @ DROPBOX-KIND:FOLDER
+   DROPBOX-KIND:EQ TTRUE ;
+
+: REMOTE-REPLAY-CREATES-NESTED-PARENTS-BEFORE-THE-FILE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" remote_replay_creates_nested_parents_before_the_file" T-LABEL
+   TEST-DROPBOX:RESET
+   ar UPLOAD-DIRS {: d:str r:str s:str j :}
+   r s" one" ar INSIDE {: one:str :} one str> FS:MAKE-DIR
+   one s" two" ar INSIDE {: two:str :} two str> FS:MAKE-DIR
+   two s" file.txt" ar INSIDE str> s" nested bytes" FS:WRITE-ALL
+   s" nested bytes" ar HASH-OF {: c:DROPBOX:hash :}
+   j s" one/two/file.txt" c MODEL-OPERATION:CREATE-REMOTE ar PLANNED
+   drop
+   j r s ar REMOTE-REPLAYED {: rep :}
+   rep COMPLETED 1 T=
+   rep BLOCKS VEC:COUNT 0 T=
+   j s" one/two/file.txt" DISPLAY ar JOURNAL:BASELINE BASELINE-FILE
+   MODEL-REMOTE:UNMAKE {: h v :}
+   h DROPBOX:HASH>STR str> c DROPBOX:HASH>STR str> T$=
+   v DROPBOX:REV>STR str> s" 01701" T$=
+   TEST-DROPBOX:SEEN$
+   s" /2/files/create_folder_v2 /2/files/create_folder_v2 /2/files/upload"
+   T$=
+   s" /one" FOLDER-AT s" /one/two" FOLDER-AT
+   j JOURNAL:CLOSE
+   d GONE ;
+
+: NOOP-RECORDED? ( JOURNAL:noop-write -- bool )
+   MATCH JOURNAL:noop-write
+      recorded OF true ENDOF
+      live-plan OF drop false ENDOF
+   ;MATCH ;
+
+\ Rust's seed_directory_baseline and the folder delete it plans at gone:
+\ the case's directory, root, staging and journal.
+: GONE-PLAN ( ^ARENA:arena -- str str str JOURNAL:journal )
+   {: ar :}
+   ar UPLOAD-DIRS {: d:str r:str s:str j :}
+   j s" gone" DISPLAY MODEL-BASELINE:DIRECTORY ar JOURNAL:RECORD-NOOP
+   NOOP-RECORDED? TTRUE
+   j s" gone" MODEL-OPERATION:DELETE-REMOTE-DIRECTORY ar PLANNED drop
+   d r s j ;
+
+: ALREADY-ABSENT-DROPBOX-DIRECTORY-COMPLETES-ITS-REPLAYED-DELETE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" already_absent_dropbox_directory_completes_its_replayed_delete"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   s" not_found" LOOKUP-ERROR
+   ar GONE-PLAN {: d:str r:str s:str j :}
+   j r s ar REMOTE-REPLAYED {: rep :}
+   rep COMPLETED 1 T=
+   rep BLOCKS VEC:COUNT 0 T=
+   j s" gone" DISPLAY ar JOURNAL:BASELINE NO-BASELINE? TTRUE
+   j ar JOURNAL:PENDING-PLANS VEC:COUNT 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$=
+   j JOURNAL:CLOSE
+   d GONE ;
+
+: FRESH-AT? ( REPLAY:replay-blocked ^u8 n -- bool )
+   {: b a:^ u :}
+   b MATCH REPLAY:replay-blocked
+      fresh-observation-required OF MODEL:PATH>STR str> a u STR= ENDOF
+      durable-plan OF drop drop false ENDOF
+      local-object OF drop false ENDOF
+      download-required OF drop drop false ENDOF
+      stage-destination-occupied OF drop drop false ENDOF
+      precondition-changed OF drop drop false ENDOF
+      remote-operation OF drop false ENDOF
+      remote-pending OF drop false ENDOF
+      remote-object OF drop false ENDOF
+      sync-error OF drop drop false ENDOF
+   ;MATCH ;
+
+: DROPBOX-FILE-AT-A-DELETED-DIRECTORY-PATH-RETIRES-THE-REPLAYED-DELETE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" dropbox_file_at_a_deleted_directory_path_retires_the_replayed_delete"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   s" not_folder" LOOKUP-ERROR
+   s" file where a folder was" {: b:^ bu:n :}
+   b bu ar HASH-OF {: c:DROPBOX:hash :}
+   s" /gone" s" /gone" s" rev-file" c DROPBOX:HASH>STR str> bu
+   TEST-DROPBOX:FILE!
+   ar GONE-PLAN {: d:str r:str s:str j :}
+   j r s ar REMOTE-REPLAYED {: rep :}
+   rep COMPLETED 0 T=
+   rep BLOCKS VEC:COUNT 1 T=
+   rep BLOCKS 0 VEC:AT @ s" gone" FRESH-AT? TTRUE
+   j s" gone" DISPLAY ar JOURNAL:BASELINE DIRECTORY? TTRUE
+   j ar JOURNAL:PENDING-PLANS VEC:COUNT 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/get_metadata" T$=
+   j JOURNAL:CLOSE
+   d GONE ;
+
+\ The delete of old's rev-old at delete.txt completes with no download
+\ and no recovery; the recovery directory stays empty.
+: DELETE-REPLAYED ( str str str str JOURNAL:journal ^ARENA:arena -- )
+   {: d:str r:str s:str rec:str j ar :}
+   s" old remote bytes" {: b:^ bu:n :}
+   b bu ar HASH-OF {: old:DROPBOX:hash :}
+   s" /delete.txt" s" /Delete.txt" s" old-rev" old DROPBOX:HASH>STR str>
+   bu TEST-DROPBOX:FILE!
+   j s" delete.txt" s" old-rev" AS-REV MODEL-OPERATION:DELETE-REMOTE ar
+   PLANNED drop
+   j r s ar REMOTE-REPLAYED COMPLETED 1 T=
+   \ An empty directory removes: nothing was put in it.
+   rec str> FS:REMOVE-DIR
+   j ar JOURNAL:PENDING-RECOVERIES VEC:COUNT 0 T=
+   j ar JOURNAL:COMPLETED-RECOVERIES VEC:COUNT 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2" T$= ;
+
+\ The create of create.txt's "desired bytes", its upload's answer lost
+\ before it took effect, ends the pass on a retry.
+: CREATE-STOPPED ( str str JOURNAL:journal ^ARENA:arena -- )
+   {: r:str s:str j ar :}
+   r s" create.txt" ar INSIDE str> s" desired bytes" FS:WRITE-ALL
+   s" desired bytes" ar HASH-OF {: want:DROPBOX:hash :}
+   j s" create.txt" want MODEL-OPERATION:CREATE-REMOTE ar PLANNED drop
+   TEST-DROPBOX:RESET TEST-DROPBOX:CUT
+   [: j r s ar REMOTE-REPLAYED drop ;] REPLAY:E-DROPBOX TTHROWSQ
+   LINK REPLAY-LINK:REPLY @ RETRY? TTRUE
+   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$= ;
+
+: REMOTE-DELETE-SKIPS-BACKUP-DOWNLOAD-AND-AMBIGUOUS-CREATE-STAYS-PENDING
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" remote_delete_skips_backup_download_and_ambiguous_create_stays_pending"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar UPLOAD-DIRS {: d:str r:str s:str j :}
+   d s" recovery" ar INSIDE {: rec:str :} rec str> FS:MAKE-DIR
+   d r s rec j ar DELETE-REPLAYED
+   r s j ar CREATE-STOPPED
+   j JOURNAL:CLOSE
+   d s" journal.sqlite3" ar INSIDE JOURNAL:OPEN {: again :}
+   again ar JOURNAL:PENDING-PLANS VEC:COUNT 1 T=
+   again JOURNAL:CLOSE
+   d GONE ;
+
+\ A plan whose next operation is local is left to local replay: no
+\ request, no block, both operations pending.
+: A-LOCAL-OPERATION-WAITS-FOR-LOCAL-REPLAY ( ^ARENA:arena -- )
+   {: ar :}
+   s" a local operation waits for local replay" T-LABEL
+   TEST-DROPBOX:RESET
+   ar UPLOAD-DIRS {: d:str r:str s:str j :}
+   ar OPS {: ops :}
+   MODEL-OPERATION:CREATE-LOCAL-DIRECTORY ops OP+ MAKE-F ops OP+
+   j s" f" ops ar RECORD-OPS
+   j r s ar REMOTE-REPLAYED {: rep :}
+   rep COMPLETED 0 T=
+   rep BLOCKS VEC:COUNT 0 T=
+   j ar JOURNAL:PENDING-PLANS {: v :}
+   v VEC:COUNT 1 T=
+   v 0 VEC:AT @ JOURNAL-PLAN--RECORD:UNMAKE {: id p o st :}
+   o 0 OP-STATUS 0 T= o 1 OP-STATUS 0 T=
+   TEST-DROPBOX:SEEN$ s" " T$=
+   j JOURNAL:CLOSE
+   d GONE ;
+
+: LOOP-CASES ( ^ARENA:arena -- )
+   {: ar :}
+   ar REMOTE-REPLAY-CREATES-NESTED-PARENTS-BEFORE-THE-FILE
+   ar ALREADY-ABSENT-DROPBOX-DIRECTORY-COMPLETES-ITS-REPLAYED-DELETE
+   ar DROPBOX-FILE-AT-A-DELETED-DIRECTORY-PATH-RETIRES-THE-REPLAYED-DELETE
+   ar REMOTE-DELETE-SKIPS-BACKUP-DOWNLOAD-AND-AMBIGUOUS-CREATE-STAYS-PENDING
+   ar A-LOCAL-OPERATION-WAITS-FOR-LOCAL-REPLAY ;
+
+
 : BRIDGE-CASES ( ^ARENA:arena -- )
    {: ar :}
    ar EXACT-DOWNLOAD-RETRY-REUSES-A-STAGE-WITHOUT-CONSUMING-THE-BODY
@@ -2797,12 +3019,12 @@ ARENA FILE-CASES file-case
    s" " TEST-DROPBOX:ROOT!
    FILL-XS
    ar LINKING
-   [: ar BRIDGE-CASES ;]
+   [: ar BRIDGE-CASES ar LOOP-CASES ;]
    [: MAIN @ DROPBOX:CLOSE RUNTIME @ GONE ;] finally ;
 
 
-\ The mutation and bridge cases against one fake Dropbox, under curl's
-\ loop.
+\ The mutation, bridge and remote replay cases against one fake Dropbox,
+\ under curl's loop.
 : DROPBOX-CASES ( ^ARENA:arena -- )
    {: ar :}
    AIO:START CURL:LOOP-START CURL-READY

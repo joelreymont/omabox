@@ -5,7 +5,7 @@
 \ conflict copy, the bridge that stages a Dropbox revision's bytes
 \ through LOCAL, a revision's exact copy and remote conflict copy, the
 \ retention of legacy recovery payloads, each Dropbox mutation's
-\ outcome, and the remote replay steps that record it. A LOCAL call
+\ outcome, and the remote replay that records it. A LOCAL call
 \ whose failures REPLAY converts into outcomes runs under
 \ LOCAL:CONVERTING, so nothing logs those; any other LOCAL, JOURNAL or
 \ DROPBOX failure passes up with its own code, which that library
@@ -588,11 +588,8 @@ public
 
 private
 
-\ A replay pass, LOCAL-LIFECYCLE's context: the journal, the root's
-\ descriptor and path, and the arena; the plan and the operation it
-\ runs; the final completions and the report it adds to; blocked, why
-\ the apply step stopped the plan; the link and the upload staging
-\ directory. Local replay leaves link and staging unset, unread.
+\ A replay pass, both lifecycles' context; blocked is why the apply step
+\ stopped the plan. Local replay leaves link and staging unset, unread.
 STRUCTURE pass DERIVE addr
    FIELD journal JOURNAL:journal
    FIELD root fd
@@ -862,15 +859,18 @@ FSM:DEFINE LOCAL-LIFECYCLE ( ^pass ) local-state apply-event
 : STOPPED? ( local-state -- bool )
    construct local-state stopped LOCAL-STATE-EQ ;
 
+\ The pass takes plan p; an excluded one is retired, not run.
+: RUNNABLE? ( JOURNAL:plan-record ^pass -- bool )
+   {: p r :}
+   p r PASS-PLAN !
+   p PLAN-PATH MODEL:EXCLUDED? 0= if true exit then
+   r PASS-JOURNAL @ p r PASS-ARENA @ SUPERSEDE-PLAN false ;
+
 \ An excluded plan is retired; another's operations run in order
 \ until one stops it.
 : REPLAY-PLAN ( JOURNAL:plan-record ^pass -- )
    {: p r :}
-   p r PASS-PLAN !
-   p PLAN-PATH MODEL:EXCLUDED? if
-      r PASS-JOURNAL @ p r PASS-ARENA @ SUPERSEDE-PLAN
-      exit
-   then
+   p r RUNNABLE? 0= if exit then
    p PLAN-OPERATIONS {: ops :}
    ops VEC:COUNT 0 ?do
       ops i VEC:AT @ r PASS-OPERATION !
@@ -2335,5 +2335,200 @@ ENUM file-mutation create replace ;ENUM
       precondition-changed OF r DELETE-CHANGED ENDOF
       rejected OF r SYNC-ERROR ENDOF
    ;MATCH ;
+
+
+\ ---- parent folders
+
+: IMPOSSIBLE-PARENT ( ^pass -- )
+   {: r :}
+   s" parent folder creation returned an impossible state"
+   r CONTRADICTED ;
+
+\ A parent that is a folder answers done, so the next one is made.
+: PARENT-APPLIED ( remote-path-state ^pass -- apply-event )
+   {: r :}
+   MATCH remote-path-state
+      folder OF construct apply-event done ENDOF
+      absent OF r IMPOSSIBLE-PARENT ENDOF
+      file OF drop r IMPOSSIBLE-PARENT ENDOF
+      unsupported OF r IMPOSSIBLE-PARENT ENDOF
+   ;MATCH ;
+
+: PARENT-CHANGED ( remote-path-state ^pass -- apply-event )
+   {: r :}
+   MATCH remote-path-state
+      file OF drop r REMOTE-OBJECT ENDOF
+      unsupported OF r REMOTE-OBJECT ENDOF
+      absent OF r IMPOSSIBLE-PARENT ENDOF
+      folder OF r IMPOSSIBLE-PARENT ENDOF
+   ;MATCH ;
+
+: PARENT-MADE ( mutation-outcome ^pass -- apply-event )
+   {: r :}
+   MATCH mutation-outcome
+      applied OF r PARENT-APPLIED ENDOF
+      pending OF r PENDING-REMOTE ENDOF
+      precondition-changed OF r PARENT-CHANGED ENDOF
+      rejected OF r SYNC-ERROR ENDOF
+   ;MATCH ;
+
+\ The folder at the run's target's first n bytes.
+: PARENT ( ^pass n -- apply-event )
+   {: r n:n :}
+   r RUN-TARGET drop n >str MODEL:>PATH {: dir :}
+   r PASS-LINK @ dir r PASS-ARENA @ REMOTE-CREATE-FOLDER
+   r PARENT-MADE ;
+
+: STOPS? ( apply-event -- bool )
+   MATCH apply-event
+      done OF false ENDOF
+      blocked OF true ENDOF
+   ;MATCH ;
+
+\ Rust's ensure_remote_parents: next runs once each parent of the
+\ run's path, shortest first, is a Dropbox folder.
+: ENSURE-REMOTE-PARENTS
+   ( ^pass [ -- apply-event ] -- apply-event )
+   {: r next :}
+   r RUN-TARGET {: p:^ u:n :}
+   u 0 ?do
+      p i + c@ SLASH = if
+         r i PARENT dup STOPS? if unloop exit then drop
+      then
+   loop
+   next execute ;
+
+
+\ ---- operations
+
+: NO-REV ( -- DROPBOX:rev ) s" " >str DROPBOX:>REV ;
+
+: FOLDER-CREATE ( ^pass -- apply-event )
+   {: r :}
+   r [: r PASS-LINK @ r RUN-PATH r PASS-ARENA @ REMOTE-CREATE-FOLDER
+      r APPLY-FOLDER-MUTATION ;] ENSURE-REMOTE-PARENTS ;
+
+: SEND-NEW ( ^LOCAL:staged-upload ^pass -- apply-event )
+   {: up r :}
+   r [: r PASS-LINK @ r RUN-PATH up NO-REV r PASS-ARENA @
+      REMOTE-UPLOAD up FILE-MUTATION-CREATE r APPLY-FILE-MUTATION ;]
+   ENSURE-REMOTE-PARENTS ;
+
+: FILE-CREATE ( DROPBOX:hash ^pass -- apply-event )
+   {: want r :}
+   want r [: r SEND-NEW ;] PREPARE-UPLOAD ;
+
+: SEND-OVER ( ^LOCAL:staged-upload DROPBOX:rev ^pass -- apply-event )
+   {: up v:DROPBOX:rev r :}
+   r PASS-LINK @ r RUN-PATH up v r PASS-ARENA @ REMOTE-UPLOAD
+   up FILE-MUTATION-REPLACE r APPLY-FILE-MUTATION ;
+
+: FILE-REPLACE ( DROPBOX:hash DROPBOX:rev ^pass -- apply-event )
+   {: want v:DROPBOX:rev r :}
+   want r [: v r SEND-OVER ;] PREPARE-UPLOAD ;
+
+: FILE-DELETE ( DROPBOX:rev ^pass -- apply-event )
+   {: v:DROPBOX:rev r :}
+   r PASS-LINK @ r RUN-PATH v r PASS-ARENA @ REMOTE-DELETE-FILE
+   r APPLY-DELETE-MUTATION ;
+
+: FOLDER-DELETE ( ^pass -- apply-event )
+   {: r :}
+   r PASS-LINK @ r RUN-PATH r PASS-ARENA @ REMOTE-DELETE-FOLDER
+   r APPLY-FOLDER-DELETE-MUTATION ;
+
+
+\ ---- the remote operation's machine
+
+ENUM remote-state DERIVE eq
+   recorded applying passed stopped yielded ;ENUM
+ENUM remote-event done blocked local ;ENUM
+
+: >REMOTE-EVENT ( apply-event -- remote-event )
+   MATCH apply-event
+      done OF construct remote-event done ENDOF
+      blocked OF construct remote-event blocked ENDOF
+   ;MATCH ;
+
+: YIELD ( -- remote-event ) construct remote-event local ;
+
+\ The run's operation sent to Dropbox; a local one waits for local
+\ replay.
+: APPLY-REMOTE ( ^pass -- remote-event )
+   {: r :}
+   r RUN-OPERATION MATCH MODEL:operation
+      create-remote-directory OF r FOLDER-CREATE >REMOTE-EVENT ENDOF
+      preserve-remote OF
+         drop r COMPLETED-NONFINAL >REMOTE-EVENT
+      ENDOF
+      create-remote OF r FILE-CREATE >REMOTE-EVENT ENDOF
+      replace-remote OF r FILE-REPLACE >REMOTE-EVENT ENDOF
+      delete-remote OF r FILE-DELETE >REMOTE-EVENT ENDOF
+      delete-remote-directory OF r FOLDER-DELETE >REMOTE-EVENT ENDOF
+      create-local-directory OF YIELD ENDOF
+      delete-local-directory OF YIELD ENDOF
+      install-local OF drop YIELD ENDOF
+      preserve-local OF drop YIELD ENDOF
+      replace-local OF drop drop YIELD ENDOF
+      delete-local OF drop YIELD ENDOF
+   ;MATCH ;
+
+\ The block, held durably where Dropbox or the stage caused it, goes in
+\ the report.
+: STOP-REMOTE ( ^pass -- )
+   {: r :}
+   r PASS-BLOCKED @ r PERSIST-REMOTE-BLOCK
+   r PASS-REPORT @ REPLAY-REPLAY--REPORT:BLOCKED @ VEC:PUSH ! ;
+
+\ One remote operation's replay, after formal/MutationLifecycle.tla:
+\ a completed one passes; a pending one is applied, or yields if local.
+FSM:DEFINE REMOTE-LIFECYCLE ( ^pass ) remote-state remote-event
+   IN recorded  STATUS ( JOURNAL:record-status )
+      completed  -  >passed
+      pending    -  >applying
+   IN applying  APPLY-REMOTE
+      done     -  >passed
+      blocked  -  >stopped
+      local    -  >yielded
+   FINAL passed   -
+   FINAL stopped  STOP-REMOTE
+   FINAL yielded  -
+;DEFINE
+
+\ Runs the machine on r's operation; answers its final state.
+: REMOTE-RUN ( ^pass -- remote-state )
+   {: r :}
+   construct remote-state recorded
+   begin r swap REMOTE-LIFECYCLE-STEP until ;
+
+: PASSED? ( remote-state -- bool )
+   construct remote-state passed REMOTE-STATE-EQ ;
+
+\ An excluded plan is retired; another's operations run in order
+\ until one stops it or is local.
+: REPLAY-REMOTE-PLAN ( JOURNAL:plan-record ^pass -- )
+   {: p r :}
+   p r RUNNABLE? 0= if exit then
+   p PLAN-OPERATIONS {: ops :}
+   ops VEC:COUNT 0 ?do
+      ops i VEC:AT @ r PASS-OPERATION !
+      r REMOTE-RUN PASSED? 0= if leave then
+   loop ;
+
+public
+
+\ Replays the pending plans' Dropbox operations below root path r,
+\ staging uploads in s; each completion is written as it happens.
+: REPLAY-REMOTE-OPERATIONS-AT
+   ( JOURNAL:journal ^link fd ^u8 n ^u8 n ^ARENA:arena
+     -- ^replay-report )
+   {: j l root:fd r:^ ru:n s:^ su:n ar :}
+   j root r ru ar NEW-PASS {: run :}
+   l run PASS-LINK ! s su >str run PASS-STAGING !
+   j ar JOURNAL:PENDING-PLANS {: plans :}
+   plans VEC:COUNT 0 ?do
+      plans i VEC:AT @ run REPLAY-REMOTE-PLAN
+   loop
+   run PASS-REPORT @ ;
 
 ;package
