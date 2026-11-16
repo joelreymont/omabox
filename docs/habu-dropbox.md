@@ -217,36 +217,44 @@ STRUCTURE config
 Files up to 32 MiB go in one `upload` call; larger ones go through a session.
 
 ```forth
-FSM:DEFINE SESSION ( ^upload ) upload-step
-   IN single      SEND-SENSE ( send-event )
-      committed   ANSWER-DONE     >ended
-      lost        -               >confirming
-      refused     ANSWER-REFUSED  >ended
-   IN starting    START-SENSE ( start-event )
-      opened      -               >appending
-      lost        ANSWER-RETRY    >ended
-      refused     ANSWER-REFUSED  >ended
-   IN appending   APPEND-SENSE ( append-event )
-      stored      ADVANCE         >appending
-      complete    ADVANCE         >finishing
-      lost        -               >appending   \ resent once
-      cut         ANSWER-RETRY    >ended       \ lost twice
-      gone        -               >restarting
-      refused     ANSWER-REFUSED  >ended
-   IN finishing   FINISH-SENSE ( finish-event )
-      committed   ANSWER-DONE     >ended
-      lost        -               >confirming
-      gone        -               >verifying
-      refused     ANSWER-REFUSED  >ended
+FSM:DEFINE SESSION ( ^run ) upload-step send-event
+   IN single  SEND-SENSE
+      committed  ANSWER-DONE   >ended
+      elsewhere  DISTRUST      >confirming   \ at another path
+      lost       -             >confirming
+      conflict   -             >confirming
+      failed     ANSWER-REPLY  >ended
+   IN starting  START-SENSE ( start-event )
+      opened  -             >appending
+      lost    ANSWER-RETRY  >ended
+      failed  ANSWER-REPLY  >ended
+   IN appending  APPEND-SENSE ( append-event )
+      stored    CHUNK-ADVANCE  >appending
+      complete  CHUNK-ADVANCE  >finishing
+      lost      -              >appending    \ resent once
+      cut       ANSWER-RETRY   >ended        \ lost twice
+      gone      -              >restarting
+      failed    ANSWER-REPLY   >ended
+   IN finishing  FINISH-SENSE ( finish-event )
+      committed  ANSWER-DONE   >ended
+      elsewhere  DISTRUST      >confirming
+      lost       -             >confirming
+      conflict   -             >confirming
+      gone       -             >verifying
+      failed     ANSWER-REPLY  >ended
    IN confirming  CONFIRM-SENSE ( confirm-event )
-      same        ANSWER-DONE     >ended
-      other       ANSWER-RETRY    >ended
-   IN verifying   CONFIRM-SENSE ( confirm-event )
-      same        ANSWER-DONE     >ended
-      other       -               >restarting
+      same       ANSWER-DONE      >ended
+      elsewhere  ANSWER-MISMATCH  >ended
+      other      ANSWER-REPLY     >ended
+      unlinked   ANSWER-UNLINKED  >ended
+   IN verifying  CONFIRM-SENSE ( confirm-event )
+      same       ANSWER-DONE      >ended
+      elsewhere  ANSWER-MISMATCH  >ended
+      other      -                >restarting
+      unlinked   ANSWER-UNLINKED  >ended
    IN restarting  RESTART-SENSE ( restart-event )
-      again       REWIND          >starting    \ once per UPLOAD
-      twice       ANSWER-RETRY    >ended
+      once   REWIND        >starting     \ once per UPLOAD
+      twice  ANSWER-RETRY  >ended
    FINAL ended  -
 ;DEFINE
 ```
