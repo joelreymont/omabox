@@ -1,8 +1,8 @@
 \ omabox.f - the omabox program (rust src/bin/omabox.rs), whose global
 \ MAIN is the build's entry. PARSE reads the arguments as Rust's parse
-\ does: help, version, status, pause, resume, settings [--json], service
-\ ACTION and logs. A command that fails exits 1, as Rust's main
-\ returning an error does.
+\ does: help, version, status, pause, resume, settings [--json], settings
+\ set-root PATH, service ACTION and logs. A command that fails exits 1,
+\ as Rust's main returning an error does.
 \ A failure logs as CONFIG's refusals do: the library that failed logs
 \ its own lines, then OMABOX logs Rust's CliError text and, where the
 \ error has one, its help line; a SERVICE or ATTENTION failure is that
@@ -14,10 +14,14 @@
 \ setup's local steps are Rust's: its options parsed whole, the default
 \ sync root made, the authorization code read, and the config written
 \ under the daemon lock.
+\ settings set-root is Rust's: the replacement config validated, then,
+\ while the service is released and under the daemon lock, the new root
+\ inspected, the config written and the journal, where there is one,
+\ made to adopt the root.
 \ STORAGE CLASS. CALLER-OWNED: a command's service commands, drive
-\ record, configuration, text, lock, default root and authorization
-\ code live in an arena the run holds; help and the version line are
-\ built in string.f's task-local builder.
+\ record, configuration, text, lock, default root, authorization code,
+\ root binding and journal live in an arena the run holds; help and the
+\ version line are built in string.f's task-local builder.
 require src/lib/error.f
 require src/lib/string.f
 require src/lib/arena.f
@@ -64,6 +68,10 @@ public
 -101110 s" could not create the default sync root"
    ERROR:CODE E-CREATE-DEFAULT-ROOT
 -101111 s" an Omabox journal operation failed" ERROR:CODE E-JOURNAL
+-101116 s" could not inspect the sync folder" ERROR:CODE E-SYNC-ROOT
+-101117
+   s" could not inspect the Omabox journal before changing the sync root"
+   ERROR:CODE E-INSPECT-JOURNAL
 
 private
 
@@ -79,6 +87,7 @@ private
    s"   omabox status" LINE+
    s"   omabox pause|resume" LINE+
    s"   omabox settings [--json]" LINE+
+   s"   omabox settings set-root PATH" LINE+
    s"   omabox service start|stop|restart|enable|disable|status" LINE+
    s"   omabox logs" LINE+
    s"   omabox --help" LINE+
@@ -98,6 +107,7 @@ ENUM command
    VARIANT version ;VARIANT
    VARIANT status ;VARIANT
    VARIANT settings FIELD shown form ;VARIANT
+   VARIANT set-root FIELD path str ;VARIANT
    VARIANT service FIELD action SERVICE:action ;VARIANT
    VARIANT logs ;VARIANT
 ;ENUM
@@ -121,6 +131,8 @@ STRUCTURE setup-options
 ARENA DRIVENS SERVICE:driven
 ARENA WRITERS JSON:writer
 ARENA LOCKS CONFIG:lock
+ARENA BINDINGS JOURNAL:local-root-binding
+ARENA JOURNALS JOURNAL:journal
 
 
 \ ---- errors
@@ -252,6 +264,22 @@ ARENA LOCKS CONFIG:lock
    s" Create the directory, or pass --sync-root PATH." HELP
    E-CREATE-DEFAULT-ROOT cause FAIL ;
 
+\ Rust's SyncRoot, in place of the code it caught, after the lines its
+\ cause logged, all Rust's JournalError.
+: SYNC-ROOT-FAILED ( n -- )
+   drop FS:ERRNO {: cause:n :}
+   LOG-OPEN s" could not inspect the sync folder" LOG:TEXT+
+   s" Ensure the sync folder exists, is readable and is on a filesystem"
+   HELP s"  that records file creation times, or choose another folder."
+   LOG:TEXT+ E-SYNC-ROOT cause FAIL ;
+
+: INSPECT-JOURNAL-FAILED ( n -- )
+   {: cause:n :}
+   LOG-OPEN s" could not inspect the Omabox journal before changing the"
+   LOG:TEXT+ s"  sync root" LOG:TEXT+
+   s" Ensure the Omabox state directory is accessible and retry." HELP
+   E-INSPECT-JOURNAL cause FAIL ;
+
 
 \ ---- output
 
@@ -324,13 +352,19 @@ ARENA LOCKS CONFIG:lock
    argc 2 <> if s" service requires exactly one action" USAGE then
    1 arg execute ACTION COMMAND-SERVICE ;
 
-\ Rust's parse_settings, but for set-root.
+\ Rust's parse_settings; set-root takes its path as any bytes, as
+\ PathBuf::from does.
 : PARSE-SETTINGS ( n [ n -- ^u8 n ] -- command )
    {: argc:n arg :}
    argc 1 = if construct form text COMMAND-SETTINGS exit then
    argc 2 = if
       1 arg execute s" --json" STR= if
          construct form json COMMAND-SETTINGS exit
+      then
+   then
+   argc 3 = if
+      1 arg execute s" set-root" STR= if
+         2 arg execute >str COMMAND-SET-ROOT exit
       then
    then
    s" invalid settings command" USAGE ;
@@ -446,6 +480,7 @@ ARENA LOCKS CONFIG:lock
 
 
 \ ---- the configuration
+\ Each step's failure is Rust's Config for its operation, op where given.
 
 : XDG ( ^ARENA:arena -- ^CONFIG:xdg )
    {: ar :}
@@ -453,17 +488,17 @@ ARENA LOCKS CONFIG:lock
    code 0= if x exit then
    code s" resolve XDG paths" CONFIG-FAILED ;
 
-: DOCUMENT ( ^CONFIG:xdg ^ARENA:arena -- ^CONFIG:document )
-   {: x ar :}
+: DOCUMENT ( ^CONFIG:xdg ^u8 n ^ARENA:arena -- ^CONFIG:document )
+   {: x op:^ opu:n ar :}
    NULL-PTR [: drop x ar CONFIG:DOCUMENT-LOAD-FROM ;] catch {: d code :}
    code 0= if d exit then
-   code s" load configuration" CONFIG-FAILED ;
+   code op opu CONFIG-FAILED ;
 
-: STATE-PATHS ( ^CONFIG:xdg ^ARENA:arena -- ^CONFIG:paths )
-   {: x ar :}
+: STATE-PATHS ( ^CONFIG:xdg ^u8 n ^ARENA:arena -- ^CONFIG:paths )
+   {: x op:^ opu:n ar :}
    NULL-PTR [: drop x ar CONFIG:RESOLVE-PRIVATE ;] catch {: p code :}
    code 0= if p exit then
-   code s" resolve state paths" CONFIG-FAILED ;
+   code op opu CONFIG-FAILED ;
 
 \ Rust's unusable_root_line: CONFIG logs its refusal of the stored root,
 \ which leaves the command's text standing; any other code goes on.
@@ -486,8 +521,8 @@ ARENA LOCKS CONFIG:lock
 \ Rust's status_output: the journal's text.
 : STATUS-TEXT ( ^CONFIG:xdg ^ARENA:arena -- str )
    {: x ar :}
-   x ar DOCUMENT {: d :}
-   x ar STATE-PATHS {: p :}
+   x s" load configuration" ar DOCUMENT {: d :}
+   x s" resolve state paths" ar STATE-PATHS {: p :}
    p CONFIG:JOURNAL-FILE CONFIG:ABS-PATH>STR ar ATTENTION:RENDER {: t :}
    d x ar ROOT-CHECKED
    t ;
@@ -528,7 +563,7 @@ ARENA LOCKS CONFIG:lock
 \ Rust's settings_output: the stored settings, as text or JSON.
 : SETTINGS-TEXT ( ^CONFIG:xdg form ^ARENA:arena -- str )
    {: x f ar :}
-   x ar DOCUMENT {: d :}
+   x s" load configuration" ar DOCUMENT {: d :}
    f MATCH form
       text OF d ar SETTINGS-LINES ENDOF
       json OF d ar SETTINGS-JSON ENDOF
@@ -614,11 +649,12 @@ ARENA LOCKS CONFIG:lock
 
 \ ---- setup's local steps
 
-\ A path FS refuses before stat: too long, or holding a NUL byte.
-: STAT-CAUGHT ( n -- )
+\ The errno of a path FS refuses before stat: ENAMETOOLONG for one too
+\ long, 0 for one holding a NUL byte; any other code goes on.
+: STAT-CAUSE ( n -- n )
    {: code:n :}
-   code E-FS-PATH = if FS:ENAMETOOLONG INSPECT-FAILED then
-   code E-FFI-NUL = if 0 INSPECT-FAILED then
+   code E-FS-PATH = if FS:ENAMETOOLONG exit then
+   code E-FFI-NUL = if 0 exit then
    code throw ;
 
 \ Rust's refuse_existing_config: Path::try_exists is false only where
@@ -626,7 +662,7 @@ ARENA LOCKS CONFIG:lock
 : REFUSE-EXISTING ( CONFIG:abs-path -- )
    CONFIG:ABS-PATH>STR {: p :}
    false [: drop p str> FS:TRY-STAT ;] catch {: code:n :}
-   code 0<> if code STAT-CAUGHT then
+   code 0<> if code STAT-CAUSE INSPECT-FAILED then
    if CONFIG-EXISTS then
    FS:ERRNO FS:ENOENT <> if FS:ERRNO INSPECT-FAILED then ;
 
@@ -761,6 +797,99 @@ ARENA LOCKS CONFIG:lock
    [: c w bind ar HELD ;] [: l CONFIG:UNLOCK ;] finally ;
 
 
+\ ---- the sync-root change
+
+\ Rust's LocalRootBinding::inspect of the replacement's root.
+: ROOT-BINDING ( ^CONFIG:config ^ARENA:arena -- JOURNAL:local-root-binding )
+   {: r ar :}
+   r CONFIG:SYNC-ROOT CONFIG:ABS-PATH>STR {: root :}
+   ar BINDINGS-NEW {: slot :}
+   [: root JOURNAL:INSPECT slot ! ;] catch {: code:n :}
+   code 0<> if code SYNC-ROOT-FAILED then
+   slot @ ;
+
+\ Whether the journal file exists: Path::try_exists is false only where
+\ stat answers ENOENT.
+: JOURNAL-THERE? ( str -- bool )
+   {: p :}
+   false [: drop p str> FS:TRY-STAT ;] catch {: code:n :}
+   code 0<> if code STAT-CAUSE INSPECT-JOURNAL-FAILED then
+   dup if exit then
+   FS:ERRNO FS:ENOENT <> if FS:ERRNO INSPECT-JOURNAL-FAILED then ;
+
+: JOURNAL-OPENED ( str ^ARENA:arena -- JOURNAL:journal )
+   {: p ar :}
+   ar JOURNALS-NEW {: slot :}
+   [: p JOURNAL:OPEN slot ! ;] catch {: code:n :}
+   code 0<> if
+      code s" open the sync journal before changing the sync root"
+      JOURNAL-FAILED
+   then
+   slot @ ;
+
+\ The replacement written over config.toml: the stale temporaries the
+\ write left in place.
+: ROOT-WRITTEN ( ^CONFIG:config ^ARENA:arena -- ^VEC:vector<STALE:leftover> )
+   {: r ar :}
+   NULL-PTR [: drop r ar CONFIG:WRITE ;] catch {: v code:n :}
+   code 0= if v exit then
+   code s" write the new sync root" CONFIG-FAILED ;
+
+\ ROOT-WRITTEN, then the journal adopts the root the binding names.
+: ADOPTED ( JOURNAL:journal JOURNAL:local-root-binding ^CONFIG:config
+     ^ARENA:arena -- ^VEC:vector<STALE:leftover> )
+   {: j b r ar :}
+   r ar ROOT-WRITTEN {: left :}
+   [: j b ar JOURNAL:ADOPT-LOCAL-ROOT drop ;] catch {: code:n :}
+   code 0<> if code s" adopt the selected sync root" JOURNAL-FAILED then
+   left ;
+
+\ The change under the lock: the journal, opened where it exists, is
+\ closed on every path out.
+: ROOT-CHANGED ( ^CONFIG:paths ^CONFIG:config ^ARENA:arena
+     -- ^VEC:vector<STALE:leftover> )
+   {: p r ar :}
+   r ar ROOT-BINDING {: b :}
+   p CONFIG:JOURNAL-FILE CONFIG:ABS-PATH>STR {: jp :}
+   jp JOURNAL-THERE? 0= if r ar ROOT-WRITTEN exit then
+   jp ar JOURNAL-OPENED {: j :}
+   [: j b r ar ADOPTED ;] [: j JOURNAL:CLOSE ;] finally ;
+
+\ Rust's change_sync_root_while_stopped: under the daemon lock, the
+\ replacement r's root inspected, the config written, then the journal,
+\ where there is one, adopts the root; the lock is released on every
+\ path out.
+: CHANGE-ROOT ( ^CONFIG:paths ^CONFIG:config ^ARENA:arena
+     -- ^VEC:vector<STALE:leftover> )
+   {: p r ar :}
+   p ar LOCKED {: l :}
+   [: p r ar ROOT-CHANGED ;] [: l CONFIG:UNLOCK ;] finally ;
+
+\ The replacement config: the root and the stored app key.
+: REPLACEMENT ( ^CONFIG:xdg str str ^ARENA:arena -- ^CONFIG:config )
+   {: x root key ar :}
+   NULL-PTR [: drop x root key ar CONFIG:FROM-VALUES ;] catch {: r code :}
+   code 0= if r exit then
+   code s" validate the new sync root" CONFIG-FAILED ;
+
+\ "Omabox sync root is now {root}", kept in the arena.
+: ROOT-DONE ( ^CONFIG:config ^ARENA:arena -- str )
+   {: r ar :}
+   SB-RESET s" Omabox sync root is now " SB-APPEND
+   r CONFIG:SYNC-ROOT CONFIG:ABS-PATH>STR str> SB-APPEND SB$ ar KEPT ;
+
+\ Rust's set_sync_root: the root validated against the stored config,
+\ then changed while the service c is released.
+: SET-ROOT ( str ^CONFIG:xdg ^SERVICE:commands ^ARENA:arena -- )
+   {: root x c ar :}
+   x s" load configuration for sync-root change" ar DOCUMENT {: d :}
+   x s" resolve state paths for sync-root change" ar STATE-PATHS {: p :}
+   x root d CONFIG:DOCUMENT-KEY ar REPLACEMENT {: r :}
+   r ar ROOT-DONE {: done :}
+   c s" the sync-root change" done str> [: p r rot CHANGE-ROOT ;] ar
+   RELEASED ;
+
+
 \ ---- running
 
 \ Rust's run_service: a start, restart or stop drives the unit toward
@@ -786,6 +915,9 @@ ARENA LOCKS CONFIG:lock
       status OF ar XDG ar STATUS-TEXT str> WRITE-OUT ENDOF
       settings OF
          {: f :} ar XDG f ar SETTINGS-TEXT str> WRITE-OUT
+      ENDOF
+      set-root OF
+         {: root :} root ar XDG ar SERVICE:COMMANDS ar SET-ROOT
       ENDOF
       service OF {: act :} ar SERVICE:COMMANDS act ar RUN-SERVICE ENDOF
       logs OF ar SERVICE:COMMANDS SERVICE:LOGS ENDOF

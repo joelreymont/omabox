@@ -13,9 +13,9 @@
 \   an_authorization_code_is_trimmed and
 \   a_blank_or_non_utf8_authorization_code_is_rejected, each code read
 \   from a pipe
-\ - config_errors_show_their_own_help: status over a config.toml that
-\   does not parse logs CONFIG's error and help, then OMABOX's Config
-\   line with no help of its own
+\ - config_errors_show_their_own_help: set-root to a regular file logs
+\   CONFIG's error and help, then OMABOX's Config line with no help of
+\   its own
 \ - status_reports_the_journal_when_the_root_is_unavailable,
 \   settings_show_the_stored_root_when_it_is_unavailable and
 \   settings_json_is_one_document_when_the_root_is_available, where
@@ -30,11 +30,23 @@
 \   Rust's InvalidAuthorizationCode, and
 \   a_failed_release_skips_the_change_and_restores, each systemctl Rust's
 \   stateful script in a directory of its own under TMPDIR
+\ - set_root_retires_live_intent_and_preserves_payloads,
+\   set_root_starts_a_failed_service_after_the_change,
+\   set_root_restarts_a_starting_service,
+\   set_root_waits_out_a_stopping_service, the set-root half of
+\   a_completed_change_reports_a_failed_start,
+\   set_root_requires_the_daemon_lock_before_writing_config,
+\   config_write_failure_preserves_root_generation_and_live_intent,
+\   a_failed_change_and_restart_report_both,
+\   set_root_works_when_the_prior_root_is_unavailable and
+\   set_root_explicitly_adopts_a_replacement_at_the_same_path, each over
+\   Rust's fixture with its systemctl script in the fixture's directory,
+\   the journal seeded through JOURNAL and PLANNER
 \ and the program built with README's command into a directory under
 \ TMPDIR, whose --version prints its name and version and exits 0.
 \ White-box: OMABOX is reopened for PARSE, PARSE-SETUP, HOME-ROOT,
 \ COMPLETE-SETUP, READ-CODE, RUN-SERVICE, STATUS-TEXT, SETTINGS-TEXT,
-\ RESTORE-GOAL and RELEASED.
+\ RESTORE-GOAL, RELEASED and SET-ROOT.
 \ Run from the repository root: hb --load src/omabox-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -54,6 +66,7 @@ require src/lib/vector.f
 require src/dropbox.f
 require src/model.f
 require src/journal.f
+require src/planner.f
 require src/stale.f
 require src/config.f
 require src/attention.f
@@ -145,6 +158,7 @@ variable CHANGES
          s" service " SB-APPEND SERVICE-ACTION:TAG FMT:INT$ SB-APPEND
       ENDOF
       logs OF s" logs" SB-APPEND ENDOF
+      set-root OF s" set-root " SB-APPEND str> SB-APPEND ENDOF
    ;MATCH SB$ ;
 
 : ACCEPTS-IN ( command ^ARENA:arena -- )
@@ -223,7 +237,9 @@ variable CHANGES
    s" status" ONE construct command status ACCEPTS
    s" settings" ONE construct form text COMMAND-SETTINGS ACCEPTS
    s" settings" s" --json" TWO
-   construct form json COMMAND-SETTINGS ACCEPTS ;
+   construct form json COMMAND-SETTINGS ACCEPTS
+   s" settings" s" set-root" TWO s" /tmp/new" ARG+
+   s" /tmp/new" >str COMMAND-SET-ROOT ACCEPTS ;
 
 : LINES ( ^u8 n -- n )
    {: a:^ u:n :}
@@ -524,26 +540,6 @@ variable CHANGES
    s" help: Create the sync root as a local directory and ensure it is accessible."
    CONFIG-LOGGED? TTRUE ;
 
-: CONFIG-ERRORS-SHOW-THEIR-OWN-HELP ( ^ARENA:arena -- )
-   {: ar :}
-   s" config_errors_show_their_own_help" T-LABEL
-   ar FIXTURE {: d x first :}
-   x ar CONFIG:XDG-CONFIG-FILE CONFIG:ABS-PATH>STR {: file :}
-   file str> s" app_secret = 'secret'" FS:WRITE-ALL
-   d s" stderr.txt" ar INSIDE {: p :}
-   [: x ar STATUS-TEXT drop ;] p str> ar STDERR:CAPTURING
-   {: code:n e:^ eu:n :}
-   code CONFIG:E-PARSE T=
-   e eu LINES 3 T=
-   e eu s" could not parse Omabox configuration at " file PATH-LOGGED?
-   TTRUE
-   e eu
-   s" help: The file may contain only `sync_root` and `dropbox_app_key`; credentials do not belong in configuration."
-   CONFIG-LOGGED? TTRUE
-   e eu s" could not load configuration" ENDS-LOGGED? TTRUE
-   e eu s" omabox: help:" CONTAINS? TFALSE
-   d str> FS:REMOVE-TREE ;
-
 : BOUND? ( JOURNAL:dropbox-binding-write -- bool )
    MATCH JOURNAL:dropbox-binding-write
       bound OF true ENDOF
@@ -837,6 +833,483 @@ variable CHANGES
    d str> FS:REMOVE-TREE ;
 
 
+\ ---- the sync-root change
+
+\ The commands no test of a refused root reaches.
+: UNUSED ( ^ARENA:arena -- ^SERVICE:commands )
+   {: ar :}
+   s" /unused/systemctl" >str s" /unused/journalctl" >str ar SERVICE:SCRIPTS ;
+
+\ SET-ROOT of root over the XDG with the commands, its log captured in
+\ DIR/stderr.txt: the code and the log.
+: SET ( str ^CONFIG:xdg ^SERVICE:commands str ^ARENA:arena -- n ^u8 n )
+   {: root x c d ar :}
+   d s" stderr.txt" ar INSIDE {: p :}
+   [: root x c ar SET-ROOT ;] p str> ar STDERR:CAPTURING ;
+
+: CONFIG-ERRORS-SHOW-THEIR-OWN-HELP ( ^ARENA:arena -- )
+   {: ar :}
+   s" config_errors_show_their_own_help" T-LABEL
+   ar FIXTURE {: d x first :}
+   d s" file" ar INSIDE {: file :}
+   file str> s" not a directory" FS:WRITE-ALL
+   file x ar UNUSED d ar SET {: code:n e:^ eu:n :}
+   code CONFIG:E-SYNC-ROOT-NOT-DIRECTORY T=
+   e eu LINES 3 T=
+   e eu s" help: Set `sync_root` to an existing local directory."
+   CONFIG-LOGGED? TTRUE
+   e eu s" could not validate the new sync root" ENDS-LOGGED? TTRUE
+   e eu s" omabox: help:" CONTAINS? TFALSE
+   d str> FS:REMOVE-TREE ;
+
+\ Rust's fake_systemctl in DIR, answering show with the state: the
+\ commands and the service log.
+: FAKED ( str ^u8 n ^ARENA:arena -- ^SERVICE:commands str )
+   {: d s:^ su:n ar :}
+   d s" service.log" ar INSIDE {: log :}
+   d s" systemctl" ar INSIDE {: sys :}
+   sys s su log FAKE-SYSTEMCTL
+   sys s" /unused/journalctl" >str ar SERVICE:SCRIPTS log ;
+
+: PATHS-OF ( ^CONFIG:xdg ^ARENA:arena -- ^CONFIG:paths )
+   CONFIG:RESOLVE-PRIVATE ;
+
+: JOURNAL-PATH ( ^CONFIG:xdg ^ARENA:arena -- str )
+   PATHS-OF CONFIG:JOURNAL-FILE CONFIG:ABS-PATH>STR ;
+
+\ The journal at the fixture's state path, its root activated at first.
+: ACTIVE-JOURNAL ( ^CONFIG:xdg str ^ARENA:arena -- JOURNAL:journal )
+   {: x first ar :}
+   x ar JOURNAL-PATH JOURNAL:OPEN {: j :}
+   j first JOURNAL:INSPECT ar JOURNAL:ACTIVATE-LOCAL-ROOT drop
+   j ;
+
+: ONE-PLAN ( MODEL:operation ^ARENA:arena -- JOURNAL:operation-plan )
+   {: o ar :}
+   ar ARENA:ALLOCATOR 0 [type] MODEL:operation VEC:NEW {: ops :}
+   o ops VEC:PUSH !
+   ops JOURNAL-OPERATION--PLAN:MAKE ;
+
+\ Rust's let Decision::Operations(plan) = plan(...) else fail.
+: OPERATIONS ( MODEL:decision ^ARENA:arena -- JOURNAL:operation-plan )
+   {: ar :}
+   MATCH MODEL:decision
+      operate OF ENDOF
+      noop OF drop false TTRUE MODEL-OPERATION:CREATE-LOCAL-DIRECTORY ENDOF
+      blocked OF
+         drop false TTRUE MODEL-OPERATION:CREATE-LOCAL-DIRECTORY
+      ENDOF
+      conflicted OF
+         drop false TTRUE MODEL-OPERATION:CREATE-LOCAL-DIRECTORY
+      ENDOF
+      collided OF
+         drop false TTRUE MODEL-OPERATION:CREATE-LOCAL-DIRECTORY
+      ENDOF
+   ;MATCH ar ONE-PLAN ;
+
+\ Rust's let Decision::NoOp(agreement) = plan(...) else fail.
+: AGREEMENT ( MODEL:decision -- MODEL:baseline )
+   MATCH MODEL:decision
+      noop OF ENDOF
+      operate OF drop false TTRUE MODEL-BASELINE:ABSENT ENDOF
+      blocked OF drop false TTRUE MODEL-BASELINE:ABSENT ENDOF
+      conflicted OF drop false TTRUE MODEL-BASELINE:ABSENT ENDOF
+      collided OF drop false TTRUE MODEL-BASELINE:ABSENT ENDOF
+   ;MATCH ;
+
+: CONTENT ( ^u8 n -- DROPBOX:hash ) >str DROPBOX:>HASH ;
+
+: REMOTE-ABSENT ( -- MODEL:observation<MODEL:remote> )
+   MODEL-OBSERVATION:ABSENT ;
+
+\ The planner's plan for a new local file of the content, no remote one
+\ and no baseline.
+: NEW-FILE-PLAN ( ^u8 n ^ARENA:arena -- JOURNAL:operation-plan )
+   {: c:^ cu:n ar :}
+   MODEL-BASELINE:ABSENT c cu CONTENT MODEL-LOCAL:MAKE
+   MODEL-OBSERVATION:PRESENT REMOTE-ABSENT MODEL-SUBTREE:EMPTY PLANNER:PLAN
+   ar OPERATIONS ;
+
+\ The planner's agreement where both sides hold the remote file and no
+\ baseline is recorded.
+: AGREED ( MODEL:remote -- MODEL:baseline )
+   {: rf :}
+   rf MODEL-REMOTE:UNMAKE drop {: c :}
+   MODEL-BASELINE:ABSENT c MODEL-LOCAL:MAKE MODEL-OBSERVATION:PRESENT
+   rf MODEL-OBSERVATION:PRESENT MODEL-SUBTREE:EMPTY PLANNER:PLAN AGREEMENT ;
+
+: RECORDED ( JOURNAL:plan-write -- JOURNAL:plan-record )
+   MATCH JOURNAL:plan-write
+      recorded OF ENDOF
+      already-live OF false TTRUE ENDOF
+   ;MATCH ;
+
+: NOOP-RECORDED? ( JOURNAL:noop-write -- bool )
+   MATCH JOURNAL:noop-write
+      recorded OF true ENDOF
+      live-plan OF drop false ENDOF
+   ;MATCH ;
+
+: BLOCKED? ( JOURNAL:plan-block -- bool )
+   MATCH JOURNAL:plan-block
+      not-found OF false ENDOF
+      already-completed OF false ENDOF
+      blocked OF true ENDOF
+   ;MATCH ;
+
+: DISPLAY ( ^u8 n -- MODEL:path ) >str MODEL:>PATH ;
+
+: PATH$ ( MODEL:path -- ^u8 n ) MODEL:PATH>STR str> ;
+
+\ Rust's derived PartialEq of two birth times, either one absent.
+: BIRTH$ ( option<JOURNAL:birth-time> -- n n bool )
+   MATCH option
+      some OF JOURNAL-BIRTH--TIME:UNMAKE true ENDOF
+      none OF 0 0 false ENDOF
+   ;MATCH ;
+
+: SUBVOLUME$ ( option<n> -- n bool )
+   MATCH option
+      some OF true ENDOF
+      none OF 0 false ENDOF
+   ;MATCH ;
+
+: BINDINGS= ( JOURNAL:local-root-binding JOURNAL:local-root-binding
+     -- bool )
+   JOURNAL-LOCAL--ROOT--BINDING:UNMAKE {: q i2 b2 s2 :}
+   JOURNAL-LOCAL--ROOT--BINDING:UNMAKE {: p i1 b1 s1 :}
+   b1 BIRTH$ {: bs1:n bn1:n bf1:bool :}
+   b2 BIRTH$ {: bs2:n bn2:n bf2:bool :}
+   s1 SUBVOLUME$ {: v1:n vf1:bool :}
+   s2 SUBVOLUME$ {: v2:n vf2:bool :}
+   p str> q str> STR= i1 i2 = and
+   bf1 bf2 SAME-BOOL? and bs1 bs2 = and bn1 bn2 = and
+   vf1 vf2 SAME-BOOL? and v1 v2 = and ;
+
+: NO-BIRTH ( -- option<JOURNAL:birth-time> ) OPTION:NONE ;
+: NO-SUB ( -- option<n> ) OPTION:NONE ;
+
+\ The recorded root's binding and generation, none where there is none.
+: RECORD$ ( option<JOURNAL:local-root-record>
+     -- JOURNAL:local-root-binding n bool )
+   MATCH option
+      some OF JOURNAL-LOCAL--ROOT--RECORD:UNMAKE true ENDOF
+      none OF s" " >str 0 NO-BIRTH NO-SUB
+         JOURNAL-LOCAL--ROOT--BINDING:MAKE 0 false
+      ENDOF
+   ;MATCH ;
+
+: RECORDS= ( option<JOURNAL:local-root-record>
+     option<JOURNAL:local-root-record> -- bool )
+   RECORD$ {: b2 g2:n f2:bool :}
+   RECORD$ {: b1 g1:n f1:bool :}
+   f1 f2 SAME-BOOL? g1 g2 = and b1 b2 BINDINGS= and ;
+
+\ The status as a number: 0 pending, 1 blocked, 2 completed.
+: STATUS# ( JOURNAL:plan-status -- n )
+   MATCH JOURNAL:plan-status
+      pending OF 0 ENDOF
+      blocked OF 2drop 1 ENDOF
+      completed OF 2 ENDOF
+   ;MATCH ;
+
+\ The plans alike in id, path, operation count and status.
+: PLAN= ( JOURNAL:plan-record JOURNAL:plan-record -- bool )
+   JOURNAL-PLAN--RECORD:UNMAKE {: j q o2 t :}
+   JOURNAL-PLAN--RECORD:UNMAKE {: i p o1 s :}
+   i JOURNAL:PLAN-ID>N j JOURNAL:PLAN-ID>N =
+   p PATH$ q PATH$ STR= and
+   o1 VEC:COUNT o2 VEC:COUNT = and
+   s STATUS# t STATUS# = and ;
+
+: PLANS= ( ^VEC:vector<JOURNAL:plan-record>
+     ^VEC:vector<JOURNAL:plan-record> -- bool )
+   {: a b :}
+   a VEC:COUNT b VEC:COUNT <> if false exit then
+   a VEC:COUNT 0 ?do
+      a i VEC:AT @ b i VEC:AT @ PLAN= 0= if false unloop exit then
+   loop true ;
+
+\ The pending plan for path recorded from a new file of the content.
+: PENDING ( JOURNAL:journal ^u8 n ^u8 n ^ARENA:arena
+     -- JOURNAL:plan-record )
+   {: j p:^ pu:n c:^ cu:n ar :}
+   j p pu DISPLAY c cu ar NEW-FILE-PLAN ar JOURNAL:RECORD-PLAN RECORDED ;
+
+\ The root stored in the XDG's config.
+: STORED-ROOT ( ^CONFIG:xdg ^ARENA:arena -- ^u8 n ) STORED str> ;
+
+: SET-ROOT-RETIRES-LIVE-INTENT-AND-PRESERVES-PAYLOADS ( ^ARENA:arena -- )
+   {: ar :}
+   s" set_root_retires_live_intent_and_preserves_payloads" T-LABEL
+   ar FIXTURE {: d x first :}
+   d s" second" ar INSIDE {: second :}
+   second str> FS:MAKE-DIR
+   x ar PATHS-OF {: paths :}
+   x first ar ACTIVE-JOURNAL {: j :}
+   j s" pending.txt" s" pending-content" ar PENDING drop
+   j s" blocked.txt" s" blocked-content" ar PENDING {: blocked :}
+   j blocked JOURNAL-PLAN--RECORD:UNMAKE drop drop drop
+   MODEL-BLOCKAGE:STAGE-OCCUPIED 1700000000 ar JOURNAL:BLOCK-PLAN
+   BLOCKED? TTRUE
+   j JOURNAL:CLOSE
+   paths CONFIG:UPLOAD-STAGING-DIRECTORY CONFIG:ABS-PATH>STR
+   s" payload" ar INSIDE {: staged :}
+   paths CONFIG:RECOVERY-DIRECTORY CONFIG:ABS-PATH>STR
+   s" payload" ar INSIDE {: recovery :}
+   staged str> s" staged" FS:WRITE-ALL
+   recovery str> s" recovery" FS:WRITE-ALL
+   d s" active" ar FAKED {: c log :}
+   second x c d ar SET {: code:n e:^ eu:n :}
+   code 0 T=
+   x ar STORED-ROOT second str> T$=
+   log FILE-TEXT S\" show\nstop\nreset-failed\nstart\n" T$=
+   x ar JOURNAL-PATH JOURNAL:OPEN {: k :}
+   k ar JOURNAL:PENDING-PLANS VEC:COUNT 0 T=
+   k ar JOURNAL:BLOCKED-PLANS VEC:COUNT 0 T=
+   k JOURNAL:CLOSE
+   staged FILE-TEXT s" staged" T$=
+   recovery FILE-TEXT s" recovery" T$=
+   d str> FS:REMOVE-TREE ;
+
+\ set-root to DIR/second from a unit in the state succeeds, the root
+\ stored and the service log the verbs w.
+: SETS-ROOT ( ^u8 n ^u8 n ^ARENA:arena -- )
+   {: s:^ su:n w:^ wu:n ar :}
+   ar FIXTURE {: d x first :}
+   d s" second" ar INSIDE {: second :}
+   second str> FS:MAKE-DIR
+   d s su ar FAKED {: c log :}
+   second x c d ar SET {: code:n e:^ eu:n :}
+   code 0 T=
+   x ar STORED-ROOT second str> T$=
+   log FILE-TEXT w wu T$=
+   d str> FS:REMOVE-TREE ;
+
+: SET-ROOT-STARTS-A-FAILED-SERVICE-AFTER-THE-CHANGE ( ^ARENA:arena -- )
+   {: ar :}
+   s" set_root_starts_a_failed_service_after_the_change" T-LABEL
+   s" failed" S\" show\nshow\nreset-failed\nstart\n" ar SETS-ROOT ;
+
+: SET-ROOT-RESTARTS-A-STARTING-SERVICE ( ^ARENA:arena -- )
+   {: ar :}
+   s" set_root_restarts_a_starting_service" T-LABEL
+   s" activating" S\" show\nstop\nreset-failed\nstart\n" ar SETS-ROOT ;
+
+: SET-ROOT-WAITS-OUT-A-STOPPING-SERVICE ( ^ARENA:arena -- )
+   {: ar :}
+   s" set_root_waits_out_a_stopping_service" T-LABEL
+   s" deactivating" S\" show\nstop\nshow\nstop\nshow\n" ar SETS-ROOT ;
+
+\ Rust's failing_start in DIR: show answers the state, start exits 1.
+: FAILING-START ( str ^u8 n ^ARENA:arena -- ^SERVICE:commands )
+   {: d s:^ su:n ar :}
+   d s" systemctl" ar INSIDE {: sys :}
+   SB-RESET S\" printf '%s\\n' \"$2\" >> " SB-APPEND
+   d s" service.log" ar INSIDE QUOTED+
+   S\" \ncase \"$2\" in\n  show) printf '%s\\n' " SB-APPEND s su SB-APPEND
+   S\"  ;;\n  start) exit 1 ;;\nesac\nexit 0\n" SB-APPEND
+   sys str> SB$ FS:WRITE-ALL
+   sys s" /unused/journalctl" >str ar SERVICE:SCRIPTS ;
+
+\ set-root from a unit in the state whose start fails: the change is
+\ kept and reported as E-START-AFTER-CHANGE.
+: START-FAILS ( ^u8 n ^ARENA:arena -- )
+   {: s:^ su:n ar :}
+   ar FIXTURE {: d x first :}
+   d s" second" ar INSIDE {: second :}
+   second str> FS:MAKE-DIR
+   d s su ar FAILING-START {: c :}
+   second x c d ar SET {: code:n e:^ eu:n :}
+   code E-START-AFTER-CHANGE T=
+   x ar STORED-ROOT second str> T$=
+   d str> FS:REMOVE-TREE ;
+
+: A-COMPLETED-CHANGE-REPORTS-A-FAILED-START ( ^ARENA:arena -- )
+   {: ar :}
+   s" a_completed_change_reports_a_failed_start" T-LABEL
+   s" failed" ar START-FAILS
+   s" active" ar START-FAILS ;
+
+: SET-ROOT-REQUIRES-THE-DAEMON-LOCK-BEFORE-WRITING-CONFIG
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" set_root_requires_the_daemon_lock_before_writing_config" T-LABEL
+   ar FIXTURE {: d x first :}
+   d s" second" ar INSIDE {: second :}
+   second str> FS:MAKE-DIR
+   x ar PATHS-OF {: paths :}
+   paths ar CONFIG:CONFIG-FILE CONFIG:ABS-PATH>STR {: file :}
+   file FILE-TEXT ar COPIED {: original :}
+   paths CONFIG:LOCK {: held :}
+   d s" inactive" ar FAKED {: c log :}
+   second x c d ar SET {: code:n e:^ eu:n :}
+   held CONFIG:UNLOCK
+   code E-LOCK T=
+   e eu s" help: Stop any manually started Omabox daemon, then retry."
+   ENDS-LOGGED? TTRUE
+   file FILE-TEXT original str> T$=
+   log FILE-TEXT S\" show\n" T$=
+   d str> FS:REMOVE-TREE ;
+
+\ A systemctl in DIR whose stop moves the config directory to
+\ DIR/saved-config and leaves a file in its place, and whose start exits
+\ with start: the commands and the service log.
+: CONFIG-BREAKING ( str ^CONFIG:paths n ^ARENA:arena
+     -- ^SERVICE:commands str )
+   {: d paths start:n ar :}
+   paths CONFIG:CONFIG-DIRECTORY CONFIG:ABS-PATH>STR {: cd :}
+   d s" saved-config" ar INSIDE {: saved :}
+   d s" service.log" ar INSIDE {: log :}
+   d s" systemctl-write-failure" ar INSIDE {: sys :}
+   SB-RESET S\" printf '%s\\n' \"$2\" >> " SB-APPEND log QUOTED+
+   S\" \nif [ \"$2\" = show ]; then printf '%s\\n' active; fi\n" SB-APPEND
+   S\" if [ \"$2\" = stop ]; then mv " SB-APPEND cd QUOTED+ s"  " SB-APPEND
+   saved QUOTED+ s" ; : > " SB-APPEND cd QUOTED+ S\" ; fi\n" SB-APPEND
+   S\" if [ \"$2\" = start ]; then exit " SB-APPEND start CODE+
+   S\" ; fi\nexit 0\n" SB-APPEND
+   sys str> SB$ FS:WRITE-ALL
+   sys s" /unused/journalctl" >str ar SERVICE:SCRIPTS log ;
+
+\ The config directory DIR/saved-config put back in place.
+: CONFIG-RESTORED ( str ^CONFIG:paths ^ARENA:arena -- )
+   {: d paths ar :}
+   paths CONFIG:CONFIG-DIRECTORY CONFIG:ABS-PATH>STR {: cd :}
+   cd str> FS:REMOVE-FILE
+   d s" saved-config" ar INSIDE str> cd str> FS:RENAME-FILE ;
+
+: CONFIG-WRITE-FAILURE-PRESERVES-ROOT-GENERATION-AND-LIVE-INTENT
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" config_write_failure_preserves_root_generation_and_live_intent"
+   T-LABEL
+   ar FIXTURE {: d x first :}
+   d s" second" ar INSIDE {: second :}
+   second str> FS:MAKE-DIR
+   x ar PATHS-OF {: paths :}
+   x first ar ACTIVE-JOURNAL {: j :}
+   j s" pending.txt" s" pending-content" ar PENDING drop
+   j ar JOURNAL:LOCAL-ROOT-BINDING {: binding :}
+   j ar JOURNAL:PENDING-PLANS {: pending :}
+   j JOURNAL:CLOSE
+   d paths 0 ar CONFIG-BREAKING {: c log :}
+   second x c d ar SET {: code:n e:^ eu:n :}
+   code CONFIG-CODE? TTRUE
+   e eu s" could not write the new sync root" ENDS-LOGGED? TTRUE
+   log FILE-TEXT S\" show\nstop\nreset-failed\nstart\n" T$=
+   d paths ar CONFIG-RESTORED
+   x ar STORED-ROOT first str> T$=
+   x ar JOURNAL-PATH JOURNAL:OPEN {: k :}
+   k ar JOURNAL:LOCAL-ROOT-BINDING binding RECORDS= TTRUE
+   k ar JOURNAL:PENDING-PLANS pending PLANS= TTRUE
+   k JOURNAL:CLOSE
+   d str> FS:REMOVE-TREE ;
+
+: A-FAILED-CHANGE-AND-RESTART-REPORT-BOTH ( ^ARENA:arena -- )
+   {: ar :}
+   s" a_failed_change_and_restart_report_both" T-LABEL
+   ar FIXTURE {: d x first :}
+   d s" second" ar INSIDE {: second :}
+   second str> FS:MAKE-DIR
+   x ar PATHS-OF {: paths :}
+   d paths 1 ar CONFIG-BREAKING {: c log :}
+   second x c d ar SET {: code:n e:^ eu:n :}
+   code E-CHANGE-AND-RESTORE T=
+   d paths ar CONFIG-RESTORED
+   x ar STORED-ROOT first str> T$=
+   d str> FS:REMOVE-TREE ;
+
+: REMOTE ( ^u8 n ^u8 n -- MODEL:remote )
+   {: c:^ cu:n r:^ ru:n :}
+   c cu CONTENT r ru >str DROPBOX:>REV MODEL-REMOTE:MAKE ;
+
+\ The noop for path, where both sides hold the remote file, recorded.
+: AGREEMENT-RECORDED ( JOURNAL:journal ^u8 n MODEL:remote ^ARENA:arena -- )
+   {: j p:^ pu:n rf ar :}
+   j p pu DISPLAY rf AGREED ar JOURNAL:RECORD-NOOP NOOP-RECORDED? TTRUE ;
+
+\ The remote inventory: remote.txt present as the file, at remote-cursor.
+: INVENTORY-PUBLISHED ( JOURNAL:journal MODEL:remote ^ARENA:arena -- )
+   {: j rf ar :}
+   s" remote.txt" DISPLAY {: rp :}
+   ar ARENA:ALLOCATOR 0 [type] MODEL:remote-record VEC:NEW {: v :}
+   rp ar MODEL:FOLD rp rf MODEL-OBSERVATION:PRESENT
+   MODEL-REMOTE--RECORD:MAKE v VEC:PUSH !
+   j s" remote-cursor" >str DROPBOX:>CURSOR v
+   JOURNAL:PUBLISH-REMOTE-INVENTORY ;
+
+: CURSOR-IS? ( option<DROPBOX:cursor> ^u8 n -- bool )
+   {: a:^ u:n :}
+   MATCH option
+      none OF false ENDOF
+      some OF DROPBOX:CURSOR>STR str> a u STR= ENDOF
+   ;MATCH ;
+
+: SET-ROOT-WORKS-WHEN-THE-PRIOR-ROOT-IS-UNAVAILABLE ( ^ARENA:arena -- )
+   {: ar :}
+   s" set_root_works_when_the_prior_root_is_unavailable" T-LABEL
+   ar FIXTURE {: d x first :}
+   d s" second" ar INSIDE {: second :}
+   second str> FS:MAKE-DIR
+   x first ar ACTIVE-JOURNAL {: j :}
+   s" remote-content" s" remote-revision" REMOTE {: rf :}
+   j rf ar INVENTORY-PUBLISHED
+   j s" remote.txt" rf ar AGREEMENT-RECORDED
+   j ar JOURNAL:BASELINE-PATHS {: paths :}
+   paths VEC:COUNT 1 T=
+   paths 0 VEC:AT @ PATH$ s" remote.txt" T$=
+   j JOURNAL:CLOSE
+   first str> d s" unavailable-first" ar INSIDE str> FS:RENAME-FILE
+   d s" inactive" ar FAKED {: c log :}
+   second x c d ar SET {: code:n e:^ eu:n :}
+   code 0 T=
+   x ar STORED-ROOT second str> T$=
+   log FILE-TEXT S\" show\nshow\n" T$=
+   x ar JOURNAL-PATH JOURNAL:OPEN {: k :}
+   k ar JOURNAL:BASELINE-PATHS VEC:COUNT 0 T=
+   k ar JOURNAL:REMOTE-INVENTORY JOURNAL-REMOTE--INVENTORY:UNMAKE
+   {: cur v :}
+   cur s" remote-cursor" CURSOR-IS? TTRUE
+   k JOURNAL:CLOSE
+   d str> FS:REMOVE-TREE ;
+
+: CURRENT? ( JOURNAL:local-root-activation -- bool )
+   MATCH JOURNAL:local-root-activation
+      activated OF drop false ENDOF
+      current OF drop true ENDOF
+      unavailable OF drop drop false ENDOF
+   ;MATCH ;
+
+: SET-ROOT-EXPLICITLY-ADOPTS-A-REPLACEMENT-AT-THE-SAME-PATH
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" set_root_explicitly_adopts_a_replacement_at_the_same_path" T-LABEL
+   ar FIXTURE {: d x first :}
+   first JOURNAL:INSPECT {: recorded :}
+   x ar JOURNAL-PATH JOURNAL:OPEN {: j :}
+   j recorded ar JOURNAL:ACTIVATE-LOCAL-ROOT drop
+   s" same-content" s" same-revision" REMOTE {: rf :}
+   j s" tracked.txt" rf ar AGREEMENT-RECORDED
+   j JOURNAL:CLOSE
+   first str> d s" moved-first" ar INSIDE str> FS:RENAME-FILE
+   first str> FS:MAKE-DIR
+   first JOURNAL:INSPECT {: actual :}
+   recorded actual BINDINGS= TFALSE
+   d s" inactive" ar FAKED {: c log :}
+   first x c d ar SET {: code:n e:^ eu:n :}
+   code 0 T=
+   x ar JOURNAL-PATH JOURNAL:OPEN {: k :}
+   k ar JOURNAL:LOCAL-ROOT-BINDING RECORD$ {: b g:n f:bool :}
+   f TTRUE
+   b actual BINDINGS= TTRUE
+   g 2 T=
+   k ar JOURNAL:BASELINE-PATHS VEC:COUNT 0 T=
+   k actual ar JOURNAL:ACTIVATE-LOCAL-ROOT CURRENT? TTRUE
+   k JOURNAL:CLOSE
+   log FILE-TEXT S\" show\nshow\n" T$=
+   d str> FS:REMOVE-TREE ;
+
+
 \ ---- the built program
 
 : BUILD-ARGS ( str -- )
@@ -896,7 +1369,6 @@ variable CHANGES
    ar AN-AUTHORIZATION-CODE-AT-THE-LIMIT-IS-ACCEPTED
    ar AN-AUTHORIZATION-CODE-IS-TRIMMED
    ar A-BLANK-OR-NON-UTF8-AUTHORIZATION-CODE-IS-REJECTED
-   ar CONFIG-ERRORS-SHOW-THEIR-OWN-HELP
    ar STATUS-REPORTS-THE-JOURNAL-WHEN-THE-ROOT-IS-UNAVAILABLE
    ar SETTINGS-SHOW-THE-STORED-ROOT-WHEN-IT-IS-UNAVAILABLE
    ar SETTINGS-JSON-IS-ONE-DOCUMENT-WHEN-THE-ROOT-IS-AVAILABLE
@@ -905,6 +1377,17 @@ variable CHANGES
    ar A-CHANGE-RUNS-WHILE-THE-SERVICE-IS-RELEASED
    ar A-FAILED-CHANGE-STILL-RESTORES-THE-SERVICE
    ar A-FAILED-RELEASE-SKIPS-THE-CHANGE-AND-RESTORES
+   ar CONFIG-ERRORS-SHOW-THEIR-OWN-HELP
+   ar SET-ROOT-RETIRES-LIVE-INTENT-AND-PRESERVES-PAYLOADS
+   ar SET-ROOT-STARTS-A-FAILED-SERVICE-AFTER-THE-CHANGE
+   ar SET-ROOT-RESTARTS-A-STARTING-SERVICE
+   ar SET-ROOT-WAITS-OUT-A-STOPPING-SERVICE
+   ar A-COMPLETED-CHANGE-REPORTS-A-FAILED-START
+   ar SET-ROOT-REQUIRES-THE-DAEMON-LOCK-BEFORE-WRITING-CONFIG
+   ar CONFIG-WRITE-FAILURE-PRESERVES-ROOT-GENERATION-AND-LIVE-INTENT
+   ar A-FAILED-CHANGE-AND-RESTART-REPORT-BOTH
+   ar SET-ROOT-WORKS-WHEN-THE-PRIOR-ROOT-IS-UNAVAILABLE
+   ar SET-ROOT-EXPLICITLY-ADOPTS-A-REPLACEMENT-AT-THE-SAME-PATH
    ar PROGRAM ;
 
 : RUN-SUITE ( -- )
