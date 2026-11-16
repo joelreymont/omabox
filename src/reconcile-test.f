@@ -2764,16 +2764,24 @@ XS-SIZE BUFFER: XS
    [: root x RUN-ROOT @ s" a.bin" c l x RUN-ARENA @ CHECKPOINTED ;]
    [: root FS:CLOSE-DIR ;] finally ;
 
-\ Holds plan p live, blocked until an hour from now.
-: BLOCKED-AHEAD ( ^run JOURNAL:plan-record -- )
-   {: x p :}
-   x RUN-JOURNAL @ p ID-OF 503 MODEL-BLOCKAGE:DOWNLOAD-UNAVAILABLE
-   epoch-seconds JOURNAL:BLOCK-RETRY-SECONDS + x RUN-ARENA @
-   JOURNAL:BLOCK-PLAN MATCH JOURNAL:plan-block
+: PLAN-BLOCKED? ( JOURNAL:plan-block -- bool )
+   MATCH JOURNAL:plan-block
       not-found OF false ENDOF
       already-completed OF false ENDOF
       blocked OF true ENDOF
-   ;MATCH TTRUE ;
+   ;MATCH ;
+
+\ Plan id blocked for the reason until the second at.
+: BLOCKED-UNTIL ( ^run JOURNAL:plan-id MODEL:blockage n -- )
+   {: x id why at:n :}
+   x RUN-JOURNAL @ id why at x RUN-ARENA @ JOURNAL:BLOCK-PLAN
+   PLAN-BLOCKED? TTRUE ;
+
+\ Holds plan p live, blocked until an hour from now.
+: BLOCKED-AHEAD ( ^run JOURNAL:plan-record -- )
+   {: x p :}
+   x p ID-OF 503 MODEL-BLOCKAGE:DOWNLOAD-UNAVAILABLE
+   epoch-seconds JOURNAL:BLOCK-RETRY-SECONDS + BLOCKED-UNTIL ;
 
 : UNBLOCKED ( ^run JOURNAL:plan-record -- )
    {: x p :}
@@ -2880,6 +2888,9 @@ XS-SIZE BUFFER: XS
 : UPLOAD-ROUTE$ ( -- ^u8 n ) s" /2/files/upload" ;
 : METADATA-ROUTE$ ( -- ^u8 n ) s" /2/files/get_metadata" ;
 : DELETE$ ( -- ^u8 n ) s" /2/files/delete_v2" ;
+: UPLOAD-SEEN$ ( -- ^u8 n ) s" /2/files/list_folder /2/files/upload" ;
+: PASS-SEEN$ ( -- ^u8 n )
+   s" /2/files/list_folder /2/files/download /2/files/upload" ;
 
 : UPLOAD$ ( -- ^u8 n ) s" local upload" ;
 : REMOTE$ ( -- ^u8 n ) s" remote download" ;
@@ -2950,9 +2961,6 @@ XS-SIZE BUFFER: XS
 \ that hashes to it: Rust's body assert.
 : UPLOAD-SENT ( ^u8 n ^u8 n ^ARENA:arena -- )
    ADD-ARG$ TEST-DROPBOX:ARG-SENT$ 2swap T$= ;
-
-: PASS-SEEN$ ( -- ^u8 n )
-   s" /2/files/list_folder /2/files/download /2/files/upload" ;
 
 : ONE-RECONCILIATION-PASS-SYNCHRONIZES-FILES-IN-BOTH-DIRECTIONS
    ( ^ARENA:arena -- )
@@ -3079,7 +3087,7 @@ XS-SIZE BUFFER: XS
    x rec PASSED COMPLETE 1 1 0 COUNTED
    x PENDING-OF VEC:COUNT 0 T=
    x s" file.txt" STALE-LOCAL$ s" 01701" ar REMOTE-FILE BASELINE-AT
-   TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/upload" T$=
+   TEST-DROPBOX:SEEN$ UPLOAD-SEEN$ T$=
    s" /file.txt" STALE-LOCAL$ ar UPLOAD-SENT
    d x STEP-GONE ;
 
@@ -3125,7 +3133,7 @@ XS-SIZE BUFFER: XS
    x s" removed.txt" NO-BASELINE? TTRUE
    sp str> FS:EXISTS? TTRUE
    TEST-DROPBOX:SEEN$ 1 LISTED$ T$=
-   TEST-DROPBOX:SEEN$ DOWNLOAD$ CONTAINS? TFALSE
+   DOWNLOAD$ TEST-DROPBOX:CALLS 0 T=
    d x STEP-GONE ;
 
 : STALE-CASES ( ^ARENA:arena -- )
@@ -3143,19 +3151,6 @@ XS-SIZE BUFFER: XS
    RECONCILE-REPORT:UNMAKE {: r:n o:n p:n b:n e:n c:n :} p ;
 : BLOCKED-IN ( report -- n )
    RECONCILE-REPORT:UNMAKE {: r:n o:n p:n b:n e:n c:n :} b ;
-
-: PLAN-BLOCKED? ( JOURNAL:plan-block -- bool )
-   MATCH JOURNAL:plan-block
-      not-found OF false ENDOF
-      already-completed OF false ENDOF
-      blocked OF true ENDOF
-   ;MATCH ;
-
-\ Plan id blocked for the reason until the second at.
-: BLOCKED-UNTIL ( ^run JOURNAL:plan-id MODEL:blockage n -- )
-   {: x id why at:n :}
-   x RUN-JOURNAL @ id why at x RUN-ARENA @ JOURNAL:BLOCK-PLAN
-   PLAN-BLOCKED? TTRUE ;
 
 : BLOCKED-STATUS? ( JOURNAL:plan-record -- bool )
    STATUS-OF MATCH JOURNAL:plan-status
@@ -3553,8 +3548,6 @@ XS-SIZE BUFFER: XS
 
 : BLOCKED-UPLOAD$ ( -- ^u8 n ) s" blocked upload" ;
 : SIBLING$ ( -- ^u8 n ) s" sibling upload" ;
-: UPLOAD-SEEN$ ( -- ^u8 n ) s" /2/files/list_folder /2/files/upload" ;
-
 \ blocked.txt and good.txt in the root, and a symlink at blocked.txt's
 \ upload stage; answers the stage.
 : SPECIAL-STAGED ( ^run -- str )
@@ -4380,8 +4373,8 @@ $1C0 constant OWNER-ACCESS
    x s" open.txt" SIBLING$ s" 01701" ar REMOTE-FILE BASELINE-AT
    x s" locked/secret.txt" IN-ROOT SECRET$ HOLDS-BYTES
    x NO-CONFLICT-RECORD
-   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2" CONTAINS? TFALSE
-   TEST-DROPBOX:SEEN$ s" /2/files/upload" CONTAINS? TTRUE
+   DELETE$ TEST-DROPBOX:CALLS 0 T=
+   UPLOAD-ROUTE$ TEST-DROPBOX:CALLS 0 > TTRUE
    d x STEP-GONE ;
 
 : RESTRICTED-CASES ( ^ARENA:arena -- )
@@ -5064,9 +5057,6 @@ $1C0 constant OWNER-ACCESS
    x s" Foo.txt" IN-ROOT NEWER$ HOLDS-BYTES
    x s" foo.txt (case variant)" IN-ROOT VARIANT$ HOLDS-BYTES ;
 
-: UPLOAD-DOWNLOAD$ ( -- ^u8 n )
-   s" /2/files/list_folder /2/files/download /2/files/upload" ;
-
 : CASE-COLLISION-KEEPS-THE-BASELINED-SPELLING-AND-ITS-HISTORY
    ( ^ARENA:arena -- )
    {: ar :}
@@ -5084,7 +5074,7 @@ $1C0 constant OWNER-ACCESS
    S\" {\qpath\q:\qrev:rev-new\q}" CONTAINS? TTRUE
    x STEP-UNBLOCKED
    x KEPT-REPLACED
-   TEST-DROPBOX:SEEN$ UPLOAD-DOWNLOAD$ T$=
+   TEST-DROPBOX:SEEN$ PASS-SEEN$ T$=
    d x STEP-GONE ;
 
 : UPPER$ ( -- ^u8 n ) s" upper local bytes" ;
@@ -5134,7 +5124,7 @@ $1C0 constant OWNER-ACCESS
    x s" notes.txt (case variant)" IN-ROOT NOTES$ HOLDS-BYTES
    x s" notes.txt" EXISTS-IN? TFALSE
    x rec PASSED OUTCOME-FRESH? TFALSE
-   TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/upload" T$=
+   TEST-DROPBOX:SEEN$ UPLOAD-SEEN$ T$=
    d x STEP-GONE ;
 
 : OTHER$ ( -- ^u8 n ) s" other notes" ;

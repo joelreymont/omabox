@@ -756,7 +756,7 @@ variable HELD-U
 \ ---- list_folder, list_folder/continue and list_folder/longpoll
 
 \ Pages go out in order, one per listing call, each with its status; the
-\ long poll answers POLLED every time. ARGS joins those calls' bodies.
+\ long poll answers POLLED every time.
 STRUCTURE page DERIVE addr
    FIELD start n
    FIELD len n
@@ -769,8 +769,6 @@ TYPED-VARIABLE PAGES ^VEC:vector<page>
 variable PAGE-SERVED
 create POLLED TEXT-CAP allot
 variable POLLED-U
-create ARGS TEXT-CAP allot
-variable ARGS-U
 
 : NO-HOOK ( -- ) ;
 TYPED-VARIABLE ON-LISTING [ -- ]
@@ -792,17 +790,6 @@ PAGES-MADE
    PAGE-TEXT BUF:SPAN$ drop p PAGE-START @ + p PAGE-LEN @ ;
 
 
-: ARG+ ( ^u8 n -- )
-   {: a:^ u:n :}
-   a u ARGS ARGS-U @ + TEXT-CAP ARGS-U @ - STORE ARGS-U +! ;
-
-
-: ARGUED ( HTTP:request -- )
-   {: q:HTTP:request :}
-   ARGS-U @ 0<> if s"  " ARG+ then
-   q HTTP:BODY$ ARG+ ;
-
-
 : UNSET! ( HTTP:response -- )
    {: a:HTTP:response :}
    a 400 HTTP:STATUS!
@@ -812,7 +799,6 @@ PAGES-MADE
 : LISTING ( HTTP:request HTTP:response -- )
    {: q:HTTP:request a:HTTP:response :}
    q a ADMITTED? 0= if exit then
-   q ARGUED
    ON-LISTING @ ['] NO-HOOK ON-LISTING ! execute
    PAGE-SERVED @ {: i:n :}
    i PAGE-COUNT >= if a UNSET! exit then
@@ -823,14 +809,13 @@ PAGES-MADE
 
 : LONGPOLL ( HTTP:request HTTP:response -- )
    {: q:HTTP:request a:HTTP:response :}
-   q ARGUED
    POLLED-U @ 0= if a UNSET! exit then
    a POLLED POLLED-U @ ANSWER! ;
 
 
 : LISTING-RESET ( -- )
    PAGE-TEXT BUF:CLEAR PAGES @ 0 VEC:RESIZE
-   0 PAGE-SERVED ! 0 POLLED-U ! 0 ARGS-U !
+   0 PAGE-SERVED ! 0 POLLED-U !
    ['] NO-HOOK ON-LISTING ! ;
 
 
@@ -1608,11 +1593,6 @@ $2100000 constant UPLOAD-CAP
    wait 0<> if S\" ,\qbackoff\q:" SB-APPEND wait FMT:SB-INT then
    s" }" SB-APPEND
    SB$ POLLED TEXT-CAP STORE POLLED-U ! ;
-
-
-\ The bodies of the listing calls and long polls since RESET, joined by
-\ spaces.
-: ARGS$ ( -- ^u8 n ) ARGS ARGS-U @ ;
 
 
 \ The next listing call runs the quotation once, on the fake's task,

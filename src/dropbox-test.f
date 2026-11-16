@@ -938,8 +938,10 @@ variable GOT-U
    MAIN @ DROPBOX:CURSOR s" c3" T$=
    TEST-DROPBOX:SEEN$
    s" /2/files/list_folder /2/files/list_folder/continue /2/files/list_folder/continue" T$=
-   TEST-DROPBOX:ARGS$
-   S\" {\qpath\q:\q/sync\q,\qrecursive\q:true,\qinclude_deleted\q:false} {\qcursor\q:\qc1\q} {\qcursor\q:\qc2\q}" T$= ;
+   s" /2/files/list_folder" TEST-DROPBOX:BODIES-TO$
+   S\" {\qpath\q:\q/sync\q,\qrecursive\q:true,\qinclude_deleted\q:false}" T$=
+   s" /2/files/list_folder/continue" TEST-DROPBOX:BODIES-TO$
+   S\" {\qcursor\q:\qc1\q} {\qcursor\q:\qc2\q}" T$= ;
 
 
 \ A long listing: 12 pages of one folder each but page 5, whose 1200
@@ -1049,7 +1051,8 @@ variable WIDEST
    GOT$ s" x/sync/b" T$=
    TEST-DROPBOX:SEEN$
    s" /2/files/list_folder/continue /2/files/list_folder/continue" T$=
-   TEST-DROPBOX:ARGS$ S\" {\qcursor\q:\qs0\q} {\qcursor\q:\qc4\q}" T$= ;
+   s" /2/files/list_folder/continue" TEST-DROPBOX:BODIES-TO$
+   S\" {\qcursor\q:\qs0\q} {\qcursor\q:\qc4\q}" T$= ;
 
 
 \ A listing's entry is a Metadata union: one with no `.tag` has no kind,
@@ -1184,7 +1187,8 @@ variable WIDEST
    LISTING TEST-DROPBOX:POLL!
    s" c3" 30 MAIN @ DROPBOX:WAIT DONE? ASSERT
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder/longpoll" T$=
-   TEST-DROPBOX:ARGS$ S\" {\qcursor\q:\qc3\q,\qtimeout\q:30}" T$=
+   s" /2/files/list_folder/longpoll" TEST-DROPBOX:BODIES-TO$
+   S\" {\qcursor\q:\qc3\q,\qtimeout\q:30}" T$=
    TEST-DROPBOX:LEAKED? TFALSE ;
 
 
