@@ -25,7 +25,9 @@
 \ the last API call's Authorization, Path-Root and Content-Type, and the
 \ body of the last delete_v2 or single upload its route answered,
 \ BODY-SENT$. ARGS-SENT$ joins every Dropbox-API-Arg sent, and
-\ DELETE-SENT$ is the last delete_v2's body.
+\ DELETE-SENT$ is the last delete_v2's body. UPLOAD-PATHS$ and
+\ UPLOAD-BODIES$ answer each upload's Dropbox-API-Arg path and body,
+\ METADATA-BODIES$ each get_metadata's body.
 \ STORAGE CLASS. PROCESS-WIDE: one worker serves every request, so its handler
 \ alone writes the state while a test waits on its call, and the test sets it
 \ between calls; only RESUME-BODY sets it during one, and the
@@ -112,6 +114,12 @@ create TYPE-SENT NAME-CAP allot
 variable TYPE-SENT-U
 TYPED-VARIABLE TYPED bool
 TYPED-VARIABLE LEAKED bool
+create UPLOAD-PATHS TEXT-CAP allot
+variable UPLOAD-PATHS-U
+create UPLOAD-BODIES TEXT-CAP allot
+variable UPLOAD-BODIES-U
+create METADATA-BODIES TEXT-CAP allot
+variable METADATA-BODIES-U
 
 create OUT TEXT-CAP allot
 variable OUT-U
@@ -204,11 +212,63 @@ TYPED-VARIABLE TOKEN-CUTTING bool
    if true LEAKED ! then ;
 
 
+: UPLOAD-BODY+ ( ^u8 n -- )
+   {: a:^ u:n :}
+   a u UPLOAD-BODIES UPLOAD-BODIES-U @ + TEXT-CAP UPLOAD-BODIES-U @ -
+   STORE UPLOAD-BODIES-U +! ;
+
+
+: METADATA-BODY+ ( ^u8 n -- )
+   {: a:^ u:n :}
+   a u METADATA-BODIES METADATA-BODIES-U @ +
+   TEXT-CAP METADATA-BODIES-U @ - STORE METADATA-BODIES-U +! ;
+
+
+\ A member's value after its key, appended to UPLOAD-PATHS when the key
+\ was path.
+: ARG-PATH-VALUE ( JSON:reader bool -- JSON:reader )
+   {: path:bool :}
+   JSON:READ-NEXT drop
+   path 0= if JSON:READ-SKIP-VALUE exit then
+   UPLOAD-PATHS UPLOAD-PATHS-U @ + TEXT-CAP UPLOAD-PATHS-U @ -
+   JSON:READ-STR UPLOAD-PATHS-U +! ;
+
+
+: ARG-PATH-MEMBERS ( JSON:reader -- JSON:reader )
+   begin JSON:READ-NEXT dup JSON:T-KEY = while
+      drop s" path" JSON:READ-STR-EQ? ARG-PATH-VALUE
+   repeat drop ;
+
+
+\ An upload's argument path and its body, recorded.
+: UPLOAD-SENT ( HTTP:request -- )
+   {: q:HTTP:request :}
+   UPLOAD-PATHS-U @ 0<> if
+      s"  " UPLOAD-PATHS UPLOAD-PATHS-U @ + TEXT-CAP UPLOAD-PATHS-U @ -
+      STORE UPLOAD-PATHS-U +!
+   then
+   q s" Dropbox-API-Arg" HTTP:HEADER-OF$ {: v:^ vu:n sent:bool :}
+   sent if
+      PARSER v vu JSON:READ-INIT
+      JSON:READ-NEXT JSON:T-OBJ = if ARG-PATH-MEMBERS then
+      JSON:READ-FINISH
+   then
+   q HTTP:BODY$ UPLOAD-BODY+ S\" \n" UPLOAD-BODY+ ;
+
+
+: METADATA-SENT ( HTTP:request -- )
+   {: q:HTTP:request :}
+   METADATA-BODIES-U @ 0<> if s"  " METADATA-BODY+ then
+   q HTTP:BODY$ METADATA-BODY+ ;
+
+
 : RECORD ( HTTP:request -- )
    {: q:HTTP:request :}
    SEEN-U @ 0<> if s"  " SEEN+ then
    q HTTP:PATH$ SEEN+
    q HTTP:PATH$ s" /2/files/delete_v2" STR= if q RECORD-DELETE then
+   q HTTP:PATH$ s" /2/files/upload" STR= if q UPLOAD-SENT then
+   q HTTP:PATH$ s" /2/files/get_metadata" STR= if q METADATA-SENT then
    q HTTP:PATH$ s" /oauth2/token" STR= if q TOKEN-HEADERS exit then
    q HTTP:PATH$ s" /2/files/list_folder/longpoll" STR=
    if q TOKEN-HEADERS exit then
@@ -1441,7 +1501,8 @@ $2100000 constant UPLOAD-CAP
    0 GRANT-CODE-U ! 0 ROTATED-U !
    0 SEEN-U ! 0 DELETES-U ! 0 AUTH-U ! 0 ROOT-SENT-U ! 0 TYPE-SENT-U !
    0 ARG-SENT-U ! 0 ARGS-SENT-U ! 0 DELETE-SENT-U ! 0 RANGE-SENT-U !
-   0 BODY-SENT-U !
+   0 BODY-SENT-U ! 0 UPLOAD-PATHS-U ! 0 UPLOAD-BODIES-U !
+   0 METADATA-BODIES-U !
    false ROOTED ! false TYPED ! false LEAKED ! false RANGED !
    false SKEWED ! false CLIPPED ! false INFLATED !
    0 MISHASHED-U ! false MISSIZED ! 0 MISFILED-U !
@@ -1536,6 +1597,13 @@ $2100000 constant UPLOAD-CAP
 \ Whether a token request or long poll since RESET carried Authorization or
 \ Path-Root.
 : LEAKED? ( -- bool ) LEAKED @ ;
+\ Each files/upload's Dropbox-API-Arg path since RESET, joined by
+\ spaces.
+: UPLOAD-PATHS$ ( -- ^u8 n ) UPLOAD-PATHS UPLOAD-PATHS-U @ ;
+\ Each files/upload's body since RESET, each followed by a newline.
+: UPLOAD-BODIES$ ( -- ^u8 n ) UPLOAD-BODIES UPLOAD-BODIES-U @ ;
+\ Each get_metadata's body since RESET, joined by spaces.
+: METADATA-BODIES$ ( -- ^u8 n ) METADATA-BODIES METADATA-BODIES-U @ ;
 
 
 \ ---- list_folder, list_folder/continue and list_folder/longpoll

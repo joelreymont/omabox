@@ -167,6 +167,16 @@
 \ - child_created_after_scan_forces_an_immediate_directory_rescan, the
 \   fake's listing hook writing the child where Rust's gate does
 \ - nonempty_directory_delete_reobserves_and_syncs_the_new_child
+\ The root and exclusions against the fake Dropbox, Rust's tests of the
+\ same names:
+\ - replaced_local_root_never_replays_pending_deletion
+\ - rejected_paths_do_not_stop_unrelated_sync_or_report_progress, with
+\   replayed 2 as its download installs in the pass, and no account
+\   request
+\ - documented_exclusions_preserve_payloads_while_ordinary_siblings_sync,
+\   with no account request
+\ - excluded_pending_and_blocked_work_is_retired_across_reopen_without_effects,
+\   without its status render, which has no port
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -5943,6 +5953,479 @@ TYPED-VARIABLE RACED str
    ar CHILD-CREATED-AFTER-SCAN-FORCES-AN-IMMEDIATE-DIRECTORY-RESCAN
    ar NONEMPTY-DIRECTORY-DELETE-REOBSERVES-AND-SYNCS-THE-NEW-CHILD ;
 
+\ ---- the root and exclusions against the fake Dropbox ---------------
+
+: UNROOTED-PASS? ( outcome -- bool )
+   MATCH outcome
+      complete OF drop false ENDOF
+      fresh OF false ENDOF
+      root-changed OF true ENDOF
+   ;MATCH ;
+
+\ The report's replayed and sync-errors.
+: REPLAYED-ERRORS ( report -- n n )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   replayed errors ;
+
+\ Rust's replay_remote_operations below the run's root.
+: REMOTE-REPLAYED ( ^run -- ^REPLAY:replay-report )
+   {: x :}
+   x ROOT$ s" open test root" LOCAL:OPEN-ROOT {: root:fd :}
+   [: x RUN-JOURNAL @ x RUN-LINK @ root x ROOT$ x STAGING$
+      x RUN-ARENA @ REPLAY:REPLAY-REMOTE-OPERATIONS-AT ;]
+   [: root FS:CLOSE-DIR ;] finally ;
+
+\ Rust's replay_local_operations: the pending plans' local operations
+\ below the run's root.
+: LOCAL-REPLAYED ( ^run -- ^REPLAY:replay-report )
+   {: x :}
+   x ROOT$ s" open test root" LOCAL:OPEN-ROOT {: root:fd :}
+   [: x RUN-JOURNAL @ root x ROOT$ x PENDING-OF x RUN-ARENA @
+      REPLAY:REPLAY-LOCAL-PLANS-AT ;]
+   [: root FS:CLOSE-DIR ;] finally ;
+
+\ Plan id blocked for the reason until the second at.
+: BLOCKED-UNTIL ( ^run JOURNAL:plan-id MODEL:blockage n -- )
+   {: x id why at:n :}
+   x RUN-JOURNAL @ id why at x RUN-ARENA @ JOURNAL:BLOCK-PLAN
+   MATCH JOURNAL:plan-block
+      not-found OF false ENDOF
+      already-completed OF false ENDOF
+      blocked OF true ENDOF
+   ;MATCH TTRUE ;
+
+: REJECTED-AS ( ^u8 n -- MODEL:blockage )
+   >str MODEL-BLOCKAGE:REMOTE-REJECTED ;
+
+: REJECTION$ ( MODEL:blockage -- ^u8 n )
+   MATCH MODEL:blockage
+      unsupported-file-size OF s" " ENDOF
+      remote-rejected OF str> ENDOF
+      download-unavailable OF drop s" " ENDOF
+      download-verification-failed OF s" " ENDOF
+      stage-occupied OF s" " ENDOF
+      local-object-in-way OF s" " ENDOF
+      remote-object OF s" " ENDOF
+      conflict-copy-occupied OF s" " ENDOF
+   ;MATCH ;
+
+\ The tag of the plan's remote-rejected block, else empty.
+: REJECTED-TAG$ ( JOURNAL:plan-record -- ^u8 n )
+   JOURNAL-PLAN--RECORD:UNMAKE {: id p o s :}
+   s MATCH JOURNAL:plan-status
+      pending OF s" " ENDOF
+      blocked OF drop REJECTION$ ENDOF
+      completed OF s" " ENDOF
+   ;MATCH ;
+
+: KEEP$ ( -- ^u8 n ) s" must not be deleted from a replacement root" ;
+
+\ Rust's swap: the run's root renamed old-root in the case directory
+\ d, and a new root holding keep.txt's bytes.
+: REPLACED-ROOT ( str ^run -- )
+   {: d:str x :}
+   x ROOT$ d s" old-root" x RUN-ARENA @ INSIDE str> FS:RENAME-FILE
+   x ROOT$ FS:MAKE-DIR
+   x s" keep.txt" IN-ROOT str> KEEP$ FS:WRITE-ALL ;
+
+: REPLACED-LOCAL-ROOT-NEVER-REPLAYS-PENDING-DELETION
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" replaced_local_root_never_replays_pending_deletion" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   KEEP$ s" rev-old" ar REMOTE-FILE {: rem :}
+   rem MODEL-REMOTE:UNMAKE {: c v :}
+   x s" keep.txt" IN-ROOT str> KEEP$ FS:WRITE-ALL
+   x s" keep.txt" rem SEED-BASELINE
+   x s" keep.txt" rem MODEL-BASELINE:PRESENT c MODEL-LOCAL:MAKE
+   LOCAL-PRESENT REMOTE-ABSENT RECORD-FIXTURE-PLAN drop
+   d x REPLACED-ROOT
+   x rec PASSED UNROOTED-PASS? TTRUE
+   x s" keep.txt" IN-ROOT KEEP$ HOLDS-BYTES
+   x PENDING-OF VEC:COUNT 1 T=
+   TEST-DROPBOX:SEEN$ s" " T$=
+   d x STEP-GONE ;
+
+: INVALID-NAME$ ( -- ^u8 n ) s\" invalid-\xFF.txt" ;
+: INVALID-BYTES$ ( -- ^u8 n ) s" invalid path bytes" ;
+: REJECTED-BYTES$ ( -- ^u8 n ) s" rejected bytes" ;
+: GOOD-BYTES$ ( -- ^u8 n ) s" uploaded bytes" ;
+: SIBLING-BYTES$ ( -- ^u8 n ) s" downloaded sibling bytes" ;
+: METADATA-ROUTE$ ( -- ^u8 n ) s" /2/files/get_metadata" ;
+
+: UPLOAD-SUMMARY$ ( ^u8 n -- ^u8 n )
+   {: t:^ tu:n :}
+   t tu s" conflict" STR= if s" path/conflict/file/..." exit then
+   t tu s" disallowed_name" STR= if
+      s" path/disallowed_name/..." exit
+   then
+   s" path/other/..." ;
+
+\ Rust's upload_error for a reason of tag t, in SB.
+: UPLOAD-ERROR$ ( ^u8 n -- ^u8 n )
+   {: t:^ tu:n :}
+   SB-RESET S\" {\qerror_summary\q:" SB-APPEND
+   t tu UPLOAD-SUMMARY$ QUOTED+
+   S\" ,\qerror\q:{\q.tag\q:\qpath\q,\qreason\q:{\q.tag\q:" SB-APPEND
+   t tu QUOTED+
+   S\" },\qupload_session_id\q:\qfixture-session\q}}" SB-APPEND SB$ ;
+
+\ The next upload is refused 409 for the wire tag t.
+: UPLOAD-REFUSED ( ^u8 n -- )
+   {: t:^ tu:n :}
+   UPLOAD-ROUTE$ 409 s" " s" " t tu UPLOAD-ERROR$
+   TEST-DROPBOX:ROUTE-SCRIPT! ;
+
+: DISALLOWED-UPLOAD ( DROPBOX:hash -- )
+   drop s" disallowed_name" UPLOAD-REFUSED ;
+
+: FUTURE-WRITE ( DROPBOX:hash -- )
+   drop s" future_write_error" UPLOAD-REFUSED ;
+
+\ The next upload and its read-back answer /moved.txt with content h.
+: MOVED ( DROPBOX:hash -- )
+   {: h:DROPBOX:hash :}
+   SB-RESET
+   s" /moved.txt" s" /moved.txt" s" moved-revision" h FILE-JSON+
+   UPLOAD-ROUTE$ 200 s" " s" " SB$ TEST-DROPBOX:ROUTE-SCRIPT!
+   METADATA-ROUTE$ 200 s" " s" " SB$ TEST-DROPBOX:ROUTE-SCRIPT! ;
+
+\ A listing page of good.txt, content g, and download.txt, content sib,
+\ with the cursor k.
+: SIBLINGS-PAGE ( DROPBOX:hash DROPBOX:hash ^u8 n ^ARENA:arena -- )
+   {: g:DROPBOX:hash sib:DROPBOX:hash k:^ ku:n ar :}
+   [: s" /good.txt" s" /good.txt" s" good-revision" g FILE-JSON+ COMMA+
+      s" /download.txt" s" /download.txt" s" download-sibling-revision"
+      sib FILE-JSON+ ;]
+   ar ENTRIES k ku false PAGE ;
+
+\ Rust's answers: the rejection q for the rejected content, good.txt's
+\ upload, both passes' listings and download.txt, then q again.
+: REJECTED-SERVED ( [ DROPBOX:hash -- ] ^ARENA:arena -- )
+   {: q ar :}
+   REJECTED-BYTES$ ar IDENTITY {: rc:DROPBOX:hash :}
+   GOOD-BYTES$ ar IDENTITY {: g:DROPBOX:hash :}
+   SIBLING-BYTES$ ar IDENTITY {: sib:DROPBOX:hash :}
+   rc q execute
+   SB-RESET s" /good.txt" s" /good.txt" s" good-revision" g FILE-JSON+
+   UPLOAD-ROUTE$ 200 s" " s" " SB$ TEST-DROPBOX:ROUTE-SCRIPT!
+   g sib s" after-rejection" ar SIBLINGS-PAGE
+   s" download.txt" s" download-sibling-revision" SIBLING-BYTES$ ar
+   SERVES
+   g sib s" after-due-rejection" ar SIBLINGS-PAGE
+   rc q execute ;
+
+\ The local file p holding b, and its upload recorded pending.
+: UPLOAD-PENDING ( ^run ^u8 n ^u8 n -- )
+   {: x p:^ u:n b:^ bu:n :}
+   x RUN-ARENA @ {: ar :}
+   x p u IN-ROOT str> b bu FS:WRITE-ALL
+   x p u MODEL-BASELINE:ABSENT
+   b bu ar IDENTITY MODEL-LOCAL:MAKE LOCAL-PRESENT REMOTE-ABSENT
+   RECORD-FIXTURE-PLAN drop ;
+
+\ The first pass uploads good.txt, installs download.txt and blocks the
+\ invalid path and bad.txt, the second as tag t; bad.txt's plan id.
+: REJECTED-FIRST ( ^run str ^u8 n -- JOURNAL:plan-id )
+   {: x rec:str t:^ tu:n :}
+   x RUN-ARENA @ {: ar :}
+   x rec PASSED COMPLETE REPLAYED-ERRORS {: replayed:n errors:n :}
+   \ Departure 2: download.txt installs in the pass, so 2, not 1.
+   replayed 2 T=
+   errors 2 T=
+   x STEPPED
+   x s" download.txt" IN-ROOT SIBLING-BYTES$ HOLDS-BYTES
+   x s" good.txt" GOOD-BYTES$ s" good-revision" ar REMOTE-FILE
+   BASELINE-AT
+   x PENDING-OF VEC:COUNT 0 T=
+   x BLOCKED-OF {: held :}
+   held VEC:COUNT 2 T=
+   held 0 PLAN-PATH$ INVALID-NAME$ T$=
+   held 1 PLAN-PATH$ s" bad.txt" T$=
+   held 0 VEC:AT @ REJECTED-TAG$ s" invalid_path" T$=
+   held 1 VEC:AT @ REJECTED-TAG$ t tu T$=
+   held 1 VEC:AT @ ID-OF ;
+
+\ Reopened, the remote replay reports nothing blocked; bad, blocked as
+\ tag t and due now, is sent again by a second pass.
+: REJECTED-DUE ( str ^run str JOURNAL:plan-id ^u8 n -- )
+   {: d:str x rec:str bad t:^ tu:n :}
+   d x REOPENED
+   x REMOTE-REPLAYED BLOCKS VEC:COUNT 0 T=
+   x bad t tu REJECTED-AS 0 BLOCKED-UNTIL
+   x rec PASSED COMPLETE REPLAYED-ERRORS nip 2 T=
+   x PENDING-OF VEC:COUNT 0 T=
+   x BLOCKED-OF VEC:COUNT 2 T= ;
+
+\ The requests: the rejection's rs, good.txt's upload, the listing, the
+\ download and the continuation, then rs again; no account request
+\ (departure 5).
+: REJECTED-SEEN$ ( ^u8 n -- ^u8 n )
+   {: rs:^ ru:n :}
+   SB-RESET rs ru SB-APPEND
+   s"  /2/files/upload /2/files/list_folder /2/files/download" SB-APPEND
+   s"  /2/files/list_folder/continue " SB-APPEND rs ru SB-APPEND SB$ ;
+
+: REJECTED-BODIES$ ( -- ^u8 n )
+   SB-RESET REJECTED-BYTES$ SB-APPEND S\" \n" SB-APPEND
+   GOOD-BYTES$ SB-APPEND S\" \n" SB-APPEND
+   REJECTED-BYTES$ SB-APPEND S\" \n" SB-APPEND SB$ ;
+
+\ Rust's rejected_path_case: the rejection q, whose requests' paths are
+\ rs, blocks bad.txt as tag t while unrelated paths sync.
+: REJECTED-PATH-CASE ( [ DROPBOX:hash -- ] ^u8 n ^u8 n ^ARENA:arena -- )
+   {: q rs:^ ru:n t:^ tu:n ar :}
+   TEST-DROPBOX:RESET
+   q ar REJECTED-SERVED
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x INVALID-NAME$ INVALID-BYTES$ UPLOAD-PENDING
+   x s" bad.txt" REJECTED-BYTES$ UPLOAD-PENDING
+   x s" good.txt" GOOD-BYTES$ UPLOAD-PENDING
+   x rec t tu REJECTED-FIRST {: bad :}
+   d x rec bad t tu REJECTED-DUE
+   TEST-DROPBOX:SEEN$ rs ru REJECTED-SEEN$ T$=
+   TEST-DROPBOX:UPLOAD-BODIES$ REJECTED-BODIES$ T$=
+   d x STEP-GONE ;
+
+: BAD-LOOKUPS$ ( -- ^u8 n )
+   SB-RESET 2 0 ?do
+      i 0<> if s"  " SB-APPEND then
+      S\" {\qpath\q:\q/bad.txt\q,\qinclude_deleted\q:true}" SB-APPEND
+   loop SB$ ;
+
+: REJECTED-PATHS-DO-NOT-STOP-UNRELATED-SYNC-OR-REPORT-PROGRESS
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" rejected_paths_do_not_stop_unrelated_sync_or_report_progress"
+   T-LABEL
+   [: DISALLOWED-UPLOAD ;] UPLOAD-ROUTE$ s" disallowed_name" ar
+   REJECTED-PATH-CASE
+   [: FUTURE-WRITE ;] UPLOAD-ROUTE$ s" rejected_by_dropbox" ar
+   REJECTED-PATH-CASE
+   [: MOVED ;] s" /2/files/upload /2/files/get_metadata"
+   s" path_mismatch" ar REJECTED-PATH-CASE
+   \ The uploads besides good.txt's both name /bad.txt.
+   TEST-DROPBOX:UPLOAD-PATHS$ s" /bad.txt /good.txt /bad.txt" T$=
+   TEST-DROPBOX:METADATA-BODIES$ BAD-LOOKUPS$ T$= ;
+
+: STALE$ ( -- ^u8 n ) s" preserve stale local metadata" ;
+: ORDINARY-UPLOAD$ ( -- ^u8 n ) s" ordinary local upload" ;
+: ORDINARY-DOWNLOAD$ ( -- ^u8 n ) s" ordinary remote download" ;
+
+\ Rust's excluded local files: q runs on each path and its bytes.
+: EXCLUDED-LOCALS ( [ ^u8 n ^u8 n -- ] -- )
+   {: q :}
+   s" Desktop.INI" STALE$ q execute
+   s\" Icon\r" s" local icon metadata" q execute
+   s" .DROPBOX.ATTR" s" local Dropbox attributes" q execute
+   s" metadata.DS_STORE" s" local suffixed metadata" q execute
+   s" ~$draft.docx" s" local office temporary file" q execute
+   s" .~draft.docx" s" local hidden temporary file" q execute
+   s" .DROPBOX/local-child.txt" s" local excluded descendant"
+   q execute ;
+
+: EXCLUDED-WRITE ( ^u8 n ^u8 n ^run -- )
+   {: p:^ u:n b:^ bu:n x :}
+   x p u IN-ROOT str> b bu FS:WRITE-ALL ;
+
+: EXCLUDED-KEPT ( ^u8 n ^u8 n ^run -- )
+   {: p:^ u:n b:^ bu:n x :}
+   x p u IN-ROOT b bu HOLDS-BYTES ;
+
+\ Rust's delta page: excluded files and a folder with a child, and
+\ ordinary-download.txt.
+: EXCLUDED-ENTRIES ( ^ARENA:arena -- str )
+   {: ar :}
+   s" new excluded inventory" ar IDENTITY {: nc:DROPBOX:hash :}
+   s" remote excluded payload" ar IDENTITY {: ro:DROPBOX:hash :}
+   s" remote excluded descendant" ar IDENTITY {: rc:DROPBOX:hash :}
+   ORDINARY-DOWNLOAD$ ar IDENTITY {: dl:DROPBOX:hash :}
+   [: s" /.ds_store" s" /.ds_store" s" new-excluded-revision" nc
+      FILE-JSON+ COMMA+
+      s" /thumbs.db" s" /THUMBS.DB" s" remote-excluded-revision" ro
+      FILE-JSON+ COMMA+
+      s" /.dropbox" s" /.Dropbox" FOLDER-JSON+ COMMA+
+      s" /.dropbox/remote-child.txt" s" /.Dropbox/remote-child.txt"
+      s" remote-child-revision" rc FILE-JSON+ COMMA+
+      s" /ordinary-download.txt" s" /ordinary-download.txt"
+      s" ordinary-download-revision" dl FILE-JSON+ ;]
+   ar ENTRIES ;
+
+\ Rust's answers: the delta page, ordinary-upload.txt's upload and
+\ ordinary-download.txt.
+: EXCLUDED-SERVED ( ^ARENA:arena -- )
+   {: ar :}
+   ar EXCLUDED-ENTRIES s" excluded-delta" false PAGE
+   ORDINARY-UPLOAD$ ar IDENTITY {: up:DROPBOX:hash :}
+   SB-RESET s" /ordinary-upload.txt" s" /ordinary-upload.txt"
+   s" ordinary-upload-revision" up FILE-JSON+
+   UPLOAD-ROUTE$ 200 s" " s" " SB$ TEST-DROPBOX:ROUTE-SCRIPT!
+   s" ordinary-download.txt" s" ordinary-download-revision"
+   ORDINARY-DOWNLOAD$ ar SERVES ;
+
+\ The root's excluded files and ordinary-upload.txt; the journal's
+\ baselines at Desktop.INI and THUMBS.DB and its inventory, .DS_Store
+\ at the old revision.
+: EXCLUDED-ROOT ( ^run MODEL:remote MODEL:remote -- )
+   {: x stale only :}
+   x RUN-ARENA @ {: ar :}
+   x RUN-JOURNAL @ {: j :}
+   x s" .DROPBOX" IN-ROOT str> FS:MAKE-DIR
+   [: x EXCLUDED-WRITE ;] EXCLUDED-LOCALS
+   x s" ordinary-upload.txt" IN-ROOT str> ORDINARY-UPLOAD$ FS:WRITE-ALL
+   x s" Desktop.INI" stale SEED-BASELINE
+   x s" THUMBS.DB" only SEED-BASELINE
+   s" old excluded inventory" s" old-excluded-revision" ar REMOTE-FILE
+   {: old :}
+   j s" old-excluded-cursor"
+   s" .DS_Store" ar CANONICAL s" .DS_Store" DISPLAY old REMOTE-PRESENT
+   MODEL-REMOTE--RECORD:MAKE ar PUBLISHED ;
+
+\ Departure 5: no account request; the download installs before the
+\ upload is sent.
+: EXCLUDED-SEEN$ ( -- ^u8 n )
+   s" /2/files/list_folder/continue /2/files/download /2/files/upload" ;
+
+: DOCUMENTED-EXCLUSIONS-PRESERVE-PAYLOADS-WHILE-ORDINARY-SIBLINGS-SYNC
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" documented_exclusions_preserve_payloads_while_ordinary_siblings_sync"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar EXCLUDED-SERVED
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   STALE$ s" stale-metadata-revision" ar REMOTE-FILE {: stale :}
+   s" remote excluded payload" s" remote-excluded-revision" ar
+   REMOTE-FILE {: only :}
+   x stale only EXCLUDED-ROOT
+   x rec PASSED COMPLETE REPLAYED-ERRORS nip 0 T=
+   x STEPPED
+   [: x EXCLUDED-KEPT ;] EXCLUDED-LOCALS
+   x s" .ds_store" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" THUMBS.DB" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" .Dropbox/remote-child.txt" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" ordinary-upload.txt" IN-ROOT ORDINARY-UPLOAD$ HOLDS-BYTES
+   x s" ordinary-download.txt" IN-ROOT ORDINARY-DOWNLOAD$ HOLDS-BYTES
+   x s" ordinary-upload.txt" ORDINARY-UPLOAD$
+   s" ordinary-upload-revision" ar REMOTE-FILE BASELINE-AT
+   x s" ordinary-download.txt" ORDINARY-DOWNLOAD$
+   s" ordinary-download-revision" ar REMOTE-FILE BASELINE-AT
+   x s" Desktop.INI" stale BASELINE-AT
+   x s" THUMBS.DB" only BASELINE-AT
+   x PENDING-OF VEC:COUNT 0 T=
+   x BLOCKED-OF VEC:COUNT 0 T=
+   TEST-DROPBOX:SEEN$ EXCLUDED-SEEN$ T$=
+   d x STEP-GONE ;
+
+: EXCLUDED-LOCAL$ ( -- ^u8 n ) s" preserved excluded local bytes" ;
+
+: BOUND-ANY ( JOURNAL:dropbox-binding-write -- )
+   MATCH JOURNAL:dropbox-binding-write
+      bound OF ENDOF
+      already-bound OF ENDOF
+      mismatch OF drop ENDOF
+   ;MATCH ;
+
+\ Pending excluded plans on both sides, retired by a remote replay of
+\ the reopened journal that sends nothing.
+: REMOTE-RETIRES ( str ^run MODEL:local MODEL:remote -- )
+   {: d:str x loc rem :}
+   x RUN-ARENA @ {: ar :}
+   x s" .DS_Store" MODEL-BASELINE:ABSENT
+   loc LOCAL-PRESENT REMOTE-ABSENT RECORD-FIXTURE-PLAN drop
+   x s" Desktop.ini" rem SEED-BASELINE
+   x s" Desktop.ini" rem MODEL-BASELINE:PRESENT
+   LOCAL-ABSENT rem REMOTE-PRESENT RECORD-FIXTURE-PLAN drop
+   d x REOPENED
+   x REMOTE-REPLAYED COMPLETED 0 T=
+   x PENDING-OF VEC:COUNT 0 T=
+   TEST-DROPBOX:SEEN$ s" " T$=
+   x s" .DS_Store" IN-ROOT EXCLUDED-LOCAL$ HOLDS-BYTES ;
+
+\ Pending excluded plans on both sides, retired by a local replay of
+\ the reopened journal that touches neither file.
+: LOCAL-RETIRES ( str ^run MODEL:local MODEL:remote -- )
+   {: d:str x loc rem :}
+   x RUN-ARENA @ {: ar :}
+   x s" Thumbs.db" MODEL-BASELINE:ABSENT
+   LOCAL-ABSENT rem REMOTE-PRESENT RECORD-FIXTURE-PLAN drop
+   x s\" Icon\r" rem SEED-BASELINE
+   x s\" Icon\r" rem MODEL-BASELINE:PRESENT
+   loc LOCAL-PRESENT REMOTE-ABSENT RECORD-FIXTURE-PLAN drop
+   d x REOPENED
+   x LOCAL-REPLAYED COMPLETED 0 T=
+   x PENDING-OF VEC:COUNT 0 T=
+   x s" Thumbs.db" IN-ROOT str> FS:EXISTS? TFALSE
+   x s\" Icon\r" IN-ROOT EXCLUDED-LOCAL$ HOLDS-BYTES ;
+
+\ An excluded pending download, and three excluded plans blocked.
+: BLOCKED-EXCLUSIONS ( ^run MODEL:local MODEL:remote -- )
+   {: x loc rem :}
+   x RUN-ARENA @ {: ar :}
+   x s" folder/metadata.ds_store" MODEL-BASELINE:ABSENT
+   LOCAL-ABSENT rem REMOTE-PRESENT RECORD-FIXTURE-PLAN drop
+   x s" .dropbox.attr" IN-ROOT str> EXCLUDED-LOCAL$ FS:WRITE-ALL
+   x s" .dropbox.attr" MODEL-BASELINE:ABSENT
+   loc LOCAL-PRESENT REMOTE-ABSENT RECORD-FIXTURE-PLAN ID-OF
+   {: up :}
+   x up s" disallowed_name" REJECTED-AS 4000000000 BLOCKED-UNTIL
+   x s" ~$blocked-download" MODEL-BASELINE:ABSENT
+   LOCAL-ABSENT rem REMOTE-PRESENT RECORD-FIXTURE-PLAN ID-OF {: down :}
+   x down MODEL-BLOCKAGE:DOWNLOAD-VERIFICATION-FAILED 4000000000
+   BLOCKED-UNTIL
+   x s" .~remote-delete" rem SEED-BASELINE
+   x s" .~remote-delete" rem MODEL-BASELINE:PRESENT
+   LOCAL-ABSENT rem REMOTE-PRESENT RECORD-FIXTURE-PLAN ID-OF {: del :}
+   x del s" conflict" REJECTED-AS 4000000000 BLOCKED-UNTIL ;
+
+\ The reopened journal's replay step retires the excluded work, sends
+\ nothing and keeps every baseline and file. Rust's status render of
+\ the journal has no port.
+: BLOCKED-RETIRES ( str ^run MODEL:remote -- )
+   {: d:str x rem :}
+   d x REOPENED
+   TEST-DROPBOX:RESET
+   x REPLAY-STEP REPORTED COMPLETED 0 T=
+   x PENDING-OF VEC:COUNT 0 T=
+   x BLOCKED-OF VEC:COUNT 0 T=
+   x s" Desktop.ini" rem BASELINE-AT
+   x s\" Icon\r" rem BASELINE-AT
+   x s" .~remote-delete" rem BASELINE-AT
+   x s" .dropbox.attr" IN-ROOT EXCLUDED-LOCAL$ HOLDS-BYTES
+   x s" folder/metadata.ds_store" IN-ROOT str> FS:EXISTS? TFALSE
+   TEST-DROPBOX:SEEN$ s" " T$= ;
+
+: EXCLUDED-PENDING-AND-BLOCKED-WORK-IS-RETIRED-ACROSS-REOPEN-WITHOUT-EFFECTS
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" excluded_pending_and_blocked_work_is_retired_across_reopen_without_effects"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   EXCLUDED-LOCAL$ ar IDENTITY MODEL-LOCAL:MAKE {: loc :}
+   EXCLUDED-LOCAL$ s" excluded-remote-revision" ar REMOTE-FILE {: rem :}
+   x s" .DS_Store" IN-ROOT str> EXCLUDED-LOCAL$ FS:WRITE-ALL
+   x s\" Icon\r" IN-ROOT str> EXCLUDED-LOCAL$ FS:WRITE-ALL
+   x RUN-JOURNAL @ s" dbid:account" >str s" namespace" >str s" " >str
+   JOURNAL-DROPBOX--BINDING:MAKE ar JOURNAL:BIND-DROPBOX-ROOT BOUND-ANY
+   d x loc rem REMOTE-RETIRES
+   d x loc rem LOCAL-RETIRES
+   x loc rem BLOCKED-EXCLUSIONS
+   d x rem BLOCKED-RETIRES
+   d x STEP-GONE ;
+
+: ROOT-AND-EXCLUSIONS-CASES ( ^ARENA:arena -- )
+   {: ar :}
+   ar REPLACED-LOCAL-ROOT-NEVER-REPLAYS-PENDING-DELETION
+   ar REJECTED-PATHS-DO-NOT-STOP-UNRELATED-SYNC-OR-REPORT-PROGRESS
+   ar DOCUMENTED-EXCLUSIONS-PRESERVE-PAYLOADS-WHILE-ORDINARY-SIBLINGS-SYNC
+   ar EXCLUDED-PENDING-AND-BLOCKED-WORK-IS-RETIRED-ACROSS-REOPEN-WITHOUT-EFFECTS ;
+
 : SERVED ( ^ARENA:arena -- )
    {: ar :}
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
@@ -5953,7 +6436,8 @@ TYPED-VARIABLE RACED str
       ar STALE-CASES ar DOWNLOAD-BLOCKS-CASES ar UPLOADS-CASES
       ar CONFLICTS-CASES ar RESTRICTED-CASES
       ar EDITS-AND-DIRECTORIES-CASES ar CASE-COLLISION-PASS-CASES
-      ar DIRECTORY-COLLISION-CASES ar DIRECTORY-DELETION-CASES ;]
+      ar DIRECTORY-COLLISION-CASES ar DIRECTORY-DELETION-CASES
+      ar ROOT-AND-EXCLUSIONS-CASES ;]
    [: MAIN @ DROPBOX:CLOSE ;]
    finally ;
 
