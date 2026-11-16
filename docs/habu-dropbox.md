@@ -206,6 +206,7 @@ STRUCTURE config
     absent, which is what a delete intends.
   - A confirmation whose entry's `path_lower` is not the path's full
     Unicode lowercase answers `refused path-mismatch`, for that path alone.
+  - A confirmation that must wait answers its `retry`, with its wait.
   - Every other refusal stands. A mutation never answers "unknown".
 - **`UPLOAD` checks what Dropbox committed.** An entry at another path is
   confirmed, as above. Its content hash must be the upload's, else it
@@ -245,11 +246,13 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
    IN confirming  CONFIRM-SENSE ( confirm-event )
       same       ANSWER-DONE      >ended
       elsewhere  ANSWER-MISMATCH  >ended
+      wait       ANSWER-REPLY     >ended      \ get_metadata's retry
       other      ANSWER-REPLY     >ended
       unlinked   ANSWER-UNLINKED  >ended
    IN verifying  CONFIRM-SENSE ( confirm-event )
       same       ANSWER-DONE      >ended
       elsewhere  ANSWER-MISMATCH  >ended
+      wait       ANSWER-REPLY     >ended
       other      -                >restarting
       unlinked   ANSWER-UNLINKED  >ended
    IN restarting  RESTART-SENSE ( restart-event )

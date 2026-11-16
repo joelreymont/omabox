@@ -10,9 +10,11 @@
 \ parse), delete, create-folder, the code exchange, Dropbox's content hash
 \ and uploads, whose stages are written under TMPDIR and removed once
 \ open, so no run leaves one; a mutation or session finish Dropbox answers
-\ at another path, an upload's that get_metadata then does not find, a
-\ conflict whose confirmation is at another path, and a delete it answers
-\ with a folder or a file at another rev. One server and one main client
+\ at another path, an upload's or finish's that get_metadata then does not
+\ find, an upload confirmation Dropbox asks to wait on, a delete or
+\ create-folder conflict whose confirmation it asks to wait on, a conflict
+\ whose confirmation is at another path, and a delete it answers with a
+\ folder or a file at another rev. One server and one main client
 \ serve every case; a case that needs another config opens its own client.
 \ DROPBOX's log lines go to stderr, but those a case checks, which are
 \ captured in TMPDIR, checked and removed. A stub in place of AIO's
@@ -1195,6 +1197,17 @@ variable BODY-CODE
    0 TEST-DROPBOX:FILE! ;
 
 
+\ Queues a 503 that asks to wait 3 s.
+: BUSY! ( -- ) 503 s" Retry-After" s" 3" s" " TEST-DROPBOX:SCRIPT! ;
+
+
+\ The next call answers path_write/conflict, as delete_v2 does.
+: DELETE-CONFLICT! ( -- )
+   409 s" " s" "
+   S\" {\qerror_summary\q:\qpath_write/conflict/file/...\q,\qerror\q:{\q.tag\q:\qpath_write\q,\qpath_write\q:{\q.tag\q:\qconflict\q,\qconflict\q:{\q.tag\q:\qfile\q}}}}"
+   TEST-DROPBOX:SCRIPT! ;
+
+
 : DELETE-CONFLICT-CASE ( -- )
    s" delete conflict" T-LABEL
    TEST-DROPBOX:RESET
@@ -1221,9 +1234,7 @@ variable BODY-CODE
 : DELETE-GONE-CASE ( -- )
    s" delete conflict on a gone path" T-LABEL
    TEST-DROPBOX:RESET
-   409 s" " s" "
-   S\" {\qerror_summary\q:\qpath_write/conflict/file/...\q,\qerror\q:{\q.tag\q:\qpath_write\q,\qpath_write\q:{\q.tag\q:\qconflict\q,\qconflict\q:{\q.tag\q:\qfile\q}}}}"
-   TEST-DROPBOX:SCRIPT!
+   DELETE-CONFLICT!
    s" /gone.txt" s" rev-gone" MAIN @ DROPBOX:DELETE DONE? ASSERT
    DROPBOX-KIND:deleted KIND? TTRUE
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
@@ -1320,14 +1331,22 @@ variable BODY-CODE
    s" /gone.txt" s" rev-gone" MAIN @ DROPBOX:DELETE UNLINKED? OUTCOME ! ;
 
 
+\ A delete refused as a conflict whose confirmation asks to wait: the
+\ confirmation's retry.
+: BUSY-CONFLICT-CASE ( -- )
+   s" delete conflict, confirmation busy" T-LABEL
+   TEST-DROPBOX:RESET
+   DELETE-CONFLICT! BUSY!
+   s" /gone.txt" s" rev-gone" MAIN @ DROPBOX:DELETE RETRY-MS 3000 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
+
+
 \ A delete refused as a conflict whose confirmation Dropbox refuses 403:
 \ unlinked.
 : DENIED-CONFLICT-CASE ( -- )
    s" delete conflict, confirmation denied" T-LABEL
    TEST-DROPBOX:RESET
-   409 s" " s" "
-   S\" {\qerror_summary\q:\qpath_write/conflict/file/...\q,\qerror\q:{\q.tag\q:\qpath_write\q,\qpath_write\q:{\q.tag\q:\qconflict\q,\qconflict\q:{\q.tag\q:\qfile\q}}}}"
-   TEST-DROPBOX:SCRIPT!
+   DELETE-CONFLICT!
    TEST-DROPBOX:DENY
    false OUTCOME !
    [: CONFLICT-UNLINKED ;] LOGGED 0 T=
@@ -1351,6 +1370,18 @@ variable BODY-CODE
    TEST-DROPBOX:SEEN$
    s" /2/files/create_folder_v2 /2/files/create_folder_v2 /2/files/get_metadata /2/files/create_folder_v2 /2/files/get_metadata"
    T$= ;
+
+
+\ A create-folder refused as a conflict whose confirmation asks to wait:
+\ the confirmation's retry.
+: BUSY-FOLDER-CASE ( -- )
+   s" create-folder conflict, confirmation busy" T-LABEL
+   TEST-DROPBOX:RESET
+   409 s" " s" "
+   S\" {\qerror_summary\q:\qpath/conflict/folder/...\q,\qerror\q:{\q.tag\q:\qpath\q,\qpath\q:{\q.tag\q:\qconflict\q,\qconflict\q:{\q.tag\q:\qfolder\q}}}}"
+   TEST-DROPBOX:SCRIPT! BUSY!
+   s" /taken" MAIN @ DROPBOX:CREATE-FOLDER RETRY-MS 3000 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/create_folder_v2 /2/files/get_metadata" T$= ;
 
 
 : LOST-FOLDER-CASE ( -- )
@@ -1524,7 +1555,9 @@ variable SHOWS
 \ the strikes left there.
 variable FAULT-AT
 variable STRIKES
-ENUM fault cut cut-twice lose close unfound applied offset denied ;ENUM
+ENUM fault
+   cut cut-twice lose close unfound applied offset denied elsewhere busy
+;ENUM
 TYPED-VARIABLE FAULT fault
 
 
@@ -1599,6 +1632,13 @@ TYPED-VARIABLE FAULT fault
    TEST-DROPBOX:FILE! ;
 
 
+\ The next call answers done with a file at /other.bin.
+: ELSEWHERE! ( -- )
+   200 s" " s" "
+   S\" {\qname\q:\qother.bin\q,\qid\q:\qid:o\q,\qpath_lower\q:\q/other.bin\q,\qpath_display\q:\q/other.bin\q,\qrev\q:\q0180a\q,\qsize\q:12,\qcontent_hash\q:\q0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\q,\qis_downloadable\q:true}"
+   TEST-DROPBOX:SCRIPT! ;
+
+
 \ The next call refused with incorrect_offset at 0, short of any chunk's end.
 : OFFSET! ( -- )
    409 s" " s" "
@@ -1616,6 +1656,8 @@ TYPED-VARIABLE FAULT fault
       applied OF UNFOUND APPLIED ENDOF
       offset OF OFFSET! ENDOF
       denied OF UNFOUND TEST-DROPBOX:DENY ENDOF
+      elsewhere OF ELSEWHERE! ENDOF
+      busy OF UNFOUND BUSY! ENDOF
    ;MATCH ;
 
 
@@ -1725,6 +1767,18 @@ TYPED-VARIABLE FAULT fault
    S\" {\qname\q:\qCAF\xc3\x89.txt\q,\qid\q:\qid:a\q,\qpath_lower\q:\q/docs/caf\xc3\x89.txt\q,\qpath_display\q:\q/Docs/CAF\xc3\x89.txt\q,\qrev\q:\q0170a\q,\qsize\q:10,\qcontent_hash\q:\q0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\q,\qis_downloadable\q:true}"
    TEST-DROPBOX:SCRIPT!
    SEND RETRY-MS 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
+   UNSTAGED ;
+
+
+\ An upload answered at another path whose confirmation asks to wait:
+\ the confirmation's retry.
+: BUSY-ELSEWHERE-CASE ( -- )
+   s" upload answered at another path, confirmation busy" T-LABEL
+   TEST-DROPBOX:RESET -1 FAULT-AT !
+   s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
+   ELSEWHERE! BUSY!
+   SEND RETRY-MS 3000 T=
    TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
    UNSTAGED ;
 
@@ -1864,7 +1918,7 @@ TYPED-VARIABLE FAULT fault
 
 : SINGLE-CASES ( -- )
    SINGLE-CASE CONFLICT-CASE HELD-CASE NON-ASCII-CASE OTHER-CASE-CASE
-   UNFOUND-ELSEWHERE-CASE CUT-SINGLE-CASE DENIED-SINGLE-CASE
+   UNFOUND-ELSEWHERE-CASE BUSY-ELSEWHERE-CASE CUT-SINGLE-CASE DENIED-SINGLE-CASE
    LOST-SINGLE-CASE SHORT-STAGE-CASE REFUSED-STAGE-CASE FULL-READ-CASE
    ENTERED-READ-CASE TIMED-OUT-READ-CASE CANCELLED-READ-CASE ;
 
@@ -2025,6 +2079,26 @@ TYPED-VARIABLE FAULT fault
    CHUNK 1+ construct fault unfound FAULTED ;
 
 
+\ A finish answered at another path that get_metadata does not find:
+\ retry 0, as a lost finish is.
+: UNFOUND-ELSEWHERE-FINISH-CASE ( -- )
+   s" finish answered at another path, not found" T-LABEL
+   CHUNK 1+ construct fault elsewhere 1 STRUCK RETRY-MS 0 T=
+   SB-RESET S-START S-APPEND S-APPEND S-FINISH
+   s"  /2/files/get_metadata" SB-APPEND
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
+
+
+\ A finish answered gone whose confirmation asks to wait: the
+\ confirmation's retry, with no restart.
+: BUSY-FINISH-CASE ( -- )
+   s" finish gone, confirmation busy" T-LABEL
+   CHUNK 1+ construct fault busy 1 STRUCK RETRY-MS 3000 T=
+   SB-RESET S-START S-APPEND S-APPEND S-FINISH
+   s"  /2/files/get_metadata" SB-APPEND
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
+
+
 \ A finish answered gone whose confirmation Dropbox refuses 403: unlinked.
 : DENIED-FINISH-CASE ( -- )
    s" finish gone, confirmation denied" T-LABEL
@@ -2045,7 +2119,8 @@ TYPED-VARIABLE FAULT fault
    SESSION-CASE LOST-APPEND-CASE HELD-APPEND-CASE OFFSET-APPEND-CASE
    CLOSED-CASE LOST-START-CASE LOST-FINISH-CASE APPLIED-FINISH-CASE
    UNFOUND-FINISH-CASE DENIED-FINISH-CASE CUT-APPEND-CASE CLOSED-TWICE-CASE
-   MISMATCH-CASE FINISH-ELSEWHERE-CASE
+   MISMATCH-CASE FINISH-ELSEWHERE-CASE UNFOUND-ELSEWHERE-FINISH-CASE
+   BUSY-FINISH-CASE
    ENDED-EARLY-CASE
    UNSTAGED ;
 
@@ -2067,8 +2142,8 @@ TYPED-VARIABLE FAULT fault
    DELETE-CONFLICT-CASE DELETE-MISSING-CASE DELETE-GONE-CASE
    LOST-DELETE-CASE CUT-DELETE-CASE DELETE-ELSEWHERE-CASE
    CONFLICT-ELSEWHERE-CASE DELETE-REV-CASE DELETE-AS-FOLDER-CASE
-   DENIED-DELETE-CASE DENIED-CONFLICT-CASE
-   FOLDER-CONFLICT-CASE LOST-FOLDER-CASE FOLDER-ELSEWHERE-CASE
+   DENIED-DELETE-CASE BUSY-CONFLICT-CASE DENIED-CONFLICT-CASE
+   FOLDER-CONFLICT-CASE BUSY-FOLDER-CASE LOST-FOLDER-CASE FOLDER-ELSEWHERE-CASE
    FOLDER-TAKEN-ELSEWHERE-CASE CUT-FOLDER-CASE DENIED-FOLDER-CASE
    DENIED-CUT-FOLDER-CASE
    LOST-REFRESH-CASE

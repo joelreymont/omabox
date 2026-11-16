@@ -1990,10 +1990,20 @@ private
    ;MATCH ;
 
 
+\ An answer that asks to wait, 0 ms or more.
+: RETRY? ( reply -- bool )
+   MATCH reply
+      done OF false ENDOF
+      refused OF drop false ENDOF
+      retry OF drop true ENDOF
+      unlinked OF false ENDOF
+   ;MATCH ;
+
+
 \ A confirmation that answers in its call's place.
 : STANDS? ( reply -- bool )
    {: r:reply :}
-   r UNLINKED? r MISMATCH? or ;
+   r UNLINKED? r MISMATCH? or r RETRY? or ;
 
 
 : FOLDER? ( ^entry -- bool )
@@ -2557,7 +2567,7 @@ ENUM send-event committed elsewhere lost conflict failed ;ENUM
 ENUM start-event opened lost failed ;ENUM
 ENUM append-event stored complete lost cut gone failed ;ENUM
 ENUM finish-event committed elsewhere lost conflict gone failed ;ENUM
-ENUM confirm-event same elsewhere other unlinked ;ENUM
+ENUM confirm-event same elsewhere wait other unlinked ;ENUM
 ENUM restart-event once twice ;ENUM
 
 
@@ -2638,8 +2648,8 @@ ENUM restart-event once twice ;ENUM
    construct finish-event failed ;
 
 
-\ get_metadata of the path shows a file with the upload's content hash,
-\ or an entry at another path, or answers unlinked.
+\ get_metadata of the path: same for a file with the upload's content hash;
+\ a retry it answers becomes the last reply.
 : CONFIRM-SENSE ( ^run -- confirm-event )
    {: r :}
    r RUN-CLIENT @ {: c :}
@@ -2647,6 +2657,7 @@ ENUM restart-event once twice ;ENUM
    up DROPBOX-UPLOAD:PATH @ SPAN:$ c CONFIRMED {: m:reply :}
    m UNLINKED? if construct confirm-event unlinked exit then
    m MISMATCH? if construct confirm-event elsewhere exit then
+   m RETRY? if m r RUN-LAST ! construct confirm-event wait exit then
    m DONE? 0= if construct confirm-event other exit then
    c CLIENT-ENTRY {: e :}
    e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$
@@ -2686,8 +2697,8 @@ ENUM restart-event once twice ;ENUM
 : DISTRUST ( ^run -- ) {: r :} 0 RETRY r RUN-LAST ! ;
 
 
-\ Answers the last call's reply as it came, or as COMMITTED? or DISTRUST
-\ set it.
+\ Answers the last call's reply as it came, or as COMMITTED?, DISTRUST
+\ or CONFIRM-SENSE set it.
 : ANSWER-REPLY ( ^run -- ) {: r :} r RUN-LAST @ r RUN-ANSWER ! ;
 
 
@@ -2733,11 +2744,13 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
    IN confirming  CONFIRM-SENSE ( confirm-event )
       same       ANSWER-DONE      >ended
       elsewhere  ANSWER-MISMATCH  >ended
+      wait       ANSWER-REPLY     >ended
       other      ANSWER-REPLY     >ended
       unlinked   ANSWER-UNLINKED  >ended
    IN verifying  CONFIRM-SENSE ( confirm-event )
       same       ANSWER-DONE      >ended
       elsewhere  ANSWER-MISMATCH  >ended
+      wait       ANSWER-REPLY     >ended
       other      -                >restarting
       unlinked   ANSWER-UNLINKED  >ended
    IN restarting  RESTART-SENSE ( restart-event )
