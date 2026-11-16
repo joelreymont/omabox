@@ -77,21 +77,34 @@ watcher comes only for a measured need.
 - **`STATUS`** keeps one transfer, as one task syncs. Tasks are threads, so
   one `TASK:FACILITY` guards the snapshot the sync task and the heartbeat
   share.
-- **One task does the sync.** Downloads and hashing run one at a time. The
-  Rust daemon's four download workers and parallel hashing come back only for a
-  measured need.
-- **Failures.** Each pending plan runs under one catch: a path's failure
-  blocks that plan; a transport, journal or root failure ends the pass. One
-  table maps each code and `DROPBOX:reply` to a disposition and status text.
-- **Machines.** `DAEMON:RUN`, `RECONCILE:PASS` and a `REPLAY` operation are
-  `fsm.f` tables named after their `formal/` models.
+- **One task does the sync.** Downloads and hashing run one at a time, and a
+  staged download installs at once. The Rust daemon's four download workers
+  and parallel hashing come back only for a measured need.
+- **Failures.** A path's failure becomes its plan's block at the call that
+  meets it; a transport, journal or root failure ends the pass, and so does a
+  local write the system denies, once `LOCAL` has logged the directory that
+  denies it and why. One word, `REPLAY:DOWNLOAD-BLOCKAGE`, classifies every
+  download failure. One table maps each code and `DROPBOX:reply` to a
+  disposition and status text.
+- **Machines.** `DAEMON:RUN`, `RECONCILE:PASS`, its listing and its one
+  download, and a `REPLAY` operation are `fsm.f` tables named after their
+  `formal/` models.
+- **`RECONCILE:PASS`** answers `complete` with its counts, `fresh` (rescan) or
+  `root-changed`; a Dropbox answer that ends it is in the link, as `REPLAY`'s.
+  `DAEMON` validates the account, not the pass. Apart from Rust, a download
+  refused `locked` blocks its path, and so does a directory collision's copy
+  that Dropbox refuses or that fails verification, for that pass, unplanned.
 - **Upload progress.** `DROPBOX:UPLOAD` takes a quotation `[ n -- ]`, called
   with the bytes Dropbox has accepted.
 
 ## Tests
 
-- The 105 tests of `tests/dropbox_fake.rs`, ported under their names, each
-  running `RECONCILE:PASS` against the fake Dropbox.
+- The tests of `tests/dropbox_fake.rs`, ported under their names, each against
+  the fake Dropbox: a pass's through `RECONCILE:PASS`, one word's through that
+  word. The four-worker pool's three (:846, :4081, :4194) do not apply; four
+  (:7330, :8053, :8073, :8137) are `DAEMON`'s. Three (:3313, :5113, :5220)
+  assert what `docs/habu-dropbox.md` changes on purpose: an upload session
+  restarts, a held conflict is done and a 5xx is retried.
 - The planner's table, every value's JSON and `FOLD` over a case corpus,
   against what the Rust version prints (`src/oracle/`).
 - A Habu-made schema against a Rust-made one (`sqlite_master`), and a journal
