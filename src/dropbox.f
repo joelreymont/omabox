@@ -80,6 +80,10 @@ ENUM reply
    VARIANT unlinked ;VARIANT
 ;ENUM
 
+\ What PROBE found in a folder; interrupted, a continue page whose cursor
+\ did not advance, settles nothing.
+ENUM probe empty occupied interrupted ;ENUM
+
 ENUM kind DERIVE eq file folder deleted ;ENUM
 
 \ Dropbox's content hash of a file's bytes.
@@ -1833,11 +1837,12 @@ private
 105 constant GRACE
 
 \ The bits of got: a page needs entries, cursor and has_more, a long poll's
-\ answer changes.
+\ answer changes; other marks a probed page's entry not at the path.
 1 constant GOT-ENTRIES
 2 constant GOT-CURSOR
 4 constant GOT-MORE
 7 constant GOT-PAGE
+8 constant GOT-OTHER
 1 constant GOT-CHANGES
 
 
@@ -1876,17 +1881,28 @@ private
    BOOLEAN c CLIENT-MORE ! c GOT-MORE GOT ;
 
 
-\ Reads and checks a page; one with more whose cursor is the one sent
-\ would list the same page forever.
-: PAGE-READ ( ^client -- )
+\ Reads a page and checks it has entries, cursor and has_more.
+: PAGE-PARSE ( ^client -- )
    {: c :}
    0 c CLIENT-GOT ! EMPTY c CLIENT-PAGE ! false c CLIENT-MORE !
    c [: PAGE-MEMBER ;] PARSE
    c CLIENT-GOT @ GOT-PAGE <>
-   if c s" no entries, cursor or has_more" E-ANSWER FAILED then
+   if c s" no entries, cursor or has_more" E-ANSWER FAILED then ;
+
+
+\ Whether the page's cursor is the one sent.
+: STALE? ( ^client -- bool )
+   {: c :}
+   c CLIENT-PAGE @ SPAN:$ c CLIENT-SENT @ BUF$ STR= ;
+
+
+\ Reads and checks a page; one with more whose cursor is the one sent
+\ would list the same page forever.
+: PAGE-READ ( ^client -- )
+   {: c :}
+   c PAGE-PARSE
    c CLIENT-MORE @ 0= if exit then
-   c CLIENT-PAGE @ SPAN:$ c CLIENT-SENT @ BUF$ STR=
-   if c s" a cursor that did not advance" E-ANSWER FAILED then ;
+   c STALE? if c s" a cursor that did not advance" E-ANSWER FAILED then ;
 
 
 : HANDED ( JSON:reader ^client [ ^entry -- ] -- JSON:reader )
@@ -1950,6 +1966,43 @@ private
    JSON:WRITE-OBJECT-END JSON:WRITE-CLOSE ;
 
 
+: PROBE-BODY ( ^u8 n ^client -- )
+   {: p:^ pu:n c :}
+   c BODY-OPEN JSON:WRITE-OBJECT-START
+   s" path" p pu JSON:WRITE-FIELD-S JSON:WRITE-COMMA
+   s" recursive" false JSON:WRITE-FIELD-BOOL JSON:WRITE-COMMA
+   s" include_deleted" false JSON:WRITE-FIELD-BOOL JSON:WRITE-COMMA
+   s" limit" 1 JSON:WRITE-FIELD-INT
+   JSON:WRITE-OBJECT-END JSON:WRITE-CLOSE ;
+
+
+\ Marks the page when the entry just handed on is not at t.
+: OTHER ( ^u8 n ^client -- )
+   {: t:^ tu:n c :}
+   t tu c AT? if exit then
+   c GOT-OTHER GOT ;
+
+
+\ Whether the page read last shows an entry not at t.
+: OCCUPIED? ( ^u8 n ^client -- bool )
+   {: t:^ tu:n c :}
+   c [: [: drop t tu c OTHER ;] HAND-MEMBER ;] READ-ANSWER drop
+   c CLIENT-GOT @ GOT-OTHER and 0<> ;
+
+
+\ One page of the probe of t from its reply, next true for a continue
+\ page: the reply, the probe, and true while a later page decides it.
+: PROBE-STEP ( reply ^u8 n ^client bool -- reply probe bool )
+   {: r:reply t:^ tu:n c next:bool :}
+   r DONE? 0= if r construct probe empty false exit then
+   c PAGE-PARSE
+   next c STALE? and if r construct probe interrupted false exit then
+   t tu c OCCUPIED? if r construct probe occupied false exit then
+   c CLIENT-MORE @ 0= if r construct probe empty false exit then
+   c CLIENT-PAGE @ SPAN:$ BUF:N>BLEN c CLIENT-SENT @ BUF:REPLACE
+   c CONTINUE construct probe empty true ;
+
+
 : POLL-MEMBER ( JSON:reader ^client -- JSON:reader )
    {: c :}
    s" changes" JSON:READ-STR-EQ? if
@@ -1998,6 +2051,17 @@ public
    p pu c LIST-BODY
    c s" files/list_folder" [: JSON-BODY ;] CALL
    c each PAGES ;
+
+
+\ files/list_folder of the path, one entry a page, until a page shows an
+\ entry not at the path or ends the listing; any reply but done answers
+\ itself, empty as filler. The listing's cursor stays.
+: PROBE ( ^u8 n ^client -- reply probe )
+   {: p:^ pu:n c :}
+   p pu c PROBE-BODY
+   c s" files/list_folder" [: JSON-BODY ;] CALL
+   p pu c false PROBE-STEP
+   begin while drop p pu c true PROBE-STEP repeat ;
 
 
 \ files/list_folder/continue from the cursor, deleted entries included.

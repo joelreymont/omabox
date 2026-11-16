@@ -49,8 +49,7 @@
 \ - REMOTE-DELETE-FOLDER of an empty folder deletes it; of an occupied
 \   one, or one the listing answers not_found, deletes nothing; Rust's
 \   folder_delete_probe_outcomes_are_classified_per_path, whose 503
-\   throws E-DROPBOX with a retry and whose stalled cursor throws
-\   DROPBOX's E-ANSWER, logged once.
+\   throws E-DROPBOX with a retry.
 \ - REMOTE-UPLOAD of a new file sends its progress, then a finished
 \   transfer to a STATUS in TMPDIR; one Dropbox refuses as a conflict
 \   with other bytes at the path is read back as changed, and its
@@ -1283,16 +1282,12 @@ ARENA LINKS REPLAY:link
    true OWN-PAGE TEST-DROPBOX:PAGE-RESET!
    l ar DELETE-F s" pending" s" " GIVES ;
 
-\ A cursor that does not advance throws DROPBOX's E-ANSWER, logged
-\ once; Rust leaves the delete pending.
-: PROBE-STALLED ( str ^REPLAY:link ^ARENA:arena -- )
-   {: d:str l ar :}
+\ A continue page whose cursor did not advance leaves the delete pending.
+: PROBE-STALLED ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
    s" []" s" c1" true TEST-DROPBOX:PAGE!
    s" []" s" c1" true TEST-DROPBOX:PAGE!
-   d [: [: l ar DELETE-F drop ;] DROPBOX:E-ANSWER TTHROWSQ ;] ar LOGGED
-   {: t:^ tu:n :}
-   t tu LINE-COUNT 1 T=
-   t tu s" a cursor that did not advance" CONTAINS? TTRUE ;
+   l ar DELETE-F s" pending" s" " GIVES ;
 
 : PROBE-LATER-ENTRY ( ^REPLAY:link ^ARENA:arena -- )
    {: l ar :}
@@ -1337,7 +1332,7 @@ ARENA LINKS REPLAY:link
    l s" f" DISPLAY ar REPLAY:REMOTE-CREATE-FOLDER
    s" applied" s" folder" GIVES
    l ar PROBE-UNREACHED l ar PROBE-RESTRICTED l ar PROBE-RESET
-   d l ar PROBE-STALLED l ar PROBE-LATER-ENTRY l ar PROBE-OWN-ENTRY
+   l ar PROBE-STALLED l ar PROBE-LATER-ENTRY l ar PROBE-OWN-ENTRY
    d l ar PROBE-RACED
    TEST-DROPBOX:SEEN$ PROBES$ T$=
    d GONE ;

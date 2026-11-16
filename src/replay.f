@@ -27,7 +27,6 @@
 require src/lib/error.f
 require src/lib/string.f
 require src/lib/span.f
-require src/lib/unicode.f
 require src/lib/utf8-scalar.f
 require src/lib/arena.f
 require src/lib/memory.f
@@ -988,10 +987,6 @@ ENUM expectation
    VARIANT delete-folder ;VARIANT
 ;ENUM
 
-\ The probe's count of entries other than the folder itself.
-STRUCTURE probe DERIVE addr FIELD seen n ;STRUCTURE
-ARENA PROBES probe
-
 \ One upload; rev is the rev it replaces, empty to create, and done the
 \ bytes Dropbox has accepted.
 STRUCTURE sending DERIVE addr
@@ -1410,21 +1405,6 @@ private
 
 \ ---- delete folder
 
-\ Counts an entry whose path_lower is not t's lowercase.
-: SEEN ( ^DROPBOX:entry ^u8 n ^probe -- )
-   {: e t:^ tu:n p :}
-   t tu e DROPBOX-ENTRY:LOWER @ SPAN:$ UNICODE:LOWERS-TO?
-   if exit then
-   1 p PROBE-SEEN +! ;
-
-\ A recursive listing of the folder at t, and how many entries it
-\ holds but t itself.
-: PROBED ( ^u8 n ^link ^ARENA:arena -- DROPBOX:reply n )
-   {: t:^ tu:n l ar :}
-   ar PROBES-NEW {: p :}
-   t tu l CLIENT [: t tu p SEEN ;] DROPBOX:LIST
-   p PROBE-SEEN @ ;
-
 \ A file the delete found took the folder's place after the probe.
 : REPLACED ( ^link MODEL:path -- )
    {: l path :}
@@ -1458,15 +1438,23 @@ private
    e DROPBOX-ERROR:RESET IS? if PENDING exit then
    e l REJECTED ;
 
-\ Rust's delete_folder: only a folder the listing shows empty.
+: PROBED
+   ( DROPBOX:probe str ^link MODEL:path ^ARENA:arena
+     -- mutation-outcome )
+   {: b:DROPBOX:probe t:str l path ar :}
+   b MATCH DROPBOX:probe
+      empty OF t l path ar EMPTIED ENDOF
+      occupied OF FOLDER CHANGED-TO ENDOF
+      interrupted OF PENDING ENDOF
+   ;MATCH ;
+
+\ Rust's delete_folder: only a folder the probe shows empty.
 : CLEARED
    ( str ^link MODEL:path ^ARENA:arena -- mutation-outcome )
    {: t:str l path ar :}
-   t str> l ar PROBED {: r:DROPBOX:reply seen:n :}
+   t str> l CLIENT DROPBOX:PROBE {: r:DROPBOX:reply b:DROPBOX:probe :}
    r MATCH DROPBOX:reply
-      done OF
-         seen 0= if t l path ar EMPTIED else FOLDER CHANGED-TO then
-      ENDOF
+      done OF b t l path ar PROBED ENDOF
       refused OF t l ar PROBE-REFUSED ENDOF
       retry OF drop r l STOP-PASS ENDOF
       unlinked OF r l STOP-PASS ENDOF

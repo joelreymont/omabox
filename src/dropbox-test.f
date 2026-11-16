@@ -11,7 +11,9 @@
 \ 64 KiB, one holding a file that is not
 \ downloadable, one holding files Dropbox described incompletely, handed
 \ on, and one holding restricted folders, among them), COMPLETE? of each
-\ kind of entry, the long poll,
+\ kind of entry, the probe of a folder (one a continue page whose cursor
+\ did not advance interrupts, one stopped at its first entry), the long
+\ poll,
 \ downloads, whose body reads through READ-BODY (whole, resumed, a 416
 \ at the end, a body that throws before or after its end, one left
 \ unread while the server holds the rest, one in two chunks read 7 or
@@ -1060,6 +1062,37 @@ variable WIDEST
    s" u1" false TEST-DROPBOX:PAGE!
    [: UNTAGGED-LISTED ;] DROPBOX:E-ANSWER TTHROWSQ
    GOT$ s" " T$=
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$= ;
+
+
+: PROBE$ ( DROPBOX:probe -- ^u8 n )
+   MATCH DROPBOX:probe
+      empty OF s" empty" ENDOF
+      occupied OF s" occupied" ENDOF
+      interrupted OF s" interrupted" ENDOF
+   ;MATCH ;
+
+
+: PROBE-STALL-CASE ( -- )
+   s" probe stalled" T-LABEL
+   LISTING
+   s" []" s" p1" true TEST-DROPBOX:PAGE!
+   s" []" s" p1" true TEST-DROPBOX:PAGE!
+   s" /sync" MAIN @ DROPBOX:PROBE PROBE$ s" interrupted" T$=
+   DONE? ASSERT
+   TEST-DROPBOX:SEEN$
+   s" /2/files/list_folder /2/files/list_folder/continue" T$= ;
+
+
+\ A page with more that shows an entry not at the path ends the probe.
+: PROBE-FIRST-CASE ( -- )
+   s" probe stopped at its first entry" T-LABEL
+   LISTING
+   S\" [{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/sync/b\q,\qpath_display\q:\q/Sync/b\q}]"
+   s" p1" true TEST-DROPBOX:PAGE!
+   s" []" s" p2" false TEST-DROPBOX:PAGE!
+   s" /Sync" MAIN @ DROPBOX:PROBE PROBE$ s" occupied" T$=
+   DONE? ASSERT
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$= ;
 
 
@@ -2740,7 +2773,8 @@ TYPED-VARIABLE FAULT fault
    RATE-ZEROS-CASE RATE-HUGE-CASE
    BUSY-CASE REDIRECT-CASE BAD-REQUEST-CASE
    CLASSIFY-CASES
-   PAGES-CASE LONG-CASE RESET-CASE STALL-CASE UNTAGGED-CASE UNDOWNLOADABLE-LISTED-CASE
+   PAGES-CASE LONG-CASE RESET-CASE STALL-CASE UNTAGGED-CASE
+   PROBE-STALL-CASE PROBE-FIRST-CASE UNDOWNLOADABLE-LISTED-CASE
    INCOMPLETE-LISTED-CASE RESTRICTED-LISTED-CASE INCOMPLETE-KINDS-CASE
    POLL-CASE LONG-POLL-EXPOSES-RESET-AND-RATE-LIMIT-OUTCOMES
    DOWNLOAD-CASES

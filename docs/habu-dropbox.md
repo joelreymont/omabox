@@ -78,6 +78,12 @@ ENUM reply
 : CHANGES ( ^u8 n ^client [ ^entry -- ] -- reply )  \ cursor
 : CURSOR  ( ^client -- ^u8 n )
 
+\ files/list_folder of a folder, one entry a page, until a page shows
+\ an entry not at the path; interrupted, a continue page whose cursor
+\ did not advance; not_found, not_folder and reset are refused
+ENUM probe empty occupied interrupted ;ENUM
+: PROBE   ( ^u8 n ^client -- reply probe )  \ path
+
 \ files/list_folder/longpoll
 : WAIT     ( ^u8 n n ^client -- reply )  \ cursor, seconds
 : CHANGED? ( ^client -- bool )
