@@ -23,6 +23,7 @@ require src/lib/unicode.f
 require src/lib/fmt.f
 require src/lib/fs-anchored.f
 require src/model.f
+require src/planner.f
 require src/journal.f
 require src/local.f
 require src/dropbox.f
@@ -2924,5 +2925,620 @@ ENUM replay-step
          [: root FS:CLOSE-DIR ;] finally
       ENDOF
    ;MATCH ;
+
+
+\ ---- planning ------------------------------------------------------
+
+\ Planning's answer: fresh is Rust's FreshObservationRequired,
+\ root-changed its LocalRootChanged.
+ENUM pass-event ok fresh root-changed ;ENUM
+
+\ A recorded conflict and its path's key.
+STRUCTURE known-conflict
+   FIELD key MODEL:key
+   FIELD conflict MODEL:conflict
+;STRUCTURE
+
+\ One planning pass. noop-count, planned and conflict-count are Rust's
+\ report; held is its blocked_paths, where a key may appear twice.
+STRUCTURE planning DERIVE addr
+   FIELD run ^run
+   FIELD sides sides
+   FIELD conflicts ^VEC:vector<known-conflict>
+   FIELD now n
+   FIELD noop-count n
+   FIELD planned n
+   FIELD conflict-count n
+   FIELD held ^VEC:vector<MODEL:key>
+   FIELD noops ^VEC:vector<JOURNAL:path-baseline>
+   FIELD plans ^VEC:vector<JOURNAL:path-plan>
+   FIELD decisions ^VEC:vector<path-decision>
+;STRUCTURE
+
+ARENA PLANNINGS planning
+
+: NEW-VECTOR ( ^ARENA:arena width<t> -- ^VEC:vector<t> )
+   {: ar w :}
+   ar ARENA:ALLOCATOR 0 w VEC:NEW ;
+
+\ Rust's sort_by is stable: equal items keep their order.
+: STABLE< ( n n n -- bool )
+   {: x:n y:n c:n :}
+   c 0<> if c 0 < exit then
+   x y < ;
+
+\ The indices 0 to n-1 in the order cmp gives.
+: STABLE-ORDER ( n [ n n -- n ] ^ARENA:arena -- ^VEC:vector<n> )
+   {: k:n cmp ar :}
+   k [: 2dup cmp execute STABLE< ;] ar ORDER ;
+
+\ Runs q on each index in turn.
+: GATHER ( ^VEC:vector<n> [ n -- ] -- )
+   {: idx q :}
+   idx VEC:COUNT 0 ?do idx i VEC:AT @ q execute loop ;
+
+: KEY-PLAN
+   ( JOURNAL:plan-record ^VEC:vector<pending-plan> ^ARENA:arena -- )
+   {: plan v ar :}
+   plan PLAN-PATH ar MODEL:FOLD plan PENDING-PLAN-MAKE v VEC:PUSH ! ;
+
+: KEY-PLANS
+   ( ^VEC:vector<JOURNAL:plan-record> ^VEC:vector<pending-plan>
+     ^ARENA:arena -- )
+   {: plans v ar :}
+   plans VEC:COUNT 0 ?do plans i VEC:AT @ v ar KEY-PLAN loop ;
+
+: PLAN-CMP ( n n ^VEC:vector<pending-plan> -- n )
+   {: x:n y:n v :}
+   v x VEC:AT @ PENDING-KEY v y VEC:AT @ PENDING-KEY MODEL:KEY-CMP ;
+
+\ Rust's live map: the pending plans, then the blocked ones, keyed by
+\ path.
+: LIVE-PLANS ( ^run -- ^VEC:vector<pending-plan> )
+   {: r :}
+   r RUN-JOURNAL @ {: j :}
+   r RUN-ARENA @ {: ar :}
+   ar [type] pending-plan NEW-VECTOR {: v :}
+   j ar JOURNAL:PENDING-PLANS v ar KEY-PLANS
+   j ar JOURNAL:BLOCKED-PLANS v ar KEY-PLANS
+   ar [type] pending-plan NEW-VECTOR {: out :}
+   v VEC:COUNT [: v PLAN-CMP ;] ar STABLE-ORDER
+   [: v swap VEC:AT @ out VEC:PUSH ! ;] GATHER
+   out ;
+
+: CONFLICT-KEY ( known-conflict -- MODEL:key )
+   KNOWN-CONFLICT-UNMAKE {: k c :} k ;
+
+: CONFLICT-OF ( known-conflict -- MODEL:conflict )
+   KNOWN-CONFLICT-UNMAKE {: k c :} c ;
+
+: KEY-CONFLICT
+   ( JOURNAL:conflict-record ^VEC:vector<known-conflict>
+     ^ARENA:arena -- )
+   {: rec v ar :}
+   rec JOURNAL-CONFLICT--RECORD:UNMAKE {: id path c :}
+   path ar MODEL:FOLD c KNOWN-CONFLICT-MAKE v VEC:PUSH ! ;
+
+: CONFLICT-CMP ( n n ^VEC:vector<known-conflict> -- n )
+   {: x:n y:n v :}
+   v x VEC:AT @ CONFLICT-KEY v y VEC:AT @ CONFLICT-KEY MODEL:KEY-CMP ;
+
+\ Rust's conflicts, keyed by path.
+: KNOWN-CONFLICTS ( ^run -- ^VEC:vector<known-conflict> )
+   {: r :}
+   r RUN-ARENA @ {: ar :}
+   r RUN-JOURNAL @ ar JOURNAL:CONFLICTS {: recs :}
+   ar [type] known-conflict NEW-VECTOR {: v :}
+   recs VEC:COUNT 0 ?do recs i VEC:AT @ v ar KEY-CONFLICT loop
+   ar [type] known-conflict NEW-VECTOR {: out :}
+   v VEC:COUNT [: v CONFLICT-CMP ;] ar STABLE-ORDER
+   [: v swap VEC:AT @ out VEC:PUSH ! ;] GATHER
+   out ;
+
+\ The merge's sides, read in Rust's order.
+: READ-SIDES ( ^run ^VEC:vector<MODEL:local-record> -- sides )
+   {: r records :}
+   r RUN-JOURNAL @ {: j :}
+   r RUN-ARENA @ {: ar :}
+   records ar LOCAL-MAP {: ls :}
+   j ar JOURNAL:REMOTE-INVENTORY JOURNAL-REMOTE--INVENTORY:UNMAKE
+   {: cursor seen :}
+   seen ar REMOTE-MAP {: rs :}
+   r LIVE-PLANS {: ps :}
+   j ar JOURNAL:BASELINES ls rs ps SIDES-MAKE ;
+
+: NEW-PLANNING
+   ( ^run ^VEC:vector<MODEL:local-record> -- ^planning )
+   {: r records :}
+   r records READ-SIDES {: s :}
+   r RUN-ARENA @ {: ar :}
+   ar PLANNINGS-NEW {: pl :}
+   r pl PLANNING-RUN ! s pl PLANNING-SIDES !
+   r KNOWN-CONFLICTS pl PLANNING-CONFLICTS !
+   ar [type] MODEL:key NEW-VECTOR pl PLANNING-HELD !
+   ar [type] JOURNAL:path-baseline NEW-VECTOR pl PLANNING-NOOPS !
+   ar [type] JOURNAL:path-plan NEW-VECTOR pl PLANNING-PLANS !
+   ar [type] path-decision NEW-VECTOR pl PLANNING-DECISIONS !
+   pl ;
+
+: ARENA-OF ( ^planning -- ^ARENA:arena ) PLANNING-RUN @ RUN-ARENA @ ;
+: JOURNAL-OF ( ^planning -- JOURNAL:journal )
+   PLANNING-RUN @ RUN-JOURNAL @ ;
+
+: SCAN-SIDE ( ^planning -- ^VEC:vector<local-entry> )
+   PLANNING-SIDES @ SIDES-UNMAKE {: bs ls rs ps :} ls ;
+
+: LIST-SIDE ( ^planning -- ^VEC:vector<MODEL:remote-record> )
+   PLANNING-SIDES @ SIDES-UNMAKE {: bs ls rs ps :} rs ;
+
+: LIVE-SIDE ( ^planning -- ^VEC:vector<pending-plan> )
+   PLANNING-SIDES @ SIDES-UNMAKE {: bs ls rs ps :} ps ;
+
+\ The live plan at the key; the journal keeps one per key.
+: FIND-LIVE ( ^planning MODEL:key -- option<JOURNAL:plan-record> )
+   {: pl k :}
+   pl LIVE-SIDE {: v :}
+   k KEY-BYTES v VEC:COUNT [: v swap VEC:AT @ PENDING-KEY ;] FIND-BYTES
+   {: at:n :}
+   at v VEC:COUNT = if OPTION:NONE exit then
+   v at VEC:AT @ PENDING-PLAN-UNMAKE {: pk plan :} plan OPTION:SOME ;
+
+: LIVE-AT? ( ^planning MODEL:key -- bool )
+   FIND-LIVE MATCH option
+      none OF false ENDOF
+      some OF drop true ENDOF
+   ;MATCH ;
+
+\ The index of the first known conflict at or past the key.
+: CONFLICT-FROM ( ^VEC:vector<known-conflict> MODEL:key -- n )
+   {: v k :}
+   0 v VEC:COUNT
+   [: v swap VEC:AT @ CONFLICT-KEY k MODEL:KEY-CMP 0 < ;]
+   SORT:PARTITION-POINT ;
+
+\ Whether q accepts a known conflict at the key.
+: ANY-AT? ( ^planning MODEL:key [ MODEL:conflict -- bool ] -- bool )
+   {: pl k q :}
+   pl PLANNING-CONFLICTS @ {: v :}
+   v VEC:COUNT v k CONFLICT-FROM ?do
+      v i VEC:AT @ CONFLICT-KEY k MODEL:KEY= 0= if
+         false unloop exit
+      then
+      v i VEC:AT @ CONFLICT-OF q execute if true unloop exit then
+   loop
+   false ;
+
+: ANY-CONFLICT ( MODEL:conflict -- bool ) drop true ;
+
+\ Rust's conflict_paths.contains.
+: CONFLICT-AT? ( ^planning MODEL:key -- bool )
+   [: ANY-CONFLICT ;] ANY-AT? ;
+
+\ The conflict is recorded at the key.
+: CONFLICT-RECORDED? ( ^planning MODEL:key MODEL:conflict -- bool )
+   {: pl k c :}
+   pl k [: c MODEL:CONFLICT= ;] ANY-AT? ;
+
+\ Rust's blocked_paths.insert.
+: HELD+ ( ^planning MODEL:key -- )
+   {: pl k :}
+   k pl PLANNING-HELD @ VEC:PUSH ! ;
+
+\ Rust's no-op rule: one that keeps the baseline at a path with no
+\ conflict is only counted; any other is recorded.
+: NOOP ( ^planning MODEL:key MODEL:path MODEL:baseline bool -- )
+   {: pl k path base same:bool :}
+   same pl k CONFLICT-AT? 0= and if
+      1 pl PLANNING-NOOP-COUNT +! exit
+   then
+   path base JOURNAL-PATH--BASELINE:MAKE
+   pl PLANNING-NOOPS @ VEC:PUSH ! ;
+
+: BASELINE-OF ( option<JOURNAL:path-baseline> -- MODEL:baseline )
+   MATCH option
+      none OF MODEL-BASELINE:ABSENT ENDOF
+      some OF JOURNAL-PATH--BASELINE:UNMAKE {: p b :} b ENDOF
+   ;MATCH ;
+
+: LOCAL-SEEN
+   ( option<MODEL:local-record> ^planning MODEL:key
+     -- MODEL:observation<MODEL:local> )
+   {: lr pl k :}
+   lr MATCH option
+      none OF pl SCAN-SIDE k LOCAL-UNOBSERVED ENDOF
+      some OF MODEL-LOCAL--RECORD:UNMAKE {: p o :} o ENDOF
+   ;MATCH ;
+
+: REMOTE-SEEN
+   ( option<MODEL:remote-record> ^planning MODEL:key
+     -- MODEL:observation<MODEL:remote> )
+   {: rr pl k :}
+   rr MATCH option
+      none OF pl LIST-SIDE k REMOTE-UNOBSERVED ENDOF
+      some OF REMOTE-OBSERVATION ENDOF
+   ;MATCH ;
+
+: LIVE-PATH ( ^planning MODEL:key -- MODEL:path )
+   {: pl k :}
+   pl k FIND-LIVE MATCH option
+      none OF
+         k MODEL:KEY>STR MODEL:>PATH
+         s" canonical path has no display spelling" INVALID
+      ENDOF
+      some OF PLAN-PATH ENDOF
+   ;MATCH ;
+
+: REMOTE-PATH
+   ( option<MODEL:remote-record> ^planning MODEL:key -- MODEL:path )
+   {: rr pl k :}
+   rr MATCH option
+      none OF pl k LIVE-PATH ENDOF
+      some OF MODEL-REMOTE--RECORD:UNMAKE {: rk p o :} p ENDOF
+   ;MATCH ;
+
+\ The baseline's path, else the listing's, else the live plan's.
+: CANDIDATE
+   ( option<JOURNAL:path-baseline> option<MODEL:remote-record>
+     ^planning MODEL:key -- MODEL:path )
+   {: br rr pl k :}
+   br MATCH option
+      none OF rr pl k REMOTE-PATH ENDOF
+      some OF JOURNAL-PATH--BASELINE:UNMAKE {: p b :} p ENDOF
+   ;MATCH ;
+
+\ The scan's spelling, else the candidate's with the local spelling of
+\ each ancestor the scan observed.
+: SHOWN-PATH
+   ( MODEL:key option<JOURNAL:path-baseline>
+     option<MODEL:local-record> option<MODEL:remote-record>
+     ^planning -- MODEL:path )
+   {: k br lr rr pl :}
+   lr MATCH option
+      none OF
+         pl SCAN-SIDE k br rr pl k CANDIDATE pl ARENA-OF
+         SPELL-WITH-LOCAL-ANCESTORS
+      ENDOF
+      some OF RECORD-PATH ENDOF
+   ;MATCH ;
+
+: DECISION-AT
+   ( MODEL:baseline option<MODEL:local-record>
+     option<MODEL:remote-record> ^planning MODEL:key
+     -- MODEL:decision )
+   {: base lr rr pl k :}
+   base lr pl k LOCAL-SEEN rr pl k REMOTE-SEEN
+   pl LIST-SIDE k REMOTE-SUBTREE PLANNER:PLAN ;
+
+\ Rust's baseline_matches_noop.
+: KEEPS-BASELINE? ( MODEL:decision MODEL:baseline -- bool )
+   {: d base :}
+   d MATCH MODEL:decision
+      noop OF base MODEL:BASELINE= ENDOF
+      operate OF drop false ENDOF
+      blocked OF drop false ENDOF
+      conflicted OF drop false ENDOF
+      collided OF drop false ENDOF
+   ;MATCH ;
+
+: NOOP-OF ( MODEL:decision -- option<MODEL:baseline> )
+   MATCH MODEL:decision
+      noop OF OPTION:SOME ENDOF
+      operate OF drop OPTION:NONE ENDOF
+      blocked OF drop OPTION:NONE ENDOF
+      conflicted OF drop OPTION:NONE ENDOF
+      collided OF drop OPTION:NONE ENDOF
+   ;MATCH ;
+
+\ A no-op at a key no live plan holds is settled now; any other
+\ decision waits for DECIDE.
+: FILE-DECISION ( ^planning path-decision -- )
+   {: pl pd :}
+   pd PATH-DECISION-UNMAKE {: k path same d :}
+   pl k LIVE-AT? if pd pl PLANNING-DECISIONS @ VEC:PUSH ! exit then
+   d NOOP-OF MATCH option
+      none OF pd pl PLANNING-DECISIONS @ VEC:PUSH ! ENDOF
+      some OF {: base :} pl k path base same NOOP ENDOF
+   ;MATCH ;
+
+\ Rust's closure over each known path in reconcile_published. An
+\ excluded path is outside synchronization, even when an older journal
+\ has a baseline or remote observation for it: never infer its
+\ deletion from its omission in the local scan.
+: KNOWN-PATH
+   ( MODEL:key option<JOURNAL:path-baseline>
+     option<MODEL:local-record> option<MODEL:remote-record>
+     ^planning -- )
+   {: k br lr rr pl :}
+   k MODEL:KEY>STR MODEL:>PATH MODEL:EXCLUDED? if exit then
+   br BASELINE-OF {: base :}
+   k br lr rr pl SHOWN-PATH {: path :}
+   base lr rr pl k DECISION-AT {: d :}
+   d base KEEPS-BASELINE? {: same:bool :}
+   pl k path same d PATH-DECISION-MAKE FILE-DECISION ;
+
+: DECISION-CMP ( n n ^VEC:vector<path-decision> -- n )
+   {: x:n y:n v :}
+   v x VEC:AT @ v y VEC:AT @ ORDER-PATH-DECISIONS ;
+
+: DECIDE-ALL ( ^planning -- )
+   {: pl :}
+   pl PLANNING-SIDES @ SIDES-UNMAKE {: bs ls rs ps :}
+   bs ls rs ps [: pl KNOWN-PATH ;] FOR-EACH-KNOWN-PATH
+   pl PLANNING-DECISIONS @ {: v :}
+   pl ARENA-OF {: ar :}
+   ar [type] path-decision NEW-VECTOR {: out :}
+   v VEC:COUNT [: v DECISION-CMP ;] ar STABLE-ORDER
+   [: v swap VEC:AT @ out VEC:PUSH ! ;] GATHER
+   out pl PLANNING-DECISIONS ! ;
+
+\ Rust's Operations(plan): a decision's operate carries one operation.
+: ONE-OPERATION
+   ( MODEL:operation ^ARENA:arena -- JOURNAL:operation-plan )
+   {: op ar :}
+   ar [type] MODEL:operation NEW-VECTOR {: ops :}
+   op ops VEC:PUSH !
+   ops JOURNAL-OPERATION--PLAN:MAKE ;
+
+\ What a live plan leaves its path's decision: held, settled for this
+\ pass; superseded, decided afresh; fresh, Rust's
+\ FreshObservationRequired.
+ENUM live-step held superseded fresh ;ENUM
+
+: STATUS-OF ( JOURNAL:plan-record -- JOURNAL:plan-status )
+   JOURNAL-PLAN--RECORD:UNMAKE {: id p ops s :} s ;
+
+: PLACE-TAKEN? ( MODEL:blockage -- bool )
+   MATCH MODEL:blockage
+      unsupported-file-size OF false ENDOF
+      remote-rejected OF drop false ENDOF
+      download-unavailable OF drop false ENDOF
+      download-verification-failed OF false ENDOF
+      stage-occupied OF true ENDOF
+      local-object-in-way OF false ENDOF
+      remote-object OF false ENDOF
+      conflict-copy-occupied OF true ENDOF
+   ;MATCH ;
+
+\ A plan blocked on a taken copy or stage place before its retry time.
+: COPY-WAITS? ( JOURNAL:plan-record n -- bool )
+   {: plan now:n :}
+   plan STATUS-OF MATCH JOURNAL:plan-status
+      pending OF false ENDOF
+      blocked OF {: why at:n :} why PLACE-TAKEN? at now > and ENDOF
+      completed OF false ENDOF
+   ;MATCH ;
+
+\ A blocked plan whose retry time has come.
+: DUE? ( JOURNAL:plan-record n -- bool )
+   {: plan now:n :}
+   plan STATUS-OF MATCH JOURNAL:plan-status
+      pending OF false ENDOF
+      blocked OF {: why at:n :} at now <= ENDOF
+      completed OF false ENDOF
+   ;MATCH ;
+
+: SUPERSEDE ( ^planning JOURNAL:plan-record -- )
+   {: pl plan :}
+   pl JOURNAL-OF plan pl ARENA-OF SUPERSEDE-PENDING-PLAN ;
+
+\ Rust's finish_pending_conflict.
+: FINISH-PENDING-CONFLICT
+   ( ^planning JOURNAL:plan-record MODEL:conflict -- )
+   {: pl plan c :}
+   pl JOURNAL-OF plan ID-OF c pl ARENA-OF
+   JOURNAL:FINISH-PLAN-WITH-CONFLICT
+   MATCH JOURNAL:plan-conflict-completion
+      not-found OF
+         plan PLAN-PATH
+         s" pending plan disappeared before conflict completion" INVALID
+      ENDOF
+      already-completed OF ENDOF
+      recorded OF ENDOF
+   ;MATCH ;
+
+: CONFLICT-LOST ( JOURNAL:plan-record -- )
+   PLAN-PATH s" blocked conflict lost its pending plan" INVALID ;
+
+: BLOCK-CONFLICT
+   ( ^planning JOURNAL:plan-record MODEL:blockage -- )
+   {: pl plan why :}
+   pl PLANNING-NOW @ JOURNAL:BLOCK-RETRY-SECONDS + {: at:n :}
+   pl JOURNAL-OF plan ID-OF why at pl ARENA-OF JOURNAL:BLOCK-PLAN
+   MATCH JOURNAL:plan-block
+      not-found OF plan CONFLICT-LOST ENDOF
+      already-completed OF plan CONFLICT-LOST ENDOF
+      blocked OF ENDOF
+   ;MATCH ;
+
+\ A live plan's conflict: one whose copy waits is held; a prepared one
+\ completes the plan, which settles the path without holding it.
+: LIVE-CONFLICT
+   ( ^planning MODEL:key MODEL:path JOURNAL:plan-record
+     MODEL:conflict -- live-step )
+   {: pl k path plan c :}
+   plan pl PLANNING-NOW @ COPY-WAITS? if
+      pl k HELD+ construct live-step held exit
+   then
+   pl PLANNING-RUN @ path c PREPARE-CONFLICT
+   MATCH REPLAY:copy-outcome
+      ready OF
+         pl plan c FINISH-PENDING-CONFLICT
+         1 pl PLANNING-CONFLICT-COUNT +! construct live-step held
+      ENDOF
+      blocked OF
+         {: why :} pl plan why BLOCK-CONFLICT
+         pl k HELD+ construct live-step held
+      ENDOF
+      source-changed OF construct live-step fresh ENDOF
+   ;MATCH ;
+
+\ A recorded remote directory delete rests on an inventory that showed
+\ nothing beneath the path; entries there now retire it. Every other
+\ block keeps its plan, whose own precondition still guards the replay.
+: LIVE-BLOCKED
+   ( ^planning MODEL:key JOURNAL:plan-record MODEL:blocked-reason
+     -- live-step )
+   {: pl k plan why :}
+   why MATCH MODEL:blocked-reason
+      unknown OF ENDOF
+      occupied OF pl plan SUPERSEDE ENDOF
+   ;MATCH
+   pl k HELD+ construct live-step held ;
+
+: UNBLOCK ( ^planning JOURNAL:plan-record -- )
+   {: pl plan :}
+   pl JOURNAL-OF plan ID-OF pl ARENA-OF JOURNAL:UNBLOCK-PLAN
+   MATCH JOURNAL:plan-unblock
+      not-found OF
+         plan PLAN-PATH s" due blocked plan disappeared" INVALID
+      ENDOF
+      not-blocked OF ENDOF
+      unblocked OF ENDOF
+   ;MATCH ;
+
+\ A live plan whose remaining operations are the decision's is kept,
+\ and pending again once its retry time has come.
+: LIVE-OPERATE
+   ( ^planning MODEL:key JOURNAL:plan-record MODEL:operation
+     -- live-step )
+   {: pl k plan op :}
+   plan op pl ARENA-OF ONE-OPERATION REMAINING-OPERATIONS-MATCH?
+   0= if pl plan SUPERSEDE construct live-step superseded exit then
+   plan pl PLANNING-NOW @ DUE? if pl plan UNBLOCK then
+   pl k HELD+ construct live-step held ;
+
+\ reconcile_published's decision at a path a live plan holds.
+: LIVE-DECISION
+   ( ^planning path-decision JOURNAL:plan-record -- live-step )
+   {: pl pd plan :}
+   pd PATH-DECISION-UNMAKE {: k path same d :}
+   d MATCH MODEL:decision
+      noop OF
+         drop pl plan SUPERSEDE construct live-step superseded
+      ENDOF
+      operate OF {: op :} pl k plan op LIVE-OPERATE ENDOF
+      blocked OF {: why :} pl k plan why LIVE-BLOCKED ENDOF
+      conflicted OF {: c :} pl k path plan c LIVE-CONFLICT ENDOF
+      collided OF
+         drop pl plan SUPERSEDE construct live-step fresh
+      ENDOF
+   ;MATCH ;
+
+\ Rust's require_active_local_root, then the plan for recording.
+: PUSH-PLAN
+   ( ^planning MODEL:path JOURNAL:operation-plan -- pass-event )
+   {: pl path plan :}
+   pl PLANNING-RUN @ ROOT-ACTIVE? 0= if
+      construct pass-event root-changed exit
+   then
+   path plan JOURNAL-PATH--PLAN:MAKE pl PLANNING-PLANS @ VEC:PUSH !
+   construct pass-event ok ;
+
+: NEW-OPERATE
+   ( ^planning MODEL:path MODEL:operation -- pass-event )
+   {: pl path op :}
+   pl PLANNING-RUN @ path op PREPARE-OPERATION MATCH prepared
+      ready OF pl path op pl ARENA-OF ONE-OPERATION PUSH-PLAN ENDOF
+      fresh OF construct pass-event fresh ENDOF
+   ;MATCH ;
+
+\ A recorded conflict was prepared once; its copies now belong to the
+\ user, who may edit, move, or delete them.
+: NEW-CONFLICT
+   ( ^planning MODEL:key MODEL:path MODEL:conflict -- pass-event )
+   {: pl k path c :}
+   pl k c CONFLICT-RECORDED? if construct pass-event ok exit then
+   pl PLANNING-RUN @ path c PREPARE-CONFLICT
+   MATCH REPLAY:copy-outcome
+      ready OF
+         pl JOURNAL-OF path c pl ARENA-OF JOURNAL:RECORD-CONFLICT drop
+         1 pl PLANNING-CONFLICT-COUNT +! construct pass-event ok
+      ENDOF
+      blocked OF drop pl k HELD+ construct pass-event ok ENDOF
+      source-changed OF construct pass-event fresh ENDOF
+   ;MATCH ;
+
+: NEW-COLLISION
+   ( ^planning MODEL:key MODEL:path MODEL:collision -- pass-event )
+   {: pl k path col :}
+   pl PLANNING-RUN @ pl PLANNING-SIDES @ path col
+   PREPARE-DIRECTORY-COLLISION MATCH prepared-collision
+      root-changed OF construct pass-event root-changed ENDOF
+      fresh OF construct pass-event fresh ENDOF
+      blocked OF drop pl k HELD+ construct pass-event ok ENDOF
+      plan OF {: plan :} pl path plan PUSH-PLAN ENDOF
+   ;MATCH ;
+
+\ reconcile_published's decision at a path no live plan holds.
+: NEW-DECISION ( ^planning path-decision -- pass-event )
+   {: pl pd :}
+   pd PATH-DECISION-UNMAKE {: k path same d :}
+   d MATCH MODEL:decision
+      noop OF
+         {: base :} pl k path base same NOOP construct pass-event ok
+      ENDOF
+      operate OF {: op :} pl path op NEW-OPERATE ENDOF
+      blocked OF drop pl k HELD+ construct pass-event ok ENDOF
+      conflicted OF {: c :} pl k path c NEW-CONFLICT ENDOF
+      collided OF {: col :} pl k path col NEW-COLLISION ENDOF
+   ;MATCH ;
+
+: AFTER-LIVE ( ^planning path-decision live-step -- pass-event )
+   {: pl pd step :}
+   step MATCH live-step
+      held OF construct pass-event ok ENDOF
+      superseded OF pl pd NEW-DECISION ENDOF
+      fresh OF construct pass-event fresh ENDOF
+   ;MATCH ;
+
+: DECISION-KEY ( path-decision -- MODEL:key )
+   PATH-DECISION-UNMAKE {: k path same d :} k ;
+
+: DECIDE ( ^planning path-decision -- pass-event )
+   {: pl pd :}
+   pl pd DECISION-KEY FIND-LIVE MATCH option
+      none OF pl pd NEW-DECISION ENDOF
+      some OF {: plan :} pl pd pl pd plan LIVE-DECISION AFTER-LIVE ENDOF
+   ;MATCH ;
+
+: OK? ( pass-event -- bool )
+   MATCH pass-event
+      ok OF true ENDOF
+      fresh OF false ENDOF
+      root-changed OF false ENDOF
+   ;MATCH ;
+
+\ Each decision in order; the first answer but ok ends planning.
+: DECIDE-EACH ( ^planning -- pass-event )
+   {: pl :}
+   pl PLANNING-DECISIONS @ {: v :}
+   v VEC:COUNT 0 ?do
+      pl v i VEC:AT @ DECIDE dup OK? 0= if unloop exit then drop
+   loop
+   construct pass-event ok ;
+
+\ Rust's record_reconciliation and what reconcile_published takes from
+\ its answer; a path a live plan kept is held.
+: RECORD-PLANNING ( ^planning -- )
+   {: pl :}
+   pl JOURNAL-OF pl PLANNING-NOOPS @ pl PLANNING-PLANS @ pl ARENA-OF
+   JOURNAL:RECORD-RECONCILIATION
+   JOURNAL-RECONCILIATION--WRITE:UNMAKE {: noops:n plans:n live :}
+   noops pl PLANNING-NOOP-COUNT +!
+   plans pl PLANNING-PLANNED !
+   live VEC:COUNT 0 ?do
+      pl live i VEC:AT @ pl ARENA-OF MODEL:FOLD HELD+
+   loop ;
+
+\ Rust's reconcile_published from its start to record_reconciliation:
+\ every known path decided and prepared, then the no-ops and plans
+\ recorded together, unless planning ended early.
+: PLAN-PATHS
+   ( ^run ^VEC:vector<MODEL:local-record> -- ^planning pass-event )
+   NEW-PLANNING {: pl :}
+   pl DECIDE-ALL
+   epoch-seconds pl PLANNING-NOW !
+   pl pl DECIDE-EACH dup OK? 0= if exit then
+   drop pl RECORD-PLANNING construct pass-event ok ;
 
 ;package
