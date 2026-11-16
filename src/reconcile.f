@@ -1353,8 +1353,7 @@ STRUCTURE casing
 : NEW-LISTING-ROOT ( str ^ARENA:arena -- listing-root )
    {: s:str ar :}
    s str> DROPBOX:ROOT-PATH? 0= if
-      s" configured Dropbox root must be empty or a normalized absolute Dropbox path"
-      LISTING-FAILED
+      DROPBOX:E-ROOT-PATH ERROR:TEXT$ LISTING-FAILED
    then
    s s str> ar LOWERED s str> SEPARATOR COUNT-CHAR LISTING-ROOT-MAKE ;
 

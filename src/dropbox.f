@@ -1887,15 +1887,22 @@ public
 : ROOT-NAMESPACE ( ^client -- ^u8 n ) CLIENT-NAMESPACE @ SPAN:$ ;
 
 
-\ files/get_metadata of the path, a deleted entry included.
-: METADATA ( ^u8 n ^client -- reply )
-   {: p:^ pu:n c :}
+private
+
+\ files/get_metadata of the path, a deleted entry included as d says.
+: METADATA-WITH ( ^u8 n bool ^client -- reply )
+   {: p:^ pu:n d:bool c :}
    c BODY-OPEN JSON:WRITE-OBJECT-START
    s" path" p pu JSON:WRITE-FIELD-S JSON:WRITE-COMMA
-   s" include_deleted" true JSON:WRITE-FIELD-BOOL
+   s" include_deleted" d JSON:WRITE-FIELD-BOOL
    JSON:WRITE-OBJECT-END JSON:WRITE-CLOSE
    c s" files/get_metadata" [: JSON-BODY ;] CALL
    c [: ENTRY-READ ;] ANSWERED p pu c PLACED ;
+
+public
+
+\ files/get_metadata of the path, a deleted entry included.
+: METADATA ( ^u8 n ^client -- reply ) true swap METADATA-WITH ;
 
 
 : ENTRY ( ^client -- ^entry ) CLIENT-ENTRY ;
@@ -2414,11 +2421,8 @@ public
    p u + 1- c@ SEPARATOR = if false exit then
    p 1+ u 1- INVALID-PARTS? 0= ;
 
-\ What linking or checking a remote root found. failed: a call did not
-\ answer done, its reply; unbound: the account's root_info is neither
-\ user nor team (Rust's AccountBindingChanged from namespace_id);
-\ unavailable, not-folder and restricted: Rust's RemoteRootUnavailable,
-\ RemoteRootNotFolder and RemoteRootRestricted.
+\ What checking a remote root found. failed carries the reply of a call
+\ that did not answer done; unbound: root_info neither user nor team.
 ENUM root-check
    VARIANT valid ;VARIANT
    VARIANT failed FIELD r reply ;VARIANT
@@ -2445,31 +2449,42 @@ private
    LOG-OPEN E-ROOT-PATH ERROR:TEXT$ LOG:TEXT+ LOG:;LINE
    E-ROOT-PATH throw ;
 
+\ Rust's "Dropbox operation `op` failed" line for c's last call: its
+\ route and status, or that the route got no answer.
+: OP-FAILED ( ^client ^u8 n -- )
+   {: c op:^ ou:n :}
+   LOG-OPEN s" Dropbox operation `" LOG:TEXT+ op ou LOG:TEXT+
+   s" ` failed: " LOG:TEXT+ c CLIENT-ROUTE @ SPAN:$ LOG:TEXT+
+   c CLIENT-STATUS @ {: s:n :}
+   s 0= if s"  got no answer" LOG:TEXT+
+   else s"  answered " LOG:TEXT+ s LOG:INT+ then
+   LOG:;LINE ;
+
 public
 
-\ Rust's validate_remote_root of the remote root p under the client's
-\ Path-Root: empty, the root's own top, needs no call; an entry whose
-\ path_lower is not p's lowercase is unavailable, a deleted entry or a
-\ file not-folder.
+\ Rust's validate_remote_root under the client's Path-Root, asking for no
+\ deleted entry. An empty p needs no call; another path_lower is unavailable.
 : CHECK-ROOT ( ^u8 n ^client -- root-check )
    {: p:^ pu:n c :}
    pu 0= if construct root-check valid exit then
-   p pu c METADATA {: r:reply :}
+   p pu false c METADATA-WITH {: r:reply :}
    r MISMATCH? if construct root-check unavailable exit then
-   r DONE? 0= if r construct root-check failed exit then
+   r DONE? 0= if
+      c s" validate configured Dropbox root" OP-FAILED
+      r construct root-check failed exit
+   then
    c CLIENT-ENTRY ENTRY-CHECK ;
 
-\ Rust's link_inner with no expected account, on a client whose access
-\ token an EXCHANGE set and whose Path-Root line is empty, the account's
-\ home: the account, then the client rooted at its namespace from then
-\ on and CHECK-ROOT of the remote root p. A p ROOT-PATH? refuses throws
-\ E-ROOT-PATH before any call. After valid, ACCOUNT-ID and ROOT-NAMESPACE
-\ name the binding, kept in ar with the Path-Root line.
+\ Rust's link_inner with no expected account; the client's Path-Root line
+\ must be empty. After valid the binding lives in ar and roots the client.
 : LINK ( ^u8 n ^client ^ARENA:arena -- root-check )
    {: p:^ pu:n c ar :}
    p pu ROOT-PATH? 0= if ROOT-REFUSED then
    c ACCOUNT {: r:reply :}
-   r DONE? 0= if r construct root-check failed exit then
+   r DONE? 0= if
+      c s" inspect authorized Dropbox account" OP-FAILED
+      r construct root-check failed exit
+   then
    c CLIENT-NAMESPACE @ SPAN:LEN 0= if construct root-check unbound exit then
    c CLIENT-ACCOUNT @ SPAN:$ ar KEEP c CLIENT-ACCOUNT !
    c CLIENT-NAMESPACE @ SPAN:$ ar KEEP c CLIENT-NAMESPACE !

@@ -27,8 +27,11 @@
 \ not its body catches the short one's failure, a held body one byte
 \ long whose body catches it in flight, a 416 from 0, a
 \ Dropbox-API-Result or an error that does not parse), delete,
-\ create-folder, the code exchange, linking a login (of a folder, and
-\ of an account whose root_info carries a tag other than user or team),
+\ create-folder, the code exchange, linking a login (of a folder, of
+\ an account whose root_info carries a tag other than user or team, one
+\ whose get_metadata or get_current_account answers 503, logging the
+\ operation, of an invalid root, unsent, a root check asking for no
+\ deleted entry, and one answered at another path, unavailable),
 \ Dropbox's content hash and uploads,
 \ whose stages are written under TMPDIR and removed once open, so no run
 \ leaves one; a mutation, session start or finish lost or answered 503
@@ -2816,10 +2819,15 @@ TYPED-VARIABLE FAULT fault
    c DROPBOX:CLOSE ;
 
 
+\ OUTCOME: LINK of a missing /Sync failed on Dropbox's not_found.
+: NOT-FOUND-LINKED ( -- )
+   409 [: NOT-FOUND$ ;] ROOT-LINKED
+   DROPBOX-ERROR:NOT-FOUND CHECK-REFUSED? OUTCOME ! ;
+
 : LINK-REJECTS-UNAVAILABLE-FILE-AND-RESTRICTED-ROOTS ( -- )
    s" link_rejects_unavailable_file_and_restricted_roots" T-LABEL
-   409 [: NOT-FOUND$ ;] ROOT-LINKED
-   DROPBOX-ERROR:NOT-FOUND CHECK-REFUSED? TTRUE
+   false OUTCOME ! [: NOT-FOUND-LINKED ;] LOGGED 0 T= OUTCOME @ TTRUE
+   s" files/get_metadata answered 409" LOGGED? TTRUE
    200 [: ROOT-FILE$ ;] ROOT-LINKED CHECK$ s" not-folder" T$=
    200 [: s" no_access" RESTRICTED$ ;] ROOT-LINKED CHECK$
    s" restricted" T$=
@@ -2840,6 +2848,82 @@ TYPED-VARIABLE FAULT fault
    c DROPBOX:CLOSE ;
 
 
+\ OUTCOME: LINK of /Sync on OWN answered failed.
+: LINK-FAILED ( -- )
+   s" /Sync" OWN @ AR @ DROPBOX:LINK CHECK$ s" failed" STR= OUTCOME ! ;
+
+
+\ LINK of /Sync on a client whose call to the route rt answers 503 answers
+\ failed and logs Rust's one line t for that operation.
+: FAILED-LINKED ( ^u8 n ^u8 n -- )
+   {: rt:^ ru:n t:^ tu:n :}
+   LINKABLE {: c :}
+   rt ru 503 s" " s" " s" " TEST-DROPBOX:ROUTE-SCRIPT!
+   c OWN ! false OUTCOME !
+   [: LINK-FAILED ;] LOGGED 0 T=
+   OUTCOME @ TTRUE t tu LOGGED? TTRUE
+   c DROPBOX:CLOSE ;
+
+
+: FAILED-LINK-CASE ( -- )
+   s" link whose call answers 503" T-LABEL
+   s" /2/files/get_metadata"
+   s" Dropbox operation `validate configured Dropbox root` failed: files/get_metadata answered 503"
+   FAILED-LINKED
+   s" /2/users/get_current_account"
+   s" Dropbox operation `inspect authorized Dropbox account` failed: users/get_current_account answered 503"
+   FAILED-LINKED ;
+
+
+\ Rust's GetMetadataArg asks for no deleted entry, so a deleted root is
+\ not_found as a missing one is.
+: UNDELETED-ROOT-CASE ( -- )
+   s" root check asks for no deleted entry" T-LABEL
+   200 [: SB-RESET S\" {\q.tag\q:\qfolder\q" SB-APPEND
+      SYNC-PATHS+ s" }" SB-APPEND SB$ ;] ROOT-LINKED
+   CHECK$ s" valid" T$=
+   s" /2/files/get_metadata" TEST-DROPBOX:BODIES-TO$
+   S\" {\qpath\q:\q/Sync\q,\qinclude_deleted\q:false}" T$= ;
+
+
+\ OUTCOME: CHECK-ROOT of /Sync on OWN answered unavailable.
+: ROOT-UNAVAILABLE ( -- )
+   s" /Sync" OWN @ DROPBOX:CHECK-ROOT CHECK$ s" unavailable" STR=
+   OUTCOME ! ;
+
+
+\ A get_metadata answered at another path_lower is unavailable, with no
+\ line logged.
+: ELSEWHERE-ROOT-CASE ( -- )
+   s" root check answered at another path" T-LABEL
+   LINKABLE {: c :}
+   s" /2/files/get_metadata" 200 s" " s" "
+   S\" {\q.tag\q:\qfolder\q,\qpath_lower\q:\q/other\q,\qpath_display\q:\q/Other\q}"
+   TEST-DROPBOX:ROUTE-SCRIPT!
+   c OWN ! false OUTCOME !
+   [: ROOT-UNAVAILABLE ;] LOGGED 0 T=
+   OUTCOME @ TTRUE ERR$ nip 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/get_metadata" T$=
+   c DROPBOX:CLOSE ;
+
+
+\ OUTCOME: LINK of Sync, no leading slash, on OWN answered.
+: LINK-UNROOTED ( -- )
+   s" Sync" OWN @ AR @ DROPBOX:LINK CHECK$ 2drop true OUTCOME ! ;
+
+
+\ A root ROOT-PATH? refuses throws E-ROOT-PATH with its line, unsent.
+: INVALID-ROOT-CASE ( -- )
+   s" link of an invalid root" T-LABEL
+   LINKABLE {: c :}
+   c OWN ! false OUTCOME !
+   [: LINK-UNROOTED ;] LOGGED DROPBOX:E-ROOT-PATH T=
+   OUTCOME @ TFALSE
+   DROPBOX:E-ROOT-PATH ERROR:TEXT$ LOGGED? TTRUE
+   TEST-DROPBOX:SEEN$ s" " T$=
+   c DROPBOX:CLOSE ;
+
+
 \ Linking starts at the account's home, so the fake expects no Path-Root;
 \ the get_metadata under the namespace's is scripted, and a scripted
 \ answer passes no root check.
@@ -2847,6 +2931,8 @@ TYPED-VARIABLE FAULT fault
    s" " TEST-DROPBOX:ROOT!
    VALID-LINK-CASE
    LINK-REJECTS-UNAVAILABLE-FILE-AND-RESTRICTED-ROOTS UNBOUND-LINK-CASE
+   FAILED-LINK-CASE UNDELETED-ROOT-CASE ELSEWHERE-ROOT-CASE
+   INVALID-ROOT-CASE
    s" ns-root" TEST-DROPBOX:ROOT! ;
 
 
