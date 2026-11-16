@@ -18,8 +18,8 @@
 \ record's path and its cause and thrown as E-JSON. Each write is one
 \ immediate transaction, and the remote cursor and inventory are read in
 \ one deferred one.
-\ STORAGE CLASS. CALLER-OWNED: a journal borrows the path it was opened
-\ with until CLOSE, and a binding INSPECT answers borrows its path; every
+\ STORAGE CLASS. CALLER-OWNED: a journal OPEN makes borrows its path
+\ until CLOSE, and a binding INSPECT answers borrows its path; every
 \ string and vector a reader answers lies in the arena the caller passes.
 \ A journal belongs to the task that opened it. TASK-LOCAL: the bytes a
 \ root's inode and subvolume are bound from, and the JSON writer and
@@ -64,7 +64,7 @@ public
    ERROR:CODE E-ROOT
 -100306 s" journal operation found the disk full" ERROR:CODE E-DISK-FULL
 
-\ The connection and the path it was opened on, which logs name.
+\ The connection and the name its logs give.
 STRUCTURE journal OPAQUE
    FIELD connection SQLITE:connection
    FIELD path str
@@ -375,10 +375,13 @@ public
    path OWNER-ONLY
    path str> SQLITE:OPEN path JOURNAL-MAKE [: READY ;] SET-UP ;
 
-\ The schema-8 journal at path, never created or changed.
+\ The schema-8 journal at path, never created or changed, named
+\ `[Omabox journal]` in the lines it and the words on it log, as Rust's
+\ status redacts its journal's path.
 : OPEN-READ ( str -- journal )
    {: path:str :}
-   path str> SQLITE:OPEN-READ path JOURNAL-MAKE [: READABLE ;] SET-UP ;
+   path str> SQLITE:OPEN-READ s" [Omabox journal]" >str JOURNAL-MAKE
+   [: READABLE ;] SET-UP ;
 
 
 private

@@ -182,8 +182,7 @@
 \   request
 \ - documented_exclusions_preserve_payloads_while_ordinary_siblings_sync,
 \   with no account request
-\ - excluded_pending_and_blocked_work_is_retired_across_reopen_without_effects,
-\   without its status render, which has no port
+\ - excluded_pending_and_blocked_work_is_retired_across_reopen_without_effects
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -211,6 +210,7 @@ require src/planner.f
 require src/status.f
 require src/replay.f
 require src/reconcile.f
+require src/attention.f
 require src/test-client.f
 
 using TEST-CLIENT
@@ -3059,12 +3059,21 @@ TYPED-VARIABLE CANARY str
 : ISOLATION-SEEN$ ( -- ^u8 n )
    s" /2/files/list_folder /2/files/download /2/files/download /2/files/upload" ;
 
+\ The run's journal file in d.
+: JOURNAL-FILE ( str ^run -- str )
+   {: d:str x :}
+   d s" journal.sqlite3" x RUN-ARENA @ INSIDE ;
+
+\ The run's journal opened again from its file in d.
+: OPENED-AGAIN ( str ^run -- )
+   {: d:str x :}
+   d x JOURNAL-FILE JOURNAL:OPEN x RUN-JOURNAL ! ;
+
 \ The run's journal closed and opened again from its file in d.
 : REOPENED ( str ^run -- )
    {: d:str x :}
    x RUN-JOURNAL @ JOURNAL:CLOSE
-   d s" journal.sqlite3" x RUN-ARENA @ INSIDE JOURNAL:OPEN
-   x RUN-JOURNAL ! ;
+   d x OPENED-AGAIN ;
 
 \ Over a reopened journal, a step reports the block and sends nothing.
 : BLOCK-KEPT ( str ^run n -- )
@@ -6117,12 +6126,15 @@ TYPED-VARIABLE RACED str
    LOCAL-ABSENT rem REMOTE-PRESENT RECORD-FIXTURE-PLAN ID-OF {: del :}
    x del s" conflict" REJECTED-AS 4000000000 BLOCKED-UNTIL ;
 
-\ The reopened journal's replay step retires the excluded work, sends
-\ nothing and keeps every baseline and file. Rust's status render of
-\ the journal has no port.
+\ The closed journal's status shows none of the excluded work; the
+\ reopened journal's replay step retires it, sends nothing and keeps
+\ every baseline and file.
 : BLOCKED-RETIRES ( str ^run MODEL:remote -- )
    {: d:str x rem :}
-   d x REOPENED
+   x RUN-JOURNAL @ JOURNAL:CLOSE
+   d x JOURNAL-FILE x RUN-ARENA @ ATTENTION:RENDER str>
+   s\" Omabox has no recorded work needing attention.\n" T$=
+   d x OPENED-AGAIN
    TEST-DROPBOX:RESET
    x REPLAY-STEP REPORTED COMPLETED 0 T=
    x PENDING-OF VEC:COUNT 0 T=
