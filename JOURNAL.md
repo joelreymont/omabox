@@ -928,3 +928,40 @@ requires it.
 Lane times: the cancelled state 8.8 min; downloadability and the path
 check 5.1 min; case-variant renames 5.4 min; root binding 1.4 min to
 its stop, then 5.6 min; LOCAL's failure tests 9.1 min.
+
+## 2026-11-16: 41 ms of Nagle, and a file Dropbox describes in part
+
+A review of the download cancel noticed that every call to the fake
+Dropbox after the first took about 41 ms. A worker given only the
+measurement and a hypothesis found the cause in Habu's HTTP server,
+not in omabox. It writes a reply's head and body as two writes, and it
+never sets TCP_NODELAY. The body then waits for the client's delayed
+ACK of the head: the classic write-write-read stall. The first request
+on a connection escapes it because Linux ACKs at once at first. The
+worker had no strace or tcpdump, so it proved the cause three ways.
+Patching only NODELAY took a call to 0.2 ms, and so did sending head
+and body in one write. The kernel's delayed-ACK counter rose once per
+slow request and stayed flat under either patch. The report and a
+40-line reproducer went to Habu's owner. A suite that takes 41 ms per
+call hides this well: it looks like a slow test, not a bug.
+
+The same review found that Habu's listing throws when Dropbox lists a
+downloadable file with no content hash. Rust records that file as
+"incomplete" and goes on. In Habu, one such file would have ended every
+pass. DROPBOX now hands the file to the caller as it came, and a public
+COMPLETE? says whether it is whole. Deciding what an incomplete file
+means is sync's job.
+
+Two lead slips are worth recording, because jj caught both. A script
+that folded review comments into four commits passed `-q`, which jj
+does not take. Every `jj new` failed, so all the edits landed in one
+working copy; `jj diff --stat` showed it before anything moved, and
+`jj restore` undid it. Then a rebase of REPLAY's line started one
+commit too high. REPLAY's base commit had never reached master, and
+every commit came back with "2-sided conflict including 1 deletion".
+`jj op revert` of that one operation put the graph back, and the rebase
+from the right root had no conflicts.
+
+Lane times: the renames review's fold-ins 1.4 min; the Nagle hunt
+4.5 min; the three-commit DROPBOX review 13.1 min; the renames review
+8.4 min.
