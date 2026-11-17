@@ -1597,3 +1597,50 @@ One stale-build trap: after rebasing the Habu workspace onto a newer
 master, its `bin/hb` still carried the old engine's libraries, and the
 new library source failed with an undefined error word. Rebuilding the
 engine took 8 s.
+
+## 2026-11-17: every table under its model
+
+The listing check proved the mechanism on one table. The user then asked
+for a model of every table, with the tests running TLC themselves. Seven
+tables had none. Six got one in parallel lanes, each designed, built and
+checked; the seventh, the upload session, waits for its model. TLC
+checks each new model in about a second, over 17 to 145 distinct states.
+
+The check reads a line as state, input and next state. That rule did more
+than check: it found every place where code outside a table moved the
+machine, and each one had to become a line.
+
+- The daemon parked every failure in a `waiting` state and stored the
+  state to return to; a line picked its next state at run time, which no
+  reader can see. Each state now has its own retry line back to itself
+  and its own stop line, which is how Rust's loop already read.
+- The service drive's steps wrote their own next state through `TO-*`
+  words and a `failed` phase. Now each line names its next state, and a
+  step that throws leaves the machine, as Rust's `break Err` does.
+  `service.f` came out shorter.
+- The download's transfer entered three of its final states from code
+  that wrote the state field directly. As lines, they showed a gap: a
+  read after a caught length failure answered 0, which a reader takes as
+  the end of the file.
+
+An older model was wrong in a quieter way. `SyncBehavior` passed TLC,
+and it recorded an upload's plan before staging it and a conflict before
+making its copies. The code, and Rust before it, do the reverse: a stage is private, and a conflict is recorded only once its
+copies exist, so a crash cannot lose a payload. The model was a green
+proof of a different program. Its invariants all still hold in the code's
+order.
+
+Writing the pass's model turned up a defect too: conflict copies opened
+the sync root by its path, while every other write in a pass checks that
+the directory there is still the journal's root. A directory swapped in
+after the pass's root check would have received the copies, and the
+conflict would have been recorded as done. Rust has the same defect. The
+first fix put the check in the copy words, which replay shares, and so
+handed replay an answer it can never meet; the review moved it to the
+pass, which now opens the root once per conflict, as it already did for
+directory collisions.
+
+The check has a limit, which a test fix made concrete. It sees where a
+line goes, not what it runs. A stop line changed to wait before stopping
+passed the model check; only the test that counts the daemon's naps
+failed. A table check replaces no test of a line's action.
