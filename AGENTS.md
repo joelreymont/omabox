@@ -31,7 +31,9 @@ rewrite and `JOURNAL.md` records it.
 - Before landing, run the tests (`src/*-test.f`) of every package the change
   touches.
 - With the user's approval, run the relevant TLC model after changing
-  durable replay or concurrency.
+  durable replay or concurrency. The tests that check an FSM table
+  against its model run TLC themselves, with the user's standing
+  approval (2026-11-17); any other TLC run still needs it.
 - Keep real Dropbox tests opt-in and separate from unit tests.
 - Classify and test every external/filesystem failure. Repeated bad input must
   neither crash-loop nor stop unrelated work.
