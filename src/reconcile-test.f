@@ -5881,6 +5881,13 @@ TYPED-VARIABLE RACED str
 : FUTURE-WRITE ( DROPBOX:hash -- )
    drop s" future_write_error" UPLOAD-REFUSED ;
 
+\ The next upload is refused 409 content_hash_mismatch, a top-level tag.
+: HASH-MISMATCH ( DROPBOX:hash -- )
+   drop SB-RESET
+   S\" {\qerror_summary\q:\qcontent_hash_mismatch/\q," SB-APPEND
+   S\" \qerror\q:{\q.tag\q:\qcontent_hash_mismatch\q}}" SB-APPEND
+   UPLOAD-ROUTE$ 409 s" " s" " SB$ TEST-DROPBOX:ROUTE-SCRIPT! ;
+
 \ The next upload and its read-back answer /moved.txt with content h.
 : MOVED ( DROPBOX:hash -- )
    {: h:DROPBOX:hash :}
@@ -6007,6 +6014,8 @@ TYPED-VARIABLE RACED str
    REJECTED-PATH-CASE
    [: FUTURE-WRITE ;] UPLOAD-ROUTE$ s" rejected_by_dropbox" ar
    REJECTED-PATH-CASE
+   [: HASH-MISMATCH ;] UPLOAD-ROUTE$
+   s" content_hash_mismatch" ar REJECTED-PATH-CASE
    [: MOVED ;] s" /2/files/upload /2/files/get_metadata"
    s" path_mismatch" ar REJECTED-PATH-CASE
    \ The uploads besides good.txt's both name /bad.txt.

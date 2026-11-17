@@ -98,7 +98,7 @@ ENUM remote-path-state
 ENUM mutation-rejection
    invalid-path unsupported-file-size disallowed-name
    permission-denied insufficient-space operation-not-allowed
-   path-mismatch rejected-by-dropbox
+   path-mismatch rejected-by-dropbox content-hash-mismatch
 ;ENUM
 
 \ One conditional mutation: pending keeps the precondition, so the
@@ -1182,7 +1182,9 @@ ARENA UPLOADS DROPBOX:upload
       locked OF BY-DROPBOX ENDOF
       reset OF e l STOP-REFUSED ENDOF
       invalid-root OF e l STOP-REFUSED ENDOF
-      content-hash-mismatch OF BY-DROPBOX ENDOF
+      content-hash-mismatch OF
+         construct mutation-rejection content-hash-mismatch
+      ENDOF
       unsupported-file OF BY-DROPBOX ENDOF
       path-mismatch OF
          construct mutation-rejection path-mismatch
@@ -1991,6 +1993,7 @@ private
       operation-not-allowed OF s" operation_not_allowed" ENDOF
       path-mismatch OF s" path_mismatch" ENDOF
       rejected-by-dropbox OF s" rejected_by_dropbox" ENDOF
+      content-hash-mismatch OF s" content_hash_mismatch" ENDOF
    ;MATCH ;
 
 \ Rust's sync_error: the rejection, logged, blocks the plan.
@@ -2049,6 +2052,7 @@ private
       operation-not-allowed OF why REMOTE-REJECTED ENDOF
       path-mismatch OF why REMOTE-REJECTED ENDOF
       rejected-by-dropbox OF why REMOTE-REJECTED ENDOF
+      content-hash-mismatch OF why REMOTE-REJECTED ENDOF
    ;MATCH ;
 
 \ Rust's persist_remote_block: a block Dropbox or the stage caused

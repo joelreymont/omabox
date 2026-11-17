@@ -872,6 +872,7 @@ $140 constant MODE-NO-WRITE
       operation-not-allowed OF s" operation-not-allowed" ENDOF
       path-mismatch OF s" path-mismatch" ENDOF
       rejected-by-dropbox OF s" rejected-by-dropbox" ENDOF
+      content-hash-mismatch OF s" content-hash-mismatch" ENDOF
    ;MATCH ;
 
 \ The outcome's variant and its state's or rejection's name.
@@ -986,7 +987,7 @@ $140 constant MODE-NO-WRITE
    DROPBOX-ERROR:INSUFFICIENT-SPACE l s" insufficient-space" REJECTS
    DROPBOX-ERROR:LOCKED l s" rejected-by-dropbox" REJECTS
    DROPBOX-ERROR:UNSUPPORTED-FILE l s" rejected-by-dropbox" REJECTS
-   DROPBOX-ERROR:CONTENT-HASH-MISMATCH l s" rejected-by-dropbox" REJECTS
+   DROPBOX-ERROR:CONTENT-HASH-MISMATCH l s" content-hash-mismatch" REJECTS
    DROPBOX-ERROR:PATH-MISMATCH l s" path-mismatch" REJECTS
    DROPBOX-ERROR:OTHER l s" rejected-by-dropbox" REJECTS ;
 
