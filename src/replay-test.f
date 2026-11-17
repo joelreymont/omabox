@@ -13,7 +13,7 @@
 \   directory at one plan's install target blocking only that plan,
 \   logging nothing, the next plan's directory made and its baseline
 \   written.
-\ - MATERIALIZE-LOCAL-CONFLICT, given a staged upload in a fresh sync
+\ - MATERIALIZE-LOCAL-CONFLICT-AT, given a staged upload in a fresh sync
 \   root, answers blocked conflict-copy-occupied for a directory at the
 \   copy's name, logging nothing, or an unreadable file there, and ready
 \   beside a directory elsewhere, and passes up LOCAL's E-IO when the
@@ -75,7 +75,7 @@
 \   eight bad answers are each refused unverified, logged once, the slot
 \   at its checkpoint; a download's progress, then finished, in a status
 \   under TMPDIR.
-\ - MATERIALIZE-REMOTE-CONFLICT downloads the copy once, then is ready
+\ - MATERIALIZE-REMOTE-CONFLICT-AT downloads the copy once, then is ready
 \   with no request; a directory or other bytes at the copy's name
 \   block it conflict-copy-occupied, logging nothing; other bytes at
 \   its stage block it stage-occupied, logged once, with no request.
@@ -791,11 +791,16 @@ $140 constant MODE-NO-WRITE
       source-changed OF s" source-changed" s" " ENDOF
    ;MATCH ;
 
+: OPEN-ROOT ( str -- fd ) str> s" open test sync root" LOCAL:OPEN-ROOT ;
+
 \ The local conflict copy of p, written below the root r.
 : LOCAL-COPY$
    ( str ^u8 n ^LOCAL:staged-upload ^ARENA:arena -- ^u8 n ^u8 n )
    {: r:str p:^ u:n up ar :}
-   r str> p u DISPLAY up ar REPLAY:MATERIALIZE-LOCAL-CONFLICT OUTCOME$ ;
+   r OPEN-ROOT {: root:fd :}
+   [: root r str> p u DISPLAY up ar
+      REPLAY:MATERIALIZE-LOCAL-CONFLICT-AT OUTCOME$ ;]
+   [: root FS:CLOSE-DIR ;] finally ;
 
 : BLOCKED-OCCUPIED ( ^u8 n ^u8 n -- )
    s" conflict-copy-occupied" T$= s" blocked" T$= ;
@@ -827,9 +832,11 @@ $140 constant MODE-NO-WRITE
 \ The copy below dir, which denies writes; LOCAL's E-IO passes up.
 : DENIED-COPY ( str ^LOCAL:staged-upload ^ARENA:arena -- )
    {: r:str up ar :}
-   [: r str> s" dir/notes.txt" DISPLAY up ar
-      REPLAY:MATERIALIZE-LOCAL-CONFLICT drop ;] LOCAL:E-IO TTHROWSQ
-   FS:ERRNO FS:EACCES T= ;
+   r OPEN-ROOT {: root:fd :}
+   [: root r str> s" dir/notes.txt" DISPLAY up ar
+      REPLAY:MATERIALIZE-LOCAL-CONFLICT-AT drop ;] LOCAL:E-IO TTHROWSQ
+   FS:ERRNO FS:EACCES T=
+   root FS:CLOSE-DIR ;
 
 : A-DENIED-OPERATION-AT-THE-COPY-NAME-DOES-NOT-OCCUPY-IT
    ( ^ARENA:arena -- )
@@ -2009,8 +2016,6 @@ CAP BUFFER: TEXT
 : REMOTE-OF ( DROPBOX:hash ^u8 n -- MODEL:remote )
    >str DROPBOX:>REV MODEL-REMOTE:MAKE ;
 
-: OPEN-ROOT ( str -- fd ) str> s" open test sync root" LOCAL:OPEN-ROOT ;
-
 : NO-LEASE ( -- option<LOCAL:download-slot-lease> ) OPTION:NONE ;
 
 \ The case directory d's slot for target t's download of the remote.
@@ -2415,8 +2420,10 @@ variable HELD
 : REMOTE-COPY$
    ( str ^u8 n MODEL:remote ^ARENA:arena -- ^u8 n ^u8 n )
    {: r:str p:^ u:n rem:MODEL:remote ar :}
-   LINK r str> p u DISPLAY rem ar REPLAY:MATERIALIZE-REMOTE-CONFLICT
-   OUTCOME$ ;
+   r OPEN-ROOT {: root:fd :}
+   [: LINK root r str> p u DISPLAY rem ar
+      REPLAY:MATERIALIZE-REMOTE-CONFLICT-AT OUTCOME$ ;]
+   [: root FS:CLOSE-DIR ;] finally ;
 
 : EXACT$ ( REPLAY:exact-copy-outcome -- ^u8 n )
    MATCH REPLAY:exact-copy-outcome

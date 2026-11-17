@@ -948,28 +948,17 @@ private
    drop code FS:ERRNO OCCUPIED? if COPY-OCCUPIED exit then
    code throw ;
 
-\ COPY-IN from the verified upload, which closes after it.
-: COPY-FROM-UPLOAD
+public
+
+\ Writes the staged upload as path's local conflict copy below the open
+\ root, whose path is r.
+: MATERIALIZE-LOCAL-CONFLICT-AT
    ( fd ^u8 n MODEL:path ^LOCAL:staged-upload ^ARENA:arena
      -- copy-outcome )
    {: root:fd r:^ ru:n path:MODEL:path up:^LOCAL:staged-upload
       ar:^ARENA:arena :}
    up ar LOCAL:OPEN-VERIFIED-UPLOAD {: f:fd :}
    [: root r ru path up f ar COPY-IN ;] [: f DISCARD ;] finally ;
-
-public
-
-\ Writes the staged upload as path's local conflict copy below the sync
-\ root, whose absolute path is r; it never overwrites a file.
-: MATERIALIZE-LOCAL-CONFLICT
-   ( ^u8 n MODEL:path ^LOCAL:staged-upload ^ARENA:arena
-     -- copy-outcome )
-   {: r:^ ru:n path:MODEL:path up:^LOCAL:staged-upload
-      ar:^ARENA:arena :}
-   r ru s" open sync root for local conflict" LOCAL:OPEN-ROOT
-   {: root:fd :}
-   [: root r ru path up ar COPY-FROM-UPLOAD ;] [: root DISCARD ;]
-   finally ;
 
 
 \ ---- Dropbox mutations ---------------------------------------------
@@ -1970,11 +1959,9 @@ public
       some OF construct exact-copy-outcome blocked ENDOF
    ;MATCH ;
 
-private
-
-\ Rust's materialize_remote_conflict_at; an occupied copy name or a
-\ path's blocked download blocks the copy, another failure passes up.
-: REMOTE-CONFLICT-AT
+\ Rust's materialize_remote_conflict_at, below the open root at path r;
+\ an occupied name or a blocked download blocks it.
+: MATERIALIZE-REMOTE-CONFLICT-AT
    ( ^link fd ^u8 n MODEL:path MODEL:remote ^ARENA:arena
      -- copy-outcome )
    {: k root:fd r:^ ru:n path rem ar :}
@@ -1985,18 +1972,6 @@ private
    code 0= if exit then
    drop code FS:ERRNO NAME-HELD? if COPY-OCCUPIED exit then
    code throw ;
-
-public
-
-\ Writes the remote's bytes as path's remote conflict copy below the
-\ sync root, whose absolute path is r; it never overwrites a file.
-: MATERIALIZE-REMOTE-CONFLICT
-   ( ^link ^u8 n MODEL:path MODEL:remote ^ARENA:arena -- copy-outcome )
-   {: k r:^ ru:n path rem ar :}
-   r ru s" open sync root for remote conflict" LOCAL:OPEN-ROOT
-   {: root:fd :}
-   [: k root r ru path rem ar REMOTE-CONFLICT-AT ;] [: root DISCARD ;]
-   finally ;
 
 
 \ ---- remote replay -------------------------------------------------
@@ -2253,14 +2228,14 @@ ENUM file-mutation add replace ;ENUM
 \ The upload's bytes as the run's local conflict copy.
 : KEEP-LOCAL ( ^LOCAL:staged-upload ^pass -- option<replay-blocked> )
    {: up r :}
-   r RUN-ROOT r RUN-PATH up r PASS-ARENA @ COPY-FROM-UPLOAD
-   r UNPLACED-COPY ;
+   r RUN-ROOT r RUN-PATH up r PASS-ARENA @
+   MATERIALIZE-LOCAL-CONFLICT-AT r UNPLACED-COPY ;
 
 \ The remote's bytes as the run's remote conflict copy.
 : KEEP-REMOTE ( MODEL:remote ^pass -- option<replay-blocked> )
    {: rem r :}
    r PASS-LINK @ r RUN-ROOT r RUN-PATH rem r PASS-ARENA @
-   REMOTE-CONFLICT-AT r UNPLACED-COPY ;
+   MATERIALIZE-REMOTE-CONFLICT-AT r UNPLACED-COPY ;
 
 : LOCAL-SIDE ( ^LOCAL:staged-upload -- MODEL:local )
    LOCAL:UPLOAD-CONTENT MODEL-LOCAL:MAKE ;

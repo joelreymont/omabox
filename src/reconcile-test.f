@@ -180,6 +180,9 @@
 \ The root and exclusions against the fake Dropbox, Rust's tests of the
 \ same names:
 \ - replaced_local_root_never_replays_pending_deletion
+\ - NEW-CONFLICT-ANSWERS-A-REPLACED-ROOT: NEW-CONFLICT, the root replaced
+\   after its file is written, answers root-changed, recording no conflict
+\   and copying nothing into the replacement.
 \ - rejected_paths_do_not_stop_unrelated_sync_or_report_progress, with
 \   replayed 2 as its download installs in the pass, and no account
 \   request
@@ -5818,6 +5821,31 @@ TYPED-VARIABLE RACED str
    TEST-DROPBOX:SEEN$ s" " T$=
    d x STEP-GONE ;
 
+: EVENT$ ( pass-event -- ^u8 n )
+   MATCH pass-event
+      ok OF s" ok" ENDOF
+      fresh OF s" fresh" ENDOF
+      root-changed OF s" root-changed" ENDOF
+   ;MATCH ;
+
+: NEW-CONFLICT-ANSWERS-A-REPLACED-ROOT ( ^ARENA:arena -- )
+   {: ar :}
+   s" new conflict answers a replaced root" T-LABEL
+   ar STEP-RUN {: d:str x :}
+   x s" c-diverged.txt" IN-ROOT str> DIVERGED-LOCAL$ FS:WRITE-ALL
+   DIVERGED-LOCAL$ ar IDENTITY MODEL-LOCAL:MAKE
+   DIVERGED-REMOTE$ s" rev-remote-conflict" ar REMOTE-FILE
+   MODEL-CONFLICT:DIVERGENT {: c :}
+   d x REPLACED-ROOT
+   x s" c-diverged.txt" IN-ROOT str> DIVERGED-LOCAL$ FS:WRITE-ALL
+   x ar [type] MODEL:local-record NEW-VECTOR NEW-PLANNING {: pl :}
+   pl s" c-diverged.txt" ar CANONICAL s" c-diverged.txt" DISPLAY c
+   NEW-CONFLICT EVENT$ s" root-changed" T$=
+   x NO-CONFLICT-RECORD
+   x ROOT$ S\" c-diverged.txt\nkeep.txt" NAMES-ARE
+   d s" old-root/c-diverged.txt" ar INSIDE DIVERGED-LOCAL$ HOLDS-BYTES
+   d x STEP-GONE ;
+
 : INVALID-NAME$ ( -- ^u8 n ) s\" invalid-\xFF.txt" ;
 : INVALID-BYTES$ ( -- ^u8 n ) s" invalid path bytes" ;
 : REJECTED-BYTES$ ( -- ^u8 n ) s" rejected bytes" ;
@@ -6198,6 +6226,7 @@ TYPED-VARIABLE RACED str
 : ROOT-AND-EXCLUSIONS-CASES ( ^ARENA:arena -- )
    {: ar :}
    ar REPLACED-LOCAL-ROOT-NEVER-REPLAYS-PENDING-DELETION
+   ar NEW-CONFLICT-ANSWERS-A-REPLACED-ROOT
    ar REJECTED-PATHS-DO-NOT-STOP-UNRELATED-SYNC-OR-REPORT-PROGRESS
    ar DOCUMENTED-EXCLUSIONS-PRESERVE-PAYLOADS-WHILE-ORDINARY-SIBLINGS-SYNC
    ar EXCLUDED-PENDING-AND-BLOCKED-WORK-IS-RETIRED-ACROSS-REOPEN-WITHOUT-EFFECTS ;

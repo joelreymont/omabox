@@ -2179,12 +2179,12 @@ ENUM prepared ready fresh ;ENUM
 \ The local copy from the prepared stage; another entry at the stage
 \ path blocks it.
 : STAGED-COPY
-   ( prepared-upload ^run MODEL:path -- REPLAY:copy-outcome )
-   {: r path :}
+   ( prepared-upload ^run fd MODEL:path -- REPLAY:copy-outcome )
+   {: r root:fd path :}
    MATCH prepared-upload
       ready OF
-         {: stage :} r ROOT$ path stage r RUN-ARENA @
-         REPLAY:MATERIALIZE-LOCAL-CONFLICT
+         {: stage :} root r ROOT$ path stage r RUN-ARENA @
+         REPLAY:MATERIALIZE-LOCAL-CONFLICT-AT
       ENDOF
       fresh OF REPLAY-COPY--OUTCOME:SOURCE-CHANGED ENDOF
       occupied OF
@@ -2194,36 +2194,48 @@ ENUM prepared ready fresh ;ENUM
 
 \ The conflict's local copy, ready when it has no local side.
 : LOCAL-SIDE
-   ( ^run MODEL:path MODEL:conflict -- REPLAY:copy-outcome )
-   {: r path c :}
+   ( ^run fd MODEL:path MODEL:conflict -- REPLAY:copy-outcome )
+   {: r root:fd path c :}
    c CONFLICT-LOCAL MATCH option
       none OF REPLAY-COPY--OUTCOME:READY ENDOF
       some OF
          MODEL-LOCAL:UNMAKE {: want :}
-         r path want PREPARE-LOCAL r path STAGED-COPY
+         r path want PREPARE-LOCAL r root path STAGED-COPY
       ENDOF
    ;MATCH ;
 
 \ The conflict's remote copy, ready when it has no remote side.
 : REMOTE-SIDE
-   ( ^run MODEL:path MODEL:conflict -- REPLAY:copy-outcome )
-   {: r path c :}
+   ( ^run fd MODEL:path MODEL:conflict -- REPLAY:copy-outcome )
+   {: r root:fd path c :}
    c CONFLICT-REMOTE MATCH option
       none OF REPLAY-COPY--OUTCOME:READY ENDOF
       some OF
-         {: rem :} r RUN-LINK @ r ROOT$ path rem r RUN-ARENA @
-         REPLAY:MATERIALIZE-REMOTE-CONFLICT
+         {: rem :} r RUN-LINK @ root r ROOT$ path rem
+         r RUN-ARENA @ REPLAY:MATERIALIZE-REMOTE-CONFLICT-AT
       ENDOF
    ;MATCH ;
 
-\ Rust's prepare_conflict: the local copy first, then the remote one.
-: PREPARE-CONFLICT
-   ( ^run MODEL:path MODEL:conflict -- REPLAY:copy-outcome )
-   {: r path c :}
-   r path c LOCAL-SIDE MATCH REPLAY:copy-outcome
-      ready OF r path c REMOTE-SIDE ENDOF
+: CONFLICT-BELOW
+   ( ^run fd MODEL:path MODEL:conflict -- REPLAY:copy-outcome )
+   {: r root:fd path c :}
+   r root path c LOCAL-SIDE MATCH REPLAY:copy-outcome
+      ready OF r root path c REMOTE-SIDE ENDOF
       blocked OF REPLAY-COPY--OUTCOME:BLOCKED ENDOF
       source-changed OF REPLAY-COPY--OUTCOME:SOURCE-CHANGED ENDOF
+   ;MATCH ;
+
+\ Rust's prepare_conflict: the local copy first, then the remote one,
+\ below the active root; none if the root changed.
+: PREPARE-CONFLICT
+   ( ^run MODEL:path MODEL:conflict -- option<REPLAY:copy-outcome> )
+   {: r path c :}
+   r RUN-JOURNAL @ r ROOT$ LOCAL:OPEN-ACTIVE-ROOT MATCH option
+      none OF OPTION:NONE ENDOF
+      some OF {: root:fd :}
+         [: r root path c CONFLICT-BELOW OPTION:SOME ;]
+         [: root FS:CLOSE-DIR ;] finally
+      ENDOF
    ;MATCH ;
 
 \ Rust's PreparedDirectoryCollision; root-changed is its
@@ -3271,10 +3283,9 @@ ARENA PLANNINGS planning
    op ops VEC:PUSH !
    ops JOURNAL-OPERATION--PLAN:MAKE ;
 
-\ What a live plan leaves its path's decision: held, settled for this
-\ pass; superseded, decided afresh; fresh, Rust's
-\ FreshObservationRequired.
-ENUM live-step held superseded fresh ;ENUM
+\ What a live plan leaves its path's decision: held, settled this pass;
+\ superseded, decided afresh; fresh and root-changed, as pass-event's.
+ENUM live-step held superseded fresh root-changed ;ENUM
 
 : STATUS-OF ( JOURNAL:plan-record -- JOURNAL:plan-status )
    JOURNAL-PLAN--RECORD:UNMAKE {: id p ops s :} s ;
@@ -3342,16 +3353,10 @@ ENUM live-step held superseded fresh ;ENUM
       blocked OF ENDOF
    ;MATCH ;
 
-\ A live plan's conflict: one whose copy waits is held; a prepared one
-\ completes the plan, which settles the path without holding it.
-: LIVE-CONFLICT
-   ( ^planning MODEL:key MODEL:path JOURNAL:plan-record
+: LIVE-COPIES
+   ( REPLAY:copy-outcome ^planning MODEL:key JOURNAL:plan-record
      MODEL:conflict -- live-step )
-   {: pl k path plan c :}
-   plan pl PLANNING-NOW @ COPY-WAITS? if
-      pl k HELD+ construct live-step held exit
-   then
-   pl PLANNING-RUN @ path c PREPARE-CONFLICT
+   {: pl k plan c :}
    MATCH REPLAY:copy-outcome
       ready OF
          pl plan c FINISH-PENDING-CONFLICT
@@ -3362,6 +3367,20 @@ ENUM live-step held superseded fresh ;ENUM
          pl k HELD+ construct live-step held
       ENDOF
       source-changed OF construct live-step fresh ENDOF
+   ;MATCH ;
+
+\ A live plan's conflict: one whose copy waits is held; a prepared one
+\ completes the plan, which settles the path without holding it.
+: LIVE-CONFLICT
+   ( ^planning MODEL:key MODEL:path JOURNAL:plan-record
+     MODEL:conflict -- live-step )
+   {: pl k path plan c :}
+   plan pl PLANNING-NOW @ COPY-WAITS? if
+      pl k HELD+ construct live-step held exit
+   then
+   pl PLANNING-RUN @ path c PREPARE-CONFLICT MATCH option
+      none OF construct live-step root-changed ENDOF
+      some OF pl k plan c LIVE-COPIES ENDOF
    ;MATCH ;
 
 \ A recorded remote directory delete rests on an inventory that showed
@@ -3434,13 +3453,10 @@ ENUM live-step held superseded fresh ;ENUM
       fresh OF construct pass-event fresh ENDOF
    ;MATCH ;
 
-\ A recorded conflict was prepared once; its copies now belong to the
-\ user, who may edit, move, or delete them.
-: NEW-CONFLICT
-   ( ^planning MODEL:key MODEL:path MODEL:conflict -- pass-event )
+: NEW-COPIES
+   ( REPLAY:copy-outcome ^planning MODEL:key MODEL:path MODEL:conflict
+     -- pass-event )
    {: pl k path c :}
-   pl k c CONFLICT-RECORDED? if construct pass-event ok exit then
-   pl PLANNING-RUN @ path c PREPARE-CONFLICT
    MATCH REPLAY:copy-outcome
       ready OF
          pl JOURNAL-OF path c pl ARENA-OF JOURNAL:RECORD-CONFLICT drop
@@ -3448,6 +3464,17 @@ ENUM live-step held superseded fresh ;ENUM
       ENDOF
       blocked OF drop pl k HELD+ construct pass-event ok ENDOF
       source-changed OF construct pass-event fresh ENDOF
+   ;MATCH ;
+
+\ A recorded conflict was prepared once; its copies now belong to the
+\ user, who may edit, move, or delete them.
+: NEW-CONFLICT
+   ( ^planning MODEL:key MODEL:path MODEL:conflict -- pass-event )
+   {: pl k path c :}
+   pl k c CONFLICT-RECORDED? if construct pass-event ok exit then
+   pl PLANNING-RUN @ path c PREPARE-CONFLICT MATCH option
+      none OF construct pass-event root-changed ENDOF
+      some OF pl k path c NEW-COPIES ENDOF
    ;MATCH ;
 
 \ A collision whose copy is blocked holds its path and its subtree.
@@ -3485,6 +3512,7 @@ ENUM live-step held superseded fresh ;ENUM
       held OF construct pass-event ok ENDOF
       superseded OF pl pd NEW-DECISION ENDOF
       fresh OF construct pass-event fresh ENDOF
+      root-changed OF construct pass-event root-changed ENDOF
    ;MATCH ;
 
 : DECISION-KEY ( path-decision -- MODEL:key )
