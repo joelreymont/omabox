@@ -830,9 +830,9 @@ private
 
 \ ---- the operation's machine
 
-\ One local operation's replay: a completed operation passes; a pending
-\ one is applied, and passes or stops its plan. APPLY's steps are
-\ formal/MutationLifecycle.tla's.
+\ One local operation's replay, after formal/LocalLifecycle.tla: a
+\ completed operation passes; a pending one is applied, and passes or
+\ stops its plan. APPLY's steps are formal/MutationLifecycle.tla's.
 FSM:DEFINE LOCAL-LIFECYCLE ( ^pass ) local-state apply-event
    IN recorded  STATUS ( JOURNAL:record-status )
       completed  -  >passed

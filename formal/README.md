@@ -11,6 +11,16 @@ baseline completion. It verifies that changed user content is never mutated,
 only verified bytes are installed, and no displacement guard survives a
 completed operation.
 
+`LocalLifecycle` checks one pending plan's local replay, whose steps are
+`LOCAL-LIFECYCLE`'s lines. Each pass runs the plan's operations in order,
+passing a completed one, applying a pending one, and stopping the plan at a
+block, which may retire it. A non-final operation completes at once; the final
+one's completion waits for the pass's commit and a crash loses it. It requires
+that only a plan's first pending operation is applied, so the journal accepts
+every completion the pass asks for, and that the baseline advances only with
+the final operation's completion after an apply confirmed its effect.
+`MutationLifecycle` models what an apply does.
+
 `DownloadExecutor` checks the bounded worker queue around that lifecycle. It
 covers slot exclusivity, failure cancellation, preservation of successful
 stages, crash recovery, retry, installation, and journal completion. It also
@@ -64,6 +74,7 @@ checker on PATH:
 ```sh
 tlc -config DownloadLifecycle.cfg DownloadLifecycle.tla
 tlc -config MutationLifecycle.cfg MutationLifecycle.tla
+tlc -config LocalLifecycle.cfg LocalLifecycle.tla
 tlc -config DownloadExecutor.cfg DownloadExecutor.tla
 tlc -config ScanCoordination.cfg ScanCoordination.tla
 tlc -config SyncBehavior.cfg SyncBehavior.tla
@@ -72,11 +83,13 @@ tlc -config InventoryPublication.cfg InventoryPublication.tla
 tlc -config DirectoryDeletion.cfg DirectoryDeletion.tla
 ```
 
-`src/reconcile-test.f` holds `InventoryPublicationTable.tla`,
-`DownloadExecutorTable.tla` and `SyncPassTable.tla` to their tables' lines,
-`INVENTORY-PUBLICATION`'s, `DOWNLOAD-EXECUTOR`'s and `SYNC-PASS`'s, and runs
-TLC on each `Follows` module, which states that its model's steps follow that
-table.
+Each table's check, in its package's tests, holds `<Model>Table.tla` to the
+table's lines and runs TLC on `<Model>Follows.tla`, which states that the
+model's steps follow that table:
+
+- `src/reconcile-test.f`: `INVENTORY-PUBLICATION` (`InventoryPublication`),
+  `DOWNLOAD-EXECUTOR` (`DownloadExecutor`) and `SYNC-PASS` (`SyncPass`);
+- `src/replay-test.f`: `LOCAL-LIFECYCLE` (`LocalLifecycle`).
 
 Same- and cross-filesystem promotion share one durable abstract boundary; TLC
 checks crashes immediately before and after it. Dropbox transport and concrete

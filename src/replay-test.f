@@ -107,6 +107,8 @@
 \   a pass over two plans, the first blocked at its delete, sends none of
 \   its later operations and completes the second; a directory at a
 \   replace's stage holds its plan stage-occupied, in the report.
+\ - LOCAL-LIFECYCLE's lines are formal/LocalLifecycleTable.tla's, and
+\   TLC finds formal/LocalLifecycle.tla's steps follow them.
 \ Run from the repository root: hb --load src/replay-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -131,6 +133,7 @@ require src/test-journal.f
 require src/local.f
 require src/status.f
 require src/replay.f
+require src/test-formal.f
 require src/test-client.f
 
 \ REPLAY reopened for the private words the tests call.
@@ -3544,6 +3547,15 @@ variable SIDES
    [: CURL:LOOP-STOP AIO:STOP ;] finally ;
 
 
+\ ---- the local table against its model
+
+: FORMAL-HOLDS-THE-LOCAL-TABLE ( ^ARENA:arena -- )
+   {: ar :}
+   s" formal holds the local table" T-LABEL
+   s" src/replay.f" s" LOCAL-LIFECYCLE" s" LocalLifecycle" ar
+   TEST-FORMAL:HOLDS ;
+
+
 : CASES ( ^ARENA:arena -- )
    {: ar :}
    ar RETIRE-EXCLUDED-PLANS-SUPERSEDES-ONLY-EXCLUDED-PLANS
@@ -3560,7 +3572,8 @@ variable SIDES
    ar DOWNLOAD-FAILURES-SEPARATE-PATH-BLOCKS-FROM-GLOBAL-ERRORS
    UPLOAD-SIZE-STOPS-AT-THE-SESSION-LIMIT
    ar REMOTE-REPLAY-CASES
-   ar DROPBOX-CASES ;
+   ar DROPBOX-CASES
+   ar FORMAL-HOLDS-THE-LOCAL-TABLE ;
 
 
 : RUN ( -- )
