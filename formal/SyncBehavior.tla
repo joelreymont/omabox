@@ -78,11 +78,11 @@ Wake ==
           observedLocal, observedRemote, uploadVerified, downloadVerified,
           localCopy, remoteCopy, conflictRecorded>>
 
-BeginPlan(nextPlan, nextPhase) ==
+BeginPlan(nextPlan, nextPhase, nextJournal) ==
     /\ phase = "Observing"
     /\ plan' = nextPlan
     /\ phase' = nextPhase
-    /\ journal' = "Pending"
+    /\ journal' = nextJournal
     /\ observedLocal' = local
     /\ observedRemote' = remote
     /\ uploadVerified' = FALSE
@@ -95,31 +95,31 @@ PlanUpload ==
     /\ local # "Absent"
     /\ local # baseline
     /\ remote = baseline
-    /\ BeginPlan("Upload", "Staging")
+    /\ BeginPlan("Upload", "Staging", journal)
 
 PlanDownload ==
     /\ remote # "Absent"
     /\ remote # baseline
     /\ local = baseline
-    /\ BeginPlan("Download", "Staging")
+    /\ BeginPlan("Download", "Staging", "Pending")
 
 PlanDeleteRemote ==
     /\ baseline # "Absent"
     /\ local = "Absent"
     /\ remote = baseline
-    /\ BeginPlan("DeleteRemote", "Applying")
+    /\ BeginPlan("DeleteRemote", "Applying", "Pending")
 
 PlanDeleteLocal ==
     /\ baseline # "Absent"
     /\ remote = "Absent"
     /\ local = baseline
-    /\ BeginPlan("DeleteLocal", "Applying")
+    /\ BeginPlan("DeleteLocal", "Applying", "Pending")
 
 PlanConflict ==
     /\ local # remote
     /\ local # baseline
     /\ remote # baseline
-    /\ BeginPlan("Conflict", "Materializing")
+    /\ BeginPlan("Conflict", "Materializing", journal)
 
 PlanNoOp ==
     /\ phase = "Observing"
@@ -150,8 +150,9 @@ StageUpload ==
     /\ local = observedLocal
     /\ uploadVerified' = TRUE
     /\ phase' = "Applying"
+    /\ journal' = "Pending"
     /\ UNCHANGED
-        <<scenario, local, remote, baseline, plan, journal,
+        <<scenario, local, remote, baseline, plan,
           observedLocal, observedRemote, downloadVerified,
           localCopy, remoteCopy, conflictRecorded>>
 
@@ -171,11 +172,11 @@ RetireStaleUpload ==
     /\ local # observedLocal
     /\ plan' = "None"
     /\ phase' = "Observing"
-    /\ journal' = "Completed"
     /\ uploadVerified' = FALSE
     /\ UNCHANGED
-        <<scenario, local, remote, baseline, observedLocal, observedRemote,
-          downloadVerified, localCopy, remoteCopy, conflictRecorded>>
+        <<scenario, local, remote, baseline, journal,
+          observedLocal, observedRemote, downloadVerified,
+          localCopy, remoteCopy, conflictRecorded>>
 
 StageDownload ==
     /\ phase = "Staging"
@@ -335,9 +336,9 @@ TypeOK ==
     /\ remoteCopy \in Contents \cup {NoContent}
     /\ conflictRecorded \in BOOLEAN
 
+\* A staged upload is private, and a conflict is recorded only once its copies exist.
 JournalAuthorizesEffects ==
-    (phase \in {"Staging", "Applying", "Materializing", "Finishing"}) =>
-        journal = "Pending"
+    phase \in {"Applying", "Finishing"} => journal = "Pending"
 
 VerifiedTransfersOnly ==
     /\ (phase = "Finishing" /\ plan = "Upload") => uploadVerified
