@@ -86,9 +86,12 @@ watcher comes only for a measured need.
   denies it and why. One word, `REPLAY:DOWNLOAD-BLOCKAGE`, classifies every
   Dropbox answer that fails a download. One table maps each code and
   `DROPBOX:reply` to a disposition and status text.
-- **Machines.** `RECONCILE:PASS`, its listing and its one download, and a
-  `REPLAY` operation are `fsm.f` tables named after their `formal/` models.
-  `DAEMON:RUN` is an `fsm.f` table with no model.
+- **Machines.** `RECONCILE:PASS`, its listing and its one download, a
+  `REPLAY` operation, `DAEMON:RUN`, `SERVICE`'s drive and `DROPBOX`'s
+  download and upload session are `fsm.f` tables. Of the `formal/` models,
+  `InventoryPublication` describes the listing's table, `DownloadExecutor`
+  the download's apart from its root check, and `MutationLifecycle` what a
+  local operation's apply does; the other tables have none.
 - **`RECONCILE:PASS`** answers `complete` with its counts, `fresh` (rescan) or
   `root-changed`; a Dropbox answer that ends it is in the link, as `REPLAY`'s.
   `DAEMON` validates the account, not the pass. Apart from Rust, a download

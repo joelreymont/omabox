@@ -30,7 +30,8 @@ rewrite and `JOURNAL.md` records it.
   merges, so it never drifts far from `master`.
 - Before landing, run the tests (`src/*-test.f`) of every package the change
   touches.
-- Run the relevant TLC model after changing durable replay or concurrency.
+- With the user's approval, run the relevant TLC model after changing
+  durable replay or concurrency.
 - Keep real Dropbox tests opt-in and separate from unit tests.
 - Classify and test every external/filesystem failure. Repeated bad input must
   neither crash-loop nor stop unrelated work.

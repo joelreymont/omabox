@@ -830,9 +830,9 @@ private
 
 \ ---- the operation's machine
 
-\ One local operation's replay, after formal/MutationLifecycle.tla:
-\ a completed operation passes; a pending one is applied, and passes
-\ or stops its plan.
+\ One local operation's replay: a completed operation passes; a pending
+\ one is applied, and passes or stops its plan. APPLY's steps are
+\ formal/MutationLifecycle.tla's.
 FSM:DEFINE LOCAL-LIFECYCLE ( ^pass ) local-state apply-event
    IN recorded  STATUS ( JOURNAL:record-status )
       completed  -  >passed
@@ -2590,8 +2590,8 @@ ENUM remote-event done blocked local ;ENUM
    r PASS-BLOCKED @ r PERSIST-REMOTE-BLOCK
    r PASS-REPORT @ REPLAY-REPLAY--REPORT:BLOCKED @ VEC:PUSH ! ;
 
-\ One remote operation's replay, after formal/MutationLifecycle.tla:
-\ a completed one passes; a pending one is applied, or yields if local.
+\ One remote operation's replay: a completed one passes; a pending one
+\ is applied, or yields if local.
 FSM:DEFINE REMOTE-LIFECYCLE ( ^pass ) remote-state remote-event
    IN recorded  STATUS ( JOURNAL:record-status )
       completed  -  >passed

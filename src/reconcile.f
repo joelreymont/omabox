@@ -2728,10 +2728,10 @@ ENUM root-check active changed ;ENUM
       construct root-check changed
    then ;
 
-\ One download, after formal/DownloadExecutor.tla: a staged download
-\ is installed only while its root is still the active one; otherwise
-\ it stays staged and its plan pending. A blocked one is held; any
-\ other failure passes up.
+\ One download, after formal/DownloadExecutor.tla, which has no root:
+\ a staged download is installed only while its root is still the
+\ active one; otherwise it stays staged and its plan pending. A blocked
+\ one is held; any other failure passes up.
 FSM:DEFINE DOWNLOAD-EXECUTOR ( ^download ) download-state fetched
    IN queued  FETCH
       staged   -  >staged
@@ -3801,8 +3801,8 @@ ENUM pass-state DERIVE eq
    x PASS-RUN @ STAGING$ [: kept RETAINED? ;] x ARENA@
    LOCAL:REMOVE-UNREFERENCED-UPLOAD-STAGES drop ;
 
-\ One pass, after formal/SyncBehavior.tla. A pass that ends early
-\ leaves the journal's plans for the next pass to replay.
+\ One pass. A pass that ends early leaves the journal's plans for the
+\ next pass to replay.
 FSM:DEFINE SYNC-BEHAVIOR ( ^pass ) pass-state pass-event
    IN settling  SETTLE-PUBLISHED
       ok            -  >recovering
