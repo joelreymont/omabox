@@ -454,6 +454,7 @@ private
 : STARTED ( ^client -- CURL:handle )
    {: c :}
    0 c CLIENT-STATUS ! 0 c CLIENT-FAILURE !
+   EMPTY c CLIENT-OUTER ! EMPTY c CLIENT-LEAF-NAME ! EMPTY c CLIENT-LEAF !
    c CLIENT-ANSWER @ BUF:CLEAR
    s" body" SPAN:MAKE c CLIENT-HOLDS !
    c CLIENT-HEADS @ BUF:CLEAR
@@ -2449,16 +2450,30 @@ private
    LOG-OPEN E-ROOT-PATH ERROR:TEXT$ LOG:TEXT+ LOG:;LINE
    E-ROOT-PATH throw ;
 
-\ Rust's "Dropbox operation `op` failed" line for c's last call: its
-\ route and status, or that the route got no answer.
+public
+
+\ Appends c's last call to the open log line: its route, then the status
+\ Dropbox answered and the error's tag, or that it got no answer and why.
+: LAST-CALL+ ( ^client -- )
+   {: c :}
+   c CLIENT-ROUTE @ SPAN:$ LOG:TEXT+
+   c CLIENT-STATUS @ {: s:n :}
+   s 0= if
+      s"  got no answer" LOG:TEXT+
+      c CLIENT-FAILURE @ {: f:n :}
+      f 0<> if s" : " LOG:TEXT+ f CURL:>CODE CURL:ERROR$ LOG:TEXT+ then
+   else
+      s"  answered " LOG:TEXT+ s LOG:INT+
+      c TAG$ nip 0<> if s" : " LOG:TEXT+ c LEAF$ LOG:TEXT+ then
+   then ;
+
+private
+
+\ Rust's "Dropbox operation `op` failed" line, then c's last call.
 : OP-FAILED ( ^client ^u8 n -- )
    {: c op:^ ou:n :}
    LOG-OPEN s" Dropbox operation `" LOG:TEXT+ op ou LOG:TEXT+
-   s" ` failed: " LOG:TEXT+ c CLIENT-ROUTE @ SPAN:$ LOG:TEXT+
-   c CLIENT-STATUS @ {: s:n :}
-   s 0= if s"  got no answer" LOG:TEXT+
-   else s"  answered " LOG:TEXT+ s LOG:INT+ then
-   LOG:;LINE ;
+   s" ` failed: " LOG:TEXT+ c LAST-CALL+ LOG:;LINE ;
 
 public
 

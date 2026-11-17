@@ -2827,7 +2827,7 @@ TYPED-VARIABLE FAULT fault
 : LINK-REJECTS-UNAVAILABLE-FILE-AND-RESTRICTED-ROOTS ( -- )
    s" link_rejects_unavailable_file_and_restricted_roots" T-LABEL
    false OUTCOME ! [: NOT-FOUND-LINKED ;] LOGGED 0 T= OUTCOME @ TTRUE
-   s" files/get_metadata answered 409" LOGGED? TTRUE
+   s" files/get_metadata answered 409: not_found" LOGGED? TTRUE
    200 [: ROOT-FILE$ ;] ROOT-LINKED CHECK$ s" not-folder" T$=
    200 [: s" no_access" RESTRICTED$ ;] ROOT-LINKED CHECK$
    s" restricted" T$=
@@ -2873,6 +2873,24 @@ TYPED-VARIABLE FAULT fault
    s" /2/users/get_current_account"
    s" Dropbox operation `inspect authorized Dropbox account` failed: users/get_current_account answered 503"
    FAILED-LINKED ;
+
+
+\ One client's root check answers 409 not_found, then 503: the 503's
+\ line names no tag left from the 409.
+: UNTAGGED-AFTER-TAGGED-CASE ( -- )
+   s" a 503 after a 409 names no tag" T-LABEL
+   LINKABLE {: c :}
+   s" /2/files/get_metadata" 409 s" " s" " NOT-FOUND$
+   TEST-DROPBOX:ROUTE-SCRIPT!
+   s" /2/files/get_metadata" 503 s" " s" " s" " TEST-DROPBOX:ROUTE-SCRIPT!
+   c OWN !
+   [: LINK-FAILED ;] LOGGED 0 T=
+   S\" files/get_metadata answered 409: not_found\n" LOGGED? TTRUE
+   [: s" /Sync" OWN @ DROPBOX:METADATA UNLINKED? drop
+      LOG:ERROR s" test" LOG:LINE OWN @ DROPBOX:LAST-CALL+ LOG:;LINE ;]
+   LOGGED 0 T=
+   S\" files/get_metadata answered 503\n" LOGGED? TTRUE
+   c DROPBOX:CLOSE ;
 
 
 \ Rust's GetMetadataArg asks for no deleted entry, so a deleted root is
@@ -2931,7 +2949,8 @@ TYPED-VARIABLE FAULT fault
    s" " TEST-DROPBOX:ROOT!
    VALID-LINK-CASE
    LINK-REJECTS-UNAVAILABLE-FILE-AND-RESTRICTED-ROOTS UNBOUND-LINK-CASE
-   FAILED-LINK-CASE UNDELETED-ROOT-CASE ELSEWHERE-ROOT-CASE
+   FAILED-LINK-CASE UNTAGGED-AFTER-TAGGED-CASE
+   UNDELETED-ROOT-CASE ELSEWHERE-ROOT-CASE
    INVALID-ROOT-CASE
    s" ns-root" TEST-DROPBOX:ROOT! ;
 

@@ -842,12 +842,18 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
    DISPOSITION@ STOPS? if construct wait-event stop exit then
    construct wait-event retry ;
 
+\ For a pass a Dropbox answer ended, the call that answered.
+: CALL+ ( ^run -- )
+   {: x :}
+   x RUN-CODE @ REPLAY:E-DROPBOX <> if exit then
+   s" ; " LOG:TEXT+ x CLIENT@ DROPBOX:LAST-CALL+ ;
+
 : RETRY-LOGGED ( n ^run -- )
    {: ms x :}
    LOG:WARN s" daemon" LOG:LINE
    s" daemon operation failed; retrying in process seconds=" LOG:TEXT+
    ms 1000 / LOG:INT+ s"  error=" LOG:TEXT+ x TEXT@ str> LOG:TEXT+
-   x RUN-CODE @ CAUSE+ LOG:;LINE ;
+   x RUN-CODE @ CAUSE+ x CALL+ LOG:;LINE ;
 
 \ Rust's wait_for_failure for a failure that does not stop.
 : WAITED ( ^run -- )
@@ -864,7 +870,7 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
    x TEXT@ x STATUS@ STATUS:STOPPED
    LOG:ERROR s" daemon" LOG:LINE
    s" daemon stopped: " LOG:TEXT+ x TEXT@ str> LOG:TEXT+
-   x RUN-CODE @ CAUSE+ LOG:;LINE ;
+   x RUN-CODE @ CAUSE+ x CALL+ LOG:;LINE ;
 
 : EXIT-STATUS ( ^run -- n ) DISPOSITION@ EXIT-CODE ;
 
