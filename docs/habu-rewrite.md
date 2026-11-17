@@ -125,4 +125,5 @@ watcher comes only for a measured need.
 6. `DAEMON` and `omaboxd`.
 7. Cutover of the daemon; the Rust CLI keeps working. Reinstalling the Rust
    `omaboxd` is the way back.
-8. CLI, installer, service.
+8. CLI and service; an Arch package installs them in place of Rust's
+   installer.
