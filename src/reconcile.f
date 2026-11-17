@@ -2728,10 +2728,10 @@ ENUM root-check active changed ;ENUM
       construct root-check changed
    then ;
 
-\ One download, after formal/DownloadExecutor.tla, which has no root:
-\ a staged download is installed only while its root is still the
-\ active one; otherwise it stays staged and its plan pending. A blocked
-\ one is held; any other failure passes up.
+\ One download, after formal/DownloadExecutor.tla: a staged download is
+\ installed only while its root is still the active one; otherwise it
+\ stays staged and its plan pending. A blocked one is held; any other
+\ failure passes up.
 FSM:DEFINE DOWNLOAD-EXECUTOR ( ^download ) download-state fetched
    IN queued  FETCH
       staged   -  >staged

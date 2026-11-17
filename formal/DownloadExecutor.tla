@@ -15,9 +15,11 @@ JobStates == {
 }
 PlanStates == {"Pending", "Blocked", "Completed"}
 
-VARIABLES job, plan, workerPath, slotPath, cancelled, failure, running
+VARIABLES job, plan, workerPath, slotPath, cancelled, failure, running,
+    rootActive
 
-vars == <<job, plan, workerPath, slotPath, cancelled, failure, running>>
+vars == <<job, plan, workerPath, slotPath, cancelled, failure, running,
+    rootActive>>
 
 Init ==
     /\ job = [path \in Paths |-> "Pending"]
@@ -27,6 +29,7 @@ Init ==
     /\ cancelled = FALSE
     /\ failure = FALSE
     /\ running = TRUE
+    /\ rootActive = TRUE
 
 Queue(path) ==
     /\ running
@@ -34,7 +37,8 @@ Queue(path) ==
     /\ plan[path] = "Pending"
     /\ job[path] = "Pending"
     /\ job' = [job EXCEPT ![path] = "Queued"]
-    /\ UNCHANGED <<plan, workerPath, slotPath, cancelled, failure, running>>
+    /\ UNCHANGED <<plan, workerPath, slotPath, cancelled, failure, running,
+        rootActive>>
 
 Start(path, worker, slot) ==
     /\ running
@@ -45,7 +49,7 @@ Start(path, worker, slot) ==
     /\ job' = [job EXCEPT ![path] = "Active"]
     /\ workerPath' = [workerPath EXCEPT ![worker] = path]
     /\ slotPath' = [slotPath EXCEPT ![slot] = path]
-    /\ UNCHANGED <<plan, cancelled, failure, running>>
+    /\ UNCHANGED <<plan, cancelled, failure, running, rootActive>>
 
 Release(path) ==
     /\ workerPath' = [worker \in Workers |->
@@ -58,7 +62,7 @@ FinishSuccess(path) ==
     /\ job[path] = "Active"
     /\ job' = [job EXCEPT ![path] = "Staged"]
     /\ Release(path)
-    /\ UNCHANGED <<plan, cancelled, failure, running>>
+    /\ UNCHANGED <<plan, cancelled, failure, running, rootActive>>
 
 FinishFailure(path) ==
     /\ running
@@ -67,7 +71,7 @@ FinishFailure(path) ==
     /\ Release(path)
     /\ cancelled' = TRUE
     /\ failure' = TRUE
-    /\ UNCHANGED <<plan, running>>
+    /\ UNCHANGED <<plan, running, rootActive>>
 
 \* Dropbox rejected the download of this one path outright. The executor
 \* records a BlockReason against that plan and stops working on it, without
@@ -79,7 +83,7 @@ FinishPermanent(path) ==
     /\ job' = [job EXCEPT ![path] = "Blocked"]
     /\ plan' = [plan EXCEPT ![path] = "Blocked"]
     /\ Release(path)
-    /\ UNCHANGED <<cancelled, failure, running>>
+    /\ UNCHANGED <<cancelled, failure, running, rootActive>>
 
 \* The reconciler decides a blocked plan is worth another attempt, either
 \* because its retry deadline passed or because the path changed. Until it
@@ -89,27 +93,34 @@ Unblock(path) ==
     /\ plan[path] = "Blocked"
     /\ plan' = [plan EXCEPT ![path] = "Pending"]
     /\ job' = [job EXCEPT ![path] = "Pending"]
-    /\ UNCHANGED <<workerPath, slotPath, cancelled, failure, running>>
+    /\ UNCHANGED <<workerPath, slotPath, cancelled, failure, running,
+        rootActive>>
 
 CancelQueued(path) ==
     /\ running
     /\ cancelled
     /\ job[path] = "Queued"
     /\ job' = [job EXCEPT ![path] = "Cancelled"]
-    /\ UNCHANGED <<plan, workerPath, slotPath, cancelled, failure, running>>
+    /\ UNCHANGED <<plan, workerPath, slotPath, cancelled, failure, running,
+        rootActive>>
 
+\* A staged download installs only while the configured root is still the
+\* journal's active one; otherwise it stays staged and its plan pending.
 Install(path) ==
     /\ running
+    /\ rootActive
     /\ job[path] = "Staged"
     /\ job' = [job EXCEPT ![path] = "Installed"]
-    /\ UNCHANGED <<plan, workerPath, slotPath, cancelled, failure, running>>
+    /\ UNCHANGED <<plan, workerPath, slotPath, cancelled, failure, running,
+        rootActive>>
 
 Complete(path) ==
     /\ running
     /\ job[path] = "Installed"
     /\ job' = [job EXCEPT ![path] = "Completed"]
     /\ plan' = [plan EXCEPT ![path] = "Completed"]
-    /\ UNCHANGED <<workerPath, slotPath, cancelled, failure, running>>
+    /\ UNCHANGED <<workerPath, slotPath, cancelled, failure, running,
+        rootActive>>
 
 ReportFailure ==
     /\ running
@@ -120,7 +131,7 @@ ReportFailure ==
         IF job[path] \in {"Failed", "Cancelled"} THEN "Pending" ELSE job[path]]
     /\ cancelled' = FALSE
     /\ failure' = FALSE
-    /\ UNCHANGED <<plan, workerPath, slotPath, running>>
+    /\ UNCHANGED <<plan, workerPath, slotPath, running, rootActive>>
 
 Crash ==
     /\ running
@@ -133,12 +144,20 @@ Crash ==
     /\ cancelled' = FALSE
     /\ failure' = FALSE
     /\ running' = FALSE
-    /\ UNCHANGED plan
+    /\ UNCHANGED <<plan, rootActive>>
+
+\* The user can move or replace the configured root at any time, and put
+\* it back.
+RootChange ==
+    /\ rootActive' = ~rootActive
+    /\ UNCHANGED <<job, plan, workerPath, slotPath, cancelled, failure,
+        running>>
 
 Restart ==
     /\ ~running
     /\ running' = TRUE
-    /\ UNCHANGED <<job, plan, workerPath, slotPath, cancelled, failure>>
+    /\ UNCHANGED <<job, plan, workerPath, slotPath, cancelled, failure,
+        rootActive>>
 
 Next ==
     \/ \E path \in Paths: Queue(path)
@@ -153,6 +172,7 @@ Next ==
     \/ \E path \in Paths: Complete(path)
     \/ ReportFailure
     \/ Crash
+    \/ RootChange
     \/ Restart
 
 Spec == Init /\ [][Next]_vars
@@ -165,6 +185,7 @@ TypeOK ==
     /\ cancelled \in BOOLEAN
     /\ failure \in BOOLEAN
     /\ running \in BOOLEAN
+    /\ rootActive \in BOOLEAN
 
 UniqueAssignments ==
     /\ \A path \in Paths:
@@ -225,6 +246,18 @@ BlockOutlivesCrash ==
     \A path \in Paths:
         (plan[path] = "Blocked" /\ ~running') => plan'[path] = "Blocked"
 
+\* Nothing installs under a root that is no longer the active one.
+InstallRooted ==
+    \A path \in Paths:
+        (job[path] # "Installed" /\ job'[path] = "Installed") => rootActive
+
+\* Under a root that is no longer active, a staged download stays staged
+\* and its plan pending.
+UnrootedStaged ==
+    \A path \in Paths:
+        (job[path] = "Staged" /\ ~rootActive)
+        => (job'[path] = "Staged" /\ plan'[path] = "Pending")
+
 CompletedIsStable == [][CompletedStable]_vars
 
 StagedWorkIsPreserved == [][StagedStable]_vars
@@ -234,5 +267,9 @@ PermanentFailureSparesSiblings == [][PermanentFailureIsolated]_vars
 BlockedWorkIsNotRetried == [][BlockedNotRetried]_vars
 
 BlockedPlansOutliveCrashes == [][BlockOutlivesCrash]_vars
+
+InstallsOnlyUnderActiveRoot == [][InstallRooted]_vars
+
+UnrootedWorkStaysStaged == [][UnrootedStaged]_vars
 
 =============================================================================

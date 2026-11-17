@@ -18,6 +18,9 @@ covers the durable per-path block that schema 6 records: a rejected download
 blocks its own plan without cancelling the batch or touching a sibling, no
 worker picks the path up while that plan is blocked, and the block outlives a
 crash, so only the reconciler returning the plan to pending queues it again.
+A staged download installs only while the configured root is still the
+journal's active one; under any other root it stays staged and its plan
+pending.
 
 `ScanCoordination` checks that downloads continue while a complete local scan
 runs, but verified-stage promotion cannot mutate the sync root until that scan
