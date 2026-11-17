@@ -1193,7 +1193,7 @@ ARENA UPLOADS DROPBOX:upload
       locked OF BY-DROPBOX ENDOF
       reset OF e l STOP-REFUSED ENDOF
       invalid-root OF e l STOP-REFUSED ENDOF
-      content-hash-mismatch OF e l STOP-REFUSED ENDOF
+      content-hash-mismatch OF BY-DROPBOX ENDOF
       unsupported-file OF BY-DROPBOX ENDOF
       path-mismatch OF
          construct mutation-rejection path-mismatch

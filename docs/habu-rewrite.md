@@ -95,7 +95,8 @@ watcher comes only for a measured need.
   refused `locked` blocks its path, and so does a directory collision's copy
   that Dropbox refuses or that fails verification, with every path beneath
   it, for that pass, unplanned, and so does a replayed conflict's remote copy
-  whose download fails for its path.
+  whose download fails for its path. An upload Dropbox refuses for a content
+  hash mismatch blocks its path too, where Rust ends the pass.
 - **Upload progress.** `DROPBOX:UPLOAD` takes a quotation `[ n -- ]`, called
   with the bytes Dropbox has accepted.
 
