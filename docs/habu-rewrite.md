@@ -92,8 +92,9 @@ watcher comes only for a measured need.
   `SyncPass` describes the pass's table, `InventoryPublication` the
   listing's, `DownloadExecutor` the download's, `LocalLifecycle` a local
   operation's, `RemoteLifecycle` a remote operation's, `ServiceDrive`
-  `SERVICE`'s drive, `DaemonRun` the daemon's run, and `MutationLifecycle`
-  what a local operation's apply does; the other tables have none.
+  `SERVICE`'s drive, `DaemonRun` the daemon's run, `Downloading` a
+  download's transfer, and `MutationLifecycle` what a local operation's
+  apply does; the other tables have none.
 - **`RECONCILE:PASS`** answers `complete` with its counts, `fresh` (rescan) or
   `root-changed`; a Dropbox answer that ends it is in the link, as `REPLAY`'s.
   `DAEMON` validates the account, not the pass. Apart from Rust, a download

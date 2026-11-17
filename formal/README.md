@@ -95,6 +95,13 @@ against the journal's binding; the long poll follows only a complete pass; and
 only a failure that stops ends the run, while one that continues waits and
 tries its state again, a failed long poll from syncing.
 
+`Downloading` checks one files/download transfer as `DOWNLOADING` reads it: no
+byte of the file reaches the body's reader before the answer's rev, content
+hash and range pass, nor the logged answer buffer; the reader takes no byte
+past the file's end; a drained body holds every byte and a cancelled one was
+left by its reader; and the transfer ends once, by curl's last read or by one
+cancel, exactly when the machine is final or a throw leaves `READ-OUT`.
+
 Run the models from this directory with `tlc`, the TLA+ tools' model
 checker on PATH:
 
@@ -111,6 +118,7 @@ tlc -config DirectoryDeletion.cfg DirectoryDeletion.tla
 tlc -config RemoteLifecycle.cfg RemoteLifecycle.tla
 tlc -config ServiceDrive.cfg ServiceDrive.tla
 tlc -config DaemonRun.cfg DaemonRun.tla
+tlc -config Downloading.cfg Downloading.tla
 ```
 
 Each table's check, in its package's tests, holds `<Model>Table.tla` to the
@@ -122,8 +130,10 @@ model's steps follow that table:
 - `src/replay-test.f`: `LOCAL-LIFECYCLE` (`LocalLifecycle`) and
   `REMOTE-LIFECYCLE` (`RemoteLifecycle`);
 - `src/service-test.f`: `DRIVING` (`ServiceDrive`);
-- `src/daemon-test.f`: `DAEMON-RUN` (`DaemonRun`).
+- `src/daemon-test.f`: `DAEMON-RUN` (`DaemonRun`);
+- `src/dropbox-test.f`: `DOWNLOADING` (`Downloading`).
 
 Same- and cross-filesystem promotion share one durable abstract boundary; TLC
-checks crashes immediately before and after it. Dropbox transport and concrete
-filesystem syscalls remain outside the model.
+checks crashes immediately before and after it. Dropbox's HTTP beyond the reads
+`Downloading` models, and concrete filesystem syscalls, remain outside the
+models.

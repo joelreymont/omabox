@@ -63,6 +63,8 @@
 \ captured in TMPDIR, checked and removed. A stub in place of AIO's
 \ transfer fails the stage's reads. Each failed assertion prints its
 \ label; the run goes on and fails at its end.
+\ The table against its model, through TEST-FORMAL:HOLDS:
+\ formal_holds_the_downloading_table, DOWNLOADING and formal/Downloading.tla.
 \ Run from the repository root: hb --load src/dropbox-test.f </dev/null
 require src/lib/aio.f
 require src/lib/byte-buffer.f
@@ -78,6 +80,7 @@ require src/lib/fs.f
 require src/lib/fs-mutate.f
 require src/lib/test/stderr.f
 require src/lib/net/curl.f
+require src/test-formal.f
 require src/dropbox.f
 require src/test-dropbox.f
 require src/test-client.f
@@ -1551,18 +1554,29 @@ TYPED-VARIABLE ZEROED bool
    code ERROR:TEXT$ UNVERIFIED$ STR= 0= if code throw then ;
 
 
-: CAUGHT-UNVERIFIED ( -- ) [: CAUGHT-BODY ;] BODY-UNVERIFIED ;
+variable AGAIN-CODE
+
+
+\ CAUGHT-BODY, then one more read, whose code AGAIN-CODE keeps.
+: REREAD-BODY ( n n ^DROPBOX:fetch -- )
+   {: at:n size:n f :}
+   at size f CAUGHT-BODY
+   [: SUNK 1 f DROPBOX:READ-BODY drop ;] catch AGAIN-CODE ! ;
 
 
 \ A resumed body one byte short whose body catches READ-BODY's throw
-\ and returns: the answer is still refused, logged once.
+\ and reads again: that read throws too, never answering 0, and the
+\ answer is still refused, logged once.
 : CAUGHT-SHORT-CASE ( -- )
    s" download one byte short, its failure caught" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
    TEST-DROPBOX:SHORTEN
-   [: CAUGHT-UNVERIFIED ;] s" a body of another length" REFUSED-LOGGED
+   0 AGAIN-CODE !
+   [: [: REREAD-BODY ;] BODY-UNVERIFIED ;]
+   s" a body of another length" REFUSED-LOGGED
    ZEROED @ TFALSE
    BODY-CODE @ ERROR:TEXT$ UNVERIFIED$ T$=
+   AGAIN-CODE @ ERROR:TEXT$ UNVERIFIED$ T$=
    USABLE ;
 
 
@@ -2995,6 +3009,12 @@ TYPED-VARIABLE FAULT fault
    [: CASES ;] [: TEST-DROPBOX:STOP ;] finally ;
 
 
+\ DOWNLOADING's lines against formal/Downloading.tla.
+: FORMAL-DOWNLOADING-CASE ( -- )
+   s" formal_holds_the_downloading_table" T-LABEL
+   s" src/dropbox.f" s" DOWNLOADING" s" Downloading" AR @ TEST-FORMAL:HOLDS ;
+
+
 \ The curl loop started; the run goes on and fails at its end if not.
 : CURL-STARTED ( CURL:status -- )
    MATCH CURL:status
@@ -3007,6 +3027,7 @@ public
 : RUN ( -- )
    T-RESET
    ARENA:NEW AR !
+   FORMAL-DOWNLOADING-CASE
    AIO:START CURL:LOOP-START CURL-STARTED
    [: SERVED ;] [: CURL:LOOP-STOP AIO:STOP ;] finally
    AR @ ARENA:RELEASE

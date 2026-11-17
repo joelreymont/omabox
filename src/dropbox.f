@@ -1430,17 +1430,21 @@ private
 
 \ ---- the download's machine
 
-\ A step ends in streaming only with a new chunk held, none taken; drained
-\ at the body's end. BODIED sets cancelled, READ-BODY overran and short.
+\ A read steps streaming, again while it pulls an empty chunk, and pulls
+\ only once the held chunk is all taken: held, or overran by a byte past
+\ the file's end; drained or short at the body's end, by its length;
+\ cancelled once the body returns.
 ENUM download-step DERIVE eq
    opened streaming buffering answered drained lost cancelled
    overran short ;ENUM
 ENUM read-event chunk response failure ;ENUM
 ENUM open-event passed other response failure ;ENUM
+ENUM stream-event held response short failure overrun unread ;ENUM
 
 
 \ One download's read: held the chunk read last and taken its bytes the
-\ reader took, total all it took; failure a failed transfer's curl code.
+\ reader took, total all it took; failure a failed transfer's curl code;
+\ room what the read in progress asks; returned once the body returned.
 public
 STRUCTURE fetch OPAQUE DERIVE addr
    FIELD client ^client
@@ -1454,6 +1458,8 @@ STRUCTURE fetch OPAQUE DERIVE addr
    FIELD status n
    FIELD failure n
    FIELD total n
+   FIELD room n
+   FIELD returned bool
 ;STRUCTURE
 private
 
@@ -1537,31 +1543,6 @@ HEAP FETCHES fetch
    f FETCH-FAILURE @ c CLIENT-FAILURE ! ;
 
 
-\ A throw from a sense or an action leaves the transfer in flight, for
-\ READ-OUT to end.
-FSM:DEFINE DOWNLOADING ( ^fetch ) download-step open-event
-   IN opened  OPEN-SENSE
-      passed    -          >streaming
-      other     ANSWER+    >buffering
-      response  RESPONDED  >answered
-      failure   BROKE      >lost
-   IN streaming  PULL ( read-event )
-      chunk     -          >streaming
-      response  RESPONDED  >drained
-      failure   BROKE      >lost
-   IN buffering  PULL ( read-event )
-      chunk     ANSWER+    >buffering
-      response  RESPONDED  >answered
-      failure   BROKE      >lost
-   FINAL answered  -
-   FINAL drained   -
-   FINAL lost      -
-   FINAL cancelled -
-   FINAL overran   -
-   FINAL short     -
-;DEFINE
-
-
 : STREAMING? ( download-step -- bool )
    construct download-step streaming DOWNLOAD-STEP-EQ ;
 : DRAINED? ( download-step -- bool )
@@ -1574,6 +1555,88 @@ FSM:DEFINE DOWNLOADING ( ^fetch ) download-step open-event
    construct download-step overran DOWNLOAD-STEP-EQ ;
 : SHORT? ( download-step -- bool )
    construct download-step short DOWNLOAD-STEP-EQ ;
+
+
+\ Whether the machine streams with its held chunk all taken.
+: STARVED? ( ^fetch -- bool )
+   {: f :}
+   f FETCH-STEP @ STREAMING? 0= if false exit then
+   f FETCH-TAKEN @ f FETCH-HELD @ SPAN:$ nip = ;
+
+
+\ How many of the held chunk's untaken bytes fit in room.
+: TAKING ( n ^fetch -- n )
+   {: room:n f :}
+   f FETCH-HELD @ SPAN:$ nip f FETCH-TAKEN @ - room min ;
+
+
+: FILE-SIZE ( ^client -- n ) CLIENT-ENTRY DROPBOX-ENTRY:SIZE @ ;
+
+
+\ held, or overrun when the room the read asks would take a byte of the
+\ held chunk past the rest bytes after the offset.
+: HELD-EVENT ( ^fetch n -- stream-event )
+   {: f rest:n :}
+   f FETCH-ROOM @ f TAKING f FETCH-TOTAL @ + rest > if
+      construct stream-event overrun exit
+   then
+   construct stream-event held ;
+
+
+\ curl's last read: response for a body of the rest bytes after the
+\ offset, short for one of fewer.
+: LAST-EVENT ( ^fetch n -- stream-event )
+   {: f rest:n :}
+   f FETCH-TOTAL @ rest = if construct stream-event response exit then
+   construct stream-event short ;
+
+
+\ unread once the body returned; else, with the held chunk all taken,
+\ curl's next read, then held or overrun for the read in progress.
+: STREAM-SENSE ( ^fetch -- stream-event )
+   {: f :}
+   f FETCH-RETURNED @ if construct stream-event unread exit then
+   f FETCH-CLIENT @ FILE-SIZE f FETCH-OFFSET @ - {: rest:n :}
+   f STARVED? 0= if f rest HELD-EVENT exit then
+   f PULL MATCH read-event
+      chunk OF f rest HELD-EVENT ENDOF
+      response OF f rest LAST-EVENT ENDOF
+      failure OF construct stream-event failure ENDOF
+   ;MATCH ;
+
+
+\ Cancels the transfer in flight and reads it to its end.
+: ABANDON ( ^fetch -- )
+   {: f :}
+   f FETCH-HANDLE @ f FETCH-CLIENT @ ABANDONED ;
+
+
+\ One download's transfer, after formal/Downloading.tla. A throw from a
+\ sense or an action leaves the transfer in flight, for READ-OUT to end.
+FSM:DEFINE DOWNLOADING ( ^fetch ) download-step open-event
+   IN opened  OPEN-SENSE
+      passed    -          >streaming
+      other     ANSWER+    >buffering
+      response  RESPONDED  >answered
+      failure   BROKE      >lost
+   IN streaming  STREAM-SENSE ( stream-event )
+      held      -          >streaming
+      response  RESPONDED  >drained
+      short     RESPONDED  >short
+      failure   BROKE      >lost
+      overrun   ABANDON    >overran
+      unread    ABANDON    >cancelled
+   IN buffering  PULL ( read-event )
+      chunk     ANSWER+    >buffering
+      response  RESPONDED  >answered
+      failure   BROKE      >lost
+   FINAL answered  -
+   FINAL drained   -
+   FINAL lost      -
+   FINAL cancelled -
+   FINAL overran   -
+   FINAL short     -
+;DEFINE
 
 
 \ Whether the machine is at its end, so the transfer has ended.
@@ -1591,19 +1654,6 @@ FSM:DEFINE DOWNLOADING ( ^fetch ) download-step open-event
    end ;
 
 
-\ Whether the machine streams with its held chunk all taken.
-: STARVED? ( ^fetch -- bool )
-   {: f :}
-   f FETCH-STEP @ STREAMING? 0= if false exit then
-   f FETCH-TAKEN @ f FETCH-HELD @ SPAN:$ nip = ;
-
-
-\ How many of the held chunk's untaken bytes fit in room.
-: TAKING ( n ^fetch -- n )
-   {: room:n f :}
-   f FETCH-HELD @ SPAN:$ nip f FETCH-TAKEN @ - room min ;
-
-
 \ Copies what fits in room of the held chunk's untaken bytes to p.
 : TAKEN ( ^u8 n ^fetch -- n )
    {: p:^ room:n f :}
@@ -1611,9 +1661,6 @@ FSM:DEFINE DOWNLOADING ( ^fetch ) download-step open-event
    f FETCH-HELD @ SPAN:$ drop f FETCH-TAKEN @ + p k BYTE-COPY
    k f FETCH-TAKEN +! k f FETCH-TOTAL +!
    k ;
-
-
-: FILE-SIZE ( ^client -- n ) CLIENT-ENTRY DROPBOX-ENTRY:SIZE @ ;
 
 
 : MISSIZED ( ^client -- )
@@ -1626,53 +1673,39 @@ FSM:DEFINE DOWNLOADING ( ^fetch ) download-step open-event
    c FILE-SIZE at - got <> if c MISSIZED then ;
 
 
-\ got bytes of the body hold none past the file's end, or the transfer
-\ still in flight is ended and the machine overran.
-: BOUNDED ( ^fetch n -- )
-   {: f got:n :}
-   f FETCH-CLIENT @ {: c :}
-   c FILE-SIZE f FETCH-OFFSET @ - got < 0= if exit then
-   f FETCH-HANDLE @ c ABANDONED
-   construct download-step overran f FETCH-STEP !
-   c MISSIZED ;
-
-
-\ A streamed body at its end holds every byte after the offset, or the
-\ machine is short; a fetch handed over at its end was checked before.
-: ENDED-SIZED ( ^fetch -- )
-   {: f :}
-   f FETCH-STEP @ DRAINED? 0= if exit then
-   f FETCH-CLIENT @ {: c :}
-   c FILE-SIZE f FETCH-OFFSET @ - f FETCH-TOTAL @ = if exit then
-   construct download-step short f FETCH-STEP !
-   c MISSIZED ;
-
-
 public
 
-\ At most room of the body's next bytes into p, 0 at its end; a lost
-\ transfer throws E-BODY-LOST, a body of another length E-UNVERIFIED.
+\ At most room of the body's next bytes into p, 0 at its end; each read
+\ steps the machine, again while it pulls an empty chunk. A lost transfer
+\ throws E-BODY-LOST; a body of another length logs and throws
+\ E-UNVERIFIED at the read that meets it, and every later read throws it
+\ too, never answering 0.
 : READ-BODY ( ^u8 n ^fetch -- n )
    {: p:^ room:n f :}
-   begin f STARVED? while f STEPPED drop repeat
+   f FETCH-STEP @ STREAMING? {: flight:bool :}
+   room f FETCH-ROOM !
+   begin f STEPPED drop f STARVED? 0= until
    f FETCH-STEP @ {: s:download-step :}
    s CUT? if E-BODY-LOST throw then
-   s STREAMING? 0= if f ENDED-SIZED 0 exit then
-   f room f TAKING f FETCH-TOTAL @ + BOUNDED
+   s OVERRAN? s SHORT? or if
+      flight if f FETCH-CLIENT @ MISSIZED then
+      E-UNVERIFIED throw
+   then
+   s STREAMING? 0= if 0 exit then
    p room f TAKEN ;
 
 private
 
 
-\ Hands body the offset, the file's size and the fetch; a body it leaves
-\ unread is cancelled, and nothing after that throws.
+\ Hands body the offset, the file's size and the fetch, then steps the
+\ machine once: a body it left unread is cancelled, and nothing after
+\ that throws.
 : BODIED ( ^fetch [ n n ^fetch -- ] -- )
    {: f body :}
    f FETCH-CLIENT @ {: c :}
    f FETCH-OFFSET @ c FILE-SIZE f body execute
-   f FETCH-STEP @ STREAMING? 0= if exit then
-   f FETCH-HANDLE @ c ABANDONED
-   construct download-step cancelled f FETCH-STEP ! ;
+   true f FETCH-RETURNED !
+   f STEPPED drop ;
 
 
 \ Steps the machine from opened: once the checks pass, body reads the

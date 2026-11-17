@@ -188,7 +188,9 @@ STRUCTURE config
   - `READ-BODY` checks the body's length: a body that ends before every
     byte after the offset came, or carries a byte past them, fails at the
     read that meets it, and the answer is `refused unverified` even when
-    the quotation caught that failure. A body the quotation leaves unread
+    the quotation caught that failure. A read after that caught failure
+    throws it again, unlogged, never answering 0, which the caller would
+    take for the body's end. A body the quotation leaves unread
     is cancelled as a throw cancels it, and the answer is done without
     the check at its end.
   - A transfer lost inside the body throws a code of DROPBOX's own from
