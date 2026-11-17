@@ -16,10 +16,10 @@ JobStates == {
 PlanStates == {"Pending", "Blocked", "Completed"}
 
 VARIABLES job, plan, workerPath, slotPath, cancelled, failure, running,
-    rootActive
+    rootActive, unrooted
 
 vars == <<job, plan, workerPath, slotPath, cancelled, failure, running,
-    rootActive>>
+    rootActive, unrooted>>
 
 Init ==
     /\ job = [path \in Paths |-> "Pending"]
@@ -30,6 +30,7 @@ Init ==
     /\ failure = FALSE
     /\ running = TRUE
     /\ rootActive = TRUE
+    /\ unrooted = {}
 
 Queue(path) ==
     /\ running
@@ -38,7 +39,7 @@ Queue(path) ==
     /\ job[path] = "Pending"
     /\ job' = [job EXCEPT ![path] = "Queued"]
     /\ UNCHANGED <<plan, workerPath, slotPath, cancelled, failure, running,
-        rootActive>>
+        rootActive, unrooted>>
 
 Start(path, worker, slot) ==
     /\ running
@@ -49,7 +50,7 @@ Start(path, worker, slot) ==
     /\ job' = [job EXCEPT ![path] = "Active"]
     /\ workerPath' = [workerPath EXCEPT ![worker] = path]
     /\ slotPath' = [slotPath EXCEPT ![slot] = path]
-    /\ UNCHANGED <<plan, cancelled, failure, running, rootActive>>
+    /\ UNCHANGED <<plan, cancelled, failure, running, rootActive, unrooted>>
 
 Release(path) ==
     /\ workerPath' = [worker \in Workers |->
@@ -62,7 +63,7 @@ FinishSuccess(path) ==
     /\ job[path] = "Active"
     /\ job' = [job EXCEPT ![path] = "Staged"]
     /\ Release(path)
-    /\ UNCHANGED <<plan, cancelled, failure, running, rootActive>>
+    /\ UNCHANGED <<plan, cancelled, failure, running, rootActive, unrooted>>
 
 FinishFailure(path) ==
     /\ running
@@ -71,7 +72,7 @@ FinishFailure(path) ==
     /\ Release(path)
     /\ cancelled' = TRUE
     /\ failure' = TRUE
-    /\ UNCHANGED <<plan, running, rootActive>>
+    /\ UNCHANGED <<plan, running, rootActive, unrooted>>
 
 \* Dropbox rejected the download of this one path outright. The executor
 \* records a BlockReason against that plan and stops working on it, without
@@ -83,7 +84,7 @@ FinishPermanent(path) ==
     /\ job' = [job EXCEPT ![path] = "Blocked"]
     /\ plan' = [plan EXCEPT ![path] = "Blocked"]
     /\ Release(path)
-    /\ UNCHANGED <<cancelled, failure, running, rootActive>>
+    /\ UNCHANGED <<cancelled, failure, running, rootActive, unrooted>>
 
 \* The reconciler decides a blocked plan is worth another attempt, either
 \* because its retry deadline passed or because the path changed. Until it
@@ -94,7 +95,7 @@ Unblock(path) ==
     /\ plan' = [plan EXCEPT ![path] = "Pending"]
     /\ job' = [job EXCEPT ![path] = "Pending"]
     /\ UNCHANGED <<workerPath, slotPath, cancelled, failure, running,
-        rootActive>>
+        rootActive, unrooted>>
 
 CancelQueued(path) ==
     /\ running
@@ -102,7 +103,7 @@ CancelQueued(path) ==
     /\ job[path] = "Queued"
     /\ job' = [job EXCEPT ![path] = "Cancelled"]
     /\ UNCHANGED <<plan, workerPath, slotPath, cancelled, failure, running,
-        rootActive>>
+        rootActive, unrooted>>
 
 \* A staged download installs only while the configured root is still the
 \* journal's active one; otherwise it stays staged and its plan pending.
@@ -112,7 +113,19 @@ Install(path) ==
     /\ job[path] = "Staged"
     /\ job' = [job EXCEPT ![path] = "Installed"]
     /\ UNCHANGED <<plan, workerPath, slotPath, cancelled, failure, running,
-        rootActive>>
+        rootActive, unrooted>>
+
+\* Before it installs a staged download the executor checks the root; one
+\* it finds no longer active it leaves staged, its plan pending, and a
+\* later pass under the active root installs it.
+Unroot(path) ==
+    /\ running
+    /\ ~rootActive
+    /\ job[path] = "Staged"
+    /\ path \notin unrooted
+    /\ unrooted' = unrooted \cup {path}
+    /\ UNCHANGED <<job, plan, workerPath, slotPath, cancelled, failure,
+        running, rootActive>>
 
 Complete(path) ==
     /\ running
@@ -120,7 +133,7 @@ Complete(path) ==
     /\ job' = [job EXCEPT ![path] = "Completed"]
     /\ plan' = [plan EXCEPT ![path] = "Completed"]
     /\ UNCHANGED <<workerPath, slotPath, cancelled, failure, running,
-        rootActive>>
+        rootActive, unrooted>>
 
 ReportFailure ==
     /\ running
@@ -131,7 +144,7 @@ ReportFailure ==
         IF job[path] \in {"Failed", "Cancelled"} THEN "Pending" ELSE job[path]]
     /\ cancelled' = FALSE
     /\ failure' = FALSE
-    /\ UNCHANGED <<plan, workerPath, slotPath, running, rootActive>>
+    /\ UNCHANGED <<plan, workerPath, slotPath, running, rootActive, unrooted>>
 
 Crash ==
     /\ running
@@ -144,20 +157,20 @@ Crash ==
     /\ cancelled' = FALSE
     /\ failure' = FALSE
     /\ running' = FALSE
-    /\ UNCHANGED <<plan, rootActive>>
+    /\ UNCHANGED <<plan, rootActive, unrooted>>
 
 \* The user can move or replace the configured root at any time, and put
 \* it back.
 RootChange ==
     /\ rootActive' = ~rootActive
     /\ UNCHANGED <<job, plan, workerPath, slotPath, cancelled, failure,
-        running>>
+        running, unrooted>>
 
 Restart ==
     /\ ~running
     /\ running' = TRUE
     /\ UNCHANGED <<job, plan, workerPath, slotPath, cancelled, failure,
-        rootActive>>
+        rootActive, unrooted>>
 
 Next ==
     \/ \E path \in Paths: Queue(path)
@@ -169,6 +182,7 @@ Next ==
     \/ \E path \in Paths: Unblock(path)
     \/ \E path \in Paths: CancelQueued(path)
     \/ \E path \in Paths: Install(path)
+    \/ \E path \in Paths: Unroot(path)
     \/ \E path \in Paths: Complete(path)
     \/ ReportFailure
     \/ Crash
@@ -186,6 +200,7 @@ TypeOK ==
     /\ failure \in BOOLEAN
     /\ running \in BOOLEAN
     /\ rootActive \in BOOLEAN
+    /\ unrooted \subseteq Paths
 
 UniqueAssignments ==
     /\ \A path \in Paths:

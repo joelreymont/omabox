@@ -6229,21 +6229,24 @@ ARENA RENDERED str
    ar u ARENA:ALLOC drop {: b:^ :}
    b  p pu b u FS:READ-ALL ;
 
-\ The text from INVENTORY-PUBLICATION's name to its end; none if absent.
-: TABLE-AT ( ^u8 n -- ^u8 n )
-   {: t:^ tu:n :}
-   t tu s" FSM:DEFINE INVENTORY-PUBLICATION" FIND-SUB MATCH option
+\ The text from the table's name to its end; none if absent.
+: TABLE-AT ( ^u8 n ^u8 n -- ^u8 n )
+   {: t:^ tu:n n:^ nu:n :}
+   SB-RESET s" FSM:DEFINE " SB-APPEND n nu SB-APPEND
+   t tu SB$ FIND-SUB MATCH option
       none OF t 0 ENDOF
       some OF IDX>N s" FSM:DEFINE " nip + t over + tu rot - ENDOF
    ;MATCH ;
 
 : SB-LINE ( ^u8 n -- ) SB-APPEND 10 SB-APPEND-C ;
 
-\ formal/InventoryPublicationTable.tla's lines before the tuples.
-: HEAD$ ( -- ^u8 n )
+\ The model's Table module's lines before the tuples.
+: HEAD$ ( ^u8 n ^u8 n -- ^u8 n )
+   {: n:^ nu:n m:^ mu:n :}
    SB-RESET
-   s" ---- MODULE InventoryPublicationTable ----" SB-LINE
-   s" \* The lines of INVENTORY-PUBLICATION, src/reconcile.f, as <<state, input," SB-LINE
+   s" ---- MODULE " SB-APPEND m mu SB-APPEND s" Table ----" SB-LINE
+   s" \* The lines of " SB-APPEND n nu SB-APPEND
+   s" , src/reconcile.f, as <<state, input," SB-LINE
    s" \* next state>>. src/reconcile-test.f fails unless this file is that table." SB-LINE
    s" Lines == {" SB-LINE SB$ ;
 
@@ -6258,41 +6261,50 @@ ARENA RENDERED str
    S\" \q, \q" SB-APPEND x 1+ xu 1- SB-APPEND
    S\" \q>>" SB-APPEND h SB$ ar ADD ;
 
-\ The table at t as formal/InventoryPublicationTable.tla holds it.
-: TABLE-TLA ( ^u8 n ^ARENA:arena -- ^u8 n )
-   {: t:^ tu:n ar :}
+\ The table at t as the model's Table module holds it.
+: TABLE-TLA ( ^u8 n ^u8 n ^u8 n ^ARENA:arena -- ^u8 n )
+   {: t:^ tu:n n:^ nu:n m:^ mu:n ar :}
    ar RENDERED-NEW {: h :}
    t tu [: h ar TUPLE+ ;] FSM:LINES
-   ar RENDERED-NEW {: m :}
-   m HEAD$ ar ADD  m h @ str> ar ADD
-   m S\" \n}\n====\n" ar ADD  m @ str> ;
+   ar RENDERED-NEW {: o :}
+   o n nu m mu HEAD$ ar ADD  o h @ str> ar ADD
+   o S\" \n}\n====\n" ar ADD  o @ str> ;
 
-\ TLC on InventoryPublicationFollows, its files in d; its output on
-\ a failure.
-: FOLLOWS-RUN ( CMD:command str ^ARENA:arena -- CMD:command )
-   {: d:str ar :}
+\ TLC on the model's Follows module, its files in d; its output on a failure.
+: FOLLOWS-RUN ( CMD:command str ^u8 n ^ARENA:arena -- CMD:command )
+   {: d:str m:^ mu:n ar :}
    s" tlc" CMD:ARG+ s" -workers" CMD:ARG+ s" 1" CMD:ARG+
    s" -metadir" CMD:ARG+ d s" tlc" ar INSIDE str> CMD:ARG+
-   s" -config" CMD:ARG+ s" InventoryPublicationFollows.cfg" CMD:ARG+
-   s" InventoryPublicationFollows.tla" CMD:ARG+
+   s" -config" CMD:ARG+
+   SB-RESET m mu SB-APPEND s" Follows.cfg" SB-APPEND SB$ CMD:ARG+
+   SB-RESET m mu SB-APPEND s" Follows.tla" SB-APPEND SB$ CMD:ARG+
    s" formal" CMD:CWD!  s" TMPDIR" d str> CMD:ENV+
    s" /usr/bin/env" 120000 >MS CMD:RUN-RC
    MATCH result ok OF ENDOF err OF ENDOF ;MATCH {: rc:n :}
    rc 0<> if CMD:OUT$ type then
    rc 0 T= ;
 
-\ The model's copy of INVENTORY-PUBLICATION is its lines, and TLC
-\ finds InventoryPublication follows them.
+\ The model's copy of the table is its lines; TLC finds the model follows them.
+: FORMAL-HOLDS ( ^u8 n ^u8 n ^ARENA:arena -- )
+   {: n:^ nu:n m:^ mu:n ar :}
+   s" src/reconcile.f" ar FILE$ n nu TABLE-AT {: t:^ tu:n :}
+   tu 0 > TTRUE  tu 0= if exit then
+   SB-RESET s" formal/" SB-APPEND m mu SB-APPEND s" Table.tla" SB-APPEND
+   SB$ ar FILE$
+   t tu n nu m mu ar TABLE-TLA T$=
+   s" reconcile-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
+   [: d m mu ar FOLLOWS-RUN ;] CMD:WITH-COMMAND
+   d str> FS:REMOVE-TREE ;
+
 : FORMAL-HOLDS-THE-LISTING-TABLE ( ^ARENA:arena -- )
    {: ar :}
    s" formal_holds_the_listing_table" T-LABEL
-   s" src/reconcile.f" ar FILE$ TABLE-AT {: t:^ tu:n :}
-   tu 0 > TTRUE  tu 0= if exit then
-   s" formal/InventoryPublicationTable.tla" ar FILE$
-   t tu ar TABLE-TLA T$=
-   s" reconcile-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
-   [: d ar FOLLOWS-RUN ;] CMD:WITH-COMMAND
-   d str> FS:REMOVE-TREE ;
+   s" INVENTORY-PUBLICATION" s" InventoryPublication" ar FORMAL-HOLDS ;
+
+: FORMAL-HOLDS-THE-DOWNLOAD-TABLE ( ^ARENA:arena -- )
+   {: ar :}
+   s" formal_holds_the_download_table" T-LABEL
+   s" DOWNLOAD-EXECUTOR" s" DownloadExecutor" ar FORMAL-HOLDS ;
 
 
 : CASES ( ^ARENA:arena -- )
@@ -6313,7 +6325,8 @@ ARENA RENDERED str
    ar PATH-DECISIONS-ORDER-DELETES-LAST-AND-DEEPEST-FIRST
    ar CASE-COLLISION-CASES
    ar LISTING-CASES
-   ar FORMAL-HOLDS-THE-LISTING-TABLE ;
+   ar FORMAL-HOLDS-THE-LISTING-TABLE
+   ar FORMAL-HOLDS-THE-DOWNLOAD-TABLE ;
 
 
 : RUN ( -- )

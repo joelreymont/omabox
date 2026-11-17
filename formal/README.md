@@ -20,7 +20,8 @@ worker picks the path up while that plan is blocked, and the block outlives a
 crash, so only the reconciler returning the plan to pending queues it again.
 A staged download installs only while the configured root is still the
 journal's active one; under any other root it stays staged and its plan
-pending.
+pending. `Unroot` is the executor's root check leaving it so, for a later pass
+under the active root to install.
 
 `ScanCoordination` checks that downloads continue while a complete local scan
 runs, but verified-stage promotion cannot mutate the sync root until that scan
@@ -63,9 +64,10 @@ tlc -config InventoryPublication.cfg InventoryPublication.tla
 tlc -config DirectoryDeletion.cfg DirectoryDeletion.tla
 ```
 
-`src/reconcile-test.f` holds `InventoryPublicationTable.tla` to
-`INVENTORY-PUBLICATION`'s lines and runs TLC on `InventoryPublicationFollows`,
-which states that `InventoryPublication`'s steps follow that table.
+`src/reconcile-test.f` holds `InventoryPublicationTable.tla` and
+`DownloadExecutorTable.tla` to their tables' lines, `INVENTORY-PUBLICATION`'s
+and `DOWNLOAD-EXECUTOR`'s, and runs TLC on each `Follows` module, which states
+that its model's steps follow that table.
 
 Same- and cross-filesystem promotion share one durable abstract boundary; TLC
 checks crashes immediately before and after it. Dropbox transport and concrete
