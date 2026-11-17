@@ -2297,6 +2297,11 @@ public
    j >CONNECTION s" blocked" s" read blocked plans" >str ar
    READ-PLANS-WITH-STATUS ;
 
+\ The plan with this id as the journal holds it now, if any.
+: PLAN-OF ( journal plan-id ^ARENA:arena -- option<plan-record> )
+   {: j id ar :}
+   j >CONNECTION id ar READ-PLAN ;
+
 private
 
 

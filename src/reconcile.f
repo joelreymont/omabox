@@ -2699,13 +2699,27 @@ ENUM root-check active changed ;ENUM
    code 0= if x STAGED-AS exit then
    DROP-FETCH code x THROWN-AS ;
 
+\ The download's plan as the journal holds it now: the step's earlier
+\ replay may have completed some of its operations.
+: CURRENT-PLAN ( ^download -- JOURNAL:plan-record )
+   {: x :}
+   x DOWNLOAD-RUN @ {: r :}
+   x DOWNLOAD-PLAN @ {: p :}
+   r RUN-JOURNAL @ p ID-OF r RUN-ARENA @ JOURNAL:PLAN-OF
+   MATCH option
+      none OF
+         p PLAN-PATH s" installing download has no journal plan" INVALID
+      ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
 \ The staged download installed at once.
 : INSTALL ( ^download -- )
    {: x :}
    x DOWNLOAD-RUN @ {: r :}
    r RUN-ARENA @ ARENA:ALLOCATOR 0 [type] JOURNAL:plan-record
    VEC:NEW {: one :}
-   x DOWNLOAD-PLAN @ one VEC:PUSH !
+   x CURRENT-PLAN one VEC:PUSH !
    r RUN-JOURNAL @ x DOWNLOAD-ROOT @ r ROOT$ one r RUN-ARENA @
    REPLAY:REPLAY-LOCAL-PLANS-AT {: rep :}
    r one one r RUN-ARENA @ PATH-ORDER rep RECORD-LOCAL-BLOCKS

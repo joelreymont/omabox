@@ -73,6 +73,9 @@
 \ - later_planned_download_does_not_reclaim_an_active_slot, plan a held
 \   blocked an hour where Rust holds its download, its slot holding a
 \   checkpoint that a second step resumes once a is unblocked
+\ - legacy_preservation_before_a_download_replays_once, Omabox's own: a
+\   legacy [preserve-local, install-local] plan whose install waits on
+\   its download counts its preservation once
 \ The pass against the fake Dropbox, Rust's test of the same name:
 \ - one_reconciliation_pass_synchronizes_files_in_both_directions, with
 \   replayed 2 and blocked 0 as its download installs in the pass, no
@@ -2706,6 +2709,25 @@ TYPED-VARIABLE CANARY str
    x p c HELD-STEPPED
    d x STEP-GONE ;
 
+\ The bytes legacy.txt's download installs.
+: LEGACY$ ( -- ^u8 n ) s" legacy download" ;
+
+: LEGACY-PRESERVATION-BEFORE-A-DOWNLOAD-REPLAYS-ONCE ( ^ARENA:arena -- )
+   {: ar :}
+   s" legacy_preservation_before_a_download_replays_once" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   s" legacy.txt" s" legacy-revision" LEGACY$ ar SERVES
+   s" preserved" ar IDENTITY MODEL-LOCAL:MAKE {: local :}
+   LEGACY$ s" legacy-revision" ar REMOTE-FILE {: rem :}
+   local MODEL-OPERATION:PRESERVE-LOCAL
+   rem MODEL-OPERATION:INSTALL-LOCAL ar TWO-PLAN {: plan :}
+   x RUN-JOURNAL @ s" legacy.txt" DISPLAY plan ar JOURNAL:RECORD-PLAN
+   WRITTEN TTRUE drop
+   x REPLAY-STEP REPORTED COMPLETED 2 T=
+   x s" legacy.txt" IN-ROOT LEGACY$ HOLDS-BYTES
+   d x STEP-GONE ;
+
 : STEP-CASES ( ^ARENA:arena -- )
    {: ar :}
    ar WORKER-VERIFICATION-MISMATCH-DURABLY-BLOCKS-ITS-PLAN
@@ -2714,7 +2736,8 @@ TYPED-VARIABLE CANARY str
    ar COMPLETED-DOWNLOAD-BATCH-IS-INSTALLED-BEFORE-THE-NEXT-BATCH-FAILS
    ar UNKNOWN-DOWNLOAD-SLOTS-ARE-PRESERVED-WITH-DISPOSABLE-FALLBACK
    ar ROOT-SWAP-AFTER-REPLAY-VALIDATION-NEVER-TOUCHES-THE-REPLACEMENT
-   ar LATER-PLANNED-DOWNLOAD-DOES-NOT-RECLAIM-AN-ACTIVE-SLOT ;
+   ar LATER-PLANNED-DOWNLOAD-DOES-NOT-RECLAIM-AN-ACTIVE-SLOT
+   ar LEGACY-PRESERVATION-BEFORE-A-DOWNLOAD-REPLAYS-ONCE ;
 
 \ ---- the pass against the fake Dropbox -----------------------------
 
