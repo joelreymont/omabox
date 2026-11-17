@@ -376,15 +376,14 @@ ENUM account-check
 
 ENUM daemon-state DERIVE eq
    preparing locking opening notifying configuring
-   starting validating syncing polling waiting stopped ;ENUM
+   starting validating syncing polling stopped ;ENUM
 
-ENUM step-event ok failed ;ENUM
+ENUM step-event ok retry stop ;ENUM
 \ clean and dirty: a complete pass without and with sync errors.
-ENUM sync-event clean dirty fresh failed ;ENUM
-ENUM wait-event retry stop ;ENUM
+ENUM sync-event clean dirty fresh retry stop ;ENUM
 
-\ code is 0 for a failure a step answered; resume is the state waiting
-\ returns to; backoff the s the last long poll asked for, 0 for none.
+\ code is 0 for a failure a step answered; backoff the s the last long
+\ poll asked for, 0 for none.
 STRUCTURE run DERIVE addr
    FIELD arena ^ARENA:arena
    FIELD preparing ^ARENA:arena
@@ -405,7 +404,6 @@ STRUCTURE run DERIVE addr
    FIELD schedule schedule
    FIELD failure failure
    FIELD code n
-   FIELD resume daemon-state
    FIELD backoff n
    FIELD passed sync-event
 ;STRUCTURE
@@ -451,24 +449,31 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
 
 : TRIED ( ^run [ ^run -- bool ] -- bool ) [: CODE-FAILURE ;] ATTEMPT ;
 
-: >STEP ( bool -- step-event )
-   if construct step-event ok exit then
-   construct step-event failed ;
+: DISPOSITION@ ( ^run -- disposition )
+   RUN-FAILURE @ FAILURE-UNMAKE {: d t:str :} d ;
 
-: RESUMED ( ^run -- daemon-state ) RUN-RESUME @ ;
-: RESUME ( daemon-state ^run -- ) RUN-RESUME ! ;
+: STOPS? ( disposition -- bool )
+   MATCH disposition
+      retry OF drop false ENDOF
+      environmental OF false ENDOF
+      user-action OF true ENDOF
+      invariant OF true ENDOF
+   ;MATCH ;
 
-: AGAIN-PREPARING ( ^run -- ) construct daemon-state preparing swap RESUME ;
-: AGAIN-LOCKING ( ^run -- ) construct daemon-state locking swap RESUME ;
-: AGAIN-OPENING ( ^run -- ) construct daemon-state opening swap RESUME ;
-: AGAIN-NOTIFYING ( ^run -- )
-   construct daemon-state notifying swap RESUME ;
-: AGAIN-CONFIGURING ( ^run -- )
-   construct daemon-state configuring swap RESUME ;
-: AGAIN-STARTING ( ^run -- ) construct daemon-state starting swap RESUME ;
-: AGAIN-VALIDATING ( ^run -- )
-   construct daemon-state validating swap RESUME ;
-: AGAIN-SYNCING ( ^run -- ) construct daemon-state syncing swap RESUME ;
+\ The failure recorded: stop if it stops the daemon, else retry.
+: WEIGH ( ^run -- step-event )
+   DISPOSITION@ STOPS? if construct step-event stop exit then
+   construct step-event retry ;
+
+: WEIGH-PASS ( ^run -- sync-event )
+   DISPOSITION@ STOPS? if construct sync-event stop exit then
+   construct sync-event retry ;
+
+\ ok if step on x succeeds, else its failure weighed.
+: TRIED-STEP ( ^run [ ^run -- bool ] -- step-event )
+   {: x step :}
+   x step TRIED if construct step-event ok exit then
+   x WEIGH ;
 
 \ ---- the process's states
 
@@ -483,7 +488,7 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
    CONFIG:PREPARE-PATHS
    true ;
 
-: PREPARE ( ^run -- step-event ) [: PREPARED ;] TRIED >STEP ;
+: PREPARE ( ^run -- step-event ) [: PREPARED ;] TRIED-STEP ;
 
 : UNLOCKED ( ^option<CONFIG:lock> -- )
    @ MATCH option
@@ -497,7 +502,7 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
    x RUN-PATHS @ CONFIG:LOCK OPTION:SOME x RUN-LOCK @ !
    true ;
 
-: LOCKING ( ^run -- step-event ) [: LOCKED ;] TRIED >STEP ;
+: LOCKING ( ^run -- step-event ) [: LOCKED ;] TRIED-STEP ;
 
 : CLOSED ( ^option<JOURNAL:journal> -- )
    @ MATCH option
@@ -518,7 +523,7 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
    x HOLD-JOURNAL
    true ;
 
-: OPENING ( ^run -- step-event ) [: OPENED ;] TRIED >STEP ;
+: OPENING ( ^run -- step-event ) [: OPENED ;] TRIED-STEP ;
 
 : UNNOTIFIED ( n ^run -- bool )
    {: errno x :}
@@ -534,7 +539,7 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
       failed OF SYSTEMD:ERRNO>N x UNNOTIFIED ENDOF
    ;MATCH ;
 
-: NOTIFYING ( ^run -- step-event ) [: NOTIFIED ;] TRIED >STEP ;
+: NOTIFYING ( ^run -- step-event ) [: NOTIFIED ;] TRIED-STEP ;
 
 : CONFIGURED ( ^run -- bool )
    {: x :}
@@ -546,7 +551,7 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
    c x RUN-CONFIG !
    true ;
 
-: CONFIGURING ( ^run -- step-event ) [: CONFIGURED ;] TRIED >STEP ;
+: CONFIGURING ( ^run -- step-event ) [: CONFIGURED ;] TRIED-STEP ;
 
 \ ---- the session's states
 
@@ -640,7 +645,7 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
 : START ( ^run -- step-event )
    {: x :}
    STATUS-PHASE:STARTING x PHASE!
-   x [: LOADED ;] TRIED >STEP ;
+   x [: LOADED ;] TRIED-STEP ;
 
 \ valid fails nothing, so a failure for it is an invariant's.
 : CHECK-FAILURE ( account-check -- failure )
@@ -659,7 +664,7 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
    k VALID? if true exit then
    k CHECK-FAILURE x FAIL ;
 
-: VALIDATING ( ^run -- step-event ) [: VALIDATED ;] TRIED >STEP ;
+: VALIDATING ( ^run -- step-event ) [: VALIDATED ;] TRIED-STEP ;
 
 : SESSION-STARTED ( ^run -- )
    drop LOG:INFO s" daemon" LOG:LINE s" Omabox daemon session started" LOG:TEXT+
@@ -725,7 +730,7 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
       complete OF COMPLETED ENDOF
       fresh OF construct sync-event fresh ENDOF
       root-changed OF
-         0 ROOT-UNAVAILABLE x FAILED construct sync-event failed
+         0 ROOT-UNAVAILABLE x FAILED x WEIGH-PASS
       ENDOF
    ;MATCH ;
 
@@ -735,12 +740,12 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
    [: x RECONCILED x RUN-PASSED ! ;] catch {: code :}
    code 0= if x RUN-PASSED @ exit then
    code code x RUN-LINK @ PASS-FAILURE x FAILED
-   construct sync-event failed ;
+   x WEIGH-PASS ;
 
 : SYNC ( ^run -- sync-event )
    {: x :}
    STATUS-PHASE:SYNCING x PHASE!
-   x [: ROOT-ACTIVE ;] TRIED 0= if construct sync-event failed exit then
+   x [: ROOT-ACTIVE ;] TRIED 0= if x WEIGH-PASS exit then
    x PASSED ;
 
 \ Rust's clean_sync_pass, then the phase.
@@ -801,26 +806,15 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
 : POLL ( ^run -- step-event )
    {: x :}
    x BACKED-OFF
-   x [: POLLED ;] TRIED >STEP ;
+   x [: POLLED ;] TRIED-STEP ;
 
 \ Rust's cycle_completed.
 : CYCLED ( ^run -- ) RUN-SCHEDULE RESET ;
 
 \ ---- waiting and stopping
 
-: DISPOSITION@ ( ^run -- disposition )
-   RUN-FAILURE @ FAILURE-UNMAKE {: d t:str :} d ;
-
 : TEXT@ ( ^run -- str )
    RUN-FAILURE @ FAILURE-UNMAKE {: d t:str :} t ;
-
-: STOPS? ( disposition -- bool )
-   MATCH disposition
-      retry OF drop false ENDOF
-      environmental OF false ENDOF
-      user-action OF true ENDOF
-      invariant OF true ENDOF
-   ;MATCH ;
 
 : FLOOR ( disposition -- n )
    MATCH disposition
@@ -837,10 +831,6 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
       user-action OF false ENDOF
       invariant OF false ENDOF
    ;MATCH ;
-
-: WEIGH ( ^run -- wait-event )
-   DISPOSITION@ STOPS? if construct wait-event stop exit then
-   construct wait-event retry ;
 
 \ For a pass a Dropbox answer ended, the call that answered.
 : CALL+ ( ^run -- )
@@ -874,41 +864,47 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
 
 : EXIT-STATUS ( ^run -- n ) DISPOSITION@ EXIT-CODE ;
 
-\ Rust's run, run_owned and run_session. A failure waits and returns to
-\ its state, polling's to syncing, until one stops the daemon.
+\ Rust's run, run_owned and run_session: a failure that stops ends the run;
+\ any other waits and tries its state again, polling's from syncing.
 FSM:DEFINE DAEMON-RUN ( ^run ) daemon-state step-event
    IN preparing  PREPARE
-      ok      -                  >locking
-      failed  AGAIN-PREPARING    >waiting
+      ok     -                >locking
+      retry  WAITED           >preparing
+      stop   -                >stopped
    IN locking  LOCKING
-      ok      -                  >opening
-      failed  AGAIN-LOCKING      >waiting
+      ok     -                >opening
+      retry  WAITED           >locking
+      stop   -                >stopped
    IN opening  OPENING
-      ok      -                  >notifying
-      failed  AGAIN-OPENING      >waiting
+      ok     -                >notifying
+      retry  WAITED           >opening
+      stop   -                >stopped
    IN notifying  NOTIFYING
-      ok      -                  >configuring
-      failed  AGAIN-NOTIFYING    >waiting
+      ok     -                >configuring
+      retry  WAITED           >notifying
+      stop   -                >stopped
    IN configuring  CONFIGURING
-      ok      -                  >starting
-      failed  AGAIN-CONFIGURING  >waiting
+      ok     -                >starting
+      retry  WAITED           >configuring
+      stop   -                >stopped
    IN starting  START
-      ok      -                  >validating
-      failed  AGAIN-STARTING     >waiting
+      ok     -                >validating
+      retry  WAITED           >starting
+      stop   -                >stopped
    IN validating  VALIDATING
-      ok      SESSION-STARTED    >syncing
-      failed  AGAIN-VALIDATING   >waiting
+      ok     SESSION-STARTED  >syncing
+      retry  WAITED           >validating
+      stop   -                >stopped
    IN syncing  SYNC ( sync-event )
-      clean   CLEANED            >polling
-      dirty   DIRTIED            >polling
-      fresh   REOBSERVE          >syncing
-      failed  AGAIN-SYNCING      >waiting
+      clean  CLEANED          >polling
+      dirty  DIRTIED          >polling
+      fresh  REOBSERVE        >syncing
+      retry  WAITED           >syncing
+      stop   -                >stopped
    IN polling  POLL
-      ok      CYCLED             >syncing
-      failed  AGAIN-SYNCING      >waiting
-   IN waiting  WEIGH ( wait-event )
-      retry   WAITED             RESUMED
-      stop    -                  >stopped
+      ok     CYCLED           >syncing
+      retry  WAITED           >syncing
+      stop   -                >stopped
    FINAL stopped  STOP
 ;DEFINE
 

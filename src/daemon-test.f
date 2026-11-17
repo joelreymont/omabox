@@ -31,6 +31,8 @@
 \ - stand_in_without_birth_time_leaves_the_root_unavailable, /sys/kernel
 \ - syncing_backs_off_and_stops_on_a_refused_refresh, Rust having none:
 \   DAEMON-RUN from a clean pass through a backed-off poll to the stop
+\ The table against its model, through TEST-FORMAL:HOLDS:
+\ - formal_holds_the_daemon_table, DAEMON-RUN and formal/DaemonRun.tla
 \ Run from the repository root: hb --load src/daemon-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -54,6 +56,7 @@ require src/lib/aio.f
 require src/lib/net/curl.f
 require src/test-dropbox.f
 require src/test-client.f
+require src/test-formal.f
 
 \ DAEMON reopened for the private words the tests call.
 package DAEMON
@@ -204,7 +207,6 @@ variable DROPPED
 : AT-NOTIFYING ( -- daemon-state ) construct daemon-state notifying ;
 : AT-SYNCING ( -- daemon-state ) construct daemon-state syncing ;
 : AT-POLLING ( -- daemon-state ) construct daemon-state polling ;
-: AT-WAITING ( -- daemon-state ) construct daemon-state waiting ;
 
 \ One step from s, which must reach want.
 : STEP-TO ( daemon-state ^run daemon-state -- daemon-state )
@@ -216,7 +218,8 @@ variable DROPPED
 : OK? ( step-event -- bool )
    MATCH step-event
       ok OF true ENDOF
-      failed OF false ENDOF
+      retry OF false ENDOF
+      stop OF false ENDOF
    ;MATCH ;
 
 \ A case's directory under TMPDIR.
@@ -257,8 +260,7 @@ variable DROPPED
    s [: LOCK-NAP ;] car NEW-RUN {: x :}
    p x RUN-PATHS !
    AT-LOCKING x AT-OPENING STEP-TO
-   x AT-WAITING STEP-TO x AT-OPENING STEP-TO
-   x AT-WAITING STEP-TO x AT-OPENING STEP-TO
+   x AT-OPENING STEP-TO x AT-OPENING STEP-TO
    x AT-NOTIFYING STEP-TO drop
    NAPS @ 2 T= 0 5000 NAPPED= 1 10000 NAPPED=
    d S\" \qphase\q:\qerror\q" ar STATUS-HAS
@@ -286,24 +288,6 @@ variable DROPPED
    p HELD-PATHS ! jp HELD-JOURNAL !
    0 NAPS !
    [: d p ar HELD-LOCK ;] WITH-CASE
-   d str> FS:REMOVE-TREE ;
-
-: STOPS-FOR-SETUP ( ^ARENA:arena str ^ARENA:arena -- )
-   {: car d ar :}
-   d car STATUS:NEW [: NAP ;] car NEW-RUN {: x :}
-   0 SETUP USER-ACTION x FAILED
-   x AT-WAITING DAEMON-RUN
-   NAPS @ 0 T=
-   d S\" \qphase\q:\qstopped\q" ar STATUS-HAS
-   d SETUP str> ar STATUS-HAS
-   x EXIT-STATUS 78 T= ;
-
-: RECOVERY-CONTROL-PUBLISHES-STOPPED-BEFORE-A-FATAL-EXIT ( ^ARENA:arena -- )
-   {: ar :}
-   s" recovery_control_publishes_stopped_before_a_fatal_exit" T-LABEL
-   ar CASE-DIR {: d:str :}
-   0 NAPS !
-   [: d ar STOPS-FOR-SETUP ;] WITH-CASE
    d str> FS:REMOVE-TREE ;
 
 \ ---- the binding starting checks
@@ -362,6 +346,27 @@ variable DROPPED
    [: d root BINDINGS-CHECKED ;] WITH-CASE
    d str> FS:REMOVE-TREE ;
 
+: STOPS-FOR-SETUP ( ^ARENA:arena str str -- )
+   {: car d root:str :}
+   d d car STATUS:NEW car RUN-IN-DIR drop {: x :}
+   d root CONFIG:>ABS-PATH car CASE-CONFIG x RUN-CONFIG !
+   EXPECTED car CREDENTIAL!
+   x construct daemon-state starting DAEMON-RUN
+   NAPS @ 0 T=
+   d S\" \qphase\q:\qstopped\q" car STATUS-HAS
+   d SETUP str> car STATUS-HAS
+   x EXIT-STATUS 78 T= ;
+
+: RECOVERY-CONTROL-PUBLISHES-STOPPED-BEFORE-A-FATAL-EXIT ( ^ARENA:arena -- )
+   {: ar :}
+   s" recovery_control_publishes_stopped_before_a_fatal_exit" T-LABEL
+   ar CASE-DIR {: d:str :}
+   d s" Dropbox" ar TEST-CLIENT:INSIDE {: root:str :}
+   root str> FS:MAKE-DIR
+   0 NAPS !
+   [: d root STOPS-FOR-SETUP ;] WITH-CASE
+   d str> FS:REMOVE-TREE ;
+
 \ ---- the session polling keeps
 
 : NOTE-DROPPED ( ^u8 -- ) drop true DROPPED ! ;
@@ -374,7 +379,7 @@ variable DROPPED
    {: x s :}
    x CLEANED
    LONGPOLL-503
-   AT-POLLING x AT-WAITING STEP-TO x AT-SYNCING STEP-TO drop
+   AT-POLLING x AT-SYNCING STEP-TO drop
    DROPPED @ TFALSE
    x RUN-SESSION @ NULL-PTR - s NULL-PTR - T= ;
 
@@ -468,7 +473,8 @@ TYPED-VARIABLE CYCLE-ARENA ^ARENA:arena
       clean OF true ENDOF
       dirty OF false ENDOF
       fresh OF false ENDOF
-      failed OF false ENDOF
+      retry OF false ENDOF
+      stop OF false ENDOF
    ;MATCH ;
 
 \ The token route's next answer: Dropbox refuses the refresh token.
@@ -686,12 +692,21 @@ private
    [: CURL:LOOP-STOP AIO:STOP ;] finally ;
 
 
+\ ---- the run's table against its model ----
+
+: FORMAL-HOLDS-THE-DAEMON-TABLE ( ^ARENA:arena -- )
+   {: ar :}
+   s" formal_holds_the_daemon_table" T-LABEL
+   s" src/daemon.f" s" DAEMON-RUN" s" DaemonRun" ar TEST-FORMAL:HOLDS ;
+
+
 \ ---- the suite ----
 
 : RUN ( -- )
    T-RESET
    ARENA:NEW {: ar :}
-   [: ar DAEMON:POLICY-CASES ar ACCOUNT-CASES ar DAEMON:RUN-CASES ;]
+   [: ar DAEMON:POLICY-CASES ar ACCOUNT-CASES ar DAEMON:RUN-CASES
+      ar FORMAL-HOLDS-THE-DAEMON-TABLE ;]
    [: ar ARENA:RELEASE ;] finally
    s" daemon-test: " type T-CASES FMT:.INT s"  checks" type cr
    T-REPORT ;

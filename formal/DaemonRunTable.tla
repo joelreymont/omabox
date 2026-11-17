@@ -1,0 +1,35 @@
+---- MODULE DaemonRunTable ----
+\* The lines of DAEMON-RUN, src/daemon.f, as <<state, input,
+\* next state>>. TEST-FORMAL:HOLDS fails unless this file is that table.
+Lines == {
+    <<"preparing", "ok", "locking">>,
+    <<"preparing", "retry", "preparing">>,
+    <<"preparing", "stop", "stopped">>,
+    <<"locking", "ok", "opening">>,
+    <<"locking", "retry", "locking">>,
+    <<"locking", "stop", "stopped">>,
+    <<"opening", "ok", "notifying">>,
+    <<"opening", "retry", "opening">>,
+    <<"opening", "stop", "stopped">>,
+    <<"notifying", "ok", "configuring">>,
+    <<"notifying", "retry", "notifying">>,
+    <<"notifying", "stop", "stopped">>,
+    <<"configuring", "ok", "starting">>,
+    <<"configuring", "retry", "configuring">>,
+    <<"configuring", "stop", "stopped">>,
+    <<"starting", "ok", "validating">>,
+    <<"starting", "retry", "starting">>,
+    <<"starting", "stop", "stopped">>,
+    <<"validating", "ok", "syncing">>,
+    <<"validating", "retry", "validating">>,
+    <<"validating", "stop", "stopped">>,
+    <<"syncing", "clean", "polling">>,
+    <<"syncing", "dirty", "polling">>,
+    <<"syncing", "fresh", "syncing">>,
+    <<"syncing", "retry", "syncing">>,
+    <<"syncing", "stop", "stopped">>,
+    <<"polling", "ok", "syncing">>,
+    <<"polling", "retry", "syncing">>,
+    <<"polling", "stop", "stopped">>
+}
+====

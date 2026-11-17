@@ -87,6 +87,14 @@ recover; a drive that ends without failure or launch was not asked for one, a
 halt or release stopped a unit it first saw holding the lock, and a halt
 cleared a failed state it last saw.
 
+`DaemonRun` checks the daemon's run, `DAEMON-RUN`: each step runs only once
+what it reads exists and never makes again what the run holds, so the journal
+opens only under the instance lock, systemd hears the daemon is ready only once
+both are held, and a pass or a long poll runs only on a session validated
+against the journal's binding; the long poll follows only a complete pass; and
+only a failure that stops ends the run, while one that continues waits and
+tries its state again, a failed long poll from syncing.
+
 Run the models from this directory with `tlc`, the TLA+ tools' model
 checker on PATH:
 
@@ -102,6 +110,7 @@ tlc -config InventoryPublication.cfg InventoryPublication.tla
 tlc -config DirectoryDeletion.cfg DirectoryDeletion.tla
 tlc -config RemoteLifecycle.cfg RemoteLifecycle.tla
 tlc -config ServiceDrive.cfg ServiceDrive.tla
+tlc -config DaemonRun.cfg DaemonRun.tla
 ```
 
 Each table's check, in its package's tests, holds `<Model>Table.tla` to the
@@ -112,7 +121,8 @@ model's steps follow that table:
   `DOWNLOAD-EXECUTOR` (`DownloadExecutor`) and `SYNC-PASS` (`SyncPass`);
 - `src/replay-test.f`: `LOCAL-LIFECYCLE` (`LocalLifecycle`) and
   `REMOTE-LIFECYCLE` (`RemoteLifecycle`);
-- `src/service-test.f`: `DRIVING` (`ServiceDrive`).
+- `src/service-test.f`: `DRIVING` (`ServiceDrive`);
+- `src/daemon-test.f`: `DAEMON-RUN` (`DaemonRun`).
 
 Same- and cross-filesystem promotion share one durable abstract boundary; TLC
 checks crashes immediately before and after it. Dropbox transport and concrete
