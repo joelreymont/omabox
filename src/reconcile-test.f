@@ -191,6 +191,7 @@
 \   formal/InventoryPublication.tla
 \ - formal_holds_the_download_table, DOWNLOAD-EXECUTOR and
 \   formal/DownloadExecutor.tla
+\ - formal_holds_the_pass_table, SYNC-PASS and formal/SyncPass.tla
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -6249,6 +6250,12 @@ TYPED-VARIABLE RACED str
    s" formal_holds_the_download_table" T-LABEL
    s" src/reconcile.f" s" DOWNLOAD-EXECUTOR" s" DownloadExecutor" ar TEST-FORMAL:HOLDS ;
 
+: FORMAL-HOLDS-THE-PASS-TABLE ( ^ARENA:arena -- )
+   {: ar :}
+   s" formal_holds_the_pass_table" T-LABEL
+   s" src/reconcile.f" s" SYNC-PASS" s" SyncPass" ar
+   TEST-FORMAL:HOLDS ;
+
 
 : CASES ( ^ARENA:arena -- )
    {: ar :}
@@ -6269,7 +6276,8 @@ TYPED-VARIABLE RACED str
    ar CASE-COLLISION-CASES
    ar LISTING-CASES
    ar FORMAL-HOLDS-THE-LISTING-TABLE
-   ar FORMAL-HOLDS-THE-DOWNLOAD-TABLE ;
+   ar FORMAL-HOLDS-THE-DOWNLOAD-TABLE
+   ar FORMAL-HOLDS-THE-PASS-TABLE ;
 
 
 : RUN ( -- )

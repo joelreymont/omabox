@@ -35,6 +35,13 @@ convergence for ordinary changes, and preservation of every present conflict
 side. The corresponding fake-Dropbox tests exercise these cases; TLC does not
 prove that the implementation conforms to the model.
 
+`SyncPass` checks one reconciliation pass, `SYNC-PASS`'s lines: a pass ends
+stale or unrooted wherever the table lets a word answer so, planning reads a
+local scan and a Dropbox listing both taken after the pass last replayed or
+copied, and the complete report comes only from a pass whose replays and
+planning answered ok. What planning and replay do to one path is
+`SyncBehavior`'s.
+
 `DirectoryDeletion` checks one locally deleted directory holding one
 synchronized file while another Dropbox client may rewrite or re-create that
 file. It requires that a remote directory delete is planned only from an
@@ -60,14 +67,16 @@ tlc -config MutationLifecycle.cfg MutationLifecycle.tla
 tlc -config DownloadExecutor.cfg DownloadExecutor.tla
 tlc -config ScanCoordination.cfg ScanCoordination.tla
 tlc -config SyncBehavior.cfg SyncBehavior.tla
+tlc -config SyncPass.cfg SyncPass.tla
 tlc -config InventoryPublication.cfg InventoryPublication.tla
 tlc -config DirectoryDeletion.cfg DirectoryDeletion.tla
 ```
 
-`src/reconcile-test.f` holds `InventoryPublicationTable.tla` and
-`DownloadExecutorTable.tla` to their tables' lines, `INVENTORY-PUBLICATION`'s
-and `DOWNLOAD-EXECUTOR`'s, and runs TLC on each `Follows` module, which states
-that its model's steps follow that table.
+`src/reconcile-test.f` holds `InventoryPublicationTable.tla`,
+`DownloadExecutorTable.tla` and `SyncPassTable.tla` to their tables' lines,
+`INVENTORY-PUBLICATION`'s, `DOWNLOAD-EXECUTOR`'s and `SYNC-PASS`'s, and runs
+TLC on each `Follows` module, which states that its model's steps follow that
+table.
 
 Same- and cross-filesystem promotion share one durable abstract boundary; TLC
 checks crashes immediately before and after it. Dropbox transport and concrete

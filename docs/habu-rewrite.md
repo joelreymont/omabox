@@ -89,9 +89,9 @@ watcher comes only for a measured need.
 - **Machines.** `RECONCILE:PASS`, its listing and its one download, a
   `REPLAY` operation, `DAEMON:RUN`, `SERVICE`'s drive and `DROPBOX`'s
   download and upload session are `fsm.f` tables. Of the `formal/` models,
-  `InventoryPublication` describes the listing's table, `DownloadExecutor`
-  the download's, and `MutationLifecycle` what a local operation's apply
-  does; the other tables have none.
+  `SyncPass` describes the pass's table, `InventoryPublication` the
+  listing's, `DownloadExecutor` the download's, and `MutationLifecycle` what
+  a local operation's apply does; the other tables have none.
 - **`RECONCILE:PASS`** answers `complete` with its counts, `fresh` (rescan) or
   `root-changed`; a Dropbox answer that ends it is in the link, as `REPLAY`'s.
   `DAEMON` validates the account, not the pass. Apart from Rust, a download

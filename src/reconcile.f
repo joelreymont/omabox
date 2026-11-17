@@ -3815,9 +3815,9 @@ ENUM pass-state DERIVE eq
    x PASS-RUN @ STAGING$ [: kept RETAINED? ;] x ARENA@
    LOCAL:REMOVE-UNREFERENCED-UPLOAD-STAGES drop ;
 
-\ One pass. A pass that ends early leaves the journal's plans for the
-\ next pass to replay.
-FSM:DEFINE SYNC-BEHAVIOR ( ^pass ) pass-state pass-event
+\ One pass, after formal/SyncPass.tla. A pass that ends early leaves the
+\ journal's plans for the next pass to replay.
+FSM:DEFINE SYNC-PASS ( ^pass ) pass-state pass-event
    IN settling  SETTLE-PUBLISHED
       ok            -  >recovering
       fresh         -  >stale
@@ -3853,7 +3853,7 @@ FSM:DEFINE SYNC-BEHAVIOR ( ^pass ) pass-state pass-event
    root r RUN-ROOT ! staging r RUN-STAGING ! ar r RUN-ARENA !
    r ;
 
-\ SYNC-BEHAVIOR stops only in a final state.
+\ SYNC-PASS stops only in a final state.
 : ANSWER ( pass-state ^pass -- outcome )
    {: s x :}
    s construct pass-state complete PASS-STATE-EQ if
@@ -3875,7 +3875,7 @@ public
    ar PASSES-NEW {: x :}
    r x PASS-RUN ! recovery x PASS-RECOVERY !
    construct pass-state settling
-   begin x swap SYNC-BEHAVIOR-STEP until
+   begin x swap SYNC-PASS-STEP until
    x ANSWER ;
 
 ;package
