@@ -1553,3 +1553,47 @@ had already filled part of it, so the 3 s was a half-warm build timed as
 a clean one. Timing three builds in a row showed 2.85, 0.53 and 0.55 s,
 and that jump led to the cache; the numbers above set `HABU_OUT` to an
 empty directory for each clean build.
+
+## 2026-11-17: a table held to its model, and a package without a Habu release
+
+Rust's state machines are `match` arms spread over functions; the TLA+
+models beside them were checked against nothing. Habu's `FSM:DEFINE`
+tables are data the language reads, so a test can read one too. Habu had
+no public reader, and I filed a request with Habu's owners and waited. The
+user's answer: "why are you waiting for any owner? you have access to
+habu". The missing word was one commit away, in a language this project
+owns. Rust's version of that gap is a crate to find or a parser to write.
+
+The reader, `FSM:LINES`, takes a table's text and hands back each line's
+state, input and next state, through DEFINE's own grammar. Habu's
+checker shaped it. A word whose body reaches `parse-name`, `create` or a
+`defer` is treated as a possible top-level parser, so pointing DEFINE's
+token source at a string through a deferred word would have marked every
+caller as unverifiable. Instead DEFINE now gathers its tokens first and
+LINES gathers them from the text with a scanner that splits on bytes up
+to 32, as `parse-name` does, and one grammar reads both. The review
+found two things. DEFINE now ends a table at a `;DEFINE` in its header,
+where before it read past it; that is what the checker's
+`parses-through` row already assumed, so the run now agrees with the
+checker, but the docs and tests had to say so. And the test's table used
+single spaces, so a scanner that missed newlines and tabs passed it.
+
+The check itself, in `reconcile-test.f`, holds a TLA+ copy of the
+listing table's lines to the table byte for byte, then runs TLC on a
+module that maps the model's phases onto the table's states and states
+that every step between them is a line and every line such a step. Both
+deliberate breaks failed it: a changed table line fails the byte
+comparison and, once copied, stops TLC on a line the module does not
+name; a changed model step fails `Follows`. The whole reconcile test,
+TLC's JVM included, takes 3.6 s.
+
+Packaging met Habu's bootstrap: nothing builds `hb` without an `hb`, and
+Habu has no release. The PKGBUILD clones Habu at a pinned commit and
+seeds its build with the builder's own `hb`, the route Habu's recovery
+docs give. makepkg builds Habu's engine and both programs in about 30 s.
+A Rust package needs only cargo, which pacman installs.
+
+One stale-build trap: after rebasing the Habu workspace onto a newer
+master, its `bin/hb` still carried the old engine's libraries, and the
+new library source failed with an undefined error word. Rebuilding the
+engine took 8 s.
