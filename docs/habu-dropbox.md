@@ -296,11 +296,11 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
   the chunk's end: a resent chunk Dropbox already had. Any other correct
   offset, or a closed or missing session, is **`gone`**, and the upload starts
   over once.
-- **A finish whose session is gone is verified first.** A resent finish
-  Dropbox already applied answers `lookup_failed/not_found`, so the upload
-  asks `get_metadata` and starts over only when Dropbox does not hold the
-  upload's complete entry with its content hash: a downloadable file with
-  a rev.
+- **A finish whose session is gone is verified first.** Dropbox may have
+  committed it, so the upload asks `get_metadata` and starts over unless it
+  shows the upload's complete entry with its content hash: a downloadable file
+  with a rev. A restart over a committed upload is refused as a conflict,
+  which the replay reads back.
 - **`finish` carries no content hash.** It sends no bytes, and Dropbox
   checks that field against the bytes of the call. The upload is checked
   instead by the content hash of the entry Dropbox commits. The Rust version

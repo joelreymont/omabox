@@ -102,6 +102,15 @@ past the file's end; a drained body holds every byte and a cancelled one was
 left by its reader; and the transfer ends once, by curl's last read or by one
 cancel, exactly when the machine is final or a throw leaves `READ-OUT`.
 
+`UploadSession` checks one upload as `SESSION` runs it: a stage of one chunk in
+one files/upload, a longer one through a session's start, an append a chunk and
+a finish. Dropbox takes an append only at its session's offset and commits only
+the whole stage over the upload's revision; a call may have acted though its
+answer does not say so, a session may be gone at any call, and get_metadata may
+not show an upload Dropbox holds. The upload answers done only while Dropbox
+holds its complete entry at its path, counts as accepted only chunks its
+session holds, and, resending a chunk once and restarting once, ends.
+
 Run the models from this directory with `tlc`, the TLA+ tools' model
 checker on PATH:
 
@@ -119,6 +128,7 @@ tlc -config RemoteLifecycle.cfg RemoteLifecycle.tla
 tlc -config ServiceDrive.cfg ServiceDrive.tla
 tlc -config DaemonRun.cfg DaemonRun.tla
 tlc -config Downloading.cfg Downloading.tla
+tlc -config UploadSession.cfg UploadSession.tla
 ```
 
 Each table's check, in its package's tests, holds `<Model>Table.tla` to the
@@ -131,9 +141,10 @@ model's steps follow that table:
   `REMOTE-LIFECYCLE` (`RemoteLifecycle`);
 - `src/service-test.f`: `DRIVING` (`ServiceDrive`);
 - `src/daemon-test.f`: `DAEMON-RUN` (`DaemonRun`);
-- `src/dropbox-test.f`: `DOWNLOADING` (`Downloading`).
+- `src/dropbox-test.f`: `DOWNLOADING` (`Downloading`) and `SESSION`
+  (`UploadSession`).
 
 Same- and cross-filesystem promotion share one durable abstract boundary; TLC
 checks crashes immediately before and after it. Dropbox's HTTP beyond the reads
-`Downloading` models, and concrete filesystem syscalls, remain outside the
-models.
+`Downloading` models and the answers `UploadSession` models, and concrete
+filesystem syscalls, remain outside the models.

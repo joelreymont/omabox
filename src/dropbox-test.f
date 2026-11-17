@@ -63,8 +63,9 @@
 \ captured in TMPDIR, checked and removed. A stub in place of AIO's
 \ transfer fails the stage's reads. Each failed assertion prints its
 \ label; the run goes on and fails at its end.
-\ The table against its model, through TEST-FORMAL:HOLDS:
-\ formal_holds_the_downloading_table, DOWNLOADING and formal/Downloading.tla.
+\ The tables against their models, through TEST-FORMAL:HOLDS:
+\ formal_holds_the_downloading_table, DOWNLOADING and formal/Downloading.tla;
+\ formal_holds_the_session_table, SESSION and formal/UploadSession.tla.
 \ Run from the repository root: hb --load src/dropbox-test.f </dev/null
 require src/lib/aio.f
 require src/lib/byte-buffer.f
@@ -3015,6 +3016,12 @@ TYPED-VARIABLE FAULT fault
    s" src/dropbox.f" s" DOWNLOADING" s" Downloading" AR @ TEST-FORMAL:HOLDS ;
 
 
+\ SESSION's lines against formal/UploadSession.tla.
+: FORMAL-SESSION-CASE ( -- )
+   s" formal_holds_the_session_table" T-LABEL
+   s" src/dropbox.f" s" SESSION" s" UploadSession" AR @ TEST-FORMAL:HOLDS ;
+
+
 \ The curl loop started; the run goes on and fails at its end if not.
 : CURL-STARTED ( CURL:status -- )
    MATCH CURL:status
@@ -3028,6 +3035,7 @@ public
    T-RESET
    ARENA:NEW AR !
    FORMAL-DOWNLOADING-CASE
+   FORMAL-SESSION-CASE
    AIO:START CURL:LOOP-START CURL-STARTED
    [: SERVED ;] [: CURL:LOOP-STOP AIO:STOP ;] finally
    AR @ ARENA:RELEASE

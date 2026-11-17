@@ -3085,8 +3085,9 @@ ENUM restart-event once twice ;ENUM
    0 r RUN-ACCEPTED ! false r RUN-RESENT ! ;
 
 
-\ verifying asks whether a finish whose session is gone was a resend
-\ Dropbox already committed, and starts over only when it was not.
+\ One upload, after formal/UploadSession.tla. A finish whose session is
+\ gone may have been committed: verifying starts over unless get_metadata
+\ shows the upload's complete entry at its path.
 FSM:DEFINE SESSION ( ^run ) upload-step send-event
    IN single  SEND-SENSE
       committed  ANSWER-DONE        >ended
