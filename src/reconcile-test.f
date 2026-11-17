@@ -183,6 +183,11 @@
 \ - documented_exclusions_preserve_payloads_while_ordinary_siblings_sync,
 \   with no account request
 \ - excluded_pending_and_blocked_work_is_retired_across_reopen_without_effects
+\ The tables against their models, through TEST-FORMAL:HOLDS:
+\ - formal_holds_the_listing_table, INVENTORY-PUBLICATION and
+\   formal/InventoryPublication.tla
+\ - formal_holds_the_download_table, DOWNLOAD-EXECUTOR and
+\   formal/DownloadExecutor.tla
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
