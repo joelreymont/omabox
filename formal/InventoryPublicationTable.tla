@@ -1,6 +1,6 @@
 ---- MODULE InventoryPublicationTable ----
 \* The lines of INVENTORY-PUBLICATION, src/reconcile.f, as <<state, input,
-\* next state>>. src/reconcile-test.f fails unless this file is that table.
+\* next state>>. TEST-FORMAL:HOLDS fails unless this file is that table.
 Lines == {
     <<"starting", "some", "delta">>,
     <<"starting", "none", "full">>,
