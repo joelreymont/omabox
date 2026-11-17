@@ -19,16 +19,13 @@ setup command that cannot succeed without configuration.
 Missing, stale, malformed, and CLI errors are explicit, and a service that
 stopped on a failure shows why. Logs and setup help remain one click away.
 
-Install the release build while the desktop session is unlocked:
+The Omabox package installs the widget under
+`/usr/share/omabox/omarchy/plugins/local.omabox`, and `omabox setup` links
+`~/.config/omarchy/plugins/local.omabox` to it. Enable it with:
 
 ```bash
-omabox install
 omarchy plugin enable local.omabox --section right --after omarchy.tray
 ```
 
 Disable the built-in Dropbox widget with `omarchy plugin disable
 omarchy.dropbox` to avoid showing both clients.
-
-Install and upgrade validate a complete staged plugin outside the watched
-directory, then publish it atomically. They refuse publication while the shell
-is locked because plugin changes trigger a live shell reload.

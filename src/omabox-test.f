@@ -7,6 +7,10 @@
 \   options compared with OPTIONS=
 \ - default_sync_root_is_a_private_home_dropbox_created_once, the home a
 \   directory under TMPDIR
+\ - the_widget_link_is_made_once_and_never_replaces_an_entry and
+\   the_widget_link_refuses_a_bad_home_or_plugins_folder, Omabox's own:
+\   HOME-WIDGET of a home under TMPDIR, each refusal's log in a file
+\   there
 \ - failed_initial_setup_leaves_no_config_and_same_command_can_retry,
 \   the sync root and XDG homes in a directory under TMPDIR
 \ - an_overlong_authorization_code_is_rejected_within_the_bound,
@@ -68,9 +72,10 @@
 \   library code and of an OMABOX code, its log in a file under TMPDIR
 \ and the program built with README's command into a directory under
 \ TMPDIR, whose --version prints its name and version and exits 0.
-\ White-box: OMABOX is reopened for PARSE, HOME-ROOT, COMPLETE-SETUP,
-\ READ-CODE, RUN-SERVICE, STATUS-TEXT, SETTINGS-TEXT, RESTORE-GOAL,
-\ RELEASED, SET-ROOT, UNEXPECTED, EXCHANGED, LINKED and BIND.
+\ White-box: OMABOX is reopened for PARSE, HOME-ROOT, HOME-WIDGET,
+\ COMPLETE-SETUP, READ-CODE, RUN-SERVICE, STATUS-TEXT, SETTINGS-TEXT,
+\ RESTORE-GOAL, RELEASED, SET-ROOT, UNEXPECTED, EXCHANGED, LINKED and
+\ BIND.
 \ Run from the repository root: hb --load src/omabox-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -387,6 +392,95 @@ variable CHANGES
    d s" stderr.txt" ar INSIDE {: p :}
    NO-STR p ar NO-ROOT
    s" relative/home" SOME-STR p ar NO-ROOT
+   d str> FS:REMOVE-TREE ;
+
+\ The symlink at link reads as the target.
+: LINKS-TO ( str ^u8 n ^ARENA:arena -- )
+   {: link t:^ tu:n ar :}
+   link ar CONFIG:READLINK MATCH option
+      some OF str> t tu T$= ENDOF
+      none OF false TTRUE ENDOF
+   ;MATCH ;
+
+\ HOME-WIDGET of the home, refused with the code, captured in p.
+: WIDGET-REFUSED ( option<str> n str ^ARENA:arena -- )
+   {: home want:n p ar :}
+   [: home ar HOME-WIDGET ;] p str> ar STDERR:CAPTURING
+   {: code:n e:^ eu:n :}
+   code want T=
+   e eu LINES 2 T= ;
+
+\ HOME-WIDGET of the home links link, then leaves it as it is.
+: LINKED-ONCE ( str str ^ARENA:arena -- )
+   {: home link ar :}
+   home OPTION:SOME ar HOME-WIDGET
+   link WIDGET ar LINKS-TO
+   home OPTION:SOME ar HOME-WIDGET
+   link WIDGET ar LINKS-TO ;
+
+\ A link at link to another target is refused and kept.
+: OTHER-LINK-KEPT ( str str str ^ARENA:arena -- )
+   {: home link p ar :}
+   link str> FS:REMOVE-FILE
+   s" /elsewhere" link str> FS:MAKE-SYMLINK
+   home OPTION:SOME E-WIDGET-TAKEN p ar WIDGET-REFUSED
+   link s" /elsewhere" ar LINKS-TO ;
+
+\ A folder at link is refused and kept with what it holds.
+: FOLDER-KEPT ( str str str ^ARENA:arena -- )
+   {: home link p ar :}
+   link str> FS:REMOVE-FILE
+   link s" kept" ar INSIDE {: kept :}
+   kept str> FS:MAKE-DIRS
+   home OPTION:SOME E-WIDGET-TAKEN p ar WIDGET-REFUSED
+   link str> FS:SYMLINK? TFALSE
+   kept str> FS:DIR? TTRUE ;
+
+: THE-WIDGET-LINK-IS-MADE-ONCE-AND-NEVER-REPLACES-AN-ENTRY
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" the_widget_link_is_made_once_and_never_replaces_an_entry" T-LABEL
+   ar TEMPORARY {: d :}
+   d s" home" ar INSIDE {: home :}
+   home str> FS:MAKE-DIR
+   home s" .config/omarchy/plugins/local.omabox" ar INSIDE {: link :}
+   d s" stderr.txt" ar INSIDE {: p :}
+   home link ar LINKED-ONCE
+   home link p ar OTHER-LINK-KEPT
+   home link p ar FOLDER-KEPT
+   d str> FS:REMOVE-TREE ;
+
+\ A file at home/.config is refused and kept.
+: CONFIG-FILE-KEPT ( str str ^ARENA:arena -- )
+   {: home p ar :}
+   home s" .config" ar INSIDE {: f :}
+   f str> s" not a directory" FS:WRITE-ALL
+   home OPTION:SOME E-LINK-WIDGET p ar WIDGET-REFUSED
+   f str> FS:FILE? TTRUE
+   f str> FS:REMOVE-FILE ;
+
+\ A plugins folder of mode 0500 is refused and left with no link.
+: READ-ONLY-PLUGINS ( str str ^ARENA:arena -- )
+   {: home p ar :}
+   home s" .config/omarchy/plugins" ar INSIDE {: dir :}
+   dir str> FS:MAKE-DIRS
+   dir str> $140 FS:CHMOD-MODE
+   home OPTION:SOME E-LINK-WIDGET p ar WIDGET-REFUSED
+   dir str> FS:MODE-PRIVATE-DIR FS:CHMOD-MODE
+   dir s" local.omabox" ar INSIDE str> FS:SYMLINK? TFALSE ;
+
+: THE-WIDGET-LINK-REFUSES-A-BAD-HOME-OR-PLUGINS-FOLDER
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" the_widget_link_refuses_a_bad_home_or_plugins_folder" T-LABEL
+   ar TEMPORARY {: d :}
+   d s" stderr.txt" ar INSIDE {: p :}
+   NO-STR E-NO-HOME p ar WIDGET-REFUSED
+   s" relative/home" SOME-STR E-NO-HOME p ar WIDGET-REFUSED
+   d s" home" ar INSIDE {: home :}
+   home str> FS:MAKE-DIR
+   home p ar CONFIG-FILE-KEPT
+   home p ar READ-ONLY-PLUGINS
    d str> FS:REMOVE-TREE ;
 
 \ setup --sync-root root --app-key public-app-key.
@@ -1795,6 +1889,8 @@ variable REC-WRITES
    ar PARSER-REJECTS-INCOMPLETE-OR-SECRET-BEARING-FORMS
    ar PARSER-NAMES-THE-SETUP-OPTION-FAULT
    ar DEFAULT-SYNC-ROOT-IS-A-PRIVATE-HOME-DROPBOX-CREATED-ONCE
+   ar THE-WIDGET-LINK-IS-MADE-ONCE-AND-NEVER-REPLACES-AN-ENTRY
+   ar THE-WIDGET-LINK-REFUSES-A-BAD-HOME-OR-PLUGINS-FOLDER
    ar FAILED-INITIAL-SETUP-LEAVES-NO-CONFIG-AND-SAME-COMMAND-CAN-RETRY
    ar AN-OVERLONG-AUTHORIZATION-CODE-IS-REJECTED-WITHIN-THE-BOUND
    ar AN-AUTHORIZATION-CODE-AT-THE-LIMIT-IS-ACCEPTED

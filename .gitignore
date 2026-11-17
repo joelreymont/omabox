@@ -3,3 +3,5 @@
 /states/
 /.jj-ws.noindex/
 /bin/
+/packaging/arch/*/
+/packaging/arch/*.pkg.tar.*

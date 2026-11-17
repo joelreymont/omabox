@@ -1,0 +1,9 @@
+[Trigger]
+Type = Path
+Operation = Upgrade
+Target = usr/bin/omaboxd
+
+[Action]
+Description = Restarting running Omabox services...
+When = PostTransaction
+Exec = /usr/share/libalpm/scripts/omabox-service upgrade

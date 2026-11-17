@@ -1,0 +1,9 @@
+[Trigger]
+Type = Path
+Operation = Remove
+Target = usr/bin/omaboxd
+
+[Action]
+Description = Stopping running Omabox services...
+When = PreTransaction
+Exec = /usr/share/libalpm/scripts/omabox-service remove

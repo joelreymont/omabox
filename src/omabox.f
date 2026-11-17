@@ -15,12 +15,14 @@
 \ while the service is released and under the daemon lock, the new root
 \ inspected, the config written and the journal, where there is one,
 \ made to adopt the root.
-\ setup is Rust's: its options parsed whole, the config made or loaded
-\ and its state prepared, a browser login exchanged and checked against
-\ the account and remote root while the service still syncs, then,
-\ with the service released and under the daemon lock, the journal
-\ bound, the refresh token stored and a new config written. DROPBOX's
-\ calls run under AIO's and CURL's loops, started for them alone.
+\ setup is Rust's, with the Omarchy widget linked once its options are
+\ parsed whole and before the config, so a refused link makes no
+\ ~/Dropbox: the config made or loaded and its state prepared, a
+\ browser login exchanged and checked against the account and remote
+\ root while the service still syncs, then, with the service released
+\ and under the daemon lock, the journal bound, the refresh token
+\ stored and a new config written. DROPBOX's calls run under AIO's and
+\ CURL's loops, started for them alone.
 \ STORAGE CLASS. CALLER-OWNED: a command's service commands, drive
 \ record, configuration, text, lock, default root, authorization code,
 \ root binding, Dropbox client, login and journal live in an arena the
@@ -85,6 +87,12 @@ public
 -101117
    s" could not inspect the Omabox journal before changing the sync root"
    ERROR:CODE E-INSPECT-JOURNAL
+-101118
+   s" ~/.config/omarchy/plugins/local.omabox is not the Omabox widget's link"
+   ERROR:CODE E-WIDGET-TAKEN
+-101119 s" HOME must be an absolute path to link the Omarchy widget"
+   ERROR:CODE E-NO-HOME
+-101120 s" could not link the Omarchy widget" ERROR:CODE E-LINK-WIDGET
 
 private
 
@@ -294,6 +302,27 @@ ARENA JOURNALS JOURNAL:journal
    root str> LOG:TEXT+
    s" Create the directory, or pass --sync-root PATH." HELP
    E-CREATE-DEFAULT-ROOT cause FAIL ;
+
+: WIDGET-TAKEN ( str -- )
+   {: link :}
+   LOG-OPEN link str> LOG:TEXT+
+   s"  is not the Omabox widget's link" LOG:TEXT+
+   s" Move what is there, then run `omabox setup` again." HELP
+   E-WIDGET-TAKEN 0 FAIL ;
+
+: NO-HOME ( -- )
+   LOG-OPEN s" HOME must be an absolute path to link the Omarchy" LOG:TEXT+
+   s"  widget" LOG:TEXT+
+   s" Set HOME, then run `omabox setup` again." HELP
+   E-NO-HOME 0 FAIL ;
+
+: LINK-FAILED ( str n -- )
+   {: link cause:n :}
+   LOG-OPEN s" could not link the Omarchy widget at " LOG:TEXT+
+   link str> LOG:TEXT+
+   s" Make ~/.config/omarchy/plugins a writable folder," HELP
+   s"  then run `omabox setup` again." LOG:TEXT+
+   E-LINK-WIDGET cause FAIL ;
 
 \ Whether code lies in the block from first down to last.
 : IN? ( n n n -- bool )
@@ -780,11 +809,27 @@ ARENA JOURNALS JOURNAL:journal
    u 0= if false exit then
    a c@ [char] / = ;
 
-\ dir/Dropbox, joined as PathBuf::join: no second separator.
-: DROPBOX-IN ( str ^ARENA:arena -- str )
-   {: h ar :}
-   h h str> + 1- c@ [char] / <> if s" /" ar FOLLOWED then
-   s" Dropbox" ar FOLLOWED ;
+\ dir/name, joined as PathBuf::join: no second separator.
+: IN-DIR ( str ^u8 n ^ARENA:arena -- str )
+   {: d name:^ nu:n ar :}
+   d d str> + 1- c@ [char] / <> if s" /" ar FOLLOWED then
+   name nu ar FOLLOWED ;
+
+\ The home where it is absolute; fail, which throws, refuses a missing
+\ or relative one.
+: ABSOLUTE-HOME ( option<str> [ -- ] -- str )
+   {: home fail :}
+   home MATCH option
+      some OF ENDOF
+      none OF s" " >str ENDOF
+   ;MATCH {: h :}
+   h ABSOLUTE? 0= if fail execute then
+   h ;
+
+\ HOME from the environment, none where unset.
+: HOME-ENV ( -- option<str> )
+   s" HOME" GETENV {: a:^ u:n :}
+   a NULL-PTR = if NO-STR else a u >str OPTION:SOME then ;
 
 \ The directory made 0700, under the umask; an entry already there
 \ stays, as Rust's AlreadyExists does.
@@ -801,22 +846,60 @@ ARENA JOURNALS JOURNAL:journal
 \ Rust's create_default_sync_root for the home: home/Dropbox.
 : HOME-ROOT ( option<str> ^ARENA:arena -- str )
    {: home ar :}
-   home MATCH option
-      some OF ENDOF
-      none OF NO-DEFAULT-ROOT ENDOF
-   ;MATCH {: h :}
-   h ABSOLUTE? 0= if NO-DEFAULT-ROOT then
-   h ar DROPBOX-IN {: root :}
+   home [: NO-DEFAULT-ROOT ;] ABSOLUTE-HOME
+   s" Dropbox" ar IN-DIR {: root :}
    root MADE
    root ;
+
+\ The errno behind a code FS threw: FS:ERRNO for E-FS-IO, else
+\ STAT-CAUSE's.
+: FS-CAUSE ( n -- n )
+   {: code:n :}
+   code E-FS-IO = if FS:ERRNO exit then
+   code STAT-CAUSE ;
+
+\ The widget the package installs.
+: WIDGET ( -- ^u8 n ) s" /usr/share/omabox/omarchy/plugins/local.omabox" ;
+
+\ Omarchy's plugins folder under the home: Omarchy reads $HOME/.config,
+\ never XDG_CONFIG_HOME (omarchy-plugin-add:14).
+: PLUGINS-DIR ( option<str> ^ARENA:arena -- str )
+   {: home ar :}
+   home [: NO-HOME ;] ABSOLUTE-HOME
+   s" .config/omarchy/plugins" ar IN-DIR ;
+
+\ Whether link is the widget's link; false only where readlink answers
+\ ENOENT. Another link, a file or a folder (EINVAL) is WIDGET-TAKEN.
+: WIDGET-THERE? ( str ^ARENA:arena -- bool )
+   {: link ar :}
+   link ar CONFIG:READLINK MATCH option
+      some OF str> WIDGET STR= 0= if link WIDGET-TAKEN then true ENDOF
+      none OF false ENDOF
+   ;MATCH if true exit then
+   FS:ERRNO FS:EINVAL = if link WIDGET-TAKEN then
+   FS:ERRNO FS:ENOENT <> if link FS:ERRNO LINK-FAILED then
+   false ;
+
+\ The folders to dir and the widget's link at link, made.
+: WIDGET-MADE ( str str -- )
+   {: dir link :}
+   [: dir str> FS:MAKE-DIRS WIDGET link str> FS:MAKE-SYMLINK ;] catch
+   {: code:n :}
+   code 0<> if link code FS-CAUSE LINK-FAILED then ;
+
+\ The widget linked under the home, where its link is not already there.
+: HOME-WIDGET ( option<str> ^ARENA:arena -- )
+   {: home ar :}
+   home ar PLUGINS-DIR {: dir :}
+   dir s" local.omabox" ar IN-DIR {: link :}
+   link ar WIDGET-THERE? if exit then
+   dir link WIDGET-MADE ;
 
 \ HOME/Dropbox, made where missing; a root named with --sync-root
 \ must already exist, so a mistyped one fails instead.
 : DEFAULT-ROOT ( ^ARENA:arena -- str )
    {: ar :}
-   s" HOME" GETENV {: a:^ u:n :}
-   a NULL-PTR = if NO-STR else a u >str OPTION:SOME then
-   ar HOME-ROOT ;
+   HOME-ENV ar HOME-ROOT ;
 
 \ The index of the first LF in the bytes from..to, or -1.
 : LF-AT ( ^u8 n n -- n )
@@ -1201,6 +1284,7 @@ ARENA PRIORS prior
    {: o s ar :}
    AUTH:BIND
    o SETUP-OPTIONS-UNMAKE {: r i :}
+   HOME-ENV ar HOME-WIDGET
    i ar SETUP-CONFIG {: c w:bool :}
    c STATE-PREPARED
    c r ar AUTHORIZE {: a :}

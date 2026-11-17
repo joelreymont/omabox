@@ -15,35 +15,35 @@ untouched locally and skips syncing them: names ending in `.DS_Store`,
 
 ## Install
 
-There is no release build yet: the rewrite in Habu is under way, and
-`docs/habu-rewrite.md` lists what remains.
-
-To build the daemon as `bin/omaboxd`, run this from the repository root, with
-`HABU` naming a Habu checkout; `bin/omaboxd --self-check` then prints its version.
+Omabox ships as an Arch package for aarch64. On an aarch64 machine, build and
+install it from `packaging/arch`; the PKGBUILD fetches Omabox's release tag and
+Habu at a pinned commit, and builds that Habu with the `hb` on your `PATH`:
 
 ```bash
-mkdir -p bin
-$HABU/bin/hb --load $HABU/tools/hb-build.f -- src/omaboxd.f -o bin/omaboxd
+cd packaging/arch
+makepkg -si
 ```
 
 Create a Dropbox API app and copy its public app key. Omabox neither needs nor
-accepts the app secret. Then, from a release build and while the desktop is
-unlocked:
+accepts the app secret. Then:
 
 ```bash
-omabox install
 omabox setup --app-key YOUR_APP_KEY
 omabox service enable
 omabox service start
 ```
 
-Setup syncs `~/Dropbox`, creating it if missing; pass `--sync-root PATH` to sync
-another existing directory instead.
+Setup links the Omarchy widget, `~/.config/omarchy/plugins/local.omabox`, to
+the packaged one, then runs the browser login. It syncs `~/Dropbox`, creating
+it if missing; pass `--sync-root PATH` to sync another existing directory
+instead.
 
 Setup prints a Dropbox authorization URL, asks for the code Dropbox shows once
 you approve, and stores the refresh token in Secret Service, never in the
-configuration or SQLite journal. Installation writes only the two binaries, a
-systemd user unit, and the packaged Omarchy plugin.
+configuration or SQLite journal. The package installs `omabox` and `omaboxd` in
+`/usr/bin`, the systemd user unit `omabox.service`, the Omarchy widget under
+`/usr/share/omabox/omarchy/plugins/local.omabox`, and two pacman hooks with
+their script.
 
 Enable the widget if wanted:
 
@@ -78,20 +78,28 @@ re-created locally.
 
 ## Upgrade or remove
 
-Run a new release's `omabox upgrade` to replace the installed one, and
-`omabox uninstall` to remove it.
+To upgrade, build and install the new release's package as above. pacman
+restarts a running service on the new program and starts a failed one again;
+if it still fails, `omabox status` and `omabox logs` show why. The widget runs
+its new code after `omarchy restart shell`. An upgrade cannot roll back: to go
+back, install the previous package file makepkg built with `pacman -U`.
 
-Upgrade validates the complete replacement and rolls back if the new daemon
-cannot replace a running one. A service that was still starting is restarted
-on the new build, and one that had failed is started again on it; if either
-still fails, the new build stays and `omabox status` and `omabox logs` show
-why. Uninstall removes program artifacts but retains configuration,
-credentials, journal state, recovery data, local files, and Dropbox content.
-It also takes the widget off the Omarchy bar; after a reinstall, enable it
-again as above.
-Commands that replace the live QuickShell plugin refuse to run while locked.
+`pacman -R omabox` stops the service and removes the programs, the unit and the
+widget. It keeps configuration, credentials, journal state, recovery data,
+local files, and Dropbox content. The widget link stays, and Omarchy skips it
+while it points nowhere.
 
 ## Develop
+
+To build the daemon as `bin/omaboxd` and the CLI as `bin/omabox`, run this from
+the repository root, with `HABU` naming a Habu checkout; `bin/omaboxd
+--self-check` then prints its version.
+
+```bash
+mkdir -p bin
+$HABU/bin/hb --load $HABU/tools/hb-build.f -- src/omaboxd.f -o bin/omaboxd
+$HABU/bin/hb --load $HABU/tools/hb-build.f -- src/omabox.f -o bin/omabox
+```
 
 The Omarchy plugin's QML tests need Qt 6's `qmltestrunner`, from
 `qt6-declarative`. Find it through `qmake6 -query QT_INSTALL_BINS` rather than

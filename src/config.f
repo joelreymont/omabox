@@ -461,6 +461,8 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
    u 0 < if FFI:ERRNO FS:CAUSE! OPTION:NONE exit then
    ROW u >str ar COPY >ABS-PATH OPTION:SOME ;
 
+public
+
 \ readlink, laid in the arena; none leaves the cause in FS:ERRNO.
 : READLINK ( str ^ARENA:arena -- option<str> )
    {: s ar :}
@@ -468,6 +470,8 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
    s str> FS:>PATHZ ROW FS:PATHZ-CAP readlink {: u:n :}
    u 0 < if OPTION:NONE exit then
    ROW u >str ar COPY OPTION:SOME ;
+
+private
 
 \ open for reading, as Rust's File::open: the descriptor, or E-READ.
 : OPENED ( abs-path -- n )

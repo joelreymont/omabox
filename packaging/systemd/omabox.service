@@ -7,7 +7,7 @@ StartLimitBurst=5
 [Service]
 Type=notify
 ExecStartPre=-/usr/bin/rm -f %t/omabox/status.json
-ExecStart=%h/.local/bin/omaboxd
+ExecStart=/usr/bin/omaboxd
 ExecStopPost=-/bin/sh -c 'if [ "$$SERVICE_RESULT" = success ]; then exec /usr/bin/rm -f "%t/omabox/status.json"; fi'
 Restart=on-failure
 RestartPreventExitStatus=70 78

@@ -1,0 +1,40 @@
+pkgname=omabox
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Dropbox sync for Omarchy: a headless daemon, a CLI and a bar widget'
+arch=(aarch64)
+url=https://github.com/joelreymont/omabox
+license=(MIT)
+depends=(glibc curl sqlite libsecret glib2 libunistring systemd)
+makedepends=(git)
+# Habu's programs have no section headers to strip or split.
+options=(!strip !debug)
+_habu=6391c0b45e03890b7787b6bb890bec36445ca02b
+source=("omabox::git+https://github.com/joelreymont/omabox.git#tag=v$pkgver"
+        "habu::git+https://github.com/joelreymont/habu.git#commit=$_habu")
+sha256sums=(SKIP SKIP)
+
+build() {
+  # No route builds hb without an hb: the builder's seeds one built from the
+  # pinned source (Habu's docs/bootstrap.md, "Recovery").
+  local seed
+  seed=$(command -v hb) || { echo "makepkg needs Habu's hb on PATH" >&2; return 1; }
+  (cd habu && "$seed" --load tools/seed-main.f -- "$seed")
+  cd omabox
+  mkdir -p bin
+  ../habu/bin/hb --load ../habu/tools/hb-build.f -- src/omaboxd.f -o bin/omaboxd
+  ../habu/bin/hb --load ../habu/tools/hb-build.f -- src/omabox.f -o bin/omabox
+}
+
+package() {
+  cd omabox
+  local widget=packaging/omarchy/plugins/local.omabox
+  install -Dm755 -t "$pkgdir/usr/bin" bin/omabox bin/omaboxd
+  install -Dm644 -t "$pkgdir/usr/lib/systemd/user" packaging/systemd/omabox.service
+  install -Dm644 -t "$pkgdir/usr/share/omabox/omarchy/plugins/local.omabox" \
+    "$widget/manifest.json" "$widget/Panel.qml" "$widget/Status.qml"
+  install -Dm644 -t "$pkgdir/usr/share/libalpm/hooks" \
+    packaging/arch/omabox-upgrade.hook packaging/arch/omabox-remove.hook
+  install -Dm755 -t "$pkgdir/usr/share/libalpm/scripts" packaging/arch/omabox-service
+  install -Dm644 -t "$pkgdir/usr/share/licenses/omabox" LICENSE
+}

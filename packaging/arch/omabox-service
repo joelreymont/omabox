@@ -1,0 +1,25 @@
+#!/bin/sh
+# omabox-service upgrade|remove: run by pacman's hooks, restarts each logged-in
+# user's running Omabox service after an upgrade, or stops it before removal.
+
+verb=$1
+
+/usr/bin/loginctl list-users --no-legend | while read -r uid user _; do
+  if ! state=$(/usr/bin/systemctl --user -M "$uid@" show -p ActiveState \
+      --value omabox.service </dev/null); then
+    echo "omabox-service: show failed for $user" >&2
+    continue
+  fi
+  case $verb:$state in
+    upgrade:active|upgrade:activating|upgrade:reloading) actions=restart ;;
+    upgrade:failed) actions='reset-failed start' ;;
+    remove:active|remove:activating|remove:reloading|remove:deactivating) actions=stop ;;
+    *) actions= ;;
+  esac
+  for action in $actions; do
+    /usr/bin/systemctl --user -M "$uid@" "$action" omabox.service </dev/null ||
+      echo "omabox-service: $action failed for $user" >&2
+  done
+done
+
+exit 0

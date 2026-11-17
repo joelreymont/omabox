@@ -102,6 +102,10 @@ watcher comes only for a measured need.
   hash mismatch blocks its path too, where Rust ends the pass.
 - **Upload progress.** `DROPBOX:UPLOAD` takes a quotation `[ n -- ]`, called
   with the bytes Dropbox has accepted.
+- **Install.** An Arch package (`packaging/arch`) replaces Rust's `omabox
+  install`, `upgrade` and `uninstall`. Apart from Rust, an upgrade cannot roll
+  back: the previous package file makepkg built is the way back. `omabox
+  setup` links the Omarchy widget the package installs, before the login.
 
 ## Tests
 
