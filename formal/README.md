@@ -63,6 +63,14 @@ completely while a raced one settles with the payload preserved on both sides. E
 completions are separate steps, so replay after a crash between them is
 covered. `DropboxClient::delete_folder` realizes the probe-then-delete step.
 
+`RemoteLifecycle` checks one plan's operations replayed against Dropbox one
+pass at a time: a completed operation passes, a pending one is sent, and a
+blocked or local one ends the plan's turn. Dropbox may hold an operation's
+effect before the journal records it, and another client may change its path.
+The journal completes an operation only once Dropbox holds its effect or its
+plan retired, operations reach Dropbox in plan order, and nothing is sent for
+a plan that completed or retired.
+
 `InventoryPublication` checks fresh listings, cursor deltas, reset-triggered
 rebuilds, multi-page failures, crashes, retries, and atomic publication. Partial
 pages and failed attempts must leave the prior durable inventory and cursor
@@ -81,6 +89,7 @@ tlc -config SyncBehavior.cfg SyncBehavior.tla
 tlc -config SyncPass.cfg SyncPass.tla
 tlc -config InventoryPublication.cfg InventoryPublication.tla
 tlc -config DirectoryDeletion.cfg DirectoryDeletion.tla
+tlc -config RemoteLifecycle.cfg RemoteLifecycle.tla
 ```
 
 Each table's check, in its package's tests, holds `<Model>Table.tla` to the
@@ -89,7 +98,8 @@ model's steps follow that table:
 
 - `src/reconcile-test.f`: `INVENTORY-PUBLICATION` (`InventoryPublication`),
   `DOWNLOAD-EXECUTOR` (`DownloadExecutor`) and `SYNC-PASS` (`SyncPass`);
-- `src/replay-test.f`: `LOCAL-LIFECYCLE` (`LocalLifecycle`).
+- `src/replay-test.f`: `LOCAL-LIFECYCLE` (`LocalLifecycle`) and
+  `REMOTE-LIFECYCLE` (`RemoteLifecycle`).
 
 Same- and cross-filesystem promotion share one durable abstract boundary; TLC
 checks crashes immediately before and after it. Dropbox transport and concrete

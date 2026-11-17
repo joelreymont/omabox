@@ -109,6 +109,8 @@
 \   replace's stage holds its plan stage-occupied, in the report.
 \ - LOCAL-LIFECYCLE's lines are formal/LocalLifecycleTable.tla's, and
 \   TLC finds formal/LocalLifecycle.tla's steps follow them.
+\ - REMOTE-LIFECYCLE's lines are formal/RemoteLifecycleTable.tla's,
+\   and TLC finds formal/RemoteLifecycle.tla's steps follow them.
 \ Run from the repository root: hb --load src/replay-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -3546,13 +3548,18 @@ variable SIDES
       [: ar SERVED ar BRIDGE-SERVED ;] [: TEST-DROPBOX:STOP ;] finally ;]
    [: CURL:LOOP-STOP AIO:STOP ;] finally ;
 
-
-\ ---- the local table against its model
+\ ---- the tables against their models
 
 : FORMAL-HOLDS-THE-LOCAL-TABLE ( ^ARENA:arena -- )
    {: ar :}
    s" formal holds the local table" T-LABEL
    s" src/replay.f" s" LOCAL-LIFECYCLE" s" LocalLifecycle" ar
+   TEST-FORMAL:HOLDS ;
+
+: FORMAL-HOLDS-THE-REMOTE-TABLE ( ^ARENA:arena -- )
+   {: ar :}
+   s" formal holds the remote table" T-LABEL
+   s" src/replay.f" s" REMOTE-LIFECYCLE" s" RemoteLifecycle" ar
    TEST-FORMAL:HOLDS ;
 
 
@@ -3573,7 +3580,8 @@ variable SIDES
    UPLOAD-SIZE-STOPS-AT-THE-SESSION-LIMIT
    ar REMOTE-REPLAY-CASES
    ar DROPBOX-CASES
-   ar FORMAL-HOLDS-THE-LOCAL-TABLE ;
+   ar FORMAL-HOLDS-THE-LOCAL-TABLE
+   ar FORMAL-HOLDS-THE-REMOTE-TABLE ;
 
 
 : RUN ( -- )

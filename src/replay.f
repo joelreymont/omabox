@@ -2590,8 +2590,8 @@ ENUM remote-event done blocked local ;ENUM
    r PASS-BLOCKED @ r PERSIST-REMOTE-BLOCK
    r PASS-REPORT @ REPLAY-REPLAY--REPORT:BLOCKED @ VEC:PUSH ! ;
 
-\ One remote operation's replay: a completed one passes; a pending one
-\ is applied, or yields if local.
+\ One remote operation's replay, after formal/RemoteLifecycle.tla: a
+\ completed one passes; a pending one is applied, or yields if local.
 FSM:DEFINE REMOTE-LIFECYCLE ( ^pass ) remote-state remote-event
    IN recorded  STATUS ( JOURNAL:record-status )
       completed  -  >passed
