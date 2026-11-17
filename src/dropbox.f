@@ -2500,6 +2500,10 @@ public
       c TAG$ nip 0<> if s" : " LOG:TEXT+ c LEAF$ LOG:TEXT+ then
    then ;
 
+\ Whether the client's last call's transfer ended with an HTTP
+\ status; one cut after the head did not.
+: ANSWERED? ( ^client -- bool ) CLIENT-STATUS @ 0<> ;
+
 private
 
 \ Rust's "Dropbox operation `op` failed" line, then c's last call.

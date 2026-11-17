@@ -4,7 +4,8 @@
 \ stood for by the Habu code or Dropbox reply that carries it:
 \ - retry_schedule_doubles_caps_and_honors_bounded_server_delays
 \ - dispositions_cover_retry_environment_user_action_and_invariant,
-\   the rate limit as the 900 s retry DROPBOX caps it to
+\   the rate limit as the 900 s retry DROPBOX caps it to, and a
+\   transport failure as the retry that did not reach Dropbox
 \ - rejected_token_exits_without_rebuilding_the_download_pool, its
 \   disposition, a pass's E-DROPBOX whose link keeps unlinked
 \ - refresh_rejection_and_binding_rejection_exit_for_user_action, the
@@ -26,7 +27,8 @@
 \   a directory at the journal's path failing opening twice
 \ - recovery_control_publishes_stopped_before_a_fatal_exit
 \ - repeated_long_poll_retries_retain_the_session_and_escalate_after_clean_sync_passes,
-\   on a status that writes nothing, as Rust's has none
+\   on a status that writes nothing, as Rust's has none; a 503 says
+\   Dropbox is unavailable and a lost poll that it was not reached
 \ - root_inspection_failure_is_unavailable_only_for_a_stand_in
 \ - stand_in_without_birth_time_leaves_the_root_unavailable, /sys/kernel
 \ - syncing_backs_off_and_stops_on_a_refused_refresh, Rust having none:
@@ -101,10 +103,11 @@ TYPED-VARIABLE LINK REPLAY:link
    RETRY-BASE 0 WAITS ;
 
 : DISPOSITIONS-COVER-RETRY-ENVIRONMENT-USER-ACTION-AND-INVARIANT
-   ( -- )
+   ( ^DROPBOX:client -- )
+   {: k :}
    s" dispositions_cover_retry_environment_user_action_and_invariant"
    T-LABEL
-   MAX-RETRY-AFTER DROPBOX-REPLY:RETRY REPLY-FAILURE
+   MAX-RETRY-AFTER DROPBOX-REPLY:RETRY k REPLY-FAILURE
    MAX-RETRY-AFTER construct disposition retry KIND=
    SQLITE:E-FULL CODE-FAILURE
    construct disposition environmental KIND=
@@ -115,6 +118,9 @@ TYPED-VARIABLE LINK REPLAY:link
    DROPBOX:E-UNUSABLE CODE-FAILURE {: f :}
    f construct disposition environmental KIND=
    f DROPBOX TEXT=
+   DROPBOX:E-TRANSPORT CODE-FAILURE {: t :}
+   t 5000 construct disposition retry KIND=
+   t UNREACHABLE TEXT=
    SECRET:E-CONFIG CODE-FAILURE {: g :}
    g construct disposition environmental KIND=
    g CREDENTIALS TEXT=
@@ -136,13 +142,14 @@ TYPED-VARIABLE LINK REPLAY:link
    construct disposition user-action KIND= ;
 
 : REFRESH-REJECTION-AND-BINDING-REJECTION-EXIT-FOR-USER-ACTION
-   ( -- )
+   ( ^DROPBOX:client -- )
+   {: k :}
    s" refresh_rejection_and_binding_rejection_exit_for_user_action"
    T-LABEL
-   DROPBOX-REPLY:UNLINKED REPLY-FAILURE {: f :}
+   DROPBOX-REPLY:UNLINKED k REPLY-FAILURE {: f :}
    f construct disposition user-action KIND=
    f FAILURE-UNMAKE {: d u:str :} d EXIT-CODE 78 T=
-   construct account-check account-changed CHECK-FAILURE
+   construct account-check account-changed k CHECK-FAILURE
    FAILURE-UNMAKE {: c v:str :} c EXIT-CODE 78 T=
    RECONCILE:E-INVALID-STATE CODE-FAILURE
    FAILURE-UNMAKE {: i w:str :} i EXIT-CODE 70 T= ;
@@ -176,9 +183,11 @@ TYPED-VARIABLE LINK REPLAY:link
 : POLICY-CASES ( ^ARENA:arena -- )
    {: ar :}
    RETRY-SCHEDULE-DOUBLES-CAPS-AND-HONORS-BOUNDED-SERVER-DELAYS
-   DISPOSITIONS-COVER-RETRY-ENVIRONMENT-USER-ACTION-AND-INVARIANT
+   ar TEST-CLIENT:OPENED {: k :}
+   k DISPOSITIONS-COVER-RETRY-ENVIRONMENT-USER-ACTION-AND-INVARIANT
    REJECTED-TOKEN-EXITS-WITHOUT-REBUILDING-THE-DOWNLOAD-POOL
-   REFRESH-REJECTION-AND-BINDING-REJECTION-EXIT-FOR-USER-ACTION
+   k REFRESH-REJECTION-AND-BINDING-REJECTION-EXIT-FOR-USER-ACTION
+   k DROPBOX:CLOSE
    LOCAL-AND-NESTED-FAILURES-KEEP-THEIR-INTENDED-POLICY
    ar LOCAL-ROOT-FAILURES-NAME-THEIR-OWN-CAUSE ;
 
@@ -395,10 +404,14 @@ variable DROPPED
    s x RUN-SESSION !
    TEST-DROPBOX:RESET
    x s RETRIED-POLL x s RETRIED-POLL
+   x RUN-FAILURE @ DROPBOX TEXT=
    NAPS @ 2 T= 0 5000 NAPPED= 1 10000 NAPPED=
    false 0 TEST-DROPBOX:POLL!
    AT-POLLING x AT-SYNCING STEP-TO drop
    x RUN-SCHEDULE SCHEDULE-NEXT @ RETRY-BASE T=
+   TEST-DROPBOX:CUT
+   AT-POLLING x AT-SYNCING STEP-TO drop
+   x RUN-FAILURE @ UNREACHABLE TEXT=
    DROPPED @ TFALSE ;
 
 : REPEATED-LONG-POLL-RETRIES-RETAIN-THE-SESSION-AND-ESCALATE-AFTER-CLEAN-SYNC-PASSES

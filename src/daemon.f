@@ -74,6 +74,7 @@ STRUCTURE failure
    s" Dropbox credentials need to be renewed." >str ;
 : DROPBOX ( -- str )
    s" Dropbox is temporarily unavailable." >str ;
+: UNREACHABLE ( -- str ) s" Dropbox could not be reached." >str ;
 : BINDING ( -- str )
    s" The Dropbox account or sync root no longer matches setup." >str ;
 : SYNC-ROOT ( -- str )
@@ -102,9 +103,10 @@ STRUCTURE failure
 : INVARIANT ( str -- failure )
    {: t:str :}
    construct disposition invariant t FAILURE-MAKE ;
-\ Rust's retry_policy: Dropbox asked for a wait of at least ms.
-: RETRY ( n -- failure )
-   construct disposition retry DROPBOX FAILURE-MAKE ;
+\ Rust's retry_policy: try again after at least n ms.
+: RETRY ( n str -- failure )
+   {: t:str :}
+   construct disposition retry t FAILURE-MAKE ;
 
 \ Rust's config_policy and lock_policy.
 : CONFIG-POLICY ( n -- failure )
@@ -164,8 +166,8 @@ STRUCTURE failure
       INTERNAL INVARIANT swap
    endcase ;
 
-\ Rust's dropbox_policy and transport_policy. E-TRANSPORT is a transfer
-\ that failed on this side, which Rust retries.
+\ Rust's dropbox_policy and transport_policy. E-TRANSPORT is a call
+\ that got no HTTP answer, which Rust retries.
 : DROPBOX-POLICY ( n -- failure )
    case
       DROPBOX:E-REDIRECT of INTERNAL INVARIANT endof
@@ -173,7 +175,7 @@ STRUCTURE failure
       DROPBOX:E-STATUS of INTERNAL INVARIANT endof
       DROPBOX:E-ANSWER of INTERNAL INVARIANT endof
       DROPBOX:E-AUTH of BINDING USER-ACTION endof
-      DROPBOX:E-TRANSPORT of 5000 RETRY endof
+      DROPBOX:E-TRANSPORT of 5000 UNREACHABLE RETRY endof
       DROPBOX:E-NOT-STORED of CREDENTIALS ENVIRONMENTAL endof
       DROPBOX:E-STAGE of STATE ENVIRONMENTAL endof
       DROPBOX:E-UNUSABLE of DROPBOX ENVIRONMENTAL endof
@@ -228,12 +230,16 @@ STRUCTURE failure
    if c PASS-POLICY exit then
    c JOURNAL-POLICY ;
 
-\ done ends no step, so a failure for it is an invariant's.
-: REPLY-FAILURE ( DROPBOX:reply -- failure )
+\ done ends no step, so a failure for it is an invariant's. k is the
+\ client whose last call gave the reply.
+: REPLY-FAILURE ( DROPBOX:reply ^DROPBOX:client -- failure )
+   {: k :}
    MATCH DROPBOX:reply
       done OF INTERNAL INVARIANT ENDOF
       refused OF drop DROPBOX ENVIRONMENTAL ENDOF
-      retry OF RETRY ENDOF
+      retry OF
+         k DROPBOX:ANSWERED? if DROPBOX else UNREACHABLE then RETRY
+      ENDOF
       unlinked OF BINDING USER-ACTION ENDOF
    ;MATCH ;
 
@@ -241,7 +247,7 @@ STRUCTURE failure
 : PASS-FAILURE ( n ^REPLAY:link -- failure )
    {: c l :}
    c REPLAY:E-DROPBOX =
-   if l REPLAY-LINK:REPLY @ REPLY-FAILURE exit then
+   if l REPLAY-LINK:REPLY @ l REPLAY-LINK:CLIENT @ REPLY-FAILURE exit then
    c CODE-FAILURE ;
 
 \ The process's exit status; systemd restarts neither 70 nor 78.
@@ -648,21 +654,22 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
    x [: LOADED ;] TRIED-STEP ;
 
 \ valid fails nothing, so a failure for it is an invariant's.
-: CHECK-FAILURE ( account-check -- failure )
+: CHECK-FAILURE ( account-check ^DROPBOX:client -- failure )
+   {: k :}
    MATCH account-check
       valid OF INTERNAL INVARIANT ENDOF
       account-changed OF BINDING USER-ACTION ENDOF
       root-changed OF BINDING USER-ACTION ENDOF
       journal-binding-changed OF BINDING USER-ACTION ENDOF
       root-unavailable OF DROPBOX ENVIRONMENTAL ENDOF
-      failed OF REPLY-FAILURE ENDOF
+      failed OF k REPLY-FAILURE ENDOF
    ;MATCH ;
 
 : VALIDATED ( ^run -- bool )
    {: x :}
    x JOURNAL@ x RUN-SESSION @ x RUN-SESSIONS @ VALIDATE {: k :}
    k VALID? if true exit then
-   k CHECK-FAILURE x FAIL ;
+   k x CLIENT@ CHECK-FAILURE x FAIL ;
 
 : VALIDATING ( ^run -- step-event ) [: VALIDATED ;] TRIED-STEP ;
 
@@ -789,7 +796,7 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
    {: r x :}
    r DROPBOX:DONE? if x CLIENT@ DROPBOX:BACKOFF x RUN-BACKOFF ! true exit then
    r RESET? if true exit then
-   r REPLY-FAILURE x FAIL ;
+   r x CLIENT@ REPLY-FAILURE x FAIL ;
 
 : CURSOR-POLLED ( DROPBOX:cursor ^run -- bool )
    {: k:DROPBOX:cursor x :}
