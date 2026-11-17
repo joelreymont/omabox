@@ -1644,3 +1644,46 @@ The check has a limit, which a test fix made concrete. It sees where a
 line goes, not what it runs. A stop line changed to wait before stopping
 passed the model check; only the test that counts the daemon's naps
 failed. A table check replaces no test of a line's action.
+
+## 2026-11-17: the switch, and the upload Rust never finished
+
+At 11:19 the installed Rust `omaboxd` gave way to the Habu one, over the
+same journal. Before the switch, the Rust and Habu CLIs printed that
+journal's status byte for byte alike, 670,911 bytes each. A script saved
+the Rust binary, stopped the service, copied the journal aside, installed
+the Habu binary with a rename, ran its self-check and started the service.
+The way back was the same swap in reverse; it was not needed. A swap was
+enough because the rewrite kept Rust's journal schema, its upload stages
+and its download slots, down to the extended attribute names.
+
+The Rust daemon had failed one upload 333 times, from 2026-11-15 10:07 to
+the switch: a 201,752,253-byte file sent as an upload session, whose
+finish answered "The content received by the Dropbox server in this call
+does not match the provided content hash." Rust retried it as a passing
+failure, so every pass tried it again and none got past it. Its journal
+shows no scan published since: at the switch it still listed as present
+a file deleted locally on 2026-11-15.
+
+Dropbox's answer names the check: the content received in this call.
+Rust's finish carried the whole file's hash and no bytes, as the
+2026-11-15 entry found; Habu's finish carries no hash. Over the same
+staged bytes and the same account, the Habu daemon's upload went through,
+and Dropbox's listing records the file at a content hash equal to the
+stage's. The cause the 2026-11-15 entry inferred is the one.
+
+That file was the deleted one. Its upload was recorded intent, so the
+Habu daemon finished it, and its next pass carried the local deletion to
+Dropbox. Nothing was lost: everything the archive held was already in the
+local tree, 240 files byte for byte and four PDFs with the same text and
+images under a new title.
+
+In its first six and a half hours the Habu daemon completed 10,540 plans;
+5,049 wait, and one is blocked, because Dropbox rejects a name that ends
+in a space; that plan waits for its retry time and the rest go on.
+Dropbox answered three deletes with 429; each ended the pass, and the
+daemon tried again 10 or 20 seconds later.
+
+Observation for the blog: one misread field stopped the whole sync for
+two days, because the failure was classed as passing. Habu blocks a plan
+Dropbox rejects for its content, so the other paths go on, but records it
+under a generic tag; the cause still needs a name of its own.
