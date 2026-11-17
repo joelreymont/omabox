@@ -50,30 +50,22 @@ rebuilds, multi-page failures, crashes, retries, and atomic publication. Partial
 pages and failed attempts must leave the prior durable inventory and cursor
 unchanged; deleting durable entries requires a complete validated publication.
 
-Run it from this directory with the official TLA+ tools:
+Run the models from this directory with `tlc`, the TLA+ tools' model
+checker on PATH:
 
 ```sh
-java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
-  -config DownloadLifecycle.cfg DownloadLifecycle.tla
-
-java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
-  -config MutationLifecycle.cfg MutationLifecycle.tla
-
-java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
-  -config DownloadExecutor.cfg DownloadExecutor.tla
-
-java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
-  -config ScanCoordination.cfg ScanCoordination.tla
-
-java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
-  -config SyncBehavior.cfg SyncBehavior.tla
-
-java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
-  -config InventoryPublication.cfg InventoryPublication.tla
-
-java -XX:+UseParallelGC -jar ~/.local/share/tla/tla2tools.jar \
-  -config DirectoryDeletion.cfg DirectoryDeletion.tla
+tlc -config DownloadLifecycle.cfg DownloadLifecycle.tla
+tlc -config MutationLifecycle.cfg MutationLifecycle.tla
+tlc -config DownloadExecutor.cfg DownloadExecutor.tla
+tlc -config ScanCoordination.cfg ScanCoordination.tla
+tlc -config SyncBehavior.cfg SyncBehavior.tla
+tlc -config InventoryPublication.cfg InventoryPublication.tla
+tlc -config DirectoryDeletion.cfg DirectoryDeletion.tla
 ```
+
+`src/reconcile-test.f` holds `InventoryPublicationTable.tla` to
+`INVENTORY-PUBLICATION`'s lines and runs TLC on `InventoryPublicationFollows`,
+which states that `InventoryPublication`'s steps follow that table.
 
 Same- and cross-filesystem promotion share one durable abstract boundary; TLC
 checks crashes immediately before and after it. Dropbox transport and concrete

@@ -199,6 +199,7 @@ require src/lib/fs-anchored.f
 require src/lib/fs-list.f
 require src/lib/aio.f
 require src/lib/time.f
+require src/lib/process-command.f
 require src/lib/net/curl.f
 require src/dropbox.f
 require src/test-dropbox.f
@@ -6208,6 +6209,91 @@ TYPED-VARIABLE RACED str
    ar LISTING-CLASSIFIES-THE-REMOTE-ROOTS-OWN-ENTRY
    ar DROPBOX-SERVED ;
 
+\ ---- the listing table against its model --------------------------
+
+ARENA RENDERED str
+
+\ The bytes laid after the text at h, in the arena.
+: ADD ( ^str ^u8 n ^ARENA:arena -- )
+   {: h a:^ u:n ar :}
+   h @ str> {: s:^ su:n :}
+   ar su u + ARENA:ALLOC drop {: b:^ :}
+   s b su BYTE-COPY
+   a b su + u BYTE-COPY
+   b su u + >str h ! ;
+
+\ The file at the path, whole, in the arena.
+: FILE$ ( ^u8 n ^ARENA:arena -- ^u8 n )
+   {: p:^ pu:n ar :}
+   p pu FS:FILE-SIZE {: u:n :}
+   ar u ARENA:ALLOC drop {: b:^ :}
+   b  p pu b u FS:READ-ALL ;
+
+\ The text from INVENTORY-PUBLICATION's name to its end; none if absent.
+: TABLE-AT ( ^u8 n -- ^u8 n )
+   {: t:^ tu:n :}
+   t tu s" FSM:DEFINE INVENTORY-PUBLICATION" FIND-SUB MATCH option
+      none OF t 0 ENDOF
+      some OF IDX>N s" FSM:DEFINE " nip + t over + tu rot - ENDOF
+   ;MATCH ;
+
+: SB-LINE ( ^u8 n -- ) SB-APPEND 10 SB-APPEND-C ;
+
+\ formal/InventoryPublicationTable.tla's lines before the tuples.
+: HEAD$ ( -- ^u8 n )
+   SB-RESET
+   s" ---- MODULE InventoryPublicationTable ----" SB-LINE
+   s" \* The lines of INVENTORY-PUBLICATION, src/reconcile.f, as <<state, input," SB-LINE
+   s" \* next state>>. src/reconcile-test.f fails unless this file is that table." SB-LINE
+   s" Lines == {" SB-LINE SB$ ;
+
+\ A line state input >next as a tuple after the text at h; a PICK
+\ line has no fixed next state, which the check cannot hold.
+: TUPLE+ ( ^u8 n ^u8 n ^u8 n ^str ^ARENA:arena -- )
+   {: s:^ su:n i:^ iu:n x:^ xu:n h ar :}
+   x c@ 62 = TTRUE
+   SB-RESET h @ str> nip 0 > if S\" ,\n" SB-APPEND then
+   S\"     <<\q" SB-APPEND s su SB-APPEND
+   S\" \q, \q" SB-APPEND i iu SB-APPEND
+   S\" \q, \q" SB-APPEND x 1+ xu 1- SB-APPEND
+   S\" \q>>" SB-APPEND h SB$ ar ADD ;
+
+\ The table at t as formal/InventoryPublicationTable.tla holds it.
+: TABLE-TLA ( ^u8 n ^ARENA:arena -- ^u8 n )
+   {: t:^ tu:n ar :}
+   ar RENDERED-NEW {: h :}
+   t tu [: h ar TUPLE+ ;] FSM:LINES
+   ar RENDERED-NEW {: m :}
+   m HEAD$ ar ADD  m h @ str> ar ADD
+   m S\" \n}\n====\n" ar ADD  m @ str> ;
+
+\ TLC on InventoryPublicationFollows, its files in d; its output on
+\ a failure.
+: FOLLOWS-RUN ( CMD:command str ^ARENA:arena -- CMD:command )
+   {: d:str ar :}
+   s" tlc" CMD:ARG+ s" -workers" CMD:ARG+ s" 1" CMD:ARG+
+   s" -metadir" CMD:ARG+ d s" tlc" ar INSIDE str> CMD:ARG+
+   s" -config" CMD:ARG+ s" InventoryPublicationFollows.cfg" CMD:ARG+
+   s" InventoryPublicationFollows.tla" CMD:ARG+
+   s" formal" CMD:CWD!  s" TMPDIR" d str> CMD:ENV+
+   s" /usr/bin/env" 120000 >MS CMD:RUN-RC
+   MATCH result ok OF ENDOF err OF ENDOF ;MATCH {: rc:n :}
+   rc 0<> if CMD:OUT$ type then
+   rc 0 T= ;
+
+\ The model's copy of INVENTORY-PUBLICATION is its lines, and TLC
+\ finds InventoryPublication follows them.
+: FORMAL-HOLDS-THE-LISTING-TABLE ( ^ARENA:arena -- )
+   {: ar :}
+   s" formal_holds_the_listing_table" T-LABEL
+   s" src/reconcile.f" ar FILE$ TABLE-AT {: t:^ tu:n :}
+   tu 0 > TTRUE  tu 0= if exit then
+   s" formal/InventoryPublicationTable.tla" ar FILE$
+   t tu ar TABLE-TLA T$=
+   s" reconcile-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
+   [: d ar FOLLOWS-RUN ;] CMD:WITH-COMMAND
+   d str> FS:REMOVE-TREE ;
+
 
 : CASES ( ^ARENA:arena -- )
    {: ar :}
@@ -6226,7 +6312,8 @@ TYPED-VARIABLE RACED str
    ar CHILD-PREFIX-ORDER-MATCHES-THE-MATERIALIZED-PREFIX
    ar PATH-DECISIONS-ORDER-DELETES-LAST-AND-DEEPEST-FIRST
    ar CASE-COLLISION-CASES
-   ar LISTING-CASES ;
+   ar LISTING-CASES
+   ar FORMAL-HOLDS-THE-LISTING-TABLE ;
 
 
 : RUN ( -- )

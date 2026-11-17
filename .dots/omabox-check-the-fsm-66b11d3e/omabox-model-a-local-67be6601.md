@@ -4,8 +4,6 @@ status: open
 priority: 2
 issue-type: task
 created-at: "2026-11-17T14:11:50.118313+02:00"
-blocks:
-  - omabox-check-the-listing-28b9d181
 ---
 
-Problem: LOCAL-LIFECYCLE (src/replay.f:836) has no model its lines are steps of; formal/MutationLifecycle.tla describes what APPLY does inside one line. Acceptance: a formal/ model whose steps are the table's lines, with the invariants its words rely on, passes TLC as the user approves and the listing check's mechanism applied to the table. Depends: omabox-check-the-listing-28b9d181. Claim: unassigned.
+Problem: LOCAL-LIFECYCLE (src/replay.f:836) has no model its lines are steps of; formal/MutationLifecycle.tla describes what APPLY does inside one line. Acceptance: a formal/ model whose steps are the table's lines, with the invariants its words rely on, passes TLC as the user approves and the listing check's mechanism applied to the table. Depends: none. Claim: unassigned.
