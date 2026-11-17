@@ -1507,3 +1507,49 @@ and the cleanup deleted my change. The full suite run caught it: the
 Dropbox suite counted three checks fewer than my run. The jj skill
 already says to run `jj st` in a workspace before moving its commits
 from another; I skipped it.
+
+## 2026-11-17: binary size and build time, measured twice
+
+Built from the same machine (aarch64, 12 cores), the Rust code from the
+`rust` branch and the Habu code from master at a46cb741:
+
+| Build | `omaboxd` | `omabox` |
+|---|---|---|
+| Rust, release as installed | 99.0 MB | 100.6 MB |
+| Rust, release, stripped | 4.8 MB | 4.1 MB |
+| Rust, opt-level z, fat LTO, one codegen unit, panic=abort, stripped | 2.69 MB | 2.36 MB |
+| Habu | 1.05 MB | 0.66 MB |
+
+The installed 99 MB is debug information: the shell exports
+`CARGO_PROFILE_RELEASE_DEBUG=true`, so every Rust release build carried
+it. Against the smallest Rust build, Habu's programs are 2.6 and 3.6
+times smaller. They do not hold the same code. Rust compiles in its
+HTTP client and TLS (ureq, rustls) and Unicode tables (std), loads
+SQLite, and reaches Secret Service by running `/usr/bin/secret-tool`.
+Habu's program loads libcurl with OpenSSL, libsecret, libsystemd,
+libunistring and SQLite. The running Habu daemon maps 40 libraries,
+27.8 MB on disk, that the Rust daemon does not: the distribution's curl
+alone brings Kerberos, SSH, HTTP/3, brotli and zstd. Part of that the
+Rust daemon also loads, in the `secret-tool` child it starts.
+
+Build times, Rust release without debug information against Habu's
+`hb-build`, each Habu cold build into an empty out root:
+
+| Build | Rust, both programs | Habu `omaboxd` | Habu `omabox` |
+|---|---|---|---|
+| Clean | 12.2 s | 7.5 s | 6.8 s |
+| No change | 0.05 s | 0.55 s | 0.49 s |
+| One file touched (daemon, Dropbox client) | 4.6-4.7 s | 0.65-0.70 s | not measured |
+
+Cargo builds both programs and 138 crates at once across the cores;
+Habu builds one program per process. Clean, both programs take 12.2 s
+in Rust and 14.3 s in Habu one after the other; the loop an agent runs,
+edit and rebuild, is about seven times faster in Habu. A size-tuned Rust
+build took 26 s clean.
+
+My first Habu number was 3 s against Rust's 15-25 s, and it was wrong.
+Habu keeps compiled objects in the tree's `.out`, and earlier test runs
+had already filled part of it, so the 3 s was a half-warm build timed as
+a clean one. Timing three builds in a row showed 2.85, 0.53 and 0.55 s,
+and that jump led to the cache; the numbers above set `HABU_OUT` to an
+empty directory for each clean build.
