@@ -4,7 +4,8 @@
 \ DRIVE moves the unit toward a goal through the machine DRIVING, whose
 \ states are Rust's phases. Each state's step word is Rust's next for that
 \ state: from the goal and the unit state last observed it answers the step
-\ to run, and the step's outcome picks the next state, failed when it threw.
+\ to run, and the step's line names the next state; a step that throws ends
+\ the drive, as Rust's loop breaks on an error.
 \ systemd's activating includes the wait before an automatic restart, and
 \ deactivating can still end failed; systemd unloads a disabled, stopped unit.
 \ recover follows a change that may fix a fatal cause. release stops a
@@ -609,7 +610,7 @@ private
 \ Where a drive is, Rust's Phase. settled: the state observed after a
 \ stop; cleared: the failed state and the start limit cleared.
 ENUM phase
-   initial seen after-stop settled cleared launched reached failed
+   initial seen after-stop settled cleared launched reached
 ;ENUM
 
 \ The steps each phase can take next, Rust's Step.
@@ -619,14 +620,13 @@ ENUM after-stop-step observe done ;ENUM
 ENUM settled-step clear done ;ENUM
 ENUM cleared-step start restart done ;ENUM
 
-\ A drive's commands and goal, the record it fills, the state its last
-\ observation read, and the code of the step that threw, 0 for none.
+\ A drive's commands and goal, the record it fills, and the state its
+\ last observation read.
 STRUCTURE drive DERIVE addr
    FIELD commands ^commands
    FIELD goal goal
    FIELD driven ^driven
    FIELD unit unit-state
-   FIELD code n
 ;STRUCTURE
 
 ARENA DRIVES drive
@@ -737,32 +737,24 @@ ARENA DRIVES drive
       release OF construct cleared-step done ENDOF
    ;MATCH ;
 
-\ Runs the step, keeping the code it threw, 0 for none.
-: TRIED ( ^drive [ -- ] -- )
-   {: d step :}
-   step catch d DRIVE-CODE ! ;
-
 \ Rust's acting: a step whose command was spawned may have changed the
 \ unit; one whose command could not be spawned did not.
 : ACTING ( ^drive [ -- ] -- )
    {: d step :}
-   d step TRIED
-   d DRIVE-CODE @ E-START-COMMAND = if exit then
-   true d DRIVEN@ SERVICE-DRIVEN:ACTED ! ;
+   step catch {: code:n :}
+   code E-START-COMMAND <> if true d DRIVEN@ SERVICE-DRIVEN:ACTED ! then
+   code 0<> if code throw then ;
 
-: OBSERVED ( ^drive -- )
+: OBSERVE ( ^drive -- )
    {: d :}
    d COMMANDS@ STATE {: u :}
    u d DRIVE-UNIT !
    u OPTION:SOME d DRIVEN@ SERVICE-DRIVEN:LAST ! ;
 
-: FIRST-OBSERVED ( ^drive -- )
+: OBSERVE-FIRST ( ^drive -- )
    {: d :}
-   d OBSERVED
+   d OBSERVE
    d UNIT@ OPTION:SOME d DRIVEN@ SERVICE-DRIVEN:FIRST ! ;
-
-: OBSERVE-FIRST ( ^drive -- ) {: d :} d [: d FIRST-OBSERVED ;] TRIED ;
-: OBSERVE ( ^drive -- ) {: d :} d [: d OBSERVED ;] TRIED ;
 
 : STOP ( ^drive -- ) {: d :} d [: d COMMANDS@ SETTLE-STOP ;] ACTING ;
 : CLEAR ( ^drive -- ) {: d :} d [: d COMMANDS@ SETTLE-RESET ;] ACTING ;
@@ -778,40 +770,28 @@ ARENA DRIVES drive
 : RESTART ( ^drive -- )
    {: d :} d [: d construct action restart LAUNCHED ;] ACTING ;
 
-\ Rust's advance: the phase a step reaches, or failed when it threw.
-: ADVANCE ( ^drive phase -- phase )
-   {: d p :}
-   d DRIVE-CODE @ 0<> if construct phase failed exit then
-   p ;
-
-: TO-SEEN ( ^drive -- phase ) construct phase seen ADVANCE ;
-: TO-AFTER-STOP ( ^drive -- phase ) construct phase after-stop ADVANCE ;
-: TO-SETTLED ( ^drive -- phase ) construct phase settled ADVANCE ;
-: TO-CLEARED ( ^drive -- phase ) construct phase cleared ADVANCE ;
-: TO-LAUNCHED ( ^drive -- phase ) construct phase launched ADVANCE ;
-
+\ Rust's drive_recorded loop, after formal/ServiceDrive.tla.
 FSM:DEFINE DRIVING ( ^drive ) phase initial-step
    IN initial  AT-INITIAL
-      observe  OBSERVE-FIRST  TO-SEEN
-      clear    CLEAR          TO-CLEARED
+      observe  OBSERVE-FIRST  >seen
+      clear    CLEAR          >cleared
       done     -              >reached
    IN seen  AT-SEEN ( seen-step )
-      stop     STOP           TO-AFTER-STOP
-      clear    CLEAR          TO-CLEARED
+      stop     STOP           >after-stop
+      clear    CLEAR          >cleared
       done     -              >reached
    IN after-stop  AT-AFTER-STOP ( after-stop-step )
-      observe  OBSERVE        TO-SETTLED
+      observe  OBSERVE        >settled
       done     -              >reached
    IN settled  AT-SETTLED ( settled-step )
-      clear    CLEAR          TO-CLEARED
+      clear    CLEAR          >cleared
       done     -              >reached
    IN cleared  AT-CLEARED ( cleared-step )
-      start    START          TO-LAUNCHED
-      restart  RESTART        TO-LAUNCHED
+      start    START          >launched
+      restart  RESTART        >launched
       done     -              >reached
    FINAL launched  -
    FINAL reached  -
-   FINAL failed  -
 ;DEFINE
 
 : UNDRIVEN ( ^driven -- )
@@ -827,9 +807,7 @@ FSM:DEFINE DRIVING ( ^drive ) phase initial-step
    c d DRIVE-COMMANDS !
    g d DRIVE-GOAL !
    v d DRIVE-DRIVEN !
-   0 d DRIVE-CODE !
-   d construct phase initial DRIVING
-   d DRIVE-CODE @ ;
+   [: d construct phase initial DRIVING ;] catch ;
 
 public
 

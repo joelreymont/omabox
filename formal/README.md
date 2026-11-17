@@ -78,6 +78,15 @@ rebuilds, multi-page failures, crashes, retries, and atomic publication. Partial
 pages and failed attempts must leave the prior durable inventory and cursor
 unchanged; deleting durable entries requires a complete validated publication.
 
+`ServiceDrive` checks one drive of the user unit toward each goal, `DRIVING` in
+`src/service.f`. Any observation may read any state, and any step may fail, a
+command before or after it was spawned. A start or restart follows a clear and
+only where the goal asks for one; a release only stops, and only a unit it
+first observed holding the instance lock, so a failed state stays for a later
+recover; a drive that ends without failure or launch was not asked for one, a
+halt or release stopped a unit it first saw holding the lock, and a halt
+cleared a failed state it last saw.
+
 Run the models from this directory with `tlc`, the TLA+ tools' model
 checker on PATH:
 
@@ -92,6 +101,7 @@ tlc -config SyncPass.cfg SyncPass.tla
 tlc -config InventoryPublication.cfg InventoryPublication.tla
 tlc -config DirectoryDeletion.cfg DirectoryDeletion.tla
 tlc -config RemoteLifecycle.cfg RemoteLifecycle.tla
+tlc -config ServiceDrive.cfg ServiceDrive.tla
 ```
 
 Each table's check, in its package's tests, holds `<Model>Table.tla` to the
@@ -101,7 +111,8 @@ model's steps follow that table:
 - `src/reconcile-test.f`: `INVENTORY-PUBLICATION` (`InventoryPublication`),
   `DOWNLOAD-EXECUTOR` (`DownloadExecutor`) and `SYNC-PASS` (`SyncPass`);
 - `src/replay-test.f`: `LOCAL-LIFECYCLE` (`LocalLifecycle`) and
-  `REMOTE-LIFECYCLE` (`RemoteLifecycle`).
+  `REMOTE-LIFECYCLE` (`RemoteLifecycle`);
+- `src/service-test.f`: `DRIVING` (`ServiceDrive`).
 
 Same- and cross-filesystem promotion share one durable abstract boundary; TLC
 checks crashes immediately before and after it. Dropbox transport and concrete

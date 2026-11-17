@@ -8,7 +8,8 @@
 \ directory, and so is what a settle passes on of systemctl's stderr.
 \ The walk of every goal from each state runs each drive through a
 \ scripted systemctl and checks the verbs it ran against the Rust test's
-\ table, one row of which must match each walk.
+\ table, one row of which must match each walk. DRIVING's lines are held
+\ to formal/ServiceDrive.tla through TEST-FORMAL:HOLDS, which runs TLC.
 \ White-box: SERVICE is reopened for control, settle, commands of
 \ programs, and the index of a goal or a state.
 \ Run from the repository root: hb --load src/service-test.f </dev/null
@@ -20,6 +21,7 @@ require src/lib/test/stderr.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
 require src/service.f
+require src/test-formal.f
 
 package SERVICE-TEST
 ;package
@@ -622,6 +624,12 @@ variable CODE            \ what a recorded drive answered
    RETRY-HELP REFUSED ;
 
 
+\ ---- formal_holds_the_drive_table
+
+: FORMAL-HOLDS ( -- )
+   s" src/service.f" s" DRIVING" s" ServiceDrive" AR @ TEST-FORMAL:HOLDS ;
+
+
 public
 
 : RUN ( -- )
@@ -636,6 +644,7 @@ public
    s" a_systemctl_that_cannot_spawn_has_not_acted" ['] CANNOT-SPAWN RUN-CASE
    s" a_systemctl_that_ran_and_failed_has_acted" ['] RAN-AND-FAILED RUN-CASE
    s" signal_terminated_controls_have_a_distinct_error" ['] SIGNALED RUN-CASE
+   s" formal_holds_the_drive_table" ['] FORMAL-HOLDS RUN-CASE
    s" service-test: " type T-CASES FMT:.INT s"  checks" type cr
    T-REPORT ;
 
