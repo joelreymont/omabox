@@ -1750,3 +1750,49 @@ of scope, so memory follows the code that uses it. An arena's memory
 lives until someone resets it, and here the reset was in the right step
 but at the wrong end of it. A test cannot tell the two apart; only the
 idle daemon's memory can.
+
+## 2026-11-18: an error that depended on the scheduler
+
+Omabox runs secret-tool and systemctl with its own spawn, pipe and wait
+code, two copies of what Habu's process library already does. Moving to
+the library showed two gaps. A capture that could not even start threw
+the same code as one whose read failed later, and a child that stopped
+reading its input looked like success. The first fix stands: a capture
+that cannot start now throws E-PROC-SPAWN.
+
+The second fix added an error for input the child left unread, and every
+test passed. The review then ran `true` with one byte of input: pinned to
+one CPU, it threw in 299 of 300 runs; on all CPUs, in none. A pipe takes
+bytes before the child reads them, so the parent can never tell whether
+the child read them. Whether the error fired depended on who ran first.
+The tests passed because they fed more than a pipe holds. Go settled the
+same question in 2014 (issue 9173) by ignoring a broken pipe on stdin, and
+Python's `communicate()` does the same. Habu now does too: the capture
+reads both streams to their end and the exit status decides.
+
+Observation for the blog: Rust's standard library leaves this to the
+caller; `write_all` on a child's stdin answers `BrokenPipe` and the caller
+chooses. A library that runs the whole exchange for its caller has to
+choose for everyone, and a choice that tests confirm can still be wrong.
+Only a run that changed the scheduling showed it.
+
+## 2026-11-18: a statement that cannot be dropped
+
+Publishing a scan row by row was slower than reading the whole inventory
+back: 159 ms against 103 at 4,000 files. Each row prepared its own SQL
+statement and opened its own buffer and arena. The plan was a scan record
+holding both prepared inserts, passed to each call like any other value.
+
+Habu refused it when the file loaded, before any test ran. An SQLite
+statement is a linear value: the word that prepares it must get it back
+to finalize it, so code may move it but never copy or drop it. A record
+holding two statements is linear too. So the scan words now take the scan
+and hand it back, and the body that runs a scan returns it.
+
+Observation for the blog: in Rust each call would borrow the scan
+(`&mut Scan`), and dropping the scan would finalize its statements. Habu
+has no borrows and no destructors: passing the scan moves it, and dropping
+it is an error, so every call hands it back. The loader caught the
+design's mistake before any test ran, as Rust's compiler catches a bad
+borrow; the price is a scan in the stack effect of every word it passes
+through.
