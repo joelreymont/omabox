@@ -696,6 +696,11 @@ TYPED-VARIABLE W JSON:writer
    j ju [: s su >str AR @ MODEL:JSON>FINGERPRINT
       swap MODEL:FINGERPRINT>JSON ;] WRITES ;
 
+: READS-HASH-VALUE ( ^u8 n ^u8 n -- )
+   {: s:^ su:n j:^ ju:n :}
+   j ju [: s su >str AR @ MODEL:JSON>HASH-VALUE HASH-RECORD
+      swap MODEL:HASH-VALUE>JSON ;] WRITES ;
+
 : READS-HASH ( ^u8 n ^u8 n -- )
    {: s:^ su:n j:^ ju:n :}
    j ju [: s su >str AR @ MODEL:JSON>HASH
@@ -743,6 +748,11 @@ TYPED-VARIABLE W JSON:writer
    [: s su >str AR @ MODEL:JSON>FINGERPRINT drop ;]
    MODEL:E-STORED TTHROWSQ ;
 
+: REFUSES-HASH-VALUE ( ^u8 n -- )
+   {: s:^ su:n :}
+   [: s su >str AR @ MODEL:JSON>HASH-VALUE drop drop ;]
+   MODEL:E-STORED TTHROWSQ ;
+
 : REFUSES-HASH ( ^u8 n -- )
    {: s:^ su:n :}
    [: s su >str AR @ MODEL:JSON>HASH drop ;]
@@ -787,6 +797,43 @@ TYPED-VARIABLE W JSON:writer
    s\" {}" REFUSES-BASELINE
    s" " REFUSES-BASELINE ;
 
+: HV$ ( -- ^u8 n )
+   s\" {\"fingerprint\":{\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":5,\"changed_nanoseconds\":6},\"content\":\"c\"}" ;
+
+: HASH-VALUE-ORDER-CASE ( -- )
+   s" hash value reads its members in any order" T-LABEL
+   s\" {\"content\":\"c\",\"fingerprint\":{\"changed_nanoseconds\":6,\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":5}}"
+   HV$ READS-HASH-VALUE ;
+
+: HASH-VALUE-UNKNOWN-CASE ( -- )
+   s" hash value skips an unknown member, repeated or not" T-LABEL
+   s\" {\"device\":[1],\"fingerprint\":{\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":5,\"changed_nanoseconds\":6},\"device\":{\"content\":7},\"content\":\"c\"}"
+   HV$ READS-HASH-VALUE ;
+
+: HASH-VALUE-REPEATED-CASE ( -- )
+   s" hash value and fingerprint refuse a repeated member" T-LABEL
+   s\" {\"fingerprint\":{\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":5,\"changed_nanoseconds\":6},\"content\":\"c\",\"cont\\u0065nt\":\"c\"}"
+   REFUSES-HASH-VALUE
+   s\" {\"fingerprint\":{\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":5,\"changed_nanoseconds\":6},\"content\":\"c\",\"fingerprint\":{}}"
+   REFUSES-HASH-VALUE
+   s\" {\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":5,\"changed_nanoseconds\":6,\"s\\u0069ze\":2}"
+   REFUSES-FINGERPRINT ;
+
+: FINGERPRINT-SIGNED-CASE ( -- )
+   s" fingerprint's changed seconds is signed" T-LABEL
+   s\" {\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":-5,\"changed_nanoseconds\":6}"
+   2dup READS-FINGERPRINT
+   s\" {\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":9223372036854775808,\"changed_nanoseconds\":6}"
+   REFUSES-FINGERPRINT ;
+
+\ The cells keep the previous row's values, so a missing member must not
+\ read them.
+: HASH-VALUE-MISSING-CASE ( -- )
+   s" hash value refuses a missing member after a full one" T-LABEL
+   HV$ HV$ READS-HASH-VALUE
+   s\" {\"fingerprint\":{\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":5,\"changed_nanoseconds\":6}}"
+   REFUSES-HASH-VALUE ;
+
 
 : CASES ( -- )
    FOLD-CASE
@@ -803,7 +850,9 @@ TYPED-VARIABLE W JSON:writer
    UNKNOWN-TEXT-CASE
    s" OPERATION$" T-LABEL DIRECTORY-TEXT-CASE FILE-TEXT-CASE
    CONFLICT-TEXT-CASE
-   JSON-CASE ACCEPTED-CASE REFUSED-CASE ;
+   JSON-CASE ACCEPTED-CASE REFUSED-CASE
+   HASH-VALUE-ORDER-CASE HASH-VALUE-UNKNOWN-CASE HASH-VALUE-REPEATED-CASE
+   FINGERPRINT-SIGNED-CASE HASH-VALUE-MISSING-CASE ;
 
 public
 

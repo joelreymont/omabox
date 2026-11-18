@@ -26,6 +26,8 @@
 \ borrowed; FOLD lays its answer, and a JSON reader the strings it reads,
 \ in the arena the caller passes. A JSON writer appends to the caller's
 \ open JSON writer.
+\ TASK-LOCAL: the seen buffers and value cells JSON>HASH-VALUE and
+\ JSON>FINGERPRINT fill, TASK:+USERS rows.
 
 require src/lib/type/deftype.f
 require src/lib/string.f
@@ -33,6 +35,7 @@ require src/lib/arena.f
 require src/lib/unicode.f
 require src/lib/utf8-scalar.f
 require src/lib/error.f
+require src/lib/task.f
 require src/lib/json.f
 require src/dropbox.f
 
@@ -931,8 +934,8 @@ public
 
 private
 
-\ A reader finds a member by searching its object's text, so members come
-\ in any order; each step reads its text to the end and reuses one cursor.
+\ MEMBER searches an object's text for one member, so members come in any
+\ order; each search reads the text to the end and reuses one cursor.
 
 \ The cursor a read reuses and the arena that takes its strings.
 STRUCTURE reading
@@ -957,24 +960,35 @@ ARENA CURSORS JSON:cursor
 : MEMBER ( ^u8 n ^u8 n reading -- ^u8 n )
    READING-UNMAKE drop JSON:READ-MEMBER$ ;
 
-\ A string's decoded bytes, copied into the arena; its text bounds them.
+\ A word ending -HERE decodes the value at the reader's token and leaves the
+\ reader on the value's last token, where READ-LISTED takes it back.
+
+\ The string at the reader's token, decoded and copied into the arena;
+\ its text as written bounds it.
+: STRING-HERE ( JSON:reader reading -- JSON:reader str )
+   {: r:reading :}
+   JSON:READ-TOKEN JSON:T-STR EXPECT
+   JSON:READ-SPAN$ nip {: u:n :}
+   r READING-UNMAKE nip u ARENA:ALLOC {: d:^ du:n :}
+   d du JSON:READ-STR {: len:n :} d len >str ;
+
 : READ-STRING ( ^u8 n reading -- str )
    {: t:^ u:n r:reading :}
-   t u r OPEN JSON:T-STR EXPECT
-   r READING-UNMAKE nip u ARENA:ALLOC {: d:^ du:n :}
-   d du JSON:READ-STR {: len:n :}
-   JSON:READ-FINISH d len >str ;
+   t u r OPEN drop r STRING-HERE {: s:str :}
+   JSON:READ-FINISH s ;
 
 \ serde_json reads -0 as a float, which no integer field takes.
-: READ-I64 ( ^u8 n reading -- n )
-   OPEN JSON:T-INT EXPECT
+: I64-HERE ( JSON:reader -- JSON:reader n )
+   JSON:READ-TOKEN JSON:T-INT EXPECT
    JSON:READ-SPAN$ s" -0" STR= if E-STORED throw then
-   JSON:READ-INT {: v:n :} JSON:READ-FINISH v ;
+   JSON:READ-INT ;
+
+: READ-I64 ( ^u8 n reading -- n )
+   OPEN drop I64-HERE {: v:n :} JSON:READ-FINISH v ;
 
 \ A value at or above 2^63 is a negative cell, its 64 bits.
-: READ-U64 ( ^u8 n reading -- n )
-   OPEN JSON:T-INT EXPECT JSON:READ-U64 {: v:n :}
-   JSON:READ-FINISH v ;
+: U64-HERE ( JSON:reader -- JSON:reader n )
+   JSON:READ-TOKEN JSON:T-INT EXPECT JSON:READ-U64 ;
 
 : READ-U16 ( ^u8 n reading -- u16 )
    READ-I64 {: v:n :}
@@ -1108,26 +1122,56 @@ ARENA CURSORS JSON:cursor
    i 0 = if MODEL-CONFLICT:INITIAL exit then
    MODEL-CONFLICT:DIVERGENT ;
 
-: U64-AT ( ^u8 n ^u8 n reading -- n )
-   {: r:reading :} r MEMBER r READ-U64 ;
+\ Each list ends in `*`, as serde skips unknown members, and requires every
+\ other name, so the cells never answer an earlier row's values.
+: FINGERPRINT-NAMES ( -- ^u8 n )
+   s" inode size modified_seconds modified_nanoseconds changed_seconds changed_nanoseconds *" ;
 
-: I64-AT ( ^u8 n ^u8 n reading -- n )
-   {: r:reading :} r MEMBER r READ-I64 ;
+: VALUE-NAMES ( -- ^u8 n ) s" fingerprint content *" ;
+
+\ The fingerprint is read while the hash value's list is open, so each list
+\ has its own seen buffer.
+FINGERPRINT-NAMES JSON:SEEN-BYTES constant FINGERPRINT-SEEN-BYTES
+FINGERPRINT-SEEN-BYTES TASK:+USERS FINGERPRINT-SEEN u8
+VALUE-NAMES JSON:SEEN-BYTES constant VALUE-SEEN-BYTES
+VALUE-SEEN-BYTES TASK:+USERS VALUE-SEEN u8
+
+6 TASK:+USERS FINGERPRINT-FIELDS n
+1 TASK:+USERS VALUE-FINGERPRINT fingerprint
+1 TASK:+USERS VALUE-CONTENT DROPBOX:hash
+
+\ A seen buffer zeroed for its object's first READ-LISTED.
+: CLEARED ( ^u8 n -- ^u8 )
+   {: a:^ u:n :} u 0 ?do 0 a i + c! loop a ;
+
+\ The fingerprint's seconds may be negative.
+: SIGNED? ( n -- bool ) dup 2 = swap 4 = or ;
+
+\ The fingerprint object at the reader's token; the reader is left on its
+\ `}`.
+: FINGERPRINT-HERE ( JSON:reader -- JSON:reader fingerprint )
+   JSON:READ-TOKEN JSON:T-OBJ EXPECT
+   0 FINGERPRINT-SEEN FINGERPRINT-SEEN-BYTES CLEARED {: seen:^ :}
+   begin FINGERPRINT-NAMES seen JSON:READ-LISTED dup 0< 0= while
+      {: i:n :} i SIGNED? if I64-HERE else U64-HERE then
+      i FINGERPRINT-FIELDS !
+   repeat drop
+   0 FINGERPRINT-FIELDS @ 1 FINGERPRINT-FIELDS @ 2 FINGERPRINT-FIELDS @
+   3 FINGERPRINT-FIELDS @ 4 FINGERPRINT-FIELDS @ 5 FINGERPRINT-FIELDS @
+   MODEL-FINGERPRINT:MAKE ;
 
 : READ-FINGERPRINT ( ^u8 n reading -- fingerprint )
-   {: t:^ u:n r:reading :}
-   t u s" inode" r U64-AT
-   t u s" size" r U64-AT
-   t u s" modified_seconds" r I64-AT
-   t u s" modified_nanoseconds" r U64-AT
-   t u s" changed_seconds" r I64-AT
-   t u s" changed_nanoseconds" r U64-AT
-   MODEL-FINGERPRINT:MAKE ;
+   OPEN drop FINGERPRINT-HERE {: f:fingerprint :} JSON:READ-FINISH f ;
 
 : READ-HASH-VALUE ( ^u8 n reading -- fingerprint DROPBOX:hash )
    {: t:^ u:n r:reading :}
-   t u s" fingerprint" r MEMBER r READ-FINGERPRINT
-   t u s" content" r HASH-AT ;
+   t u r OPEN JSON:T-OBJ EXPECT
+   0 VALUE-SEEN VALUE-SEEN-BYTES CLEARED {: seen:^ :}
+   begin VALUE-NAMES seen JSON:READ-LISTED dup 0< 0= while
+      0= if FINGERPRINT-HERE 0 VALUE-FINGERPRINT !
+      else r STRING-HERE DROPBOX:>HASH 0 VALUE-CONTENT ! then
+   repeat drop
+   JSON:READ-FINISH 0 VALUE-FINGERPRINT @ 0 VALUE-CONTENT @ ;
 
 : UNIT-BLOCKAGE ( n -- blockage )
    case
