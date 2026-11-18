@@ -932,6 +932,25 @@ STRUCTURE case-variant-move
       some OF OPTION:SOME ENDOF
    ;MATCH ;
 
+\ For EACH-LOCAL-COLLISION: true, the records copied into found, when
+\ their spellings collide with a renamable one.
+: COLLISION-FOUND?
+   ( ^VEC:vector<MODEL:local-record> ^VEC:vector<MODEL:local-record>
+     ^ARENA:arena -- bool )
+   {: records found ar :}
+   records ar SPELLINGS ar ORDERED FIRST-COLLISION = if false exit then
+   records VEC:COUNT 0 ?do records i VEC:AT @ found VEC:PUSH ! loop
+   true ;
+
+\ The records of the first key, in the journal's order, whose spellings
+\ collide with a renamable one; empty when no key's do.
+: COLLIDING
+   ( JOURNAL:journal ^ARENA:arena -- ^VEC:vector<MODEL:local-record> )
+   {: j ar :}
+   ar ARENA:ALLOCATOR 0 [type] MODEL:local-record VEC:NEW {: found :}
+   j ar [: found ar COLLISION-FOUND? ;] JOURNAL:EACH-LOCAL-COLLISION
+   found ;
+
 \ Rust's truncate_component: the name cut to limit bytes, at a character
 \ boundary when the name is UTF-8.
 : TRUNCATE-COMPONENT ( ^u8 n n -- ^u8 n )
@@ -984,33 +1003,24 @@ STRUCTURE case-variant-move
    du 0= if name MODEL:>PATH exit then
    dir du s" /" ar JOIN-BYTES name str> ar JOIN-BYTES >str MODEL:>PATH ;
 
-: KEYS
-   ( ^VEC:vector<MODEL:local-record> ^ARENA:arena
-     -- ^VEC:vector<MODEL:key> )
-   {: v ar :}
-   ar ARENA:ALLOCATOR 0 [type] MODEL:key VEC:NEW {: out :}
-   v VEC:COUNT 0 ?do
-      v i VEC:AT @ RECORD-PATH ar MODEL:FOLD out VEC:PUSH !
-   loop
-   out ;
+: HELD? ( option<MODEL:local-record> -- bool )
+   MATCH option
+      none OF false ENDOF
+      some OF drop true ENDOF
+   ;MATCH ;
 
-: TAKEN? ( ^VEC:vector<MODEL:key> MODEL:key -- bool )
-   {: keys k :}
-   keys VEC:COUNT 0 ?do
-      keys i VEC:AT @ k MODEL:KEY= if true unloop exit then
-   loop
-   false ;
-
-\ The attempt's destination, unless no name fits or a record holds its
-\ identity.
+\ The attempt's destination, unless no name fits or a local row holds
+\ its identity.
 : DESTINATION
-   ( ^VEC:vector<MODEL:key> ^u8 n ^u8 n n n ^ARENA:arena
+   ( JOURNAL:journal ^u8 n ^u8 n n n ^ARENA:arena
      -- option<MODEL:path> bool )
-   {: keys dir:^ du:n name:^ nu:n attempt:n max:n ar :}
+   {: j dir:^ du:n name:^ nu:n attempt:n max:n ar :}
    name nu attempt max ar CASE-VARIANT-NAME MATCH option
       none OF NO-PATH true ENDOF
       some OF dir du rot ar UNDER {: d :}
-         keys d ar MODEL:FOLD TAKEN? if NO-PATH false exit then
+         j d ar MODEL:FOLD ar JOURNAL:LOCAL-AT HELD? if
+            NO-PATH false exit
+         then
          d OPTION:SOME true
       ENDOF
    ;MATCH ;
@@ -1019,19 +1029,17 @@ STRUCTURE case-variant-move
    s" could not select a unique local case-variant path" INVALID ;
 
 \ Rust's case_variant_move: the source's first case-variant name whose
-\ identity no record holds, trying one more name than there are records.
+\ identity no local row holds, trying one more name than there are rows.
 : CASE-VARIANT-MOVE
-   ( ^VEC:vector<MODEL:local-record> MODEL:path n ^ARENA:arena
-     -- case-variant-move )
-   {: records source max:n ar :}
-   records ar KEYS {: keys :}
+   ( JOURNAL:journal MODEL:path n ^ARENA:arena -- case-variant-move )
+   {: j source max:n ar :}
    source PATH$ SPLIT-NAME {: dir:^ du:n name:^ nu:n :}
    name nu FINAL? 0= if
       source s" local case collision has no final path component"
       INVALID
    then
-   records VEC:COUNT 1+ 0 ?do
-      keys dir du name nu i max ar DESTINATION if
+   j JOURNAL:LOCAL-COUNT 1+ 0 ?do
+      j dir du name nu i max ar DESTINATION if
          MATCH option
             none OF source NO-UNIQUE ENDOF
             some OF source swap CASE-VARIANT-MOVE-MAKE unloop exit ENDOF
@@ -1098,24 +1106,24 @@ STRUCTURE case-variant-move
    ;MATCH ;
 
 : RESOLVE-BELOW
-   ( fd MODEL:path JOURNAL:journal ^VEC:vector<MODEL:local-record>
-     ^ARENA:arena -- case-collision-resolution )
-   {: root:fd source j records ar :}
+   ( fd MODEL:path JOURNAL:journal ^ARENA:arena
+     -- case-collision-resolution )
+   {: root:fd source j ar :}
    root source PATH$ LOCAL:PARENT-NAME-MAX MATCH option
       none OF source CHANGED ENDOF
       some OF {: max:n :}
-         root j records source max ar CASE-VARIANT-MOVE ar MOVE-VARIANT
+         root j j source max ar CASE-VARIANT-MOVE ar MOVE-VARIANT
       ENDOF
    ;MATCH ;
 
 : RESOLVE-AT
-   ( MODEL:path JOURNAL:journal ^u8 n ^VEC:vector<MODEL:local-record>
-     ^ARENA:arena -- case-collision-resolution )
-   {: source j p:^ u:n records ar :}
+   ( MODEL:path JOURNAL:journal ^u8 n ^ARENA:arena
+     -- case-collision-resolution )
+   {: source j p:^ u:n ar :}
    j p u LOCAL:OPEN-ACTIVE-ROOT MATCH option
       none OF construct case-collision-resolution root-changed ENDOF
       some OF {: root:fd :}
-         [: root source j records ar RESOLVE-BELOW ;]
+         [: root source j ar RESOLVE-BELOW ;]
          [: root FS:CLOSE-DIR ;] finally
       ENDOF
    ;MATCH ;
@@ -1125,17 +1133,15 @@ STRUCTURE case-variant-move
    {: k j ar :}
    j k ar JOURNAL:BASELINE-SPELLING ;
 
-\ Rust's resolve_case_collision: renames one spelling of the first
-\ collision below the sync root at p apart, retiring the plans at its
-\ identity and forgetting the baselines the rename leaves stale.
+\ Rust's resolve_case_collision: renames a spelling of the journal's first
+\ local collision under p apart, retiring its plans and stale baselines.
 : RESOLVE-CASE-COLLISION
-   ( JOURNAL:journal ^u8 n ^VEC:vector<MODEL:local-record> ^ARENA:arena
-     -- case-collision-resolution )
-   {: j p:^ u:n records ar :}
-   records [: j ar RECORDED-SPELLING ;] ar
+   ( JOURNAL:journal ^u8 n ^ARENA:arena -- case-collision-resolution )
+   {: j p:^ u:n ar :}
+   j ar COLLIDING [: j ar RECORDED-SPELLING ;] ar
    CASE-VARIANT-SOURCE MATCH option
       none OF construct case-collision-resolution none ENDOF
-      some OF j p u records ar RESOLVE-AT ENDOF
+      some OF j p u ar RESOLVE-AT ENDOF
    ;MATCH ;
 
 \ ---- file-copy names ----------------------------------------------
@@ -3668,17 +3674,11 @@ ENUM pass-state DERIVE eq
       root-changed OF construct pass-event root-changed ENDOF
    ;MATCH ;
 
-: RESOLVED
-   ( ^pass ^VEC:vector<MODEL:local-record>
-     -- case-collision-resolution )
-   {: x records :}
-   x JOURNAL@ x PASS-RUN @ ROOT$ records x ARENA@
-   RESOLVE-CASE-COLLISION ;
-
-: SETTLE-PUBLISHED ( ^pass -- pass-event )
+: RESOLVED ( ^pass -- case-collision-resolution )
    {: x :}
-   x x JOURNAL@ x ARENA@ JOURNAL:LOCAL-INVENTORY RESOLVED
-   PUBLISHED-SETTLED ;
+   x JOURNAL@ x PASS-RUN @ ROOT$ x ARENA@ RESOLVE-CASE-COLLISION ;
+
+: SETTLE-PUBLISHED ( ^pass -- pass-event ) RESOLVED PUBLISHED-SETTLED ;
 
 : RECOVER ( ^pass -- step-event )
    {: x :}
@@ -3705,7 +3705,7 @@ ENUM pass-state DERIVE eq
    MATCH LOCAL:scan-publication
       published OF LOCAL:SCAN-OBSERVATIONS {: records :}
          records x PASS-RECORDS !
-         x records RESOLVED SCAN-SETTLED
+         x RESOLVED SCAN-SETTLED
       ENDOF
       root-changed OF construct pass-event root-changed ENDOF
    ;MATCH ;

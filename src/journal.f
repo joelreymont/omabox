@@ -1840,6 +1840,74 @@ public
 
 private
 
+: LOCAL-RECORDS ( ^ARENA:arena -- ^VEC:vector<MODEL:local-record> )
+   [type] MODEL:local-record NEW-VECTOR ;
+
+\ The row's record joins v; at its key's last row the visitor takes v,
+\ and a new vector follows it for the next key.
+: COLLISION-ROW
+   ( SQLITE:statement ^VEC:vector<MODEL:local-record> ^ARENA:arena
+     [ ^VEC:vector<MODEL:local-record> -- bool ]
+     -- SQLITE:statement ^VEC:vector<MODEL:local-record> bool )
+   {: v ar visit :}
+   ar LOCAL-ROW v VEC:PUSH !
+   2 SQLITE:COL-INT 0= if v false exit then
+   v visit execute {: stop:bool :}
+   ar LOCAL-RECORDS stop ;
+
+\ Every visited key ends at its last row, so no records are left over.
+: COLLISION-ROWS
+   ( SQLITE:statement ^ARENA:arena
+     [ ^VEC:vector<MODEL:local-record> -- bool ] -- SQLITE:statement )
+   {: ar visit :}
+   ar LOCAL-RECORDS
+   begin swap SQLITE:STEP while
+      swap ar visit COLLISION-ROW if drop exit then
+   repeat
+   nip ;
+
+: NO-LOCAL ( -- option<MODEL:local-record> ) OPTION:NONE ;
+
+: LOCAL-AT-ROW
+   ( SQLITE:statement ^ARENA:arena
+     -- option<MODEL:local-record> SQLITE:statement )
+   {: ar :}
+   SQLITE:STEP 0= if NO-LOCAL swap exit then
+   ar LOCAL-ROW OPTION:SOME swap ;
+
+public
+
+\ The records of each canonical path several local rows hold, by key then
+\ path bytes, to the visitor inside the statement until it answers true.
+: EACH-LOCAL-COLLISION
+   ( journal ^ARENA:arena [ ^VEC:vector<MODEL:local-record> -- bool ]
+     -- )
+   {: j ar visit :}
+   j >CONNECTION
+   s" SELECT o.path, o.observation_json, o.path = c.last
+      FROM (SELECT canonical_path, max(path) AS last
+            FROM local_observations
+            GROUP BY canonical_path HAVING count(*) > 1) AS c
+      JOIN local_observations AS o
+         ON o.canonical_path = c.canonical_path
+      ORDER BY o.canonical_path, o.path"
+   >str [: ar visit COLLISION-ROWS ;] SQLITE:WITH-STATEMENT ;
+
+: LOCAL-COUNT ( journal -- n )
+   >CONNECTION s" SELECT count(*) FROM local_observations" QUERY-INT ;
+
+\ The local record with the least path at the canonical path.
+: LOCAL-AT
+   ( journal MODEL:key ^ARENA:arena -- option<MODEL:local-record> )
+   {: j k ar :}
+   j >CONNECTION
+   s" SELECT path, observation_json FROM local_observations
+      WHERE canonical_path = ?1 ORDER BY path LIMIT 1"
+   >str [: k KEY-BYTES >str 1 SQLITE:BIND-BLOB ar LOCAL-AT-ROW ;]
+   SQLITE:WITH-STATEMENT ;
+
+private
+
 
 \ ---- a case-collision rename ---------------------------------------
 

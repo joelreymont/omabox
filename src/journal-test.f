@@ -12,6 +12,8 @@
 \ upload content, conflicts and pending and completed recoveries, each in
 \ the line's own form; a file of other bytes refused as corrupt by both
 \ opens, unchanged; a failed open's E-FILE leaving EACCES in FS:ERRNO;
+\ the keys EACH-LOCAL-COLLISION visits, in MODEL:KEY-CMP's order, and
+\ LOCAL-COUNT and LOCAL-AT over published scans;
 \ and fifty-one tests of the Rust version's src/journal.rs and two of
 \ its src/daemon.rs under their names, which
 \ build each decision the Rust ones ask the planner for as
@@ -1342,6 +1344,103 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    s" new.txt" 20 ar LOCAL-HASH ar ONE-HASH PUBLISH-LOCAL-SCAN TFALSE
    j TOTAL-CHANGES stale T=
    j old old-hash ar SCAN-HELD
+   j CLOSE
+   d GONE ;
+
+: LOCAL-DIRECTORY ( -- MODEL:observation<MODEL:local> )
+   MODEL-OBSERVATION:DIRECTORY ;
+
+: DIRECTORY-LOCAL ( ^u8 n -- MODEL:local-record )
+   LOCAL-DIRECTORY LOCAL-RECORD ;
+
+\ The piece of p from at joins v as a directory; the index after it,
+\ or -1 past the last.
+: SCAN-PIECE ( ^u8 n n ^VEC:vector<MODEL:local-record> -- n )
+   {: p:^ u:n at:n v :}
+   p u 32 at SPLIT-NEXT 0= if 2drop drop -1 exit then
+   {: q:^ w:n next:n :}
+   q w DIRECTORY-LOCAL v LOCAL+ next ;
+
+\ The local inventory is directories at the paths p names, in its
+\ order and apart by spaces, with no hashes.
+: LOCAL-SCAN ( journal local-root-binding ^u8 n ^ARENA:arena -- )
+   {: j b p:^ u:n ar :}
+   ar LOCALS {: v :}
+   0 begin p u rot v SCAN-PIECE dup 0< until drop
+   j b v ar HASHES PUBLISH-LOCAL-SCAN TTRUE ;
+
+\ Each record's path then a space, and "|" after the key's last.
+: VISIT-PUT ( ^VEC:vector<MODEL:local-record> -- )
+   {: v :}
+   v VEC:COUNT 0 ?do
+      v i VEC:AT @ MODEL-LOCAL--RECORD:UNMAKE drop PATH-BYTES SB-APPEND
+      s"  " SB-APPEND
+   loop
+   s" |" SB-APPEND ;
+
+: VISIT-ON ( ^VEC:vector<MODEL:local-record> -- bool ) VISIT-PUT false ;
+: VISIT-ONCE ( ^VEC:vector<MODEL:local-record> -- bool ) VISIT-PUT true ;
+
+\ VISIT-PUT's text of the keys EACH-LOCAL-COLLISION visits with v.
+: VISITS
+   ( journal [ ^VEC:vector<MODEL:local-record> -- bool ] ^ARENA:arena
+     -- ^u8 n )
+   {: j v ar :}
+   SB-RESET j ar v EACH-LOCAL-COLLISION SB$ ar COPIED str> ;
+
+: KEY-BEFORE? ( ^u8 n ^u8 n ^ARENA:arena -- bool )
+   {: a:^ au:n b:^ bu:n ar :}
+   a au ar CANONICAL b bu ar CANONICAL MODEL:KEY-CMP 0< ;
+
+: COLLISIONS-VISITED ( journal local-root-binding ^ARENA:arena -- )
+   {: j b ar :}
+   j b s" b.txt a.txt" ar LOCAL-SCAN
+   j [: VISIT-ON ;] ar VISITS s" " T$=
+   s" z.txt" s\" \xC3\xA9.txt" ar KEY-BEFORE? TTRUE
+   j b s\" \xC3\xA9.txt z.txt solo.txt \xC3\x89.txt Z.txt" ar LOCAL-SCAN
+   j [: VISIT-ON ;] ar VISITS
+   s\" Z.txt z.txt |\xC3\x89.txt \xC3\xA9.txt |" T$=
+   s" note" s" notes" ar KEY-BEFORE? TTRUE
+   j b s" notes Note solo Notes note" ar LOCAL-SCAN
+   j [: VISIT-ON ;] ar VISITS s" Note note |Notes notes |" T$=
+   j [: VISIT-ONCE ;] ar VISITS s" Note note |" T$= ;
+
+\ Only keys several rows hold, in MODEL:KEY-CMP's order: 0x80 after 0x7A,
+\ a prefix first; each key's records in path order; true stops the visit.
+: EACH-LOCAL-COLLISION-VISITS-IN-KEY-ORDER ( ^ARENA:arena -- )
+   {: ar :}
+   s" each local collision visits in key order" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   s" /sync" 2 LOCAL-ROOT {: b :}
+   j b ar ACTIVATE-LOCAL-ROOT ACTIVATED
+   j b ar COLLISIONS-VISITED
+   j CLOSE
+   d GONE ;
+
+: LOCAL-AT$ ( journal ^u8 n ^ARENA:arena -- ^u8 n )
+   {: j k:^ ku:n ar :}
+   j k ku ar CANONICAL ar LOCAL-AT MATCH option
+      none OF s" (none)" ENDOF
+      some OF MODEL-LOCAL--RECORD:UNMAKE drop PATH-BYTES ENDOF
+   ;MATCH ;
+
+\ LOCAL-COUNT counts the local rows; LOCAL-AT answers a key's least
+\ path, none where no row holds it.
+: LOCAL-COUNT-AND-LOCAL-AT ( ^ARENA:arena -- )
+   {: ar :}
+   s" local count and local at" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   s" /sync" 2 LOCAL-ROOT {: b :}
+   j b ar ACTIVATE-LOCAL-ROOT ACTIVATED
+   j LOCAL-COUNT 0 T=
+   j s" a.txt" ar LOCAL-AT$ s" (none)" T$=
+   j b s" b.txt a.txt A.txt" ar LOCAL-SCAN
+   j LOCAL-COUNT 3 T=
+   j s" a.txt" ar LOCAL-AT$ s" A.txt" T$=
+   j s" b.txt" ar LOCAL-AT$ s" b.txt" T$=
+   j s" c.txt" ar LOCAL-AT$ s" (none)" T$=
    j CLOSE
    d GONE ;
 
@@ -3329,6 +3428,8 @@ variable CRAFT
    ar REMOTE-DELTA-ENSURED-DIRECTORY-KEEPS-AN-UNKNOWN-FOLDER
    ar REMOTE-DIRECTORY-AT-INCLUDES-RESTRICTED-FOLDERS
    ar JOURNAL-LOCAL-SCAN-REPLACES-INVENTORY-AND-HASHES-ATOMICALLY
+   ar EACH-LOCAL-COLLISION-VISITS-IN-KEY-ORDER
+   ar LOCAL-COUNT-AND-LOCAL-AT
    ar ORACLE-JOURNAL-HOLDS-ITS-BASELINES
    ar JOURNAL-REOPEN-EXPOSES-INTENT-WITHOUT-ADVANCING-BASELINE
    ar RECONCILIATION-DECISIONS-COMMIT-ATOMICALLY

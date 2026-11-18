@@ -28,9 +28,10 @@
 \   case_variant_source_leaves_unsupported_spellings and
 \   case_variant_source_skips_an_unsupported_collision.
 \ - RESOLVE-CASE-COLLISION below a bound root holding Dir/a.txt and
-\   dir/b.txt renames dir, the spelling CASE-VARIANT-SOURCE picks, to
-\   its case-variant name and retires the plans at both spellings,
-\   which share its identity, leaving one at another path pending.
+\   dir/b.txt, as its journal's local inventory does, renames dir, the
+\   spelling CASE-VARIANT-SOURCE picks, to its case-variant name and
+\   retires the plans at both spellings, which share its identity,
+\   leaving one at another path pending.
 \ - With the root replaced by another directory it answers
 \   root-changed, renaming nothing and retiring no plan.
 \ Listing changes, Rust's tests of the same names:
@@ -245,6 +246,41 @@ private
 
 : GONE ( str JOURNAL:journal -- )
    JOURNAL:CLOSE str> FS:REMOVE-TREE ;
+
+: ACTIVATED-BINDING
+   ( JOURNAL:local-root-activation -- JOURNAL:local-root-binding )
+   MATCH JOURNAL:local-root-activation
+      activated OF JOURNAL-LOCAL--ROOT--RECORD:UNMAKE drop ENDOF
+      current OF JOURNAL-LOCAL--ROOT--RECORD:UNMAKE drop ENDOF
+      unavailable OF
+         drop drop s" reconcile-test: the root is unavailable" FAILED
+      ENDOF
+   ;MATCH ;
+
+\ The directory at r made the journal's root, and the binding its
+\ activation answers.
+: ROOTED
+   ( JOURNAL:journal str ^ARENA:arena -- JOURNAL:local-root-binding )
+   {: j r:str ar :}
+   j r JOURNAL:INSPECT ar JOURNAL:ACTIVATE-LOCAL-ROOT
+   ACTIVATED-BINDING ;
+
+\ The records made the journal's local inventory, with no hashes.
+: LOCALS-PUBLISHED
+   ( JOURNAL:journal JOURNAL:local-root-binding
+     ^VEC:vector<MODEL:local-record> ^ARENA:arena -- )
+   {: j b v ar :}
+   ar ARENA:ALLOCATOR 0 [type] MODEL:hash-record VEC:NEW {: none :}
+   j b v none JOURNAL:PUBLISH-LOCAL-SCAN TTRUE ;
+
+\ The body runs on a case's directory and its journal, rooted at the
+\ directory, which is removed after.
+: WITH-ROOTED
+   ( [ str JOURNAL:journal JOURNAL:local-root-binding -- ] ^ARENA:arena
+     -- )
+   {: body ar :}
+   ar CASE-JOURNAL {: d:str j :}
+   [: d j j d ar ROOTED body execute ;] [: d j GONE ;] finally ;
 
 \ Rust's CanonicalPath::from_display of the bytes.
 : CANONICAL ( ^u8 n ^ARENA:arena -- MODEL:key )
@@ -489,17 +525,20 @@ variable SEED
 
 : NO-SPELLING ( MODEL:key -- option<MODEL:path> ) drop NO-PATH ;
 
-\ Rust's case_variant_move, max 255, of case_variant_source's pick
-\ with no baseline; a collision with no source fails the case.
+\ Rust's case_variant_move, max 255, of case_variant_source's unbased pick,
+\ the records published first; a collision with no source fails the case.
 : RENAME
-   ( ^VEC:vector<MODEL:local-record> ^ARENA:arena
-     -- case-variant-move )
-   {: rs ar :}
+   ( JOURNAL:journal JOURNAL:local-root-binding
+     ^VEC:vector<MODEL:local-record> ^ARENA:arena -- case-variant-move )
+   {: j b rs ar :}
    rs [: NO-SPELLING ;] ar CASE-VARIANT-SOURCE MATCH option
       none OF
          false TTRUE s" " DISPLAY dup CASE-VARIANT-MOVE-MAKE
       ENDOF
-      some OF rs swap 255 ar CASE-VARIANT-MOVE ENDOF
+      some OF {: src :}
+         j b rs ar LOCALS-PUBLISHED
+         j src 255 ar CASE-VARIANT-MOVE
+      ENDOF
    ;MATCH ;
 
 : MOVES= ( case-variant-move case-variant-move -- )
@@ -518,17 +557,19 @@ variable SEED
 
 \ The records in reverse order rename alike, to a unique path.
 : RENAMES-AGREE
-   ( ^VEC:vector<MODEL:local-record> str str ^ARENA:arena -- )
-   {: rs lower:str upper:str ar :}
+   ( JOURNAL:journal JOURNAL:local-root-binding
+     ^VEC:vector<MODEL:local-record> str str ^ARENA:arena -- )
+   {: j b rs lower:str upper:str ar :}
    ar LOCAL-RECORDS {: sr :}
    sr upper str> DIRECTORY+ sr lower str> DIRECTORY+
-   rs ar RENAME {: fwd :}
-   fwd sr ar RENAME MOVES=
+   j b rs ar RENAME {: fwd :}
+   fwd j b sr ar RENAME MOVES=
    fwd lower upper ar UNIQUE ;
 
 \ One sample of the proptest: a lowercase name and its uppercase.
-: CASE-VARIANTS ( str ^ARENA:arena -- )
-   {: d:str ar :}
+: CASE-VARIANTS
+   ( str JOURNAL:journal JOURNAL:local-root-binding ^ARENA:arena -- )
+   {: d:str j b ar :}
    s" abcdefghijklmnopqrstuvwxyz" 24 RANDOM 1+ ar SAMPLE {: stem:str :}
    SB-RESET stem str> SB-APPEND s" .txt" SB-APPEND
    SB$ ar COPIED {: lower:str :}
@@ -540,16 +581,19 @@ variable SEED
    LOGGED {: t:^ tu:n :}
    t tu >str 10 COUNT-CHAR 1 T=
    t tu upper str> lower str> COLLISION$ CONTAINS? TTRUE
-   rs lower upper ar RENAMES-AGREE ;
+   j b rs lower upper ar RENAMES-AGREE ;
+
+: SAMPLED-VARIANTS
+   ( str JOURNAL:journal JOURNAL:local-root-binding ^ARENA:arena -- )
+   {: d:str j b ar :}
+   1 SEED !
+   16 0 ?do d j b ar CASE-VARIANTS loop ;
 
 : LOCAL-CASE-VARIANTS-NEVER-COLLAPSE-INTO-ONE-OBSERVATION
    ( ^ARENA:arena -- )
    {: ar :}
    s" local_case_variants_never_collapse_into_one_observation" T-LABEL
-   s" reconcile-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
-   1 SEED !
-   16 0 ?do d ar CASE-VARIANTS loop
-   d str> FS:REMOVE-TREE ;
+   [: ar SAMPLED-VARIANTS ;] ar WITH-ROOTED ;
 
 \ For MERGE-PATH: the piece from at, kept unless empty, "." or "..";
 \ the index after it, or -1 past the last.
@@ -1082,17 +1126,31 @@ variable SEED
 : MOVE-DESTINATION ( case-variant-move -- MODEL:path )
    CASE-VARIANT-MOVE-UNMAKE {: s d :} d ;
 
-: CASE-VARIANT-NAME-SKIPS-EXISTING-SUFFIXES ( ^ARENA:arena -- )
-   {: ar :}
-   s" case_variant_name_skips_existing_suffixes" T-LABEL
+\ CASE-VARIANT-MOVE, max 255, of the records' source with no baseline,
+\ the records published first.
+: UNBASED-MOVE
+   ( JOURNAL:journal JOURNAL:local-root-binding
+     ^VEC:vector<MODEL:local-record> ^ARENA:arena -- case-variant-move )
+   {: j b v ar :}
+   j b v ar LOCALS-PUBLISHED
+   j v ar UNBASED-SOURCE 255 ar CASE-VARIANT-MOVE ;
+
+: SKIPS-EXISTING-SUFFIXES
+   ( str JOURNAL:journal JOURNAL:local-root-binding ^ARENA:arena -- )
+   {: d:str j b ar :}
    ar NEW-RECORDS {: v :}
    v s" Credit" DIR+
    v s" credit" DIR+
    v s" credit (case variant)" DIR+
    v s" CREDIT (CASE VARIANT 2)" DIR+
-   v v ar UNBASED-SOURCE 255 ar CASE-VARIANT-MOVE {: mv :}
+   j b v ar UNBASED-MOVE {: mv :}
    mv MOVE-SOURCE$ s" credit" T$=
    mv MOVE-DESTINATION PATH$ s" credit (case variant 3)" T$= ;
+
+: CASE-VARIANT-NAME-SKIPS-EXISTING-SUFFIXES ( ^ARENA:arena -- )
+   {: ar :}
+   s" case_variant_name_skips_existing_suffixes" T-LABEL
+   [: ar SKIPS-EXISTING-SUFFIXES ;] ar WITH-ROOTED ;
 
 : REPEATED ( u8 n ^ARENA:arena -- ^u8 n )
    {: c:u8 u:n ar :}
@@ -1100,16 +1158,21 @@ variable SEED
    u 0 ?do c p i + c! loop
    p u ;
 
-: CASE-VARIANT-NAME-FITS-A-MAXIMUM-LENGTH-COMPONENT ( ^ARENA:arena -- )
-   {: ar :}
-   s" case_variant_name_fits_a_maximum_length_component" T-LABEL
+: FITS-A-MAXIMUM-LENGTH-COMPONENT
+   ( str JOURNAL:journal JOURNAL:local-root-binding ^ARENA:arena -- )
+   {: d:str j b ar :}
    ar NEW-RECORDS {: v :}
    v 65 255 ar REPEATED DIR+
    v 97 255 ar REPEATED DIR+
-   v v ar UNBASED-SOURCE 255 ar CASE-VARIANT-MOVE MOVE-DESTINATION
+   j b v ar UNBASED-MOVE MOVE-DESTINATION
    PATH$ SPLIT-NAME {: dir:^ du:n name:^ nu:n :}
    nu 255 T=
    name nu >str s"  (case variant)" >str ENDS-WITH? TTRUE ;
+
+: CASE-VARIANT-NAME-FITS-A-MAXIMUM-LENGTH-COMPONENT ( ^ARENA:arena -- )
+   {: ar :}
+   s" case_variant_name_fits_a_maximum_length_component" T-LABEL
+   [: ar FITS-A-MAXIMUM-LENGTH-COMPONENT ;] ar WITH-ROOTED ;
 
 \ The name, failing the case when none fits.
 : SOME-NAME ( option<str> -- str )
@@ -1133,15 +1196,15 @@ variable SEED
    au 255 T=
    a au >str s"  (Dropbox file bbbbbbbbbbbb)" >str ENDS-WITH? TTRUE ;
 
-: CASE-VARIANT-MOVES-CONVERGE-FROM-PARENT-TO-CHILD ( ^ARENA:arena -- )
-   {: ar :}
-   s" case_variant_moves_converge_from_parent_to_child" T-LABEL
+: CONVERGE-FROM-PARENT-TO-CHILD
+   ( str JOURNAL:journal JOURNAL:local-root-binding ^ARENA:arena -- )
+   {: d:str j b ar :}
    ar NEW-RECORDS {: v :}
    v s" Credit" DIR+
    v s" credit" DIR+
    v s" credit/Expenses" DIR+
    v s" credit/expenses" DIR+
-   v v ar UNBASED-SOURCE 255 ar CASE-VARIANT-MOVE {: parent :}
+   j b v ar UNBASED-MOVE {: parent :}
    parent MOVE-SOURCE$ s" credit" T$=
    parent MOVE-DESTINATION PATH$ s" credit (case variant)" T$=
    ar NEW-RECORDS {: after :}
@@ -1149,7 +1212,7 @@ variable SEED
    after s" credit (case variant)" DIR+
    after s" credit (case variant)/Expenses" DIR+
    after s" credit (case variant)/expenses" DIR+
-   after after ar UNBASED-SOURCE 255 ar CASE-VARIANT-MOVE {: child :}
+   j b after ar UNBASED-MOVE {: child :}
    child MOVE-SOURCE$ s" credit (case variant)/expenses" T$=
    child MOVE-DESTINATION PATH$
    s" credit (case variant)/expenses (case variant)" T$=
@@ -1160,6 +1223,11 @@ variable SEED
    converged child MOVE-DESTINATION PATH$ DIR+
    converged [: NO-SPELLING ;] ar CASE-VARIANT-SOURCE SOURCE$
    s" (none)" T$= ;
+
+: CASE-VARIANT-MOVES-CONVERGE-FROM-PARENT-TO-CHILD ( ^ARENA:arena -- )
+   {: ar :}
+   s" case_variant_moves_converge_from_parent_to_child" T-LABEL
+   [: ar CONVERGE-FROM-PARENT-TO-CHILD ;] ar WITH-ROOTED ;
 
 : CASE-VARIANT-SOURCE-KEEPS-THE-RECORDED-SPELLING ( ^ARENA:arena -- )
    {: ar :}
@@ -1195,6 +1263,23 @@ variable SEED
    v s" Notes.txt" s" Notes.txt" ar FILE+
    v s" notes.txt" s" notes.txt" ar FILE+
    v [: NO-SPELLING ;] ar CASE-VARIANT-SOURCE SOURCE$ s" notes.txt" T$= ;
+
+\ The journal's first collision, Link and link, is unsupported, so
+\ COLLIDING passes it for the notes.
+: FIRST-COLLISION-SKIPS-UNSUPPORTED
+   ( str JOURNAL:journal JOURNAL:local-root-binding ^ARENA:arena -- )
+   {: d:str j b ar :}
+   ar UNSUPPORTED-RECORDS {: v :}
+   v s" Notes.txt" s" Notes.txt" ar FILE+
+   v s" notes.txt" s" notes.txt" ar FILE+
+   j b v ar LOCALS-PUBLISHED
+   j ar COLLIDING [: NO-SPELLING ;] ar CASE-VARIANT-SOURCE SOURCE$
+   s" notes.txt" T$= ;
+
+: JOURNAL-FIRST-COLLISION-SKIPS-AN-UNSUPPORTED-ONE ( ^ARENA:arena -- )
+   {: ar :}
+   s" journal_first_collision_skips_an_unsupported_one" T-LABEL
+   [: ar FIRST-COLLISION-SKIPS-UNSUPPORTED ;] ar WITH-ROOTED ;
 
 \ ---- RESOLVE-CASE-COLLISION
 
@@ -1232,12 +1317,13 @@ variable SEED
    v s" dir/b.txt" s" b" ar FILE+
    v ;
 
-\ The journal in the case's directory d, bound to the root r, with a
-\ pending plan below each spelling and one beside them.
+\ The journal in d, bound to the root r and holding the fixture's tree,
+\ with a pending plan below each spelling and one beside them.
 : BOUND ( str str ^ARENA:arena -- JOURNAL:journal )
    {: d:str r:str ar :}
    d s" journal.sqlite3" ar INSIDE JOURNAL:OPEN {: j :}
-   j r JOURNAL:INSPECT ar JOURNAL:ACTIVATE-LOCAL-ROOT drop
+   j r ar ROOTED {: b :}
+   j b ar TREE ar LOCALS-PUBLISHED
    j s" Dir/a.txt" ar RECORD
    j s" dir/b.txt" ar RECORD
    j s" other.txt" ar RECORD
@@ -1260,7 +1346,7 @@ variable SEED
    d r ar BOUND {: j :}
    ar TREE {: v :}
    v ar UNBASED-SOURCE PATH$ s" dir" T$=
-   j r str> v ar RESOLVE-CASE-COLLISION ar RESOLUTION$
+   j r str> ar RESOLVE-CASE-COLLISION ar RESOLUTION$
    s" renamed dir" T$=
    r s" dir (case variant)/b.txt" ar THERE? TTRUE
    r s" dir" ar THERE? TFALSE
@@ -1282,7 +1368,7 @@ variable SEED
    d s" old" ar INSIDE {: old:str :}
    r old FS:RENAME-FILE
    r str> FS:MAKE-DIR
-   j r str> ar TREE ar RESOLVE-CASE-COLLISION ar RESOLUTION$
+   j r str> ar RESOLVE-CASE-COLLISION ar RESOLUTION$
    s" root-changed" T$=
    old s" dir/b.txt" ar THERE? TTRUE
    old s" dir (case variant)" ar THERE? TFALSE
@@ -1305,6 +1391,7 @@ variable SEED
    ar CASE-VARIANT-SOURCE-KEEPS-THE-RECORDED-SPELLING
    ar CASE-VARIANT-SOURCE-LEAVES-UNSUPPORTED-SPELLINGS
    ar CASE-VARIANT-SOURCE-SKIPS-AN-UNSUPPORTED-COLLISION
+   ar JOURNAL-FIRST-COLLISION-SKIPS-AN-UNSUPPORTED-ONE
    ar RESOLVE-CASE-COLLISION-RENAMES-ONE-SPELLING
    ar RESOLVE-CASE-COLLISION-ANSWERS-A-REPLACED-ROOT ;
 
