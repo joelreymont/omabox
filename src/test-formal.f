@@ -32,7 +32,7 @@ ARENA RENDERED str
 \ The file at the path, whole, in the arena.
 : FILE$ ( ^u8 n ^ARENA:arena -- ^u8 n )
    {: p:^ pu:n ar :}
-   p pu FS:FILE-SIZE {: u:n :}
+   p pu >str FS:FILE-SIZE {: u:n :}
    ar u ARENA:ALLOC drop {: b:^ :}
    b  p pu b u FS:READ-ALL ;
 
@@ -86,7 +86,7 @@ ARENA RENDERED str
    s" -config" CMD:ARG+
    SB-RESET m mu SB-APPEND s" Follows.cfg" SB-APPEND SB$ CMD:ARG+
    SB-RESET m mu SB-APPEND s" Follows.tla" SB-APPEND SB$ CMD:ARG+
-   s" formal" CMD:CWD!  s" TMPDIR" d str> CMD:ENV+
+   s" formal" >str CMD:CWD!  s" TMPDIR" d str> CMD:ENV+
    s" /usr/bin/env" 120000 >MS CMD:RUN-RC
    MATCH result ok OF ENDOF err OF ENDOF ;MATCH {: rc:n :}
    rc 0<> if CMD:OUT$ type then

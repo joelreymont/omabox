@@ -71,7 +71,7 @@ private
    a u CANONICAL? 0= if false exit then
    u 20 < if true exit then
    u 20 > if false exit then
-   s" 18446744073709551615" a u STR< 0= ;
+   s" 18446744073709551615" >str a u >str STR< 0= ;
 
 \ A canonical PID: a positive i32.
 : PID ( ^u8 n -- option<n> )
@@ -131,7 +131,7 @@ private
    {: dir name:^ nu:n ar :}
    dir str> nip nu + 1 + {: cap:n :}
    ar cap ARENA:ALLOC drop {: d:^ :}
-   dir str> name nu d cap SPAN:MAKE FS:JOIN-PATH-INTO {: u:n :}
+   dir name nu >str d cap SPAN:MAKE FS:JOIN-PATH-INTO {: u:n :}
    d u >str ;
 
 : GONE? ( -- bool ) FS:ERRNO FS:ENOENT = ;
@@ -178,7 +178,7 @@ private
 : MATCHED ( fd ^u8 n ^u8 n ^VEC:vector<str> ^ARENA:arena -- )
    {: dir:fd p:^ pu:n s:^ su:n names scratch :}
    scratch FS-LIST:STORAGE-BYTES ARENA:ALLOC SPAN:MAKE FS-LIST:INIT
-   dir [: drop p pu s su names scratch MATCH-ONE ;] FS-LIST:EACH-TYPED-AT ;
+   dir [: drop str> p pu s su names scratch MATCH-ONE ;] FS-LIST:EACH-TYPED-AT ;
 
 : LIST-CODE? ( n -- bool )
    {: code:n :}
@@ -228,7 +228,7 @@ private
 \ The error as Rust's io::Error displays an OS error.
 : ERROR-OUT ( n fd -- )
    {: e:n f:fd :}
-   f e FS:ERRNO$ FD:WRITE-FULL
+   f e FS:ERRNO$ str> FD:WRITE-FULL
    f s"  (os error " FD:WRITE-FULL
    f e FMT:INT$ FD:WRITE-FULL
    f s" )" FD:WRITE-FULL ;

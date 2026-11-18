@@ -163,8 +163,8 @@ TYPED-VARIABLE TOKEN-CUTTING bool
 
 : ANSWER! ( HTTP:response ^u8 n -- )
    {: a:HTTP:response b:^ bu:n :}
-   a s" Content-Type" s" application/json" HTTP:HEADER!
-   a b bu HTTP:BODY! ;
+   a s" Content-Type" >str s" application/json" >str HTTP:HEADER!
+   a b bu >str HTTP:BODY! ;
 
 
 \ ---- what was sent
@@ -222,7 +222,7 @@ CALLS-MADE
 
 \ The request's Dropbox-API-Arg, empty when it sends none.
 : ARG-OF ( HTTP:request -- ^u8 n )
-   s" Dropbox-API-Arg" HTTP:HEADER-OF$ 0= if drop 0 then ;
+   s" Dropbox-API-Arg" >str HTTP:HEADER-OF$ swap str> rot 0= if drop 0 then ;
 
 
 \ The body is read first, so one that fails to arrive records nothing.
@@ -264,14 +264,14 @@ CALLS-MADE
 
 : SENT ( HTTP:request ^u8 n ^u8 n -- n bool )
    {: q:HTTP:request nm:^ nu:n dst:^ cap:n :}
-   q nm nu HTTP:HEADER-OF$ if dst cap STORE true exit then
+   q nm nu >str HTTP:HEADER-OF$ swap str> rot if dst cap STORE true exit then
    2drop 0 false ;
 
 
 : TOKEN-HEADERS ( HTTP:request -- )
    {: q:HTTP:request :}
-   q s" Authorization" HTTP:HEADER-OF$ nip nip
-   q s" Dropbox-API-Path-Root" HTTP:HEADER-OF$ nip nip or
+   q s" Authorization" >str HTTP:HEADER-OF$ nip
+   q s" Dropbox-API-Path-Root" >str HTTP:HEADER-OF$ nip or
    if true LEAKED ! then ;
 
 
@@ -310,7 +310,7 @@ CALLS-MADE
    i 0 < if false exit then
    true i SPENT !
    a i STATUSES @ HTTP:STATUS!
-   i NAME$ nip 0<> if a i NAME$ i VALUE$ HTTP:HEADER! then
+   i NAME$ nip 0<> if a i NAME$ >str i VALUE$ >str HTTP:HEADER! then
    a i BODY$ ANSWER!
    true ;
 
@@ -438,7 +438,7 @@ variable FORM-AT
    s" Bearer sl.fake-" nip {: pu:n :}
    tu pu <= if -1 exit then
    t pu s" Bearer sl.fake-" STR= 0= if -1 exit then
-   t pu + tu pu - STR-PARSE-POS MATCH option
+   t pu + tu pu - >str STR-PARSE-POS MATCH option
       none OF -1 ENDOF
       some OF ENDOF
    ;MATCH ;
@@ -446,7 +446,7 @@ variable FORM-AT
 
 : AUTHORIZED? ( HTTP:request HTTP:response -- bool )
    {: q:HTTP:request a:HTTP:response :}
-   q s" Authorization" HTTP:HEADER-OF$ 0= if 2drop -1 else TOKEN-NUMBER then
+   q s" Authorization" >str HTTP:HEADER-OF$ swap str> rot 0= if 2drop -1 else TOKEN-NUMBER then
    {: k:n :}
    k 1 < k ISSUES @ > or REVOKED @ or if
       a s" invalid_access_token" UNAUTHORIZED! false exit
@@ -462,7 +462,7 @@ variable FORM-AT
 
 : ROOT-OK? ( HTTP:request -- bool )
    {: q:HTTP:request :}
-   q s" Dropbox-API-Path-Root" HTTP:HEADER-OF$ {: v:^ vu:n sent:bool :}
+   q s" Dropbox-API-Path-Root" >str HTTP:HEADER-OF$ swap str> rot {: v:^ vu:n sent:bool :}
    ROOT-U @ 0= if sent 0= exit then
    sent if v vu ROOT-LINE$ STR= else false then ;
 
@@ -510,7 +510,7 @@ variable FORM-AT
 \ Dropbox's paths ignore case; this fake folds ASCII alone.
 : FOUND ( -- n )
    FILES @ 0 ?do
-      i PATH$ ASKED ASKED-U @ STR=CI if i unloop exit then
+      i PATH$ >str ASKED ASKED-U @ >str STR=CI if i unloop exit then
    loop -1 ;
 
 
@@ -793,7 +793,7 @@ PAGES-MADE
 : UNSET! ( HTTP:response -- )
    {: a:HTTP:response :}
    a 400 HTTP:STATUS!
-   a s" the test set no answer" HTTP:BODY! ;
+   a s" the test set no answer" >str HTTP:BODY! ;
 
 
 : LISTING ( HTTP:request HTTP:response -- )
@@ -910,7 +910,7 @@ TYPED-VARIABLE DURING [ -- ]
 \ empty when it names no rev.
 : REV-ASK ( HTTP:request -- )
    {: q:HTTP:request :}
-   q s" Dropbox-API-Arg" HTTP:HEADER-OF$ {: v:^ vu:n sent:bool :}
+   q s" Dropbox-API-Arg" >str HTTP:HEADER-OF$ swap str> rot {: v:^ vu:n sent:bool :}
    v vu ARG-SENT!
    0 ASKED-U !
    sent if
@@ -955,14 +955,14 @@ TYPED-VARIABLE DURING [ -- ]
 \ The offset a Range bytes=<n>- names, 0 for none, -1 for another form.
 : RANGE-OF ( HTTP:request -- n )
    {: q:HTTP:request :}
-   q s" Range" HTTP:HEADER-OF$ {: v:^ vu:n sent:bool :}
+   q s" Range" >str HTTP:HEADER-OF$ swap str> rot {: v:^ vu:n sent:bool :}
    sent RANGED !
    v vu RANGE-SENT NAME-CAP STORE RANGE-SENT-U !
    sent 0= if 0 exit then
    vu 7 < if -1 exit then
    v 6 s" bytes=" STR= 0= if -1 exit then
    v vu + 1- c@ 45 <> if -1 exit then
-   v 6 + vu 7 - STR-PARSE-POS MATCH option
+   v 6 + vu 7 - >str STR-PARSE-POS MATCH option
       none OF -1 ENDOF
       some OF ENDOF
    ;MATCH ;
@@ -995,7 +995,7 @@ TYPED-VARIABLE DURING [ -- ]
    {: a:HTTP:response size:n :}
    a 416 HTTP:STATUS!
    SB-RESET s" bytes */" SB-APPEND size FMT:SB-INT
-   a s" Content-Range" SB$ HTTP:HEADER! ;
+   a s" Content-Range" >str SB$ >str HTTP:HEADER! ;
 
 
 \ The bytes and one more, in OUT.
@@ -1045,11 +1045,11 @@ TYPED-VARIABLE DURING [ -- ]
    {: a:HTTP:response i:n k:n from:n :}
    k CONTENT-SIZE {: size:n :}
    from size >= from 0 > and if a size UNSATISFIABLE! exit then
-   a s" Dropbox-API-Result" i RESULT$ HTTP:HEADER!
-   a s" Content-Type" s" application/octet-stream" HTTP:HEADER!
+   a s" Dropbox-API-Result" >str i RESULT$ >str HTTP:HEADER!
+   a s" Content-Type" >str s" application/octet-stream" >str HTTP:HEADER!
    from 0 > PARTED @ or if
       a 206 HTTP:STATUS!
-      a s" Content-Range" from size CONTENT-RANGE$ HTTP:HEADER!
+      a s" Content-Range" >str from size CONTENT-RANGE$ >str HTTP:HEADER!
    then
    false PARTED !
    EMPTIED @ if s" " else
@@ -1057,7 +1057,7 @@ TYPED-VARIABLE DURING [ -- ]
       LENGTHENED @ if LONGER$ then
    then {: b:^ len:n :}
    false SHORTED ! false LENGTHENED ! false EMPTIED !
-   a b len HTTP:BODY! ;
+   a b len >str HTTP:BODY! ;
 
 
 \ The rev the next download answers: a MISFILE's once, else the one asked.
@@ -1186,7 +1186,7 @@ private
    SERVED-REV$ {: r:^ ru:n :}
    r ru FILE-OF r ru CONTENT-OF {: i:n k:n :}
    i 0< k 0< or if a NOT-FOUND! exit then
-   from 0< if a 400 HTTP:STATUS! a s" bad range" HTTP:BODY! exit then
+   from 0< if a 400 HTTP:STATUS! a s" bad range" >str HTTP:BODY! exit then
    from k CONTENT-SKIPS @ < EMPTIED @ 0= and if a 500 HTTP:STATUS! exit then
    BREAKING @ if q i k from BROKEN exit then
    HOLDING @ if q i k from HELD-OPEN exit then
@@ -1267,7 +1267,7 @@ variable SESSIONS
    {: q:HTTP:request :}
    0 ARG-PATH-U ! 0 ARG-MODE-U ! 0 ARG-REV-U ! 0 ARG-HASH-U !
    0 ARG-SESSION-U ! -1 ARG-OFFSET !
-   q s" Dropbox-API-Arg" HTTP:HEADER-OF$ {: v:^ vu:n sent:bool :}
+   q s" Dropbox-API-Arg" >str HTTP:HEADER-OF$ swap str> rot {: v:^ vu:n sent:bool :}
    v vu ARG-SENT!
    sent 0= if exit then
    PARSER v vu JSON:READ-INIT
@@ -1352,7 +1352,7 @@ variable SESSIONS
    s" fake-session-" nip {: pu:n :}
    ARG-SESSION-U @ pu <= if -1 exit then
    ARG-SESSION pu s" fake-session-" STR= 0= if -1 exit then
-   ARG-SESSION pu + ARG-SESSION-U @ pu - STR-PARSE-POS MATCH option
+   ARG-SESSION pu + ARG-SESSION-U @ pu - >str STR-PARSE-POS MATCH option
       none OF -1 ENDOF
       some OF dup SESSIONS @ < 0= if drop -1 then ENDOF
    ;MATCH ;

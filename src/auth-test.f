@@ -66,23 +66,24 @@ TYPED-VARIABLE ACTION [ -- ]
    s SEEN-SERVICE su BYTE-COPY su SEEN-SERVICE-U !
    a SEEN-ACCOUNT au BYTE-COPY au SEEN-ACCOUNT-U ! ;
 
-: REC-READ ( ^u8 n ^u8 n SPAN:span<u8> -- n bool )
-   {: s:^ su:n a:^ au:n dest :}
-   s su a au SEEN
+: REC-READ ( str str SPAN:span<u8> -- n bool )
+   {: s:str a:str dest :}
+   s str> a str> SEEN
    READ-CODE @ 0<> if READ-CODE @ throw then
    PRESENT @ 0= if 0 false exit then
    HELD-U @ dest SPAN:$ nip > if SECRET:E-CAPACITY throw then
    HELD HELD-U @ dest SPAN:COPY
    HELD-U @ true ;
 
-: REC-WRITE ( ^u8 n ^u8 n ^u8 n -- )
-   {: s:^ su:n a:^ au:n v:^ vu:n :}
-   s su a au SEEN
+: REC-WRITE ( str str str -- )
+   {: s:str a:str vs:str :}
+   vs str> {: v:^ vu:n :}
+   s str> a str> SEEN
    WRITE-CODE @ 0<> if WRITE-CODE @ throw then
    v HELD vu BYTE-COPY vu HELD-U !
    1 WRITES +! ;
 
-: REC-ERASE ( ^u8 n ^u8 n -- bool ) 2drop 2drop false ;
+: REC-ERASE ( str str -- bool ) {: s:str a:str :} false ;
 
 ' REC-READ ' REC-WRITE ' REC-ERASE SECRET:STORE!
 
@@ -142,10 +143,10 @@ FILL-FILLER
 : LOGGED ( [ -- ] n ^u8 n -- )
    {: want t:^ tu :}
    ACTION !
-   ACTION @ LOG-PATH LOG-PATH-U @ AR @ STDERR:CAPTURING
+   ACTION @ LOG-PATH LOG-PATH-U @ >str AR @ STDERR:CAPTURING str>
    {: code:n e:^ u:n :}
    code want T=
-   e u 10 COUNT-CHAR 1 T=
+   e u >str 10 COUNT-CHAR 1 T=
    e u t tu CONTAINS? TTRUE
    e u s" sentinel" CONTAINS? TFALSE ;
 

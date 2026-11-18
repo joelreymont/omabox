@@ -152,7 +152,7 @@ variable CHANGES
 \ The file's text, empty where there is no file.
 : FILE-TEXT ( str -- ^u8 n )
    {: p :}
-   p str> FS:TRY-STAT 0= if s" " exit then
+   p FS:TRY-STAT 0= if s" " exit then
    p str> SEEN CAP FS:READ-ALL {: u:n :}
    SEEN u ;
 
@@ -312,7 +312,7 @@ variable CHANGES
 \ file at p.
 : REJECTS ( ^u8 n str ^ARENA:arena -- )
    {: m:^ mu:n p ar :}
-   [: PARSED drop ;] p str> ar STDERR:CAPTURING m mu USAGE-LOGGED ;
+   [: PARSED drop ;] p ar STDERR:CAPTURING str> m mu USAGE-LOGGED ;
 
 : PARSER-REJECTS-INCOMPLETE-OR-SECRET-BEARING-FORMS
    ( ^ARENA:arena -- )
@@ -368,7 +368,7 @@ variable CHANGES
 \ HOME-ROOT of the home, refused with the code, captured in p.
 : NO-ROOT ( option<str> str ^ARENA:arena -- )
    {: home p ar :}
-   [: home ar HOME-ROOT drop ;] p str> ar STDERR:CAPTURING
+   [: home ar HOME-ROOT drop ;] p ar STDERR:CAPTURING str>
    {: code:n e:^ eu:n :}
    code E-NO-DEFAULT-ROOT T=
    e eu LINES 2 T= ;
@@ -377,7 +377,7 @@ variable CHANGES
 : PRIVATE-ROOT ( str str ^ARENA:arena -- )
    {: home root ar :}
    home OPTION:SOME ar HOME-ROOT str> root str> T$=
-   root str> FS:STAT-MODE $1FF and FS:MODE-PRIVATE-DIR T= ;
+   root FS:STAT-MODE $1FF and FS:MODE-PRIVATE-DIR T= ;
 
 : DEFAULT-SYNC-ROOT-IS-A-PRIVATE-HOME-DROPBOX-CREATED-ONCE
    ( ^ARENA:arena -- )
@@ -405,7 +405,7 @@ variable CHANGES
 \ HOME-WIDGET of the home, refused with the code, captured in p.
 : WIDGET-REFUSED ( option<str> n str ^ARENA:arena -- )
    {: home want:n p ar :}
-   [: home ar HOME-WIDGET ;] p str> ar STDERR:CAPTURING
+   [: home ar HOME-WIDGET ;] p ar STDERR:CAPTURING str>
    {: code:n e:^ eu:n :}
    code want T=
    e eu LINES 2 T= ;
@@ -421,17 +421,17 @@ variable CHANGES
 \ A link at link to another target is refused and kept.
 : OTHER-LINK-KEPT ( str str str ^ARENA:arena -- )
    {: home link p ar :}
-   link str> FS:REMOVE-FILE
-   s" /elsewhere" link str> FS:MAKE-SYMLINK
+   link FS:REMOVE-FILE
+   s" /elsewhere" >str link FS:MAKE-SYMLINK
    home OPTION:SOME E-WIDGET-TAKEN p ar WIDGET-REFUSED
    link s" /elsewhere" ar LINKS-TO ;
 
 \ A folder at link is refused and kept with what it holds.
 : FOLDER-KEPT ( str str str ^ARENA:arena -- )
    {: home link p ar :}
-   link str> FS:REMOVE-FILE
+   link FS:REMOVE-FILE
    link s" kept" ar INSIDE {: kept :}
-   kept str> FS:MAKE-DIRS
+   kept FS:MAKE-DIRS
    home OPTION:SOME E-WIDGET-TAKEN p ar WIDGET-REFUSED
    link str> FS:SYMLINK? TFALSE
    kept str> FS:DIR? TTRUE ;
@@ -456,17 +456,17 @@ variable CHANGES
    home s" .config" ar INSIDE {: f :}
    f str> s" not a directory" FS:WRITE-ALL
    home OPTION:SOME E-LINK-WIDGET p ar WIDGET-REFUSED
-   f str> FS:FILE? TTRUE
-   f str> FS:REMOVE-FILE ;
+   f FS:FILE? TTRUE
+   f FS:REMOVE-FILE ;
 
 \ A plugins folder of mode 0500 is refused and left with no link.
 : READ-ONLY-PLUGINS ( str str ^ARENA:arena -- )
    {: home p ar :}
    home s" .config/omarchy/plugins" ar INSIDE {: dir :}
-   dir str> FS:MAKE-DIRS
-   dir str> $140 FS:CHMOD-MODE
+   dir FS:MAKE-DIRS
+   dir $140 FS:CHMOD-MODE
    home OPTION:SOME E-LINK-WIDGET p ar WIDGET-REFUSED
-   dir str> FS:MODE-PRIVATE-DIR FS:CHMOD-MODE
+   dir FS:MODE-PRIVATE-DIR FS:CHMOD-MODE
    dir s" local.omabox" ar INSIDE str> FS:SYMLINK? TFALSE ;
 
 : THE-WIDGET-LINK-REFUSES-A-BAD-HOME-OR-PLUGINS-FOLDER
@@ -498,7 +498,7 @@ variable CHANGES
    OPTIONS= TTRUE
    x root s" public-app-key" >str ar CONFIG:FROM-VALUES {: c :}
    c CONFIG:PREPARE
-   [: c true bind ar COMPLETE-SETUP drop ;] p str> ar STDERR:CAPTURING
+   [: c true bind ar COMPLETE-SETUP drop ;] p ar STDERR:CAPTURING str>
    {: code:n e:^ eu:n :}
    code ;
 
@@ -515,7 +515,7 @@ variable CHANGES
    x ar CONFIG:XDG-CONFIG-FILE CONFIG:ABS-PATH>STR {: file :}
    d s" stderr.txt" ar INSIDE {: p :}
    root x [: E-INVALID-CODE throw ;] p ar ATTEMPT E-INVALID-CODE T=
-   file str> FS:TRY-STAT TFALSE
+   file FS:TRY-STAT TFALSE
    root x [: ;] p ar ATTEMPT 0 T=
    x ar CONFIG:LOAD-FROM CONFIG:APP-KEY str> s" public-app-key" T$=
    d str> FS:REMOVE-TREE ;
@@ -539,7 +539,7 @@ variable CHANGES
 : CODE-READ ( ^u8 n str ^ARENA:arena -- n fd )
    {: a:^ u:n p ar :}
    a u PIPED {: f:fd :}
-   [: f ar READ-CODE SHOWN ! ;] p str> ar STDERR:CAPTURING
+   [: f ar READ-CODE SHOWN ! ;] p ar STDERR:CAPTURING str>
    {: code:n e:^ eu:n :}
    code f ;
 
@@ -629,7 +629,7 @@ variable CHANGES
    {: ar :}
    ar TEMPORARY {: d :}
    d s" first" ar INSIDE {: first :}
-   first str> FS:MAKE-DIRS
+   first FS:MAKE-DIRS
    d s" config" ar INSIDE CONFIG:>ABS-PATH
    d s" state" ar INSIDE CONFIG:>ABS-PATH ar CONFIG:XDG-NEW {: x :}
    x first s" public-app-key" >str ar CONFIG:FROM-VALUES
@@ -707,11 +707,11 @@ variable CHANGES
    x ar CONFIG:RESOLVE-PRIVATE CONFIG:JOURNAL-FILE CONFIG:ABS-PATH>STR
    {: jp :}
    jp ar STALE-JOURNAL
-   first str> FS:REMOVE-DIR
+   first FS:REMOVE-DIR
    jp ar ATTENTION:RENDER {: journal :}
    journal str> s" stale.txt" CONTAINS? TTRUE
    d s" stderr.txt" ar INSIDE {: p :}
-   [: x ar STATUS-TEXT SHOWN ! ;] p str> ar STDERR:CAPTURING
+   [: x ar STATUS-TEXT SHOWN ! ;] p ar STDERR:CAPTURING str>
    {: code:n e:^ eu:n :}
    code 0 T=
    SHOWN @ str> journal str> T$=
@@ -728,7 +728,7 @@ variable CHANGES
 \ The settings in the form, captured in p: the text, then the log.
 : SETTINGS ( ^CONFIG:xdg form str ^ARENA:arena -- str ^u8 n )
    {: x f p ar :}
-   [: x f ar SETTINGS-TEXT SHOWN ! ;] p str> ar STDERR:CAPTURING
+   [: x f ar SETTINGS-TEXT SHOWN ! ;] p ar STDERR:CAPTURING str>
    {: code:n e:^ eu:n :}
    code 0 T=
    SHOWN @ e eu ;
@@ -738,7 +738,7 @@ variable CHANGES
    s" settings_show_the_stored_root_when_it_is_unavailable" T-LABEL
    ar FIXTURE {: d x first :}
    x ar STORED {: stored :}
-   first str> FS:REMOVE-DIR
+   first FS:REMOVE-DIR
    d s" stderr.txt" ar INSIDE {: p :}
    x construct form text p ar SETTINGS {: text e:^ eu:n :}
    e eu stored UNAVAILABLE
@@ -988,8 +988,8 @@ variable CHANGES
    s" active" 0 1 ar STATEFUL {: d c :}
    d s" stderr.txt" ar INSIDE {: p :}
    0 CHANGES !
-   [: c [: d swap WATCHED ;] ar SETUP-RELEASED ;] p str> ar
-   STDERR:CAPTURING {: code:n e:^ eu:n :}
+   [: c [: d swap WATCHED ;] ar SETUP-RELEASED ;] p ar
+   STDERR:CAPTURING str> {: code:n e:^ eu:n :}
    CHANGES @ 0 T=
    code SERVICE:E-UNSUCCESSFUL T=
    e eu s" service: " CONTAINS? TTRUE
@@ -1011,7 +1011,7 @@ variable CHANGES
 : SET ( str ^CONFIG:xdg ^SERVICE:commands str ^ARENA:arena -- n ^u8 n )
    {: root x c d ar :}
    d s" stderr.txt" ar INSIDE {: p :}
-   [: root x c ar SET-ROOT ;] p str> ar STDERR:CAPTURING ;
+   [: root x c ar SET-ROOT ;] p ar STDERR:CAPTURING str> ;
 
 : CONFIG-ERRORS-SHOW-THEIR-OWN-HELP ( ^ARENA:arena -- )
    {: ar :}
@@ -1334,8 +1334,8 @@ variable CHANGES
 : CONFIG-RESTORED ( str ^CONFIG:paths ^ARENA:arena -- )
    {: d paths ar :}
    paths CONFIG:CONFIG-DIRECTORY CONFIG:ABS-PATH>STR {: cd :}
-   cd str> FS:REMOVE-FILE
-   d s" saved-config" ar INSIDE str> cd str> FS:RENAME-FILE ;
+   cd FS:REMOVE-FILE
+   d s" saved-config" ar INSIDE cd FS:RENAME-FILE ;
 
 : CONFIG-WRITE-FAILURE-PRESERVES-ROOT-GENERATION-AND-LIVE-INTENT
    ( ^ARENA:arena -- )
@@ -1418,7 +1418,7 @@ variable CHANGES
    paths VEC:COUNT 1 T=
    paths 0 VEC:AT @ PATH$ s" remote.txt" T$=
    j JOURNAL:CLOSE
-   first str> d s" unavailable-first" ar INSIDE str> FS:RENAME-FILE
+   first d s" unavailable-first" ar INSIDE FS:RENAME-FILE
    d s" inactive" ar FAKED {: c log :}
    second x c d ar SET {: code:n e:^ eu:n :}
    code 0 T=
@@ -1450,7 +1450,7 @@ variable CHANGES
    s" same-content" s" same-revision" REMOTE {: rf :}
    j s" tracked.txt" rf ar AGREEMENT-RECORDED
    j JOURNAL:CLOSE
-   first str> d s" moved-first" ar INSIDE str> FS:RENAME-FILE
+   first d s" moved-first" ar INSIDE FS:RENAME-FILE
    first str> FS:MAKE-DIR
    first JOURNAL:INSPECT {: actual :}
    recorded actual BINDINGS= TFALSE
@@ -1484,7 +1484,7 @@ variable CHANGES
      -- n ^u8 n )
    {: s c p ar :}
    [: s [: c swap SETUP-CHANGE ;] ar SETUP-RELEASED ;]
-   p str> ar STDERR:CAPTURING ;
+   p ar STDERR:CAPTURING str> ;
 
 \ Rust's fixture's config, loaded, and the log file in its directory.
 : LOADED-FIXTURE ( ^ARENA:arena -- str ^CONFIG:config str )
@@ -1513,7 +1513,7 @@ variable CHANGES
 : PAST ( ^u8 n n ^u8 n -- n )
    {: a:^ u:n at:n t:^ tu:n :}
    at 0 < if -1 exit then
-   a u t tu at FIND-SUB-FROM MATCH option
+   a u >str t tu >str at FIND-SUB-FROM MATCH option
       none OF -1 ENDOF
       some OF IDX>N tu + ENDOF
    ;MATCH ;
@@ -1598,7 +1598,7 @@ variable CHANGES
 : UNEXPECTED-LOG ( n str ^ARENA:arena -- ^u8 n )
    {: code:n d ar :}
    d s" stderr.txt" ar INSIDE {: p :}
-   [: code UNEXPECTED ;] p str> ar STDERR:CAPTURING
+   [: code UNEXPECTED ;] p ar STDERR:CAPTURING str>
    {: rc:n e:^ eu:n :}
    rc 0 T=
    e eu ;
@@ -1629,17 +1629,18 @@ CAP BUFFER: REC
 variable REC-U
 variable REC-WRITES
 
-: REC-READ ( ^u8 n ^u8 n SPAN:span<u8> -- n bool )
-   {: s:^ su:n a:^ au:n dest:SPAN:span<u8> :}
+: REC-READ ( str str SPAN:span<u8> -- n bool )
+   {: s:str a:str dest:SPAN:span<u8> :}
    0 false ;
 
-: REC-WRITE ( ^u8 n ^u8 n ^u8 n -- )
-   {: s:^ su:n a:^ au:n v:^ vu:n :}
+: REC-WRITE ( str str str -- )
+   {: s:str a:str vs:str :}
+   vs str> {: v:^ vu:n :}
    vu CAP min {: k:n :}
    v REC k BYTE-COPY k REC-U !
    1 REC-WRITES +! ;
 
-: REC-ERASE ( ^u8 n ^u8 n -- bool ) 2drop 2drop false ;
+: REC-ERASE ( str str -- bool ) {: s:str a:str :} false ;
 
 ' REC-READ ' REC-WRITE ' REC-ERASE SECRET:STORE!
 
@@ -1678,7 +1679,7 @@ variable REC-WRITES
 : BIND-RUN ( ^CONFIG:config ^authorized str ^ARENA:arena -- n ^u8 n )
    {: c a p ar :}
    0 REC-WRITES ! 0 REC-U !
-   [: c a ar BIND ;] p str> ar STDERR:CAPTURING ;
+   [: c a ar BIND ;] p ar STDERR:CAPTURING str> ;
 
 : BIND-STORES-THE-TOKEN-AND-BINDS-AN-UNBOUND-JOURNAL ( ^ARENA:arena -- )
    {: ar :}
@@ -1725,7 +1726,7 @@ variable REC-WRITES
 : LOGGED ( [ -- ] ^ARENA:arena -- n ^u8 n )
    {: xt ar :}
    ar TEMPORARY {: d :}
-   xt d s" stderr.txt" ar INSIDE str> ar STDERR:CAPTURING
+   xt d s" stderr.txt" ar INSIDE ar STDERR:CAPTURING str>
    d str> FS:REMOVE-TREE ;
 
 \ A client on the fake with no token and no root, as setup's is.

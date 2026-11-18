@@ -354,7 +354,9 @@ version's `SESSION_FINISH_SECONDS`.
 
 A client reads every answer through curl's streaming words, so no buffer caps
 its size. A program that uses `DROPBOX` therefore starts the CURL loop first
-(`AIO:START CURL:LOOP-START`) and stops it last.
+(`AIO:START CURL:LOOP-START`) and stops it last; `DROPBOX:WITH-LOOPS` does
+both. `CURL:LOOP-START` takes and gives nothing: a loop that will not start
+logs a line and throws `CURL:E-LOOP`.
 
 ## How it is tested
 

@@ -321,7 +321,7 @@ ARENA PENDINGS pending
    ar 32 ARENA:ALLOC {: d:^ du:n :}
    ctx v vu d SHA256-IN
    ar PROOF-CHARS ARENA:ALLOC {: c:^ cu:n :}
-   d du c cu SPAN:MAKE BASE64:ENCODE-URL {: n:n :}
+   d du >str c cu SPAN:MAKE BASE64:ENCODE-URL {: n:n :}
    c n ;
 
 \ The authorize URL's parameters, as AuthorizeUrlBuilder appends them
@@ -352,7 +352,7 @@ ARENA PENDINGS pending
    ar PROOF-BYTES ARENA:ALLOC {: b:^ bu:n :}
    b bu RANDOM
    ar PROOF-CHARS ARENA:ALLOC {: v:^ vu:n :}
-   b bu v vu SPAN:MAKE BASE64:ENCODE-URL {: n:n :}
+   b bu >str v vu SPAN:MAKE BASE64:ENCODE-URL {: n:n :}
    v n >str ;
 
 public
@@ -361,7 +361,7 @@ public
 \ them, for the whole process: the daemon calls it once, before any
 \ other AUTH word.
 : BIND ( -- )
-   s" application" s" kind" s" Omabox Dropbox credentials"
+   s" application" >str s" kind" >str s" Omabox Dropbox credentials" >str
    SECRET:LINUX-ITEM! ;
 
 \ Stores the binding and the refresh token, replacing the item's value.

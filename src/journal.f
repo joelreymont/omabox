@@ -133,7 +133,7 @@ $7FFFFFFFFFFFFFFF constant INT-MAX  \ SQLite's largest integer
 \ name precedes the create: a top-level string is itself laid at here.
 : LAY ( ^u8 n -- )
    SOURCE-ROOT:RESOLVE drop {: at:^ u :}
-   at u FS:FILE-SIZE {: size :}
+   at u >str FS:FILE-SIZE {: size :}
    size ,
    at u here size FS:READ-ALL drop
    size allot align ;
@@ -172,7 +172,7 @@ s" migrations/0008.sql" create V8 LAY
 : LOG-FAILED ( str str n n -- )
    {: op:str path:str code errno :}
    op path FAILED-FOR
-   errno 0= if code LOG:CODE+ else errno FS:ERRNO$ LOG:TEXT+ then
+   errno 0= if code LOG:CODE+ else errno FS:ERRNO$ str> LOG:TEXT+ then
    LOG:;LINE errno FS:CAUSE! ;
 
 : FILE-FAILED ( str str n n -- )
@@ -225,7 +225,7 @@ s" migrations/0008.sql" create V8 LAY
 
 \ The first column of the query's first row; no row is SQLITE's throw.
 : QUERY-INT ( SQLITE:connection ^u8 n -- n )
-   [: INT-ROW ;] SQLITE:WITH-STATEMENT ;
+   >str [: INT-ROW ;] SQLITE:WITH-STATEMENT ;
 
 : VERSION ( SQLITE:connection -- n )
    s" PRAGMA user_version" QUERY-INT ;
@@ -249,7 +249,7 @@ private
 \ A name already taken must be a regular file, never followed.
 : REGULAR ( str str -- )
    {: op:str path:str :}
-   path str> FS:TRY-LSTAT 0= if op path E-FS-STAT 0 FILE-FAILED then
+   path FS:TRY-LSTAT 0= if op path E-FS-STAT 0 FILE-FAILED then
    FS:STAT-MODE@ FS:S-IFMT and FS:S-IFREG = if exit then
    op path s" existing path is not a regular file" >str FILE-REFUSED ;
 
@@ -264,13 +264,13 @@ private
    drop op path code FS:ERRNO FILE-FAILED ;
 
 : DELETE-MODE? ( SQLITE:statement -- bool SQLITE:statement )
-   SQLITE:STEP drop 0 SQLITE:COL-TEXT s" delete" STR=CI swap ;
+   SQLITE:STEP drop 0 SQLITE:COL-TEXT >str s" delete" >str STR=CI swap ;
 
 : CONFIGURE-WRITABLE ( journal -- )
    {: j :}
    j >CONNECTION {: c :}
    c s" PRAGMA foreign_keys = ON" SQLITE:EXEC
-   c s" PRAGMA journal_mode = DELETE" [: DELETE-MODE? ;]
+   c s" PRAGMA journal_mode = DELETE" >str [: DELETE-MODE? ;]
    SQLITE:WITH-STATEMENT 0= if
       s" set rollback journal mode" >str j >PATH
       s" SQLite did not enable DELETE journal mode" >str INVALID
@@ -314,7 +314,7 @@ private
    {: j :}
    j >CONNECTION {: c :}
    BUSY-MS c SQLITE:BUSY-MS!
-   [: j >PATH str> MODE-OWNER FS:CHMOD-MODE ;]
+   [: j >PATH MODE-OWNER FS:CHMOD-MODE ;]
    s" restrict journal permissions" >str j >PATH FILE-IO
    c VERSION {: v :}
    v 0<> v SCHEMA <> and if j >PATH v UNSUPPORTED then
@@ -379,7 +379,7 @@ public
 \ name it `[Omabox journal]`, as Rust's status redacts the path.
 : OPEN-READ ( str -- journal )
    {: path:str :}
-   path str> SQLITE:OPEN-READ s" [Omabox journal]" >str JOURNAL-MAKE
+   path SQLITE:OPEN-READ s" [Omabox journal]" >str JOURNAL-MAKE
    [: READABLE ;] SET-UP ;
 
 
@@ -404,7 +404,7 @@ private
 
 : BLOB-COPY ( SQLITE:statement n ^ARENA:arena -- SQLITE:statement str )
    {: col ar :}
-   col SQLITE:COL-BLOB ar COPIED ;
+   col SQLITE:COL-BLOB str> ar COPIED ;
 
 
 \ ---- the Dropbox binding -------------------------------------------
@@ -453,9 +453,9 @@ private
          singleton, account_id, root_namespace_id, remote_root
       ) VALUES (1, ?1, ?2, ?3)
       ON CONFLICT(singleton) DO NOTHING"
-   [: account str> 1 SQLITE:BIND-TEXT
-      namespace str> 2 SQLITE:BIND-TEXT
-      root str> 3 SQLITE:BIND-TEXT
+   >str [: account 1 SQLITE:BIND-TEXT
+      namespace 2 SQLITE:BIND-TEXT
+      root 3 SQLITE:BIND-TEXT
       SQLITE:STEP drop ;] SQLITE:WITH-STATEMENT ;
 
 : BIND-WRITE
@@ -464,7 +464,7 @@ private
    {: c b ar :}
    c b INSERT-BINDING
    c SQLITE:CHANGES 1 = if construct dropbox-binding-write bound exit then
-   ar c SELECT-BINDING [: EXISTING-ROW ;] SQLITE:WITH-STATEMENT
+   ar c SELECT-BINDING >str [: EXISTING-ROW ;] SQLITE:WITH-STATEMENT
    {: existing :}
    existing b BINDING= if
       construct dropbox-binding-write already-bound exit
@@ -477,7 +477,7 @@ public
 \ completed.
 : DROPBOX-BINDING ( journal ^ARENA:arena -- option<dropbox-binding> )
    {: j ar :}
-   ar j >CONNECTION SELECT-BINDING [: BINDING-ROW ;]
+   ar j >CONNECTION SELECT-BINDING >str [: BINDING-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
 \ Binds the journal to one account and root; an existing binding stays.
@@ -690,14 +690,14 @@ private
 : BIND-SUBVOLUME ( SQLITE:statement option<n> -- SQLITE:statement )
    MATCH option
       none OF 5 SQLITE:BIND-NULL ENDOF
-      some OF 8 BE-BYTES 5 SQLITE:BIND-BLOB ENDOF
+      some OF 8 BE-BYTES >str 5 SQLITE:BIND-BLOB ENDOF
    ;MATCH ;
 
 : BIND-ROOT ( local-root-record SQLITE:statement -- SQLITE:statement )
    swap JOURNAL-LOCAL--ROOT--RECORD:UNMAKE {: b g :}
    b JOURNAL-LOCAL--ROOT--BINDING:UNMAKE {: p:str inode birth sub :}
-   p str> 1 SQLITE:BIND-BLOB
-   inode 0 BE-BYTES 2 SQLITE:BIND-BLOB
+   p 1 SQLITE:BIND-BLOB
+   inode 0 BE-BYTES >str 2 SQLITE:BIND-BLOB
    birth BIND-BIRTH
    sub BIND-SUBVOLUME
    g 6 SQLITE:BIND-INT
@@ -705,7 +705,7 @@ private
 
 : WRITE-LOCAL-ROOT ( SQLITE:connection local-root-record -- )
    {: c r :}
-   r c UPSERT-ROOT [: BIND-ROOT ;] SQLITE:WITH-STATEMENT ;
+   r c UPSERT-ROOT >str [: BIND-ROOT ;] SQLITE:WITH-STATEMENT ;
 
 : DECODE-U64 ( ^u8 n str str -- n )
    {: a:^ u op:str path:str :}
@@ -717,7 +717,7 @@ private
 
 : BLOB-U64 ( SQLITE:statement n str str -- SQLITE:statement n )
    {: col op:str path:str :}
-   col SQLITE:COL-BLOB op path DECODE-U64 ;
+   col SQLITE:COL-BLOB str> op path DECODE-U64 ;
 
 : BIRTH-INVALID ( str str -- )
    {: path:str detail:str :}
@@ -781,7 +781,7 @@ public
 \ The active root's identity and generation, if a root was activated.
 : LOCAL-ROOT-BINDING ( journal ^ARENA:arena -- option<local-root-record> )
    {: j ar :}
-   ar j >PATH j >CONNECTION SELECT-ROOT [: ROOT-ROW ;]
+   ar j >PATH j >CONNECTION SELECT-ROOT >str [: ROOT-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
 private
@@ -1113,7 +1113,7 @@ BUF:HDR-BYTES TASK:+USERS ENCODED u8
    ( SQLITE:statement ^ARENA:arena
      -- SQLITE:statement MODEL:local-record )
    {: ar :}
-   0 SQLITE:COL-BLOB ar BYTES-PATH {: p:MODEL:path :}
+   0 SQLITE:COL-BLOB str> ar BYTES-PATH {: p:MODEL:path :}
    1 SQLITE:COL-TEXT >str p MODEL:PATH>STR ar LOCAL-OBSERVATION-OF
    {: o :}
    p o MODEL-LOCAL--RECORD:MAKE ;
@@ -1122,7 +1122,7 @@ BUF:HDR-BYTES TASK:+USERS ENCODED u8
    ( SQLITE:statement ^ARENA:arena
      -- SQLITE:statement MODEL:hash-record )
    {: ar :}
-   0 SQLITE:COL-BLOB ar BYTES-PATH {: p:MODEL:path :}
+   0 SQLITE:COL-BLOB str> ar BYTES-PATH {: p:MODEL:path :}
    1 SQLITE:COL-TEXT >str p MODEL:PATH>STR ar HASH-VALUE-OF
    {: f h :}
    h DROPBOX:HASH>STR str> DROPBOX:CONTENT-HASH? 0= if
@@ -1134,8 +1134,8 @@ BUF:HDR-BYTES TASK:+USERS ENCODED u8
    ( SQLITE:statement ^ARENA:arena
      -- SQLITE:statement MODEL:remote-record )
    {: ar :}
-   0 SQLITE:COL-BLOB ar BYTES-KEY {: k:MODEL:key :}
-   1 SQLITE:COL-BLOB ar BYTES-PATH {: p:MODEL:path :}
+   0 SQLITE:COL-BLOB str> ar BYTES-KEY {: k:MODEL:key :}
+   1 SQLITE:COL-BLOB str> ar BYTES-PATH {: p:MODEL:path :}
    2 SQLITE:COL-TEXT >str p MODEL:PATH>STR ar REMOTE-OBSERVATION-OF
    {: o :}
    k p o MODEL-REMOTE--RECORD:MAKE ;
@@ -1144,8 +1144,8 @@ BUF:HDR-BYTES TASK:+USERS ENCODED u8
    ( SQLITE:statement ^ARENA:arena
      -- SQLITE:statement remote-directory )
    {: ar :}
-   0 SQLITE:COL-BLOB ar BYTES-KEY {: k:MODEL:key :}
-   1 SQLITE:COL-BLOB ar BYTES-PATH {: p:MODEL:path :}
+   0 SQLITE:COL-BLOB str> ar BYTES-KEY {: k:MODEL:key :}
+   1 SQLITE:COL-BLOB str> ar BYTES-PATH {: p:MODEL:path :}
    k p JOURNAL-REMOTE--DIRECTORY:MAKE ;
 
 : CURSOR-ROW
@@ -1162,7 +1162,7 @@ BUF:HDR-BYTES TASK:+USERS ENCODED u8
    ar ARENA:ALLOCATOR 0 [type] MODEL:local-record VEC:NEW {: v :}
    c s" SELECT path, observation_json FROM local_observations
       ORDER BY path"
-   [: begin SQLITE:STEP while ar LOCAL-ROW v VEC:PUSH ! repeat ;]
+   >str [: begin SQLITE:STEP while ar LOCAL-ROW v VEC:PUSH ! repeat ;]
    SQLITE:WITH-STATEMENT
    v ;
 
@@ -1177,7 +1177,7 @@ BUF:HDR-BYTES TASK:+USERS ENCODED u8
       JOIN local_root_binding AS root
          ON root.singleton = 1 AND cache.root_generation = root.generation
       ORDER BY cache.path"
-   [: begin SQLITE:STEP while ar HASH-ROW v VEC:PUSH ! repeat ;]
+   >str [: begin SQLITE:STEP while ar HASH-ROW v VEC:PUSH ! repeat ;]
    SQLITE:WITH-STATEMENT
    v ;
 
@@ -1188,7 +1188,7 @@ BUF:HDR-BYTES TASK:+USERS ENCODED u8
    ar ARENA:ALLOCATOR 0 [type] MODEL:remote-record VEC:NEW {: v :}
    c s" SELECT canonical_path, path, observation_json
       FROM remote_observations ORDER BY canonical_path"
-   [: begin SQLITE:STEP while ar REMOTE-ROW v VEC:PUSH ! repeat ;]
+   >str [: begin SQLITE:STEP while ar REMOTE-ROW v VEC:PUSH ! repeat ;]
    SQLITE:WITH-STATEMENT
    v ;
 
@@ -1211,7 +1211,7 @@ public
    {: j ar :}
    ar j >CONNECTION
    s" SELECT cursor FROM remote_inventory WHERE singleton = 1"
-   [: CURSOR-ROW ;] SQLITE:WITH-STATEMENT ;
+   >str [: CURSOR-ROW ;] SQLITE:WITH-STATEMENT ;
 
 \ The directories and restricted folders Dropbox holds, by key.
 : REMOTE-DIRECTORY-PATHS
@@ -1223,7 +1223,7 @@ public
       WHERE observation_json IN
          ('\"Directory\"', '{\"Unknown\":\"Inaccessible\"}')
       ORDER BY canonical_path"
-   [: begin SQLITE:STEP while ar DIRECTORY-ROW v VEC:PUSH ! repeat ;]
+   >str [: begin SQLITE:STEP while ar DIRECTORY-ROW v VEC:PUSH ! repeat ;]
    SQLITE:WITH-STATEMENT
    v ;
 
@@ -1264,8 +1264,8 @@ private
      -- SQLITE:statement )
    {: r w :}
    r MODEL-LOCAL--RECORD:UNMAKE {: p:MODEL:path o :}
-   p PATH-BYTES 1 SQLITE:BIND-BLOB
-   w [: o swap MODEL:LOCAL-OBSERVATION>JSON ;] ENCODE 2 SQLITE:BIND-TEXT
+   p PATH-BYTES >str 1 SQLITE:BIND-BLOB
+   w [: o swap MODEL:LOCAL-OBSERVATION>JSON ;] ENCODE >str 2 SQLITE:BIND-TEXT
    RAN ;
 
 : LOCAL-INSERTS
@@ -1285,8 +1285,8 @@ private
       NOT-CONTENT-HASH
    then
    g 1 SQLITE:BIND-INT
-   p PATH-BYTES 2 SQLITE:BIND-BLOB
-   w [: r swap MODEL:HASH-VALUE>JSON ;] ENCODE 3 SQLITE:BIND-TEXT
+   p PATH-BYTES >str 2 SQLITE:BIND-BLOB
+   w [: r swap MODEL:HASH-VALUE>JSON ;] ENCODE >str 3 SQLITE:BIND-TEXT
    RAN ;
 
 : HASH-INSERTS
@@ -1327,8 +1327,8 @@ private
    {: c g obs hashes w :}
    c s" DELETE FROM local_observations" SQLITE:EXEC
    c s" DELETE FROM local_hash_cache" SQLITE:EXEC
-   c INSERT-LOCAL [: obs w LOCAL-INSERTS ;] SQLITE:WITH-STATEMENT
-   c INSERT-HASH [: g hashes w HASH-INSERTS ;] SQLITE:WITH-STATEMENT ;
+   c INSERT-LOCAL >str [: obs w LOCAL-INSERTS ;] SQLITE:WITH-STATEMENT
+   c INSERT-HASH >str [: g hashes w HASH-INSERTS ;] SQLITE:WITH-STATEMENT ;
 
 : ACTIVE-SCAN
    ( local-root-record journal local-root-binding
@@ -1402,9 +1402,9 @@ private
      -- SQLITE:statement )
    {: r w :}
    r MODEL-REMOTE--RECORD:UNMAKE {: k:MODEL:key p:MODEL:path o :}
-   p PATH-BYTES 1 SQLITE:BIND-BLOB
-   w [: o swap MODEL:REMOTE-OBSERVATION>JSON ;] ENCODE 2 SQLITE:BIND-TEXT
-   k KEY-BYTES 3 SQLITE:BIND-BLOB ;
+   p PATH-BYTES >str 1 SQLITE:BIND-BLOB
+   w [: o swap MODEL:REMOTE-OBSERVATION>JSON ;] ENCODE >str 2 SQLITE:BIND-TEXT
+   k KEY-BYTES >str 3 SQLITE:BIND-BLOB ;
 
 : REMOTE-INSERTS
    ( SQLITE:statement ^VEC:vector<MODEL:remote-record> ^JSON:writer
@@ -1416,7 +1416,7 @@ private
    {: c cur:DROPBOX:cursor :}
    c s" INSERT INTO remote_inventory(singleton, cursor) VALUES (1, ?1)
       ON CONFLICT(singleton) DO UPDATE SET cursor = excluded.cursor"
-   [: cur DROPBOX:CURSOR>STR str> 1 SQLITE:BIND-TEXT RAN ;]
+   >str [: cur DROPBOX:CURSOR>STR 1 SQLITE:BIND-TEXT RAN ;]
    SQLITE:WITH-STATEMENT ;
 
 : REMOTE-WRITTEN
@@ -1424,7 +1424,7 @@ private
      ^VEC:vector<MODEL:remote-record> ^JSON:writer -- )
    {: c cur:DROPBOX:cursor v w :}
    c s" DELETE FROM remote_observations" SQLITE:EXEC
-   c INSERT-REMOTE [: v w REMOTE-INSERTS ;] SQLITE:WITH-STATEMENT
+   c INSERT-REMOTE >str [: v w REMOTE-INSERTS ;] SQLITE:WITH-STATEMENT
    c cur PUBLISH-CURSOR ;
 
 public
@@ -1489,17 +1489,17 @@ private
 : RECORD-WRITTEN
    ( SQLITE:connection MODEL:remote-record ^JSON:writer ^u8 n -- )
    {: c r w sql:^ u :}
-   c sql u [: r w BIND-REMOTE SQLITE:STEP drop ;]
+   c sql u >str [: r w BIND-REMOTE SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT ;
 
 : SUBTREE-DELETED ( SQLITE:connection MODEL:key ^ARENA:arena -- )
    {: c k:MODEL:key ar :}
    c s" DELETE FROM remote_observations WHERE canonical_path = ?1"
-   [: k KEY-BYTES 1 SQLITE:BIND-BLOB SQLITE:STEP drop ;]
+   >str [: k KEY-BYTES >str 1 SQLITE:BIND-BLOB SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT
    k ar MODEL:SUBTREE-RANGE {: lo:str hi:str :}
    c DELETE-REMOTE-DESCENDANTS
-   [: lo str> 1 SQLITE:BIND-BLOB hi str> 2 SQLITE:BIND-BLOB
+   >str [: lo 1 SQLITE:BIND-BLOB hi 2 SQLITE:BIND-BLOB
       SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT ;
 
@@ -1755,7 +1755,7 @@ public
    path ar MODEL:FOLD {: k :}
    j >CONNECTION
    s" SELECT baseline_json FROM baselines WHERE canonical_path = ?1"
-   [: k KEY-BYTES 1 SQLITE:BIND-BLOB path ar BASELINE-ROW ;]
+   >str [: k KEY-BYTES >str 1 SQLITE:BIND-BLOB path ar BASELINE-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
 \ Every path with a baseline, in the order of its bytes.
@@ -1765,7 +1765,7 @@ public
    j >CONNECTION
    s\" SELECT path FROM baselines WHERE baseline_json != '\"Absent\"'
       ORDER BY path"
-   [: begin SQLITE:STEP while paths ar PATH-ROW repeat ;]
+   >str [: begin SQLITE:STEP while paths ar PATH-ROW repeat ;]
    SQLITE:WITH-STATEMENT
    paths ;
 
@@ -1777,7 +1777,7 @@ public
    j >CONNECTION
    s\" SELECT canonical_path, path, baseline_json FROM baselines
       WHERE baseline_json != '\"Absent\"' ORDER BY canonical_path"
-   [: begin SQLITE:STEP while records ar RECORD-ROW repeat ;]
+   >str [: begin SQLITE:STEP while records ar RECORD-ROW repeat ;]
    SQLITE:WITH-STATEMENT
    records ;
 
@@ -1788,7 +1788,7 @@ public
    j >CONNECTION
    s\" SELECT path FROM baselines
       WHERE canonical_path = ?1 AND baseline_json != '\"Absent\"'"
-   [: k KEY-BYTES 1 SQLITE:BIND-BLOB ar SPELLING-ROW ;]
+   >str [: k KEY-BYTES >str 1 SQLITE:BIND-BLOB ar SPELLING-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
 private
@@ -1799,7 +1799,7 @@ private
 : FORGET ( SQLITE:connection MODEL:key -- )
    {: c k :}
    c s" DELETE FROM baselines WHERE canonical_path = ?1"
-   [: k KEY-BYTES 1 SQLITE:BIND-BLOB SQLITE:STEP drop ;]
+   >str [: k KEY-BYTES >str 1 SQLITE:BIND-BLOB SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT ;
 
 : COLLECT-SPELLING
@@ -1819,9 +1819,9 @@ private
    c s" SELECT canonical_path, path FROM baselines
       WHERE canonical_path = ?1
          OR (canonical_path >= ?2 AND canonical_path < ?3)"
-   [: k KEY-BYTES 1 SQLITE:BIND-BLOB
-      from str> 2 SQLITE:BIND-BLOB
-      to str> 3 SQLITE:BIND-BLOB
+   >str [: k KEY-BYTES >str 1 SQLITE:BIND-BLOB
+      from 2 SQLITE:BIND-BLOB
+      to 3 SQLITE:BIND-BLOB
       begin SQLITE:STEP while found ar COLLECT-SPELLING repeat ;]
    SQLITE:WITH-STATEMENT
    found ;
@@ -2013,7 +2013,7 @@ private
    {: c s:^ su op:str ar :}
    ar [type] plan-record NEW-VECTOR {: plans :}
    c PLAN-QUERY
-   [: s su 1 SQLITE:BIND-TEXT
+   >str [: s su >str 1 SQLITE:BIND-TEXT
       begin SQLITE:STEP while plans op ar PLAN-ROW repeat ;]
    SQLITE:WITH-STATEMENT
    plans ;
@@ -2035,7 +2035,7 @@ private
    {: c id op:str ar :}
    c s" SELECT path, status, blocked_json, retry_at FROM plans
       WHERE id = ?1"
-   [: id PLAN-ID>N 1 SQLITE:BIND-INT op ar STATE-ROW ;]
+   >str [: id PLAN-ID>N 1 SQLITE:BIND-INT op ar STATE-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
 : OPERATION-ROW
@@ -2051,7 +2051,7 @@ private
    ar [type] planned-operation NEW-VECTOR {: ops :}
    c s" SELECT id, ordinal, operation_json, status
       FROM operations WHERE plan_id = ?1 ORDER BY ordinal"
-   [: id PLAN-ID>N 1 SQLITE:BIND-INT
+   >str [: id PLAN-ID>N 1 SQLITE:BIND-INT
       begin SQLITE:STEP while ops path ar OPERATION-ROW repeat ;]
    SQLITE:WITH-STATEMENT
    ops ;
@@ -2083,7 +2083,7 @@ private
    {: c k :}
    c s" SELECT id FROM plans
       WHERE canonical_path = ?1 AND status IN ('pending', 'blocked')"
-   [: k KEY-BYTES 1 SQLITE:BIND-BLOB LIVE-ROW ;]
+   >str [: k KEY-BYTES >str 1 SQLITE:BIND-BLOB LIVE-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
 : UPSERT-BASELINE ( -- ^u8 n )
@@ -2104,16 +2104,16 @@ private
    path ar MODEL:FOLD {: k :}
    b ABSENT? if c k FORGET exit then
    c UPSERT-BASELINE
-   [: path PATH-BYTES 1 SQLITE:BIND-BLOB
-      b w ENCODE-BASELINE 2 SQLITE:BIND-TEXT
-      k KEY-BYTES 3 SQLITE:BIND-BLOB
+   >str [: path PATH-BYTES >str 1 SQLITE:BIND-BLOB
+      b w ENCODE-BASELINE >str 2 SQLITE:BIND-TEXT
+      k KEY-BYTES >str 3 SQLITE:BIND-BLOB
       SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT ;
 
 : RETIRE-CONFLICTS ( SQLITE:connection MODEL:key -- )
    {: c k :}
    c s" DELETE FROM conflicts WHERE canonical_path = ?1"
-   [: k KEY-BYTES 1 SQLITE:BIND-BLOB SQLITE:STEP drop ;]
+   >str [: k KEY-BYTES >str 1 SQLITE:BIND-BLOB SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT ;
 
 : AGREED
@@ -2147,8 +2147,8 @@ private
    {: c path k :}
    c s" INSERT INTO plans(path, status, canonical_path)
       VALUES (?1, 'pending', ?2)"
-   [: path PATH-BYTES 1 SQLITE:BIND-BLOB
-      k KEY-BYTES 2 SQLITE:BIND-BLOB
+   >str [: path PATH-BYTES >str 1 SQLITE:BIND-BLOB
+      k KEY-BYTES >str 2 SQLITE:BIND-BLOB
       SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT
    c SQLITE:LAST-ROWID >PLAN-ID ;
@@ -2157,9 +2157,9 @@ private
    {: c id ordinal js:^ ju :}
    c s" INSERT INTO operations(plan_id, ordinal, operation_json, status)
       VALUES (?1, ?2, ?3, 'pending')"
-   [: id PLAN-ID>N 1 SQLITE:BIND-INT
+   >str [: id PLAN-ID>N 1 SQLITE:BIND-INT
       ordinal 2 SQLITE:BIND-INT
-      js ju 3 SQLITE:BIND-TEXT
+      js ju >str 3 SQLITE:BIND-TEXT
       SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT ;
 
@@ -2332,8 +2332,8 @@ private
    c s" UPDATE plans SET status = 'blocked', blocked_json = ?2,
          retry_at = ?3
       WHERE id = ?1"
-   [: id PLAN-ID>N 1 SQLITE:BIND-INT
-      js ju 2 SQLITE:BIND-TEXT
+   >str [: id PLAN-ID>N 1 SQLITE:BIND-INT
+      js ju >str 2 SQLITE:BIND-TEXT
       at 3 SQLITE:BIND-INT
       SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT ;
@@ -2364,7 +2364,7 @@ private
    c s" UPDATE plans SET status = 'pending', blocked_json = NULL,
          retry_at = NULL
       WHERE id = ?1"
-   [: id PLAN-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   >str [: id PLAN-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT ;
 
 : UNBLOCK-STATED
@@ -2442,7 +2442,7 @@ public
       WHERE plans.status IN ('pending', 'blocked')
          AND operations.status = 'pending'
       ORDER BY operations.id"
-   [: begin SQLITE:STEP while hashes ar UPLOAD-ROW repeat ;]
+   >str [: begin SQLITE:STEP while hashes ar UPLOAD-ROW repeat ;]
    SQLITE:WITH-STATEMENT
    hashes ;
 
@@ -2581,7 +2581,7 @@ STRUCTURE operation-state
    c s" UPDATE plans
       SET status = 'completed', blocked_json = NULL, retry_at = NULL
       WHERE id = ?1"
-   [: id PLAN-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   >str [: id PLAN-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT ;
 
 \ The plan's completed recovery copies start their retention now.
@@ -2592,14 +2592,14 @@ STRUCTURE operation-state
          AND operation_id IN (
             SELECT id FROM operations WHERE plan_id = ?1
          )"
-   [: id PLAN-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   >str [: id PLAN-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT ;
 
 \ The plan and every operation of it completed, its baseline unchanged.
 : RETIRE-PLAN ( SQLITE:connection plan-id -- )
    {: c id :}
    c s" UPDATE operations SET status = 'completed' WHERE plan_id = ?1"
-   [: id PLAN-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   >str [: id PLAN-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT
    c id FINISH-PLAN
    c id START-RECOVERY-RETENTION ;
@@ -2613,9 +2613,9 @@ STRUCTURE operation-state
    path ar MODEL:FOLD {: k :}
    c s" INSERT INTO conflicts(path, conflict_json, canonical_path)
       VALUES (?1, ?2, ?3)"
-   [: path PATH-BYTES 1 SQLITE:BIND-BLOB
-      js ju 2 SQLITE:BIND-TEXT
-      k KEY-BYTES 3 SQLITE:BIND-BLOB
+   >str [: path PATH-BYTES >str 1 SQLITE:BIND-BLOB
+      js ju >str 2 SQLITE:BIND-TEXT
+      k KEY-BYTES >str 3 SQLITE:BIND-BLOB
       SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT
    c SQLITE:LAST-ROWID ;
@@ -2660,7 +2660,7 @@ STRUCTURE operation-state
      -- option<operation-state> )
    {: c id ar :}
    c STEP-QUERY
-   [: id OPERATION-ID>N 1 SQLITE:BIND-INT ar STEP-ROW ;]
+   >str [: id OPERATION-ID>N 1 SQLITE:BIND-INT ar STEP-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
 : EARLIER-ROW ( SQLITE:statement -- option<operation-id> SQLITE:statement )
@@ -2674,7 +2674,7 @@ STRUCTURE operation-state
    c s" SELECT id FROM operations
       WHERE plan_id = ?1 AND ordinal < ?2 AND status = 'pending'
       ORDER BY ordinal LIMIT 1"
-   [: plan PLAN-ID>N 1 SQLITE:BIND-INT ordinal 2 SQLITE:BIND-INT
+   >str [: plan PLAN-ID>N 1 SQLITE:BIND-INT ordinal 2 SQLITE:BIND-INT
       EARLIER-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
@@ -2684,7 +2684,7 @@ STRUCTURE operation-state
    s OPERATION-STATE-UNMAKE {: plan ordinal done:bool path json:str :}
    c s" SELECT EXISTS(SELECT 1 FROM operations
       WHERE plan_id = ?1 AND ordinal > ?2)"
-   [: plan PLAN-ID>N 1 SQLITE:BIND-INT ordinal 2 SQLITE:BIND-INT
+   >str [: plan PLAN-ID>N 1 SQLITE:BIND-INT ordinal 2 SQLITE:BIND-INT
       INT-ROW ;]
    SQLITE:WITH-STATEMENT 0<> ;
 
@@ -2692,11 +2692,11 @@ STRUCTURE operation-state
 : MARK-COMPLETED ( SQLITE:connection operation-id -- )
    {: c id :}
    c s" UPDATE operations SET status = 'completed' WHERE id = ?1"
-   [: id OPERATION-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   >str [: id OPERATION-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT
    c s" UPDATE recovery_records SET status = 'completed'
       WHERE operation_id = ?1 AND status = 'pending'"
-   [: id OPERATION-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   >str [: id OPERATION-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT ;
 
 \ The final operation, its plan and the actual baseline completed; the
@@ -2874,7 +2874,7 @@ public
    ar [type] conflict-record NEW-VECTOR {: found :}
    j >CONNECTION
    s" SELECT id, path, conflict_json FROM conflicts ORDER BY id"
-   [: begin SQLITE:STEP while found ar CONFLICT-ROW repeat ;]
+   >str [: begin SQLITE:STEP while found ar CONFLICT-ROW repeat ;]
    SQLITE:WITH-STATEMENT
    found ;
 
@@ -2958,7 +2958,7 @@ private
    c s" SELECT operation_id, original_path, recovery_path, content_json,
          status, retained_at
       FROM recovery_records WHERE id = ?1"
-   [: id RECOVERY-ID>N 1 SQLITE:BIND-INT id ar RECOVERY-ROW ;]
+   >str [: id RECOVERY-ID>N 1 SQLITE:BIND-INT id ar RECOVERY-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
 : PUSH-RECOVERY-ID
@@ -2988,7 +2988,7 @@ private
    {: c path:str s:^ su op:str ar :}
    ar [type] recovery-id NEW-VECTOR {: ids :}
    c s" SELECT id FROM recovery_records WHERE status = ?1 ORDER BY id"
-   [: s su 1 SQLITE:BIND-TEXT
+   >str [: s su >str 1 SQLITE:BIND-TEXT
       begin SQLITE:STEP while ids PUSH-RECOVERY-ID repeat ;]
    SQLITE:WITH-STATEMENT
    c ids op path
@@ -3038,7 +3038,7 @@ private
    done 0= if construct recovery-forget pending exit then
    c s" DELETE FROM recovery_records
       WHERE id = ?1 AND status = 'completed'"
-   [: id RECOVERY-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   >str [: id RECOVERY-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT
    construct recovery-forget forgotten ;
 
@@ -3046,7 +3046,7 @@ private
    ( SQLITE:connection recovery-id str -- recovery-forget )
    {: c id path:str :}
    c FORGET-QUERY
-   [: id RECOVERY-ID>N 1 SQLITE:BIND-INT path FORGETTABLE-ROW ;]
+   >str [: id RECOVERY-ID>N 1 SQLITE:BIND-INT path FORGETTABLE-ROW ;]
    SQLITE:WITH-STATEMENT
    MATCH option
       none OF construct recovery-forget not-found ENDOF
@@ -3070,7 +3070,7 @@ public
    ar [type] recovery-id NEW-VECTOR {: ids :}
    j >CONNECTION {: c :}
    c ELIGIBLE-QUERY
-   [: begin SQLITE:STEP while ids PUSH-RECOVERY-ID repeat ;]
+   >str [: begin SQLITE:STEP while ids PUSH-RECOVERY-ID repeat ;]
    SQLITE:WITH-STATEMENT
    c ids s" read completed recovery" >str j >PATH
    s" eligible recovery disappeared while reading the journal" ar

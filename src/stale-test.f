@@ -42,17 +42,17 @@ TYPED-VARIABLE DIR str
    d bu 1 + nu + >str ;
 
 : CLEANUP ( -- )
-   DIR @ str> FS:MODE-PRIVATE-DIR FS:CHMOD-MODE ;
+   DIR @ FS:MODE-PRIVATE-DIR FS:CHMOD-MODE ;
 
 : SWEPT ( -- ^VEC:vector<STALE:leftover> )
-   DIR @ str> UNREADABLE FS:CHMOD-MODE
+   DIR @ UNREADABLE FS:CHMOD-MODE
    [: DIR @ s" .omabox.install." s" " AR @ STALE:SWEEP ;]
    [: CLEANUP ;] finally ;
 
 : UNREADABLE-DIRECTORY ( -- )
    s" unreadable_directory_is_one_leftover" T-LABEL
    FS:EUID 0= if exit then
-   s" TMPDIR" GETENV s" stale-test-" FS:MKTEMP-DIR-IN KEEP {: tmp :}
+   s" TMPDIR" GETENV >str s" stale-test-" >str FS:MKTEMP-DIR-IN str> KEEP {: tmp :}
    tmp s" unreadable" UNDER DIR !
    DIR @ str> FS:MAKE-DIR
    [: SWEPT ;] [: tmp str> FS:REMOVE-TREE ;] finally {: v :}
@@ -74,11 +74,11 @@ TYPED-VARIABLE DIR str
    t s" file" UNDER str> s" stale" FS:WRITE-ALL
    sub s" file" UNDER str> s" stale" FS:WRITE-ALL
    tmp s" .omabox.install." s" " AR @ STALE:SWEEP VEC:COUNT 0 T=
-   t str> FS:TRY-LSTAT TFALSE ;
+   t FS:TRY-LSTAT TFALSE ;
 
 : DEAD-DIRECTORY ( -- )
    s" dead_directory_is_removed_whole" T-LABEL
-   s" TMPDIR" GETENV s" stale-test-" FS:MKTEMP-DIR-IN KEEP {: tmp :}
+   s" TMPDIR" GETENV >str s" stale-test-" >str FS:MKTEMP-DIR-IN str> KEEP {: tmp :}
    [: tmp REMOVED-WHOLE ;] [: tmp str> FS:REMOVE-TREE ;] finally ;
 
 public

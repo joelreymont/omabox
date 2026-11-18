@@ -192,7 +192,7 @@ ARENA FIXTURES fixture
 \ config.toml as Rust's Config::write_new writes it.
 : WRITE-CONFIG ( ^fixture ^ARENA:arena -- )
    {: x ar :}
-   x FIXTURE-CONFIG-HOME @ s" omabox" ar TEST-CLIENT:INSIDE str> FS:MAKE-DIRS
+   x FIXTURE-CONFIG-HOME @ s" omabox" ar TEST-CLIENT:INSIDE FS:MAKE-DIRS
    x FIXTURE-CONFIG-HOME @ s" omabox/config.toml" ar TEST-CLIENT:INSIDE
    {: file :}
    SB-RESET S\" sync_root = \q" SB-APPEND
@@ -248,15 +248,15 @@ ARENA FIXTURES fixture
    {: x ar :}
    x PATHS {: p :}
    [: p CONFIG:LOCK CONFIG:UNLOCK ;]
-   x FIXTURE-DIR @ s" lock-stderr.txt" ar TEST-CLIENT:INSIDE str> ar
-   STDERR:CAPTURING 2drop
+   x FIXTURE-DIR @ s" lock-stderr.txt" ar TEST-CLIENT:INSIDE ar
+   STDERR:CAPTURING drop
    CONFIG:E-ALREADY-RUNNING T= ;
 
 \ Whether the status's file holds last_error t.
 : SAYS? ( ^fixture ^u8 n ^ARENA:arena -- bool )
    {: x t:^ tu ar :}
    x FIXTURE-RUNTIME @ s" omabox/status.json" ar TEST-CLIENT:INSIDE {: f :}
-   f str> FS:FILE? 0= if false exit then
+   f FS:FILE? 0= if false exit then
    f str> SEEN CAP FS:READ-ALL {: u :}
    SB-RESET S\" \qlast_error\q:" SB-APPEND t tu TEST-CLIENT:QUOTED+
    SEEN u SB$ CONTAINS? ;
@@ -349,7 +349,7 @@ ARENA FIXTURES fixture
    x bin SPAWNED
    x READY
    x ar LOCK-HELD
-   x JOURNAL$ FS:FILE? TTRUE
+   x JOURNAL$ >str FS:FILE? TTRUE
    x RUNNING? TTRUE
    x TERMINATE drop
    [: x JOURNAL$ >str JOURNAL:OPEN JOURNAL:CLOSE ;] catch 0 T= ;
@@ -362,16 +362,16 @@ ARENA FIXTURES fixture
 \ The root removed, or a link to a missing sibling when dangling.
 : UNAVAILABLE ( ^fixture ^ARENA:arena str bool -- )
    {: x ar bin dangling :}
-   x ROOT$ FS:REMOVE-DIR
+   x ROOT$ >str FS:REMOVE-DIR
    dangling if
-      x FIXTURE-DIR @ s" missing" ar TEST-CLIENT:INSIDE str>
-      x ROOT$ FS:MAKE-SYMLINK
+      x FIXTURE-DIR @ s" missing" ar TEST-CLIENT:INSIDE
+      x ROOT$ >str FS:MAKE-SYMLINK
    then
    x bin SPAWNED
    x READY
    x RUNNING? TTRUE
    x ar LOCK-HELD
-   x JOURNAL$ FS:FILE? TTRUE
+   x JOURNAL$ >str FS:FILE? TTRUE
    x SYNC-ROOT ar AWAITED TTRUE
    x RUNNING? TTRUE
    x TERMINATE drop ;
@@ -380,13 +380,13 @@ ARENA FIXTURES fixture
 \ appears: refused before readiness.
 : CONTAINING ( ^fixture ^ARENA:arena str -- )
    {: x ar bin :}
-   x ROOT$ FS:REMOVE-DIR
-   x FIXTURE-STATE-HOME @ str> x ROOT$ FS:MAKE-SYMLINK
+   x ROOT$ >str FS:REMOVE-DIR
+   x FIXTURE-STATE-HOME @ x ROOT$ >str FS:MAKE-SYMLINK
    x bin SPAWNED
    x SETTLED
    x TERMINATE EXIT-USER-ACTION T=
    x QUIET-MS RECEIVED -1 T=
-   x FIXTURE-STATE-HOME @ str> FS:EXISTS? TFALSE
+   x FIXTURE-STATE-HOME @ FS:EXISTS? TFALSE
    x CONFIGURATION-INVALID ar SAYS? TTRUE ;
 
 : UNAVAILABLE-ROOT-STILL-SIGNALS-READINESS ( str -- )

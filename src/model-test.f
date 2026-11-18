@@ -81,7 +81,7 @@ TYPED-VARIABLE AR ^ARENA:arena
 : FOLD-CASE ( -- )
    s" fold.tsv" T-LABEL
    s" src/oracle/fold.tsv" {: f:^ fu:n :}
-   AR @ f fu FS:FILE-SIZE ARENA:ALLOC {: t:^ u:n :}
+   AR @ f fu >str FS:FILE-SIZE ARENA:ALLOC {: t:^ u:n :}
    f fu t u FS:READ-ALL u T=
    t u 0 FOLD-FROM t u LINES T= ;
 
@@ -184,7 +184,7 @@ TYPED-VARIABLE AR ^ARENA:arena
    {: k:MODEL:key top:MODEL:key :}
    top AR @ MODEL:SUBTREE-RANGE {: lo:str hi:str :}
    k KEY$ {: p:^ u:n :}
-   p u lo str> STR< 0= p u hi str> STR< and ;
+   p u >str lo STR< 0= p u >str hi STR< and ;
 
 \ BENEATH? and the range both answer `want` for the key.
 : RANGE-AGREES ( MODEL:key MODEL:key bool -- )
@@ -641,7 +641,7 @@ TYPED-VARIABLE W JSON:writer
    {: l:^ lu:n :}
    l lu PERIOD 0 SPLIT-NEXT drop {: at:n :}
    l at + lu at - {: v:^ vu:n :}
-   v vu s" .escapes" ENDS-WITH? {: e:bool :}
+   v vu >str s" .escapes" >str ENDS-WITH? {: e:bool :}
    v e if vu 8 - else vu then e ;
 
 : JSON-LINE ( ^u8 n -- )
@@ -675,7 +675,7 @@ TYPED-VARIABLE W JSON:writer
 : JSON-CASE ( -- )
    s" json.tsv" T-LABEL
    s" src/oracle/json.tsv" {: f:^ fu:n :}
-   AR @ f fu FS:FILE-SIZE ARENA:ALLOC {: t:^ u:n :}
+   AR @ f fu >str FS:FILE-SIZE ARENA:ALLOC {: t:^ u:n :}
    f fu t u FS:READ-ALL u T=
    t u 0 JSON-FROM t u LINES T= ;
 

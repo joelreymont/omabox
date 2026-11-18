@@ -450,13 +450,13 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
 : LSTAT? ( ^u8 n -- bool )
    {: a:^ u:n :}
    a u >str PASSABLE? 0= if false exit then
-   a u FS:TRY-LSTAT ;
+   a u >str FS:TRY-LSTAT ;
 
 \ realpath, laid in the arena; none leaves the cause in FS:ERRNO.
 : CANONICAL ( str ^ARENA:arena -- option<abs-path> )
    {: s ar :}
    s PASSABLE? 0= if OPTION:NONE exit then
-   s str> FS:>PATHZ ROW FS:PATHZ-CAP realpath {: u:n :}
+   s FS:>PATHZ ROW FS:PATHZ-CAP realpath {: u:n :}
    u -2 = if FS:ENAMETOOLONG FS:CAUSE! OPTION:NONE exit then
    u 0 < if FFI:ERRNO FS:CAUSE! OPTION:NONE exit then
    ROW u >str ar COPY >ABS-PATH OPTION:SOME ;
@@ -467,7 +467,7 @@ public
 : READLINK ( str ^ARENA:arena -- option<str> )
    {: s ar :}
    s PASSABLE? 0= if OPTION:NONE exit then
-   s str> FS:>PATHZ ROW FS:PATHZ-CAP readlink {: u:n :}
+   s FS:>PATHZ ROW FS:PATHZ-CAP readlink {: u:n :}
    u 0 < if OPTION:NONE exit then
    ROW u >str ar COPY OPTION:SOME ;
 
@@ -477,7 +477,7 @@ private
 : OPENED ( abs-path -- n )
    {: p :}
    p ABS-PATH>STR PASSABLE? 0= if p READ-FAILED then
-   p ABS-PATH>STR str> FS:>PATHZ 0 0 open {: fd:n :}
+   p ABS-PATH>STR FS:>PATHZ 0 0 open {: fd:n :}
    fd 0 < if p READ-FAILED then
    fd ;
 
@@ -590,7 +590,7 @@ private
       none OF root RESOLVE-FAILED ENDOF
       some OF ENDOF
    ;MATCH {: c :}
-   c ABS-PATH>STR str> FS:TRY-STAT 0= if root RESOLVE-FAILED then
+   c ABS-PATH>STR FS:TRY-STAT 0= if root RESOLVE-FAILED then
    FS:STAT-MODE@ FS:S-IFMT and FS:S-IFDIR <> if
       root NOT-DIRECTORY
    then
@@ -1202,13 +1202,13 @@ private
 : MKDIR? ( ^u8 n -- bool )
    {: a:^ u:n :}
    a u >str PASSABLE? 0= if false exit then
-   a u FS:>PATHZ FS:MODE-PRIVATE-DIR mkdir 0= ;
+   a u >str FS:>PATHZ FS:MODE-PRIVATE-DIR mkdir 0= ;
 
 \ A failed mkdir stands unless a directory is there now, links followed.
 : PRESENT? ( ^u8 n -- bool )
    {: a:^ u:n :}
    FS:ERRNO {: cause:n :}
-   a u FS:TRY-STAT if
+   a u >str FS:TRY-STAT if
       FS:STAT-MODE@ FS:S-IFMT and FS:S-IFDIR = if true exit then
    then
    cause FS:CAUSE! false ;
@@ -1249,7 +1249,7 @@ private
    p role ROLE-PATH {: at :}
    at ABS-PATH>STR str> {: a:^ u:n :}
    a u MAKE-ALL? 0= if role at CREATE-FAILED then
-   a u FS:>PATHZ FS:MODE-PRIVATE-DIR chmod 0<> if
+   a u >str FS:>PATHZ FS:MODE-PRIVATE-DIR chmod 0<> if
       role at SECURE-FAILED
    then ;
 
@@ -1286,7 +1286,7 @@ private
 \ A new file at s, mode 0600; false leaves the cause in FS:ERRNO.
 : CREATED? ( str -- bool )
    {: s :}
-   [: s str> FS:MODE-PRIVATE-FILE FS:CREATE-NEW FD>N close ;] catch {: code:n :}
+   [: s FS:MODE-PRIVATE-FILE FS:CREATE-NEW FD>N close ;] catch {: code:n :}
    code 0= if true exit then
    code E-FS-OPEN <> if code throw then
    false ;
@@ -1298,7 +1298,7 @@ private
    s PASSABLE? 0= if false exit then
    s CREATED? if true exit then
    FS:ERRNO FS:EEXIST <> if false exit then
-   s str> FS:TRY-LSTAT 0= if false exit then
+   s FS:TRY-LSTAT 0= if false exit then
    FS:STAT-MODE@ FS:S-IFMT and FS:S-IFREG = if true exit then
    0 FS:CAUSE! false ;
 
@@ -1312,7 +1312,7 @@ private
 : OPEN-LOCK ( abs-path -- fd )
    {: p :}
    p ABS-PATH>STR OWNER-ONLY? 0= if p OPEN-FAILED then
-   -1 >FD [: drop p ABS-PATH>STR str> FS:OPEN-RDWR-NOFOLLOW ;] catch
+   -1 >FD [: drop p ABS-PATH>STR FS:OPEN-RDWR-NOFOLLOW ;] catch
    {: code:n :}
    code 0<> if code p OPEN-CAUGHT then ;
 
@@ -1329,7 +1329,7 @@ private
    {: cause:n p :}
    LOG:WARN s" config" LOG:LINE
    s" could not unlock the daemon lock file " LOG:TEXT+ p QUOTED+
-   s" ; closing it instead: " LOG:TEXT+ cause FS:ERRNO$ LOG:TEXT+
+   s" ; closing it instead: " LOG:TEXT+ cause FS:ERRNO$ str> LOG:TEXT+
    LOG:;LINE ;
 
 public
@@ -1587,7 +1587,7 @@ ARENA WRITINGS writing
    {: p :}
    p ABS-PATH>STR str> {: a:^ u:n :}
    a u MAKE-ALL? 0= if p PREPARE-FAILED then
-   a u FS:>PATHZ FS:MODE-PRIVATE-DIR chmod 0<> if p PREPARE-FAILED then ;
+   a u >str FS:>PATHZ FS:MODE-PRIVATE-DIR chmod 0<> if p PREPARE-FAILED then ;
 
 \ The directory's descriptor, which names the renames' entries.
 : ANCHOR ( abs-path -- fd )
@@ -1620,7 +1620,7 @@ ARENA WRITINGS writing
    {: t :}
    t ABS-PATH>STR PASSABLE? 0= if s" create a temporary" t WRITE-FAILED then
    -1 >FD
-   [: drop t ABS-PATH>STR str> FS:MODE-PRIVATE-FILE FS:CREATE-NEW ;]
+   [: drop t ABS-PATH>STR FS:MODE-PRIVATE-FILE FS:CREATE-NEW ;]
    catch {: code:n :}
    code 0<> if code t CREATE-CAUGHT then ;
 
@@ -1655,7 +1655,7 @@ ARENA WRITINGS writing
 : DIRECTORY-SYNCED ( ^writing -- )
    {: w :}
    w WRITING-FILE @ {: file :}
-   w WRITING-PARENT @ ABS-PATH>STR str> FS:>PATHZ 0 0 open {: d:n :}
+   w WRITING-PARENT @ ABS-PATH>STR FS:>PATHZ 0 0 open {: d:n :}
    d 0 < if s" make the new" file WRITE-FAILED then
    [: d >FD FD:SYNC ;] catch {: code:n :}
    FS:ERRNO {: cause:n :}

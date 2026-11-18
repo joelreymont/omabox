@@ -142,7 +142,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
    {: op:^ opu code errno :}
    LOG-OPEN s" could not " LOG:TEXT+ op opu LOG:TEXT+
    s" : " LOG:TEXT+
-   errno 0= if code LOG:CODE+ else errno FS:ERRNO$ LOG:TEXT+ then
+   errno 0= if code LOG:CODE+ else errno FS:ERRNO$ str> LOG:TEXT+ then
    LOG:;LINE
    E-IO throw ;
 
@@ -169,7 +169,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
    {: base:str n:^ nu ar :}
    base str> {: b:^ bu :}
    ar bu nu + 1 + ARENA:ALLOC SPAN:MAKE {: dst :}
-   b bu n nu dst FS:JOIN-PATH-INTO {: u :}
+   b bu >str n nu >str dst FS:JOIN-PATH-INTO {: u :}
    dst SPAN:$ drop u >str ;
 
 
@@ -191,7 +191,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
 : MADE ( str -- )
    {: d:str :}
    FS:CAUSE-CLEAR
-   [: d str> FS:MODE-PRIVATE-DIR FS:MKDIR-MODE ;] catch {: code :}
+   [: d FS:MODE-PRIVATE-DIR FS:MKDIR-MODE ;] catch {: code :}
    code 0= if exit then
    FS:ERRNO {: errno :}
    errno FS:EEXIST = if d str> FS:DIR? if exit then then
@@ -201,7 +201,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
 : PRIVATE-DIR ( str -- )
    {: d:str :}
    d MADE
-   [: d str> FS:MODE-PRIVATE-DIR FS:CHMOD-MODE ;]
+   [: d FS:MODE-PRIVATE-DIR FS:CHMOD-MODE ;]
    s" secure the runtime status directory" IO ;
 
 
@@ -233,7 +233,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
 
 : REPAIRED ( ^u8 n ^n ^ARENA:arena -- str )
    {: a:^ u buf ar :}
-   a u ar UTF8-LOSSY:REPAIR buf FILLED ;
+   a u >str ar UTF8-LOSSY:REPAIR str> buf FILLED ;
 
 
 \ The path as the widget shows it, in buf: an absolute one is never
@@ -418,9 +418,9 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
 : LAST-ERROR ( ^JSON:writer fault -- ^JSON:writer )
    MATCH fault
       none OF JSON:WRITE-NULL ENDOF
-      retrying OF drop str> JSON:WRITE-STRING ENDOF
-      unsynced OF UNSYNCED$ JSON:WRITE-STRING ENDOF
-      stopped OF str> JSON:WRITE-STRING ENDOF
+      retrying OF drop JSON:WRITE-STRING ENDOF
+      unsynced OF UNSYNCED$ >str JSON:WRITE-STRING ENDOF
+      stopped OF JSON:WRITE-STRING ENDOF
    ;MATCH ;
 
 
@@ -474,7 +474,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
    errno FS:ENOENT = if exit then
    LOG:WARN s" status" LOG:LINE
    s" could not remove a temporary runtime status file: " LOG:TEXT+
-   errno FS:ERRNO$ LOG:TEXT+ LOG:;LINE ;
+   errno FS:ERRNO$ str> LOG:TEXT+ LOG:;LINE ;
 
 
 \ The temporary removed, then the failure of op.

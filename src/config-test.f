@@ -139,14 +139,14 @@ variable CAUSE
 : P ( ^u8 n -- CONFIG:abs-path ) UNDER CONFIG:>ABS-PATH ;
 
 : MKDIR ( str -- ) str> FS:MAKE-DIR ;
-: MKDIRS ( str -- ) str> FS:MAKE-DIRS ;
-: SYMLINK ( str str -- ) {: target link :} target str> link str> FS:MAKE-SYMLINK ;
-: EXISTS? ( str -- bool ) str> FS:TRY-STAT ;
+: MKDIRS ( str -- ) FS:MAKE-DIRS ;
+: SYMLINK ( str str -- ) {: target link :} target link FS:MAKE-SYMLINK ;
+: EXISTS? ( str -- bool ) FS:TRY-STAT ;
 : DIRECTORY? ( CONFIG:abs-path -- bool ) CONFIG:ABS-PATH>STR str> FS:DIR? ;
 
 \ The permission bits of the entry a path names, links followed.
 : MODE ( CONFIG:abs-path -- n )
-   CONFIG:ABS-PATH>STR str> FS:TRY-STAT TTRUE
+   CONFIG:ABS-PATH>STR FS:TRY-STAT TTRUE
    FS:STAT-MODE@ $1FF and ;
 
 : PATH= ( CONFIG:abs-path str -- )
@@ -157,7 +157,7 @@ variable CAUSE
    {: a:^ u:n t:^ tu:n :}
    tu u > if false exit then
    u tu - 1+ 0 ?do
-      a i + tu t tu T-STR= if true unloop exit then
+      a i + tu >str t tu >str T-STR= if true unloop exit then
    loop false ;
 
 
@@ -171,7 +171,7 @@ variable CAUSE
 : RUN-CASE ( ^u8 n [ -- ] -- )
    BODY ! T-LABEL
    ARENA:NEW AR !
-   s" TMPDIR" GETENV s" config-test-" FS:MKTEMP-DIR-IN KEEP DIR !
+   s" TMPDIR" GETENV >str s" config-test-" >str FS:MKTEMP-DIR-IN str> KEEP DIR !
    DIR @ AR @ CONFIG-TEST:CANON CONFIG:ABS-PATH>STR REAL !
    [: BODY @ execute ;] [: CLEANUP ;] finally ;
 
@@ -186,7 +186,7 @@ variable CAUSE
 : LOGGED ( [ -- ] -- n )
    ACTION !
    [: ACTION @ [: FS:ERRNO CAUSE ! ;] finally ;]
-   ERR-PATH str> AR @ STDERR:CAPTURING ERR-U ! ERR ! ;
+   ERR-PATH AR @ STDERR:CAPTURING str> ERR-U ! ERR ! ;
 
 : LINES ( ^u8 n -- n )
    {: a:^ u:n :}
@@ -197,7 +197,7 @@ variable CAUSE
    {: a:^ u:n t :}
    s" config: " >str t CAT s\" \n" S+ str> {: w:^ wu:n :}
    u wu < if false exit then
-   a u wu - + wu w wu T-STR= ;
+   a u wu - + wu >str w wu >str T-STR= ;
 
 \ ERR$'s first line's length, its newline included.
 : FIRST-LINE ( -- n )
@@ -508,8 +508,8 @@ variable CAUSE
 \ The directory made, then set 0777.
 : BROAD ( CONFIG:abs-path -- )
    CONFIG:ABS-PATH>STR str> {: a:^ u:n :}
-   a u FS:MAKE-DIRS
-   a u $1FF FS:CHMOD-MODE ;
+   a u >str FS:MAKE-DIRS
+   a u >str $1FF FS:CHMOD-MODE ;
 
 : PREPARE-REPAIRS ( -- )
    FIXTURE STANDARD
@@ -560,7 +560,7 @@ variable CAUSE
 : LOCK-OWNER-ONLY ( -- )
    LOCKABLE HELD !
    HELD-LOCK {: l :}
-   LOCK-PATH str> FS:TRY-STAT TTRUE
+   LOCK-PATH FS:TRY-STAT TTRUE
    FS:STAT-MODE@ $1FF and $180 T=
    l CONFIG:UNLOCK ;
 
@@ -572,7 +572,7 @@ variable CAUSE
    ['] LOCK-DROP CONFIG:E-LOCK-OPEN OPEN-TEXT REFUSED
    CAUSE @ 0 T=
    s" planted.lock" UNDER EXISTS? TFALSE
-   LOCK-PATH str> FS:REMOVE-FILE
+   LOCK-PATH FS:REMOVE-FILE
    s" existing.lock" UNDER str> s" " FS:WRITE-ALL
    s" existing.lock" UNDER LOCK-PATH SYMLINK
    ['] LOCK-DROP CONFIG:E-LOCK-OPEN OPEN-TEXT REFUSED
@@ -622,13 +622,13 @@ variable CAUSE
    FIXTURE STANDARD
    s" state" UNDER {: home :}
    home MKDIR
-   home str> $16D FS:CHMOD-MODE
+   home $16D FS:CHMOD-MODE
    LOAD HELD !
    ['] PREPARE-HELD CONFIG:E-CREATE-DIRECTORY
    s" could not create Omabox state directory at `" >str STATE-PATH CAT
    s" `" S+ REFUSED
    CAUSE @ FS:EACCES T=
-   home str> $1ED FS:CHMOD-MODE ;
+   home $1ED FS:CHMOD-MODE ;
 
 \ LOCK before PREPARE, which makes the state directory.
 : LOCK-NO-STATE ( -- )
@@ -645,7 +645,7 @@ variable CAUSE
    LOCKABLE HELD !
    ['] UNLOCK-CLOSED LOGGED 0 T=
    s" could not unlock the daemon lock file `" >str LOCK-PATH CAT
-   s" `; closing it instead: " S+ FS:EBADF FS:ERRNO$ S+ {: t :}
+   s" `; closing it instead: " S+ FS:EBADF FS:ERRNO$ str> S+ {: t :}
    t LINE? t ASSERT-LOG ;
 
 : LOCK-CLOEXEC ( -- )
@@ -766,7 +766,7 @@ variable CAUSE
 
 \ The lowest free descriptor.
 : NEXT-FD ( -- n )
-   s" /dev/null" FS:>PATHZ 0 0 open {: fd:n :}
+   s" /dev/null" >str FS:>PATHZ 0 0 open {: fd:n :}
    fd close fd ;
 
 : CONFIG-DIRECTORY-FILE ( -- )
@@ -822,7 +822,7 @@ TEXT-CAP BUFFER: TEXT
    FIXTURE
    REPLACEMENT MKDIR
    STANDARD
-   CONFIG-FILE str> $1A4 FS:CHMOD-MODE
+   CONFIG-FILE $1A4 FS:CHMOD-MODE
    REPLACEMENT s" replacement-app-key" FROM {: r :}
    r AR @ CONFIG:WRITE NO-LEFTOVERS
    CONFIG-FILE CONFIG:>ABS-PATH MODE $180 T=
@@ -902,7 +902,7 @@ TEXT-CAP BUFFER: TEXT
    {: t :}
    CONFIG-DIR s" /.config.toml." S+ t CAT ;
 
-: LSTAT? ( str -- bool ) str> FS:TRY-LSTAT ;
+: LSTAT? ( str -- bool ) FS:TRY-LSTAT ;
 
 \ The config half of install.rs's
 \ upgrade_and_config_write_sweep_only_dead_temporaries: no process has a

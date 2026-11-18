@@ -169,10 +169,10 @@ TYPED-VARIABLE LINK REPLAY:link
    d s" Dropbox" ar TEST-CLIENT:INSIDE {: root:str :}
    root str> FS:MAKE-DIR
    d s" journal.sqlite3" ar TEST-CLIENT:INSIDE JOURNAL:OPEN {: j :}
-   root str> FS:REMOVE-DIR
+   root FS:REMOVE-DIR
    d s" stderr.txt" ar TEST-CLIENT:INSIDE {: log:str :}
-   [: root j ar JOURNAL:INSPECT-ROOT drop ;] log str> ar
-   STDERR:CAPTURING 2drop {: code :}
+   [: root j ar JOURNAL:INSPECT-ROOT drop ;] log ar
+   STDERR:CAPTURING drop {: code :}
    j JOURNAL:CLOSE
    code JOURNAL:E-ROOT T=
    code CODE-FAILURE {: f :}
@@ -255,7 +255,7 @@ variable DROPPED
    NAP
    [: HELD-PATHS @ CONFIG:LOCK CONFIG:UNLOCK ;]
    CONFIG:E-ALREADY-RUNNING TTHROWSQ
-   NAPS @ 2 = if HELD-JOURNAL @ str> FS:REMOVE-DIR then ;
+   NAPS @ 2 = if HELD-JOURNAL @ FS:REMOVE-DIR then ;
 
 : WITH-CASE ( [ ^ARENA:arena -- ] -- )
    {: q :}
@@ -566,12 +566,12 @@ TYPED-VARIABLE CYCLE-ARENA ^ARENA:arena
    {: ar :}
    ar CASE-DIR {: cd:str :}
    cd CREDENTIAL-DIR !
-   cd str> s" org.omarchy.omabox" SECRET:DIR-BIND
+   cd s" org.omarchy.omabox" >str SECRET:DIR-BIND
    ar RECOVERY-CONTROL-RETRIES-UNDER-A-HELD-LOCK-AND-CLEARS-ONLY-AFTER-A-CLEAN-PASS
    ar RECOVERY-CONTROL-PUBLISHES-STOPPED-BEFORE-A-FATAL-EXIT
    ROOT-INSPECTION-FAILURE-IS-UNAVAILABLE-ONLY-FOR-A-STAND-IN
    ar STAND-IN-WITHOUT-BIRTH-TIME-LEAVES-THE-ROOT-UNAVAILABLE
-   AIO:START CURL:LOOP-START TEST-CLIENT:CURL-READY
+   AIO:START CURL:LOOP-START
    [: TEST-DROPBOX:START
       [: ar RUN-SERVED ;] [: TEST-DROPBOX:STOP ;] finally ;]
    [: CURL:LOOP-STOP AIO:STOP ;] finally
@@ -699,7 +699,7 @@ private
 \ The account cases against one fake Dropbox, under curl's loop.
 : ACCOUNT-CASES ( ^ARENA:arena -- )
    {: ar :}
-   AIO:START CURL:LOOP-START CURL-READY
+   AIO:START CURL:LOOP-START
    [: TEST-DROPBOX:START
       [: ar ACCOUNT-SERVED ;] [: TEST-DROPBOX:STOP ;] finally ;]
    [: CURL:LOOP-STOP AIO:STOP ;] finally ;

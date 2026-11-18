@@ -84,7 +84,7 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
 
 : GONE ( str -- ) str> FS:REMOVE-TREE ;
 
-: MODE-OF ( str -- n ) str> FS:STAT-MODE MODE-BITS and ;
+: MODE-OF ( str -- n ) FS:STAT-MODE MODE-BITS and ;
 
 
 \ The action throws want with fd 2 sent to dir/stderr.txt, which then
@@ -93,9 +93,9 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    {: want dir:str t:^ tu ar :}
    ACTION !
    dir s" stderr.txt" ar INSIDE {: f:str :}
-   ACTION @ f str> ar STDERR:CAPTURING {: code:n e:^ u:n :}
+   ACTION @ f ar STDERR:CAPTURING str> {: code:n e:^ u:n :}
    code want T=
-   e u 10 COUNT-CHAR 1 T=
+   e u >str 10 COUNT-CHAR 1 T=
    e u t tu CONTAINS? TTRUE ;
 
 \ The action runs with fd 2 sent to dir/stderr.txt, which then is empty
@@ -104,7 +104,7 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    {: dir:str ar :}
    ACTION !
    dir s" stderr.txt" ar INSIDE {: f:str :}
-   ACTION @ f str> ar STDERR:CAPTURING nip {: code:n u:n :}
+   ACTION @ f ar STDERR:CAPTURING str> nip {: code:n u:n :}
    code 0<> if code throw then
    u 0 T= ;
 
@@ -509,8 +509,8 @@ variable SCANNED       \ query plan rows that scan the table
 
 \ The plan of deleting what lies beneath "a".
 : SUBTREE-PLAN ( SQLITE:statement -- SQLITE:statement )
-   s" a/" 1 SQLITE:BIND-BLOB
-   s\" a/\xFF" 2 SQLITE:BIND-BLOB
+   s" a/" >str 1 SQLITE:BIND-BLOB
+   s\" a/\xFF" >str 2 SQLITE:BIND-BLOB
    begin SQLITE:STEP while SUBTREE-PLAN-ROW repeat ;
 
 
@@ -650,7 +650,7 @@ variable SCANNED       \ query plan rows that scan the table
    ( SQLITE:connection ^VEC:vector<MODEL:local-record> ^JSON:writer -- )
    {: c v w :}
    c s" DELETE FROM local_observations" SQLITE:EXEC
-   c INSERT-LOCAL [: v w LOCAL-INSERTS ;] SQLITE:WITH-STATEMENT ;
+   c INSERT-LOCAL >str [: v w LOCAL-INSERTS ;] SQLITE:WITH-STATEMENT ;
 
 \ Replaces the local inventory, and nothing else, in one transaction.
 : PUBLISH-LOCAL-INVENTORY
@@ -669,11 +669,11 @@ variable SCANNED       \ query plan rows that scan the table
    s" src/oracle/schema.tsv" ORACLE
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
-   0 j >CONNECTION SCHEMA-SQL [: SCHEMA-ROWS ;] SQLITE:WITH-STATEMENT
+   0 j >CONNECTION SCHEMA-SQL >str [: SCHEMA-ROWS ;] SQLITE:WITH-STATEMENT
    26 T=
    j >CONNECTION VERSION 8 T=
    s\" user_version\t8" HELD? TTRUE
-   BODY BODY-U @ 10 COUNT-CHAR 28 T=
+   BODY BODY-U @ >str 10 COUNT-CHAR 28 T=
    j CLOSE
    d GONE ;
 
@@ -713,7 +713,7 @@ variable SCANNED       \ query plan rows that scan the table
    s" read_only_journal_preserves_existing_permissions" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN CLOSE
-   p str> MODE-SHARED FS:CHMOD-MODE
+   p MODE-SHARED FS:CHMOD-MODE
    p OPEN-READ {: j :}
    p MODE-OF MODE-SHARED T=
    j CLOSE
@@ -724,7 +724,7 @@ variable SCANNED       \ query plan rows that scan the table
    s" writable_journal_restricts_existing_database" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN CLOSE
-   p str> MODE-SHARED FS:CHMOD-MODE
+   p MODE-SHARED FS:CHMOD-MODE
    p OPEN {: j :}
    p MODE-OF MODE-OWNER T=
    j CLOSE
@@ -756,7 +756,7 @@ variable SCANNED       \ query plan rows that scan the table
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
    j >CONNECTION {: c :}
-   c s" PRAGMA journal_mode" [: DELETE-ROW? ;] SQLITE:WITH-STATEMENT
+   c s" PRAGMA journal_mode" >str [: DELETE-ROW? ;] SQLITE:WITH-STATEMENT
    TTRUE
    c s" PRAGMA synchronous" QUERY-INT 2 T=
    j BUSY-MS-OF 5000 T=
@@ -790,10 +790,10 @@ variable SCANNED       \ query plan rows that scan the table
    ar SCRATCH {: d:str :}
    d s" sealed" ar INSIDE {: sealed:str :}
    sealed str> FS:MAKE-DIR
-   sealed str> MODE-SEALED FS:CHMOD-MODE
+   sealed MODE-SEALED FS:CHMOD-MODE
    sealed s" journal.sqlite3" ar INSIDE {: path:str :}
    path d CREATE-FAILED ar OPEN-REFUSED
-   sealed str> MODE-DIR-OWNER FS:CHMOD-MODE
+   sealed MODE-DIR-OWNER FS:CHMOD-MODE
    d GONE ;
 
 variable SEEN          \ FS:ERRNO as OPEN's throw left it
@@ -807,11 +807,11 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    ar SCRATCH {: d:str :}
    d s" sealed" ar INSIDE {: sealed:str :}
    sealed str> FS:MAKE-DIR
-   sealed str> MODE-SEALED FS:CHMOD-MODE
+   sealed MODE-SEALED FS:CHMOD-MODE
    sealed s" journal.sqlite3" ar INSIDE SUBJECT !
    [: OPEN-NOTING ;] E-FILE d CREATE-FAILED ar LOGGED
    SEEN @ FS:EACCES T=
-   sealed str> MODE-DIR-OWNER FS:CHMOD-MODE
+   sealed MODE-DIR-OWNER FS:CHMOD-MODE
    d GONE ;
 
 : JOURNAL-REFUSES-A-SYMLINKED-DATABASE ( ^ARENA:arena -- )
@@ -820,13 +820,13 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    ar SCRATCH {: d:str :}
    d s" planted.sqlite3" ar INSIDE {: planted:str :}
    d s" dangling.sqlite3" ar INSIDE {: dangling:str :}
-   planted str> dangling str> FS:MAKE-SYMLINK
+   planted dangling FS:MAKE-SYMLINK
    dangling d CREATE-FAILED ar OPEN-REFUSED
-   planted str> FS:EXISTS? TFALSE
+   planted FS:EXISTS? TFALSE
    d s" existing.sqlite3" ar INSIDE {: existing:str :}
    existing OPEN CLOSE
    d s" linked.sqlite3" ar INSIDE {: linked:str :}
-   existing str> linked str> FS:MAKE-SYMLINK
+   existing linked FS:MAKE-SYMLINK
    linked d s" `: existing path is not a regular file" ar
    OPEN-REFUSED
    d GONE ;
@@ -855,7 +855,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
 \ The identity statx gives for the directory, read here on its own.
 : STATX-ROOT ( str -- local-root-binding )
    {: d:str :}
-   d str> FS:TRY-STAT TTRUE
+   d FS:TRY-STAT TTRUE
    FS:STAT-INO@ {: inode :}
    d str> FS:OPEN-DIR {: dir:fd :}
    dir FS-STATX:BIRTH {: s ns born:bool :}
@@ -914,7 +914,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
 \ A directory whose filesystem reports no birth time.
 : SYS-KERNEL ( -- str ) s" /sys/kernel" >str ;
 
-: SYS-INODE ( -- n ) SYS-KERNEL str> FS:TRY-STAT TTRUE FS:STAT-INO@ ;
+: SYS-INODE ( -- n ) SYS-KERNEL FS:TRY-STAT TTRUE FS:STAT-INO@ ;
 
 : SYS-REFUSAL ( -- ^u8 n ) s" sync root `/sys/kernel` is on" ;
 
@@ -1027,7 +1027,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    s" SELECT lower(group_concat(name || ' ' || sql, char(10)))
       FROM sqlite_master
       WHERE type IN ('table', 'index') AND sql IS NOT NULL"
-   [: SCHEMA-TEXT ;] SQLITE:WITH-STATEMENT {: u :}
+   >str [: SCHEMA-TEXT ;] SQLITE:WITH-STATEMENT {: u :}
    BODY u s" oauth" CONTAINS? TFALSE
    BODY u s" credential" CONTAINS? TFALSE
    BODY u s" access_token" CONTAINS? TFALSE
@@ -1162,7 +1162,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    p OPEN {: j :}
    j s" cursor-old" CURSOR ar SUBTREE-SAMPLE PUBLISH-REMOTE-INVENTORY
    0 INDEXED !  0 SCANNED !
-   j >CONNECTION SUBTREE-PLAN-SQL [: SUBTREE-PLAN ;]
+   j >CONNECTION SUBTREE-PLAN-SQL >str [: SUBTREE-PLAN ;]
    SQLITE:WITH-STATEMENT
    INDEXED @ 0 > TTRUE
    SCANNED @ 0 T=
@@ -1435,7 +1435,7 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
 : ROWS-AT ( journal MODEL:path -- n )
    {: j path :}
    j >CONNECTION s" SELECT COUNT(*) FROM baselines WHERE path = ?1"
-   [: path PATH-BYTES 1 SQLITE:BIND-BLOB INT-ROW ;]
+   >str [: path PATH-BYTES >str 1 SQLITE:BIND-BLOB INT-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
 : AGREE ( journal ^u8 n ^u8 n ^u8 n ^ARENA:arena -- )
@@ -2939,7 +2939,7 @@ variable CRAFT
 \ A new directory at root, the old one moved aside, inspected.
 : REPLACED ( str str -- local-root-binding )
    {: root:str moved:str :}
-   root str> moved str> FS:RENAME-FILE
+   root moved FS:RENAME-FILE
    root str> FS:MAKE-DIR
    root INSPECT ;
 

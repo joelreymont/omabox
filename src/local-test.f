@@ -360,9 +360,9 @@ FS:PATHZ-CAP BUFFER: JOINED
 
 : WRITE ( ^u8 n ^u8 n -- ) {: p:^ u:n b:^ bu:n :} p u AT b bu FS:WRITE-ALL ;
 : MKDIR ( ^u8 n -- ) AT FS:MAKE-DIR ;
-: REMOVE ( ^u8 n -- ) AT FS:REMOVE-FILE ;
-: DENY ( ^u8 n -- ) AT 0 FS:CHMOD-MODE ;
-: ALLOW ( ^u8 n -- ) AT MODE-0700 FS:CHMOD-MODE ;
+: REMOVE ( ^u8 n -- ) AT >str FS:REMOVE-FILE ;
+: DENY ( ^u8 n -- ) AT >str 0 FS:CHMOD-MODE ;
+: ALLOW ( ^u8 n -- ) AT >str MODE-0700 FS:CHMOD-MODE ;
 
 \ A new directory under TMPDIR, its path copied to buf; the path's length.
 : TEMP-DIR ( ^u8 n ^u8 -- n )
@@ -400,12 +400,12 @@ create TIMES 32 allot
 
 \ Rust's force_changed: access and modification one second past the epoch.
 : FORCE-CHANGED ( ^u8 n -- )
-   AT FS:>PATHZ {: z:^ :}
+   AT >str FS:>PATHZ {: z:^ :}
    1 TIMES ! 0 TIMES 8 + ! 1 TIMES 16 + ! 0 TIMES 24 + !
    AT-FDCWD z TIMES 0 UTIMENSAT-CALL 0 T= ;
 
 : LINK-OF ( ^u8 n -- ^u8 n )
-   AT FS:>PATHZ READ-BUF 64 READLINK-CALL READ-BUF swap ;
+   AT >str FS:>PATHZ READ-BUF 64 READLINK-CALL READ-BUF swap ;
 
 FUNCTION: MKFIFO-CALL mkfifo ( ^u8 n -- i32 ) ;FUNCTION
 
@@ -431,7 +431,7 @@ FS:PATHZ-CAP BUFFER: LOG-AT
 \ Runs q with fd 2 sent to LOG-PATH; what that file then holds, in AR,
 \ after which it is removed.
 : STDERR-OF ( [ -- ] -- ^u8 n )
-   LOG-PATH AR @ STDERR:CAPTURING {: code:n e:^ u:n :}
+   LOG-PATH >str AR @ STDERR:CAPTURING str> {: code:n e:^ u:n :}
    code 0<> if code throw then
    e u ;
 
@@ -565,7 +565,7 @@ FS:PATHZ-CAP BUFFER: LOG-AT
 : ORDERED ( complete-scan -- )
    SCAN-OBSERVATIONS {: v :}
    true v VEC:COUNT 1 max 1 ?do
-      v i 1- VEC:AT OBSERVATION-PATH@ v i VEC:AT OBSERVATION-PATH@ STR< and
+      v i 1- VEC:AT OBSERVATION-PATH@ >str v i VEC:AT OBSERVATION-PATH@ >str STR< and
    loop TTRUE ;
 
 : SAME-RECORDS
@@ -760,7 +760,7 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    s" .DS_Store" s" Finder metadata" WRITE
    s" ~$private" MKDIR
    s" ~$private/child.txt" s" private" WRITE
-   s" missing" s" .dropbox" AT FS:MAKE-SYMLINK ;
+   s" missing" >str s" .dropbox" AT >str FS:MAKE-SYMLINK ;
 
 \ The half without the journal: the scan's reusable hashes are the cache
 \ the publication stores.
@@ -781,7 +781,7 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    s" kept.txt" s" kept" WRITE
    NO-CACHE STABLE [: STABLE ;] CACHED-SCAN REUSABLE {: cache :}
    cache VEC:COUNT 1 T=
-   OUTSIDE$ s" unsupported-link" AT FS:MAKE-SYMLINK
+   OUTSIDE$ >str s" unsupported-link" AT >str FS:MAKE-SYMLINK
    cache STABLE [: STABLE ;] CACHED-SCAN {: s:complete-scan :}
    s s" unsupported-link" UNSUPPORTED-KIND SEEN
    s s" kept.txt" PRESENT SEEN
@@ -799,8 +799,8 @@ FS:PATHZ-CAP BUFFER: LOG-AT
 : SPECIAL-ENTRIES-ARE-PUBLISHED-AS-UNSUPPORTED ( -- )
    s" special_entries_are_published_as_unsupported" T-LABEL
    s" regular.txt" s" regular" WRITE
-   s" regular.txt" TARGET-AT s" link" AT FS:MAKE-SYMLINK
-   s" fifo" AT FS:>PATHZ MODE-0600 MKFIFO-CALL 0 T=
+   s" regular.txt" TARGET-AT >str s" link" AT >str FS:MAKE-SYMLINK
+   s" fifo" AT >str FS:>PATHZ MODE-0600 MKFIFO-CALL 0 T=
    s" socket" AT TEST-CLIENT:SOCKET-AT {: sock:fd :}
    [: ROOT-SCAN ;] [: sock DISCARD ;] finally {: s:complete-scan :}
    s s" fifo" UNSUPPORTED-KIND SEEN
@@ -849,7 +849,7 @@ variable CAUGHT
    s" closed" MKDIR
    s" closed/file.txt" s" inside" WRITE
    s" closed" AT s" open test parent" OPEN-ROOT {: parent:fd :}
-   s" closed" AT MODE-0600 FS:CHMOD-MODE
+   s" closed" AT >str MODE-0600 FS:CHMOD-MODE
    [: [: parent HASH-BELOW ;]
       [: FS:ERRNO CAUGHT ! s" closed" ALLOW ;] finally
    ;] E-IO TTHROWSQ
@@ -892,7 +892,7 @@ variable CAUGHT
 
 : LINK-OVER ( ^u8 n -- )
    {: p:^ u:n :}
-   s" elsewhere" p u AT FS:MAKE-SYMLINK ;
+   s" elsewhere" >str p u AT >str FS:MAKE-SYMLINK ;
 
 \ Replaces an enumerated directory with what put makes at its name. The
 \ reopen fails ENOTDIR or ELOOP, which the scan owes that one path; the
@@ -906,7 +906,7 @@ variable CAUGHT
    s" kept.txt" s" kept" WRITE
    NO-CACHE NO-CUTOFF ENUMERATE {: ps:pending-scan :}
    s" outer/swapped/inside.txt" REMOVE
-   s" outer/swapped" AT FS:REMOVE-DIR
+   s" outer/swapped" AT >str FS:REMOVE-DIR
    s" outer/swapped" put execute
    ps FINISH-SCAN {: s:complete-scan :}
    s s" outer" INCOMPLETE SEEN
@@ -956,7 +956,7 @@ variable CAUGHT
 : NESTED? ( ^u8 n -- bool )
    {: p:^ u:n :}
    p u s" nested" STR= if true exit then
-   p u s" nested/" STARTS-WITH? ;
+   p u >str s" nested/" >str STARTS-WITH? ;
 
 \ Moves the cached hashes beneath "nested" to retained.
 : RETAIN-NESTED ( scan-entries -- )
@@ -1054,7 +1054,7 @@ variable RAISED-ERRNO
 : LOGGED ( ^u8 n n -- )
    {: p:^ u:n lines:n :}
    lines 0= if u 0 T= exit then
-   p u 10 COUNT-CHAR lines T= ;
+   p u >str 10 COUNT-CHAR lines T= ;
 
 \ What q throws under the scan's predicate, LOCAL's log of it holding
 \ lines lines; FS:ERRNO is q's again after the log's file calls.
@@ -1149,8 +1149,8 @@ variable RAISED-ERRNO
    s" denied_write_gives_its_directory_and_entry" T-LABEL
    ROOT-USER? if exit then
    s" denied" MKDIR s" denied/file.txt" s" held" WRITE
-   s" denied/file.txt" AT MODE-0640 FS:CHMOD-MODE
-   s" denied" AT MODE-0750 FS:CHMOD-MODE
+   s" denied/file.txt" AT >str MODE-0640 FS:CHMOD-MODE
+   s" denied" AT >str MODE-0750 FS:CHMOD-MODE
    s" denied" AT FS:OPEN-DIR {: dir:fd :}
    [: [: FS:EPERM FS:CAUSE! dir s" file.txt" s" write test file"
          s" denied/file.txt" IO-FAILURE-AT ;] E-IO TTHROWSQ
@@ -1211,7 +1211,7 @@ variable RAISED-ERRNO
    s" create_directory_denied_gives_its_directory" T-LABEL
    ROOT-USER? if exit then
    s" root" MKDIR s" root/ro" MKDIR
-   s" root/ro" AT MODE-0500 FS:CHMOD-MODE
+   s" root/ro" AT >str MODE-0500 FS:CHMOD-MODE
    s" root" AT FS:OPEN-DIR {: root:fd :}
    [: [: [: root s" ro/new" CREATE-DIRECTORY-AT drop ;]
          [: FS:ERRNO CAUGHT ! s" root/ro" ALLOW ;] finally
@@ -1229,8 +1229,8 @@ variable RAISED-ERRNO
    s" existing_directory_denied_gives_its_entry" T-LABEL
    ROOT-USER? if exit then
    s" root" MKDIR s" root/held" MKDIR
-   s" root" AT MODE-0700 FS:CHMOD-MODE
-   s" root/held" AT MODE-0300 FS:CHMOD-MODE
+   s" root" AT >str MODE-0700 FS:CHMOD-MODE
+   s" root/held" AT >str MODE-0300 FS:CHMOD-MODE
    s" root" AT FS:OPEN-DIR {: root:fd :}
    [: [: [: root s" held" CREATE-DIRECTORY-AT drop ;]
          [: FS:ERRNO CAUGHT ! s" root/held" ALLOW ;] finally
@@ -1463,8 +1463,8 @@ FS:PATHZ-CAP BUFFER: JOINED
    s" dir" AT FS:MAKE-DIR
    s" dir/file.txt" AT s" bytes" FS:WRITE-ALL
    s" file.txt" AT s" bytes" FS:WRITE-ALL
-   s" missing" s" dangling" AT FS:MAKE-SYMLINK
-   s" dir" s" linked" AT FS:MAKE-SYMLINK
+   s" missing" >str s" dangling" AT >str FS:MAKE-SYMLINK
+   s" dir" >str s" linked" AT >str FS:MAKE-SYMLINK
    s" denied" AT FS:MAKE-DIR ;
 
 : EXISTS ( fd ^u8 n bool -- )
@@ -1486,9 +1486,9 @@ FS:PATHZ-CAP BUFFER: JOINED
 \ Rust's deny_all_access, then allow_owner_access whatever the probe did.
 : DENIED ( fd -- )
    {: root:fd :}
-   s" denied" AT 0 FS:CHMOD-MODE
+   s" denied" AT >str 0 FS:CHMOD-MODE
    [: root s" denied/file.txt" false EXISTS ;]
-   [: s" denied" AT MODE-0700 FS:CHMOD-MODE ;] finally ;
+   [: s" denied" AT >str MODE-0700 FS:CHMOD-MODE ;] finally ;
 
 : ENTRY-EXISTENCE-NEVER-FOLLOWS-SYMLINKS-AND-TREATS-PROBE-FAILURES-AS-UNCONFIRMED
    ( -- )
@@ -1571,7 +1571,7 @@ SHA256-CTX-BYTES BUFFER: PART
       {: at:n :}
       u at - DROPBOX:BLOCK min {: k:n :}
       PART a at + k DIGEST SHA256-IN
-      WHOLE DIGEST 32 SHA256-FEED
+      WHOLE DIGEST 32 >str SHA256-FEED
       at k +
    repeat drop
    WHOLE DIGEST SHA256-END DIGEST HEX SHA256>HEX
@@ -1708,9 +1708,9 @@ FS:PATHZ-CAP BUFFER: LOG-AT
 : ONE-XATTR-LINE ( fd ^u8 n -- )
    {: f:fd p:^ u:n :}
    [: [: f p u MARK ;] LOCAL:E-IO TTHROWSQ FS:ERRNO FS:EEXIST T= ;]
-   LOG-PATH AR @ STDERR:CAPTURING {: code:n e:^ n:n :}
+   LOG-PATH >str AR @ STDERR:CAPTURING str> {: code:n e:^ n:n :}
    code 0<> if code throw then
-   e n 10 COUNT-CHAR 1 T=
+   e n >str 10 COUNT-CHAR 1 T=
    e n s" xattr: fsetxattr" CONTAINS? TTRUE ;
 
 : MARKER-CHECKS ( fd -- )
@@ -1815,7 +1815,7 @@ FS:PATHZ-CAP BUFFER: LOG-AT
 
 \ The entry's file type bits, 0 when nothing is there.
 : KIND ( ^u8 n -- n )
-   FS:TRY-LSTAT 0= if 0 exit then
+   >str FS:TRY-LSTAT 0= if 0 exit then
    FS:STAT-MODE@ FS:S-IFMT and ;
 
 64 BUFFER: CONTENTS-BUF
@@ -1860,7 +1860,7 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    {: corrupt:DROPBOX:hash directory:DROPBOX:hash link:DROPBOX:hash :}
    corrupt STAGE-PATH s" different bytes" FS:WRITE-ALL
    directory STAGE-PATH FS:MAKE-DIR
-   s" root/retained" AT HOLD link STAGE-PATH FS:MAKE-SYMLINK
+   s" root/retained" AT HOLD >str link STAGE-PATH >str FS:MAKE-SYMLINK
    s" staging/unrecognized" s" leave me" PUT-FILE ;
 
 : COLLECTION-CHECKS
@@ -1903,7 +1903,7 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    {: name:^ nu:n want:DROPBOX:hash :}
    [: name nu want UPLOAD-STAGE UPLOAD-OUTCOME$ HOLD
       want STAGE-PATH T$= s" destination-occupied" T$= ;]
-   LOG-PATH AR @ STDERR:CAPTURING nip {: code:n n:n :}
+   LOG-PATH >str AR @ STDERR:CAPTURING str> nip {: code:n n:n :}
    code 0<> if code throw then
    n 0 T= ;
 
@@ -2093,8 +2093,8 @@ variable FILES
    0 LEASED-COUNT !
    5 0 ?do i POOL-LEASE loop
    LEASED-COUNT @ 4 T=
-   0 FILES ! ROOT$ [: 2drop 1 FILES +! ;] FS:WALK-FILES FILES @ 4 T=
-   4 0 ?do i SLOT-AT FS:FILE? TTRUE loop ;
+   0 FILES ! ROOT$ >str [: str> 2drop 1 FILES +! ;] FS:WALK-FILES FILES @ 4 T=
+   4 0 ?do i SLOT-AT >str FS:FILE? TTRUE loop ;
 
 : DOWNLOAD-SLOT-POOL-HAS-FOUR-FIXED-PATHS-WITHOUT-OVERFLOW ( -- )
    s" download_slot_pool_has_four_fixed_paths_without_overflow" T-LABEL
@@ -2121,7 +2121,7 @@ variable FILES
 \ The slot is empty and carries the binding at offset 0.
 : EMPTY-SLOT ( fd n LOCAL:binding -- )
    {: root:fd slot:n b:LOCAL:binding :}
-   slot SLOT-AT FS:FILE-SIZE 0 T=
+   slot SLOT-AT >str FS:FILE-SIZE 0 T=
    root slot LOCAL:DOWNLOAD-SLOT-NAME b 0 STATE-AT ;
 
 \ A one-slot lease has no empty form to free a stale slot with, so a
@@ -2174,7 +2174,7 @@ variable SLOT-PATH-U
 \ Rust's before_reset here: the slot moves to held-slot and a new file
 \ takes its name.
 : SWAP-SLOT ( -- )
-   SLOT$ AT2 s" held-slot" AT FS:RENAME-FILE
+   SLOT$ AT2 >str s" held-slot" AT >str FS:RENAME-FILE
    SLOT$ AT s" replacement" FS:WRITE-ALL ;
 
 : EXPECTED ( -- DROPBOX:hash ) s" expected bytes" HASH-OF ;
@@ -2196,7 +2196,7 @@ variable SLOT-PATH-U
    opened TTRUE
    [: f root b SWAP-RESET TFALSE ;] [: f FS:CLOSE-DIR ;] finally
    SLOT$ AT s" replacement" HOLDS
-   s" held-slot" AT FS:FILE-SIZE 0 T=
+   s" held-slot" AT >str FS:FILE-SIZE 0 T=
    root s" held-slot" b 0 STATE-AT
    root s" held-slot" OPEN-AT {: moved:fd :}
    [: moved TARGET EXPECTED AR @ LOCAL:STAGE-MARKER s" held-slot"
@@ -2287,7 +2287,7 @@ variable REMAINING
    cut REMAINING !
    [: x TOTAL [: FAILING ;] AR @ LOCAL:APPEND-PARTIAL DROP-OUTCOME ;]
    LOCAL:E-STAGE-READ TTHROWSQ
-   p u FS:FILE-SIZE written T=
+   p u >str FS:FILE-SIZE written T=
    root BOUNDARY c lease DOWNLOAD-PREPARE LOCAL:READY-PARTIAL {: y :}
    y LOCAL:PARTIAL-OFFSET@ durable T=
    y LOCAL:PARTIAL-FILE SIZE-OF durable T=
@@ -2398,7 +2398,7 @@ variable REMAINING
 \ takes its name.
 : SWAP-PARTIAL ( ^u8 n -- )
    {: p:^ u:n :}
-   p u s" held-slot" AT FS:RENAME-FILE
+   p u >str s" held-slot" AT >str FS:RENAME-FILE
    p u s" replacement" FS:WRITE-ALL ;
 
 : SWAPPED-PROMOTION ( fd -- )
@@ -2414,7 +2414,7 @@ variable REMAINING
    [: x LOCAL:CLOSE-PARTIAL ;] finally
    p u s" replacement" HOLDS
    s" held-slot" AT b bu HOLDS
-   x LOCAL:PARTIAL-STAGE-PATH FS:TRY-LSTAT TFALSE ;
+   x LOCAL:PARTIAL-STAGE-PATH >str FS:TRY-LSTAT TFALSE ;
 
 : COMPLETED-PARTIAL-PROMOTION-PRESERVES-A-SWAPPED-REPLACEMENT ( -- )
    s" completed_partial_promotion_preserves_a_swapped_replacement" T-LABEL
@@ -2423,16 +2423,16 @@ variable REMAINING
 \ The errno is read before the sync root is writable again.
 : REFUSED-PROMOTION ( ^LOCAL:download-partial -- )
    {: x :}
-   [: [: x [: SYNC$ LOCAL:MODE-0500 FS:CHMOD-MODE ;] AR @
+   [: [: x [: SYNC$ >str LOCAL:MODE-0500 FS:CHMOD-MODE ;] AR @
          LOCAL:PROMOTE-WITH DROP-OUTCOME ;]
-      [: FS:ERRNO LOCAL:CAUGHT ! SYNC$ MODE-0700 FS:CHMOD-MODE ;]
+      [: FS:ERRNO LOCAL:CAUGHT ! SYNC$ >str MODE-0700 FS:CHMOD-MODE ;]
       finally ;] LOCAL:E-IO TTHROWSQ ;
 
 \ The slot is in the case directory and the stage in the sync root.
 : REFUSED-PROMOTION-LOGS ( ^LOCAL:download-partial -- )
    {: x :}
    [: x REFUSED-PROMOTION ;]
-   LOG-PATH AR @ STDERR:CAPTURING {: code:n e:^ u:n :}
+   LOG-PATH >str AR @ STDERR:CAPTURING str> {: code:n e:^ u:n :}
    code 0<> if code throw then
    LOCAL:CAUGHT @ FS:EACCES T=
    e u 1 LOCAL:LOGGED
@@ -2466,7 +2466,7 @@ variable REMAINING
    x AR @ LOCAL:MARK-PARTIAL
    [: x AR @ LOCAL:COPY-PARTIAL OUTCOME$ s" " T$= s" staged" T$= ;]
    [: x LOCAL:CLOSE-PARTIAL ;] finally
-   x LOCAL:PARTIAL-PATH FS:FILE-SIZE 0 T=
+   x LOCAL:PARTIAL-PATH >str FS:FILE-SIZE 0 T=
    x b bu STAGE-HOLDS
    root c b bu INSTALLS ;
 
@@ -2497,7 +2497,7 @@ variable REMAINING
    x LOCAL:PARTIAL-PATH {: p:^ u:n :}
    x LOCAL:CLOSE-PARTIAL
    root TARGET c lease DOWNLOAD-PREPARE s" already-staged" PREPARED-AS
-   p u FS:FILE-SIZE 0 T=
+   p u >str FS:FILE-SIZE 0 T=
    root TARGET c lease DOWNLOAD-PREPARE s" already-staged" PREPARED-AS
    root c b bu INSTALLS ;
 
@@ -2517,7 +2517,7 @@ variable REMAINING
    RESTARTABLE {: x :}
    x LOCAL:PARTIAL-PATH {: p:^ u:n :}
    x LOCAL:RESTART-PARTIAL RESTARTED-EMPTY
-   p u FS:FILE-SIZE 0 T= ;
+   p u >str FS:FILE-SIZE 0 T= ;
 
 \ A replacement swapped in for the slot keeps its bytes, and so does the
 \ slot.
@@ -2534,10 +2534,10 @@ variable REMAINING
 : RESTART-DENIED ( fd -- )
    LOCAL:ROOT-USER? if drop exit then
    RESTARTABLE {: x :}
-   ROOT$ 0 FS:CHMOD-MODE
+   ROOT$ >str 0 FS:CHMOD-MODE
    [: [: x LOCAL:RESTART-PARTIAL DOWNLOAD-PREPARATION$ 2drop 2drop ;]
       LOCAL:E-IO TTHROWSQ ;]
-   [: ROOT$ MODE-0700 FS:CHMOD-MODE ;] finally ;
+   [: ROOT$ >str MODE-0700 FS:CHMOD-MODE ;] finally ;
 
 : RESTARTED-PARTIAL-IS-EMPTY-OR-FAILS ( -- )
    s" restarted partial is empty or fails" T-LABEL
@@ -2613,7 +2613,7 @@ variable REMAINING
    {: root:fd :}
    root TARGET STAGE-REMOTE
    TARGET STAGE-NAME$ {: sn:^ snu:n :}
-   sn snu AT FS:MODE-PRIVATE-FILE FS:CHMOD-MODE
+   sn snu AT >str FS:MODE-PRIVATE-FILE FS:CHMOD-MODE
    root sn snu OPEN-WRITE-AT {: w:fd :}
    [: root ROOT$ TARGET WANT AR @ w LOCAL:INSTALL-RENAME-MUTATED ;]
    [: w FS:CLOSE-DIR ;] finally
@@ -2706,7 +2706,7 @@ variable REMAINING
    root TARGET NO-CONTENT INSTALL s" " T$= s" installed" T$=
    TARGET READ$ s" remote" T$=
    root TARGET STAGE-NAME$ LOCAL:ENTRY-EXISTS-AT TFALSE
-   TARGET AT FS:TRY-LSTAT TTRUE
+   TARGET AT >str FS:TRY-LSTAT TTRUE
    FS:STAT-MODE@ $1FF and FS:MODE-PRIVATE-FILE T=
    root TARGET NO-CONTENT INSTALL s" " T$= s" already-installed" T$= ;
 
@@ -2756,10 +2756,10 @@ variable REMAINING
    LOCAL:ROOT-USER? if exit then
    s" denied.txt" STAGE-NAME$ {: sn:^ snu:n :}
    sn snu s" mutant" PUT-FILE
-   sn snu AT 0 FS:CHMOD-MODE
+   sn snu AT >str 0 FS:CHMOD-MODE
    [: root s" denied.txt" NO-CONTENT INSTALL
       sn snu AT T$= s" stage-destination-occupied" T$= ;]
-   [: sn snu AT MODE-0700 FS:CHMOD-MODE ;] finally
+   [: sn snu AT >str MODE-0700 FS:CHMOD-MODE ;] finally
    sn snu READ$ s" mutant" T$= ;
 
 \ Rust's inspect_download_stage throws for both.
@@ -2850,7 +2850,7 @@ variable ENTRIES
 
 : INODE ( fd -- n ) FS:FD-STAT FS:STAT-INO@ ;
 
-: PATH-INODE ( ^u8 n -- n ) AT FS:TRY-LSTAT TTRUE FS:STAT-INO@ ;
+: PATH-INODE ( ^u8 n -- n ) AT >str FS:TRY-LSTAT TTRUE FS:STAT-INO@ ;
 
 : SAME-ADDRESS ( ^u8 ^u8 -- )
    {: a:^ b:^ :}
@@ -2882,7 +2882,7 @@ variable ENTRIES
 
 : EXISTING-PARENT ( fd -- )
    {: root:fd :}
-   s" a/b" AT FS:MAKE-DIRS
+   s" a/b" AT >str FS:MAKE-DIRS
    root s" a/b/file" false s" file" s" a/b" PARENT {: f:fd :}
    f INODE s" a/b" PATH-INODE T=
    f FS:CLOSE-DIR ;
@@ -2898,7 +2898,7 @@ variable ENTRIES
 : PRIVATE-DIR ( ^u8 n -- )
    {: p:^ u:n :}
    p u T-LABEL
-   p u AT FS:TRY-LSTAT TTRUE
+   p u AT >str FS:TRY-LSTAT TTRUE
    FS:STAT-MODE@ FS:S-IFMT and FS:S-IFDIR T=
    FS:STAT-MODE@ $1FF and MODE-0700 T= ;
 
@@ -2913,7 +2913,7 @@ variable ENTRIES
 : SYMLINK-PARENT ( fd -- )
    {: root:fd :}
    s" real" AT FS:MAKE-DIR
-   s" real" s" link" AT FS:MAKE-SYMLINK
+   s" real" >str s" link" AT >str FS:MAKE-SYMLINK
    s" link/sub/file" T-LABEL
    [: root s" link/sub/file" true TRY-PARENT ;] LOCAL:E-IO TTHROWSQ
    FS:ERRNO FS:ENOTDIR T=
@@ -2981,7 +2981,7 @@ variable ENTRIES
 \ The bytes of the file at the name below the case directory.
 : BYTES ( ^u8 n -- ^u8 n ) AT BACK 64 FS:READ-ALL BACK swap ;
 
-: PRESENT? ( ^u8 n -- bool ) AT FS:TRY-LSTAT ;
+: PRESENT? ( ^u8 n -- bool ) AT >str FS:TRY-LSTAT ;
 
 : DELETE-REPLAY ( fd -- )
    {: root:fd :}
@@ -3017,7 +3017,7 @@ variable ENTRIES
    TARGET s" new" PUT-FILE
    root DELETE s" new" IDENTITY T$= s" precondition-changed" T$=
    TARGET BYTES s" new" T$=
-   TARGET AT FS:REMOVE-FILE
+   TARGET AT >str FS:REMOVE-FILE
    root GUARD-RESTORED ;
 
 \ precondition-changed with none needs the guard to vanish between its
@@ -3180,7 +3180,7 @@ variable ENTRIES
    s" already present" T-LABEL
    root s" remote" MATERIALIZED COPY-PATH T$= s" already-present" T$=
    s" content changed" T-LABEL
-   COPY-PATH AT FS:REMOVE-FILE
+   COPY-PATH AT >str FS:REMOVE-FILE
    root s" mutant" MATERIALIZED s" mutant" IDENTITY T$=
    s" content-changed" T$=
    COPY-PATH PRESENT? TFALSE
@@ -3223,7 +3223,7 @@ variable ENTRIES
    RECOVERY BYTES s" mutant" T$=
    LOCAL:ROOT-USER? if exit then
    s" unreadable copy" T-LABEL
-   RECOVERY AT 0 FS:CHMOD-MODE
+   RECOVERY AT >str 0 FS:CHMOD-MODE
    root LOCAL:E-UNREADABLE COPY-FAILS ;
 
 : EACH-RECOVERY-COPY-OUTCOME-IS-REACHED ( -- )
@@ -3260,12 +3260,12 @@ FS:PATHZ-CAP BUFFER: SLOT-FILE-BUF
    {: slot:n :}
    PHYSICAL$ s" omabox/upload-staging" STAGING-BUF FS:JOIN-PATH {: k:n :}
    STAGING-BUF k slot LOCAL:DOWNLOAD-SLOT-NAME SLOT-FILE-BUF FS:JOIN-PATH
-   SLOT-FILE-BUF swap FS:FILE? ;
+   SLOT-FILE-BUF swap >str FS:FILE? ;
 
 \ Rust's test's config: its state home a link to physical-state.
 : LINKED-CONFIG ( -- ^CONFIG:config )
    s" physical-state" AT FS:MAKE-DIR
-   s" physical-state" AT HOLD s" state-link" AT FS:MAKE-SYMLINK
+   s" physical-state" AT HOLD >str s" state-link" AT >str FS:MAKE-SYMLINK
    s" Dropbox" AT FS:MAKE-DIR
    s" config" CASE-PATH s" state-link" CASE-PATH AR @ CONFIG:XDG-NEW
    s" Dropbox" AT HOLD >str s" test-app-key" >str AR @ CONFIG:FROM-VALUES ;
@@ -3320,7 +3320,7 @@ FS:PATHZ-CAP BUFFER: SLOT-FILE-BUF
 
 : RETRIED-RENAME ( fd -- )
    {: root:fd :}
-   DESTINATION AT FS:REMOVE-FILE
+   DESTINATION AT >str FS:REMOVE-FILE
    root RENAME-VARIANT s" renamed" T$=
    CREDIT PRESENT? TFALSE
    s" credit (case variant)/receipt.pdf" BYTES s" receipt" T$=
@@ -3364,7 +3364,7 @@ FS:PATHZ-CAP BUFFER: SLOT-FILE-BUF
 : PARENT-LIMIT ( fd -- )
    {: root:fd :}
    root s" missing/c" LOCAL:PARENT-NAME-MAX NAME-MAX-OF TFALSE drop
-   s" a/b" AT FS:MAKE-DIRS
+   s" a/b" AT >str FS:MAKE-DIRS
    root s" a/b/c" LOCAL:PARENT-NAME-MAX NAME-MAX-OF TTRUE
    root FS:FD-NAME-MAX T= ;
 

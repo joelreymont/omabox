@@ -226,8 +226,8 @@ private
    d s" stderr.txt" ar INSIDE str> {: e:^ eu:n :}
    e eu STDERR:CAPTURE
    [: q execute ;] [: STDERR:;CAPTURE ;] finally
-   e eu FS:FILE-SIZE 0 T=
-   e eu FS:REMOVE-FILE ;
+   e eu >str FS:FILE-SIZE 0 T=
+   e eu >str FS:REMOVE-FILE ;
 
 
 \ ---- plans ---------------------------------------------------------
@@ -432,7 +432,7 @@ create TIMES 32 allot
 
 \ The file's modification time set to the epoch, its access time kept.
 : MODIFIED-AT-EPOCH ( ^u8 n -- )
-   FS:>PATHZ {: z:^ :}
+   >str FS:>PATHZ {: z:^ :}
    0 TIMES ! UTIME-OMIT TIMES 8 + ! 0 TIMES 16 + ! 0 TIMES 24 + !
    AT-FDCWD z TIMES 0 UTIMENSAT-CALL 0 T= ;
 
@@ -484,9 +484,9 @@ create TIMES 32 allot
    j rec ar RETAINED-START REPLAY:COMPLETED-RECOVERY-RETENTION +
    {: boundary:n :}
    j r str> boundary 1- REPLAY:PRUNE-COMPLETED-RECOVERIES-AT 0 T=
-   rec COPY-PATH$ FS:FILE? TTRUE
+   rec COPY-PATH$ >str FS:FILE? TTRUE
    j r str> boundary REPLAY:PRUNE-COMPLETED-RECOVERIES-AT 1 T=
-   rec COPY-PATH$ FS:EXISTS? TFALSE
+   rec COPY-PATH$ >str FS:EXISTS? TFALSE
    j rec FORGOTTEN
    j JOURNAL:CLOSE
    d GONE ;
@@ -546,11 +546,11 @@ create TIMES 32 allot
    orphan str> s" unknown bytes" FS:WRITE-ALL
    j r str> epoch-seconds REPLAY:COMPLETED-RECOVERY-RETENTION +
    REPLAY:PRUNE-COMPLETED-RECOVERIES-AT 0 T=
-   pending COPY-PATH$ FS:FILE? TTRUE
-   blocked COPY-PATH$ FS:FILE? TTRUE
-   corrupt COPY-PATH$ FS:FILE? TTRUE
+   pending COPY-PATH$ >str FS:FILE? TTRUE
+   blocked COPY-PATH$ >str FS:FILE? TTRUE
+   corrupt COPY-PATH$ >str FS:FILE? TTRUE
    nonregular COPY-PATH$ FS:DIR? TTRUE
-   orphan str> FS:FILE? TTRUE
+   orphan FS:FILE? TTRUE
    j pending corrupt nonregular ar ELIGIBLE-KEPT
    j JOURNAL:CLOSE
    d GONE ;
@@ -569,10 +569,10 @@ create TIMES 32 allot
    ( JOURNAL:journal str str JOURNAL:recovery-record ^ARENA:arena
      -- )
    {: j d:str r:str locked ar :}
-   locked COPY-PATH$ 0 FS:CHMOD-MODE
+   locked COPY-PATH$ >str 0 FS:CHMOD-MODE
    [: d [: j r str> epoch-seconds REPLAY:COMPLETED-RECOVERY-RETENTION +
       REPLAY:PRUNE-COMPLETED-RECOVERIES-AT 1 T= ;] ar QUIETLY ;]
-   [: locked COPY-PATH$ FS:MODE-PRIVATE-FILE FS:CHMOD-MODE ;] finally ;
+   [: locked COPY-PATH$ >str FS:MODE-PRIVATE-FILE FS:CHMOD-MODE ;] finally ;
 
 : RETENTION-KEEPS-AN-UNREADABLE-PAYLOAD ( ^ARENA:arena -- )
    {: ar :}
@@ -583,8 +583,8 @@ create TIMES 32 allot
    j r s" locked.txt" s" locked bytes" ar VERIFIED {: locked :}
    j r s" verified.txt" s" verified bytes" ar VERIFIED {: verified :}
    j d r locked ar PRUNE-LOCKED
-   locked COPY-PATH$ FS:FILE? TTRUE
-   verified COPY-PATH$ FS:EXISTS? TFALSE
+   locked COPY-PATH$ >str FS:FILE? TTRUE
+   verified COPY-PATH$ >str FS:EXISTS? TFALSE
    j verified FORGOTTEN
    j ar JOURNAL:COMPLETED-RECOVERIES {: kept :}
    kept VEC:COUNT 1 T=
@@ -602,7 +602,7 @@ create TIMES 32 allot
    j r s" interrupted.txt" s" deleted before retry"
    s" deleted before retry" ar WRITTEN {: plan rec :}
    j plan rec ar COMPLETE-RECOVERY-AND-PLAN
-   rec COPY-PATH$ FS:REMOVE-FILE
+   rec COPY-PATH$ >str FS:REMOVE-FILE
    j r str> epoch-seconds REPLAY:PRUNE-COMPLETED-RECOVERIES-AT 1 T=
    j rec FORGOTTEN
    j JOURNAL:CLOSE
@@ -699,9 +699,9 @@ create TIMES 32 allot
    j root ar REPLAYED {: r :}
    r COMPLETED 2 T=
    r BLOCKS VEC:COUNT 0 T=
-   f str> FS:EXISTS? TFALSE
+   f FS:EXISTS? TFALSE
    \ An empty root removes: no copy was made in it.
-   root str> FS:REMOVE-DIR
+   root FS:REMOVE-DIR
    j ar JOURNAL:PENDING-RECOVERIES VEC:COUNT 0 T=
    j ar JOURNAL:PENDING-PLANS VEC:COUNT 0 T=
    j JOURNAL:CLOSE
@@ -727,7 +727,7 @@ create TIMES 32 allot
    j s" taken.txt" ops ar RECORD-OPS
    j s" made" ar RECORD
    d [: j root ar REPLAYED TAKEN-BLOCKED ;] ar QUIETLY
-   root s" made" ar INSIDE str> FS:EXISTS? TTRUE
+   root s" made" ar INSIDE FS:EXISTS? TTRUE
    j s" made" DISPLAY ar JOURNAL:BASELINE DIRECTORY? TTRUE
    j ar JOURNAL:PENDING-PLANS s" taken.txt" ONLY-AT
    j JOURNAL:CLOSE
@@ -811,10 +811,10 @@ $140 constant MODE-NO-WRITE
 : UNREADABLE-COPY ( str ^LOCAL:staged-upload str ^ARENA:arena -- )
    {: r:str up c:str ar :}
    c str> s" other bytes" FS:WRITE-ALL
-   c str> 0 FS:CHMOD-MODE
+   c 0 FS:CHMOD-MODE
    [: r s" notes.txt" up ar LOCAL-COPY$ BLOCKED-OCCUPIED ;]
-   [: c str> FS:MODE-PRIVATE-FILE FS:CHMOD-MODE ;] finally
-   c str> FS:REMOVE-FILE ;
+   [: c FS:MODE-PRIVATE-FILE FS:CHMOD-MODE ;] finally
+   c FS:REMOVE-FILE ;
 
 : ONLY-AN-OBJECT-AT-THE-COPY-NAME-OCCUPIES-IT ( ^ARENA:arena -- )
    {: ar :}
@@ -825,7 +825,7 @@ $140 constant MODE-NO-WRITE
    c str> FS:MAKE-DIR
    d [: r s" notes.txt" up ar LOCAL-COPY$ BLOCKED-OCCUPIED ;] ar
    QUIETLY
-   c str> FS:REMOVE-DIR
+   c FS:REMOVE-DIR
    r up c ar UNREADABLE-COPY
    r s" notes.d" ar INSIDE str> FS:MAKE-DIR
    r s" notes.txt" up ar LOCAL-COPY$ s" " T$= s" ready" T$=
@@ -848,9 +848,9 @@ $140 constant MODE-NO-WRITE
    r s" dir" ar INSIDE {: dir:str :}
    dir str> FS:MAKE-DIR
    r s s" dir/notes.txt" ar STAGED {: up :}
-   dir str> MODE-NO-WRITE FS:CHMOD-MODE
+   dir MODE-NO-WRITE FS:CHMOD-MODE
    [: r up ar DENIED-COPY ;]
-   [: dir str> FS:MODE-PRIVATE-DIR FS:CHMOD-MODE ;] finally
+   [: dir FS:MODE-PRIVATE-DIR FS:CHMOD-MODE ;] finally
    d GONE ;
 
 
@@ -1207,12 +1207,12 @@ $140 constant MODE-NO-WRITE
 \ in the arena.
 : LOGGED ( str [ -- ] ^ARENA:arena -- ^u8 n )
    {: d:str q ar :}
-   q d s" stderr.txt" ar INSIDE str> ar STDERR:CAPTURING
+   q d s" stderr.txt" ar INSIDE ar STDERR:CAPTURING str>
    {: code:n t:^ u:n :}
    code 0<> if code throw then
    t u ;
 
-: LINE-COUNT ( ^u8 n -- n ) 10 COUNT-CHAR ;
+: LINE-COUNT ( ^u8 n -- n ) >str 10 COUNT-CHAR ;
 
 \ A probe Dropbox fails 503 ends the pass; Rust reads the path back.
 : PROBE-UNREACHED ( ^REPLAY:link ^ARENA:arena -- )
@@ -2108,13 +2108,13 @@ variable HELD
 : SAME-FILE? ( ^u8 n n n -- bool )
    {: nm:^ nu:n dev:n ino:n :}
    SB-RESET s" /proc/self/fd/" SB-APPEND nm nu SB-APPEND
-   SB$ FS:TRY-STAT 0= if false exit then
+   SB$ >str FS:TRY-STAT 0= if false exit then
    FS:STAT-DEV@ dev = FS:STAT-INO@ ino = and ;
 
 \ How many of this process's descriptors hold the file at p.
 : HOLDERS ( ^u8 n -- n )
    {: p:^ u:n :}
-   p u FS:TRY-STAT TTRUE
+   p u >str FS:TRY-STAT TTRUE
    FS:STAT-DEV@ FS:STAT-INO@ {: dev:n ino:n :}
    0 HELD !
    s" /proc/self/fd" TEXT CAP FS-LIST:NAMES {: k:n :}
@@ -2126,7 +2126,7 @@ variable HELD
 : STAGE-HASH ( str ^ARENA:arena -- DROPBOX:hash )
    {: r:str ar :}
    r str> TEXT CAP FS-LIST:NAMES {: u:n :}
-   r TEXT u ar INSIDE str> FS:OPEN-SIZED TTRUE drop {: f:fd :}
+   r TEXT u ar INSIDE FS:OPEN-SIZED TTRUE drop {: f:fd :}
    f ar LOCAL:DROPBOX-CONTENT-HASH f FS:CLOSE-DIR ;
 
 \ A reader of the pipe's bytes into LOCAL.
@@ -2149,7 +2149,7 @@ variable HELD
 \ The race client's store: it runs while DOWNLOAD's call is in flight,
 \ after the bridge found no stage, and the verified stage reappears.
 : RETURNED ( ^u8 n -- )
-   2drop ASIDE @ str> STAGE-AT @ str> FS:RENAME-FILE ;
+   2drop ASIDE @ STAGE-AT @ FS:RENAME-FILE ;
 
 : NO-CONTENT ( -- option<DROPBOX:hash> ) OPTION:NONE ;
 
@@ -2194,7 +2194,7 @@ variable HELD
    r str> TEXT CAP FS-LIST:NAMES {: u:n :}
    r TEXT u ar INSIDE STAGE-AT !
    d s" aside" ar INSIDE ASIDE !
-   STAGE-AT @ str> ASIDE @ str> FS:RENAME-FILE ;
+   STAGE-AT @ ASIDE @ FS:RENAME-FILE ;
 
 \ A fresh client refreshes its token first, and stores the rotated
 \ refresh token through RETURNED.
@@ -2260,7 +2260,7 @@ variable HELD
    root r s" lost.txt" rem l ar STOPPED
    d ar SLOT-PATH {: slot:str :}
    slot str> HOLDERS 0 T=
-   slot str> FS:FILE-SIZE 0 T=
+   slot FS:FILE-SIZE 0 T=
    root r s" lost.txt" rem l ar STAGED-AT s" staged" AS
    TEST-DROPBOX:RANGE-SENT? TFALSE
    2 SEEN
@@ -2320,7 +2320,7 @@ variable HELD
    TEST-DROPBOX:LOSE
    root r s" restart.bin" rem l ar STOPPED
    slot str> HOLDERS 0 T=
-   slot str> FS:FILE-SIZE CHECKPOINT T=
+   slot FS:FILE-SIZE CHECKPOINT T=
    RESUMED-RANGE
    s" restart-revision" ASKED-REV
    root r s" restart.bin" rem l ar STAGED-AT s" staged" AS
@@ -2341,8 +2341,8 @@ variable HELD
    d [: [: root r s" resume.bin" rem l ar STAGED-AT DROP-STAGE ;]
       REPLAY:E-DROPBOX TTHROWSQ ;] ar LOGGED LINE-COUNT 1 T=
    LINK REPLAY-LINK:REPLY @ DROPBOX-ERROR:UNVERIFIED REFUSAL? TTRUE
-   d ar SLOT-PATH str> FS:FILE-SIZE CHECKPOINT T=
-   r s" resume.bin" ar INSIDE str> FS:TRY-STAT TFALSE
+   d ar SLOT-PATH FS:FILE-SIZE CHECKPOINT T=
+   r s" resume.bin" ar INSIDE FS:TRY-STAT TFALSE
    RESUMED-RANGE s" resume-revision" ASKED-REV ;
 
 \ Rust's eight bad answers in its order: a 200 with no range or body, a
@@ -2382,7 +2382,7 @@ variable HELD
    d ar SLOT-PATH {: slot:str :}
    TEST-DROPBOX:LOSE
    root r s" resume.bin" rem l ar STOPPED
-   slot str> FS:FILE-SIZE CHECKPOINT T=
+   slot FS:FILE-SIZE CHECKPOINT T=
    s" resume-revision" ASKED-REV
    root d r rem l c ar BAD-RESUMES
    root r s" resume.bin" rem l ar STAGED-AT s" staged" AS
@@ -2484,7 +2484,7 @@ variable HELD
    k str> FS:MAKE-DIR
    d [: r s" notes.txt" rem ar REMOTE-COPY$ BLOCKED-OCCUPIED ;] ar
    QUIETLY
-   k str> FS:REMOVE-DIR
+   k FS:REMOVE-DIR
    k str> s" other bytes" FS:WRITE-ALL
    d [: r s" notes.txt" rem ar REMOTE-COPY$ BLOCKED-OCCUPIED ;] ar
    QUIETLY
@@ -2528,7 +2528,7 @@ variable HELD
    r OPEN-ROOT {: root:fd :}
    root r s" moved.txt" s" notes.txt" rem ar COPY-AT$ s" ready" T$=
    r s" moved.txt" THEIRS ar HOLDS
-   r s" notes.txt" ar INSIDE str> FS:TRY-STAT TFALSE
+   r s" notes.txt" ar INSIDE FS:TRY-STAT TFALSE
    r s" taken.txt" ar INSIDE str> s" other bytes" FS:WRITE-ALL
    root r s" taken.txt" s" notes.txt" rem ar COPY-AT$
    s" destination-changed" T$=
@@ -2695,7 +2695,7 @@ ARENA FILE-CASES file-case
    {: c p:^ pu:n b:^ bu:n there:bool ar :}
    c FILE-CASE-ROOT @ {: r:str :}
    there if r p pu b bu ar HOLDS exit then
-   r p pu ar INSIDE str> FS:TRY-STAT TFALSE ;
+   r p pu ar INSIDE FS:TRY-STAT TFALSE ;
 
 \ The case's local copy holds the upload when l is set, and its
 \ remote copy THEIRS when m is set; an unset one is not on disk.
@@ -2865,7 +2865,7 @@ ARENA FILE-CASES file-case
    o c s" blocked durable-plan conflict-copy-occupied blocked 0" s" "
    ar ARMED
    c FILE-CASE-JOURNAL @ s" conflict-copy-occupied" ar HELD-AS drop
-   t str> FS:REMOVE-DIR
+   t FS:REMOVE-DIR
    c l false ar COPIES
    c ENDED ;
 
@@ -3220,7 +3220,7 @@ ARENA FILE-CASES file-case
    j r s ar REMOTE-REPLAYED COMPLETED 1 T=
    RUNTIME @ ar S\" \qlast_error\q:null" SHOWS
    \ An empty directory removes: nothing was put in it.
-   rec str> FS:REMOVE-DIR
+   rec FS:REMOVE-DIR
    j ar JOURNAL:PENDING-RECOVERIES VEC:COUNT 0 T=
    j ar JOURNAL:COMPLETED-RECOVERIES VEC:COUNT 0 T=
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2" T$= ;
@@ -3316,7 +3316,7 @@ ARENA FILE-CASES file-case
 variable SIDES
 
 : SIDE? ( ^u8 n -- )
-   s" .omabox-conflict-" STARTS-WITH? if 1 SIDES +! then ;
+   >str s" .omabox-conflict-" >str STARTS-WITH? if 1 SIDES +! then ;
 
 \ Rust's conflict_bytes: how many conflict copies the root r holds.
 : SIDES-IN ( str -- n )
@@ -3431,16 +3431,16 @@ variable SIDES
    s" /replace.txt" ar CURRENT-AT {: cur :}
    ar UPLOAD-DIRS {: d:str r:str s:str j :}
    j r ar REPLACE-PLAN
-   r str> MODE-NO-WRITE FS:CHMOD-MODE
+   r MODE-NO-WRITE FS:CHMOD-MODE
    [: d [: j r s ar COPY-DENIED ;] ar LOGGED ;]
-   [: r str> FS:MODE-PRIVATE-DIR FS:CHMOD-MODE ;] finally {: t:^ tu:n :}
+   [: r FS:MODE-PRIVATE-DIR FS:CHMOD-MODE ;] finally {: t:^ tu:n :}
    t tu LINE-COUNT 1 T=
    t tu s" Permission denied" CONTAINS? TTRUE
    t tu r READ-ONLY-CLAUSE$ CONTAINS? TTRUE
    t tu RUNS-AS$ CONTAINS? TTRUE
    j ar JOURNAL:BLOCKED-PLANS VEC:COUNT 0 T=
    j ar JOURNAL:PENDING-PLANS VEC:COUNT 1 T=
-   r ar LOCAL-SIDE ar INSIDE str> FS:TRY-STAT TFALSE
+   r ar LOCAL-SIDE ar INSIDE FS:TRY-STAT TFALSE
    r s" replace.txt" s" new local bytes" ar HOLDS
    s" /2/files/upload /2/files/get_metadata" {: w:^ wu:n :}
    TEST-DROPBOX:SEEN$ wu min w wu T$=
@@ -3566,7 +3566,7 @@ variable SIDES
 \ under curl's loop.
 : DROPBOX-CASES ( ^ARENA:arena -- )
    {: ar :}
-   AIO:START CURL:LOOP-START CURL-READY
+   AIO:START CURL:LOOP-START
    [: TEST-DROPBOX:START
       [: ar SERVED ar BRIDGE-SERVED ;] [: TEST-DROPBOX:STOP ;] finally ;]
    [: CURL:LOOP-STOP AIO:STOP ;] finally ;

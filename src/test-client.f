@@ -40,7 +40,7 @@ package TEST-CLIENT
 public
 
 \ Ends the run: the case cannot go on.
-: FAILED ( ^u8 n -- ) T-EX-FAIL die ;
+: FAILED ( ^u8 n -- ) EXIT-STATUS:FAILURE die ;
 
 : COPIED ( ^u8 n ^ARENA:arena -- str )
    {: a:^ u ar :}
@@ -105,12 +105,6 @@ TYPED-VARIABLE MAIN ^DROPBOX:client
 : OPENED ( ^ARENA:arena -- ^DROPBOX:client )
    {: ar :}
    [: 2drop ;] s" live-token" s" " ar CLIENT-ON ;
-
-: CURL-READY ( CURL:status -- )
-   MATCH CURL:status
-      ok OF ENDOF
-      failed OF drop s" the curl loop did not start" FAILED ENDOF
-   ;MATCH ;
 
 \ The account call takes the client's first access token, so no case's
 \ requests start with a refresh.
@@ -277,8 +271,8 @@ public
 \ by /proc/self/fd/<parent>/<name>, which any depth fits; its descriptor.
 : SOCKET-AT ( ^u8 n -- fd )
    {: p:^ u:n :}
-   p u FS:BASENAME {: b:^ bu:n :}
-   p u bu - FS:OPEN-DIR-READ {: d:n :}
+   p u >str FS:BASENAME str> {: b:^ bu:n :}
+   p u bu - >str FS:OPEN-DIR-READ {: d:n :}
    SB-RESET s" /proc/self/fd/" SB-APPEND d FMT:SB-INT
    s" /" SB-APPEND b bu SB-APPEND SB$ {: q:^ qu:n :}
    qu 108 >= if d close E-FS-PATH throw then

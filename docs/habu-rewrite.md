@@ -37,8 +37,8 @@ General code goes into Habu's `src/lib`; sync policy stays here.
 - **`UTF8-LOSSY:REPAIR`:** Rust's `from_utf8_lossy`, for the paths in
   `status.json` (`src/runtime_status.rs:336`).
 
-These take a string as `^u8 n` until Habu's `str` lands; its sweep moves them
-with the rest of Habu.
+These take a string as one `str`, as the rest of Habu does, except the
+`FS-ANCHORED` words, which take `^u8 n`.
 
 SHA-256 is already in Habu core (`src/core/sha256.f`). Inotify is not added:
 the daemon rescans after each 30 s long poll, as the Rust one does, and a

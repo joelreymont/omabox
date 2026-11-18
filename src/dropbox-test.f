@@ -109,8 +109,8 @@ TYPED-VARIABLE PROBE config
    ARENA:NEW {: ar :}
    s" " ar PROBED {: c :}
    s\" {\"a\":1}" BUF:N>BLEN c CLIENT-ANSWER @ BUF:REPLACE
-   [: c [: drop ENGINE-ERROR:MEMORY-FAULT throw ;] PARSE ;]
-   ENGINE-ERROR:MEMORY-FAULT TTHROWSQ
+   [: c [: drop EXIT-STATUS:MEMORY-FAULT throw ;] PARSE ;]
+   EXIT-STATUS:MEMORY-FAULT TTHROWSQ
    c CLOSE
    ar ARENA:RELEASE ;
 
@@ -490,7 +490,7 @@ TYPED-VARIABLE OUTCOME bool
 : LOGGED ( [ -- ] -- n )
    ACTION !
    s" stderr.txt" ERR-PATH IN-TMP ERR-PATH-U !
-   ACTION @ ERR-PATH$ AR @ STDERR:CAPTURING ERR-U ! ERR ! ;
+   ACTION @ ERR-PATH$ >str AR @ STDERR:CAPTURING str> ERR-U ! ERR ! ;
 
 
 : LINES ( ^u8 n -- n )
@@ -906,7 +906,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    [: METADATA-DROPPED ;] LOGGED DROPBOX:E-TRANSPORT T=
    8 CURL:>CODE CURL:LOST? TFALSE
    SB-RESET s" error dropbox: curl files/get_metadata: " SB-APPEND
-   8 CURL:>CODE CURL:ERROR$ SB-APPEND
+   8 CURL:>CODE CURL:ERROR$ str> SB-APPEND
    SB$ LOGGED? TTRUE
    TEST-DROPBOX:SEEN$ s" /2/files/get_metadata" T$= ;
 
@@ -1017,7 +1017,7 @@ variable WIDEST
 
 : NTH? ( ^u8 n n -- bool )
    {: p:^ u:n i:n :}
-   p u s" /sync/d" STARTS-WITH? 0= if false exit then
+   p u >str s" /sync/d" >str STARTS-WITH? 0= if false exit then
    p 7 + u 7 - i FMT:INT$ STR= ;
 
 
@@ -2166,7 +2166,7 @@ TYPED-VARIABLE FAULT fault
 : STAGED ( ^u8 n ^u8 n ^u8 n -- )
    {: b:^ bu:n p:^ pu:n r:^ ru:n :}
    STAGE$ b bu FS:WRITE-ALL
-   STAGE$ FS:OPEN-SIZED STAGE$ FS:REMOVE-FILE ASSERT {: f:fd size:n :}
+   STAGE$ >str FS:OPEN-SIZED STAGE$ >str FS:REMOVE-FILE ASSERT {: f:fd size:n :}
    f UP DROPBOX-UPLOAD:FD !
    size UP DROPBOX-UPLOAD:SIZE !
    b bu HASHED EXPECTED swap BYTE-COPY
@@ -2387,7 +2387,7 @@ TYPED-VARIABLE FAULT fault
    s" stage read refused" T-LABEL
    TEST-DROPBOX:RESET -1 FAULT-AT !
    s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
-   UNSTAGED STAGE$ FS:OPEN-APPEND-FD >FD UP DROPBOX-UPLOAD:FD !
+   UNSTAGED STAGE$ >str FS:OPEN-APPEND-FD >FD UP DROPBOX-UPLOAD:FD !
    SEND-LOGGED DROPBOX:E-STAGE T=
    s" the stage's read was refused, errno 9" STAGE-LOGGED? TTRUE
    TEST-DROPBOX:SEEN$ s" " T$=
@@ -3022,13 +3022,6 @@ TYPED-VARIABLE FAULT fault
    s" src/dropbox.f" s" SESSION" s" UploadSession" AR @ TEST-FORMAL:HOLDS ;
 
 
-\ The curl loop started; the run goes on and fails at its end if not.
-: CURL-STARTED ( CURL:status -- )
-   MATCH CURL:status
-      ok OF ENDOF
-      failed OF drop false ASSERT ENDOF
-   ;MATCH ;
-
 public
 
 : RUN ( -- )
@@ -3036,7 +3029,7 @@ public
    ARENA:NEW AR !
    FORMAL-DOWNLOADING-CASE
    FORMAL-SESSION-CASE
-   AIO:START CURL:LOOP-START CURL-STARTED
+   AIO:START CURL:LOOP-START
    [: SERVED ;] [: CURL:LOOP-STOP AIO:STOP ;] finally
    AR @ ARENA:RELEASE
    s" dropbox-test: " type T-CASES FMT:.INT s"  checks" type cr

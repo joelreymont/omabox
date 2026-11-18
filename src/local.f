@@ -114,7 +114,7 @@ $2E constant DOT
 : ERRNO+ ( n -- )
    {: e:n :}
    e 0= if exit then
-   s" : " LOG:TEXT+ e FS:ERRNO$ LOG:TEXT+ ;
+   s" : " LOG:TEXT+ e FS:ERRNO$ str> LOG:TEXT+ ;
 
 \ Out of descriptors, memory or space, the next entry would fail the same
 \ way: Rust's EXHAUSTION, which says nothing about the object observed.
@@ -284,7 +284,7 @@ FS:PATHZ-CAP BUFFER: DENIED-PATH
    MATCH option
       none OF ENDOF
       some OF FACTS-UNMAKE {: m:n o:n a:n :}
-         s"  mode " LOG:TEXT+ m $FFF and 4 FMT:OCT-WIDTH$ LOG:TEXT+
+         s"  mode " LOG:TEXT+ m $FFF and 4 FMT:OCT-WIDTH$ str> LOG:TEXT+
          s"  owner uid " LOG:TEXT+ o LOG:INT+
          a FS-STATX:IMMUTABLE and 0<> if s"  immutable" LOG:TEXT+ then
          a FS-STATX:APPEND and 0<> if s"  append-only" LOG:TEXT+ then
@@ -594,7 +594,7 @@ SHA256-CTX-BYTES BUFFER: NAME-CTX
 32 BUFFER: NAME-DIGEST
 1 BUFFER: NUL
 
-: FEED ( ^u8 n -- ) {: p:^ u:n :} NAME-CTX p u SHA256-FEED ;
+: FEED ( ^u8 n -- ) {: p:^ u:n :} NAME-CTX p u >str SHA256-FEED ;
 
 \ Copies the bytes to dst at offset at; answers the offset after them.
 : PUT ( ^u8 n ^u8 n -- n )
@@ -1197,7 +1197,7 @@ private
 
 : KEY-LESS ( n n [ n -- ^u8 n ] -- bool )
    {: a:n b:n key :}
-   a key execute b key execute STR< ;
+   a key execute >str b key execute >str STR< ;
 
 \ The indices below count in the byte order of the keys key answers for
 \ them.
@@ -1246,7 +1246,7 @@ private
 : CACHED-HASH
    ( ^VEC:vector<MODEL:hash-record> ^u8 n -- option<MODEL:hash-record> )
    {: v p:^ u:n :}
-   0 v VEC:COUNT [: v swap VEC:AT @ RECORD-PATH p u STR< ;]
+   0 v VEC:COUNT [: v swap VEC:AT @ RECORD-PATH >str p u >str STR< ;]
    SORT:PARTITION-POINT {: at:n :}
    at v VEC:COUNT >= if OPTION:NONE exit then
    v at VEC:AT @ {: r:MODEL:hash-record :}
@@ -1272,7 +1272,7 @@ private
 \ the arena; an empty q answers p, where Rust appends a "/".
 : JOIN ( ^u8 n ^u8 n ^ARENA:arena -- ^u8 n )
    {: p:^ u:n q:^ qu:n ar:^ARENA:arena :}
-   u 0= qu 0= or p u FS:JOIN-SEPARATED? or {: bare:bool :}
+   u 0= qu 0= or p u >str FS:JOIN-SEPARATED? or {: bare:bool :}
    bare if 0 else 1 then {: sep:n :}
    ar u sep + qu + ARENA:ALLOC {: dst:^ size:n :}
    p u dst 0 PUT {: at:n :}
@@ -1295,7 +1295,7 @@ create LISTING FS-LIST:STORAGE-BYTES allot
 : LISTED ( fd str ^ARENA:arena ^VEC:vector<str> -- )
    {: dir:fd parent:str ar:^ARENA:arena v :}
    LISTING FS-LIST:STORAGE-BYTES SPAN:MAKE FS-LIST:INIT
-   dir [: drop parent str> 2swap ar JOIN >str v VEC:PUSH ! ;]
+   dir [: drop str> parent str> 2swap ar JOIN >str v VEC:PUSH ! ;]
    FS-LIST:EACH-TYPED-AT ;
 
 : LIST-FAILURE ( n ^u8 n ^u8 n ^u8 n -- )
@@ -1604,7 +1604,7 @@ SUBTREE-INSTALL
 \ Whether the path is among the roots, which are in byte order.
 : AMONG? ( ^u8 n ^VEC:vector<str> -- bool )
    {: p:^ u:n roots :}
-   0 roots VEC:COUNT [: roots swap VEC:AT @ str> p u STR< ;]
+   0 roots VEC:COUNT [: roots swap VEC:AT @ p u >str STR< ;]
    SORT:PARTITION-POINT {: at:n :}
    at roots VEC:COUNT >= if false exit then
    roots at VEC:AT @ str> p u STR= ;

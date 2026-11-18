@@ -483,7 +483,7 @@ variable SEED
 : LOGGED ( str [ -- ] ^ARENA:arena -- ^u8 n )
    {: d:str q ar :}
    SB-RESET d str> SB-APPEND s" /stderr.txt" SB-APPEND
-   q SB$ ar COPIED str> ar STDERR:CAPTURING {: code:n t:^ u:n :}
+   q SB$ ar COPIED ar STDERR:CAPTURING str> {: code:n t:^ u:n :}
    code 0<> if code throw then
    t u ;
 
@@ -538,7 +538,7 @@ variable SEED
    rs lower str> DIRECTORY+ rs upper str> DIRECTORY+
    d [: [: rs ar LOCAL-MAP drop ;] E-CASE-COLLISION TTHROWSQ ;] ar
    LOGGED {: t:^ tu:n :}
-   t tu 10 COUNT-CHAR 1 T=
+   t tu >str 10 COUNT-CHAR 1 T=
    t tu upper str> lower str> COLLISION$ CONTAINS? TTRUE
    rs lower upper ar RENAMES-AGREE ;
 
@@ -969,7 +969,7 @@ variable SEED
 : DISAGREES? ( ^u8 n ^u8 n -- bool )
    {: b:^ u:n p:^ v:n :}
    p PREFIX v BYTE-COPY SEPARATOR PREFIX v + c!
-   b u p v PRECEDES-CHILDREN? bool>n b u PREFIX v 1+ STR< bool>n <> ;
+   b u p v PRECEDES-CHILDREN? bool>n b u >str PREFIX v 1+ >str STR< bool>n <> ;
 
 : CHILD-PREFIX-ORDER-MATCHES-THE-MATERIALIZED-PREFIX ( ^ARENA:arena -- )
    drop
@@ -1109,7 +1109,7 @@ variable SEED
    v v ar UNBASED-SOURCE 255 ar CASE-VARIANT-MOVE MOVE-DESTINATION
    PATH$ SPLIT-NAME {: dir:^ du:n name:^ nu:n :}
    nu 255 T=
-   name nu s"  (case variant)" ENDS-WITH? TTRUE ;
+   name nu >str s"  (case variant)" >str ENDS-WITH? TTRUE ;
 
 \ The name, failing the case when none fits.
 : SOME-NAME ( option<str> -- str )
@@ -1131,7 +1131,7 @@ variable SEED
    name h o 0 255 ar FILE-COPY-NAME SOME-NAME str> {: b:^ bu:n :}
    a au b bu T$=
    au 255 T=
-   a au s"  (Dropbox file bbbbbbbbbbbb)" ENDS-WITH? TTRUE ;
+   a au >str s"  (Dropbox file bbbbbbbbbbbb)" >str ENDS-WITH? TTRUE ;
 
 : CASE-VARIANT-MOVES-CONVERGE-FROM-PARENT-TO-CHILD ( ^ARENA:arena -- )
    {: ar :}
@@ -1207,7 +1207,7 @@ variable SEED
    {: r:str p:^ u:n b:^ bu:n ar :}
    r p u ar INSIDE str> b bu FS:WRITE-ALL ;
 
-: THERE? ( str ^u8 n ^ARENA:arena -- bool ) INSIDE str> FS:EXISTS? ;
+: THERE? ( str ^u8 n ^ARENA:arena -- bool ) INSIDE FS:EXISTS? ;
 
 \ A case's directory under TMPDIR and the sync root in it, holding
 \ Dir/a.txt and dir/b.txt.
@@ -1280,7 +1280,7 @@ variable SEED
    {: d:str r:str ar :}
    d r ar BOUND {: j :}
    d s" old" ar INSIDE {: old:str :}
-   r str> old str> FS:RENAME-FILE
+   r old FS:RENAME-FILE
    r str> FS:MAKE-DIR
    j r str> ar TREE ar RESOLVE-CASE-COLLISION ar RESOLUTION$
    s" root-changed" T$=
@@ -1468,7 +1468,7 @@ ARENA LISTED DROPBOX:entry
    s" /report.txt" s" /Different.txt" ar FILE-ENTRY {: e :}
    d [: [: e root v ar APPEND-ENTRY-CHANGES ;] E-LISTING TTHROWSQ ;]
    ar LOGGED {: t:^ tu:n :}
-   t tu 10 COUNT-CHAR 1 T=
+   t tu >str 10 COUNT-CHAR 1 T=
    t tu s" invalid or out-of-root path `/Different.txt`" CONTAINS? TTRUE
    v ar INVENTORY-RECORDS VEC:COUNT 0 T=
    d str> FS:REMOVE-TREE ;
@@ -1478,7 +1478,7 @@ ARENA LISTED DROPBOX:entry
    {: p:^ u:n d:str ar :}
    d [: [: p u ar LISTING-AT ROOT-DEPTH drop ;] E-LISTING TTHROWSQ ;]
    ar LOGGED {: t:^ tu:n :}
-   t tu 10 COUNT-CHAR 1 T=
+   t tu >str 10 COUNT-CHAR 1 T=
    t tu
    s" configured Dropbox root must be empty or a normalized absolute Dropbox path"
    CONTAINS? TTRUE ;
@@ -1501,7 +1501,7 @@ ARENA LISTED DROPBOX:entry
    ar NO-CHANGES {: v :}
    d [: [: e root v ar APPEND-ENTRY-CHANGES ;] E-LISTING TTHROWSQ ;]
    ar LOGGED {: t:^ tu:n :}
-   t tu 10 COUNT-CHAR 1 T=
+   t tu >str 10 COUNT-CHAR 1 T=
    t tu s" Dropbox listing contained an invalid or out-of-root path"
    CONTAINS? TTRUE
    v ar INVENTORY-RECORDS VEC:COUNT 0 T=
@@ -1535,7 +1535,7 @@ ARENA LISTED DROPBOX:entry
    d [: [: e root v ar APPEND-ENTRY-CHANGES
          child root v ar APPEND-ENTRY-CHANGES ;] E-LISTING TTHROWSQ ;]
    ar LOGGED {: g:^ gu:n :}
-   g gu 10 COUNT-CHAR 1 T=
+   g gu >str 10 COUNT-CHAR 1 T=
    g gu t tu CONTAINS? TTRUE
    v ar INVENTORY-RECORDS {: rs :}
    rs RECORD-PATHS$ s" Old|" T$=
@@ -2335,7 +2335,7 @@ READ-CAP BUFFER: READ-BUF
    {: x :}
    x ROOT$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
    READ-BUF u ONE-NAME? TTRUE
-   READ-BUF u s" .omabox-download-" STARTS-WITH? TTRUE
+   READ-BUF u >str s" .omabox-download-" >str STARTS-WITH? TTRUE
    x RUN-ROOT @ READ-BUF u x RUN-ARENA @ INSIDE ;
 
 : HOLDS-BYTES ( str ^u8 n -- )
@@ -2351,7 +2351,7 @@ READ-CAP BUFFER: READ-BUF
    [: root x s" occupied.txt" EXPECTED$ PRESTAGED ;]
    [: root FS:CLOSE-DIR ;] finally
    x STAGE-PATH {: sp:str :}
-   sp str> FS:REMOVE-FILE sp str> OCCUPANT$ FS:WRITE-ALL
+   sp FS:REMOVE-FILE sp str> OCCUPANT$ FS:WRITE-ALL
    EXPECTED$ s" occupied-stage-revision" x RUN-ARENA @ REMOTE-FILE
    {: rem :}
    sp x s" occupied.txt" rem INSTALLING ;
@@ -2415,7 +2415,7 @@ READ-CAP BUFFER: READ-BUF
    {: x k:n :}
    k x RUN-ARENA @ BATCH drop {: p:str :}
    x RUN-ROOT @ p str> x RUN-ARENA @ INSIDE {: f:str :}
-   f str> FS:FILE? 0= if false exit then
+   f FS:FILE? 0= if false exit then
    f BATCH$ HOLDS-BYTES true ;
 
 : INSTALLED ( ^run -- n )
@@ -2434,7 +2434,7 @@ READ-CAP BUFFER: READ-BUF
    x INSTALLED COMPLETED-BATCH T=
    x PENDING-OF {: pending :}
    pending VEC:COUNT 1 T=
-   x RUN-ROOT @ pending 0 PLAN-PATH$ ar INSIDE str> FS:EXISTS? TFALSE
+   x RUN-ROOT @ pending 0 PLAN-PATH$ ar INSIDE FS:EXISTS? TFALSE
    TEST-DROPBOX:SEEN$ DOWNLOAD-COUNT DOWNLOADS$ T$=
    d x STEP-GONE ;
 
@@ -2465,13 +2465,13 @@ $100 constant MODE-0400
    SLOTS 1 ?do
       x i SLOT-AT str> i x RUN-ARENA @ UNKNOWN$ str> FS:WRITE-ALL
    loop
-   x 1 SLOT-AT str> MODE-0400 FS:CHMOD-MODE
+   x 1 SLOT-AT MODE-0400 FS:CHMOD-MODE
    x 0 SLOT-AT str> SOCKET-AT ;
 
 \ Slot 0 is still a socket, and the others hold their bytes.
 : SLOTS-KEPT ( ^run -- )
    {: x :}
-   x 0 SLOT-AT str> FS:TRY-LSTAT TTRUE
+   x 0 SLOT-AT FS:TRY-LSTAT TTRUE
    FS:STAT-MODE@ FS:S-IFMT and S-IFSOCK T=
    SLOTS 1 ?do
       x i SLOT-AT i x RUN-ARENA @ UNKNOWN$ str> HOLDS-BYTES
@@ -2512,7 +2512,7 @@ TYPED-VARIABLE CANARY str
 \ Rust's swap: the root renamed old-root, and a new root holding
 \ canary.txt.
 : SWAP-ROOT ( -- )
-   LIVE-ROOT @ str> OLD-ROOT @ str> FS:RENAME-FILE
+   LIVE-ROOT @ OLD-ROOT @ FS:RENAME-FILE
    LIVE-ROOT @ str> FS:MAKE-DIR
    CANARY @ str> CANARY$ FS:WRITE-ALL ;
 
@@ -2540,7 +2540,7 @@ TYPED-VARIABLE CANARY str
 \ Whether a name in the list starts with .omabox-download-.
 : STAGE-LISTED? ( ^u8 n -- bool )
    {: l:^ u:n :}
-   l u s" .omabox-download-" STARTS-WITH? if true exit then
+   l u >str s" .omabox-download-" >str STARTS-WITH? if true exit then
    l u 10 INDEX-OF MATCH option
       none OF false ENDOF
       some OF IDX>N 1+ {: k:n :} l k + u k - RECURSE ENDOF
@@ -2549,7 +2549,7 @@ TYPED-VARIABLE CANARY str
 \ old-root holds no download.txt, and a download's stage.
 : OLD-ROOT-STAGED ( ^ARENA:arena -- )
    {: ar :}
-   OLD-ROOT @ s" download.txt" ar INSIDE str> FS:EXISTS? TFALSE
+   OLD-ROOT @ s" download.txt" ar INSIDE FS:EXISTS? TFALSE
    OLD-ROOT @ str> READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
    READ-BUF u STAGE-LISTED? TTRUE ;
 
@@ -2659,7 +2659,7 @@ TYPED-VARIABLE CANARY str
    {: x :}
    x STAGING$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
    READ-BUF u ONE-NAME? TTRUE
-   READ-BUF u s" .omabox-download-slot-" STARTS-WITH? TTRUE
+   READ-BUF u >str s" .omabox-download-slot-" >str STARTS-WITH? TTRUE
    x RUN-STAGING @ READ-BUF u x RUN-ARENA @ INSIDE ;
 
 : IN-ROOT ( ^run ^u8 n -- str )
@@ -2686,16 +2686,16 @@ TYPED-VARIABLE CANARY str
 \ The file f holds content c, of size u.
 : HOLDS-CONTENT ( str DROPBOX:hash n ^ARENA:arena -- )
    {: f:str c:DROPBOX:hash u:n ar :}
-   f str> FS:FILE-SIZE u T=
-   f str> FS:OPEN-SIZED TTRUE drop {: h:fd :}
+   f FS:FILE-SIZE u T=
+   f FS:OPEN-SIZED TTRUE drop {: h:fd :}
    h ar LOCAL:DROPBOX-CONTENT-HASH h FS:CLOSE-DIR {: got:DROPBOX:hash :}
    got DROPBOX:HASH>STR str> c DROPBOX:HASH>STR str> T$= ;
 
 \ Whether f is a file of u bytes.
 : SIZED? ( str n -- bool )
    {: f:str u:n :}
-   f str> FS:FILE? 0= if false exit then
-   f str> FS:FILE-SIZE u = ;
+   f FS:FILE? 0= if false exit then
+   f FS:FILE-SIZE u = ;
 
 \ Plan a unblocked, and a step resuming its download from its slot.
 : HELD-STEPPED ( ^run JOURNAL:plan-record DROPBOX:hash -- )
@@ -2716,7 +2716,7 @@ TYPED-VARIABLE CANARY str
    x HELD-PLAN {: p c:DROPBOX:hash :}
    x HELD-SLOT-PATH {: slot:str :}
    x NEXT-STEPPED
-   x s" a.bin" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" a.bin" IN-ROOT FS:EXISTS? TFALSE
    slot CHECKPOINT SIZED? TTRUE
    x p c HELD-STEPPED
    d x STEP-GONE ;
@@ -3012,7 +3012,7 @@ TYPED-VARIABLE RACED-INSTALL str
    [: root x s" removed.txt" OBSOLETE$ PRESTAGED ;]
    [: root FS:CLOSE-DIR ;] finally
    x STAGE-PATH {: sp:str :}
-   sp str> $180 FS:CHMOD-MODE
+   sp $180 FS:CHMOD-MODE
    sp str> UNRELATED-STAGE$ FS:WRITE-ALL
    sp ;
 
@@ -3030,7 +3030,7 @@ TYPED-VARIABLE RACED-INSTALL str
    x rec PASSED COMPLETE drop
    x PENDING-OF VEC:COUNT 0 T=
    x s" removed.txt" NO-BASELINE? TTRUE
-   sp str> FS:EXISTS? TTRUE
+   sp FS:EXISTS? TTRUE
    TEST-DROPBOX:SEEN$ 1 LISTED$ T$=
    DOWNLOAD$ TEST-DROPBOX:CALLS 0 T=
    d x STEP-GONE ;
@@ -3109,7 +3109,7 @@ TYPED-VARIABLE RACED-INSTALL str
    {: x :}
    x s" good.txt" IN-ROOT INDEPENDENT-DOWNLOAD$ HOLDS-BYTES
    x s" upload.txt" IN-ROOT INDEPENDENT-UPLOAD$ HOLDS-BYTES
-   x s" blocked.txt" IN-ROOT str> FS:EXISTS? TFALSE ;
+   x s" blocked.txt" IN-ROOT FS:EXISTS? TFALSE ;
 
 \ No plan pending, and blocked.txt's alone blocked for status st.
 : BLOCKED-ALONE ( ^run n -- )
@@ -3234,7 +3234,7 @@ TYPED-VARIABLE RACED-INSTALL str
    x RUN-ARENA @ {: ar :}
    s" unknown.txt" s" rev-unknown" UNKNOWN-REMOTE$ s" cursor-unknown" ar
    LISTED-ALONE
-   s" missing-target" x s" unknown.txt" IN-ROOT str> FS:MAKE-SYMLINK
+   s" missing-target" >str x s" unknown.txt" IN-ROOT FS:MAKE-SYMLINK
    UNKNOWN-REMOTE$ s" rev-unknown" ar REMOTE-FILE {: rem :}
    x s" unknown.txt" rem 0 RECORD-BLOCKED-INSTALL ;
 
@@ -3402,7 +3402,7 @@ TYPED-VARIABLE RACED-INSTALL str
    x s" occupied.txt" IN-ROOT str> REPAIR$ FS:WRITE-ALL
    x s" occupied.txt" REPAIR$ x RUN-ARENA @ IDENTITY UPLOAD-STAGE
    {: sp:str :}
-   sp str> FS:REMOVE-FILE sp str> CORRUPT$ FS:WRITE-ALL ;
+   sp FS:REMOVE-FILE sp str> CORRUPT$ FS:WRITE-ALL ;
 
 \ occupied.txt's upload plan, blocked for its occupied stage and due,
 \ as a journal opened again finds it.
@@ -3465,7 +3465,7 @@ TYPED-VARIABLE RACED-INSTALL str
    x s" good.txt" IN-ROOT str> SIBLING$ FS:WRITE-ALL
    BLOCKED-UPLOAD$ ar IDENTITY DROPBOX:HASH>STR str> {: h:^ hu:n :}
    x RUN-STAGING @ h hu ar INSIDE {: sp:str :}
-   s" foreign-stage-target" sp str> FS:MAKE-SYMLINK
+   s" foreign-stage-target" >str sp FS:MAKE-SYMLINK
    sp ;
 
 : SPECIAL-REPORT ( report -- )
@@ -3537,7 +3537,7 @@ TYPED-VARIABLE RACED-INSTALL str
 \ due; answers the plan.
 : UNKNOWN-REJECTED ( ^run -- JOURNAL:plan-record )
    {: x :}
-   s" missing-target" x s" unknown.txt" IN-ROOT str> FS:MAKE-SYMLINK
+   s" missing-target" >str x s" unknown.txt" IN-ROOT FS:MAKE-SYMLINK
    x s" unknown.txt" s" unreadable upload" x RUN-ARENA @ IDENTITY
    UPLOAD-PLANNED {: p :}
    x p ID-OF s" disallowed_name" REJECTED-AS 0 BLOCKED-UNTIL
@@ -3783,7 +3783,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
 : OCCUPANT-PLACED ( ^run copy-occupant -- )
    {: x o :}
    x LOCAL-COPY str> USER-FILE$ FS:WRITE-ALL
-   o UNREADABLE? if x LOCAL-COPY str> 0 FS:CHMOD-MODE then ;
+   o UNREADABLE? if x LOCAL-COPY 0 FS:CHMOD-MODE then ;
 
 \ The remote replay blocks replace.txt for its local copy's name; the
 \ occupant and replace.txt are kept.
@@ -3796,19 +3796,19 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    TTRUE
    x COPY-HELD
    x CONFLICTS-OF VEC:COUNT 0 T=
-   o UNREADABLE? if x LOCAL-COPY str> $180 FS:CHMOD-MODE then
+   o UNREADABLE? if x LOCAL-COPY $180 FS:CHMOD-MODE then
    x LOCAL-COPY USER-FILE$ HOLDS-BYTES
    x s" replace.txt" IN-ROOT NEW-LOCAL$ HOLDS-BYTES ;
 
 \ The occupant is gone, but the block is not yet due.
 : COPY-WAITS ( ^run str -- )
    {: x rec:str :}
-   x LOCAL-COPY str> FS:REMOVE-FILE
+   x LOCAL-COPY FS:REMOVE-FILE
    x rec PASSED COMPLETE {: waiting :}
    waiting COPY-CONFLICTS 0 T=
    waiting BLOCKED-IN 1 T=
    x COPY-HELD drop
-   x LOCAL-COPY str> FS:EXISTS? TFALSE
+   x LOCAL-COPY FS:EXISTS? TFALSE
    x CONFLICTS-OF VEC:COUNT 0 T= ;
 
 \ Rust's replay_blocks_an_occupied_copy_name.
@@ -3828,7 +3828,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x id MODEL-BLOCKAGE:CONFLICT-COPY-OCCUPIED 0 BLOCKED-UNTIL
    x rec PASSED COMPLETE COPY-CONFLICTS 1 T=
    x REPLACE-PREPARED
-   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata "
+   TEST-DROPBOX:SEEN$ >str s" /2/files/upload /2/files/get_metadata " >str
    STARTS-WITH? TTRUE
    DOWNLOAD$ TEST-DROPBOX:CALLS 1 T=
    d x STEP-GONE ;
@@ -4069,7 +4069,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x s" Shared/notes.txt" notes SEED-BASELINE
    x s" Shared/keep.txt" keep SEED-BASELINE
    x notes keep ACCESSIBLE
-   x s" Shared/notes.txt" IN-ROOT str> FS:REMOVE-FILE
+   x s" Shared/notes.txt" IN-ROOT FS:REMOVE-FILE
    x s" Shared/keep.txt" EDITED-KEEP$ WRITE-IN ;
 
 : NEWLY-RESTRICTED-FOLDER-DROPS-STALE-CHILD-RECORDS ( ^ARENA:arena -- )
@@ -4086,7 +4086,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x rec PASSED COMPLETE drop
    x s" Shared/notes.txt" notes BASELINE-AT
    x s" Shared/keep.txt" keep BASELINE-AT
-   x s" Shared/notes.txt" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" Shared/notes.txt" IN-ROOT FS:EXISTS? TFALSE
    x s" Shared/keep.txt" IN-ROOT EDITED-KEEP$ HOLDS-BYTES
    \ Departure 5: no account request.
    TEST-DROPBOX:SEEN$ CONTINUE$ T$=
@@ -4170,7 +4170,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x rec PASSED COMPLETE SIBLING-REPORTS
    x s" report/x" NO-BASELINE? TTRUE
    x s" report.txt" shared BASELINE-AT
-   x s" report/x" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" report/x" IN-ROOT FS:EXISTS? TFALSE
    x NO-CONFLICT-RECORD
    x PENDING-OF VEC:COUNT 0 T=
    DELETE$ TEST-DROPBOX:BODIES-TO$ SIBLING-DELETE$ T$=
@@ -4187,7 +4187,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    d x shared SIBLINGS {: rec:str :}
    x s" report/x" SHARED-SIBLING$ WRITE-IN
    x rec PASSED COMPLETE SIBLING-REPORTS
-   x s" report/x" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" report/x" IN-ROOT FS:EXISTS? TFALSE
    x s" report/x" NO-BASELINE? TTRUE
    x s" report.txt" shared BASELINE-AT
    x NO-CONFLICT-RECORD
@@ -4243,8 +4243,8 @@ $1C0 constant OWNER-ACCESS
 : LOCKED-PASSED ( ^run str -- outcome )
    {: x rec:str :}
    x s" locked" IN-ROOT {: l:str :}
-   l str> 0 FS:CHMOD-MODE
-   [: x rec PASSED ;] [: l str> OWNER-ACCESS FS:CHMOD-MODE ;] finally ;
+   l 0 FS:CHMOD-MODE
+   [: x rec PASSED ;] [: l OWNER-ACCESS FS:CHMOD-MODE ;] finally ;
 
 \ locked/secret.txt and open.txt in the root and on the page, and the
 \ baselines locked and locked/secret.txt.
@@ -4306,7 +4306,7 @@ $1C0 constant OWNER-ACCESS
    {: ns:^ nu:n at:n x v :}
    ns nu 10 at SPLIT-NEXT 0= if 2drop drop -1 exit then
    {: q:^ w:n next:n :}
-   q w s" .omabox-conflict-" STARTS-WITH? if
+   q w >str s" .omabox-conflict-" >str STARTS-WITH? if
       x RUN-ROOT @ q w x RUN-ARENA @ INSIDE str>
       READ-BUF READ-CAP FS:READ-ALL READ-BUF swap
       x RUN-ARENA @ COPIED v VEC:PUSH !
@@ -4315,7 +4315,7 @@ $1C0 constant OWNER-ACCESS
 
 : BYTES-BEFORE? ( str str -- bool )
    {: a:str b:str :}
-   a str> b str> STR< ;
+   a b STR< ;
 
 \ Swaps the strings at k-1 and k if they are out of byte order; whether
 \ it did.
@@ -4495,8 +4495,8 @@ $1C0 constant OWNER-ACCESS
    d x PASS-READY {: rec:str :}
    x DELETIONS
    x rec PASSED COMPLETE REPORTS
-   x s" local-deleted.txt" IN-ROOT str> FS:EXISTS? TFALSE
-   x s" dropbox-deleted.txt" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" local-deleted.txt" IN-ROOT FS:EXISTS? TFALSE
+   x s" dropbox-deleted.txt" IN-ROOT FS:EXISTS? TFALSE
    x s" local-deleted.txt" NO-BASELINE? TTRUE
    x s" dropbox-deleted.txt" NO-BASELINE? TTRUE
    x PENDING-OF VEC:COUNT 0 T=
@@ -4600,7 +4600,7 @@ $1C0 constant OWNER-ACCESS
    \ follows completes none.
    x REPLAY-STEP REPORTED COMPLETED 0 T=
    x s" apps/Entry.doentry" IN-ROOT ENTRY-BYTES$ HOLDS-BYTES
-   x s" Apps" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" Apps" IN-ROOT FS:EXISTS? TFALSE
    x rec PASSED COMPLETE drop
    \ Departure 2, as above.
    x REPLAY-STEP REPORTED COMPLETED 0 T=
@@ -4649,7 +4649,7 @@ $1C0 constant OWNER-ACCESS
    x rec PASSED COMPLETE 2 SETTLED
    x rec PASSED COMPLETE JOURNAL-CREATED
    x s" Apps/Day One/Journal" IN-ROOT str> FS:DIR? TTRUE
-   x s" Apps/day one" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" Apps/day one" IN-ROOT FS:EXISTS? TFALSE
    x s" Apps" IN-ROOT str> READ-BUF READ-CAP FS-LIST:NAMES
    READ-BUF swap s" Day One" T$=
    x s" apps/day one/journal" FOLDER-BASELINE-AT
@@ -4675,16 +4675,16 @@ $1C0 constant OWNER-ACCESS
       root-changed OF false ENDOF
    ;MATCH ;
 
-: EXISTS-IN? ( ^run ^u8 n -- bool ) IN-ROOT str> FS:EXISTS? ;
+: EXISTS-IN? ( ^run ^u8 n -- bool ) IN-ROOT FS:EXISTS? ;
 
 \ The symlink at path p in the root points at the text t.
 : LINKS-TO ( ^run ^u8 n ^u8 n -- )
    {: x p:^ u:n t:^ tu:n :}
-   t tu x p u IN-ROOT str> FS:MAKE-SYMLINK ;
+   t tu >str x p u IN-ROOT FS:MAKE-SYMLINK ;
 
 \ The target the symlink at f holds.
 : LINK-TARGET$ ( str -- ^u8 n )
-   str> FS:>PATHZ READ-BUF READ-CAP readlink {: u:n :}
+   FS:>PATHZ READ-BUF READ-CAP readlink {: u:n :}
    u 0< if s" the symlink did not read" FAILED then
    READ-BUF u ;
 
@@ -4759,7 +4759,7 @@ $1C0 constant OWNER-ACCESS
    x rec PASSED COMPLETE NOOP-REPORTS
    x PENDING-OF VEC:COUNT 0 T=
    x s" report.txt" rem BASELINE-AT
-   x s" Report.TXT" IN-ROOT str> FS:FILE? TTRUE
+   x s" Report.TXT" IN-ROOT FS:FILE? TTRUE
    x s" report.txt" EXISTS-IN? TFALSE
    x REPORT-LISTED
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$=
@@ -5151,7 +5151,7 @@ $1C0 constant OWNER-ACCESS
    [: ;] ar ENTRIES s" directory-file-collision" false PAGE
    x s" node" IN-ROOT str> LOCAL-FILE$ FS:WRITE-ALL
    x rec PASSED OUTCOME-KIND$ s" fresh" T$=
-   x s" node" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" node" IN-ROOT FS:EXISTS? TFALSE
    x v str> IN-ROOT LOCAL-FILE$ HOLDS-BYTES
    x PENDING-OF VEC:COUNT 0 T=
    x CONFLICTS-OF VEC:COUNT 0 T=
@@ -5240,7 +5240,7 @@ $1C0 constant OWNER-ACCESS
    [: SWAP-ROOT ;] TEST-DROPBOX:DURING-DOWNLOAD!
    x rec PASSED OUTCOME-KIND$ s" root-changed" T$=
    OLD-ROOT @ v str> ar INSIDE BOUND-COPY$ HOLDS-BYTES
-   x v str> IN-ROOT str> FS:EXISTS? TFALSE
+   x v str> IN-ROOT FS:EXISTS? TFALSE
    CANARY @ CANARY$ HOLDS-BYTES
    x PENDING-OF VEC:COUNT 0 T=
    x s" node" BASELINE-KIND$ s" none" T$=
@@ -5289,7 +5289,7 @@ $180 constant MODE-0600
    l u 10 INDEX-OF MATCH option
       none OF l u ENDOF
       some OF IDX>N {: k:n :}
-         l k s" .omabox-download-" STARTS-WITH? if l k
+         l k >str s" .omabox-download-" >str STARTS-WITH? if l k
          else l k 1+ + u k 1+ - RECURSE then
       ENDOF
    ;MATCH ;
@@ -5299,7 +5299,7 @@ $180 constant MODE-0600
    {: x :}
    x ROOT$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
    READ-BUF u STAGE-NAMED {: s:^ su:n :}
-   s su s" .omabox-download-" STARTS-WITH? TTRUE
+   s su >str s" .omabox-download-" >str STARTS-WITH? TTRUE
    x RUN-ROOT @ s su x RUN-ARENA @ INSIDE ;
 
 \ The first variant's stage, staged with the copy's bytes, then
@@ -5310,7 +5310,7 @@ $180 constant MODE-0600
    [: root x v str> OCCUPIED-COPY$ PRESTAGED ;]
    [: root FS:CLOSE-DIR ;] finally
    x STAGE-AMONG {: sp:str :}
-   sp str> MODE-0600 FS:CHMOD-MODE
+   sp MODE-0600 FS:CHMOD-MODE
    sp str> UNRELATED-STAGE$ FS:WRITE-ALL
    sp ;
 
@@ -5329,7 +5329,7 @@ $180 constant MODE-0600
    x first OCCUPIED-COPY-STAGE {: sp:str :}
    x rec PASSED REPLAYED-PLANNED {: replayed:n planned:n :}
    planned 1 T= replayed 2 T=
-   x first str> IN-ROOT str> FS:EXISTS? TFALSE
+   x first str> IN-ROOT FS:EXISTS? TFALSE
    x second str> IN-ROOT OCCUPIED-COPY$ HOLDS-BYTES
    sp UNRELATED-STAGE$ HOLDS-BYTES
    x s" node" BASELINE-KIND$ s" directory" T$=
@@ -5350,7 +5350,7 @@ $180 constant MODE-0600
       none OF r l u ar INSIDE ENDOF
       some OF IDX>N {: k:n :}
          r l k ar INSIDE {: f:str :}
-         f str> FS:FILE? if f
+         f FS:FILE? if f
          else r l k 1+ + u k 1+ - ar RECURSE then
       ENDOF
    ;MATCH ;
@@ -5418,10 +5418,10 @@ $180 constant MODE-0600
    {: d:str x rec:str r:^ ru:n :}
    x RUN-ARENA @ {: ar :}
    d [: x rec OTHER-SYNCED ;] ar LOGGED {: t:^ tu:n :}
-   t tu 10 COUNT-CHAR 1 T=
+   t tu >str 10 COUNT-CHAR 1 T=
    t tu r ru HELD-LINE CONTAINS? TTRUE
    s" Dropbox file" COLLIDED$ s" " ar NODE-COPY {: v:str :}
-   x v str> IN-ROOT str> FS:EXISTS? TFALSE
+   x v str> IN-ROOT FS:EXISTS? TFALSE
    x PENDING-OF VEC:COUNT 0 T=
    x BLOCKED-OF VEC:COUNT 0 T=
    x CONFLICTS-OF VEC:COUNT 0 T=
@@ -5548,7 +5548,7 @@ $180 constant MODE-0600
 \ value[...] reads it.
 : MEMBER$ ( ^u8 n ^u8 n -- ^u8 n )
    {: b:^ bu:n p:^ pu:n :}
-   b bu p pu JSON:POINTER-SPAN 0= if 2drop s" null" exit then
+   b bu >str p pu >str JSON:POINTER-SPAN 0= if 2drop s" null" exit then
    {: off:n len:n :}
    b off + len ;
 
@@ -5582,7 +5582,7 @@ $180 constant MODE-0600
    x rec PASSED COMPLETE RECONCILE-REPORT:UNMAKE
    {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
    planned 2 T= replayed 2 T=
-   x s" gone" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" gone" IN-ROOT FS:EXISTS? TFALSE
    x s" gone" NO-BASELINE? TTRUE
    x s" gone/child" NO-BASELINE? TTRUE
    x PENDING-OF VEC:COUNT 0 T=
@@ -5656,7 +5656,7 @@ $180 constant MODE-0600
    x rec PASSED COMPLETE 1 1 2 COUNTED
    x rec PASSED COMPLETE 1 1 1 COUNTED
    x rec PASSED COMPLETE 1 1 0 COUNTED
-   x s" Gone" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" Gone" IN-ROOT FS:EXISTS? TFALSE
    x s" Gone" NO-BASELINE? TTRUE
    x s" Gone/Child" NO-BASELINE? TTRUE
    x s" Gone/Child/leaf.txt" NO-BASELINE? TTRUE
@@ -5680,7 +5680,7 @@ $180 constant MODE-0600
    d x PASS-READY {: rec:str :}
    x s" docs" SEED-DIRECTORY-BASELINE
    x rec PASSED COMPLETE 0 0 2 COUNTED
-   x s" docs" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" docs" IN-ROOT FS:EXISTS? TFALSE
    x s" docs" FOLDER-BASELINE-AT
    x PENDING-OF VEC:COUNT 0 T=
    TEST-DROPBOX:SEEN$ LIST$ T$=
@@ -5704,7 +5704,7 @@ $180 constant MODE-0600
    d x PASS-READY {: rec:str :}
    x s" gone" SEED-DIRECTORY-BASELINE
    x rec PASSED OUTCOME-FRESH? TTRUE
-   x s" gone" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" gone" IN-ROOT FS:EXISTS? TFALSE
    x s" gone" FOLDER-BASELINE-AT
    x PENDING-OF VEC:COUNT 0 T=
    TEST-DROPBOX:SEEN$ TWO-LISTS$ T$=
@@ -5835,7 +5835,7 @@ TYPED-VARIABLE RACED str
 \ d, and a new root holding keep.txt's bytes.
 : REPLACED-ROOT ( str ^run -- )
    {: d:str x :}
-   x ROOT$ d s" old-root" x RUN-ARENA @ INSIDE str> FS:RENAME-FILE
+   x ROOT$ >str d s" old-root" x RUN-ARENA @ INSIDE FS:RENAME-FILE
    x ROOT$ FS:MAKE-DIR
    x s" keep.txt" IN-ROOT str> KEEP$ FS:WRITE-ALL ;
 
@@ -6154,9 +6154,9 @@ TYPED-VARIABLE RACED str
    x rec PASSED COMPLETE REPLAYED-ERRORS nip 0 T=
    x STEPPED
    [: x EXCLUDED-KEPT ;] EXCLUDED-LOCALS
-   x s" .ds_store" IN-ROOT str> FS:EXISTS? TFALSE
-   x s" THUMBS.DB" IN-ROOT str> FS:EXISTS? TFALSE
-   x s" .Dropbox/remote-child.txt" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" .ds_store" IN-ROOT FS:EXISTS? TFALSE
+   x s" THUMBS.DB" IN-ROOT FS:EXISTS? TFALSE
+   x s" .Dropbox/remote-child.txt" IN-ROOT FS:EXISTS? TFALSE
    x s" ordinary-upload.txt" IN-ROOT ORDINARY-UPLOAD$ HOLDS-BYTES
    x s" ordinary-download.txt" IN-ROOT ORDINARY-DOWNLOAD$ HOLDS-BYTES
    x s" ordinary-upload.txt" ORDINARY-UPLOAD$
@@ -6208,7 +6208,7 @@ TYPED-VARIABLE RACED str
    d x REOPENED
    x LOCAL-REPLAYED COMPLETED 0 T=
    x PENDING-OF VEC:COUNT 0 T=
-   x s" Thumbs.db" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" Thumbs.db" IN-ROOT FS:EXISTS? TFALSE
    x s\" Icon\r" IN-ROOT EXCLUDED-LOCAL$ HOLDS-BYTES ;
 
 \ An excluded pending download, and three excluded plans blocked.
@@ -6248,7 +6248,7 @@ TYPED-VARIABLE RACED str
    x s\" Icon\r" rem BASELINE-AT
    x s" .~remote-delete" rem BASELINE-AT
    x s" .dropbox.attr" IN-ROOT EXCLUDED-LOCAL$ HOLDS-BYTES
-   x s" folder/metadata.ds_store" IN-ROOT str> FS:EXISTS? TFALSE
+   x s" folder/metadata.ds_store" IN-ROOT FS:EXISTS? TFALSE
    TEST-DROPBOX:SEEN$ s" " T$= ;
 
 : EXCLUDED-PENDING-AND-BLOCKED-WORK-IS-RETIRED-ACROSS-REOPEN-WITHOUT-EFFECTS
@@ -6297,7 +6297,7 @@ TYPED-VARIABLE RACED str
 \ The refresh cases against one fake Dropbox, under curl's loop.
 : DROPBOX-SERVED ( ^ARENA:arena -- )
    {: ar :}
-   AIO:START CURL:LOOP-START CURL-READY
+   AIO:START CURL:LOOP-START
    [: TEST-DROPBOX:START
       [: ar SERVED ;] [: TEST-DROPBOX:STOP ;] finally ;]
    [: CURL:LOOP-STOP AIO:STOP ;] finally ;

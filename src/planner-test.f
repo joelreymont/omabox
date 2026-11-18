@@ -124,7 +124,7 @@ TYPED-VARIABLE W JSON:writer
 : PLAN-CASE ( -- n )
    s" plan.tsv" T-LABEL
    s" src/oracle/plan.tsv" {: f:^ fu:n :}
-   AR @ f fu FS:FILE-SIZE ARENA:ALLOC {: t:^ u:n :}
+   AR @ f fu >str FS:FILE-SIZE ARENA:ALLOC {: t:^ u:n :}
    f fu t u FS:READ-ALL u T=
    t u PLAN-LINES dup t u LINES T= ;
 

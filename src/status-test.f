@@ -65,7 +65,7 @@ $1A4 constant LOOSE-FILE
 
 \ status.json's path, in PATHS.
 : FILE-PATH ( ^status -- ^u8 n )
-   STATUS-DIR @ str> FILE$ PATHS CAP SPAN:MAKE
+   STATUS-DIR @ FILE$ >str PATHS CAP SPAN:MAKE
    FS:JOIN-PATH-INTO {: u :}
    PATHS u ;
 
@@ -127,8 +127,8 @@ $1A4 constant LOOSE-FILE
    rt ar NEW {: s :}
    construct phase waiting s PHASE
    s HEARTBEAT
-   s STATUS-DIR @ str> FS:STAT-MODE MODE-BITS and DIR-MODE T=
-   s FILE-PATH FS:STAT-MODE MODE-BITS and FILE-MODE T=
+   s STATUS-DIR @ FS:STAT-MODE MODE-BITS and DIR-MODE T=
+   s FILE-PATH >str FS:STAT-MODE MODE-BITS and FILE-MODE T=
    s s\" {\"version\":3,\"phase\":\"waiting\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
    s LISTED FILE$ T$=
    rt GONE ;
@@ -204,11 +204,11 @@ $1A4 constant LOOSE-FILE
    s" failed_replacement_does_not_leave_a_temporary_file" T-LABEL
    ar RUNTIME {: rt:str :}
    rt ar NEW {: s :}
-   s FILE-PATH FS:REMOVE-FILE
+   s FILE-PATH >str FS:REMOVE-FILE
    s FILE-PATH FS:MAKE-DIR
    ar RUNTIME {: log:str :}
    log s" status.log" ar JOINED {: path:str :}
-   [: construct phase syncing s PHASE ;] path str> ar STDERR:CAPTURING
+   [: construct phase syncing s PHASE ;] path ar STDERR:CAPTURING str>
    {: code:n e:^ u:n :}
    code 0<> if code throw then
    s LISTED FILE$ T$=
@@ -254,8 +254,8 @@ $1A4 constant LOOSE-FILE
 : PRIVATE-FILE ( ^status -- )
    FILE-PATH {: file:^ fu :}
    file fu FS:SYMLINK? TFALSE
-   file fu FS:FILE? TTRUE
-   file fu FS:STAT-MODE MODE-BITS and FILE-MODE T= ;
+   file fu >str FS:FILE? TTRUE
+   file fu >str FS:STAT-MODE MODE-BITS and FILE-MODE T= ;
 
 
 : LINK-AT-STATUS-IS-REPLACED-NEVER-FOLLOWED ( ^ARENA:arena -- )
@@ -267,21 +267,21 @@ $1A4 constant LOOSE-FILE
    rt s" missing" ar JOINED {: gone:str :}
    rt s" target" ar JOINED {: kept:str :}
    kept str> s" keep" FS:WRITE-ALL
-   kept str> LOOSE-FILE FS:CHMOD-MODE
-   file str> FS:REMOVE-FILE
-   gone str> file str> FS:MAKE-SYMLINK
+   kept LOOSE-FILE FS:CHMOD-MODE
+   file FS:REMOVE-FILE
+   gone file FS:MAKE-SYMLINK
    construct phase waiting s PHASE
    s PRIVATE-FILE
    s s\" {\"version\":3,\"phase\":\"waiting\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
-   gone str> FS:TRY-STAT TFALSE
-   file str> FS:REMOVE-FILE
-   kept str> file str> FS:MAKE-SYMLINK
+   gone FS:TRY-STAT TFALSE
+   file FS:REMOVE-FILE
+   kept file FS:MAKE-SYMLINK
    construct phase syncing s PHASE
    s PRIVATE-FILE
    s s\" {\"version\":3,\"phase\":\"syncing\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
    kept str> BODY CAP FS:READ-ALL {: u :}
    BODY u s" keep" T$=
-   kept str> FS:STAT-MODE MODE-BITS and LOOSE-FILE T=
+   kept FS:STAT-MODE MODE-BITS and LOOSE-FILE T=
    s LISTED FILE$ T$=
    rt GONE ;
 
@@ -295,19 +295,19 @@ $1A4 constant LOOSE-FILE
    rt s" outside" ar JOINED {: kept:str :}
    rt s" missing" ar JOINED {: gone:str :}
    kept str> s" keep" FS:WRITE-ALL
-   kept str> LOOSE-FILE FS:CHMOD-MODE
-   kept str> temp str> FS:MAKE-SYMLINK
+   kept LOOSE-FILE FS:CHMOD-MODE
+   kept temp FS:MAKE-SYMLINK
    construct phase waiting s PHASE
    s s\" {\"version\":3,\"phase\":\"waiting\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
    s LISTED FILE$ T$=
    kept str> BODY CAP FS:READ-ALL {: u :}
    BODY u s" keep" T$=
-   kept str> FS:STAT-MODE MODE-BITS and LOOSE-FILE T=
-   gone str> temp str> FS:MAKE-SYMLINK
+   kept FS:STAT-MODE MODE-BITS and LOOSE-FILE T=
+   gone temp FS:MAKE-SYMLINK
    construct phase syncing s PHASE
    s s\" {\"version\":3,\"phase\":\"syncing\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
    s LISTED FILE$ T$=
-   gone str> FS:TRY-STAT TFALSE
+   gone FS:TRY-STAT TFALSE
    rt GONE ;
 
 
@@ -316,12 +316,12 @@ $1A4 constant LOOSE-FILE
    s" a restart secures the directory and status.json again" T-LABEL
    ar RUNTIME {: rt:str :}
    rt ar NEW {: s :}
-   s STATUS-DIR @ str> LOOSE-DIR FS:CHMOD-MODE
-   s FILE-PATH LOOSE-FILE FS:CHMOD-MODE
-   s STATUS-DIR @ str> FS:STAT-MODE MODE-BITS and LOOSE-DIR T=
-   s FILE-PATH FS:STAT-MODE MODE-BITS and LOOSE-FILE T=
+   s STATUS-DIR @ LOOSE-DIR FS:CHMOD-MODE
+   s FILE-PATH >str LOOSE-FILE FS:CHMOD-MODE
+   s STATUS-DIR @ FS:STAT-MODE MODE-BITS and LOOSE-DIR T=
+   s FILE-PATH >str FS:STAT-MODE MODE-BITS and LOOSE-FILE T=
    rt ar NEW {: again :}
-   again STATUS-DIR @ str> FS:STAT-MODE MODE-BITS and DIR-MODE T=
+   again STATUS-DIR @ FS:STAT-MODE MODE-BITS and DIR-MODE T=
    again PRIVATE-FILE
    again s\" {\"version\":3,\"phase\":\"starting\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
    again LISTED FILE$ T$=
@@ -376,14 +376,14 @@ $1A4 constant LOOSE-FILE
    log s" status.log" ar JOINED {: path:str :}
    [: [: s" run/user" >str ar NEW drop ;] E-RUNTIME-NOT-ABSOLUTE TTHROWS
       [: absent ar NEW drop ;] E-RUNTIME-UNAVAILABLE TTHROWS ;]
-   path str> ar STDERR:CAPTURING {: code:n e:^ u:n :}
+   path ar STDERR:CAPTURING str> {: code:n e:^ u:n :}
    code 0<> if code throw then
    e u s" STATUS:E-RUNTIME-NOT-ABSOLUTE: XDG_RUNTIME_DIR must be absolute"
    CONTAINS?
    TTRUE
    e u s" STATUS:E-RUNTIME-UNAVAILABLE: XDG_RUNTIME_DIR is unavailable"
    CONTAINS? TTRUE
-   absent str> FS:TRY-STAT TFALSE
+   absent FS:TRY-STAT TFALSE
    log GONE
    rt GONE ;
 
@@ -394,12 +394,12 @@ $1A4 constant LOOSE-FILE
    ar RUNTIME {: rt:str :}
    ar RUNTIME {: base:str :}
    base s" runtime" ar JOINED {: link:str :}
-   rt str> link str> FS:MAKE-SYMLINK
+   rt link FS:MAKE-SYMLINK
    link ar NEW {: s :}
    rt s" omabox" ar JOINED FILE$ ar JOINED {: file:str :}
    link str> FS:SYMLINK? TTRUE
-   file str> FS:FILE? TTRUE
-   file str> FS:STAT-MODE MODE-BITS and FILE-MODE T=
+   file FS:FILE? TTRUE
+   file FS:STAT-MODE MODE-BITS and FILE-MODE T=
    s s\" {\"version\":3,\"phase\":\"starting\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
    base GONE
    rt GONE ;
@@ -436,7 +436,7 @@ $1A4 constant LOOSE-FILE
    ar DETACHED {: s :}
    ar RUNTIME {: log:str :}
    log s" status.log" ar JOINED {: path:str :}
-   [: s CHANGES s UNBEATING ;] path str> ar STDERR:CAPTURING
+   [: s CHANGES s UNBEATING ;] path ar STDERR:CAPTURING str>
    {: code:n e:^ u:n :}
    code 0 T= u 0 T=
    log GONE ;

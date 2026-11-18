@@ -128,7 +128,7 @@ variable ERR-U
 \ The file's text, empty where there is no file.
 : READ ( str -- ^u8 n )
    {: p :}
-   p str> FS:TRY-STAT 0= if s" " exit then
+   p FS:TRY-STAT 0= if s" " exit then
    AR @ 4096 ARENA:ALLOC {: d:^ du:n :}
    p str> d du FS:READ-ALL {: u:n :}
    d u ;
@@ -137,7 +137,7 @@ variable ERR-U
 
 : REMOVE ( str -- )
    {: p :}
-   p str> FS:TRY-STAT if p str> FS:REMOVE-FILE then ;
+   p FS:TRY-STAT if p FS:REMOVE-FILE then ;
 
 : OK ( [ -- ] -- ) catch 0 T= ;
 
@@ -152,7 +152,7 @@ variable ERR-U
 : RUN-CASE ( ^u8 n [ -- ] -- )
    BODY ! T-LABEL
    ARENA:NEW AR !
-   s" TMPDIR" GETENV s" service-test-" FS:MKTEMP-DIR-IN KEEP DIR !
+   s" TMPDIR" GETENV >str s" service-test-" >str FS:MKTEMP-DIR-IN str> KEEP DIR !
    [: BODY @ execute ;] [: CLEANUP ;] finally ;
 
 
@@ -164,7 +164,7 @@ variable ERR-U
 \ The code the action throws, 0 for none, with fd 2 sent to the case's
 \ stderr.txt, which ERR$ then holds and which is removed.
 : LOGGED ( [ -- ] -- n )
-   ERR-PATH str> AR @ STDERR:CAPTURING ERR-U ! ERR ! ;
+   ERR-PATH AR @ STDERR:CAPTURING str> ERR-U ! ERR ! ;
 
 : LINES ( ^u8 n -- n )
    {: a:^ u:n :}
@@ -175,7 +175,7 @@ variable ERR-U
    {: a:^ u:n t :}
    s" service: " >str t CAT s\" \n" S+ str> {: w:^ wu:n :}
    u wu < if false exit then
-   a u wu - + wu w wu T-STR= ;
+   a u wu - + wu >str w wu >str T-STR= ;
 
 \ The length of a u's first line, its newline included.
 : FIRST-LINE ( ^u8 n -- n )
@@ -201,7 +201,7 @@ variable ERR-U
 : AFTER ( ^u8 n str str -- )
    {: p:^ pu:n t h :}
    ERR-U @ pu < if false t ASSERT-LOG exit then
-   ERR @ pu p pu T-STR= TTRUE
+   ERR @ pu >str p pu >str T-STR= TTRUE
    ERR @ pu + ERR-U @ pu - t h HELPED?
    t s"  / help: " S+ h CAT ASSERT-LOG ;
 

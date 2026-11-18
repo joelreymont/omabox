@@ -76,8 +76,8 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
    {: path:str want:n dir:str ar :}
    path SUBJECT !  ar SUBJECT-ARENA !
    dir s" stderr.txt" ar INSIDE {: f:str :}
-   [: [: RENDER-SUBJECT ;] [: FS:ERRNO CAUSE ! ;] finally ;] f str> ar
-   STDERR:CAPTURING {: code:n e:^ u:n :}
+   [: [: RENDER-SUBJECT ;] [: FS:ERRNO CAUSE ! ;] finally ;] f ar
+   STDERR:CAPTURING str> {: code:n e:^ u:n :}
    code want T=
    e u CAUSE @ ;
 
@@ -284,12 +284,12 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
    d GONE ;
 
 \ The bytes of the file at path.
-: SIZE ( str -- n ) str> FS:FILE-SIZE ;
+: SIZE ( str -- n ) FS:FILE-SIZE ;
 
 : USER-VERSION ( str -- n )
-   str> SQLITE:OPEN-READ {: c :}
+   SQLITE:OPEN-READ {: c :}
    c s" PRAGMA user_version"
-   [: SQLITE:STEP drop 0 SQLITE:COL-INT swap ;] SQLITE:WITH-STATEMENT
+   >str [: SQLITE:STEP drop 0 SQLITE:COL-INT swap ;] SQLITE:WITH-STATEMENT
    c SQLITE:CLOSE ;
 
 : STATUS-NEVER-INITIALIZES-OR-MIGRATES-A-JOURNAL ( ^ARENA:arena -- )
@@ -298,7 +298,7 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
    ar SCRATCH {: d:str :}
    d s" absent.sqlite3" ar INSIDE {: absent:str :}
    absent ar RENDERED NOT-SET-UP$ T$=
-   absent str> FS:EXISTS? TFALSE
+   absent FS:EXISTS? TFALSE
    d s" empty.sqlite3" ar INSIDE {: empty:str :}
    empty str> s" " FS:WRITE-ALL
    empty ATTENTION:E-JOURNAL d ar REFUSED drop 2drop

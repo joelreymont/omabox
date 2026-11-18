@@ -436,7 +436,7 @@ STRUCTURE retention
 \ after an empty directory or one that ends in "/".
 : JOINED ( ^u8 n ^u8 n ^ARENA:arena -- ^u8 n )
    {: d:^ du:n nm:^ nu:n ar :}
-   du 0= d du FS:JOIN-SEPARATED? or if 0 else 1 then {: sep:n :}
+   du 0= d du >str FS:JOIN-SEPARATED? or if 0 else 1 then {: sep:n :}
    ar du sep + nu + ARENA:ALLOC {: dst:^ size:n :}
    d dst du BYTE-COPY
    sep 0<> if $2F dst du + c! then
@@ -1034,7 +1034,7 @@ ARENA UPLOADS DROPBOX:upload
    {: p:^ u:n :}
    u 0= if false exit then
    p u s" ." STR= p u s" .." STR= or if false exit then
-   p u 0 COUNT-CHAR 0<> if false exit then
+   p u >str 0 COUNT-CHAR 0<> if false exit then
    p u UTF8:VALID? ;
 
 \ Whether every component from `at` on is NORMAL?.

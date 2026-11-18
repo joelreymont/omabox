@@ -203,7 +203,7 @@ $2E constant DOT
    if 1 else 0 then > ;
 
 : LOWERED-BYTES ( ^u8 n -- n )
-   2dup UTF8:VALID? if UNICODE:LOWERED-BYTES exit then
+   2dup UTF8:VALID? if >str UNICODE:LOWERED-BYTES exit then
    nip ;
 
 : LOWER-INTO ( ^u8 n ^u8 n -- n )
@@ -425,7 +425,7 @@ public
 : KEY-CMP ( key key -- n )
    {: a:key b:key :}
    a BYTES b BYTES STR= if 0 exit then
-   a BYTES b BYTES STR< if -1 exit then
+   a BYTES >str b BYTES >str STR< if -1 exit then
    1 ;
 
 : KEY= ( key key -- bool ) {: a:key b:key :} a BYTES b BYTES STR= ;
@@ -489,7 +489,7 @@ private
    xr yr <> if i2 j2 xr yr - false exit then
    xr END-RANK = if i2 j2 0 false exit then
    x xu y yu STR= if i2 j2 0 true exit then
-   i2 j2 x xu y yu STR< if -1 else 1 then false ;
+   i2 j2 x xu >str y yu >str STR< if -1 else 1 then false ;
 
 public
 
@@ -507,7 +507,7 @@ private
 : SUFFIX-CI? ( ^u8 n ^u8 n -- bool )
    {: p:^ u:n x:^ xu:n :}
    u xu < if false exit then
-   p u + xu - xu x xu STR=CI ;
+   p u + xu - xu >str x xu >str STR=CI ;
 
 public
 
@@ -515,8 +515,8 @@ public
 \ suffixes in any ASCII case (help.dropbox.com/en-en/sync/files-not-syncing).
 : EXCLUDED-NAME? ( ^u8 n -- bool )
    {: p:^ u:n :}
-   p u s" ~$" STARTS-WITH? if true exit then
-   p u s" .~" STARTS-WITH? if true exit then
+   p u >str s" ~$" >str STARTS-WITH? if true exit then
+   p u >str s" .~" >str STARTS-WITH? if true exit then
    p u s" desktop.ini" SUFFIX-CI? if true exit then
    p u s" thumbs.db" SUFFIX-CI? if true exit then
    p u s" .ds_store" SUFFIX-CI? if true exit then
@@ -754,11 +754,11 @@ public
 
 : HASH>JSON ( DROPBOX:hash ^JSON:writer -- ^JSON:writer )
    {: h:DROPBOX:hash w :}
-   w h DROPBOX:HASH>STR str> JSON:WRITE-STRING ;
+   w h DROPBOX:HASH>STR JSON:WRITE-STRING ;
 
 : REV>JSON ( DROPBOX:rev ^JSON:writer -- ^JSON:writer )
    {: r:DROPBOX:rev w :}
-   w r DROPBOX:REV>STR str> JSON:WRITE-STRING ;
+   w r DROPBOX:REV>STR JSON:WRITE-STRING ;
 
 : LOCAL>JSON ( local ^JSON:writer -- ^JSON:writer )
    {: v:local w :}
@@ -777,14 +777,14 @@ public
 : BASELINE>JSON ( baseline ^JSON:writer -- ^JSON:writer )
    {: v:baseline w :}
    v MATCH baseline
-      absent OF w 0 BASELINE-NAME JSON:WRITE-STRING ENDOF
+      absent OF w 0 BASELINE-NAME >str JSON:WRITE-STRING ENDOF
       present OF w 1 BASELINE-NAME TAGGED+ REMOTE>JSON
          JSON:WRITE-OBJECT-END ENDOF
-      directory OF w 2 BASELINE-NAME JSON:WRITE-STRING ENDOF
+      directory OF w 2 BASELINE-NAME >str JSON:WRITE-STRING ENDOF
    ;MATCH ;
 
 : UNKNOWN-REASON>JSON ( unknown-reason ^JSON:writer -- ^JSON:writer )
-   swap REASON-INDEX REASON-NAME JSON:WRITE-STRING ;
+   swap REASON-INDEX REASON-NAME >str JSON:WRITE-STRING ;
 
 private
 
@@ -794,10 +794,10 @@ private
    JSON:WRITE-OBJECT-END ;
 
 : DIRECTORY+ ( ^JSON:writer -- ^JSON:writer )
-   1 OBSERVATION-NAME JSON:WRITE-STRING ;
+   1 OBSERVATION-NAME >str JSON:WRITE-STRING ;
 
 : ABSENT+ ( ^JSON:writer -- ^JSON:writer )
-   2 OBSERVATION-NAME JSON:WRITE-STRING ;
+   2 OBSERVATION-NAME >str JSON:WRITE-STRING ;
 
 public
 
@@ -824,7 +824,7 @@ public
 private
 
 : DIRECTORY-OPERATION+ ( ^JSON:writer n -- ^JSON:writer )
-   OPERATION-NAME JSON:WRITE-STRING ;
+   OPERATION-NAME >str JSON:WRITE-STRING ;
 
 : REPLACE-LOCAL+ ( remote DROPBOX:hash ^JSON:writer -- ^JSON:writer )
    {: s:remote e:DROPBOX:hash w :}
@@ -909,7 +909,7 @@ public
 private
 
 : UNIT-BLOCKAGE+ ( ^JSON:writer n -- ^JSON:writer )
-   BLOCKAGE-NAME JSON:WRITE-STRING ;
+   BLOCKAGE-NAME >str JSON:WRITE-STRING ;
 
 public
 
@@ -918,7 +918,7 @@ public
    v MATCH blockage
       unsupported-file-size OF w 0 UNIT-BLOCKAGE+ ENDOF
       remote-rejected OF {: t:str :} w 1 BLOCKAGE-NAME FIELDS+
-         s" tag" KEY+ t str> JSON:WRITE-STRING ;FIELDS+ ENDOF
+         s" tag" KEY+ t JSON:WRITE-STRING ;FIELDS+ ENDOF
       download-unavailable OF {: s :} w 2 BLOCKAGE-NAME FIELDS+
          s" status" KEY+ s JSON:WRITE-U ;FIELDS+ ENDOF
       download-verification-failed OF w 3 UNIT-BLOCKAGE+ ENDOF

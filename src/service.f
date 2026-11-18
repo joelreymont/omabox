@@ -255,7 +255,7 @@ ARENA HELD n
 \ The cell is made before the descriptor, so none opens unheld.
 : DEV-NULL ( ^ARENA:arena -- n )
    HELD-CELL {: c:^ :}
-   s" /dev/null" FS:OPEN-RDWR-NOFOLLOW FD>N c !
+   s" /dev/null" >str FS:OPEN-RDWR-NOFOLLOW FD>N c !
    c @ ;
 
 \ A pipe's read end and write end, each held.
@@ -443,7 +443,7 @@ ARENA HELD n
    {: a:^ u:n ar :}
    a u ACTIVE-STATE MATCH option
       some OF ENDOF
-      none OF a u ar UTF8-LOSSY:REPAIR UNKNOWN-STATE ENDOF
+      none OF a u >str ar UTF8-LOSSY:REPAIR str> UNKNOWN-STATE ENDOF
    ;MATCH ;
 
 : STATE-IN ( ^commands ^ARENA:arena -- unit-state )
@@ -482,7 +482,7 @@ ARENA HELD n
    {: c args name:^ nu:n ar :}
    c SYSTEMCTL@ args construct wiring errors name nu ar RAN {: k :}
    k REFUSED? if c UNLOADED? if exit then then
-   FD:STDERR [: FD:STDERR k CHILD-OUT @ str> FD:TRY-WRITE-FULL drop ;]
+   FD:STDERR [: FD:STDERR k CHILD-OUT @ FD:TRY-WRITE-FULL drop ;]
    FD:WITH-NOSIGPIPE
    k name nu SUCCEEDED ;
 

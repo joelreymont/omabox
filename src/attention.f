@@ -119,7 +119,7 @@ STRUCTURE entry
 \ Path::try_exists: false only where stat answers ENOENT.
 : PRESENT? ( str -- bool )
    {: path:str :}
-   false [: drop path str> FS:TRY-STAT ;] catch {: code:n :}
+   false [: drop path FS:TRY-STAT ;] catch {: code:n :}
    code 0<> if code STAT-CAUGHT then
    if true exit then
    FS:ERRNO FS:ENOENT <> if FS:ERRNO INSPECT-FAILED then
@@ -192,7 +192,7 @@ ARENA SLOTS JOURNAL:journal
    path MODEL:PATH>STR str> {: p:^ u:n :}
    u 0= if s" ." >str exit then
    p c@ SLASH = if s" (invalid synchronized path)" >str exit then
-   p u ar UTF8-LOSSY:REPAIR >str ;
+   p u >str ar UTF8-LOSSY:REPAIR ;
 
 : ENTRY+ ( MODEL:path str ^ARENA:arena ^VEC:vector<entry> -- )
    {: path detail:str ar v :}
@@ -349,7 +349,7 @@ ARENA SLOTS JOURNAL:journal
    v x VEC:AT @ ENTRY-UNMAKE {: a sa:str da:str :}
    v y VEC:AT @ ENTRY-UNMAKE {: b sb:str db:str :}
    a b MODEL:PATH-CMP {: c:n :}
-   c 0= if da str> db str> STR< exit then
+   c 0= if da db STR< exit then
    c 0 < ;
 
 \ The entries' indices in the text's order.

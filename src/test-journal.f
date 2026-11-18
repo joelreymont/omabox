@@ -62,7 +62,7 @@ private
    {: s c id :}
    s DONE? if construct recovery-completion already-completed exit then
    c s" UPDATE recovery_records SET status = 'completed' WHERE id = ?1"
-   [: id RECOVERY-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   >str [: id RECOVERY-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT
    construct recovery-completion completed ;
 
@@ -70,7 +70,7 @@ private
    ( SQLITE:connection recovery-id str -- recovery-completion )
    {: c id path:str :}
    c s" SELECT status FROM recovery_records WHERE id = ?1"
-   [: id RECOVERY-ID>N 1 SQLITE:BIND-INT
+   >str [: id RECOVERY-ID>N 1 SQLITE:BIND-INT
       s" read recovery status" >str path RECOVERY-STATUS ;]
    SQLITE:WITH-STATEMENT
    MATCH option
@@ -212,7 +212,7 @@ STRUCTURE intent
      -- option<recovery-record> )
    {: c id ar :}
    c s" SELECT id FROM recovery_records WHERE operation_id = ?1"
-   [: id OPERATION-ID>N 1 SQLITE:BIND-INT RECOVERY-ID-ROW ;]
+   >str [: id OPERATION-ID>N 1 SQLITE:BIND-INT RECOVERY-ID-ROW ;]
    SQLITE:WITH-STATEMENT
    MATCH option
       none OF NO-RECOVERY ENDOF
@@ -237,7 +237,7 @@ STRUCTURE intent
          operations.plan_id, operations.ordinal
       FROM operations JOIN plans ON plans.id = operations.plan_id
       WHERE operations.id = ?1"
-   [: id OPERATION-ID>N 1 SQLITE:BIND-INT ar INTENT-ROW ;]
+   >str [: id OPERATION-ID>N 1 SQLITE:BIND-INT ar INTENT-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
 : JSON-ROW
@@ -253,7 +253,7 @@ STRUCTURE intent
    t INTENT-UNMAKE {: path json:str status:str plan ordinal :}
    c s" SELECT operation_json FROM operations
       WHERE plan_id = ?1 AND ordinal = ?2"
-   [: plan PLAN-ID>N 1 SQLITE:BIND-INT ordinal 1- 2 SQLITE:BIND-INT
+   >str [: plan PLAN-ID>N 1 SQLITE:BIND-INT ordinal 1- 2 SQLITE:BIND-INT
       ar JSON-ROW ;]
    SQLITE:WITH-STATEMENT MATCH option
       none OF path MISSING-PRESERVATION ENDOF
@@ -277,10 +277,10 @@ STRUCTURE intent
    c s" INSERT INTO recovery_records(operation_id, original_path,
          recovery_path, content_json, status)
       VALUES (?1, ?2, ?3, ?4, 'pending')"
-   [: id OPERATION-ID>N 1 SQLITE:BIND-INT
-      original PATH-BYTES 2 SQLITE:BIND-BLOB
-      copy PATH-BYTES 3 SQLITE:BIND-BLOB
-      js ju 4 SQLITE:BIND-TEXT
+   >str [: id OPERATION-ID>N 1 SQLITE:BIND-INT
+      original PATH-BYTES >str 2 SQLITE:BIND-BLOB
+      copy PATH-BYTES >str 3 SQLITE:BIND-BLOB
+      js ju >str 4 SQLITE:BIND-TEXT
       SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT
    c c SQLITE:LAST-ROWID >RECOVERY-ID ar READ-RECOVERY MATCH option

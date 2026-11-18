@@ -535,7 +535,7 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
    {: errno x :}
    LOG:WARN s" daemon" LOG:LINE
    s" could not send the systemd readiness notification: " LOG:TEXT+
-   errno FS:ERRNO$ LOG:TEXT+ LOG:;LINE
+   errno FS:ERRNO$ str> LOG:TEXT+ LOG:;LINE
    READINESS ENVIRONMENTAL x FAIL ;
 
 : NOTIFIED ( ^run -- bool )

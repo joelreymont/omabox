@@ -62,7 +62,6 @@ public
 -100007 s" the rotated Dropbox refresh token could not be stored"
    ERROR:CODE E-NOT-STORED
 -100010 s" Dropbox's answer cannot be used" ERROR:CODE E-UNUSABLE
--100012 s" the curl loop could not start" ERROR:CODE E-LOOP
 
 \ Dropbox's 409 tags omabox decides on, else other; no tag: path-mismatch, an
 \ entry elsewhere, and unverified, an answer omabox cannot trust.
@@ -263,7 +262,7 @@ ENUM verdict
    {: code:CURL:code what:^ what-u:n :}
    LOG-OPEN
    s" curl " LOG:TEXT+ what what-u LOG:TEXT+
-   s" : " LOG:TEXT+ code CURL:ERROR$ LOG:TEXT+
+   s" : " LOG:TEXT+ code CURL:ERROR$ str> LOG:TEXT+
    LOG:;LINE
    E-TRANSPORT throw ;
 
@@ -279,24 +278,14 @@ ENUM verdict
 
 \ ---- the loops
 
-\ One line with curl's code, then E-LOOP.
-: LOOP-REFUSED ( CURL:code -- )
-   {: rc :}
-   LOG-OPEN s" could not start the curl loop: curl code " LOG:TEXT+
-   rc CURL:CODE>N LOG:INT+ LOG:;LINE
-   E-LOOP throw ;
-
 : CURLED ( [ -- ] -- )
    {: step :}
-   CURL:LOOP-START MATCH CURL:status
-      ok OF step [: CURL:LOOP-STOP ;] finally ENDOF
-      failed OF LOOP-REFUSED ENDOF
-   ;MATCH ;
+   CURL:LOOP-START step [: CURL:LOOP-STOP ;] finally ;
 
 public
 
 \ The step under AIO's and CURL's loops, which DROPBOX's calls need;
-\ a CURL loop that will not start logs a line and throws E-LOOP.
+\ a CURL loop that will not start logs a line and throws CURL:E-LOOP.
 : WITH-LOOPS ( [ -- ] -- )
    {: step :}
    AIO:START [: step CURLED ;] [: AIO:STOP ;] finally ;
@@ -392,7 +381,7 @@ private
    {: c :}
    c CLIENT-HANDLE @ {: h:CURL:handle :}
    h CURL:RESET s" reset" OK
-   h c LINE$ CURL:URL! s" url" OK
+   h c LINE$ >str CURL:URL! s" url" OK
    h false CURL:FOLLOW! s" follow" OK
    h DEADLINE >MS CURL:TIMEOUT! s" timeout" OK
    h ;
@@ -403,10 +392,10 @@ private
    c LINE-CLEAR
    c s" Authorization: Bearer " LINE+
    c c CLIENT-ACCESS @ BUF$ LINE+
-   h c LINE$ CURL:HEADER+ s" header" OK
+   h c LINE$ >str CURL:HEADER+ s" header" OK
    c CLIENT-ROOT-LINE @ SPAN:$ {: r:^ ru:n :}
    ru 0= if exit then
-   h r ru CURL:HEADER+ s" header" OK ;
+   h r ru >str CURL:HEADER+ s" header" OK ;
 
 
 \ Free room past the answer's end, at least CHUNK bytes.
@@ -524,7 +513,7 @@ private
    {: a:^ u:n nm:^ nu:n :}
    u nu > 0= if false exit then
    a nu + c@ 58 <> if false exit then
-   a nu nm nu STR=CI ;
+   a nu >str nm nu >str STR=CI ;
 
 
 \ The trimmed value of the header name in the captured block, else empty.
@@ -547,7 +536,7 @@ private
 \ Delta-seconds: digits only, any number of them, at most WAIT-CAP.
 : DELTA-SECONDS ( ^u8 n -- option<n> )
    {: a:^ u:n :}
-   a u STR-DIGITS? 0= if OPTION:NONE exit then
+   a u >str STR-DIGITS? 0= if OPTION:NONE exit then
    0 0 begin dup u < while
       swap STR-BASE * over a + c@ STR-DIGIT-VALUE +
       WAIT-CAP min swap 1+
@@ -560,7 +549,7 @@ private
    s" Retry-After" HEADER$ epoch-seconds {: a:^ u:n now:n :}
    a u DELTA-SECONDS MATCH option
       some OF true ENDOF
-      none OF a u now DATE:PARSE-HTTP MATCH option
+      none OF a u >str now DATE:PARSE-HTTP MATCH option
          none OF 0 false ENDOF
          some OF now - 0 max true ENDOF
       ;MATCH ENDOF
@@ -960,7 +949,7 @@ private
    true c CLIENT-QUIET !
    c LINE-CLEAR c c CLIENT-API @ SPAN:$ LINE+ c s" /oauth2/token" LINE+
    c PREPARE {: h:CURL:handle :}
-   h c form execute CURL:BODY! s" body" OK
+   h c form execute >str CURL:BODY! s" body" OK
    c TRANSFER ;
 
 
@@ -1064,14 +1053,14 @@ private
 \ libcurl adds to it.
 : NO-BODY ( CURL:handle ^client -- )
    drop {: h:CURL:handle :}
-   h s" Content-Type:" CURL:HEADER+ s" header" OK
-   h s" " CURL:BODY! s" body" OK ;
+   h s" Content-Type:" >str CURL:HEADER+ s" header" OK
+   h s" " >str CURL:BODY! s" body" OK ;
 
 
 : JSON-BODY ( CURL:handle ^client -- )
    {: h:CURL:handle c :}
-   h s" Content-Type: application/json" CURL:HEADER+ s" header" OK
-   h c CLIENT-BODY @ BUF$ CURL:BODY! s" body" OK ;
+   h s" Content-Type: application/json" >str CURL:HEADER+ s" header" OK
+   h c CLIENT-BODY @ BUF$ >str CURL:BODY! s" body" OK ;
 
 
 : BODY-OPEN ( ^client -- ^JSON:writer )
@@ -1311,7 +1300,7 @@ private
 
 \ Whether the entry's path_lower is the path's full lowercase.
 : AT? ( ^u8 n ^client -- bool )
-   CLIENT-ENTRY DROPBOX-ENTRY:LOWER @ SPAN:$ UNICODE:LOWERS-TO? ;
+   -rot >str swap CLIENT-ENTRY DROPBOX-ENTRY:LOWER @ SPAN:$ >str UNICODE:LOWERS-TO? ;
 
 
 \ done stands for an entry at the path; one elsewhere is refused
@@ -1357,10 +1346,10 @@ private
 : ASKED ( CURL:handle ^client ^u8 n n -- )
    {: h:CURL:handle c r:^ ru:n at:n :}
    h c NO-BODY
-   h c r ru ARG-LINE CURL:HEADER+ s" header" OK
+   h c r ru ARG-LINE >str CURL:HEADER+ s" header" OK
    at 0 > if
       c LINE-CLEAR c s" Range: bytes=" LINE+ c at INT+ c s" -" LINE+
-      h c LINE$ CURL:HEADER+ s" header" OK
+      h c LINE$ >str CURL:HEADER+ s" header" OK
    then
    h STALLED ;
 
@@ -2422,7 +2411,7 @@ $2F constant SEPARATOR
    {: p:^ u:n :}
    u 0= if true exit then
    p u s" ." STR= p u s" .." STR= or if true exit then
-   p u 0 COUNT-CHAR 0<> ;
+   p u >str 0 COUNT-CHAR 0<> ;
 
 \ Whether the separated part from at is invalid; the index after it,
 \ or -1 past the last.
@@ -2494,7 +2483,7 @@ public
    s 0= if
       s"  got no answer" LOG:TEXT+
       c CLIENT-FAILURE @ {: f:n :}
-      f 0<> if s" : " LOG:TEXT+ f CURL:>CODE CURL:ERROR$ LOG:TEXT+ then
+      f 0<> if s" : " LOG:TEXT+ f CURL:>CODE CURL:ERROR$ str> LOG:TEXT+ then
    else
       s"  answered " LOG:TEXT+ s LOG:INT+
       c TAG$ nip 0<> if s" : " LOG:TEXT+ c LEAF$ LOG:TEXT+ then
@@ -2634,7 +2623,7 @@ ROOMS-FIT
 : BLOCK-END ( ^hasher -- )
    {: h :}
    h BLOCK$ h DIGEST$ SHA256-END
-   h WHOLE$ h DIGEST$ 32 SHA256-FEED
+   h WHOLE$ h DIGEST$ 32 >str SHA256-FEED
    h BLOCK$ SHA256-BEGIN
    0 h HASHER-FILL ! ;
 
@@ -2643,7 +2632,7 @@ ROOMS-FIT
 : BLOCK-FEED ( ^u8 n ^hasher -- n )
    {: a:^ u:n h :}
    BLOCK h HASHER-FILL @ - u min {: k:n :}
-   h BLOCK$ a k SHA256-FEED
+   h BLOCK$ a k >str SHA256-FEED
    k h HASHER-FILL +!
    h HASHER-FILL @ BLOCK = if h BLOCK-END then
    k ;
@@ -2820,9 +2809,9 @@ HEAP RUNS run
    JSON:WRITE-OBJECT-END JSON:WRITE-CLOSE
    c LINE-CLEAR c s" Dropbox-API-Arg: " LINE+
    c c CLIENT-BODY @ BUF$ LINE+
-   h c LINE$ CURL:HEADER+ s" header" OK
-   h s" Content-Type: application/octet-stream" CURL:HEADER+ s" header" OK
-   h b bu CURL:BODY! s" body" OK
+   h c LINE$ >str CURL:HEADER+ s" header" OK
+   h s" Content-Type: application/octet-stream" >str CURL:HEADER+ s" header" OK
+   h b bu >str CURL:BODY! s" body" OK
    h deadline execute ;
 
 

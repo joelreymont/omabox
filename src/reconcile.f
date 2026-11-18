@@ -405,7 +405,7 @@ STRUCTURE pending-plan
 \ these bytes, or n when none does.
 : FIND-BYTES ( ^u8 n n [ n -- MODEL:key ] -- n )
    {: p:^ u:n count:n key :}
-   0 count [: key execute KEY-BYTES p u STR< ;]
+   0 count [: key execute KEY-BYTES >str p u >str STR< ;]
    SORT:PARTITION-POINT {: at:n :}
    at count >= if count exit then
    at key execute KEY-BYTES p u STR= if at exit then
@@ -591,7 +591,7 @@ STRUCTURE pending-plan
          b v + c@ SEPARATOR < exit
       then
    then
-   b u p v STR< ;
+   b u >str p v >str STR< ;
 
 \ Whether the inventory, sorted by key, holds a path beneath the key:
 \ the first record at or past the key then "/" decides, as a sibling
@@ -831,7 +831,7 @@ STRUCTURE case-variant-move
    x SPELLING-KEY y SPELLING-KEY MODEL:KEY-CMP {: c :}
    c 0<> if c exit then
    x SPELLING-PATH y SPELLING-PATH PATH= if 0 exit then
-   x SPELLING-PATH PATH$ y SPELLING-PATH PATH$ STR<
+   x SPELLING-PATH PATH$ >str y SPELLING-PATH PATH$ >str STR<
    if -1 else 1 then ;
 
 : SAME-AS-LAST? ( ^VEC:vector<spelling> spelling -- bool )
@@ -1344,7 +1344,7 @@ STRUCTURE casing
 : LOWERED ( ^u8 n ^ARENA:arena -- str )
    {: p:^ u:n ar :}
    u 0= if s" " >str exit then
-   p u UNICODE:LOWERED-BYTES {: size:n :}
+   p u >str UNICODE:LOWERED-BYTES {: size:n :}
    ar size ARENA:ALLOC drop {: dst:^ :}
    p u dst size UNICODE:LOWER drop
    dst size >str ;
@@ -1355,7 +1355,7 @@ STRUCTURE casing
    s str> DROPBOX:ROOT-PATH? 0= if
       DROPBOX:E-ROOT-PATH ERROR:TEXT$ LISTING-FAILED
    then
-   s s str> ar LOWERED s str> SEPARATOR COUNT-CHAR LISTING-ROOT-MAKE ;
+   s s str> ar LOWERED s SEPARATOR COUNT-CHAR LISTING-ROOT-MAKE ;
 
 : ROOT-LOWER ( listing-root -- str )
    LISTING-ROOT-UNMAKE {: p:str l:str depth:n :} l ;
@@ -1368,14 +1368,14 @@ STRUCTURE casing
 : LOWERS? ( ^u8 n ^u8 n -- bool )
    {: l:^ lu:n d:^ du:n :}
    l lu UTF8:VALID? d du UTF8:VALID? and 0= if false exit then
-   d du l lu UNICODE:LOWERS-TO? ;
+   d du >str l lu >str UNICODE:LOWERS-TO? ;
 
 \ The index of the key in the lower path: past the root's lower path
 \ and a separator, or -1.
 : KEY-START ( ^u8 n str -- n )
    {: l:^ lu:n rl:str :}
    rl str> {: r:^ ru:n :}
-   l lu r ru STARTS-WITH? 0= if -1 exit then
+   l lu >str r ru >str STARTS-WITH? 0= if -1 exit then
    lu ru <= if -1 exit then
    l ru + c@ SEPARATOR <> if -1 exit then
    ru 1+ ;
@@ -1392,7 +1392,7 @@ STRUCTURE casing
 \ Whether key and path bytes have as many components, none invalid.
 : FITTING? ( ^u8 n ^u8 n -- bool )
    {: k:^ ku:n p:^ pu:n :}
-   k ku SEPARATOR COUNT-CHAR p pu SEPARATOR COUNT-CHAR <>
+   k ku >str SEPARATOR COUNT-CHAR p pu >str SEPARATOR COUNT-CHAR <>
    if false exit then
    k ku DROPBOX:INVALID-PARTS? p pu DROPBOX:INVALID-PARTS? or 0= ;
 
@@ -1775,7 +1775,7 @@ STRUCTURE casing
    ( MODEL:key MODEL:path ^VEC:vector<casing> ^ARENA:arena
      -- MODEL:path )
    {: k p cv ar :}
-   k KEY-BYTES SEPARATOR COUNT-CHAR p PATH$ SEPARATOR COUNT-CHAR <>
+   k KEY-BYTES >str SEPARATOR COUNT-CHAR p PATH$ >str SEPARATOR COUNT-CHAR <>
    if p PATH$ BAD-PATH then
    0 k p cv [: nip swap dup 0 > if 1+ then + ;] EACH-SPELLED
    {: size:n :}
@@ -3773,7 +3773,7 @@ ENUM pass-state DERIVE eq
 
 : NTH< ( n n ^VEC:vector<str> -- bool )
    {: x:n y:n v :}
-   v x NTH$ v y NTH$ STR< ;
+   v x NTH$ >str v y NTH$ >str STR< ;
 
 \ How many distinct byte strings v holds, counted in STR< order.
 : DISTINCT ( ^VEC:vector<str> ^ARENA:arena -- n )

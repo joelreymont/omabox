@@ -9,17 +9,30 @@ depends=(glibc curl sqlite libsecret glib2 libunistring systemd)
 makedepends=(git)
 # Habu's programs have no section headers to strip or split.
 options=(!strip !debug)
-_habu=6391c0b45e03890b7787b6bb890bec36445ca02b
+_habu=f29c6465d4ec0283b640618cf953058ab53808a7
 source=("omabox::git+https://github.com/joelreymont/omabox.git#tag=v$pkgver"
         "habu::git+https://github.com/joelreymont/habu.git#commit=$_habu")
 sha256sums=(SKIP SKIP)
 
 build() {
-  # No route builds hb without an hb: the builder's seeds one built from the
-  # pinned source (Habu's docs/bootstrap.md, "Recovery").
-  local seed
+  # No route builds hb without an hb: the builder's seeds a candidate from the
+  # pinned source, which the convergence check rebuilds until two generations
+  # are one image (Habu's docs/bootstrap.md, "Recovery").
+  local seed gen
   seed=$(command -v hb) || { echo "makepkg needs Habu's hb on PATH" >&2; return 1; }
-  (cd habu && "$seed" --load tools/seed-main.f -- "$seed")
+  (
+    cd habu
+    "$seed" --load tools/seed-main.f -- "$seed"
+    rm -rf "$srcdir/chain" "$srcdir"/g[123] "$srcdir"/g[123].map
+    mkdir "$srcdir/chain"
+    TMPDIR="$srcdir/chain" bin/hb --load tools/chain-run-build.f -- \
+      bin/hb "$srcdir/g1" "$srcdir/g2" "$srcdir/g3" "$srcdir/chain"
+    # The check stops at the first generation equal to the one before it.
+    gen="$srcdir/g3"
+    [[ -e $gen ]] || gen="$srcdir/g2"
+    mv "$gen" bin/hb
+    mv "$gen.map" bin/hb.map
+  )
   cd omabox
   mkdir -p bin
   ../habu/bin/hb --load ../habu/tools/hb-build.f -- src/omaboxd.f -o bin/omaboxd

@@ -792,7 +792,7 @@ ARENA JOURNALS JOURNAL:journal
 \ fail, which throws, takes the errno of any other failure.
 : EXISTS? ( str [ n -- ] -- bool )
    {: p fail :}
-   false [: drop p str> FS:TRY-STAT ;] catch {: there code:n :}
+   false [: drop p FS:TRY-STAT ;] catch {: there code:n :}
    code 0<> if code STAT-CAUSE fail execute code throw then
    there if true exit then
    FS:ERRNO FS:ENOENT <> if FS:ERRNO fail execute then
@@ -835,7 +835,7 @@ ARENA JOURNALS JOURNAL:journal
 \ stays, as Rust's AlreadyExists does.
 : MADE ( str -- )
    {: root :}
-   [: root str> FS:MODE-PRIVATE-DIR FS:MKDIR-MODE ;] catch {: code:n :}
+   [: root FS:MODE-PRIVATE-DIR FS:MKDIR-MODE ;] catch {: code:n :}
    code 0= if exit then
    code E-FS-IO = FS:ERRNO FS:EEXIST = and if exit then
    code E-FS-PATH = if root FS:ENAMETOOLONG CREATE-ROOT-FAILED then
@@ -883,7 +883,7 @@ ARENA JOURNALS JOURNAL:journal
 \ The folders to dir and the widget's link at link, made.
 : WIDGET-MADE ( str str -- )
    {: dir link :}
-   [: dir str> FS:MAKE-DIRS WIDGET link str> FS:MAKE-SYMLINK ;] catch
+   [: dir FS:MAKE-DIRS WIDGET >str link FS:MAKE-SYMLINK ;] catch
    {: code:n :}
    code 0<> if link code FS-CAUSE LINK-FAILED then ;
 
@@ -1331,10 +1331,12 @@ ARENA PRIORS prior
    [: cmd swap PERFORM ;] ARENA:WITH ;
 
 \ A code outside the application block -999999..-100000, which no
-\ omabox word logged, on a line of its own.
+\ omabox word logged, on a line of its own. CURL:E-LOOP is logged too:
+\ CURL:LOOP-START reports it before it throws.
 : UNEXPECTED ( n -- )
    {: code:n :}
    code -100000 -999999 IN? if exit then
+   code CURL:E-LOOP = if exit then
    LOG-OPEN s" the command failed unexpectedly (" LOG:TEXT+
    code LOG:CODE+ s" )" LOG:TEXT+ LOG:;LINE ;
 
