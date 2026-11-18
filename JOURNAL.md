@@ -1729,3 +1729,24 @@ Observation for the blog: Cargo pins a crate's version and semver tells
 the client what a bump will cost. Habu has no versions, so the client pins
 a commit and pays for every change since in one go. A library's "nothing
 calls this" holds only for the code it can see.
+
+## 2026-11-18: the memory a pass left behind
+
+With the upload copies gone, the daemon still held 63 MB of anonymous
+memory, flat from pass to pass. Most of it was one 57,344 kB mapping:
+the 8, 16 and 32 MB chunks of the pass's arena, which doubles each new
+chunk. The daemon reset that arena when a pass started, so between passes
+it kept the whole of the last one. Emptying it as the pass ends took the
+idle daemon to 8.6 MB.
+
+The chunks were that large because a pass reads whole inventories into
+vectors that grow by doubling. In an arena, a resize that moves a block
+leaves the old copy where it was: 16 MB of the 63 MB a no-op pass over
+16,400 entries allocates are dead copies. A pass still peaks at about
+70 MB, 2.9 to 3.9 kB per entry; that is the next fix.
+
+Observation for the blog: a Rust value is freed when its owner goes out
+of scope, so memory follows the code that uses it. An arena's memory
+lives until someone resets it, and here the reset was in the right step
+but at the wrong end of it. A test cannot tell the two apart; only the
+idle daemon's memory can.

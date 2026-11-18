@@ -695,12 +695,11 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
       unavailable OF drop drop ROOT-UNAVAILABLE x FAIL ENDOF
    ;MATCH ;
 
-\ Rust's activate_configured_root on the pass's arena, reset first;
-\ none is another directory standing in for the root.
+\ Rust's activate_configured_root on the pass's arena; none is another
+\ directory standing in for the root.
 : ROOT-ACTIVE ( ^run -- bool )
    {: x :}
    x RUN-PASSES @ {: ar :}
-   ar ARENA:RESET
    x RUN-CONFIG @ CONFIG:SYNC-ROOT CONFIG:ABS-PATH>STR
    x JOURNAL@ ar JOURNAL:INSPECT-ROOT MATCH option
       none OF ROOT-UNAVAILABLE x FAIL ENDOF
@@ -749,11 +748,17 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
    code code x RUN-LINK @ PASS-FAILURE x FAILED
    x WEIGH-PASS ;
 
+: SYNCED ( ^run -- sync-event )
+   {: x :}
+   x [: ROOT-ACTIVE ;] TRIED 0= if x WEIGH-PASS exit then
+   x PASSED ;
+
+\ The pass's arena is emptied as the pass ends, so a waiting daemon
+\ holds none of the pass's memory.
 : SYNC ( ^run -- sync-event )
    {: x :}
    STATUS-PHASE:SYNCING x PHASE!
-   x [: ROOT-ACTIVE ;] TRIED 0= if x WEIGH-PASS exit then
-   x PASSED ;
+   [: x SYNCED ;] [: x RUN-PASSES @ ARENA:RESET ;] finally ;
 
 \ Rust's clean_sync_pass, then the phase.
 : CLEANED ( ^run -- )
@@ -803,6 +808,7 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
    k DROPBOX:CURSOR>STR str> LONG-POLL-S x CLIENT@ DROPBOX:WAIT
    x WOKEN ;
 
+\ The cursor stays in the pass's arena until the next pass ends.
 : POLLED ( ^run -- bool )
    {: x :}
    x JOURNAL@ x RUN-PASSES @ JOURNAL:REMOTE-CURSOR MATCH option
