@@ -1,23 +1,24 @@
-\ journal.f - package JOURNAL: the sync journal, a SQLite file at schema 8
-\ (rust src/journal.rs), and the Dropbox account and local root it is
-\ bound to. OPEN makes the file 0600 without following a link and creates
-\ schema 8 in a new one, in one transaction, from migrations/, whose texts
-\ this file lays in the program as it loads; any version but 0 and 8 is
-\ refused unchanged, and OPEN-READ refuses any but 8. A SQLite failure is
-\ SQLITE's throw, passed up unchanged. JOURNAL's own failures are logged
-\ once with the Rust version's text, then thrown as its codes. E-FILE,
-\ E-DISK-FULL and E-ROOT leave the host errno in FS:ERRNO, 0 where there
-\ is none; E-DISK-FULL is E-FILE on ENOSPC.
+\ journal.f - package JOURNAL: the sync journal, a SQLite file at schema 9
+\ (rust src/journal.rs at schema 8), and the Dropbox account and local root
+\ it is bound to. OPEN makes the file 0600 without following a link,
+\ creates schema 9 in a new one and migrates schema 8 to it, each in one
+\ transaction, from migrations/, whose texts this file lays in the program
+\ as it loads; any version but 0, 8 and 9 is refused unchanged, and
+\ OPEN-READ refuses any but 9. A SQLite failure is SQLITE's throw, passed
+\ up unchanged. JOURNAL's own failures are logged once with the Rust
+\ version's text, then thrown as its codes. E-FILE, E-DISK-FULL and E-ROOT
+\ leave the host errno in FS:ERRNO, 0 where there is none; E-DISK-FULL is
+\ E-FILE on ENOSPC.
 \ A root binding is the root's inode, birth time and subvolume: btrfs gives
 \ a subvolume a new device number at every mount, so the device is none
 \ of it. A binding with no birth time is one a version-6 journal recorded;
 \ an activation whose path and inode match it upgrades it in place.
-\ A baseline, a plan and a conflict are keyed by the canonical path
-\ MODEL:FOLD gives the display path. Every stored value is written and
-\ read by MODEL's JSON words; one MODEL cannot read is logged with the
-\ record's path and its cause and thrown as E-JSON. Each write is one
-\ immediate transaction, and the remote cursor and inventory are read in
-\ one deferred one.
+\ A baseline, a plan, a conflict and a local observation are keyed by
+\ the canonical path MODEL:FOLD gives the display path. Every stored
+\ value is written and read by MODEL's JSON words; one MODEL cannot read
+\ is logged with the record's path and its cause and thrown as E-JSON.
+\ Each write is one immediate transaction, and the remote cursor and
+\ inventory are read in one deferred one.
 \ STORAGE CLASS. CALLER-OWNED: a journal OPEN makes borrows its path
 \ until CLOSE, and a binding INSPECT answers borrows its path; every
 \ string and vector a reader answers lies in the arena the caller passes.
@@ -117,7 +118,7 @@ ENUM local-root-activation
 
 private
 
-8 constant SCHEMA
+9 constant SCHEMA
 5000 constant BUSY-MS
 $180 constant MODE-OWNER            \ 0600
 $1FF constant MODE-BITS
@@ -125,6 +126,35 @@ $7FFFFFFFFFFFFFFF constant INT-MAX  \ SQLite's largest integer
 1000000000 constant NS-PER-S
 
 16 TASK:+USERS ID-ROW u8
+
+
+\ ---- stored rows ---------------------------------------------------
+
+: COPIED ( ^u8 n ^ARENA:arena -- str )
+   {: a:^ u ar :}
+   ar u ARENA:ALLOC drop {: dst:^ :}
+   a dst u BYTE-COPY
+   dst u >str ;
+
+: PATH-BYTES ( MODEL:path -- ^u8 n ) MODEL:PATH>STR str> ;
+
+: BYTES-PATH ( ^u8 n ^ARENA:arena -- MODEL:path ) COPIED MODEL:>PATH ;
+
+: KEY-BYTES ( MODEL:key -- ^u8 n ) MODEL:KEY>STR str> ;
+
+\ Runs the statement's row, reset for the next.
+: RAN ( SQLITE:statement -- SQLITE:statement )
+   SQLITE:STEP drop SQLITE:RESET ;
+
+: INSERT-LOCAL ( -- ^u8 n )
+   s" INSERT INTO local_observations(
+         path, observation_json, canonical_path
+      ) VALUES (?1, ?2, ?3)" ;
+
+\ Binds INSERT-LOCAL's canonical_path, ?3.
+: BIND-KEY
+   ( SQLITE:statement MODEL:path ^ARENA:arena -- SQLITE:statement )
+   MODEL:FOLD KEY-BYTES >str 3 SQLITE:BIND-BLOB ;
 
 
 \ ---- migrations ----------------------------------------------------
@@ -147,6 +177,7 @@ s" migrations/0005.sql" create V5 LAY
 s" migrations/0006.sql" create V6 LAY
 s" migrations/0007.sql" create V7 LAY
 s" migrations/0008.sql" create V8 LAY
+s" migrations/0009.sql" create V9 LAY
 
 : TEXT ( ^n -- ^u8 n )
    {: p:^n :}
@@ -301,14 +332,52 @@ private
    c V6 RUN
    c s" PRAGMA user_version = 6" SQLITE:EXEC ;
 
-\ Schema 8 in a new file: every migration in order.
+\ The top statement's row inserted through the one under it.
+: LOCAL-COPIED
+   ( SQLITE:statement SQLITE:statement ^ARENA:arena
+     -- SQLITE:statement SQLITE:statement )
+   {: ar :}
+   0 SQLITE:COL-BLOB {: p:str :}
+   1 SQLITE:COL-TEXT >str {: o:str :}
+   swap p 1 SQLITE:BIND-BLOB o 2 SQLITE:BIND-TEXT
+   p str> ar BYTES-PATH ar BIND-KEY RAN swap ;
+
+: ROWS-COPIED
+   ( SQLITE:statement SQLITE:statement ^ARENA:arena
+     -- SQLITE:statement SQLITE:statement )
+   {: ar :}
+   begin SQLITE:STEP while ar LOCAL-COPIED ar ARENA:RESET repeat ;
+
+\ Each schema-8 row inserted through the statement.
+: ROWS-READ
+   ( SQLITE:statement SQLITE:connection ^ARENA:arena
+     -- SQLITE:statement )
+   {: c ar :}
+   c s" SELECT path, observation_json FROM local_observations_8"
+   >str [: ar ROWS-COPIED ;] SQLITE:WITH-STATEMENT ;
+
+: LOCALS-COPIED ( SQLITE:connection ^ARENA:arena -- )
+   {: c ar :}
+   c INSERT-LOCAL >str [: c ar ROWS-READ ;] SQLITE:WITH-STATEMENT ;
+
+\ Migration 9: local observations keyed by canonical path, each row
+\ copied with its path folded.
+: MIGRATE-LOCAL-OBSERVATIONS ( SQLITE:connection -- )
+   {: c :}
+   c V9 RUN
+   c [: LOCALS-COPIED ;] ARENA:WITH
+   c s" DROP TABLE local_observations_8; PRAGMA user_version = 9"
+   SQLITE:EXEC ;
+
+\ Schema 9 in a new file: every migration in order.
 : CREATE-SCHEMA ( SQLITE:connection -- )
    {: c :}
    c V1 RUN  c V2 RUN  c V3 RUN  c V4 RUN
    c CANONICAL-PATHS
    c V5 RUN
    c MIGRATE-BLOCKED-PLANS
-   c V7 RUN  c V8 RUN ;
+   c V7 RUN  c V8 RUN
+   c MIGRATE-LOCAL-OBSERVATIONS ;
 
 : WRITABLE ( journal -- )
    {: j :}
@@ -317,9 +386,12 @@ private
    [: j >PATH MODE-OWNER FS:CHMOD-MODE ;]
    s" restrict journal permissions" >str j >PATH FILE-IO
    c VERSION {: v :}
-   v 0<> v SCHEMA <> and if j >PATH v UNSUPPORTED then
+   v 0<> v 8 <> and v SCHEMA <> and if j >PATH v UNSUPPORTED then
    j CONFIGURE-WRITABLE
-   v 0= if c [: c CREATE-SCHEMA ;] SQLITE:WITH-TRANSACTION then ;
+   v 0= if c [: c CREATE-SCHEMA ;] SQLITE:WITH-TRANSACTION then
+   v 8 = if
+      c [: c MIGRATE-LOCAL-OBSERVATIONS ;] SQLITE:WITH-TRANSACTION
+   then ;
 
 \ Deletes each completed plan no pending or unretained recovery record
 \ holds, operations first: both deletes select the same plans.
@@ -368,14 +440,15 @@ private
 
 public
 
-\ The journal at path, schema 8 created in a new or empty file and its
-\ completed work pruned; another version is refused, the file unchanged.
+\ The journal at path, schema 9 created in a new or empty file or
+\ migrated from 8, and its completed work pruned; another version is
+\ refused, the file unchanged.
 : OPEN ( str -- journal )
    {: path:str :}
    path OWNER-ONLY
    path str> SQLITE:OPEN path JOURNAL-MAKE [: READY ;] SET-UP ;
 
-\ The schema-8 journal at path, never created or changed. Its log lines
+\ The schema-9 journal at path, never created or changed. Its log lines
 \ name it `[Omabox journal]`, as Rust's status redacts the path.
 : OPEN-READ ( str -- journal )
    {: path:str :}
@@ -391,12 +464,6 @@ private
 : SAME? ( str str -- bool )
    {: a:str b:str :}
    a str> b str> STR= ;
-
-: COPIED ( ^u8 n ^ARENA:arena -- str )
-   {: a:^ u ar :}
-   ar u ARENA:ALLOC drop {: dst:^ :}
-   a dst u BYTE-COPY
-   dst u >str ;
 
 : TEXT-COPY ( SQLITE:statement n ^ARENA:arena -- SQLITE:statement str )
    {: col ar :}
@@ -1021,12 +1088,6 @@ BUF:HDR-BYTES TASK:+USERS ENCODED u8
 
 \ ---- stored columns ------------------------------------------------
 
-: PATH-BYTES ( MODEL:path -- ^u8 n ) MODEL:PATH>STR str> ;
-
-: BYTES-PATH ( ^u8 n ^ARENA:arena -- MODEL:path ) COPIED MODEL:>PATH ;
-
-: KEY-BYTES ( MODEL:key -- ^u8 n ) MODEL:KEY>STR str> ;
-
 : BYTES-KEY ( ^u8 n ^ARENA:arena -- MODEL:key ) COPIED MODEL:>KEY ;
 
 : ON-BUFFER ( R ^n [ R ^JSON:writer -- S ] -- S )
@@ -1243,32 +1304,31 @@ private
 
 \ ---- the local scan ------------------------------------------------
 
-: INSERT-LOCAL ( -- ^u8 n )
-   s" INSERT INTO local_observations(path, observation_json)
-      VALUES (?1, ?2)" ;
-
 : INSERT-HASH ( -- ^u8 n )
    s" INSERT INTO local_hash_cache(root_generation, path, hash_json)
       VALUES (?1, ?2, ?3)" ;
 
-\ Runs the statement's row, reset for the next.
-: RAN ( SQLITE:statement -- SQLITE:statement )
-   SQLITE:STEP drop SQLITE:RESET ;
-
 : LOCAL-INSERTED
-   ( SQLITE:statement MODEL:local-record ^JSON:writer
+   ( SQLITE:statement MODEL:local-record ^JSON:writer ^ARENA:arena
      -- SQLITE:statement )
-   {: r w :}
+   {: r w ar :}
    r MODEL-LOCAL--RECORD:UNMAKE {: p:MODEL:path o :}
    p PATH-BYTES >str 1 SQLITE:BIND-BLOB
    w [: o swap MODEL:LOCAL-OBSERVATION>JSON ;] ENCODE >str 2 SQLITE:BIND-TEXT
-   RAN ;
+   p ar BIND-KEY RAN ;
+
+: LOCALS-INSERTED
+   ( SQLITE:statement ^VEC:vector<MODEL:local-record> ^JSON:writer
+     ^ARENA:arena -- SQLITE:statement )
+   {: v w ar :}
+   v VEC:COUNT 0 ?do
+      v i VEC:AT @ w ar LOCAL-INSERTED ar ARENA:RESET
+   loop ;
 
 : LOCAL-INSERTS
    ( SQLITE:statement ^VEC:vector<MODEL:local-record> ^JSON:writer
      -- SQLITE:statement )
-   {: v w :}
-   v VEC:COUNT 0 ?do v i VEC:AT @ w LOCAL-INSERTED loop ;
+   [: LOCALS-INSERTED ;] ARENA:WITH ;
 
 \ A hash that is not Dropbox's is never cached.
 : HASH-INSERTED

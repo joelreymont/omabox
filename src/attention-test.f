@@ -307,6 +307,10 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
    zero str> SQLITE:OPEN SQLITE:CLOSE
    zero ATTENTION:E-JOURNAL d ar REFUSED drop 2drop
    zero USER-VERSION 0 T=
+   d s" version-eight.sqlite3" ar INSIDE {: eight:str :}
+   s" src/oracle/journal.sqlite3" eight str> FS:COPY-FILE-STREAM
+   eight ATTENTION:E-JOURNAL d ar REFUSED drop 2drop
+   eight USER-VERSION 8 T=
    d s" unbound.sqlite3" ar INSIDE {: unbound:str :}
    unbound JOURNAL:OPEN JOURNAL:CLOSE
    unbound ar RENDERED NOT-SET-UP$ T$=
@@ -321,7 +325,7 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
    p ATTENTION:E-JOURNAL d ar REFUSED drop {: e:^ u:n :}
    e u s" absolute-journal-path-sentinel" CONTAINS? TFALSE
    e u FIRST-LINE 2swap
-   s" journal: journal `[Omabox journal]` has unsupported schema version 0; supported version is 8"
+   s" journal: journal `[Omabox journal]` has unsupported schema version 0; supported version is 9"
    LINE-ENDS? TTRUE
    FIRST-LINE 2swap
    s" attention: could not open the journal read-only" LINE-ENDS? TTRUE

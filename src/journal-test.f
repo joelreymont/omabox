@@ -1,7 +1,11 @@
-\ journal-test.f - JOURNAL's open, schema 8, bindings, inventories,
+\ journal-test.f - JOURNAL's open, schema 9, bindings, inventories,
 \ baselines, plans, completions, conflicts and recoveries on journals
 \ under TMPDIR: a new journal's sqlite_master and user_version against
-\ src/oracle/schema.tsv as a set; versions 1, 7 and 9 refused unchanged;
+\ src/oracle/schema.tsv as a set; versions 1, 7 and 10 refused unchanged;
+\ src/oracle/journal.sqlite3, a schema-8 journal, migrated with its local
+\ observations keyed by their folded paths, and, without its
+\ remote_directories index, left at schema 8 with every row when the
+\ migration fails;
 \ src/oracle/journal.sqlite3, copied and opened, giving journal.tsv's
 \ Dropbox and local root bindings, local and remote inventories, remote
 \ cursor, baselines, baseline paths, pending and blocked plans, pending
@@ -12,7 +16,7 @@
 \ its src/daemon.rs under their names, which
 \ build each decision the Rust ones ask the planner for as
 \ src/oracle/plan.tsv holds it. Habu opens no
-\ schema-6 file, so the version-six tests start from a schema-8 journal
+\ schema-6 file, so the version-six tests start from a schema-9 journal
 \ holding the row migration 7 leaves for a schema-6 root, birth and
 \ subvolume NULL, and the baseline the Rust tests' version_six_with_root
 \ writes. A copy of the oracle journal with a value MODEL cannot read
@@ -125,6 +129,16 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    a LINE 1+ u BYTE-COPY
    10 LINE u + 1+ c!
    BODY BODY-U @ LINE u 2 + CONTAINS? ;
+
+
+\ The oracle journal copied to path and migrated to schema 9 in one
+\ transaction, its completed work kept.
+: MIGRATED-ORACLE ( str -- )
+   {: p:str :}
+   s" src/oracle/journal.sqlite3" p str> FS:COPY-FILE-STREAM
+   p str> SQLITE:OPEN {: c :}
+   c [: c MIGRATE-LOCAL-OBSERVATIONS ;] SQLITE:WITH-TRANSACTION
+   c SQLITE:CLOSE ;
 
 
 : PUT ( ^u8 n n -- n )
@@ -678,18 +692,18 @@ variable SCANNED       \ query plan rows that scan the table
    p OPEN {: j :}
    0 j >CONNECTION SCHEMA-SQL >str [: SCHEMA-ROWS ;] SQLITE:WITH-STATEMENT
    26 T=
-   j >CONNECTION VERSION 8 T=
-   s\" user_version\t8" HELD? TTRUE
+   j >CONNECTION VERSION 9 T=
+   s\" user_version\t9" HELD? TTRUE
    BODY BODY-U @ >str 10 COUNT-CHAR 28 T=
    j CLOSE
    d GONE ;
 
 : OTHER-VERSIONS-ARE-REFUSED-UNCHANGED ( ^ARENA:arena -- )
    {: ar :}
-   s" versions 1, 7 and 9 are refused unchanged" T-LABEL
+   s" versions 1, 7 and 10 are refused unchanged" T-LABEL
    1 ar REFUSED
    7 ar REFUSED
-   9 ar REFUSED ;
+   10 ar REFUSED ;
 
 : ORACLE-JOURNAL-HOLDS-ITS-BINDINGS ( ^ARENA:arena -- )
    {: ar :}
@@ -701,6 +715,55 @@ variable SCANNED       \ query plan rows that scan the table
    j ar DROPBOX-BINDING DROPBOX-HELD? TTRUE
    j ar LOCAL-ROOT-BINDING ROOT-HELD? TTRUE
    j CLOSE
+   d GONE ;
+
+\ The row's canonical path is the key MODEL:FOLD gives its path.
+: FOLDED? ( SQLITE:statement ^ARENA:arena -- SQLITE:statement bool )
+   {: ar :}
+   0 SQLITE:COL-BLOB str> ar BYTES-PATH ar MODEL:FOLD {: k :}
+   1 SQLITE:COL-BLOB k KEY-BYTES >str SAME? ;
+
+\ Counts the rows, each one FOLDED? holds for.
+: FOLDED-ROWS ( n SQLITE:statement ^ARENA:arena -- n SQLITE:statement )
+   {: ar :}
+   begin SQLITE:STEP while
+      ar FOLDED? TTRUE
+      swap 1+ swap
+   repeat ;
+
+: ORACLE-JOURNAL-IS-MIGRATED ( ^ARENA:arena -- )
+   {: ar :}
+   s" the oracle journal migrates to schema.tsv's schema" T-LABEL
+   s" src/oracle/schema.tsv" ORACLE
+   ar JOURNAL-AT {: d:str p:str :}
+   s" src/oracle/journal.sqlite3" p str> FS:COPY-FILE-STREAM
+   p OPEN {: j :}
+   0 j >CONNECTION SCHEMA-SQL >str [: SCHEMA-ROWS ;] SQLITE:WITH-STATEMENT
+   26 T=
+   j >CONNECTION VERSION 9 T=
+   0 j >CONNECTION
+   s" SELECT path, canonical_path FROM local_observations" >str
+   [: ar FOLDED-ROWS ;] SQLITE:WITH-STATEMENT 3 T=
+   j CLOSE
+   d GONE ;
+
+\ The oracle journal without its remote_directories index fails
+\ migration 9's DROP INDEX, inside the one transaction.
+: FAILED-MIGRATION-LEAVES-SCHEMA-8 ( ^ARENA:arena -- )
+   {: ar :}
+   s" a failed migration leaves schema 8 and every row" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   s" src/oracle/journal.sqlite3" p str> FS:COPY-FILE-STREAM
+   p str> SQLITE:OPEN {: c :}
+   c s" DROP INDEX remote_directories" SQLITE:EXEC
+   c SQLITE:CLOSE
+   p SUBJECT !
+   [: SUBJECT @ OPEN CLOSE ;] SQLITE:E-SQL d
+   s" no such index: remote_directories" ar LOGGED
+   p VERSION-AT 8 T=
+   p str> SQLITE:OPEN {: k :}
+   k s" SELECT COUNT(*) FROM local_observations" QUERY-INT 3 T=
+   k SQLITE:CLOSE
    d GONE ;
 
 
@@ -1022,7 +1085,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    ( ^ARENA:arena -- )
    {: ar :}
    s" journal_rejects_newer_schema_without_changing_its_version" T-LABEL
-   9 ar REFUSED ;
+   10 ar REFUSED ;
 
 : JOURNAL-SCHEMA-AND-PAYLOAD-COLUMNS-ARE-NOT-SECRET-BEARING
    ( ^ARENA:arena -- )
@@ -1570,7 +1633,7 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    s" the oracle journal's baselines are journal.tsv's" T-LABEL
    s" src/oracle/journal.tsv" ORACLE
    ar JOURNAL-AT {: d:str p:str :}
-   s" src/oracle/journal.sqlite3" p str> FS:COPY-FILE-STREAM
+   p MIGRATED-ORACLE
    p OPEN-READ {: j :}
    j s" Docs" ar BASELINE-LINE HELD? TTRUE
    j s" Docs/A.txt" ar BASELINE-LINE HELD? TTRUE
@@ -1635,7 +1698,7 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    s" the oracle journal's conflicts are journal.tsv's" T-LABEL
    s" src/oracle/journal.tsv" ORACLE
    ar JOURNAL-AT {: d:str p:str :}
-   s" src/oracle/journal.sqlite3" p str> FS:COPY-FILE-STREAM
+   p MIGRATED-ORACLE
    p OPEN-READ {: j :}
    j ar CONFLICTS CONFLICTS-LINE HELD? TTRUE
    j CLOSE
@@ -1949,7 +2012,7 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    s" the oracle journal's plans are journal.tsv's" T-LABEL
    s" src/oracle/journal.tsv" ORACLE
    ar JOURNAL-AT {: d:str p:str :}
-   s" src/oracle/journal.sqlite3" p str> FS:COPY-FILE-STREAM
+   p MIGRATED-ORACLE
    p OPEN-READ {: j :}
    s" pending_plans" j ar PENDING-PLANS PLANS-LINE HELD? TTRUE
    s" blocked_plans" j ar BLOCKED-PLANS PLANS-LINE HELD? TTRUE
@@ -2294,7 +2357,7 @@ variable CRAFT
 : KEPT ( -- MODEL:baseline )
    s" kept" s" rev-kept" REMOTE-FILE MODEL-BASELINE:PRESENT ;
 
-\ A schema-8 journal holding a schema-6 root's row, as migration 7
+\ A schema-9 journal holding a schema-6 root's row, as migration 7
 \ copies it, and the baseline version_six_with_root writes.
 : LEGACY ( str ^ARENA:arena -- )
    {: p:str ar :}
@@ -2339,7 +2402,7 @@ variable CRAFT
    r ar LOCAL-ROOT-BINDING LEGACY-ROOT RECORD-HELD? TTRUE
    r CLOSE
    p OPEN {: j :}
-   j >CONNECTION VERSION 8 T=
+   j >CONNECTION VERSION 9 T=
    j ar LOCAL-ROOT-BINDING LEGACY-ROOT RECORD-HELD? TTRUE
    s" observed.txt" 10 ar LOCAL-HASH {: hash :}
    j LEGACY-ROOT >BINDING OBSERVED ar ONE-LOCAL hash ar ONE-HASH
@@ -2439,7 +2502,7 @@ variable CRAFT
    s" the oracle journal's recoveries are journal.tsv's" T-LABEL
    s" src/oracle/journal.tsv" ORACLE
    ar JOURNAL-AT {: d:str p:str :}
-   s" src/oracle/journal.sqlite3" p str> FS:COPY-FILE-STREAM
+   p MIGRATED-ORACLE
    p OPEN-READ {: j :}
    s" pending_recoveries" j ar PENDING-RECOVERIES RECOVERIES-LINE HELD?
    TTRUE
@@ -3229,6 +3292,8 @@ variable CRAFT
    ar NEW-JOURNAL-HAS-THE-ORACLE-SCHEMA
    ar OTHER-VERSIONS-ARE-REFUSED-UNCHANGED
    ar ORACLE-JOURNAL-HOLDS-ITS-BINDINGS
+   ar ORACLE-JOURNAL-IS-MIGRATED
+   ar FAILED-MIGRATION-LEAVES-SCHEMA-8
    ar WRITABLE-JOURNAL-CREATES-OWNER-ONLY-DATABASE
    ar READ-ONLY-JOURNAL-PRESERVES-EXISTING-PERMISSIONS
    ar WRITABLE-JOURNAL-RESTRICTS-EXISTING-DATABASE

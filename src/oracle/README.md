@@ -8,12 +8,16 @@
   it in hex.
 - `schema.tsv`: a fresh journal's `sqlite_master` in `rowid` order (`type`,
   `name`, `tbl_name`, `sql`; NULL empty; `\n`, `\t`, `\\` escaped), then
-  `user_version`.
+  `user_version`. It is the Rust version's schema 8 changed by
+  migrations/0009.sql: local_observations' canonical_path and its index, no
+  remote_directories index, and user_version 9.
 - `journal.sqlite3`: a schema-8 journal written through `Journal`, a row in
   every table but `legacy_local_root_adoption`, which only a migration fills.
-  `recovery_records.retained_at` holds the clock (`unixepoch()`).
+  `recovery_records.retained_at` holds the clock (`unixepoch()`). OPEN
+  migrates it to schema 9.
 - `journal.tsv`: each public read of `journal.sqlite3`, then its answer as
   Rust's `{:?}`; `completed_recoveries` carries that clock.
 
 Written by `OMABOX_ORACLE=<dir> cargo test oracle -- --ignored` at `rust`
-commit `e3c161352d0ddca750059a1ef7aea4f7c7cce811` (`src/journal/oracle.rs`).
+commit `e3c161352d0ddca750059a1ef7aea4f7c7cce811` (`src/journal/oracle.rs`),
+but for `schema.tsv`'s schema-9 rows, read from a journal `OPEN` creates.

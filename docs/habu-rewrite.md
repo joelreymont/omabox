@@ -52,15 +52,17 @@ watcher comes only for a measured need.
 | `PLANNER` | `PLAN`, a decision table | `planner.rs` |
 | `CONFIG` | paths, `config.toml`, the instance lock | `config.rs` |
 | `STATUS` | `status.json`, rewritten every 20 s by its own task | `runtime_status.rs` |
-| `JOURNAL` | schema 8; a listing publishes in one transaction | `journal.rs` |
+| `JOURNAL` | schema 9; a listing publishes in one transaction | `journal.rs` |
 | `LOCAL` | scan, hash, stage, install, guarded delete | `local.rs` |
 | `AUTH` | the credential record, PKCE | `auth.rs` |
 | `REPLAY` | pending plans: intent, guard, effect, complete | `recovery.rs` |
 | `RECONCILE` | `PASS`: list, scan, plan, replay, download | `reconcile.rs` |
 | `DAEMON` | `RUN`, and one table of failure dispositions | `daemon.rs` |
 
-- **Journal.** Opens schema 8, or creates it from `migrations/`; refuses 1 to
-  7. Schema 8 is frozen while the Rust upload-session work stays parked.
+- **Journal.** Opens schema 9, creates it from `migrations/` or migrates 8 to
+  it; refuses every other version. Schema 9 keys local observations by
+  canonical path, as the user chose on 2026-11-18; the Rust version cannot
+  open it.
 - **Values.** `MODEL` holds types, equality and JSON, no state. A display path
   and its Dropbox identity, `FOLD`'s answer, are `DEFTYPE`s over `str`; the
   hash, revision and cursor roles are `DROPBOX`'s. A value travels by value;
@@ -121,8 +123,9 @@ watcher comes only for a measured need.
   5xx.
 - The planner's table, every value's JSON and `FOLD` over a case corpus,
   against what the Rust version prints (`src/oracle/`).
-- A Habu-made schema against a Rust-made one (`sqlite_master`), and a journal
-  the Rust daemon wrote, read back.
+- A Habu-made schema against the Rust-made one as `migrations/0009.sql`
+  changes it (`sqlite_master`), and a journal the Rust daemon wrote,
+  migrated and read back.
 - Startup and crash tests of the built `omaboxd`.
 - The widget's QML tests, through Qt 6's `qmltestrunner` (README, "Develop").
 
