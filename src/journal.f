@@ -17,8 +17,13 @@
 \ the canonical path MODEL:FOLD gives the display path. Every stored
 \ value is written and read by MODEL's JSON words; one MODEL cannot read
 \ is logged with the record's path and its cause and thrown as E-JSON.
-\ Each write is one immediate transaction, and the remote cursor and
-\ inventory are read in one deferred one.
+\ Each write to the file is one immediate transaction, and the remote
+\ cursor and inventory are read in one deferred one.
+\ A local scan is gathered in the connection's temporary tables, then
+\ published as its difference in SQL: the local inventory and hash cache
+\ lose each row the scan does not hold with the same value and gain each
+\ row they lack, so an unchanged row keeps its rowid and an unchanged scan
+\ writes nothing.
 \ STORAGE CLASS. CALLER-OWNED: a journal OPEN makes borrows its path
 \ until CLOSE, and a binding INSPECT answers borrows its path; every
 \ string and vector a reader answers lies in the arena the caller passes.
@@ -297,14 +302,18 @@ private
 : DELETE-MODE? ( SQLITE:statement -- bool SQLITE:statement )
    SQLITE:STEP drop 0 SQLITE:COL-TEXT >str s" delete" >str STR=CI swap ;
 
-\ The daemon holds its connection for life, so the connection keeps 64 KiB
-\ of pages, not SQLite's 2 MB; the OS page cache holds the rest.
+\ The daemon holds its connection for life, so each of its databases keeps
+\ 64 KiB of pages, not SQLite's 2 MB; the OS page cache holds the rest.
+\ The temporary database journals in memory, so a failed scan write
+\ rolls back.
 : CONFIGURE-WRITABLE ( journal -- )
    {: j :}
    j >CONNECTION {: c :}
    c s" PRAGMA cache_size = -64" SQLITE:EXEC
+   c s" PRAGMA temp.cache_size = -64" SQLITE:EXEC
+   c s" PRAGMA temp.journal_mode = MEMORY" SQLITE:EXEC
    c s" PRAGMA foreign_keys = ON" SQLITE:EXEC
-   c s" PRAGMA journal_mode = DELETE" >str [: DELETE-MODE? ;]
+   c s" PRAGMA main.journal_mode = DELETE" >str [: DELETE-MODE? ;]
    SQLITE:WITH-STATEMENT 0= if
       s" set rollback journal mode" >str j >PATH
       s" SQLite did not enable DELETE journal mode" >str INVALID
@@ -1188,13 +1197,10 @@ BUF:HDR-BYTES TASK:+USERS ENCODED u8
    {: o :}
    p o MODEL-LOCAL--RECORD:MAKE ;
 
-: HASH-ROW
-   ( SQLITE:statement ^ARENA:arena
-     -- SQLITE:statement MODEL:hash-record )
-   {: ar :}
-   0 SQLITE:COL-BLOB str> ar BYTES-PATH {: p:MODEL:path :}
-   1 SQLITE:COL-TEXT >str p MODEL:PATH>STR ar HASH-VALUE-OF
-   {: f h :}
+\ The hash record stored at the path as the JSON.
+: HASH-OF ( MODEL:path str ^ARENA:arena -- MODEL:hash-record )
+   {: p:MODEL:path json:str ar :}
+   json p MODEL:PATH>STR ar HASH-VALUE-OF {: f h :}
    h DROPBOX:HASH>STR str> DROPBOX:CONTENT-HASH? 0= if
       s" read local hash cache" >str p MODEL:PATH>STR NOT-CONTENT-HASH
    then
@@ -1307,9 +1313,26 @@ private
 
 \ ---- the local scan ------------------------------------------------
 
-: INSERT-HASH ( -- ^u8 n )
-   s" INSERT INTO local_hash_cache(root_generation, path, hash_json)
-      VALUES (?1, ?2, ?3)" ;
+public
+
+\ A scan's rows lie in temp tables: scan_observations and scan_hashes,
+\ which it publishes, and scan_cached, scan_jobs and scan_listed, which
+\ hold reused hashes, files to hash and listed directories until visited.
+STRUCTURE scan OPAQUE
+   FIELD observe-insert SQLITE:statement
+   FIELD hash-insert SQLITE:statement
+   FIELD reuse-insert SQLITE:statement
+   FIELD job-insert SQLITE:statement
+   FIELD listed-insert SQLITE:statement
+   FIELD cached-lookup SQLITE:statement
+   FIELD journal journal
+   FIELD writer ^JSON:writer
+   FIELD arena ^ARENA:arena
+;STRUCTURE
+
+private
+
+$2F constant SLASH
 
 : LOCAL-INSERTED
    ( SQLITE:statement MODEL:local-record ^JSON:writer ^ARENA:arena
@@ -1333,26 +1356,74 @@ private
      -- SQLITE:statement )
    [: LOCALS-INSERTED ;] ARENA:WITH ;
 
-\ A hash that is not Dropbox's is never cached.
+\ Binds path ?1 and hash_json ?2. A hash that is not Dropbox's is never
+\ cached.
 : HASH-INSERTED
-   ( SQLITE:statement n MODEL:hash-record ^JSON:writer
-     -- SQLITE:statement )
-   {: g r w :}
+   ( SQLITE:statement MODEL:hash-record ^JSON:writer -- SQLITE:statement )
+   {: r w :}
    r MODEL-HASH--RECORD:UNMAKE {: p:MODEL:path f h :}
    h DROPBOX:HASH>STR str> DROPBOX:CONTENT-HASH? 0= if
       s" publish local hash cache" >str p MODEL:PATH>STR
       NOT-CONTENT-HASH
    then
-   g 1 SQLITE:BIND-INT
-   p PATH-BYTES >str 2 SQLITE:BIND-BLOB
-   w [: r swap MODEL:HASH-VALUE>JSON ;] ENCODE >str 3 SQLITE:BIND-TEXT
+   p PATH-BYTES >str 1 SQLITE:BIND-BLOB
+   w [: r swap MODEL:HASH-VALUE>JSON ;] ENCODE >str 2 SQLITE:BIND-TEXT
    RAN ;
 
-: HASH-INSERTS
-   ( SQLITE:statement n ^VEC:vector<MODEL:hash-record> ^JSON:writer
-     -- SQLITE:statement )
-   {: g v w :}
-   v VEC:COUNT 0 ?do g v i VEC:AT @ w HASH-INSERTED loop ;
+: JOB-INSERTED
+   ( SQLITE:statement str MODEL:fingerprint -- SQLITE:statement )
+   {: p:str f :}
+   f MODEL-FINGERPRINT:UNMAKE {: i s ms mn cs cn :}
+   p 1 SQLITE:BIND-BLOB
+   i 2 SQLITE:BIND-INT  s 3 SQLITE:BIND-INT
+   ms 4 SQLITE:BIND-INT  mn 5 SQLITE:BIND-INT
+   cs 6 SQLITE:BIND-INT  cn 7 SQLITE:BIND-INT RAN ;
+
+: LISTED-INSERTED
+   ( SQLITE:statement str MODEL:stat -- SQLITE:statement )
+   {: p:str st :}
+   st MODEL-STAT:UNMAKE {: d i m s ms mn cs cn :}
+   p 1 SQLITE:BIND-BLOB
+   d 2 SQLITE:BIND-INT  i 3 SQLITE:BIND-INT
+   m 4 SQLITE:BIND-INT  s 5 SQLITE:BIND-INT
+   ms 6 SQLITE:BIND-INT  mn 7 SQLITE:BIND-INT
+   cs 8 SQLITE:BIND-INT  cn 9 SQLITE:BIND-INT RAN ;
+
+: JOB-ROW
+   ( SQLITE:statement ^ARENA:arena
+     -- SQLITE:statement str MODEL:fingerprint )
+   {: ar :}
+   0 ar BLOB-COPY {: p:str :}
+   1 SQLITE:COL-INT {: i :}  2 SQLITE:COL-INT {: s :}
+   3 SQLITE:COL-INT {: ms :}  4 SQLITE:COL-INT {: mn :}
+   5 SQLITE:COL-INT {: cs :}  6 SQLITE:COL-INT {: cn :}
+   p i s ms mn cs cn MODEL-FINGERPRINT:MAKE ;
+
+: LISTED-ROW
+   ( SQLITE:statement ^ARENA:arena -- SQLITE:statement str MODEL:stat )
+   {: ar :}
+   0 ar BLOB-COPY {: p:str :}
+   1 SQLITE:COL-INT {: d :}  2 SQLITE:COL-INT {: i :}
+   3 SQLITE:COL-INT {: m :}  4 SQLITE:COL-INT {: s :}
+   5 SQLITE:COL-INT {: ms :}  6 SQLITE:COL-INT {: mn :}
+   7 SQLITE:COL-INT {: cs :}  8 SQLITE:COL-INT {: cn :}
+   p d i m s ms mn cs cn MODEL-STAT:MAKE ;
+
+: NO-HASH-RECORD ( -- MODEL:hash-record )
+   s" " >str MODEL:>PATH MODEL:NO-FINGERPRINT MODEL:NO-HASH
+   MODEL-HASH--RECORD:MAKE ;
+
+\ The row is copied before the statement is reset, so a record that
+\ does not decode leaves the statement ready for the next lookup.
+: LOOKED-UP
+   ( SQLITE:statement str ^ARENA:arena
+     -- SQLITE:statement MODEL:hash-record bool )
+   {: p:str ar :}
+   p 1 SQLITE:BIND-BLOB
+   SQLITE:STEP 0= if SQLITE:RESET NO-HASH-RECORD false exit then
+   0 ar PATH-COPY {: q:MODEL:path :}
+   1 ar TEXT-COPY {: json:str :}
+   SQLITE:RESET q json ar HASH-OF true ;
 
 : LOCAL-RECORDS=
    ( ^VEC:vector<MODEL:local-record> ^VEC:vector<MODEL:local-record>
@@ -1372,53 +1443,404 @@ private
       a i VEC:AT @ b i VEC:AT @ MODEL:HASH-RECORD= and
    loop ;
 
-: SCAN-UNCHANGED?
-   ( SQLITE:connection ^VEC:vector<MODEL:local-record>
-     ^VEC:vector<MODEL:hash-record> ^ARENA:arena -- bool )
-   {: c obs hashes ar :}
-   c ar READ-LOCAL-INVENTORY obs LOCAL-RECORDS= 0= if false exit then
-   c ar READ-LOCAL-HASH-CACHE hashes HASH-RECORDS= ;
+: OBSERVE-SCAN ( -- ^u8 n )
+   s" INSERT OR REPLACE INTO temp.scan_observations(
+         path, observation_json, canonical_path
+      ) VALUES (?1, ?2, ?3)" ;
+
+: HASH-SCAN ( -- ^u8 n )
+   s" INSERT OR REPLACE INTO temp.scan_hashes(path, hash_json)
+      VALUES (?1, ?2)" ;
+
+: REUSE-SCAN ( -- ^u8 n )
+   s" INSERT OR REPLACE INTO temp.scan_cached(path, hash_json)
+      VALUES (?1, ?2)" ;
+
+: JOB-SCAN ( -- ^u8 n )
+   s" INSERT OR REPLACE INTO temp.scan_jobs(
+         path, inode, size, modified_seconds, modified_nanoseconds,
+         changed_seconds, changed_nanoseconds
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)" ;
+
+: LISTED-SCAN ( -- ^u8 n )
+   s" INSERT OR REPLACE INTO temp.scan_listed(
+         path, dev, inode, mode, size, modified_seconds,
+         modified_nanoseconds, changed_seconds, changed_nanoseconds
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)" ;
+
+: CACHED-SCAN ( -- ^u8 n )
+   s" SELECT cache.path, cache.hash_json
+      FROM local_hash_cache AS cache
+      JOIN local_root_binding AS root
+         ON root.singleton = 1 AND cache.root_generation = root.generation
+      WHERE cache.path = ?1" ;
+
+: SCAN-TABLES ( -- ^u8 n )
+   s" CREATE TABLE IF NOT EXISTS temp.scan_observations(
+         path BLOB PRIMARY KEY,
+         observation_json TEXT NOT NULL,
+         canonical_path BLOB NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS temp.scan_hashes(
+         path BLOB PRIMARY KEY,
+         hash_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS temp.scan_cached(
+         path BLOB PRIMARY KEY,
+         hash_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS temp.scan_jobs(
+         path BLOB PRIMARY KEY,
+         inode INTEGER NOT NULL,
+         size INTEGER NOT NULL,
+         modified_seconds INTEGER NOT NULL,
+         modified_nanoseconds INTEGER NOT NULL,
+         changed_seconds INTEGER NOT NULL,
+         changed_nanoseconds INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS temp.scan_listed(
+         path BLOB PRIMARY KEY,
+         dev INTEGER NOT NULL,
+         inode INTEGER NOT NULL,
+         mode INTEGER NOT NULL,
+         size INTEGER NOT NULL,
+         modified_seconds INTEGER NOT NULL,
+         modified_nanoseconds INTEGER NOT NULL,
+         changed_seconds INTEGER NOT NULL,
+         changed_nanoseconds INTEGER NOT NULL
+      );
+      DELETE FROM temp.scan_observations;
+      DELETE FROM temp.scan_hashes;
+      DELETE FROM temp.scan_cached;
+      DELETE FROM temp.scan_jobs;
+      DELETE FROM temp.scan_listed;" ;
+
+: SCANNING
+   ( R SQLITE:statement SQLITE:statement SQLITE:statement
+     SQLITE:statement SQLITE:statement SQLITE:statement journal
+     [ R scan -- S scan ] ^JSON:writer ^ARENA:arena
+     -- S SQLITE:statement SQLITE:statement SQLITE:statement
+     SQLITE:statement SQLITE:statement SQLITE:statement )
+   {: j body w ar :}
+   j w ar SCAN-MAKE body execute SCAN-UNMAKE drop drop drop ;
+
+: SCAN-ENCODED
+   ( R SQLITE:statement SQLITE:statement SQLITE:statement
+     SQLITE:statement SQLITE:statement SQLITE:statement journal
+     [ R scan -- S scan ] ^JSON:writer
+     -- S SQLITE:statement SQLITE:statement SQLITE:statement
+     SQLITE:statement SQLITE:statement SQLITE:statement )
+   [: SCANNING ;] ARENA:WITH ;
+
+: SCAN-PREPARED
+   ( R SQLITE:statement SQLITE:statement SQLITE:statement
+     SQLITE:statement SQLITE:statement SQLITE:statement journal
+     [ R scan -- S scan ]
+     -- S SQLITE:statement SQLITE:statement SQLITE:statement
+     SQLITE:statement SQLITE:statement SQLITE:statement )
+   [: SCAN-ENCODED ;] ENCODING ;
+
+: LOOKUP-PREPARED
+   ( R SQLITE:statement SQLITE:statement SQLITE:statement
+     SQLITE:statement SQLITE:statement journal [ R scan -- S scan ]
+     -- S SQLITE:statement SQLITE:statement SQLITE:statement
+     SQLITE:statement SQLITE:statement )
+   {: j body :}
+   j >CONNECTION CACHED-SCAN >str [: j body SCAN-PREPARED ;]
+   SQLITE:WITH-STATEMENT ;
+
+: LISTED-PREPARED
+   ( R SQLITE:statement SQLITE:statement SQLITE:statement
+     SQLITE:statement journal [ R scan -- S scan ]
+     -- S SQLITE:statement SQLITE:statement SQLITE:statement
+     SQLITE:statement )
+   {: j body :}
+   j >CONNECTION LISTED-SCAN >str [: j body LOOKUP-PREPARED ;]
+   SQLITE:WITH-STATEMENT ;
+
+: JOB-PREPARED
+   ( R SQLITE:statement SQLITE:statement SQLITE:statement journal
+     [ R scan -- S scan ]
+     -- S SQLITE:statement SQLITE:statement SQLITE:statement )
+   {: j body :}
+   j >CONNECTION JOB-SCAN >str [: j body LISTED-PREPARED ;]
+   SQLITE:WITH-STATEMENT ;
+
+: REUSE-PREPARED
+   ( R SQLITE:statement SQLITE:statement journal [ R scan -- S scan ]
+     -- S SQLITE:statement SQLITE:statement )
+   {: j body :}
+   j >CONNECTION REUSE-SCAN >str [: j body JOB-PREPARED ;]
+   SQLITE:WITH-STATEMENT ;
+
+: HASH-PREPARED
+   ( R SQLITE:statement journal [ R scan -- S scan ]
+     -- S SQLITE:statement )
+   {: j body :}
+   j >CONNECTION HASH-SCAN >str [: j body REUSE-PREPARED ;]
+   SQLITE:WITH-STATEMENT ;
+
+: SCAN-JOURNAL ( scan -- scan journal )
+   SCAN-UNMAKE {: j w ar :}
+   j w ar SCAN-MAKE j ;
+
+\ Runs visit on each row the statement answers, in ar reset before each.
+: VISITED
+   ( R scan SQLITE:statement ^ARENA:arena
+     [ R scan SQLITE:statement ^ARENA:arena -- R scan SQLITE:statement ]
+     -- R scan SQLITE:statement )
+   {: ar visit :}
+   begin SQLITE:STEP while ar ARENA:RESET ar visit execute repeat ;
+
+\ VISITED in an arena of its own.
+: ROWS-VISITED
+   ( R scan SQLITE:statement
+     [ R scan SQLITE:statement ^ARENA:arena -- R scan SQLITE:statement ]
+     -- R scan SQLITE:statement )
+   {: visit :}
+   [: visit VISITED ;] ARENA:WITH ;
+
+\ Visits the rows select answers, then runs empty.
+: EACH-ROW
+   ( R scan
+     [ R scan SQLITE:statement ^ARENA:arena -- R scan SQLITE:statement ]
+     str str -- R scan )
+   {: visit select:str empty:str :}
+   SCAN-JOURNAL >CONNECTION {: c :}
+   c select [: visit ROWS-VISITED ;] SQLITE:WITH-STATEMENT
+   c empty str> SQLITE:EXEC ;
+
+\ The statement waits on the return stack while body runs.
+: REUSE-VISITED
+   ( R scan SQLITE:statement ^ARENA:arena
+     [ R scan MODEL:hash-record -- R scan ] -- R scan SQLITE:statement )
+   {: ar body :}
+   ar HASH-ROW {: r :}
+   >r r body execute r> ;
+
+: JOB-VISITED
+   ( R scan SQLITE:statement ^ARENA:arena
+     [ R scan str MODEL:fingerprint -- R scan ]
+     -- R scan SQLITE:statement )
+   {: ar body :}
+   ar JOB-ROW {: p:str f :}
+   >r p f body execute r> ;
+
+: LISTED-VISITED
+   ( R scan SQLITE:statement ^ARENA:arena
+     [ R scan str MODEL:stat -- R scan ] -- R scan SQLITE:statement )
+   {: ar body :}
+   ar LISTED-ROW {: p:str st :}
+   >r p st body execute r> ;
+
+\ The path then one byte.
+: SUFFIXED ( str n ^ARENA:arena -- str )
+   {: p:str b ar :}
+   p str> {: a:^ u :}
+   ar u 1+ ARENA:ALLOC drop {: d:^ :}
+   a d u BYTE-COPY
+   b d u + c!
+   d u 1+ >str ;
+
+\ ?1 is the path and [?2, ?3) the byte range of the paths beneath it:
+\ the path then "/", to the path then "0", the byte after "/".
+: SUBTREE-RAN ( SQLITE:connection str str str ^u8 n -- )
+   {: c p:str lo:str hi:str sql:^ u :}
+   c sql u >str [:
+      p 1 SQLITE:BIND-BLOB lo 2 SQLITE:BIND-BLOB hi 3 SQLITE:BIND-BLOB
+      RAN
+   ;] SQLITE:WITH-STATEMENT ;
+
+: DISCARDED ( SQLITE:connection str ^ARENA:arena -- )
+   {: c p:str ar :}
+   p SLASH ar SUFFIXED {: lo:str :}
+   p SLASH 1+ ar SUFFIXED {: hi:str :}
+   c p lo hi s" INSERT OR REPLACE INTO temp.scan_hashes(path, hash_json)
+      SELECT path, hash_json FROM temp.scan_cached
+      WHERE path = ?1 OR (path >= ?2 AND path < ?3)" SUBTREE-RAN
+   c p lo hi s" DELETE FROM temp.scan_cached
+      WHERE path = ?1 OR (path >= ?2 AND path < ?3)" SUBTREE-RAN
+   c p lo hi s" DELETE FROM temp.scan_observations
+      WHERE path = ?1 OR (path >= ?2 AND path < ?3)" SUBTREE-RAN
+   c p lo hi s" DELETE FROM temp.scan_jobs
+      WHERE path = ?1 OR (path >= ?2 AND path < ?3)" SUBTREE-RAN
+   c p lo hi s" DELETE FROM temp.scan_listed
+      WHERE path = ?1 OR (path >= ?2 AND path < ?3)" SUBTREE-RAN ;
+
+: OBSERVATIONS-DIFFERENCE ( -- ^u8 n )
+   s" DELETE FROM local_observations WHERE NOT EXISTS (
+         SELECT 1 FROM temp.scan_observations AS s
+         WHERE s.path = local_observations.path
+            AND s.observation_json = local_observations.observation_json
+      );
+      INSERT INTO local_observations(path, observation_json, canonical_path)
+         SELECT s.path, s.observation_json, s.canonical_path
+         FROM temp.scan_observations AS s
+         WHERE NOT EXISTS (
+            SELECT 1 FROM local_observations AS o WHERE o.path = s.path
+         );" ;
+
+\ ?1 is the active generation; a row of any other is deleted.
+: STALE-HASHES ( -- ^u8 n )
+   s" DELETE FROM local_hash_cache
+      WHERE root_generation != ?1 OR NOT EXISTS (
+         SELECT 1 FROM temp.scan_hashes AS s
+         WHERE s.path = local_hash_cache.path
+            AND s.hash_json = local_hash_cache.hash_json
+      )" ;
+
+: MISSING-HASHES ( -- ^u8 n )
+   s" INSERT INTO local_hash_cache(root_generation, path, hash_json)
+      SELECT ?1, s.path, s.hash_json FROM temp.scan_hashes AS s
+      WHERE NOT EXISTS (
+         SELECT 1 FROM local_hash_cache AS c
+         WHERE c.root_generation = ?1 AND c.path = s.path
+      )" ;
 
 \ g, the generation, was read as an SQLite integer, so it binds as one.
-: SCAN-WRITTEN
-   ( SQLITE:connection n ^VEC:vector<MODEL:local-record>
-     ^VEC:vector<MODEL:hash-record> ^JSON:writer -- )
-   {: c g obs hashes w :}
-   c s" DELETE FROM local_observations" SQLITE:EXEC
-   c s" DELETE FROM local_hash_cache" SQLITE:EXEC
-   c INSERT-LOCAL >str [: obs w LOCAL-INSERTS ;] SQLITE:WITH-STATEMENT
-   c INSERT-HASH >str [: g hashes w HASH-INSERTS ;] SQLITE:WITH-STATEMENT ;
+: AT-GENERATION ( SQLITE:connection n ^u8 n -- )
+   {: c g a:^ u:n :}
+   c a u >str [: g 1 SQLITE:BIND-INT RAN ;] SQLITE:WITH-STATEMENT ;
 
-: ACTIVE-SCAN
-   ( local-root-record journal local-root-binding
-     ^VEC:vector<MODEL:local-record> ^VEC:vector<MODEL:hash-record>
-     ^ARENA:arena -- bool )
-   {: r j b obs hashes ar :}
+: DIFFERENCE-WRITTEN ( SQLITE:connection n -- )
+   {: c g :}
+   c OBSERVATIONS-DIFFERENCE SQLITE:EXEC
+   c g STALE-HASHES AT-GENERATION
+   c g MISSING-HASHES AT-GENERATION ;
+
+: ACTIVE-DIFFERENCE
+   ( local-root-record journal local-root-binding -- bool )
+   {: r j b :}
    r >BINDING b ROOT= 0= if false exit then
-   j >CONNECTION {: c :}
-   c obs hashes ar SCAN-UNCHANGED? if true exit then
-   c r >GENERATION obs hashes [: SCAN-WRITTEN ;] ENCODING
+   j >CONNECTION r >GENERATION DIFFERENCE-WRITTEN
    true ;
 
-: SCAN-PUBLISHED
-   ( journal local-root-binding ^VEC:vector<MODEL:local-record>
-     ^VEC:vector<MODEL:hash-record> ^ARENA:arena -- bool )
-   {: j b obs hashes ar :}
+: BOUND-DIFFERENCE
+   ( journal local-root-binding ^ARENA:arena -- bool )
+   {: j b ar :}
    j ar LOCAL-ROOT-BINDING MATCH option
       none OF false ENDOF
-      some OF j b obs hashes ar ACTIVE-SCAN ENDOF
+      some OF j b ACTIVE-DIFFERENCE ENDOF
    ;MATCH ;
 
 public
 
-\ Replaces the local inventory and its hash cache in one transaction;
-\ false, nothing written, when binding is no longer the active root.
+\ Runs body over a scan that starts empty, to publish with PUBLISH-SCAN;
+\ body hands the scan back.
+: WITH-SCAN ( R journal [ R scan -- S scan ] -- S )
+   {: j body :}
+   j >CONNECTION SCAN-TABLES SQLITE:EXEC
+   j >CONNECTION OBSERVE-SCAN >str [: j body HASH-PREPARED ;]
+   SQLITE:WITH-STATEMENT ;
+
+\ Records the observation in the scan, replacing one at its path.
+: SCAN-OBSERVE ( scan MODEL:local-record -- scan )
+   {: r :}
+   SCAN-UNMAKE {: j w ar :}
+   >r >r >r >r >r
+   r w ar LOCAL-INSERTED ar ARENA:RESET
+   r> r> r> r> r>
+   j w ar SCAN-MAKE ;
+
+\ Records the hash in the scan, replacing one at its path.
+: SCAN-HASH ( scan MODEL:hash-record -- scan )
+   {: r :}
+   SCAN-UNMAKE {: j w ar :}
+   >r >r >r >r
+   r w HASH-INSERTED
+   r> r> r> r>
+   j w ar SCAN-MAKE ;
+
+\ Records a cached hash the walk reused, replacing one at its path.
+: SCAN-REUSE ( scan MODEL:hash-record -- scan )
+   {: r :}
+   SCAN-UNMAKE {: j w ar :}
+   >r >r >r  r w HASH-INSERTED  r> r> r>
+   j w ar SCAN-MAKE ;
+
+\ Records a file no cached hash covers, replacing one at its path.
+: SCAN-JOB ( scan str MODEL:fingerprint -- scan )
+   {: p:str f :}
+   SCAN-UNMAKE {: j w ar :}
+   >r >r  p f JOB-INSERTED  r> r>
+   j w ar SCAN-MAKE ;
+
+\ Records a directory the walk listed, with its stat before the listing,
+\ replacing one at its path.
+: SCAN-LISTED ( scan str MODEL:stat -- scan )
+   {: p:str st :}
+   SCAN-UNMAKE {: j w ar :}
+   >r  p st LISTED-INSERTED  r>
+   j w ar SCAN-MAKE ;
+
+\ Runs body on each reused hash in path byte order, then forgets them.
+\ The record is valid only during body, which may write the scan only
+\ through SCAN-OBSERVE and SCAN-HASH. Body reads no journal table.
+: EACH-SCAN-REUSE
+   ( R scan [ R scan MODEL:hash-record -- R scan ] -- R scan )
+   {: body :}
+   [: body REUSE-VISITED ;]
+   s" SELECT path, hash_json FROM temp.scan_cached ORDER BY path" >str
+   s" DELETE FROM temp.scan_cached" >str EACH-ROW ;
+
+\ Runs body on each file to hash in path byte order, then forgets them.
+: EACH-SCAN-JOB
+   ( R scan [ R scan str MODEL:fingerprint -- R scan ] -- R scan )
+   {: body :}
+   [: body JOB-VISITED ;]
+   s" SELECT path, inode, size, modified_seconds, modified_nanoseconds,
+         changed_seconds, changed_nanoseconds
+      FROM temp.scan_jobs ORDER BY path" >str
+   s" DELETE FROM temp.scan_jobs" >str EACH-ROW ;
+
+\ Runs body on each listed directory in path byte order, then forgets them.
+: EACH-SCAN-LISTED
+   ( R scan [ R scan str MODEL:stat -- R scan ] -- R scan )
+   {: body :}
+   [: body LISTED-VISITED ;]
+   s" SELECT path, dev, inode, mode, size, modified_seconds,
+         modified_nanoseconds, changed_seconds, changed_nanoseconds
+      FROM temp.scan_listed ORDER BY path" >str
+   s" DELETE FROM temp.scan_listed" >str EACH-ROW ;
+
+\ Forgets the path, never the root "", and every path beneath it. A
+\ cached hash among them matched its file's fingerprint when the walk
+\ took it, so it is kept as a published hash: dropping it would rehash
+\ an untouched subtree on every later pass.
+: SCAN-DISCARD ( scan str -- scan )
+   {: p:str :}
+   SCAN-UNMAKE {: j w ar :}
+   j >CONNECTION p ar DISCARDED ar ARENA:RESET
+   j w ar SCAN-MAKE ;
+
+\ The hash the active root's cache holds for the path, decoded into ar;
+\ false, with an empty record, when it holds none.
+: CACHED-HASH ( scan str ^ARENA:arena -- scan MODEL:hash-record bool )
+   {: p:str ar :}
+   SCAN-UNMAKE {: j w sa :}
+   p ar LOOKED-UP {: r found :}
+   j w sa SCAN-MAKE r found ;
+
+\ Makes the local inventory and the active root's hash cache the scan's
+\ in one transaction; false, nothing written, when binding is no longer
+\ the active root.
+: PUBLISH-SCAN ( scan local-root-binding -- scan bool )
+   {: b :}
+   SCAN-JOURNAL {: j :}
+   j >CONNECTION [: j b [: BOUND-DIFFERENCE ;] ARENA:WITH ;]
+   SQLITE:WITH-TRANSACTION ;
+
+\ Publishes the observations and hashes as one scan; false, nothing
+\ written, when binding is no longer the active root.
 : PUBLISH-LOCAL-SCAN
    ( journal local-root-binding ^VEC:vector<MODEL:local-record>
      ^VEC:vector<MODEL:hash-record> -- bool )
    {: j b obs hashes :}
-   j >CONNECTION [: j b obs hashes [: SCAN-PUBLISHED ;] ARENA:WITH ;]
-   SQLITE:WITH-TRANSACTION ;
+   j [:
+      obs VEC:COUNT 0 ?do obs i VEC:AT @ SCAN-OBSERVE loop
+      hashes VEC:COUNT 0 ?do hashes i VEC:AT @ SCAN-HASH loop
+      b PUBLISH-SCAN swap
+   ;] WITH-SCAN ;
 
 private
 

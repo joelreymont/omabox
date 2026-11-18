@@ -423,22 +423,10 @@ private
 
 \ ---- stat
 
-\ What fstat says of an open entry.
-STRUCTURE stat
-   FIELD dev n
-   FIELD inode n
-   FIELD mode n
-   FIELD size n
-   FIELD modified-seconds n
-   FIELD modified-nanoseconds n
-   FIELD changed-seconds n
-   FIELD changed-nanoseconds n
-;STRUCTURE
-
 \ A descriptor and its stat, as Rust's (File, Stat).
 STRUCTURE opened
    FIELD fd fd
-   FIELD stat stat
+   FIELD stat MODEL:stat
 ;STRUCTURE
 
 \ A file opened and hashed, as Rust's (File, ContentIdentity,
@@ -450,38 +438,38 @@ STRUCTURE hashed
 ;STRUCTURE
 
 \ The seeds a guarded word replaces, and their typed drops.
-: NO-STAT ( -- stat ) 0 0 0 0 0 0 0 0 STAT-MAKE ;
+: NO-STAT ( -- MODEL:stat ) 0 0 0 0 0 0 0 0 MODEL-STAT:MAKE ;
 : NO-HASH ( -- DROPBOX:hash ) s" " >str DROPBOX:>HASH ;
 : NO-FINGERPRINT ( -- MODEL:fingerprint )
    0 0 0 0 0 0 MODEL-FINGERPRINT:MAKE ;
-: DROP-STAT ( stat -- ) drop ;
+: DROP-STAT ( MODEL:stat -- ) drop ;
 : DROP-HASH ( DROPBOX:hash -- ) drop ;
 : DROP-FINGERPRINT ( MODEL:fingerprint -- ) drop ;
 
-: STAT-FD-FAILS ( fd ^u8 n ^u8 n n -- stat )
+: STAT-FD-FAILS ( fd ^u8 n ^u8 n n -- MODEL:stat )
    {: f:fd p:^ u:n o:^ ou:n code:n :}
    [: f FS:FD-STAT ;] [: o ou p u code IO-FAILS ;] FS-FAILS
    FS:STAT-DEV@ FS:STAT-INO@ FS:STAT-MODE@ FS:STAT-SIZE@
    FS:STAT-MTIME-SEC@ FS:STAT-MTIME-NS@
-   FS:STAT-CTIME-SEC@ FS:STAT-CTIME-NS@ STAT-MAKE ;
+   FS:STAT-CTIME-SEC@ FS:STAT-CTIME-NS@ MODEL-STAT:MAKE ;
 
-: STAT-FD ( fd ^u8 n ^u8 n -- stat ) E-IO STAT-FD-FAILS ;
+: STAT-FD ( fd ^u8 n ^u8 n -- MODEL:stat ) E-IO STAT-FD-FAILS ;
 
-: REGULAR? ( stat -- bool )
-   STAT-UNMAKE {: d i m s ms mn cs cn :}
+: REGULAR? ( MODEL:stat -- bool )
+   MODEL-STAT:UNMAKE {: d i m s ms mn cs cn :}
    m FS:S-IFMT and FS:S-IFREG = ;
 
-: SAME-INODE ( stat stat -- bool )
-   {: a:stat b:stat :}
-   a STAT-UNMAKE {: d i m s ms mn cs cn :}
-   b STAT-UNMAKE {: d2 i2 m2 s2 ms2 mn2 cs2 cn2 :}
+: SAME-INODE ( MODEL:stat MODEL:stat -- bool )
+   {: a:MODEL:stat b:MODEL:stat :}
+   a MODEL-STAT:UNMAKE {: d i m s ms mn cs cn :}
+   b MODEL-STAT:UNMAKE {: d2 i2 m2 s2 ms2 mn2 cs2 cn2 :}
    d d2 = i i2 = and ;
 
-: SAME-OBSERVATION ( stat stat -- bool )
-   {: a:stat b:stat :}
+: SAME-OBSERVATION ( MODEL:stat MODEL:stat -- bool )
+   {: a:MODEL:stat b:MODEL:stat :}
    a b SAME-INODE 0= if false exit then
-   a STAT-UNMAKE {: d i m s ms mn cs cn :}
-   b STAT-UNMAKE {: d2 i2 m2 s2 ms2 mn2 cs2 cn2 :}
+   a MODEL-STAT:UNMAKE {: d i m s ms mn cs cn :}
+   b MODEL-STAT:UNMAKE {: d2 i2 m2 s2 ms2 mn2 cs2 cn2 :}
    s s2 = ms ms2 = and mn mn2 = and cs cs2 = and cn cn2 = and ;
 
 : SAME-HASHED-CONTENT ( MODEL:fingerprint MODEL:fingerprint -- bool )
@@ -490,9 +478,9 @@ STRUCTURE hashed
    b MODEL-FINGERPRINT:UNMAKE {: i2 s2 ms2 mn2 cs2 cn2 :}
    i i2 = s s2 = and ms ms2 = and mn mn2 = and ;
 
-: FILE-FINGERPRINT ( stat ^u8 n -- MODEL:fingerprint )
-   {: st:stat p:^ u:n :}
-   st STAT-UNMAKE {: d i m s ms mn cs cn :}
+: FILE-FINGERPRINT ( MODEL:stat ^u8 n -- MODEL:fingerprint )
+   {: st:MODEL:stat p:^ u:n :}
+   st MODEL-STAT:UNMAKE {: d i m s ms mn cs cn :}
    s 0 < if 0 s" inspect local file size" p u SYSCALL-FAILURE then
    i s ms mn cs cn MODEL-FINGERPRINT:MAKE ;
 
@@ -559,9 +547,9 @@ private
 \ The hash of a regular file whose stat after the read is the one given;
 \ a file not regular throws the first code, a changed one the second.
 : HASH-STABLE-FILE-FROM-STAT
-   ( fd ^u8 n ^u8 n stat ^ARENA:arena n n
+   ( fd ^u8 n ^u8 n MODEL:stat ^ARENA:arena n n
      -- DROPBOX:hash MODEL:fingerprint )
-   {: f:fd p:^ u:n o:^ ou:n before:stat ar:^ARENA:arena
+   {: f:fd p:^ u:n o:^ ou:n before:MODEL:stat ar:^ARENA:arena
       unsupported:n changed:n :}
    before REGULAR? 0= if p u unsupported UNSUPPORTED-FAILS then
    before p u FILE-FINGERPRINT {: print:MODEL:fingerprint :}
@@ -574,7 +562,7 @@ private
 : HASH-STABLE-FILE-WITH-FINGERPRINT
    ( fd ^u8 n ^u8 n ^ARENA:arena n n -- DROPBOX:hash MODEL:fingerprint )
    {: f:fd p:^ u:n o:^ ou:n ar:^ARENA:arena unsupported:n changed:n :}
-   f p u o ou STAT-FD {: before:stat :}
+   f p u o ou STAT-FD {: before:MODEL:stat :}
    f p u o ou before ar unsupported changed HASH-STABLE-FILE-FROM-STAT ;
 
 : HASH-STABLE-FILE ( fd ^u8 n ^u8 n ^ARENA:arena n n -- DROPBOX:hash )
@@ -803,22 +791,22 @@ private
    ;MATCH ;
 
 \ A failed stat throws the first code, a file not regular the second.
-: CHECK-REGULAR ( fd ^u8 n ^u8 n n n -- stat )
+: CHECK-REGULAR ( fd ^u8 n ^u8 n n n -- MODEL:stat )
    {: f:fd p:^ u:n o:^ ou:n io:n unsupported:n :}
-   f p u o ou io STAT-FD-FAILS {: st:stat :}
+   f p u o ou io STAT-FD-FAILS {: st:MODEL:stat :}
    st REGULAR? 0= if p u unsupported UNSUPPORTED-FAILS then
    st ;
 
 \ The stat of the regular file at fd, CHECK-REGULAR's codes given; a throw
 \ closes fd.
-: REGULAR-STAT ( fd ^u8 n ^u8 n n n -- stat )
+: REGULAR-STAT ( fd ^u8 n ^u8 n n n -- MODEL:stat )
    {: f:fd p:^ u:n o:^ ou:n io:n unsupported:n :}
    NO-STAT f [: DROP-STAT f p u o ou io unsupported CHECK-REGULAR ;]
    CLOSING ;
 
 \ A failed open or stat throws the first code, a file not regular the
 \ second.
-: OPEN-RELATIVE-REGULAR-WITH-STAT ( fd ^u8 n ^u8 n n n -- fd stat )
+: OPEN-RELATIVE-REGULAR-WITH-STAT ( fd ^u8 n ^u8 n n n -- fd MODEL:stat )
    {: root:fd p:^ u:n o:^ ou:n io:n unsupported:n :}
    p u SAFE-COMPONENTS drop
    root p u OPEN-BELOW MATCH option
@@ -827,7 +815,7 @@ private
    ;MATCH ;
 
 : OPEN-RELATIVE-REGULAR ( fd ^u8 n ^u8 n n n -- fd )
-   OPEN-RELATIVE-REGULAR-WITH-STAT {: f:fd st:stat :} f ;
+   OPEN-RELATIVE-REGULAR-WITH-STAT {: f:fd st:MODEL:stat :} f ;
 
 \ Rust's open_relative_at with O_RDONLY|O_NONBLOCK, the flags its one
 \ caller passes, which FS:TRY-OPEN-READ-AT sets.
@@ -862,7 +850,7 @@ ENUM name-entry
    FS:ERRNO FS:ENOENT <> if o ou p u IO-FAILURE then ;
 
 \ The stat of the open entry; a failed stat closes it.
-: STAT-CLOSING ( fd ^u8 n ^u8 n -- stat )
+: STAT-CLOSING ( fd ^u8 n ^u8 n -- MODEL:stat )
    {: f:fd p:^ u:n o:^ ou:n :}
    NO-STAT f [: DROP-STAT f p u o ou STAT-FD ;] CLOSING ;
 
@@ -874,7 +862,7 @@ ENUM name-entry
 \ The entry open for reading, closed unless it is a regular file.
 : OPENED-ENTRY ( fd ^u8 n ^u8 n -- name-entry )
    {: f:fd p:^ u:n o:^ ou:n :}
-   f p u o ou STAT-CLOSING {: st:stat :}
+   f p u o ou STAT-CLOSING {: st:MODEL:stat :}
    st REGULAR? 0= if f DISCARD NAME-ENTRY-UNSUPPORTED exit then
    f st OPENED-MAKE NAME-ENTRY-REGULAR ;
 
@@ -915,7 +903,7 @@ ENUM name-entry
 \ Hashes the opened file, closing it on a throw.
 : HASH-OPENED ( opened ^u8 n ^u8 n ^ARENA:arena -- hashed )
    {: x:opened p:^ u:n o:^ ou:n ar:^ARENA:arena :}
-   x OPENED-UNMAKE {: f:fd st:stat :}
+   x OPENED-UNMAKE {: f:fd st:MODEL:stat :}
    NO-HASH NO-FINGERPRINT f
    [: DROP-FINGERPRINT DROP-HASH f p u o ou st ar E-UNSUPPORTED E-CHANGED
       HASH-STABLE-FILE-FROM-STAT ;] CLOSING
@@ -955,7 +943,7 @@ ENUM name-entry
 \ Whether the name's entry is file's inode; a symlink there is another.
 : NAMED-INODE-MATCHES ( fd fd ^u8 n ^u8 n -- bool )
    {: file:fd dir:fd name:^ nu:n p:^ u:n :}
-   file p u s" inspect held local entry" STAT-FD {: held:stat :}
+   file p u s" inspect held local entry" STAT-FD {: held:MODEL:stat :}
    dir name nu FS:TRY-OPEN-ENTRY-AT MATCH option
       none OF FS:ERRNO FS:ENOENT <> if
             s" inspect named local entry" p u IO-FAILURE
@@ -981,7 +969,7 @@ ENUM name-entry
    s" open installed file for sync" {: o:^ ou:n :}
    dir name nu p u o ou OPEN-REGULAR-AT-IF-PRESENT MATCH option
       none OF o ou p u CHANGED ENDOF
-      some OF OPENED-UNMAKE {: f:fd st:stat :}
+      some OF OPENED-UNMAKE {: f:fd st:MODEL:stat :}
          [: f p u s" sync installed file" SYNC-FILE ;] [: f DISCARD ;]
          finally
       ENDOF
@@ -1005,7 +993,7 @@ STRUCTURE cutoff
 \ A directory the walk listed, and its stat before the listing.
 STRUCTURE scanned-directory
    FIELD path str
-   FIELD before stat
+   FIELD before MODEL:stat
 ;STRUCTURE
 
 \ A file the walk found and no cached hash covers.
@@ -1058,7 +1046,7 @@ STRUCTURE scan-context
 STRUCTURE pending-scan
    FIELD root str
    FIELD root-fd fd
-   FIELD root-before stat
+   FIELD root-before MODEL:stat
    FIELD entries scan-entries
    FIELD arena ^ARENA:arena
 ;STRUCTURE
@@ -1255,10 +1243,10 @@ private
 
 \ ---- the walk
 
-: STAT-DEV ( stat -- n ) STAT-UNMAKE {: d i m s ms mn cs cn :} d ;
+: STAT-DEV ( MODEL:stat -- n ) MODEL-STAT:UNMAKE {: d i m s ms mn cs cn :} d ;
 
-: DIRECTORY? ( stat -- bool )
-   STAT-UNMAKE {: d i m s ms mn cs cn :}
+: DIRECTORY? ( MODEL:stat -- bool )
+   MODEL-STAT:UNMAKE {: d i m s ms mn cs cn :}
    m FS:S-IFMT and FS:S-IFDIR = ;
 
 : SAME-FINGERPRINT? ( MODEL:fingerprint MODEL:fingerprint -- bool )
@@ -1332,10 +1320,10 @@ create LISTING FS-LIST:STORAGE-BYTES allot
 
 \ The file at f, opened where the probe found it, as a cached hash or a
 \ file to hash.
-: COLLECT-FILE ( fd str stat scan-context scan-entries -- )
-   {: f:fd path:str probe:stat cx:scan-context en:scan-entries :}
+: COLLECT-FILE ( fd str MODEL:stat scan-context scan-entries -- )
+   {: f:fd path:str probe:MODEL:stat cx:scan-context en:scan-entries :}
    path str> {: p:^ u:n :}
-   f p u s" inspect opened scan file" STAT-FD {: opened:stat :}
+   f p u s" inspect opened scan file" STAT-FD {: opened:MODEL:stat :}
    probe opened SAME-INODE 0= if s" open scanned file" p u CHANGED then
    opened p u FILE-FINGERPRINT {: print:MODEL:fingerprint :}
    cx path print REUSABLE-CONTENT MATCH option
@@ -1349,8 +1337,8 @@ create LISTING FS-LIST:STORAGE-BYTES allot
 \ A special file put where the probe found a regular one would block a
 \ plain read forever, so the open never waits and the inode check rejects
 \ it.
-: SCAN-FILE ( fd ^u8 n str stat scan-context scan-entries -- )
-   {: dir:fd name:^ nu:n path:str probe:stat cx:scan-context
+: SCAN-FILE ( fd ^u8 n str MODEL:stat scan-context scan-entries -- )
+   {: dir:fd name:^ nu:n path:str probe:MODEL:stat cx:scan-context
       en:scan-entries :}
    name nu RESERVED-ARTIFACT? if
       en path MODEL-UNKNOWN--REASON:UNSUPPORTED UNKNOWN exit
@@ -1363,17 +1351,17 @@ defer SCAN-SUBTREE ( fd str scan-context scan-entries -- )
 
 \ The directory's observation follows its subtree's, so a failure below
 \ leaves it unpublished.
-: COLLECT-DIRECTORY ( fd str stat scan-context scan-entries -- )
-   {: child:fd path:str probe:stat cx:scan-context en:scan-entries :}
+: COLLECT-DIRECTORY ( fd str MODEL:stat scan-context scan-entries -- )
+   {: child:fd path:str probe:MODEL:stat cx:scan-context en:scan-entries :}
    path str> {: p:^ u:n :}
-   child p u s" inspect opened scan directory" STAT-FD {: opened:stat :}
+   child p u s" inspect opened scan directory" STAT-FD {: opened:MODEL:stat :}
    probe opened SAME-INODE 0= if s" open scanned directory" p u CHANGED then
    child path cx en SCAN-SUBTREE
    path MODEL:>PATH DIRECTORY-OBSERVATION MODEL-LOCAL--RECORD:MAKE
    en OBSERVED VEC:PUSH ! ;
 
-: SCAN-SUBDIRECTORY ( fd ^u8 n str stat scan-context scan-entries -- )
-   {: dir:fd name:^ nu:n path:str probe:stat cx:scan-context
+: SCAN-SUBDIRECTORY ( fd ^u8 n str MODEL:stat scan-context scan-entries -- )
+   {: dir:fd name:^ nu:n path:str probe:MODEL:stat cx:scan-context
       en:scan-entries :}
    dir name nu path str> OPEN-DIRECTORY-AT {: child:fd :}
    [: child path probe cx en COLLECT-DIRECTORY ;] [: child DISCARD ;]
@@ -1384,7 +1372,7 @@ defer SCAN-SUBTREE ( fd str scan-context scan-entries -- )
 : SCAN-PROBED ( fd fd ^u8 n str scan-context scan-entries -- )
    {: probe:fd dir:fd name:^ nu:n path:str cx:scan-context
       en:scan-entries :}
-   probe path str> s" inspect directory entry type" STAT-FD {: st:stat :}
+   probe path str> s" inspect directory entry type" STAT-FD {: st:MODEL:stat :}
    cx SCAN-CONTEXT-UNMAKE {: cache cut:option<cutoff> dev:n ar :}
    st STAT-DEV dev <> if
       en path MODEL-UNKNOWN--REASON:UNSUPPORTED UNKNOWN exit
@@ -1445,7 +1433,7 @@ defer SCAN-SUBTREE ( fd str scan-context scan-entries -- )
    {: dir:fd path:str cx:scan-context en:scan-entries :}
    path str> {: p:^ u:n :}
    cx SCAN-CONTEXT-UNMAKE {: cache cut:option<cutoff> dev:n ar :}
-   dir p u s" inspect directory before scan" STAT-FD {: before:stat :}
+   dir p u s" inspect directory before scan" STAT-FD {: before:MODEL:stat :}
    dir path s" open directory stream" s" read directory" ar LIST-PATHS
    {: names :}
    names VEC:COUNT [: names swap VEC:AT STR@ ;] ar ORDER {: idx :}
@@ -1479,9 +1467,9 @@ SUBTREE-INSTALL
 
 \ The open file's hash, which must match the fingerprint the walk took.
 : HASH-OPENED-FILE
-   ( fd str MODEL:fingerprint stat [ -- option<cutoff> ] ^ARENA:arena
+   ( fd str MODEL:fingerprint MODEL:stat [ -- option<cutoff> ] ^ARENA:arena
      -- scanned-hash )
-   {: f:fd path:str want:MODEL:fingerprint opened:stat q
+   {: f:fd path:str want:MODEL:fingerprint opened:MODEL:stat q
       ar:^ARENA:arena :}
    path str> {: p:^ u:n :}
    opened p u FILE-FINGERPRINT want SAME-FINGERPRINT? 0= if
@@ -1502,7 +1490,7 @@ SUBTREE-INSTALL
    {: root:fd job:hash-job q ar:^ARENA:arena :}
    job HASH-JOB-UNMAKE {: path:str want:MODEL:fingerprint :}
    root path str> s" open enumerated scan file" E-IO E-UNSUPPORTED
-   OPEN-RELATIVE-REGULAR-WITH-STAT {: f:fd opened:stat :}
+   OPEN-RELATIVE-REGULAR-WITH-STAT {: f:fd opened:MODEL:stat :}
    [: f path want opened q ar HASH-OPENED-FILE ;] [: f DISCARD ;] finally ;
 
 \ Every failure here concerns the job's own path.
@@ -1529,7 +1517,7 @@ SUBTREE-INSTALL
    {: root:fd r:MODEL:hash-record res:scan-hash-results :}
    r RECORD-PATH {: p:^ u:n :}
    root p u s" reopen cached scan file" E-IO E-UNSUPPORTED
-   OPEN-RELATIVE-REGULAR-WITH-STAT {: f:fd before:stat :}
+   OPEN-RELATIVE-REGULAR-WITH-STAT {: f:fd before:MODEL:stat :}
    f DISCARD
    before p u FILE-FINGERPRINT r RECORD-FINGERPRINT
    SAME-FINGERPRINT? 0= if
@@ -1553,7 +1541,7 @@ SUBTREE-INSTALL
 
 \ ---- directories
 
-: REOPEN-SCANNED-DIRECTORY ( fd ^u8 n -- stat )
+: REOPEN-SCANNED-DIRECTORY ( fd ^u8 n -- MODEL:stat )
    {: root:fd p:^ u:n :}
    p u SAFE-COMPONENTS drop
    root p u FS:TRY-OPEN-DIR-AT MATCH option
@@ -1565,16 +1553,16 @@ SUBTREE-INSTALL
    ;MATCH ;
 
 \ Only the root failing revalidation fails the scan.
-: REVALIDATE-ROOT ( fd stat -- )
-   {: root:fd before:stat :}
+: REVALIDATE-ROOT ( fd MODEL:stat -- )
+   {: root:fd before:MODEL:stat :}
    root s" " s" revalidate scanned directory" STAT-FD
    before SAME-OBSERVATION 0= if
       s" revalidate scanned directory" s" " CHANGED
    then ;
 
 : CHECK-DIRECTORY
-   ( fd str stat ^VEC:vector<MODEL:local-record> -- )
-   {: root:fd path:str before:stat unknown :}
+   ( fd str MODEL:stat ^VEC:vector<MODEL:local-record> -- )
+   {: root:fd path:str before:MODEL:stat unknown :}
    root path str> REOPEN-SCANNED-DIRECTORY
    before SAME-OBSERVATION if exit then
    path MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN-RECORD unknown VEC:PUSH ! ;
@@ -1582,7 +1570,7 @@ SUBTREE-INSTALL
 : REVALIDATE-DIRECTORY
    ( fd scanned-directory ^VEC:vector<MODEL:local-record> -- )
    {: root:fd d:scanned-directory unknown :}
-   d SCANNED-DIRECTORY-UNMAKE {: path:str before:stat :}
+   d SCANNED-DIRECTORY-UNMAKE {: path:str before:MODEL:stat :}
    path str> nip 0= if root before REVALIDATE-ROOT exit then
    [: root path before unknown CHECK-DIRECTORY ;] ['] ENTRY-CODE?
    CONVERTING {: code:n :}
@@ -1674,8 +1662,8 @@ SUBTREE-INSTALL
    unknown VEC:COUNT 0 ?do unknown i VEC:AT @ observations VEC:PUSH ! loop ;
 
 \ The configured path must still name the root the scan opened.
-: VERIFY-ROOT ( str stat -- )
-   {: root:str before:stat :}
+: VERIFY-ROOT ( str MODEL:stat -- )
+   {: root:str before:MODEL:stat :}
    root str> {: p:^ u:n :}
    p u s" reopen sync root after scan" OPEN-ABSOLUTE-DIRECTORY {: f:fd :}
    [: f p u s" verify sync root binding after scan" STAT-FD ;]
@@ -1684,9 +1672,9 @@ SUBTREE-INSTALL
    0= if s" verify complete local scan root" p u CHANGED then ;
 
 : FINISH
-   ( str fd stat scan-entries [ -- option<cutoff> ] ^ARENA:arena
+   ( str fd MODEL:stat scan-entries [ -- option<cutoff> ] ^ARENA:arena
      -- complete-scan )
-   {: root:str rfd:fd before:stat en:scan-entries q ar:^ARENA:arena :}
+   {: root:str rfd:fd before:MODEL:stat en:scan-entries q ar:^ARENA:arena :}
    en SCAN-ENTRIES-UNMAKE {: observations cached reusable dirs jobs :}
    rfd jobs q ar HASH-SCAN-FILES {: hashed:scan-hash-results :}
    rfd cached ar REVALIDATE-CACHED-FILES {: again:scan-hash-results :}
@@ -1703,7 +1691,7 @@ SUBTREE-INSTALL
 : FINISH-SCAN-AT ( pending-scan [ -- option<cutoff> ] -- complete-scan )
    {: ps:pending-scan q :}
    ps PENDING-SCAN-UNMAKE
-   {: root:str rfd:fd before:stat en:scan-entries ar:^ARENA:arena :}
+   {: root:str rfd:fd before:MODEL:stat en:scan-entries ar:^ARENA:arena :}
    [: root rfd before en q ar FINISH ;] [: rfd DISCARD ;] finally ;
 
 \ FINISH-SCAN-AT, then the root's binding, read from its descriptor while
@@ -1713,7 +1701,7 @@ SUBTREE-INSTALL
      -- complete-scan option<JOURNAL:local-root-binding> )
    {: ps:pending-scan q j :}
    ps PENDING-SCAN-UNMAKE
-   {: root:str rfd:fd before:stat en:scan-entries ar:^ARENA:arena :}
+   {: root:str rfd:fd before:MODEL:stat en:scan-entries ar:^ARENA:arena :}
    [: root rfd before en q ar FINISH
       root rfd j ar JOURNAL:INSPECT-ROOT-AT ;]
    [: rfd DISCARD ;] finally ;
@@ -1727,15 +1715,15 @@ SUBTREE-INSTALL
 \ other device is an unsupported subtree. The walk's collections stay in
 \ walk order: FINISH sorts what it publishes. A throw closes the root.
 : ENUMERATE-SCAN-ON-DEVICE
-   ( str scan-entries fd stat ^VEC:vector<MODEL:hash-record>
+   ( str scan-entries fd MODEL:stat ^VEC:vector<MODEL:hash-record>
      option<cutoff> n ^ARENA:arena -- pending-scan )
-   {: root:str en:scan-entries rfd:fd before:stat cache
+   {: root:str en:scan-entries rfd:fd before:MODEL:stat cache
       cut:option<cutoff> dev:n ar:^ARENA:arena :}
    cache cut dev ar SCAN-CONTEXT-MAKE {: cx:scan-context :}
    rfd [: rfd s" " >str cx en SCAN-DIRECTORY ;] CLOSING
    root rfd before en ar PENDING-SCAN-MAKE ;
 
-: ROOT-STAT ( fd ^u8 n -- stat )
+: ROOT-STAT ( fd ^u8 n -- MODEL:stat )
    {: rfd:fd p:^ u:n :}
    NO-STAT rfd
    [: DROP-STAT rfd p u s" inspect sync root before scan" STAT-FD ;]
@@ -1747,7 +1735,7 @@ SUBTREE-INSTALL
    {: p:^ u:n cache cut:option<cutoff> ar:^ARENA:arena :}
    p u ar KEEP ar NEW-ENTRIES {: root:str en:scan-entries :}
    p u s" open sync root for scan" OPEN-ABSOLUTE-DIRECTORY {: rfd:fd :}
-   rfd p u ROOT-STAT {: before:stat :}
+   rfd p u ROOT-STAT {: before:MODEL:stat :}
    root en rfd before cache cut before STAT-DEV ar
    ENUMERATE-SCAN-ON-DEVICE ;
 
@@ -2401,7 +2389,7 @@ private
    {: src:fd r:^ ru:n dir:fd name:^ nu:n p:^ u:n want:DROPBOX:hash
       ar:^ARENA:arena :}
    src r ru s" inspect upload source before staging" STAT-FD
-   {: before:stat :}
+   {: before:MODEL:stat :}
    src dir name nu p u want ar WRITE-UPLOAD-STAGE if exit then
    {: w:stage-write :}
    src r ru s" inspect upload source after staging" STAT-FD
@@ -2510,7 +2498,7 @@ private
 
 \ The stat of the entry the candidate opens, which it closes; none when
 \ nothing is there.
-: CANDIDATE-STAT ( fd ^u8 n ^u8 n ^u8 n -- option<stat> )
+: CANDIDATE-STAT ( fd ^u8 n ^u8 n ^u8 n -- option<MODEL:stat> )
    {: dir:fd name:^ nu:n p:^ u:n o:^ ou:n :}
    dir name nu [: FS:TRY-OPEN-ENTRY-AT ;] p u o ou
    OPEN-UPLOAD-STAGE-CANDIDATE MATCH option
@@ -2544,7 +2532,7 @@ private
    dir name nu p u s" reinspect upload stage for collection" CANDIDATE-STAT
    MATCH option
       none OF false ENDOF
-      some OF {: current:stat :}
+      some OF {: current:MODEL:stat :}
          f p u s" reinspect opened upload stage for collection" STAT-FD
          current SAME-OBSERVATION
       ENDOF
@@ -2552,8 +2540,8 @@ private
 
 \ The opened stage file is the entry seen before, holds its name's
 \ content, and is still that entry.
-: VERIFIED-OPENED? ( fd stat fd ^u8 n ^u8 n ^ARENA:arena -- bool )
-   {: f:fd before:stat dir:fd name:^ nu:n p:^ u:n ar:^ARENA:arena :}
+: VERIFIED-OPENED? ( fd MODEL:stat fd ^u8 n ^u8 n ^ARENA:arena -- bool )
+   {: f:fd before:MODEL:stat dir:fd name:^ nu:n p:^ u:n ar:^ARENA:arena :}
    f p u s" inspect opened upload stage for collection" STAT-FD
    before SAME-OBSERVATION 0= if false exit then
    f name nu p u ar HOLDS-ITS-NAME? 0= if false exit then
@@ -2567,7 +2555,7 @@ private
    MATCH option
       none OF false exit ENDOF
       some OF ENDOF
-   ;MATCH {: before:stat :}
+   ;MATCH {: before:MODEL:stat :}
    before REGULAR? 0= if false exit then
    dir name nu [: FS:TRY-OPEN-READ-AT ;] p u
    s" open upload stage for collection"
@@ -2869,11 +2857,11 @@ ENUM download-slot-open
 : DROP-SLOT-OPEN ( download-slot-open -- ) drop ;
 
 \ The opened file, when it is the regular file probed.
-: CHECK-SLOT-FILE ( fd stat ^u8 n -- download-slot-open )
-   {: f:fd probed:stat p:^ u:n :}
+: CHECK-SLOT-FILE ( fd MODEL:stat ^u8 n -- download-slot-open )
+   {: f:fd probed:MODEL:stat p:^ u:n :}
    NO-STAT f
    [: DROP-STAT f p u s" inspect opened download slot" STAT-FD ;] CLOSING
-   {: opened:stat :}
+   {: opened:MODEL:stat :}
    opened REGULAR? opened probed SAME-INODE and if
       f DOWNLOAD-SLOT-OPEN-FILE exit
    then
@@ -2894,7 +2882,7 @@ ENUM download-slot-open
 \ Opens the probed name for writing when the probe found a regular file.
 : OPEN-PROBED-SLOT ( fd fd ^u8 n ^u8 n -- download-slot-open )
    {: probe:fd dir:fd name:^ nu:n p:^ u:n :}
-   probe p u s" inspect resumed download slot" STAT-FD {: probed:stat :}
+   probe p u s" inspect resumed download slot" STAT-FD {: probed:MODEL:stat :}
    probed REGULAR? 0= if DOWNLOAD-SLOT-OPEN-OCCUPIED exit then
    dir name nu FS:TRY-OPEN-WRITE-AT MATCH option
       none OF probe dir name nu p u SLOT-OPEN-FAILED ENDOF
@@ -3807,9 +3795,9 @@ private
       some OF ENDOF
    ;MATCH ;
 
-: SLOT-LENGTH ( stat ^u8 n -- n )
-   {: st:stat p:^ u:n :}
-   st STAT-UNMAKE {: d i m s ms mn cs cn :}
+: SLOT-LENGTH ( MODEL:stat ^u8 n -- n )
+   {: st:MODEL:stat p:^ u:n :}
+   st MODEL-STAT:UNMAKE {: d i m s ms mn cs cn :}
    s 0 < if 0 s" inspect resumed download size" p u SYSCALL-FAILURE then
    s ;
 
@@ -3888,7 +3876,7 @@ private
    ( ^download-partial binding ^ARENA:arena -- download-preparation )
    {: x b:binding ar:^ARENA:arena :}
    x PARTIAL-FILE x PARTIAL-PATH s" inspect resumed download" STAT-FD
-   {: st:stat :}
+   {: st:MODEL:stat :}
    st REGULAR? 0= if EPHEMERAL exit then
    st x PARTIAL-PATH SLOT-LENGTH {: length:n :}
    x PARTIAL-FILE x PARTIAL-PATH READ-DOWNLOAD-SLOT-STATE MATCH option
@@ -4904,8 +4892,8 @@ private
    {: other:n :}
    FS:ERRNO FS:ENOENT = FS:ERRNO other = or ;
 
-: RENAMEABLE? ( stat bool -- bool )
-   {: st:stat dirs:bool :}
+: RENAMEABLE? ( MODEL:stat bool -- bool )
+   {: st:MODEL:stat dirs:bool :}
    st REGULAR? if true exit then
    dirs st DIRECTORY? and ;
 

@@ -128,6 +128,18 @@ STRUCTURE fingerprint
    FIELD changed-nanoseconds n
 ;STRUCTURE
 
+\ What fstat says of an open entry.
+STRUCTURE stat
+   FIELD dev n
+   FIELD inode n
+   FIELD mode n
+   FIELD size n
+   FIELD modified-seconds n
+   FIELD modified-nanoseconds n
+   FIELD changed-seconds n
+   FIELD changed-nanoseconds n
+;STRUCTURE
+
 \ A verified content hash a complete local scan may reuse.
 STRUCTURE hash-record
    FIELD path path

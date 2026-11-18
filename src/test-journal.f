@@ -5,14 +5,19 @@
 \ version recorded before a destructive operation, answering a
 \ recovery-write, COMPLETE-RECOVERY completes a recovery record,
 \ answering a recovery-completion, TOTAL-CHANGES answers the rows the
-\ journal's connection has changed since it opened, and LOCAL-RECORDS=
+\ journal's connection has changed since it opened, CHANGE-COUNTER
+\ answers SQLite's file change counter, and LOCAL-RECORDS=
 \ answers whether two local inventories hold equal records in the same
 \ order. Tests alone load this file; nothing in the program calls these
 \ words.
 \ STORAGE CLASS. CALLER-OWNED, as JOURNAL's: a record answered lies in the
-\ arena the caller passes.
+\ arena the caller passes. TASK-LOCAL: the bytes CHANGE-COUNTER reads,
+\ TASK:+USERS rows.
 
 require src/lib/arena.f
+require src/lib/be.f
+require src/lib/fs.f
+require src/lib/task.f
 require src/lib/adt/option.f
 require src/lib/sqlite.f
 require src/lib/json.f
@@ -39,6 +44,18 @@ ENUM recovery-completion not-found already-completed completed ;ENUM
 
 : TOTAL-CHANGES ( journal -- n )
    >CONNECTION s" SELECT total_changes()" QUERY-INT ;
+
+private
+
+4 TASK:+USERS COUNTER-BYTES u8
+
+public
+
+\ SQLite's file change counter, which every commit that writes the
+\ journal file increments.
+: CHANGE-COUNTER ( journal -- n )
+   >PATH 24 0 COUNTER-BYTES 4 FS:READ-AT
+   0 COUNTER-BYTES BE:U32@ ;
 
 EXPORT LOCAL-RECORDS=
 

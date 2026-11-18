@@ -489,11 +489,11 @@ FS:PATHZ-CAP BUFFER: LOG-AT
 : PUBLISHED ( complete-scan -- n ) SCAN-OBSERVATIONS VEC:COUNT ;
 
 : PENDING-ENTRIES ( pending-scan -- scan-entries )
-   PENDING-SCAN-UNMAKE {: r:str f:fd b:stat en:scan-entries ar :} en ;
+   PENDING-SCAN-UNMAKE {: r:str f:fd b:MODEL:stat en:scan-entries ar :} en ;
 
 \ Closes the root a pending scan holds, as Rust's drop of one.
 : RELEASE ( pending-scan -- )
-   PENDING-SCAN-UNMAKE {: r:str f:fd b:stat en:scan-entries ar :}
+   PENDING-SCAN-UNMAKE {: r:str f:fd b:MODEL:stat en:scan-entries ar :}
    f DISCARD ;
 
 \ The kind each observation is, and unknown's reason after it.
@@ -636,7 +636,7 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    {: p:^ u:n ar:^ARENA:arena :}
    p u ar KEEP ar NEW-ENTRIES {: root:str en:scan-entries :}
    p u s" open sync root for scan" OPEN-ABSOLUTE-DIRECTORY {: rfd:fd :}
-   rfd p u ROOT-STAT {: before:stat :}
+   rfd p u ROOT-STAT {: before:MODEL:stat :}
    root en rfd before ar [type] MODEL:hash-record NEW-VEC NO-CUTOFF
    before STAT-DEV 1 xor ar ENUMERATE-SCAN-ON-DEVICE ;
 
@@ -985,7 +985,7 @@ variable CAUGHT
    AR @ [type] scanned-directory NEW-VEC {: kept :}
    d VEC:COUNT 0 ?do
       d i VEC:AT @ {: x:scanned-directory :}
-      x SCANNED-DIRECTORY-UNMAKE {: p:str b:stat :}
+      x SCANNED-DIRECTORY-UNMAKE {: p:str b:MODEL:stat :}
       p str> NESTED? 0= if x kept VEC:PUSH ! then
    loop
    d 0 VEC:RESIZE
@@ -1326,9 +1326,9 @@ variable RAISED-ERRNO
    {: j :}
    j s" root" ACTIVATE
    j s" root" NO-CUTOFF PUBLISH-STABLE
-   j JOURNAL:TOTAL-CHANGES {: before :}
+   j JOURNAL:CHANGE-COUNTER {: before :}
    j s" root" NO-CUTOFF PUBLISH-STABLE
-   j JOURNAL:TOTAL-CHANGES before T= ;
+   j JOURNAL:CHANGE-COUNTER before T= ;
 
 : UNCHANGED-TREE-BESIDE-A-SAME-NAMED-DIRECTORY-REPUBLISHES-NOTHING
    ( -- )

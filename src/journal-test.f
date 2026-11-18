@@ -5,7 +5,13 @@
 \ src/oracle/journal.sqlite3, a schema-8 journal, migrated with its local
 \ observations keyed by their folded paths, and, without its
 \ remote_directories index, left at schema 8 with every row when the
-\ migration fails;
+\ migration fails; a local scan published as its difference, every
+\ unchanged row keeping its rowid and the hashes of another generation
+\ dropped, emptied by WITH-SCAN, and writing nothing for a root that is
+\ not active; a scan's reused hashes, jobs and listed directories each
+\ visited once in path order, then gone; what a visit observes and
+\ hashes published; a discarded subtree dropped from the scan but for
+\ its cached hashes, which publish; CACHED-HASH's lookup by path;
 \ src/oracle/journal.sqlite3, copied and opened, giving journal.tsv's
 \ Dropbox and local root bindings, local and remote inventories, remote
 \ cursor, baselines, baseline paths, pending and blocked plans, pending
@@ -406,6 +412,11 @@ variable SCANNED       \ query plan rows that scan the table
    p pu DISPLAY
    m 1 + m 2 + 1 ns 2 ns MODEL-FINGERPRINT:MAKE
    ar A-HASH MODEL-HASH--RECORD:MAKE ;
+
+\ A hash record at the path whose hash, "new", is not Dropbox's.
+: FOREIGN-HASH ( ^u8 n -- MODEL:hash-record )
+   DISPLAY 1 2 1 0 2 0 MODEL-FINGERPRINT:MAKE s" new" CONTENT
+   MODEL-HASH--RECORD:MAKE ;
 
 : REMOTES ( ^ARENA:arena -- ^VEC:vector<MODEL:remote-record> )
    ARENA:ALLOCATOR 0 [type] MODEL:remote-record VEC:NEW ;
@@ -821,6 +832,9 @@ variable SCANNED       \ query plan rows that scan the table
 : DELETE-ROW? ( SQLITE:statement -- bool SQLITE:statement )
    SQLITE:STEP drop 0 SQLITE:COL-TEXT s" delete" STR= swap ;
 
+: MEMORY-ROW? ( SQLITE:statement -- bool SQLITE:statement )
+   SQLITE:STEP drop 0 SQLITE:COL-TEXT s" memory" STR= swap ;
+
 : WRITABLE-JOURNAL-USES-FULL-SYNCHRONOUS-ROLLBACK-MODE
    ( ^ARENA:arena -- )
    {: ar :}
@@ -829,6 +843,8 @@ variable SCANNED       \ query plan rows that scan the table
    p OPEN {: j :}
    j >CONNECTION {: c :}
    c s" PRAGMA journal_mode" >str [: DELETE-ROW? ;] SQLITE:WITH-STATEMENT
+   TTRUE
+   c s" PRAGMA temp.journal_mode" >str [: MEMORY-ROW? ;] SQLITE:WITH-STATEMENT
    TTRUE
    c s" PRAGMA synchronous" QUERY-INT 2 T=
    j BUSY-MS-OF 5000 T=
@@ -1301,6 +1317,51 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    j CLOSE
    d GONE ;
 
+\ Notes each published row's rowid, path and value in temporary tables.
+: ROWS-NOTED ( journal -- )
+   >CONNECTION
+   s" DROP TABLE IF EXISTS temp.noted_observations;
+      DROP TABLE IF EXISTS temp.noted_hashes;
+      CREATE TEMP TABLE noted_observations AS
+         SELECT rowid AS id, path, observation_json FROM local_observations;
+      CREATE TEMP TABLE noted_hashes AS
+         SELECT rowid AS id, root_generation, path, hash_json
+         FROM local_hash_cache;" SQLITE:EXEC ;
+
+\ The observation rows noted that remain with their rowid, the rows
+\ added since, and the rows noted that are gone.
+: OBSERVATIONS-MOVED ( journal -- n n n )
+   >CONNECTION {: c :}
+   c s" SELECT COUNT(*) FROM (
+         SELECT rowid, path, observation_json FROM local_observations
+         INTERSECT SELECT * FROM noted_observations)" QUERY-INT
+   c s" SELECT COUNT(*) FROM (
+         SELECT rowid, path, observation_json FROM local_observations
+         EXCEPT SELECT * FROM noted_observations)" QUERY-INT
+   c s" SELECT COUNT(*) FROM (
+         SELECT * FROM noted_observations
+         EXCEPT SELECT rowid, path, observation_json FROM local_observations)"
+   QUERY-INT ;
+
+\ OBSERVATIONS-MOVED's counts for the hash cache.
+: HASHES-MOVED ( journal -- n n n )
+   >CONNECTION {: c :}
+   c s" SELECT COUNT(*) FROM (
+         SELECT rowid, root_generation, path, hash_json FROM local_hash_cache
+         INTERSECT SELECT * FROM noted_hashes)" QUERY-INT
+   c s" SELECT COUNT(*) FROM (
+         SELECT rowid, root_generation, path, hash_json FROM local_hash_cache
+         EXCEPT SELECT * FROM noted_hashes)" QUERY-INT
+   c s" SELECT COUNT(*) FROM (
+         SELECT * FROM noted_hashes EXCEPT
+         SELECT rowid, root_generation, path, hash_json FROM local_hash_cache)"
+   QUERY-INT ;
+
+\ The counts OBSERVATIONS-MOVED and HASHES-MOVED answer are the ones given.
+: MOVED= ( n n n n n n -- )
+   {: k a g wk wa wg :}
+   k wk T=  a wa T=  g wg T= ;
+
 : PUBLISH-HELD-SCAN ( -- )
    THE-JOURNAL @ THE-BINDING @ THE-LOCALS @ THE-HASHES @
    PUBLISH-LOCAL-SCAN drop ;
@@ -1326,24 +1387,223 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    s" old.txt" s" old" PRESENT-LOCAL LOCAL-RECORD {: old :}
    s" old.txt" 10 ar LOCAL-HASH {: old-hash :}
    j b old ar ONE-LOCAL old-hash ar ONE-HASH PUBLISH-LOCAL-SCAN TTRUE
-   j TOTAL-CHANGES {: unchanged :}
+   j ROWS-NOTED
    j b old ar ONE-LOCAL old-hash ar ONE-HASH PUBLISH-LOCAL-SCAN TTRUE
-   j TOTAL-CHANGES unchanged T=
+   j OBSERVATIONS-MOVED 1 0 0 MOVED=  j HASHES-MOVED 1 0 0 MOVED=
    s" new.txt" s" new" PRESENT-LOCAL LOCAL-RECORD ar ONE-LOCAL
    {: replacement :}
-   ar HASHES {: dups :}
-   s" new.txt" 20 ar LOCAL-HASH dups HASH+
-   s" new.txt" 30 ar LOCAL-HASH dups HASH+
    j THE-JOURNAL !  b THE-BINDING !
-   replacement THE-LOCALS !  dups THE-HASHES !
-   [: PUBLISH-HELD-SCAN ;] SQLITE:E-SQL d s" UNIQUE constraint failed"
-   ar LOGGED
+   replacement THE-LOCALS !  s" new.txt" FOREIGN-HASH ar ONE-HASH THE-HASHES !
+   [: PUBLISH-HELD-SCAN ;] E-INVALID-STATE d
+   s" is not a Dropbox content hash" ar LOGGED
    j old old-hash ar SCAN-HELD
-   j TOTAL-CHANGES {: stale :}
    j s" /stale" 4 LOCAL-ROOT replacement
    s" new.txt" 20 ar LOCAL-HASH ar ONE-HASH PUBLISH-LOCAL-SCAN TFALSE
-   j TOTAL-CHANGES stale T=
-   j old old-hash ar SCAN-HELD
+   j OBSERVATIONS-MOVED 1 0 0 MOVED=  j HASHES-MOVED 1 0 0 MOVED=
+   j CLOSE
+   d GONE ;
+
+
+\ Adds the path's observation, with the content, and its hash, with
+\ the marker, to the scan.
+: SCAN+
+   ( ^u8 n ^u8 n n ^VEC:vector<MODEL:local-record>
+     ^VEC:vector<MODEL:hash-record> ^ARENA:arena -- )
+   {: p:^ pu c:^ cu m obs hashes ar :}
+   p pu c cu PRESENT-LOCAL LOCAL-RECORD obs LOCAL+
+   p pu m ar LOCAL-HASH hashes HASH+ ;
+
+\ The journal at the path, opened with /sync its active root.
+: ACTIVE-JOURNAL ( str ^ARENA:arena -- journal local-root-binding )
+   {: p:str ar :}
+   p OPEN {: j :}
+   s" /sync" 2 LOCAL-ROOT {: b :}
+   j b ar ACTIVATE-LOCAL-ROOT ACTIVATED
+   j b ;
+
+: A-SCAN-PUBLISHES-ONLY-ITS-DIFFERENCE ( ^ARENA:arena -- )
+   {: ar :}
+   s" a scan publishes only its difference" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   ar LOCALS {: obs :}  ar HASHES {: hashes :}
+   s" a.txt" s" a" 1 obs hashes ar SCAN+
+   s" b.txt" s" b" 2 obs hashes ar SCAN+
+   s" c.txt" s" c" 3 obs hashes ar SCAN+
+   j b obs hashes PUBLISH-LOCAL-SCAN TTRUE
+   j ROWS-NOTED
+   j CHANGE-COUNTER {: before :}
+   j b obs hashes PUBLISH-LOCAL-SCAN TTRUE
+   j CHANGE-COUNTER before T=
+   j OBSERVATIONS-MOVED 3 0 0 MOVED=  j HASHES-MOVED 3 0 0 MOVED=
+   ar LOCALS {: next :}  ar HASHES {: next-hashes :}
+   s" a.txt" s" a" 1 next next-hashes ar SCAN+
+   s" b.txt" s" b2" 4 next next-hashes ar SCAN+
+   s" d.txt" s" d" 5 next next-hashes ar SCAN+
+   j b next next-hashes PUBLISH-LOCAL-SCAN TTRUE
+   j OBSERVATIONS-MOVED 1 2 2 MOVED=  j HASHES-MOVED 1 2 2 MOVED=
+   j ar LOCAL-INVENTORY next LOCAL-RECORDS= TTRUE
+   j ar LOCAL-HASH-CACHE next-hashes HASH-RECORDS= TTRUE
+   j CLOSE
+   d GONE ;
+
+: A-SCAN-DROPS-HASHES-OF-ANOTHER-GENERATION ( ^ARENA:arena -- )
+   {: ar :}
+   s" a scan drops the hashes of another generation" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   ar LOCALS {: obs :}  ar HASHES {: hashes :}
+   s" a.txt" s" a" 1 obs hashes ar SCAN+
+   s" b.txt" s" b" 2 obs hashes ar SCAN+
+   j b obs hashes PUBLISH-LOCAL-SCAN TTRUE
+   j >CONNECTION
+   s" INSERT INTO local_hash_cache(root_generation, path, hash_json)
+      SELECT root_generation + 1, path, hash_json FROM local_hash_cache"
+   SQLITE:EXEC
+   j ROWS-NOTED
+   j b obs hashes PUBLISH-LOCAL-SCAN TTRUE
+   j OBSERVATIONS-MOVED 2 0 0 MOVED=  j HASHES-MOVED 2 0 2 MOVED=
+   j >CONNECTION
+   s" SELECT COUNT(*) FROM local_hash_cache WHERE root_generation != 1"
+   QUERY-INT 0 T=
+   j CLOSE
+   d GONE ;
+
+variable ROWS-SEEN       \ rows an EACH-SCAN body was given
+
+\ The fingerprint and stat of the marker, a negative field among them.
+: MARKED-FINGERPRINT ( n -- MODEL:fingerprint )
+   {: m :}
+   m m 1 + -1 999999999 m 2 + m 3 + MODEL-FINGERPRINT:MAKE ;
+
+: MARKED-STAT ( n -- MODEL:stat )
+   {: m :}
+   m 1 + m -1 $41ED m 2 + 999999999 m 3 + 7 MODEL-STAT:MAKE ;
+
+: STAT= ( MODEL:stat MODEL:stat -- bool )
+   {: a b :}
+   a MODEL-STAT:UNMAKE {: d i m s ms mn cs cn :}
+   b MODEL-STAT:UNMAKE {: d2 i2 m2 s2 ms2 mn2 cs2 cn2 :}
+   d d2 = i i2 = and m m2 = and s s2 = and
+   ms ms2 = and mn mn2 = and cs cs2 = and cn cn2 = and ;
+
+\ The n-th path in byte order of "a-b", "a/x" and "a", put in with
+\ markers 1, 2 and 3, and its marker.
+: ORDERED-PATH ( n -- ^u8 n )
+   dup 0= if drop s" a" exit then
+   1 = if s" a-b" exit then
+   s" a/x" ;
+
+: ORDERED-MARK ( n -- n )
+   dup 0= if drop 3 exit then
+   1 = if 1 exit then
+   2 ;
+
+\ The paths SCAN-DISCARD of "a" keeps, in byte order.
+: SPARED-PATH ( n -- ^u8 n ) 0= if s" a-b" exit then s" ab" ;
+
+\ The path is the n-th one of the order, counted in ROWS-SEEN.
+: SEEN-AT ( str [ n -- ^u8 n ] -- n )
+   {: p:str order :}
+   ROWS-SEEN @ {: k :}
+   p str> k order execute STR= TTRUE
+   1 ROWS-SEEN +!
+   k ;
+
+: REUSE-SEEN ( scan MODEL:hash-record ^ARENA:arena -- scan )
+   {: r ar :}
+   r MODEL-HASH--RECORD:UNMAKE {: p:MODEL:path f h :}
+   p MODEL:PATH>STR [: ORDERED-PATH ;] SEEN-AT {: k :}
+   k ORDERED-PATH k ORDERED-MARK ar LOCAL-HASH
+   r MODEL:HASH-RECORD= TTRUE ;
+
+: JOB-SEEN ( scan str MODEL:fingerprint -- scan )
+   {: p:str f :}
+   p [: ORDERED-PATH ;] SEEN-AT {: k :}
+   k ORDERED-MARK MARKED-FINGERPRINT f MODEL:FINGERPRINT= TTRUE ;
+
+: LISTED-SEEN ( scan str MODEL:stat -- scan )
+   {: p:str st :}
+   p [: ORDERED-PATH ;] SEEN-AT {: k :}
+   k ORDERED-MARK MARKED-STAT st STAT= TTRUE ;
+
+: JOB-KEPT ( scan str MODEL:fingerprint -- scan )
+   {: p:str f :}
+   p [: SPARED-PATH ;] SEEN-AT drop ;
+
+: LISTED-KEPT ( scan str MODEL:stat -- scan )
+   {: p:str st :}
+   p [: SPARED-PATH ;] SEEN-AT drop ;
+
+: REUSE-COUNTED ( scan MODEL:hash-record -- scan )
+   {: r :} 1 ROWS-SEEN +! ;
+
+: JOB-COUNTED ( scan str MODEL:fingerprint -- scan )
+   {: p:str f :} 1 ROWS-SEEN +! ;
+
+: LISTED-COUNTED ( scan str MODEL:stat -- scan )
+   {: p:str st :} 1 ROWS-SEEN +! ;
+
+\ The scan's reused hashes, jobs and listed directories are all visited.
+: NOTHING-LEFT ( scan -- scan )
+   0 ROWS-SEEN !
+   [: REUSE-COUNTED ;] EACH-SCAN-REUSE
+   [: JOB-COUNTED ;] EACH-SCAN-JOB
+   [: LISTED-COUNTED ;] EACH-SCAN-LISTED
+   ROWS-SEEN @ 0 T= ;
+
+\ Puts old.txt in each of the scan's tables, publishing nothing.
+: OLD-SCANNED ( scan ^ARENA:arena -- scan )
+   {: ar :}
+   s" old.txt" s" old" PRESENT-LOCAL LOCAL-RECORD SCAN-OBSERVE
+   s" old.txt" 10 ar LOCAL-HASH SCAN-HASH
+   s" old.txt" 10 ar LOCAL-HASH SCAN-REUSE
+   s" old.txt" >str 10 MARKED-FINGERPRINT SCAN-JOB
+   s" old.txt" >str 10 MARKED-STAT SCAN-LISTED ;
+
+\ Observes and hashes new.txt, then publishes the scan.
+: NEW-PUBLISHED
+   ( scan local-root-binding MODEL:local-record MODEL:hash-record
+     -- scan )
+   {: b new new-hash :}
+   NOTHING-LEFT
+   new SCAN-OBSERVE  new-hash SCAN-HASH
+   b PUBLISH-SCAN TTRUE ;
+
+: WITH-SCAN-EMPTIES-THE-PREVIOUS-SCAN ( ^ARENA:arena -- )
+   {: ar :}
+   s" WITH-SCAN empties the previous scan" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   j [: ar OLD-SCANNED ;] WITH-SCAN
+   s" new.txt" s" new" PRESENT-LOCAL LOCAL-RECORD {: new :}
+   s" new.txt" 20 ar LOCAL-HASH {: new-hash :}
+   j [: b new new-hash NEW-PUBLISHED ;] WITH-SCAN
+   j new new-hash ar SCAN-HELD
+   j CLOSE
+   d GONE ;
+
+\ Observes and hashes new.txt, then publishes the scan for a root that
+\ is not active, which writes nothing.
+: STALE-PUBLISHED ( scan journal ^ARENA:arena -- scan )
+   {: j ar :}
+   s" new.txt" s" new" PRESENT-LOCAL LOCAL-RECORD SCAN-OBSERVE
+   s" new.txt" 20 ar LOCAL-HASH SCAN-HASH
+   j TOTAL-CHANGES {: before :}
+   s" /stale" 4 LOCAL-ROOT PUBLISH-SCAN TFALSE
+   j TOTAL-CHANGES before T= ;
+
+: A-SCAN-FOR-ANOTHER-ROOT-WRITES-NOTHING ( ^ARENA:arena -- )
+   {: ar :}
+   s" a scan for a root that is not active writes nothing" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   s" old.txt" s" old" PRESENT-LOCAL LOCAL-RECORD {: old :}
+   s" old.txt" 10 ar LOCAL-HASH {: old-hash :}
+   j b old ar ONE-LOCAL old-hash ar ONE-HASH PUBLISH-LOCAL-SCAN TTRUE
+   j ROWS-NOTED
+   j [: j ar STALE-PUBLISHED ;] WITH-SCAN
+   j OBSERVATIONS-MOVED 1 0 0 MOVED=  j HASHES-MOVED 1 0 0 MOVED=
    j CLOSE
    d GONE ;
 
@@ -1352,6 +1612,134 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
 
 : DIRECTORY-LOCAL ( ^u8 n -- MODEL:local-record )
    LOCAL-DIRECTORY LOCAL-RECORD ;
+
+\ The journal at a new path, given to body, closed and removed after.
+: ON-NEW-JOURNAL ( ^ARENA:arena [ journal -- ] -- )
+   {: ar body :}
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j body execute
+   j CLOSE
+   d GONE ;
+
+: REUSES-VISITED ( scan ^ARENA:arena -- scan )
+   {: ar :}
+   s" a-b" 1 ar LOCAL-HASH SCAN-REUSE
+   s" a/x" 2 ar LOCAL-HASH SCAN-REUSE
+   s" a" 3 ar LOCAL-HASH SCAN-REUSE
+   0 ROWS-SEEN !  [: ar REUSE-SEEN ;] EACH-SCAN-REUSE  ROWS-SEEN @ 3 T=
+   0 ROWS-SEEN !  [: REUSE-COUNTED ;] EACH-SCAN-REUSE  ROWS-SEEN @ 0 T= ;
+
+: EACH-SCAN-REUSE-VISITS-EACH-ROW-ONCE-IN-PATH-ORDER ( ^ARENA:arena -- )
+   {: ar :}
+   s" EACH-SCAN-REUSE visits each row once in path order" T-LABEL
+   ar [: [: ar REUSES-VISITED ;] WITH-SCAN ;] ON-NEW-JOURNAL ;
+
+: JOBS-VISITED ( scan -- scan )
+   s" a-b" >str 1 MARKED-FINGERPRINT SCAN-JOB
+   s" a/x" >str 2 MARKED-FINGERPRINT SCAN-JOB
+   s" a" >str 3 MARKED-FINGERPRINT SCAN-JOB
+   0 ROWS-SEEN !  [: JOB-SEEN ;] EACH-SCAN-JOB  ROWS-SEEN @ 3 T=
+   0 ROWS-SEEN !  [: JOB-COUNTED ;] EACH-SCAN-JOB  ROWS-SEEN @ 0 T= ;
+
+: EACH-SCAN-JOB-VISITS-EACH-ROW-ONCE-IN-PATH-ORDER ( ^ARENA:arena -- )
+   s" EACH-SCAN-JOB visits each row once in path order" T-LABEL
+   [: [: JOBS-VISITED ;] WITH-SCAN ;] ON-NEW-JOURNAL ;
+
+: LISTINGS-VISITED ( scan -- scan )
+   s" a-b" >str 1 MARKED-STAT SCAN-LISTED
+   s" a/x" >str 2 MARKED-STAT SCAN-LISTED
+   s" a" >str 3 MARKED-STAT SCAN-LISTED
+   0 ROWS-SEEN !  [: LISTED-SEEN ;] EACH-SCAN-LISTED  ROWS-SEEN @ 3 T=
+   0 ROWS-SEEN !  [: LISTED-COUNTED ;] EACH-SCAN-LISTED
+   ROWS-SEEN @ 0 T= ;
+
+: EACH-SCAN-LISTED-VISITS-EACH-ROW-ONCE-IN-PATH-ORDER ( ^ARENA:arena -- )
+   s" EACH-SCAN-LISTED visits each row once in path order" T-LABEL
+   [: [: LISTINGS-VISITED ;] WITH-SCAN ;] ON-NEW-JOURNAL ;
+
+\ Observes the reused hash's file and confirms the hash.
+: CONFIRMED ( scan MODEL:hash-record -- scan )
+   {: r :}
+   r MODEL-HASH--RECORD:UNMAKE {: p:MODEL:path f h :}
+   p s" a" PRESENT-LOCAL MODEL-LOCAL--RECORD:MAKE SCAN-OBSERVE
+   r SCAN-HASH ;
+
+: CONFIRMED-PUBLISHED
+   ( scan local-root-binding ^ARENA:arena -- scan )
+   {: b ar :}
+   s" a.txt" 10 ar LOCAL-HASH SCAN-REUSE
+   [: CONFIRMED ;] EACH-SCAN-REUSE
+   b PUBLISH-SCAN TTRUE ;
+
+: A-VISIT-PUBLISHES-WHAT-IT-OBSERVES-AND-HASHES ( ^ARENA:arena -- )
+   {: ar :}
+   s" a visit publishes what it observes and hashes" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   j [: b ar CONFIRMED-PUBLISHED ;] WITH-SCAN
+   j s" a.txt" s" a" PRESENT-LOCAL LOCAL-RECORD
+   s" a.txt" 10 ar LOCAL-HASH ar SCAN-HELD
+   j CLOSE
+   d GONE ;
+
+\ Puts the path in the scan's observations, jobs and listings.
+: EVERYWHERE ( scan MODEL:local-record -- scan )
+   {: r :}
+   r MODEL-LOCAL--RECORD:UNMAKE {: p:MODEL:path o :}
+   r SCAN-OBSERVE
+   p MODEL:PATH>STR 4 MARKED-FINGERPRINT SCAN-JOB
+   p MODEL:PATH>STR 4 MARKED-STAT SCAN-LISTED ;
+
+: DISCARD-PUBLISHED
+   ( scan local-root-binding ^ARENA:arena -- scan )
+   {: b ar :}
+   s" a" DIRECTORY-LOCAL EVERYWHERE
+   s" a/x" s" x" PRESENT-LOCAL LOCAL-RECORD EVERYWHERE
+   s" a-b" s" b" PRESENT-LOCAL LOCAL-RECORD EVERYWHERE
+   s" ab" s" c" PRESENT-LOCAL LOCAL-RECORD EVERYWHERE
+   s" a/y" 5 ar LOCAL-HASH SCAN-REUSE
+   s" a/z" 6 ar LOCAL-HASH SCAN-HASH
+   s" a" >str SCAN-DISCARD
+   0 ROWS-SEEN !  [: JOB-KEPT ;] EACH-SCAN-JOB  ROWS-SEEN @ 2 T=
+   0 ROWS-SEEN !  [: LISTED-KEPT ;] EACH-SCAN-LISTED  ROWS-SEEN @ 2 T=
+   0 ROWS-SEEN !  [: REUSE-COUNTED ;] EACH-SCAN-REUSE  ROWS-SEEN @ 0 T=
+   b PUBLISH-SCAN TTRUE ;
+
+: SCAN-DISCARD-DROPS-THE-SUBTREE-BUT-KEEPS-ITS-HASHES ( ^ARENA:arena -- )
+   {: ar :}
+   s" SCAN-DISCARD drops the subtree but keeps its hashes" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   j [: b ar DISCARD-PUBLISHED ;] WITH-SCAN
+   ar LOCALS {: obs :}  ar HASHES {: hashes :}
+   s" a-b" s" b" PRESENT-LOCAL LOCAL-RECORD obs LOCAL+
+   s" ab" s" c" PRESENT-LOCAL LOCAL-RECORD obs LOCAL+
+   s" a/y" 5 ar LOCAL-HASH hashes HASH+
+   s" a/z" 6 ar LOCAL-HASH hashes HASH+
+   j ar LOCAL-INVENTORY obs LOCAL-RECORDS= TTRUE
+   j ar LOCAL-HASH-CACHE hashes HASH-RECORDS= TTRUE
+   j CLOSE
+   d GONE ;
+
+: DROP-HASH-RECORD ( MODEL:hash-record -- ) drop ;
+
+: LOOKED-UP-IN ( scan MODEL:hash-record ^ARENA:arena -- scan )
+   {: want ar :}
+   s" a.txt" >str ar CACHED-HASH TTRUE want MODEL:HASH-RECORD= TTRUE
+   s" b.txt" >str ar CACHED-HASH TFALSE DROP-HASH-RECORD ;
+
+: CACHED-HASH-ANSWERS-THE-PUBLISHED-HASH ( ^ARENA:arena -- )
+   {: ar :}
+   s" CACHED-HASH answers the published hash" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   s" a.txt" s" a" PRESENT-LOCAL LOCAL-RECORD {: r :}
+   s" a.txt" 10 ar LOCAL-HASH {: h :}
+   j b r ar ONE-LOCAL h ar ONE-HASH PUBLISH-LOCAL-SCAN TTRUE
+   j [: h ar LOOKED-UP-IN ;] WITH-SCAN
+   j CLOSE
+   d GONE ;
 
 \ The piece of p from at joins v as a directory; the index after it,
 \ or -1 past the last.
@@ -3430,6 +3818,16 @@ variable CRAFT
    ar JOURNAL-LOCAL-SCAN-REPLACES-INVENTORY-AND-HASHES-ATOMICALLY
    ar EACH-LOCAL-COLLISION-VISITS-IN-KEY-ORDER
    ar LOCAL-COUNT-AND-LOCAL-AT
+   ar A-SCAN-PUBLISHES-ONLY-ITS-DIFFERENCE
+   ar A-SCAN-DROPS-HASHES-OF-ANOTHER-GENERATION
+   ar WITH-SCAN-EMPTIES-THE-PREVIOUS-SCAN
+   ar A-SCAN-FOR-ANOTHER-ROOT-WRITES-NOTHING
+   ar EACH-SCAN-REUSE-VISITS-EACH-ROW-ONCE-IN-PATH-ORDER
+   ar EACH-SCAN-JOB-VISITS-EACH-ROW-ONCE-IN-PATH-ORDER
+   ar EACH-SCAN-LISTED-VISITS-EACH-ROW-ONCE-IN-PATH-ORDER
+   ar A-VISIT-PUBLISHES-WHAT-IT-OBSERVES-AND-HASHES
+   ar SCAN-DISCARD-DROPS-THE-SUBTREE-BUT-KEEPS-ITS-HASHES
+   ar CACHED-HASH-ANSWERS-THE-PUBLISHED-HASH
    ar ORACLE-JOURNAL-HOLDS-ITS-BASELINES
    ar JOURNAL-REOPEN-EXPOSES-INTENT-WITHOUT-ADVANCING-BASELINE
    ar RECONCILIATION-DECISIONS-COMMIT-ATOMICALLY
