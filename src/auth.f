@@ -1,24 +1,24 @@
 \ auth.f - package AUTH: the Dropbox credential in the Secret Service
-\ (rust src/auth.rs RefreshTokenStore), through SECRET. The item is the
-\ one whose attributes application and kind hold org.omarchy.omabox and
-\ dropbox-credentials-v1, as `secret-tool` stores and looks it up, so
-\ either version reads what the other stored. Its value is serde_json's
-\ compact record of the version, 1, the refresh token and the Dropbox
-\ binding, under 8192 bytes. LOAD reads it as serde reads Rust's
-\ LoadedSecret: members in any order, an unknown one skipped, one absent,
-\ repeated or of another type refused. It refuses two records serde reads
-\ and no writer makes: one written as an array, and one whose skipped
-\ member holds a lone surrogate escape. AUTH's failures are logged once
-\ with the Rust version's text, then thrown as its codes; a SECRET code
-\ it passes on is logged as the credential operation's failure, then
-\ rethrown. No log line holds a string of the record, only an
-\ unsupported version's number.
+\ (rust src/auth.rs RefreshTokenStore), through SECRET, read and written
+\ by running `secret-tool`, as Rust's is. The item is the one whose
+\ attributes application and kind hold org.omarchy.omabox and
+\ dropbox-credentials-v1, so either version reads what the other stored.
+\ Its value is serde_json's compact record of the version, 1, the
+\ refresh token and the Dropbox binding, under 8192 bytes. LOAD reads it
+\ as serde reads Rust's LoadedSecret: members in any order, an unknown
+\ one skipped, one absent, repeated or of another type refused. It
+\ refuses two records serde reads and no writer makes: one written as an
+\ array, and one whose skipped member holds a lone surrogate escape.
+\ AUTH's failures, its store's included, are logged once with the Rust
+\ version's text, then thrown as its codes. No log line holds a string
+\ of the record, only an unsupported version's number.
 \ START begins a browser login (rust OAuthClient::begin): a PKCE verifier
 \ of 32 random bytes, and the URL dropbox-sdk 0.20.3's AuthorizeUrlBuilder
 \ builds for it, byte for byte.
-\ STORAGE CLASS. No state of its own. CALLER-OWNED: the strings LOAD
-\ answers, the record it read, and START's login, lie in the arena the
-\ caller passes.
+\ STORAGE CLASS. PROCESS-WIDE: PROGRAM, written before BIND and only read
+\ by a call. CALLER-OWNED: the strings LOAD answers, the record it read,
+\ and START's login, lie in the arena the caller passes; a lookup's
+\ output, in its own arena.
 HB-TARGET-LINUX? HB-TARGET-LINUX-X86-64? or ?TARGET
 require src/lib/error.f
 require src/lib/string.f
@@ -28,6 +28,7 @@ require src/lib/log.f
 require src/lib/utf8-scalar.f
 require src/lib/json.f
 require src/lib/secret.f
+require src/lib/process.f
 require src/lib/entropy.f
 require src/lib/base64.f
 require src/journal.f
@@ -104,8 +105,8 @@ private
 : STORING ( -- ^u8 n ) s" store Dropbox credential" ;
 : LOADING ( -- ^u8 n ) s" load Dropbox credential" ;
 
-\ rust CredentialSpawn and CredentialStatus for a SECRET code passed on:
-\ the operation, then what befell it; libsecret has no exit status.
+\ rust CredentialSpawn, CredentialWait and CredentialStatus: the
+\ operation, then what befell it.
 : OPERATION ( ^u8 n ^u8 n n -- )
    {: op:^ ou:n what:^ wu:n code:n :}
    LOG-OPEN s" credential operation `" LOG:TEXT+ op ou LOG:TEXT+
@@ -156,11 +157,7 @@ ARENA WRITERS JSON:writer
    r ru ;
 
 : WRITE-RECORD ( JOURNAL:dropbox-binding str ^ARENA:arena -- )
-   RECORD {: r:^ ru:n :}
-   [: SERVICE ACCOUNT r ru SECRET:WRITE ;] catch {: code:n :}
-   code SECRET:E-CONFIG = if STORING s" could not start" code OPERATION then
-   code UNAVAILABLE? if STORING s" failed" code OPERATION then
-   code 0<> if code throw then ;
+   RECORD {: r:^ ru:n :} SERVICE ACCOUNT r ru SECRET:WRITE ;
 
 
 \ ---- the record read -----------------------------------------------
@@ -263,8 +260,97 @@ ARENA CURSORS JSON:cursor
    drop drop
    code UNAVAILABLE? if 0 false exit then
    code SECRET:E-CAPACITY = if E-TOO-LARGE FAIL then
-   code SECRET:E-CONFIG = if LOADING s" could not start" code OPERATION then
    code throw ;
+
+
+\ ---- the store: one `secret-tool` run per call ---------------------
+
+\ Rust's arguments: the verb, a store's label, then the item's attributes.
+\ Neither the value nor the child's output is logged.
+
+TYPED-VARIABLE PROGRAM str     \ the program a call runs; tests set it
+
+: SECRET-TOOL ( -- ) s" /usr/bin/secret-tool" >str PROGRAM ! ;
+SECRET-TOOL
+
+: LABEL ( -- ^u8 n ) s" --label=Omabox Dropbox credentials" ;
+
+\ The item's attributes, for the service and the account.
+: ITEM ( PROCESS:request ^u8 n ^u8 n -- PROCESS:request )
+   {: s:^ su:n a:^ au:n :}
+   s" application" PROCESS:ARG s su PROCESS:ARG
+   s" kind" PROCESS:ARG a au PROCESS:ARG ;
+
+\ Whether the child ended other than by exit 0: a nonzero exit or a signal.
+: FAILED? ( PROCESS:status -- bool )
+   PROCESS:STATUS>RC RC>N 0<> ;
+
+\ `secret-tool lookup`, its output captured into room of dest's length;
+\ only an exit of 0 copies it into dest, so a miss leaves dest unchanged.
+: LOOKED-UP ( ^u8 n ^u8 n SPAN:span<u8> ^ARENA:arena -- n bool )
+   {: s:^ su:n a:^ au:n dest ar :}
+   ar dest SPAN:$ nip ARENA:ALLOC SPAN:MAKE {: room :}
+   PROGRAM @ str> PROCESS:NEW s" lookup" PROCESS:ARG s su a au ITEM
+   PROCESS-STDIO:NULL room PROCESS-STDIO:PIPE PROCESS-STDIO:NULL
+   PROCESS:RUN {: u:len eu:len status :}
+   status FAILED? if SECRET:E-UNAVAILABLE throw then
+   room SPAN:$ drop u LEN>N dest SPAN:COPY
+   u LEN>N true ;
+
+\ `secret-tool store`, the value its stdin.
+: STORED ( ^u8 n ^u8 n ^u8 n -- )
+   {: s:^ su:n a:^ au:n v:^ vu:n :}
+   PROGRAM @ str> PROCESS:NEW s" store" PROCESS:ARG LABEL PROCESS:ARG
+   s su a au ITEM
+   v vu SPAN:MAKE PROCESS-STDIO:PIPE PROCESS-STDIO:NULL PROCESS-STDIO:NULL
+   PROCESS:RUN {: u:len eu:len status :}
+   status FAILED? if SECRET:E-ACCESS throw then ;
+
+\ rust CredentialRead: a lookup's failed read or poll.
+: UNREAD ( -- )
+   LOG-OPEN s" could not read the Dropbox credential from Secret Service"
+   LOG:TEXT+ LOG:;LINE SECRET:E-UNAVAILABLE throw ;
+
+\ rust CredentialWrite: a store's failed pipe or poll.
+: UNSENT ( -- )
+   LOG-OPEN s" could not send the Dropbox credential to Secret Service"
+   LOG:TEXT+ LOG:;LINE SECRET:E-ACCESS throw ;
+
+\ A run's failure, logged once as the store's code: an unstarted child
+\ E-CONFIG, a failed wait fail; another code passes up unlogged.
+: CAUGHT ( n ^u8 n n -- )
+   {: code:n op:^ ou:n fail:n :}
+   code E-PROC-SPAWN = if
+      op ou s" could not start" SECRET:E-CONFIG OPERATION
+   then
+   code E-PROC-WAIT = if
+      op ou s" could not wait for completion" fail OPERATION
+   then
+   code throw ;
+
+\ SECRET:STORE!'s three words. A lookup's nonzero exit or signal is a
+\ miss, which is no failure: rust CredentialsUnavailable.
+: ITEM-READ ( str str SPAN:span<u8> -- n bool )
+   {: s:str a:str dest :}
+   0 false [: drop drop s str> a str> dest [: LOOKED-UP ;] ARENA:WITH ;]
+   catch {: code:n :}
+   code 0= if exit then
+   drop drop
+   code E-PROC-OUTPUT = if UNREAD then
+   code E-PROC-STDOUT-CAPACITY = if SECRET:E-CAPACITY throw then
+   code LOADING SECRET:E-UNAVAILABLE CAUGHT ;
+
+\ A store's nonzero exit or signal is STORED's E-ACCESS.
+: ITEM-WRITE ( str str str -- )
+   {: s:str a:str v:str :}
+   [: s str> a str> v str> STORED ;] catch {: code:n :}
+   code 0= if exit then
+   code E-PROC-OUTPUT = if UNSENT then
+   code SECRET:E-ACCESS = if STORING s" failed" code OPERATION then
+   code STORING SECRET:E-ACCESS CAUGHT ;
+
+\ AUTH never erases: an operation this store cannot do.
+: ITEM-ERASE ( str str -- bool ) drop drop SECRET:E-CONFIG throw ;
 
 
 \ ---- the login -----------------------------------------------------
@@ -357,12 +443,10 @@ ARENA PENDINGS pending
 
 public
 
-\ Names the item's attributes and label as `secret-tool store` wrote
-\ them, for the whole process: the daemon calls it once, before any
-\ other AUTH word.
+\ Binds the credential store, one `secret-tool` run per call, for the
+\ whole process: a program's entry calls it once, before any AUTH word.
 : BIND ( -- )
-   s" application" >str s" kind" >str s" Omabox Dropbox credentials" >str
-   SECRET:LINUX-ITEM! ;
+   [: ITEM-READ ;] [: ITEM-WRITE ;] [: ITEM-ERASE ;] SECRET:STORE! ;
 
 \ Stores the binding and the refresh token, replacing the item's value.
 : STORE ( JOURNAL:dropbox-binding str -- )

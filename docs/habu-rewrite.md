@@ -31,9 +31,10 @@ General code goes into Habu's `src/lib`; sync policy stays here.
 - **`XATTR`:** get, add (create only), set and erase, for the stage and
   partial markers (`src/local.rs:38`).
 - **statx:** birth time and subvolume, which the root binding stores.
-- **`SECRET`:** write on Linux, as `secret-tool store` writes, under the
-  attribute keys and label a program binds once (`src/auth.rs:30`). Nothing
-  in the Rust version erases the credential, so there is no erase.
+- **`SECRET`:** `STORE!`, which AUTH binds to a store that runs
+  `/usr/bin/secret-tool` per call with `src/auth.rs:26-35`'s arguments, so
+  no program loads libsecret. Nothing in the Rust version erases the
+  credential, so there is no erase.
 - **`UTF8-LOSSY:REPAIR`:** Rust's `from_utf8_lossy`, for the paths in
   `status.json` (`src/runtime_status.rs:336`).
 

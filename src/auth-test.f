@@ -1,8 +1,16 @@
 \ auth-test.f - AUTH's store and load on a recording store SECRET:STORE!
 \ binds before any SECRET call, so no case reaches the keyring or the
-\ session bus: the item BIND names and the exact record STORE writes; a
-\ record LOAD decodes, a miss, a refused access and an unanswered
-\ service answering unavailable, and a configuration failure passed up;
+\ session bus. Five cases BIND the store that runs a program, with
+\ PROGRAM a path in the suite's scratch directory, then bind the
+\ recording store again: Rust's exact arguments and the exact record
+\ STORE writes to a `#!/bin/sh` fake's stdin; Rust's arguments for a
+\ lookup, the record LOAD decodes from a fake's stdout on exit 0, and a
+\ miss on exit 1 and on SIGKILL; a program that does not exist, which
+\ STORE and LOAD cannot start; a lookup's output of 8192 bytes or more,
+\ and of more than a pipe holds; and a store's exit 3, and its exit 1
+\ before reading a value larger than a pipe holds, each logged once. On
+\ the recording store: a refused access and an unanswered service
+\ answering unavailable, and a configuration failure passed up;
 \ a store SECRET:WRITE fails with each code it throws, passed up;
 \ a malformed record, one cut off, and one not UTF-8; a wrongly typed
 \ version, a repeated one, and one out of u8's range; a token STORE
@@ -25,15 +33,8 @@ require src/lib/secret.f
 require src/journal.f
 require src/auth.f
 
-\ SECRET reopened: the attribute keys and label BIND bound, as LINUX-ITEM!
-\ lays them, each NUL-terminated. The word lands in AUTH-TEST, so SECRET's
-\ public surface gains nothing.
-package SECRET
-: AUTH-TEST:BOUND-NAMES ( -- ^u8 n )
-   0 ITEM-NAMES ITEM-LABEL-AT @ s" Omabox Dropbox credentials" nip + 1+ ;
-;package
-
-\ AUTH reopened: a case reads CAP and the lookup's variants.
+\ AUTH reopened: a case reads CAP and the lookup's variants, sets
+\ PROGRAM and calls AUTHORIZE-URL.
 package AUTH
 private
 
@@ -45,30 +46,24 @@ false PRESENT !
 variable READ-CODE         \ READ throws it when nonzero
 variable WRITE-CODE        \ WRITE throws it when nonzero
 variable WRITES
-64 BUFFER: SEEN-SERVICE  variable SEEN-SERVICE-U
-64 BUFFER: SEEN-ACCOUNT  variable SEEN-ACCOUNT-U
 
 9000 constant FILLER-U
 FILLER-U BUFFER: FILLER
 variable TOKEN-U           \ the bytes of FILLER a too-large token takes
+\ The bytes a default pipe holds at most: 16 pages of 64 KiB.
+1048576 constant PIPE-MOST
 
 PATH-CAP BUFFER: DIR       variable DIR-U
 PATH-CAP BUFFER: LOG-PATH  variable LOG-PATH-U
-TYPED-VARIABLE AR ^ARENA:arena    \ holds the captured logs
+TYPED-VARIABLE AR ^ARENA:arena    \ captured logs, scratch paths and their bytes
 
 TYPED-VARIABLE ACTION [ -- ]
 
 
 \ ---- the recording store ------------------------------------------
 
-: SEEN ( ^u8 n ^u8 n -- )
-   {: s:^ su:n a:^ au:n :}
-   s SEEN-SERVICE su BYTE-COPY su SEEN-SERVICE-U !
-   a SEEN-ACCOUNT au BYTE-COPY au SEEN-ACCOUNT-U ! ;
-
 : REC-READ ( str str SPAN:span<u8> -- n bool )
    {: s:str a:str dest :}
-   s str> a str> SEEN
    READ-CODE @ 0<> if READ-CODE @ throw then
    PRESENT @ 0= if 0 false exit then
    HELD-U @ dest SPAN:$ nip > if SECRET:E-CAPACITY throw then
@@ -78,14 +73,16 @@ TYPED-VARIABLE ACTION [ -- ]
 : REC-WRITE ( str str str -- )
    {: s:str a:str vs:str :}
    vs str> {: v:^ vu:n :}
-   s str> a str> SEEN
    WRITE-CODE @ 0<> if WRITE-CODE @ throw then
    v HELD vu BYTE-COPY vu HELD-U !
    1 WRITES +! ;
 
 : REC-ERASE ( str str -- bool ) {: s:str a:str :} false ;
 
-' REC-READ ' REC-WRITE ' REC-ERASE SECRET:STORE!
+\ Binds the recording store, in place of the one BIND binds.
+: RECORDING ( -- )
+   [: REC-READ ;] [: REC-WRITE ;] [: REC-ERASE ;] SECRET:STORE! ;
+RECORDING
 
 : FILL-FILLER ( -- ) FILLER-U 0 ?do [char] x FILLER i + c! loop ;
 FILL-FILLER
@@ -133,10 +130,6 @@ FILL-FILLER
       unavailable OF false TTRUE ENDOF
    ;MATCH ;
 
-: IDENTIFIED ( -- )
-   SEEN-SERVICE SEEN-SERVICE-U @ s" org.omarchy.omabox" T$=
-   SEEN-ACCOUNT SEEN-ACCOUNT-U @ s" dropbox-credentials-v1" T$= ;
-
 
 \ The action throws want with fd 2 sent to LOG-PATH, which then holds
 \ one line with the text and no sentinel, and is removed.
@@ -161,39 +154,97 @@ FILL-FILLER
 : SCRATCH-CLOSE ( -- ) DIR DIR-U @ FS:REMOVE-TREE ;
 
 
+\ ---- the program ----------------------------------------------------
+
+\ DIR/name, in AR.
+: UNDER ( ^u8 n -- str )
+   {: n:^ nu:n :}
+   DIR-U @ 1+ nu + {: pu:n :}
+   AR @ pu ARENA:ALLOC drop {: p:^ :}
+   DIR p DIR-U @ BYTE-COPY
+   [char] / p DIR-U @ + c!
+   n p DIR-U @ 1+ + nu BYTE-COPY
+   p pu >str ;
+
+\ DIR/name now holds the text.
+: HOLDS ( ^u8 n ^u8 n -- )
+   {: n:^ nu:n t:^ tu:n :}
+   n nu UNDER str> t tu FS:WRITE-ALL ;
+
+\ DIR/name's bytes, in the arena.
+: TAKEN ( ^u8 n -- ^u8 n )
+   UNDER str> {: p:^ pu:n :}
+   AR @ ROOM ARENA:ALLOC {: d:^ du:n :}
+   p pu d du FS:READ-ALL {: got:n :}
+   d got ;
+
+\ An executable script DIR/name holding the body, which STORE and LOAD
+\ then run.
+: RUNS ( ^u8 n ^u8 n -- )
+   {: n:^ nu:n b:^ bu:n :}
+   n nu UNDER {: p:str :}
+   p str> b bu FS:WRITE-ALL
+   p FS:CHMOD-X
+   p PROGRAM ! BIND ;
+
+\ Rust's store fake: its arguments to $0.args, its stdin to $0.stdin.
+: STORE-FAKE ( -- ^u8 n )
+   s\" #!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\ncat > \"$0.stdin\"\n" ;
+
+\ Rust's lookup fake, whose output and status the case holds in
+\ $0.out and $0.status.
+: LOOKUP-FAKE ( -- ^u8 n )
+   s\" #!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\ncat \"$0.out\"\nexit \"$(cat \"$0.status\")\"\n" ;
+
+: ATTRIBUTES ( -- ^u8 n )
+   s\" application\norg.omarchy.omabox\nkind\ndropbox-credentials-v1\n" ;
+
+\ The verb's lines, then the attributes', in the arena.
+: ARGUMENTS ( ^u8 n -- ^u8 n )
+   {: v:^ vu:n :}
+   ATTRIBUTES {: t:^ tu:n :}
+   AR @ vu tu + ARENA:ALLOC {: d:^ du:n :}
+   v d vu BYTE-COPY
+   t d vu + tu BYTE-COPY
+   d du ;
+
+
 \ ---- the cases ----------------------------------------------------
 
 : SECRET-TOOL-STORE-USES-FIXED-ARGUMENTS-AND-EXACT-JSON-STDIN ( -- )
    s" secret_tool_store_uses_fixed_arguments_and_exact_json_stdin" T-LABEL
-   0 WRITES !
+   s" store-fake" STORE-FAKE RUNS
    s" credential-stdin-sentinel" STORE-TOKEN
-   WRITES @ 1 T=
-   IDENTIFIED
-   HELD HELD-U @
+   s" store-fake.args" TAKEN
+   s\" store\n--label=Omabox Dropbox credentials\n" ARGUMENTS T$=
+   s" store-fake.stdin" TAKEN
    s\" {\"version\":1,\"refresh_token\":\"credential-stdin-sentinel\",\"account_id\":\"account-id\",\"root_namespace_id\":\"namespace-id\",\"remote_root\":\"/Root\"}"
    T$=
-   AUTH-TEST:BOUND-NAMES
-   s\" application\zkind\zOmabox Dropbox credentials\z" T$= ;
+   RECORDING ;
 
 : SECRET-TOOL-LOOKUP-DECODES-RECORD-AND-PRESERVES-NONZERO-STATUS
    ( ^ARENA:arena -- )
    {: ar :}
    s" secret_tool_lookup_decodes_record_and_preserves_nonzero_status"
    T-LABEL
+   s" lookup-fake.out"
    s\" {\"version\":1,\"refresh_token\":\"lookup-token\",\"account_id\":\"account\",\"root_namespace_id\":\"namespace\",\"remote_root\":\"/Root\"}"
-   HOLD
-   0 SEEN-SERVICE-U ! 0 SEEN-ACCOUNT-U !
+   HOLDS
+   s" lookup-fake.status" s" 0" HOLDS
+   s" lookup-fake" LOOKUP-FAKE RUNS
    ar LOAD FOUND
-   IDENTIFIED
-   false PRESENT !
+   s" lookup-fake.args" TAKEN s\" lookup\n" ARGUMENTS T$=
+   s" lookup-fake.status" s" 1" HOLDS
    ar LOAD UNAVAILABLE TTRUE
+   s" killed-fake" s\" #!/bin/sh\nkill -9 $$\n" RUNS
+   ar LOAD UNAVAILABLE TTRUE
+   RECORDING
    SECRET:E-ACCESS READ-CODE !
    ar LOAD UNAVAILABLE TTRUE
    SECRET:E-UNAVAILABLE READ-CODE !
    ar LOAD UNAVAILABLE TTRUE
    SECRET:E-CONFIG READ-CODE !
-   [: LOADS ;] SECRET:E-CONFIG
-   s" credential operation `load Dropbox credential` could not start" LOGGED
+   [: LOADS ;] SECRET:E-CONFIG TTHROWSQ
    0 READ-CODE ! ;
 
 : SECRET-TOOL-PARSER-DIAGNOSTICS-DO-NOT-ECHO-OUTPUT ( -- )
@@ -251,6 +302,30 @@ FILL-FILLER
    FILLER CAP 1+ HOLD
    [: LOADS ;] E-TOO-LARGE s" exceeds the supported size" LOGGED ;
 
+: MISSING-SECRET-TOOL-COULD-NOT-START ( -- )
+   s" missing_secret_tool_could_not_start" T-LABEL
+   s" absent" UNDER PROGRAM ! BIND
+   [: s" absent-sentinel" STORE-TOKEN ;] SECRET:E-CONFIG
+   s" credential operation `store Dropbox credential` could not start" LOGGED
+   [: LOADS ;] SECRET:E-CONFIG
+   s" credential operation `load Dropbox credential` could not start" LOGGED
+   RECORDING ;
+
+\ At CAP bytes LOAD refuses the output, past CAP the store does, and
+\ past any pipe's capacity the lookup still ends.
+: SECRET-TOOL-OUTPUT-OF-8192-BYTES-OR-MORE-IS-TOO-LARGE ( -- )
+   s" secret_tool_output_of_8192_bytes_or_more_is_too_large" T-LABEL
+   s" large-fake.status" s" 0" HOLDS
+   s" large-fake" LOOKUP-FAKE RUNS
+   s" large-fake.out" FILLER CAP HOLDS
+   [: LOADS ;] E-TOO-LARGE s" exceeds the supported size" LOGGED
+   s" large-fake.out" FILLER CAP 1+ HOLDS
+   [: LOADS ;] E-TOO-LARGE s" exceeds the supported size" LOGGED
+   s" large-fake.out" UNDER {: o:str :}
+   PIPE-MOST FILLER-U / 1+ 0 ?do o FILLER FILLER-U >str FS:APPEND-FILE loop
+   [: LOADS ;] E-TOO-LARGE s" exceeds the supported size" LOGGED
+   RECORDING ;
+
 : STORED-CREDENTIAL-VERSION-2-IS-UNSUPPORTED ( -- )
    s" stored_credential_version_2_is_unsupported" T-LABEL
    s\" {\"version\":2,\"refresh_token\":\"version-sentinel\",\"account_id\":\"account\",\"root_namespace_id\":\"namespace\",\"remote_root\":\"/Root\"}"
@@ -259,20 +334,26 @@ FILL-FILLER
    s" Secret Service returned unsupported Omabox credential version 2"
    LOGGED ;
 
-\ Each code SECRET:WRITE throws is logged as the store's failure and
-\ rethrown, and the store keeps no record.
+\ A store's exit 3, and its exit 1 before reading a value no pipe holds,
+\ are logged once as failed. Each code the recording store's WRITE throws
+\ is rethrown unlogged, and the store keeps no record.
 : STORE-FAILURE-NAMES-THE-CREDENTIAL-OPERATION ( -- )
    s" store_failure_names_the_credential_operation" T-LABEL
+   s" failing-fake" s\" #!/bin/sh\ncat >/dev/null\nexit 3\n" RUNS
+   [: s" exit-sentinel" STORE-TOKEN ;] SECRET:E-ACCESS
+   s" credential operation `store Dropbox credential` failed" LOGGED
+   s" unread-fake" s\" #!/bin/sh\nexit 1\n" RUNS
+   [: SERVICE ACCOUNT AR @ PIPE-MOST 1+ ARENA:ALLOC SECRET:WRITE ;]
+   SECRET:E-ACCESS
+   s" credential operation `store Dropbox credential` failed" LOGGED
+   RECORDING
    0 WRITES !
    SECRET:E-CONFIG WRITE-CODE !
-   [: s" config-sentinel" STORE-TOKEN ;] SECRET:E-CONFIG
-   s" credential operation `store Dropbox credential` could not start" LOGGED
+   [: s" config-sentinel" STORE-TOKEN ;] SECRET:E-CONFIG TTHROWSQ
    SECRET:E-ACCESS WRITE-CODE !
-   [: s" access-sentinel" STORE-TOKEN ;] SECRET:E-ACCESS
-   s" credential operation `store Dropbox credential` failed" LOGGED
+   [: s" access-sentinel" STORE-TOKEN ;] SECRET:E-ACCESS TTHROWSQ
    SECRET:E-UNAVAILABLE WRITE-CODE !
-   [: s" unavailable-sentinel" STORE-TOKEN ;] SECRET:E-UNAVAILABLE
-   s" credential operation `store Dropbox credential` failed" LOGGED
+   [: s" unavailable-sentinel" STORE-TOKEN ;] SECRET:E-UNAVAILABLE TTHROWSQ
    0 WRITE-CODE !
    WRITES @ 0 T= ;
 
@@ -319,6 +400,8 @@ FILL-FILLER
    SECRET-TOOL-PARSER-DIAGNOSTICS-DO-NOT-ECHO-OUTPUT
    SECRET-TOOL-DATA-ERROR-DIAGNOSTICS-DO-NOT-ECHO-OUTPUT
    CREDENTIAL-OF-8192-BYTES-OR-MORE-IS-TOO-LARGE
+   MISSING-SECRET-TOOL-COULD-NOT-START
+   SECRET-TOOL-OUTPUT-OF-8192-BYTES-OR-MORE-IS-TOO-LARGE
    STORED-CREDENTIAL-VERSION-2-IS-UNSUPPORTED
    STORE-FAILURE-NAMES-THE-CREDENTIAL-OPERATION
    ar PKCE-AUTHORIZATION-USES-OFFLINE-CODE-FLOW
@@ -327,7 +410,6 @@ FILL-FILLER
 
 : TESTS ( -- )
    T-RESET
-   BIND
    SCRATCH-OPEN
    ARENA:NEW {: ar :}
    ar AR !

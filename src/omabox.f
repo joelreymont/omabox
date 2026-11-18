@@ -1282,7 +1282,6 @@ ARENA PRIORS prior
 \ the browser; the bind and the config's write run with it released.
 : SETUP ( setup-options ^SERVICE:commands ^ARENA:arena -- )
    {: o s ar :}
-   AUTH:BIND
    o SETUP-OPTIONS-UNMAKE {: r i :}
    HOME-ENV ar HOME-WIDGET
    i ar SETUP-CONFIG {: c w:bool :}
@@ -1327,6 +1326,7 @@ ARENA PRIORS prior
    ;MATCH ;
 
 : RUN ( -- )
+   AUTH:BIND
    SCRIPT-ARGC [: SCRIPT-ARGV$ ;] PARSE {: cmd :}
    [: cmd swap PERFORM ;] ARENA:WITH ;
 

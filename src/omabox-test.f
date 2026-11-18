@@ -57,8 +57,8 @@
 \ - bind_stores_the_token_and_binds_an_unbound_journal,
 \   bind_stores_the_token_for_a_journal_bound_to_the_login and
 \   bind_refuses_a_journal_bound_elsewhere, Omabox's own: Rust's
-\   fixture's journal, after AUTH:BIND, with a recording store bound
-\   in place of the keyring
+\   fixture's journal, with a recording store bound in place of the
+\   keyring
 \ - exchanged_passes_a_token_dropbox_issues,
 \   exchanged_refuses_a_token_dropbox_does_not_issue,
 \   linked_refuses_an_unavailable_account,
@@ -1825,11 +1825,9 @@ variable REC-WRITES
          ar LINKED-REFUSES-AN-ACCOUNT-OF-ANOTHER-ROOT-TAG ;]
       [: TEST-DROPBOX:STOP ;] finally ;] DROPBOX:WITH-LOOPS ;
 
-\ BIND's three arms, after AUTH:BIND as setup calls it, then the
-\ login's steps against the fake.
+\ BIND's three arms, then the login's steps against the fake.
 : LOGIN-CASES ( ^ARENA:arena -- )
    {: ar :}
-   AUTH:BIND
    ar BIND-STORES-THE-TOKEN-AND-BINDS-AN-UNBOUND-JOURNAL
    ar BIND-STORES-THE-TOKEN-FOR-A-JOURNAL-BOUND-TO-THE-LOGIN
    ar BIND-REFUSES-A-JOURNAL-BOUND-ELSEWHERE

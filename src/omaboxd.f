@@ -7,6 +7,7 @@
 require src/lib/string.f
 require src/lib/fd.f
 require src/lib/ffi-abi.f
+require src/auth.f
 require src/daemon.f
 require src/version.f
 
@@ -38,6 +39,7 @@ public
 : RUN ( -- )
    ONE-ARENA
    SELF-CHECK? if SELF-CHECK exit then
+   AUTH:BIND
    s" " DAEMON:RUN die ;
 
 ;package

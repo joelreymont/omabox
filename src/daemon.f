@@ -954,7 +954,6 @@ FSM:DEFINE DAEMON-RUN ( ^run ) daemon-state step-event
 
 : MACHINE ( ^run -- )
    {: x :}
-   AUTH:BIND
    [: x construct daemon-state preparing DAEMON-RUN ;] DROPBOX:WITH-LOOPS ;
 
 \ A code the machine does not catch stops it as an invariant.
