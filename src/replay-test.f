@@ -97,7 +97,8 @@
 \   already_absent_dropbox_directory_completes_its_replayed_delete,
 \   dropbox_file_at_a_deleted_directory_path_retires_the_replayed_delete
 \   and remote_delete_skips_backup_download_and_ambiguous_create_stays_pending,
-\   whose create's lost answer is read back absent, blocking its plan
+\   whose completed remote delete clears a retry's error the status
+\   held and whose create's lost answer is read back absent, blocking its plan
 \   remote-pending as the pass goes on; a plan whose next operation is
 \   local is left pending, unblocked, with no request; Rust's
 \   remote_replay_preserves_conflict_sides_without_a_backup_download,
@@ -142,12 +143,13 @@ require src/test-client.f
 package REPLAY
 private
 
-\ A pass below the root over the plan's first operation.
+\ A pass below the root over the plan's first operation, on link l.
 : PASS-OVER
-   ( JOURNAL:journal fd ^u8 n JOURNAL:plan-record ^ARENA:arena
-     -- ^pass )
-   {: j root:fd p:^ u:n plan ar :}
+   ( JOURNAL:journal fd ^u8 n JOURNAL:plan-record ^link
+     ^ARENA:arena -- ^pass )
+   {: j root:fd p:^ u:n plan l ar :}
    j root p u ar NEW-PASS {: r :}
+   l r PASS-LINK !
    plan r PASS-PLAN !
    plan PLAN-OPERATIONS 0 VEC:AT @ r PASS-OPERATION !
    r ;
@@ -1519,6 +1521,16 @@ STATUS-CAP BUFFER: STATUS-BUF
    {: j a:^ u:n o ar :}
    j a u DISPLAY o ar ONE-PLAN ar JOURNAL:RECORD-PLAN NEW-PLAN ;
 
+ARENA OFFLINE-LINKS REPLAY:link
+
+\ A link with no client and a status that writes nothing, for a pass
+\ that makes no Dropbox call.
+: OFFLINE ( ^ARENA:arena -- ^REPLAY:link )
+   {: ar :}
+   ar OFFLINE-LINKS-NEW {: l :}
+   ar STATUS:DETACHED l REPLAY-LINK:STATUS !
+   l ;
+
 \ A case's directory and its open journal, holding one plan of o at a.
 : CASE-PLAN
    ( ^u8 n MODEL:operation ^ARENA:arena
@@ -1608,7 +1620,7 @@ STATUS-CAP BUFFER: STATUS-BUF
    s" oversized source identity" ar HASH-OF {: c :}
    s" oversized.bin" c MODEL-OPERATION:CREATE-REMOTE ar CASE-PLAN
    {: d:str j plan :}
-   j NO-ROOT s" " plan ar REPLAY:PASS-OVER {: r :}
+   j NO-ROOT s" " plan ar OFFLINE ar REPLAY:PASS-OVER {: r :}
    plan PLAN-PATH REPLAY-MUTATION--REJECTION:UNSUPPORTED-FILE-SIZE
    REPLAY-REPLAY--BLOCKED:SYNC-ERROR r REPLAY:PERSIST-REMOTE-BLOCK
    BLOCK$ s" unsupported-file-size" T$= s" durable-plan" T$=
@@ -1623,7 +1635,7 @@ STATUS-CAP BUFFER: STATUS-BUF
    {: ar :}
    s" block durably holds a plan for an hour" T-LABEL
    s" f" MAKE-F ar CASE-PLAN {: d:str j plan :}
-   j NO-ROOT s" " plan ar REPLAY:PASS-OVER {: r :}
+   j NO-ROOT s" " plan ar OFFLINE ar REPLAY:PASS-OVER {: r :}
    epoch-seconds 3600 + {: early:n :}
    MODEL-BLOCKAGE:REMOTE-OBJECT r REPLAY:BLOCK-DURABLY
    epoch-seconds 3600 + {: late:n :}
@@ -1643,7 +1655,7 @@ STATUS-CAP BUFFER: STATUS-BUF
    {: ar :}
    s" block durably refuses a completed plan" T-LABEL
    s" f" MAKE-F ar CASE-PLAN {: d:str j plan :}
-   j NO-ROOT s" " plan ar REPLAY:PASS-OVER {: r :}
+   j NO-ROOT s" " plan ar OFFLINE ar REPLAY:PASS-OVER {: r :}
    j plan ar COMPLETE-F
    d [: [: MODEL-BLOCKAGE:REMOTE-OBJECT r REPLAY:BLOCK-DURABLY drop ;]
       REPLAY:E-INVALID-STATE TTHROWSQ ;] ar LOGGED {: t:^ tu:n :}
@@ -1657,7 +1669,7 @@ STATUS-CAP BUFFER: STATUS-BUF
    {: ar :}
    s" persist remote block keeps other blocks" T-LABEL
    s" f" MAKE-F ar CASE-PLAN {: d:str j plan :}
-   j NO-ROOT s" " plan ar REPLAY:PASS-OVER {: r :}
+   j NO-ROOT s" " plan ar OFFLINE ar REPLAY:PASS-OVER {: r :}
    plan PLAN-PATH {: p :}
    p MODEL-BLOCKAGE:LOCAL-OBJECT-IN-WAY
    REPLAY-REPLAY--BLOCKED:DURABLE-PLAN
@@ -1687,7 +1699,7 @@ STATUS-CAP BUFFER: STATUS-BUF
    {: ar :}
    s" persist remote block holds remote causes" T-LABEL
    s" f" MAKE-F ar CASE-PLAN {: d:str j plan :}
-   j NO-ROOT s" " plan ar REPLAY:PASS-OVER {: r :}
+   j NO-ROOT s" " plan ar OFFLINE ar REPLAY:PASS-OVER {: r :}
    plan PLAN-PATH {: p :}
    p REPLAY-MUTATION--REJECTION:UNSUPPORTED-FILE-SIZE
    REPLAY-REPLAY--BLOCKED:SYNC-ERROR r REPLAY:PERSIST-REMOTE-BLOCK
@@ -1712,7 +1724,7 @@ STATUS-CAP BUFFER: STATUS-BUF
    {: ar :}
    s" unplaced copy covers every copy outcome" T-LABEL
    s" f" MAKE-F ar CASE-PLAN {: d:str j plan :}
-   j NO-ROOT s" " plan ar REPLAY:PASS-OVER {: r :}
+   j NO-ROOT s" " plan ar OFFLINE ar REPLAY:PASS-OVER {: r :}
    REPLAY-COPY--OUTCOME:READY r REPLAY:UNPLACED-COPY SOME-BLOCK$
    s" -" T$= s" none" T$=
    j ar JOURNAL$ s" pending" T$=
@@ -1780,7 +1792,7 @@ STATUS-CAP BUFFER: STATUS-BUF
    ( REPLAY:mutation-outcome bool JOURNAL:journal JOURNAL:plan-record
      ^ARENA:arena -- ^u8 n )
    {: o del:bool j plan ar :}
-   j NO-ROOT s" " plan ar REPLAY:PASS-OVER {: r :}
+   j NO-ROOT s" " plan ar OFFLINE ar REPLAY:PASS-OVER {: r :}
    del if o r REPLAY:APPLY-FOLDER-DELETE-MUTATION
    else o r REPLAY:APPLY-FOLDER-MUTATION then
    REPLAY:EVENT$ r REPLAY:PASS-BLOCKED @ j ar JOURNAL$
@@ -1804,7 +1816,7 @@ STATUS-CAP BUFFER: STATUS-BUF
 : IMPOSSIBLE ( REPLAY:mutation-outcome ^u8 n ^ARENA:arena -- )
    {: o line:^ lu:n ar :}
    true ar FOLDER-PLAN {: d:str j plan :}
-   j NO-ROOT s" " plan ar REPLAY:PASS-OVER {: r :}
+   j NO-ROOT s" " plan ar OFFLINE ar REPLAY:PASS-OVER {: r :}
    d [: [: o r REPLAY:APPLY-FOLDER-DELETE-MUTATION drop ;]
       REPLAY:E-INVALID-STATE TTHROWSQ ;] ar LOGGED {: t:^ tu:n :}
    t tu LINE-COUNT 1 T= t tu line lu CONTAINS? TTRUE
@@ -1895,7 +1907,7 @@ TYPED-VARIABLE SENT ^LOCAL:staged-upload
    {: j plan r:str s:str want ar :}
    0 SENDS !
    r str> s" open test root" LOCAL:OPEN-ROOT {: f:fd :}
-   j f r str> plan ar REPLAY:PASS-OVER {: p :}
+   j f r str> plan ar OFFLINE ar REPLAY:PASS-OVER {: p :}
    s p REPLAY:PASS-STAGING !
    [: want p [: SEND REPLAY:APPLY-EVENT-DONE ;] REPLAY:PREPARE-UPLOAD
       REPLAY:EVENT$ p REPLAY:PASS-BLOCKED @ EVENT-BLOCK$ ;]
@@ -2645,8 +2657,7 @@ ARENA FILE-CASES file-case
    {: o c ar :}
    c FILE-CASE-ROOT @ OPEN-ROOT {: root:fd :}
    c FILE-CASE-JOURNAL @ root c FILE-CASE-ROOT @ str>
-   c FILE-CASE-PLAN @ ar REPLAY:PASS-OVER {: p :}
-   LINK p REPLAY:PASS-LINK !
+   c FILE-CASE-PLAN @ LINK ar REPLAY:PASS-OVER {: p :}
    c FILE-CASE-UPLOAD @ {: up :}
    [: o c UPLOADS? if
          up c PLAN-KIND-REPLACING KIND?
@@ -3194,7 +3205,8 @@ ARENA FILE-CASES file-case
    d GONE ;
 
 \ The delete of old's rev-old at delete.txt completes with no download
-\ and no recovery; the recovery directory stays empty.
+\ and no recovery, clearing the retry's error the status held; the
+\ recovery directory stays empty.
 : DELETE-REPLAYED ( str str str str JOURNAL:journal ^ARENA:arena -- )
    {: d:str r:str s:str rec:str j ar :}
    s" old remote bytes" {: b:^ bu:n :}
@@ -3203,7 +3215,10 @@ ARENA FILE-CASES file-case
    bu TEST-DROPBOX:FILE!
    j s" delete.txt" s" old-rev" AS-REV MODEL-OPERATION:DELETE-REMOTE ar
    PLANNED drop
+   s" Dropbox could not be reached." >str
+   LINK REPLAY-LINK:STATUS @ STATUS:ERROR
    j r s ar REMOTE-REPLAYED COMPLETED 1 T=
+   RUNTIME @ ar S\" \qlast_error\q:null" SHOWS
    \ An empty directory removes: nothing was put in it.
    rec str> FS:REMOVE-DIR
    j ar JOURNAL:PENDING-RECOVERIES VEC:COUNT 0 T=

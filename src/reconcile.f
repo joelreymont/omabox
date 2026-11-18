@@ -2725,6 +2725,12 @@ ENUM root-check active changed ;ENUM
       some OF ENDOF
    ;MATCH ;
 
+\ A retry ends only once the install completed an operation.
+: INSTALL-DONE ( ^REPLAY:replay-report ^run -- )
+   {: rep r :}
+   rep REPLAY-REPLAY--REPORT:COMPLETED-OPERATIONS @ 0= if exit then
+   r RUN-LINK @ REPLAY-LINK:STATUS @ STATUS:COMPLETED ;
+
 \ The staged download installed at once.
 : INSTALL ( ^download -- )
    {: x :}
@@ -2734,6 +2740,7 @@ ENUM root-check active changed ;ENUM
    x CURRENT-PLAN one VEC:PUSH !
    r RUN-JOURNAL @ x DOWNLOAD-ROOT @ r ROOT$ one r RUN-ARENA @
    REPLAY:REPLAY-LOCAL-PLANS-AT {: rep :}
+   rep r INSTALL-DONE
    r one one r RUN-ARENA @ PATH-ORDER rep RECORD-LOCAL-BLOCKS
    rep x DOWNLOAD-REPORT @ ADD-REPORT ;
 

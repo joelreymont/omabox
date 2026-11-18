@@ -76,6 +76,9 @@
 \ - legacy_preservation_before_a_download_replays_once, Omabox's own: a
 \   legacy [preserve-local, install-local] plan whose install waits on
 \   its download counts its preservation once
+\ - retry_error_stays_when_no_install_completes, Omabox's own: a
+\   download whose destination is written as it arrives completes
+\   nothing, so the retry's error stays in status.json
 \ The pass against the fake Dropbox, Rust's test of the same name:
 \ - one_reconciliation_pass_synchronizes_files_in_both_directions, with
 \   replayed 2 and blocked 0 as its download installs in the pass, no
@@ -2485,7 +2488,12 @@ $100 constant MODE-0400
    s" fallback.txt" s" fallback-revision" FALLBACK$ ar SERVES
    FALLBACK$ s" fallback-revision" ar REMOTE-FILE {: rem :}
    x s" fallback.txt" rem INSTALLING drop
+   s" Dropbox could not be reached." >str
+   x RUN-LINK @ REPLAY-LINK:STATUS @ STATUS:ERROR
    x REPLAY-STEP REPORTED COMPLETED 1 T=
+   d s" omabox/status.json" ar INSIDE str> READ-BUF READ-CAP FS:READ-ALL
+   {: u:n :}
+   READ-BUF u S\" \qlast_error\q:null" CONTAINS? TTRUE
    x RUN-ROOT @ s" fallback.txt" ar INSIDE FALLBACK$ HOLDS-BYTES
    x SLOTS-KEPT
    TEST-DROPBOX:SEEN$ 1 DOWNLOADS$ T$=
@@ -2732,6 +2740,35 @@ TYPED-VARIABLE CANARY str
    x s" legacy.txt" IN-ROOT LEGACY$ HOLDS-BYTES
    d x STEP-GONE ;
 
+: FETCHED$ ( -- ^u8 n ) s" Dropbox bytes the install never places" ;
+: WRITTEN$ ( -- ^u8 n ) s" local bytes written during the download" ;
+
+\ The install's destination the race writes; it runs on the fake's task.
+TYPED-VARIABLE RACED-INSTALL str
+
+: RACE-INSTALL ( -- ) RACED-INSTALL @ str> WRITTEN$ FS:WRITE-ALL ;
+
+: RETRY-ERROR-STAYS-WHEN-NO-INSTALL-COMPLETES ( ^ARENA:arena -- )
+   {: ar :}
+   s" retry_error_stays_when_no_install_completes" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   s" raced.txt" s" raced-revision" FETCHED$ ar SERVES
+   FETCHED$ s" raced-revision" ar REMOTE-FILE {: rem :}
+   x s" raced.txt" rem INSTALLING drop
+   x s" raced.txt" IN-ROOT RACED-INSTALL !
+   [: RACE-INSTALL ;] TEST-DROPBOX:DURING-DOWNLOAD!
+   s" Dropbox could not be reached." >str
+   x RUN-LINK @ REPLAY-LINK:STATUS @ STATUS:ERROR
+   x REPLAY-STEP REPORTED {: rep :}
+   rep COMPLETED 0 T=
+   rep BLOCKS VEC:COUNT 1 T=
+   d s" omabox/status.json" ar INSIDE str> READ-BUF READ-CAP FS:READ-ALL
+   {: u:n :}
+   READ-BUF u s" Dropbox could not be reached." CONTAINS? TTRUE
+   x s" raced.txt" IN-ROOT WRITTEN$ HOLDS-BYTES
+   d x STEP-GONE ;
+
 : STEP-CASES ( ^ARENA:arena -- )
    {: ar :}
    ar WORKER-VERIFICATION-MISMATCH-DURABLY-BLOCKS-ITS-PLAN
@@ -2741,7 +2778,8 @@ TYPED-VARIABLE CANARY str
    ar UNKNOWN-DOWNLOAD-SLOTS-ARE-PRESERVED-WITH-DISPOSABLE-FALLBACK
    ar ROOT-SWAP-AFTER-REPLAY-VALIDATION-NEVER-TOUCHES-THE-REPLACEMENT
    ar LATER-PLANNED-DOWNLOAD-DOES-NOT-RECLAIM-AN-ACTIVE-SLOT
-   ar LEGACY-PRESERVATION-BEFORE-A-DOWNLOAD-REPLAYS-ONCE ;
+   ar LEGACY-PRESERVATION-BEFORE-A-DOWNLOAD-REPLAYS-ONCE
+   ar RETRY-ERROR-STAYS-WHEN-NO-INSTALL-COMPLETES ;
 
 \ ---- the pass against the fake Dropbox -----------------------------
 

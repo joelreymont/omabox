@@ -9,6 +9,10 @@
 \ The snapshot holds at most one transfer, as one task syncs. A progress
 \ sample replaces it; a finish of that transfer keeps it, shown as
 \ finished, until the next sample or a change of phase clears it.
+\ The fault is last_error's machine: ERROR's retrying, SYNC-ERROR's
+\ unsynced and STOPPED's stopped; CLEAR-ERROR ends any.
+\ COMPLETED ends retrying: unsynced if ERROR replaced
+\ unsynced, else none.
 \ LOCK guards every snapshot, which the sync task and BEAT share.
 \ The heartbeat is one task per process, BEAT, which refreshes
 \ updated_at every 20 s from HEARTBEAT-START to HEARTBEAT-STOP.
@@ -72,6 +76,17 @@ ENUM event
    VARIANT finished FIELD sample transfer ;VARIANT
 ;ENUM
 
+private
+
+ENUM fault
+   VARIANT none ;VARIANT
+   VARIANT retrying FIELD text str FIELD dirty bool ;VARIANT
+   VARIANT unsynced ;VARIANT
+   VARIANT stopped FIELD text str ;VARIANT
+;ENUM
+
+public
+
 \ anchor is dir open and temp the temporary's name in it; slot's path is
 \ shown's bytes, and spare takes a sample's path before it replaces them.
 STRUCTURE status OPAQUE DERIVE addr
@@ -80,7 +95,7 @@ STRUCTURE status OPAQUE DERIVE addr
    FIELD temp str
    FIELD now phase
    FIELD slot option<transfer>
-   FIELD error option<str>
+   FIELD fault fault
    FIELD updated n
    FIELD shown ^n
    FIELD spare ^n
@@ -243,7 +258,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
 
 
 : NO-SAMPLE ( -- option<transfer> ) OPTION:NONE ;
-: NO-TEXT ( -- option<str> ) OPTION:NONE ;
+: NO-FAULT ( -- fault ) construct fault none ;
 
 
 : CLEARED ( ^status -- )
@@ -289,6 +304,30 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
    true ;
 
 
+\ A retried failure is over: answers whether it was one.
+: RECOVERED ( ^status -- bool )
+   {: s :}
+   s STATUS-FAULT @ MATCH fault
+      retrying OF
+         nip if construct fault unsynced else NO-FAULT then
+         s STATUS-FAULT ! true
+      ENDOF
+      none OF false ENDOF
+      unsynced OF false ENDOF
+      stopped OF drop false ENDOF
+   ;MATCH ;
+
+
+\ Whether files stay unsynced under the fault.
+: DIRTY? ( ^status -- bool )
+   STATUS-FAULT @ MATCH fault
+      retrying OF nip ENDOF
+      none OF false ENDOF
+      unsynced OF true ENDOF
+      stopped OF drop false ENDOF
+   ;MATCH ;
+
+
 \ A finish of a transfer slot does not hold changes nothing.
 : ENDED ( ^status transfer -- bool )
    {: s t :}
@@ -305,24 +344,23 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
    true ;
 
 
-: ERRED ( ^status str phase -- bool )
-   {: s text:str p:phase :}
+: ERRED ( ^status fault phase -- bool )
+   {: s f:fault p:phase :}
    p s STATUS-NOW !
    s CLEARED
-   text OPTION:SOME s STATUS-ERROR !
+   f s STATUS-FAULT !
    true ;
 
 
 : SYNC-FAILED ( ^status -- bool )
    {: s :}
    construct phase error s STATUS-NOW !
-   s" One or more files could not be synchronized." >str
-   OPTION:SOME s STATUS-ERROR !
+   construct fault unsynced s STATUS-FAULT !
    true ;
 
 
 : NO-ERROR ( ^status -- bool )
-   NO-TEXT swap STATUS-ERROR !
+   NO-FAULT swap STATUS-FAULT !
    true ;
 
 
@@ -373,10 +411,16 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
    JSON:WRITE-ARRAY-END ;
 
 
-: LAST-ERROR ( ^JSON:writer option<str> -- ^JSON:writer )
-   MATCH option
-      some OF str> JSON:WRITE-STRING ENDOF
+: UNSYNCED$ ( -- ^u8 n )
+   s" One or more files could not be synchronized." ;
+
+
+: LAST-ERROR ( ^JSON:writer fault -- ^JSON:writer )
+   MATCH fault
       none OF JSON:WRITE-NULL ENDOF
+      retrying OF drop str> JSON:WRITE-STRING ENDOF
+      unsynced OF UNSYNCED$ JSON:WRITE-STRING ENDOF
+      stopped OF str> JSON:WRITE-STRING ENDOF
    ;MATCH ;
 
 
@@ -390,7 +434,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
    JSON:WRITE-COMMA
    s" transfers" JSON:WRITE-KEY s STATUS-SLOT @ TRANSFERS
    JSON:WRITE-COMMA
-   s" last_error" JSON:WRITE-KEY s STATUS-ERROR @ LAST-ERROR
+   s" last_error" JSON:WRITE-KEY s STATUS-FAULT @ LAST-ERROR
    JSON:WRITE-COMMA
    s" updated_at" s STATUS-UPDATED @ JSON:WRITE-FIELD-U
    JSON:WRITE-OBJECT-END JSON:WRITE-CLOSE ;
@@ -546,7 +590,7 @@ public
    ar BUFFER s STATUS-OUT !
    construct phase starting s STATUS-NOW !
    s CLEARED
-   NO-TEXT s STATUS-ERROR !
+   NO-FAULT s STATUS-FAULT !
    s [: PUBLISH ;] LOCKED
    s ;
 
@@ -564,7 +608,7 @@ public
    true s STATUS-DETACHED !
    construct phase starting s STATUS-NOW !
    s CLEARED
-   NO-TEXT s STATUS-ERROR !
+   NO-FAULT s STATUS-FAULT !
    s ;
 
 
@@ -581,18 +625,25 @@ public
 \ text is a fixed summary, never a path or a token.
 : ERROR ( str ^status -- )
    {: text:str s :}
-   s [: text construct phase error ERRED ;] UPDATE ;
+   s [: dup DIRTY? text swap construct fault retrying
+      construct phase error ERRED ;] UPDATE ;
 
 
 \ The daemon exits after a failure it does not retry.
 : STOPPED ( str ^status -- )
    {: text:str s :}
-   s [: text construct phase stopped ERRED ;] UPDATE ;
+   text construct fault stopped {: f :}
+   s [: f construct phase stopped ERRED ;] UPDATE ;
 
 
 \ Only after a clean reconciliation pass.
 : CLEAR-ERROR ( ^status -- )
    [: NO-ERROR ;] UPDATE ;
+
+
+\ An operation completed: a retried failure is over.
+: COMPLETED ( ^status -- )
+   [: RECOVERED ;] UPDATE ;
 
 
 \ A path failed to sync; the transfer stays.

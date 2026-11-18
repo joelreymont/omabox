@@ -3,7 +3,10 @@
 \ the Rust version writes for the snapshot, updated_at the status's own;
 \ and the heartbeat, which rewrites the file on a short period and stops
 \ at once on a long one. The snapshot holds one transfer, so the
-\ finished-transfer test follows one transfer at a time. Then a link at
+\ finished-transfer test follows one transfer at a time. A retry's error
+\ clears once an operation completes, back to a dirty pass's if it
+\ replaced one; a finished transfer leaves it, and a dirty pass's and a
+\ stop's stay. Then a link at
 \ status.json or at the temporary's name, a restart over loosened modes,
 \ the transfer path's display rules, NEW's refusals, a runtime
 \ directory reached through a link and a detached status, which logs
@@ -212,6 +215,36 @@ $1A4 constant LOOSE-FILE
    e u s" status: could not replace the status file: " CONTAINS?
    TTRUE
    log GONE
+   rt GONE ;
+
+
+\ ---- a retry's error --------------------------------------------
+
+: A-RETRY-ERROR-CLEARS-ONCE-WORK-COMPLETES ( ^ARENA:arena -- )
+   {: ar :}
+   s" a retry's error clears once work completes" T-LABEL
+   ar RUNTIME {: rt:str :}
+   rt ar NEW {: s :}
+   s" Dropbox could not be reached." >str s ERROR
+   construct phase syncing s PHASE
+   s COMPLETED
+   s s\" {\"version\":3,\"phase\":\"syncing\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
+   s" Dropbox could not be reached." >str s ERROR
+   s UP s" good.txt" 4 10 OF-N PROGRESS
+   s UP s" good.txt" 10 10 OF-N FINISH
+   s s\" {\"version\":3,\"phase\":\"error\",\"transfers\":[{\"direction\":\"upload\",\"path\":\"good.txt\",\"bytes_done\":10,\"bytes_total\":10}],\"last_error\":\"Dropbox could not be reached.\",\"updated_at\":" READS
+   s SYNC-ERROR
+   s COMPLETED
+   s s\" {\"version\":3,\"phase\":\"error\",\"transfers\":[{\"direction\":\"upload\",\"path\":\"good.txt\",\"bytes_done\":10,\"bytes_total\":10}],\"last_error\":\"One or more files could not be synchronized.\",\"updated_at\":" READS
+   s" Dropbox could not be reached." >str s ERROR
+   s" Dropbox could not be reached." >str s ERROR
+   s COMPLETED
+   s s\" {\"version\":3,\"phase\":\"error\",\"transfers\":[],\"last_error\":\"One or more files could not be synchronized.\",\"updated_at\":" READS
+   s CLEAR-ERROR
+   s s\" {\"version\":3,\"phase\":\"error\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
+   s" Omabox setup is required." >str s STOPPED
+   s COMPLETED
+   s s\" {\"version\":3,\"phase\":\"stopped\",\"transfers\":[],\"last_error\":\"Omabox setup is required.\",\"updated_at\":" READS
    rt GONE ;
 
 
@@ -443,6 +476,7 @@ $1A4 constant LOOSE-FILE
    ar TRANSFER-PATH-IS-RELATIVE-AND-ERROR-IS-FIXED-TEXT
    ar STOPPED-STATUS-CLEARS-TRANSFERS-AND-KEEPS-THE-FATAL-TEXT
    ar SYNC-ERROR-SURVIVES-PHASE-CHANGES-UNTIL-A-CLEAN-PASS
+   ar A-RETRY-ERROR-CLEARS-ONCE-WORK-COMPLETES
    ar FINISHED-TRANSFER-REMAINS-VISIBLE-UNTIL-ACTIVITY-OR-PHASE-CHANGES
    ar FAILED-REPLACEMENT-DOES-NOT-LEAVE-A-TEMPORARY-FILE
    ar LINK-AT-STATUS-IS-REPLACED-NEVER-FOLLOWED

@@ -638,6 +638,9 @@ ENUM apply-event done blocked ;ENUM
    PASS-REPORT @
    REPLAY-REPLAY--REPORT:COMPLETED-OPERATIONS +! ;
 
+: REMOTE-DONE ( ^pass -- )
+   PASS-LINK @ REPLAY-LINK:STATUS @ STATUS:COMPLETED ;
+
 : BLOCKED ( replay-blocked ^pass -- apply-event )
    PASS-BLOCKED ! construct apply-event blocked ;
 
@@ -2573,12 +2576,12 @@ ENUM remote-event done blocked local ;ENUM
 \ completed one passes; a pending one is applied, or yields if local.
 FSM:DEFINE REMOTE-LIFECYCLE ( ^pass ) remote-state remote-event
    IN recorded  STATUS ( JOURNAL:record-status )
-      completed  -  >passed
-      pending    -  >applying
+      completed  -            >passed
+      pending    -            >applying
    IN applying  APPLY-REMOTE
-      done     -  >passed
-      blocked  -  >stopped
-      local    -  >yielded
+      done     REMOTE-DONE  >passed
+      blocked  -            >stopped
+      local    -            >yielded
    FINAL passed   -
    FINAL stopped  STOP-REMOTE
    FINAL yielded  -
