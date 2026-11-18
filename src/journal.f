@@ -1012,12 +1012,6 @@ ENUM remote-inventory-change
    VARIANT delete-subtree FIELD key MODEL:key ;VARIANT
 ;ENUM
 
-\ A remote directory's key and display path.
-STRUCTURE remote-directory
-   FIELD key MODEL:key
-   FIELD path MODEL:path
-;STRUCTURE
-
 private
 
 1 TASK:+USERS ENCODER JSON:writer
@@ -1087,6 +1081,18 @@ BUF:HDR-BYTES TASK:+USERS ENCODED u8
 : DROP-CONFLICT ( MODEL:conflict -- ) drop ;
 
 : NO-CURSOR ( -- option<DROPBOX:cursor> ) OPTION:NONE ;
+: NO-PATH ( -- option<MODEL:path> ) OPTION:NONE ;
+
+: PATH-COPY ( SQLITE:statement n ^ARENA:arena
+     -- SQLITE:statement MODEL:path )
+   BLOB-COPY MODEL:>PATH ;
+
+: SPELLING-ROW
+   ( SQLITE:statement ^ARENA:arena
+     -- option<MODEL:path> SQLITE:statement )
+   {: ar :}
+   SQLITE:STEP 0= if NO-PATH swap exit then
+   0 ar PATH-COPY OPTION:SOME swap ;
 
 : LOCAL-OBSERVATION-OF
    ( str str ^ARENA:arena -- MODEL:observation<MODEL:local> )
@@ -1139,14 +1145,6 @@ BUF:HDR-BYTES TASK:+USERS ENCODED u8
    2 SQLITE:COL-TEXT >str p MODEL:PATH>STR ar REMOTE-OBSERVATION-OF
    {: o :}
    k p o MODEL-REMOTE--RECORD:MAKE ;
-
-: DIRECTORY-ROW
-   ( SQLITE:statement ^ARENA:arena
-     -- SQLITE:statement remote-directory )
-   {: ar :}
-   0 SQLITE:COL-BLOB str> ar BYTES-KEY {: k:MODEL:key :}
-   1 SQLITE:COL-BLOB str> ar BYTES-PATH {: p:MODEL:path :}
-   k p JOURNAL-REMOTE--DIRECTORY:MAKE ;
 
 : CURSOR-ROW
    ( ^ARENA:arena SQLITE:statement
@@ -1213,19 +1211,17 @@ public
    s" SELECT cursor FROM remote_inventory WHERE singleton = 1"
    >str [: CURSOR-ROW ;] SQLITE:WITH-STATEMENT ;
 
-\ The directories and restricted folders Dropbox holds, by key.
-: REMOTE-DIRECTORY-PATHS
-   ( journal ^ARENA:arena -- ^VEC:vector<remote-directory> )
-   {: j ar :}
-   ar ARENA:ALLOCATOR 0 [type] remote-directory VEC:NEW {: v :}
+\ The display path of the directory or restricted folder Dropbox holds
+\ at the key; none for a file or nothing.
+: REMOTE-DIRECTORY-AT
+   ( journal MODEL:key ^ARENA:arena -- option<MODEL:path> )
+   {: j k ar :}
    j >CONNECTION
-   s\" SELECT canonical_path, path FROM remote_observations
-      WHERE observation_json IN
-         ('\"Directory\"', '{\"Unknown\":\"Inaccessible\"}')
-      ORDER BY canonical_path"
-   >str [: begin SQLITE:STEP while ar DIRECTORY-ROW v VEC:PUSH ! repeat ;]
-   SQLITE:WITH-STATEMENT
-   v ;
+   s\" SELECT path FROM remote_observations
+      WHERE canonical_path = ?1 AND observation_json IN
+         ('\"Directory\"', '{\"Unknown\":\"Inaccessible\"}')"
+   >str [: k KEY-BYTES >str 1 SQLITE:BIND-BLOB ar SPELLING-ROW ;]
+   SQLITE:WITH-STATEMENT ;
 
 private
 
@@ -1682,7 +1678,6 @@ $FFFFFFFF constant U32-MAX
    ;MATCH ;
 
 : NO-BASELINE ( -- option<MODEL:baseline> ) OPTION:NONE ;
-: NO-PATH ( -- option<MODEL:path> ) OPTION:NONE ;
 : NO-PLAN-ID ( -- option<plan-id> ) OPTION:NONE ;
 : NO-PLAN ( -- option<plan-record> ) OPTION:NONE ;
 : NO-STATE ( -- option<plan-state> ) OPTION:NONE ;
@@ -1699,10 +1694,6 @@ $FFFFFFFF constant U32-MAX
    {: col :}
    col SQLITE:COL-NULL? if NO-INT exit then
    col SQLITE:COL-INT OPTION:SOME ;
-
-: PATH-COPY ( SQLITE:statement n ^ARENA:arena
-     -- SQLITE:statement MODEL:path )
-   BLOB-COPY MODEL:>PATH ;
 
 : KEY-COPY ( SQLITE:statement n ^ARENA:arena
      -- SQLITE:statement MODEL:key )
@@ -1739,13 +1730,6 @@ $FFFFFFFF constant U32-MAX
    2 SQLITE:COL-TEXT >str path ar DECODE-BASELINE {: b :}
    b ABSENT? if exit then
    k path b MODEL-BASELINE--RECORD:MAKE records VEC:PUSH ! ;
-
-: SPELLING-ROW
-   ( SQLITE:statement ^ARENA:arena
-     -- option<MODEL:path> SQLITE:statement )
-   {: ar :}
-   SQLITE:STEP 0= if NO-PATH swap exit then
-   0 ar PATH-COPY OPTION:SOME swap ;
 
 public
 

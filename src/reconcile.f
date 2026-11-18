@@ -1812,14 +1812,31 @@ STRUCTURE casing
    out ar NORMALIZE-INVENTORY-RECORDS
    out ;
 
-\ A journal directory keeps its spelling while no delete is over it.
+\ The journal directory at k keeps its spelling while no delete is
+\ over it.
 : KEPT-CASING
-   ( JOURNAL:remote-directory ^VEC:vector<n>
+   ( MODEL:key JOURNAL:journal ^VEC:vector<n>
      ^VEC:vector<JOURNAL:remote-inventory-change> ^VEC:vector<casing>
      ^ARENA:arena -- )
-   {: d ds cs cv ar :}
-   d JOURNAL-REMOTE--DIRECTORY:UNMAKE {: k p :}
-   k ds cs LAST-DELETE 0< if k p cv ar INSERT-DIRECTORY-CASING then ;
+   {: k j ds cs cv ar :}
+   k ds cs LAST-DELETE 0 >= if exit then
+   j k ar JOURNAL:REMOTE-DIRECTORY-AT MATCH option
+      none OF ENDOF
+      some OF {: p :} k p cv ar INSERT-DIRECTORY-CASING ENDOF
+   ;MATCH ;
+
+\ The kept casings at the writes' keys, each once; a write's ancestors
+\ are writes too (UPSERT+), so these are every key a casing is asked at.
+: KEPT-CASINGS
+   ( JOURNAL:journal ^VEC:vector<n>
+     ^VEC:vector<JOURNAL:remote-inventory-change> ^VEC:vector<casing>
+     ^ARENA:arena -- )
+   {: j ds cs cv ar :}
+   cs [: WRITE? ;] ar KEYED-NUMBERS {: ws :}
+   0 begin dup ws VEC:COUNT < while
+      ws over cs NTH-KEY j ds cs cv ar KEPT-CASING
+      ws swap cs KEY-RUN-END
+   repeat drop ;
 
 : WRITE-CASING
    ( JOURNAL:remote-inventory-change ^VEC:vector<casing> ^ARENA:arena
@@ -1884,14 +1901,13 @@ STRUCTURE casing
 \ Rust's normalize_inventory_changes: a directory keeps the journal's
 \ spelling until a delete is over it, then takes the first after.
 : NORMALIZE-INVENTORY-CHANGES
-   ( ^VEC:vector<JOURNAL:remote-inventory-change>
-     ^VEC:vector<JOURNAL:remote-directory> ^ARENA:arena
-     -- ^VEC:vector<JOURNAL:remote-inventory-change> )
-   {: cs dirs ar :}
+   ( ^VEC:vector<JOURNAL:remote-inventory-change> JOURNAL:journal
+     ^ARENA:arena -- ^VEC:vector<JOURNAL:remote-inventory-change> )
+   {: cs j ar :}
    cs ar LATEST-DELETES {: ds :}
    cs [: FOLDER-WRITE? ;] ar KEYED-NUMBERS {: ws :}
    ar NO-CASINGS {: all :}
-   dirs VEC:COUNT 0 ?do dirs i VEC:AT @ ds cs all ar KEPT-CASING loop
+   j ds cs all ar KEPT-CASINGS
    0 begin dup ws VEC:COUNT < while ws cs ds all ar RUN-CASING repeat
    drop
    all ar UNIQUE-CASINGS {: cv :}
@@ -1999,9 +2015,7 @@ ENUM listed done ;ENUM
 
 : APPLY-DELTA ( ^refresh -- )
    {: r :}
-   r REFRESH-JOURNAL @ r REFRESH-ARENA @ JOURNAL:REMOTE-DIRECTORY-PATHS
-   {: dirs :}
-   r REFRESH-CHANGES @ dirs r REFRESH-ARENA @
+   r REFRESH-CHANGES @ r REFRESH-JOURNAL @ r REFRESH-ARENA @
    NORMALIZE-INVENTORY-CHANGES {: cs :}
    r REFRESH-JOURNAL @ r LISTED-CURSOR cs
    JOURNAL:APPLY-REMOTE-INVENTORY-DELTA ;

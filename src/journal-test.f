@@ -494,11 +494,18 @@ variable SCANNED       \ query plan rows that scan the table
    v 0 VEC:AT @ MODEL-REMOTE--RECORD:UNMAKE {: k p o2 :}
    o o2 MODEL:REMOTE-OBSERVATION= ;
 
-: DIRECTORY-IS?
-   ( ^VEC:vector<remote-directory> n ^u8 n ^u8 n -- bool )
-   {: v i k:^ ku p:^ pu :}
-   v i VEC:AT @ JOURNAL-REMOTE--DIRECTORY:UNMAKE {: key path :}
-   key KEY-BYTES k ku STR= path PATH-BYTES p pu STR= and ;
+: DIRECTORY-IS? ( option<MODEL:path> ^u8 n -- bool )
+   {: p:^ pu :}
+   MATCH option
+      none OF false ENDOF
+      some OF PATH-BYTES p pu STR= ENDOF
+   ;MATCH ;
+
+: NO-DIRECTORY? ( option<MODEL:path> -- bool )
+   MATCH option
+      none OF true ENDOF
+      some OF drop false ENDOF
+   ;MATCH ;
 
 : SUBTREE-PLAN-ROW ( SQLITE:statement -- SQLITE:statement )
    3 SQLITE:COL-TEXT {: a:^ u :}
@@ -1209,16 +1216,23 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    s" shared" s" Shared" INACCESSIBLE ar REMOTE-RECORD v REMOTE+
    v ;
 
-: REMOTE-DIRECTORY-PATHS-INCLUDE-RESTRICTED-FOLDERS ( ^ARENA:arena -- )
+: DIRECTORY-AT
+   ( journal ^u8 n ^ARENA:arena -- option<MODEL:path> )
+   {: j k:^ ku ar :}
+   j k ku ar CANONICAL ar REMOTE-DIRECTORY-AT ;
+
+\ Rust's remote_directory_paths_include_restricted_folders, one key
+\ at a time.
+: REMOTE-DIRECTORY-AT-INCLUDES-RESTRICTED-FOLDERS ( ^ARENA:arena -- )
    {: ar :}
    s" remote_directory_paths_include_restricted_folders" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
    j s" cursor" CURSOR ar RESTRICTED-SAMPLE PUBLISH-REMOTE-INVENTORY
-   j ar REMOTE-DIRECTORY-PATHS {: v :}
-   v VEC:COUNT 2 T=
-   v 0 s" docs" s" Docs" DIRECTORY-IS? TTRUE
-   v 1 s" shared" s" Shared" DIRECTORY-IS? TTRUE
+   j s" docs" ar DIRECTORY-AT s" Docs" DIRECTORY-IS? TTRUE
+   j s" shared" ar DIRECTORY-AT s" Shared" DIRECTORY-IS? TTRUE
+   j s" docs/a.txt" ar DIRECTORY-AT NO-DIRECTORY? TTRUE
+   j s" absent" ar DIRECTORY-AT NO-DIRECTORY? TTRUE
    j CLOSE
    d GONE ;
 
@@ -3248,7 +3262,7 @@ variable CRAFT
    ar REMOTE-DELTA-MUTATES-ONLY-CHANGED-ROWS-AND-CURSOR
    ar REMOTE-DELTA-DELETES-ONLY-THE-NAMED-SUBTREE
    ar REMOTE-DELTA-ENSURED-DIRECTORY-KEEPS-AN-UNKNOWN-FOLDER
-   ar REMOTE-DIRECTORY-PATHS-INCLUDE-RESTRICTED-FOLDERS
+   ar REMOTE-DIRECTORY-AT-INCLUDES-RESTRICTED-FOLDERS
    ar JOURNAL-LOCAL-SCAN-REPLACES-INVENTORY-AND-HASHES-ATOMICALLY
    ar ORACLE-JOURNAL-HOLDS-ITS-BASELINES
    ar JOURNAL-REOPEN-EXPOSES-INTENT-WITHOUT-ADVANCING-BASELINE

@@ -8,7 +8,6 @@ blocks:
   - omabox-decide-a-pass-faa14ab1
   - omabox-scan-the-local-b929e99d
   - omabox-find-why-a-666a99c6
-  - omabox-read-a-delta-498791cf
 ---
 
-Problem: the redesign must show a pass's peak no longer grows with the tree. Acceptance: a no-op pass's peak memory and time measured at about 4,000 and 16,000 entries before and after; JOURNAL.md, docs/habu-rewrite.md and file headers describe the row-by-row pass. Depends: omabox-decide-a-pass-faa14ab1, omabox-scan-the-local-b929e99d, omabox-find-why-a-666a99c6, omabox-read-a-delta-498791cf. Claim: unassigned.
+Problem: the redesign must show a pass's peak no longer grows with the tree. Acceptance: a no-op pass's peak memory and time measured at about 4,000 and 16,000 entries before and after; JOURNAL.md, docs/habu-rewrite.md and file headers describe the row-by-row pass. Depends: omabox-decide-a-pass-faa14ab1, omabox-scan-the-local-b929e99d, omabox-find-why-a-666a99c6. Claim: unassigned.

@@ -1421,42 +1421,46 @@ ARENA LISTED DROPBOX:entry
    rs s" apps/day one/entry.doentry" ar PATH-OF
    s" apps/Day One/Entry.doentry" T$= ;
 
-\ Rust's existing directories: Apps and Apps/Day One.
-: EXISTING ( ^ARENA:arena -- ^VEC:vector<JOURNAL:remote-directory> )
-   {: ar :}
-   ar ARENA:ALLOCATOR 0 [type] JOURNAL:remote-directory VEC:NEW {: v :}
-   s" apps" ar CANONICAL s" Apps" DISPLAY
-   JOURNAL-REMOTE--DIRECTORY:MAKE v VEC:PUSH !
-   s" apps/day one" ar CANONICAL s" Apps/Day One" DISPLAY
-   JOURNAL-REMOTE--DIRECTORY:MAKE v VEC:PUSH !
-   v ;
+\ Rust's existing directories, Apps and Apps/Day One, in the journal.
+: EXISTING ( JOURNAL:journal ^ARENA:arena -- )
+   {: j ar :}
+   ar REMOTE-RECORDS {: rs :}
+   rs s" Apps" REMOTE-DIRECTORY ar REMOTE+
+   rs s" Apps/Day One" REMOTE-DIRECTORY ar REMOTE+
+   j s" cursor" >str DROPBOX:>CURSOR rs
+   JOURNAL:PUBLISH-REMOTE-INVENTORY ;
 
 : DELTA-PATHS
-   ( ^VEC:vector<JOURNAL:remote-inventory-change> ^ARENA:arena
-     -- ^u8 n )
-   {: v ar :}
-   v ar EXISTING ar NORMALIZE-INVENTORY-CHANGES CHANGE-PATHS ;
+   ( ^VEC:vector<JOURNAL:remote-inventory-change> JOURNAL:journal
+     ^ARENA:arena -- ^u8 n )
+   NORMALIZE-INVENTORY-CHANGES CHANGE-PATHS ;
 
 : DELTA-NEVER-RESPELLS-A-DIRECTORY-THAT-STILL-EXISTS ( ^ARENA:arena -- )
    {: ar :}
    s" delta_never_respells_a_directory_that_still_exists" T-LABEL
+   ar CASE-JOURNAL {: d:str j :}
+   j ar EXISTING
    s" " ar LISTING-AT {: root :}
    ar NO-CHANGES {: v :}
    s" /apps" s" /apps" ar FOLDER-ENTRY root v ar APPEND-ENTRY-CHANGES
    s" /apps/day one/journal" s" /apps/day one/Journal" ar FOLDER-ENTRY
    root v ar APPEND-ENTRY-CHANGES
-   v ar DELTA-PATHS s" Apps|Apps|Apps/Day One|Apps/Day One/Journal|" T$=
+   v j ar DELTA-PATHS s" Apps|Apps|Apps/Day One|Apps/Day One/Journal|" T$=
    ar NO-CHANGES {: w :}
    s" /apps/day one" s" /apps/day one" ar DELETED-ENTRY
    root w ar APPEND-ENTRY-CHANGES
    s" /apps/day one" s" /apps/DAY ONE" ar FOLDER-ENTRY
    root w ar APPEND-ENTRY-CHANGES
-   w ar DELTA-PATHS s" Apps|Apps/DAY ONE|" T$=
+   w j ar DELTA-PATHS s" Apps|Apps/DAY ONE|" T$=
    ar NO-CHANGES {: x :}
    s" /apps" s" /apps" ar DELETED-ENTRY root x ar APPEND-ENTRY-CHANGES
    s" /apps/day one/journal" s" /APPS/DAY ONE/Journal" ar FOLDER-ENTRY
    root x ar APPEND-ENTRY-CHANGES
-   x ar DELTA-PATHS s" APPS|APPS/DAY ONE|APPS/DAY ONE/Journal|" T$= ;
+   x j ar DELTA-PATHS s" APPS|APPS/DAY ONE|APPS/DAY ONE/Journal|" T$=
+   ar NO-CHANGES {: y :}
+   s" /apps" s" /apps" ar FOLDER-ENTRY root y ar APPEND-ENTRY-CHANGES
+   y j ar DELTA-PATHS s" Apps|" T$=
+   d j GONE ;
 
 : LISTING-REJECTS-MISMATCHED-CANONICAL-AND-DISPLAY-PATHS
    ( ^ARENA:arena -- )
