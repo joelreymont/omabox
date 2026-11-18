@@ -6,11 +6,22 @@
 \ systemd starts, and exit with its status.
 require src/lib/string.f
 require src/lib/fd.f
+require src/lib/ffi-abi.f
 require src/daemon.f
 require src/version.f
 
 package OMABOXD
 private
+
+-8 constant M-ARENA-MAX   \ glibc malloc.h
+
+PROCESS-SYMBOLS
+FUNCTION: MALLOPT mallopt ( i32 i32 -- i32 )
+;FUNCTION
+
+\ One arena for every thread, set before any starts: glibc never
+\ returns a thread arena's free top, and libcurl starts a resolver each pass.
+: ONE-ARENA ( -- ) M-ARENA-MAX 1 MALLOPT drop ;
 
 : SELF-CHECK? ( -- bool )
    SCRIPT-ARGC 1 <> if false exit then
@@ -25,6 +36,7 @@ private
 public
 
 : RUN ( -- )
+   ONE-ARENA
    SELF-CHECK? if SELF-CHECK exit then
    s" " DAEMON:RUN die ;
 
