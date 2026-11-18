@@ -1687,3 +1687,45 @@ Observation for the blog: one misread field stopped the whole sync for
 two days, because the failure was classed as passing. Habu blocks a plan
 Dropbox rejects for its content, so the other paths go on, but records it
 under a generic tag; the cause still needs a name of its own.
+
+## 2026-11-18: the daemon's memory, and a Habu that moved on
+
+systemd reported the service peaking at 822 MB. Most of that was page
+cache, which the cgroup charges for the files the daemon reads; the
+process's own private memory, from smaps_rollup, was 92 MB, against
+about 4 MB of anonymous memory for a daemon that has not uploaded.
+
+The cause was one option. `CURL:BODY!` sets CURLOPT_COPYPOSTFIELDS, so
+libcurl copied every upload chunk into a malloc of its own. A malloc above
+glibc's mmap threshold raises that threshold, so the next chunk's copy
+came from the heap, and the heap kept the freed copies. A reproducer that
+uploads through the fake Dropbox showed a 50,688 kB heap with under
+0.5 MB in use. Habu gained `CURL:BORROW-BODY!` (CURLOPT_POSTFIELDS), which
+lets libcurl read the chunk where it lies, in a buffer Omabox maps and
+unmaps itself. On the same reproducer the heap stays at or below 592 kB
+and the peak resident size falls from 127,520 kB to 44,592 kB. What still
+grows is glibc's per-thread cache of small freed chunks: about 35 kB, flat
+after some 16 uploads, and flat from the first with the cache turned off.
+
+Shipping that one word meant moving Omabox onto Habu master, whose own
+changes had piled up since the pinned commit:
+- **Deleted words:** Habu had deleted the anchored file-system words
+  (`FS:OPEN-DIR`, `FS:TRY-RENAME-AT` and the rest) because, it judged, no
+  program called them. Omabox calls 16 of them; Habu could not see a
+  client outside its tree.
+- **Staged build:** putting the file back meant a staged build. hb builds
+  with its own list of the files it carries, so an hb whose list lacks a
+  file cannot build one that has it. The package build now runs Habu's
+  convergence check after the seed, rather than trusting the first
+  generation.
+- **Strings:** Habu had respelled its strings as `str` and marked its own
+  files with a transitional `split-str`. I assumed Omabox needed the
+  marker too, but Omabox had been on one-item `str` for days and the marker
+  broke it. The client was ahead of the library. The real port changed
+  582 lines in 34 source files, so that each call meets Habu's row as it
+  is now, mostly with a `>str` or `str>` at the call.
+
+Observation for the blog: Cargo pins a crate's version and semver tells
+the client what a bump will cost. Habu has no versions, so the client pins
+a commit and pays for every change since in one go. A library's "nothing
+calls this" holds only for the code it can see.

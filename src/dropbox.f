@@ -2541,8 +2541,9 @@ public
 \ bytes. A call Dropbox may have applied, or a 2xx answer that is not the
 \ upload's complete entry at its path with its content hash, is refused
 \ unverified, but an append is resent once; a conflict is answered as
-\ refused. A run's chunk buffer is MEM's, released before UPLOAD answers
-\ or throws.
+\ refused. A run's chunk buffer is MEM's and libcurl reads it in place: it
+\ is refilled and released only between calls, each transfer ended, before
+\ UPLOAD answers or throws.
 
 public
 
@@ -2811,7 +2812,7 @@ HEAP RUNS run
    c c CLIENT-BODY @ BUF$ LINE+
    h c LINE$ >str CURL:HEADER+ s" header" OK
    h s" Content-Type: application/octet-stream" >str CURL:HEADER+ s" header" OK
-   h b bu >str CURL:BODY! s" body" OK
+   h b bu >str CURL:BORROW-BODY! s" body" OK
    h deadline execute ;
 
 
