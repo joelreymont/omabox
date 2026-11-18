@@ -297,9 +297,12 @@ private
 : DELETE-MODE? ( SQLITE:statement -- bool SQLITE:statement )
    SQLITE:STEP drop 0 SQLITE:COL-TEXT >str s" delete" >str STR=CI swap ;
 
+\ The daemon holds its connection for life, so the connection keeps 64 KiB
+\ of pages, not SQLite's 2 MB; the OS page cache holds the rest.
 : CONFIGURE-WRITABLE ( journal -- )
    {: j :}
    j >CONNECTION {: c :}
+   c s" PRAGMA cache_size = -64" SQLITE:EXEC
    c s" PRAGMA foreign_keys = ON" SQLITE:EXEC
    c s" PRAGMA journal_mode = DELETE" >str [: DELETE-MODE? ;]
    SQLITE:WITH-STATEMENT 0= if
