@@ -376,11 +376,13 @@ private
 
 
 \ Resets the handle and sets what every request needs, the URL the line
-\ buffer holds included.
+\ buffer holds included. Peers are verified against /etc/ssl/certs, so
+\ libcurl never holds its whole CA bundle.
 : PREPARE ( ^client -- CURL:handle )
    {: c :}
    c CLIENT-HANDLE @ {: h:CURL:handle :}
    h CURL:RESET s" reset" OK
+   h s" /etc/ssl/certs" >str CURL:CA-PATH! s" ca path" OK
    h c LINE$ >str CURL:URL! s" url" OK
    h false CURL:FOLLOW! s" follow" OK
    h DEADLINE >MS CURL:TIMEOUT! s" timeout" OK
