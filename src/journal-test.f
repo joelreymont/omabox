@@ -3181,7 +3181,7 @@ variable CRAFT
    s" ` could not process the record for `" rot PUT
    path pu rot PUT  s" `: " rot PUT
    MODEL:E-STORED swap PUT-N  s"  " rot PUT
-   MODEL:E-STORED ERROR:NAME$ rot PUT {: u :}
+   MODEL:E-STORED ERROR:NAME$ swap PUT-STR {: u :}
    WANT u ;
 
 \ The reader throws E-JSON after one line naming op, path and cause.
