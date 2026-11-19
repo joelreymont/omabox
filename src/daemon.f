@@ -27,6 +27,7 @@ require src/lib/adt/option.f
 require src/lib/systemd.f
 require src/lib/task.f
 require src/lib/time.f
+require src/lib/ffi-abi.f
 require src/dropbox.f
 require src/journal.f
 require src/config.f
@@ -434,7 +435,15 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
 : JOURNAL@ ( ^run -- JOURNAL:journal ) RUN-JOURNAL @ ;
 : CLIENT@ ( ^run -- ^DROPBOX:client ) RUN-SESSION @ SESSION-CLIENT @ ;
 : PHASE! ( STATUS:phase ^run -- ) STATUS@ STATUS:PHASE ;
-: SLEEP ( n ^run -- ) RUN-WAIT @ execute ;
+PROCESS-SYMBOLS
+FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
+;FUNCTION
+
+\ Freed heap pages go back to the system before the daemon blocks: glibc
+\ returns only the heap's top by itself.
+: RELEASE-HEAP ( -- ) 0 MALLOC-TRIM drop ;
+
+: SLEEP ( n ^run -- ) RELEASE-HEAP RUN-WAIT @ execute ;
 
 : FAILED ( n failure ^run -- )
    {: code f x :}
@@ -810,6 +819,7 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
 
 : CURSOR-POLLED ( DROPBOX:cursor ^run -- bool )
    {: k:DROPBOX:cursor x :}
+   RELEASE-HEAP
    k DROPBOX:CURSOR>STR str> LONG-POLL-S x CLIENT@ DROPBOX:WAIT
    x WOKEN ;
 
