@@ -1,15 +1,18 @@
 \ test-journal.f - JOURNAL's words for tests, never production: the Rust
-\ version's test-only words (rust src/journal.rs, #[cfg(test)]) and a
-\ private comparison exported.
+\ version's test-only words (rust src/journal.rs, #[cfg(test)]), a
+\ private comparison exported, and readers and writers of the local scan.
 \ RECORD-RECOVERY-INTENT commits the recovery intent an older Omabox
 \ version recorded before a destructive operation, answering a
 \ recovery-write, COMPLETE-RECOVERY completes a recovery record,
 \ answering a recovery-completion, TOTAL-CHANGES answers the rows the
 \ journal's connection has changed since it opened, CHANGE-COUNTER
-\ answers SQLite's file change counter, and LOCAL-RECORDS=
-\ answers whether two local inventories hold equal records in the same
-\ order. Tests alone load this file; nothing in the program calls these
-\ words.
+\ answers SQLite's file change counter, LOCAL-RECORDS= answers whether
+\ two local inventories hold equal records in the same order,
+\ LOCAL-HASH-CACHE answers the active root's hash cache,
+\ PUBLISH-LOCAL-SCAN publishes given observations and hashes as one
+\ scan, and SCAN-COUNTS answers how many files a scan has still to hash
+\ and cached hashes still to revalidate. Tests alone load this file;
+\ nothing in the program calls these words.
 \ STORAGE CLASS. CALLER-OWNED, as JOURNAL's: a record answered lies in the
 \ arena the caller passes. TASK-LOCAL: the bytes CHANGE-COUNTER reads,
 \ TASK:+USERS rows.
@@ -58,6 +61,51 @@ public
    0 COUNTER-BYTES BE:U32@ ;
 
 EXPORT LOCAL-RECORDS=
+
+private
+
+: HASH-ROW
+   ( SQLITE:statement ^ARENA:arena
+     -- SQLITE:statement MODEL:hash-record )
+   {: ar :}
+   0 SQLITE:COL-BLOB str> ar BYTES-PATH {: p:MODEL:path :}
+   1 SQLITE:COL-TEXT >str {: json:str :}
+   p json ar HASH-OF ;
+
+public
+
+\ The hashes verified for the active root, by path.
+: LOCAL-HASH-CACHE
+   ( journal ^ARENA:arena -- ^VEC:vector<MODEL:hash-record> )
+   {: j ar :}
+   ar ARENA:ALLOCATOR 0 [type] MODEL:hash-record VEC:NEW {: v :}
+   j >CONNECTION s" SELECT cache.path, cache.hash_json
+      FROM local_hash_cache AS cache
+      JOIN local_root_binding AS root
+         ON root.singleton = 1 AND cache.root_generation = root.generation
+      ORDER BY cache.path"
+   >str [: begin SQLITE:STEP while ar HASH-ROW v VEC:PUSH ! repeat ;]
+   SQLITE:WITH-STATEMENT
+   v ;
+
+\ Publishes the observations and hashes as one scan; false, nothing
+\ written, when binding is no longer the active root.
+: PUBLISH-LOCAL-SCAN
+   ( journal local-root-binding ^VEC:vector<MODEL:local-record>
+     ^VEC:vector<MODEL:hash-record> -- bool )
+   {: j b obs hashes :}
+   j [:
+      obs VEC:COUNT 0 ?do obs i VEC:AT @ SCAN-OBSERVE loop
+      hashes VEC:COUNT 0 ?do hashes i VEC:AT @ SCAN-HASH loop
+      b PUBLISH-SCAN swap
+   ;] WITH-SCAN ;
+
+\ The scan's files still to hash, then its cached hashes still to
+\ revalidate; both stay in the scan.
+: SCAN-COUNTS ( scan -- scan n n )
+   SCAN-JOURNAL >CONNECTION {: c :}
+   c s" SELECT COUNT(*) FROM temp.scan_jobs" QUERY-INT
+   c s" SELECT COUNT(*) FROM temp.scan_cached" QUERY-INT ;
 
 private
 

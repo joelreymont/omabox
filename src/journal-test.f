@@ -680,6 +680,19 @@ variable SCANNED       \ query plan rows that scan the table
 
 \ ---- test-only words of the Rust version -------------------------
 
+: LOCALS-INSERTED
+   ( SQLITE:statement ^VEC:vector<MODEL:local-record> ^JSON:writer
+     ^ARENA:arena -- SQLITE:statement )
+   {: v w ar :}
+   v VEC:COUNT 0 ?do
+      v i VEC:AT @ w ar LOCAL-INSERTED ar ARENA:RESET
+   loop ;
+
+: LOCAL-INSERTS
+   ( SQLITE:statement ^VEC:vector<MODEL:local-record> ^JSON:writer
+     -- SQLITE:statement )
+   [: LOCALS-INSERTED ;] ARENA:WITH ;
+
 : LOCAL-INVENTORY-WRITTEN
    ( SQLITE:connection ^VEC:vector<MODEL:local-record> ^JSON:writer -- )
    {: c v w :}

@@ -1234,21 +1234,6 @@ BUF:HDR-BYTES TASK:+USERS ENCODED u8
    SQLITE:WITH-STATEMENT
    v ;
 
-\ The hashes of the active root's generation.
-: READ-LOCAL-HASH-CACHE
-   ( SQLITE:connection ^ARENA:arena
-     -- ^VEC:vector<MODEL:hash-record> )
-   {: c ar :}
-   ar ARENA:ALLOCATOR 0 [type] MODEL:hash-record VEC:NEW {: v :}
-   c s" SELECT cache.path, cache.hash_json
-      FROM local_hash_cache AS cache
-      JOIN local_root_binding AS root
-         ON root.singleton = 1 AND cache.root_generation = root.generation
-      ORDER BY cache.path"
-   >str [: begin SQLITE:STEP while ar HASH-ROW v VEC:PUSH ! repeat ;]
-   SQLITE:WITH-STATEMENT
-   v ;
-
 : READ-REMOTE-OBSERVATIONS
    ( SQLITE:connection ^ARENA:arena
      -- ^VEC:vector<MODEL:remote-record> )
@@ -1261,12 +1246,6 @@ BUF:HDR-BYTES TASK:+USERS ENCODED u8
    v ;
 
 public
-
-\ The hashes verified for the active root, by path.
-: LOCAL-HASH-CACHE
-   ( journal ^ARENA:arena -- ^VEC:vector<MODEL:hash-record> )
-   {: j ar :}
-   j >CONNECTION ar READ-LOCAL-HASH-CACHE ;
 
 \ The committed local inventory, by path.
 : LOCAL-INVENTORY
@@ -1342,19 +1321,6 @@ $2F constant SLASH
    p PATH-BYTES >str 1 SQLITE:BIND-BLOB
    w [: o swap MODEL:LOCAL-OBSERVATION>JSON ;] ENCODE >str 2 SQLITE:BIND-TEXT
    p ar BIND-KEY RAN ;
-
-: LOCALS-INSERTED
-   ( SQLITE:statement ^VEC:vector<MODEL:local-record> ^JSON:writer
-     ^ARENA:arena -- SQLITE:statement )
-   {: v w ar :}
-   v VEC:COUNT 0 ?do
-      v i VEC:AT @ w ar LOCAL-INSERTED ar ARENA:RESET
-   loop ;
-
-: LOCAL-INSERTS
-   ( SQLITE:statement ^VEC:vector<MODEL:local-record> ^JSON:writer
-     -- SQLITE:statement )
-   [: LOCALS-INSERTED ;] ARENA:WITH ;
 
 \ Binds path ?1 and hash_json ?2. A hash that is not Dropbox's is never
 \ cached.
@@ -1829,18 +1795,6 @@ public
    SCAN-JOURNAL {: j :}
    j >CONNECTION [: j b [: BOUND-DIFFERENCE ;] ARENA:WITH ;]
    SQLITE:WITH-TRANSACTION ;
-
-\ Publishes the observations and hashes as one scan; false, nothing
-\ written, when binding is no longer the active root.
-: PUBLISH-LOCAL-SCAN
-   ( journal local-root-binding ^VEC:vector<MODEL:local-record>
-     ^VEC:vector<MODEL:hash-record> -- bool )
-   {: j b obs hashes :}
-   j [:
-      obs VEC:COUNT 0 ?do obs i VEC:AT @ SCAN-OBSERVE loop
-      hashes VEC:COUNT 0 ?do hashes i VEC:AT @ SCAN-HASH loop
-      b PUBLISH-SCAN swap
-   ;] WITH-SCAN ;
 
 private
 

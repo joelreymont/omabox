@@ -5,10 +5,9 @@
 \ unconfirmed, that the content hash composes block hashes, and that
 \ neither the hash nor a stage's copy depends on how a reader fragments
 \ the bytes; its scan tests, the reason each failure one entry raises
-\ publishes and the lines LOCAL logs for it among them, but those the
-\ comment on CASES names, each journal test keeping the half without the
-\ journal but four that publish to a journal in their case's directory,
-\ in the part LOCAL SCAN-TEST, which sees LOCAL's private types, and
+\ publishes and the lines LOCAL logs for it among them, each scanning
+\ into a journal in a directory of its own beside the case's root, in
+\ the part LOCAL SCAN-TEST, which sees LOCAL's private types, and
 \ there too that a denied write's line gives its directory's and entry's
 \ facts, a denied rename's names both directories, one on a directory
 \ already closed gives none of its facts, a denied directory creation's
@@ -435,10 +434,53 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    code 0<> if code throw then
    e u ;
 
+\ ---- the case's journal
+
+FS:PATHZ-CAP BUFFER: JOURNAL-BUF
+variable JOURNAL-U
+FS:PATHZ-CAP BUFFER: JOURNAL-FILE
+
+: JOURNAL-DIR$ ( -- ^u8 n ) JOURNAL-BUF JOURNAL-U @ ;
+
+: JOURNAL-PATH ( -- ^u8 n )
+   JOURNAL-DIR$ s" journal.sqlite3" JOURNAL-FILE FS:JOIN-PATH
+   JOURNAL-FILE swap ;
+
+\ Runs q on the journal in JOURNAL-DIR$, then closes it.
+: OPENED-JOURNAL ( [ JOURNAL:journal -- ] -- )
+   {: q :}
+   JOURNAL-PATH AR @ KEEP JOURNAL:OPEN {: j :}
+   [: j q execute ;] [: j JOURNAL:CLOSE ;] finally ;
+
+\ Runs q on a journal in a new directory under TMPDIR, outside the
+\ case's root, which it then removes.
+: WITH-JOURNAL ( [ JOURNAL:journal -- ] -- )
+   {: q :}
+   s" local-scan-journal" JOURNAL-BUF TEMP-DIR JOURNAL-U !
+   [: q OPENED-JOURNAL ;] [: JOURNAL-DIR$ FS:REMOVE-TREE ;] finally ;
+
+\ The journal a scan case publishes to, and its active root, ROOT$.
+TYPED-VARIABLE JNL JOURNAL:journal
+TYPED-VARIABLE BOUND JOURNAL:local-root-binding
+
+: ACTIVATE-ROOT ( JOURNAL:journal -- )
+   {: j :}
+   ROOT$ AR @ KEEP JOURNAL:INSPECT {: b :}
+   j b AR @ JOURNAL:ACTIVATE-LOCAL-ROOT drop
+   j JNL ! b BOUND ! ;
+
+\ Runs q in a new root under TMPDIR, the active root of a journal
+\ beside it; both are then removed.
+: IN-SCAN-CASE ( [ -- ] -- )
+   {: q :}
+   [: [: ACTIVATE-ROOT q execute ;] WITH-JOURNAL ;] IN-CASE ;
+
 \ ---- the scan's values
 
 : ZEROS ( -- ^u8 n )
    s" 0000000000000000000000000000000000000000000000000000000000000000" ;
+
+: NO-CUTOFF ( -- option<cutoff> ) OPTION:NONE ;
 
 : STABLE ( -- option<cutoff> )
    $7FFFFFFFFFFFFFFF 999999999 CUTOFF-MAKE OPTION:SOME ;
@@ -471,29 +513,68 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    r AR @ DROPBOX-CONTENT-HASH r DISCARD
    DROPBOX:HASH>STR str> ;
 
-: ROOT-SCAN ( -- complete-scan ) ROOT$ AR @ SCAN ;
+: ROOT-CHANGED? ( scan-publication -- bool )
+   MATCH scan-publication
+      published OF false ENDOF
+      root-changed OF true ENDOF
+   ;MATCH ;
 
-: CACHED-SCAN ( ^VEC:vector<MODEL:hash-record> option<cutoff>
-     [ -- option<cutoff> ] -- complete-scan )
-   {: cache cut:option<cutoff> q :}
-   ROOT$ cache cut q AR @ SCAN-WITH-CACHE-COMPLETED-AT ;
+\ The journal's published inventory and hash cache, in AR.
+: INVENTORY ( -- ^VEC:vector<MODEL:local-record> )
+   JNL @ AR @ JOURNAL:LOCAL-INVENTORY ;
 
-: ENUMERATE ( ^VEC:vector<MODEL:hash-record> option<cutoff>
-     -- pending-scan )
-   {: cache cut:option<cutoff> :}
-   ROOT$ cache cut AR @ ENUMERATE-SCAN ;
+: REUSABLE ( -- ^VEC:vector<MODEL:hash-record> )
+   JNL @ AR @ JOURNAL:LOCAL-HASH-CACHE ;
 
-: REUSABLE ( complete-scan -- ^VEC:vector<MODEL:hash-record> )
-   COMPLETE-SCAN-UNMAKE nip ;
+\ Makes the records the journal's hash cache, its inventory empty.
+: SEED ( ^VEC:vector<MODEL:hash-record> -- )
+   {: cache :}
+   JNL @ BOUND @ AR @ [type] MODEL:local-record NEW-VEC cache
+   JOURNAL:PUBLISH-LOCAL-SCAN TTRUE ;
 
-: PUBLISHED ( complete-scan -- n ) SCAN-OBSERVATIONS VEC:COUNT ;
+\ Rust's scan_and_publish_at: ROOT$ scanned with the journal's cache and
+\ published to it; cut decides which cached hashes the walk reuses, q
+\ which hashes it computes stay reusable. The inventory published.
+: CACHED-SCAN ( option<cutoff> [ -- option<cutoff> ]
+     -- ^VEC:vector<MODEL:local-record> )
+   {: cut:option<cutoff> q :}
+   JNL @ ROOT$ cut q AR @ SCAN-AND-PUBLISH-AT ROOT-CHANGED? TFALSE
+   INVENTORY ;
 
-: PENDING-ENTRIES ( pending-scan -- scan-entries )
-   PENDING-SCAN-UNMAKE {: r:str f:fd b:MODEL:stat en:scan-entries ar :} en ;
+\ CACHED-SCAN, computed hashes reusable before the current cutoff.
+: SCAN-AT ( option<cutoff> -- ^VEC:vector<MODEL:local-record> )
+   [: CURRENT-HASH-CACHE-CUTOFF ;] CACHED-SCAN ;
+
+: ROOT-SCAN ( -- ^VEC:vector<MODEL:local-record> ) NO-CUTOFF SCAN-AT ;
+
+\ ROOT$ enumerated into the scan with the journal's cache; cut decides
+\ which cached hashes the walk reuses.
+: ENUMERATE ( JOURNAL:scan option<cutoff> -- JOURNAL:scan pending-scan )
+   {: cut:option<cutoff> :}
+   ROOT$ cut AR @ ENUMERATE-SCAN ;
+
+\ Finishes the pending scan and publishes it; q decides which hashes it
+\ computes stay reusable.
+: FINISH-SCAN-AT
+   ( JOURNAL:scan pending-scan [ -- option<cutoff> ] -- JOURNAL:scan )
+   {: ps:pending-scan q :}
+   ps q JNL @ FINISH-BOUND-SCAN-AT MATCH option
+      none OF false TTRUE ENDOF
+      some OF JOURNAL:PUBLISH-SCAN TTRUE ENDOF
+   ;MATCH ;
+
+: FINISH-SCAN ( JOURNAL:scan pending-scan -- JOURNAL:scan )
+   [: CURRENT-HASH-CACHE-CUTOFF ;] FINISH-SCAN-AT ;
+
+\ Runs body over a scan of the journal; the inventory it published.
+: SCANNED ( [ JOURNAL:scan -- JOURNAL:scan ]
+     -- ^VEC:vector<MODEL:local-record> )
+   {: body :}
+   JNL @ body JOURNAL:WITH-SCAN INVENTORY ;
 
 \ Closes the root a pending scan holds, as Rust's drop of one.
 : RELEASE ( pending-scan -- )
-   PENDING-SCAN-UNMAKE {: r:str f:fd b:MODEL:stat en:scan-entries ar :}
+   PENDING-SCAN-UNMAKE {: r:str f:fd b:MODEL:stat ar :}
    f DISCARD ;
 
 \ The kind each observation is, and unknown's reason after it.
@@ -528,27 +609,30 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    MODEL-LOCAL--RECORD:UNMAKE
    {: p:MODEL:path o:MODEL:observation<MODEL:local> :} o ;
 
-\ The observation of the path, none where the scan published none.
-: FIND ( complete-scan ^u8 n -- option<MODEL:local-record> )
-   {: s:complete-scan p:^ u:n :}
-   s SCAN-OBSERVATIONS {: v :}
+: PUBLISHED ( ^VEC:vector<MODEL:local-record> -- n ) VEC:COUNT ;
+
+\ The observation of the path, none where the inventory holds none.
+: FIND
+   ( ^VEC:vector<MODEL:local-record> ^u8 n
+     -- option<MODEL:local-record> )
+   {: v p:^ u:n :}
    v VEC:COUNT 0 ?do
       v i VEC:AT @ {: r:MODEL:local-record :}
       r OBSERVATION-PATH p u STR= if r OPTION:SOME unloop exit then
    loop OPTION:NONE ;
 
-: KIND-AT ( complete-scan ^u8 n -- n )
+: KIND-AT ( ^VEC:vector<MODEL:local-record> ^u8 n -- n )
    FIND MATCH option
       none OF MISSING ENDOF
       some OF RECORD-OBSERVATION KIND ENDOF
    ;MATCH ;
 
-: SEEN ( complete-scan ^u8 n n -- )
-   {: s:complete-scan p:^ u:n want:n :}
+: SEEN ( ^VEC:vector<MODEL:local-record> ^u8 n n -- )
+   {: s p:^ u:n want:n :}
    s p u KIND-AT want T= ;
 
 \ Rust's scanned_content: a present file's content hash, else empty.
-: SCANNED-CONTENT ( complete-scan ^u8 n -- ^u8 n )
+: SCANNED-CONTENT ( ^VEC:vector<MODEL:local-record> ^u8 n -- ^u8 n )
    FIND MATCH option
       none OF s" " ENDOF
       some OF RECORD-OBSERVATION MATCH MODEL:observation
@@ -562,10 +646,11 @@ FS:PATHZ-CAP BUFFER: LOG-AT
 
 \ Rust's observed_paths refuses a path published twice; the observations
 \ are also in strictly increasing byte order.
-: ORDERED ( complete-scan -- )
-   SCAN-OBSERVATIONS {: v :}
+: ORDERED ( ^VEC:vector<MODEL:local-record> -- )
+   {: v :}
    true v VEC:COUNT 1 max 1 ?do
-      v i 1- VEC:AT OBSERVATION-PATH@ >str v i VEC:AT OBSERVATION-PATH@ >str STR< and
+      v i 1- VEC:AT @ OBSERVATION-PATH >str
+      v i VEC:AT @ OBSERVATION-PATH >str STR< and
    loop TTRUE ;
 
 : SAME-RECORDS
@@ -581,16 +666,29 @@ FS:PATHZ-CAP BUFFER: LOG-AT
       y RECORD-CONTENT DROPBOX:HASH>STR str> T$=
    loop ;
 
+\ Whether the hash records hold one at the path.
+: HOLDS? ( ^VEC:vector<MODEL:hash-record> ^u8 n -- bool )
+   {: v p:^ u:n :}
+   false v VEC:COUNT 0 ?do
+      v i VEC:AT @ RECORD-PATH p u STR= or
+   loop ;
+
 \ ---- cases
 
 : SCAN-PUBLISHES-EMPTY-AND-NESTED-DIRECTORIES ( -- )
    s" scan_publishes_empty_and_nested_directories" T-LABEL
    s" parent" MKDIR s" parent/child" MKDIR s" empty" MKDIR
-   ROOT-SCAN {: s:complete-scan :}
+   ROOT-SCAN {: s :}
    s ORDERED
    s s" empty" DIRECTORY SEEN
    s s" parent" DIRECTORY SEEN
    s s" parent/child" DIRECTORY SEEN ;
+
+: REMOVED-DURING-HASHING ( JOURNAL:scan -- JOURNAL:scan )
+   NO-CUTOFF ENUMERATE {: ps:pending-scan :}
+   s" nested/a-missing" REMOVE s" nested/b-missing" REMOVE
+   s" nested" FORCE-CHANGED
+   ps FINISH-SCAN ;
 
 : FILES-REMOVED-DURING-HASHING-PUBLISH-AN-INCOMPLETE-DIRECTORY ( -- )
    s" files_removed_during_hashing_publish_an_incomplete_directory" T-LABEL
@@ -598,10 +696,7 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    s" kept" s" kept" WRITE
    s" nested/a-missing" s" a" WRITE
    s" nested/b-missing" s" b" WRITE
-   NO-CACHE NO-CUTOFF ENUMERATE {: ps:pending-scan :}
-   s" nested/a-missing" REMOVE s" nested/b-missing" REMOVE
-   s" nested" FORCE-CHANGED
-   ps FINISH-SCAN {: s:complete-scan :}
+   [: REMOVED-DURING-HASHING ;] SCANNED {: s :}
    s ORDERED
    s s" nested" INCOMPLETE SEEN
    s s" nested/a-missing" MISSING SEEN
@@ -609,68 +704,81 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    s s" kept" PRESENT SEEN
    s PUBLISHED 2 T= ;
 
+: LOCKED-AFTER-ENUMERATION ( JOURNAL:scan -- JOURNAL:scan )
+   NO-CUTOFF ENUMERATE {: ps:pending-scan :}
+   s" locked.txt" DENY
+   ps FINISH-SCAN ;
+
 : FILE-LOCKED-AFTER-ENUMERATION-IS-INACCESSIBLE ( -- )
    s" file_locked_after_enumeration_is_inaccessible" T-LABEL
    s" locked.txt" s" locked" WRITE
    s" stable.txt" s" stable" WRITE
-   NO-CACHE NO-CUTOFF ENUMERATE {: ps:pending-scan :}
-   s" locked.txt" DENY
-   ps FINISH-SCAN {: s:complete-scan :}
+   [: LOCKED-AFTER-ENUMERATION ;] SCANNED {: s :}
    s s" locked.txt" INACCESSIBLE SEEN
    s s" stable.txt" PRESENT SEEN ;
 
-\ The half without the journal: the first scan's reusable hashes stand for
-\ the cache it would publish, and the check that a failed scan leaves the
-\ published inventory and cache alone is JOURNAL's. The throw carries no
-\ path; only the root's change escapes FINISH-SCAN.
+: ROOT-CHANGED-AFTER-ENUMERATION ( JOURNAL:scan -- JOURNAL:scan )
+   STABLE ENUMERATE {: ps:pending-scan :}
+   s" a-missing" REMOVE
+   ps FINISH-SCAN ;
+
+\ The second scan reuses the cache the first published. The check that
+\ a failed scan leaves the published inventory and cache alone is
+\ JOURNAL's. The throw carries no path; only the root's change escapes
+\ the finish.
 : CHANGED-ROOT-FAILS-THE-SCAN-AND-PRESERVES-THE-PUBLICATION ( -- )
    s" changed_root_fails_the_scan_and_preserves_the_publication" T-LABEL
    s" kept" s" kept" WRITE
-   NO-CACHE STABLE [: STABLE ;] CACHED-SCAN REUSABLE {: cache :}
+   STABLE [: STABLE ;] CACHED-SCAN drop
    s" a-missing" s" a" WRITE
-   cache STABLE ENUMERATE {: ps:pending-scan :}
-   s" a-missing" REMOVE
-   [: ps FINISH-SCAN drop ;] E-CHANGED TTHROWSQ ;
+   [: [: ROOT-CHANGED-AFTER-ENUMERATION ;] SCANNED drop ;]
+   E-CHANGED TTHROWSQ ;
 
-: ENUMERATE-SCAN-ACROSS-DEVICES ( ^u8 n ^ARENA:arena -- pending-scan )
+: ENUMERATE-SCAN-ACROSS-DEVICES
+   ( JOURNAL:scan ^u8 n ^ARENA:arena -- JOURNAL:scan pending-scan )
    {: p:^ u:n ar:^ARENA:arena :}
-   p u ar KEEP ar NEW-ENTRIES {: root:str en:scan-entries :}
+   p u ar KEEP {: root:str :}
    p u s" open sync root for scan" OPEN-ABSOLUTE-DIRECTORY {: rfd:fd :}
    rfd p u ROOT-STAT {: before:MODEL:stat :}
-   root en rfd before ar [type] MODEL:hash-record NEW-VEC NO-CUTOFF
-   before STAT-DEV 1 xor ar ENUMERATE-SCAN-ON-DEVICE ;
+   root rfd before NO-CUTOFF before STAT-DEV 1 xor ar
+   ENUMERATE-SCAN-ON-DEVICE ;
+
+: SCANNED-ACROSS-DEVICES ( JOURNAL:scan -- JOURNAL:scan )
+   ROOT$ AR @ ENUMERATE-SCAN-ACROSS-DEVICES FINISH-SCAN ;
 
 : OBJECTS-ON-ANOTHER-DEVICE-ARE-UNSUPPORTED-AND-UNSCANNED ( -- )
    s" objects_on_another_device_are_unsupported_and_unscanned" T-LABEL
    s" volume" MKDIR
    s" volume/inside.txt" s" inside" WRITE
    s" outside.txt" s" outside" WRITE
-   ROOT$ AR @ ENUMERATE-SCAN-ACROSS-DEVICES FINISH-SCAN
-   {: across:complete-scan :}
+   [: SCANNED-ACROSS-DEVICES ;] SCANNED {: across :}
    across ORDERED
    across s" volume" UNSUPPORTED-KIND SEEN
    across s" outside.txt" UNSUPPORTED-KIND SEEN
    across s" volume/inside.txt" MISSING SEEN
    across PUBLISHED 2 T=
-   across REUSABLE VEC:COUNT 0 T=
-   ROOT-SCAN {: same:complete-scan :}
+   REUSABLE VEC:COUNT 0 T=
+   ROOT-SCAN {: same :}
    same s" volume" DIRECTORY SEEN
    same s" volume/inside.txt" PRESENT SEEN
    same s" outside.txt" PRESENT SEEN
    same PUBLISHED 3 T= ;
 
+: CHANGED-AFTER-ENUMERATION ( JOURNAL:scan -- JOURNAL:scan )
+   STABLE ENUMERATE {: ps:pending-scan :}
+   JOURNAL:SCAN-COUNTS {: jobs:n cached:n :}
+   jobs 2 T= cached 1 T=
+   s" cached" s" changed after enumeration" WRITE
+   s" hashing" s" also changed" WRITE
+   ps FINISH-SCAN ;
+
 : CHANGING-FILES-ARE-UNKNOWN-WITHOUT-HIDING-STABLE-FILES ( -- )
    s" changing_files_are_unknown_without_hiding_stable_files" T-LABEL
    s" cached" s" before" WRITE
-   NO-CACHE NO-CUTOFF [: STABLE ;] CACHED-SCAN REUSABLE {: cache :}
+   NO-CUTOFF [: STABLE ;] CACHED-SCAN drop
    s" hashing" s" before" WRITE
    s" stable" s" stable" WRITE
-   cache STABLE ENUMERATE {: ps:pending-scan :}
-   ps PENDING-ENTRIES JOBS VEC:COUNT 2 T=
-   ps PENDING-ENTRIES CACHED VEC:COUNT 1 T=
-   s" cached" s" changed after enumeration" WRITE
-   s" hashing" s" also changed" WRITE
-   ps FINISH-SCAN {: s:complete-scan :}
+   [: CHANGED-AFTER-ENUMERATION ;] SCANNED {: s :}
    s s" cached" INCOMPLETE SEEN
    s s" hashing" INCOMPLETE SEEN
    s s" stable" PRESENT SEEN ;
@@ -678,24 +786,27 @@ FS:PATHZ-CAP BUFFER: LOG-AT
 : UNCHANGED-SCAN-FILE-REUSES-CACHED-HASH-WITHOUT-READING-BYTES ( -- )
    s" unchanged_scan_file_reuses_cached_hash_without_reading_bytes" T-LABEL
    s" cached.txt" s" bytes that would hash differently" WRITE
-   s" cached.txt" s" cached.txt" FINGERPRINT-AT ZEROS TEST-CACHE {: cache :}
-   ROOT$ cache STABLE AR @ SCAN-WITH-CACHE-AT {: s:complete-scan :}
-   s s" cached.txt" SCANNED-CONTENT ZEROS T$= ;
+   s" cached.txt" s" cached.txt" FINGERPRINT-AT ZEROS TEST-CACHE SEED
+   STABLE SCAN-AT s" cached.txt" SCANNED-CONTENT ZEROS T$= ;
 
-\ The half without the journal: the first scan's reusable hashes stand for
-\ the cache JOURNAL would store and answer in path-byte order.
+: ALL-CACHED ( JOURNAL:scan -- JOURNAL:scan )
+   STABLE ENUMERATE {: ps:pending-scan :}
+   JOURNAL:SCAN-COUNTS {: jobs:n cached:n :}
+   jobs 0 T= cached 2 T=
+   ps RELEASE ;
+
+\ The cache the first scan published, which JOURNAL answers in
+\ path-byte order, is the one the enumeration reuses and the next scan
+\ publishes.
 : FILE-BESIDE-A-SAME-NAMED-DIRECTORY-KEEPS-ITS-CACHED-HASH ( -- )
    s" file_beside_a_same_named_directory_keeps_its_cached_hash" T-LABEL
    s" x" MKDIR
    s" x.txt" s" beside the directory" WRITE
    s" x/y.txt" s" under the directory" WRITE
-   NO-CACHE NO-CUTOFF [: STABLE ;] CACHED-SCAN REUSABLE {: cache :}
+   NO-CUTOFF [: STABLE ;] CACHED-SCAN drop REUSABLE {: cache :}
    cache VEC:COUNT 2 T=
-   cache STABLE ENUMERATE {: ps:pending-scan :}
-   ps PENDING-ENTRIES JOBS VEC:COUNT 0 T=
-   ps PENDING-ENTRIES CACHED VEC:COUNT 2 T=
-   ps RELEASE
-   NO-CACHE NO-CUTOFF [: STABLE ;] CACHED-SCAN REUSABLE cache SAME-RECORDS ;
+   [: ALL-CACHED ;] SCANNED drop
+   NO-CUTOFF [: STABLE ;] CACHED-SCAN drop REUSABLE cache SAME-RECORDS ;
 
 : RECENT-CACHE-ENTRY-IS-REHASHED-AND-OMITTED ( -- )
    s" recent_cache_entry_is_rehashed_and_omitted" T-LABEL
@@ -703,10 +814,10 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    s" recent.txt" FINGERPRINT-AT {: f:MODEL:fingerprint :}
    f MODEL-FINGERPRINT:UNMAKE {: i sz ms mn cs cn :}
    ms mn CUTOFF-MAKE OPTION:SOME {: cut:option<cutoff> :}
-   s" recent.txt" f ZEROS TEST-CACHE cut [: NO-CUTOFF ;] CACHED-SCAN
-   {: s:complete-scan :}
+   s" recent.txt" f ZEROS TEST-CACHE SEED
+   cut [: NO-CUTOFF ;] CACHED-SCAN {: s :}
    s s" recent.txt" SCANNED-CONTENT s" actual bytes" IDENTITY T$=
-   s REUSABLE VEC:COUNT 0 T= ;
+   REUSABLE VEC:COUNT 0 T= ;
 
 \ The fingerprint with the field at idx flipped in its lowest bit.
 : FLIPPED ( MODEL:fingerprint n -- MODEL:fingerprint )
@@ -725,8 +836,8 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    s" changed.txt" s" actual bytes" WRITE
    s" changed.txt" FINGERPRINT-AT {: f:MODEL:fingerprint :}
    6 0 ?do
-      s" changed.txt" f i FLIPPED ZEROS TEST-CACHE {: cache :}
-      ROOT$ cache STABLE AR @ SCAN-WITH-CACHE-AT
+      s" changed.txt" f i FLIPPED ZEROS TEST-CACHE SEED
+      STABLE SCAN-AT
       s" changed.txt" SCANNED-CONTENT s" actual bytes" IDENTITY T$=
    loop ;
 
@@ -735,25 +846,24 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    {: p:MODEL:path f:MODEL:fingerprint c:DROPBOX:hash :}
    p f ZEROS >str DROPBOX:>HASH MODEL-HASH--RECORD:MAKE ;
 
-\ The half without the journal: a stored row with a device and its JSON
-\ are JOURNAL's and MODEL's; here the first scan's record, its content
-\ replaced by one only the cache could supply, is reused.
+\ A stored row with a device and its JSON are JOURNAL's and MODEL's;
+\ here the hash the first scan published, its content replaced by one
+\ only the cache could supply, is reused.
 : CACHED-HASH-WITH-A-STORED-DEVICE-IS-REUSED ( -- )
    s" cached_hash_with_a_stored_device_is_reused" T-LABEL
    s" kept.txt" s" actual bytes" WRITE
-   NO-CACHE NO-CUTOFF [: STABLE ;] CACHED-SCAN REUSABLE {: first :}
+   NO-CUTOFF [: STABLE ;] CACHED-SCAN drop REUSABLE {: first :}
    first VEC:COUNT 1 T=
    NO-CACHE {: cache :}
    first 0 VEC:AT @ ZEROED cache VEC:PUSH !
-   cache STABLE [: STABLE ;] CACHED-SCAN
+   cache SEED
+   STABLE [: STABLE ;] CACHED-SCAN
    s" kept.txt" SCANNED-CONTENT ZEROS T$= ;
 
-\ The half without the journal: the scan's reusable hashes are the cache
-\ the publication stores.
 : SCAN-PUBLICATION-USES-COMPLETION-CUTOFF-FOR-NEW-HASHES ( -- )
    s" scan_publication_uses_completion_cutoff_for_new_hashes" T-LABEL
    s" slow.txt" s" newly hashed" WRITE
-   NO-CACHE NO-CUTOFF [: STABLE ;] CACHED-SCAN REUSABLE VEC:COUNT 1 T= ;
+   NO-CUTOFF [: STABLE ;] CACHED-SCAN drop REUSABLE VEC:COUNT 1 T= ;
 
 : EXCLUDED-TREE ( -- )
    s" kept.txt" s" kept" WRITE
@@ -762,35 +872,31 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    s" ~$private/child.txt" s" private" WRITE
    s" missing" >str s" .dropbox" AT >str FS:MAKE-SYMLINK ;
 
-\ The half without the journal: the scan's reusable hashes are the cache
-\ the publication stores.
 : EXCLUDED-ENTRIES-ARE-NOT-OPENED-HASHED-OR-PUBLISHED ( -- )
    s" excluded_entries_are_not_opened_hashed_or_published" T-LABEL
    EXCLUDED-TREE
    s" ~$private" DENY
-   [: NO-CACHE STABLE [: STABLE ;] CACHED-SCAN ;]
-   [: s" ~$private" ALLOW ;] finally {: s:complete-scan :}
+   [: STABLE [: STABLE ;] CACHED-SCAN ;]
+   [: s" ~$private" ALLOW ;] finally {: s :}
    s PUBLISHED 1 T=
    s s" kept.txt" PRESENT SEEN
-   s REUSABLE VEC:COUNT 1 T=
+   REUSABLE VEC:COUNT 1 T=
    s" .DS_Store" CONTENT-OF s" Finder metadata" T$=
    s" ~$private/child.txt" CONTENT-OF s" private" T$=
    s" .dropbox" LINK-OF s" missing" T$= ;
 
+\ The second scan reuses the cache the first published.
 : LINKED-OUTSIDE ( -- )
    s" kept.txt" s" kept" WRITE
-   NO-CACHE STABLE [: STABLE ;] CACHED-SCAN REUSABLE {: cache :}
+   STABLE [: STABLE ;] CACHED-SCAN drop REUSABLE {: cache :}
    cache VEC:COUNT 1 T=
    OUTSIDE$ >str s" unsupported-link" AT >str FS:MAKE-SYMLINK
-   cache STABLE [: STABLE ;] CACHED-SCAN {: s:complete-scan :}
+   STABLE [: STABLE ;] CACHED-SCAN {: s :}
    s s" unsupported-link" UNSUPPORTED-KIND SEEN
    s s" kept.txt" PRESENT SEEN
    s PUBLISHED 2 T=
-   s REUSABLE VEC:COUNT 1 T= ;
+   REUSABLE VEC:COUNT 1 T= ;
 
-\ The half without the journal: the first scan's reusable hashes stand for
-\ the cache it would publish, and the second's observations and reusable
-\ hashes for the inventory and cache it publishes.
 : SYMLINK-IS-PUBLISHED-AS-UNSUPPORTED-BESIDE-A-SYNCHRONIZED-FILE ( -- )
    s" symlink_is_published_as_unsupported_beside_a_synchronized_file"
    T-LABEL
@@ -802,7 +908,7 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    s" regular.txt" TARGET-AT >str s" link" AT >str FS:MAKE-SYMLINK
    s" fifo" AT >str FS:>PATHZ MODE-0600 MKFIFO-CALL 0 T=
    s" socket" AT TEST-CLIENT:SOCKET-AT {: sock:fd :}
-   [: ROOT-SCAN ;] [: sock DISCARD ;] finally {: s:complete-scan :}
+   [: ROOT-SCAN ;] [: sock DISCARD ;] finally {: s :}
    s s" fifo" UNSUPPORTED-KIND SEEN
    s s" link" UNSUPPORTED-KIND SEEN
    s s" socket" UNSUPPORTED-KIND SEEN
@@ -814,7 +920,7 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    s" locked.txt" s" locked" WRITE
    s" open.txt" s" open" WRITE
    s" locked.txt" DENY
-   ROOT-SCAN {: s:complete-scan :}
+   ROOT-SCAN {: s :}
    s s" locked.txt" INACCESSIBLE SEEN
    s s" open.txt" PRESENT SEEN
    s PUBLISHED 2 T= ;
@@ -866,7 +972,7 @@ variable CAUGHT
    s" locked/secret.txt" s" secret" WRITE
    s" open.txt" s" open" WRITE
    s" locked" DENY
-   [: ROOT-SCAN ;] [: s" locked" ALLOW ;] finally {: s:complete-scan :}
+   [: ROOT-SCAN ;] [: s" locked" ALLOW ;] finally {: s :}
    s s" locked" INACCESSIBLE SEEN
    s s" locked/secret.txt" MISSING SEEN
    s s" earlier" DIRECTORY SEEN
@@ -874,14 +980,17 @@ variable CAUGHT
    s s" open.txt" PRESENT SEEN
    s PUBLISHED 4 T= ;
 
+: APPEARED-AFTER-ENUMERATION ( JOURNAL:scan -- JOURNAL:scan )
+   NO-CUTOFF ENUMERATE {: ps:pending-scan :}
+   s" nested/appeared" s" new" WRITE
+   ps FINISH-SCAN ;
+
 : DIRECTORY-CHANGED-DURING-THE-SCAN-HIDES-ITS-CONTENTS ( -- )
    s" directory_changed_during_the_scan_hides_its_contents" T-LABEL
    s" nested" MKDIR
    s" nested/file" s" bytes" WRITE
    s" stable.txt" s" stable" WRITE
-   NO-CACHE NO-CUTOFF ENUMERATE {: ps:pending-scan :}
-   s" nested/appeared" s" new" WRITE
-   ps FINISH-SCAN {: s:complete-scan :}
+   [: APPEARED-AFTER-ENUMERATION ;] SCANNED {: s :}
    s s" nested" INCOMPLETE SEEN
    s s" nested/file" MISSING SEEN
    s s" nested/appeared" MISSING SEEN
@@ -894,6 +1003,16 @@ variable CAUGHT
    {: p:^ u:n :}
    s" elsewhere" >str p u AT >str FS:MAKE-SYMLINK ;
 
+\ Replaces the enumerated "outer/swapped" with what put makes there.
+: SWAPPED-AFTER-ENUMERATION
+   ( JOURNAL:scan [ ^u8 n -- ] -- JOURNAL:scan )
+   {: put :}
+   NO-CUTOFF ENUMERATE {: ps:pending-scan :}
+   s" outer/swapped/inside.txt" REMOVE
+   s" outer/swapped" AT >str FS:REMOVE-DIR
+   s" outer/swapped" put execute
+   ps FINISH-SCAN ;
+
 \ Replaces an enumerated directory with what put makes at its name. The
 \ reopen fails ENOTDIR or ELOOP, which the scan owes that one path; the
 \ removal changed the parent, which carries the reason, so the whole
@@ -904,11 +1023,7 @@ variable CAUGHT
    s" outer/swapped/inside.txt" s" inside" WRITE
    s" outer/sibling.txt" s" sibling" WRITE
    s" kept.txt" s" kept" WRITE
-   NO-CACHE NO-CUTOFF ENUMERATE {: ps:pending-scan :}
-   s" outer/swapped/inside.txt" REMOVE
-   s" outer/swapped" AT >str FS:REMOVE-DIR
-   s" outer/swapped" put execute
-   ps FINISH-SCAN {: s:complete-scan :}
+   [: put SWAPPED-AFTER-ENUMERATION ;] SCANNED {: s :}
    s s" outer" INCOMPLETE SEEN
    s s" outer/swapped" MISSING SEEN
    s s" outer/swapped/inside.txt" MISSING SEEN
@@ -930,111 +1045,86 @@ variable CAUGHT
    s" stable.txt" s" stable" WRITE ;
 
 \ The rescan Rust's two retained-hash cases end with.
-: RESCAN-REUSES ( complete-scan -- )
-   {: s:complete-scan :}
-   s REUSABLE VEC:COUNT 2 T=
-   s REUSABLE STABLE ENUMERATE {: ps:pending-scan :}
-   ps PENDING-ENTRIES JOBS VEC:COUNT 0 T=
-   ps PENDING-ENTRIES CACHED VEC:COUNT 2 T=
-   ps RELEASE ;
+: RESCAN-REUSES ( -- )
+   REUSABLE VEC:COUNT 2 T=
+   [: ALL-CACHED ;] SCANNED drop ;
 
-\ The half without the journal: the first scan's reusable hashes stand for
-\ the cache it would publish.
+: NESTED-CHANGED-AFTER-ENUMERATION ( JOURNAL:scan -- JOURNAL:scan )
+   STABLE ENUMERATE {: ps:pending-scan :}
+   JOURNAL:SCAN-COUNTS {: jobs:n cached:n :}
+   jobs 0 T=
+   s" nested" FORCE-CHANGED
+   ps [: STABLE ;] FINISH-SCAN-AT ;
+
+\ The second scan reuses the cache the first published.
 : A-DISCARDED-SUBTREE-KEEPS-ITS-VALIDATED-HASHES ( -- )
    s" a_discarded_subtree_keeps_its_validated_hashes" T-LABEL
    NESTED-TREE
-   NO-CACHE NO-CUTOFF [: STABLE ;] CACHED-SCAN REUSABLE {: cache :}
-   cache VEC:COUNT 2 T=
-   cache STABLE ENUMERATE {: ps:pending-scan :}
-   ps PENDING-ENTRIES JOBS VEC:COUNT 0 T=
-   s" nested" FORCE-CHANGED
-   ps [: STABLE ;] FINISH-SCAN-AT {: s:complete-scan :}
+   NO-CUTOFF [: STABLE ;] CACHED-SCAN drop
+   REUSABLE VEC:COUNT 2 T=
+   [: NESTED-CHANGED-AFTER-ENUMERATION ;] SCANNED {: s :}
    s s" nested" INCOMPLETE SEEN
    s s" nested/kept.txt" MISSING SEEN
-   s RESCAN-REUSES ;
+   RESCAN-REUSES ;
 
-: NESTED? ( ^u8 n -- bool )
-   {: p:^ u:n :}
-   p u s" nested" STR= if true exit then
-   p u >str s" nested/" >str STARTS-WITH? ;
+\ What SCAN-NAME leaves when "nested" fails after its subtree was
+\ walked, which only a concurrent writer reaches through the walk.
+: NESTED-FAILED-AFTER-ENUMERATION ( JOURNAL:scan -- JOURNAL:scan )
+   STABLE ENUMERATE {: ps:pending-scan :}
+   JOURNAL:SCAN-COUNTS {: jobs:n cached:n :}
+   jobs 0 T=
+   s" nested" >str JOURNAL:SCAN-DISCARD
+   s" nested" >str MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN
+   ps [: STABLE ;] FINISH-SCAN-AT ;
 
-\ Moves the cached hashes beneath "nested" to retained.
-: RETAIN-NESTED ( scan-entries -- )
-   {: en:scan-entries :}
-   en SCAN-ENTRIES-UNMAKE {: o c r d j :}
-   AR @ [type] MODEL:hash-record NEW-VEC {: kept :}
-   c VEC:COUNT 0 ?do
-      c i VEC:AT @ {: x:MODEL:hash-record :}
-      x RECORD-PATH NESTED? if x r VEC:PUSH ! else x kept VEC:PUSH ! then
-   loop
-   r VEC:COUNT 1 T=
-   c 0 VEC:RESIZE
-   kept VEC:COUNT 0 ?do kept i VEC:AT @ c VEC:PUSH ! loop ;
-
-\ Drops the observations and directories at or beneath "nested".
-: DROP-NESTED ( scan-entries -- )
-   {: en:scan-entries :}
-   en SCAN-ENTRIES-UNMAKE {: o c r d j :}
-   AR @ [type] MODEL:local-record NEW-VEC {: seen :}
-   o VEC:COUNT 0 ?do
-      o i VEC:AT @ {: x:MODEL:local-record :}
-      x OBSERVATION-PATH NESTED? 0= if x seen VEC:PUSH ! then
-   loop
-   o 0 VEC:RESIZE
-   seen VEC:COUNT 0 ?do seen i VEC:AT @ o VEC:PUSH ! loop
-   AR @ [type] scanned-directory NEW-VEC {: kept :}
-   d VEC:COUNT 0 ?do
-      d i VEC:AT @ {: x:scanned-directory :}
-      x SCANNED-DIRECTORY-UNMAKE {: p:str b:MODEL:stat :}
-      p str> NESTED? 0= if x kept VEC:PUSH ! then
-   loop
-   d 0 VEC:RESIZE
-   kept VEC:COUNT 0 ?do kept i VEC:AT @ d VEC:PUSH ! loop ;
-
-\ The half without the journal: the first scan's reusable hashes stand for
-\ the cache it would publish. The enumeration is shaped as TRUNCATE leaves
-\ it when an entry fails after its subtree was validated, which only a
-\ concurrent writer reaches through the walk.
+\ The second scan reuses the cache the first published, and publishes
+\ the cached hash beneath "nested" the discard kept.
 : HASHES-THE-WALK-RETAINED-REACH-THE-PUBLICATION ( -- )
    s" hashes_the_walk_retained_reach_the_publication" T-LABEL
    NESTED-TREE
-   NO-CACHE NO-CUTOFF [: STABLE ;] CACHED-SCAN REUSABLE {: cache :}
-   cache VEC:COUNT 2 T=
-   cache STABLE ENUMERATE {: ps:pending-scan :}
-   ps PENDING-ENTRIES {: en:scan-entries :}
-   en JOBS VEC:COUNT 0 T=
-   en RETAIN-NESTED
-   en DROP-NESTED
-   en s" nested" >str MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN
-   ps [: STABLE ;] FINISH-SCAN-AT {: s:complete-scan :}
+   NO-CUTOFF [: STABLE ;] CACHED-SCAN drop
+   REUSABLE VEC:COUNT 2 T=
+   [: NESTED-FAILED-AFTER-ENUMERATION ;] SCANNED {: s :}
+   REUSABLE s" nested/kept.txt" HOLDS? TTRUE
    s s" nested" INCOMPLETE SEEN
    s s" nested/kept.txt" MISSING SEEN
-   s RESCAN-REUSES ;
+   RESCAN-REUSES ;
 
 : TEST-RECORD ( ^u8 n DROPBOX:hash -- MODEL:hash-record )
    {: p:^ u:n c:DROPBOX:hash :}
    p u >str MODEL:>PATH 2 5 3 0 3 0 MODEL-FINGERPRINT:MAKE c
    MODEL-HASH--RECORD:MAKE ;
 
+: BEFORE-CACHED ( JOURNAL:scan MODEL:hash-record -- JOURNAL:scan )
+   RECORD-PATH s" before.txt" T$= ;
+
+\ A cached hash taken before "sub" stays to revalidate; one beneath it
+\ is kept as a published hash, and its file to hash and observations
+\ leave with it.
+: TRUNCATED ( JOURNAL:scan DROPBOX:hash -- JOURNAL:scan )
+   {: c:DROPBOX:hash :}
+   s" before.txt" c TEST-RECORD JOURNAL:SCAN-REUSE
+   s" sub" >str MODEL:>PATH DIRECTORY-OBSERVATION MODEL-LOCAL--RECORD:MAKE
+   JOURNAL:SCAN-OBSERVE
+   s" sub/kept.txt" c TEST-RECORD JOURNAL:SCAN-REUSE
+   s" sub/fresh.txt" >str 2 5 3 0 3 0 MODEL-FINGERPRINT:MAKE
+   JOURNAL:SCAN-JOB
+   s" sub" >str JOURNAL:SCAN-DISCARD
+   s" sub" >str MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN
+   JOURNAL:SCAN-COUNTS {: jobs:n cached:n :}
+   jobs 0 T= cached 1 T=
+   [: BEFORE-CACHED ;] JOURNAL:EACH-SCAN-REUSE
+   BOUND @ JOURNAL:PUBLISH-SCAN TTRUE ;
+
+\ The cached hash still to revalidate publishes only once a finish
+\ confirms it, so the published cache holds just the kept one.
 : TRUNCATING-A-FAILED-ENTRY-KEEPS-ITS-VALIDATED-HASHES ( -- )
    s" truncating_a_failed_entry_keeps_its_validated_hashes" T-LABEL
    s" bytes" IDENTITY >str DROPBOX:>HASH {: c:DROPBOX:hash :}
-   AR @ NEW-ENTRIES {: en:scan-entries :}
-   en SCAN-ENTRIES-UNMAKE {: o cf r d j :}
-   s" before.txt" c TEST-RECORD cf VEC:PUSH !
-   en MARK {: mk:scan-mark :}
-   s" sub" >str MODEL:>PATH DIRECTORY-OBSERVATION MODEL-LOCAL--RECORD:MAKE
-   o VEC:PUSH !
-   s" sub/kept.txt" c TEST-RECORD cf VEC:PUSH !
-   s" sub/fresh.txt" >str 2 5 3 0 3 0 MODEL-FINGERPRINT:MAKE HASH-JOB-MAKE
-   j VEC:PUSH !
-   en mk TRUNCATE
-   en s" sub" >str MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN
-   cf VEC:COUNT 1 T=
-   cf 0 VEC:AT RECORD-PATH@ s" before.txt" T$=
+   [: c TRUNCATED ;] SCANNED {: o :}
+   REUSABLE {: r :}
    r VEC:COUNT 1 T=
-   r 0 VEC:AT RECORD-PATH@ s" sub/kept.txt" T$=
-   j VEC:COUNT 0 T=
+   r 0 VEC:AT @ RECORD-PATH s" sub/kept.txt" T$=
    o VEC:COUNT 1 T=
    o 0 VEC:AT @ {: x:MODEL:local-record :}
    x OBSERVATION-PATH s" sub" T$=
@@ -1264,12 +1354,6 @@ variable RAISED-ERRNO
 
 : STAND-IN$ ( -- ^u8 n ) s" /sys/class/mem" ;
 
-\ Runs the action on a journal opened in the case's root, then closes it.
-: WITH-JOURNAL ( [ JOURNAL:journal -- ] -- )
-   {: q :}
-   s" journal.sqlite3" AT AR @ KEEP JOURNAL:OPEN {: j :}
-   [: j q execute ;] [: j JOURNAL:CLOSE ;] finally ;
-
 \ Activates the directory at the name below the case's root.
 : ACTIVATE ( JOURNAL:journal ^u8 n -- )
    {: j p:^ u:n :}
@@ -1283,12 +1367,6 @@ variable RAISED-ERRNO
    STAND-IN$ >str 1
    1700000000 5 JOURNAL-BIRTH--TIME:MAKE OPTION:SOME NO-SUBVOLUME
    JOURNAL-LOCAL--ROOT--BINDING:MAKE ;
-
-: ROOT-CHANGED? ( scan-publication -- bool )
-   MATCH scan-publication
-      published OF drop false ENDOF
-      root-changed OF true ENDOF
-   ;MATCH ;
 
 : NO-ROOT? ( option<fd> -- bool )
    MATCH option
@@ -1369,39 +1447,49 @@ variable RAISED-ERRNO
    [: OPENS-ONLY-THE-ACTIVE-ROOT ;] WITH-JOURNAL ;
 
 : CASES ( -- )
-   [: SCAN-PUBLISHES-EMPTY-AND-NESTED-DIRECTORIES ;] IN-CASE
+   [: SCAN-PUBLISHES-EMPTY-AND-NESTED-DIRECTORIES ;] IN-SCAN-CASE
    [: FILES-REMOVED-DURING-HASHING-PUBLISH-AN-INCOMPLETE-DIRECTORY ;]
-   IN-CASE
-   [: FILE-LOCKED-AFTER-ENUMERATION-IS-INACCESSIBLE ;] IN-CASE
-   [: CHANGED-ROOT-FAILS-THE-SCAN-AND-PRESERVES-THE-PUBLICATION ;] IN-CASE
-   [: OBJECTS-ON-ANOTHER-DEVICE-ARE-UNSUPPORTED-AND-UNSCANNED ;] IN-CASE
-   [: CHANGING-FILES-ARE-UNKNOWN-WITHOUT-HIDING-STABLE-FILES ;] IN-CASE
+   IN-SCAN-CASE
+   [: FILE-LOCKED-AFTER-ENUMERATION-IS-INACCESSIBLE ;] IN-SCAN-CASE
+   [: CHANGED-ROOT-FAILS-THE-SCAN-AND-PRESERVES-THE-PUBLICATION ;]
+   IN-SCAN-CASE
+   [: OBJECTS-ON-ANOTHER-DEVICE-ARE-UNSUPPORTED-AND-UNSCANNED ;]
+   IN-SCAN-CASE
+   [: CHANGING-FILES-ARE-UNKNOWN-WITHOUT-HIDING-STABLE-FILES ;]
+   IN-SCAN-CASE
    [: UNCHANGED-SCAN-FILE-REUSES-CACHED-HASH-WITHOUT-READING-BYTES ;]
-   IN-CASE
-   [: FILE-BESIDE-A-SAME-NAMED-DIRECTORY-KEEPS-ITS-CACHED-HASH ;] IN-CASE
-   [: RECENT-CACHE-ENTRY-IS-REHASHED-AND-OMITTED ;] IN-CASE
-   [: EVERY-FINGERPRINT-FIELD-MISMATCH-REHASHES-THE-FILE ;] IN-CASE
-   [: CACHED-HASH-WITH-A-STORED-DEVICE-IS-REUSED ;] IN-CASE
-   [: SCAN-PUBLICATION-USES-COMPLETION-CUTOFF-FOR-NEW-HASHES ;] IN-CASE
-   [: EXCLUDED-ENTRIES-ARE-NOT-OPENED-HASHED-OR-PUBLISHED ;] IN-CASE
+   IN-SCAN-CASE
+   [: FILE-BESIDE-A-SAME-NAMED-DIRECTORY-KEEPS-ITS-CACHED-HASH ;]
+   IN-SCAN-CASE
+   [: RECENT-CACHE-ENTRY-IS-REHASHED-AND-OMITTED ;] IN-SCAN-CASE
+   [: EVERY-FINGERPRINT-FIELD-MISMATCH-REHASHES-THE-FILE ;] IN-SCAN-CASE
+   [: CACHED-HASH-WITH-A-STORED-DEVICE-IS-REUSED ;] IN-SCAN-CASE
+   [: SCAN-PUBLICATION-USES-COMPLETION-CUTOFF-FOR-NEW-HASHES ;]
+   IN-SCAN-CASE
+   [: EXCLUDED-ENTRIES-ARE-NOT-OPENED-HASHED-OR-PUBLISHED ;]
+   IN-SCAN-CASE
    [: SYMLINK-IS-PUBLISHED-AS-UNSUPPORTED-BESIDE-A-SYNCHRONIZED-FILE ;]
-   IN-CASE
-   [: SPECIAL-ENTRIES-ARE-PUBLISHED-AS-UNSUPPORTED ;] IN-CASE
-   [: INACCESSIBLE-FILE-IS-UNKNOWN-BESIDE-A-READABLE-FILE ;] IN-CASE
+   IN-SCAN-CASE
+   [: SPECIAL-ENTRIES-ARE-PUBLISHED-AS-UNSUPPORTED ;] IN-SCAN-CASE
+   [: INACCESSIBLE-FILE-IS-UNKNOWN-BESIDE-A-READABLE-FILE ;]
+   IN-SCAN-CASE
    [: UNREADABLE-REGULAR-FILE-IS-REPORTED-AS-UNREADABLE ;] IN-CASE
    [: UNSEARCHABLE-PARENT-IS-AN-IO-FAILURE ;] IN-CASE
-   [: INACCESSIBLE-DIRECTORY-PUBLISHES-NOTHING-BENEATH-ITSELF ;] IN-CASE
-   [: DIRECTORY-CHANGED-DURING-THE-SCAN-HIDES-ITS-CONTENTS ;] IN-CASE
-   [: A-DIRECTORY-REPLACED-BY-A-FILE-IS-INCOMPLETE ;] IN-CASE
-   [: A-DIRECTORY-REPLACED-BY-A-SYMLINK-IS-INCOMPLETE ;] IN-CASE
-   [: A-DISCARDED-SUBTREE-KEEPS-ITS-VALIDATED-HASHES ;] IN-CASE
-   [: HASHES-THE-WALK-RETAINED-REACH-THE-PUBLICATION ;] IN-CASE
+   [: INACCESSIBLE-DIRECTORY-PUBLISHES-NOTHING-BENEATH-ITSELF ;]
+   IN-SCAN-CASE
+   [: DIRECTORY-CHANGED-DURING-THE-SCAN-HIDES-ITS-CONTENTS ;]
+   IN-SCAN-CASE
+   [: A-DIRECTORY-REPLACED-BY-A-FILE-IS-INCOMPLETE ;] IN-SCAN-CASE
+   [: A-DIRECTORY-REPLACED-BY-A-SYMLINK-IS-INCOMPLETE ;] IN-SCAN-CASE
+   [: A-DISCARDED-SUBTREE-KEEPS-ITS-VALIDATED-HASHES ;] IN-SCAN-CASE
+   [: HASHES-THE-WALK-RETAINED-REACH-THE-PUBLICATION ;] IN-SCAN-CASE
    [: SCAN-OF-A-STAND-IN-PUBLISHES-NOTHING ;] IN-CASE
    [: UNCHANGED-TREE-BESIDE-A-SAME-NAMED-DIRECTORY-REPUBLISHES-NOTHING ;]
    IN-CASE
    [: SWITCHING-LOCAL-ROOT-CLEARS-THE-HASH-CACHE ;] IN-CASE
    [: ONLY-THE-ACTIVE-ROOT-OPENS ;] IN-CASE
-   TRUNCATING-A-FAILED-ENTRY-KEEPS-ITS-VALIDATED-HASHES
+   [: TRUNCATING-A-FAILED-ENTRY-KEEPS-ITS-VALIDATED-HASHES ;]
+   IN-SCAN-CASE
    [: ONLY-EXHAUSTION-ESCAPES-A-FAILURE-RAISED-AGAINST-ONE-ENTRY ;]
    IN-CASE
    [: DENIED-WRITE-GIVES-ITS-DIRECTORY-AND-ENTRY ;] IN-CASE

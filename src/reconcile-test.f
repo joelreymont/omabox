@@ -4799,7 +4799,9 @@ $1C0 constant OWNER-ACCESS
    {: x :}
    x RUN-JOURNAL @ x ROOT$ x RUN-ARENA @ LOCAL:SCAN-AND-PUBLISH
    MATCH LOCAL:scan-publication
-      published OF LOCAL:SCAN-OBSERVATIONS ENDOF
+      published OF
+         x RUN-JOURNAL @ x RUN-ARENA @ JOURNAL:LOCAL-INVENTORY
+      ENDOF
       root-changed OF
          s" the stable fixture changed its root" FAILED
       ENDOF

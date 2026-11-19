@@ -3703,7 +3703,10 @@ ENUM pass-state DERIVE eq
 : SCAN-OBSERVED ( LOCAL:scan-publication ^pass -- pass-event )
    {: x :}
    MATCH LOCAL:scan-publication
-      published OF LOCAL:SCAN-OBSERVATIONS {: records :}
+      published OF
+         x PASS-RUN @ {: r :}
+         r RUN-JOURNAL @ r RUN-ARENA @ JOURNAL:LOCAL-INVENTORY
+         {: records :}
          records x PASS-RECORDS !
          x RESOLVED SCAN-SETTLED
       ENDOF
