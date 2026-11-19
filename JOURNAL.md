@@ -2018,3 +2018,39 @@ Drop calls freeaddrinfo, so a panic or an early `?` return frees it on
 the way out. Habu's throw runs no destructors, so whatever a run holds
 must be released by the catch, and listing what a run holds is the
 agent's job.
+
+## 2026-11-19: a fallback the throw had overwritten
+
+Moving Omabox to Habu 528f293d stopped seven of sixteen test files at one
+word. LOCAL:CONVERTING ran a step under a catch and answered its result
+and the code it threw. Its callers passed a fallback, NO-STAT or `false`,
+which the step dropped and replaced. After a throw the caller read the
+code and ignored the result, but the cell it got back was whatever the
+throw left there, not the fallback. Habu's checker now marks every cell a
+catch held as stale after a throw, and refuses a word that hands one on
+as typed.
+
+The first fix was one generic helper, `( x [ -- x ] -- x n )`, that
+answered the fallback on the throw arm. It fit only one-cell results. A
+generic `x` in Habu is one cell, and most of these results are records,
+MODEL:stat among them at eight cells. Habu's card names the cure: do the
+work in a word whose effect names the type. So each of the twenty-two
+callers now catches in its own body and swaps in its fallback there,
+which is two lines each.
+
+Observation for the blog: Rust's `Result<Stat, Code>` makes the bad value
+unreachable, since the error arm has no stat to read. Habu reached the same
+guarantee by refusing the read, but a generic helper over any value is out
+of reach until its generics are width-generic. Rust's monomorphized
+generics give that for free. Here the agent paid for it in repetition.
+
+## 2026-11-19: a hunt in code that was being deleted
+
+A review found a defect in a `TRUSTED:` body, Habu's unchecked escape
+hatch. The agent filed it and sent a worker to find its root cause. The
+user stopped it: `TRUSTED:` is being deleted, and the question that
+mattered was whether its replacements had the same defect. They did not.
+
+Observation for the blog: an agent's attention follows the code in front
+of it, not the project's plans. The tracker held a dot retiring that
+machinery. Checking the tracker before a hunt now comes first.
