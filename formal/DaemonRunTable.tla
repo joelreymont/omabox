@@ -1,6 +1,6 @@
 ---- MODULE DaemonRunTable ----
 \* The lines of DAEMON-RUN, src/daemon.f, as <<state, input,
-\* next state>>. TEST-FORMAL:HOLDS fails unless this file is that table.
+\* next state>>. A test fails unless this file is that table.
 Lines == {
     <<"preparing", "ok", "locking">>,
     <<"preparing", "retry", "preparing">>,

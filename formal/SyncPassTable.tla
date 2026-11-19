@@ -1,6 +1,6 @@
 ---- MODULE SyncPassTable ----
 \* The lines of SYNC-PASS, src/reconcile.f, as <<state, input,
-\* next state>>. TEST-FORMAL:HOLDS fails unless this file is that table.
+\* next state>>. A test fails unless this file is that table.
 Lines == {
     <<"settling", "ok", "recovering">>,
     <<"settling", "fresh", "stale">>,

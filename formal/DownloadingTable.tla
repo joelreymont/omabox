@@ -1,6 +1,6 @@
 ---- MODULE DownloadingTable ----
 \* The lines of DOWNLOADING, src/dropbox.f, as <<state, input,
-\* next state>>. TEST-FORMAL:HOLDS fails unless this file is that table.
+\* next state>>. A test fails unless this file is that table.
 Lines == {
     <<"opened", "passed", "streaming">>,
     <<"opened", "other", "buffering">>,

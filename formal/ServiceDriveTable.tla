@@ -1,6 +1,6 @@
 ---- MODULE ServiceDriveTable ----
 \* The lines of DRIVING, src/service.f, as <<state, input,
-\* next state>>. TEST-FORMAL:HOLDS fails unless this file is that table.
+\* next state>>. A test fails unless this file is that table.
 Lines == {
     <<"initial", "observe", "seen">>,
     <<"initial", "clear", "cleared">>,
