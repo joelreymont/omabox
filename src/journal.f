@@ -1322,8 +1322,15 @@ $2F constant SLASH
    w [: o swap MODEL:LOCAL-OBSERVATION>JSON ;] ENCODE >str 2 SQLITE:BIND-TEXT
    p ar BIND-KEY RAN ;
 
-\ Binds path ?1 and hash_json ?2. A hash that is not Dropbox's is never
-\ cached.
+\ Binds path ?1 and hash_json ?2.
+: TEXT-INSERTED
+   ( SQLITE:statement MODEL:path str -- SQLITE:statement )
+   {: p:MODEL:path json:str :}
+   p PATH-BYTES >str 1 SQLITE:BIND-BLOB
+   json 2 SQLITE:BIND-TEXT RAN ;
+
+\ TEXT-INSERTED of the record as MODEL writes it. A hash that is not
+\ Dropbox's is never cached.
 : HASH-INSERTED
    ( SQLITE:statement MODEL:hash-record ^JSON:writer -- SQLITE:statement )
    {: r w :}
@@ -1332,18 +1339,31 @@ $2F constant SLASH
       s" publish local hash cache" >str p MODEL:PATH>STR
       NOT-CONTENT-HASH
    then
-   p PATH-BYTES >str 1 SQLITE:BIND-BLOB
-   w [: r swap MODEL:HASH-VALUE>JSON ;] ENCODE >str 2 SQLITE:BIND-TEXT
-   RAN ;
+   p w [: r swap MODEL:HASH-VALUE>JSON ;] ENCODE >str TEXT-INSERTED ;
 
-: JOB-INSERTED
+\ Binds the path ?1 and the fingerprint ?2 to ?7.
+: FILE-BOUND
    ( SQLITE:statement str MODEL:fingerprint -- SQLITE:statement )
    {: p:str f :}
    f MODEL-FINGERPRINT:UNMAKE {: i s ms mn cs cn :}
    p 1 SQLITE:BIND-BLOB
    i 2 SQLITE:BIND-INT  s 3 SQLITE:BIND-INT
    ms 4 SQLITE:BIND-INT  mn 5 SQLITE:BIND-INT
-   cs 6 SQLITE:BIND-INT  cn 7 SQLITE:BIND-INT RAN ;
+   cs 6 SQLITE:BIND-INT  cn 7 SQLITE:BIND-INT ;
+
+\ FILE-BOUND of the record's path and fingerprint, then its content ?8
+\ and json ?9, the text the cache stores the record as.
+: REUSE-INSERTED
+   ( SQLITE:statement MODEL:hash-record str -- SQLITE:statement )
+   {: r json:str :}
+   r MODEL-HASH--RECORD:UNMAKE {: p:MODEL:path f h :}
+   p PATH-BYTES >str f FILE-BOUND
+   h DROPBOX:HASH>STR 8 SQLITE:BIND-TEXT
+   json 9 SQLITE:BIND-TEXT RAN ;
+
+: JOB-INSERTED
+   ( SQLITE:statement str MODEL:fingerprint -- SQLITE:statement )
+   FILE-BOUND RAN ;
 
 : LISTED-INSERTED
    ( SQLITE:statement str MODEL:stat -- SQLITE:statement )
@@ -1380,16 +1400,19 @@ $2F constant SLASH
    MODEL-HASH--RECORD:MAKE ;
 
 \ The row is copied before the statement is reset, so a record that
-\ does not decode leaves the statement ready for the next lookup.
+\ does not decode leaves the statement ready for the next lookup. The
+\ record comes with the text it is stored as.
 : LOOKED-UP
    ( SQLITE:statement str ^ARENA:arena
-     -- SQLITE:statement MODEL:hash-record bool )
+     -- SQLITE:statement MODEL:hash-record str bool )
    {: p:str ar :}
    p 1 SQLITE:BIND-BLOB
-   SQLITE:STEP 0= if SQLITE:RESET NO-HASH-RECORD false exit then
+   SQLITE:STEP 0= if
+      SQLITE:RESET NO-HASH-RECORD s" " >str false exit
+   then
    0 ar PATH-COPY {: q:MODEL:path :}
    1 ar TEXT-COPY {: json:str :}
-   SQLITE:RESET q json ar HASH-OF true ;
+   SQLITE:RESET q json ar HASH-OF json true ;
 
 : LOCAL-RECORDS=
    ( ^VEC:vector<MODEL:local-record> ^VEC:vector<MODEL:local-record>
@@ -1419,8 +1442,10 @@ $2F constant SLASH
       VALUES (?1, ?2)" ;
 
 : REUSE-SCAN ( -- ^u8 n )
-   s" INSERT OR REPLACE INTO temp.scan_cached(path, hash_json)
-      VALUES (?1, ?2)" ;
+   s" INSERT OR REPLACE INTO temp.scan_cached(
+         path, inode, size, modified_seconds, modified_nanoseconds,
+         changed_seconds, changed_nanoseconds, content_hash, hash_json
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)" ;
 
 : JOB-SCAN ( -- ^u8 n )
    s" INSERT OR REPLACE INTO temp.scan_jobs(
@@ -1453,6 +1478,13 @@ $2F constant SLASH
       );
       CREATE TABLE IF NOT EXISTS temp.scan_cached(
          path BLOB PRIMARY KEY,
+         inode INTEGER NOT NULL,
+         size INTEGER NOT NULL,
+         modified_seconds INTEGER NOT NULL,
+         modified_nanoseconds INTEGER NOT NULL,
+         changed_seconds INTEGER NOT NULL,
+         changed_nanoseconds INTEGER NOT NULL,
+         content_hash TEXT NOT NULL,
          hash_json TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS temp.scan_jobs(
@@ -1576,13 +1608,39 @@ $2F constant SLASH
    c select [: visit ROWS-VISITED ;] SQLITE:WITH-STATEMENT
    c empty str> SQLITE:EXEC ;
 
-\ The statement waits on the return stack while body runs.
+\ A row of temp.scan_cached as the record its columns hold; the path
+\ and content are copied into ar.
+: REUSE-ROW
+   ( SQLITE:statement ^ARENA:arena
+     -- SQLITE:statement MODEL:hash-record )
+   {: ar :}
+   0 SQLITE:COL-BLOB str> ar BYTES-PATH {: p:MODEL:path :}
+   1 SQLITE:COL-INT {: i :}  2 SQLITE:COL-INT {: s :}
+   3 SQLITE:COL-INT {: ms :}  4 SQLITE:COL-INT {: mn :}
+   5 SQLITE:COL-INT {: cs :}  6 SQLITE:COL-INT {: cn :}
+   7 ar TEXT-COPY DROPBOX:>HASH {: h:DROPBOX:hash :}
+   p i s ms mn cs cn MODEL-FINGERPRINT:MAKE h MODEL-HASH--RECORD:MAKE ;
+
+\ Records json, the text the cache stored, as the hash at the record's
+\ path.
+: HASH-COPIED ( scan MODEL:hash-record str -- scan )
+   {: r json:str :}
+   r MODEL-HASH--RECORD:UNMAKE {: p:MODEL:path f h :}
+   SCAN-UNMAKE {: j w ar :}
+   >r >r >r >r  p json TEXT-INSERTED  r> r> r> r>
+   j w ar SCAN-MAKE ;
+
+\ The statement waits on the return stack while body runs; a hash body
+\ keeps is copied into the scan's hashes as the text the cache stored.
 : REUSE-VISITED
    ( R scan SQLITE:statement ^ARENA:arena
-     [ R scan MODEL:hash-record -- R scan ] -- R scan SQLITE:statement )
+     [ R scan MODEL:hash-record -- R scan bool ]
+     -- R scan SQLITE:statement )
    {: ar body :}
-   ar HASH-ROW {: r :}
-   >r r body execute r> ;
+   ar REUSE-ROW {: r :}
+   8 SQLITE:COL-TEXT >str {: json:str :}
+   >r r body execute r> swap
+   if >r r json HASH-COPIED r> then ;
 
 : JOB-VISITED
    ( R scan SQLITE:statement ^ARENA:arena
@@ -1717,11 +1775,13 @@ public
    r> r> r> r>
    j w ar SCAN-MAKE ;
 
-\ Records a cached hash the walk reused, replacing one at its path.
-: SCAN-REUSE ( scan MODEL:hash-record -- scan )
-   {: r :}
+\ Records a cached hash the walk reused, with json, the text the cache
+\ stores it as, replacing one at its path. Both are as CACHED-HASH
+\ answered them.
+: SCAN-REUSE ( scan MODEL:hash-record str -- scan )
+   {: r json:str :}
    SCAN-UNMAKE {: j w ar :}
-   >r >r >r  r w HASH-INSERTED  r> r> r>
+   >r >r >r  r json REUSE-INSERTED  r> r> r>
    j w ar SCAN-MAKE ;
 
 \ Records a file no cached hash covers, replacing one at its path.
@@ -1739,14 +1799,18 @@ public
    >r  p st LISTED-INSERTED  r>
    j w ar SCAN-MAKE ;
 
-\ Runs body on each reused hash in path byte order, then forgets them.
-\ The record is valid only during body, which may write the scan only
-\ through SCAN-OBSERVE and SCAN-HASH. Body reads no journal table.
+\ An EACH-SCAN word's row is valid only during body, which reads no journal
+\ table and writes the scan only through SCAN-OBSERVE and SCAN-HASH.
+
+\ Runs body on each reused hash in path byte order, then forgets them; a held
+\ one joins the scan's hashes as the text the cache stored.
 : EACH-SCAN-REUSE
-   ( R scan [ R scan MODEL:hash-record -- R scan ] -- R scan )
+   ( R scan [ R scan MODEL:hash-record -- R scan bool ] -- R scan )
    {: body :}
    [: body REUSE-VISITED ;]
-   s" SELECT path, hash_json FROM temp.scan_cached ORDER BY path" >str
+   s" SELECT path, inode, size, modified_seconds, modified_nanoseconds,
+         changed_seconds, changed_nanoseconds, content_hash, hash_json
+      FROM temp.scan_cached ORDER BY path" >str
    s" DELETE FROM temp.scan_cached" >str EACH-ROW ;
 
 \ Runs body on each file to hash in path byte order, then forgets them.
@@ -1779,13 +1843,15 @@ public
    j >CONNECTION p ar DISCARDED ar ARENA:RESET
    j w ar SCAN-MAKE ;
 
-\ The hash the active root's cache holds for the path, decoded into ar;
-\ false, with an empty record, when it holds none.
-: CACHED-HASH ( scan str ^ARENA:arena -- scan MODEL:hash-record bool )
+\ The hash the active root's cache holds for the path, decoded into ar,
+\ and the text it is stored as, copied there; false, with an empty
+\ record and text, when it holds none.
+: CACHED-HASH
+   ( scan str ^ARENA:arena -- scan MODEL:hash-record str bool )
    {: p:str ar :}
    SCAN-UNMAKE {: j w sa :}
-   p ar LOOKED-UP {: r found :}
-   j w sa SCAN-MAKE r found ;
+   p ar LOOKED-UP {: r json:str found :}
+   j w sa SCAN-MAKE r json found ;
 
 \ Makes the local inventory and the active root's hash cache the scan's
 \ in one transaction; false, nothing written, when binding is no longer

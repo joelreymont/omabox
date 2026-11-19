@@ -653,6 +653,10 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
       v i VEC:AT @ OBSERVATION-PATH >str STR< and
    loop TTRUE ;
 
+: RECORD-CONTENT ( MODEL:hash-record -- DROPBOX:hash )
+   MODEL-HASH--RECORD:UNMAKE
+   {: p:MODEL:path f:MODEL:fingerprint c:DROPBOX:hash :} c ;
+
 : SAME-RECORDS
    ( ^VEC:vector<MODEL:hash-record> ^VEC:vector<MODEL:hash-record> -- )
    {: a b :}
@@ -1067,7 +1071,7 @@ variable CAUGHT
    s s" nested/kept.txt" MISSING SEEN
    RESCAN-REUSES ;
 
-\ What SCAN-NAME leaves when "nested" fails after its subtree was
+\ What the walk leaves when "nested" fails after its subtree was
 \ walked, which only a concurrent writer reaches through the walk.
 : NESTED-FAILED-AFTER-ENUMERATION ( JOURNAL:scan -- JOURNAL:scan )
    STABLE ENUMERATE {: ps:pending-scan :}
@@ -1090,23 +1094,33 @@ variable CAUGHT
    s s" nested/kept.txt" MISSING SEEN
    RESCAN-REUSES ;
 
-: TEST-RECORD ( ^u8 n DROPBOX:hash -- MODEL:hash-record )
-   {: p:^ u:n c:DROPBOX:hash :}
-   p u >str MODEL:>PATH 2 5 3 0 3 0 MODEL-FINGERPRINT:MAKE c
-   MODEL-HASH--RECORD:MAKE ;
+: TEST-CONTENT ( -- ^u8 n )
+   s" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ;
 
-: BEFORE-CACHED ( JOURNAL:scan MODEL:hash-record -- JOURNAL:scan )
-   RECORD-PATH s" before.txt" T$= ;
+: TEST-RECORD ( ^u8 n -- MODEL:hash-record )
+   {: p:^ u:n :}
+   p u >str MODEL:>PATH 2 5 3 0 3 0 MODEL-FINGERPRINT:MAKE
+   TEST-CONTENT >str DROPBOX:>HASH MODEL-HASH--RECORD:MAKE ;
+
+\ TEST-RECORD's fingerprint and content as the cache stores them.
+: TEST-JSON ( -- str )
+   s\" {\"fingerprint\":{\"inode\":2,\"size\":5,
+      \"modified_seconds\":3,\"modified_nanoseconds\":0,
+      \"changed_seconds\":3,\"changed_nanoseconds\":0},\"content\":
+      \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}" >str ;
+
+: BEFORE-CACHED
+   ( JOURNAL:scan MODEL:hash-record -- JOURNAL:scan bool )
+   RECORD-PATH s" before.txt" T$= false ;
 
 \ A cached hash taken before "sub" stays to revalidate; one beneath it
 \ is kept as a published hash, and its file to hash and observations
 \ leave with it.
-: TRUNCATED ( JOURNAL:scan DROPBOX:hash -- JOURNAL:scan )
-   {: c:DROPBOX:hash :}
-   s" before.txt" c TEST-RECORD JOURNAL:SCAN-REUSE
+: TRUNCATED ( JOURNAL:scan -- JOURNAL:scan )
+   s" before.txt" TEST-RECORD TEST-JSON JOURNAL:SCAN-REUSE
    s" sub" >str MODEL:>PATH DIRECTORY-OBSERVATION MODEL-LOCAL--RECORD:MAKE
    JOURNAL:SCAN-OBSERVE
-   s" sub/kept.txt" c TEST-RECORD JOURNAL:SCAN-REUSE
+   s" sub/kept.txt" TEST-RECORD TEST-JSON JOURNAL:SCAN-REUSE
    s" sub/fresh.txt" >str 2 5 3 0 3 0 MODEL-FINGERPRINT:MAKE
    JOURNAL:SCAN-JOB
    s" sub" >str JOURNAL:SCAN-DISCARD
@@ -1120,8 +1134,7 @@ variable CAUGHT
 \ confirms it, so the published cache holds just the kept one.
 : TRUNCATING-A-FAILED-ENTRY-KEEPS-ITS-VALIDATED-HASHES ( -- )
    s" truncating_a_failed_entry_keeps_its_validated_hashes" T-LABEL
-   s" bytes" IDENTITY >str DROPBOX:>HASH {: c:DROPBOX:hash :}
-   [: c TRUNCATED ;] SCANNED {: o :}
+   [: TRUNCATED ;] SCANNED {: o :}
    REUSABLE {: r :}
    r VEC:COUNT 1 T=
    r 0 VEC:AT @ RECORD-PATH s" sub/kept.txt" T$=

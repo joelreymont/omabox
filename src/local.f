@@ -1000,11 +1000,12 @@ STRUCTURE scanned-hash
    FIELD reusable bool
 ;STRUCTURE
 
-\ What every step of the walk reads and none changes. A directory on a
-\ device other than root-device, the sync root's, is out of scope.
+\ The walk's settings, which no step changes: lookup holds one file's
+\ cache answer at a time, and any device but root-device is out of scope.
 STRUCTURE scan-context
    FIELD cutoff option<cutoff>
    FIELD root-device n
+   FIELD lookup ^ARENA:arena
 ;STRUCTURE
 
 \ An enumerated root whose files are still to hash; it owns root-fd.
@@ -1047,10 +1048,6 @@ private
 : RECORD-FINGERPRINT ( MODEL:hash-record -- MODEL:fingerprint )
    MODEL-HASH--RECORD:UNMAKE
    {: p:MODEL:path f:MODEL:fingerprint c:DROPBOX:hash :} f ;
-
-: RECORD-CONTENT ( MODEL:hash-record -- DROPBOX:hash )
-   MODEL-HASH--RECORD:UNMAKE
-   {: p:MODEL:path f:MODEL:fingerprint c:DROPBOX:hash :} c ;
 
 : RECORD-PATH ( MODEL:hash-record -- ^u8 n )
    MODEL-HASH--RECORD:UNMAKE
@@ -1216,33 +1213,42 @@ create LISTING FS-LIST:STORAGE-BYTES allot
    [: drop dir path s" open directory stream" s" read directory" ar
       LIST-PATHS ;] ENTRY-STEP ;
 
-\ The cached hash of the path when it still describes the file and the
-\ cutoff lets it be reused; the cache's answer lives in ar, the listing's
-\ arena.
-: REUSABLE-CONTENT
+\ The path's cached hash and its stored text, both in ar, and whether it
+\ still describes the file and the cutoff lets it be reused.
+: REUSABLE-HASH
    ( JOURNAL:scan scan-context str MODEL:fingerprint ^ARENA:arena
-     -- JOURNAL:scan option<DROPBOX:hash> )
+     -- JOURNAL:scan MODEL:hash-record str bool )
    {: cx:scan-context path:str print:MODEL:fingerprint ar:^ARENA:arena :}
-   cx SCAN-CONTEXT-UNMAKE {: cut:option<cutoff> dev:n :}
-   path ar JOURNAL:CACHED-HASH {: r:MODEL:hash-record found:bool :}
-   found 0= if OPTION:NONE exit then
+   cx SCAN-CONTEXT-UNMAKE
+   {: cut:option<cutoff> dev:n lookup:^ARENA:arena :}
+   path ar JOURNAL:CACHED-HASH
+   {: r:MODEL:hash-record json:str found:bool :}
+   found 0= if r json false exit then
    r RECORD-FINGERPRINT print SAME-FINGERPRINT?
-   r cut HASH-IS-REUSABLE and if r RECORD-CONTENT OPTION:SOME exit then
-   OPTION:NONE ;
+   r cut HASH-IS-REUSABLE and {: ok:bool :}
+   r json ok ;
 
-\ The file the walk found, as a cached hash or a file to hash; the
-\ cache's answer lives in ar, the listing's arena.
-: COLLECT-FILE
-   ( JOURNAL:scan str MODEL:fingerprint scan-context ^ARENA:arena
+\ The file as a cached hash in ar or as a file to hash; a reused record
+\ matched the walk's in every field, so it goes on as the cache's text.
+: COLLECT-IN
+   ( JOURNAL:scan ^ARENA:arena str MODEL:fingerprint scan-context
      -- JOURNAL:scan )
-   {: path:str print:MODEL:fingerprint cx:scan-context ar:^ARENA:arena :}
-   cx path print ar REUSABLE-CONTENT MATCH option
-      some OF {: c:DROPBOX:hash :}
-         path MODEL:>PATH print c MODEL-HASH--RECORD:MAKE
-         JOURNAL:SCAN-REUSE
-      ENDOF
-      none OF path print JOURNAL:SCAN-JOB ENDOF
-   ;MATCH ;
+   {: ar:^ARENA:arena path:str print:MODEL:fingerprint
+      cx:scan-context :}
+   cx path print ar REUSABLE-HASH
+   {: r:MODEL:hash-record json:str reused:bool :}
+   reused if r json JOURNAL:SCAN-REUSE exit then
+   path print JOURNAL:SCAN-JOB ;
+
+\ COLLECT-IN in cx's lookup arena, reset once the journal copied what it
+\ records, so no listing holds an answer per file.
+: COLLECT-FILE
+   ( JOURNAL:scan str MODEL:fingerprint scan-context -- JOURNAL:scan )
+   {: path:str print:MODEL:fingerprint cx:scan-context :}
+   cx SCAN-CONTEXT-UNMAKE
+   {: cut:option<cutoff> dev:n lookup:^ARENA:arena :}
+   lookup path print cx COLLECT-IN
+   lookup ARENA:RESET ;
 
 : OPENED-PRINT ( fd ^u8 n MODEL:stat -- MODEL:fingerprint )
    {: f:fd p:^ u:n probe:MODEL:stat :}
@@ -1266,19 +1272,18 @@ create LISTING FS-LIST:STORAGE-BYTES allot
    NO-FINGERPRINT
    [: DROP-FINGERPRINT dir name nu p u probe FILE-PRINT ;] ENTRY-STEP ;
 
-\ A reserved artifact publishes unsupported; any other file is collected
-\ in ar, the listing's arena, or answers the code its step threw.
+\ A reserved artifact publishes unsupported; any other file is collected,
+\ or answers the code its step threw.
 : SCAN-FILE
-   ( JOURNAL:scan fd ^u8 n str MODEL:stat scan-context ^ARENA:arena
+   ( JOURNAL:scan fd ^u8 n str MODEL:stat scan-context
      -- JOURNAL:scan n )
-   {: dir:fd name:^ nu:n path:str probe:MODEL:stat cx:scan-context
-      ar:^ARENA:arena :}
+   {: dir:fd name:^ nu:n path:str probe:MODEL:stat cx:scan-context :}
    name nu RESERVED-ARTIFACT? if
       path MODEL-UNKNOWN--REASON:UNSUPPORTED UNKNOWN 0 exit
    then
    dir name nu path probe PRINT-STEP {: print:MODEL:fingerprint code:n :}
    code 0<> if code exit then
-   path print cx ar COLLECT-FILE 0 ;
+   path print cx COLLECT-FILE 0 ;
 
 \ SCAN-DIRECTORY, which the walk reaches again below a directory.
 defer SCAN-SUBTREE
@@ -1301,7 +1306,7 @@ defer SCAN-SUBTREE
    -1 >FD [: drop dir name nu p u probe OPENED-DIRECTORY ;] ENTRY-STEP ;
 
 \ The directory's observation follows its subtree's, so a failure below
-\ leaves it unpublished.
+\ leaves it unpublished and drops all the walk recorded beneath it.
 : SCAN-SUBDIRECTORY
    ( JOURNAL:scan fd ^u8 n str MODEL:stat scan-context
      -- JOURNAL:scan n )
@@ -1310,40 +1315,36 @@ defer SCAN-SUBTREE
    code 0<> if code exit then
    [: child path cx SCAN-SUBTREE ;] [: child DISCARD ;] finally
    {: walked:n :}
-   walked 0<> if walked exit then
+   walked 0<> if path JOURNAL:SCAN-DISCARD walked exit then
    path MODEL:>PATH DIRECTORY-OBSERVATION MODEL-LOCAL--RECORD:MAKE
    JOURNAL:SCAN-OBSERVE 0 ;
 
 \ Content on another volume is never synchronized, so an object there is
-\ published as a symlink is and nothing beneath it is observed. A file
-\ is collected in ar, the listing's arena.
+\ published as a symlink is and nothing beneath it is observed.
 : SCAN-PROBED
-   ( JOURNAL:scan fd fd ^u8 n str scan-context ^ARENA:arena
-     -- JOURNAL:scan n )
-   {: probe:fd dir:fd name:^ nu:n path:str cx:scan-context
-      ar:^ARENA:arena :}
+   ( JOURNAL:scan fd fd ^u8 n str scan-context -- JOURNAL:scan n )
+   {: probe:fd dir:fd name:^ nu:n path:str cx:scan-context :}
    probe path str> s" inspect directory entry type" STAT-STEP
    {: st:MODEL:stat code:n :}
    code 0<> if code exit then
-   cx SCAN-CONTEXT-UNMAKE {: cut:option<cutoff> dev:n :}
+   cx SCAN-CONTEXT-UNMAKE
+   {: cut:option<cutoff> dev:n lookup:^ARENA:arena :}
    st STAT-DEV dev <> if
       path MODEL-UNKNOWN--REASON:UNSUPPORTED UNKNOWN 0 exit
    then
-   st REGULAR? if dir name nu path st cx ar SCAN-FILE exit then
+   st REGULAR? if dir name nu path st cx SCAN-FILE exit then
    st DIRECTORY? if dir name nu path st cx SCAN-SUBDIRECTORY exit then
    path str> UNSUPPORTED-STEP ;
 
 \ Rust's scan_entry: records one entry and answers 0, or answers the code
-\ that says why it cannot be observed, which SCAN-NAME publishes. ar is
-\ the listing's arena.
+\ that says why it cannot be observed, which SCAN-NAME publishes.
 : SCAN-ENTRY
-   ( JOURNAL:scan fd ^u8 n str scan-context ^ARENA:arena
-     -- JOURNAL:scan n )
-   {: dir:fd name:^ nu:n path:str cx:scan-context ar:^ARENA:arena :}
+   ( JOURNAL:scan fd ^u8 n str scan-context -- JOURNAL:scan n )
+   {: dir:fd name:^ nu:n path:str cx:scan-context :}
    dir name nu FS:TRY-OPEN-ENTRY-AT MATCH option
       none OF s" inspect directory entry" path str> IO-STEP ENDOF
       some OF {: probe:fd :}
-         [: probe dir name nu path cx ar SCAN-PROBED ;]
+         [: probe dir name nu path cx SCAN-PROBED ;]
          [: probe DISCARD ;] finally
       ENDOF
    ;MATCH ;
@@ -1370,28 +1371,25 @@ defer SCAN-SUBTREE
 : REVISITED-UNKNOWN ( n -- MODEL:unknown-reason )
    MODEL-UNKNOWN--REASON:INCOMPLETE ENTRY-UNKNOWN ;
 
-\ One entry never fails the pass: it publishes as unknown, and all the walk
-\ recorded beneath it leaves the scan. LOCAL logs no failure ENTRY-CODE?
-\ names while the entry is walked. ar is the listing's arena.
-: SCAN-NAME
-   ( JOURNAL:scan fd str str scan-context ^ARENA:arena -- JOURNAL:scan )
-   {: dir:fd path:str parent:str cx:scan-context ar:^ARENA:arena :}
+\ One entry never fails the pass: it publishes as unknown. LOCAL logs no
+\ failure ENTRY-CODE? names while the entry is walked.
+: SCAN-NAME ( JOURNAL:scan fd str str scan-context -- JOURNAL:scan )
+   {: dir:fd path:str parent:str cx:scan-context :}
    path parent NAME-OF {: name:^ nu:n :}
    name nu MODEL:EXCLUDED-NAME? if exit then
-   [: dir name nu path cx ar SCAN-ENTRY ;] ['] ENTRY-CODE? WITH-CONVERTS
+   [: dir name nu path cx SCAN-ENTRY ;] ['] ENTRY-CODE? WITH-CONVERTS
    {: code:n :}
    code 0= if exit then
-   code WALK-UNKNOWN {: why:MODEL:unknown-reason :}
-   path JOURNAL:SCAN-DISCARD path why UNKNOWN ;
+   path code WALK-UNKNOWN UNKNOWN ;
 
-\ Each name in byte order, its answers in ar.
+\ Each name in byte order, the order in ar.
 : SCAN-NAMES
    ( JOURNAL:scan fd str ^VEC:vector<str> scan-context ^ARENA:arena
      -- JOURNAL:scan )
    {: dir:fd path:str names cx:scan-context ar:^ARENA:arena :}
    names VEC:COUNT [: names swap VEC:AT STR@ ;] ar ORDER {: idx :}
    idx VEC:COUNT 0 ?do
-      dir names idx i VEC:AT @ VEC:AT @ path cx ar SCAN-NAME
+      dir names idx i VEC:AT @ VEC:AT @ path cx SCAN-NAME
    loop ;
 
 \ A directory that changed while it was listed fails; one that did not
@@ -1475,13 +1473,17 @@ SUBTREE-INSTALL
    [: DROP-SCANNED-HASH root path want q ar HASH-SCAN-FILE ;]
    ['] ENTRY-CODE? CONVERTING ;
 
+\ The hash's file publishes present.
+: OBSERVE-PRESENT ( JOURNAL:scan MODEL:hash-record -- JOURNAL:scan )
+   MODEL-HASH--RECORD:UNMAKE
+   {: p:MODEL:path f:MODEL:fingerprint c:DROPBOX:hash :}
+   p c MODEL-LOCAL:MAKE PRESENT-OBSERVATION MODEL-LOCAL--RECORD:MAKE
+   JOURNAL:SCAN-OBSERVE ;
+
 \ A confirmed hash publishes present, and its record when reusable.
 : PUBLISH-HASH ( JOURNAL:scan scanned-hash -- JOURNAL:scan )
    SCANNED-HASH-UNMAKE {: r:MODEL:hash-record ok:bool :}
-   r MODEL-HASH--RECORD:UNMAKE
-   {: p:MODEL:path f:MODEL:fingerprint c:DROPBOX:hash :}
-   p c MODEL-LOCAL:MAKE PRESENT-OBSERVATION MODEL-LOCAL--RECORD:MAKE
-   JOURNAL:SCAN-OBSERVE
+   r OBSERVE-PRESENT
    ok if r JOURNAL:SCAN-HASH then ;
 
 \ Every failure here concerns the job's own path.
@@ -1515,15 +1517,18 @@ SUBTREE-INSTALL
    {: root:fd r:MODEL:hash-record :}
    false [: drop root r CACHED-STILL? ;] ['] ENTRY-CODE? CONVERTING ;
 
-\ A cached hash still true publishes present and stays reusable.
+\ A cached hash still true publishes present and answers true: it stays
+\ reusable, as the text the cache stored.
 : REVALIDATE-CACHED
-   ( JOURNAL:scan MODEL:hash-record fd -- JOURNAL:scan )
+   ( JOURNAL:scan MODEL:hash-record fd -- JOURNAL:scan bool )
    {: r:MODEL:hash-record root:fd :}
    root r CACHED-STEP {: same:bool code:n :}
    r RECORD-PATH >str {: p:str :}
-   code 0<> if p code REVISITED-UNKNOWN UNKNOWN exit then
-   same 0= if p MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN exit then
-   r true SCANNED-HASH-MAKE PUBLISH-HASH ;
+   code 0<> if p code REVISITED-UNKNOWN UNKNOWN false exit then
+   same 0= if
+      p MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN false exit
+   then
+   r OBSERVE-PRESENT true ;
 
 \ ---- directories
 
@@ -1658,6 +1663,12 @@ SUBTREE-INSTALL
    {: code:n :}
    code 0<> if code throw then ;
 
+\ The walk from the root, with one lookup arena for the whole pass.
+: WALK-ROOT ( JOURNAL:scan fd option<cutoff> n -- JOURNAL:scan )
+   {: rfd:fd cut:option<cutoff> dev:n :}
+   [: >r rfd s" " >str cut dev r> SCAN-CONTEXT-MAKE
+      SCAN-DIRECTORY ROOT-WALKED ;] ARENA:WITH ;
+
 \ Rust's enumerate_scan_on_device: every entry on device into the scan;
 \ any other device is an unsupported subtree. A failure of the root's own
 \ throws and closes the root.
@@ -1666,8 +1677,7 @@ SUBTREE-INSTALL
      -- JOURNAL:scan pending-scan )
    {: root:str rfd:fd before:MODEL:stat cut:option<cutoff> dev:n
       ar:^ARENA:arena :}
-   cut dev SCAN-CONTEXT-MAKE {: cx:scan-context :}
-   rfd [: rfd s" " >str cx SCAN-DIRECTORY ROOT-WALKED ;] CLOSING
+   rfd [: rfd cut dev WALK-ROOT ;] CLOSING
    root rfd before ar PENDING-SCAN-MAKE ;
 
 : ROOT-STAT ( fd ^u8 n -- MODEL:stat )

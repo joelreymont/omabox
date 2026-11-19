@@ -9,9 +9,10 @@
 \ unchanged row keeping its rowid and the hashes of another generation
 \ dropped, emptied by WITH-SCAN, and writing nothing for a root that is
 \ not active; a scan's reused hashes, jobs and listed directories each
-\ visited once in path order, then gone; what a visit observes and
-\ hashes published; a discarded subtree dropped from the scan but for
-\ its cached hashes, which publish; CACHED-HASH's lookup by path;
+\ visited once in path order, then gone; what a visit observes
+\ published, and a reused hash it confirms as the text the cache
+\ stored; a discarded subtree dropped from the scan but for its cached
+\ hashes, which publish; CACHED-HASH's lookup by path, with the text;
 \ src/oracle/journal.sqlite3, copied and opened, giving journal.tsv's
 \ Dropbox and local root bindings, local and remote inventories, remote
 \ cursor, baselines, baseline paths, pending and blocked plans, pending
@@ -1523,12 +1524,12 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    1 ROWS-SEEN +!
    k ;
 
-: REUSE-SEEN ( scan MODEL:hash-record ^ARENA:arena -- scan )
+: REUSE-SEEN ( scan MODEL:hash-record ^ARENA:arena -- scan bool )
    {: r ar :}
    r MODEL-HASH--RECORD:UNMAKE {: p:MODEL:path f h :}
    p MODEL:PATH>STR [: ORDERED-PATH ;] SEEN-AT {: k :}
    k ORDERED-PATH k ORDERED-MARK ar LOCAL-HASH
-   r MODEL:HASH-RECORD= TTRUE ;
+   r MODEL:HASH-RECORD= TTRUE false ;
 
 : JOB-SEEN ( scan str MODEL:fingerprint -- scan )
    {: p:str f :}
@@ -1548,8 +1549,16 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    {: p:str st :}
    p [: SPARED-PATH ;] SEEN-AT drop ;
 
-: REUSE-COUNTED ( scan MODEL:hash-record -- scan )
-   {: r :} 1 ROWS-SEEN +! ;
+: REUSE-COUNTED ( scan MODEL:hash-record -- scan bool )
+   {: r :} 1 ROWS-SEEN +! false ;
+
+\ SCAN-REUSE of the record with the text MODEL writes for it, as the
+\ cache stores it.
+: REUSED ( scan MODEL:hash-record ^ARENA:arena -- scan )
+   {: r ar :}
+   SCAN-UNMAKE {: j w sa :}
+   w [: r swap MODEL:HASH-VALUE>JSON ;] ENCODE ar COPIED {: json:str :}
+   j w sa SCAN-MAKE r json SCAN-REUSE ;
 
 : JOB-COUNTED ( scan str MODEL:fingerprint -- scan )
    {: p:str f :} 1 ROWS-SEEN +! ;
@@ -1570,7 +1579,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    {: ar :}
    s" old.txt" s" old" PRESENT-LOCAL LOCAL-RECORD SCAN-OBSERVE
    s" old.txt" 10 ar LOCAL-HASH SCAN-HASH
-   s" old.txt" 10 ar LOCAL-HASH SCAN-REUSE
+   s" old.txt" 10 ar LOCAL-HASH ar REUSED
    s" old.txt" >str 10 MARKED-FINGERPRINT SCAN-JOB
    s" old.txt" >str 10 MARKED-STAT SCAN-LISTED ;
 
@@ -1637,9 +1646,9 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 
 : REUSES-VISITED ( scan ^ARENA:arena -- scan )
    {: ar :}
-   s" a-b" 1 ar LOCAL-HASH SCAN-REUSE
-   s" a/x" 2 ar LOCAL-HASH SCAN-REUSE
-   s" a" 3 ar LOCAL-HASH SCAN-REUSE
+   s" a-b" 1 ar LOCAL-HASH ar REUSED
+   s" a/x" 2 ar LOCAL-HASH ar REUSED
+   s" a" 3 ar LOCAL-HASH ar REUSED
    0 ROWS-SEEN !  [: ar REUSE-SEEN ;] EACH-SCAN-REUSE  ROWS-SEEN @ 3 T=
    0 ROWS-SEEN !  [: REUSE-COUNTED ;] EACH-SCAN-REUSE  ROWS-SEEN @ 0 T= ;
 
@@ -1672,19 +1681,36 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    [: [: LISTINGS-VISITED ;] WITH-SCAN ;] ON-NEW-JOURNAL ;
 
 \ Observes the reused hash's file and confirms the hash.
-: CONFIRMED ( scan MODEL:hash-record -- scan )
+: CONFIRMED ( scan MODEL:hash-record -- scan bool )
    {: r :}
    r MODEL-HASH--RECORD:UNMAKE {: p:MODEL:path f h :}
    p s" a" PRESENT-LOCAL MODEL-LOCAL--RECORD:MAKE SCAN-OBSERVE
-   r SCAN-HASH ;
+   true ;
+
+\ a.txt's hash at marker 10 spaced as MODEL never writes it.
+: SPACED-HASH ( -- ^u8 n )
+   s\" { \"fingerprint\": { \"inode\": 11, \"size\": 12,
+      \"modified_seconds\": 1, \"modified_nanoseconds\": 10,
+      \"changed_seconds\": 2, \"changed_nanoseconds\": 10 },
+      \"content\":
+      \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }" ;
+
+\ The local hash cache's rows stored as the text.
+: STORED-AS ( journal ^u8 n -- n )
+   {: j a:^ u:n :}
+   j >CONNECTION
+   s" SELECT COUNT(*) FROM local_hash_cache WHERE hash_json = ?1" >str
+   [: a u >str 1 SQLITE:BIND-TEXT INT-ROW ;] SQLITE:WITH-STATEMENT ;
 
 : CONFIRMED-PUBLISHED
    ( scan local-root-binding ^ARENA:arena -- scan )
    {: b ar :}
-   s" a.txt" 10 ar LOCAL-HASH SCAN-REUSE
+   s" a.txt" 10 ar LOCAL-HASH SPACED-HASH >str SCAN-REUSE
    [: CONFIRMED ;] EACH-SCAN-REUSE
    b PUBLISH-SCAN TTRUE ;
 
+\ The confirmed hash publishes as the text the cache stored, never
+\ encoded again.
 : A-VISIT-PUBLISHES-WHAT-IT-OBSERVES-AND-HASHES ( ^ARENA:arena -- )
    {: ar :}
    s" a visit publishes what it observes and hashes" T-LABEL
@@ -1693,6 +1719,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    j [: b ar CONFIRMED-PUBLISHED ;] WITH-SCAN
    j s" a.txt" s" a" PRESENT-LOCAL LOCAL-RECORD
    s" a.txt" 10 ar LOCAL-HASH ar SCAN-HELD
+   j SPACED-HASH STORED-AS 1 T=
    j CLOSE
    d GONE ;
 
@@ -1711,7 +1738,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    s" a/x" s" x" PRESENT-LOCAL LOCAL-RECORD EVERYWHERE
    s" a-b" s" b" PRESENT-LOCAL LOCAL-RECORD EVERYWHERE
    s" ab" s" c" PRESENT-LOCAL LOCAL-RECORD EVERYWHERE
-   s" a/y" 5 ar LOCAL-HASH SCAN-REUSE
+   s" a/y" 5 ar LOCAL-HASH ar REUSED
    s" a/z" 6 ar LOCAL-HASH SCAN-HASH
    s" a" >str SCAN-DISCARD
    0 ROWS-SEEN !  [: JOB-KEPT ;] EACH-SCAN-JOB  ROWS-SEEN @ 2 T=
@@ -1737,10 +1764,14 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 
 : DROP-HASH-RECORD ( MODEL:hash-record -- ) drop ;
 
+\ a.txt's hash comes with the text it is stored as; b.txt has neither.
 : LOOKED-UP-IN ( scan MODEL:hash-record ^ARENA:arena -- scan )
    {: want ar :}
-   s" a.txt" >str ar CACHED-HASH TTRUE want MODEL:HASH-RECORD= TTRUE
-   s" b.txt" >str ar CACHED-HASH TFALSE DROP-HASH-RECORD ;
+   s" a.txt" >str ar CACHED-HASH TTRUE {: r json:str :}
+   r want MODEL:HASH-RECORD= TTRUE
+   SCAN-JOURNAL json str> STORED-AS 1 T=
+   s" b.txt" >str ar CACHED-HASH TFALSE {: empty:str :}
+   empty str> nip 0 T= DROP-HASH-RECORD ;
 
 : CACHED-HASH-ANSWERS-THE-PUBLISHED-HASH ( ^ARENA:arena -- )
    {: ar :}
