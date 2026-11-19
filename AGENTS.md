@@ -39,3 +39,7 @@ rewrite and `JOURNAL.md` records it.
   neither crash-loop nor stop unrelated work.
 - Never weaken a safety invariant to make a test pass.
 - Never commit credentials, tokens, test accounts, or other secrets.
+- Hold growable bytes in Habu's `VEC:vector<u8>`, never in BUF, and read JSON
+  with Habu's JSON values (`JSON:value`), never the cursor reader
+  (`JSON:READ-*`). Code that still uses either moves once Habu lands the
+  replacement.
