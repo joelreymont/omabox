@@ -154,7 +154,7 @@ ENUM read-fault full entered timed-out cancelled ;ENUM
 \ White-box, as Habu's aio-test.f: package AIO reopened to swap its private
 \ HOST-XFER for STAGE-XFER, which fails the reads of FAILING's descriptor
 \ and passes every other transfer, the fake's HTTP reads included, to the
-\ real XFER-STAGE. Each name lands in DROPBOX-TEST, so AIO gains none.
+\ real URING-XFER. Each name lands in DROPBOX-TEST, so AIO gains none.
 package AIO
 
 TYPED-VARIABLE DROPBOX-TEST:READ-FAULT DROPBOX-TEST:read-fault
@@ -164,7 +164,7 @@ TYPED-VARIABLE DROPBOX-TEST:OFFERED ^u8
 TYPED-VARIABLE DROPBOX-TEST:OFFERED-CAP NUM:alloc-byte-len
 
 
-\ The record holds the buffer as XFER-STAGE's does, so AWAIT-XFER gives
+\ The record holds the buffer as URING-XFER's does, so AWAIT-XFER gives
 \ it back with the record's outcome.
 : DROPBOX-TEST:HOLDS ( ^u8 NUM:alloc-byte-len n -- )
    {: buf cap:NUM:alloc-byte-len idx:n :}
@@ -198,7 +198,7 @@ TYPED-VARIABLE DROPBOX-TEST:OFFERED-CAP NUM:alloc-byte-len
 : DROPBOX-TEST:STAGE-XFER ( n ^u8 NUM:alloc-byte-len n n n -- n n )
    {: f:n buf cap:NUM:alloc-byte-len count:n off:n kind:n :}
    f DROPBOX-TEST:FAILING @ <> if
-      f buf cap count off kind XFER-STAGE exit
+      f buf cap count off kind URING-XFER exit
    then
    buf DROPBOX-TEST:OFFERED ! cap DROPBOX-TEST:OFFERED-CAP !
    DROPBOX-TEST:READ-FAULT @ MATCH DROPBOX-TEST:read-fault
@@ -215,7 +215,7 @@ TYPED-VARIABLE DROPBOX-TEST:OFFERED-CAP NUM:alloc-byte-len
    ['] DROPBOX-TEST:STAGE-XFER is HOST-XFER ;
 
 
-: DROPBOX-TEST:;FAIL-READS ( -- ) ['] XFER-STAGE is HOST-XFER ;
+: DROPBOX-TEST:;FAIL-READS ( -- ) ['] URING-XFER is HOST-XFER ;
 
 ;package
 

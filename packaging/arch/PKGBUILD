@@ -9,7 +9,7 @@ depends=(glibc curl sqlite libsecret glib2 libunistring systemd)
 makedepends=(git)
 # Habu's programs have no section headers to strip or split.
 options=(!strip !debug)
-_habu=851edbc328f0edd891d53636d903cf6337ef1a4e
+_habu=528f293d12b1e2599188b6db4922f7db78fd9a2c
 source=("omabox::git+https://github.com/joelreymont/omabox.git#tag=v$pkgver"
         "habu::git+https://github.com/joelreymont/habu.git#commit=$_habu")
 sha256sums=(SKIP SKIP)

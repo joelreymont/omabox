@@ -7,7 +7,7 @@
 \ retention of legacy recovery payloads, each Dropbox mutation's
 \ outcome, and the remote replay that records it. A LOCAL call
 \ whose failures REPLAY converts into outcomes runs under
-\ LOCAL:CONVERTING, so nothing logs those; any other LOCAL, JOURNAL or
+\ LOCAL:WITH-CONVERTS, so nothing logs those; any other LOCAL, JOURNAL or
 \ DROPBOX failure passes up with its own code, which that library
 \ logged where it saw it. A mutation Dropbox rejects for its path is
 \ logged once with its tag, and a download blocked for its path once
@@ -514,8 +514,8 @@ STRUCTURE retention
 \ kept on a failure that concerns it alone.
 : CHECKED ( retention JOURNAL:recovery-record ^u8 n stat -- n )
    {: x r nm:^ nu:n before :}
-   false [: drop x r nm nu VERIFY ;]
-   ['] KEEPS? LOCAL:CONVERTING {: code:n :}
+   false [: drop [: x r nm nu VERIFY ;] ['] KEEPS? LOCAL:WITH-CONVERTS ;]
+   catch {: code:n :}
    code 0= if
       if x r nm nu before REINSPECT exit then
       x r SYNC-THEN-FORGET exit
@@ -707,9 +707,8 @@ private
 : CREATE-DIRECTORY ( ^pass -- apply-event )
    {: r :}
    LOCAL-CREATE--DIRECTORY--OUTCOME:CREATED
-   [: DROP-MADE r PASS-ROOT @ r RUN-TARGET
-      LOCAL:CREATE-DIRECTORY-AT ;]
-   ['] LOCAL-OBJECT? LOCAL:CONVERTING {: code:n :}
+   [: DROP-MADE [: r PASS-ROOT @ r RUN-TARGET LOCAL:CREATE-DIRECTORY-AT ;]
+      ['] LOCAL-OBJECT? LOCAL:WITH-CONVERTS ;] catch {: code:n :}
    code 0= if r MADE exit then
    drop r code LOCAL-OBJECT ;
 
@@ -725,9 +724,8 @@ private
 : DELETE-DIRECTORY ( ^pass -- apply-event )
    {: r :}
    LOCAL-DELETE--DIRECTORY--OUTCOME:DELETED
-   [: DROP-REMOVED r PASS-ROOT @ r RUN-TARGET
-      LOCAL:DELETE-DIRECTORY-AT ;]
-   ['] LOCAL-OBJECT? LOCAL:CONVERTING {: code:n :}
+   [: DROP-REMOVED [: r PASS-ROOT @ r RUN-TARGET LOCAL:DELETE-DIRECTORY-AT ;]
+      ['] LOCAL-OBJECT? LOCAL:WITH-CONVERTS ;] catch {: code:n :}
    code 0= if r REMOVED exit then
    drop r code LOCAL-OBJECT ;
 
@@ -769,9 +767,9 @@ private
    {: src expected r :}
    src MODEL-REMOTE:UNMAKE {: want v :}
    LOCAL-INSTALL--OUTCOME:INSTALLED
-   [: DROP-INSTALLED r RUN-ROOT r RUN-TARGET want expected
-      r PASS-ARENA @ LOCAL:INSTALL-DOWNLOAD-AT ;]
-   ['] LOCAL-OBJECT? LOCAL:CONVERTING {: code:n :}
+   [: DROP-INSTALLED [: r RUN-ROOT r RUN-TARGET want expected
+         r PASS-ARENA @ LOCAL:INSTALL-DOWNLOAD-AT ;]
+      ['] LOCAL-OBJECT? LOCAL:WITH-CONVERTS ;] catch {: code:n :}
    code 0= if src r INSTALLED exit then
    drop r code LOCAL-OBJECT ;
 
@@ -786,9 +784,9 @@ private
 : DELETE-FILE ( DROPBOX:hash ^pass -- apply-event )
    {: want r :}
    LOCAL-DELETE--OUTCOME:DELETED
-   [: DROP-DELETED r RUN-ROOT r RUN-TARGET want
-      r PASS-ARENA @ LOCAL:DELETE-LOCAL-AT ;]
-   ['] LOCAL-OBJECT? LOCAL:CONVERTING {: code:n :}
+   [: DROP-DELETED [: r RUN-ROOT r RUN-TARGET want
+         r PASS-ARENA @ LOCAL:DELETE-LOCAL-AT ;]
+      ['] LOCAL-OBJECT? LOCAL:WITH-CONVERTS ;] catch {: code:n :}
    code 0= if r DELETED exit then
    drop r code LOCAL-OBJECT ;
 
@@ -944,9 +942,9 @@ private
      -- copy-outcome )
    {: root:fd r:^ ru:n path:MODEL:path up:^LOCAL:staged-upload f:fd
       ar:^ARENA:arena :}
-   COPY-OCCUPIED [: DROP-COPY root r ru path up f ar WRITE-COPY
-      >COPY-OUTCOME ;]
-   ['] OCCUPIED? LOCAL:CONVERTING {: code:n :}
+   COPY-OCCUPIED [: DROP-COPY
+      [: root r ru path up f ar WRITE-COPY >COPY-OUTCOME ;]
+      ['] OCCUPIED? LOCAL:WITH-CONVERTS ;] catch {: code:n :}
    code 0= if exit then
    drop code FS:ERRNO OCCUPIED? if COPY-OCCUPIED exit then
    code throw ;
@@ -1971,9 +1969,9 @@ public
      -- copy-outcome )
    {: k root:fd r:^ ru:n path rem ar :}
    path rem ar REMOTE-COPY-PATH {: copy :}
-   COPY-OCCUPIED [: DROP-COPY k root r ru copy path rem ar
-      MATERIALIZE-REMOTE-COPY-AT path >CONFLICT-OUTCOME ;]
-   ['] NAME-HELD? LOCAL:CONVERTING {: code:n :}
+   COPY-OCCUPIED [: DROP-COPY [: k root r ru copy path rem ar
+         MATERIALIZE-REMOTE-COPY-AT path >CONFLICT-OUTCOME ;]
+      ['] NAME-HELD? LOCAL:WITH-CONVERTS ;] catch {: code:n :}
    code 0= if exit then
    drop code FS:ERRNO NAME-HELD? if COPY-OCCUPIED exit then
    code throw ;
@@ -2101,14 +2099,15 @@ private
    s" " >str LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED ;
 : DROP-STAGE ( LOCAL:stage-outcome<^LOCAL:staged-upload> -- ) drop ;
 
-\ The run's target staged for upload as want, and the code a changed
-\ source threw, else 0.
+\ The run's target staged for upload as want and 0, or NO-UPLOAD-STAGE
+\ and the code it threw.
 : STAGE
    ( DROPBOX:hash ^pass -- LOCAL:stage-outcome<^LOCAL:staged-upload> n )
    {: want r :}
-   NO-UPLOAD-STAGE [: DROP-STAGE r PASS-ROOT @ r RUN-TARGET
-      r PASS-STAGING @ str> want r PASS-ARENA @ LOCAL:STAGE-UPLOAD-AT ;]
-   ['] SOURCE-CHANGED? LOCAL:CONVERTING ;
+   NO-UPLOAD-STAGE [: DROP-STAGE [: r PASS-ROOT @ r RUN-TARGET
+         r PASS-STAGING @ str> want r PASS-ARENA @ LOCAL:STAGE-UPLOAD-AT ;]
+      ['] SOURCE-CHANGED? LOCAL:WITH-CONVERTS ;] catch {: code:n :}
+   code 0<> if drop NO-UPLOAD-STAGE then code ;
 
 \ Other bytes hold the stage's path p.
 : STAGE-HELD ( str ^pass -- apply-event )

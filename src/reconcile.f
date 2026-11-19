@@ -2091,22 +2091,24 @@ ENUM prepared ready fresh ;ENUM
    drop dup LOCAL:E-OCCUPIED = swap LOCAL:E-SOURCE-CHANGED = or ;
 : SOURCE-CHANGED? ( n n -- bool ) drop LOCAL:E-SOURCE-CHANGED = ;
 
-\ LOCAL:STAGE-UPLOAD of path's content c, and the code it threw,
-\ else 0.
+\ LOCAL:STAGE-UPLOAD of path's content c and 0, or NO-STAGE and the code
+\ it threw.
 : STAGE-LOCAL
    ( ^run MODEL:path DROPBOX:hash
      -- LOCAL:stage-outcome<^LOCAL:staged-upload> n )
    {: r path c :}
-   NO-STAGE [: DROP-STAGE r ROOT$ path PATH$ r STAGING$ c
-      r RUN-ARENA @ LOCAL:STAGE-UPLOAD ;]
-   ['] STAGE-CONVERTS? LOCAL:CONVERTING ;
+   NO-STAGE [: DROP-STAGE [: r ROOT$ path PATH$ r STAGING$ c
+         r RUN-ARENA @ LOCAL:STAGE-UPLOAD ;]
+      ['] STAGE-CONVERTS? LOCAL:WITH-CONVERTS ;] catch {: code:n :}
+   code 0<> if drop NO-STAGE then code ;
 
-\ The upload source's content now, and the code it threw, else 0.
+\ The upload source's content now and 0, or NO-HASH and the code it threw.
 : OBSERVE-SOURCE ( ^run MODEL:path -- DROPBOX:hash n )
    {: r path :}
-   NO-HASH [: DROP-HASH r ROOT$ path PATH$ r RUN-ARENA @
-      LOCAL:OBSERVE-UPLOAD-SOURCE ;]
-   ['] SOURCE-CHANGED? LOCAL:CONVERTING ;
+   NO-HASH [: DROP-HASH [: r ROOT$ path PATH$ r RUN-ARENA @
+         LOCAL:OBSERVE-UPLOAD-SOURCE ;]
+      ['] SOURCE-CHANGED? LOCAL:WITH-CONVERTS ;] catch {: code:n :}
+   code 0<> if drop NO-HASH then code ;
 
 \ An already staged upload is ready while its source still holds c.
 : RECHECK
@@ -2681,16 +2683,18 @@ ENUM root-check active changed ;ENUM
    {: code:n e:n :}
    code LOCAL:E-OCCUPIED = code e REPLAY:LOCAL-OBJECT? or ;
 
-\ The download staged through the lease, and the code it threw, else 0.
+\ The download staged through the lease and 0, or NO-FETCH and the code
+\ it threw.
 : STAGE
    ( ^download option<LOCAL:download-slot-lease>
      -- LOCAL:stage-outcome<n> n )
    {: x lease :}
    x DOWNLOAD-RUN @ {: r :}
-   NO-FETCH [: DROP-FETCH r RUN-LINK @ x DOWNLOAD-ROOT @ r ROOT$
-      x DOWNLOAD-PLAN @ PLAN-PATH x WANTED-SOURCE lease r STAGING$
-      r RUN-ARENA @ REPLAY:STAGE-EXACT-DOWNLOAD-AT ;]
-   ['] FETCH-CONVERTS? LOCAL:CONVERTING ;
+   NO-FETCH [: DROP-FETCH [: r RUN-LINK @ x DOWNLOAD-ROOT @ r ROOT$
+         x DOWNLOAD-PLAN @ PLAN-PATH x WANTED-SOURCE lease r STAGING$
+         r RUN-ARENA @ REPLAY:STAGE-EXACT-DOWNLOAD-AT ;]
+      ['] FETCH-CONVERTS? LOCAL:WITH-CONVERTS ;] catch {: code:n :}
+   code 0<> if drop NO-FETCH then code ;
 
 : BLOCKED-AS ( MODEL:blockage ^download -- fetched )
    DOWNLOAD-REASON ! construct fetched blocked ;
@@ -3692,13 +3696,15 @@ ENUM pass-state DERIVE eq
 : DROP-SCAN ( LOCAL:scan-publication -- ) drop ;
 : SCAN-CONVERTS? ( n n -- bool ) drop LOCAL:E-CHANGED = ;
 
-\ LOCAL:SCAN-AND-PUBLISH of the root, and the code it threw, else 0.
+\ LOCAL:SCAN-AND-PUBLISH of the root and 0, or NO-SCAN and the code it
+\ threw.
 : SCANNED ( ^pass -- LOCAL:scan-publication n )
    {: x :}
    x PASS-RUN @ {: r :}
-   NO-SCAN [: DROP-SCAN r RUN-JOURNAL @ r ROOT$ r RUN-ARENA @
-      LOCAL:SCAN-AND-PUBLISH ;]
-   ['] SCAN-CONVERTS? LOCAL:CONVERTING ;
+   NO-SCAN [: DROP-SCAN [: r RUN-JOURNAL @ r ROOT$ r RUN-ARENA @
+         LOCAL:SCAN-AND-PUBLISH ;]
+      ['] SCAN-CONVERTS? LOCAL:WITH-CONVERTS ;] catch {: code:n :}
+   code 0<> if drop NO-SCAN then code ;
 
 : SCAN-OBSERVED ( LOCAL:scan-publication ^pass -- pass-event )
    {: x :}

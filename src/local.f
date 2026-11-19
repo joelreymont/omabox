@@ -23,14 +23,15 @@
 \ Habu word that failed keeps none; on ENOSPC the code is E-DISK-FULL, not
 \ E-IO.
 \ LOCAL logs a failure once, with its text, where it throws, unless the
-\ catch around it turns it into an outcome: CONVERTING runs a word under a
-\ predicate naming the codes and errnos its caller converts, and QUIET?
-\ asks the innermost one. A scan's observation converts what ENTRY-CODE?
-\ names and rethrows the rest, which logs and ends the scan; a failure
-\ XATTR logged gets no second line. On EACCES or EPERM, the line of a call
-\ that makes, links, renames or removes a name in a directory, or opens it
-\ as a directory, also gives the mode, owner and attributes of that
-\ directory and of the entry, and the uid Omabox runs as.
+\ catch around it turns it into an outcome: CONVERTING or WITH-CONVERTS
+\ runs a word under a predicate naming the codes and errnos its caller
+\ converts, and QUIET? asks the innermost one. A scan's observation
+\ converts what ENTRY-CODE? names and rethrows the rest, which logs and
+\ ends the scan; a failure XATTR logged gets no second line. On EACCES or
+\ EPERM, the line of a call that makes, links, renames or removes a name
+\ in a directory, or opens it as a directory, also gives the mode, owner
+\ and attributes of that directory and of the entry, and the uid Omabox
+\ runs as.
 \ The scan walks the root depth first, each directory's names in byte order,
 \ and records in the journal's scan observations, cached hashes it may
 \ reuse, files to hash and the directories it listed; a failure that
@@ -42,7 +43,7 @@
 \ name hasher, the marker and slot state buffers, the slot name and path
 \ buffers, a lease's slot table, the byte a partial's end is probed with,
 \ the directory listing context, the predicate of the innermost
-\ CONVERTING and DENIED-PATH; one task syncs, so one uses them at a
+\ WITH-CONVERTS and DENIED-PATH; one task syncs, so one uses them at a
 \ time. CALLER-OWNED: every descriptor answered, the hashes, names,
 \ paths, vectors, staged uploads and partials laid in the caller's arena,
 \ the paths a stage's result names and a lease's slot directory.
@@ -143,14 +144,14 @@ $2E constant DOT
 
 : NONE-CONVERTED ( n n -- bool ) 2drop false ;
 
-\ The predicate of the innermost CONVERTING, true for the code and errno
-\ of each failure its caller turns into an outcome; NONE-CONVERTED
-\ outside any.
+\ The innermost WITH-CONVERTS's predicate; NONE-CONVERTED outside any.
 TYPED-VARIABLE CONVERTS [ n n -- bool ]
 ' NONE-CONVERTED CONVERTS !
 
 \ Whether LOCAL logs nothing for a failure: its catcher converts it.
 : QUIET? ( n n -- bool ) CONVERTS @ execute ;
+
+public
 
 \ Runs q with converted? as the predicate QUIET? asks, the outer one back
 \ on every exit. LOCAL logs no failure converted? names: the caller
@@ -161,10 +162,8 @@ TYPED-VARIABLE CONVERTS [ n n -- bool ]
    converted? CONVERTS !
    [: q execute ;] [: outer CONVERTS ! ;] finally ;
 
-public
-
 \ Runs q under WITH-CONVERTS; answers what q threw, 0 for none.
-: CONVERTING ( R [ R -- R ] [ n n -- bool ] -- R n )
+: CONVERTING ( [ -- ] [ n n -- bool ] -- n )
    {: q converted? :}
    [: [: q execute ;] catch ;] converted? WITH-CONVERTS ;
 
@@ -1116,20 +1115,25 @@ private
 
 \ ---- the walk's steps
 
-\ Runs step, a filesystem step: no catch may hold the linear scan. Under
-\ the predicate in force it answers 0, or the code it threw when
-\ ENTRY-CODE? names it with FS:ERRNO; any other code throws on.
-: ENTRY-STEP ( R [ R -- R ] -- R n )
-   {: step :}
-   [: step execute ;] catch {: code:n :}
+\ The code a step threw, 0 for none, when ENTRY-CODE? names it with
+\ FS:ERRNO; any other code throws on.
+: STEP-CODE ( n -- n )
+   {: code:n :}
    code 0= if 0 exit then
    code FS:ERRNO ENTRY-CODE? 0= if code throw then
    code ;
 
-\ STAT-FD as a step; the stat is valid only when the code is 0.
+\ Runs step, a filesystem step: no catch may hold the linear scan.
+: ENTRY-STEP ( [ -- ] -- n )
+   {: step :}
+   [: step execute ;] catch STEP-CODE ;
+
+\ STAT-FD as a step; after a throw ENTRY-CODE? names, NO-STAT and the
+\ code.
 : STAT-STEP ( fd ^u8 n ^u8 n -- MODEL:stat n )
    {: f:fd p:^ u:n o:^ ou:n :}
-   NO-STAT [: DROP-STAT f p u o ou STAT-FD ;] ENTRY-STEP ;
+   NO-STAT [: DROP-STAT f p u o ou STAT-FD ;] catch {: code:n :}
+   code 0<> if drop NO-STAT then code STEP-CODE ;
 
 : CHANGED-STEP ( ^u8 n ^u8 n -- n )
    {: o:^ ou:n p:^ u:n :}
@@ -1206,12 +1210,14 @@ create LISTING FS-LIST:STORAGE-BYTES allot
    code 0<> if code open ou read ru parent str> LIST-FAILURE then
    v ;
 
-\ LIST-PATHS of the directory as a step, the paths in ar.
+\ LIST-PATHS of the directory as a step, the paths in ar; after a throw
+\ ENTRY-CODE? names, an empty vector and the code.
 : LISTING-STEP ( fd str ^ARENA:arena -- ^VEC:vector<str> n )
    {: dir:fd path:str ar:^ARENA:arena :}
-   ar [type] str NEW-VEC
-   [: drop dir path s" open directory stream" s" read directory" ar
-      LIST-PATHS ;] ENTRY-STEP ;
+   ar [type] str NEW-VEC {: none :}
+   none [: drop dir path s" open directory stream" s" read directory" ar
+      LIST-PATHS ;] catch {: code:n :}
+   code 0<> if drop none then code STEP-CODE ;
 
 \ The path's cached hash and its stored text, both in ar, and whether it
 \ still describes the file and the cutoff lets it be reused.
@@ -1265,12 +1271,14 @@ create LISTING FS-LIST:STORAGE-BYTES allot
    dir name nu p u OPEN-RELATIVE-AT {: f:fd :}
    [: f p u probe OPENED-PRINT ;] [: f DISCARD ;] finally ;
 
-\ FILE-PRINT as a step; the fingerprint is valid only when the code is 0.
+\ FILE-PRINT as a step; after a throw ENTRY-CODE? names, NO-FINGERPRINT
+\ and the code.
 : PRINT-STEP ( fd ^u8 n str MODEL:stat -- MODEL:fingerprint n )
    {: dir:fd name:^ nu:n path:str probe:MODEL:stat :}
    path str> {: p:^ u:n :}
-   NO-FINGERPRINT
-   [: DROP-FINGERPRINT dir name nu p u probe FILE-PRINT ;] ENTRY-STEP ;
+   NO-FINGERPRINT [: DROP-FINGERPRINT dir name nu p u probe FILE-PRINT ;]
+   catch {: code:n :}
+   code 0<> if drop NO-FINGERPRINT then code STEP-CODE ;
 
 \ A reserved artifact publishes unsupported; any other file is collected,
 \ or answers the code its step threw.
@@ -1298,12 +1306,14 @@ defer SCAN-SUBTREE
    ;] CLOSING
    child ;
 
-\ The directory at name, opened where the probe found it, as a step; the
-\ descriptor is open only when the code is 0.
+\ The directory at name, opened where the probe found it, as a step;
+\ after a throw ENTRY-CODE? names, -1 and the code.
 : DIRECTORY-STEP ( fd ^u8 n str MODEL:stat -- fd n )
    {: dir:fd name:^ nu:n path:str probe:MODEL:stat :}
    path str> {: p:^ u:n :}
-   -1 >FD [: drop dir name nu p u probe OPENED-DIRECTORY ;] ENTRY-STEP ;
+   -1 >FD [: drop dir name nu p u probe OPENED-DIRECTORY ;] catch
+   {: code:n :}
+   code 0<> if drop -1 >FD then code STEP-CODE ;
 
 \ The directory's observation follows its subtree's, so a failure below
 \ leaves it unpublished and drops all the walk recorded beneath it.
@@ -1463,15 +1473,16 @@ SUBTREE-INSTALL
    OPEN-RELATIVE-REGULAR-WITH-STAT {: f:fd opened:MODEL:stat :}
    [: f path want opened q ar HASH-OPENED-FILE ;] [: f DISCARD ;] finally ;
 
-\ HASH-SCAN-FILE under ENTRY-CODE?; the hash is valid only when the code
-\ is 0.
+\ HASH-SCAN-FILE under ENTRY-CODE?; after a throw, NO-SCANNED-HASH and the
+\ code.
 : HASH-STEP
    ( fd str MODEL:fingerprint [ -- option<cutoff> ] ^ARENA:arena
      -- scanned-hash n )
    {: root:fd path:str want:MODEL:fingerprint q ar:^ARENA:arena :}
-   NO-SCANNED-HASH
-   [: DROP-SCANNED-HASH root path want q ar HASH-SCAN-FILE ;]
-   ['] ENTRY-CODE? CONVERTING ;
+   NO-SCANNED-HASH [: DROP-SCANNED-HASH
+      [: root path want q ar HASH-SCAN-FILE ;] ['] ENTRY-CODE? WITH-CONVERTS
+   ;] catch {: code:n :}
+   code 0<> if drop NO-SCANNED-HASH then code ;
 
 \ The hash's file publishes present.
 : OBSERVE-PRESENT ( JOURNAL:scan MODEL:hash-record -- JOURNAL:scan )
@@ -1511,11 +1522,12 @@ SUBTREE-INSTALL
    f DISCARD
    before p u FILE-FINGERPRINT r RECORD-FINGERPRINT SAME-FINGERPRINT? ;
 
-\ CACHED-STILL? under ENTRY-CODE?; the flag is valid only when the code
-\ is 0.
+\ CACHED-STILL? under ENTRY-CODE?; after a throw, false and the code.
 : CACHED-STEP ( fd MODEL:hash-record -- bool n )
    {: root:fd r:MODEL:hash-record :}
-   false [: drop root r CACHED-STILL? ;] ['] ENTRY-CODE? CONVERTING ;
+   false [: drop [: root r CACHED-STILL? ;] ['] ENTRY-CODE? WITH-CONVERTS ;]
+   catch {: code:n :}
+   code 0<> if drop false then code ;
 
 \ A cached hash still true publishes present and answers true: it stays
 \ reusable, as the text the cache stored.
@@ -1556,12 +1568,13 @@ SUBTREE-INSTALL
    root path str> REOPEN-SCANNED-DIRECTORY
    before SAME-OBSERVATION 0= ;
 
-\ DIRECTORY-CHANGED? under ENTRY-CODE?; the flag is valid only when the
-\ code is 0.
+\ DIRECTORY-CHANGED? under ENTRY-CODE?; after a throw, false and the
+\ code.
 : DIRECTORY-CHANGED-STEP ( fd str MODEL:stat -- bool n )
    {: root:fd path:str before:MODEL:stat :}
-   false [: drop root path before DIRECTORY-CHANGED? ;]
-   ['] ENTRY-CODE? CONVERTING ;
+   false [: drop [: root path before DIRECTORY-CHANGED? ;]
+      ['] ENTRY-CODE? WITH-CONVERTS ;] catch {: code:n :}
+   code 0<> if drop false then code ;
 
 \ Whether the path is among the held records, which are in byte order.
 : AMONG? ( ^u8 n ^VEC:vector<MODEL:local-record> -- bool )
@@ -2277,9 +2290,9 @@ private
 : HASH-UPLOAD-STAGE
    ( fd ^u8 n ^u8 n ^ARENA:arena -- option<hashed> bool )
    {: dir:fd name:^ nu:n p:^ u:n ar:^ARENA:arena :}
-   NO-HASHED [: DROP-HASHED dir name nu p u
-      s" verify immutable upload stage" ar OPEN-AND-HASH-IF-PRESENT ;]
-   ['] UPLOAD-STAGE-OCCUPIED? CONVERTING {: code:n :}
+   NO-HASHED [: DROP-HASHED [: dir name nu p u
+         s" verify immutable upload stage" ar OPEN-AND-HASH-IF-PRESENT ;]
+      ['] UPLOAD-STAGE-OCCUPIED? WITH-CONVERTS ;] catch {: code:n :}
    code 0= if false exit then
    drop code FS:ERRNO UPLOAD-STAGE-OCCUPIED? if NO-HASHED true exit then
    code throw ;
@@ -2313,10 +2326,10 @@ private
    ( fd fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- stage-write bool )
    {: src:fd dir:fd name:^ nu:n p:^ u:n want:DROPBOX:hash
       ar:^ARENA:arena :}
-   STAGE-WRITE-CREATED [: DROP-STAGE-WRITE
-      dir name nu p u want [: src -rot FD-READ ;] NO-MARKER
-      s" stage upload" ar WRITE-VERIFIED-STAGE ;]
-   ['] UPLOAD-STAGE-OCCUPIED? CONVERTING {: code:n :}
+   STAGE-WRITE-CREATED [: DROP-STAGE-WRITE [:
+         dir name nu p u want [: src -rot FD-READ ;] NO-MARKER
+         s" stage upload" ar WRITE-VERIFIED-STAGE ;]
+      ['] UPLOAD-STAGE-OCCUPIED? WITH-CONVERTS ;] catch {: code:n :}
    code 0= if false exit then
    drop code FS:ERRNO UPLOAD-STAGE-OCCUPIED? if
       p u >str STAGE-WRITE-DESTINATION-OCCUPIED true exit
@@ -2459,10 +2472,10 @@ private
 \ Whether the file hashes to its name; an UNSTABLE? file does not.
 : HOLDS-ITS-NAME? ( fd ^u8 n ^u8 n ^ARENA:arena -- bool )
    {: f:fd name:^ nu:n p:^ u:n ar:^ARENA:arena :}
-   false [: drop f p u s" verify upload stage for collection" ar
-      E-UNSUPPORTED E-CHANGED HASH-STABLE-FILE
-      DROPBOX:HASH>STR str> name nu STR= ;]
-   ['] UNSTABLE? CONVERTING {: code:n :}
+   false [: drop [: f p u s" verify upload stage for collection" ar
+         E-UNSUPPORTED E-CHANGED HASH-STABLE-FILE
+         DROPBOX:HASH>STR str> name nu STR= ;]
+      ['] UNSTABLE? WITH-CONVERTS ;] catch {: code:n :}
    code 0= if exit then
    drop code FS:ERRNO UNSTABLE? if false exit then
    code throw ;
