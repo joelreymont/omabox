@@ -5,7 +5,8 @@ pkgdesc='Dropbox sync for Omarchy: a headless daemon, a CLI and a bar widget'
 arch=(aarch64)
 url=https://github.com/joelreymont/omabox
 license=(MIT)
-depends=(glibc curl sqlite libsecret glib2 libunistring systemd)
+depends=(glibc libmbedtls.so=23-64 libmbedx509.so=9-64 libtfpsacrypto.so=2-64
+         sqlite libsecret glib2 libunistring systemd ca-certificates)
 makedepends=(git)
 # Habu's programs have no section headers to strip or split.
 options=(!strip !debug)

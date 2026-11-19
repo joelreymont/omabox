@@ -1,15 +1,20 @@
 \ dropbox.f - package DROPBOX: the Dropbox API v2 routes omabox calls, over
-\ libcurl's easy interface and json.f (docs/habu-dropbox.md).
-\ A client owns one curl handle. Every request resets it, sets all it needs,
-\ streams the answer whole into a growing buffer and captures the final header
-\ block, so no option or header outlives its request. A call is a POST to
-\ <api>/2/<route>; a client with no access token refreshes first, and any 401
-\ refreshes and resends the call once, which answers unlinked if refused
-\ again. Unlinked is logged once, where it is decided, and a confirmation
-\ that answers unlinked answers it in its call's place. A refresh that
-\ rotates the refresh token hands it to the config's store before the new
-\ access token is used (the token's phase, below). The long poll is a
-\ POST to <notify>/2/files/list_folder/longpoll with neither token nor root.
+\ HTTPC and json.f (docs/habu-dropbox.md).
+\ A client holds three HTTPC connections, one per origin (api, content,
+\ notify), each dialed at its first request and kept between calls while
+\ each answer allows, until REST closes api and content. Every request is a
+\ POST with `User-Agent: omabox/<version>` and its call shape's deadlines.
+\ A call reads its answer whole into a growing buffer, a download's body
+\ through READ-BODY; an answer's head stays on its connection until that
+\ connection's next request. No proxy is used: the proxy variables are
+\ ignored. A call is a POST to <api>/2/<route>; a client with no access
+\ token refreshes first, and any 401 refreshes and resends the call once,
+\ which answers unlinked if refused again. Unlinked is logged once, where
+\ it is decided, and a confirmation that answers unlinked answers it in its
+\ call's place. A refresh that rotates the refresh token hands it to the
+\ config's store before the new access token is used (the token's phase,
+\ below). The long poll is a POST to <notify>/2/files/list_folder/longpoll
+\ with neither token nor root.
 \ An answer is classified once: 200 done, 403 unlinked, 409 refused by its
 \ error tag, 422 refused invalid-root, 429, 408 and 5xx retry, a timeout or
 \ lost connection retry 0; anything else logs one line (route, status, at
@@ -26,10 +31,10 @@
 \ member is an object, else the outer `.tag` itself, so path/not_found reads
 \ not_found.
 \ STORAGE CLASS. CALLER-OWNED: OPEN lays the client and its copies of the
-\ config in the caller's arena; the client owns its handle and buffers until
-\ CLOSE. Every span or entry it answers is borrowed until its next call. One
-\ task uses a client at a time. A program runs its DROPBOX calls inside
-\ WITH-LOOPS, which starts and stops AIO's and CURL's loops.
+\ config in the caller's arena; the client owns its connections and buffers
+\ until CLOSE. Every span or entry it answers is borrowed until its next
+\ call. One task uses a client at a time. A program runs its DROPBOX calls
+\ inside WITH-LOOP, which runs AIO's loop that uploads' AIO:READ needs.
 
 require src/lib/error.f
 require src/lib/string.f
@@ -41,13 +46,14 @@ require src/lib/arena.f
 require src/lib/json.f
 require src/lib/fmt.f
 require src/lib/log.f
-require src/lib/net/curl.f
+require src/lib/net/httpc.f
 require src/lib/memory.f
 require src/lib/aio.f
 require src/lib/fsm.f
 require src/lib/unicode.f
 require src/lib/date.f
 require src/lib/type/deftype.f
+require src/version.f
 
 package DROPBOX
 public
@@ -142,14 +148,17 @@ ENUM phase ready pending rejected ;ENUM
 public
 
 \ The buffers are BUF headers in the arena: token holds the refresh token,
-\ access the access token, body a route's JSON body, line a URL or header
-\ line being built, answer the body received, heads its header block.
-\ values, a heap vector, holds the strings decoded from it. holds names
-\ what answer holds, for the log: body, or result once a download's
-\ Dropbox-API-Result replaced it. root-line is the Path-Root header line,
-\ empty for none. route names the request for the log; quiet marks the
-\ token route, whose body is never logged. status is the answer's HTTP
-\ status, 0 when curl failed with failure. outer, leaf-name and leaf are
+\ access the access token, body a route's JSON body, line a target or
+\ header line being built, answer the body received. values, a heap
+\ vector, holds the strings decoded from it. holds names what answer
+\ holds, for the log: body, or result once a download's Dropbox-API-Result
+\ replaced it. root-line is the Path-Root header line, empty for none.
+\ route names the request for the log; quiet marks the token route, whose
+\ body is never logged. api-conn, content-conn and notify-conn are the
+\ origins' connections, conn the connection of the last request PREPARE
+\ started, whose head HEADER$ reads, and out the body SEND writes. status
+\ is the answer's HTTP status, 0 when none arrived; failure the fault of
+\ the read that failed, none until one does. outer, leaf-name and leaf are
 \ an error body's tags; wait its retry_after in seconds, -1 for none;
 \ correct its correct_offset, -1 for none; issued a token answer's
 \ access_token and granted its refresh_token. sent holds a listing's
@@ -158,11 +167,14 @@ public
 \ has_more, got the members an answer must hold, one bit each; changes and
 \ backoff are a long poll's answer. tagged marks the `.tag` of the union
 \ being read: a Metadata entry or an account's root_info, whose tag is
-\ root-tag. drain takes the reads of a transfer ABANDONED ends; laid out
-\ at OPEN and never grown, so ending a transfer allocates nothing. store
-\ and phase are the config's store and the refresh token's phase.
+\ root-tag. store and phase are the config's store and the refresh token's
+\ phase.
 STRUCTURE client OPAQUE DERIVE addr
-   FIELD handle CURL:handle
+   FIELD api-conn HTTPC:conn
+   FIELD content-conn HTTPC:conn
+   FIELD notify-conn HTTPC:conn
+   FIELD conn ^HTTPC:conn
+   FIELD out SPAN:span<u8>
    FIELD key SPAN:span<u8>
    FIELD token ^n
    FIELD store [ ^u8 n -- ]
@@ -176,14 +188,13 @@ STRUCTURE client OPAQUE DERIVE addr
    FIELD line ^n
    FIELD answer ^n
    FIELD holds SPAN:span<u8>
-   FIELD heads ^n
    FIELD values ^VEC:vector<u8>
    FIELD writer JSON:writer
    FIELD cursor JSON:cursor
    FIELD route SPAN:span<u8>
    FIELD quiet bool
    FIELD status n
-   FIELD failure n
+   FIELD failure option<HTTPC:fault>
    FIELD outer SPAN:span<u8>
    FIELD leaf-name SPAN:span<u8>
    FIELD leaf SPAN:span<u8>
@@ -203,7 +214,6 @@ STRUCTURE client OPAQUE DERIVE addr
    FIELD changes bool
    FIELD backoff n
    FIELD tagged bool
-   FIELD drain SPAN:span<u8>
 ;STRUCTURE
 
 private
@@ -260,37 +270,26 @@ ENUM verdict
    code throw ;
 
 
-: CURL-FAILED ( CURL:code ^u8 n -- )
-   {: code:CURL:code what:^ what-u:n :}
+\ One line, the route, the fault and its cause on the request's connection,
+\ then E-TRANSPORT.
+: HTTP-FAILED ( ^client HTTPC:fault -- )
+   {: c f:HTTPC:fault :}
    LOG-OPEN
-   s" curl " LOG:TEXT+ what what-u LOG:TEXT+
-   s" : " LOG:TEXT+ code CURL:ERROR$ str> LOG:TEXT+
+   s" http " LOG:TEXT+ c CLIENT-ROUTE @ SPAN:$ LOG:TEXT+
+   s" : " LOG:TEXT+ f HTTPC:FAULT$ LOG:TEXT+
+   s"  cause=" LOG:TEXT+ c CLIENT-CONN @ HTTPC:CAUSE LOG:INT+
    LOG:;LINE
    E-TRANSPORT throw ;
 
 
-\ A setter's status; the step names it in the log.
-: OK ( CURL:status ^u8 n -- )
-   {: s:CURL:status what:^ what-u:n :}
-   s MATCH CURL:status
-      ok OF ENDOF
-      failed OF what what-u CURL-FAILED ENDOF
-   ;MATCH ;
-
-
-\ ---- the loops
-
-: CURLED ( [ -- ] -- )
-   {: step :}
-   CURL:LOOP-START step [: CURL:LOOP-STOP ;] finally ;
+\ ---- the loop
 
 public
 
-\ The step under AIO's and CURL's loops, which DROPBOX's calls need;
-\ a CURL loop that will not start logs a line and throws CURL:E-LOOP.
-: WITH-LOOPS ( [ -- ] -- )
+\ The step under AIO's loop, which uploads' AIO:READ needs.
+: WITH-LOOP ( [ -- ] -- )
    {: step :}
-   AIO:START [: step CURLED ;] [: AIO:STOP ;] finally ;
+   AIO:START step [: AIO:STOP ;] finally ;
 
 private
 
@@ -315,11 +314,19 @@ private
    dup FIRST-CAP BUF:N>BLEN BUF:INIT ;
 
 
-: NEW-HANDLE ( -- CURL:handle )
-   CURL:INIT MATCH CURL:init-result
-      ready OF ENDOF
-      failed OF s" init" CURL-FAILED ENDOF
-   ;MATCH ;
+\ Each connection's room, for a request's head and then its answer's.
+65536 constant HEAD-ROOM
+: TRUST ( -- ^u8 n ) s" /etc/ssl/certs/ca-certificates.crt" ;
+
+
+\ Opens h on the origin o with a room from the arena; an origin HTTPC
+\ cannot read logs one line and throws E-TRANSPORT.
+: ORIGIN-CONN ( ^HTTPC:conn SPAN:span<u8> ^ARENA:arena -- )
+   {: h o:SPAN:span<u8> ar :}
+   h o SPAN:$ TRUST ar HEAD-ROOM ARENA:ALLOC HTTPC:OPEN if exit then
+   LOG-OPEN s" http " LOG:TEXT+ o SPAN:$ LOG:TEXT+
+   s" : not an origin" LOG:TEXT+ LOG:;LINE
+   E-TRANSPORT throw ;
 
 
 \ The Path-Root line, written once through the line buffer; Dropbox
@@ -352,8 +359,15 @@ private
    construct phase ready c CLIENT-PHASE !
    cfg ar [: DROPBOX-CONFIG:API ;] KEPT c CLIENT-API !
    cfg ar [: DROPBOX-CONFIG:CONTENT ;] KEPT c CLIENT-CONTENT !
-   cfg ar [: DROPBOX-CONFIG:NOTIFY ;] KEPT c CLIENT-NOTIFY !
-   ar CHUNK ARENA:ALLOC SPAN:MAKE c CLIENT-DRAIN ! ;
+   cfg ar [: DROPBOX-CONFIG:NOTIFY ;] KEPT c CLIENT-NOTIFY ! ;
+
+
+\ The three connections, on the origins CONFIGURED kept.
+: ORIGIN-CONNS ( ^client ^ARENA:arena -- )
+   {: c ar :}
+   c CLIENT-API-CONN c CLIENT-API @ ar ORIGIN-CONN
+   c CLIENT-CONTENT-CONN c CLIENT-CONTENT @ ar ORIGIN-CONN
+   c CLIENT-NOTIFY-CONN c CLIENT-NOTIFY @ ar ORIGIN-CONN ;
 
 
 : BUFFERED ( ^client ^ARENA:arena -- )
@@ -364,7 +378,6 @@ private
    ar BUFFER c CLIENT-LINE !
    ar BUFFER c CLIENT-ANSWER !
    s" body" SPAN:MAKE c CLIENT-HOLDS !
-   ar BUFFER c CLIENT-HEADS !
    HEAP:ALLOCATOR 0 [type] u8 VEC:NEW c CLIENT-VALUES !
    ar BUFFER c CLIENT-SENT !
    ar BUFFER c CLIENT-MARK ! ;
@@ -377,29 +390,27 @@ private
 : LINE$ ( ^client -- ^u8 n ) CLIENT-LINE @ BUF$ ;
 
 
-\ Resets the handle and sets what every request needs, the URL the line
-\ buffer holds included. Peers are verified against /etc/ssl/certs, so
-\ libcurl never holds its whole CA bundle.
-: PREPARE ( ^client -- CURL:handle )
-   {: c :}
-   c CLIENT-HANDLE @ {: h:CURL:handle :}
-   h CURL:RESET s" reset" OK
-   h s" /etc/ssl/certs" >str CURL:CA-PATH! s" ca path" OK
-   h c LINE$ >str CURL:URL! s" url" OK
-   h false CURL:FOLLOW! s" follow" OK
-   h DEADLINE >MS CURL:TIMEOUT! s" timeout" OK
+\ Starts on h, the request's connection from now, a POST to the target the
+\ line holds, under the whole-call deadline, with the User-Agent line.
+: PREPARE ( ^client ^HTTPC:conn -- ^HTTPC:conn )
+   {: c h :}
+   h c CLIENT-CONN !
+   h s" POST" c LINE$ HTTPC:REQUEST
+   h DEADLINE 0 HTTPC:DEADLINES!
+   c LINE-CLEAR c s" User-Agent: omabox/" LINE+ c RELEASE:VERSION$ LINE+
+   h c LINE$ HTTPC:HEADER+
    h ;
 
 
-: AUTHORIZE ( CURL:handle ^client -- )
-   {: h:CURL:handle c :}
+: AUTHORIZE ( ^HTTPC:conn ^client -- )
+   {: h c :}
    c LINE-CLEAR
    c s" Authorization: Bearer " LINE+
    c c CLIENT-ACCESS @ BUF$ LINE+
-   h c LINE$ >str CURL:HEADER+ s" header" OK
+   h c LINE$ HTTPC:HEADER+
    c CLIENT-ROOT-LINE @ SPAN:$ {: r:^ ru:n :}
    ru 0= if exit then
-   h r ru >str CURL:HEADER+ s" header" OK ;
+   h r ru HTTPC:HEADER+ ;
 
 
 \ Free room past the answer's end, at least CHUNK bytes.
@@ -416,74 +427,35 @@ private
 
 
 \ One read; true once the transfer ended, its status or failure kept.
-: STEP ( CURL:handle ^client -- bool )
-   {: h:CURL:handle c :}
+: STEP ( ^HTTPC:conn ^client -- bool )
+   {: h c :}
    c CLIENT-ANSWER @ {: buf :}
-   h buf ROOM CURL:NEXT MATCH CURL:chunk-result
+   h buf ROOM HTTPC:NEXT MATCH HTTPC:chunk-result
       chunk OF LEN>N buf ADVANCE drop false ENDOF
-      response OF CURL:HTTP-STATUS>N c CLIENT-STATUS ! true ENDOF
-      failed OF CURL:CODE>N c CLIENT-FAILURE ! true ENDOF
+      response OF c CLIENT-STATUS ! true ENDOF
+      failed OF OPTION:SOME c CLIENT-FAILURE ! true ENDOF
    ;MATCH ;
 
 
-\ The final header block into heads; true when it fit.
-: HEADS-FIT? ( ^client -- bool )
+\ Sends the prepared request and its body, nothing received yet.
+: STARTED ( ^client -- ^HTTPC:conn )
    {: c :}
-   c CLIENT-HEADS @ {: buf :}
-   c CLIENT-HANDLE @ buf BUF:SPAN$ drop buf BUF:CAP@ BUF:BLEN>N >LEN
-   CURL:HEADERS MATCH CURL:header-result
-      complete OF LEN>N BUF:N>BLEN buf BUF:LEN! true ENDOF
-      truncated OF LEN>N BUF:N>BLEN buf swap BUF:RESERVE false ENDOF
-   ;MATCH ;
-
-
-: CAPTURE ( ^client -- )
-   {: c :}
-   c HEADS-FIT? if exit then
-   c HEADS-FIT? drop ;
-
-
-\ Starts the prepared request with nothing received yet.
-: STARTED ( ^client -- CURL:handle )
-   {: c :}
-   0 c CLIENT-STATUS ! 0 c CLIENT-FAILURE !
+   0 c CLIENT-STATUS ! OPTION:NONE c CLIENT-FAILURE !
    EMPTY c CLIENT-OUTER ! EMPTY c CLIENT-LEAF-NAME ! EMPTY c CLIENT-LEAF !
    c CLIENT-ANSWER @ BUF:CLEAR
    s" body" SPAN:MAKE c CLIENT-HOLDS !
-   c CLIENT-HEADS @ BUF:CLEAR
-   c CLIENT-HANDLE @ {: h:CURL:handle :}
-   h CURL:STREAM-START s" stream" OK
+   c CLIENT-CONN @ {: h :}
+   h c CLIENT-OUT @ SPAN:$ HTTPC:SEND
    h ;
 
 
-\ The header block of an answer that arrived.
-: ENDED ( ^client -- )
-   {: c :}
-   c CLIENT-STATUS @ 0<> if c CAPTURE then ;
-
-
-\ Cancels the transfer in flight on h and reads it to its end, its
-\ result included, so the handle is free for the next request.
-: ABANDONED ( CURL:handle ^client -- )
-   {: h:CURL:handle c :}
-   h CURL:CANCEL
-   c CLIENT-DRAIN @ SPAN:$ >LEN {: p:^ room:len :}
-   begin
-      h p room CURL:NEXT MATCH CURL:chunk-result
-         chunk OF drop drop false ENDOF
-         response OF drop true ENDOF
-         failed OF drop true ENDOF
-      ;MATCH
-   until ;
-
-
-\ The one place a throw ends h's transfer: ABANDONED ends it unless
-\ ended answers that a read of reads ended it; the code is rethrown.
-: READ-OUT ( CURL:handle ^client [ -- ] [ -- bool ] -- )
-   {: h:CURL:handle c reads ended :}
+\ The one place a throw ends h's transfer: it is closed unless ended
+\ answers that a read of reads ended it; the code is rethrown.
+: READ-OUT ( ^HTTPC:conn [ -- ] [ -- bool ] -- )
+   {: h reads ended :}
    [: reads execute ;] catch {: code:n :}
    code 0= if exit then
-   ended execute 0= if h c ABANDONED then
+   ended execute 0= if h HTTPC:CLOSE then
    code throw ;
 
 
@@ -491,9 +463,8 @@ private
 \ read that ended the transfer throws, so a throw finds it in flight.
 : TRANSFER ( ^client -- )
    {: c :}
-   c STARTED {: h:CURL:handle :}
-   h c [: begin h c STEP until ;] [: false ;] READ-OUT
-   c ENDED ;
+   c STARTED {: h :}
+   h [: begin h c STEP until ;] [: false ;] READ-OUT ;
 
 
 \ ---- reading headers
@@ -520,10 +491,10 @@ private
    a nu >str nm nu >str STR=CI ;
 
 
-\ The trimmed value of the header name in the captured block, else empty.
+\ The trimmed value of the header name in the answer's head, else empty.
 : HEADER$ ( ^client ^u8 n -- ^u8 n )
    {: c nm:^ nu:n :}
-   c CLIENT-HEADS @ BUF$ {: a:^ u:n :}
+   c CLIENT-CONN @ HTTPC:HEAD$ {: a:^ u:n :}
    0 begin dup u < while
       a u rot LINE >r
       2dup nm nu NAMES? if
@@ -718,13 +689,35 @@ private
 : ANSWER ( reply -- verdict ) construct verdict answer ;
 
 
-\ A failed transfer: a timeout or a lost connection is retry 0.
+\ A fault that may pass if the call is made again, a timeout or a lost
+\ connection, is retry 0; any other is logged and thrown.
+: FAULTED ( ^client HTTPC:fault -- reply )
+   {: c f:HTTPC:fault :}
+   f HTTPC:LOST? if 0 RETRY exit then
+   c f HTTP-FAILED ;
+
+
+\ One line, the route and that no answer came, then E-TRANSPORT.
+: UNANSWERED ( ^client -- reply )
+   {: c :}
+   LOG-OPEN s" http " LOG:TEXT+ c CLIENT-ROUTE @ SPAN:$ LOG:TEXT+
+   s" : no answer" LOG:TEXT+ LOG:;LINE
+   E-TRANSPORT throw ;
+
+
+\ A transfer that ended with no answer, by its fault.
 : LOST ( ^client -- reply )
    {: c :}
-   c CLIENT-FAILURE @ CURL:>CODE {: code:CURL:code :}
-   code CURL:LOST? if 0 RETRY exit then
-   c CLIENT-ROUTE @ SPAN:$ {: r:^ ru:n :}
-   code r ru CURL-FAILED ;
+   c CLIENT-FAILURE @ MATCH option
+      some OF c swap FAULTED ENDOF
+      none OF c UNANSWERED ENDOF
+   ;MATCH ;
+
+
+\ 408, 429 and 5xx: statuses Dropbox may answer otherwise later.
+: UNAVAILABLE? ( n -- bool )
+   {: s:n :}
+   s 408 = s 429 = or s 500 >= s 599 <= and or ;
 
 
 \ Whether the reply is a retry asking no wait.
@@ -745,7 +738,7 @@ private
    c CLIENT-QUIET @ if false exit then
    c CLIENT-STATUS @ {: s:n :}
    s 0= if true exit then
-   s 429 <> s CURL:>HTTP-STATUS CURL:UNAVAILABLE? and ;
+   s 429 <> s UNAVAILABLE? and ;
 
 
 \ 429: the larger of Retry-After and the body's error.retry_after; 408 or
@@ -799,7 +792,7 @@ private
    s 403 = if c s" 403" UNLINKED ANSWER exit then
    s 409 = if c REFUSED ANSWER exit then
    s 422 = if construct error invalid-root construct reply refused ANSWER exit then
-   s CURL:>HTTP-STATUS CURL:UNAVAILABLE? if c WAITED ANSWER exit then
+   s UNAVAILABLE? if c WAITED ANSWER exit then
    c s UNEXPECTED ;
 
 
@@ -828,7 +821,8 @@ private
    u 0 ?do a i + c@ buf BYTE+ loop ;
 
 
-\ The refresh's form body, in the line buffer once PREPARE copied the URL.
+\ The refresh's form body, in the line buffer: HTTPC:HEADER+ copied each
+\ head line out of it.
 : FORM ( ^client -- ^u8 n )
    {: c :}
    c CLIENT-LINE @ {: buf :}
@@ -939,7 +933,7 @@ private
    s 0= if c LOST exit then
    s 200 = if c kept execute exit then
    s 400 = if c dead GRANT exit then
-   s CURL:>HTTP-STATUS CURL:UNAVAILABLE? if c WAITED exit then
+   s UNAVAILABLE? if c WAITED exit then
    c s UNEXPECTED ;
 
 
@@ -950,9 +944,10 @@ private
    c CLIENT-ACCESS @ BUF:CLEAR
    s" oauth2/token" SPAN:MAKE c CLIENT-ROUTE !
    true c CLIENT-QUIET !
-   c LINE-CLEAR c c CLIENT-API @ SPAN:$ LINE+ c s" /oauth2/token" LINE+
-   c PREPARE {: h:CURL:handle :}
-   h c form execute >str CURL:BODY! s" body" OK
+   c LINE-CLEAR c s" /oauth2/token" LINE+
+   c c CLIENT-API-CONN PREPARE {: h :}
+   h s" Content-Type: application/x-www-form-urlencoded" HTTPC:HEADER+
+   c form execute SPAN:MAKE c CLIENT-OUT !
    c TRANSFER ;
 
 
@@ -979,21 +974,22 @@ public
 private
 
 
-\ A POST to <origin>/2/<route>; body sets the route's headers and body, and
-\ send exchanges the request and classifies its answer.
-: ATTEMPT ( ^client SPAN:span<u8> ^u8 n [ CURL:handle ^client -- ] [ ^client -- verdict ] -- verdict )
-   {: c o:SPAN:span<u8> r:^ ru:n body send :}
+\ A POST to /2/<route> on the origin's connection o; body sets the route's
+\ headers and body, and send exchanges the request and classifies its
+\ answer.
+: ATTEMPT ( ^client ^HTTPC:conn ^u8 n [ ^HTTPC:conn ^client -- ] [ ^client -- verdict ] -- verdict )
+   {: c o r:^ ru:n body send :}
    r ru SPAN:MAKE c CLIENT-ROUTE !
    false c CLIENT-QUIET !
-   c LINE-CLEAR c o SPAN:$ LINE+ c s" /2/" LINE+ c r ru LINE+
-   c PREPARE {: h:CURL:handle :}
+   c LINE-CLEAR c s" /2/" LINE+ c r ru LINE+
+   c o PREPARE {: h :}
    h c AUTHORIZE
    h c body execute
    c send execute ;
 
 
-: RESEND ( ^client SPAN:span<u8> ^u8 n [ CURL:handle ^client -- ] [ ^client -- verdict ] -- reply )
-   {: c o:SPAN:span<u8> r:^ ru:n body send :}
+: RESEND ( ^client ^HTTPC:conn ^u8 n [ ^HTTPC:conn ^client -- ] [ ^client -- verdict ] -- reply )
+   {: c o r:^ ru:n body send :}
    c REFRESH {: again:reply :}
    again DONE? 0= if again exit then
    c o r ru body send ATTEMPT MATCH verdict
@@ -1025,8 +1021,8 @@ private
    ;MATCH ;
 
 
-: CALL-AT ( ^client SPAN:span<u8> ^u8 n [ CURL:handle ^client -- ] [ ^client -- verdict ] -- reply )
-   {: c o:SPAN:span<u8> r:^ ru:n body send :}
+: CALL-AT ( ^client ^HTTPC:conn ^u8 n [ ^HTTPC:conn ^client -- ] [ ^client -- verdict ] -- reply )
+   {: c o r:^ ru:n body send :}
    c READY {: first:reply :}
    first DONE? 0= if first exit then
    c o r ru body send ATTEMPT MATCH verdict
@@ -1040,9 +1036,9 @@ private
 
 
 \ A POST to <api>/2/<route>; body sets the route's headers and body.
-: CALL ( ^client ^u8 n [ CURL:handle ^client -- ] -- reply )
+: CALL ( ^client ^u8 n [ ^HTTPC:conn ^client -- ] -- reply )
    {: c r:^ ru:n body :}
-   c c CLIENT-API @ r ru body [: RECEIVED ;] CALL-AT ;
+   c c CLIENT-API-CONN r ru body [: RECEIVED ;] CALL-AT ;
 
 
 \ On done, reads the answer into the client.
@@ -1052,18 +1048,16 @@ private
    r ;
 
 
-\ An empty body, and an empty Content-Type line to drop the form type
-\ libcurl adds to it.
-: NO-BODY ( CURL:handle ^client -- )
-   drop {: h:CURL:handle :}
-   h s" Content-Type:" >str CURL:HEADER+ s" header" OK
-   h s" " >str CURL:BODY! s" body" OK ;
+\ An empty body, with no Content-Type line.
+: NO-BODY ( ^HTTPC:conn ^client -- )
+   nip {: c :}
+   EMPTY c CLIENT-OUT ! ;
 
 
-: JSON-BODY ( CURL:handle ^client -- )
-   {: h:CURL:handle c :}
-   h s" Content-Type: application/json" >str CURL:HEADER+ s" header" OK
-   h c CLIENT-BODY @ BUF$ >str CURL:BODY! s" body" OK ;
+: JSON-BODY ( ^HTTPC:conn ^client -- )
+   {: h c :}
+   h s" Content-Type: application/json" HTTPC:HEADER+
+   c CLIENT-BODY @ BUF$ SPAN:MAKE c CLIENT-OUT ! ;
 
 
 : BODY-OPEN ( ^client -- ^JSON:writer )
@@ -1338,21 +1332,19 @@ private
 
 
 \ The content deadlines: a stall ends the call, a long body does not.
-: STALLED ( CURL:handle -- )
-   {: h:CURL:handle :}
-   h 0 >MS CURL:TIMEOUT! s" timeout" OK
-   h 1 IDLE CURL:LOW-SPEED! s" low speed" OK ;
+: STALLED ( ^HTTPC:conn -- )
+   0 IDLE 1000 * HTTPC:DEADLINES! ;
 
 
 \ An empty body, the rev's argument, a Range from a nonzero offset, and the
 \ content deadlines.
-: ASKED ( CURL:handle ^client ^u8 n n -- )
-   {: h:CURL:handle c r:^ ru:n at:n :}
+: ASKED ( ^HTTPC:conn ^client ^u8 n n -- )
+   {: h c r:^ ru:n at:n :}
    h c NO-BODY
-   h c r ru ARG-LINE >str CURL:HEADER+ s" header" OK
+   h c r ru ARG-LINE HTTPC:HEADER+
    at 0 > if
       c LINE-CLEAR c s" Range: bytes=" LINE+ c at INT+ c s" -" LINE+
-      h c LINE$ >str CURL:HEADER+ s" header" OK
+      h c LINE$ HTTPC:HEADER+
    then
    h STALLED ;
 
@@ -1407,7 +1399,7 @@ private
    0= if c s" another Content-Range" E-UNVERIFIED FAILED then ;
 
 
-\ The status, metadata and Content-Range of a 2xx answer, from the captured
+\ The status, metadata and Content-Range of a 2xx answer, from the answer's
 \ headers: the rev, content hash and range asked.
 : CHECKED ( ^client ^u8 n ^u8 n n -- )
    {: c r:^ ru:n h:^ hu:n at:n :}
@@ -1435,12 +1427,13 @@ ENUM stream-event held response short failure overrun unread ;ENUM
 
 
 \ One download's read: held the chunk read last and taken its bytes the
-\ reader took, total all it took; failure a failed transfer's curl code;
+\ reader took, total all it took; conn the transfer's connection; failure
+\ the fault of the read that failed;
 \ room what the read in progress asks; returned once the body returned.
 public
 STRUCTURE fetch OPAQUE DERIVE addr
    FIELD client ^client
-   FIELD handle CURL:handle
+   FIELD conn ^HTTPC:conn
    FIELD rev rev
    FIELD content-hash hash
    FIELD offset n
@@ -1448,7 +1441,7 @@ STRUCTURE fetch OPAQUE DERIVE addr
    FIELD held SPAN:span<u8>
    FIELD taken n
    FIELD status n
-   FIELD failure n
+   FIELD failure option<HTTPC:fault>
    FIELD total n
    FIELD room n
    FIELD returned bool
@@ -1466,11 +1459,11 @@ HEAP FETCHES fetch
    ERROR:CODE E-BODY-LOST
 
 
-: HOLD ( CURL:http-status len ^u8 ^fetch -- )
+: HOLD ( n len ^u8 ^fetch -- )
    {: p:^ f :}
    LEN>N p swap SPAN:MAKE f FETCH-HELD !
    0 f FETCH-TAKEN !
-   CURL:HTTP-STATUS>N f FETCH-STATUS ! ;
+   f FETCH-STATUS ! ;
 
 
 \ One read into the body buffer, which a download never sends.
@@ -1479,21 +1472,21 @@ HEAP FETCHES fetch
    f FETCH-CLIENT @ CLIENT-BODY @ {: buf :}
    buf BUF:CLEAR
    buf ROOM {: p:^ room:len :}
-   f FETCH-HANDLE @ p room CURL:NEXT MATCH CURL:chunk-result
+   f FETCH-CONN @ p room HTTPC:NEXT MATCH HTTPC:chunk-result
       chunk OF p f HOLD construct read-event chunk ENDOF
       response OF
-         CURL:HTTP-STATUS>N f FETCH-STATUS !
+         f FETCH-STATUS !
          construct read-event response
       ENDOF
       failed OF
-         CURL:CODE>N f FETCH-FAILURE !
+         OPTION:SOME f FETCH-FAILURE !
          construct read-event failure
       ENDOF
    ;MATCH ;
 
 
-\ The first chunk: a 2xx one passes CHECKED, made through the headers
-\ curl answers from that chunk on, or CHECKED throws; any other status is
+\ The first chunk: a 2xx one passes CHECKED, made through the answer's
+\ head, read before that chunk, or CHECKED throws; any other status is
 \ the core's to classify.
 : FIRST-CHECKED ( ^fetch -- open-event )
    {: f :}
@@ -1501,7 +1494,6 @@ HEAP FETCHES fetch
    s 200 >= s 300 < and 0= if construct open-event other exit then
    f FETCH-CLIENT @ {: c :}
    s c CLIENT-STATUS !
-   c CAPTURE
    c f REV-HASH f FETCH-OFFSET @ CHECKED
    construct open-event passed ;
 
@@ -1522,7 +1514,7 @@ HEAP FETCHES fetch
 
 
 \ The transfer ended with an answer: only its status, as nothing after
-\ the read that ended a transfer may throw; ENDED captures its headers.
+\ the read that ended a transfer may throw.
 : RESPONDED ( ^fetch -- )
    {: f :}
    f FETCH-STATUS @ f FETCH-CLIENT @ CLIENT-STATUS ! ;
@@ -1575,7 +1567,7 @@ HEAP FETCHES fetch
    construct stream-event held ;
 
 
-\ curl's last read: response for a body of the rest bytes after the
+\ The transfer's last read: response for a body of the rest bytes after the
 \ offset, short for one of fewer.
 : LAST-EVENT ( ^fetch n -- stream-event )
    {: f rest:n :}
@@ -1584,7 +1576,7 @@ HEAP FETCHES fetch
 
 
 \ unread once the body returned; else, with the held chunk all taken,
-\ curl's next read, then held or overrun for the read in progress.
+\ the transfer's next read, then held or overrun for the read in progress.
 : STREAM-SENSE ( ^fetch -- stream-event )
    {: f :}
    f FETCH-RETURNED @ if construct stream-event unread exit then
@@ -1597,10 +1589,9 @@ HEAP FETCHES fetch
    ;MATCH ;
 
 
-\ Cancels the transfer in flight and reads it to its end.
+\ Ends the transfer in flight by closing its connection.
 : ABANDON ( ^fetch -- )
-   {: f :}
-   f FETCH-HANDLE @ f FETCH-CLIENT @ ABANDONED ;
+   FETCH-CONN @ HTTPC:CLOSE ;
 
 
 \ One download's transfer, after formal/Downloading.tla. A throw from a
@@ -1709,16 +1700,12 @@ private
    begin f STEPPED until ;
 
 
-\ Sends the request and reads it through DOWNLOADING under READ-OUT. A
-\ transfer cancelled or overran keeps no header block for ENDED to capture.
+\ Sends the request and reads it through DOWNLOADING under READ-OUT.
 : RECEIVING ( ^fetch [ n n ^fetch -- ] -- )
    {: f body :}
-   f FETCH-CLIENT @ {: c :}
-   c STARTED {: h:CURL:handle :}
-   h f FETCH-HANDLE !
-   h c [: f body DRIVEN ;] [: f FETCH-STEP @ FINAL? ;] READ-OUT
-   f FETCH-STEP @ {: s:download-step :}
-   s CANCELLED? s OVERRAN? or 0= if c ENDED then ;
+   f FETCH-CLIENT @ STARTED {: h :}
+   h f FETCH-CONN !
+   h [: f body DRIVEN ;] [: f FETCH-STEP @ FINAL? ;] READ-OUT ;
 
 
 \ RECEIVING, where the reader's E-BODY-LOST ends: the machine is lost.
@@ -1800,7 +1787,7 @@ private
 : FROM
    ( rev hash n ^client [ n n ^fetch -- ] [ ^fetch -- reply ] -- reply )
    {: v:rev h:hash at:n c body unsat :}
-   c c CLIENT-CONTENT @ s" files/download"
+   c c CLIENT-CONTENT-CONN s" files/download"
    [: v REV>STR str> at ASKED ;] [: v h at body unsat FETCHED ;] CALL-AT ;
 
 
@@ -1856,21 +1843,19 @@ private
    c CLIENT-BODY @ DISCARD
    c CLIENT-LINE @ DISCARD
    c CLIENT-ANSWER @ DISCARD
-   c CLIENT-HEADS @ DISCARD
    c CLIENT-VALUES @ VEC:DELETE
    c CLIENT-SENT @ DISCARD
    c CLIENT-MARK @ DISCARD ;
 
 
 \ What OPEN keeps in c. A throw part-way disposes the buffers made and
-\ goes on; the rest is the arena's, and the handle, made last, exists only
-\ when nothing threw.
+\ goes on; the rest, the connections' rooms included, is the arena's.
 : FILLED ( ^client ^config ^ARENA:arena -- )
    {: c cfg ar :}
    [: c ar BUFFERED
       c cfg ar CONFIGURED
       c cfg DROPBOX-CONFIG:ROOT @ SPAN:$ ar ROOT-LINE c CLIENT-ROOT-LINE !
-      NEW-HANDLE c CLIENT-HANDLE ! ;] catch {: code:n :}
+      c ar ORIGIN-CONNS ;] catch {: code:n :}
    code 0= if exit then
    c UNBUFFERED
    code throw ;
@@ -1893,9 +1878,17 @@ public
    c ;
 
 
+\ Closes the api and content connections; the next call on either dials
+\ again. The long poll's stays.
+: REST ( ^client -- )
+   {: c :}
+   c CLIENT-API-CONN HTTPC:CLOSE
+   c CLIENT-CONTENT-CONN HTTPC:CLOSE ;
+
 : CLOSE ( ^client -- )
    {: c :}
-   c CLIENT-HANDLE @ CURL:CLEANUP
+   c REST
+   c CLIENT-NOTIFY-CONN HTTPC:CLOSE
    c CLIENT-CURSOR JSON:READ-DISPOSE
    c UNBUFFERED ;
 
@@ -2150,11 +2143,9 @@ private
    {: c secs:n :}
    s" files/list_folder/longpoll" SPAN:MAKE c CLIENT-ROUTE !
    false c CLIENT-QUIET !
-   c LINE-CLEAR c c CLIENT-NOTIFY @ SPAN:$ LINE+
-   c s" /2/files/list_folder/longpoll" LINE+
-   c PREPARE {: h:CURL:handle :}
-   h secs SLACK + GRACE + 1000 * >MS CURL:TIMEOUT! s" timeout" OK
-   h 0 0 CURL:LOW-SPEED! s" low speed" OK
+   c LINE-CLEAR c s" /2/files/list_folder/longpoll" LINE+
+   c c CLIENT-NOTIFY-CONN PREPARE {: h :}
+   h secs SLACK + GRACE + 1000 * 0 HTTPC:DEADLINES!
    h c JSON-BODY
    c TRANSFER
    c CLASSIFY ;
@@ -2485,8 +2476,10 @@ public
    c CLIENT-STATUS @ {: s:n :}
    s 0= if
       s"  got no answer" LOG:TEXT+
-      c CLIENT-FAILURE @ {: f:n :}
-      f 0<> if s" : " LOG:TEXT+ f CURL:>CODE CURL:ERROR$ str> LOG:TEXT+ then
+      c CLIENT-FAILURE @ MATCH option
+         some OF s" : " LOG:TEXT+ HTTPC:FAULT$ LOG:TEXT+ ENDOF
+         none OF ENDOF
+      ;MATCH
    else
       s"  answered " LOG:TEXT+ s LOG:INT+
       c TAG$ nip 0<> if s" : " LOG:TEXT+ c LEAF$ LOG:TEXT+ then
@@ -2544,7 +2537,7 @@ public
 \ bytes. A call Dropbox may have applied, or a 2xx answer that is not the
 \ upload's complete entry at its path with its content hash, is refused
 \ unverified, but an append is resent once; a conflict is answered as
-\ refused. A run's chunk buffer is MEM's and libcurl reads it in place: it
+\ refused. A run's chunk buffer is MEM's and SEND writes it in place: it
 \ is refilled and released only between calls, each transfer ended, before
 \ UPLOAD answers or throws.
 
@@ -2800,30 +2793,28 @@ HEAP RUNS run
 
 \ A finish sends no byte and is silent until Dropbox commits, so only the
 \ whole call is bounded.
-: PATIENT ( CURL:handle -- )
-   {: h:CURL:handle :}
-   h FINISH-WAIT 1000 * >MS CURL:TIMEOUT! s" timeout" OK
-   h 0 0 CURL:LOW-SPEED! s" low speed" OK ;
+: PATIENT ( ^HTTPC:conn -- )
+   FINISH-WAIT 1000 * 0 HTTPC:DEADLINES! ;
 
 
 \ The argument the fields write, the bytes, and the deadlines.
-: ARGUED ( CURL:handle ^client ^u8 n [ ^JSON:writer -- ^JSON:writer ] [ CURL:handle -- ] -- )
-   {: h:CURL:handle c b:^ bu:n fields deadline :}
+: ARGUED ( ^HTTPC:conn ^client ^u8 n [ ^JSON:writer -- ^JSON:writer ] [ ^HTTPC:conn -- ] -- )
+   {: h c b:^ bu:n fields deadline :}
    c BODY-OPEN JSON:WRITE-OBJECT-START fields execute
    JSON:WRITE-OBJECT-END JSON:WRITE-CLOSE
    c LINE-CLEAR c s" Dropbox-API-Arg: " LINE+
    c c CLIENT-BODY @ BUF$ LINE+
-   h c LINE$ >str CURL:HEADER+ s" header" OK
-   h s" Content-Type: application/octet-stream" >str CURL:HEADER+ s" header" OK
-   h b bu >str CURL:BORROW-BODY! s" body" OK
+   h c LINE$ HTTPC:HEADER+
+   h s" Content-Type: application/octet-stream" HTTPC:HEADER+
+   b bu SPAN:MAKE c CLIENT-OUT !
    h deadline execute ;
 
 
 \ A POST of the bytes to <content>/2/<route>, under the deadlines.
-: SENT ( ^run ^u8 n ^u8 n [ ^JSON:writer -- ^JSON:writer ] [ CURL:handle -- ] -- reply )
+: SENT ( ^run ^u8 n ^u8 n [ ^JSON:writer -- ^JSON:writer ] [ ^HTTPC:conn -- ] -- reply )
    {: r rt:^ ru:n b:^ bu:n fields deadline :}
    r RUN-CLIENT @ {: c :}
-   c c CLIENT-CONTENT @ rt ru
+   c c CLIENT-CONTENT-CONN rt ru
    [: b bu fields deadline ARGUED ;] [: RECEIVED ;] CALL-AT ;
 
 

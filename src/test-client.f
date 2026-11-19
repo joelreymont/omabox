@@ -2,7 +2,8 @@
 \ slot leases and checkpointed partial downloads, for tests, never
 \ production.
 \ CLIENT-ON opens a client on test-dropbox.f's fake with a store, a token
-\ and a root, OPENED one keeping no rotated token, MAIN holds it while it
+\ and a root, OPENED one keeping no rotated token, IDLE the same at
+\ NOWHERE$, an origin that never resolves, MAIN holds it while it
 \ serves, ACCOUNTED takes its first access token, NEW-LINK makes a
 \ REPLAY link on a client below a root, and DOWNLOADS$ is the fake's
 \ record of downloads. RECORD journals a pending plan at a path.
@@ -28,7 +29,6 @@ require src/lib/test.f
 require src/lib/fs.f
 require src/lib/fmt.f
 require src/lib/adt/option.f
-require src/lib/net/curl.f
 require src/dropbox.f
 require src/test-dropbox.f
 require src/model.f
@@ -87,24 +87,38 @@ TYPED-VARIABLE CFG DROPBOX:config
 \ The client on the fake, while it serves.
 TYPED-VARIABLE MAIN ^DROPBOX:client
 
-\ A client on the fake with the store s, refresh token t and root r.
-: CLIENT-ON
-   ( [ ^u8 n -- ] ^u8 n ^u8 n ^ARENA:arena -- ^DROPBOX:client )
-   {: s t:^ tu:n r:^ ru:n ar :}
+\ A client at origin o with the store s, refresh token t and root r.
+: CLIENT-AT
+   ( ^u8 n [ ^u8 n -- ] ^u8 n ^u8 n ^ARENA:arena -- ^DROPBOX:client )
+   {: o:^ ou:n s t:^ tu:n r:^ ru:n ar :}
    s CFG DROPBOX-CONFIG:STORE !
    CFG DROPBOX:PRODUCTION
-   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:API !
-   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:NOTIFY !
-   TEST-DROPBOX:ORIGIN$ SPAN:MAKE CFG DROPBOX-CONFIG:CONTENT !
+   o ou SPAN:MAKE CFG DROPBOX-CONFIG:API !
+   o ou SPAN:MAKE CFG DROPBOX-CONFIG:NOTIFY !
+   o ou SPAN:MAKE CFG DROPBOX-CONFIG:CONTENT !
    s" fake-key" SPAN:MAKE CFG DROPBOX-CONFIG:KEY !
    t tu SPAN:MAKE CFG DROPBOX-CONFIG:TOKEN !
    r ru SPAN:MAKE CFG DROPBOX-CONFIG:ROOT !
    CFG ar DROPBOX:OPEN ;
 
+\ A client on the fake with the store s, refresh token t and root r.
+: CLIENT-ON
+   ( [ ^u8 n -- ] ^u8 n ^u8 n ^ARENA:arena -- ^DROPBOX:client )
+   {: s t:^ tu:n r:^ ru:n ar :}
+   TEST-DROPBOX:ORIGIN$ s t tu r ru ar CLIENT-AT ;
+
 \ A client on the fake, no root, keeping no rotated token.
 : OPENED ( ^ARENA:arena -- ^DROPBOX:client )
    {: ar :}
    [: 2drop ;] s" live-token" s" " ar CLIENT-ON ;
+
+\ An origin under the name RFC 6761 reserves never to resolve.
+: NOWHERE$ ( -- ^u8 n ) s" https://dropbox.invalid" ;
+
+\ OPENED at NOWHERE$, for a case that sends nothing.
+: IDLE ( ^ARENA:arena -- ^DROPBOX:client )
+   {: ar :}
+   NOWHERE$ [: 2drop ;] s" live-token" s" " ar CLIENT-AT ;
 
 \ The account call takes the client's first access token, so no case's
 \ requests start with a refresh.

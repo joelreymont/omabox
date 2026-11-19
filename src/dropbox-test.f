@@ -80,7 +80,6 @@ require src/lib/memory.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
 require src/lib/test/stderr.f
-require src/lib/net/curl.f
 require src/test-formal.f
 require src/dropbox.f
 require src/test-dropbox.f
@@ -94,11 +93,14 @@ private
 TYPED-VARIABLE PROBE config
 
 
-\ A client on an arena of its own, with PROBE's root, no origins and a
-\ store that keeps nothing, as no case refreshes.
+\ A client on an arena of its own, with PROBE's root, origins at
+\ NOWHERE$ and a store that keeps nothing, as no case sends.
 : PROBED ( ^u8 n ^ARENA:arena -- ^client )
    {: r:^ ru:n ar :}
    r ru SPAN:MAKE PROBE DROPBOX-CONFIG:ROOT !
+   TEST-CLIENT:NOWHERE$ SPAN:MAKE PROBE DROPBOX-CONFIG:API !
+   TEST-CLIENT:NOWHERE$ SPAN:MAKE PROBE DROPBOX-CONFIG:NOTIFY !
+   TEST-CLIENT:NOWHERE$ SPAN:MAKE PROBE DROPBOX-CONFIG:CONTENT !
    [: 2drop ;] PROBE DROPBOX-CONFIG:STORE !
    PROBE ar OPEN ;
 
@@ -128,7 +130,6 @@ TYPED-VARIABLE PROBE config
    c CLIENT-BODY @ BUF:LIVE? 0= T-ASSERT
    c CLIENT-LINE @ BUF:LIVE? 0= T-ASSERT
    c CLIENT-ANSWER @ BUF:LIVE? 0= T-ASSERT
-   c CLIENT-HEADS @ BUF:LIVE? 0= T-ASSERT
    c CLIENT-SENT @ BUF:LIVE? 0= T-ASSERT
    c CLIENT-MARK @ BUF:LIVE? 0= T-ASSERT
    ar ARENA:RELEASE ;
@@ -309,6 +310,9 @@ variable REFUSALS
    TEST-DROPBOX:SEEN$ s" /oauth2/token /2/users/get_current_account" T$=
    TEST-DROPBOX:AUTH$ s" Bearer sl.fake-1" T$=
    TEST-DROPBOX:TYPE-SENT? TFALSE
+   TEST-DROPBOX:TOKEN-TYPE$ s" application/x-www-form-urlencoded" T$=
+   SB-RESET s" omabox/" SB-APPEND RELEASE:VERSION$ SB-APPEND
+   TEST-DROPBOX:AGENT-SENT$ SB$ T$=
    TEST-DROPBOX:LEAKED? TFALSE ;
 
 
@@ -894,8 +898,8 @@ TYPED-VARIABLE OWN ^DROPBOX:client
 
 
 \ A line that is not HTTP on a connection an answer kept open, as the
-\ client's calls reuse one: CURLE_WEIRD_SERVER_REPLY, 8, not a lost
-\ exchange. A fresh connection would give CURLE_UNSUPPORTED_PROTOCOL.
+\ client's calls on one origin reuse one: HTTPC's malformed, not a lost
+\ exchange, logged with no cause.
 : GARBLED-CASE ( -- )
    s" transport failure" T-LABEL
    TEST-DROPBOX:RESET
@@ -903,9 +907,10 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    TEST-DROPBOX:RESET
    TEST-DROPBOX:GARBLE
    [: METADATA-DROPPED ;] LOGGED DROPBOX:E-TRANSPORT T=
-   8 CURL:>CODE CURL:LOST? TFALSE
-   SB-RESET s" error dropbox: curl files/get_metadata: " SB-APPEND
-   8 CURL:>CODE CURL:ERROR$ str> SB-APPEND
+   HTTPC-FAULT:MALFORMED HTTPC:LOST? TFALSE
+   SB-RESET s" error dropbox: http files/get_metadata: " SB-APPEND
+   HTTPC-FAULT:MALFORMED HTTPC:FAULT$ SB-APPEND
+   s"  cause=0" SB-APPEND
    SB$ LOGGED? TTRUE
    TEST-DROPBOX:SEEN$ s" /2/files/get_metadata" T$= ;
 
@@ -1317,6 +1322,45 @@ variable READ-COUNT
    {: at:n :}
    SUNK-CLEAR
    ABC-REV ABC-HASH at MAIN @ [: SUNK-BODY ;] DROPBOX:DOWNLOAD ;
+
+
+\ A long poll on c that answers no change, set up as WAITED's.
+: POLLED ( ^DROPBOX:client -- )
+   {: c :}
+   LISTING false 0 TEST-DROPBOX:POLL!
+   s" c3" 30 c DROPBOX:WAIT DROPBOX:DONE? ASSERT ;
+
+
+\ A whole download of the alphabet file on c, read to its end.
+: DOWNLOADED ( ^DROPBOX:client -- )
+   {: c :}
+   TEST-DROPBOX:RESET ALPHABET SUNK-CLEAR
+   ABC-REV ABC-HASH 0 c [: SUNK-BODY ;] DROPBOX:DOWNLOAD
+   DROPBOX:DONE? ASSERT ;
+
+
+\ A client's calls on each origin reuse one connection; after REST the api and
+\ content calls dial again while the long poll's stays: the server counts dials.
+: REUSED-CASE ( -- )
+   s" connections reused and rested" T-LABEL
+   TEST-DROPBOX:RESET
+   s" live-token" s" ns-root" RECORDED-CLIENT {: c :}
+   TEST-DROPBOX:ACCEPTED {: n0:n :}
+   c DROPBOX:ACCOUNT DROPBOX:DONE? ASSERT
+   c DROPBOX:ACCOUNT DROPBOX:DONE? ASSERT
+   TEST-DROPBOX:ACCEPTED n0 - 1 T=
+   c DOWNLOADED c DOWNLOADED
+   TEST-DROPBOX:ACCEPTED n0 - 2 T=
+   c POLLED
+   TEST-DROPBOX:ACCEPTED n0 - 3 T=
+   c DROPBOX:REST
+   c POLLED
+   TEST-DROPBOX:ACCEPTED n0 - 3 T=
+   c DROPBOX:ACCOUNT DROPBOX:DONE? ASSERT
+   TEST-DROPBOX:ACCEPTED n0 - 4 T=
+   c DOWNLOADED
+   TEST-DROPBOX:ACCEPTED n0 - 5 T=
+   c DROPBOX:CLOSE ;
 
 
 : WHOLE-CASE ( -- )
@@ -2322,7 +2366,8 @@ TYPED-VARIABLE FAULT fault
    UNSTAGED ;
 
 
-\ Dropbox already holds these bytes, as after an upload libcurl resent.
+\ Dropbox already holds these bytes, as after an upload that reached it
+\ but whose answer was lost.
 : HELD-CASE ( -- )
    s" upload already held" T-LABEL
    TEST-DROPBOX:RESET -1 FAULT-AT !
@@ -2989,7 +3034,7 @@ TYPED-VARIABLE FAULT fault
    PAGES-CASE LONG-CASE RESET-CASE STALL-CASE UNTAGGED-CASE PATHLESS-CASE
    PROBE-STALL-CASE PROBE-FIRST-CASE UNDOWNLOADABLE-LISTED-CASE
    INCOMPLETE-LISTED-CASE RESTRICTED-LISTED-CASE INCOMPLETE-KINDS-CASE
-   POLL-CASE LONG-POLL-EXPOSES-RESET-AND-RATE-LIMIT-OUTCOMES
+   POLL-CASE REUSED-CASE LONG-POLL-EXPOSES-RESET-AND-RATE-LIMIT-OUTCOMES
    DOWNLOAD-CASES
    DELETE-CONFLICT-CASE DELETE-MISSING-CASE DELETE-GONE-CASE
    LOST-DELETE-CASE DELETE-ELSEWHERE-CASE DELETE-REV-CASE
@@ -3028,8 +3073,8 @@ public
    ARENA:NEW AR !
    FORMAL-DOWNLOADING-CASE
    FORMAL-SESSION-CASE
-   AIO:START CURL:LOOP-START
-   [: SERVED ;] [: CURL:LOOP-STOP AIO:STOP ;] finally
+   AIO:START
+   [: SERVED ;] [: AIO:STOP ;] finally
    AR @ ARENA:RELEASE
    s" dropbox-test: " type T-CASES FMT:.INT s"  checks" type cr
    T-REPORT ;

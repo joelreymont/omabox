@@ -127,7 +127,6 @@ require src/lib/vector.f
 require src/lib/adt/option.f
 require src/lib/fs-list.f
 require src/lib/aio.f
-require src/lib/net/curl.f
 require src/dropbox.f
 require src/test-dropbox.f
 require src/model.f
@@ -3563,13 +3562,13 @@ variable SIDES
 
 
 \ The mutation, bridge and remote replay cases against one fake Dropbox,
-\ under curl's loop.
+\ under AIO's loop.
 : DROPBOX-CASES ( ^ARENA:arena -- )
    {: ar :}
-   AIO:START CURL:LOOP-START
+   AIO:START
    [: TEST-DROPBOX:START
       [: ar SERVED ar BRIDGE-SERVED ;] [: TEST-DROPBOX:STOP ;] finally ;]
-   [: CURL:LOOP-STOP AIO:STOP ;] finally ;
+   [: AIO:STOP ;] finally ;
 
 \ ---- the tables against their models
 

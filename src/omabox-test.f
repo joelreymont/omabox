@@ -64,7 +64,7 @@
 \   linked_refuses_an_unavailable_account,
 \   linked_refuses_a_root_not_a_folder and
 \   linked_refuses_an_account_of_another_root_tag, Omabox's own:
-\   against test-dropbox.f's fake under DROPBOX:WITH-LOOPS, each log
+\   against test-dropbox.f's fake under DROPBOX:WITH-LOOP, each log
 \   captured in a file under TMPDIR
 \ - settings_show_a_root_of_any_length, Omabox's own: Rust's fixture
 \   with config.toml naming a root of over 1024 bytes that is made nowhere
@@ -1823,7 +1823,7 @@ variable REC-WRITES
          ar LINKED-REFUSES-AN-UNAVAILABLE-ACCOUNT
          ar LINKED-REFUSES-A-ROOT-NOT-A-FOLDER
          ar LINKED-REFUSES-AN-ACCOUNT-OF-ANOTHER-ROOT-TAG ;]
-      [: TEST-DROPBOX:STOP ;] finally ;] DROPBOX:WITH-LOOPS ;
+      [: TEST-DROPBOX:STOP ;] finally ;] DROPBOX:WITH-LOOP ;
 
 \ BIND's three arms, then the login's steps against the fake.
 : LOGIN-CASES ( ^ARENA:arena -- )

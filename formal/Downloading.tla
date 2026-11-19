@@ -2,10 +2,10 @@
 \* One files/download transfer as DOWNLOADING (src/dropbox.f) reads it. The
 \* first chunk's status and CHECKED decide whether the body reaches the
 \* reader, which asks up to room bytes a read and may return at any time;
-\* curl may send fewer than Size bytes, Size, or one more, and fail at any
-\* read. The transfer ends once: by curl's last read, or by ABANDONED, which
-\* the overrun and unread lines call and READ-OUT calls for a throw. A throw
-\* ends the run.
+\* the server may send fewer than Size bytes, Size, or one more, and the
+\* transfer may fail at any read. The transfer ends once: by its last read,
+\* or by closing its connection, which the overrun and unread lines' ABANDON
+\* and READ-OUT for a throw do. A throw ends the run.
 EXTENDS Naturals
 
 Size == 2
@@ -26,7 +26,7 @@ Init ==
     /\ reader = "idle"
     /\ thrown = FALSE
 
-\* curl's last read, a response or a failure, ends the transfer in t.
+\* The transfer's last read, a response or a failure, ends it in t.
 Last(s, t) ==
     /\ ~thrown
     /\ step = s
@@ -75,7 +75,7 @@ Overrun(room) ==
     /\ transfer' = "abandoned"
     /\ UNCHANGED <<first, left, total, buffered, reader, thrown>>
 
-\* Every byte taken, curl's last read ends the body.
+\* Every byte taken, the transfer's last read ends the body.
 Drain == Reads /\ left = 0 /\ total = Size /\ Last("streaming", "drained")
 Short == Reads /\ left = 0 /\ total # Size /\ Last("streaming", "short")
 Lose == Reads /\ left = 0 /\ Last("streaming", "lost")
@@ -135,9 +135,8 @@ TypeOK ==
     /\ reader \in {"idle", "reading", "returned"}
     /\ thrown \in BOOLEAN
 
-\* READ-OUT abandons just the transfers in flight: FINAL? holds just when
-\* the transfer ended, and RECEIVING captures no headers of one ABANDONED
-\* ended, cancelled or overran.
+\* READ-OUT closes the connection of just the transfers in flight: FINAL?
+\* holds just when the transfer ended, cancelled or overran.
 FinalIsEnded ==
     transfer = IF step \in {"cancelled", "overran"} THEN "abandoned"
                ELSE IF step \in Finals THEN "ended"

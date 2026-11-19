@@ -671,7 +671,10 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
    k VALID? if true exit then
    k x CLIENT@ CHECK-FAILURE x FAIL ;
 
-: VALIDATING ( ^run -- step-event ) [: VALIDATED ;] TRIED-STEP ;
+\ Rested however the step ends, so a retry's backoff holds no api connection.
+: VALIDATING ( ^run -- step-event )
+   {: x :}
+   [: x [: VALIDATED ;] TRIED-STEP ;] [: x CLIENT@ DROPBOX:REST ;] finally ;
 
 : SESSION-STARTED ( ^run -- )
    drop LOG:INFO s" daemon" LOG:LINE s" Omabox daemon session started" LOG:TEXT+
@@ -753,12 +756,14 @@ TYPED-VARIABLE STORED JOURNAL:dropbox-binding
    x [: ROOT-ACTIVE ;] TRIED 0= if x WEIGH-PASS exit then
    x PASSED ;
 
-\ The pass's arena is emptied as the pass ends, so a waiting daemon
-\ holds none of the pass's memory.
+\ The pass's arena is emptied and its connections closed as the pass
+\ ends, so a waiting daemon holds none of its memory and only the long
+\ poll's connection.
 : SYNC ( ^run -- sync-event )
    {: x :}
    STATUS-PHASE:SYNCING x PHASE!
-   [: x SYNCED ;] [: x RUN-PASSES @ ARENA:RESET ;] finally ;
+   [: x SYNCED ;] [: x RUN-PASSES @ ARENA:RESET x CLIENT@ DROPBOX:REST ;]
+   finally ;
 
 \ Rust's clean_sync_pass, then the phase.
 : CLEANED ( ^run -- )
@@ -954,7 +959,7 @@ FSM:DEFINE DAEMON-RUN ( ^run ) daemon-state step-event
 
 : MACHINE ( ^run -- )
    {: x :}
-   [: x construct daemon-state preparing DAEMON-RUN ;] DROPBOX:WITH-LOOPS ;
+   [: x construct daemon-state preparing DAEMON-RUN ;] DROPBOX:WITH-LOOP ;
 
 \ A code the machine does not catch stops it as an invariant.
 : GUARDED ( ^run -- )

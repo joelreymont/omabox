@@ -21,8 +21,8 @@
 \ browser login exchanged and checked against the account and remote
 \ root while the service still syncs, then, with the service released
 \ and under the daemon lock, the journal bound, the refresh token
-\ stored and a new config written. DROPBOX's calls run under AIO's and
-\ CURL's loops, started for them alone.
+\ stored and a new config written. DROPBOX's calls run under AIO's loop,
+\ started for them alone.
 \ STORAGE CLASS. CALLER-OWNED: a command's service commands, drive
 \ record, configuration, text, lock, default root, authorization code,
 \ root binding, Dropbox client, login and journal live in an arena the
@@ -1162,7 +1162,7 @@ ARENA JOURNALS JOURNAL:journal
    p ar PROMPT
    FD:STDIN ar READ-CODE {: ac :}
    ar LOGINS-NEW {: a :}
-   [: c ac p r a ar LINK-LOGIN ;] DROPBOX:WITH-LOOPS
+   [: c ac p r a ar LINK-LOGIN ;] DROPBOX:WITH-LOOP
    a ;
 
 
@@ -1331,12 +1331,10 @@ ARENA PRIORS prior
    [: cmd swap PERFORM ;] ARENA:WITH ;
 
 \ A code outside the application block -999999..-100000, which no
-\ omabox word logged, on a line of its own. CURL:E-LOOP is logged too:
-\ CURL:LOOP-START reports it before it throws.
+\ omabox word logged, on a line of its own.
 : UNEXPECTED ( n -- )
    {: code:n :}
    code -100000 -999999 IN? if exit then
-   code CURL:E-LOOP = if exit then
    LOG-OPEN s" the command failed unexpectedly (" LOG:TEXT+
    code LOG:CODE+ s" )" LOG:TEXT+ LOG:;LINE ;
 

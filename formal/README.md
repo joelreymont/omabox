@@ -99,7 +99,7 @@ tries its state again, a failed long poll from syncing.
 byte of the file reaches the body's reader before the answer's rev, content
 hash and range pass, nor the logged answer buffer; the reader takes no byte
 past the file's end; a drained body holds every byte and a cancelled one was
-left by its reader; and the transfer ends once, by curl's last read or by one
+left by its reader; and the transfer ends once, by its last read or by one
 cancel, exactly when the machine is final or a throw leaves `READ-OUT`.
 
 `UploadSession` checks one upload as `SESSION` runs it: a stage of one chunk in

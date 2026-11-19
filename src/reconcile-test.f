@@ -226,7 +226,6 @@ require src/lib/fs-list.f
 require src/lib/aio.f
 require src/lib/time.f
 require src/test-formal.f
-require src/lib/net/curl.f
 require src/dropbox.f
 require src/test-dropbox.f
 require src/model.f
@@ -6458,13 +6457,13 @@ TYPED-VARIABLE RACED str
    finally ;
 
 
-\ The refresh cases against one fake Dropbox, under curl's loop.
+\ The refresh cases against one fake Dropbox, under AIO's loop.
 : DROPBOX-SERVED ( ^ARENA:arena -- )
    {: ar :}
-   AIO:START CURL:LOOP-START
+   AIO:START
    [: TEST-DROPBOX:START
       [: ar SERVED ;] [: TEST-DROPBOX:STOP ;] finally ;]
-   [: CURL:LOOP-STOP AIO:STOP ;] finally ;
+   [: AIO:STOP ;] finally ;
 
 : LISTING-CASES ( ^ARENA:arena -- )
    {: ar :}

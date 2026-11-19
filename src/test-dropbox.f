@@ -23,7 +23,8 @@
 \ contain.
 \ It records each request once, in order: its route, its Dropbox-API-Arg
 \ and its body's first KiB, which SEEN$, CALLS, ARGS-TO$ and BODIES-TO$
-\ read; and the last API call's Authorization, Path-Root and Content-Type.
+\ read; the last API call's Authorization, Path-Root and Content-Type; the
+\ last token request's Content-Type; and the last request's User-Agent.
 \ STORAGE CLASS. PROCESS-WIDE: one worker serves every request, so its handler
 \ alone writes the state while a test waits on its call, and the test sets it
 \ between calls; only RESUME-BODY sets it during one, and the
@@ -105,6 +106,10 @@ TYPED-VARIABLE ROOTED bool
 create TYPE-SENT NAME-CAP allot
 variable TYPE-SENT-U
 TYPED-VARIABLE TYPED bool
+create TOKEN-TYPE NAME-CAP allot
+variable TOKEN-TYPE-U
+create AGENT-SENT NAME-CAP allot
+variable AGENT-SENT-U
 TYPED-VARIABLE LEAKED bool
 
 create OUT TEXT-CAP allot
@@ -278,7 +283,11 @@ CALLS-MADE
 : RECORD ( HTTP:request -- )
    {: q:HTTP:request :}
    q CALL+
-   q HTTP:PATH$ s" /oauth2/token" STR= if q TOKEN-HEADERS exit then
+   q s" User-Agent" AGENT-SENT NAME-CAP SENT drop AGENT-SENT-U !
+   q HTTP:PATH$ s" /oauth2/token" STR= if
+      q s" Content-Type" TOKEN-TYPE NAME-CAP SENT drop TOKEN-TYPE-U !
+      q TOKEN-HEADERS exit
+   then
    q HTTP:PATH$ s" /2/files/list_folder/longpoll" STR=
    if q TOKEN-HEADERS exit then
    q s" Authorization" AUTH NAME-CAP SENT drop AUTH-U !
@@ -667,11 +676,8 @@ variable HELD-U
    ;MATCH ;
 
 
-\ Sends a 200 head promising one body byte and closes. libcurl answers
-\ CURLE_PARTIAL_FILE, which the client's LOST reads, and does not resend the
-\ call, as it does when a reused connection closes before a whole header
-\ line. A status line alone will not do: libcurl takes it, closed, as a
-\ whole answer with no headers.
+\ Sends a 200 head promising one body byte and closes: the client reads a
+\ cut inside the body, which its LOST answers as retry 0.
 : SEVER ( HTTP:request -- )
    {: q:HTTP:request :}
    q HTTP:TAKE-OVER 2drop {: conn:TCP4:connection :}
@@ -710,8 +716,8 @@ variable HELD-U
 
 
 \ After GARBLE, an API call's body is read, as CUT's is, and its answer is
-\ one line that is not HTTP, then a close. libcurl fails it with a code
-\ CURL:LOST? does not take.
+\ one line that is not HTTP, then a close. The client reads it as a
+\ malformed answer, a fault HTTPC:LOST? does not take.
 : GARBLED? ( HTTP:request -- bool )
    {: q:HTTP:request :}
    GARBLING @ 0= if false exit then
@@ -1086,6 +1092,7 @@ private
 \ The file in slot i with the bytes in slot k from the offset, cut: a 200
 \ head promising them all, and PART of them. LENGTHENED, they carry one
 \ byte more under a head promising one more still, so it arrives mid-transfer.
+\ The head says Connection: close, as its taker closes the connection after.
 : CUT$ ( n n n -- ^u8 n )
    {: i:n k:n from:n :}
    k CONTENT-SIZE from - LENGTHENED @ {: rest:n extra:bool :}
@@ -1093,7 +1100,7 @@ private
    i RESULT$ {: e:^ eu:n :}
    SB-RESET S\" HTTP/1.1 200 OK\r\nDropbox-API-Result: " SB-APPEND
    e eu SB-APPEND S\" \r\nContent-Length: " SB-APPEND
-   rest extra if 2 + then FMT:SB-INT S\" \r\n\r\n" SB-APPEND
+   rest extra if 2 + then FMT:SB-INT S\" \r\nConnection: close\r\n\r\n" SB-APPEND
    k from CONTENT-FROM PART min SB-APPEND
    extra rest PART < and if 33 SB-APPEND-C then
    SB$ ;
@@ -1108,7 +1115,7 @@ private
    conn ;
 
 
-\ CUT-SENT and a close, which libcurl answers CURLE_PARTIAL_FILE.
+\ CUT-SENT and a close, which the client reads as a cut.
 : BROKEN ( HTTP:request n n n -- )
    {: q:HTTP:request i:n k:n from:n :}
    false BREAKING !
@@ -1411,12 +1418,15 @@ variable SESSIONS
    a h hu i SESSION-ATS @ false COMMIT ;
 
 
+\ How long a connection may sit quiet, longer than any test runs: a request
+\ crossing the server's idle close would be lost, never answered.
+600000 constant KEEP-MS
+
+
 public
 
-\ An upload's body, one chunk of 32 MiB at most, with room to spare, and
-\ the ms its read may take, which the connection's idle bound would cut.
+\ An upload's body, one chunk of 32 MiB at most, with room to spare.
 $2100000 constant UPLOAD-CAP
-60000 constant UPLOAD-MS
 
 
 \ Starts the server on a free port with one worker.
@@ -1440,8 +1450,8 @@ $2100000 constant UPLOAD-CAP
    [: [: UPLOAD-APPEND ;] SERVE ;] HTTP:ROUTE
    s" POST" s" /2/files/upload_session/finish"
    [: [: UPLOAD-FINISH ;] SERVE ;] HTTP:ROUTE
-   UPLOAD-CAP HTTP:BODY-CAP! UPLOAD-MS HTTP:BODY-TIMEOUT!
-   $7F000001 0 1 1000 HTTP:START
+   UPLOAD-CAP HTTP:BODY-CAP!
+   $7F000001 0 1 KEEP-MS HTTP:START
    SB-RESET s" http://127.0.0.1:" SB-APPEND HTTP:PORT FMT:SB-INT
    SB$ ORIGIN NAME-CAP STORE ORIGIN-U ! ;
 
@@ -1462,6 +1472,7 @@ $2100000 constant UPLOAD-CAP
    0 SCRIPTS ! 0 FILES ! 0 CONTENTS ! 0 SESSIONS ! 0 REVS !
    0 GRANT-CODE-U ! 0 ROTATED-U !
    CALLS-RESET 0 AUTH-U ! 0 ROOT-SENT-U ! 0 TYPE-SENT-U !
+   0 TOKEN-TYPE-U ! 0 AGENT-SENT-U !
    0 ARG-SENT-U ! 0 RANGE-SENT-U !
    false ROOTED ! false TYPED ! false LEAKED ! false RANGED !
    false SKEWED ! false CLIPPED ! false INFLATED !
@@ -1564,6 +1575,10 @@ $2100000 constant UPLOAD-CAP
 \ The last API call's Content-Type value, and whether it sent one.
 : TYPE-SENT$ ( -- ^u8 n ) TYPE-SENT TYPE-SENT-U @ ;
 : TYPE-SENT? ( -- bool ) TYPED @ ;
+\ The last token request's Content-Type value, empty when it sent none.
+: TOKEN-TYPE$ ( -- ^u8 n ) TOKEN-TYPE TOKEN-TYPE-U @ ;
+\ The last request's User-Agent value, any route, empty when it sent none.
+: AGENT-SENT$ ( -- ^u8 n ) AGENT-SENT AGENT-SENT-U @ ;
 \ Whether a token request or long poll since RESET carried Authorization or
 \ Path-Root.
 : LEAKED? ( -- bool ) LEAKED @ ;
@@ -1692,4 +1707,11 @@ $2100000 constant UPLOAD-CAP
    SESSIONS @ 0 ?do false i SESSION-OPEN ! loop ;
 
 
+;package
+
+
+\ A white-box read of how many connections the server has accepted since
+\ START, defined into TEST-DROPBOX so HTTP's public surface gains nothing.
+package HTTP
+: TEST-DROPBOX:ACCEPTED ( -- n ) ACCEPTED-COUNT atomic@ ;
 ;package

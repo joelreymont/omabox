@@ -55,7 +55,6 @@ require src/status.f
 require src/config.f
 require src/lib/secret/dir.f
 require src/lib/aio.f
-require src/lib/net/curl.f
 require src/test-dropbox.f
 require src/test-client.f
 require src/test-formal.f
@@ -183,7 +182,7 @@ TYPED-VARIABLE LINK REPLAY:link
 : POLICY-CASES ( ^ARENA:arena -- )
    {: ar :}
    RETRY-SCHEDULE-DOUBLES-CAPS-AND-HONORS-BOUNDED-SERVER-DELAYS
-   ar TEST-CLIENT:OPENED {: k :}
+   ar TEST-CLIENT:IDLE {: k :}
    k DISPOSITIONS-COVER-RETRY-ENVIRONMENT-USER-ACTION-AND-INVARIANT
    REJECTED-TOKEN-EXITS-WITHOUT-REBUILDING-THE-DOWNLOAD-POOL
    k REFRESH-REJECTION-AND-BINDING-REJECTION-EXIT-FOR-USER-ACTION
@@ -552,7 +551,7 @@ TYPED-VARIABLE CYCLE-ARENA ^ARENA:arena
    d str> FS:REMOVE-TREE ;
 
 \ The cases that need no Dropbox, then those against the fake under
-\ curl's loop.
+\ AIO's loop.
 : RUN-SERVED ( ^ARENA:arena -- )
    {: ar :}
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
@@ -571,10 +570,10 @@ TYPED-VARIABLE CYCLE-ARENA ^ARENA:arena
    ar RECOVERY-CONTROL-PUBLISHES-STOPPED-BEFORE-A-FATAL-EXIT
    ROOT-INSPECTION-FAILURE-IS-UNAVAILABLE-ONLY-FOR-A-STAND-IN
    ar STAND-IN-WITHOUT-BIRTH-TIME-LEAVES-THE-ROOT-UNAVAILABLE
-   AIO:START CURL:LOOP-START
+   AIO:START
    [: TEST-DROPBOX:START
       [: ar RUN-SERVED ;] [: TEST-DROPBOX:STOP ;] finally ;]
-   [: CURL:LOOP-STOP AIO:STOP ;] finally
+   [: AIO:STOP ;] finally
    cd str> FS:REMOVE-TREE ;
 
 
@@ -696,13 +695,13 @@ private
    ar ACCOUNT-VALIDATION-IS-CACHED-PER-CLIENT-BUT-EVERY-JOURNAL-IS-CHECKED
    ar FAILED-ACCOUNT-VALIDATION-IS-RETRIED-BY-THE-SAME-CLIENT ;
 
-\ The account cases against one fake Dropbox, under curl's loop.
+\ The account cases against one fake Dropbox, under AIO's loop.
 : ACCOUNT-CASES ( ^ARENA:arena -- )
    {: ar :}
-   AIO:START CURL:LOOP-START
+   AIO:START
    [: TEST-DROPBOX:START
       [: ar ACCOUNT-SERVED ;] [: TEST-DROPBOX:STOP ;] finally ;]
-   [: CURL:LOOP-STOP AIO:STOP ;] finally ;
+   [: AIO:STOP ;] finally ;
 
 
 \ ---- the run's table against its model ----

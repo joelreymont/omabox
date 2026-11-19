@@ -214,19 +214,16 @@ STRUCTURE config
     call.
   - A throw while the transfer is in flight, from a failed check, the
     quotation, `READ-BODY` or an allocation, ends it in one place: the client
-    cancels the transfer and reads it to its end into a region laid out at
-    `OPEN`, so ending it allocates nothing. A failed check then answers
-    `refused unverified`; any other code is rethrown. The client's handle is
-    then free for its next call. A throw after the read that ended the
-    transfer, such as the quotation's once `READ-BODY` reached the body's
-    end, cancels nothing; the header capture after the transfer may throw,
-    and its checks answer `refused unverified`, with the handle already free.
+    closes the transfer's connection with `HTTPC:CLOSE`, which allocates
+    nothing, and the next call on that origin dials again. A failed check
+    then answers `refused unverified`; any other code is rethrown. A throw
+    after the read that ended the transfer closes nothing.
 - **`DELETE`** sends the rev as `parent_rev`. With an empty rev it deletes
   unconditionally, which sync uses only for a folder it has just seen empty.
 - **A mutation answers `refused unverified` for an answer it cannot
-  trust.** libcurl resends a POST on a new connection when a reused one
-  closes before any answer byte, so a mutation Dropbox applied can come
-  back lost, and one answered 408 or 5xx may have been applied too.
+  trust.** A connection can close after a request was written and before
+  its answer arrives. HTTPC never resends, so a mutation Dropbox applied can
+  come back lost, and one answered 408 or 5xx may have been applied too.
   `UPLOAD`, `DELETE` and `CREATE-FOLDER` ask no `get_metadata`; REPLAY
   reads the path back once and classifies that one path, as the Rust
   version's `resolve_ambiguous` does, so a mutation that keeps failing
@@ -328,35 +325,35 @@ The sync code builds these from the words above:
   single-flight refresh. Dropbox tokens last four hours, so a few workers
   each refreshing on their own costs a few extra calls a day.
 - **No SDK.** The generated `dropbox-sdk` and the `ureq` adapter give way to
-  `net/curl.f` and `json.f` directly.
+  `net/httpc.f` and `json.f` directly.
 
 ## What it needs from Habu
 
 - **`json.f`:** a writer mode that escapes DEL and every non-ASCII character
   as `\uXXXX`. `Dropbox-API-Arg` is a header, and Dropbox requires those
   escapes in it.
-- **`net/curl.f`:** `RESET`, which sets a handle back to the options `INIT`
-  gives it, as `curl_easy_reset` does, and keeps its connections. A handle
-  keeps every option from one request to the next, and nothing clears its
-  headers, so without it a client's one handle would resend every earlier
-  request's headers, old tokens included.
-- **`net/curl.f`:** `HEADERS` answering a streamed transfer's headers from its
-  first chunk on. Today it refuses a transfer in flight, so `DOWNLOAD` could
-  check the status and Content-Range only after the body had reached the
-  caller.
+- **`net/httpc.f`:** an HTTP/1.1 client over TLS, one connection per
+  origin, deadlines for the whole exchange and for a stall, the answer read
+  in pieces, the head read in place, and no resend.
 
-A call's deadlines need nothing new: `CURL:LOW-SPEED!` bounds the connect by
-the same seconds as a stalled body, so a call has `TIMEOUT!` for the whole
-call and `LOW-SPEED!` for a stall. A long poll, whose body is silent until it
-answers, sets `LOW-SPEED!` to zero and only `TIMEOUT!`. So does
-`upload_session/finish`, silent while Dropbox commits: 3600 s, as the Rust
-version's `SESSION_FINISH_SECONDS`.
+A call sets its deadlines with `HTTPC:DEADLINES!` (whole, stall): a JSON call
+60 s whole; a download or an upload 60 s per stall and nothing whole; a long
+poll, whose body is silent until it answers, its timeout plus 195 s whole;
+`upload_session/finish`, silent while Dropbox commits, 3600 s whole, as the
+Rust version's `SESSION_FINISH_SECONDS`.
 
-A client reads every answer through curl's streaming words, so no buffer caps
-its size. A program that uses `DROPBOX` therefore starts the CURL loop first
-(`AIO:START CURL:LOOP-START`) and stops it last; `DROPBOX:WITH-LOOPS` does
-both. `CURL:LOOP-START` takes and gives nothing: a loop that will not start
-logs a line and throws `CURL:E-LOOP`.
+A client reads every answer body piece by piece, so no buffer caps a body;
+a head must fit its connection's 64 kB room, past which the call fails
+oversize (E-TRANSPORT). A client dials a host's addresses one at a time, in
+getaddrinfo's order, as the Rust version's ureq did: on a network that
+routes IPv6 but drops it, each dial waits out the IPv6 address's share of
+the deadline before it tries IPv4.
+Uploads read their stage through AIO, so a program runs `DROPBOX` inside
+`DROPBOX:WITH-LOOP`, which starts AIO's loop first and stops it last.
+
+No proxy is used: `https_proxy` and `no_proxy` are ignored, where the Rust
+version's ureq honoured them (settled 2026-11-19). Every request sends
+`User-Agent: omabox/<version>`, as the Rust version sent ureq's.
 
 ## How it is tested
 
@@ -410,5 +407,6 @@ The tests run against a fake Dropbox on `net/http.f`, in the style of
   - a non-ASCII path in `Dropbox-API-Arg`.
 
 The fake cuts an answer two ways: after the call takes effect (`LOSE`) and
-before (`DROP`). Either way it sends part of a status line and closes, so
-libcurl reports a failed transfer instead of resending the request.
+before (`CUT`). Either way it sends a 200 head promising one body byte and
+closes, so the client reads a cut, which HTTPC never resends. After `GARBLE`
+it answers one line that is not HTTP, which the client reads as malformed.

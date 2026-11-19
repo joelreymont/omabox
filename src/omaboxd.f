@@ -21,7 +21,7 @@ FUNCTION: MALLOPT mallopt ( i32 i32 -- i32 )
 ;FUNCTION
 
 \ One arena for every thread, set before any starts: glibc never
-\ returns a thread arena's free top, and libcurl starts a resolver each pass.
+\ returns a thread arena's free top.
 : ONE-ARENA ( -- ) M-ARENA-MAX 1 MALLOPT drop ;
 
 : SELF-CHECK? ( -- bool )
