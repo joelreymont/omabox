@@ -2054,3 +2054,31 @@ mattered was whether its replacements had the same defect. They did not.
 Observation for the blog: an agent's attention follows the code in front
 of it, not the project's plans. The tracker held a dot retiring that
 machinery. Checking the tracker before a hunt now comes first.
+
+## 2026-11-19: a cursor that survived by accident
+
+Moving Omabox to Habu 6c0d2f62 changed one word it uses:
+JSON:READ-STR-APPEND now appends to a vector instead of a BUF. The client
+keeps the strings it decodes from an answer in one store, which
+READ-ANSWER empties before each read. The port moved that store to a
+vector and changed four lines. Then two test files failed: a probe whose
+cursor did not advance asked Dropbox for a third page instead of stopping.
+
+The cause was older than the port. PROBE-STEP parsed a page, then read the
+same answer again to look for entries outside the probed path, and only
+after that copied the page's cursor, a span into the store, to send with
+the next request. The second read had emptied the store and decoded the
+entries over it. BUF's clear only reset the length, so with an empty page
+the old cursor bytes were still there and the test passed. The vector
+zeroes what it cuts, so the same span read as zeros. In production, a
+first page whose only entries sat at the probed path would have sent
+Dropbox a cursor overwritten with entry text. TURN, the listing's version
+of the same step, already copied the cursor before the second read. The
+fix moved one line in PROBE-STEP to match.
+
+Observation for the blog: in Rust the borrow checker would refuse this
+code. The cursor borrows the store, and the second read needs the store
+mutably while that borrow is still live. Habu's spans carry no lifetime,
+so the defect lived until a library made emptied memory read as zeros.
+The test that caught it was already there; the old buffer's leftover
+bytes were what made it pass.
