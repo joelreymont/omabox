@@ -44,6 +44,7 @@ require src/lib/fs-mutate.f
 require src/lib/fs-anchored.f
 require src/lib/fs-statx.f
 require src/lib/sqlite.f
+require src/lib/fsm.f
 require src/lib/type/deftype.f
 require src/lib/byte-buffer.f
 require src/lib/json.f
@@ -1292,12 +1293,32 @@ private
 
 \ ---- the local scan ------------------------------------------------
 
+\ A scan's batch: the transaction a write opens and later writes and lookups
+\ join, so temp is not flushed nor main's lock retaken at each.
+ENUM batch-state none open ;ENUM
+\ What the scan does next: a write; commit, before an EACH-ROW's SELECT,
+\ a publish or its body's return; close, its scope closing.
+ENUM batch-input write commit close ;ENUM
+\ An open batch's input, a write past its bound as bound.
+ENUM open-input write bound commit close ;ENUM
+
+STRUCTURE batch DERIVE addr
+   FIELD connection SQLITE:connection
+   FIELD state batch-state
+   FIELD input batch-input
+   FIELD writes n
+;STRUCTURE
+
+ARENA BATCHES batch
+
 public
 
 \ A scan's rows lie in temp tables: scan_observations and scan_hashes,
 \ which it publishes, and scan_cached, scan_jobs and scan_listed, which
 \ hold reused hashes, files to hash and listed directories until visited.
+\ Its batch lies under its statements.
 STRUCTURE scan OPAQUE
+   FIELD batch ^batch
    FIELD observe-insert SQLITE:statement
    FIELD hash-insert SQLITE:statement
    FIELD reuse-insert SQLITE:statement
@@ -1513,14 +1534,113 @@ $2F constant SLASH
       DELETE FROM temp.scan_jobs;
       DELETE FROM temp.scan_listed;" ;
 
+\ The most writes one batch holds: main is locked no longer than one
+\ batch takes, and each commit's flush serves this many writes.
+512 constant BATCH-BOUND
+
+: PENDING ( ^batch -- batch-input ) BATCH-INPUT @ ;
+
+\ The pending input, a write the full batch has no room for as bound.
+: BOUNDED ( ^batch -- open-input )
+   {: b :}
+   b BATCH-INPUT @ MATCH batch-input
+      write OF
+         b BATCH-WRITES @ BATCH-BOUND < if construct open-input write
+         else construct open-input bound then
+      ENDOF
+      commit OF construct open-input commit ENDOF
+      close OF construct open-input close ENDOF
+   ;MATCH ;
+
+\ Opens a batch holding the write it is stepped for.
+: BEGUN ( ^batch -- )
+   {: b :}
+   b BATCH-CONNECTION @ s" BEGIN DEFERRED" SQLITE:EXEC
+   1 b BATCH-WRITES ! ;
+
+: COUNTED ( ^batch -- ) BATCH-WRITES 1 swap +! ;
+
+: COMMITTED ( ^batch -- ) BATCH-CONNECTION @ s" COMMIT" SQLITE:EXEC ;
+
+: REBATCHED ( ^batch -- ) dup COMMITTED BEGUN ;
+
+: ROLLED-BACK ( ^batch -- ) BATCH-CONNECTION @ SQLITE:ROLLBACK-OPEN ;
+
+\ A throw leaves the state for close: ROLLBACK-OPEN rolls back what SQLite
+\ holds open, and rows of committed batches stay until WITH-SCAN empties them.
+FSM:DEFINE BATCHING ( ^batch ) batch-state batch-input
+   IN none  PENDING
+      write    BEGUN          >open
+      commit   -              >none
+      close    ROLLED-BACK    >none
+   IN open  BOUNDED ( open-input )
+      write    COUNTED        >open
+      bound    REBATCHED      >open
+      commit   COMMITTED      >none
+      close    ROLLED-BACK    >none
+;DEFINE
+
+\ Steps the batch on the input.
+: BATCH-STEPPED ( ^batch batch-input -- )
+   {: b i:batch-input :}
+   i b BATCH-INPUT !
+   b b BATCH-STATE @ BATCHING-STEP drop b BATCH-STATE ! ;
+
+: NEW-BATCH ( SQLITE:connection ^ARENA:arena -- ^batch )
+   {: c ar :}
+   ar BATCHES-NEW {: b :}
+   c b BATCH-CONNECTION !
+   construct batch-state none b BATCH-STATE !
+   0 b BATCH-WRITES !
+   b ;
+
+: CLOSED ( ^batch -- ) construct batch-input close BATCH-STEPPED ;
+
+: SCAN-BATCH ( scan -- scan ^batch )
+   SCAN-UNMAKE {: j w ar :}
+   >r >r >r >r >r >r {: b :}
+   b r> r> r> r> r> r> j w ar SCAN-MAKE b ;
+
+: SCAN-STEPPED ( scan batch-input -- scan )
+   {: i:batch-input :}
+   SCAN-BATCH i BATCH-STEPPED ;
+
+: WRITING ( scan -- scan ) construct batch-input write SCAN-STEPPED ;
+
+: COMMITTING ( scan -- scan ) construct batch-input commit SCAN-STEPPED ;
+
+\ The scan of the statements and b handed to body; its batch ends when
+\ body returns.
+: BATCHED-SCAN
+   ( R SQLITE:statement SQLITE:statement SQLITE:statement
+     SQLITE:statement SQLITE:statement SQLITE:statement journal
+     [ R scan -- S scan ] ^JSON:writer ^ARENA:arena ^batch
+     -- S SQLITE:statement SQLITE:statement SQLITE:statement
+     SQLITE:statement SQLITE:statement SQLITE:statement )
+   {: j body w ar b :}
+   >r >r >r >r >r >r b r> r> r> r> r> r>
+   j w ar SCAN-MAKE body execute COMMITTING
+   SCAN-UNMAKE drop drop drop
+   >r >r >r >r >r >r drop r> r> r> r> r> r> ;
+
+\ BATCHED-SCAN with its batch in ba, closed however body ends.
+: BATCH-KEPT
+   ( R SQLITE:statement SQLITE:statement SQLITE:statement
+     SQLITE:statement SQLITE:statement SQLITE:statement journal
+     [ R scan -- S scan ] ^JSON:writer ^ARENA:arena ^ARENA:arena
+     -- S SQLITE:statement SQLITE:statement SQLITE:statement
+     SQLITE:statement SQLITE:statement SQLITE:statement )
+   {: j body w ar ba :}
+   j >CONNECTION ba NEW-BATCH {: b :}
+   j body w ar b [: BATCHED-SCAN ;] [: b CLOSED ;] finally ;
+
 : SCANNING
    ( R SQLITE:statement SQLITE:statement SQLITE:statement
      SQLITE:statement SQLITE:statement SQLITE:statement journal
      [ R scan -- S scan ] ^JSON:writer ^ARENA:arena
      -- S SQLITE:statement SQLITE:statement SQLITE:statement
      SQLITE:statement SQLITE:statement SQLITE:statement )
-   {: j body w ar :}
-   j w ar SCAN-MAKE body execute SCAN-UNMAKE drop drop drop ;
+   [: BATCH-KEPT ;] ARENA:WITH ;
 
 : SCAN-ENCODED
    ( R SQLITE:statement SQLITE:statement SQLITE:statement
@@ -1598,15 +1718,19 @@ $2F constant SLASH
    {: visit :}
    [: visit VISITED ;] ARENA:WITH ;
 
-\ Visits the rows select answers, then runs empty.
+\ Visits the rows select answers, then runs empty. The open batch commits
+\ before select opens: SQLite's COMMIT under an open SELECT keeps every
+\ database the batch read locked until the SELECT ends, and the batches
+\ the visits open read no main table.
 : EACH-ROW
    ( R scan
      [ R scan SQLITE:statement ^ARENA:arena -- R scan SQLITE:statement ]
      str str -- R scan )
    {: visit select:str empty:str :}
+   COMMITTING
    SCAN-JOURNAL >CONNECTION {: c :}
    c select [: visit ROWS-VISITED ;] SQLITE:WITH-STATEMENT
-   c empty str> SQLITE:EXEC ;
+   WRITING c empty str> SQLITE:EXEC ;
 
 \ A row of temp.scan_cached as the record its columns hold; the path
 \ and content are copied into ar.
@@ -1626,7 +1750,7 @@ $2F constant SLASH
 : HASH-COPIED ( scan MODEL:hash-record str -- scan )
    {: r json:str :}
    r MODEL-HASH--RECORD:UNMAKE {: p:MODEL:path f h :}
-   SCAN-UNMAKE {: j w ar :}
+   WRITING SCAN-UNMAKE {: j w ar :}
    >r >r >r >r  p json TEXT-INSERTED  r> r> r> r>
    j w ar SCAN-MAKE ;
 
@@ -1750,7 +1874,7 @@ $2F constant SLASH
 public
 
 \ Runs body over a scan that starts empty, to publish with PUBLISH-SCAN;
-\ body hands the scan back.
+\ body hands the scan back, and no batch is open once WITH-SCAN ends.
 : WITH-SCAN ( R journal [ R scan -- S scan ] -- S )
    {: j body :}
    j >CONNECTION SCAN-TABLES SQLITE:EXEC
@@ -1760,7 +1884,7 @@ public
 \ Records the observation in the scan, replacing one at its path.
 : SCAN-OBSERVE ( scan MODEL:local-record -- scan )
    {: r :}
-   SCAN-UNMAKE {: j w ar :}
+   WRITING SCAN-UNMAKE {: j w ar :}
    >r >r >r >r >r
    r w ar LOCAL-INSERTED ar ARENA:RESET
    r> r> r> r> r>
@@ -1769,7 +1893,7 @@ public
 \ Records the hash in the scan, replacing one at its path.
 : SCAN-HASH ( scan MODEL:hash-record -- scan )
    {: r :}
-   SCAN-UNMAKE {: j w ar :}
+   WRITING SCAN-UNMAKE {: j w ar :}
    >r >r >r >r
    r w HASH-INSERTED
    r> r> r> r>
@@ -1780,14 +1904,14 @@ public
 \ answered them.
 : SCAN-REUSE ( scan MODEL:hash-record str -- scan )
    {: r json:str :}
-   SCAN-UNMAKE {: j w ar :}
+   WRITING SCAN-UNMAKE {: j w ar :}
    >r >r >r  r json REUSE-INSERTED  r> r> r>
    j w ar SCAN-MAKE ;
 
 \ Records a file no cached hash covers, replacing one at its path.
 : SCAN-JOB ( scan str MODEL:fingerprint -- scan )
    {: p:str f :}
-   SCAN-UNMAKE {: j w ar :}
+   WRITING SCAN-UNMAKE {: j w ar :}
    >r >r  p f JOB-INSERTED  r> r>
    j w ar SCAN-MAKE ;
 
@@ -1795,7 +1919,7 @@ public
 \ replacing one at its path.
 : SCAN-LISTED ( scan str MODEL:stat -- scan )
    {: p:str st :}
-   SCAN-UNMAKE {: j w ar :}
+   WRITING SCAN-UNMAKE {: j w ar :}
    >r  p st LISTED-INSERTED  r>
    j w ar SCAN-MAKE ;
 
@@ -1839,7 +1963,7 @@ public
 \ an untouched subtree on every later pass.
 : SCAN-DISCARD ( scan str -- scan )
    {: p:str :}
-   SCAN-UNMAKE {: j w ar :}
+   WRITING SCAN-UNMAKE {: j w ar :}
    j >CONNECTION p ar DISCARDED ar ARENA:RESET
    j w ar SCAN-MAKE ;
 
@@ -1854,10 +1978,11 @@ public
    j w sa SCAN-MAKE r json found ;
 
 \ Makes the local inventory and the active root's hash cache the scan's
-\ in one transaction; false, nothing written, when binding is no longer
-\ the active root.
+\ in one transaction, after the open batch commits; false, nothing
+\ written, when binding is no longer the active root.
 : PUBLISH-SCAN ( scan local-root-binding -- scan bool )
    {: b :}
+   COMMITTING
    SCAN-JOURNAL {: j :}
    j >CONNECTION [: j b [: BOUND-DIFFERENCE ;] ARENA:WITH ;]
    SQLITE:WITH-TRANSACTION ;

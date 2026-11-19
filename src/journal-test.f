@@ -13,6 +13,10 @@
 \ published, and a reused hash it confirms as the text the cache
 \ stored; a discarded subtree dropped from the scan but for its cached
 \ hashes, which publish; CACHED-HASH's lookup by path, with the text;
+\ a scan's batch holding main's lock through its 512 writes and
+\ committing at the next, no transaction left open by a throw out of
+\ WITH-SCAN, a visit holding no lock of the batch before it, and a scan
+\ that fills its temporary database leaving the next scan whole;
 \ src/oracle/journal.sqlite3, copied and opened, giving journal.tsv's
 \ Dropbox and local root bindings, local and remote inventories, remote
 \ cursor, baselines, baseline paths, pending and blocked plans, pending
@@ -1782,6 +1786,127 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    s" a.txt" 10 ar LOCAL-HASH {: h :}
    j b r ar ONE-LOCAL h ar ONE-HASH PUBLISH-LOCAL-SCAN TTRUE
    j [: h ar LOOKED-UP-IN ;] WITH-SCAN
+   j CLOSE
+   d GONE ;
+
+\ Another connection takes the journal at SUBJECT for writing, waiting
+\ for no lock, and lets it go.
+: EXCLUSIVE ( -- )
+   SUBJECT @ str> SQLITE:OPEN {: c :}
+   [: c s" BEGIN EXCLUSIVE; COMMIT" SQLITE:EXEC ;] [: c SQLITE:CLOSE ;]
+   finally ;
+
+\ THE-JOURNAL's connection opens and ends a transaction of its own,
+\ which it cannot while one is open.
+: NONE-OPEN ( -- )
+   THE-JOURNAL @ >CONNECTION s" BEGIN IMMEDIATE; COMMIT" SQLITE:EXEC ;
+
+\ n writes of the scan, each a job at "a".
+: JOBS-WRITTEN ( scan n -- scan )
+   0 ?do s" a" >str 1 MARKED-FINGERPRINT SCAN-JOB loop ;
+
+\ CACHED-HASH reads main, in the open batch if there is one; it finds
+\ no hash for "a.txt".
+: LOOKED-UP-NONE ( scan ^ARENA:arena -- scan )
+   {: ar :}
+   s" a.txt" >str ar CACHED-HASH TFALSE {: none:str :}
+   none str> nip 0 T= DROP-HASH-RECORD ;
+
+\ A write opens the batch and a lookup reads main into it; the batch holds
+\ main through BATCH-BOUND writes, and the write past them commits it.
+: BOUNDED-BATCH ( scan str ^ARENA:arena -- scan )
+   {: d:str ar :}
+   1 JOBS-WRITTEN ar LOOKED-UP-NONE
+   BATCH-BOUND 1 - JOBS-WRITTEN
+   [: EXCLUSIVE ;] SQLITE:E-SQL d s" database is locked" ar LOGGED
+   1 JOBS-WRITTEN
+   [: EXCLUSIVE ;] d ar SILENT ;
+
+: A-BATCH-COMMITS-AT-ITS-BOUND ( ^ARENA:arena -- )
+   {: ar :}
+   s" a batch commits at its bound" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   p SUBJECT !
+   j [: d ar BOUNDED-BATCH ;] WITH-SCAN
+   j CLOSE
+   d GONE ;
+
+\ A write opens the batch and a lookup reads main into it, then the
+\ body throws.
+: THROWN-SCAN ( scan ^ARENA:arena -- scan )
+   {: ar :}
+   1 JOBS-WRITTEN ar LOOKED-UP-NONE
+   E-INVALID-STATE throw ;
+
+: A-THROW-OUT-OF-WITH-SCAN-LEAVES-NO-TRANSACTION-OPEN ( ^ARENA:arena -- )
+   {: ar :}
+   s" a throw out of WITH-SCAN leaves no transaction open" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   p SUBJECT !  j THE-JOURNAL !
+   [: j [: ar THROWN-SCAN ;] WITH-SCAN ;] E-INVALID-STATE TTHROWSQ
+   [: NONE-OPEN ;] d ar SILENT
+   [: EXCLUSIVE ;] d ar SILENT
+   j CLOSE
+   d GONE ;
+
+\ The job's visit writes past the bound, then another connection takes
+\ the journal.
+: UNLOCKED-VISIT
+   ( scan str MODEL:fingerprint MODEL:hash-record str ^ARENA:arena
+     -- scan )
+   {: p:str f h d:str ar :}
+   BATCH-BOUND 1 + 0 ?do h SCAN-HASH loop
+   [: EXCLUSIVE ;] d ar SILENT ;
+
+\ A write opens the batch and a lookup reads main into it before the
+\ one job's visit.
+: VISITED-UNLOCKED ( scan str ^ARENA:arena -- scan )
+   {: d:str ar :}
+   s" a.txt" 10 ar LOCAL-HASH {: h :}
+   1 JOBS-WRITTEN ar LOOKED-UP-NONE
+   [: h d ar UNLOCKED-VISIT ;] EACH-SCAN-JOB ;
+
+: A-VISIT-HOLDS-NO-LOCK-OF-THE-BATCH-BEFORE-IT ( ^ARENA:arena -- )
+   {: ar :}
+   s" a visit holds no lock of the batch before it" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   p SUBJECT !
+   j [: d ar VISITED-UNLOCKED ;] WITH-SCAN
+   j CLOSE
+   d GONE ;
+
+\ Sets the most pages the connection's temporary database holds; SQLite
+\ raises n below the database's size to its size.
+: TEMP-CAPPED ( SQLITE:connection n -- )
+   {: c n :}
+   s" PRAGMA temp.max_page_count = " 0 PUT  n swap PUT-N {: u :}
+   c WANT u SQLITE:EXEC ;
+
+\ Jobs at new paths fill the scan's temporary database, capped at its
+\ size, until a write fails.
+: FILLED-SCAN ( scan -- scan )
+   SCAN-JOURNAL >CONNECTION 1 TEMP-CAPPED
+   100000 0 ?do i FMT:INT$ >str 1 MARKED-FINGERPRINT SCAN-JOB loop ;
+
+: FULL-SCAN ( -- ) THE-JOURNAL @ [: FILLED-SCAN ;] WITH-SCAN ;
+
+: A-FULL-SCAN-LEAVES-THE-NEXT-SCAN-WHOLE ( ^ARENA:arena -- )
+   {: ar :}
+   s" a full scan leaves the next scan whole" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   j THE-JOURNAL !
+   j >CONNECTION s" PRAGMA temp.max_page_count" QUERY-INT {: most :}
+   [: FULL-SCAN ;] SQLITE:E-FULL d s" database or disk is full" ar LOGGED
+   j >CONNECTION most TEMP-CAPPED
+   s" a.txt" s" a" PRESENT-LOCAL LOCAL-RECORD {: r :}
+   s" a.txt" 10 ar LOCAL-HASH {: h :}
+   j b r ar ONE-LOCAL h ar ONE-HASH PUBLISH-LOCAL-SCAN TTRUE
+   j ar LOCAL-INVENTORY r ar ONE-LOCAL LOCAL-RECORDS= TTRUE
+   j ar LOCAL-HASH-CACHE h ar ONE-HASH HASH-RECORDS= TTRUE
    j CLOSE
    d GONE ;
 
@@ -3872,6 +3997,10 @@ variable CRAFT
    ar A-VISIT-PUBLISHES-WHAT-IT-OBSERVES-AND-HASHES
    ar SCAN-DISCARD-DROPS-THE-SUBTREE-BUT-KEEPS-ITS-HASHES
    ar CACHED-HASH-ANSWERS-THE-PUBLISHED-HASH
+   ar A-BATCH-COMMITS-AT-ITS-BOUND
+   ar A-THROW-OUT-OF-WITH-SCAN-LEAVES-NO-TRANSACTION-OPEN
+   ar A-VISIT-HOLDS-NO-LOCK-OF-THE-BATCH-BEFORE-IT
+   ar A-FULL-SCAN-LEAVES-THE-NEXT-SCAN-WHOLE
    ar ORACLE-JOURNAL-HOLDS-ITS-BASELINES
    ar JOURNAL-REOPEN-EXPOSES-INTENT-WITHOUT-ADVANCING-BASELINE
    ar RECONCILIATION-DECISIONS-COMMIT-ATOMICALLY
