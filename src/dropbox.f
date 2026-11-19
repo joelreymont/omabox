@@ -2113,9 +2113,9 @@ private
    r DONE? 0= if r construct probe empty false exit then
    c PAGE-PARSE
    next c STALE? and if r construct probe interrupted false exit then
+   c CLIENT-PAGE @ SPAN:$ BUF:N>BLEN c CLIENT-SENT @ BUF:REPLACE
    t tu c OCCUPIED? if r construct probe occupied false exit then
    c CLIENT-MORE @ 0= if r construct probe empty false exit then
-   c CLIENT-PAGE @ SPAN:$ BUF:N>BLEN c CLIENT-SENT @ BUF:REPLACE
    c CONTINUE construct probe empty true ;
 
 
