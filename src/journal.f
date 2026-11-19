@@ -1224,25 +1224,24 @@ BUF:HDR-BYTES TASK:+USERS ENCODED u8
    SQLITE:STEP 0= if NO-CURSOR swap exit then
    0 ar TEXT-COPY DROPBOX:>CURSOR OPTION:SOME swap ;
 
-: READ-LOCAL-INVENTORY
-   ( SQLITE:connection ^ARENA:arena
+\ The local records the statement selects as path, observation_json.
+: LOCAL-ROWS
+   ( SQLITE:connection str ^ARENA:arena
      -- ^VEC:vector<MODEL:local-record> )
-   {: c ar :}
+   {: c q:str ar :}
    ar ARENA:ALLOCATOR 0 [type] MODEL:local-record VEC:NEW {: v :}
-   c s" SELECT path, observation_json FROM local_observations
-      ORDER BY path"
-   >str [: begin SQLITE:STEP while ar LOCAL-ROW v VEC:PUSH ! repeat ;]
+   c q [: begin SQLITE:STEP while ar LOCAL-ROW v VEC:PUSH ! repeat ;]
    SQLITE:WITH-STATEMENT
    v ;
 
-: READ-REMOTE-OBSERVATIONS
-   ( SQLITE:connection ^ARENA:arena
+\ The remote records the statement selects as canonical_path, path,
+\ observation_json.
+: REMOTE-ROWS
+   ( SQLITE:connection str ^ARENA:arena
      -- ^VEC:vector<MODEL:remote-record> )
-   {: c ar :}
+   {: c q:str ar :}
    ar ARENA:ALLOCATOR 0 [type] MODEL:remote-record VEC:NEW {: v :}
-   c s" SELECT canonical_path, path, observation_json
-      FROM remote_observations ORDER BY canonical_path"
-   >str [: begin SQLITE:STEP while ar REMOTE-ROW v VEC:PUSH ! repeat ;]
+   c q [: begin SQLITE:STEP while ar REMOTE-ROW v VEC:PUSH ! repeat ;]
    SQLITE:WITH-STATEMENT
    v ;
 
@@ -1252,7 +1251,9 @@ public
 : LOCAL-INVENTORY
    ( journal ^ARENA:arena -- ^VEC:vector<MODEL:local-record> )
    {: j ar :}
-   j >CONNECTION ar READ-LOCAL-INVENTORY ;
+   j >CONNECTION
+   s" SELECT path, observation_json FROM local_observations ORDER BY path"
+   >str ar LOCAL-ROWS ;
 
 \ The committed cursor, without the inventory.
 : REMOTE-CURSOR ( journal ^ARENA:arena -- option<DROPBOX:cursor> )
@@ -1278,7 +1279,10 @@ private
 : SNAPSHOT ( journal ^ARENA:arena -- remote-inventory )
    {: j ar :}
    j ar REMOTE-CURSOR
-   j >CONNECTION ar READ-REMOTE-OBSERVATIONS
+   j >CONNECTION
+   s" SELECT canonical_path, path, observation_json
+      FROM remote_observations ORDER BY canonical_path"
+   >str ar REMOTE-ROWS
    JOURNAL-REMOTE--INVENTORY:MAKE ;
 
 public
@@ -1287,6 +1291,28 @@ public
 : REMOTE-INVENTORY ( journal ^ARENA:arena -- remote-inventory )
    {: j ar :}
    j >CONNECTION [: j ar SNAPSHOT ;] SQLITE:WITH-READ ;
+
+\ The committed local records whose observation is unknown, by path.
+: UNKNOWN-LOCALS
+   ( journal ^ARENA:arena -- ^VEC:vector<MODEL:local-record> )
+   {: j ar :}
+   j >CONNECTION
+   s" SELECT path, observation_json FROM local_observations
+      WHERE json_type(observation_json, '$.Unknown') IS NOT NULL
+      ORDER BY path"
+   >str ar LOCAL-ROWS ;
+
+\ The committed remote records whose observation is unknown, by
+\ canonical path.
+: UNKNOWN-REMOTES
+   ( journal ^ARENA:arena -- ^VEC:vector<MODEL:remote-record> )
+   {: j ar :}
+   j >CONNECTION
+   s" SELECT canonical_path, path, observation_json
+      FROM remote_observations
+      WHERE json_type(observation_json, '$.Unknown') IS NOT NULL
+      ORDER BY canonical_path"
+   >str ar REMOTE-ROWS ;
 
 private
 

@@ -29,6 +29,9 @@
 \ unheld key; the keys EACH-KNOWN-PATH visits, in byte order, and
 \ KNOWN-PATH-AT at a held key and at keys nothing holds, and its subtree
 \ as Rust's reconcile.rs remote_subtree_holds_only_true_descendants has it;
+\ UNKNOWN-LOCALS and UNKNOWN-REMOTES answering only the unknown records of
+\ inventories holding each observation, an excluded path among them, by
+\ path and by canonical path;
 \ and fifty-one tests of the Rust version's src/journal.rs and two of
 \ its src/daemon.rs under their names, which
 \ build each decision the Rust ones ask the planner for as
@@ -395,6 +398,9 @@ variable SCANNED       \ query plan rows that scan the table
 
 : PRESENT-LOCAL ( ^u8 n -- MODEL:observation<MODEL:local> )
    CONTENT MODEL-LOCAL:MAKE MODEL-OBSERVATION:PRESENT ;
+
+: LOCAL-DIRECTORY ( -- MODEL:observation<MODEL:local> )
+   MODEL-OBSERVATION:DIRECTORY ;
 
 \ The Rust tests' record(key, path, observation).
 : REMOTE-RECORD
@@ -1366,6 +1372,81 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    j CLOSE
    d GONE ;
 
+: UNKNOWN-LOCAL
+   ( MODEL:unknown-reason -- MODEL:observation<MODEL:local> )
+   MODEL-OBSERVATION:UNKNOWN ;
+
+: ABSENT-LOCAL ( -- MODEL:observation<MODEL:local> )
+   MODEL-OBSERVATION:ABSENT ;
+
+: STALE-REMOTE ( -- MODEL:observation<MODEL:remote> )
+   MODEL-UNKNOWN--REASON:STALE MODEL-OBSERVATION:UNKNOWN ;
+
+\ A local inventory of each observation, out of path order; its unknown
+\ paths, Thumbs.db an excluded name, sort otherwise once folded.
+: MIXED-LOCALS ( ^ARENA:arena -- ^VEC:vector<MODEL:local-record> )
+   {: ar :}
+   ar LOCALS {: v :}
+   s" z-unknown.txt" MODEL-UNKNOWN--REASON:UNAVAILABLE UNKNOWN-LOCAL
+   LOCAL-RECORD v LOCAL+
+   s" a.txt" s" a" PRESENT-LOCAL LOCAL-RECORD v LOCAL+
+   s" dir" LOCAL-DIRECTORY LOCAL-RECORD v LOCAL+
+   s" gone.txt" ABSENT-LOCAL LOCAL-RECORD v LOCAL+
+   s" Thumbs.db" MODEL-UNKNOWN--REASON:INACCESSIBLE UNKNOWN-LOCAL
+   LOCAL-RECORD v LOCAL+
+   s" m-unknown" MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN-LOCAL
+   LOCAL-RECORD v LOCAL+
+   v ;
+
+\ MIXED-LOCALS' unknown records, by path.
+: UNKNOWN-SAMPLE-LOCALS
+   ( ^ARENA:arena -- ^VEC:vector<MODEL:local-record> )
+   {: ar :}
+   ar LOCALS {: v :}
+   s" Thumbs.db" MODEL-UNKNOWN--REASON:INACCESSIBLE UNKNOWN-LOCAL
+   LOCAL-RECORD v LOCAL+
+   s" m-unknown" MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN-LOCAL
+   LOCAL-RECORD v LOCAL+
+   s" z-unknown.txt" MODEL-UNKNOWN--REASON:UNAVAILABLE UNKNOWN-LOCAL
+   LOCAL-RECORD v LOCAL+
+   v ;
+
+\ A remote inventory of each observation, out of canonical path order;
+\ its unknown spellings, Thumbs.db an excluded name, sort otherwise.
+: MIXED-REMOTES ( ^ARENA:arena -- ^VEC:vector<MODEL:remote-record> )
+   {: ar :}
+   ar REMOTES {: v :}
+   s" z-shared" s" Z-Shared" INACCESSIBLE ar REMOTE-RECORD v REMOTE+
+   s" a.txt" s" A.txt" s" a" s" rev-a" PRESENT-REMOTE
+   ar REMOTE-RECORD v REMOTE+
+   s" docs" s" Docs" REMOTE-DIRECTORY ar REMOTE-RECORD v REMOTE+
+   s" gone.txt" s" gone.txt" ABSENT-REMOTE ar REMOTE-RECORD v REMOTE+
+   s" thumbs.db" s" Thumbs.db" STALE-REMOTE ar REMOTE-RECORD v REMOTE+
+   s" m-stale" s" m-stale" STALE-REMOTE ar REMOTE-RECORD v REMOTE+
+   v ;
+
+\ MIXED-REMOTES' unknown records, by canonical path.
+: UNKNOWN-SAMPLE-REMOTES
+   ( ^ARENA:arena -- ^VEC:vector<MODEL:remote-record> )
+   {: ar :}
+   ar REMOTES {: v :}
+   s" m-stale" s" m-stale" STALE-REMOTE ar REMOTE-RECORD v REMOTE+
+   s" thumbs.db" s" Thumbs.db" STALE-REMOTE ar REMOTE-RECORD v REMOTE+
+   s" z-shared" s" Z-Shared" INACCESSIBLE ar REMOTE-RECORD v REMOTE+
+   v ;
+
+: UNKNOWN-OBSERVATIONS-ARE-READ-ALONE ( ^ARENA:arena -- )
+   {: ar :}
+   s" unknown observations are read alone, in path order" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j ar MIXED-LOCALS PUBLISH-LOCAL-INVENTORY
+   j s" cursor" CURSOR ar MIXED-REMOTES PUBLISH-REMOTE-INVENTORY
+   j ar UNKNOWN-LOCALS ar UNKNOWN-SAMPLE-LOCALS LOCAL-RECORDS= TTRUE
+   j ar UNKNOWN-REMOTES ar UNKNOWN-SAMPLE-REMOTES REMOTES= TTRUE
+   j CLOSE
+   d GONE ;
+
 \ Notes each published row's rowid, path and value in temporary tables.
 : ROWS-NOTED ( journal -- )
    >CONNECTION
@@ -1663,9 +1744,6 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    j OBSERVATIONS-MOVED 1 0 0 MOVED=  j HASHES-MOVED 1 0 0 MOVED=
    j CLOSE
    d GONE ;
-
-: LOCAL-DIRECTORY ( -- MODEL:observation<MODEL:local> )
-   MODEL-OBSERVATION:DIRECTORY ;
 
 : DIRECTORY-LOCAL ( ^u8 n -- MODEL:local-record )
    LOCAL-DIRECTORY LOCAL-RECORD ;
@@ -4202,6 +4280,7 @@ variable CRAFT
    ar REMOTE-DELTA-ENSURED-DIRECTORY-KEEPS-AN-UNKNOWN-FOLDER
    ar REMOTE-DIRECTORY-AT-INCLUDES-RESTRICTED-FOLDERS
    ar REMOTE-AT-ANSWERS-THE-RECORD-AT-A-KEY
+   ar UNKNOWN-OBSERVATIONS-ARE-READ-ALONE
    ar JOURNAL-LOCAL-SCAN-REPLACES-INVENTORY-AND-HASHES-ATOMICALLY
    ar EACH-LOCAL-COLLISION-VISITS-IN-KEY-ORDER
    ar LOCAL-COUNT-AND-LOCAL-AT

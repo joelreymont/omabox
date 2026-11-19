@@ -303,7 +303,7 @@ ARENA SLOTS JOURNAL:journal
 
 : LOCAL-ENTRIES ( JOURNAL:journal ^ARENA:arena ^VEC:vector<entry> -- )
    {: j ar v :}
-   j ar JOURNAL:LOCAL-INVENTORY {: rs :}
+   j ar JOURNAL:UNKNOWN-LOCALS {: rs :}
    rs VEC:COUNT 0 ?do rs i VEC:AT @ ar v LOCAL+ loop ;
 
 : REMOTE+ ( MODEL:remote-record ^ARENA:arena ^VEC:vector<entry> -- )
@@ -315,8 +315,7 @@ ARENA SLOTS JOURNAL:journal
 : REMOTE-ENTRIES
    ( JOURNAL:journal ^ARENA:arena ^VEC:vector<entry> -- )
    {: j ar v :}
-   j ar JOURNAL:REMOTE-INVENTORY JOURNAL-REMOTE--INVENTORY:UNMAKE
-   {: cur rs :}
+   j ar JOURNAL:UNKNOWN-REMOTES {: rs :}
    rs VEC:COUNT 0 ?do rs i VEC:AT @ ar v REMOTE+ loop ;
 
 : RECOVERY+ ( JOURNAL:recovery-record ^ARENA:arena ^VEC:vector<entry> -- )
