@@ -104,7 +104,9 @@ Throw ==
     /\ transfer' = IF step \in Finals THEN transfer ELSE "abandoned"
     /\ UNCHANGED <<step, first, left, total, buffered, reader>>
 
-Next ==
+\* The steps DOWNLOADING's lines take. The reader returns, and a throw
+\* leaves READ-OUT, outside them.
+Run ==
     \/ \E n \in Bytes : Passed(n)
     \/ Buffer("opened")
     \/ Buffer("buffering")
@@ -117,9 +119,9 @@ Next ==
     \/ Drain
     \/ Short
     \/ Lose
-    \/ Return
     \/ Unread
-    \/ Throw
+
+Next == Run \/ Return \/ Throw
 
 Spec == Init /\ [][Next]_vars
 

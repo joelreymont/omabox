@@ -1,7 +1,8 @@
 ---- MODULE DownloadingFollows ----
-\* Follows: every step between DOWNLOADING's states is one of its lines and
-\* every line's step moves as the line says. Out is a throw out of READ-OUT,
-\* which ends the run; a fetch is never re-entered.
+\* Follows: every step between DOWNLOADING's states, and every step of its
+\* lines (Run), one that keeps the state included, is one of its lines,
+\* and every line's step moves as the line says. Out is a throw out of
+\* READ-OUT, which ends the run; a fetch is never re-entered.
 EXTENDS Downloading
 T == INSTANCE DownloadingTable
 Out == "out"
@@ -22,7 +23,7 @@ Walks(l) ==
       [] l = <<"buffering", "failure", "lost">> -> Last("buffering", "lost")
 Line(l) == At = l[1] /\ At' = l[3]
 Follows ==
-    [][ /\ At' # At => \/ \E l \in T!Lines : Line(l) /\ Walks(l)
-                       \/ At' = Out
+    [][ /\ (At' # At \/ Run) => \/ \E l \in T!Lines : Line(l) /\ Walks(l)
+                                \/ At' = Out
         /\ \A l \in T!Lines : Walks(l) => Line(l) ]_vars
 ====

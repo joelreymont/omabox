@@ -1,7 +1,9 @@
 ---- MODULE InventoryPublicationFollows ----
-\* Follows: every step between the table's states is a line of
-\* INVENTORY-PUBLICATION and every line's step moves as the line says; Out is
-\* a failure or crash, which leaves the table, and a retry re-enters at First.
+\* Follows: every step between the table's states, and every step of its
+\* lines (Run), one that keeps the state included, is a line of
+\* INVENTORY-PUBLICATION, and every line's step moves as the line says; Out
+\* is a failure or crash, which leaves the table, and a retry re-enters at
+\* First.
 EXTENDS InventoryPublication
 T == INSTANCE InventoryPublicationTable
 Out == "out"
@@ -20,8 +22,8 @@ Walks(l) ==
       [] l = <<"full", "done", "published">> -> Publish /\ mode = "Full"
 Line(l) == At = l[1] /\ At' = l[3]
 Follows ==
-    [][ /\ At' # At => \/ \E l \in T!Lines : Line(l) /\ Walks(l)
-                       \/ At' = Out
-                       \/ At = Out /\ At' = First
+    [][ /\ (At' # At \/ Run) => \/ \E l \in T!Lines : Line(l) /\ Walks(l)
+                                \/ At' = Out
+                                \/ At = Out /\ At' = First
         /\ \A l \in T!Lines : Walks(l) => Line(l) ]_vars
 ====

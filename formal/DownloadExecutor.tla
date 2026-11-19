@@ -172,17 +172,23 @@ Restart ==
     /\ UNCHANGED <<job, plan, workerPath, slotPath, cancelled, failure,
         rootActive, unrooted>>
 
+\* The steps DOWNLOAD-EXECUTOR's lines take on path's download. The
+\* scheduler, the journal, a failure passed up, a crash and the user act
+\* outside them.
+Run(path) ==
+    \/ FinishSuccess(path)
+    \/ FinishPermanent(path)
+    \/ Install(path)
+    \/ Unroot(path)
+
 Next ==
+    \/ \E path \in Paths: Run(path)
     \/ \E path \in Paths: Queue(path)
     \/ \E path \in Paths, worker \in Workers, slot \in Slots:
         Start(path, worker, slot)
-    \/ \E path \in Paths: FinishSuccess(path)
     \/ \E path \in Paths: FinishFailure(path)
-    \/ \E path \in Paths: FinishPermanent(path)
     \/ \E path \in Paths: Unblock(path)
     \/ \E path \in Paths: CancelQueued(path)
-    \/ \E path \in Paths: Install(path)
-    \/ \E path \in Paths: Unroot(path)
     \/ \E path \in Paths: Complete(path)
     \/ ReportFailure
     \/ Crash

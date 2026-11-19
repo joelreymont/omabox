@@ -127,12 +127,17 @@ Edit(i) ==
     /\ remote' = [remote EXCEPT ![i] = "Other"]
     /\ UNCHANGED <<status, plan, run>>
 
+\* The steps REMOTE-LIFECYCLE's lines take on operation i. The pass,
+\* Dropbox, local replay and another client act outside them.
+Run(i) ==
+    \/ Skip(i) \/ Apply(i) \/ Complete(i) \/ Conflict(i) \/ Block(i)
+    \/ Yield(i)
+
 Next ==
     \/ Begin
     \/ End
     \/ \E i \in Ops :
-        \/ Advance(i) \/ Skip(i) \/ Apply(i) \/ Send(i) \/ Complete(i)
-        \/ Conflict(i) \/ Block(i) \/ Yield(i) \/ LocalReplay(i) \/ Edit(i)
+        \/ Run(i) \/ Advance(i) \/ Send(i) \/ LocalReplay(i) \/ Edit(i)
 
 Spec == Init /\ [][Next]_vars
 

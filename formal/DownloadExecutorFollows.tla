@@ -1,6 +1,8 @@
 ---- MODULE DownloadExecutorFollows ----
-\* Follows: every step that moves a path between the table's states is a
-\* line of DOWNLOAD-EXECUTOR and every line's step moves as the line says.
+\* Follows: every step that moves a path between the table's states, and
+\* every step of the table's lines on a path (Run), one that keeps its
+\* state included, is a line of DOWNLOAD-EXECUTOR, and every line's step
+\* moves as the line says.
 \* Out is a path outside a run: not yet queued, failed, cancelled, reset by
 \* a crash or a lifted block, or installed by a later pass from the stage a
 \* run left unrooted; a queued job enters at First.
@@ -25,8 +27,9 @@ Walks(l, p) ==
 Line(l, p) == At(p) = l[1] /\ At(p)' = l[3]
 Follows ==
     [][ \A p \in Paths :
-          /\ At(p)' # At(p) => \/ \E l \in T!Lines : Line(l, p) /\ Walks(l, p)
-                               \/ At(p)' = Out
-                               \/ At(p) = Out /\ At(p)' = First
+          /\ (At(p)' # At(p) \/ Run(p)) =>
+                \/ \E l \in T!Lines : Line(l, p) /\ Walks(l, p)
+                \/ At(p)' = Out
+                \/ At(p) = Out /\ At(p)' = First
           /\ \A l \in T!Lines : Walks(l, p) => Line(l, p) ]_vars
 ====

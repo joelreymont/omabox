@@ -102,9 +102,11 @@ Crash ==
     /\ phase' = "out"
     /\ UNCHANGED <<status, baseline, confirmed, op>>
 
-Next ==
-    \/ Begin \/ Skip \/ Enter \/ Done \/ Block \/ Retire
-    \/ Advance \/ Commit \/ Crash
+\* The steps LOCAL-LIFECYCLE's lines take on op. The pass begins,
+\* advances, commits and crashes outside them.
+Run == Skip \/ Enter \/ Done \/ Block \/ Retire
+
+Next == Run \/ Begin \/ Advance \/ Commit \/ Crash
 
 Spec == Init /\ [][Next]_vars
 

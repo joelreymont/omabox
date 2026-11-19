@@ -141,17 +141,19 @@ Retry ==
     /\ validated' = FALSE
     /\ UNCHANGED <<scenario, durable, cursor, committed>>
 
+\* The steps INVENTORY-PUBLICATION's lines take. The listing's reads and
+\* failures, a crash and a retry happen outside them.
+Run == Start \/ ObserveReset \/ Publish
+
 Next ==
-    \/ Start
+    \/ Run
     \/ ReadDeltaFirst
     \/ ReadDeltaLast
     \/ FailDelta
-    \/ ObserveReset
     \/ ReadFullFirst
     \/ ReadFullLast
     \/ FailFull
     \/ RejectFreshReset
-    \/ Publish
     \/ Crash
     \/ Retry
 
