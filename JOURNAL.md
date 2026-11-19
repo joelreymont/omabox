@@ -1929,3 +1929,92 @@ Observation for the blog: in Rust the header would be private fields,
 and other code could not build one. Habu's packages hide words, not
 memory: a pointer can still write any cell. The checker cannot see this
 bug, so it took a root-cause hunt, not a type error.
+
+## 2026-11-19: a scan that caught up in four steps
+
+Publishing the scan row by row, the plan from 2026-11-18, ended at
+four commits, each measured against master on one bench. The first had
+the scan publish only its difference from the stored inventory. The
+second had the walk record each observation in SQLite's temporary
+tables as it found it, not in vectors held until the end. A cached pass
+of 4,000 files then took 236 ms against master's 103.
+
+Two changes closed the gap. Each unchanged file's cached hash went
+through three JSON encodes and two decodes, where master did none; it
+now goes through one decode. And every write ran in autocommit, so each
+flushed the temporary tables and retook the main database's lock. One
+transaction around the whole scan would hold that lock past another
+connection's 5 s busy timeout, so the writes now go in batches of at
+most 512, run by a small state machine. On the way, a pass over 4,000
+dangling symlinks went from 87 ms to 19-21 ms; master takes 19.
+
+Cached passes now take 95 ms at 4,000 files (master 100) and 403-414 ms
+at 16,000 (master 414). Peak memory fell from 29.4 to 23.7 MB at 4,000
+and from 49.3 to 28.0 MB at 16,000. The first, uncached pass is slower:
+107.5 against 89.0 ms at 4,000, and 445.6 against 363.5 ms at 16,000.
+A cached pass at 16,000 also makes 42,000 to 60,000 read calls where
+master makes 2,800. The temporary database's small page cache is the
+likely reader; that is not measured yet.
+
+Observation for the blog: the Rust original held whole inventories in
+memory, and the first Habu port copied that shape. Moving the working
+set into SQLite nearly halved peak memory at 16,000 files, but on the
+way a cached pass ran more than twice as long as master's. A bench
+against master caught that, not a review. The trade is still visible in
+the numbers: less memory, the same cached speed, a slower cold pass and
+many more reads.
+
+## 2026-11-19: a false refusal, and the error behind it
+
+Factoring Omabox's walk, a worker nested an arena's scope inside a
+quotation, and Habu refused the word with E-LINEAR-COPY: it said a
+linear value was copied, where the code only moved it. The root-cause
+hunt found the checker counting a step's linear values before and after
+it. Inside a quotation literal the input row is still open, so before
+the step it counted none; the step then bound that open row to one
+holding the value, and after the step it counted one. One more than
+before reads as a copy. The fix counts the rows from before the step
+after it, under the same bindings.
+
+That rule is stricter too. A literal that drops a linear value through
+a combinator, `[: ['] CONSUME APPLY ;] execute`, was accepted before and
+is now refused with E-LINEAR-DROP, as the same call outside a literal
+always was. The fix's review then found a second defect, older and
+hidden by the first. A quotation that needs more stack than its caller
+has, run through a row-polymorphic combinator, makes the checker die
+with an internal error (exit 76) and no diagnostic. With a linear
+operand the false E-LINEAR-COPY had printed instead. The first fix is
+taking its review's changes; the second defect has a root-cause hunt of
+its own.
+
+Observation for the blog: Rust users meet false borrow-checker errors
+too, and restructure their code to get past them. Here the agent fixed
+the checker in the same session, because Habu is within reach. A wrong
+diagnostic also hides what is behind it: the first fix made the second
+defect visible.
+
+## 2026-11-19: a throw the model did not have
+
+Habu's HTTPS client threw out of its handshake when the trust file's
+path was one its filesystem words cannot spell, too long or holding a 0
+byte. The machine never reached a rest, so every request leaked a
+socket. TLS now answers such a path as untrusted before it allocates
+anything. The client also runs its machine inside a catch now: on any
+throw it hangs up, rests the machine at `down`, and throws again.
+
+The TLA+ model had no such step; a run moved only by lines of the
+table. Adding one, a step from any run straight to `down`, meant asking
+what a run holds when it throws. One thing is the socket, which the
+model counts and the catch closes. The other is the address list from
+getaddrinfo, which a run holds while it dials: the catch never freed
+it, and the next lookup overwrote the pointer. This was found by
+reading; no test makes a run throw while dialing. The catch now frees
+the list too. The model change still needs its TLC run.
+
+Observation for the blog: the model counts sockets but not memory, so
+TLC could never have found this leak; writing the step is what raised
+the question. Rust's standard library holds the list in a value whose
+Drop calls freeaddrinfo, so a panic or an early `?` return frees it on
+the way out. Habu's throw runs no destructors, so whatever a run holds
+must be released by the catch, and listing what a run holds is the
+agent's job.
