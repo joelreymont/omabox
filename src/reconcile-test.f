@@ -3,22 +3,32 @@
 \ Known paths, Rust's tests of the same names:
 \ - absent_paths_are_spelled_with_local_ancestor_casing
 \ - local_case_variants_never_collapse_into_one_observation, over
-\   sampled names, the collision logged once naming both spellings and
-\   renamed alike in either order, to a path neither spelling holds
-\ - known_path_merge_matches_set_union, over sampled path sets
+\   sampled names written as local rows, deciding them logging the
+\   collision once naming both spellings, then renamed alike in either
+\   order, to a path neither spelling holds
+\ - known_path_merge_matches_set_union, over sampled path sets written
+\   as baselines and local and remote rows, which
+\   JOURNAL:EACH-KNOWN-PATH visits
 \ - remaining_operation_comparison_ignores_a_completed_prefix
-\ - pending_only_paths_are_visited_as_absent_without_creating_a_baseline
-\ - local_map_keeps_one_unsupported_spelling
+\ - pending_only_paths_are_visited_as_absent_without_creating_a_baseline,
+\   deciding a journal that holds only the pending plan
 \ - a_path_below_an_unknown_directory_inherits_its_reason
 \ - a_record_below_an_unknown_directory_cannot_restore_absence
 \ - names_that_neighbor_the_separator_are_not_ancestors
 \ - an_unknown_ancestor_blocks_a_deletion_on_either_side
 \ - baseline_only_paths_are_included_in_confirmed_absence
-\ - remote_subtree_holds_only_true_descendants
-\ - child_prefix_order_matches_the_materialized_prefix, over every
-\   pair of strings of up to three bytes from 00 . / 0 FF
 \ - ORDER-PATH-DECISIONS puts an upload at depth 3 first, then local
 \   directory deletes at depths 2 and 1, deepest first.
+\ - AN-EXCLUDED-ANCESTOR-LENDS-NO-REASON-OR-SPELLING: an unknown local
+\   record at Cache.dropbox leaves cache.dropbox/x absent and spelled
+\   as the candidate, where one at Locked lends both.
+\ - A-WALK-COUNTS-EVERY-KEPT-BASELINE: Docs, Docs/Notes and Music, each
+\   a directory on both sides and in the baseline: the walk keeps no
+\   key, and deciding files no decision and no no-op record and counts
+\   three no-ops.
+\ - DECIDING-KEEPS-THE-RUN-RULE, Rust's
+\   local_map_keeps_one_unsupported_spelling: unsupported link and Link
+\   decide Link alone.
 \ Case collisions:
 \ - Rust's case_variant_name_skips_existing_suffixes,
 \   case_variant_name_fits_a_maximum_length_component,
@@ -358,48 +368,73 @@ private
    p u ar CANONICAL p u DISPLAY o MODEL-REMOTE--RECORD:MAKE
    v VEC:PUSH ! ;
 
-\ The local entries' paths, each followed by a space.
-: PATHS$ ( ^VEC:vector<local-entry> -- ^u8 n )
-   {: v :}
-   SB-RESET
-   v VEC:COUNT 0 ?do
-      v i VEC:AT @ ENTRY-RECORD RECORD-PATH PATH$ SB-APPEND
-      s"  " SB-APPEND
-   loop
-   SB$ ;
+\ The records published as the journal's local inventory and its remote
+\ one, then the body run on it.
+: SIDES-IN
+   ( str JOURNAL:journal JOURNAL:local-root-binding
+     ^VEC:vector<MODEL:local-record> ^VEC:vector<MODEL:remote-record>
+     [ JOURNAL:journal -- ] ^ARENA:arena -- )
+   {: d:str j b ls rs body ar :}
+   j b ls ar LOCALS-PUBLISHED
+   j s" cursor" >str DROPBOX:>CURSOR rs JOURNAL:PUBLISH-REMOTE-INVENTORY
+   j body execute ;
 
-\ The local observation the map holds at the path, else unobserved.
+\ The body runs on a rooted case journal holding the records as its
+\ local inventory and its remote one, which is removed after.
+: WITH-SIDES
+   ( ^VEC:vector<MODEL:local-record> ^VEC:vector<MODEL:remote-record>
+     [ JOURNAL:journal -- ] ^ARENA:arena -- )
+   {: ls rs body ar :}
+   [: ls rs body ar SIDES-IN ;] ar WITH-ROOTED ;
+
+\ A planning over the journal, in a run that holds only it and ar.
+: PLANNING-OVER ( JOURNAL:journal ^ARENA:arena -- ^planning )
+   {: j ar :}
+   ar RUNS-NEW {: x :}
+   j x RUN-JOURNAL ! ar x RUN-ARENA !
+   x NEW-PLANNING ;
+
+\ The planning over the journal once the records are its local
+\ inventory.
+: LOCALS-PLANNING
+   ( JOURNAL:journal JOURNAL:local-root-binding
+     ^VEC:vector<MODEL:local-record> ^ARENA:arena -- ^planning )
+   {: j b ls ar :}
+   j b ls ar LOCALS-PUBLISHED
+   j ar PLANNING-OVER ;
+
+\ The local observation the journal holds at the path, else unobserved.
 : LOCAL-AT
-   ( ^VEC:vector<local-entry> MODEL:key
+   ( JOURNAL:journal MODEL:key ^ARENA:arena
      -- MODEL:observation<MODEL:local> )
-   {: v k :}
-   v k FIND-LOCAL
+   {: j k ar :}
+   j k ar JOURNAL:LOCAL-AT
    MATCH option
-      none OF v k LOCAL-UNOBSERVED ENDOF
+      none OF j k ar LOCAL-UNOBSERVED ENDOF
       some OF MODEL-LOCAL--RECORD:UNMAKE {: p o :} o ENDOF
    ;MATCH ;
 
 : REMOTE-AT
-   ( ^VEC:vector<MODEL:remote-record> MODEL:key
+   ( JOURNAL:journal MODEL:key ^ARENA:arena
      -- MODEL:observation<MODEL:remote> )
-   {: v k :}
-   v k FIND-REMOTE
+   {: j k ar :}
+   j k ar JOURNAL:REMOTE-AT
    MATCH option
-      none OF v k REMOTE-UNOBSERVED ENDOF
+      none OF j k ar REMOTE-UNOBSERVED ENDOF
       some OF REMOTE-OBSERVATION ENDOF
    ;MATCH ;
 
-: LOCAL-UNOBSERVED= ( ^VEC:vector<local-entry> ^u8 n
+: LOCAL-UNOBSERVED= ( JOURNAL:journal ^u8 n
      MODEL:observation<MODEL:local> ^ARENA:arena -- )
-   {: v p:^ u:n want ar :}
-   v p u ar CANONICAL LOCAL-UNOBSERVED want MODEL:LOCAL-OBSERVATION=
+   {: j p:^ u:n want ar :}
+   j p u ar CANONICAL ar LOCAL-UNOBSERVED want MODEL:LOCAL-OBSERVATION=
    TTRUE ;
 
-: REMOTE-UNOBSERVED= ( ^VEC:vector<MODEL:remote-record> ^u8 n
+: REMOTE-UNOBSERVED= ( JOURNAL:journal ^u8 n
      MODEL:observation<MODEL:remote> ^ARENA:arena -- )
-   {: v p:^ u:n want ar :}
-   v p u ar CANONICAL REMOTE-UNOBSERVED want MODEL:REMOTE-OBSERVATION=
-   TTRUE ;
+   {: j p:^ u:n want ar :}
+   j p u ar CANONICAL ar REMOTE-UNOBSERVED want
+   MODEL:REMOTE-OBSERVATION= TTRUE ;
 
 \ A plan of the one operation, or of two.
 : OPERATIONS ( ^ARENA:arena -- ^VEC:vector<MODEL:operation> )
@@ -487,9 +522,19 @@ variable SEED
 \ ---- known paths: cases ---------------------------------------------
 
 : RESPELLED
-   ( ^VEC:vector<local-entry> ^u8 n ^u8 n ^ARENA:arena -- ^u8 n )
-   {: v p:^ u:n q:^ w:n ar :}
-   v p u ar CANONICAL q w DISPLAY ar SPELL-WITH-LOCAL-ANCESTORS PATH$ ;
+   ( JOURNAL:journal ^u8 n ^u8 n ^ARENA:arena -- ^u8 n )
+   {: j p:^ u:n q:^ w:n ar :}
+   j p u ar CANONICAL q w DISPLAY ar SPELL-WITH-LOCAL-ANCESTORS PATH$ ;
+
+: RESPELLINGS ( JOURNAL:journal ^ARENA:arena -- )
+   {: j ar :}
+   j s" apps/day one/journal" s" apps/day one/Journal" ar RESPELLED
+   s" Apps/Day One/Journal" T$=
+   j s" apps/day one/journal/entries" s" APPS/Day one/journal/Entries"
+   ar RESPELLED s" Apps/Day One/journal/Entries" T$=
+   j s" docs/report.txt" s" Docs/Report.txt" ar RESPELLED
+   s" Docs/Report.txt" T$=
+   j s" notes" s" NOTES" ar RESPELLED s" NOTES" T$= ;
 
 : ABSENT-PATHS-ARE-SPELLED-WITH-LOCAL-ANCESTOR-CASING ( ^ARENA:arena -- )
    {: ar :}
@@ -498,16 +543,9 @@ variable SEED
    rs s" Apps" DIRECTORY+
    rs s" Apps/Day One" DIRECTORY+
    rs s" Notes" DIRECTORY+
-   rs ar LOCAL-MAP {: v :}
-   v s" apps/day one/journal" s" apps/day one/Journal" ar RESPELLED
-   s" Apps/Day One/Journal" T$=
-   v s" apps/day one/journal/entries" s" APPS/Day one/journal/Entries"
-   ar RESPELLED s" Apps/Day One/journal/Entries" T$=
-   v s" docs/report.txt" s" Docs/Report.txt" ar RESPELLED
-   s" Docs/Report.txt" T$=
-   v s" notes" s" NOTES" ar RESPELLED s" NOTES" T$= ;
+   rs ar REMOTE-RECORDS [: ar RESPELLINGS ;] ar WITH-SIDES ;
 
-\ The text LOCAL-MAP logs for a collision of the two spellings.
+\ The text a pass logs for a collision of the two spellings.
 : COLLISION$ ( ^u8 n ^u8 n -- ^u8 n )
    {: a:^ au:n b:^ bu:n :}
    SB-RESET s" local paths `" SB-APPEND a au SB-APPEND
@@ -577,7 +615,8 @@ variable SEED
    upper str> 0 ?do dup i + c@ ASCII-UPPER over i + c! loop drop
    ar LOCAL-RECORDS {: rs :}
    rs lower str> DIRECTORY+ rs upper str> DIRECTORY+
-   d [: [: rs ar LOCAL-MAP drop ;] E-CASE-COLLISION TTHROWSQ ;] ar
+   j b rs ar LOCALS-PLANNING {: pl :}
+   d [: [: pl DECIDE-ALL ;] E-CASE-COLLISION TTHROWSQ ;] ar
    LOGGED {: t:^ tu:n :}
    t tu >str 10 COUNT-CHAR 1 T=
    t tu upper str> lower str> COLLISION$ CONTAINS? TTRUE
@@ -645,17 +684,18 @@ variable SEED
       NOOP-RECORDED? TTRUE
    loop ;
 
+\ Which sides hold the known path's key, against the samples; the key
+\ is copied into ar, as the walk resets its own arena before each row.
 : CHECK-VISIT
-   ( MODEL:key option<JOURNAL:path-baseline>
-     option<MODEL:local-record> option<MODEL:remote-record>
-     ^VEC:vector<str> ^VEC:vector<str> ^VEC:vector<str>
-     ^VEC:vector<MODEL:key> -- )
-   {: k b l r bp lp rp merged :}
+   ( JOURNAL:known-path ^VEC:vector<str> ^VEC:vector<str>
+     ^VEC:vector<str> ^VEC:vector<MODEL:key> ^ARENA:arena -- )
+   {: kp bp lp rp merged ar :}
+   kp JOURNAL-KNOWN--PATH:UNMAKE {: k br lr n:n rr t live:bool :}
    k KEY-BYTES {: p:^ u:n :}
-   b BASELINE-SOME? bool>n bp p u HOLDS? bool>n T=
-   l LOCAL-SOME? bool>n lp p u HOLDS? bool>n T=
-   r REMOTE-SOME? bool>n rp p u HOLDS? bool>n T=
-   k merged VEC:PUSH ! ;
+   br BASELINE-SOME? bool>n bp p u HOLDS? bool>n T=
+   lr LOCAL-SOME? bool>n lp p u HOLDS? bool>n T=
+   rr REMOTE-SOME? bool>n rp p u HOLDS? bool>n T=
+   p u ar COPIED MODEL:>KEY merged VEC:PUSH ! ;
 
 : KEYS-INTO
    ( ^VEC:vector<str> ^VEC:vector<MODEL:key> ^ARENA:arena -- )
@@ -703,41 +743,43 @@ variable SEED
    paths VEC:COUNT 0 ?do
       v paths i VEC:AT @ str> REMOTE-DIRECTORY ar REMOTE+
    loop
-   v ar REMOTE-MAP ;
+   v ;
 
 : LOCAL-DIRECTORIES
-   ( ^VEC:vector<str> ^ARENA:arena -- ^VEC:vector<local-entry> )
+   ( ^VEC:vector<str> ^ARENA:arena -- ^VEC:vector<MODEL:local-record> )
    {: paths ar :}
    ar LOCAL-RECORDS {: v :}
    paths VEC:COUNT 0 ?do v paths i VEC:AT @ str> DIRECTORY+ loop
-   v ar LOCAL-MAP ;
+   v ;
 
-: NO-PENDING ( ^ARENA:arena -- ^VEC:vector<pending-plan> )
-   ARENA:ALLOCATOR 0 [type] pending-plan VEC:NEW ;
+\ The keys JOURNAL:EACH-KNOWN-PATH visits, in order, each checked.
+: WALKED
+   ( JOURNAL:journal ^VEC:vector<str> ^VEC:vector<str>
+     ^VEC:vector<str> ^ARENA:arena -- ^VEC:vector<MODEL:key> )
+   {: j bp lp rp ar :}
+   ar ARENA:ALLOCATOR 0 [type] MODEL:key VEC:NEW {: merged :}
+   [: j swap [: bp lp rp merged ar CHECK-VISIT ;]
+      JOURNAL:EACH-KNOWN-PATH ;] ARENA:WITH
+   merged ;
 
-\ One sample of the proptest.
-: MERGE-SAMPLE ( ^ARENA:arena -- )
-   {: ar :}
+\ One sample of the proptest, written into the rooted journal.
+: MERGE-SAMPLE
+   ( str JOURNAL:journal JOURNAL:local-root-binding ^ARENA:arena -- )
+   {: d:str j b ar :}
    ar MERGE-PATHS {: bp :}
    ar MERGE-PATHS {: lp :}
    ar MERGE-PATHS {: rp :}
-   ar CASE-JOURNAL {: d:str j :}
    j bp ar SEED-DIRECTORY-BASELINES
-   j ar JOURNAL:BASELINES {: bs :}
-   bs VEC:COUNT bp VEC:COUNT T=
-   lp ar LOCAL-DIRECTORIES {: ls :}
-   rp ar REMOTE-DIRECTORIES {: rs :}
-   ar ARENA:ALLOCATOR 0 [type] MODEL:key VEC:NEW {: merged :}
-   bs ls rs ar NO-PENDING
-   [: bp lp rp merged CHECK-VISIT ;] FOR-EACH-KNOWN-PATH
-   merged bp lp rp ar EXPECTED SAME-KEYS
-   d j GONE ;
+   j ar JOURNAL:BASELINE-PATHS VEC:COUNT bp VEC:COUNT T=
+   d j b lp ar LOCAL-DIRECTORIES rp ar REMOTE-DIRECTORIES
+   [: bp lp rp ar WALKED bp lp rp ar EXPECTED SAME-KEYS ;]
+   ar SIDES-IN ;
 
 : KNOWN-PATH-MERGE-MATCHES-SET-UNION ( ^ARENA:arena -- )
    {: ar :}
    s" known_path_merge_matches_set_union" T-LABEL
    7 SEED !
-   24 0 ?do ar MERGE-SAMPLE loop ;
+   24 0 ?do [: ar MERGE-SAMPLE ;] ar WITH-ROOTED loop ;
 
 : NO-BASELINE ( -- option<MODEL:baseline> ) OPTION:NONE ;
 
@@ -769,33 +811,6 @@ variable SEED
    plan original REMAINING-OPERATIONS-MATCH? TFALSE
    d j GONE ;
 
-: KEYED-PLAN
-   ( JOURNAL:plan-record ^VEC:vector<pending-plan> ^ARENA:arena -- )
-   {: plan v ar :}
-   plan JOURNAL-PLAN--RECORD:UNMAKE {: id p ops s :}
-   p ar MODEL:FOLD plan PENDING-PLAN-MAKE v VEC:PUSH ! ;
-
-\ The pending plans keyed by path, as Rust's BTreeMap holds them.
-: PENDING-MAP
-   ( ^VEC:vector<JOURNAL:plan-record> ^ARENA:arena
-     -- ^VEC:vector<pending-plan> )
-   {: plans ar :}
-   ar NO-PENDING {: v :}
-   plans VEC:COUNT 0 ?do plans i VEC:AT @ v ar KEYED-PLAN loop
-   v ;
-
-: VISITED-ABSENT
-   ( MODEL:key option<JOURNAL:path-baseline>
-     option<MODEL:local-record> option<MODEL:remote-record>
-     MODEL:key ^VEC:vector<MODEL:decision> -- )
-   {: k b l r want decisions :}
-   k want MODEL:KEY= TTRUE
-   b BASELINE-SOME? TFALSE
-   l LOCAL-SOME? TFALSE
-   r REMOTE-SOME? TFALSE
-   MODEL-BASELINE:ABSENT LOCAL-ABSENT REMOTE-ABSENT MODEL-SUBTREE:EMPTY
-   PLANNER:PLAN decisions VEC:PUSH ! ;
-
 : PENDING-ONLY-PATHS-ARE-VISITED-AS-ABSENT-WITHOUT-CREATING-A-BASELINE
    ( ^ARENA:arena -- )
    {: ar :}
@@ -806,23 +821,27 @@ variable SEED
    s" obsolete" s" obsolete-revision" ar REMOTE-FILE
    MODEL-OPERATION:INSTALL-LOCAL ar ONE-PLAN {: plan :}
    j path plan ar JOURNAL:RECORD-PLAN RECORDED drop
-   j ar JOURNAL:PENDING-PLANS ar PENDING-MAP {: pending :}
-   path ar MODEL:FOLD {: want :}
-   ar ARENA:ALLOCATOR 0 [type] MODEL:decision VEC:NEW {: decisions :}
-   ar ARENA:ALLOCATOR 0 [type] MODEL:baseline-record VEC:NEW
-   ar LOCAL-RECORDS ar LOCAL-MAP ar REMOTE-RECORDS pending
-   [: want decisions VISITED-ABSENT ;] FOR-EACH-KNOWN-PATH
+   j ar PLANNING-OVER {: pl :}
+   pl DECIDE-ALL
+   pl PLANNING-DECISIONS @ {: decisions :}
    decisions VEC:COUNT 1 T=
-   decisions 0 VEC:AT @ NOOP? TTRUE
+   decisions 0 VEC:AT @ PATH-DECISION-UNMAKE
+   {: k shown same dec :}
+   k path ar MODEL:FOLD MODEL:KEY= TTRUE
+   dec MODEL-BASELINE:ABSENT LOCAL-ABSENT REMOTE-ABSENT
+   MODEL-SUBTREE:EMPTY PLANNER:PLAN MODEL:DECISION= TTRUE
+   dec NOOP? TTRUE
    j path ar JOURNAL:BASELINE STORED-SOME? TFALSE
    d j GONE ;
 
-: LOCAL-MAP-KEEPS-ONE-UNSUPPORTED-SPELLING ( ^ARENA:arena -- )
-   {: ar :}
-   s" local_map_keeps_one_unsupported_spelling" T-LABEL
-   ar LOCAL-RECORDS {: rs :}
-   rs s" link" UNSUPPORTED+ rs s" Link" UNSUPPORTED+
-   rs ar LOCAL-MAP PATHS$ s" Link " T$= ;
+: INHERITED ( JOURNAL:journal ^ARENA:arena -- )
+   {: j ar :}
+   MODEL-UNKNOWN--REASON:INACCESSIBLE LOCAL-UNKNOWN {: locked :}
+   j s" locked/secret.txt" locked ar LOCAL-UNOBSERVED=
+   j s" Locked/Deep/Deeper.TXT" locked ar LOCAL-UNOBSERVED=
+   j s" gone.txt" LOCAL-ABSENT ar LOCAL-UNOBSERVED=
+   j s" open/gone.txt" LOCAL-ABSENT ar LOCAL-UNOBSERVED=
+   j s" open/kept.txt/below" LOCAL-ABSENT ar LOCAL-UNOBSERVED= ;
 
 : A-PATH-BELOW-AN-UNKNOWN-DIRECTORY-INHERITS-ITS-REASON
    ( ^ARENA:arena -- )
@@ -832,13 +851,20 @@ variable SEED
    rs s" locked" MODEL-UNKNOWN--REASON:INACCESSIBLE LOCAL-UNKNOWN LOCAL+
    rs s" open" DIRECTORY+
    rs s" open/kept.txt" s" kept" ar PRESENT+
-   rs ar LOCAL-MAP {: v :}
-   MODEL-UNKNOWN--REASON:INACCESSIBLE LOCAL-UNKNOWN {: locked :}
-   v s" locked/secret.txt" locked ar LOCAL-UNOBSERVED=
-   v s" Locked/Deep/Deeper.TXT" locked ar LOCAL-UNOBSERVED=
-   v s" gone.txt" LOCAL-ABSENT ar LOCAL-UNOBSERVED=
-   v s" open/gone.txt" LOCAL-ABSENT ar LOCAL-UNOBSERVED=
-   v s" open/kept.txt/below" LOCAL-ABSENT ar LOCAL-UNOBSERVED= ;
+   rs ar REMOTE-RECORDS [: ar INHERITED ;] ar WITH-SIDES ;
+
+: VOLUME-UNKNOWN ( JOURNAL:journal ^ARENA:arena -- )
+   {: j ar :}
+   MODEL-UNKNOWN--REASON:UNSUPPORTED REMOTE-UNKNOWN {: why :}
+   j s" volume/gone.txt" why ar REMOTE-UNOBSERVED=
+   j s" volume/listed/gone.txt" why ar REMOTE-UNOBSERVED=
+   j s" volume/listed/deeper/gone.txt" why ar REMOTE-UNOBSERVED= ;
+
+: VOLUME-LISTED ( JOURNAL:journal ^ARENA:arena -- )
+   {: j ar :}
+   j s" volume/gone.txt" REMOTE-ABSENT ar REMOTE-UNOBSERVED=
+   j s" volume/listed/deeper/gone.txt" REMOTE-ABSENT ar
+   REMOTE-UNOBSERVED= ;
 
 : A-RECORD-BELOW-AN-UNKNOWN-DIRECTORY-CANNOT-RESTORE-ABSENCE
    ( ^ARENA:arena -- )
@@ -848,18 +874,24 @@ variable SEED
    rs s" volume" MODEL-UNKNOWN--REASON:UNSUPPORTED REMOTE-UNKNOWN ar
    REMOTE+
    rs s" volume/listed" REMOTE-DIRECTORY ar REMOTE+
-   rs ar REMOTE-MAP {: v :}
-   MODEL-UNKNOWN--REASON:UNSUPPORTED REMOTE-UNKNOWN {: why :}
-   v s" volume/gone.txt" why ar REMOTE-UNOBSERVED=
-   v s" volume/listed/gone.txt" why ar REMOTE-UNOBSERVED=
-   v s" volume/listed/deeper/gone.txt" why ar REMOTE-UNOBSERVED=
+   ar LOCAL-RECORDS rs [: ar VOLUME-UNKNOWN ;] ar WITH-SIDES
    ar REMOTE-RECORDS {: cs :}
    cs s" volume" REMOTE-DIRECTORY ar REMOTE+
    cs s" volume/listed" REMOTE-DIRECTORY ar REMOTE+
-   cs ar REMOTE-MAP {: complete :}
-   complete s" volume/gone.txt" REMOTE-ABSENT ar REMOTE-UNOBSERVED=
-   complete s" volume/listed/deeper/gone.txt" REMOTE-ABSENT ar
-   REMOTE-UNOBSERVED= ;
+   ar LOCAL-RECORDS cs [: ar VOLUME-LISTED ;] ar WITH-SIDES ;
+
+: NEIGHBORS ( JOURNAL:journal ^ARENA:arena -- )
+   {: j ar :}
+   MODEL-UNKNOWN--REASON:INCOMPLETE LOCAL-UNKNOWN {: why :}
+   j s" report/x" why ar LOCAL-UNOBSERVED=
+   j s" REPORT/x/y" why ar LOCAL-UNOBSERVED=
+   j s\" unreadable\xFF/x" MODEL-UNKNOWN--REASON:INACCESSIBLE
+   LOCAL-UNKNOWN ar LOCAL-UNOBSERVED=
+   j s" report.txt/x" LOCAL-ABSENT ar LOCAL-UNOBSERVED=
+   j s" report0/x" LOCAL-ABSENT ar LOCAL-UNOBSERVED=
+   j s" reportx/y" LOCAL-ABSENT ar LOCAL-UNOBSERVED=
+   j s" report" LOCAL-ABSENT ar LOCAL-UNOBSERVED=
+   j s" unreadable/x" LOCAL-ABSENT ar LOCAL-UNOBSERVED= ;
 
 : NAMES-THAT-NEIGHBOR-THE-SEPARATOR-ARE-NOT-ANCESTORS
    ( ^ARENA:arena -- )
@@ -871,20 +903,53 @@ variable SEED
    rs s" report0" DIRECTORY+
    rs s\" unreadable\xFF" MODEL-UNKNOWN--REASON:INACCESSIBLE
    LOCAL-UNKNOWN LOCAL+
-   rs ar LOCAL-MAP {: v :}
-   MODEL-UNKNOWN--REASON:INCOMPLETE LOCAL-UNKNOWN {: why :}
-   v s" report/x" why ar LOCAL-UNOBSERVED=
-   v s" REPORT/x/y" why ar LOCAL-UNOBSERVED=
-   v s\" unreadable\xFF/x" MODEL-UNKNOWN--REASON:INACCESSIBLE
-   LOCAL-UNKNOWN ar LOCAL-UNOBSERVED=
-   v s" report.txt/x" LOCAL-ABSENT ar LOCAL-UNOBSERVED=
-   v s" report0/x" LOCAL-ABSENT ar LOCAL-UNOBSERVED=
-   v s" reportx/y" LOCAL-ABSENT ar LOCAL-UNOBSERVED=
-   v s" report" LOCAL-ABSENT ar LOCAL-UNOBSERVED=
-   v s" unreadable/x" LOCAL-ABSENT ar LOCAL-UNOBSERVED= ;
+   rs ar REMOTE-RECORDS [: ar NEIGHBORS ;] ar WITH-SIDES ;
+
+: LENDS-NOTHING ( JOURNAL:journal ^ARENA:arena -- )
+   {: j ar :}
+   MODEL-UNKNOWN--REASON:INACCESSIBLE LOCAL-UNKNOWN {: why :}
+   j s" cache.dropbox/x" LOCAL-ABSENT ar LOCAL-UNOBSERVED=
+   j s" cache.dropbox/x" s" cache.dropbox/x" ar RESPELLED
+   s" cache.dropbox/x" T$=
+   j s" locked/x" why ar LOCAL-UNOBSERVED=
+   j s" locked/x" s" locked/x" ar RESPELLED s" Locked/x" T$= ;
+
+: AN-EXCLUDED-ANCESTOR-LENDS-NO-REASON-OR-SPELLING ( ^ARENA:arena -- )
+   {: ar :}
+   s" an excluded ancestor lends no reason or spelling" T-LABEL
+   MODEL-UNKNOWN--REASON:INACCESSIBLE LOCAL-UNKNOWN {: why :}
+   ar LOCAL-RECORDS {: rs :}
+   rs s" Cache.dropbox" why LOCAL+
+   rs s" Locked" why LOCAL+
+   rs ar REMOTE-RECORDS [: ar LENDS-NOTHING ;] ar WITH-SIDES ;
 
 : BLOCKED-UNKNOWN ( -- MODEL:decision )
    MODEL-BLOCKED--REASON:UNKNOWN MODEL-DECISION:BLOCKED ;
+
+: BELOW ( ^ARENA:arena -- MODEL:key )
+   {: ar :} s" locked/secret.txt" ar CANONICAL ;
+
+\ The local side below the unknown directory.
+: LOCAL-BLOCKS
+   ( JOURNAL:journal MODEL:unknown-reason MODEL:baseline ^ARENA:arena
+     -- )
+   {: j why baseline ar :}
+   j ar BELOW ar LOCAL-UNOBSERVED {: lo :}
+   j ar BELOW ar REMOTE-AT {: ro :}
+   lo why LOCAL-UNKNOWN MODEL:LOCAL-OBSERVATION= TTRUE
+   baseline lo ro MODEL-SUBTREE:EMPTY PLANNER:PLAN BLOCKED-UNKNOWN
+   MODEL:DECISION= TTRUE ;
+
+\ The remote side below the unknown directory.
+: REMOTE-BLOCKS
+   ( JOURNAL:journal MODEL:unknown-reason MODEL:baseline ^ARENA:arena
+     -- )
+   {: j why baseline ar :}
+   j ar BELOW ar LOCAL-AT {: lo :}
+   j ar BELOW ar REMOTE-UNOBSERVED {: ro :}
+   ro why REMOTE-UNKNOWN MODEL:REMOTE-OBSERVATION= TTRUE
+   baseline lo ro MODEL-SUBTREE:EMPTY PLANNER:PLAN BLOCKED-UNKNOWN
+   MODEL:DECISION= TTRUE ;
 
 \ One reason of an_unknown_ancestor_blocks_a_deletion_on_either_side:
 \ the observation each side reads below the unknown directory is
@@ -893,27 +958,18 @@ variable SEED
    ( MODEL:unknown-reason MODEL:remote ^ARENA:arena -- )
    {: why file ar :}
    file MODEL-BASELINE:PRESENT {: baseline :}
-   s" locked/secret.txt" ar CANONICAL {: below :}
    ar LOCAL-RECORDS {: ul :}
    ul s" locked" why LOCAL-UNKNOWN LOCAL+
-   ul ar LOCAL-MAP below LOCAL-UNOBSERVED {: lo :}
    ar REMOTE-RECORDS {: lr :}
    lr s" locked" REMOTE-DIRECTORY ar REMOTE+
    lr s" locked/secret.txt" file REMOTE-PRESENT ar REMOTE+
-   lr ar REMOTE-MAP below REMOTE-AT {: ro :}
-   lo why LOCAL-UNKNOWN MODEL:LOCAL-OBSERVATION= TTRUE
-   baseline lo ro MODEL-SUBTREE:EMPTY PLANNER:PLAN BLOCKED-UNKNOWN
-   MODEL:DECISION= TTRUE
+   ul lr [: why baseline ar LOCAL-BLOCKS ;] ar WITH-SIDES
    ar LOCAL-RECORDS {: sl :}
    sl s" locked" DIRECTORY+
    sl s" locked/secret.txt" s" secret" ar PRESENT+
-   sl ar LOCAL-MAP below LOCAL-AT {: lo2 :}
    ar REMOTE-RECORDS {: ur :}
    ur s" locked" why REMOTE-UNKNOWN ar REMOTE+
-   ur ar REMOTE-MAP below REMOTE-UNOBSERVED {: ro2 :}
-   ro2 why REMOTE-UNKNOWN MODEL:REMOTE-OBSERVATION= TTRUE
-   baseline lo2 ro2 MODEL-SUBTREE:EMPTY PLANNER:PLAN BLOCKED-UNKNOWN
-   MODEL:DECISION= TTRUE ;
+   sl ur [: why baseline ar REMOTE-BLOCKS ;] ar WITH-SIDES ;
 
 : AN-UNKNOWN-ANCESTOR-BLOCKS-A-DELETION-ON-EITHER-SIDE ( ^ARENA:arena -- )
    {: ar :}
@@ -955,76 +1011,69 @@ variable SEED
    MODEL-BASELINE:ABSENT MODEL-DECISION:NOOP MODEL:DECISION= TTRUE
    d j GONE ;
 
-: SUBTREE$ ( MODEL:subtree -- ^u8 n )
-   MATCH MODEL:subtree
-      empty OF s" empty" ENDOF
-      occupied OF s" occupied" ENDOF
-   ;MATCH ;
-
-: SUBTREE-AT
-   ( ^VEC:vector<MODEL:remote-record> ^u8 n ^ARENA:arena -- ^u8 n )
-   {: v p:^ u:n ar :}
-   v p u ar CANONICAL REMOTE-SUBTREE SUBTREE$ ;
-
 \ Rust's remote_directory.
 : REMOTE-DIRECTORY+
    ( ^VEC:vector<MODEL:remote-record> ^u8 n ^ARENA:arena -- )
    {: v p:^ u:n ar :}
    v p u REMOTE-DIRECTORY ar REMOTE+ ;
 
-: REMOTE-SUBTREE-HOLDS-ONLY-TRUE-DESCENDANTS ( ^ARENA:arena -- )
-   {: ar :}
-   s" remote_subtree_holds_only_true_descendants" T-LABEL
+\ A directory at the path on both sides and in the baseline.
+: KEPT-DIRECTORY+
+   ( JOURNAL:journal ^VEC:vector<MODEL:local-record>
+     ^VEC:vector<MODEL:remote-record> ^u8 n ^ARENA:arena -- )
+   {: j ls rs p:^ u:n ar :}
+   ls p u DIRECTORY+ rs p u ar REMOTE-DIRECTORY+
+   j p u DISPLAY MODEL-BASELINE:DIRECTORY ar JOURNAL:RECORD-NOOP
+   NOOP-RECORDED? TTRUE ;
+
+: KEPT-DIRECTORIES
+   ( JOURNAL:journal JOURNAL:local-root-binding ^ARENA:arena -- )
+   {: j b ar :}
+   ar LOCAL-RECORDS {: ls :}
    ar REMOTE-RECORDS {: rs :}
-   rs s" Report" ar REMOTE-DIRECTORY+
-   rs s" report.txt" ar REMOTE-DIRECTORY+
-   rs s" Report/x" ar REMOTE-DIRECTORY+
-   rs s" reports/y" ar REMOTE-DIRECTORY+
-   rs s\" deep/\xFF" ar REMOTE-DIRECTORY+
-   rs ar REMOTE-MAP {: v :}
-   v s" report" ar SUBTREE-AT s" occupied" T$=
-   v s" reports" ar SUBTREE-AT s" occupied" T$=
-   v s" deep" ar SUBTREE-AT s" occupied" T$=
-   v s" report.txt" ar SUBTREE-AT s" empty" T$=
-   v s" report/x" ar SUBTREE-AT s" empty" T$=
-   v s" repo" ar SUBTREE-AT s" empty" T$=
-   v s" other" ar SUBTREE-AT s" empty" T$= ;
+   j ls rs s" Docs" ar KEPT-DIRECTORY+
+   j ls rs s" Docs/Notes" ar KEPT-DIRECTORY+
+   j ls rs s" Music" ar KEPT-DIRECTORY+
+   j b ls ar LOCALS-PUBLISHED
+   j s" cursor" >str DROPBOX:>CURSOR rs
+   JOURNAL:PUBLISH-REMOTE-INVENTORY ;
 
-\ Appends the byte of 00 . / 0 FF that digit d names, none for 0.
-: SYMBOL+ ( n n ^u8 -- n )
-   {: len:n d:n dst:^ :}
-   d 0= if len exit then
-   s\" \x00./0\xFF" drop d 1- + c@ dst len + c!
-   len 1+ ;
+: NOOPS-WALKED
+   ( str JOURNAL:journal JOURNAL:local-root-binding ^ARENA:arena -- )
+   {: d:str j b ar :}
+   j b ar KEPT-DIRECTORIES
+   j ar PLANNING-OVER {: pl :}
+   pl KNOWN-WALK VEC:COUNT 0 T=
+   pl PLANNING-NOOP-COUNT @ 3 T=
+   j ar PLANNING-OVER {: all :}
+   all DECIDE-ALL
+   all PLANNING-DECISIONS @ VEC:COUNT 0 T=
+   all PLANNING-NOOPS @ VEC:COUNT 0 T=
+   all PLANNING-NOOP-COUNT @ 3 T= ;
 
-\ The string k's three base-6 digits name, in dst.
-: SYMBOL-STRING ( n ^u8 -- ^u8 n )
-   {: k:n dst:^ :}
-   0 k 3 0 do 6 /mod swap rot swap dst SYMBOL+ swap loop drop
-   dst swap ;
+: A-WALK-COUNTS-EVERY-KEPT-BASELINE ( ^ARENA:arena -- )
+   {: ar :}
+   s" a walk counts every kept baseline" T-LABEL
+   [: ar NOOPS-WALKED ;] ar WITH-ROOTED ;
 
-216 constant STRINGS
-4 BUFFER: LEFT
-4 BUFFER: RIGHT
-5 BUFFER: PREFIX
+: DECISION-PATH$ ( path-decision -- ^u8 n )
+   PATH-DECISION-UNMAKE {: k path same dec :} path PATH$ ;
 
-\ PRECEDES-CHILDREN? disagrees with a comparison against parent then
-\ "/" materialized.
-: DISAGREES? ( ^u8 n ^u8 n -- bool )
-   {: b:^ u:n p:^ v:n :}
-   p PREFIX v BYTE-COPY SEPARATOR PREFIX v + c!
-   b u p v PRECEDES-CHILDREN? bool>n b u >str PREFIX v 1+ >str STR< bool>n <> ;
+: UNSUPPORTED-PAIR
+   ( str JOURNAL:journal JOURNAL:local-root-binding ^ARENA:arena -- )
+   {: d:str j b ar :}
+   ar LOCAL-RECORDS {: ls :}
+   ls s" link" UNSUPPORTED+ ls s" Link" UNSUPPORTED+
+   j b ls ar LOCALS-PLANNING {: pl :}
+   pl DECIDE-ALL
+   pl PLANNING-DECISIONS @ {: v :}
+   v VEC:COUNT 1 T=
+   v 0 VEC:AT @ DECISION-PATH$ s" Link" T$= ;
 
-: CHILD-PREFIX-ORDER-MATCHES-THE-MATERIALIZED-PREFIX ( ^ARENA:arena -- )
-   drop
-   s" child_prefix_order_matches_the_materialized_prefix" T-LABEL
-   0 STRINGS 0 ?do
-      i LEFT SYMBOL-STRING
-      STRINGS 0 ?do
-         2dup i RIGHT SYMBOL-STRING DISAGREES? if rot 1+ -rot then
-      loop 2drop
-   loop
-   0 T= ;
+: DECIDING-KEEPS-THE-RUN-RULE ( ^ARENA:arena -- )
+   {: ar :}
+   s" deciding keeps the run rule" T-LABEL
+   [: ar UNSUPPORTED-PAIR ;] ar WITH-ROOTED ;
 
 \ A path decision at the path, its key folded.
 : DECIDED ( ^u8 n MODEL:decision ^ARENA:arena -- path-decision )
@@ -1436,11 +1485,33 @@ ARENA LISTED DROPBOX:entry
    ( ^ARENA:arena -- ^VEC:vector<JOURNAL:remote-inventory-change> )
    ARENA:ALLOCATOR 0 [type] JOURNAL:remote-inventory-change VEC:NEW ;
 
+\ The record at the key in a listing's records.
+: RECORD-IN
+   ( ^VEC:vector<MODEL:remote-record> MODEL:key
+     -- option<MODEL:remote-record> )
+   {: rs k :}
+   rs VEC:COUNT 0 ?do
+      rs i VEC:AT @ REMOTE-KEY k MODEL:KEY= if
+         rs i VEC:AT @ OPTION:SOME unloop exit
+      then
+   loop
+   OPTION:NONE ;
+
+\ The observation of the record at the key in a listing's records; no
+\ record fails the case.
+: OBSERVED-IN
+   ( ^VEC:vector<MODEL:remote-record> MODEL:key
+     -- MODEL:observation<MODEL:remote> )
+   RECORD-IN MATCH option
+      none OF false TTRUE REMOTE-ABSENT ENDOF
+      some OF REMOTE-OBSERVATION ENDOF
+   ;MATCH ;
+
 \ The record's path at the key's display bytes, else empty.
 : PATH-OF
    ( ^VEC:vector<MODEL:remote-record> ^u8 n ^ARENA:arena -- ^u8 n )
    {: rs p:^ u:n ar :}
-   rs p u ar CANONICAL FIND-REMOTE MATCH option
+   rs p u ar CANONICAL RECORD-IN MATCH option
       none OF s" " ENDOF
       some OF MODEL-REMOTE--RECORD:UNMAKE {: k q o :} q PATH$ ENDOF
    ;MATCH ;
@@ -1484,9 +1555,9 @@ ARENA LISTED DROPBOX:entry
    paper root v ar APPEND-ENTRY-CHANGES
    v ar INVENTORY-RECORDS {: rs :}
    rs VEC:COUNT 2 T=
-   rs s" folder" ar CANONICAL REMOTE-AT REMOTE-DIRECTORY
+   rs s" folder" ar CANONICAL OBSERVED-IN REMOTE-DIRECTORY
    MODEL:REMOTE-OBSERVATION= TTRUE
-   rs s" paper" ar CANONICAL REMOTE-AT
+   rs s" paper" ar CANONICAL OBSERVED-IN
    MODEL-UNKNOWN--REASON:UNSUPPORTED REMOTE-UNKNOWN
    MODEL:REMOTE-OBSERVATION= TTRUE ;
 
@@ -1630,7 +1701,7 @@ ARENA LISTED DROPBOX:entry
    g gu t tu CONTAINS? TTRUE
    v ar INVENTORY-RECORDS {: rs :}
    rs RECORD-PATHS$ s" Old|" T$=
-   rs s" old" ar CANONICAL REMOTE-AT REMOTE-DIRECTORY
+   rs s" old" ar CANONICAL OBSERVED-IN REMOTE-DIRECTORY
    MODEL:REMOTE-OBSERVATION= TTRUE ;
 
 : ROOT-ACCEPTED ( ^ARENA:arena -- )
@@ -5969,7 +6040,7 @@ TYPED-VARIABLE RACED str
    MODEL-CONFLICT:DIVERGENT {: c :}
    d x REPLACED-ROOT
    x s" c-diverged.txt" IN-ROOT str> DIVERGED-LOCAL$ FS:WRITE-ALL
-   x ar [type] MODEL:local-record NEW-VECTOR NEW-PLANNING {: pl :}
+   x NEW-PLANNING {: pl :}
    pl s" c-diverged.txt" ar CANONICAL s" c-diverged.txt" DISPLAY c
    NEW-CONFLICT EVENT$ s" root-changed" T$=
    x NO-CONFLICT-RECORD
@@ -6433,14 +6504,14 @@ TYPED-VARIABLE RACED str
    ar KNOWN-PATH-MERGE-MATCHES-SET-UNION
    ar REMAINING-OPERATION-COMPARISON-IGNORES-A-COMPLETED-PREFIX
    ar PENDING-ONLY-PATHS-ARE-VISITED-AS-ABSENT-WITHOUT-CREATING-A-BASELINE
-   ar LOCAL-MAP-KEEPS-ONE-UNSUPPORTED-SPELLING
    ar A-PATH-BELOW-AN-UNKNOWN-DIRECTORY-INHERITS-ITS-REASON
    ar A-RECORD-BELOW-AN-UNKNOWN-DIRECTORY-CANNOT-RESTORE-ABSENCE
    ar NAMES-THAT-NEIGHBOR-THE-SEPARATOR-ARE-NOT-ANCESTORS
+   ar AN-EXCLUDED-ANCESTOR-LENDS-NO-REASON-OR-SPELLING
    ar AN-UNKNOWN-ANCESTOR-BLOCKS-A-DELETION-ON-EITHER-SIDE
    ar BASELINE-ONLY-PATHS-ARE-INCLUDED-IN-CONFIRMED-ABSENCE
-   ar REMOTE-SUBTREE-HOLDS-ONLY-TRUE-DESCENDANTS
-   ar CHILD-PREFIX-ORDER-MATCHES-THE-MATERIALIZED-PREFIX
+   ar A-WALK-COUNTS-EVERY-KEPT-BASELINE
+   ar DECIDING-KEEPS-THE-RUN-RULE
    ar PATH-DECISIONS-ORDER-DELETES-LAST-AND-DEEPEST-FIRST
    ar CASE-COLLISION-CASES
    ar LISTING-CASES

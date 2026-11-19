@@ -2351,16 +2351,6 @@ $FFFFFFFF constant U32-MAX
    {: paths ar :}
    0 ar PATH-COPY paths VEC:PUSH ! ;
 
-: RECORD-ROW
-   ( SQLITE:statement ^VEC:vector<MODEL:baseline-record> ^ARENA:arena
-     -- SQLITE:statement )
-   {: records ar :}
-   0 ar KEY-COPY {: k :}
-   1 ar PATH-COPY {: path :}
-   2 SQLITE:COL-TEXT >str path ar DECODE-BASELINE {: b :}
-   b ABSENT? if exit then
-   k path b MODEL-BASELINE--RECORD:MAKE records VEC:PUSH ! ;
-
 public
 
 \ The common baseline recorded for the display path; absent is none.
@@ -2382,18 +2372,6 @@ public
    >str [: begin SQLITE:STEP while paths ar PATH-ROW repeat ;]
    SQLITE:WITH-STATEMENT
    paths ;
-
-\ Every baseline, in the order of its canonical path's bytes.
-: BASELINES
-   ( journal ^ARENA:arena -- ^VEC:vector<MODEL:baseline-record> )
-   {: j ar :}
-   ar [type] MODEL:baseline-record NEW-VECTOR {: records :}
-   j >CONNECTION
-   s\" SELECT canonical_path, path, baseline_json FROM baselines
-      WHERE baseline_json != '\"Absent\"' ORDER BY canonical_path"
-   >str [: begin SQLITE:STEP while records ar RECORD-ROW repeat ;]
-   SQLITE:WITH-STATEMENT
-   records ;
 
 \ The display path the canonical path's baseline was recorded under.
 : BASELINE-SPELLING
@@ -2442,6 +2420,15 @@ private
    SQLITE:STEP 0= if NO-LOCAL swap exit then
    ar LOCAL-ROW OPTION:SOME swap ;
 
+: NO-REMOTE ( -- option<MODEL:remote-record> ) OPTION:NONE ;
+
+: REMOTE-AT-ROW
+   ( SQLITE:statement ^ARENA:arena
+     -- option<MODEL:remote-record> SQLITE:statement )
+   {: ar :}
+   SQLITE:STEP 0= if NO-REMOTE swap exit then
+   ar REMOTE-ROW OPTION:SOME swap ;
+
 public
 
 \ The records of each canonical path several local rows hold, by key then
@@ -2471,6 +2458,183 @@ public
    s" SELECT path, observation_json FROM local_observations
       WHERE canonical_path = ?1 ORDER BY path LIMIT 1"
    >str [: k KEY-BYTES >str 1 SQLITE:BIND-BLOB ar LOCAL-AT-ROW ;]
+   SQLITE:WITH-STATEMENT ;
+
+\ Every local record at the canonical path, in the order of its path's
+\ bytes.
+: LOCALS-AT
+   ( journal MODEL:key ^ARENA:arena
+     -- ^VEC:vector<MODEL:local-record> )
+   {: j k ar :}
+   ar LOCAL-RECORDS {: v :}
+   j >CONNECTION
+   s" SELECT path, observation_json FROM local_observations
+      WHERE canonical_path = ?1 ORDER BY path"
+   >str [: k KEY-BYTES >str 1 SQLITE:BIND-BLOB
+      begin SQLITE:STEP while ar LOCAL-ROW v VEC:PUSH ! repeat ;]
+   SQLITE:WITH-STATEMENT
+   v ;
+
+\ The remote record at the canonical path.
+: REMOTE-AT
+   ( journal MODEL:key ^ARENA:arena -- option<MODEL:remote-record> )
+   {: j k ar :}
+   j >CONNECTION
+   s" SELECT canonical_path, path, observation_json
+      FROM remote_observations WHERE canonical_path = ?1"
+   >str [: k KEY-BYTES >str 1 SQLITE:BIND-BLOB ar REMOTE-AT-ROW ;]
+   SQLITE:WITH-STATEMENT ;
+
+private
+
+
+\ ---- known paths ---------------------------------------------------
+
+public
+
+\ What one canonical path holds. baseline: none for Absent; local: the
+\ least path's row; subtree: remote rows beneath; live: a live plan.
+STRUCTURE known-path
+   FIELD key MODEL:key
+   FIELD baseline option<path-baseline>
+   FIELD local option<MODEL:local-record>
+   FIELD locals n
+   FIELD remote option<MODEL:remote-record>
+   FIELD subtree MODEL:subtree
+   FIELD live bool
+;STRUCTURE
+
+private
+
+: NO-PATH-BASELINE ( -- option<path-baseline> ) OPTION:NONE ;
+
+\ Each held key once, in byte order. The UNION merges the four tables'
+\ canonical-path indexes, so the statement streams.
+: KNOWN-KEYS ( -- ^u8 n )
+   s\" WITH keys(k) AS (
+         SELECT canonical_path FROM baselines
+            WHERE baseline_json != '\"Absent\"'
+         UNION SELECT canonical_path FROM local_observations
+         UNION SELECT canonical_path FROM remote_observations
+         UNION SELECT canonical_path FROM plans
+            WHERE status IN ('pending', 'blocked')
+         ORDER BY 1) " ;
+
+: ONE-KEY ( -- ^u8 n ) s" WITH keys(k) AS (SELECT ?1) " ;
+
+\ What each key of keys holds. || makes text of a blob; the CAST keeps
+\ the subtree's bounds, the key then "/" and the key then "0", bytes.
+: KNOWN-SELECT ( -- ^u8 n )
+   s\" SELECT keys.k, b.path, b.baseline_json,
+         l.path, l.observation_json,
+         (SELECT count(*) FROM local_observations c
+            WHERE c.canonical_path = keys.k),
+         r.path, r.observation_json,
+         EXISTS (SELECT 1 FROM plans p
+            WHERE p.canonical_path = keys.k
+               AND p.status IN ('pending', 'blocked')),
+         EXISTS (SELECT 1 FROM remote_observations s
+            WHERE s.canonical_path > CAST(keys.k || '/' AS BLOB)
+               AND s.canonical_path < CAST(keys.k || '0' AS BLOB))
+      FROM keys
+      LEFT JOIN baselines b ON b.canonical_path = keys.k
+         AND b.baseline_json != '\"Absent\"'
+      LEFT JOIN local_observations l ON l.path = (
+         SELECT m.path FROM local_observations m
+         WHERE m.canonical_path = keys.k ORDER BY m.path LIMIT 1)
+      LEFT JOIN remote_observations r ON r.canonical_path = keys.k
+      ORDER BY keys.k" ;
+
+\ Lays the two strings' total length, then their bytes, in the word just
+\ created, for TEXT to read.
+: LAY-BOTH ( ^u8 n ^u8 n -- )
+   {: a:^ au:n b:^ bu:n :}
+   au bu + ,
+   a here au BYTE-COPY  au allot
+   b here bu BYTE-COPY  bu allot align ;
+
+create EVERY-KNOWN KNOWN-KEYS KNOWN-SELECT LAY-BOTH
+create ONE-KNOWN ONE-KEY KNOWN-SELECT LAY-BOTH
+
+\ Columns 1 and 2, NULL where no baseline is.
+: KNOWN-BASELINE
+   ( SQLITE:statement ^ARENA:arena
+     -- SQLITE:statement option<path-baseline> )
+   {: ar :}
+   1 SQLITE:COL-NULL? if NO-PATH-BASELINE exit then
+   1 ar PATH-COPY {: p :}
+   2 SQLITE:COL-TEXT >str p ar DECODE-BASELINE {: b :}
+   b ABSENT? if NO-PATH-BASELINE exit then
+   p b JOURNAL-PATH--BASELINE:MAKE OPTION:SOME ;
+
+\ Columns 3 and 4, NULL where no local row is.
+: KNOWN-LOCAL
+   ( SQLITE:statement ^ARENA:arena
+     -- SQLITE:statement option<MODEL:local-record> )
+   {: ar :}
+   3 SQLITE:COL-NULL? if NO-LOCAL exit then
+   3 ar PATH-COPY {: p :}
+   4 SQLITE:COL-TEXT >str p MODEL:PATH>STR ar LOCAL-OBSERVATION-OF
+   {: o :}
+   p o MODEL-LOCAL--RECORD:MAKE OPTION:SOME ;
+
+\ Columns 6 and 7, NULL where no remote row is.
+: KNOWN-REMOTE
+   ( SQLITE:statement MODEL:key ^ARENA:arena
+     -- SQLITE:statement option<MODEL:remote-record> )
+   {: k ar :}
+   6 SQLITE:COL-NULL? if NO-REMOTE exit then
+   6 ar PATH-COPY {: p :}
+   7 SQLITE:COL-TEXT >str p MODEL:PATH>STR ar REMOTE-OBSERVATION-OF
+   {: o :}
+   k p o MODEL-REMOTE--RECORD:MAKE OPTION:SOME ;
+
+: KNOWN-SUBTREE ( SQLITE:statement -- SQLITE:statement MODEL:subtree )
+   9 SQLITE:COL-INT 0= if MODEL-SUBTREE:EMPTY exit then
+   MODEL-SUBTREE:OCCUPIED ;
+
+\ The row of a KNOWN-SELECT statement, decoded into ar.
+: KNOWN-ROW
+   ( SQLITE:statement ^ARENA:arena -- SQLITE:statement known-path )
+   {: ar :}
+   0 ar KEY-COPY {: k :}
+   ar KNOWN-BASELINE {: b :}
+   ar KNOWN-LOCAL {: l :}
+   5 SQLITE:COL-INT {: n :}
+   k ar KNOWN-REMOTE {: r :}
+   KNOWN-SUBTREE {: s :}
+   8 SQLITE:COL-INT 0<> {: live:bool :}
+   k b l n r s live JOURNAL-KNOWN--PATH:MAKE ;
+
+: KNOWN-ROWS
+   ( SQLITE:statement ^ARENA:arena [ known-path -- ]
+     -- SQLITE:statement )
+   {: ar visit :}
+   begin SQLITE:STEP while
+      ar ARENA:RESET ar KNOWN-ROW visit execute
+   repeat ;
+
+\ ONE-KEY's statement answers one row.
+: KNOWN-ROW-AT
+   ( SQLITE:statement MODEL:key ^ARENA:arena
+     -- known-path SQLITE:statement )
+   {: k ar :}
+   k KEY-BYTES >str 1 SQLITE:BIND-BLOB
+   SQLITE:STEP drop ar KNOWN-ROW swap ;
+
+public
+
+\ Each held key in byte order, decoded into ar, which is reset before
+\ each.
+: EACH-KNOWN-PATH ( journal ^ARENA:arena [ known-path -- ] -- )
+   {: j ar visit :}
+   j >CONNECTION EVERY-KNOWN TEXT >str [: ar visit KNOWN-ROWS ;]
+   SQLITE:WITH-STATEMENT ;
+
+\ What the journal holds at the key, decoded into ar.
+: KNOWN-PATH-AT ( journal MODEL:key ^ARENA:arena -- known-path )
+   {: j k ar :}
+   j >CONNECTION ONE-KNOWN TEXT >str [: k ar KNOWN-ROW-AT ;]
    SQLITE:WITH-STATEMENT ;
 
 private
@@ -2983,6 +3147,36 @@ public
 : PLAN-OF ( journal plan-id ^ARENA:arena -- option<plan-record> )
    {: j id ar :}
    j >CONNECTION id ar READ-PLAN ;
+
+private
+
+: FIRST-PLAN ( ^VEC:vector<plan-record> -- option<plan-record> )
+   {: plans :}
+   plans VEC:COUNT 0= if NO-PLAN exit then
+   plans 0 VEC:AT @ OPTION:SOME ;
+
+public
+
+\ The plan pending or blocked at the canonical path; the journal keeps
+\ at most one.
+: LIVE-PLAN-AT
+   ( journal MODEL:key ^ARENA:arena -- option<plan-record> )
+   {: j k ar :}
+   ar [type] plan-record NEW-VECTOR {: plans :}
+   j >CONNECTION
+   s" SELECT plans.id, plans.path, plans.status, plans.blocked_json,
+         plans.retry_at, operations.id, operations.ordinal,
+         operations.operation_json, operations.status
+      FROM plans JOIN operations ON operations.plan_id = plans.id
+      WHERE plans.canonical_path = ?1
+         AND plans.status IN ('pending', 'blocked')
+      ORDER BY plans.id, operations.ordinal"
+   >str [: k KEY-BYTES >str 1 SQLITE:BIND-BLOB
+      begin SQLITE:STEP while
+         plans s" read live plan" >str ar PLAN-ROW
+      repeat ;]
+   SQLITE:WITH-STATEMENT
+   plans FIRST-PLAN ;
 
 private
 

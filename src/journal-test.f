@@ -24,7 +24,11 @@
 \ the line's own form; a file of other bytes refused as corrupt by both
 \ opens, unchanged; a failed open's E-FILE leaving EACCES in FS:ERRNO;
 \ the keys EACH-LOCAL-COLLISION visits, in MODEL:KEY-CMP's order, and
-\ LOCAL-COUNT and LOCAL-AT over published scans;
+\ LOCAL-COUNT and LOCAL-AT over published scans; REMOTE-AT at held and
+\ unheld keys; LIVE-PLAN-AT at a pending, a blocked, a completed and an
+\ unheld key; the keys EACH-KNOWN-PATH visits, in byte order, and
+\ KNOWN-PATH-AT at a held key and at keys nothing holds, and its subtree
+\ as Rust's reconcile.rs remote_subtree_holds_only_true_descendants has it;
 \ and fifty-one tests of the Rust version's src/journal.rs and two of
 \ its src/daemon.rs under their names, which
 \ build each decision the Rust ones ask the planner for as
@@ -1335,6 +1339,33 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    j CLOSE
    d GONE ;
 
+\ Whether the answer is the record.
+: REMOTE-IS? ( option<MODEL:remote-record> MODEL:remote-record -- bool )
+   {: want :}
+   MATCH option
+      none OF false ENDOF
+      some OF want MODEL:REMOTE-RECORD= ENDOF
+   ;MATCH ;
+
+: NO-REMOTE? ( option<MODEL:remote-record> -- bool )
+   MATCH option none OF true ENDOF some OF drop false ENDOF ;MATCH ;
+
+\ REMOTE-AT answers the record at a key, an unknown one included, and
+\ none where no row holds it.
+: REMOTE-AT-ANSWERS-THE-RECORD-AT-A-KEY ( ^ARENA:arena -- )
+   {: ar :}
+   s" remote at answers the record at a key" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   ar RESTRICTED-SAMPLE {: v :}
+   j s" cursor" CURSOR v PUBLISH-REMOTE-INVENTORY
+   j s" docs/a.txt" ar CANONICAL ar REMOTE-AT v 1 VEC:AT @ REMOTE-IS?
+   TTRUE
+   j s" shared" ar CANONICAL ar REMOTE-AT v 2 VEC:AT @ REMOTE-IS? TTRUE
+   j s" absent" ar CANONICAL ar REMOTE-AT NO-REMOTE? TTRUE
+   j CLOSE
+   d GONE ;
+
 \ Notes each published row's rowid, path and value in temporary tables.
 : ROWS-NOTED ( journal -- )
    >CONNECTION
@@ -2001,6 +2032,175 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    j CLOSE
    d GONE ;
 
+\ A row of each family at its own key, every value a directory, each
+\ canonical path as MODEL:FOLD gives it.
+: KNOWN-FIXTURE ( -- ^u8 n )
+   s\" INSERT INTO baselines(path, baseline_json, canonical_path)
+         SELECT CAST(column1 AS BLOB), column2, CAST(column3 AS BLOB)
+         FROM (VALUES ('Base', '\"Directory\"', 'base'),
+            ('gone', '\"Absent\"', 'gone'));
+      INSERT INTO local_observations(path, observation_json,
+            canonical_path)
+         SELECT CAST(column1 AS BLOB), '\"Directory\"',
+            CAST(column2 AS BLOB)
+         FROM (VALUES ('local', 'local'), ('pair', 'pair'),
+            ('Pair', 'pair'));
+      INSERT INTO remote_observations(path, observation_json,
+            canonical_path)
+         SELECT CAST(column1 AS BLOB), '\"Directory\"',
+            CAST(column2 AS BLOB)
+         FROM (VALUES ('A', 'a'), ('a/b', 'a/b'), ('a.txt', 'a.txt'),
+            ('dir/file', 'dir/file'));
+      INSERT INTO plans(id, path, canonical_path, status,
+            blocked_json, retry_at)
+         SELECT column1, CAST(column2 AS BLOB), CAST(column2 AS BLOB),
+            column3, column4, column5
+         FROM (VALUES (1, 'live', 'pending', NULL, NULL),
+            (2, 'blocked', 'blocked', '{}', 0),
+            (3, 'done', 'completed', NULL, NULL));" ;
+
+: NONE-PUT ( -- ) s" - " SB-APPEND ;
+
+\ The path then a space, "?" before it where the value is not the
+\ fixture's directory.
+: HELD-PUT ( MODEL:path bool -- )
+   0= if s" ?" SB-APPEND then
+   PATH-BYTES SB-APPEND s"  " SB-APPEND ;
+
+: KNOWN-BASELINE-PUT ( option<path-baseline> -- )
+   MATCH option
+      none OF NONE-PUT ENDOF
+      some OF
+         JOURNAL-PATH--BASELINE:UNMAKE
+         MODEL-BASELINE:DIRECTORY MODEL:BASELINE= HELD-PUT
+      ENDOF
+   ;MATCH ;
+
+: KNOWN-LOCAL-PUT ( option<MODEL:local-record> -- )
+   MATCH option
+      none OF NONE-PUT ENDOF
+      some OF
+         MODEL-LOCAL--RECORD:UNMAKE
+         LOCAL-DIRECTORY MODEL:LOCAL-OBSERVATION= HELD-PUT
+      ENDOF
+   ;MATCH ;
+
+\ The record's path, and whether it holds the key and a directory.
+: REMOTE-HELD? ( MODEL:remote-record MODEL:key -- MODEL:path bool )
+   {: k :}
+   MODEL-REMOTE--RECORD:UNMAKE {: rk p o :}
+   p rk k MODEL:KEY=
+   o REMOTE-DIRECTORY MODEL:REMOTE-OBSERVATION= and ;
+
+: KNOWN-REMOTE-PUT ( option<MODEL:remote-record> MODEL:key -- )
+   {: k :}
+   MATCH option
+      none OF NONE-PUT ENDOF
+      some OF k REMOTE-HELD? HELD-PUT ENDOF
+   ;MATCH ;
+
+: SUBTREE-PUT ( MODEL:subtree -- )
+   MATCH MODEL:subtree
+      empty OF s" empty " ENDOF
+      occupied OF s" occupied " ENDOF
+   ;MATCH SB-APPEND ;
+
+: LIVE-PUT ( bool -- ) if s" live|" else s" -|" then SB-APPEND ;
+
+\ The key, baseline, local, locals, remote, subtree and live fields,
+\ apart by spaces, "-" for none, then "|".
+: KNOWN-PUT ( known-path -- )
+   JOURNAL-KNOWN--PATH:UNMAKE {: k b l n r t live:bool :}
+   k KEY-BYTES SB-APPEND s"  " SB-APPEND
+   b KNOWN-BASELINE-PUT l KNOWN-LOCAL-PUT
+   n FMT:INT$ SB-APPEND s"  " SB-APPEND
+   r k KNOWN-REMOTE-PUT t SUBTREE-PUT live LIVE-PUT ;
+
+\ KNOWN-PUT's text of the keys EACH-KNOWN-PATH visits in ar.
+: KNOWN-VISITS ( journal ^ARENA:arena -- ^u8 n )
+   {: j ar :}
+   SB-RESET j ar [: KNOWN-PUT ;] EACH-KNOWN-PATH SB$ ;
+
+: KNOWN-AT$ ( journal ^u8 n ^ARENA:arena -- ^u8 n )
+   {: j k:^ ku:n ar :}
+   SB-RESET j k ku ar CANONICAL ar KNOWN-PATH-AT KNOWN-PUT
+   SB$ ar COPIED str> ;
+
+\ The fixture's keys in byte order: "a.txt" before "a/b" ('.' before
+\ '/'), and neither the Absent baseline nor the completed plan.
+: KNOWN-WANT ( ^ARENA:arena -- ^u8 n )
+   {: ar :}
+   SB-RESET
+   s" a - - 0 A occupied -|" SB-APPEND
+   s" a.txt - - 0 a.txt empty -|" SB-APPEND
+   s" a/b - - 0 a/b empty -|" SB-APPEND
+   s" base Base - 0 - empty -|" SB-APPEND
+   s" blocked - - 0 - empty live|" SB-APPEND
+   s" dir/file - - 0 dir/file empty -|" SB-APPEND
+   s" live - - 0 - empty live|" SB-APPEND
+   s" local - local 1 - empty -|" SB-APPEND
+   s" pair - Pair 2 - empty -|" SB-APPEND
+   SB$ ar COPIED str> ;
+
+\ Each held key once, in byte order, with its least local path; at one
+\ key the same, and only the subtree where nothing holds the key.
+: KNOWN-PATHS-ARE-READ-ROW-BY-ROW ( ^ARENA:arena -- )
+   {: ar :}
+   s" known paths are read row by row" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j >CONNECTION KNOWN-FIXTURE SQLITE:EXEC
+   ar KNOWN-WANT {: w:^ wu:n :}
+   j [: KNOWN-VISITS ;] ARENA:WITH ar COPIED str> w wu T$=
+   j s" Pair" ar KNOWN-AT$ s" pair - Pair 2 - empty -|" T$=
+   j s" a" ar KNOWN-AT$ s" a - - 0 A occupied -|" T$=
+   j s" gone" ar KNOWN-AT$ s" gone - - 0 - empty -|" T$=
+   j s" dir" ar KNOWN-AT$ s" dir - - 0 - occupied -|" T$=
+   j CLOSE
+   d GONE ;
+
+\ A remote directory at the path, keyed by its fold.
+: REMOTE-DIRECTORY+
+   ( ^VEC:vector<MODEL:remote-record> ^u8 n ^ARENA:arena -- )
+   {: v p:^ u:n ar :}
+   p u p u REMOTE-DIRECTORY ar REMOTE-RECORD v REMOTE+ ;
+
+\ report.txt sorts between report and its children; repo0 is the upper
+\ bound of repo's subtree; deep/FF is the last child deep can hold.
+: DESCENDANTS ( ^ARENA:arena -- ^VEC:vector<MODEL:remote-record> )
+   {: ar :}
+   ar REMOTES {: v :}
+   v s" Report" ar REMOTE-DIRECTORY+
+   v s" report.txt" ar REMOTE-DIRECTORY+
+   v s" repo0" ar REMOTE-DIRECTORY+
+   v s" Report/x" ar REMOTE-DIRECTORY+
+   v s" reports/y" ar REMOTE-DIRECTORY+
+   v s\" deep/\xFF" ar REMOTE-DIRECTORY+
+   v ;
+
+\ SUBTREE-PUT's text of the subtree KNOWN-PATH-AT answers at the path.
+: SUBTREE-AT ( journal ^u8 n ^ARENA:arena -- ^u8 n )
+   {: j p:^ u:n ar :}
+   j p u ar CANONICAL ar KNOWN-PATH-AT
+   JOURNAL-KNOWN--PATH:UNMAKE {: k b l n r t live:bool :}
+   SB-RESET t SUBTREE-PUT SB$ ;
+
+: SUBTREE-HOLDS-ONLY-TRUE-DESCENDANTS ( ^ARENA:arena -- )
+   {: ar :}
+   s" remote_subtree_holds_only_true_descendants" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j s" cursor" CURSOR ar DESCENDANTS PUBLISH-REMOTE-INVENTORY
+   j s" report" ar SUBTREE-AT s" occupied " T$=
+   j s" reports" ar SUBTREE-AT s" occupied " T$=
+   j s" deep" ar SUBTREE-AT s" occupied " T$=
+   j s" report.txt" ar SUBTREE-AT s" empty " T$=
+   j s" report/x" ar SUBTREE-AT s" empty " T$=
+   j s" repo" ar SUBTREE-AT s" empty " T$=
+   j s" other" ar SUBTREE-AT s" empty " T$=
+   j CLOSE
+   d GONE ;
+
 
 \ ---- baselines and plans -----------------------------------------
 
@@ -2189,11 +2389,6 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
 : PROBE-FAILS ( MODEL:path -- bool ) drop E-INVALID-STATE throw ;
 
 : NOT-GONE? ( MODEL:path -- bool ) s" Foo/gone.txt" DISPLAY PATH= 0= ;
-
-: RECORD-IS? ( MODEL:baseline-record ^u8 n ^u8 n ^ARENA:arena -- bool )
-   {: r k:^ ku p:^ pu ar :}
-   r MODEL-BASELINE--RECORD:UNMAKE {: key path b :}
-   key k ku ar CANONICAL MODEL:KEY= path p pu DISPLAY PATH= and ;
 
 
 \ The id of the plan's first operation.
@@ -2477,9 +2672,9 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    p OPEN {: j :}
    j s" p" ar DIRECTORY
    j s\" p/\xFFchild" s" old" s" rev-old" ar AGREE
-   j ar BASELINES VEC:COUNT 2 T=
+   j ar BASELINE-PATHS VEC:COUNT 2 T=
    j s" p" DISPLAY [: EXISTS? ;] ar INVALIDATE-CASE-COLLISION-BASELINES
-   j ar BASELINES VEC:COUNT 0 T=
+   j ar BASELINE-PATHS VEC:COUNT 0 T=
    j CLOSE
    d GONE ;
 
@@ -2503,22 +2698,6 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    j CLOSE
    d GONE ;
 
-: BASELINE-SNAPSHOT-IS-CANONICAL-SORTED ( ^ARENA:arena -- )
-   {: ar :}
-   s" baseline_snapshot_is_canonical_sorted" T-LABEL
-   ar JOURNAL-AT {: d:str p:str :}
-   p OPEN {: j :}
-   j s" Zulu.TXT" s" zulu" s" rev-zulu" ar AGREE
-   j s" alpha.txt" s" alpha" s" rev-alpha" ar AGREE
-   j ar BASELINES {: records :}
-   records VEC:COUNT 2 T=
-   records 0 VEC:AT @ s" alpha.txt" s" alpha.txt" ar RECORD-IS? TTRUE
-   records 1 VEC:AT @ s" zulu.txt" s" Zulu.TXT" ar RECORD-IS? TTRUE
-   records 1 VEC:AT @ MODEL-BASELINE--RECORD:UNMAKE {: k path b :}
-   b s" zulu" s" rev-zulu" REMOTE-FILE MODEL-BASELINE:PRESENT
-   MODEL:BASELINE= TTRUE
-   j CLOSE
-   d GONE ;
 
 
 \ ---- the oracle's plans as the Rust version prints them ----------
@@ -3548,6 +3727,45 @@ variable CRAFT
    loop
    true ;
 
+: LIVE-AT ( journal ^u8 n ^ARENA:arena -- option<plan-record> )
+   {: j k:^ ku:n ar :}
+   j k ku ar CANONICAL ar LIVE-PLAN-AT ;
+
+\ Whether the answer is the plan.
+: LIVE-IS? ( option<plan-record> plan-record -- bool )
+   {: want :}
+   MATCH option
+      none OF false ENDOF
+      some OF want PLAN= ENDOF
+   ;MATCH ;
+
+: NO-LIVE? ( option<plan-record> -- bool )
+   MATCH option none OF true ENDOF some OF drop false ENDOF ;MATCH ;
+
+\ LIVE-PLAN-AT answers a pending or a blocked plan as PENDING-PLANS and
+\ BLOCKED-PLANS read it, and none for a completed plan or no plan.
+: LIVE-PLAN-AT-ANSWERS-ONLY-A-LIVE-PLAN ( ^ARENA:arena -- )
+   {: ar :}
+   s" live plan at answers only a live plan" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   s" created" UPLOAD-DECISION ar OPERATIONS {: plan :}
+   p OPEN {: j :}
+   j s" created.txt" DISPLAY plan ar RECORD-PLAN RECORDED-PLAN
+   {: created :}
+   j s" held.txt" DISPLAY plan ar RECORD-PLAN RECORDED-PLAN >ID {: id :}
+   j id MODEL-BLOCKAGE:STAGE-OCCUPIED 1700000000 ar BLOCK-PLAN
+   BLOCK-N 2 T=
+   j s" created.txt" ar LIVE-AT j ar PENDING-PLANS ONLY LIVE-IS? TTRUE
+   j s" HELD.txt" ar LIVE-AT j ar BLOCKED-PLANS ONLY LIVE-IS? TTRUE
+   j s" absent.txt" ar LIVE-AT NO-LIVE? TTRUE
+   s" created" s" rev-server" REMOTE-FILE MODEL-BASELINE:PRESENT
+   {: actual :}
+   j created FIRST-ID actual OPTION:SOME ar COMPLETE-OPERATION
+   COMPLETION-N 7 T=
+   j s" created.txt" ar LIVE-AT NO-LIVE? TTRUE
+   j CLOSE
+   d GONE ;
+
 : RECOVERIES=
    ( ^VEC:vector<recovery-record> ^VEC:vector<recovery-record> -- bool )
    {: a b :}
@@ -3846,8 +4064,6 @@ variable CRAFT
    op ou path pu STORED-LINE {: a:^ u :}
    reader E-JSON d a u ar LOGGED ;
 
-: HELD-BASELINES ( -- ) HELD-JOURNAL @ HELD-ARENA @ BASELINES drop ;
-
 : HELD-PENDING-PLANS ( -- )
    HELD-JOURNAL @ HELD-ARENA @ PENDING-PLANS drop ;
 
@@ -3873,7 +4089,8 @@ variable CRAFT
    s" an unknown stored baseline is refused" T-LABEL
    s\" UPDATE baselines SET baseline_json = '{\"Future\":1}'
       WHERE hex(path) = hex('Docs')" ar PLANTED {: d:str :}
-   [: HELD-BASELINES ;] d s" deserialize baseline" s" Docs" ar
+   [: HELD-JOURNAL @ s" Docs" HELD-ARENA @ CANONICAL HELD-ARENA @
+      KNOWN-PATH-AT drop ;] d s" deserialize baseline" s" Docs" ar
    UNREADABLE
    d PLANTED-GONE ;
 
@@ -3984,9 +4201,12 @@ variable CRAFT
    ar REMOTE-DELTA-DELETES-ONLY-THE-NAMED-SUBTREE
    ar REMOTE-DELTA-ENSURED-DIRECTORY-KEEPS-AN-UNKNOWN-FOLDER
    ar REMOTE-DIRECTORY-AT-INCLUDES-RESTRICTED-FOLDERS
+   ar REMOTE-AT-ANSWERS-THE-RECORD-AT-A-KEY
    ar JOURNAL-LOCAL-SCAN-REPLACES-INVENTORY-AND-HASHES-ATOMICALLY
    ar EACH-LOCAL-COLLISION-VISITS-IN-KEY-ORDER
    ar LOCAL-COUNT-AND-LOCAL-AT
+   ar KNOWN-PATHS-ARE-READ-ROW-BY-ROW
+   ar SUBTREE-HOLDS-ONLY-TRUE-DESCENDANTS
    ar A-SCAN-PUBLISHES-ONLY-ITS-DIFFERENCE
    ar A-SCAN-DROPS-HASHES-OF-ANOTHER-GENERATION
    ar WITH-SCAN-EMPTIES-THE-PREVIOUS-SCAN
@@ -4008,7 +4228,6 @@ variable CRAFT
    ar ABSENT-BASELINE-REMOVES-ITS-ROW
    ar CASE-COLLISION-INVALIDATION-COVERS-A-CHILD-NAMED-WITH-A-HIGH-BYTE
    ar CASE-COLLISION-INVALIDATION-JUDGES-EACH-RECORDED-SPELLING
-   ar BASELINE-SNAPSHOT-IS-CANONICAL-SORTED
    ar ORACLE-JOURNAL-HOLDS-ITS-PLANS
    ar BLOCKING-A-PLAN-HIDES-IT-FROM-PENDING-WORK-ACROSS-REOPEN
    ar A-BLOCKED-PATH-KEEPS-ITS-PLAN-INSTEAD-OF-GAINING-A-SECOND-ONE
@@ -4027,6 +4246,7 @@ variable CRAFT
    ar BLOCKING-REPORTS-MISSING-AND-FINISHED-PLANS-WITHOUT-CHANGING-THEM
    ar BLOCKED-PLAN-UPLOAD-PAYLOADS-STAY-REFERENCED
    ar JOURNAL-PLAN-CONFLICT-COMPLETES-ONCE-WITHOUT-ADVANCING-BASELINE
+   ar LIVE-PLAN-AT-ANSWERS-ONLY-A-LIVE-PLAN
    ar AN-UNKNOWN-BASELINE-IS-REFUSED
    ar AN-UNKNOWN-OPERATION-IS-REFUSED
    ar AN-UNKNOWN-OBSERVATION-IS-REFUSED

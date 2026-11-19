@@ -9,7 +9,8 @@
 \ directory spelling comes from its writes numbered after that delete:
 \ no change is replayed against the whole inventory.
 \ STORAGE CLASS. No state of its own. CALLER-OWNED: every value a pass
-\ reads or makes lies in the arena the caller passes.
+\ keeps lies in the arena the caller passes; the walk of known paths
+\ reads each row in an arena of its own, released when the walk ends.
 
 require src/lib/error.f
 require src/lib/string.f
@@ -184,29 +185,14 @@ STRUCTURE path-decision
    dup 0<> if exit then
    drop ak bk MODEL:KEY-CMP ;
 
-\ A scan record and its key.
-STRUCTURE local-entry
-   FIELD key MODEL:key
-   FIELD record MODEL:local-record
-;STRUCTURE
-
 \ A pending plan and its path's key.
 STRUCTURE pending-plan
    FIELD key MODEL:key
    FIELD plan JOURNAL:plan-record
 ;STRUCTURE
 
-: ENTRY-KEY ( local-entry -- MODEL:key )
-   LOCAL-ENTRY-UNMAKE {: k r :} k ;
-
-: ENTRY-RECORD ( local-entry -- MODEL:local-record )
-   LOCAL-ENTRY-UNMAKE {: k r :} r ;
-
 : RECORD-PATH ( MODEL:local-record -- MODEL:path )
    MODEL-LOCAL--RECORD:UNMAKE {: p o :} p ;
-
-: ENTRY-OBSERVATION ( local-entry -- MODEL:observation<MODEL:local> )
-   ENTRY-RECORD MODEL-LOCAL--RECORD:UNMAKE {: p o :} o ;
 
 : REMOTE-KEY ( MODEL:remote-record -- MODEL:key )
    MODEL-REMOTE--RECORD:UNMAKE {: k p o :} k ;
@@ -214,9 +200,6 @@ STRUCTURE pending-plan
 : REMOTE-OBSERVATION
    ( MODEL:remote-record -- MODEL:observation<MODEL:remote> )
    MODEL-REMOTE--RECORD:UNMAKE {: k p o :} o ;
-
-: BASELINE-KEY ( MODEL:baseline-record -- MODEL:key )
-   MODEL-BASELINE--RECORD:UNMAKE {: k p b :} k ;
 
 : PENDING-KEY ( pending-plan -- MODEL:key )
    PENDING-PLAN-UNMAKE {: k p :} k ;
@@ -242,50 +225,6 @@ STRUCTURE pending-plan
    {: k:n cmp ar :}
    k [: 2dup cmp execute STABLE< ;] ar ORDER ;
 
-\ Entry x against y by key, then path.
-: ENTRY-CMP ( n n ^VEC:vector<local-entry> -- n )
-   {: x:n y:n v :}
-   v x VEC:AT @ LOCAL-ENTRY-UNMAKE {: k r :}
-   v y VEC:AT @ LOCAL-ENTRY-UNMAKE {: k2 r2 :}
-   k k2 MODEL:KEY-CMP {: c:n :}
-   c 0<> if c exit then
-   r RECORD-PATH r2 RECORD-PATH MODEL:PATH-CMP ;
-
-: KEY-INTO
-   ( MODEL:local-record ^VEC:vector<local-entry> ^ARENA:arena -- )
-   {: r v ar :}
-   r RECORD-PATH {: p :}
-   p MODEL:EXCLUDED? if exit then
-   p ar MODEL:FOLD r LOCAL-ENTRY-MAKE v VEC:PUSH ! ;
-
-\ The scan's records but excluded ones, each with its key.
-: KEYED
-   ( ^VEC:vector<MODEL:local-record> ^ARENA:arena
-     -- ^VEC:vector<local-entry> )
-   {: records ar :}
-   ar ARENA:ALLOCATOR 0 [type] local-entry VEC:NEW {: v :}
-   records VEC:COUNT 0 ?do records i VEC:AT @ v ar KEY-INTO loop
-   v ;
-
-: ENTRIES-IN
-   ( ^VEC:vector<local-entry> ^VEC:vector<n> ^ARENA:arena
-     -- ^VEC:vector<local-entry> )
-   {: v idx ar :}
-   ar ARENA:ALLOCATOR 0 [type] local-entry VEC:NEW {: out :}
-   idx VEC:COUNT 0 ?do
-      v idx i VEC:AT @ VEC:AT @ out VEC:PUSH !
-   loop
-   out ;
-
-\ The index after the run of entries from i that share its key.
-: RUN-END ( ^VEC:vector<local-entry> n -- n )
-   {: v from:n :}
-   v from VEC:AT @ ENTRY-KEY {: k :}
-   from 1+ begin dup v VEC:COUNT < while
-      v over VEC:AT @ ENTRY-KEY k MODEL:KEY= 0= if exit then
-      1+
-   repeat ;
-
 : UNSUPPORTED-REASON? ( MODEL:unknown-reason -- bool )
    MATCH MODEL:unknown-reason
       incomplete OF false ENDOF
@@ -296,58 +235,32 @@ STRUCTURE pending-plan
       unsupported OF true ENDOF
    ;MATCH ;
 
-: UNSUPPORTED? ( local-entry -- bool )
-   ENTRY-OBSERVATION
-   MATCH MODEL:observation
+: UNSUPPORTED? ( MODEL:local-record -- bool )
+   MODEL-LOCAL--RECORD:UNMAKE {: p o :}
+   o MATCH MODEL:observation
       present OF drop false ENDOF
       directory OF false ENDOF
       absent OF false ENDOF
       unknown OF UNSUPPORTED-REASON? ENDOF
    ;MATCH ;
 
-: UNSUPPORTED-ONLY? ( ^VEC:vector<local-entry> n n -- bool )
-   {: v from:n end:n :}
-   true end from ?do v i VEC:AT @ UNSUPPORTED? and loop ;
+\ Whether every record is unsupported.
+: UNSUPPORTED-ONLY? ( ^VEC:vector<MODEL:local-record> -- bool )
+   {: v :}
+   true v VEC:COUNT 0 ?do v i VEC:AT @ UNSUPPORTED? and loop ;
 
-: SPELLING ( ^VEC:vector<local-entry> n -- ^u8 n )
-   VEC:AT @ ENTRY-RECORD RECORD-PATH MODEL:PATH>STR str> ;
+: SPELLING ( MODEL:local-record -- ^u8 n )
+   RECORD-PATH MODEL:PATH>STR str> ;
 
-\ Logs Rust's LocalCaseCollision text for the run's first two
-\ spellings, then throws E-CASE-COLLISION.
-: COLLISION ( ^VEC:vector<local-entry> n -- )
-   {: v from:n :}
+\ Logs Rust's LocalCaseCollision text for the two spellings, then
+\ throws E-CASE-COLLISION.
+: COLLISION ( MODEL:local-record MODEL:local-record -- )
+   {: a b :}
    LOG:ERROR s" reconcile" LOG:LINE
-   s" local paths `" LOG:TEXT+ v from SPELLING LOG:TEXT+
-   s" ` and `" LOG:TEXT+ v from 1+ SPELLING LOG:TEXT+
+   s" local paths `" LOG:TEXT+ a SPELLING LOG:TEXT+
+   s" ` and `" LOG:TEXT+ b SPELLING LOG:TEXT+
    s" ` have the same Dropbox path identity" LOG:TEXT+ LOG:;LINE
    E-CASE-COLLISION throw ;
-
-\ Keeps a run's first entry; a run of more, unless all unsupported,
-\ is a collision.
-: KEEP-RUN
-   ( n n ^VEC:vector<local-entry> ^VEC:vector<local-entry> -- n )
-   {: from:n end:n v out :}
-   end from - 1 > if
-      v from end UNSUPPORTED-ONLY? 0= if v from COLLISION then
-   then
-   v from VEC:AT @ out VEC:PUSH !
-   end ;
-
-\ The scan's records but excluded ones, keyed and sorted by key, then
-\ path. A run of unsupported spellings of one key cannot be renamed
-\ apart and infers nothing, so its least spelling stands for them.
-: LOCAL-MAP
-   ( ^VEC:vector<MODEL:local-record> ^ARENA:arena
-     -- ^VEC:vector<local-entry> )
-   {: records ar :}
-   records ar KEYED {: v :}
-   v VEC:COUNT [: v ENTRY-CMP ;] ar STABLE-ORDER {: idx :}
-   v idx ar ENTRIES-IN {: sorted :}
-   ar ARENA:ALLOCATOR 0 [type] local-entry VEC:NEW {: out :}
-   0 begin dup sorted VEC:COUNT < while
-      dup sorted over RUN-END sorted out KEEP-RUN nip
-   repeat drop
-   out ;
 
 \ Rust's observed_unknown, one word for each side's observation.
 : LOCAL-OBSERVED-UNKNOWN
@@ -411,81 +324,84 @@ STRUCTURE pending-plan
    at key execute KEY-BYTES p u STR= if at exit then
    count ;
 
-\ The reason of the record at these bytes, if it is unknown.
-: REASON-AT
-   ( ^u8 n n [ n -- MODEL:key ]
-     [ n -- option<MODEL:unknown-reason> ]
-     -- option<MODEL:unknown-reason> )
-   {: p:^ u:n count:n key reason :}
-   p u count key FIND-BYTES {: at:n :}
-   at count = if OPTION:NONE exit then
-   at reason execute ;
-
 \ For ANCESTOR-UNKNOWN: the reason at the ancestor or the next one up.
 : CLIMB
-   ( option<str> n [ n -- MODEL:key ]
-     [ n -- option<MODEL:unknown-reason> ]
+   ( option<str> [ ^u8 n -- option<MODEL:unknown-reason> ]
      -- option<MODEL:unknown-reason> )
-   {: ancestor count:n key reason :}
+   {: ancestor reason :}
    ancestor MATCH option
       none OF OPTION:NONE ENDOF
       some OF {: s:str :}
-         s str> count key reason REASON-AT
+         s str> reason execute
          MATCH option
-            none OF s PARENT-BYTES count key reason RECURSE ENDOF
+            none OF s PARENT-BYTES reason RECURSE ENDOF
             some OF OPTION:SOME ENDOF
          ;MATCH
       ENDOF
    ;MATCH ;
 
-\ The reason any ancestor of the key was recorded unknown with, among
-\ n records sorted by key that key and reason read by index. The climb
-\ goes to the root: a record below an unknown directory cannot turn
-\ the rest of it back into confirmed absence.
+\ The reason of the nearest ancestor recorded unknown. The climb goes to
+\ the root: a record below an unknown directory confirms no absence.
 : ANCESTOR-UNKNOWN
-   ( n MODEL:key [ n -- MODEL:key ]
-     [ n -- option<MODEL:unknown-reason> ]
+   ( MODEL:key [ ^u8 n -- option<MODEL:unknown-reason> ]
      -- option<MODEL:unknown-reason> )
-   {: count:n k key reason :}
-   k MODEL:KEY>STR PARENT-BYTES count key reason CLIMB ;
+   {: k reason :}
+   k MODEL:KEY>STR PARENT-BYTES reason CLIMB ;
+
+: UNEXCLUDED ( MODEL:local-record -- option<MODEL:local-record> )
+   {: r :}
+   r RECORD-PATH MODEL:EXCLUDED? if OPTION:NONE exit then
+   r OPTION:SOME ;
+
+\ The local record at these key bytes; one at an excluded path, outside
+\ synchronization, counts as none.
+: LOCAL-BYTES-AT
+   ( JOURNAL:journal ^u8 n ^ARENA:arena -- option<MODEL:local-record> )
+   {: j p:^ u:n ar :}
+   j p u >str MODEL:>KEY ar JOURNAL:LOCAL-AT MATCH option
+      none OF OPTION:NONE ENDOF
+      some OF UNEXCLUDED ENDOF
+   ;MATCH ;
+
+: LOCAL-REASON
+   ( option<MODEL:local-record> -- option<MODEL:unknown-reason> )
+   MATCH option
+      none OF OPTION:NONE ENDOF
+      some OF
+         MODEL-LOCAL--RECORD:UNMAKE {: p o :} o LOCAL-OBSERVED-UNKNOWN
+      ENDOF
+   ;MATCH ;
+
+: REMOTE-REASON
+   ( option<MODEL:remote-record> -- option<MODEL:unknown-reason> )
+   MATCH option
+      none OF OPTION:NONE ENDOF
+      some OF REMOTE-OBSERVATION REMOTE-OBSERVED-UNKNOWN ENDOF
+   ;MATCH ;
+
+: LOCAL-REASON-AT
+   ( ^u8 n JOURNAL:journal ^ARENA:arena
+     -- option<MODEL:unknown-reason> )
+   {: p:^ u:n j ar :}
+   j p u ar LOCAL-BYTES-AT LOCAL-REASON ;
+
+: REMOTE-REASON-AT
+   ( ^u8 n JOURNAL:journal ^ARENA:arena
+     -- option<MODEL:unknown-reason> )
+   {: p:^ u:n j ar :}
+   j p u >str MODEL:>KEY ar JOURNAL:REMOTE-AT REMOTE-REASON ;
 
 : LOCAL-UNOBSERVED
-   ( ^VEC:vector<local-entry> MODEL:key
+   ( JOURNAL:journal MODEL:key ^ARENA:arena
      -- MODEL:observation<MODEL:local> )
-   {: v k :}
-   v VEC:COUNT k [: v swap VEC:AT @ ENTRY-KEY ;]
-   [: v swap VEC:AT @ ENTRY-OBSERVATION LOCAL-OBSERVED-UNKNOWN ;]
-   ANCESTOR-UNKNOWN UNOBSERVED-LOCAL ;
+   {: j k ar :}
+   k [: j ar LOCAL-REASON-AT ;] ANCESTOR-UNKNOWN UNOBSERVED-LOCAL ;
 
 : REMOTE-UNOBSERVED
-   ( ^VEC:vector<MODEL:remote-record> MODEL:key
+   ( JOURNAL:journal MODEL:key ^ARENA:arena
      -- MODEL:observation<MODEL:remote> )
-   {: v k :}
-   v VEC:COUNT k [: v swap VEC:AT @ REMOTE-KEY ;]
-   [: v swap VEC:AT @ REMOTE-OBSERVATION REMOTE-OBSERVED-UNKNOWN ;]
-   ANCESTOR-UNKNOWN UNOBSERVED-REMOTE ;
-
-\ The index of the local entry at these bytes, or the count.
-: LOCAL-INDEX ( ^VEC:vector<local-entry> ^u8 n -- n )
-   {: v p:^ u:n :}
-   p u v VEC:COUNT [: v swap VEC:AT @ ENTRY-KEY ;] FIND-BYTES ;
-
-: FIND-LOCAL
-   ( ^VEC:vector<local-entry> MODEL:key
-     -- option<MODEL:local-record> )
-   {: v k :}
-   v k KEY-BYTES LOCAL-INDEX {: at:n :}
-   at v VEC:COUNT = if OPTION:NONE exit then
-   v at VEC:AT @ ENTRY-RECORD OPTION:SOME ;
-
-: FIND-REMOTE
-   ( ^VEC:vector<MODEL:remote-record> MODEL:key
-     -- option<MODEL:remote-record> )
-   {: v k :}
-   k KEY-BYTES v VEC:COUNT [: v swap VEC:AT @ REMOTE-KEY ;] FIND-BYTES
-   {: at:n :}
-   at v VEC:COUNT = if OPTION:NONE exit then
-   v at VEC:AT @ OPTION:SOME ;
+   {: j k ar :}
+   k [: j ar REMOTE-REASON-AT ;] ANCESTOR-UNKNOWN UNOBSERVED-REMOTE ;
 
 \ Rust's Path::file_name: the last component, unless a root, "." or
 \ "..".
@@ -499,22 +415,24 @@ STRUCTURE pending-plan
    if OPTION:NONE exit then
    last OPTION:SOME ;
 
-\ The component at idx: an ancestor's spelling from the local entry at
+\ The component at idx: an ancestor's spelling from the local record at
 \ the key's bytes up to it, else the candidate's.
 : SPELLED
-   ( ^VEC:vector<local-entry> MODEL:key ^VEC:vector<str>
-     ^VEC:vector<str> n ^ARENA:arena -- str )
-   {: v k canon shown at:n ar :}
+   ( JOURNAL:journal MODEL:key ^VEC:vector<str> ^VEC:vector<str> n
+     ^ARENA:arena -- str )
+   {: j k canon shown at:n ar :}
    shown at VEC:AT @ {: own:str :}
    at 1+ canon VEC:COUNT = if own exit then
    k KEY-BYTES drop {: base:^ :}
    canon at VEC:AT @ str> + base - {: end:n :}
-   v base end LOCAL-INDEX {: found:n :}
-   found v VEC:COUNT = if own exit then
-   v found VEC:AT @ ENTRY-RECORD RECORD-PATH ar FILE-NAME
-   MATCH option
+   j base end ar LOCAL-BYTES-AT MATCH option
       none OF own ENDOF
-      some OF ENDOF
+      some OF
+         RECORD-PATH ar FILE-NAME MATCH option
+            none OF own ENDOF
+            some OF ENDOF
+         ;MATCH
+      ENDOF
    ;MATCH ;
 
 \ PathBuf::push puts a separator after a part but a root.
@@ -553,204 +471,16 @@ STRUCTURE pending-plan
 \ filesystem holds instead of building a sibling tree in other case;
 \ the last component keeps the candidate's spelling.
 : SPELL-WITH-LOCAL-ANCESTORS
-   ( ^VEC:vector<local-entry> MODEL:key MODEL:path ^ARENA:arena
-     -- MODEL:path )
-   {: v k candidate ar :}
+   ( JOURNAL:journal MODEL:key MODEL:path ^ARENA:arena -- MODEL:path )
+   {: j k candidate ar :}
    k MODEL:KEY>STR ar COMPONENTS {: canon :}
    candidate MODEL:PATH>STR ar COMPONENTS {: shown :}
    canon VEC:COUNT shown VEC:COUNT <> if candidate exit then
    ar ARENA:ALLOCATOR 0 [type] str VEC:NEW {: parts :}
    canon VEC:COUNT 0 ?do
-      v k canon shown i ar SPELLED parts VEC:PUSH !
+      j k canon shown i ar SPELLED parts VEC:PUSH !
    loop
    parts ar JOINED MODEL:>PATH ;
-
-\ Remote record x against y by key.
-: REMOTE-CMP ( n n ^VEC:vector<MODEL:remote-record> -- n )
-   {: x:n y:n v :}
-   v x VEC:AT @ REMOTE-KEY v y VEC:AT @ REMOTE-KEY MODEL:KEY-CMP ;
-
-: REMOTE-MAP
-   ( ^VEC:vector<MODEL:remote-record> ^ARENA:arena
-     -- ^VEC:vector<MODEL:remote-record> )
-   {: v ar :}
-   v VEC:COUNT [: v REMOTE-CMP ;] ar STABLE-ORDER {: idx :}
-   ar ARENA:ALLOCATOR 0 [type] MODEL:remote-record VEC:NEW {: out :}
-   idx VEC:COUNT 0 ?do
-      v idx i VEC:AT @ VEC:AT @ out VEC:PUSH !
-   loop
-   out ;
-
-\ The bytes sort before every path beneath parent, before parent then
-\ "/", decided without building that prefix.
-: PRECEDES-CHILDREN? ( ^u8 n ^u8 n -- bool )
-   {: b:^ u:n p:^ v:n :}
-   u v >= if
-      b v p v STR= if
-         u v = if true exit then
-         b v + c@ SEPARATOR < exit
-      then
-   then
-   b u >str p v >str STR< ;
-
-\ Whether the inventory, sorted by key, holds a path beneath the key:
-\ the first record at or past the key then "/" decides, as a sibling
-\ such as the key then ".txt" sorts between the key and its children.
-: REMOTE-SUBTREE
-   ( ^VEC:vector<MODEL:remote-record> MODEL:key -- MODEL:subtree )
-   {: v k :}
-   k KEY-BYTES {: p:^ u:n :}
-   0 v VEC:COUNT
-   [: v swap VEC:AT @ REMOTE-KEY KEY-BYTES p u PRECEDES-CHILDREN? ;]
-   SORT:PARTITION-POINT {: first:n :}
-   first v VEC:COUNT < if
-      v first VEC:AT @ REMOTE-KEY k MODEL:BENEATH? if
-         MODEL-SUBTREE:OCCUPIED exit
-      then
-   then
-   MODEL-SUBTREE:EMPTY ;
-
-\ Every side for FOR-EACH-KNOWN-PATH, each sorted by key.
-STRUCTURE sides
-   FIELD baselines ^VEC:vector<MODEL:baseline-record>
-   FIELD local ^VEC:vector<local-entry>
-   FIELD remote ^VEC:vector<MODEL:remote-record>
-   FIELD pending ^VEC:vector<pending-plan>
-;STRUCTURE
-
-\ How far FOR-EACH-KNOWN-PATH is through each side.
-STRUCTURE cursor
-   FIELD baseline n
-   FIELD local n
-   FIELD remote n
-   FIELD pending n
-;STRUCTURE
-
-\ The key q reads at idx, if idx is below the count.
-: KEY-AT ( n n [ n -- MODEL:key ] -- option<MODEL:key> )
-   {: count:n at:n q :}
-   at count >= if OPTION:NONE exit then
-   at q execute OPTION:SOME ;
-
-\ The key q reads at idx, below the count, is this one.
-: HERE? ( n n MODEL:key [ n -- MODEL:key ] -- bool )
-   {: count:n at:n k q :}
-   at count >= if false exit then
-   at q execute k MODEL:KEY= ;
-
-\ The lesser of two keys a side may hold, by bytes.
-: LEAST ( option<MODEL:key> option<MODEL:key> -- option<MODEL:key> )
-   {: a b :}
-   a MATCH option
-      none OF b ENDOF
-      some OF {: x :}
-         b MATCH option
-            none OF x OPTION:SOME ENDOF
-            some OF {: y :}
-               x y MODEL:KEY-CMP 0 > if y else x then OPTION:SOME
-            ENDOF
-         ;MATCH
-      ENDOF
-   ;MATCH ;
-
-\ A baseline at a key leads when no other side holds a lesser one.
-: LEADS? ( option<MODEL:key> option<MODEL:key> -- bool )
-   {: base least :}
-   base MATCH option
-      none OF false ENDOF
-      some OF {: x :}
-         least MATCH option
-            none OF true ENDOF
-            some OF x swap MODEL:KEY-CMP 0 <= ENDOF
-         ;MATCH
-      ENDOF
-   ;MATCH ;
-
-: SIDE-LEAST ( sides cursor -- option<MODEL:key> )
-   {: s c :}
-   s SIDES-UNMAKE {: bs ls rs ps :}
-   c CURSOR-UNMAKE {: b:n l:n r:n p:n :}
-   ls VEC:COUNT l [: ls swap VEC:AT @ ENTRY-KEY ;] KEY-AT
-   rs VEC:COUNT r [: rs swap VEC:AT @ REMOTE-KEY ;] KEY-AT LEAST
-   ps VEC:COUNT p [: ps swap VEC:AT @ PENDING-KEY ;] KEY-AT LEAST ;
-
-: TURN-BASELINE
-   ( bool ^VEC:vector<MODEL:baseline-record> n
-     -- option<JOURNAL:path-baseline> )
-   {: leads bs b:n :}
-   leads 0= if OPTION:NONE exit then
-   bs b VEC:AT @ MODEL-BASELINE--RECORD:UNMAKE {: k path base :}
-   path base JOURNAL-PATH--BASELINE:MAKE OPTION:SOME ;
-
-: TURN-LOCAL
-   ( bool ^VEC:vector<local-entry> n -- option<MODEL:local-record> )
-   {: here ls l:n :}
-   here 0= if OPTION:NONE exit then
-   ls l VEC:AT @ ENTRY-RECORD OPTION:SOME ;
-
-: TURN-REMOTE
-   ( bool ^VEC:vector<MODEL:remote-record> n
-     -- option<MODEL:remote-record> )
-   {: here rs r:n :}
-   here 0= if OPTION:NONE exit then
-   rs r VEC:AT @ OPTION:SOME ;
-
-: ADVANCE ( n bool -- n ) if 1+ then ;
-
-\ Visits the key with what each side holds there; the cursor past it.
-: VISIT
-   ( sides cursor bool MODEL:key
-     [ MODEL:key option<JOURNAL:path-baseline>
-       option<MODEL:local-record> option<MODEL:remote-record> -- ]
-     -- cursor )
-   {: s c leads k visit :}
-   s SIDES-UNMAKE {: bs ls rs ps :}
-   c CURSOR-UNMAKE {: b:n l:n r:n p:n :}
-   ls VEC:COUNT l k [: ls swap VEC:AT @ ENTRY-KEY ;] HERE?
-   {: lh:bool :}
-   rs VEC:COUNT r k [: rs swap VEC:AT @ REMOTE-KEY ;] HERE?
-   {: rh:bool :}
-   ps VEC:COUNT p k [: ps swap VEC:AT @ PENDING-KEY ;] HERE?
-   {: ph:bool :}
-   k leads bs b TURN-BASELINE lh ls l TURN-LOCAL rh rs r TURN-REMOTE
-   visit execute
-   b leads ADVANCE l lh ADVANCE r rh ADVANCE p ph ADVANCE
-   CURSOR-MAKE ;
-
-\ One turn of the merge over the least key any side holds next; false
-\ once every side is done.
-: MERGE-STEP
-   ( sides cursor
-     [ MODEL:key option<JOURNAL:path-baseline>
-       option<MODEL:local-record> option<MODEL:remote-record> -- ]
-     -- cursor bool )
-   {: s c visit :}
-   s SIDES-UNMAKE {: bs ls rs ps :}
-   c CURSOR-UNMAKE {: b:n l:n r:n p:n :}
-   s c SIDE-LEAST {: least :}
-   bs VEC:COUNT b [: bs swap VEC:AT @ BASELINE-KEY ;] KEY-AT
-   {: base :}
-   base least LEADS? {: leads:bool :}
-   leads if base else least then
-   MATCH option
-      none OF c false ENDOF
-      some OF {: k :} s c leads k visit VISIT true ENDOF
-   ;MATCH ;
-
-\ Visits every key any side knows once, in key order, with the
-\ baseline's path and value, the scan's record and the listing's
-\ record at it, each if that side has one.
-: FOR-EACH-KNOWN-PATH
-   ( ^VEC:vector<MODEL:baseline-record> ^VEC:vector<local-entry>
-     ^VEC:vector<MODEL:remote-record> ^VEC:vector<pending-plan>
-     [ MODEL:key option<JOURNAL:path-baseline>
-       option<MODEL:local-record> option<MODEL:remote-record> -- ]
-     -- )
-   {: bs ls rs ps visit :}
-   bs ls rs ps SIDES-MAKE {: s :}
-   0 0 0 0 CURSOR-MAKE
-   begin s swap visit MERGE-STEP 0= until
-   drop ;
 
 
 \ ---- case collisions ------------------------------------------------
@@ -1264,14 +994,13 @@ ENUM file-copy-origin
 \ Whether the copy may take candidate c: no record holds its identity,
 \ or a Dropbox copy finds this content in each record that does.
 : USABLE?
-   ( sides MODEL:path DROPBOX:hash file-copy-origin ^ARENA:arena
-     -- bool )
-   {: s c h o ar :}
+   ( JOURNAL:journal MODEL:path DROPBOX:hash file-copy-origin
+     ^ARENA:arena -- bool )
+   {: j c h o ar :}
    o c EXCLUDED-COPY? if false exit then
    c ar MODEL:FOLD {: k :}
-   s SIDES-UNMAKE {: bs ls rs ps :}
-   ls k FIND-LOCAL {: l :}
-   rs k FIND-REMOTE {: r :}
+   j k ar JOURNAL:LOCAL-AT {: l :}
+   j k ar JOURNAL:REMOTE-AT {: r :}
    l r FREE? if true exit then
    o REUSES? 0= if false exit then
    l h LOCAL-MATCHES? r h REMOTE-MATCHES? and ;
@@ -1289,9 +1018,9 @@ ENUM file-copy-origin
 \ Rust's file_copy_path: the source's first file-copy name under its
 \ parent the copy may take; the names grow until one no longer fits.
 : FILE-COPY-PATH
-   ( sides MODEL:path DROPBOX:hash file-copy-origin n ^ARENA:arena
-     -- MODEL:path )
-   {: s source h o max:n ar :}
+   ( JOURNAL:journal MODEL:path DROPBOX:hash file-copy-origin n
+     ^ARENA:arena -- MODEL:path )
+   {: j source h o max:n ar :}
    source ar COPY-NAME {: name:str :}
    source PATH$ SPLIT-NAME {: dir:^ du:n x:^ xu:n :}
    0 begin
@@ -1303,7 +1032,7 @@ ENUM file-copy-origin
          ENDOF
          some OF
             dir du rot ar UNDER
-            s over h o ar USABLE? if nip exit then drop
+            j over h o ar USABLE? if nip exit then drop
          ENDOF
       ;MATCH
       1+
@@ -2276,11 +2005,11 @@ ENUM prepared-collision
 \ prepare_directory_collision's local file, renamed aside to its
 \ file-copy name; the path is observed again.
 : RENAME-ASIDE
-   ( fd ^run sides MODEL:path MODEL:local n -- prepared-collision )
-   {: root:fd r s path file max:n :}
+   ( fd ^run MODEL:path MODEL:local n -- prepared-collision )
+   {: root:fd r path file max:n :}
    file MODEL-LOCAL:UNMAKE {: c :}
-   s path c construct file-copy-origin local max r RUN-ARENA @
-   FILE-COPY-PATH {: dst :}
+   r RUN-JOURNAL @ path c construct file-copy-origin local max
+   r RUN-ARENA @ FILE-COPY-PATH {: dst :}
    root path PATH$ dst PATH$ LOCAL:RENAME-FILE-COPY
    MATCH LOCAL:rename-outcome
       renamed OF FRESH-COLLISION ENDOF
@@ -2344,21 +2073,21 @@ ENUM prepared-collision
 \ prepare_directory_collision's Dropbox file copy path, skipping the
 \ excluded paths.
 : DROPBOX-COPY-PATH
-   ( sides MODEL:path MODEL:remote ^VEC:vector<MODEL:path> n ^run
+   ( MODEL:path MODEL:remote ^VEC:vector<MODEL:path> n ^run
      -- MODEL:path )
-   {: s path rem ex max:n r :}
+   {: path rem ex max:n r :}
    rem MODEL-REMOTE:UNMAKE {: c v :}
-   s path c ex construct file-copy-origin dropbox max r RUN-ARENA @
-   FILE-COPY-PATH ;
+   r RUN-JOURNAL @ path c ex construct file-copy-origin dropbox max
+   r RUN-ARENA @ FILE-COPY-PATH ;
 
 \ prepare_directory_collision's Dropbox file, placed locally under its
 \ file-copy name, a name whose stage other bytes hold skipped.
 : PLACE-COPY
-   ( fd ^run sides MODEL:path MODEL:remote n -- prepared-collision )
-   {: root:fd r s path rem max:n :}
+   ( fd ^run MODEL:path MODEL:remote n -- prepared-collision )
+   {: root:fd r path rem max:n :}
    r RUN-ARENA @ ARENA:ALLOCATOR 0 [type] MODEL:path VEC:NEW {: ex :}
    begin
-      root r path rem ex s path rem ex max r DROPBOX-COPY-PATH
+      root r path rem ex path rem ex max r DROPBOX-COPY-PATH
       COPY-TRY MATCH option
          none OF ENDOF
          some OF exit ENDOF
@@ -2366,33 +2095,32 @@ ENUM prepared-collision
    again ;
 
 : BY-SIDE
-   ( fd ^run sides MODEL:path MODEL:collision n
-     -- prepared-collision )
-   {: root:fd r s path col max:n :}
+   ( fd ^run MODEL:path MODEL:collision n -- prepared-collision )
+   {: root:fd r path col max:n :}
    col MATCH MODEL:collision
       local-file OF
-         {: file :} root r s path file max RENAME-ASIDE
+         {: file :} root r path file max RENAME-ASIDE
       ENDOF
-      local-dir OF {: rem :} root r s path rem max PLACE-COPY ENDOF
+      local-dir OF {: rem :} root r path rem max PLACE-COPY ENDOF
    ;MATCH ;
 
 : COLLIDE-BELOW
-   ( fd ^run sides MODEL:path MODEL:collision -- prepared-collision )
-   {: root:fd r s path col :}
+   ( fd ^run MODEL:path MODEL:collision -- prepared-collision )
+   {: root:fd r path col :}
    root path PATH$ LOCAL:PARENT-NAME-MAX MATCH option
       none OF FRESH-COLLISION ENDOF
-      some OF {: max:n :} root r s path col max BY-SIDE ENDOF
+      some OF {: max:n :} root r path col max BY-SIDE ENDOF
    ;MATCH ;
 
 \ Rust's prepare_directory_collision: the directory wins, the file
 \ kept under its file-copy name.
 : PREPARE-DIRECTORY-COLLISION
-   ( ^run sides MODEL:path MODEL:collision -- prepared-collision )
-   {: r s path col :}
+   ( ^run MODEL:path MODEL:collision -- prepared-collision )
+   {: r path col :}
    r RUN-JOURNAL @ r ROOT$ LOCAL:OPEN-ACTIVE-ROOT MATCH option
       none OF construct prepared-collision root-changed ENDOF
       some OF {: root:fd :}
-         [: root r s path col COLLIDE-BELOW ;]
+         [: root r path col COLLIDE-BELOW ;]
          [: root FS:CLOSE-DIR ;] finally
       ENDOF
    ;MATCH ;
@@ -2986,7 +2714,6 @@ STRUCTURE known-conflict
 \ blocked_paths (held, keys may repeat); collisions are the held collisions.
 STRUCTURE planning DERIVE addr
    FIELD run ^run
-   FIELD sides sides
    FIELD conflicts ^VEC:vector<known-conflict>
    FIELD now n
    FIELD noop-count n
@@ -3068,26 +2795,12 @@ ARENA PLANNINGS planning
    [: v swap VEC:AT @ out VEC:PUSH ! ;] GATHER
    out ;
 
-\ The merge's sides, read in Rust's order.
-: READ-SIDES ( ^run ^VEC:vector<MODEL:local-record> -- sides )
-   {: r records :}
-   r RUN-JOURNAL @ {: j :}
-   r RUN-ARENA @ {: ar :}
-   records ar LOCAL-MAP {: ls :}
-   j ar JOURNAL:REMOTE-INVENTORY JOURNAL-REMOTE--INVENTORY:UNMAKE
-   {: cursor seen :}
-   seen ar REMOTE-MAP {: rs :}
-   r LIVE-PLANS {: ps :}
-   j ar JOURNAL:BASELINES ls rs ps SIDES-MAKE ;
-
-\ A pass's planning over the merge's sides and the known conflicts.
-: NEW-PLANNING
-   ( ^run ^VEC:vector<MODEL:local-record> -- ^planning )
-   {: r records :}
-   r records READ-SIDES {: s :}
+\ A pass's planning over the known conflicts.
+: NEW-PLANNING ( ^run -- ^planning )
+   {: r :}
    r RUN-ARENA @ {: ar :}
    ar PLANNINGS-NEW {: pl :}
-   r pl PLANNING-RUN ! s pl PLANNING-SIDES !
+   r pl PLANNING-RUN !
    r KNOWN-CONFLICTS pl PLANNING-CONFLICTS !
    ar [type] MODEL:key NEW-VECTOR pl PLANNING-HELD !
    ar [type] MODEL:key NEW-VECTOR pl PLANNING-COLLISIONS !
@@ -3100,29 +2813,10 @@ ARENA PLANNINGS planning
 : JOURNAL-OF ( ^planning -- JOURNAL:journal )
    PLANNING-RUN @ RUN-JOURNAL @ ;
 
-: SCAN-SIDE ( ^planning -- ^VEC:vector<local-entry> )
-   PLANNING-SIDES @ SIDES-UNMAKE {: bs ls rs ps :} ls ;
-
-: LIST-SIDE ( ^planning -- ^VEC:vector<MODEL:remote-record> )
-   PLANNING-SIDES @ SIDES-UNMAKE {: bs ls rs ps :} rs ;
-
-: LIVE-SIDE ( ^planning -- ^VEC:vector<pending-plan> )
-   PLANNING-SIDES @ SIDES-UNMAKE {: bs ls rs ps :} ps ;
-
-\ The live plan at the key; the journal keeps one per key.
-: FIND-LIVE ( ^planning MODEL:key -- option<JOURNAL:plan-record> )
-   {: pl k :}
-   pl LIVE-SIDE {: v :}
-   k KEY-BYTES v VEC:COUNT [: v swap VEC:AT @ PENDING-KEY ;] FIND-BYTES
-   {: at:n :}
-   at v VEC:COUNT = if OPTION:NONE exit then
-   v at VEC:AT @ PENDING-PLAN-UNMAKE {: pk plan :} plan OPTION:SOME ;
-
-: LIVE-AT? ( ^planning MODEL:key -- bool )
-   FIND-LIVE MATCH option
-      none OF false ENDOF
-      some OF drop true ENDOF
-   ;MATCH ;
+: FIND-LIVE
+   ( ^planning MODEL:key ^ARENA:arena -- option<JOURNAL:plan-record> )
+   {: pl k ar :}
+   pl JOURNAL-OF k ar JOURNAL:LIVE-PLAN-AT ;
 
 \ The index of the first known conflict at or past the key.
 : CONFLICT-FROM ( ^VEC:vector<known-conflict> MODEL:key -- n )
@@ -3161,9 +2855,13 @@ ARENA PLANNINGS planning
 
 \ Rust's no-op rule: one that keeps the baseline at a path with no
 \ conflict is only counted; any other is recorded.
+: ONLY-COUNTED? ( bool ^planning MODEL:key -- bool )
+   {: same:bool pl k :}
+   same pl k CONFLICT-AT? 0= and ;
+
 : NOOP ( ^planning MODEL:key MODEL:path MODEL:baseline bool -- )
    {: pl k path base same:bool :}
-   same pl k CONFLICT-AT? 0= and if
+   same pl k ONLY-COUNTED? if
       1 pl PLANNING-NOOP-COUNT +! exit
    then
    path base JOURNAL-PATH--BASELINE:MAKE
@@ -3176,26 +2874,26 @@ ARENA PLANNINGS planning
    ;MATCH ;
 
 : LOCAL-SEEN
-   ( option<MODEL:local-record> ^planning MODEL:key
+   ( option<MODEL:local-record> ^planning MODEL:key ^ARENA:arena
      -- MODEL:observation<MODEL:local> )
-   {: lr pl k :}
+   {: lr pl k ar :}
    lr MATCH option
-      none OF pl SCAN-SIDE k LOCAL-UNOBSERVED ENDOF
+      none OF pl JOURNAL-OF k ar LOCAL-UNOBSERVED ENDOF
       some OF MODEL-LOCAL--RECORD:UNMAKE {: p o :} o ENDOF
    ;MATCH ;
 
 : REMOTE-SEEN
-   ( option<MODEL:remote-record> ^planning MODEL:key
+   ( option<MODEL:remote-record> ^planning MODEL:key ^ARENA:arena
      -- MODEL:observation<MODEL:remote> )
-   {: rr pl k :}
+   {: rr pl k ar :}
    rr MATCH option
-      none OF pl LIST-SIDE k REMOTE-UNOBSERVED ENDOF
+      none OF pl JOURNAL-OF k ar REMOTE-UNOBSERVED ENDOF
       some OF REMOTE-OBSERVATION ENDOF
    ;MATCH ;
 
-: LIVE-PATH ( ^planning MODEL:key -- MODEL:path )
-   {: pl k :}
-   pl k FIND-LIVE MATCH option
+: LIVE-PATH ( ^planning MODEL:key ^ARENA:arena -- MODEL:path )
+   {: pl k ar :}
+   pl k ar FIND-LIVE MATCH option
       none OF
          k MODEL:KEY>STR MODEL:>PATH
          s" canonical path has no display spelling" INVALID
@@ -3204,20 +2902,21 @@ ARENA PLANNINGS planning
    ;MATCH ;
 
 : REMOTE-PATH
-   ( option<MODEL:remote-record> ^planning MODEL:key -- MODEL:path )
-   {: rr pl k :}
+   ( option<MODEL:remote-record> ^planning MODEL:key ^ARENA:arena
+     -- MODEL:path )
+   {: rr pl k ar :}
    rr MATCH option
-      none OF pl k LIVE-PATH ENDOF
+      none OF pl k ar LIVE-PATH ENDOF
       some OF MODEL-REMOTE--RECORD:UNMAKE {: rk p o :} p ENDOF
    ;MATCH ;
 
 \ The baseline's path, else the listing's, else the live plan's.
 : CANDIDATE
    ( option<JOURNAL:path-baseline> option<MODEL:remote-record>
-     ^planning MODEL:key -- MODEL:path )
-   {: br rr pl k :}
+     ^planning MODEL:key ^ARENA:arena -- MODEL:path )
+   {: br rr pl k ar :}
    br MATCH option
-      none OF rr pl k REMOTE-PATH ENDOF
+      none OF rr pl k ar REMOTE-PATH ENDOF
       some OF JOURNAL-PATH--BASELINE:UNMAKE {: p b :} p ENDOF
    ;MATCH ;
 
@@ -3226,11 +2925,11 @@ ARENA PLANNINGS planning
 : SHOWN-PATH
    ( MODEL:key option<JOURNAL:path-baseline>
      option<MODEL:local-record> option<MODEL:remote-record>
-     ^planning -- MODEL:path )
-   {: k br lr rr pl :}
+     ^planning ^ARENA:arena -- MODEL:path )
+   {: k br lr rr pl ar :}
    lr MATCH option
       none OF
-         pl SCAN-SIDE k br rr pl k CANDIDATE pl ARENA-OF
+         pl JOURNAL-OF k br rr pl k ar CANDIDATE ar
          SPELL-WITH-LOCAL-ANCESTORS
       ENDOF
       some OF RECORD-PATH ENDOF
@@ -3238,11 +2937,11 @@ ARENA PLANNINGS planning
 
 : DECISION-AT
    ( MODEL:baseline option<MODEL:local-record>
-     option<MODEL:remote-record> ^planning MODEL:key
-     -- MODEL:decision )
-   {: base lr rr pl k :}
-   base lr pl k LOCAL-SEEN rr pl k REMOTE-SEEN
-   pl LIST-SIDE k REMOTE-SUBTREE PLANNER:PLAN ;
+     option<MODEL:remote-record> MODEL:subtree ^planning MODEL:key
+     ^ARENA:arena -- MODEL:decision )
+   {: base lr rr t pl k ar :}
+   base lr pl k ar LOCAL-SEEN rr pl k ar REMOTE-SEEN t
+   PLANNER:PLAN ;
 
 \ Rust's baseline_matches_noop.
 : KEEPS-BASELINE? ( MODEL:decision MODEL:baseline -- bool )
@@ -3266,30 +2965,90 @@ ARENA PLANNINGS planning
 
 \ A no-op at a key no live plan holds is settled now; any other
 \ decision waits for DECIDE.
-: FILE-DECISION ( ^planning path-decision -- )
-   {: pl pd :}
+: FILE-DECISION ( ^planning path-decision bool -- )
+   {: pl pd live:bool :}
    pd PATH-DECISION-UNMAKE {: k path same d :}
-   pl k LIVE-AT? if pd pl PLANNING-DECISIONS @ VEC:PUSH ! exit then
+   live if pd pl PLANNING-DECISIONS @ VEC:PUSH ! exit then
    d NOOP-OF MATCH option
       none OF pd pl PLANNING-DECISIONS @ VEC:PUSH ! ENDOF
       some OF {: base :} pl k path base same NOOP ENDOF
    ;MATCH ;
 
-\ Rust's closure over each known path in reconcile_published. An
-\ excluded path is outside synchronization, even when an older journal
-\ has a baseline or remote observation for it: never infer its
-\ deletion from its omission in the local scan.
-: KNOWN-PATH
-   ( MODEL:key option<JOURNAL:path-baseline>
-     option<MODEL:local-record> option<MODEL:remote-record>
-     ^planning -- )
-   {: k br lr rr pl :}
-   k MODEL:KEY>STR MODEL:>PATH MODEL:EXCLUDED? if exit then
-   br BASELINE-OF {: base :}
-   k br lr rr pl SHOWN-PATH {: path :}
-   base lr rr pl k DECISION-AT {: d :}
-   d base KEEPS-BASELINE? {: same:bool :}
-   pl k path same d PATH-DECISION-MAKE FILE-DECISION ;
+\ More than one local spelling of a key is a collision unless all are
+\ unsupported, which infer nothing: the known path's least stands for them.
+: CHECK-LOCALS ( MODEL:key n ^planning ^ARENA:arena -- )
+   {: k n:n pl ar :}
+   n 1 > 0= if exit then
+   pl JOURNAL-OF k ar JOURNAL:LOCALS-AT {: v :}
+   v UNSUPPORTED-ONLY? if exit then
+   v 0 VEC:AT @ v 1 VEC:AT @ COLLISION ;
+
+\ An excluded path is outside synchronization, whatever an older journal
+\ holds for it: its omission from the local scan is never a deletion.
+: EXCLUDED-KEY? ( MODEL:key -- bool )
+   MODEL:KEY>STR MODEL:>PATH MODEL:EXCLUDED? ;
+
+: KNOWN-KEY ( JOURNAL:known-path -- MODEL:key )
+   JOURNAL-KNOWN--PATH:UNMAKE {: k br lr n:n rr t live:bool :} k ;
+
+\ The decision at a known path, in ar, once its local rows keep the
+\ run rule.
+: KNOWN-DECISION
+   ( JOURNAL:known-path ^planning ^ARENA:arena -- MODEL:decision )
+   {: kp pl ar :}
+   kp JOURNAL-KNOWN--PATH:UNMAKE {: k br lr n:n rr t live:bool :}
+   k n pl ar CHECK-LOCALS
+   br BASELINE-OF lr rr t pl k ar DECISION-AT ;
+
+\ Rust's closure over each known path in reconcile_published.
+: KNOWN-PATH ( JOURNAL:known-path ^planning -- )
+   {: kp pl :}
+   kp JOURNAL-KNOWN--PATH:UNMAKE {: k br lr n:n rr t live:bool :}
+   k EXCLUDED-KEY? if exit then
+   pl ARENA-OF {: ar :}
+   kp pl ar KNOWN-DECISION {: d :}
+   d br BASELINE-OF KEEPS-BASELINE? {: same:bool :}
+   k br lr rr pl ar SHOWN-PATH {: path :}
+   pl k path same d PATH-DECISION-MAKE live FILE-DECISION ;
+
+\ Whether NOOP would only count the decision at the known path: a
+\ no-op that keeps the baseline at a key no live plan or conflict holds.
+: COUNTED? ( JOURNAL:known-path MODEL:decision ^planning -- bool )
+   {: kp d pl :}
+   kp JOURNAL-KNOWN--PATH:UNMAKE {: k br lr n:n rr t live:bool :}
+   live if false exit then
+   d br BASELINE-OF KEEPS-BASELINE? pl k ONLY-COUNTED? ;
+
+\ A known path decided in the scratch arena ar: one NOOP would only
+\ count is counted, any other key kept, copied into the pass's arena.
+: WALK-STEP
+   ( JOURNAL:known-path ^planning ^VEC:vector<MODEL:key> ^ARENA:arena
+     -- )
+   {: kp pl kept ar :}
+   kp KNOWN-KEY {: k :}
+   k EXCLUDED-KEY? if exit then
+   kp kp pl ar KNOWN-DECISION pl COUNTED? if
+      1 pl PLANNING-NOOP-COUNT +! exit
+   then
+   k KEY-BYTES pl ARENA-OF SAVED MODEL:>KEY kept VEC:PUSH ! ;
+
+\ The scratch arena first, as ARENA:WITH passes it.
+: WALK-IN ( ^ARENA:arena ^planning ^VEC:vector<MODEL:key> -- )
+   {: scratch pl kept :}
+   pl JOURNAL-OF scratch [: pl kept scratch WALK-STEP ;]
+   JOURNAL:EACH-KNOWN-PATH ;
+
+\ The keys of the journal's known paths a pass must decide again, in
+\ byte order; a pass's memory grows with its changes, not the tree.
+: KNOWN-WALK ( ^planning -- ^VEC:vector<MODEL:key> )
+   {: pl :}
+   pl ARENA-OF [type] MODEL:key NEW-VECTOR {: kept :}
+   [: pl kept WALK-IN ;] ARENA:WITH
+   kept ;
+
+: DECIDE-KEPT ( ^planning MODEL:key -- )
+   {: pl k :}
+   pl JOURNAL-OF k pl ARENA-OF JOURNAL:KNOWN-PATH-AT pl KNOWN-PATH ;
 
 : DECISION-CMP ( n n ^VEC:vector<path-decision> -- n )
    {: x:n y:n v :}
@@ -3297,8 +3056,8 @@ ARENA PLANNINGS planning
 
 : DECIDE-ALL ( ^planning -- )
    {: pl :}
-   pl PLANNING-SIDES @ SIDES-UNMAKE {: bs ls rs ps :}
-   bs ls rs ps [: pl KNOWN-PATH ;] FOR-EACH-KNOWN-PATH
+   pl KNOWN-WALK {: kept :}
+   kept VEC:COUNT 0 ?do pl kept i VEC:AT @ DECIDE-KEPT loop
    pl PLANNING-DECISIONS @ {: v :}
    pl ARENA-OF {: ar :}
    ar [type] path-decision NEW-VECTOR {: out :}
@@ -3512,8 +3271,8 @@ ENUM live-step held superseded fresh root-changed ;ENUM
 : NEW-COLLISION
    ( ^planning MODEL:key MODEL:path MODEL:collision -- pass-event )
    {: pl k path col :}
-   pl PLANNING-RUN @ pl PLANNING-SIDES @ path col
-   PREPARE-DIRECTORY-COLLISION MATCH prepared-collision
+   pl PLANNING-RUN @ path col PREPARE-DIRECTORY-COLLISION
+   MATCH prepared-collision
       root-changed OF construct pass-event root-changed ENDOF
       fresh OF construct pass-event fresh ENDOF
       blocked OF
@@ -3564,7 +3323,7 @@ ENUM live-step held superseded fresh root-changed ;ENUM
    pl pd DECISION-KEY UNDER-HELD? if
       pl pd DECISION-KEY HELD+ construct pass-event ok exit
    then
-   pl pd DECISION-KEY FIND-LIVE MATCH option
+   pl pd DECISION-KEY pl ARENA-OF FIND-LIVE MATCH option
       none OF pl pd NEW-DECISION ENDOF
       some OF {: plan :} pl pd pl pd plan LIVE-DECISION AFTER-LIVE ENDOF
    ;MATCH ;
@@ -3601,8 +3360,7 @@ ENUM live-step held superseded fresh root-changed ;ENUM
 \ Rust's reconcile_published from its start to record_reconciliation:
 \ every known path decided and prepared, then the no-ops and plans
 \ recorded together, unless planning ended early.
-: PLAN-PATHS
-   ( ^run ^VEC:vector<MODEL:local-record> -- ^planning pass-event )
+: PLAN-PATHS ( ^run -- ^planning pass-event )
    NEW-PLANNING {: pl :}
    pl DECIDE-ALL
    epoch-seconds pl PLANNING-NOW !
@@ -3641,7 +3399,6 @@ ARENA RUNS run
 STRUCTURE pass DERIVE addr
    FIELD run ^run
    FIELD recovery str
-   FIELD records ^VEC:vector<MODEL:local-record>
    FIELD recovered ^REPLAY:replay-report
    FIELD planning ^planning
    FIELD applied ^REPLAY:replay-report
@@ -3709,13 +3466,7 @@ ENUM pass-state DERIVE eq
 : SCAN-OBSERVED ( LOCAL:scan-publication ^pass -- pass-event )
    {: x :}
    MATCH LOCAL:scan-publication
-      published OF
-         x PASS-RUN @ {: r :}
-         r RUN-JOURNAL @ r RUN-ARENA @ JOURNAL:LOCAL-INVENTORY
-         {: records :}
-         records x PASS-RECORDS !
-         x RESOLVED SCAN-SETTLED
-      ENDOF
+      published OF x RESOLVED SCAN-SETTLED ENDOF
       root-changed OF construct pass-event root-changed ENDOF
    ;MATCH ;
 
@@ -3739,7 +3490,7 @@ ENUM pass-state DERIVE eq
 
 : PLAN ( ^pass -- pass-event )
    {: x :}
-   x PASS-RUN @ x PASS-RECORDS @ PLAN-PATHS {: pl ev :}
+   x PASS-RUN @ PLAN-PATHS {: pl ev :}
    pl x PASS-PLANNING ! ev ;
 
 : FRESH-REQUIRED? ( REPLAY:replay-blocked -- bool )

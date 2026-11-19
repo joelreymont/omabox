@@ -158,12 +158,6 @@ STRUCTURE remote-record
    FIELD observation observation<remote>
 ;STRUCTURE
 
-STRUCTURE baseline-record
-   FIELD key key
-   FIELD path path
-   FIELD baseline baseline
-;STRUCTURE
-
 \ Why a path waits until its cause is retried or cleared (`block-` is an
 \ atom prefix, no family's name); error-tag is Dropbox's, status HTTP's.
 ENUM blockage
