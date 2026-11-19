@@ -35,6 +35,8 @@ require src/lib/error.f
 require src/lib/string.f
 require src/lib/span.f
 require src/lib/byte-buffer.f
+require src/lib/vector.f
+require src/lib/heap.f
 require src/lib/arena.f
 require src/lib/json.f
 require src/lib/fmt.f
@@ -141,24 +143,24 @@ public
 
 \ The buffers are BUF headers in the arena: token holds the refresh token,
 \ access the access token, body a route's JSON body, line a URL or header
-\ line being built, answer the body received, heads its header block,
-\ values the strings decoded from it. holds names what answer holds, for
-\ the log: body, or result once a download's Dropbox-API-Result replaced
-\ it. root-line is the Path-Root header line, empty for none. route names
-\ the request for the log; quiet marks the token route, whose body is
-\ never logged. status is the answer's HTTP status, 0 when curl failed
-\ with failure. outer, leaf-name and leaf are an error body's tags; wait
-\ its retry_after in seconds, -1 for none; correct its correct_offset,
-\ -1 for none; issued a token answer's access_token and granted its
-\ refresh_token. sent holds a listing's cursor, the one sent and then
-\ its page's, and mark the cursor of the last listing that answered done;
-\ page is a page's cursor, more its has_more, got the members an answer
-\ must hold, one bit each; changes and backoff are a long poll's answer.
-\ tagged marks the `.tag` of the union being read: a Metadata entry or an
-\ account's root_info, whose tag is root-tag.
-\ drain takes the reads of a transfer ABANDONED ends; laid out at OPEN
-\ and never grown, so ending a transfer allocates nothing. store and
-\ phase are the config's store and the refresh token's phase.
+\ line being built, answer the body received, heads its header block.
+\ values, a heap vector, holds the strings decoded from it. holds names
+\ what answer holds, for the log: body, or result once a download's
+\ Dropbox-API-Result replaced it. root-line is the Path-Root header line,
+\ empty for none. route names the request for the log; quiet marks the
+\ token route, whose body is never logged. status is the answer's HTTP
+\ status, 0 when curl failed with failure. outer, leaf-name and leaf are
+\ an error body's tags; wait its retry_after in seconds, -1 for none;
+\ correct its correct_offset, -1 for none; issued a token answer's
+\ access_token and granted its refresh_token. sent holds a listing's
+\ cursor, the one sent and then its page's, and mark the cursor of the
+\ last listing that answered done; page is a page's cursor, more its
+\ has_more, got the members an answer must hold, one bit each; changes and
+\ backoff are a long poll's answer. tagged marks the `.tag` of the union
+\ being read: a Metadata entry or an account's root_info, whose tag is
+\ root-tag. drain takes the reads of a transfer ABANDONED ends; laid out
+\ at OPEN and never grown, so ending a transfer allocates nothing. store
+\ and phase are the config's store and the refresh token's phase.
 STRUCTURE client OPAQUE DERIVE addr
    FIELD handle CURL:handle
    FIELD key SPAN:span<u8>
@@ -175,7 +177,7 @@ STRUCTURE client OPAQUE DERIVE addr
    FIELD answer ^n
    FIELD holds SPAN:span<u8>
    FIELD heads ^n
-   FIELD values ^n
+   FIELD values ^VEC:vector<u8>
    FIELD writer JSON:writer
    FIELD cursor JSON:cursor
    FIELD route SPAN:span<u8>
@@ -363,7 +365,7 @@ private
    ar BUFFER c CLIENT-ANSWER !
    s" body" SPAN:MAKE c CLIENT-HOLDS !
    ar BUFFER c CLIENT-HEADS !
-   ar BUFFER c CLIENT-VALUES !
+   HEAP:ALLOCATOR 0 [type] u8 VEC:NEW c CLIENT-VALUES !
    ar BUFFER c CLIENT-SENT !
    ar BUFFER c CLIENT-MARK ! ;
 
@@ -568,17 +570,16 @@ private
    JSON:T-OBJ <> if E-ANSWER throw then ;
 
 
-\ The current string or key decoded into values. PARSES? reserves values
+\ The current string or key decoded into values. READ-ANSWER reserves values
 \ for the whole answer first, so a span taken here never moves.
 : DECODE ( JSON:reader ^client -- JSON:reader SPAN:span<u8> )
    {: c :}
    JSON:READ-TOKEN dup JSON:T-STR = swap JSON:T-KEY = or
    0= if E-ANSWER throw then
-   c CLIENT-VALUES @ {: buf :}
-   buf BLEN {: at:n :}
-   buf JSON:READ-STR-APPEND
-   buf BUF$ {: base:^ end:n :}
-   base at + end at - SPAN:MAKE ;
+   c CLIENT-VALUES @ {: v:^ :}
+   v VEC:COUNT {: at:n :}
+   v JSON:READ-STR-APPEND
+   v VEC:SPAN at SPAN:SKIP ;
 
 
 : STRING ( JSON:reader ^client -- JSON:reader SPAN:span<u8> )
@@ -608,9 +609,9 @@ private
 
 : READ-ANSWER ( ^client [ JSON:reader ^client -- JSON:reader ] -- ^client )
    {: c member :}
-   c CLIENT-VALUES @ {: buf :}
-   buf BUF:CLEAR
-   buf c ANSWER$ nip BUF:N>BLEN BUF:ENSURE
+   c CLIENT-VALUES @ {: v:^ :}
+   v 0 VEC:RESIZE
+   v c ANSWER$ nip VEC:RESERVE
    c CLIENT-CURSOR c ANSWER$ JSON:READ-INIT
    VALUE OBJECT c member MEMBERS
    JSON:READ-FINISH c ;
@@ -1856,7 +1857,7 @@ private
    c CLIENT-LINE @ DISCARD
    c CLIENT-ANSWER @ DISCARD
    c CLIENT-HEADS @ DISCARD
-   c CLIENT-VALUES @ DISCARD
+   c CLIENT-VALUES @ VEC:DELETE
    c CLIENT-SENT @ DISCARD
    c CLIENT-MARK @ DISCARD ;
 
