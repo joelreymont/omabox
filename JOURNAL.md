@@ -1884,3 +1884,48 @@ Observation for the blog: parallel agents turned one probe's side effect
 into a shared outage, the kind of failure a single developer at a
 terminal rarely meets. Each agent's brief now carries limits that one
 person would keep in their head.
+
+## 2026-11-19: data the program never writes
+
+The idle daemon held 544 kB resident in its data region, 306 kB of it
+written. The rest was data the program only reads, held as anonymous
+memory anyway: Habu's boot copied the image's data from the file into a
+fixed anonymous mapping, so every page it copied became the process's
+own. Habu now maps the data from the file and moves that mapping to the
+fixed address with mremap. A page the program never writes stays a clean
+page of the file, which the kernel can share and drop; only a page it
+writes becomes its own. A test builds a program with a 256 kB table it
+only reads and finds at least 128 kB of the data region backed by the
+file; the copying boot gave 0. The daemon itself is not measured yet.
+
+The change took two commits, for the bootstrap reason in the entry
+above: the hb that builds it has the old image writer, so the first
+commit teaches the writer to put the data in the file, and only an hb
+built from it can build the second, whose boot expects the data there.
+One test broke on the way: it read a built program into a fixed 128 kB
+buffer, and the program had grown past it. It now sizes the read from
+the file.
+
+Observation for the blog: Rust gets this for free from the system
+linker and loader: a static's pages come from the file and are copied
+only when written. Habu writes its own images, so it owns that
+property, and here it had to earn it back. In exchange the fix sits in
+code the agent can read and change in the same repository.
+
+## 2026-11-19: a heap error one unused variable could move
+
+Two Habu xml tests died with glibc's "free(): invalid size" on one
+branch and passed on its parent. Adding one unused variable to the parent
+made it fail too, so the failure followed the memory layout, not the
+change. That looks like a flake. The project rule is to name no flake
+until the artifacts prove one, so the hunt went on to the cause: two xml
+trimming words allocated their buffer with mmap and wrote the header of
+Habu's growable buffer, BUF, themselves. BUF judges by a block's size
+whether malloc made it, so a small mmap block reached free(). Another
+agent had fixed the xml words on master the same day; a dot now asks
+that only BUF's own words touch its header.
+
+Observation for the blog: in Rust the header would be private fields,
+and other code could not build one. Habu's packages hide words, not
+memory: a pointer can still write any cell. The checker cannot see this
+bug, so it took a root-cause hunt, not a type error.
