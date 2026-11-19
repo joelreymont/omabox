@@ -1845,3 +1845,42 @@ so a contributor rarely sees it. A self-hosting Habu that agents rebuild
 many times a day meets it whenever a change alters what the compiler
 carries, and the agent has to recognize the failure as a bootstrap order
 and not a bug in the change.
+
+## 2026-11-19: a check written twice
+
+Habu's new HTTPS client got the same check Omabox's tables have: a TLA+
+module, Follows, that requires each step of the model to be a line of the
+code's table. Writing it again for Habu, the condition came out as "every
+step that changes the state, or is one of the machine's own actions". The
+second half was missing from all five of Omabox's Follows modules. They
+required a table line only of a step that changed the state, so a model
+step that kept it, such as a download's `streaming held streaming`, could
+be absent from the code and TLC would still pass.
+
+Each Omabox model now names its machine's actions as one action, Run, and
+Follows requires a table line of every Run step, a step that keeps the
+state included. The caller's and the peer's steps still need none. No
+model step was missing from its table, so the code did not change.
+
+Observation for the blog: the hole was in a check, not in the code, and
+reading the check did not show it; writing it a second time, for another
+machine, did. The Rust original had TLA+ models too, but nothing tied
+them to its code, so there was no such check to get wrong. An agent that
+writes the same proof in two places can compare them, which is cheap once
+the proof is short.
+
+## 2026-11-19: a core dump that stopped every agent
+
+Agents share one 48 GB tmpfs for scratch. A reviewer checking Habu's
+x86-64 boot ran it under qemu-x86_64-static with no loader, as planned,
+and it crashed at address 0, as expected. qemu then wrote a 37 GB core.
+The boot reserves a 256 GiB window for Habu's data, lazily, which costs
+the program nothing; which mappings filled the core was not measured, and
+the window is only the likely source. /tmp filled, and two other lanes
+stopped on "no space left". Deleting the core freed it; every brief now
+starts probes with `ulimit -c 0` and caps scratch size.
+
+Observation for the blog: parallel agents turned one probe's side effect
+into a shared outage, the kind of failure a single developer at a
+terminal rarely meets. Each agent's brief now carries limits that one
+person would keep in their head.
