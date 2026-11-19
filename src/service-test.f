@@ -624,6 +624,21 @@ variable CODE            \ what a recorded drive answered
    RETRY-HELP REFUSED ;
 
 
+\ ---- a_flooding_systemctl_fails_its_wait
+
+\ show writes one byte past what a run keeps of a stream on stdout; stop
+\ does so on stderr.
+: FLOODED ( -- )
+   s" systemctl" s\" head -c 4097 /dev/zero\n" >str SCRIPT UNUSED SCRIPTS {: c :}
+   [: c SERVICE:STATE drop ;] SERVICE:E-WAIT-COMMAND
+   s" `systemctl show` was started but could not be waited for" >str
+   RETRY-HELP REFUSED
+   s" systemctl" s\" head -c 4097 /dev/zero >&2\n" >str SCRIPT drop
+   [: c SERVICE-TEST:SETTLE-STOP ;] SERVICE:E-WAIT-COMMAND
+   s" `systemctl stop` was started but could not be waited for" >str
+   RETRY-HELP REFUSED ;
+
+
 \ ---- formal_holds_the_drive_table
 
 : FORMAL-HOLDS ( -- )
@@ -644,6 +659,7 @@ public
    s" a_systemctl_that_cannot_spawn_has_not_acted" ['] CANNOT-SPAWN RUN-CASE
    s" a_systemctl_that_ran_and_failed_has_acted" ['] RAN-AND-FAILED RUN-CASE
    s" signal_terminated_controls_have_a_distinct_error" ['] SIGNALED RUN-CASE
+   s" a_flooding_systemctl_fails_its_wait" ['] FLOODED RUN-CASE
    s" formal_holds_the_drive_table" ['] FORMAL-HOLDS RUN-CASE
    s" service-test: " type T-CASES FMT:.INT s"  checks" type cr
    T-REPORT ;

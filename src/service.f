@@ -21,20 +21,18 @@
 \ after.
 \ STORAGE CLASS. CALLER-OWNED: commands, with copies of their scripts'
 \ paths, live in the arena the caller passes; a driven record is the
-\ caller's. Each run and each drive owns an arena, released on return,
-\ that holds its descriptors and what the child wrote.
-\ PROCESS-WIDE: FOUND, a program's path as PATH resolves it, and PIPED,
-\ the bytes a child writes while they are read; one run uses them at a
-\ time, on the main thread.
+\ caller's. Each run owns an arena, released on return, that holds what
+\ its child wrote; each drive owns one that holds its state.
+\ PROCESS-WIDE: FOUND, a program's path as PATH resolves it; one run uses
+\ it at a time, on the main thread.
 
 require src/lib/error.f
 require src/lib/string.f
 require src/lib/arena.f
+require src/lib/span.f
 require src/lib/adt/option.f
 require src/lib/log.f
 require src/lib/fd.f
-require src/lib/fs.f
-require src/lib/fs-mutate.f
 require src/lib/spawn.f
 require src/lib/process.f
 require src/lib/process-env.f
@@ -103,9 +101,6 @@ private
 ARENA COMMAND-SETS commands
 
 PATH-CAP BUFFER: FOUND
-DYNAMIC-BUFFER PIPED u8
-variable PIPED-U
-4096 constant CHUNK
 
 
 \ ---- errors
@@ -222,142 +217,60 @@ private
 
 \ ---- running a command
 
-\ stdin/stdout/stderr: inherited own/own/own, quiet own/null/null,
-\ output null/pipe/null, errors null/null/pipe.
 ENUM wiring inherited quiet output errors ;ENUM
 
--1 constant OWN          \ a slot that keeps this process's descriptor
-
-\ A spawned child: its pid, the cell holding its pipe's read end, OWN
-\ for none, what it wrote there, and how it ended.
+\ A child that ran: what it wrote to its piped stream, empty for none,
+\ and how it ended.
 STRUCTURE child DERIVE addr
-   FIELD pid pid
-   FIELD reader ^n
    FIELD out str
    FIELD status PROCESS:status
 ;STRUCTURE
 
 ARENA CHILDREN child
 
-\ A cell holding a descriptor, which the arena closes at its release
-\ unless SHUT closed it first; OWN holds none.
-ARENA HELD n
+\ The bytes a piped stream may hold; a child that writes more fails its
+\ run.
+4096 constant ROOM
 
-: SHUT ( ^n -- )
-   {: c:^ :}
-   c @ 0 < if exit then
-   c @ close  OWN c ! ;
-
-: HELD-CELL ( ^ARENA:arena -- ^n )
-   [: SHUT ;] HELD-NEW-DISPOSE {: c:^ :}
-   OWN c ! c ;
-
-\ The cell is made before the descriptor, so none opens unheld.
-: DEV-NULL ( ^ARENA:arena -- n )
-   HELD-CELL {: c:^ :}
-   s" /dev/null" >str FS:OPEN-RDWR-NOFOLLOW FD>N c !
-   c @ ;
-
-\ A pipe's read end and write end, each held.
-: CHANNEL ( ^ARENA:arena -- ^n ^n )
-   {: ar :}
-   ar HELD-CELL ar HELD-CELL {: r:^ w:^ :}
-   FD:PIPE FD>N w ! FD>N r !
-   r w ;
-
-\ The child's fd slot is the parent's fd, unless OWN keeps this
-\ process's.
-: PLACE ( PROCESS:request n n -- PROCESS:request )
-   {: slot:n parent:n :}
-   parent 0 < if exit then
-   slot >FD parent >FD PROCESS:FD ;
-
-: SPAWN-WITH ( launch [ PROCESS:request -- PROCESS:request ] n n n -- pid )
-   {: l args in:n out:n err:n :}
-   l REQUEST args execute
-   0 in PLACE  1 out PLACE  2 err PLACE
-   PROCESS:SPAWN ;
-
-: STARTED ( pid ^n ^child -- )
-   {: p r:^ k :}
-   p k CHILD-PID !
-   r k CHILD-READER ! ;
-
-: INHERITED ( launch [ PROCESS:request -- PROCESS:request ] ^ARENA:arena ^child -- )
-   {: l args ar k :}
-   ar HELD-CELL {: r:^ :}
-   l args OWN OWN OWN SPAWN-WITH r k STARTED ;
-
-: QUIET ( launch [ PROCESS:request -- PROCESS:request ] ^ARENA:arena ^child -- )
-   {: l args ar k :}
-   ar DEV-NULL {: z:n :}
-   ar HELD-CELL {: r:^ :}
-   l args OWN z z SPAWN-WITH r k STARTED ;
-
-\ The parent closes its write end once the child holds one, so reading
-\ ends when the child's copy closes.
-: OUTPUT ( launch [ PROCESS:request -- PROCESS:request ] ^ARENA:arena ^child -- )
-   {: l args ar k :}
-   ar DEV-NULL {: z:n :}
-   ar CHANNEL {: r:^ w:^ :}
-   l args z w @ z SPAWN-WITH r k STARTED
-   w SHUT ;
-
-: ERRORS ( launch [ PROCESS:request -- PROCESS:request ] ^ARENA:arena ^child -- )
-   {: l args ar k :}
-   ar DEV-NULL {: z:n :}
-   ar CHANNEL {: r:^ w:^ :}
-   l args z z w @ SPAWN-WITH r k STARTED
-   w SHUT ;
-
-: SPAWNED ( launch [ PROCESS:request -- PROCESS:request ] wiring ^ARENA:arena ^child -- )
-   {: l args w ar k :}
-   l args ar k
+: STREAMS ( wiring SPAN:span<u8> -- PROCESS:stdio PROCESS:stdio PROCESS:stdio )
+   {: w room :}
    w MATCH wiring
-      inherited OF INHERITED ENDOF
-      quiet OF QUIET ENDOF
-      output OF OUTPUT ENDOF
-      errors OF ERRORS ENDOF
+      inherited OF
+         PROCESS-STDIO:INHERIT PROCESS-STDIO:INHERIT PROCESS-STDIO:INHERIT
+      ENDOF
+      quiet OF
+         PROCESS-STDIO:INHERIT PROCESS-STDIO:NULL PROCESS-STDIO:NULL
+      ENDOF
+      output OF
+         PROCESS-STDIO:NULL room PROCESS-STDIO:PIPE PROCESS-STDIO:NULL
+      ENDOF
+      errors OF
+         PROCESS-STDIO:NULL PROCESS-STDIO:NULL room PROCESS-STDIO:PIPE
+      ENDOF
    ;MATCH ;
 
-\ What the child writes to the pipe until its end, copied into the arena;
-\ a failed read is E-FS-IO.
-: DRAINED ( n ^ARENA:arena -- str )
-   {: r:n ar :}
-   0 PIPED-U !
-   begin
-      PIPED-U @ CHUNK + PIPED-RESERVE
-      r PIPED-U @ PIPED CHUNK read dup 0 > while
-      PIPED-U +!
-   repeat
-   0 < if E-FS-IO throw then
-   ar PIPED-U @ ARENA:ALLOC {: d:^ du:n :}
-   0 PIPED d du BYTE-COPY
-   d du >str ;
-
-: DRAIN ( ^child ^ARENA:arena -- )
-   {: k ar :}
-   k CHILD-READER @ {: r:^ :}
-   r @ 0 < if s" " >str k CHILD-OUT ! exit then
-   r @ ar DRAINED k CHILD-OUT !
-   r SHUT ;
-
-\ The wait runs whatever the read did, so no child is left unreaped.
-: COLLECT ( ^child ^ARENA:arena -- )
-   {: k ar :}
-   [: k ar DRAIN ;] catch {: code:n :}
-   k CHILD-PID @ PROCESS:WAIT k CHILD-STATUS !
-   code 0<> if code throw then ;
+\ The room is taken before the request is built, so a failed allocation
+\ leaves no request unfreed.
+: ENDED ( launch [ PROCESS:request -- PROCESS:request ] wiring ^ARENA:arena ^child -- )
+   {: l args w ar k :}
+   ar ROOM ARENA:ALLOC {: room:^ ru:n :}
+   l REQUEST args execute
+   w room ru SPAN:MAKE STREAMS PROCESS:RUN {: o:len e:len s :}
+   s k CHILD-STATUS !
+   \ At most one stream is piped.
+   room o LEN>N e LEN>N + >str k CHILD-OUT ! ;
 
 \ Rust's run. A failure before the child runs logs E-START-COMMAND for
 \ name, one after it E-WAIT-COMMAND.
 : RAN ( launch [ PROCESS:request -- PROCESS:request ] wiring ^u8 n ^ARENA:arena -- ^child )
    {: l args w name:^ nu:n ar :}
    ar CHILDREN-NEW {: k :}
-   [: l args w ar k SPAWNED ;] catch {: code:n :}
-   code 0<> if name nu START-FAILED then
-   [: k ar COLLECT ;] catch {: again:n :}
-   again 0<> if name nu WAIT-FAILED then
+   [: l args w ar k ENDED ;] catch {: code:n :}
+   code 0<> if
+      code E-PROC-OUTPUT = code E-PROC-WAIT = or
+      code E-PROC-STDOUT-CAPACITY = or code E-PROC-STDERR-CAPACITY = or
+      if name nu WAIT-FAILED else name nu START-FAILED then
+   then
    k ;
 
 : STATUS@ ( ^child -- PROCESS:status ) CHILD-STATUS @ ;
@@ -461,8 +374,7 @@ ARENA HELD n
    c SYSTEMCTL@
    [: s" list-units" VERB s" --all" PROCESS:ARG
       s" --plain" PROCESS:ARG s" --no-legend" PROCESS:ARG UNIT+ ;]
-   construct wiring output ar k SPAWNED
-   k ar COLLECT ;
+   construct wiring output ar k ENDED ;
 
 \ Rust's unloaded: systemd confirms the unit is not loaded; a list-units
 \ that fails to run or reports a failure confirms nothing.
