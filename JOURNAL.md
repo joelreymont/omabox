@@ -1796,3 +1796,52 @@ it is an error, so every call hands it back. The loader caught the
 design's mistake before any test ran, as Rust's compiler catches a bad
 borrow; the price is a scan in the stack effect of every word it passes
 through.
+
+## 2026-11-19: a statement a catch cannot hold
+
+The scan record from the last entry met the walk's error handling. The
+walk caught each entry's failure, published the entry as unknown and went
+on, and the first plan ran each entry inside a catch with the scan on the
+stack beneath it. The worker stopped before writing it: Habu's manual
+says a linear value cannot cross a catch, because a throw restores the
+stack's depth but not its contents. After a throw the slot may hold a
+statement the caught code already finalized.
+
+So the walk changed shape. Only the filesystem steps, which never touch
+the scan, run inside a catch; each answers 0 or an error code, and the
+word that writes the scan decides from that value. The root's own failure
+still throws, because reconcile waits for it by name.
+
+Checking that rule turned up a gap in Habu. Its checker accepts a word
+that reads a handle after a catch whose body consumed it, both directly
+and through a helper that wraps the catch; the manual says both are
+refused. That is now a Habu dot with a root-cause lane.
+
+Observation for the blog: this is the shape the Rust original had all
+along. Each step returned a `Result`, `?` passed errors up, and an error
+dropped what it held on the way out. The Habu port first reached for
+throw and catch, Forth's habit, and the linear type pushed it back to
+errors as values. The difference is in what checks it: Rust's borrow
+checker has no gap here, while Habu's rule was written down before its
+checker enforced every case of it.
+
+## 2026-11-19: a compiler that could not build its own master
+
+Habu's master moved its Linux layout constants into a package. The hb
+binary the lanes were using could not build that master: hb carries the
+list of files its boot loads, and the old list loaded the new package
+without the file that gives its names their old, bare spelling. The
+build died on the first bare name.
+
+Habu's bootstrap notes describe the remedy, a stage: build, with the old
+hb, a revision that adds the new boot list but does not need it yet, then
+build master with that stage. Here that meant a throwaway revision with
+two added rows and an empty file. The master built with the stage then
+rebuilt itself byte for byte.
+
+Observation for the blog: Rust bootstraps the same way (stage0 builds
+stage1, stage1 builds stage2), but rustup ships stage0 prebuilt and pinned,
+so a contributor rarely sees it. A self-hosting Habu that agents rebuild
+many times a day meets it whenever a change alters what the compiler
+carries, and the agent has to recognize the failure as a bootstrap order
+and not a bug in the change.
