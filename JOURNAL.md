@@ -2082,3 +2082,35 @@ mutably while that borrow is still live. Habu's spans carry no lifetime,
 so the defect lived until a library made emptied memory read as zeros.
 The test that caught it was already there; the old buffer's leftover
 bytes were what made it pass.
+
+## 2026-11-19: what libcurl's resend was hiding
+
+The Dropbox client moved from libcurl to HTTPC, Habu's own HTTPS client.
+HTTPC writes a request at most once. A request lost on a reused connection
+comes back as a lost answer, which Omabox already classifies: a read is
+retried, a mutation is refused as unverified. libcurl instead sends
+the request again when a reused connection closes before any answer byte.
+
+After the move, the Dropbox test file failed about once in 40 runs with 20
+running in parallel. Master, still on libcurl, failed 0 of 40 under the
+same load. The first guess was the fake server's one-second idle limit:
+under load the api connection sat 818 to 994 ms quiet before one
+get_metadata, so the server's idle close could cross the request. Raising
+the limit refuted half of the guess, since a download case still failed.
+Its handler sent a whole answer, then closed the connection without saying
+`Connection: close`. HTTPC judged the connection reusable, and the next
+case's request could reach the server before the close, which discarded
+it. A 300 ms wait before that close made the failure certain, 3 runs of 3;
+adding the header made all 3 pass. Both were test-fake bugs from the fake's
+first commit, and libcurl's resend had hidden both.
+
+Observations for the blog:
+- A client that quietly resends hides protocol mistakes in the test
+  doubles around it. Swapping in one that never resends turned two latent
+  fake-server bugs into flaky runs.
+- Each experiment was a scratch copy of the tree with one line changed,
+  and twenty parallel runs took about 16 seconds. Refuting a hypothesis
+  cost a minute, which made "measure it" the cheap option.
+- The idle race exists in production too: Dropbox can close a kept
+  connection just as a request crosses it. That case lands in the lost
+  answer classes the daemon already handles, not in a new code path.
