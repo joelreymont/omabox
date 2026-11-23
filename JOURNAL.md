@@ -2193,14 +2193,17 @@ validation runs once per session, not per pass. Across the phases:
   handshake. An idle pass opens one or two sessions.
 
 Observations for the blog:
-- Most of the difference is a trade the rewrite made on purpose. Rust
-  held the tree in memory. Habu keeps a pass's memory proportional to
-  its changes: the scan goes through SQLite, and the certificate chain
-  is freed after each handshake. That is how the idle daemon gets to
-  2.27 MB private, and it costs CPU on every pass. systemd's memory
-  peaks, page cache included, put Rust at 47 MB and Habu at 28 to 33 MB.
-- The rest is the JSON reader. Omabox moves to Habu's JSON values once
-  they land, and the decode cost is to be measured again then.
+- I first called most of the difference a trade made on purpose: Rust
+  held the tree in memory, while Habu keeps a pass's memory in
+  proportion to its changes, staging the scan in SQLite and freeing the
+  certificate chain after each handshake. The user answered that we are
+  not three times better than Rust while being three times slower. The
+  only memory figure both daemons have, systemd's peak with page cache,
+  is 47 MB for Rust and 28 to 33 MB for Habu: not three times. Rust's
+  private memory was never measured.
+- Both daemons repeat the whole pass every 44 s over a tree that did not
+  change. The better question is how to avoid that work, not how to do
+  it faster.
 - Without perf or valgrind on the machine, a clock read at phase
   boundaries was enough. The fine split inflated the pass from 0.63 to
   0.88 s, so its shares were scaled back to the coarse total.

@@ -1,11 +1,9 @@
 ---
-title: Decode a journal record at the cost of its parse
-status: open
+title: Make an idle pass cheaper than Rust's
+status: active
 priority: 2
 issue-type: task
 created-at: "2026-11-23T12:07:23.654389+02:00"
-blocks:
-  - omabox-read-omabox-s-3a2e750e
 ---
 
-Problem: an idle pass over 16,217 entries costs 0.92 s of CPU live, three times the Rust daemon's 0.31 s over 17,939. A third of it is decoding 64,000 journal records per pass with Habu's JSON cursor reader, about 4.3 us each; Rust decodes more records per entry, faster. The rest traces to the bounded-memory design (the scan staged in SQLite, the trust chain parsed per TLS session) or matches Rust's own cost (the walk). Acceptance: with Omabox reading JSON as Habu's JSON values, an idle pass is timed by phase again, and decoding a record costs no more than parsing it does on its own. Depends: omabox-read-omabox-s-3a2e750e. Claim: unassigned.
+Problem: every 44 s, after the long poll comes back empty, a pass walks the whole tree (16,220 entries, 3,459 directories), stages it in SQLite and decides every known path again, decoding its records: 0.92 s of CPU live, 2.1% of a core, with nothing to do. The Rust daemon did the same work in memory for 0.31 s. Local changes wait for the long poll to come back before any pass sees them. The user, 2026-11-23: "we are not 3 times better than rust while being 3 times slower". Acceptance: a pass with nothing changed costs less CPU than the Rust daemon's 0.31 s on this machine, measured live, and the idle daemon's private memory stays within today's 2.27 MB. Depends: none. Claim: agent=bob design=Plan.
