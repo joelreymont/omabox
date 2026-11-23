@@ -2114,3 +2114,48 @@ Observations for the blog:
 - The idle race exists in production too: Dropbox can close a kept
   connection just as a request crosses it. That case lands in the lost
   answer classes the daemon already handles, not in a new code path.
+
+## 2026-11-23: a heap that was full of nothing
+
+With libcurl gone, the idle daemon held 3.5 MB of private memory. Its C
+heap was 2.2 MB, and every page of it was resident. The first guess was
+the system's root certificates, which each TLS connection parses. A
+sandboxed harness of the daemon's three connections refuted it: the
+certificates are freed right after each handshake, and only 80 to 170 kB
+of the heap stayed in use. The rest was freed memory that glibc kept.
+
+A `malloc_trim(0)` before each long poll and sleep changed nothing on
+the live daemon: 1744 kB of heap, 1744 kB resident. A second harness ran
+the daemon's real pass loop over 16,000 empty files against the test
+fake and found three causes, none of them in our logic:
+- Arch builds SQLite with secure delete, so clearing the temporary scan
+  tables each pass first copied every page into the in-memory journal:
+  a 3.4 MB peak, 0.33 MB with secure delete off for the temporary
+  database alone.
+- The Dropbox client's buffer for parsed answers kept the size of the
+  largest answer it ever read, 972 kB after one 16,000-entry listing page.
+- glibc 2.43 on aarch64 grows and trims the heap only in 2 MiB steps,
+  even on a kernel without transparent huge pages, and `malloc_trim`
+  leaves the freed top of the heap alone. Freed memory under 2 MiB at the
+  top stays resident for good. A report with a reproducer went to
+  libc-alpha.
+
+After the first two fixes the live daemon holds 2.27 MB private: 1040 kB
+resident of a 1920 kB heap, 656 kB of library data, 480 kB of Habu's own
+mappings and 96 kB of stack.
+
+Observations for the blog:
+- "Resident" and "in use" are different numbers, and only a harness with
+  the allocator's own counters can tell them apart. The live process,
+  which we may not attach to, shows only the first.
+- Both heap sizes on the live daemon ran exactly from where the heap
+  started to the next 2 MiB boundary. Two sizes that matched an alignment
+  rule rather than any workload were the clue that the allocator, not
+  the program, set them.
+- One probe of mine "proved" that malloc_trim released memory. Its
+  printf allocated a buffer above the freed blocks, so they were no
+  longer the heap's top. A measurement that allocates can change what
+  it measures.
+- Two of the three causes were build choices of the platform (SQLite's
+  secure delete, glibc's huge page default). Neither shows in the code;
+  both show in a measurement.
