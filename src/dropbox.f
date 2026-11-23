@@ -578,10 +578,12 @@ private
    JSON:T-OBJ-END <> if E-ANSWER throw then ;
 
 
+\ Each answer's values get a block of their own, so the room a large answer
+\ took is freed with the next.
 : READ-ANSWER ( ^client [ JSON:reader ^client -- JSON:reader ] -- ^client )
    {: c member :}
-   c CLIENT-VALUES @ {: v:^ :}
-   v 0 VEC:RESIZE
+   HEAP:ALLOCATOR 0 [type] u8 VEC:NEW {: v:^ :}
+   c CLIENT-VALUES @ VEC:DELETE  v c CLIENT-VALUES !
    v c ANSWER$ nip VEC:RESERVE
    c CLIENT-CURSOR c ANSWER$ JSON:READ-INIT
    VALUE OBJECT c member MEMBERS
