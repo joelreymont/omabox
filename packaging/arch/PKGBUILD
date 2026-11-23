@@ -10,7 +10,7 @@ depends=(glibc libmbedtls.so=23-64 libmbedx509.so=9-64 libtfpsacrypto.so=2-64
 makedepends=(git)
 # Habu's programs have no section headers to strip or split.
 options=(!strip !debug)
-_habu=6c0d2f62a05cf20ec58d0a356cd1d2e409bf9623
+_habu=37e207b0f73dbb6e342a13e1c4f0fac479742113
 source=("omabox::git+https://github.com/joelreymont/omabox.git#tag=v$pkgver"
         "habu::git+https://github.com/joelreymont/habu.git#commit=$_habu")
 sha256sums=(SKIP SKIP)

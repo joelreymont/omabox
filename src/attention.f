@@ -54,13 +54,13 @@ STRUCTURE entry
    FIELD detail str
 ;STRUCTURE
 
-: NOT-SET-UP$ ( -- ^u8 n )
+: NOT-SET-UP$ ( -- str )
    s\" Omabox is not set up; run `omabox setup [REMOTE_ROOT]`.\n" ;
 
-: NOTHING$ ( -- ^u8 n )
+: NOTHING$ ( -- str )
    s\" Omabox has no recorded work needing attention.\n" ;
 
-: HEADER$ ( -- ^u8 n ) s\" Omabox status:\n" ;
+: HEADER$ ( -- str ) s\" Omabox status:\n" ;
 
 
 \ ---- failures ------------------------------------------------------
@@ -100,18 +100,18 @@ STRUCTURE entry
 
 \ JOURNAL's or SQLITE's code is E-JOURNAL's, logged with the operation
 \ that failed; any other goes on.
-: CAUGHT ( n ^u8 n -- )
-   {: code:n op:^ ou:n :}
+: CAUGHT ( n str -- )
+   {: code:n op:str :}
    code JOURNAL-CODE? 0= if code throw then
-   LOG-OPEN s" could not " LOG:TEXT+ op ou LOG:TEXT+
+   LOG-OPEN s" could not " LOG:TEXT+ op LOG:TEXT+
    E-JOURNAL 0 HELPED ;
 
 \ Runs step; its failure is op's.
-: GUARDED ( [ -- ] ^u8 n -- )
-   {: step op:^ ou:n :}
+: GUARDED ( [ -- ] str -- )
+   {: step op:str :}
    step catch {: code:n :}
    code 0= if exit then
-   code op ou CAUGHT ;
+   code op CAUGHT ;
 
 
 \ ---- setup state ---------------------------------------------------
@@ -150,38 +150,40 @@ ARENA SLOTS JOURNAL:journal
 \ ---- text pieces ---------------------------------------------------
 
 \ a then b, laid in the arena.
-: CAT ( ^u8 n ^u8 n ^ARENA:arena -- str )
-   {: a:^ u:n b:^ v:n ar :}
+: CAT ( str str ^ARENA:arena -- str )
+   {: x:str y:str ar :}
+   x str> {: a:^ u:n :}
+   y str> {: b:^ v:n :}
    ar u v + ARENA:ALLOC drop {: dst:^ :}
    a dst u BYTE-COPY
    b dst u + v BYTE-COPY
    dst u v + >str ;
 
-: NUMBERED ( ^u8 n n ^ARENA:arena -- str )
-   {: a:^ u:n k:n ar :}
-   a u k FMT:INT$ ar CAT ;
+: NUMBERED ( str n ^ARENA:arena -- str )
+   {: a:str k:n ar :}
+   a k FMT:INT$ ar CAT ;
 
 : BLOCKAGE$ ( MODEL:blockage ^ARENA:arena -- str )
    {: why ar :}
    why MATCH MODEL:blockage
       unsupported-file-size OF
-         s" file exceeds the supported Dropbox upload size" >str ENDOF
+         s" file exceeds the supported Dropbox upload size" ENDOF
       remote-rejected OF {: tag:str :}
-         s" Dropbox rejected the path (" tag str> ar CAT str>
+         s" Dropbox rejected the path (" tag ar CAT
          s" )" ar CAT ENDOF
       download-unavailable OF {: st:n :}
          s" Dropbox download returned HTTP " st ar NUMBERED ENDOF
       download-verification-failed OF
-         s" Dropbox download did not match its recorded identity" >str
+         s" Dropbox download did not match its recorded identity"
       ENDOF
       stage-occupied OF
-         s" unrelated data occupies the private staging path" >str ENDOF
+         s" unrelated data occupies the private staging path" ENDOF
       local-object-in-way OF
-         s" a local object blocks the download path" >str ENDOF
+         s" a local object blocks the download path" ENDOF
       remote-object OF
-         s" a Dropbox object blocks the file path" >str ENDOF
+         s" a Dropbox object blocks the file path" ENDOF
       conflict-copy-occupied OF
-         s" another file holds this path's conflict copy name" >str ENDOF
+         s" another file holds this path's conflict copy name" ENDOF
    ;MATCH ;
 
 
@@ -189,10 +191,11 @@ ARENA SLOTS JOURNAL:journal
 
 : SHOWN ( MODEL:path ^ARENA:arena -- str )
    {: path ar :}
-   path MODEL:PATH>STR str> {: p:^ u:n :}
-   u 0= if s" ." >str exit then
-   p c@ SLASH = if s" (invalid synchronized path)" >str exit then
-   p u >str ar UTF8-LOSSY:REPAIR ;
+   path MODEL:PATH>STR {: s:str :}
+   s str> {: p:^ u:n :}
+   u 0= if s" ." exit then
+   p c@ SLASH = if s" (invalid synchronized path)" exit then
+   s ar UTF8-LOSSY:REPAIR ;
 
 : ENTRY+ ( MODEL:path str ^ARENA:arena ^VEC:vector<entry> -- )
    {: path detail:str ar v :}
@@ -224,11 +227,11 @@ ARENA SLOTS JOURNAL:journal
    {: ops ar :}
    ops PENDING-COUNT {: k:n :}
    k 0= if
-      s" pending sync: completion is awaiting journal recovery" >str
+      s" pending sync: completion is awaiting journal recovery"
       exit
    then
-   s" pending sync: " k ar NUMBERED str> s"  remaining; next: " ar CAT
-   str> ops NEXT$ str> ar CAT ;
+   s" pending sync: " k ar NUMBERED s"  remaining; next: " ar CAT
+   ops NEXT$ ar CAT ;
 
 : PENDING+ ( JOURNAL:plan-record ^ARENA:arena ^VEC:vector<entry> -- )
    {: plan ar v :}
@@ -244,7 +247,7 @@ ARENA SLOTS JOURNAL:journal
 
 : BLOCKED-DETAIL ( MODEL:blockage ^ARENA:arena -- str )
    {: why ar :}
-   s" blocked sync: " why ar BLOCKAGE$ str> ar CAT str>
+   s" blocked sync: " why ar BLOCKAGE$ ar CAT
    s" ; retry is scheduled" ar CAT ;
 
 : BLOCKED+ ( JOURNAL:plan-record ^ARENA:arena ^VEC:vector<entry> -- )
@@ -267,13 +270,13 @@ ARENA SLOTS JOURNAL:journal
 \ The reason's text after the side's words, when the observation was
 \ unknown.
 : UNKNOWN+
-   ( MODEL:path option<MODEL:unknown-reason> ^u8 n ^ARENA:arena
+   ( MODEL:path option<MODEL:unknown-reason> str ^ARENA:arena
      ^VEC:vector<entry> -- )
-   {: path why side:^ su:n ar v :}
+   {: path why side:str ar v :}
    why MATCH option
       none OF ENDOF
       some OF MODEL:UNKNOWN$ {: t:str :}
-         path side su t str> ar CAT ar v ENTRY+
+         path side t ar CAT ar v ENTRY+
       ENDOF
    ;MATCH ;
 
@@ -321,7 +324,7 @@ ARENA SLOTS JOURNAL:journal
 : RECOVERY+ ( JOURNAL:recovery-record ^ARENA:arena ^VEC:vector<entry> -- )
    {: r ar v :}
    r JOURNAL-RECOVERY--RECORD:UNMAKE {: id op path copy h s kept :}
-   path s" recovery copy is pending" >str ar v ENTRY+ ;
+   path s" recovery copy is pending" ar v ENTRY+ ;
 
 : RECOVERY-ENTRIES
    ( JOURNAL:journal ^ARENA:arena ^VEC:vector<entry> -- )
@@ -360,30 +363,31 @@ ARENA SLOTS JOURNAL:journal
    k 1 > if idx 0 VEC:AT k [: v ENTRY< ;] SORT:SORT! then
    idx ;
 
-\ Copies a u to dst at `at`; answers the index after them.
-: PUT ( n ^u8 n ^u8 -- n )
-   {: at:n a:^ u:n dst:^ :}
+\ Copies s to dst at `at`; answers the index after it.
+: PUT ( n str ^u8 -- n )
+   {: at:n s:str dst:^ :}
+   s str> {: a:^ u:n :}
    a dst at + u BYTE-COPY
    at u + ;
 
 \ "- ", the path, ": ", the detail and a newline.
 : LINE-SIZE ( entry -- n )
    ENTRY-UNMAKE {: k s:str d:str :}
-   s str> nip d str> nip + 5 + ;
+   s STR:len d STR:len + 5 + ;
 
 : LINE! ( n entry ^u8 -- n )
    {: at:n e dst:^ :}
    e ENTRY-UNMAKE {: k s:str d:str :}
-   at s" - " dst PUT s str> dst PUT s" : " dst PUT
-   d str> dst PUT s\" \n" dst PUT ;
+   at s" - " dst PUT s dst PUT s" : " dst PUT
+   d dst PUT s\" \n" dst PUT ;
 
 : SIZE ( ^VEC:vector<entry> -- n )
    {: v :}
-   HEADER$ nip v VEC:COUNT 0 ?do v i VEC:AT @ LINE-SIZE + loop ;
+   HEADER$ STR:len v VEC:COUNT 0 ?do v i VEC:AT @ LINE-SIZE + loop ;
 
 : TEXT ( ^VEC:vector<entry> ^VEC:vector<n> ^ARENA:arena -- str )
    {: v idx out :}
-   v VEC:COUNT 0= if NOTHING$ >str exit then
+   v VEC:COUNT 0= if NOTHING$ exit then
    v SIZE {: size:n :}
    out size ARENA:ALLOC drop {: dst:^ :}
    0 HEADER$ dst PUT
@@ -393,7 +397,7 @@ ARENA SLOTS JOURNAL:journal
 \ The text for a bound journal, laid in out; ar holds the reads.
 : SHOW ( JOURNAL:journal ^ARENA:arena ^ARENA:arena -- str )
    {: j out ar :}
-   j ar SET-UP? 0= if NOT-SET-UP$ >str exit then
+   j ar SET-UP? 0= if NOT-SET-UP$ exit then
    j ar ENTRIES {: v :}
    v v ar ORDERED out TEXT ;
 
@@ -408,7 +412,7 @@ public
 \ The status text for the journal file at path, laid in the arena.
 : RENDER ( str ^ARENA:arena -- str )
    {: path:str out :}
-   path PRESENT? 0= if NOT-SET-UP$ >str exit then
+   path PRESENT? 0= if NOT-SET-UP$ exit then
    path out [: READ ;] ARENA:WITH ;
 
 ;package

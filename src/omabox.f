@@ -97,10 +97,10 @@ public
 private
 
 \ Appends the line and its LF.
-: LINE+ ( ^u8 n -- ) SB-APPEND 10 SB-APPEND-C ;
+: LINE+ ( str -- ) SB-APPEND 10 SB-APPEND-C ;
 
 \ Rust's HELP, with the usage lines of the commands PARSE knows.
-: HELP-TEXT ( -- ^u8 n )
+: HELP-TEXT ( -- str )
    SB-RESET
    s" Omabox synchronizes a local directory with Dropbox." LINE+
    s" " LINE+
@@ -124,7 +124,7 @@ private
    s" requests or stores an app secret." LINE+
    SB$ ;
 
-: VERSION-LINE ( -- ^u8 n )
+: VERSION-LINE ( -- str )
    SB-RESET s" omabox " SB-APPEND RELEASE:VERSION$ LINE+ SB$ ;
 
 \ Rust's Settings { json }: how settings shows the stored settings.
@@ -180,9 +180,9 @@ ARENA JOURNALS JOURNAL:journal
 : LOG-OPEN ( -- ) LOG:ERROR s" omabox" LOG:LINE ;
 
 \ Ends the error's line and opens its help line with the text.
-: HELP ( ^u8 n -- )
-   {: h:^ hu:n :}
-   LOG:;LINE LOG-OPEN s" help: " LOG:TEXT+ h hu LOG:TEXT+ ;
+: HELP ( str -- )
+   {: h:str :}
+   LOG:;LINE LOG-OPEN s" help: " LOG:TEXT+ h LOG:TEXT+ ;
 
 \ Ends Rust's Usage after its fault: the pointer to --help.
 : USAGE-END ( -- )
@@ -190,9 +190,9 @@ ARENA JOURNALS JOURNAL:journal
    LOG:;LINE E-USAGE throw ;
 
 \ Rust's Usage: the fault, then the pointer to --help.
-: USAGE ( ^u8 n -- )
-   {: m:^ mu:n :}
-   LOG-OPEN m mu LOG:TEXT+ USAGE-END ;
+: USAGE ( str -- )
+   {: m:str :}
+   LOG-OPEN m LOG:TEXT+ USAGE-END ;
 
 \ Rust's dropbox_root fault, a Usage.
 : ROOT-FAULT ( -- )
@@ -202,10 +202,10 @@ ARENA JOURNALS JOURNAL:journal
    LOG:TEXT+ s"  parts" LOG:TEXT+ USAGE-END ;
 
 \ Rust's Io for the operation; the cause stays FS:ERRNO's on entry.
-: IO-FAILED ( ^u8 n -- )
-   {: op:^ opu:n :}
+: IO-FAILED ( str -- )
+   {: op:str :}
    FS:ERRNO {: cause:n :}
-   LOG-OPEN s" could not " LOG:TEXT+ op opu LOG:TEXT+
+   LOG-OPEN s" could not " LOG:TEXT+ op LOG:TEXT+
    s" Check the terminal input and output, then retry." HELP
    LOG:;LINE cause FS:CAUSE! E-IO throw ;
 
@@ -215,11 +215,11 @@ ARENA JOURNALS JOURNAL:journal
 
 \ Rust's Config for the operation, after CONFIG's own lines; a code of
 \ another package goes on.
-: CONFIG-FAILED ( n ^u8 n -- )
-   {: code:n op:^ opu:n :}
+: CONFIG-FAILED ( n str -- )
+   {: code:n op:str :}
    code CONFIG-CODE? 0= if code throw then
    FS:ERRNO {: cause:n :}
-   LOG-OPEN s" could not " LOG:TEXT+ op opu LOG:TEXT+
+   LOG-OPEN s" could not " LOG:TEXT+ op LOG:TEXT+
    LOG:;LINE cause FS:CAUSE! code throw ;
 
 : SERIALIZE-FAILED ( -- )
@@ -228,20 +228,20 @@ ARENA JOURNALS JOURNAL:journal
    LOG:;LINE 0 FS:CAUSE! E-SERIALIZE-OUTPUT throw ;
 
 \ Rust's ChangeAndRestore, after the change's lines and the restore's.
-: CHANGE-AND-RESTORE ( ^u8 n -- )
-   {: c:^ cu:n :}
+: CHANGE-AND-RESTORE ( str -- )
+   {: c:str :}
    FS:ERRNO {: cause:n :}
-   LOG-OPEN c cu LOG:TEXT+
+   LOG-OPEN c LOG:TEXT+
    s"  failed, and the Omabox service could not be restarted;"
    LOG:TEXT+
    s"  run `omabox resume` once the errors above are fixed" LOG:TEXT+
    LOG:;LINE cause FS:CAUSE! E-CHANGE-AND-RESTORE throw ;
 
 \ Rust's StartAfterChange for the done text, after the drive's lines.
-: START-AFTER-CHANGE ( ^u8 n -- )
-   {: d:^ du:n :}
+: START-AFTER-CHANGE ( str -- )
+   {: d:str :}
    FS:ERRNO {: cause:n :}
-   LOG-OPEN d du LOG:TEXT+
+   LOG-OPEN d LOG:TEXT+
    s" , but the Omabox service could not be started or checked"
    LOG:TEXT+
    s" The change is kept. Run `omabox status` and `omabox logs` to see why, then `omabox resume`."
@@ -277,10 +277,10 @@ ARENA JOURNALS JOURNAL:journal
 
 \ Rust's Journal for the operation, in place of the code caught,
 \ after the lines its cause logged.
-: JOURNAL-FAILED ( n ^u8 n -- )
-   {: op:^ opu:n :} drop
+: JOURNAL-FAILED ( n str -- )
+   {: op:str :} drop
    FS:ERRNO {: cause:n :}
-   LOG-OPEN s" could not " LOG:TEXT+ op opu LOG:TEXT+
+   LOG-OPEN s" could not " LOG:TEXT+ op LOG:TEXT+
    s" Ensure the Omabox state directory is accessible and retry." HELP
    E-JOURNAL cause FAIL ;
 
@@ -297,15 +297,15 @@ ARENA JOURNALS JOURNAL:journal
    E-NO-DEFAULT-ROOT 0 FAIL ;
 
 : CREATE-ROOT-FAILED ( str n -- )
-   {: root cause:n :}
+   {: root:str cause:n :}
    LOG-OPEN s" could not create the default sync root " LOG:TEXT+
-   root str> LOG:TEXT+
+   root LOG:TEXT+
    s" Create the directory, or pass --sync-root PATH." HELP
    E-CREATE-DEFAULT-ROOT cause FAIL ;
 
 : WIDGET-TAKEN ( str -- )
-   {: link :}
-   LOG-OPEN link str> LOG:TEXT+
+   {: link:str :}
+   LOG-OPEN link LOG:TEXT+
    s"  is not the Omabox widget's link" LOG:TEXT+
    s" Move what is there, then run `omabox setup` again." HELP
    E-WIDGET-TAKEN 0 FAIL ;
@@ -317,9 +317,9 @@ ARENA JOURNALS JOURNAL:journal
    E-NO-HOME 0 FAIL ;
 
 : LINK-FAILED ( str n -- )
-   {: link cause:n :}
+   {: link:str cause:n :}
    LOG-OPEN s" could not link the Omarchy widget at " LOG:TEXT+
-   link str> LOG:TEXT+
+   link LOG:TEXT+
    s" Make ~/.config/omarchy/plugins a writable folder," HELP
    s"  then run `omabox setup` again." LOG:TEXT+
    E-LINK-WIDGET cause FAIL ;
@@ -338,10 +338,10 @@ ARENA JOURNALS JOURNAL:journal
 : DROPBOX-CODE? ( n -- bool ) DROPBOX:E-FIRST DROPBOX:E-LAST IN? ;
 
 \ Rust's Auth for the operation, after the lines its cause logged.
-: AUTH-FAILED ( ^u8 n -- )
-   {: op:^ opu:n :}
+: AUTH-FAILED ( str -- )
+   {: op:str :}
    FS:ERRNO {: cause:n :}
-   LOG-OPEN s" could not " LOG:TEXT+ op opu LOG:TEXT+
+   LOG-OPEN s" could not " LOG:TEXT+ op LOG:TEXT+
    s" Check the network connection and Dropbox app key," HELP
    s"  then retry setup." LOG:TEXT+
    E-AUTH cause FAIL ;
@@ -365,9 +365,9 @@ ARENA JOURNALS JOURNAL:journal
    E-DROPBOX cause FAIL ;
 
 \ Rust's line for a remote root LINK refused, then VALIDATE-FAILED.
-: ROOT-REFUSED ( ^u8 n -- )
-   {: m:^ mu:n :}
-   LOG-OPEN s" configured Dropbox root " LOG:TEXT+ m mu LOG:TEXT+
+: ROOT-REFUSED ( str -- )
+   {: m:str :}
+   LOG-OPEN s" configured Dropbox root " LOG:TEXT+ m LOG:TEXT+
    LOG:;LINE VALIDATE-FAILED ;
 
 : ACCOUNT-CHANGED ( -- )
@@ -404,77 +404,77 @@ ARENA JOURNALS JOURNAL:journal
 \ ---- output
 
 \ A closed reader refuses the write rather than ending the process.
-: WRITE-FULL ( ^u8 n -- )
-   {: a:^ u:n :}
-   FD:STDOUT [: FD:STDOUT a u FD:WRITE-FULL ;] FD:WITH-NOSIGPIPE ;
+: WRITE-FULL ( str -- )
+   {: s:str :}
+   FD:STDOUT [: FD:STDOUT s FD:WRITE-FULL ;] FD:WITH-NOSIGPIPE ;
 
-: WRITE-OUT ( ^u8 n -- )
-   {: a:^ u:n :}
-   [: a u WRITE-FULL ;] catch {: code:n :}
+: WRITE-OUT ( str -- )
+   {: s:str :}
+   [: s WRITE-FULL ;] catch {: code:n :}
    code 0<> if s" write command output" IO-FAILED then ;
 
 \ The text, then the leftovers' lines, with SIGPIPE held off.
-: REPORT-FULL ( ^u8 n ^VEC:vector<STALE:leftover> -- )
-   {: a:^ u:n left :}
+: REPORT-FULL ( str ^VEC:vector<STALE:leftover> -- )
+   {: s:str left :}
    FD:STDOUT [:
-      FD:STDOUT a u FD:WRITE-FULL
+      FD:STDOUT s FD:WRITE-FULL
       left FD:STDOUT STALE:REPORT
    ;] FD:WITH-NOSIGPIPE ;
 
-: REPORT-OUT ( ^u8 n ^VEC:vector<STALE:leftover> -- )
-   {: a:^ u:n left :}
-   [: a u left REPORT-FULL ;] catch {: code:n :}
+: REPORT-OUT ( str ^VEC:vector<STALE:leftover> -- )
+   {: s:str left :}
+   [: s left REPORT-FULL ;] catch {: code:n :}
    code 0<> if s" write command output" IO-FAILED then ;
 
 
 \ ---- parsing
 
-: HELP? ( ^u8 n -- bool )
-   {: a:^ u:n :}
-   a u s" --help" STR= a u s" -h" STR= or a u s" help" STR= or ;
+: HELP? ( str -- bool )
+   {: a:str :}
+   a s" --help" STR= a s" -h" STR= or a s" help" STR= or ;
 
-: VERSION? ( ^u8 n -- bool )
-   {: a:^ u:n :}
-   a u s" --version" STR= a u s" -V" STR= or ;
+: VERSION? ( str -- bool )
+   {: a:str :}
+   a s" --version" STR= a s" -V" STR= or ;
 
 : ACTION-COMMAND ( SERVICE:action -- option<command> )
    COMMAND-SERVICE OPTION:SOME ;
 
 \ The command a name alone selects, none for one that takes arguments
 \ or is unknown.
-: ALONE ( ^u8 n -- option<command> )
-   {: a:^ u:n :}
-   a u HELP? if construct command help OPTION:SOME exit then
-   a u VERSION? if construct command version OPTION:SOME exit then
-   a u s" pause" STR= if
+: ALONE ( str -- option<command> )
+   {: a:str :}
+   a HELP? if construct command help OPTION:SOME exit then
+   a VERSION? if construct command version OPTION:SOME exit then
+   a s" pause" STR= if
       SERVICE-ACTION:STOP ACTION-COMMAND exit
    then
-   a u s" resume" STR= if
+   a s" resume" STR= if
       SERVICE-ACTION:START ACTION-COMMAND exit
    then
-   a u s" status" STR= if construct command status OPTION:SOME exit then
-   a u s" logs" STR= if construct command logs OPTION:SOME exit then
+   a s" status" STR= if construct command status OPTION:SOME exit then
+   a s" logs" STR= if construct command logs OPTION:SOME exit then
    OPTION:NONE ;
 
 \ Rust's parse_service's action; bytes that are not UTF-8 name none.
-: ACTION ( ^u8 n -- SERVICE:action )
-   {: a:^ u:n :}
-   a u s" start" STR= if SERVICE-ACTION:START exit then
-   a u s" stop" STR= if SERVICE-ACTION:STOP exit then
-   a u s" restart" STR= if SERVICE-ACTION:RESTART exit then
-   a u s" enable" STR= if SERVICE-ACTION:ENABLE exit then
-   a u s" disable" STR= if SERVICE-ACTION:DISABLE exit then
-   a u s" status" STR= if SERVICE-ACTION:STATUS exit then
+: ACTION ( str -- SERVICE:action )
+   {: a:str :}
+   a s" start" STR= if SERVICE-ACTION:START exit then
+   a s" stop" STR= if SERVICE-ACTION:STOP exit then
+   a s" restart" STR= if SERVICE-ACTION:RESTART exit then
+   a s" enable" STR= if SERVICE-ACTION:ENABLE exit then
+   a s" disable" STR= if SERVICE-ACTION:DISABLE exit then
+   a s" status" STR= if SERVICE-ACTION:STATUS exit then
    s" unknown service action" USAGE ;
 
-: PARSE-SERVICE ( n [ n -- ^u8 n ] -- command )
+: PARSE-SERVICE ( n [ n -- str ] -- command )
    {: argc:n arg :}
    argc 2 <> if s" service requires exactly one action" USAGE then
    1 arg execute ACTION COMMAND-SERVICE ;
 
 \ Rust's parse_settings; set-root takes its path as any bytes, as
 \ PathBuf::from does.
-: PARSE-SETTINGS ( n [ n -- ^u8 n ] -- command )
+: PARSE-SETTINGS ( n [ n -- str ] -- command )
    {: argc:n arg :}
    argc 1 = if construct form text COMMAND-SETTINGS exit then
    argc 2 = if
@@ -484,7 +484,7 @@ ARENA JOURNALS JOURNAL:journal
    then
    argc 3 = if
       1 arg execute s" set-root" STR= if
-         2 arg execute >str COMMAND-SET-ROOT exit
+         2 arg execute COMMAND-SET-ROOT exit
       then
    then
    s" invalid settings command" USAGE ;
@@ -500,25 +500,25 @@ ARENA JOURNALS JOURNAL:journal
    ;MATCH ;
 
 \ Rust's is_option.
-: OPTION-ARG? ( ^u8 n -- bool ) 2 min s" --" STR= ;
+: OPTION-ARG? ( str -- bool ) s" --" STARTS-WITH? ;
 
 \ Rust's utf8: the bytes, or Usage with the fault m.
-: VALID-ARG ( ^u8 n ^u8 n -- str )
-   {: a:^ u:n m:^ mu:n :}
-   a u UTF8:VALID? 0= if m mu USAGE then
-   a u >str ;
+: VALID-ARG ( str str -- str )
+   {: a:str m:str :}
+   a UTF8:VALID? 0= if m USAGE then
+   a ;
 
 \ Rust's dropbox_root, refused before setup sends the user through the
 \ browser.
-: REMOTE-ROOT ( ^u8 n -- str )
+: REMOTE-ROOT ( str -- str )
    s" the Dropbox root must be valid UTF-8" VALID-ARG {: r :}
-   r str> DROPBOX:ROOT-PATH? 0= if ROOT-FAULT then
+   r DROPBOX:ROOT-PATH? 0= if ROOT-FAULT then
    r ;
 
 : NO-STR ( -- option<str> ) OPTION:NONE ;
 
 \ The value after the option at index at.
-: VALUE ( n [ n -- ^u8 n ] n -- ^u8 n )
+: VALUE ( n [ n -- str ] n -- str )
    {: argc:n arg at:n :}
    at 1+ argc >= if s" a setup option is missing its value" USAGE then
    at 1+ arg execute ;
@@ -534,26 +534,26 @@ ARENA JOURNALS JOURNAL:journal
 
 \ The option at index at and its value taken into the sync root, app
 \ key and remote root given so far.
-: STEP ( option<str> option<str> option<str> n [ n -- ^u8 n ] n
+: STEP ( option<str> option<str> option<str> n [ n -- str ] n
      -- option<str> option<str> option<str> )
    {: sync key remote argc:n arg at:n :}
-   at arg execute {: o:^ ou:n :}
-   o ou UTF8:VALID? 0= if s" setup options must be valid UTF-8" USAGE then
-   o ou s" --sync-root" STR= if
-      sync UNSET argc arg at VALUE >str OPTION:SOME key remote exit
+   at arg execute {: o:str :}
+   o UTF8:VALID? 0= if s" setup options must be valid UTF-8" USAGE then
+   o s" --sync-root" STR= if
+      sync UNSET argc arg at VALUE OPTION:SOME key remote exit
    then
-   o ou s" --app-key" STR= if
+   o s" --app-key" STR= if
       key UNSET sync argc arg at VALUE
       s" the Dropbox app key must be valid UTF-8" VALID-ARG OPTION:SOME
       remote exit
    then
-   o ou s" --remote-root" STR= if
+   o s" --remote-root" STR= if
       remote UNSET sync key argc arg at VALUE REMOTE-ROOT OPTION:SOME exit
    then
    s" unknown setup option" USAGE ;
 
 \ The sync root, app key and remote root the options from index 1 give.
-: SETUP-FLAGS ( n [ n -- ^u8 n ] -- option<str> option<str> option<str> )
+: SETUP-FLAGS ( n [ n -- str ] -- option<str> option<str> option<str> )
    {: argc:n arg :}
    NO-STR NO-STR NO-STR
    argc 1 ?do argc arg i STEP 2 +loop ;
@@ -566,7 +566,7 @@ ARENA JOURNALS JOURNAL:journal
    ;MATCH {: k :}
    remote MATCH option
       some OF ENDOF
-      none OF s" " >str ENDOF
+      none OF s" " ENDOF
    ;MATCH
    sync k INITIAL-CONFIG-MAKE OPTION:SOME SETUP-OPTIONS-MAKE ;
 
@@ -576,9 +576,9 @@ ARENA JOURNALS JOURNAL:journal
 : STORED-SETUP ( str -- setup-options ) NO-INITIAL SETUP-OPTIONS-MAKE ;
 
 \ Rust's parse_setup over the whole argument list, index 0 being setup.
-: PARSE-SETUP ( n [ n -- ^u8 n ] -- setup-options )
+: PARSE-SETUP ( n [ n -- str ] -- setup-options )
    {: argc:n arg :}
-   argc 1 = if s" " >str STORED-SETUP exit then
+   argc 1 = if s" " STORED-SETUP exit then
    argc 2 = if
       1 arg execute OPTION-ARG? 0= if
          1 arg execute REMOTE-ROOT STORED-SETUP exit
@@ -587,17 +587,17 @@ ARENA JOURNALS JOURNAL:journal
    argc arg SETUP-FLAGS FLAGGED ;
 
 \ Rust's parse over argc arguments, arg answering the one at an index.
-: PARSE ( n [ n -- ^u8 n ] -- command )
+: PARSE ( n [ n -- str ] -- command )
    {: argc:n arg :}
    argc 0= if s" a command is required" USAGE then
-   0 arg execute {: c:^ cu:n :}
-   c cu UTF8:VALID? 0= if
+   0 arg execute {: c:str :}
+   c UTF8:VALID? 0= if
       s" the command must be valid UTF-8" USAGE
    then
-   c cu s" settings" STR= if argc arg PARSE-SETTINGS exit then
-   c cu s" service" STR= if argc arg PARSE-SERVICE exit then
-   c cu s" setup" STR= if argc arg PARSE-SETUP COMMAND-SETUP exit then
-   c cu ALONE argc SOLE ;
+   c s" settings" STR= if argc arg PARSE-SETTINGS exit then
+   c s" service" STR= if argc arg PARSE-SERVICE exit then
+   c s" setup" STR= if argc arg PARSE-SETUP COMMAND-SETUP exit then
+   c ALONE argc SOLE ;
 
 
 \ ---- the configuration
@@ -609,17 +609,17 @@ ARENA JOURNALS JOURNAL:journal
    code 0= if x exit then
    code s" resolve XDG paths" CONFIG-FAILED ;
 
-: DOCUMENT ( ^CONFIG:xdg ^u8 n ^ARENA:arena -- ^CONFIG:document )
-   {: x op:^ opu:n ar :}
+: DOCUMENT ( ^CONFIG:xdg str ^ARENA:arena -- ^CONFIG:document )
+   {: x op:str ar :}
    NULL-PTR [: drop x ar CONFIG:DOCUMENT-LOAD-FROM ;] catch {: d code :}
    code 0= if d exit then
-   code op opu CONFIG-FAILED ;
+   code op CONFIG-FAILED ;
 
-: STATE-PATHS ( ^CONFIG:xdg ^u8 n ^ARENA:arena -- ^CONFIG:paths )
-   {: x op:^ opu:n ar :}
+: STATE-PATHS ( ^CONFIG:xdg str ^ARENA:arena -- ^CONFIG:paths )
+   {: x op:str ar :}
    NULL-PTR [: drop x ar CONFIG:RESOLVE-PRIVATE ;] catch {: p code :}
    code 0= if p exit then
-   code op opu CONFIG-FAILED ;
+   code op CONFIG-FAILED ;
 
 \ Rust's unusable_root_line: CONFIG logs its refusal of the stored root,
 \ which leaves the command's text standing; any other code goes on.
@@ -633,17 +633,19 @@ ARENA JOURNALS JOURNAL:journal
 \ ---- status and settings
 
 \ The bytes copied into the arena.
-: KEPT ( ^u8 n ^ARENA:arena -- str )
-   {: a:^ u:n ar :}
+: KEPT ( str ^ARENA:arena -- str )
+   {: s:str ar :}
+   s str> {: a:^ u:n :}
    ar u ARENA:ALLOC {: d:^ du:n :}
    a d u BYTE-COPY
    d du >str ;
 
-\ The str s, then the bytes, copied into the arena as KEPT copies; s
+\ The str s, then the str t, copied into the arena as KEPT copies; s
 \ stays as it was.
-: FOLLOWED ( str ^u8 n ^ARENA:arena -- str )
-   {: s a:^ u:n ar :}
+: FOLLOWED ( str str ^ARENA:arena -- str )
+   {: s:str t:str ar :}
    s str> {: sa:^ su:n :}
+   t str> {: a:^ u:n :}
    ar su u + ARENA:ALLOC drop {: d:^ :}
    sa d su BYTE-COPY
    a d su + u BYTE-COPY
@@ -661,35 +663,30 @@ ARENA JOURNALS JOURNAL:journal
 : SETTINGS-LINES ( ^CONFIG:document ^ARENA:arena -- str )
    {: d ar :}
    s" Sync root: " ar KEPT
-   d CONFIG:DOCUMENT-ROOT CONFIG:ABS-PATH>STR str> ar FOLLOWED
+   d CONFIG:DOCUMENT-ROOT CONFIG:ABS-PATH>STR ar FOLLOWED
    S\" \nDropbox app key: " ar FOLLOWED
-   d CONFIG:DOCUMENT-KEY str> ar FOLLOWED S\" \n" ar FOLLOWED ;
+   d CONFIG:DOCUMENT-KEY ar FOLLOWED S\" \n" ar FOLLOWED ;
 
 : SETTINGS-FIELDS ( ^CONFIG:document ^JSON:writer -- )
    {: d w :}
    w 2 JSON:WRITE-INDENT! JSON:WRITE-OBJECT-START
-   s" sync_root" d CONFIG:DOCUMENT-ROOT CONFIG:ABS-PATH>STR str>
+   s" sync_root" d CONFIG:DOCUMENT-ROOT CONFIG:ABS-PATH>STR
    JSON:WRITE-FIELD-S JSON:WRITE-COMMA
-   s" dropbox_app_key" d CONFIG:DOCUMENT-KEY str> JSON:WRITE-FIELD-S
+   s" dropbox_app_key" d CONFIG:DOCUMENT-KEY JSON:WRITE-FIELD-S
    JSON:WRITE-OBJECT-END drop ;
 
 \ serde_json's to_string_pretty of the document, then LF; text that
 \ is not UTF-8 is Rust's SerializeOutput.
 : SETTINGS-JSON ( ^CONFIG:document ^ARENA:arena -- str )
    {: d ar :}
-   \ Every byte escaped to six fits.
-   d CONFIG:DOCUMENT-ROOT CONFIG:ABS-PATH>STR str> nip
-   d CONFIG:DOCUMENT-KEY str> nip + 6 * 64 + {: cap:n :}
-   ar cap 1+ ARENA:ALLOC drop {: buf:^ :}
-   ar WRITERS-NEW {: w :}
-   w buf cap JSON:WRITE-OPEN drop
+   ar ARENA:ALLOCATOR 0 [type] u8 VEC:NEW {: v :}
+   ar WRITERS-NEW v JSON:OPEN {: w :}
    [: d w SETTINGS-FIELDS ;] catch {: code:n :}
    code E-JSON-WRITE-BYTE = if SERIALIZE-FAILED then
    code 0<> if code throw then
-   w JSON:WRITTEN$ {: r:^ ru:n :}
-   w JSON:WRITE-CLOSE
-   10 r ru + c!
-   r ru 1+ >str ;
+   w JSON:CLOSE
+   10 v VEC:PUSH c!
+   v VEC:SPAN SPAN:$ ;
 
 \ Rust's settings_output: the stored settings, as text or JSON.
 : SETTINGS-TEXT ( ^CONFIG:xdg form ^ARENA:arena -- str )
@@ -736,46 +733,46 @@ ARENA JOURNALS JOURNAL:journal
 
 \ The change may fix the fatal cause of a unit the release left failed:
 \ unless the restore launched it, a recover drive answers whether it did.
-: RECOVERED ( ^SERVICE:commands bool ^u8 n ^ARENA:arena -- bool )
-   {: c launched:bool d:^ du:n ar :}
+: RECOVERED ( ^SERVICE:commands bool str ^ARENA:arena -- bool )
+   {: c launched:bool d:str ar :}
    launched if false exit then
    ar DRIVENS-NEW {: v :}
    c SERVICE-GOAL:RECOVER v SERVICE:DRIVE-RECORDED
-   0<> if d du START-AFTER-CHANGE then
+   0<> if d START-AFTER-CHANGE then
    v SERVICE-DRIVEN:LAUNCHED @ ;
 
-: NOTE ( bool -- ^u8 n )
+: NOTE ( bool -- str )
    if s"  The stopped service has been started again." exit then s" " ;
 
 \ "{done}.{note}", LF and the leftovers' lines on stdout, the text
 \ built in ar.
-: DONE-OUT ( ^u8 n bool ^VEC:vector<STALE:leftover> ^ARENA:arena -- )
-   {: d:^ du:n recovered:bool left ar :}
-   d du ar KEPT s" ." ar FOLLOWED recovered NOTE ar FOLLOWED
-   S\" \n" ar FOLLOWED str> left REPORT-OUT ;
+: DONE-OUT ( str bool ^VEC:vector<STALE:leftover> ^ARENA:arena -- )
+   {: d:str recovered:bool left ar :}
+   d ar KEPT s" ." ar FOLLOWED recovered NOTE ar FOLLOWED
+   S\" \n" ar FOLLOWED left REPORT-OUT ;
 
 \ Rust's match on the change's outcome and the restore's: c the
 \ commands, n the change's name, d its done text.
-: DECIDED ( ^SERVICE:commands ^u8 n ^u8 n
+: DECIDED ( ^SERVICE:commands str str
      ^VEC:vector<STALE:leftover> n bool n ^ARENA:arena -- )
-   {: c n:^ nu:n d:^ du:n left changed:n
+   {: c n:str d:str left changed:n
       launched:bool restored:n ar :}
-   changed 0<> restored 0<> and if n nu CHANGE-AND-RESTORE then
+   changed 0<> restored 0<> and if n CHANGE-AND-RESTORE then
    changed 0<> if changed throw then
-   restored 0<> if d du START-AFTER-CHANGE then
-   c launched d du ar RECOVERED {: recovered:bool :}
-   d du recovered left ar DONE-OUT ;
+   restored 0<> if d START-AFTER-CHANGE then
+   c launched d ar RECOVERED {: recovered:bool :}
+   d recovered left ar DONE-OUT ;
 
 \ Rust's change_while_released: releases the unit, runs the change
 \ named n, restores the unit; d states the finished change.
-: RELEASED ( ^SERVICE:commands ^u8 n ^u8 n
+: RELEASED ( ^SERVICE:commands str str
      [ ^ARENA:arena -- ^VEC:vector<STALE:leftover> ] ^ARENA:arena -- )
-   {: c n:^ nu:n d:^ du:n change ar :}
+   {: c n:str d:str change ar :}
    ar DRIVENS-NEW {: v :}
    c SERVICE-GOAL:RELEASE v SERVICE:DRIVE-RECORDED
    change ar CHANGED {: left changed:n :}
    c v ar RESTORED {: launched:bool restored:n :}
-   c n nu d du left changed launched restored ar DECIDED ;
+   c n d left changed launched restored ar DECIDED ;
 
 
 \ ---- setup's local steps
@@ -810,10 +807,10 @@ ARENA JOURNALS JOURNAL:journal
    a c@ [char] / = ;
 
 \ dir/name, joined as PathBuf::join: no second separator.
-: IN-DIR ( str ^u8 n ^ARENA:arena -- str )
-   {: d name:^ nu:n ar :}
+: IN-DIR ( str str ^ARENA:arena -- str )
+   {: d:str name:str ar :}
    d d str> + 1- c@ [char] / <> if s" /" ar FOLLOWED then
-   name nu ar FOLLOWED ;
+   name ar FOLLOWED ;
 
 \ The home where it is absolute; fail, which throws, refuses a missing
 \ or relative one.
@@ -821,15 +818,15 @@ ARENA JOURNALS JOURNAL:journal
    {: home fail :}
    home MATCH option
       some OF ENDOF
-      none OF s" " >str ENDOF
+      none OF s" " ENDOF
    ;MATCH {: h :}
    h ABSOLUTE? 0= if fail execute then
    h ;
 
 \ HOME from the environment, none where unset.
 : HOME-ENV ( -- option<str> )
-   s" HOME" GETENV {: a:^ u:n :}
-   a NULL-PTR = if NO-STR else a u >str OPTION:SOME then ;
+   s" HOME" GETENV {: h:str :}
+   h str> drop NULL-PTR = if NO-STR else h OPTION:SOME then ;
 
 \ The directory made 0700, under the umask; an entry already there
 \ stays, as Rust's AlreadyExists does.
@@ -859,7 +856,7 @@ ARENA JOURNALS JOURNAL:journal
    code STAT-CAUSE ;
 
 \ The widget the package installs.
-: WIDGET ( -- ^u8 n ) s" /usr/share/omabox/omarchy/plugins/local.omabox" ;
+: WIDGET ( -- str ) s" /usr/share/omabox/omarchy/plugins/local.omabox" ;
 
 \ Omarchy's plugins folder under the home: Omarchy reads $HOME/.config,
 \ never XDG_CONFIG_HOME (omarchy-plugin-add:14).
@@ -873,7 +870,7 @@ ARENA JOURNALS JOURNAL:journal
 : WIDGET-THERE? ( str ^ARENA:arena -- bool )
    {: link ar :}
    link ar CONFIG:READLINK MATCH option
-      some OF str> WIDGET STR= 0= if link WIDGET-TAKEN then true ENDOF
+      some OF WIDGET STR= 0= if link WIDGET-TAKEN then true ENDOF
       none OF false ENDOF
    ;MATCH if true exit then
    FS:ERRNO FS:EINVAL = if link WIDGET-TAKEN then
@@ -883,7 +880,7 @@ ARENA JOURNALS JOURNAL:journal
 \ The folders to dir and the widget's link at link, made.
 : WIDGET-MADE ( str str -- )
    {: dir link :}
-   [: dir FS:MAKE-DIRS WIDGET >str link FS:MAKE-SYMLINK ;] catch
+   [: dir FS:MAKE-DIRS WIDGET link FS:MAKE-SYMLINK ;] catch
    {: code:n :}
    code 0<> if link code FS-CAUSE LINK-FAILED then ;
 
@@ -926,11 +923,12 @@ ARENA JOURNALS JOURNAL:journal
 
 \ Rust's str::trim: the bytes inside the leading and trailing Unicode
 \ White_Space.
-: TRIMMED ( ^u8 n -- ^u8 n )
-   {: a:^ u:n :}
+: TRIMMED ( str -- str )
+   {: s:str :}
+   s str> {: a:^ u:n :}
    u 0 0 begin dup u < while
       {: start:n end:n at:n :}
-      a u at UTF8:NEXT MATCH UTF8:scalar-step
+      s at UTF8:NEXT MATCH UTF8:scalar-step
          scalar OF {: cp:n next:n :}
             cp UNICODE-CLASS:WHITE-SPACE? if start end next
             else start at min next next then
@@ -938,8 +936,8 @@ ARENA JOURNALS JOURNAL:journal
          raw-byte OF {: byte:n next:n :} start at min next next ENDOF
       ;MATCH
    repeat drop {: start:n end:n :}
-   start end >= if a 0 exit then
-   a start + end start - ;
+   start end >= if a 0 >str exit then
+   a start + end start - >str ;
 
 \ Rust's read_authorization_code: one line of at most CODE-LIMIT bytes
 \ and its LF, read from f and trimmed.
@@ -948,10 +946,12 @@ ARENA JOURNALS JOURNAL:journal
    ar CODE-LIMIT 1+ ARENA:ALLOC drop {: b:^ :}
    f b CODE-LIMIT 1+ READ-LINE {: u:n :}
    u CODE-LIMIT 1+ = if b u + 1- c@ 10 <> if INVALID-CODE then then
-   b u UTF8:VALID? 0= if INVALID-CODE then
-   b u TRIMMED {: c:^ cu:n :}
+   b u >str {: line:str :}
+   line UTF8:VALID? 0= if INVALID-CODE then
+   line TRIMMED {: c:str :}
+   c STR:len {: cu:n :}
    cu 0= cu CODE-LIMIT > or if INVALID-CODE then
-   c cu >str ;
+   c ;
 
 \ Rust's InstanceLock::acquire for the paths.
 : LOCKED ( ^CONFIG:paths ^ARENA:arena -- CONFIG:lock )
@@ -1000,11 +1000,11 @@ ARENA JOURNALS JOURNAL:journal
 
 \ Rust's Journal::open of the file p, failing as Journal for the
 \ operation.
-: JOURNAL-OPENED ( str ^u8 n ^ARENA:arena -- JOURNAL:journal )
-   {: p op:^ opu:n ar :}
+: JOURNAL-OPENED ( str str ^ARENA:arena -- JOURNAL:journal )
+   {: p op:str ar :}
    ar JOURNALS-NEW {: slot :}
    [: p JOURNAL:OPEN slot ! ;] catch {: code:n :}
-   code 0<> if code op opu JOURNAL-FAILED then
+   code 0<> if code op JOURNAL-FAILED then
    slot @ ;
 
 \ The replacement written over config.toml: the stale temporaries the
@@ -1048,17 +1048,17 @@ ARENA JOURNALS JOURNAL:journal
 
 \ Rust's Config::from_values of the root and key, failing as Config for
 \ the operation.
-: VALIDATED ( ^CONFIG:xdg str str ^u8 n ^ARENA:arena -- ^CONFIG:config )
-   {: x root key op:^ opu:n ar :}
+: VALIDATED ( ^CONFIG:xdg str str str ^ARENA:arena -- ^CONFIG:config )
+   {: x root key op:str ar :}
    NULL-PTR [: drop x root key ar CONFIG:FROM-VALUES ;] catch {: c code :}
    code 0= if c exit then
-   code op opu CONFIG-FAILED ;
+   code op CONFIG-FAILED ;
 
 \ "Omabox sync root is now {root}", kept in the arena.
 : ROOT-DONE ( ^CONFIG:config ^ARENA:arena -- str )
    {: r ar :}
    s" Omabox sync root is now " ar KEPT
-   r CONFIG:SYNC-ROOT CONFIG:ABS-PATH>STR str> ar FOLLOWED ;
+   r CONFIG:SYNC-ROOT CONFIG:ABS-PATH>STR ar FOLLOWED ;
 
 \ Rust's set_sync_root: the root validated against the stored config,
 \ then changed while the service c is released.
@@ -1069,7 +1069,7 @@ ARENA JOURNALS JOURNAL:journal
    x root d CONFIG:DOCUMENT-KEY s" validate the new sync root" ar
    VALIDATED {: r :}
    r ar ROOT-DONE {: done :}
-   c s" the sync-root change" done str> [: p r rot CHANGE-ROOT ;] ar
+   c s" the sync-root change" done [: p r rot CHANGE-ROOT ;] ar
    RELEASED ;
 
 
@@ -1078,7 +1078,7 @@ ARENA JOURNALS JOURNAL:journal
 \ AUTH:START for the app key k, Rust's Auth starting authorization.
 : STARTED ( str ^ARENA:arena -- ^AUTH:pending )
    {: k ar :}
-   NULL-PTR [: drop k str> ar AUTH:START ;] catch {: p code:n :}
+   NULL-PTR [: drop k ar AUTH:START ;] catch {: p code:n :}
    code 0= if p exit then
    code AUTH-CODE? 0= if code throw then
    s" start Dropbox authorization" AUTH-FAILED ;
@@ -1087,7 +1087,10 @@ ARENA JOURNALS JOURNAL:journal
 : PROMPT ( ^AUTH:pending ^ARENA:arena -- )
    {: p ar :}
    S\" Open this URL in a browser:\n" ar KEPT p AUTH:URL ar FOLLOWED
-   S\" \n\nPaste the authorization code: " ar FOLLOWED str> WRITE-OUT ;
+   S\" \n\nPaste the authorization code: " ar FOLLOWED WRITE-OUT ;
+
+\ The token store of a client that keeps nothing.
+: KEEP-NONE ( str -- ) drop ;
 
 \ A client for the app key k on Dropbox's origins: no token yet, the
 \ account's own root, and a store that keeps nothing.
@@ -1096,14 +1099,14 @@ ARENA JOURNALS JOURNAL:journal
    ar CLIENT-CONFIGS-NEW {: cfg :}
    cfg DROPBOX:PRODUCTION
    k str> SPAN:MAKE cfg DROPBOX-CONFIG:KEY !
-   s" " SPAN:MAKE cfg DROPBOX-CONFIG:TOKEN !
-   [: 2drop ;] cfg DROPBOX-CONFIG:STORE !
-   s" " SPAN:MAKE cfg DROPBOX-CONFIG:ROOT !
+   s" " str> SPAN:MAKE cfg DROPBOX-CONFIG:TOKEN !
+   [: KEEP-NONE ;] cfg DROPBOX-CONFIG:STORE !
+   s" " str> SPAN:MAKE cfg DROPBOX-CONFIG:ROOT !
    cfg ar DROPBOX:OPEN ;
 
 : EXCHANGE-DONE ( str ^AUTH:pending ^DROPBOX:client -- )
    {: ac p cl :}
-   ac str> p AUTH:VERIFIER cl DROPBOX:EXCHANGE DROPBOX:DONE?
+   ac p AUTH:VERIFIER cl DROPBOX:EXCHANGE DROPBOX:DONE?
    if exit then
    NOT-ISSUED EXCHANGE-FAILED ;
 
@@ -1117,7 +1120,7 @@ ARENA JOURNALS JOURNAL:journal
 
 : LINK-CHECKED ( str ^DROPBOX:client ^ARENA:arena -- )
    {: r cl ar :}
-   r str> cl ar DROPBOX:LINK MATCH DROPBOX:root-check
+   r cl ar DROPBOX:LINK MATCH DROPBOX:root-check
       valid OF ENDOF
       failed OF drop VALIDATE-FAILED ENDOF
       unbound OF ACCOUNT-CHANGED ENDOF
@@ -1140,7 +1143,7 @@ ARENA JOURNALS JOURNAL:journal
 \ in a; the token is copied, as CLOSE discards the client's.
 : KEEP-LOGIN ( str ^DROPBOX:client ^authorized ^ARENA:arena -- )
    {: r cl a ar :}
-   cl DROPBOX:ACCOUNT-ID >str cl DROPBOX:ROOT-NAMESPACE >str
+   cl DROPBOX:ACCOUNT-ID cl DROPBOX:ROOT-NAMESPACE
    r JOURNAL-DROPBOX--BINDING:MAKE a AUTHORIZED-BINDING !
    cl DROPBOX:REFRESH-TOKEN ar KEPT a AUTHORIZED-REFRESH-TOKEN ! ;
 
@@ -1313,9 +1316,9 @@ ARENA PRIORS prior
    cmd MATCH command
       help OF HELP-TEXT WRITE-OUT ENDOF
       version OF VERSION-LINE WRITE-OUT ENDOF
-      status OF ar XDG ar STATUS-TEXT str> WRITE-OUT ENDOF
+      status OF ar XDG ar STATUS-TEXT WRITE-OUT ENDOF
       settings OF
-         {: f :} ar XDG f ar SETTINGS-TEXT str> WRITE-OUT
+         {: f :} ar XDG f ar SETTINGS-TEXT WRITE-OUT
       ENDOF
       set-root OF
          {: root :} root ar XDG ar SERVICE:COMMANDS ar SET-ROOT

@@ -250,11 +250,11 @@ private
 : CASE-JOURNAL ( ^ARENA:arena -- str JOURNAL:journal )
    {: ar :}
    s" reconcile-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
-   SB-RESET d str> SB-APPEND s" /journal.sqlite3" SB-APPEND
+   SB-RESET d SB-APPEND s" /journal.sqlite3" SB-APPEND
    d SB$ ar COPIED JOURNAL:OPEN ;
 
 : GONE ( str JOURNAL:journal -- )
-   JOURNAL:CLOSE str> FS:REMOVE-TREE ;
+   JOURNAL:CLOSE FS:REMOVE-TREE ;
 
 : ACTIVATED-BINDING
    ( JOURNAL:local-root-activation -- JOURNAL:local-root-binding )
@@ -292,20 +292,20 @@ private
    [: d j j d ar ROOTED body execute ;] [: d j GONE ;] finally ;
 
 \ Rust's CanonicalPath::from_display of the bytes.
-: CANONICAL ( ^u8 n ^ARENA:arena -- MODEL:key )
-   {: p:^ u:n ar :}
-   p u DISPLAY ar MODEL:FOLD ;
+: CANONICAL ( str ^ARENA:arena -- MODEL:key )
+   {: p:str ar :}
+   p DISPLAY ar MODEL:FOLD ;
 
 \ Rust's identity: dropbox_content_hash of the bytes, from a pipe.
-: IDENTITY ( ^u8 n ^ARENA:arena -- DROPBOX:hash )
-   {: b:^ u:n ar :}
+: IDENTITY ( str ^ARENA:arena -- DROPBOX:hash )
+   {: b:str ar :}
    FD:PIPE {: r:fd w:fd :}
-   w b u FD:WRITE-FULL w FS:CLOSE-DIR
+   w b FD:WRITE-FULL w FS:CLOSE-DIR
    r ar LOCAL:DROPBOX-CONTENT-HASH r FS:CLOSE-DIR ;
 
-: REMOTE-FILE ( ^u8 n ^u8 n ^ARENA:arena -- MODEL:remote )
-   {: b:^ u:n r:^ ru:n ar :}
-   b u ar IDENTITY r ru >str DROPBOX:>REV MODEL-REMOTE:MAKE ;
+: REMOTE-FILE ( str str ^ARENA:arena -- MODEL:remote )
+   {: b:str r:str ar :}
+   b ar IDENTITY r DROPBOX:>REV MODEL-REMOTE:MAKE ;
 
 : LOCAL-RECORDS ( ^ARENA:arena -- ^VEC:vector<MODEL:local-record> )
    ARENA:ALLOCATOR 0 [type] MODEL:local-record VEC:NEW ;
@@ -339,32 +339,32 @@ private
    MODEL-OBSERVATION:ABSENT ;
 
 : LOCAL+
-   ( ^VEC:vector<MODEL:local-record> ^u8 n
+   ( ^VEC:vector<MODEL:local-record> str
      MODEL:observation<MODEL:local> -- )
-   {: v p:^ u:n o :}
-   p u DISPLAY o MODEL-LOCAL--RECORD:MAKE v VEC:PUSH ! ;
+   {: v p:str o :}
+   p DISPLAY o MODEL-LOCAL--RECORD:MAKE v VEC:PUSH ! ;
 
 \ Rust's local_records: a directory at the path.
-: DIRECTORY+ ( ^VEC:vector<MODEL:local-record> ^u8 n -- )
+: DIRECTORY+ ( ^VEC:vector<MODEL:local-record> str -- )
    LOCAL-DIRECTORY LOCAL+ ;
 
 \ Rust's unsupported_records: unknown unsupported at the path.
-: UNSUPPORTED+ ( ^VEC:vector<MODEL:local-record> ^u8 n -- )
+: UNSUPPORTED+ ( ^VEC:vector<MODEL:local-record> str -- )
    MODEL-UNKNOWN--REASON:UNSUPPORTED LOCAL-UNKNOWN LOCAL+ ;
 
 \ Rust's present_locally.
 : PRESENT+
-   ( ^VEC:vector<MODEL:local-record> ^u8 n ^u8 n ^ARENA:arena -- )
-   {: v p:^ u:n b:^ bu:n ar :}
-   v p u b bu ar IDENTITY MODEL-LOCAL:MAKE LOCAL-PRESENT
+   ( ^VEC:vector<MODEL:local-record> str str ^ARENA:arena -- )
+   {: v p:str b:str ar :}
+   v p b ar IDENTITY MODEL-LOCAL:MAKE LOCAL-PRESENT
    LOCAL+ ;
 
 \ Rust's remote_side for one record.
 : REMOTE+
-   ( ^VEC:vector<MODEL:remote-record> ^u8 n
+   ( ^VEC:vector<MODEL:remote-record> str
      MODEL:observation<MODEL:remote> ^ARENA:arena -- )
-   {: v p:^ u:n o ar :}
-   p u ar CANONICAL p u DISPLAY o MODEL-REMOTE--RECORD:MAKE
+   {: v p:str o ar :}
+   p ar CANONICAL p DISPLAY o MODEL-REMOTE--RECORD:MAKE
    v VEC:PUSH ! ;
 
 \ The records published as the journal's local inventory and its remote
@@ -375,7 +375,7 @@ private
      [ JOURNAL:journal -- ] ^ARENA:arena -- )
    {: d:str j b ls rs body ar :}
    j b ls ar LOCALS-PUBLISHED
-   j s" cursor" >str DROPBOX:>CURSOR rs JOURNAL:PUBLISH-REMOTE-INVENTORY
+   j s" cursor" DROPBOX:>CURSOR rs JOURNAL:PUBLISH-REMOTE-INVENTORY
    j body execute ;
 
 \ The body runs on a rooted case journal holding the records as its
@@ -423,16 +423,16 @@ private
       some OF REMOTE-OBSERVATION ENDOF
    ;MATCH ;
 
-: LOCAL-UNOBSERVED= ( JOURNAL:journal ^u8 n
+: LOCAL-UNOBSERVED= ( JOURNAL:journal str
      MODEL:observation<MODEL:local> ^ARENA:arena -- )
-   {: j p:^ u:n want ar :}
-   j p u ar CANONICAL ar LOCAL-UNOBSERVED want MODEL:LOCAL-OBSERVATION=
+   {: j p:str want ar :}
+   j p ar CANONICAL ar LOCAL-UNOBSERVED want MODEL:LOCAL-OBSERVATION=
    TTRUE ;
 
-: REMOTE-UNOBSERVED= ( JOURNAL:journal ^u8 n
+: REMOTE-UNOBSERVED= ( JOURNAL:journal str
      MODEL:observation<MODEL:remote> ^ARENA:arena -- )
-   {: j p:^ u:n want ar :}
-   j p u ar CANONICAL ar REMOTE-UNOBSERVED want
+   {: j p:str want ar :}
+   j p ar CANONICAL ar REMOTE-UNOBSERVED want
    MODEL:REMOTE-OBSERVATION= TTRUE ;
 
 \ A plan of the one operation, or of two.
@@ -512,8 +512,9 @@ variable SEED
    33 rshift swap mod ;
 
 \ n random bytes of the alphabet, in the arena.
-: SAMPLE ( ^u8 n n ^ARENA:arena -- str )
-   {: a:^ au:n k:n ar :}
+: SAMPLE ( str n ^ARENA:arena -- str )
+   {: s:str k:n ar :}
+   s str> {: a:^ au:n :}
    ar k ARENA:ALLOC drop {: dst:^ :}
    k 0 ?do a au RANDOM + c@ dst i + c! loop
    dst k >str ;
@@ -521,9 +522,9 @@ variable SEED
 \ ---- known paths: cases ---------------------------------------------
 
 : RESPELLED
-   ( JOURNAL:journal ^u8 n ^u8 n ^ARENA:arena -- ^u8 n )
-   {: j p:^ u:n q:^ w:n ar :}
-   j p u ar CANONICAL q w DISPLAY ar SPELL-WITH-LOCAL-ANCESTORS PATH$ ;
+   ( JOURNAL:journal str str ^ARENA:arena -- str )
+   {: j p:str q:str ar :}
+   j p ar CANONICAL q DISPLAY ar SPELL-WITH-LOCAL-ANCESTORS PATH$ ;
 
 : RESPELLINGS ( JOURNAL:journal ^ARENA:arena -- )
    {: j ar :}
@@ -545,20 +546,20 @@ variable SEED
    rs ar REMOTE-RECORDS [: ar RESPELLINGS ;] ar WITH-SIDES ;
 
 \ The text a pass logs for a collision of the two spellings.
-: COLLISION$ ( ^u8 n ^u8 n -- ^u8 n )
-   {: a:^ au:n b:^ bu:n :}
-   SB-RESET s" local paths `" SB-APPEND a au SB-APPEND
-   s" ` and `" SB-APPEND b bu SB-APPEND
+: COLLISION$ ( str str -- str )
+   {: a:str b:str :}
+   SB-RESET s" local paths `" SB-APPEND a SB-APPEND
+   s" ` and `" SB-APPEND b SB-APPEND
    s" ` have the same Dropbox path identity" SB-APPEND SB$ ;
 
 \ What q writes to fd 2, captured in the case's directory d, in the
 \ arena.
-: LOGGED ( str [ -- ] ^ARENA:arena -- ^u8 n )
+: LOGGED ( str [ -- ] ^ARENA:arena -- str )
    {: d:str q ar :}
-   SB-RESET d str> SB-APPEND s" /stderr.txt" SB-APPEND
-   q SB$ ar COPIED ar STDERR:CAPTURING str> {: code:n t:^ u:n :}
+   SB-RESET d SB-APPEND s" /stderr.txt" SB-APPEND
+   q SB$ ar COPIED ar STDERR:CAPTURING {: code:n t:str :}
    code 0<> if code throw then
-   t u ;
+   t ;
 
 : NO-SPELLING ( MODEL:key -- option<MODEL:path> ) drop NO-PATH ;
 
@@ -589,8 +590,8 @@ variable SEED
    {: mv a:str b:str ar :}
    mv CASE-VARIANT-MOVE-UNMAKE {: s d :}
    d ar MODEL:FOLD {: k :}
-   k a str> ar CANONICAL MODEL:KEY= TFALSE
-   k b str> ar CANONICAL MODEL:KEY= TFALSE ;
+   k a ar CANONICAL MODEL:KEY= TFALSE
+   k b ar CANONICAL MODEL:KEY= TFALSE ;
 
 \ The records in reverse order rename alike, to a unique path.
 : RENAMES-AGREE
@@ -598,7 +599,7 @@ variable SEED
      ^VEC:vector<MODEL:local-record> str str ^ARENA:arena -- )
    {: j b rs lower:str upper:str ar :}
    ar LOCAL-RECORDS {: sr :}
-   sr upper str> DIRECTORY+ sr lower str> DIRECTORY+
+   sr upper DIRECTORY+ sr lower DIRECTORY+
    j b rs ar RENAME {: fwd :}
    fwd j b sr ar RENAME MOVES=
    fwd lower upper ar UNIQUE ;
@@ -608,17 +609,17 @@ variable SEED
    ( str JOURNAL:journal JOURNAL:local-root-binding ^ARENA:arena -- )
    {: d:str j b ar :}
    s" abcdefghijklmnopqrstuvwxyz" 24 RANDOM 1+ ar SAMPLE {: stem:str :}
-   SB-RESET stem str> SB-APPEND s" .txt" SB-APPEND
+   SB-RESET stem SB-APPEND s" .txt" SB-APPEND
    SB$ ar COPIED {: lower:str :}
-   lower str> ar COPIED {: upper:str :}
+   lower ar COPIED {: upper:str :}
    upper str> 0 ?do dup i + c@ ASCII-UPPER over i + c! loop drop
    ar LOCAL-RECORDS {: rs :}
-   rs lower str> DIRECTORY+ rs upper str> DIRECTORY+
+   rs lower DIRECTORY+ rs upper DIRECTORY+
    j b rs ar LOCALS-PLANNING {: pl :}
    d [: [: pl DECIDE-ALL ;] E-CASE-COLLISION TTHROWSQ ;] ar
-   LOGGED {: t:^ tu:n :}
-   t tu >str 10 COUNT-CHAR 1 T=
-   t tu upper str> lower str> COLLISION$ CONTAINS? TTRUE
+   LOGGED {: t:str :}
+   t 10 COUNT-CHAR 1 T=
+   t upper lower COLLISION$ CONTAINS? TTRUE
    j b rs lower upper ar RENAMES-AGREE ;
 
 : SAMPLED-VARIANTS
@@ -635,11 +636,11 @@ variable SEED
 
 \ For MERGE-PATH: the piece from at, kept unless empty, "." or "..";
 \ the index after it, or -1 past the last.
-: MERGE-PIECE ( ^u8 n n ^VEC:vector<str> -- n )
-   {: p:^ u:n at:n kept :}
-   p u SEPARATOR at SPLIT-NEXT 0= if 2drop drop -1 exit then
-   {: q:^ w:n next:n :}
-   q w NAME? q w s" .." STR= 0= and if q w >str kept VEC:PUSH ! then
+: MERGE-PIECE ( str n ^VEC:vector<str> -- n )
+   {: p:str at:n kept :}
+   p SEPARATOR at SPLIT-NEXT 0= if 2drop -1 exit then
+   {: q:str next:n :}
+   q NAME? q s" .." STR= 0= and if q kept VEC:PUSH ! then
    next ;
 
 \ Rust's merge_path: the pieces between separators but empty, "."
@@ -647,14 +648,13 @@ variable SEED
 : MERGE-PATH ( str ^ARENA:arena -- option<str> )
    {: raw:str ar :}
    ar ARENA:ALLOCATOR 0 [type] str VEC:NEW {: kept :}
-   raw str> {: p:^ u:n :}
-   0 begin p u rot kept MERGE-PIECE dup 0< until drop
+   0 begin raw swap kept MERGE-PIECE dup 0< until drop
    kept VEC:COUNT 0= if OPTION:NONE exit then
    kept ar JOINED OPTION:SOME ;
 
-: HOLDS? ( ^VEC:vector<str> ^u8 n -- bool )
-   {: v p:^ u:n :}
-   false v VEC:COUNT 0 ?do v i VEC:AT @ str> p u STR= or loop ;
+: HOLDS? ( ^VEC:vector<str> str -- bool )
+   {: v p:str :}
+   false v VEC:COUNT 0 ?do v i VEC:AT @ p STR= or loop ;
 
 \ Rust's merge_paths over up to 23 sampled names, without repeats.
 : MERGE-PATHS ( ^ARENA:arena -- ^VEC:vector<str> )
@@ -665,7 +665,7 @@ variable SEED
       ar MERGE-PATH
       MATCH option
          none OF ENDOF
-         some OF dup str> v -rot HOLDS? if drop else v VEC:PUSH ! then
+         some OF dup v swap HOLDS? if drop else v VEC:PUSH ! then
          ENDOF
       ;MATCH
    loop
@@ -690,17 +690,17 @@ variable SEED
      ^VEC:vector<str> ^VEC:vector<MODEL:key> ^ARENA:arena -- )
    {: kp bp lp rp merged ar :}
    kp JOURNAL-KNOWN--PATH:UNMAKE {: k br lr n:n rr t live:bool :}
-   k KEY-BYTES {: p:^ u:n :}
-   br BASELINE-SOME? bool>n bp p u HOLDS? bool>n T=
-   lr LOCAL-SOME? bool>n lp p u HOLDS? bool>n T=
-   rr REMOTE-SOME? bool>n rp p u HOLDS? bool>n T=
-   p u ar COPIED MODEL:>KEY merged VEC:PUSH ! ;
+   k KEY-BYTES {: p:str :}
+   br BASELINE-SOME? bool>n bp p HOLDS? bool>n T=
+   lr LOCAL-SOME? bool>n lp p HOLDS? bool>n T=
+   rr REMOTE-SOME? bool>n rp p HOLDS? bool>n T=
+   p ar COPIED MODEL:>KEY merged VEC:PUSH ! ;
 
 : KEYS-INTO
    ( ^VEC:vector<str> ^VEC:vector<MODEL:key> ^ARENA:arena -- )
    {: paths keys ar :}
    paths VEC:COUNT 0 ?do
-      paths i VEC:AT @ str> ar CANONICAL keys VEC:PUSH !
+      paths i VEC:AT @ ar CANONICAL keys VEC:PUSH !
    loop ;
 
 \ Key x sorts before key y.
@@ -740,7 +740,7 @@ variable SEED
    {: paths ar :}
    ar REMOTE-RECORDS {: v :}
    paths VEC:COUNT 0 ?do
-      v paths i VEC:AT @ str> REMOTE-DIRECTORY ar REMOTE+
+      v paths i VEC:AT @ REMOTE-DIRECTORY ar REMOTE+
    loop
    v ;
 
@@ -748,7 +748,7 @@ variable SEED
    ( ^VEC:vector<str> ^ARENA:arena -- ^VEC:vector<MODEL:local-record> )
    {: paths ar :}
    ar LOCAL-RECORDS {: v :}
-   paths VEC:COUNT 0 ?do v paths i VEC:AT @ str> DIRECTORY+ loop
+   paths VEC:COUNT 0 ?do v paths i VEC:AT @ DIRECTORY+ loop
    v ;
 
 \ The keys JOURNAL:EACH-KNOWN-PATH visits, in order, each checked.
@@ -1012,17 +1012,17 @@ variable SEED
 
 \ Rust's remote_directory.
 : REMOTE-DIRECTORY+
-   ( ^VEC:vector<MODEL:remote-record> ^u8 n ^ARENA:arena -- )
-   {: v p:^ u:n ar :}
-   v p u REMOTE-DIRECTORY ar REMOTE+ ;
+   ( ^VEC:vector<MODEL:remote-record> str ^ARENA:arena -- )
+   {: v p:str ar :}
+   v p REMOTE-DIRECTORY ar REMOTE+ ;
 
 \ A directory at the path on both sides and in the baseline.
 : KEPT-DIRECTORY+
    ( JOURNAL:journal ^VEC:vector<MODEL:local-record>
-     ^VEC:vector<MODEL:remote-record> ^u8 n ^ARENA:arena -- )
-   {: j ls rs p:^ u:n ar :}
-   ls p u DIRECTORY+ rs p u ar REMOTE-DIRECTORY+
-   j p u DISPLAY MODEL-BASELINE:DIRECTORY ar JOURNAL:RECORD-NOOP
+     ^VEC:vector<MODEL:remote-record> str ^ARENA:arena -- )
+   {: j ls rs p:str ar :}
+   ls p DIRECTORY+ rs p ar REMOTE-DIRECTORY+
+   j p DISPLAY MODEL-BASELINE:DIRECTORY ar JOURNAL:RECORD-NOOP
    NOOP-RECORDED? TTRUE ;
 
 : KEPT-DIRECTORIES
@@ -1034,7 +1034,7 @@ variable SEED
    j ls rs s" Docs/Notes" ar KEPT-DIRECTORY+
    j ls rs s" Music" ar KEPT-DIRECTORY+
    j b ls ar LOCALS-PUBLISHED
-   j s" cursor" >str DROPBOX:>CURSOR rs
+   j s" cursor" DROPBOX:>CURSOR rs
    JOURNAL:PUBLISH-REMOTE-INVENTORY ;
 
 : NOOPS-WALKED
@@ -1055,7 +1055,7 @@ variable SEED
    s" a walk counts every kept baseline" T-LABEL
    [: ar NOOPS-WALKED ;] ar WITH-ROOTED ;
 
-: DECISION-PATH$ ( path-decision -- ^u8 n )
+: DECISION-PATH$ ( path-decision -- str )
    PATH-DECISION-UNMAKE {: k path same dec :} path PATH$ ;
 
 : UNSUPPORTED-PAIR
@@ -1075,11 +1075,11 @@ variable SEED
    [: ar UNSUPPORTED-PAIR ;] ar WITH-ROOTED ;
 
 \ A path decision at the path, its key folded.
-: DECIDED ( ^u8 n MODEL:decision ^ARENA:arena -- path-decision )
-   {: p:^ u:n d ar :}
-   p u ar CANONICAL p u DISPLAY false d PATH-DECISION-MAKE ;
+: DECIDED ( str MODEL:decision ^ARENA:arena -- path-decision )
+   {: p:str d ar :}
+   p ar CANONICAL p DISPLAY false d PATH-DECISION-MAKE ;
 
-: DECISION-PATH ( path-decision -- ^u8 n )
+: DECISION-PATH ( path-decision -- str )
    PATH-DECISION-UNMAKE {: k path same d :} path PATH$ ;
 
 : DECISION< ( n n ^VEC:vector<path-decision> -- bool )
@@ -1116,34 +1116,34 @@ variable SEED
    MODEL-OBSERVATION:PRESENT ;
 
 : OBSERVED
-   ( ^VEC:vector<MODEL:local-record> ^u8 n
+   ( ^VEC:vector<MODEL:local-record> str
      MODEL:observation<MODEL:local> -- )
-   {: v p:^ u:n o :}
-   p u DISPLAY o MODEL-LOCAL--RECORD:MAKE v VEC:PUSH ! ;
+   {: v p:str o :}
+   p DISPLAY o MODEL-LOCAL--RECORD:MAKE v VEC:PUSH ! ;
 
 \ Rust's local_records: each path a directory.
-: DIR+ ( ^VEC:vector<MODEL:local-record> ^u8 n -- )
+: DIR+ ( ^VEC:vector<MODEL:local-record> str -- )
    DIRECTORY OBSERVED ;
 
-: UNSUPPORTED-SPELLING+ ( ^VEC:vector<MODEL:local-record> ^u8 n -- )
+: UNSUPPORTED-SPELLING+ ( ^VEC:vector<MODEL:local-record> str -- )
    MODEL-UNKNOWN--REASON:UNSUPPORTED UNKNOWN OBSERVED ;
 
-: INACCESSIBLE+ ( ^VEC:vector<MODEL:local-record> ^u8 n -- )
+: INACCESSIBLE+ ( ^VEC:vector<MODEL:local-record> str -- )
    MODEL-UNKNOWN--REASON:INACCESSIBLE UNKNOWN OBSERVED ;
 
 \ Rust's identity: dropbox_content_hash of the bytes, read from a pipe.
-: HASH-OF ( ^u8 n ^ARENA:arena -- DROPBOX:hash )
-   {: b:^ u:n ar :}
+: HASH-OF ( str ^ARENA:arena -- DROPBOX:hash )
+   {: b:str ar :}
    FD:PIPE {: r:fd w:fd :}
-   w b u FD:WRITE-FULL w FS:CLOSE-DIR
+   w b FD:WRITE-FULL w FS:CLOSE-DIR
    r ar LOCAL:DROPBOX-CONTENT-HASH r FS:CLOSE-DIR ;
 
 \ A file at the path holding the bytes b.
 : FILE+
-   ( ^VEC:vector<MODEL:local-record> ^u8 n ^u8 n ^ARENA:arena -- )
-   {: v p:^ u:n b:^ bu:n ar :}
-   b bu ar HASH-OF MODEL-LOCAL:MAKE PRESENT {: o :}
-   v p u o OBSERVED ;
+   ( ^VEC:vector<MODEL:local-record> str str ^ARENA:arena -- )
+   {: v p:str b:str ar :}
+   b ar HASH-OF MODEL-LOCAL:MAKE PRESENT {: o :}
+   v p o OBSERVED ;
 
 : RECORDED-FOO ( MODEL:key -- option<MODEL:path> )
    drop s" FOO.txt" DISPLAY OPTION:SOME ;
@@ -1151,7 +1151,7 @@ variable SEED
 : RECORDED-NOTES ( MODEL:key -- option<MODEL:path> )
    drop s" notes.txt" DISPLAY OPTION:SOME ;
 
-: SOURCE$ ( option<MODEL:path> -- ^u8 n )
+: SOURCE$ ( option<MODEL:path> -- str )
    MATCH option
       none OF s" (none)" ENDOF
       some OF PATH$ ENDOF
@@ -1168,7 +1168,7 @@ variable SEED
    ( ^VEC:vector<MODEL:local-record> ^ARENA:arena -- MODEL:path )
    [: NO-SPELLING ;] swap CASE-VARIANT-SOURCE SOME-PATH ;
 
-: MOVE-SOURCE$ ( case-variant-move -- ^u8 n )
+: MOVE-SOURCE$ ( case-variant-move -- str )
    CASE-VARIANT-MOVE-UNMAKE {: s d :} s PATH$ ;
 
 : MOVE-DESTINATION ( case-variant-move -- MODEL:path )
@@ -1200,11 +1200,11 @@ variable SEED
    s" case_variant_name_skips_existing_suffixes" T-LABEL
    [: ar SKIPS-EXISTING-SUFFIXES ;] ar WITH-ROOTED ;
 
-: REPEATED ( u8 n ^ARENA:arena -- ^u8 n )
+: REPEATED ( u8 n ^ARENA:arena -- str )
    {: c:u8 u:n ar :}
    ar u ARENA:ALLOC drop {: p:^ :}
    u 0 ?do c p i + c! loop
-   p u ;
+   p u >str ;
 
 : FITS-A-MAXIMUM-LENGTH-COMPONENT
    ( str JOURNAL:journal JOURNAL:local-root-binding ^ARENA:arena -- )
@@ -1213,9 +1213,9 @@ variable SEED
    v 65 255 ar REPEATED DIR+
    v 97 255 ar REPEATED DIR+
    j b v ar UNBASED-MOVE MOVE-DESTINATION
-   PATH$ SPLIT-NAME {: dir:^ du:n name:^ nu:n :}
-   nu 255 T=
-   name nu >str s"  (case variant)" >str ENDS-WITH? TTRUE ;
+   PATH$ SPLIT-NAME {: dir:str name:str :}
+   name str> nip 255 T=
+   name s"  (case variant)" ENDS-WITH? TTRUE ;
 
 : CASE-VARIANT-NAME-FITS-A-MAXIMUM-LENGTH-COMPONENT ( ^ARENA:arena -- )
    {: ar :}
@@ -1225,7 +1225,7 @@ variable SEED
 \ The name, failing the case when none fits.
 : SOME-NAME ( option<str> -- str )
    MATCH option
-      none OF false TTRUE s" " >str ENDOF
+      none OF false TTRUE s" " ENDOF
       some OF ENDOF
    ;MATCH ;
 
@@ -1234,15 +1234,15 @@ variable SEED
    {: ar :}
    s" file_copy_name_is_deterministic_and_fits_the_parent_limit"
    T-LABEL
-   97 255 ar REPEATED >str {: name:str :}
-   98 64 ar REPEATED >str DROPBOX:>HASH {: h :}
+   97 255 ar REPEATED {: name:str :}
+   98 64 ar REPEATED DROPBOX:>HASH {: h :}
    ar ARENA:ALLOCATOR 0 [type] MODEL:path VEC:NEW {: none :}
    none construct file-copy-origin dropbox {: o :}
-   name h o 0 255 ar FILE-COPY-NAME SOME-NAME str> {: a:^ au:n :}
-   name h o 0 255 ar FILE-COPY-NAME SOME-NAME str> {: b:^ bu:n :}
-   a au b bu T$=
-   au 255 T=
-   a au >str s"  (Dropbox file bbbbbbbbbbbb)" >str ENDS-WITH? TTRUE ;
+   name h o 0 255 ar FILE-COPY-NAME SOME-NAME {: a:str :}
+   name h o 0 255 ar FILE-COPY-NAME SOME-NAME {: b:str :}
+   a b T$=
+   a str> nip 255 T=
+   a s"  (Dropbox file bbbbbbbbbbbb)" ENDS-WITH? TTRUE ;
 
 : CONVERGE-FROM-PARENT-TO-CHILD
    ( str JOURNAL:journal JOURNAL:local-root-binding ^ARENA:arena -- )
@@ -1331,16 +1331,16 @@ variable SEED
 
 \ ---- RESOLVE-CASE-COLLISION
 
-: TREE-GONE ( str -- ) str> FS:REMOVE-TREE ;
+: TREE-GONE ( str -- ) FS:REMOVE-TREE ;
 
-: MAKE-AT ( str ^u8 n ^ARENA:arena -- )
-   INSIDE str> FS:MAKE-DIR ;
+: MAKE-AT ( str str ^ARENA:arena -- )
+   INSIDE FS:MAKE-DIR ;
 
-: WRITE-AT ( str ^u8 n ^u8 n ^ARENA:arena -- )
-   {: r:str p:^ u:n b:^ bu:n ar :}
-   r p u ar INSIDE str> b bu FS:WRITE-ALL ;
+: WRITE-AT ( str str str ^ARENA:arena -- )
+   {: r:str p:str b:str ar :}
+   r p ar INSIDE b FS:WRITE-ALL ;
 
-: THERE? ( str ^u8 n ^ARENA:arena -- bool ) INSIDE FS:EXISTS? ;
+: THERE? ( str str ^ARENA:arena -- bool ) INSIDE FS:EXISTS? ;
 
 \ A case's directory under TMPDIR and the sync root in it, holding
 \ Dir/a.txt and dir/b.txt.
@@ -1348,7 +1348,7 @@ variable SEED
    {: ar :}
    s" reconcile-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
    d s" root" ar INSIDE {: r:str :}
-   r str> FS:MAKE-DIR
+   r FS:MAKE-DIR
    r s" Dir" ar MAKE-AT
    r s" dir" ar MAKE-AT
    r s" Dir/a.txt" s" a" ar WRITE-AT
@@ -1377,16 +1377,16 @@ variable SEED
    j s" other.txt" ar RECORD
    j ;
 
-: RESOLUTION$ ( case-collision-resolution ^ARENA:arena -- ^u8 n )
+: RESOLUTION$ ( case-collision-resolution ^ARENA:arena -- str )
    {: ar :}
    MATCH case-collision-resolution
       none OF s" none" ENDOF
-      renamed OF s" renamed " rot PATH$ ar JOIN-BYTES ENDOF
-      changed OF s" changed " rot PATH$ ar JOIN-BYTES ENDOF
+      renamed OF s" renamed " swap PATH$ ar JOIN-BYTES ENDOF
+      changed OF s" changed " swap PATH$ ar JOIN-BYTES ENDOF
       root-changed OF s" root-changed" ENDOF
    ;MATCH ;
 
-: PLAN-PATH$ ( ^VEC:vector<JOURNAL:plan-record> n -- ^u8 n )
+: PLAN-PATH$ ( ^VEC:vector<JOURNAL:plan-record> n -- str )
    VEC:AT @ JOURNAL-PLAN--RECORD:UNMAKE {: id p o s :} p PATH$ ;
 
 : RENAMES-ONE ( str str ^ARENA:arena -- )
@@ -1394,7 +1394,7 @@ variable SEED
    d r ar BOUND {: j :}
    ar TREE {: v :}
    v ar UNBASED-SOURCE PATH$ s" dir" T$=
-   j r str> ar RESOLVE-CASE-COLLISION ar RESOLUTION$
+   j r ar RESOLVE-CASE-COLLISION ar RESOLUTION$
    s" renamed dir" T$=
    r s" dir (case variant)/b.txt" ar THERE? TTRUE
    r s" dir" ar THERE? TFALSE
@@ -1415,8 +1415,8 @@ variable SEED
    d r ar BOUND {: j :}
    d s" old" ar INSIDE {: old:str :}
    r old FS:RENAME-FILE
-   r str> FS:MAKE-DIR
-   j r str> ar RESOLVE-CASE-COLLISION ar RESOLUTION$
+   r FS:MAKE-DIR
+   j r ar RESOLVE-CASE-COLLISION ar RESOLUTION$
    s" root-changed" T$=
    old s" dir/b.txt" ar THERE? TTRUE
    old s" dir (case variant)" ar THERE? TFALSE
@@ -1449,36 +1449,36 @@ variable SEED
 ARENA LISTED DROPBOX:entry
 
 : ENTRY-AT
-   ( DROPBOX:kind ^u8 n ^u8 n ^ARENA:arena -- ^DROPBOX:entry )
-   {: kind l:^ lu:n d:^ du:n ar :}
+   ( DROPBOX:kind str str ^ARENA:arena -- ^DROPBOX:entry )
+   {: kind l:str d:str ar :}
    ar LISTED-NEW {: e :}
    kind e DROPBOX-ENTRY:KIND !
-   l lu SPAN:MAKE e DROPBOX-ENTRY:LOWER !
-   d du SPAN:MAKE e DROPBOX-ENTRY:DISPLAY !
+   l str> SPAN:MAKE e DROPBOX-ENTRY:LOWER !
+   d str> SPAN:MAKE e DROPBOX-ENTRY:DISPLAY !
    true e DROPBOX-ENTRY:DOWNLOADABLE !
    e ;
 
 \ Rust's folder_metadata.
-: FOLDER-ENTRY ( ^u8 n ^u8 n ^ARENA:arena -- ^DROPBOX:entry )
-   {: l:^ lu:n d:^ du:n ar :}
-   DROPBOX-KIND:FOLDER l lu d du ar ENTRY-AT ;
+: FOLDER-ENTRY ( str str ^ARENA:arena -- ^DROPBOX:entry )
+   {: l:str d:str ar :}
+   DROPBOX-KIND:FOLDER l d ar ENTRY-AT ;
 
 \ Rust's file_metadata: a revision and a well-formed content hash.
-: FILE-ENTRY ( ^u8 n ^u8 n ^ARENA:arena -- ^DROPBOX:entry )
-   {: l:^ lu:n d:^ du:n ar :}
-   DROPBOX-KIND:FILE l lu d du ar ENTRY-AT {: e :}
-   s" test-revision" SPAN:MAKE e DROPBOX-ENTRY:REV !
+: FILE-ENTRY ( str str ^ARENA:arena -- ^DROPBOX:entry )
+   {: l:str d:str ar :}
+   DROPBOX-KIND:FILE l d ar ENTRY-AT {: e :}
+   s" test-revision" str> SPAN:MAKE e DROPBOX-ENTRY:REV !
    s" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-   SPAN:MAKE e DROPBOX-ENTRY:CONTENT-HASH !
+   str> SPAN:MAKE e DROPBOX-ENTRY:CONTENT-HASH !
    e ;
 
-: DELETED-ENTRY ( ^u8 n ^u8 n ^ARENA:arena -- ^DROPBOX:entry )
-   {: l:^ lu:n d:^ du:n ar :}
-   DROPBOX-KIND:DELETED l lu d du ar ENTRY-AT ;
+: DELETED-ENTRY ( str str ^ARENA:arena -- ^DROPBOX:entry )
+   {: l:str d:str ar :}
+   DROPBOX-KIND:DELETED l d ar ENTRY-AT ;
 
-: LISTING-AT ( ^u8 n ^ARENA:arena -- listing-root )
-   {: p:^ u:n ar :}
-   p u >str ar NEW-LISTING-ROOT ;
+: LISTING-AT ( str ^ARENA:arena -- listing-root )
+   {: p:str ar :}
+   p ar NEW-LISTING-ROOT ;
 
 : NO-CHANGES
    ( ^ARENA:arena -- ^VEC:vector<JOURNAL:remote-inventory-change> )
@@ -1508,15 +1508,15 @@ ARENA LISTED DROPBOX:entry
 
 \ The record's path at the key's display bytes, else empty.
 : PATH-OF
-   ( ^VEC:vector<MODEL:remote-record> ^u8 n ^ARENA:arena -- ^u8 n )
-   {: rs p:^ u:n ar :}
-   rs p u ar CANONICAL RECORD-IN MATCH option
+   ( ^VEC:vector<MODEL:remote-record> str ^ARENA:arena -- str )
+   {: rs p:str ar :}
+   rs p ar CANONICAL RECORD-IN MATCH option
       none OF s" " ENDOF
       some OF MODEL-REMOTE--RECORD:UNMAKE {: k q o :} q PATH$ ENDOF
    ;MATCH ;
 
 \ The records' paths, each followed by "|".
-: RECORD-PATHS$ ( ^VEC:vector<MODEL:remote-record> -- ^u8 n )
+: RECORD-PATHS$ ( ^VEC:vector<MODEL:remote-record> -- str )
    {: rs :}
    SB-RESET
    rs VEC:COUNT 0 ?do
@@ -1527,7 +1527,7 @@ ARENA LISTED DROPBOX:entry
 
 \ Rust's change_paths: the writes' paths, each followed by "|".
 : CHANGE-PATHS
-   ( ^VEC:vector<JOURNAL:remote-inventory-change> -- ^u8 n )
+   ( ^VEC:vector<JOURNAL:remote-inventory-change> -- str )
    {: cs :}
    SB-RESET
    cs VEC:COUNT 0 ?do
@@ -1550,7 +1550,7 @@ ARENA LISTED DROPBOX:entry
    s" /folder" s" /Folder" ar FOLDER-ENTRY root v ar APPEND-ENTRY-CHANGES
    s" /paper" s" /Paper" ar FILE-ENTRY {: paper :}
    false paper DROPBOX-ENTRY:DOWNLOADABLE !
-   s" " SPAN:MAKE paper DROPBOX-ENTRY:CONTENT-HASH !
+   s" " str> SPAN:MAKE paper DROPBOX-ENTRY:CONTENT-HASH !
    paper root v ar APPEND-ENTRY-CHANGES
    v ar INVENTORY-RECORDS {: rs :}
    rs VEC:COUNT 2 T=
@@ -1584,12 +1584,12 @@ ARENA LISTED DROPBOX:entry
    ar REMOTE-RECORDS {: rs :}
    rs s" Apps" REMOTE-DIRECTORY ar REMOTE+
    rs s" Apps/Day One" REMOTE-DIRECTORY ar REMOTE+
-   j s" cursor" >str DROPBOX:>CURSOR rs
+   j s" cursor" DROPBOX:>CURSOR rs
    JOURNAL:PUBLISH-REMOTE-INVENTORY ;
 
 : DELTA-PATHS
    ( ^VEC:vector<JOURNAL:remote-inventory-change> JOURNAL:journal
-     ^ARENA:arena -- ^u8 n )
+     ^ARENA:arena -- str )
    NORMALIZE-INVENTORY-CHANGES CHANGE-PATHS ;
 
 : DELTA-NEVER-RESPELLS-A-DIRECTORY-THAT-STILL-EXISTS ( ^ARENA:arena -- )
@@ -1628,19 +1628,19 @@ ARENA LISTED DROPBOX:entry
    ar NO-CHANGES {: v :}
    s" /report.txt" s" /Different.txt" ar FILE-ENTRY {: e :}
    d [: [: e root v ar APPEND-ENTRY-CHANGES ;] E-LISTING TTHROWSQ ;]
-   ar LOGGED {: t:^ tu:n :}
-   t tu >str 10 COUNT-CHAR 1 T=
-   t tu s" invalid or out-of-root path `/Different.txt`" CONTAINS? TTRUE
+   ar LOGGED {: t:str :}
+   t 10 COUNT-CHAR 1 T=
+   t s" invalid or out-of-root path `/Different.txt`" CONTAINS? TTRUE
    v ar INVENTORY-RECORDS VEC:COUNT 0 T=
-   d str> FS:REMOVE-TREE ;
+   d FS:REMOVE-TREE ;
 
 \ The configured root p refused: E-LISTING and its one line.
-: ROOT-PATH-REFUSED ( ^u8 n str ^ARENA:arena -- )
-   {: p:^ u:n d:str ar :}
-   d [: [: p u ar LISTING-AT ROOT-DEPTH drop ;] E-LISTING TTHROWSQ ;]
-   ar LOGGED {: t:^ tu:n :}
-   t tu >str 10 COUNT-CHAR 1 T=
-   t tu
+: ROOT-PATH-REFUSED ( str str ^ARENA:arena -- )
+   {: p:str d:str ar :}
+   d [: [: p ar LISTING-AT ROOT-DEPTH drop ;] E-LISTING TTHROWSQ ;]
+   ar LOGGED {: t:str :}
+   t 10 COUNT-CHAR 1 T=
+   t
    s" configured Dropbox root must be empty or a normalized absolute Dropbox path"
    CONTAINS? TTRUE ;
 
@@ -1652,42 +1652,42 @@ ARENA LISTED DROPBOX:entry
    s" /a/" d ar ROOT-PATH-REFUSED
    s" /a//b" d ar ROOT-PATH-REFUSED
    s\" /a\xFF" d ar ROOT-PATH-REFUSED
-   d str> FS:REMOVE-TREE ;
+   d FS:REMOVE-TREE ;
 
 \ The entry e refused as an invalid path: E-LISTING, its one line,
 \ nothing listed; the line's text.
-: ENTRY-REFUSED ( ^DROPBOX:entry str ^ARENA:arena -- ^u8 n )
+: ENTRY-REFUSED ( ^DROPBOX:entry str ^ARENA:arena -- str )
    {: e d:str ar :}
    s" " ar LISTING-AT {: root :}
    ar NO-CHANGES {: v :}
    d [: [: e root v ar APPEND-ENTRY-CHANGES ;] E-LISTING TTHROWSQ ;]
-   ar LOGGED {: t:^ tu:n :}
-   t tu >str 10 COUNT-CHAR 1 T=
-   t tu s" Dropbox listing contained an invalid or out-of-root path"
+   ar LOGGED {: t:str :}
+   t 10 COUNT-CHAR 1 T=
+   t s" Dropbox listing contained an invalid or out-of-root path"
    CONTAINS? TTRUE
    v ar INVENTORY-RECORDS VEC:COUNT 0 T=
-   t tu ;
+   t ;
 
 : LISTING-REJECTS-AN-ENTRY-WITHOUT-PATHS ( ^ARENA:arena -- )
    {: ar :}
    s" listing rejects an entry without paths" T-LABEL
    s" reconcile-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
-   s" " s" " ar FILE-ENTRY d ar ENTRY-REFUSED {: t:^ tu:n :}
-   t tu s" `" CONTAINS? TFALSE
-   d str> FS:REMOVE-TREE ;
+   s" " s" " ar FILE-ENTRY d ar ENTRY-REFUSED {: t:str :}
+   t s" `" CONTAINS? TFALSE
+   d FS:REMOVE-TREE ;
 
 : LISTING-REJECTS-A-PATH-THAT-IS-NOT-UTF-8 ( ^ARENA:arena -- )
    {: ar :}
    s" listing rejects a path that is not UTF-8" T-LABEL
    s" reconcile-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
    s\" /report\xFF.txt" s\" /report\xFF.txt" ar FILE-ENTRY
-   d ar ENTRY-REFUSED 2drop
-   d str> FS:REMOVE-TREE ;
+   d ar ENTRY-REFUSED drop
+   d FS:REMOVE-TREE ;
 
 \ The root's own entry e refused with its text t: E-LISTING, one line
 \ naming t, and nothing listed after Old.
-: ROOT-REFUSED ( ^DROPBOX:entry ^u8 n str ^ARENA:arena -- )
-   {: e t:^ tu:n d:str ar :}
+: ROOT-REFUSED ( ^DROPBOX:entry str str ^ARENA:arena -- )
+   {: e t:str d:str ar :}
    s" /Sync" ar LISTING-AT {: root :}
    ar NO-CHANGES {: v :}
    s" /sync/old" s" /Sync/Old" ar FOLDER-ENTRY
@@ -1695,9 +1695,9 @@ ARENA LISTED DROPBOX:entry
    s" /sync/child" s" /Sync/Child" ar FOLDER-ENTRY {: child :}
    d [: [: e root v ar APPEND-ENTRY-CHANGES
          child root v ar APPEND-ENTRY-CHANGES ;] E-LISTING TTHROWSQ ;]
-   ar LOGGED {: g:^ gu:n :}
-   g gu >str 10 COUNT-CHAR 1 T=
-   g gu t tu CONTAINS? TTRUE
+   ar LOGGED {: g:str :}
+   g 10 COUNT-CHAR 1 T=
+   g t CONTAINS? TTRUE
    v ar INVENTORY-RECORDS {: rs :}
    rs RECORD-PATHS$ s" Old|" T$=
    rs s" old" ar CANONICAL OBSERVED-IN REMOTE-DIRECTORY
@@ -1725,29 +1725,29 @@ ARENA LISTED DROPBOX:entry
    ROOT-REFUSED
    s" /sync" s" /Sync" ar FILE-ENTRY
    s" configured Dropbox root is not a folder" d ar ROOT-REFUSED
-   d str> FS:REMOVE-TREE ;
+   d FS:REMOVE-TREE ;
 
 \ ---- the listing against the fake Dropbox ---------------------------
 
-: PATHS+ ( ^u8 n ^u8 n -- )
-   {: l:^ lu:n d:^ du:n :}
-   S\" ,\qpath_lower\q:" SB-APPEND l lu QUOTED+
-   S\" ,\qpath_display\q:" SB-APPEND d du QUOTED+ ;
+: PATHS+ ( str str -- )
+   {: l:str d:str :}
+   S\" ,\qpath_lower\q:" SB-APPEND l QUOTED+
+   S\" ,\qpath_display\q:" SB-APPEND d QUOTED+ ;
 
 \ Rust's folder_metadata, deleted_metadata and file_metadata, each
 \ appended to SB.
-: FOLDER-JSON+ ( ^u8 n ^u8 n -- )
+: FOLDER-JSON+ ( str str -- )
    S\" {\q.tag\q:\qfolder\q" SB-APPEND PATHS+ s" }" SB-APPEND ;
 
-: DELETED-JSON+ ( ^u8 n ^u8 n -- )
+: DELETED-JSON+ ( str str -- )
    S\" {\q.tag\q:\qdeleted\q" SB-APPEND PATHS+ s" }" SB-APPEND ;
 
-: FILE-JSON+ ( ^u8 n ^u8 n ^u8 n DROPBOX:hash -- )
-   {: l:^ lu:n d:^ du:n r:^ ru:n h:DROPBOX:hash :}
-   S\" {\q.tag\q:\qfile\q" SB-APPEND l lu d du PATHS+
-   S\" ,\qrev\q:" SB-APPEND r ru QUOTED+
+: FILE-JSON+ ( str str str DROPBOX:hash -- )
+   {: l:str d:str r:str h:DROPBOX:hash :}
+   S\" {\q.tag\q:\qfile\q" SB-APPEND l d PATHS+
+   S\" ,\qrev\q:" SB-APPEND r QUOTED+
    S\" ,\qsize\q:0,\qcontent_hash\q:" SB-APPEND
-   h DROPBOX:HASH>STR str> QUOTED+ s" }" SB-APPEND ;
+   h DROPBOX:HASH>STR QUOTED+ s" }" SB-APPEND ;
 
 : COMMA+ ( -- ) s" ," SB-APPEND ;
 
@@ -1756,11 +1756,11 @@ ARENA LISTED DROPBOX:entry
    {: q ar :}
    SB-RESET s" [" SB-APPEND q execute s" ]" SB-APPEND SB$ ar COPIED ;
 
-: PAGE ( str ^u8 n bool -- )
-   {: e:str k:^ ku:n more:bool :}
-   e str> k ku more TEST-DROPBOX:PAGE! ;
+: PAGE ( str str bool -- )
+   {: e:str k:str more:bool :}
+   e k more TEST-DROPBOX:PAGE! ;
 
-: CONTINUE$ ( -- ^u8 n ) s" /2/files/list_folder/continue" ;
+: CONTINUE$ ( -- str ) s" /2/files/list_folder/continue" ;
 
 \ Rust's 503 answer, which only a continuation gets.
 : UNAVAILABLE! ( -- )
@@ -1771,24 +1771,24 @@ ARENA LISTED DROPBOX:entry
 : OLD-RECORD ( DROPBOX:hash ^ARENA:arena -- MODEL:remote-record )
    {: h:DROPBOX:hash ar :}
    s" old.txt" ar CANONICAL s" Old.txt" DISPLAY
-   h s" rev-old" >str DROPBOX:>REV MODEL-REMOTE:MAKE REMOTE-PRESENT
+   h s" rev-old" DROPBOX:>REV MODEL-REMOTE:MAKE REMOTE-PRESENT
    MODEL-REMOTE--RECORD:MAKE ;
 
 \ The journal's inventory: the record o, published with the cursor.
 : PUBLISHED
-   ( JOURNAL:journal ^u8 n MODEL:remote-record ^ARENA:arena -- )
-   {: j k:^ ku:n o ar :}
+   ( JOURNAL:journal str MODEL:remote-record ^ARENA:arena -- )
+   {: j k:str o ar :}
    ar REMOTE-RECORDS {: rs :} o rs VEC:PUSH !
-   j k ku >str DROPBOX:>CURSOR rs JOURNAL:PUBLISH-REMOTE-INVENTORY ;
+   j k DROPBOX:>CURSOR rs JOURNAL:PUBLISH-REMOTE-INVENTORY ;
 
-: CURSOR-IS? ( option<DROPBOX:cursor> ^u8 n -- bool )
-   {: a:^ u :}
+: CURSOR-IS? ( option<DROPBOX:cursor> str -- bool )
+   {: a:str :}
    MATCH option
       none OF false ENDOF
-      some OF DROPBOX:CURSOR>STR str> a u STR= ENDOF
+      some OF DROPBOX:CURSOR>STR a STR= ENDOF
    ;MATCH ;
 
-: KIND$ ( MODEL:observation<MODEL:remote> -- ^u8 n )
+: KIND$ ( MODEL:observation<MODEL:remote> -- str )
    MATCH MODEL:observation
       present OF drop s" present" ENDOF
       directory OF s" directory" ENDOF
@@ -1798,11 +1798,11 @@ ARENA LISTED DROPBOX:entry
 
 \ Rust's observation: the kind of the record at the display path, else
 \ none.
-: OBSERVED$ ( ^VEC:vector<MODEL:remote-record> ^u8 n -- ^u8 n )
-   {: rs p:^ u:n :}
+: OBSERVED$ ( ^VEC:vector<MODEL:remote-record> str -- str )
+   {: rs p:str :}
    rs VEC:COUNT 0 ?do
       rs i VEC:AT @ MODEL-REMOTE--RECORD:UNMAKE {: k q o :}
-      q PATH$ p u STR= if o KIND$ unloop exit then
+      q PATH$ p STR= if o KIND$ unloop exit then
    loop
    s" none" ;
 
@@ -1811,11 +1811,11 @@ ARENA LISTED DROPBOX:entry
    j l s" " ar LISTING-AT ar REFRESH-INVENTORY ;
 
 \ The journal's one record is o, with the cursor k.
-: KEPT ( JOURNAL:journal ^u8 n MODEL:remote-record ^ARENA:arena -- )
-   {: j k:^ ku:n o ar :}
+: KEPT ( JOURNAL:journal str MODEL:remote-record ^ARENA:arena -- )
+   {: j k:str o ar :}
    j ar JOURNAL:REMOTE-INVENTORY
    JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur rs :}
-   cur k ku CURSOR-IS? TTRUE
+   cur k CURSOR-IS? TTRUE
    rs VEC:COUNT 1 T=
    rs 0 VEC:AT @ o MODEL:REMOTE-RECORD= TTRUE ;
 
@@ -1826,7 +1826,7 @@ ARENA LISTED DROPBOX:entry
    TEST-DROPBOX:RESET
    s" replacement" ar IDENTITY {: h:DROPBOX:hash :}
    ar CASE-JOURNAL {: d:str j :}
-   j s" stale" s" old" >str DROPBOX:>HASH ar OLD-RECORD ar
+   j s" stale" s" old" DROPBOX:>HASH ar OLD-RECORD ar
    PUBLISHED
    TEST-DROPBOX:PAGE-RESET!
    [: s" /folder" s" /Folder" FOLDER-JSON+ ;] ar ENTRIES
@@ -1873,9 +1873,9 @@ ARENA LISTED DROPBOX:entry
    T$=
    d j GONE ;
 
-: TREE-JSON+ ( ^u8 n ^u8 n DROPBOX:hash -- )
-   {: l:^ lu:n d:^ du:n h:DROPBOX:hash :}
-   l lu d du s" tree-revision" h FILE-JSON+ ;
+: TREE-JSON+ ( str str DROPBOX:hash -- )
+   {: l:str d:str h:DROPBOX:hash :}
+   l d s" tree-revision" h FILE-JSON+ ;
 
 : LISTING-APPLIES-ORDERED-TREE-MUTATIONS-ACROSS-PAGES
    ( ^ARENA:arena -- )
@@ -1922,13 +1922,13 @@ ARENA LISTED DROPBOX:entry
    T-LABEL
    TEST-DROPBOX:RESET
    s" changed" ar IDENTITY {: h:DROPBOX:hash :}
-   s" durable-old" >str DROPBOX:>HASH ar OLD-RECORD {: old :}
+   s" durable-old" DROPBOX:>HASH ar OLD-RECORD {: old :}
    ar CASE-JOURNAL {: d:str j :}
    j s" durable-cursor" old ar PUBLISHED
    [: s" /old.txt" s" /Old.txt" s" rev-changed" h FILE-JSON+ ;] ar ENTRIES
    {: e:str :}
    \ Both pages are continuations, so the first is a script too.
-   SB-RESET S\" {\qentries\q:" SB-APPEND e str> SB-APPEND
+   SB-RESET S\" {\qentries\q:" SB-APPEND e SB-APPEND
    S\" ,\qcursor\q:\qnext\q,\qhas_more\q:true}" SB-APPEND
    CONTINUE$ 200 s" " s" " SB$ TEST-DROPBOX:ROUTE-SCRIPT!
    UNAVAILABLE!
@@ -1950,18 +1950,18 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
 
 \ Rust's RemoteObservationRecord at the display path.
 : RECORD-AT
-   ( ^u8 n MODEL:observation<MODEL:remote> ^ARENA:arena
+   ( str MODEL:observation<MODEL:remote> ^ARENA:arena
      -- MODEL:remote-record )
-   {: p:^ u:n o ar :}
-   p u ar CANONICAL p u DISPLAY o MODEL-REMOTE--RECORD:MAKE ;
+   {: p:str o ar :}
+   p ar CANONICAL p DISPLAY o MODEL-REMOTE--RECORD:MAKE ;
 
 : STALE ( -- MODEL:observation<MODEL:remote> )
    MODEL-UNKNOWN--REASON:STALE REMOTE-UNKNOWN ;
 
 : PRESENT-AT
-   ( DROPBOX:hash ^u8 n -- MODEL:observation<MODEL:remote> )
-   {: h:DROPBOX:hash r:^ ru:n :}
-   h r ru >str DROPBOX:>REV MODEL-REMOTE:MAKE REMOTE-PRESENT ;
+   ( DROPBOX:hash str -- MODEL:observation<MODEL:remote> )
+   {: h:DROPBOX:hash r:str :}
+   h r DROPBOX:>REV MODEL-REMOTE:MAKE REMOTE-PRESENT ;
 
 \ Rust's {index:05}, appended to SB.
 : INDEX+ ( n -- )
@@ -1971,9 +1971,9 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
    repeat drop ;
 
 \ The bulk name at the index below the prefix: <prefix>/00042.txt.
-: BULK$ ( ^u8 n n -- ^u8 n )
-   {: p:^ u:n x:n :}
-   SB-RESET p u SB-APPEND s" /" SB-APPEND x INDEX+
+: BULK$ ( str n -- str )
+   {: p:str x:n :}
+   SB-RESET p SB-APPEND s" /" SB-APPEND x INDEX+
    s" .txt" SB-APPEND SB$ ;
 
 \ Rust's large inventory: Bulk, then Bulk/00001.txt on at rev-old with
@@ -1984,31 +1984,31 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
    ar REMOTE-RECORDS {: rs :}
    s" Bulk" REMOTE-DIRECTORY ar RECORD-AT rs VEC:PUSH !
    u 1 ?do
-      s" Bulk" i BULK$ ar COPIED str> h s" rev-old" PRESENT-AT
+      s" Bulk" i BULK$ ar COPIED h s" rev-old" PRESENT-AT
       ar RECORD-AT rs VEC:PUSH !
    loop
    rs ;
 
 \ Rust's observation: the record at the display path is o.
 : OBSERVED?
-   ( ^VEC:vector<MODEL:remote-record> ^u8 n
+   ( ^VEC:vector<MODEL:remote-record> str
      MODEL:observation<MODEL:remote> -- bool )
-   {: rs p:^ u:n o :}
+   {: rs p:str o :}
    rs VEC:COUNT 0 ?do
       rs i VEC:AT @ MODEL-REMOTE--RECORD:UNMAKE {: k q w :}
-      q PATH$ p u STR= if w o MODEL:REMOTE-OBSERVATION= unloop exit then
+      q PATH$ p STR= if w o MODEL:REMOTE-OBSERVATION= unloop exit then
    loop
    false ;
 
 \ The journal's inventory, sorted by key as Rust sorts it, is the
 \ cursor k and the records want.
 : HOLDS
-   ( JOURNAL:journal ^u8 n ^VEC:vector<MODEL:remote-record>
+   ( JOURNAL:journal str ^VEC:vector<MODEL:remote-record>
      ^ARENA:arena -- )
-   {: j k:^ ku:n want ar :}
+   {: j k:str want ar :}
    j ar JOURNAL:REMOTE-INVENTORY
    JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur rs :}
-   cur k ku CURSOR-IS? TTRUE
+   cur k CURSOR-IS? TTRUE
    rs VEC:COUNT want VEC:COUNT T=
    rs VEC:COUNT want VEC:COUNT min 0 ?do
       rs i VEC:AT @ want i VEC:AT @ MODEL:REMOTE-RECORD= TTRUE
@@ -2018,8 +2018,9 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
 : NO-TEXT ( ^ARENA:arena -- ^VEC:vector<u8> )
    ARENA:ALLOCATOR 0 [type] u8 VEC:NEW ;
 
-: TEXT+ ( ^VEC:vector<u8> ^u8 n -- )
-   {: v a:^ u:n :}
+: TEXT+ ( ^VEC:vector<u8> str -- )
+   {: v s:str :}
+   s str> {: a:^ u:n :}
    v VEC:COUNT {: at:n :}
    v at u + VEC:RESIZE
    a v at VEC:AT u BYTE-COPY ;
@@ -2030,12 +2031,12 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
 
 \ Rust's large listing's entry at the index: the folder /bulk, then
 \ /bulk/00001.txt on at rev-bulk with the identity h; in SB.
-: BULK-ENTRY ( n DROPBOX:hash ^ARENA:arena -- ^u8 n )
+: BULK-ENTRY ( n DROPBOX:hash ^ARENA:arena -- str )
    {: x:n h:DROPBOX:hash ar :}
    x 0= if SB-RESET s" /bulk" s" /Bulk" FOLDER-JSON+ SB$ exit then
    s" /bulk" x BULK$ ar COPIED {: l:str :}
    s" /Bulk" x BULK$ ar COPIED {: d:str :}
-   SB-RESET l str> d str> s" rev-bulk" h FILE-JSON+ SB$ ;
+   SB-RESET l d s" rev-bulk" h FILE-JSON+ SB$ ;
 
 \ Rust's page k of the large listing: its entries' JSON array.
 : BULK-PAGE ( n DROPBOX:hash ^ARENA:arena -- str )
@@ -2060,21 +2061,21 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
    loop ;
 
 \ A full listing's requests: list_folder, then its continuations.
-: LISTED$ ( n -- ^u8 n )
+: LISTED$ ( n -- str )
    {: u:n :}
    SB-RESET s" /2/files/list_folder" SB-APPEND
    u 1 ?do s"  " SB-APPEND CONTINUE$ SB-APPEND loop
    SB$ ;
 
 \ Rust's incomplete_file_metadata: downloadable, with no content hash.
-: INCOMPLETE-JSON+ ( ^u8 n ^u8 n ^u8 n -- )
-   {: l:^ lu:n d:^ du:n r:^ ru:n :}
-   S\" {\q.tag\q:\qfile\q" SB-APPEND l lu d du PATHS+
-   S\" ,\qrev\q:" SB-APPEND r ru QUOTED+
+: INCOMPLETE-JSON+ ( str str str -- )
+   {: l:str d:str r:str :}
+   S\" {\q.tag\q:\qfile\q" SB-APPEND l d PATHS+
+   S\" ,\qrev\q:" SB-APPEND r QUOTED+
    S\" ,\qsize\q:0,\qis_downloadable\q:true}" SB-APPEND ;
 
 \ Rust's restricted_folder_metadata with traverse_only.
-: TRAVERSE-ONLY-JSON+ ( ^u8 n ^u8 n -- )
+: TRAVERSE-ONLY-JSON+ ( str str -- )
    S\" {\q.tag\q:\qfolder\q" SB-APPEND PATHS+
    S\" ,\qsharing_info\q:{\qread_only\q:false," SB-APPEND
    S\" \qtraverse_only\q:true}}" SB-APPEND ;
@@ -2088,7 +2089,7 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
    s" old inventory bytes" ar IDENTITY {: old:DROPBOX:hash :}
    s" new inventory bytes" ar IDENTITY {: h:DROPBOX:hash :}
    ar CASE-JOURNAL {: d:str j :}
-   j s" cursor-old" >str DROPBOX:>CURSOR old 10000 ar BULK-RECORDS
+   j s" cursor-old" DROPBOX:>CURSOR old 10000 ar BULK-RECORDS
    JOURNAL:PUBLISH-REMOTE-INVENTORY
    [: s" /bulk/05000.txt" s" /Bulk/05000.txt" s" rev-new" h
       FILE-JSON+ ;] ar ENTRIES
@@ -2213,7 +2214,7 @@ READ-CAP BUFFER: READ-BUF
    s" reconcile-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
    d s" root" ar INSIDE {: r:str :}
    d s" staging" ar INSIDE {: s:str :}
-   r str> FS:MAKE-DIR s str> FS:MAKE-DIR
+   r FS:MAKE-DIR s FS:MAKE-DIR
    d s" journal.sqlite3" ar INSIDE JOURNAL:OPEN {: j :}
    j r JOURNAL:INSPECT ar JOURNAL:ACTIVATE-LOCAL-ROOT drop
    ar RUNS-NEW {: x :}
@@ -2239,31 +2240,31 @@ READ-CAP BUFFER: READ-BUF
 
 \ Rust's plan(Absent, ConfirmedAbsent, Present(remote), Empty): one
 \ install-local operation, recorded pending at path a.
-: INSTALLING ( ^run ^u8 n MODEL:remote -- JOURNAL:plan-record )
-   {: x a:^ u:n rem :}
+: INSTALLING ( ^run str MODEL:remote -- JOURNAL:plan-record )
+   {: x a:str rem :}
    x RUN-ARENA @ {: ar :}
    rem MODEL-OPERATION:INSTALL-LOCAL ar ONE-PLAN {: plan :}
-   x RUN-JOURNAL @ a u DISPLAY plan ar JOURNAL:RECORD-PLAN
+   x RUN-JOURNAL @ a DISPLAY plan ar JOURNAL:RECORD-PLAN
    WRITTEN TTRUE ;
 
-: NUMBERED ( ^u8 n n ^ARENA:arena -- str )
-   {: a:^ u:n k:n ar :}
-   SB-RESET a u SB-APPEND k FMT:SB-INT SB$ ar COPIED ;
+: NUMBERED ( str n ^ARENA:arena -- str )
+   {: a:str k:n ar :}
+   SB-RESET a SB-APPEND k FMT:SB-INT SB$ ar COPIED ;
 
 \ The fake's file /<p> at rev v with b's identity and size.
-: FILE-AT ( ^u8 n ^u8 n ^u8 n ^ARENA:arena -- )
-   {: p:^ pu:n v:^ vu:n b:^ bu:n ar :}
-   b bu ar IDENTITY DROPBOX:HASH>STR str> {: h:^ hu:n :}
-   SB-RESET s" /" SB-APPEND p pu SB-APPEND SB$ ar COPIED {: l:str :}
-   l str> l str> v vu h hu bu TEST-DROPBOX:FILE! ;
+: FILE-AT ( str str str ^ARENA:arena -- )
+   {: p:str v:str b:str ar :}
+   b ar IDENTITY DROPBOX:HASH>STR {: h:str :}
+   SB-RESET s" /" SB-APPEND p SB-APPEND SB$ ar COPIED {: l:str :}
+   l l v h b str> nip TEST-DROPBOX:FILE! ;
 
 \ The fake serves b as rev v of /<p>.
-: SERVES ( ^u8 n ^u8 n ^u8 n ^ARENA:arena -- )
-   {: p:^ pu:n v:^ vu:n b:^ bu:n ar :}
-   p pu v vu b bu ar FILE-AT
-   v vu b bu TEST-DROPBOX:CONTENT! ;
+: SERVES ( str str str ^ARENA:arena -- )
+   {: p:str v:str b:str ar :}
+   p v b ar FILE-AT
+   v b TEST-DROPBOX:CONTENT! ;
 
-: DOWNLOAD$ ( -- ^u8 n ) s" /2/files/download" ;
+: DOWNLOAD$ ( -- str ) s" /2/files/download" ;
 
 : REPORTED ( replay-step -- ^REPLAY:replay-report )
    MATCH replay-step
@@ -2296,7 +2297,7 @@ READ-CAP BUFFER: READ-BUF
    ;MATCH ;
 
 \ A plan's status: pending, completed, or the reason it is blocked.
-: HELD-FOR$ ( JOURNAL:plan-record -- ^u8 n )
+: HELD-FOR$ ( JOURNAL:plan-record -- str )
    JOURNAL-PLAN--RECORD:UNMAKE {: id p o s :}
    SB-RESET
    s MATCH JOURNAL:plan-status
@@ -2321,7 +2322,7 @@ READ-CAP BUFFER: READ-BUF
       stage-destination-occupied OF {: id p:str :}
          s" stage-destination-occupied " SB-APPEND
          id JOURNAL:PLAN-ID>N FMT:SB-INT
-         s"  " SB-APPEND p str> SB-APPEND
+         s"  " SB-APPEND p SB-APPEND
       ENDOF
       precondition-changed OF
          drop drop s" precondition-changed" SB-APPEND
@@ -2333,17 +2334,17 @@ READ-CAP BUFFER: READ-BUF
    ;MATCH ;
 
 \ Whether the report holds the entry e, which is not in SB.
-: REPORTS? ( ^REPLAY:replay-report ^u8 n -- bool )
-   {: rep e:^ eu:n :}
+: REPORTS? ( ^REPLAY:replay-report str -- bool )
+   {: rep e:str :}
    rep BLOCKS {: bs :}
    bs VEC:COUNT 0 ?do
       SB-RESET bs i VEC:AT @ BLOCKED+
-      SB$ e eu STR= if true unloop exit then
+      SB$ e STR= if true unloop exit then
    loop
    false ;
 
 \ The reply's variant, then a retry's wait, else 0.
-: REPLY$ ( DROPBOX:reply -- ^u8 n n )
+: REPLY$ ( DROPBOX:reply -- str n )
    MATCH DROPBOX:reply
       done OF s" done" 0 ENDOF
       refused OF drop s" refused" 0 ENDOF
@@ -2351,7 +2352,7 @@ READ-CAP BUFFER: READ-BUF
       unlinked OF s" unlinked" 0 ENDOF
    ;MATCH ;
 
-: MISMATCH$ ( -- ^u8 n ) s" correct body with mismatched metadata" ;
+: MISMATCH$ ( -- str ) s" correct body with mismatched metadata" ;
 
 \ Rust's wrong_revision: the bytes answered as another rev.
 : MISREVISED ( ^ARENA:arena -- )
@@ -2370,19 +2371,19 @@ READ-CAP BUFFER: READ-BUF
 
 \ The answer q scripts blocks mismatch.txt durably for the reason w,
 \ and a second step sends nothing.
-: BLOCKS-MISMATCH ( [ -- ] ^u8 n ^ARENA:arena -- )
-   {: q w:^ wu:n ar :}
+: BLOCKS-MISMATCH ( [ -- ] str ^ARENA:arena -- )
+   {: q w:str ar :}
    TEST-DROPBOX:RESET q execute
    ar STEP-RUN {: d:str x :}
    MISMATCH$ s" expected-revision" ar REMOTE-FILE {: rem :}
    x s" mismatch.txt" rem INSTALLING drop
-   SB-RESET s" durable-plan mismatch.txt " SB-APPEND w wu SB-APPEND
+   SB-RESET s" durable-plan mismatch.txt " SB-APPEND w SB-APPEND
    SB$ ar COPIED {: e:str :}
-   x REPLAY-STEP REPORTED e str> REPORTS? TTRUE
+   x REPLAY-STEP REPORTED e REPORTS? TTRUE
    x PENDING-OF VEC:COUNT 0 T=
    x BLOCKED-OF {: held :}
    held VEC:COUNT 1 T=
-   held 0 VEC:AT @ HELD-FOR$ w wu T$=
+   held 0 VEC:AT @ HELD-FOR$ w T$=
    x REPLAY-STEP REPORTED COMPLETED 0 T=
    TEST-DROPBOX:SEEN$ DOWNLOAD$ T$=
    d x STEP-GONE ;
@@ -2411,27 +2412,27 @@ READ-CAP BUFFER: READ-BUF
    {: c st:n ar :}
    ar STEP-RUN {: d:str x :}
    c x RUN-LINK @ REPLAY-LINK:CLIENT !
-   s" global-" st ar NUMBERED str>
-   s" revision-" st ar NUMBERED str> ar REMOTE-FILE {: rem :}
+   s" global-" st ar NUMBERED
+   s" revision-" st ar NUMBERED ar REMOTE-FILE {: rem :}
    x s" global.txt" rem INSTALLING drop
    d x ;
 
 \ The step ends with E-DROPBOX, the reply w with the wait ms kept in
 \ the link and the plan still pending; the fake saw the requests s.
-: ENDS-STEP ( ^run ^u8 n n ^u8 n -- )
-   {: x w:^ wu:n ms:n s:^ su:n :}
+: ENDS-STEP ( ^run str n str -- )
+   {: x w:str ms:n s:str :}
    [: x STEPPED ;] REPLAY:E-DROPBOX TTHROWSQ
-   x RUN-LINK @ REPLAY-LINK:REPLY @ REPLY$ ms T= w wu T$=
+   x RUN-LINK @ REPLAY-LINK:REPLY @ REPLY$ ms T= w T$=
    x PENDING-OF VEC:COUNT 1 T=
    x BLOCKED-OF VEC:COUNT 0 T=
-   TEST-DROPBOX:SEEN$ s su T$= ;
+   TEST-DROPBOX:SEEN$ s T$= ;
 
 \ The answer q scripts for status st ends the step.
-: STAYS-GLOBAL ( [ -- ] n ^u8 n n ^ARENA:arena -- )
-   {: q st:n w:^ wu:n ms:n ar :}
+: STAYS-GLOBAL ( [ -- ] n str n ^ARENA:arena -- )
+   {: q st:n w:str ms:n ar :}
    TEST-DROPBOX:RESET q execute
    MAIN @ st ar GLOBAL-RUN {: d:str x :}
-   x w wu ms DOWNLOAD$ ENDS-STEP
+   x w ms DOWNLOAD$ ENDS-STEP
    d x STEP-GONE ;
 
 \ The client c, holding its first token, refreshes on a 401 and sends
@@ -2459,8 +2460,8 @@ READ-CAP BUFFER: READ-BUF
    [: RATE-LIMITED ;] 429 s" retry" 7000 ar STAYS-GLOBAL
    [: SERVER-ERROR ;] 500 s" retry" 0 ar STAYS-GLOBAL ;
 
-: EXPECTED$ ( -- ^u8 n ) s" expected download bytes" ;
-: OCCUPANT$ ( -- ^u8 n ) s" unrelated occupant bytes" ;
+: EXPECTED$ ( -- str ) s" expected download bytes" ;
+: OCCUPANT$ ( -- str ) s" unrelated occupant bytes" ;
 
 : STAGED? ( LOCAL:stage-outcome<n> -- bool )
    MATCH LOCAL:stage-outcome
@@ -2471,21 +2472,21 @@ READ-CAP BUFFER: READ-BUF
    ;MATCH ;
 
 \ The pipe's bytes, of identity c, staged as target t's download.
-: STAGE-FROM ( fd ^run ^u8 n DROPBOX:hash fd -- bool )
-   {: root:fd x t:^ tu:n c:DROPBOX:hash rd:fd :}
-   root x ROOT$ t tu c [: rd -rot LOCAL:FD-READ ;] x RUN-ARENA @
+: STAGE-FROM ( fd ^run str DROPBOX:hash fd -- bool )
+   {: root:fd x t:str c:DROPBOX:hash rd:fd :}
+   root x ROOT$ t c [: rd -rot LOCAL:FD-READ ;] x RUN-ARENA @
    LOCAL:STAGE-DOWNLOAD-AT STAGED? ;
 
 \ Rust's stage_download: b staged as target t's download.
-: PRESTAGED ( fd ^run ^u8 n ^u8 n -- )
-   {: root:fd x t:^ tu:n b:^ bu:n :}
-   b bu x RUN-ARENA @ IDENTITY {: c:DROPBOX:hash :}
+: PRESTAGED ( fd ^run str str -- )
+   {: root:fd x t:str b:str :}
+   b x RUN-ARENA @ IDENTITY {: c:DROPBOX:hash :}
    FD:PIPE {: rd:fd w:fd :}
-   w b bu FD:WRITE-FULL w FS:CLOSE-DIR
-   [: root x t tu c rd STAGE-FROM TTRUE ;] [: rd FS:CLOSE-DIR ;]
+   w b FD:WRITE-FULL w FS:CLOSE-DIR
+   [: root x t c rd STAGE-FROM TTRUE ;] [: rd FS:CLOSE-DIR ;]
    finally ;
 
-: ONE-NAME? ( ^u8 n -- bool )
+: ONE-NAME? ( str -- bool )
    10 INDEX-OF MATCH option
       none OF true ENDOF
       some OF drop false ENDOF
@@ -2495,14 +2496,14 @@ READ-CAP BUFFER: READ-BUF
 : STAGE-PATH ( ^run -- str )
    {: x :}
    x ROOT$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
-   READ-BUF u ONE-NAME? TTRUE
-   READ-BUF u >str s" .omabox-download-" >str STARTS-WITH? TTRUE
-   x RUN-ROOT @ READ-BUF u x RUN-ARENA @ INSIDE ;
+   READ-BUF u >str ONE-NAME? TTRUE
+   READ-BUF u >str s" .omabox-download-" STARTS-WITH? TTRUE
+   x RUN-ROOT @ READ-BUF u >str x RUN-ARENA @ INSIDE ;
 
-: HOLDS-BYTES ( str ^u8 n -- )
-   {: f:str b:^ bu:n :}
-   f str> READ-BUF READ-CAP FS:READ-ALL {: u:n :}
-   READ-BUF u b bu T$= ;
+: HOLDS-BYTES ( str str -- )
+   {: f:str b:str :}
+   f READ-BUF READ-CAP FS:READ-ALL {: u:n :}
+   READ-BUF u >str b T$= ;
 
 \ The stage of occupied.txt's download, holding other bytes, and the
 \ plan to install it.
@@ -2512,7 +2513,7 @@ READ-CAP BUFFER: READ-BUF
    [: root x s" occupied.txt" EXPECTED$ PRESTAGED ;]
    [: root FS:CLOSE-DIR ;] finally
    x STAGE-PATH {: sp:str :}
-   sp FS:REMOVE-FILE sp str> OCCUPANT$ FS:WRITE-ALL
+   sp FS:REMOVE-FILE sp OCCUPANT$ FS:WRITE-ALL
    EXPECTED$ s" occupied-stage-revision" x RUN-ARENA @ REMOTE-FILE
    {: rem :}
    sp x s" occupied.txt" rem INSTALLING ;
@@ -2522,7 +2523,7 @@ READ-CAP BUFFER: READ-BUF
    {: p sp:str ar :}
    SB-RESET s" stage-destination-occupied " SB-APPEND
    p ID-OF JOURNAL:PLAN-ID>N FMT:SB-INT
-   s"  " SB-APPEND sp str> SB-APPEND SB$ ar COPIED ;
+   s"  " SB-APPEND sp SB-APPEND SB$ ar COPIED ;
 
 : OCCUPIED-DOWNLOAD-STAGE-IS-DURABLY-BLOCKED-WITHOUT-OVERWRITE-OR-REQUEST
    ( ^ARENA:arena -- )
@@ -2533,7 +2534,7 @@ READ-CAP BUFFER: READ-BUF
    ar STEP-RUN {: d:str x :}
    x OCCUPIED {: sp:str p :}
    p sp ar OCCUPIED-ENTRY {: e:str :}
-   x REPLAY-STEP REPORTED e str> REPORTS? TTRUE
+   x REPLAY-STEP REPORTED e REPORTS? TTRUE
    sp OCCUPANT$ HOLDS-BYTES
    x PENDING-OF VEC:COUNT 0 T=
    x BLOCKED-OF {: held :}
@@ -2545,22 +2546,22 @@ READ-CAP BUFFER: READ-BUF
 5 constant DOWNLOAD-COUNT
 4 constant COMPLETED-BATCH
 
-: BATCH$ ( -- ^u8 n ) s" install each bounded batch" ;
+: BATCH$ ( -- str ) s" install each bounded batch" ;
 
 \ batch-<k>.txt and its own rev, batch-<k>.
 : BATCH ( n ^ARENA:arena -- str str )
    {: k:n ar :}
    s" batch-" k ar NUMBERED {: v:str :}
-   SB-RESET v str> SB-APPEND s" .txt" SB-APPEND SB$ ar COPIED v ;
+   SB-RESET v SB-APPEND s" .txt" SB-APPEND SB$ ar COPIED v ;
 
 \ The fake serves batch file k's bytes, the last's only past a byte it
 \ does not keep, so its download from the start answers 500.
 : BATCH-SERVED ( str str n ^ARENA:arena -- )
    {: p:str v:str k:n ar :}
-   p str> v str> BATCH$ ar FILE-AT
-   BATCH$ {: b:^ bu:n :}
-   k COMPLETED-BATCH < if v str> b bu TEST-DROPBOX:CONTENT! exit then
-   v str> 1 b 1 + bu 1 - TEST-DROPBOX:CONTENT-TAIL! ;
+   p v BATCH$ ar FILE-AT
+   BATCH$ {: b:str :}
+   k COMPLETED-BATCH < if v b TEST-DROPBOX:CONTENT! exit then
+   v 1 b 1 b str> nip PART TEST-DROPBOX:CONTENT-TAIL! ;
 
 \ Batch file k, served, and its pending plan.
 : BATCHED ( ^run n -- )
@@ -2568,14 +2569,14 @@ READ-CAP BUFFER: READ-BUF
    x RUN-ARENA @ {: ar :}
    k ar BATCH {: p:str v:str :}
    p v k ar BATCH-SERVED
-   BATCH$ v str> ar REMOTE-FILE {: rem :}
-   x p str> rem INSTALLING drop ;
+   BATCH$ v ar REMOTE-FILE {: rem :}
+   x p rem INSTALLING drop ;
 
 \ Whether batch file k is installed, holding the batch's bytes.
 : INSTALLED? ( ^run n -- bool )
    {: x k:n :}
    k x RUN-ARENA @ BATCH drop {: p:str :}
-   x RUN-ROOT @ p str> x RUN-ARENA @ INSIDE {: f:str :}
+   x RUN-ROOT @ p x RUN-ARENA @ INSIDE {: f:str :}
    f FS:FILE? 0= if false exit then
    f BATCH$ HOLDS-BYTES true ;
 
@@ -2599,7 +2600,7 @@ READ-CAP BUFFER: READ-BUF
    TEST-DROPBOX:SEEN$ DOWNLOAD-COUNT DOWNLOADS$ T$=
    d x STEP-GONE ;
 
-: FALLBACK$ ( -- ^u8 n ) s" fallback download" ;
+: FALLBACK$ ( -- str ) s" fallback download" ;
 
 \ S_IFSOCK, the file type of a socket.
 $C000 constant S-IFSOCK
@@ -2613,7 +2614,7 @@ $100 constant MODE-0400
    {: x k:n :}
    x RUN-ARENA @ {: ar :}
    s" .omabox-download-slot-" k ar NUMBERED {: nm:str :}
-   x RUN-STAGING @ nm str> ar INSIDE ;
+   x RUN-STAGING @ nm ar INSIDE ;
 
 : UNKNOWN$ ( n ^ARENA:arena -- str )
    {: k:n ar :}
@@ -2624,10 +2625,10 @@ $100 constant MODE-0400
 : UNKNOWN-SLOTS ( ^run -- fd )
    {: x :}
    SLOTS 1 ?do
-      x i SLOT-AT str> i x RUN-ARENA @ UNKNOWN$ str> FS:WRITE-ALL
+      x i SLOT-AT i x RUN-ARENA @ UNKNOWN$ FS:WRITE-ALL
    loop
    x 1 SLOT-AT MODE-0400 FS:CHMOD-MODE
-   x 0 SLOT-AT str> SOCKET-AT ;
+   x 0 SLOT-AT SOCKET-AT ;
 
 \ Slot 0 is still a socket, and the others hold their bytes.
 : SLOTS-KEPT ( ^run -- )
@@ -2635,7 +2636,7 @@ $100 constant MODE-0400
    x 0 SLOT-AT FS:TRY-LSTAT TTRUE
    FS:STAT-MODE@ FS:S-IFMT and S-IFSOCK T=
    SLOTS 1 ?do
-      x i SLOT-AT i x RUN-ARENA @ UNKNOWN$ str> HOLDS-BYTES
+      x i SLOT-AT i x RUN-ARENA @ UNKNOWN$ HOLDS-BYTES
    loop ;
 
 : UNKNOWN-DOWNLOAD-SLOTS-ARE-PRESERVED-WITH-DISPOSABLE-FALLBACK
@@ -2649,12 +2650,12 @@ $100 constant MODE-0400
    s" fallback.txt" s" fallback-revision" FALLBACK$ ar SERVES
    FALLBACK$ s" fallback-revision" ar REMOTE-FILE {: rem :}
    x s" fallback.txt" rem INSTALLING drop
-   s" Dropbox could not be reached." >str
+   s" Dropbox could not be reached."
    x RUN-LINK @ REPLAY-LINK:STATUS @ STATUS:ERROR
    x REPLAY-STEP REPORTED COMPLETED 1 T=
-   d s" omabox/status.json" ar INSIDE str> READ-BUF READ-CAP FS:READ-ALL
+   d s" omabox/status.json" ar INSIDE READ-BUF READ-CAP FS:READ-ALL
    {: u:n :}
-   READ-BUF u S\" \qlast_error\q:null" CONTAINS? TTRUE
+   READ-BUF u >str S\" \qlast_error\q:null" CONTAINS? TTRUE
    x RUN-ROOT @ s" fallback.txt" ar INSIDE FALLBACK$ HOLDS-BYTES
    x SLOTS-KEPT
    TEST-DROPBOX:SEEN$ 1 DOWNLOADS$ T$=
@@ -2667,15 +2668,15 @@ TYPED-VARIABLE LIVE-ROOT str
 TYPED-VARIABLE OLD-ROOT str
 TYPED-VARIABLE CANARY str
 
-: CANARY$ ( -- ^u8 n ) s" replacement bytes" ;
-: SWAPPED$ ( -- ^u8 n ) s" descriptor-bound download" ;
+: CANARY$ ( -- str ) s" replacement bytes" ;
+: SWAPPED$ ( -- str ) s" descriptor-bound download" ;
 
 \ Rust's swap: the root renamed old-root, and a new root holding
 \ canary.txt.
 : SWAP-ROOT ( -- )
    LIVE-ROOT @ OLD-ROOT @ FS:RENAME-FILE
-   LIVE-ROOT @ str> FS:MAKE-DIR
-   CANARY @ str> CANARY$ FS:WRITE-ALL ;
+   LIVE-ROOT @ FS:MAKE-DIR
+   CANARY @ CANARY$ FS:WRITE-ALL ;
 
 \ The swap's paths for the run x in the case directory d.
 : SWAP-AT ( str ^run -- )
@@ -2695,28 +2696,28 @@ TYPED-VARIABLE CANARY str
 : REPLACEMENT-KEPT ( ^run -- )
    {: x :}
    x ROOT$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
-   READ-BUF u s" canary.txt" T$=
+   READ-BUF u >str s" canary.txt" T$=
    CANARY @ CANARY$ HOLDS-BYTES ;
 
 \ Whether a name in the list starts with .omabox-download-.
-: STAGE-LISTED? ( ^u8 n -- bool )
-   {: l:^ u:n :}
-   l u >str s" .omabox-download-" >str STARTS-WITH? if true exit then
-   l u 10 INDEX-OF MATCH option
+: STAGE-LISTED? ( str -- bool )
+   {: l:str :}
+   l s" .omabox-download-" STARTS-WITH? if true exit then
+   l 10 INDEX-OF MATCH option
       none OF false ENDOF
-      some OF IDX>N 1+ {: k:n :} l k + u k - RECURSE ENDOF
+      some OF IDX>N 1+ {: k:n :} l k l str> nip PART RECURSE ENDOF
    ;MATCH ;
 
 \ old-root holds no download.txt, and a download's stage.
 : OLD-ROOT-STAGED ( ^ARENA:arena -- )
    {: ar :}
    OLD-ROOT @ s" download.txt" ar INSIDE FS:EXISTS? TFALSE
-   OLD-ROOT @ str> READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
-   READ-BUF u STAGE-LISTED? TTRUE ;
+   OLD-ROOT @ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
+   READ-BUF u >str STAGE-LISTED? TTRUE ;
 
-: NO-BASELINE? ( ^run ^u8 n -- bool )
-   {: x p:^ u:n :}
-   x RUN-JOURNAL @ p u DISPLAY x RUN-ARENA @ JOURNAL:BASELINE
+: NO-BASELINE? ( ^run str -- bool )
+   {: x p:str :}
+   x RUN-JOURNAL @ p DISPLAY x RUN-ARENA @ JOURNAL:BASELINE
    MATCH option
       none OF true ENDOF
       some OF drop false ENDOF
@@ -2742,8 +2743,8 @@ TYPED-VARIABLE CANARY str
    TEST-DROPBOX:SEEN$ 1 DOWNLOADS$ T$=
    d x STEP-GONE ;
 
-: HELD$ ( -- ^u8 n ) s" first download held open by the fake server" ;
-: NEXT$ ( -- ^u8 n ) s" download introduced by the next pass" ;
+: HELD$ ( -- str ) s" first download held open by the fake server" ;
+: NEXT$ ( -- str ) s" download introduced by the next pass" ;
 
 : GENERATION ( ^run -- n )
    {: x :}
@@ -2809,7 +2810,7 @@ TYPED-VARIABLE CANARY str
    x RUN-ARENA @ {: ar :}
    HELD$ ar PAST-HASH {: c:DROPBOX:hash :}
    s" /a.bin" s" rev-held-slot" HELD$ c SERVES-PAST
-   c s" rev-held-slot" >str DROPBOX:>REV MODEL-REMOTE:MAKE {: rem :}
+   c s" rev-held-slot" DROPBOX:>REV MODEL-REMOTE:MAKE {: rem :}
    x s" a.bin" rem INSTALLING {: p :}
    x p BLOCKED-AHEAD
    x p c HELD-SLOT
@@ -2819,13 +2820,13 @@ TYPED-VARIABLE CANARY str
 : HELD-SLOT-PATH ( ^run -- str )
    {: x :}
    x STAGING$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
-   READ-BUF u ONE-NAME? TTRUE
-   READ-BUF u >str s" .omabox-download-slot-" >str STARTS-WITH? TTRUE
-   x RUN-STAGING @ READ-BUF u x RUN-ARENA @ INSIDE ;
+   READ-BUF u >str ONE-NAME? TTRUE
+   READ-BUF u >str s" .omabox-download-slot-" STARTS-WITH? TTRUE
+   x RUN-STAGING @ READ-BUF u >str x RUN-ARENA @ INSIDE ;
 
-: IN-ROOT ( ^run ^u8 n -- str )
-   {: x p:^ u:n :}
-   x RUN-ROOT @ p u x RUN-ARENA @ INSIDE ;
+: IN-ROOT ( ^run str -- str )
+   {: x p:str :}
+   x RUN-ROOT @ p x RUN-ARENA @ INSIDE ;
 
 \ Plan b pending, and one step installing it, from the start.
 : NEXT-STEPPED ( ^run -- )
@@ -2850,7 +2851,7 @@ TYPED-VARIABLE CANARY str
    f FS:FILE-SIZE u T=
    f FS:OPEN-SIZED TTRUE drop {: h:fd :}
    h ar LOCAL:DROPBOX-CONTENT-HASH h FS:CLOSE-DIR {: got:DROPBOX:hash :}
-   got DROPBOX:HASH>STR str> c DROPBOX:HASH>STR str> T$= ;
+   got DROPBOX:HASH>STR c DROPBOX:HASH>STR T$= ;
 
 \ Whether f is a file of u bytes.
 : SIZED? ( str n -- bool )
@@ -2863,7 +2864,7 @@ TYPED-VARIABLE CANARY str
    {: x p c:DROPBOX:hash :}
    x p UNBLOCKED
    x STEPPED
-   x s" a.bin" IN-ROOT c CHECKPOINT HELD$ nip + x RUN-ARENA @
+   x s" a.bin" IN-ROOT c CHECKPOINT HELD$ str> nip + x RUN-ARENA @
    HOLDS-CONTENT
    RESUMED-RANGE
    TEST-DROPBOX:SEEN$ 2 DOWNLOADS$ T$= ;
@@ -2883,7 +2884,7 @@ TYPED-VARIABLE CANARY str
    d x STEP-GONE ;
 
 \ The bytes legacy.txt's download installs.
-: LEGACY$ ( -- ^u8 n ) s" legacy download" ;
+: LEGACY$ ( -- str ) s" legacy download" ;
 
 : LEGACY-PRESERVATION-BEFORE-A-DOWNLOAD-REPLAYS-ONCE ( ^ARENA:arena -- )
    {: ar :}
@@ -2901,13 +2902,13 @@ TYPED-VARIABLE CANARY str
    x s" legacy.txt" IN-ROOT LEGACY$ HOLDS-BYTES
    d x STEP-GONE ;
 
-: FETCHED$ ( -- ^u8 n ) s" Dropbox bytes the install never places" ;
-: WRITTEN$ ( -- ^u8 n ) s" local bytes written during the download" ;
+: FETCHED$ ( -- str ) s" Dropbox bytes the install never places" ;
+: WRITTEN$ ( -- str ) s" local bytes written during the download" ;
 
 \ The install's destination the race writes; it runs on the fake's task.
 TYPED-VARIABLE RACED-INSTALL str
 
-: RACE-INSTALL ( -- ) RACED-INSTALL @ str> WRITTEN$ FS:WRITE-ALL ;
+: RACE-INSTALL ( -- ) RACED-INSTALL @ WRITTEN$ FS:WRITE-ALL ;
 
 : RETRY-ERROR-STAYS-WHEN-NO-INSTALL-COMPLETES ( ^ARENA:arena -- )
    {: ar :}
@@ -2919,14 +2920,14 @@ TYPED-VARIABLE RACED-INSTALL str
    x s" raced.txt" rem INSTALLING drop
    x s" raced.txt" IN-ROOT RACED-INSTALL !
    [: RACE-INSTALL ;] TEST-DROPBOX:DURING-DOWNLOAD!
-   s" Dropbox could not be reached." >str
+   s" Dropbox could not be reached."
    x RUN-LINK @ REPLAY-LINK:STATUS @ STATUS:ERROR
    x REPLAY-STEP REPORTED {: rep :}
    rep COMPLETED 0 T=
    rep BLOCKS VEC:COUNT 1 T=
-   d s" omabox/status.json" ar INSIDE str> READ-BUF READ-CAP FS:READ-ALL
+   d s" omabox/status.json" ar INSIDE READ-BUF READ-CAP FS:READ-ALL
    {: u:n :}
-   READ-BUF u s" Dropbox could not be reached." CONTAINS? TTRUE
+   READ-BUF u >str s" Dropbox could not be reached." CONTAINS? TTRUE
    x s" raced.txt" IN-ROOT WRITTEN$ HOLDS-BYTES
    d x STEP-GONE ;
 
@@ -2944,16 +2945,16 @@ TYPED-VARIABLE RACED-INSTALL str
 
 \ ---- the pass against the fake Dropbox -----------------------------
 
-: LIST$ ( -- ^u8 n ) s" /2/files/list_folder" ;
-: UPLOAD-ROUTE$ ( -- ^u8 n ) s" /2/files/upload" ;
-: METADATA-ROUTE$ ( -- ^u8 n ) s" /2/files/get_metadata" ;
-: DELETE$ ( -- ^u8 n ) s" /2/files/delete_v2" ;
-: UPLOAD-SEEN$ ( -- ^u8 n ) s" /2/files/list_folder /2/files/upload" ;
-: PASS-SEEN$ ( -- ^u8 n )
+: LIST$ ( -- str ) s" /2/files/list_folder" ;
+: UPLOAD-ROUTE$ ( -- str ) s" /2/files/upload" ;
+: METADATA-ROUTE$ ( -- str ) s" /2/files/get_metadata" ;
+: DELETE$ ( -- str ) s" /2/files/delete_v2" ;
+: UPLOAD-SEEN$ ( -- str ) s" /2/files/list_folder /2/files/upload" ;
+: PASS-SEEN$ ( -- str )
    s" /2/files/list_folder /2/files/download /2/files/upload" ;
 
-: UPLOAD$ ( -- ^u8 n ) s" local upload" ;
-: REMOTE$ ( -- ^u8 n ) s" remote download" ;
+: UPLOAD$ ( -- str ) s" local upload" ;
+: REMOTE$ ( -- str ) s" remote download" ;
 
 \ The pass's report; any other outcome ends the run.
 : COMPLETE ( outcome -- report )
@@ -2968,8 +2969,8 @@ TYPED-VARIABLE RACED-INSTALL str
 : PASS-READY ( str ^run -- str )
    {: d:str x :}
    d s" recovery" x RUN-ARENA @ INSIDE {: rec:str :}
-   rec str> FS:MAKE-DIR
-   s" " >str x RUN-LINK @ REPLAY-LINK:ROOT !
+   rec FS:MAKE-DIR
+   s" " x RUN-LINK @ REPLAY-LINK:ROOT !
    rec ;
 
 \ PASS over the run, with the recovery directory rec.
@@ -2979,11 +2980,11 @@ TYPED-VARIABLE RACED-INSTALL str
    x RUN-ARENA @ PASS ;
 
 \ The one listing page, cursor k: /<p> at rev v with b's identity.
-: LISTED-ALONE ( ^u8 n ^u8 n ^u8 n ^u8 n ^ARENA:arena -- )
-   {: p:^ pu:n v:^ vu:n b:^ bu:n k:^ ku:n ar :}
-   b bu ar IDENTITY {: h:DROPBOX:hash :}
-   SB-RESET s" /" SB-APPEND p pu SB-APPEND SB$ ar COPIED {: l:str :}
-   [: l str> l str> v vu h FILE-JSON+ ;] ar ENTRIES k ku false PAGE ;
+: LISTED-ALONE ( str str str str ^ARENA:arena -- )
+   {: p:str v:str b:str k:str ar :}
+   b ar IDENTITY {: h:DROPBOX:hash :}
+   SB-RESET s" /" SB-APPEND p SB-APPEND SB$ ar COPIED {: l:str :}
+   [: l l v h FILE-JSON+ ;] ar ENTRIES k false PAGE ;
 
 \ Rust's fixture: upload.txt in the root, download.txt served and on
 \ the one listing page; answers the recovery directory.
@@ -2991,7 +2992,7 @@ TYPED-VARIABLE RACED-INSTALL str
    {: d:str x :}
    x RUN-ARENA @ {: ar :}
    d x PASS-READY {: rec:str :}
-   x s" upload.txt" IN-ROOT str> UPLOAD$ FS:WRITE-ALL
+   x s" upload.txt" IN-ROOT UPLOAD$ FS:WRITE-ALL
    s" download.txt" s" rev-download" REMOTE$ ar SERVES
    s" download.txt" s" rev-download" REMOTE$ s" cursor-complete" ar
    LISTED-ALONE
@@ -3003,24 +3004,24 @@ TYPED-VARIABLE RACED-INSTALL str
    replayed 2 T= planned 2 T= blocked 0 T= conflicts 0 T= ;
 
 \ The baseline at path p is present as rem.
-: BASELINE-AT ( ^run ^u8 n MODEL:remote -- )
-   {: x p:^ u:n rem :}
-   x RUN-JOURNAL @ p u DISPLAY x RUN-ARENA @ JOURNAL:BASELINE
+: BASELINE-AT ( ^run str MODEL:remote -- )
+   {: x p:str rem :}
+   x RUN-JOURNAL @ p DISPLAY x RUN-ARENA @ JOURNAL:BASELINE
    STORED-BASELINE rem MODEL-BASELINE:PRESENT MODEL:BASELINE= TTRUE ;
 
 \ An add upload's argument as DROPBOX writes it for b at path p, in SB.
-: ADD-ARG$ ( ^u8 n ^u8 n ^ARENA:arena -- ^u8 n )
-   {: p:^ u:n b:^ bu:n ar :}
-   b bu ar IDENTITY DROPBOX:HASH>STR str> {: h:^ hu:n :}
-   SB-RESET S\" {\qpath\q:\q" SB-APPEND p u SB-APPEND
+: ADD-ARG$ ( str str ^ARENA:arena -- str )
+   {: p:str b:str ar :}
+   b ar IDENTITY DROPBOX:HASH>STR {: h:str :}
+   SB-RESET S\" {\qpath\q:\q" SB-APPEND p SB-APPEND
    S\" \q,\qmode\q:\qadd\q,\qautorename\q:false," SB-APPEND
    S\" \qstrict_conflict\q:true,\qcontent_hash\q:\q" SB-APPEND
-   h hu SB-APPEND S\" \q}" SB-APPEND SB$ ;
+   h SB-APPEND S\" \q}" SB-APPEND SB$ ;
 
 \ The last upload's argument is ADD-ARG$'s. The fake commits only a body
 \ that hashes to it: Rust's body assert.
-: UPLOAD-SENT ( ^u8 n ^u8 n ^ARENA:arena -- )
-   ADD-ARG$ TEST-DROPBOX:ARG-SENT$ 2swap T$= ;
+: UPLOAD-SENT ( str str ^ARENA:arena -- )
+   ADD-ARG$ TEST-DROPBOX:ARG-SENT$ swap T$= ;
 
 : ONE-RECONCILIATION-PASS-SYNCHRONIZES-FILES-IN-BOTH-DIRECTIONS
    ( ^ARENA:arena -- )
@@ -3046,11 +3047,11 @@ TYPED-VARIABLE RACED-INSTALL str
 
 \ ---- stale installs against the fake Dropbox -----------------------
 
-: OBSOLETE$ ( -- ^u8 n ) s" obsolete Dropbox bytes" ;
-: MATCHING$ ( -- ^u8 n ) s" matching current bytes" ;
-: LOCAL-EDIT$ ( -- ^u8 n ) s" later local edit" ;
-: STALE-LOCAL$ ( -- ^u8 n ) s" current local bytes" ;
-: UNRELATED-STAGE$ ( -- ^u8 n ) s" unrelated stage bytes" ;
+: OBSOLETE$ ( -- str ) s" obsolete Dropbox bytes" ;
+: MATCHING$ ( -- str ) s" matching current bytes" ;
+: LOCAL-EDIT$ ( -- str ) s" later local edit" ;
+: STALE-LOCAL$ ( -- str ) s" current local bytes" ;
+: UNRELATED-STAGE$ ( -- str ) s" unrelated stage bytes" ;
 
 \ Rust's stale: the obsolete bytes at stale-revision.
 : STALE-REMOTE ( ^ARENA:arena -- MODEL:remote )
@@ -3058,29 +3059,29 @@ TYPED-VARIABLE RACED-INSTALL str
    OBSOLETE$ s" stale-revision" ar REMOTE-FILE ;
 
 \ Rust's stale_install, recorded pending at path p.
-: STALE-INSTALL ( ^run ^u8 n -- )
-   {: x p:^ u:n :}
-   x p u x RUN-ARENA @ STALE-REMOTE INSTALLING drop ;
+: STALE-INSTALL ( ^run str -- )
+   {: x p:str :}
+   x p x RUN-ARENA @ STALE-REMOTE INSTALLING drop ;
 
 \ A case's run with file.txt holding b and a stale install pending
 \ there; answers the recovery directory.
-: STALE-FILE ( ^u8 n ^ARENA:arena -- str ^run str )
-   {: b:^ bu:n ar :}
+: STALE-FILE ( str ^ARENA:arena -- str ^run str )
+   {: b:str ar :}
    ar STEP-RUN {: d:str x :}
    d x PASS-READY {: rec:str :}
-   x s" file.txt" IN-ROOT str> b bu FS:WRITE-ALL
+   x s" file.txt" IN-ROOT b FS:WRITE-ALL
    x s" file.txt" STALE-INSTALL
    d x rec ;
 
-: EMPTY-PAGE ( ^u8 n ^ARENA:arena -- )
-   {: k:^ ku:n ar :}
-   [: ;] ar ENTRIES k ku false PAGE ;
+: EMPTY-PAGE ( str ^ARENA:arena -- )
+   {: k:str ar :}
+   [: ;] ar ENTRIES k false PAGE ;
 
 \ Rust's unsupported_file_metadata: not downloadable, export only.
-: UNSUPPORTED-FILE-JSON+ ( ^u8 n ^u8 n ^u8 n -- )
-   {: l:^ lu:n d:^ du:n r:^ ru:n :}
-   S\" {\q.tag\q:\qfile\q" SB-APPEND l lu d du PATHS+
-   S\" ,\qrev\q:" SB-APPEND r ru QUOTED+
+: UNSUPPORTED-FILE-JSON+ ( str str str -- )
+   {: l:str d:str r:str :}
+   S\" {\q.tag\q:\qfile\q" SB-APPEND l d PATHS+
+   S\" ,\qrev\q:" SB-APPEND r QUOTED+
    S\" ,\qsize\q:0,\qis_downloadable\q:false," SB-APPEND
    S\" \qexport_info\q:{\qexport_as\q:\qhtml\q}}" SB-APPEND ;
 
@@ -3111,7 +3112,7 @@ TYPED-VARIABLE RACED-INSTALL str
    s" after-local-edit" ar EMPTY-PAGE
    s" file.txt" s" current-revision" MATCHING$ ar FILE-AT ;
 
-: MATCHING-SEEN$ ( -- ^u8 n )
+: MATCHING-SEEN$ ( -- str )
    SB-RESET s" /2/files/list_folder " SB-APPEND
    CONTINUE$ SB-APPEND s"  " SB-APPEND CONTINUE$ SB-APPEND
    s"  /2/files/upload" SB-APPEND SB$ ;
@@ -3129,7 +3130,7 @@ TYPED-VARIABLE RACED-INSTALL str
    x s" file.txt" MATCHING$ s" current-revision" ar REMOTE-FILE
    BASELINE-AT
    x rec PASSED COMPLETE STALE-NOOPED
-   x s" file.txt" IN-ROOT str> LOCAL-EDIT$ FS:WRITE-ALL
+   x s" file.txt" IN-ROOT LOCAL-EDIT$ FS:WRITE-ALL
    x rec PASSED COMPLETE 1 1 0 COUNTED
    x PENDING-OF VEC:COUNT 0 T=
    x s" file.txt" LOCAL-EDIT$ s" 01701" ar REMOTE-FILE BASELINE-AT
@@ -3174,7 +3175,7 @@ TYPED-VARIABLE RACED-INSTALL str
    [: root FS:CLOSE-DIR ;] finally
    x STAGE-PATH {: sp:str :}
    sp $180 FS:CHMOD-MODE
-   sp str> UNRELATED-STAGE$ FS:WRITE-ALL
+   sp UNRELATED-STAGE$ FS:WRITE-ALL
    sp ;
 
 : A-PENDING-ONLY-PATH-RETIRES-WITHOUT-FETCHING-OBSOLETE-BYTES
@@ -3222,28 +3223,28 @@ TYPED-VARIABLE RACED-INSTALL str
 \ Rust's record_blocked_install: INSTALLING's plan at path a, held as
 \ download-unavailable 409 until at, in seconds since the epoch.
 : RECORD-BLOCKED-INSTALL
-   ( ^run ^u8 n MODEL:remote n -- JOURNAL:plan-record )
-   {: x a:^ u:n rem at:n :}
-   x a u rem INSTALLING {: p :}
+   ( ^run str MODEL:remote n -- JOURNAL:plan-record )
+   {: x a:str rem at:n :}
+   x a rem INSTALLING {: p :}
    x p ID-OF 409 MODEL-BLOCKAGE:DOWNLOAD-UNAVAILABLE at BLOCKED-UNTIL
    p ;
 
-: INDEPENDENT-UPLOAD$ ( -- ^u8 n ) s" independent upload" ;
-: INDEPENDENT-DOWNLOAD$ ( -- ^u8 n ) s" independent download" ;
-: UNAVAILABLE-DOWNLOAD$ ( -- ^u8 n ) s" unavailable download" ;
+: INDEPENDENT-UPLOAD$ ( -- str ) s" independent upload" ;
+: INDEPENDENT-DOWNLOAD$ ( -- str ) s" independent download" ;
+: UNAVAILABLE-DOWNLOAD$ ( -- str ) s" unavailable download" ;
 
 \ Rust's lookup_error("not_found").
-: LOOKUP-NOT-FOUND$ ( -- ^u8 n )
+: LOOKUP-NOT-FOUND$ ( -- str )
    S\" {\qerror_summary\q:\qpath/not_found/...\q,\qerror\q:{\q.tag\q:\qpath\q,\qpath\q:{\q.tag\q:\qnot_found\q}}}" ;
 
-: UNDECODABLE-ARG$ ( -- ^u8 n )
+: UNDECODABLE-ARG$ ( -- str )
    S\" Error in call to API function \qfiles/download\q: HTTP header \qDropbox-API-Arg\q: could not decode input as JSON" ;
 
 \ Rust's failure, status st with body b, which only the download of
 \ rev-blocked gets.
-: BLOCKED-ANSWER ( n ^u8 n -- )
-   {: st:n b:^ bu:n :}
-   DOWNLOAD$ s" rev-blocked" st s" " s" " b bu
+: BLOCKED-ANSWER ( n str -- )
+   {: st:n b:str :}
+   DOWNLOAD$ s" rev-blocked" st s" " s" " b
    TEST-DROPBOX:ARG-SCRIPT! ;
 
 \ Rust's listing: blocked.txt and good.txt, each at its own rev.
@@ -3261,7 +3262,7 @@ TYPED-VARIABLE RACED-INSTALL str
    {: d:str x :}
    x RUN-ARENA @ {: ar :}
    d x PASS-READY {: rec:str :}
-   x s" upload.txt" IN-ROOT str> INDEPENDENT-UPLOAD$ FS:WRITE-ALL
+   x s" upload.txt" IN-ROOT INDEPENDENT-UPLOAD$ FS:WRITE-ALL
    s" good.txt" s" rev-good" INDEPENDENT-DOWNLOAD$ ar SERVES
    ar ISOLATION-PAGE
    rec ;
@@ -3280,7 +3281,7 @@ TYPED-VARIABLE RACED-INSTALL str
    held VEC:COUNT 1 T=
    held 0 PLAN-PATH$ s" blocked.txt" T$=
    s" download-unavailable " st x RUN-ARENA @ NUMBERED {: w:str :}
-   held 0 VEC:AT @ HELD-FOR$ w str> T$= ;
+   held 0 VEC:AT @ HELD-FOR$ w T$= ;
 
 : UNAVAILABLE-ENTRY ( n ^ARENA:arena -- str )
    {: st:n ar :}
@@ -3288,7 +3289,7 @@ TYPED-VARIABLE RACED-INSTALL str
 
 \ Rust's five requests but the account call; the fake serves good.txt's
 \ bytes only to an argument naming rev-good.
-: ISOLATION-SEEN$ ( -- ^u8 n )
+: ISOLATION-SEEN$ ( -- str )
    s" /2/files/list_folder /2/files/download /2/files/download /2/files/upload" ;
 
 \ The run's journal file in d.
@@ -3312,7 +3313,7 @@ TYPED-VARIABLE RACED-INSTALL str
    {: d:str x st:n :}
    d x REOPENED
    TEST-DROPBOX:RESET
-   x REPLAY-STEP REPORTED st x RUN-ARENA @ UNAVAILABLE-ENTRY str>
+   x REPLAY-STEP REPORTED st x RUN-ARENA @ UNAVAILABLE-ENTRY
    REPORTS? TTRUE
    TEST-DROPBOX:SEEN$ s" " T$= ;
 
@@ -3329,7 +3330,7 @@ TYPED-VARIABLE RACED-INSTALL str
    x REPLAY-STEP REPORTED {: settled :}
    x ISOLATION-FILES
    x st BLOCKED-ALONE
-   settled st ar UNAVAILABLE-ENTRY str> REPORTS? TTRUE
+   settled st ar UNAVAILABLE-ENTRY REPORTS? TTRUE
    TEST-DROPBOX:SEEN$ ISOLATION-SEEN$ T$=
    d x st BLOCK-KEPT
    d x STEP-GONE ;
@@ -3358,7 +3359,7 @@ TYPED-VARIABLE RACED-INSTALL str
    418 [: 418 s" {}" BLOCKED-ANSWER ;] ar
    ASSERT-DOWNLOAD-FAILURE-BLOCKS-ONLY-ITS-PLAN ;
 
-: DUE$ ( -- ^u8 n ) s" download available on retry" ;
+: DUE$ ( -- str ) s" download available on retry" ;
 
 \ due.txt served and listed, and its plan blocked with its retry due.
 : DUE-BLOCKED ( ^run -- )
@@ -3386,7 +3387,7 @@ TYPED-VARIABLE RACED-INSTALL str
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/download" T$=
    d x STEP-GONE ;
 
-: UNKNOWN-REMOTE$ ( -- ^u8 n ) s" remote bytes" ;
+: UNKNOWN-REMOTE$ ( -- str ) s" remote bytes" ;
 
 \ unknown.txt listed, a dangling symlink in the root, and its plan
 \ blocked with its retry due.
@@ -3395,7 +3396,7 @@ TYPED-VARIABLE RACED-INSTALL str
    x RUN-ARENA @ {: ar :}
    s" unknown.txt" s" rev-unknown" UNKNOWN-REMOTE$ s" cursor-unknown" ar
    LISTED-ALONE
-   s" missing-target" >str x s" unknown.txt" IN-ROOT FS:MAKE-SYMLINK
+   s" missing-target" x s" unknown.txt" IN-ROOT FS:MAKE-SYMLINK
    UNKNOWN-REMOTE$ s" rev-unknown" ar REMOTE-FILE {: rem :}
    x s" unknown.txt" rem 0 RECORD-BLOCKED-INSTALL ;
 
@@ -3416,7 +3417,7 @@ TYPED-VARIABLE RACED-INSTALL str
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$=
    d x STEP-GONE ;
 
-: NEW-REMOTE$ ( -- ^u8 n ) s" new remote bytes" ;
+: NEW-REMOTE$ ( -- str ) s" new remote bytes" ;
 
 \ changed.txt served and listed at rev-new-current, and the plan for
 \ rev-old-blocked held until at.
@@ -3429,7 +3430,7 @@ TYPED-VARIABLE RACED-INSTALL str
    s" old remote bytes" s" rev-old-blocked" ar REMOTE-FILE {: old :}
    x s" changed.txt" old at RECORD-BLOCKED-INSTALL drop ;
 
-: NEW-REV-ARG$ ( -- ^u8 n ) S\" {\qpath\q:\qrev:rev-new-current\q}" ;
+: NEW-REV-ARG$ ( -- str ) S\" {\qpath\q:\qrev:rev-new-current\q}" ;
 
 \ Rust's changed_revision_supersedes_blocked_download.
 : CHANGED-REVISION-SUPERSEDES-BLOCKED-DOWNLOAD ( n ^ARENA:arena -- )
@@ -3509,24 +3510,24 @@ TYPED-VARIABLE RACED-INSTALL str
 
 \ Rust's record_fixture_plan: plan(b, l, r, Empty) recorded at path p.
 : RECORD-FIXTURE-PLAN
-   ( ^run ^u8 n MODEL:baseline MODEL:observation<MODEL:local>
+   ( ^run str MODEL:baseline MODEL:observation<MODEL:local>
      MODEL:observation<MODEL:remote> -- JOURNAL:plan-record )
-   {: x p:^ u:n b l r :}
+   {: x p:str b l r :}
    x RUN-ARENA @ {: ar :}
    b l r MODEL-SUBTREE:EMPTY PLANNER:PLAN ar PLANNED-OPERATIONS
    {: plan :}
-   x RUN-JOURNAL @ p u DISPLAY plan ar JOURNAL:RECORD-PLAN
+   x RUN-JOURNAL @ p DISPLAY plan ar JOURNAL:RECORD-PLAN
    WRITTEN TTRUE ;
 
 \ Rust's plan(Absent, Present(c), ConfirmedAbsent, Empty) at path p.
-: UPLOAD-PLANNED ( ^run ^u8 n DROPBOX:hash -- JOURNAL:plan-record )
-   {: x p:^ u:n c:DROPBOX:hash :}
-   x p u MODEL-BASELINE:ABSENT c MODEL-LOCAL:MAKE LOCAL-PRESENT
+: UPLOAD-PLANNED ( ^run str DROPBOX:hash -- JOURNAL:plan-record )
+   {: x p:str c:DROPBOX:hash :}
+   x p MODEL-BASELINE:ABSENT c MODEL-LOCAL:MAKE LOCAL-PRESENT
    REMOTE-ABSENT RECORD-FIXTURE-PLAN ;
 
 \ Rust's RemoteRejected { tag }.
-: REJECTED-AS ( ^u8 n -- MODEL:blockage )
-   >str MODEL-BLOCKAGE:REMOTE-REJECTED ;
+: REJECTED-AS ( str -- MODEL:blockage )
+   MODEL-BLOCKAGE:REMOTE-REJECTED ;
 
 : UPLOAD-STAGED? ( LOCAL:stage-outcome<^LOCAL:staged-upload> -- bool )
    MATCH LOCAL:stage-outcome
@@ -3537,16 +3538,16 @@ TYPED-VARIABLE RACED-INSTALL str
    ;MATCH ;
 
 \ Rust's stage_upload of path p's content c; answers the stage.
-: UPLOAD-STAGE ( ^run ^u8 n DROPBOX:hash -- str )
-   {: x p:^ u:n c:DROPBOX:hash :}
-   x ROOT$ p u x STAGING$ c x RUN-ARENA @ LOCAL:STAGE-UPLOAD
+: UPLOAD-STAGE ( ^run str DROPBOX:hash -- str )
+   {: x p:str c:DROPBOX:hash :}
+   x ROOT$ p x STAGING$ c x RUN-ARENA @ LOCAL:STAGE-UPLOAD
    UPLOAD-STAGED? TTRUE
-   x RUN-STAGING @ c DROPBOX:HASH>STR str> x RUN-ARENA @ INSIDE ;
+   x RUN-STAGING @ c DROPBOX:HASH>STR x RUN-ARENA @ INSIDE ;
 
-: REPAIR$ ( -- ^u8 n ) s" expected upload bytes" ;
-: CORRUPT$ ( -- ^u8 n ) s" corrupt private cache bytes" ;
+: REPAIR$ ( -- str ) s" expected upload bytes" ;
+: CORRUPT$ ( -- str ) s" corrupt private cache bytes" ;
 
-: REPAIR-SEEN$ ( -- ^u8 n )
+: REPAIR-SEEN$ ( -- str )
    s" /2/files/list_folder /2/files/upload /2/files/list_folder/continue" ;
 
 \ The listing's pages: none, then occupied.txt as the fake's first
@@ -3560,10 +3561,10 @@ TYPED-VARIABLE RACED-INSTALL str
 \ occupied.txt in the root, its upload stage holding other bytes.
 : CORRUPT-STAGED ( ^run -- )
    {: x :}
-   x s" occupied.txt" IN-ROOT str> REPAIR$ FS:WRITE-ALL
+   x s" occupied.txt" IN-ROOT REPAIR$ FS:WRITE-ALL
    x s" occupied.txt" REPAIR$ x RUN-ARENA @ IDENTITY UPLOAD-STAGE
    {: sp:str :}
-   sp FS:REMOVE-FILE sp str> CORRUPT$ FS:WRITE-ALL ;
+   sp FS:REMOVE-FILE sp CORRUPT$ FS:WRITE-ALL ;
 
 \ occupied.txt's upload plan, blocked for its occupied stage and due,
 \ as a journal opened again finds it.
@@ -3615,18 +3616,18 @@ TYPED-VARIABLE RACED-INSTALL str
    T-LABEL
    true swap ASSERT-CORRUPT-UPLOAD-STAGE-RECOVERS ;
 
-: BLOCKED-UPLOAD$ ( -- ^u8 n ) s" blocked upload" ;
-: SIBLING$ ( -- ^u8 n ) s" sibling upload" ;
+: BLOCKED-UPLOAD$ ( -- str ) s" blocked upload" ;
+: SIBLING$ ( -- str ) s" sibling upload" ;
 \ blocked.txt and good.txt in the root, and a symlink at blocked.txt's
 \ upload stage; answers the stage.
 : SPECIAL-STAGED ( ^run -- str )
    {: x :}
    x RUN-ARENA @ {: ar :}
-   x s" blocked.txt" IN-ROOT str> BLOCKED-UPLOAD$ FS:WRITE-ALL
-   x s" good.txt" IN-ROOT str> SIBLING$ FS:WRITE-ALL
-   BLOCKED-UPLOAD$ ar IDENTITY DROPBOX:HASH>STR str> {: h:^ hu:n :}
-   x RUN-STAGING @ h hu ar INSIDE {: sp:str :}
-   s" foreign-stage-target" >str sp FS:MAKE-SYMLINK
+   x s" blocked.txt" IN-ROOT BLOCKED-UPLOAD$ FS:WRITE-ALL
+   x s" good.txt" IN-ROOT SIBLING$ FS:WRITE-ALL
+   BLOCKED-UPLOAD$ ar IDENTITY DROPBOX:HASH>STR {: h:str :}
+   x RUN-STAGING @ h ar INSIDE {: sp:str :}
+   s" foreign-stage-target" sp FS:MAKE-SYMLINK
    sp ;
 
 : SPECIAL-REPORT ( report -- )
@@ -3650,7 +3651,7 @@ TYPED-VARIABLE RACED-INSTALL str
    d x PASS-READY {: rec:str :}
    x SPECIAL-STAGED {: sp:str :}
    x rec PASSED COMPLETE SPECIAL-REPORT
-   sp str> FS:SYMLINK? TTRUE
+   sp FS:SYMLINK? TTRUE
    x s" good.txt" SIBLING$ s" 01701" ar REMOTE-FILE BASELINE-AT
    x PENDING-OF VEC:COUNT 0 T=
    x STAGE-HELD
@@ -3658,20 +3659,20 @@ TYPED-VARIABLE RACED-INSTALL str
    s" /good.txt" SIBLING$ ar UPLOAD-SENT
    d x STEP-GONE ;
 
-: OLD-UPLOAD$ ( -- ^u8 n ) s" old rejected upload" ;
-: NEW-UPLOAD$ ( -- ^u8 n ) s" new upload decision" ;
+: OLD-UPLOAD$ ( -- str ) s" old rejected upload" ;
+: NEW-UPLOAD$ ( -- str ) s" new upload decision" ;
 
 \ changed.txt's upload of its old bytes, rejected until long after the
 \ pass, and the new bytes in its place.
 : REJECTED-CHANGE ( ^run -- )
    {: x :}
    x s" changed.txt" IN-ROOT {: f:str :}
-   f str> OLD-UPLOAD$ FS:WRITE-ALL
+   f OLD-UPLOAD$ FS:WRITE-ALL
    x s" changed.txt" OLD-UPLOAD$ x RUN-ARENA @ IDENTITY UPLOAD-PLANNED
    {: p :}
    x p ID-OF s" disallowed_name" REJECTED-AS 4000000000
    BLOCKED-UNTIL
-   f str> NEW-UPLOAD$ FS:WRITE-ALL ;
+   f NEW-UPLOAD$ FS:WRITE-ALL ;
 
 : CHANGED-REPORT ( report -- )
    RECONCILE-REPORT:UNMAKE
@@ -3698,7 +3699,7 @@ TYPED-VARIABLE RACED-INSTALL str
 \ due; answers the plan.
 : UNKNOWN-REJECTED ( ^run -- JOURNAL:plan-record )
    {: x :}
-   s" missing-target" >str x s" unknown.txt" IN-ROOT FS:MAKE-SYMLINK
+   s" missing-target" x s" unknown.txt" IN-ROOT FS:MAKE-SYMLINK
    x s" unknown.txt" s" unreadable upload" x RUN-ARENA @ IDENTITY
    UPLOAD-PLANNED {: p :}
    x p ID-OF s" disallowed_name" REJECTED-AS 0 BLOCKED-UNTIL
@@ -3718,11 +3719,11 @@ TYPED-VARIABLE RACED-INSTALL str
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$=
    d x STEP-GONE ;
 
-: PLANNED-BYTES$ ( -- ^u8 n ) s" planned bytes" ;
-: CHANGED-BYTES$ ( -- ^u8 n ) s" changed bytes" ;
-: OTHER-BYTES$ ( -- ^u8 n ) s" other bytes" ;
+: PLANNED-BYTES$ ( -- str ) s" planned bytes" ;
+: CHANGED-BYTES$ ( -- str ) s" changed bytes" ;
+: OTHER-BYTES$ ( -- str ) s" other bytes" ;
 
-: STALE-SEEN$ ( -- ^u8 n )
+: STALE-SEEN$ ( -- str )
    s" /2/files/upload /2/files/list_folder /2/files/upload" ;
 
 \ The listing's one page: other.txt as the fake's first upload commits
@@ -3737,8 +3738,8 @@ TYPED-VARIABLE RACED-INSTALL str
 : STALE-PLANNED ( ^run -- )
    {: x :}
    x RUN-ARENA @ {: ar :}
-   x s" file.txt" IN-ROOT str> CHANGED-BYTES$ FS:WRITE-ALL
-   x s" other.txt" IN-ROOT str> OTHER-BYTES$ FS:WRITE-ALL
+   x s" file.txt" IN-ROOT CHANGED-BYTES$ FS:WRITE-ALL
+   x s" other.txt" IN-ROOT OTHER-BYTES$ FS:WRITE-ALL
    x s" file.txt" PLANNED-BYTES$ ar IDENTITY UPLOAD-PLANNED drop
    x s" other.txt" OTHER-BYTES$ ar IDENTITY UPLOAD-PLANNED drop ;
 
@@ -3751,7 +3752,7 @@ TYPED-VARIABLE RACED-INSTALL str
    [: root FS:CLOSE-DIR ;] finally ;
 
 \ The path a fresh-observation entry names, else the empty string.
-: FRESH-AT$ ( REPLAY:replay-blocked -- ^u8 n )
+: FRESH-AT$ ( REPLAY:replay-blocked -- str )
    MATCH REPLAY:replay-blocked
       durable-plan OF drop drop s" " ENDOF
       local-object OF drop s" " ENDOF
@@ -3804,14 +3805,14 @@ TYPED-VARIABLE RACED-INSTALL str
 
 \ ---- conflicts against the fake Dropbox ----------------------------
 
-: COMMON$ ( -- ^u8 n ) s" common bytes" ;
-: NEW-LOCAL$ ( -- ^u8 n ) s" new local bytes" ;
-: USER-FILE$ ( -- ^u8 n ) s" a file the user made" ;
-: SHARED$ ( -- ^u8 n ) s" shared baseline" ;
-: DIVERGED-LOCAL$ ( -- ^u8 n ) s" divergent local edit" ;
-: DIVERGED-REMOTE$ ( -- ^u8 n ) s" divergent Dropbox edit" ;
-: EDITED-COPY$ ( -- ^u8 n ) s" the user edited the Dropbox copy" ;
-: UNRELATED$ ( -- ^u8 n ) s" an unrelated new file" ;
+: COMMON$ ( -- str ) s" common bytes" ;
+: NEW-LOCAL$ ( -- str ) s" new local bytes" ;
+: USER-FILE$ ( -- str ) s" a file the user made" ;
+: SHARED$ ( -- str ) s" shared baseline" ;
+: DIVERGED-LOCAL$ ( -- str ) s" divergent local edit" ;
+: DIVERGED-REMOTE$ ( -- str ) s" divergent Dropbox edit" ;
+: EDITED-COPY$ ( -- str ) s" the user edited the Dropbox copy" ;
+: UNRELATED$ ( -- str ) s" an unrelated new file" ;
 
 \ Rust's CopyOccupant: what sits at a local conflict copy's name.
 ENUM copy-occupant different-file unreadable-file ;ENUM
@@ -3823,39 +3824,39 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    ;MATCH ;
 
 \ The no-op decision's baseline, recorded at p.
-: SEEDED-NOOP ( ^run ^u8 n MODEL:decision -- )
-   {: x p:^ u:n dec :}
+: SEEDED-NOOP ( ^run str MODEL:decision -- )
+   {: x p:str dec :}
    dec NOOP-BASELINE {: b :}
-   x RUN-JOURNAL @ p u DISPLAY b x RUN-ARENA @ JOURNAL:RECORD-NOOP
+   x RUN-JOURNAL @ p DISPLAY b x RUN-ARENA @ JOURNAL:RECORD-NOOP
    NOOP-RECORDED? TTRUE ;
 
 \ Rust's seed_baseline: path p in sync at rem.
-: SEED-BASELINE ( ^run ^u8 n MODEL:remote -- )
-   {: x p:^ u:n rem :}
+: SEED-BASELINE ( ^run str MODEL:remote -- )
+   {: x p:str rem :}
    rem MODEL-REMOTE:UNMAKE {: c v :}
    rem MODEL-BASELINE:PRESENT c MODEL-LOCAL:MAKE LOCAL-PRESENT
    rem REMOTE-PRESENT MODEL-SUBTREE:EMPTY PLANNER:PLAN {: dec :}
-   x p u dec SEEDED-NOOP ;
+   x p dec SEEDED-NOOP ;
 
 \ Rust's plan(Present(old), Present(local c), Present(old), Empty),
 \ recorded at path p: one upload over old.
 : UPLOAD-OVER
-   ( ^run ^u8 n MODEL:remote DROPBOX:hash -- JOURNAL:plan-record )
-   {: x p:^ u:n old c:DROPBOX:hash :}
-   x p u old MODEL-BASELINE:PRESENT c MODEL-LOCAL:MAKE LOCAL-PRESENT
+   ( ^run str MODEL:remote DROPBOX:hash -- JOURNAL:plan-record )
+   {: x p:str old c:DROPBOX:hash :}
+   x p old MODEL-BASELINE:PRESENT c MODEL-LOCAL:MAKE LOCAL-PRESENT
    old REMOTE-PRESENT RECORD-FIXTURE-PLAN ;
 
 \ Rust's conflict_copy_path: p's copy of bytes b for side, relative to
 \ the root.
 : CONFLICT-COPY-PATH
-   ( ^u8 n LOCAL:conflict-side ^u8 n ^ARENA:arena -- ^u8 n )
-   {: p:^ u:n side b:^ bu:n ar :}
-   p u side b bu ar IDENTITY ar LOCAL:CONFLICT-RELATIVE-PATH ;
+   ( str LOCAL:conflict-side str ^ARENA:arena -- str )
+   {: p:str side b:str ar :}
+   p side b ar IDENTITY ar LOCAL:CONFLICT-RELATIVE-PATH ;
 
 \ The copy CONFLICT-COPY-PATH names, below the run's root.
-: COPY-IN-ROOT ( ^run ^u8 n LOCAL:conflict-side ^u8 n -- str )
-   {: x p:^ u:n side b:^ bu:n :}
-   x p u side b bu x RUN-ARENA @ CONFLICT-COPY-PATH IN-ROOT ;
+: COPY-IN-ROOT ( ^run str LOCAL:conflict-side str -- str )
+   {: x p:str side b:str :}
+   x p side b x RUN-ARENA @ CONFLICT-COPY-PATH IN-ROOT ;
 
 : COPY-CONFLICTS ( report -- n )
    RECONCILE-REPORT:UNMAKE
@@ -3905,17 +3906,17 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
 
 \ The fake serves new remote bytes as replace.txt's current-rev, on one
 \ listing page with the cursor k.
-: REPLACE-LISTED ( ^u8 n ^ARENA:arena -- )
-   {: k:^ ku:n ar :}
+: REPLACE-LISTED ( str ^ARENA:arena -- )
+   {: k:str ar :}
    s" replace.txt" s" current-rev" NEW-REMOTE$ ar SERVES
-   s" replace.txt" s" current-rev" NEW-REMOTE$ k ku ar LISTED-ALONE ;
+   s" replace.txt" s" current-rev" NEW-REMOTE$ k ar LISTED-ALONE ;
 
 \ replace.txt holds new local bytes over a baseline at old-rev, and its
 \ upload is planned; the plan.
 : REPLACE-PLANNED ( ^run -- JOURNAL:plan-record )
    {: x :}
    x RUN-ARENA @ {: ar :}
-   x s" replace.txt" IN-ROOT str> NEW-LOCAL$ FS:WRITE-ALL
+   x s" replace.txt" IN-ROOT NEW-LOCAL$ FS:WRITE-ALL
    COMMON$ s" old-rev" ar REMOTE-FILE {: old :}
    x s" replace.txt" old SEED-BASELINE
    x s" replace.txt" old NEW-LOCAL$ ar IDENTITY UPLOAD-OVER ;
@@ -3943,7 +3944,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
 \ unreadable-file.
 : OCCUPANT-PLACED ( ^run copy-occupant -- )
    {: x o :}
-   x LOCAL-COPY str> USER-FILE$ FS:WRITE-ALL
+   x LOCAL-COPY USER-FILE$ FS:WRITE-ALL
    o UNREADABLE? if x LOCAL-COPY 0 FS:CHMOD-MODE then ;
 
 \ The remote replay blocks replace.txt for its local copy's name; the
@@ -3989,7 +3990,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x id MODEL-BLOCKAGE:CONFLICT-COPY-OCCUPIED 0 BLOCKED-UNTIL
    x rec PASSED COMPLETE COPY-CONFLICTS 1 T=
    x REPLACE-PREPARED
-   TEST-DROPBOX:SEEN$ >str s" /2/files/upload /2/files/get_metadata " >str
+   TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata "
    STARTS-WITH? TTRUE
    DOWNLOAD$ TEST-DROPBOX:CALLS 1 T=
    d x STEP-GONE ;
@@ -4014,28 +4015,28 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
 
 \ c-diverged.txt holds a local edit over a baseline at rev-old, and the
 \ fake lists Dropbox's edit at rev-remote on one page with cursor k.
-: DIVERGED ( ^run ^u8 n -- )
-   {: x k:^ ku:n :}
+: DIVERGED ( ^run str -- )
+   {: x k:str :}
    x RUN-ARENA @ {: ar :}
    s" c-diverged.txt" s" rev-remote" DIVERGED-REMOTE$ ar FILE-AT
-   s" c-diverged.txt" s" rev-remote" DIVERGED-REMOTE$ k ku ar
+   s" c-diverged.txt" s" rev-remote" DIVERGED-REMOTE$ k ar
    LISTED-ALONE
-   x s" c-diverged.txt" IN-ROOT str> DIVERGED-LOCAL$ FS:WRITE-ALL
+   x s" c-diverged.txt" IN-ROOT DIVERGED-LOCAL$ FS:WRITE-ALL
    x s" c-diverged.txt" SHARED$ s" rev-old" ar REMOTE-FILE
    SEED-BASELINE ;
 
-: DIVERGED-COPY ( ^run LOCAL:conflict-side ^u8 n -- str )
-   {: x side b:^ bu:n :}
-   x s" c-diverged.txt" side b bu COPY-IN-ROOT ;
+: DIVERGED-COPY ( ^run LOCAL:conflict-side str -- str )
+   {: x side b:str :}
+   x s" c-diverged.txt" side b COPY-IN-ROOT ;
 
 : UNRELATED-WRITTEN ( ^run -- )
-   s" d-unrelated.txt" IN-ROOT str> UNRELATED$ FS:WRITE-ALL ;
+   s" d-unrelated.txt" IN-ROOT UNRELATED$ FS:WRITE-ALL ;
 
 \ d-unrelated.txt's baseline at rev v, the rev the fake's upload
 \ answered; it numbers revs in upload order.
-: UNRELATED-SYNCED ( ^run ^u8 n -- )
-   {: x v:^ vu:n :}
-   x s" d-unrelated.txt" UNRELATED$ v vu x RUN-ARENA @ REMOTE-FILE
+: UNRELATED-SYNCED ( ^run str -- )
+   {: x v:str :}
+   x s" d-unrelated.txt" UNRELATED$ v x RUN-ARENA @ REMOTE-FILE
    BASELINE-AT ;
 
 : RECORDED-CONFLICT-LEAVES-AN-EDITED-COPY-ALONE ( ^ARENA:arena -- )
@@ -4055,7 +4056,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x CONFLICTS-OF {: recorded :}
    recorded VEC:COUNT 1 T=
    rc DIVERGED-REMOTE$ HOLDS-BYTES
-   rc str> EDITED-COPY$ FS:WRITE-ALL
+   rc EDITED-COPY$ FS:WRITE-ALL
    x UNRELATED-WRITTEN
    x rec PASSED COMPLETE {: second :}
    second COPY-CONFLICTS 0 T=
@@ -4072,14 +4073,14 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
 
 \ c-diverged.txt blocked alone: its bytes and baseline kept and no
 \ conflict recorded, while d-unrelated.txt syncs as rev v.
-: DIVERGED-HELD ( ^run report ^u8 n -- )
-   {: x rep v:^ vu:n :}
+: DIVERGED-HELD ( ^run report str -- )
+   {: x rep v:str :}
    rep BLOCKED-IN 1 T=
    x CONFLICTS-OF VEC:COUNT 0 T=
    x s" c-diverged.txt" IN-ROOT DIVERGED-LOCAL$ HOLDS-BYTES
    x s" c-diverged.txt" SHARED$ s" rev-old" x RUN-ARENA @ REMOTE-FILE
    BASELINE-AT
-   x v vu UNRELATED-SYNCED
+   x v UNRELATED-SYNCED
    DOWNLOAD$ TEST-DROPBOX:CALLS 0 T= ;
 
 : OCCUPIED-DROPBOX-CONFLICT-COPY-NAME-BLOCKS-ONLY-ITS-PATH
@@ -4092,7 +4093,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x s" cursor-occupied" DIVERGED
    x LOCAL-CONFLICT--SIDE:REMOTE DIVERGED-REMOTE$ DIVERGED-COPY
    {: rc:str :}
-   rc str> USER-FILE$ FS:WRITE-ALL
+   rc USER-FILE$ FS:WRITE-ALL
    x UNRELATED-WRITTEN
    x rec PASSED COMPLETE {: rep :}
    rep COPY-CONFLICTS 0 T=
@@ -4131,11 +4132,11 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x s" cursor-occupied-directory" DIVERGED
    x LOCAL-CONFLICT--SIDE:REMOTE DIVERGED-REMOTE$ DIVERGED-COPY
    {: rc:str :}
-   rc str> FS:MAKE-DIR
+   rc FS:MAKE-DIR
    x UNRELATED-WRITTEN
    x rec PASSED COMPLETE {: rep :}
-   rc str> FS:DIR? TTRUE
-   rc str> READ-BUF READ-CAP FS-LIST:NAMES 0 T=
+   rc FS:DIR? TTRUE
+   rc READ-BUF READ-CAP FS-LIST:NAMES 0 T=
    x rep s" 01701" DIVERGED-HELD
    d x STEP-GONE ;
 
@@ -4151,39 +4152,39 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
 \ ---- restricted and same-named entries against the fake Dropbox ----
 
 \ Rust's seed_directory_baseline.
-: SEED-DIRECTORY-BASELINE ( ^run ^u8 n -- )
-   {: x p:^ u:n :}
+: SEED-DIRECTORY-BASELINE ( ^run str -- )
+   {: x p:str :}
    MODEL-BASELINE:DIRECTORY LOCAL-DIRECTORY REMOTE-DIRECTORY
    MODEL-SUBTREE:EMPTY PLANNER:PLAN {: dec :}
-   x p u dec SEEDED-NOOP ;
+   x p dec SEEDED-NOOP ;
 
-: FOLDER-BASELINE-AT ( ^run ^u8 n -- )
-   {: x p:^ u:n :}
-   x RUN-JOURNAL @ p u DISPLAY x RUN-ARENA @ JOURNAL:BASELINE
+: FOLDER-BASELINE-AT ( ^run str -- )
+   {: x p:str :}
+   x RUN-JOURNAL @ p DISPLAY x RUN-ARENA @ JOURNAL:BASELINE
    STORED-BASELINE MODEL-BASELINE:DIRECTORY MODEL:BASELINE= TTRUE ;
 
 : NO-CONFLICT-RECORD ( ^run -- )
    CONFLICTS-OF VEC:COUNT 0 T= ;
 
 \ Rust's restricted_folder_metadata with no_access.
-: NO-ACCESS-JSON+ ( ^u8 n ^u8 n -- )
+: NO-ACCESS-JSON+ ( str str -- )
    S\" {\q.tag\q:\qfolder\q" SB-APPEND PATHS+
    S\" ,\qsharing_info\q:{\qread_only\q:false," SB-APPEND
    S\" \qno_access\q:true}}" SB-APPEND ;
 
 \ The listing's one page: /Shared, which the user cannot access.
-: NO-ACCESS-PAGE ( ^u8 n ^ARENA:arena -- )
-   {: k:^ ku:n ar :}
+: NO-ACCESS-PAGE ( str ^ARENA:arena -- )
+   {: k:str ar :}
    [: s" /shared" s" /Shared" NO-ACCESS-JSON+ ;] ar ENTRIES
-   k ku false PAGE ;
+   k false PAGE ;
 
-: MKDIR-IN ( ^run ^u8 n -- ) IN-ROOT str> FS:MAKE-DIR ;
+: MKDIR-IN ( ^run str -- ) IN-ROOT FS:MAKE-DIR ;
 
-: WRITE-IN ( ^run ^u8 n ^u8 n -- )
-   {: x p:^ u:n b:^ bu:n :}
-   x p u IN-ROOT str> b bu FS:WRITE-ALL ;
+: WRITE-IN ( ^run str str -- )
+   {: x p:str b:str :}
+   x p IN-ROOT b FS:WRITE-ALL ;
 
-: BENEATH$ ( -- ^u8 n ) s" notes kept beneath an inaccessible folder" ;
+: BENEATH$ ( -- str ) s" notes kept beneath an inaccessible folder" ;
 
 : INACCESSIBLE-FOLDER-DELETES-NOTHING-BENEATH-IT ( ^ARENA:arena -- )
    {: ar :}
@@ -4204,9 +4205,9 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$=
    d x STEP-GONE ;
 
-: BEFORE-NOTES$ ( -- ^u8 n ) s" notes observed before the restriction" ;
-: BEFORE-KEEP$ ( -- ^u8 n ) s" keep observed before the restriction" ;
-: EDITED-KEEP$ ( -- ^u8 n ) s" keep edited locally" ;
+: BEFORE-NOTES$ ( -- str ) s" notes observed before the restriction" ;
+: BEFORE-KEEP$ ( -- str ) s" keep observed before the restriction" ;
+: EDITED-KEEP$ ( -- str ) s" keep edited locally" ;
 
 \ Shared, its notes and keep, published with cursor-accessible.
 : ACCESSIBLE ( ^run MODEL:remote MODEL:remote -- )
@@ -4216,7 +4217,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    rs s" Shared" REMOTE-DIRECTORY ar REMOTE+
    rs s" Shared/notes.txt" notes REMOTE-PRESENT ar REMOTE+
    rs s" Shared/keep.txt" keep REMOTE-PRESENT ar REMOTE+
-   x RUN-JOURNAL @ s" cursor-accessible" >str DROPBOX:>CURSOR rs
+   x RUN-JOURNAL @ s" cursor-accessible" DROPBOX:>CURSOR rs
    JOURNAL:PUBLISH-REMOTE-INVENTORY ;
 
 \ Shared's notes and keep, observed on both sides, then notes removed
@@ -4254,12 +4255,12 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    d x STEP-GONE ;
 
 \ The directory's names, newline-separated in byte order, are w.
-: NAMES-ARE ( ^u8 n ^u8 n -- )
-   {: p:^ u:n w:^ wu:n :}
-   p u READ-BUF READ-CAP FS-LIST:NAMES {: k:n :}
-   READ-BUF k w wu T$= ;
+: NAMES-ARE ( str str -- )
+   {: p:str w:str :}
+   p READ-BUF READ-CAP FS-LIST:NAMES {: k:n :}
+   READ-BUF k >str w T$= ;
 
-: FOLDER-IN? ( ^run ^u8 n -- bool ) IN-ROOT str> FS:DIR? ;
+: FOLDER-IN? ( ^run str -- bool ) IN-ROOT FS:DIR? ;
 
 : RESTRICTED-FOLDER-SPELLS-ITS-LISTED-CHILDREN ( ^ARENA:arena -- )
    {: ar :}
@@ -4274,15 +4275,15 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x rec PASSED COMPLETE drop
    x ROOT$ s" Shared" NAMES-ARE
    x s" Shared" FOLDER-IN? TTRUE
-   x s" Shared" IN-ROOT str> S\" A\nB" NAMES-ARE
+   x s" Shared" IN-ROOT S\" A\nB" NAMES-ARE
    x s" Shared/A" FOLDER-IN? TTRUE
    x s" Shared/B" FOLDER-IN? TTRUE
    \ Departure 5: Rust's two requests but the account's.
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$=
    d x STEP-GONE ;
 
-: SHARED-SIBLING$ ( -- ^u8 n ) s" shared sibling baseline" ;
-: SIBLING-EDIT$ ( -- ^u8 n ) s" sibling child edited locally" ;
+: SHARED-SIBLING$ ( -- str ) s" shared sibling baseline" ;
+: SIBLING-EDIT$ ( -- str ) s" sibling child edited locally" ;
 
 \ Rust's sibling_fixture: report/ and report.txt in the root, and the
 \ baselines report, report.txt and report/x; answers the recovery.
@@ -4296,9 +4297,9 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x s" report/x" shared SEED-BASELINE
    rec ;
 
-: SIBLING-FILE+ ( ^u8 n DROPBOX:hash -- )
-   {: p:^ u:n h:DROPBOX:hash :}
-   p u p u s" rev-sibling" h FILE-JSON+ ;
+: SIBLING-FILE+ ( str DROPBOX:hash -- )
+   {: p:str h:DROPBOX:hash :}
+   p p s" rev-sibling" h FILE-JSON+ ;
 
 \ Rust's sibling_listing, its files' identity h; with child, report/x.
 : SIBLING-PAGE ( DROPBOX:hash bool ^ARENA:arena -- )
@@ -4313,7 +4314,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
    planned 1 T= replayed 1 T= conflicts 0 T= blocked 0 T= ;
 
-: SIBLING-DELETE$ ( -- ^u8 n )
+: SIBLING-DELETE$ ( -- str )
    S\" {\qpath\q:\q/report/x\q,\qparent_rev\q:\qrev-sibling\q}" ;
 
 : FILE-BESIDE-A-SAME-NAMED-DIRECTORY-STILL-DELETES-ON-DROPBOX
@@ -4360,17 +4361,17 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
 \ Rust's conflict_bytes of the root is empty.
 : NO-CONFLICT-COPY ( ^run -- )
    ROOT$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
-   SB-RESET S\" \n" SB-APPEND READ-BUF u SB-APPEND
+   SB-RESET S\" \n" SB-APPEND READ-BUF u >str SB-APPEND
    SB$ S\" \n.omabox-conflict-" CONTAINS? TFALSE ;
 
 \ report/x's update argument as DROPBOX writes it, for content h.
-: SIBLING-ARG$ ( DROPBOX:hash -- ^u8 n )
+: SIBLING-ARG$ ( DROPBOX:hash -- str )
    {: h:DROPBOX:hash :}
    SB-RESET S\" {\qpath\q:\q/report/x\q,\qmode\q:{\q.tag\q:" SB-APPEND
    S\" \qupdate\q,\qupdate\q:\qrev-sibling\q}," SB-APPEND
    S\" \qautorename\q:false,\qstrict_conflict\q:true," SB-APPEND
    S\" \qcontent_hash\q:\q" SB-APPEND
-   h DROPBOX:HASH>STR str> SB-APPEND S\" \q}" SB-APPEND SB$ ;
+   h DROPBOX:HASH>STR SB-APPEND S\" \q}" SB-APPEND SB$ ;
 
 : FILE-BESIDE-A-SAME-NAMED-DIRECTORY-STILL-UPLOADS-A-LOCAL-EDIT
    ( ^ARENA:arena -- )
@@ -4395,7 +4396,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    TEST-DROPBOX:ARG-SENT$ SIBLING-EDIT$ ar IDENTITY SIBLING-ARG$ T$=
    d x STEP-GONE ;
 
-: SECRET$ ( -- ^u8 n ) s" secret baseline bytes" ;
+: SECRET$ ( -- str ) s" secret baseline bytes" ;
 \ 0700, Rust's allow_owner_access.
 $1C0 constant OWNER-ACCESS
 
@@ -4458,18 +4459,18 @@ $1C0 constant OWNER-ACCESS
 
 \ ---- edits and directories against the fake Dropbox ---------------
 
-: REMOTE-EDIT$ ( -- ^u8 n ) s" later Dropbox edit" ;
+: REMOTE-EDIT$ ( -- str ) s" later Dropbox edit" ;
 
 \ For CONFLICT-BYTES: the name from at in the root's names ns, its
 \ bytes kept in v when it is a conflict copy; the index after it, or
 \ -1 past the last.
-: CONFLICT-COPY+ ( ^u8 n n ^run ^VEC:vector<str> -- n )
-   {: ns:^ nu:n at:n x v :}
-   ns nu 10 at SPLIT-NEXT 0= if 2drop drop -1 exit then
-   {: q:^ w:n next:n :}
-   q w >str s" .omabox-conflict-" >str STARTS-WITH? if
-      x RUN-ROOT @ q w x RUN-ARENA @ INSIDE str>
-      READ-BUF READ-CAP FS:READ-ALL READ-BUF swap
+: CONFLICT-COPY+ ( str n ^run ^VEC:vector<str> -- n )
+   {: ns:str at:n x v :}
+   ns 10 at SPLIT-NEXT 0= if 2drop -1 exit then
+   {: q:str next:n :}
+   q s" .omabox-conflict-" STARTS-WITH? if
+      x RUN-ROOT @ q x RUN-ARENA @ INSIDE
+      READ-BUF READ-CAP FS:READ-ALL READ-BUF swap >str
       x RUN-ARENA @ COPIED v VEC:PUSH !
    then
    next ;
@@ -4504,12 +4505,12 @@ $1C0 constant OWNER-ACCESS
    x RUN-ARENA @ {: ar :}
    ar ARENA:ALLOCATOR 0 [type] str VEC:NEW {: v :}
    x ROOT$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
-   READ-BUF u ar COPIED str> {: ns:^ nu:n :}
-   0 begin ns nu rot x v CONFLICT-COPY+ dup 0< until drop
+   READ-BUF u >str ar COPIED {: ns:str :}
+   0 begin ns swap x v CONFLICT-COPY+ dup 0< until drop
    v COPIES-SORTED v ;
 
 \ The directory d holds no entry.
-: NOTHING-IN ( str -- ) str> READ-BUF READ-CAP FS-LIST:NAMES 0 T= ;
+: NOTHING-IN ( str -- ) READ-BUF READ-CAP FS-LIST:NAMES 0 T= ;
 
 \ No request created, uploaded or deleted on Dropbox.
 : UNWRITTEN ( -- )
@@ -4522,9 +4523,9 @@ $1C0 constant OWNER-ACCESS
 : EDITS-LOCAL ( ^run -- )
    {: x :}
    x RUN-ARENA @ {: ar :}
-   x s" a-local-update.txt" IN-ROOT str> LOCAL-EDIT$ FS:WRITE-ALL
-   x s" b-remote-update.txt" IN-ROOT str> SHARED$ FS:WRITE-ALL
-   x s" c-diverged.txt" IN-ROOT str> DIVERGED-LOCAL$ FS:WRITE-ALL
+   x s" a-local-update.txt" IN-ROOT LOCAL-EDIT$ FS:WRITE-ALL
+   x s" b-remote-update.txt" IN-ROOT SHARED$ FS:WRITE-ALL
+   x s" c-diverged.txt" IN-ROOT DIVERGED-LOCAL$ FS:WRITE-ALL
    SHARED$ s" rev-old" ar REMOTE-FILE {: old :}
    x s" a-local-update.txt" old SEED-BASELINE
    x s" b-remote-update.txt" old SEED-BASELINE
@@ -4540,10 +4541,10 @@ $1C0 constant OWNER-ACCESS
    SHARED$ ar IDENTITY {: ho:DROPBOX:hash :}
    REMOTE-EDIT$ ar IDENTITY {: hb:DROPBOX:hash :}
    DIVERGED-REMOTE$ ar IDENTITY {: hc:DROPBOX:hash :}
-   [: s" /a-local-update.txt" 2dup s" rev-old" ho FILE-JSON+ COMMA+
-      s" /b-remote-update.txt" 2dup s" rev-remote-update" hb FILE-JSON+
+   [: s" /a-local-update.txt" dup s" rev-old" ho FILE-JSON+ COMMA+
+      s" /b-remote-update.txt" dup s" rev-remote-update" hb FILE-JSON+
       COMMA+
-      s" /c-diverged.txt" 2dup s" rev-remote-conflict" hc FILE-JSON+ ;]
+      s" /c-diverged.txt" dup s" rev-remote-conflict" hc FILE-JSON+ ;]
    ar ENTRIES s" cursor-after-edits" false PAGE ;
 
 : EDITS-REPORTED ( report -- )
@@ -4570,21 +4571,21 @@ $1C0 constant OWNER-ACCESS
 : BOTH-SIDES ( ^run -- )
    CONFLICT-BYTES {: v :}
    v VEC:COUNT 2 T=
-   v 0 VEC:AT @ str> DIVERGED-REMOTE$ T$=
-   v 1 VEC:AT @ str> DIVERGED-LOCAL$ T$= ;
+   v 0 VEC:AT @ DIVERGED-REMOTE$ T$=
+   v 1 VEC:AT @ DIVERGED-LOCAL$ T$= ;
 
 \ The upload's argument as DROPBOX writes it: a over rev-old.
-: UPDATE-ARG$ ( DROPBOX:hash -- ^u8 n )
+: UPDATE-ARG$ ( DROPBOX:hash -- str )
    {: h:DROPBOX:hash :}
    SB-RESET S\" {\qpath\q:\q/a-local-update.txt\q," SB-APPEND
    S\" \qmode\q:{\q.tag\q:\qupdate\q,\qupdate\q:\qrev-old\q}," SB-APPEND
    S\" \qautorename\q:false,\qstrict_conflict\q:true," SB-APPEND
    S\" \qcontent_hash\q:\q" SB-APPEND
-   h DROPBOX:HASH>STR str> SB-APPEND S\" \q}" SB-APPEND SB$ ;
+   h DROPBOX:HASH>STR SB-APPEND S\" \q}" SB-APPEND SB$ ;
 
 \ Rust's requests, the account's aside: one listing, two downloads and
 \ the upload, nothing deleted.
-: EDITS-SEEN$ ( -- ^u8 n )
+: EDITS-SEEN$ ( -- str )
    SB-RESET s" /2/files/list_folder /2/files/download " SB-APPEND
    s" /2/files/download /2/files/upload" SB-APPEND SB$ ;
 
@@ -4629,14 +4630,14 @@ $1C0 constant OWNER-ACCESS
    ar EDITS-SENT
    d x STEP-GONE ;
 
-: DELETE-BASE$ ( -- ^u8 n ) s" shared deletion baseline" ;
+: DELETE-BASE$ ( -- str ) s" shared deletion baseline" ;
 
 \ Rust's fixture: dropbox-deleted.txt here, local-deleted.txt on
 \ Dropbox and its one listing page, both with the shared baseline.
 : DELETIONS ( ^run -- )
    {: x :}
    x RUN-ARENA @ {: ar :}
-   x s" dropbox-deleted.txt" IN-ROOT str> DELETE-BASE$ FS:WRITE-ALL
+   x s" dropbox-deleted.txt" IN-ROOT DELETE-BASE$ FS:WRITE-ALL
    DELETE-BASE$ s" rev-delete-baseline" ar REMOTE-FILE {: old :}
    x s" local-deleted.txt" old SEED-BASELINE
    x s" dropbox-deleted.txt" old SEED-BASELINE
@@ -4644,7 +4645,7 @@ $1C0 constant OWNER-ACCESS
    s" local-deleted.txt" s" rev-delete-baseline" DELETE-BASE$
    s" cursor-after-deletions" ar LISTED-ALONE ;
 
-: DELETE-BODY$ ( -- ^u8 n )
+: DELETE-BODY$ ( -- str )
    SB-RESET S\" {\qpath\q:\q/local-deleted.txt\q," SB-APPEND
    S\" \qparent_rev\q:\qrev-delete-baseline\q}" SB-APPEND SB$ ;
 
@@ -4670,21 +4671,21 @@ $1C0 constant OWNER-ACCESS
    d x STEP-GONE ;
 
 \ Rust's create_folder_v2 answer: the folder p as its metadata.
-: FOLDER-MADE ( ^u8 n -- )
-   {: p:^ u:n :}
-   SB-RESET S\" {\qmetadata\q:" SB-APPEND p u 2dup FOLDER-JSON+
+: FOLDER-MADE ( str -- )
+   {: p:str :}
+   SB-RESET S\" {\qmetadata\q:" SB-APPEND p dup FOLDER-JSON+
    s" }" SB-APPEND
    s" /2/files/create_folder_v2" 200 s" " s" " SB$
    TEST-DROPBOX:ROUTE-SCRIPT! ;
 
 \ The directory p is in the root, with a directory baseline.
-: SYNCED-DIRECTORY ( ^run ^u8 n -- )
-   {: x p:^ u:n :}
-   x p u IN-ROOT str> FS:DIR? TTRUE
-   x p u FOLDER-BASELINE-AT ;
+: SYNCED-DIRECTORY ( ^run str -- )
+   {: x p:str :}
+   x p IN-ROOT FS:DIR? TTRUE
+   x p FOLDER-BASELINE-AT ;
 
 \ Rust's five requests less the account's.
-: NESTED-SEEN$ ( -- ^u8 n )
+: NESTED-SEEN$ ( -- str )
    SB-RESET s" /2/files/list_folder /2/files/create_folder_v2 " SB-APPEND
    s" /2/files/create_folder_v2 /2/files/create_folder_v2" SB-APPEND SB$ ;
 
@@ -4696,10 +4697,10 @@ $1C0 constant OWNER-ACCESS
    TEST-DROPBOX:RESET
    ar STEP-RUN {: d:str x :}
    d x PASS-READY {: rec:str :}
-   x s" local" IN-ROOT str> FS:MAKE-DIR
-   x s" local/child" IN-ROOT str> FS:MAKE-DIR
-   [: s" /remote" 2dup FOLDER-JSON+ COMMA+
-      s" /remote/child" 2dup FOLDER-JSON+ ;]
+   x s" local" IN-ROOT FS:MAKE-DIR
+   x s" local/child" IN-ROOT FS:MAKE-DIR
+   [: s" /remote" dup FOLDER-JSON+ COMMA+
+      s" /remote/child" dup FOLDER-JSON+ ;]
    ar ENTRIES s" directories" false PAGE
    s" /local" FOLDER-MADE s" /local" FOLDER-MADE
    s" /local/child" FOLDER-MADE
@@ -4713,15 +4714,15 @@ $1C0 constant OWNER-ACCESS
    s" /2/files/create_folder_v2" TEST-DROPBOX:CALLS 3 T=
    d x STEP-GONE ;
 
-: ENTRY-BYTES$ ( -- ^u8 n ) s" Dropbox source bytes" ;
+: ENTRY-BYTES$ ( -- str ) s" Dropbox source bytes" ;
 
 \ The fake's file at path_lower l and path_display p, rev v, holding
 \ ENTRY-BYTES$.
-: ENTRY-SERVED ( ^u8 n ^u8 n ^u8 n ^ARENA:arena -- )
-   {: l:^ lu:n p:^ pu:n v:^ vu:n ar :}
-   ENTRY-BYTES$ ar IDENTITY DROPBOX:HASH>STR str> {: h:^ hu:n :}
-   l lu p pu v vu h hu ENTRY-BYTES$ nip TEST-DROPBOX:FILE!
-   v vu ENTRY-BYTES$ TEST-DROPBOX:CONTENT! ;
+: ENTRY-SERVED ( str str str ^ARENA:arena -- )
+   {: l:str p:str v:str ar :}
+   ENTRY-BYTES$ ar IDENTITY DROPBOX:HASH>STR {: h:str :}
+   l p v h ENTRY-BYTES$ str> nip TEST-DROPBOX:FILE!
+   v ENTRY-BYTES$ TEST-DROPBOX:CONTENT! ;
 
 \ Rust's two pages, each a file below /apps that Dropbox spells /Apps,
 \ and their downloads, which spell the folder apps.
@@ -4732,7 +4733,7 @@ $1C0 constant OWNER-ACCESS
    ENTRY-SERVED
    s" /apps/second.doentry" s" /apps/Second.doentry" s" remote-rev-2"
    ar ENTRY-SERVED
-   [: s" /apps" 2dup FOLDER-JSON+ COMMA+
+   [: s" /apps" dup FOLDER-JSON+ COMMA+
       s" /apps/entry.doentry" s" /Apps/Entry.doentry" s" remote-rev" h
       FILE-JSON+ ;]
    ar ENTRIES s" fresh-case" false PAGE
@@ -4778,8 +4779,8 @@ $1C0 constant OWNER-ACCESS
    [: s" /apps" s" /Apps" FOLDER-JSON+ COMMA+
       s" /apps/day one" s" /Apps/Day One" FOLDER-JSON+ ;]
    ar ENTRIES s" miscased-parents" false PAGE
-   [: s" /apps/day one" 2dup DELETED-JSON+ COMMA+
-      s" /apps/day one" 2dup FOLDER-JSON+ COMMA+
+   [: s" /apps/day one" dup DELETED-JSON+ COMMA+
+      s" /apps/day one" dup FOLDER-JSON+ COMMA+
       s" /apps/day one/journal" s" /apps/day one/Journal" FOLDER-JSON+ ;]
    ar ENTRIES s" miscased-parents-2" false PAGE
    [: ;] ar ENTRIES s" miscased-parents-2" false PAGE ;
@@ -4804,15 +4805,15 @@ $1C0 constant OWNER-ACCESS
    TEST-DROPBOX:RESET
    ar STEP-RUN {: d:str x :}
    d x PASS-READY {: rec:str :}
-   x s" Apps" IN-ROOT str> FS:MAKE-DIR
-   x s" Apps/Day One" IN-ROOT str> FS:MAKE-DIR
+   x s" Apps" IN-ROOT FS:MAKE-DIR
+   x s" Apps/Day One" IN-ROOT FS:MAKE-DIR
    ar MISCASED
    x rec PASSED COMPLETE 2 SETTLED
    x rec PASSED COMPLETE JOURNAL-CREATED
-   x s" Apps/Day One/Journal" IN-ROOT str> FS:DIR? TTRUE
+   x s" Apps/Day One/Journal" IN-ROOT FS:DIR? TTRUE
    x s" Apps/day one" IN-ROOT FS:EXISTS? TFALSE
-   x s" Apps" IN-ROOT str> READ-BUF READ-CAP FS-LIST:NAMES
-   READ-BUF swap s" Day One" T$=
+   x s" Apps" IN-ROOT READ-BUF READ-CAP FS-LIST:NAMES
+   READ-BUF swap >str s" Day One" T$=
    x s" apps/day one/journal" FOLDER-BASELINE-AT
    x rec PASSED COMPLETE 3 SETTLED
    x PENDING-OF VEC:COUNT 0 T=
@@ -4836,26 +4837,26 @@ $1C0 constant OWNER-ACCESS
       root-changed OF false ENDOF
    ;MATCH ;
 
-: EXISTS-IN? ( ^run ^u8 n -- bool ) IN-ROOT FS:EXISTS? ;
+: EXISTS-IN? ( ^run str -- bool ) IN-ROOT FS:EXISTS? ;
 
 \ The symlink at path p in the root points at the text t.
-: LINKS-TO ( ^run ^u8 n ^u8 n -- )
-   {: x p:^ u:n t:^ tu:n :}
-   t tu >str x p u IN-ROOT FS:MAKE-SYMLINK ;
+: LINKS-TO ( ^run str str -- )
+   {: x p:str t:str :}
+   t x p IN-ROOT FS:MAKE-SYMLINK ;
 
 \ The target the symlink at f holds.
-: LINK-TARGET$ ( str -- ^u8 n )
+: LINK-TARGET$ ( str -- str )
    FS:>PATHZ READ-BUF READ-CAP readlink {: u:n :}
    u 0< if s" the symlink did not read" FAILED then
-   READ-BUF u ;
+   READ-BUF u >str ;
 
 \ The root's names in byte order, one per line.
-: ROOT-NAMES$ ( ^run -- ^u8 n )
+: ROOT-NAMES$ ( ^run -- str )
    ROOT$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
-   READ-BUF u ;
+   READ-BUF u >str ;
 
 \ The journal's baseline paths, joined by spaces.
-: BASELINED$ ( ^run -- ^u8 n )
+: BASELINED$ ( ^run -- str )
    {: x :}
    x RUN-JOURNAL @ x RUN-ARENA @ JOURNAL:BASELINE-PATHS {: ps :}
    SB-RESET
@@ -4881,7 +4882,7 @@ $1C0 constant OWNER-ACCESS
 : STEP-UNBLOCKED ( ^run -- )
    REPLAY-STEP REPORTED BLOCKS VEC:COUNT 0 T= ;
 
-: SAME$ ( -- ^u8 n ) s" same bytes across a case-only change" ;
+: SAME$ ( -- str ) s" same bytes across a case-only change" ;
 
 \ Rust's fixture: Report.TXT in the root and baselined, report.txt on
 \ the one listing page; answers the remote file.
@@ -4928,8 +4929,8 @@ $1C0 constant OWNER-ACCESS
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$=
    d x STEP-GONE ;
 
-: FIRST$ ( -- ^u8 n ) s" first" ;
-: SECOND$ ( -- ^u8 n ) s" second" ;
+: FIRST$ ( -- str ) s" first" ;
+: SECOND$ ( -- str ) s" second" ;
 
 \ Rust's fixture: Foo.txt and foo.txt in the root, an empty listing.
 : TWO-SPELLINGS ( ^run ^ARENA:arena -- )
@@ -4947,7 +4948,7 @@ $1C0 constant OWNER-ACCESS
    x s" foo.txt" EXISTS-IN? TFALSE
    x s" foo.txt (case variant)" IN-ROOT SECOND$ HOLDS-BYTES ;
 
-: TWO-UPLOADS$ ( -- ^u8 n )
+: TWO-UPLOADS$ ( -- str )
    s" /2/files/list_folder /2/files/upload /2/files/upload" ;
 
 : LOCAL-CASE-COLLISION-IS-RENAMED-BEFORE-PLANNING-AND-THEN-SYNCS
@@ -4967,7 +4968,7 @@ $1C0 constant OWNER-ACCESS
    TEST-DROPBOX:SEEN$ TWO-UPLOADS$ T$=
    d x STEP-GONE ;
 
-: ASSOCIATED$ ( -- ^u8 n ) s" remote-associated local bytes" ;
+: ASSOCIATED$ ( -- str ) s" remote-associated local bytes" ;
 
 \ Rust's two answers creating /apps (case variant), as FolderMetadata.
 : VARIANT-MADE ( -- )
@@ -5002,7 +5003,7 @@ $1C0 constant OWNER-ACCESS
    rem REMOTE-PRESENT RECORD-FIXTURE-PLAN drop ;
 
 \ Rust's two folder creations, its upload and its download.
-: APPS-SEEN$ ( -- ^u8 n )
+: APPS-SEEN$ ( -- str )
    SB-RESET s" /2/files/list_folder /2/files/download " SB-APPEND
    s" /2/files/create_folder_v2 /2/files/create_folder_v2 " SB-APPEND
    s" /2/files/upload" SB-APPEND SB$ ;
@@ -5091,9 +5092,9 @@ $1C0 constant OWNER-ACCESS
    TEST-DROPBOX:SEEN$ s" " T$=
    d x STEP-GONE ;
 
-: KEPT$ ( -- ^u8 n ) s" kept local bytes" ;
-: VARIANT$ ( -- ^u8 n ) s" variant local bytes" ;
-: NEWER$ ( -- ^u8 n ) s" newer remote bytes" ;
+: KEPT$ ( -- str ) s" kept local bytes" ;
+: VARIANT$ ( -- str ) s" variant local bytes" ;
+: NEWER$ ( -- str ) s" newer remote bytes" ;
 
 \ Rust's fixture: Foo.txt baselined at rev-old and foo.txt in the root,
 \ foo.txt listed as Foo.txt at rev-new and served.
@@ -5148,8 +5149,8 @@ $1C0 constant OWNER-ACCESS
    TEST-DROPBOX:SEEN$ PASS-SEEN$ T$=
    d x STEP-GONE ;
 
-: UPPER$ ( -- ^u8 n ) s" upper local bytes" ;
-: LOWER$ ( -- ^u8 n ) s" lower local bytes" ;
+: UPPER$ ( -- str ) s" upper local bytes" ;
+: LOWER$ ( -- str ) s" lower local bytes" ;
 
 : CASE-COLLISION-SPARES-THE-RECORDED-GREATER-SPELLING
    ( ^ARENA:arena -- )
@@ -5169,7 +5170,7 @@ $1C0 constant OWNER-ACCESS
    TEST-DROPBOX:SEEN$ s" " T$=
    d x STEP-GONE ;
 
-: NOTES$ ( -- ^u8 n ) s" synced notes" ;
+: NOTES$ ( -- str ) s" synced notes" ;
 
 \ Rust's fixture: notes.txt baselined and listed at rev-synced, and the
 \ symlink Notes.txt beside it.
@@ -5198,7 +5199,7 @@ $1C0 constant OWNER-ACCESS
    TEST-DROPBOX:SEEN$ UPLOAD-SEEN$ T$=
    d x STEP-GONE ;
 
-: OTHER$ ( -- ^u8 n ) s" other notes" ;
+: OTHER$ ( -- str ) s" other notes" ;
 
 \ Rust's fixture: other.txt and the symlinks Link and link in the root,
 \ an empty listing, then a continuation listing other.txt as its
@@ -5216,7 +5217,7 @@ $1C0 constant OWNER-ACCESS
    x s" Link" s" upper-target" LINKS-TO
    x s" link" s" lower-target" LINKS-TO ;
 
-: LINKS-SEEN$ ( -- ^u8 n )
+: LINKS-SEEN$ ( -- str )
    SB-RESET s" /2/files/list_folder /2/files/upload " SB-APPEND
    s" /2/files/list_folder/continue" SB-APPEND SB$ ;
 
@@ -5250,27 +5251,27 @@ $1C0 constant OWNER-ACCESS
 
 \ Rust's file-copy name for node: node (<origin> <the first 12
 \ characters of the bytes' identity><suffix>).
-: NODE-COPY ( ^u8 n ^u8 n ^u8 n ^ARENA:arena -- str )
-   {: o:^ ou:n b:^ bu:n s:^ su:n ar :}
-   b bu ar IDENTITY DROPBOX:HASH>STR str> drop 12 {: h:^ hu:n :}
-   SB-RESET s" node (" SB-APPEND o ou SB-APPEND s"  " SB-APPEND
-   h hu SB-APPEND s su SB-APPEND s" )" SB-APPEND SB$ ar COPIED ;
+: NODE-COPY ( str str str ^ARENA:arena -- str )
+   {: o:str b:str s:str ar :}
+   b ar IDENTITY DROPBOX:HASH>STR 0 12 PART {: h:str :}
+   SB-RESET s" node (" SB-APPEND o SB-APPEND s"  " SB-APPEND
+   h SB-APPEND s SB-APPEND s" )" SB-APPEND SB$ ar COPIED ;
 
-: NODE-DIR ( ^run -- ) s" node" IN-ROOT str> FS:MAKE-DIR ;
+: NODE-DIR ( ^run -- ) s" node" IN-ROOT FS:MAKE-DIR ;
 
 \ Dropbox's file /node, served as rev v of the bytes b and alone on
 \ the next listing page, at cursor k.
-: NODE-LISTED ( ^u8 n ^u8 n ^u8 n ^ARENA:arena -- )
-   {: v:^ vu:n b:^ bu:n k:^ ku:n ar :}
-   s" node" v vu b bu ar SERVES
-   s" node" v vu b bu k ku ar LISTED-ALONE ;
+: NODE-LISTED ( str str str ^ARENA:arena -- )
+   {: v:str b:str k:str ar :}
+   s" node" v b ar SERVES
+   s" node" v b k ar LISTED-ALONE ;
 
 \ The next listing page, at cursor k, holding Dropbox's folder /node.
-: NODE-FOLDER-PAGE ( ^u8 n ^ARENA:arena -- )
-   {: k:^ ku:n ar :}
-   [: s" /node" s" /node" FOLDER-JSON+ ;] ar ENTRIES k ku false PAGE ;
+: NODE-FOLDER-PAGE ( str ^ARENA:arena -- )
+   {: k:str ar :}
+   [: s" /node" s" /node" FOLDER-JSON+ ;] ar ENTRIES k false PAGE ;
 
-: OUTCOME-KIND$ ( outcome -- ^u8 n )
+: OUTCOME-KIND$ ( outcome -- str )
    MATCH outcome
       complete OF {: rep :} s" complete" ENDOF
       fresh OF s" fresh" ENDOF
@@ -5283,7 +5284,7 @@ $1C0 constant OWNER-ACCESS
    {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
    replayed planned ;
 
-: KIND-OF ( MODEL:baseline -- ^u8 n )
+: KIND-OF ( MODEL:baseline -- str )
    MATCH MODEL:baseline
       absent OF s" absent" ENDOF
       present OF {: rem :} s" present" ENDOF
@@ -5291,15 +5292,15 @@ $1C0 constant OWNER-ACCESS
    ;MATCH ;
 
 \ The baseline's variant at path p, none for no row.
-: BASELINE-KIND$ ( ^run ^u8 n -- ^u8 n )
-   {: x p:^ u:n :}
-   x RUN-JOURNAL @ p u DISPLAY x RUN-ARENA @ JOURNAL:BASELINE
+: BASELINE-KIND$ ( ^run str -- str )
+   {: x p:str :}
+   x RUN-JOURNAL @ p DISPLAY x RUN-ARENA @ JOURNAL:BASELINE
    MATCH option
       none OF s" none" ENDOF
       some OF KIND-OF ENDOF
    ;MATCH ;
 
-: LOCAL-FILE$ ( -- ^u8 n ) s" local file preserved beside directory" ;
+: LOCAL-FILE$ ( -- str ) s" local file preserved beside directory" ;
 
 : REMOTE-DIRECTORY-PRESERVES-A-LOCAL-FILE-UNDER-A-SYNCHRONIZED-NAME
    ( ^ARENA:arena -- )
@@ -5312,25 +5313,25 @@ $1C0 constant OWNER-ACCESS
    s" local file" LOCAL-FILE$ s" " ar NODE-COPY {: v:str :}
    s" directory-file-collision" ar NODE-FOLDER-PAGE
    [: ;] ar ENTRIES s" directory-file-collision" false PAGE
-   x s" node" IN-ROOT str> LOCAL-FILE$ FS:WRITE-ALL
+   x s" node" IN-ROOT LOCAL-FILE$ FS:WRITE-ALL
    x rec PASSED OUTCOME-KIND$ s" fresh" T$=
    x s" node" IN-ROOT FS:EXISTS? TFALSE
-   x v str> IN-ROOT LOCAL-FILE$ HOLDS-BYTES
+   x v IN-ROOT LOCAL-FILE$ HOLDS-BYTES
    x PENDING-OF VEC:COUNT 0 T=
    x CONFLICTS-OF VEC:COUNT 0 T=
    x rec PASSED REPLAYED-PLANNED {: replayed:n planned:n :}
    planned 2 T= replayed 2 T=
-   x s" node" IN-ROOT str> FS:DIR? TTRUE
-   x v str> IN-ROOT LOCAL-FILE$ HOLDS-BYTES
+   x s" node" IN-ROOT FS:DIR? TTRUE
+   x v IN-ROOT LOCAL-FILE$ HOLDS-BYTES
    x s" node" BASELINE-KIND$ s" directory" T$=
-   x v str> BASELINE-KIND$ s" present" T$=
+   x v BASELINE-KIND$ s" present" T$=
    x CONFLICTS-OF VEC:COUNT 0 T=
    TEST-DROPBOX:SEEN$
    s" /2/files/list_folder /2/files/list_folder/continue /2/files/upload"
    T$=
    d x STEP-GONE ;
 
-: DROPBOX-FILE$ ( -- ^u8 n ) s" Dropbox file preserved beside directory" ;
+: DROPBOX-FILE$ ( -- str ) s" Dropbox file preserved beside directory" ;
 
 \ The first pass: Dropbox's file copied beside the local directory,
 \ then deleted there and replaced by a directory.
@@ -5339,8 +5340,8 @@ $1C0 constant OWNER-ACCESS
    x RUN-ARENA @ {: ar :}
    x rec PASSED REPLAYED-PLANNED {: replayed:n planned:n :}
    planned 1 T= replayed 2 T=
-   x s" node" IN-ROOT str> FS:DIR? TTRUE
-   x v str> IN-ROOT DROPBOX-FILE$ HOLDS-BYTES
+   x s" node" IN-ROOT FS:DIR? TTRUE
+   x v IN-ROOT DROPBOX-FILE$ HOLDS-BYTES
    x s" node" BASELINE-KIND$ s" directory" T$=
    x PENDING-OF VEC:COUNT 0 T=
    x CONFLICTS-OF VEC:COUNT 0 T=
@@ -5352,14 +5353,14 @@ $1C0 constant OWNER-ACCESS
    {: ar :}
    s" dropbox file" DROPBOX-FILE$ s" " ar NODE-COPY {: low:str :}
    s" Dropbox file" DROPBOX-FILE$ s" " ar NODE-COPY {: v:str :}
-   DROPBOX-FILE$ ar IDENTITY DROPBOX:HASH>STR str> {: h:^ hu:n :}
+   DROPBOX-FILE$ ar IDENTITY DROPBOX:HASH>STR {: h:str :}
    SB-RESET S\" {\qentries\q:[" SB-APPEND
    s" /node" s" /node" FOLDER-JSON+
    S\" ],\qcursor\q:\qremote-directory\q,\qhas_more\q:false}" SB-APPEND
    SB$ ar COPIED {: page:str :}
-   s" /2/files/upload" 200 s" " s" " page str> TEST-DROPBOX:ROUTE-SCRIPT!
-   s" /" low str> ar JOIN-BYTES s" /" v str> ar JOIN-BYTES
-   s" rev-dropbox-copy" h hu DROPBOX-FILE$ nip TEST-DROPBOX:FILE! ;
+   s" /2/files/upload" 200 s" " s" " page TEST-DROPBOX:ROUTE-SCRIPT!
+   s" /" low ar JOIN-BYTES s" /" v ar JOIN-BYTES
+   s" rev-dropbox-copy" h DROPBOX-FILE$ str> nip TEST-DROPBOX:FILE! ;
 
 : LOCAL-DIRECTORY-PRESERVES-A-DROPBOX-FILE-UNDER-A-SYNCHRONIZED-NAME
    ( ^ARENA:arena -- )
@@ -5377,8 +5378,8 @@ $1C0 constant OWNER-ACCESS
    x rec v DROPBOX-FILE-COPIED
    x rec PASSED REPLAYED-PLANNED {: replayed:n planned:n :}
    planned 1 T= replayed 1 T=
-   x v str> IN-ROOT DROPBOX-FILE$ HOLDS-BYTES
-   x v str> BASELINE-KIND$ s" present" T$=
+   x v IN-ROOT DROPBOX-FILE$ HOLDS-BYTES
+   x v BASELINE-KIND$ s" present" T$=
    x CONFLICTS-OF VEC:COUNT 0 T=
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/download "
    s" /2/files/delete_v2 /2/files/create_folder_v2 " ar JOIN-BYTES
@@ -5386,7 +5387,7 @@ $1C0 constant OWNER-ACCESS
    s" /2/files/get_metadata" ar JOIN-BYTES T$=
    d x STEP-GONE ;
 
-: BOUND-COPY$ ( -- ^u8 n ) s" descriptor-bound Dropbox file copy" ;
+: BOUND-COPY$ ( -- str ) s" descriptor-bound Dropbox file copy" ;
 
 : DIRECTORY-COLLISION-COPY-STAYS-BOUND-TO-THE-VERIFIED-ROOT
    ( ^ARENA:arena -- )
@@ -5402,21 +5403,21 @@ $1C0 constant OWNER-ACCESS
    NODE-LISTED
    [: SWAP-ROOT ;] TEST-DROPBOX:DURING-DOWNLOAD!
    x rec PASSED OUTCOME-KIND$ s" root-changed" T$=
-   OLD-ROOT @ v str> ar INSIDE BOUND-COPY$ HOLDS-BYTES
-   x v str> IN-ROOT FS:EXISTS? TFALSE
+   OLD-ROOT @ v ar INSIDE BOUND-COPY$ HOLDS-BYTES
+   x v IN-ROOT FS:EXISTS? TFALSE
    CANARY @ CANARY$ HOLDS-BYTES
    x PENDING-OF VEC:COUNT 0 T=
    x s" node" BASELINE-KIND$ s" none" T$=
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/download" T$=
    d x STEP-GONE ;
 
-: EXACT$ ( -- ^u8 n ) s" Dropbox bytes that must remain exact" ;
-: RACED$ ( -- ^u8 n ) s" local file created after observation" ;
+: EXACT$ ( -- str ) s" Dropbox bytes that must remain exact" ;
+: RACED$ ( -- str ) s" local file created after observation" ;
 
 \ The copy's destination the race writes; it runs on the fake's task.
 TYPED-VARIABLE RACED-COPY str
 
-: RACE-COPY ( -- ) RACED-COPY @ str> RACED$ FS:WRITE-ALL ;
+: RACE-COPY ( -- ) RACED-COPY @ RACED$ FS:WRITE-ALL ;
 
 : DIRECTORY-COLLISION-DESTINATION-RACE-REQUESTS-A-FRESH-SCAN
    ( ^ARENA:arena -- )
@@ -5428,32 +5429,33 @@ TYPED-VARIABLE RACED-COPY str
    d x PASS-READY {: rec:str :}
    x NODE-DIR
    s" Dropbox file" EXACT$ s" " ar NODE-COPY {: v:str :}
-   x v str> IN-ROOT RACED-COPY !
+   x v IN-ROOT RACED-COPY !
    s" rev-destination-race" EXACT$ s" directory-copy-destination-race"
    ar NODE-LISTED
    [: RACE-COPY ;] TEST-DROPBOX:DURING-DOWNLOAD!
    x rec PASSED OUTCOME-KIND$ s" fresh" T$=
-   x v str> IN-ROOT RACED$ HOLDS-BYTES
-   x s" node" IN-ROOT str> FS:DIR? TTRUE
+   x v IN-ROOT RACED$ HOLDS-BYTES
+   x s" node" IN-ROOT FS:DIR? TTRUE
    x PENDING-OF VEC:COUNT 0 T=
    x s" node" BASELINE-KIND$ s" none" T$=
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/download" T$=
    d x STEP-GONE ;
 
-: OCCUPIED-COPY$ ( -- ^u8 n )
+: OCCUPIED-COPY$ ( -- str )
    s" Dropbox bytes preserved beside an occupied stage" ;
 \ Mode 0600, read and write to its owner.
 $180 constant MODE-0600
 
 \ The first name in the newline-separated list l that starts with
 \ .omabox-download-, else its last name.
-: STAGE-NAMED ( ^u8 n -- ^u8 n )
-   {: l:^ u:n :}
-   l u 10 INDEX-OF MATCH option
-      none OF l u ENDOF
+: STAGE-NAMED ( str -- str )
+   {: l:str :}
+   l str> nip {: u:n :}
+   l 10 INDEX-OF MATCH option
+      none OF l ENDOF
       some OF IDX>N {: k:n :}
-         l k >str s" .omabox-download-" >str STARTS-WITH? if l k
-         else l k 1+ + u k 1+ - RECURSE then
+         l 0 k PART s" .omabox-download-" STARTS-WITH? if l 0 k PART
+         else l k 1+ u PART RECURSE then
       ENDOF
    ;MATCH ;
 
@@ -5461,20 +5463,20 @@ $180 constant MODE-0600
 : STAGE-AMONG ( ^run -- str )
    {: x :}
    x ROOT$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
-   READ-BUF u STAGE-NAMED {: s:^ su:n :}
-   s su >str s" .omabox-download-" >str STARTS-WITH? TTRUE
-   x RUN-ROOT @ s su x RUN-ARENA @ INSIDE ;
+   READ-BUF u >str STAGE-NAMED {: s:str :}
+   s s" .omabox-download-" STARTS-WITH? TTRUE
+   x RUN-ROOT @ s x RUN-ARENA @ INSIDE ;
 
 \ The first variant's stage, staged with the copy's bytes, then
 \ holding other bytes; its path.
 : OCCUPIED-COPY-STAGE ( ^run str -- str )
    {: x v:str :}
    x ROOT$ s" open test root" LOCAL:OPEN-ROOT {: root:fd :}
-   [: root x v str> OCCUPIED-COPY$ PRESTAGED ;]
+   [: root x v OCCUPIED-COPY$ PRESTAGED ;]
    [: root FS:CLOSE-DIR ;] finally
    x STAGE-AMONG {: sp:str :}
    sp MODE-0600 FS:CHMOD-MODE
-   sp str> UNRELATED-STAGE$ FS:WRITE-ALL
+   sp UNRELATED-STAGE$ FS:WRITE-ALL
    sp ;
 
 : OCCUPIED-COLLISION-STAGE-USES-THE-NEXT-SYNCHRONIZED-NAME
@@ -5492,8 +5494,8 @@ $180 constant MODE-0600
    x first OCCUPIED-COPY-STAGE {: sp:str :}
    x rec PASSED REPLAYED-PLANNED {: replayed:n planned:n :}
    planned 1 T= replayed 2 T=
-   x first str> IN-ROOT FS:EXISTS? TFALSE
-   x second str> IN-ROOT OCCUPIED-COPY$ HOLDS-BYTES
+   x first IN-ROOT FS:EXISTS? TFALSE
+   x second IN-ROOT OCCUPIED-COPY$ HOLDS-BYTES
    sp UNRELATED-STAGE$ HOLDS-BYTES
    x s" node" BASELINE-KIND$ s" directory" T$=
    x PENDING-OF VEC:COUNT 0 T=
@@ -5502,19 +5504,20 @@ $180 constant MODE-0600
    s" /2/files/delete_v2 /2/files/create_folder_v2" ar JOIN-BYTES T$=
    d x STEP-GONE ;
 
-: OLD-FILE$ ( -- ^u8 n ) s" old Dropbox file" ;
-: NEW-FILE$ ( -- ^u8 n ) s" new Dropbox file" ;
+: OLD-FILE$ ( -- str ) s" old Dropbox file" ;
+: NEW-FILE$ ( -- str ) s" new Dropbox file" ;
 
 \ The first entry of the newline-separated list l in the directory r
 \ that is a file, else its last entry.
-: FILE-NAMED ( str ^u8 n ^ARENA:arena -- str )
-   {: r:str l:^ u:n ar :}
-   l u 10 INDEX-OF MATCH option
-      none OF r l u ar INSIDE ENDOF
+: FILE-NAMED ( str str ^ARENA:arena -- str )
+   {: r:str l:str ar :}
+   l str> nip {: u:n :}
+   l 10 INDEX-OF MATCH option
+      none OF r l ar INSIDE ENDOF
       some OF IDX>N {: k:n :}
-         r l k ar INSIDE {: f:str :}
+         r l 0 k PART ar INSIDE {: f:str :}
          f FS:FILE? if f
-         else r l k 1+ + u k 1+ - ar RECURSE then
+         else r l k 1+ u PART ar RECURSE then
       ENDOF
    ;MATCH ;
 
@@ -5531,9 +5534,9 @@ $180 constant MODE-0600
    s" node" s" rev-new" NEW-FILE$ ar FILE-AT
    s" rev-old" OLD-FILE$ s" old-file" ar NODE-LISTED
    x rec PASSED OUTCOME-KIND$ s" fresh" T$=
-   x s" node" IN-ROOT str> FS:DIR? TTRUE
+   x s" node" IN-ROOT FS:DIR? TTRUE
    x ROOT$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
-   x RUN-ROOT @ READ-BUF u ar FILE-NAMED OLD-FILE$ HOLDS-BYTES
+   x RUN-ROOT @ READ-BUF u >str ar FILE-NAMED OLD-FILE$ HOLDS-BYTES
    x PENDING-OF VEC:COUNT 0 T=
    x CONFLICTS-OF VEC:COUNT 0 T=
    x s" node" BASELINE-KIND$ s" none" T$=
@@ -5541,20 +5544,20 @@ $180 constant MODE-0600
    s" /2/files/delete_v2 /2/files/get_metadata" ar JOIN-BYTES T$=
    d x STEP-GONE ;
 
-: BESIDE$ ( -- ^u8 n ) s" unrelated Dropbox file" ;
+: BESIDE$ ( -- str ) s" unrelated Dropbox file" ;
 \ One length: the fake serves a rev's bytes at the size FILE! gave it.
-: COLLIDED$ ( -- ^u8 n ) s" Dropbox bytes held" ;
-: FORGED$ ( -- ^u8 n ) s" forged bytes, held" ;
+: COLLIDED$ ( -- str ) s" Dropbox bytes held" ;
+: FORGED$ ( -- str ) s" forged bytes, held" ;
 
 \ The one listing page, cursor k: /node at rev-held with COLLIDED$'s
 \ identity, and /other.txt at rev-other.
-: HELD-PAGE ( ^u8 n ^ARENA:arena -- )
-   {: k:^ ku:n ar :}
+: HELD-PAGE ( str ^ARENA:arena -- )
+   {: k:str ar :}
    COLLIDED$ ar IDENTITY {: h:DROPBOX:hash :}
    BESIDE$ ar IDENTITY {: o:DROPBOX:hash :}
    [: s" /node" s" /node" s" rev-held" h FILE-JSON+ COMMA+
       s" /other.txt" s" /other.txt" s" rev-other" o FILE-JSON+ ;]
-   ar ENTRIES k ku false PAGE ;
+   ar ENTRIES k false PAGE ;
 
 \ The empty local directory node; Dropbox's file /node and other.txt,
 \ served, on the one listing page.
@@ -5571,20 +5574,20 @@ $180 constant MODE-0600
    PASSED REPLAYED-PLANNED 1 T= 1 T= ;
 
 \ REPLAY's line for node's copy, blocked for the reason r.
-: HELD-LINE ( ^u8 n -- ^u8 n )
+: HELD-LINE ( str -- str )
    SB-RESET s" exact download blocked for its path `node`: "
    SB-APPEND SB-APPEND SB$ ;
 
 \ The pass held node, its copy blocked for the reason r and logged
 \ once, and synced other.txt.
-: COLLISION-HELD ( str ^run str ^u8 n -- )
-   {: d:str x rec:str r:^ ru:n :}
+: COLLISION-HELD ( str ^run str str -- )
+   {: d:str x rec:str r:str :}
    x RUN-ARENA @ {: ar :}
-   d [: x rec OTHER-SYNCED ;] ar LOGGED {: t:^ tu:n :}
-   t tu >str 10 COUNT-CHAR 1 T=
-   t tu r ru HELD-LINE CONTAINS? TTRUE
+   d [: x rec OTHER-SYNCED ;] ar LOGGED {: t:str :}
+   t 10 COUNT-CHAR 1 T=
+   t r HELD-LINE CONTAINS? TTRUE
    s" Dropbox file" COLLIDED$ s" " ar NODE-COPY {: v:str :}
-   x v str> IN-ROOT FS:EXISTS? TFALSE
+   x v IN-ROOT FS:EXISTS? TFALSE
    x PENDING-OF VEC:COUNT 0 T=
    x BLOCKED-OF VEC:COUNT 0 T=
    x CONFLICTS-OF VEC:COUNT 0 T=
@@ -5595,10 +5598,10 @@ $180 constant MODE-0600
    s" /2/files/list_folder /2/files/download /2/files/download" T$= ;
 
 \ COLLISION-HELD, with node left empty.
-: NODE-HELD ( str ^run str ^u8 n -- )
-   {: d:str x rec:str r:^ ru:n :}
-   d x rec r ru COLLISION-HELD
-   x s" node" IN-ROOT str> READ-BUF READ-CAP FS-LIST:NAMES 0 T= ;
+: NODE-HELD ( str ^run str str -- )
+   {: d:str x rec:str r:str :}
+   d x rec r COLLISION-HELD
+   x s" node" IN-ROOT READ-BUF READ-CAP FS-LIST:NAMES 0 T= ;
 
 \ Dropbox's 409 for the next API call, the copy's download.
 : REFUSE-COPY ( -- )
@@ -5627,7 +5630,7 @@ $180 constant MODE-0600
    d x rec s" download_verification_failed" NODE-HELD
    d x STEP-GONE ;
 
-: INNER$ ( -- ^u8 n ) s" local file beneath a held collision" ;
+: INNER$ ( -- str ) s" local file beneath a held collision" ;
 
 : A-HELD-COLLISION-HOLDS-THE-PATHS-BENEATH-IT ( ^ARENA:arena -- )
    {: ar :}
@@ -5667,33 +5670,34 @@ $180 constant MODE-0600
 
 \ Rust's FakeResponse::json for the route r, any API call when r is
 \ empty: the JSON q appends.
-: ANSWERS ( [ -- ] ^u8 n -- )
-   {: q r:^ ru:n :}
+: ANSWERS ( [ -- ] str -- )
+   {: q r:str :}
    SB-RESET q execute
-   r ru 200 s" " s" " SB$ TEST-DROPBOX:ROUTE-SCRIPT! ;
+   r 200 s" " s" " SB$ TEST-DROPBOX:ROUTE-SCRIPT! ;
 
 \ ANSWERS of {"metadata": the entry q appends}.
-: METADATA-ANSWERS ( [ -- ] ^u8 n -- )
-   {: q r:^ ru:n :}
+: METADATA-ANSWERS ( [ -- ] str -- )
+   {: q r:str :}
    [: S\" {\qmetadata\q:" SB-APPEND q execute s" }" SB-APPEND ;]
-   r ru ANSWERS ;
+   r ANSWERS ;
 
 \ The words of a, which single spaces part: the first, then the rest.
-: FIRST-WORD ( ^u8 n -- ^u8 n )
-   {: a:^ u:n :}
-   a u 32 INDEX-OF MATCH option
-      none OF a u ENDOF
-      some OF IDX>N a swap ENDOF
+: FIRST-WORD ( str -- str )
+   {: a:str :}
+   a 32 INDEX-OF MATCH option
+      none OF a ENDOF
+      some OF IDX>N {: k:n :} a 0 k PART ENDOF
    ;MATCH ;
 
-: REST-WORDS ( ^u8 n -- ^u8 n )
-   {: a:^ u:n :}
-   a u 32 INDEX-OF MATCH option
-      none OF a u + 0 ENDOF
-      some OF IDX>N 1+ {: k:n :} a k + u k - ENDOF
+: REST-WORDS ( str -- str )
+   {: a:str :}
+   a str> nip {: u:n :}
+   a 32 INDEX-OF MATCH option
+      none OF a u u PART ENDOF
+      some OF IDX>N 1+ {: k:n :} a k u PART ENDOF
    ;MATCH ;
 
-: WORD-AT ( ^u8 n n -- ^u8 n )
+: WORD-AT ( str n -- str )
    {: k:n :}
    k 0 ?do REST-WORDS loop FIRST-WORD ;
 
@@ -5709,21 +5713,21 @@ $180 constant MODE-0600
 
 \ The JSON value at the pointer p in b, null for none, as Rust's
 \ value[...] reads it.
-: MEMBER$ ( ^u8 n ^u8 n -- ^u8 n )
-   {: b:^ bu:n p:^ pu:n :}
-   b bu >str p pu >str JSON:POINTER-SPAN 0= if 2drop s" null" exit then
+: MEMBER$ ( str str -- str )
+   {: b:str p:str :}
+   b p JSON:POINTER-SPAN 0= if 2drop s" null" exit then
    {: off:n len:n :}
-   b off + len ;
+   b off off len + PART ;
 
-: MEMBER= ( str ^u8 n ^u8 n -- bool )
-   {: b:str p:^ pu:n v:^ vu:n :}
-   b str> p pu MEMBER$ v vu JSON:VALUE= ;
+: MEMBER= ( str str str -- bool )
+   {: b:str p:str v:str :}
+   b p MEMBER$ v JSON:VALUE= ;
 
 \ Rust's probe of the folder p: at most one entry, neither recursive
 \ nor with deleted entries.
-: PROBED-AS ( str ^u8 n -- )
-   {: b:str p:^ pu:n :}
-   SB-RESET p pu QUOTED+
+: PROBED-AS ( str str -- )
+   {: b:str p:str :}
+   SB-RESET p QUOTED+
    b s" /path" SB$ MEMBER= TTRUE
    b s" /limit" s" 1" MEMBER= TTRUE
    b s" /recursive" s" true" MEMBER= TFALSE
@@ -5737,8 +5741,8 @@ $180 constant MODE-0600
    TEST-DROPBOX:RESET
    ar STEP-RUN {: d:str x :}
    d x PASS-READY {: rec:str :}
-   x s" gone" IN-ROOT str> FS:MAKE-DIR
-   x s" gone/child" IN-ROOT str> FS:MAKE-DIR
+   x s" gone" IN-ROOT FS:MAKE-DIR
+   x s" gone/child" IN-ROOT FS:MAKE-DIR
    x s" gone" SEED-DIRECTORY-BASELINE
    x s" gone/child" SEED-DIRECTORY-BASELINE
    s" directories-deleted" ar EMPTY-PAGE
@@ -5785,9 +5789,9 @@ $180 constant MODE-0600
    [: s" /gone" s" /Gone" FOLDER-JSON+ ;] DELETE$ METADATA-ANSWERS ;
 
 \ Whether the k-th delete_v2 body holds the JSON value v.
-: DELETED-AS? ( n ^u8 n -- bool )
-   {: k:n v:^ vu:n :}
-   DELETE$ TEST-DROPBOX:BODIES-TO$ k WORD-AT v vu JSON:VALUE= ;
+: DELETED-AS? ( n str -- bool )
+   {: k:n v:str :}
+   DELETE$ TEST-DROPBOX:BODIES-TO$ k WORD-AT v JSON:VALUE= ;
 
 : TREE-DELETED ( -- )
    DELETE$ TEST-DROPBOX:CALLS 3 T=
@@ -5850,7 +5854,7 @@ $180 constant MODE-0600
    d x STEP-GONE ;
 
 \ The listing, then the probe, with no delete between or after.
-: TWO-LISTS$ ( -- ^u8 n ) s" /2/files/list_folder /2/files/list_folder" ;
+: TWO-LISTS$ ( -- str ) s" /2/files/list_folder /2/files/list_folder" ;
 
 : DROPBOX-DIRECTORY-THAT-GAINED-AN-ENTRY-IS-NOT-DELETED-FROM-A-STALE-INVENTORY
    ( ^ARENA:arena -- )
@@ -5875,8 +5879,8 @@ $180 constant MODE-0600
 
 \ The file the listing's hook writes, Rust's gated write.
 TYPED-VARIABLE RACED str
-: AFTER-SCAN$ ( -- ^u8 n ) s" created after scan" ;
-: RACE ( -- ) RACED @ str> AFTER-SCAN$ FS:WRITE-ALL ;
+: AFTER-SCAN$ ( -- str ) s" created after scan" ;
+: RACE ( -- ) RACED @ AFTER-SCAN$ FS:WRITE-ALL ;
 
 : CHILD-CREATED-AFTER-SCAN-FORCES-AN-IMMEDIATE-DIRECTORY-RESCAN
    ( ^ARENA:arena -- )
@@ -5887,7 +5891,7 @@ TYPED-VARIABLE RACED str
    s" directory-raced-after-scan" ar EMPTY-PAGE
    ar STEP-RUN {: d:str x :}
    d x PASS-READY {: rec:str :}
-   x s" gone" IN-ROOT str> FS:MAKE-DIR
+   x s" gone" IN-ROOT FS:MAKE-DIR
    x s" gone" SEED-DIRECTORY-BASELINE
    x s" gone/new.txt" IN-ROOT RACED !
    [: RACE ;] TEST-DROPBOX:DURING-LISTING!
@@ -5898,7 +5902,7 @@ TYPED-VARIABLE RACED str
    TEST-DROPBOX:SEEN$ LIST$ T$=
    d x STEP-GONE ;
 
-: NEW-CHILD$ ( -- ^u8 n ) s" new child" ;
+: NEW-CHILD$ ( -- str ) s" new child" ;
 
 \ Rust's answers in order, whatever the route: the empty listing, the
 \ parent's folder, then the new child's file.
@@ -5910,7 +5914,7 @@ TYPED-VARIABLE RACED str
    [: s" /parent/new.txt" s" /parent/new.txt" s" rev-new-child" h
       FILE-JSON+ ;] s" " ANSWERS ;
 
-: CHILD-SYNCED-SEEN$ ( -- ^u8 n )
+: CHILD-SYNCED-SEEN$ ( -- str )
    s" /2/files/list_folder /2/files/create_folder_v2 /2/files/upload" ;
 
 : CHILD-PRESENT? ( ^run -- bool )
@@ -5927,8 +5931,8 @@ TYPED-VARIABLE RACED str
    NEW-CHILD$ ar IDENTITY PARENT-DELETED
    ar STEP-RUN {: d:str x :}
    d x PASS-READY {: rec:str :}
-   x s" parent" IN-ROOT str> FS:MAKE-DIR
-   x s" parent/new.txt" IN-ROOT str> NEW-CHILD$ FS:WRITE-ALL
+   x s" parent" IN-ROOT FS:MAKE-DIR
+   x s" parent/new.txt" IN-ROOT NEW-CHILD$ FS:WRITE-ALL
    x s" parent" SEED-DIRECTORY-BASELINE
    x rec PASSED OUTCOME-FRESH? TTRUE
    x s" parent/new.txt" IN-ROOT NEW-CHILD$ HOLDS-BYTES
@@ -5971,10 +5975,10 @@ TYPED-VARIABLE RACED str
       REPLAY:REPLAY-LOCAL-PLANS-AT ;]
    [: root FS:CLOSE-DIR ;] finally ;
 
-: REJECTION$ ( MODEL:blockage -- ^u8 n )
+: REJECTION$ ( MODEL:blockage -- str )
    MATCH MODEL:blockage
       unsupported-file-size OF s" " ENDOF
-      remote-rejected OF str> ENDOF
+      remote-rejected OF ENDOF
       download-unavailable OF drop s" " ENDOF
       download-verification-failed OF s" " ENDOF
       stage-occupied OF s" " ENDOF
@@ -5984,7 +5988,7 @@ TYPED-VARIABLE RACED str
    ;MATCH ;
 
 \ The tag of the plan's remote-rejected block, else empty.
-: REJECTED-TAG$ ( JOURNAL:plan-record -- ^u8 n )
+: REJECTED-TAG$ ( JOURNAL:plan-record -- str )
    JOURNAL-PLAN--RECORD:UNMAKE {: id p o s :}
    s MATCH JOURNAL:plan-status
       pending OF s" " ENDOF
@@ -5992,15 +5996,15 @@ TYPED-VARIABLE RACED str
       completed OF s" " ENDOF
    ;MATCH ;
 
-: KEEP$ ( -- ^u8 n ) s" must not be deleted from a replacement root" ;
+: KEEP$ ( -- str ) s" must not be deleted from a replacement root" ;
 
 \ Rust's swap: the run's root renamed old-root in the case directory
 \ d, and a new root holding keep.txt's bytes.
 : REPLACED-ROOT ( str ^run -- )
    {: d:str x :}
-   x ROOT$ >str d s" old-root" x RUN-ARENA @ INSIDE FS:RENAME-FILE
+   x ROOT$ d s" old-root" x RUN-ARENA @ INSIDE FS:RENAME-FILE
    x ROOT$ FS:MAKE-DIR
-   x s" keep.txt" IN-ROOT str> KEEP$ FS:WRITE-ALL ;
+   x s" keep.txt" IN-ROOT KEEP$ FS:WRITE-ALL ;
 
 : REPLACED-LOCAL-ROOT-NEVER-REPLAYS-PENDING-DELETION
    ( ^ARENA:arena -- )
@@ -6011,7 +6015,7 @@ TYPED-VARIABLE RACED str
    d x PASS-READY {: rec:str :}
    KEEP$ s" rev-old" ar REMOTE-FILE {: rem :}
    rem MODEL-REMOTE:UNMAKE {: c v :}
-   x s" keep.txt" IN-ROOT str> KEEP$ FS:WRITE-ALL
+   x s" keep.txt" IN-ROOT KEEP$ FS:WRITE-ALL
    x s" keep.txt" rem SEED-BASELINE
    x s" keep.txt" rem MODEL-BASELINE:PRESENT c MODEL-LOCAL:MAKE
    LOCAL-PRESENT REMOTE-ABSENT RECORD-FIXTURE-PLAN drop
@@ -6022,7 +6026,7 @@ TYPED-VARIABLE RACED str
    TEST-DROPBOX:SEEN$ s" " T$=
    d x STEP-GONE ;
 
-: EVENT$ ( pass-event -- ^u8 n )
+: EVENT$ ( pass-event -- str )
    MATCH pass-event
       ok OF s" ok" ENDOF
       fresh OF s" fresh" ENDOF
@@ -6033,12 +6037,12 @@ TYPED-VARIABLE RACED str
    {: ar :}
    s" new conflict answers a replaced root" T-LABEL
    ar STEP-RUN {: d:str x :}
-   x s" c-diverged.txt" IN-ROOT str> DIVERGED-LOCAL$ FS:WRITE-ALL
+   x s" c-diverged.txt" IN-ROOT DIVERGED-LOCAL$ FS:WRITE-ALL
    DIVERGED-LOCAL$ ar IDENTITY MODEL-LOCAL:MAKE
    DIVERGED-REMOTE$ s" rev-remote-conflict" ar REMOTE-FILE
    MODEL-CONFLICT:DIVERGENT {: c :}
    d x REPLACED-ROOT
-   x s" c-diverged.txt" IN-ROOT str> DIVERGED-LOCAL$ FS:WRITE-ALL
+   x s" c-diverged.txt" IN-ROOT DIVERGED-LOCAL$ FS:WRITE-ALL
    x NEW-PLANNING {: pl :}
    pl s" c-diverged.txt" ar CANONICAL s" c-diverged.txt" DISPLAY c
    NEW-CONFLICT EVENT$ s" root-changed" T$=
@@ -6047,33 +6051,33 @@ TYPED-VARIABLE RACED str
    d s" old-root/c-diverged.txt" ar INSIDE DIVERGED-LOCAL$ HOLDS-BYTES
    d x STEP-GONE ;
 
-: INVALID-NAME$ ( -- ^u8 n ) s\" invalid-\xFF.txt" ;
-: INVALID-BYTES$ ( -- ^u8 n ) s" invalid path bytes" ;
-: REJECTED-BYTES$ ( -- ^u8 n ) s" rejected bytes" ;
-: GOOD-BYTES$ ( -- ^u8 n ) s" uploaded bytes" ;
-: SIBLING-BYTES$ ( -- ^u8 n ) s" downloaded sibling bytes" ;
+: INVALID-NAME$ ( -- str ) s\" invalid-\xFF.txt" ;
+: INVALID-BYTES$ ( -- str ) s" invalid path bytes" ;
+: REJECTED-BYTES$ ( -- str ) s" rejected bytes" ;
+: GOOD-BYTES$ ( -- str ) s" uploaded bytes" ;
+: SIBLING-BYTES$ ( -- str ) s" downloaded sibling bytes" ;
 
-: UPLOAD-SUMMARY$ ( ^u8 n -- ^u8 n )
-   {: t:^ tu:n :}
-   t tu s" conflict" STR= if s" path/conflict/file/..." exit then
-   t tu s" disallowed_name" STR= if
+: UPLOAD-SUMMARY$ ( str -- str )
+   {: t:str :}
+   t s" conflict" STR= if s" path/conflict/file/..." exit then
+   t s" disallowed_name" STR= if
       s" path/disallowed_name/..." exit
    then
    s" path/other/..." ;
 
 \ Rust's upload_error for a reason of tag t, in SB.
-: UPLOAD-ERROR$ ( ^u8 n -- ^u8 n )
-   {: t:^ tu:n :}
+: UPLOAD-ERROR$ ( str -- str )
+   {: t:str :}
    SB-RESET S\" {\qerror_summary\q:" SB-APPEND
-   t tu UPLOAD-SUMMARY$ QUOTED+
+   t UPLOAD-SUMMARY$ QUOTED+
    S\" ,\qerror\q:{\q.tag\q:\qpath\q,\qreason\q:{\q.tag\q:" SB-APPEND
-   t tu QUOTED+
+   t QUOTED+
    S\" },\qupload_session_id\q:\qfixture-session\q}}" SB-APPEND SB$ ;
 
 \ The next upload is refused 409 for the wire tag t.
-: UPLOAD-REFUSED ( ^u8 n -- )
-   {: t:^ tu:n :}
-   UPLOAD-ROUTE$ 409 s" " s" " t tu UPLOAD-ERROR$
+: UPLOAD-REFUSED ( str -- )
+   {: t:str :}
+   UPLOAD-ROUTE$ 409 s" " s" " t UPLOAD-ERROR$
    TEST-DROPBOX:ROUTE-SCRIPT! ;
 
 : DISALLOWED-UPLOAD ( DROPBOX:hash -- )
@@ -6099,12 +6103,12 @@ TYPED-VARIABLE RACED str
 
 \ A listing page of good.txt, content g, and download.txt, content sib,
 \ with the cursor k.
-: SIBLINGS-PAGE ( DROPBOX:hash DROPBOX:hash ^u8 n ^ARENA:arena -- )
-   {: g:DROPBOX:hash sib:DROPBOX:hash k:^ ku:n ar :}
+: SIBLINGS-PAGE ( DROPBOX:hash DROPBOX:hash str ^ARENA:arena -- )
+   {: g:DROPBOX:hash sib:DROPBOX:hash k:str ar :}
    [: s" /good.txt" s" /good.txt" s" good-revision" g FILE-JSON+ COMMA+
       s" /download.txt" s" /download.txt" s" download-sibling-revision"
       sib FILE-JSON+ ;]
-   ar ENTRIES k ku false PAGE ;
+   ar ENTRIES k false PAGE ;
 
 \ Rust's answers: the rejection q for the rejected content, good.txt's
 \ upload, both passes' listings and download.txt, then q again.
@@ -6123,15 +6127,15 @@ TYPED-VARIABLE RACED str
    rc q execute ;
 
 \ The local file p holding b, and its upload recorded pending.
-: UPLOAD-PENDING ( ^run ^u8 n ^u8 n -- )
-   {: x p:^ u:n b:^ bu:n :}
-   x p u b bu WRITE-IN
-   x p u b bu x RUN-ARENA @ IDENTITY UPLOAD-PLANNED drop ;
+: UPLOAD-PENDING ( ^run str str -- )
+   {: x p:str b:str :}
+   x p b WRITE-IN
+   x p b x RUN-ARENA @ IDENTITY UPLOAD-PLANNED drop ;
 
 \ The first pass uploads good.txt, installs download.txt and blocks the
 \ invalid path and bad.txt, the second as tag t; bad.txt's plan id.
-: REJECTED-FIRST ( ^run str ^u8 n -- JOURNAL:plan-id )
-   {: x rec:str t:^ tu:n :}
+: REJECTED-FIRST ( ^run str str -- JOURNAL:plan-id )
+   {: x rec:str t:str :}
    x RUN-ARENA @ {: ar :}
    x rec PASSED COMPLETE REPLAYED-ERRORS {: replayed:n errors:n :}
    \ Departure 2: download.txt installs in the pass, so 2, not 1.
@@ -6147,16 +6151,16 @@ TYPED-VARIABLE RACED str
    held 0 PLAN-PATH$ INVALID-NAME$ T$=
    held 1 PLAN-PATH$ s" bad.txt" T$=
    held 0 VEC:AT @ REJECTED-TAG$ s" invalid_path" T$=
-   held 1 VEC:AT @ REJECTED-TAG$ t tu T$=
+   held 1 VEC:AT @ REJECTED-TAG$ t T$=
    held 1 VEC:AT @ ID-OF ;
 
 \ Reopened, the remote replay reports nothing blocked; bad, blocked as
 \ tag t and due now, is sent again by a second pass.
-: REJECTED-DUE ( str ^run str JOURNAL:plan-id ^u8 n -- )
-   {: d:str x rec:str bad t:^ tu:n :}
+: REJECTED-DUE ( str ^run str JOURNAL:plan-id str -- )
+   {: d:str x rec:str bad t:str :}
    d x REOPENED
    x REMOTE-REPLAYED BLOCKS VEC:COUNT 0 T=
-   x bad t tu REJECTED-AS 0 BLOCKED-UNTIL
+   x bad t REJECTED-AS 0 BLOCKED-UNTIL
    x rec PASSED COMPLETE REPLAYED-ERRORS nip 2 T=
    x PENDING-OF VEC:COUNT 0 T=
    x BLOCKED-OF VEC:COUNT 2 T= ;
@@ -6164,21 +6168,21 @@ TYPED-VARIABLE RACED str
 \ The requests: the rejection's rs, good.txt's upload, the listing, the
 \ download and the continuation, then rs again; no account request
 \ (departure 5).
-: REJECTED-SEEN$ ( ^u8 n -- ^u8 n )
-   {: rs:^ ru:n :}
-   SB-RESET rs ru SB-APPEND
+: REJECTED-SEEN$ ( str -- str )
+   {: rs:str :}
+   SB-RESET rs SB-APPEND
    s"  /2/files/upload /2/files/list_folder /2/files/download" SB-APPEND
-   s"  /2/files/list_folder/continue " SB-APPEND rs ru SB-APPEND SB$ ;
+   s"  /2/files/list_folder/continue " SB-APPEND rs SB-APPEND SB$ ;
 
-: REJECTED-BODIES$ ( -- ^u8 n )
+: REJECTED-BODIES$ ( -- str )
    SB-RESET REJECTED-BYTES$ SB-APPEND s"  " SB-APPEND
    GOOD-BYTES$ SB-APPEND s"  " SB-APPEND
    REJECTED-BYTES$ SB-APPEND SB$ ;
 
 \ Rust's rejected_path_case: the rejection q, whose requests' paths are
 \ rs, blocks bad.txt as tag t while unrelated paths sync.
-: REJECTED-PATH-CASE ( [ DROPBOX:hash -- ] ^u8 n ^u8 n ^ARENA:arena -- )
-   {: q rs:^ ru:n t:^ tu:n ar :}
+: REJECTED-PATH-CASE ( [ DROPBOX:hash -- ] str str ^ARENA:arena -- )
+   {: q rs:str t:str ar :}
    TEST-DROPBOX:RESET
    q ar REJECTED-SERVED
    ar STEP-RUN {: d:str x :}
@@ -6186,20 +6190,20 @@ TYPED-VARIABLE RACED str
    x INVALID-NAME$ INVALID-BYTES$ UPLOAD-PENDING
    x s" bad.txt" REJECTED-BYTES$ UPLOAD-PENDING
    x s" good.txt" GOOD-BYTES$ UPLOAD-PENDING
-   x rec t tu REJECTED-FIRST {: bad :}
-   d x rec bad t tu REJECTED-DUE
-   TEST-DROPBOX:SEEN$ rs ru REJECTED-SEEN$ T$=
+   x rec t REJECTED-FIRST {: bad :}
+   d x rec bad t REJECTED-DUE
+   TEST-DROPBOX:SEEN$ rs REJECTED-SEEN$ T$=
    UPLOAD-ROUTE$ TEST-DROPBOX:BODIES-TO$ REJECTED-BODIES$ T$=
    d x STEP-GONE ;
 
-: BAD-LOOKUPS$ ( -- ^u8 n )
+: BAD-LOOKUPS$ ( -- str )
    SB-RESET 2 0 ?do
       i 0<> if s"  " SB-APPEND then
       S\" {\qpath\q:\q/bad.txt\q,\qinclude_deleted\q:true}" SB-APPEND
    loop SB$ ;
 
 \ The uploads' arguments: bad.txt's, good.txt's, then bad.txt's again.
-: REJECTED-ARGS$ ( ^ARENA:arena -- ^u8 n )
+: REJECTED-ARGS$ ( ^ARENA:arena -- str )
    {: ar :}
    s" /bad.txt" REJECTED-BYTES$ ar ADD-ARG$ s"  " ar JOIN-BYTES
    s" /good.txt" GOOD-BYTES$ ar ADD-ARG$ ar JOIN-BYTES
@@ -6223,12 +6227,12 @@ TYPED-VARIABLE RACED str
    UPLOAD-ROUTE$ TEST-DROPBOX:ARGS-TO$ ar REJECTED-ARGS$ T$=
    METADATA-ROUTE$ TEST-DROPBOX:BODIES-TO$ BAD-LOOKUPS$ T$= ;
 
-: STALE$ ( -- ^u8 n ) s" preserve stale local metadata" ;
-: ORDINARY-UPLOAD$ ( -- ^u8 n ) s" ordinary local upload" ;
-: ORDINARY-DOWNLOAD$ ( -- ^u8 n ) s" ordinary remote download" ;
+: STALE$ ( -- str ) s" preserve stale local metadata" ;
+: ORDINARY-UPLOAD$ ( -- str ) s" ordinary local upload" ;
+: ORDINARY-DOWNLOAD$ ( -- str ) s" ordinary remote download" ;
 
 \ Rust's excluded local files: q runs on each path and its bytes.
-: EXCLUDED-LOCALS ( [ ^u8 n ^u8 n -- ] -- )
+: EXCLUDED-LOCALS ( [ str str -- ] -- )
    {: q :}
    s" Desktop.INI" STALE$ q execute
    s\" Icon\r" s" local icon metadata" q execute
@@ -6239,13 +6243,13 @@ TYPED-VARIABLE RACED str
    s" .DROPBOX/local-child.txt" s" local excluded descendant"
    q execute ;
 
-: EXCLUDED-WRITE ( ^u8 n ^u8 n ^run -- )
-   {: p:^ u:n b:^ bu:n x :}
-   x p u b bu WRITE-IN ;
+: EXCLUDED-WRITE ( str str ^run -- )
+   {: p:str b:str x :}
+   x p b WRITE-IN ;
 
-: EXCLUDED-KEPT ( ^u8 n ^u8 n ^run -- )
-   {: p:^ u:n b:^ bu:n x :}
-   x p u IN-ROOT b bu HOLDS-BYTES ;
+: EXCLUDED-KEPT ( str str ^run -- )
+   {: p:str b:str x :}
+   x p IN-ROOT b HOLDS-BYTES ;
 
 \ Rust's delta page: excluded files and a folder with a child, and
 \ ordinary-download.txt.
@@ -6285,9 +6289,9 @@ TYPED-VARIABLE RACED str
    {: x stale only :}
    x RUN-ARENA @ {: ar :}
    x RUN-JOURNAL @ {: j :}
-   x s" .DROPBOX" IN-ROOT str> FS:MAKE-DIR
+   x s" .DROPBOX" IN-ROOT FS:MAKE-DIR
    [: x EXCLUDED-WRITE ;] EXCLUDED-LOCALS
-   x s" ordinary-upload.txt" IN-ROOT str> ORDINARY-UPLOAD$ FS:WRITE-ALL
+   x s" ordinary-upload.txt" IN-ROOT ORDINARY-UPLOAD$ FS:WRITE-ALL
    x s" Desktop.INI" stale SEED-BASELINE
    x s" THUMBS.DB" only SEED-BASELINE
    s" old excluded inventory" s" old-excluded-revision" ar REMOTE-FILE
@@ -6298,7 +6302,7 @@ TYPED-VARIABLE RACED str
 
 \ Departure 5: no account request; the download installs before the
 \ upload is sent.
-: EXCLUDED-SEEN$ ( -- ^u8 n )
+: EXCLUDED-SEEN$ ( -- str )
    s" /2/files/list_folder/continue /2/files/download /2/files/upload" ;
 
 : DOCUMENTED-EXCLUSIONS-PRESERVE-PAYLOADS-WHILE-ORDINARY-SIBLINGS-SYNC
@@ -6333,7 +6337,7 @@ TYPED-VARIABLE RACED str
    TEST-DROPBOX:SEEN$ EXCLUDED-SEEN$ T$=
    d x STEP-GONE ;
 
-: EXCLUDED-LOCAL$ ( -- ^u8 n ) s" preserved excluded local bytes" ;
+: EXCLUDED-LOCAL$ ( -- str ) s" preserved excluded local bytes" ;
 
 : BOUND-ANY ( JOURNAL:dropbox-binding-write -- )
    MATCH JOURNAL:dropbox-binding-write
@@ -6380,7 +6384,7 @@ TYPED-VARIABLE RACED str
    x RUN-ARENA @ {: ar :}
    x s" folder/metadata.ds_store" MODEL-BASELINE:ABSENT
    LOCAL-ABSENT rem REMOTE-PRESENT RECORD-FIXTURE-PLAN drop
-   x s" .dropbox.attr" IN-ROOT str> EXCLUDED-LOCAL$ FS:WRITE-ALL
+   x s" .dropbox.attr" IN-ROOT EXCLUDED-LOCAL$ FS:WRITE-ALL
    x s" .dropbox.attr" MODEL-BASELINE:ABSENT
    loc LOCAL-PRESENT REMOTE-ABSENT RECORD-FIXTURE-PLAN ID-OF
    {: up :}
@@ -6400,7 +6404,7 @@ TYPED-VARIABLE RACED str
 : BLOCKED-RETIRES ( str ^run MODEL:remote -- )
    {: d:str x rem :}
    x RUN-JOURNAL @ JOURNAL:CLOSE
-   d x JOURNAL-FILE x RUN-ARENA @ ATTENTION:RENDER str>
+   d x JOURNAL-FILE x RUN-ARENA @ ATTENTION:RENDER
    s\" Omabox has no recorded work needing attention.\n" T$=
    d x OPENED-AGAIN
    TEST-DROPBOX:RESET
@@ -6423,9 +6427,9 @@ TYPED-VARIABLE RACED str
    ar STEP-RUN {: d:str x :}
    EXCLUDED-LOCAL$ ar IDENTITY MODEL-LOCAL:MAKE {: loc :}
    EXCLUDED-LOCAL$ s" excluded-remote-revision" ar REMOTE-FILE {: rem :}
-   x s" .DS_Store" IN-ROOT str> EXCLUDED-LOCAL$ FS:WRITE-ALL
-   x s\" Icon\r" IN-ROOT str> EXCLUDED-LOCAL$ FS:WRITE-ALL
-   x RUN-JOURNAL @ s" dbid:account" >str s" namespace" >str s" " >str
+   x s" .DS_Store" IN-ROOT EXCLUDED-LOCAL$ FS:WRITE-ALL
+   x s\" Icon\r" IN-ROOT EXCLUDED-LOCAL$ FS:WRITE-ALL
+   x RUN-JOURNAL @ s" dbid:account" s" namespace" s" "
    JOURNAL-DROPBOX--BINDING:MAKE ar JOURNAL:BIND-DROPBOX-ROOT BOUND-ANY
    d x loc rem REMOTE-RETIRES
    d x loc rem LOCAL-RETIRES

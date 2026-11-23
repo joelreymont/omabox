@@ -184,26 +184,26 @@ private
 $2F constant SLASH
 $2E constant DOT
 
-: ROOT? ( ^u8 n -- bool )
-   {: p:^ u:n :}
+: ROOT? ( str -- bool )
+   str> {: p:^ u:n :}
    u 0 > if p c@ SLASH = exit then
    false ;
 
-: CURRENT? ( ^u8 n -- bool )
-   {: p:^ u:n :}
+: CURRENT? ( str -- bool )
+   str> {: p:^ u:n :}
    u 0= if false exit then
    p c@ DOT <> if false exit then
    u 1 = if true exit then
    p 1+ c@ SLASH = ;
 
 \ The bytes of the root or the leading "." a path starts with.
-: LEAD ( ^u8 n -- n )
-   2dup ROOT? if 2drop 1 exit then
+: LEAD ( str -- n )
+   dup ROOT? if drop 1 exit then
    CURRENT? if 1 exit then
    0 ;
 
-: PART? ( ^u8 n -- bool )
-   {: p:^ u:n :}
+: PART? ( str -- bool )
+   str> {: p:^ u:n :}
    u 1 = if p c@ DOT <> exit then
    u 0 > ;
 
@@ -211,70 +211,71 @@ $2E constant DOT
 : SEP? ( n bool -- bool )
    if 1 else 0 then > ;
 
-: LOWERED-BYTES ( ^u8 n -- n )
-   2dup UTF8:VALID? if >str UNICODE:LOWERED-BYTES exit then
-   nip ;
+: LOWERED-BYTES ( str -- n )
+   dup UTF8:VALID? if UNICODE:LOWERED-BYTES exit then
+   STR:len ;
 
-: LOWER-INTO ( ^u8 n ^u8 n -- n )
-   {: p:^ u:n dst:^ cap:n :}
-   p u UTF8:VALID? if p u dst cap UNICODE:LOWER exit then
+: LOWER-INTO ( str ^u8 n -- n )
+   {: s dst:^ cap:n :}
+   s str> {: p:^ u:n :}
+   s UTF8:VALID? if s dst cap UNICODE:LOWER exit then
    u 0 ?do p i + c@ ASCII-LOWER dst i + c! loop
    u ;
 
 \ The bytes a component adds after `len`.
-: ADD-SIZE ( n bool ^u8 n -- n )
-   {: len:n root:bool p:^ u:n :}
+: ADD-SIZE ( n bool str -- n )
+   {: len:n root:bool p :}
    len len root SEP? if 1+ then
-   p u LOWERED-BYTES + ;
+   p LOWERED-BYTES + ;
 
 \ Writes a component after `len` of `size` bytes at `dst`.
-: ADD-BYTES ( n bool ^u8 n ^u8 n -- n )
-   {: len:n root:bool p:^ u:n dst:^ size:n :}
+: ADD-BYTES ( n bool str ^u8 n -- n )
+   {: len:n root:bool p dst:^ size:n :}
    len root SEP? if SLASH dst len + c! len 1+ else len then
    {: at:n :}
-   p u dst at + size at - LOWER-INTO at + ;
+   p dst at + size at - LOWER-INTO at + ;
 
 \ The component from `at` that PART? accepts and the index after it;
 \ false past the last.
-: NEXT-PART ( ^u8 n n -- ^u8 n n bool )
-   {: p:^ u:n at:n :}
-   p u SLASH at SPLIT-NEXT 0= if false exit then
-   {: q:^ v:n next:n :}
-   q v PART? if q v next true exit then
-   p u next RECURSE ;
+: NEXT-PART ( str n -- str n bool )
+   {: p at:n :}
+   p SLASH at SPLIT-NEXT 0= if false exit then
+   {: q next:n :}
+   q PART? if q next true exit then
+   p next RECURSE ;
 
 \ Runs ADD on the next component from `at`; false past the last.
-: STEP ( ^u8 n bool n n [ n bool ^u8 n -- n ] -- n n bool )
-   {: p:^ u:n root:bool len:n at:n add :}
-   p u at NEXT-PART 0= if 2drop drop len at false exit then
-   {: next:n :}
-   len root 2swap add execute next true ;
+: STEP ( str bool n n [ n bool str -- n ] -- n n bool )
+   {: p root:bool len:n at:n add :}
+   p at NEXT-PART 0= if drop drop len at false exit then
+   {: q next:n :}
+   len root q add execute next true ;
 
 \ Runs ADD over every component PART? accepts, from the lead's
 \ bytes on.
-: PARTS ( ^u8 n [ n bool ^u8 n -- n ] -- n )
-   {: p:^ u:n add :}
-   p u ROOT? {: root:bool :}
-   p u LEAD 0
-   begin 2>r p u root 2r> add STEP 0= until
+: PARTS ( str [ n bool str -- n ] -- n )
+   {: p add :}
+   p ROOT? {: root:bool :}
+   p LEAD 0
+   begin 2>r p root 2r> add STEP 0= until
    drop ;
 
 \ For PARTS over q: the index in p after p's next component when that is
 \ q's component, else -1, which every later component keeps.
-: MATCH-PART ( n bool ^u8 n ^u8 n -- n )
-   {: at:n root:bool q:^ v:n p:^ u:n :}
+: MATCH-PART ( n bool str str -- n )
+   {: at:n root:bool q p :}
    at 0 < if -1 exit then
-   p u at NEXT-PART 0= if 2drop drop -1 exit then
-   {: a:^ au:n next:n :}
-   a au q v STR= if next exit then
+   p at NEXT-PART 0= if drop drop -1 exit then
+   {: a next:n :}
+   a q STR= if next exit then
    -1 ;
 
-: BYTES ( key -- ^u8 n ) KEY>STR str> ;
+: BYTES ( key -- str ) KEY>STR ;
 
 \ The key's bytes then one byte, laid in the arena.
 : EXTENDED ( key u8 ^ARENA:arena -- str )
    {: k:key b:u8 ar:^ARENA:arena :}
-   k BYTES {: p:^ u:n :}
+   k BYTES str> {: p:^ u:n :}
    ar u 1+ ARENA:ALLOC drop {: dst:^ :}
    p dst u BYTE-COPY
    b dst u + c!
@@ -282,7 +283,7 @@ $2E constant DOT
 
 : PATH= ( path path -- bool )
    {: a:path b:path :}
-   a PATH>STR str> b PATH>STR str> STR= ;
+   a PATH>STR b PATH>STR STR= ;
 
 \ A value's variant and the strings it holds, empty where it holds none.
 STRUCTURE form
@@ -292,16 +293,16 @@ STRUCTURE form
    FIELD three str
 ;STRUCTURE
 
-: NONE ( -- str ) s" " >str ;
+: NONE ( -- str ) s" " ;
 
 : FORM= ( form form -- bool )
    {: a:form b:form :}
    a FORM-UNMAKE {: v:n x:str y:str z:str :}
    b FORM-UNMAKE {: w:n x2:str y2:str z2:str :}
    v w <> if false exit then
-   x str> x2 str> STR= 0= if false exit then
-   y str> y2 str> STR= 0= if false exit then
-   z str> z2 str> STR= ;
+   x x2 STR= 0= if false exit then
+   y y2 STR= 0= if false exit then
+   z z2 STR= ;
 
 : LOCAL-FORM ( n local -- form )
    MODEL-LOCAL:UNMAKE DROPBOX:HASH>STR NONE NONE FORM-MAKE ;
@@ -422,11 +423,11 @@ public
 \ The display path's Dropbox identity, its bytes in ARENA.
 : FOLD ( path ^ARENA:arena -- key )
    {: path:path ar:^ARENA:arena :}
-   path PATH>STR str> {: p:^ u:n :}
-   p u [: ADD-SIZE ;] PARTS {: size:n :}
+   path PATH>STR {: s :}
+   s [: ADD-SIZE ;] PARTS {: size:n :}
    ar size ARENA:ALLOC drop {: dst:^ :}
-   p dst p u LEAD BYTE-COPY
-   p u [: dst size ADD-BYTES ;] PARTS drop
+   s STR:data dst s LEAD BYTE-COPY
+   s [: dst size ADD-BYTES ;] PARTS drop
    dst size >str >KEY ;
 
 \ Below zero, zero or above zero as the first key's bytes sort before,
@@ -434,7 +435,7 @@ public
 : KEY-CMP ( key key -- n )
    {: a:key b:key :}
    a BYTES b BYTES STR= if 0 exit then
-   a BYTES >str b BYTES >str STR< if -1 exit then
+   a BYTES b BYTES STR< if -1 exit then
    1 ;
 
 : KEY= ( key key -- bool ) {: a:key b:key :} a BYTES b BYTES STR= ;
@@ -442,10 +443,10 @@ public
 \ True when the first key is strictly beneath the second.
 : BENEATH? ( key key -- bool )
    {: k:key top:key :}
-   k BYTES {: p:^ u:n :}
-   top BYTES {: q:^ v:n :}
+   k BYTES str> {: p:^ u:n :}
+   top BYTES str> {: q:^ v:n :}
    u v <= if false exit then
-   p v q v STR= 0= if false exit then
+   p v >str q v >str STR= 0= if false exit then
    p v + c@ SLASH = ;
 
 \ The half-open byte range from the key then "/" to the key then the
@@ -460,10 +461,11 @@ public
 \ at the second's lead length, which the first's lead shares.
 : BEGINS? ( path path -- bool )
    {: a:path b:path :}
-   a PATH>STR str> {: p:^ u:n :}
-   b PATH>STR str> {: q:^ v:n :}
-   p p u LEAD q q v LEAD STR= 0= if false exit then
-   q v [: p u MATCH-PART ;] PARTS 0 >= ;
+   a PATH>STR {: p :}
+   b PATH>STR {: q :}
+   p STR:data p LEAD >str q STR:data q LEAD >str STR=
+   0= if false exit then
+   q [: p MATCH-PART ;] PARTS 0 >= ;
 
 private
 
@@ -477,28 +479,29 @@ private
 
 \ The component from `at`, its rank and the index after it; END-RANK
 \ past the last. At -1, the root or leading "." comes first.
-: COMPONENT ( ^u8 n n -- ^u8 n n n )
-   {: p:^ u:n at:n :}
+: COMPONENT ( str n -- str n n )
+   {: p at:n :}
+   p STR:data {: a:^ :}
    at 0 < if
-      p u ROOT? if p 1 ROOT-RANK 1 exit then
-      p u CURRENT? if p 1 CURRENT-RANK 1 exit then
-      p u 0 RECURSE exit
+      p ROOT? if a 1 >str ROOT-RANK 1 exit then
+      p CURRENT? if a 1 >str CURRENT-RANK 1 exit then
+      p 0 RECURSE exit
    then
-   p u at NEXT-PART 0= if 2drop drop p 0 END-RANK at exit then
-   {: q:^ v:n next:n :}
-   q v s" .." STR= if q v PARENT-RANK next exit then
-   q v NAME-RANK next ;
+   p at NEXT-PART 0= if drop drop a 0 >str END-RANK at exit then
+   {: q next:n :}
+   q s" .." STR= if q PARENT-RANK next exit then
+   q NAME-RANK next ;
 
 \ The components from i in p and j in q: the indices after them, their
 \ order, and true when they are equal and neither path has ended.
-: CMP-STEP ( ^u8 n ^u8 n n n -- n n n bool )
-   {: p:^ u:n q:^ v:n i:n j:n :}
-   p u i COMPONENT {: x:^ xu:n xr:n i2:n :}
-   q v j COMPONENT {: y:^ yu:n yr:n j2:n :}
+: CMP-STEP ( str str n n -- n n n bool )
+   {: p q i:n j:n :}
+   p i COMPONENT {: x xr:n i2:n :}
+   q j COMPONENT {: y yr:n j2:n :}
    xr yr <> if i2 j2 xr yr - false exit then
    xr END-RANK = if i2 j2 0 false exit then
-   x xu y yu STR= if i2 j2 0 true exit then
-   i2 j2 x xu >str y yu >str STR< if -1 else 1 then false ;
+   x y STR= if i2 j2 0 true exit then
+   i2 j2 x y STR< if -1 else 1 then false ;
 
 public
 
@@ -506,40 +509,42 @@ public
 \ that order, and a path that runs out first is less. Allocates nothing.
 : PATH-CMP ( path path -- n )
    {: a:path b:path :}
-   a PATH>STR str> {: p:^ u:n :}
-   b PATH>STR str> {: q:^ v:n :}
-   -1 -1 0 begin drop 2>r p u q v 2r> CMP-STEP 0= until
+   a PATH>STR {: p :}
+   b PATH>STR {: q :}
+   -1 -1 0 begin drop 2>r p q 2r> CMP-STEP 0= until
    nip nip ;
 
 private
 
-: SUFFIX-CI? ( ^u8 n ^u8 n -- bool )
-   {: p:^ u:n x:^ xu:n :}
+: SUFFIX-CI? ( str str -- bool )
+   {: s x :}
+   s str> {: p:^ u:n :}
+   x STR:len {: xu:n :}
    u xu < if false exit then
-   p u + xu - xu >str x xu >str STR=CI ;
+   p u + xu - xu >str x STR=CI ;
 
 public
 
 \ Dropbox's documented temporary-file prefixes and metadata suffixes, the
 \ suffixes in any ASCII case (help.dropbox.com/en-en/sync/files-not-syncing).
-: EXCLUDED-NAME? ( ^u8 n -- bool )
-   {: p:^ u:n :}
-   p u >str s" ~$" >str STARTS-WITH? if true exit then
-   p u >str s" .~" >str STARTS-WITH? if true exit then
-   p u s" desktop.ini" SUFFIX-CI? if true exit then
-   p u s" thumbs.db" SUFFIX-CI? if true exit then
-   p u s" .ds_store" SUFFIX-CI? if true exit then
-   p u s\" icon\r" SUFFIX-CI? if true exit then
-   p u s" .dropbox" SUFFIX-CI? if true exit then
-   p u s" .dropbox.attr" SUFFIX-CI? ;
+: EXCLUDED-NAME? ( str -- bool )
+   {: p :}
+   p s" ~$" STARTS-WITH? if true exit then
+   p s" .~" STARTS-WITH? if true exit then
+   p s" desktop.ini" SUFFIX-CI? if true exit then
+   p s" thumbs.db" SUFFIX-CI? if true exit then
+   p s" .ds_store" SUFFIX-CI? if true exit then
+   p s\" icon\r" SUFFIX-CI? if true exit then
+   p s" .dropbox" SUFFIX-CI? if true exit then
+   p s" .dropbox.attr" SUFFIX-CI? ;
 
 private
 
 \ For PARTS: -1 once a component is an excluded name, else `at`.
-: EXCLUDED-PART ( n bool ^u8 n -- n )
-   {: at:n root:bool q:^ v:n :}
+: EXCLUDED-PART ( n bool str -- n )
+   {: at:n root:bool q :}
    at 0 < if -1 exit then
-   q v EXCLUDED-NAME? if -1 exit then
+   q EXCLUDED-NAME? if -1 exit then
    at ;
 
 public
@@ -547,7 +552,7 @@ public
 \ Some component is an excluded name: an excluded directory excludes
 \ everything beneath it.
 : EXCLUDED? ( path -- bool )
-   PATH>STR str> [: EXCLUDED-PART ;] PARTS 0 < ;
+   PATH>STR [: EXCLUDED-PART ;] PARTS 0 < ;
 
 : LOCAL= ( local local -- bool )
    {: a:local b:local :}
@@ -617,7 +622,7 @@ public
       stale OF s" inventory is stale" ENDOF
       cursor-reset OF s" remote cursor was reset" ENDOF
       unsupported OF s" object is unsupported" ENDOF
-   ;MATCH >str ;
+   ;MATCH ;
 
 public
 
@@ -641,7 +646,7 @@ public
       delete-remote OF drop
          s" delete remote file if the expected revision still matches"
       ENDOF
-   ;MATCH >str ;
+   ;MATCH ;
 
 : CONFLICT$ ( conflict -- str )
    MATCH conflict
@@ -657,22 +662,22 @@ public
       remote-deleted OF drop
          s" remote deletion conflicts with a local edit; preserve the local payload"
       ENDOF
-   ;MATCH >str ;
+   ;MATCH ;
 
 \ ---- JSON
 
 private
 
 \ The names Rust gives a family's variants, by index; empty past them.
-: BASELINE-NAME ( n -- ^u8 n )
+: BASELINE-NAME ( n -- str )
    case
       0 of s" Absent" endof
       1 of s" Present" endof
       2 of s" Directory" endof
-      s" " rot
+      s" " swap
    endcase ;
 
-: REASON-NAME ( n -- ^u8 n )
+: REASON-NAME ( n -- str )
    case
       0 of s" Incomplete" endof
       1 of s" Inaccessible" endof
@@ -680,19 +685,19 @@ private
       3 of s" Stale" endof
       4 of s" CursorReset" endof
       5 of s" Unsupported" endof
-      s" " rot
+      s" " swap
    endcase ;
 
-: OBSERVATION-NAME ( n -- ^u8 n )
+: OBSERVATION-NAME ( n -- str )
    case
       0 of s" Present" endof
       1 of s" Directory" endof
       2 of s" ConfirmedAbsent" endof
       3 of s" Unknown" endof
-      s" " rot
+      s" " swap
    endcase ;
 
-: OPERATION-NAME ( n -- ^u8 n )
+: OPERATION-NAME ( n -- str )
    case
       0 of s" CreateLocalDirectory" endof
       1 of s" CreateRemoteDirectory" endof
@@ -706,19 +711,19 @@ private
       9 of s" PreserveRemote" endof
       10 of s" ReplaceRemote" endof
       11 of s" DeleteRemote" endof
-      s" " rot
+      s" " swap
    endcase ;
 
-: CONFLICT-NAME ( n -- ^u8 n )
+: CONFLICT-NAME ( n -- str )
    case
       0 of s" InitialCollision" endof
       1 of s" DivergentEdits" endof
       2 of s" LocalDeletionRemoteEdit" endof
       3 of s" RemoteDeletionLocalEdit" endof
-      s" " rot
+      s" " swap
    endcase ;
 
-: BLOCKAGE-NAME ( n -- ^u8 n )
+: BLOCKAGE-NAME ( n -- str )
    case
       0 of s" UnsupportedFileSize" endof
       1 of s" RemoteRejected" endof
@@ -728,7 +733,7 @@ private
       5 of s" LocalObjectInWay" endof
       6 of s" RemoteObject" endof
       7 of s" ConflictCopyOccupied" endof
-      s" " rot
+      s" " swap
    endcase ;
 
 : >REASON ( n -- unknown-reason )
@@ -742,18 +747,18 @@ private
    endcase ;
 
 \ The next member's key, after a comma unless it is the first.
-: KEY+ ( ^JSON:writer ^u8 n -- ^JSON:writer )
-   {: a:^ u:n :}
-   JSON:WRITE-COMMA a u JSON:WRITE-KEY ;
+: KEY+ ( ^JSON:writer str -- ^JSON:writer )
+   {: a :}
+   JSON:WRITE-COMMA a JSON:WRITE-KEY ;
 
 \ Opens a variant written with its payload, `{"Name":`; an object end
 \ closes it.
-: TAGGED+ ( ^JSON:writer ^u8 n -- ^JSON:writer )
-   {: a:^ u:n :}
-   JSON:WRITE-OBJECT-START a u JSON:WRITE-KEY ;
+: TAGGED+ ( ^JSON:writer str -- ^JSON:writer )
+   {: a :}
+   JSON:WRITE-OBJECT-START a JSON:WRITE-KEY ;
 
 \ Opens a struct variant, `{"Name":{`; ;FIELDS+ closes it.
-: FIELDS+ ( ^JSON:writer ^u8 n -- ^JSON:writer )
+: FIELDS+ ( ^JSON:writer str -- ^JSON:writer )
    TAGGED+ JSON:WRITE-OBJECT-START ;
 
 : ;FIELDS+ ( ^JSON:writer -- ^JSON:writer )
@@ -786,14 +791,14 @@ public
 : BASELINE>JSON ( baseline ^JSON:writer -- ^JSON:writer )
    {: v:baseline w :}
    v MATCH baseline
-      absent OF w 0 BASELINE-NAME >str JSON:WRITE-STRING ENDOF
+      absent OF w 0 BASELINE-NAME JSON:WRITE-STRING ENDOF
       present OF w 1 BASELINE-NAME TAGGED+ REMOTE>JSON
          JSON:WRITE-OBJECT-END ENDOF
-      directory OF w 2 BASELINE-NAME >str JSON:WRITE-STRING ENDOF
+      directory OF w 2 BASELINE-NAME JSON:WRITE-STRING ENDOF
    ;MATCH ;
 
 : UNKNOWN-REASON>JSON ( unknown-reason ^JSON:writer -- ^JSON:writer )
-   swap REASON-INDEX REASON-NAME >str JSON:WRITE-STRING ;
+   swap REASON-INDEX REASON-NAME JSON:WRITE-STRING ;
 
 private
 
@@ -803,10 +808,10 @@ private
    JSON:WRITE-OBJECT-END ;
 
 : DIRECTORY+ ( ^JSON:writer -- ^JSON:writer )
-   1 OBSERVATION-NAME >str JSON:WRITE-STRING ;
+   1 OBSERVATION-NAME JSON:WRITE-STRING ;
 
 : ABSENT+ ( ^JSON:writer -- ^JSON:writer )
-   2 OBSERVATION-NAME >str JSON:WRITE-STRING ;
+   2 OBSERVATION-NAME JSON:WRITE-STRING ;
 
 public
 
@@ -833,7 +838,7 @@ public
 private
 
 : DIRECTORY-OPERATION+ ( ^JSON:writer n -- ^JSON:writer )
-   OPERATION-NAME >str JSON:WRITE-STRING ;
+   OPERATION-NAME JSON:WRITE-STRING ;
 
 : REPLACE-LOCAL+ ( remote DROPBOX:hash ^JSON:writer -- ^JSON:writer )
    {: s:remote e:DROPBOX:hash w :}
@@ -918,7 +923,7 @@ public
 private
 
 : UNIT-BLOCKAGE+ ( ^JSON:writer n -- ^JSON:writer )
-   BLOCKAGE-NAME >str JSON:WRITE-STRING ;
+   BLOCKAGE-NAME JSON:WRITE-STRING ;
 
 public
 
@@ -963,8 +968,8 @@ ARENA CURSORS JSON:cursor
    r READING-UNMAKE drop t u JSON:READ-INIT JSON:READ-NEXT ;
 
 \ The text of the object's member named by the second string.
-: MEMBER ( ^u8 n ^u8 n reading -- ^u8 n )
-   READING-UNMAKE drop JSON:READ-MEMBER$ ;
+: MEMBER ( ^u8 n str reading -- ^u8 n )
+   READING-UNMAKE drop {: c :} str> c JSON:READ-MEMBER$ ;
 
 \ A word ending -HERE decodes the value at the reader's token and leaves the
 \ reader on the value's last token, where READ-LISTED takes it back.
@@ -986,7 +991,7 @@ ARENA CURSORS JSON:cursor
 \ serde_json reads -0 as a float, which no integer field takes.
 : I64-HERE ( JSON:reader -- JSON:reader n )
    JSON:READ-TOKEN JSON:T-INT EXPECT
-   JSON:READ-SPAN$ s" -0" STR= if E-STORED throw then
+   JSON:READ-SPAN$ >str s" -0" STR= if E-STORED throw then
    JSON:READ-INT ;
 
 : READ-I64 ( ^u8 n reading -- n )
@@ -1002,16 +1007,16 @@ ARENA CURSORS JSON:cursor
    v ;
 
 \ The index whose name the current string or key decodes to, from i on.
-: INDEX ( JSON:reader [ n -- ^u8 n ] n -- JSON:reader n )
+: INDEX ( JSON:reader [ n -- str ] n -- JSON:reader n )
    {: names i:n :}
-   i names execute {: a:^ u:n :}
-   u 0= if E-STORED throw then
-   a u JSON:READ-STR-EQ? if i exit then
+   i names execute {: a :}
+   a STR:len 0= if E-STORED throw then
+   a JSON:READ-STR-EQ? if i exit then
    names i 1+ RECURSE ;
 
 \ An externally tagged enum's variant index and the text of its payload,
 \ empty for a variant written as its name alone.
-: TAGGED ( ^u8 n [ n -- ^u8 n ] reading -- n ^u8 n )
+: TAGGED ( ^u8 n [ n -- str ] reading -- n ^u8 n )
    {: t:^ u:n names r:reading :}
    t u r OPEN dup JSON:T-STR = if
       drop names 0 INDEX {: i:n :} JSON:READ-FINISH i t 0 exit
@@ -1031,10 +1036,10 @@ ARENA CURSORS JSON:cursor
 : READ-REV ( ^u8 n reading -- DROPBOX:rev )
    READ-STRING DROPBOX:>REV ;
 
-: HASH-AT ( ^u8 n ^u8 n reading -- DROPBOX:hash )
+: HASH-AT ( ^u8 n str reading -- DROPBOX:hash )
    {: r:reading :} r MEMBER r READ-HASH ;
 
-: REV-AT ( ^u8 n ^u8 n reading -- DROPBOX:rev )
+: REV-AT ( ^u8 n str reading -- DROPBOX:rev )
    {: r:reading :} r MEMBER r READ-REV ;
 
 : READ-LOCAL ( ^u8 n reading -- local )
@@ -1045,10 +1050,10 @@ ARENA CURSORS JSON:cursor
    t u s" content" r HASH-AT
    t u s" revision" r REV-AT MODEL-REMOTE:MAKE ;
 
-: LOCAL-AT ( ^u8 n ^u8 n reading -- local )
+: LOCAL-AT ( ^u8 n str reading -- local )
    {: r:reading :} r MEMBER r READ-LOCAL ;
 
-: REMOTE-AT ( ^u8 n ^u8 n reading -- remote )
+: REMOTE-AT ( ^u8 n str reading -- remote )
    {: r:reading :} r MEMBER r READ-REMOTE ;
 
 : READ-BASELINE ( ^u8 n reading -- baseline )
@@ -1130,16 +1135,16 @@ ARENA CURSORS JSON:cursor
 
 \ Each list ends in `*`, as serde skips unknown members, and requires every
 \ other name, so the cells never answer an earlier row's values.
-: FINGERPRINT-NAMES ( -- ^u8 n )
+: FINGERPRINT-NAMES ( -- str )
    s" inode size modified_seconds modified_nanoseconds changed_seconds changed_nanoseconds *" ;
 
-: VALUE-NAMES ( -- ^u8 n ) s" fingerprint content *" ;
+: VALUE-NAMES ( -- str ) s" fingerprint content *" ;
 
 \ The fingerprint is read while the hash value's list is open, so each list
 \ has its own seen buffer.
-FINGERPRINT-NAMES JSON:SEEN-BYTES constant FINGERPRINT-SEEN-BYTES
+FINGERPRINT-NAMES str> JSON:SEEN-BYTES constant FINGERPRINT-SEEN-BYTES
 FINGERPRINT-SEEN-BYTES TASK:+USERS FINGERPRINT-SEEN u8
-VALUE-NAMES JSON:SEEN-BYTES constant VALUE-SEEN-BYTES
+VALUE-NAMES str> JSON:SEEN-BYTES constant VALUE-SEEN-BYTES
 VALUE-SEEN-BYTES TASK:+USERS VALUE-SEEN u8
 
 6 TASK:+USERS FINGERPRINT-FIELDS n
@@ -1158,7 +1163,7 @@ VALUE-SEEN-BYTES TASK:+USERS VALUE-SEEN u8
 : FINGERPRINT-HERE ( JSON:reader -- JSON:reader fingerprint )
    JSON:READ-TOKEN JSON:T-OBJ EXPECT
    0 FINGERPRINT-SEEN FINGERPRINT-SEEN-BYTES CLEARED {: seen:^ :}
-   begin FINGERPRINT-NAMES seen JSON:READ-LISTED dup 0< 0= while
+   begin FINGERPRINT-NAMES str> seen JSON:READ-LISTED dup 0< 0= while
       {: i:n :} i SIGNED? if I64-HERE else U64-HERE then
       i FINGERPRINT-FIELDS !
    repeat drop
@@ -1173,7 +1178,7 @@ VALUE-SEEN-BYTES TASK:+USERS VALUE-SEEN u8
    {: t:^ u:n r:reading :}
    t u r OPEN JSON:T-OBJ EXPECT
    0 VALUE-SEEN VALUE-SEEN-BYTES CLEARED {: seen:^ :}
-   begin VALUE-NAMES seen JSON:READ-LISTED dup 0< 0= while
+   begin VALUE-NAMES str> seen JSON:READ-LISTED dup 0< 0= while
       0= if FINGERPRINT-HERE 0 VALUE-FINGERPRINT !
       else r STRING-HERE DROPBOX:>HASH 0 VALUE-CONTENT ! then
    repeat drop

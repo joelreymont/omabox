@@ -95,8 +95,8 @@ STRUCTURE commands OPAQUE DERIVE addr
 
 private
 
-: UNIT ( -- ^u8 n ) s" omabox.service" ;
-: SHELL ( -- ^u8 n ) s" /bin/sh" ;
+: UNIT ( -- str ) s" omabox.service" ;
+: SHELL ( -- str ) s" /bin/sh" ;
 
 ARENA COMMAND-SETS commands
 
@@ -108,45 +108,45 @@ PATH-CAP BUFFER: FOUND
 : LOG-OPEN ( -- ) LOG:ERROR s" service" LOG:LINE ;
 
 \ Ends the error's line and opens its help line with the text.
-: HELP ( ^u8 n -- )
-   {: h:^ hu:n :}
-   LOG:;LINE LOG-OPEN s" help: " LOG:TEXT+ h hu LOG:TEXT+ ;
+: HELP ( str -- )
+   {: h :}
+   LOG:;LINE LOG-OPEN s" help: " LOG:TEXT+ h LOG:TEXT+ ;
 
 : FAIL ( n -- ) LOG:;LINE throw ;
 
-: QUOTED+ ( ^u8 n -- )
-   {: a:^ u:n :}
-   s" `" LOG:TEXT+ a u LOG:TEXT+ s" `" LOG:TEXT+ ;
+: QUOTED+ ( str -- )
+   {: s :}
+   s" `" LOG:TEXT+ s LOG:TEXT+ s" `" LOG:TEXT+ ;
 
 : RETRY-HELP ( -- )
    s" Retry the command; inspect the user session if it happens" HELP
    s"  repeatedly." LOG:TEXT+ ;
 
-: START-FAILED ( ^u8 n -- )
+: START-FAILED ( str -- )
    LOG-OPEN s" could not run " LOG:TEXT+ QUOTED+
    s" Ensure systemd user services and the system journal are" HELP
    s"  available, then retry." LOG:TEXT+
    E-START-COMMAND FAIL ;
 
-: WAIT-FAILED ( ^u8 n -- )
+: WAIT-FAILED ( str -- )
    LOG-OPEN QUOTED+
    s"  was started but could not be waited for" LOG:TEXT+
    RETRY-HELP E-WAIT-COMMAND FAIL ;
 
-: TERMINATED ( ^u8 n -- )
+: TERMINATED ( str -- )
    LOG-OPEN QUOTED+
    s"  was terminated before it reported a result" LOG:TEXT+
    RETRY-HELP E-TERMINATED FAIL ;
 
 \ Rust prints the status as Option's Debug form.
-: UNSUCCESSFUL ( n ^u8 n -- )
-   {: code:n name:^ nu:n :}
-   LOG-OPEN name nu QUOTED+ s"  failed with status Some(" LOG:TEXT+
+: UNSUCCESSFUL ( n str -- )
+   {: code:n name :}
+   LOG-OPEN name QUOTED+ s"  failed with status Some(" LOG:TEXT+
    code LOG:INT+ s" )" LOG:TEXT+
    s" Review the command output and `omabox logs`, then retry." HELP
    E-UNSUCCESSFUL FAIL ;
 
-: UNKNOWN-STATE ( ^u8 n -- )
+: UNKNOWN-STATE ( str -- )
    LOG-OPEN s" systemd reported the unknown service state " LOG:TEXT+
    QUOTED+
    s" Update Omabox, or report this state if Omabox is current." HELP
@@ -156,12 +156,12 @@ PATH-CAP BUFFER: FOUND
 \ ---- a launch
 
 : PROGRAM-REQUEST ( str -- PROCESS:request )
-   str> >LEN FOUND RESOLVE-EXECUTABLE LEN>N {: u:n :}
-   FOUND u PROCESS:NEW ;
+   FOUND RESOLVE-EXECUTABLE {: u:n :}
+   FOUND u >str PROCESS:NEW ;
 
 : SCRIPT-REQUEST ( str -- PROCESS:request )
    {: s :}
-   SHELL PROCESS:NEW s str> PROCESS:ARG ;
+   SHELL PROCESS:NEW s PROCESS:ARG ;
 
 public
 
@@ -180,9 +180,9 @@ private
 
 : KEEP ( str ^ARENA:arena -- str )
    {: s ar :}
-   s str> {: a:^ u:n :}
+   s STR:len {: u:n :}
    ar u ARENA:ALLOC {: d:^ du:n :}
-   a d u BYTE-COPY
+   s STR:data d u BYTE-COPY
    d du >str ;
 
 : LAUNCHING ( launch launch ^ARENA:arena -- ^commands )
@@ -200,8 +200,8 @@ public
 \ The installed systemctl and journalctl, Rust's default.
 : COMMANDS ( ^ARENA:arena -- ^commands )
    {: ar :}
-   s" systemctl" >str SERVICE-LAUNCH:PROGRAM
-   s" journalctl" >str SERVICE-LAUNCH:PROGRAM
+   s" systemctl" SERVICE-LAUNCH:PROGRAM
+   s" journalctl" SERVICE-LAUNCH:PROGRAM
    ar LAUNCHING ;
 
 \ Scripts at the paths in place of systemctl and journalctl, which keeps
@@ -262,31 +262,31 @@ ARENA CHILDREN child
 
 \ Rust's run. A failure before the child runs logs E-START-COMMAND for
 \ name, one after it E-WAIT-COMMAND.
-: RAN ( launch [ PROCESS:request -- PROCESS:request ] wiring ^u8 n ^ARENA:arena -- ^child )
-   {: l args w name:^ nu:n ar :}
+: RAN ( launch [ PROCESS:request -- PROCESS:request ] wiring str ^ARENA:arena -- ^child )
+   {: l args w name ar :}
    ar CHILDREN-NEW {: k :}
    [: l args w ar k ENDED ;] catch {: code:n :}
    code 0<> if
       code E-PROC-OUTPUT = code E-PROC-WAIT = or
       code E-PROC-STDOUT-CAPACITY = or code E-PROC-STDERR-CAPACITY = or
-      if name nu WAIT-FAILED else name nu START-FAILED then
+      if name WAIT-FAILED else name START-FAILED then
    then
    k ;
 
 : STATUS@ ( ^child -- PROCESS:status ) CHILD-STATUS @ ;
 
-: EXITED ( n ^u8 n -- )
-   {: code:n name:^ nu:n :}
+: EXITED ( n str -- )
+   {: code:n name :}
    code 0= if exit then
-   code name nu UNSUCCESSFUL ;
+   code name UNSUCCESSFUL ;
 
 \ Rust's status_result: an exit of 0 passes, any other is Unsuccessful,
 \ a signal Terminated.
-: SUCCEEDED ( ^child ^u8 n -- )
-   {: k name:^ nu:n :}
+: SUCCEEDED ( ^child str -- )
+   {: k name :}
    k STATUS@ MATCH PROCESS:status
-      exited OF name nu EXITED ENDOF
-      signaled OF drop name nu TERMINATED ENDOF
+      exited OF name EXITED ENDOF
+      signaled OF drop name TERMINATED ENDOF
    ;MATCH ;
 
 \ An exit with a status other than 0.
@@ -303,9 +303,9 @@ ARENA CHILDREN child
    ;MATCH ;
 
 \ systemctl's own arguments: --user, then the verb.
-: VERB ( PROCESS:request ^u8 n -- PROCESS:request )
-   {: v:^ vu:n :}
-   s" --user" PROCESS:ARG v vu PROCESS:ARG ;
+: VERB ( PROCESS:request str -- PROCESS:request )
+   {: v :}
+   s" --user" PROCESS:ARG v PROCESS:ARG ;
 
 : UNIT+ ( PROCESS:request -- PROCESS:request ) UNIT PROCESS:ARG ;
 
@@ -314,7 +314,7 @@ ARENA CHILDREN child
 
 \ The scalar at the cursor and the cursor after it; a byte no scalar
 \ holds answers -1.
-: SCALAR ( ^u8 n n -- n n )
+: SCALAR ( str n -- n n )
    UTF8:NEXT MATCH UTF8:scalar-step
       scalar OF ENDOF
       raw-byte OF nip -1 swap ENDOF
@@ -326,37 +326,38 @@ ARENA CHILDREN child
 
 \ Rust's trim of the lossy text: White_Space scalars off both ends; a byte
 \ no scalar holds is U+FFFD there, so it stays.
-: TRIMMED ( ^u8 n -- ^u8 n )
-   {: a:^ u:n :}
+: TRIMMED ( str -- str )
+   {: s :}
+   s STR:len {: u:n :}
    u 0 0 begin dup u < while
       {: from:n to:n at:n :}
-      a u at SCALAR {: cp:n next:n :}
+      s at SCALAR {: cp:n next:n :}
       cp BLANK? if from to next
       else from at min next next then
    repeat drop
    {: from:n to:n :}
-   a from +  to from - 0 max ;
+   s STR:data from +  to from - 0 max >str ;
 
-: ACTIVE-STATE ( ^u8 n -- option<unit-state> )
-   {: a:^ u:n :}
-   a u s" active" STR= a u s" reloading" STR= or
-   a u s" refreshing" STR= or
+: ACTIVE-STATE ( str -- option<unit-state> )
+   {: a :}
+   a s" active" STR= a s" reloading" STR= or
+   a s" refreshing" STR= or
    if construct unit-state running OPTION:SOME exit then
-   a u s" activating" STR=
+   a s" activating" STR=
    if construct unit-state starting OPTION:SOME exit then
-   a u s" failed" STR=
+   a s" failed" STR=
    if construct unit-state failed OPTION:SOME exit then
-   a u s" deactivating" STR=
+   a s" deactivating" STR=
    if construct unit-state stopping OPTION:SOME exit then
-   a u s" inactive" STR= a u s" maintenance" STR= or
+   a s" inactive" STR= a s" maintenance" STR= or
    if construct unit-state stopped OPTION:SOME exit then
    OPTION:NONE ;
 
-: STATE-OF ( ^u8 n ^ARENA:arena -- unit-state )
-   {: a:^ u:n ar :}
-   a u ACTIVE-STATE MATCH option
+: STATE-OF ( str ^ARENA:arena -- unit-state )
+   {: a ar :}
+   a ACTIVE-STATE MATCH option
       some OF ENDOF
-      none OF a u >str ar UTF8-LOSSY:REPAIR str> UNKNOWN-STATE ENDOF
+      none OF a ar UTF8-LOSSY:REPAIR UNKNOWN-STATE ENDOF
    ;MATCH ;
 
 : STATE-IN ( ^commands ^ARENA:arena -- unit-state )
@@ -366,7 +367,7 @@ ARENA CHILDREN child
       s" --value" PROCESS:ARG UNIT+ ;]
    construct wiring output s" systemctl show" ar RAN {: k :}
    k s" systemctl show" SUCCEEDED
-   k CHILD-OUT @ str> TRIMMED ar STATE-OF ;
+   k CHILD-OUT @ TRIMMED ar STATE-OF ;
 
 \ list-units lists only loaded units and loads none, unlike show.
 : LISTED-NONE ( ^commands ^ARENA:arena ^child -- )
@@ -384,21 +385,21 @@ ARENA CHILDREN child
    [: c ar k LISTED-NONE ;] catch {: code:n :}
    code 0<> if false exit then
    k PASSED? 0= if false exit then
-   k CHILD-OUT @ str> TRIMMED nip 0= ;
+   k CHILD-OUT @ TRIMMED STR:len 0= ;
 
 : UNLOADED? ( ^commands -- bool ) [: UNLOADED-IN ;] ARENA:WITH ;
 
 \ Rust's settle. An unloaded unit refuses stop and reset-failed; that
 \ refusal passes, checked after it as the unit can unload between calls.
-: SETTLE-IN ( ^commands [ PROCESS:request -- PROCESS:request ] ^u8 n ^ARENA:arena -- )
-   {: c args name:^ nu:n ar :}
-   c SYSTEMCTL@ args construct wiring errors name nu ar RAN {: k :}
+: SETTLE-IN ( ^commands [ PROCESS:request -- PROCESS:request ] str ^ARENA:arena -- )
+   {: c args name ar :}
+   c SYSTEMCTL@ args construct wiring errors name ar RAN {: k :}
    k REFUSED? if c UNLOADED? if exit then then
    FD:STDERR [: FD:STDERR k CHILD-OUT @ FD:TRY-WRITE-FULL drop ;]
    FD:WITH-NOSIGPIPE
-   k name nu SUCCEEDED ;
+   k name SUCCEEDED ;
 
-: SETTLE ( ^commands [ PROCESS:request -- PROCESS:request ] ^u8 n -- )
+: SETTLE ( ^commands [ PROCESS:request -- PROCESS:request ] str -- )
    [: SETTLE-IN ;] ARENA:WITH ;
 
 : SETTLE-STOP ( ^commands -- )
@@ -417,7 +418,7 @@ ENUM action DERIVE eq start stop restart enable disable status ;ENUM
 
 private
 
-: ACTION$ ( action -- ^u8 n )
+: ACTION$ ( action -- str )
    MATCH action
       start OF s" start" ENDOF
       stop OF s" stop" ENDOF

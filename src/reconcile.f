@@ -46,12 +46,12 @@ private
 
 \ ---- failures ------------------------------------------------------
 
-: INVALID ( MODEL:path ^u8 n -- )
-   {: path detail:^ du:n :}
+: INVALID ( MODEL:path str -- )
+   {: path detail:str :}
    LOG:ERROR s" reconcile" LOG:LINE
    s" reconciliation found invalid journal state for `" LOG:TEXT+
-   path MODEL:PATH>STR str> LOG:TEXT+ s" `: " LOG:TEXT+
-   detail du LOG:TEXT+ LOG:;LINE
+   path MODEL:PATH>STR LOG:TEXT+ s" `: " LOG:TEXT+
+   detail LOG:TEXT+ LOG:;LINE
    E-INVALID-STATE throw ;
 
 
@@ -59,6 +59,11 @@ private
 
 $2F constant SEPARATOR
 $2E constant PERIOD
+
+\ The bytes of p from from up to to.
+: PART ( str n n -- str )
+   {: p:str from:n to:n :}
+   p str> drop from + to from - >str ;
 
 : PENDING? ( JOURNAL:record-status -- bool )
    MATCH JOURNAL:record-status
@@ -121,8 +126,8 @@ STRUCTURE path-decision
    ;MATCH ;
 
 \ A path's leading root or ".", which Path::iter yields first.
-: LEAD ( ^u8 n -- n )
-   {: p:^ u:n :}
+: LEAD ( str -- n )
+   str> {: p:^ u:n :}
    u 0= if 0 exit then
    p c@ SEPARATOR = if 1 exit then
    p c@ PERIOD <> if 0 exit then
@@ -131,36 +136,39 @@ STRUCTURE path-decision
    0 ;
 
 \ A name Path::iter yields: neither empty nor ".".
-: NAME? ( ^u8 n -- bool )
-   {: p:^ u:n :}
+: NAME? ( str -- bool )
+   str> {: p:^ u:n :}
    u 1 = if p c@ PERIOD <> exit then
    u 0 > ;
 
 \ Runs q on the name from at, when NAME? accepts it; the index after
 \ it, or -1 past the last.
-: NEXT-NAME ( n ^u8 n n [ n ^u8 n -- n ] -- n n )
-   {: acc:n p:^ u:n at:n q :}
-   p u SEPARATOR at SPLIT-NEXT 0= if 2drop drop acc -1 exit then
-   {: s:^ su:n next:n :}
-   s su NAME? if acc s su q execute next exit then
+: NEXT-NAME ( n str n [ n str -- n ] -- n n )
+   {: acc:n p:str at:n q :}
+   p SEPARATOR at SPLIT-NEXT 0= if 2drop acc -1 exit then
+   {: s:str next:n :}
+   s NAME? if acc s q execute next exit then
    acc next ;
 
 \ Runs q on each of Path::iter's components of the bytes, a slice of
 \ them, threading n.
-: EACH-COMPONENT ( n ^u8 n [ n ^u8 n -- n ] -- n )
-   {: p:^ u:n q :}
-   p u LEAD {: lead:n :}
-   lead 0 > if p lead q execute then
-   lead begin p u rot q NEXT-NAME dup 0< until drop ;
+: EACH-COMPONENT ( n str [ n str -- n ] -- n )
+   {: p:str q :}
+   p LEAD {: lead:n :}
+   lead 0 > if p 0 lead PART q execute then
+   lead begin p swap q NEXT-NAME dup 0< until drop ;
 
 : COMPONENTS ( str ^ARENA:arena -- ^VEC:vector<str> )
    {: s:str ar :}
    ar ARENA:ALLOCATOR 0 [type] str VEC:NEW {: v :}
-   0 s str> [: >str v VEC:PUSH ! ;] EACH-COMPONENT drop
+   0 s [: v VEC:PUSH ! ;] EACH-COMPONENT drop
    v ;
 
+\ One more component.
+: COMPONENT+ ( n str -- n ) drop 1+ ;
+
 : PATH-DEPTH ( MODEL:path -- n )
-   0 swap MODEL:PATH>STR str> [: 2drop 1+ ;] EACH-COMPONENT ;
+   0 swap MODEL:PATH>STR [: COMPONENT+ ;] EACH-COMPONENT ;
 
 \ Rust's Ordering of two cells: -1, 0 or 1.
 : CMP ( n n -- n )
@@ -204,7 +212,7 @@ STRUCTURE pending-plan
 : PENDING-KEY ( pending-plan -- MODEL:key )
    PENDING-PLAN-UNMAKE {: k p :} k ;
 
-: KEY-BYTES ( MODEL:key -- ^u8 n ) MODEL:KEY>STR str> ;
+: KEY-BYTES ( MODEL:key -- str ) MODEL:KEY>STR ;
 
 \ The indices 0 to n-1 in the order less gives.
 : ORDER ( n [ n n -- bool ] ^ARENA:arena -- ^VEC:vector<n> )
@@ -249,8 +257,8 @@ STRUCTURE pending-plan
    {: v :}
    true v VEC:COUNT 0 ?do v i VEC:AT @ UNSUPPORTED? and loop ;
 
-: SPELLING ( MODEL:local-record -- ^u8 n )
-   RECORD-PATH MODEL:PATH>STR str> ;
+: SPELLING ( MODEL:local-record -- str )
+   RECORD-PATH MODEL:PATH>STR ;
 
 \ Logs Rust's LocalCaseCollision text for the two spellings, then
 \ throws E-CASE-COLLISION.
@@ -299,8 +307,8 @@ STRUCTURE pending-plan
    ;MATCH ;
 
 \ The index of the last separator in the bytes.
-: LAST-SEPARATOR ( ^u8 n -- option<n> )
-   {: p:^ u:n :}
+: LAST-SEPARATOR ( str -- option<n> )
+   str> {: p:^ u:n :}
    u begin dup 0 > while
       1- dup p + c@ SEPARATOR = if OPTION:SOME exit then
    repeat
@@ -308,31 +316,31 @@ STRUCTURE pending-plan
 
 \ Rust's parent_bytes: the bytes before the last separator.
 : PARENT-BYTES ( str -- option<str> )
-   str> {: p:^ u:n :}
-   p u LAST-SEPARATOR MATCH option
+   {: p:str :}
+   p LAST-SEPARATOR MATCH option
       none OF OPTION:NONE ENDOF
-      some OF p swap >str OPTION:SOME ENDOF
+      some OF {: k:n :} p 0 k PART OPTION:SOME ENDOF
    ;MATCH ;
 
 \ The index of the record of n, sorted by key, that key reads as
 \ these bytes, or n when none does.
-: FIND-BYTES ( ^u8 n n [ n -- MODEL:key ] -- n )
-   {: p:^ u:n count:n key :}
-   0 count [: key execute KEY-BYTES >str p u >str STR< ;]
+: FIND-BYTES ( str n [ n -- MODEL:key ] -- n )
+   {: p:str count:n key :}
+   0 count [: key execute KEY-BYTES p STR< ;]
    SORT:PARTITION-POINT {: at:n :}
    at count >= if count exit then
-   at key execute KEY-BYTES p u STR= if at exit then
+   at key execute KEY-BYTES p STR= if at exit then
    count ;
 
 \ For ANCESTOR-UNKNOWN: the reason at the ancestor or the next one up.
 : CLIMB
-   ( option<str> [ ^u8 n -- option<MODEL:unknown-reason> ]
+   ( option<str> [ str -- option<MODEL:unknown-reason> ]
      -- option<MODEL:unknown-reason> )
    {: ancestor reason :}
    ancestor MATCH option
       none OF OPTION:NONE ENDOF
       some OF {: s:str :}
-         s str> reason execute
+         s reason execute
          MATCH option
             none OF s PARENT-BYTES reason RECURSE ENDOF
             some OF OPTION:SOME ENDOF
@@ -343,7 +351,7 @@ STRUCTURE pending-plan
 \ The reason of the nearest ancestor recorded unknown. The climb goes to
 \ the root: a record below an unknown directory confirms no absence.
 : ANCESTOR-UNKNOWN
-   ( MODEL:key [ ^u8 n -- option<MODEL:unknown-reason> ]
+   ( MODEL:key [ str -- option<MODEL:unknown-reason> ]
      -- option<MODEL:unknown-reason> )
    {: k reason :}
    k MODEL:KEY>STR PARENT-BYTES reason CLIMB ;
@@ -356,9 +364,9 @@ STRUCTURE pending-plan
 \ The local record at these key bytes; one at an excluded path, outside
 \ synchronization, counts as none.
 : LOCAL-BYTES-AT
-   ( JOURNAL:journal ^u8 n ^ARENA:arena -- option<MODEL:local-record> )
-   {: j p:^ u:n ar :}
-   j p u >str MODEL:>KEY ar JOURNAL:LOCAL-AT MATCH option
+   ( JOURNAL:journal str ^ARENA:arena -- option<MODEL:local-record> )
+   {: j p:str ar :}
+   j p MODEL:>KEY ar JOURNAL:LOCAL-AT MATCH option
       none OF OPTION:NONE ENDOF
       some OF UNEXCLUDED ENDOF
    ;MATCH ;
@@ -380,16 +388,16 @@ STRUCTURE pending-plan
    ;MATCH ;
 
 : LOCAL-REASON-AT
-   ( ^u8 n JOURNAL:journal ^ARENA:arena
+   ( str JOURNAL:journal ^ARENA:arena
      -- option<MODEL:unknown-reason> )
-   {: p:^ u:n j ar :}
-   j p u ar LOCAL-BYTES-AT LOCAL-REASON ;
+   {: p:str j ar :}
+   j p ar LOCAL-BYTES-AT LOCAL-REASON ;
 
 : REMOTE-REASON-AT
-   ( ^u8 n JOURNAL:journal ^ARENA:arena
+   ( str JOURNAL:journal ^ARENA:arena
      -- option<MODEL:unknown-reason> )
-   {: p:^ u:n j ar :}
-   j p u >str MODEL:>KEY ar JOURNAL:REMOTE-AT REMOTE-REASON ;
+   {: p:str j ar :}
+   j p MODEL:>KEY ar JOURNAL:REMOTE-AT REMOTE-REASON ;
 
 : LOCAL-UNOBSERVED
    ( JOURNAL:journal MODEL:key ^ARENA:arena
@@ -410,8 +418,7 @@ STRUCTURE pending-plan
    path MODEL:PATH>STR ar COMPONENTS {: parts :}
    parts VEC:COUNT 0= if OPTION:NONE exit then
    parts parts VEC:COUNT 1- VEC:AT @ {: last:str :}
-   last str> {: p:^ u:n :}
-   p u s" /" STR= p u s" ." STR= or p u s" .." STR= or
+   last s" /" STR= last s" ." STR= or last s" .." STR= or
    if OPTION:NONE exit then
    last OPTION:SOME ;
 
@@ -423,9 +430,10 @@ STRUCTURE pending-plan
    {: j k canon shown at:n ar :}
    shown at VEC:AT @ {: own:str :}
    at 1+ canon VEC:COUNT = if own exit then
-   k KEY-BYTES drop {: base:^ :}
+   k KEY-BYTES {: ks:str :}
+   ks str> drop {: base:^ :}
    canon at VEC:AT @ str> + base - {: end:n :}
-   j base end ar LOCAL-BYTES-AT MATCH option
+   j ks 0 end PART ar LOCAL-BYTES-AT MATCH option
       none OF own ENDOF
       some OF
          RECORD-PATH ar FILE-NAME MATCH option
@@ -436,7 +444,7 @@ STRUCTURE pending-plan
    ;MATCH ;
 
 \ PathBuf::push puts a separator after a part but a root.
-: SEPARATED? ( str -- bool ) str> s" /" STR= 0= ;
+: SEPARATED? ( str -- bool ) s" /" STR= 0= ;
 
 : JOINED-SIZE ( ^VEC:vector<str> -- n )
    {: parts :}
@@ -461,7 +469,7 @@ STRUCTURE pending-plan
 : JOINED ( ^VEC:vector<str> ^ARENA:arena -- str )
    {: parts ar :}
    parts JOINED-SIZE {: size:n :}
-   size 0= if s" " >str exit then
+   size 0= if s" " exit then
    ar size ARENA:ALLOC drop {: dst:^ :}
    0 parts VEC:COUNT 0 ?do parts i dst APPEND-PART loop drop
    dst size >str ;
@@ -510,7 +518,7 @@ STRUCTURE case-variant-move
 : NO-PATH ( -- option<MODEL:path> ) OPTION:NONE ;
 : NO-NAME ( -- option<str> ) OPTION:NONE ;
 
-: PATH$ ( MODEL:path -- ^u8 n ) MODEL:PATH>STR str> ;
+: PATH$ ( MODEL:path -- str ) MODEL:PATH>STR ;
 
 : PATH= ( MODEL:path MODEL:path -- bool )
    {: a:MODEL:path b:MODEL:path :}
@@ -561,7 +569,7 @@ STRUCTURE case-variant-move
    x SPELLING-KEY y SPELLING-KEY MODEL:KEY-CMP {: c :}
    c 0<> if c exit then
    x SPELLING-PATH y SPELLING-PATH PATH= if 0 exit then
-   x SPELLING-PATH PATH$ >str y SPELLING-PATH PATH$ >str STR<
+   x SPELLING-PATH PATH$ y SPELLING-PATH PATH$ STR<
    if -1 else 1 then ;
 
 : SAME-AS-LAST? ( ^VEC:vector<spelling> spelling -- bool )
@@ -683,55 +691,58 @@ STRUCTURE case-variant-move
 
 \ Rust's truncate_component: the name cut to limit bytes, at a character
 \ boundary when the name is UTF-8.
-: TRUNCATE-COMPONENT ( ^u8 n n -- ^u8 n )
-   {: p:^ u:n limit:n :}
-   u limit <= if p u exit then
-   p u UTF8:VALID? if p p u limit UTF8:FIT exit then
-   p limit ;
+: TRUNCATE-COMPONENT ( str n -- str )
+   {: p:str limit:n :}
+   p str> nip limit <= if p exit then
+   p UTF8:VALID? if p 0 p limit UTF8:FIT PART exit then
+   p 0 limit PART ;
 
-: JOIN-BYTES ( ^u8 n ^u8 n ^ARENA:arena -- ^u8 n )
-   {: a:^ au:n b:^ bu:n ar :}
+: JOIN-BYTES ( str str ^ARENA:arena -- str )
+   {: as:str bs:str ar :}
+   as str> {: a:^ au:n :}
+   bs str> {: b:^ bu:n :}
    ar au bu + ARENA:ALLOC drop {: dst:^ :}
    a dst au BYTE-COPY
    b dst au + bu BYTE-COPY
-   dst au bu + ;
+   dst au bu + >str ;
 
-: SUFFIX ( n ^ARENA:arena -- ^u8 n )
+: SUFFIX ( n ^ARENA:arena -- str )
    {: attempt:n ar :}
    attempt 0= if s"  (case variant)" exit then
    s"  (case variant " attempt 1+ FMT:INT$ ar JOIN-BYTES
    s" )" ar JOIN-BYTES ;
 
 \ Rust's case_variant_name; none when the suffix alone passes name-max.
-: CASE-VARIANT-NAME ( ^u8 n n n ^ARENA:arena -- option<str> )
-   {: name:^ nu:n attempt:n max:n ar :}
-   attempt ar SUFFIX {: s:^ su:n :}
+: CASE-VARIANT-NAME ( str n n ^ARENA:arena -- option<str> )
+   {: name:str attempt:n max:n ar :}
+   attempt ar SUFFIX {: s:str :}
+   s str> nip {: su:n :}
    max su < if NO-NAME exit then
-   name nu max su - TRUNCATE-COMPONENT s su ar JOIN-BYTES >str OPTION:SOME ;
+   name max su - TRUNCATE-COMPONENT s ar JOIN-BYTES OPTION:SOME ;
 
 \ The bytes before and after the "/" at k.
-: SPLIT-AT ( ^u8 n n -- ^u8 n ^u8 n )
-   {: p:^ u:n k:n :}
-   p k p k + 1+ u k - 1- ;
+: SPLIT-AT ( str n -- str str )
+   {: p:str k:n :}
+   p 0 k PART p k 1+ p str> nip PART ;
 
 \ The path's parent, empty at the top, and its last name.
-: SPLIT-NAME ( ^u8 n -- ^u8 n ^u8 n )
-   {: p:^ u:n :}
-   p u LAST-SEPARATOR MATCH option
-      none OF p 0 p u ENDOF
-      some OF p u rot SPLIT-AT ENDOF
+: SPLIT-NAME ( str -- str str )
+   {: p:str :}
+   p LAST-SEPARATOR MATCH option
+      none OF p 0 0 PART p ENDOF
+      some OF p swap SPLIT-AT ENDOF
    ;MATCH ;
 
-: FINAL? ( ^u8 n -- bool )
-   {: p:^ u:n :}
-   u 0= if false exit then
-   p u s" ." STR= if false exit then
-   p u s" .." STR= 0= ;
+: FINAL? ( str -- bool )
+   {: p:str :}
+   p str> nip 0= if false exit then
+   p s" ." STR= if false exit then
+   p s" .." STR= 0= ;
 
-: UNDER ( ^u8 n str ^ARENA:arena -- MODEL:path )
-   {: dir:^ du:n name:str ar :}
-   du 0= if name MODEL:>PATH exit then
-   dir du s" /" ar JOIN-BYTES name str> ar JOIN-BYTES >str MODEL:>PATH ;
+: UNDER ( str str ^ARENA:arena -- MODEL:path )
+   {: dir:str name:str ar :}
+   dir str> nip 0= if name MODEL:>PATH exit then
+   dir s" /" ar JOIN-BYTES name ar JOIN-BYTES MODEL:>PATH ;
 
 : HELD? ( option<MODEL:local-record> -- bool )
    MATCH option
@@ -742,12 +753,12 @@ STRUCTURE case-variant-move
 \ The attempt's destination, unless no name fits or a local row holds
 \ its identity.
 : DESTINATION
-   ( JOURNAL:journal ^u8 n ^u8 n n n ^ARENA:arena
+   ( JOURNAL:journal str str n n ^ARENA:arena
      -- option<MODEL:path> bool )
-   {: j dir:^ du:n name:^ nu:n attempt:n max:n ar :}
-   name nu attempt max ar CASE-VARIANT-NAME MATCH option
+   {: j dir:str name:str attempt:n max:n ar :}
+   name attempt max ar CASE-VARIANT-NAME MATCH option
       none OF NO-PATH true ENDOF
-      some OF dir du rot ar UNDER {: d :}
+      some OF dir swap ar UNDER {: d :}
          j d ar MODEL:FOLD ar JOURNAL:LOCAL-AT HELD? if
             NO-PATH false exit
          then
@@ -763,13 +774,13 @@ STRUCTURE case-variant-move
 : CASE-VARIANT-MOVE
    ( JOURNAL:journal MODEL:path n ^ARENA:arena -- case-variant-move )
    {: j source max:n ar :}
-   source PATH$ SPLIT-NAME {: dir:^ du:n name:^ nu:n :}
-   name nu FINAL? 0= if
+   source PATH$ SPLIT-NAME {: dir:str name:str :}
+   name FINAL? 0= if
       source s" local case collision has no final path component"
       INVALID
    then
    j JOURNAL:LOCAL-COUNT 1+ 0 ?do
-      j dir du name nu i max ar DESTINATION if
+      j dir name i max ar DESTINATION if
          MATCH option
             none OF source NO-UNIQUE ENDOF
             some OF source swap CASE-VARIANT-MOVE-MAKE unloop exit ENDOF
@@ -821,13 +832,19 @@ STRUCTURE case-variant-move
 : CHANGED ( MODEL:path -- case-collision-resolution )
    construct case-collision-resolution changed ;
 
+\ Whether an entry is at the path below root.
+: ENTRY-AT? ( MODEL:path fd -- bool )
+   {: p:MODEL:path root:fd :}
+   root p PATH$ LOCAL:ENTRY-EXISTS-AT ;
+
 : MOVE-VARIANT
    ( fd JOURNAL:journal case-variant-move ^ARENA:arena
      -- case-collision-resolution )
    {: root:fd j mv ar :}
    mv CASE-VARIANT-MOVE-UNMAKE {: src dst :}
    j src ar SUPERSEDE-BENEATH
-   j src [: PATH$ root -rot LOCAL:ENTRY-EXISTS-AT ;] ar
+   j src [: root ENTRY-AT? ;] ar
+
    JOURNAL:INVALIDATE-CASE-COLLISION-BASELINES
    root src PATH$ dst PATH$ LOCAL:RENAME-CASE-VARIANT
    MATCH LOCAL:rename-outcome
@@ -847,10 +864,10 @@ STRUCTURE case-variant-move
    ;MATCH ;
 
 : RESOLVE-AT
-   ( MODEL:path JOURNAL:journal ^u8 n ^ARENA:arena
+   ( MODEL:path JOURNAL:journal str ^ARENA:arena
      -- case-collision-resolution )
-   {: source j p:^ u:n ar :}
-   j p u LOCAL:OPEN-ACTIVE-ROOT MATCH option
+   {: source j p:str ar :}
+   j p LOCAL:OPEN-ACTIVE-ROOT MATCH option
       none OF construct case-collision-resolution root-changed ENDOF
       some OF {: root:fd :}
          [: root source j ar RESOLVE-BELOW ;]
@@ -866,12 +883,12 @@ STRUCTURE case-variant-move
 \ Rust's resolve_case_collision: renames a spelling of the journal's first
 \ local collision under p apart, retiring its plans and stale baselines.
 : RESOLVE-CASE-COLLISION
-   ( JOURNAL:journal ^u8 n ^ARENA:arena -- case-collision-resolution )
-   {: j p:^ u:n ar :}
+   ( JOURNAL:journal str ^ARENA:arena -- case-collision-resolution )
+   {: j p:str ar :}
    j ar COLLIDING [: j ar RECORDED-SPELLING ;] ar
    CASE-VARIANT-SOURCE MATCH option
       none OF construct case-collision-resolution none ENDOF
-      some OF j p u ar RESOLVE-AT ENDOF
+      some OF j p ar RESOLVE-AT ENDOF
    ;MATCH ;
 
 \ ---- file-copy names ----------------------------------------------
@@ -891,22 +908,22 @@ ENUM file-copy-origin
    k 1+ ;
 
 \ The hash's first 12 ASCII letters and digits, else "content".
-: COPY-IDENTITY ( DROPBOX:hash ^ARENA:arena -- ^u8 n )
+: COPY-IDENTITY ( DROPBOX:hash ^ARENA:arena -- str )
    {: h ar :}
    h DROPBOX:HASH>STR str> {: p:^ u:n :}
    ar 12 ARENA:ALLOC drop {: dst:^ :}
    0 u 0 ?do dst p i + c@ KEEP-ALNUM loop {: k:n :}
    k 0= if s" content" exit then
-   dst k ;
+   dst k >str ;
 
-: ORIGIN$ ( file-copy-origin -- ^u8 n )
+: ORIGIN$ ( file-copy-origin -- str )
    MATCH file-copy-origin
       local OF s" local file" ENDOF
       dropbox OF drop s" Dropbox file" ENDOF
    ;MATCH ;
 
 : COPY-SUFFIX
-   ( file-copy-origin DROPBOX:hash n ^ARENA:arena -- ^u8 n )
+   ( file-copy-origin DROPBOX:hash n ^ARENA:arena -- str )
    {: o h attempt:n ar :}
    s"  (" o ORIGIN$ ar JOIN-BYTES s"  " ar JOIN-BYTES
    h ar COPY-IDENTITY ar JOIN-BYTES
@@ -919,10 +936,10 @@ ENUM file-copy-origin
 : FILE-COPY-NAME
    ( str DROPBOX:hash file-copy-origin n n ^ARENA:arena -- option<str> )
    {: name:str h o attempt:n max:n ar :}
-   o h attempt ar COPY-SUFFIX {: s:^ su:n :}
+   o h attempt ar COPY-SUFFIX {: s:str :}
+   s str> nip {: su:n :}
    max su < if NO-NAME exit then
-   name str> max su - TRUNCATE-COMPONENT s su ar JOIN-BYTES >str
-   OPTION:SOME ;
+   name max su - TRUNCATE-COMPONENT s ar JOIN-BYTES OPTION:SOME ;
 
 : LISTED? ( ^VEC:vector<MODEL:path> MODEL:path -- bool )
    {: v p :}
@@ -1022,7 +1039,7 @@ ENUM file-copy-origin
      ^ARENA:arena -- MODEL:path )
    {: j source h o max:n ar :}
    source ar COPY-NAME {: name:str :}
-   source PATH$ SPLIT-NAME {: dir:^ du:n x:^ xu:n :}
+   source PATH$ SPLIT-NAME {: dir:str x:str :}
    0 begin
       dup >r name h o r> max ar FILE-COPY-NAME MATCH option
          none OF
@@ -1031,7 +1048,7 @@ ENUM file-copy-origin
             INVALID
          ENDOF
          some OF
-            dir du rot ar UNDER
+            dir swap ar UNDER
             j over h o ar USABLE? if nip exit then drop
          ENDOF
       ;MATCH
@@ -1054,43 +1071,44 @@ STRUCTURE casing
    FIELD name str
 ;STRUCTURE
 
-: LISTING-FAILED ( ^u8 n -- )
-   {: t:^ tu:n :}
-   LOG:ERROR s" reconcile" LOG:LINE t tu LOG:TEXT+ LOG:;LINE
+: LISTING-FAILED ( str -- )
+   {: t:str :}
+   LOG:ERROR s" reconcile" LOG:LINE t LOG:TEXT+ LOG:;LINE
    E-LISTING throw ;
 
 \ Rust's InvalidEntryPath, naming the display path when there is one.
-: BAD-PATH ( ^u8 n -- )
-   {: d:^ du:n :}
+: BAD-PATH ( str -- )
+   {: d:str :}
    LOG:ERROR s" reconcile" LOG:LINE
    s" Dropbox listing contained an invalid or out-of-root path"
    LOG:TEXT+
-   du 0<> if s"  `" LOG:TEXT+ d du LOG:TEXT+ s" `" LOG:TEXT+ then
+   d str> nip 0<> if s"  `" LOG:TEXT+ d LOG:TEXT+ s" `" LOG:TEXT+ then
    LOG:;LINE E-LISTING throw ;
 
-: SAVED ( ^u8 n ^ARENA:arena -- str )
-   {: p:^ u:n ar :}
-   u 0= if s" " >str exit then
+: SAVED ( str ^ARENA:arena -- str )
+   {: s:str ar :}
+   s str> {: p:^ u:n :}
+   u 0= if s" " exit then
    ar u ARENA:ALLOC drop {: dst:^ :}
    p dst u BYTE-COPY
    dst u >str ;
 
 \ The valid UTF-8 bytes lowercased, in the arena.
-: LOWERED ( ^u8 n ^ARENA:arena -- str )
-   {: p:^ u:n ar :}
-   u 0= if s" " >str exit then
-   p u >str UNICODE:LOWERED-BYTES {: size:n :}
+: LOWERED ( str ^ARENA:arena -- str )
+   {: s:str ar :}
+   s str> nip 0= if s" " exit then
+   s UNICODE:LOWERED-BYTES {: size:n :}
    ar size ARENA:ALLOC drop {: dst:^ :}
-   p u dst size UNICODE:LOWER drop
+   s dst size UNICODE:LOWER drop
    dst size >str ;
 
 \ Rust's DropboxRoot::new over the binding's remote root.
 : NEW-LISTING-ROOT ( str ^ARENA:arena -- listing-root )
    {: s:str ar :}
-   s str> DROPBOX:ROOT-PATH? 0= if
+   s DROPBOX:ROOT-PATH? 0= if
       DROPBOX:E-ROOT-PATH ERROR:TEXT$ LISTING-FAILED
    then
-   s s str> ar LOWERED s SEPARATOR COUNT-CHAR LISTING-ROOT-MAKE ;
+   s s ar LOWERED s SEPARATOR COUNT-CHAR LISTING-ROOT-MAKE ;
 
 : ROOT-LOWER ( listing-root -- str )
    LISTING-ROOT-UNMAKE {: p:str l:str depth:n :} l ;
@@ -1100,24 +1118,26 @@ STRUCTURE casing
 
 \ Whether the display path lowercases to the lower one, both valid
 \ UTF-8 as Rust's strings are.
-: LOWERS? ( ^u8 n ^u8 n -- bool )
-   {: l:^ lu:n d:^ du:n :}
-   l lu UTF8:VALID? d du UTF8:VALID? and 0= if false exit then
-   d du >str l lu >str UNICODE:LOWERS-TO? ;
+: LOWERS? ( str str -- bool )
+   {: l:str d:str :}
+   l UTF8:VALID? d UTF8:VALID? and 0= if false exit then
+   d l UNICODE:LOWERS-TO? ;
 
 \ The index of the key in the lower path: past the root's lower path
 \ and a separator, or -1.
-: KEY-START ( ^u8 n str -- n )
-   {: l:^ lu:n rl:str :}
-   rl str> {: r:^ ru:n :}
-   l lu >str r ru >str STARTS-WITH? 0= if -1 exit then
+: KEY-START ( str str -- n )
+   {: ls:str rl:str :}
+   ls str> {: l:^ lu:n :}
+   rl str> nip {: ru:n :}
+   ls rl STARTS-WITH? 0= if -1 exit then
    lu ru <= if -1 exit then
    l ru + c@ SEPARATOR <> if -1 exit then
    ru 1+ ;
 
 \ The index after the k-th separator, k above 0, or -1 when fewer.
-: PAST-SEPARATORS ( ^u8 n n -- n )
-   {: p:^ u:n k:n :}
+: PAST-SEPARATORS ( str n -- n )
+   {: s:str k:n :}
+   s str> {: p:^ u:n :}
    0 u 0 ?do
       p i + c@ SEPARATOR = if
          1+ dup k = if drop i 1+ unloop exit then
@@ -1125,30 +1145,31 @@ STRUCTURE casing
    loop drop -1 ;
 
 \ Whether key and path bytes have as many components, none invalid.
-: FITTING? ( ^u8 n ^u8 n -- bool )
-   {: k:^ ku:n p:^ pu:n :}
-   k ku >str SEPARATOR COUNT-CHAR p pu >str SEPARATOR COUNT-CHAR <>
+: FITTING? ( str str -- bool )
+   {: k:str p:str :}
+   k SEPARATOR COUNT-CHAR p SEPARATOR COUNT-CHAR <>
    if false exit then
-   k ku DROPBOX:INVALID-PARTS? p pu DROPBOX:INVALID-PARTS? or 0= ;
+   k DROPBOX:INVALID-PARTS? p DROPBOX:INVALID-PARTS? or 0= ;
 
 \ Rust's relative_paths: the key and display path beneath the root of
 \ the entry's lower and display paths, in the arena.
 : RELATIVE-PATHS
-   ( ^u8 n ^u8 n listing-root ^ARENA:arena -- MODEL:key MODEL:path )
-   {: l:^ lu:n d:^ du:n root ar :}
-   l lu root ROOT-LOWER KEY-START {: ks:n :}
-   d du root ROOT-DEPTH 1+ PAST-SEPARATORS {: ps:n :}
-   l lu d du LOWERS? ks 0 >= and ps 0 >= and 0= if d du BAD-PATH then
-   l ks + lu ks - {: k:^ ku:n :}
-   d ps + du ps - {: p:^ pu:n :}
-   k ku p pu FITTING? 0= if d du BAD-PATH then
-   k ku ar SAVED MODEL:>KEY p pu ar SAVED MODEL:>PATH ;
+   ( str str listing-root ^ARENA:arena -- MODEL:key MODEL:path )
+   {: l:str d:str root ar :}
+   l root ROOT-LOWER KEY-START {: ks:n :}
+   d root ROOT-DEPTH 1+ PAST-SEPARATORS {: ps:n :}
+   l d LOWERS? ks 0 >= and ps 0 >= and 0= if d BAD-PATH then
+   l ks l str> nip PART {: k:str :}
+   d ps d str> nip PART {: p:str :}
+   k p FITTING? 0= if d BAD-PATH then
+   k ar SAVED MODEL:>KEY p ar SAVED MODEL:>PATH ;
 
 : OWN-ENTRY? ( ^DROPBOX:entry listing-root -- bool )
    {: e root :}
-   root ROOT-LOWER str> {: r:^ ru:n :}
-   ru 0= if false exit then
-   e DROPBOX-ENTRY:LOWER @ SPAN:$ r ru STR= ;
+   root ROOT-LOWER {: r:str :}
+   r str> nip 0= if false exit then
+   e DROPBOX-ENTRY:LOWER @ SPAN:$ r STR= ;
+
 
 : RESTRICTED-ROOT ( ^DROPBOX:entry -- )
    DROPBOX-ENTRY:RESTRICTED @ if
@@ -1174,8 +1195,9 @@ STRUCTURE casing
    k JOURNAL-REMOTE--INVENTORY--CHANGE:DELETE-SUBTREE v VEC:PUSH ! ;
 
 \ The index of the next separator from at, or the length.
-: NEXT-SEPARATOR ( ^u8 n n -- n )
-   {: p:^ u:n at:n :}
+: NEXT-SEPARATOR ( str n -- n )
+   {: s:str at:n :}
+   s str> {: p:^ u:n :}
    at begin dup u < while
       dup p + c@ SEPARATOR = if exit then
       1+
@@ -1190,12 +1212,12 @@ STRUCTURE casing
    ( n n MODEL:key MODEL:path
      ^VEC:vector<JOURNAL:remote-inventory-change> -- n n )
    {: ki:n pi:n k p v :}
-   k KEY-BYTES {: kb:^ ku:n :}
-   p PATH$ {: pb:^ pu:n :}
-   kb ku ki NEXT-SEPARATOR {: ke:n :}
-   ke ku >= if -1 -1 exit then
-   pb pu pi NEXT-SEPARATOR {: pe:n :}
-   kb ke >str MODEL:>KEY pb pe >str MODEL:>PATH REMOTE-FOLDER
+   k KEY-BYTES {: ks:str :}
+   p PATH$ {: ps:str :}
+   ks ki NEXT-SEPARATOR {: ke:n :}
+   ke ks str> nip >= if -1 -1 exit then
+   ps pi NEXT-SEPARATOR {: pe:n :}
+   ks 0 ke PART MODEL:>KEY ps 0 pe PART MODEL:>PATH REMOTE-FOLDER
    MODEL-REMOTE--RECORD:MAKE
    JOURNAL-REMOTE--INVENTORY--CHANGE:ENSURE-DIRECTORY v VEC:PUSH !
    ke 1+ pe 1+ ;
@@ -1255,11 +1277,11 @@ STRUCTURE casing
    ( ^DROPBOX:entry listing-root
      ^VEC:vector<JOURNAL:remote-inventory-change> ^ARENA:arena -- )
    {: e root v ar :}
-   e DROPBOX-ENTRY:LOWER @ SPAN:$ {: l:^ lu:n :}
-   e DROPBOX-ENTRY:DISPLAY @ SPAN:$ {: d:^ du:n :}
-   lu 0= du 0= or if d du BAD-PATH then
+   e DROPBOX-ENTRY:LOWER @ SPAN:$ {: l:str :}
+   e DROPBOX-ENTRY:DISPLAY @ SPAN:$ {: d:str :}
+   l str> nip 0= d str> nip 0= or if d BAD-PATH then
    e root OWN-ENTRY? if e ROOT-ENTRY exit then
-   l lu d du root ar RELATIVE-PATHS {: k p :}
+   l d root ar RELATIVE-PATHS {: k p :}
    e k p v ar APPEND-OBSERVED ;
 
 : CHANGE-KEY ( JOURNAL:remote-inventory-change -- MODEL:key )
@@ -1363,10 +1385,10 @@ STRUCTURE casing
 
 \ The number of the delete at these key bytes, or -1.
 : DELETE-AT
-   ( ^u8 n ^VEC:vector<n> ^VEC:vector<JOURNAL:remote-inventory-change>
+   ( str ^VEC:vector<n> ^VEC:vector<JOURNAL:remote-inventory-change>
      -- n )
-   {: p:^ u:n ds cs :}
-   p u ds VEC:COUNT [: ds swap cs NTH-KEY ;] FIND-BYTES {: at:n :}
+   {: p:str ds cs :}
+   p ds VEC:COUNT [: ds swap cs NTH-KEY ;] FIND-BYTES {: at:n :}
    at ds VEC:COUNT = if -1 exit then
    ds at VEC:AT @ ;
 
@@ -1375,10 +1397,11 @@ STRUCTURE casing
    ( MODEL:key ^VEC:vector<n>
      ^VEC:vector<JOURNAL:remote-inventory-change> -- n )
    {: k ds cs :}
-   k KEY-BYTES {: p:^ u:n :}
-   p u ds cs DELETE-AT
+   k KEY-BYTES {: s:str :}
+   s str> {: p:^ u:n :}
+   s ds cs DELETE-AT
    u 0 ?do
-      p i + c@ SEPARATOR = if p i ds cs DELETE-AT max then
+      p i + c@ SEPARATOR = if s 0 i PART ds cs DELETE-AT max then
    loop ;
 
 : NO-RECORD ( -- option<MODEL:remote-record> ) OPTION:NONE ;
@@ -1464,9 +1487,9 @@ STRUCTURE casing
    cv ;
 
 \ The casing at these key bytes among casings sorted by key, if any.
-: CASING-AT ( ^u8 n ^VEC:vector<casing> -- option<str> )
-   {: p:^ u:n cv :}
-   p u cv VEC:COUNT [: cv swap VEC:AT @ CASING-KEY ;] FIND-BYTES
+: CASING-AT ( str ^VEC:vector<casing> -- option<str> )
+   {: p:str cv :}
+   p cv VEC:COUNT [: cv swap VEC:AT @ CASING-KEY ;] FIND-BYTES
    {: at:n :}
    at cv VEC:COUNT = if OPTION:NONE exit then
    cv at VEC:AT @ CASING-UNMAKE {: k s:str :} s OPTION:SOME ;
@@ -1475,34 +1498,40 @@ STRUCTURE casing
 \ key up to it, else its own; the indices after them, or -1 past the
 \ last.
 : SPELL-PART
-   ( n n n MODEL:key MODEL:path ^VEC:vector<casing> [ n ^u8 n -- n ]
+   ( n n n MODEL:key MODEL:path ^VEC:vector<casing> [ n str -- n ]
      -- n n n )
    {: acc:n ki:n pi:n k p cv q :}
-   k KEY-BYTES {: kb:^ ku:n :}
-   p PATH$ {: pb:^ pu:n :}
-   kb ku ki NEXT-SEPARATOR {: ke:n :}
-   pb pu pi NEXT-SEPARATOR {: pe:n :}
-   kb ke cv CASING-AT MATCH option
-      none OF pb pi + pe pi - ENDOF
-      some OF str> ENDOF
-   ;MATCH {: s:^ su:n :}
-   acc s su q execute
-   ke ku >= if -1 -1 exit then
+   k KEY-BYTES {: ks:str :}
+   p PATH$ {: ps:str :}
+   ks ki NEXT-SEPARATOR {: ke:n :}
+   ps pi NEXT-SEPARATOR {: pe:n :}
+   ks 0 ke PART cv CASING-AT MATCH option
+      none OF ps pi pe PART ENDOF
+      some OF ENDOF
+   ;MATCH {: s:str :}
+   acc s q execute
+   ke ks str> nip >= if -1 -1 exit then
    ke 1+ pe 1+ ;
 
 : EACH-SPELLED
-   ( n MODEL:key MODEL:path ^VEC:vector<casing> [ n ^u8 n -- n ]
+   ( n MODEL:key MODEL:path ^VEC:vector<casing> [ n str -- n ]
      -- n )
    {: k p cv q :}
    0 0 begin dup 0 >= while k p cv q SPELL-PART repeat 2drop ;
 
 \ Writes the part at offset at of dst, after a separator unless
 \ first; the offset after it.
-: PUT-PART ( n ^u8 n ^u8 -- n )
-   {: at:n s:^ su:n dst:^ :}
+: PUT-PART ( n str ^u8 -- n )
+   {: at:n ss:str dst:^ :}
+   ss str> {: s:^ su:n :}
    at at 0 > if SEPARATOR dst at + c! 1+ then {: from:n :}
    s dst from + su BYTE-COPY
    from su + ;
+
+\ The size at grown by the part, after a separator unless first.
+: SIZED ( n str -- n )
+   {: at:n s:str :}
+   s str> nip at 0 > if 1+ then at + ;
 
 \ Rust's normalized_remote_path: each component takes the casing of
 \ its prefix's key, when there is one.
@@ -1510,9 +1539,10 @@ STRUCTURE casing
    ( MODEL:key MODEL:path ^VEC:vector<casing> ^ARENA:arena
      -- MODEL:path )
    {: k p cv ar :}
-   k KEY-BYTES >str SEPARATOR COUNT-CHAR p PATH$ >str SEPARATOR COUNT-CHAR <>
+   k KEY-BYTES SEPARATOR COUNT-CHAR p PATH$ SEPARATOR COUNT-CHAR <>
    if p PATH$ BAD-PATH then
-   0 k p cv [: nip swap dup 0 > if 1+ then + ;] EACH-SPELLED
+   0 k p cv [: SIZED ;] EACH-SPELLED
+
    {: size:n :}
    ar size ARENA:ALLOC drop {: dst:^ :}
    0 k p cv [: dst PUT-PART ;] EACH-SPELLED drop
@@ -1686,12 +1716,12 @@ ENUM listed done ;ENUM
 : CLIENT ( ^refresh -- ^DROPBOX:client )
    REFRESH-LINK @ REPLAY-LINK:CLIENT @ ;
 
-: LISTING-PATH ( listing-root -- ^u8 n )
-   LISTING-ROOT-UNMAKE {: p:str l:str depth:n :} p str> ;
+: LISTING-PATH ( listing-root -- str )
+   LISTING-ROOT-UNMAKE {: p:str l:str depth:n :} p ;
 
 \ The cursor of the listing the client finished last.
 : LISTED-CURSOR ( ^refresh -- DROPBOX:cursor )
-   CLIENT DROPBOX:CURSOR >str DROPBOX:>CURSOR ;
+   CLIENT DROPBOX:CURSOR DROPBOX:>CURSOR ;
 
 \ Every listing starts with no changes, so a reset drops the delta's.
 : FRESH ( ^refresh -- )
@@ -1739,7 +1769,7 @@ ENUM listed done ;ENUM
 : CONTINUED ( ^refresh -- listing-event )
    {: r :}
    r FRESH
-   r REFRESH-CURSOR @ DROPBOX:CURSOR>STR str> r CLIENT
+   r REFRESH-CURSOR @ DROPBOX:CURSOR>STR r CLIENT
    [: r ENTRY+ ;] DROPBOX:CHANGES r DELTA-REPLY ;
 
 : LISTED ( ^refresh -- listed )
@@ -1796,8 +1826,8 @@ STRUCTURE run DERIVE addr
    FIELD arena ^ARENA:arena
 ;STRUCTURE
 
-: ROOT$ ( ^run -- ^u8 n ) RUN-ROOT @ str> ;
-: STAGING$ ( ^run -- ^u8 n ) RUN-STAGING @ str> ;
+: ROOT$ ( ^run -- str ) RUN-ROOT @ ;
+: STAGING$ ( ^run -- str ) RUN-STAGING @ ;
 
 \ Rust's Prepared<StagedUpload>; occupied is its
 \ StageDestinationOccupied error, which every caller acts on at once.
@@ -1811,9 +1841,10 @@ ENUM prepared-upload
 ENUM prepared ready fresh ;ENUM
 
 : NO-STAGE ( -- LOCAL:stage-outcome<^LOCAL:staged-upload> )
-   s" " >str LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED ;
+   s" " LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED ;
 : DROP-STAGE ( LOCAL:stage-outcome<^LOCAL:staged-upload> -- ) drop ;
-: NO-HASH ( -- DROPBOX:hash ) s" " >str DROPBOX:>HASH ;
+: NO-HASH ( -- DROPBOX:hash ) s" " DROPBOX:>HASH ;
+
 : DROP-HASH ( DROPBOX:hash -- ) drop ;
 
 : STAGE-CONVERTS? ( n n -- bool )
@@ -2403,7 +2434,7 @@ ENUM root-check active changed ;ENUM
    [: x DOWNLOAD-LIVE @ LIVE? ;] LOCAL:LEASE-DOWNLOAD-SLOT ;
 
 : NO-FETCH ( -- LOCAL:stage-outcome<n> )
-   s" " >str LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED ;
+   s" " LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED ;
 : DROP-FETCH ( LOCAL:stage-outcome<n> -- ) drop ;
 
 \ The codes FETCH blocks on, other than DOWNLOAD-BLOCKAGE's.
@@ -3543,11 +3574,11 @@ ENUM pass-state DERIVE eq
       sync-error OF drop OPTION:SOME ENDOF
    ;MATCH ;
 
-: NTH$ ( ^VEC:vector<str> n -- ^u8 n ) VEC:AT @ str> ;
+: NTH$ ( ^VEC:vector<str> n -- str ) VEC:AT @ ;
 
 : NTH< ( n n ^VEC:vector<str> -- bool )
    {: x:n y:n v :}
-   v x NTH$ >str v y NTH$ >str STR< ;
+   v x NTH$ v y NTH$ STR< ;
 
 \ How many distinct byte strings v holds, counted in STR< order.
 : DISTINCT ( ^VEC:vector<str> ^ARENA:arena -- n )
@@ -3617,7 +3648,8 @@ ENUM pass-state DERIVE eq
    {: x :}
    x JOURNAL@ {: j :}
    j JOURNAL:PRUNE-COMPLETED-WORK drop
-   j x PASS-RECOVERY @ str> REPLAY:PRUNE-COMPLETED-RECOVERIES drop
+   j x PASS-RECOVERY @ REPLAY:PRUNE-COMPLETED-RECOVERIES drop
+
    j x ARENA@ JOURNAL:PENDING-UPLOAD-CONTENT {: kept :}
    x HOLD-LIVE
    x FILL-REPORT

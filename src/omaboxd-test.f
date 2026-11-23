@@ -64,9 +64,9 @@ $40 constant MSG-DONTWAIT
 2 constant O-RDWR
 
 \ The status's last_error texts.
-: SYNC-ROOT ( -- ^u8 n )
+: SYNC-ROOT ( -- str )
    s" The configured sync folder is temporarily unavailable." ;
-: CONFIGURATION-INVALID ( -- ^u8 n )
+: CONFIGURATION-INVALID ( -- str )
    s" Omabox configuration needs attention." ;
 
 
@@ -75,13 +75,13 @@ $40 constant MSG-DONTWAIT
 : BUILD-ARGS ( str -- )
    {: bin :}
    PROC-ARGV-ENV-RESET
-   s" --load" >LEN PROC-ARGV+
+   s" --load" PROC-ARGV+
    SOURCE-ROOT:ENGINE$ s" tools/hb-build.f" JOINED FS:JOIN-PATH
-   {: n :} JOINED n >LEN PROC-ARGV+
-   s" --" >LEN PROC-ARGV+
-   s" src/omaboxd.f" >LEN PROC-ARGV+
-   s" -o" >LEN PROC-ARGV+
-   bin str> >LEN PROC-ARGV+
+   {: n :} JOINED n >str PROC-ARGV+
+   s" --" PROC-ARGV+
+   s" src/omaboxd.f" PROC-ARGV+
+   s" -o" PROC-ARGV+
+   bin PROC-ARGV+
    PROC-ENV-INHERIT-MISSING ;
 
 \ README's command, with this engine's hb and tree, writes bin.
@@ -89,17 +89,17 @@ $40 constant MSG-DONTWAIT
    {: bin :}
    s" hb-build builds omaboxd" T-LABEL
    bin BUILD-ARGS
-   ENGINE-CANDIDATE:PATH$ >LEN OUT CAP >LEN ERR CAP >LEN
+   ENGINE-CANDIDATE:PATH$ OUT CAP >LEN ERR CAP >LEN
    BUILD-MS >MS RUN-ARGV-ENV-CAPTURE-OUTCOME
    PROCESS:ENDING>RC RC>N {: outu:len erru:len rc :}
-   rc 0<> if ERR erru LEN>N type then
+   rc 0<> if ERR erru LEN>N >str type then
    rc 0 T=
    rc 0= ;
 
 
 \ ---- the self-check ----
 
-: VERSION-LINE ( -- ^u8 n )
+: VERSION-LINE ( -- str )
    SB-RESET s" omaboxd " SB-APPEND RELEASE:VERSION$ SB-APPEND 10 SB-APPEND-C SB$ ;
 
 : SELF-CHECK-IGNORES-UNAVAILABLE-CONFIGURATION-AND-PRINTS-VERSION
@@ -108,14 +108,14 @@ $40 constant MSG-DONTWAIT
    s" self_check_ignores_unavailable_configuration_and_prints_version"
    T-LABEL
    PROC-ARGV-ENV-RESET
-   s" --self-check" >LEN PROC-ARGV+
-   s" XDG_CONFIG_HOME" >LEN s" relative-and-invalid" >LEN PROC-ENV+
-   s" XDG_STATE_HOME" >LEN s" relative-and-invalid" >LEN PROC-ENV+
-   bin str> >LEN OUT CAP >LEN ERR CAP >LEN
+   s" --self-check" PROC-ARGV+
+   s" XDG_CONFIG_HOME" s" relative-and-invalid" PROC-ENV+
+   s" XDG_STATE_HOME" s" relative-and-invalid" PROC-ENV+
+   bin OUT CAP >LEN ERR CAP >LEN
    SELF-CHECK-MS >MS RUN-ARGV-ENV-CAPTURE-OUTCOME
    PROCESS:ENDING>RC RC>N {: outu:len erru:len rc :}
    rc 0 T=
-   OUT outu LEN>N VERSION-LINE T$=
+   OUT outu LEN>N >str VERSION-LINE T$=
    erru LEN>N 0 T= ;
 
 \ How the child ended, its exit code or 128 + its signal; past the
@@ -137,11 +137,11 @@ $40 constant MSG-DONTWAIT
 : SELF-CHECK-FAILS-ON-A-FULL-STDOUT ( str -- )
    {: bin :}
    s" self_check_fails_on_a_full_stdout" T-LABEL
-   S\" /dev/full\z" drop O-RDWR 0 open {: full :}
-   S\" /dev/null\z" drop O-RDWR 0 open {: null :}
+   S\" /dev/full\z" str> drop O-RDWR 0 open {: full :}
+   S\" /dev/null\z" str> drop O-RDWR 0 open {: null :}
    full 0 >= TTRUE
    null 0 >= TTRUE
-   bin str> PROCESS:NEW PROCESS:HERMETIC
+   bin PROCESS:NEW PROCESS:HERMETIC
    s" --self-check" PROCESS:ARG
    0 >FD null >FD PROCESS:FD
    1 >FD full >FD PROCESS:FD
@@ -171,12 +171,13 @@ STRUCTURE fixture DERIVE addr
 
 ARENA FIXTURES fixture
 
-: MADE ( str ^u8 n ^ARENA:arena -- str )
-   TEST-CLIENT:INSIDE dup str> FS:MAKE-DIR ;
+: MADE ( str str ^ARENA:arena -- str )
+   TEST-CLIENT:INSIDE dup FS:MAKE-DIR ;
 
 \ sockaddr_un for path; answers its length.
-: ADDRESS ( ^u8 n -- n )
-   {: p:^ u:n :}
+: ADDRESS ( str -- n )
+   {: s:str :}
+   s str> {: p:^ u:n :}
    u 108 < TTRUE
    AF-UNIX ADDR c! 0 ADDR 1 + c!
    p ADDR 2 + u BYTE-COPY 0 ADDR 2 + u + c!
@@ -186,7 +187,7 @@ ARENA FIXTURES fixture
    {: p :}
    AF-UNIX DGRAM-CLOEXEC 0 SOCKET-CALL {: fd :}
    fd 0 >= TTRUE
-   fd ADDR p str> ADDRESS BIND-CALL 0 T=
+   fd ADDR p ADDRESS BIND-CALL 0 T=
    fd ;
 
 \ config.toml as Rust's Config::write_new writes it.
@@ -196,15 +197,15 @@ ARENA FIXTURES fixture
    x FIXTURE-CONFIG-HOME @ s" omabox/config.toml" ar TEST-CLIENT:INSIDE
    {: file :}
    SB-RESET S\" sync_root = \q" SB-APPEND
-   x FIXTURE-CONFIG @ CONFIG:SYNC-ROOT CONFIG:ABS-PATH>STR str> SB-APPEND
+   x FIXTURE-CONFIG @ CONFIG:SYNC-ROOT CONFIG:ABS-PATH>STR SB-APPEND
    S\" \q\ndropbox_app_key = \qtest-app-key\q\n" SB-APPEND
-   file str> SB$ FS:WRITE-ALL ;
+   file SB$ FS:WRITE-ALL ;
 
 : CONFIGURED ( ^fixture str ^ARENA:arena -- )
    {: x root ar :}
    x FIXTURE-CONFIG-HOME @ CONFIG:>ABS-PATH
    x FIXTURE-STATE-HOME @ CONFIG:>ABS-PATH ar CONFIG:XDG-NEW {: xdg :}
-   xdg root s" test-app-key" >str ar CONFIG:FROM-VALUES
+   xdg root s" test-app-key" ar CONFIG:FROM-VALUES
    x FIXTURE-CONFIG !
    x ar WRITE-CONFIG ;
 
@@ -224,13 +225,13 @@ ARENA FIXTURES fixture
    sock BOUND x FIXTURE-NOTIFY !
    x ;
 
-: ROOT$ ( ^fixture -- ^u8 n )
-   FIXTURE-CONFIG @ CONFIG:SYNC-ROOT CONFIG:ABS-PATH>STR str> ;
+: ROOT$ ( ^fixture -- str )
+   FIXTURE-CONFIG @ CONFIG:SYNC-ROOT CONFIG:ABS-PATH>STR ;
 
 : PATHS ( ^fixture -- ^CONFIG:paths ) FIXTURE-CONFIG @ CONFIG:PATHS ;
 
-: JOURNAL$ ( ^fixture -- ^u8 n )
-   PATHS CONFIG:JOURNAL-FILE CONFIG:ABS-PATH>STR str> ;
+: JOURNAL$ ( ^fixture -- str )
+   PATHS CONFIG:JOURNAL-FILE CONFIG:ABS-PATH>STR ;
 
 \ The bytes of one datagram in GOT, or -1 when none came within n ms.
 : RECEIVED ( ^fixture n -- n )
@@ -241,7 +242,7 @@ ARENA FIXTURES fixture
 
 : READY ( ^fixture -- )
    READY-MS RECEIVED {: n :}
-   GOT n 0 max s" READY=1" T$= ;
+   GOT n 0 max >str s" READY=1" T$= ;
 
 \ The lock is another daemon's: CONFIG:LOCK refuses it.
 : LOCK-HELD ( ^fixture ^ARENA:arena -- )
@@ -253,27 +254,27 @@ ARENA FIXTURES fixture
    CONFIG:E-ALREADY-RUNNING T= ;
 
 \ Whether the status's file holds last_error t.
-: SAYS? ( ^fixture ^u8 n ^ARENA:arena -- bool )
-   {: x t:^ tu ar :}
+: SAYS? ( ^fixture str ^ARENA:arena -- bool )
+   {: x t:str ar :}
    x FIXTURE-RUNTIME @ s" omabox/status.json" ar TEST-CLIENT:INSIDE {: f :}
    f FS:FILE? 0= if false exit then
-   f str> SEEN CAP FS:READ-ALL {: u :}
-   SB-RESET S\" \qlast_error\q:" SB-APPEND t tu TEST-CLIENT:QUOTED+
-   SEEN u SB$ CONTAINS? ;
+   f SEEN CAP FS:READ-ALL {: u :}
+   SB-RESET S\" \qlast_error\q:" SB-APPEND t TEST-CLIENT:QUOTED+
+   SEEN u >str SB$ CONTAINS? ;
 
 
 \ ---- the child ----
 
 : SPAWNED ( ^fixture str -- )
    {: x bin :}
-   S\" /dev/null\z" drop O-RDWR 0 open {: null :}
+   S\" /dev/null\z" str> drop O-RDWR 0 open {: null :}
    null 0 >= TTRUE
-   bin str> PROCESS:NEW PROCESS:HERMETIC
-   s" XDG_CONFIG_HOME" x FIXTURE-CONFIG-HOME @ str> PROCESS:ENV
-   s" XDG_STATE_HOME" x FIXTURE-STATE-HOME @ str> PROCESS:ENV
-   s" XDG_RUNTIME_DIR" x FIXTURE-RUNTIME @ str> PROCESS:ENV
-   s" PATH" x FIXTURE-COMMAND-PATH @ str> PROCESS:ENV
-   s" NOTIFY_SOCKET" x FIXTURE-NOTIFY-PATH @ str> PROCESS:ENV
+   bin PROCESS:NEW PROCESS:HERMETIC
+   s" XDG_CONFIG_HOME" x FIXTURE-CONFIG-HOME @ PROCESS:ENV
+   s" XDG_STATE_HOME" x FIXTURE-STATE-HOME @ PROCESS:ENV
+   s" XDG_RUNTIME_DIR" x FIXTURE-RUNTIME @ PROCESS:ENV
+   s" PATH" x FIXTURE-COMMAND-PATH @ PROCESS:ENV
+   s" NOTIFY_SOCKET" x FIXTURE-NOTIFY-PATH @ PROCESS:ENV
    0 >FD null >FD PROCESS:FD
    1 >FD null >FD PROCESS:FD
    2 >FD null >FD PROCESS:FD
@@ -311,7 +312,7 @@ ARENA FIXTURES fixture
    {: x :}
    x FIXTURE-PID @ 0 > if x TERMINATE drop then
    x FIXTURE-NOTIFY @ close
-   x FIXTURE-DIR @ str> FS:REMOVE-TREE ;
+   x FIXTURE-DIR @ FS:REMOVE-TREE ;
 
 : FIXTURED ( [ ^fixture ^ARENA:arena -- ] ^ARENA:arena -- )
    {: q ar :}
@@ -327,10 +328,10 @@ ARENA FIXTURES fixture
 : NAP ( -- ) NAP-MS >MS TASK:SLEEP ;
 
 \ Whether the status says t before the deadline.
-: AWAITED ( ^fixture ^u8 n ^ARENA:arena -- bool )
-   {: x t:^ tu ar :}
+: AWAITED ( ^fixture str ^ARENA:arena -- bool )
+   {: x t:str ar :}
    DEADLINE {: end :}
-   begin x t tu ar SAYS? 0= while
+   begin x t ar SAYS? 0= while
       end PAST? if false exit then
       NAP
    repeat true ;
@@ -349,10 +350,10 @@ ARENA FIXTURES fixture
    x bin SPAWNED
    x READY
    x ar LOCK-HELD
-   x JOURNAL$ >str FS:FILE? TTRUE
+   x JOURNAL$ FS:FILE? TTRUE
    x RUNNING? TTRUE
    x TERMINATE drop
-   [: x JOURNAL$ >str JOURNAL:OPEN JOURNAL:CLOSE ;] catch 0 T= ;
+   [: x JOURNAL$ JOURNAL:OPEN JOURNAL:CLOSE ;] catch 0 T= ;
 
 : INITIALIZED-JOURNAL-AND-HELD-LOCK-PRECEDE-READINESS ( str -- )
    {: bin :}
@@ -362,16 +363,16 @@ ARENA FIXTURES fixture
 \ The root removed, or a link to a missing sibling when dangling.
 : UNAVAILABLE ( ^fixture ^ARENA:arena str bool -- )
    {: x ar bin dangling :}
-   x ROOT$ >str FS:REMOVE-DIR
+   x ROOT$ FS:REMOVE-DIR
    dangling if
       x FIXTURE-DIR @ s" missing" ar TEST-CLIENT:INSIDE
-      x ROOT$ >str FS:MAKE-SYMLINK
+      x ROOT$ FS:MAKE-SYMLINK
    then
    x bin SPAWNED
    x READY
    x RUNNING? TTRUE
    x ar LOCK-HELD
-   x JOURNAL$ >str FS:FILE? TTRUE
+   x JOURNAL$ FS:FILE? TTRUE
    x SYNC-ROOT ar AWAITED TTRUE
    x RUNNING? TTRUE
    x TERMINATE drop ;
@@ -380,8 +381,8 @@ ARENA FIXTURES fixture
 \ appears: refused before readiness.
 : CONTAINING ( ^fixture ^ARENA:arena str -- )
    {: x ar bin :}
-   x ROOT$ >str FS:REMOVE-DIR
-   x FIXTURE-STATE-HOME @ x ROOT$ >str FS:MAKE-SYMLINK
+   x ROOT$ FS:REMOVE-DIR
+   x FIXTURE-STATE-HOME @ x ROOT$ FS:MAKE-SYMLINK
    x bin SPAWNED
    x SETTLED
    x TERMINATE EXIT-USER-ACTION T=
@@ -411,7 +412,7 @@ ARENA FIXTURES fixture
    s" omaboxd-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d :}
    d s" bin" ar MADE s" omaboxd" ar TEST-CLIENT:INSIDE {: bin :}
    [: bin BUILT? if bin CASES then ;]
-   [: d str> FS:REMOVE-TREE ;] finally ;
+   [: d FS:REMOVE-TREE ;] finally ;
 
 : RUN-SUITE ( -- )
    T-RESET

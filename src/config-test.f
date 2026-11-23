@@ -110,8 +110,8 @@ variable CAUSE
 
 \ ---- strings and paths, laid in the case's arena
 
-: KEEP ( ^u8 n -- str )
-   {: a:^ u:n :}
+: KEEP ( str -- str )
+   str> {: a:^ u:n :}
    AR @ u ARENA:ALLOC {: d:^ du:n :}
    a d u BYTE-COPY
    d du >str ;
@@ -125,24 +125,22 @@ variable CAUSE
    bp d au + bu BYTE-COPY
    d du >str ;
 
-: S+ ( str ^u8 n -- str ) >str CAT ;
-
 \ DIR/name and REAL/name.
-: UNDER ( ^u8 n -- str )
-   {: n:^ u:n :}
-   DIR @ s" /" S+ n u S+ ;
+: UNDER ( str -- str )
+   {: n :}
+   DIR @ s" /" CAT n CAT ;
 
-: REAL-UNDER ( ^u8 n -- str )
-   {: n:^ u:n :}
-   REAL @ s" /" S+ n u S+ ;
+: REAL-UNDER ( str -- str )
+   {: n :}
+   REAL @ s" /" CAT n CAT ;
 
-: P ( ^u8 n -- CONFIG:abs-path ) UNDER CONFIG:>ABS-PATH ;
+: P ( str -- CONFIG:abs-path ) UNDER CONFIG:>ABS-PATH ;
 
-: MKDIR ( str -- ) str> FS:MAKE-DIR ;
+: MKDIR ( str -- ) FS:MAKE-DIR ;
 : MKDIRS ( str -- ) FS:MAKE-DIRS ;
 : SYMLINK ( str str -- ) {: target link :} target link FS:MAKE-SYMLINK ;
 : EXISTS? ( str -- bool ) FS:TRY-STAT ;
-: DIRECTORY? ( CONFIG:abs-path -- bool ) CONFIG:ABS-PATH>STR str> FS:DIR? ;
+: DIRECTORY? ( CONFIG:abs-path -- bool ) CONFIG:ABS-PATH>STR FS:DIR? ;
 
 \ The permission bits of the entry a path names, links followed.
 : MODE ( CONFIG:abs-path -- n )
@@ -151,34 +149,27 @@ variable CAUSE
 
 : PATH= ( CONFIG:abs-path str -- )
    {: p s :}
-   p CONFIG:ABS-PATH>STR str> s str> T$= ;
-
-: CONTAINS? ( ^u8 n ^u8 n -- bool )
-   {: a:^ u:n t:^ tu:n :}
-   tu u > if false exit then
-   u tu - 1+ 0 ?do
-      a i + tu >str t tu >str T-STR= if true unloop exit then
-   loop false ;
+   p CONFIG:ABS-PATH>STR s T$= ;
 
 
 \ ---- the case's frame
 
 : CLEANUP ( -- )
-   DIR @ str> FS:REMOVE-TREE
+   DIR @ FS:REMOVE-TREE
    AR @ ARENA:RELEASE ;
 
 \ Runs the body with AR, DIR and REAL fresh; the directory goes after.
-: RUN-CASE ( ^u8 n [ -- ] -- )
+: RUN-CASE ( str [ -- ] -- )
    BODY ! T-LABEL
    ARENA:NEW AR !
-   s" TMPDIR" GETENV >str s" config-test-" >str FS:MKTEMP-DIR-IN str> KEEP DIR !
+   s" TMPDIR" GETENV s" config-test-" FS:MKTEMP-DIR-IN KEEP DIR !
    DIR @ AR @ CONFIG-TEST:CANON CONFIG:ABS-PATH>STR REAL !
    [: BODY @ execute ;] [: CLEANUP ;] finally ;
 
 
 \ ---- the log a refusal writes
 
-: ERR$ ( -- ^u8 n ) ERR @ ERR-U @ ;
+: ERR$ ( -- str ) ERR @ ERR-U @ >str ;
 : ERR-PATH ( -- str ) s" stderr.txt" UNDER ;
 
 \ The code the action throws, 0 for none, with fd 2 sent to the case's
@@ -188,14 +179,15 @@ variable CAUSE
    [: ACTION @ [: FS:ERRNO CAUSE ! ;] finally ;]
    ERR-PATH AR @ STDERR:CAPTURING str> ERR-U ! ERR ! ;
 
-: LINES ( ^u8 n -- n )
-   {: a:^ u:n :}
+: LINES ( str -- n )
+   str> {: a:^ u:n :}
    0 u 0 ?do a i + c@ 10 = if 1+ then loop ;
 
 \ The text a u ends in CONFIG's tag, t and a newline.
-: ENDS? ( ^u8 n str -- bool )
-   {: a:^ u:n t :}
-   s" config: " >str t CAT s\" \n" S+ str> {: w:^ wu:n :}
+: ENDS? ( str str -- bool )
+   {: s t :}
+   s str> {: a:^ u:n :}
+   s" config: " t CAT s\" \n" CAT str> {: w:^ wu:n :}
    u wu < if false exit then
    a u wu - + wu >str w wu >str T-STR= ;
 
@@ -214,25 +206,25 @@ variable CAUSE
 : HELPED? ( str str -- bool )
    {: t h :}
    ERR$ LINES 2 <> if false exit then
-   ERR @ FIRST-LINE t ENDS? 0= if false exit then
-   ERR @ FIRST-LINE + ERR-U @ FIRST-LINE -
-   s" help: " >str h CAT ENDS? ;
+   ERR @ FIRST-LINE >str t ENDS? 0= if false exit then
+   ERR @ FIRST-LINE + ERR-U @ FIRST-LINE - >str
+   s" help: " h CAT ENDS? ;
 
 \ Asserts the flag, showing what ERR$ should have held.
 : ASSERT-LOG ( bool str -- )
    {: ok:bool t :}
    ok T-ASSERT ok if exit then
-   s" want: " type t str> type cr s" got: " type ERR$ type ;
+   s" want: " type t type cr s" got: " type ERR$ type ;
 
 \ The action throws the code and logs the line t and the help line h.
 : REFUSED-WITH ( [ -- ] n str str -- )
    {: xt want:n t h :}
    xt LOGGED want T=
-   t h HELPED? t s"  / help: " S+ h CAT ASSERT-LOG ;
+   t h HELPED? t s"  / help: " CAT h CAT ASSERT-LOG ;
 
 \ Rust's help for each code a case expects; a protected path's names
 \ XDG_STATE_HOME, as every role's but the configuration directory's.
-: HELP$ ( n -- ^u8 n )
+: HELP$ ( n -- str )
    case
       CONFIG:E-PATH-NOT-ABSOLUTE of s" Use an absolute path so the unattended service resolves it consistently." endof
       CONFIG:E-READ of s" Create a readable file containing an absolute `sync_root` and a `dropbox_app_key`." endof
@@ -251,13 +243,13 @@ variable CAUSE
       CONFIG:E-ALREADY-EXISTS of s" Use Omabox settings commands to change existing configuration." endof
       CONFIG:E-WRITE of s" Ensure the XDG configuration location is owned by this user and writable." endof
       CONFIG:E-HOME-UNAVAILABLE of s" Set HOME, or set both XDG_CONFIG_HOME and XDG_STATE_HOME to absolute paths." endof
-      s" " rot
+      s" " swap
    endcase ;
 
 \ The action throws the code and logs the line t and the code's help.
 : REFUSED ( [ -- ] n str -- )
    {: xt want:n t :}
-   xt want t want HELP$ >str REFUSED-WITH ;
+   xt want t want HELP$ REFUSED-WITH ;
 
 
 \ ---- the Rust fixture
@@ -269,25 +261,25 @@ variable CAUSE
    s" config" P s" state" P AR @ CONFIG:XDG-NEW XDG !
    s" config/omabox" UNDER MKDIRS ;
 
-: XDG-AT ( ^u8 n ^u8 n -- )
-   {: c:^ cu:n s:^ su:n :}
-   c cu P s su P AR @ CONFIG:XDG-NEW XDG ! ;
+: XDG-AT ( str str -- )
+   {: c s :}
+   c P s P AR @ CONFIG:XDG-NEW XDG ! ;
 
-: XDG-LINKED ( ^u8 n str -- )
-   {: c:^ cu:n s :}
-   c cu P s CONFIG:>ABS-PATH AR @ CONFIG:XDG-NEW XDG ! ;
+: XDG-LINKED ( str str -- )
+   {: c s :}
+   c P s CONFIG:>ABS-PATH AR @ CONFIG:XDG-NEW XDG ! ;
 
 : CONFIG-FILE ( -- str ) XDG @ AR @ CONFIG:XDG-CONFIG-FILE CONFIG:ABS-PATH>STR ;
 : CONFIG-DIR ( -- str ) XDG @ AR @ CONFIG:RESOLVE-PRIVATE CONFIG:CONFIG-DIRECTORY CONFIG:ABS-PATH>STR ;
 : STATE-APP ( -- str ) XDG @ AR @ CONFIG-TEST:STATE-APP CONFIG:ABS-PATH>STR ;
 
-: WRITE-CONFIG ( str -- ) {: t :} CONFIG-FILE str> t str> FS:WRITE-ALL ;
+: WRITE-CONFIG ( str -- ) {: t :} CONFIG-FILE t FS:WRITE-ALL ;
 
-: ROOT-LINE ( -- str ) s\" sync_root = \"" >str ROOT @ CAT s\" \"\n" S+ ;
+: ROOT-LINE ( -- str ) s\" sync_root = \"" ROOT @ CAT s\" \"\n" CAT ;
 
 \ The root and test-app-key.
 : STANDARD ( -- )
-   ROOT-LINE s\" dropbox_app_key = \"test-app-key\"\n" S+ WRITE-CONFIG ;
+   ROOT-LINE s\" dropbox_app_key = \"test-app-key\"\n" CAT WRITE-CONFIG ;
 
 : LOAD ( -- ^CONFIG:config ) XDG @ AR @ CONFIG:LOAD-FROM ;
 : LOAD-DROP ( -- ) LOAD drop ;
@@ -295,16 +287,16 @@ variable CAUSE
 : DOCUMENT-DROP ( -- ) DOCUMENT drop ;
 
 : PARSE-TEXT ( -- str )
-   s" could not parse Omabox configuration at `" >str CONFIG-FILE CAT s" `" S+ ;
+   s" could not parse Omabox configuration at `" CONFIG-FILE CAT s" `" CAT ;
 
 : READ-TEXT ( -- str )
-   s" could not read Omabox configuration at `" >str CONFIG-FILE CAT s" `" S+ ;
+   s" could not read Omabox configuration at `" CONFIG-FILE CAT s" `" CAT ;
 
 \ "<role> `<path>` must not be inside sync root `<root>`".
-: INSIDE-TEXT ( ^u8 n str str -- str )
-   {: r:^ ru:n p root :}
-   r ru >str s"  `" S+ p CAT s" ` must not be inside sync root `" S+
-   root CAT s" `" S+ ;
+: INSIDE-TEXT ( str str str -- str )
+   {: r p root :}
+   r s"  `" CAT p CAT s" ` must not be inside sync root `" CAT
+   root CAT s" `" CAT ;
 
 : SAME-PATHS ( ^CONFIG:paths ^CONFIG:paths -- )
    {: a b :}
@@ -327,9 +319,9 @@ variable CAUSE
    c CONFIG:PREPARE
    c CONFIG:PATHS {: p :}
    c CONFIG:SYNC-ROOT s" Dropbox" REAL-UNDER PATH=
-   c CONFIG:APP-KEY str> s" test-app-key" T$=
+   c CONFIG:APP-KEY s" test-app-key" T$=
    p CONFIG:JOURNAL-FILE s" state" UNDER AR @ CONFIG-TEST:CANON
-   CONFIG:ABS-PATH>STR s" /omabox/journal.sqlite3" S+ PATH=
+   CONFIG:ABS-PATH>STR s" /omabox/journal.sqlite3" CAT PATH=
    p CONFIG:UPLOAD-STAGING-DIRECTORY DIRECTORY? TTRUE
    p CONFIG:RECOVERY-DIRECTORY DIRECTORY? TTRUE
    p CONFIG:JOURNAL-FILE CONFIG:ABS-PATH>STR EXISTS? TFALSE ;
@@ -337,13 +329,13 @@ variable CAUSE
 : ROOT-UNAVAILABLE ( -- )
    FIXTURE STANDARD
    LOAD {: available :}
-   ROOT @ str> FS:REMOVE-TREE
+   ROOT @ FS:REMOVE-TREE
    ['] LOAD-DROP CONFIG:E-RESOLVE-SYNC-ROOT
-   s" could not resolve sync root `" >str ROOT @ CAT s" `" S+ REFUSED
+   s" could not resolve sync root `" ROOT @ CAT s" `" CAT REFUSED
    CAUSE @ FS:ENOENT T=
    DOCUMENT {: d :}
    d CONFIG:DOCUMENT-ROOT ROOT @ PATH=
-   d CONFIG:DOCUMENT-KEY str> s" test-app-key" T$=
+   d CONFIG:DOCUMENT-KEY s" test-app-key" T$=
    XDG @ AR @ CONFIG:RESOLVE-PRIVATE available CONFIG:PATHS SAME-PATHS ;
 
 : STATE-INSIDE ( -- )
@@ -376,8 +368,8 @@ variable CAUSE
    s" config-four/omabox" UNDER MKDIRS
    STANDARD
    ['] LOAD-DROP CONFIG:E-INSPECT-PATH
-   s" could not inspect `" >str s" dangling-state-link" UNDER CAT
-   s" ` while validating configuration paths" S+ REFUSED
+   s" could not inspect `" s" dangling-state-link" UNDER CAT
+   s" ` while validating configuration paths" CAT REFUSED
    s" Dropbox/not-yet-existing-state" UNDER EXISTS? TFALSE ;
 
 \ Its loading half: the Rust test then prepares, which leaves the path.
@@ -385,7 +377,7 @@ variable CAUSE
    FIXTURE
    s" elsewhere" UNDER MKDIR
    STATE-APP MKDIRS
-   s" elsewhere" UNDER STATE-APP s" /upload-staging" S+ SYMLINK
+   s" elsewhere" UNDER STATE-APP s" /upload-staging" CAT SYMLINK
    STANDARD
    LOAD CONFIG:PATHS CONFIG:UPLOAD-STAGING-DIRECTORY
    s" elsewhere" REAL-UNDER PATH= ;
@@ -396,13 +388,13 @@ variable CAUSE
 
 : FOLLOWS-RELATIVE ( -- )
    s" links" UNDER MKDIR
-   s" ../data/sub" >str s" links/link" UNDER SYMLINK
+   s" ../data/sub" s" links/link" UNDER SYMLINK
    s" links/link/leaf" P AR @ CONFIG-TEST:FOLLOW
    s" data/sub/leaf" REAL-UNDER PATH= ;
 
 : MISSING-ON-PARENT ( -- )
    s" links" UNDER MKDIR
-   s" ../missing/../data" >str s" links/link" UNDER SYMLINK
+   s" ../missing/../data" s" links/link" UNDER SYMLINK
    s" links/link/leaf" P AR @ CONFIG-TEST:FOLLOW s" data/leaf" REAL-UNDER PATH=
    s" missing/../data/leaf" P AR @ CONFIG-TEST:REFUSE
    s" data/leaf" REAL-UNDER PATH= ;
@@ -413,8 +405,8 @@ variable CAUSE
    s" second" UNDER s" first" UNDER SYMLINK
    s" first" UNDER s" second" UNDER SYMLINK
    ['] FOLLOW-FIRST CONFIG:E-INSPECT-PATH
-   s" could not inspect `" >str s" first" UNDER CAT
-   s" ` while validating configuration paths" S+ REFUSED
+   s" could not inspect `" s" first" UNDER CAT
+   s" ` while validating configuration paths" CAT REFUSED
    CAUSE @ FS:ELOOP T= ;
 
 : REFUSE-LEAF ( -- ) s" link/leaf" P AR @ CONFIG-TEST:REFUSE drop ;
@@ -422,10 +414,10 @@ variable CAUSE
 : REFUSES-DANGLING ( -- )
    s" data" UNDER s" link" UNDER SYMLINK
    ['] REFUSE-LEAF CONFIG:E-INSPECT-PATH
-   s" could not inspect `" >str s" link" UNDER CAT
-   s" ` while validating configuration paths" S+ REFUSED ;
+   s" could not inspect `" s" link" UNDER CAT
+   s" ` while validating configuration paths" CAT REFUSED ;
 
-: FROM-ROOT ( -- ) XDG @ ROOT @ s" test-app-key" >str AR @ CONFIG:FROM-VALUES drop ;
+: FROM-ROOT ( -- ) XDG @ ROOT @ s" test-app-key" AR @ CONFIG:FROM-VALUES drop ;
 
 : ROOT-HOLDS-CONFIG ( -- )
    s" Dropbox" UNDER ROOT !
@@ -434,14 +426,14 @@ variable CAUSE
    ['] FROM-ROOT CONFIG:E-INSIDE-SYNC-ROOT
    s" configuration directory" s" Dropbox/omabox" UNDER
    s" Dropbox" REAL-UNDER INSIDE-TEXT
-   s" Set XDG_CONFIG_HOME to a local directory outside the sync root." >str
+   s" Set XDG_CONFIG_HOME to a local directory outside the sync root."
    REFUSED-WITH ;
 
 : LOCK-INSIDE ( -- )
    FIXTURE
-   s" Dropbox/stolen.lock" UNDER str> s" " FS:WRITE-ALL
+   s" Dropbox/stolen.lock" UNDER s" " FS:WRITE-ALL
    STATE-APP MKDIRS
-   s" Dropbox/stolen.lock" UNDER STATE-APP s" /daemon.lock" S+ SYMLINK
+   s" Dropbox/stolen.lock" UNDER STATE-APP s" /daemon.lock" CAT SYMLINK
    STANDARD
    ['] LOAD-DROP CONFIG:E-INSIDE-SYNC-ROOT
    s" daemon lock" s" Dropbox/stolen.lock" REAL-UNDER
@@ -449,7 +441,7 @@ variable CAUSE
 
 : UNKNOWN-FIELDS ( -- )
    FIXTURE
-   ROOT-LINE s\" refresh_token = \"credential-sentinel-must-never-render\"\n" S+
+   ROOT-LINE s\" refresh_token = \"credential-sentinel-must-never-render\"\n" CAT
    WRITE-CONFIG
    ['] LOAD-DROP CONFIG:E-PARSE PARSE-TEXT REFUSED
    ERR$ s" credential-sentinel-must-never-render" CONTAINS? TFALSE ;
@@ -458,9 +450,9 @@ variable CAUSE
    FIXTURE
    s" local-path-sentinel" UNDER ROOT !
    ROOT @ MKDIR
-   ROOT-LINE s\" dropbox_app_key = \"  \"\n" S+ WRITE-CONFIG
+   ROOT-LINE s\" dropbox_app_key = \"  \"\n" CAT WRITE-CONFIG
    ['] LOAD-DROP CONFIG:E-EMPTY-APP-KEY
-   s" Dropbox application key is empty" >str REFUSED
+   s" Dropbox application key is empty" REFUSED
    ERR$ s" local-path-sentinel" CONTAINS? TFALSE ;
 
 : SOME ( str -- option<str> ) OPTION:SOME ;
@@ -470,24 +462,24 @@ variable CAUSE
    AR @ CONFIG-TEST:RESOLVE drop ;
 
 : HOME-MISSING ( -- )
-   ['] NO-HOME CONFIG:E-HOME-UNAVAILABLE s" HOME is not set" >str REFUSED ;
+   ['] NO-HOME CONFIG:E-HOME-UNAVAILABLE s" HOME is not set" REFUSED ;
 
 : EMPTY-VALUES ( -- )
-   DIR @ SOME s" " >str SOME s" " >str SOME AR @ CONFIG-TEST:RESOLVE {: x :}
+   DIR @ SOME s" " SOME s" " SOME AR @ CONFIG-TEST:RESOLVE {: x :}
    x CONFIG:CONFIG-HOME s" .config" UNDER PATH=
    x CONFIG-TEST:STATE-HOME s" .local/state" UNDER PATH= ;
 
 : RELATIVE-VALUES ( -- )
-   DIR @ SOME s" relative-config" >str SOME s" relative-state" >str SOME
+   DIR @ SOME s" relative-config" SOME s" relative-state" SOME
    AR @ CONFIG-TEST:RESOLVE {: x :}
    x CONFIG:CONFIG-HOME s" .config" UNDER PATH=
    x CONFIG-TEST:STATE-HOME s" .local/state" UNDER PATH= ;
 
 : ABSOLUTE-VALUES ( -- )
-   CONFIG-TEST:ABSENT s" /configured/config" >str SOME
-   s" /configured/state" >str SOME AR @ CONFIG-TEST:RESOLVE {: x :}
-   x CONFIG:CONFIG-HOME s" /configured/config" >str PATH=
-   x CONFIG-TEST:STATE-HOME s" /configured/state" >str PATH= ;
+   CONFIG-TEST:ABSENT s" /configured/config" SOME
+   s" /configured/state" SOME AR @ CONFIG-TEST:RESOLVE {: x :}
+   x CONFIG:CONFIG-HOME s" /configured/config" PATH=
+   x CONFIG-TEST:STATE-HOME s" /configured/state" PATH= ;
 
 
 \ ---- prepare and the daemon lock
@@ -549,12 +541,12 @@ variable CAUSE
 : LOCK-DROP ( -- ) HELD-LOCK CONFIG:UNLOCK ;
 
 : OPEN-TEXT ( -- str )
-   s" could not open daemon lock file `" >str LOCK-PATH CAT s" `" S+ ;
+   s" could not open daemon lock file `" LOCK-PATH CAT s" `" CAT ;
 
 \ The exit code of `flock -n LOCK-PATH true`: 1 while the lock is held.
 : FLOCK-RC ( -- n )
    s" /usr/bin/flock" PROCESS:NEW s" -n" PROCESS:ARG
-   LOCK-PATH str> PROCESS:ARG s" true" PROCESS:ARG
+   LOCK-PATH PROCESS:ARG s" true" PROCESS:ARG
    PROCESS:SPAWN PROCESS:WAIT PROCESS:STATUS>RC RC>N ;
 
 : LOCK-OWNER-ONLY ( -- )
@@ -573,7 +565,7 @@ variable CAUSE
    CAUSE @ 0 T=
    s" planted.lock" UNDER EXISTS? TFALSE
    LOCK-PATH FS:REMOVE-FILE
-   s" existing.lock" UNDER str> s" " FS:WRITE-ALL
+   s" existing.lock" UNDER s" " FS:WRITE-ALL
    s" existing.lock" UNDER LOCK-PATH SYMLINK
    ['] LOCK-DROP CONFIG:E-LOCK-OPEN OPEN-TEXT REFUSED
    CAUSE @ 0 T= ;
@@ -584,7 +576,7 @@ variable CAUSE
    LOCKABLE HELD !
    HELD-LOCK {: first :}
    ['] LOCK-DROP CONFIG:E-ALREADY-RUNNING
-   s" another Omabox daemon is already running" >str REFUSED
+   s" another Omabox daemon is already running" REFUSED
    CAUSE @ 0 T=
    FLOCK-RC 1 T=
    first CONFIG:UNLOCK
@@ -625,8 +617,8 @@ variable CAUSE
    home $16D FS:CHMOD-MODE
    LOAD HELD !
    ['] PREPARE-HELD CONFIG:E-CREATE-DIRECTORY
-   s" could not create Omabox state directory at `" >str STATE-PATH CAT
-   s" `" S+ REFUSED
+   s" could not create Omabox state directory at `" STATE-PATH CAT
+   s" `" CAT REFUSED
    CAUSE @ FS:EACCES T=
    home $1ED FS:CHMOD-MODE ;
 
@@ -644,8 +636,8 @@ variable CAUSE
 : UNLOCK-WARNS ( -- )
    LOCKABLE HELD !
    ['] UNLOCK-CLOSED LOGGED 0 T=
-   s" could not unlock the daemon lock file `" >str LOCK-PATH CAT
-   s" `; closing it instead: " S+ FS:EBADF FS:ERRNO$ str> S+ {: t :}
+   s" could not unlock the daemon lock file `" LOCK-PATH CAT
+   s" `; closing it instead: " CAT FS:EBADF FS:ERRNO$ CAT {: t :}
    t LINE? t ASSERT-LOG ;
 
 : LOCK-CLOEXEC ( -- )
@@ -660,8 +652,8 @@ variable CAUSE
 
 : SECURE-FAILS ( -- )
    ['] SECURE-DENIED CONFIG:E-SECURE-DIRECTORY
-   s" could not secure Omabox state directory at `" >str s" state" UNDER CAT
-   s" `" S+ REFUSED
+   s" could not secure Omabox state directory at `" s" state" UNDER CAT
+   s" `" CAT REFUSED
    CAUSE @ FS:EPERM T= ;
 
 : ACQUIRE-DENIED ( -- )
@@ -670,8 +662,8 @@ variable CAUSE
 
 : ACQUIRE-FAILS ( -- )
    ['] ACQUIRE-DENIED CONFIG:E-LOCK-ACQUIRE
-   s" could not acquire daemon lock on `" >str s" daemon.lock" UNDER CAT
-   s" `" S+ REFUSED
+   s" could not acquire daemon lock on `" s" daemon.lock" UNDER CAT
+   s" `" CAT REFUSED
    CAUSE @ FS:EINVAL T= ;
 
 : OPEN-FULL ( -- )
@@ -692,26 +684,26 @@ variable CAUSE
 
 \ The file is the root's line, then `dropbox_app_key = ` the value's TOML
 \ text; the key decodes to the bytes.
-: DECODES ( ^u8 n ^u8 n -- )
-   {: v:^ vu:n w:^ wu:n :}
+: DECODES ( str str -- )
+   {: v w :}
    FIXTURE
-   ROOT-LINE s" dropbox_app_key = " S+ v vu S+ s\" \n" S+ WRITE-CONFIG
-   DOCUMENT CONFIG:DOCUMENT-KEY str> w wu T$= ;
+   ROOT-LINE s" dropbox_app_key = " CAT v CAT s\" \n" CAT WRITE-CONFIG
+   DOCUMENT CONFIG:DOCUMENT-KEY w T$= ;
 
 \ The file is before, the root, after; it loads with the root and key k.
-: ACCEPTS ( ^u8 n ^u8 n -- )
-   {: b:^ bu:n a:^ au:n :}
+: ACCEPTS ( str str -- )
+   {: b a :}
    FIXTURE
-   b bu >str ROOT @ CAT a au S+ WRITE-CONFIG
+   b ROOT @ CAT a CAT WRITE-CONFIG
    DOCUMENT {: d :}
    d CONFIG:DOCUMENT-ROOT ROOT @ PATH=
-   d CONFIG:DOCUMENT-KEY str> s" k" T$= ;
+   d CONFIG:DOCUMENT-KEY s" k" T$= ;
 
 \ The file is before, the root, after; its load is refused with the code.
-: REFUSES ( ^u8 n ^u8 n n -- )
-   {: b:^ bu:n a:^ au:n code:n :}
+: REFUSES ( str str n -- )
+   {: b a code:n :}
    FIXTURE
-   b bu >str ROOT @ CAT a au S+ WRITE-CONFIG
+   b ROOT @ CAT a CAT WRITE-CONFIG
    ['] DOCUMENT-DROP code
    code CONFIG:E-READ = if READ-TEXT else PARSE-TEXT then REFUSED ;
 
@@ -741,7 +733,7 @@ variable CAUSE
    s\" sync_root = \"" s\" \"\n\"dropbox\\u005Fapp_key\" = \"k\"\n" ACCEPTS ;
 : BOM ( -- ) s\" \xEF\xBB\xBFsync_root = \"" s\" \"\ndropbox_app_key = \"k\"\n" ACCEPTS ;
 
-: K ( -- ^u8 n ) s\" \"\ndropbox_app_key = \"k\"\n" ;
+: K ( -- str ) s\" \"\ndropbox_app_key = \"k\"\n" ;
 
 : ANOTHER-KEY ( -- ) s\" sync_root = \"" s\" \"\ndropbox_app_key = \"k\"\nextra = \"x\"\n" CONFIG:E-PARSE REFUSES ;
 : TABLE ( -- ) s\" [omabox]\nsync_root = \"" K CONFIG:E-PARSE REFUSES ;
@@ -766,7 +758,7 @@ variable CAUSE
 
 \ The lowest free descriptor.
 : NEXT-FD ( -- n )
-   s" /dev/null" >str FS:>PATHZ 0 0 open {: fd:n :}
+   s" /dev/null" FS:>PATHZ 0 0 open {: fd:n :}
    fd close fd ;
 
 : CONFIG-DIRECTORY-FILE ( -- )
@@ -779,17 +771,17 @@ variable CAUSE
 
 : RELATIVE-ROOT ( -- )
    FIXTURE
-   s\" sync_root = \"Dropbox\"\ndropbox_app_key = \"k\"\n" >str WRITE-CONFIG
+   s\" sync_root = \"Dropbox\"\ndropbox_app_key = \"k\"\n" WRITE-CONFIG
    ['] DOCUMENT-DROP CONFIG:E-PATH-NOT-ABSOLUTE
-   s" sync_root must be an absolute path, but was `Dropbox`" >str REFUSED ;
+   s" sync_root must be an absolute path, but was `Dropbox`" REFUSED ;
 
 : NOT-DIRECTORY ( -- )
    FIXTURE
-   ROOT @ str> FS:REMOVE-TREE
-   ROOT @ str> s" " FS:WRITE-ALL
+   ROOT @ FS:REMOVE-TREE
+   ROOT @ s" " FS:WRITE-ALL
    STANDARD
    ['] LOAD-DROP CONFIG:E-SYNC-ROOT-NOT-DIRECTORY
-   s" sync root `" >str ROOT @ CAT s" ` is not a directory" S+
+   s" sync root `" ROOT @ CAT s" ` is not a directory" CAT
    REFUSED ;
 
 
@@ -798,25 +790,25 @@ variable CAUSE
 : REPLACEMENT ( -- str ) s" Replacement" UNDER ;
 
 \ A config from XDG, the root and the key.
-: FROM ( str ^u8 n -- ^CONFIG:config )
-   {: root k:^ ku:n :}
-   XDG @ root k ku >str AR @ CONFIG:FROM-VALUES ;
+: FROM ( str str -- ^CONFIG:config )
+   {: root k :}
+   XDG @ root k AR @ CONFIG:FROM-VALUES ;
 
 : NO-LEFTOVERS ( ^VEC:vector<STALE:leftover> -- ) VEC:COUNT 0 T= ;
 
 variable ENTRIES
-: COUNT-ENTRY ( ^u8 n -- ) 2drop 1 ENTRIES +! ;
+: COUNT-ENTRY ( str -- ) drop 1 ENTRIES +! ;
 
 : ENTRY-COUNT ( str -- n )
-   0 ENTRIES ! str> [: COUNT-ENTRY ;] FS-LIST:EACH ENTRIES @ ;
+   0 ENTRIES ! [: COUNT-ENTRY ;] FS-LIST:EACH ENTRIES @ ;
 
 4096 constant TEXT-CAP
 TEXT-CAP BUFFER: TEXT
 
 \ The bytes of a file, laid in AR.
 : CONTENTS ( str -- str )
-   str> TEXT TEXT-CAP FS:READ-ALL {: u:n :}
-   TEXT u KEEP ;
+   TEXT TEXT-CAP FS:READ-ALL {: u:n :}
+   TEXT u >str KEEP ;
 
 : WRITE-REPLACES ( -- )
    FIXTURE
@@ -828,7 +820,7 @@ TEXT-CAP BUFFER: TEXT
    CONFIG-FILE CONFIG:>ABS-PATH MODE $180 T=
    LOAD {: c :}
    c CONFIG:SYNC-ROOT r CONFIG:SYNC-ROOT CONFIG:ABS-PATH>STR PATH=
-   c CONFIG:APP-KEY str> r CONFIG:APP-KEY str> T$=
+   c CONFIG:APP-KEY r CONFIG:APP-KEY T$=
    c CONFIG:PATHS r CONFIG:PATHS SAME-PATHS
    CONFIG-DIR ENTRY-COUNT 1 T= ;
 
@@ -842,9 +834,9 @@ TEXT-CAP BUFFER: TEXT
    CONFIG-FILE CONTENTS {: original :}
    REPLACEMENT s" replacement-app-key" FROM HELD !
    ['] NEW-AGAIN CONFIG:E-ALREADY-EXISTS
-   s" Omabox configuration already exists at `" >str CONFIG-FILE CAT
-   s" `" S+ REFUSED
-   CONFIG-FILE CONTENTS str> original str> T$=
+   s" Omabox configuration already exists at `" CONFIG-FILE CAT
+   s" `" CAT REFUSED
+   CONFIG-FILE CONTENTS original T$=
    CONFIG-DIR ENTRY-COUNT 1 T= ;
 
 \ The offset past the line that starts at or after at.
@@ -854,18 +846,18 @@ TEXT-CAP BUFFER: TEXT
    ERR-U @ ;
 
 \ ERR$'s line k, its newline included.
-: LINE-AT ( n -- ^u8 n )
+: LINE-AT ( n -- str )
    {: k:n :}
    0 k 0 ?do PAST-LINE loop {: s:n :}
    s PAST-LINE {: e:n :}
-   ERR @ s + e s - ;
+   ERR @ s + e s - >str ;
 
-: LINE-IS ( n ^u8 n -- )
-   {: k:n t:^ tu:n :}
-   k LINE-AT t tu >str ENDS? t tu >str ASSERT-LOG ;
+: LINE-IS ( n str -- )
+   {: k:n t :}
+   k LINE-AT t ENDS? t ASSERT-LOG ;
 
 : CLEANUP-FAILS ( -- )
-   s" /config.tmp" >str CONFIG:>ABS-PATH CONFIG-TEST:CLEANUP-FAILS ;
+   s" /config.tmp" CONFIG:>ABS-PATH CONFIG-TEST:CLEANUP-FAILS ;
 
 \ Both failures are writes, so both helps are the same text.
 : CLEANUP-RENDERS ( -- )
@@ -874,18 +866,18 @@ TEXT-CAP BUFFER: TEXT
    ERR$ LINES 4 T=
    0 s" could not write a temporary Omabox configuration at `/config.tmp`"
    LINE-IS
-   s" help: " >str CONFIG:E-WRITE HELP$ S+ str> {: h:^ hu:n :}
-   1 h hu LINE-IS
-   s" the configuration write failed and cleanup also failed: " >str
-   s" could not remove the temporary Omabox configuration at" S+
-   s"  `/config.tmp`; the incomplete owner-only temporary file is" S+
-   s"  ignored" S+ {: c :}
-   2 c str> LINE-IS
-   3 h hu LINE-IS ;
+   s" help: " CONFIG:E-WRITE HELP$ CAT {: h :}
+   1 h LINE-IS
+   s" the configuration write failed and cleanup also failed: "
+   s" could not remove the temporary Omabox configuration at" CAT
+   s"  `/config.tmp`; the incomplete owner-only temporary file is" CAT
+   s"  ignored" CAT {: c :}
+   2 c LINE-IS
+   3 h LINE-IS ;
 
 \ The decimal at the start of a u.
-: LEADING ( ^u8 n -- n )
-   {: a:^ u:n :}
+: LEADING ( str -- n )
+   str> {: a:^ u:n :}
    0 u 0 ?do
       a i + c@ {: b:n :}
       b [char] 0 < b [char] 9 > or if unloop exit then
@@ -893,14 +885,14 @@ TEXT-CAP BUFFER: TEXT
    loop ;
 
 : PID-MAX ( -- n )
-   s" /proc/sys/kernel/pid_max" >str CONTENTS str> LEADING ;
+   s" /proc/sys/kernel/pid_max" CONTENTS LEADING ;
 
 : N$ ( n -- str ) FMT:INT$ KEEP ;
 
 \ CONFIG-DIR/.config.toml.<t>
 : TEMPORARY ( str -- str )
    {: t :}
-   CONFIG-DIR s" /.config.toml." S+ t CAT ;
+   CONFIG-DIR s" /.config.toml." CAT t CAT ;
 
 : LSTAT? ( str -- bool ) FS:TRY-LSTAT ;
 
@@ -911,37 +903,37 @@ TEXT-CAP BUFFER: TEXT
    FIXTURE
    PID-MAX 1 + N$ {: dead :}
    s" outside-file" UNDER {: outside :}
-   outside str> s" outside" FS:WRITE-ALL
-   dead s" .0.tmp" S+ TEMPORARY {: file :}
-   dead s" .1.tmp" S+ TEMPORARY {: link :}
-   getpid N$ s" .999999999.tmp" S+ TEMPORARY {: live :}
-   dead s" .0" S+ TEMPORARY {: miss :}
-   file str> s" stale" FS:WRITE-ALL
-   live str> s" stale" FS:WRITE-ALL
-   miss str> s" stale" FS:WRITE-ALL
+   outside s" outside" FS:WRITE-ALL
+   dead s" .0.tmp" CAT TEMPORARY {: file :}
+   dead s" .1.tmp" CAT TEMPORARY {: link :}
+   getpid N$ s" .999999999.tmp" CAT TEMPORARY {: live :}
+   dead s" .0" CAT TEMPORARY {: miss :}
+   file s" stale" FS:WRITE-ALL
+   live s" stale" FS:WRITE-ALL
+   miss s" stale" FS:WRITE-ALL
    outside link SYMLINK
    ROOT @ s" test-app-key" FROM AR @ CONFIG:WRITE NO-LEFTOVERS
    file LSTAT? TFALSE
    link LSTAT? TFALSE
    live LSTAT? TTRUE
    miss LSTAT? TTRUE
-   outside CONTENTS str> s" outside" T$= ;
+   outside CONTENTS s" outside" T$= ;
 
 \ `"`, `\` and `'` rule out every form toml_writer prefers to a
 \ multi-line literal string.
-: AWKWARD ( -- ^u8 n ) s\" a\"b\\c'd\xC3\xA9" ;
+: AWKWARD ( -- str ) s\" a\"b\\c'd\xC3\xA9" ;
 
 : WRITES-TOML ( -- )
    FIXTURE
    AWKWARD UNDER {: root :}
    root MKDIR
    root s" test-app-key" FROM AR @ CONFIG:WRITE NO-LEFTOVERS
-   s" sync_root = '''" >str REAL @ CAT s" /" S+ AWKWARD S+
-   s\" '''\ndropbox_app_key = \"test-app-key\"\n" S+ {: want :}
-   CONFIG-FILE CONTENTS str> want str> T$=
+   s" sync_root = '''" REAL @ CAT s" /" CAT AWKWARD CAT
+   s\" '''\ndropbox_app_key = \"test-app-key\"\n" CAT {: want :}
+   CONFIG-FILE CONTENTS want T$=
    LOAD {: c :}
    c CONFIG:SYNC-ROOT AWKWARD REAL-UNDER PATH=
-   c CONFIG:APP-KEY str> s" test-app-key" T$= ;
+   c CONFIG:APP-KEY s" test-app-key" T$= ;
 
 public
 

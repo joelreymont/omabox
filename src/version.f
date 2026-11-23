@@ -4,6 +4,6 @@
 package RELEASE
 public
 
-: VERSION$ ( -- ^u8 n ) s" 0.1.0" ;
+: VERSION$ ( -- str ) s" 0.1.0" ;
 
 ;package

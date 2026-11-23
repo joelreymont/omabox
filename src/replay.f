@@ -159,12 +159,12 @@ ARENA REPORTS replay-report
 
 \ ---- failures ------------------------------------------------------
 
-: INVALID ( MODEL:path ^u8 n -- )
-   {: path detail:^ du:n :}
+: INVALID ( MODEL:path str -- )
+   {: path detail:str :}
    LOG:ERROR s" replay" LOG:LINE
    s" journaled recovery state is invalid for `" LOG:TEXT+
-   path MODEL:PATH>STR str> LOG:TEXT+ s" `: " LOG:TEXT+
-   detail du LOG:TEXT+ LOG:;LINE
+   path MODEL:PATH>STR LOG:TEXT+ s" `: " LOG:TEXT+
+   detail LOG:TEXT+ LOG:;LINE
    E-INVALID-STATE throw ;
 
 
@@ -393,18 +393,18 @@ STRUCTURE retention
    [: dir FD:SYNC ;] catch {: code:n :}
    code 0= if exit then
    code E-FS-IO <> if code throw then
-   s" sync recovery retention" d str> LOCAL:IO-FAILURE ;
+   s" sync recovery retention" d LOCAL:IO-FAILURE ;
 
 \ statat of the name, never a symlink's target; none once it is gone.
 \ o names the operation, p the payload's path.
-: STAT-AT ( fd ^u8 n ^u8 n MODEL:path -- option<stat> )
-   {: dir:fd nm:^ nu:n o:^ ou:n p :}
-   dir nm nu FS:TRY-STAT-AT if
+: STAT-AT ( fd str str MODEL:path -- option<stat> )
+   {: dir:fd nm:str o:str p :}
+   dir nm FS:TRY-STAT-AT if
       FS:STAT-DEV@ FS:STAT-INO@ FS:STAT-MODE@ STAT-MAKE OPTION:SOME
       exit
    then
    FS:ERRNO FS:ENOENT = if NO-STAT exit then
-   o ou p MODEL:PATH>STR str> LOCAL:IO-FAILURE ;
+   o p MODEL:PATH>STR LOCAL:IO-FAILURE ;
 
 : REGULAR? ( stat -- bool )
    STAT-UNMAKE {: d i m :}
@@ -434,23 +434,25 @@ STRUCTURE retention
 
 \ The directory then the name as PathBuf::push joins them: no "/"
 \ after an empty directory or one that ends in "/".
-: JOINED ( ^u8 n ^u8 n ^ARENA:arena -- ^u8 n )
-   {: d:^ du:n nm:^ nu:n ar :}
-   du 0= d du >str FS:JOIN-SEPARATED? or if 0 else 1 then {: sep:n :}
+: JOINED ( str str ^ARENA:arena -- str )
+   {: ds:str ns:str ar :}
+   ds str> {: d:^ du:n :}
+   ns str> {: nm:^ nu:n :}
+   du 0= ds FS:JOIN-SEPARATED? or if 0 else 1 then {: sep:n :}
    ar du sep + nu + ARENA:ALLOC {: dst:^ size:n :}
    d dst du BYTE-COPY
    sep 0<> if $2F dst du + c! then
    nm dst du + sep + nu BYTE-COPY
-   dst size ;
+   dst size >str ;
 
 \ Rust's destination: where the recovery directory d keeps the copy of
 \ the original path holding c.
 : DESTINATION
-   ( ^u8 n MODEL:path DROPBOX:hash ^ARENA:arena -- MODEL:path )
-   {: d:^ du:n original c ar :}
-   original MODEL:PATH>STR str> c ar LOCAL:RECOVERY-FILE-NAME
-   {: nm:^ nu:n :}
-   d du nm nu ar JOINED >str MODEL:>PATH ;
+   ( str MODEL:path DROPBOX:hash ^ARENA:arena -- MODEL:path )
+   {: d:str original c ar :}
+   original MODEL:PATH>STR c ar LOCAL:RECOVERY-FILE-NAME
+   {: nm:str :}
+   d nm ar JOINED MODEL:>PATH ;
 
 : BECAME-PENDING ( MODEL:path -- )
    s" completed recovery became pending during retention" INVALID ;
@@ -482,42 +484,42 @@ STRUCTURE retention
    code LOCAL:E-UNREADABLE = or ;
 
 \ Whether the payload at the name holds the record's content.
-: VERIFY ( retention JOURNAL:recovery-record ^u8 n -- bool )
-   {: x r nm:^ nu:n :}
-   x DIR-OF x PATH-OF str> nm nu r CONTENT x ARENA-OF
+: VERIFY ( retention JOURNAL:recovery-record str -- bool )
+   {: x r nm:str :}
+   x DIR-OF x PATH-OF nm r CONTENT x ARENA-OF
    LOCAL:VERIFY-PRIVATE-COPY ;
 
 \ Removes the payload, gone already or not, then forgets the record.
-: REMOVE-PAYLOAD ( retention JOURNAL:recovery-record ^u8 n -- n )
-   {: x r nm:^ nu:n :}
-   x DIR-OF nm nu FS:TRY-REMOVE-FILE-AT 0= if
+: REMOVE-PAYLOAD ( retention JOURNAL:recovery-record str -- n )
+   {: x r nm:str :}
+   x DIR-OF nm FS:TRY-REMOVE-FILE-AT 0= if
       FS:ERRNO FS:ENOENT <> if
-         x DIR-OF nm nu s" remove expired recovery payload"
-         r COPY-PATH MODEL:PATH>STR str> LOCAL:IO-FAILURE-AT
+         x DIR-OF nm s" remove expired recovery payload"
+         r COPY-PATH MODEL:PATH>STR LOCAL:IO-FAILURE-AT
       then
    then
    x r SYNC-THEN-FORGET ;
 
 \ The verified payload, removed while it is the file inspected before.
-: REINSPECT ( retention JOURNAL:recovery-record ^u8 n stat -- n )
-   {: x r nm:^ nu:n before :}
-   x DIR-OF nm nu s" reinspect retained recovery payload" r COPY-PATH
+: REINSPECT ( retention JOURNAL:recovery-record str stat -- n )
+   {: x r nm:str before :}
+   x DIR-OF nm s" reinspect retained recovery payload" r COPY-PATH
    STAT-AT MATCH option
       none OF x r SYNC-THEN-FORGET ENDOF
       some OF {: after :}
          after REGULAR? before after SAME-INODE? and
-         if x r nm nu REMOVE-PAYLOAD else 0 then
+         if x r nm REMOVE-PAYLOAD else 0 then
       ENDOF
    ;MATCH ;
 
 \ The expired payload: forgotten when gone, removed when verified,
 \ kept on a failure that concerns it alone.
-: CHECKED ( retention JOURNAL:recovery-record ^u8 n stat -- n )
-   {: x r nm:^ nu:n before :}
-   false [: drop [: x r nm nu VERIFY ;] ['] KEEPS? LOCAL:WITH-CONVERTS ;]
+: CHECKED ( retention JOURNAL:recovery-record str stat -- n )
+   {: x r nm:str before :}
+   false [: drop [: x r nm VERIFY ;] ['] KEEPS? LOCAL:WITH-CONVERTS ;]
    catch {: code:n :}
    code 0= if
-      if x r nm nu before REINSPECT exit then
+      if x r nm before REINSPECT exit then
       x r SYNC-THEN-FORGET exit
    then
    drop code FS:ERRNO KEEPS? if 0 exit then
@@ -525,14 +527,14 @@ STRUCTURE retention
 
 \ The payload at the name: forgotten when gone, kept when it is not a
 \ regular file or its retention has not run out.
-: INSPECT ( retention JOURNAL:recovery-record ^u8 n -- n )
-   {: x r nm:^ nu:n :}
-   x DIR-OF nm nu s" inspect retained recovery payload" r COPY-PATH
+: INSPECT ( retention JOURNAL:recovery-record str -- n )
+   {: x r nm:str :}
+   x DIR-OF nm s" inspect retained recovery payload" r COPY-PATH
    STAT-AT MATCH option
       none OF x r SYNC-THEN-FORGET ENDOF
       some OF {: before :}
          before REGULAR? r RETAINED x NOW-OF EXPIRED? and
-         if x r nm nu before CHECKED else 0 then
+         if x r nm before CHECKED else 0 then
       ENDOF
    ;MATCH ;
 
@@ -540,11 +542,11 @@ STRUCTURE retention
 \ at all.
 : PRUNE ( retention JOURNAL:recovery-record -- n )
    {: x r :}
-   x PATH-OF str> r ORIGINAL r CONTENT x ARENA-OF DESTINATION
+   x PATH-OF r ORIGINAL r CONTENT x ARENA-OF DESTINATION
    r COPY-PATH SAME-PATH? 0= if 0 exit then
-   r ORIGINAL MODEL:PATH>STR str> r CONTENT x ARENA-OF
-   LOCAL:RECOVERY-FILE-NAME {: nm:^ nu:n :}
-   x r nm nu INSPECT ;
+   r ORIGINAL MODEL:PATH>STR r CONTENT x ARENA-OF
+   LOCAL:RECOVERY-FILE-NAME {: nm:str :}
+   x r nm INSPECT ;
 
 : PRUNE-ALL ( retention -- n )
    {: x :}
@@ -552,17 +554,17 @@ STRUCTURE retention
    0 records VEC:COUNT 0 ?do x records i VEC:AT @ PRUNE + loop ;
 
 \ Prunes from the recovery directory at d, which it opens and closes.
-: RETAINING ( ^ARENA:arena JOURNAL:journal ^u8 n n -- n )
-   {: ar j d:^ du:n now:n :}
-   d du s" open recovery directory for retention"
+: RETAINING ( ^ARENA:arena JOURNAL:journal str n -- n )
+   {: ar j d:str now:n :}
+   d s" open recovery directory for retention"
    LOCAL:OPEN-PRIVATE-DIRECTORY {: dir:fd :}
-   j dir d du >str now ar RETENTION-MAKE {: x :}
+   j dir d now ar RETENTION-MAKE {: x :}
    [: x PRUNE-ALL ;] [: dir DISCARD ;] finally ;
 
 \ PRUNE-COMPLETED-RECOVERIES at now, in seconds since the epoch.
-: PRUNE-COMPLETED-RECOVERIES-AT ( JOURNAL:journal ^u8 n n -- n )
-   {: j d:^ du:n now:n :}
-   [: j d du now RETAINING ;] ARENA:WITH ;
+: PRUNE-COMPLETED-RECOVERIES-AT ( JOURNAL:journal str n -- n )
+   {: j d:str now:n :}
+   [: j d now RETAINING ;] ARENA:WITH ;
 
 public
 
@@ -570,7 +572,7 @@ public
 \ that no unfinished journal work can need and forgets their records,
 \ answering how many it forgot. Unknown entries and payloads that are
 \ not a verified regular file stay.
-: PRUNE-COMPLETED-RECOVERIES ( JOURNAL:journal ^u8 n -- n )
+: PRUNE-COMPLETED-RECOVERIES ( JOURNAL:journal str -- n )
    epoch-seconds PRUNE-COMPLETED-RECOVERIES-AT ;
 
 
@@ -608,24 +610,24 @@ ENUM apply-event done blocked ;ENUM
 : RUN-PATH ( ^pass -- MODEL:path )
    PASS-PLAN @ PLAN-PATH ;
 
-: RUN-TARGET ( ^pass -- ^u8 n )
-   RUN-PATH MODEL:PATH>STR str> ;
+: RUN-TARGET ( ^pass -- str )
+   RUN-PATH MODEL:PATH>STR ;
 
 \ The root's descriptor and path.
-: RUN-ROOT ( ^pass -- fd ^u8 n )
+: RUN-ROOT ( ^pass -- fd str )
    {: r :}
-   r PASS-ROOT @ r PASS-ROOT-PATH @ str> ;
+   r PASS-ROOT @ r PASS-ROOT-PATH @ ;
 
 : RUN-OPERATION ( ^pass -- MODEL:operation )
    PASS-OPERATION @
    JOURNAL-PLANNED--OPERATION:UNMAKE {: id at o s :} o ;
 
 : NEW-PASS
-   ( JOURNAL:journal fd ^u8 n ^ARENA:arena -- ^pass )
-   {: j root:fd p:^ u:n ar :}
+   ( JOURNAL:journal fd str ^ARENA:arena -- ^pass )
+   {: j root:fd p:str ar :}
    ar PASSES-NEW {: r :}
    j r PASS-JOURNAL ! root r PASS-ROOT !
-   p u >str r PASS-ROOT-PATH ! ar r PASS-ARENA !
+   p r PASS-ROOT-PATH ! ar r PASS-ARENA !
    ar ARENA:ALLOCATOR 0 [type] final-completion VEC:NEW
    r PASS-FINALS !
    ar NEW-REPORT r PASS-REPORT !
@@ -886,10 +888,10 @@ public
 \ descriptor, whose path is r; the final completions commit
 \ together once every plan has run.
 : REPLAY-LOCAL-PLANS-AT
-   ( JOURNAL:journal fd ^u8 n ^VEC:vector<JOURNAL:plan-record>
+   ( JOURNAL:journal fd str ^VEC:vector<JOURNAL:plan-record>
      ^ARENA:arena -- ^replay-report )
-   {: j root:fd r:^ ru:n plans ar :}
-   j root r ru ar NEW-PASS {: run :}
+   {: j root:fd r:str plans ar :}
+   j root r ar NEW-PASS {: run :}
    plans VEC:COUNT 0 ?do plans i VEC:AT @ run REPLAY-PLAN loop
    run COMMIT-PASS
    run PASS-REPORT @ ;
@@ -928,22 +930,22 @@ private
 
 \ The upload's bytes, read from f, written as path's local conflict copy.
 : WRITE-COPY
-   ( fd ^u8 n MODEL:path ^LOCAL:staged-upload fd ^ARENA:arena
+   ( fd str MODEL:path ^LOCAL:staged-upload fd ^ARENA:arena
      -- LOCAL:conflict-outcome )
-   {: root:fd r:^ ru:n path:MODEL:path up:^LOCAL:staged-upload f:fd
+   {: root:fd r:str path:MODEL:path up:^LOCAL:staged-upload f:fd
       ar:^ARENA:arena :}
-   root r ru path MODEL:PATH>STR str> LOCAL-CONFLICT--SIDE:LOCAL
+   root r path MODEL:PATH>STR LOCAL-CONFLICT--SIDE:LOCAL
    up LOCAL:UPLOAD-CONTENT [: f -rot LOCAL:FD-READ ;] ar
    LOCAL:MATERIALIZE-CONFLICT-AT ;
 
 \ An occupied copy name blocks the copy; another failure passes up.
 : COPY-IN
-   ( fd ^u8 n MODEL:path ^LOCAL:staged-upload fd ^ARENA:arena
+   ( fd str MODEL:path ^LOCAL:staged-upload fd ^ARENA:arena
      -- copy-outcome )
-   {: root:fd r:^ ru:n path:MODEL:path up:^LOCAL:staged-upload f:fd
+   {: root:fd r:str path:MODEL:path up:^LOCAL:staged-upload f:fd
       ar:^ARENA:arena :}
    COPY-OCCUPIED [: DROP-COPY
-      [: root r ru path up f ar WRITE-COPY >COPY-OUTCOME ;]
+      [: root r path up f ar WRITE-COPY >COPY-OUTCOME ;]
       ['] OCCUPIED? LOCAL:WITH-CONVERTS ;] catch {: code:n :}
    code 0= if exit then
    drop code FS:ERRNO OCCUPIED? if COPY-OCCUPIED exit then
@@ -954,12 +956,12 @@ public
 \ Writes the staged upload as path's local conflict copy below the open
 \ root, whose path is r.
 : MATERIALIZE-LOCAL-CONFLICT-AT
-   ( fd ^u8 n MODEL:path ^LOCAL:staged-upload ^ARENA:arena
+   ( fd str MODEL:path ^LOCAL:staged-upload ^ARENA:arena
      -- copy-outcome )
-   {: root:fd r:^ ru:n path:MODEL:path up:^LOCAL:staged-upload
+   {: root:fd r:str path:MODEL:path up:^LOCAL:staged-upload
       ar:^ARENA:arena :}
    up ar LOCAL:OPEN-VERIFIED-UPLOAD {: f:fd :}
-   [: root r ru path up f ar COPY-IN ;] [: f DISCARD ;] finally ;
+   [: root r path up f ar COPY-IN ;] [: f DISCARD ;] finally ;
 
 
 \ ---- Dropbox mutations ---------------------------------------------
@@ -1000,8 +1002,9 @@ ARENA UPLOADS DROPBOX:upload
 
 : CLIENT ( ^link -- ^DROPBOX:client ) REPLAY-LINK:CLIENT @ ;
 
-: COPIED ( ^u8 n ^ARENA:arena -- str )
-   {: a:^ u:n ar :}
+: COPIED ( str ^ARENA:arena -- str )
+   {: s:str ar :}
+   s str> {: a:^ u:n :}
    ar u ARENA:ALLOC drop {: dst:^ :}
    a dst u BYTE-COPY
    dst u >str ;
@@ -1028,27 +1031,28 @@ ARENA UPLOADS DROPBOX:upload
 \ ---- the Dropbox path
 
 \ Rust's Component::Normal that invalid_dropbox_component accepts.
-: NORMAL? ( ^u8 n -- bool )
-   {: p:^ u:n :}
-   u 0= if false exit then
-   p u s" ." STR= p u s" .." STR= or if false exit then
-   p u >str 0 COUNT-CHAR 0<> if false exit then
-   p u UTF8:VALID? ;
+: NORMAL? ( str -- bool )
+   {: p:str :}
+   p str> nip 0= if false exit then
+   p s" ." STR= p s" .." STR= or if false exit then
+   p 0 COUNT-CHAR 0<> if false exit then
+   p UTF8:VALID? ;
 
 \ Whether every component from `at` on is NORMAL?.
-: NORMAL-FROM? ( ^u8 n n -- bool )
-   {: p:^ u:n at:n :}
-   p u SLASH at SPLIT-NEXT 0= if 2drop drop true exit then
-   {: q:^ v:n next:n :}
-   q v NORMAL? 0= if false exit then
-   p u next RECURSE ;
+: NORMAL-FROM? ( str n -- bool )
+   {: p:str at:n :}
+   p SLASH at SPLIT-NEXT 0= if 2drop true exit then
+   {: q:str next:n :}
+   q NORMAL? 0= if false exit then
+   p next RECURSE ;
 
 : NO-TARGET ( -- option<str> ) OPTION:NONE ;
 
 \ The root, "/" and p, in the arena.
-: UNDER ( str ^u8 n ^ARENA:arena -- str )
-   {: root:str p:^ u:n ar :}
+: UNDER ( str str ^ARENA:arena -- str )
+   {: root:str s:str ar :}
    root str> {: r:^ ru:n :}
+   s str> {: p:^ u:n :}
    ar ru u + 1+ ARENA:ALLOC drop {: dst:^ :}
    r dst ru BYTE-COPY
    SLASH dst ru + c!
@@ -1059,9 +1063,9 @@ ARENA UPLOADS DROPBOX:upload
 \ path with no component or one Dropbox cannot name.
 : TARGET ( ^link MODEL:path ^ARENA:arena -- option<str> )
    {: l path ar :}
-   path MODEL:PATH>STR str> {: p:^ u:n :}
-   p u 0 NORMAL-FROM? 0= if NO-TARGET exit then
-   l REPLAY-LINK:ROOT @ p u ar UNDER OPTION:SOME ;
+   path MODEL:PATH>STR {: p:str :}
+   p 0 NORMAL-FROM? 0= if NO-TARGET exit then
+   l REPLAY-LINK:ROOT @ p ar UNDER OPTION:SOME ;
 
 \ Runs `call` on the path's target; an invalid path makes no call.
 : TARGETED
@@ -1082,7 +1086,7 @@ ARENA UPLOADS DROPBOX:upload
       absent OF false ENDOF
       file OF
          MODEL-REMOTE:UNMAKE {: c v :}
-         v DROPBOX:REV>STR str> want DROPBOX:REV>STR str> STR=
+         v DROPBOX:REV>STR want DROPBOX:REV>STR STR=
       ENDOF
       folder OF false ENDOF
       unsupported OF false ENDOF
@@ -1227,9 +1231,9 @@ private
    ;MATCH ;
 
 \ Rust's verify: what Dropbox holds at t, classified against x.
-: STATE ( ^link ^u8 n expectation ^ARENA:arena -- mutation-outcome )
-   {: l t:^ tu:n x ar :}
-   t tu l CLIENT DROPBOX:METADATA {: r:DROPBOX:reply :}
+: STATE ( ^link str expectation ^ARENA:arena -- mutation-outcome )
+   {: l t:str x ar :}
+   t l CLIENT DROPBOX:METADATA {: r:DROPBOX:reply :}
    r MATCH DROPBOX:reply
       done OF l CLIENT DROPBOX:ENTRY {: m :}
          m DROPBOX-ENTRY:KIND @ DROPBOX-KIND:FILE DROPBOX-KIND:EQ
@@ -1254,14 +1258,14 @@ private
 \ One mutation's reply: done answers `applied`; a conflict or an
 \ unverified answer reads the path back once.
 : ANSWERED
-   ( DROPBOX:reply ^link ^u8 n expectation ^ARENA:arena
+   ( DROPBOX:reply ^link str expectation ^ARENA:arena
      [ -- mutation-outcome ] -- mutation-outcome )
-   {: r:DROPBOX:reply l t:^ tu:n x ar applied :}
+   {: r:DROPBOX:reply l t:str x ar applied :}
    r MATCH DROPBOX:reply
       done OF applied execute ENDOF
       refused OF {: e:DROPBOX:error :}
          e READ-BACK?
-         if l t tu x ar STATE else e l REJECTED then
+         if l t x ar STATE else e l REJECTED then
       ENDOF
       retry OF drop r l STOP-PASS ENDOF
       unlinked OF r l STOP-PASS ENDOF
@@ -1272,8 +1276,8 @@ private
 
 : MAKE-FOLDER ( str ^link ^ARENA:arena -- mutation-outcome )
    {: t:str l ar :}
-   t str> l CLIENT DROPBOX:CREATE-FOLDER
-   l t str> EXPECTATION-CREATE-FOLDER ar
+   t l CLIENT DROPBOX:CREATE-FOLDER
+   l t EXPECTATION-CREATE-FOLDER ar
    [: FOLDER APPLIED ;] ANSWERED ;
 
 : REMOTE-CREATE-FOLDER
@@ -1283,8 +1287,8 @@ private
 
 : UNLINK ( str ^link DROPBOX:rev ^ARENA:arena -- mutation-outcome )
    {: t:str l rev:DROPBOX:rev ar :}
-   t str> rev DROPBOX:REV>STR str> l CLIENT DROPBOX:DELETE
-   l t str> rev EXPECTATION-DELETE-FILE ar ['] GONE ANSWERED ;
+   t rev DROPBOX:REV>STR l CLIENT DROPBOX:DELETE
+   l t rev EXPECTATION-DELETE-FILE ar ['] GONE ANSWERED ;
 
 : REMOTE-DELETE-FILE
    ( ^link MODEL:path DROPBOX:rev ^ARENA:arena -- mutation-outcome )
@@ -1304,7 +1308,7 @@ private
    code 0= if FS:STAT-SIZE@ exit then
    code E-FS-STAT <> if code throw then
    s" read upload stage metadata"
-   s SENDING-PATH @ MODEL:PATH>STR str> LOCAL:IO-FAILURE ;
+   s SENDING-PATH @ MODEL:PATH>STR LOCAL:IO-FAILURE ;
 
 \ Rust's validate_upload_size.
 : OVERSIZE? ( n -- bool ) UPLOAD-MAX > ;
@@ -1365,7 +1369,7 @@ private
 
 : SEND ( ^sending -- mutation-outcome )
    {: s :}
-   s PUT s SENDING-LINK @ s SENDING-TARGET @ str> s EXPECTED
+   s PUT s SENDING-LINK @ s SENDING-TARGET @ s EXPECTED
    s SENDING-ARENA @ [: s UPLOADED ;] ANSWERED ;
 
 \ A stage Dropbox cannot take is rejected before any call.
@@ -1415,7 +1419,7 @@ private
    LOG:TEXT+
    s"  its listing; restore it from Dropbox's deleted files if it"
    LOG:TEXT+
-   s"  is wanted path=" LOG:TEXT+ path MODEL:PATH>STR str> LOG:TEXT+
+   s"  is wanted path=" LOG:TEXT+ path MODEL:PATH>STR LOG:TEXT+
    s"  revision=" LOG:TEXT+ e DROPBOX-ENTRY:REV @ SPAN:$ LOG:TEXT+
    LOG:;LINE ;
 
@@ -1423,8 +1427,8 @@ private
 : EMPTIED
    ( str ^link MODEL:path ^ARENA:arena -- mutation-outcome )
    {: t:str l path ar :}
-   t str> s" " l CLIENT DROPBOX:DELETE
-   l t str> EXPECTATION-DELETE-FOLDER ar
+   t s" " l CLIENT DROPBOX:DELETE
+   l t EXPECTATION-DELETE-FOLDER ar
    [: l path REPLACED GONE ;] ANSWERED ;
 
 : PROBE-REFUSED
@@ -1432,7 +1436,7 @@ private
    {: e:DROPBOX:error t:str l ar :}
    e DROPBOX-ERROR:NOT-FOUND IS? if GONE exit then
    e DROPBOX-ERROR:NOT-FOLDER IS? if
-      l t str> EXPECTATION-DELETE-FOLDER ar STATE exit
+      l t EXPECTATION-DELETE-FOLDER ar STATE exit
    then
    e DROPBOX-ERROR:RESET IS? if PENDING exit then
    e l REJECTED ;
@@ -1451,7 +1455,7 @@ private
 : CLEARED
    ( str ^link MODEL:path ^ARENA:arena -- mutation-outcome )
    {: t:str l path ar :}
-   t str> l CLIENT DROPBOX:PROBE {: r:DROPBOX:reply b:DROPBOX:probe :}
+   t l CLIENT DROPBOX:PROBE {: r:DROPBOX:reply b:DROPBOX:probe :}
    r MATCH DROPBOX:reply
       done OF b t l path ar PROBED ENDOF
       refused OF t l ar PROBE-REFUSED ENDOF
@@ -1500,10 +1504,10 @@ ARENA BRIDGES bridge
 : NO-STAGE ( -- option<LOCAL:stage-outcome<n>> ) OPTION:NONE ;
 
 \ The root's descriptor and path, and the target's text.
-: TARGET-AT ( ^bridge -- fd ^u8 n ^u8 n )
+: TARGET-AT ( ^bridge -- fd str str )
    {: x :}
-   x BRIDGE-ROOT @ x BRIDGE-ROOT-PATH @ str>
-   x BRIDGE-TARGET @ MODEL:PATH>STR str> ;
+   x BRIDGE-ROOT @ x BRIDGE-ROOT-PATH @
+   x BRIDGE-TARGET @ MODEL:PATH>STR ;
 
 : HELD? ( ^bridge -- bool )
    BRIDGE-PARTIAL @ MATCH option
@@ -1642,10 +1646,10 @@ ARENA BRIDGES bridge
    ;MATCH ;
 
 \ An unnamed file in the staging directory s, empty for none.
-: DISPOSABLE-FILE ( ^u8 n ^bridge -- option<LOCAL:stage-outcome<n>> )
-   {: s:^ su:n x :}
-   x HELD? su 0= or if NO-STAGE exit then
-   x TARGET-AT x BRIDGE-WANT @ s su x BRIDGE-ARENA @
+: DISPOSABLE-FILE ( str ^bridge -- option<LOCAL:stage-outcome<n>> )
+   {: s:str x :}
+   x HELD? s str> nip 0= or if NO-STAGE exit then
+   x TARGET-AT x BRIDGE-WANT @ s x BRIDGE-ARENA @
    LOCAL:PREPARE-DISPOSABLE-DOWNLOAD-AT x PREPARED ;
 
 : EXISTING-STAGE ( ^bridge -- option<LOCAL:stage-outcome<n>> )
@@ -1655,10 +1659,10 @@ ARENA BRIDGES bridge
    LOCAL:EXISTING-DOWNLOAD-STAGE-AT ;
 
 : PREPARE
-   ( option<LOCAL:download-slot-lease> ^u8 n ^bridge
+   ( option<LOCAL:download-slot-lease> str ^bridge
      -- option<LOCAL:stage-outcome<n>> )
-   {: lease s:^ su:n x :}
-   lease x LEASED-SLOT [: s su x DISPOSABLE-FILE ;] OR-ELSE
+   {: lease s:str x :}
+   lease x LEASED-SLOT [: s x DISPOSABLE-FILE ;] OR-ELSE
    [: x EXISTING-STAGE ;] OR-ELSE ;
 
 : RESUME-OFFSET ( ^bridge -- n )
@@ -1683,10 +1687,10 @@ ARENA BRIDGES bridge
    x BRIDGE-OUTCOME @ ;
 
 : STAGED-BY
-   ( MODEL:remote option<LOCAL:download-slot-lease> ^u8 n ^bridge
+   ( MODEL:remote option<LOCAL:download-slot-lease> str ^bridge
      -- LOCAL:stage-outcome<n> )
-   {: rem lease s:^ su:n x :}
-   lease s su x PREPARE MATCH option
+   {: rem lease s:str x :}
+   lease s x PREPARE MATCH option
       none OF rem x FETCHED ENDOF
       some OF ENDOF
    ;MATCH ;
@@ -1699,11 +1703,11 @@ ARENA BRIDGES bridge
    ;MATCH ;
 
 : NEW-BRIDGE
-   ( ^link fd ^u8 n MODEL:path MODEL:path DROPBOX:hash ^ARENA:arena
+   ( ^link fd str MODEL:path MODEL:path DROPBOX:hash ^ARENA:arena
      -- ^bridge )
-   {: k root:fd r:^ ru:n t p c ar :}
+   {: k root:fd r:str t p c ar :}
    ar BRIDGES-NEW {: x :}
-   k x BRIDGE-LINK ! root x BRIDGE-ROOT ! r ru >str x BRIDGE-ROOT-PATH !
+   k x BRIDGE-LINK ! root x BRIDGE-ROOT ! r x BRIDGE-ROOT-PATH !
    t x BRIDGE-TARGET ! p x BRIDGE-PATH ! c x BRIDGE-WANT !
    ar x BRIDGE-ARENA ! NO-PARTIAL x BRIDGE-PARTIAL !
    x ;
@@ -1711,13 +1715,13 @@ ARENA BRIDGES bridge
 \ Rust's stage_exact_download_for_access_at: target t's stage, its
 \ transfer shown as p; s is the staging directory, empty for none.
 : STAGE-EXACT-DOWNLOAD-FOR-AT
-   ( ^link fd ^u8 n MODEL:path MODEL:path MODEL:remote
-     option<LOCAL:download-slot-lease> ^u8 n ^ARENA:arena
+   ( ^link fd str MODEL:path MODEL:path MODEL:remote
+     option<LOCAL:download-slot-lease> str ^ARENA:arena
      -- LOCAL:stage-outcome<n> )
-   {: k root:fd r:^ ru:n t p rem lease s:^ su:n ar :}
+   {: k root:fd r:str t p rem lease s:str ar :}
    rem MODEL-REMOTE:UNMAKE {: c v :}
-   k root r ru t p c ar NEW-BRIDGE {: x :}
-   [: rem lease s su x STAGED-BY ;] [: x RELEASED x FETCH-FINISHED ;]
+   k root r t p c ar NEW-BRIDGE {: x :}
+   [: rem lease s x STAGED-BY ;] [: x RELEASED x FETCH-FINISHED ;]
    finally ;
 
 public
@@ -1725,11 +1729,11 @@ public
 \ Rust's stage_worker_download_at: path's stage below root path r,
 \ through the lease's slot, else an unnamed file in s.
 : STAGE-EXACT-DOWNLOAD-AT
-   ( ^link fd ^u8 n MODEL:path MODEL:remote
-     option<LOCAL:download-slot-lease> ^u8 n ^ARENA:arena
+   ( ^link fd str MODEL:path MODEL:remote
+     option<LOCAL:download-slot-lease> str ^ARENA:arena
      -- LOCAL:stage-outcome<n> )
-   {: k root:fd r:^ ru:n path rem lease s:^ su:n ar :}
-   k root r ru path path rem lease s su ar
+   {: k root:fd r:str path rem lease s:str ar :}
+   k root r path path rem lease s ar
    STAGE-EXACT-DOWNLOAD-FOR-AT ;
 
 \ ---- remote conflict copies ------------------------------------------
@@ -1783,38 +1787,38 @@ private
 
 \ Installs t's verified stage of c; nothing at t is replaced.
 : INSTALLED-COPY
-   ( fd ^u8 n MODEL:path DROPBOX:hash ^ARENA:arena
+   ( fd str MODEL:path DROPBOX:hash ^ARENA:arena
      -- option<exact-copy-outcome> )
-   {: root:fd r:^ ru:n t c ar :}
-   root r ru t MODEL:PATH>STR str> c NO-CONTENT ar
+   {: root:fd r:str t c ar :}
+   root r t MODEL:PATH>STR c NO-CONTENT ar
    LOCAL:INSTALL-DOWNLOAD-AT INSTALL-ANSWER ;
 
 : STAGED-COPY
-   ( ^link fd ^u8 n MODEL:path MODEL:path MODEL:remote ^ARENA:arena
+   ( ^link fd str MODEL:path MODEL:path MODEL:remote ^ARENA:arena
      -- option<exact-copy-outcome> )
-   {: k root:fd r:^ ru:n t path rem ar :}
-   k root r ru t path rem NO-LEASE s" " ar
+   {: k root:fd r:str t path rem ar :}
+   k root r t path rem NO-LEASE s" " ar
    STAGE-EXACT-DOWNLOAD-FOR-AT STAGE-ANSWER ;
 
 : STAGED-THEN-INSTALLED
-   ( ^link fd ^u8 n MODEL:path MODEL:path MODEL:remote ^ARENA:arena
+   ( ^link fd str MODEL:path MODEL:path MODEL:remote ^ARENA:arena
      -- exact-copy-outcome )
-   {: k root:fd r:^ ru:n t path rem ar :}
+   {: k root:fd r:str t path rem ar :}
    rem MODEL-REMOTE:UNMAKE {: c v :}
-   k root r ru t path rem ar STAGED-COPY MATCH option
-      none OF root r ru t c ar INSTALLED-COPY path REQUIRED ENDOF
+   k root r t path rem ar STAGED-COPY MATCH option
+      none OF root r t c ar INSTALLED-COPY path REQUIRED ENDOF
       some OF ENDOF
    ;MATCH ;
 
 \ Rust's ensure_exact_copy_at: the remote's exact bytes at target t,
 \ staged when no verified stage is there, its transfer shown as path.
 : EXACT-COPY-AT
-   ( ^link fd ^u8 n MODEL:path MODEL:path MODEL:remote ^ARENA:arena
+   ( ^link fd str MODEL:path MODEL:path MODEL:remote ^ARENA:arena
      -- exact-copy-outcome )
-   {: k root:fd r:^ ru:n t path rem ar :}
+   {: k root:fd r:str t path rem ar :}
    rem MODEL-REMOTE:UNMAKE {: c v :}
-   root r ru t c ar INSTALLED-COPY MATCH option
-      none OF k root r ru t path rem ar STAGED-THEN-INSTALLED ENDOF
+   root r t c ar INSTALLED-COPY MATCH option
+      none OF k root r t path rem ar STAGED-THEN-INSTALLED ENDOF
       some OF ENDOF
    ;MATCH ;
 
@@ -1824,7 +1828,7 @@ private
    MATCH MODEL:blockage
       unsupported-file-size OF s" unsupported_file_size" LOG:TEXT+ ENDOF
       remote-rejected OF {: t:str :}
-         s" remote_rejected " LOG:TEXT+ t str> LOG:TEXT+
+         s" remote_rejected " LOG:TEXT+ t LOG:TEXT+
       ENDOF
       download-unavailable OF {: st :}
          s" download_unavailable " LOG:TEXT+ st LOG:INT+
@@ -1847,7 +1851,7 @@ public
    {: b path :}
    LOG:WARN s" replay" LOG:LINE
    s" exact download blocked for its path `" LOG:TEXT+
-   path MODEL:PATH>STR str> LOG:TEXT+ s" `: " LOG:TEXT+
+   path MODEL:PATH>STR LOG:TEXT+ s" `: " LOG:TEXT+
    b REASON+ LOG:;LINE ;
 
 private
@@ -1877,8 +1881,8 @@ private
    ( MODEL:path MODEL:remote ^ARENA:arena -- MODEL:path )
    {: path rem ar :}
    rem MODEL-REMOTE:UNMAKE {: c v :}
-   path MODEL:PATH>STR str> LOCAL-CONFLICT--SIDE:REMOTE c ar
-   LOCAL:CONFLICT-RELATIVE-PATH >str MODEL:>PATH ;
+   path MODEL:PATH>STR LOCAL-CONFLICT--SIDE:REMOTE c ar
+   LOCAL:CONFLICT-RELATIVE-PATH MODEL:>PATH ;
 
 : NAME-HELD? ( n n -- bool ) drop COPY-NAME-OCCUPIED? ;
 
@@ -1951,10 +1955,10 @@ public
 \ Rust's materialize_remote_copy_at: the remote's bytes at t, shown as path,
 \ never over a file; blocked by any failure DOWNLOAD-BLOCKAGE classifies.
 : MATERIALIZE-REMOTE-COPY-AT
-   ( ^link fd ^u8 n MODEL:path MODEL:path MODEL:remote ^ARENA:arena
+   ( ^link fd str MODEL:path MODEL:path MODEL:remote ^ARENA:arena
      -- exact-copy-outcome )
-   {: k root:fd r:^ ru:n t path rem ar :}
-   EXACT-READY [: DROP-EXACT k root r ru t path rem ar
+   {: k root:fd r:str t path rem ar :}
+   EXACT-READY [: DROP-EXACT k root r t path rem ar
       EXACT-COPY-AT ;] catch {: code:n :}
    code 0= if exit then
    drop code k DOWNLOAD-BLOCKAGE MATCH option
@@ -1965,11 +1969,11 @@ public
 \ Rust's materialize_remote_conflict_at, below the open root at path r;
 \ an occupied name or a blocked download blocks it.
 : MATERIALIZE-REMOTE-CONFLICT-AT
-   ( ^link fd ^u8 n MODEL:path MODEL:remote ^ARENA:arena
+   ( ^link fd str MODEL:path MODEL:remote ^ARENA:arena
      -- copy-outcome )
-   {: k root:fd r:^ ru:n path rem ar :}
+   {: k root:fd r:str path rem ar :}
    path rem ar REMOTE-COPY-PATH {: copy :}
-   COPY-OCCUPIED [: DROP-COPY [: k root r ru copy path rem ar
+   COPY-OCCUPIED [: DROP-COPY [: k root r copy path rem ar
          MATERIALIZE-REMOTE-COPY-AT path >CONFLICT-OUTCOME ;]
       ['] NAME-HELD? LOCAL:WITH-CONVERTS ;] catch {: code:n :}
    code 0= if exit then
@@ -1984,7 +1988,7 @@ private
 \ ---- blocks
 
 \ Rust's mutation_rejection_tag.
-: REJECTION-TAG ( mutation-rejection -- ^u8 n )
+: REJECTION-TAG ( mutation-rejection -- str )
    MATCH mutation-rejection
       unsupported-file-size OF s" unsupported_file_size" ENDOF
       invalid-path OF s" invalid_path" ENDOF
@@ -2038,7 +2042,7 @@ private
    ;MATCH ;
 
 : REMOTE-REJECTED ( mutation-rejection -- MODEL:blockage )
-   REJECTION-TAG >str MODEL-BLOCKAGE:REMOTE-REJECTED ;
+   REJECTION-TAG MODEL-BLOCKAGE:REMOTE-REJECTED ;
 
 : REJECTED-BLOCKAGE ( mutation-rejection -- MODEL:blockage )
    {: why :}
@@ -2096,7 +2100,7 @@ private
 : SOURCE-CHANGED? ( n n -- bool ) drop LOCAL:E-SOURCE-CHANGED = ;
 
 : NO-UPLOAD-STAGE ( -- LOCAL:stage-outcome<^LOCAL:staged-upload> )
-   s" " >str LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED ;
+   s" " LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED ;
 : DROP-STAGE ( LOCAL:stage-outcome<^LOCAL:staged-upload> -- ) drop ;
 
 \ The run's target staged for upload as want and 0, or NO-UPLOAD-STAGE
@@ -2105,7 +2109,7 @@ private
    ( DROPBOX:hash ^pass -- LOCAL:stage-outcome<^LOCAL:staged-upload> n )
    {: want r :}
    NO-UPLOAD-STAGE [: DROP-STAGE [: r PASS-ROOT @ r RUN-TARGET
-         r PASS-STAGING @ str> want r PASS-ARENA @ LOCAL:STAGE-UPLOAD-AT ;]
+         r PASS-STAGING @ want r PASS-ARENA @ LOCAL:STAGE-UPLOAD-AT ;]
       ['] SOURCE-CHANGED? LOCAL:WITH-CONVERTS ;] catch {: code:n :}
    code 0<> if drop NO-UPLOAD-STAGE then code ;
 
@@ -2276,9 +2280,9 @@ ENUM file-mutation add replace ;ENUM
    PLACED ;
 
 \ Dropbox's answer contradicts the run's journaled state.
-: CONTRADICTED ( ^u8 n ^pass -- )
-   {: t:^ tu:n r :}
-   r RUN-PATH t tu INVALID ;
+: CONTRADICTED ( str ^pass -- )
+   {: t:str r :}
+   r RUN-PATH t INVALID ;
 
 : REMOTE-GONE
    ( ^LOCAL:staged-upload file-mutation ^pass -- apply-event )
@@ -2466,7 +2470,7 @@ ENUM file-mutation add replace ;ENUM
 \ The folder at the run's target's first n bytes.
 : PARENT ( ^pass n -- apply-event )
    {: r n:n :}
-   r RUN-TARGET drop n >str MODEL:>PATH {: dir :}
+   r RUN-TARGET str> drop n >str MODEL:>PATH {: dir :}
    r PASS-LINK @ dir r PASS-ARENA @ REMOTE-CREATE-FOLDER
    r PARENT-MADE ;
 
@@ -2481,7 +2485,7 @@ ENUM file-mutation add replace ;ENUM
 : ENSURE-REMOTE-PARENTS
    ( ^pass [ -- apply-event ] -- apply-event )
    {: r next :}
-   r RUN-TARGET {: p:^ u:n :}
+   r RUN-TARGET str> {: p:^ u:n :}
    u 0 ?do
       p i + c@ SLASH = if
          r i PARENT dup STOPS? if unloop exit then drop
@@ -2492,7 +2496,7 @@ ENUM file-mutation add replace ;ENUM
 
 \ ---- operations
 
-: NO-REV ( -- DROPBOX:rev ) s" " >str DROPBOX:>REV ;
+: NO-REV ( -- DROPBOX:rev ) s" " DROPBOX:>REV ;
 
 : FOLDER-CREATE ( ^pass -- apply-event )
    {: r :}
@@ -2611,11 +2615,11 @@ public
 \ Replays the pending plans' Dropbox operations below root path r,
 \ staging uploads in s; each completion is written as it happens.
 : REPLAY-REMOTE-OPERATIONS-AT
-   ( JOURNAL:journal ^link fd ^u8 n ^u8 n ^ARENA:arena
+   ( JOURNAL:journal ^link fd str str ^ARENA:arena
      -- ^replay-report )
-   {: j l root:fd r:^ ru:n s:^ su:n ar :}
-   j root r ru ar NEW-PASS {: run :}
-   l run PASS-LINK ! s su >str run PASS-STAGING !
+   {: j l root:fd r:str s:str ar :}
+   j root r ar NEW-PASS {: run :}
+   l run PASS-LINK ! s run PASS-STAGING !
    j ar JOURNAL:PENDING-PLANS {: plans :}
    plans VEC:COUNT 0 ?do
       plans i VEC:AT @ run REPLAY-REMOTE-PLAN

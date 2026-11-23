@@ -72,7 +72,7 @@ package LOCAL
 private
 
 \ The variant's name; a verified stage's descriptor is closed.
-: DOWNLOAD-STAGE$ ( download-stage -- ^u8 n )
+: DOWNLOAD-STAGE$ ( download-stage -- str )
    MATCH download-stage
       missing OF s" missing" ENDOF
       verified OF VERIFIED-DOWNLOAD-STAGE-UNMAKE
@@ -82,10 +82,10 @@ private
    ;MATCH ;
 
 : INSPECTED$
-   ( fd ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- ^u8 n )
+   ( fd str str str DROPBOX:hash ^ARENA:arena -- str )
    INSPECT-DOWNLOAD-STAGE DOWNLOAD-STAGE$ ;
 
-: MARKER$ ( fd ^u8 n ^u8 n -- ^u8 n )
+: MARKER$ ( fd str str -- str )
    READ-DOWNLOAD-MARKER MATCH download-marker
       missing OF s" missing" ENDOF
       expected OF s" expected" ENDOF
@@ -94,17 +94,17 @@ private
 
 \ WRITE-VERIFIED-STAGE's result as its caller sees it, the stage 0.
 : WRITE-STAGE-OUTCOME
-   ( fd ^u8 n ^u8 n DROPBOX:hash [ ^u8 n -- n ] option<str> ^u8 n
+   ( fd str str DROPBOX:hash [ ^u8 n -- n ] option<str> str
      ^ARENA:arena -- stage-outcome<n> )
    WRITE-VERIFIED-STAGE [: 0 ;] MAP-STAGE-WRITE ;
 
 \ OPEN-PARENT's answer apart: its descriptor, name, parent path and true;
 \ for none, -1, empty spans and false.
-: PARENT-OF ( fd ^u8 n bool -- fd ^u8 n ^u8 n bool )
+: PARENT-OF ( fd str bool -- fd str str bool )
    OPEN-PARENT MATCH option
       none OF -1 >FD s" " s" " false ENDOF
       some OF PARENT-DIR-UNMAKE {: f:fd name:str path:str :}
-         f name str> path str> true
+         f name path true
       ENDOF
    ;MATCH ;
 
@@ -125,7 +125,7 @@ private
    ;MATCH ;
 
 \ The slot's state apart: its binding, its offset and true.
-: SLOT-STATE-OF ( fd ^u8 n -- binding n bool )
+: SLOT-STATE-OF ( fd str -- binding n bool )
    READ-DOWNLOAD-SLOT-STATE STATE-APART ;
 
 \ The state encoded and decoded again, apart.
@@ -135,7 +135,7 @@ private
 
 \ The slot state's bytes for the binding at offset, valid until the
 \ next encode.
-: STATE-BYTES ( binding n -- ^u8 n )
+: STATE-BYTES ( binding n -- str )
    DOWNLOAD-SLOT-STATE-MAKE ENCODE-DOWNLOAD-SLOT-STATE ;
 
 32 BUFFER: FILLED
@@ -148,7 +148,7 @@ private
 
 \ The slot opened for writing and true; for a missing or occupied one,
 \ -1 and false.
-: OPENED-SLOT ( fd ^u8 n ^u8 n -- fd bool )
+: OPENED-SLOT ( fd str str -- fd bool )
    OPEN-DOWNLOAD-SLOT MATCH download-slot-open
       missing OF -1 >FD false ENDOF
       file OF true ENDOF
@@ -185,7 +185,7 @@ private
    x DOWNLOAD-PARTIAL-LOCATION {: loc :}
    loc SOURCE@ MATCH download-source
       resumable OF {: slots:fd name:str path:str b:binding :}
-         slots name str> loc TARGET-DIR@ loc STAGE-NAME@
+         slots name loc TARGET-DIR@ loc STAGE-NAME@
          FS:TRY-RENAME-NEW-AT
       ENDOF
       disposable OF {: p:str :} false ENDOF
@@ -214,13 +214,13 @@ private
    {: x ar:^ARENA:arena :}
    x PARTIAL-FILE x DOWNLOAD-PARTIAL-LOCATION ar COPY-COMPLETED-SLOT ;
 
-: PARTIAL-STAGE-PATH ( ^download-partial -- ^u8 n )
+: PARTIAL-STAGE-PATH ( ^download-partial -- str )
    DOWNLOAD-PARTIAL-LOCATION STAGE-PATH@ ;
 
 \ The name target t's stage of want takes.
-: STAGE-NAME ( ^u8 n DROPBOX:hash ^ARENA:arena -- ^u8 n )
-   {: t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
-   s" download" t tu want ar INTERNAL-NAME ;
+: STAGE-NAME ( str DROPBOX:hash ^ARENA:arena -- str )
+   {: t:str want:DROPBOX:hash ar:^ARENA:arena :}
+   s" download" t want ar INTERNAL-NAME ;
 
 : DROP-INSTALL-OUTCOME ( install-outcome -- ) drop ;
 
@@ -254,13 +254,13 @@ private
 \ RENAME-MUTATED on target t's install below the root fd at r, its
 \ parent opened as INSTALL-DOWNLOAD-AT opens it.
 : INSTALL-RENAME-MUTATED
-   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena fd -- )
-   {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena
+   ( fd str str DROPBOX:hash ^ARENA:arena fd -- )
+   {: root:fd r:str t:str want:DROPBOX:hash ar:^ARENA:arena
       w:fd :}
-   root t tu false OPEN-PARENT MATCH option
+   root t false OPEN-PARENT MATCH option
       none OF E-CHANGED throw ENDOF
       some OF PARENT-DIR-UNMAKE {: f:fd name:str rel:str :}
-         [: f name rel r ru t tu want ar INSTALL-OF w RENAME-MUTATED ;]
+         [: f name rel r t want ar INSTALL-OF w RENAME-MUTATED ;]
          [: f DISCARD ;] finally
       ENDOF
    ;MATCH ;
@@ -268,13 +268,13 @@ private
 \ PREPARE-REPLACEMENT-AT on target t below the root fd at r, its parent
 \ opened as INSTALL-DOWNLOAD-AT opens it.
 : PREPARE-BELOW
-   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- replacement-preparation )
-   {: root:fd r:^ ru:n t:^ tu:n c:DROPBOX:hash ar:^ARENA:arena :}
-   root t tu false OPEN-PARENT MATCH option
+   ( fd str str DROPBOX:hash ^ARENA:arena -- replacement-preparation )
+   {: root:fd r:str t:str c:DROPBOX:hash ar:^ARENA:arena :}
+   root t false OPEN-PARENT MATCH option
       none OF E-CHANGED throw ENDOF
       some OF PARENT-DIR-UNMAKE {: f:fd name:str rel:str :}
-         r ru rel str> ar JOIN {: dp:^ du:n :}
-         [: f dp du name str> t tu c ar PREPARE-REPLACEMENT-AT ;]
+         r rel ar JOIN {: dp:str :}
+         [: f dp name t c ar PREPARE-REPLACEMENT-AT ;]
          [: f DISCARD ;] finally
       ENDOF
    ;MATCH ;
@@ -282,12 +282,12 @@ private
 \ SYNC-RENAMED-DOWNLOAD of the file at t in dir, as a stage verified
 \ now, refuses it: it carries no marker.
 : RENAMED-WITHOUT-MARKER
-   ( fd fd ^u8 n DROPBOX:hash ^ARENA:arena -- )
-   {: f:fd dir:fd t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
-   f t tu s" inspect test download" STAT-FD t tu FILE-FINGERPRINT
+   ( fd fd str DROPBOX:hash ^ARENA:arena -- )
+   {: f:fd dir:fd t:str want:DROPBOX:hash ar:^ARENA:arena :}
+   f t s" inspect test download" STAT-FD t FILE-FINGERPRINT
    {: print:MODEL:fingerprint :}
    f print VERIFIED-DOWNLOAD-STAGE-MAKE {: s:verified-download-stage :}
-   [: s dir t tu t tu want ar SYNC-RENAMED-DOWNLOAD ;]
+   [: s dir t t want ar SYNC-RENAMED-DOWNLOAD ;]
    E-CHANGED TTHROWSQ ;
 
 public
@@ -350,23 +350,23 @@ FS:PATHZ-CAP BUFFER: ROOT-BUF
 variable ROOT-U
 FS:PATHZ-CAP BUFFER: JOINED
 
-: ROOT$ ( -- ^u8 n ) ROOT-BUF ROOT-U @ ;
+: ROOT$ ( -- str ) ROOT-BUF ROOT-U @ >str ;
 
 \ The name below the case's root, valid until the next AT.
-: AT ( ^u8 n -- ^u8 n )
-   {: p:^ u:n :}
-   ROOT$ p u JOINED FS:JOIN-PATH JOINED swap ;
+: AT ( str -- str )
+   {: p:str :}
+   ROOT$ p JOINED FS:JOIN-PATH JOINED swap >str ;
 
-: WRITE ( ^u8 n ^u8 n -- ) {: p:^ u:n b:^ bu:n :} p u AT b bu FS:WRITE-ALL ;
-: MKDIR ( ^u8 n -- ) AT FS:MAKE-DIR ;
-: REMOVE ( ^u8 n -- ) AT >str FS:REMOVE-FILE ;
-: DENY ( ^u8 n -- ) AT >str 0 FS:CHMOD-MODE ;
-: ALLOW ( ^u8 n -- ) AT >str MODE-0700 FS:CHMOD-MODE ;
+: WRITE ( str str -- ) {: p:str b:str :} p AT b FS:WRITE-ALL ;
+: MKDIR ( str -- ) AT FS:MAKE-DIR ;
+: REMOVE ( str -- ) AT FS:REMOVE-FILE ;
+: DENY ( str -- ) AT 0 FS:CHMOD-MODE ;
+: ALLOW ( str -- ) AT MODE-0700 FS:CHMOD-MODE ;
 
 \ A new directory under TMPDIR, its path copied to buf; the path's length.
-: TEMP-DIR ( ^u8 n ^u8 -- n )
-   {: pre:^ pu:n buf:^ :}
-   pre pu FS:MKTEMP-DIR {: p:^ u:n :}
+: TEMP-DIR ( str ^u8 -- n )
+   {: pre:str buf:^ :}
+   pre FS:MKTEMP-DIR str> {: p:^ u:n :}
    p buf u BYTE-COPY u ;
 
 \ Runs q in a new root under TMPDIR, which it then removes.
@@ -378,7 +378,7 @@ FS:PATHZ-CAP BUFFER: JOINED
 FS:PATHZ-CAP BUFFER: OUTSIDE-BUF
 variable OUTSIDE-U
 
-: OUTSIDE$ ( -- ^u8 n ) OUTSIDE-BUF OUTSIDE-U @ ;
+: OUTSIDE$ ( -- str ) OUTSIDE-BUF OUTSIDE-U @ >str ;
 
 \ Runs q beside a new directory under TMPDIR, outside the case's root,
 \ which it then removes.
@@ -389,7 +389,8 @@ variable OUTSIDE-U
 
 64 BUFFER: READ-BUF
 
-: CONTENT-OF ( ^u8 n -- ^u8 n ) AT READ-BUF 64 FS:READ-ALL READ-BUF swap ;
+: CONTENT-OF ( str -- str )
+   AT READ-BUF 64 FS:READ-ALL READ-BUF swap >str ;
 
 PROCESS-SYMBOLS
 FUNCTION: UTIMENSAT-CALL utimensat ( n ^u8 ^u8 n -- i32 ) ;FUNCTION
@@ -398,13 +399,13 @@ FUNCTION: READLINK-CALL readlink ( ^u8 ^u8 n -- n ) ;FUNCTION
 create TIMES 32 allot
 
 \ Rust's force_changed: access and modification one second past the epoch.
-: FORCE-CHANGED ( ^u8 n -- )
-   AT >str FS:>PATHZ {: z:^ :}
+: FORCE-CHANGED ( str -- )
+   AT FS:>PATHZ {: z:^ :}
    1 TIMES ! 0 TIMES 8 + ! 1 TIMES 16 + ! 0 TIMES 24 + !
    AT-FDCWD z TIMES 0 UTIMENSAT-CALL 0 T= ;
 
-: LINK-OF ( ^u8 n -- ^u8 n )
-   AT >str FS:>PATHZ READ-BUF 64 READLINK-CALL READ-BUF swap ;
+: LINK-OF ( str -- str )
+   AT FS:>PATHZ READ-BUF 64 READLINK-CALL READ-BUF swap >str ;
 
 FUNCTION: MKFIFO-CALL mkfifo ( ^u8 n -- i32 ) ;FUNCTION
 
@@ -413,9 +414,9 @@ FUNCTION: MKFIFO-CALL mkfifo ( ^u8 n -- i32 ) ;FUNCTION
 FS:PATHZ-CAP BUFFER: TARGET
 
 \ The name below the case's root, valid until the next TARGET-AT.
-: TARGET-AT ( ^u8 n -- ^u8 n )
-   {: p:^ u:n :}
-   ROOT$ p u TARGET FS:JOIN-PATH TARGET swap ;
+: TARGET-AT ( str -- str )
+   {: p:str :}
+   ROOT$ p TARGET FS:JOIN-PATH TARGET swap >str ;
 
 \ Root opens a file and searches a directory whatever its mode.
 : ROOT-USER? ( -- bool ) FS:EUID 0 = ;
@@ -424,15 +425,15 @@ FS:PATHZ-CAP BUFFER: LOG-AT
 
 \ stderr.txt below the case's root, apart from AT's buffer, which a
 \ captured action may reuse.
-: LOG-PATH ( -- ^u8 n )
-   ROOT$ s" stderr.txt" LOG-AT FS:JOIN-PATH LOG-AT swap ;
+: LOG-PATH ( -- str )
+   ROOT$ s" stderr.txt" LOG-AT FS:JOIN-PATH LOG-AT swap >str ;
 
 \ Runs q with fd 2 sent to LOG-PATH; what that file then holds, in AR,
 \ after which it is removed.
-: STDERR-OF ( [ -- ] -- ^u8 n )
-   LOG-PATH >str AR @ STDERR:CAPTURING str> {: code:n e:^ u:n :}
+: STDERR-OF ( [ -- ] -- str )
+   LOG-PATH AR @ STDERR:CAPTURING {: code:n e:str :}
    code 0<> if code throw then
-   e u ;
+   e ;
 
 \ ---- the case's journal
 
@@ -440,11 +441,11 @@ FS:PATHZ-CAP BUFFER: JOURNAL-BUF
 variable JOURNAL-U
 FS:PATHZ-CAP BUFFER: JOURNAL-FILE
 
-: JOURNAL-DIR$ ( -- ^u8 n ) JOURNAL-BUF JOURNAL-U @ ;
+: JOURNAL-DIR$ ( -- str ) JOURNAL-BUF JOURNAL-U @ >str ;
 
-: JOURNAL-PATH ( -- ^u8 n )
+: JOURNAL-PATH ( -- str )
    JOURNAL-DIR$ s" journal.sqlite3" JOURNAL-FILE FS:JOIN-PATH
-   JOURNAL-FILE swap ;
+   JOURNAL-FILE swap >str ;
 
 \ Runs q on the journal in JOURNAL-DIR$, then closes it.
 : OPENED-JOURNAL ( [ JOURNAL:journal -- ] -- )
@@ -477,7 +478,7 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
 
 \ ---- the scan's values
 
-: ZEROS ( -- ^u8 n )
+: ZEROS ( -- str )
    s" 0000000000000000000000000000000000000000000000000000000000000000" ;
 
 : NO-CUTOFF ( -- option<cutoff> ) OPTION:NONE ;
@@ -489,29 +490,29 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
    AR @ [type] MODEL:hash-record NEW-VEC ;
 
 : TEST-CACHE
-   ( ^u8 n MODEL:fingerprint ^u8 n -- ^VEC:vector<MODEL:hash-record> )
-   {: p:^ u:n f:MODEL:fingerprint c:^ cu:n :}
+   ( str MODEL:fingerprint str -- ^VEC:vector<MODEL:hash-record> )
+   {: p:str f:MODEL:fingerprint c:str :}
    NO-CACHE {: v :}
-   p u >str MODEL:>PATH f c cu >str DROPBOX:>HASH MODEL-HASH--RECORD:MAKE
+   p MODEL:>PATH f c DROPBOX:>HASH MODEL-HASH--RECORD:MAKE
    v VEC:PUSH !
    v ;
 
 \ Rust's fingerprint: the file's below the case's root.
-: FINGERPRINT-AT ( ^u8 n -- MODEL:fingerprint )
-   {: p:^ u:n :}
+: FINGERPRINT-AT ( str -- MODEL:fingerprint )
+   {: p:str :}
    ROOT$ s" open test scan root" OPEN-ROOT {: root:fd :}
-   root p u s" open test scan file" E-IO E-UNSUPPORTED
+   root p s" open test scan file" E-IO E-UNSUPPORTED
    OPEN-RELATIVE-REGULAR {: f:fd :}
-   f p u s" inspect test scan file" STAT-FD p u FILE-FINGERPRINT
+   f p s" inspect test scan file" STAT-FD p FILE-FINGERPRINT
    f DISCARD root DISCARD ;
 
 \ Rust's identity: the content hash of the bytes, read from a pipe.
-: IDENTITY ( ^u8 n -- ^u8 n )
-   {: p:^ u:n :}
+: IDENTITY ( str -- str )
+   {: p:str :}
    FD:PIPE {: r:fd w:fd :}
-   w p u FD:WRITE-FULL w DISCARD
+   w p FD:WRITE-FULL w DISCARD
    r AR @ DROPBOX-CONTENT-HASH r DISCARD
-   DROPBOX:HASH>STR str> ;
+   DROPBOX:HASH>STR ;
 
 : ROOT-CHANGED? ( scan-publication -- bool )
    MATCH scan-publication
@@ -613,30 +614,30 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
 
 \ The observation of the path, none where the inventory holds none.
 : FIND
-   ( ^VEC:vector<MODEL:local-record> ^u8 n
+   ( ^VEC:vector<MODEL:local-record> str
      -- option<MODEL:local-record> )
-   {: v p:^ u:n :}
+   {: v p:str :}
    v VEC:COUNT 0 ?do
       v i VEC:AT @ {: r:MODEL:local-record :}
-      r OBSERVATION-PATH p u STR= if r OPTION:SOME unloop exit then
+      r OBSERVATION-PATH p STR= if r OPTION:SOME unloop exit then
    loop OPTION:NONE ;
 
-: KIND-AT ( ^VEC:vector<MODEL:local-record> ^u8 n -- n )
+: KIND-AT ( ^VEC:vector<MODEL:local-record> str -- n )
    FIND MATCH option
       none OF MISSING ENDOF
       some OF RECORD-OBSERVATION KIND ENDOF
    ;MATCH ;
 
-: SEEN ( ^VEC:vector<MODEL:local-record> ^u8 n n -- )
-   {: s p:^ u:n want:n :}
-   s p u KIND-AT want T= ;
+: SEEN ( ^VEC:vector<MODEL:local-record> str n -- )
+   {: s p:str want:n :}
+   s p KIND-AT want T= ;
 
 \ Rust's scanned_content: a present file's content hash, else empty.
-: SCANNED-CONTENT ( ^VEC:vector<MODEL:local-record> ^u8 n -- ^u8 n )
+: SCANNED-CONTENT ( ^VEC:vector<MODEL:local-record> str -- str )
    FIND MATCH option
       none OF s" " ENDOF
       some OF RECORD-OBSERVATION MATCH MODEL:observation
-            present OF MODEL-LOCAL:UNMAKE DROPBOX:HASH>STR str> ENDOF
+            present OF MODEL-LOCAL:UNMAKE DROPBOX:HASH>STR ENDOF
             directory OF s" " ENDOF
             absent OF s" " ENDOF
             unknown OF {: why:MODEL:unknown-reason :} s" " ENDOF
@@ -649,8 +650,8 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
 : ORDERED ( ^VEC:vector<MODEL:local-record> -- )
    {: v :}
    true v VEC:COUNT 1 max 1 ?do
-      v i 1- VEC:AT @ OBSERVATION-PATH >str
-      v i VEC:AT @ OBSERVATION-PATH >str STR< and
+      v i 1- VEC:AT @ OBSERVATION-PATH
+      v i VEC:AT @ OBSERVATION-PATH STR< and
    loop TTRUE ;
 
 : RECORD-CONTENT ( MODEL:hash-record -- DROPBOX:hash )
@@ -666,15 +667,15 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
       b i VEC:AT @ {: y:MODEL:hash-record :}
       x RECORD-PATH y RECORD-PATH T$=
       x RECORD-FINGERPRINT y RECORD-FINGERPRINT SAME-FINGERPRINT? TTRUE
-      x RECORD-CONTENT DROPBOX:HASH>STR str>
-      y RECORD-CONTENT DROPBOX:HASH>STR str> T$=
+      x RECORD-CONTENT DROPBOX:HASH>STR
+      y RECORD-CONTENT DROPBOX:HASH>STR T$=
    loop ;
 
 \ Whether the hash records hold one at the path.
-: HOLDS? ( ^VEC:vector<MODEL:hash-record> ^u8 n -- bool )
-   {: v p:^ u:n :}
+: HOLDS? ( ^VEC:vector<MODEL:hash-record> str -- bool )
+   {: v p:str :}
    false v VEC:COUNT 0 ?do
-      v i VEC:AT @ RECORD-PATH p u STR= or
+      v i VEC:AT @ RECORD-PATH p STR= or
    loop ;
 
 \ ---- cases
@@ -739,11 +740,11 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
    E-CHANGED TTHROWSQ ;
 
 : ENUMERATE-SCAN-ACROSS-DEVICES
-   ( JOURNAL:scan ^u8 n ^ARENA:arena -- JOURNAL:scan pending-scan )
-   {: p:^ u:n ar:^ARENA:arena :}
-   p u ar KEEP {: root:str :}
-   p u s" open sync root for scan" OPEN-ABSOLUTE-DIRECTORY {: rfd:fd :}
-   rfd p u ROOT-STAT {: before:MODEL:stat :}
+   ( JOURNAL:scan str ^ARENA:arena -- JOURNAL:scan pending-scan )
+   {: p:str ar:^ARENA:arena :}
+   p ar KEEP {: root:str :}
+   p s" open sync root for scan" OPEN-ABSOLUTE-DIRECTORY {: rfd:fd :}
+   rfd p ROOT-STAT {: before:MODEL:stat :}
    root rfd before NO-CUTOFF before STAT-DEV 1 xor ar
    ENUMERATE-SCAN-ON-DEVICE ;
 
@@ -848,7 +849,7 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
 : ZEROED ( MODEL:hash-record -- MODEL:hash-record )
    MODEL-HASH--RECORD:UNMAKE
    {: p:MODEL:path f:MODEL:fingerprint c:DROPBOX:hash :}
-   p f ZEROS >str DROPBOX:>HASH MODEL-HASH--RECORD:MAKE ;
+   p f ZEROS DROPBOX:>HASH MODEL-HASH--RECORD:MAKE ;
 
 \ A stored row with a device and its JSON are JOURNAL's and MODEL's;
 \ here the hash the first scan published, its content replaced by one
@@ -874,7 +875,7 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
    s" .DS_Store" s" Finder metadata" WRITE
    s" ~$private" MKDIR
    s" ~$private/child.txt" s" private" WRITE
-   s" missing" >str s" .dropbox" AT >str FS:MAKE-SYMLINK ;
+   s" missing" s" .dropbox" AT FS:MAKE-SYMLINK ;
 
 : EXCLUDED-ENTRIES-ARE-NOT-OPENED-HASHED-OR-PUBLISHED ( -- )
    s" excluded_entries_are_not_opened_hashed_or_published" T-LABEL
@@ -894,7 +895,7 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
    s" kept.txt" s" kept" WRITE
    STABLE [: STABLE ;] CACHED-SCAN drop REUSABLE {: cache :}
    cache VEC:COUNT 1 T=
-   OUTSIDE$ >str s" unsupported-link" AT >str FS:MAKE-SYMLINK
+   OUTSIDE$ s" unsupported-link" AT FS:MAKE-SYMLINK
    STABLE [: STABLE ;] CACHED-SCAN {: s :}
    s s" unsupported-link" UNSUPPORTED-KIND SEEN
    s s" kept.txt" PRESENT SEEN
@@ -909,8 +910,8 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
 : SPECIAL-ENTRIES-ARE-PUBLISHED-AS-UNSUPPORTED ( -- )
    s" special_entries_are_published_as_unsupported" T-LABEL
    s" regular.txt" s" regular" WRITE
-   s" regular.txt" TARGET-AT >str s" link" AT >str FS:MAKE-SYMLINK
-   s" fifo" AT >str FS:>PATHZ MODE-0600 MKFIFO-CALL 0 T=
+   s" regular.txt" TARGET-AT s" link" AT FS:MAKE-SYMLINK
+   s" fifo" AT FS:>PATHZ MODE-0600 MKFIFO-CALL 0 T=
    s" socket" AT TEST-CLIENT:SOCKET-AT {: sock:fd :}
    [: ROOT-SCAN ;] [: sock DISCARD ;] finally {: s :}
    s s" fifo" UNSUPPORTED-KIND SEEN
@@ -959,7 +960,7 @@ variable CAUGHT
    s" closed" MKDIR
    s" closed/file.txt" s" inside" WRITE
    s" closed" AT s" open test parent" OPEN-ROOT {: parent:fd :}
-   s" closed" AT >str MODE-0600 FS:CHMOD-MODE
+   s" closed" AT MODE-0600 FS:CHMOD-MODE
    [: [: parent HASH-BELOW ;]
       [: FS:ERRNO CAUGHT ! s" closed" ALLOW ;] finally
    ;] E-IO TTHROWSQ
@@ -1001,19 +1002,19 @@ variable CAUGHT
    s s" stable.txt" PRESENT SEEN
    s PUBLISHED 2 T= ;
 
-: WRITE-OVER ( ^u8 n -- ) s" no longer a directory" WRITE ;
+: WRITE-OVER ( str -- ) s" no longer a directory" WRITE ;
 
-: LINK-OVER ( ^u8 n -- )
-   {: p:^ u:n :}
-   s" elsewhere" >str p u AT >str FS:MAKE-SYMLINK ;
+: LINK-OVER ( str -- )
+   {: p:str :}
+   s" elsewhere" p AT FS:MAKE-SYMLINK ;
 
 \ Replaces the enumerated "outer/swapped" with what put makes there.
 : SWAPPED-AFTER-ENUMERATION
-   ( JOURNAL:scan [ ^u8 n -- ] -- JOURNAL:scan )
+   ( JOURNAL:scan [ str -- ] -- JOURNAL:scan )
    {: put :}
    NO-CUTOFF ENUMERATE {: ps:pending-scan :}
    s" outer/swapped/inside.txt" REMOVE
-   s" outer/swapped" AT >str FS:REMOVE-DIR
+   s" outer/swapped" AT FS:REMOVE-DIR
    s" outer/swapped" put execute
    ps FINISH-SCAN ;
 
@@ -1021,7 +1022,7 @@ variable CAUGHT
 \ reopen fails ENOTDIR or ELOOP, which the scan owes that one path; the
 \ removal changed the parent, which carries the reason, so the whole
 \ subtree beneath it leaves the publication.
-: SWAPPED-SUBTREE-IS-INCOMPLETE ( [ ^u8 n -- ] -- )
+: SWAPPED-SUBTREE-IS-INCOMPLETE ( [ str -- ] -- )
    {: put :}
    s" outer" MKDIR s" outer/swapped" MKDIR
    s" outer/swapped/inside.txt" s" inside" WRITE
@@ -1077,8 +1078,8 @@ variable CAUGHT
    STABLE ENUMERATE {: ps:pending-scan :}
    JOURNAL:SCAN-COUNTS {: jobs:n cached:n :}
    jobs 0 T=
-   s" nested" >str JOURNAL:SCAN-DISCARD
-   s" nested" >str MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN
+   s" nested" JOURNAL:SCAN-DISCARD
+   s" nested" MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN
    ps [: STABLE ;] FINISH-SCAN-AT ;
 
 \ The second scan reuses the cache the first published, and publishes
@@ -1094,20 +1095,20 @@ variable CAUGHT
    s s" nested/kept.txt" MISSING SEEN
    RESCAN-REUSES ;
 
-: TEST-CONTENT ( -- ^u8 n )
+: TEST-CONTENT ( -- str )
    s" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ;
 
-: TEST-RECORD ( ^u8 n -- MODEL:hash-record )
-   {: p:^ u:n :}
-   p u >str MODEL:>PATH 2 5 3 0 3 0 MODEL-FINGERPRINT:MAKE
-   TEST-CONTENT >str DROPBOX:>HASH MODEL-HASH--RECORD:MAKE ;
+: TEST-RECORD ( str -- MODEL:hash-record )
+   {: p:str :}
+   p MODEL:>PATH 2 5 3 0 3 0 MODEL-FINGERPRINT:MAKE
+   TEST-CONTENT DROPBOX:>HASH MODEL-HASH--RECORD:MAKE ;
 
 \ TEST-RECORD's fingerprint and content as the cache stores them.
 : TEST-JSON ( -- str )
    s\" {\"fingerprint\":{\"inode\":2,\"size\":5,
       \"modified_seconds\":3,\"modified_nanoseconds\":0,
       \"changed_seconds\":3,\"changed_nanoseconds\":0},\"content\":
-      \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}" >str ;
+      \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}" ;
 
 : BEFORE-CACHED
    ( JOURNAL:scan MODEL:hash-record -- JOURNAL:scan bool )
@@ -1118,13 +1119,13 @@ variable CAUGHT
 \ leave with it.
 : TRUNCATED ( JOURNAL:scan -- JOURNAL:scan )
    s" before.txt" TEST-RECORD TEST-JSON JOURNAL:SCAN-REUSE
-   s" sub" >str MODEL:>PATH DIRECTORY-OBSERVATION MODEL-LOCAL--RECORD:MAKE
+   s" sub" MODEL:>PATH DIRECTORY-OBSERVATION MODEL-LOCAL--RECORD:MAKE
    JOURNAL:SCAN-OBSERVE
    s" sub/kept.txt" TEST-RECORD TEST-JSON JOURNAL:SCAN-REUSE
-   s" sub/fresh.txt" >str 2 5 3 0 3 0 MODEL-FINGERPRINT:MAKE
+   s" sub/fresh.txt" 2 5 3 0 3 0 MODEL-FINGERPRINT:MAKE
    JOURNAL:SCAN-JOB
-   s" sub" >str JOURNAL:SCAN-DISCARD
-   s" sub" >str MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN
+   s" sub" JOURNAL:SCAN-DISCARD
+   s" sub" MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN
    JOURNAL:SCAN-COUNTS {: jobs:n cached:n :}
    jobs 0 T= cached 1 T=
    [: BEFORE-CACHED ;] JOURNAL:EACH-SCAN-REUSE
@@ -1154,10 +1155,10 @@ variable RAISED-ERRNO
 
 \ The log holds lines lines: none for a failure its catcher converts, one
 \ for one it rethrows.
-: LOGGED ( ^u8 n n -- )
-   {: p:^ u:n lines:n :}
-   lines 0= if u 0 T= exit then
-   p u >str 10 COUNT-CHAR lines T= ;
+: LOGGED ( str n -- )
+   {: p:str lines:n :}
+   lines 0= if p str> nip 0 T= exit then
+   p 10 COUNT-CHAR lines T= ;
 
 \ What q throws under the scan's predicate, LOCAL's log of it holding
 \ lines lines; FS:ERRNO is q's again after the log's file calls.
@@ -1215,36 +1216,36 @@ variable RAISED-ERRNO
 192 constant MODE-0300
 
 \ SB holds the clause of kind k for the name p, through its mode's label.
-: CLAUSE ( ^u8 n ^u8 n -- )
-   {: k:^ ku:n p:^ pu:n :}
-   SB-RESET k ku SB-APPEND s"  `" SB-APPEND p pu SB-APPEND
+: CLAUSE ( str str -- )
+   {: k:str p:str :}
+   SB-RESET k SB-APPEND s"  `" SB-APPEND p SB-APPEND
    s" ` mode " SB-APPEND ;
 
-: DIRECTORY? ( ^u8 n ^u8 n -- bool )
-   {: e:^ u:n p:^ pu:n :}
-   s" ; directory" p pu CLAUSE e u SB$ CONTAINS? ;
+: DIRECTORY? ( str str -- bool )
+   {: e:str p:str :}
+   s" ; directory" p CLAUSE e SB$ CONTAINS? ;
 
 \ Where the directory clause for the name p starts in the log, -1 when
 \ it holds none.
-: CLAUSE-AT ( ^u8 n ^u8 n -- n )
-   {: e:^ u:n p:^ pu:n :}
-   s" ; directory" p pu CLAUSE e u SB$ FIND-SUB MATCH option
+: CLAUSE-AT ( str str -- n )
+   {: e:str p:str :}
+   s" ; directory" p CLAUSE e SB$ FIND-SUB MATCH option
       none OF -1 ENDOF
       some OF IDX>N ENDOF
    ;MATCH ;
 
 \ Whether the log holds the clause, the mode m, and Omabox's uid as owner.
-: OWNED? ( ^u8 n ^u8 n ^u8 n ^u8 n -- bool )
-   {: e:^ u:n k:^ ku:n p:^ pu:n m:^ mu:n :}
-   k ku p pu CLAUSE m mu SB-APPEND
+: OWNED? ( str str str str -- bool )
+   {: e:str k:str p:str m:str :}
+   k p CLAUSE m SB-APPEND
    s"  owner uid " SB-APPEND FS:EUID FMT:INT$ SB-APPEND
-   e u SB$ CONTAINS? ;
+   e SB$ CONTAINS? ;
 
-: RUNS-AS? ( ^u8 n -- bool )
-   {: e:^ u:n :}
+: RUNS-AS? ( str -- bool )
+   {: e:str :}
    SB-RESET s" ; Omabox runs as uid " SB-APPEND
    FS:EUID FMT:INT$ SB-APPEND 10 SB-APPEND-C
-   e u SB$ CONTAINS? ;
+   e SB$ CONTAINS? ;
 
 \ EPERM raised against a file: the one line gives the facts of the file
 \ and of its directory, and FS:ERRNO keeps EPERM.
@@ -1252,19 +1253,19 @@ variable RAISED-ERRNO
    s" denied_write_gives_its_directory_and_entry" T-LABEL
    ROOT-USER? if exit then
    s" denied" MKDIR s" denied/file.txt" s" held" WRITE
-   s" denied/file.txt" AT >str MODE-0640 FS:CHMOD-MODE
-   s" denied" AT >str MODE-0750 FS:CHMOD-MODE
+   s" denied/file.txt" AT MODE-0640 FS:CHMOD-MODE
+   s" denied" AT MODE-0750 FS:CHMOD-MODE
    s" denied" AT FS:OPEN-DIR {: dir:fd :}
    [: [: FS:EPERM FS:CAUSE! dir s" file.txt" s" write test file"
          s" denied/file.txt" IO-FAILURE-AT ;] E-IO TTHROWSQ
-      FS:ERRNO CAUGHT ! ;] STDERR-OF {: e:^ u:n :}
+      FS:ERRNO CAUGHT ! ;] STDERR-OF {: e:str :}
    dir DISCARD
    CAUGHT @ FS:EPERM T=
-   e u 1 LOGGED
-   e u s" : Operation not permitted;" CONTAINS? TTRUE
-   e u s" ; directory" s" denied" AT s" 0750" OWNED? TTRUE
-   e u s" ; entry" s" file.txt" s" 0640" OWNED? TTRUE
-   e u RUNS-AS? TTRUE ;
+   e 1 LOGGED
+   e s" : Operation not permitted;" CONTAINS? TTRUE
+   e s" ; directory" s" denied" AT s" 0750" OWNED? TTRUE
+   e s" ; entry" s" file.txt" s" 0640" OWNED? TTRUE
+   e RUNS-AS? TTRUE ;
 
 : RENAME-DENIED ( fd fd -- )
    {: from:fd to:fd :}
@@ -1279,16 +1280,16 @@ variable RAISED-ERRNO
    s" from" AT FS:OPEN-DIR {: from:fd :}
    s" to" AT FS:OPEN-DIR {: to:fd :}
    [: [: from to RENAME-DENIED ;] E-IO TTHROWSQ
-      FS:ERRNO CAUGHT ! ;] STDERR-OF {: e:^ u:n :}
+      FS:ERRNO CAUGHT ! ;] STDERR-OF {: e:str :}
    from DISCARD to DISCARD
    CAUGHT @ FS:EACCES T=
-   e u 1 LOGGED
-   e u s" : Permission denied;" CONTAINS? TTRUE
-   e u s" from" AT DIRECTORY? TTRUE
-   e u s" to" AT DIRECTORY? TTRUE
-   s" ; entry" s" file.txt" CLAUSE e u SB$ CONTAINS? TTRUE
-   e u s" from" AT CLAUSE-AT e u s" to" AT CLAUSE-AT < TTRUE
-   e u RUNS-AS? TTRUE ;
+   e 1 LOGGED
+   e s" : Permission denied;" CONTAINS? TTRUE
+   e s" from" AT DIRECTORY? TTRUE
+   e s" to" AT DIRECTORY? TTRUE
+   s" ; entry" s" file.txt" CLAUSE e SB$ CONTAINS? TTRUE
+   e s" from" AT CLAUSE-AT e s" to" AT CLAUSE-AT < TTRUE
+   e RUNS-AS? TTRUE ;
 
 \ The descriptor closes inside the capture, so no open there takes its
 \ number: statx logs its own line, then LOCAL's has no path or facts.
@@ -1299,14 +1300,14 @@ variable RAISED-ERRNO
    s" closed" AT FS:OPEN-DIR {: dir:fd :}
    [: [: dir DISCARD FS:EACCES FS:CAUSE! dir s" file.txt"
          s" write test file" s" closed/file.txt" IO-FAILURE-AT ;]
-      E-IO TTHROWSQ FS:ERRNO CAUGHT ! ;] STDERR-OF {: e:^ u:n :}
+      E-IO TTHROWSQ FS:ERRNO CAUGHT ! ;] STDERR-OF {: e:str :}
    CAUGHT @ FS:EACCES T=
-   e u 2 LOGGED
-   e u 10 0 SPLIT-NEXT {: a:^ au:n next:n ok:bool :}
-   a au s" fs-statx: " CONTAINS? TTRUE
-   e u 10 next SPLIT-NEXT {: b:^ bu:n end:n more:bool :}
-   b bu s" local: " CONTAINS? TTRUE
-   b bu s" : Permission denied; directory; Omabox runs as uid "
+   e 2 LOGGED
+   e 10 0 SPLIT-NEXT {: a:str next:n ok:bool :}
+   a s" fs-statx: " CONTAINS? TTRUE
+   e 10 next SPLIT-NEXT {: b:str end:n more:bool :}
+   b s" local: " CONTAINS? TTRUE
+   b s" : Permission denied; directory; Omabox runs as uid "
    CONTAINS? TTRUE ;
 
 \ The errno is read before ro is writable again.
@@ -1314,17 +1315,17 @@ variable RAISED-ERRNO
    s" create_directory_denied_gives_its_directory" T-LABEL
    ROOT-USER? if exit then
    s" root" MKDIR s" root/ro" MKDIR
-   s" root/ro" AT >str MODE-0500 FS:CHMOD-MODE
+   s" root/ro" AT MODE-0500 FS:CHMOD-MODE
    s" root" AT FS:OPEN-DIR {: root:fd :}
    [: [: [: root s" ro/new" CREATE-DIRECTORY-AT drop ;]
          [: FS:ERRNO CAUGHT ! s" root/ro" ALLOW ;] finally
-      ;] E-IO TTHROWSQ ;] STDERR-OF {: e:^ u:n :}
+      ;] E-IO TTHROWSQ ;] STDERR-OF {: e:str :}
    root DISCARD
    CAUGHT @ FS:EACCES T=
-   e u 1 LOGGED
-   e u s" ; directory" s" root/ro" AT s" 0500" OWNED? TTRUE
-   e u s" ; entry" CONTAINS? TFALSE
-   e u RUNS-AS? TTRUE ;
+   e 1 LOGGED
+   e s" ; directory" s" root/ro" AT s" 0500" OWNED? TTRUE
+   e s" ; entry" CONTAINS? TFALSE
+   e RUNS-AS? TTRUE ;
 
 \ held exists but cannot be opened to read; root's mode is set, not left
 \ to the umask, and the errno is read before held is readable again.
@@ -1332,18 +1333,18 @@ variable RAISED-ERRNO
    s" existing_directory_denied_gives_its_entry" T-LABEL
    ROOT-USER? if exit then
    s" root" MKDIR s" root/held" MKDIR
-   s" root" AT >str MODE-0700 FS:CHMOD-MODE
-   s" root/held" AT >str MODE-0300 FS:CHMOD-MODE
+   s" root" AT MODE-0700 FS:CHMOD-MODE
+   s" root/held" AT MODE-0300 FS:CHMOD-MODE
    s" root" AT FS:OPEN-DIR {: root:fd :}
    [: [: [: root s" held" CREATE-DIRECTORY-AT drop ;]
          [: FS:ERRNO CAUGHT ! s" root/held" ALLOW ;] finally
-      ;] E-IO TTHROWSQ ;] STDERR-OF {: e:^ u:n :}
+      ;] E-IO TTHROWSQ ;] STDERR-OF {: e:str :}
    root DISCARD
    CAUGHT @ FS:EACCES T=
-   e u 1 LOGGED
-   e u s" ; directory" s" root" AT s" 0700" OWNED? TTRUE
-   e u s" ; entry" s" held" s" 0300" OWNED? TTRUE
-   e u RUNS-AS? TTRUE ;
+   e 1 LOGGED
+   e s" ; directory" s" root" AT s" 0700" OWNED? TTRUE
+   e s" ; entry" s" held" s" 0300" OWNED? TTRUE
+   e RUNS-AS? TTRUE ;
 
 \ A denial the scan converts into an entry's outcome logs no line.
 : CONVERTED-DENIAL-LOGS-NOTHING ( -- )
@@ -1360,24 +1361,24 @@ variable RAISED-ERRNO
    s" attributes_are_labelled" T-LABEL
    [: LOG-OPEN MODE-0640 0 FS-STATX:IMMUTABLE FS-STATX:APPEND or
       FACTS-MAKE OPTION:SOME FACTS+ LOG:;LINE ;] STDERR-OF
-   {: e:^ u:n :}
-   e u s"  mode 0640 owner uid 0 immutable append-only" CONTAINS? TTRUE ;
+   {: e:str :}
+   e s"  mode 0640 owner uid 0 immutable append-only" CONTAINS? TTRUE ;
 
 \ ---- publication
 
-: STAND-IN$ ( -- ^u8 n ) s" /sys/class/mem" ;
+: STAND-IN$ ( -- str ) s" /sys/class/mem" ;
 
 \ Activates the directory at the name below the case's root.
-: ACTIVATE ( JOURNAL:journal ^u8 n -- )
-   {: j p:^ u:n :}
-   p u AT AR @ KEEP JOURNAL:INSPECT {: b :}
+: ACTIVATE ( JOURNAL:journal str -- )
+   {: j p:str :}
+   p AT AR @ KEEP JOURNAL:INSPECT {: b :}
    j b AR @ JOURNAL:ACTIVATE-LOCAL-ROOT drop ;
 
 : NO-SUBVOLUME ( -- option<n> ) OPTION:NONE ;
 
 \ The root /sys/class/mem stands in for.
 : STAND-IN-ROOT ( -- JOURNAL:local-root-binding )
-   STAND-IN$ >str 1
+   STAND-IN$ 1
    1700000000 5 JOURNAL-BIRTH--TIME:MAKE OPTION:SOME NO-SUBVOLUME
    JOURNAL-LOCAL--ROOT--BINDING:MAKE ;
 
@@ -1388,7 +1389,7 @@ variable RAISED-ERRNO
    ;MATCH ;
 
 : REFUSED-STAND-IN ( -- )
-   [: STAND-IN$ >str JOURNAL:INSPECT drop ;]
+   [: STAND-IN$ JOURNAL:INSPECT drop ;]
    JOURNAL:E-NO-BIRTH-TIME TTHROWSQ ;
 
 \ Nothing logged: JOURNAL decides the stand-in before it refuses.
@@ -1398,7 +1399,7 @@ variable RAISED-ERRNO
    j AR @ JOURNAL:LOCAL-INVENTORY {: before :}
    [: j STAND-IN$ AR @ SCAN-AND-PUBLISH ROOT-CHANGED? TTRUE
       j STAND-IN$ OPEN-ACTIVE-ROOT NO-ROOT? TTRUE ;] STDERR-OF
-   nip 0 T=
+   str> nip 0 T=
    j AR @ JOURNAL:LOCAL-INVENTORY before JOURNAL:LOCAL-RECORDS= TTRUE ;
 
 : SCAN-OF-A-STAND-IN-PUBLISHES-NOTHING ( -- )
@@ -1408,9 +1409,9 @@ variable RAISED-ERRNO
    [: STAND-IN-PUBLISHES-NOTHING ;] WITH-JOURNAL ;
 
 \ Rust's scan_and_publish_at with all_cache_entries_stable completing.
-: PUBLISH-STABLE ( JOURNAL:journal ^u8 n option<cutoff> -- )
-   {: j p:^ u:n cut:option<cutoff> :}
-   j p u AT AR @ KEEP str> cut [: STABLE ;] AR @ SCAN-AND-PUBLISH-AT
+: PUBLISH-STABLE ( JOURNAL:journal str option<cutoff> -- )
+   {: j p:str cut:option<cutoff> :}
+   j p AT AR @ KEEP cut [: STABLE ;] AR @ SCAN-AND-PUBLISH-AT
    ROOT-CHANGED? TFALSE ;
 
 : REPUBLISHES-NOTHING ( JOURNAL:journal -- )
@@ -1542,15 +1543,15 @@ FS:PATHZ-CAP BUFFER: ROOT-BUF
 variable ROOT-U
 FS:PATHZ-CAP BUFFER: JOINED
 
-: ROOT$ ( -- ^u8 n ) ROOT-BUF ROOT-U @ ;
+: ROOT$ ( -- str ) ROOT-BUF ROOT-U @ >str ;
 
 \ The name below the case's directory, valid until the next AT.
-: AT ( ^u8 n -- ^u8 n )
-   {: p:^ u:n :}
-   ROOT$ p u JOINED FS:JOIN-PATH JOINED swap ;
+: AT ( str -- str )
+   {: p:str :}
+   ROOT$ p JOINED FS:JOIN-PATH JOINED swap >str ;
 
 : CASE-DIR ( -- )
-   s" local-test" FS:MKTEMP-DIR {: p:^ u:n :}
+   s" local-test" FS:MKTEMP-DIR str> {: p:^ u:n :}
    p ROOT-BUF u BYTE-COPY u ROOT-U ! ;
 
 \ Runs q on the case directory's fd, then removes the directory.
@@ -1564,14 +1565,14 @@ FS:PATHZ-CAP BUFFER: JOINED
    s" dir" AT FS:MAKE-DIR
    s" dir/file.txt" AT s" bytes" FS:WRITE-ALL
    s" file.txt" AT s" bytes" FS:WRITE-ALL
-   s" missing" >str s" dangling" AT >str FS:MAKE-SYMLINK
-   s" dir" >str s" linked" AT >str FS:MAKE-SYMLINK
+   s" missing" s" dangling" AT FS:MAKE-SYMLINK
+   s" dir" s" linked" AT FS:MAKE-SYMLINK
    s" denied" AT FS:MAKE-DIR ;
 
-: EXISTS ( fd ^u8 n bool -- )
-   {: root:fd p:^ u:n want:bool :}
-   p u T-LABEL
-   root p u LOCAL:ENTRY-EXISTS-AT want if TTRUE else TFALSE then ;
+: EXISTS ( fd str bool -- )
+   {: root:fd p:str want:bool :}
+   p T-LABEL
+   root p LOCAL:ENTRY-EXISTS-AT want if TTRUE else TFALSE then ;
 
 : ENTRY-CHECKS ( fd -- )
    {: root:fd :}
@@ -1587,9 +1588,9 @@ FS:PATHZ-CAP BUFFER: JOINED
 \ Rust's deny_all_access, then allow_owner_access whatever the probe did.
 : DENIED ( fd -- )
    {: root:fd :}
-   s" denied" AT >str 0 FS:CHMOD-MODE
+   s" denied" AT 0 FS:CHMOD-MODE
    [: root s" denied/file.txt" false EXISTS ;]
-   [: s" denied" AT >str MODE-0700 FS:CHMOD-MODE ;] finally ;
+   [: s" denied" AT MODE-0700 FS:CHMOD-MODE ;] finally ;
 
 : ENTRY-EXISTENCE-NEVER-FOLLOWS-SYMLINKS-AND-TREATS-PROBE-FAILURES-AS-UNCONFIRMED
    ( -- )
@@ -1601,12 +1602,12 @@ FS:PATHZ-CAP BUFFER: JOINED
 \ ---- content hashes
 
 \ Rust's identity: the content hash of the bytes, read from a pipe.
-: IDENTITY ( ^u8 n -- ^u8 n )
-   {: p:^ u:n :}
+: IDENTITY ( str -- str )
+   {: p:str :}
    FD:PIPE {: r:fd w:fd :}
-   w p u FD:WRITE-FULL w FS:CLOSE-DIR
+   w p FD:WRITE-FULL w FS:CLOSE-DIR
    r AR @ LOCAL:DROPBOX-CONTENT-HASH r FS:CLOSE-DIR
-   DROPBOX:HASH>STR str> ;
+   DROPBOX:HASH>STR ;
 
 : DROPBOX-HASH-USES-BLOCK-HASH-COMPOSITION ( -- )
    s" dropbox_hash_uses_block_hash_composition" T-LABEL
@@ -1619,7 +1620,7 @@ FS:PATHZ-CAP BUFFER: JOINED
 : UNREADABLE-HASH-INPUT-FAILS ( -- )
    s" unreadable hash input fails" T-LABEL
    FD:PIPE {: r:fd w:fd :}
-   [: [: w AR @ LOCAL:DROPBOX-CONTENT-HASH DROPBOX:HASH>STR str> 2drop ;]
+   [: [: w AR @ LOCAL:DROPBOX-CONTENT-HASH DROPBOX:HASH>STR drop ;]
       LOCAL:E-HASH-READ TTHROWSQ ;]
    [: r FS:CLOSE-DIR w FS:CLOSE-DIR ;] finally ;
 
@@ -1635,8 +1636,8 @@ variable FRAGMENT-COUNT
 
 : SOURCE@ ( -- ^u8 ) SOURCE @ ;
 
-: START ( ^u8 n -- )
-   {: p:^ u:n :}
+: START ( str -- )
+   str> {: p:^ u:n :}
    p SOURCE ! u SOURCE-U ! 0 POSITION ! 0 NEXT-FRAGMENT ! ;
 
 \ Rust's FragmentedReader: the next fragment's bytes, at most the span's.
@@ -1665,18 +1666,18 @@ SHA256-CTX-BYTES BUFFER: PART
 64 BUFFER: HEX
 
 \ Rust's reference_dropbox_hash: SHA-256 over each block's SHA-256.
-: REFERENCE ( ^u8 n -- ^u8 n )
-   {: a:^ u:n :}
+: REFERENCE ( str -- str )
+   str> {: a:^ u:n :}
    WHOLE SHA256-BEGIN
    0 begin dup u < while
       {: at:n :}
       u at - DROPBOX:BLOCK min {: k:n :}
-      PART a at + k DIGEST SHA256-IN
+      PART a at + k >str DIGEST SHA256-IN
       WHOLE DIGEST 32 >str SHA256-FEED
       at k +
    repeat drop
    WHOLE DIGEST SHA256-END DIGEST HEX SHA256>HEX
-   HEX 64 ;
+   HEX 64 >str ;
 
 \ Rust's hash_length_strategy, its random arm 2..=65536.
 : LENGTH ( n -- n )
@@ -1714,12 +1715,12 @@ SHA256-CTX-BYTES BUFFER: PART
    ;MATCH ;
 
 \ What COPY-AND-HASH gives an unnamed file in dir from the fragments.
-: COPY ( fd -- ^u8 n fd )
+: COPY ( fd -- str fd )
    {: dir:fd :}
    dir FS:TEMP-AT {: f:fd :}
    [: FRAGMENT ;] f s" fragmented-download"
    s" test fragmented download copy" AR @ LOCAL:COPY-AND-HASH
-   DROPBOX:HASH>STR str> f ;
+   DROPBOX:HASH>STR f ;
 
 \ The file's bytes from its start fill back, and nothing follows them.
 : READ-BACK ( fd ^u8 n -- )
@@ -1729,11 +1730,12 @@ SHA256-CTX-BYTES BUFFER: PART
    f ONE 1 SPAN:MAKE FD:READ-EXACT FULL? TFALSE ;
 
 \ The bytes copied hash as want and read back as they were.
-: COPIED ( ^u8 n ^u8 n fd ^u8 -- )
-   {: bytes:^ u:n want:^ wu:n dir:fd back:^ :}
-   bytes u START
-   dir COPY {: c:^ cu:n f:fd :}
-   [: c cu want wu T$= f back u READ-BACK bytes u back u STR= TTRUE ;]
+: COPIED ( str str fd ^u8 -- )
+   {: bytes:str want:str dir:fd back:^ :}
+   bytes str> nip {: u:n :}
+   bytes START
+   dir COPY {: c:str f:fd :}
+   [: c want T$= f back u READ-BACK bytes back u >str STR= TTRUE ;]
    [: f FS:CLOSE-DIR ;] finally ;
 
 \ Case i takes length arm i mod 9 and schedule arm i mod 3.
@@ -1742,11 +1744,11 @@ SHA256-CTX-BYTES BUFFER: PART
    i 9 mod LENGTH {: u:n :}
    i 3 mod SCHEDULE
    bytes u 256 PROP:RND% PATTERNED
-   bytes u REFERENCE {: want:^ wu:n :}
-   bytes u START
-   [: FRAGMENT ;] AR @ LOCAL:HASH-STREAM DROPBOX:HASH>STR str>
-   want wu T$=
-   bytes u want wu dir back COPIED ;
+   bytes u >str REFERENCE {: want:str :}
+   bytes u >str START
+   [: FRAGMENT ;] AR @ LOCAL:HASH-STREAM DROPBOX:HASH>STR
+   want T$=
+   bytes u >str want dir back COPIED ;
 
 : FRAGMENT-CASES ( fd ^u8 ^u8 -- )
    {: dir:fd bytes:^ back:^ :}
@@ -1766,24 +1768,24 @@ SHA256-CTX-BYTES BUFFER: PART
 
 \ ---- download stages
 
-: HASH-OF ( ^u8 n -- DROPBOX:hash ) IDENTITY >str DROPBOX:>HASH ;
-: TARGET ( -- ^u8 n ) s" target.txt" ;
+: HASH-OF ( str -- DROPBOX:hash ) IDENTITY DROPBOX:>HASH ;
+: TARGET ( -- str ) s" target.txt" ;
 : WANT ( -- DROPBOX:hash ) s" remote" HASH-OF ;
-: MARKER ( -- ^u8 n ) TARGET WANT AR @ LOCAL:STAGE-MARKER ;
+: MARKER ( -- str ) TARGET WANT AR @ LOCAL:STAGE-MARKER ;
 
-: PUT-FILE ( ^u8 n ^u8 n -- )
-   {: name:^ nu:n b:^ bu:n :}
-   name nu AT b bu FS:WRITE-ALL ;
+: PUT-FILE ( str str -- )
+   {: name:str b:str :}
+   name AT b FS:WRITE-ALL ;
 
-: OPEN-AT ( fd ^u8 n -- fd )
+: OPEN-AT ( fd str -- fd )
    FS:TRY-OPEN-READ-AT MATCH option
       none OF E-FS-OPEN throw ENDOF
       some OF ENDOF
    ;MATCH ;
 
-: MARK ( fd ^u8 n -- )
-   {: f:fd p:^ u:n :}
-   f LOCAL:DOWNLOAD-STAGE-XATTR MARKER true p u s" test mark"
+: MARK ( fd str -- )
+   {: f:fd p:str :}
+   f LOCAL:DOWNLOAD-STAGE-XATTR MARKER true p s" test mark"
    LOCAL:SET-XATTR ;
 
 \ The Rust daemon's marker for target.txt holding "remote".
@@ -1801,18 +1803,18 @@ FS:PATHZ-CAP BUFFER: LOG-AT
 
 \ stderr.txt below the case's directory, apart from AT's buffer, which a
 \ captured action may reuse.
-: LOG-PATH ( -- ^u8 n )
-   ROOT$ s" stderr.txt" LOG-AT FS:JOIN-PATH LOG-AT swap ;
+: LOG-PATH ( -- str )
+   ROOT$ s" stderr.txt" LOG-AT FS:JOIN-PATH LOG-AT swap >str ;
 
 \ Marking an attribute that exists throws LOCAL's code with EEXIST, fd 2
 \ sent to LOG-PATH, which then holds XATTR's one line and is removed.
-: ONE-XATTR-LINE ( fd ^u8 n -- )
-   {: f:fd p:^ u:n :}
-   [: [: f p u MARK ;] LOCAL:E-IO TTHROWSQ FS:ERRNO FS:EEXIST T= ;]
-   LOG-PATH >str AR @ STDERR:CAPTURING str> {: code:n e:^ n:n :}
+: ONE-XATTR-LINE ( fd str -- )
+   {: f:fd p:str :}
+   [: [: f p MARK ;] LOCAL:E-IO TTHROWSQ FS:ERRNO FS:EEXIST T= ;]
+   LOG-PATH AR @ STDERR:CAPTURING {: code:n e:str :}
    code 0<> if code throw then
-   e n >str 10 COUNT-CHAR 1 T=
-   e n s" xattr: fsetxattr" CONTAINS? TTRUE ;
+   e 10 COUNT-CHAR 1 T=
+   e s" xattr: fsetxattr" CONTAINS? TTRUE ;
 
 : MARKER-CHECKS ( fd -- )
    {: f:fd :}
@@ -1834,10 +1836,10 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    s" stage marker is set, read and removed" T-LABEL
    [: MARKER-ROUND-TRIP ;] IN-CASE-DIR ;
 
-: INSPECTED ( fd ^u8 n ^u8 n -- )
-   {: root:fd p:^ u:n want:^ wu:n :}
-   p u T-LABEL
-   root p u p u TARGET WANT AR @ LOCAL:INSPECTED$ want wu T$= ;
+: INSPECTED ( fd str str -- )
+   {: root:fd p:str want:str :}
+   p T-LABEL
+   root p p TARGET WANT AR @ LOCAL:INSPECTED$ want T$= ;
 
 : OWNED-STAGE ( fd -- )
    {: root:fd :}
@@ -1860,24 +1862,24 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    [: INSPECT-CASES ;] IN-CASE-DIR ;
 
 \ The outcome's variant, and its actual hash or path, else empty.
-: OUTCOME$ ( LOCAL:stage-outcome<n> -- ^u8 n ^u8 n )
+: OUTCOME$ ( LOCAL:stage-outcome<n> -- str str )
    MATCH LOCAL:stage-outcome
       staged OF drop s" staged" s" " ENDOF
       already-staged OF drop s" already-staged" s" " ENDOF
       content-changed OF {: c:DROPBOX:hash :}
-         s" content-changed" c DROPBOX:HASH>STR str>
+         s" content-changed" c DROPBOX:HASH>STR
       ENDOF
       destination-occupied OF {: p:str :}
-         s" destination-occupied" p str>
+         s" destination-occupied" p
       ENDOF
    ;MATCH ;
 
 \ Stages bytes at name, marked as target's owned download of "remote".
-: STAGED ( fd ^u8 n ^u8 n -- ^u8 n ^u8 n )
-   {: root:fd name:^ nu:n b:^ bu:n :}
-   name nu T-LABEL
-   b bu START 0 SCHEDULE
-   root name nu name nu WANT [: FRAGMENT ;] MARKER >str OPTION:SOME
+: STAGED ( fd str str -- str str )
+   {: root:fd name:str b:str :}
+   name T-LABEL
+   b START 0 SCHEDULE
+   root name name WANT [: FRAGMENT ;] MARKER OPTION:SOME
    s" test stage" AR @ LOCAL:WRITE-STAGE-OUTCOME OUTCOME$ ;
 
 : STAGE-CASES ( fd -- )
@@ -1899,69 +1901,69 @@ FS:PATHZ-CAP BUFFER: LOG-AT
 \ ---- upload stages
 
 \ The bytes laid in the arena, so they outlive the next AT.
-: HOLD ( ^u8 n -- ^u8 n )
-   {: p:^ u:n :}
+: HOLD ( str -- str )
+   str> {: p:^ u:n :}
    AR @ u ARENA:ALLOC {: dst:^ size:n :}
-   p dst u BYTE-COPY dst u ;
+   p dst u BYTE-COPY dst u >str ;
 
-: UPLOAD-ROOT ( -- ^u8 n ) s" root" AT HOLD ;
-: STAGING ( -- ^u8 n ) s" staging" AT HOLD ;
+: UPLOAD-ROOT ( -- str ) s" root" AT HOLD ;
+: STAGING ( -- str ) s" staging" AT HOLD ;
 
 : UPLOAD-DIRS ( -- ) s" root" AT FS:MAKE-DIR s" staging" AT FS:MAKE-DIR ;
 
 \ The stage path of content c, valid until the next AT.
-: STAGE-PATH ( DROPBOX:hash -- ^u8 n )
+: STAGE-PATH ( DROPBOX:hash -- str )
    {: c:DROPBOX:hash :}
-   STAGING c DROPBOX:HASH>STR str> JOINED FS:JOIN-PATH JOINED swap ;
+   STAGING c DROPBOX:HASH>STR JOINED FS:JOIN-PATH JOINED swap >str ;
 
 \ The entry's file type bits, 0 when nothing is there.
-: KIND ( ^u8 n -- n )
-   >str FS:TRY-LSTAT 0= if 0 exit then
+: KIND ( str -- n )
+   FS:TRY-LSTAT 0= if 0 exit then
    FS:STAT-MODE@ FS:S-IFMT and ;
 
 64 BUFFER: CONTENTS-BUF
 
-: CONTENTS ( ^u8 n -- ^u8 n )
-   CONTENTS-BUF 64 FS:READ-ALL CONTENTS-BUF swap ;
+: CONTENTS ( str -- str )
+   CONTENTS-BUF 64 FS:READ-ALL CONTENTS-BUF swap >str ;
 
 \ Stages the file at name below the upload root as content want.
 : UPLOAD-STAGE
-   ( ^u8 n DROPBOX:hash -- LOCAL:stage-outcome<^LOCAL:staged-upload> )
-   {: name:^ nu:n want:DROPBOX:hash :}
-   UPLOAD-ROOT name nu STAGING want AR @ LOCAL:STAGE-UPLOAD ;
+   ( str DROPBOX:hash -- LOCAL:stage-outcome<^LOCAL:staged-upload> )
+   {: name:str want:DROPBOX:hash :}
+   UPLOAD-ROOT name STAGING want AR @ LOCAL:STAGE-UPLOAD ;
 
 \ The hash of what the stage's verified descriptor reads.
-: VERIFIED$ ( ^LOCAL:staged-upload -- ^u8 n )
+: VERIFIED$ ( ^LOCAL:staged-upload -- str )
    AR @ LOCAL:OPEN-VERIFIED-UPLOAD {: f:fd :}
    f AR @ LOCAL:DROPBOX-CONTENT-HASH f FS:CLOSE-DIR
-   DROPBOX:HASH>STR str> ;
+   DROPBOX:HASH>STR ;
 
 \ The outcome's variant, and the stage's verified hash, the actual hash
 \ or the path.
 : UPLOAD-OUTCOME$
-   ( LOCAL:stage-outcome<^LOCAL:staged-upload> -- ^u8 n ^u8 n )
+   ( LOCAL:stage-outcome<^LOCAL:staged-upload> -- str str )
    MATCH LOCAL:stage-outcome
       staged OF {: rec:^ :} s" staged" rec VERIFIED$ ENDOF
       already-staged OF {: rec:^ :} s" already-staged" rec VERIFIED$
       ENDOF
       content-changed OF {: c:DROPBOX:hash :}
-         s" content-changed" c DROPBOX:HASH>STR str>
+         s" content-changed" c DROPBOX:HASH>STR
       ENDOF
       destination-occupied OF {: p:str :}
-         s" destination-occupied" p str>
+         s" destination-occupied" p
       ENDOF
    ;MATCH ;
 
 : SAME-HASH? ( DROPBOX:hash DROPBOX:hash -- bool )
    {: a:DROPBOX:hash b:DROPBOX:hash :}
-   a DROPBOX:HASH>STR str> b DROPBOX:HASH>STR str> STR= ;
+   a DROPBOX:HASH>STR b DROPBOX:HASH>STR STR= ;
 
 \ The entries local.rs's collection test lays in the staging directory.
 : COLLECTION-ENTRIES ( DROPBOX:hash DROPBOX:hash DROPBOX:hash -- )
    {: corrupt:DROPBOX:hash directory:DROPBOX:hash link:DROPBOX:hash :}
    corrupt STAGE-PATH s" different bytes" FS:WRITE-ALL
    directory STAGE-PATH FS:MAKE-DIR
-   s" root/retained" AT HOLD >str link STAGE-PATH >str FS:MAKE-SYMLINK
+   s" root/retained" AT HOLD link STAGE-PATH FS:MAKE-SYMLINK
    s" staging/unrecognized" s" leave me" PUT-FILE ;
 
 : COLLECTION-CHECKS
@@ -1984,9 +1986,9 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    s" claimed bytes" HASH-OF {: corrupt:DROPBOX:hash :}
    s" directory entry" HASH-OF {: directory:DROPBOX:hash :}
    s" symlink entry" HASH-OF {: link:DROPBOX:hash :}
-   s" retained" retained UPLOAD-STAGE UPLOAD-OUTCOME$ 2drop
+   s" retained" retained UPLOAD-STAGE UPLOAD-OUTCOME$ drop
    s" staged" T$=
-   s" orphan" orphan UPLOAD-STAGE UPLOAD-OUTCOME$ 2drop s" staged" T$=
+   s" orphan" orphan UPLOAD-STAGE UPLOAD-OUTCOME$ drop s" staged" T$=
    corrupt directory link COLLECTION-ENTRIES
    STAGING [: retained SAME-HASH? ;] AR @
    LOCAL:REMOVE-UNREFERENCED-UPLOAD-STAGES 1 T=
@@ -2000,11 +2002,11 @@ FS:PATHZ-CAP BUFFER: LOG-AT
 
 \ A directory at the stage's path answers destination-occupied, a
 \ converted failure, so no LOCAL line goes to LOG-PATH, which is removed.
-: OCCUPIED-QUIETLY ( ^u8 n DROPBOX:hash -- )
-   {: name:^ nu:n want:DROPBOX:hash :}
-   [: name nu want UPLOAD-STAGE UPLOAD-OUTCOME$ HOLD
+: OCCUPIED-QUIETLY ( str DROPBOX:hash -- )
+   {: name:str want:DROPBOX:hash :}
+   [: name want UPLOAD-STAGE UPLOAD-OUTCOME$ HOLD
       want STAGE-PATH T$= s" destination-occupied" T$= ;]
-   LOG-PATH >str AR @ STDERR:CAPTURING str> nip {: code:n n:n :}
+   LOG-PATH AR @ STDERR:CAPTURING str> nip {: code:n n:n :}
    code 0<> if code throw then
    n 0 T= ;
 
@@ -2013,16 +2015,16 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    UPLOAD-DIRS
    s" root/source" s" source bytes" PUT-FILE
    s" source bytes" HASH-OF {: want:DROPBOX:hash :}
-   want DROPBOX:HASH>STR str> {: w:^ wu:n :}
+   want DROPBOX:HASH>STR {: w:str :}
    s" staged" T-LABEL
-   s" source" want UPLOAD-STAGE UPLOAD-OUTCOME$ w wu T$= s" staged" T$=
+   s" source" want UPLOAD-STAGE UPLOAD-OUTCOME$ w T$= s" staged" T$=
    s" already staged" T-LABEL
    s" source" want UPLOAD-STAGE UPLOAD-OUTCOME$
-   w wu T$= s" already-staged" T$=
+   w T$= s" already-staged" T$=
    s" content changed" T-LABEL
    s" other bytes" HASH-OF {: other:DROPBOX:hash :}
    s" source" other UPLOAD-STAGE UPLOAD-OUTCOME$
-   w wu T$= s" content-changed" T$=
+   w T$= s" content-changed" T$=
    other STAGE-PATH KIND 0 T=
    s" destination occupied" T-LABEL
    s" root/occupied" s" occupied bytes" PUT-FILE
@@ -2036,13 +2038,13 @@ FS:PATHZ-CAP BUFFER: LOG-AT
 
 \ STAGE-UPLOAD-AT of r below the root as content want, its outcome
 \ dropped.
-: STAGE-AT ( fd ^u8 n DROPBOX:hash -- )
-   {: root:fd r:^ ru:n want:DROPBOX:hash :}
-   root r ru STAGING want AR @ LOCAL:STAGE-UPLOAD-AT
-   UPLOAD-OUTCOME$ 2drop 2drop ;
+: STAGE-AT ( fd str DROPBOX:hash -- )
+   {: root:fd r:str want:DROPBOX:hash :}
+   root r STAGING want AR @ LOCAL:STAGE-UPLOAD-AT
+   UPLOAD-OUTCOME$ 2drop ;
 
-: OBSERVE-AT ( fd ^u8 n -- )
-   AR @ LOCAL:OBSERVE-UPLOAD-SOURCE-AT DROPBOX:HASH>STR str> 2drop ;
+: OBSERVE-AT ( fd str -- )
+   AR @ LOCAL:OBSERVE-UPLOAD-SOURCE-AT DROPBOX:HASH>STR drop ;
 
 : SOURCE-CHANGED-CASES ( fd -- )
    {: root:fd :}
@@ -2084,26 +2086,26 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    p c@ STR-HEX-DIGIT-VALUE 4 lshift p 1+ c@ STR-HEX-DIGIT-VALUE or ;
 
 \ The bytes the hex digits spell, valid until the next.
-: UNHEX ( ^u8 n -- ^u8 n )
-   {: h:^ hu:n :}
+: UNHEX ( str -- str )
+   str> {: h:^ hu:n :}
    hu 2 / 0 ?do h i 2 * + HEX-BYTE UNHEXED i + c! loop
-   UNHEXED hu 2 / ;
+   UNHEXED hu 2 / >str ;
 
 \ Rust's DownloadSlotIdentity::new and encode_download_slot_state; the
 \ binding is sha256sum of Rust's input for this download.
 : SLOT-BYTES-ARE-RUSTS ( -- )
    s" slot identity and state bytes are the Rust daemon's" T-LABEL
    s" 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-   >str DROPBOX:>HASH s" 015f1a2b3c4d" >str DROPBOX:>REV
+   DROPBOX:>HASH s" 015f1a2b3c4d" DROPBOX:>REV
    MODEL-REMOTE:MAKE {: r:MODEL:remote :}
    7 42 s" Docs/a.txt" r LOCAL:NEW-SLOT-IDENTITY LOCAL:SLOT-BINDING
-   $0102030405060708 LOCAL:STATE-BYTES {: p:^ u:n :}
+   $0102030405060708 LOCAL:STATE-BYTES str> {: p:^ u:n :}
    u 63 T=
-   p 23 s" omabox-download-slot-v1" T$=
-   p 23 + 32
+   p 23 >str s" omabox-download-slot-v1" T$=
+   p 23 + 32 >str
    s" 5ab14b7f1ecd878a5ce03fa13ad45efd36df5aad8c4bef0129fefdc17a4b9430"
    UNHEX T$=
-   p 55 + 8 s" 0102030405060708" UNHEX T$= ;
+   p 55 + 8 >str s" 0102030405060708" UNHEX T$= ;
 
 \ Rust's range is 0 to 1024 checkpoints and a block; its boundaries are
 \ 0, each checkpoint and the bytes either side of it, and the last.
@@ -2120,29 +2122,30 @@ FS:PATHZ-CAP BUFFER: LOG-AT
 32 BUFFER: TEXT-BUF
 
 \ The prefix and n's digits, valid until the next.
-: NUMBERED ( ^u8 n n -- ^u8 n )
-   {: x:^ xu:n k:n :}
+: NUMBERED ( str n -- str )
+   {: s:str k:n :}
+   s str> {: x:^ xu:n :}
    x TEXT-BUF xu BYTE-COPY
-   k FMT:INT$ {: d:^ du:n :}
+   k FMT:INT$ str> {: d:^ du:n :}
    d TEXT-BUF xu + du BYTE-COPY
-   TEXT-BUF xu du + ;
+   TEXT-BUF xu du + >str ;
 
 \ Rust's test_slot_identity: target t's download of c at "revision-<op>".
 : SLOT-IDENTITY
-   ( ^u8 n DROPBOX:hash n n -- LOCAL:download-slot-identity )
-   {: t:^ tu:n c:DROPBOX:hash generation:n op:n :}
-   c s" revision-" op NUMBERED >str DROPBOX:>REV MODEL-REMOTE:MAKE
+   ( str DROPBOX:hash n n -- LOCAL:download-slot-identity )
+   {: t:str c:DROPBOX:hash generation:n op:n :}
+   c s" revision-" op NUMBERED DROPBOX:>REV MODEL-REMOTE:MAKE
    {: r:MODEL:remote :}
-   generation op t tu r LOCAL:NEW-SLOT-IDENTITY ;
+   generation op t r LOCAL:NEW-SLOT-IDENTITY ;
 
 : DOWNLOAD ( -- DROPBOX:hash ) s" download" HASH-OF ;
 
 \ The lease of the case directory's slots for the identity, apart.
 : LEASE
-   ( ^u8 n DROPBOX:hash n n [ LOCAL:binding -- bool ]
+   ( str DROPBOX:hash n n [ LOCAL:binding -- bool ]
      -- n LOCAL:binding bool )
-   {: t:^ tu:n c:DROPBOX:hash generation:n op:n protected :}
-   t tu c generation op SLOT-IDENTITY {: id:LOCAL:download-slot-identity :}
+   {: t:str c:DROPBOX:hash generation:n op:n protected :}
+   t c generation op SLOT-IDENTITY {: id:LOCAL:download-slot-identity :}
    ROOT$ id protected LOCAL:LEASE-DOWNLOAD-SLOT LOCAL:LEASE-OF ;
 
 TYPED-VARIABLE HELD-BINDING LOCAL:binding
@@ -2157,29 +2160,31 @@ variable LEASED-COUNT
       i LEASED @ b LOCAL:BINDING= if true unloop exit then
    loop false ;
 
-: SLOT-AT ( n -- ^u8 n ) LOCAL:DOWNLOAD-SLOT-NAME AT ;
+: SLOT-AT ( n -- str ) LOCAL:DOWNLOAD-SLOT-NAME AT ;
 
 64 BUFFER: HELD-BYTES
 
 \ The file at the path holds exactly the bytes.
-: HOLDS ( ^u8 n ^u8 n -- )
-   {: p:^ u:n b:^ bu:n :}
-   p u HELD-BYTES 64 FS:READ-ALL {: k:n :}
-   HELD-BYTES k b bu T$= ;
+: HOLDS ( str str -- )
+   {: p:str b:str :}
+   p HELD-BYTES 64 FS:READ-ALL {: k:n :}
+   HELD-BYTES k >str b T$= ;
 
 \ The open file carries the binding at offset at.
-: STATE-IS ( fd ^u8 n LOCAL:binding n -- )
-   {: f:fd name:^ nu:n want:LOCAL:binding offset:n :}
-   f name nu LOCAL:SLOT-STATE-OF {: b:LOCAL:binding at:n found:bool :}
+: STATE-IS ( fd str LOCAL:binding n -- )
+   {: f:fd name:str want:LOCAL:binding offset:n :}
+   f name LOCAL:SLOT-STATE-OF {: b:LOCAL:binding at:n found:bool :}
    found TTRUE b want LOCAL:BINDING= TTRUE at offset T= ;
 
 \ The file at name below the root carries the binding at offset at.
-: STATE-AT ( fd ^u8 n LOCAL:binding n -- )
-   {: root:fd name:^ nu:n want:LOCAL:binding offset:n :}
-   root name nu OPEN-AT {: f:fd :}
-   [: f name nu want offset STATE-IS ;] [: f FS:CLOSE-DIR ;] finally ;
+: STATE-AT ( fd str LOCAL:binding n -- )
+   {: root:fd name:str want:LOCAL:binding offset:n :}
+   root name OPEN-AT {: f:fd :}
+   [: f name want offset STATE-IS ;] [: f FS:CLOSE-DIR ;] finally ;
 
 variable FILES
+
+: COUNT-FILE ( str -- ) drop 1 FILES +! ;
 
 : POOL-LEASE ( n -- )
    {: op:n :}
@@ -2194,8 +2199,8 @@ variable FILES
    0 LEASED-COUNT !
    5 0 ?do i POOL-LEASE loop
    LEASED-COUNT @ 4 T=
-   0 FILES ! ROOT$ >str [: str> 2drop 1 FILES +! ;] FS:WALK-FILES FILES @ 4 T=
-   4 0 ?do i SLOT-AT >str FS:FILE? TTRUE loop ;
+   0 FILES ! ROOT$ [: COUNT-FILE ;] FS:WALK-FILES FILES @ 4 T=
+   4 0 ?do i SLOT-AT FS:FILE? TTRUE loop ;
 
 : DOWNLOAD-SLOT-POOL-HAS-FOUR-FIXED-PATHS-WITHOUT-OVERFLOW ( -- )
    s" download_slot_pool_has_four_fixed_paths_without_overflow" T-LABEL
@@ -2222,7 +2227,7 @@ variable FILES
 \ The slot is empty and carries the binding at offset 0.
 : EMPTY-SLOT ( fd n LOCAL:binding -- )
    {: root:fd slot:n b:LOCAL:binding :}
-   slot SLOT-AT >str FS:FILE-SIZE 0 T=
+   slot SLOT-AT FS:FILE-SIZE 0 T=
    root slot LOCAL:DOWNLOAD-SLOT-NAME b 0 STATE-AT ;
 
 \ A one-slot lease has no empty form to free a stale slot with, so a
@@ -2257,25 +2262,25 @@ FS:PATHZ-CAP BUFFER: SLOT-PATH-BUF
 variable SLOT-PATH-U
 
 \ AT into a buffer of its own.
-: AT2 ( ^u8 n -- ^u8 n )
-   {: p:^ u:n :}
-   ROOT$ p u JOINED2 FS:JOIN-PATH JOINED2 swap ;
+: AT2 ( str -- str )
+   {: p:str :}
+   ROOT$ p JOINED2 FS:JOIN-PATH JOINED2 swap >str ;
 
-: SLOT$ ( -- ^u8 n ) SLOT-NAME-BUF SLOT-NAME-U @ ;
-: SLOT-PATH$ ( -- ^u8 n ) SLOT-PATH-BUF SLOT-PATH-U @ ;
+: SLOT$ ( -- str ) SLOT-NAME-BUF SLOT-NAME-U @ >str ;
+: SLOT-PATH$ ( -- str ) SLOT-PATH-BUF SLOT-PATH-U @ >str ;
 
 \ Keeps the slot's name and path where only the case reads them.
 : KEEP-SLOT ( n -- )
    {: slot:n :}
-   slot LOCAL:DOWNLOAD-SLOT-NAME {: p:^ u:n :}
+   slot LOCAL:DOWNLOAD-SLOT-NAME str> {: p:^ u:n :}
    p SLOT-NAME-BUF u BYTE-COPY u SLOT-NAME-U !
-   SLOT$ AT {: q:^ qu:n :}
+   SLOT$ AT str> {: q:^ qu:n :}
    q SLOT-PATH-BUF qu BYTE-COPY qu SLOT-PATH-U ! ;
 
 \ Rust's before_reset here: the slot moves to held-slot and a new file
 \ takes its name.
 : SWAP-SLOT ( -- )
-   SLOT$ AT2 >str s" held-slot" AT >str FS:RENAME-FILE
+   SLOT$ AT2 s" held-slot" AT FS:RENAME-FILE
    SLOT$ AT s" replacement" FS:WRITE-ALL ;
 
 : EXPECTED ( -- DROPBOX:hash ) s" expected bytes" HASH-OF ;
@@ -2297,7 +2302,7 @@ variable SLOT-PATH-U
    opened TTRUE
    [: f root b SWAP-RESET TFALSE ;] [: f FS:CLOSE-DIR ;] finally
    SLOT$ AT s" replacement" HOLDS
-   s" held-slot" AT >str FS:FILE-SIZE 0 T=
+   s" held-slot" AT FS:FILE-SIZE 0 T=
    root s" held-slot" b 0 STATE-AT
    root s" held-slot" OPEN-AT {: moved:fd :}
    [: moved TARGET EXPECTED AR @ LOCAL:STAGE-MARKER s" held-slot"
@@ -2313,12 +2318,12 @@ variable SLOT-PATH-U
 FS:PATHZ-CAP BUFFER: SYNC-BUF
 variable SYNC-U
 
-: SYNC$ ( -- ^u8 n ) SYNC-BUF SYNC-U @ ;
+: SYNC$ ( -- str ) SYNC-BUF SYNC-U @ >str ;
 
 : WITH-SYNC-ROOT ( fd [ fd -- ] -- )
    {: case:fd q :}
    s" sync" AT FS:MAKE-DIR
-   s" sync" AT {: p:^ u:n :}
+   s" sync" AT str> {: p:^ u:n :}
    p SYNC-BUF u BYTE-COPY u SYNC-U !
    SYNC$ s" open test sync root" LOCAL:OPEN-ROOT {: root:fd :}
    [: root q execute ;] [: root FS:CLOSE-DIR ;] finally ;
@@ -2331,31 +2336,31 @@ variable SYNC-U
 
 \ Rust's test_download_lease: the slot leased for target t's download
 \ of c, root generation 1, operation 1.
-: TEST-LEASE ( ^u8 n DROPBOX:hash -- LOCAL:download-slot-lease )
-   {: t:^ tu:n c:DROPBOX:hash :}
-   t tu c 1 1 SLOT-IDENTITY {: id:LOCAL:download-slot-identity :}
+: TEST-LEASE ( str DROPBOX:hash -- LOCAL:download-slot-lease )
+   {: t:str c:DROPBOX:hash :}
+   t c 1 1 SLOT-IDENTITY {: id:LOCAL:download-slot-identity :}
    ROOT$ id [: TEST-CLIENT:UNPROTECTED ;] LOCAL:LEASE-DOWNLOAD-SLOT TEST-CLIENT:LEASED ;
 
 : DOWNLOAD-PREPARE
-   ( fd ^u8 n DROPBOX:hash LOCAL:download-slot-lease
+   ( fd str DROPBOX:hash LOCAL:download-slot-lease
      -- LOCAL:download-preparation )
-   {: root:fd t:^ tu:n c:DROPBOX:hash lease:LOCAL:download-slot-lease :}
-   root SYNC$ t tu c lease AR @ LOCAL:PREPARE-DOWNLOAD-SLOT-AT ;
+   {: root:fd t:str c:DROPBOX:hash lease:LOCAL:download-slot-lease :}
+   root SYNC$ t c lease AR @ LOCAL:PREPARE-DOWNLOAD-SLOT-AT ;
 
 : DROP-OUTCOME ( LOCAL:stage-outcome<n> -- ) drop ;
 
 \ The preparation's variant, a complete one's outcome and its path; a
 \ ready partial is freed.
-: DOWNLOAD-PREPARATION$ ( LOCAL:download-preparation -- ^u8 n ^u8 n )
+: DOWNLOAD-PREPARATION$ ( LOCAL:download-preparation -- str str )
    MATCH LOCAL:download-preparation
       ready OF LOCAL:CLOSE-PARTIAL s" ready" s" " ENDOF
       complete OF OUTCOME$ ENDOF
       ephemeral OF s" ephemeral" s" " ENDOF
    ;MATCH ;
 
-: PREPARED-AS ( LOCAL:download-preparation ^u8 n -- )
-   {: p:LOCAL:download-preparation want:^ wu:n :}
-   p DOWNLOAD-PREPARATION$ s" " T$= want wu T$= ;
+: PREPARED-AS ( LOCAL:download-preparation str -- )
+   {: p:LOCAL:download-preparation want:str :}
+   p DOWNLOAD-PREPARATION$ s" " T$= want T$= ;
 
 104 constant ECONNRESET
 variable REMAINING
@@ -2373,7 +2378,7 @@ variable REMAINING
 : TOTAL ( -- n )
    LOCAL:DOWNLOAD-CHECKPOINT-BYTES DROPBOX:BLOCK 2 * + ;
 
-: BOUNDARY ( -- ^u8 n ) s" boundary.bin" ;
+: BOUNDARY ( -- str ) s" boundary.bin" ;
 
 : SIZE-OF ( fd -- n ) FS:FD-STAT FS:STAT-SIZE@ ;
 
@@ -2384,11 +2389,11 @@ variable REMAINING
    s" download never reaches verification" HASH-OF {: c:DROPBOX:hash :}
    BOUNDARY c TEST-LEASE {: lease:LOCAL:download-slot-lease :}
    root BOUNDARY c lease DOWNLOAD-PREPARE LOCAL:READY-PARTIAL {: x :}
-   x LOCAL:PARTIAL-PATH {: p:^ u:n :}
+   x LOCAL:PARTIAL-PATH {: p:str :}
    cut REMAINING !
    [: x TOTAL [: FAILING ;] AR @ LOCAL:APPEND-PARTIAL DROP-OUTCOME ;]
    LOCAL:E-STAGE-READ TTHROWSQ
-   p u >str FS:FILE-SIZE written T=
+   p FS:FILE-SIZE written T=
    root BOUNDARY c lease DOWNLOAD-PREPARE LOCAL:READY-PARTIAL {: y :}
    y LOCAL:PARTIAL-OFFSET@ durable T=
    y LOCAL:PARTIAL-FILE SIZE-OF durable T=
@@ -2405,33 +2410,33 @@ variable REMAINING
 
 \ The prepared partial of target.txt's download of c, its bytes written.
 : WRITTEN
-   ( fd DROPBOX:hash LOCAL:download-slot-lease ^u8 n
+   ( fd DROPBOX:hash LOCAL:download-slot-lease str
      -- ^LOCAL:download-partial )
-   {: root:fd c:DROPBOX:hash lease:LOCAL:download-slot-lease b:^ bu:n :}
+   {: root:fd c:DROPBOX:hash lease:LOCAL:download-slot-lease b:str :}
    root TARGET c lease DOWNLOAD-PREPARE LOCAL:READY-PARTIAL {: x :}
-   x LOCAL:PARTIAL-FILE b bu FD:WRITE-FULL
+   x LOCAL:PARTIAL-FILE b FD:WRITE-FULL
    x ;
 
-: STAGE-HOLDS ( ^LOCAL:download-partial ^u8 n -- )
-   {: x b:^ bu:n :}
-   x LOCAL:PARTIAL-STAGE-PATH b bu HOLDS ;
+: STAGE-HOLDS ( ^LOCAL:download-partial str -- )
+   {: x b:str :}
+   x LOCAL:PARTIAL-STAGE-PATH b HOLDS ;
 
 : NO-CONTENT ( -- option<DROPBOX:hash> ) OPTION:NONE ;
 
-: ACTUAL$ ( option<DROPBOX:hash> -- ^u8 n )
+: ACTUAL$ ( option<DROPBOX:hash> -- str )
    MATCH option
       none OF s" none" ENDOF
-      some OF DROPBOX:HASH>STR str> ENDOF
+      some OF DROPBOX:HASH>STR ENDOF
    ;MATCH ;
 
 \ The outcome's variant, and its path or actual content, else empty.
-: INSTALL$ ( LOCAL:install-outcome -- ^u8 n ^u8 n )
+: INSTALL$ ( LOCAL:install-outcome -- str str )
    MATCH LOCAL:install-outcome
       installed OF s" installed" s" " ENDOF
       already-installed OF s" already-installed" s" " ENDOF
       download-required OF s" download-required" s" " ENDOF
       stage-destination-occupied OF {: p:str :}
-         s" stage-destination-occupied" p str>
+         s" stage-destination-occupied" p
       ENDOF
       precondition-changed OF {: a:option<DROPBOX:hash> :}
          s" precondition-changed" a ACTUAL$
@@ -2440,26 +2445,26 @@ variable REMAINING
 
 \ Rust's install_download of c at the target below the sync root, then
 \ the target read back: it holds b.
-: INSTALLS ( fd DROPBOX:hash ^u8 n -- )
-   {: root:fd c:DROPBOX:hash b:^ bu:n :}
+: INSTALLS ( fd DROPBOX:hash str -- )
+   {: root:fd c:DROPBOX:hash b:str :}
    root SYNC$ TARGET c NO-CONTENT AR @ LOCAL:INSTALL-DOWNLOAD-AT
    INSTALL$ s" " T$= s" installed" T$=
-   SYNC$ TARGET JOINED FS:JOIN-PATH JOINED swap b bu HOLDS ;
+   SYNC$ TARGET JOINED FS:JOIN-PATH JOINED swap >str b HOLDS ;
 
 : RECOVERED ( fd bool -- )
    {: root:fd renamed:bool :}
-   s" completed bytes" {: b:^ bu:n :}
-   b bu HASH-OF {: c:DROPBOX:hash :}
+   s" completed bytes" {: b:str :}
+   b HASH-OF {: c:DROPBOX:hash :}
    TARGET c TEST-LEASE {: lease:LOCAL:download-slot-lease :}
-   root c lease b bu WRITTEN {: x :}
+   root c lease b WRITTEN {: x :}
    x AR @ LOCAL:MARK-PARTIAL
    renamed if x LOCAL:RENAME-TO-STAGE TTRUE then
    x LOCAL:CLOSE-PARTIAL
    root TARGET c lease DOWNLOAD-PREPARE
    renamed if s" already-staged" else s" staged" then PREPARED-AS
    root TARGET c lease DOWNLOAD-PREPARE s" already-staged" PREPARED-AS
-   x b bu STAGE-HOLDS
-   root c b bu INSTALLS ;
+   x b STAGE-HOLDS
+   root c b INSTALLS ;
 
 : COMPLETED-PARTIAL-RECOVERS-BEFORE-AND-AFTER-RENAME ( -- )
    s" completed_partial_recovers_before_and_after_rename" T-LABEL
@@ -2481,14 +2486,14 @@ variable REMAINING
       x LOCAL:PARTIAL-FILE LOCAL:DOWNLOAD-PARTIAL-XATTR s" foreign owner"
       XATTR:SET
    then
-   x LOCAL:PARTIAL-PATH {: p:^ u:n :}
+   x LOCAL:PARTIAL-PATH {: p:str :}
    x AR @ LOCAL:MARK-PARTIAL
    x LOCAL:CLOSE-PARTIAL
    root TARGET c lease DOWNLOAD-PREPARE
    {: prep:LOCAL:download-preparation :}
    owned if prep RESTARTED-EMPTY exit then
    prep s" ephemeral" PREPARED-AS
-   p u s" incomplete" HOLDS ;
+   p s" incomplete" HOLDS ;
 
 : CORRUPT-COMPLETED-PARTIAL-RESTARTS-ONLY-WHEN-OWNED ( -- )
    s" corrupt_completed_partial_restarts_only_when_owned" T-LABEL
@@ -2497,25 +2502,25 @@ variable REMAINING
 
 \ Rust's before_move here: the slot moves to held-slot and a new file
 \ takes its name.
-: SWAP-PARTIAL ( ^u8 n -- )
-   {: p:^ u:n :}
-   p u >str s" held-slot" AT >str FS:RENAME-FILE
-   p u s" replacement" FS:WRITE-ALL ;
+: SWAP-PARTIAL ( str -- )
+   {: p:str :}
+   p s" held-slot" AT FS:RENAME-FILE
+   p s" replacement" FS:WRITE-ALL ;
 
 : SWAPPED-PROMOTION ( fd -- )
    {: root:fd :}
-   s" complete bytes" {: b:^ bu:n :}
-   b bu HASH-OF {: c:DROPBOX:hash :}
+   s" complete bytes" {: b:str :}
+   b HASH-OF {: c:DROPBOX:hash :}
    TARGET c TEST-LEASE {: lease:LOCAL:download-slot-lease :}
-   root c lease b bu WRITTEN {: x :}
+   root c lease b WRITTEN {: x :}
    x AR @ LOCAL:MARK-PARTIAL
-   x LOCAL:PARTIAL-PATH {: p:^ u:n :}
-   [: x [: p u SWAP-PARTIAL ;] AR @ LOCAL:PROMOTE-WITH OUTCOME$
-      p u T$= s" destination-occupied" T$= ;]
+   x LOCAL:PARTIAL-PATH {: p:str :}
+   [: x [: p SWAP-PARTIAL ;] AR @ LOCAL:PROMOTE-WITH OUTCOME$
+      p T$= s" destination-occupied" T$= ;]
    [: x LOCAL:CLOSE-PARTIAL ;] finally
-   p u s" replacement" HOLDS
-   s" held-slot" AT b bu HOLDS
-   x LOCAL:PARTIAL-STAGE-PATH >str FS:TRY-LSTAT TFALSE ;
+   p s" replacement" HOLDS
+   s" held-slot" AT b HOLDS
+   x LOCAL:PARTIAL-STAGE-PATH FS:TRY-LSTAT TFALSE ;
 
 : COMPLETED-PARTIAL-PROMOTION-PRESERVES-A-SWAPPED-REPLACEMENT ( -- )
    s" completed_partial_promotion_preserves_a_swapped_replacement" T-LABEL
@@ -2524,32 +2529,32 @@ variable REMAINING
 \ The errno is read before the sync root is writable again.
 : REFUSED-PROMOTION ( ^LOCAL:download-partial -- )
    {: x :}
-   [: [: x [: SYNC$ >str LOCAL:MODE-0500 FS:CHMOD-MODE ;] AR @
+   [: [: x [: SYNC$ LOCAL:MODE-0500 FS:CHMOD-MODE ;] AR @
          LOCAL:PROMOTE-WITH DROP-OUTCOME ;]
-      [: FS:ERRNO LOCAL:CAUGHT ! SYNC$ >str MODE-0700 FS:CHMOD-MODE ;]
+      [: FS:ERRNO LOCAL:CAUGHT ! SYNC$ MODE-0700 FS:CHMOD-MODE ;]
       finally ;] LOCAL:E-IO TTHROWSQ ;
 
 \ The slot is in the case directory and the stage in the sync root.
 : REFUSED-PROMOTION-LOGS ( ^LOCAL:download-partial -- )
    {: x :}
    [: x REFUSED-PROMOTION ;]
-   LOG-PATH >str AR @ STDERR:CAPTURING str> {: code:n e:^ u:n :}
+   LOG-PATH AR @ STDERR:CAPTURING {: code:n e:str :}
    code 0<> if code throw then
    LOCAL:CAUGHT @ FS:EACCES T=
-   e u 1 LOCAL:LOGGED
-   e u s" ; directory" ROOT$ s" 0700" LOCAL:OWNED? TTRUE
-   e u s" ; directory" SYNC$ s" 0500" LOCAL:OWNED? TTRUE
-   e u ROOT$ LOCAL:CLAUSE-AT e u SYNC$ LOCAL:CLAUSE-AT < TTRUE
-   e u s" ; entry" s" .omabox-download-slot-0" s" 0600" LOCAL:OWNED?
+   e 1 LOCAL:LOGGED
+   e s" ; directory" ROOT$ s" 0700" LOCAL:OWNED? TTRUE
+   e s" ; directory" SYNC$ s" 0500" LOCAL:OWNED? TTRUE
+   e ROOT$ LOCAL:CLAUSE-AT e SYNC$ LOCAL:CLAUSE-AT < TTRUE
+   e s" ; entry" s" .omabox-download-slot-0" s" 0600" LOCAL:OWNED?
    TTRUE
-   e u LOCAL:RUNS-AS? TTRUE ;
+   e LOCAL:RUNS-AS? TTRUE ;
 
 : DENIED-PROMOTION ( fd -- )
    {: root:fd :}
-   s" complete bytes" {: b:^ bu:n :}
-   b bu HASH-OF {: c:DROPBOX:hash :}
+   s" complete bytes" {: b:str :}
+   b HASH-OF {: c:DROPBOX:hash :}
    TARGET c TEST-LEASE {: lease:LOCAL:download-slot-lease :}
-   root c lease b bu WRITTEN {: x :}
+   root c lease b WRITTEN {: x :}
    x AR @ LOCAL:MARK-PARTIAL
    [: x REFUSED-PROMOTION-LOGS ;] [: x LOCAL:CLOSE-PARTIAL ;] finally ;
 
@@ -2560,16 +2565,16 @@ variable REMAINING
 
 : CROSS-FILESYSTEM ( fd -- )
    {: root:fd :}
-   s" complete bytes" {: b:^ bu:n :}
-   b bu HASH-OF {: c:DROPBOX:hash :}
+   s" complete bytes" {: b:str :}
+   b HASH-OF {: c:DROPBOX:hash :}
    TARGET c TEST-LEASE {: lease:LOCAL:download-slot-lease :}
-   root c lease b bu WRITTEN {: x :}
+   root c lease b WRITTEN {: x :}
    x AR @ LOCAL:MARK-PARTIAL
    [: x AR @ LOCAL:COPY-PARTIAL OUTCOME$ s" " T$= s" staged" T$= ;]
    [: x LOCAL:CLOSE-PARTIAL ;] finally
-   x LOCAL:PARTIAL-PATH >str FS:FILE-SIZE 0 T=
-   x b bu STAGE-HOLDS
-   root c b bu INSTALLS ;
+   x LOCAL:PARTIAL-PATH FS:FILE-SIZE 0 T=
+   x b STAGE-HOLDS
+   root c b INSTALLS ;
 
 : CROSS-FILESYSTEM-SLOT-COMPLETION-COPIES-REHASHES-AND-FREES-THE-SLOT
    ( -- )
@@ -2579,28 +2584,28 @@ variable REMAINING
 
 \ Rust's staged_download(stage_download(...)): b staged from a reader
 \ below the sync root fd.
-: STAGE-BYTES ( fd ^u8 n DROPBOX:hash -- )
-   {: root:fd b:^ bu:n c:DROPBOX:hash :}
-   b bu START 0 SCHEDULE
+: STAGE-BYTES ( fd str DROPBOX:hash -- )
+   {: root:fd b:str c:DROPBOX:hash :}
+   b START 0 SCHEDULE
    root SYNC$ TARGET c [: FRAGMENT ;] AR @ LOCAL:STAGE-DOWNLOAD-AT
    OUTCOME$
    s" " T$= s" staged" T$= ;
 
 : ZERO-REPLAY ( fd -- )
    {: root:fd :}
-   s" complete bytes" {: b:^ bu:n :}
-   b bu HASH-OF {: c:DROPBOX:hash :}
+   s" complete bytes" {: b:str :}
+   b HASH-OF {: c:DROPBOX:hash :}
    TARGET c TEST-LEASE {: lease:LOCAL:download-slot-lease :}
-   root c lease b bu WRITTEN {: x :}
+   root c lease b WRITTEN {: x :}
    x AR @ LOCAL:MARK-PARTIAL
    x LOCAL:ZERO-CHECKPOINT
-   root b bu c STAGE-BYTES
-   x LOCAL:PARTIAL-PATH {: p:^ u:n :}
+   root b c STAGE-BYTES
+   x LOCAL:PARTIAL-PATH {: p:str :}
    x LOCAL:CLOSE-PARTIAL
    root TARGET c lease DOWNLOAD-PREPARE s" already-staged" PREPARED-AS
-   p u >str FS:FILE-SIZE 0 T=
+   p FS:FILE-SIZE 0 T=
    root TARGET c lease DOWNLOAD-PREPARE s" already-staged" PREPARED-AS
-   root c b bu INSTALLS ;
+   root c b INSTALLS ;
 
 : INTERRUPTED-PARTIAL-RESET-REPLAYS-TO-A-REUSABLE-ZERO-CHECKPOINT ( -- )
    s" interrupted_partial_reset_replays_to_a_reusable_zero_checkpoint"
@@ -2616,29 +2621,29 @@ variable REMAINING
 
 : RESTARTS ( fd -- )
    RESTARTABLE {: x :}
-   x LOCAL:PARTIAL-PATH {: p:^ u:n :}
+   x LOCAL:PARTIAL-PATH {: p:str :}
    x LOCAL:RESTART-PARTIAL RESTARTED-EMPTY
-   p u >str FS:FILE-SIZE 0 T= ;
+   p FS:FILE-SIZE 0 T= ;
 
 \ A replacement swapped in for the slot keeps its bytes, and so does the
 \ slot.
 : RESTART-SWAPPED ( fd -- )
    RESTARTABLE {: x :}
-   x LOCAL:PARTIAL-PATH {: p:^ u:n :}
-   p u SWAP-PARTIAL
+   x LOCAL:PARTIAL-PATH {: p:str :}
+   p SWAP-PARTIAL
    x LOCAL:RESTART-PARTIAL DOWNLOAD-PREPARATION$
-   p u T$= s" destination-occupied" T$=
-   p u s" replacement" HOLDS
+   p T$= s" destination-occupied" T$=
+   p s" replacement" HOLDS
    s" held-slot" AT s" partial bytes" HOLDS ;
 
 \ The slot directory, unsearchable, fails the slot's reopen.
 : RESTART-DENIED ( fd -- )
    LOCAL:ROOT-USER? if drop exit then
    RESTARTABLE {: x :}
-   ROOT$ >str 0 FS:CHMOD-MODE
-   [: [: x LOCAL:RESTART-PARTIAL DOWNLOAD-PREPARATION$ 2drop 2drop ;]
+   ROOT$ 0 FS:CHMOD-MODE
+   [: [: x LOCAL:RESTART-PARTIAL DOWNLOAD-PREPARATION$ 2drop ;]
       LOCAL:E-IO TTHROWSQ ;]
-   [: ROOT$ >str MODE-0700 FS:CHMOD-MODE ;] finally ;
+   [: ROOT$ MODE-0700 FS:CHMOD-MODE ;] finally ;
 
 : RESTARTED-PARTIAL-IS-EMPTY-OR-FAILS ( -- )
    s" restarted partial is empty or fails" T-LABEL
@@ -2653,13 +2658,13 @@ variable REMAINING
 64 BUFFER: READ-BUF
 
 \ The bytes of the file at the name below the case's directory.
-: READ$ ( ^u8 n -- ^u8 n )
-   AT READ-BUF 64 FS:READ-ALL READ-BUF swap ;
+: READ$ ( str -- str )
+   AT READ-BUF 64 FS:READ-ALL READ-BUF swap >str ;
 
-: HELD ( ^u8 n -- option<DROPBOX:hash> ) HASH-OF OPTION:SOME ;
+: HELD ( str -- option<DROPBOX:hash> ) HASH-OF OPTION:SOME ;
 
 : REPLACEMENT-PREPARATION$
-   ( LOCAL:replacement-preparation -- ^u8 n ^u8 n )
+   ( LOCAL:replacement-preparation -- str str )
    MATCH LOCAL:replacement-preparation
       prepared OF s" prepared" s" " ENDOF
       already-prepared OF s" already-prepared" s" " ENDOF
@@ -2668,28 +2673,28 @@ variable REMAINING
       ENDOF
    ;MATCH ;
 
-: STAGE-NAME$ ( ^u8 n -- ^u8 n ) WANT AR @ LOCAL:STAGE-NAME ;
+: STAGE-NAME$ ( str -- str ) WANT AR @ LOCAL:STAGE-NAME ;
 
 \ STAGE-DOWNLOAD-AT of "remote" as t's owned download below the case's
 \ directory, whose fd is root.
-: STAGE-REMOTE ( fd ^u8 n -- )
-   {: root:fd t:^ tu:n :}
+: STAGE-REMOTE ( fd str -- )
+   {: root:fd t:str :}
    s" remote" START 0 SCHEDULE
-   root ROOT$ t tu WANT [: FRAGMENT ;] AR @ LOCAL:STAGE-DOWNLOAD-AT
+   root ROOT$ t WANT [: FRAGMENT ;] AR @ LOCAL:STAGE-DOWNLOAD-AT
    OUTCOME$ s" " T$= s" staged" T$= ;
 
 \ INSTALL-DOWNLOAD-AT of "remote" at t below the case's directory, whose
 \ fd is root.
-: INSTALL ( fd ^u8 n option<DROPBOX:hash> -- ^u8 n ^u8 n )
-   {: root:fd t:^ tu:n expected:option<DROPBOX:hash> :}
-   t tu T-LABEL
-   root ROOT$ t tu WANT expected AR @ LOCAL:INSTALL-DOWNLOAD-AT
+: INSTALL ( fd str option<DROPBOX:hash> -- str str )
+   {: root:fd t:str expected:option<DROPBOX:hash> :}
+   t T-LABEL
+   root ROOT$ t WANT expected AR @ LOCAL:INSTALL-DOWNLOAD-AT
    INSTALL$ ;
 
-: REPLACEMENT-PREPARE ( fd ^u8 n ^u8 n -- ^u8 n ^u8 n )
-   {: root:fd t:^ tu:n c:^ cu:n :}
-   t tu T-LABEL
-   root ROOT$ t tu c cu HASH-OF AR @ LOCAL:PREPARE-BELOW
+: REPLACEMENT-PREPARE ( fd str str -- str str )
+   {: root:fd t:str c:str :}
+   t T-LABEL
+   root ROOT$ t c HASH-OF AR @ LOCAL:PREPARE-BELOW
    REPLACEMENT-PREPARATION$ ;
 
 : ABSENT-INSTALL ( fd -- )
@@ -2704,7 +2709,7 @@ variable REMAINING
    s" absent_install_never_overwrites_an_existing_file" T-LABEL
    [: ABSENT-INSTALL ;] IN-CASE-DIR ;
 
-: OPEN-WRITE-AT ( fd ^u8 n -- fd )
+: OPEN-WRITE-AT ( fd str -- fd )
    FS:TRY-OPEN-WRITE-AT MATCH option
       none OF E-FS-OPEN throw ENDOF
       some OF ENDOF
@@ -2713,13 +2718,13 @@ variable REMAINING
 : MUTATED-STAGE ( fd -- )
    {: root:fd :}
    root TARGET STAGE-REMOTE
-   TARGET STAGE-NAME$ {: sn:^ snu:n :}
-   sn snu AT >str FS:MODE-PRIVATE-FILE FS:CHMOD-MODE
-   root sn snu OPEN-WRITE-AT {: w:fd :}
+   TARGET STAGE-NAME$ {: sn:str :}
+   sn AT FS:MODE-PRIVATE-FILE FS:CHMOD-MODE
+   root sn OPEN-WRITE-AT {: w:fd :}
    [: root ROOT$ TARGET WANT AR @ w LOCAL:INSTALL-RENAME-MUTATED ;]
    [: w FS:CLOSE-DIR ;] finally
    root TARGET LOCAL:ENTRY-EXISTS-AT TFALSE
-   sn snu READ$ s" mutant" T$= ;
+   sn READ$ s" mutant" T$= ;
 
 \ The stage is verified, then changed through a writer opened before it
 \ was sealed; the rename refuses it and leaves both names as they are.
@@ -2737,8 +2742,8 @@ variable REMAINING
       oversize OF true ENDOF
    ;MATCH ;
 
-: INSTALLED-BYTES ( -- ^u8 n ) s" installed bytes" ;
-: INSTALLED-MARKER ( -- ^u8 n )
+: INSTALLED-BYTES ( -- str ) s" installed bytes" ;
+: INSTALLED-MARKER ( -- str )
    TARGET INSTALLED-BYTES HASH-OF AR @ LOCAL:STAGE-MARKER ;
 
 \ The download slot words are not LOCAL's yet: the partial marker holds
@@ -2807,16 +2812,16 @@ variable REMAINING
    root TARGET NO-CONTENT INSTALL s" " T$= s" installed" T$=
    TARGET READ$ s" remote" T$=
    root TARGET STAGE-NAME$ LOCAL:ENTRY-EXISTS-AT TFALSE
-   TARGET AT >str FS:TRY-LSTAT TTRUE
+   TARGET AT FS:TRY-LSTAT TTRUE
    FS:STAT-MODE@ $1FF and FS:MODE-PRIVATE-FILE T=
    root TARGET NO-CONTENT INSTALL s" " T$= s" already-installed" T$= ;
 
 : OCCUPIED-STAGE ( fd -- )
    {: root:fd :}
-   s" other.txt" STAGE-NAME$ {: sn:^ snu:n :}
-   sn snu s" mutant" PUT-FILE
+   s" other.txt" STAGE-NAME$ {: sn:str :}
+   sn s" mutant" PUT-FILE
    root s" other.txt" NO-CONTENT INSTALL
-   sn snu AT T$= s" stage-destination-occupied" T$= ;
+   sn AT T$= s" stage-destination-occupied" T$= ;
 
 \ A replacement installs over the content expected and keeps any other.
 : REPLACEMENT-OUTCOMES ( fd -- )
@@ -2844,24 +2849,24 @@ variable REMAINING
 \ A directory at the stage's name blocks the install and stays.
 : DIRECTORY-STAGE ( fd -- )
    {: root:fd :}
-   s" dir.txt" STAGE-NAME$ {: sn:^ snu:n :}
-   sn snu AT FS:MAKE-DIR
+   s" dir.txt" STAGE-NAME$ {: sn:str :}
+   sn AT FS:MAKE-DIR
    root s" dir.txt" NO-CONTENT INSTALL
-   sn snu AT T$= s" stage-destination-occupied" T$=
-   sn snu AT KIND FS:S-IFDIR T= ;
+   sn AT T$= s" stage-destination-occupied" T$=
+   sn AT KIND FS:S-IFDIR T= ;
 
 \ A file Omabox cannot read at the stage's name blocks the install and
 \ keeps its bytes.
 : UNREADABLE-STAGE ( fd -- )
    {: root:fd :}
    LOCAL:ROOT-USER? if exit then
-   s" denied.txt" STAGE-NAME$ {: sn:^ snu:n :}
-   sn snu s" mutant" PUT-FILE
-   sn snu AT >str 0 FS:CHMOD-MODE
+   s" denied.txt" STAGE-NAME$ {: sn:str :}
+   sn s" mutant" PUT-FILE
+   sn AT 0 FS:CHMOD-MODE
    [: root s" denied.txt" NO-CONTENT INSTALL
-      sn snu AT T$= s" stage-destination-occupied" T$= ;]
-   [: sn snu AT >str MODE-0700 FS:CHMOD-MODE ;] finally
-   sn snu READ$ s" mutant" T$= ;
+      sn AT T$= s" stage-destination-occupied" T$= ;]
+   [: sn AT MODE-0700 FS:CHMOD-MODE ;] finally
+   sn READ$ s" mutant" T$= ;
 
 \ Rust's inspect_download_stage throws for both.
 : OBJECT-AT-STAGE-NAME-BLOCKS-ONLY-ITS-INSTALL ( -- )
@@ -2890,10 +2895,10 @@ variable REMAINING
 
 variable ENTRIES
 
-: COUNT-ENTRY ( ^u8 n -- ) 2drop 1 ENTRIES +! ;
+: COUNT-ENTRY ( str -- ) drop 1 ENTRIES +! ;
 
 \ The count of the directory's entries but . and ..
-: ENTRY-COUNT ( ^u8 n -- n )
+: ENTRY-COUNT ( str -- n )
    0 ENTRIES ! [: COUNT-ENTRY ;] FS-LIST:EACH ENTRIES @ ;
 
 : FD-COUNT ( -- n ) s" /proc/self/fd" ENTRY-COUNT ;
@@ -2912,9 +2917,9 @@ variable ENTRIES
    s" complete disposable download closes its parent" T-LABEL
    [: COMPLETE-DISPOSABLE ;] IN-CASE-DIR ;
 
-: FALLBACK ( -- ^u8 n ) s" fallback.bin" ;
+: FALLBACK ( -- str ) s" fallback.bin" ;
 
-: EXISTING$ ( option<LOCAL:stage-outcome<n>> -- ^u8 n ^u8 n )
+: EXISTING$ ( option<LOCAL:stage-outcome<n>> -- str str )
    MATCH option
       none OF s" none" s" " ENDOF
       some OF OUTCOME$ ENDOF
@@ -2932,12 +2937,12 @@ variable ENTRIES
 \ the stage is then already staged, and the staging directory is empty.
 : DISPOSABLE-BODY ( fd -- )
    {: root:fd :}
-   s" disposable download" {: b:^ bu:n :}
-   b bu HASH-OF {: c:DROPBOX:hash :}
+   s" disposable download" {: b:str :}
+   b HASH-OF {: c:DROPBOX:hash :}
    root c DISPOSABLE-PARTIAL {: x :}
    x LOCAL:DISPOSABLE? TTRUE
-   b bu START 0 SCHEDULE
-   x bu [: FRAGMENT ;] AR @ LOCAL:APPEND-PARTIAL OUTCOME$
+   b START 0 SCHEDULE
+   x b str> nip [: FRAGMENT ;] AR @ LOCAL:APPEND-PARTIAL OUTCOME$
    s" " T$= s" staged" T$=
    root SYNC$ FALLBACK c AR @ LOCAL:EXISTING-DOWNLOAD-STAGE-AT
    EXISTING$ s" " T$= s" already-staged" T$=
@@ -2951,25 +2956,28 @@ variable ENTRIES
 
 : INODE ( fd -- n ) FS:FD-STAT FS:STAT-INO@ ;
 
-: PATH-INODE ( ^u8 n -- n ) AT >str FS:TRY-LSTAT TTRUE FS:STAT-INO@ ;
+: PATH-INODE ( str -- n ) AT FS:TRY-LSTAT TTRUE FS:STAT-INO@ ;
 
 : SAME-ADDRESS ( ^u8 ^u8 -- )
    {: a:^ b:^ :}
    a NULL-PTR - b NULL-PTR - T= ;
 
 \ p's parent opens, its name and path spans of p; answers the descriptor.
-: PARENT ( fd ^u8 n bool ^u8 n ^u8 n -- fd )
-   {: root:fd p:^ u:n create:bool name:^ nu:n path:^ pu:n :}
-   p u T-LABEL
-   root p u create LOCAL:PARENT-OF TTRUE
-   {: f:fd got:^ gu:n gp:^ gpu:n :}
-   got gu name nu T$= gp gpu path pu T$=
-   got p u + nu - SAME-ADDRESS gp p SAME-ADDRESS
+: PARENT ( fd str bool str str -- fd )
+   {: root:fd p:str create:bool name:str path:str :}
+   p T-LABEL
+   root p create LOCAL:PARENT-OF TTRUE
+   {: f:fd got:str gp:str :}
+   got name T$= gp path T$=
+   p str> {: a:^ u:n :}
+   name str> nip {: nu:n :}
+   got str> drop a u + nu - SAME-ADDRESS
+   gp str> drop a SAME-ADDRESS
    f ;
 
 \ Closes the descriptor PARENT-OF answers, if any.
-: TRY-PARENT ( fd ^u8 n bool -- )
-   LOCAL:PARENT-OF {: f:fd n:^ nu:n pp:^ pu:n found:bool :}
+: TRY-PARENT ( fd str bool -- )
+   LOCAL:PARENT-OF {: f:fd n:str pp:str found:bool :}
    found if f FS:CLOSE-DIR then ;
 
 : ROOT-PARENT ( fd -- )
@@ -2983,7 +2991,7 @@ variable ENTRIES
 
 : EXISTING-PARENT ( fd -- )
    {: root:fd :}
-   s" a/b" AT >str FS:MAKE-DIRS
+   s" a/b" AT FS:MAKE-DIRS
    root s" a/b/file" false s" file" s" a/b" PARENT {: f:fd :}
    f INODE s" a/b" PATH-INODE T=
    f FS:CLOSE-DIR ;
@@ -2993,13 +3001,13 @@ variable ENTRIES
    s" a" AT FS:MAKE-DIR
    s" a/missing/file" T-LABEL
    root s" a/missing/file" false LOCAL:PARENT-OF TFALSE
-   {: f:fd n:^ nu:n pp:^ pu:n :}
+   {: f:fd n:str pp:str :}
    root s" a/missing" LOCAL:ENTRY-EXISTS-AT TFALSE ;
 
-: PRIVATE-DIR ( ^u8 n -- )
-   {: p:^ u:n :}
-   p u T-LABEL
-   p u AT >str FS:TRY-LSTAT TTRUE
+: PRIVATE-DIR ( str -- )
+   {: p:str :}
+   p T-LABEL
+   p AT FS:TRY-LSTAT TTRUE
    FS:STAT-MODE@ FS:S-IFMT and FS:S-IFDIR T=
    FS:STAT-MODE@ $1FF and MODE-0700 T= ;
 
@@ -3014,16 +3022,16 @@ variable ENTRIES
 : SYMLINK-PARENT ( fd -- )
    {: root:fd :}
    s" real" AT FS:MAKE-DIR
-   s" real" >str s" link" AT >str FS:MAKE-SYMLINK
+   s" real" s" link" AT FS:MAKE-SYMLINK
    s" link/sub/file" T-LABEL
    [: root s" link/sub/file" true TRY-PARENT ;] LOCAL:E-IO TTHROWSQ
    FS:ERRNO FS:ENOTDIR T=
    root s" real/sub" LOCAL:ENTRY-EXISTS-AT TFALSE ;
 
-: UNSAFE-PARENT ( fd ^u8 n -- )
-   {: root:fd p:^ u:n :}
-   p u T-LABEL
-   [: root p u false TRY-PARENT ;] LOCAL:E-UNSAFE-PATH TTHROWSQ ;
+: UNSAFE-PARENT ( fd str -- )
+   {: root:fd p:str :}
+   p T-LABEL
+   [: root p false TRY-PARENT ;] LOCAL:E-UNSAFE-PATH TTHROWSQ ;
 
 : UNSAFE-PARENTS ( fd -- )
    {: root:fd :}
@@ -3061,7 +3069,7 @@ variable ENTRIES
 : OLD ( -- DROPBOX:hash ) s" old" HASH-OF ;
 
 \ The outcome's variant, and its actual hash, else empty.
-: DELETED$ ( LOCAL:delete-outcome -- ^u8 n ^u8 n )
+: DELETED$ ( LOCAL:delete-outcome -- str str )
    MATCH LOCAL:delete-outcome
       deleted OF s" deleted" s" " ENDOF
       already-deleted OF s" already-deleted" s" " ENDOF
@@ -3072,17 +3080,17 @@ variable ENTRIES
 
 \ Deletes target.txt below the case directory, whose fd is root, while
 \ it holds "old".
-: DELETE ( fd -- ^u8 n ^u8 n )
+: DELETE ( fd -- str str )
    ROOT$ TARGET OLD AR @ LOCAL:DELETE-LOCAL-AT DELETED$ ;
 
-: GUARD ( -- ^u8 n ) s" deleted" TARGET OLD AR @ LOCAL:INTERNAL-NAME ;
+: GUARD ( -- str ) s" deleted" TARGET OLD AR @ LOCAL:INTERNAL-NAME ;
 
 64 BUFFER: BACK
 
 \ The bytes of the file at the name below the case directory.
-: BYTES ( ^u8 n -- ^u8 n ) AT BACK 64 FS:READ-ALL BACK swap ;
+: BYTES ( str -- str ) AT BACK 64 FS:READ-ALL BACK swap >str ;
 
-: PRESENT? ( ^u8 n -- bool ) AT >str FS:TRY-LSTAT ;
+: PRESENT? ( str -- bool ) AT FS:TRY-LSTAT ;
 
 : DELETE-REPLAY ( fd -- )
    {: root:fd :}
@@ -3118,7 +3126,7 @@ variable ENTRIES
    TARGET s" new" PUT-FILE
    root DELETE s" new" IDENTITY T$= s" precondition-changed" T$=
    TARGET BYTES s" new" T$=
-   TARGET AT >str FS:REMOVE-FILE
+   TARGET AT FS:REMOVE-FILE
    root GUARD-RESTORED ;
 
 \ precondition-changed with none needs the guard to vanish between its
@@ -3130,14 +3138,14 @@ variable ENTRIES
 \ The empty content's hash in uppercase, which is no content hash.
 : UPPERCASE ( -- DROPBOX:hash )
    s" E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855"
-   >str DROPBOX:>HASH ;
+   DROPBOX:>HASH ;
 
 \ The delete fails before it looks at the target.
 : UPPERCASE-DELETE ( fd -- )
    {: root:fd :}
    TARGET s" old" PUT-FILE
    [: root ROOT$ TARGET UPPERCASE AR @ LOCAL:DELETE-LOCAL-AT
-      DELETED$ 2drop 2drop ;]
+      DELETED$ 2drop ;]
    LOCAL:E-CONTENT-HASH TTHROWSQ
    TARGET BYTES s" old" T$= ;
 
@@ -3149,10 +3157,10 @@ variable ENTRIES
 
 : RACED ( -- DROPBOX:hash ) s" raced bytes" HASH-OF ;
 
-: RACED-GUARD ( -- ^u8 n )
+: RACED-GUARD ( -- str )
    s" displaced" TARGET RACED AR @ LOCAL:INTERNAL-NAME ;
 
-: RACED-COPY ( -- ^u8 n )
+: RACED-COPY ( -- str )
    TARGET LOCAL-CONFLICT--SIDE:LOCAL RACED AR @ LOCAL:CONFLICT-NAME ;
 
 \ The guard holds "raced bytes" and target.txt an edit raced in.
@@ -3165,10 +3173,10 @@ variable ENTRIES
    root RACED-GUARD TARGET TARGET actual AR @
    LOCAL:RESTORE-OR-PRESERVE-CHANGED-GUARD ;
 
-: RACE-KEPT ( ^u8 n -- )
-   {: copy:^ cu:n :}
+: RACE-KEPT ( str -- )
+   {: copy:str :}
    TARGET BYTES s" edit" T$=
-   RACED-COPY BYTES copy cu T$= ;
+   RACED-COPY BYTES copy T$= ;
 
 : PRESERVE-CASES ( fd -- )
    {: root:fd :}
@@ -3196,29 +3204,29 @@ variable ENTRIES
 
 \ ---- directories
 
-: CREATED$ ( LOCAL:create-directory-outcome -- ^u8 n )
+: CREATED$ ( LOCAL:create-directory-outcome -- str )
    MATCH LOCAL:create-directory-outcome
       created OF s" created" ENDOF
       already-present OF s" already-present" ENDOF
       fresh-observation OF s" fresh-observation" ENDOF
    ;MATCH ;
 
-: REMOVED$ ( LOCAL:delete-directory-outcome -- ^u8 n )
+: REMOVED$ ( LOCAL:delete-directory-outcome -- str )
    MATCH LOCAL:delete-directory-outcome
       deleted OF s" deleted" ENDOF
       already-absent OF s" already-absent" ENDOF
       fresh-observation OF s" fresh-observation" ENDOF
    ;MATCH ;
 
-: MKDIR ( fd ^u8 n ^u8 n -- )
-   {: root:fd p:^ u:n want:^ wu:n :}
-   p u T-LABEL
-   root p u LOCAL:CREATE-DIRECTORY-AT CREATED$ want wu T$= ;
+: MKDIR ( fd str str -- )
+   {: root:fd p:str want:str :}
+   p T-LABEL
+   root p LOCAL:CREATE-DIRECTORY-AT CREATED$ want T$= ;
 
-: RMDIR ( fd ^u8 n ^u8 n -- )
-   {: root:fd p:^ u:n want:^ wu:n :}
-   p u T-LABEL
-   root p u LOCAL:DELETE-DIRECTORY-AT REMOVED$ want wu T$= ;
+: RMDIR ( fd str str -- )
+   {: root:fd p:str want:str :}
+   p T-LABEL
+   root p LOCAL:DELETE-DIRECTORY-AT REMOVED$ want T$= ;
 
 : DIRECTORY-EFFECTS ( fd -- )
    {: root:fd :}
@@ -3241,26 +3249,26 @@ variable ENTRIES
 \ ---- conflicts
 
 \ The outcome's variant, and its path or actual hash.
-: CONFLICT$ ( LOCAL:conflict-outcome -- ^u8 n ^u8 n )
+: CONFLICT$ ( LOCAL:conflict-outcome -- str str )
    MATCH LOCAL:conflict-outcome
-      created OF {: p:str :} s" created" p str> ENDOF
-      already-present OF {: p:str :} s" already-present" p str> ENDOF
+      created OF {: p:str :} s" created" p ENDOF
+      already-present OF {: p:str :} s" already-present" p ENDOF
       content-changed OF {: c:DROPBOX:hash :}
-         s" content-changed" c DROPBOX:HASH>STR str>
+         s" content-changed" c DROPBOX:HASH>STR
       ENDOF
    ;MATCH ;
 
-: ORIGINAL ( -- ^u8 n ) s" dir/original.txt" ;
+: ORIGINAL ( -- str ) s" dir/original.txt" ;
 
 \ Materializes the bytes as ORIGINAL's remote conflict copy of "remote"
 \ below the case directory, whose fd is root.
-: MATERIALIZED ( fd ^u8 n -- ^u8 n ^u8 n )
-   {: root:fd b:^ bu:n :}
-   b bu START 0 SCHEDULE
+: MATERIALIZED ( fd str -- str str )
+   {: root:fd b:str :}
+   b START 0 SCHEDULE
    root ROOT$ ORIGINAL LOCAL-CONFLICT--SIDE:REMOTE WANT [: FRAGMENT ;]
    AR @ LOCAL:MATERIALIZE-CONFLICT-AT CONFLICT$ ;
 
-: COPY-PATH ( -- ^u8 n )
+: COPY-PATH ( -- str )
    ORIGINAL LOCAL-CONFLICT--SIDE:REMOTE WANT AR @
    LOCAL:CONFLICT-RELATIVE-PATH ;
 
@@ -3269,7 +3277,7 @@ variable ENTRIES
    {: root:fd :}
    0 REMAINING !
    [: root ROOT$ ORIGINAL LOCAL-CONFLICT--SIDE:REMOTE WANT [: FAILING ;]
-      AR @ LOCAL:MATERIALIZE-CONFLICT-AT CONFLICT$ 2drop 2drop ;]
+      AR @ LOCAL:MATERIALIZE-CONFLICT-AT CONFLICT$ 2drop ;]
    LOCAL:E-IO TTHROWSQ ;
 
 : CONFLICT-CASES ( fd -- )
@@ -3277,11 +3285,11 @@ variable ENTRIES
    s" created" T-LABEL
    root s" remote" MATERIALIZED COPY-PATH T$= s" created" T$=
    COPY-PATH BYTES s" remote" T$=
-   COPY-PATH drop 4 s" dir/" T$=
+   COPY-PATH str> drop 4 >str s" dir/" T$=
    s" already present" T-LABEL
    root s" remote" MATERIALIZED COPY-PATH T$= s" already-present" T$=
    s" content changed" T-LABEL
-   COPY-PATH AT >str FS:REMOVE-FILE
+   COPY-PATH AT FS:REMOVE-FILE
    root s" mutant" MATERIALIZED s" mutant" IDENTITY T$=
    s" content-changed" T$=
    COPY-PATH PRESENT? TFALSE
@@ -3295,7 +3303,7 @@ variable ENTRIES
 
 \ ---- recovery copies
 
-: RECOVERY ( -- ^u8 n ) TARGET WANT AR @ LOCAL:RECOVERY-FILE-NAME ;
+: RECOVERY ( -- str ) TARGET WANT AR @ LOCAL:RECOVERY-FILE-NAME ;
 
 \ The Rust daemon's name for target.txt's copy holding "remote".
 : RECOVERY-NAME-IS-RUSTS ( -- )
@@ -3324,7 +3332,7 @@ variable ENTRIES
    RECOVERY BYTES s" mutant" T$=
    LOCAL:ROOT-USER? if exit then
    s" unreadable copy" T-LABEL
-   RECOVERY AT >str 0 FS:CHMOD-MODE
+   RECOVERY AT 0 FS:CHMOD-MODE
    root LOCAL:E-UNREADABLE COPY-FAILS ;
 
 : EACH-RECOVERY-COPY-OUTCOME-IS-REACHED ( -- )
@@ -3338,38 +3346,40 @@ variable PHYSICAL-U
 FS:PATHZ-CAP BUFFER: STAGING-BUF
 FS:PATHZ-CAP BUFFER: SLOT-FILE-BUF
 
-: PHYSICAL$ ( -- ^u8 n ) PHYSICAL-BUF PHYSICAL-U @ ;
+: PHYSICAL$ ( -- str ) PHYSICAL-BUF PHYSICAL-U @ >str ;
 
 \ The name below the case directory, kept, as CONFIG takes it.
-: CASE-PATH ( ^u8 n -- CONFIG:abs-path ) AT HOLD >str CONFIG:>ABS-PATH ;
+: CASE-PATH ( str -- CONFIG:abs-path ) AT HOLD CONFIG:>ABS-PATH ;
 
 \ Rust's physical_state canonicalized: beside the sync root, which
 \ CONFIG canonicalizes.
 : KEEP-PHYSICAL ( ^CONFIG:config -- )
    CONFIG:SYNC-ROOT CONFIG:ABS-PATH>STR str> {: p:^ u:n :}
-   p u s" /Dropbox" nip - s" physical-state" PHYSICAL-BUF FS:JOIN-PATH
+   p u s" /Dropbox" str> nip - >str s" physical-state" PHYSICAL-BUF
+   FS:JOIN-PATH
    PHYSICAL-U ! ;
 
 \ Rust's starts_with: the path names physical-state's descendant.
 : PROJECTED ( CONFIG:abs-path -- )
    CONFIG:ABS-PATH>STR str> {: p:^ u:n :}
    PHYSICAL-U @ {: k:n :}
-   u k > if p k PHYSICAL$ STR= p k + c@ $2F = and else false then
+   u k > if p k >str PHYSICAL$ STR= p k + c@ $2F = and else false then
    TTRUE ;
 
 : STAGED-SLOT? ( n -- bool )
    {: slot:n :}
    PHYSICAL$ s" omabox/upload-staging" STAGING-BUF FS:JOIN-PATH {: k:n :}
-   STAGING-BUF k slot LOCAL:DOWNLOAD-SLOT-NAME SLOT-FILE-BUF FS:JOIN-PATH
+   STAGING-BUF k >str slot LOCAL:DOWNLOAD-SLOT-NAME SLOT-FILE-BUF
+   FS:JOIN-PATH
    SLOT-FILE-BUF swap >str FS:FILE? ;
 
 \ Rust's test's config: its state home a link to physical-state.
 : LINKED-CONFIG ( -- ^CONFIG:config )
    s" physical-state" AT FS:MAKE-DIR
-   s" physical-state" AT HOLD >str s" state-link" AT >str FS:MAKE-SYMLINK
+   s" physical-state" AT HOLD s" state-link" AT FS:MAKE-SYMLINK
    s" Dropbox" AT FS:MAKE-DIR
    s" config" CASE-PATH s" state-link" CASE-PATH AR @ CONFIG:XDG-NEW
-   s" Dropbox" AT HOLD >str s" test-app-key" >str AR @ CONFIG:FROM-VALUES ;
+   s" Dropbox" AT HOLD s" test-app-key" AR @ CONFIG:FROM-VALUES ;
 
 : PATHS-PROJECTED ( ^CONFIG:paths -- )
    {: p :}
@@ -3384,7 +3394,7 @@ FS:PATHZ-CAP BUFFER: SLOT-FILE-BUF
    c CONFIG:PREPARE c KEEP-PHYSICAL
    c CONFIG:PATHS {: p :}
    TARGET DOWNLOAD 1 1 SLOT-IDENTITY {: id:LOCAL:download-slot-identity :}
-   p CONFIG:UPLOAD-STAGING-DIRECTORY CONFIG:ABS-PATH>STR str>
+   p CONFIG:UPLOAD-STAGING-DIRECTORY CONFIG:ABS-PATH>STR
    id [: TEST-CLIENT:UNPROTECTED ;] LOCAL:LEASE-DOWNLOAD-SLOT LOCAL:LEASE-OF
    {: slot:n b:LOCAL:binding found:bool :}
    found TTRUE
@@ -3397,17 +3407,17 @@ FS:PATHZ-CAP BUFFER: SLOT-FILE-BUF
 
 \ ---- renames
 
-: RENAMED$ ( LOCAL:rename-outcome -- ^u8 n )
+: RENAMED$ ( LOCAL:rename-outcome -- str )
    MATCH LOCAL:rename-outcome
       renamed OF s" renamed" ENDOF
       retry OF s" retry" ENDOF
    ;MATCH ;
 
-: CREDIT ( -- ^u8 n ) s" credit" ;
-: DESTINATION ( -- ^u8 n ) s" credit (case variant)" ;
-: PRESERVED ( -- ^u8 n ) s" preserved-by-racer" ;
+: CREDIT ( -- str ) s" credit" ;
+: DESTINATION ( -- str ) s" credit (case variant)" ;
+: PRESERVED ( -- str ) s" preserved-by-racer" ;
 
-: RENAME-VARIANT ( fd -- ^u8 n )
+: RENAME-VARIANT ( fd -- str )
    CREDIT DESTINATION LOCAL:RENAME-CASE-VARIANT RENAMED$ ;
 
 : RACED-RENAME ( fd -- )
@@ -3421,7 +3431,7 @@ FS:PATHZ-CAP BUFFER: SLOT-FILE-BUF
 
 : RETRIED-RENAME ( fd -- )
    {: root:fd :}
-   DESTINATION AT >str FS:REMOVE-FILE
+   DESTINATION AT FS:REMOVE-FILE
    root RENAME-VARIANT s" renamed" T$=
    CREDIT PRESENT? TFALSE
    s" credit (case variant)/receipt.pdf" BYTES s" receipt" T$=
@@ -3465,7 +3475,7 @@ FS:PATHZ-CAP BUFFER: SLOT-FILE-BUF
 : PARENT-LIMIT ( fd -- )
    {: root:fd :}
    root s" missing/c" LOCAL:PARENT-NAME-MAX NAME-MAX-OF TFALSE drop
-   s" a/b" AT >str FS:MAKE-DIRS
+   s" a/b" AT FS:MAKE-DIRS
    root s" a/b/c" LOCAL:PARENT-NAME-MAX NAME-MAX-OF TTRUE
    root FS:FD-NAME-MAX T= ;
 

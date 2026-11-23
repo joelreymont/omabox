@@ -18,29 +18,30 @@ require src/lib/test-fsm.f
 package TEST-FORMAL
 
 \ The bytes, copied into the arena.
-: KEPT ( ^u8 n ^ARENA:arena -- str )
-   {: a:^ u:n ar :}
+: KEPT ( str ^ARENA:arena -- str )
+   {: s:str ar :}
+   s STR:len {: u:n :}
    ar u ARENA:ALLOC drop {: b:^ :}
-   a b u BYTE-COPY
+   s STR:data b u BYTE-COPY
    b u >str ;
 
 \ The file at the path, whole, in the arena.
-: FILE$ ( ^u8 n ^ARENA:arena -- ^u8 n )
-   {: p:^ pu:n ar :}
-   p pu >str FS:FILE-SIZE {: u:n :}
+: FILE$ ( str ^ARENA:arena -- str )
+   {: p:str ar :}
+   p FS:FILE-SIZE {: u:n :}
    ar u ARENA:ALLOC drop {: b:^ :}
-   b  p pu b u FS:READ-ALL ;
+   b  p b u FS:READ-ALL >str ;
 
 \ TLC on the model's Follows module, its files in d; its output on a failure.
-: FOLLOWS-RUN ( CMD:command str ^u8 n -- CMD:command )
-   {: d:str m:^ mu:n :}
+: FOLLOWS-RUN ( CMD:command str str -- CMD:command )
+   {: d:str m:str :}
    s" tlc" CMD:ARG+ s" -workers" CMD:ARG+ s" 1" CMD:ARG+
    s" -metadir" CMD:ARG+
-   SB-RESET d str> SB-APPEND s" /tlc" SB-APPEND SB$ CMD:ARG+
+   SB-RESET d SB-APPEND s" /tlc" SB-APPEND SB$ CMD:ARG+
    s" -config" CMD:ARG+
-   SB-RESET m mu SB-APPEND s" Follows.cfg" SB-APPEND SB$ CMD:ARG+
-   SB-RESET m mu SB-APPEND s" Follows.tla" SB-APPEND SB$ CMD:ARG+
-   s" formal" >str CMD:CWD!  s" TMPDIR" d str> CMD:ENV+
+   SB-RESET m SB-APPEND s" Follows.cfg" SB-APPEND SB$ CMD:ARG+
+   SB-RESET m SB-APPEND s" Follows.tla" SB-APPEND SB$ CMD:ARG+
+   s" formal" CMD:CWD!  s" TMPDIR" d CMD:ENV+
    s" /usr/bin/env" 120000 >MS CMD:RUN-RC
    MATCH result ok OF ENDOF err OF ENDOF ;MATCH {: rc:n :}
    rc 0<> if CMD:OUT$ type then
@@ -50,14 +51,14 @@ public
 
 \ The model's copy of the source file's table is its lines; TLC finds the
 \ model follows them, run in a temp dir made under TMPDIR and removed.
-: HOLDS ( ^u8 n ^u8 n ^u8 n ^ARENA:arena -- )
-   {: f:^ fu:n n:^ nu:n m:^ mu:n ar :}
-   f fu n nu m mu ar TEST-FSM:TABLE-MODULE {: t:^ tu:n :}
-   tu 0= if exit then
-   SB-RESET s" formal/" SB-APPEND m mu SB-APPEND s" Table.tla" SB-APPEND
-   SB$ ar FILE$ t tu T$=
+: HOLDS ( str str str ^ARENA:arena -- )
+   {: f:str n:str m:str ar :}
+   f n m ar TEST-FSM:TABLE-MODULE {: t:str :}
+   t STR:len 0= if exit then
+   SB-RESET s" formal/" SB-APPEND m SB-APPEND s" Table.tla" SB-APPEND
+   SB$ ar FILE$ t T$=
    s" test-formal" FS:MKTEMP-DIR ar KEPT {: d:str :}
-   [: d m mu FOLLOWS-RUN ;] CMD:WITH-COMMAND
-   d str> FS:REMOVE-TREE ;
+   [: d m FOLLOWS-RUN ;] CMD:WITH-COMMAND
+   d FS:REMOVE-TREE ;
 
 ;package

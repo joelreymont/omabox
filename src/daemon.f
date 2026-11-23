@@ -58,42 +58,40 @@ STRUCTURE failure
    FIELD text str
 ;STRUCTURE
 
-: SETUP ( -- str ) s" Omabox setup is incomplete." >str ;
+: SETUP ( -- str ) s" Omabox setup is incomplete." ;
 : CONFIGURATION ( -- str )
-   s" Omabox configuration is unavailable." >str ;
+   s" Omabox configuration is unavailable." ;
 : CONFIGURATION-INVALID ( -- str )
-   s" Omabox configuration needs attention." >str ;
-: STATE ( -- str ) s" Omabox state storage is unavailable." >str ;
-: DISK-FULL ( -- str ) s" Local storage is full." >str ;
+   s" Omabox configuration needs attention." ;
+: STATE ( -- str ) s" Omabox state storage is unavailable." ;
+: DISK-FULL ( -- str ) s" Local storage is full." ;
 : JOURNAL ( -- str )
-   s" The sync journal is temporarily unavailable." >str ;
+   s" The sync journal is temporarily unavailable." ;
 : JOURNAL-INVALID ( -- str )
-   s" The sync journal needs attention." >str ;
+   s" The sync journal needs attention." ;
 : CREDENTIALS ( -- str )
-   s" Dropbox credentials are temporarily unavailable." >str ;
+   s" Dropbox credentials are temporarily unavailable." ;
 : CREDENTIAL-INVALID ( -- str )
-   s" Dropbox credentials need to be renewed." >str ;
+   s" Dropbox credentials need to be renewed." ;
 : DROPBOX ( -- str )
-   s" Dropbox is temporarily unavailable." >str ;
-: UNREACHABLE ( -- str ) s" Dropbox could not be reached." >str ;
+   s" Dropbox is temporarily unavailable." ;
+: UNREACHABLE ( -- str ) s" Dropbox could not be reached." ;
 : BINDING ( -- str )
-   s" The Dropbox account or sync root no longer matches setup." >str ;
+   s" The Dropbox account or sync root no longer matches setup." ;
 : SYNC-ROOT ( -- str )
-   s" The configured sync folder is temporarily unavailable." >str ;
+   s" The configured sync folder is temporarily unavailable." ;
 : ROOT-UNSUPPORTED ( -- str )
-   s" The sync folder's filesystem does not record creation times."
-   >str ;
+   s" The sync folder's filesystem does not record creation times." ;
 : SYNC-ERRORS ( -- str )
-   s" One or more files could not be synchronized." >str ;
+   s" One or more files could not be synchronized." ;
 : CURSOR ( -- str )
-   s" The Dropbox inventory cursor is temporarily unavailable." >str ;
+   s" The Dropbox inventory cursor is temporarily unavailable." ;
 : RUNNING ( -- str )
-   s" Another Omabox daemon is already running." >str ;
+   s" Another Omabox daemon is already running." ;
 : READINESS ( -- str )
-   s" Omabox could not notify the service manager that startup completed."
-   >str ;
+   s" Omabox could not notify the service manager that startup completed." ;
 : INTERNAL ( -- str )
-   s" Omabox stopped after detecting invalid internal state." >str ;
+   s" Omabox stopped after detecting invalid internal state." ;
 
 : ENVIRONMENTAL ( str -- failure )
    {: t:str :}
@@ -320,17 +318,17 @@ ENUM account-check
       mismatch OF drop false ENDOF
    ;MATCH ;
 
-: ACCOUNT$ ( ^session -- ^u8 n )
+: ACCOUNT$ ( ^session -- str )
    SESSION-BINDING @ JOURNAL-DROPBOX--BINDING:UNMAKE
-   {: a:str n:str r:str :} a str> ;
+   {: a:str n:str r:str :} a ;
 
-: NAMESPACE$ ( ^session -- ^u8 n )
+: NAMESPACE$ ( ^session -- str )
    SESSION-BINDING @ JOURNAL-DROPBOX--BINDING:UNMAKE
-   {: a:str n:str r:str :} n str> ;
+   {: a:str n:str r:str :} n ;
 
-: REMOTE-ROOT$ ( ^session -- ^u8 n )
+: REMOTE-ROOT$ ( ^session -- str )
    SESSION-BINDING @ JOURNAL-DROPBOX--BINDING:UNMAKE
-   {: a:str n:str r:str :} r str> ;
+   {: a:str n:str r:str :} r ;
 
 \ DROPBOX's check of the binding's remote root, its three refusals
 \ root-unavailable; unbound, which only LINK answers, a root that changed.
@@ -544,7 +542,7 @@ FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
    {: errno x :}
    LOG:WARN s" daemon" LOG:LINE
    s" could not send the systemd readiness notification: " LOG:TEXT+
-   errno FS:ERRNO$ str> LOG:TEXT+ LOG:;LINE
+   errno FS:ERRNO$ LOG:TEXT+ LOG:;LINE
    READINESS ENVIRONMENTAL x FAIL ;
 
 : NOTIFIED ( ^run -- bool )
@@ -586,8 +584,8 @@ FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
       ENDOF
    ;MATCH ;
 
-: ROTATED ( ^u8 n -- )
-   >str {: t:str :}
+: ROTATED ( str -- )
+   {: t:str :}
    STORED @ t AUTH:STORE ;
 
 \ The client's config: production's origins, the binding's namespace as
@@ -623,7 +621,7 @@ FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
    {: s x :}
    x RUN-SESSIONS @ LINKS-NEW {: l :}
    s SESSION-CLIENT @ l REPLAY-LINK:CLIENT !
-   s REMOTE-ROOT$ >str l REPLAY-LINK:ROOT !
+   s REMOTE-ROOT$ l REPLAY-LINK:ROOT !
    x STATUS@ l REPLAY-LINK:STATUS !
    l ;
 
@@ -820,7 +818,7 @@ FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
 : CURSOR-POLLED ( DROPBOX:cursor ^run -- bool )
    {: k:DROPBOX:cursor x :}
    RELEASE-HEAP
-   k DROPBOX:CURSOR>STR str> LONG-POLL-S x CLIENT@ DROPBOX:WAIT
+   k DROPBOX:CURSOR>STR LONG-POLL-S x CLIENT@ DROPBOX:WAIT
    x WOKEN ;
 
 \ The cursor stays in the pass's arena until the next pass ends.
@@ -870,7 +868,7 @@ FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
    {: ms x :}
    LOG:WARN s" daemon" LOG:LINE
    s" daemon operation failed; retrying in process seconds=" LOG:TEXT+
-   ms 1000 / LOG:INT+ s"  error=" LOG:TEXT+ x TEXT@ str> LOG:TEXT+
+   ms 1000 / LOG:INT+ s"  error=" LOG:TEXT+ x TEXT@ LOG:TEXT+
    x RUN-CODE @ CAUSE+ x CALL+ LOG:;LINE ;
 
 \ Rust's wait_for_failure for a failure that does not stop.
@@ -887,7 +885,7 @@ FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
    {: x :}
    x TEXT@ x STATUS@ STATUS:STOPPED
    LOG:ERROR s" daemon" LOG:LINE
-   s" daemon stopped: " LOG:TEXT+ x TEXT@ str> LOG:TEXT+
+   s" daemon stopped: " LOG:TEXT+ x TEXT@ LOG:TEXT+
    x RUN-CODE @ CAUSE+ x CALL+ LOG:;LINE ;
 
 : EXIT-STATUS ( ^run -- n ) DISPOSITION@ EXIT-CODE ;
@@ -1019,7 +1017,7 @@ public
    0 [: drop [: [: SLEEPS ;] swap RUN-IN ;] ARENA:WITH ;]
    catch {: n code :}
    code 0= if n exit then
-   LOG:ERROR s" daemon" LOG:LINE s" daemon stopped: " LOG:TEXT+ INTERNAL str>
+   LOG:ERROR s" daemon" LOG:LINE s" daemon stopped: " LOG:TEXT+ INTERNAL
    LOG:TEXT+ code CAUSE+ LOG:;LINE
    70 ;
 

@@ -51,64 +51,65 @@ $1A4 constant LOOSE-FILE
 
 : RUNTIME ( ^ARENA:arena -- str )
    {: ar :}
-   s" status-test" FS:MKTEMP-DIR {: p:^ u :}
+   s" status-test" FS:MKTEMP-DIR str> {: p:^ u :}
    ar u ARENA:ALLOC drop {: dst:^ :}
    p dst u BYTE-COPY
    dst u >str ;
 
 
 : GONE ( str -- )
-   str> FS:REMOVE-TREE ;
+   FS:REMOVE-TREE ;
 
 
 \ ---- the file ----------------------------------------------------
 
 \ status.json's path, in PATHS.
-: FILE-PATH ( ^status -- ^u8 n )
-   STATUS-DIR @ FILE$ >str PATHS CAP SPAN:MAKE
+: FILE-PATH ( ^status -- str )
+   STATUS-DIR @ FILE$ PATHS CAP SPAN:MAKE
    FS:JOIN-PATH-INTO {: u :}
-   PATHS u ;
+   PATHS u >str ;
 
 
-: READ ( ^status -- ^u8 n )
+: READ ( ^status -- str )
    FILE-PATH BODY CAP FS:READ-ALL {: u :}
-   BODY u ;
+   BODY u >str ;
 
 
-: PUT ( ^u8 n n -- n )
-   {: a:^ u at :}
+: PUT ( str n -- n )
+   {: s at :}
+   s str> {: a:^ u :}
    a WANT at + u BYTE-COPY
    at u + ;
 
 
 \ want's prefix, then s's updated_at and the closing brace.
-: WANTED ( ^status ^u8 n -- ^u8 n )
-   {: s want:^ wu :}
-   want wu 0 PUT
-   s STATUS-UPDATED @ FMT:INT$ rot PUT
-   s" }" rot PUT {: u :}
-   WANT u ;
+: WANTED ( ^status str -- str )
+   {: s want :}
+   want 0 PUT
+   s STATUS-UPDATED @ FMT:INT$ swap PUT
+   s" }" swap PUT {: u :}
+   WANT u >str ;
 
 
-: READS ( ^status ^u8 n -- )
-   {: s want:^ wu :}
-   s READ s want wu WANTED T$= ;
+: READS ( ^status str -- )
+   {: s want :}
+   s READ s want WANTED T$= ;
 
 
-: LISTED ( ^status -- ^u8 n )
-   STATUS-DIR @ str> NAMES CAP FS-LIST:NAMES {: u :}
-   NAMES u ;
+: LISTED ( ^status -- str )
+   STATUS-DIR @ NAMES CAP FS-LIST:NAMES {: u :}
+   NAMES u >str ;
 
 
-: PROGRESS ( ^status direction ^u8 n n option<n> -- )
-   {: s d:direction a:^ u done total :}
-   d a u >str done total STATUS-TRANSFER:MAKE
+: PROGRESS ( ^status direction str n option<n> -- )
+   {: s d:direction a done total :}
+   d a done total STATUS-TRANSFER:MAKE
    STATUS-EVENT:PROGRESS s TRANSFER ;
 
 
-: FINISH ( ^status direction ^u8 n n option<n> -- )
-   {: s d:direction a:^ u done total :}
-   d a u >str done total STATUS-TRANSFER:MAKE
+: FINISH ( ^status direction str n option<n> -- )
+   {: s d:direction a done total :}
+   d a done total STATUS-TRANSFER:MAKE
    STATUS-EVENT:FINISHED s TRANSFER ;
 
 
@@ -128,7 +129,7 @@ $1A4 constant LOOSE-FILE
    construct phase waiting s PHASE
    s HEARTBEAT
    s STATUS-DIR @ FS:STAT-MODE MODE-BITS and DIR-MODE T=
-   s FILE-PATH >str FS:STAT-MODE MODE-BITS and FILE-MODE T=
+   s FILE-PATH FS:STAT-MODE MODE-BITS and FILE-MODE T=
    s s\" {\"version\":3,\"phase\":\"waiting\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
    s LISTED FILE$ T$=
    rt GONE ;
@@ -143,7 +144,7 @@ $1A4 constant LOOSE-FILE
    s HEARTBEAT
    s s\" {\"version\":3,\"phase\":\"starting\",\"transfers\":[{\"direction\":\"download\",\"path\":\"folder/report.txt\",\"bytes_done\":4,\"bytes_total\":10}],\"last_error\":null,\"updated_at\":" READS
    s DOWN s" folder/report.txt" 0 UNKNOWN FINISH
-   s" Dropbox authentication is unavailable." >str s ERROR
+   s" Dropbox authentication is unavailable." s ERROR
    s s\" {\"version\":3,\"phase\":\"error\",\"transfers\":[],\"last_error\":\"Dropbox authentication is unavailable.\",\"updated_at\":" READS
    rt GONE ;
 
@@ -154,7 +155,7 @@ $1A4 constant LOOSE-FILE
    ar RUNTIME {: rt:str :}
    rt ar NEW {: s :}
    s UP s" folder/report.txt" 4 10 OF-N PROGRESS
-   s" Omabox setup is required." >str s STOPPED
+   s" Omabox setup is required." s STOPPED
    s s\" {\"version\":3,\"phase\":\"stopped\",\"transfers\":[],\"last_error\":\"Omabox setup is required.\",\"updated_at\":" READS
    rt GONE ;
 
@@ -204,15 +205,15 @@ $1A4 constant LOOSE-FILE
    s" failed_replacement_does_not_leave_a_temporary_file" T-LABEL
    ar RUNTIME {: rt:str :}
    rt ar NEW {: s :}
-   s FILE-PATH >str FS:REMOVE-FILE
+   s FILE-PATH FS:REMOVE-FILE
    s FILE-PATH FS:MAKE-DIR
    ar RUNTIME {: log:str :}
    log s" status.log" ar JOINED {: path:str :}
-   [: construct phase syncing s PHASE ;] path ar STDERR:CAPTURING str>
-   {: code:n e:^ u:n :}
+   [: construct phase syncing s PHASE ;] path ar STDERR:CAPTURING
+   {: code:n e :}
    code 0<> if code throw then
    s LISTED FILE$ T$=
-   e u s" status: could not replace the status file: " CONTAINS?
+   e s" status: could not replace the status file: " CONTAINS?
    TTRUE
    log GONE
    rt GONE ;
@@ -225,24 +226,24 @@ $1A4 constant LOOSE-FILE
    s" a retry's error clears once work completes" T-LABEL
    ar RUNTIME {: rt:str :}
    rt ar NEW {: s :}
-   s" Dropbox could not be reached." >str s ERROR
+   s" Dropbox could not be reached." s ERROR
    construct phase syncing s PHASE
    s COMPLETED
    s s\" {\"version\":3,\"phase\":\"syncing\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
-   s" Dropbox could not be reached." >str s ERROR
+   s" Dropbox could not be reached." s ERROR
    s UP s" good.txt" 4 10 OF-N PROGRESS
    s UP s" good.txt" 10 10 OF-N FINISH
    s s\" {\"version\":3,\"phase\":\"error\",\"transfers\":[{\"direction\":\"upload\",\"path\":\"good.txt\",\"bytes_done\":10,\"bytes_total\":10}],\"last_error\":\"Dropbox could not be reached.\",\"updated_at\":" READS
    s SYNC-ERROR
    s COMPLETED
    s s\" {\"version\":3,\"phase\":\"error\",\"transfers\":[{\"direction\":\"upload\",\"path\":\"good.txt\",\"bytes_done\":10,\"bytes_total\":10}],\"last_error\":\"One or more files could not be synchronized.\",\"updated_at\":" READS
-   s" Dropbox could not be reached." >str s ERROR
-   s" Dropbox could not be reached." >str s ERROR
+   s" Dropbox could not be reached." s ERROR
+   s" Dropbox could not be reached." s ERROR
    s COMPLETED
    s s\" {\"version\":3,\"phase\":\"error\",\"transfers\":[],\"last_error\":\"One or more files could not be synchronized.\",\"updated_at\":" READS
    s CLEAR-ERROR
    s s\" {\"version\":3,\"phase\":\"error\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
-   s" Omabox setup is required." >str s STOPPED
+   s" Omabox setup is required." s STOPPED
    s COMPLETED
    s s\" {\"version\":3,\"phase\":\"stopped\",\"transfers\":[],\"last_error\":\"Omabox setup is required.\",\"updated_at\":" READS
    rt GONE ;
@@ -252,10 +253,10 @@ $1A4 constant LOOSE-FILE
 
 \ status.json is a regular 0600 file, never a link.
 : PRIVATE-FILE ( ^status -- )
-   FILE-PATH {: file:^ fu :}
-   file fu FS:SYMLINK? TFALSE
-   file fu >str FS:FILE? TTRUE
-   file fu >str FS:STAT-MODE MODE-BITS and FILE-MODE T= ;
+   FILE-PATH {: file :}
+   file FS:SYMLINK? TFALSE
+   file FS:FILE? TTRUE
+   file FS:STAT-MODE MODE-BITS and FILE-MODE T= ;
 
 
 : LINK-AT-STATUS-IS-REPLACED-NEVER-FOLLOWED ( ^ARENA:arena -- )
@@ -266,7 +267,7 @@ $1A4 constant LOOSE-FILE
    s STATUS-DIR @ FILE$ ar JOINED {: file:str :}
    rt s" missing" ar JOINED {: gone:str :}
    rt s" target" ar JOINED {: kept:str :}
-   kept str> s" keep" FS:WRITE-ALL
+   kept s" keep" FS:WRITE-ALL
    kept LOOSE-FILE FS:CHMOD-MODE
    file FS:REMOVE-FILE
    gone file FS:MAKE-SYMLINK
@@ -279,8 +280,8 @@ $1A4 constant LOOSE-FILE
    construct phase syncing s PHASE
    s PRIVATE-FILE
    s s\" {\"version\":3,\"phase\":\"syncing\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
-   kept str> BODY CAP FS:READ-ALL {: u :}
-   BODY u s" keep" T$=
+   kept BODY CAP FS:READ-ALL {: u :}
+   BODY u >str s" keep" T$=
    kept FS:STAT-MODE MODE-BITS and LOOSE-FILE T=
    s LISTED FILE$ T$=
    rt GONE ;
@@ -291,17 +292,17 @@ $1A4 constant LOOSE-FILE
    s" a link at the temporary's name is swept" T-LABEL
    ar RUNTIME {: rt:str :}
    rt ar NEW {: s :}
-   s STATUS-DIR @ s STATUS-TEMP @ str> ar JOINED {: temp:str :}
+   s STATUS-DIR @ s STATUS-TEMP @ ar JOINED {: temp:str :}
    rt s" outside" ar JOINED {: kept:str :}
    rt s" missing" ar JOINED {: gone:str :}
-   kept str> s" keep" FS:WRITE-ALL
+   kept s" keep" FS:WRITE-ALL
    kept LOOSE-FILE FS:CHMOD-MODE
    kept temp FS:MAKE-SYMLINK
    construct phase waiting s PHASE
    s s\" {\"version\":3,\"phase\":\"waiting\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
    s LISTED FILE$ T$=
-   kept str> BODY CAP FS:READ-ALL {: u :}
-   BODY u s" keep" T$=
+   kept BODY CAP FS:READ-ALL {: u :}
+   BODY u >str s" keep" T$=
    kept FS:STAT-MODE MODE-BITS and LOOSE-FILE T=
    gone temp FS:MAKE-SYMLINK
    construct phase syncing s PHASE
@@ -317,9 +318,9 @@ $1A4 constant LOOSE-FILE
    ar RUNTIME {: rt:str :}
    rt ar NEW {: s :}
    s STATUS-DIR @ LOOSE-DIR FS:CHMOD-MODE
-   s FILE-PATH >str LOOSE-FILE FS:CHMOD-MODE
+   s FILE-PATH LOOSE-FILE FS:CHMOD-MODE
    s STATUS-DIR @ FS:STAT-MODE MODE-BITS and LOOSE-DIR T=
-   s FILE-PATH >str FS:STAT-MODE MODE-BITS and LOOSE-FILE T=
+   s FILE-PATH FS:STAT-MODE MODE-BITS and LOOSE-FILE T=
    rt ar NEW {: again :}
    again STATUS-DIR @ FS:STAT-MODE MODE-BITS and DIR-MODE T=
    again PRIVATE-FILE
@@ -329,28 +330,29 @@ $1A4 constant LOOSE-FILE
 
 
 \ a's bytes at PRE's offset at.
-: APPEND ( ^u8 n n -- n )
-   {: a:^ u at :}
+: APPEND ( str n -- n )
+   {: s at :}
+   s str> {: a:^ u :}
    a PRE at + u BYTE-COPY
    at u + ;
 
 
 \ An upload of path shows as shown, byte for byte.
-: SHOWS ( ^status ^u8 n ^u8 n -- )
-   {: s p:^ pu w:^ wu :}
-   s UP p pu 1 2 OF-N PROGRESS
+: SHOWS ( ^status str str -- )
+   {: s p w :}
+   s UP p 1 2 OF-N PROGRESS
    s\" {\"version\":3,\"phase\":\"starting\",\"transfers\":[{\"direction\":\"upload\",\"path\":\"" 0 APPEND
-   w wu rot APPEND
-   s\" \",\"bytes_done\":1,\"bytes_total\":2}],\"last_error\":null,\"updated_at\":" rot APPEND {: u :}
-   s PRE u READS ;
+   w swap APPEND
+   s\" \",\"bytes_done\":1,\"bytes_total\":2}],\"last_error\":null,\"updated_at\":" swap APPEND {: u :}
+   s PRE u >str READS ;
 
 
 \ deep/ and x up to LONG-U bytes, past the shown buffers' first 256.
-: LONG-PATH ( -- ^u8 n )
-   s" deep/" {: a:^ u :}
+: LONG-PATH ( -- str )
+   s" deep/" str> {: a:^ u :}
    a LONG u BYTE-COPY
    LONG-U u ?do $78 LONG i + c! loop
-   LONG LONG-U ;
+   LONG LONG-U >str ;
 
 
 \ Rust's display_path and to_string_lossy: one U+FFFD per maximal invalid
@@ -374,14 +376,14 @@ $1A4 constant LOOSE-FILE
    rt s" absent" ar JOINED {: absent:str :}
    ar RUNTIME {: log:str :}
    log s" status.log" ar JOINED {: path:str :}
-   [: [: s" run/user" >str ar NEW drop ;] E-RUNTIME-NOT-ABSOLUTE TTHROWS
+   [: [: s" run/user" ar NEW drop ;] E-RUNTIME-NOT-ABSOLUTE TTHROWS
       [: absent ar NEW drop ;] E-RUNTIME-UNAVAILABLE TTHROWS ;]
-   path ar STDERR:CAPTURING str> {: code:n e:^ u:n :}
+   path ar STDERR:CAPTURING {: code:n e :}
    code 0<> if code throw then
-   e u s" STATUS:E-RUNTIME-NOT-ABSOLUTE: XDG_RUNTIME_DIR must be absolute"
+   e s" STATUS:E-RUNTIME-NOT-ABSOLUTE: XDG_RUNTIME_DIR must be absolute"
    CONTAINS?
    TTRUE
-   e u s" STATUS:E-RUNTIME-UNAVAILABLE: XDG_RUNTIME_DIR is unavailable"
+   e s" STATUS:E-RUNTIME-UNAVAILABLE: XDG_RUNTIME_DIR is unavailable"
    CONTAINS? TTRUE
    absent FS:TRY-STAT TFALSE
    log GONE
@@ -397,7 +399,7 @@ $1A4 constant LOOSE-FILE
    rt link FS:MAKE-SYMLINK
    link ar NEW {: s :}
    rt s" omabox" ar JOINED FILE$ ar JOINED {: file:str :}
-   link str> FS:SYMLINK? TTRUE
+   link FS:SYMLINK? TTRUE
    file FS:FILE? TTRUE
    file FS:STAT-MODE MODE-BITS and FILE-MODE T=
    s s\" {\"version\":3,\"phase\":\"starting\",\"transfers\":[],\"last_error\":null,\"updated_at\":" READS
@@ -408,7 +410,7 @@ $1A4 constant LOOSE-FILE
 \ ---- a detached status ------------------------------------------
 
 \ Every change a detached status takes; a publish would log, as it has
-\ no buffer to encode into.
+\ no output to encode into.
 : CHANGES ( ^status -- )
    {: s :}
    construct phase syncing s PHASE
@@ -417,8 +419,8 @@ $1A4 constant LOOSE-FILE
    s UP s" folder/report.txt" 10 10 OF-N FINISH
    s SYNC-ERROR
    s CLEAR-ERROR
-   s" Dropbox is temporarily unavailable." >str s ERROR
-   s" Omabox setup is required." >str s STOPPED ;
+   s" Dropbox is temporarily unavailable." s ERROR
+   s" Omabox setup is required." s STOPPED ;
 
 
 : UNBEATING ( ^status -- )
@@ -436,9 +438,9 @@ $1A4 constant LOOSE-FILE
    ar DETACHED {: s :}
    ar RUNTIME {: log:str :}
    log s" status.log" ar JOINED {: path:str :}
-   [: s CHANGES s UNBEATING ;] path ar STDERR:CAPTURING str>
-   {: code:n e:^ u:n :}
-   code 0 T= u 0 T=
+   [: s CHANGES s UNBEATING ;] path ar STDERR:CAPTURING
+   {: code:n e :}
+   code 0 T= e STR:len 0 T=
    log GONE ;
 
 

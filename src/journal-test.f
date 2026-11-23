@@ -89,9 +89,10 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
 
 
 \ dir/name.
-: INSIDE ( str ^u8 n ^ARENA:arena -- str )
-   {: d:str a:^ u ar :}
+: INSIDE ( str str ^ARENA:arena -- str )
+   {: d:str n:str ar :}
    d str> {: p:^ pu :}
+   n str> {: a:^ u :}
    ar pu u + 1+ ARENA:ALLOC drop {: dst:^ :}
    p dst pu BYTE-COPY
    47 dst pu + c!
@@ -106,21 +107,21 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    d d s" journal.sqlite3" ar INSIDE ;
 
 
-: GONE ( str -- ) str> FS:REMOVE-TREE ;
+: GONE ( str -- ) FS:REMOVE-TREE ;
 
 : MODE-OF ( str -- n ) FS:STAT-MODE MODE-BITS and ;
 
 
 \ The action throws want with fd 2 sent to dir/stderr.txt, which then
 \ holds one line with the text and is removed.
-: LOGGED ( [ -- ] n str ^u8 n ^ARENA:arena -- )
-   {: want dir:str t:^ tu ar :}
+: LOGGED ( [ -- ] n str str ^ARENA:arena -- )
+   {: want dir:str t:str ar :}
    ACTION !
    dir s" stderr.txt" ar INSIDE {: f:str :}
-   ACTION @ f ar STDERR:CAPTURING str> {: code:n e:^ u:n :}
+   ACTION @ f ar STDERR:CAPTURING {: code:n e:str :}
    code want T=
-   e u >str 10 COUNT-CHAR 1 T=
-   e u t tu CONTAINS? TTRUE ;
+   e 10 COUNT-CHAR 1 T=
+   e t CONTAINS? TTRUE ;
 
 \ The action runs with fd 2 sent to dir/stderr.txt, which then is empty
 \ and is removed.
@@ -128,65 +129,64 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    {: dir:str ar :}
    ACTION !
    dir s" stderr.txt" ar INSIDE {: f:str :}
-   ACTION @ f ar STDERR:CAPTURING str> nip {: code:n u:n :}
+   ACTION @ f ar STDERR:CAPTURING {: code:n e:str :}
    code 0<> if code throw then
-   u 0 T= ;
+   e STR:len 0 T= ;
 
 
 \ ---- the oracle files --------------------------------------------
 
 \ BODY holds a newline, then the file at path.
-: ORACLE ( ^u8 n -- )
-   {: a:^ u :}
+: ORACLE ( str -- )
+   {: p:str :}
    10 BODY c!
-   a u BODY 1+ CAP 1- FS:READ-ALL 1+ BODY-U ! ;
+   p BODY 1+ CAP 1- FS:READ-ALL 1+ BODY-U ! ;
 
 
 \ BODY holds the text as a whole line.
-: HELD? ( ^u8 n -- bool )
-   {: a:^ u :}
+: HELD? ( str -- bool )
+   str> {: a:^ u :}
    10 LINE c!
    a LINE 1+ u BYTE-COPY
    10 LINE u + 1+ c!
-   BODY BODY-U @ LINE u 2 + CONTAINS? ;
+   BODY BODY-U @ >str LINE u 2 + >str CONTAINS? ;
 
 
 \ The oracle journal copied to path and migrated to schema 9 in one
 \ transaction, its completed work kept.
 : MIGRATED-ORACLE ( str -- )
    {: p:str :}
-   s" src/oracle/journal.sqlite3" p str> FS:COPY-FILE-STREAM
-   p str> SQLITE:OPEN {: c :}
+   s" src/oracle/journal.sqlite3" p FS:COPY-FILE-STREAM
+   p SQLITE:OPEN {: c :}
    c [: c MIGRATE-LOCAL-OBSERVATIONS ;] SQLITE:WITH-TRANSACTION
    c SQLITE:CLOSE ;
 
 
-: PUT ( ^u8 n n -- n )
-   {: a:^ u at :}
+: PUT ( str n -- n )
+   {: s:str at :}
+   s str> {: a:^ u :}
    a WANT at + u BYTE-COPY
    at u + ;
-
-: PUT-STR ( str n -- n ) {: s:str at :} s str> at PUT ;
 
 : PUT-N ( n n -- n ) {: v at :} v FMT:INT$ at PUT ;
 
 : PUT-QUOTED ( str n -- n )
    {: s:str at :}
-   s\" \"" at PUT  s swap PUT-STR  s\" \"" rot PUT ;
+   s\" \"" at PUT  s swap PUT  s\" \"" swap PUT ;
 
 
 \ ---- the bindings as the Rust version prints them ----------------
 
-: DROPBOX-DEBUG ( dropbox-binding -- ^u8 n )
+: DROPBOX-DEBUG ( dropbox-binding -- str )
    JOURNAL-DROPBOX--BINDING:UNMAKE {: acct:str ns:str root:str :}
    s\" dropbox_binding\tSome(DropboxBinding { account_id: " 0 PUT
    acct swap PUT-QUOTED
-   s" , root_namespace_id: " rot PUT
+   s" , root_namespace_id: " swap PUT
    ns swap PUT-QUOTED
-   s" , remote_root: " rot PUT
+   s" , remote_root: " swap PUT
    root swap PUT-QUOTED
-   s"  })" rot PUT {: u :}
-   WANT u ;
+   s"  })" swap PUT {: u :}
+   WANT u >str ;
 
 : BIRTH-DEBUG ( option<birth-time> n -- n )
    {: at :}
@@ -195,8 +195,8 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
       some OF
          JOURNAL-BIRTH--TIME:UNMAKE {: s ns :}
          s" Some(BirthTime { seconds: " at PUT  s swap PUT-N
-         s" , nanoseconds: " rot PUT  ns swap PUT-N
-         s"  })" rot PUT
+         s" , nanoseconds: " swap PUT  ns swap PUT-N
+         s"  })" swap PUT
       ENDOF
    ;MATCH ;
 
@@ -204,21 +204,21 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    {: at :}
    MATCH option
       none OF s" None" at PUT ENDOF
-      some OF {: v :} s" Some(" at PUT  v swap PUT-N  s" )" rot PUT ENDOF
+      some OF {: v :} s" Some(" at PUT  v swap PUT-N  s" )" swap PUT ENDOF
    ;MATCH ;
 
-: ROOT-DEBUG ( local-root-record -- ^u8 n )
+: ROOT-DEBUG ( local-root-record -- str )
    JOURNAL-LOCAL--ROOT--RECORD:UNMAKE {: b g :}
    b JOURNAL-LOCAL--ROOT--BINDING:UNMAKE {: p:str inode birth sub :}
    s\" local_root_binding\tSome(LocalRootRecord { binding: LocalRootBinding { canonical_path: "
    0 PUT
    p swap PUT-QUOTED
-   s" , inode: " rot PUT  inode swap PUT-N
-   s" , birth: " rot PUT  birth swap BIRTH-DEBUG
-   s" , subvolume: " rot PUT  sub swap SUBVOLUME-DEBUG
-   s"  }, generation: " rot PUT  g swap PUT-N
-   s"  })" rot PUT {: u :}
-   WANT u ;
+   s" , inode: " swap PUT  inode swap PUT-N
+   s" , birth: " swap PUT  birth swap BIRTH-DEBUG
+   s" , subvolume: " swap PUT  sub swap SUBVOLUME-DEBUG
+   s"  }, generation: " swap PUT  g swap PUT-N
+   s"  })" swap PUT {: u :}
+   WANT u >str ;
 
 : DROPBOX-HELD? ( option<dropbox-binding> -- bool )
    MATCH option
@@ -235,21 +235,20 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
 
 \ ---- bindings and outcomes ---------------------------------------
 
-: DROPBOX ( ^u8 n ^u8 n ^u8 n -- dropbox-binding )
-   {: a:^ au b:^ bu c:^ cu :}
-   a au >str b bu >str c cu >str JOURNAL-DROPBOX--BINDING:MAKE ;
+: DROPBOX ( str str str -- dropbox-binding )
+   JOURNAL-DROPBOX--BINDING:MAKE ;
 
 : BIRTH-5 ( -- birth-time ) 1700000000 5 JOURNAL-BIRTH--TIME:MAKE ;
 
 \ The Rust tests' local_root(path, inode).
-: LOCAL-ROOT ( ^u8 n n -- local-root-binding )
-   {: a:^ u inode :}
-   a u >str inode BIRTH-5 OPTION:SOME 256 OPTION:SOME
+: LOCAL-ROOT ( str n -- local-root-binding )
+   {: p:str inode :}
+   p inode BIRTH-5 OPTION:SOME 256 OPTION:SOME
    JOURNAL-LOCAL--ROOT--BINDING:MAKE ;
 
 \ The root a schema-6 journal recorded: no birth time, no subvolume.
 : LEGACY-ROOT ( -- local-root-record )
-   s" /sync/root" >str 2 NO-BIRTH NO-SUBVOLUME
+   s" /sync/root" 2 NO-BIRTH NO-SUBVOLUME
    JOURNAL-LOCAL--ROOT--BINDING:MAKE
    3 JOURNAL-LOCAL--ROOT--RECORD:MAKE ;
 
@@ -319,7 +318,7 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
 
 \ ---- the journal's rows ------------------------------------------
 
-: SCHEMA-SQL ( -- ^u8 n )
+: SCHEMA-SQL ( -- str )
    s" SELECT type || char(9) || name || char(9) || tbl_name || char(9)
          || coalesce(replace(replace(replace(sql, '\', '\\'),
             char(10), '\n'), char(9), '\t'), '')
@@ -335,19 +334,19 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
 \ Every table's and index's name and SQL, lower case, in BODY.
 : SCHEMA-TEXT ( SQLITE:statement -- n SQLITE:statement )
    SQLITE:STEP drop
-   0 SQLITE:COL-TEXT {: a:^ u :}
+   0 SQLITE:COL-TEXT str> {: a:^ u :}
    a BODY u BYTE-COPY
    u swap ;
 
 : VERSIONED ( str n -- )
    {: p:str v :}
-   p str> SQLITE:OPEN {: c :}
+   p SQLITE:OPEN {: c :}
    s" PRAGMA user_version = " 0 PUT v swap PUT-N {: u :}
-   c WANT u SQLITE:EXEC
+   c WANT u >str SQLITE:EXEC
    c SQLITE:CLOSE ;
 
 : VERSION-AT ( str -- n )
-   str> SQLITE:OPEN {: c :}
+   SQLITE:OPEN {: c :}
    c VERSION
    c SQLITE:CLOSE ;
 
@@ -373,21 +372,21 @@ TYPED-VARIABLE THE-HASHES ^VEC:vector<MODEL:hash-record>
 variable INDEXED       \ query plan rows that use the key's index
 variable SCANNED       \ query plan rows that scan the table
 
-: CONTENT ( ^u8 n -- DROPBOX:hash ) >str DROPBOX:>HASH ;
+: CONTENT ( str -- DROPBOX:hash ) DROPBOX:>HASH ;
 
-: CURSOR ( ^u8 n -- DROPBOX:cursor ) >str DROPBOX:>CURSOR ;
+: CURSOR ( str -- DROPBOX:cursor ) DROPBOX:>CURSOR ;
 
-: DISPLAY ( ^u8 n -- MODEL:path ) >str MODEL:>PATH ;
+: DISPLAY ( str -- MODEL:path ) MODEL:>PATH ;
 
-: CANONICAL ( ^u8 n ^ARENA:arena -- MODEL:key )
-   {: a:^ u ar :}
-   a u DISPLAY ar MODEL:FOLD ;
+: CANONICAL ( str ^ARENA:arena -- MODEL:key )
+   {: s:str ar :}
+   s DISPLAY ar MODEL:FOLD ;
 
-: REMOTE-FILE ( ^u8 n ^u8 n -- MODEL:remote )
-   {: c:^ cu r:^ ru :}
-   c cu CONTENT r ru >str DROPBOX:>REV MODEL-REMOTE:MAKE ;
+: REMOTE-FILE ( str str -- MODEL:remote )
+   {: c:str r:str :}
+   c CONTENT r DROPBOX:>REV MODEL-REMOTE:MAKE ;
 
-: PRESENT-REMOTE ( ^u8 n ^u8 n -- MODEL:observation<MODEL:remote> )
+: PRESENT-REMOTE ( str str -- MODEL:observation<MODEL:remote> )
    REMOTE-FILE MODEL-OBSERVATION:PRESENT ;
 
 : ABSENT-REMOTE ( -- MODEL:observation<MODEL:remote> )
@@ -396,7 +395,7 @@ variable SCANNED       \ query plan rows that scan the table
 : INACCESSIBLE ( -- MODEL:observation<MODEL:remote> )
    MODEL-UNKNOWN--REASON:INACCESSIBLE MODEL-OBSERVATION:UNKNOWN ;
 
-: PRESENT-LOCAL ( ^u8 n -- MODEL:observation<MODEL:local> )
+: PRESENT-LOCAL ( str -- MODEL:observation<MODEL:local> )
    CONTENT MODEL-LOCAL:MAKE MODEL-OBSERVATION:PRESENT ;
 
 : LOCAL-DIRECTORY ( -- MODEL:observation<MODEL:local> )
@@ -404,15 +403,15 @@ variable SCANNED       \ query plan rows that scan the table
 
 \ The Rust tests' record(key, path, observation).
 : REMOTE-RECORD
-   ( ^u8 n ^u8 n MODEL:observation<MODEL:remote> ^ARENA:arena
+   ( str str MODEL:observation<MODEL:remote> ^ARENA:arena
      -- MODEL:remote-record )
-   {: k:^ ku p:^ pu o ar :}
-   k ku ar CANONICAL p pu DISPLAY o MODEL-REMOTE--RECORD:MAKE ;
+   {: k:str p:str o ar :}
+   k ar CANONICAL p DISPLAY o MODEL-REMOTE--RECORD:MAKE ;
 
 : LOCAL-RECORD
-   ( ^u8 n MODEL:observation<MODEL:local> -- MODEL:local-record )
-   {: p:^ pu o :}
-   p pu DISPLAY o MODEL-LOCAL--RECORD:MAKE ;
+   ( str MODEL:observation<MODEL:local> -- MODEL:local-record )
+   {: p:str o :}
+   p DISPLAY o MODEL-LOCAL--RECORD:MAKE ;
 
 \ Sixty-four "a"s, a Dropbox content hash.
 : A-HASH ( ^ARENA:arena -- DROPBOX:hash )
@@ -421,15 +420,15 @@ variable SCANNED       \ query plan rows that scan the table
    d 64 >str DROPBOX:>HASH ;
 
 \ The Rust tests' local_hash(path, marker).
-: LOCAL-HASH ( ^u8 n n ^ARENA:arena -- MODEL:hash-record )
-   {: p:^ pu m ar :}
+: LOCAL-HASH ( str n ^ARENA:arena -- MODEL:hash-record )
+   {: p:str m ar :}
    m 1000000000 mod {: ns :}
-   p pu DISPLAY
+   p DISPLAY
    m 1 + m 2 + 1 ns 2 ns MODEL-FINGERPRINT:MAKE
    ar A-HASH MODEL-HASH--RECORD:MAKE ;
 
 \ A hash record at the path whose hash, "new", is not Dropbox's.
-: FOREIGN-HASH ( ^u8 n -- MODEL:hash-record )
+: FOREIGN-HASH ( str -- MODEL:hash-record )
    DISPLAY 1 2 1 0 2 0 MODEL-FINGERPRINT:MAKE s" new" CONTENT
    MODEL-HASH--RECORD:MAKE ;
 
@@ -493,11 +492,11 @@ variable SCANNED       \ query plan rows that scan the table
 
 \ ---- inventories' answers ----------------------------------------
 
-: CURSOR-IS? ( option<DROPBOX:cursor> ^u8 n -- bool )
-   {: a:^ u :}
+: CURSOR-IS? ( option<DROPBOX:cursor> str -- bool )
+   {: s:str :}
    MATCH option
       none OF false ENDOF
-      some OF DROPBOX:CURSOR>STR str> a u STR= ENDOF
+      some OF DROPBOX:CURSOR>STR s STR= ENDOF
    ;MATCH ;
 
 : REMOTES=
@@ -509,9 +508,9 @@ variable SCANNED       \ query plan rows that scan the table
       a i VEC:AT @ b i VEC:AT @ MODEL:REMOTE-RECORD= and
    loop ;
 
-: KEY-AT ( ^VEC:vector<MODEL:remote-record> n -- ^u8 n )
+: KEY-AT ( ^VEC:vector<MODEL:remote-record> n -- str )
    VEC:AT @ MODEL-REMOTE--RECORD:UNMAKE {: k:MODEL:key p o :}
-   k KEY-BYTES ;
+   k MODEL:KEY>STR ;
 
 : HELD-AS?
    ( MODEL:remote-record MODEL:key MODEL:observation<MODEL:remote>
@@ -536,11 +535,11 @@ variable SCANNED       \ query plan rows that scan the table
    v 0 VEC:AT @ MODEL-REMOTE--RECORD:UNMAKE {: k p o2 :}
    o o2 MODEL:REMOTE-OBSERVATION= ;
 
-: DIRECTORY-IS? ( option<MODEL:path> ^u8 n -- bool )
-   {: p:^ pu :}
+: DIRECTORY-IS? ( option<MODEL:path> str -- bool )
+   {: p:str :}
    MATCH option
       none OF false ENDOF
-      some OF PATH-BYTES p pu STR= ENDOF
+      some OF MODEL:PATH>STR p STR= ENDOF
    ;MATCH ;
 
 : NO-DIRECTORY? ( option<MODEL:path> -- bool )
@@ -550,53 +549,54 @@ variable SCANNED       \ query plan rows that scan the table
    ;MATCH ;
 
 : SUBTREE-PLAN-ROW ( SQLITE:statement -- SQLITE:statement )
-   3 SQLITE:COL-TEXT {: a:^ u :}
-   a u s" remote_observations_by_canonical_path" CONTAINS? if
+   3 SQLITE:COL-TEXT {: a:str :}
+   a s" remote_observations_by_canonical_path" CONTAINS? if
       1 INDEXED +!
    then
-   a u s" SCAN remote_observations" CONTAINS? if 1 SCANNED +! then ;
+   a s" SCAN remote_observations" CONTAINS? if 1 SCANNED +! then ;
 
 \ The plan of deleting what lies beneath "a".
 : SUBTREE-PLAN ( SQLITE:statement -- SQLITE:statement )
-   s" a/" >str 1 SQLITE:BIND-BLOB
-   s\" a/\xFF" >str 2 SQLITE:BIND-BLOB
+   s" a/" 1 SQLITE:BIND-BLOB
+   s\" a/\xFF" 2 SQLITE:BIND-BLOB
    begin SQLITE:STEP while SUBTREE-PLAN-ROW repeat ;
 
 
 \ ---- the Rust version's lines ------------------------------------
 
 \ The text of a JSON string without its quotes.
-: NAME-PUT ( n ^u8 n -- n )
-   {: at a:^ u :}
-   a 1+ u 2 - at PUT ;
+: NAME-PUT ( n str -- n )
+   {: at s:str :}
+   s str> {: a:^ u :}
+   a 1+ u 2 - >str at PUT ;
 
 : LOCAL-FILE-PUT ( n MODEL:local -- n )
    {: at l :}
    l MODEL-LOCAL:UNMAKE DROPBOX:HASH>STR {: h:str :}
    s" LocalFile { content: ContentIdentity(" at PUT
-   h swap PUT-QUOTED s" ) }" rot PUT ;
+   h swap PUT-QUOTED s" ) }" swap PUT ;
 
 : REMOTE-FILE-PUT ( n MODEL:remote -- n )
    {: at r :}
    r MODEL-REMOTE:UNMAKE {: h:DROPBOX:hash v:DROPBOX:rev :}
    s" RemoteFile { content: ContentIdentity(" at PUT
    h DROPBOX:HASH>STR swap PUT-QUOTED
-   s" ), revision: DropboxRevision(" rot PUT
-   v DROPBOX:REV>STR swap PUT-QUOTED s" ) }" rot PUT ;
+   s" ), revision: DropboxRevision(" swap PUT
+   v DROPBOX:REV>STR swap PUT-QUOTED s" ) }" swap PUT ;
 
 \ Rust names a reason as serde does, the name MODEL's writer quotes.
 : UNKNOWN-PUT ( n MODEL:unknown-reason ^JSON:writer -- n )
    {: at r w :}
    s" Unknown(" at PUT
    w [: r swap MODEL:UNKNOWN-REASON>JSON ;] ENCODE NAME-PUT
-   s" )" rot PUT ;
+   s" )" swap PUT ;
 
 : LOCAL-OBSERVATION-PUT
    ( n MODEL:observation<MODEL:local> ^JSON:writer -- n )
    {: at o w :}
    o MATCH MODEL:observation
       present OF
-         s" Present(" at PUT swap LOCAL-FILE-PUT s" )" rot PUT
+         s" Present(" at PUT swap LOCAL-FILE-PUT s" )" swap PUT
       ENDOF
       unknown OF {: r :} at r w UNKNOWN-PUT ENDOF
       directory OF
@@ -612,7 +612,7 @@ variable SCANNED       \ query plan rows that scan the table
    {: at o w :}
    o MATCH MODEL:observation
       present OF
-         s" Present(" at PUT swap REMOTE-FILE-PUT s" )" rot PUT
+         s" Present(" at PUT swap REMOTE-FILE-PUT s" )" swap PUT
       ENDOF
       unknown OF {: r :} at r w UNKNOWN-PUT ENDOF
       directory OF
@@ -628,17 +628,17 @@ variable SCANNED       \ query plan rows that scan the table
    r MODEL-LOCAL--RECORD:UNMAKE {: p:MODEL:path o :}
    s" LocalObservationRecord { path: " at PUT
    p MODEL:PATH>STR swap PUT-QUOTED
-   s" , observation: " rot PUT o w LOCAL-OBSERVATION-PUT
-   s"  }" rot PUT ;
+   s" , observation: " swap PUT o w LOCAL-OBSERVATION-PUT
+   s"  }" swap PUT ;
 
 : REMOTE-RECORD-PUT ( n MODEL:remote-record ^JSON:writer -- n )
    {: at r w :}
    r MODEL-REMOTE--RECORD:UNMAKE {: k:MODEL:key p:MODEL:path o :}
    s" RemoteObservationRecord { canonical_path: CanonicalPath(" at PUT
    k MODEL:KEY>STR swap PUT-QUOTED
-   s" ), path: " rot PUT p MODEL:PATH>STR swap PUT-QUOTED
-   s" , observation: " rot PUT o w REMOTE-OBSERVATION-PUT
-   s"  }" rot PUT ;
+   s" ), path: " swap PUT p MODEL:PATH>STR swap PUT-QUOTED
+   s" , observation: " swap PUT o w REMOTE-OBSERVATION-PUT
+   s"  }" swap PUT ;
 
 : SEPARATED ( n n -- n )
    {: at i :}
@@ -649,13 +649,13 @@ variable SCANNED       \ query plan rows that scan the table
    {: at v w :}
    s" [" at PUT
    v VEC:COUNT 0 ?do i SEPARATED v i VEC:AT @ w LOCAL-RECORD-PUT loop
-   s" ]" rot PUT ;
+   s" ]" swap PUT ;
 
 : REMOTES-PUT ( n ^VEC:vector<MODEL:remote-record> ^JSON:writer -- n )
    {: at v w :}
    s" [" at PUT
    v VEC:COUNT 0 ?do i SEPARATED v i VEC:AT @ w REMOTE-RECORD-PUT loop
-   s" ]" rot PUT ;
+   s" ]" swap PUT ;
 
 : CURSOR-PUT ( option<DROPBOX:cursor> n -- n )
    {: at :}
@@ -663,28 +663,28 @@ variable SCANNED       \ query plan rows that scan the table
       none OF s" None" at PUT ENDOF
       some OF
          DROPBOX:CURSOR>STR {: c:str :}
-         s" Some(" at PUT c swap PUT-QUOTED s" )" rot PUT
+         s" Some(" at PUT c swap PUT-QUOTED s" )" swap PUT
       ENDOF
    ;MATCH ;
 
 : LOCAL-INVENTORY-DEBUG
-   ( ^VEC:vector<MODEL:local-record> ^JSON:writer -- ^u8 n )
+   ( ^VEC:vector<MODEL:local-record> ^JSON:writer -- str )
    {: v w :}
    s\" local_inventory\t" 0 PUT v w LOCALS-PUT {: u :}
-   WANT u ;
+   WANT u >str ;
 
-: REMOTE-CURSOR-DEBUG ( option<DROPBOX:cursor> -- ^u8 n )
+: REMOTE-CURSOR-DEBUG ( option<DROPBOX:cursor> -- str )
    s\" remote_cursor\t" 0 PUT CURSOR-PUT {: u :}
-   WANT u ;
+   WANT u >str ;
 
-: REMOTE-INVENTORY-DEBUG ( remote-inventory ^JSON:writer -- ^u8 n )
+: REMOTE-INVENTORY-DEBUG ( remote-inventory ^JSON:writer -- str )
    {: inv w :}
    inv JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur v :}
    cur s\" remote_inventory\tRemoteInventory { cursor: " 0 PUT
    CURSOR-PUT
-   s" , observations: " rot PUT v w REMOTES-PUT
-   s"  }" rot PUT {: u :}
-   WANT u ;
+   s" , observations: " swap PUT v w REMOTES-PUT
+   s"  }" swap PUT {: u :}
+   WANT u >str ;
 
 : INVENTORY-LINES ( journal ^ARENA:arena ^JSON:writer -- )
    {: j ar w :}
@@ -712,7 +712,7 @@ variable SCANNED       \ query plan rows that scan the table
    ( SQLITE:connection ^VEC:vector<MODEL:local-record> ^JSON:writer -- )
    {: c v w :}
    c s" DELETE FROM local_observations" SQLITE:EXEC
-   c INSERT-LOCAL >str [: v w LOCAL-INSERTS ;] SQLITE:WITH-STATEMENT ;
+   c INSERT-LOCAL [: v w LOCAL-INSERTS ;] SQLITE:WITH-STATEMENT ;
 
 \ Replaces the local inventory, and nothing else, in one transaction.
 : PUBLISH-LOCAL-INVENTORY
@@ -731,7 +731,7 @@ variable SCANNED       \ query plan rows that scan the table
    s" src/oracle/schema.tsv" ORACLE
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
-   0 j >CONNECTION SCHEMA-SQL >str [: SCHEMA-ROWS ;] SQLITE:WITH-STATEMENT
+   0 j >CONNECTION SCHEMA-SQL [: SCHEMA-ROWS ;] SQLITE:WITH-STATEMENT
    26 T=
    j >CONNECTION VERSION 9 T=
    s\" user_version\t9" HELD? TTRUE
@@ -751,7 +751,7 @@ variable SCANNED       \ query plan rows that scan the table
    s" the oracle journal's bindings are journal.tsv's" T-LABEL
    s" src/oracle/journal.tsv" ORACLE
    ar JOURNAL-AT {: d:str p:str :}
-   s" src/oracle/journal.sqlite3" p str> FS:COPY-FILE-STREAM
+   s" src/oracle/journal.sqlite3" p FS:COPY-FILE-STREAM
    p OPEN {: j :}
    j ar DROPBOX-BINDING DROPBOX-HELD? TTRUE
    j ar LOCAL-ROOT-BINDING ROOT-HELD? TTRUE
@@ -761,8 +761,8 @@ variable SCANNED       \ query plan rows that scan the table
 \ The row's canonical path is the key MODEL:FOLD gives its path.
 : FOLDED? ( SQLITE:statement ^ARENA:arena -- SQLITE:statement bool )
    {: ar :}
-   0 SQLITE:COL-BLOB str> ar BYTES-PATH ar MODEL:FOLD {: k :}
-   1 SQLITE:COL-BLOB k KEY-BYTES >str SAME? ;
+   0 SQLITE:COL-BLOB ar BYTES-PATH ar MODEL:FOLD {: k :}
+   1 SQLITE:COL-BLOB k MODEL:KEY>STR SAME? ;
 
 \ Counts the rows, each one FOLDED? holds for.
 : FOLDED-ROWS ( n SQLITE:statement ^ARENA:arena -- n SQLITE:statement )
@@ -777,13 +777,13 @@ variable SCANNED       \ query plan rows that scan the table
    s" the oracle journal migrates to schema.tsv's schema" T-LABEL
    s" src/oracle/schema.tsv" ORACLE
    ar JOURNAL-AT {: d:str p:str :}
-   s" src/oracle/journal.sqlite3" p str> FS:COPY-FILE-STREAM
+   s" src/oracle/journal.sqlite3" p FS:COPY-FILE-STREAM
    p OPEN {: j :}
-   0 j >CONNECTION SCHEMA-SQL >str [: SCHEMA-ROWS ;] SQLITE:WITH-STATEMENT
+   0 j >CONNECTION SCHEMA-SQL [: SCHEMA-ROWS ;] SQLITE:WITH-STATEMENT
    26 T=
    j >CONNECTION VERSION 9 T=
    0 j >CONNECTION
-   s" SELECT path, canonical_path FROM local_observations" >str
+   s" SELECT path, canonical_path FROM local_observations"
    [: ar FOLDED-ROWS ;] SQLITE:WITH-STATEMENT 3 T=
    j CLOSE
    d GONE ;
@@ -794,15 +794,15 @@ variable SCANNED       \ query plan rows that scan the table
    {: ar :}
    s" a failed migration leaves schema 8 and every row" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
-   s" src/oracle/journal.sqlite3" p str> FS:COPY-FILE-STREAM
-   p str> SQLITE:OPEN {: c :}
+   s" src/oracle/journal.sqlite3" p FS:COPY-FILE-STREAM
+   p SQLITE:OPEN {: c :}
    c s" DROP INDEX remote_directories" SQLITE:EXEC
    c SQLITE:CLOSE
    p SUBJECT !
    [: SUBJECT @ OPEN CLOSE ;] SQLITE:E-SQL d
    s" no such index: remote_directories" ar LOGGED
    p VERSION-AT 8 T=
-   p str> SQLITE:OPEN {: k :}
+   p SQLITE:OPEN {: k :}
    k s" SELECT COUNT(*) FROM local_observations" QUERY-INT 3 T=
    k SQLITE:CLOSE
    d GONE ;
@@ -870,9 +870,9 @@ variable SCANNED       \ query plan rows that scan the table
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
    j >CONNECTION {: c :}
-   c s" PRAGMA journal_mode" >str [: DELETE-ROW? ;] SQLITE:WITH-STATEMENT
+   c s" PRAGMA journal_mode" [: DELETE-ROW? ;] SQLITE:WITH-STATEMENT
    TTRUE
-   c s" PRAGMA temp.journal_mode" >str [: MEMORY-ROW? ;] SQLITE:WITH-STATEMENT
+   c s" PRAGMA temp.journal_mode" [: MEMORY-ROW? ;] SQLITE:WITH-STATEMENT
    TTRUE
    c s" PRAGMA temp.secure_delete" QUERY-INT 0 T=
    c s" PRAGMA synchronous" QUERY-INT 2 T=
@@ -881,14 +881,14 @@ variable SCANNED       \ query plan rows that scan the table
    j CLOSE
    d GONE ;
 
-: CREATE-FAILED ( -- ^u8 n )
+: CREATE-FAILED ( -- str )
    s" journal operation `create journal database` failed for" ;
 
 \ Opening path throws E-FILE with a log line in dir holding the text.
-: OPEN-REFUSED ( str str ^u8 n ^ARENA:arena -- )
-   {: path:str dir:str t:^ tu ar :}
+: OPEN-REFUSED ( str str str ^ARENA:arena -- )
+   {: path:str dir:str t:str ar :}
    path SUBJECT !
-   [: SUBJECT @ OPEN CLOSE ;] E-FILE dir t tu ar LOGGED ;
+   [: SUBJECT @ OPEN CLOSE ;] E-FILE dir t ar LOGGED ;
 
 \ A file failure on ENOSPC throws E-DISK-FULL, logged as E-FILE is.
 : A-FULL-DISK-IS-ITS-OWN-CODE ( ^ARENA:arena -- )
@@ -896,7 +896,7 @@ variable SCANNED       \ query plan rows that scan the table
    s" a full disk is its own code" T-LABEL
    ar SCRATCH {: d:str :}
    d SUBJECT !
-   [: s" create journal database" >str SUBJECT @ E-FS-OPEN FS:ENOSPC
+   [: s" create journal database" SUBJECT @ E-FS-OPEN FS:ENOSPC
       FILE-FAILED ;] E-DISK-FULL d CREATE-FAILED ar LOGGED
    d GONE ;
 
@@ -906,7 +906,7 @@ variable SCANNED       \ query plan rows that scan the table
    s" journal_creation_reports_its_own_filesystem_failure" T-LABEL
    ar SCRATCH {: d:str :}
    d s" sealed" ar INSIDE {: sealed:str :}
-   sealed str> FS:MAKE-DIR
+   sealed FS:MAKE-DIR
    sealed MODE-SEALED FS:CHMOD-MODE
    sealed s" journal.sqlite3" ar INSIDE {: path:str :}
    path d CREATE-FAILED ar OPEN-REFUSED
@@ -923,7 +923,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    s" a failed open keeps the host errno" T-LABEL
    ar SCRATCH {: d:str :}
    d s" sealed" ar INSIDE {: sealed:str :}
-   sealed str> FS:MAKE-DIR
+   sealed FS:MAKE-DIR
    sealed MODE-SEALED FS:CHMOD-MODE
    sealed s" journal.sqlite3" ar INSIDE SUBJECT !
    [: OPEN-NOTING ;] E-FILE d CREATE-FAILED ar LOGGED
@@ -948,18 +948,18 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    OPEN-REFUSED
    d GONE ;
 
-: GARBAGE ( -- ^u8 n )
+: GARBAGE ( -- str )
    s" these bytes are text, not a SQLite database's" ;
 
 : GARBAGE-KEPT? ( str -- bool )
-   str> BODY CAP FS:READ-ALL {: u :}
-   BODY u GARBAGE STR= ;
+   BODY CAP FS:READ-ALL {: u :}
+   BODY u >str GARBAGE STR= ;
 
 : GARBAGE-FILE-IS-CORRUPT ( ^ARENA:arena -- )
    {: ar :}
    s" a file of other bytes is corrupt to both opens" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
-   p str> GARBAGE FS:WRITE-ALL
+   p GARBAGE FS:WRITE-ALL
    p SUBJECT !
    [: SUBJECT @ OPEN CLOSE ;] SQLITE:E-CORRUPT d
    s" file is not a database" ar LOGGED
@@ -974,7 +974,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    {: d:str :}
    d FS:TRY-STAT TTRUE
    FS:STAT-INO@ {: inode :}
-   d str> FS:OPEN-DIR {: dir:fd :}
+   d FS:OPEN-DIR {: dir:fd :}
    dir FS-STATX:BIRTH {: s ns born:bool :}
    dir FS-STATX:SUBVOLUME {: sub has:bool :}
    dir FS:CLOSE-DIR
@@ -990,14 +990,14 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    ar SCRATCH {: d:str :}
    d INSPECT d STATX-ROOT ROOT= TTRUE
    d s" not-a-root" ar INSIDE {: f:str :}
-   f str> s" file" FS:WRITE-ALL
+   f s" file" FS:WRITE-ALL
    f SUBJECT !
    [: SUBJECT @ INSPECT drop ;] E-ROOT d
    s" journal operation `inspect local root` failed for" ar LOGGED
    d GONE ;
 
 : UNBORN-SYNC ( -- )
-   s" /sync" >str 2 BIRTH-5 false 256 true FROM-STATX-FIELDS drop ;
+   s" /sync" 2 BIRTH-5 false 256 true FROM-STATX-FIELDS drop ;
 
 : ROOT-IDENTITY-REQUIRES-A-RECORDED-BIRTH-TIME ( ^ARENA:arena -- )
    {: ar :}
@@ -1005,13 +1005,13 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    ar SCRATCH {: d:str :}
    [: UNBORN-SYNC ;] E-NO-BIRTH-TIME d s" sync root `/sync` is on" ar
    LOGGED
-   s" /sync" >str 2 BIRTH-5 true 256 false FROM-STATX-FIELDS
+   s" /sync" 2 BIRTH-5 true 256 false FROM-STATX-FIELDS
    SUBVOLUME-OF NO-INT? TTRUE
    d GONE ;
 
-: RECORDED ( ^u8 n option<birth-time> -- local-root-record )
-   {: a:^ u birth :}
-   a u >str 2 birth NO-SUBVOLUME JOURNAL-LOCAL--ROOT--BINDING:MAKE
+: RECORDED ( str option<birth-time> -- local-root-record )
+   {: a:str birth :}
+   a 2 birth NO-SUBVOLUME JOURNAL-LOCAL--ROOT--BINDING:MAKE
    1 JOURNAL-LOCAL--ROOT--RECORD:MAKE ;
 
 \ The Rust test's last case, a File error, has no counterpart: the
@@ -1020,20 +1020,20 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    s" stand_in_needs_the_root_path_and_a_birth_time_or_another_inode"
    T-LABEL
    s" /sync/root" BIRTH-5 OPTION:SOME RECORDED {: born :}
-   born s" /sync/root" >str 2 STOOD-IN-BY? TTRUE
-   born s" /sync/root" >str 9 STOOD-IN-BY? TTRUE
+   born s" /sync/root" 2 STOOD-IN-BY? TTRUE
+   born s" /sync/root" 9 STOOD-IN-BY? TTRUE
    s" /sync/root" NO-BIRTH RECORDED {: legacy :}
-   legacy s" /sync/root" >str 9 STOOD-IN-BY? TTRUE
-   legacy s" /sync/root" >str 2 STOOD-IN-BY? TFALSE
+   legacy s" /sync/root" 9 STOOD-IN-BY? TTRUE
+   legacy s" /sync/root" 2 STOOD-IN-BY? TFALSE
    s" /sync/other" BIRTH-5 OPTION:SOME RECORDED {: elsewhere :}
-   elsewhere s" /sync/root" >str 9 STOOD-IN-BY? TFALSE ;
+   elsewhere s" /sync/root" 9 STOOD-IN-BY? TFALSE ;
 
 \ A directory whose filesystem reports no birth time.
-: SYS-KERNEL ( -- str ) s" /sys/kernel" >str ;
+: SYS-KERNEL ( -- str ) s" /sys/kernel" ;
 
 : SYS-INODE ( -- n ) SYS-KERNEL FS:TRY-STAT TTRUE FS:STAT-INO@ ;
 
-: SYS-REFUSAL ( -- ^u8 n ) s" sync root `/sys/kernel` is on" ;
+: SYS-REFUSAL ( -- str ) s" sync root `/sys/kernel` is on" ;
 
 : SYS-ROOT ( n option<birth-time> -- local-root-binding )
    {: inode birth :}
@@ -1143,14 +1143,14 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    j >CONNECTION
    s" SELECT lower(group_concat(name || ' ' || sql, char(10)))
       FROM sqlite_master
-      WHERE type IN ('table', 'index') AND sql IS NOT NULL"
-   >str [: SCHEMA-TEXT ;] SQLITE:WITH-STATEMENT {: u :}
-   BODY u s" oauth" CONTAINS? TFALSE
-   BODY u s" credential" CONTAINS? TFALSE
-   BODY u s" access_token" CONTAINS? TFALSE
-   BODY u s" refresh_token" CONTAINS? TFALSE
-   BODY u s" secret" CONTAINS? TFALSE
-   BODY u s" local_root_binding" CONTAINS? TTRUE
+      WHERE type IN ('table', 'index') AND sql IS NOT NULL" [: SCHEMA-TEXT ;] SQLITE:WITH-STATEMENT {: u :}
+   BODY u >str {: b:str :}
+   b s" oauth" CONTAINS? TFALSE
+   b s" credential" CONTAINS? TFALSE
+   b s" access_token" CONTAINS? TFALSE
+   b s" refresh_token" CONTAINS? TFALSE
+   b s" secret" CONTAINS? TFALSE
+   b s" local_root_binding" CONTAINS? TTRUE
    j CLOSE
    d GONE ;
 
@@ -1162,7 +1162,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    s" the oracle journal's inventories are journal.tsv's" T-LABEL
    s" src/oracle/journal.tsv" ORACLE
    ar JOURNAL-AT {: d:str p:str :}
-   s" src/oracle/journal.sqlite3" p str> FS:COPY-FILE-STREAM
+   s" src/oracle/journal.sqlite3" p FS:COPY-FILE-STREAM
    p OPEN {: j :}
    j ar [: INVENTORY-LINES ;] ENCODING
    j CLOSE
@@ -1199,8 +1199,8 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
 : BULK-PATH ( n ^ARENA:arena -- MODEL:path )
    {: n ar :}
    ar 14 ARENA:ALLOC drop {: dst:^ :}
-   s" bulk/" drop dst 5 BYTE-COPY
-   s" .txt" drop dst 10 + 4 BYTE-COPY
+   s" bulk/" STR:data dst 5 BYTE-COPY
+   s" .txt" STR:data dst 10 + 4 BYTE-COPY
    n 5 0 ?do dup 10 mod 48 + dst 9 i - + c! 10 / loop drop
    dst 14 >str MODEL:>PATH ;
 
@@ -1267,10 +1267,10 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    PRESENT-REMOTE ar REMOTE-RECORD v REMOTE+
    v ;
 
-: SUBTREE-PLAN-SQL ( -- ^u8 n )
+: SUBTREE-PLAN-SQL ( -- str )
    s" EXPLAIN QUERY PLAN " 0 PUT
-   DELETE-REMOTE-DESCENDANTS rot PUT {: u :}
-   WANT u ;
+   DELETE-REMOTE-DESCENDANTS swap PUT {: u :}
+   WANT u >str ;
 
 : REMOTE-DELTA-DELETES-ONLY-THE-NAMED-SUBTREE ( ^ARENA:arena -- )
    {: ar :}
@@ -1279,7 +1279,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    p OPEN {: j :}
    j s" cursor-old" CURSOR ar SUBTREE-SAMPLE PUBLISH-REMOTE-INVENTORY
    0 INDEXED !  0 SCANNED !
-   j >CONNECTION SUBTREE-PLAN-SQL >str [: SUBTREE-PLAN ;]
+   j >CONNECTION SUBTREE-PLAN-SQL [: SUBTREE-PLAN ;]
    SQLITE:WITH-STATEMENT
    INDEXED @ 0 > TTRUE
    SCANNED @ 0 T=
@@ -1327,9 +1327,9 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    v ;
 
 : DIRECTORY-AT
-   ( journal ^u8 n ^ARENA:arena -- option<MODEL:path> )
-   {: j k:^ ku ar :}
-   j k ku ar CANONICAL ar REMOTE-DIRECTORY-AT ;
+   ( journal str ^ARENA:arena -- option<MODEL:path> )
+   {: j k:str ar :}
+   j k ar CANONICAL ar REMOTE-DIRECTORY-AT ;
 
 \ Rust's remote_directory_paths_include_restricted_folders, one key
 \ at a time.
@@ -1538,11 +1538,11 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
 \ Adds the path's observation, with the content, and its hash, with
 \ the marker, to the scan.
 : SCAN+
-   ( ^u8 n ^u8 n n ^VEC:vector<MODEL:local-record>
+   ( str str n ^VEC:vector<MODEL:local-record>
      ^VEC:vector<MODEL:hash-record> ^ARENA:arena -- )
-   {: p:^ pu c:^ cu m obs hashes ar :}
-   p pu c cu PRESENT-LOCAL LOCAL-RECORD obs LOCAL+
-   p pu m ar LOCAL-HASH hashes HASH+ ;
+   {: p:str c:str m obs hashes ar :}
+   p c PRESENT-LOCAL LOCAL-RECORD obs LOCAL+
+   p m ar LOCAL-HASH hashes HASH+ ;
 
 \ The journal at the path, opened with /sync its active root.
 : ACTIVE-JOURNAL ( str ^ARENA:arena -- journal local-root-binding )
@@ -1620,7 +1620,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 
 \ The n-th path in byte order of "a-b", "a/x" and "a", put in with
 \ markers 1, 2 and 3, and its marker.
-: ORDERED-PATH ( n -- ^u8 n )
+: ORDERED-PATH ( n -- str )
    dup 0= if drop s" a" exit then
    1 = if s" a-b" exit then
    s" a/x" ;
@@ -1631,13 +1631,13 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    2 ;
 
 \ The paths SCAN-DISCARD of "a" keeps, in byte order.
-: SPARED-PATH ( n -- ^u8 n ) 0= if s" a-b" exit then s" ab" ;
+: SPARED-PATH ( n -- str ) 0= if s" a-b" exit then s" ab" ;
 
 \ The path is the n-th one of the order, counted in ROWS-SEEN.
-: SEEN-AT ( str [ n -- ^u8 n ] -- n )
+: SEEN-AT ( str [ n -- str ] -- n )
    {: p:str order :}
    ROWS-SEEN @ {: k :}
-   p str> k order execute STR= TTRUE
+   p k order execute STR= TTRUE
    1 ROWS-SEEN +!
    k ;
 
@@ -1697,8 +1697,8 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    s" old.txt" s" old" PRESENT-LOCAL LOCAL-RECORD SCAN-OBSERVE
    s" old.txt" 10 ar LOCAL-HASH SCAN-HASH
    s" old.txt" 10 ar LOCAL-HASH ar REUSED
-   s" old.txt" >str 10 MARKED-FINGERPRINT SCAN-JOB
-   s" old.txt" >str 10 MARKED-STAT SCAN-LISTED ;
+   s" old.txt" 10 MARKED-FINGERPRINT SCAN-JOB
+   s" old.txt" 10 MARKED-STAT SCAN-LISTED ;
 
 \ Observes and hashes new.txt, then publishes the scan.
 : NEW-PUBLISHED
@@ -1746,7 +1746,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    j CLOSE
    d GONE ;
 
-: DIRECTORY-LOCAL ( ^u8 n -- MODEL:local-record )
+: DIRECTORY-LOCAL ( str -- MODEL:local-record )
    LOCAL-DIRECTORY LOCAL-RECORD ;
 
 \ The journal at a new path, given to body, closed and removed after.
@@ -1772,9 +1772,9 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    ar [: [: ar REUSES-VISITED ;] WITH-SCAN ;] ON-NEW-JOURNAL ;
 
 : JOBS-VISITED ( scan -- scan )
-   s" a-b" >str 1 MARKED-FINGERPRINT SCAN-JOB
-   s" a/x" >str 2 MARKED-FINGERPRINT SCAN-JOB
-   s" a" >str 3 MARKED-FINGERPRINT SCAN-JOB
+   s" a-b" 1 MARKED-FINGERPRINT SCAN-JOB
+   s" a/x" 2 MARKED-FINGERPRINT SCAN-JOB
+   s" a" 3 MARKED-FINGERPRINT SCAN-JOB
    0 ROWS-SEEN !  [: JOB-SEEN ;] EACH-SCAN-JOB  ROWS-SEEN @ 3 T=
    0 ROWS-SEEN !  [: JOB-COUNTED ;] EACH-SCAN-JOB  ROWS-SEEN @ 0 T= ;
 
@@ -1783,9 +1783,9 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    [: [: JOBS-VISITED ;] WITH-SCAN ;] ON-NEW-JOURNAL ;
 
 : LISTINGS-VISITED ( scan -- scan )
-   s" a-b" >str 1 MARKED-STAT SCAN-LISTED
-   s" a/x" >str 2 MARKED-STAT SCAN-LISTED
-   s" a" >str 3 MARKED-STAT SCAN-LISTED
+   s" a-b" 1 MARKED-STAT SCAN-LISTED
+   s" a/x" 2 MARKED-STAT SCAN-LISTED
+   s" a" 3 MARKED-STAT SCAN-LISTED
    0 ROWS-SEEN !  [: LISTED-SEEN ;] EACH-SCAN-LISTED  ROWS-SEEN @ 3 T=
    0 ROWS-SEEN !  [: LISTED-COUNTED ;] EACH-SCAN-LISTED
    ROWS-SEEN @ 0 T= ;
@@ -1802,7 +1802,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    true ;
 
 \ a.txt's hash at marker 10 spaced as MODEL never writes it.
-: SPACED-HASH ( -- ^u8 n )
+: SPACED-HASH ( -- str )
    s\" { \"fingerprint\": { \"inode\": 11, \"size\": 12,
       \"modified_seconds\": 1, \"modified_nanoseconds\": 10,
       \"changed_seconds\": 2, \"changed_nanoseconds\": 10 },
@@ -1810,16 +1810,16 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
       \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }" ;
 
 \ The local hash cache's rows stored as the text.
-: STORED-AS ( journal ^u8 n -- n )
-   {: j a:^ u:n :}
+: STORED-AS ( journal str -- n )
+   {: j a:str :}
    j >CONNECTION
-   s" SELECT COUNT(*) FROM local_hash_cache WHERE hash_json = ?1" >str
-   [: a u >str 1 SQLITE:BIND-TEXT INT-ROW ;] SQLITE:WITH-STATEMENT ;
+   s" SELECT COUNT(*) FROM local_hash_cache WHERE hash_json = ?1"
+   [: a 1 SQLITE:BIND-TEXT INT-ROW ;] SQLITE:WITH-STATEMENT ;
 
 : CONFIRMED-PUBLISHED
    ( scan local-root-binding ^ARENA:arena -- scan )
    {: b ar :}
-   s" a.txt" 10 ar LOCAL-HASH SPACED-HASH >str SCAN-REUSE
+   s" a.txt" 10 ar LOCAL-HASH SPACED-HASH SCAN-REUSE
    [: CONFIRMED ;] EACH-SCAN-REUSE
    b PUBLISH-SCAN TTRUE ;
 
@@ -1854,7 +1854,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    s" ab" s" c" PRESENT-LOCAL LOCAL-RECORD EVERYWHERE
    s" a/y" 5 ar LOCAL-HASH ar REUSED
    s" a/z" 6 ar LOCAL-HASH SCAN-HASH
-   s" a" >str SCAN-DISCARD
+   s" a" SCAN-DISCARD
    0 ROWS-SEEN !  [: JOB-KEPT ;] EACH-SCAN-JOB  ROWS-SEEN @ 2 T=
    0 ROWS-SEEN !  [: LISTED-KEPT ;] EACH-SCAN-LISTED  ROWS-SEEN @ 2 T=
    0 ROWS-SEEN !  [: REUSE-COUNTED ;] EACH-SCAN-REUSE  ROWS-SEEN @ 0 T=
@@ -1881,11 +1881,11 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 \ a.txt's hash comes with the text it is stored as; b.txt has neither.
 : LOOKED-UP-IN ( scan MODEL:hash-record ^ARENA:arena -- scan )
    {: want ar :}
-   s" a.txt" >str ar CACHED-HASH TTRUE {: r json:str :}
+   s" a.txt" ar CACHED-HASH TTRUE {: r json:str :}
    r want MODEL:HASH-RECORD= TTRUE
-   SCAN-JOURNAL json str> STORED-AS 1 T=
-   s" b.txt" >str ar CACHED-HASH TFALSE {: empty:str :}
-   empty str> nip 0 T= DROP-HASH-RECORD ;
+   SCAN-JOURNAL json STORED-AS 1 T=
+   s" b.txt" ar CACHED-HASH TFALSE {: empty:str :}
+   empty STR:len 0 T= DROP-HASH-RECORD ;
 
 : CACHED-HASH-ANSWERS-THE-PUBLISHED-HASH ( ^ARENA:arena -- )
    {: ar :}
@@ -1902,7 +1902,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 \ Another connection takes the journal at SUBJECT for writing, waiting
 \ for no lock, and lets it go.
 : EXCLUSIVE ( -- )
-   SUBJECT @ str> SQLITE:OPEN {: c :}
+   SUBJECT @ SQLITE:OPEN {: c :}
    [: c s" BEGIN EXCLUSIVE; COMMIT" SQLITE:EXEC ;] [: c SQLITE:CLOSE ;]
    finally ;
 
@@ -1913,14 +1913,14 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 
 \ n writes of the scan, each a job at "a".
 : JOBS-WRITTEN ( scan n -- scan )
-   0 ?do s" a" >str 1 MARKED-FINGERPRINT SCAN-JOB loop ;
+   0 ?do s" a" 1 MARKED-FINGERPRINT SCAN-JOB loop ;
 
 \ CACHED-HASH reads main, in the open batch if there is one; it finds
 \ no hash for "a.txt".
 : LOOKED-UP-NONE ( scan ^ARENA:arena -- scan )
    {: ar :}
-   s" a.txt" >str ar CACHED-HASH TFALSE {: none:str :}
-   none str> nip 0 T= DROP-HASH-RECORD ;
+   s" a.txt" ar CACHED-HASH TFALSE {: none:str :}
+   none STR:len 0 T= DROP-HASH-RECORD ;
 
 \ A write opens the batch and a lookup reads main into it; the batch holds
 \ main through BATCH-BOUND writes, and the write past them commits it.
@@ -1993,13 +1993,13 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 : TEMP-CAPPED ( SQLITE:connection n -- )
    {: c n :}
    s" PRAGMA temp.max_page_count = " 0 PUT  n swap PUT-N {: u :}
-   c WANT u SQLITE:EXEC ;
+   c WANT u >str SQLITE:EXEC ;
 
 \ Jobs at new paths fill the scan's temporary database, capped at its
 \ size, until a write fails.
 : FILLED-SCAN ( scan -- scan )
    SCAN-JOURNAL >CONNECTION 1 TEMP-CAPPED
-   100000 0 ?do i FMT:INT$ >str 1 MARKED-FINGERPRINT SCAN-JOB loop ;
+   100000 0 ?do i FMT:INT$ 1 MARKED-FINGERPRINT SCAN-JOB loop ;
 
 : FULL-SCAN ( -- ) THE-JOURNAL @ [: FILLED-SCAN ;] WITH-SCAN ;
 
@@ -2022,25 +2022,25 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 
 \ The piece of p from at joins v as a directory; the index after it,
 \ or -1 past the last.
-: SCAN-PIECE ( ^u8 n n ^VEC:vector<MODEL:local-record> -- n )
-   {: p:^ u:n at:n v :}
-   p u 32 at SPLIT-NEXT 0= if 2drop drop -1 exit then
-   {: q:^ w:n next:n :}
-   q w DIRECTORY-LOCAL v LOCAL+ next ;
+: SCAN-PIECE ( str n ^VEC:vector<MODEL:local-record> -- n )
+   {: p:str at:n v :}
+   p 32 at SPLIT-NEXT 0= if 2drop -1 exit then
+   {: q:str next:n :}
+   q DIRECTORY-LOCAL v LOCAL+ next ;
 
 \ The local inventory is directories at the paths p names, in its
 \ order and apart by spaces, with no hashes.
-: LOCAL-SCAN ( journal local-root-binding ^u8 n ^ARENA:arena -- )
-   {: j b p:^ u:n ar :}
+: LOCAL-SCAN ( journal local-root-binding str ^ARENA:arena -- )
+   {: j b p:str ar :}
    ar LOCALS {: v :}
-   0 begin p u rot v SCAN-PIECE dup 0< until drop
+   0 begin p swap v SCAN-PIECE dup 0< until drop
    j b v ar HASHES PUBLISH-LOCAL-SCAN TTRUE ;
 
 \ Each record's path then a space, and "|" after the key's last.
 : VISIT-PUT ( ^VEC:vector<MODEL:local-record> -- )
    {: v :}
    v VEC:COUNT 0 ?do
-      v i VEC:AT @ MODEL-LOCAL--RECORD:UNMAKE drop PATH-BYTES SB-APPEND
+      v i VEC:AT @ MODEL-LOCAL--RECORD:UNMAKE drop MODEL:PATH>STR SB-APPEND
       s"  " SB-APPEND
    loop
    s" |" SB-APPEND ;
@@ -2051,13 +2051,13 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 \ VISIT-PUT's text of the keys EACH-LOCAL-COLLISION visits with v.
 : VISITS
    ( journal [ ^VEC:vector<MODEL:local-record> -- bool ] ^ARENA:arena
-     -- ^u8 n )
+     -- str )
    {: j v ar :}
-   SB-RESET j ar v EACH-LOCAL-COLLISION SB$ ar COPIED str> ;
+   SB-RESET j ar v EACH-LOCAL-COLLISION SB$ ar COPIED ;
 
-: KEY-BEFORE? ( ^u8 n ^u8 n ^ARENA:arena -- bool )
-   {: a:^ au:n b:^ bu:n ar :}
-   a au ar CANONICAL b bu ar CANONICAL MODEL:KEY-CMP 0< ;
+: KEY-BEFORE? ( str str ^ARENA:arena -- bool )
+   {: a:str b:str ar :}
+   a ar CANONICAL b ar CANONICAL MODEL:KEY-CMP 0< ;
 
 : COLLISIONS-VISITED ( journal local-root-binding ^ARENA:arena -- )
    {: j b ar :}
@@ -2085,11 +2085,11 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    j CLOSE
    d GONE ;
 
-: LOCAL-AT$ ( journal ^u8 n ^ARENA:arena -- ^u8 n )
-   {: j k:^ ku:n ar :}
-   j k ku ar CANONICAL ar LOCAL-AT MATCH option
+: LOCAL-AT$ ( journal str ^ARENA:arena -- str )
+   {: j k:str ar :}
+   j k ar CANONICAL ar LOCAL-AT MATCH option
       none OF s" (none)" ENDOF
-      some OF MODEL-LOCAL--RECORD:UNMAKE drop PATH-BYTES ENDOF
+      some OF MODEL-LOCAL--RECORD:UNMAKE drop MODEL:PATH>STR ENDOF
    ;MATCH ;
 
 \ LOCAL-COUNT counts the local rows; LOCAL-AT answers a key's least
@@ -2113,7 +2113,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 
 \ A row of each family at its own key, every value a directory, each
 \ canonical path as MODEL:FOLD gives it.
-: KNOWN-FIXTURE ( -- ^u8 n )
+: KNOWN-FIXTURE ( -- str )
    s\" INSERT INTO baselines(path, baseline_json, canonical_path)
          SELECT CAST(column1 AS BLOB), column2, CAST(column3 AS BLOB)
          FROM (VALUES ('Base', '\"Directory\"', 'base'),
@@ -2144,7 +2144,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 \ fixture's directory.
 : HELD-PUT ( MODEL:path bool -- )
    0= if s" ?" SB-APPEND then
-   PATH-BYTES SB-APPEND s"  " SB-APPEND ;
+   MODEL:PATH>STR SB-APPEND s"  " SB-APPEND ;
 
 : KNOWN-BASELINE-PUT ( option<path-baseline> -- )
    MATCH option
@@ -2190,24 +2190,24 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 \ apart by spaces, "-" for none, then "|".
 : KNOWN-PUT ( known-path -- )
    JOURNAL-KNOWN--PATH:UNMAKE {: k b l n r t live:bool :}
-   k KEY-BYTES SB-APPEND s"  " SB-APPEND
+   k MODEL:KEY>STR SB-APPEND s"  " SB-APPEND
    b KNOWN-BASELINE-PUT l KNOWN-LOCAL-PUT
    n FMT:INT$ SB-APPEND s"  " SB-APPEND
    r k KNOWN-REMOTE-PUT t SUBTREE-PUT live LIVE-PUT ;
 
 \ KNOWN-PUT's text of the keys EACH-KNOWN-PATH visits in ar.
-: KNOWN-VISITS ( journal ^ARENA:arena -- ^u8 n )
+: KNOWN-VISITS ( journal ^ARENA:arena -- str )
    {: j ar :}
    SB-RESET j ar [: KNOWN-PUT ;] EACH-KNOWN-PATH SB$ ;
 
-: KNOWN-AT$ ( journal ^u8 n ^ARENA:arena -- ^u8 n )
-   {: j k:^ ku:n ar :}
-   SB-RESET j k ku ar CANONICAL ar KNOWN-PATH-AT KNOWN-PUT
-   SB$ ar COPIED str> ;
+: KNOWN-AT$ ( journal str ^ARENA:arena -- str )
+   {: j k:str ar :}
+   SB-RESET j k ar CANONICAL ar KNOWN-PATH-AT KNOWN-PUT
+   SB$ ar COPIED ;
 
 \ The fixture's keys in byte order: "a.txt" before "a/b" ('.' before
 \ '/'), and neither the Absent baseline nor the completed plan.
-: KNOWN-WANT ( ^ARENA:arena -- ^u8 n )
+: KNOWN-WANT ( ^ARENA:arena -- str )
    {: ar :}
    SB-RESET
    s" a - - 0 A occupied -|" SB-APPEND
@@ -2219,7 +2219,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    s" live - - 0 - empty live|" SB-APPEND
    s" local - local 1 - empty -|" SB-APPEND
    s" pair - Pair 2 - empty -|" SB-APPEND
-   SB$ ar COPIED str> ;
+   SB$ ar COPIED ;
 
 \ Each held key once, in byte order, with its least local path; at one
 \ key the same, and only the subtree where nothing holds the key.
@@ -2229,8 +2229,8 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
    j >CONNECTION KNOWN-FIXTURE SQLITE:EXEC
-   ar KNOWN-WANT {: w:^ wu:n :}
-   j [: KNOWN-VISITS ;] ARENA:WITH ar COPIED str> w wu T$=
+   ar KNOWN-WANT {: w:str :}
+   j [: KNOWN-VISITS ;] ARENA:WITH ar COPIED w T$=
    j s" Pair" ar KNOWN-AT$ s" pair - Pair 2 - empty -|" T$=
    j s" a" ar KNOWN-AT$ s" a - - 0 A occupied -|" T$=
    j s" gone" ar KNOWN-AT$ s" gone - - 0 - empty -|" T$=
@@ -2240,9 +2240,9 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 
 \ A remote directory at the path, keyed by its fold.
 : REMOTE-DIRECTORY+
-   ( ^VEC:vector<MODEL:remote-record> ^u8 n ^ARENA:arena -- )
-   {: v p:^ u:n ar :}
-   p u p u REMOTE-DIRECTORY ar REMOTE-RECORD v REMOTE+ ;
+   ( ^VEC:vector<MODEL:remote-record> str ^ARENA:arena -- )
+   {: v p:str ar :}
+   p p REMOTE-DIRECTORY ar REMOTE-RECORD v REMOTE+ ;
 
 \ report.txt sorts between report and its children; repo0 is the upper
 \ bound of repo's subtree; deep/FF is the last child deep can hold.
@@ -2258,9 +2258,9 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    v ;
 
 \ SUBTREE-PUT's text of the subtree KNOWN-PATH-AT answers at the path.
-: SUBTREE-AT ( journal ^u8 n ^ARENA:arena -- ^u8 n )
-   {: j p:^ u:n ar :}
-   j p u ar CANONICAL ar KNOWN-PATH-AT
+: SUBTREE-AT ( journal str ^ARENA:arena -- str )
+   {: j p:str ar :}
+   j p ar CANONICAL ar KNOWN-PATH-AT
    JOURNAL-KNOWN--PATH:UNMAKE {: k b l n r t live:bool :}
    SB-RESET t SUBTREE-PUT SB$ ;
 
@@ -2290,13 +2290,12 @@ TYPED-VARIABLE PLANS ^VEC:vector<path-plan>
 TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
 
 : PATH= ( MODEL:path MODEL:path -- bool )
-   PATH-BYTES {: b:^ bu :}
-   PATH-BYTES b bu STR= ;
+   {: a b :} a MODEL:PATH>STR b MODEL:PATH>STR STR= ;
 
 \ The planner's decisions for the Rust tests' plan() calls, built here
 \ as src/oracle/plan.tsv holds them. An upload: a new local file, no
 \ remote one, no baseline.
-: UPLOAD-DECISION ( ^u8 n -- MODEL:decision )
+: UPLOAD-DECISION ( str -- MODEL:decision )
    CONTENT MODEL-OPERATION:CREATE-REMOTE MODEL-DECISION:OPERATE ;
 
 \ Both sides present with the remote file's content, whatever the
@@ -2317,7 +2316,7 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
 : DIRECTORY-DECISION ( -- MODEL:decision )
    MODEL-BASELINE:DIRECTORY MODEL-DECISION:NOOP ;
 
-: TEST-PATH ( -- str ) s" test" >str ;
+: TEST-PATH ( -- str ) s" test" ;
 
 : ONE-PLAN ( MODEL:operation ^ARENA:arena -- operation-plan )
    {: o ar :}
@@ -2326,8 +2325,8 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    ops JOURNAL-OPERATION--PLAN:MAKE ;
 
 : NOT-OPERATIONS ( -- )
-   s" extract test operation plan" >str TEST-PATH
-   s" test expected planner operations" >str INVALID ;
+   s" extract test operation plan" TEST-PATH
+   s" test expected planner operations" INVALID ;
 
 \ The Rust tests' operations(decision).
 : OPERATIONS ( MODEL:decision ^ARENA:arena -- operation-plan )
@@ -2341,8 +2340,8 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    ;MATCH ;
 
 : NOT-NOOP ( -- )
-   s" extract test no-op" >str TEST-PATH
-   s" test expected a planner no-op" >str INVALID ;
+   s" extract test no-op" TEST-PATH
+   s" test expected a planner no-op" INVALID ;
 
 \ The Rust tests' noop(decision): the baseline it records.
 : NOOP ( MODEL:decision -- MODEL:baseline )
@@ -2359,8 +2358,8 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    MATCH plan-write
       recorded OF ENDOF
       already-live OF
-         drop s" extract recorded test plan" >str TEST-PATH
-         s" test expected a newly recorded plan" >str INVALID
+         drop s" extract recorded test plan" TEST-PATH
+         s" test expected a newly recorded plan" INVALID
       ENDOF
    ;MATCH ;
 
@@ -2438,26 +2437,25 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    true ;
 
 \ The paths' vector holds the two paths, in order.
-: TWO-PATHS? ( ^VEC:vector<MODEL:path> ^u8 n ^u8 n -- bool )
-   {: v a:^ au b:^ bu :}
+: TWO-PATHS? ( ^VEC:vector<MODEL:path> str str -- bool )
+   {: v a:str b:str :}
    v VEC:COUNT 2 <> if false exit then
-   v 0 VEC:AT @ a au DISPLAY PATH=
-   v 1 VEC:AT @ b bu DISPLAY PATH= and ;
+   v 0 VEC:AT @ a DISPLAY PATH=
+   v 1 VEC:AT @ b DISPLAY PATH= and ;
 
 : ROWS-AT ( journal MODEL:path -- n )
    {: j path :}
-   j >CONNECTION s" SELECT COUNT(*) FROM baselines WHERE path = ?1"
-   >str [: path PATH-BYTES >str 1 SQLITE:BIND-BLOB INT-ROW ;]
+   j >CONNECTION s" SELECT COUNT(*) FROM baselines WHERE path = ?1" [: path MODEL:PATH>STR 1 SQLITE:BIND-BLOB INT-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
-: AGREE ( journal ^u8 n ^u8 n ^u8 n ^ARENA:arena -- )
-   {: j p:^ pu c:^ cu r:^ ru ar :}
-   j p pu DISPLAY c cu r ru REMOTE-FILE MATCH-DECISION NOOP ar
+: AGREE ( journal str str str ^ARENA:arena -- )
+   {: j p:str c:str r:str ar :}
+   j p DISPLAY c r REMOTE-FILE MATCH-DECISION NOOP ar
    RECORD-NOOP drop ;
 
-: DIRECTORY ( journal ^u8 n ^ARENA:arena -- )
-   {: j p:^ pu ar :}
-   j p pu DISPLAY DIRECTORY-DECISION NOOP ar RECORD-NOOP drop ;
+: DIRECTORY ( journal str ^ARENA:arena -- )
+   {: j p:str ar :}
+   j p DISPLAY DIRECTORY-DECISION NOOP ar RECORD-NOOP drop ;
 
 : RECONCILE ( -- )
    HELD-JOURNAL @ NOOPS @ PLANS @ HELD-ARENA @ RECORD-RECONCILIATION
@@ -2502,22 +2500,22 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    {: h at :}
    s" ContentIdentity(" at PUT
    h DROPBOX:HASH>STR swap PUT-QUOTED
-   s" )" rot PUT ;
+   s" )" swap PUT ;
 
 : REV-DEBUG ( DROPBOX:rev n -- n )
    {: r at :}
    s" DropboxRevision(" at PUT
    r DROPBOX:REV>STR swap PUT-QUOTED
-   s" )" rot PUT ;
+   s" )" swap PUT ;
 
-: SHUT ( n -- n ) s"  }" rot PUT ;
+: SHUT ( n -- n ) s"  }" swap PUT ;
 
 : REMOTE-DEBUG ( MODEL:remote n -- n )
    {: r at :}
    r MODEL-REMOTE:UNMAKE {: c rev :}
    s" RemoteFile { content: " at PUT
    c swap HASH-DEBUG
-   s" , revision: " rot PUT
+   s" , revision: " swap PUT
    rev swap REV-DEBUG SHUT ;
 
 : VALUE-DEBUG ( MODEL:baseline n -- n )
@@ -2526,7 +2524,7 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
       absent OF s" Absent" at PUT ENDOF
       present OF
          {: r :} s" Present(" at PUT {: at2 :}
-         r at2 REMOTE-DEBUG s" )" rot PUT
+         r at2 REMOTE-DEBUG s" )" swap PUT
       ENDOF
       directory OF s" Directory" at PUT ENDOF
    ;MATCH ;
@@ -2537,26 +2535,26 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
       none OF s" None" at PUT ENDOF
       some OF
          {: b :} s" Some(" at PUT {: at2 :}
-         b at2 VALUE-DEBUG s" )" rot PUT
+         b at2 VALUE-DEBUG s" )" swap PUT
       ENDOF
    ;MATCH ;
 
 \ The line baseline(path) answers.
-: BASELINE-LINE ( journal ^u8 n ^ARENA:arena -- ^u8 n )
-   {: j a:^ u ar :}
-   s" baseline(" 0 PUT  a u rot PUT  s\" )\t" rot PUT {: at :}
-   j a u DISPLAY ar BASELINE at BASELINE-DEBUG {: v :}
-   WANT v ;
+: BASELINE-LINE ( journal str ^ARENA:arena -- str )
+   {: j a:str ar :}
+   s" baseline(" 0 PUT  a swap PUT  s\" )\t" swap PUT {: at :}
+   j a DISPLAY ar BASELINE at BASELINE-DEBUG {: v :}
+   WANT v >str ;
 
-: PATHS-LINE ( ^VEC:vector<MODEL:path> -- ^u8 n )
+: PATHS-LINE ( ^VEC:vector<MODEL:path> -- str )
    {: paths :}
    s\" baseline_paths\t[" 0 PUT
    paths VEC:COUNT 0 ?do
-      i 0<> if s" , " rot PUT then
+      i 0<> if s" , " swap PUT then
       paths i VEC:AT @ MODEL:PATH>STR swap PUT-QUOTED
    loop
-   s" ]" rot PUT {: u :}
-   WANT u ;
+   s" ]" swap PUT {: u :}
+   WANT u >str ;
 
 : ORACLE-JOURNAL-HOLDS-ITS-BASELINES ( ^ARENA:arena -- )
    {: ar :}
@@ -2581,12 +2579,12 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    l MODEL-LOCAL:UNMAKE swap HASH-DEBUG SHUT ;
 
 \ A conflict that holds both sides: its name, then local and remote.
-: BOTH-DEBUG ( ^u8 n MODEL:local MODEL:remote n -- n )
-   {: a:^ u l r at :}
-   a u at PUT
-   s"  { local: " rot PUT  l swap LOCAL-DEBUG
-   s" , remote: " rot PUT  r swap REMOTE-DEBUG
-   s"  }" rot PUT ;
+: BOTH-DEBUG ( str MODEL:local MODEL:remote n -- n )
+   {: a:str l r at :}
+   a at PUT
+   s"  { local: " swap PUT  l swap LOCAL-DEBUG
+   s" , remote: " swap PUT  r swap REMOTE-DEBUG
+   s"  }" swap PUT ;
 
 : CONFLICT-DEBUG ( MODEL:conflict n -- n )
    {: at :}
@@ -2597,11 +2595,11 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
       divergent OF {: l r :} s" DivergentEdits" l r at BOTH-DEBUG ENDOF
       local-deleted OF
          {: r :} s" LocalDeletionRemoteEdit { remote: " at PUT
-         r swap REMOTE-DEBUG s"  }" rot PUT
+         r swap REMOTE-DEBUG s"  }" swap PUT
       ENDOF
       remote-deleted OF
          {: l :} s" RemoteDeletionLocalEdit { local: " at PUT
-         l swap LOCAL-DEBUG s"  }" rot PUT
+         l swap LOCAL-DEBUG s"  }" swap PUT
       ENDOF
    ;MATCH ;
 
@@ -2609,19 +2607,19 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    {: r at :}
    r JOURNAL-CONFLICT--RECORD:UNMAKE {: id path x :}
    s" ConflictRecord { id: " at PUT  id swap PUT-N
-   s" , path: " rot PUT  path MODEL:PATH>STR swap PUT-QUOTED
-   s" , conflict: " rot PUT  x swap CONFLICT-DEBUG
-   s"  }" rot PUT ;
+   s" , path: " swap PUT  path MODEL:PATH>STR swap PUT-QUOTED
+   s" , conflict: " swap PUT  x swap CONFLICT-DEBUG
+   s"  }" swap PUT ;
 
-: CONFLICTS-LINE ( ^VEC:vector<conflict-record> -- ^u8 n )
+: CONFLICTS-LINE ( ^VEC:vector<conflict-record> -- str )
    {: found :}
    s\" conflicts\t[" 0 PUT
    found VEC:COUNT 0 ?do
-      i 0<> if s" , " rot PUT then
+      i 0<> if s" , " swap PUT then
       found i VEC:AT @ swap RECORD-DEBUG
    loop
-   s" ]" rot PUT {: u :}
-   WANT u ;
+   s" ]" swap PUT {: u :}
+   WANT u >str ;
 
 : ORACLE-JOURNAL-HOLDS-ITS-CONFLICTS ( ^ARENA:arena -- )
    {: ar :}
@@ -2785,14 +2783,14 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    {: r h at :}
    s" ReplaceLocal { source: " at PUT
    r swap REMOTE-DEBUG
-   s" , expected_content: " rot PUT
+   s" , expected_content: " swap PUT
    h swap HASH-DEBUG SHUT ;
 
 : REPLACE-REMOTE-DEBUG ( DROPBOX:hash DROPBOX:rev n -- n )
    {: h r at :}
    s" ReplaceRemote { content: " at PUT
    h swap HASH-DEBUG
-   s" , expected_revision: " rot PUT
+   s" , expected_revision: " swap PUT
    r swap REV-DEBUG SHUT ;
 
 : OPERATION-DEBUG ( MODEL:operation n -- n )
@@ -2847,7 +2845,7 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    {: reason retry at :}
    s" Blocked { reason: " at PUT
    reason swap BLOCKAGE-DEBUG
-   s" , retry_at: " rot PUT
+   s" , retry_at: " swap PUT
    retry swap PUT-N SHUT ;
 
 : STATUS-DEBUG ( plan-status n -- n )
@@ -2870,48 +2868,48 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    JOURNAL-PLANNED--OPERATION:UNMAKE {: id ordinal o st :}
    s" PlannedOperation { id: OperationId(" at PUT
    id OPERATION-ID>N swap PUT-N
-   s" ), ordinal: " rot PUT  ordinal swap PUT-N
-   s" , operation: " rot PUT  o swap OPERATION-DEBUG
-   s" , status: " rot PUT  st swap RECORD-STATUS-DEBUG SHUT ;
+   s" ), ordinal: " swap PUT  ordinal swap PUT-N
+   s" , operation: " swap PUT  o swap OPERATION-DEBUG
+   s" , status: " swap PUT  st swap RECORD-STATUS-DEBUG SHUT ;
 
 : PLANNED-LIST ( ^VEC:vector<planned-operation> n -- n )
    {: ops at :}
    s" [" at PUT
    ops VEC:COUNT 0 ?do
-      i 0<> if s" , " rot PUT then
+      i 0<> if s" , " swap PUT then
       ops i VEC:AT @ swap PLANNED-DEBUG
    loop
-   s" ]" rot PUT ;
+   s" ]" swap PUT ;
 
 : PLAN-DEBUG ( plan-record n -- n )
    {: at :}
    JOURNAL-PLAN--RECORD:UNMAKE {: id path ops st :}
    s" PlanRecord { id: PlanId(" at PUT
    id PLAN-ID>N swap PUT-N
-   s" ), path: " rot PUT  path MODEL:PATH>STR swap PUT-QUOTED
-   s" , operations: " rot PUT  ops swap PLANNED-LIST
-   s" , status: " rot PUT  st swap STATUS-DEBUG SHUT ;
+   s" ), path: " swap PUT  path MODEL:PATH>STR swap PUT-QUOTED
+   s" , operations: " swap PUT  ops swap PLANNED-LIST
+   s" , status: " swap PUT  st swap STATUS-DEBUG SHUT ;
 
 \ name, a tab, then the plans as a list.
-: PLANS-LINE ( ^u8 n ^VEC:vector<plan-record> -- ^u8 n )
-   {: a:^ u plans :}
-   a u 0 PUT  s\" \t[" rot PUT
+: PLANS-LINE ( str ^VEC:vector<plan-record> -- str )
+   {: a:str plans :}
+   a 0 PUT  s\" \t[" swap PUT
    plans VEC:COUNT 0 ?do
-      i 0<> if s" , " rot PUT then
+      i 0<> if s" , " swap PUT then
       plans i VEC:AT @ swap PLAN-DEBUG
    loop
-   s" ]" rot PUT {: v :}
-   WANT v ;
+   s" ]" swap PUT {: v :}
+   WANT v >str ;
 
-: CONTENT-LINE ( ^VEC:vector<DROPBOX:hash> -- ^u8 n )
+: CONTENT-LINE ( ^VEC:vector<DROPBOX:hash> -- str )
    {: hashes :}
    s\" pending_upload_content\t[" 0 PUT
    hashes VEC:COUNT 0 ?do
-      i 0<> if s" , " rot PUT then
+      i 0<> if s" , " swap PUT then
       hashes i VEC:AT @ swap HASH-DEBUG
    loop
-   s" ]" rot PUT {: u :}
-   WANT u ;
+   s" ]" swap PUT {: u :}
+   WANT u >str ;
 
 \ Two statuses alike as the Rust version prints them, which names each
 \ field: the first is printed at WANT, the second after it.
@@ -2919,7 +2917,7 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    {: a b :}
    a 0 STATUS-DEBUG {: u :}
    b u STATUS-DEBUG {: v :}
-   WANT u WANT u + v u - STR= ;
+   WANT u >str WANT u + v u - >str STR= ;
 
 : ORACLE-JOURNAL-HOLDS-ITS-PLANS ( ^ARENA:arena -- )
    {: ar :}
@@ -2973,8 +2971,8 @@ variable CRAFT
    MATCH plan-write
       already-live OF ENDOF
       recorded OF
-         drop s" extract live test plan" >str TEST-PATH
-         s" a blocked path accepted a second live plan" >str INVALID
+         drop s" extract live test plan" TEST-PATH
+         s" a blocked path accepted a second live plan" INVALID
       ENDOF
    ;MATCH ;
 
@@ -2998,7 +2996,7 @@ variable CRAFT
    ar JOURNAL-AT {: d:str p:str :}
    s" blocked.txt" DISPLAY {: path :}
    s" upload" UPLOAD-DECISION ar OPERATIONS {: upload :}
-   s" insufficient_space" >str MODEL-BLOCKAGE:REMOTE-REJECTED {: why :}
+   s" insufficient_space" MODEL-BLOCKAGE:REMOTE-REJECTED {: why :}
    p OPEN {: j :}
    j path upload ar RECORD-PLAN RECORDED-PLAN {: recorded :}
    recorded >ID {: id :}
@@ -3070,9 +3068,9 @@ variable CRAFT
    loop
    true ;
 
-: RECORD-UPLOAD ( journal ^u8 n operation-plan ^ARENA:arena -- )
-   {: j a:^ u plan ar :}
-   j a u DISPLAY plan ar RECORD-PLAN RECORDED-PLAN drop ;
+: RECORD-UPLOAD ( journal str operation-plan ^ARENA:arena -- )
+   {: j a:str plan ar :}
+   j a DISPLAY plan ar RECORD-PLAN RECORDED-PLAN drop ;
 
 \ The Rust test also counts the statements pending_plans runs, by
 \ rusqlite's trace. SQLITE has no trace hook; PENDING-PLANS reads in
@@ -3122,7 +3120,7 @@ variable CRAFT
 
 \ The Rust test's crafted columns, case k: status, blocked_json and
 \ retry_at.
-: CRAFTED-STATUS ( n -- ^u8 n )
+: CRAFTED-STATUS ( n -- str )
    {: k :}
    k 0= if s" pending" exit then
    k 1 = if s" completed" exit then
@@ -3141,7 +3139,7 @@ variable CRAFT
    k 1 = k 2 = or k 5 = or if 1 OPTION:SOME exit then
    NO-INT ;
 
-: CRAFTED-DETAIL ( n -- ^u8 n )
+: CRAFTED-DETAIL ( n -- str )
    {: k :}
    k 4 < if s" plan status disagrees with its block columns" exit then
    k 6 < if s" plan has an unrecognized status" exit then
@@ -3149,8 +3147,8 @@ variable CRAFT
 
 : CRAFTED-PATH ( -- MODEL:path ) s" crafted.txt" DISPLAY ;
 
-: DECODE-COLUMNS ( ^u8 n option<str> option<n> -- plan-status )
-   s" read plan status" >str CRAFTED-PATH HELD-ARENA @
+: DECODE-COLUMNS ( str option<str> option<n> -- plan-status )
+   s" read plan status" CRAFTED-PATH HELD-ARENA @
    DECODE-PLAN-STATUS ;
 
 : DECODE-CRAFTED ( -- )
@@ -3276,7 +3274,7 @@ variable CRAFT
 : LEGACY ( str ^ARENA:arena -- )
    {: p:str ar :}
    p OPEN CLOSE
-   p str> SQLITE:OPEN {: c :}
+   p SQLITE:OPEN {: c :}
    c s" INSERT INTO local_root_binding(
          singleton, canonical_path, inode, generation
       ) VALUES (1, CAST('/sync/root' AS BLOB), X'0000000000000002', 3)"
@@ -3375,7 +3373,7 @@ variable CRAFT
    {: at :}
    MATCH option
       none OF s" None" at PUT ENDOF
-      some OF {: v :} s" Some(" at PUT v swap PUT-N s" )" rot PUT ENDOF
+      some OF {: v :} s" Some(" at PUT v swap PUT-N s" )" swap PUT ENDOF
    ;MATCH ;
 
 : RECOVERY-DEBUG ( recovery-record n -- n )
@@ -3383,31 +3381,31 @@ variable CRAFT
    r JOURNAL-RECOVERY--RECORD:UNMAKE {: id op from to c s kept :}
    s" RecoveryRecord { id: RecoveryId(" at PUT
    id RECOVERY-ID>N swap PUT-N
-   s" ), operation_id: OperationId(" rot PUT
+   s" ), operation_id: OperationId(" swap PUT
    op OPERATION-ID>N swap PUT-N
-   s" ), original_path: " rot PUT  from MODEL:PATH>STR swap PUT-QUOTED
-   s" , recovery_path: " rot PUT  to MODEL:PATH>STR swap PUT-QUOTED
-   s" , content: " rot PUT  c swap HASH-DEBUG
-   s" , status: " rot PUT  s swap RECORD-STATUS-DEBUG
-   s" , retained_at: " rot PUT  kept swap RETAINED-DEBUG SHUT ;
+   s" ), original_path: " swap PUT  from MODEL:PATH>STR swap PUT-QUOTED
+   s" , recovery_path: " swap PUT  to MODEL:PATH>STR swap PUT-QUOTED
+   s" , content: " swap PUT  c swap HASH-DEBUG
+   s" , status: " swap PUT  s swap RECORD-STATUS-DEBUG
+   s" , retained_at: " swap PUT  kept swap RETAINED-DEBUG SHUT ;
 
 \ name, a tab, then the records as a list.
-: RECOVERIES-LINE ( ^u8 n ^VEC:vector<recovery-record> -- ^u8 n )
-   {: a:^ u found :}
-   a u 0 PUT  s\" \t[" rot PUT
+: RECOVERIES-LINE ( str ^VEC:vector<recovery-record> -- str )
+   {: a:str found :}
+   a 0 PUT  s\" \t[" swap PUT
    found VEC:COUNT 0 ?do
-      i 0<> if s" , " rot PUT then
+      i 0<> if s" , " swap PUT then
       found i VEC:AT @ swap RECOVERY-DEBUG
    loop
-   s" ]" rot PUT {: v :}
-   WANT v ;
+   s" ]" swap PUT {: v :}
+   WANT v >str ;
 
 \ Two records alike as the Rust version prints them, every field named.
 : RECOVERY= ( recovery-record recovery-record -- bool )
    {: a b :}
    a 0 RECOVERY-DEBUG {: u :}
    b u RECOVERY-DEBUG {: v :}
-   WANT u WANT u + v u - STR= ;
+   WANT u >str WANT u + v u - >str STR= ;
 
 \ retained_at in completed_recoveries is the clock journal.sqlite3 was
 \ written at, which the file holds.
@@ -3430,8 +3428,8 @@ variable CRAFT
 
 \ The Rust tests' recorded_recovery(write).
 : NO-RECOVERY-RECORDED ( -- )
-   s" extract recorded test recovery" >str TEST-PATH
-   s" test expected a newly recorded recovery" >str INVALID ;
+   s" extract recorded test recovery" TEST-PATH
+   s" test expected a newly recorded recovery" INVALID ;
 
 : RECORDED-RECOVERY ( recovery-write -- recovery-record )
    MATCH recovery-write
@@ -3520,7 +3518,7 @@ variable CRAFT
    {: path :}
    RETAINED-OF MATCH option
       none OF
-         s" read retained test recovery" >str path
+         s" read retained test recovery" path
          s" completed destructive operation did not start retention"
          PATH-INVALID
       ENDOF
@@ -3544,19 +3542,19 @@ variable CRAFT
    ;MATCH ;
 
 \ The upload content at k is the content of the text.
-: UPLOAD-AT? ( ^VEC:vector<DROPBOX:hash> n ^u8 n -- bool )
-   {: v k c:^ cu :}
-   v k VEC:AT @ c cu CONTENT HASH= ;
+: UPLOAD-AT? ( ^VEC:vector<DROPBOX:hash> n str -- bool )
+   {: v k c:str :}
+   v k VEC:AT @ c CONTENT HASH= ;
 
 \ The file preserved, then replaced with the content of the text where
 \ its revision still stands.
 : PRESERVED-REPLACE
-   ( MODEL:remote ^u8 n ^ARENA:arena -- operation-plan )
-   {: file c:^ cu ar :}
+   ( MODEL:remote str ^ARENA:arena -- operation-plan )
+   {: file c:str ar :}
    ar [type] MODEL:operation NEW-VECTOR {: ops :}
    file MODEL-OPERATION:PRESERVE-REMOTE ops VEC:PUSH !
    file MODEL-REMOTE:UNMAKE {: old rev :}
-   c cu CONTENT rev MODEL-OPERATION:REPLACE-REMOTE ops VEC:PUSH !
+   c CONTENT rev MODEL-OPERATION:REPLACE-REMOTE ops VEC:PUSH !
    ops JOURNAL-OPERATION--PLAN:MAKE ;
 
 : JOURNAL-FINAL-OPERATION-RECORDS-ONLY-ITS-ACTUAL-RESULT
@@ -3600,7 +3598,7 @@ variable CRAFT
    s" create.txt" DISPLAY {: create-path :}
    j create-path s" create" UPLOAD-DECISION ar OPERATIONS ar RECORD-PLAN
    RECORDED-PLAN {: create :}
-   s" replace" CONTENT s" rev-old" >str DROPBOX:>REV
+   s" replace" CONTENT s" rev-old" DROPBOX:>REV
    MODEL-OPERATION:REPLACE-REMOTE ar ONE-PLAN {: replace :}
    j s" replace.txt" replace ar RECORD-UPLOAD
    s" download" s" rev-download" REMOTE-FILE DOWNLOAD-DECISION
@@ -3730,7 +3728,7 @@ variable CRAFT
    j recovery ID-OF COMPLETE-RECOVERY RECOVERY-COMPLETION-N 2 T=
    j >CONNECTION recovery ID-OF ar READ-RECOVERY MATCH option
       none OF
-         s" read conflicted recovery test" >str path
+         s" read conflicted recovery test" path
          s" test recovery disappeared before conflict completion"
          PATH-INVALID
       ENDOF
@@ -3806,9 +3804,9 @@ variable CRAFT
    loop
    true ;
 
-: LIVE-AT ( journal ^u8 n ^ARENA:arena -- option<plan-record> )
-   {: j k:^ ku:n ar :}
-   j k ku ar CANONICAL ar LIVE-PLAN-AT ;
+: LIVE-AT ( journal str ^ARENA:arena -- option<plan-record> )
+   {: j k:str ar :}
+   j k ar CANONICAL ar LIVE-PLAN-AT ;
 
 \ Whether the answer is the plan.
 : LIVE-IS? ( option<plan-record> plan-record -- bool )
@@ -3867,7 +3865,7 @@ variable CRAFT
 \ /sync/root at inode 2, with the birth time and subvolume statx gave.
 : SYNC-ROOT ( birth-time n bool -- local-root-binding )
    {: birth sub has:bool :}
-   s" /sync/root" >str 2 birth true sub has FROM-STATX-FIELDS ;
+   s" /sync/root" 2 birth true sub has FROM-STATX-FIELDS ;
 
 \ Activating actual over recorded is unavailable and writes nothing.
 : UNAVAILABLE-UNCHANGED
@@ -3896,19 +3894,19 @@ variable CRAFT
    d GONE ;
 
 \ The content preserved as a local file, then deleted where it stands.
-: PRESERVED-DELETE ( ^u8 n ^ARENA:arena -- operation-plan )
-   {: c:^ cu ar :}
+: PRESERVED-DELETE ( str ^ARENA:arena -- operation-plan )
+   {: c:str ar :}
    ar [type] MODEL:operation NEW-VECTOR {: ops :}
-   c cu CONTENT MODEL-LOCAL:MAKE MODEL-OPERATION:PRESERVE-LOCAL
+   c CONTENT MODEL-LOCAL:MAKE MODEL-OPERATION:PRESERVE-LOCAL
    ops VEC:PUSH !
-   c cu CONTENT MODEL-OPERATION:DELETE-LOCAL ops VEC:PUSH !
+   c CONTENT MODEL-OPERATION:DELETE-LOCAL ops VEC:PUSH !
    ops JOURNAL-OPERATION--PLAN:MAKE ;
 
 \ A pending destructive plan of the content, whose deletion has a
 \ recovery intent copying to copy, and a blocked upload.
-: PRIOR-WORK ( journal ^u8 n MODEL:path ^ARENA:arena -- )
-   {: j c:^ cu copy ar :}
-   j s" pending.txt" DISPLAY c cu ar PRESERVED-DELETE ar RECORD-PLAN
+: PRIOR-WORK ( journal str MODEL:path ^ARENA:arena -- )
+   {: j c:str copy ar :}
+   j s" pending.txt" DISPLAY c ar PRESERVED-DELETE ar RECORD-PLAN
    RECORDED-PLAN {: pending :}
    j pending 1 NTH-ID copy ar RECORD-RECOVERY-INTENT RECORDED-RECOVERY
    drop
@@ -3923,15 +3921,15 @@ variable CRAFT
    {: d:str ar :}
    d s" recovery-payload" ar INSIDE {: r:str :}
    d s" staged-payload" ar INSIDE {: s:str :}
-   r str> s" recovery" FS:WRITE-ALL
-   s str> s" staged" FS:WRITE-ALL
+   r s" recovery" FS:WRITE-ALL
+   s s" staged" FS:WRITE-ALL
    r s ;
 
-: FILE-HOLDS? ( str ^u8 n ^ARENA:arena -- bool )
-   {: f:str t:^ tu ar :}
+: FILE-HOLDS? ( str str ^ARENA:arena -- bool )
+   {: f:str t:str ar :}
    ar 16 ARENA:ALLOC drop {: buf:^ :}
-   f str> buf 16 FS:READ-ALL {: u :}
-   buf u t tu STR= ;
+   f buf 16 FS:READ-ALL {: u :}
+   buf u >str t STR= ;
 
 \ Retiring a root's work leaves the payload files as they were written.
 : PAYLOADS-KEPT ( str str ^ARENA:arena -- )
@@ -3970,7 +3968,7 @@ variable CRAFT
 : REPLACED ( str str -- local-root-binding )
    {: root:str moved:str :}
    root moved FS:RENAME-FILE
-   root str> FS:MAKE-DIR
+   root FS:MAKE-DIR
    root INSPECT ;
 
 \ The root's state: an agreed baseline, a local inventory, prior work
@@ -3990,7 +3988,7 @@ variable CRAFT
    T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    d s" root" ar INSIDE {: root:str :}
-   root str> FS:MAKE-DIR
+   root FS:MAKE-DIR
    root INSPECT {: recorded :}
    recorded 1 JOURNAL-LOCAL--ROOT--RECORD:MAKE {: was :}
    p OPEN {: j :}
@@ -4116,32 +4114,32 @@ variable CRAFT
 
 \ The oracle journal, copied into a case's directory and opened, with
 \ the SQL run on it; the journal and arena are held for a reader.
-: PLANTED ( ^u8 n ^ARENA:arena -- str )
-   {: sql:^ su ar :}
+: PLANTED ( str ^ARENA:arena -- str )
+   {: sql:str ar :}
    ar JOURNAL-AT {: d:str p:str :}
-   s" src/oracle/journal.sqlite3" p str> FS:COPY-FILE-STREAM
+   s" src/oracle/journal.sqlite3" p FS:COPY-FILE-STREAM
    p OPEN {: j :}
-   j >CONNECTION sql su SQLITE:EXEC
+   j >CONNECTION sql SQLITE:EXEC
    j HELD-JOURNAL !  ar HELD-ARENA !
    d ;
 
 : PLANTED-GONE ( str -- ) HELD-JOURNAL @ CLOSE GONE ;
 
 \ `op` could not process the record for `path`, as MODEL:E-STORED.
-: STORED-LINE ( ^u8 n ^u8 n -- ^u8 n )
-   {: op:^ ou path:^ pu :}
-   s" `" 0 PUT  op ou rot PUT
-   s" ` could not process the record for `" rot PUT
-   path pu rot PUT  s" `: " rot PUT
-   MODEL:E-STORED swap PUT-N  s"  " rot PUT
-   MODEL:E-STORED ERROR:NAME$ swap PUT-STR {: u :}
-   WANT u ;
+: STORED-LINE ( str str -- str )
+   {: op:str path:str :}
+   s" `" 0 PUT  op swap PUT
+   s" ` could not process the record for `" swap PUT
+   path swap PUT  s" `: " swap PUT
+   MODEL:E-STORED swap PUT-N  s"  " swap PUT
+   MODEL:E-STORED ERROR:NAME$ swap PUT {: u :}
+   WANT u >str ;
 
 \ The reader throws E-JSON after one line naming op, path and cause.
-: UNREADABLE ( [ -- ] str ^u8 n ^u8 n ^ARENA:arena -- )
-   {: reader d:str op:^ ou path:^ pu ar :}
-   op ou path pu STORED-LINE {: a:^ u :}
-   reader E-JSON d a u ar LOGGED ;
+: UNREADABLE ( [ -- ] str str str ^ARENA:arena -- )
+   {: reader d:str op:str path:str ar :}
+   op path STORED-LINE {: a:str :}
+   reader E-JSON d a ar LOGGED ;
 
 : HELD-PENDING-PLANS ( -- )
    HELD-JOURNAL @ HELD-ARENA @ PENDING-PLANS drop ;

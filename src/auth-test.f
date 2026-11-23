@@ -62,13 +62,12 @@ TYPED-VARIABLE ACTION [ -- ]
 
 \ ---- the recording store ------------------------------------------
 
-: REC-READ ( str str SPAN:span<u8> -- n bool )
+: REC-READ ( str str ^VEC:vector<u8> -- bool )
    {: s:str a:str dest :}
    READ-CODE @ 0<> if READ-CODE @ throw then
-   PRESENT @ 0= if 0 false exit then
-   HELD-U @ dest SPAN:$ nip > if SECRET:E-CAPACITY throw then
-   HELD HELD-U @ dest SPAN:COPY
-   HELD-U @ true ;
+   PRESENT @ 0= if false exit then
+   HELD HELD-U @ dest VEC:APPEND
+   true ;
 
 : REC-WRITE ( str str str -- )
    {: s:str a:str vs:str :}
@@ -91,22 +90,22 @@ FILL-FILLER
 \ ---- helpers ------------------------------------------------------
 
 \ The store holds the record, and READ finds it.
-: HOLD ( ^u8 n -- )
-   {: r:^ ru:n :}
+: HOLD ( str -- )
+   str> {: r:^ ru:n :}
    r HELD ru BYTE-COPY ru HELD-U !
    true PRESENT ! 0 READ-CODE ! ;
 
 : BINDING ( -- JOURNAL:dropbox-binding )
-   s" account-id" >str s" namespace-id" >str s" /Root" >str
+   s" account-id" s" namespace-id" s" /Root"
    JOURNAL-DROPBOX--BINDING:MAKE ;
 
-: STORE-TOKEN ( ^u8 n -- ) >str {: t:str :} BINDING t STORE ;
+: STORE-TOKEN ( str -- ) {: t:str :} BINDING t STORE ;
 
 : DROP-LOOKUP ( lookup -- ) drop ;
 
 : LOADS ( -- ) [: LOAD DROP-LOOKUP ;] ARENA:WITH ;
 
-: TOO-LONG ( -- ) FILLER TOKEN-U @ STORE-TOKEN ;
+: TOO-LONG ( -- ) FILLER TOKEN-U @ >str STORE-TOKEN ;
 
 : UNAVAILABLE ( lookup -- bool )
    MATCH lookup
@@ -114,15 +113,13 @@ FILL-FILLER
       unavailable OF true ENDOF
    ;MATCH ;
 
-: SAME$ ( ^u8 n str -- ) str> T$= ;
-
 : CHECK-FOUND ( JOURNAL:dropbox-binding str -- )
    {: b token:str :}
    b JOURNAL-DROPBOX--BINDING:UNMAKE {: a:str n:str r:str :}
-   s" account" a SAME$
-   s" namespace" n SAME$
-   s" /Root" r SAME$
-   s" lookup-token" token SAME$ ;
+   s" account" a T$=
+   s" namespace" n T$=
+   s" /Root" r T$=
+   s" lookup-token" token T$= ;
 
 : FOUND ( lookup -- )
    MATCH lookup
@@ -133,32 +130,32 @@ FILL-FILLER
 
 \ The action throws want with fd 2 sent to LOG-PATH, which then holds
 \ one line with the text and no sentinel, and is removed.
-: LOGGED ( [ -- ] n ^u8 n -- )
-   {: want t:^ tu :}
+: LOGGED ( [ -- ] n str -- )
+   {: want t:str :}
    ACTION !
-   ACTION @ LOG-PATH LOG-PATH-U @ >str AR @ STDERR:CAPTURING str>
-   {: code:n e:^ u:n :}
+   ACTION @ LOG-PATH LOG-PATH-U @ >str AR @ STDERR:CAPTURING
+   {: code:n e:str :}
    code want T=
-   e u >str 10 COUNT-CHAR 1 T=
-   e u t tu CONTAINS? TTRUE
-   e u s" sentinel" CONTAINS? TFALSE ;
+   e 10 COUNT-CHAR 1 T=
+   e t CONTAINS? TTRUE
+   e s" sentinel" CONTAINS? TFALSE ;
 
 : SCRATCH-OPEN ( -- )
-   s" auth-test" FS:MKTEMP-DIR {: d:^ du :}
+   s" auth-test" FS:MKTEMP-DIR str> {: d:^ du :}
    d DIR du BYTE-COPY du DIR-U !
    d LOG-PATH du BYTE-COPY
-   s" /stderr.txt" {: f:^ fu :}
+   s" /stderr.txt" str> {: f:^ fu :}
    f LOG-PATH du + fu BYTE-COPY
    du fu + LOG-PATH-U ! ;
 
-: SCRATCH-CLOSE ( -- ) DIR DIR-U @ FS:REMOVE-TREE ;
+: SCRATCH-CLOSE ( -- ) DIR DIR-U @ >str FS:REMOVE-TREE ;
 
 
 \ ---- the program ----------------------------------------------------
 
 \ DIR/name, in AR.
-: UNDER ( ^u8 n -- str )
-   {: n:^ nu:n :}
+: UNDER ( str -- str )
+   str> {: n:^ nu:n :}
    DIR-U @ 1+ nu + {: pu:n :}
    AR @ pu ARENA:ALLOC drop {: p:^ :}
    DIR p DIR-U @ BYTE-COPY
@@ -167,46 +164,46 @@ FILL-FILLER
    p pu >str ;
 
 \ DIR/name now holds the text.
-: HOLDS ( ^u8 n ^u8 n -- )
-   {: n:^ nu:n t:^ tu:n :}
-   n nu UNDER str> t tu FS:WRITE-ALL ;
+: HOLDS ( str str -- )
+   {: n:str t:str :}
+   n UNDER t FS:WRITE-ALL ;
 
 \ DIR/name's bytes, in the arena.
-: TAKEN ( ^u8 n -- ^u8 n )
-   UNDER str> {: p:^ pu:n :}
+: TAKEN ( str -- str )
+   UNDER {: p:str :}
    AR @ ROOM ARENA:ALLOC {: d:^ du:n :}
-   p pu d du FS:READ-ALL {: got:n :}
-   d got ;
+   p d du FS:READ-ALL {: got:n :}
+   d got >str ;
 
 \ An executable script DIR/name holding the body, which STORE and LOAD
 \ then run.
-: RUNS ( ^u8 n ^u8 n -- )
-   {: n:^ nu:n b:^ bu:n :}
-   n nu UNDER {: p:str :}
-   p str> b bu FS:WRITE-ALL
+: RUNS ( str str -- )
+   {: n:str b:str :}
+   n UNDER {: p:str :}
+   p b FS:WRITE-ALL
    p FS:CHMOD-X
    p PROGRAM ! BIND ;
 
 \ Rust's store fake: its arguments to $0.args, its stdin to $0.stdin.
-: STORE-FAKE ( -- ^u8 n )
+: STORE-FAKE ( -- str )
    s\" #!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\ncat > \"$0.stdin\"\n" ;
 
 \ Rust's lookup fake, whose output and status the case holds in
 \ $0.out and $0.status.
-: LOOKUP-FAKE ( -- ^u8 n )
+: LOOKUP-FAKE ( -- str )
    s\" #!/bin/sh\nprintf '%s\\n' \"$@\" > \"$0.args\"\ncat \"$0.out\"\nexit \"$(cat \"$0.status\")\"\n" ;
 
-: ATTRIBUTES ( -- ^u8 n )
+: ATTRIBUTES ( -- str )
    s\" application\norg.omarchy.omabox\nkind\ndropbox-credentials-v1\n" ;
 
 \ The verb's lines, then the attributes', in the arena.
-: ARGUMENTS ( ^u8 n -- ^u8 n )
-   {: v:^ vu:n :}
-   ATTRIBUTES {: t:^ tu:n :}
+: ARGUMENTS ( str -- str )
+   str> {: v:^ vu:n :}
+   ATTRIBUTES str> {: t:^ tu:n :}
    AR @ vu tu + ARENA:ALLOC {: d:^ du:n :}
    v d vu BYTE-COPY
    t d vu + tu BYTE-COPY
-   d du ;
+   d du >str ;
 
 
 \ ---- the cases ----------------------------------------------------
@@ -282,12 +279,12 @@ FILL-FILLER
 
 \ STORE's bound, where an empty token gives the record's other bytes,
 \ and the CAP - 1 bytes it wrote LOAD finds; then LOAD's bound, at CAP
-\ bytes and at CAP + 1, which E-CAPACITY refuses.
+\ bytes and at CAP + 1.
 : CREDENTIAL-OF-8192-BYTES-OR-MORE-IS-TOO-LARGE ( -- )
    s" credential_of_8192_bytes_or_more_is_too_large" T-LABEL
    s" " STORE-TOKEN HELD-U @ {: other:n :}
    0 WRITES !
-   FILLER CAP 1- other - STORE-TOKEN
+   FILLER CAP 1- other - >str STORE-TOKEN
    WRITES @ 1 T=
    HELD-U @ CAP 1- T=
    true PRESENT ! 0 READ-CODE !
@@ -297,9 +294,9 @@ FILL-FILLER
    FILLER-U TOKEN-U !
    [: TOO-LONG ;] E-TOO-LARGE s" exceeds the supported size" LOGGED
    WRITES @ 1 T=
-   FILLER CAP HOLD
+   FILLER CAP >str HOLD
    [: LOADS ;] E-TOO-LARGE s" exceeds the supported size" LOGGED
-   FILLER CAP 1+ HOLD
+   FILLER CAP 1+ >str HOLD
    [: LOADS ;] E-TOO-LARGE s" exceeds the supported size" LOGGED ;
 
 : MISSING-SECRET-TOOL-COULD-NOT-START ( -- )
@@ -317,9 +314,9 @@ FILL-FILLER
    s" secret_tool_output_of_8192_bytes_or_more_is_too_large" T-LABEL
    s" large-fake.status" s" 0" HOLDS
    s" large-fake" LOOKUP-FAKE RUNS
-   s" large-fake.out" FILLER CAP HOLDS
+   s" large-fake.out" FILLER CAP >str HOLDS
    [: LOADS ;] E-TOO-LARGE s" exceeds the supported size" LOGGED
-   s" large-fake.out" FILLER CAP 1+ HOLDS
+   s" large-fake.out" FILLER CAP 1+ >str HOLDS
    [: LOADS ;] E-TOO-LARGE s" exceeds the supported size" LOGGED
    s" large-fake.out" UNDER {: o:str :}
    PIPE-MOST FILLER-U / 1+ 0 ?do o FILLER FILLER-U >str FS:APPEND-FILE loop
@@ -343,7 +340,7 @@ FILL-FILLER
    [: s" exit-sentinel" STORE-TOKEN ;] SECRET:E-ACCESS
    s" credential operation `store Dropbox credential` failed" LOGGED
    s" unread-fake" s\" #!/bin/sh\nexit 1\n" RUNS
-   [: SERVICE ACCOUNT AR @ PIPE-MOST 1+ ARENA:ALLOC SECRET:WRITE ;]
+   [: SERVICE ACCOUNT AR @ PIPE-MOST 1+ ARENA:ALLOC >str SECRET:WRITE ;]
    SECRET:E-ACCESS
    s" credential operation `store Dropbox credential` failed" LOGGED
    RECORDING
@@ -363,7 +360,7 @@ FILL-FILLER
 : FIXED-URL ( ^ARENA:arena -- )
    {: ar :}
    s" app-key 1~*" s" dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
-   ar AUTHORIZE-URL str>
+   ar AUTHORIZE-URL
    s" https://www.dropbox.com/oauth2/authorize?response_type=code&client_id=app-key+1%7E*&token_access_type=offline&scope=account_info.read+files.metadata.read+files.content.read+files.content.write&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256"
    T$= ;
 
@@ -372,14 +369,14 @@ FILL-FILLER
    s" pkce_authorization_uses_offline_code_flow" T-LABEL
    ar FIXED-URL
    s" app-key" ar START {: p :}
-   p URL s" app-key" p VERIFIER ar AUTHORIZE-URL str> T$= ;
+   p URL s" app-key" p VERIFIER ar AUTHORIZE-URL T$= ;
 
 : URL-SAFE? ( n -- bool )
    {: b:n :}
    b STR-ALNUM? b [char] - = or b [char] _ = or ;
 
-: PROOF-SHAPE ( ^u8 n -- )
-   {: v:^ u:n :}
+: PROOF-SHAPE ( str -- )
+   str> {: v:^ u:n :}
    u 43 T=
    u 0 ?do v i + c@ URL-SAFE? TTRUE loop ;
 

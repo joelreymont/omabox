@@ -63,7 +63,7 @@ require src/test-formal.f
 package DAEMON
 private
 
-: CHECK$ ( account-check -- ^u8 n )
+: CHECK$ ( account-check -- str )
    MATCH account-check
       valid OF s" valid" ENDOF
       account-changed OF s" account-changed" ENDOF
@@ -80,7 +80,7 @@ TYPED-VARIABLE LINK REPLAY:link
 
 : TEXT= ( failure str -- )
    {: f t:str :}
-   f FAILURE-UNMAKE {: d u:str :} u str> t str> T$= ;
+   f FAILURE-UNMAKE {: d u:str :} u t T$= ;
 
 : KIND= ( failure disposition -- )
    {: f want :}
@@ -166,7 +166,7 @@ TYPED-VARIABLE LINK REPLAY:link
    s" local_root_failures_name_their_own_cause" T-LABEL
    s" daemon-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d:str :}
    d s" Dropbox" ar TEST-CLIENT:INSIDE {: root:str :}
-   root str> FS:MAKE-DIR
+   root FS:MAKE-DIR
    d s" journal.sqlite3" ar TEST-CLIENT:INSIDE JOURNAL:OPEN {: j :}
    root FS:REMOVE-DIR
    d s" stderr.txt" ar TEST-CLIENT:INSIDE {: log:str :}
@@ -177,7 +177,7 @@ TYPED-VARIABLE LINK REPLAY:link
    code CODE-FAILURE {: f :}
    f construct disposition environmental KIND=
    f SYNC-ROOT TEXT=
-   d str> FS:REMOVE-TREE ;
+   d FS:REMOVE-TREE ;
 
 : POLICY-CASES ( ^ARENA:arena -- )
    {: ar :}
@@ -232,22 +232,22 @@ variable DROPPED
 
 \ A case's directory under TMPDIR.
 : CASE-DIR ( ^ARENA:arena -- str )
-   s" daemon-test" FS:MKTEMP-DIR rot TEST-CLIENT:COPIED ;
+   s" daemon-test" FS:MKTEMP-DIR swap TEST-CLIENT:COPIED ;
 
 \ The status DIR/omabox/status.json holds the text t.
-: STATUS-HAS ( str ^u8 n ^ARENA:arena -- )
-   {: d t:^ tu ar :}
+: STATUS-HAS ( str str ^ARENA:arena -- )
+   {: d t:str ar :}
    d s" omabox/status.json" ar TEST-CLIENT:INSIDE
-   str> SEEN-JSON SEEN-CAP FS:READ-ALL
+   SEEN-JSON SEEN-CAP FS:READ-ALL
    {: u :}
-   SEEN-JSON u t tu CONTAINS? TTRUE ;
+   SEEN-JSON u >str t CONTAINS? TTRUE ;
 
 \ XDG under DIR/config and DIR/state, the sync root at root.
 : CASE-CONFIG ( str CONFIG:abs-path ^ARENA:arena -- ^CONFIG:config )
    {: d root ar :}
    d s" config" ar TEST-CLIENT:INSIDE CONFIG:>ABS-PATH
    d s" state" ar TEST-CLIENT:INSIDE CONFIG:>ABS-PATH ar CONFIG:XDG-NEW
-   root CONFIG:ABS-PATH>STR s" test-app-key" >str ar CONFIG:FROM-VALUES ;
+   root CONFIG:ABS-PATH>STR s" test-app-key" ar CONFIG:FROM-VALUES ;
 
 \ The second wait releases the journal path a directory held.
 : LOCK-NAP ( n -- )
@@ -272,9 +272,9 @@ variable DROPPED
    x AT-NOTIFYING STEP-TO drop
    NAPS @ 2 T= 0 5000 NAPPED= 1 10000 NAPPED=
    d S\" \qphase\q:\qerror\q" ar STATUS-HAS
-   d JOURNAL str> ar STATUS-HAS
+   d JOURNAL ar STATUS-HAS
    STATUS-PHASE:SYNCING s STATUS:PHASE
-   d JOURNAL str> ar STATUS-HAS
+   d JOURNAL ar STATUS-HAS
    x CLEANED
    d S\" \qlast_error\q:null" ar STATUS-HAS ;
 
@@ -289,19 +289,19 @@ variable DROPPED
    ar CONFIG:XDG-NEW {: xdg :}
    xdg ar CONFIG:RESOLVE-PRIVATE {: p :}
    d s" Dropbox" ar TEST-CLIENT:INSIDE {: root:str :}
-   root str> FS:MAKE-DIR
+   root FS:MAKE-DIR
    p root CONFIG:>ABS-PATH CONFIG:PREPARE-PATHS
    p CONFIG:JOURNAL-FILE CONFIG:ABS-PATH>STR {: jp:str :}
-   jp str> FS:MAKE-DIR
+   jp FS:MAKE-DIR
    p HELD-PATHS ! jp HELD-JOURNAL !
    0 NAPS !
    [: d p ar HELD-LOCK ;] WITH-CASE
-   d str> FS:REMOVE-TREE ;
+   d FS:REMOVE-TREE ;
 
 \ ---- the binding starting checks
 
 : EXPECTED ( -- JOURNAL:dropbox-binding )
-   s" dbid:account" >str s" namespace" >str s" /root" >str
+   s" dbid:account" s" namespace" s" /root"
    JOURNAL-DROPBOX--BINDING:MAKE ;
 
 \ The credential store's record, for the binding b.
@@ -312,11 +312,11 @@ variable DROPPED
    {: p:str :}
    SB-RESET
    S\" {\qversion\q:1,\qrefresh_token\q:\qrefresh\q,\qaccount_id\q:\q"
-   SB-APPEND a str> SB-APPEND
-   S\" \q,\qroot_namespace_id\q:\q" SB-APPEND n str> SB-APPEND
-   S\" \q,\qremote_root\q:\q" SB-APPEND r str> SB-APPEND
+   SB-APPEND a SB-APPEND
+   S\" \q,\qroot_namespace_id\q:\q" SB-APPEND n SB-APPEND
+   S\" \q,\qremote_root\q:\q" SB-APPEND r SB-APPEND
    S\" \q}" SB-APPEND
-   p str> SB$ FS:WRITE-ALL ;
+   p SB$ FS:WRITE-ALL ;
 
 : STARTS ( JOURNAL:dropbox-binding ^run ^ARENA:arena -- bool )
    {: b x ar :}
@@ -338,7 +338,7 @@ variable DROPPED
    x RUN-FAILURE @ construct disposition user-action KIND=
    x RUN-FAILURE @ SETUP TEXT=
    j EXPECTED car JOURNAL:BIND-DROPBOX-ROOT drop
-   s" dbid:other" >str s" namespace" >str s" /root" >str
+   s" dbid:other" s" namespace" s" /root"
    JOURNAL-DROPBOX--BINDING:MAKE x car STARTS TFALSE
    x RUN-FAILURE @ construct disposition user-action KIND=
    x RUN-FAILURE @ BINDING TEXT=
@@ -350,9 +350,9 @@ variable DROPPED
    s" durable_binding_is_required_and_authoritative" T-LABEL
    ar CASE-DIR {: d:str :}
    d s" Dropbox" ar TEST-CLIENT:INSIDE {: root:str :}
-   root str> FS:MAKE-DIR
+   root FS:MAKE-DIR
    [: d root BINDINGS-CHECKED ;] WITH-CASE
-   d str> FS:REMOVE-TREE ;
+   d FS:REMOVE-TREE ;
 
 : STOPS-FOR-SETUP ( ^ARENA:arena str str -- )
    {: car d root:str :}
@@ -362,7 +362,7 @@ variable DROPPED
    x construct daemon-state starting DAEMON-RUN
    NAPS @ 0 T=
    d S\" \qphase\q:\qstopped\q" car STATUS-HAS
-   d SETUP str> car STATUS-HAS
+   d SETUP car STATUS-HAS
    x EXIT-STATUS 78 T= ;
 
 : RECOVERY-CONTROL-PUBLISHES-STOPPED-BEFORE-A-FATAL-EXIT ( ^ARENA:arena -- )
@@ -370,10 +370,10 @@ variable DROPPED
    s" recovery_control_publishes_stopped_before_a_fatal_exit" T-LABEL
    ar CASE-DIR {: d:str :}
    d s" Dropbox" ar TEST-CLIENT:INSIDE {: root:str :}
-   root str> FS:MAKE-DIR
+   root FS:MAKE-DIR
    0 NAPS !
    [: d root STOPS-FOR-SETUP ;] WITH-CASE
-   d str> FS:REMOVE-TREE ;
+   d FS:REMOVE-TREE ;
 
 \ ---- the session polling keeps
 
@@ -394,7 +394,7 @@ variable DROPPED
 : RETAINED ( ^ARENA:arena str -- )
    {: car d :}
    d car STATUS:DETACHED car RUN-IN-DIR {: x j :}
-   j s" cursor" >str DROPBOX:>CURSOR
+   j s" cursor" DROPBOX:>CURSOR
    car ARENA:ALLOCATOR 0 [type] MODEL:remote-record VEC:NEW
    JOURNAL:PUBLISH-REMOTE-INVENTORY
    x RUN-SESSIONS @ {: sar :}
@@ -422,7 +422,7 @@ variable DROPPED
    0 NAPS ! false DROPPED !
    [: d RETAINED ;] WITH-CASE
    DROPPED @ TTRUE
-   d str> FS:REMOVE-TREE ;
+   d FS:REMOVE-TREE ;
 
 \ ---- the local root
 
@@ -432,7 +432,7 @@ private
 
 : SYNC-ROOT-AT ( option<JOURNAL:birth-time> -- JOURNAL:local-root-record )
    {: birth :}
-   s" /sync/root" >str 2 birth OPTION:NONE JOURNAL-LOCAL--ROOT--BINDING:MAKE
+   s" /sync/root" 2 birth OPTION:NONE JOURNAL-LOCAL--ROOT--BINDING:MAKE
    1 JOURNAL-LOCAL--ROOT--RECORD:MAKE ;
 
 : BORN ( -- option<JOURNAL:birth-time> )
@@ -442,22 +442,22 @@ private
 
 : ROOT-INSPECTION-FAILURE-IS-UNAVAILABLE-ONLY-FOR-A-STAND-IN ( -- )
    s" root_inspection_failure_is_unavailable_only_for_a_stand_in" T-LABEL
-   BORN SYNC-ROOT-AT s" /sync/root" >str 2 STOOD-IN-BY? TTRUE
+   BORN SYNC-ROOT-AT s" /sync/root" 2 STOOD-IN-BY? TTRUE
    ROOT-UNAVAILABLE {: f :}
    f construct disposition environmental KIND=
    f SYNC-ROOT TEXT=
-   NO-BIRTH SYNC-ROOT-AT s" /sync/root" >str 2 STOOD-IN-BY? TFALSE
+   NO-BIRTH SYNC-ROOT-AT s" /sync/root" 2 STOOD-IN-BY? TFALSE
    JOURNAL:E-NO-BIRTH-TIME CODE-FAILURE {: g :}
    g construct disposition user-action KIND=
    g ROOT-UNSUPPORTED TEXT= ;
 
-: STAND-IN$ ( -- ^u8 n ) s" /sys/kernel" ;
+: STAND-IN$ ( -- str ) s" /sys/kernel" ;
 
 : STOOD-IN ( ^ARENA:arena str -- )
    {: car d :}
    d d car STATUS:NEW car RUN-IN-DIR {: x j :}
-   d STAND-IN$ >str CONFIG:>ABS-PATH car CASE-CONFIG x RUN-CONFIG !
-   j STAND-IN$ >str 1 BORN OPTION:NONE JOURNAL-LOCAL--ROOT--BINDING:MAKE
+   d STAND-IN$ CONFIG:>ABS-PATH car CASE-CONFIG x RUN-CONFIG !
+   j STAND-IN$ 1 BORN OPTION:NONE JOURNAL-LOCAL--ROOT--BINDING:MAKE
    car JOURNAL:ACTIVATE-LOCAL-ROOT drop
    x [: ROOT-ACTIVE ;] TRIED TFALSE
    x RUN-FAILURE @ construct disposition environmental KIND=
@@ -468,11 +468,11 @@ private
    ( ^ARENA:arena -- )
    {: ar :}
    s" stand_in_without_birth_time_leaves_the_root_unavailable" T-LABEL
-   [: STAND-IN$ >str JOURNAL:INSPECT drop ;] JOURNAL:E-NO-BIRTH-TIME
+   [: STAND-IN$ JOURNAL:INSPECT drop ;] JOURNAL:E-NO-BIRTH-TIME
    TTHROWSQ
    ar CASE-DIR {: d:str :}
    [: d STOOD-IN ;] WITH-CASE
-   d str> FS:REMOVE-TREE ;
+   d FS:REMOVE-TREE ;
 
 \ ---- a cycle from syncing to a stop
 
@@ -537,7 +537,7 @@ TYPED-VARIABLE CYCLE-ARENA ^ARENA:arena
    NAPS @ 1 T= 0 BACKOFF-S 1000 * NAPPED=
    x RUN-PASSED @ CLEAN? TTRUE
    d S\" \qphase\q:\qstopped\q" car STATUS-HAS
-   d BINDING str> car STATUS-HAS
+   d BINDING car STATUS-HAS
    x EXIT-STATUS 78 T= ;
 
 : SYNCING-BACKS-OFF-AND-STOPS-ON-A-REFUSED-REFRESH
@@ -547,8 +547,8 @@ TYPED-VARIABLE CYCLE-ARENA ^ARENA:arena
    ar CASE-DIR {: d:str :}
    ar CASE-DIR {: root:str :}
    [: d root CYCLED-TO-A-STOP ;] WITH-CASE
-   root str> FS:REMOVE-TREE
-   d str> FS:REMOVE-TREE ;
+   root FS:REMOVE-TREE
+   d FS:REMOVE-TREE ;
 
 \ The cases that need no Dropbox, then those against the fake under
 \ AIO's loop.
@@ -565,7 +565,7 @@ TYPED-VARIABLE CYCLE-ARENA ^ARENA:arena
    {: ar :}
    ar CASE-DIR {: cd:str :}
    cd CREDENTIAL-DIR !
-   cd s" org.omarchy.omabox" >str SECRET:DIR-BIND
+   cd s" org.omarchy.omabox" SECRET:DIR-BIND
    ar RECOVERY-CONTROL-RETRIES-UNDER-A-HELD-LOCK-AND-CLEARS-ONLY-AFTER-A-CLEAN-PASS
    ar RECOVERY-CONTROL-PUBLISHES-STOPPED-BEFORE-A-FATAL-EXIT
    ROOT-INSPECTION-FAILURE-IS-UNAVAILABLE-ONLY-FOR-A-STAND-IN
@@ -574,7 +574,7 @@ TYPED-VARIABLE CYCLE-ARENA ^ARENA:arena
    [: TEST-DROPBOX:START
       [: ar RUN-SERVED ;] [: TEST-DROPBOX:STOP ;] finally ;]
    [: AIO:STOP ;] finally
-   cd str> FS:REMOVE-TREE ;
+   cd FS:REMOVE-TREE ;
 
 
 public
@@ -594,29 +594,29 @@ private
 
 \ Rust's fake_client's root: the fake's account and namespace, at
 \ remote root r.
-: BINDING-AT ( ^u8 n -- JOURNAL:dropbox-binding )
-   >str {: r:str :}
-   s" dbid:account" >str s" namespace" >str r
+: BINDING-AT ( str -- JOURNAL:dropbox-binding )
+   {: r:str :}
+   s" dbid:account" s" namespace" r
    JOURNAL-DROPBOX--BINDING:MAKE ;
 
 \ The binding Rust's tests store for another account.
 : ANOTHER ( -- JOURNAL:dropbox-binding )
-   s" different-account" >str s" namespace" >str s" " >str
+   s" different-account" s" namespace" s" "
    JOURNAL-DROPBOX--BINDING:MAKE ;
 
 \ A case's directory and the journal opened in it.
 : CASE-JOURNAL ( ^ARENA:arena -- str JOURNAL:journal )
    {: ar :}
    s" daemon-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
-   SB-RESET d str> SB-APPEND s" /journal.sqlite3" SB-APPEND
+   SB-RESET d SB-APPEND s" /journal.sqlite3" SB-APPEND
    d SB$ ar COPIED JOURNAL:OPEN ;
 
 : CASE-GONE ( str JOURNAL:journal -- )
-   JOURNAL:CLOSE str> FS:REMOVE-TREE ;
+   JOURNAL:CLOSE FS:REMOVE-TREE ;
 
-: SEEN ( ^u8 n -- ) TEST-DROPBOX:SEEN$ 2swap T$= ;
+: SEEN ( str -- ) TEST-DROPBOX:SEEN$ swap T$= ;
 
-: ACCOUNT-ROUTE$ ( -- ^u8 n ) s" /2/users/get_current_account" ;
+: ACCOUNT-ROUTE$ ( -- str ) s" /2/users/get_current_account" ;
 
 \ A restricted remote root through VALIDATE is unavailable, so the
 \ daemon never syncs a root it cannot list completely.

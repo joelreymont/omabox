@@ -111,12 +111,12 @@ $2E constant DOT
 
 : LOG-OPEN ( -- ) LOG:ERROR s" local" LOG:LINE ;
 
-: QUOTED+ ( ^u8 n -- ) s" `" LOG:TEXT+ LOG:TEXT+ s" `" LOG:TEXT+ ;
+: QUOTED+ ( str -- ) s" `" LOG:TEXT+ LOG:TEXT+ s" `" LOG:TEXT+ ;
 
 : ERRNO+ ( n -- )
    {: e:n :}
    e 0= if exit then
-   s" : " LOG:TEXT+ e FS:ERRNO$ str> LOG:TEXT+ ;
+   s" : " LOG:TEXT+ e FS:ERRNO$ LOG:TEXT+ ;
 
 \ Out of descriptors, memory or space, the next entry would fail the same
 \ way: Rust's EXHAUSTION, which says nothing about the object observed.
@@ -170,78 +170,78 @@ public
 private
 
 \ Logs "local path `p`" and the text after it, then throws code.
-: PATH-FAILS ( ^u8 n ^u8 n n -- )
-   {: p:^ u:n t:^ tu:n code:n :}
+: PATH-FAILS ( str str n -- )
+   {: p:str t:str code:n :}
    code FS:ERRNO QUIET? 0= if
-      LOG-OPEN s" local path " LOG:TEXT+ p u QUOTED+
-      t tu LOG:TEXT+ LOG:;LINE
+      LOG-OPEN s" local path " LOG:TEXT+ p QUOTED+
+      t LOG:TEXT+ LOG:;LINE
    then
    code throw ;
 
-: UNSAFE ( ^u8 n -- )
+: UNSAFE ( str -- )
    s"  is not a safe path relative to the sync root"
    E-UNSAFE-PATH PATH-FAILS ;
 
-: UNSUPPORTED-FAILS ( ^u8 n n -- )
-   {: p:^ u:n code:n :}
-   p u s"  is not a regular file or directory" code PATH-FAILS ;
+: UNSUPPORTED-FAILS ( str n -- )
+   {: p:str code:n :}
+   p s"  is not a regular file or directory" code PATH-FAILS ;
 
-: UNREADABLE ( ^u8 n -- )
+: UNREADABLE ( str -- )
    s"  is a file Omabox cannot read" E-UNREADABLE PATH-FAILS ;
 
 \ The operation, then the path, as every word below takes them.
-: CHANGED-FAILS ( ^u8 n ^u8 n n -- )
-   {: o:^ ou:n p:^ u:n code:n :}
+: CHANGED-FAILS ( str str n -- )
+   {: o:str p:str code:n :}
    code FS:ERRNO QUIET? 0= if
-      LOG-OPEN s" local path " LOG:TEXT+ p u QUOTED+
-      s"  changed during " LOG:TEXT+ o ou QUOTED+ LOG:;LINE
+      LOG-OPEN s" local path " LOG:TEXT+ p QUOTED+
+      s"  changed during " LOG:TEXT+ o QUOTED+ LOG:;LINE
    then
    code throw ;
 
-: CHANGED ( ^u8 n ^u8 n -- ) E-CHANGED CHANGED-FAILS ;
+: CHANGED ( str str -- ) E-CHANGED CHANGED-FAILS ;
 
-: INVALID-HASH ( ^u8 n -- )
-   {: o:^ ou:n :}
+: INVALID-HASH ( str -- )
+   {: o:str :}
    E-CONTENT-HASH FS:ERRNO QUIET? 0= if
-      LOG-OPEN s" operation " LOG:TEXT+ o ou QUOTED+
+      LOG-OPEN s" operation " LOG:TEXT+ o QUOTED+
       s"  requires a lowercase Dropbox content hash" LOG:TEXT+ LOG:;LINE
    then
    E-CONTENT-HASH throw ;
 
-: CORRUPT ( ^u8 n ^u8 n -- )
-   {: o:^ ou:n p:^ u:n :}
+: CORRUPT ( str str -- )
+   {: o:str p:str :}
    E-CORRUPT FS:ERRNO QUIET? 0= if
-      LOG-OPEN s" private local file for " LOG:TEXT+ o ou QUOTED+
-      s"  at " LOG:TEXT+ p u QUOTED+
+      LOG-OPEN s" private local file for " LOG:TEXT+ o QUOTED+
+      s"  at " LOG:TEXT+ p QUOTED+
       s"  failed content verification" LOG:TEXT+ LOG:;LINE
    then
    E-CORRUPT throw ;
 
-: OCCUPIED ( ^u8 n ^u8 n -- )
-   {: o:^ ou:n p:^ u:n :}
+: OCCUPIED ( str str -- )
+   {: o:str p:str :}
    E-OCCUPIED FS:ERRNO QUIET? 0= if
-      LOG-OPEN s" non-overwriting operation " LOG:TEXT+ o ou QUOTED+
-      s"  found unrelated bytes at " LOG:TEXT+ p u QUOTED+ LOG:;LINE
+      LOG-OPEN s" non-overwriting operation " LOG:TEXT+ o QUOTED+
+      s"  found unrelated bytes at " LOG:TEXT+ p QUOTED+ LOG:;LINE
    then
    E-OCCUPIED throw ;
 
 \ Opens the line of operation o failing for p with errno e.
-: FAILED+ ( ^u8 n ^u8 n n -- )
-   {: o:^ ou:n p:^ u:n e:n :}
-   LOG-OPEN s" local filesystem operation " LOG:TEXT+ o ou QUOTED+
-   s"  failed for " LOG:TEXT+ p u QUOTED+ e ERRNO+ ;
+: FAILED+ ( str str n -- )
+   {: o:str p:str e:n :}
+   LOG-OPEN s" local filesystem operation " LOG:TEXT+ o QUOTED+
+   s"  failed for " LOG:TEXT+ p QUOTED+ e ERRNO+ ;
 
 \ Rust's io_failure, throwing code: FS:ERRNO holds the errno, kept across
 \ the log.
-: IO-FAILS ( ^u8 n ^u8 n n -- )
-   {: o:^ ou:n p:^ u:n code:n :}
+: IO-FAILS ( str str n -- )
+   {: o:str p:str code:n :}
    FS:ERRNO {: e:n :}
-   code e QUIET? 0= if o ou p u e FAILED+ LOG:;LINE then
+   code e QUIET? 0= if o p e FAILED+ LOG:;LINE then
    e FS:CAUSE! code throw ;
 
 public
 
-: IO-FAILURE ( ^u8 n ^u8 n -- )
+: IO-FAILURE ( str str -- )
    FS:ERRNO FS:ENOSPC = if E-DISK-FULL else E-IO then IO-FAILS ;
 
 private
@@ -268,10 +268,10 @@ STRUCTURE facts
 
 \ The facts of the entry named in dir, not of a symlink's target; none
 \ for an empty name or an entry that does not open.
-: ENTRY-FACTS ( fd ^u8 n -- option<facts> )
-   {: dir:fd name:^ nu:n :}
-   nu 0= if OPTION:NONE exit then
-   dir name nu FS:TRY-OPEN-ENTRY-AT MATCH option
+: ENTRY-FACTS ( fd str -- option<facts> )
+   {: dir:fd name:str :}
+   name str> nip 0= if OPTION:NONE exit then
+   dir name FS:TRY-OPEN-ENTRY-AT MATCH option
       none OF OPTION:NONE ENDOF
       some OF {: f:fd :} f FACTS f DISCARD ENDOF
    ;MATCH ;
@@ -288,7 +288,7 @@ FS:PATHZ-CAP BUFFER: DENIED-PATH
    MATCH option
       none OF ENDOF
       some OF FACTS-UNMAKE {: m:n o:n a:n :}
-         s"  mode " LOG:TEXT+ m $FFF and 4 FMT:OCT-WIDTH$ str> LOG:TEXT+
+         s"  mode " LOG:TEXT+ m $FFF and 4 FMT:OCT-WIDTH$ LOG:TEXT+
          s"  owner uid " LOG:TEXT+ o LOG:INT+
          a FS-STATX:IMMUTABLE and 0<> if s"  immutable" LOG:TEXT+ then
          a FS-STATX:APPEND and 0<> if s"  append-only" LOG:TEXT+ then
@@ -301,7 +301,7 @@ FS:PATHZ-CAP BUFFER: DENIED-PATH
    {: dir:fd :}
    0 [: drop dir DENIED-PATH FS:PATHZ-CAP FS:FD-PATH ;] catch
    {: code:n :}
-   code 0= if s"  " LOG:TEXT+ DENIED-PATH swap QUOTED+ exit then
+   code 0= if s"  " LOG:TEXT+ DENIED-PATH swap >str QUOTED+ exit then
    drop code E-FS-STAT = code E-FS-CAPACITY = or if exit then
    code throw ;
 
@@ -309,11 +309,11 @@ FS:PATHZ-CAP BUFFER: DENIED-PATH
    {: dir:fd known :}
    s" ; directory" LOG:TEXT+ dir PATH+ known FACTS+ ;
 
-: ENTRY+ ( ^u8 n option<facts> -- )
-   {: name:^ nu:n known :}
+: ENTRY+ ( str option<facts> -- )
+   {: name:str known :}
    known MATCH option
       none OF ENDOF
-      some OF drop s" ; entry " LOG:TEXT+ name nu QUOTED+ known FACTS+
+      some OF drop s" ; entry " LOG:TEXT+ name QUOTED+ known FACTS+
       ENDOF
    ;MATCH ;
 
@@ -321,19 +321,19 @@ FS:PATHZ-CAP BUFFER: DENIED-PATH
    s" ; Omabox runs as uid " LOG:TEXT+ FS:EUID LOG:INT+ ;
 
 \ IO-FAILURE for any errno but a denial LOCAL logs.
-: UNLESS-DENIED ( ^u8 n ^u8 n n -- )
-   {: o:^ ou:n p:^ u:n e:n :}
-   E-IO e QUIET? e DENIED? 0= or if o ou p u IO-FAILURE then ;
+: UNLESS-DENIED ( str str n -- )
+   {: o:str p:str e:n :}
+   E-IO e QUIET? e DENIED? 0= or if o p IO-FAILURE then ;
 
 \ The facts of dir and of the entry named in it, read before the line
 \ opens: a failing statx logs a line of its own.
-: SIDE ( fd ^u8 n -- option<facts> option<facts> )
-   {: dir:fd name:^ nu:n :}
-   dir FACTS dir name nu ENTRY-FACTS ;
+: SIDE ( fd str -- option<facts> option<facts> )
+   {: dir:fd name:str :}
+   dir FACTS dir name ENTRY-FACTS ;
 
-: SIDE+ ( fd ^u8 n option<facts> option<facts> -- )
-   {: dir:fd name:^ nu:n df ef :}
-   dir df DIRECTORY+ name nu ef ENTRY+ ;
+: SIDE+ ( fd str option<facts> option<facts> -- )
+   {: dir:fd name:str df ef :}
+   dir df DIRECTORY+ name ef ENTRY+ ;
 
 : DENIED-THROW ( n -- )
    {: e:n :}
@@ -343,37 +343,37 @@ public
 
 \ IO-FAILURE for a call on the name in dir, or on dir for an empty name;
 \ a denial's line also gives their facts.
-: IO-FAILURE-AT ( fd ^u8 n ^u8 n ^u8 n -- )
-   {: dir:fd name:^ nu:n o:^ ou:n p:^ u:n :}
+: IO-FAILURE-AT ( fd str str str -- )
+   {: dir:fd name:str o:str p:str :}
    FS:ERRNO {: e:n :}
-   o ou p u e UNLESS-DENIED
-   dir name nu SIDE {: df ef :}
-   o ou p u e FAILED+ dir name nu df ef SIDE+ e DENIED-THROW ;
+   o p e UNLESS-DENIED
+   dir name SIDE {: df ef :}
+   o p e FAILED+ dir name df ef SIDE+ e DENIED-THROW ;
 
 private
 
 \ IO-FAILURE-AT for a call from a name in one directory to a name in
 \ another: a denial's line gives both sides, the source first.
-: IO-FAILURE-ACROSS ( fd ^u8 n fd ^u8 n ^u8 n ^u8 n -- )
-   {: from:fd fn:^ fu:n to:fd tn:^ tu:n o:^ ou:n p:^ u:n :}
+: IO-FAILURE-ACROSS ( fd str fd str str str -- )
+   {: from:fd fn:str to:fd tn:str o:str p:str :}
    FS:ERRNO {: e:n :}
-   o ou p u e UNLESS-DENIED
-   from fn fu SIDE {: sd se :} to tn tu SIDE {: td te :}
-   o ou p u e FAILED+
-   from fn fu sd se SIDE+ to tn tu td te SIDE+ e DENIED-THROW ;
+   o p e UNLESS-DENIED
+   from fn SIDE {: sd se :} to tn SIDE {: td te :}
+   o p e FAILED+
+   from fn sd se SIDE+ to tn td te SIDE+ e DENIED-THROW ;
 
 \ Rust's syscall_failure: io_failure with the errno given.
-: SYSCALL-FAILURE ( n ^u8 n ^u8 n -- )
-   {: e:n o:^ ou:n p:^ u:n :}
-   e FS:CAUSE! o ou p u IO-FAILURE ;
+: SYSCALL-FAILURE ( n str str -- )
+   {: e:n o:str p:str :}
+   e FS:CAUSE! o p IO-FAILURE ;
 
 \ Rust's StageIoError::Read: the source of a stage's bytes failed.
-: STAGE-READ ( ^u8 n ^u8 n -- )
-   {: o:^ ou:n p:^ u:n :}
+: STAGE-READ ( str str -- )
+   {: o:str p:str :}
    FS:ERRNO {: e:n :}
    E-STAGE-READ e QUIET? 0= if
       LOG-OPEN s" could not read stage input during " LOG:TEXT+
-      o ou QUOTED+ s"  for " LOG:TEXT+ p u QUOTED+ e ERRNO+ LOG:;LINE
+      o QUOTED+ s"  for " LOG:TEXT+ p QUOTED+ e ERRNO+ LOG:;LINE
    then
    e FS:CAUSE! E-STAGE-READ throw ;
 
@@ -443,21 +443,21 @@ STRUCTURE hashed
 
 \ The seeds a guarded word replaces, and their typed drops.
 : NO-STAT ( -- MODEL:stat ) 0 0 0 0 0 0 0 0 MODEL-STAT:MAKE ;
-: NO-HASH ( -- DROPBOX:hash ) s" " >str DROPBOX:>HASH ;
+: NO-HASH ( -- DROPBOX:hash ) s" " DROPBOX:>HASH ;
 : NO-FINGERPRINT ( -- MODEL:fingerprint )
    0 0 0 0 0 0 MODEL-FINGERPRINT:MAKE ;
 : DROP-STAT ( MODEL:stat -- ) drop ;
 : DROP-HASH ( DROPBOX:hash -- ) drop ;
 : DROP-FINGERPRINT ( MODEL:fingerprint -- ) drop ;
 
-: STAT-FD-FAILS ( fd ^u8 n ^u8 n n -- MODEL:stat )
-   {: f:fd p:^ u:n o:^ ou:n code:n :}
-   [: f FS:FD-STAT ;] [: o ou p u code IO-FAILS ;] FS-FAILS
+: STAT-FD-FAILS ( fd str str n -- MODEL:stat )
+   {: f:fd p:str o:str code:n :}
+   [: f FS:FD-STAT ;] [: o p code IO-FAILS ;] FS-FAILS
    FS:STAT-DEV@ FS:STAT-INO@ FS:STAT-MODE@ FS:STAT-SIZE@
    FS:STAT-MTIME-SEC@ FS:STAT-MTIME-NS@
    FS:STAT-CTIME-SEC@ FS:STAT-CTIME-NS@ MODEL-STAT:MAKE ;
 
-: STAT-FD ( fd ^u8 n ^u8 n -- MODEL:stat ) E-IO STAT-FD-FAILS ;
+: STAT-FD ( fd str str -- MODEL:stat ) E-IO STAT-FD-FAILS ;
 
 : REGULAR? ( MODEL:stat -- bool )
    MODEL-STAT:UNMAKE {: d i m s ms mn cs cn :}
@@ -482,10 +482,10 @@ STRUCTURE hashed
    b MODEL-FINGERPRINT:UNMAKE {: i2 s2 ms2 mn2 cs2 cn2 :}
    i i2 = s s2 = and ms ms2 = and mn mn2 = and ;
 
-: FILE-FINGERPRINT ( MODEL:stat ^u8 n -- MODEL:fingerprint )
-   {: st:MODEL:stat p:^ u:n :}
+: FILE-FINGERPRINT ( MODEL:stat str -- MODEL:fingerprint )
+   {: st:MODEL:stat p:str :}
    st MODEL-STAT:UNMAKE {: d i m s ms mn cs cn :}
-   s 0 < if 0 s" inspect local file size" p u SYSCALL-FAILURE then
+   s 0 < if 0 s" inspect local file size" p SYSCALL-FAILURE then
    i s ms mn cs cn MODEL-FINGERPRINT:MAKE ;
 
 \ ---- content hashes
@@ -494,8 +494,9 @@ TYPED-VARIABLE HASHER DROPBOX:hasher
 IO-SIZE BUFFER: IO-BUF
 
 \ Copies the bytes into the arena.
-: KEEP ( ^u8 n ^ARENA:arena -- str )
-   {: p:^ u:n ar:^ARENA:arena :}
+: KEEP ( str ^ARENA:arena -- str )
+   {: s:str ar:^ARENA:arena :}
+   s str> {: p:^ u:n :}
    ar u ARENA:ALLOC drop {: dst:^ :}
    p dst u BYTE-COPY dst u >str ;
 
@@ -536,48 +537,48 @@ public
 
 private
 
-: REWIND ( fd ^u8 n -- )
-   {: f:fd p:^ u:n :}
+: REWIND ( fd str -- )
+   {: f:fd p:str :}
    [: f 0 FD:SEEK ;]
-   [: s" rewind file before hashing" p u IO-FAILURE ;] FS-FAILS ;
+   [: s" rewind file before hashing" p IO-FAILURE ;] FS-FAILS ;
 
 \ The content hash of fd's bytes from its start; a read failure is o's.
-: HASH-READS ( fd ^u8 n ^u8 n ^ARENA:arena -- DROPBOX:hash )
-   {: f:fd p:^ u:n o:^ ou:n ar:^ARENA:arena :}
-   f p u REWIND
-   NO-HASH [: DROP-HASH f ar HASH-FD ;] [: o ou p u IO-FAILURE ;]
+: HASH-READS ( fd str str ^ARENA:arena -- DROPBOX:hash )
+   {: f:fd p:str o:str ar:^ARENA:arena :}
+   f p REWIND
+   NO-HASH [: DROP-HASH f ar HASH-FD ;] [: o p IO-FAILURE ;]
    FS-FAILS ;
 
 \ The hash of a regular file whose stat after the read is the one given;
 \ a file not regular throws the first code, a changed one the second.
 : HASH-STABLE-FILE-FROM-STAT
-   ( fd ^u8 n ^u8 n MODEL:stat ^ARENA:arena n n
+   ( fd str str MODEL:stat ^ARENA:arena n n
      -- DROPBOX:hash MODEL:fingerprint )
-   {: f:fd p:^ u:n o:^ ou:n before:MODEL:stat ar:^ARENA:arena
+   {: f:fd p:str o:str before:MODEL:stat ar:^ARENA:arena
       unsupported:n changed:n :}
-   before REGULAR? 0= if p u unsupported UNSUPPORTED-FAILS then
-   before p u FILE-FINGERPRINT {: print:MODEL:fingerprint :}
-   f p u o ou ar HASH-READS {: c:DROPBOX:hash :}
-   before f p u o ou STAT-FD SAME-OBSERVATION 0= if
-      o ou p u changed CHANGED-FAILS
+   before REGULAR? 0= if p unsupported UNSUPPORTED-FAILS then
+   before p FILE-FINGERPRINT {: print:MODEL:fingerprint :}
+   f p o ar HASH-READS {: c:DROPBOX:hash :}
+   before f p o STAT-FD SAME-OBSERVATION 0= if
+      o p changed CHANGED-FAILS
    then
    c print ;
 
 : HASH-STABLE-FILE-WITH-FINGERPRINT
-   ( fd ^u8 n ^u8 n ^ARENA:arena n n -- DROPBOX:hash MODEL:fingerprint )
-   {: f:fd p:^ u:n o:^ ou:n ar:^ARENA:arena unsupported:n changed:n :}
-   f p u o ou STAT-FD {: before:MODEL:stat :}
-   f p u o ou before ar unsupported changed HASH-STABLE-FILE-FROM-STAT ;
+   ( fd str str ^ARENA:arena n n -- DROPBOX:hash MODEL:fingerprint )
+   {: f:fd p:str o:str ar:^ARENA:arena unsupported:n changed:n :}
+   f p o STAT-FD {: before:MODEL:stat :}
+   f p o before ar unsupported changed HASH-STABLE-FILE-FROM-STAT ;
 
-: HASH-STABLE-FILE ( fd ^u8 n ^u8 n ^ARENA:arena n n -- DROPBOX:hash )
+: HASH-STABLE-FILE ( fd str str ^ARENA:arena n n -- DROPBOX:hash )
    HASH-STABLE-FILE-WITH-FINGERPRINT
    {: c:DROPBOX:hash print:MODEL:fingerprint :} c ;
 
 \ o names the operation that needs the hash.
-: REQUIRE-CONTENT-HASH ( DROPBOX:hash ^u8 n -- )
-   {: h:DROPBOX:hash o:^ ou:n :}
-   h DROPBOX:HASH>STR str> DROPBOX:CONTENT-HASH? 0= if
-      o ou INVALID-HASH
+: REQUIRE-CONTENT-HASH ( DROPBOX:hash str -- )
+   {: h:DROPBOX:hash o:str :}
+   h DROPBOX:HASH>STR DROPBOX:CONTENT-HASH? 0= if
+      o INVALID-HASH
    then ;
 
 \ ---- names
@@ -586,255 +587,270 @@ SHA256-CTX-BYTES BUFFER: NAME-CTX
 32 BUFFER: NAME-DIGEST
 1 BUFFER: NUL
 
-: FEED ( ^u8 n -- ) {: p:^ u:n :} NAME-CTX p u >str SHA256-FEED ;
+: FEED ( str -- ) {: p:str :} NAME-CTX p SHA256-FEED ;
 
 \ Copies the bytes to dst at offset at; answers the offset after them.
-: PUT ( ^u8 n ^u8 n -- n )
-   {: p:^ u:n dst:^ at:n :}
+: PUT ( str ^u8 n -- n )
+   {: s:str dst:^ at:n :}
+   s str> {: p:^ u:n :}
    p dst at + u BYTE-COPY at u + ;
 
 \ ".omabox-<prefix>-" and the hex SHA-256 of the prefix, the path and
 \ the content, each NUL-separated; laid in the arena.
-: INTERNAL-NAME ( ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- ^u8 n )
-   {: x:^ xu:n p:^ u:n c:DROPBOX:hash ar:^ARENA:arena :}
+: INTERNAL-NAME ( str str DROPBOX:hash ^ARENA:arena -- str )
+   {: x:str p:str c:DROPBOX:hash ar:^ARENA:arena :}
+   x str> nip {: xu:n :}
    NAME-CTX SHA256-BEGIN
-   x xu FEED NUL 1 FEED p u FEED NUL 1 FEED c DROPBOX:HASH>STR str> FEED
+   x FEED NUL 1 >str FEED p FEED NUL 1 >str FEED c DROPBOX:HASH>STR FEED
    NAME-CTX NAME-DIGEST SHA256-END
    ar 8 xu + 1+ 64 + ARENA:ALLOC {: dst:^ size:n :}
    s" .omabox-" dst 0 PUT {: at:n :}
-   x xu dst at PUT {: at2:n :}
+   x dst at PUT {: at2:n :}
    s" -" dst at2 PUT {: at3:n :}
    NAME-DIGEST dst at3 + SHA256>HEX
-   dst size ;
+   dst size >str ;
 
-: PREFIXED-HASH? ( ^u8 n ^u8 n -- bool )
-   {: p:^ u:n x:^ xu:n :}
+: PREFIXED-HASH? ( str str -- bool )
+   {: s:str x:str :}
+   s str> {: p:^ u:n :}
+   x str> nip {: xu:n :}
    u xu < if false exit then
-   p xu x xu STR= 0= if false exit then
-   p xu + u xu - DROPBOX:CONTENT-HASH? ;
+   p xu >str x STR= 0= if false exit then
+   p xu + u xu - >str DROPBOX:CONTENT-HASH? ;
 
 \ A name only LOCAL makes: a download, displaced or deleted file's.
-: RESERVED-ARTIFACT? ( ^u8 n -- bool )
-   {: p:^ u:n :}
-   p u s" .omabox-download-" PREFIXED-HASH? if true exit then
-   p u s" .omabox-displaced-" PREFIXED-HASH? if true exit then
-   p u s" .omabox-deleted-" PREFIXED-HASH? ;
+: RESERVED-ARTIFACT? ( str -- bool )
+   {: p:str :}
+   p s" .omabox-download-" PREFIXED-HASH? if true exit then
+   p s" .omabox-displaced-" PREFIXED-HASH? if true exit then
+   p s" .omabox-deleted-" PREFIXED-HASH? ;
 
 : CONFLICT-NAME
-   ( ^u8 n conflict-side DROPBOX:hash ^ARENA:arena -- ^u8 n )
-   {: p:^ u:n side:conflict-side c:DROPBOX:hash ar:^ARENA:arena :}
+   ( str conflict-side DROPBOX:hash ^ARENA:arena -- str )
+   {: p:str side:conflict-side c:DROPBOX:hash ar:^ARENA:arena :}
    side MATCH conflict-side
       local OF s" conflict-local" ENDOF
       remote OF s" conflict-remote" ENDOF
-   ;MATCH p u c ar INTERNAL-NAME ;
+   ;MATCH p c ar INTERNAL-NAME ;
 
 \ ---- relative paths
 
-: SKIP-SEPS ( ^u8 n n -- n )
-   {: p:^ u:n at:n :}
+\ The bytes of p from from up to to.
+: PART ( str n n -- str )
+   {: p:str from:n to:n :}
+   p str> drop from + to from - >str ;
+
+: SKIP-SEPS ( str n -- n )
+   {: s:str at:n :}
+   s str> {: p:^ u:n :}
    at begin dup u < while
       p over + c@ SLASH <> if exit then
       1+
    repeat ;
 
-: COMPONENT-END ( ^u8 n n -- n )
-   {: p:^ u:n at:n :}
+: COMPONENT-END ( str n -- n )
+   {: s:str at:n :}
+   s str> {: p:^ u:n :}
    at begin dup u < while
       p over + c@ SLASH = if exit then
       1+
    repeat ;
 
-: CURRENT? ( ^u8 n -- bool )
-   {: p:^ u:n :}
+: CURRENT? ( str -- bool )
+   {: s:str :}
+   s str> {: p:^ u:n :}
    u 1 = if p c@ DOT = exit then
    false ;
 
-: PARENT? ( ^u8 n -- bool )
-   {: p:^ u:n :}
+: PARENT? ( str -- bool )
+   {: s:str :}
+   s str> {: p:^ u:n :}
    u 2 = if p c@ DOT = p 1+ c@ DOT = and exit then
    false ;
 
 \ Whether the path starts with Rust's CurDir component.
-: LEADING-DOT? ( ^u8 n -- bool )
-   {: p:^ u:n :}
+: LEADING-DOT? ( str -- bool )
+   {: s:str :}
+   s str> {: p:^ u:n :}
    p c@ DOT <> if false exit then
    u 1 = if true exit then
    p 1+ c@ SLASH = ;
 
 \ The next component from at on that is neither empty nor ".": its start,
 \ its end and true; u u false past the last.
-: NEXT-COMPONENT ( ^u8 n n -- n n bool )
-   {: p:^ u:n at:n :}
-   p u at SKIP-SEPS {: from:n :}
+: NEXT-COMPONENT ( str n -- n n bool )
+   {: p:str at:n :}
+   p str> nip {: u:n :}
+   p at SKIP-SEPS {: from:n :}
    from u >= if u u false exit then
-   p u from COMPONENT-END {: to:n :}
-   p from + to from - CURRENT? if p u to RECURSE exit then
+   p from COMPONENT-END {: to:n :}
+   p from to PART CURRENT? if p to RECURSE exit then
    from to true ;
 
 \ The components from at on, counted onto count; ".." is unsafe.
-: TALLY ( ^u8 n n n -- n )
-   {: p:^ u:n count:n at:n :}
-   p u at NEXT-COMPONENT {: from:n to:n found:bool :}
+: TALLY ( str n n -- n )
+   {: p:str count:n at:n :}
+   p at NEXT-COMPONENT {: from:n to:n found:bool :}
    found 0= if count exit then
-   p from + to from - PARENT? if p u UNSAFE then
-   p u count 1+ to RECURSE ;
+   p from to PART PARENT? if p UNSAFE then
+   p count 1+ to RECURSE ;
 
 \ Rust's safe_components: throws E-UNSAFE-PATH for an unsafe path, else
 \ answers its count of components.
-: SAFE-COMPONENTS ( ^u8 n -- n )
-   {: p:^ u:n :}
-   u 0= if p u UNSAFE then
-   p c@ SLASH = if p u UNSAFE then
-   p u LEADING-DOT? if p u UNSAFE then
-   p u 0 0 TALLY ;
+: SAFE-COMPONENTS ( str -- n )
+   {: p:str :}
+   p str> nip 0= if p UNSAFE then
+   p str> drop c@ SLASH = if p UNSAFE then
+   p LEADING-DOT? if p UNSAFE then
+   p 0 0 TALLY ;
 
-: LAST-FROM ( ^u8 n n n n -- n n n )
-   {: p:^ u:n prev:n from:n to:n :}
-   p u to NEXT-COMPONENT {: from2:n to2:n found:bool :}
+: LAST-FROM ( str n n n -- n n n )
+   {: p:str prev:n from:n to:n :}
+   p to NEXT-COMPONENT {: from2:n to2:n found:bool :}
    found 0= if prev from to exit then
-   p u to from2 to2 RECURSE ;
+   p to from2 to2 RECURSE ;
 
 \ Rust's split_last over a safe path's components: the bytes of the
 \ parent, then the last component's start and end.
-: SPLIT-LAST ( ^u8 n -- n n n )
-   {: p:^ u:n :}
-   p u 0 NEXT-COMPONENT {: from:n to:n found:bool :}
-   found 0= if p u UNSAFE then
-   p u 0 from to LAST-FROM ;
+: SPLIT-LAST ( str -- n n n )
+   {: p:str :}
+   p 0 NEXT-COMPONENT {: from:n to:n found:bool :}
+   found 0= if p UNSAFE then
+   p 0 from to LAST-FROM ;
 
 \ The safe path's parent, a prefix of it, empty for a top-level name.
-: PARENT-PATH ( ^u8 n -- ^u8 n )
-   {: p:^ u:n :}
-   p u SAFE-COMPONENTS drop
-   p u SPLIT-LAST 2drop {: len:n :}
-   p len ;
+: PARENT-PATH ( str -- str )
+   {: p:str :}
+   p SAFE-COMPONENTS drop
+   p SPLIT-LAST 2drop {: len:n :}
+   p 0 len PART ;
 
 \ ---- opens
 
-\ Opens the components of p before u from dir, which it then closes, each
-\ by O_PATH: some, or none with FS:ERRNO set; and the offset past the
-\ last component it tried.
-: DESCEND ( fd ^u8 n n -- option<fd> n )
-   {: dir:fd p:^ u:n at:n :}
-   p u at NEXT-COMPONENT {: from:n to:n found:bool :}
+\ Opens the components of p from at on from dir, which it then closes,
+\ each by O_PATH: some, or none with FS:ERRNO set; and the offset past
+\ the last component it tried.
+: DESCEND ( fd str n -- option<fd> n )
+   {: dir:fd p:str at:n :}
+   p at NEXT-COMPONENT {: from:n to:n found:bool :}
    found 0= if dir OPTION:SOME at exit then
-   dir p from + to from - FS:TRY-OPEN-ENTRY-AT dir DISCARD
+   dir p from to PART FS:TRY-OPEN-ENTRY-AT dir DISCARD
    MATCH option
       none OF OPTION:NONE to ENDOF
-      some OF p u to RECURSE ENDOF
+      some OF p to RECURSE ENDOF
    ;MATCH ;
 
 \ DESCEND from the root, which stays open; p holds a component.
-: WALK ( fd ^u8 n -- option<fd> n )
-   {: root:fd p:^ u:n :}
-   p u 0 NEXT-COMPONENT {: from:n to:n found:bool :}
-   root p from + to from - FS:TRY-OPEN-ENTRY-AT MATCH option
+: WALK ( fd str -- option<fd> n )
+   {: root:fd p:str :}
+   p 0 NEXT-COMPONENT {: from:n to:n found:bool :}
+   root p from to PART FS:TRY-OPEN-ENTRY-AT MATCH option
       none OF OPTION:NONE to ENDOF
-      some OF p u to DESCEND ENDOF
+      some OF p to DESCEND ENDOF
    ;MATCH ;
 
-: OPEN-ABSOLUTE-DIRECTORY ( ^u8 n ^u8 n -- fd )
-   {: p:^ u:n o:^ ou:n :}
-   u 0= if p u UNSAFE then
-   p c@ SLASH <> if p u UNSAFE then
-   -1 >FD [: drop p u FS:OPEN-DIR ;] [: o ou p u IO-FAILURE ;] FS-FAILS ;
+: OPEN-ABSOLUTE-DIRECTORY ( str str -- fd )
+   {: p:str o:str :}
+   p str> nip 0= if p UNSAFE then
+   p str> drop c@ SLASH <> if p UNSAFE then
+   -1 >FD [: drop p FS:OPEN-DIR ;] [: o p IO-FAILURE ;] FS-FAILS ;
 
 public
 
 \ The sync root's directory, o naming the operation that opens it.
-: OPEN-ROOT ( ^u8 n ^u8 n -- fd ) OPEN-ABSOLUTE-DIRECTORY ;
+: OPEN-ROOT ( str str -- fd ) OPEN-ABSOLUTE-DIRECTORY ;
 
-: OPEN-PRIVATE-DIRECTORY ( ^u8 n ^u8 n -- fd ) OPEN-ABSOLUTE-DIRECTORY ;
+: OPEN-PRIVATE-DIRECTORY ( str str -- fd ) OPEN-ABSOLUTE-DIRECTORY ;
 
 private
 
 \ A probe that failed confirms nothing, unless the system ran out of a
 \ resource, which says nothing about the entry.
-: UNCONFIRMED ( ^u8 n -- bool )
-   {: p:^ u:n :}
+: UNCONFIRMED ( str -- bool )
+   {: p:str :}
    FS:ERRNO EXHAUSTED? if
-      s" probe local entry existence" p u IO-FAILURE
+      s" probe local entry existence" p IO-FAILURE
    then false ;
 
 \ Whether dir holds the name, closing dir unless it is the root.
-: PRESENT-IN? ( fd bool ^u8 n ^u8 n -- bool )
-   {: dir:fd owned:bool name:^ nu:n p:^ u:n :}
-   dir name nu FS:TRY-STAT-AT
+: PRESENT-IN? ( fd bool str str -- bool )
+   {: dir:fd owned:bool name:str p:str :}
+   dir name FS:TRY-STAT-AT
    owned if dir DISCARD then
    if true exit then
-   p u UNCONFIRMED ;
+   p UNCONFIRMED ;
 
 public
 
 \ Whether an entry is at the path below the root now, a symlink itself
 \ included; its parents are never followed through a symlink.
-: ENTRY-EXISTS-AT ( fd ^u8 n -- bool )
-   {: root:fd p:^ u:n :}
-   p u SAFE-COMPONENTS drop
-   p u SPLIT-LAST {: parent:n from:n to:n :}
-   p from + to from - {: name:^ nu:n :}
-   parent 0= if root false name nu p u PRESENT-IN? exit then
-   root p parent WALK {: o:option<fd> at:n :}
+: ENTRY-EXISTS-AT ( fd str -- bool )
+   {: root:fd p:str :}
+   p SAFE-COMPONENTS drop
+   p SPLIT-LAST {: parent:n from:n to:n :}
+   p from to PART {: name:str :}
+   parent 0= if root false name p PRESENT-IN? exit then
+   root p 0 parent PART WALK {: o:option<fd> at:n :}
    o MATCH option
-      none OF p at UNCONFIRMED ENDOF
-      some OF true name nu p u PRESENT-IN? ENDOF
+      none OF p 0 at PART UNCONFIRMED ENDOF
+      some OF true name p PRESENT-IN? ENDOF
    ;MATCH ;
 
 private
 
 \ Opens p's last component for reading below the root.
-: OPEN-BELOW ( fd ^u8 n -- option<fd> )
-   {: root:fd p:^ u:n :}
-   p u SPLIT-LAST {: parent:n from:n to:n :}
-   p from + to from - {: name:^ nu:n :}
-   parent 0= if root name nu FS:TRY-OPEN-READ-AT exit then
-   root p parent WALK drop MATCH option
+: OPEN-BELOW ( fd str -- option<fd> )
+   {: root:fd p:str :}
+   p SPLIT-LAST {: parent:n from:n to:n :}
+   p from to PART {: name:str :}
+   parent 0= if root name FS:TRY-OPEN-READ-AT exit then
+   root p 0 parent PART WALK drop MATCH option
       none OF OPTION:NONE ENDOF
-      some OF {: dir:fd :} dir name nu FS:TRY-OPEN-READ-AT dir DISCARD
+      some OF {: dir:fd :} dir name FS:TRY-OPEN-READ-AT dir DISCARD
       ENDOF
    ;MATCH ;
 
 \ A failed stat throws the first code, a file not regular the second.
-: CHECK-REGULAR ( fd ^u8 n ^u8 n n n -- MODEL:stat )
-   {: f:fd p:^ u:n o:^ ou:n io:n unsupported:n :}
-   f p u o ou io STAT-FD-FAILS {: st:MODEL:stat :}
-   st REGULAR? 0= if p u unsupported UNSUPPORTED-FAILS then
+: CHECK-REGULAR ( fd str str n n -- MODEL:stat )
+   {: f:fd p:str o:str io:n unsupported:n :}
+   f p o io STAT-FD-FAILS {: st:MODEL:stat :}
+   st REGULAR? 0= if p unsupported UNSUPPORTED-FAILS then
    st ;
 
 \ The stat of the regular file at fd, CHECK-REGULAR's codes given; a throw
 \ closes fd.
-: REGULAR-STAT ( fd ^u8 n ^u8 n n n -- MODEL:stat )
-   {: f:fd p:^ u:n o:^ ou:n io:n unsupported:n :}
-   NO-STAT f [: DROP-STAT f p u o ou io unsupported CHECK-REGULAR ;]
+: REGULAR-STAT ( fd str str n n -- MODEL:stat )
+   {: f:fd p:str o:str io:n unsupported:n :}
+   NO-STAT f [: DROP-STAT f p o io unsupported CHECK-REGULAR ;]
    CLOSING ;
 
 \ A failed open or stat throws the first code, a file not regular the
 \ second.
-: OPEN-RELATIVE-REGULAR-WITH-STAT ( fd ^u8 n ^u8 n n n -- fd MODEL:stat )
-   {: root:fd p:^ u:n o:^ ou:n io:n unsupported:n :}
-   p u SAFE-COMPONENTS drop
-   root p u OPEN-BELOW MATCH option
-      none OF o ou p u io IO-FAILS ENDOF
-      some OF {: f:fd :} f f p u o ou io unsupported REGULAR-STAT ENDOF
+: OPEN-RELATIVE-REGULAR-WITH-STAT ( fd str str n n -- fd MODEL:stat )
+   {: root:fd p:str o:str io:n unsupported:n :}
+   p SAFE-COMPONENTS drop
+   root p OPEN-BELOW MATCH option
+      none OF o p io IO-FAILS ENDOF
+      some OF {: f:fd :} f f p o io unsupported REGULAR-STAT ENDOF
    ;MATCH ;
 
-: OPEN-RELATIVE-REGULAR ( fd ^u8 n ^u8 n n n -- fd )
+: OPEN-RELATIVE-REGULAR ( fd str str n n -- fd )
    OPEN-RELATIVE-REGULAR-WITH-STAT {: f:fd st:MODEL:stat :} f ;
 
 \ Rust's open_relative_at with O_RDONLY|O_NONBLOCK, the flags its one
 \ caller passes, which FS:TRY-OPEN-READ-AT sets.
-: OPEN-RELATIVE-AT ( fd ^u8 n ^u8 n -- fd )
-   {: dir:fd name:^ nu:n p:^ u:n :}
-   dir name nu FS:TRY-OPEN-READ-AT MATCH option
-      none OF s" open root-confined file" p u IO-FAILURE ENDOF
+: OPEN-RELATIVE-AT ( fd str str -- fd )
+   {: dir:fd name:str p:str :}
+   dir name FS:TRY-OPEN-READ-AT MATCH option
+      none OF s" open root-confined file" p IO-FAILURE ENDOF
       some OF ENDOF
    ;MATCH ;
 
-: OPEN-DIRECTORY-AT ( fd ^u8 n ^u8 n -- fd )
-   {: dir:fd name:^ nu:n p:^ u:n :}
-   dir name nu FS:TRY-OPEN-DIR-AT MATCH option
+: OPEN-DIRECTORY-AT ( fd str str -- fd )
+   {: dir:fd name:str p:str :}
+   dir name FS:TRY-OPEN-DIR-AT MATCH option
       none OF
-         dir name nu s" open root-confined directory" p u IO-FAILURE-AT
+         dir name s" open root-confined directory" p IO-FAILURE-AT
       ENDOF
       some OF ENDOF
    ;MATCH ;
@@ -849,45 +865,45 @@ ENUM name-entry
 ;ENUM
 
 \ A failed open is an io failure unless nothing is at the name.
-: MISSING-OR-FAILS ( ^u8 n ^u8 n -- )
-   {: p:^ u:n o:^ ou:n :}
-   FS:ERRNO FS:ENOENT <> if o ou p u IO-FAILURE then ;
+: MISSING-OR-FAILS ( str str -- )
+   {: p:str o:str :}
+   FS:ERRNO FS:ENOENT <> if o p IO-FAILURE then ;
 
 \ The stat of the open entry; a failed stat closes it.
-: STAT-CLOSING ( fd ^u8 n ^u8 n -- MODEL:stat )
-   {: f:fd p:^ u:n o:^ ou:n :}
-   NO-STAT f [: DROP-STAT f p u o ou STAT-FD ;] CLOSING ;
+: STAT-CLOSING ( fd str str -- MODEL:stat )
+   {: f:fd p:str o:str :}
+   NO-STAT f [: DROP-STAT f p o STAT-FD ;] CLOSING ;
 
 \ Whether the probed entry is a regular file; closes the probe.
-: PROBED-REGULAR? ( fd ^u8 n ^u8 n -- bool )
-   {: probe:fd p:^ u:n o:^ ou:n :}
-   probe p u o ou STAT-CLOSING probe DISCARD REGULAR? ;
+: PROBED-REGULAR? ( fd str str -- bool )
+   {: probe:fd p:str o:str :}
+   probe p o STAT-CLOSING probe DISCARD REGULAR? ;
 
 \ The entry open for reading, closed unless it is a regular file.
-: OPENED-ENTRY ( fd ^u8 n ^u8 n -- name-entry )
-   {: f:fd p:^ u:n o:^ ou:n :}
-   f p u o ou STAT-CLOSING {: st:MODEL:stat :}
+: OPENED-ENTRY ( fd str str -- name-entry )
+   {: f:fd p:str o:str :}
+   f p o STAT-CLOSING {: st:MODEL:stat :}
    st REGULAR? 0= if f DISCARD NAME-ENTRY-UNSUPPORTED exit then
    f st OPENED-MAKE NAME-ENTRY-REGULAR ;
 
-: OPEN-READ ( fd ^u8 n ^u8 n ^u8 n -- name-entry )
-   {: dir:fd name:^ nu:n p:^ u:n o:^ ou:n :}
-   dir name nu FS:TRY-OPEN-READ-AT MATCH option
+: OPEN-READ ( fd str str str -- name-entry )
+   {: dir:fd name:str p:str o:str :}
+   dir name FS:TRY-OPEN-READ-AT MATCH option
       none OF FS:ERRNO FS:EACCES = if NAME-ENTRY-UNREADABLE
-         else p u o ou MISSING-OR-FAILS NAME-ENTRY-ABSENT then
+         else p o MISSING-OR-FAILS NAME-ENTRY-ABSENT then
       ENDOF
-      some OF p u o ou OPENED-ENTRY ENDOF
+      some OF p o OPENED-ENTRY ENDOF
    ;MATCH ;
 
 \ What the name holds, probed without following a symlink, then opened
 \ for reading when a regular file is there.
-: OPEN-NAMED ( fd ^u8 n ^u8 n ^u8 n -- name-entry )
-   {: dir:fd name:^ nu:n p:^ u:n o:^ ou:n :}
-   dir name nu FS:TRY-OPEN-ENTRY-AT MATCH option
-      none OF p u o ou MISSING-OR-FAILS NAME-ENTRY-ABSENT ENDOF
+: OPEN-NAMED ( fd str str str -- name-entry )
+   {: dir:fd name:str p:str o:str :}
+   dir name FS:TRY-OPEN-ENTRY-AT MATCH option
+      none OF p o MISSING-OR-FAILS NAME-ENTRY-ABSENT ENDOF
       some OF {: probe:fd :}
-         probe p u o ou PROBED-REGULAR? if
-            dir name nu p u o ou OPEN-READ
+         probe p o PROBED-REGULAR? if
+            dir name p o OPEN-READ
          else NAME-ENTRY-UNSUPPORTED then
       ENDOF
    ;MATCH ;
@@ -895,35 +911,35 @@ ENUM name-entry
 \ The regular file at the name, none when nothing is there; another
 \ object throws E-UNSUPPORTED, a file Omabox cannot read E-UNREADABLE.
 : OPEN-REGULAR-AT-IF-PRESENT
-   ( fd ^u8 n ^u8 n ^u8 n -- option<opened> )
-   {: dir:fd name:^ nu:n p:^ u:n o:^ ou:n :}
-   dir name nu p u o ou OPEN-NAMED MATCH name-entry
+   ( fd str str str -- option<opened> )
+   {: dir:fd name:str p:str o:str :}
+   dir name p o OPEN-NAMED MATCH name-entry
       absent OF OPTION:NONE ENDOF
       regular OF OPTION:SOME ENDOF
-      unsupported OF p u E-UNSUPPORTED UNSUPPORTED-FAILS ENDOF
-      unreadable OF p u UNREADABLE ENDOF
+      unsupported OF p E-UNSUPPORTED UNSUPPORTED-FAILS ENDOF
+      unreadable OF p UNREADABLE ENDOF
    ;MATCH ;
 
 \ Hashes the opened file, closing it on a throw.
-: HASH-OPENED ( opened ^u8 n ^u8 n ^ARENA:arena -- hashed )
-   {: x:opened p:^ u:n o:^ ou:n ar:^ARENA:arena :}
+: HASH-OPENED ( opened str str ^ARENA:arena -- hashed )
+   {: x:opened p:str o:str ar:^ARENA:arena :}
    x OPENED-UNMAKE {: f:fd st:MODEL:stat :}
    NO-HASH NO-FINGERPRINT f
-   [: DROP-FINGERPRINT DROP-HASH f p u o ou st ar E-UNSUPPORTED E-CHANGED
+   [: DROP-FINGERPRINT DROP-HASH f p o st ar E-UNSUPPORTED E-CHANGED
       HASH-STABLE-FILE-FROM-STAT ;] CLOSING
    {: c:DROPBOX:hash print:MODEL:fingerprint :}
    f c print HASHED-MAKE ;
 
 : OPEN-AND-HASH-IF-PRESENT
-   ( fd ^u8 n ^u8 n ^u8 n ^ARENA:arena -- option<hashed> )
-   {: dir:fd name:^ nu:n p:^ u:n o:^ ou:n ar:^ARENA:arena :}
-   dir name nu p u o ou OPEN-REGULAR-AT-IF-PRESENT MATCH option
+   ( fd str str str ^ARENA:arena -- option<hashed> )
+   {: dir:fd name:str p:str o:str ar:^ARENA:arena :}
+   dir name p o OPEN-REGULAR-AT-IF-PRESENT MATCH option
       none OF OPTION:NONE ENDOF
-      some OF p u o ou ar HASH-OPENED OPTION:SOME ENDOF
+      some OF p o ar HASH-OPENED OPTION:SOME ENDOF
    ;MATCH ;
 
 : HASH-AT-IF-PRESENT
-   ( fd ^u8 n ^u8 n ^u8 n ^ARENA:arena -- option<DROPBOX:hash> )
+   ( fd str str str ^ARENA:arena -- option<DROPBOX:hash> )
    OPEN-AND-HASH-IF-PRESENT MATCH option
       none OF OPTION:NONE ENDOF
       some OF HASHED-UNMAKE
@@ -934,10 +950,10 @@ ENUM name-entry
 
 \ The open regular file at the name and its hash; none there is ENOENT.
 : OPEN-AND-HASH-AT
-   ( fd ^u8 n ^u8 n ^u8 n ^ARENA:arena -- fd DROPBOX:hash )
-   {: dir:fd name:^ nu:n p:^ u:n o:^ ou:n ar:^ARENA:arena :}
-   dir name nu p u o ou ar OPEN-AND-HASH-IF-PRESENT MATCH option
-      none OF FS:ENOENT o ou p u SYSCALL-FAILURE ENDOF
+   ( fd str str str ^ARENA:arena -- fd DROPBOX:hash )
+   {: dir:fd name:str p:str o:str ar:^ARENA:arena :}
+   dir name p o ar OPEN-AND-HASH-IF-PRESENT MATCH option
+      none OF FS:ENOENT o p SYSCALL-FAILURE ENDOF
       some OF HASHED-UNMAKE
          {: f:fd c:DROPBOX:hash print:MODEL:fingerprint :}
          f c
@@ -945,40 +961,40 @@ ENUM name-entry
    ;MATCH ;
 
 \ Whether the name's entry is file's inode; a symlink there is another.
-: NAMED-INODE-MATCHES ( fd fd ^u8 n ^u8 n -- bool )
-   {: file:fd dir:fd name:^ nu:n p:^ u:n :}
-   file p u s" inspect held local entry" STAT-FD {: held:MODEL:stat :}
-   dir name nu FS:TRY-OPEN-ENTRY-AT MATCH option
+: NAMED-INODE-MATCHES ( fd fd str str -- bool )
+   {: file:fd dir:fd name:str p:str :}
+   file p s" inspect held local entry" STAT-FD {: held:MODEL:stat :}
+   dir name FS:TRY-OPEN-ENTRY-AT MATCH option
       none OF FS:ERRNO FS:ENOENT <> if
-            s" inspect named local entry" p u IO-FAILURE
+            s" inspect named local entry" p IO-FAILURE
          then false
       ENDOF
       some OF {: e:fd :}
          NO-STAT e
-         [: DROP-STAT e p u s" inspect named local entry" STAT-FD ;] CLOSING
+         [: DROP-STAT e p s" inspect named local entry" STAT-FD ;] CLOSING
          e DISCARD held SAME-INODE
       ENDOF
    ;MATCH ;
 
-: SYNC-DIRECTORY ( fd ^u8 n ^u8 n -- )
-   {: f:fd p:^ u:n o:^ ou:n :}
-   [: f FD:SYNC ;] [: o ou p u IO-FAILURE ;] FS-FAILS ;
+: SYNC-DIRECTORY ( fd str str -- )
+   {: f:fd p:str o:str :}
+   [: f FD:SYNC ;] [: o p IO-FAILURE ;] FS-FAILS ;
 
-: SYNC-FILE ( fd ^u8 n ^u8 n -- ) SYNC-DIRECTORY ;
+: SYNC-FILE ( fd str str -- ) SYNC-DIRECTORY ;
 
 \ Syncs the regular file at the name and its entry; none there is a
 \ change.
-: SYNC-INSTALLED-FILE ( fd ^u8 n ^u8 n -- )
-   {: dir:fd name:^ nu:n p:^ u:n :}
-   s" open installed file for sync" {: o:^ ou:n :}
-   dir name nu p u o ou OPEN-REGULAR-AT-IF-PRESENT MATCH option
-      none OF o ou p u CHANGED ENDOF
+: SYNC-INSTALLED-FILE ( fd str str -- )
+   {: dir:fd name:str p:str :}
+   s" open installed file for sync" {: o:str :}
+   dir name p o OPEN-REGULAR-AT-IF-PRESENT MATCH option
+      none OF o p CHANGED ENDOF
       some OF OPENED-UNMAKE {: f:fd st:MODEL:stat :}
-         [: f p u s" sync installed file" SYNC-FILE ;] [: f DISCARD ;]
+         [: f p s" sync installed file" SYNC-FILE ;] [: f DISCARD ;]
          finally
       ENDOF
    ;MATCH
-   dir p u s" sync installed file entry" SYNC-DIRECTORY ;
+   dir p s" sync installed file entry" SYNC-DIRECTORY ;
 
 \ ---- the scan
 
@@ -1048,10 +1064,10 @@ private
    MODEL-HASH--RECORD:UNMAKE
    {: p:MODEL:path f:MODEL:fingerprint c:DROPBOX:hash :} f ;
 
-: RECORD-PATH ( MODEL:hash-record -- ^u8 n )
+: RECORD-PATH ( MODEL:hash-record -- str )
    MODEL-HASH--RECORD:UNMAKE
    {: p:MODEL:path f:MODEL:fingerprint c:DROPBOX:hash :}
-   p MODEL:PATH>STR str> ;
+   p MODEL:PATH>STR ;
 
 : HASH-IS-REUSABLE ( MODEL:hash-record option<cutoff> -- bool )
    {: r:MODEL:hash-record o:option<cutoff> :}
@@ -1090,20 +1106,20 @@ private
 : UNKNOWN ( JOURNAL:scan str MODEL:unknown-reason -- JOURNAL:scan )
    UNKNOWN-RECORD JOURNAL:SCAN-OBSERVE ;
 
-: OBSERVATION-PATH ( MODEL:local-record -- ^u8 n )
+: OBSERVATION-PATH ( MODEL:local-record -- str )
    MODEL-LOCAL--RECORD:UNMAKE
    {: p:MODEL:path o:MODEL:observation<MODEL:local> :}
-   p MODEL:PATH>STR str> ;
+   p MODEL:PATH>STR ;
 
 \ ---- order
 
-: KEY-LESS ( n n [ n -- ^u8 n ] -- bool )
+: KEY-LESS ( n n [ n -- str ] -- bool )
    {: a:n b:n key :}
-   a key execute >str b key execute >str STR< ;
+   a key execute b key execute STR< ;
 
 \ The indices below count in the byte order of the keys key answers for
 \ them.
-: ORDER ( n [ n -- ^u8 n ] ^ARENA:arena -- ^VEC:vector<n> )
+: ORDER ( n [ n -- str ] ^ARENA:arena -- ^VEC:vector<n> )
    {: count:n key ar:^ARENA:arena :}
    ar ARENA:ALLOCATOR count [type] n VEC:NEW {: idx :}
    count 0 ?do i idx i VEC:AT ! loop
@@ -1111,7 +1127,7 @@ private
    idx 0 VEC:AT count [: key KEY-LESS ;] SORT:SORT!
    idx ;
 
-: STR@ ( ^str -- ^u8 n ) @ str> ;
+: STR@ ( ^str -- str ) @ ;
 
 \ ---- the walk's steps
 
@@ -1130,22 +1146,22 @@ private
 
 \ STAT-FD as a step; after a throw ENTRY-CODE? names, NO-STAT and the
 \ code.
-: STAT-STEP ( fd ^u8 n ^u8 n -- MODEL:stat n )
-   {: f:fd p:^ u:n o:^ ou:n :}
-   NO-STAT [: DROP-STAT f p u o ou STAT-FD ;] catch {: code:n :}
+: STAT-STEP ( fd str str -- MODEL:stat n )
+   {: f:fd p:str o:str :}
+   NO-STAT [: DROP-STAT f p o STAT-FD ;] catch {: code:n :}
    code 0<> if drop NO-STAT then code STEP-CODE ;
 
-: CHANGED-STEP ( ^u8 n ^u8 n -- n )
-   {: o:^ ou:n p:^ u:n :}
-   [: o ou p u CHANGED ;] ENTRY-STEP ;
+: CHANGED-STEP ( str str -- n )
+   {: o:str p:str :}
+   [: o p CHANGED ;] ENTRY-STEP ;
 
-: IO-STEP ( ^u8 n ^u8 n -- n )
-   {: o:^ ou:n p:^ u:n :}
-   [: o ou p u IO-FAILURE ;] ENTRY-STEP ;
+: IO-STEP ( str str -- n )
+   {: o:str p:str :}
+   [: o p IO-FAILURE ;] ENTRY-STEP ;
 
-: UNSUPPORTED-STEP ( ^u8 n -- n )
-   {: p:^ u:n :}
-   [: p u E-UNSUPPORTED UNSUPPORTED-FAILS ;] ENTRY-STEP ;
+: UNSUPPORTED-STEP ( str -- n )
+   {: p:str :}
+   [: p E-UNSUPPORTED UNSUPPORTED-FAILS ;] ENTRY-STEP ;
 
 \ ---- the walk
 
@@ -1164,50 +1180,51 @@ private
 
 \ p and the relative q joined as Rust's Path::join joins them, laid anew in
 \ the arena; an empty q answers p, where Rust appends a "/".
-: JOIN ( ^u8 n ^u8 n ^ARENA:arena -- ^u8 n )
-   {: p:^ u:n q:^ qu:n ar:^ARENA:arena :}
-   u 0= qu 0= or p u >str FS:JOIN-SEPARATED? or {: bare:bool :}
+: JOIN ( str str ^ARENA:arena -- str )
+   {: p:str q:str ar:^ARENA:arena :}
+   p str> nip {: u:n :}
+   q str> nip {: qu:n :}
+   u 0= qu 0= or p FS:JOIN-SEPARATED? or {: bare:bool :}
    bare if 0 else 1 then {: sep:n :}
    ar u sep + qu + ARENA:ALLOC {: dst:^ size:n :}
-   p u dst 0 PUT {: at:n :}
-   s" /" drop sep dst at PUT {: at2:n :}
-   q qu dst at2 PUT drop
-   dst size ;
+   p dst 0 PUT {: at:n :}
+   s" /" 0 sep PART dst at PUT {: at2:n :}
+   q dst at2 PUT drop
+   dst size >str ;
 
 \ The name, the last component of a path below parent.
-: NAME-OF ( str str -- ^u8 n )
+: NAME-OF ( str str -- str )
    {: path:str parent:str :}
-   path str> {: p:^ u:n :}
+   path str> nip {: u:n :}
    parent str> nip {: pu:n :}
-   pu 0= if p u exit then
-   p pu 1+ + u pu 1+ - ;
+   pu 0= if path exit then
+   path pu 1+ u PART ;
 
-\ The one directory listing open at a time: LIST-PATHS reads a directory
-\ whole before its caller uses any entry in it.
-create LISTING FS-LIST:STORAGE-BYTES allot
+\ Pushes the path of the entry, a name in parent, laid in ar, onto v.
+: LIST-ONE ( str u8 str ^ARENA:arena ^VEC:vector<str> -- )
+   {: name:str type:u8 parent:str ar:^ARENA:arena v :}
+   parent name ar JOIN v VEC:PUSH ! ;
 
 : LISTED ( fd str ^ARENA:arena ^VEC:vector<str> -- )
    {: dir:fd parent:str ar:^ARENA:arena v :}
-   LISTING FS-LIST:STORAGE-BYTES SPAN:MAKE FS-LIST:INIT
-   dir [: drop str> parent str> 2swap ar JOIN >str v VEC:PUSH ! ;]
-   FS-LIST:EACH-TYPED-AT ;
+   dir [: parent ar v LIST-ONE ;] FS-LIST:EACH-TYPED-AT ;
 
-: LIST-FAILURE ( n ^u8 n ^u8 n ^u8 n -- )
-   {: code:n open:^ ou:n read:^ ru:n p:^ u:n :}
-   code FS-LIST:E-OPEN = if open ou p u IO-FAILURE then
+: LIST-FAILURE ( n str str str -- )
+   {: code:n open:str read:str p:str :}
+   code FS-LIST:E-OPEN = if open p IO-FAILURE then
    code E-FS-LIST-LAST >= code E-FS-LIST-FIRST <= and if
-      read ru p u IO-FAILURE
+      read p IO-FAILURE
    then
    code throw ;
 
 \ The paths of the entries in dir, but . and .., in the order listed; a
 \ failed listing is an io failure named by the open or the read text.
-: LIST-PATHS ( fd str ^u8 n ^u8 n ^ARENA:arena -- ^VEC:vector<str> )
-   {: dir:fd parent:str open:^ ou:n read:^ ru:n ar:^ARENA:arena :}
+: LIST-PATHS ( fd str str str ^ARENA:arena -- ^VEC:vector<str> )
+   {: dir:fd parent:str open:str read:str ar:^ARENA:arena :}
    ar [type] str NEW-VEC {: v :}
    0 FS:CAUSE!
    [: dir parent ar v LISTED ;] catch {: code:n :}
-   code 0<> if code open ou read ru parent str> LIST-FAILURE then
+   code 0<> if code open read parent LIST-FAILURE then
    v ;
 
 \ LIST-PATHS of the directory as a step, the paths in ar; after a throw
@@ -1256,40 +1273,39 @@ create LISTING FS-LIST:STORAGE-BYTES allot
    lookup path print cx COLLECT-IN
    lookup ARENA:RESET ;
 
-: OPENED-PRINT ( fd ^u8 n MODEL:stat -- MODEL:fingerprint )
-   {: f:fd p:^ u:n probe:MODEL:stat :}
-   f p u s" inspect opened scan file" STAT-FD {: opened:MODEL:stat :}
-   probe opened SAME-INODE 0= if s" open scanned file" p u CHANGED then
-   opened p u FILE-FINGERPRINT ;
+: OPENED-PRINT ( fd str MODEL:stat -- MODEL:fingerprint )
+   {: f:fd p:str probe:MODEL:stat :}
+   f p s" inspect opened scan file" STAT-FD {: opened:MODEL:stat :}
+   probe opened SAME-INODE 0= if s" open scanned file" p CHANGED then
+   opened p FILE-FINGERPRINT ;
 
 \ The fingerprint of the file at name, opened where the probe found it. A
 \ special file put where the probe found a regular one would block a
 \ plain read forever, so the open never waits and the inode check rejects
 \ it.
-: FILE-PRINT ( fd ^u8 n ^u8 n MODEL:stat -- MODEL:fingerprint )
-   {: dir:fd name:^ nu:n p:^ u:n probe:MODEL:stat :}
-   dir name nu p u OPEN-RELATIVE-AT {: f:fd :}
-   [: f p u probe OPENED-PRINT ;] [: f DISCARD ;] finally ;
+: FILE-PRINT ( fd str str MODEL:stat -- MODEL:fingerprint )
+   {: dir:fd name:str p:str probe:MODEL:stat :}
+   dir name p OPEN-RELATIVE-AT {: f:fd :}
+   [: f p probe OPENED-PRINT ;] [: f DISCARD ;] finally ;
 
 \ FILE-PRINT as a step; after a throw ENTRY-CODE? names, NO-FINGERPRINT
 \ and the code.
-: PRINT-STEP ( fd ^u8 n str MODEL:stat -- MODEL:fingerprint n )
-   {: dir:fd name:^ nu:n path:str probe:MODEL:stat :}
-   path str> {: p:^ u:n :}
-   NO-FINGERPRINT [: DROP-FINGERPRINT dir name nu p u probe FILE-PRINT ;]
+: PRINT-STEP ( fd str str MODEL:stat -- MODEL:fingerprint n )
+   {: dir:fd name:str path:str probe:MODEL:stat :}
+   NO-FINGERPRINT [: DROP-FINGERPRINT dir name path probe FILE-PRINT ;]
    catch {: code:n :}
    code 0<> if drop NO-FINGERPRINT then code STEP-CODE ;
 
 \ A reserved artifact publishes unsupported; any other file is collected,
 \ or answers the code its step threw.
 : SCAN-FILE
-   ( JOURNAL:scan fd ^u8 n str MODEL:stat scan-context
+   ( JOURNAL:scan fd str str MODEL:stat scan-context
      -- JOURNAL:scan n )
-   {: dir:fd name:^ nu:n path:str probe:MODEL:stat cx:scan-context :}
-   name nu RESERVED-ARTIFACT? if
+   {: dir:fd name:str path:str probe:MODEL:stat cx:scan-context :}
+   name RESERVED-ARTIFACT? if
       path MODEL-UNKNOWN--REASON:UNSUPPORTED UNKNOWN 0 exit
    then
-   dir name nu path probe PRINT-STEP {: print:MODEL:fingerprint code:n :}
+   dir name path probe PRINT-STEP {: print:MODEL:fingerprint code:n :}
    code 0<> if code exit then
    path print cx COLLECT-FILE 0 ;
 
@@ -1297,31 +1313,30 @@ create LISTING FS-LIST:STORAGE-BYTES allot
 defer SCAN-SUBTREE
    ( JOURNAL:scan fd str scan-context -- JOURNAL:scan n )
 
-: OPENED-DIRECTORY ( fd ^u8 n ^u8 n MODEL:stat -- fd )
-   {: dir:fd name:^ nu:n p:^ u:n probe:MODEL:stat :}
-   dir name nu p u OPEN-DIRECTORY-AT {: child:fd :}
+: OPENED-DIRECTORY ( fd str str MODEL:stat -- fd )
+   {: dir:fd name:str p:str probe:MODEL:stat :}
+   dir name p OPEN-DIRECTORY-AT {: child:fd :}
    child [:
-      child p u s" inspect opened scan directory" STAT-FD
-      probe SAME-INODE 0= if s" open scanned directory" p u CHANGED then
+      child p s" inspect opened scan directory" STAT-FD
+      probe SAME-INODE 0= if s" open scanned directory" p CHANGED then
    ;] CLOSING
    child ;
 
 \ The directory at name, opened where the probe found it, as a step;
 \ after a throw ENTRY-CODE? names, -1 and the code.
-: DIRECTORY-STEP ( fd ^u8 n str MODEL:stat -- fd n )
-   {: dir:fd name:^ nu:n path:str probe:MODEL:stat :}
-   path str> {: p:^ u:n :}
-   -1 >FD [: drop dir name nu p u probe OPENED-DIRECTORY ;] catch
+: DIRECTORY-STEP ( fd str str MODEL:stat -- fd n )
+   {: dir:fd name:str path:str probe:MODEL:stat :}
+   -1 >FD [: drop dir name path probe OPENED-DIRECTORY ;] catch
    {: code:n :}
    code 0<> if drop -1 >FD then code STEP-CODE ;
 
 \ The directory's observation follows its subtree's, so a failure below
 \ leaves it unpublished and drops all the walk recorded beneath it.
 : SCAN-SUBDIRECTORY
-   ( JOURNAL:scan fd ^u8 n str MODEL:stat scan-context
+   ( JOURNAL:scan fd str str MODEL:stat scan-context
      -- JOURNAL:scan n )
-   {: dir:fd name:^ nu:n path:str probe:MODEL:stat cx:scan-context :}
-   dir name nu path probe DIRECTORY-STEP {: child:fd code:n :}
+   {: dir:fd name:str path:str probe:MODEL:stat cx:scan-context :}
+   dir name path probe DIRECTORY-STEP {: child:fd code:n :}
    code 0<> if code exit then
    [: child path cx SCAN-SUBTREE ;] [: child DISCARD ;] finally
    {: walked:n :}
@@ -1332,9 +1347,9 @@ defer SCAN-SUBTREE
 \ Content on another volume is never synchronized, so an object there is
 \ published as a symlink is and nothing beneath it is observed.
 : SCAN-PROBED
-   ( JOURNAL:scan fd fd ^u8 n str scan-context -- JOURNAL:scan n )
-   {: probe:fd dir:fd name:^ nu:n path:str cx:scan-context :}
-   probe path str> s" inspect directory entry type" STAT-STEP
+   ( JOURNAL:scan fd fd str str scan-context -- JOURNAL:scan n )
+   {: probe:fd dir:fd name:str path:str cx:scan-context :}
+   probe path s" inspect directory entry type" STAT-STEP
    {: st:MODEL:stat code:n :}
    code 0<> if code exit then
    cx SCAN-CONTEXT-UNMAKE
@@ -1342,19 +1357,19 @@ defer SCAN-SUBTREE
    st STAT-DEV dev <> if
       path MODEL-UNKNOWN--REASON:UNSUPPORTED UNKNOWN 0 exit
    then
-   st REGULAR? if dir name nu path st cx SCAN-FILE exit then
-   st DIRECTORY? if dir name nu path st cx SCAN-SUBDIRECTORY exit then
-   path str> UNSUPPORTED-STEP ;
+   st REGULAR? if dir name path st cx SCAN-FILE exit then
+   st DIRECTORY? if dir name path st cx SCAN-SUBDIRECTORY exit then
+   path UNSUPPORTED-STEP ;
 
 \ Rust's scan_entry: records one entry and answers 0, or answers the code
 \ that says why it cannot be observed, which SCAN-NAME publishes.
 : SCAN-ENTRY
-   ( JOURNAL:scan fd ^u8 n str scan-context -- JOURNAL:scan n )
-   {: dir:fd name:^ nu:n path:str cx:scan-context :}
-   dir name nu FS:TRY-OPEN-ENTRY-AT MATCH option
-      none OF s" inspect directory entry" path str> IO-STEP ENDOF
+   ( JOURNAL:scan fd str str scan-context -- JOURNAL:scan n )
+   {: dir:fd name:str path:str cx:scan-context :}
+   dir name FS:TRY-OPEN-ENTRY-AT MATCH option
+      none OF s" inspect directory entry" path IO-STEP ENDOF
       some OF {: probe:fd :}
-         [: probe dir name nu path cx SCAN-PROBED ;]
+         [: probe dir name path cx SCAN-PROBED ;]
          [: probe DISCARD ;] finally
       ENDOF
    ;MATCH ;
@@ -1385,9 +1400,9 @@ defer SCAN-SUBTREE
 \ failure ENTRY-CODE? names while the entry is walked.
 : SCAN-NAME ( JOURNAL:scan fd str str scan-context -- JOURNAL:scan )
    {: dir:fd path:str parent:str cx:scan-context :}
-   path parent NAME-OF {: name:^ nu:n :}
-   name nu MODEL:EXCLUDED-NAME? if exit then
-   [: dir name nu path cx SCAN-ENTRY ;] ['] ENTRY-CODE? WITH-CONVERTS
+   path parent NAME-OF {: name:str :}
+   name MODEL:EXCLUDED-NAME? if exit then
+   [: dir name path cx SCAN-ENTRY ;] ['] ENTRY-CODE? WITH-CONVERTS
    {: code:n :}
    code 0= if exit then
    path code WALK-UNKNOWN UNKNOWN ;
@@ -1407,12 +1422,11 @@ defer SCAN-SUBTREE
 : LISTED-UNCHANGED
    ( JOURNAL:scan fd str MODEL:stat -- JOURNAL:scan n )
    {: dir:fd path:str before:MODEL:stat :}
-   path str> {: p:^ u:n :}
-   dir p u s" inspect directory after scan" STAT-STEP
+   dir path s" inspect directory after scan" STAT-STEP
    {: after:MODEL:stat code:n :}
    code 0<> if code exit then
    after before SAME-OBSERVATION 0= if
-      s" scan directory" p u CHANGED-STEP exit
+      s" scan directory" path CHANGED-STEP exit
    then
    path before JOURNAL:SCAN-LISTED 0 ;
 
@@ -1421,7 +1435,7 @@ defer SCAN-SUBTREE
 : SCAN-LISTING
    ( JOURNAL:scan ^ARENA:arena fd str scan-context -- JOURNAL:scan n )
    {: ar:^ARENA:arena dir:fd path:str cx:scan-context :}
-   dir path str> s" inspect directory before scan" STAT-STEP
+   dir path s" inspect directory before scan" STAT-STEP
    {: before:MODEL:stat code:n :}
    code 0<> if code exit then
    dir path ar LISTING-STEP {: names listed:n :}
@@ -1440,7 +1454,7 @@ SUBTREE-INSTALL
 \ ---- the hash stage
 
 : NO-SCANNED-HASH ( -- scanned-hash )
-   s" " >str MODEL:>PATH NO-FINGERPRINT NO-HASH MODEL-HASH--RECORD:MAKE
+   s" " MODEL:>PATH NO-FINGERPRINT NO-HASH MODEL-HASH--RECORD:MAKE
    false SCANNED-HASH-MAKE ;
 
 : DROP-SCANNED-HASH ( scanned-hash -- ) drop ;
@@ -1451,15 +1465,14 @@ SUBTREE-INSTALL
      -- scanned-hash )
    {: f:fd path:str want:MODEL:fingerprint opened:MODEL:stat q
       ar:^ARENA:arena :}
-   path str> {: p:^ u:n :}
-   opened p u FILE-FINGERPRINT want SAME-FINGERPRINT? 0= if
-      s" open enumerated scan file" p u CHANGED
+   opened path FILE-FINGERPRINT want SAME-FINGERPRINT? 0= if
+      s" open enumerated scan file" path CHANGED
    then
-   f p u s" hash local scan file" opened ar E-UNSUPPORTED E-CHANGED
+   f path s" hash local scan file" opened ar E-UNSUPPORTED E-CHANGED
    HASH-STABLE-FILE-FROM-STAT
    {: c:DROPBOX:hash print:MODEL:fingerprint :}
    print want SAME-FINGERPRINT? 0= if
-      s" hash enumerated scan file" p u CHANGED
+      s" hash enumerated scan file" path CHANGED
    then
    path MODEL:>PATH print c MODEL-HASH--RECORD:MAKE
    {: r:MODEL:hash-record :}
@@ -1469,7 +1482,7 @@ SUBTREE-INSTALL
    ( fd str MODEL:fingerprint [ -- option<cutoff> ] ^ARENA:arena
      -- scanned-hash )
    {: root:fd path:str want:MODEL:fingerprint q ar:^ARENA:arena :}
-   root path str> s" open enumerated scan file" E-IO E-UNSUPPORTED
+   root path s" open enumerated scan file" E-IO E-UNSUPPORTED
    OPEN-RELATIVE-REGULAR-WITH-STAT {: f:fd opened:MODEL:stat :}
    [: f path want opened q ar HASH-OPENED-FILE ;] [: f DISCARD ;] finally ;
 
@@ -1516,11 +1529,11 @@ SUBTREE-INSTALL
 \ at.
 : CACHED-STILL? ( fd MODEL:hash-record -- bool )
    {: root:fd r:MODEL:hash-record :}
-   r RECORD-PATH {: p:^ u:n :}
-   root p u s" reopen cached scan file" E-IO E-UNSUPPORTED
+   r RECORD-PATH {: p:str :}
+   root p s" reopen cached scan file" E-IO E-UNSUPPORTED
    OPEN-RELATIVE-REGULAR-WITH-STAT {: f:fd before:MODEL:stat :}
    f DISCARD
-   before p u FILE-FINGERPRINT r RECORD-FINGERPRINT SAME-FINGERPRINT? ;
+   before p FILE-FINGERPRINT r RECORD-FINGERPRINT SAME-FINGERPRINT? ;
 
 \ CACHED-STILL? under ENTRY-CODE?; after a throw, false and the code.
 : CACHED-STEP ( fd MODEL:hash-record -- bool n )
@@ -1535,7 +1548,7 @@ SUBTREE-INSTALL
    ( JOURNAL:scan MODEL:hash-record fd -- JOURNAL:scan bool )
    {: r:MODEL:hash-record root:fd :}
    root r CACHED-STEP {: same:bool code:n :}
-   r RECORD-PATH >str {: p:str :}
+   r RECORD-PATH {: p:str :}
    code 0<> if p code REVISITED-UNKNOWN UNKNOWN false exit then
    same 0= if
       p MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN false exit
@@ -1544,13 +1557,13 @@ SUBTREE-INSTALL
 
 \ ---- directories
 
-: REOPEN-SCANNED-DIRECTORY ( fd ^u8 n -- MODEL:stat )
-   {: root:fd p:^ u:n :}
-   p u SAFE-COMPONENTS drop
-   root p u FS:TRY-OPEN-DIR-AT MATCH option
-      none OF s" reopen scanned directory" p u IO-FAILURE ENDOF
+: REOPEN-SCANNED-DIRECTORY ( fd str -- MODEL:stat )
+   {: root:fd p:str :}
+   p SAFE-COMPONENTS drop
+   root p FS:TRY-OPEN-DIR-AT MATCH option
+      none OF s" reopen scanned directory" p IO-FAILURE ENDOF
       some OF {: d:fd :}
-         [: d p u s" revalidate scanned directory" STAT-FD ;]
+         [: d p s" revalidate scanned directory" STAT-FD ;]
          [: d DISCARD ;] finally
       ENDOF
    ;MATCH ;
@@ -1565,7 +1578,7 @@ SUBTREE-INSTALL
 
 : DIRECTORY-CHANGED? ( fd str MODEL:stat -- bool )
    {: root:fd path:str before:MODEL:stat :}
-   root path str> REOPEN-SCANNED-DIRECTORY
+   root path REOPEN-SCANNED-DIRECTORY
    before SAME-OBSERVATION 0= ;
 
 \ DIRECTORY-CHANGED? under ENTRY-CODE?; after a throw, false and the
@@ -1577,21 +1590,22 @@ SUBTREE-INSTALL
    code 0<> if drop false then code ;
 
 \ Whether the path is among the held records, which are in byte order.
-: AMONG? ( ^u8 n ^VEC:vector<MODEL:local-record> -- bool )
-   {: p:^ u:n held :}
+: AMONG? ( str ^VEC:vector<MODEL:local-record> -- bool )
+   {: p:str held :}
    0 held VEC:COUNT
-   [: held swap VEC:AT @ OBSERVATION-PATH >str p u >str STR< ;]
+   [: held swap VEC:AT @ OBSERVATION-PATH p STR< ;]
    SORT:PARTITION-POINT {: at:n :}
    at held VEC:COUNT >= if false exit then
-   held at VEC:AT @ OBSERVATION-PATH p u STR= ;
+   held at VEC:AT @ OBSERVATION-PATH p STR= ;
 
 \ Whether an ancestor of the path, the bytes before one of its "/", is
 \ among the held records.
-: BENEATH-ANY? ( ^u8 n ^VEC:vector<MODEL:local-record> -- bool )
-   {: p:^ u:n held :}
+: BENEATH-ANY? ( str ^VEC:vector<MODEL:local-record> -- bool )
+   {: s:str held :}
+   s str> {: p:^ u:n :}
    u 0 ?do
       p i + c@ SLASH = if
-         p i held AMONG? if true unloop exit then
+         s 0 i PART held AMONG? if true unloop exit then
       then
    loop false ;
 
@@ -1601,9 +1615,8 @@ SUBTREE-INSTALL
    ( str MODEL:unknown-reason ^VEC:vector<MODEL:local-record>
      ^ARENA:arena -- )
    {: path:str why:MODEL:unknown-reason held ar:^ARENA:arena :}
-   path str> {: p:^ u:n :}
-   p u held AMONG? p u held BENEATH-ANY? or if exit then
-   p u ar KEEP why UNKNOWN-RECORD held VEC:PUSH ! ;
+   path held AMONG? path held BENEATH-ANY? or if exit then
+   path ar KEEP why UNKNOWN-RECORD held VEC:PUSH ! ;
 
 \ Rust's revalidate_directories, one directory: one that moved, changed
 \ or became unreadable is held with its reason.
@@ -1623,7 +1636,7 @@ SUBTREE-INSTALL
    {: held :}
    held VEC:COUNT 0 ?do
       held i VEC:AT @ {: r:MODEL:local-record :}
-      r OBSERVATION-PATH >str JOURNAL:SCAN-DISCARD r JOURNAL:SCAN-OBSERVE
+      r OBSERVATION-PATH JOURNAL:SCAN-DISCARD r JOURNAL:SCAN-OBSERVE
    loop ;
 
 \ Every listed directory revalidated, those held in ar until each is
@@ -1639,12 +1652,11 @@ SUBTREE-INSTALL
 \ The configured path must still name the root the scan opened.
 : VERIFY-ROOT ( str MODEL:stat -- )
    {: root:str before:MODEL:stat :}
-   root str> {: p:^ u:n :}
-   p u s" reopen sync root after scan" OPEN-ABSOLUTE-DIRECTORY {: f:fd :}
-   [: f p u s" verify sync root binding after scan" STAT-FD ;]
+   root s" reopen sync root after scan" OPEN-ABSOLUTE-DIRECTORY {: f:fd :}
+   [: f root s" verify sync root binding after scan" STAT-FD ;]
    [: f DISCARD ;] finally
    before SAME-INODE
-   0= if s" verify complete local scan root" p u CHANGED then ;
+   0= if s" verify complete local scan root" root CHANGED then ;
 
 \ Rust's finish_scan_at: hashes the files, revalidates the cached hashes,
 \ then every listed directory, each in path byte order, and checks the
@@ -1679,7 +1691,7 @@ SUBTREE-INSTALL
 \ The walk from the root, with one lookup arena for the whole pass.
 : WALK-ROOT ( JOURNAL:scan fd option<cutoff> n -- JOURNAL:scan )
    {: rfd:fd cut:option<cutoff> dev:n :}
-   [: >r rfd s" " >str cut dev r> SCAN-CONTEXT-MAKE
+   [: >r rfd s" " cut dev r> SCAN-CONTEXT-MAKE
       SCAN-DIRECTORY ROOT-WALKED ;] ARENA:WITH ;
 
 \ Rust's enumerate_scan_on_device: every entry on device into the scan;
@@ -1693,19 +1705,19 @@ SUBTREE-INSTALL
    rfd [: rfd cut dev WALK-ROOT ;] CLOSING
    root rfd before ar PENDING-SCAN-MAKE ;
 
-: ROOT-STAT ( fd ^u8 n -- MODEL:stat )
-   {: rfd:fd p:^ u:n :}
+: ROOT-STAT ( fd str -- MODEL:stat )
+   {: rfd:fd p:str :}
    NO-STAT rfd
-   [: DROP-STAT rfd p u s" inspect sync root before scan" STAT-FD ;]
+   [: DROP-STAT rfd p s" inspect sync root before scan" STAT-FD ;]
    CLOSING ;
 
 : ENUMERATE-SCAN
-   ( JOURNAL:scan ^u8 n option<cutoff> ^ARENA:arena
+   ( JOURNAL:scan str option<cutoff> ^ARENA:arena
      -- JOURNAL:scan pending-scan )
-   {: p:^ u:n cut:option<cutoff> ar:^ARENA:arena :}
-   p u ar KEEP {: root:str :}
-   p u s" open sync root for scan" OPEN-ABSOLUTE-DIRECTORY {: rfd:fd :}
-   rfd p u ROOT-STAT {: before:MODEL:stat :}
+   {: p:str cut:option<cutoff> ar:^ARENA:arena :}
+   p ar KEEP {: root:str :}
+   p s" open sync root for scan" OPEN-ABSOLUTE-DIRECTORY {: rfd:fd :}
+   rfd p ROOT-STAT {: before:MODEL:stat :}
    root rfd before cut before STAT-DEV ar ENUMERATE-SCAN-ON-DEVICE ;
 
 \ ---- publishing
@@ -1714,9 +1726,9 @@ SUBTREE-INSTALL
    LOCAL-SCAN--PUBLICATION:ROOT-CHANGED ;
 
 : ACTIVE-BINDING?
-   ( fd ^u8 n JOURNAL:journal ^ARENA:arena -- bool )
-   {: dir:fd p:^ u:n j ar:^ARENA:arena :}
-   p u >str dir j ar JOURNAL:INSPECT-ROOT-AT MATCH option
+   ( fd str JOURNAL:journal ^ARENA:arena -- bool )
+   {: dir:fd p:str j ar:^ARENA:arena :}
+   p dir j ar JOURNAL:INSPECT-ROOT-AT MATCH option
       none OF false ENDOF
       some OF j ar JOURNAL:ACTIVE-ROOT? ENDOF
    ;MATCH ;
@@ -1725,16 +1737,16 @@ public
 
 \ The directory at p while it is the journal's active root; none, the
 \ directory closed, where p names another.
-: OPEN-ACTIVE-ROOT ( JOURNAL:journal ^u8 n -- option<fd> )
-   {: j p:^ u:n :}
-   p u s" open sync root for identity verification"
+: OPEN-ACTIVE-ROOT ( JOURNAL:journal str -- option<fd> )
+   {: j p:str :}
+   p s" open sync root for identity verification"
    OPEN-ABSOLUTE-DIRECTORY {: dir:fd :}
    false dir
-   [: drop dir p u j [: ACTIVE-BINDING? ;] ARENA:WITH ;] CLOSING
+   [: drop dir p j [: ACTIVE-BINDING? ;] ARENA:WITH ;] CLOSING
    if dir OPTION:SOME exit then
    dir DISCARD OPTION:NONE ;
 
-: CONFIGURED-ROOT-IS-ACTIVE? ( JOURNAL:journal ^u8 n -- bool )
+: CONFIGURED-ROOT-IS-ACTIVE? ( JOURNAL:journal str -- bool )
    OPEN-ACTIVE-ROOT MATCH option
       none OF false ENDOF
       some OF DISCARD true ENDOF
@@ -1745,23 +1757,23 @@ private
 \ Rust's order: the scanned root, then the configured path, must be the
 \ active root, which the publication checks again as it writes.
 : PUBLISH-BOUND
-   ( JOURNAL:scan JOURNAL:local-root-binding JOURNAL:journal ^u8 n
+   ( JOURNAL:scan JOURNAL:local-root-binding JOURNAL:journal str
      ^ARENA:arena -- JOURNAL:scan scan-publication )
-   {: b j p:^ u:n ar:^ARENA:arena :}
+   {: b j p:str ar:^ARENA:arena :}
    b j ar JOURNAL:ACTIVE-ROOT? 0= if ROOT-CHANGED exit then
-   j p u CONFIGURED-ROOT-IS-ACTIVE? 0= if ROOT-CHANGED exit then
+   j p CONFIGURED-ROOT-IS-ACTIVE? 0= if ROOT-CHANGED exit then
    b JOURNAL:PUBLISH-SCAN 0= if ROOT-CHANGED exit then
    LOCAL-SCAN--PUBLICATION:PUBLISHED ;
 
 : SCAN-PUBLISHED
-   ( JOURNAL:scan JOURNAL:journal ^u8 n option<cutoff>
+   ( JOURNAL:scan JOURNAL:journal str option<cutoff>
      [ -- option<cutoff> ] ^ARENA:arena
      -- scan-publication JOURNAL:scan )
-   {: j p:^ u:n cut:option<cutoff> q ar:^ARENA:arena :}
-   p u cut ar ENUMERATE-SCAN q j FINISH-BOUND-SCAN-AT
+   {: j p:str cut:option<cutoff> q ar:^ARENA:arena :}
+   p cut ar ENUMERATE-SCAN q j FINISH-BOUND-SCAN-AT
    MATCH option
       none OF ROOT-CHANGED ENDOF
-      some OF j p u ar PUBLISH-BOUND ENDOF
+      some OF j p ar PUBLISH-BOUND ENDOF
    ;MATCH swap ;
 
 \ The complete root through no-follow, descriptor-relative opens, scanned
@@ -1771,18 +1783,18 @@ private
 \ own failures fail the scan. cut decides which cached hashes the walk
 \ reuses, q which hashes it computes stay reusable.
 : SCAN-AND-PUBLISH-AT
-   ( JOURNAL:journal ^u8 n option<cutoff> [ -- option<cutoff> ]
+   ( JOURNAL:journal str option<cutoff> [ -- option<cutoff> ]
      ^ARENA:arena -- scan-publication )
-   {: j p:^ u:n cut:option<cutoff> q ar:^ARENA:arena :}
-   j [: j p u cut q ar SCAN-PUBLISHED ;] JOURNAL:WITH-SCAN ;
+   {: j p:str cut:option<cutoff> q ar:^ARENA:arena :}
+   j [: j p cut q ar SCAN-PUBLISHED ;] JOURNAL:WITH-SCAN ;
 
 public
 
 \ p scanned with the journal's hash cache and published to it, in ar.
 : SCAN-AND-PUBLISH
-   ( JOURNAL:journal ^u8 n ^ARENA:arena -- scan-publication )
-   {: j p:^ u:n ar:^ARENA:arena :}
-   j p u CURRENT-HASH-CACHE-CUTOFF [: CURRENT-HASH-CACHE-CUTOFF ;] ar
+   ( JOURNAL:journal str ^ARENA:arena -- scan-publication )
+   {: j p:str ar:^ARENA:arena :}
+   j p CURRENT-HASH-CACHE-CUTOFF [: CURRENT-HASH-CACHE-CUTOFF ;] ar
    SCAN-AND-PUBLISH-AT ;
 
 private
@@ -1800,73 +1812,73 @@ STRUCTURE parent-dir
 
 : DROP-DIR ( option<fd> -- ) drop ;
 
-: DUPLICATE-ROOT ( fd ^u8 n -- fd )
-   {: root:fd p:^ u:n :}
+: DUPLICATE-ROOT ( fd str -- fd )
+   {: root:fd p:str :}
    -1 >FD [: drop root FD:DUPLICATE ;]
-   [: s" duplicate sync root descriptor" p u IO-FAILURE ;] FS-FAILS ;
+   [: s" duplicate sync root descriptor" p IO-FAILURE ;] FS-FAILS ;
 
 \ Makes the directory p names in dir and syncs dir's entry; one that
 \ exists by now is used as it is.
-: MAKE-PARENT ( fd ^u8 n ^u8 n -- )
-   {: dir:fd name:^ nu:n p:^ u:n :}
-   dir name nu FS:MODE-PRIVATE-DIR FS:TRY-MAKE-DIR-AT if
-      dir p u s" sync newly created parent directory entry"
+: MAKE-PARENT ( fd str str -- )
+   {: dir:fd name:str p:str :}
+   dir name FS:MODE-PRIVATE-DIR FS:TRY-MAKE-DIR-AT if
+      dir p s" sync newly created parent directory entry"
       SYNC-DIRECTORY exit
    then
    FS:ERRNO FS:EEXIST = if exit then
-   dir name nu s" create download parent directory" p u IO-FAILURE-AT ;
+   dir name s" create download parent directory" p IO-FAILURE-AT ;
 
 \ The directory made and opened, then synced; a throw closes it.
-: MADE-DIRECTORY ( fd ^u8 n ^u8 n -- fd )
-   {: dir:fd name:^ nu:n p:^ u:n :}
-   dir name nu p u MAKE-PARENT
-   dir name nu p u OPEN-DIRECTORY-AT {: next:fd :}
-   next [: next p u s" sync newly created directory" SYNC-DIRECTORY ;]
+: MADE-DIRECTORY ( fd str str -- fd )
+   {: dir:fd name:str p:str :}
+   dir name p MAKE-PARENT
+   dir name p OPEN-DIRECTORY-AT {: next:fd :}
+   next [: next p s" sync newly created directory" SYNC-DIRECTORY ;]
    CLOSING next ;
 
 \ After an open in dir failed: none for a missing name without create,
 \ else the directory made.
-: MISSING-DIRECTORY ( fd ^u8 n ^u8 n bool -- option<fd> )
-   {: dir:fd name:^ nu:n p:^ u:n create:bool :}
+: MISSING-DIRECTORY ( fd str str bool -- option<fd> )
+   {: dir:fd name:str p:str create:bool :}
    FS:ERRNO FS:ENOENT <> if
-      dir name nu s" open root-confined directory" p u IO-FAILURE-AT
+      dir name s" open root-confined directory" p IO-FAILURE-AT
    then
    create 0= if OPTION:NONE exit then
-   dir name nu p u MADE-DIRECTORY OPTION:SOME ;
+   dir name p MADE-DIRECTORY OPTION:SOME ;
 
-: OPEN-COMPONENT ( fd ^u8 n ^u8 n bool -- option<fd> )
-   {: dir:fd name:^ nu:n p:^ u:n create:bool :}
-   dir name nu FS:TRY-OPEN-DIR-AT MATCH option
-      none OF dir name nu p u create MISSING-DIRECTORY ENDOF
+: OPEN-COMPONENT ( fd str str bool -- option<fd> )
+   {: dir:fd name:str p:str create:bool :}
+   dir name FS:TRY-OPEN-DIR-AT MATCH option
+      none OF dir name p create MISSING-DIRECTORY ENDOF
       some OF OPTION:SOME ENDOF
    ;MATCH ;
 
-\ Opens each component of p before u from at on in the directory before
+\ Opens each component of p from at on in the directory before
 \ it, dir first; each closes once the next opens or a throw passes.
-: DESCEND-PARENTS ( fd ^u8 n n bool -- option<fd> )
-   {: dir:fd p:^ u:n at:n create:bool :}
-   p u at NEXT-COMPONENT {: from:n to:n found:bool :}
+: DESCEND-PARENTS ( fd str n bool -- option<fd> )
+   {: dir:fd p:str at:n create:bool :}
+   p at NEXT-COMPONENT {: from:n to:n found:bool :}
    found 0= if dir OPTION:SOME exit then
    OPTION:NONE dir
-   [: DROP-DIR dir p from + to from - p to create OPEN-COMPONENT ;]
+   [: DROP-DIR dir p from to PART p 0 to PART create OPEN-COMPONENT ;]
    CLOSING dir DISCARD
    MATCH option
       none OF OPTION:NONE ENDOF
-      some OF p u to create RECURSE ENDOF
+      some OF p to create RECURSE ENDOF
    ;MATCH ;
 
 \ Rust's open_parent: the parent of p's last component below the root,
 \ none when a directory on the way is missing; create makes those
 \ directories, each synced with its entry.
-: OPEN-PARENT ( fd ^u8 n bool -- option<parent-dir> )
-   {: root:fd p:^ u:n create:bool :}
-   p u SAFE-COMPONENTS drop
-   p u SPLIT-LAST {: parent:n from:n to:n :}
-   root p u DUPLICATE-ROOT p parent 0 create DESCEND-PARENTS
+: OPEN-PARENT ( fd str bool -- option<parent-dir> )
+   {: root:fd p:str create:bool :}
+   p SAFE-COMPONENTS drop
+   p SPLIT-LAST {: parent:n from:n to:n :}
+   root p DUPLICATE-ROOT p 0 parent PART 0 create DESCEND-PARENTS
    MATCH option
       none OF OPTION:NONE ENDOF
       some OF {: f:fd :}
-         f p from + to from - >str p parent >str PARENT-DIR-MAKE
+         f p from to PART p 0 parent PART PARENT-DIR-MAKE
          OPTION:SOME
       ENDOF
    ;MATCH ;
@@ -1911,57 +1923,57 @@ ENUM download-marker missing expected other ;ENUM
 : DROP-MARKER ( download-marker -- ) drop ;
 
 \ The Rust daemon's names and sizes, so either reads the other's stages.
-: DOWNLOAD-STAGE-XATTR ( -- ^u8 n ) s" user.omabox.download-stage-v1" ;
+: DOWNLOAD-STAGE-XATTR ( -- str ) s" user.omabox.download-stage-v1" ;
 96 constant MARKER-CAP
 MARKER-CAP BUFFER: MARKER-BUF
 \ S_IRUSR: a verified stage's only permission.
 $100 constant MODE-READ-ONLY
 
 \ The marker an owned download stage of target's content carries.
-: STAGE-MARKER ( ^u8 n DROPBOX:hash ^ARENA:arena -- ^u8 n )
-   {: t:^ tu:n c:DROPBOX:hash ar:^ARENA:arena :}
-   s" download-marker-v1" t tu c ar INTERNAL-NAME ;
+: STAGE-MARKER ( str DROPBOX:hash ^ARENA:arena -- str )
+   {: t:str c:DROPBOX:hash ar:^ARENA:arena :}
+   s" download-marker-v1" t c ar INTERNAL-NAME ;
 
 : SAME-CONTENT? ( DROPBOX:hash DROPBOX:hash -- bool )
    {: a:DROPBOX:hash b:DROPBOX:hash :}
-   a DROPBOX:HASH>STR str> b DROPBOX:HASH>STR str> STR= ;
+   a DROPBOX:HASH>STR b DROPBOX:HASH>STR STR= ;
 
-: READ-ONLY ( fd ^u8 n ^u8 n -- )
-   {: f:fd p:^ u:n o:^ ou:n :}
-   [: f MODE-READ-ONLY FD:MODE! ;] [: o ou p u IO-FAILURE ;] FS-FAILS ;
+: READ-ONLY ( fd str str -- )
+   {: f:fd p:str o:str :}
+   [: f MODE-READ-ONLY FD:MODE! ;] [: o p IO-FAILURE ;] FS-FAILS ;
 
 \ ---- xattrs
 
 \ create refuses an attribute that exists, as XATTR_CREATE does.
-: SET-XATTR ( fd ^u8 n ^u8 n bool ^u8 n ^u8 n -- )
-   {: f:fd name:^ nu:n v:^ vu:n create:bool p:^ u:n o:^ ou:n :}
-   [: create if f name nu v vu XATTR:ADD exit then
-      f name nu v vu XATTR:SET ;]
-   [: o ou p u IO-FAILURE ;] FS-FAILS ;
+: SET-XATTR ( fd str str bool str str -- )
+   {: f:fd name:str v:str create:bool p:str o:str :}
+   [: create if f name v XATTR:ADD exit then
+      f name v XATTR:SET ;]
+   [: o p IO-FAILURE ;] FS-FAILS ;
 
 \ An absent attribute is already removed.
-: REMOVE-XATTR ( fd ^u8 n ^u8 n ^u8 n -- )
-   {: f:fd name:^ nu:n p:^ u:n o:^ ou:n :}
-   [: f name nu XATTR:ERASE ;] [: o ou p u IO-FAILURE ;] FS-FAILS ;
+: REMOVE-XATTR ( fd str str str -- )
+   {: f:fd name:str p:str o:str :}
+   [: f name XATTR:ERASE ;] [: o p IO-FAILURE ;] FS-FAILS ;
 
-: MARKER-GOT ( XATTR:got ^u8 n -- download-marker )
-   {: g:XATTR:got want:^ wu:n :}
+: MARKER-GOT ( XATTR:got str -- download-marker )
+   {: g:XATTR:got want:str :}
    g MATCH XATTR:got
       absent OF DOWNLOAD-MARKER-MISSING ENDOF
       value OF {: k:n :}
-         MARKER-BUF k want wu STR= if DOWNLOAD-MARKER-EXPECTED
+         MARKER-BUF k >str want STR= if DOWNLOAD-MARKER-EXPECTED
          else DOWNLOAD-MARKER-OTHER then
       ENDOF
       oversize OF DOWNLOAD-MARKER-OTHER ENDOF
    ;MATCH ;
 
 \ The stage marker on the file, compared with want's bytes.
-: READ-DOWNLOAD-MARKER ( fd ^u8 n ^u8 n -- download-marker )
-   {: f:fd want:^ wu:n p:^ u:n :}
+: READ-DOWNLOAD-MARKER ( fd str str -- download-marker )
+   {: f:fd want:str p:str :}
    DOWNLOAD-MARKER-MISSING
    [: DROP-MARKER f DOWNLOAD-STAGE-XATTR MARKER-BUF MARKER-CAP SPAN:MAKE
-      XATTR:GET want wu MARKER-GOT ;]
-   [: s" verify download stage marker" p u IO-FAILURE ;] FS-FAILS ;
+      XATTR:GET want MARKER-GOT ;]
+   [: s" verify download stage marker" p IO-FAILURE ;] FS-FAILS ;
 
 : EXPECTED? ( download-marker -- bool )
    MATCH download-marker
@@ -1973,27 +1985,27 @@ $100 constant MODE-READ-ONLY
 \ ---- staging
 
 \ Fills the span from read; a file failure there is a stage read's.
-: STAGE-READ-INTO ( ^u8 n [ ^u8 n -- n ] ^u8 n ^u8 n -- n )
-   {: dst:^ cap:n read p:^ u:n o:^ ou:n :}
-   0 [: drop dst cap read execute ;] [: o ou p u STAGE-READ ;] FS-FAILS ;
+: STAGE-READ-INTO ( ^u8 n [ ^u8 n -- n ] str str -- n )
+   {: dst:^ cap:n read p:str o:str :}
+   0 [: drop dst cap read execute ;] [: o p STAGE-READ ;] FS-FAILS ;
 
-: WRITE-PRIVATE ( fd ^u8 n ^u8 n -- )
-   {: w:fd b:^ k:n p:^ u:n :}
-   [: w b k FD:WRITE-FULL ;]
-   [: s" write private stage" p u IO-FAILURE ;] FS-FAILS ;
+: WRITE-PRIVATE ( fd str str -- )
+   {: w:fd b:str p:str :}
+   [: w b FD:WRITE-FULL ;]
+   [: s" write private stage" p IO-FAILURE ;] FS-FAILS ;
 
 \ Reads into the span, writes what came to w and answers its count.
-: COPY-CHUNK ( ^u8 n [ ^u8 n -- n ] fd ^u8 n ^u8 n -- n )
-   {: dst:^ cap:n read w:fd p:^ u:n o:^ ou:n :}
-   dst cap read p u o ou STAGE-READ-INTO {: k:n :}
-   k 0 > if w dst k p u WRITE-PRIVATE then
+: COPY-CHUNK ( ^u8 n [ ^u8 n -- n ] fd str str -- n )
+   {: dst:^ cap:n read w:fd p:str o:str :}
+   dst cap read p o STAGE-READ-INTO {: k:n :}
+   k 0 > if w dst k >str p WRITE-PRIVATE then
    k ;
 
 \ Copies what read gives to w; answers its Dropbox content hash.
 : COPY-AND-HASH
-   ( [ ^u8 n -- n ] fd ^u8 n ^u8 n ^ARENA:arena -- DROPBOX:hash )
-   {: read w:fd p:^ u:n o:^ ou:n ar:^ARENA:arena :}
-   [: read w p u o ou COPY-CHUNK ;] ar HASH-STREAM ;
+   ( [ ^u8 n -- n ] fd str str ^ARENA:arena -- DROPBOX:hash )
+   {: read w:fd p:str o:str ar:^ARENA:arena :}
+   [: read w p o COPY-CHUNK ;] ar HASH-STREAM ;
 
 : MAP-STAGE-WRITE ( stage-write [ -- a ] -- stage-outcome<a> )
    {: w:stage-write stage :}
@@ -2006,95 +2018,95 @@ $100 constant MODE-READ-ONLY
    ;MATCH ;
 
 \ Whether the file carries marker, true when there is none to carry.
-: MARKED? ( fd option<str> ^u8 n -- bool )
-   {: f:fd marker:option<str> p:^ u:n :}
+: MARKED? ( fd option<str> str -- bool )
+   {: f:fd marker:option<str> p:str :}
    marker MATCH option
       none OF true ENDOF
-      some OF {: m:str :} f m str> p u READ-DOWNLOAD-MARKER EXPECTED?
+      some OF {: m:str :} f m p READ-DOWNLOAD-MARKER EXPECTED?
       ENDOF
    ;MATCH ;
 
 \ Syncs the file and its entry when it holds want and carries the marker.
 : REUSE-VERIFIED-STAGE
-   ( fd DROPBOX:hash DROPBOX:hash option<str> fd ^u8 n -- bool )
+   ( fd DROPBOX:hash DROPBOX:hash option<str> fd str -- bool )
    {: f:fd actual:DROPBOX:hash want:DROPBOX:hash marker:option<str>
-      dir:fd p:^ u:n :}
+      dir:fd p:str :}
    actual want SAME-CONTENT? 0= if false exit then
-   f marker p u MARKED? 0= if false exit then
-   f p u s" sync verified stage" SYNC-FILE
-   dir p u s" sync verified stage entry" SYNC-DIRECTORY
+   f marker p MARKED? 0= if false exit then
+   f p s" sync verified stage" SYNC-FILE
+   dir p s" sync verified stage entry" SYNC-DIRECTORY
    true ;
 
 \ An entry at the stage's name is reused or kept; it closes the file.
 : EXISTING-STAGE
-   ( hashed DROPBOX:hash option<str> fd ^u8 n -- stage-write )
-   {: h:hashed want:DROPBOX:hash marker:option<str> dir:fd p:^ u:n :}
+   ( hashed DROPBOX:hash option<str> fd str -- stage-write )
+   {: h:hashed want:DROPBOX:hash marker:option<str> dir:fd p:str :}
    h HASHED-UNMAKE {: f:fd actual:DROPBOX:hash print:MODEL:fingerprint :}
    false f
-   [: drop f actual want marker dir p u REUSE-VERIFIED-STAGE ;] CLOSING
+   [: drop f actual want marker dir p REUSE-VERIFIED-STAGE ;] CLOSING
    f DISCARD
    if STAGE-WRITE-REUSED exit then
-   p u >str STAGE-WRITE-DESTINATION-OCCUPIED ;
+   p STAGE-WRITE-DESTINATION-OCCUPIED ;
 
-: MARK-STAGE ( fd option<str> ^u8 n -- )
-   {: f:fd marker:option<str> p:^ u:n :}
+: MARK-STAGE ( fd option<str> str -- )
+   {: f:fd marker:option<str> p:str :}
    marker MATCH option
       none OF ENDOF
       some OF {: m:str :}
-         f DOWNLOAD-STAGE-XATTR m str> true p u
+         f DOWNLOAD-STAGE-XATTR m true p
          s" mark owned download stage" SET-XATTR
       ENDOF
    ;MATCH ;
 
 \ Names the file in dir; another entry already there is reused or kept.
 : LINK-STAGE
-   ( fd fd ^u8 n ^u8 n DROPBOX:hash option<str> ^u8 n ^ARENA:arena
+   ( fd fd str str DROPBOX:hash option<str> str ^ARENA:arena
      -- stage-write )
-   {: f:fd dir:fd name:^ nu:n p:^ u:n want:DROPBOX:hash
-      marker:option<str> o:^ ou:n ar:^ARENA:arena :}
-   f dir name nu FS:TRY-LINK-AT if
-      dir p u s" sync staged file entry" SYNC-DIRECTORY
+   {: f:fd dir:fd name:str p:str want:DROPBOX:hash
+      marker:option<str> o:str ar:^ARENA:arena :}
+   f dir name FS:TRY-LINK-AT if
+      dir p s" sync staged file entry" SYNC-DIRECTORY
       STAGE-WRITE-CREATED exit
    then
    FS:ERRNO FS:EEXIST <> if
-      dir name nu s" install verified private stage" p u
+      dir name s" install verified private stage" p
       IO-FAILURE-AT
    then
-   dir name nu p u s" verify raced stage" ar OPEN-AND-HASH-IF-PRESENT
+   dir name p s" verify raced stage" ar OPEN-AND-HASH-IF-PRESENT
    MATCH option
-      none OF o ou p u CHANGED ENDOF
-      some OF want marker dir p u EXISTING-STAGE ENDOF
+      none OF o p CHANGED ENDOF
+      some OF want marker dir p EXISTING-STAGE ENDOF
    ;MATCH ;
 
 \ Copies read's bytes into the unnamed file f and names it when they hash
 \ to want, marked, read-only and synced.
 : FILL-STAGE
-   ( fd fd ^u8 n ^u8 n DROPBOX:hash [ ^u8 n -- n ] option<str> ^u8 n
+   ( fd fd str str DROPBOX:hash [ ^u8 n -- n ] option<str> str
      ^ARENA:arena -- stage-write )
-   {: f:fd dir:fd name:^ nu:n p:^ u:n want:DROPBOX:hash read
-      marker:option<str> o:^ ou:n ar:^ARENA:arena :}
-   read f p u o ou ar COPY-AND-HASH {: actual:DROPBOX:hash :}
+   {: f:fd dir:fd name:str p:str want:DROPBOX:hash read
+      marker:option<str> o:str ar:^ARENA:arena :}
+   read f p o ar COPY-AND-HASH {: actual:DROPBOX:hash :}
    actual want SAME-CONTENT? 0= if actual STAGE-WRITE-MISMATCH exit then
-   f marker p u MARK-STAGE
-   f p u s" make staged bytes immutable" READ-ONLY
-   f p u s" sync verified staged bytes" SYNC-FILE
-   f dir name nu p u want marker o ou ar LINK-STAGE ;
+   f marker p MARK-STAGE
+   f p s" make staged bytes immutable" READ-ONLY
+   f p s" sync verified staged bytes" SYNC-FILE
+   f dir name p want marker o ar LINK-STAGE ;
 
-: TEMP-FILE ( fd ^u8 n -- fd )
-   {: dir:fd p:^ u:n :}
+: TEMP-FILE ( fd str -- fd )
+   {: dir:fd p:str :}
    -1 >FD [: drop dir FS:TEMP-AT ;]
-   [: dir s" " s" create unnamed staging file" p u IO-FAILURE-AT ;]
+   [: dir s" " s" create unnamed staging file" p IO-FAILURE-AT ;]
    FS-FAILS ;
 
 : WRITE-NEW-STAGE
-   ( fd ^u8 n ^u8 n DROPBOX:hash [ ^u8 n -- n ] option<str> ^u8 n
+   ( fd str str DROPBOX:hash [ ^u8 n -- n ] option<str> str
      ^ARENA:arena -- stage-write )
-   {: dir:fd name:^ nu:n p:^ u:n want:DROPBOX:hash read
-      marker:option<str> o:^ ou:n ar:^ARENA:arena :}
-   dir p u TEMP-FILE {: f:fd :}
+   {: dir:fd name:str p:str want:DROPBOX:hash read
+      marker:option<str> o:str ar:^ARENA:arena :}
+   dir p TEMP-FILE {: f:fd :}
    STAGE-WRITE-CREATED f
    [: DROP-STAGE-WRITE
-      f dir name nu p u want read marker o ou ar FILL-STAGE ;]
+      f dir name p want read marker o ar FILL-STAGE ;]
    CLOSING
    f DISCARD ;
 
@@ -2102,46 +2114,46 @@ $100 constant MODE-READ-ONLY
 \ entry already there is reused when it holds want and, given a marker,
 \ carries it, and is kept otherwise. o names the operation.
 : WRITE-VERIFIED-STAGE
-   ( fd ^u8 n ^u8 n DROPBOX:hash [ ^u8 n -- n ] option<str> ^u8 n
+   ( fd str str DROPBOX:hash [ ^u8 n -- n ] option<str> str
      ^ARENA:arena -- stage-write )
-   {: dir:fd name:^ nu:n p:^ u:n want:DROPBOX:hash read
-      marker:option<str> o:^ ou:n ar:^ARENA:arena :}
-   dir name nu p u o ou ar OPEN-AND-HASH-IF-PRESENT MATCH option
-      none OF dir name nu p u want read marker o ou ar WRITE-NEW-STAGE
+   {: dir:fd name:str p:str want:DROPBOX:hash read
+      marker:option<str> o:str ar:^ARENA:arena :}
+   dir name p o ar OPEN-AND-HASH-IF-PRESENT MATCH option
+      none OF dir name p want read marker o ar WRITE-NEW-STAGE
       ENDOF
-      some OF want marker dir p u EXISTING-STAGE ENDOF
+      some OF want marker dir p EXISTING-STAGE ENDOF
    ;MATCH ;
 
 \ ---- owned download stages
 
-: OWNED? ( fd DROPBOX:hash DROPBOX:hash ^u8 n ^u8 n -- bool )
-   {: f:fd actual:DROPBOX:hash want:DROPBOX:hash m:^ mu:n p:^ u:n :}
+: OWNED? ( fd DROPBOX:hash DROPBOX:hash str str -- bool )
+   {: f:fd actual:DROPBOX:hash want:DROPBOX:hash m:str p:str :}
    actual want SAME-CONTENT? 0= if false exit then
-   f m mu p u READ-DOWNLOAD-MARKER EXPECTED? ;
+   f m p READ-DOWNLOAD-MARKER EXPECTED? ;
 
 \ Makes the hashed file read-only and synced; answers its fingerprint.
-: SEAL-STAGE ( fd MODEL:fingerprint ^u8 n -- MODEL:fingerprint )
-   {: f:fd print:MODEL:fingerprint p:^ u:n :}
-   s" revalidate owned download stage" {: r:^ ru:n :}
-   s" make verified download stage immutable" {: m:^ mu:n :}
-   f p u r ru STAT-FD p u FILE-FINGERPRINT
-   print SAME-FINGERPRINT? 0= if r ru p u CHANGED then
-   f p u m mu READ-ONLY
-   f p u s" sync immutable download stage" SYNC-FILE
-   f p u s" inspect immutable download stage" STAT-FD
-   p u FILE-FINGERPRINT {: after:MODEL:fingerprint :}
-   print after SAME-HASHED-CONTENT 0= if m mu p u CHANGED then
+: SEAL-STAGE ( fd MODEL:fingerprint str -- MODEL:fingerprint )
+   {: f:fd print:MODEL:fingerprint p:str :}
+   s" revalidate owned download stage" {: r:str :}
+   s" make verified download stage immutable" {: m:str :}
+   f p r STAT-FD p FILE-FINGERPRINT
+   print SAME-FINGERPRINT? 0= if r p CHANGED then
+   f p m READ-ONLY
+   f p s" sync immutable download stage" SYNC-FILE
+   f p s" inspect immutable download stage" STAT-FD
+   p FILE-FINGERPRINT {: after:MODEL:fingerprint :}
+   print after SAME-HASHED-CONTENT 0= if m p CHANGED then
    after ;
 
 : INSPECT-HASHED
-   ( hashed ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- download-stage )
-   {: h:hashed p:^ u:n t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
+   ( hashed str str DROPBOX:hash ^ARENA:arena -- download-stage )
+   {: h:hashed p:str t:str want:DROPBOX:hash ar:^ARENA:arena :}
    h HASHED-UNMAKE {: f:fd actual:DROPBOX:hash print:MODEL:fingerprint :}
-   false f [: drop f actual want t tu want ar STAGE-MARKER p u OWNED? ;]
+   false f [: drop f actual want t want ar STAGE-MARKER p OWNED? ;]
    CLOSING 0= if
-      f DISCARD p u >str DOWNLOAD-STAGE-DESTINATION-OCCUPIED exit
+      f DISCARD p DOWNLOAD-STAGE-DESTINATION-OCCUPIED exit
    then
-   NO-FINGERPRINT f [: DROP-FINGERPRINT f print p u SEAL-STAGE ;] CLOSING
+   NO-FINGERPRINT f [: DROP-FINGERPRINT f print p SEAL-STAGE ;] CLOSING
    {: after:MODEL:fingerprint :}
    f after VERIFIED-DOWNLOAD-STAGE-MAKE DOWNLOAD-STAGE-VERIFIED ;
 
@@ -2151,17 +2163,17 @@ $100 constant MODE-READ-ONLY
 \ the last two; a Habu throw names no path, so its callers could not tell
 \ the stage's name from the target's.
 : INSPECT-DOWNLOAD-STAGE
-   ( fd ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- download-stage )
-   {: dir:fd name:^ nu:n p:^ u:n t:^ tu:n want:DROPBOX:hash
+   ( fd str str str DROPBOX:hash ^ARENA:arena -- download-stage )
+   {: dir:fd name:str p:str t:str want:DROPBOX:hash
       ar:^ARENA:arena :}
-   s" verify owned download stage" {: o:^ ou:n :}
-   dir name nu p u o ou OPEN-NAMED MATCH name-entry
+   s" verify owned download stage" {: o:str :}
+   dir name p o OPEN-NAMED MATCH name-entry
       absent OF DOWNLOAD-STAGE-MISSING ENDOF
-      regular OF p u o ou ar HASH-OPENED
-         p u t tu want ar INSPECT-HASHED
+      regular OF p o ar HASH-OPENED
+         p t want ar INSPECT-HASHED
       ENDOF
-      unsupported OF p u >str DOWNLOAD-STAGE-DESTINATION-OCCUPIED ENDOF
-      unreadable OF p u >str DOWNLOAD-STAGE-DESTINATION-OCCUPIED ENDOF
+      unsupported OF p DOWNLOAD-STAGE-DESTINATION-OCCUPIED ENDOF
+      unreadable OF p DOWNLOAD-STAGE-DESTINATION-OCCUPIED ENDOF
    ;MATCH ;
 
 \ ---- changed guards
@@ -2175,51 +2187,51 @@ $100 constant MODE-READ-ONLY
 
 \ The conflict name holds the guard's bytes already: drops the guard.
 : DROP-DUPLICATE-GUARD
-   ( fd ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- )
-   {: dir:fd g:^ gu:n cn:^ cnu:n t:^ tu:n c:DROPBOX:hash
+   ( fd str str str DROPBOX:hash ^ARENA:arena -- )
+   {: dir:fd g:str cn:str t:str c:DROPBOX:hash
       ar:^ARENA:arena :}
-   dir cn cnu t tu s" verify raced conflict destination" ar
+   dir cn t s" verify raced conflict destination" ar
    HASH-AT-IF-PRESENT c HOLDS? 0= if
-      s" preserve raced local destination" t tu OCCUPIED
+      s" preserve raced local destination" t OCCUPIED
    then
-   dir g gu FS:TRY-REMOVE-FILE-AT 0= if
-      dir g gu s" remove duplicate raced local copy" t tu IO-FAILURE-AT
+   dir g FS:TRY-REMOVE-FILE-AT 0= if
+      dir g s" remove duplicate raced local copy" t IO-FAILURE-AT
    then
-   dir t tu s" sync duplicate raced local cleanup" SYNC-DIRECTORY ;
+   dir t s" sync duplicate raced local cleanup" SYNC-DIRECTORY ;
 
 \ Renames the guard to target's local conflict name for content c.
-: PRESERVE-GUARD ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- )
-   {: dir:fd g:^ gu:n t:^ tu:n c:DROPBOX:hash ar:^ARENA:arena :}
-   s" preserve raced local destination" {: o:^ ou:n :}
-   t tu LOCAL-CONFLICT--SIDE:LOCAL c ar CONFLICT-NAME {: cn:^ cnu:n :}
-   dir g gu dir cn cnu FS:TRY-RENAME-NEW-AT if
-      dir t tu s" sync preserved raced local destination" SYNC-DIRECTORY
+: PRESERVE-GUARD ( fd str str DROPBOX:hash ^ARENA:arena -- )
+   {: dir:fd g:str t:str c:DROPBOX:hash ar:^ARENA:arena :}
+   s" preserve raced local destination" {: o:str :}
+   t LOCAL-CONFLICT--SIDE:LOCAL c ar CONFLICT-NAME {: cn:str :}
+   dir g dir cn FS:TRY-RENAME-NEW-AT if
+      dir t s" sync preserved raced local destination" SYNC-DIRECTORY
       exit
    then
-   FS:ERRNO FS:EEXIST <> if dir g gu o ou t tu IO-FAILURE-AT then
-   dir g gu cn cnu t tu c ar DROP-DUPLICATE-GUARD ;
+   FS:ERRNO FS:EEXIST <> if dir g o t IO-FAILURE-AT then
+   dir g cn t c ar DROP-DUPLICATE-GUARD ;
 
 \ Puts the guard back at target_name; when an entry raced in there, keeps
 \ the guard's bytes, whose hash is actual, under a local conflict name.
 : RESTORE-OR-PRESERVE-CHANGED-GUARD
-   ( fd ^u8 n ^u8 n ^u8 n option<DROPBOX:hash> ^ARENA:arena -- )
-   {: dir:fd g:^ gu:n tn:^ tnu:n t:^ tu:n actual:option<DROPBOX:hash>
+   ( fd str str str option<DROPBOX:hash> ^ARENA:arena -- )
+   {: dir:fd g:str tn:str t:str actual:option<DROPBOX:hash>
       ar:^ARENA:arena :}
-   s" restore changed local destination" {: o:^ ou:n :}
-   dir g gu dir tn tnu FS:TRY-RENAME-NEW-AT if
-      dir t tu o ou SYNC-DIRECTORY exit
+   s" restore changed local destination" {: o:str :}
+   dir g dir tn FS:TRY-RENAME-NEW-AT if
+      dir t o SYNC-DIRECTORY exit
    then
-   FS:ERRNO FS:EEXIST <> if dir g gu o ou t tu IO-FAILURE-AT then
+   FS:ERRNO FS:EEXIST <> if dir g o t IO-FAILURE-AT then
    actual MATCH option
-      none OF s" preserve raced local destination" t tu CHANGED ENDOF
-      some OF {: c:DROPBOX:hash :} dir g gu t tu c ar PRESERVE-GUARD ENDOF
+      none OF s" preserve raced local destination" t CHANGED ENDOF
+      some OF {: c:DROPBOX:hash :} dir g t c ar PRESERVE-GUARD ENDOF
    ;MATCH ;
 
 \ ---- upload stages
 
-: SEEK-START ( fd ^u8 n ^u8 n -- )
-   {: f:fd p:^ u:n o:^ ou:n :}
-   [: f 0 FD:SEEK ;] [: o ou p u IO-FAILURE ;] FS-FAILS ;
+: SEEK-START ( fd str str -- )
+   {: f:fd p:str o:str :}
+   [: f 0 FD:SEEK ;] [: o p IO-FAILURE ;] FS-FAILS ;
 
 public
 
@@ -2238,23 +2250,23 @@ private
 
 \ The open stage at the name when it holds c, at its start.
 : VERIFY-UPLOAD-STAGE
-   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- fd )
-   {: dir:fd name:^ nu:n p:^ u:n c:DROPBOX:hash ar:^ARENA:arena :}
-   dir name nu p u s" verify immutable upload stage" ar OPEN-AND-HASH-AT
+   ( fd str str DROPBOX:hash ^ARENA:arena -- fd )
+   {: dir:fd name:str p:str c:DROPBOX:hash ar:^ARENA:arena :}
+   dir name p s" verify immutable upload stage" ar OPEN-AND-HASH-AT
    {: f:fd actual:DROPBOX:hash :}
    actual c SAME-CONTENT? 0= if
-      f DISCARD s" open immutable upload stage" p u CORRUPT
+      f DISCARD s" open immutable upload stage" p CORRUPT
    then
-   f [: f p u s" rewind immutable upload stage" SEEK-START ;] CLOSING
+   f [: f p s" rewind immutable upload stage" SEEK-START ;] CLOSING
    f ;
 
 ARENA STAGED-UPLOADS staged-upload
 
 : NEW-STAGED-UPLOAD
-   ( ^u8 n DROPBOX:hash ^ARENA:arena -- ^staged-upload )
-   {: d:^ du:n c:DROPBOX:hash ar:^ARENA:arena :}
+   ( str DROPBOX:hash ^ARENA:arena -- ^staged-upload )
+   {: d:str c:DROPBOX:hash ar:^ARENA:arena :}
    ar STAGED-UPLOADS-NEW {: rec:^ :}
-   d du >str c STAGED-UPLOAD-MAKE rec !
+   d c STAGED-UPLOAD-MAKE rec !
    rec ;
 
 public
@@ -2263,11 +2275,11 @@ public
 : OPEN-VERIFIED-UPLOAD ( ^staged-upload ^ARENA:arena -- fd )
    {: rec:^ ar:^ARENA:arena :}
    rec @ STAGED-UPLOAD-UNMAKE {: d:str c:DROPBOX:hash :}
-   c DROPBOX:HASH>STR str> {: name:^ nu:n :}
-   d str> name nu ar JOIN {: p:^ u:n :}
-   d str> s" open upload staging directory" OPEN-PRIVATE-DIRECTORY
+   c DROPBOX:HASH>STR {: name:str :}
+   d name ar JOIN {: p:str :}
+   d s" open upload staging directory" OPEN-PRIVATE-DIRECTORY
    {: dir:fd :}
-   -1 >FD dir [: drop dir name nu p u c ar VERIFY-UPLOAD-STAGE ;] CLOSING
+   -1 >FD dir [: drop dir name p c ar VERIFY-UPLOAD-STAGE ;] CLOSING
    dir DISCARD ;
 
 private
@@ -2288,9 +2300,9 @@ private
 \ The entry at the stage's path hashed, none when nothing is there; an
 \ occupied path is occupied, a throw.
 : HASH-UPLOAD-STAGE
-   ( fd ^u8 n ^u8 n ^ARENA:arena -- option<hashed> bool )
-   {: dir:fd name:^ nu:n p:^ u:n ar:^ARENA:arena :}
-   NO-HASHED [: DROP-HASHED [: dir name nu p u
+   ( fd str str ^ARENA:arena -- option<hashed> bool )
+   {: dir:fd name:str p:str ar:^ARENA:arena :}
+   NO-HASHED [: DROP-HASHED [: dir name p
          s" verify immutable upload stage" ar OPEN-AND-HASH-IF-PRESENT ;]
       ['] UPLOAD-STAGE-OCCUPIED? WITH-CONVERTS ;] catch {: code:n :}
    code 0= if false exit then
@@ -2299,23 +2311,23 @@ private
 
 \ A stage file that does not hold want is disposable: it is removed when
 \ the name is still its inode, so each retry rebuilds the stage.
-: REMOVE-CORRUPT-STAGE ( fd fd ^u8 n ^u8 n -- )
-   {: f:fd dir:fd name:^ nu:n p:^ u:n :}
-   s" remove corrupt upload stage" {: o:^ ou:n :}
-   f dir name nu p u NAMED-INODE-MATCHES 0= if o ou p u CHANGED then
-   dir name nu FS:TRY-REMOVE-FILE-AT 0= if
-      dir name nu o ou p u IO-FAILURE-AT
+: REMOVE-CORRUPT-STAGE ( fd fd str str -- )
+   {: f:fd dir:fd name:str p:str :}
+   s" remove corrupt upload stage" {: o:str :}
+   f dir name p NAMED-INODE-MATCHES 0= if o p CHANGED then
+   dir name FS:TRY-REMOVE-FILE-AT 0= if
+      dir name o p IO-FAILURE-AT
    then
-   dir p u s" sync corrupt upload stage removal" SYNC-DIRECTORY ;
+   dir p s" sync corrupt upload stage removal" SYNC-DIRECTORY ;
 
 \ Reuses the hashed stage when it holds want, else removes it: true
 \ when it was reused. It closes the file.
-: SETTLE-UPLOAD-STAGE ( hashed fd ^u8 n ^u8 n DROPBOX:hash -- bool )
-   {: h:hashed dir:fd name:^ nu:n p:^ u:n want:DROPBOX:hash :}
+: SETTLE-UPLOAD-STAGE ( hashed fd str str DROPBOX:hash -- bool )
+   {: h:hashed dir:fd name:str p:str want:DROPBOX:hash :}
    h HASHED-UNMAKE {: f:fd actual:DROPBOX:hash print:MODEL:fingerprint :}
    false f [: drop
-      f actual want NO-MARKER dir p u REUSE-VERIFIED-STAGE dup 0= if
-         f dir name nu p u REMOVE-CORRUPT-STAGE
+      f actual want NO-MARKER dir p REUSE-VERIFIED-STAGE dup 0= if
+         f dir name p REMOVE-CORRUPT-STAGE
       then ;] CLOSING
    f DISCARD ;
 
@@ -2323,68 +2335,68 @@ private
 \ stage path occupied: then destination-occupied. A failed read of the
 \ source is an io failure.
 : WRITE-UPLOAD-STAGE
-   ( fd fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- stage-write bool )
-   {: src:fd dir:fd name:^ nu:n p:^ u:n want:DROPBOX:hash
+   ( fd fd str str DROPBOX:hash ^ARENA:arena -- stage-write bool )
+   {: src:fd dir:fd name:str p:str want:DROPBOX:hash
       ar:^ARENA:arena :}
    STAGE-WRITE-CREATED [: DROP-STAGE-WRITE [:
-         dir name nu p u want [: src -rot FD-READ ;] NO-MARKER
+         dir name p want [: src -rot FD-READ ;] NO-MARKER
          s" stage upload" ar WRITE-VERIFIED-STAGE ;]
       ['] UPLOAD-STAGE-OCCUPIED? WITH-CONVERTS ;] catch {: code:n :}
    code 0= if false exit then
    drop code FS:ERRNO UPLOAD-STAGE-OCCUPIED? if
-      p u >str STAGE-WRITE-DESTINATION-OCCUPIED true exit
+      p STAGE-WRITE-DESTINATION-OCCUPIED true exit
    then
    code LOCAL-CODE throw ;
 
 \ Stages the source's bytes; its stat must not change while they copy,
 \ unless the stage path was occupied, answered before the second stat.
 : STAGE-SOURCE
-   ( fd ^u8 n fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- stage-write )
-   {: src:fd r:^ ru:n dir:fd name:^ nu:n p:^ u:n want:DROPBOX:hash
+   ( fd str fd str str DROPBOX:hash ^ARENA:arena -- stage-write )
+   {: src:fd r:str dir:fd name:str p:str want:DROPBOX:hash
       ar:^ARENA:arena :}
-   src r ru s" inspect upload source before staging" STAT-FD
+   src r s" inspect upload source before staging" STAT-FD
    {: before:MODEL:stat :}
-   src dir name nu p u want ar WRITE-UPLOAD-STAGE if exit then
+   src dir name p want ar WRITE-UPLOAD-STAGE if exit then
    {: w:stage-write :}
-   src r ru s" inspect upload source after staging" STAT-FD
+   src r s" inspect upload source after staging" STAT-FD
    before SAME-OBSERVATION 0= if
-      s" stage upload" r ru E-SOURCE-CHANGED CHANGED-FAILS
+      s" stage upload" r E-SOURCE-CHANGED CHANGED-FAILS
    then
    w ;
 
 \ Rust's upload_source_changed holds for any failure of this open but an
 \ unsafe path: they throw E-SOURCE-CHANGED.
-: OPEN-UPLOAD-SOURCE ( fd ^u8 n -- fd )
+: OPEN-UPLOAD-SOURCE ( fd str -- fd )
    s" open upload source" E-SOURCE-CHANGED E-SOURCE-CHANGED
    OPEN-RELATIVE-REGULAR ;
 
 \ Opens the source below the root and stages its bytes; it closes it.
 : STAGE-FROM-SOURCE
-   ( fd ^u8 n fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- stage-write )
-   {: root:fd r:^ ru:n dir:fd name:^ nu:n p:^ u:n want:DROPBOX:hash
+   ( fd str fd str str DROPBOX:hash ^ARENA:arena -- stage-write )
+   {: root:fd r:str dir:fd name:str p:str want:DROPBOX:hash
       ar:^ARENA:arena :}
-   root r ru OPEN-UPLOAD-SOURCE {: src:fd :}
+   root r OPEN-UPLOAD-SOURCE {: src:fd :}
    STAGE-WRITE-CREATED src [: DROP-STAGE-WRITE
-      src r ru dir name nu p u want ar STAGE-SOURCE ;] CLOSING
+      src r dir name p want ar STAGE-SOURCE ;] CLOSING
    src DISCARD ;
 
 \ The stage in the open staging directory: one already there is reused
 \ or replaced, and an occupied path is kept.
 : STAGE-UPLOAD-IN
-   ( fd ^u8 n fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- stage-write )
-   {: root:fd r:^ ru:n dir:fd name:^ nu:n p:^ u:n want:DROPBOX:hash
+   ( fd str fd str str DROPBOX:hash ^ARENA:arena -- stage-write )
+   {: root:fd r:str dir:fd name:str p:str want:DROPBOX:hash
       ar:^ARENA:arena :}
-   dir name nu p u ar HASH-UPLOAD-STAGE if
-      DROP-HASHED p u >str STAGE-WRITE-DESTINATION-OCCUPIED exit
+   dir name p ar HASH-UPLOAD-STAGE if
+      DROP-HASHED p STAGE-WRITE-DESTINATION-OCCUPIED exit
    then
    MATCH option
       none OF false ENDOF
-      some OF dir name nu p u want SETTLE-UPLOAD-STAGE ENDOF
+      some OF dir name p want SETTLE-UPLOAD-STAGE ENDOF
    ;MATCH if STAGE-WRITE-REUSED exit then
-   root r ru dir name nu p u want ar STAGE-FROM-SOURCE ;
+   root r dir name p want ar STAGE-FROM-SOURCE ;
 
 : NO-UPLOAD-OUTCOME ( -- stage-outcome<^staged-upload> )
-   s" " >str LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED ;
+   s" " LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED ;
 : DROP-UPLOAD-OUTCOME ( stage-outcome<^staged-upload> -- ) drop ;
 
 public
@@ -2393,43 +2405,43 @@ public
 \ an absolute path, under want's hash, when it holds want. A source that
 \ fails to open or changes while it copies throws E-SOURCE-CHANGED.
 : STAGE-UPLOAD-AT
-   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+   ( fd str str DROPBOX:hash ^ARENA:arena
      -- stage-outcome<^staged-upload> )
-   {: root:fd r:^ ru:n s:^ su:n want:DROPBOX:hash ar:^ARENA:arena :}
+   {: root:fd r:str s:str want:DROPBOX:hash ar:^ARENA:arena :}
    want s" stage upload" REQUIRE-CONTENT-HASH
-   want DROPBOX:HASH>STR str> {: name:^ nu:n :}
-   s su name nu ar JOIN {: p:^ u:n :}
-   s su s" open upload staging directory" OPEN-PRIVATE-DIRECTORY
+   want DROPBOX:HASH>STR {: name:str :}
+   s name ar JOIN {: p:str :}
+   s s" open upload staging directory" OPEN-PRIVATE-DIRECTORY
    {: dir:fd :}
    STAGE-WRITE-CREATED dir [: DROP-STAGE-WRITE
-      root r ru dir name nu p u want ar STAGE-UPLOAD-IN ;] CLOSING
+      root r dir name p want ar STAGE-UPLOAD-IN ;] CLOSING
    dir DISCARD
-   [: s su want ar NEW-STAGED-UPLOAD ;] MAP-STAGE-WRITE ;
+   [: s want ar NEW-STAGED-UPLOAD ;] MAP-STAGE-WRITE ;
 
 \ STAGE-UPLOAD-AT below the sync root at the absolute path.
 : STAGE-UPLOAD
-   ( ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+   ( str str str DROPBOX:hash ^ARENA:arena
      -- stage-outcome<^staged-upload> )
-   {: rp:^ rpu:n r:^ ru:n s:^ su:n want:DROPBOX:hash ar:^ARENA:arena :}
-   rp rpu s" open sync root for upload staging" OPEN-ROOT {: root:fd :}
+   {: rp:str r:str s:str want:DROPBOX:hash ar:^ARENA:arena :}
+   rp s" open sync root for upload staging" OPEN-ROOT {: root:fd :}
    NO-UPLOAD-OUTCOME root
-   [: DROP-UPLOAD-OUTCOME root r ru s su want ar STAGE-UPLOAD-AT ;] CLOSING
+   [: DROP-UPLOAD-OUTCOME root r s want ar STAGE-UPLOAD-AT ;] CLOSING
    root DISCARD ;
 
 \ The content hash of the regular file r below the root, as it is now; a
 \ source that changes while it is read throws E-SOURCE-CHANGED.
-: OBSERVE-UPLOAD-SOURCE-AT ( fd ^u8 n ^ARENA:arena -- DROPBOX:hash )
-   {: root:fd r:^ ru:n ar:^ARENA:arena :}
-   root r ru OPEN-UPLOAD-SOURCE {: src:fd :}
-   NO-HASH src [: DROP-HASH src r ru s" verify upload source" ar
+: OBSERVE-UPLOAD-SOURCE-AT ( fd str ^ARENA:arena -- DROPBOX:hash )
+   {: root:fd r:str ar:^ARENA:arena :}
+   root r OPEN-UPLOAD-SOURCE {: src:fd :}
+   NO-HASH src [: DROP-HASH src r s" verify upload source" ar
       E-SOURCE-CHANGED E-SOURCE-CHANGED HASH-STABLE-FILE ;] CLOSING
    src DISCARD ;
 
 \ OBSERVE-UPLOAD-SOURCE-AT below the sync root at the absolute path.
-: OBSERVE-UPLOAD-SOURCE ( ^u8 n ^u8 n ^ARENA:arena -- DROPBOX:hash )
-   {: rp:^ rpu:n r:^ ru:n ar:^ARENA:arena :}
-   rp rpu s" open sync root for upload observation" OPEN-ROOT {: root:fd :}
-   NO-HASH root [: DROP-HASH root r ru ar OBSERVE-UPLOAD-SOURCE-AT ;]
+: OBSERVE-UPLOAD-SOURCE ( str str ^ARENA:arena -- DROPBOX:hash )
+   {: rp:str r:str ar:^ARENA:arena :}
+   rp s" open sync root for upload observation" OPEN-ROOT {: root:fd :}
+   NO-HASH root [: DROP-HASH root r ar OBSERVE-UPLOAD-SOURCE-AT ;]
    CLOSING
    root DISCARD ;
 
@@ -2440,11 +2452,11 @@ private
 \ Opens the name in dir with open; none when nothing, or a symlink, is
 \ there.
 : OPEN-UPLOAD-STAGE-CANDIDATE
-   ( fd ^u8 n [ fd ^u8 n -- option<fd> ] ^u8 n ^u8 n -- option<fd> )
-   {: dir:fd name:^ nu:n open p:^ u:n o:^ ou:n :}
-   dir name nu open execute MATCH option
+   ( fd str [ fd str -- option<fd> ] str str -- option<fd> )
+   {: dir:fd name:str open p:str o:str :}
+   dir name open execute MATCH option
       none OF FS:ERRNO {: e:n :}
-         e FS:ENOENT <> e FS:ELOOP <> and if o ou p u IO-FAILURE then
+         e FS:ENOENT <> e FS:ELOOP <> and if o p IO-FAILURE then
          OPTION:NONE
       ENDOF
       some OF OPTION:SOME ENDOF
@@ -2452,13 +2464,13 @@ private
 
 \ The stat of the entry the candidate opens, which it closes; none when
 \ nothing is there.
-: CANDIDATE-STAT ( fd ^u8 n ^u8 n ^u8 n -- option<MODEL:stat> )
-   {: dir:fd name:^ nu:n p:^ u:n o:^ ou:n :}
-   dir name nu [: FS:TRY-OPEN-ENTRY-AT ;] p u o ou
+: CANDIDATE-STAT ( fd str str str -- option<MODEL:stat> )
+   {: dir:fd name:str p:str o:str :}
+   dir name [: FS:TRY-OPEN-ENTRY-AT ;] p o
    OPEN-UPLOAD-STAGE-CANDIDATE MATCH option
       none OF OPTION:NONE ENDOF
       some OF {: e:fd :}
-         NO-STAT e [: DROP-STAT e p u o ou STAT-FD ;] CLOSING
+         NO-STAT e [: DROP-STAT e p o STAT-FD ;] CLOSING
          e DISCARD OPTION:SOME
       ENDOF
    ;MATCH ;
@@ -2470,53 +2482,53 @@ private
    code E-CHANGED = code E-UNSUPPORTED = or ;
 
 \ Whether the file hashes to its name; an UNSTABLE? file does not.
-: HOLDS-ITS-NAME? ( fd ^u8 n ^u8 n ^ARENA:arena -- bool )
-   {: f:fd name:^ nu:n p:^ u:n ar:^ARENA:arena :}
-   false [: drop [: f p u s" verify upload stage for collection" ar
+: HOLDS-ITS-NAME? ( fd str str ^ARENA:arena -- bool )
+   {: f:fd name:str p:str ar:^ARENA:arena :}
+   false [: drop [: f p s" verify upload stage for collection" ar
          E-UNSUPPORTED E-CHANGED HASH-STABLE-FILE
-         DROPBOX:HASH>STR str> name nu STR= ;]
+         DROPBOX:HASH>STR name STR= ;]
       ['] UNSTABLE? WITH-CONVERTS ;] catch {: code:n :}
    code 0= if exit then
    drop code FS:ERRNO UNSTABLE? if false exit then
    code throw ;
 
 \ Whether the name is still the opened file's entry, unchanged.
-: STILL-NAMED? ( fd fd ^u8 n ^u8 n -- bool )
-   {: f:fd dir:fd name:^ nu:n p:^ u:n :}
-   dir name nu p u s" reinspect upload stage for collection" CANDIDATE-STAT
+: STILL-NAMED? ( fd fd str str -- bool )
+   {: f:fd dir:fd name:str p:str :}
+   dir name p s" reinspect upload stage for collection" CANDIDATE-STAT
    MATCH option
       none OF false ENDOF
       some OF {: current:MODEL:stat :}
-         f p u s" reinspect opened upload stage for collection" STAT-FD
+         f p s" reinspect opened upload stage for collection" STAT-FD
          current SAME-OBSERVATION
       ENDOF
    ;MATCH ;
 
 \ The opened stage file is the entry seen before, holds its name's
 \ content, and is still that entry.
-: VERIFIED-OPENED? ( fd MODEL:stat fd ^u8 n ^u8 n ^ARENA:arena -- bool )
-   {: f:fd before:MODEL:stat dir:fd name:^ nu:n p:^ u:n ar:^ARENA:arena :}
-   f p u s" inspect opened upload stage for collection" STAT-FD
+: VERIFIED-OPENED? ( fd MODEL:stat fd str str ^ARENA:arena -- bool )
+   {: f:fd before:MODEL:stat dir:fd name:str p:str ar:^ARENA:arena :}
+   f p s" inspect opened upload stage for collection" STAT-FD
    before SAME-OBSERVATION 0= if false exit then
-   f name nu p u ar HOLDS-ITS-NAME? 0= if false exit then
-   f dir name nu p u STILL-NAMED? ;
+   f name p ar HOLDS-ITS-NAME? 0= if false exit then
+   f dir name p STILL-NAMED? ;
 
 \ Whether the entry at the name is a regular file that holds the content
 \ its name claims, and stayed so while it was read.
-: VERIFIED-UPLOAD-STAGE-ENTRY? ( fd ^u8 n ^u8 n ^ARENA:arena -- bool )
-   {: dir:fd name:^ nu:n p:^ u:n ar:^ARENA:arena :}
-   dir name nu p u s" inspect upload stage for collection" CANDIDATE-STAT
+: VERIFIED-UPLOAD-STAGE-ENTRY? ( fd str str ^ARENA:arena -- bool )
+   {: dir:fd name:str p:str ar:^ARENA:arena :}
+   dir name p s" inspect upload stage for collection" CANDIDATE-STAT
    MATCH option
       none OF false exit ENDOF
       some OF ENDOF
    ;MATCH {: before:MODEL:stat :}
    before REGULAR? 0= if false exit then
-   dir name nu [: FS:TRY-OPEN-READ-AT ;] p u
+   dir name [: FS:TRY-OPEN-READ-AT ;] p
    s" open upload stage for collection"
    OPEN-UPLOAD-STAGE-CANDIDATE MATCH option
       none OF false ENDOF
       some OF {: f:fd :}
-         false f [: drop f before dir name nu p u ar VERIFIED-OPENED? ;]
+         false f [: drop f before dir name p ar VERIFIED-OPENED? ;]
          CLOSING
          f DISCARD
       ENDOF
@@ -2524,12 +2536,12 @@ private
 
 \ Removes the stage at the listed path when it verifies; answers how
 \ many it removed.
-: COLLECT-UPLOAD-STAGE ( fd ^u8 n ^u8 n ^ARENA:arena -- n )
-   {: dir:fd name:^ nu:n p:^ u:n ar:^ARENA:arena :}
-   dir name nu p u ar VERIFIED-UPLOAD-STAGE-ENTRY? 0= if 0 exit then
-   dir name nu FS:TRY-REMOVE-FILE-AT if 1 exit then
+: COLLECT-UPLOAD-STAGE ( fd str str ^ARENA:arena -- n )
+   {: dir:fd name:str p:str ar:^ARENA:arena :}
+   dir name p ar VERIFIED-UPLOAD-STAGE-ENTRY? 0= if 0 exit then
+   dir name FS:TRY-REMOVE-FILE-AT if 1 exit then
    FS:ERRNO FS:ENOENT <> if
-      dir name nu s" remove unreferenced upload stage" p u
+      dir name s" remove unreferenced upload stage" p
       IO-FAILURE-AT
    then 0 ;
 
@@ -2538,10 +2550,10 @@ private
 : COLLECT-LISTED-STAGE
    ( fd str str [ DROPBOX:hash -- bool ] ^ARENA:arena -- n )
    {: dir:fd path:str s:str retained ar:^ARENA:arena :}
-   path s NAME-OF {: name:^ nu:n :}
-   name nu DROPBOX:CONTENT-HASH? 0= if 0 exit then
-   name nu >str DROPBOX:>HASH retained execute if 0 exit then
-   dir name nu path str> ar COLLECT-UPLOAD-STAGE ;
+   path s NAME-OF {: name:str :}
+   name DROPBOX:CONTENT-HASH? 0= if 0 exit then
+   name DROPBOX:>HASH retained execute if 0 exit then
+   dir name path ar COLLECT-UPLOAD-STAGE ;
 
 \ The stages in s visited in name byte order, the whole listing read
 \ before any is removed.
@@ -2563,13 +2575,13 @@ public
 \ Other names, entries that are not regular files, and files that change
 \ or do not hold their name's content stay. The directory syncs once.
 : REMOVE-UNREFERENCED-UPLOAD-STAGES
-   ( ^u8 n [ DROPBOX:hash -- bool ] ^ARENA:arena -- n )
-   {: s:^ su:n retained ar:^ARENA:arena :}
-   s su s" open upload staging directory for collection"
+   ( str [ DROPBOX:hash -- bool ] ^ARENA:arena -- n )
+   {: s:str retained ar:^ARENA:arena :}
+   s s" open upload staging directory for collection"
    OPEN-PRIVATE-DIRECTORY {: dir:fd :}
-   0 dir [: drop dir s su >str retained ar COLLECT-UPLOAD-STAGES
+   0 dir [: drop dir s retained ar COLLECT-UPLOAD-STAGES
       dup 0<> if
-         dir s su s" sync upload stage collection" SYNC-DIRECTORY
+         dir s s" sync upload stage collection" SYNC-DIRECTORY
       then ;] CLOSING
    dir DISCARD ;
 
@@ -2580,12 +2592,13 @@ private
 
 \ The Rust daemon's names and sizes, so either resumes the other's
 \ partials.
-: DOWNLOAD-PARTIAL-XATTR ( -- ^u8 n ) s" user.omabox.download-partial-v1" ;
+: DOWNLOAD-PARTIAL-XATTR ( -- str ) s" user.omabox.download-partial-v1" ;
 \ 64 MiB, a whole number of Dropbox's 4 MiB blocks.
 $4000000 constant DOWNLOAD-CHECKPOINT-BYTES
-: DOWNLOAD-SLOT-OWNER-PREFIX ( -- ^u8 n ) s" omabox-download-slot-v1" ;
+: DOWNLOAD-SLOT-OWNER-PREFIX ( -- str ) s" omabox-download-slot-v1" ;
 \ The owner prefix, the binding's 32 bytes, then the offset big-endian.
-DOWNLOAD-SLOT-OWNER-PREFIX nip 32 + 8 + constant DOWNLOAD-SLOT-STATE-LENGTH
+DOWNLOAD-SLOT-OWNER-PREFIX str> nip 32 + 8 +
+   constant DOWNLOAD-SLOT-STATE-LENGTH
 \ The slots are this many fixed files, so a partial either daemon left in
 \ any of them is found.
 4 constant MAX-PARALLEL-DOWNLOADS
@@ -2667,11 +2680,11 @@ STRUCTURE download-slot-state
 ARENA PARTIALS download-partial
 
 \ The source's path: a slot's, or an unnamed file's display path.
-: SOURCE-PATH ( download-source -- ^u8 n )
+: SOURCE-PATH ( download-source -- str )
    MATCH download-source
-      resumable OF {: dir:fd name:str path:str b:binding :} path str>
+      resumable OF {: dir:fd name:str path:str b:binding :} path
       ENDOF
-      disposable OF str> ENDOF
+      disposable OF ENDOF
    ;MATCH ;
 
 \ ---- slot bindings
@@ -2696,7 +2709,7 @@ ARENA PARTIALS download-partial
 
 8 BUFFER: BE-BUF
 
-: FEED-BE ( n -- ) BE-BUF BE! BE-BUF 8 FEED ;
+: FEED-BE ( n -- ) BE-BUF BE! BE-BUF 8 >str FEED ;
 
 public
 
@@ -2711,14 +2724,14 @@ public
 \ operation big-endian, the target, the rev and the content, the last
 \ three NUL-separated.
 : NEW-SLOT-IDENTITY
-   ( n n ^u8 n MODEL:remote -- download-slot-identity )
-   {: generation:n operation:n t:^ tu:n r:MODEL:remote :}
+   ( n n str MODEL:remote -- download-slot-identity )
+   {: generation:n operation:n t:str r:MODEL:remote :}
    r MODEL-REMOTE:UNMAKE {: c:DROPBOX:hash rev:DROPBOX:rev :}
    NAME-CTX SHA256-BEGIN
    s" omabox-download-slot-lease-v1" FEED
    generation FEED-BE operation FEED-BE
-   t tu FEED NUL 1 FEED rev DROPBOX:REV>STR str> FEED
-   NUL 1 FEED c DROPBOX:HASH>STR str> FEED
+   t FEED NUL 1 >str FEED rev DROPBOX:REV>STR FEED
+   NUL 1 >str FEED c DROPBOX:HASH>STR FEED
    NAME-CTX NAME-DIGEST SHA256-END
    NAME-DIGEST BYTES>BINDING DOWNLOAD-SLOT-IDENTITY-MAKE ;
 
@@ -2732,38 +2745,40 @@ private
 DOWNLOAD-SLOT-STATE-LENGTH BUFFER: STATE-BUF
 
 \ The xattr's bytes, valid until the next encode or read.
-: ENCODE-DOWNLOAD-SLOT-STATE ( download-slot-state -- ^u8 n )
+: ENCODE-DOWNLOAD-SLOT-STATE ( download-slot-state -- str )
    DOWNLOAD-SLOT-STATE-UNMAKE {: b:binding offset:n :}
-   DOWNLOAD-SLOT-OWNER-PREFIX {: x:^ xu:n :}
+   DOWNLOAD-SLOT-OWNER-PREFIX str> {: x:^ xu:n :}
    x STATE-BUF xu BYTE-COPY
    b STATE-BUF xu + BINDING>BYTES
    offset STATE-BUF xu + 32 + BE!
-   STATE-BUF DOWNLOAD-SLOT-STATE-LENGTH ;
+   STATE-BUF DOWNLOAD-SLOT-STATE-LENGTH >str ;
 
-: DECODE-DOWNLOAD-SLOT-STATE ( ^u8 n -- option<download-slot-state> )
-   {: p:^ u:n :}
-   DOWNLOAD-SLOT-OWNER-PREFIX {: x:^ xu:n :}
+: DECODE-DOWNLOAD-SLOT-STATE ( str -- option<download-slot-state> )
+   {: s:str :}
+   s str> {: p:^ u:n :}
+   DOWNLOAD-SLOT-OWNER-PREFIX {: x:str :}
+   x str> nip {: xu:n :}
    u DOWNLOAD-SLOT-STATE-LENGTH <> if OPTION:NONE exit then
-   p xu x xu STR= 0= if OPTION:NONE exit then
+   p xu >str x STR= 0= if OPTION:NONE exit then
    p xu + BYTES>BINDING p xu + 32 + BE@
    DOWNLOAD-SLOT-STATE-MAKE OPTION:SOME ;
 
 : STATE-GOT ( XATTR:got -- option<download-slot-state> )
    MATCH XATTR:got
       absent OF OPTION:NONE ENDOF
-      value OF STATE-BUF swap DECODE-DOWNLOAD-SLOT-STATE ENDOF
+      value OF STATE-BUF swap >str DECODE-DOWNLOAD-SLOT-STATE ENDOF
       oversize OF OPTION:NONE ENDOF
    ;MATCH ;
 
 : DROP-SLOT-STATE ( option<download-slot-state> -- ) drop ;
 
 \ The slot's state, none when it carries none in this format.
-: READ-DOWNLOAD-SLOT-STATE ( fd ^u8 n -- option<download-slot-state> )
-   {: f:fd p:^ u:n :}
+: READ-DOWNLOAD-SLOT-STATE ( fd str -- option<download-slot-state> )
+   {: f:fd p:str :}
    OPTION:NONE
    [: DROP-SLOT-STATE f DOWNLOAD-PARTIAL-XATTR
       STATE-BUF DOWNLOAD-SLOT-STATE-LENGTH SPAN:MAKE XATTR:GET STATE-GOT ;]
-   [: s" inspect resumed download slot marker" p u IO-FAILURE ;] FS-FAILS ;
+   [: s" inspect resumed download slot marker" p IO-FAILURE ;] FS-FAILS ;
 
 : SLOT-BOUND? ( option<download-slot-state> binding -- bool )
    {: s:option<download-slot-state> b:binding :}
@@ -2779,7 +2794,7 @@ DOWNLOAD-SLOT-STATE-LENGTH BUFFER: STATE-BUF
    {: f:fd loc :}
    loc DOWNLOAD-LOCATION-SOURCE @ MATCH download-source
       resumable OF {: dir:fd name:str path:str b:binding :}
-         f path str> READ-DOWNLOAD-SLOT-STATE b SLOT-BOUND?
+         f path READ-DOWNLOAD-SLOT-STATE b SLOT-BOUND?
       ENDOF
       disposable OF {: path:str :} false ENDOF
    ;MATCH ;
@@ -2791,17 +2806,17 @@ DOWNLOAD-SLOT-STATE-LENGTH BUFFER: STATE-BUF
 FS:PATHZ-CAP BUFFER: SLOT-PATH
 
 \ The slot's name, valid until the next.
-: DOWNLOAD-SLOT-NAME ( n -- ^u8 n )
+: DOWNLOAD-SLOT-NAME ( n -- str )
    {: slot:n :}
-   s" .omabox-download-slot-" {: p:^ u:n :}
+   s" .omabox-download-slot-" str> {: p:^ u:n :}
    p SLOT-NAME u BYTE-COPY
    slot $30 + SLOT-NAME u + c!
-   SLOT-NAME u 1+ ;
+   SLOT-NAME u 1+ >str ;
 
 \ The slot's path in the directory, for logs; valid until the next.
-: DOWNLOAD-SLOT-PATH ( ^u8 n n -- ^u8 n )
-   {: d:^ du:n slot:n :}
-   d du slot DOWNLOAD-SLOT-NAME SLOT-PATH FS:JOIN-PATH SLOT-PATH swap ;
+: DOWNLOAD-SLOT-PATH ( str n -- str )
+   {: d:str slot:n :}
+   d slot DOWNLOAD-SLOT-NAME SLOT-PATH FS:JOIN-PATH SLOT-PATH swap >str ;
 
 ENUM download-slot-open
    VARIANT missing ;VARIANT
@@ -2811,10 +2826,10 @@ ENUM download-slot-open
 : DROP-SLOT-OPEN ( download-slot-open -- ) drop ;
 
 \ The opened file, when it is the regular file probed.
-: CHECK-SLOT-FILE ( fd MODEL:stat ^u8 n -- download-slot-open )
-   {: f:fd probed:MODEL:stat p:^ u:n :}
+: CHECK-SLOT-FILE ( fd MODEL:stat str -- download-slot-open )
+   {: f:fd probed:MODEL:stat p:str :}
    NO-STAT f
-   [: DROP-STAT f p u s" inspect opened download slot" STAT-FD ;] CLOSING
+   [: DROP-STAT f p s" inspect opened download slot" STAT-FD ;] CLOSING
    {: opened:MODEL:stat :}
    opened REGULAR? opened probed SAME-INODE and if
       f DOWNLOAD-SLOT-OPEN-FILE exit
@@ -2823,116 +2838,116 @@ ENUM download-slot-open
 
 \ After the open for writing failed: missing, occupied by another inode
 \ or one Omabox may not write, else the failure.
-: SLOT-OPEN-FAILED ( fd fd ^u8 n ^u8 n -- download-slot-open )
-   {: probe:fd dir:fd name:^ nu:n p:^ u:n :}
+: SLOT-OPEN-FAILED ( fd fd str str -- download-slot-open )
+   {: probe:fd dir:fd name:str p:str :}
    FS:ERRNO {: e:n :}
    e FS:ENOENT = if DOWNLOAD-SLOT-OPEN-MISSING exit then
-   probe dir name nu p u NAMED-INODE-MATCHES 0= if
+   probe dir name p NAMED-INODE-MATCHES 0= if
       DOWNLOAD-SLOT-OPEN-OCCUPIED exit
    then
    e FS:EACCES = e FS:EPERM = or if DOWNLOAD-SLOT-OPEN-OCCUPIED exit then
-   e s" open resumed download" p u SYSCALL-FAILURE ;
+   e s" open resumed download" p SYSCALL-FAILURE ;
 
 \ Opens the probed name for writing when the probe found a regular file.
-: OPEN-PROBED-SLOT ( fd fd ^u8 n ^u8 n -- download-slot-open )
-   {: probe:fd dir:fd name:^ nu:n p:^ u:n :}
-   probe p u s" inspect resumed download slot" STAT-FD {: probed:MODEL:stat :}
+: OPEN-PROBED-SLOT ( fd fd str str -- download-slot-open )
+   {: probe:fd dir:fd name:str p:str :}
+   probe p s" inspect resumed download slot" STAT-FD {: probed:MODEL:stat :}
    probed REGULAR? 0= if DOWNLOAD-SLOT-OPEN-OCCUPIED exit then
-   dir name nu FS:TRY-OPEN-WRITE-AT MATCH option
-      none OF probe dir name nu p u SLOT-OPEN-FAILED ENDOF
-      some OF probed p u CHECK-SLOT-FILE ENDOF
+   dir name FS:TRY-OPEN-WRITE-AT MATCH option
+      none OF probe dir name p SLOT-OPEN-FAILED ENDOF
+      some OF probed p CHECK-SLOT-FILE ENDOF
    ;MATCH ;
 
-: SLOT-PROBE-FAILED ( ^u8 n -- download-slot-open )
-   {: p:^ u:n :}
+: SLOT-PROBE-FAILED ( str -- download-slot-open )
+   {: p:str :}
    FS:ERRNO {: e:n :}
    e FS:ENOENT = if DOWNLOAD-SLOT-OPEN-MISSING exit then
    e FS:ELOOP = if DOWNLOAD-SLOT-OPEN-OCCUPIED exit then
-   e s" inspect resumed download slot" p u SYSCALL-FAILURE ;
+   e s" inspect resumed download slot" p SYSCALL-FAILURE ;
 
 \ The slot at the name in dir, open for writing when it is a regular file
 \ that stays the inode its name held; a symlink there is occupied.
-: OPEN-DOWNLOAD-SLOT ( fd ^u8 n ^u8 n -- download-slot-open )
-   {: dir:fd name:^ nu:n p:^ u:n :}
-   dir name nu FS:TRY-OPEN-ENTRY-AT MATCH option
-      none OF p u SLOT-PROBE-FAILED ENDOF
+: OPEN-DOWNLOAD-SLOT ( fd str str -- download-slot-open )
+   {: dir:fd name:str p:str :}
+   dir name FS:TRY-OPEN-ENTRY-AT MATCH option
+      none OF p SLOT-PROBE-FAILED ENDOF
       some OF {: probe:fd :}
          DOWNLOAD-SLOT-OPEN-MISSING probe
-         [: DROP-SLOT-OPEN probe dir name nu p u OPEN-PROBED-SLOT ;]
+         [: DROP-SLOT-OPEN probe dir name p OPEN-PROBED-SLOT ;]
          CLOSING probe DISCARD
       ENDOF
    ;MATCH ;
 
 \ A new unnamed file in dir; o names the operation that makes it.
-: UNNAMED-FILE ( fd ^u8 n ^u8 n -- fd )
-   {: dir:fd p:^ u:n o:^ ou:n :}
+: UNNAMED-FILE ( fd str str -- fd )
+   {: dir:fd p:str o:str :}
    -1 >FD [: drop dir FS:TEMP-AT ;]
-   [: dir s" " o ou p u IO-FAILURE-AT ;] FS-FAILS ;
+   [: dir s" " o p IO-FAILURE-AT ;] FS-FAILS ;
 
 \ Binds the unnamed file at offset 0 and names it; false when the name
 \ is taken.
-: INSTALL-SLOT ( fd fd ^u8 n ^u8 n binding -- bool )
-   {: f:fd dir:fd name:^ nu:n p:^ u:n b:binding :}
+: INSTALL-SLOT ( fd fd str str binding -- bool )
+   {: f:fd dir:fd name:str p:str b:binding :}
    f DOWNLOAD-PARTIAL-XATTR b 0 DOWNLOAD-SLOT-STATE-MAKE
-   ENCODE-DOWNLOAD-SLOT-STATE true p u s" mark resumed download slot"
+   ENCODE-DOWNLOAD-SLOT-STATE true p s" mark resumed download slot"
    SET-XATTR
-   f p u s" sync new resumed download slot" SYNC-FILE
-   f dir name nu FS:TRY-LINK-AT if
-      dir p u s" sync new resumed download slot entry" SYNC-DIRECTORY
+   f p s" sync new resumed download slot" SYNC-FILE
+   f dir name FS:TRY-LINK-AT if
+      dir p s" sync new resumed download slot entry" SYNC-DIRECTORY
       true exit
    then
    FS:ERRNO FS:EEXIST <> if
-      dir name nu s" install new resumed download slot" p u
+      dir name s" install new resumed download slot" p
       IO-FAILURE-AT
    then false ;
 
 \ A new slot at the name in dir bound to b; none when the name is taken.
-: CREATE-DOWNLOAD-SLOT ( fd ^u8 n ^u8 n binding -- option<fd> )
-   {: dir:fd name:^ nu:n p:^ u:n b:binding :}
-   dir p u s" create resumed download slot" UNNAMED-FILE {: f:fd :}
-   false f [: drop f dir name nu p u b INSTALL-SLOT ;] CLOSING
+: CREATE-DOWNLOAD-SLOT ( fd str str binding -- option<fd> )
+   {: dir:fd name:str p:str b:binding :}
+   dir p s" create resumed download slot" UNNAMED-FILE {: f:fd :}
+   false f [: drop f dir name p b INSTALL-SLOT ;] CLOSING
    if f OPTION:SOME exit then
    f DISCARD OPTION:NONE ;
 
 \ Empties the open slot c and binds it to b at offset 0, its stage marker
 \ cleared; true when its name still holds it then.
-: CLEAR-SLOT ( fd fd ^u8 n ^u8 n binding -- bool )
-   {: c:fd dir:fd name:^ nu:n p:^ u:n b:binding :}
+: CLEAR-SLOT ( fd fd str str binding -- bool )
+   {: c:fd dir:fd name:str p:str b:binding :}
    [: c 0 FD:RESIZE ;]
-   [: s" truncate resumed download slot for reuse" p u IO-FAILURE ;]
+   [: s" truncate resumed download slot for reuse" p IO-FAILURE ;]
    FS-FAILS
    c DOWNLOAD-PARTIAL-XATTR b 0 DOWNLOAD-SLOT-STATE-MAKE
-   ENCODE-DOWNLOAD-SLOT-STATE false p u
+   ENCODE-DOWNLOAD-SLOT-STATE false p
    s" reset resumed download slot checkpoint" SET-XATTR
-   c p u s" sync reset resumed download slot" SYNC-FILE
-   c DOWNLOAD-STAGE-XATTR p u
+   c p s" sync reset resumed download slot" SYNC-FILE
+   c DOWNLOAD-STAGE-XATTR p
    s" clear resumed download slot completion marker" REMOVE-XATTR
-   c p u s" sync reusable resumed download slot" SYNC-FILE
-   c dir name nu p u NAMED-INODE-MATCHES ;
+   c p s" sync reusable resumed download slot" SYNC-FILE
+   c dir name p NAMED-INODE-MATCHES ;
 
 \ Runs before, then clears c, when c is held's inode.
-: REBIND-SLOT ( fd fd fd ^u8 n ^u8 n binding [ -- ] -- bool )
-   {: held:fd c:fd dir:fd name:^ nu:n p:^ u:n b:binding before :}
-   held p u s" inspect held resumed download slot" STAT-FD
-   c p u s" inspect reusable resumed download slot" STAT-FD
+: REBIND-SLOT ( fd fd fd str str binding [ -- ] -- bool )
+   {: held:fd c:fd dir:fd name:str p:str b:binding before :}
+   held p s" inspect held resumed download slot" STAT-FD
+   c p s" inspect reusable resumed download slot" STAT-FD
    SAME-INODE 0= if false exit then
-   before [: s" reset resumed download slot" p u IO-FAILURE ;] FS-FAILS
-   c dir name nu p u b CLEAR-SLOT ;
+   before [: s" reset resumed download slot" p IO-FAILURE ;] FS-FAILS
+   c dir name p b CLEAR-SLOT ;
 
 \ The slot named again, rebound, when it is still held's inode; a throw
 \ closes it.
-: REBIND-OPENED ( fd fd fd ^u8 n ^u8 n binding [ -- ] -- option<fd> )
-   {: held:fd c:fd dir:fd name:^ nu:n p:^ u:n b:binding before :}
+: REBIND-OPENED ( fd fd fd str str binding [ -- ] -- option<fd> )
+   {: held:fd c:fd dir:fd name:str p:str b:binding before :}
    false c
-   [: drop held c dir name nu p u b before REBIND-SLOT ;] CLOSING
+   [: drop held c dir name p b before REBIND-SLOT ;] CLOSING
    if c OPTION:SOME exit then
    c DISCARD OPTION:NONE ;
 
-: REBIND-NAMED ( fd fd ^u8 n ^u8 n binding [ -- ] -- option<fd> )
-   {: held:fd dir:fd name:^ nu:n p:^ u:n b:binding before :}
-   dir name nu p u OPEN-DOWNLOAD-SLOT MATCH download-slot-open
+: REBIND-NAMED ( fd fd str str binding [ -- ] -- option<fd> )
+   {: held:fd dir:fd name:str p:str b:binding before :}
+   dir name p OPEN-DOWNLOAD-SLOT MATCH download-slot-open
       missing OF OPTION:NONE ENDOF
-      file OF {: c:fd :} held c dir name nu p u b before REBIND-OPENED
+      file OF {: c:fd :} held c dir name p b before REBIND-OPENED
       ENDOF
       occupied OF OPTION:NONE ENDOF
    ;MATCH ;
@@ -2942,12 +2957,12 @@ ENUM download-slot-open
 \ 0; before runs just ahead of the truncate. None when held carries no
 \ state or its name holds another entry, which stays as it is.
 : RESET-DOWNLOAD-SLOT-FILE-WITH
-   ( fd fd ^u8 n ^u8 n binding [ -- ] -- option<fd> )
-   {: held:fd dir:fd name:^ nu:n p:^ u:n b:binding before :}
-   held p u READ-DOWNLOAD-SLOT-STATE MATCH option
+   ( fd fd str str binding [ -- ] -- option<fd> )
+   {: held:fd dir:fd name:str p:str b:binding before :}
+   held p READ-DOWNLOAD-SLOT-STATE MATCH option
       none OF OPTION:NONE ENDOF
       some OF DOWNLOAD-SLOT-STATE-UNMAKE {: was:binding at:n :}
-         held dir name nu p u b before REBIND-NAMED
+         held dir name p b before REBIND-NAMED
       ENDOF
    ;MATCH ;
 
@@ -2957,7 +2972,7 @@ ENUM download-slot-open
    {: f:fd loc :}
    loc DOWNLOAD-LOCATION-SOURCE @ MATCH download-source
       resumable OF {: dir:fd name:str path:str b:binding :}
-         f dir name str> path str> b [: ;] RESET-DOWNLOAD-SLOT-FILE-WITH
+         f dir name path b [: ;] RESET-DOWNLOAD-SLOT-FILE-WITH
       ENDOF
       disposable OF {: path:str :} OPTION:NONE ENDOF
    ;MATCH ;
@@ -2990,12 +3005,12 @@ MAX-PARALLEL-DOWNLOADS TYPED-BUFFER SLOTS available-download-slot
    slot NOT-OWNED usable AVAILABLE-DOWNLOAD-SLOT-MAKE ;
 
 \ The open slot's state, usable unless protected says its binding is.
-: SLOT-STATE ( n fd ^u8 n [ binding -- bool ] -- available-download-slot )
-   {: slot:n f:fd p:^ u:n protected :}
-   f p u s" inspect resumed download slot" STAT-FD REGULAR? 0= if
+: SLOT-STATE ( n fd str [ binding -- bool ] -- available-download-slot )
+   {: slot:n f:fd p:str protected :}
+   f p s" inspect resumed download slot" STAT-FD REGULAR? 0= if
       f DISCARD slot false UNOWNED exit
    then
-   f p u READ-DOWNLOAD-SLOT-STATE MATCH option
+   f p READ-DOWNLOAD-SLOT-STATE MATCH option
       none OF f DISCARD slot false UNOWNED ENDOF
       some OF {: s:download-slot-state :}
          s DOWNLOAD-SLOT-STATE-UNMAKE {: b:binding at:n :}
@@ -3005,18 +3020,18 @@ MAX-PARALLEL-DOWNLOADS TYPED-BUFFER SLOTS available-download-slot
       ENDOF
    ;MATCH ;
 
-: OWNED ( n fd ^u8 n [ binding -- bool ] -- available-download-slot )
-   {: slot:n f:fd p:^ u:n protected :}
+: OWNED ( n fd str [ binding -- bool ] -- available-download-slot )
+   {: slot:n f:fd p:str protected :}
    slot false UNOWNED f
-   [: DROP-AVAILABLE slot f p u protected SLOT-STATE ;] CLOSING ;
+   [: DROP-AVAILABLE slot f p protected SLOT-STATE ;] CLOSING ;
 
-: SCAN-SLOT ( fd ^u8 n n [ binding -- bool ] -- available-download-slot )
-   {: dir:fd d:^ du:n slot:n protected :}
-   d du slot DOWNLOAD-SLOT-PATH {: p:^ u:n :}
-   dir slot DOWNLOAD-SLOT-NAME p u OPEN-DOWNLOAD-SLOT
+: SCAN-SLOT ( fd str n [ binding -- bool ] -- available-download-slot )
+   {: dir:fd d:str slot:n protected :}
+   d slot DOWNLOAD-SLOT-PATH {: p:str :}
+   dir slot DOWNLOAD-SLOT-NAME p OPEN-DOWNLOAD-SLOT
    MATCH download-slot-open
       missing OF slot true UNOWNED ENDOF
-      file OF {: f:fd :} slot f p u protected OWNED ENDOF
+      file OF {: f:fd :} slot f p protected OWNED ENDOF
       occupied OF slot false UNOWNED ENDOF
    ;MATCH ;
 
@@ -3041,10 +3056,10 @@ MAX-PARALLEL-DOWNLOADS TYPED-BUFFER SLOTS available-download-slot
    MAX-PARALLEL-DOWNLOADS 0 ?do i SLOT-OWNED@ CLOSE-OWNED loop
    CLEAR-SLOTS ;
 
-: SCAN-SLOTS ( fd ^u8 n [ binding -- bool ] -- )
-   {: dir:fd d:^ du:n protected :}
+: SCAN-SLOTS ( fd str [ binding -- bool ] -- )
+   {: dir:fd d:str protected :}
    MAX-PARALLEL-DOWNLOADS 0 ?do
-      dir d du i protected SCAN-SLOT i SLOTS !
+      dir d i protected SCAN-SLOT i SLOTS !
    loop ;
 
 : OWNED-BY? ( option<owned-slot> binding -- bool )
@@ -3056,16 +3071,16 @@ MAX-PARALLEL-DOWNLOADS TYPED-BUFFER SLOTS available-download-slot
       ENDOF
    ;MATCH ;
 
-: NEW-LEASE ( ^u8 n n binding -- option<download-slot-lease> )
-   {: d:^ du:n slot:n b:binding :}
-   d du >str slot b DOWNLOAD-SLOT-LEASE-MAKE OPTION:SOME ;
+: NEW-LEASE ( str n binding -- option<download-slot-lease> )
+   {: d:str slot:n b:binding :}
+   d slot b DOWNLOAD-SLOT-LEASE-MAKE OPTION:SOME ;
 
 \ The first slot whose partial is bound to b, claimed.
-: BOUND-SLOT ( ^u8 n binding -- option<download-slot-lease> )
-   {: d:^ du:n b:binding :}
+: BOUND-SLOT ( str binding -- option<download-slot-lease> )
+   {: d:str b:binding :}
    MAX-PARALLEL-DOWNLOADS 0 ?do
       i SLOT-OWNED@ b OWNED-BY? if
-         i CLAIMED d du i b NEW-LEASE unloop exit
+         i CLAIMED d i b NEW-LEASE unloop exit
       then
    loop OPTION:NONE ;
 
@@ -3077,55 +3092,55 @@ MAX-PARALLEL-DOWNLOADS TYPED-BUFFER SLOTS available-download-slot
    ;MATCH ;
 
 \ Rebinds the slot's partial to b, or makes the slot bound to b.
-: TAKE-SLOT ( fd ^u8 n n binding -- bool )
-   {: dir:fd d:^ du:n slot:n b:binding :}
-   d du slot DOWNLOAD-SLOT-PATH {: p:^ u:n :}
+: TAKE-SLOT ( fd str n binding -- bool )
+   {: dir:fd d:str slot:n b:binding :}
+   d slot DOWNLOAD-SLOT-PATH {: p:str :}
    slot SLOT-OWNED@ MATCH option
-      none OF dir slot DOWNLOAD-SLOT-NAME p u b CREATE-DOWNLOAD-SLOT ENDOF
+      none OF dir slot DOWNLOAD-SLOT-NAME p b CREATE-DOWNLOAD-SLOT ENDOF
       some OF OWNED-SLOT-UNMAKE {: f:fd s:download-slot-state :}
-         f dir slot DOWNLOAD-SLOT-NAME p u b [: ;]
+         f dir slot DOWNLOAD-SLOT-NAME p b [: ;]
          RESET-DOWNLOAD-SLOT-FILE-WITH
       ENDOF
    ;MATCH TAKEN? ;
 
 \ The first usable slot that takes b; each one tried is used up.
-: CLAIM-SLOT ( fd ^u8 n binding -- option<download-slot-lease> )
-   {: dir:fd d:^ du:n b:binding :}
+: CLAIM-SLOT ( fd str binding -- option<download-slot-lease> )
+   {: dir:fd d:str b:binding :}
    MAX-PARALLEL-DOWNLOADS 0 ?do
       i SLOT-USABLE@ if
          i CLAIMED
-         dir d du i b TAKE-SLOT if d du i b NEW-LEASE unloop exit then
+         dir d i b TAKE-SLOT if d i b NEW-LEASE unloop exit then
       then
    loop OPTION:NONE ;
 
 \ Empties a usable slot's partial, its binding kept.
-: FREE-SLOT ( fd ^u8 n n -- )
-   {: dir:fd d:^ du:n slot:n :}
-   d du slot DOWNLOAD-SLOT-PATH {: p:^ u:n :}
+: FREE-SLOT ( fd str n -- )
+   {: dir:fd d:str slot:n :}
+   d slot DOWNLOAD-SLOT-PATH {: p:str :}
    slot SLOT-OWNED@ MATCH option
       none OF ENDOF
       some OF OWNED-SLOT-UNMAKE {: f:fd s:download-slot-state :}
          s DOWNLOAD-SLOT-STATE-UNMAKE {: b:binding at:n :}
-         f dir slot DOWNLOAD-SLOT-NAME p u b [: ;]
+         f dir slot DOWNLOAD-SLOT-NAME p b [: ;]
          RESET-DOWNLOAD-SLOT-FILE-WITH TAKEN? drop
       ENDOF
    ;MATCH ;
 
-: FREE-SLOTS ( fd ^u8 n -- )
-   {: dir:fd d:^ du:n :}
+: FREE-SLOTS ( fd str -- )
+   {: dir:fd d:str :}
    MAX-PARALLEL-DOWNLOADS 0 ?do
-      i SLOT-USABLE@ if dir d du i FREE-SLOT then
+      i SLOT-USABLE@ if dir d i FREE-SLOT then
    loop ;
 
 : LEASE-IN
-   ( fd ^u8 n binding [ binding -- bool ] -- option<download-slot-lease> )
-   {: dir:fd d:^ du:n b:binding protected :}
-   dir d du protected SCAN-SLOTS
-   d du b BOUND-SLOT MATCH option
-      none OF dir d du b CLAIM-SLOT ENDOF
+   ( fd str binding [ binding -- bool ] -- option<download-slot-lease> )
+   {: dir:fd d:str b:binding protected :}
+   dir d protected SCAN-SLOTS
+   d b BOUND-SLOT MATCH option
+      none OF dir d b CLAIM-SLOT ENDOF
       some OF OPTION:SOME ENDOF
    ;MATCH
-   dir d du FREE-SLOTS ;
+   dir d FREE-SLOTS ;
 
 public
 
@@ -3134,13 +3149,13 @@ public
 \ rebound to it; none when no slot can be. Every other unprotected partial
 \ is emptied, its binding kept. The lease holds d's span.
 : LEASE-DOWNLOAD-SLOT
-   ( ^u8 n download-slot-identity [ binding -- bool ]
+   ( str download-slot-identity [ binding -- bool ]
      -- option<download-slot-lease> )
-   {: d:^ du:n id:download-slot-identity protected :}
-   d du s" open resumable download slot directory" OPEN-PRIVATE-DIRECTORY
+   {: d:str id:download-slot-identity protected :}
+   d s" open resumable download slot directory" OPEN-PRIVATE-DIRECTORY
    {: dir:fd :}
    CLEAR-SLOTS
-   [: dir d du id SLOT-BINDING protected LEASE-IN ;]
+   [: dir d id SLOT-BINDING protected LEASE-IN ;]
    [: CLOSE-SLOTS dir DISCARD ;] finally ;
 
 private
@@ -3149,25 +3164,25 @@ private
 
 \ Feeds the next bytes of f, at most IO-SIZE of the left ones, to h;
 \ answers the bytes left after them. A short file fails as a read.
-: REHASH-CHUNK ( fd n ^u8 n ^DROPBOX:hasher -- n )
-   {: f:fd left:n p:^ u:n h :}
-   s" rehash resumed download checkpoint" {: o:^ ou:n :}
+: REHASH-CHUNK ( fd n str ^DROPBOX:hasher -- n )
+   {: f:fd left:n p:str h :}
+   s" rehash resumed download checkpoint" {: o:str :}
    left IO-SIZE min {: k:n :}
-   0 [: drop f IO-BUF k FD-READ ;] [: o ou p u IO-FAILURE ;] FS-FAILS
-   k < if 0 FS:CAUSE! o ou p u IO-FAILURE then
+   0 [: drop f IO-BUF k FD-READ ;] [: o p IO-FAILURE ;] FS-FAILS
+   k < if 0 FS:CAUSE! o p IO-FAILURE then
    IO-BUF k h DROPBOX:HASH-FEED
    left k - ;
 
 \ Rust's hash_download_prefix: h begun and fed the slot's first offset
 \ bytes, a whole number of checkpoints, and f left at offset.
-: HASH-DOWNLOAD-PREFIX ( fd n ^u8 n ^DROPBOX:hasher -- )
-   {: f:fd offset:n p:^ u:n h :}
-   [: f 0 FD:SEEK ;] [: s" rewind resumed download" p u IO-FAILURE ;]
+: HASH-DOWNLOAD-PREFIX ( fd n str ^DROPBOX:hasher -- )
+   {: f:fd offset:n p:str h :}
+   [: f 0 FD:SEEK ;] [: s" rewind resumed download" p IO-FAILURE ;]
    FS-FAILS
    h DROPBOX:HASH-BEGIN
-   offset begin dup 0 > while f swap p u h REHASH-CHUNK repeat drop
+   offset begin dup 0 > while f swap p h REHASH-CHUNK repeat drop
    [: f offset FD:SEEK ;]
-   [: s" position resumed download" p u IO-FAILURE ;] FS-FAILS ;
+   [: s" position resumed download" p IO-FAILURE ;] FS-FAILS ;
 
 : DROP-PREPARATION ( download-preparation -- ) drop ;
 : DROP-STAGE-OUTCOME ( stage-outcome<n> -- ) drop ;
@@ -3220,31 +3235,31 @@ private
 \ The download's stage name for target t, and its path below root path r
 \ through the parent's path rel, laid in the arena.
 : STAGE-PATHS
-   ( ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- ^u8 n ^u8 n )
-   {: r:^ ru:n rel:^ relu:n t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
-   s" download" t tu want ar INTERNAL-NAME {: name:^ nu:n :}
-   r ru rel relu ar JOIN name nu ar JOIN {: sp:^ spu:n :}
-   name nu sp spu ;
+   ( str str str DROPBOX:hash ^ARENA:arena -- str str )
+   {: r:str rel:str t:str want:DROPBOX:hash ar:^ARENA:arena :}
+   s" download" t want ar INTERNAL-NAME {: name:str :}
+   r rel ar JOIN name ar JOIN {: sp:str :}
+   name sp ;
 
 \ The location of target t's download into dir from the source src
 \ answers, its stage named and the target kept in the arena before src
 \ runs.
 : NEW-LOCATION
-   ( [ -- download-source ] fd ^u8 n ^u8 n ^u8 n DROPBOX:hash
+   ( [ -- download-source ] fd str str str DROPBOX:hash
      ^ARENA:arena -- download-location )
-   {: src dir:fd r:^ ru:n rel:^ relu:n t:^ tu:n want:DROPBOX:hash
+   {: src dir:fd r:str rel:str t:str want:DROPBOX:hash
       ar:^ARENA:arena :}
-   r ru rel relu t tu want ar STAGE-PATHS {: name:^ nu:n sp:^ spu:n :}
-   t tu ar KEEP {: target:str :}
-   src execute dir name nu >str sp spu >str target want
+   r rel t want ar STAGE-PATHS {: name:str sp:str :}
+   t ar KEEP {: target:str :}
+   src execute dir name sp target want
    DOWNLOAD-LOCATION-MAKE ;
 
 : NO-LOCATION ( -- download-location )
-   s" " >str DOWNLOAD-SOURCE-DISPOSABLE -1 >FD
-   s" " >str s" " >str s" " >str NO-HASH DOWNLOAD-LOCATION-MAKE ;
+   s" " DOWNLOAD-SOURCE-DISPOSABLE -1 >FD
+   s" " s" " s" " NO-HASH DOWNLOAD-LOCATION-MAKE ;
 : DROP-LOCATION ( download-location -- ) drop ;
 
-: LOCATION-PATH ( download-location -- ^u8 n )
+: LOCATION-PATH ( download-location -- str )
    DOWNLOAD-LOCATION-UNMAKE
    {: src:download-source dir:fd name:str sp:str t:str want:DROPBOX:hash :}
    src SOURCE-PATH ;
@@ -3253,7 +3268,7 @@ private
    {: loc:download-location ar:^ARENA:arena :}
    loc DOWNLOAD-LOCATION-UNMAKE
    {: src:download-source dir:fd name:str sp:str t:str want:DROPBOX:hash :}
-   dir name str> sp str> t str> want ar INSPECT-DOWNLOAD-STAGE ;
+   dir name sp t want ar INSPECT-DOWNLOAD-STAGE ;
 
 \ The partial of the location's download in f, at offset 0.
 : NEW-PARTIAL ( download-location fd ^ARENA:arena -- ^download-partial )
@@ -3267,21 +3282,21 @@ private
 
 \ A partial in a new unnamed file in the staging directory s.
 : DISPOSABLE-PARTIAL
-   ( download-location ^u8 n ^ARENA:arena -- download-preparation )
-   {: loc:download-location s:^ su:n ar:^ARENA:arena :}
-   s su s" open disposable download staging directory"
+   ( download-location str ^ARENA:arena -- download-preparation )
+   {: loc:download-location s:str ar:^ARENA:arena :}
+   s s" open disposable download staging directory"
    OPEN-PRIVATE-DIRECTORY {: staging:fd :}
-   loc LOCATION-PATH {: p:^ u:n :}
-   [: staging p u s" create disposable download stage" UNNAMED-FILE ;]
+   loc LOCATION-PATH {: p:str :}
+   [: staging p s" create disposable download stage" UNNAMED-FILE ;]
    [: staging DISCARD ;] finally {: f:fd :}
    EPHEMERAL f [: DROP-PREPARATION loc f ar NEW-PARTIAL READY ;]
    CLOSING ;
 
 : DISPOSABLE
-   ( download-location ^u8 n ^ARENA:arena -- download-preparation )
-   {: loc:download-location s:^ su:n ar:^ARENA:arena :}
+   ( download-location str ^ARENA:arena -- download-preparation )
+   {: loc:download-location s:str ar:^ARENA:arena :}
    loc ar INSPECT-LOCATION STAGE-PREPARATION MATCH option
-      none OF loc s su ar DISPOSABLE-PARTIAL ENDOF
+      none OF loc s ar DISPOSABLE-PARTIAL ENDOF
       some OF ENDOF
    ;MATCH ;
 
@@ -3292,18 +3307,18 @@ public
 \ in an unnamed file in the staging directory s, its paths in the arena.
 \ The partial holds the target's parent directory.
 : PREPARE-DISPOSABLE-DOWNLOAD-AT
-   ( fd ^u8 n ^u8 n DROPBOX:hash ^u8 n ^ARENA:arena
+   ( fd str str DROPBOX:hash str ^ARENA:arena
      -- download-preparation )
-   {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash s:^ su:n
+   {: root:fd r:str t:str want:DROPBOX:hash s:str
       ar:^ARENA:arena :}
    want s" prepare disposable download" REQUIRE-CONTENT-HASH
-   root t tu true OPEN-PARENT MATCH option
-      none OF t tu UNSAFE ENDOF
+   root t true OPEN-PARENT MATCH option
+      none OF t UNSAFE ENDOF
       some OF ENDOF
    ;MATCH PARENT-DIR-UNMAKE {: dir:fd last:str rel:str :}
-   [: [: s su s" <unnamed-download>" ar JOIN >str
+   [: [: s s" <unnamed-download>" ar JOIN
          DOWNLOAD-SOURCE-DISPOSABLE ;]
-      dir r ru rel str> t tu want ar NEW-LOCATION s su ar DISPOSABLE ;]
+      dir r rel t want ar NEW-LOCATION s ar DISPOSABLE ;]
    [: dir DISCARD ;] PREPARING ;
 
 private
@@ -3312,12 +3327,12 @@ private
 
 : TARGET-DIR@ ( ^download-location -- fd )
    DOWNLOAD-LOCATION-TARGET-DIRECTORY @ ;
-: STAGE-NAME@ ( ^download-location -- ^u8 n )
-   DOWNLOAD-LOCATION-STAGE-NAME @ str> ;
-: STAGE-PATH@ ( ^download-location -- ^u8 n )
-   DOWNLOAD-LOCATION-STAGE-PATH @ str> ;
-: TARGET@ ( ^download-location -- ^u8 n )
-   DOWNLOAD-LOCATION-TARGET @ str> ;
+: STAGE-NAME@ ( ^download-location -- str )
+   DOWNLOAD-LOCATION-STAGE-NAME @ ;
+: STAGE-PATH@ ( ^download-location -- str )
+   DOWNLOAD-LOCATION-STAGE-PATH @ ;
+: TARGET@ ( ^download-location -- str )
+   DOWNLOAD-LOCATION-TARGET @ ;
 : EXPECTED@ ( ^download-location -- DROPBOX:hash )
    DOWNLOAD-LOCATION-EXPECTED @ ;
 : SOURCE@ ( ^download-location -- download-source )
@@ -3337,7 +3352,7 @@ private
 : PARTIAL-FILE ( ^download-partial -- fd ) DOWNLOAD-PARTIAL-FILE @ ;
 
 \ The partial's file's path: its slot's, or its unnamed file's.
-: PARTIAL-PATH ( ^download-partial -- ^u8 n )
+: PARTIAL-PATH ( ^download-partial -- str )
    DOWNLOAD-PARTIAL-LOCATION SOURCE@ SOURCE-PATH ;
 
 \ Closes the location's directories: the target's and a slot's.
@@ -3373,8 +3388,8 @@ private
    code 0= if exit then
    code LOCAL-CODE throw ;
 
-: OCCUPIED-AT ( ^u8 n -- stage-outcome<n> )
-   >str LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED ;
+: OCCUPIED-AT ( str -- stage-outcome<n> )
+ LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED ;
 
 : STAGED? ( stage-outcome<n> -- bool )
    MATCH stage-outcome
@@ -3390,7 +3405,7 @@ private
 \ staged when they hash to the location's content.
 : COPY-INTO-STAGE ( fd ^download-location ^ARENA:arena -- stage-outcome<n> )
    {: f:fd loc ar:^ARENA:arena :}
-   loc TARGET@ loc EXPECTED@ ar STAGE-MARKER >str OPTION:SOME
+   loc TARGET@ loc EXPECTED@ ar STAGE-MARKER OPTION:SOME
    {: marker:option<str> :}
    loc TARGET-DIR@ loc STAGE-NAME@ loc STAGE-PATH@ loc EXPECTED@
    [: f -rot FD-READ ;] marker s" copy completed download slot" ar
@@ -3401,9 +3416,9 @@ private
 : COPY-COMPLETED-SLOT
    ( fd ^download-location ^ARENA:arena -- stage-outcome<n> )
    {: f:fd loc ar:^ARENA:arena :}
-   loc SOURCE@ SOURCE-PATH {: p:^ u:n :}
+   loc SOURCE@ SOURCE-PATH {: p:str :}
    [: f 0 FD:SEEK ;]
-   [: s" rewind completed download slot" p u IO-FAILURE ;] FS-FAILS
+   [: s" rewind completed download slot" p IO-FAILURE ;] FS-FAILS
    0 LOCAL-STAGE--OUTCOME:STAGED
    [: DROP-STAGE-OUTCOME f loc ar COPY-INTO-STAGE ;] LOCAL-ERRORS
    {: out:stage-outcome<n> :}
@@ -3413,10 +3428,10 @@ private
 \ The entry already at the stage's name: a verified stage, whose
 \ descriptor closes, runs q and is staged already; o names the operation.
 : RACED-STAGE
-   ( ^download-location ^u8 n [ -- ] ^ARENA:arena -- stage-outcome<n> )
-   {: loc o:^ ou:n q ar:^ARENA:arena :}
+   ( ^download-location str [ -- ] ^ARENA:arena -- stage-outcome<n> )
+   {: loc o:str q ar:^ARENA:arena :}
    loc @ ar INSPECT-LOCATION MATCH download-stage
-      missing OF o ou loc TARGET@ CHANGED ENDOF
+      missing OF o loc TARGET@ CHANGED ENDOF
       verified OF VERIFIED-DOWNLOAD-STAGE-UNMAKE
          {: s:fd print:MODEL:fingerprint :} s DISCARD
          q execute 0 LOCAL-STAGE--OUTCOME:ALREADY-STAGED
@@ -3430,50 +3445,50 @@ private
 \ filesystem is copied across; else fail, which throws, runs with
 \ FS:ERRNO set to e.
 : MOVE-FAILED
-   ( fd ^download-location ^ARENA:arena n ^u8 n [ -- ] [ -- ]
+   ( fd ^download-location ^ARENA:arena n str [ -- ] [ -- ]
      -- stage-outcome<n> )
-   {: f:fd loc ar:^ARENA:arena e:n o:^ ou:n q fail :}
-   e FS:EEXIST = if loc o ou q ar RACED-STAGE exit then
+   {: f:fd loc ar:^ARENA:arena e:n o:str q fail :}
+   e FS:EEXIST = if loc o q ar RACED-STAGE exit then
    e FS:EXDEV = if f loc ar COPY-COMPLETED-SLOT exit then
    e FS:CAUSE! fail execute E-IO throw ;
 
 \ The stage made read-only by m and synced by s.
-: SEAL-PROMOTED ( fd ^download-location ^u8 n ^u8 n -- stage-outcome<n> )
-   {: f:fd loc m:^ mu:n s:^ su:n :}
-   f loc STAGE-PATH@ m mu READ-ONLY
-   f loc STAGE-PATH@ s su SYNC-FILE
+: SEAL-PROMOTED ( fd ^download-location str str -- stage-outcome<n> )
+   {: f:fd loc m:str s:str :}
+   f loc STAGE-PATH@ m READ-ONLY
+   f loc STAGE-PATH@ s SYNC-FILE
    0 LOCAL-STAGE--OUTCOME:STAGED ;
 
 \ Where the swapped stage went: the slot's name, or, when an entry took
 \ that, the stage's, where it stays.
-: RESTORED-PATH ( ^download-location fd ^u8 n ^u8 n -- ^u8 n )
-   {: loc slots:fd name:^ nu:n p:^ u:n :}
-   loc TARGET-DIR@ loc STAGE-NAME@ slots name nu FS:TRY-RENAME-NEW-AT if
-      p u exit
+: RESTORED-PATH ( ^download-location fd str str -- str )
+   {: loc slots:fd name:str p:str :}
+   loc TARGET-DIR@ loc STAGE-NAME@ slots name FS:TRY-RENAME-NEW-AT if
+      p exit
    then
    FS:ERRNO FS:EEXIST <> if
-      loc TARGET-DIR@ loc STAGE-NAME@ slots name nu
+      loc TARGET-DIR@ loc STAGE-NAME@ slots name
       s" restore swapped resumed download" loc STAGE-PATH@
       IO-FAILURE-ACROSS
    then
    loc STAGE-PATH@ ;
 
 \ Another inode took the slot's name before the move: it goes back.
-: RESTORE-SWAPPED ( ^download-location fd ^u8 n ^u8 n -- stage-outcome<n> )
-   {: loc slots:fd name:^ nu:n p:^ u:n :}
-   loc slots name nu p u RESTORED-PATH {: at:^ atu:n :}
-   slots p u s" sync restored download slot" SYNC-DIRECTORY
+: RESTORE-SWAPPED ( ^download-location fd str str -- stage-outcome<n> )
+   {: loc slots:fd name:str p:str :}
+   loc slots name p RESTORED-PATH {: at:str :}
+   slots p s" sync restored download slot" SYNC-DIRECTORY
    loc TARGET-DIR@ loc STAGE-PATH@ s" sync restored download stage"
    SYNC-DIRECTORY
-   at atu OCCUPIED-AT ;
+   at OCCUPIED-AT ;
 
 \ The slot named the stage: sealed, when it is still the file held.
 : PROMOTED-SLOT
-   ( fd ^download-location fd ^u8 n ^u8 n -- stage-outcome<n> )
-   {: f:fd loc slots:fd name:^ nu:n p:^ u:n :}
+   ( fd ^download-location fd str str -- stage-outcome<n> )
+   {: f:fd loc slots:fd name:str p:str :}
    f loc TARGET-DIR@ loc STAGE-NAME@ loc STAGE-PATH@ NAMED-INODE-MATCHES
-   0= if loc slots name nu p u RESTORE-SWAPPED exit then
-   slots p u s" sync consumed download slot" SYNC-DIRECTORY
+   0= if loc slots name p RESTORE-SWAPPED exit then
+   slots p s" sync consumed download slot" SYNC-DIRECTORY
    loc TARGET-DIR@ loc STAGE-PATH@ s" sync promoted download stage"
    SYNC-DIRECTORY
    f loc s" make resumed download stage immutable"
@@ -3482,17 +3497,17 @@ private
 \ Renames the slot, still bound to the download, to the stage's name;
 \ before runs just ahead of the rename.
 : MOVE-SLOT
-   ( fd ^download-location [ -- ] ^ARENA:arena fd ^u8 n ^u8 n
+   ( fd ^download-location [ -- ] ^ARENA:arena fd str str
      -- stage-outcome<n> )
-   {: f:fd loc before ar:^ARENA:arena slots:fd name:^ nu:n p:^ u:n :}
-   s" recover completed resumed download" {: o:^ ou:n :}
-   f loc DOWNLOAD-SLOT-MATCHES 0= if p u OCCUPIED-AT exit then
-   before [: s" promote completed download slot" p u IO-FAILURE ;] FS-FAILS
-   slots name nu loc TARGET-DIR@ loc STAGE-NAME@ FS:TRY-RENAME-NEW-AT if
-      f loc slots name nu p u PROMOTED-SLOT exit
+   {: f:fd loc before ar:^ARENA:arena slots:fd name:str p:str :}
+   s" recover completed resumed download" {: o:str :}
+   f loc DOWNLOAD-SLOT-MATCHES 0= if p OCCUPIED-AT exit then
+   before [: s" promote completed download slot" p IO-FAILURE ;] FS-FAILS
+   slots name loc TARGET-DIR@ loc STAGE-NAME@ FS:TRY-RENAME-NEW-AT if
+      f loc slots name p PROMOTED-SLOT exit
    then
-   f loc ar FS:ERRNO o ou [: f loc RESET-DOWNLOAD-SLOT TAKEN? drop ;]
-   [: slots name nu loc TARGET-DIR@ loc STAGE-NAME@ o ou p u
+   f loc ar FS:ERRNO o [: f loc RESET-DOWNLOAD-SLOT TAKEN? drop ;]
+   [: slots name loc TARGET-DIR@ loc STAGE-NAME@ o p
       IO-FAILURE-ACROSS ;]
    MOVE-FAILED ;
 
@@ -3508,14 +3523,14 @@ private
 : PROMOTE-COMPLETED-DISPOSABLE
    ( fd ^download-location [ -- ] ^ARENA:arena -- stage-outcome<n> )
    {: f:fd loc before ar:^ARENA:arena :}
-   s" promote completed disposable download" {: o:^ ou:n :}
-   loc SOURCE@ SOURCE-PATH {: p:^ u:n :}
-   before [: o ou p u IO-FAILURE ;] FS-FAILS
+   s" promote completed disposable download" {: o:str :}
+   loc SOURCE@ SOURCE-PATH {: p:str :}
+   before [: o p IO-FAILURE ;] FS-FAILS
    f loc TARGET-DIR@ loc STAGE-NAME@ FS:TRY-LINK-AT if
       f loc LINKED-DISPOSABLE exit
    then
-   f loc ar FS:ERRNO o ou [: ;]
-   [: loc TARGET-DIR@ loc STAGE-NAME@ o ou p u IO-FAILURE-AT ;]
+   f loc ar FS:ERRNO o [: ;]
+   [: loc TARGET-DIR@ loc STAGE-NAME@ o p IO-FAILURE-AT ;]
    MOVE-FAILED ;
 
 \ Rust's promote_completed_slot_with: the completed, marked file f moved
@@ -3525,7 +3540,7 @@ private
    {: f:fd loc before ar:^ARENA:arena :}
    loc SOURCE@ MATCH download-source
       resumable OF {: slots:fd name:str path:str b:binding :}
-         f loc before ar slots name str> path str> MOVE-SLOT
+         f loc before ar slots name path MOVE-SLOT
       ENDOF
       disposable OF {: p:str :}
          f loc before ar PROMOTE-COMPLETED-DISPOSABLE
@@ -3543,21 +3558,21 @@ private
 
 \ Fills the span from read; a failure, or an end before the span is
 \ full, is a stage read's.
-: STAGE-READ-EXACT ( ^u8 n [ ^u8 n -- n ] ^u8 n ^u8 n -- )
-   {: dst:^ cap:n read p:^ u:n o:^ ou:n :}
+: STAGE-READ-EXACT ( ^u8 n [ ^u8 n -- n ] str str -- )
+   {: dst:^ cap:n read p:str o:str :}
    0 begin dup cap < while
       {: done:n :}
-      dst done + cap done - read p u o ou STAGE-READ-INTO {: k:n :}
-      k 0= if 0 FS:CAUSE! o ou p u STAGE-READ then
+      dst done + cap done - read p o STAGE-READ-INTO {: k:n :}
+      k 0= if 0 FS:CAUSE! o p STAGE-READ then
       done k +
    repeat drop ;
 
 \ Rust's discard_uncommitted_block: the file cut back to the offset.
 : DISCARD-UNCOMMITTED-BLOCK ( ^download-partial -- )
    {: x :}
-   x PARTIAL-PATH {: p:^ u:n :}
+   x PARTIAL-PATH {: p:str :}
    [: x PARTIAL-FILE x DOWNLOAD-PARTIAL-OFFSET @ FD:RESIZE ;]
-   [: s" discard incomplete resumed download block" p u IO-FAILURE ;]
+   [: s" discard incomplete resumed download block" p IO-FAILURE ;]
    FS-FAILS ;
 
 \ Runs q; a throw first discards the block it was writing.
@@ -3567,18 +3582,18 @@ private
    code 0= if exit then
    x DISCARD-UNCOMMITTED-BLOCK code throw ;
 
-: WRITE-DOWNLOAD ( ^download-partial ^u8 n -- )
-   {: x b:^ k:n :}
-   x PARTIAL-PATH {: p:^ u:n :}
-   [: x PARTIAL-FILE b k FD:WRITE-FULL ;]
-   [: s" write resumed download" p u IO-FAILURE ;] FS-FAILS ;
+: WRITE-DOWNLOAD ( ^download-partial str -- )
+   {: x b:str :}
+   x PARTIAL-PATH {: p:str :}
+   [: x PARTIAL-FILE b FD:WRITE-FULL ;]
+   [: s" write resumed download" p IO-FAILURE ;] FS-FAILS ;
 
 \ Reads k bytes, writes them to the file and feeds them to the hash.
 : APPEND-CHUNK ( ^download-partial n [ ^u8 n -- n ] -- )
    {: x k:n read :}
    IO-BUF k read x DOWNLOAD-PARTIAL-LOCATION TARGET@
    s" read resumed download" STAGE-READ-EXACT
-   x IO-BUF k WRITE-DOWNLOAD
+   x IO-BUF k >str WRITE-DOWNLOAD
    IO-BUF k x DOWNLOAD-PARTIAL-AGGREGATE DROPBOX:HASH-FEED ;
 
 : COPY-BLOCK ( ^download-partial n [ ^u8 n -- n ] -- )
@@ -3603,12 +3618,12 @@ private
    x PARTIAL-FILE {: f:fd :}
    x DOWNLOAD-PARTIAL-LOCATION SOURCE@ MATCH download-source
       resumable OF {: slots:fd name:str path:str b:binding :}
-         f path str> s" sync resumed download checkpoint" SYNC-FILE
+         f path s" sync resumed download checkpoint" SYNC-FILE
          f DOWNLOAD-PARTIAL-XATTR
          b x DOWNLOAD-PARTIAL-OFFSET @ DOWNLOAD-SLOT-STATE-MAKE
-         ENCODE-DOWNLOAD-SLOT-STATE false path str>
+         ENCODE-DOWNLOAD-SLOT-STATE false path
          s" record resumed download checkpoint" SET-XATTR
-         f path str> s" sync resumed download checkpoint marker" SYNC-FILE
+         f path s" sync resumed download checkpoint marker" SYNC-FILE
       ENDOF
       disposable OF {: p:str :} ENDOF
    ;MATCH ;
@@ -3643,12 +3658,12 @@ private
 : COMPLETE-PARTIAL ( ^download-partial ^ARENA:arena -- stage-outcome<n> )
    {: x ar:^ARENA:arena :}
    x PARTIAL-FILE {: f:fd :}
-   x PARTIAL-PATH {: p:^ u:n :}
+   x PARTIAL-PATH {: p:str :}
    x DOWNLOAD-PARTIAL-LOCATION {: loc :}
-   f p u s" sync completed resumed download data" SYNC-FILE
+   f p s" sync completed resumed download data" SYNC-FILE
    f DOWNLOAD-STAGE-XATTR loc TARGET@ loc EXPECTED@ ar STAGE-MARKER true
-   p u s" mark completed resumed download" SET-XATTR
-   f p u s" sync completed resumed download marker" SYNC-FILE
+   p s" mark completed resumed download" SET-XATTR
+   f p s" sync completed resumed download marker" SYNC-FILE
    f loc ar PROMOTE-COMPLETED-SLOT ;
 
 \ Rust's DownloadPartial::finish.
@@ -3664,13 +3679,13 @@ private
 : APPENDED
    ( ^download-partial n [ ^u8 n -- n ] ^ARENA:arena -- stage-outcome<n> )
    {: x total:n read ar:^ARENA:arena :}
-   x DOWNLOAD-PARTIAL-LOCATION TARGET@ {: t:^ tu:n :}
+   x DOWNLOAD-PARTIAL-LOCATION TARGET@ {: t:str :}
    x DOWNLOAD-PARTIAL-OFFSET @ total > if
-      s" validate resumed download size" t tu CHANGED
+      s" validate resumed download size" t CHANGED
    then
    x total read APPEND-BLOCKS
-   EXTRA 1 read t tu s" finish resumed download" STAGE-READ-INTO 0<> if
-      s" validate resumed download length" t tu CHANGED
+   EXTRA 1 read t s" finish resumed download" STAGE-READ-INTO 0<> if
+      s" validate resumed download length" t CHANGED
    then
    x ar FINISH-PARTIAL ;
 
@@ -3717,15 +3732,15 @@ private
    {: lease:download-slot-lease ar:^ARENA:arena :}
    lease DOWNLOAD-SLOT-LEASE-UNMAKE {: d:str slot:n b:binding :}
    slot DOWNLOAD-SLOT-NAME ar KEEP {: name:str :}
-   d str> name str> ar JOIN >str {: path:str :}
-   d str> s" open resumable download slot directory"
+   d name ar JOIN {: path:str :}
+   d s" open resumable download slot directory"
    OPEN-PRIVATE-DIRECTORY name path b DOWNLOAD-SOURCE-RESUMABLE ;
 
 \ The source's slot opened; an unnamed file has none.
 : SLOT-OPEN ( download-source -- download-slot-open )
    MATCH download-source
       resumable OF {: slots:fd name:str path:str b:binding :}
-         slots name str> path str> OPEN-DOWNLOAD-SLOT
+         slots name path OPEN-DOWNLOAD-SLOT
       ENDOF
       disposable OF {: p:str :} DOWNLOAD-SLOT-OPEN-MISSING ENDOF
    ;MATCH ;
@@ -3749,18 +3764,18 @@ private
       some OF ENDOF
    ;MATCH ;
 
-: SLOT-LENGTH ( MODEL:stat ^u8 n -- n )
-   {: st:MODEL:stat p:^ u:n :}
+: SLOT-LENGTH ( MODEL:stat str -- n )
+   {: st:MODEL:stat p:str :}
    st MODEL-STAT:UNMAKE {: d i m s ms mn cs cn :}
-   s 0 < if 0 s" inspect resumed download size" p u SYSCALL-FAILURE then
+   s 0 < if 0 s" inspect resumed download size" p SYSCALL-FAILURE then
    s ;
 
 : TRUNCATE-TAIL ( ^download-partial n -- )
    {: x at:n :}
-   x PARTIAL-PATH {: p:^ u:n :}
+   x PARTIAL-PATH {: p:str :}
    [: x PARTIAL-FILE at FD:RESIZE ;]
-   [: s" truncate resumed download tail" p u IO-FAILURE ;] FS-FAILS
-   x PARTIAL-FILE p u s" sync truncated resumed download" SYNC-FILE ;
+   [: s" truncate resumed download tail" p IO-FAILURE ;] FS-FAILS
+   x PARTIAL-FILE p s" sync truncated resumed download" SYNC-FILE ;
 
 \ The partial resumed at the checkpoint at, its file length bytes long
 \ cut back to it and its hash fed the bytes before it.
@@ -3806,8 +3821,8 @@ private
 : SLOT-MARKER ( ^download-partial ^ARENA:arena -- download-marker )
    {: x ar:^ARENA:arena :}
    x DOWNLOAD-PARTIAL-LOCATION {: loc :}
-   loc TARGET@ loc EXPECTED@ ar STAGE-MARKER {: m:^ mu:n :}
-   x PARTIAL-FILE m mu x PARTIAL-PATH READ-DOWNLOAD-MARKER ;
+   loc TARGET@ loc EXPECTED@ ar STAGE-MARKER {: m:str :}
+   x PARTIAL-FILE m x PARTIAL-PATH READ-DOWNLOAD-MARKER ;
 
 : RESUME-MARKED ( ^download-partial n n ^ARENA:arena -- download-preparation )
    {: x at:n length:n ar:^ARENA:arena :}
@@ -3852,10 +3867,10 @@ private
    ;MATCH ;
 
 \ Rust's open_parent with create; none is an unsafe path.
-: OPEN-TARGET-PARENT ( fd ^u8 n -- parent-dir )
-   {: root:fd t:^ tu:n :}
-   root t tu true OPEN-PARENT MATCH option
-      none OF t tu UNSAFE ENDOF
+: OPEN-TARGET-PARENT ( fd str -- parent-dir )
+   {: root:fd t:str :}
+   root t true OPEN-PARENT MATCH option
+      none OF t UNSAFE ENDOF
       some OF ENDOF
    ;MATCH ;
 
@@ -3868,15 +3883,15 @@ public
 \ slot; ephemeral when the slot is not the lease's. A ready partial holds
 \ the target's parent and the slot directory; paths go in the arena.
 : PREPARE-DOWNLOAD-SLOT-AT
-   ( fd ^u8 n ^u8 n DROPBOX:hash download-slot-lease ^ARENA:arena
+   ( fd str str DROPBOX:hash download-slot-lease ^ARENA:arena
      -- download-preparation )
-   {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash
+   {: root:fd r:str t:str want:DROPBOX:hash
       lease:download-slot-lease ar:^ARENA:arena :}
    want s" prepare resumed download" REQUIRE-CONTENT-HASH
-   root t tu OPEN-TARGET-PARENT PARENT-DIR-UNMAKE
+   root t OPEN-TARGET-PARENT PARENT-DIR-UNMAKE
    {: dir:fd last:str rel:str :}
    NO-LOCATION dir [: DROP-LOCATION [: lease ar SLOT-SOURCE ;]
-      dir r ru rel str> t tu want ar NEW-LOCATION ;] CLOSING
+      dir r rel t want ar NEW-LOCATION ;] CLOSING
    {: loc:download-location :}
    [: loc ar SLOT-PREPARATION ;] [: loc CLOSE-LOCATION ;] PREPARING
    lease ar RESUMED ;
@@ -3886,22 +3901,22 @@ private
 \ ---- staged downloads
 
 : STAGE-DOWNLOAD-IN
-   ( fd ^u8 n ^u8 n ^u8 n DROPBOX:hash [ ^u8 n -- n ] ^ARENA:arena
+   ( fd str str str DROPBOX:hash [ ^u8 n -- n ] ^ARENA:arena
      -- stage-outcome<n> )
-   {: dir:fd r:^ ru:n rel:^ relu:n t:^ tu:n want:DROPBOX:hash read
+   {: dir:fd r:str rel:str t:str want:DROPBOX:hash read
       ar:^ARENA:arena :}
-   r ru rel relu t tu want ar STAGE-PATHS {: name:^ nu:n sp:^ spu:n :}
-   t tu want ar STAGE-MARKER >str OPTION:SOME {: marker:option<str> :}
-   dir name nu sp spu want read marker s" stage download" ar
+   r rel t want ar STAGE-PATHS {: name:str sp:str :}
+   t want ar STAGE-MARKER OPTION:SOME {: marker:option<str> :}
+   dir name sp want read marker s" stage download" ar
    WRITE-VERIFIED-STAGE [: 0 ;] MAP-STAGE-WRITE ;
 
 : EXISTING-IN
-   ( fd ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+   ( fd str str str DROPBOX:hash ^ARENA:arena
      -- option<stage-outcome<n>> )
-   {: dir:fd r:^ ru:n rel:^ relu:n t:^ tu:n want:DROPBOX:hash
+   {: dir:fd r:str rel:str t:str want:DROPBOX:hash
       ar:^ARENA:arena :}
-   r ru rel relu t tu want ar STAGE-PATHS {: name:^ nu:n sp:^ spu:n :}
-   dir name nu sp spu t tu want ar INSPECT-DOWNLOAD-STAGE EXISTING-OUTCOME ;
+   r rel t want ar STAGE-PATHS {: name:str sp:str :}
+   dir name sp t want ar INSPECT-DOWNLOAD-STAGE EXISTING-OUTCOME ;
 
 public
 
@@ -3909,24 +3924,24 @@ public
 \ root path r when they hash to want, marked as its owned download. A
 \ failed read throws E-STAGE-READ.
 : STAGE-DOWNLOAD-AT
-   ( fd ^u8 n ^u8 n DROPBOX:hash [ ^u8 n -- n ] ^ARENA:arena
+   ( fd str str DROPBOX:hash [ ^u8 n -- n ] ^ARENA:arena
      -- stage-outcome<n> )
-   {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash read ar:^ARENA:arena :}
+   {: root:fd r:str t:str want:DROPBOX:hash read ar:^ARENA:arena :}
    want s" stage download" REQUIRE-CONTENT-HASH
-   root t tu OPEN-TARGET-PARENT PARENT-DIR-UNMAKE
+   root t OPEN-TARGET-PARENT PARENT-DIR-UNMAKE
    {: dir:fd last:str rel:str :}
-   [: dir r ru rel str> t tu want read ar STAGE-DOWNLOAD-IN ;]
+   [: dir r rel t want read ar STAGE-DOWNLOAD-IN ;]
    [: dir DISCARD ;] finally ;
 
 \ Rust's existing_download_stage_at: what the stage for target t holding
 \ want below root path r already comes to, none when it is missing.
 : EXISTING-DOWNLOAD-STAGE-AT
-   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- option<stage-outcome<n>> )
-   {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
+   ( fd str str DROPBOX:hash ^ARENA:arena -- option<stage-outcome<n>> )
+   {: root:fd r:str t:str want:DROPBOX:hash ar:^ARENA:arena :}
    want s" inspect download stage" REQUIRE-CONTENT-HASH
-   root t tu OPEN-TARGET-PARENT PARENT-DIR-UNMAKE
+   root t OPEN-TARGET-PARENT PARENT-DIR-UNMAKE
    {: dir:fd last:str rel:str :}
-   [: dir r ru rel str> t tu want ar EXISTING-IN ;] [: dir DISCARD ;]
+   [: dir r rel t want ar EXISTING-IN ;] [: dir DISCARD ;]
    finally ;
 
 \ ---- installs
@@ -4000,197 +4015,197 @@ STRUCTURE install
       some OF DROP-HASH true ENDOF
    ;MATCH ;
 
-: GUARD-NAME ( ^u8 n DROPBOX:hash ^ARENA:arena -- ^u8 n )
-   {: t:^ tu:n c:DROPBOX:hash ar:^ARENA:arena :}
-   s" displaced" t tu c ar INTERNAL-NAME ;
+: GUARD-NAME ( str DROPBOX:hash ^ARENA:arena -- str )
+   {: t:str c:DROPBOX:hash ar:^ARENA:arena :}
+   s" displaced" t c ar INTERNAL-NAME ;
 
 \ Removes the name in dir; o names the operation and p the path.
-: REMOVE-AT ( fd ^u8 n ^u8 n ^u8 n -- )
-   {: dir:fd name:^ nu:n o:^ ou:n p:^ u:n :}
-   dir name nu FS:TRY-REMOVE-FILE-AT 0= if
-      dir name nu o ou p u IO-FAILURE-AT
+: REMOVE-AT ( fd str str str -- )
+   {: dir:fd name:str o:str p:str :}
+   dir name FS:TRY-REMOVE-FILE-AT 0= if
+      dir name o p IO-FAILURE-AT
    then ;
 
-: WRITABLE ( fd ^u8 n ^u8 n -- )
-   {: f:fd p:^ u:n o:^ ou:n :}
-   [: f FS:MODE-PRIVATE-FILE FD:MODE! ;] [: o ou p u IO-FAILURE ;]
+: WRITABLE ( fd str str -- )
+   {: f:fd p:str o:str :}
+   [: f FS:MODE-PRIVATE-FILE FD:MODE! ;] [: o p IO-FAILURE ;]
    FS-FAILS ;
 
 \ The stage's file is as it was verified.
-: VERIFY-DOWNLOAD-STAGE-BEFORE-RENAME ( verified-download-stage ^u8 n -- )
-   {: s:verified-download-stage p:^ u:n :}
+: VERIFY-DOWNLOAD-STAGE-BEFORE-RENAME ( verified-download-stage str -- )
+   {: s:verified-download-stage p:str :}
    s VERIFIED-DOWNLOAD-STAGE-UNMAKE {: f:fd print:MODEL:fingerprint :}
-   s" verify download stage before rename" {: o:^ ou:n :}
-   f p u o ou STAT-FD p u FILE-FINGERPRINT
-   print SAME-FINGERPRINT? 0= if o ou p u CHANGED then ;
+   s" verify download stage before rename" {: o:str :}
+   f p o STAT-FD p FILE-FINGERPRINT
+   print SAME-FINGERPRINT? 0= if o p CHANGED then ;
 
 \ Makes the owned download at f a plain file: writable, unmarked.
-: RELEASE-OWNED-DOWNLOAD ( fd ^u8 n -- )
-   {: f:fd p:^ u:n :}
-   f p u s" make installed download writable" WRITABLE
-   f DOWNLOAD-PARTIAL-XATTR p u s" clear resumed download marker"
+: RELEASE-OWNED-DOWNLOAD ( fd str -- )
+   {: f:fd p:str :}
+   f p s" make installed download writable" WRITABLE
+   f DOWNLOAD-PARTIAL-XATTR p s" clear resumed download marker"
    REMOVE-XATTR
-   f p u s" sync installed download cleanup" SYNC-FILE
-   f DOWNLOAD-STAGE-XATTR p u s" clear installed download marker"
+   f p s" sync installed download cleanup" SYNC-FILE
+   f DOWNLOAD-STAGE-XATTR p s" clear installed download marker"
    REMOVE-XATTR ;
 
 \ Syncs the installed file; one still marked as LOCAL's is released first.
-: FINISH-INSTALLED-DOWNLOAD ( fd ^u8 n bool -- )
-   {: f:fd p:^ u:n owned:bool :}
-   owned if f p u RELEASE-OWNED-DOWNLOAD then
-   f p u s" sync installed download" SYNC-FILE ;
+: FINISH-INSTALLED-DOWNLOAD ( fd str bool -- )
+   {: f:fd p:str owned:bool :}
+   owned if f p RELEASE-OWNED-DOWNLOAD then
+   f p s" sync installed download" SYNC-FILE ;
 
 \ Whether the stage's file holds its verified bytes under the name.
-: BOUND? ( verified-download-stage fd ^u8 n ^u8 n ^u8 n -- bool )
-   {: s:verified-download-stage dir:fd name:^ nu:n p:^ u:n o:^ ou:n :}
+: BOUND? ( verified-download-stage fd str str str -- bool )
+   {: s:verified-download-stage dir:fd name:str p:str o:str :}
    s VERIFIED-DOWNLOAD-STAGE-UNMAKE {: f:fd print:MODEL:fingerprint :}
-   f p u o ou STAT-FD p u FILE-FINGERPRINT
+   f p o STAT-FD p FILE-FINGERPRINT
    print SAME-HASHED-CONTENT 0= if false exit then
-   f dir name nu p u NAMED-INODE-MATCHES ;
+   f dir name p NAMED-INODE-MATCHES ;
 
 \ Whether the renamed stage is the owned download of want at the name.
 : OWNED-RENAME?
-   ( verified-download-stage fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+   ( verified-download-stage fd str str DROPBOX:hash ^ARENA:arena
      -- bool )
-   {: s:verified-download-stage dir:fd name:^ nu:n p:^ u:n
+   {: s:verified-download-stage dir:fd name:str p:str
       want:DROPBOX:hash ar:^ARENA:arena :}
-   p u want ar STAGE-MARKER {: m:^ mu:n :}
-   s dir name nu p u s" verify renamed download content" BOUND?
+   p want ar STAGE-MARKER {: m:str :}
+   s dir name p s" verify renamed download content" BOUND?
    0= if false exit then
    s VERIFIED-DOWNLOAD-STAGE-UNMAKE {: f:fd print:MODEL:fingerprint :}
-   f m mu p u READ-DOWNLOAD-MARKER EXPECTED? ;
+   f m p READ-DOWNLOAD-MARKER EXPECTED? ;
 
 \ Releases and syncs the stage renamed to the name, which must be the
 \ owned download of want before and after.
 : SYNC-RENAMED-DOWNLOAD
-   ( verified-download-stage fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- )
-   {: s:verified-download-stage dir:fd name:^ nu:n p:^ u:n
+   ( verified-download-stage fd str str DROPBOX:hash ^ARENA:arena -- )
+   {: s:verified-download-stage dir:fd name:str p:str
       want:DROPBOX:hash ar:^ARENA:arena :}
-   s dir name nu p u want ar OWNED-RENAME? 0= if
-      s" verify renamed download ownership" p u CHANGED
+   s dir name p want ar OWNED-RENAME? 0= if
+      s" verify renamed download ownership" p CHANGED
    then
-   dir p u s" sync installed download rename" SYNC-DIRECTORY
+   dir p s" sync installed download rename" SYNC-DIRECTORY
    s VERIFIED-DOWNLOAD-STAGE-UNMAKE {: f:fd print:MODEL:fingerprint :}
-   f p u true FINISH-INSTALLED-DOWNLOAD
-   s dir name nu p u s" verify installed download content" BOUND? 0= if
-      s" verify installed download binding" p u CHANGED
+   f p true FINISH-INSTALLED-DOWNLOAD
+   s dir name p s" verify installed download content" BOUND? 0= if
+      s" verify installed download binding" p CHANGED
    then ;
 
 \ Finishes the open installed file when its content actual is want.
 : FINISH-IF-WANTED
-   ( fd DROPBOX:hash ^u8 n DROPBOX:hash ^ARENA:arena -- )
-   {: f:fd actual:DROPBOX:hash p:^ u:n want:DROPBOX:hash
+   ( fd DROPBOX:hash str DROPBOX:hash ^ARENA:arena -- )
+   {: f:fd actual:DROPBOX:hash p:str want:DROPBOX:hash
       ar:^ARENA:arena :}
    actual want SAME-CONTENT? 0= if
-      s" verify installed download" p u CHANGED
+      s" verify installed download" p CHANGED
    then
-   p u want ar STAGE-MARKER {: m:^ mu:n :}
-   f m mu p u READ-DOWNLOAD-MARKER EXPECTED? {: owned:bool :}
-   f p u owned FINISH-INSTALLED-DOWNLOAD ;
+   p want ar STAGE-MARKER {: m:str :}
+   f m p READ-DOWNLOAD-MARKER EXPECTED? {: owned:bool :}
+   f p owned FINISH-INSTALLED-DOWNLOAD ;
 
 \ Syncs the download installed at the name, which must hold want, and
 \ its entry; a file still marked as LOCAL's is released first.
 : SYNC-INSTALLED-DOWNLOAD
-   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- )
-   {: dir:fd name:^ nu:n p:^ u:n want:DROPBOX:hash ar:^ARENA:arena :}
-   s" verify installed download" {: o:^ ou:n :}
-   dir name nu p u o ou ar OPEN-AND-HASH-IF-PRESENT MATCH option
-      none OF o ou p u CHANGED ENDOF
+   ( fd str str DROPBOX:hash ^ARENA:arena -- )
+   {: dir:fd name:str p:str want:DROPBOX:hash ar:^ARENA:arena :}
+   s" verify installed download" {: o:str :}
+   dir name p o ar OPEN-AND-HASH-IF-PRESENT MATCH option
+      none OF o p CHANGED ENDOF
       some OF HASHED-UNMAKE
          {: f:fd c:DROPBOX:hash print:MODEL:fingerprint :}
-         [: f c p u want ar FINISH-IF-WANTED ;] [: f DISCARD ;] finally
+         [: f c p want ar FINISH-IF-WANTED ;] [: f DISCARD ;] finally
       ENDOF
    ;MATCH
-   dir p u s" sync installed download entry" SYNC-DIRECTORY ;
+   dir p s" sync installed download entry" SYNC-DIRECTORY ;
 
 \ Removes the owned stage of want at the name in dir; another file
 \ there is kept.
 : REMOVE-VERIFIED-STAGE
-   ( fd ^u8 n DROPBOX:hash ^u8 n ^u8 n ^ARENA:arena -- stage-cleanup )
-   {: dir:fd name:^ nu:n want:DROPBOX:hash p:^ u:n t:^ tu:n
+   ( fd str DROPBOX:hash str str ^ARENA:arena -- stage-cleanup )
+   {: dir:fd name:str want:DROPBOX:hash p:str t:str
       ar:^ARENA:arena :}
-   dir name nu p u t tu want ar INSPECT-DOWNLOAD-STAGE
+   dir name p t want ar INSPECT-DOWNLOAD-STAGE
    MATCH download-stage
       missing OF STAGE-CLEANUP-REMOVED-OR-ABSENT ENDOF
       verified OF VERIFIED-DOWNLOAD-STAGE-UNMAKE
          {: f:fd print:MODEL:fingerprint :} f DISCARD
-         dir name nu s" remove verified staging file" p u REMOVE-AT
+         dir name s" remove verified staging file" p REMOVE-AT
          STAGE-CLEANUP-REMOVED-OR-ABSENT
       ENDOF
       destination-occupied OF STAGE-CLEANUP-DESTINATION-OCCUPIED ENDOF
    ;MATCH ;
 
 \ Removes target's guard for c when it holds c; other bytes are kept.
-: REMOVE-GUARD-IF-VERIFIED ( fd ^u8 n DROPBOX:hash ^ARENA:arena -- )
-   {: dir:fd t:^ tu:n c:DROPBOX:hash ar:^ARENA:arena :}
-   t tu c ar GUARD-NAME {: g:^ gu:n :}
-   dir g gu t tu s" verify stale install guard" ar HASH-AT-IF-PRESENT
+: REMOVE-GUARD-IF-VERIFIED ( fd str DROPBOX:hash ^ARENA:arena -- )
+   {: dir:fd t:str c:DROPBOX:hash ar:^ARENA:arena :}
+   t c ar GUARD-NAME {: g:str :}
+   dir g t s" verify stale install guard" ar HASH-AT-IF-PRESENT
    MATCH option
       none OF ENDOF
       some OF c SAME-CONTENT? 0= if
-            s" clean completed replacement" t tu OCCUPIED
+            s" clean completed replacement" t OCCUPIED
          then
-         dir g gu s" remove stale install guard" t tu REMOVE-AT
+         dir g s" remove stale install guard" t REMOVE-AT
       ENDOF
    ;MATCH ;
 
 \ The guard at path gp holds held: prepared when that is c.
 : EXISTING-GUARD
-   ( option<DROPBOX:hash> DROPBOX:hash ^u8 n -- replacement-preparation )
-   {: held:option<DROPBOX:hash> c:DROPBOX:hash gp:^ gpu:n :}
+   ( option<DROPBOX:hash> DROPBOX:hash str -- replacement-preparation )
+   {: held:option<DROPBOX:hash> c:DROPBOX:hash gp:str :}
    held c HOLDS? 0= if
-      s" prepare download replacement" gp gpu OCCUPIED
+      s" prepare download replacement" gp OCCUPIED
    then
    ALREADY-PREPARED ;
 
 \ The target is at its guard g, at path gp, now: prepared when the guard
 \ holds c, else the guard goes back or is kept as a local conflict.
 : VERIFY-DISPLACED
-   ( fd ^u8 n ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+   ( fd str str str str DROPBOX:hash ^ARENA:arena
      -- replacement-preparation )
-   {: dir:fd g:^ gu:n gp:^ gpu:n tn:^ tnu:n t:^ tu:n c:DROPBOX:hash
+   {: dir:fd g:str gp:str tn:str t:str c:DROPBOX:hash
       ar:^ARENA:arena :}
-   dir t tu s" sync replacement displacement guard" SYNC-DIRECTORY
-   dir g gu gp gpu s" verify displaced replacement file" ar
+   dir t s" sync replacement displacement guard" SYNC-DIRECTORY
+   dir g gp s" verify displaced replacement file" ar
    HASH-AT-IF-PRESENT {: held:option<DROPBOX:hash> :}
    held c HOLDS? if PREPARED exit then
-   dir g gu tn tnu t tu held ar RESTORE-OR-PRESERVE-CHANGED-GUARD
+   dir g tn t held ar RESTORE-OR-PRESERVE-CHANGED-GUARD
    held PREPARE-CHANGED ;
 
 \ Renames the target to its guard g, at path gp, never over an entry.
 : MOVE-TO-GUARD
-   ( fd ^u8 n ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+   ( fd str str str str DROPBOX:hash ^ARENA:arena
      -- replacement-preparation )
-   {: dir:fd g:^ gu:n gp:^ gpu:n tn:^ tnu:n t:^ tu:n c:DROPBOX:hash
+   {: dir:fd g:str gp:str tn:str t:str c:DROPBOX:hash
       ar:^ARENA:arena :}
-   dir tn tnu dir g gu FS:TRY-RENAME-NEW-AT if
-      dir g gu gp gpu tn tnu t tu c ar VERIFY-DISPLACED exit
+   dir tn dir g FS:TRY-RENAME-NEW-AT if
+      dir g gp tn t c ar VERIFY-DISPLACED exit
    then
    FS:ERRNO {: e:n :}
    e FS:ENOENT = if ABSENT PREPARE-CHANGED exit then
    e FS:EEXIST <> if
-      dir tn tnu s" move replaced file to displacement guard" t tu
+      dir tn s" move replaced file to displacement guard" t
       IO-FAILURE-AT
    then
-   dir g gu gp gpu s" verify raced replacement displacement" ar
-   HASH-AT-IF-PRESENT c gp gpu EXISTING-GUARD ;
+   dir g gp s" verify raced replacement displacement" ar
+   HASH-AT-IF-PRESENT c gp EXISTING-GUARD ;
 
 \ Moves the target at the name in dir, whose path is dp, to its guard
 \ when it holds c; a guard already there holding c was moved before.
 : PREPARE-REPLACEMENT-AT
-   ( fd ^u8 n ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena
+   ( fd str str str DROPBOX:hash ^ARENA:arena
      -- replacement-preparation )
-   {: dir:fd dp:^ du:n tn:^ tnu:n t:^ tu:n c:DROPBOX:hash
+   {: dir:fd dp:str tn:str t:str c:DROPBOX:hash
       ar:^ARENA:arena :}
-   t tu c ar GUARD-NAME {: g:^ gu:n :}
-   dp du g gu ar JOIN {: gp:^ gpu:n :}
-   dir tn tnu t tu s" check replacement preparation precondition" ar
+   t c ar GUARD-NAME {: g:str :}
+   dp g ar JOIN {: gp:str :}
+   dir tn t s" check replacement preparation precondition" ar
    HASH-AT-IF-PRESENT {: current:option<DROPBOX:hash> :}
-   dir g gu gp gpu s" inspect replacement displacement guard" ar
+   dir g gp s" inspect replacement displacement guard" ar
    HASH-AT-IF-PRESENT {: held:option<DROPBOX:hash> :}
-   held PRESENT? if held c gp gpu EXISTING-GUARD exit then
+   held PRESENT? if held c gp EXISTING-GUARD exit then
    current c HOLDS? 0= if current PREPARE-CHANGED exit then
-   dir g gu gp gpu tn tnu t tu c ar MOVE-TO-GUARD ;
+   dir g gp tn t c ar MOVE-TO-GUARD ;
 
 \ ---- an install's steps
 
@@ -4198,26 +4213,26 @@ STRUCTURE install
    INSTALL-UNMAKE {: dir dp sn sp tn t want ar :} want ;
 
 \ The content at x's target now; o names the operation.
-: TARGET-HASH ( install ^u8 n -- option<DROPBOX:hash> )
-   {: x:install o:^ ou:n :}
+: TARGET-HASH ( install str -- option<DROPBOX:hash> )
+   {: x:install o:str :}
    x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
-   dir tn str> t str> o ou ar HASH-AT-IF-PRESENT ;
+   dir tn t o ar HASH-AT-IF-PRESENT ;
 
 \ Syncs x's parent; o names the operation.
-: SYNC-PARENT ( install ^u8 n -- )
-   {: x:install o:^ ou:n :}
+: SYNC-PARENT ( install str -- )
+   {: x:install o:str :}
    x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
-   dir t str> o ou SYNC-DIRECTORY ;
+   dir t o SYNC-DIRECTORY ;
 
 \ Removes the name in x's parent; o names the operation.
-: REMOVE-IN-PARENT ( install ^u8 n ^u8 n -- )
-   {: x:install g:^ gu:n o:^ ou:n :}
+: REMOVE-IN-PARENT ( install str str -- )
+   {: x:install g:str o:str :}
    x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
-   dir g gu o ou t str> REMOVE-AT ;
+   dir g o t REMOVE-AT ;
 
 : INSPECT-INSTALL-STAGE ( install -- download-stage )
    INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
-   dir sn str> sp str> t str> want ar INSPECT-DOWNLOAD-STAGE ;
+   dir sn sp t want ar INSPECT-DOWNLOAD-STAGE ;
 
 \ Runs q on x's verified stage, closing it after; with none, or other
 \ bytes at the stage's name, the install answers that.
@@ -4238,8 +4253,8 @@ STRUCTURE install
 \ x's target holds its content: syncs it and removes the stage.
 : CLEAN-INSTALLED ( install -- stage-cleanup )
    INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
-   dir tn str> t str> want ar SYNC-INSTALLED-DOWNLOAD
-   dir sn str> want sp str> t str> ar REMOVE-VERIFIED-STAGE ;
+   dir tn t want ar SYNC-INSTALLED-DOWNLOAD
+   dir sn want sp t ar REMOVE-VERIFIED-STAGE ;
 
 \ Runs q once the stage is gone; other bytes at its name answer the
 \ install.
@@ -4254,7 +4269,7 @@ STRUCTURE install
 : REMOVE-INSTALL-GUARD ( install DROPBOX:hash -- )
    {: x:install c:DROPBOX:hash :}
    x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
-   dir t str> c ar REMOVE-GUARD-IF-VERIFIED ;
+   dir t c ar REMOVE-GUARD-IF-VERIFIED ;
 
 : DROP-INSTALLED-GUARD ( install option<DROPBOX:hash> -- )
    {: x:install expected:option<DROPBOX:hash> :}
@@ -4291,15 +4306,15 @@ STRUCTURE install
    ( install verified-download-stage -- install-outcome )
    {: x:install s:verified-download-stage :}
    x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
-   s sp str> VERIFY-DOWNLOAD-STAGE-BEFORE-RENAME
-   dir sn str> dir tn str> FS:TRY-RENAME-NEW-AT if
-      s dir tn str> t str> want ar SYNC-RENAMED-DOWNLOAD
+   s sp VERIFY-DOWNLOAD-STAGE-BEFORE-RENAME
+   dir sn dir tn FS:TRY-RENAME-NEW-AT if
+      s dir tn t want ar SYNC-RENAMED-DOWNLOAD
       INSTALLED exit
    then
    FS:ERRNO {: e:n :}
    e FS:ENOENT = if DOWNLOAD-REQUIRED exit then
    e FS:EEXIST <> if
-      dir sn str> s" install download into absent path" t str>
+      dir sn s" install download into absent path" t
       IO-FAILURE-AT
    then
    x RACED-INITIAL-INSTALL ;
@@ -4332,9 +4347,9 @@ STRUCTURE install
 
 \ The guard g is removed after the rename found an entry at the target.
 : SETTLE-RACED
-   ( install ^u8 n option<DROPBOX:hash> -- install-outcome )
-   {: x:install g:^ gu:n actual:option<DROPBOX:hash> :}
-   x g gu s" remove recovered displacement guard" REMOVE-IN-PARENT
+   ( install str option<DROPBOX:hash> -- install-outcome )
+   {: x:install g:str actual:option<DROPBOX:hash> :}
+   x g s" remove recovered displacement guard" REMOVE-IN-PARENT
    actual x DESIRED HOLDS? if
       x s" sync raced replacement cleanup" SYNC-PARENT
       ALREADY-INSTALLED exit
@@ -4342,20 +4357,20 @@ STRUCTURE install
    x s" sync raced replacement" SYNC-PARENT
    actual INSTALL-CHANGED ;
 
-: RACED-REPLACEMENT ( install ^u8 n -- install-outcome )
-   {: x:install g:^ gu:n :}
+: RACED-REPLACEMENT ( install str -- install-outcome )
+   {: x:install g:str :}
    x s" inspect raced install destination" TARGET-HASH
    {: actual:option<DROPBOX:hash> :}
-   actual x DESIRED HOLDS? 0= if x g gu actual SETTLE-RACED exit then
-   x CLEAN-INSTALLED [: x g gu actual SETTLE-RACED ;] CLEANED ;
+   actual x DESIRED HOLDS? 0= if x g actual SETTLE-RACED exit then
+   x CLEAN-INSTALLED [: x g actual SETTLE-RACED ;] CLEANED ;
 
 \ The stage renamed to the target; the guard g it displaced is removed.
 : REPLACED
-   ( verified-download-stage install ^u8 n -- install-outcome )
-   {: s:verified-download-stage x:install g:^ gu:n :}
+   ( verified-download-stage install str -- install-outcome )
+   {: s:verified-download-stage x:install g:str :}
    x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
-   s dir tn str> t str> want ar SYNC-RENAMED-DOWNLOAD
-   x g gu s" remove displaced install guard" REMOVE-IN-PARENT
+   s dir tn t want ar SYNC-RENAMED-DOWNLOAD
+   x g s" remove displaced install guard" REMOVE-IN-PARENT
    x s" sync completed replacement" SYNC-PARENT
    INSTALLED ;
 
@@ -4364,16 +4379,16 @@ STRUCTURE install
    ( verified-download-stage install DROPBOX:hash -- install-outcome )
    {: s:verified-download-stage x:install c:DROPBOX:hash :}
    x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
-   t str> c ar GUARD-NAME {: g:^ gu:n :}
-   s sp str> VERIFY-DOWNLOAD-STAGE-BEFORE-RENAME
-   dir sn str> dir tn str> FS:TRY-RENAME-NEW-AT if
-      s x g gu REPLACED exit
+   t c ar GUARD-NAME {: g:str :}
+   s sp VERIFY-DOWNLOAD-STAGE-BEFORE-RENAME
+   dir sn dir tn FS:TRY-RENAME-NEW-AT if
+      s x g REPLACED exit
    then
    FS:ERRNO FS:EEXIST <> if
-      dir sn str> s" install verified replacement" t str>
+      dir sn s" install verified replacement" t
       IO-FAILURE-AT
    then
-   x g gu RACED-REPLACEMENT ;
+   x g RACED-REPLACEMENT ;
 
 \ The target is at its guard for c, unless an entry raced in after.
 : RESUME-REPLACEMENT
@@ -4387,7 +4402,7 @@ STRUCTURE install
 : PREPARE-INSTALL ( install DROPBOX:hash -- replacement-preparation )
    {: x:install c:DROPBOX:hash :}
    x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
-   dir dp str> tn str> t str> c ar PREPARE-REPLACEMENT-AT ;
+   dir dp tn t c ar PREPARE-REPLACEMENT-AT ;
 
 : REPLACE-WITH-STAGE
    ( install verified-download-stage DROPBOX:hash -- install-outcome )
@@ -4417,13 +4432,13 @@ STRUCTURE install
 \ The install of t's content want in the parent f, opened at rel below
 \ the root at r.
 : INSTALL-OF
-   ( fd str str ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- install )
-   {: f:fd tn:str rel:str r:^ ru:n t:^ tu:n want:DROPBOX:hash
+   ( fd str str str str DROPBOX:hash ^ARENA:arena -- install )
+   {: f:fd tn:str rel:str r:str t:str want:DROPBOX:hash
       ar:^ARENA:arena :}
-   r ru rel str> ar JOIN {: dp:^ du:n :}
-   s" download" t tu want ar INTERNAL-NAME {: sn:^ snu:n :}
-   dp du sn snu ar JOIN {: sp:^ spu:n :}
-   f dp du >str sn snu >str sp spu >str tn t tu >str want ar
+   r rel ar JOIN {: dp:str :}
+   s" download" t want ar INTERNAL-NAME {: sn:str :}
+   dp sn ar JOIN {: sp:str :}
+   f dp sn sp tn t want ar
    INSTALL-MAKE ;
 
 public
@@ -4434,15 +4449,15 @@ public
 \ With expected none, E-UNSUPPORTED or E-UNREADABLE is about t's own
 \ name; a replacement's guard or local conflict name can throw them too.
 : INSTALL-DOWNLOAD-AT
-   ( fd ^u8 n ^u8 n DROPBOX:hash option<DROPBOX:hash> ^ARENA:arena
+   ( fd str str DROPBOX:hash option<DROPBOX:hash> ^ARENA:arena
      -- install-outcome )
-   {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash
+   {: root:fd r:str t:str want:DROPBOX:hash
       expected:option<DROPBOX:hash> ar:^ARENA:arena :}
    want s" install download" REQUIRE-CONTENT-HASH
-   root t tu false OPEN-PARENT MATCH option
+   root t false OPEN-PARENT MATCH option
       none OF DOWNLOAD-REQUIRED ENDOF
       some OF PARENT-DIR-UNMAKE {: f:fd name:str rel:str :}
-         [: f name rel r ru t tu want ar INSTALL-OF
+         [: f name rel r t want ar INSTALL-OF
             expected INSTALL-IN-PARENT ;]
          [: f DISCARD ;] finally
       ENDOF
@@ -4481,34 +4496,34 @@ STRUCTURE deletion
 
 \ The content of the guard, none when it is absent; o names the read.
 : GUARD-CONTENT
-   ( deletion ^u8 n ^ARENA:arena -- option<DROPBOX:hash> )
-   {: x:deletion o:^ ou:n ar:^ARENA:arena :}
+   ( deletion str ^ARENA:arena -- option<DROPBOX:hash> )
+   {: x:deletion o:str ar:^ARENA:arena :}
    x DELETION-UNMAKE {: dir:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
-   dir g str> gp str> o ou ar HASH-AT-IF-PRESENT ;
+   dir g gp o ar HASH-AT-IF-PRESENT ;
 
 \ Whether a guard holding the expected content is there; other bytes are
 \ kept and stop the operation oc names. i names the read.
-: GUARD-HELD? ( deletion ^u8 n ^u8 n ^ARENA:arena -- bool )
-   {: x:deletion i:^ iu:n oc:^ ocu:n ar:^ARENA:arena :}
-   x i iu ar GUARD-CONTENT MATCH option
+: GUARD-HELD? ( deletion str str ^ARENA:arena -- bool )
+   {: x:deletion i:str oc:str ar:^ARENA:arena :}
+   x i ar GUARD-CONTENT MATCH option
       none OF false ENDOF
       some OF x DELETION-WANT SAME-CONTENT? 0= if
             x DELETION-UNMAKE
             {: d:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
-            oc ocu gp str> OCCUPIED
+            oc gp OCCUPIED
          then true
       ENDOF
    ;MATCH ;
 
 \ Removes the guard, then syncs its directory; o names the removal, sy
 \ the sync.
-: REMOVE-GUARD ( deletion ^u8 n ^u8 n -- )
-   {: x:deletion o:^ ou:n sy:^ syu:n :}
+: REMOVE-GUARD ( deletion str str -- )
+   {: x:deletion o:str sy:str :}
    x DELETION-UNMAKE {: dir:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
-   dir g str> FS:TRY-REMOVE-FILE-AT 0= if
-      dir g str> o ou t str> IO-FAILURE-AT
+   dir g FS:TRY-REMOVE-FILE-AT 0= if
+      dir g o t IO-FAILURE-AT
    then
-   dir t str> sy syu SYNC-DIRECTORY ;
+   dir t sy SYNC-DIRECTORY ;
 
 \ The guard holds other content than expected: it goes back to the target,
 \ or is kept beside an entry raced in there.
@@ -4516,7 +4531,7 @@ STRUCTURE deletion
    ( deletion option<DROPBOX:hash> ^ARENA:arena -- delete-outcome )
    {: x:deletion c:option<DROPBOX:hash> ar:^ARENA:arena :}
    x DELETION-UNMAKE {: dir:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
-   dir g str> n str> t str> c ar RESTORE-OR-PRESERVE-CHANGED-GUARD
+   dir g n t c ar RESTORE-OR-PRESERVE-CHANGED-GUARD
    c LOCAL-DELETE--OUTCOME:PRECONDITION-CHANGED ;
 
 \ The target is absent: a guard holding the expected content finishes an
@@ -4550,11 +4565,11 @@ STRUCTURE deletion
 : DISPLACE ( deletion -- bool )
    {: x:deletion :}
    x DELETION-UNMAKE {: dir:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
-   dir n str> dir g str> FS:TRY-RENAME-NEW-AT if
-      dir t str> s" sync deletion displacement" SYNC-DIRECTORY true exit
+   dir n dir g FS:TRY-RENAME-NEW-AT if
+      dir t s" sync deletion displacement" SYNC-DIRECTORY true exit
    then
    FS:ERRNO FS:ENOENT = if false exit then
-   dir n str> s" move deleted file to displacement guard" t str>
+   dir n s" move deleted file to displacement guard" t
    IO-FAILURE-AT ;
 
 \ The target holds the expected content: it moves aside to the guard and
@@ -4576,7 +4591,7 @@ STRUCTURE deletion
 : DELETE-IN ( deletion ^ARENA:arena -- delete-outcome )
    {: x:deletion ar:^ARENA:arena :}
    x DELETION-UNMAKE {: dir:fd n:str t:str g:str gp:str want:DROPBOX:hash :}
-   dir n str> t str> s" check delete precondition" ar HASH-AT-IF-PRESENT
+   dir n t s" check delete precondition" ar HASH-AT-IF-PRESENT
    {: c:option<DROPBOX:hash> :}
    c MATCH option
       none OF x ar FINISH-INTERRUPTED ENDOF
@@ -4589,21 +4604,21 @@ STRUCTURE deletion
 \ The deletion of t in the parent f, opened at rel below the root at r,
 \ its guard named in the arena.
 : DELETION-OF
-   ( fd str str ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- deletion )
-   {: f:fd tn:str rel:str r:^ ru:n t:^ tu:n want:DROPBOX:hash
+   ( fd str str str str DROPBOX:hash ^ARENA:arena -- deletion )
+   {: f:fd tn:str rel:str r:str t:str want:DROPBOX:hash
       ar:^ARENA:arena :}
-   s" deleted" t tu want ar INTERNAL-NAME {: g:^ gu:n :}
-   r ru rel str> ar JOIN g gu ar JOIN {: gp:^ gpu:n :}
-   f tn t tu >str g gu >str gp gpu >str want DELETION-MAKE ;
+   s" deleted" t want ar INTERNAL-NAME {: g:str :}
+   r rel ar JOIN g ar JOIN {: gp:str :}
+   f tn t g gp want DELETION-MAKE ;
 
 \ The delete in the open parent, which closes after it; r is the root's
 \ path, which failures name.
 : DELETE-BELOW
-   ( parent-dir ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- delete-outcome )
-   {: pd:parent-dir r:^ ru:n t:^ tu:n want:DROPBOX:hash
+   ( parent-dir str str DROPBOX:hash ^ARENA:arena -- delete-outcome )
+   {: pd:parent-dir r:str t:str want:DROPBOX:hash
       ar:^ARENA:arena :}
    pd PARENT-DIR-UNMAKE {: dir:fd name:str path:str :}
-   [: dir name path r ru t tu want ar DELETION-OF ar DELETE-IN ;]
+   [: dir name path r t want ar DELETION-OF ar DELETE-IN ;]
    [: dir DISCARD ;] finally ;
 
 public
@@ -4612,12 +4627,12 @@ public
 \ r, while it holds want. It moves aside under a guard name first, and a
 \ guard left by an interrupted attempt is finished or put back.
 : DELETE-LOCAL-AT
-   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- delete-outcome )
-   {: root:fd r:^ ru:n t:^ tu:n want:DROPBOX:hash ar:^ARENA:arena :}
+   ( fd str str DROPBOX:hash ^ARENA:arena -- delete-outcome )
+   {: root:fd r:str t:str want:DROPBOX:hash ar:^ARENA:arena :}
    want s" delete local file" REQUIRE-CONTENT-HASH
-   root t tu false OPEN-PARENT MATCH option
+   root t false OPEN-PARENT MATCH option
       none OF LOCAL-DELETE--OUTCOME:ALREADY-DELETED ENDOF
-      some OF r ru t tu want ar DELETE-BELOW ENDOF
+      some OF r t want ar DELETE-BELOW ENDOF
    ;MATCH ;
 
 \ ---- directories
@@ -4638,51 +4653,51 @@ private
 
 \ A directory open at the name in dir is synced with its entry; a missing
 \ name, a non-directory or a symlink there is a fresh observation.
-: EXISTING-DIRECTORY ( fd ^u8 n ^u8 n -- create-directory-outcome )
-   {: dir:fd name:^ nu:n p:^ u:n :}
-   dir name nu FS:TRY-OPEN-DIR-AT MATCH option
+: EXISTING-DIRECTORY ( fd str str -- create-directory-outcome )
+   {: dir:fd name:str p:str :}
+   dir name FS:TRY-OPEN-DIR-AT MATCH option
       none OF FS:ERRNO {: e:n :}
          e FS:ENOENT = e FS:ENOTDIR = or e FS:ELOOP = or 0= if
-            dir name nu s" inspect occupied local directory path"
-            p u IO-FAILURE-AT
+            dir name s" inspect occupied local directory path"
+            p IO-FAILURE-AT
          then LOCAL-CREATE--DIRECTORY--OUTCOME:FRESH-OBSERVATION
       ENDOF
       some OF {: d:fd :}
-         [: d p u s" sync existing local directory" SYNC-DIRECTORY ;]
+         [: d p s" sync existing local directory" SYNC-DIRECTORY ;]
          [: d DISCARD ;] finally
-         dir p u s" sync existing local directory entry" SYNC-DIRECTORY
+         dir p s" sync existing local directory entry" SYNC-DIRECTORY
          LOCAL-CREATE--DIRECTORY--OUTCOME:ALREADY-PRESENT
       ENDOF
    ;MATCH ;
 
 \ Opens the directory just made at the name in dir and syncs it.
-: SYNC-MADE-DIRECTORY ( fd ^u8 n ^u8 n -- )
-   {: dir:fd name:^ nu:n p:^ u:n :}
-   dir name nu p u OPEN-DIRECTORY-AT {: d:fd :}
-   [: d p u s" sync created local directory" SYNC-DIRECTORY ;]
+: SYNC-MADE-DIRECTORY ( fd str str -- )
+   {: dir:fd name:str p:str :}
+   dir name p OPEN-DIRECTORY-AT {: d:fd :}
+   [: d p s" sync created local directory" SYNC-DIRECTORY ;]
    [: d DISCARD ;] finally ;
 
-: MAKE-DIRECTORY-IN ( fd ^u8 n ^u8 n -- create-directory-outcome )
-   {: dir:fd name:^ nu:n p:^ u:n :}
-   dir name nu FS:MODE-PRIVATE-DIR FS:TRY-MAKE-DIR-AT if
-      dir p u s" sync created local directory entry" SYNC-DIRECTORY
-      dir name nu p u SYNC-MADE-DIRECTORY
+: MAKE-DIRECTORY-IN ( fd str str -- create-directory-outcome )
+   {: dir:fd name:str p:str :}
+   dir name FS:MODE-PRIVATE-DIR FS:TRY-MAKE-DIR-AT if
+      dir p s" sync created local directory entry" SYNC-DIRECTORY
+      dir name p SYNC-MADE-DIRECTORY
       LOCAL-CREATE--DIRECTORY--OUTCOME:CREATED exit
    then
    FS:ERRNO FS:EEXIST <> if
-      dir name nu s" create local directory" p u IO-FAILURE-AT
+      dir name s" create local directory" p IO-FAILURE-AT
    then
-   dir name nu p u EXISTING-DIRECTORY ;
+   dir name p EXISTING-DIRECTORY ;
 
 \ Whether a failed rmdir found an entry that is not an empty directory.
 : OCCUPIED-DIRECTORY? ( n -- bool )
    {: e:n :}
    e FS:ENOTEMPTY = e FS:EEXIST = or e FS:ENOTDIR = or e FS:EISDIR = or ;
 
-: REMOVE-DIRECTORY-IN ( fd ^u8 n ^u8 n -- delete-directory-outcome )
-   {: dir:fd name:^ nu:n p:^ u:n :}
-   dir name nu FS:TRY-REMOVE-DIR-AT if
-      dir p u s" sync deleted local directory" SYNC-DIRECTORY
+: REMOVE-DIRECTORY-IN ( fd str str -- delete-directory-outcome )
+   {: dir:fd name:str p:str :}
+   dir name FS:TRY-REMOVE-DIR-AT if
+      dir p s" sync deleted local directory" SYNC-DIRECTORY
       LOCAL-DELETE--DIRECTORY--OUTCOME:DELETED exit
    then
    FS:ERRNO {: e:n :}
@@ -4690,29 +4705,29 @@ private
    e OCCUPIED-DIRECTORY? if
       LOCAL-DELETE--DIRECTORY--OUTCOME:FRESH-OBSERVATION exit
    then
-   dir name nu s" delete empty local directory" p u IO-FAILURE-AT ;
+   dir name s" delete empty local directory" p IO-FAILURE-AT ;
 
 public
 
 \ Makes the directory at p below the root, its missing parents as well;
 \ it never follows a link or replaces an entry.
-: CREATE-DIRECTORY-AT ( fd ^u8 n -- create-directory-outcome )
-   {: root:fd p:^ u:n :}
-   root p u true OPEN-PARENT MATCH option
-      none OF p u UNSAFE ENDOF
+: CREATE-DIRECTORY-AT ( fd str -- create-directory-outcome )
+   {: root:fd p:str :}
+   root p true OPEN-PARENT MATCH option
+      none OF p UNSAFE ENDOF
       some OF PARENT-DIR-UNMAKE {: dir:fd name:str path:str :}
-         [: dir name str> p u MAKE-DIRECTORY-IN ;] [: dir DISCARD ;]
+         [: dir name p MAKE-DIRECTORY-IN ;] [: dir DISCARD ;]
          finally
       ENDOF
    ;MATCH ;
 
 \ Removes the directory at p below the root only while it is empty.
-: DELETE-DIRECTORY-AT ( fd ^u8 n -- delete-directory-outcome )
-   {: root:fd p:^ u:n :}
-   root p u false OPEN-PARENT MATCH option
+: DELETE-DIRECTORY-AT ( fd str -- delete-directory-outcome )
+   {: root:fd p:str :}
+   root p false OPEN-PARENT MATCH option
       none OF LOCAL-DELETE--DIRECTORY--OUTCOME:ALREADY-ABSENT ENDOF
       some OF PARENT-DIR-UNMAKE {: dir:fd name:str path:str :}
-         [: dir name str> p u REMOVE-DIRECTORY-IN ;] [: dir DISCARD ;]
+         [: dir name p REMOVE-DIRECTORY-IN ;] [: dir DISCARD ;]
          finally
       ENDOF
    ;MATCH ;
@@ -4730,49 +4745,49 @@ ENUM conflict-outcome
 
 \ The path, relative to the root, of p's conflict copy for side holding c.
 : CONFLICT-RELATIVE-PATH
-   ( ^u8 n conflict-side DROPBOX:hash ^ARENA:arena -- ^u8 n )
-   {: p:^ u:n side:conflict-side c:DROPBOX:hash ar:^ARENA:arena :}
-   p u PARENT-PATH p u side c ar CONFLICT-NAME ar JOIN ;
+   ( str conflict-side DROPBOX:hash ^ARENA:arena -- str )
+   {: p:str side:conflict-side c:DROPBOX:hash ar:^ARENA:arena :}
+   p PARENT-PATH p side c ar CONFLICT-NAME ar JOIN ;
 
 private
 
 \ The stage written at the conflict's path rel; another file there is
 \ kept.
-: CONFLICT-RESULT ( stage-write ^u8 n -- conflict-outcome )
-   {: w:stage-write rel:^ relu:n :}
+: CONFLICT-RESULT ( stage-write str -- conflict-outcome )
+   {: w:stage-write rel:str :}
    w MATCH stage-write
-      created OF rel relu >str LOCAL-CONFLICT--OUTCOME:CREATED ENDOF
-      reused OF rel relu >str LOCAL-CONFLICT--OUTCOME:ALREADY-PRESENT
+      created OF rel LOCAL-CONFLICT--OUTCOME:CREATED ENDOF
+      reused OF rel LOCAL-CONFLICT--OUTCOME:ALREADY-PRESENT
       ENDOF
       mismatch OF LOCAL-CONFLICT--OUTCOME:CONTENT-CHANGED ENDOF
       destination-occupied OF {: q:str :}
-         s" materialize conflict" q str> OCCUPIED
+         s" materialize conflict" q OCCUPIED
       ENDOF
    ;MATCH ;
 
 \ The conflict copy written in p's parent dir, its names laid in the
 \ arena; r is the root's path.
 : CONFLICT-IN
-   ( fd ^u8 n ^u8 n conflict-side DROPBOX:hash [ ^u8 n -- n ]
+   ( fd str str conflict-side DROPBOX:hash [ ^u8 n -- n ]
      ^ARENA:arena -- conflict-outcome )
-   {: dir:fd r:^ ru:n p:^ u:n side:conflict-side want:DROPBOX:hash read
+   {: dir:fd r:str p:str side:conflict-side want:DROPBOX:hash read
       ar:^ARENA:arena :}
-   p u side want ar CONFLICT-NAME {: cn:^ cnu:n :}
-   p u side want ar CONFLICT-RELATIVE-PATH {: rel:^ relu:n :}
-   r ru rel relu ar JOIN {: shown:^ shownu:n :}
+   p side want ar CONFLICT-NAME {: cn:str :}
+   p side want ar CONFLICT-RELATIVE-PATH {: rel:str :}
+   r rel ar JOIN {: shown:str :}
    STAGE-WRITE-CREATED [: DROP-STAGE-WRITE
-      dir cn cnu shown shownu want read NO-MARKER
+      dir cn shown want read NO-MARKER
       s" materialize conflict" ar WRITE-VERIFIED-STAGE ;] LOCAL-ERRORS
-   rel relu CONFLICT-RESULT ;
+   rel CONFLICT-RESULT ;
 
 \ The conflict copy written in the open parent, which closes after it.
 : CONFLICT-BELOW
-   ( parent-dir ^u8 n ^u8 n conflict-side DROPBOX:hash [ ^u8 n -- n ]
+   ( parent-dir str str conflict-side DROPBOX:hash [ ^u8 n -- n ]
      ^ARENA:arena -- conflict-outcome )
-   {: pd:parent-dir r:^ ru:n p:^ u:n side:conflict-side
+   {: pd:parent-dir r:str p:str side:conflict-side
       want:DROPBOX:hash read ar:^ARENA:arena :}
    pd PARENT-DIR-UNMAKE {: dir:fd name:str path:str :}
-   [: dir r ru p u side want read ar CONFLICT-IN ;]
+   [: dir r p side want read ar CONFLICT-IN ;]
    [: dir DISCARD ;] finally ;
 
 public
@@ -4781,34 +4796,34 @@ public
 \ path is r, when they hash to want; it never overwrites a file. A failed
 \ read throws E-IO.
 : MATERIALIZE-CONFLICT-AT
-   ( fd ^u8 n ^u8 n conflict-side DROPBOX:hash [ ^u8 n -- n ]
+   ( fd str str conflict-side DROPBOX:hash [ ^u8 n -- n ]
      ^ARENA:arena -- conflict-outcome )
-   {: root:fd r:^ ru:n p:^ u:n side:conflict-side want:DROPBOX:hash
+   {: root:fd r:str p:str side:conflict-side want:DROPBOX:hash
       read ar:^ARENA:arena :}
    want s" materialize conflict" REQUIRE-CONTENT-HASH
-   root p u true OPEN-PARENT MATCH option
-      none OF p u UNSAFE ENDOF
-      some OF r ru p u side want read ar CONFLICT-BELOW ENDOF
+   root p true OPEN-PARENT MATCH option
+      none OF p UNSAFE ENDOF
+      some OF r p side want read ar CONFLICT-BELOW ENDOF
    ;MATCH ;
 
 \ ---- recovery copies
 
 \ The name of a private recovery copy of p holding c, laid in the arena.
-: RECOVERY-FILE-NAME ( ^u8 n DROPBOX:hash ^ARENA:arena -- ^u8 n )
-   {: p:^ u:n c:DROPBOX:hash ar:^ARENA:arena :}
-   s" recovery" p u c ar INTERNAL-NAME ;
+: RECOVERY-FILE-NAME ( str DROPBOX:hash ^ARENA:arena -- str )
+   {: p:str c:DROPBOX:hash ar:^ARENA:arena :}
+   s" recovery" p c ar INTERNAL-NAME ;
 
 \ Whether the copy at the name in dir, whose path is p, is there; one
 \ there holds want and is synced, else it is corrupt.
 : VERIFY-PRIVATE-COPY
-   ( fd ^u8 n ^u8 n DROPBOX:hash ^ARENA:arena -- bool )
-   {: dir:fd p:^ u:n name:^ nu:n want:DROPBOX:hash ar:^ARENA:arena :}
-   s" verify recovery copy" {: o:^ ou:n :}
-   p u name nu ar JOIN {: at:^ atu:n :}
-   dir name nu at atu o ou ar HASH-AT-IF-PRESENT MATCH option
+   ( fd str str DROPBOX:hash ^ARENA:arena -- bool )
+   {: dir:fd p:str name:str want:DROPBOX:hash ar:^ARENA:arena :}
+   s" verify recovery copy" {: o:str :}
+   p name ar JOIN {: at:str :}
+   dir name at o ar HASH-AT-IF-PRESENT MATCH option
       none OF false ENDOF
-      some OF want SAME-CONTENT? 0= if o ou at atu CORRUPT then
-         dir name nu at atu SYNC-INSTALLED-FILE true
+      some OF want SAME-CONTENT? 0= if o at CORRUPT then
+         dir name at SYNC-INSTALLED-FILE true
       ENDOF
    ;MATCH ;
 
@@ -4822,23 +4837,23 @@ private
 
 \ Whether the safe paths' components from a and from b on are the same,
 \ as Rust compares paths.
-: SAME-COMPONENTS? ( ^u8 n n ^u8 n n -- bool )
-   {: p:^ u:n a:n q:^ v:n b:n :}
-   p u a NEXT-COMPONENT {: pf:n pt:n more:bool :}
-   q v b NEXT-COMPONENT {: qf:n qt:n more2:bool :}
+: SAME-COMPONENTS? ( str n str n -- bool )
+   {: p:str a:n q:str b:n :}
+   p a NEXT-COMPONENT {: pf:n pt:n more:bool :}
+   q b NEXT-COMPONENT {: qf:n qt:n more2:bool :}
    more 0= more2 0= and if true exit then
    more more2 and 0= if false exit then
-   p pf + pt pf - q qf + qt qf - STR= 0= if false exit then
-   p u pt q v qt RECURSE ;
+   p pf pt PART q qf qt PART STR= 0= if false exit then
+   p pt q qt RECURSE ;
 
-: SAME-PARENT? ( ^u8 n ^u8 n -- bool )
-   {: p:^ u:n d:^ du:n :}
-   p u PARENT-PATH 0 d du PARENT-PATH 0 SAME-COMPONENTS? ;
+: SAME-PARENT? ( str str -- bool )
+   {: p:str d:str :}
+   p PARENT-PATH 0 d PARENT-PATH 0 SAME-COMPONENTS? ;
 
-: LAST-NAME ( ^u8 n -- ^u8 n )
-   {: p:^ u:n :}
-   p u SPLIT-LAST {: parent:n from:n to:n :}
-   p from + to from - ;
+: LAST-NAME ( str -- str )
+   {: p:str :}
+   p SPLIT-LAST {: parent:n from:n to:n :}
+   p from to PART ;
 
 \ Whether the failure just seen, ENOENT or the errno other, is a race a
 \ rescan retries.
@@ -4853,109 +4868,109 @@ private
 
 \ The probed source held when it is a file, or with dirs a directory;
 \ else none, the probe closed.
-: KEEP-RENAMEABLE ( fd ^u8 n bool -- option<fd> )
-   {: src:fd p:^ u:n dirs:bool :}
-   src p u s" inspect local rename source type" STAT-CLOSING
+: KEEP-RENAMEABLE ( fd str bool -- option<fd> )
+   {: src:fd p:str dirs:bool :}
+   src p s" inspect local rename source type" STAT-CLOSING
    dirs RENAMEABLE? if src OPTION:SOME exit then
    src DISCARD OPTION:NONE ;
 
 \ The source at the name in dir, held by O_PATH without following a
 \ symlink; none when it is gone or not an entry dirs allows.
-: HELD-SOURCE ( fd ^u8 n ^u8 n bool -- option<fd> )
-   {: dir:fd name:^ nu:n p:^ u:n dirs:bool :}
-   dir name nu FS:TRY-OPEN-ENTRY-AT MATCH option
+: HELD-SOURCE ( fd str str bool -- option<fd> )
+   {: dir:fd name:str p:str dirs:bool :}
+   dir name FS:TRY-OPEN-ENTRY-AT MATCH option
       none OF FS:ELOOP RACED? 0= if
-            s" inspect local rename source" p u IO-FAILURE
+            s" inspect local rename source" p IO-FAILURE
          then OPTION:NONE
       ENDOF
-      some OF p u dirs KEEP-RENAMEABLE ENDOF
+      some OF p dirs KEEP-RENAMEABLE ENDOF
    ;MATCH ;
 
 \ The rename hook, its file failures thrown by IO-FAILURE.
-: BEFORE-RENAME ( [ -- ] ^u8 n -- )
-   {: hook p:^ u:n :}
-   hook [: s" rename local entry" p u IO-FAILURE ;] FS-FAILS ;
+: BEFORE-RENAME ( [ -- ] str -- )
+   {: hook p:str :}
+   hook [: s" rename local entry" p IO-FAILURE ;] FS-FAILS ;
 
 \ Renamed when d's name holds src, the source held open, once dir is
 \ synced.
-: SETTLE-RENAME ( fd fd ^u8 n ^u8 n -- rename-outcome )
-   {: src:fd dir:fd dn:^ dnu:n d:^ du:n :}
-   src dir dn dnu d du NAMED-INODE-MATCHES {: held:bool :}
-   dir d du s" sync local entry rename" SYNC-DIRECTORY
+: SETTLE-RENAME ( fd fd str str -- rename-outcome )
+   {: src:fd dir:fd dn:str d:str :}
+   src dir dn d NAMED-INODE-MATCHES {: held:bool :}
+   dir d s" sync local entry rename" SYNC-DIRECTORY
    held if LOCAL-RENAME--OUTCOME:RENAMED exit then
    LOCAL-RENAME--OUTCOME:RETRY ;
 
 \ Renames the name in dir to d's last name unless an entry is there.
-: RENAME-NEW ( fd fd ^u8 n ^u8 n ^u8 n -- rename-outcome )
-   {: src:fd dir:fd name:^ nu:n p:^ u:n d:^ du:n :}
-   d du LAST-NAME {: dn:^ dnu:n :}
-   dir name nu dir dn dnu FS:TRY-RENAME-NEW-AT if
-      src dir dn dnu d du SETTLE-RENAME exit
+: RENAME-NEW ( fd fd str str str -- rename-outcome )
+   {: src:fd dir:fd name:str p:str d:str :}
+   d LAST-NAME {: dn:str :}
+   dir name dir dn FS:TRY-RENAME-NEW-AT if
+      src dir dn d SETTLE-RENAME exit
    then
    FS:EEXIST RACED? if LOCAL-RENAME--OUTCOME:RETRY exit then
-   dir name nu s" rename local entry" p u IO-FAILURE-AT ;
+   dir name s" rename local entry" p IO-FAILURE-AT ;
 
-: RENAME-IN ( fd ^u8 n ^u8 n ^u8 n bool [ -- ] -- rename-outcome )
-   {: dir:fd name:^ nu:n p:^ u:n d:^ du:n dirs:bool hook :}
-   dir name nu p u dirs HELD-SOURCE MATCH option
+: RENAME-IN ( fd str str str bool [ -- ] -- rename-outcome )
+   {: dir:fd name:str p:str d:str dirs:bool hook :}
+   dir name p dirs HELD-SOURCE MATCH option
       none OF LOCAL-RENAME--OUTCOME:RETRY ENDOF
       some OF {: src:fd :}
-         [: hook p u BEFORE-RENAME
-            src dir name nu p u d du RENAME-NEW ;]
+         [: hook p BEFORE-RENAME
+            src dir name p d RENAME-NEW ;]
          [: src DISCARD ;] finally
       ENDOF
    ;MATCH ;
 
 \ RENAME-IN the open parent, which closes after it.
-: RENAME-BELOW ( parent-dir ^u8 n ^u8 n bool [ -- ] -- rename-outcome )
-   {: pd:parent-dir p:^ u:n d:^ du:n dirs:bool hook :}
+: RENAME-BELOW ( parent-dir str str bool [ -- ] -- rename-outcome )
+   {: pd:parent-dir p:str d:str dirs:bool hook :}
    pd PARENT-DIR-UNMAKE {: dir:fd name:str path:str :}
-   [: dir name str> p u d du dirs hook RENAME-IN ;]
+   [: dir name p d dirs hook RENAME-IN ;]
    [: dir DISCARD ;] finally ;
 
 \ Renames p below the root to its sibling d, never over an entry: a file,
 \ or with dirs a directory. hook runs just before the rename.
 : RENAME-CASE-VARIANT-WITH
-   ( fd ^u8 n ^u8 n bool [ -- ] -- rename-outcome )
-   {: root:fd p:^ u:n d:^ du:n dirs:bool hook :}
-   p u d du SAME-PARENT? 0= if d du UNSAFE then
-   root p u false OPEN-PARENT MATCH option
+   ( fd str str bool [ -- ] -- rename-outcome )
+   {: root:fd p:str d:str dirs:bool hook :}
+   p d SAME-PARENT? 0= if d UNSAFE then
+   root p false OPEN-PARENT MATCH option
       none OF LOCAL-RENAME--OUTCOME:RETRY ENDOF
-      some OF p u d du dirs hook RENAME-BELOW ENDOF
+      some OF p d dirs hook RENAME-BELOW ENDOF
    ;MATCH ;
 
 public
 
 \ Renames a local case variant, a file or a directory, to its sibling d.
-: RENAME-CASE-VARIANT ( fd ^u8 n ^u8 n -- rename-outcome )
+: RENAME-CASE-VARIANT ( fd str str -- rename-outcome )
    true [: ;] RENAME-CASE-VARIANT-WITH ;
 
 \ Renames a regular file to its synchronized copy name d.
-: RENAME-FILE-COPY ( fd ^u8 n ^u8 n -- rename-outcome )
+: RENAME-FILE-COPY ( fd str str -- rename-outcome )
    false [: ;] RENAME-CASE-VARIANT-WITH ;
 
 private
 
-: NAME-MAX ( fd ^u8 n -- n )
-   {: dir:fd p:^ u:n :}
+: NAME-MAX ( fd str -- n )
+   {: dir:fd p:str :}
    0 [: drop dir FS:FD-NAME-MAX ;]
-   [: s" inspect parent filename limit" p u IO-FAILURE ;] FS-FAILS ;
+   [: s" inspect parent filename limit" p IO-FAILURE ;] FS-FAILS ;
 
 \ NAME-MAX of the open parent, which closes after it.
-: NAME-MAX-BELOW ( parent-dir ^u8 n -- n )
-   {: pd:parent-dir p:^ u:n :}
+: NAME-MAX-BELOW ( parent-dir str -- n )
+   {: pd:parent-dir p:str :}
    pd PARENT-DIR-UNMAKE {: dir:fd name:str path:str :}
-   [: dir p u NAME-MAX ;] [: dir DISCARD ;] finally ;
+   [: dir p NAME-MAX ;] [: dir DISCARD ;] finally ;
 
 public
 
 \ The longest name in bytes the filesystem of p's actual parent takes;
 \ none when a directory on the way is missing. A zero limit is E-IO.
-: PARENT-NAME-MAX ( fd ^u8 n -- option<n> )
-   {: root:fd p:^ u:n :}
-   root p u false OPEN-PARENT MATCH option
+: PARENT-NAME-MAX ( fd str -- option<n> )
+   {: root:fd p:str :}
+   root p false OPEN-PARENT MATCH option
       none OF OPTION:NONE ENDOF
-      some OF p u NAME-MAX-BELOW OPTION:SOME ENDOF
+      some OF p NAME-MAX-BELOW OPTION:SOME ENDOF
    ;MATCH ;
 
 ;package

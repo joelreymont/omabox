@@ -27,6 +27,7 @@ require src/lib/arena.f
 require src/lib/log.f
 require src/lib/utf8-scalar.f
 require src/lib/json.f
+require src/lib/vector.f
 require src/lib/secret.f
 require src/lib/process.f
 require src/lib/entropy.f
@@ -72,8 +73,8 @@ private
 8192 constant CAP          \ a record's bytes, exclusive
 1 constant VERSION
 
-: SERVICE ( -- ^u8 n ) s" org.omarchy.omabox" ;
-: ACCOUNT ( -- ^u8 n ) s" dropbox-credentials-v1" ;
+: SERVICE ( -- str ) s" org.omarchy.omabox" ;
+: ACCOUNT ( -- str ) s" dropbox-credentials-v1" ;
 
 
 \ ---- failures ------------------------------------------------------
@@ -89,10 +90,10 @@ private
 \ the whole text is read before any member, so where serde stops at an
 \ earlier data error, or calls an unterminated string end-of-input, this
 \ one says syntax.
-: REFUSED ( ^u8 n -- )
-   {: what:^ wu:n :}
+: REFUSED ( str -- )
+   {: what:str :}
    LOG-OPEN E-JSON ERROR:TEXT$ LOG:TEXT+
-   s" : credential JSON " LOG:TEXT+ what wu LOG:TEXT+
+   s" : credential JSON " LOG:TEXT+ what LOG:TEXT+
    s"  error" LOG:TEXT+ LOG:;LINE
    E-JSON throw ;
 
@@ -102,15 +103,15 @@ private
    s"  " LOG:TEXT+ found LOG:INT+ LOG:;LINE
    E-VERSION throw ;
 
-: STORING ( -- ^u8 n ) s" store Dropbox credential" ;
-: LOADING ( -- ^u8 n ) s" load Dropbox credential" ;
+: STORING ( -- str ) s" store Dropbox credential" ;
+: LOADING ( -- str ) s" load Dropbox credential" ;
 
 \ rust CredentialSpawn, CredentialWait and CredentialStatus: the
 \ operation, then what befell it.
-: OPERATION ( ^u8 n ^u8 n n -- )
-   {: op:^ ou:n what:^ wu:n code:n :}
-   LOG-OPEN s" credential operation `" LOG:TEXT+ op ou LOG:TEXT+
-   s" ` " LOG:TEXT+ what wu LOG:TEXT+ LOG:;LINE
+: OPERATION ( str str n -- )
+   {: op:str what:str code:n :}
+   LOG-OPEN s" credential operation `" LOG:TEXT+ op LOG:TEXT+
+   s" ` " LOG:TEXT+ what LOG:TEXT+ LOG:;LINE
    code throw ;
 
 \ The answers secret-tool's nonzero exit gives: a locked or refused
@@ -124,9 +125,9 @@ private
 
 ARENA WRITERS JSON:writer
 
-: STRING+ ( ^JSON:writer ^u8 n str -- ^JSON:writer )
-   {: k:^ ku:n v:str :}
-   k ku v str> JSON:WRITE-FIELD-S ;
+: STRING+ ( ^JSON:writer str str -- ^JSON:writer )
+   {: k:str v:str :}
+   k v JSON:WRITE-FIELD-S ;
 
 \ serde's field order, StoredSecret's.
 : FIELDS ( JOURNAL:dropbox-binding str ^JSON:writer -- )
@@ -141,23 +142,25 @@ ARENA WRITERS JSON:writer
    s" remote_root" root STRING+
    JSON:WRITE-OBJECT-END drop ;
 
-\ The record in a CAP-byte buffer, which a longer one does not fit; a
-\ string that is not UTF-8 is a record serde could not write.
-: RECORD ( JOURNAL:dropbox-binding str ^ARENA:arena -- ^u8 n )
+\ The record, written into a vector in the arena; one of CAP bytes or
+\ more is too large, and a string that is not UTF-8 is a record serde
+\ could not write.
+: RECORD ( JOURNAL:dropbox-binding str ^ARENA:arena -- str )
    {: b token:str ar :}
    ar WRITERS-NEW {: w :}
-   w ar CAP ARENA:ALLOC JSON:WRITE-OPEN drop
+   ar ARENA:ALLOCATOR 0 [type] u8 VEC:NEW {: v :}
+   v CAP VEC:RESERVE
+   w v JSON:OPEN drop
    [: b token w FIELDS ;] catch {: code:n :}
-   code E-JSON-WRITE-CAPACITY = if E-TOO-LARGE FAIL then
    code E-JSON-WRITE-BYTE = if s" data" REFUSED then
    code 0<> if code throw then
-   w JSON:WRITTEN$ {: r:^ ru:n :}
-   w JSON:WRITE-CLOSE
-   ru CAP >= if E-TOO-LARGE FAIL then
-   r ru ;
+   w JSON:WRITTEN$ {: r:str :}
+   w JSON:CLOSE
+   r STR:len CAP >= if E-TOO-LARGE FAIL then
+   r ;
 
 : WRITE-RECORD ( JOURNAL:dropbox-binding str ^ARENA:arena -- )
-   RECORD {: r:^ ru:n :} SERVICE ACCOUNT r ru SECRET:WRITE ;
+   RECORD {: r:str :} SERVICE ACCOUNT r SECRET:WRITE ;
 
 
 \ ---- the record read -----------------------------------------------
@@ -193,14 +196,14 @@ ARENA CURSORS JSON:cursor
    v 255 > if E-JSON throw then
    v ;
 
-: STRING-AT ( ^u8 n ^u8 n ^JSON:cursor ^ARENA:arena -- str )
-   {: c ar :} c JSON:READ-MEMBER$ c ar READ-STRING ;
+: STRING-AT ( ^u8 n str ^JSON:cursor ^ARENA:arena -- str )
+   {: c ar :} str> c JSON:READ-MEMBER$ c ar READ-STRING ;
 
 \ LoadedSecret: the version, the binding and the refresh token.
 : READ-RECORD
    ( ^u8 n ^JSON:cursor ^ARENA:arena -- n JOURNAL:dropbox-binding str )
    {: t:^ u:n c ar :}
-   t u s" version" c JSON:READ-MEMBER$ c READ-VERSION
+   t u s" version" str> c JSON:READ-MEMBER$ c READ-VERSION
    t u s" account_id" c ar STRING-AT
    t u s" root_namespace_id" c ar STRING-AT
    t u s" remote_root" c ar STRING-AT
@@ -210,7 +213,7 @@ ARENA CURSORS JSON:cursor
 \ The category a refusal is logged with: E-JSON-READ-EOF the text's end,
 \ another reader code its syntax; E-JSON its data, and JSON:E-MEMBER, a
 \ member missing or repeated or a text no object, which serde calls data.
-: CATEGORY ( n -- ^u8 n )
+: CATEGORY ( n -- str )
    {: code:n :}
    code E-JSON = code JSON:E-MEMBER = or if s" data" exit then
    code E-JSON-READ-EOF = if s" end-of-input" exit then
@@ -221,7 +224,7 @@ ARENA CURSORS JSON:cursor
    code E-JSON-READ-LAST >= code E-JSON-READ-FIRST <= and
    code E-JSON = or ;
 
-: NO-STR ( -- str ) s" " >str ;
+: NO-STR ( -- str ) s" " ;
 
 : NO-BINDING ( -- JOURNAL:dropbox-binding )
    NO-STR NO-STR NO-STR JOURNAL-DROPBOX--BINDING:MAKE ;
@@ -231,8 +234,9 @@ ARENA CURSORS JSON:cursor
 
 \ READ-RECORD, replacing the seed it is given, as catch keeps the
 \ stack's shape; a refusal leaves the cursor owning nothing.
-: DECODE ( ^u8 n ^ARENA:arena -- n JOURNAL:dropbox-binding str )
-   {: t:^ u:n ar :}
+: DECODE ( str ^ARENA:arena -- n JOURNAL:dropbox-binding str )
+   {: s:str ar :}
+   s str> {: t:^ u:n :}
    ar CURSORS-NEW {: c :}
    0 NO-BINDING NO-STR [: DROP-SEED t u c ar READ-RECORD ;] catch
    {: code:n :}
@@ -243,23 +247,23 @@ ARENA CURSORS JSON:cursor
 
 \ Rust's checks of the item's value, in Rust's order: its size, its
 \ encoding, its form, then its version.
-: CREDENTIAL ( ^u8 n ^ARENA:arena -- lookup )
-   {: t:^ u:n ar :}
-   u CAP >= if E-TOO-LARGE FAIL then
-   t u UTF8:VALID? 0= if E-UTF8 FAIL then
-   t u ar DECODE {: version:n b token:str :}
+: CREDENTIAL ( str ^ARENA:arena -- lookup )
+   {: t:str ar :}
+   t STR:len CAP >= if E-TOO-LARGE FAIL then
+   t UTF8:VALID? 0= if E-UTF8 FAIL then
+   t ar DECODE {: version:n b token:str :}
    version VERSION <> if version WRONG-VERSION then
    b token construct lookup found ;
 
-\ The item's length in dest, and whether it was found.
-: FETCH ( SPAN:span<u8> -- n bool )
+\ Whether the item was found, appended to dest.
+: FETCH ( ^VEC:vector<u8> -- bool )
    {: dest :}
-   0 false [: drop drop SERVICE ACCOUNT dest SECRET:READ ;] catch
+   false [: drop SERVICE ACCOUNT dest SECRET:READ ;] catch
    {: code:n :}
    code 0= if exit then
-   drop drop
-   code UNAVAILABLE? if 0 false exit then
-   code SECRET:E-CAPACITY = if E-TOO-LARGE FAIL then
+   drop
+   code UNAVAILABLE? if false exit then
+   code E-TOO-LARGE = if E-TOO-LARGE FAIL then
    code throw ;
 
 
@@ -270,39 +274,39 @@ ARENA CURSORS JSON:cursor
 
 TYPED-VARIABLE PROGRAM str     \ the program a call runs; tests set it
 
-: SECRET-TOOL ( -- ) s" /usr/bin/secret-tool" >str PROGRAM ! ;
+: SECRET-TOOL ( -- ) s" /usr/bin/secret-tool" PROGRAM ! ;
 SECRET-TOOL
 
-: LABEL ( -- ^u8 n ) s" --label=Omabox Dropbox credentials" ;
+: LABEL ( -- str ) s" --label=Omabox Dropbox credentials" ;
 
 \ The item's attributes, for the service and the account.
-: ITEM ( PROCESS:request ^u8 n ^u8 n -- PROCESS:request )
-   {: s:^ su:n a:^ au:n :}
-   s" application" PROCESS:ARG s su PROCESS:ARG
-   s" kind" PROCESS:ARG a au PROCESS:ARG ;
+: ITEM ( PROCESS:request str str -- PROCESS:request )
+   {: s:str a:str :}
+   s" application" PROCESS:ARG s PROCESS:ARG
+   s" kind" PROCESS:ARG a PROCESS:ARG ;
 
 \ Whether the child ended other than by exit 0: a nonzero exit or a signal.
 : FAILED? ( PROCESS:status -- bool )
    PROCESS:STATUS>RC RC>N 0<> ;
 
-\ `secret-tool lookup`, its output captured into room of dest's length;
-\ only an exit of 0 copies it into dest, so a miss leaves dest unchanged.
-: LOOKED-UP ( ^u8 n ^u8 n SPAN:span<u8> ^ARENA:arena -- n bool )
-   {: s:^ su:n a:^ au:n dest ar :}
-   ar dest SPAN:$ nip ARENA:ALLOC SPAN:MAKE {: room :}
-   PROGRAM @ str> PROCESS:NEW s" lookup" PROCESS:ARG s su a au ITEM
+\ `secret-tool lookup`, its output captured into room of CAP bytes; only
+\ an exit of 0 appends it to dest, so a miss leaves dest unchanged.
+: LOOKED-UP ( str str ^VEC:vector<u8> ^ARENA:arena -- bool )
+   {: s:str a:str dest ar :}
+   ar CAP ARENA:ALLOC SPAN:MAKE {: room :}
+   PROGRAM @ PROCESS:NEW s" lookup" PROCESS:ARG s a ITEM
    PROCESS-STDIO:NULL room PROCESS-STDIO:PIPE PROCESS-STDIO:NULL
    PROCESS:RUN {: u:len eu:len status :}
    status FAILED? if SECRET:E-UNAVAILABLE throw then
-   room SPAN:$ drop u LEN>N dest SPAN:COPY
-   u LEN>N true ;
+   room SPAN:$ STR:data u LEN>N dest VEC:APPEND
+   true ;
 
 \ `secret-tool store`, the value its stdin.
-: STORED ( ^u8 n ^u8 n ^u8 n -- )
-   {: s:^ su:n a:^ au:n v:^ vu:n :}
-   PROGRAM @ str> PROCESS:NEW s" store" PROCESS:ARG LABEL PROCESS:ARG
-   s su a au ITEM
-   v vu SPAN:MAKE PROCESS-STDIO:PIPE PROCESS-STDIO:NULL PROCESS-STDIO:NULL
+: STORED ( str str str -- )
+   {: s:str a:str v:str :}
+   PROGRAM @ PROCESS:NEW s" store" PROCESS:ARG LABEL PROCESS:ARG
+   s a ITEM
+   v str> SPAN:MAKE PROCESS-STDIO:PIPE PROCESS-STDIO:NULL PROCESS-STDIO:NULL
    PROCESS:RUN {: u:len eu:len status :}
    status FAILED? if SECRET:E-ACCESS throw then ;
 
@@ -318,32 +322,33 @@ SECRET-TOOL
 
 \ A run's failure, logged once as the store's code: an unstarted child
 \ E-CONFIG, a failed wait fail; another code passes up unlogged.
-: CAUGHT ( n ^u8 n n -- )
-   {: code:n op:^ ou:n fail:n :}
+: CAUGHT ( n str n -- )
+   {: code:n op:str fail:n :}
    code E-PROC-SPAWN = if
-      op ou s" could not start" SECRET:E-CONFIG OPERATION
+      op s" could not start" SECRET:E-CONFIG OPERATION
    then
    code E-PROC-WAIT = if
-      op ou s" could not wait for completion" fail OPERATION
+      op s" could not wait for completion" fail OPERATION
    then
    code throw ;
 
 \ SECRET:STORE!'s three words. A lookup's nonzero exit or signal is a
-\ miss, which is no failure: rust CredentialsUnavailable.
-: ITEM-READ ( str str SPAN:span<u8> -- n bool )
+\ miss, which is no failure: rust CredentialsUnavailable. Output that
+\ fills CAP is E-TOO-LARGE, which FETCH logs.
+: ITEM-READ ( str str ^VEC:vector<u8> -- bool )
    {: s:str a:str dest :}
-   0 false [: drop drop s str> a str> dest [: LOOKED-UP ;] ARENA:WITH ;]
+   false [: drop s a dest [: LOOKED-UP ;] ARENA:WITH ;]
    catch {: code:n :}
    code 0= if exit then
-   drop drop
+   drop
    code E-PROC-OUTPUT = if UNREAD then
-   code E-PROC-STDOUT-CAPACITY = if SECRET:E-CAPACITY throw then
+   code E-PROC-STDOUT-CAPACITY = if E-TOO-LARGE throw then
    code LOADING SECRET:E-UNAVAILABLE CAUGHT ;
 
 \ A store's nonzero exit or signal is STORED's E-ACCESS.
 : ITEM-WRITE ( str str str -- )
    {: s:str a:str v:str :}
-   [: s str> a str> v str> STORED ;] catch {: code:n :}
+   [: s a v STORED ;] catch {: code:n :}
    code 0= if exit then
    code E-PROC-OUTPUT = if UNSENT then
    code SECRET:E-ACCESS = if STORING s" failed" code OPERATION then
@@ -360,18 +365,19 @@ ARENA PENDINGS pending
 32 constant PROOF-BYTES    \ the verifier's random bytes
 43 constant PROOF-CHARS    \ 32 bytes in unpadded base64url
 
-: SCOPE ( -- ^u8 n )
+: SCOPE ( -- str )
    s" account_info.read files.metadata.read files.content.read files.content.write" ;
 
 \ The URL's texts around its three values, in the SDK's order.
-: BASE$ ( -- ^u8 n )
+: BASE$ ( -- str )
    s" https://www.dropbox.com/oauth2/authorize?response_type=code&client_id=" ;
-: TYPE$ ( -- ^u8 n ) s" &token_access_type=offline&scope=" ;
-: CHALLENGE$ ( -- ^u8 n ) s" &code_challenge=" ;
-: METHOD$ ( -- ^u8 n ) s" &code_challenge_method=S256" ;
+: TYPE$ ( -- str ) s" &token_access_type=offline&scope=" ;
+: CHALLENGE$ ( -- str ) s" &code_challenge=" ;
+: METHOD$ ( -- str ) s" &code_challenge_method=S256" ;
 
 : FIXED ( -- n )
-   BASE$ nip TYPE$ nip + CHALLENGE$ nip + METHOD$ nip + ;
+   BASE$ STR:len TYPE$ STR:len + CHALLENGE$ STR:len +
+   METHOD$ STR:len + ;
 
 \ form_urlencoded's bytes kept as they are.
 : KEPT? ( n -- bool )
@@ -382,8 +388,9 @@ ARENA PENDINGS pending
 : HEX ( n -- n ) dup 10 < if [char] 0 + else 55 + then ;
 
 \ Copies the bytes to p; answers the address after them.
-: PUT ( ^u8 ^u8 n -- ^u8 )
-   {: p:^ a:^ u:n :}
+: PUT ( ^u8 str -- ^u8 )
+   {: p:^ s:str :}
+   s str> {: a:^ u:n :}
    a p u BYTE-COPY p u + ;
 
 \ A byte as form_urlencoded writes it: kept, a space as +, or %XX.
@@ -396,34 +403,35 @@ ARENA PENDINGS pending
    b 15 and HEX p 2 + c!
    p 3 + ;
 
-: FORM ( ^u8 ^u8 n -- ^u8 )
-   {: p:^ a:^ u:n :}
+: FORM ( ^u8 str -- ^u8 )
+   {: p:^ s:str :}
+   s str> {: a:^ u:n :}
    p u 0 ?do a i + c@ FORM-BYTE loop ;
 
 \ The SDK's PKCE challenge: the verifier's SHA-256 in unpadded base64url.
-: CHALLENGE ( ^u8 n ^ARENA:arena -- ^u8 n )
-   {: v:^ vu:n ar :}
+: CHALLENGE ( str ^ARENA:arena -- str )
+   {: v:str ar :}
    ar SHA256-CTX-BYTES ARENA:ALLOC drop {: ctx:^ :}
    ar 32 ARENA:ALLOC {: d:^ du:n :}
-   ctx v vu d SHA256-IN
+   ctx v d SHA256-IN
    ar PROOF-CHARS ARENA:ALLOC {: c:^ cu:n :}
    d du >str c cu SPAN:MAKE BASE64:ENCODE-URL {: n:n :}
-   c n ;
+   c n >str ;
 
 \ The authorize URL's parameters, as AuthorizeUrlBuilder appends them
 \ for a PKCE code flow with token type ShortLivedAndRefresh and a scope.
-: QUERY ( ^u8 ^u8 n ^u8 n -- ^u8 )
-   {: p:^ k:^ ku:n c:^ cu:n :}
-   p BASE$ PUT k ku FORM TYPE$ PUT SCOPE FORM
-   CHALLENGE$ PUT c cu FORM METHOD$ PUT ;
+: QUERY ( ^u8 str str -- ^u8 )
+   {: p:^ k:str c:str :}
+   p BASE$ PUT k FORM TYPE$ PUT SCOPE FORM
+   CHALLENGE$ PUT c FORM METHOD$ PUT ;
 
 \ The URL for the app key and the verifier; a value at most triples.
-: AUTHORIZE-URL ( ^u8 n ^u8 n ^ARENA:arena -- str )
-   {: k:^ ku:n v:^ vu:n ar :}
-   v vu ar CHALLENGE {: c:^ cu:n :}
-   FIXED ku SCOPE nip + 3 * + cu + {: cap:n :}
+: AUTHORIZE-URL ( str str ^ARENA:arena -- str )
+   {: k:str v:str ar :}
+   v ar CHALLENGE {: c:str :}
+   FIXED k STR:len SCOPE STR:len + 3 * + c STR:len + {: cap:n :}
    ar cap ARENA:ALLOC drop {: d:^ :}
-   d k ku c cu QUERY {: e:^ :}
+   d k c QUERY {: e:^ :}
    d e d - >str ;
 
 : RANDOM ( ^u8 n -- )
@@ -455,25 +463,24 @@ public
 \ The binding and the refresh token, copied into the arena.
 : LOAD ( ^ARENA:arena -- lookup )
    {: ar :}
-   ar CAP ARENA:ALLOC SPAN:MAKE {: dest :}
-   dest FETCH {: u:n found:bool :}
-   found 0= if construct lookup unavailable exit then
-   dest SPAN:$ drop u ar CREDENTIAL ;
+   ar ARENA:ALLOCATOR 0 [type] u8 VEC:NEW {: dest :}
+   dest FETCH 0= if construct lookup unavailable exit then
+   dest VEC:SPAN SPAN:$ ar CREDENTIAL ;
 
 
 \ A login for the app key with a fresh verifier, in the arena.
-: START ( ^u8 n ^ARENA:arena -- ^pending )
-   {: k:^ ku:n ar :}
+: START ( str ^ARENA:arena -- ^pending )
+   {: k:str ar :}
    ar PROOF {: v:str :}
    ar PENDINGS-NEW {: p :}
    v p PENDING-VERIFIER !
-   k ku v str> ar AUTHORIZE-URL p PENDING-URL !
+   k v ar AUTHORIZE-URL p PENDING-URL !
    p ;
 
 \ The URL the user opens to authorize Omabox.
-: URL ( ^pending -- ^u8 n ) PENDING-URL @ str> ;
+: URL ( ^pending -- str ) PENDING-URL @ ;
 
 \ The verifier DROPBOX:EXCHANGE sends with the code.
-: VERIFIER ( ^pending -- ^u8 n ) PENDING-VERIFIER @ str> ;
+: VERIFIER ( ^pending -- str ) PENDING-VERIFIER @ ;
 
 ;package

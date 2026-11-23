@@ -13,7 +13,8 @@ require src/lib/string.f
 require src/lib/fs.f
 require src/lib/test.f
 require src/lib/fmt.f
-require src/lib/byte-buffer.f
+require src/lib/vector.f
+require src/lib/heap.f
 require src/lib/json.f
 require src/dropbox.f
 require src/model.f
@@ -26,25 +27,25 @@ TYPED-VARIABLE AR ^ARENA:arena
 10 constant LF
 9 constant TAB
 
-: HASH ( ^u8 n -- DROPBOX:hash ) >str DROPBOX:>HASH ;
-: REV ( ^u8 n -- DROPBOX:rev ) >str DROPBOX:>REV ;
-: LOCAL ( ^u8 n -- MODEL:local ) HASH MODEL-LOCAL:MAKE ;
+: HASH ( str -- DROPBOX:hash ) DROPBOX:>HASH ;
+: REV ( str -- DROPBOX:rev ) DROPBOX:>REV ;
+: LOCAL ( str -- MODEL:local ) HASH MODEL-LOCAL:MAKE ;
 
-: REMOTE ( ^u8 n ^u8 n -- MODEL:remote )
-   {: c:^ cu:n r:^ ru:n :}
-   c cu HASH r ru REV MODEL-REMOTE:MAKE ;
+: REMOTE ( str str -- MODEL:remote )
+   {: c r :}
+   c HASH r REV MODEL-REMOTE:MAKE ;
 
-: KEY ( ^u8 n -- MODEL:key ) >str MODEL:>PATH AR @ MODEL:FOLD ;
+: KEY ( str -- MODEL:key ) MODEL:>PATH AR @ MODEL:FOLD ;
 \ A key from its bytes, as Rust's CanonicalPath::from_bytes.
-: RAW ( ^u8 n -- MODEL:key ) >str MODEL:>KEY ;
+: RAW ( str -- MODEL:key ) MODEL:>KEY ;
 
-: KEY$ ( MODEL:key -- ^u8 n ) MODEL:KEY>STR str> ;
-: TEXT= ( str ^u8 n -- ) {: s:str w:^ wu:n :} s str> w wu T$= ;
+: KEY$ ( MODEL:key -- str ) MODEL:KEY>STR ;
 
 
 \ The bytes the hex digits spell, written at `dst`; answers their count.
-: UNHEX ( ^u8 n ^u8 -- n )
-   {: h:^ u:n dst:^ :}
+: UNHEX ( str ^u8 -- n )
+   {: s dst:^ :}
+   s str> {: h:^ u:n :}
    u 2 / 0 ?do
       h i 2 * + c@ STR-HEX-DIGIT-VALUE 16 *
       h i 2 * + 1+ c@ STR-HEX-DIGIT-VALUE +
@@ -52,38 +53,39 @@ TYPED-VARIABLE AR ^ARENA:arena
    loop
    u 2 / ;
 
-: DECODED ( ^u8 n -- ^u8 n )
-   {: h:^ u:n :}
-   AR @ u 2 / ARENA:ALLOC drop {: dst:^ :}
-   dst h u dst UNHEX ;
+: DECODED ( str -- str )
+   {: h :}
+   AR @ h STR:len 2 / ARENA:ALLOC drop {: dst:^ :}
+   dst h dst UNHEX >str ;
 
 \ One line: a display path, a tab, its fold, both in hex.
-: FOLD-LINE ( ^u8 n -- )
-   {: line:^ lu:n :}
-   line lu TAB 0 SPLIT-NEXT drop {: next:n :}
-   DECODED {: p:^ pu:n :}
-   line next + lu next - DECODED {: w:^ wu:n :}
-   p pu KEY KEY$ w wu T$= ;
+: FOLD-LINE ( str -- )
+   {: line :}
+   line TAB 0 SPLIT-NEXT drop {: next:n :}
+   DECODED {: p :}
+   line str> {: l:^ lu:n :}
+   l next + lu next - >str DECODED {: w :}
+   p KEY KEY$ w T$= ;
 
 \ Folds each line from `at` on; answers how many it folded.
-: FOLD-FROM ( ^u8 n n -- n )
-   {: t:^ u:n at:n :}
-   t u LF at SPLIT-NEXT 0= if 2drop drop 0 exit then
-   {: line:^ lu:n next:n :}
-   lu 0= if t u next RECURSE exit then
-   line lu FOLD-LINE
-   t u next RECURSE 1+ ;
+: FOLD-FROM ( str n -- n )
+   {: t at:n :}
+   t LF at SPLIT-NEXT 0= if drop drop 0 exit then
+   {: line next:n :}
+   line STR:len 0= if t next RECURSE exit then
+   line FOLD-LINE
+   t next RECURSE 1+ ;
 
-: LINES ( ^u8 n -- n )
-   {: t:^ u:n :}
+: LINES ( str -- n )
+   str> {: t:^ u:n :}
    0 u 0 ?do t i + c@ LF = if 1+ then loop ;
 
 : FOLD-CASE ( -- )
    s" fold.tsv" T-LABEL
-   s" src/oracle/fold.tsv" {: f:^ fu:n :}
-   AR @ f fu >str FS:FILE-SIZE ARENA:ALLOC {: t:^ u:n :}
-   f fu t u FS:READ-ALL u T=
-   t u 0 FOLD-FROM t u LINES T= ;
+   s" src/oracle/fold.tsv" {: f :}
+   AR @ f FS:FILE-SIZE ARENA:ALLOC {: t:^ u:n :}
+   f t u FS:READ-ALL u T=
+   t u >str 0 FOLD-FROM t u >str LINES T= ;
 
 
 : CANONICAL-ORDER-IS-BYTEWISE-NOT-COMPONENT-WISE ( -- )
@@ -112,7 +114,7 @@ TYPED-VARIABLE AR ^ARENA:arena
    top top MODEL:BENEATH? TFALSE
    s" other/report/x" KEY top MODEL:BENEATH? TFALSE ;
 
-: DISPLAY ( ^u8 n -- MODEL:path ) >str MODEL:>PATH ;
+: DISPLAY ( str -- MODEL:path ) MODEL:>PATH ;
 
 \ BEGINS? compares whole components: a byte prefix is not a parent.
 : PATHS-BEGIN-BY-COMPONENT ( -- )
@@ -127,9 +129,9 @@ TYPED-VARIABLE AR ^ARENA:arena
    s" a/b" DISPLAY s" /" DISPLAY MODEL:BEGINS? TFALSE ;
 
 \ PATH-CMP's sign for two display paths.
-: PATH-ORDER ( ^u8 n ^u8 n -- n )
-   {: a:^ u:n b:^ v:n :}
-   a u DISPLAY b v DISPLAY MODEL:PATH-CMP {: c:n :}
+: PATH-ORDER ( str str -- n )
+   {: a b :}
+   a DISPLAY b DISPLAY MODEL:PATH-CMP {: c:n :}
    c 0 < if -1 exit then
    c 0 > if 1 exit then
    0 ;
@@ -146,8 +148,8 @@ TYPED-VARIABLE AR ^ARENA:arena
    s" a//b" s" a/b" PATH-ORDER 0 T=
    s" a/./b" s" a/b" PATH-ORDER 0 T= ;
 
-: EXCLUDED ( ^u8 n -- ) DISPLAY MODEL:EXCLUDED? TTRUE ;
-: SYNCED ( ^u8 n -- ) DISPLAY MODEL:EXCLUDED? TFALSE ;
+: EXCLUDED ( str -- ) DISPLAY MODEL:EXCLUDED? TTRUE ;
+: SYNCED ( str -- ) DISPLAY MODEL:EXCLUDED? TFALSE ;
 
 : DOCUMENTED-NAMES-AND-DESCENDANTS-ARE-EXCLUDED ( -- )
    s" documented_names_and_descendants_are_excluded" T-LABEL
@@ -183,8 +185,8 @@ TYPED-VARIABLE AR ^ARENA:arena
 : IN-RANGE? ( MODEL:key MODEL:key -- bool )
    {: k:MODEL:key top:MODEL:key :}
    top AR @ MODEL:SUBTREE-RANGE {: lo:str hi:str :}
-   k KEY$ {: p:^ u:n :}
-   p u >str lo STR< 0= p u >str hi STR< and ;
+   k KEY$ {: p :}
+   p lo STR< 0= p hi STR< and ;
 
 \ BENEATH? and the range both answer `want` for the key.
 : RANGE-AGREES ( MODEL:key MODEL:key bool -- )
@@ -206,8 +208,8 @@ TYPED-VARIABLE AR ^ARENA:arena
    s" reports/x" KEY top false RANGE-AGREES
    s" a" KEY {: a:MODEL:key :}
    a AR @ MODEL:SUBTREE-RANGE {: lo:str hi:str :}
-   lo str> s" a/" T$=
-   hi str> s" a0" T$=
+   lo s" a/" T$=
+   hi s" a0" T$=
    s" a/b" KEY a true RANGE-AGREES
    s" a/b/c" KEY a true RANGE-AGREES
    s\" a/\xFF" RAW a true RANGE-AGREES
@@ -253,19 +255,19 @@ TYPED-VARIABLE AR ^ARENA:arena
 \ each other value differ in one field or variant, and every value is
 \ built afresh, its strings copied, so equal means equal bytes.
 
-: FRESH ( ^u8 n -- str )
-   {: p:^ u:n :}
+: FRESH ( str -- str )
+   str> {: p:^ u:n :}
    AR @ u ARENA:ALLOC drop {: d:^ :}
    p d u BYTE-COPY d u >str ;
 
-: FRESH-HASH ( ^u8 n -- DROPBOX:hash ) FRESH DROPBOX:>HASH ;
-: FRESH-REV ( ^u8 n -- DROPBOX:rev ) FRESH DROPBOX:>REV ;
-: FRESH-PATH ( ^u8 n -- MODEL:path ) FRESH MODEL:>PATH ;
-: FRESH-KEY ( ^u8 n -- MODEL:key ) FRESH MODEL:>KEY ;
+: FRESH-HASH ( str -- DROPBOX:hash ) FRESH DROPBOX:>HASH ;
+: FRESH-REV ( str -- DROPBOX:rev ) FRESH DROPBOX:>REV ;
+: FRESH-PATH ( str -- MODEL:path ) FRESH MODEL:>PATH ;
+: FRESH-KEY ( str -- MODEL:key ) FRESH MODEL:>KEY ;
 
-: FRESH-REMOTE ( ^u8 n ^u8 n -- MODEL:remote )
-   {: c:^ cu:n r:^ ru:n :}
-   c cu FRESH-HASH r ru FRESH-REV MODEL-REMOTE:MAKE ;
+: FRESH-REMOTE ( str str -- MODEL:remote )
+   {: c r :}
+   c FRESH-HASH r FRESH-REV MODEL-REMOTE:MAKE ;
 
 \ Each of `count` values equals itself, built again, and no other.
 : MATRIX ( n [ n n -- bool ] -- )
@@ -366,84 +368,84 @@ TYPED-VARIABLE AR ^ARENA:arena
 : UNKNOWN-TEXT-CASE ( -- )
    s" UNKNOWN$" T-LABEL
    MODEL-UNKNOWN--REASON:INCOMPLETE MODEL:UNKNOWN$
-   s" observation is incomplete" TEXT=
+   s" observation is incomplete" T$=
    MODEL-UNKNOWN--REASON:INACCESSIBLE MODEL:UNKNOWN$
-   s" path is inaccessible" TEXT=
+   s" path is inaccessible" T$=
    MODEL-UNKNOWN--REASON:UNAVAILABLE MODEL:UNKNOWN$
-   s" source is unavailable" TEXT=
+   s" source is unavailable" T$=
    MODEL-UNKNOWN--REASON:STALE MODEL:UNKNOWN$
-   s" inventory is stale" TEXT=
+   s" inventory is stale" T$=
    MODEL-UNKNOWN--REASON:CURSOR-RESET MODEL:UNKNOWN$
-   s" remote cursor was reset" TEXT=
+   s" remote cursor was reset" T$=
    MODEL-UNKNOWN--REASON:UNSUPPORTED MODEL:UNKNOWN$
-   s" object is unsupported" TEXT= ;
+   s" object is unsupported" T$= ;
 
 : DIRECTORY-TEXT-CASE ( -- )
    MODEL-OPERATION:CREATE-LOCAL-DIRECTORY MODEL:OPERATION$
-   s" create local directory if still absent" TEXT=
+   s" create local directory if still absent" T$=
    MODEL-OPERATION:CREATE-REMOTE-DIRECTORY MODEL:OPERATION$
-   s" create remote directory if still absent" TEXT=
+   s" create remote directory if still absent" T$=
    MODEL-OPERATION:DELETE-LOCAL-DIRECTORY MODEL:OPERATION$
-   s" delete empty local directory" TEXT=
+   s" delete empty local directory" T$=
    MODEL-OPERATION:DELETE-REMOTE-DIRECTORY MODEL:OPERATION$
-   s" delete empty remote directory" TEXT= ;
+   s" delete empty remote directory" T$= ;
 
 : FILE-TEXT-CASE ( -- )
    s" h1" HASH MODEL-OPERATION:CREATE-REMOTE MODEL:OPERATION$
-   s" create remote file if still absent" TEXT=
+   s" create remote file if still absent" T$=
    R1 MODEL-OPERATION:INSTALL-LOCAL MODEL:OPERATION$
-   s" install remote content locally" TEXT=
+   s" install remote content locally" T$=
    s" h1" LOCAL MODEL-OPERATION:PRESERVE-LOCAL MODEL:OPERATION$
-   s" preserve displaced local payload" TEXT=
+   s" preserve displaced local payload" T$=
    R1 s" h0" HASH MODEL-OPERATION:REPLACE-LOCAL MODEL:OPERATION$
-   s" replace local content" TEXT=
+   s" replace local content" T$=
    s" h0" HASH MODEL-OPERATION:DELETE-LOCAL MODEL:OPERATION$
-   s" delete local file" TEXT=
+   s" delete local file" T$=
    R1 MODEL-OPERATION:PRESERVE-REMOTE MODEL:OPERATION$
-   s" preserve displaced remote payload" TEXT=
+   s" preserve displaced remote payload" T$=
    s" h1" HASH s" r1" REV MODEL-OPERATION:REPLACE-REMOTE MODEL:OPERATION$
    s" replace remote content if the expected revision still matches"
-   TEXT=
+   T$=
    s" r1" REV MODEL-OPERATION:DELETE-REMOTE MODEL:OPERATION$
-   s" delete remote file if the expected revision still matches" TEXT= ;
+   s" delete remote file if the expected revision still matches" T$= ;
 
 : CONFLICT-TEXT-CASE ( -- )
    s" CONFLICT$" T-LABEL
    s" h1" LOCAL R1 MODEL-CONFLICT:INITIAL MODEL:CONFLICT$
    s" different local and remote payloads were introduced; preserve both payloads"
-   TEXT=
+   T$=
    s" h1" LOCAL R1 MODEL-CONFLICT:DIVERGENT MODEL:CONFLICT$
-   s" local and remote payloads diverged; preserve both payloads" TEXT=
+   s" local and remote payloads diverged; preserve both payloads" T$=
    R1 MODEL-CONFLICT:LOCAL-DELETED MODEL:CONFLICT$
    s" local deletion conflicts with a remote edit; preserve the remote payload"
-   TEXT=
+   T$=
    s" h1" LOCAL MODEL-CONFLICT:REMOTE-DELETED MODEL:CONFLICT$
    s" remote deletion conflicts with a local edit; preserve the local payload"
-   TEXT= ;
+   T$= ;
 
 
 \ ---- JSON
 
-create OUT BUF:HDR-BYTES allot
+TYPED-VARIABLE OUT ^VEC:vector<u8>
 TYPED-VARIABLE W JSON:writer
 46 constant PERIOD
 
 \ The writer's bytes for one value equal the line's JSON.
-: WRITES ( ^u8 n [ ^JSON:writer -- ^JSON:writer ] -- )
-   {: j:^ ju:n q :}
-   W OUT JSON:WRITE-OPEN-BUF q execute JSON:WRITTEN$ j ju T$= ;
+: WRITES ( str [ ^JSON:writer -- ^JSON:writer ] -- )
+   {: j q :}
+   W OUT @ JSON:OPEN q execute JSON:WRITTEN$ j T$= ;
 
-: H0$ ( -- ^u8 n )
+: H0$ ( -- str )
    s" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ;
-: H1$ ( -- ^u8 n )
+: H1$ ( -- str )
    s" 2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae" ;
-: R0$ ( -- ^u8 n ) s" 5f0a1b2c3d4e" ;
-: R1$ ( -- ^u8 n ) s" 5f0a1b2c3d4f" ;
+: R0$ ( -- str ) s" 5f0a1b2c3d4e" ;
+: R1$ ( -- str ) s" 5f0a1b2c3d4f" ;
 \ The .escapes lines' string: a quote, a backslash, U+0001, DEL, é and
 \ U+2028.
-: ESC$ ( -- ^u8 n ) s\" \"\\\x01\x7F\xC3\xA9\xE2\x80\xA8" ;
+: ESC$ ( -- str ) s\" \"\\\x01\x7F\xC3\xA9\xE2\x80\xA8" ;
 
-: OR-ESC ( ^u8 n bool -- ^u8 n ) if 2drop ESC$ then ;
+: OR-ESC ( str bool -- str ) if drop ESC$ then ;
 : C0 ( bool -- DROPBOX:hash ) {: e:bool :} H0$ e OR-ESC HASH ;
 : C1 ( bool -- DROPBOX:hash ) {: e:bool :} H1$ e OR-ESC HASH ;
 : V0 ( bool -- DROPBOX:rev ) {: e:bool :} R0$ e OR-ESC REV ;
@@ -459,254 +461,257 @@ TYPED-VARIABLE W JSON:writer
 : FINGERPRINT ( -- MODEL:fingerprint )
    -1 12345 -1 999999999 $7FFFFFFFFFFFFFFF 0 MODEL-FINGERPRINT:MAKE ;
 
-: BASELINE-OF ( ^u8 n bool -- MODEL:baseline )
-   {: v:^ vu:n e:bool :}
-   v vu s" Absent" STR= if MODEL-BASELINE:ABSENT exit then
-   v vu s" Directory" STR= if MODEL-BASELINE:DIRECTORY exit then
+: BASELINE-OF ( str bool -- MODEL:baseline )
+   {: v e:bool :}
+   v s" Absent" STR= if MODEL-BASELINE:ABSENT exit then
+   v s" Directory" STR= if MODEL-BASELINE:DIRECTORY exit then
    e REMOTE0 MODEL-BASELINE:PRESENT ;
 
-: REASON-OF ( ^u8 n -- MODEL:unknown-reason )
-   {: v:^ vu:n :}
-   v vu s" Incomplete" STR= if MODEL-UNKNOWN--REASON:INCOMPLETE exit then
-   v vu s" Inaccessible" STR= if
+: REASON-OF ( str -- MODEL:unknown-reason )
+   {: v :}
+   v s" Incomplete" STR= if MODEL-UNKNOWN--REASON:INCOMPLETE exit then
+   v s" Inaccessible" STR= if
       MODEL-UNKNOWN--REASON:INACCESSIBLE exit then
-   v vu s" Unavailable" STR= if
+   v s" Unavailable" STR= if
       MODEL-UNKNOWN--REASON:UNAVAILABLE exit then
-   v vu s" Stale" STR= if MODEL-UNKNOWN--REASON:STALE exit then
-   v vu s" CursorReset" STR= if
+   v s" Stale" STR= if MODEL-UNKNOWN--REASON:STALE exit then
+   v s" CursorReset" STR= if
       MODEL-UNKNOWN--REASON:CURSOR-RESET exit then
    MODEL-UNKNOWN--REASON:UNSUPPORTED ;
 
 \ An Unknown observation's label names its reason after a period.
-: UNKNOWN-REASON-OF ( ^u8 n -- MODEL:unknown-reason )
-   {: v:^ vu:n :}
-   v 8 + vu 8 - REASON-OF ;
+: UNKNOWN-REASON-OF ( str -- MODEL:unknown-reason )
+   str> {: v:^ vu:n :}
+   v 8 + vu 8 - >str REASON-OF ;
 
-: LOCAL-OBSERVATION-OF ( ^u8 n bool -- MODEL:observation<MODEL:local> )
-   {: v:^ vu:n e:bool :}
-   v vu s" ConfirmedAbsent" STR= if MODEL-OBSERVATION:ABSENT exit then
-   v vu s" Directory" STR= if MODEL-OBSERVATION:DIRECTORY exit then
-   v vu s" Present" STR= if e LOCAL0 MODEL-OBSERVATION:PRESENT exit then
-   v vu UNKNOWN-REASON-OF MODEL-OBSERVATION:UNKNOWN ;
+: LOCAL-OBSERVATION-OF ( str bool -- MODEL:observation<MODEL:local> )
+   {: v e:bool :}
+   v s" ConfirmedAbsent" STR= if MODEL-OBSERVATION:ABSENT exit then
+   v s" Directory" STR= if MODEL-OBSERVATION:DIRECTORY exit then
+   v s" Present" STR= if e LOCAL0 MODEL-OBSERVATION:PRESENT exit then
+   v UNKNOWN-REASON-OF MODEL-OBSERVATION:UNKNOWN ;
 
-: REMOTE-OBSERVATION-OF ( ^u8 n bool -- MODEL:observation<MODEL:remote> )
-   {: v:^ vu:n e:bool :}
-   v vu s" ConfirmedAbsent" STR= if MODEL-OBSERVATION:ABSENT exit then
-   v vu s" Directory" STR= if MODEL-OBSERVATION:DIRECTORY exit then
-   v vu s" Present" STR= if e REMOTE0 MODEL-OBSERVATION:PRESENT exit then
-   v vu UNKNOWN-REASON-OF MODEL-OBSERVATION:UNKNOWN ;
+: REMOTE-OBSERVATION-OF ( str bool -- MODEL:observation<MODEL:remote> )
+   {: v e:bool :}
+   v s" ConfirmedAbsent" STR= if MODEL-OBSERVATION:ABSENT exit then
+   v s" Directory" STR= if MODEL-OBSERVATION:DIRECTORY exit then
+   v s" Present" STR= if e REMOTE0 MODEL-OBSERVATION:PRESENT exit then
+   v UNKNOWN-REASON-OF MODEL-OBSERVATION:UNKNOWN ;
 
-: DIRECTORY-OPERATION-OF ( ^u8 n -- MODEL:operation )
-   {: v:^ vu:n :}
-   v vu s" CreateLocalDirectory" STR= if
+: DIRECTORY-OPERATION-OF ( str -- MODEL:operation )
+   {: v :}
+   v s" CreateLocalDirectory" STR= if
       MODEL-OPERATION:CREATE-LOCAL-DIRECTORY exit then
-   v vu s" CreateRemoteDirectory" STR= if
+   v s" CreateRemoteDirectory" STR= if
       MODEL-OPERATION:CREATE-REMOTE-DIRECTORY exit then
-   v vu s" DeleteLocalDirectory" STR= if
+   v s" DeleteLocalDirectory" STR= if
       MODEL-OPERATION:DELETE-LOCAL-DIRECTORY exit then
    MODEL-OPERATION:DELETE-REMOTE-DIRECTORY ;
 
-: OPERATION-OF ( ^u8 n bool -- MODEL:operation )
-   {: v:^ vu:n e:bool :}
-   v vu s" CreateRemote" STR= if
+: OPERATION-OF ( str bool -- MODEL:operation )
+   {: v e:bool :}
+   v s" CreateRemote" STR= if
       e C0 MODEL-OPERATION:CREATE-REMOTE exit then
-   v vu s" InstallLocal" STR= if
+   v s" InstallLocal" STR= if
       e REMOTE0 MODEL-OPERATION:INSTALL-LOCAL exit then
-   v vu s" PreserveLocal" STR= if
+   v s" PreserveLocal" STR= if
       e LOCAL0 MODEL-OPERATION:PRESERVE-LOCAL exit then
-   v vu s" ReplaceLocal" STR= if
+   v s" ReplaceLocal" STR= if
       e REMOTE1 e C0 MODEL-OPERATION:REPLACE-LOCAL exit then
-   v vu s" DeleteLocal" STR= if
+   v s" DeleteLocal" STR= if
       e C0 MODEL-OPERATION:DELETE-LOCAL exit then
-   v vu s" PreserveRemote" STR= if
+   v s" PreserveRemote" STR= if
       e REMOTE0 MODEL-OPERATION:PRESERVE-REMOTE exit then
-   v vu s" ReplaceRemote" STR= if
+   v s" ReplaceRemote" STR= if
       e C1 e V0 MODEL-OPERATION:REPLACE-REMOTE exit then
-   v vu s" DeleteRemote" STR= if
+   v s" DeleteRemote" STR= if
       e V0 MODEL-OPERATION:DELETE-REMOTE exit then
-   v vu DIRECTORY-OPERATION-OF ;
+   v DIRECTORY-OPERATION-OF ;
 
-: CONFLICT-OF ( ^u8 n bool -- MODEL:conflict )
-   {: v:^ vu:n e:bool :}
-   v vu s" InitialCollision" STR= if
+: CONFLICT-OF ( str bool -- MODEL:conflict )
+   {: v e:bool :}
+   v s" InitialCollision" STR= if
       e LOCAL0 e REMOTE1 MODEL-CONFLICT:INITIAL exit then
-   v vu s" DivergentEdits" STR= if
+   v s" DivergentEdits" STR= if
       e LOCAL0 e REMOTE1 MODEL-CONFLICT:DIVERGENT exit then
-   v vu s" LocalDeletionRemoteEdit" STR= if
+   v s" LocalDeletionRemoteEdit" STR= if
       e REMOTE1 MODEL-CONFLICT:LOCAL-DELETED exit then
    e LOCAL0 MODEL-CONFLICT:REMOTE-DELETED ;
 
 : TAG ( bool -- str )
-   {: e:bool :} s" insufficient_space" e OR-ESC >str ;
+   {: e:bool :} s" insufficient_space" e OR-ESC ;
 
-: BLOCKAGE-OF ( ^u8 n bool -- MODEL:blockage )
-   {: v:^ vu:n e:bool :}
-   v vu s" UnsupportedFileSize" STR= if
+: BLOCKAGE-OF ( str bool -- MODEL:blockage )
+   {: v e:bool :}
+   v s" UnsupportedFileSize" STR= if
       MODEL-BLOCKAGE:UNSUPPORTED-FILE-SIZE exit then
-   v vu s" RemoteRejected" STR= if
+   v s" RemoteRejected" STR= if
       e TAG MODEL-BLOCKAGE:REMOTE-REJECTED exit then
-   v vu s" DownloadUnavailable" STR= if
+   v s" DownloadUnavailable" STR= if
       409 MODEL-BLOCKAGE:DOWNLOAD-UNAVAILABLE exit then
-   v vu s" DownloadVerificationFailed" STR= if
+   v s" DownloadVerificationFailed" STR= if
       MODEL-BLOCKAGE:DOWNLOAD-VERIFICATION-FAILED exit then
-   v vu s" StageOccupied" STR= if MODEL-BLOCKAGE:STAGE-OCCUPIED exit then
-   v vu s" LocalObjectInWay" STR= if
+   v s" StageOccupied" STR= if MODEL-BLOCKAGE:STAGE-OCCUPIED exit then
+   v s" LocalObjectInWay" STR= if
       MODEL-BLOCKAGE:LOCAL-OBJECT-IN-WAY exit then
-   v vu s" RemoteObject" STR= if MODEL-BLOCKAGE:REMOTE-OBJECT exit then
+   v s" RemoteObject" STR= if MODEL-BLOCKAGE:REMOTE-OBJECT exit then
    MODEL-BLOCKAGE:CONFLICT-COPY-OCCUPIED ;
 
 : HASH-RECORD ( MODEL:fingerprint DROPBOX:hash -- MODEL:hash-record )
    {: f:MODEL:fingerprint c:DROPBOX:hash :}
-   s" x" >str MODEL:>PATH f c MODEL-HASH--RECORD:MAKE ;
+   s" x" MODEL:>PATH f c MODEL-HASH--RECORD:MAKE ;
 
 \ One line's checks: its variant label, whether it is an .escapes line,
 \ and its JSON.
-: BASELINE-LINE ( ^u8 n bool ^u8 n -- )
-   {: v:^ vu:n e:bool j:^ ju:n :}
-   j ju [: v vu e BASELINE-OF swap MODEL:BASELINE>JSON ;] WRITES
-   j ju [: j ju >str AR @ MODEL:JSON>BASELINE
+: BASELINE-LINE ( str bool str -- )
+   {: v e:bool j :}
+   j [: v e BASELINE-OF swap MODEL:BASELINE>JSON ;] WRITES
+   j [: j AR @ MODEL:JSON>BASELINE
       swap MODEL:BASELINE>JSON ;] WRITES ;
 
-: BLOCKAGE-LINE ( ^u8 n bool ^u8 n -- )
-   {: v:^ vu:n e:bool j:^ ju:n :}
-   j ju [: v vu e BLOCKAGE-OF swap MODEL:BLOCKAGE>JSON ;] WRITES
-   j ju [: j ju >str AR @ MODEL:JSON>BLOCKAGE
+: BLOCKAGE-LINE ( str bool str -- )
+   {: v e:bool j :}
+   j [: v e BLOCKAGE-OF swap MODEL:BLOCKAGE>JSON ;] WRITES
+   j [: j AR @ MODEL:JSON>BLOCKAGE
       swap MODEL:BLOCKAGE>JSON ;] WRITES ;
 
-: CONFLICT-LINE ( ^u8 n bool ^u8 n -- )
-   {: v:^ vu:n e:bool j:^ ju:n :}
-   j ju [: v vu e CONFLICT-OF swap MODEL:CONFLICT>JSON ;] WRITES
-   j ju [: j ju >str AR @ MODEL:JSON>CONFLICT
+: CONFLICT-LINE ( str bool str -- )
+   {: v e:bool j :}
+   j [: v e CONFLICT-OF swap MODEL:CONFLICT>JSON ;] WRITES
+   j [: j AR @ MODEL:JSON>CONFLICT
       swap MODEL:CONFLICT>JSON ;] WRITES ;
 
-: HASH-LINE ( ^u8 n bool ^u8 n -- )
-   {: v:^ vu:n e:bool j:^ ju:n :}
-   j ju [: e C0 swap MODEL:HASH>JSON ;] WRITES
-   j ju [: j ju >str AR @ MODEL:JSON>HASH
+: HASH-LINE ( str bool str -- )
+   {: v e:bool j :}
+   j [: e C0 swap MODEL:HASH>JSON ;] WRITES
+   j [: j AR @ MODEL:JSON>HASH
       swap MODEL:HASH>JSON ;] WRITES ;
 
-: REV-LINE ( ^u8 n bool ^u8 n -- )
-   {: v:^ vu:n e:bool j:^ ju:n :}
-   j ju [: e V0 swap MODEL:REV>JSON ;] WRITES
-   j ju [: j ju >str AR @ MODEL:JSON>REV
+: REV-LINE ( str bool str -- )
+   {: v e:bool j :}
+   j [: e V0 swap MODEL:REV>JSON ;] WRITES
+   j [: j AR @ MODEL:JSON>REV
       swap MODEL:REV>JSON ;] WRITES ;
 
-: LOCAL-LINE ( ^u8 n bool ^u8 n -- )
-   {: v:^ vu:n e:bool j:^ ju:n :}
-   j ju [: e LOCAL0 swap MODEL:LOCAL>JSON ;] WRITES
-   j ju [: j ju >str AR @ MODEL:JSON>LOCAL
+: LOCAL-LINE ( str bool str -- )
+   {: v e:bool j :}
+   j [: e LOCAL0 swap MODEL:LOCAL>JSON ;] WRITES
+   j [: j AR @ MODEL:JSON>LOCAL
       swap MODEL:LOCAL>JSON ;] WRITES ;
 
-: REMOTE-LINE ( ^u8 n bool ^u8 n -- )
-   {: v:^ vu:n e:bool j:^ ju:n :}
-   j ju [: e REMOTE0 swap MODEL:REMOTE>JSON ;] WRITES
-   j ju [: j ju >str AR @ MODEL:JSON>REMOTE
+: REMOTE-LINE ( str bool str -- )
+   {: v e:bool j :}
+   j [: e REMOTE0 swap MODEL:REMOTE>JSON ;] WRITES
+   j [: j AR @ MODEL:JSON>REMOTE
       swap MODEL:REMOTE>JSON ;] WRITES ;
 
-: HASH-VALUE-LINE ( ^u8 n bool ^u8 n -- )
-   {: v:^ vu:n e:bool j:^ ju:n :}
-   j ju [: FINGERPRINT e C0 HASH-RECORD
+: HASH-VALUE-LINE ( str bool str -- )
+   {: v e:bool j :}
+   j [: FINGERPRINT e C0 HASH-RECORD
       swap MODEL:HASH-VALUE>JSON ;] WRITES
-   j ju [: j ju >str AR @ MODEL:JSON>HASH-VALUE HASH-RECORD
+   j [: j AR @ MODEL:JSON>HASH-VALUE HASH-RECORD
       swap MODEL:HASH-VALUE>JSON ;] WRITES ;
 
-: LOCAL-OBSERVATION-LINE ( ^u8 n bool ^u8 n -- )
-   {: v:^ vu:n e:bool j:^ ju:n :}
-   j ju [: v vu e LOCAL-OBSERVATION-OF
+: LOCAL-OBSERVATION-LINE ( str bool str -- )
+   {: v e:bool j :}
+   j [: v e LOCAL-OBSERVATION-OF
       swap MODEL:LOCAL-OBSERVATION>JSON ;] WRITES
-   j ju [: j ju >str AR @ MODEL:JSON>LOCAL-OBSERVATION
+   j [: j AR @ MODEL:JSON>LOCAL-OBSERVATION
       swap MODEL:LOCAL-OBSERVATION>JSON ;] WRITES ;
 
-: REMOTE-OBSERVATION-LINE ( ^u8 n bool ^u8 n -- )
-   {: v:^ vu:n e:bool j:^ ju:n :}
-   j ju [: v vu e REMOTE-OBSERVATION-OF
+: REMOTE-OBSERVATION-LINE ( str bool str -- )
+   {: v e:bool j :}
+   j [: v e REMOTE-OBSERVATION-OF
       swap MODEL:REMOTE-OBSERVATION>JSON ;] WRITES
-   j ju [: j ju >str AR @ MODEL:JSON>REMOTE-OBSERVATION
+   j [: j AR @ MODEL:JSON>REMOTE-OBSERVATION
       swap MODEL:REMOTE-OBSERVATION>JSON ;] WRITES ;
 
-: OPERATION-LINE ( ^u8 n bool ^u8 n -- )
-   {: v:^ vu:n e:bool j:^ ju:n :}
-   j ju [: v vu e OPERATION-OF swap MODEL:OPERATION>JSON ;] WRITES
-   j ju [: j ju >str AR @ MODEL:JSON>OPERATION
+: OPERATION-LINE ( str bool str -- )
+   {: v e:bool j :}
+   j [: v e OPERATION-OF swap MODEL:OPERATION>JSON ;] WRITES
+   j [: j AR @ MODEL:JSON>OPERATION
       swap MODEL:OPERATION>JSON ;] WRITES ;
 
-: REASON-LINE ( ^u8 n bool ^u8 n -- )
-   {: v:^ vu:n e:bool j:^ ju:n :}
-   j ju [: v vu REASON-OF swap MODEL:UNKNOWN-REASON>JSON ;] WRITES
-   j ju [: j ju >str AR @ MODEL:JSON>UNKNOWN-REASON
+: REASON-LINE ( str bool str -- )
+   {: v e:bool j :}
+   j [: v REASON-OF swap MODEL:UNKNOWN-REASON>JSON ;] WRITES
+   j [: j AR @ MODEL:JSON>UNKNOWN-REASON
       swap MODEL:UNKNOWN-REASON>JSON ;] WRITES ;
 
 \ A label's type, then its variant and whether it is an .escapes line.
-: LABEL ( ^u8 n -- ^u8 n ^u8 n bool )
-   {: l:^ lu:n :}
-   l lu PERIOD 0 SPLIT-NEXT drop {: at:n :}
-   l at + lu at - {: v:^ vu:n :}
-   v vu >str s" .escapes" >str ENDS-WITH? {: e:bool :}
-   v e if vu 8 - else vu then e ;
+: LABEL ( str -- str str bool )
+   {: s :}
+   s PERIOD 0 SPLIT-NEXT drop {: at:n :}
+   s str> {: l:^ lu:n :}
+   l at + lu at - >str {: v :}
+   v s" .escapes" ENDS-WITH? {: e:bool :}
+   v STR:len {: vu:n :}
+   v STR:data e if vu 8 - else vu then >str e ;
 
-: JSON-LINE ( ^u8 n -- )
-   {: line:^ lu:n :}
-   line lu TAB 0 SPLIT-NEXT drop {: next:n :}
-   LABEL {: t:^ tu:n v:^ vu:n e:bool :}
-   line next + lu next - {: j:^ ju:n :}
-   v vu e j ju
-   t tu s" Baseline" STR= if BASELINE-LINE exit then
-   t tu s" BlockReason" STR= if BLOCKAGE-LINE exit then
-   t tu s" Conflict" STR= if CONFLICT-LINE exit then
-   t tu s" ContentIdentity" STR= if HASH-LINE exit then
-   t tu s" DropboxRevision" STR= if REV-LINE exit then
-   t tu s" LocalFile" STR= if LOCAL-LINE exit then
-   t tu s" LocalHashValue" STR= if HASH-VALUE-LINE exit then
-   t tu s" LocalObservation" STR= if LOCAL-OBSERVATION-LINE exit then
-   t tu s" Operation" STR= if OPERATION-LINE exit then
-   t tu s" RemoteFile" STR= if REMOTE-LINE exit then
-   t tu s" RemoteObservation" STR= if REMOTE-OBSERVATION-LINE exit then
-   t tu s" UnknownReason" STR= if REASON-LINE exit then
-   2drop drop 2drop s" a json.tsv type" s" none" T$= ;
+: JSON-LINE ( str -- )
+   {: line :}
+   line TAB 0 SPLIT-NEXT drop {: next:n :}
+   LABEL {: t v e:bool :}
+   line str> {: l:^ lu:n :}
+   l next + lu next - >str {: j :}
+   v e j
+   t s" Baseline" STR= if BASELINE-LINE exit then
+   t s" BlockReason" STR= if BLOCKAGE-LINE exit then
+   t s" Conflict" STR= if CONFLICT-LINE exit then
+   t s" ContentIdentity" STR= if HASH-LINE exit then
+   t s" DropboxRevision" STR= if REV-LINE exit then
+   t s" LocalFile" STR= if LOCAL-LINE exit then
+   t s" LocalHashValue" STR= if HASH-VALUE-LINE exit then
+   t s" LocalObservation" STR= if LOCAL-OBSERVATION-LINE exit then
+   t s" Operation" STR= if OPERATION-LINE exit then
+   t s" RemoteFile" STR= if REMOTE-LINE exit then
+   t s" RemoteObservation" STR= if REMOTE-OBSERVATION-LINE exit then
+   t s" UnknownReason" STR= if REASON-LINE exit then
+   drop drop drop s" a json.tsv type" s" none" T$= ;
 
-: JSON-FROM ( ^u8 n n -- n )
-   {: t:^ u:n at:n :}
-   t u LF at SPLIT-NEXT 0= if 2drop drop 0 exit then
-   {: line:^ lu:n next:n :}
-   lu 0= if t u next RECURSE exit then
-   line lu JSON-LINE
-   t u next RECURSE 1+ ;
+: JSON-FROM ( str n -- n )
+   {: t at:n :}
+   t LF at SPLIT-NEXT 0= if drop drop 0 exit then
+   {: line next:n :}
+   line STR:len 0= if t next RECURSE exit then
+   line JSON-LINE
+   t next RECURSE 1+ ;
 
 : JSON-CASE ( -- )
    s" json.tsv" T-LABEL
-   s" src/oracle/json.tsv" {: f:^ fu:n :}
-   AR @ f fu >str FS:FILE-SIZE ARENA:ALLOC {: t:^ u:n :}
-   f fu t u FS:READ-ALL u T=
-   t u 0 JSON-FROM t u LINES T= ;
+   s" src/oracle/json.tsv" {: f :}
+   AR @ f FS:FILE-SIZE ARENA:ALLOC {: t:^ u:n :}
+   f t u FS:READ-ALL u T=
+   t u >str 0 JSON-FROM t u >str LINES T= ;
 
 
 \ Each text reads as the value the second text, serde's bytes, holds.
-: READS-REMOTE ( ^u8 n ^u8 n -- )
-   {: s:^ su:n j:^ ju:n :}
-   j ju [: s su >str AR @ MODEL:JSON>REMOTE
+: READS-REMOTE ( str str -- )
+   {: s j :}
+   j [: s AR @ MODEL:JSON>REMOTE
       swap MODEL:REMOTE>JSON ;] WRITES ;
 
-: READS-BASELINE ( ^u8 n ^u8 n -- )
-   {: s:^ su:n j:^ ju:n :}
-   j ju [: s su >str AR @ MODEL:JSON>BASELINE
+: READS-BASELINE ( str str -- )
+   {: s j :}
+   j [: s AR @ MODEL:JSON>BASELINE
       swap MODEL:BASELINE>JSON ;] WRITES ;
 
-: READS-FINGERPRINT ( ^u8 n ^u8 n -- )
-   {: s:^ su:n j:^ ju:n :}
-   j ju [: s su >str AR @ MODEL:JSON>FINGERPRINT
+: READS-FINGERPRINT ( str str -- )
+   {: s j :}
+   j [: s AR @ MODEL:JSON>FINGERPRINT
       swap MODEL:FINGERPRINT>JSON ;] WRITES ;
 
-: READS-HASH-VALUE ( ^u8 n ^u8 n -- )
-   {: s:^ su:n j:^ ju:n :}
-   j ju [: s su >str AR @ MODEL:JSON>HASH-VALUE HASH-RECORD
+: READS-HASH-VALUE ( str str -- )
+   {: s j :}
+   j [: s AR @ MODEL:JSON>HASH-VALUE HASH-RECORD
       swap MODEL:HASH-VALUE>JSON ;] WRITES ;
 
-: READS-HASH ( ^u8 n ^u8 n -- )
-   {: s:^ su:n j:^ ju:n :}
-   j ju [: s su >str AR @ MODEL:JSON>HASH
+: READS-HASH ( str str -- )
+   {: s j :}
+   j [: s AR @ MODEL:JSON>HASH
       swap MODEL:HASH>JSON ;] WRITES ;
 
-: FP$ ( -- ^u8 n )
+: FP$ ( -- str )
    s\" {\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":5,\"changed_nanoseconds\":6}" ;
 
 \ Whitespace between tokens, members in any order, any escape, and an
@@ -728,45 +733,45 @@ TYPED-VARIABLE W JSON:writer
 
 
 \ Each text a reader refuses with E-STORED.
-: REFUSES-REMOTE ( ^u8 n -- )
-   {: s:^ su:n :}
-   [: s su >str AR @ MODEL:JSON>REMOTE drop ;]
+: REFUSES-REMOTE ( str -- )
+   {: s :}
+   [: s AR @ MODEL:JSON>REMOTE drop ;]
    MODEL:E-STORED TTHROWSQ ;
 
-: REFUSES-BASELINE ( ^u8 n -- )
-   {: s:^ su:n :}
-   [: s su >str AR @ MODEL:JSON>BASELINE drop ;]
+: REFUSES-BASELINE ( str -- )
+   {: s :}
+   [: s AR @ MODEL:JSON>BASELINE drop ;]
    MODEL:E-STORED TTHROWSQ ;
 
-: REFUSES-BLOCKAGE ( ^u8 n -- )
-   {: s:^ su:n :}
-   [: s su >str AR @ MODEL:JSON>BLOCKAGE drop ;]
+: REFUSES-BLOCKAGE ( str -- )
+   {: s :}
+   [: s AR @ MODEL:JSON>BLOCKAGE drop ;]
    MODEL:E-STORED TTHROWSQ ;
 
-: REFUSES-FINGERPRINT ( ^u8 n -- )
-   {: s:^ su:n :}
-   [: s su >str AR @ MODEL:JSON>FINGERPRINT drop ;]
+: REFUSES-FINGERPRINT ( str -- )
+   {: s :}
+   [: s AR @ MODEL:JSON>FINGERPRINT drop ;]
    MODEL:E-STORED TTHROWSQ ;
 
-: REFUSES-HASH-VALUE ( ^u8 n -- )
-   {: s:^ su:n :}
-   [: s su >str AR @ MODEL:JSON>HASH-VALUE drop drop ;]
+: REFUSES-HASH-VALUE ( str -- )
+   {: s :}
+   [: s AR @ MODEL:JSON>HASH-VALUE drop drop ;]
    MODEL:E-STORED TTHROWSQ ;
 
-: REFUSES-HASH ( ^u8 n -- )
-   {: s:^ su:n :}
-   [: s su >str AR @ MODEL:JSON>HASH drop ;]
+: REFUSES-HASH ( str -- )
+   {: s :}
+   [: s AR @ MODEL:JSON>HASH drop ;]
    MODEL:E-STORED TTHROWSQ ;
 
 \ A fingerprint whose inode is the given number's text.
-: FP-INODE$ ( ^u8 n -- ^u8 n )
-   {: d:^ du:n :}
+: FP-INODE$ ( str -- str )
+   str> {: d:^ du:n :}
    s\" {\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":5,\"changed_nanoseconds\":6,\"inode\":"
-   {: a:^ au:n :}
+   str> {: a:^ au:n :}
    AR @ au du + 1+ ARENA:ALLOC drop {: b:^ :}
    a b au BYTE-COPY d b au + du BYTE-COPY
    $7D b au + du + c!
-   b au du + 1+ ;
+   b au du + 1+ >str ;
 
 : REFUSED-CASE ( -- )
    s" reader refuses" T-LABEL
@@ -797,7 +802,7 @@ TYPED-VARIABLE W JSON:writer
    s\" {}" REFUSES-BASELINE
    s" " REFUSES-BASELINE ;
 
-: HV$ ( -- ^u8 n )
+: HV$ ( -- str )
    s\" {\"fingerprint\":{\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":5,\"changed_nanoseconds\":6},\"content\":\"c\"}" ;
 
 : HASH-VALUE-ORDER-CASE ( -- )
@@ -822,7 +827,7 @@ TYPED-VARIABLE W JSON:writer
 : FINGERPRINT-SIGNED-CASE ( -- )
    s" fingerprint's changed seconds is signed" T-LABEL
    s\" {\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":-5,\"changed_nanoseconds\":6}"
-   2dup READS-FINGERPRINT
+   dup READS-FINGERPRINT
    s\" {\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":9223372036854775808,\"changed_nanoseconds\":6}"
    REFUSES-FINGERPRINT ;
 
@@ -859,8 +864,8 @@ public
 : RUN ( -- )
    T-RESET
    ARENA:NEW AR !
-   OUT 64 BUF:N>BLEN BUF:INIT
-   [: CASES ;] [: OUT BUF:DISPOSE AR @ ARENA:RELEASE ;] finally
+   HEAP:ALLOCATOR 0 [type] u8 VEC:NEW OUT !
+   [: CASES ;] [: OUT @ VEC:DELETE AR @ ARENA:RELEASE ;] finally
    s" model-test: " type T-CASES FMT:.INT s"  checks" type cr
    T-REPORT ;
 

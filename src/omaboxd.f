@@ -31,8 +31,8 @@ FUNCTION: MALLOPT mallopt ( i32 i32 -- i32 )
 \ A write the reader cannot take throws, as Rust's println! panics.
 : SELF-CHECK ( -- )
    SB-RESET s" omaboxd " SB-APPEND RELEASE:VERSION$ SB-APPEND 10 SB-APPEND-C
-   SB$ {: a:^ u:n :}
-   FD:STDOUT [: FD:STDOUT a u FD:WRITE-FULL ;] FD:WITH-NOSIGPIPE ;
+   SB$ {: line:str :}
+   FD:STDOUT [: FD:STDOUT line FD:WRITE-FULL ;] FD:WITH-NOSIGPIPE ;
 
 public
 

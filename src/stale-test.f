@@ -25,15 +25,16 @@ $C0 constant UNREADABLE
 TYPED-VARIABLE AR ^ARENA:arena
 TYPED-VARIABLE DIR str
 
-: KEEP ( ^u8 n -- str )
-   {: a:^ u:n :}
+: KEEP ( str -- str )
+   str> {: a:^ u:n :}
    AR @ u ARENA:ALLOC drop {: d:^ :}
    a d u BYTE-COPY
    d u >str ;
 
 \ base/name laid in the case's arena.
-: UNDER ( str ^u8 n -- str )
-   {: base n:^ nu:n :}
+: UNDER ( str str -- str )
+   {: base name :}
+   name str> {: n:^ nu:n :}
    base str> {: b:^ bu:n :}
    AR @ bu 1 + nu + ARENA:ALLOC drop {: d:^ :}
    b d bu BYTE-COPY
@@ -52,34 +53,34 @@ TYPED-VARIABLE DIR str
 : UNREADABLE-DIRECTORY ( -- )
    s" unreadable_directory_is_one_leftover" T-LABEL
    FS:EUID 0= if exit then
-   s" TMPDIR" GETENV >str s" stale-test-" >str FS:MKTEMP-DIR-IN str> KEEP {: tmp :}
+   s" TMPDIR" GETENV s" stale-test-" FS:MKTEMP-DIR-IN KEEP {: tmp :}
    tmp s" unreadable" UNDER DIR !
-   DIR @ str> FS:MAKE-DIR
-   [: SWEPT ;] [: tmp str> FS:REMOVE-TREE ;] finally {: v :}
+   DIR @ FS:MAKE-DIR
+   [: SWEPT ;] [: tmp FS:REMOVE-TREE ;] finally {: v :}
    v VEC:COUNT 1 T=
    v 0 VEC:AT {: l :}
-   l STALE:PATH str> DIR @ str> T$=
+   l STALE:PATH DIR @ T$=
    l STALE:OPERATION$ s" read a directory" T$=
    l STALE:ERRNO FS:EACCES T= ;
 
 \ No process has this PID: Linux caps pid_max at 2^22.
-: DEAD-NAME ( -- ^u8 n ) s" .omabox.install.2147483647.0" ;
+: DEAD-NAME ( -- str ) s" .omabox.install.2147483647.0" ;
 
 : REMOVED-WHOLE ( str -- )
    {: tmp :}
    tmp DEAD-NAME UNDER {: t :}
    t s" sub" UNDER {: sub :}
-   t str> FS:MAKE-DIR
-   sub str> FS:MAKE-DIR
-   t s" file" UNDER str> s" stale" FS:WRITE-ALL
-   sub s" file" UNDER str> s" stale" FS:WRITE-ALL
+   t FS:MAKE-DIR
+   sub FS:MAKE-DIR
+   t s" file" UNDER s" stale" FS:WRITE-ALL
+   sub s" file" UNDER s" stale" FS:WRITE-ALL
    tmp s" .omabox.install." s" " AR @ STALE:SWEEP VEC:COUNT 0 T=
    t FS:TRY-LSTAT TFALSE ;
 
 : DEAD-DIRECTORY ( -- )
    s" dead_directory_is_removed_whole" T-LABEL
-   s" TMPDIR" GETENV >str s" stale-test-" >str FS:MKTEMP-DIR-IN str> KEEP {: tmp :}
-   [: tmp REMOVED-WHOLE ;] [: tmp str> FS:REMOVE-TREE ;] finally ;
+   s" TMPDIR" GETENV s" stale-test-" FS:MKTEMP-DIR-IN KEEP {: tmp :}
+   [: tmp REMOVED-WHOLE ;] [: tmp FS:REMOVE-TREE ;] finally ;
 
 public
 

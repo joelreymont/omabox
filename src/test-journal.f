@@ -68,8 +68,8 @@ private
    ( SQLITE:statement ^ARENA:arena
      -- SQLITE:statement MODEL:hash-record )
    {: ar :}
-   0 SQLITE:COL-BLOB str> ar BYTES-PATH {: p:MODEL:path :}
-   1 SQLITE:COL-TEXT >str {: json:str :}
+   0 SQLITE:COL-BLOB ar BYTES-PATH {: p:MODEL:path :}
+   1 SQLITE:COL-TEXT {: json:str :}
    p json ar HASH-OF ;
 
 public
@@ -83,8 +83,7 @@ public
       FROM local_hash_cache AS cache
       JOIN local_root_binding AS root
          ON root.singleton = 1 AND cache.root_generation = root.generation
-      ORDER BY cache.path"
-   >str [: begin SQLITE:STEP while ar HASH-ROW v VEC:PUSH ! repeat ;]
+      ORDER BY cache.path" [: begin SQLITE:STEP while ar HASH-ROW v VEC:PUSH ! repeat ;]
    SQLITE:WITH-STATEMENT
    v ;
 
@@ -126,17 +125,15 @@ private
    ( record-status SQLITE:connection recovery-id -- recovery-completion )
    {: s c id :}
    s DONE? if construct recovery-completion already-completed exit then
-   c s" UPDATE recovery_records SET status = 'completed' WHERE id = ?1"
-   >str [: id RECOVERY-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   c s" UPDATE recovery_records SET status = 'completed' WHERE id = ?1" [: id RECOVERY-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT
    construct recovery-completion completed ;
 
 : COMPLETE-RECOVERY-IN
    ( SQLITE:connection recovery-id str -- recovery-completion )
    {: c id path:str :}
-   c s" SELECT status FROM recovery_records WHERE id = ?1"
-   >str [: id RECOVERY-ID>N 1 SQLITE:BIND-INT
-      s" read recovery status" >str path RECOVERY-STATUS ;]
+   c s" SELECT status FROM recovery_records WHERE id = ?1" [: id RECOVERY-ID>N 1 SQLITE:BIND-INT
+      s" read recovery status" path RECOVERY-STATUS ;]
    SQLITE:WITH-STATEMENT
    MATCH option
       none OF construct recovery-completion not-found ENDOF
@@ -172,8 +169,8 @@ STRUCTURE intent
 : NO-REV ( -- option<DROPBOX:rev> ) OPTION:NONE ;
 
 : REV= ( DROPBOX:rev DROPBOX:rev -- bool )
-   DROPBOX:REV>STR str> {: b:^ bu :}
-   DROPBOX:REV>STR str> b bu STR= ;
+   {: a b :}
+   a DROPBOX:REV>STR b DROPBOX:REV>STR STR= ;
 
 : DESTRUCTIVE? ( MODEL:operation -- bool )
    MATCH MODEL:operation
@@ -193,7 +190,7 @@ STRUCTURE intent
 
 : MISSING-PRESERVATION ( MODEL:path -- )
    {: path :}
-   s" derive recovery content" >str path
+   s" derive recovery content" path
    s" destructive operation lacks immediately preceding matching preservation"
    PATH-INVALID ;
 
@@ -276,8 +273,7 @@ STRUCTURE intent
    ( SQLITE:connection operation-id ^ARENA:arena
      -- option<recovery-record> )
    {: c id ar :}
-   c s" SELECT id FROM recovery_records WHERE operation_id = ?1"
-   >str [: id OPERATION-ID>N 1 SQLITE:BIND-INT RECOVERY-ID-ROW ;]
+   c s" SELECT id FROM recovery_records WHERE operation_id = ?1" [: id OPERATION-ID>N 1 SQLITE:BIND-INT RECOVERY-ID-ROW ;]
    SQLITE:WITH-STATEMENT
    MATCH option
       none OF NO-RECOVERY ENDOF
@@ -301,8 +297,7 @@ STRUCTURE intent
    c s" SELECT plans.path, operations.operation_json, operations.status,
          operations.plan_id, operations.ordinal
       FROM operations JOIN plans ON plans.id = operations.plan_id
-      WHERE operations.id = ?1"
-   >str [: id OPERATION-ID>N 1 SQLITE:BIND-INT ar INTENT-ROW ;]
+      WHERE operations.id = ?1" [: id OPERATION-ID>N 1 SQLITE:BIND-INT ar INTENT-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
 : JSON-ROW
@@ -317,13 +312,12 @@ STRUCTURE intent
    {: c t ar :}
    t INTENT-UNMAKE {: path json:str status:str plan ordinal :}
    c s" SELECT operation_json FROM operations
-      WHERE plan_id = ?1 AND ordinal = ?2"
-   >str [: plan PLAN-ID>N 1 SQLITE:BIND-INT ordinal 1- 2 SQLITE:BIND-INT
+      WHERE plan_id = ?1 AND ordinal = ?2" [: plan PLAN-ID>N 1 SQLITE:BIND-INT ordinal 1- 2 SQLITE:BIND-INT
       ar JSON-ROW ;]
    SQLITE:WITH-STATEMENT MATCH option
       none OF path MISSING-PRESERVATION ENDOF
       some OF
-         path ar s" deserialize preservation operation" >str OPERATION-AS
+         path ar s" deserialize preservation operation" OPERATION-AS
       ENDOF
    ;MATCH ;
 
@@ -338,19 +332,18 @@ STRUCTURE intent
    ( SQLITE:connection operation-id MODEL:path MODEL:path DROPBOX:hash
      ^ARENA:arena ^JSON:writer -- recovery-write )
    {: c id original copy content ar w :}
-   w [: content swap MODEL:HASH>JSON ;] ENCODE {: js:^ ju :}
+   w [: content swap MODEL:HASH>JSON ;] ENCODE {: js:str :}
    c s" INSERT INTO recovery_records(operation_id, original_path,
          recovery_path, content_json, status)
-      VALUES (?1, ?2, ?3, ?4, 'pending')"
-   >str [: id OPERATION-ID>N 1 SQLITE:BIND-INT
-      original PATH-BYTES >str 2 SQLITE:BIND-BLOB
-      copy PATH-BYTES >str 3 SQLITE:BIND-BLOB
-      js ju >str 4 SQLITE:BIND-TEXT
+      VALUES (?1, ?2, ?3, ?4, 'pending')" [: id OPERATION-ID>N 1 SQLITE:BIND-INT
+      original MODEL:PATH>STR 2 SQLITE:BIND-BLOB
+      copy MODEL:PATH>STR 3 SQLITE:BIND-BLOB
+      js 4 SQLITE:BIND-TEXT
       SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT
    c c SQLITE:LAST-ROWID >RECOVERY-ID ar READ-RECOVERY MATCH option
       none OF
-         s" read recorded recovery intent" >str original
+         s" read recorded recovery intent" original
          s" new recovery record disappeared inside its transaction"
          PATH-INVALID
       ENDOF
@@ -362,11 +355,11 @@ STRUCTURE intent
      ^JSON:writer -- recovery-write )
    {: c id copy t ar w :}
    t INTENT-UNMAKE {: path json:str status:str plan ordinal :}
-   status str> s" read recovery operation status" >str
+   status s" read recovery operation status"
    path MODEL:PATH>STR DECODE-STATUS DONE? if
       construct recovery-write operation-completed exit
    then
-   json path ar s" deserialize recovery operation" >str OPERATION-AS {: o :}
+   json path ar s" deserialize recovery operation" OPERATION-AS {: o :}
    o DESTRUCTIVE? 0= if
       construct recovery-write operation-not-destructive exit
    then

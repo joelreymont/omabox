@@ -29,6 +29,8 @@ require src/lib/error.f
 require src/lib/string.f
 require src/lib/span.f
 require src/lib/byte-buffer.f
+require src/lib/vector.f
+require src/lib/heap.f
 require src/lib/arena.f
 require src/lib/json.f
 require src/lib/log.f
@@ -99,7 +101,7 @@ STRUCTURE status OPAQUE DERIVE addr
    FIELD updated n
    FIELD shown ^n
    FIELD spare ^n
-   FIELD out ^n
+   FIELD out ^VEC:vector<u8>
    FIELD writer JSON:writer
    FIELD detached bool
 ;STRUCTURE
@@ -115,7 +117,7 @@ $180 constant MODE-FILE
 
 ARENA STATUSES status
 
-: FILE$ ( -- ^u8 n ) s" status.json" ;
+: FILE$ ( -- str ) s" status.json" ;
 
 TASK:FACILITY LOCK
 LOCK TASK:FACILITY-INIT
@@ -138,47 +140,46 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
 
 
 \ errno is FS:ERRNO as the failure left it, 0 for none.
-: IO-FAILED ( ^u8 n n n -- )
-   {: op:^ opu code errno :}
-   LOG-OPEN s" could not " LOG:TEXT+ op opu LOG:TEXT+
+: IO-FAILED ( str n n -- )
+   {: op code errno :}
+   LOG-OPEN s" could not " LOG:TEXT+ op LOG:TEXT+
    s" : " LOG:TEXT+
-   errno 0= if code LOG:CODE+ else errno FS:ERRNO$ str> LOG:TEXT+ then
+   errno 0= if code LOG:CODE+ else errno FS:ERRNO$ LOG:TEXT+ then
    LOG:;LINE
    E-IO throw ;
 
 
 \ Runs io; its failure is the operation op's.
-: IO ( [ -- ] ^u8 n -- )
-   {: io op:^ opu :}
+: IO ( [ -- ] str -- )
+   {: io op :}
    FS:CAUSE-CLEAR
    io catch {: code :}
    code 0= if exit then
-   op opu code FS:ERRNO IO-FAILED ;
+   op code FS:ERRNO IO-FAILED ;
 
 
 \ ---- paths ---------------------------------------------------------
 
-: ABSOLUTE? ( ^u8 n -- bool )
-   {: a:^ u :}
-   u 0 > if a c@ SLASH = exit then
+: ABSOLUTE? ( str -- bool )
+   {: p :}
+   p STR:len 0 > if p STR:data c@ SLASH = exit then
    false ;
 
 
 \ base/name in the arena.
-: JOINED ( str ^u8 n ^ARENA:arena -- str )
-   {: base:str n:^ nu ar :}
-   base str> {: b:^ bu :}
-   ar bu nu + 1 + ARENA:ALLOC SPAN:MAKE {: dst :}
-   b bu >str n nu >str dst FS:JOIN-PATH-INTO {: u :}
-   dst SPAN:$ drop u >str ;
+: JOINED ( str str ^ARENA:arena -- str )
+   {: base:str n:str ar :}
+   ar base STR:len n STR:len + 1 + ARENA:ALLOC SPAN:MAKE {: dst :}
+   base n dst FS:JOIN-PATH-INTO {: u :}
+   dst SPAN:$ STR:data u >str ;
 
 
 \ .status.<pid>.tmp in the arena.
 : TEMP-NAME ( ^ARENA:arena -- str )
    {: ar :}
-   s" .status." {: h:^ hu :}
-   getpid FMT:INT$ {: p:^ pu :}
-   s" .tmp" {: t:^ tu :}
+   s" .status." str> {: h:^ hu :}
+   getpid FMT:INT$ str> {: p:^ pu :}
+   s" .tmp" str> {: t:^ tu :}
    hu pu + tu + {: u :}
    ar u ARENA:ALLOC drop {: dst:^ :}
    h dst hu BYTE-COPY
@@ -194,7 +195,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
    [: d FS:MODE-PRIVATE-DIR FS:MKDIR-MODE ;] catch {: code :}
    code 0= if exit then
    FS:ERRNO {: errno :}
-   errno FS:EEXIST = if d str> FS:DIR? if exit then then
+   errno FS:EEXIST = if d FS:DIR? if exit then then
    s" create the runtime status directory" code errno IO-FAILED ;
 
 
@@ -217,7 +218,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
    ARENA:ALLOC-DISPOSE drop CELL-VIEW {: held :}
    -1 held !
    FS:CAUSE-CLEAR
-   0 >FD [: drop d str> FS:OPEN-DIR-FOLLOW ;] catch {: f code :}
+   0 >FD [: drop d FS:OPEN-DIR-FOLLOW ;] catch {: f code :}
    code 0= if f FD>N held ! f exit then
    s" open the runtime status directory" code FS:ERRNO IO-FAILED ;
 
@@ -225,28 +226,27 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
 \ ---- the transfer's path -------------------------------------------
 
 \ buf's bytes after the replace, as one str.
-: FILLED ( ^u8 n ^n -- str )
-   {: a:^ u buf :}
-   a u BUF:N>BLEN buf BUF:REPLACE
+: FILLED ( str ^n -- str )
+   {: a buf :}
+   a str> BUF:N>BLEN buf BUF:REPLACE
    buf BUF:SPAN$ BUF:BLEN>N >str ;
 
 
-: REPAIRED ( ^u8 n ^n ^ARENA:arena -- str )
-   {: a:^ u buf ar :}
-   a u >str ar UTF8-LOSSY:REPAIR str> buf FILLED ;
+: REPAIRED ( str ^n ^ARENA:arena -- str )
+   {: a buf ar :}
+   a ar UTF8-LOSSY:REPAIR buf FILLED ;
 
 
 \ The path as the widget shows it, in buf: an absolute one is never
 \ shown, an empty one is the root, and bytes not UTF-8 are repaired.
 : DISPLAYED ( str ^n -- str )
    {: p:str buf :}
-   p str> {: a:^ u :}
-   a u ABSOLUTE? if
+   p ABSOLUTE? if
       s" (invalid synchronized path)" buf FILLED exit
    then
-   u 0= if s" ." buf FILLED exit then
-   a u UTF8:VALID? if a u buf FILLED exit then
-   a u buf [: REPAIRED ;] ARENA:WITH ;
+   p STR:len 0= if s" ." buf FILLED exit then
+   p UTF8:VALID? if p buf FILLED exit then
+   p buf [: REPAIRED ;] ARENA:WITH ;
 
 
 \ ---- the snapshot --------------------------------------------------
@@ -255,6 +255,12 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
    BUF:HDR-BYTES [: CELL-VIEW BUF:DISPOSE ;] ARENA:ALLOC-DISPOSE
    drop CELL-VIEW
    dup FIRST-CAP BUF:N>BLEN BUF:INIT ;
+
+
+\ On the heap, as BEAT's publish may grow it; the status's release deletes
+\ it.
+: OUTPUT ( -- ^VEC:vector<u8> )
+   HEAP:ALLOCATOR 0 [type] u8 VEC:NEW ;
 
 
 : NO-SAMPLE ( -- option<transfer> ) OPTION:NONE ;
@@ -269,7 +275,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
    STATUS-TRANSFER:UNMAKE 2drop {: d:direction p:str :}
    STATUS-TRANSFER:UNMAKE 2drop {: e:direction q:str :}
    d e STATUS-DIRECTION:EQ 0= if false exit then
-   p str> q str> STR= ;
+   p q STR= ;
 
 
 : HOLDS? ( transfer ^status -- bool )
@@ -366,7 +372,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
 
 \ ---- the JSON ------------------------------------------------------
 
-: PHASE$ ( phase -- ^u8 n )
+: PHASE$ ( phase -- str )
    MATCH phase
       starting OF s" starting" ENDOF
       syncing OF s" syncing" ENDOF
@@ -377,7 +383,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
    ;MATCH ;
 
 
-: DIRECTION$ ( direction -- ^u8 n )
+: DIRECTION$ ( direction -- str )
    MATCH direction
       upload OF s" upload" ENDOF
       download OF s" download" ENDOF
@@ -395,7 +401,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
    STATUS-TRANSFER:UNMAKE {: w d:direction p:str done total :}
    w JSON:WRITE-OBJECT-START
    s" direction" d DIRECTION$ JSON:WRITE-FIELD-S JSON:WRITE-COMMA
-   s" path" p str> JSON:WRITE-FIELD-S JSON:WRITE-COMMA
+   s" path" p JSON:WRITE-FIELD-S JSON:WRITE-COMMA
    s" bytes_done" done JSON:WRITE-FIELD-U JSON:WRITE-COMMA
    s" bytes_total" JSON:WRITE-KEY total TOTAL
    JSON:WRITE-OBJECT-END ;
@@ -411,7 +417,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
    JSON:WRITE-ARRAY-END ;
 
 
-: UNSYNCED$ ( -- ^u8 n )
+: UNSYNCED$ ( -- str )
    s" One or more files could not be synchronized." ;
 
 
@@ -419,7 +425,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
    MATCH fault
       none OF JSON:WRITE-NULL ENDOF
       retrying OF drop JSON:WRITE-STRING ENDOF
-      unsynced OF UNSYNCED$ >str JSON:WRITE-STRING ENDOF
+      unsynced OF UNSYNCED$ JSON:WRITE-STRING ENDOF
       stopped OF JSON:WRITE-STRING ENDOF
    ;MATCH ;
 
@@ -427,7 +433,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
 \ serde's field order, compact, into out.
 : ENCODE ( ^status -- )
    {: s :}
-   s STATUS-WRITER s STATUS-OUT @ JSON:WRITE-OPEN-BUF
+   s STATUS-WRITER s STATUS-OUT @ JSON:OPEN
    JSON:WRITE-OBJECT-START
    s" version" SCHEMA JSON:WRITE-FIELD-U JSON:WRITE-COMMA
    s" phase" s STATUS-NOW @ PHASE$ JSON:WRITE-FIELD-S
@@ -437,7 +443,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
    s" last_error" JSON:WRITE-KEY s STATUS-FAULT @ LAST-ERROR
    JSON:WRITE-COMMA
    s" updated_at" s STATUS-UPDATED @ JSON:WRITE-FIELD-U
-   JSON:WRITE-OBJECT-END JSON:WRITE-CLOSE ;
+   JSON:WRITE-OBJECT-END JSON:CLOSE ;
 
 
 \ ---- publishing ----------------------------------------------------
@@ -453,7 +459,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
    t s STATUS-UPDATED ! ;
 
 
-: ENCODED ( ^status -- ^u8 n )
+: ENCODED ( ^status -- str )
    {: s :}
    [: s ENCODE ;] catch {: code :}
    code 0<> if
@@ -461,27 +467,27 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
       code LOG:CODE+ LOG:;LINE
       E-SERIALIZE throw
    then
-   s STATUS-OUT @ BUF:SPAN$ BUF:BLEN>N ;
+   s STATUS-OUT @ VEC:SPAN SPAN:$ ;
 
 
 \ The temporary removed, an absent one included. Another failure is only
 \ logged: the caller's own failure, or the create's EEXIST, is what throws.
 : SWEPT ( ^status -- )
    {: s :}
-   s STATUS-ANCHOR @ s STATUS-TEMP @ str> FS:TRY-REMOVE-FILE-AT
+   s STATUS-ANCHOR @ s STATUS-TEMP @ FS:TRY-REMOVE-FILE-AT
    if exit then
    FS:ERRNO {: errno :}
    errno FS:ENOENT = if exit then
    LOG:WARN s" status" LOG:LINE
    s" could not remove a temporary runtime status file: " LOG:TEXT+
-   errno FS:ERRNO$ str> LOG:TEXT+ LOG:;LINE ;
+   errno FS:ERRNO$ LOG:TEXT+ LOG:;LINE ;
 
 
 \ The temporary removed, then the failure of op.
-: DISCARDED ( ^status ^u8 n n n -- )
-   {: s op:^ opu code errno :}
+: DISCARDED ( ^status str n n -- )
+   {: s op code errno :}
    s SWEPT
-   op opu code errno IO-FAILED ;
+   op code errno IO-FAILED ;
 
 
 \ The temporary, a new unnamed 0600 file in the directory, open.
@@ -495,28 +501,28 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
 
 
 \ Runs io on the unnamed f; its failure closes f and is op's.
-: STAGED ( fd [ -- ] ^u8 n -- )
-   {: f:fd io op:^ opu :}
+: STAGED ( fd [ -- ] str -- )
+   {: f:fd io op :}
    FS:CAUSE-CLEAR
    io catch {: code :}
    code 0= if exit then
    FS:ERRNO {: errno :}
    f CLOSED
-   op opu code errno IO-FAILED ;
+   op code errno IO-FAILED ;
 
 
-: WRITTEN ( fd ^u8 n -- )
-   {: f:fd a:^ u :}
+: WRITTEN ( fd str -- )
+   {: f:fd b :}
    f [: f MODE-FILE FD:MODE! ;]
    s" secure the temporary status file" STAGED
-   f [: f a u FD:WRITE-FULL ;]
+   f [: f b FD:WRITE-FULL ;]
    s" write the temporary status file" STAGED ;
 
 
 \ A failed close is not reported, as Rust's drop of a File does not.
 : NAMED ( ^status fd -- )
    {: s f:fd :}
-   f s STATUS-ANCHOR @ s STATUS-TEMP @ str> FS:TRY-LINK-AT {: linked :}
+   f s STATUS-ANCHOR @ s STATUS-TEMP @ FS:TRY-LINK-AT {: linked :}
    FS:ERRNO {: errno :}
    f CLOSED
    linked if exit then
@@ -526,7 +532,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
 : REPLACED ( ^status -- )
    {: s :}
    s STATUS-ANCHOR @ {: dir:fd :}
-   dir s STATUS-TEMP @ str> dir FILE$ FS:TRY-RENAME-AT
+   dir s STATUS-TEMP @ dir FILE$ FS:TRY-RENAME-AT
    if exit then
    s s" replace the status file" E-IO FS:ERRNO DISCARDED ;
 
@@ -534,9 +540,9 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
 : PUBLISH ( ^status -- )
    {: s :}
    s STAMPED
-   s ENCODED {: a:^ u :}
+   s ENCODED {: b :}
    s CREATED {: f:fd :}
-   f a u WRITTEN
+   f b WRITTEN
    s f NAMED
    s REPLACED ;
 
@@ -578,16 +584,16 @@ public
 \ Under runtime, an absolute path to a directory.
 : NEW ( str ^ARENA:arena -- ^status )
    {: runtime:str ar :}
-   runtime str> ABSOLUTE? 0= if E-RUNTIME-NOT-ABSOLUTE REFUSED then
-   runtime str> FS:DIR? 0= if E-RUNTIME-UNAVAILABLE REFUSED then
-   ar STATUSES-NEW {: s :}
+   runtime ABSOLUTE? 0= if E-RUNTIME-NOT-ABSOLUTE REFUSED then
+   runtime FS:DIR? 0= if E-RUNTIME-UNAVAILABLE REFUSED then
+   ar [: STATUS-OUT @ VEC:DELETE ;] STATUSES-NEW-DISPOSE {: s :}
    runtime s" omabox" ar JOINED s STATUS-DIR !
    s STATUS-DIR @ PRIVATE-DIR
    s STATUS-DIR @ ar ANCHORED s STATUS-ANCHOR !
    ar TEMP-NAME s STATUS-TEMP !
    ar BUFFER s STATUS-SHOWN !
    ar BUFFER s STATUS-SPARE !
-   ar BUFFER s STATUS-OUT !
+   OUTPUT s STATUS-OUT !
    construct phase starting s STATUS-NOW !
    s CLEARED
    NO-FAULT s STATUS-FAULT !
@@ -597,9 +603,9 @@ public
 
 : FROM-ENVIRONMENT ( ^ARENA:arena -- ^status )
    {: ar :}
-   s" XDG_RUNTIME_DIR" GETENV {: v:^ vu :}
-   v NULL-PTR = if E-RUNTIME-MISSING REFUSED then
-   v vu >str ar NEW ;
+   s" XDG_RUNTIME_DIR" GETENV {: v :}
+   v STR:data NULL-PTR = if E-RUNTIME-MISSING REFUSED then
+   v ar NEW ;
 
 
 \ A status that writes nothing, for a daemon with no runtime directory.

@@ -76,6 +76,7 @@ require src/lib/string.f
 require src/lib/test.f
 require src/lib/test/stderr.f
 require src/lib/test/mapped.f
+require src/lib/test/counting-allocator.f
 require src/lib/memory.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
@@ -93,15 +94,19 @@ private
 TYPED-VARIABLE PROBE config
 
 
+\ A store that keeps nothing.
+: KEEP-NONE ( str -- ) drop ;
+
+
 \ A client on an arena of its own, with PROBE's root, origins at
 \ NOWHERE$ and a store that keeps nothing, as no case sends.
-: PROBED ( ^u8 n ^ARENA:arena -- ^client )
-   {: r:^ ru:n ar :}
-   r ru SPAN:MAKE PROBE DROPBOX-CONFIG:ROOT !
-   TEST-CLIENT:NOWHERE$ SPAN:MAKE PROBE DROPBOX-CONFIG:API !
-   TEST-CLIENT:NOWHERE$ SPAN:MAKE PROBE DROPBOX-CONFIG:NOTIFY !
-   TEST-CLIENT:NOWHERE$ SPAN:MAKE PROBE DROPBOX-CONFIG:CONTENT !
-   [: 2drop ;] PROBE DROPBOX-CONFIG:STORE !
+: PROBED ( str ^ARENA:arena -- ^client )
+   {: r ar :}
+   r str> SPAN:MAKE PROBE DROPBOX-CONFIG:ROOT !
+   TEST-CLIENT:NOWHERE$ str> SPAN:MAKE PROBE DROPBOX-CONFIG:API !
+   TEST-CLIENT:NOWHERE$ str> SPAN:MAKE PROBE DROPBOX-CONFIG:NOTIFY !
+   TEST-CLIENT:NOWHERE$ str> SPAN:MAKE PROBE DROPBOX-CONFIG:CONTENT !
+   [: KEEP-NONE ;] PROBE DROPBOX-CONFIG:STORE !
    PROBE ar OPEN ;
 
 
@@ -110,25 +115,39 @@ TYPED-VARIABLE PROBE config
    s" a reader's own code" T-LABEL
    ARENA:NEW {: ar :}
    s" " ar PROBED {: c :}
-   s\" {\"a\":1}" BUF:N>BLEN c CLIENT-ANSWER @ BUF:REPLACE
+   s\" {\"a\":1}" str> BUF:N>BLEN c CLIENT-ANSWER @ BUF:REPLACE
    [: c [: drop EXIT-STATUS:MEMORY-FAULT throw ;] PARSE ;]
    EXIT-STATUS:MEMORY-FAULT TTHROWSQ
    c CLOSE
    ar ARENA:RELEASE ;
 
 
+\ The xt run with the client's vectors on ALLOC-TEST:COUNTING, its
+\ counts cleared; VEC-ALLOC is the heap again however the xt ends.
+: COUNTED ( [ -- ] -- )
+   0 ALLOC-TEST:TAKEN ! 0 ALLOC-TEST:FREED !
+   ALLOC-TEST:COUNTING VEC-ALLOC !
+   [: HEAP:ALLOCATOR VEC-ALLOC ! ;] finally ;
+
+
+\ OPEN's filling of c fails on PROBE's root as a header byte.
+: UNDONE-OPEN ( ^client ^ARENA:arena -- )
+   {: c ar :}
+   [: c PROBE ar FILLED ;] E-JSON-WRITE-BYTE TTHROWSQ ;
+
+
 \ A root that is not UTF-8 fails the Path-Root line after the buffers
-\ exist; none of them stays live.
+\ and vectors exist; none of them stays live, every vector taken is freed.
 : UNDONE-CASE ( -- )
    s" an OPEN that fails" T-LABEL
    ARENA:NEW {: ar :}
-   s\" \xFF" SPAN:MAKE PROBE DROPBOX-CONFIG:ROOT !
+   s\" \xFF" str> SPAN:MAKE PROBE DROPBOX-CONFIG:ROOT !
    ar CLIENTS-NEW {: c :}
-   [: c PROBE ar FILLED ;] E-JSON-WRITE-BYTE TTHROWSQ
+   [: c ar UNDONE-OPEN ;] COUNTED
+   ALLOC-TEST:TAKEN @ {: k:n :}
+   k ALLOC-TEST:FREED @ = k 0<> and T-ASSERT
    c CLIENT-TOKEN @ BUF:LIVE? 0= T-ASSERT
    c CLIENT-ACCESS @ BUF:LIVE? 0= T-ASSERT
-   c CLIENT-BODY @ BUF:LIVE? 0= T-ASSERT
-   c CLIENT-LINE @ BUF:LIVE? 0= T-ASSERT
    c CLIENT-ANSWER @ BUF:LIVE? 0= T-ASSERT
    c CLIENT-SENT @ BUF:LIVE? 0= T-ASSERT
    c CLIENT-MARK @ BUF:LIVE? 0= T-ASSERT
@@ -269,21 +288,21 @@ variable WITNESS-U
 variable REFUSALS
 
 
-: KEPT$ ( -- ^u8 n ) KEPT KEPT-U @ ;
-: WITNESS$ ( -- ^u8 n ) WITNESS WITNESS-U @ ;
+: KEPT$ ( -- str ) KEPT KEPT-U @ >str ;
+: WITNESS$ ( -- str ) WITNESS WITNESS-U @ >str ;
 
 
-: KEPT+ ( ^u8 n -- )
-   {: a:^ u:n :}
+: KEPT+ ( str -- )
+   str> {: a:^ u:n :}
    a KEPT KEPT-U @ + u BYTE-COPY
    u KEPT-U +! ;
 
 
-: RECORD-TOKEN ( ^u8 n -- )
-   {: t:^ tu:n :}
+: RECORD-TOKEN ( str -- )
+   {: t :}
    KEPT-U @ 0<> if s"  " KEPT+ then
-   t tu KEPT+
-   TEST-DROPBOX:SEEN$ {: w:^ wu:n :}
+   t KEPT+
+   TEST-DROPBOX:SEEN$ str> {: w:^ wu:n :}
    w WITNESS wu BYTE-COPY wu WITNESS-U !
    REFUSALS @ 0= if exit then
    -1 REFUSALS +!
@@ -296,9 +315,9 @@ variable REFUSALS
 
 \ A client on the fake with the refresh token t and root r, and the
 \ recording store.
-: RECORDED-CLIENT ( ^u8 n ^u8 n -- ^DROPBOX:client )
-   {: t:^ tu:n r:^ ru:n :}
-   [: RECORD-TOKEN ;] t tu r ru AR @ CLIENT-ON ;
+: RECORDED-CLIENT ( str str -- ^DROPBOX:client )
+   {: t r :}
+   [: RECORD-TOKEN ;] t r AR @ CLIENT-ON ;
 
 
 : ACCOUNT-CASE ( -- )
@@ -382,10 +401,10 @@ variable REFUSALS
 
 \ get_metadata answers /paper with the body; the entry is a file that is
 \ not downloadable.
-: UNDOWNLOADABLE ( ^u8 n -- )
-   {: b:^ bu:n :}
+: UNDOWNLOADABLE ( str -- )
+   {: b :}
    TEST-DROPBOX:RESET
-   200 s" " s" " b bu TEST-DROPBOX:SCRIPT!
+   200 s" " s" " b TEST-DROPBOX:SCRIPT!
    s" /paper" MAIN @ DROPBOX:METADATA DROPBOX:DONE? ASSERT
    MAIN @ DROPBOX:ENTRY {: e :}
    e DROPBOX-ENTRY:KIND @ DROPBOX-KIND:FILE DROPBOX-KIND:EQ TTRUE
@@ -474,17 +493,18 @@ TYPED-VARIABLE ACTION [ -- ]
 TYPED-VARIABLE OUTCOME bool
 
 
-: ERR-PATH$ ( -- ^u8 n ) ERR-PATH ERR-PATH-U @ ;
-: ERR$ ( -- ^u8 n ) ERR @ ERR-U @ ;
+: ERR-PATH$ ( -- str ) ERR-PATH ERR-PATH-U @ >str ;
+: ERR$ ( -- str ) ERR @ ERR-U @ >str ;
 
 
 \ TMPDIR/<name> at dst; answers its length.
-: IN-TMP ( ^u8 n ^u8 -- n )
-   {: nm:^ nu:n dst:^ :}
-   s" TMPDIR" GETENV {: d:^ du:n :}
+: IN-TMP ( str ^u8 -- n )
+   {: nm dst:^ :}
+   nm str> {: n:^ nu:n :}
+   s" TMPDIR" GETENV str> {: d:^ du:n :}
    d dst du BYTE-COPY
    47 dst du + c!
-   nm dst du + 1+ nu BYTE-COPY
+   n dst du + 1+ nu BYTE-COPY
    du 1+ nu + ;
 
 
@@ -493,18 +513,18 @@ TYPED-VARIABLE OUTCOME bool
 : LOGGED ( [ -- ] -- n )
    ACTION !
    s" stderr.txt" ERR-PATH IN-TMP ERR-PATH-U !
-   ACTION @ ERR-PATH$ >str AR @ STDERR:CAPTURING str> ERR-U ! ERR ! ;
+   ACTION @ ERR-PATH$ AR @ STDERR:CAPTURING str> ERR-U ! ERR ! ;
 
 
-: LINES ( ^u8 n -- n )
-   {: a:^ u:n :}
+: LINES ( str -- n )
+   str> {: a:^ u:n :}
    0 u 0 ?do a i + c@ 10 = if 1+ then loop ;
 
 
 \ ERR$ is one line that holds the text.
-: LOGGED? ( ^u8 n -- bool )
-   {: t:^ tu:n :}
-   ERR$ LINES 1 = ERR$ t tu CONTAINS? and ;
+: LOGGED? ( str -- bool )
+   {: t :}
+   ERR$ LINES 1 = ERR$ t CONTAINS? and ;
 
 
 \ A case's own client, for an action LOGGED runs.
@@ -583,7 +603,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
 
 \ ---- the refresh token's rotation
 
-: BEARER$ ( -- ^u8 n )
+: BEARER$ ( -- str )
    SB-RESET s" Bearer " SB-APPEND TEST-DROPBOX:ISSUED$ SB-APPEND SB$ ;
 
 
@@ -671,19 +691,19 @@ TYPED-VARIABLE OWN ^DROPBOX:client
 
 
 \ ALPHABET's rev and content hash, as DOWNLOAD takes them.
-: ABC-REV ( -- DROPBOX:rev ) s" 0160a1b2c3d4" >str DROPBOX:>REV ;
+: ABC-REV ( -- DROPBOX:rev ) s" 0160a1b2c3d4" DROPBOX:>REV ;
 : ABC-HASH ( -- DROPBOX:hash )
    s" 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-   >str DROPBOX:>HASH ;
+   DROPBOX:>HASH ;
 
 
 \ A download whose refresh is answered s with body b throws code; the
 \ download is never sent, and HTTP-STATUS answers 0, not s.
-: REFRESH-FAILED ( n ^u8 n n -- )
-   {: s:n b:^ bu:n code:n :}
+: REFRESH-FAILED ( n str n -- )
+   {: s:n b code:n :}
    TEST-DROPBOX:RESET
    s" live-token" s" ns-root" RECORDED-CLIENT OWN !
-   s" /oauth2/token" s s" " s" " b bu TEST-DROPBOX:ROUTE-SCRIPT!
+   s" /oauth2/token" s s" " s" " b TEST-DROPBOX:ROUTE-SCRIPT!
    [: ABC-REV ABC-HASH 0 OWN @ [: 2drop drop ;] DROPBOX:DOWNLOAD
       DROPBOX:DONE? drop ;] LOGGED code T=
    OWN @ DROPBOX:HTTP-STATUS 0 T=
@@ -818,12 +838,12 @@ TYPED-VARIABLE OWN ^DROPBOX:client
 
 
 \ A delete refused 409 with the WriteError tag answers refused with e.
-: WRITE-REFUSED ( ^u8 n DROPBOX:error -- )
-   {: t:^ tu:n e:DROPBOX:error :}
+: WRITE-REFUSED ( str DROPBOX:error -- )
+   {: t e:DROPBOX:error :}
    TEST-DROPBOX:RESET
-   SB-RESET S\" {\qerror_summary\q:\qpath_write/" SB-APPEND t tu SB-APPEND
+   SB-RESET S\" {\qerror_summary\q:\qpath_write/" SB-APPEND t SB-APPEND
    S\" /\q,\qerror\q:{\q.tag\q:\qpath_write\q,\qpath_write\q:{\q.tag\q:\q"
-   SB-APPEND t tu SB-APPEND S\" \q}}}" SB-APPEND
+   SB-APPEND t SB-APPEND S\" \q}}}" SB-APPEND
    409 s" " s" " SB$ TEST-DROPBOX:SCRIPT!
    s" /held.txt" s" " MAIN @ DROPBOX:DELETE e REFUSED? ASSERT
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2" T$= ;
@@ -927,13 +947,13 @@ create GOT GOT-CAP allot
 variable GOT-U
 
 
-: GOT+ ( ^u8 n -- )
-   {: a:^ u:n :}
-   a u GOT GOT-U @ + GOT-CAP GOT-U @ - SPAN:MAKE SPAN:COPY
-   u GOT-U +! ;
+: GOT+ ( str -- )
+   {: a :}
+   a GOT GOT-U @ + GOT-CAP GOT-U @ - SPAN:MAKE SPAN:COPY
+   a str> nip GOT-U +! ;
 
 
-: KIND$ ( DROPBOX:kind -- ^u8 n )
+: KIND$ ( DROPBOX:kind -- str )
    MATCH DROPBOX:kind
       file OF s" f" ENDOF
       folder OF s" d" ENDOF
@@ -950,7 +970,7 @@ variable GOT-U
    e DROPBOX-ENTRY:LOWER @ SPAN:$ GOT+ ;
 
 
-: GOT$ ( -- ^u8 n ) GOT GOT-U @ ;
+: GOT$ ( -- str ) GOT GOT-U @ >str ;
 : LISTING ( -- ) TEST-DROPBOX:RESET 0 GOT-U ! ;
 
 
@@ -986,23 +1006,23 @@ variable ASTRAY
 variable WIDEST
 
 
-: WIDE+ ( ^u8 n -- ) BUF:N>BLEN WIDE BUF:APPEND-SPAN ;
+: WIDE+ ( str -- ) str> BUF:N>BLEN WIDE BUF:APPEND-SPAN ;
 
 
 : NTH+ ( n -- )
-   FMT:INT$ {: d:^ du:n :}
-   S\" {\q.tag\q:\qfolder\q,\qpath_lower\q:\q/sync/d" WIDE+ d du WIDE+
-   S\" \q,\qpath_display\q:\q/Sync/d" WIDE+ d du WIDE+ S\" \q}" WIDE+ ;
+   FMT:INT$ {: d :}
+   S\" {\q.tag\q:\qfolder\q,\qpath_lower\q:\q/sync/d" WIDE+ d WIDE+
+   S\" \q,\qpath_display\q:\q/Sync/d" WIDE+ d WIDE+ S\" \q}" WIDE+ ;
 
 
 \ The entries array of entries from up to to, in WIDE.
-: NTHS ( n n -- ^u8 n )
+: NTHS ( n n -- str )
    {: from:n to:n :}
    WIDE 1024 BUF:N>BLEN BUF:RESET
    s" [" WIDE+
    to from ?do i from <> if s" ," WIDE+ then i NTH+ loop
    s" ]" WIDE+
-   WIDE BUF:SPAN$ BUF:BLEN>N ;
+   WIDE BUF:SPAN$ BUF:BLEN>N >str ;
 
 
 : WIDTH ( n -- n ) 5 = if WIDE-COUNT else 1 then ;
@@ -1012,17 +1032,18 @@ variable WIDEST
 : LONG-PAGE ( n n -- n )
    {: from:n j:n :}
    from j WIDTH + {: to:n :}
-   from to NTHS {: e:^ eu:n :}
-   eu WIDEST @ max WIDEST !
+   from to NTHS {: e :}
+   e str> nip WIDEST @ max WIDEST !
    SB-RESET s" c" SB-APPEND j FMT:SB-INT
-   e eu SB$ j LONG-PAGES 1 - < TEST-DROPBOX:PAGE!
+   e SB$ j LONG-PAGES 1 - < TEST-DROPBOX:PAGE!
    to ;
 
 
-: NTH? ( ^u8 n n -- bool )
-   {: p:^ u:n i:n :}
-   p u >str s" /sync/d" >str STARTS-WITH? 0= if false exit then
-   p 7 + u 7 - i FMT:INT$ STR= ;
+: NTH? ( str n -- bool )
+   {: s i:n :}
+   s s" /sync/d" STARTS-WITH? 0= if false exit then
+   s str> {: p:^ u:n :}
+   p 7 + u 7 - >str i FMT:INT$ STR= ;
 
 
 : TALLIED ( ^DROPBOX:entry -- )
@@ -1045,11 +1066,11 @@ variable WIDEST
 
 \ A listing of one page that answers done with the cursor, so a case sets
 \ the cursor it starts from.
-: LISTED ( ^u8 n -- )
-   {: k:^ ku:n :}
+: LISTED ( str -- )
+   {: k :}
    LISTING
    S\" [{\q.tag\q:\qfolder\q,\qpath_lower\q:\q/sync\q,\qpath_display\q:\q/Sync\q}]"
-   k ku false TEST-DROPBOX:PAGE!
+   k false TEST-DROPBOX:PAGE!
    s" /sync" MAIN @ [: SAW ;] DROPBOX:LIST DROPBOX:DONE? ASSERT
    LISTING ;
 
@@ -1111,7 +1132,7 @@ variable WIDEST
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$= ;
 
 
-: PROBE$ ( DROPBOX:probe -- ^u8 n )
+: PROBE$ ( DROPBOX:probe -- str )
    MATCH DROPBOX:probe
       empty OF s" empty" ENDOF
       occupied OF s" occupied" ENDOF
@@ -1307,7 +1328,7 @@ variable READ-COUNT
 : SUNK-BODY ( n n ^DROPBOX:fetch -- ) 7 PACED ;
 
 
-: SUNK$ ( -- ^u8 n ) SUNK SUNK-U @ ;
+: SUNK$ ( -- str ) SUNK SUNK-U @ >str ;
 
 
 \ The alphabet as the file at rev 0160a1b2c3d4.
@@ -1490,7 +1511,7 @@ variable READ-COUNT
    s" download unknown rev" T-LABEL
    TEST-DROPBOX:RESET ALPHABET
    SUNK-CLEAR
-   s" 0160ffffffff" >str DROPBOX:>REV ABC-HASH 0 MAIN @
+   s" 0160ffffffff" DROPBOX:>REV ABC-HASH 0 MAIN @
    [: SUNK-BODY ;] DROPBOX:DOWNLOAD
    DROPBOX-ERROR:NOT-FOUND REFUSED? ASSERT
    BODIES @ 0 T= ;
@@ -1503,12 +1524,12 @@ variable READ-COUNT
 
 \ The download fetch makes answers refused unverified, logging one line
 \ that holds the text.
-: REFUSED-LOGGED ( [ -- ] ^u8 n -- )
-   {: fetch t:^ tu:n :}
+: REFUSED-LOGGED ( [ -- ] str -- )
+   {: fetch t :}
    false OUTCOME !
    fetch LOGGED 0 T=
    OUTCOME @ TTRUE
-   t tu LOGGED? TTRUE ;
+   t LOGGED? TTRUE ;
 
 
 : OTHER-REV-CASE ( -- )
@@ -1530,7 +1551,7 @@ variable READ-COUNT
    SUNK-CLEAR
    ABC-REV
    s" ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-   >str DROPBOX:>HASH 0 MAIN @ [: SUNK-BODY ;] DROPBOX:DOWNLOAD
+   DROPBOX:>HASH 0 MAIN @ [: SUNK-BODY ;] DROPBOX:DOWNLOAD
    UNVERIFIED? OUTCOME ! ;
 
 
@@ -1585,7 +1606,7 @@ TYPED-VARIABLE ZEROED bool
 
 
 \ The text of the code READ-BODY throws for a body of another length.
-: UNVERIFIED$ ( -- ^u8 n ) s" a download's answer failed its checks" ;
+: UNVERIFIED$ ( -- str ) s" a download's answer failed its checks" ;
 
 
 \ ZEROED-BODY, ending normally where READ-BODY threw E-UNVERIFIED, which
@@ -1635,9 +1656,9 @@ variable AGAIN-CODE
    s" 0160b1b2c3d4" s" abcde" TEST-DROPBOX:CONTENT!
    TEST-DROPBOX:HOLD-BODY TEST-DROPBOX:LENGTHEN
    SUNK-CLEAR false ZEROED !
-   [: s" 0160b1b2c3d4" >str DROPBOX:>REV
+   [: s" 0160b1b2c3d4" DROPBOX:>REV
       s" 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-      >str DROPBOX:>HASH 0 MAIN @ [: CAUGHT-BODY ;] DROPBOX:DOWNLOAD
+      DROPBOX:>HASH 0 MAIN @ [: CAUGHT-BODY ;] DROPBOX:DOWNLOAD
       UNVERIFIED? OUTCOME ! ;] s" a body of another length" REFUSED-LOGGED
    ZEROED @ TFALSE
    SUNK-U @ 5 <= ASSERT
@@ -1689,7 +1710,7 @@ variable AGAIN-CODE
 
 
 \ The text of the code READ-BODY throws for a transfer lost in the body.
-: LOST$ ( -- ^u8 n ) s" a download's transfer ended inside its body" ;
+: LOST$ ( -- str ) s" a download's transfer ended inside its body" ;
 
 
 \ SUNK-BODY, keeping in BODY-CODE the code it ended with.
@@ -1717,7 +1738,7 @@ variable AGAIN-CODE
    BODIES @ 1 T=
    BODY-CODE @ ERROR:TEXT$ LOST$ T$=
    SUNK-U @ 10 <= TTRUE
-   SUNK$ s" abcdefghij" SUNK-U @ min STR= TTRUE
+   SUNK$ s" abcdefghij" str> SUNK-U @ min >str STR= TTRUE
    USABLE ;
 
 
@@ -1823,9 +1844,9 @@ variable AGAIN-CODE
    s" download of an empty file" T-LABEL
    TEST-DROPBOX:RESET EMPTY-FILE
    SUNK-CLEAR
-   s" 0160e0e0e0e0" >str DROPBOX:>REV
+   s" 0160e0e0e0e0" DROPBOX:>REV
    s" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-   >str DROPBOX:>HASH 0 MAIN @ [: SUNK-BODY ;] DROPBOX:DOWNLOAD
+   DROPBOX:>HASH 0 MAIN @ [: SUNK-BODY ;] DROPBOX:DOWNLOAD
    DROPBOX:DONE? ASSERT
    BODIES @ 1 T= SUNK-U @ 0 T=
    SUNK-AT @ 0 T= SUNK-SIZE @ 0 T= ;
@@ -1849,12 +1870,12 @@ variable AGAIN-CODE
    MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:KIND @ DROPBOX-KIND:EQ ;
 
 
-: LOWER$ ( -- ^u8 n ) MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:LOWER @ SPAN:$ ;
+: LOWER$ ( -- str ) MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:LOWER @ SPAN:$ ;
 
 
-: DELETED-FILE ( ^u8 n ^u8 n -- )
-   {: l:^ lu:n r:^ ru:n :}
-   l lu l lu r ru
+: DELETED-FILE ( str str -- )
+   {: l r :}
+   l l r
    s" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
    0 TEST-DROPBOX:FILE! ;
 
@@ -2058,7 +2079,7 @@ variable AGAIN-CODE
 
 
 \ Bytes a form reserves: each must reach Dropbox encoded.
-: RESERVED$ ( -- ^u8 n ) s" a+b&c=d%e f" ;
+: RESERVED$ ( -- str ) s" a+b&c=d%e f" ;
 
 
 : RESERVED-REFRESH-CASE ( -- )
@@ -2173,7 +2194,7 @@ TYPED-VARIABLE FAULT fault
    u 0 ?do i 255 and a i + c! loop ;
 
 
-: HASHED ( ^u8 n -- ^u8 n )
+: HASHED ( ^u8 n -- str )
    {: a:^ u:n :}
    HASHER DROPBOX:HASH-BEGIN
    a u HASHER DROPBOX:HASH-FEED
@@ -2197,31 +2218,31 @@ TYPED-VARIABLE FAULT fault
    a cap MEM:RELEASE-BYTES ;
 
 
-: STAGE$ ( -- ^u8 n ) STAGE STAGE-U @ ;
+: STAGE$ ( -- str ) STAGE STAGE-U @ >str ;
 
 
 \ TMPDIR/<name>, made fresh.
-: STAGE! ( ^u8 n -- ) STAGE IN-TMP STAGE-U ! ;
+: STAGE! ( str -- ) STAGE IN-TMP STAGE-U ! ;
 
 
 \ Writes the bytes as the stage, opens it and removes its name before any
 \ check can end the run, and readies UP to upload them to path over rev.
-: STAGED ( ^u8 n ^u8 n ^u8 n -- )
-   {: b:^ bu:n p:^ pu:n r:^ ru:n :}
-   STAGE$ b bu FS:WRITE-ALL
-   STAGE$ >str FS:OPEN-SIZED STAGE$ >str FS:REMOVE-FILE ASSERT {: f:fd size:n :}
+: STAGED ( str str str -- )
+   {: b p r :}
+   STAGE$ b FS:WRITE-ALL
+   STAGE$ FS:OPEN-SIZED STAGE$ FS:REMOVE-FILE ASSERT {: f:fd size:n :}
    f UP DROPBOX-UPLOAD:FD !
    size UP DROPBOX-UPLOAD:SIZE !
-   b bu HASHED EXPECTED swap BYTE-COPY
+   b str> HASHED str> EXPECTED swap BYTE-COPY
    EXPECTED 64 SPAN:MAKE UP DROPBOX-UPLOAD:CONTENT-HASH !
-   p pu SPAN:MAKE UP DROPBOX-UPLOAD:PATH !
-   r ru SPAN:MAKE UP DROPBOX-UPLOAD:REV ! ;
+   p str> SPAN:MAKE UP DROPBOX-UPLOAD:PATH !
+   r str> SPAN:MAKE UP DROPBOX-UPLOAD:REV ! ;
 
 
 : UNSTAGED ( -- ) UP DROPBOX-UPLOAD:FD @ FD>N close ;
 
 
-: EXPECTED$ ( -- ^u8 n ) EXPECTED 64 ;
+: EXPECTED$ ( -- str ) EXPECTED 64 >str ;
 
 
 \ The next call answers lookup_failed/not_found, as Dropbox answers a
@@ -2290,7 +2311,7 @@ TYPED-VARIABLE FAULT fault
    UP MAIN @ [: PROGRESSED ;] DROPBOX:UPLOAD ;
 
 
-: ENTRY-HASH$ ( -- ^u8 n )
+: ENTRY-HASH$ ( -- str )
    MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$ ;
 
 
@@ -2343,8 +2364,8 @@ TYPED-VARIABLE FAULT fault
    TEST-DROPBOX:SEEN$
    s" /2/files/upload /2/files/upload /2/files/upload /2/files/delete_v2 /2/files/create_folder_v2"
    T$=
-   s" Bearer sl.fake-" {: b:^ bu:n :}
-   TEST-DROPBOX:AUTH$ bu min b bu T$=
+   s" Bearer sl.fake-" {: b :}
+   TEST-DROPBOX:AUTH$ str> b str> nip min >str b T$=
    TEST-DROPBOX:ROOT-SENT$ S\" {\q.tag\q:\qroot\q,\qroot\q:\qns-root\q}" T$= ;
 
 
@@ -2385,8 +2406,8 @@ TYPED-VARIABLE FAULT fault
    SEND DROPBOX:DONE? ASSERT
    MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:LOWER @ SPAN:$
    S\" /docs/caf\xc3\xa9.txt" T$=
-   S\" {\qpath\q:\q/Docs/Caf\\u00e9.txt\q," {: x:^ xu:n :}
-   TEST-DROPBOX:ARG-SENT$ xu min x xu T$=
+   S\" {\qpath\q:\q/Docs/Caf\\u00e9.txt\q," {: x :}
+   TEST-DROPBOX:ARG-SENT$ str> x str> nip min >str x T$=
    UNSTAGED ;
 
 
@@ -2406,11 +2427,11 @@ TYPED-VARIABLE FAULT fault
 
 
 \ ERR$ holds the line UPLOAD logs for a failure of UP's stage.
-: STAGE-LOGGED? ( ^u8 n -- bool )
-   {: why:^ wu:n :}
+: STAGE-LOGGED? ( str -- bool )
+   {: why :}
    SB-RESET s" error dropbox: upload of " SB-APPEND
    UP DROPBOX-UPLOAD:PATH @ SPAN:$ SB-APPEND
-   s" : " SB-APPEND why wu SB-APPEND
+   s" : " SB-APPEND why SB-APPEND
    ERR$ SB$ CONTAINS? ;
 
 
@@ -2431,7 +2452,7 @@ TYPED-VARIABLE FAULT fault
    s" stage read refused" T-LABEL
    TEST-DROPBOX:RESET -1 FAULT-AT !
    s" up.txt" STAGE! s" hello upload" s" /Docs/Up.txt" s" " STAGED
-   UNSTAGED STAGE$ >str FS:OPEN-APPEND-FD >FD UP DROPBOX-UPLOAD:FD !
+   UNSTAGED STAGE$ FS:OPEN-APPEND-FD >FD UP DROPBOX-UPLOAD:FD !
    SEND-LOGGED DROPBOX:E-STAGE T=
    s" the stage's read was refused, errno 9" STAGE-LOGGED? TTRUE
    TEST-DROPBOX:SEEN$ s" " T$=
@@ -2551,7 +2572,7 @@ TYPED-VARIABLE FAULT fault
    CHUNK 1+ MEM:BYTES-ALLOC-LEN MEM:ALLOC-BYTES
    {: a:^ cap:NUM:alloc-byte-len :}
    a CHUNK 1+ PATTERN
-   s" big.bin" STAGE! a CHUNK 1+ s" /Big.bin" s" " STAGED
+   s" big.bin" STAGE! a CHUNK 1+ >str s" /Big.bin" s" " STAGED
    a cap MEM:RELEASE-BYTES ;
 
 
@@ -2682,22 +2703,22 @@ TYPED-VARIABLE FAULT fault
 : MISMATCH-CASE ( -- )
    s" committed content hash mismatch" T-LABEL
    s" 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-   SPAN:MAKE UP DROPBOX-UPLOAD:CONTENT-HASH !
+   str> SPAN:MAKE UP DROPBOX-UPLOAD:CONTENT-HASH !
    -1 construct fault cut 1 STRUCK UNVERIFIED? ASSERT
    SB-RESET S-START S-APPEND S-APPEND S-FINISH
    TEST-DROPBOX:SEEN$ SB$ T$=
-   EXPECTED$ SPAN:MAKE UP DROPBOX-UPLOAD:CONTENT-HASH ! ;
+   EXPECTED$ str> SPAN:MAKE UP DROPBOX-UPLOAD:CONTENT-HASH ! ;
 
 
 \ The fake lowers ASCII alone, so the finish's path_lower is not /É.bin's
 \ full lowercase.
 : FINISH-ELSEWHERE-CASE ( -- )
    s" finish answered at another path" T-LABEL
-   S\" /\xc3\x89.bin" SPAN:MAKE UP DROPBOX-UPLOAD:PATH !
+   S\" /\xc3\x89.bin" str> SPAN:MAKE UP DROPBOX-UPLOAD:PATH !
    -1 construct fault cut 1 STRUCK UNVERIFIED? ASSERT
    SB-RESET S-START S-APPEND S-APPEND S-FINISH
    TEST-DROPBOX:SEEN$ SB$ T$=
-   s" /Big.bin" SPAN:MAKE UP DROPBOX-UPLOAD:PATH ! ;
+   s" /Big.bin" str> SPAN:MAKE UP DROPBOX-UPLOAD:PATH ! ;
 
 
 \ Sized a byte past the stage: the second append carries the stage's last
@@ -2803,7 +2824,7 @@ TYPED-VARIABLE FAULT fault
    TEST-DROPBOX:RESET ;
 
 
-: CHECK$ ( DROPBOX:root-check -- ^u8 n )
+: CHECK$ ( DROPBOX:root-check -- str )
    MATCH DROPBOX:root-check
       valid OF s" valid" ENDOF
       failed OF drop s" failed" ENDOF
@@ -2829,7 +2850,7 @@ TYPED-VARIABLE FAULT fault
 
 \ Rust's root_link_failure: LINK of /Sync on a client whose get_metadata
 \ answers status st and the body b builds, after its two requests.
-: ROOT-LINKED ( n [ -- ^u8 n ] -- DROPBOX:root-check )
+: ROOT-LINKED ( n [ -- str ] -- DROPBOX:root-check )
    {: st:n b :}
    LINKABLE {: c :}
    s" /2/files/get_metadata" st s" " s" " b execute
@@ -2841,7 +2862,7 @@ TYPED-VARIABLE FAULT fault
 
 
 \ Rust's lookup_error("not_found").
-: NOT-FOUND$ ( -- ^u8 n )
+: NOT-FOUND$ ( -- str )
    SB-RESET S\" {\qerror_summary\q:\qpath/not_found/...\q," SB-APPEND
    S\" \qerror\q:{\q.tag\q:\qpath\q,\qpath\q:{\q.tag\q:\qnot_found\q}}}"
    SB-APPEND SB$ ;
@@ -2849,13 +2870,13 @@ TYPED-VARIABLE FAULT fault
 
 \ Rust's file_metadata("/sync", "/Sync", "root-file-revision") of the
 \ bytes "root file".
-: ROOT-FILE$ ( -- ^u8 n )
+: ROOT-FILE$ ( -- str )
    HASHER DROPBOX:HASH-BEGIN
-   s" root file" HASHER DROPBOX:HASH-FEED
-   HASHER DROPBOX:HASH-END {: h:^ hu:n :}
+   s" root file" str> HASHER DROPBOX:HASH-FEED
+   HASHER DROPBOX:HASH-END {: h :}
    SB-RESET S\" {\q.tag\q:\qfile\q" SB-APPEND SYNC-PATHS+
    S\" ,\qrev\q:\qroot-file-revision\q,\qsize\q:0" SB-APPEND
-   S\" ,\qcontent_hash\q:" SB-APPEND h hu QUOTED+
+   S\" ,\qcontent_hash\q:" SB-APPEND h QUOTED+
    S\" ,\qis_downloadable\q:true}" SB-APPEND SB$ ;
 
 
@@ -2914,13 +2935,13 @@ TYPED-VARIABLE FAULT fault
 
 \ LINK of /Sync on a client whose call to the route rt answers 503 answers
 \ failed and logs Rust's one line t for that operation.
-: FAILED-LINKED ( ^u8 n ^u8 n -- )
-   {: rt:^ ru:n t:^ tu:n :}
+: FAILED-LINKED ( str str -- )
+   {: rt t :}
    LINKABLE {: c :}
-   rt ru 503 s" " s" " s" " TEST-DROPBOX:ROUTE-SCRIPT!
+   rt 503 s" " s" " s" " TEST-DROPBOX:ROUTE-SCRIPT!
    c OWN ! false OUTCOME !
    [: LINK-FAILED ;] LOGGED 0 T=
-   OUTCOME @ TTRUE t tu LOGGED? TTRUE
+   OUTCOME @ TTRUE t LOGGED? TTRUE
    c DROPBOX:CLOSE ;
 
 
@@ -2979,14 +3000,14 @@ TYPED-VARIABLE FAULT fault
    TEST-DROPBOX:ROUTE-SCRIPT!
    c OWN ! false OUTCOME !
    [: ROOT-UNAVAILABLE ;] LOGGED 0 T=
-   OUTCOME @ TTRUE ERR$ nip 0 T=
+   OUTCOME @ TTRUE ERR$ str> nip 0 T=
    TEST-DROPBOX:SEEN$ s" /2/files/get_metadata" T$=
    c DROPBOX:CLOSE ;
 
 
 \ OUTCOME: LINK of Sync, no leading slash, on OWN answered.
 : LINK-UNROOTED ( -- )
-   s" Sync" OWN @ AR @ DROPBOX:LINK CHECK$ 2drop true OUTCOME ! ;
+   s" Sync" OWN @ AR @ DROPBOX:LINK CHECK$ drop true OUTCOME ! ;
 
 
 \ A root ROOT-PATH? refuses throws E-ROOT-PATH with its line, unsent.

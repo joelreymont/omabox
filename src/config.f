@@ -314,10 +314,11 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
 : INSIDE? ( abs-path abs-path -- bool )
    {: p root :}
    p ABS-PATH>STR str> {: a:^ u:n :}
-   root ABS-PATH>STR str> {: r:^ ru:n :}
+   root ABS-PATH>STR {: r :}
+   r STR:len {: ru:n :}
    ru 1 = if true exit then
    u ru < if false exit then
-   a ru r ru STR= 0= if false exit then
+   a ru >str r STR= 0= if false exit then
    u ru = if true exit then
    a ru + c@ FS:SLASH = ;
 
@@ -327,12 +328,12 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
 : LOG-OPEN ( -- ) LOG:ERROR s" config" LOG:LINE ;
 
 : QUOTED+ ( abs-path -- )
-   s" `" LOG:TEXT+ ABS-PATH>STR str> LOG:TEXT+ s" `" LOG:TEXT+ ;
+   s" `" LOG:TEXT+ ABS-PATH>STR LOG:TEXT+ s" `" LOG:TEXT+ ;
 
 \ Ends the error's line and opens its help line with the text.
-: HELP ( ^u8 n -- )
-   {: h:^ hu:n :}
-   LOG:;LINE LOG-OPEN s" help: " LOG:TEXT+ h hu LOG:TEXT+ ;
+: HELP ( str -- )
+   {: h :}
+   LOG:;LINE LOG-OPEN s" help: " LOG:TEXT+ h LOG:TEXT+ ;
 
 \ Ends the help line, then throws code with cause as FS:ERRNO.
 : FAIL ( n n -- )
@@ -346,9 +347,9 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
    E-HOME-UNAVAILABLE 0 FAIL ;
 
 \ The name of the variable or key, and the path it held.
-: NOT-ABSOLUTE ( ^u8 n str -- )
-   {: name:^ nameu:n s :}
-   LOG-OPEN name nameu LOG:TEXT+
+: NOT-ABSOLUTE ( str str -- )
+   {: name s :}
+   LOG-OPEN name LOG:TEXT+
    s"  must be an absolute path, but was " LOG:TEXT+ s >ABS-PATH QUOTED+
    s" Use an absolute path so the unattended service resolves it" HELP
    s"  consistently." LOG:TEXT+
@@ -401,7 +402,7 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
    s" Ensure every parent directory is accessible and retry." HELP
    E-INSPECT-PATH cause FAIL ;
 
-: ROLE$ ( path-role -- ^u8 n )
+: ROLE$ ( path-role -- str )
    MATCH path-role
       configuration OF s" configuration directory" ENDOF
       state OF s" state directory" ENDOF
@@ -412,7 +413,7 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
    ;MATCH ;
 
 \ The XDG variable that places the role's path.
-: XDG-VARIABLE$ ( path-role -- ^u8 n )
+: XDG-VARIABLE$ ( path-role -- str )
    MATCH path-role
       configuration OF s" XDG_CONFIG_HOME" ENDOF
       state OF s" XDG_STATE_HOME" ENDOF
@@ -430,9 +431,9 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
    s"  to a local directory outside the sync root." LOG:TEXT+
    E-INSIDE-SYNC-ROOT 0 FAIL ;
 
-: REQUIRE-ABSOLUTE ( ^u8 n str ^ARENA:arena -- abs-path )
-   {: name:^ nameu:n s ar :}
-   s ABSOLUTE? 0= if name nameu s NOT-ABSOLUTE then
+: REQUIRE-ABSOLUTE ( str str ^ARENA:arena -- abs-path )
+   {: name s ar :}
+   s ABSOLUTE? 0= if name s NOT-ABSOLUTE then
    s ar NORMALIZE ;
 
 
@@ -510,7 +511,7 @@ private
 : READ-FILE ( abs-path ^ARENA:arena -- str )
    {: p ar :}
    p p OPENED ar DRAIN {: s :}
-   s str> UTF8:VALID? 0= if 0 FS:CAUSE! p READ-FAILED then
+   s UTF8:VALID? 0= if 0 FS:CAUSE! p READ-FAILED then
    s ;
 
 
@@ -618,11 +619,11 @@ private
    ;MATCH ;
 
 \ The configured home, else HOME's sub.
-: OR-HOME ( option<abs-path> option<str> ^u8 n ^ARENA:arena -- abs-path )
-   {: dir home sub:^ subu:n ar :}
+: OR-HOME ( option<abs-path> option<str> str ^ARENA:arena -- abs-path )
+   {: dir home sub ar :}
    dir MATCH option
       some OF ENDOF
-      none OF home ar HOME sub subu >str ar JOIN ENDOF
+      none OF home ar HOME sub ar JOIN ENDOF
    ;MATCH ;
 
 \ From HOME, XDG_CONFIG_HOME and XDG_STATE_HOME.
@@ -635,22 +636,22 @@ private
    sh home s" .local/state" ar OR-HOME x XDG-STATE-HOME !
    x ;
 
-: ENV ( ^u8 n -- option<str> )
-   GETENV {: a:^ u:n :}
-   a NULL-PTR = if OPTION:NONE else a u >str OPTION:SOME then ;
+: ENV ( str -- option<str> )
+   GETENV {: v :}
+   v STR:data NULL-PTR = if OPTION:NONE else v OPTION:SOME then ;
 
 : XDG-CONFIG-DIRECTORY ( ^xdg ^ARENA:arena -- abs-path )
    {: x ar :}
-   x XDG-CONFIG-HOME @ s" omabox" >str ar JOIN ;
+   x XDG-CONFIG-HOME @ s" omabox" ar JOIN ;
 
 : XDG-STATE-DIRECTORY ( ^xdg ^ARENA:arena -- abs-path )
    {: x ar :}
-   x XDG-STATE-HOME @ s" omabox" >str ar JOIN ;
+   x XDG-STATE-HOME @ s" omabox" ar JOIN ;
 
 \ A file or directory of the state directory, projected.
-: PRIVATE-PATH ( abs-path ^u8 n ^ARENA:arena -- abs-path )
-   {: state name:^ nameu:n ar :}
-   state name nameu >str ar JOIN DANGLING-REFUSE ar PROJECT ;
+: PRIVATE-PATH ( abs-path str ^ARENA:arena -- abs-path )
+   {: state name ar :}
+   state name ar JOIN DANGLING-REFUSE ar PROJECT ;
 
 : ROLE-PATH ( ^paths path-role -- abs-path )
    {: p role :}
@@ -755,8 +756,8 @@ ARENA READERS reader
    {: b:n :}
    b WS? b $21 = or b $23 $5B IN? or b $5D $7E IN? or b $80 >= or ;
 
-: ONE-OF? ( n ^u8 n -- bool )
-   {: b:n a:^ u:n :}
+: ONE-OF? ( n str -- bool )
+   str> {: b:n a:^ u:n :}
    u 0 ?do a i + c@ b = if true unloop exit then loop
    false ;
 
@@ -1013,8 +1014,8 @@ ARENA READERS reader
 
 : ASSIGN ( ^reader str str -- )
    {: r k v :}
-   k str> s" sync_root" STR= if r r READER-ROOT v SET exit then
-   k str> s" dropbox_app_key" STR= if r r READER-KEY v SET exit then
+   k s" sync_root" STR= if r r READER-ROOT v SET exit then
+   k s" dropbox_app_key" STR= if r r READER-KEY v SET exit then
    r BAD ;
 
 : KEYVAL ( ^reader -- )
@@ -1055,7 +1056,7 @@ ARENA READERS reader
 \ The stored root and key, unchecked.
 : READ-DOCUMENT ( ^xdg ^ARENA:arena -- str str )
    {: x ar :}
-   x ar XDG-CONFIG-DIRECTORY s" config.toml" >str ar JOIN {: file :}
+   x ar XDG-CONFIG-DIRECTORY s" config.toml" ar JOIN {: file :}
    ar READERS-NEW {: r :}
    file r READER-FILE !
    file ar READ-FILE r READER-TEXT !
@@ -1068,10 +1069,11 @@ ARENA READERS reader
 
 \ Every scalar Unicode White_Space.
 : BLANK-KEY? ( str -- bool )
-   str> {: a:^ u:n :}
+   {: s :}
+   s STR:len {: u:n :}
    0 begin dup u < while
       {: at:n :}
-      a u at UTF8:NEXT MATCH UTF8:scalar-step
+      s at UTF8:NEXT MATCH UTF8:scalar-step
          scalar OF {: cp:n next:n :}
             cp UNICODE-CLASS:WHITE-SPACE? 0= if false exit then
             next
@@ -1110,7 +1112,7 @@ public
 
 : XDG-CONFIG-FILE ( ^xdg ^ARENA:arena -- abs-path )
    {: x ar :}
-   x ar XDG-CONFIG-DIRECTORY s" config.toml" >str ar JOIN ;
+   x ar XDG-CONFIG-DIRECTORY s" config.toml" ar JOIN ;
 
 \ XDG_CONFIG_HOME when absolute, else HOME/.config, as Rust's
 \ resolve_config_home answers it.
@@ -1136,7 +1138,7 @@ public
 
 : CONFIG-FILE ( ^paths ^ARENA:arena -- abs-path )
    {: p ar :}
-   p PATHS-CONFIG @ s" config.toml" >str ar JOIN ;
+   p PATHS-CONFIG @ s" config.toml" ar JOIN ;
 
 : STATE-DIRECTORY ( ^paths -- abs-path ) PATHS-STATE @ ;
 : JOURNAL-FILE ( ^paths -- abs-path ) PATHS-JOURNAL @ ;
@@ -1329,7 +1331,7 @@ private
    {: cause:n p :}
    LOG:WARN s" config" LOG:LINE
    s" could not unlock the daemon lock file " LOG:TEXT+ p QUOTED+
-   s" ; closing it instead: " LOG:TEXT+ cause FS:ERRNO$ str> LOG:TEXT+
+   s" ; closing it instead: " LOG:TEXT+ cause FS:ERRNO$ LOG:TEXT+
    LOG:;LINE ;
 
 public
@@ -1372,8 +1374,9 @@ private
 ENUM encoding basic literal ml-basic ml-literal ;ENUM
 
 \ src copied to dst+at: the offset after it.
-: PUT ( ^u8 n ^u8 n -- n )
-   {: src:^ u:n dst:^ at:n :}
+: PUT ( str ^u8 n -- n )
+   {: s dst:^ at:n :}
+   s str> {: src:^ u:n :}
    src dst at + u BYTE-COPY
    at u + ;
 
@@ -1461,7 +1464,7 @@ ENUM encoding basic literal ml-basic ml-literal ;ENUM
       else b ml dst o ESCAPED 0 then
    loop drop ;
 
-: DELIMITER ( encoding -- ^u8 n )
+: DELIMITER ( encoding -- str )
    MATCH encoding
       basic OF s\" \"" ENDOF
       literal OF s" '" ENDOF
@@ -1494,13 +1497,13 @@ ENUM encoding basic literal ml-basic ml-literal ;ENUM
    e DELIMITER dst at PUT {: k:n :}
    lead if $0A dst k BYTE+ else k then {: j:n :}
    e ESCAPES? if a u e MULTI-LINE? dst j ESCAPED-BODY
-   else a u dst j PUT then {: m:n :}
+   else v dst j PUT then {: m:n :}
    e DELIMITER dst m PUT ;
 
 \ One `key = value` line.
-: ENTRY ( ^u8 n str ^u8 n -- n )
-   {: k:^ ku:n v dst:^ at:n :}
-   k ku dst at PUT {: j:n :}
+: ENTRY ( str str ^u8 n -- n )
+   {: k v dst:^ at:n :}
+   k dst at PUT {: j:n :}
    s"  = " dst j PUT {: m:n :}
    v dst m STRING {: e:n :}
    $0A dst e BYTE+ ;
@@ -1510,7 +1513,7 @@ ENUM encoding basic literal ml-basic ml-literal ;ENUM
    s" Use a sync-root path representable in TOML and retry." HELP
    E-SERIALIZE 0 FAIL ;
 
-: UTF-8? ( str -- bool ) str> UTF8:VALID? ;
+: UTF-8? ( str -- bool ) UTF8:VALID? ;
 
 \ The stored document's text; a string that is not UTF-8 is E-SERIALIZE.
 \ No byte takes more than the six of an escape code.
@@ -1557,10 +1560,10 @@ ARENA WRITINGS writing
    E-PREPARE-CONFIGURATION-DIRECTORY cause FAIL ;
 
 \ The operation that failed and the path it names.
-: WRITE-FAILED ( ^u8 n abs-path -- )
-   {: op:^ opu:n p :}
+: WRITE-FAILED ( str abs-path -- )
+   {: op p :}
    FS:ERRNO {: cause:n :}
-   LOG-OPEN s" could not " LOG:TEXT+ op opu LOG:TEXT+
+   LOG-OPEN s" could not " LOG:TEXT+ op LOG:TEXT+
    s"  Omabox configuration at " LOG:TEXT+ p QUOTED+ WRITE-HELP
    E-WRITE cause FAIL ;
 
@@ -1592,7 +1595,7 @@ ARENA WRITINGS writing
 \ The directory's descriptor, which names the renames' entries.
 : ANCHOR ( abs-path -- fd )
    {: p :}
-   -1 >FD [: drop p ABS-PATH>STR str> FS:OPEN-DIR-FOLLOW ;] catch
+   -1 >FD [: drop p ABS-PATH>STR FS:OPEN-DIR-FOLLOW ;] catch
    {: code:n :}
    code 0= if exit then
    code E-FS-OPEN <> if code throw then
@@ -1628,7 +1631,7 @@ ARENA WRITINGS writing
 : WRITTEN ( fd str abs-path -- )
    {: f:fd body t :}
    0 FS:CAUSE!
-   [: f body str> FD:WRITE-FULL f FD:SYNC ;] catch {: code:n :}
+   [: f body FD:WRITE-FULL f FD:SYNC ;] catch {: code:n :}
    FS:ERRNO {: cause:n :}
    f FD>N close
    cause FS:CAUSE!
@@ -1641,13 +1644,13 @@ ARENA WRITINGS writing
 : INSTALLED ( ^writing -- )
    {: w :}
    w WRITING-ANCHOR @ {: dir:fd :}
-   w WRITING-NAME @ str> {: n:^ nu:n :}
+   w WRITING-NAME @ {: n :}
    w WRITING-FILE @ {: file :}
    w WRITING-REPLACE @ if
-      dir n nu dir s" config.toml" FS:TRY-RENAME-AT if exit then
+      dir n dir s" config.toml" FS:TRY-RENAME-AT if exit then
       s" install the new" file WRITE-FAILED
    then
-   dir n nu dir s" config.toml" FS:TRY-RENAME-NEW-AT if exit then
+   dir n dir s" config.toml" FS:TRY-RENAME-NEW-AT if exit then
    FS:ERRNO FS:EEXIST = if file ALREADY-EXISTS then
    s" install the initial" file WRITE-FAILED ;
 
@@ -1675,7 +1678,7 @@ ARENA WRITINGS writing
 \ Removed or gone already; false leaves the cause in FS:ERRNO.
 : TEMPORARY-REMOVED? ( ^writing -- bool )
    {: w :}
-   w WRITING-ANCHOR @ w WRITING-NAME @ str> FS:TRY-REMOVE-FILE-AT if
+   w WRITING-ANCHOR @ w WRITING-NAME @ FS:TRY-REMOVE-FILE-AT if
       true exit
    then
    FS:ERRNO FS:ENOENT = ;

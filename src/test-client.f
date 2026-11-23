@@ -40,18 +40,20 @@ package TEST-CLIENT
 public
 
 \ Ends the run: the case cannot go on.
-: FAILED ( ^u8 n -- ) EXIT-STATUS:FAILURE die ;
+: FAILED ( str -- ) EXIT-STATUS:FAILURE die ;
 
-: COPIED ( ^u8 n ^ARENA:arena -- str )
-   {: a:^ u ar :}
+: COPIED ( str ^ARENA:arena -- str )
+   {: s:str ar :}
+   s str> {: a:^ u:n :}
    ar u ARENA:ALLOC drop {: dst:^ :}
    a dst u BYTE-COPY
    dst u >str ;
 
 \ dir/name.
-: INSIDE ( str ^u8 n ^ARENA:arena -- str )
-   {: d:str a:^ u ar :}
-   d str> {: p:^ pu :}
+: INSIDE ( str str ^ARENA:arena -- str )
+   {: d:str s:str ar :}
+   d str> {: p:^ pu:n :}
+   s str> {: a:^ u:n :}
    ar pu u + 1+ ARENA:ALLOC drop {: dst:^ :}
    p dst pu BYTE-COPY
    47 dst pu + c!
@@ -67,17 +69,17 @@ public
       unlinked OF false ENDOF
    ;MATCH ;
 
-: QUOTED+ ( ^u8 n -- ) S\" \q" SB-APPEND SB-APPEND S\" \q" SB-APPEND ;
+: QUOTED+ ( str -- ) S\" \q" SB-APPEND SB-APPEND S\" \q" SB-APPEND ;
 
 \ Appends path_lower /sync and path_display /Sync, after a member.
 : SYNC-PATHS+ ( -- )
    S\" ,\qpath_lower\q:\q/sync\q,\qpath_display\q:\q/Sync\q" SB-APPEND ;
 
 \ Rust's restricted_folder_metadata("/sync", "/Sync", {r: true}).
-: RESTRICTED$ ( ^u8 n -- ^u8 n )
-   {: r:^ ru:n :}
+: RESTRICTED$ ( str -- str )
+   {: r:str :}
    SB-RESET S\" {\q.tag\q:\qfolder\q" SB-APPEND SYNC-PATHS+
-   S\" ,\qsharing_info\q:{" SB-APPEND r ru QUOTED+
+   S\" ,\qsharing_info\q:{" SB-APPEND r QUOTED+
    S\" :true,\qread_only\q:false}}" SB-APPEND SB$ ;
 
 
@@ -89,36 +91,43 @@ TYPED-VARIABLE MAIN ^DROPBOX:client
 
 \ A client at origin o with the store s, refresh token t and root r.
 : CLIENT-AT
-   ( ^u8 n [ ^u8 n -- ] ^u8 n ^u8 n ^ARENA:arena -- ^DROPBOX:client )
-   {: o:^ ou:n s t:^ tu:n r:^ ru:n ar :}
+   ( str [ str -- ] str str ^ARENA:arena -- ^DROPBOX:client )
+   {: o:str s t:str r:str ar :}
    s CFG DROPBOX-CONFIG:STORE !
    CFG DROPBOX:PRODUCTION
-   o ou SPAN:MAKE CFG DROPBOX-CONFIG:API !
-   o ou SPAN:MAKE CFG DROPBOX-CONFIG:NOTIFY !
-   o ou SPAN:MAKE CFG DROPBOX-CONFIG:CONTENT !
-   s" fake-key" SPAN:MAKE CFG DROPBOX-CONFIG:KEY !
-   t tu SPAN:MAKE CFG DROPBOX-CONFIG:TOKEN !
-   r ru SPAN:MAKE CFG DROPBOX-CONFIG:ROOT !
+   o str> SPAN:MAKE CFG DROPBOX-CONFIG:API !
+   o str> SPAN:MAKE CFG DROPBOX-CONFIG:NOTIFY !
+   o str> SPAN:MAKE CFG DROPBOX-CONFIG:CONTENT !
+   s" fake-key" str> SPAN:MAKE CFG DROPBOX-CONFIG:KEY !
+   t str> SPAN:MAKE CFG DROPBOX-CONFIG:TOKEN !
+   r str> SPAN:MAKE CFG DROPBOX-CONFIG:ROOT !
    CFG ar DROPBOX:OPEN ;
 
 \ A client on the fake with the store s, refresh token t and root r.
 : CLIENT-ON
-   ( [ ^u8 n -- ] ^u8 n ^u8 n ^ARENA:arena -- ^DROPBOX:client )
-   {: s t:^ tu:n r:^ ru:n ar :}
-   TEST-DROPBOX:ORIGIN$ s t tu r ru ar CLIENT-AT ;
+   ( [ str -- ] str str ^ARENA:arena -- ^DROPBOX:client )
+   {: s t:str r:str ar :}
+   TEST-DROPBOX:ORIGIN$ s t r ar CLIENT-AT ;
+
+private
+
+\ A store that keeps no rotated token.
+: KEEP-NONE ( str -- ) drop ;
+
+public
 
 \ A client on the fake, no root, keeping no rotated token.
 : OPENED ( ^ARENA:arena -- ^DROPBOX:client )
    {: ar :}
-   [: 2drop ;] s" live-token" s" " ar CLIENT-ON ;
+   [: KEEP-NONE ;] s" live-token" s" " ar CLIENT-ON ;
 
 \ An origin under the name RFC 6761 reserves never to resolve.
-: NOWHERE$ ( -- ^u8 n ) s" https://dropbox.invalid" ;
+: NOWHERE$ ( -- str ) s" https://dropbox.invalid" ;
 
 \ OPENED at NOWHERE$, for a case that sends nothing.
 : IDLE ( ^ARENA:arena -- ^DROPBOX:client )
    {: ar :}
-   NOWHERE$ [: 2drop ;] s" live-token" s" " ar CLIENT-AT ;
+   NOWHERE$ [: KEEP-NONE ;] s" live-token" s" " ar CLIENT-AT ;
 
 \ The account call takes the client's first access token, so no case's
 \ requests start with a refresh.
@@ -142,10 +151,10 @@ ARENA LINKS REPLAY:link
 public
 
 \ A link on the client below root, with no status.
-: NEW-LINK ( ^DROPBOX:client ^u8 n ^ARENA:arena -- ^REPLAY:link )
-   {: c r:^ ru:n ar :}
+: NEW-LINK ( ^DROPBOX:client str ^ARENA:arena -- ^REPLAY:link )
+   {: c r:str ar :}
    ar LINKS-NEW {: l :}
-   c l REPLAY-LINK:CLIENT ! r ru ar COPIED l REPLAY-LINK:ROOT !
+   c l REPLAY-LINK:CLIENT ! r ar COPIED l REPLAY-LINK:ROOT !
    l ;
 
 : RETRY? ( DROPBOX:reply -- bool )
@@ -157,7 +166,7 @@ public
    ;MATCH ;
 
 \ The fake's record of k downloads.
-: DOWNLOADS$ ( n -- ^u8 n )
+: DOWNLOADS$ ( n -- str )
    {: k:n :}
    SB-RESET
    k 0 ?do
@@ -167,7 +176,7 @@ public
 
 \ ---- journal plans
 
-: DISPLAY ( ^u8 n -- MODEL:path ) >str MODEL:>PATH ;
+: DISPLAY ( str -- MODEL:path ) MODEL:>PATH ;
 
 : ONE-PLAN ( MODEL:operation ^ARENA:arena -- JOURNAL:operation-plan )
    {: o ar :}
@@ -182,10 +191,10 @@ public
    ;MATCH ;
 
 \ A pending plan creating the local directory at path.
-: RECORD ( JOURNAL:journal ^u8 n ^ARENA:arena -- )
-   {: j a:^ u ar :}
+: RECORD ( JOURNAL:journal str ^ARENA:arena -- )
+   {: j a:str ar :}
    MODEL-OPERATION:CREATE-LOCAL-DIRECTORY ar ONE-PLAN {: plan :}
-   j a u DISPLAY plan ar JOURNAL:RECORD-PLAN RECORDED? TTRUE ;
+   j a DISPLAY plan ar JOURNAL:RECORD-PLAN RECORDED? TTRUE ;
 
 
 \ ---- download slot leases
@@ -238,11 +247,11 @@ public
 \ The lease's slot holding a durable checkpoint of CHECKPOINT "x"
 \ bytes for target t, as a transfer lost just past it leaves it.
 : CHECKPOINTED
-   ( fd str ^u8 n DROPBOX:hash LOCAL:download-slot-lease ^ARENA:arena
+   ( fd str str DROPBOX:hash LOCAL:download-slot-lease ^ARENA:arena
      -- )
-   {: root:fd r:str t:^ tu:n c:DROPBOX:hash
+   {: root:fd r:str t:str c:DROPBOX:hash
       l:LOCAL:download-slot-lease ar :}
-   root r str> t tu c l ar LOCAL:PREPARE-DOWNLOAD-SLOT-AT READY-PARTIAL
+   root r t c l ar LOCAL:PREPARE-DOWNLOAD-SLOT-AT READY-PARTIAL
    {: x :}
    CHECKPOINT 1+ REMAINING !
    [: x CHECKPOINT DROPBOX:BLOCK + [: FAILING ;] ar
@@ -250,20 +259,20 @@ public
    [: 2drop true ;] LOCAL:CONVERTING LOCAL:E-STAGE-READ T= ;
 
 \ The content hash of CHECKPOINT "x" bytes, then t.
-: PAST-HASH ( ^u8 n ^ARENA:arena -- DROPBOX:hash )
-   {: t:^ tu:n ar :}
+: PAST-HASH ( str ^ARENA:arena -- DROPBOX:hash )
+   {: t:str ar :}
    HASHING DROPBOX:HASH-BEGIN
    CHECKPOINT XS-SIZE / 0 ?do XS XS-SIZE HASHING DROPBOX:HASH-FEED loop
-   t tu HASHING DROPBOX:HASH-FEED
+   t str> HASHING DROPBOX:HASH-FEED
    HASHING DROPBOX:HASH-END ar COPIED DROPBOX:>HASH ;
 
 \ The fake's p at rev v, of content c: CHECKPOINT bytes it does not
 \ keep, then t, so its download from the start answers 500.
-: SERVES-PAST ( ^u8 n ^u8 n ^u8 n DROPBOX:hash -- )
-   {: p:^ pu:n v:^ vu:n t:^ tu:n c:DROPBOX:hash :}
-   c DROPBOX:HASH>STR str> {: h:^ hu:n :}
-   p pu p pu v vu h hu CHECKPOINT tu + TEST-DROPBOX:FILE!
-   v vu CHECKPOINT t tu TEST-DROPBOX:CONTENT-TAIL! ;
+: SERVES-PAST ( str str str DROPBOX:hash -- )
+   {: p:str v:str t:str c:DROPBOX:hash :}
+   t str> nip {: tu:n :}
+   p p v c DROPBOX:HASH>STR CHECKPOINT tu + TEST-DROPBOX:FILE!
+   v CHECKPOINT t TEST-DROPBOX:CONTENT-TAIL! ;
 
 
 \ ---- a socket
@@ -283,12 +292,14 @@ public
 
 \ A socket bound at the path, as Rust's UnixListener::bind leaves one,
 \ by /proc/self/fd/<parent>/<name>, which any depth fits; its descriptor.
-: SOCKET-AT ( ^u8 n -- fd )
-   {: p:^ u:n :}
-   p u >str FS:BASENAME str> {: b:^ bu:n :}
+: SOCKET-AT ( str -- fd )
+   {: s:str :}
+   s str> {: p:^ u:n :}
+   s FS:BASENAME {: b:str :}
+   b str> nip {: bu:n :}
    p u bu - >str FS:OPEN-DIR-READ {: d:n :}
    SB-RESET s" /proc/self/fd/" SB-APPEND d FMT:SB-INT
-   s" /" SB-APPEND b bu SB-APPEND SB$ {: q:^ qu:n :}
+   s" /" SB-APPEND b SB-APPEND SB$ str> {: q:^ qu:n :}
    qu 108 >= if d close E-FS-PATH throw then
    AF-UNIX SOCKADDR c! 0 SOCKADDR 1 + c!
    q SOCKADDR 2 + qu BYTE-COPY 0 SOCKADDR 2 + qu + c!

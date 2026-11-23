@@ -92,48 +92,46 @@ private
 TYPED-VARIABLE AR ^ARENA:arena
 TYPED-VARIABLE DIR str
 TYPED-VARIABLE BODY [ -- ]
-PTR-VARIABLE ERR         \ the captured stderr, in AR
-variable ERR-U
+TYPED-VARIABLE ERR str   \ the captured stderr, in AR
 
 
 \ ---- strings and files, laid in the case's arena
 
-: KEEP ( ^u8 n -- str )
-   {: a:^ u:n :}
+: KEEP ( str -- str )
+   {: s :}
+   s STR:len {: u:n :}
    AR @ u ARENA:ALLOC {: d:^ du:n :}
-   a d u BYTE-COPY
+   s STR:data d u BYTE-COPY
    d du >str ;
 
 : CAT ( str str -- str )
    {: a b :}
-   a str> {: ap:^ au:n :}
-   b str> {: bp:^ bu:n :}
+   a STR:len {: au:n :}
+   b STR:len {: bu:n :}
    AR @ au bu + ARENA:ALLOC {: d:^ du:n :}
-   ap d au BYTE-COPY
-   bp d au + bu BYTE-COPY
+   a STR:data d au BYTE-COPY
+   b STR:data d au + bu BYTE-COPY
    d du >str ;
 
-: S+ ( str ^u8 n -- str ) >str CAT ;
-
 \ DIR/name.
-: UNDER ( ^u8 n -- str )
-   {: n:^ u:n :}
-   DIR @ s" /" S+ n u S+ ;
+: UNDER ( str -- str )
+   {: n :}
+   DIR @ s" /" CAT n CAT ;
 
 \ The path in single quotes, as the scripts name it.
-: QUOTED ( str -- str ) {: p :} s" '" >str p CAT s" '" S+ ;
+: QUOTED ( str -- str ) {: p :} s" '" p CAT s" '" CAT ;
 
-: WRITE ( str str -- ) {: p t :} p str> t str> FS:WRITE-ALL ;
+: WRITE ( str str -- ) FS:WRITE-ALL ;
 
 \ The file's text, empty where there is no file.
-: READ ( str -- ^u8 n )
+: READ ( str -- str )
    {: p :}
    p FS:TRY-STAT 0= if s" " exit then
    AR @ 4096 ARENA:ALLOC {: d:^ du:n :}
-   p str> d du FS:READ-ALL {: u:n :}
-   d u ;
+   p d du FS:READ-ALL {: u:n :}
+   d u >str ;
 
-: FILE= ( str ^u8 n -- ) {: p w:^ wu:n :} p READ w wu T$= ;
+: FILE= ( str str -- ) {: p w :} p READ w T$= ;
 
 : REMOVE ( str -- )
    {: p :}
@@ -145,65 +143,70 @@ variable ERR-U
 \ ---- the case's frame
 
 : CLEANUP ( -- )
-   DIR @ str> FS:REMOVE-TREE
+   DIR @ FS:REMOVE-TREE
    AR @ ARENA:RELEASE ;
 
 \ Runs the body with AR and DIR fresh; the directory goes after.
-: RUN-CASE ( ^u8 n [ -- ] -- )
+: RUN-CASE ( str [ -- ] -- )
    BODY ! T-LABEL
    ARENA:NEW AR !
-   s" TMPDIR" GETENV >str s" service-test-" >str FS:MKTEMP-DIR-IN str> KEEP DIR !
+   s" TMPDIR" GETENV s" service-test-" FS:MKTEMP-DIR-IN KEEP DIR !
    [: BODY @ execute ;] [: CLEANUP ;] finally ;
 
 
 \ ---- the log a failure writes
 
-: ERR$ ( -- ^u8 n ) ERR @ ERR-U @ ;
+: ERR$ ( -- str ) ERR @ ;
 : ERR-PATH ( -- str ) s" stderr.txt" UNDER ;
 
 \ The code the action throws, 0 for none, with fd 2 sent to the case's
 \ stderr.txt, which ERR$ then holds and which is removed.
 : LOGGED ( [ -- ] -- n )
-   ERR-PATH AR @ STDERR:CAPTURING str> ERR-U ! ERR ! ;
+   ERR-PATH AR @ STDERR:CAPTURING ERR ! ;
 
-: LINES ( ^u8 n -- n )
-   {: a:^ u:n :}
+: LINES ( str -- n )
+   str> {: a:^ u:n :}
    0 u 0 ?do a i + c@ 10 = if 1+ then loop ;
 
-\ The text a u ends in SERVICE's tag, t and a newline.
-: ENDS? ( ^u8 n str -- bool )
-   {: a:^ u:n t :}
-   s" service: " >str t CAT s\" \n" S+ str> {: w:^ wu:n :}
+\ The text s ends in SERVICE's tag, t and a newline.
+: ENDS? ( str str -- bool )
+   {: s t :}
+   s str> {: a:^ u:n :}
+   s" service: " t CAT s\" \n" CAT {: w :}
+   w STR:len {: wu:n :}
    u wu < if false exit then
-   a u wu - + wu >str w wu >str T-STR= ;
+   a u wu - + wu >str w T-STR= ;
 
-\ The length of a u's first line, its newline included.
-: FIRST-LINE ( ^u8 n -- n )
-   {: a:^ u:n :}
+\ The length of s's first line, its newline included.
+: FIRST-LINE ( str -- n )
+   str> {: a:^ u:n :}
    u 0 ?do a i + c@ 10 = if i 1+ unloop exit then loop
    u ;
 
-\ a u is the line t, then the help line h.
-: HELPED? ( ^u8 n str str -- bool )
-   {: a:^ u:n t h :}
-   a u LINES 2 <> if false exit then
-   a a u FIRST-LINE t ENDS? 0= if false exit then
-   a u FIRST-LINE {: f:n :}
-   a f + u f - s" help: " >str h CAT ENDS? ;
+\ s is the line t, then the help line h.
+: HELPED? ( str str str -- bool )
+   {: s t h :}
+   s str> {: a:^ u:n :}
+   s LINES 2 <> if false exit then
+   a s FIRST-LINE >str t ENDS? 0= if false exit then
+   s FIRST-LINE {: f:n :}
+   a f + u f - >str s" help: " h CAT ENDS? ;
 
 \ Asserts the flag, showing what ERR$ should have held.
 : ASSERT-LOG ( bool str -- )
    {: ok:bool t :}
    ok T-ASSERT ok if exit then
-   s" want: " type t str> type cr s" got: " type ERR$ type ;
+   s" want: " type t type cr s" got: " type ERR$ type ;
 
 \ What was logged after the text p: the line t, then the help line h.
-: AFTER ( ^u8 n str str -- )
-   {: p:^ pu:n t h :}
-   ERR-U @ pu < if false t ASSERT-LOG exit then
-   ERR @ pu >str p pu >str T-STR= TTRUE
-   ERR @ pu + ERR-U @ pu - t h HELPED?
-   t s"  / help: " S+ h CAT ASSERT-LOG ;
+: AFTER ( str str str -- )
+   {: p t h :}
+   p STR:len {: pu:n :}
+   ERR$ str> {: e:^ eu:n :}
+   eu pu < if false t ASSERT-LOG exit then
+   e pu >str p T-STR= TTRUE
+   e pu + eu pu - >str t h HELPED?
+   t s"  / help: " CAT h CAT ASSERT-LOG ;
 
 \ The action throws the code and logs the line t and the help line h.
 : REFUSED ( [ -- ] n str str -- )
@@ -212,38 +215,38 @@ variable ERR-U
    s" " t h AFTER ;
 
 : START-HELP ( -- str )
-   s" Ensure systemd user services and the system journal are available, then retry." >str ;
+   s" Ensure systemd user services and the system journal are available, then retry." ;
 : RETRY-HELP ( -- str )
-   s" Retry the command; inspect the user session if it happens repeatedly." >str ;
+   s" Retry the command; inspect the user session if it happens repeatedly." ;
 : REVIEW-HELP ( -- str )
-   s" Review the command output and `omabox logs`, then retry." >str ;
+   s" Review the command output and `omabox logs`, then retry." ;
 : UPDATE-HELP ( -- str )
-   s" Update Omabox, or report this state if Omabox is current." >str ;
+   s" Update Omabox, or report this state if Omabox is current." ;
 
-: FAILED-WITH ( ^u8 n ^u8 n -- str )
-   {: c:^ cu:n s:^ su:n :}
-   s" `" >str c cu S+ s" ` failed with status Some(" S+ s su S+ s" )" S+ ;
+: FAILED-WITH ( str str -- str )
+   {: c s :}
+   s" `" c CAT s" ` failed with status Some(" CAT s CAT s" )" CAT ;
 
 
 \ ---- the Rust fixtures
 
 \ DIR/name, holding the text.
-: SCRIPT ( ^u8 n str -- str )
-   {: n:^ nu:n t :}
-   n nu UNDER {: p :}
+: SCRIPT ( str str -- str )
+   {: n t :}
+   n UNDER {: p :}
    p t WRITE p ;
 
 \ Rust's recording_script: records its arguments in the file out, then
 \ exits with the status. It is never executable: /bin/sh reads it.
-: RECORDING ( ^u8 n str ^u8 n -- str )
-   {: n:^ nu:n out x:^ xu:n :}
-   n nu
-   s\" printf '%s\\n' \"$@\" > " >str out QUOTED CAT
-   s\" \nexit " S+ x xu S+ s\" \n" S+
+: RECORDING ( str str str -- str )
+   {: n out x :}
+   n
+   s\" printf '%s\\n' \"$@\" > " out QUOTED CAT
+   s\" \nexit " CAT x CAT s\" \n" CAT
    SCRIPT ;
 
 \ Rust's terminating_script.
-: TERMINATING ( ^u8 n -- str ) s\" kill -TERM $$\n" >str SCRIPT ;
+: TERMINATING ( str -- str ) s\" kill -TERM $$\n" SCRIPT ;
 
 \ Rust's scripted_systemctl: logs each verb to log and answers each show
 \ with the next line of DIR/states, which holds the text queue.
@@ -252,19 +255,19 @@ variable ERR-U
    s" states" UNDER {: q :}
    q queue WRITE
    q QUOTED {: qq :}
-   q s" .next" S+ QUOTED {: qn :}
+   q s" .next" CAT QUOTED {: qn :}
    s" systemctl"
-   s\" printf '%s\\n' \"$2\" >> " >str log QUOTED CAT
-   s\" \nif [ \"$2\" = show ]; then\nhead -n 1 " S+ qq CAT
-   s\" \ntail -n +2 " S+ qq CAT s"  > " S+ qn CAT
-   s\" \nmv " S+ qn CAT s"  " S+ qq CAT
-   s\" \nfi\n" S+
+   s\" printf '%s\\n' \"$2\" >> " log QUOTED CAT
+   s\" \nif [ \"$2\" = show ]; then\nhead -n 1 " CAT qq CAT
+   s\" \ntail -n +2 " CAT qq CAT s"  > " CAT qn CAT
+   s\" \nmv " CAT qn CAT s"  " CAT qq CAT
+   s\" \nfi\n" CAT
    SCRIPT ;
 
 : SCRIPTS ( str str -- ^SERVICE:commands ) AR @ SERVICE:SCRIPTS ;
-: UNUSED ( -- str ) s" /unused/journalctl" >str ;
+: UNUSED ( -- str ) s" /unused/journalctl" ;
 
-: ARGS= ( str ^u8 n -- ) FILE= ;
+: ARGS= ( str str -- ) FILE= ;
 
 : BOOL= ( bool bool -- )
    {: got:bool want:bool :}
@@ -299,7 +302,7 @@ variable ERR-U
 
    \ The recording script prints nothing, which is not a known state.
    [: c SERVICE:STATE drop ;] SERVICE:E-UNKNOWN-STATE
-   s" systemd reported the unknown service state ``" >str UPDATE-HELP
+   s" systemd reported the unknown service state ``" UPDATE-HELP
    REFUSED
    sa s\" --user\nshow\n--property=ActiveState\n--value\nomabox.service\n"
    ARGS=
@@ -312,7 +315,7 @@ variable ERR-U
 
    \ A failed reset-failed asks list-units whether the unit is loaded.
    s" systemctl"
-   s\" printf '%s\\n' \"$@\" > " >str sa QUOTED CAT s\" \nexit 1\n" S+
+   s\" printf '%s\\n' \"$@\" > " sa QUOTED CAT s\" \nexit 1\n" CAT
    SCRIPT drop
    [: c SERVICE-TEST:SETTLE-RESET ;] SERVICE:E-UNSUCCESSFUL
    s" systemctl reset-failed" s" 1" FAILED-WITH REVIEW-HELP REFUSED
@@ -334,9 +337,9 @@ variable ERR-U
 
 \ ---- state_maps_each_active_state
 
-: MAPS ( ^u8 n n -- )
-   {: p:^ pu:n want:n :}
-   s" systemctl" s\" printf '%s\\n' " >str p pu S+ s\" \n" S+ SCRIPT
+: MAPS ( str n -- )
+   {: p want:n :}
+   s" systemctl" s\" printf '%s\\n' " p CAT s\" \n" CAT SCRIPT
    UNUSED SCRIPTS {: c :}
    [: c SERVICE:STATE SERVICE-TEST:STATE# want T= ;] OK ;
 
@@ -349,9 +352,9 @@ variable ERR-U
    s" inactive" STOPPED MAPS
    s" deactivating" STOPPING MAPS
    s" maintenance" STOPPED MAPS
-   s" systemctl" s\" printf '%s\\n' bogus\n" >str SCRIPT UNUSED SCRIPTS {: c :}
+   s" systemctl" s\" printf '%s\\n' bogus\n" SCRIPT UNUSED SCRIPTS {: c :}
    [: c SERVICE:STATE drop ;] SERVICE:E-UNKNOWN-STATE
-   s" systemd reported the unknown service state `bogus`" >str UPDATE-HELP
+   s" systemd reported the unknown service state `bogus`" UPDATE-HELP
    REFUSED ;
 
 
@@ -378,16 +381,16 @@ variable CODE            \ what a recorded drive answered
 \ A row of the Rust test's table: the goal, the state first observed and
 \ the state observed after a stop, NONE matching any, and the verbs the
 \ walk runs before Done. It counts when it matches the walk.
-: ROW ( n n n ^u8 n -- )
-   {: g:n f:n s:n w:^ wu:n :}
+: ROW ( n n n str -- )
+   {: g:n f:n s:n w :}
    g GOAL @ <> if exit then
    f NONE <> f FIRST @ <> and if exit then
    s NONE <> s SETTLED @ <> and if exit then
    1 HITS +!
-   w wu >str WANT ! ;
+   w WANT ! ;
 
-: STOP-LOOK ( -- ^u8 n ) s\" show\nstop\nshow\n" ;
-: STOP-CLEAR ( -- ^u8 n ) s\" show\nstop\nshow\nreset-failed\n" ;
+: STOP-LOOK ( -- str ) s\" show\nstop\nshow\n" ;
+: STOP-CLEAR ( -- str ) s\" show\nstop\nshow\nreset-failed\n" ;
 
 : TABLE ( -- )
    START NONE NONE s\" reset-failed\nstart\n" ROW
@@ -431,52 +434,52 @@ variable CODE            \ what a recorded drive answered
    RESTORE STOPPED + NONE NONE s" " ROW ;
 
 \ The ActiveState systemd prints for a state.
-: ACTIVE$ ( n -- ^u8 n )
+: ACTIVE$ ( n -- str )
    case
       RUNNING of s" active" endof
       STARTING of s" activating" endof
       FAILED of s" failed" endof
       STOPPING of s" deactivating" endof
-      s" inactive" rot
+      s" inactive" swap
    endcase ;
 
-: STATE$ ( n -- ^u8 n )
+: STATE$ ( n -- str )
    case
       RUNNING of s" Running" endof
       STARTING of s" Starting" endof
       FAILED of s" Failed" endof
       STOPPING of s" Stopping" endof
-      s" Stopped" rot
+      s" Stopped" swap
    endcase ;
 
 : GOAL$ ( n -- str )
    case
-      START of s" Start" >str endof
-      RESTART of s" Restart" >str endof
-      RECOVER of s" Recover" >str endof
-      HALT of s" Halt" >str endof
-      RELEASE of s" Release" >str endof
-      RESTORE-NONE of s" Restore(None)" >str endof
+      START of s" Start" endof
+      RESTART of s" Restart" endof
+      RECOVER of s" Recover" endof
+      HALT of s" Halt" endof
+      RELEASE of s" Release" endof
+      RESTORE-NONE of s" Restore(None)" endof
       dup RESTORE - {: i:n :}
-      s" Restore(Some(" >str i STATE$ S+ s" ))" S+ swap
+      s" Restore(Some(" i STATE$ CAT s" ))" CAT swap
    endcase ;
 
 \ Drives the goal with first observed, then settled after a stop, and
 \ checks the verbs systemctl ran against the one row that matches.
 : WALK ( -- )
-   GOAL @ GOAL$ s"  seeing " S+ FIRST @ STATE$ S+
-   s"  settling " S+ SETTLED @ STATE$ S+ str> T-LABEL
-   0 HITS ! s" " >str WANT !
+   GOAL @ GOAL$ s"  seeing " CAT FIRST @ STATE$ CAT
+   s"  settling " CAT SETTLED @ STATE$ CAT T-LABEL
+   0 HITS ! s" " WANT !
    TABLE
    HITS @ 1 T=
    s" systemctl.log" UNDER {: log :}
    log REMOVE
-   FIRST @ ACTIVE$ >str s\" \n" S+ SETTLED @ ACTIVE$ S+ s\" \n" S+ {: q :}
+   FIRST @ ACTIVE$ s\" \n" CAT SETTLED @ ACTIVE$ CAT s\" \n" CAT {: q :}
    log q SCRIPTED UNUSED SCRIPTS {: c :}
    AR @ SERVICE-TEST:DRIVEN {: v :}
    \ Ends at Done: the drive answers no failure.
    c GOAL @ SERVICE-TEST:GOAL-AT v SERVICE:DRIVE-RECORDED 0 T=
-   log WANT @ str> FILE= ;
+   log WANT @ FILE= ;
 
 : EACH-SETTLED ( -- ) STATES 0 ?do i SETTLED ! WALK loop ;
 : EACH-FIRST ( -- ) STATES 0 ?do i FIRST ! EACH-SETTLED loop ;
@@ -489,13 +492,13 @@ variable CODE            \ what a recorded drive answered
    s" systemctl.log" UNDER {: log :}
    AR @ SERVICE-TEST:DRIVEN {: v :}
 
-   log s\" active\nfailed\n" >str SCRIPTED UNUSED SCRIPTS {: c :}
+   log s\" active\nfailed\n" SCRIPTED UNUSED SCRIPTS {: c :}
    [: c SERVICE-GOAL:HALT v SERVICE:DRIVE ;] OK
    v RUNNING FAILED false true DRIVEN=
    log s\" show\nstop\nshow\nreset-failed\n" FILE=
 
    log REMOVE
-   log s\" failed\n" >str SCRIPTED UNUSED SCRIPTS {: c2 :}
+   log s\" failed\n" SCRIPTED UNUSED SCRIPTS {: c2 :}
    [: c2 SERVICE-GOAL:RECOVER v SERVICE:DRIVE ;] OK
    v FAILED FAILED true true DRIVEN=
    log s\" show\nreset-failed\nstart\n" FILE= ;
@@ -504,34 +507,34 @@ variable CODE            \ what a recorded drive answered
 \ ---- settling_an_unloaded_unit_succeeds
 
 \ The Rust test's script: refuses the verb on stderr, and lists listed.
-: REFUSING ( ^u8 n str ^u8 n -- str )
-   {: v:^ vu:n refusal l:^ lu:n :}
+: REFUSING ( str str str -- str )
+   {: v refusal l :}
    s" systemctl"
-   s\" if [ \"$2\" = " >str v vu S+ s"  ]; then echo '" S+ refusal CAT
-   s\" ' >&2; exit 1; fi\nprintf '" S+ l lu S+ s\" '\n" S+
+   s\" if [ \"$2\" = " v CAT s"  ]; then echo '" CAT refusal CAT
+   s\" ' >&2; exit 1; fi\nprintf '" CAT l CAT s\" '\n" CAT
    SCRIPT ;
 
 \ settle runs the verb that names the command.
-: UNLOADED-VERB ( ^u8 n ^u8 n [ ^SERVICE:commands -- ] -- )
-   {: v:^ vu:n n:^ nu:n settle :}
-   v vu s" Unit omabox.service not loaded." >str s" " REFUSING
+: UNLOADED-VERB ( str str [ ^SERVICE:commands -- ] -- )
+   {: v n settle :}
+   v s" Unit omabox.service not loaded." s" " REFUSING
    UNUSED SCRIPTS {: c :}
    [: c settle execute ;] LOGGED 0 T=
    ERR$ s" " T$=
 
-   s" Failed to " >str v vu S+ s"  unit omabox.service: Access denied" S+
+   s" Failed to " v CAT s"  unit omabox.service: Access denied" CAT
    {: refusal :}
-   v vu refusal s\" omabox.service loaded inactive dead Omabox\\n" REFUSING
+   v refusal s\" omabox.service loaded inactive dead Omabox\\n" REFUSING
    UNUSED SCRIPTS {: c2 :}
    [: c2 settle execute ;] LOGGED SERVICE:E-UNSUCCESSFUL T=
-   refusal s\" \n" S+ str> n nu s" 1" FAILED-WITH REVIEW-HELP AFTER
+   refusal s\" \n" CAT n s" 1" FAILED-WITH REVIEW-HELP AFTER
 
    s" Warning: The unit file, source configuration file or drop-ins of omabox.service changed on disk."
-   >str {: warning :}
-   s" systemctl" s" echo '" >str warning CAT s\" ' >&2\n" S+ SCRIPT
+   {: warning :}
+   s" systemctl" s" echo '" warning CAT s\" ' >&2\n" CAT SCRIPT
    UNUSED SCRIPTS {: c3 :}
    [: c3 settle execute ;] LOGGED 0 T=
-   ERR$ warning s\" \n" S+ str> T$= ;
+   ERR$ warning s\" \n" CAT T$= ;
 
 : UNLOADED ( -- )
    s" stop" s" systemctl stop" [: SERVICE-TEST:SETTLE-STOP ;] UNLOADED-VERB
@@ -543,12 +546,12 @@ variable CODE            \ what a recorded drive answered
 
 \ The Rust test's script: logs each verb to log, refuses reset-failed
 \ and lists listed.
-: CLEAR-REFUSING ( str ^u8 n -- str )
-   {: log l:^ lu:n :}
+: CLEAR-REFUSING ( str str -- str )
+   {: log l :}
    s" systemctl"
-   s\" printf '%s\\n' \"$2\" >> " >str log QUOTED CAT
-   s\" \ncase \"$2\" in\nreset-failed) exit 1;;\nlist-units) printf '" S+
-   l lu S+ s\" ';;\nesac\n" S+
+   s\" printf '%s\\n' \"$2\" >> " log QUOTED CAT
+   s\" \ncase \"$2\" in\nreset-failed) exit 1;;\nlist-units) printf '" CAT
+   l CAT s\" ';;\nesac\n" CAT
    SCRIPT ;
 
 : FAILED-CLEAR ( -- )
@@ -570,15 +573,15 @@ variable CODE            \ what a recorded drive answered
    \ systemd can unload the unit between the observation and the stop.
    log REMOVE
    s" states" UNDER {: q :}
-   q s\" active\ninactive\n" >str WRITE
+   q s\" active\ninactive\n" WRITE
    q QUOTED {: qq :}
-   q s" .next" S+ QUOTED {: qn :}
+   q s" .next" CAT QUOTED {: qn :}
    s" systemctl"
-   s\" printf '%s\\n' \"$2\" >> " >str log QUOTED CAT
-   s\" \ncase \"$2\" in\nshow) head -n 1 " S+ qq CAT
-   s" ; tail -n +2 " S+ qq CAT s"  > " S+ qn CAT
-   s" ; mv " S+ qn CAT s"  " S+ qq CAT
-   s\" ;;\nstop) exit 5;;\nesac\n" S+
+   s\" printf '%s\\n' \"$2\" >> " log QUOTED CAT
+   s\" \ncase \"$2\" in\nshow) head -n 1 " CAT qq CAT
+   s" ; tail -n +2 " CAT qq CAT s"  > " CAT qn CAT
+   s" ; mv " CAT qn CAT s"  " CAT qq CAT
+   s\" ;;\nstop) exit 5;;\nesac\n" CAT
    SCRIPT UNUSED SCRIPTS {: c3 :}
    [: c3 SERVICE-GOAL:HALT v SERVICE:DRIVE ;] OK
    v RUNNING STOPPED false true DRIVEN=
@@ -588,14 +591,14 @@ variable CODE            \ what a recorded drive answered
 \ ---- a_systemctl_that_cannot_spawn_has_not_acted
 
 : CANNOT-SPAWN ( -- )
-   s" /nonexistent/omabox-test/systemctl" >str
-   s" /nonexistent/omabox-test/journalctl" >str
+   s" /nonexistent/omabox-test/systemctl"
+   s" /nonexistent/omabox-test/journalctl"
    AR @ SERVICE-TEST:PROGRAMS {: c :}
    AR @ SERVICE-TEST:DRIVEN {: v :}
    [: c SERVICE-GOAL:RESTART v SERVICE:DRIVE-RECORDED CODE ! ;] LOGGED 0 T=
    CODE @ SERVICE:E-START-COMMAND T=
    v SERVICE-DRIVEN:ACTED @ TFALSE
-   s" " s" could not run `systemctl reset-failed`" >str START-HELP AFTER ;
+   s" " s" could not run `systemctl reset-failed`" START-HELP AFTER ;
 
 
 \ ---- a_systemctl_that_ran_and_failed_has_acted
@@ -604,7 +607,7 @@ variable CODE            \ what a recorded drive answered
    \ The unit stays listed, so the refusal is not an unloaded unit's.
    s" systemctl"
    s\" case \"$2\" in\nreset-failed) exit 1;;\nlist-units) printf 'omabox.service loaded failed failed Omabox\\n';;\nesac\n"
-   >str SCRIPT UNUSED SCRIPTS {: c :}
+   SCRIPT UNUSED SCRIPTS {: c :}
    AR @ SERVICE-TEST:DRIVEN {: v :}
    [: c SERVICE-GOAL:RESTART v SERVICE:DRIVE-RECORDED CODE ! ;] LOGGED 0 T=
    CODE @ SERVICE:E-UNSUCCESSFUL T=
@@ -617,10 +620,10 @@ variable CODE            \ what a recorded drive answered
 : SIGNALED ( -- )
    s" systemctl" TERMINATING s" journalctl" TERMINATING SCRIPTS {: c :}
    [: c SERVICE-TEST:START ;] SERVICE:E-TERMINATED
-   s" `systemctl` was terminated before it reported a result" >str
+   s" `systemctl` was terminated before it reported a result"
    RETRY-HELP REFUSED
    [: c SERVICE:LOGS ;] SERVICE:E-TERMINATED
-   s" `journalctl` was terminated before it reported a result" >str
+   s" `journalctl` was terminated before it reported a result"
    RETRY-HELP REFUSED ;
 
 
@@ -629,13 +632,13 @@ variable CODE            \ what a recorded drive answered
 \ show writes one byte past what a run keeps of a stream on stdout; stop
 \ does so on stderr.
 : FLOODED ( -- )
-   s" systemctl" s\" head -c 4097 /dev/zero\n" >str SCRIPT UNUSED SCRIPTS {: c :}
+   s" systemctl" s\" head -c 4097 /dev/zero\n" SCRIPT UNUSED SCRIPTS {: c :}
    [: c SERVICE:STATE drop ;] SERVICE:E-WAIT-COMMAND
-   s" `systemctl show` was started but could not be waited for" >str
+   s" `systemctl show` was started but could not be waited for"
    RETRY-HELP REFUSED
-   s" systemctl" s\" head -c 4097 /dev/zero >&2\n" >str SCRIPT drop
+   s" systemctl" s\" head -c 4097 /dev/zero >&2\n" SCRIPT drop
    [: c SERVICE-TEST:SETTLE-STOP ;] SERVICE:E-WAIT-COMMAND
-   s" `systemctl stop` was started but could not be waited for" >str
+   s" `systemctl stop` was started but could not be waited for"
    RETRY-HELP REFUSED ;
 
 
