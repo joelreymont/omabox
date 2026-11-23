@@ -1509,11 +1509,9 @@ $2F constant SLASH
       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)" ;
 
 : CACHED-SCAN ( -- ^u8 n )
-   s" SELECT cache.path, cache.hash_json
-      FROM local_hash_cache AS cache
-      JOIN local_root_binding AS root
-         ON root.singleton = 1 AND cache.root_generation = root.generation
-      WHERE cache.path = ?1" ;
+   s" SELECT path, hash_json FROM local_hash_cache
+      WHERE path = ?1 AND root_generation =
+         (SELECT generation FROM local_root_binding WHERE singleton = 1)" ;
 
 : SCAN-TABLES ( -- ^u8 n )
    s" CREATE TABLE IF NOT EXISTS temp.scan_observations(
