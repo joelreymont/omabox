@@ -306,13 +306,15 @@ private
 \ The daemon holds its connection for life, so each of its databases keeps
 \ 64 KiB of pages, not SQLite's 2 MB; the OS page cache holds the rest.
 \ The temporary database journals in memory, so a failed scan write
-\ rolls back.
+\ rolls back, and does not zero freed pages, which would journal every
+\ page a pass's DELETE of its scan tables frees.
 : CONFIGURE-WRITABLE ( journal -- )
    {: j :}
    j >CONNECTION {: c :}
    c s" PRAGMA cache_size = -64" SQLITE:EXEC
    c s" PRAGMA temp.cache_size = -64" SQLITE:EXEC
    c s" PRAGMA temp.journal_mode = MEMORY" SQLITE:EXEC
+   c s" PRAGMA temp.secure_delete = OFF" SQLITE:EXEC
    c s" PRAGMA foreign_keys = ON" SQLITE:EXEC
    c s" PRAGMA main.journal_mode = DELETE" >str [: DELETE-MODE? ;]
    SQLITE:WITH-STATEMENT 0= if

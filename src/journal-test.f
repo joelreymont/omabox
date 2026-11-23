@@ -874,6 +874,7 @@ variable SCANNED       \ query plan rows that scan the table
    TTRUE
    c s" PRAGMA temp.journal_mode" >str [: MEMORY-ROW? ;] SQLITE:WITH-STATEMENT
    TTRUE
+   c s" PRAGMA temp.secure_delete" QUERY-INT 0 T=
    c s" PRAGMA synchronous" QUERY-INT 2 T=
    j BUSY-MS-OF 5000 T=
    c s" PRAGMA foreign_keys" QUERY-INT 1 T=
