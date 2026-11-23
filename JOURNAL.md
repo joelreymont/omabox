@@ -2159,3 +2159,48 @@ Observations for the blog:
 - Two of the three causes were build choices of the platform (SQLite's
   secure delete, glibc's huge page default). Neither shows in the code;
   both show in a measurement.
+
+## 2026-11-23: where an idle pass's CPU goes
+
+Asked how the two versions compare now, I set the logs of both daemons
+side by side. Every 44 to 45 seconds (median), each runs a pass over the
+whole tree with nothing to do. Rust spent 0.31 s of CPU per pass over
+17,939 entries (40 and 31 passes in two clean runs on 2026-11-14). Habu
+spends 0.92 s over 16,217 (7,038 passes from 2026-11-19 to 11-23): three
+times as much, 2.1% of a core against 0.7%.
+
+My first figures were wrong. Dividing a run's wall time by its passes
+gave Rust a pass every 60 s and 0.39 s each, but that run held 22
+minutes with no log line at all. The spacing of the passes themselves
+showed it.
+
+A sandboxed harness ran the daemon's own pass loop over 16,000 empty
+files against the test fake and timed each phase. Its idle pass costs
+0.62 s on a performance core and 1.66 s on an efficiency core, so the
+live figure depends on where the scheduler puts the daemon. The local
+scan takes two thirds of the pass and planning one third. Account
+validation runs once per session, not per pass. Across the phases:
+- A third is JSON: 64,000 records decoded per pass, about 4.3 µs each,
+  with Habu's cursor reader, plus encoding the scan's observations. Rust
+  decodes five records per entry with serde against Habu's four, so the
+  cost is the speed of each decode, not how many there are.
+- A third is SQLite: one lookup per file in the hash cache, and the scan
+  staged row by row in temporary tables, about 48,000 inserts. Rust reads
+  the cache once and keeps the scan in vectors.
+- A sixth is the filesystem walk, the same system calls Rust makes.
+- A new TLS session costs 19.5 ms of CPU, half of it parsing the 121
+  system certificates, which Habu does per session and frees after the
+  handshake. An idle pass opens one or two sessions.
+
+Observations for the blog:
+- Most of the difference is a trade the rewrite made on purpose. Rust
+  held the tree in memory. Habu keeps a pass's memory proportional to
+  its changes: the scan goes through SQLite, and the certificate chain
+  is freed after each handshake. That is how the idle daemon gets to
+  2.27 MB private, and it costs CPU on every pass. systemd's memory
+  peaks, page cache included, put Rust at 47 MB and Habu at 28 to 33 MB.
+- The rest is the JSON reader. Omabox moves to Habu's JSON values once
+  they land, and the decode cost is to be measured again then.
+- Without perf or valgrind on the machine, a clock read at phase
+  boundaries was enough. The fine split inflated the pass from 0.63 to
+  0.88 s, so its shares were scaled back to the coarse total.
