@@ -2207,3 +2207,45 @@ Observations for the blog:
 - Without perf or valgrind on the machine, a clock read at phase
   boundaries was enough. The fine split inflated the pass from 0.63 to
   0.88 s, so its shares were scaled back to the coarse total.
+
+## 2026-11-23: what one entry costs
+
+A second hunt timed each step a pass takes per entry, on one performance
+core, against Rust doing the same step with serde_json and rusqlite on the
+same records. Nanoseconds per operation:
+
+| Step | Habu | Rust | Ratio |
+|---|---|---|---|
+| Decode a hash-cache record | 7,061 | 204 | 35x |
+| Decode a local observation | 1,990 | 58 | 34x |
+| Decode a remote observation | 3,584 | 82 | 44x |
+| Encode a local observation | 1,564 | 44 | 36x |
+| Look up a cached hash (SQLite) | 3,643 | 3,208 | 1.1x |
+| Insert a scan row (SQLite) | 931 | 664 | 1.4x |
+| One call into C | 11 | 1.2 | 9x |
+
+SQLite itself is not the problem; JSON is. Of the 629 ms pass:
+- 18% is Omabox reading each record several times. Every member lookup
+  reads the whole record to its end, and a string value gets a new reader
+  of its own, so a remote record's 64-character hash is scanned about four
+  times.
+- 11% is Habu's reader matching member names: it tries each expected name
+  in turn, unescaping the key byte by byte, and recounts the list of names
+  on every call.
+- 10% is the reader's cost per token, about 62 ns, from some twenty word
+  calls per token. The compiled code calls `!` rather than storing inline,
+  and keeps a loop's index and locals in memory.
+- 7% is SQLite preparing the hash-cache lookup again on every call. Arch
+  builds SQLite with STAT4, under which binding a parameter of that join
+  expires its plan. Without the join, SQLite's C API answers in 0.45 us.
+- 4% is Habu's JSON writer, which unpacks and repacks its whole state per
+  token.
+
+Observations for the blog:
+- The ratio that matters is not Habu against Rust but 35 against 1.2:
+  where both call the same C library, Habu is nearly even; where Habu runs
+  its own code, it pays for every word call. A port that keeps Rust's data
+  formats inherits Rust's assumption that parsing JSON is nearly free.
+- A platform build choice cost us a second time today. SQLite's STAT4,
+  like its secure delete before, shows in no code and only in a
+  measurement.
