@@ -450,12 +450,15 @@ STRUCTURE hashed
 : DROP-HASH ( DROPBOX:hash -- ) drop ;
 : DROP-FINGERPRINT ( MODEL:fingerprint -- ) drop ;
 
-: STAT-FD-FAILS ( fd str str n -- MODEL:stat )
-   {: f:fd p:str o:str code:n :}
-   [: f FS:FD-STAT ;] [: o p code IO-FAILS ;] FS-FAILS
+\ The stat FS's stat buffer holds.
+: BUF-STAT ( -- MODEL:stat )
    FS:STAT-DEV@ FS:STAT-INO@ FS:STAT-MODE@ FS:STAT-SIZE@
    FS:STAT-MTIME-SEC@ FS:STAT-MTIME-NS@
    FS:STAT-CTIME-SEC@ FS:STAT-CTIME-NS@ MODEL-STAT:MAKE ;
+
+: STAT-FD-FAILS ( fd str str n -- MODEL:stat )
+   {: f:fd p:str o:str code:n :}
+   [: f FS:FD-STAT ;] [: o p code IO-FAILS ;] FS-FAILS BUF-STAT ;
 
 : STAT-FD ( fd str str -- MODEL:stat ) E-IO STAT-FD-FAILS ;
 
@@ -836,15 +839,6 @@ private
 
 : OPEN-RELATIVE-REGULAR ( fd str str n n -- fd )
    OPEN-RELATIVE-REGULAR-WITH-STAT {: f:fd st:MODEL:stat :} f ;
-
-\ Rust's open_relative_at with O_RDONLY|O_NONBLOCK, the flags its one
-\ caller passes, which FS:TRY-OPEN-READ-AT sets.
-: OPEN-RELATIVE-AT ( fd str str -- fd )
-   {: dir:fd name:str p:str :}
-   dir name FS:TRY-OPEN-READ-AT MATCH option
-      none OF s" open root-confined file" p IO-FAILURE ENDOF
-      some OF ENDOF
-   ;MATCH ;
 
 : OPEN-DIRECTORY-AT ( fd str str -- fd )
    {: dir:fd name:str p:str :}
@@ -1273,39 +1267,23 @@ private
    lookup path print cx COLLECT-IN
    lookup ARENA:RESET ;
 
-: OPENED-PRINT ( fd str MODEL:stat -- MODEL:fingerprint )
-   {: f:fd p:str probe:MODEL:stat :}
-   f p s" inspect opened scan file" STAT-FD {: opened:MODEL:stat :}
-   probe opened SAME-INODE 0= if s" open scanned file" p CHANGED then
-   opened p FILE-FINGERPRINT ;
-
-\ The fingerprint of the file at name, opened where the probe found it. A
-\ special file put where the probe found a regular one would block a
-\ plain read forever, so the open never waits and the inode check rejects
-\ it.
-: FILE-PRINT ( fd str str MODEL:stat -- MODEL:fingerprint )
-   {: dir:fd name:str p:str probe:MODEL:stat :}
-   dir name p OPEN-RELATIVE-AT {: f:fd :}
-   [: f p probe OPENED-PRINT ;] [: f DISCARD ;] finally ;
-
-\ FILE-PRINT as a step; after a throw ENTRY-CODE? names, NO-FINGERPRINT
-\ and the code.
-: PRINT-STEP ( fd str str MODEL:stat -- MODEL:fingerprint n )
-   {: dir:fd name:str path:str probe:MODEL:stat :}
-   NO-FINGERPRINT [: DROP-FINGERPRINT dir name path probe FILE-PRINT ;]
+\ FILE-FINGERPRINT of the walk's stat as a step; after a throw
+\ ENTRY-CODE? names, NO-FINGERPRINT and the code.
+: PRINT-STEP ( MODEL:stat str -- MODEL:fingerprint n )
+   {: st:MODEL:stat path:str :}
+   NO-FINGERPRINT [: DROP-FINGERPRINT st path FILE-FINGERPRINT ;]
    catch {: code:n :}
    code 0<> if drop NO-FINGERPRINT then code STEP-CODE ;
 
 \ A reserved artifact publishes unsupported; any other file is collected,
 \ or answers the code its step threw.
 : SCAN-FILE
-   ( JOURNAL:scan fd str str MODEL:stat scan-context
-     -- JOURNAL:scan n )
-   {: dir:fd name:str path:str probe:MODEL:stat cx:scan-context :}
+   ( JOURNAL:scan str str MODEL:stat scan-context -- JOURNAL:scan n )
+   {: name:str path:str st:MODEL:stat cx:scan-context :}
    name RESERVED-ARTIFACT? if
       path MODEL-UNKNOWN--REASON:UNSUPPORTED UNKNOWN 0 exit
    then
-   dir name path probe PRINT-STEP {: print:MODEL:fingerprint code:n :}
+   st path PRINT-STEP {: print:MODEL:fingerprint code:n :}
    code 0<> if code exit then
    path print cx COLLECT-FILE 0 ;
 
@@ -1322,8 +1300,8 @@ defer SCAN-SUBTREE
    ;] CLOSING
    child ;
 
-\ The directory at name, opened where the probe found it, as a step;
-\ after a throw ENTRY-CODE? names, -1 and the code.
+\ The directory at name, opened where the walk's stat found it, as a
+\ step; after a throw ENTRY-CODE? names, -1 and the code.
 : DIRECTORY-STEP ( fd str str MODEL:stat -- fd n )
    {: dir:fd name:str path:str probe:MODEL:stat :}
    -1 >FD [: drop dir name path probe OPENED-DIRECTORY ;] catch
@@ -1344,35 +1322,30 @@ defer SCAN-SUBTREE
    path MODEL:>PATH DIRECTORY-OBSERVATION MODEL-LOCAL--RECORD:MAKE
    JOURNAL:SCAN-OBSERVE 0 ;
 
-\ Content on another volume is never synchronized, so an object there is
-\ published as a symlink is and nothing beneath it is observed.
+\ The entry by the walk's stat. One on another volume publishes as a
+\ symlink does, never synchronized, with nothing beneath it observed.
 : SCAN-PROBED
-   ( JOURNAL:scan fd fd str str scan-context -- JOURNAL:scan n )
-   {: probe:fd dir:fd name:str path:str cx:scan-context :}
-   probe path s" inspect directory entry type" STAT-STEP
-   {: st:MODEL:stat code:n :}
-   code 0<> if code exit then
+   ( JOURNAL:scan MODEL:stat fd str str scan-context
+     -- JOURNAL:scan n )
+   {: st:MODEL:stat dir:fd name:str path:str cx:scan-context :}
    cx SCAN-CONTEXT-UNMAKE
    {: cut:option<cutoff> dev:n lookup:^ARENA:arena :}
    st STAT-DEV dev <> if
       path MODEL-UNKNOWN--REASON:UNSUPPORTED UNKNOWN 0 exit
    then
-   st REGULAR? if dir name path st cx SCAN-FILE exit then
+   st REGULAR? if name path st cx SCAN-FILE exit then
    st DIRECTORY? if dir name path st cx SCAN-SUBDIRECTORY exit then
    path UNSUPPORTED-STEP ;
 
-\ Rust's scan_entry: records one entry and answers 0, or answers the code
+\ Rust's scan_entry: one no-follow stat of name, then 0 or the code
 \ that says why it cannot be observed, which SCAN-NAME publishes.
 : SCAN-ENTRY
    ( JOURNAL:scan fd str str scan-context -- JOURNAL:scan n )
    {: dir:fd name:str path:str cx:scan-context :}
-   dir name FS:TRY-OPEN-ENTRY-AT MATCH option
-      none OF s" inspect directory entry" path IO-STEP ENDOF
-      some OF {: probe:fd :}
-         [: probe dir name path cx SCAN-PROBED ;]
-         [: probe DISCARD ;] finally
-      ENDOF
-   ;MATCH ;
+   dir name FS:TRY-STAT-AT 0= if
+      s" inspect directory entry" path IO-STEP exit
+   then
+   BUF-STAT dir name path cx SCAN-PROBED ;
 
 \ Rust's entry_unknown and io_unknown_reason: the reason code, thrown
 \ while one entry was observed, publishes; wrong is what an object that is
@@ -1776,12 +1749,13 @@ private
       some OF j p ar PUBLISH-BOUND ENDOF
    ;MATCH swap ;
 
-\ The complete root through no-follow, descriptor-relative opens, scanned
-\ into the journal's scan words and published. An inaccessible, changing,
-\ symlinked or special entry publishes as unknown with nothing beneath it,
-\ so a partial walk never passes for confirmed absence; only the root's
-\ own failures fail the scan. cut decides which cached hashes the walk
-\ reuses, q which hashes it computes stay reusable.
+\ The complete root through no-follow, descriptor-relative stats and
+\ directory opens, scanned into the journal's scan words and published.
+\ An inaccessible, changing, symlinked or special entry publishes as
+\ unknown with nothing beneath it, so a partial walk never passes for
+\ confirmed absence; only the root's own failures fail the scan. cut
+\ decides which cached hashes the walk reuses, q which hashes it computes
+\ stay reusable.
 : SCAN-AND-PUBLISH-AT
    ( JOURNAL:journal str option<cutoff> [ -- option<cutoff> ]
      ^ARENA:arena -- scan-publication )
