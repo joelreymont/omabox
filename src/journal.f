@@ -14,11 +14,12 @@
 \ of it. A binding with no birth time is one a version-6 journal recorded;
 \ an activation whose path and inode match it upgrades it in place.
 \ A baseline, a plan, a conflict and a local observation are keyed by
-\ the canonical path MODEL:FOLD gives the display path. A baseline is
-\ stored in typed columns; every other stored value is written and read by
-\ MODEL's JSON words. A value MODEL cannot read, a version-nine baseline
-\ refusing the migration included, is logged with the record's path and
-\ its cause and thrown as E-JSON.
+\ the canonical path MODEL:FOLD gives the display path. A baseline and a
+\ remote and a local observation are stored in typed columns; every other
+\ stored value is written and read by MODEL's JSON words. A value MODEL
+\ cannot read, a version-nine baseline or remote observation refusing the
+\ migration included, is logged with the record's path and its cause and
+\ thrown as E-JSON; a version-nine local observation is kept as unknown.
 \ Each write to the file is one immediate transaction, and the remote
 \ cursor and inventory are read in one deferred one.
 \ A local scan is gathered in the connection's temporary tables, then
@@ -135,7 +136,7 @@ $7FFFFFFFFFFFFFFF constant INT-MAX  \ SQLite's largest integer
 1000000000 constant NS-PER-S
 
 \ A stored kind, the number MODEL gives an observation's form; an
-\ unknown remote observation's is 3 plus its reason's index.
+\ unknown observation's is 3 plus its reason's index.
 0 constant KIND-PRESENT
 1 constant KIND-DIRECTORY
 2 constant KIND-ABSENT
@@ -190,12 +191,14 @@ $7FFFFFFFFFFFFFFF constant INT-MAX  \ SQLite's largest integer
 : BIND-KIND ( SQLITE:statement n -- SQLITE:statement )
    3 SQLITE:BIND-INT 4 SQLITE:BIND-NULL 5 SQLITE:BIND-NULL ;
 
+\ Migration 9's insert, into schema 9's JSON table.
 : INSERT-LOCAL ( -- str )
    s" INSERT INTO local_observations(
          path, observation_json, canonical_path
       ) VALUES (?1, ?2, ?3)" ;
 
-\ Binds INSERT-LOCAL's canonical_path, ?3.
+\ Binds the path's canonical_path to ?3, for INSERT-LOCAL and
+\ OBSERVE-SCAN.
 : BIND-KEY
    ( SQLITE:statement MODEL:path ^ARENA:arena -- SQLITE:statement )
    MODEL:FOLD MODEL:KEY>STR 3 SQLITE:BIND-BLOB ;
@@ -435,7 +438,8 @@ private
    0 SQLITE:COL-BLOB {: path:str :}
    MODEL:E-STORED op path UNPROCESSED ;
 
-\ Migration 10: baselines and remote observations in typed columns.
+\ Migration 10: baselines, remote and local observations in typed
+\ columns.
 : MIGRATE-TYPED-COLUMNS ( SQLITE:connection -- )
    {: c :}
    c V10 RUN
@@ -1209,7 +1213,6 @@ private
 \ ---- reading -------------------------------------------------------
 
 \ A seed's typed drop, which types the read that replaces it.
-: DROP-LOCAL ( MODEL:observation<MODEL:local> -- ) drop ;
 : DROP-FINGERPRINT ( MODEL:fingerprint -- ) drop ;
 : DROP-HASH ( DROPBOX:hash -- ) drop ;
 : DROP-OPERATION ( MODEL:operation -- ) drop ;
@@ -1230,13 +1233,6 @@ private
    SQLITE:STEP 0= if NO-PATH swap exit then
    0 ar PATH-COPY OPTION:SOME swap ;
 
-: LOCAL-OBSERVATION-OF
-   ( str str ^ARENA:arena -- MODEL:observation<MODEL:local> )
-   {: json:str path:str ar :}
-   MODEL-OBSERVATION:DIRECTORY
-   [: DROP-LOCAL json ar MODEL:JSON>LOCAL-OBSERVATION ;]
-   s" deserialize local observation" path DECODE ;
-
 : HASH-VALUE-OF
    ( str str ^ARENA:arena -- MODEL:fingerprint DROPBOX:hash )
    {: json:str path:str ar :}
@@ -1244,13 +1240,26 @@ private
    [: DROP-HASH DROP-FINGERPRINT json ar MODEL:JSON>HASH-VALUE ;]
    s" deserialize local hash cache" path DECODE ;
 
+\ The local observation in columns col and col+1: its kind and
+\ content.
+: LOCAL-OBSERVATION-COPY
+   ( SQLITE:statement n ^ARENA:arena
+     -- SQLITE:statement MODEL:observation<MODEL:local> )
+   {: col ar :}
+   col SQLITE:COL-INT {: kind :}
+   kind KIND-PRESENT = if
+      col 1+ ar TEXT-COPY DROPBOX:>HASH MODEL-LOCAL:MAKE
+      MODEL-OBSERVATION:PRESENT exit
+   then
+   kind KIND-DIRECTORY = if MODEL-OBSERVATION:DIRECTORY exit then
+   kind KIND-REASON MODEL-OBSERVATION:UNKNOWN ;
+
 : LOCAL-ROW
    ( SQLITE:statement ^ARENA:arena
      -- SQLITE:statement MODEL:local-record )
    {: ar :}
    0 SQLITE:COL-BLOB ar BYTES-PATH {: p:MODEL:path :}
-   1 SQLITE:COL-TEXT p MODEL:PATH>STR ar LOCAL-OBSERVATION-OF
-   {: o :}
+   1 ar LOCAL-OBSERVATION-COPY {: o :}
    p o MODEL-LOCAL--RECORD:MAKE ;
 
 \ The hash record stored at the path as the JSON.
@@ -1299,7 +1308,7 @@ private
    SQLITE:STEP 0= if NO-CURSOR swap exit then
    0 ar TEXT-COPY DROPBOX:>CURSOR OPTION:SOME swap ;
 
-\ The local records the statement selects as path, observation_json.
+\ The local records the statement selects as path, kind, content.
 : LOCAL-ROWS
    ( SQLITE:connection str ^ARENA:arena
      -- ^VEC:vector<MODEL:local-record> )
@@ -1327,7 +1336,8 @@ public
    ( journal ^ARENA:arena -- ^VEC:vector<MODEL:local-record> )
    {: j ar :}
    j >CONNECTION
-   s" SELECT path, observation_json FROM local_observations ORDER BY path" ar LOCAL-ROWS ;
+   s" SELECT path, kind, content FROM local_observations
+      ORDER BY path" ar LOCAL-ROWS ;
 
 \ The committed cursor, without the inventory.
 : REMOTE-CURSOR ( journal ^ARENA:arena -- option<DROPBOX:cursor> )
@@ -1367,9 +1377,8 @@ public
    ( journal ^ARENA:arena -- ^VEC:vector<MODEL:local-record> )
    {: j ar :}
    j >CONNECTION
-   s" SELECT path, observation_json FROM local_observations
-      WHERE json_type(observation_json, '$.Unknown') IS NOT NULL
-      ORDER BY path" ar LOCAL-ROWS ;
+   s" SELECT path, kind, content FROM local_observations
+      WHERE kind >= 3 ORDER BY path" ar LOCAL-ROWS ;
 
 \ The committed remote records whose observation is unknown, by
 \ canonical path.
@@ -1427,13 +1436,30 @@ private
 
 $2F constant SLASH
 
+\ Binds a local observation's kind to ?2 and NULL content to ?4.
+: BIND-LOCAL-KIND ( SQLITE:statement n -- SQLITE:statement )
+   2 SQLITE:BIND-INT 4 SQLITE:BIND-NULL ;
+
+\ Binds a file's kind to ?2 and its content to ?4.
+: BIND-LOCAL-FILE ( SQLITE:statement MODEL:local -- SQLITE:statement )
+   MODEL-LOCAL:UNMAKE {: h :}
+   KIND-PRESENT 2 SQLITE:BIND-INT
+   h DROPBOX:HASH>STR 4 SQLITE:BIND-TEXT ;
+
+\ Binds the record's path to ?1, its key to ?3 and its observation to
+\ ?2 and ?4; an absent one binds kind 2, which the table refuses.
 : LOCAL-INSERTED
-   ( SQLITE:statement MODEL:local-record ^JSON:writer ^ARENA:arena
+   ( SQLITE:statement MODEL:local-record ^ARENA:arena
      -- SQLITE:statement )
-   {: r w ar :}
+   {: r ar :}
    r MODEL-LOCAL--RECORD:UNMAKE {: p:MODEL:path o :}
    p MODEL:PATH>STR 1 SQLITE:BIND-BLOB
-   w [: o swap MODEL:LOCAL-OBSERVATION>JSON ;] ENCODE 2 SQLITE:BIND-TEXT
+   o MATCH MODEL:observation
+      present OF BIND-LOCAL-FILE ENDOF
+      directory OF KIND-DIRECTORY BIND-LOCAL-KIND ENDOF
+      absent OF KIND-ABSENT BIND-LOCAL-KIND ENDOF
+      unknown OF REASON-KIND BIND-LOCAL-KIND ENDOF
+   ;MATCH
    p ar BIND-KEY RAN ;
 
 \ Binds path ?1 and hash_json ?2.
@@ -1548,8 +1574,8 @@ $2F constant SLASH
 
 : OBSERVE-SCAN ( -- str )
    s" INSERT OR REPLACE INTO temp.scan_observations(
-         path, observation_json, canonical_path
-      ) VALUES (?1, ?2, ?3)" ;
+         path, kind, canonical_path, content
+      ) VALUES (?1, ?2, ?3, ?4)" ;
 
 : HASH-SCAN ( -- str )
    s" INSERT OR REPLACE INTO temp.scan_hashes(path, hash_json)
@@ -1581,8 +1607,9 @@ $2F constant SLASH
 : SCAN-TABLES ( -- str )
    s" CREATE TABLE IF NOT EXISTS temp.scan_observations(
          path BLOB PRIMARY KEY,
-         observation_json TEXT NOT NULL,
-         canonical_path BLOB NOT NULL
+         canonical_path BLOB NOT NULL,
+         kind INTEGER NOT NULL,
+         content TEXT
       );
       CREATE TABLE IF NOT EXISTS temp.scan_hashes(
          path BLOB PRIMARY KEY,
@@ -1910,10 +1937,11 @@ FSM:DEFINE BATCHING ( ^batch ) batch-state batch-input
    s" DELETE FROM local_observations WHERE NOT EXISTS (
          SELECT 1 FROM temp.scan_observations AS s
          WHERE s.path = local_observations.path
-            AND s.observation_json = local_observations.observation_json
+            AND s.kind = local_observations.kind
+            AND s.content IS local_observations.content
       );
-      INSERT INTO local_observations(path, observation_json, canonical_path)
-         SELECT s.path, s.observation_json, s.canonical_path
+      INSERT INTO local_observations(path, canonical_path, kind, content)
+         SELECT s.path, s.canonical_path, s.kind, s.content
          FROM temp.scan_observations AS s
          WHERE NOT EXISTS (
             SELECT 1 FROM local_observations AS o WHERE o.path = s.path
@@ -1977,7 +2005,7 @@ public
    {: r :}
    WRITING SCAN-UNMAKE {: j w ar :}
    >r >r >r >r >r
-   r w ar LOCAL-INSERTED ar ARENA:RESET
+   r ar LOCAL-INSERTED ar ARENA:RESET
    r> r> r> r> r>
    j w ar SCAN-MAKE ;
 
@@ -2486,7 +2514,7 @@ private
      -- SQLITE:statement ^VEC:vector<MODEL:local-record> bool )
    {: v ar visit :}
    ar LOCAL-ROW v VEC:PUSH !
-   2 SQLITE:COL-INT 0= if v false exit then
+   3 SQLITE:COL-INT 0= if v false exit then
    v visit execute {: stop:bool :}
    ar LOCAL-RECORDS stop ;
 
@@ -2528,7 +2556,7 @@ public
      -- )
    {: j ar visit :}
    j >CONNECTION
-   s" SELECT o.path, o.observation_json, o.path = c.last
+   s" SELECT o.path, o.kind, o.content, o.path = c.last
       FROM (SELECT canonical_path, max(path) AS last
             FROM local_observations
             GROUP BY canonical_path HAVING count(*) > 1) AS c
@@ -2544,7 +2572,7 @@ public
    ( journal MODEL:key ^ARENA:arena -- option<MODEL:local-record> )
    {: j k ar :}
    j >CONNECTION
-   s" SELECT path, observation_json FROM local_observations
+   s" SELECT path, kind, content FROM local_observations
       WHERE canonical_path = ?1 ORDER BY path LIMIT 1" [: k MODEL:KEY>STR 1 SQLITE:BIND-BLOB ar LOCAL-AT-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
@@ -2556,7 +2584,7 @@ public
    {: j k ar :}
    ar LOCAL-RECORDS {: v :}
    j >CONNECTION
-   s" SELECT path, observation_json FROM local_observations
+   s" SELECT path, kind, content FROM local_observations
       WHERE canonical_path = ?1 ORDER BY path" [: k MODEL:KEY>STR 1 SQLITE:BIND-BLOB
       begin SQLITE:STEP while ar LOCAL-ROW v VEC:PUSH ! repeat ;]
    SQLITE:WITH-STATEMENT
@@ -2611,7 +2639,7 @@ private
 \ the subtree's bounds, the key then "/" and the key then "0", bytes.
 : KNOWN-SELECT ( -- str )
    s" SELECT keys.k, b.path, b.kind, b.content, b.revision,
-         l.path, l.observation_json,
+         l.path, l.kind, l.content,
          (SELECT count(*) FROM local_observations c
             WHERE c.canonical_path = keys.k),
          r.path, r.kind, r.content, r.revision,
@@ -2652,29 +2680,28 @@ create ONE-KNOWN ONE-KEY KNOWN-SELECT LAY-BOTH
    2 ar BASELINE-COPY {: b :}
    p b JOURNAL-PATH--BASELINE:MAKE OPTION:SOME ;
 
-\ Columns 5 and 6, NULL where no local row is.
+\ Columns 5 to 7, NULL where no local row is.
 : KNOWN-LOCAL
    ( SQLITE:statement ^ARENA:arena
      -- SQLITE:statement option<MODEL:local-record> )
    {: ar :}
    5 SQLITE:COL-NULL? if NO-LOCAL exit then
    5 ar PATH-COPY {: p :}
-   6 SQLITE:COL-TEXT p MODEL:PATH>STR ar LOCAL-OBSERVATION-OF
-   {: o :}
+   6 ar LOCAL-OBSERVATION-COPY {: o :}
    p o MODEL-LOCAL--RECORD:MAKE OPTION:SOME ;
 
-\ Columns 8 to 11, NULL where no remote row is.
+\ Columns 9 to 12, NULL where no remote row is.
 : KNOWN-REMOTE
    ( SQLITE:statement MODEL:key ^ARENA:arena
      -- SQLITE:statement option<MODEL:remote-record> )
    {: k ar :}
-   8 SQLITE:COL-NULL? if NO-REMOTE exit then
-   8 ar PATH-COPY {: p :}
-   9 ar REMOTE-OBSERVATION-COPY {: o :}
+   9 SQLITE:COL-NULL? if NO-REMOTE exit then
+   9 ar PATH-COPY {: p :}
+   10 ar REMOTE-OBSERVATION-COPY {: o :}
    k p o MODEL-REMOTE--RECORD:MAKE OPTION:SOME ;
 
 : KNOWN-SUBTREE ( SQLITE:statement -- SQLITE:statement MODEL:subtree )
-   13 SQLITE:COL-INT 0= if MODEL-SUBTREE:EMPTY exit then
+   14 SQLITE:COL-INT 0= if MODEL-SUBTREE:EMPTY exit then
    MODEL-SUBTREE:OCCUPIED ;
 
 \ The row of a KNOWN-SELECT statement, decoded into ar.
@@ -2684,10 +2711,10 @@ create ONE-KNOWN ONE-KEY KNOWN-SELECT LAY-BOTH
    0 ar KEY-COPY {: k :}
    ar KNOWN-BASELINE {: b :}
    ar KNOWN-LOCAL {: l :}
-   7 SQLITE:COL-INT {: n :}
+   8 SQLITE:COL-INT {: n :}
    k ar KNOWN-REMOTE {: r :}
    KNOWN-SUBTREE {: s :}
-   12 SQLITE:COL-INT 0<> {: live:bool :}
+   13 SQLITE:COL-INT 0<> {: live:bool :}
    k b l n r s live JOURNAL-KNOWN--PATH:MAKE ;
 
 : KNOWN-ROWS

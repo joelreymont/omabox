@@ -1,12 +1,13 @@
 \ journal-test.f - JOURNAL's open, schema 10, bindings, inventories,
 \ baselines, plans, completions, conflicts and recoveries on journals
 \ under TMPDIR: a new journal's sqlite_master against
-\ src/oracle/schema.tsv as a set, but for the baselines and
-\ remote_observations tables, which are migrations/0010.sql's, and its
-\ user_version 10; versions 1, 7 and 11 refused unchanged;
-\ src/oracle/journal.sqlite3, a schema-8 journal, migrated to 10 with
-\ its local observations keyed by their folded paths and its baselines
-\ and remote observations in typed columns, and, without its
+\ src/oracle/schema.tsv as a set, but for the baselines,
+\ remote_observations and local_observations tables, which are
+\ migrations/0010.sql's, and its user_version 10; versions 1, 7 and 11
+\ refused unchanged; src/oracle/journal.sqlite3, a schema-8 journal,
+\ migrated to 10 with its local observations keyed by their folded
+\ paths and its baselines, remote and local observations in typed
+\ columns, and, without its
 \ remote_directories index, left at schema 8 with every row when the
 \ migration fails; a local scan published as its difference, every
 \ unchanged row keeping its rowid and the hashes of another generation
@@ -47,11 +48,12 @@
 \ in one row of each stored JSON family is refused by the word that
 \ reads it, as E-JSON naming the row's path; at schema 9, a baseline or
 \ remote observation refuses the migration so, leaving the file at 9
-\ with every row. The oracle at schema 9 migrates a baseline and a
-\ remote observation of each kind, the absent ones gone, and the
-\ migration converts each of a list of texts exactly when MODEL's JSON
-\ reader reads it, to the value it reads. Each case removes its
-\ directory;
+\ with every row. The oracle at schema 9 migrates a baseline, a remote
+\ and a local observation of each kind, the absent ones gone and a
+\ local one MODEL cannot read kept as unknown, and the migration
+\ converts each of a list of texts exactly when MODEL's JSON reader
+\ reads it, to the value it reads, a local text it refuses to unknown.
+\ Each case removes its directory;
 \ a refusal's log line is captured in it, checked and removed.
 \ Run from the repository root: hb --load src/journal-test.f </dev/null
 require src/lib/error.f
@@ -337,15 +339,15 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
 
 \ ---- the journal's rows ------------------------------------------
 
-\ Every row but the baselines and remote_observations tables', as
-\ schema.tsv writes one.
+\ Every row but the baselines, remote_observations and
+\ local_observations tables', as schema.tsv writes one.
 : SCHEMA-SQL ( -- str )
    s" SELECT type || char(9) || name || char(9) || tbl_name || char(9)
          || coalesce(replace(replace(replace(sql, '\', '\\'),
             char(10), '\n'), char(9), '\t'), '')
       FROM sqlite_master
-      WHERE NOT (type = 'table'
-         AND name IN ('baselines', 'remote_observations'))" ;
+      WHERE NOT (type = 'table' AND name IN
+         ('baselines', 'remote_observations', 'local_observations'))" ;
 
 \ Counts the rows, each a line of BODY.
 : SCHEMA-ROWS ( n SQLITE:statement -- n SQLITE:statement )
@@ -366,13 +368,13 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    SQLITE:STEP drop 0 SQLITE:COL-TEXT {: t:str :}
    BODY BODY-U @ >str t CONTAINS? swap ;
 
-\ The journal's schema is schema.tsv's but for the baselines and
-\ remote_observations tables, which are migrations/0010.sql's, and its
-\ version is 10.
+\ The journal's schema is schema.tsv's but for the baselines,
+\ remote_observations and local_observations tables, which are
+\ migrations/0010.sql's, and its version is 10.
 : SCHEMA-10 ( journal -- )
    >CONNECTION {: c :}
    s" src/oracle/schema.tsv" ORACLE
-   0 c SCHEMA-SQL [: SCHEMA-ROWS ;] SQLITE:WITH-STATEMENT 24 T=
+   0 c SCHEMA-SQL [: SCHEMA-ROWS ;] SQLITE:WITH-STATEMENT 23 T=
    c VERSION 10 T=
    s" migrations/0010.sql" ORACLE
    c s" SELECT sql FROM sqlite_master
@@ -380,6 +382,9 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    SQLITE:WITH-STATEMENT TTRUE
    c s" SELECT sql FROM sqlite_master
       WHERE type = 'table' AND name = 'remote_observations'"
+   [: BODY-HOLDS ;] SQLITE:WITH-STATEMENT TTRUE
+   c s" SELECT sql FROM sqlite_master
+      WHERE type = 'table' AND name = 'local_observations'"
    [: BODY-HOLDS ;] SQLITE:WITH-STATEMENT TTRUE ;
 
 : VERSIONED ( str n -- )
@@ -761,31 +766,35 @@ variable SCANNED       \ query plan rows that scan the table
 \ ---- test-only words of the Rust version -------------------------
 
 : LOCALS-INSERTED
-   ( SQLITE:statement ^VEC:vector<MODEL:local-record> ^JSON:writer
-     ^ARENA:arena -- SQLITE:statement )
-   {: v w ar :}
+   ( SQLITE:statement ^VEC:vector<MODEL:local-record> ^ARENA:arena
+     -- SQLITE:statement )
+   {: v ar :}
    v VEC:COUNT 0 ?do
-      v i VEC:AT @ w ar LOCAL-INSERTED ar ARENA:RESET
+      v i VEC:AT @ ar LOCAL-INSERTED ar ARENA:RESET
    loop ;
 
 : LOCAL-INSERTS
-   ( SQLITE:statement ^VEC:vector<MODEL:local-record> ^JSON:writer
+   ( SQLITE:statement ^VEC:vector<MODEL:local-record>
      -- SQLITE:statement )
    [: LOCALS-INSERTED ;] ARENA:WITH ;
 
+\ The bindings are LOCAL-INSERTED's.
+: LOCAL-INSERT ( -- str )
+   s" INSERT INTO local_observations(path, kind, canonical_path, content)
+      VALUES (?1, ?2, ?3, ?4)" ;
+
 : LOCAL-INVENTORY-WRITTEN
-   ( SQLITE:connection ^VEC:vector<MODEL:local-record> ^JSON:writer -- )
-   {: c v w :}
+   ( SQLITE:connection ^VEC:vector<MODEL:local-record> -- )
+   {: c v :}
    c s" DELETE FROM local_observations" SQLITE:EXEC
-   c INSERT-LOCAL [: v w LOCAL-INSERTS ;] SQLITE:WITH-STATEMENT ;
+   c LOCAL-INSERT [: v LOCAL-INSERTS ;] SQLITE:WITH-STATEMENT ;
 
 \ Replaces the local inventory, and nothing else, in one transaction.
 : PUBLISH-LOCAL-INVENTORY
    ( journal ^VEC:vector<MODEL:local-record> -- )
    {: j v :}
    j >CONNECTION {: c :}
-   c [: c v [: LOCAL-INVENTORY-WRITTEN ;] ENCODING ;]
-   SQLITE:WITH-TRANSACTION ;
+   c [: c v LOCAL-INVENTORY-WRITTEN ;] SQLITE:WITH-TRANSACTION ;
 
 
 \ ---- the brief's cases -------------------------------------------
@@ -843,6 +852,22 @@ variable SCANNED       \ query plan rows that scan the table
    ORACLE-REMOTE MODEL-OBSERVATION:PRESENT ANY-HOLDS? and
    v s" restricted" ar CANONICAL INACCESSIBLE ANY-HOLDS? and ;
 
+\ The oracle journal's file at Docs/A.txt, as a local observation.
+: ORACLE-LOCAL ( -- MODEL:observation<MODEL:local> )
+   ORACLE-REMOTE MODEL-REMOTE:UNMAKE drop MODEL-LOCAL:MAKE
+   MODEL-OBSERVATION:PRESENT ;
+
+: LOCKED-LOCAL ( -- MODEL:observation<MODEL:local> )
+   MODEL-UNKNOWN--REASON:INACCESSIBLE MODEL-OBSERVATION:UNKNOWN ;
+
+\ The oracle journal's three local records, by path.
+: ORACLE-LOCALS ( ^ARENA:arena -- ^VEC:vector<MODEL:local-record> )
+   LOCALS {: v :}
+   s" Docs" LOCAL-DIRECTORY LOCAL-RECORD v LOCAL+
+   s" Docs/A.txt" ORACLE-LOCAL LOCAL-RECORD v LOCAL+
+   s" Docs/Locked" LOCKED-LOCAL LOCAL-RECORD v LOCAL+
+   v ;
+
 : ORACLE-JOURNAL-IS-MIGRATED ( ^ARENA:arena -- )
    {: ar :}
    s" the oracle journal migrates to schema 10" T-LABEL
@@ -856,6 +881,7 @@ variable SCANNED       \ query plan rows that scan the table
    0 j >CONNECTION
    s" SELECT path, canonical_path FROM local_observations"
    [: ar FOLDED-ROWS ;] SQLITE:WITH-STATEMENT 3 T=
+   j ar LOCAL-INVENTORY ar ORACLE-LOCALS LOCAL-RECORDS= TTRUE
    j ar REMOTE-INVENTORY JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur v :}
    v VEC:COUNT 3 T=
    v ar ORACLE-REMOTES? TTRUE
@@ -1457,8 +1483,9 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
 : STALE-REMOTE ( -- MODEL:observation<MODEL:remote> )
    MODEL-UNKNOWN--REASON:STALE MODEL-OBSERVATION:UNKNOWN ;
 
-\ A local inventory of each observation, out of path order; its unknown
-\ paths, Thumbs.db an excluded name, sort otherwise once folded.
+\ A local inventory of each observation a row holds, out of path order;
+\ its unknown paths, Thumbs.db an excluded name, sort otherwise once
+\ folded.
 : MIXED-LOCALS ( ^ARENA:arena -- ^VEC:vector<MODEL:local-record> )
    {: ar :}
    ar LOCALS {: v :}
@@ -1466,7 +1493,6 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    LOCAL-RECORD v LOCAL+
    s" a.txt" s" a" PRESENT-LOCAL LOCAL-RECORD v LOCAL+
    s" dir" LOCAL-DIRECTORY LOCAL-RECORD v LOCAL+
-   s" gone.txt" ABSENT-LOCAL LOCAL-RECORD v LOCAL+
    s" Thumbs.db" MODEL-UNKNOWN--REASON:INACCESSIBLE UNKNOWN-LOCAL
    LOCAL-RECORD v LOCAL+
    s" m-unknown" MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN-LOCAL
@@ -1528,7 +1554,8 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    s" DROP TABLE IF EXISTS temp.noted_observations;
       DROP TABLE IF EXISTS temp.noted_hashes;
       CREATE TEMP TABLE noted_observations AS
-         SELECT rowid AS id, path, observation_json FROM local_observations;
+         SELECT rowid AS id, path, kind, content
+         FROM local_observations;
       CREATE TEMP TABLE noted_hashes AS
          SELECT rowid AS id, root_generation, path, hash_json
          FROM local_hash_cache;" SQLITE:EXEC ;
@@ -1538,14 +1565,15 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
 : OBSERVATIONS-MOVED ( journal -- n n n )
    >CONNECTION {: c :}
    c s" SELECT COUNT(*) FROM (
-         SELECT rowid, path, observation_json FROM local_observations
+         SELECT rowid, path, kind, content FROM local_observations
          INTERSECT SELECT * FROM noted_observations)" QUERY-INT
    c s" SELECT COUNT(*) FROM (
-         SELECT rowid, path, observation_json FROM local_observations
+         SELECT rowid, path, kind, content FROM local_observations
          EXCEPT SELECT * FROM noted_observations)" QUERY-INT
    c s" SELECT COUNT(*) FROM (
          SELECT * FROM noted_observations
-         EXCEPT SELECT rowid, path, observation_json FROM local_observations)"
+         EXCEPT SELECT rowid, path, kind, content
+         FROM local_observations)"
    QUERY-INT ;
 
 \ OBSERVATIONS-MOVED's counts for the hash cache.
@@ -2190,10 +2218,8 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 : KNOWN-FIXTURE ( -- str )
    s\" INSERT INTO baselines(path, canonical_path, kind)
          VALUES (CAST('Base' AS BLOB), CAST('base' AS BLOB), 1);
-      INSERT INTO local_observations(path, observation_json,
-            canonical_path)
-         SELECT CAST(column1 AS BLOB), '\"Directory\"',
-            CAST(column2 AS BLOB)
+      INSERT INTO local_observations(path, canonical_path, kind)
+         SELECT CAST(column1 AS BLOB), CAST(column2 AS BLOB), 1
          FROM (VALUES ('local', 'local'), ('pair', 'pair'),
             ('Pair', 'pair'));
       INSERT INTO remote_observations(path, canonical_path, kind)
@@ -4204,9 +4230,6 @@ variable CRAFT
 : HELD-BLOCKED-PLANS ( -- )
    HELD-JOURNAL @ HELD-ARENA @ BLOCKED-PLANS drop ;
 
-: HELD-LOCAL-INVENTORY ( -- )
-   HELD-JOURNAL @ HELD-ARENA @ LOCAL-INVENTORY drop ;
-
 : HELD-CONFLICTS ( -- ) HELD-JOURNAL @ HELD-ARENA @ CONFLICTS drop ;
 
 : HELD-HASH-CACHE ( -- )
@@ -4338,6 +4361,74 @@ variable CRAFT
    j CLOSE
    d GONE ;
 
+\ A local row of each kind the oracle lacks, and one MODEL cannot read,
+\ as schema 9 holds them; each canonical path is its path in lower
+\ case, as MODEL:FOLD gives it.
+: EVERY-LOCAL-KIND ( -- str )
+   s\" INSERT INTO local_observations(path, observation_json,
+         canonical_path)
+      SELECT CAST(column1 AS BLOB), column2,
+         CAST(lower(column1) AS BLOB)
+      FROM (VALUES ('Gone', '\"ConfirmedAbsent\"'),
+         ('Incomplete', '{\"Unknown\":\"Incomplete\"}'),
+         ('Unavailable', '{\"Unknown\":\"Unavailable\"}'),
+         ('Stale', '{\"Unknown\":\"Stale\"}'),
+         ('Reset', '{\"Unknown\":\"CursorReset\"}'),
+         ('Unsupported', '{\"Unknown\":\"Unsupported\"}'),
+         ('Future', '{\"Future\":1}'))" ;
+
+\ The local record at the path, unknown for the reason.
+: UNKNOWN-AT
+   ( str MODEL:unknown-reason -- MODEL:local-record )
+   UNKNOWN-LOCAL LOCAL-RECORD ;
+
+\ ORACLE-LOCALS and EVERY-LOCAL-KIND's records, by path: Gone's gone
+\ and Future's unknown, Incomplete.
+: MIGRATED-LOCALS
+   ( ^ARENA:arena -- ^VEC:vector<MODEL:local-record> )
+   ORACLE-LOCALS {: v :}
+   s" Future" MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN-AT v LOCAL+
+   s" Incomplete" MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN-AT
+   v LOCAL+
+   s" Reset" MODEL-UNKNOWN--REASON:CURSOR-RESET UNKNOWN-AT v LOCAL+
+   s" Stale" MODEL-UNKNOWN--REASON:STALE UNKNOWN-AT v LOCAL+
+   s" Unavailable" MODEL-UNKNOWN--REASON:UNAVAILABLE UNKNOWN-AT
+   v LOCAL+
+   s" Unsupported" MODEL-UNKNOWN--REASON:UNSUPPORTED UNKNOWN-AT
+   v LOCAL+
+   v ;
+
+\ Whether the answer is the record.
+: LOCAL-IS? ( option<MODEL:local-record> MODEL:local-record -- bool )
+   {: want :}
+   MATCH option
+      none OF false ENDOF
+      some OF want MODEL:LOCAL-RECORD= ENDOF
+   ;MATCH ;
+
+: NO-LOCAL? ( option<MODEL:local-record> -- bool )
+   MATCH option none OF true ENDOF some OF drop false ENDOF ;MATCH ;
+
+\ A local observation of each kind at schema 9 migrates; the absent
+\ one's row goes, and the one MODEL cannot read stays, unknown, at its
+\ path and canonical path.
+: A-SCHEMA-9-JOURNAL-MIGRATES-ITS-LOCAL-OBSERVATIONS
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" a schema-9 journal migrates each kind of local observation"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p NINE-ORACLE
+   EVERY-LOCAL-KIND p PLANT-AT
+   p OPEN {: j :}
+   j >CONNECTION VERSION 10 T=
+   j ar LOCAL-INVENTORY ar MIGRATED-LOCALS LOCAL-RECORDS= TTRUE
+   s" Future" MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN-AT {: f :}
+   j s" future" ar CANONICAL ar LOCAL-AT f LOCAL-IS? TTRUE
+   j s" gone" ar CANONICAL ar LOCAL-AT NO-LOCAL? TTRUE
+   j CLOSE
+   d GONE ;
+
 : SEED-DROP ( MODEL:baseline -- ) drop ;
 
 \ The baseline MODEL reads from the text, none for absent, and whether
@@ -4350,14 +4441,14 @@ variable CRAFT
    b ABSENT? if NO-BASELINE false exit then
    b OPTION:SOME false ;
 
-\ The text set by the update at schema 9 in c, then migrated: whether
-\ the migration refused it as op's, rolled back, or else left its
-\ transaction open. f takes the refusal's log.
+\ The text set by the update at schema 9 in c, then migrated, in one
+\ transaction: whether the migration refused it as op's, rolled back,
+\ or else left the transaction open. f takes the refusal's log.
 : MIGRATED?
    ( SQLITE:connection str str str str ^ARENA:arena -- bool )
    {: c t:str update:str op:str f:str ar :}
-   c update [: t 1 SQLITE:BIND-TEXT RAN ;] SQLITE:WITH-STATEMENT
    c s" BEGIN" SQLITE:EXEC
+   c update [: t 1 SQLITE:BIND-TEXT RAN ;] SQLITE:WITH-STATEMENT
    [: c MIGRATE-TYPED-COLUMNS ;] f ar STDERR:CAPTURING {: code e:str :}
    code 0= if false exit then
    code E-JSON T=  e op CONTAINS? TTRUE
@@ -4524,8 +4615,118 @@ variable CRAFT
    c s\" {\"Future\":1}" f ar REMOTE-CONVERTS
    c s" not json" f ar REMOTE-CONVERTS ;
 
-\ Each text as Docs's baseline, then as its remote observation, of a
-\ schema-9 journal.
+: LOCAL-SEED-DROP ( MODEL:observation<MODEL:local> -- ) drop ;
+
+\ Docs's record with the observation MODEL reads from the text: none
+\ for absent, and unknown, Incomplete, where MODEL refuses the text.
+: LOCAL-CODEC-READ ( str ^ARENA:arena -- option<MODEL:local-record> )
+   {: t:str ar :}
+   ABSENT-LOCAL
+   [: LOCAL-SEED-DROP t ar MODEL:JSON>LOCAL-OBSERVATION ;] catch
+   {: o code :}
+   code 0<> if
+      code MODEL:E-STORED T=
+      s" Docs" MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN-AT
+      OPTION:SOME exit
+   then
+   o ABSENT-LOCAL MODEL:LOCAL-OBSERVATION= if NO-LOCAL exit then
+   s" Docs" o LOCAL-RECORD OPTION:SOME ;
+
+\ The text as Docs's local observation at schema 9 in c, migrated,
+\ then rolled back: its record read back. The migration never refuses
+\ a local text.
+: LOCAL-MIGRATION-READ
+   ( SQLITE:connection str str ^ARENA:arena
+     -- option<MODEL:local-record> )
+   {: c t:str f:str ar :}
+   c t s" UPDATE local_observations SET observation_json = ?1
+      WHERE path = CAST('Docs' AS BLOB)"
+   s" deserialize local observation" f ar
+   MIGRATED? dup TFALSE if NO-LOCAL exit then
+   c s" SELECT path, kind, content FROM local_observations
+      WHERE path = CAST('Docs' AS BLOB)"
+   [: ar LOCAL-AT-ROW ;] SQLITE:WITH-STATEMENT {: r :}
+   c s" ROLLBACK" SQLITE:EXEC
+   r ;
+
+: SAME-LOCAL?
+   ( option<MODEL:local-record> option<MODEL:local-record> -- bool )
+   {: want :}
+   MATCH option
+      none OF want NO-LOCAL? ENDOF
+      some OF {: r :} want r LOCAL-IS? ENDOF
+   ;MATCH ;
+
+\ The migration reads the observation MODEL reads from the text, and
+\ unknown, Incomplete, where MODEL refuses it.
+: LOCAL-CONVERTS ( SQLITE:connection str str ^ARENA:arena -- )
+   {: c t:str f:str ar :}
+   t T-LABEL
+   t ar LOCAL-CODEC-READ {: want :}
+   c t f ar LOCAL-MIGRATION-READ want SAME-LOCAL? TTRUE ;
+
+: LOCAL-READ-TEXTS ( SQLITE:connection str ^ARENA:arena -- )
+   {: c f:str ar :}
+   c s\" \"Directory\"" f ar LOCAL-CONVERTS
+   c s\" \"ConfirmedAbsent\"" f ar LOCAL-CONVERTS
+   c s\" {\"Present\":{\"content\":\"h\"}}" f ar LOCAL-CONVERTS
+   c s\" {\"Unknown\":\"Incomplete\"}" f ar LOCAL-CONVERTS
+   c s\" {\"Unknown\":\"Inaccessible\"}" f ar LOCAL-CONVERTS
+   c s\" {\"Unknown\":\"Unavailable\"}" f ar LOCAL-CONVERTS
+   c s\" {\"Unknown\":\"Stale\"}" f ar LOCAL-CONVERTS
+   c s\" {\"Unknown\":\"CursorReset\"}" f ar LOCAL-CONVERTS
+   c s\" {\"Unknown\":\"Unsupported\"}" f ar LOCAL-CONVERTS
+   c s\"  { \"Unknown\" : \"Stale\" } " f ar LOCAL-CONVERTS
+   c s\" {\"Unkn\\u006fwn\":\"St\\u0061le\"}"
+   f ar LOCAL-CONVERTS
+   c s\" \"Confirmed\\u0041bsent\"" f ar LOCAL-CONVERTS
+   c s\" \"Dir\\u0065ctory\"" f ar LOCAL-CONVERTS
+   c s\" {\"Pr\\u0065sent\":{\"c\\u006fntent\":\"h\\u0041\"}}"
+   f ar LOCAL-CONVERTS
+   c s\" {\"Present\":{\"x\":[1,{\"y\":null}],\"content\":\"h\"}}"
+   f ar LOCAL-CONVERTS
+   c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\"}}"
+   f ar LOCAL-CONVERTS
+   c s\" {\"Present\":{\"content\":\"\"}}" f ar LOCAL-CONVERTS
+   c s\" {\"Present\":{\"content\":\"\\ud83d\\ude00\"}}"
+   f ar LOCAL-CONVERTS
+   c s\" {\"Present\":{\"content\":\"a\\u0000b\"}}"
+   f ar LOCAL-CONVERTS ;
+
+: LOCAL-REFUSED-TEXTS ( SQLITE:connection str ^ARENA:arena -- )
+   {: c f:str ar :}
+   c s\" \"Absent\"" f ar LOCAL-CONVERTS
+   c s\" \"Unknown\"" f ar LOCAL-CONVERTS
+   c s\" \"Present\"" f ar LOCAL-CONVERTS
+   c s\" \"directory\"" f ar LOCAL-CONVERTS
+   c s\" \"Directory\\u0000\"" f ar LOCAL-CONVERTS
+   c s\" {\"Directory\":null}" f ar LOCAL-CONVERTS
+   c s\" {\"ConfirmedAbsent\":null}" f ar LOCAL-CONVERTS
+   c s\" {\"Unknown\":null}" f ar LOCAL-CONVERTS
+   c s\" {\"Unknown\":\"stale\"}" f ar LOCAL-CONVERTS
+   c s\" {\"Unknown\":\"Future\"}" f ar LOCAL-CONVERTS
+   c s\" {\"Unknown\":\"Stale\",\"x\":1}" f ar LOCAL-CONVERTS
+   c s\" {\"Present\":{}}" f ar LOCAL-CONVERTS
+   c s\" {\"Present\":[]}" f ar LOCAL-CONVERTS
+   c s\" {\"Present\":{\"content\":1}}" f ar LOCAL-CONVERTS
+   c s\" {\"Present\":{\"content\":null}}" f ar LOCAL-CONVERTS
+   c s\" {\"Present\":{\"content\":\"h\",\"content\":\"h\"}}"
+   f ar LOCAL-CONVERTS
+   c s\" {\"Present\":{\"content\":\"h\"},\"x\":1}"
+   f ar LOCAL-CONVERTS
+   c s\" {'Present':{\"content\":\"h\"}}" f ar LOCAL-CONVERTS
+   c s\" {\"Present\":{\"content\":\"h\",}}" f ar LOCAL-CONVERTS
+   c s\" {\"Present\":{\"content\":\"h\"}} x" f ar LOCAL-CONVERTS
+   c s\" {\"Present\":{\"content\":\"\",\"x\":{\"a\":1,\"a\":2}}}"
+   f ar LOCAL-CONVERTS
+   c s\" {\"Present\":{\"content\":\"\",\"n\":1234567890123456789012}}"
+   f ar LOCAL-CONVERTS
+   c s" []" f ar LOCAL-CONVERTS
+   c s\" {\"Future\":1}" f ar LOCAL-CONVERTS
+   c s" not json" f ar LOCAL-CONVERTS ;
+
+\ Each text as Docs's baseline, then as its remote and its local
+\ observation, of a schema-9 journal.
 : THE-MIGRATION-CONVERTS-WHAT-MODEL-READS ( ^ARENA:arena -- )
    {: ar :}
    ar JOURNAL-AT {: d:str p:str :}
@@ -4536,6 +4737,8 @@ variable CRAFT
    c f ar REFUSED-TEXTS
    c f ar REMOTE-READ-TEXTS
    c f ar REMOTE-REFUSED-TEXTS
+   c f ar LOCAL-READ-TEXTS
+   c f ar LOCAL-REFUSED-TEXTS
    c SQLITE:CLOSE
    d GONE ;
 
@@ -4547,16 +4750,6 @@ variable CRAFT
       WHERE id = 2" ar PLANTED {: d:str :}
    [: HELD-PENDING-PLANS ;] d s" deserialize operation"
    s" Docs/New.txt" ar UNREADABLE
-   d PLANTED-GONE ;
-
-: AN-UNKNOWN-LOCAL-OBSERVATION-IS-REFUSED ( ^ARENA:arena -- )
-   {: ar :}
-   s" an unknown stored local observation is refused" T-LABEL
-   s\" UPDATE local_observations
-      SET observation_json = '{\"Future\":1}'
-      WHERE hex(path) = hex('Docs')" ar PLANTED {: d:str :}
-   [: HELD-LOCAL-INVENTORY ;] d s" deserialize local observation"
-   s" Docs" ar UNREADABLE
    d PLANTED-GONE ;
 
 \ Plan 3, the oracle's blocked one.
@@ -4692,9 +4885,9 @@ variable CRAFT
    ar A-SCHEMA-9-JOURNAL-MIGRATES-ITS-BASELINES
    ar AN-UNKNOWN-REMOTE-OBSERVATION-REFUSES-THE-MIGRATION
    ar A-SCHEMA-9-JOURNAL-MIGRATES-ITS-REMOTE-OBSERVATIONS
+   ar A-SCHEMA-9-JOURNAL-MIGRATES-ITS-LOCAL-OBSERVATIONS
    ar THE-MIGRATION-CONVERTS-WHAT-MODEL-READS
    ar AN-UNKNOWN-OPERATION-IS-REFUSED
-   ar AN-UNKNOWN-LOCAL-OBSERVATION-IS-REFUSED
    ar AN-UNKNOWN-BLOCKAGE-IS-REFUSED
    ar AN-UNKNOWN-CONFLICT-IS-REFUSED
    ar AN-UNREADABLE-HASH-VALUE-IS-REFUSED
