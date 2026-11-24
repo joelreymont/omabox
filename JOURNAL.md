@@ -2409,3 +2409,41 @@ Observations for the blog:
 - Moving per-entry work into SQLite helped while it replaced JSON, but
   a scratch row is not free: at 1.3 to 4.2 µs a row, staging the tree on
   every pass costs more than Rust's whole scan of it.
+
+## 2026-11-24: three costs in Habu itself
+
+Three of the costs the live-shaped tree exposed were in Habu's libraries,
+not in Omabox, and were fixed there (Habu 9d2bb4aa, 9e169dc9, eab9b6b0):
+- Case folding and lowercasing now handle all-ASCII text directly and
+  call libunistring only for other text. The fold-and-size pair fell from
+  1,860 to 263 ns.
+- Opening a directory below a descriptor kept its work area in a fresh
+  `mmap` per call; it now uses a row of the task's own storage. 100,000
+  opens fell from 0.32 to 0.09 s, kernel time from 0.26 to 0.06 s.
+- An arena mapped its first 16 KiB on every NEW and unmapped it on
+  RELEASE; up to four released chunks are now kept, zeroed, for the next
+  NEW. 100,000 arenas fell from 0.27 to 0.10 s, and minor page faults
+  from 100,850 to 853.
+
+On the live-shaped tree an idle pass fell from 497 to 425 ms on a
+performance core. Rust's is 131 ms: the rest is the scan's design, not
+the language's libraries.
+
+Observations for the blog:
+- All three were the same habit: take fresh, zeroed memory per call, the
+  safest storage there is, and pay a syscall pair for it. Rust's
+  allocator reuses freed memory by default, so its code never paid this.
+- Reuse gave up one property. Touching an arena after RELEASE used to
+  fault; now it can read the next arena's bytes. The contract already
+  called that undefined, but a test had pinned the fault and had to
+  change.
+- The ASCII path was checked against libunistring itself: every byte
+  below $80, every pair of them and 200,000 random strings, with no
+  mismatch.
+- A review asked for a test of a reused chunk that was zeroed too short.
+  The worker broke the zeroing on purpose and found two existing tests
+  already failed; what the new check added was a chunk whose arena had
+  grown before release. Breaking the code settled what reading could not.
+- `jj squash ... | tail -0` lost three squashes without a word. GNU
+  `tail -n 0` exits without reading, so the writer died of SIGPIPE
+  before it recorded its operation. Silence output with `/dev/null`.
