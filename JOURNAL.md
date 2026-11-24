@@ -2281,3 +2281,41 @@ Observations for the blog:
   one 128 KB gap, a memory pool's first chunk landed there, and a probe
   that notices new mappings only inside the holes it freed noticed it.
   The fix went into the test, which now maps the pool before it measures.
+
+## 2026-11-24: one string, one value
+
+Habu master changed what a string is. A string literal used to leave two
+values, an address and a length (`^u8 n`); now it leaves one `str`, and
+`str>` and `>str` split and join it. The library followed: 73 words took
+`str` where they took `^u8 n`, and 6 were removed. Omabox called those
+words 1,366 times, and no Omabox file loaded on master any more.
+
+The port went layer by layer in dependency order, one commit per layer:
+base files, journal, fake Dropbox, local scan, CLI, replay, reconcile,
+daemon, then the tests of each, 14 commits over 37 files. Most of it was
+mechanical, and the checker named every site. Three places needed
+thought:
+- A callback that ignores a string used to be `[: 2drop ;]`. A string is
+  now one value, so four files grew a named one-liner, `KEEP-NONE ( str --
+  ) drop ;`.
+- Code that walks bytes splits the string with `str>`, works on the
+  address and length as before, and joins the result with `>str`; two
+  files cut substrings through a private `PART`.
+- A Dropbox test checked that a failed open frees its seven buffers by
+  asking each buffer, after the free, whether it was still live: the
+  answer came from freed memory. The port gives the client's vectors an
+  allocator that a test can replace. The test swaps in a counting one and
+  checks that every allocation was freed. Removing one free makes it fail.
+Rebasing onto Omabox master hit one conflict, in a hash-cache query that
+master had rewritten the same day. Resolving it in the journal commit
+cleared all 13 commits above it. On the new engine, all 16 test files
+pass: 32,697 checks in about 17 seconds, four files at a time.
+
+Observations for the blog:
+- A young language charges its users for each of its improvements. Rust's
+  editions keep old code compiling; Habu changed its string under 1,366
+  calls and every caller moved with it. The checker turned that from a
+  hunt into a list.
+- The test that read freed memory passed on master. Rust's borrow checker
+  would have refused it; Habu ran it. A test of freeing has to watch the
+  allocator, not ask the freed object.
