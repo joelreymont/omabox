@@ -134,9 +134,11 @@ $1FF constant MODE-BITS
 $7FFFFFFFFFFFFFFF constant INT-MAX  \ SQLite's largest integer
 1000000000 constant NS-PER-S
 
-\ A baseline's kind, the number MODEL gives an observation's form.
+\ A stored kind, the number MODEL gives an observation's form; an
+\ unknown remote observation's is 3 plus its reason's index.
 0 constant KIND-PRESENT
 1 constant KIND-DIRECTORY
+2 constant KIND-ABSENT
 
 16 TASK:+USERS ID-ROW u8
 
@@ -155,6 +157,38 @@ $7FFFFFFFFFFFFFFF constant INT-MAX  \ SQLite's largest integer
 \ Runs the statement's row, reset for the next.
 : RAN ( SQLITE:statement -- SQLITE:statement )
    SQLITE:STEP drop SQLITE:RESET ;
+
+: REASON-KIND ( MODEL:unknown-reason -- n )
+   MATCH MODEL:unknown-reason
+      incomplete OF 3 ENDOF
+      inaccessible OF 4 ENDOF
+      unavailable OF 5 ENDOF
+      stale OF 6 ENDOF
+      cursor-reset OF 7 ENDOF
+      unsupported OF 8 ENDOF
+   ;MATCH ;
+
+\ The reason of an unknown kind, 3 to 8.
+: KIND-REASON ( n -- MODEL:unknown-reason )
+   case
+      3 of MODEL-UNKNOWN--REASON:INCOMPLETE endof
+      4 of MODEL-UNKNOWN--REASON:INACCESSIBLE endof
+      5 of MODEL-UNKNOWN--REASON:UNAVAILABLE endof
+      6 of MODEL-UNKNOWN--REASON:STALE endof
+      7 of MODEL-UNKNOWN--REASON:CURSOR-RESET endof
+      MODEL-UNKNOWN--REASON:UNSUPPORTED swap
+   endcase ;
+
+\ Binds a file's kind, content and revision to ?3 to ?5.
+: BIND-PRESENT ( SQLITE:statement MODEL:remote -- SQLITE:statement )
+   MODEL-REMOTE:UNMAKE {: h v :}
+   KIND-PRESENT 3 SQLITE:BIND-INT
+   h DROPBOX:HASH>STR 4 SQLITE:BIND-TEXT
+   v DROPBOX:REV>STR 5 SQLITE:BIND-TEXT ;
+
+\ Binds the kind to ?3, and NULL content and revision to ?4 and ?5.
+: BIND-KIND ( SQLITE:statement n -- SQLITE:statement )
+   3 SQLITE:BIND-INT 4 SQLITE:BIND-NULL 5 SQLITE:BIND-NULL ;
 
 : INSERT-LOCAL ( -- str )
    s" INSERT INTO local_observations(
@@ -393,20 +427,28 @@ private
    c s" DROP TABLE local_observations_8; PRAGMA user_version = 9"
    SQLITE:EXEC ;
 
-\ The first converted baseline MODEL cannot read refuses the migration.
-: UNCONVERTED ( SQLITE:statement -- SQLITE:statement )
+\ The first converted row MODEL cannot read refuses the migration, as
+\ op's failure.
+: UNCONVERTED ( SQLITE:statement str -- SQLITE:statement )
+   {: op:str :}
    SQLITE:STEP 0= if exit then
    0 SQLITE:COL-BLOB {: path:str :}
-   MODEL:E-STORED s" deserialize baseline" path UNPROCESSED ;
+   MODEL:E-STORED op path UNPROCESSED ;
 
-\ Migration 10: baselines in typed columns.
+\ Migration 10: baselines and remote observations in typed columns.
 : MIGRATE-TYPED-COLUMNS ( SQLITE:connection -- )
    {: c :}
    c V10 RUN
    c s" SELECT path FROM converted_baselines WHERE kind IS NULL
-      ORDER BY path LIMIT 1" [: UNCONVERTED ;] SQLITE:WITH-STATEMENT
-   c s" DROP TABLE converted_baselines; PRAGMA user_version = 10"
-   SQLITE:EXEC ;
+      ORDER BY path LIMIT 1"
+   [: s" deserialize baseline" UNCONVERTED ;] SQLITE:WITH-STATEMENT
+   c s" SELECT path FROM converted_remote_observations
+      WHERE kind IS NULL ORDER BY path LIMIT 1"
+   [: s" deserialize remote observation" UNCONVERTED ;]
+   SQLITE:WITH-STATEMENT
+   c s" DROP TABLE converted_baselines;
+      DROP TABLE converted_remote_observations;
+      PRAGMA user_version = 10" SQLITE:EXEC ;
 
 \ Schema 8 in a new file: migrations 1 to 8 in order.
 : CREATE-SCHEMA ( SQLITE:connection -- )
@@ -1168,7 +1210,6 @@ private
 
 \ A seed's typed drop, which types the read that replaces it.
 : DROP-LOCAL ( MODEL:observation<MODEL:local> -- ) drop ;
-: DROP-REMOTE ( MODEL:observation<MODEL:remote> -- ) drop ;
 : DROP-FINGERPRINT ( MODEL:fingerprint -- ) drop ;
 : DROP-HASH ( DROPBOX:hash -- ) drop ;
 : DROP-OPERATION ( MODEL:operation -- ) drop ;
@@ -1196,13 +1237,6 @@ private
    [: DROP-LOCAL json ar MODEL:JSON>LOCAL-OBSERVATION ;]
    s" deserialize local observation" path DECODE ;
 
-: REMOTE-OBSERVATION-OF
-   ( str str ^ARENA:arena -- MODEL:observation<MODEL:remote> )
-   {: json:str path:str ar :}
-   MODEL-OBSERVATION:DIRECTORY
-   [: DROP-REMOTE json ar MODEL:JSON>REMOTE-OBSERVATION ;]
-   s" deserialize remote observation" path DECODE ;
-
 : HASH-VALUE-OF
    ( str str ^ARENA:arena -- MODEL:fingerprint DROPBOX:hash )
    {: json:str path:str ar :}
@@ -1228,14 +1262,34 @@ private
    then
    p f h MODEL-HASH--RECORD:MAKE ;
 
+\ The file in columns col and col+1: its content and revision.
+: REMOTE-FILE-COPY
+   ( SQLITE:statement n ^ARENA:arena -- SQLITE:statement MODEL:remote )
+   {: col ar :}
+   col ar TEXT-COPY DROPBOX:>HASH {: h:DROPBOX:hash :}
+   col 1+ ar TEXT-COPY DROPBOX:>REV {: v:DROPBOX:rev :}
+   h v MODEL-REMOTE:MAKE ;
+
+\ The remote observation in columns col to col+2: its kind, content
+\ and revision.
+: REMOTE-OBSERVATION-COPY
+   ( SQLITE:statement n ^ARENA:arena
+     -- SQLITE:statement MODEL:observation<MODEL:remote> )
+   {: col ar :}
+   col SQLITE:COL-INT {: kind :}
+   kind KIND-PRESENT = if
+      col 1+ ar REMOTE-FILE-COPY MODEL-OBSERVATION:PRESENT exit
+   then
+   kind KIND-DIRECTORY = if MODEL-OBSERVATION:DIRECTORY exit then
+   kind KIND-REASON MODEL-OBSERVATION:UNKNOWN ;
+
 : REMOTE-ROW
    ( SQLITE:statement ^ARENA:arena
      -- SQLITE:statement MODEL:remote-record )
    {: ar :}
    0 SQLITE:COL-BLOB ar BYTES-KEY {: k:MODEL:key :}
    1 SQLITE:COL-BLOB ar BYTES-PATH {: p:MODEL:path :}
-   2 SQLITE:COL-TEXT p MODEL:PATH>STR ar REMOTE-OBSERVATION-OF
-   {: o :}
+   2 ar REMOTE-OBSERVATION-COPY {: o :}
    k p o MODEL-REMOTE--RECORD:MAKE ;
 
 : CURSOR-ROW
@@ -1256,7 +1310,7 @@ private
    v ;
 
 \ The remote records the statement selects as canonical_path, path,
-\ observation_json.
+\ kind, content, revision.
 : REMOTE-ROWS
    ( SQLITE:connection str ^ARENA:arena
      -- ^VEC:vector<MODEL:remote-record> )
@@ -1287,9 +1341,8 @@ public
    ( journal MODEL:key ^ARENA:arena -- option<MODEL:path> )
    {: j k ar :}
    j >CONNECTION
-   s\" SELECT path FROM remote_observations
-      WHERE canonical_path = ?1 AND observation_json IN
-         ('\"Directory\"', '{\"Unknown\":\"Inaccessible\"}')" [: k MODEL:KEY>STR 1 SQLITE:BIND-BLOB ar SPELLING-ROW ;]
+   s" SELECT path FROM remote_observations
+      WHERE canonical_path = ?1 AND kind IN (1, 4)" [: k MODEL:KEY>STR 1 SQLITE:BIND-BLOB ar SPELLING-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
 private
@@ -1298,7 +1351,7 @@ private
    {: j ar :}
    j ar REMOTE-CURSOR
    j >CONNECTION
-   s" SELECT canonical_path, path, observation_json
+   s" SELECT canonical_path, path, kind, content, revision
       FROM remote_observations ORDER BY canonical_path" ar REMOTE-ROWS
    JOURNAL-REMOTE--INVENTORY:MAKE ;
 
@@ -1324,9 +1377,8 @@ public
    ( journal ^ARENA:arena -- ^VEC:vector<MODEL:remote-record> )
    {: j ar :}
    j >CONNECTION
-   s" SELECT canonical_path, path, observation_json
-      FROM remote_observations
-      WHERE json_type(observation_json, '$.Unknown') IS NOT NULL
+   s" SELECT canonical_path, path, kind, content, revision
+      FROM remote_observations WHERE kind >= 3
       ORDER BY canonical_path" ar REMOTE-ROWS ;
 
 private
@@ -2033,49 +2085,60 @@ private
 
 : INSERT-REMOTE ( -- str )
    s" INSERT INTO remote_observations(
-         path, observation_json, canonical_path
-      ) VALUES (?1, ?2, ?3)" ;
+         path, canonical_path, kind, content, revision
+      ) VALUES (?1, ?2, ?3, ?4, ?5)" ;
 
 : UPSERT-REMOTE ( -- str )
    s" INSERT INTO remote_observations(
-         path, observation_json, canonical_path
-      ) VALUES (?1, ?2, ?3)
+         path, canonical_path, kind, content, revision
+      ) VALUES (?1, ?2, ?3, ?4, ?5)
       ON CONFLICT(canonical_path) DO UPDATE SET
          path = excluded.path,
-         observation_json = excluded.observation_json
-      WHERE path != excluded.path
-         OR observation_json != excluded.observation_json" ;
+         kind = excluded.kind,
+         content = excluded.content,
+         revision = excluded.revision
+      WHERE remote_observations.path != excluded.path
+         OR remote_observations.kind != excluded.kind
+         OR remote_observations.content IS NOT excluded.content
+         OR remote_observations.revision IS NOT excluded.revision" ;
 
+\ An unknown observation, kind 3 on, stays.
 : ENSURE-REMOTE ( -- str )
    s" INSERT INTO remote_observations(
-         path, observation_json, canonical_path
-      ) VALUES (?1, ?2, ?3)
+         path, canonical_path, kind, content, revision
+      ) VALUES (?1, ?2, ?3, ?4, ?5)
       ON CONFLICT(canonical_path) DO UPDATE SET
-         observation_json = excluded.observation_json
-      WHERE observation_json != excluded.observation_json
-         AND json_type(
-            remote_observations.observation_json, '$.Unknown'
-         ) IS NULL" ;
+         kind = excluded.kind,
+         content = excluded.content,
+         revision = excluded.revision
+      WHERE remote_observations.kind < 3
+         AND (remote_observations.kind != excluded.kind
+            OR remote_observations.content IS NOT excluded.content
+            OR remote_observations.revision IS NOT excluded.revision)" ;
 
 : DELETE-REMOTE-DESCENDANTS ( -- str )
    s" DELETE FROM remote_observations
       WHERE canonical_path >= ?1 AND canonical_path < ?2" ;
 
-\ Binds the record's path, observation and key to ?1, ?2 and ?3.
+\ Binds the record's path and key to ?1 and ?2, its observation to ?3
+\ to ?5; an absent one binds kind 2, which the table refuses.
 : BIND-REMOTE
-   ( SQLITE:statement MODEL:remote-record ^JSON:writer
-     -- SQLITE:statement )
-   {: r w :}
-   r MODEL-REMOTE--RECORD:UNMAKE {: k:MODEL:key p:MODEL:path o :}
+   ( SQLITE:statement MODEL:remote-record -- SQLITE:statement )
+   MODEL-REMOTE--RECORD:UNMAKE {: k:MODEL:key p:MODEL:path o :}
    p MODEL:PATH>STR 1 SQLITE:BIND-BLOB
-   w [: o swap MODEL:REMOTE-OBSERVATION>JSON ;] ENCODE 2 SQLITE:BIND-TEXT
-   k MODEL:KEY>STR 3 SQLITE:BIND-BLOB ;
+   k MODEL:KEY>STR 2 SQLITE:BIND-BLOB
+   o MATCH MODEL:observation
+      present OF BIND-PRESENT ENDOF
+      directory OF KIND-DIRECTORY BIND-KIND ENDOF
+      absent OF KIND-ABSENT BIND-KIND ENDOF
+      unknown OF REASON-KIND BIND-KIND ENDOF
+   ;MATCH ;
 
 : REMOTE-INSERTS
-   ( SQLITE:statement ^VEC:vector<MODEL:remote-record> ^JSON:writer
+   ( SQLITE:statement ^VEC:vector<MODEL:remote-record>
      -- SQLITE:statement )
-   {: v w :}
-   v VEC:COUNT 0 ?do v i VEC:AT @ w BIND-REMOTE RAN loop ;
+   {: v :}
+   v VEC:COUNT 0 ?do v i VEC:AT @ BIND-REMOTE RAN loop ;
 
 : PUBLISH-CURSOR ( SQLITE:connection DROPBOX:cursor -- )
    {: c cur:DROPBOX:cursor :}
@@ -2085,10 +2148,10 @@ private
 
 : REMOTE-WRITTEN
    ( SQLITE:connection DROPBOX:cursor
-     ^VEC:vector<MODEL:remote-record> ^JSON:writer -- )
-   {: c cur:DROPBOX:cursor v w :}
+     ^VEC:vector<MODEL:remote-record> -- )
+   {: c cur:DROPBOX:cursor v :}
    c s" DELETE FROM remote_observations" SQLITE:EXEC
-   c INSERT-REMOTE [: v w REMOTE-INSERTS ;] SQLITE:WITH-STATEMENT
+   c INSERT-REMOTE [: v REMOTE-INSERTS ;] SQLITE:WITH-STATEMENT
    c cur PUBLISH-CURSOR ;
 
 public
@@ -2098,8 +2161,7 @@ public
    ( journal DROPBOX:cursor ^VEC:vector<MODEL:remote-record> -- )
    {: j cur:DROPBOX:cursor v :}
    j >CONNECTION {: c :}
-   c [: c cur v [: REMOTE-WRITTEN ;] ENCODING ;]
-   SQLITE:WITH-TRANSACTION ;
+   c [: c cur v REMOTE-WRITTEN ;] SQLITE:WITH-TRANSACTION ;
 
 private
 
@@ -2150,11 +2212,9 @@ private
    v VEC:COUNT 0 ?do v i VEC:AT @ ar CHECK-CHANGE loop ;
 
 \ The record written by the statement sql names.
-: RECORD-WRITTEN
-   ( SQLITE:connection MODEL:remote-record ^JSON:writer str -- )
-   {: c r w sql:str :}
-   c sql [: r w BIND-REMOTE SQLITE:STEP drop ;]
-   SQLITE:WITH-STATEMENT ;
+: RECORD-WRITTEN ( SQLITE:connection MODEL:remote-record str -- )
+   {: c r sql:str :}
+   c sql [: r BIND-REMOTE SQLITE:STEP drop ;] SQLITE:WITH-STATEMENT ;
 
 : SUBTREE-DELETED ( SQLITE:connection MODEL:key ^ARENA:arena -- )
    {: c k:MODEL:key ar :}
@@ -2167,23 +2227,21 @@ private
    SQLITE:WITH-STATEMENT ;
 
 : CHANGE-APPLIED
-   ( remote-inventory-change SQLITE:connection ^JSON:writer
-     ^ARENA:arena -- )
-   {: c w ar :}
+   ( remote-inventory-change SQLITE:connection ^ARENA:arena -- )
+   {: c ar :}
    MATCH remote-inventory-change
-      upsert OF {: r :} c r w UPSERT-REMOTE RECORD-WRITTEN ENDOF
+      upsert OF {: r :} c r UPSERT-REMOTE RECORD-WRITTEN ENDOF
       ensure-directory OF
-         {: r :} c r w ENSURE-REMOTE RECORD-WRITTEN
+         {: r :} c r ENSURE-REMOTE RECORD-WRITTEN
       ENDOF
       delete-subtree OF {: k :} c k ar SUBTREE-DELETED ENDOF
    ;MATCH ;
 
 : DELTA-WRITTEN
    ( SQLITE:connection DROPBOX:cursor
-     ^VEC:vector<remote-inventory-change> ^ARENA:arena
-     ^JSON:writer -- )
-   {: c cur:DROPBOX:cursor v ar w :}
-   v VEC:COUNT 0 ?do v i VEC:AT @ c w ar CHANGE-APPLIED loop
+     ^VEC:vector<remote-inventory-change> ^ARENA:arena -- )
+   {: c cur:DROPBOX:cursor v ar :}
+   v VEC:COUNT 0 ?do v i VEC:AT @ c ar CHANGE-APPLIED loop
    c cur PUBLISH-CURSOR ;
 
 \ Every change is checked before the transaction begins.
@@ -2192,8 +2250,7 @@ private
      ^VEC:vector<remote-inventory-change> ^ARENA:arena -- )
    {: c cur:DROPBOX:cursor v ar :}
    v ar DELTA-CHECKED
-   c [: c cur v ar [: DELTA-WRITTEN ;] ENCODING ;]
-   SQLITE:WITH-TRANSACTION ;
+   c [: c cur v ar DELTA-WRITTEN ;] SQLITE:WITH-TRANSACTION ;
 
 public
 
@@ -2371,9 +2428,7 @@ $FFFFFFFF constant U32-MAX
    col SQLITE:COL-INT KIND-DIRECTORY = if
       MODEL-BASELINE:DIRECTORY exit
    then
-   col 1+ ar TEXT-COPY DROPBOX:>HASH {: h:DROPBOX:hash :}
-   col 2 + ar TEXT-COPY DROPBOX:>REV {: v:DROPBOX:rev :}
-   h v MODEL-REMOTE:MAKE MODEL-BASELINE:PRESENT ;
+   col 1+ ar REMOTE-FILE-COPY MODEL-BASELINE:PRESENT ;
 
 : BASELINE-ROW
    ( SQLITE:statement ^ARENA:arena
@@ -2512,7 +2567,7 @@ public
    ( journal MODEL:key ^ARENA:arena -- option<MODEL:remote-record> )
    {: j k ar :}
    j >CONNECTION
-   s" SELECT canonical_path, path, observation_json
+   s" SELECT canonical_path, path, kind, content, revision
       FROM remote_observations WHERE canonical_path = ?1" [: k MODEL:KEY>STR 1 SQLITE:BIND-BLOB ar REMOTE-AT-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
@@ -2559,7 +2614,7 @@ private
          l.path, l.observation_json,
          (SELECT count(*) FROM local_observations c
             WHERE c.canonical_path = keys.k),
-         r.path, r.observation_json,
+         r.path, r.kind, r.content, r.revision,
          EXISTS (SELECT 1 FROM plans p
             WHERE p.canonical_path = keys.k
                AND p.status IN ('pending', 'blocked')),
@@ -2608,19 +2663,18 @@ create ONE-KNOWN ONE-KEY KNOWN-SELECT LAY-BOTH
    {: o :}
    p o MODEL-LOCAL--RECORD:MAKE OPTION:SOME ;
 
-\ Columns 8 and 9, NULL where no remote row is.
+\ Columns 8 to 11, NULL where no remote row is.
 : KNOWN-REMOTE
    ( SQLITE:statement MODEL:key ^ARENA:arena
      -- SQLITE:statement option<MODEL:remote-record> )
    {: k ar :}
    8 SQLITE:COL-NULL? if NO-REMOTE exit then
    8 ar PATH-COPY {: p :}
-   9 SQLITE:COL-TEXT p MODEL:PATH>STR ar REMOTE-OBSERVATION-OF
-   {: o :}
+   9 ar REMOTE-OBSERVATION-COPY {: o :}
    k p o MODEL-REMOTE--RECORD:MAKE OPTION:SOME ;
 
 : KNOWN-SUBTREE ( SQLITE:statement -- SQLITE:statement MODEL:subtree )
-   11 SQLITE:COL-INT 0= if MODEL-SUBTREE:EMPTY exit then
+   13 SQLITE:COL-INT 0= if MODEL-SUBTREE:EMPTY exit then
    MODEL-SUBTREE:OCCUPIED ;
 
 \ The row of a KNOWN-SELECT statement, decoded into ar.
@@ -2633,7 +2687,7 @@ create ONE-KNOWN ONE-KEY KNOWN-SELECT LAY-BOTH
    7 SQLITE:COL-INT {: n :}
    k ar KNOWN-REMOTE {: r :}
    KNOWN-SUBTREE {: s :}
-   10 SQLITE:COL-INT 0<> {: live:bool :}
+   12 SQLITE:COL-INT 0<> {: live:bool :}
    k b l n r s live JOURNAL-KNOWN--PATH:MAKE ;
 
 : KNOWN-ROWS
@@ -2979,17 +3033,6 @@ create BLOCKED-QUERY PLAN-SELECT BLOCKED-WHERE LAY-BOTH
          OR baselines.content IS NOT excluded.content
          OR baselines.revision IS NOT excluded.revision" ;
 
-\ Binds UPSERT-BASELINE's kind, content and revision, ?3 to ?5.
-: BIND-PRESENT ( SQLITE:statement MODEL:remote -- SQLITE:statement )
-   MODEL-REMOTE:UNMAKE {: h v :}
-   KIND-PRESENT 3 SQLITE:BIND-INT
-   h DROPBOX:HASH>STR 4 SQLITE:BIND-TEXT
-   v DROPBOX:REV>STR 5 SQLITE:BIND-TEXT ;
-
-: BIND-DIRECTORY ( SQLITE:statement -- SQLITE:statement )
-   KIND-DIRECTORY 3 SQLITE:BIND-INT
-   4 SQLITE:BIND-NULL 5 SQLITE:BIND-NULL ;
-
 \ The path's row, its kind, content and revision bound by bind; an
 \ unchanged row writes nothing.
 : PUT-BASELINE
@@ -3012,7 +3055,9 @@ create BLOCKED-QUERY PLAN-SELECT BLOCKED-WHERE LAY-BOTH
       present OF
          {: r :} c path k [: r BIND-PRESENT ;] PUT-BASELINE
       ENDOF
-      directory OF c path k [: BIND-DIRECTORY ;] PUT-BASELINE ENDOF
+      directory OF
+         c path k [: KIND-DIRECTORY BIND-KIND ;] PUT-BASELINE
+      ENDOF
    ;MATCH ;
 
 : RETIRE-CONFLICTS ( SQLITE:connection MODEL:key -- )

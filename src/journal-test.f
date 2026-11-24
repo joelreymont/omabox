@@ -1,11 +1,12 @@
 \ journal-test.f - JOURNAL's open, schema 10, bindings, inventories,
 \ baselines, plans, completions, conflicts and recoveries on journals
 \ under TMPDIR: a new journal's sqlite_master against
-\ src/oracle/schema.tsv as a set, but for the baselines table, which is
-\ migrations/0010.sql's, and its user_version 10; versions 1, 7 and 11
-\ refused unchanged; src/oracle/journal.sqlite3, a schema-8 journal,
-\ migrated to 10 with its local observations keyed by their folded
-\ paths and its baselines in typed columns, and, without its
+\ src/oracle/schema.tsv as a set, but for the baselines and
+\ remote_observations tables, which are migrations/0010.sql's, and its
+\ user_version 10; versions 1, 7 and 11 refused unchanged;
+\ src/oracle/journal.sqlite3, a schema-8 journal, migrated to 10 with
+\ its local observations keyed by their folded paths and its baselines
+\ and remote observations in typed columns, and, without its
 \ remote_directories index, left at schema 8 with every row when the
 \ migration fails; a local scan published as its difference, every
 \ unchanged row keeping its rowid and the hashes of another generation
@@ -32,7 +33,8 @@
 \ KNOWN-PATH-AT at a held key and at keys nothing holds, and its subtree
 \ as Rust's reconcile.rs remote_subtree_holds_only_true_descendants has it;
 \ UNKNOWN-LOCALS and UNKNOWN-REMOTES answering only the unknown records of
-\ inventories holding each observation, an excluded path among them, by
+\ inventories holding each observation they store, an excluded path
+\ among them, by
 \ path and by canonical path;
 \ and fifty-one tests of the Rust version's src/journal.rs and two of
 \ its src/daemon.rs under their names, which
@@ -43,12 +45,13 @@
 \ subvolume NULL, and the baseline the Rust tests' version_six_with_root
 \ writes. A copy of the oracle journal with a value MODEL cannot read
 \ in one row of each stored JSON family is refused by the word that
-\ reads it, as E-JSON naming the row's path; at schema 9, a baseline
-\ refuses the migration so, leaving the file at 9 with every row. The
-\ oracle at schema 9 migrates a present, a directory and an absent
-\ baseline, the absent one gone, and the migration converts each of a
-\ list of texts exactly when MODEL's JSON reader reads it, to the
-\ baseline it reads. Each case removes its directory;
+\ reads it, as E-JSON naming the row's path; at schema 9, a baseline or
+\ remote observation refuses the migration so, leaving the file at 9
+\ with every row. The oracle at schema 9 migrates a baseline and a
+\ remote observation of each kind, the absent ones gone, and the
+\ migration converts each of a list of texts exactly when MODEL's JSON
+\ reader reads it, to the value it reads. Each case removes its
+\ directory;
 \ a refusal's log line is captured in it, checked and removed.
 \ Run from the repository root: hb --load src/journal-test.f </dev/null
 require src/lib/error.f
@@ -334,13 +337,15 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
 
 \ ---- the journal's rows ------------------------------------------
 
-\ Every row but the baselines table's, as schema.tsv writes one.
+\ Every row but the baselines and remote_observations tables', as
+\ schema.tsv writes one.
 : SCHEMA-SQL ( -- str )
    s" SELECT type || char(9) || name || char(9) || tbl_name || char(9)
          || coalesce(replace(replace(replace(sql, '\', '\\'),
             char(10), '\n'), char(9), '\t'), '')
       FROM sqlite_master
-      WHERE NOT (type = 'table' AND name = 'baselines')" ;
+      WHERE NOT (type = 'table'
+         AND name IN ('baselines', 'remote_observations'))" ;
 
 \ Counts the rows, each a line of BODY.
 : SCHEMA-ROWS ( n SQLITE:statement -- n SQLITE:statement )
@@ -361,17 +366,21 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    SQLITE:STEP drop 0 SQLITE:COL-TEXT {: t:str :}
    BODY BODY-U @ >str t CONTAINS? swap ;
 
-\ The journal's schema is schema.tsv's but for the baselines table,
-\ which is migrations/0010.sql's, and its version is 10.
+\ The journal's schema is schema.tsv's but for the baselines and
+\ remote_observations tables, which are migrations/0010.sql's, and its
+\ version is 10.
 : SCHEMA-10 ( journal -- )
    >CONNECTION {: c :}
    s" src/oracle/schema.tsv" ORACLE
-   0 c SCHEMA-SQL [: SCHEMA-ROWS ;] SQLITE:WITH-STATEMENT 25 T=
+   0 c SCHEMA-SQL [: SCHEMA-ROWS ;] SQLITE:WITH-STATEMENT 24 T=
    c VERSION 10 T=
    s" migrations/0010.sql" ORACLE
    c s" SELECT sql FROM sqlite_master
       WHERE type = 'table' AND name = 'baselines'" [: BODY-HOLDS ;]
-   SQLITE:WITH-STATEMENT TTRUE ;
+   SQLITE:WITH-STATEMENT TTRUE
+   c s" SELECT sql FROM sqlite_master
+      WHERE type = 'table' AND name = 'remote_observations'"
+   [: BODY-HOLDS ;] SQLITE:WITH-STATEMENT TTRUE ;
 
 : VERSIONED ( str n -- )
    {: p:str v :}
@@ -434,10 +443,13 @@ variable SCANNED       \ query plan rows that scan the table
       some OF want MODEL:BASELINE= ENDOF
    ;MATCH ;
 
-\ The oracle journal's baseline at Docs/A.txt.
-: ORACLE-FILE ( -- MODEL:baseline )
+\ The oracle journal's file at Docs/A.txt.
+: ORACLE-REMOTE ( -- MODEL:remote )
    s" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-   s" 5f0a1b2c3d4e" REMOTE-FILE MODEL-BASELINE:PRESENT ;
+   s" 5f0a1b2c3d4e" REMOTE-FILE ;
+
+\ The oracle journal's baseline at Docs/A.txt.
+: ORACLE-FILE ( -- MODEL:baseline ) ORACLE-REMOTE MODEL-BASELINE:PRESENT ;
 
 : PRESENT-REMOTE ( str str -- MODEL:observation<MODEL:remote> )
    REMOTE-FILE MODEL-OBSERVATION:PRESENT ;
@@ -822,6 +834,15 @@ variable SCANNED       \ query plan rows that scan the table
       swap 1+ swap
    repeat ;
 
+\ The records hold the oracle journal's three remote observations.
+: ORACLE-REMOTES?
+   ( ^VEC:vector<MODEL:remote-record> ^ARENA:arena -- bool )
+   {: v ar :}
+   v s" docs" ar CANONICAL REMOTE-DIRECTORY ANY-HOLDS?
+   v s" docs/a.txt" ar CANONICAL
+   ORACLE-REMOTE MODEL-OBSERVATION:PRESENT ANY-HOLDS? and
+   v s" restricted" ar CANONICAL INACCESSIBLE ANY-HOLDS? and ;
+
 : ORACLE-JOURNAL-IS-MIGRATED ( ^ARENA:arena -- )
    {: ar :}
    s" the oracle journal migrates to schema 10" T-LABEL
@@ -835,6 +856,9 @@ variable SCANNED       \ query plan rows that scan the table
    0 j >CONNECTION
    s" SELECT path, canonical_path FROM local_observations"
    [: ar FOLDED-ROWS ;] SQLITE:WITH-STATEMENT 3 T=
+   j ar REMOTE-INVENTORY JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur v :}
+   v VEC:COUNT 3 T=
+   v ar ORACLE-REMOTES? TTRUE
    j CLOSE
    d GONE ;
 
@@ -1232,8 +1256,8 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    REMOTE-RECORD ar ONE-REMOTE {: old :}
    j s" cursor-old" CURSOR old PUBLISH-REMOTE-INVENTORY
    ar REMOTES {: dups :}
-   s" duplicate.txt" s" duplicate.txt" ABSENT-REMOTE ar REMOTE-RECORD
-   dups REMOTE+
+   s" duplicate.txt" s" duplicate.txt" REMOTE-DIRECTORY ar
+   REMOTE-RECORD dups REMOTE+
    s" duplicate.txt" s" duplicate.txt" s" new" s" rev-new" PRESENT-REMOTE
    ar REMOTE-RECORD dups REMOTE+
    j THE-JOURNAL !  dups THE-REMOTES !
@@ -1462,8 +1486,9 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    LOCAL-RECORD v LOCAL+
    v ;
 
-\ A remote inventory of each observation, out of canonical path order;
-\ its unknown spellings, Thumbs.db an excluded name, sort otherwise.
+\ A remote inventory of each observation a row holds, out of canonical
+\ path order; its unknown spellings, Thumbs.db an excluded name, sort
+\ otherwise.
 : MIXED-REMOTES ( ^ARENA:arena -- ^VEC:vector<MODEL:remote-record> )
    {: ar :}
    ar REMOTES {: v :}
@@ -1471,7 +1496,6 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    s" a.txt" s" A.txt" s" a" s" rev-a" PRESENT-REMOTE
    ar REMOTE-RECORD v REMOTE+
    s" docs" s" Docs" REMOTE-DIRECTORY ar REMOTE-RECORD v REMOTE+
-   s" gone.txt" s" gone.txt" ABSENT-REMOTE ar REMOTE-RECORD v REMOTE+
    s" thumbs.db" s" Thumbs.db" STALE-REMOTE ar REMOTE-RECORD v REMOTE+
    s" m-stale" s" m-stale" STALE-REMOTE ar REMOTE-RECORD v REMOTE+
    v ;
@@ -2172,10 +2196,8 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
             CAST(column2 AS BLOB)
          FROM (VALUES ('local', 'local'), ('pair', 'pair'),
             ('Pair', 'pair'));
-      INSERT INTO remote_observations(path, observation_json,
-            canonical_path)
-         SELECT CAST(column1 AS BLOB), '\"Directory\"',
-            CAST(column2 AS BLOB)
+      INSERT INTO remote_observations(path, canonical_path, kind)
+         SELECT CAST(column1 AS BLOB), CAST(column2 AS BLOB), 1
          FROM (VALUES ('A', 'a'), ('a/b', 'a/b'), ('a.txt', 'a.txt'),
             ('dir/file', 'dir/file'));
       INSERT INTO plans(id, path, canonical_path, status,
@@ -4185,9 +4207,6 @@ variable CRAFT
 : HELD-LOCAL-INVENTORY ( -- )
    HELD-JOURNAL @ HELD-ARENA @ LOCAL-INVENTORY drop ;
 
-: HELD-REMOTE-INVENTORY ( -- )
-   HELD-JOURNAL @ HELD-ARENA @ REMOTE-INVENTORY drop ;
-
 : HELD-CONFLICTS ( -- ) HELD-JOURNAL @ HELD-ARENA @ CONFLICTS drop ;
 
 : HELD-HASH-CACHE ( -- )
@@ -4244,6 +4263,81 @@ variable CRAFT
    j CLOSE
    d GONE ;
 
+\ At schema 9, a remote observation MODEL cannot read refuses the
+\ migration.
+: AN-UNKNOWN-REMOTE-OBSERVATION-REFUSES-THE-MIGRATION ( ^ARENA:arena -- )
+   {: ar :}
+   s" an unknown stored remote observation refuses the migration" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p NINE-ORACLE
+   s\" UPDATE remote_observations SET observation_json = '{\"Future\":1}'
+      WHERE hex(path) = hex('Docs')" p PLANT-AT
+   p SUBJECT !
+   [: SUBJECT @ OPEN CLOSE ;] d s" deserialize remote observation"
+   s" Docs" ar UNREADABLE
+   p VERSION-AT 9 T=
+   p SQLITE:OPEN {: c :}
+   c s\" SELECT count(*) FROM remote_observations
+      WHERE observation_json = '{\"Future\":1}'" QUERY-INT 1 T=
+   c s" SELECT count(*) FROM remote_observations" QUERY-INT 3 T=
+   c s" SELECT count(*) FROM sqlite_master
+      WHERE name LIKE 'converted%'" QUERY-INT 0 T=
+   c SQLITE:CLOSE
+   d GONE ;
+
+\ The oracle's remote rows, a directory, a file and an inaccessible
+\ folder, and one of each other kind, as schema 9 holds them.
+: EVERY-REMOTE-KIND ( -- str )
+   s\" INSERT INTO remote_observations(path, observation_json,
+         canonical_path)
+      SELECT CAST(column1 AS BLOB), column2, CAST(column1 AS BLOB)
+      FROM (VALUES ('gone', '\"ConfirmedAbsent\"'),
+         ('incomplete', '{\"Unknown\":\"Incomplete\"}'),
+         ('unavailable', '{\"Unknown\":\"Unavailable\"}'),
+         ('stale', '{\"Unknown\":\"Stale\"}'),
+         ('reset', '{\"Unknown\":\"CursorReset\"}'),
+         ('unsupported', '{\"Unknown\":\"Unsupported\"}'))" ;
+
+: UNKNOWN-REMOTE
+   ( MODEL:unknown-reason -- MODEL:observation<MODEL:remote> )
+   MODEL-OBSERVATION:UNKNOWN ;
+
+\ The records hold an unknown observation for the reason at the key.
+: UNKNOWN-HELD?
+   ( ^VEC:vector<MODEL:remote-record> str MODEL:unknown-reason
+     ^ARENA:arena -- bool )
+   {: v k:str why ar :}
+   v k ar CANONICAL why UNKNOWN-REMOTE ANY-HOLDS? ;
+
+\ A remote observation of each kind at schema 9 migrates; the absent
+\ one's row goes.
+: A-SCHEMA-9-JOURNAL-MIGRATES-ITS-REMOTE-OBSERVATIONS
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" a schema-9 journal migrates each kind of remote observation"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p NINE-ORACLE
+   EVERY-REMOTE-KIND p PLANT-AT
+   p OPEN {: j :}
+   j >CONNECTION VERSION 10 T=
+   j ar REMOTE-INVENTORY JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur v :}
+   v VEC:COUNT 8 T=
+   v ar ORACLE-REMOTES? TTRUE
+   v s" incomplete" MODEL-UNKNOWN--REASON:INCOMPLETE ar UNKNOWN-HELD?
+   TTRUE
+   v s" unavailable" MODEL-UNKNOWN--REASON:UNAVAILABLE ar UNKNOWN-HELD?
+   TTRUE
+   v s" stale" MODEL-UNKNOWN--REASON:STALE ar UNKNOWN-HELD? TTRUE
+   v s" reset" MODEL-UNKNOWN--REASON:CURSOR-RESET ar UNKNOWN-HELD?
+   TTRUE
+   v s" unsupported" MODEL-UNKNOWN--REASON:UNSUPPORTED ar UNKNOWN-HELD?
+   TTRUE
+   j >CONNECTION s" SELECT count(*) FROM remote_observations
+      WHERE path = CAST('gone' AS BLOB)" QUERY-INT 0 T=
+   j CLOSE
+   d GONE ;
+
 : SEED-DROP ( MODEL:baseline -- ) drop ;
 
 \ The baseline MODEL reads from the text, none for absent, and whether
@@ -4256,21 +4350,29 @@ variable CRAFT
    b ABSENT? if NO-BASELINE false exit then
    b OPTION:SOME false ;
 
+\ The text set by the update at schema 9 in c, then migrated: whether
+\ the migration refused it as op's, rolled back, or else left its
+\ transaction open. f takes the refusal's log.
+: MIGRATED?
+   ( SQLITE:connection str str str str ^ARENA:arena -- bool )
+   {: c t:str update:str op:str f:str ar :}
+   c update [: t 1 SQLITE:BIND-TEXT RAN ;] SQLITE:WITH-STATEMENT
+   c s" BEGIN" SQLITE:EXEC
+   [: c MIGRATE-TYPED-COLUMNS ;] f ar STDERR:CAPTURING {: code e:str :}
+   code 0= if false exit then
+   code E-JSON T=  e op CONTAINS? TTRUE
+   c s" ROLLBACK" SQLITE:EXEC
+   true ;
+
 \ The text as Docs's baseline at schema 9 in c, migrated, then rolled
 \ back: the baseline read back, and whether the migration refused it.
 : MIGRATION-READ
    ( SQLITE:connection str str ^ARENA:arena
      -- option<MODEL:baseline> bool )
    {: c t:str f:str ar :}
-   c s" UPDATE baselines SET baseline_json = ?1
-      WHERE path = CAST('Docs' AS BLOB)" [: t 1 SQLITE:BIND-TEXT RAN ;]
-   SQLITE:WITH-STATEMENT
-   c s" BEGIN" SQLITE:EXEC
-   [: c MIGRATE-TYPED-COLUMNS ;] f ar STDERR:CAPTURING {: code e:str :}
-   code 0<> if
-      code E-JSON T=  e s" deserialize baseline" CONTAINS? TTRUE
-      c s" ROLLBACK" SQLITE:EXEC  NO-BASELINE true exit
-   then
+   c t s" UPDATE baselines SET baseline_json = ?1
+      WHERE path = CAST('Docs' AS BLOB)" s" deserialize baseline" f ar
+   MIGRATED? if NO-BASELINE true exit then
    c s" SELECT kind, content, revision FROM baselines
       WHERE path = CAST('Docs' AS BLOB)" [: ar BASELINE-ROW ;]
    SQLITE:WITH-STATEMENT {: b :}
@@ -4329,7 +4431,101 @@ variable CRAFT
    c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\",\"n\":123456789012345678901234567890}}" f ar CONVERTS
    c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\",\"x\":{\"a\":1,\"a\":2}}}" f ar CONVERTS ;
 
-\ Each text as Docs's baseline of a schema-9 journal.
+: REMOTE-SEED-DROP ( MODEL:observation<MODEL:remote> -- ) drop ;
+
+\ Docs's record with the observation MODEL reads from the text, none
+\ for absent, and whether MODEL refuses the text.
+: REMOTE-CODEC-READ
+   ( str ^ARENA:arena -- option<MODEL:remote-record> bool )
+   {: t:str ar :}
+   ABSENT-REMOTE
+   [: REMOTE-SEED-DROP t ar MODEL:JSON>REMOTE-OBSERVATION ;] catch
+   {: o code :}
+   code 0<> if code MODEL:E-STORED T= NO-REMOTE true exit then
+   o ABSENT-REMOTE MODEL:REMOTE-OBSERVATION= if NO-REMOTE false exit then
+   s" docs" ar CANONICAL s" Docs" DISPLAY o MODEL-REMOTE--RECORD:MAKE
+   OPTION:SOME false ;
+
+\ The text as Docs's remote observation at schema 9 in c, migrated,
+\ then rolled back: its record read back, and whether the migration
+\ refused it.
+: REMOTE-MIGRATION-READ
+   ( SQLITE:connection str str ^ARENA:arena
+     -- option<MODEL:remote-record> bool )
+   {: c t:str f:str ar :}
+   c t s" UPDATE remote_observations SET observation_json = ?1
+      WHERE path = CAST('Docs' AS BLOB)"
+   s" deserialize remote observation" f ar
+   MIGRATED? if NO-REMOTE true exit then
+   c s" SELECT canonical_path, path, kind, content, revision
+      FROM remote_observations WHERE path = CAST('Docs' AS BLOB)"
+   [: ar REMOTE-AT-ROW ;] SQLITE:WITH-STATEMENT {: r :}
+   c s" ROLLBACK" SQLITE:EXEC
+   r false ;
+
+: SAME-REMOTE?
+   ( option<MODEL:remote-record> option<MODEL:remote-record> -- bool )
+   {: want :}
+   MATCH option
+      none OF want NO-REMOTE? ENDOF
+      some OF {: r :} want r REMOTE-IS? ENDOF
+   ;MATCH ;
+
+\ The migration refuses the text exactly when MODEL does, and else
+\ reads the remote observation MODEL reads.
+: REMOTE-CONVERTS ( SQLITE:connection str str ^ARENA:arena -- )
+   {: c t:str f:str ar :}
+   t T-LABEL
+   t ar REMOTE-CODEC-READ {: want refused:bool :}
+   c t f ar REMOTE-MIGRATION-READ {: got refuses:bool :}
+   refused bool>n refuses bool>n T=
+   got want SAME-REMOTE? TTRUE ;
+
+: REMOTE-READ-TEXTS ( SQLITE:connection str ^ARENA:arena -- )
+   {: c f:str ar :}
+   c s\" \"Directory\"" f ar REMOTE-CONVERTS
+   c s\" \"ConfirmedAbsent\"" f ar REMOTE-CONVERTS
+   c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\"}}"
+   f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":\"Incomplete\"}" f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":\"Inaccessible\"}" f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":\"Unavailable\"}" f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":\"Stale\"}" f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":\"CursorReset\"}" f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":\"Unsupported\"}" f ar REMOTE-CONVERTS
+   c s\"  { \"Unknown\" : \"Stale\" } " f ar REMOTE-CONVERTS
+   c s\" {\"Unkn\\u006fwn\":\"St\\u0061le\"}"
+   f ar REMOTE-CONVERTS
+   c s\" \"Confirmed\\u0041bsent\"" f ar REMOTE-CONVERTS ;
+
+: REMOTE-REFUSED-TEXTS ( SQLITE:connection str ^ARENA:arena -- )
+   {: c f:str ar :}
+   c s\" \"Absent\"" f ar REMOTE-CONVERTS
+   c s\" \"Unknown\"" f ar REMOTE-CONVERTS
+   c s\" \"Present\"" f ar REMOTE-CONVERTS
+   c s\" {\"Directory\":null}" f ar REMOTE-CONVERTS
+   c s\" {\"ConfirmedAbsent\":null}" f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":null}" f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":\"stale\"}" f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":\"Future\"}" f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":\"\"}" f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":\"Stale\\u0000\"}" f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":{\"Stale\":null}}" f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":[\"Stale\"]}" f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":3}" f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":\"Stale\",\"x\":1}" f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":\"Stale\",\"Unknown\":\"Stale\"}"
+   f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":\"Stale\"} x" f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":\"Stale\",}" f ar REMOTE-CONVERTS
+   c s\" {'Unknown':\"Stale\"}" f ar REMOTE-CONVERTS
+   c s\" {\"Present\":{\"content\":\"h\"}}"
+   f ar REMOTE-CONVERTS
+   c s\" {\"Future\":1}" f ar REMOTE-CONVERTS
+   c s" not json" f ar REMOTE-CONVERTS ;
+
+\ Each text as Docs's baseline, then as its remote observation, of a
+\ schema-9 journal.
 : THE-MIGRATION-CONVERTS-WHAT-MODEL-READS ( ^ARENA:arena -- )
    {: ar :}
    ar JOURNAL-AT {: d:str p:str :}
@@ -4338,6 +4534,8 @@ variable CRAFT
    p SQLITE:OPEN {: c :}
    c f ar READ-TEXTS
    c f ar REFUSED-TEXTS
+   c f ar REMOTE-READ-TEXTS
+   c f ar REMOTE-REFUSED-TEXTS
    c SQLITE:CLOSE
    d GONE ;
 
@@ -4351,18 +4549,13 @@ variable CRAFT
    s" Docs/New.txt" ar UNREADABLE
    d PLANTED-GONE ;
 
-: AN-UNKNOWN-OBSERVATION-IS-REFUSED ( ^ARENA:arena -- )
+: AN-UNKNOWN-LOCAL-OBSERVATION-IS-REFUSED ( ^ARENA:arena -- )
    {: ar :}
-   s" an unknown stored observation is refused" T-LABEL
+   s" an unknown stored local observation is refused" T-LABEL
    s\" UPDATE local_observations
-      SET observation_json = '{\"Future\":1}'
-      WHERE hex(path) = hex('Docs');
-      UPDATE remote_observations
       SET observation_json = '{\"Future\":1}'
       WHERE hex(path) = hex('Docs')" ar PLANTED {: d:str :}
    [: HELD-LOCAL-INVENTORY ;] d s" deserialize local observation"
-   s" Docs" ar UNREADABLE
-   [: HELD-REMOTE-INVENTORY ;] d s" deserialize remote observation"
    s" Docs" ar UNREADABLE
    d PLANTED-GONE ;
 
@@ -4497,9 +4690,11 @@ variable CRAFT
    ar LIVE-PLAN-AT-ANSWERS-ONLY-A-LIVE-PLAN
    ar AN-UNKNOWN-BASELINE-REFUSES-THE-MIGRATION
    ar A-SCHEMA-9-JOURNAL-MIGRATES-ITS-BASELINES
+   ar AN-UNKNOWN-REMOTE-OBSERVATION-REFUSES-THE-MIGRATION
+   ar A-SCHEMA-9-JOURNAL-MIGRATES-ITS-REMOTE-OBSERVATIONS
    ar THE-MIGRATION-CONVERTS-WHAT-MODEL-READS
    ar AN-UNKNOWN-OPERATION-IS-REFUSED
-   ar AN-UNKNOWN-OBSERVATION-IS-REFUSED
+   ar AN-UNKNOWN-LOCAL-OBSERVATION-IS-REFUSED
    ar AN-UNKNOWN-BLOCKAGE-IS-REFUSED
    ar AN-UNKNOWN-CONFLICT-IS-REFUSED
    ar AN-UNREADABLE-HASH-VALUE-IS-REFUSED

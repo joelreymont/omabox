@@ -14,7 +14,7 @@
 - `journal.sqlite3`: a schema-8 journal written through `Journal`, a row in
   every table but `legacy_local_root_adoption`, which only a migration fills.
   `recovery_records.retained_at` holds the clock (`unixepoch()`). OPEN
-  migrates it to schema 9.
+  migrates it to schema 10.
 - `journal.tsv`: each public read of `journal.sqlite3`, then its answer as
   Rust's `{:?}`; `completed_recoveries` carries that clock.
 
