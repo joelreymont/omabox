@@ -350,7 +350,7 @@ private
    drop op path code FS:ERRNO FILE-FAILED ;
 
 : DELETE-MODE? ( SQLITE:statement -- bool SQLITE:statement )
-   SQLITE:STEP drop 0 SQLITE:COL-TEXT s" delete" STR=CI swap ;
+   SQLITE:STEP drop 0 SQLITE:COL-TEXT s" delete" STR:=CI swap ;
 
 \ The daemon holds its connection for life, so each of its databases keeps
 \ 64 KiB of pages, not SQLite's 2 MB; the OS page cache holds the rest.
@@ -556,7 +556,7 @@ private
 
 : SAME? ( str str -- bool )
    {: a:str b:str :}
-   a b STR= ;
+   a b STR:= ;
 
 : TEXT-COPY ( SQLITE:statement n ^ARENA:arena -- SQLITE:statement str )
    {: col ar :}
@@ -2820,8 +2820,8 @@ create BLOCKED-QUERY PLAN-SELECT BLOCKED-WHERE LAY-BOTH
 
 : DECODE-STATUS ( str str str -- record-status )
    {: s:str op:str path:str :}
-   s s" pending" STR= if construct record-status pending exit then
-   s s" completed" STR= if construct record-status completed exit then
+   s s" pending" STR:= if construct record-status pending exit then
+   s s" completed" STR:= if construct record-status completed exit then
    op path s" record has an unrecognized status" INVALID ;
 
 : NO-JSON? ( option<str> -- bool )
@@ -2862,8 +2862,8 @@ create BLOCKED-QUERY PLAN-SELECT BLOCKED-WHERE LAY-BOTH
 
 : KNOWN? ( str -- bool )
    {: s:str :}
-   s s" pending" STR= s s" completed" STR= or
-   s s" blocked" STR= or ;
+   s s" pending" STR:= s s" completed" STR:= or
+   s s" blocked" STR:= or ;
 
 \ A plan's status from its status, blocked_json and retry_at columns.
 : DECODE-PLAN-STATUS
@@ -2871,13 +2871,13 @@ create BLOCKED-QUERY PLAN-SELECT BLOCKED-WHERE LAY-BOTH
      -- plan-status )
    {: s:str json retry op:str path ar :}
    json NO-JSON? retry NO-INT? and {: clear:bool :}
-   s s" pending" STR= clear and if
+   s s" pending" STR:= clear and if
       construct plan-status pending exit
    then
-   s s" completed" STR= clear and if
+   s s" completed" STR:= clear and if
       construct plan-status completed exit
    then
-   s s" blocked" STR= if
+   s s" blocked" STR:= if
       json retry op path ar BLOCKED-STATUS exit
    then
    s KNOWN? if op path DISAGREES then
@@ -3503,7 +3503,7 @@ STRUCTURE operation-state
 
 : HASH= ( DROPBOX:hash DROPBOX:hash -- bool )
    {: a b :}
-   a DROPBOX:HASH>STR b DROPBOX:HASH>STR STR= ;
+   a DROPBOX:HASH>STR b DROPBOX:HASH>STR STR:= ;
 
 : DIRECTORY? ( MODEL:baseline -- bool )
    MATCH MODEL:baseline

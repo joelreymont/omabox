@@ -612,14 +612,14 @@ variable SEED
    SB-RESET stem SB-APPEND s" .txt" SB-APPEND
    SB$ ar COPIED {: lower:str :}
    lower ar COPIED {: upper:str :}
-   upper str> 0 ?do dup i + c@ ASCII-UPPER over i + c! loop drop
+   upper str> 0 ?do dup i + c@ STR:ASCII-UPPER over i + c! loop drop
    ar LOCAL-RECORDS {: rs :}
    rs lower DIRECTORY+ rs upper DIRECTORY+
    j b rs ar LOCALS-PLANNING {: pl :}
    d [: [: pl DECIDE-ALL ;] E-CASE-COLLISION TTHROWSQ ;] ar
    LOGGED {: t:str :}
-   t 10 COUNT-CHAR 1 T=
-   t upper lower COLLISION$ CONTAINS? TTRUE
+   t 10 STR:COUNT-CHAR 1 T=
+   t upper lower COLLISION$ STR:CONTAINS? TTRUE
    j b rs lower upper ar RENAMES-AGREE ;
 
 : SAMPLED-VARIANTS
@@ -638,9 +638,9 @@ variable SEED
 \ the index after it, or -1 past the last.
 : MERGE-PIECE ( str n ^VEC:vector<str> -- n )
    {: p:str at:n kept :}
-   p SEPARATOR at SPLIT-NEXT 0= if 2drop -1 exit then
+   p SEPARATOR at STR:SPLIT-NEXT 0= if 2drop -1 exit then
    {: q:str next:n :}
-   q NAME? q s" .." STR= 0= and if q kept VEC:PUSH ! then
+   q NAME? q s" .." STR:= 0= and if q kept VEC:PUSH ! then
    next ;
 
 \ Rust's merge_path: the pieces between separators but empty, "."
@@ -654,7 +654,7 @@ variable SEED
 
 : HOLDS? ( ^VEC:vector<str> str -- bool )
    {: v p:str :}
-   false v VEC:COUNT 0 ?do v i VEC:AT @ p STR= or loop ;
+   false v VEC:COUNT 0 ?do v i VEC:AT @ p STR:= or loop ;
 
 \ Rust's merge_paths over up to 23 sampled names, without repeats.
 : MERGE-PATHS ( ^ARENA:arena -- ^VEC:vector<str> )
@@ -1215,7 +1215,7 @@ variable SEED
    j b v ar UNBASED-MOVE MOVE-DESTINATION
    PATH$ SPLIT-NAME {: dir:str name:str :}
    name str> nip 255 T=
-   name s"  (case variant)" ENDS-WITH? TTRUE ;
+   name s"  (case variant)" STR:ENDS-WITH? TTRUE ;
 
 : CASE-VARIANT-NAME-FITS-A-MAXIMUM-LENGTH-COMPONENT ( ^ARENA:arena -- )
    {: ar :}
@@ -1242,7 +1242,7 @@ variable SEED
    name h o 0 255 ar FILE-COPY-NAME SOME-NAME {: b:str :}
    a b T$=
    a str> nip 255 T=
-   a s"  (Dropbox file bbbbbbbbbbbb)" ENDS-WITH? TTRUE ;
+   a s"  (Dropbox file bbbbbbbbbbbb)" STR:ENDS-WITH? TTRUE ;
 
 : CONVERGE-FROM-PARENT-TO-CHILD
    ( str JOURNAL:journal JOURNAL:local-root-binding ^ARENA:arena -- )
@@ -1629,8 +1629,8 @@ ARENA LISTED DROPBOX:entry
    s" /report.txt" s" /Different.txt" ar FILE-ENTRY {: e :}
    d [: [: e root v ar APPEND-ENTRY-CHANGES ;] E-LISTING TTHROWSQ ;]
    ar LOGGED {: t:str :}
-   t 10 COUNT-CHAR 1 T=
-   t s" invalid or out-of-root path `/Different.txt`" CONTAINS? TTRUE
+   t 10 STR:COUNT-CHAR 1 T=
+   t s" invalid or out-of-root path `/Different.txt`" STR:CONTAINS? TTRUE
    v ar INVENTORY-RECORDS VEC:COUNT 0 T=
    d FS:REMOVE-TREE ;
 
@@ -1639,10 +1639,10 @@ ARENA LISTED DROPBOX:entry
    {: p:str d:str ar :}
    d [: [: p ar LISTING-AT ROOT-DEPTH drop ;] E-LISTING TTHROWSQ ;]
    ar LOGGED {: t:str :}
-   t 10 COUNT-CHAR 1 T=
+   t 10 STR:COUNT-CHAR 1 T=
    t
    s" configured Dropbox root must be empty or a normalized absolute Dropbox path"
-   CONTAINS? TTRUE ;
+   STR:CONTAINS? TTRUE ;
 
 : LISTING-REJECTS-AN-INVALID-CONFIGURED-ROOT ( ^ARENA:arena -- )
    {: ar :}
@@ -1662,9 +1662,9 @@ ARENA LISTED DROPBOX:entry
    ar NO-CHANGES {: v :}
    d [: [: e root v ar APPEND-ENTRY-CHANGES ;] E-LISTING TTHROWSQ ;]
    ar LOGGED {: t:str :}
-   t 10 COUNT-CHAR 1 T=
+   t 10 STR:COUNT-CHAR 1 T=
    t s" Dropbox listing contained an invalid or out-of-root path"
-   CONTAINS? TTRUE
+   STR:CONTAINS? TTRUE
    v ar INVENTORY-RECORDS VEC:COUNT 0 T=
    t ;
 
@@ -1673,7 +1673,7 @@ ARENA LISTED DROPBOX:entry
    s" listing rejects an entry without paths" T-LABEL
    s" reconcile-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
    s" " s" " ar FILE-ENTRY d ar ENTRY-REFUSED {: t:str :}
-   t s" `" CONTAINS? TFALSE
+   t s" `" STR:CONTAINS? TFALSE
    d FS:REMOVE-TREE ;
 
 : LISTING-REJECTS-A-PATH-THAT-IS-NOT-UTF-8 ( ^ARENA:arena -- )
@@ -1696,8 +1696,8 @@ ARENA LISTED DROPBOX:entry
    d [: [: e root v ar APPEND-ENTRY-CHANGES
          child root v ar APPEND-ENTRY-CHANGES ;] E-LISTING TTHROWSQ ;]
    ar LOGGED {: g:str :}
-   g 10 COUNT-CHAR 1 T=
-   g t CONTAINS? TTRUE
+   g 10 STR:COUNT-CHAR 1 T=
+   g t STR:CONTAINS? TTRUE
    v ar INVENTORY-RECORDS {: rs :}
    rs RECORD-PATHS$ s" Old|" T$=
    rs s" old" ar CANONICAL OBSERVED-IN REMOTE-DIRECTORY
@@ -1785,7 +1785,7 @@ ARENA LISTED DROPBOX:entry
    {: a:str :}
    MATCH option
       none OF false ENDOF
-      some OF DROPBOX:CURSOR>STR a STR= ENDOF
+      some OF DROPBOX:CURSOR>STR a STR:= ENDOF
    ;MATCH ;
 
 : KIND$ ( MODEL:observation<MODEL:remote> -- str )
@@ -1802,7 +1802,7 @@ ARENA LISTED DROPBOX:entry
    {: rs p:str :}
    rs VEC:COUNT 0 ?do
       rs i VEC:AT @ MODEL-REMOTE--RECORD:UNMAKE {: k q o :}
-      q PATH$ p STR= if o KIND$ unloop exit then
+      q PATH$ p STR:= if o KIND$ unloop exit then
    loop
    s" none" ;
 
@@ -1996,7 +1996,7 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
    {: rs p:str o :}
    rs VEC:COUNT 0 ?do
       rs i VEC:AT @ MODEL-REMOTE--RECORD:UNMAKE {: k q w :}
-      q PATH$ p STR= if w o MODEL:REMOTE-OBSERVATION= unloop exit then
+      q PATH$ p STR:= if w o MODEL:REMOTE-OBSERVATION= unloop exit then
    loop
    false ;
 
@@ -2339,7 +2339,7 @@ READ-CAP BUFFER: READ-BUF
    rep BLOCKS {: bs :}
    bs VEC:COUNT 0 ?do
       SB-RESET bs i VEC:AT @ BLOCKED+
-      SB$ e STR= if true unloop exit then
+      SB$ e STR:= if true unloop exit then
    loop
    false ;
 
@@ -2487,7 +2487,7 @@ READ-CAP BUFFER: READ-BUF
    finally ;
 
 : ONE-NAME? ( str -- bool )
-   10 INDEX-OF MATCH option
+   10 STR:INDEX-OF MATCH option
       none OF true ENDOF
       some OF drop false ENDOF
    ;MATCH ;
@@ -2497,7 +2497,7 @@ READ-CAP BUFFER: READ-BUF
    {: x :}
    x ROOT$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
    READ-BUF u >str ONE-NAME? TTRUE
-   READ-BUF u >str s" .omabox-download-" STARTS-WITH? TTRUE
+   READ-BUF u >str s" .omabox-download-" STR:STARTS-WITH? TTRUE
    x RUN-ROOT @ READ-BUF u >str x RUN-ARENA @ INSIDE ;
 
 : HOLDS-BYTES ( str str -- )
@@ -2655,7 +2655,7 @@ $100 constant MODE-0400
    x REPLAY-STEP REPORTED COMPLETED 1 T=
    d s" omabox/status.json" ar INSIDE READ-BUF READ-CAP FS:READ-ALL
    {: u:n :}
-   READ-BUF u >str S\" \qlast_error\q:null" CONTAINS? TTRUE
+   READ-BUF u >str S\" \qlast_error\q:null" STR:CONTAINS? TTRUE
    x RUN-ROOT @ s" fallback.txt" ar INSIDE FALLBACK$ HOLDS-BYTES
    x SLOTS-KEPT
    TEST-DROPBOX:SEEN$ 1 DOWNLOADS$ T$=
@@ -2702,8 +2702,8 @@ TYPED-VARIABLE CANARY str
 \ Whether a name in the list starts with .omabox-download-.
 : STAGE-LISTED? ( str -- bool )
    {: l:str :}
-   l s" .omabox-download-" STARTS-WITH? if true exit then
-   l 10 INDEX-OF MATCH option
+   l s" .omabox-download-" STR:STARTS-WITH? if true exit then
+   l 10 STR:INDEX-OF MATCH option
       none OF false ENDOF
       some OF IDX>N 1+ {: k:n :} l k l str> nip PART RECURSE ENDOF
    ;MATCH ;
@@ -2821,7 +2821,7 @@ TYPED-VARIABLE CANARY str
    {: x :}
    x STAGING$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
    READ-BUF u >str ONE-NAME? TTRUE
-   READ-BUF u >str s" .omabox-download-slot-" STARTS-WITH? TTRUE
+   READ-BUF u >str s" .omabox-download-slot-" STR:STARTS-WITH? TTRUE
    x RUN-STAGING @ READ-BUF u >str x RUN-ARENA @ INSIDE ;
 
 : IN-ROOT ( ^run str -- str )
@@ -2927,7 +2927,7 @@ TYPED-VARIABLE RACED-INSTALL str
    rep BLOCKS VEC:COUNT 1 T=
    d s" omabox/status.json" ar INSIDE READ-BUF READ-CAP FS:READ-ALL
    {: u:n :}
-   READ-BUF u >str s" Dropbox could not be reached." CONTAINS? TTRUE
+   READ-BUF u >str s" Dropbox could not be reached." STR:CONTAINS? TTRUE
    x s" raced.txt" IN-ROOT WRITTEN$ HOLDS-BYTES
    d x STEP-GONE ;
 
@@ -3872,7 +3872,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    {: a b :}
    a JOURNAL-CONFLICT--RECORD:UNMAKE {: id path c :}
    b JOURNAL-CONFLICT--RECORD:UNMAKE {: id2 path2 c2 :}
-   id id2 = path PATH$ path2 PATH$ STR= and
+   id id2 = path PATH$ path2 PATH$ STR:= and
    c c2 MODEL:CONFLICT= and ;
 
 \ Rust's == of two conflicts() answers.
@@ -3991,7 +3991,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x rec PASSED COMPLETE COPY-CONFLICTS 1 T=
    x REPLACE-PREPARED
    TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata "
-   STARTS-WITH? TTRUE
+   STR:STARTS-WITH? TTRUE
    DOWNLOAD$ TEST-DROPBOX:CALLS 1 T=
    d x STEP-GONE ;
 
@@ -4362,7 +4362,7 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
 : NO-CONFLICT-COPY ( ^run -- )
    ROOT$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
    SB-RESET S\" \n" SB-APPEND READ-BUF u >str SB-APPEND
-   SB$ S\" \n.omabox-conflict-" CONTAINS? TFALSE ;
+   SB$ S\" \n.omabox-conflict-" STR:CONTAINS? TFALSE ;
 
 \ report/x's update argument as DROPBOX writes it, for content h.
 : SIBLING-ARG$ ( DROPBOX:hash -- str )
@@ -4466,9 +4466,9 @@ $1C0 constant OWNER-ACCESS
 \ -1 past the last.
 : CONFLICT-COPY+ ( str n ^run ^VEC:vector<str> -- n )
    {: ns:str at:n x v :}
-   ns 10 at SPLIT-NEXT 0= if 2drop -1 exit then
+   ns 10 at STR:SPLIT-NEXT 0= if 2drop -1 exit then
    {: q:str next:n :}
-   q s" .omabox-conflict-" STARTS-WITH? if
+   q s" .omabox-conflict-" STR:STARTS-WITH? if
       x RUN-ROOT @ q x RUN-ARENA @ INSIDE
       READ-BUF READ-CAP FS:READ-ALL READ-BUF swap >str
       x RUN-ARENA @ COPIED v VEC:PUSH !
@@ -4477,7 +4477,7 @@ $1C0 constant OWNER-ACCESS
 
 : BYTES-BEFORE? ( str str -- bool )
    {: a:str b:str :}
-   a b STR< ;
+   a b STR:< ;
 
 \ Swaps the strings at k-1 and k if they are out of byte order; whether
 \ it did.
@@ -4595,12 +4595,12 @@ $1C0 constant OWNER-ACCESS
    DELETE$ TEST-DROPBOX:CALLS 0 T=
    UPLOAD-ROUTE$ TEST-DROPBOX:CALLS 1 T=
    UPLOAD-ROUTE$ TEST-DROPBOX:ARGS-TO$
-   LOCAL-EDIT$ ar IDENTITY UPDATE-ARG$ CONTAINS? TTRUE
+   LOCAL-EDIT$ ar IDENTITY UPDATE-ARG$ STR:CONTAINS? TTRUE
    DOWNLOAD$ TEST-DROPBOX:CALLS 2 T=
    DOWNLOAD$ TEST-DROPBOX:ARGS-TO$
-   S\" {\qpath\q:\qrev:rev-remote-update\q}" CONTAINS? TTRUE
+   S\" {\qpath\q:\qrev:rev-remote-update\q}" STR:CONTAINS? TTRUE
    DOWNLOAD$ TEST-DROPBOX:ARGS-TO$
-   S\" {\qpath\q:\qrev:rev-remote-conflict\q}" CONTAINS? TTRUE ;
+   S\" {\qpath\q:\qrev:rev-remote-conflict\q}" STR:CONTAINS? TTRUE ;
 
 : LATER-EDITS-SYNC-AND-DIVERGENCE-PRESERVES-BOTH-SIDES
    ( ^ARENA:arena -- )
@@ -5032,7 +5032,7 @@ $1C0 constant OWNER-ACCESS
    \ The download installs in the second pass, so the step finds none.
    x STEP-UNBLOCKED
    x APPS-KEPT
-   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2" CONTAINS? TFALSE
+   TEST-DROPBOX:SEEN$ s" /2/files/delete_v2" STR:CONTAINS? TFALSE
    TEST-DROPBOX:SEEN$ APPS-SEEN$ T$=
    d x STEP-GONE ;
 
@@ -5143,7 +5143,7 @@ $1C0 constant OWNER-ACCESS
    \ Rust's pending ReplaceLocal of rev-new over the kept bytes runs in
    \ this pass: rev-new downloaded, then installed with no conflict.
    DOWNLOAD$ TEST-DROPBOX:ARGS-TO$
-   S\" {\qpath\q:\qrev:rev-new\q}" CONTAINS? TTRUE
+   S\" {\qpath\q:\qrev:rev-new\q}" STR:CONTAINS? TTRUE
    x STEP-UNBLOCKED
    x KEPT-REPLACED
    TEST-DROPBOX:SEEN$ PASS-SEEN$ T$=
@@ -5451,10 +5451,10 @@ $180 constant MODE-0600
 : STAGE-NAMED ( str -- str )
    {: l:str :}
    l str> nip {: u:n :}
-   l 10 INDEX-OF MATCH option
+   l 10 STR:INDEX-OF MATCH option
       none OF l ENDOF
       some OF IDX>N {: k:n :}
-         l 0 k PART s" .omabox-download-" STARTS-WITH? if l 0 k PART
+         l 0 k PART s" .omabox-download-" STR:STARTS-WITH? if l 0 k PART
          else l k 1+ u PART RECURSE then
       ENDOF
    ;MATCH ;
@@ -5464,7 +5464,7 @@ $180 constant MODE-0600
    {: x :}
    x ROOT$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
    READ-BUF u >str STAGE-NAMED {: s:str :}
-   s s" .omabox-download-" STARTS-WITH? TTRUE
+   s s" .omabox-download-" STR:STARTS-WITH? TTRUE
    x RUN-ROOT @ s x RUN-ARENA @ INSIDE ;
 
 \ The first variant's stage, staged with the copy's bytes, then
@@ -5512,7 +5512,7 @@ $180 constant MODE-0600
 : FILE-NAMED ( str str ^ARENA:arena -- str )
    {: r:str l:str ar :}
    l str> nip {: u:n :}
-   l 10 INDEX-OF MATCH option
+   l 10 STR:INDEX-OF MATCH option
       none OF r l ar INSIDE ENDOF
       some OF IDX>N {: k:n :}
          r l 0 k PART ar INSIDE {: f:str :}
@@ -5584,8 +5584,8 @@ $180 constant MODE-0600
    {: d:str x rec:str r:str :}
    x RUN-ARENA @ {: ar :}
    d [: x rec OTHER-SYNCED ;] ar LOGGED {: t:str :}
-   t 10 COUNT-CHAR 1 T=
-   t r HELD-LINE CONTAINS? TTRUE
+   t 10 STR:COUNT-CHAR 1 T=
+   t r HELD-LINE STR:CONTAINS? TTRUE
    s" Dropbox file" COLLIDED$ s" " ar NODE-COPY {: v:str :}
    x v IN-ROOT FS:EXISTS? TFALSE
    x PENDING-OF VEC:COUNT 0 T=
@@ -5684,7 +5684,7 @@ $180 constant MODE-0600
 \ The words of a, which single spaces part: the first, then the rest.
 : FIRST-WORD ( str -- str )
    {: a:str :}
-   a 32 INDEX-OF MATCH option
+   a 32 STR:INDEX-OF MATCH option
       none OF a ENDOF
       some OF IDX>N {: k:n :} a 0 k PART ENDOF
    ;MATCH ;
@@ -5692,7 +5692,7 @@ $180 constant MODE-0600
 : REST-WORDS ( str -- str )
    {: a:str :}
    a str> nip {: u:n :}
-   a 32 INDEX-OF MATCH option
+   a 32 STR:INDEX-OF MATCH option
       none OF a u u PART ENDOF
       some OF IDX>N 1+ {: k:n :} a k u PART ENDOF
    ;MATCH ;
@@ -5831,7 +5831,7 @@ $180 constant MODE-0600
    x BLOCKED-OF VEC:COUNT 0 T=
    TREE-DELETED
    ar TREE-PROBED
-   TEST-DROPBOX:SEEN$ s" /2/files/create_folder_v2" CONTAINS? TFALSE
+   TEST-DROPBOX:SEEN$ s" /2/files/create_folder_v2" STR:CONTAINS? TFALSE
    d x STEP-GONE ;
 
 : LOCAL-DIRECTORY-DELETION-WAITS-FOR-UNSYNCHRONIZED-DROPBOX-ENTRIES
@@ -6059,8 +6059,8 @@ TYPED-VARIABLE RACED str
 
 : UPLOAD-SUMMARY$ ( str -- str )
    {: t:str :}
-   t s" conflict" STR= if s" path/conflict/file/..." exit then
-   t s" disallowed_name" STR= if
+   t s" conflict" STR:= if s" path/conflict/file/..." exit then
+   t s" disallowed_name" STR:= if
       s" path/disallowed_name/..." exit
    then
    s" path/other/..." ;

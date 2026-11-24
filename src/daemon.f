@@ -349,10 +349,10 @@ ENUM account-check
    s SESSION-CLIENT @ {: c :}
    c DROPBOX:ACCOUNT {: r :}
    r DROPBOX:DONE? 0= if r construct account-check failed exit then
-   c DROPBOX:ACCOUNT-ID s ACCOUNT$ STR= 0= if
+   c DROPBOX:ACCOUNT-ID s ACCOUNT$ STR:= 0= if
       construct account-check account-changed exit
    then
-   c DROPBOX:ROOT-NAMESPACE s NAMESPACE$ STR= 0= if
+   c DROPBOX:ROOT-NAMESPACE s NAMESPACE$ STR:= 0= if
       construct account-check root-changed exit
    then
    s VALIDATE-REMOTE-ROOT ;

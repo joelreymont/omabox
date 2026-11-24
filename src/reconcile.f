@@ -145,7 +145,7 @@ STRUCTURE path-decision
 \ it, or -1 past the last.
 : NEXT-NAME ( n str n [ n str -- n ] -- n n )
    {: acc:n p:str at:n q :}
-   p SEPARATOR at SPLIT-NEXT 0= if 2drop acc -1 exit then
+   p SEPARATOR at STR:SPLIT-NEXT 0= if 2drop acc -1 exit then
    {: s:str next:n :}
    s NAME? if acc s q execute next exit then
    acc next ;
@@ -326,10 +326,10 @@ STRUCTURE pending-plan
 \ these bytes, or n when none does.
 : FIND-BYTES ( str n [ n -- MODEL:key ] -- n )
    {: p:str count:n key :}
-   0 count [: key execute KEY-BYTES p STR< ;]
+   0 count [: key execute KEY-BYTES p STR:< ;]
    SORT:PARTITION-POINT {: at:n :}
    at count >= if count exit then
-   at key execute KEY-BYTES p STR= if at exit then
+   at key execute KEY-BYTES p STR:= if at exit then
    count ;
 
 \ For ANCESTOR-UNKNOWN: the reason at the ancestor or the next one up.
@@ -418,7 +418,7 @@ STRUCTURE pending-plan
    path MODEL:PATH>STR ar COMPONENTS {: parts :}
    parts VEC:COUNT 0= if OPTION:NONE exit then
    parts parts VEC:COUNT 1- VEC:AT @ {: last:str :}
-   last s" /" STR= last s" ." STR= or last s" .." STR= or
+   last s" /" STR:= last s" ." STR:= or last s" .." STR:= or
    if OPTION:NONE exit then
    last OPTION:SOME ;
 
@@ -444,7 +444,7 @@ STRUCTURE pending-plan
    ;MATCH ;
 
 \ PathBuf::push puts a separator after a part but a root.
-: SEPARATED? ( str -- bool ) s" /" STR= 0= ;
+: SEPARATED? ( str -- bool ) s" /" STR:= 0= ;
 
 : JOINED-SIZE ( ^VEC:vector<str> -- n )
    {: parts :}
@@ -522,7 +522,7 @@ STRUCTURE case-variant-move
 
 : PATH= ( MODEL:path MODEL:path -- bool )
    {: a:MODEL:path b:MODEL:path :}
-   a PATH$ b PATH$ STR= ;
+   a PATH$ b PATH$ STR:= ;
 
 : SPELLING-KEY ( spelling -- MODEL:key )
    SPELLING-UNMAKE {: k p r :} k ;
@@ -569,7 +569,7 @@ STRUCTURE case-variant-move
    x SPELLING-KEY y SPELLING-KEY MODEL:KEY-CMP {: c :}
    c 0<> if c exit then
    x SPELLING-PATH y SPELLING-PATH PATH= if 0 exit then
-   x SPELLING-PATH PATH$ y SPELLING-PATH PATH$ STR<
+   x SPELLING-PATH PATH$ y SPELLING-PATH PATH$ STR:<
    if -1 else 1 then ;
 
 : SAME-AS-LAST? ( ^VEC:vector<spelling> spelling -- bool )
@@ -736,8 +736,8 @@ STRUCTURE case-variant-move
 : FINAL? ( str -- bool )
    {: p:str :}
    p str> nip 0= if false exit then
-   p s" ." STR= if false exit then
-   p s" .." STR= 0= ;
+   p s" ." STR:= if false exit then
+   p s" .." STR:= 0= ;
 
 : UNDER ( str str ^ARENA:arena -- MODEL:path )
    {: dir:str name:str ar :}
@@ -903,7 +903,7 @@ ENUM file-copy-origin
 \ The k kept bytes, c appended while k is below 12 and c alphanumeric.
 : KEEP-ALNUM ( n ^u8 u8 -- n )
    {: k:n dst:^ c:u8 :}
-   k 12 < c STR-ALNUM? and 0= if k exit then
+   k 12 < c STR:ALNUM? and 0= if k exit then
    c dst k + c!
    k 1+ ;
 
@@ -1108,7 +1108,7 @@ STRUCTURE casing
    s DROPBOX:ROOT-PATH? 0= if
       DROPBOX:E-ROOT-PATH ERROR:TEXT$ LISTING-FAILED
    then
-   s s ar LOWERED s SEPARATOR COUNT-CHAR LISTING-ROOT-MAKE ;
+   s s ar LOWERED s SEPARATOR STR:COUNT-CHAR LISTING-ROOT-MAKE ;
 
 : ROOT-LOWER ( listing-root -- str )
    LISTING-ROOT-UNMAKE {: p:str l:str depth:n :} l ;
@@ -1129,7 +1129,7 @@ STRUCTURE casing
    {: ls:str rl:str :}
    ls str> {: l:^ lu:n :}
    rl str> nip {: ru:n :}
-   ls rl STARTS-WITH? 0= if -1 exit then
+   ls rl STR:STARTS-WITH? 0= if -1 exit then
    lu ru <= if -1 exit then
    l ru + c@ SEPARATOR <> if -1 exit then
    ru 1+ ;
@@ -1147,7 +1147,7 @@ STRUCTURE casing
 \ Whether key and path bytes have as many components, none invalid.
 : FITTING? ( str str -- bool )
    {: k:str p:str :}
-   k SEPARATOR COUNT-CHAR p SEPARATOR COUNT-CHAR <>
+   k SEPARATOR STR:COUNT-CHAR p SEPARATOR STR:COUNT-CHAR <>
    if false exit then
    k DROPBOX:INVALID-PARTS? p DROPBOX:INVALID-PARTS? or 0= ;
 
@@ -1168,7 +1168,7 @@ STRUCTURE casing
    {: e root :}
    root ROOT-LOWER {: r:str :}
    r str> nip 0= if false exit then
-   e DROPBOX-ENTRY:LOWER @ SPAN:$ r STR= ;
+   e DROPBOX-ENTRY:LOWER @ SPAN:$ r STR:= ;
 
 
 : RESTRICTED-ROOT ( ^DROPBOX:entry -- )
@@ -1539,7 +1539,7 @@ STRUCTURE casing
    ( MODEL:key MODEL:path ^VEC:vector<casing> ^ARENA:arena
      -- MODEL:path )
    {: k p cv ar :}
-   k KEY-BYTES SEPARATOR COUNT-CHAR p PATH$ SEPARATOR COUNT-CHAR <>
+   k KEY-BYTES SEPARATOR STR:COUNT-CHAR p PATH$ SEPARATOR STR:COUNT-CHAR <>
    if p PATH$ BAD-PATH then
    0 k p cv [: SIZED ;] EACH-SPELLED
 
@@ -3578,16 +3578,16 @@ ENUM pass-state DERIVE eq
 
 : NTH< ( n n ^VEC:vector<str> -- bool )
    {: x:n y:n v :}
-   v x NTH$ v y NTH$ STR< ;
+   v x NTH$ v y NTH$ STR:< ;
 
-\ How many distinct byte strings v holds, counted in STR< order.
+\ How many distinct byte strings v holds, counted in STR:< order.
 : DISTINCT ( ^VEC:vector<str> ^ARENA:arena -- n )
    {: v ar :}
    v VEC:COUNT {: k:n :}
    k 0= if 0 exit then
    k [: v NTH< ;] ar ORDER {: idx :}
    1 k 1 ?do
-      v idx i 1- VEC:AT @ NTH$ v idx i VEC:AT @ NTH$ STR= 0= if 1+ then
+      v idx i 1- VEC:AT @ NTH$ v idx i VEC:AT @ NTH$ STR:= 0= if 1+ then
    loop ;
 
 : HELD-COUNT ( ^pass -- n )

@@ -340,16 +340,16 @@ ARENA CHILDREN child
 
 : ACTIVE-STATE ( str -- option<unit-state> )
    {: a :}
-   a s" active" STR= a s" reloading" STR= or
-   a s" refreshing" STR= or
+   a s" active" STR:= a s" reloading" STR:= or
+   a s" refreshing" STR:= or
    if construct unit-state running OPTION:SOME exit then
-   a s" activating" STR=
+   a s" activating" STR:=
    if construct unit-state starting OPTION:SOME exit then
-   a s" failed" STR=
+   a s" failed" STR:=
    if construct unit-state failed OPTION:SOME exit then
-   a s" deactivating" STR=
+   a s" deactivating" STR:=
    if construct unit-state stopping OPTION:SOME exit then
-   a s" inactive" STR= a s" maintenance" STR= or
+   a s" inactive" STR:= a s" maintenance" STR:= or
    if construct unit-state stopped OPTION:SOME exit then
    OPTION:NONE ;
 

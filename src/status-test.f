@@ -213,7 +213,7 @@ $1A4 constant LOOSE-FILE
    {: code:n e :}
    code 0<> if code throw then
    s LISTED FILE$ T$=
-   e s" status: could not replace the status file: " CONTAINS?
+   e s" status: could not replace the status file: " STR:CONTAINS?
    TTRUE
    log GONE
    rt GONE ;
@@ -381,10 +381,10 @@ $1A4 constant LOOSE-FILE
    path ar STDERR:CAPTURING {: code:n e :}
    code 0<> if code throw then
    e s" STATUS:E-RUNTIME-NOT-ABSOLUTE: XDG_RUNTIME_DIR must be absolute"
-   CONTAINS?
+   STR:CONTAINS?
    TTRUE
    e s" STATUS:E-RUNTIME-UNAVAILABLE: XDG_RUNTIME_DIR is unavailable"
-   CONTAINS? TTRUE
+   STR:CONTAINS? TTRUE
    absent FS:TRY-STAT TFALSE
    log GONE
    rt GONE ;

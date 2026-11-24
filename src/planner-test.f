@@ -35,12 +35,12 @@ TYPED-VARIABLE W JSON:writer
 \ A line's first column, then the rest after its tab, empty at the end.
 : COLUMN ( str -- str str )
    {: s :}
-   s TAB 0 SPLIT-NEXT drop {: h next:n :}
+   s TAB 0 STR:SPLIT-NEXT drop {: h next:n :}
    s str> {: p:^ u:n :}
    h p next + u next - 0 max >str ;
 
 : SUBTREE ( str -- subtree )
-   dup s\" \"Empty\"" STR= if drop MODEL-SUBTREE:EMPTY exit then
+   dup s\" \"Empty\"" STR:= if drop MODEL-SUBTREE:EMPTY exit then
    s\" \"Occupied\"" T$= MODEL-SUBTREE:OCCUPIED ;
 
 \ The four inputs from a line's columns, then the columns after them.
@@ -114,7 +114,7 @@ TYPED-VARIABLE W JSON:writer
 : PLAN-LINES ( str -- n )
    {: t :}
    0 0
-   begin >r t LF r> SPLIT-NEXT while
+   begin >r t LF r> STR:SPLIT-NEXT while
       >r PLAN-LINE r>
    repeat
    drop drop ;

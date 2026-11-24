@@ -72,7 +72,7 @@ private
    s CANONICAL? 0= if false exit then
    u 20 < if true exit then
    u 20 > if false exit then
-   s" 18446744073709551615" s STR< 0= ;
+   s" 18446744073709551615" s STR:< 0= ;
 
 \ A canonical PID: a positive i32.
 : PID ( str -- option<n> )
@@ -108,8 +108,8 @@ private
    p STR:len {: pu:n :}
    s STR:len {: su:n :}
    u pu su + < if OPTION:NONE exit then
-   a pu >str p STR= 0= if OPTION:NONE exit then
-   a u + su - su >str s STR= 0= if OPTION:NONE exit then
+   a pu >str p STR:= 0= if OPTION:NONE exit then
+   a u + su - su >str s STR:= 0= if OPTION:NONE exit then
    a pu + u pu - su - >str TOKEN-OWNER ;
 
 : DEAD? ( n -- bool )

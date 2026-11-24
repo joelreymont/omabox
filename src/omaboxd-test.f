@@ -260,7 +260,7 @@ ARENA FIXTURES fixture
    f FS:FILE? 0= if false exit then
    f SEEN CAP FS:READ-ALL {: u :}
    SB-RESET S\" \qlast_error\q:" SB-APPEND t TEST-CLIENT:QUOTED+
-   SEEN u >str SB$ CONTAINS? ;
+   SEEN u >str SB$ STR:CONTAINS? ;
 
 
 \ ---- the child ----

@@ -2320,6 +2320,39 @@ Observations for the blog:
   would have refused it; Habu ran it. A test of freeing has to watch the
   allocator, not ask the freed object.
 
+## 2026-11-24: the string words move into a package
+
+Habu master moved its string library's words into package `STR`, and
+Omabox stopped loading: `STR=` was not found. The rename has two kinds.
+Words that kept their names now need the prefix (`TRIM` is `STR:TRIM`),
+and words whose names carried the package in a hyphen lost it
+(`STR-TRUE` is `STR:TRUE`). The buffer words (`SB-*`, `BUF-*`) stayed
+where they were. A short script made the change, matching whole tokens
+only, over 455 uses in 31 files. It skipped config.f's own `TRIM`, which
+shadows the library's. Two constants the library had exported became
+private, the decimal base and the space byte, so the two files that used
+them now name their own.
+
+On the new engine one test file still failed, and the failure was not
+the port's. A status test expected the journal's refusal to say
+"supported version is 9", and the scan's journal is at schema 10: the
+schema change had run only the tests its brief named. The fix went into
+that change.
+
+Observations for the blog:
+- In Rust, moving functions into a module costs each calling file one
+  `use` line, and an imported name shadows the prelude's. Habu's
+  `using STR ... ;using` imports a whole package and refuses, rather
+  than shadows, a name a core word also owns. STR publishes `=`, `<`,
+  `TRUE`, `FALSE`, `CR` and `SPACE`, and Habu matches names without
+  regard to case, so a file that compares numbers or prints a newline
+  cannot import it. For such a package Habu's guide says to name the
+  package at each call or rename the collision, so the rename touched
+  every call site. The checker found the first one, and matching whole
+  tokens found the rest.
+- A test that pins an error's text pins every number in it. The schema
+  bump broke a test in a file the bump never touched.
+
 ## 2026-11-24: two flaky suites and a check that said too little
 
 Landing Omabox's port to the new string meant landing Habu work too, and

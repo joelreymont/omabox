@@ -1034,14 +1034,14 @@ ARENA UPLOADS DROPBOX:upload
 : NORMAL? ( str -- bool )
    {: p:str :}
    p str> nip 0= if false exit then
-   p s" ." STR= p s" .." STR= or if false exit then
-   p 0 COUNT-CHAR 0<> if false exit then
+   p s" ." STR:= p s" .." STR:= or if false exit then
+   p 0 STR:COUNT-CHAR 0<> if false exit then
    p UTF8:VALID? ;
 
 \ Whether every component from `at` on is NORMAL?.
 : NORMAL-FROM? ( str n -- bool )
    {: p:str at:n :}
-   p SLASH at SPLIT-NEXT 0= if 2drop true exit then
+   p SLASH at STR:SPLIT-NEXT 0= if 2drop true exit then
    {: q:str next:n :}
    q NORMAL? 0= if false exit then
    p next RECURSE ;
@@ -1086,7 +1086,7 @@ ARENA UPLOADS DROPBOX:upload
       absent OF false ENDOF
       file OF
          MODEL-REMOTE:UNMAKE {: c v :}
-         v DROPBOX:REV>STR want DROPBOX:REV>STR STR=
+         v DROPBOX:REV>STR want DROPBOX:REV>STR STR:=
       ENDOF
       folder OF false ENDOF
       unsupported OF false ENDOF

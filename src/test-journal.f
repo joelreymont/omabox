@@ -161,7 +161,7 @@ STRUCTURE intent
 
 : REV= ( DROPBOX:rev DROPBOX:rev -- bool )
    {: a b :}
-   a DROPBOX:REV>STR b DROPBOX:REV>STR STR= ;
+   a DROPBOX:REV>STR b DROPBOX:REV>STR STR:= ;
 
 : DESTRUCTIVE? ( MODEL:operation -- bool )
    MATCH MODEL:operation

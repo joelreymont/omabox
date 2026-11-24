@@ -268,7 +268,7 @@ CALLS-MADE
    {: r f :}
    JOINED BUF:CLEAR
    CALL-COUNT 0 ?do
-      i ROUTE-OF$ r STR= if
+      i ROUTE-OF$ r STR:= if
          i f execute {: a :}
          a STR:len 0<> if a JOIN+ then
       then
@@ -292,18 +292,18 @@ CALLS-MADE
    {: q:HTTP:request :}
    q CALL+
    q s" User-Agent" AGENT-SENT NAME-CAP SENT drop AGENT-SENT-U !
-   q HTTP:PATH$ s" /oauth2/token" STR= if
+   q HTTP:PATH$ s" /oauth2/token" STR:= if
       q s" Content-Type" TOKEN-TYPE NAME-CAP SENT drop TOKEN-TYPE-U !
       q TOKEN-HEADERS exit
    then
-   q HTTP:PATH$ s" /2/files/list_folder/longpoll" STR=
+   q HTTP:PATH$ s" /2/files/list_folder/longpoll" STR:=
    if q TOKEN-HEADERS exit then
    q s" Authorization" AUTH NAME-CAP SENT drop AUTH-U !
    q s" Dropbox-API-Path-Root" ROOT-SENT TEXT-CAP SENT ROOTED ! ROOT-SENT-U !
    q s" Content-Type" TYPE-SENT NAME-CAP SENT TYPED ! TYPE-SENT-U ! ;
 
 
-: API? ( HTTP:request -- bool ) HTTP:PATH$ s" /oauth2/token" STR= 0= ;
+: API? ( HTTP:request -- bool ) HTTP:PATH$ s" /oauth2/token" STR:= 0= ;
 
 
 \ The first scripted answer left bound to the route path, the empty
@@ -313,7 +313,7 @@ CALLS-MADE
    {: q:HTTP:request p :}
    q ARG-OF {: a :}
    SCRIPTS @ 0 ?do
-      i SPENT @ 0= i ROUTE$ p STR= and a i NEEDLE$ CONTAINS? and
+      i SPENT @ 0= i ROUTE$ p STR:= and a i NEEDLE$ STR:CONTAINS? and
       if i unloop exit then
    loop -1 ;
 
@@ -345,7 +345,7 @@ variable FORM-AT
 \ A byte a form may carry unescaped.
 : PLAIN? ( n -- bool )
    {: b:n :}
-   b STR-DIGIT? b ASCII-LOWER dup 97 >= swap 122 <= and or
+   b STR:DIGIT? b STR:ASCII-LOWER dup 97 >= swap 122 <= and or
    b 45 = or b 46 = or b 95 = or b 126 = or b 42 = or ;
 
 
@@ -356,8 +356,8 @@ variable FORM-AT
    s str> {: a:^ u:n :}
    at 3 + u > if -1 u exit then
    a at 1+ + c@ a at 2 + + c@ {: h:n l:n :}
-   h STR-HEX-DIGIT? l STR-HEX-DIGIT? and 0= if -1 u exit then
-   h STR-HEX-DIGIT-VALUE 16 * l STR-HEX-DIGIT-VALUE + at 3 + ;
+   h STR:HEX-DIGIT? l STR:HEX-DIGIT? and 0= if -1 u exit then
+   h STR:HEX-DIGIT-VALUE 16 * l STR:HEX-DIGIT-VALUE + at 3 + ;
 
 
 \ The byte at the offset, decoded, and the offset after it; -1 for one
@@ -428,7 +428,7 @@ variable FORM-AT
 
 : TOKEN ( HTTP:request HTTP:response -- )
    {: q:HTTP:request a:HTTP:response :}
-   q HTTP:BODY$ FIELDS$ FORM$ STR= 0= if
+   q HTTP:BODY$ FIELDS$ FORM$ STR:= 0= if
       a 400 HTTP:STATUS!
       a S\" {\qerror\q:\qinvalid_grant\q,\qerror_description\q:\qrefresh token is invalid or revoked\q}" ANSWER!
       exit
@@ -458,8 +458,8 @@ variable FORM-AT
    s str> {: t:^ tu:n :}
    s" Bearer sl.fake-" STR:len {: pu:n :}
    tu pu <= if -1 exit then
-   t pu >str s" Bearer sl.fake-" STR= 0= if -1 exit then
-   t pu + tu pu - >str STR-PARSE-POS MATCH option
+   t pu >str s" Bearer sl.fake-" STR:= 0= if -1 exit then
+   t pu + tu pu - >str STR:PARSE-POS MATCH option
       none OF -1 ENDOF
       some OF ENDOF
    ;MATCH ;
@@ -486,7 +486,7 @@ variable FORM-AT
    {: q:HTTP:request :}
    q s" Dropbox-API-Path-Root" HTTP:HEADER-OF$ {: v sent:bool :}
    ROOT-U @ 0= if sent 0= exit then
-   sent if v ROOT-LINE$ STR= else false then ;
+   sent if v ROOT-LINE$ STR:= else false then ;
 
 
 : ROOTED? ( HTTP:request HTTP:response -- bool )
@@ -532,7 +532,7 @@ variable FORM-AT
 \ Dropbox's paths ignore case; this fake folds ASCII alone.
 : FOUND ( -- n )
    FILES @ 0 ?do
-      i PATH$ ASKED ASKED-U @ >str STR=CI if i unloop exit then
+      i PATH$ ASKED ASKED-U @ >str STR:=CI if i unloop exit then
    loop -1 ;
 
 
@@ -571,7 +571,7 @@ variable HELD-U
 \ The code grant, good once; any other form goes to TOKEN.
 : GRANT ( HTTP:request HTTP:response -- )
    {: q:HTTP:request a:HTTP:response :}
-   GRANT-CODE-U @ 0<> q HTTP:BODY$ FIELDS$ CODE-FORM$ STR= and 0=
+   GRANT-CODE-U @ 0<> q HTTP:BODY$ FIELDS$ CODE-FORM$ STR:= and 0=
    if q a TOKEN exit then
    0 GRANT-CODE-U !
    ISSUE
@@ -664,7 +664,7 @@ variable HELD-U
    FOUND {: i:n :}
    i 0< if a S\" {\qerror_summary\q:\qpath_lookup/not_found/...\q,\qerror\q:{\q.tag\q:\qpath_lookup\q,\qpath_lookup\q:{\q.tag\q:\qnot_found\q}}}" REFUSED! exit then
    q PARENT if
-      WANT WANT-U @ >str i HELD$ STR= 0= if
+      WANT WANT-U @ >str i HELD$ STR:= 0= if
          a S\" {\qerror_summary\q:\qpath_write/conflict/file/...\q,\qerror\q:{\q.tag\q:\qpath_write\q,\qpath_write\q:{\q.tag\q:\qconflict\q,\qconflict\q:{\q.tag\q:\qfile\q}}}}" REFUSED! exit
       then
    then
@@ -923,7 +923,7 @@ TYPED-VARIABLE DURING [ -- ]
 : CONTENT-OF ( str -- n )
    {: r :}
    CONTENTS @ 0 ?do
-      i CONTENT-REV$ r STR= if i unloop exit then
+      i CONTENT-REV$ r STR:= if i unloop exit then
    loop -1 ;
 
 
@@ -947,7 +947,7 @@ TYPED-VARIABLE DURING [ -- ]
 
 : REV$ ( -- str )
    ASKED-U @ 4 <= if ASKED 0 >str exit then
-   ASKED 4 >str s" rev:" STR= 0= if ASKED 0 >str exit then
+   ASKED 4 >str s" rev:" STR:= 0= if ASKED 0 >str exit then
    ASKED 4 + ASKED-U @ 4 - >str ;
 
 
@@ -969,7 +969,7 @@ TYPED-VARIABLE DURING [ -- ]
 : FILE-OF ( str -- n )
    {: r :}
    FILES @ 0 ?do
-      i ENTRY$ ENTRY-REV r STR= if i unloop exit then
+      i ENTRY$ ENTRY-REV r STR:= if i unloop exit then
    loop -1 ;
 
 
@@ -982,9 +982,9 @@ TYPED-VARIABLE DURING [ -- ]
    h RANGE-SENT NAME-CAP STORE RANGE-SENT-U !
    sent 0= if 0 exit then
    vu 7 < if -1 exit then
-   v 6 >str s" bytes=" STR= 0= if -1 exit then
+   v 6 >str s" bytes=" STR:= 0= if -1 exit then
    v vu + 1- c@ 45 <> if -1 exit then
-   v 6 + vu 7 - >str STR-PARSE-POS MATCH option
+   v 6 + vu 7 - >str STR:PARSE-POS MATCH option
       none OF -1 ENDOF
       some OF ENDOF
    ;MATCH ;
@@ -1030,7 +1030,7 @@ TYPED-VARIABLE DURING [ -- ]
    e str> {: ea:^ eu:n :}
    ea at + eu at - >str {: t :}
    t str> {: ta:^ tu:n :}
-   t c INDEX-OF MATCH option
+   t c STR:INDEX-OF MATCH option
       none OF tu ENDOF
       some OF IDX>N ENDOF
    ;MATCH {: len:n :}
@@ -1041,7 +1041,7 @@ TYPED-VARIABLE DURING [ -- ]
 \ The text e with the value after its member m, up to the byte c, as v.
 : SPLICED ( str str n str -- str )
    {: e m c:n v :}
-   e m FIND-SUB MATCH option
+   e m STR:FIND-SUB MATCH option
       none OF e ENDOF
       some OF IDX>N m STR:len + {: at:n :} e at c v REPLACED ENDOF
    ;MATCH ;
@@ -1262,13 +1262,13 @@ variable SESSIONS
 \ A string member's value into the ARG- field its key names.
 : ARG-STRING ( JSON:reader -- JSON:reader )
    ARG-KEY ARG-KEY-U @ >str {: k :}
-   k s" path" STR= if ARG-PATH PATH-CAP JSON:READ-STR ARG-PATH-U ! exit then
-   k s" mode" STR= k s" .tag" STR= or
+   k s" path" STR:= if ARG-PATH PATH-CAP JSON:READ-STR ARG-PATH-U ! exit then
+   k s" mode" STR:= k s" .tag" STR:= or
    if ARG-MODE NAME-CAP JSON:READ-STR ARG-MODE-U ! exit then
-   k s" update" STR= if ARG-REV NAME-CAP JSON:READ-STR ARG-REV-U ! exit then
-   k s" content_hash" STR=
+   k s" update" STR:= if ARG-REV NAME-CAP JSON:READ-STR ARG-REV-U ! exit then
+   k s" content_hash" STR:=
    if ARG-HASH NAME-CAP JSON:READ-STR ARG-HASH-U ! exit then
-   k s" session_id" STR=
+   k s" session_id" STR:=
    if ARG-SESSION NAME-CAP JSON:READ-STR ARG-SESSION-U ! then ;
 
 
@@ -1276,7 +1276,7 @@ variable SESSIONS
    {: t:n :}
    t JSON:T-STR = if ARG-STRING exit then
    t JSON:T-INT = if
-      ARG-KEY ARG-KEY-U @ >str s" offset" STR=
+      ARG-KEY ARG-KEY-U @ >str s" offset" STR:=
       if JSON:READ-INT ARG-OFFSET ! then
       exit
    then
@@ -1304,7 +1304,7 @@ variable SESSIONS
 
 
 : LOWERED$ ( -- str )
-   ARG-PATH-U @ 0 ?do ARG-PATH i + c@ ASCII-LOWER LOWERED i + c! loop
+   ARG-PATH-U @ 0 ?do ARG-PATH i + c@ STR:ASCII-LOWER LOWERED i + c! loop
    LOWERED ARG-PATH-U @ >str ;
 
 
@@ -1328,9 +1328,9 @@ variable SESSIONS
 \ Whether the argument's mode takes the path whose slot is i, -1 for none.
 : TAKES? ( n -- bool )
    {: i:n :}
-   ARG-MODE$ s" add" STR= if i 0< exit then
+   ARG-MODE$ s" add" STR:= if i 0< exit then
    i 0< if false exit then
-   i ENTRY$ ENTRY-REV ARG-REV$ STR= ;
+   i ENTRY$ ENTRY-REV ARG-REV$ STR:= ;
 
 
 \ Commits the argument's path with the hash and size as its mode allows,
@@ -1354,7 +1354,7 @@ variable SESSIONS
    BODY-HASHER DROPBOX:HASH-BEGIN
    b str> BODY-HASHER DROPBOX:HASH-FEED
    BODY-HASHER DROPBOX:HASH-END {: h :}
-   h ARG-HASH$ STR= 0= if
+   h ARG-HASH$ STR:= 0= if
       a 409 HTTP:STATUS!
       a S\" {\qerror_summary\q:\qcontent_hash_mismatch/...\q,\qerror\q:{\q.tag\q:\qcontent_hash_mismatch\q}}" ANSWER!
       exit
@@ -1379,8 +1379,8 @@ variable SESSIONS
 : SESSION-OF ( -- n )
    s" fake-session-" STR:len {: pu:n :}
    ARG-SESSION-U @ pu <= if -1 exit then
-   ARG-SESSION pu >str s" fake-session-" STR= 0= if -1 exit then
-   ARG-SESSION pu + ARG-SESSION-U @ pu - >str STR-PARSE-POS MATCH option
+   ARG-SESSION pu >str s" fake-session-" STR:= 0= if -1 exit then
+   ARG-SESSION pu + ARG-SESSION-U @ pu - >str STR:PARSE-POS MATCH option
       none OF -1 ENDOF
       some OF dup SESSIONS @ < 0= if drop -1 then ENDOF
    ;MATCH ;
@@ -1397,7 +1397,7 @@ variable SESSIONS
       S\" {\q.tag\q:\qlookup_failed\q,\qlookup_failed\q:" SB-APPEND
    then
    S\" {\q.tag\q:\q" SB-APPEND t SB-APPEND S\" \q" SB-APPEND
-   t s" incorrect_offset" STR= if
+   t s" incorrect_offset" STR:= if
       S\" ,\qcorrect_offset\q:" SB-APPEND at FMT:SB-INT
    then
    s" }" SB-APPEND finish if s" }" SB-APPEND then s" }" SB-APPEND
@@ -1591,7 +1591,7 @@ $2100000 constant UPLOAD-CAP
 \ How many requests since RESET went to exactly the route.
 : CALLS ( str -- n )
    {: r :}
-   0 CALL-COUNT 0 ?do i ROUTE-OF$ r STR= if 1+ then loop ;
+   0 CALL-COUNT 0 ?do i ROUTE-OF$ r STR:= if 1+ then loop ;
 \ The Dropbox-API-Args and the bodies' first KiB of the requests to the
 \ route since RESET, in order, joined by single spaces.
 : ARGS-TO$ ( str -- str ) [: ARG-OF$ ;] JOINED-TO$ ;

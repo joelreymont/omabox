@@ -444,7 +444,7 @@ variable CAUSE
    ROOT-LINE s\" refresh_token = \"credential-sentinel-must-never-render\"\n" CAT
    WRITE-CONFIG
    ['] LOAD-DROP CONFIG:E-PARSE PARSE-TEXT REFUSED
-   ERR$ s" credential-sentinel-must-never-render" CONTAINS? TFALSE ;
+   ERR$ s" credential-sentinel-must-never-render" STR:CONTAINS? TFALSE ;
 
 : EMPTY-KEY ( -- )
    FIXTURE
@@ -453,7 +453,7 @@ variable CAUSE
    ROOT-LINE s\" dropbox_app_key = \"  \"\n" CAT WRITE-CONFIG
    ['] LOAD-DROP CONFIG:E-EMPTY-APP-KEY
    s" Dropbox application key is empty" REFUSED
-   ERR$ s" local-path-sentinel" CONTAINS? TFALSE ;
+   ERR$ s" local-path-sentinel" STR:CONTAINS? TFALSE ;
 
 : SOME ( str -- option<str> ) OPTION:SOME ;
 

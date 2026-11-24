@@ -618,7 +618,7 @@ SHA256-CTX-BYTES BUFFER: NAME-CTX
    s str> {: p:^ u:n :}
    x str> nip {: xu:n :}
    u xu < if false exit then
-   p xu >str x STR= 0= if false exit then
+   p xu >str x STR:= 0= if false exit then
    p xu + u xu - >str DROPBOX:CONTENT-HASH? ;
 
 \ A name only LOCAL makes: a download, displaced or deleted file's.
@@ -1109,7 +1109,7 @@ private
 
 : KEY-LESS ( n n [ n -- str ] -- bool )
    {: a:n b:n key :}
-   a key execute b key execute STR< ;
+   a key execute b key execute STR:< ;
 
 \ The indices below count in the byte order of the keys key answers for
 \ them.
@@ -1566,10 +1566,10 @@ SUBTREE-INSTALL
 : AMONG? ( str ^VEC:vector<MODEL:local-record> -- bool )
    {: p:str held :}
    0 held VEC:COUNT
-   [: held swap VEC:AT @ OBSERVATION-PATH p STR< ;]
+   [: held swap VEC:AT @ OBSERVATION-PATH p STR:< ;]
    SORT:PARTITION-POINT {: at:n :}
    at held VEC:COUNT >= if false exit then
-   held at VEC:AT @ OBSERVATION-PATH p STR= ;
+   held at VEC:AT @ OBSERVATION-PATH p STR:= ;
 
 \ Whether an ancestor of the path, the bytes before one of its "/", is
 \ among the held records.
@@ -1910,7 +1910,7 @@ $100 constant MODE-READ-ONLY
 
 : SAME-CONTENT? ( DROPBOX:hash DROPBOX:hash -- bool )
    {: a:DROPBOX:hash b:DROPBOX:hash :}
-   a DROPBOX:HASH>STR b DROPBOX:HASH>STR STR= ;
+   a DROPBOX:HASH>STR b DROPBOX:HASH>STR STR:= ;
 
 : READ-ONLY ( fd str str -- )
    {: f:fd p:str o:str :}
@@ -1935,7 +1935,7 @@ $100 constant MODE-READ-ONLY
    g MATCH XATTR:got
       absent OF DOWNLOAD-MARKER-MISSING ENDOF
       value OF {: k:n :}
-         MARKER-BUF k >str want STR= if DOWNLOAD-MARKER-EXPECTED
+         MARKER-BUF k >str want STR:= if DOWNLOAD-MARKER-EXPECTED
          else DOWNLOAD-MARKER-OTHER then
       ENDOF
       oversize OF DOWNLOAD-MARKER-OTHER ENDOF
@@ -2460,7 +2460,7 @@ private
    {: f:fd name:str p:str ar:^ARENA:arena :}
    false [: drop [: f p s" verify upload stage for collection" ar
          E-UNSUPPORTED E-CHANGED HASH-STABLE-FILE
-         DROPBOX:HASH>STR name STR= ;]
+         DROPBOX:HASH>STR name STR:= ;]
       ['] UNSTABLE? WITH-CONVERTS ;] catch {: code:n :}
    code 0= if exit then
    drop code FS:ERRNO UNSTABLE? if false exit then
@@ -2733,7 +2733,7 @@ DOWNLOAD-SLOT-STATE-LENGTH BUFFER: STATE-BUF
    DOWNLOAD-SLOT-OWNER-PREFIX {: x:str :}
    x str> nip {: xu:n :}
    u DOWNLOAD-SLOT-STATE-LENGTH <> if OPTION:NONE exit then
-   p xu >str x STR= 0= if OPTION:NONE exit then
+   p xu >str x STR:= 0= if OPTION:NONE exit then
    p xu + BYTES>BINDING p xu + 32 + BE@
    DOWNLOAD-SLOT-STATE-MAKE OPTION:SOME ;
 
@@ -4817,7 +4817,7 @@ private
    q b NEXT-COMPONENT {: qf:n qt:n more2:bool :}
    more 0= more2 0= and if true exit then
    more more2 and 0= if false exit then
-   p pf pt PART q qf qt PART STR= 0= if false exit then
+   p pf pt PART q qf qt PART STR:= 0= if false exit then
    p pt q qt RECURSE ;
 
 : SAME-PARENT? ( str str -- bool )

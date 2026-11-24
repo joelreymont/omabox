@@ -47,8 +47,8 @@ TYPED-VARIABLE AR ^ARENA:arena
    {: s dst:^ :}
    s str> {: h:^ u:n :}
    u 2 / 0 ?do
-      h i 2 * + c@ STR-HEX-DIGIT-VALUE 16 *
-      h i 2 * + 1+ c@ STR-HEX-DIGIT-VALUE +
+      h i 2 * + c@ STR:HEX-DIGIT-VALUE 16 *
+      h i 2 * + 1+ c@ STR:HEX-DIGIT-VALUE +
       dst i + c!
    loop
    u 2 / ;
@@ -61,7 +61,7 @@ TYPED-VARIABLE AR ^ARENA:arena
 \ One line: a display path, a tab, its fold, both in hex.
 : FOLD-LINE ( str -- )
    {: line :}
-   line TAB 0 SPLIT-NEXT drop {: next:n :}
+   line TAB 0 STR:SPLIT-NEXT drop {: next:n :}
    DECODED {: p :}
    line str> {: l:^ lu:n :}
    l next + lu next - >str DECODED {: w :}
@@ -70,7 +70,7 @@ TYPED-VARIABLE AR ^ARENA:arena
 \ Folds each line from `at` on; answers how many it folded.
 : FOLD-FROM ( str n -- n )
    {: t at:n :}
-   t LF at SPLIT-NEXT 0= if drop drop 0 exit then
+   t LF at STR:SPLIT-NEXT 0= if drop drop 0 exit then
    {: line next:n :}
    line STR:len 0= if t next RECURSE exit then
    line FOLD-LINE
@@ -186,7 +186,7 @@ TYPED-VARIABLE AR ^ARENA:arena
    {: k:MODEL:key top:MODEL:key :}
    top AR @ MODEL:SUBTREE-RANGE {: lo:str hi:str :}
    k KEY$ {: p :}
-   p lo STR< 0= p hi STR< and ;
+   p lo STR:< 0= p hi STR:< and ;
 
 \ BENEATH? and the range both answer `want` for the key.
 : RANGE-AGREES ( MODEL:key MODEL:key bool -- )
@@ -460,19 +460,19 @@ TYPED-VARIABLE W JSON:writer
 
 : BASELINE-OF ( str bool -- MODEL:baseline )
    {: v e:bool :}
-   v s" Absent" STR= if MODEL-BASELINE:ABSENT exit then
-   v s" Directory" STR= if MODEL-BASELINE:DIRECTORY exit then
+   v s" Absent" STR:= if MODEL-BASELINE:ABSENT exit then
+   v s" Directory" STR:= if MODEL-BASELINE:DIRECTORY exit then
    e REMOTE0 MODEL-BASELINE:PRESENT ;
 
 : REASON-OF ( str -- MODEL:unknown-reason )
    {: v :}
-   v s" Incomplete" STR= if MODEL-UNKNOWN--REASON:INCOMPLETE exit then
-   v s" Inaccessible" STR= if
+   v s" Incomplete" STR:= if MODEL-UNKNOWN--REASON:INCOMPLETE exit then
+   v s" Inaccessible" STR:= if
       MODEL-UNKNOWN--REASON:INACCESSIBLE exit then
-   v s" Unavailable" STR= if
+   v s" Unavailable" STR:= if
       MODEL-UNKNOWN--REASON:UNAVAILABLE exit then
-   v s" Stale" STR= if MODEL-UNKNOWN--REASON:STALE exit then
-   v s" CursorReset" STR= if
+   v s" Stale" STR:= if MODEL-UNKNOWN--REASON:STALE exit then
+   v s" CursorReset" STR:= if
       MODEL-UNKNOWN--REASON:CURSOR-RESET exit then
    MODEL-UNKNOWN--REASON:UNSUPPORTED ;
 
@@ -483,55 +483,55 @@ TYPED-VARIABLE W JSON:writer
 
 : LOCAL-OBSERVATION-OF ( str bool -- MODEL:observation<MODEL:local> )
    {: v e:bool :}
-   v s" ConfirmedAbsent" STR= if MODEL-OBSERVATION:ABSENT exit then
-   v s" Directory" STR= if MODEL-OBSERVATION:DIRECTORY exit then
-   v s" Present" STR= if e LOCAL0 MODEL-OBSERVATION:PRESENT exit then
+   v s" ConfirmedAbsent" STR:= if MODEL-OBSERVATION:ABSENT exit then
+   v s" Directory" STR:= if MODEL-OBSERVATION:DIRECTORY exit then
+   v s" Present" STR:= if e LOCAL0 MODEL-OBSERVATION:PRESENT exit then
    v UNKNOWN-REASON-OF MODEL-OBSERVATION:UNKNOWN ;
 
 : REMOTE-OBSERVATION-OF ( str bool -- MODEL:observation<MODEL:remote> )
    {: v e:bool :}
-   v s" ConfirmedAbsent" STR= if MODEL-OBSERVATION:ABSENT exit then
-   v s" Directory" STR= if MODEL-OBSERVATION:DIRECTORY exit then
-   v s" Present" STR= if e REMOTE0 MODEL-OBSERVATION:PRESENT exit then
+   v s" ConfirmedAbsent" STR:= if MODEL-OBSERVATION:ABSENT exit then
+   v s" Directory" STR:= if MODEL-OBSERVATION:DIRECTORY exit then
+   v s" Present" STR:= if e REMOTE0 MODEL-OBSERVATION:PRESENT exit then
    v UNKNOWN-REASON-OF MODEL-OBSERVATION:UNKNOWN ;
 
 : DIRECTORY-OPERATION-OF ( str -- MODEL:operation )
    {: v :}
-   v s" CreateLocalDirectory" STR= if
+   v s" CreateLocalDirectory" STR:= if
       MODEL-OPERATION:CREATE-LOCAL-DIRECTORY exit then
-   v s" CreateRemoteDirectory" STR= if
+   v s" CreateRemoteDirectory" STR:= if
       MODEL-OPERATION:CREATE-REMOTE-DIRECTORY exit then
-   v s" DeleteLocalDirectory" STR= if
+   v s" DeleteLocalDirectory" STR:= if
       MODEL-OPERATION:DELETE-LOCAL-DIRECTORY exit then
    MODEL-OPERATION:DELETE-REMOTE-DIRECTORY ;
 
 : OPERATION-OF ( str bool -- MODEL:operation )
    {: v e:bool :}
-   v s" CreateRemote" STR= if
+   v s" CreateRemote" STR:= if
       e C0 MODEL-OPERATION:CREATE-REMOTE exit then
-   v s" InstallLocal" STR= if
+   v s" InstallLocal" STR:= if
       e REMOTE0 MODEL-OPERATION:INSTALL-LOCAL exit then
-   v s" PreserveLocal" STR= if
+   v s" PreserveLocal" STR:= if
       e LOCAL0 MODEL-OPERATION:PRESERVE-LOCAL exit then
-   v s" ReplaceLocal" STR= if
+   v s" ReplaceLocal" STR:= if
       e REMOTE1 e C0 MODEL-OPERATION:REPLACE-LOCAL exit then
-   v s" DeleteLocal" STR= if
+   v s" DeleteLocal" STR:= if
       e C0 MODEL-OPERATION:DELETE-LOCAL exit then
-   v s" PreserveRemote" STR= if
+   v s" PreserveRemote" STR:= if
       e REMOTE0 MODEL-OPERATION:PRESERVE-REMOTE exit then
-   v s" ReplaceRemote" STR= if
+   v s" ReplaceRemote" STR:= if
       e C1 e V0 MODEL-OPERATION:REPLACE-REMOTE exit then
-   v s" DeleteRemote" STR= if
+   v s" DeleteRemote" STR:= if
       e V0 MODEL-OPERATION:DELETE-REMOTE exit then
    v DIRECTORY-OPERATION-OF ;
 
 : CONFLICT-OF ( str bool -- MODEL:conflict )
    {: v e:bool :}
-   v s" InitialCollision" STR= if
+   v s" InitialCollision" STR:= if
       e LOCAL0 e REMOTE1 MODEL-CONFLICT:INITIAL exit then
-   v s" DivergentEdits" STR= if
+   v s" DivergentEdits" STR:= if
       e LOCAL0 e REMOTE1 MODEL-CONFLICT:DIVERGENT exit then
-   v s" LocalDeletionRemoteEdit" STR= if
+   v s" LocalDeletionRemoteEdit" STR:= if
       e REMOTE1 MODEL-CONFLICT:LOCAL-DELETED exit then
    e LOCAL0 MODEL-CONFLICT:REMOTE-DELETED ;
 
@@ -540,18 +540,18 @@ TYPED-VARIABLE W JSON:writer
 
 : BLOCKAGE-OF ( str bool -- MODEL:blockage )
    {: v e:bool :}
-   v s" UnsupportedFileSize" STR= if
+   v s" UnsupportedFileSize" STR:= if
       MODEL-BLOCKAGE:UNSUPPORTED-FILE-SIZE exit then
-   v s" RemoteRejected" STR= if
+   v s" RemoteRejected" STR:= if
       e TAG MODEL-BLOCKAGE:REMOTE-REJECTED exit then
-   v s" DownloadUnavailable" STR= if
+   v s" DownloadUnavailable" STR:= if
       409 MODEL-BLOCKAGE:DOWNLOAD-UNAVAILABLE exit then
-   v s" DownloadVerificationFailed" STR= if
+   v s" DownloadVerificationFailed" STR:= if
       MODEL-BLOCKAGE:DOWNLOAD-VERIFICATION-FAILED exit then
-   v s" StageOccupied" STR= if MODEL-BLOCKAGE:STAGE-OCCUPIED exit then
-   v s" LocalObjectInWay" STR= if
+   v s" StageOccupied" STR:= if MODEL-BLOCKAGE:STAGE-OCCUPIED exit then
+   v s" LocalObjectInWay" STR:= if
       MODEL-BLOCKAGE:LOCAL-OBJECT-IN-WAY exit then
-   v s" RemoteObject" STR= if MODEL-BLOCKAGE:REMOTE-OBJECT exit then
+   v s" RemoteObject" STR:= if MODEL-BLOCKAGE:REMOTE-OBJECT exit then
    MODEL-BLOCKAGE:CONFLICT-COPY-OCCUPIED ;
 
 \ One line's checks: its variant label, whether it is an .escapes line,
@@ -627,36 +627,36 @@ TYPED-VARIABLE W JSON:writer
 \ A label's type, then its variant and whether it is an .escapes line.
 : LABEL ( str -- str str bool )
    {: s :}
-   s PERIOD 0 SPLIT-NEXT drop {: at:n :}
+   s PERIOD 0 STR:SPLIT-NEXT drop {: at:n :}
    s str> {: l:^ lu:n :}
    l at + lu at - >str {: v :}
-   v s" .escapes" ENDS-WITH? {: e:bool :}
+   v s" .escapes" STR:ENDS-WITH? {: e:bool :}
    v STR:len {: vu:n :}
    v STR:data e if vu 8 - else vu then >str e ;
 
 : JSON-LINE ( str -- )
    {: line :}
-   line TAB 0 SPLIT-NEXT drop {: next:n :}
+   line TAB 0 STR:SPLIT-NEXT drop {: next:n :}
    LABEL {: t v e:bool :}
    line str> {: l:^ lu:n :}
    l next + lu next - >str {: j :}
    v e j
-   t s" Baseline" STR= if BASELINE-LINE exit then
-   t s" BlockReason" STR= if BLOCKAGE-LINE exit then
-   t s" Conflict" STR= if CONFLICT-LINE exit then
-   t s" ContentIdentity" STR= if HASH-LINE exit then
-   t s" DropboxRevision" STR= if REV-LINE exit then
-   t s" LocalFile" STR= if LOCAL-LINE exit then
-   t s" LocalObservation" STR= if LOCAL-OBSERVATION-LINE exit then
-   t s" Operation" STR= if OPERATION-LINE exit then
-   t s" RemoteFile" STR= if REMOTE-LINE exit then
-   t s" RemoteObservation" STR= if REMOTE-OBSERVATION-LINE exit then
-   t s" UnknownReason" STR= if REASON-LINE exit then
+   t s" Baseline" STR:= if BASELINE-LINE exit then
+   t s" BlockReason" STR:= if BLOCKAGE-LINE exit then
+   t s" Conflict" STR:= if CONFLICT-LINE exit then
+   t s" ContentIdentity" STR:= if HASH-LINE exit then
+   t s" DropboxRevision" STR:= if REV-LINE exit then
+   t s" LocalFile" STR:= if LOCAL-LINE exit then
+   t s" LocalObservation" STR:= if LOCAL-OBSERVATION-LINE exit then
+   t s" Operation" STR:= if OPERATION-LINE exit then
+   t s" RemoteFile" STR:= if REMOTE-LINE exit then
+   t s" RemoteObservation" STR:= if REMOTE-OBSERVATION-LINE exit then
+   t s" UnknownReason" STR:= if REASON-LINE exit then
    drop drop drop s" a json.tsv type" s" none" T$= ;
 
 : JSON-FROM ( str n -- n )
    {: t at:n :}
-   t LF at SPLIT-NEXT 0= if drop drop 0 exit then
+   t LF at STR:SPLIT-NEXT 0= if drop drop 0 exit then
    {: line next:n :}
    line STR:len 0= if t next RECURSE exit then
    line JSON-LINE

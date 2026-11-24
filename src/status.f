@@ -275,7 +275,7 @@ variable BEAT-LIVE              \ main thread's: BEAT is activated
    STATUS-TRANSFER:UNMAKE 2drop {: d:direction p:str :}
    STATUS-TRANSFER:UNMAKE 2drop {: e:direction q:str :}
    d e STATUS-DIRECTION:EQ 0= if false exit then
-   p q STR= ;
+   p q STR:= ;
 
 
 : HOLDS? ( transfer ^status -- bool )

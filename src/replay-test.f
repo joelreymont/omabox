@@ -239,7 +239,7 @@ private
 : ONLY-AT ( ^VEC:vector<JOURNAL:plan-record> str -- )
    {: plans a:str :}
    plans VEC:COUNT 1 T=
-   plans 0 PATH-OF a STR= TTRUE ;
+   plans 0 PATH-OF a STR:= TTRUE ;
 
 
 \ ---- recoveries ----------------------------------------------------
@@ -416,9 +416,9 @@ private
    b JOURNAL-RECOVERY--RECORD:UNMAKE {: i2 o2 p2 q2 c2 s2 t2 :}
    i JOURNAL:RECOVERY-ID>N i2 JOURNAL:RECOVERY-ID>N =
    o JOURNAL:OPERATION-ID>N o2 JOURNAL:OPERATION-ID>N = and
-   p MODEL:PATH>STR p2 MODEL:PATH>STR STR= and
-   q MODEL:PATH>STR q2 MODEL:PATH>STR STR= and
-   c DROPBOX:HASH>STR c2 DROPBOX:HASH>STR STR= and
+   p MODEL:PATH>STR p2 MODEL:PATH>STR STR:= and
+   q MODEL:PATH>STR q2 MODEL:PATH>STR STR:= and
+   c DROPBOX:HASH>STR c2 DROPBOX:HASH>STR STR:= and
    s STATUS>N s2 STATUS>N = and
    t t2 SAME-START? and ;
 
@@ -658,7 +658,7 @@ create TIMES 32 allot
 : LOCAL-OBJECT-AT? ( REPLAY:replay-blocked str -- bool )
    {: b a:str :}
    b MATCH REPLAY:replay-blocked
-      local-object OF MODEL:PATH>STR a STR= ENDOF
+      local-object OF MODEL:PATH>STR a STR:= ENDOF
       durable-plan OF drop drop false ENDOF
       fresh-observation-required OF drop false ENDOF
       download-required OF drop drop false ENDOF
@@ -1211,7 +1211,7 @@ $140 constant MODE-NO-WRITE
    code 0<> if code throw then
    t ;
 
-: LINE-COUNT ( str -- n ) 10 COUNT-CHAR ;
+: LINE-COUNT ( str -- n ) 10 STR:COUNT-CHAR ;
 
 \ A probe Dropbox fails 503 ends the pass; Rust reads the path back.
 : PROBE-UNREACHED ( ^REPLAY:link ^ARENA:arena -- )
@@ -1260,8 +1260,8 @@ $140 constant MODE-NO-WRITE
    {: t:str :}
    t LINE-COUNT 1 T=
    t s" Dropbox deleted a file that replaced the empty folder"
-   CONTAINS? TTRUE
-   t s" path=f revision=015f" CONTAINS? TTRUE ;
+   STR:CONTAINS? TTRUE
+   t s" path=f revision=015f" STR:CONTAINS? TTRUE ;
 
 : ROUTE+ ( str -- ) s"  /2/files/" SB-APPEND SB-APPEND ;
 
@@ -1303,7 +1303,7 @@ STATUS-CAP BUFFER: STATUS-BUF
 
 : SHOWS ( str ^ARENA:arena str -- )
    {: rt:str ar want:str :}
-   rt ar STATUS-TEXT want CONTAINS? TTRUE ;
+   rt ar STATUS-TEXT want STR:CONTAINS? TTRUE ;
 
 : UPLOAD-NOTES
    ( ^REPLAY:link ^LOCAL:staged-upload ^ARENA:arena
@@ -1455,7 +1455,7 @@ STATUS-CAP BUFFER: STATUS-BUF
    {: t:str :}
    t LINE-COUNT 1 T=
    t s" files/get_metadata answered 200: an incomplete entry"
-   CONTAINS? TTRUE
+   STR:CONTAINS? TTRUE
    TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
    s" /2/files/get_metadata" TEST-DROPBOX:BODIES-TO$
    S\" {\qpath\q:\q/bad.txt\q,\qinclude_deleted\q:true}" T$=
@@ -1470,7 +1470,7 @@ STATUS-CAP BUFFER: STATUS-BUF
          REPLAY:REMOTE-DELETE-FILE DROP-OUTCOME ;]
       REPLAY:E-INVALID-STATE TTHROWSQ ;] ar LOGGED {: t:str :}
    t LINE-COUNT 1 T=
-   t s" for `notes.txt`: remote delete has no revision" CONTAINS?
+   t s" for `notes.txt`: remote delete has no revision" STR:CONTAINS?
    TTRUE
    TEST-DROPBOX:SEEN$ s" " T$=
    d GONE ;
@@ -1659,7 +1659,7 @@ ARENA OFFLINE-LINKS REPLAY:link
    d [: [: MODEL-BLOCKAGE:REMOTE-OBJECT r REPLAY:BLOCK-DURABLY drop ;]
       REPLAY:E-INVALID-STATE TTHROWSQ ;] ar LOGGED {: t:str :}
    t LINE-COUNT 1 T=
-   t s" for `f`: mutation blocker lost its owning plan" CONTAINS?
+   t s" for `f`: mutation blocker lost its owning plan" STR:CONTAINS?
    TTRUE
    j JOURNAL:CLOSE
    d GONE ;
@@ -1779,7 +1779,7 @@ ARENA OFFLINE-LINKS REPLAY:link
 : SUMMARY$
    ( str REPLAY:replay-blocked str n -- str )
    {: e:str b j:str k:n :}
-   e s" blocked" STR= if b BLOCK$ else s" -" s" -" then
+   e s" blocked" STR:= if b BLOCK$ else s" -" s" -" then
    {: v:str x:str :}
    SB-RESET e SB-APPEND 32 SB-APPEND-C v SB-APPEND 32 SB-APPEND-C
    x SB-APPEND 32 SB-APPEND-C j SB-APPEND 32 SB-APPEND-C
@@ -1805,7 +1805,7 @@ ARENA OFFLINE-LINKS REPLAY:link
    del ar FOLDER-PLAN {: d:str j plan :}
    d [: o del j plan ar APPLIED$ w T$= ;] ar LOGGED {: t:str :}
    line str> nip 0= if t str> nip 0 T= else
-      t LINE-COUNT 1 T= t line CONTAINS? TTRUE
+      t LINE-COUNT 1 T= t line STR:CONTAINS? TTRUE
    then
    j JOURNAL:CLOSE
    d GONE ;
@@ -1818,7 +1818,7 @@ ARENA OFFLINE-LINKS REPLAY:link
    j NO-ROOT s" " plan ar OFFLINE ar REPLAY:PASS-OVER {: r :}
    d [: [: o r REPLAY:APPLY-FOLDER-DELETE-MUTATION drop ;]
       REPLAY:E-INVALID-STATE TTHROWSQ ;] ar LOGGED {: t:str :}
-   t LINE-COUNT 1 T= t line CONTAINS? TTRUE
+   t LINE-COUNT 1 T= t line STR:CONTAINS? TTRUE
    j ar JOURNAL$ s" pending" T$=
    j JOURNAL:CLOSE
    d GONE ;
@@ -1896,7 +1896,7 @@ TYPED-VARIABLE SENT ^LOCAL:staged-upload
 \ The event and the block, "- -" when done.
 : EVENT-BLOCK$ ( str REPLAY:replay-blocked -- str str str )
    {: e:str b :}
-   e s" blocked" STR= if e b BLOCK$ exit then
+   e s" blocked" STR:= if e b BLOCK$ exit then
    e s" -" s" -" ;
 
 \ PREPARE-UPLOAD of want for the plan, below the root r with staging s.
@@ -2418,9 +2418,9 @@ variable HELD
    r OPEN-ROOT {: root:fd :}
    TEST-DROPBOX:CUT-BODY
    root r s" docs/progress.txt" rem NO-LEASE ar STOPPED
-   ar STATUS$ PART-SHOWN$ CONTAINS? TTRUE
+   ar STATUS$ PART-SHOWN$ STR:CONTAINS? TTRUE
    root r s" docs/progress.txt" rem NO-LEASE ar STAGED-AT s" staged" AS
-   ar STATUS$ ALL-SHOWN$ CONTAINS? TTRUE
+   ar STATUS$ ALL-SHOWN$ STR:CONTAINS? TTRUE
    root FS:CLOSE-DIR
    d GONE ;
 
@@ -2497,7 +2497,7 @@ variable HELD
 \ The log t holds the line once and nothing else.
 : LOGS-ONCE ( str str -- )
    {: t:str line:str :}
-   t LINE-COUNT 1 T= t line CONTAINS? TTRUE ;
+   t LINE-COUNT 1 T= t line STR:CONTAINS? TTRUE ;
 
 \ REPLAY's line for notes.txt's copy, blocked for the reason r.
 : BLOCKED-LINE ( str -- str )
@@ -2679,7 +2679,7 @@ ARENA FILE-CASES file-case
    c FILE-CASE-DIR @ [: o c ar CASE-APPLIED$ w T$= ;] ar LOGGED
    {: t:str :}
    line str> nip 0= if t str> nip 0 T= exit then
-   t LINE-COUNT 1 T= t line CONTAINS? TTRUE ;
+   t LINE-COUNT 1 T= t line STR:CONTAINS? TTRUE ;
 
 \ The local conflict copy of the upload, relative to the root.
 : LOCAL-NAME ( ^ARENA:arena -- str )
@@ -2738,7 +2738,7 @@ ARENA FILE-CASES file-case
    c FILE-CASE-DIR @
    [: [: o c ar CASE-APPLIED$ drop ;] REPLAY:E-INVALID-STATE
       TTHROWSQ ;] ar LOGGED {: t:str :}
-   t LINE-COUNT 1 T= t line CONTAINS? TTRUE
+   t LINE-COUNT 1 T= t line STR:CONTAINS? TTRUE
    c FILE-CASE-JOURNAL @ ar NOTES$ s" pending" T$=
    c false false ar COPIES
    c ENDED ;
@@ -2942,9 +2942,9 @@ ARENA FILE-CASES file-case
    s" /2/files/download" st s" " s" " b TEST-DROPBOX:ROUTE-SCRIPT!
    rem s" blocked durable-plan download-unavailable blocked 0"
    s" download-unavailable" ar UNCOPIED {: c t:str :}
-   t LINE-COUNT 2 T= t d CONTAINS? TTRUE
+   t LINE-COUNT 2 T= t d STR:CONTAINS? TTRUE
    s" download_unavailable " SB-RESET SB-APPEND st FMT:INT$ SB-APPEND
-   SB$ ar COPIED BLOCKED-LINE t swap CONTAINS? TTRUE
+   SB$ ar COPIED BLOCKED-LINE t swap STR:CONTAINS? TTRUE
    c FILE-CASE-JOURNAL @ ar HELD-STATUS st T=
    c ENDED ;
 
@@ -3158,7 +3158,7 @@ ARENA FILE-CASES file-case
 : FRESH-AT? ( REPLAY:replay-blocked str -- bool )
    {: b a:str :}
    b MATCH REPLAY:replay-blocked
-      fresh-observation-required OF MODEL:PATH>STR a STR= ENDOF
+      fresh-observation-required OF MODEL:PATH>STR a STR:= ENDOF
       durable-plan OF drop drop false ENDOF
       local-object OF drop false ENDOF
       download-required OF drop drop false ENDOF
@@ -3173,7 +3173,7 @@ ARENA FILE-CASES file-case
 : PENDING-AT? ( REPLAY:replay-blocked str -- bool )
    {: b a:str :}
    b MATCH REPLAY:replay-blocked
-      remote-pending OF MODEL:PATH>STR a STR= ENDOF
+      remote-pending OF MODEL:PATH>STR a STR:= ENDOF
       durable-plan OF drop drop false ENDOF
       local-object OF drop false ENDOF
       fresh-observation-required OF drop false ENDOF
@@ -3319,7 +3319,7 @@ ARENA FILE-CASES file-case
 variable SIDES
 
 : SIDE? ( str -- )
-   s" .omabox-conflict-" STARTS-WITH? if 1 SIDES +! then ;
+   s" .omabox-conflict-" STR:STARTS-WITH? if 1 SIDES +! then ;
 
 \ Rust's conflict_bytes: how many conflict copies the root r holds.
 : SIDES-IN ( str -- n )
@@ -3369,7 +3369,7 @@ variable SIDES
    {: b p:str t:str :}
    b MATCH REPLAY:replay-blocked
       durable-plan OF {: at why :}
-         at MODEL:PATH>STR p STR= why BLOCKAGE$ t STR= and
+         at MODEL:PATH>STR p STR:= why BLOCKAGE$ t STR:= and
       ENDOF
       local-object OF drop false ENDOF
       fresh-observation-required OF drop false ENDOF
@@ -3439,9 +3439,9 @@ variable SIDES
    [: d [: j r s ar COPY-DENIED ;] ar LOGGED ;]
    [: r FS:MODE-PRIVATE-DIR FS:CHMOD-MODE ;] finally {: t:str :}
    t LINE-COUNT 1 T=
-   t s" Permission denied" CONTAINS? TTRUE
-   t r READ-ONLY-CLAUSE$ CONTAINS? TTRUE
-   t RUNS-AS$ CONTAINS? TTRUE
+   t s" Permission denied" STR:CONTAINS? TTRUE
+   t r READ-ONLY-CLAUSE$ STR:CONTAINS? TTRUE
+   t RUNS-AS$ STR:CONTAINS? TTRUE
    j ar JOURNAL:BLOCKED-PLANS VEC:COUNT 0 T=
    j ar JOURNAL:PENDING-PLANS VEC:COUNT 1 T=
    r ar LOCAL-SIDE ar INSIDE FS:TRY-STAT TFALSE

@@ -135,8 +135,8 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    dir s" stderr.txt" ar INSIDE {: f:str :}
    ACTION @ f ar STDERR:CAPTURING {: code:n e:str :}
    code want T=
-   e 10 COUNT-CHAR 1 T=
-   e t CONTAINS? TTRUE ;
+   e 10 STR:COUNT-CHAR 1 T=
+   e t STR:CONTAINS? TTRUE ;
 
 \ The action runs with fd 2 sent to dir/stderr.txt, which then is empty
 \ and is removed.
@@ -170,7 +170,7 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    {: t:str :}
    LINE 0 VEC:RESIZE
    10 LINE VEC:PUSH c!  t str> LINE VEC:APPEND  10 LINE VEC:PUSH c!
-   BODY BYTES$ LINE BYTES$ CONTAINS? ;
+   BODY BYTES$ LINE BYTES$ STR:CONTAINS? ;
 
 
 \ The oracle journal copied to path and brought to schema 9 in one
@@ -382,7 +382,7 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
 \ Whether BODY holds the first row's text.
 : BODY-HOLDS ( SQLITE:statement -- bool SQLITE:statement )
    SQLITE:STEP drop 0 SQLITE:COL-TEXT {: t:str :}
-   BODY BYTES$ t CONTAINS? swap ;
+   BODY BYTES$ t STR:CONTAINS? swap ;
 
 \ The journal's schema is schema.tsv's but for the baselines,
 \ remote_observations, local_observations and local_hash_cache
@@ -585,7 +585,7 @@ variable SCANNED       \ query plan rows that scan the table
    {: s:str :}
    MATCH option
       none OF false ENDOF
-      some OF DROPBOX:CURSOR>STR s STR= ENDOF
+      some OF DROPBOX:CURSOR>STR s STR:= ENDOF
    ;MATCH ;
 
 : REMOTES=
@@ -628,7 +628,7 @@ variable SCANNED       \ query plan rows that scan the table
    {: p:str :}
    MATCH option
       none OF false ENDOF
-      some OF MODEL:PATH>STR p STR= ENDOF
+      some OF MODEL:PATH>STR p STR:= ENDOF
    ;MATCH ;
 
 : NO-DIRECTORY? ( option<MODEL:path> -- bool )
@@ -639,10 +639,10 @@ variable SCANNED       \ query plan rows that scan the table
 
 : SUBTREE-PLAN-ROW ( SQLITE:statement -- SQLITE:statement )
    3 SQLITE:COL-TEXT {: a:str :}
-   a s" remote_observations_by_canonical_path" CONTAINS? if
+   a s" remote_observations_by_canonical_path" STR:CONTAINS? if
       1 INDEXED +!
    then
-   a s" SCAN remote_observations" CONTAINS? if 1 SCANNED +! then ;
+   a s" SCAN remote_observations" STR:CONTAINS? if 1 SCANNED +! then ;
 
 \ The plan of deleting what lies beneath "a".
 : SUBTREE-PLAN ( SQLITE:statement -- SQLITE:statement )
@@ -822,7 +822,7 @@ variable SCANNED       \ query plan rows that scan the table
    {: ar :}
    s" a new journal's schema is schema.tsv's and 0010.sql's" T-LABEL
    s" src/oracle/schema.tsv" ORACLE
-   BODY BYTES$ 10 COUNT-CHAR 28 T=
+   BODY BYTES$ 10 STR:COUNT-CHAR 28 T=
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
    j SCHEMA-10
@@ -984,10 +984,10 @@ variable SCANNED       \ query plan rows that scan the table
 
 \ The journal mode's name, exactly as SQLite reports it.
 : DELETE-ROW? ( SQLITE:statement -- bool SQLITE:statement )
-   SQLITE:STEP drop 0 SQLITE:COL-TEXT s" delete" STR= swap ;
+   SQLITE:STEP drop 0 SQLITE:COL-TEXT s" delete" STR:= swap ;
 
 : MEMORY-ROW? ( SQLITE:statement -- bool SQLITE:statement )
-   SQLITE:STEP drop 0 SQLITE:COL-TEXT s" memory" STR= swap ;
+   SQLITE:STEP drop 0 SQLITE:COL-TEXT s" memory" STR:= swap ;
 
 : WRITABLE-JOURNAL-USES-FULL-SYNCHRONOUS-ROLLBACK-MODE
    ( ^ARENA:arena -- )
@@ -1078,7 +1078,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    s" these bytes are text, not a SQLite database's" ;
 
 : GARBAGE-KEPT? ( str -- bool )
-   false READ-BODY BODY BYTES$ GARBAGE STR= ;
+   false READ-BODY BODY BYTES$ GARBAGE STR:= ;
 
 : GARBAGE-FILE-IS-CORRUPT ( ^ARENA:arena -- )
    {: ar :}
@@ -1270,12 +1270,12 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
       FROM sqlite_master
       WHERE type IN ('table', 'index') AND sql IS NOT NULL" [: SCHEMA-TEXT ;] SQLITE:WITH-STATEMENT
    BODY BYTES$ {: b:str :}
-   b s" oauth" CONTAINS? TFALSE
-   b s" credential" CONTAINS? TFALSE
-   b s" access_token" CONTAINS? TFALSE
-   b s" refresh_token" CONTAINS? TFALSE
-   b s" secret" CONTAINS? TFALSE
-   b s" local_root_binding" CONTAINS? TTRUE
+   b s" oauth" STR:CONTAINS? TFALSE
+   b s" credential" STR:CONTAINS? TFALSE
+   b s" access_token" STR:CONTAINS? TFALSE
+   b s" refresh_token" STR:CONTAINS? TFALSE
+   b s" secret" STR:CONTAINS? TFALSE
+   b s" local_root_binding" STR:CONTAINS? TTRUE
    j CLOSE
    d GONE ;
 
@@ -1766,7 +1766,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 : SEEN-AT ( str [ n -- str ] -- n )
    {: p:str order :}
    ROWS-SEEN @ {: k :}
-   p k order execute STR= TTRUE
+   p k order execute STR:= TTRUE
    1 ROWS-SEEN +!
    k ;
 
@@ -2126,7 +2126,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 \ or -1 past the last.
 : SCAN-PIECE ( str n ^VEC:vector<MODEL:local-record> -- n )
    {: p:str at:n v :}
-   p 32 at SPLIT-NEXT 0= if 2drop -1 exit then
+   p 32 at STR:SPLIT-NEXT 0= if 2drop -1 exit then
    {: q:str next:n :}
    q DIRECTORY-LOCAL v LOCAL+ next ;
 
@@ -2386,7 +2386,7 @@ TYPED-VARIABLE PLANS ^VEC:vector<path-plan>
 TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
 
 : PATH= ( MODEL:path MODEL:path -- bool )
-   {: a b :} a MODEL:PATH>STR b MODEL:PATH>STR STR= ;
+   {: a b :} a MODEL:PATH>STR b MODEL:PATH>STR STR:= ;
 
 \ The planner's decisions for the Rust tests' plan() calls, built here
 \ as src/oracle/plan.tsv holds them. An upload: a new local file, no
@@ -3000,7 +3000,7 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    {: a b :}
    a 0 STATUS-DEBUG {: u :}
    b u STATUS-DEBUG {: v :}
-   0 u WANT-PART u v WANT-PART STR= ;
+   0 u WANT-PART u v WANT-PART STR:= ;
 
 : ORACLE-JOURNAL-HOLDS-ITS-PLANS ( ^ARENA:arena -- )
    {: ar :}
@@ -3488,7 +3488,7 @@ variable CRAFT
    {: a b :}
    a 0 RECOVERY-DEBUG {: u :}
    b u RECOVERY-DEBUG {: v :}
-   0 u WANT-PART u v WANT-PART STR= ;
+   0 u WANT-PART u v WANT-PART STR:= ;
 
 \ retained_at in completed_recoveries is the clock journal.sqlite3 was
 \ written at, which the file holds.
@@ -4012,7 +4012,7 @@ variable CRAFT
    {: f:str t:str ar :}
    ar 16 ARENA:ALLOC drop {: buf:^ :}
    f buf 16 FS:READ-ALL {: u :}
-   buf u >str t STR= ;
+   buf u >str t STR:= ;
 
 \ Retiring a root's work leaves the payload files as they were written.
 : PAYLOADS-KEPT ( str str ^ARENA:arena -- )
@@ -4516,7 +4516,7 @@ variable CRAFT
    c update [: t 1 SQLITE:BIND-TEXT RAN ;] SQLITE:WITH-STATEMENT
    [: c MIGRATE-TYPED-COLUMNS ;] f ar STDERR:CAPTURING {: code e:str :}
    code 0= if false exit then
-   code E-JSON T=  e op CONTAINS? TTRUE
+   code E-JSON T=  e op STR:CONTAINS? TTRUE
    c s" ROLLBACK" SQLITE:EXEC
    true ;
 

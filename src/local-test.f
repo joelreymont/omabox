@@ -619,7 +619,7 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
    {: v p:str :}
    v VEC:COUNT 0 ?do
       v i VEC:AT @ {: r:MODEL:local-record :}
-      r OBSERVATION-PATH p STR= if r OPTION:SOME unloop exit then
+      r OBSERVATION-PATH p STR:= if r OPTION:SOME unloop exit then
    loop OPTION:NONE ;
 
 : KIND-AT ( ^VEC:vector<MODEL:local-record> str -- n )
@@ -651,7 +651,7 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
    {: v :}
    true v VEC:COUNT 1 max 1 ?do
       v i 1- VEC:AT @ OBSERVATION-PATH
-      v i VEC:AT @ OBSERVATION-PATH STR< and
+      v i VEC:AT @ OBSERVATION-PATH STR:< and
    loop TTRUE ;
 
 : RECORD-CONTENT ( MODEL:hash-record -- DROPBOX:hash )
@@ -675,7 +675,7 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
 : HOLDS? ( ^VEC:vector<MODEL:hash-record> str -- bool )
    {: v p:str :}
    false v VEC:COUNT 0 ?do
-      v i VEC:AT @ RECORD-PATH p STR= or
+      v i VEC:AT @ RECORD-PATH p STR:= or
    loop ;
 
 \ ---- cases
@@ -942,7 +942,7 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
    ROOT$ s" open test root" OPEN-ROOT {: root:fd :}
    s" locked.txt" DENY
    [: [: root HASH-LOCKED ;] E-UNREADABLE TTHROWSQ ;] STDERR-OF
-   s" local path `locked.txt` is a file Omabox cannot read" CONTAINS?
+   s" local path `locked.txt` is a file Omabox cannot read" STR:CONTAINS?
    TTRUE
    root DISCARD ;
 
@@ -1151,7 +1151,7 @@ variable RAISED-ERRNO
 : LOGGED ( str n -- )
    {: p:str lines:n :}
    lines 0= if p str> nip 0 T= exit then
-   p 10 COUNT-CHAR lines T= ;
+   p 10 STR:COUNT-CHAR lines T= ;
 
 \ What q throws under the scan's predicate, LOCAL's log of it holding
 \ lines lines; FS:ERRNO is q's again after the log's file calls.
@@ -1216,13 +1216,13 @@ variable RAISED-ERRNO
 
 : DIRECTORY? ( str str -- bool )
    {: e:str p:str :}
-   s" ; directory" p CLAUSE e SB$ CONTAINS? ;
+   s" ; directory" p CLAUSE e SB$ STR:CONTAINS? ;
 
 \ Where the directory clause for the name p starts in the log, -1 when
 \ it holds none.
 : CLAUSE-AT ( str str -- n )
    {: e:str p:str :}
-   s" ; directory" p CLAUSE e SB$ FIND-SUB MATCH option
+   s" ; directory" p CLAUSE e SB$ STR:FIND-SUB MATCH option
       none OF -1 ENDOF
       some OF IDX>N ENDOF
    ;MATCH ;
@@ -1232,13 +1232,13 @@ variable RAISED-ERRNO
    {: e:str k:str p:str m:str :}
    k p CLAUSE m SB-APPEND
    s"  owner uid " SB-APPEND FS:EUID FMT:INT$ SB-APPEND
-   e SB$ CONTAINS? ;
+   e SB$ STR:CONTAINS? ;
 
 : RUNS-AS? ( str -- bool )
    {: e:str :}
    SB-RESET s" ; Omabox runs as uid " SB-APPEND
    FS:EUID FMT:INT$ SB-APPEND 10 SB-APPEND-C
-   e SB$ CONTAINS? ;
+   e SB$ STR:CONTAINS? ;
 
 \ EPERM raised against a file: the one line gives the facts of the file
 \ and of its directory, and FS:ERRNO keeps EPERM.
@@ -1255,7 +1255,7 @@ variable RAISED-ERRNO
    dir DISCARD
    CAUGHT @ FS:EPERM T=
    e 1 LOGGED
-   e s" : Operation not permitted;" CONTAINS? TTRUE
+   e s" : Operation not permitted;" STR:CONTAINS? TTRUE
    e s" ; directory" s" denied" AT s" 0750" OWNED? TTRUE
    e s" ; entry" s" file.txt" s" 0640" OWNED? TTRUE
    e RUNS-AS? TTRUE ;
@@ -1277,10 +1277,10 @@ variable RAISED-ERRNO
    from DISCARD to DISCARD
    CAUGHT @ FS:EACCES T=
    e 1 LOGGED
-   e s" : Permission denied;" CONTAINS? TTRUE
+   e s" : Permission denied;" STR:CONTAINS? TTRUE
    e s" from" AT DIRECTORY? TTRUE
    e s" to" AT DIRECTORY? TTRUE
-   s" ; entry" s" file.txt" CLAUSE e SB$ CONTAINS? TTRUE
+   s" ; entry" s" file.txt" CLAUSE e SB$ STR:CONTAINS? TTRUE
    e s" from" AT CLAUSE-AT e s" to" AT CLAUSE-AT < TTRUE
    e RUNS-AS? TTRUE ;
 
@@ -1296,12 +1296,12 @@ variable RAISED-ERRNO
       E-IO TTHROWSQ FS:ERRNO CAUGHT ! ;] STDERR-OF {: e:str :}
    CAUGHT @ FS:EACCES T=
    e 2 LOGGED
-   e 10 0 SPLIT-NEXT {: a:str next:n ok:bool :}
-   a s" fs-statx: " CONTAINS? TTRUE
-   e 10 next SPLIT-NEXT {: b:str end:n more:bool :}
-   b s" local: " CONTAINS? TTRUE
+   e 10 0 STR:SPLIT-NEXT {: a:str next:n ok:bool :}
+   a s" fs-statx: " STR:CONTAINS? TTRUE
+   e 10 next STR:SPLIT-NEXT {: b:str end:n more:bool :}
+   b s" local: " STR:CONTAINS? TTRUE
    b s" : Permission denied; directory; Omabox runs as uid "
-   CONTAINS? TTRUE ;
+   STR:CONTAINS? TTRUE ;
 
 \ The errno is read before ro is writable again.
 : CREATE-DIRECTORY-DENIED-GIVES-ITS-DIRECTORY ( -- )
@@ -1317,7 +1317,7 @@ variable RAISED-ERRNO
    CAUGHT @ FS:EACCES T=
    e 1 LOGGED
    e s" ; directory" s" root/ro" AT s" 0500" OWNED? TTRUE
-   e s" ; entry" CONTAINS? TFALSE
+   e s" ; entry" STR:CONTAINS? TFALSE
    e RUNS-AS? TTRUE ;
 
 \ held exists but cannot be opened to read; root's mode is set, not left
@@ -1355,7 +1355,7 @@ variable RAISED-ERRNO
    [: LOG-OPEN MODE-0640 0 FS-STATX:IMMUTABLE FS-STATX:APPEND or
       FACTS-MAKE OPTION:SOME FACTS+ LOG:;LINE ;] STDERR-OF
    {: e:str :}
-   e s"  mode 0640 owner uid 0 immutable append-only" CONTAINS? TTRUE ;
+   e s"  mode 0640 owner uid 0 immutable append-only" STR:CONTAINS? TTRUE ;
 
 \ ---- publication
 
@@ -1398,7 +1398,7 @@ variable RAISED-ERRNO
 : SCAN-OF-A-STAND-IN-PUBLISHES-NOTHING ( -- )
    s" scan_of_a_stand_in_publishes_nothing" T-LABEL
    [: REFUSED-STAND-IN ;] STDERR-OF
-   s" does not record creation times" CONTAINS? TTRUE
+   s" does not record creation times" STR:CONTAINS? TTRUE
    [: STAND-IN-PUBLISHES-NOTHING ;] WITH-JOURNAL ;
 
 \ Rust's scan_and_publish_at with all_cache_entries_stable completing.
@@ -1728,7 +1728,7 @@ SHA256-CTX-BYTES BUFFER: PART
    bytes str> nip {: u:n :}
    bytes START
    dir COPY {: c:str f:fd :}
-   [: c want T$= f back u READ-BACK bytes back u >str STR= TTRUE ;]
+   [: c want T$= f back u READ-BACK bytes back u >str STR:= TTRUE ;]
    [: f FS:CLOSE-DIR ;] finally ;
 
 \ Case i takes length arm i mod 9 and schedule arm i mod 3.
@@ -1806,8 +1806,8 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    [: [: f p MARK ;] LOCAL:E-IO TTHROWSQ FS:ERRNO FS:EEXIST T= ;]
    LOG-PATH AR @ STDERR:CAPTURING {: code:n e:str :}
    code 0<> if code throw then
-   e 10 COUNT-CHAR 1 T=
-   e s" xattr: fsetxattr" CONTAINS? TTRUE ;
+   e 10 STR:COUNT-CHAR 1 T=
+   e s" xattr: fsetxattr" STR:CONTAINS? TTRUE ;
 
 : MARKER-CHECKS ( fd -- )
    {: f:fd :}
@@ -1949,7 +1949,7 @@ FS:PATHZ-CAP BUFFER: LOG-AT
 
 : SAME-HASH? ( DROPBOX:hash DROPBOX:hash -- bool )
    {: a:DROPBOX:hash b:DROPBOX:hash :}
-   a DROPBOX:HASH>STR b DROPBOX:HASH>STR STR= ;
+   a DROPBOX:HASH>STR b DROPBOX:HASH>STR STR:= ;
 
 \ The entries local.rs's collection test lays in the staging directory.
 : COLLECTION-ENTRIES ( DROPBOX:hash DROPBOX:hash DROPBOX:hash -- )
@@ -2076,7 +2076,7 @@ FS:PATHZ-CAP BUFFER: LOG-AT
 \ The byte the two hex digits at p spell.
 : HEX-BYTE ( ^u8 -- n )
    {: p:^ :}
-   p c@ STR-HEX-DIGIT-VALUE 4 lshift p 1+ c@ STR-HEX-DIGIT-VALUE or ;
+   p c@ STR:HEX-DIGIT-VALUE 4 lshift p 1+ c@ STR:HEX-DIGIT-VALUE or ;
 
 \ The bytes the hex digits spell, valid until the next.
 : UNHEX ( str -- str )
@@ -3356,7 +3356,7 @@ FS:PATHZ-CAP BUFFER: SLOT-FILE-BUF
 : PROJECTED ( CONFIG:abs-path -- )
    CONFIG:ABS-PATH>STR str> {: p:^ u:n :}
    PHYSICAL-U @ {: k:n :}
-   u k > if p k >str PHYSICAL$ STR= p k + c@ $2F = and else false then
+   u k > if p k >str PHYSICAL$ STR:= p k + c@ $2F = and else false then
    TTRUE ;
 
 : STAGED-SLOT? ( n -- bool )

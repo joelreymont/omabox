@@ -216,7 +216,7 @@ $2E constant DOT
    {: s dst:^ cap:n :}
    s str> {: p:^ u:n :}
    s UTF8:VALID? if s dst cap UNICODE:LOWER exit then
-   u 0 ?do p i + c@ ASCII-LOWER dst i + c! loop
+   u 0 ?do p i + c@ STR:ASCII-LOWER dst i + c! loop
    u ;
 
 \ The bytes a component adds after `len`.
@@ -236,7 +236,7 @@ $2E constant DOT
 \ false past the last.
 : NEXT-PART ( str n -- str n bool )
    {: p at:n :}
-   p SLASH at SPLIT-NEXT 0= if false exit then
+   p SLASH at STR:SPLIT-NEXT 0= if false exit then
    {: q next:n :}
    q PART? if q next true exit then
    p next RECURSE ;
@@ -264,7 +264,7 @@ $2E constant DOT
    at 0 < if -1 exit then
    p at NEXT-PART 0= if drop drop -1 exit then
    {: a next:n :}
-   a q STR= if next exit then
+   a q STR:= if next exit then
    -1 ;
 
 : BYTES ( key -- str ) KEY>STR ;
@@ -280,7 +280,7 @@ $2E constant DOT
 
 : PATH= ( path path -- bool )
    {: a:path b:path :}
-   a PATH>STR b PATH>STR STR= ;
+   a PATH>STR b PATH>STR STR:= ;
 
 \ A value's variant and the strings it holds, empty where it holds none.
 STRUCTURE form
@@ -297,9 +297,9 @@ STRUCTURE form
    a FORM-UNMAKE {: v:n x:str y:str z:str :}
    b FORM-UNMAKE {: w:n x2:str y2:str z2:str :}
    v w <> if false exit then
-   x x2 STR= 0= if false exit then
-   y y2 STR= 0= if false exit then
-   z z2 STR= ;
+   x x2 STR:= 0= if false exit then
+   y y2 STR:= 0= if false exit then
+   z z2 STR:= ;
 
 : LOCAL-FORM ( n local -- form )
    MODEL-LOCAL:UNMAKE DROPBOX:HASH>STR NONE NONE FORM-MAKE ;
@@ -431,11 +431,11 @@ public
 \ equal or after the second's.
 : KEY-CMP ( key key -- n )
    {: a:key b:key :}
-   a BYTES b BYTES STR= if 0 exit then
-   a BYTES b BYTES STR< if -1 exit then
+   a BYTES b BYTES STR:= if 0 exit then
+   a BYTES b BYTES STR:< if -1 exit then
    1 ;
 
-: KEY= ( key key -- bool ) {: a:key b:key :} a BYTES b BYTES STR= ;
+: KEY= ( key key -- bool ) {: a:key b:key :} a BYTES b BYTES STR:= ;
 
 \ True when the first key is strictly beneath the second.
 : BENEATH? ( key key -- bool )
@@ -443,7 +443,7 @@ public
    k BYTES str> {: p:^ u:n :}
    top BYTES str> {: q:^ v:n :}
    u v <= if false exit then
-   p v >str q v >str STR= 0= if false exit then
+   p v >str q v >str STR:= 0= if false exit then
    p v + c@ SLASH = ;
 
 \ The half-open byte range from the key then "/" to the key then the
@@ -460,7 +460,7 @@ public
    {: a:path b:path :}
    a PATH>STR {: p :}
    b PATH>STR {: q :}
-   p STR:data p LEAD >str q STR:data q LEAD >str STR=
+   p STR:data p LEAD >str q STR:data q LEAD >str STR:=
    0= if false exit then
    q [: p MATCH-PART ;] PARTS 0 >= ;
 
@@ -486,7 +486,7 @@ private
    then
    p at NEXT-PART 0= if drop drop a 0 >str END-RANK at exit then
    {: q next:n :}
-   q s" .." STR= if q PARENT-RANK next exit then
+   q s" .." STR:= if q PARENT-RANK next exit then
    q NAME-RANK next ;
 
 \ The components from i in p and j in q: the indices after them, their
@@ -497,8 +497,8 @@ private
    q j COMPONENT {: y yr:n j2:n :}
    xr yr <> if i2 j2 xr yr - false exit then
    xr END-RANK = if i2 j2 0 false exit then
-   x y STR= if i2 j2 0 true exit then
-   i2 j2 x y STR< if -1 else 1 then false ;
+   x y STR:= if i2 j2 0 true exit then
+   i2 j2 x y STR:< if -1 else 1 then false ;
 
 public
 
@@ -518,7 +518,7 @@ private
    s str> {: p:^ u:n :}
    x STR:len {: xu:n :}
    u xu < if false exit then
-   p u + xu - xu >str x STR=CI ;
+   p u + xu - xu >str x STR:=CI ;
 
 public
 
@@ -526,8 +526,8 @@ public
 \ suffixes in any ASCII case (help.dropbox.com/en-en/sync/files-not-syncing).
 : EXCLUDED-NAME? ( str -- bool )
    {: p :}
-   p s" ~$" STARTS-WITH? if true exit then
-   p s" .~" STARTS-WITH? if true exit then
+   p s" ~$" STR:STARTS-WITH? if true exit then
+   p s" .~" STR:STARTS-WITH? if true exit then
    p s" desktop.ini" SUFFIX-CI? if true exit then
    p s" thumbs.db" SUFFIX-CI? if true exit then
    p s" .ds_store" SUFFIX-CI? if true exit then
@@ -967,7 +967,7 @@ ARENA CURSORS JSON:cursor
 \ serde_json reads -0 as a float, which no integer field takes.
 : I64-HERE ( JSON:reader -- JSON:reader n )
    JSON:READ-TOKEN JSON:T-INT EXPECT
-   JSON:READ-SPAN$ >str s" -0" STR= if E-STORED throw then
+   JSON:READ-SPAN$ >str s" -0" STR:= if E-STORED throw then
    JSON:READ-INT ;
 
 : READ-I64 ( ^u8 n reading -- n )

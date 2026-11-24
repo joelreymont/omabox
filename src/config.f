@@ -318,7 +318,7 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
    r STR:len {: ru:n :}
    ru 1 = if true exit then
    u ru < if false exit then
-   a ru >str r STR= 0= if false exit then
+   a ru >str r STR:= 0= if false exit then
    u ru = if true exit then
    a ru + c@ FS:SLASH = ;
 
@@ -1014,8 +1014,8 @@ ARENA READERS reader
 
 : ASSIGN ( ^reader str str -- )
    {: r k v :}
-   k s" sync_root" STR= if r r READER-ROOT v SET exit then
-   k s" dropbox_app_key" STR= if r r READER-KEY v SET exit then
+   k s" sync_root" STR:= if r r READER-ROOT v SET exit then
+   k s" dropbox_app_key" STR:= if r r READER-KEY v SET exit then
    r BAD ;
 
 : KEYVAL ( ^reader -- )

@@ -524,7 +524,7 @@ TYPED-VARIABLE OUTCOME bool
 \ ERR$ is one line that holds the text.
 : LOGGED? ( str -- bool )
    {: t :}
-   ERR$ LINES 1 = ERR$ t CONTAINS? and ;
+   ERR$ LINES 1 = ERR$ t STR:CONTAINS? and ;
 
 
 \ A case's own client, for an action LOGGED runs.
@@ -1041,9 +1041,9 @@ variable WIDEST
 
 : NTH? ( str n -- bool )
    {: s i:n :}
-   s s" /sync/d" STARTS-WITH? 0= if false exit then
+   s s" /sync/d" STR:STARTS-WITH? 0= if false exit then
    s str> {: p:^ u:n :}
-   p 7 + u 7 - >str i FMT:INT$ STR= ;
+   p 7 + u 7 - >str i FMT:INT$ STR:= ;
 
 
 : TALLIED ( ^DROPBOX:entry -- )
@@ -1616,7 +1616,7 @@ TYPED-VARIABLE ZEROED bool
    [: at size f ZEROED-BODY ;] catch {: code:n :}
    code BODY-CODE !
    code 0= if exit then
-   code ERROR:TEXT$ UNVERIFIED$ STR= 0= if code throw then ;
+   code ERROR:TEXT$ UNVERIFIED$ STR:= 0= if code throw then ;
 
 
 variable AGAIN-CODE
@@ -1738,7 +1738,7 @@ variable AGAIN-CODE
    BODIES @ 1 T=
    BODY-CODE @ ERROR:TEXT$ LOST$ T$=
    SUNK-U @ 10 <= TTRUE
-   SUNK$ s" abcdefghij" str> SUNK-U @ min >str STR= TTRUE
+   SUNK$ s" abcdefghij" str> SUNK-U @ min >str STR:= TTRUE
    USABLE ;
 
 
@@ -1747,7 +1747,7 @@ variable AGAIN-CODE
    {: at:n size:n f :}
    [: at size f CODED-BODY ;] catch {: code:n :}
    code 0= if exit then
-   code ERROR:TEXT$ LOST$ STR= 0= if code throw then ;
+   code ERROR:TEXT$ LOST$ STR:= 0= if code throw then ;
 
 
 \ A body that catches the transfer lost inside it and returns: the answer
@@ -2348,7 +2348,7 @@ TYPED-VARIABLE FAULT fault
    s" up.txt" STAGE! s" hello upload" s" /Replace.txt" s" expected-rev" STAGED
    SEND DROPBOX:DONE? ASSERT
    ENTRY-HASH$ EXPECTED$ T$=
-   MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:REV @ SPAN:$ s" expected-rev" STR= TFALSE
+   MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:REV @ SPAN:$ s" expected-rev" STR:= TFALSE
    SB-RESET S\" {\qpath\q:\q/Replace.txt\q,\qmode\q:" SB-APPEND
    S\" {\q.tag\q:\qupdate\q,\qupdate\q:\qexpected-rev\q}," SB-APPEND
    S\" \qautorename\q:false,\qstrict_conflict\q:true," SB-APPEND
@@ -2432,7 +2432,7 @@ TYPED-VARIABLE FAULT fault
    SB-RESET s" error dropbox: upload of " SB-APPEND
    UP DROPBOX-UPLOAD:PATH @ SPAN:$ SB-APPEND
    s" : " SB-APPEND why SB-APPEND
-   ERR$ SB$ CONTAINS? ;
+   ERR$ SB$ STR:CONTAINS? ;
 
 
 \ A stage shorter than the size UPLOAD was given.
@@ -2930,7 +2930,7 @@ TYPED-VARIABLE FAULT fault
 
 \ OUTCOME: LINK of /Sync on OWN answered failed.
 : LINK-FAILED ( -- )
-   s" /Sync" OWN @ AR @ DROPBOX:LINK CHECK$ s" failed" STR= OUTCOME ! ;
+   s" /Sync" OWN @ AR @ DROPBOX:LINK CHECK$ s" failed" STR:= OUTCOME ! ;
 
 
 \ LINK of /Sync on a client whose call to the route rt answers 503 answers
@@ -2986,7 +2986,7 @@ TYPED-VARIABLE FAULT fault
 
 \ OUTCOME: CHECK-ROOT of /Sync on OWN answered unavailable.
 : ROOT-UNAVAILABLE ( -- )
-   s" /Sync" OWN @ DROPBOX:CHECK-ROOT CHECK$ s" unavailable" STR=
+   s" /Sync" OWN @ DROPBOX:CHECK-ROOT CHECK$ s" unavailable" STR:=
    OUTCOME ! ;
 
 

@@ -240,7 +240,7 @@ variable DROPPED
    d s" omabox/status.json" ar TEST-CLIENT:INSIDE
    SEEN-JSON SEEN-CAP FS:READ-ALL
    {: u :}
-   SEEN-JSON u >str t CONTAINS? TTRUE ;
+   SEEN-JSON u >str t STR:CONTAINS? TTRUE ;
 
 \ XDG under DIR/config and DIR/state, the sync root at root.
 : CASE-CONFIG ( str CONFIG:abs-path ^ARENA:arena -- ^CONFIG:config )

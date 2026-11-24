@@ -107,7 +107,7 @@ DEFTYPE CURSOR str
 
 : HASH= ( hash hash -- bool )
    {: a:hash b:hash :}
-   a HASH>STR b HASH>STR STR= ;
+   a HASH>STR b HASH>STR STR:= ;
 
 \ rev, content-hash, size and downloadable are a file's alone: empty, 0 and
 \ true for any other kind; lower and display are path_lower and path_display.
@@ -508,7 +508,7 @@ HEAP:ALLOCATOR VEC-ALLOC !
    nm STR:len {: nu:n :}
    u nu > 0= if false exit then
    a nu + c@ 58 <> if false exit then
-   a nu >str nm STR=CI ;
+   a nu >str nm STR:=CI ;
 
 
 \ The trimmed value of the header name in the answer's head, else empty.
@@ -520,7 +520,7 @@ HEAP:ALLOCATOR VEC-ALLOC !
    0 begin dup u < while
       head swap LINE >r
       dup nm NAMES? if
-         r> drop str> swap nu 1+ + swap nu 1+ - >str TRIM exit
+         r> drop str> swap nu 1+ + swap nu 1+ - >str STR:TRIM exit
       then
       drop r>
    repeat drop head STR:data 0 >str ;
@@ -528,15 +528,17 @@ HEAP:ALLOCATOR VEC-ALLOC !
 
 \ The longest wait in seconds, 15 minutes.
 900 constant WAIT-CAP
+\ Delta-seconds are decimal.
+10 constant RADIX
 
 
 \ Delta-seconds: digits only, any number of them, at most WAIT-CAP.
 : DELTA-SECONDS ( str -- option<n> )
    {: s :}
    s str> {: a:^ u:n :}
-   s STR-DIGITS? 0= if OPTION:NONE exit then
+   s STR:DIGITS? 0= if OPTION:NONE exit then
    0 0 begin dup u < while
-      swap STR-BASE * over a + c@ STR-DIGIT-VALUE +
+      swap RADIX * over a + c@ STR:DIGIT-VALUE +
       WAIT-CAP min swap 1+
    repeat drop OPTION:SOME ;
 
@@ -683,28 +685,28 @@ HEAP:ALLOCATOR VEC-ALLOC !
 : LEAF$ ( ^client -- str )
    {: c :}
    c CLIENT-LEAF-NAME @ SPAN:$ {: m :}
-   m c TAG$ STR= m s" reason" STR= or
+   m c TAG$ STR:= m s" reason" STR:= or
    c CLIENT-LEAF @ SPAN:LEN 0<> and if c CLIENT-LEAF @ SPAN:$ exit then
    c TAG$ ;
 
 
 : TAG>ERROR ( str -- error bool )
-   dup s" not_found" STR= if drop construct error not-found true exit then
-   dup s" not_file" STR= if drop construct error not-file true exit then
-   dup s" not_folder" STR= if drop construct error not-folder true exit then
-   dup s" malformed_path" STR= if drop construct error malformed-path true exit then
-   dup s" disallowed_name" STR= if drop construct error disallowed-name true exit then
-   dup s" conflict" STR= if drop construct error conflict true exit then
-   dup s" no_write_permission" STR= if drop construct error no-write-permission true exit then
-   dup s" restricted_content" STR= if drop construct error restricted-content true exit then
-   dup s" access_restricted" STR= if drop construct error access-restricted true exit then
-   dup s" team_folder" STR= if drop construct error team-folder true exit then
-   dup s" operation_suppressed" STR= if drop construct error operation-suppressed true exit then
-   dup s" insufficient_space" STR= if drop construct error insufficient-space true exit then
-   dup s" locked" STR= if drop construct error locked true exit then
-   dup s" reset" STR= if drop construct error reset true exit then
-   dup s" content_hash_mismatch" STR= if drop construct error content-hash-mismatch true exit then
-   dup s" unsupported_file" STR= if drop construct error unsupported-file true exit then
+   dup s" not_found" STR:= if drop construct error not-found true exit then
+   dup s" not_file" STR:= if drop construct error not-file true exit then
+   dup s" not_folder" STR:= if drop construct error not-folder true exit then
+   dup s" malformed_path" STR:= if drop construct error malformed-path true exit then
+   dup s" disallowed_name" STR:= if drop construct error disallowed-name true exit then
+   dup s" conflict" STR:= if drop construct error conflict true exit then
+   dup s" no_write_permission" STR:= if drop construct error no-write-permission true exit then
+   dup s" restricted_content" STR:= if drop construct error restricted-content true exit then
+   dup s" access_restricted" STR:= if drop construct error access-restricted true exit then
+   dup s" team_folder" STR:= if drop construct error team-folder true exit then
+   dup s" operation_suppressed" STR:= if drop construct error operation-suppressed true exit then
+   dup s" insufficient_space" STR:= if drop construct error insufficient-space true exit then
+   dup s" locked" STR:= if drop construct error locked true exit then
+   dup s" reset" STR:= if drop construct error reset true exit then
+   dup s" content_hash_mismatch" STR:= if drop construct error content-hash-mismatch true exit then
+   dup s" unsupported_file" STR:= if drop construct error unsupported-file true exit then
    drop construct error other false ;
 
 
@@ -790,7 +792,7 @@ HEAP:ALLOCATOR VEC-ALLOC !
    {: c :}
    c ERROR-READ? 0= if c s" an error that does not parse" E-ANSWER FAILED then
    c LEAF$ {: t :}
-   t s" too_many_write_operations" STR= if 0 RETRY exit then
+   t s" too_many_write_operations" STR:= if 0 RETRY exit then
    t TAG>ERROR if construct reply refused exit then
    LOG:WARN s" dropbox" LOG:LINE
    c CLIENT-ROUTE @ SPAN:$ LOG:TEXT+ s"  refused: " LOG:TEXT+ t LOG:TEXT+
@@ -825,7 +827,7 @@ HEAP:ALLOCATOR VEC-ALLOC !
 
 : UNRESERVED? ( n -- bool )
    {: b:n :}
-   b STR-DIGIT? b ASCII-LOWER dup 97 >= swap 122 <= and or
+   b STR:DIGIT? b STR:ASCII-LOWER dup 97 >= swap 122 <= and or
    b 45 = or b 46 = or b 95 = or b 126 = or ;
 
 
@@ -916,7 +918,7 @@ HEAP:ALLOCATOR VEC-ALLOC !
    {: c :}
    c CLIENT-GRANTED @ SPAN:$ {: g :}
    g STR:len 0= if 0 exit then
-   g c CLIENT-TOKEN @ BUF$ STR= if 0 exit then
+   g c CLIENT-TOKEN @ BUF$ STR:= if 0 exit then
    c CLIENT-GRANTED @ c CLIENT-TOKEN @ REPLACED
    c PERSIST ;
 
@@ -946,7 +948,7 @@ HEAP:ALLOCATOR VEC-ALLOC !
 : GRANT ( ^client [ ^client -- reply ] -- reply )
    {: c dead :}
    c ERROR-READ? if
-      c TAG$ s" invalid_grant" STR= if c dead execute exit then
+      c TAG$ s" invalid_grant" STR:= if c dead execute exit then
    then
    c s" a refused token request" E-BAD-REQUEST FAILED ;
 
@@ -1113,7 +1115,7 @@ private
 \ Whether root_info's tag is user or team, the roots that carry a namespace.
 : NAMED-ROOT? ( ^client -- bool )
    CLIENT-ROOT-TAG @ SPAN:$ {: t :}
-   t s" user" STR= t s" team" STR= or ;
+   t s" user" STR:= t s" team" STR:= or ;
 
 
 \ A root under any other tag, which Dropbox's open union may add, answers
@@ -1421,7 +1423,7 @@ private
    s 206 <> if c s" a whole file for a range" E-UNVERIFIED FAILED then
    at e DROPBOX-ENTRY:SIZE @ >=
    if c s" a range past the file" E-UNVERIFIED FAILED then
-   c s" Content-Range" HEADER$ c at e RANGE-LINE STR=
+   c s" Content-Range" HEADER$ c at e RANGE-LINE STR:=
    0= if c s" another Content-Range" E-UNVERIFIED FAILED then ;
 
 
@@ -1431,9 +1433,9 @@ private
    {: c r h at:n :}
    c RESULT-READ
    c CLIENT-ENTRY {: e :}
-   e DROPBOX-ENTRY:REV @ SPAN:$ r STR=
+   e DROPBOX-ENTRY:REV @ SPAN:$ r STR:=
    0= if c s" another rev" E-UNVERIFIED FAILED then
-   e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$ h STR=
+   e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$ h STR:=
    0= if c s" another content hash" E-UNVERIFIED FAILED then
    c at e RANGED ;
 
@@ -1843,7 +1845,7 @@ private
    {: f body :}
    f FETCH-CLIENT @ {: c :}
    f FETCH-OFFSET @ {: at:n :}
-   c s" Content-Range" HEADER$ c at LENGTH-LINE STR=
+   c s" Content-Range" HEADER$ c at LENGTH-LINE STR:=
    0= if c f FETCH-REV @ f FETCH-CONTENT-HASH @ body AFRESH exit then
    at at f body execute
    construct reply done ;
@@ -2039,7 +2041,7 @@ private
 \ Whether the page's cursor is the one sent.
 : STALE? ( ^client -- bool )
    {: c :}
-   c CLIENT-PAGE @ SPAN:$ c CLIENT-SENT @ BUF$ STR= ;
+   c CLIENT-PAGE @ SPAN:$ c CLIENT-SENT @ BUF$ STR:= ;
 
 
 \ Reads and checks a page; one with more whose cursor is the one sent
@@ -2274,7 +2276,7 @@ private
    p c AT? 0= if false exit then
    r STR:len 0= if true exit then
    c CLIENT-ENTRY {: e :}
-   e FILE? e DROPBOX-ENTRY:REV @ SPAN:$ r STR= and ;
+   e FILE? e DROPBOX-ENTRY:REV @ SPAN:$ r STR:= and ;
 
 
 : MADE-READ ( str ^client -- bool )
@@ -2442,14 +2444,14 @@ $2F constant SEPARATOR
 : INVALID-COMPONENT? ( str -- bool )
    {: p :}
    p STR:len 0= if true exit then
-   p s" ." STR= p s" .." STR= or if true exit then
-   p 0 COUNT-CHAR 0<> ;
+   p s" ." STR:= p s" .." STR:= or if true exit then
+   p 0 STR:COUNT-CHAR 0<> ;
 
 \ Whether the separated part from at is invalid; the index after it,
 \ or -1 past the last.
 : PART-INVALID ( str n -- bool n )
    {: p at:n :}
-   p SEPARATOR at SPLIT-NEXT 0= if drop drop false -1 exit then
+   p SEPARATOR at STR:SPLIT-NEXT 0= if drop drop false -1 exit then
    {: s next:n :}
    s INVALID-COMPONENT? next ;
 
@@ -2911,7 +2913,7 @@ HEAP RUNS run
    c CLIENT-ENTRY COMPLETE? 0= if false exit then
    up DROPBOX-UPLOAD:PATH @ SPAN:$ c AT? 0= if false exit then
    c CLIENT-ENTRY DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$
-   up DROPBOX-UPLOAD:CONTENT-HASH @ SPAN:$ STR= ;
+   up DROPBOX-UPLOAD:CONTENT-HASH @ SPAN:$ STR:= ;
 
 
 : REFUSAL? ( reply -- bool )
@@ -2926,8 +2928,8 @@ HEAP RUNS run
 \ A session Dropbox no longer takes chunks for.
 : GONE-TAG? ( str -- bool )
    {: t :}
-   t s" not_found" STR= t s" closed" STR= or
-   t s" incorrect_offset" STR= or ;
+   t s" not_found" STR:= t s" closed" STR:= or
+   t s" incorrect_offset" STR:= or ;
 
 
 \ incorrect_offset at the chunk's end: Dropbox already holds the chunk.
@@ -2935,7 +2937,7 @@ HEAP RUNS run
    {: rep:reply r :}
    rep REFUSAL? 0= if false exit then
    r RUN-CLIENT @ {: c :}
-   c TAG$ s" incorrect_offset" STR=
+   c TAG$ s" incorrect_offset" STR:=
    c CLIENT-CORRECT @ r RUN-ACCEPTED @ r RUN-CHUNK @ + = and ;
 
 
@@ -2948,7 +2950,7 @@ HEAP RUNS run
 : FINISH-GONE? ( reply ^client -- bool )
    {: rep:reply c :}
    rep REFUSAL? 0= if false exit then
-   c TAG$ s" lookup_failed" STR= c LEAF$ GONE-TAG? and ;
+   c TAG$ s" lookup_failed" STR:= c LEAF$ GONE-TAG? and ;
 
 
 : SESSION-MEMBER ( JSON:reader ^client ^run -- JSON:reader )
@@ -3064,7 +3066,7 @@ ENUM restart-event once twice ;ENUM
    m DONE? 0= if construct confirm-event other exit then
    c CLIENT-ENTRY {: e :}
    e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$
-   up DROPBOX-UPLOAD:CONTENT-HASH @ SPAN:$ STR= e COMPLETE? and
+   up DROPBOX-UPLOAD:CONTENT-HASH @ SPAN:$ STR:= e COMPLETE? and
    if construct confirm-event same exit then
    construct confirm-event other ;
 

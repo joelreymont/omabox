@@ -136,9 +136,9 @@ FILL-FILLER
    ACTION @ LOG-PATH LOG-PATH-U @ >str AR @ STDERR:CAPTURING
    {: code:n e:str :}
    code want T=
-   e 10 COUNT-CHAR 1 T=
-   e t CONTAINS? TTRUE
-   e s" sentinel" CONTAINS? TFALSE ;
+   e 10 STR:COUNT-CHAR 1 T=
+   e t STR:CONTAINS? TTRUE
+   e s" sentinel" STR:CONTAINS? TFALSE ;
 
 : SCRATCH-OPEN ( -- )
    s" auth-test" FS:MKTEMP-DIR str> {: d:^ du :}
@@ -373,7 +373,7 @@ FILL-FILLER
 
 : URL-SAFE? ( n -- bool )
    {: b:n :}
-   b STR-ALNUM? b [char] - = or b [char] _ = or ;
+   b STR:ALNUM? b [char] - = or b [char] _ = or ;
 
 : PROOF-SHAPE ( str -- )
    str> {: v:^ u:n :}
@@ -387,7 +387,7 @@ FILL-FILLER
    s" app-key" ar START {: b :}
    a VERIFIER PROOF-SHAPE
    b VERIFIER PROOF-SHAPE
-   a VERIFIER b VERIFIER STR= TFALSE ;
+   a VERIFIER b VERIFIER STR:= TFALSE ;
 
 
 : CASES ( ^ARENA:arena -- )

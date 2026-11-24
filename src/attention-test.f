@@ -236,19 +236,19 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
 \ Nothing the journal holds but paths and texts shows.
 : OMITS ( str -- )
    {: r:str :}
-   r s" absolute-state-sentinel" CONTAINS? TFALSE
-   r s" cursor-must-not-render" CONTAINS? TFALSE
-   r s" content-id-must-not-render" CONTAINS? TFALSE
-   r s" revision-must-not-render" CONTAINS? TFALSE
-   r s" blocked-content-must-not-render" CONTAINS? TFALSE
-   r s" blocked-revision-must-not-render" CONTAINS? TFALSE
-   r s" local-secret-sentinel" CONTAINS? TFALSE
-   r s" remote-secret-sentinel" CONTAINS? TFALSE
-   r s" account-id-must-not-render" CONTAINS? TFALSE
-   r s" namespace-id-must-not-render" CONTAINS? TFALSE
-   r s" remote-root-must-not-render" CONTAINS? TFALSE
-   r s" b-diverged.txt" CONTAINS? TFALSE
-   r s" c-diverged.txt" CONTAINS? TFALSE ;
+   r s" absolute-state-sentinel" STR:CONTAINS? TFALSE
+   r s" cursor-must-not-render" STR:CONTAINS? TFALSE
+   r s" content-id-must-not-render" STR:CONTAINS? TFALSE
+   r s" revision-must-not-render" STR:CONTAINS? TFALSE
+   r s" blocked-content-must-not-render" STR:CONTAINS? TFALSE
+   r s" blocked-revision-must-not-render" STR:CONTAINS? TFALSE
+   r s" local-secret-sentinel" STR:CONTAINS? TFALSE
+   r s" remote-secret-sentinel" STR:CONTAINS? TFALSE
+   r s" account-id-must-not-render" STR:CONTAINS? TFALSE
+   r s" namespace-id-must-not-render" STR:CONTAINS? TFALSE
+   r s" remote-root-must-not-render" STR:CONTAINS? TFALSE
+   r s" b-diverged.txt" STR:CONTAINS? TFALSE
+   r s" c-diverged.txt" STR:CONTAINS? TFALSE ;
 
 : STATUS-SNAPSHOT-IS-SORTED-AND-OMITS-INTERNAL-VALUES ( ^ARENA:arena -- )
    {: ar :}
@@ -309,14 +309,14 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
    d s" absolute-journal-path-sentinel" ar INSIDE {: p:str :}
    p SQLITE:OPEN SQLITE:CLOSE
    p ATTENTION:E-JOURNAL d ar REFUSED drop {: e:str :}
-   e s" absolute-journal-path-sentinel" CONTAINS? TFALSE
+   e s" absolute-journal-path-sentinel" STR:CONTAINS? TFALSE
    e FIRST-LINE swap
    s" journal: journal `[Omabox journal]` has unsupported schema version 0; supported version is 10"
-   ENDS-WITH? TTRUE
+   STR:ENDS-WITH? TTRUE
    FIRST-LINE swap
-   s" attention: could not open the journal read-only" ENDS-WITH? TTRUE
+   s" attention: could not open the journal read-only" STR:ENDS-WITH? TTRUE
    FIRST-LINE {: rest:str :}
-   HELP$ ENDS-WITH? TTRUE
+   HELP$ STR:ENDS-WITH? TTRUE
    rest STR:len 0 T=
    d GONE ;
 
@@ -333,9 +333,9 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
    p ATTENTION:E-INSPECT d ar REFUSED {: e:str cause:n :}
    cause FS:ENOTDIR T=
    e FIRST-LINE swap
-   s" attention: could not inspect Omabox setup state" ENDS-WITH? TTRUE
+   s" attention: could not inspect Omabox setup state" STR:ENDS-WITH? TTRUE
    FIRST-LINE {: rest:str :}
-   HELP$ ENDS-WITH? TTRUE
+   HELP$ STR:ENDS-WITH? TTRUE
    rest STR:len 0 T=
    d GONE ;
 

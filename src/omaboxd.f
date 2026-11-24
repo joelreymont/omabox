@@ -26,7 +26,7 @@ FUNCTION: MALLOPT mallopt ( i32 i32 -- i32 )
 
 : SELF-CHECK? ( -- bool )
    SCRIPT-ARGC 1 <> if false exit then
-   0 SCRIPT-ARGV$ s" --self-check" STR= ;
+   0 SCRIPT-ARGV$ s" --self-check" STR:= ;
 
 \ A write the reader cannot take throws, as Rust's println! panics.
 : SELF-CHECK ( -- )

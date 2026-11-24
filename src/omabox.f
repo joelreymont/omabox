@@ -431,11 +431,11 @@ ARENA JOURNALS JOURNAL:journal
 
 : HELP? ( str -- bool )
    {: a:str :}
-   a s" --help" STR= a s" -h" STR= or a s" help" STR= or ;
+   a s" --help" STR:= a s" -h" STR:= or a s" help" STR:= or ;
 
 : VERSION? ( str -- bool )
    {: a:str :}
-   a s" --version" STR= a s" -V" STR= or ;
+   a s" --version" STR:= a s" -V" STR:= or ;
 
 : ACTION-COMMAND ( SERVICE:action -- option<command> )
    COMMAND-SERVICE OPTION:SOME ;
@@ -446,25 +446,25 @@ ARENA JOURNALS JOURNAL:journal
    {: a:str :}
    a HELP? if construct command help OPTION:SOME exit then
    a VERSION? if construct command version OPTION:SOME exit then
-   a s" pause" STR= if
+   a s" pause" STR:= if
       SERVICE-ACTION:STOP ACTION-COMMAND exit
    then
-   a s" resume" STR= if
+   a s" resume" STR:= if
       SERVICE-ACTION:START ACTION-COMMAND exit
    then
-   a s" status" STR= if construct command status OPTION:SOME exit then
-   a s" logs" STR= if construct command logs OPTION:SOME exit then
+   a s" status" STR:= if construct command status OPTION:SOME exit then
+   a s" logs" STR:= if construct command logs OPTION:SOME exit then
    OPTION:NONE ;
 
 \ Rust's parse_service's action; bytes that are not UTF-8 name none.
 : ACTION ( str -- SERVICE:action )
    {: a:str :}
-   a s" start" STR= if SERVICE-ACTION:START exit then
-   a s" stop" STR= if SERVICE-ACTION:STOP exit then
-   a s" restart" STR= if SERVICE-ACTION:RESTART exit then
-   a s" enable" STR= if SERVICE-ACTION:ENABLE exit then
-   a s" disable" STR= if SERVICE-ACTION:DISABLE exit then
-   a s" status" STR= if SERVICE-ACTION:STATUS exit then
+   a s" start" STR:= if SERVICE-ACTION:START exit then
+   a s" stop" STR:= if SERVICE-ACTION:STOP exit then
+   a s" restart" STR:= if SERVICE-ACTION:RESTART exit then
+   a s" enable" STR:= if SERVICE-ACTION:ENABLE exit then
+   a s" disable" STR:= if SERVICE-ACTION:DISABLE exit then
+   a s" status" STR:= if SERVICE-ACTION:STATUS exit then
    s" unknown service action" USAGE ;
 
 : PARSE-SERVICE ( n [ n -- str ] -- command )
@@ -478,12 +478,12 @@ ARENA JOURNALS JOURNAL:journal
    {: argc:n arg :}
    argc 1 = if construct form text COMMAND-SETTINGS exit then
    argc 2 = if
-      1 arg execute s" --json" STR= if
+      1 arg execute s" --json" STR:= if
          construct form json COMMAND-SETTINGS exit
       then
    then
    argc 3 = if
-      1 arg execute s" set-root" STR= if
+      1 arg execute s" set-root" STR:= if
          2 arg execute COMMAND-SET-ROOT exit
       then
    then
@@ -500,7 +500,7 @@ ARENA JOURNALS JOURNAL:journal
    ;MATCH ;
 
 \ Rust's is_option.
-: OPTION-ARG? ( str -- bool ) s" --" STARTS-WITH? ;
+: OPTION-ARG? ( str -- bool ) s" --" STR:STARTS-WITH? ;
 
 \ Rust's utf8: the bytes, or Usage with the fault m.
 : VALID-ARG ( str str -- str )
@@ -539,15 +539,15 @@ ARENA JOURNALS JOURNAL:journal
    {: sync key remote argc:n arg at:n :}
    at arg execute {: o:str :}
    o UTF8:VALID? 0= if s" setup options must be valid UTF-8" USAGE then
-   o s" --sync-root" STR= if
+   o s" --sync-root" STR:= if
       sync UNSET argc arg at VALUE OPTION:SOME key remote exit
    then
-   o s" --app-key" STR= if
+   o s" --app-key" STR:= if
       key UNSET sync argc arg at VALUE
       s" the Dropbox app key must be valid UTF-8" VALID-ARG OPTION:SOME
       remote exit
    then
-   o s" --remote-root" STR= if
+   o s" --remote-root" STR:= if
       remote UNSET sync key argc arg at VALUE REMOTE-ROOT OPTION:SOME exit
    then
    s" unknown setup option" USAGE ;
@@ -594,9 +594,9 @@ ARENA JOURNALS JOURNAL:journal
    c UTF8:VALID? 0= if
       s" the command must be valid UTF-8" USAGE
    then
-   c s" settings" STR= if argc arg PARSE-SETTINGS exit then
-   c s" service" STR= if argc arg PARSE-SERVICE exit then
-   c s" setup" STR= if argc arg PARSE-SETUP COMMAND-SETUP exit then
+   c s" settings" STR:= if argc arg PARSE-SETTINGS exit then
+   c s" service" STR:= if argc arg PARSE-SERVICE exit then
+   c s" setup" STR:= if argc arg PARSE-SETUP COMMAND-SETUP exit then
    c ALONE argc SOLE ;
 
 
@@ -870,7 +870,7 @@ ARENA JOURNALS JOURNAL:journal
 : WIDGET-THERE? ( str ^ARENA:arena -- bool )
    {: link ar :}
    link ar CONFIG:READLINK MATCH option
-      some OF WIDGET STR= 0= if link WIDGET-TAKEN then true ENDOF
+      some OF WIDGET STR:= 0= if link WIDGET-TAKEN then true ENDOF
       none OF false ENDOF
    ;MATCH if true exit then
    FS:ERRNO FS:EINVAL = if link WIDGET-TAKEN then

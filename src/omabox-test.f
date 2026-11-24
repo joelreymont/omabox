@@ -230,7 +230,7 @@ variable CHANGES
 
 : STRS= ( option<str> option<str> -- bool )
    SOME$ {: b:str bf:bool :} SOME$ {: a:str af:bool :}
-   af bf SAME-BOOL? a b STR= and ;
+   af bf SAME-BOOL? a b STR:= and ;
 
 \ The sync root, the key and whether there is an initial config.
 : INITIAL$ ( option<initial-config> -- option<str> str bool )
@@ -242,13 +242,13 @@ variable CHANGES
 : INITIALS= ( option<initial-config> option<initial-config> -- bool )
    INITIAL$ {: bs bk:str bf:bool :}
    INITIAL$ {: as ak:str af:bool :}
-   af bf SAME-BOOL? ak bk STR= and as bs STRS= and ;
+   af bf SAME-BOOL? ak bk STR:= and as bs STRS= and ;
 
 \ Rust's derived PartialEq of SetupOptions.
 : OPTIONS= ( setup-options setup-options -- bool )
    SETUP-OPTIONS-UNMAKE {: br bi :}
    SETUP-OPTIONS-UNMAKE {: ar ai :}
-   ar br STR= ai bi INITIALS= and ;
+   ar br STR:= ai bi INITIALS= and ;
 
 : SETUP-ACCEPTS ( setup-options -- ) SETUP-PARSED OPTIONS= TTRUE ;
 
@@ -300,7 +300,7 @@ variable CHANGES
 : LOGGED? ( str str -- bool )
    {: a:str t:str :}
    SB-RESET s" omabox: " SB-APPEND t SB-APPEND 10 SB-APPEND-C
-   a SB$ CONTAINS? ;
+   a SB$ STR:CONTAINS? ;
 
 \ A Usage refusal: the fault m's line, then the help line.
 : USAGE-LOGGED ( n str str -- )
@@ -648,20 +648,20 @@ variable CHANGES
 : ENDS-LOGGED? ( str str -- bool )
    {: a:str t:str :}
    SB-RESET s" omabox: " SB-APPEND t SB-APPEND 10 SB-APPEND-C
-   a SB$ ENDS-WITH? ;
+   a SB$ STR:ENDS-WITH? ;
 
 \ Whether the log holds "config: " t and LF.
 : CONFIG-LOGGED? ( str str -- bool )
    {: a:str t:str :}
    SB-RESET s" config: " SB-APPEND t SB-APPEND 10 SB-APPEND-C
-   a SB$ CONTAINS? ;
+   a SB$ STR:CONTAINS? ;
 
 \ Whether the log holds "config: " t, the path p in backticks, and LF.
 : PATH-LOGGED? ( str str str -- bool )
    {: a:str t:str p :}
    SB-RESET s" config: " SB-APPEND t SB-APPEND s" `" SB-APPEND
    p SB-APPEND s" `" SB-APPEND 10 SB-APPEND-C
-   a SB$ CONTAINS? ;
+   a SB$ STR:CONTAINS? ;
 
 \ CONFIG's refusal of the stored root once it is gone: its two lines
 \ alone, Rust's unavailable_line.
@@ -710,7 +710,7 @@ variable CHANGES
    jp ar STALE-JOURNAL
    first FS:REMOVE-DIR
    jp ar ATTENTION:RENDER {: journal :}
-   journal s" stale.txt" CONTAINS? TTRUE
+   journal s" stale.txt" STR:CONTAINS? TTRUE
    d s" stderr.txt" ar INSIDE {: p :}
    [: x ar STATUS-TEXT SHOWN ! ;] p ar STDERR:CAPTURING
    {: code:n e:str :}
@@ -792,8 +792,8 @@ variable CHANGES
    x ar CONFIG:XDG-CONFIG-FILE CONFIG:ABS-PATH>STR toml FS:WRITE-ALL
    d s" stderr.txt" ar INSIDE {: p :}
    x construct form text p ar SETTINGS {: text e:str :}
-   e s" could not resolve sync root " CONTAINS? TTRUE
-   e root CONTAINS? TTRUE
+   e s" could not resolve sync root " STR:CONTAINS? TTRUE
+   e root STR:CONTAINS? TTRUE
    s" Sync root: " root ar APPENDED
    S\" \nDropbox app key: public-app-key\n" ar APPENDED {: want :}
    text want T$=
@@ -993,7 +993,7 @@ variable CHANGES
    STDERR:CAPTURING {: code:n e:str :}
    CHANGES @ 0 T=
    code SERVICE:E-UNSUCCESSFUL T=
-   e s" service: " CONTAINS? TTRUE
+   e s" service: " STR:CONTAINS? TTRUE
    d ar TRACE {: log state :}
    log S\" show\nstop\nlist-units\nreset-failed\nstart\n" T$=
    state S\" active\n" T$=
@@ -1026,7 +1026,7 @@ variable CHANGES
    e s" help: Set `sync_root` to an existing local directory."
    CONFIG-LOGGED? TTRUE
    e s" could not validate the new sync root" ENDS-LOGGED? TTRUE
-   e s" omabox: help:" CONTAINS? TFALSE
+   e s" omabox: help:" STR:CONTAINS? TFALSE
    d FS:REMOVE-TREE ;
 
 \ Rust's fake_systemctl in DIR, answering show with the state: the
@@ -1149,7 +1149,7 @@ variable CHANGES
    b2 BIRTH$ {: bs2:n bn2:n bf2:bool :}
    s1 SUBVOLUME$ {: v1:n vf1:bool :}
    s2 SUBVOLUME$ {: v2:n vf2:bool :}
-   p q STR= i1 i2 = and
+   p q STR:= i1 i2 = and
    bf1 bf2 SAME-BOOL? and bs1 bs2 = and bn1 bn2 = and
    vf1 vf2 SAME-BOOL? and v1 v2 = and ;
 
@@ -1185,7 +1185,7 @@ variable CHANGES
    JOURNAL-PLAN--RECORD:UNMAKE {: j q o2 t :}
    JOURNAL-PLAN--RECORD:UNMAKE {: i p o1 s :}
    i JOURNAL:PLAN-ID>N j JOURNAL:PLAN-ID>N =
-   p PATH$ q PATH$ STR= and
+   p PATH$ q PATH$ STR:= and
    o1 VEC:COUNT o2 VEC:COUNT = and
    s STATUS# t STATUS# = and ;
 
@@ -1402,7 +1402,7 @@ variable CHANGES
    {: a:str :}
    MATCH option
       none OF false ENDOF
-      some OF DROPBOX:CURSOR>STR a STR= ENDOF
+      some OF DROPBOX:CURSOR>STR a STR:= ENDOF
    ;MATCH ;
 
 : SET-ROOT-WORKS-WHEN-THE-PRIOR-ROOT-IS-UNAVAILABLE ( ^ARENA:arena -- )
@@ -1514,7 +1514,7 @@ variable CHANGES
 : PAST ( str n str -- n )
    {: a:str at:n t:str :}
    at 0 < if -1 exit then
-   a t at FIND-SUB-FROM MATCH option
+   a t at STR:FIND-SUB-FROM MATCH option
       none OF -1 ENDOF
       some OF IDX>N t str> nip + ENDOF
    ;MATCH ;
@@ -1690,7 +1690,7 @@ variable REC-WRITES
    c a p ar BIND-RUN {: code:n e:str :}
    code 0 T=
    REC-WRITES @ 1 T=
-   REC REC-U @ >str s" bind-refresh" CONTAINS? TTRUE
+   REC REC-U @ >str s" bind-refresh" STR:CONTAINS? TTRUE
    c a AUTHORIZED-BINDING @ ar BOUND-TO? TTRUE
    d FS:REMOVE-TREE ;
 
@@ -1704,7 +1704,7 @@ variable REC-WRITES
    c a p ar BIND-RUN {: code:n e:str :}
    code 0 T=
    REC-WRITES @ 1 T=
-   REC REC-U @ >str s" bind-refresh" CONTAINS? TTRUE
+   REC REC-U @ >str s" bind-refresh" STR:CONTAINS? TTRUE
    c a AUTHORIZED-BINDING @ ar BOUND-TO? TTRUE
    d FS:REMOVE-TREE ;
 
@@ -1718,7 +1718,7 @@ variable REC-WRITES
    c a p ar BIND-RUN {: code:n e:str :}
    code E-BINDING-MISMATCH T=
    e s" omabox: this Omabox journal is already bound to a different"
-   CONTAINS? TTRUE
+   STR:CONTAINS? TTRUE
    REC-WRITES @ 0 T=
    c other ar BOUND-TO? TTRUE
    d FS:REMOVE-TREE ;
@@ -1761,7 +1761,7 @@ variable REC-WRITES
    {: code:n e:str :}
    code E-AUTH T=
    e S\" omabox: Dropbox OAuth could not issue an access token\n"
-   CONTAINS? TTRUE
+   STR:CONTAINS? TTRUE
    cl DROPBOX:CLOSE ;
 
 \ LINKED of /Sync on a client holding its first access token, nothing
@@ -1775,7 +1775,7 @@ variable REC-WRITES
 
 : VALIDATE-LOGGED? ( str -- bool )
    S\" omabox: could not validate the Dropbox account and root\n"
-   CONTAINS? ;
+   STR:CONTAINS? ;
 
 : LINKED-REFUSES-AN-UNAVAILABLE-ACCOUNT ( ^ARENA:arena -- )
    {: ar :}
@@ -1798,7 +1798,7 @@ variable REC-WRITES
    [: s" /2/files/get_metadata" 200 s" " s" " ROOT-FILE$
       TEST-DROPBOX:ROUTE-SCRIPT! ;] ar LINK-RUN {: code:n e:str :}
    code E-DROPBOX T=
-   e S\" omabox: configured Dropbox root is not a folder\n" CONTAINS?
+   e S\" omabox: configured Dropbox root is not a folder\n" STR:CONTAINS?
    TTRUE
    e VALIDATE-LOGGED? TTRUE ;
 
@@ -1810,7 +1810,7 @@ variable REC-WRITES
       TEST-DROPBOX:ROUTE-SCRIPT! ;] ar LINK-RUN {: code:n e:str :}
    code E-ACCOUNT-CHANGED T=
    e s" omabox: Dropbox authorization returned a different account"
-   CONTAINS? TTRUE ;
+   STR:CONTAINS? TTRUE ;
 
 \ The cases against the fake, under DROPBOX's loops; linking starts
 \ at the account's home, so the fake expects no Path-Root.

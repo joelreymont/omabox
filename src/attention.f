@@ -351,7 +351,7 @@ ARENA SLOTS JOURNAL:journal
    v x VEC:AT @ ENTRY-UNMAKE {: a sa:str da:str :}
    v y VEC:AT @ ENTRY-UNMAKE {: b sb:str db:str :}
    a b MODEL:PATH-CMP {: c:n :}
-   c 0= if da db STR< exit then
+   c 0= if da db STR:< exit then
    c 0 < ;
 
 \ The entries' indices in the text's order.
