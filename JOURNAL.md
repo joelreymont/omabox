@@ -2359,3 +2359,53 @@ Observations for the blog:
   itself, so it owns the choice of clock and the bugs that follow from it.
 - A checker that stops silently gives the same green as one that checked
   everything. "Clean" has to mean "read to the end".
+
+## 2026-11-24: a tree the harness did not have
+
+The scan design of 2026-11-23 moved per-entry work out of Habu code: the
+journal's four tree-sized tables now hold typed columns instead of JSON
+(schema 10), the walk stats each name once, the hash cache is matched in
+one SQL statement, and the JSON codecs for those records are gone. On the
+harness of 16,000 files in one directory, an idle pass fell from 629 to
+223 ms on a performance core and from 1,660 to 578 ms on an efficiency
+core.
+
+Rust's daemon then ran in the same harness on the same tree, built from
+the Rust bookmark with a test of its own: 101 ms. The live tree is not
+flat, though: 3,459 directories, 12,763 files, up to 18 deep, paths of 80
+bytes on average. A synthetic tree of that shape put Rust at 131 ms and
+Habu at 498 ms, 3.8 times as much, where the flat tree had shown 2.1.
+
+Timers at each step, and Habu's own sampling profiler, split the 498 ms:
+- About 175 ms is SQLite traffic: each file is staged in scratch tables
+  two or three times per pass and read back. Rust keeps the scan in
+  memory, compares it with what it stored, and writes nothing when they
+  are equal.
+- 60 ms is the case-folded key of each path: two calls into libunistring
+  per path component, each mallocing a copy, 3.7 µs per path. For ASCII
+  names the answer is A-Z to a-z.
+- 83 ms came from reopening each cached file and directory by opening
+  every ancestor in turn. One `openat2` call per path, as Rust makes,
+  removed it in a scratch build.
+- Each directory paid an `mmap` and a `munmap` twice, once for its arena
+  and once for the open's work area.
+- Deciding costs 5.7 µs per path against Rust's 2.5, case collisions
+  included.
+Fixes for the fold, the arena and the work area are Habu lanes; how a
+scanning pass gets below Rust's goes to a new design.
+
+Observations for the blog:
+- A flat harness hid every cost that grows with depth or path length.
+  The live tree's shape, made synthetic so nothing private left the
+  machine, changed the ratio from 2.1 to 3.8.
+- The synthetic tree had a bug of its own: names padded with `x`, a
+  base-36 digit, collided in 73 paths. A worker stopped on EEXIST instead
+  of skipping them, which is how it was found.
+- The profiler charged 1,700 samples to a binary search that a CPU timer
+  showed costs under 4 ms per pass. About half the samples were inside C,
+  and a sample in C goes to the first return address found on the
+  stack, stale ones included. A profile says where to put a timer; the
+  timer says how much.
+- Moving per-entry work into SQLite helped while it replaced JSON, but
+  a scratch row is not free: at 1.3 to 4.2 µs a row, staging the tree on
+  every pass costs more than Rust's whole scan of it.
