@@ -1,10 +1,10 @@
-\ journal.f - package JOURNAL: the sync journal, a SQLite file at schema 9
+\ journal.f - package JOURNAL: the sync journal, a SQLite file at schema 10
 \ (rust src/journal.rs at schema 8), and the Dropbox account and local root
 \ it is bound to. OPEN makes the file 0600 without following a link,
-\ creates schema 9 in a new one and migrates schema 8 to it, each in one
-\ transaction, from migrations/, whose texts this file lays in the program
-\ as it loads; any version but 0, 8 and 9 is refused unchanged, and
-\ OPEN-READ refuses any but 9. A SQLite failure is SQLITE's throw, passed
+\ creates schema 10 in a new one and migrates schema 8 or 9 to it, each in
+\ one transaction, from migrations/, whose texts this file lays in the
+\ program as it loads; any version but 0, 8, 9 and 10 is refused unchanged,
+\ and OPEN-READ refuses any but 10. A SQLite failure is SQLITE's throw, passed
 \ up unchanged. JOURNAL's own failures are logged once with the Rust
 \ version's text, then thrown as its codes. E-FILE, E-DISK-FULL and E-ROOT
 \ leave the host errno in FS:ERRNO, 0 where there is none; E-DISK-FULL is
@@ -14,9 +14,11 @@
 \ of it. A binding with no birth time is one a version-6 journal recorded;
 \ an activation whose path and inode match it upgrades it in place.
 \ A baseline, a plan, a conflict and a local observation are keyed by
-\ the canonical path MODEL:FOLD gives the display path. Every stored
-\ value is written and read by MODEL's JSON words; one MODEL cannot read
-\ is logged with the record's path and its cause and thrown as E-JSON.
+\ the canonical path MODEL:FOLD gives the display path. A baseline is
+\ stored in typed columns; every other stored value is written and read by
+\ MODEL's JSON words. A value MODEL cannot read, a version-nine baseline
+\ refusing the migration included, is logged with the record's path and
+\ its cause and thrown as E-JSON.
 \ Each write to the file is one immediate transaction, and the remote
 \ cursor and inventory are read in one deferred one.
 \ A local scan is gathered in the connection's temporary tables, then
@@ -125,12 +127,16 @@ ENUM local-root-activation
 
 private
 
-9 constant SCHEMA
+10 constant SCHEMA
 5000 constant BUSY-MS
 $180 constant MODE-OWNER            \ 0600
 $1FF constant MODE-BITS
 $7FFFFFFFFFFFFFFF constant INT-MAX  \ SQLite's largest integer
 1000000000 constant NS-PER-S
+
+\ A baseline's kind, the number MODEL gives an observation's form.
+0 constant KIND-PRESENT
+1 constant KIND-DIRECTORY
 
 16 TASK:+USERS ID-ROW u8
 
@@ -182,6 +188,7 @@ s" migrations/0006.sql" create V6 LAY
 s" migrations/0007.sql" create V7 LAY
 s" migrations/0008.sql" create V8 LAY
 s" migrations/0009.sql" create V9 LAY
+s" migrations/0010.sql" create V10 LAY
 
 : TEXT ( ^n -- str )
    {: p:^n :}
@@ -225,6 +232,13 @@ s" migrations/0009.sql" create V9 LAY
    op OPERATION s" found invalid state for `" LOG:TEXT+ path LOG:TEXT+
    s" `: " LOG:TEXT+ detail LOG:TEXT+ LOG:;LINE
    E-INVALID-STATE throw ;
+
+\ op could not read path's stored value, as code says.
+: UNPROCESSED ( n str str -- )
+   {: code op:str path:str :}
+   op OPERATION s" could not process the record for `" LOG:TEXT+
+   path LOG:TEXT+ s" `: " LOG:TEXT+ code LOG:CODE+ LOG:;LINE
+   E-JSON throw ;
 
 : UNSUPPORTED ( str n -- )
    {: path:str found :}
@@ -379,15 +393,36 @@ private
    c s" DROP TABLE local_observations_8; PRAGMA user_version = 9"
    SQLITE:EXEC ;
 
-\ Schema 9 in a new file: every migration in order.
+\ The first converted baseline MODEL cannot read refuses the migration.
+: UNCONVERTED ( SQLITE:statement -- SQLITE:statement )
+   SQLITE:STEP 0= if exit then
+   0 SQLITE:COL-BLOB {: path:str :}
+   MODEL:E-STORED s" deserialize baseline" path UNPROCESSED ;
+
+\ Migration 10: baselines in typed columns.
+: MIGRATE-TYPED-COLUMNS ( SQLITE:connection -- )
+   {: c :}
+   c V10 RUN
+   c s" SELECT path FROM converted_baselines WHERE kind IS NULL
+      ORDER BY path LIMIT 1" [: UNCONVERTED ;] SQLITE:WITH-STATEMENT
+   c s" DROP TABLE converted_baselines; PRAGMA user_version = 10"
+   SQLITE:EXEC ;
+
+\ Schema 8 in a new file: migrations 1 to 8 in order.
 : CREATE-SCHEMA ( SQLITE:connection -- )
    {: c :}
    c V1 RUN  c V2 RUN  c V3 RUN  c V4 RUN
    c CANONICAL-PATHS
    c V5 RUN
    c MIGRATE-BLOCKED-PLANS
-   c V7 RUN  c V8 RUN
-   c MIGRATE-LOCAL-OBSERVATIONS ;
+   c V7 RUN  c V8 RUN ;
+
+\ Schema v, 0, 8 or 9, brought to SCHEMA by each migration it lacks.
+: MIGRATE ( SQLITE:connection n -- )
+   {: c v :}
+   v 0= if c CREATE-SCHEMA then
+   v 9 < if c MIGRATE-LOCAL-OBSERVATIONS then
+   c MIGRATE-TYPED-COLUMNS ;
 
 : WRITABLE ( journal -- )
    {: j :}
@@ -396,12 +431,12 @@ private
    [: j >PATH MODE-OWNER FS:CHMOD-MODE ;]
    s" restrict journal permissions" j >PATH FILE-IO
    c VERSION {: v :}
-   v 0<> v 8 <> and v SCHEMA <> and if j >PATH v UNSUPPORTED then
+   v 0<> v 8 <> and v 9 <> and v SCHEMA <> and if
+      j >PATH v UNSUPPORTED
+   then
    j CONFIGURE-WRITABLE
-   v 0= if c [: c CREATE-SCHEMA ;] SQLITE:WITH-TRANSACTION then
-   v 8 = if
-      c [: c MIGRATE-LOCAL-OBSERVATIONS ;] SQLITE:WITH-TRANSACTION
-   then ;
+   v SCHEMA = if exit then
+   c [: c v MIGRATE ;] SQLITE:WITH-TRANSACTION ;
 
 \ Deletes each completed plan no pending or unretained recovery record
 \ holds, operations first: both deletes select the same plans.
@@ -450,15 +485,15 @@ private
 
 public
 
-\ The journal at path, schema 9 created in a new or empty file or
-\ migrated from 8, and its completed work pruned; another version is
+\ The journal at path, schema 10 created in a new or empty file or
+\ migrated from 8 or 9, and its completed work pruned; another version is
 \ refused, the file unchanged.
 : OPEN ( str -- journal )
    {: path:str :}
    path OWNER-ONLY
    path SQLITE:OPEN path JOURNAL-MAKE [: READY ;] SET-UP ;
 
-\ The schema-9 journal at path, never created or changed. Its log lines
+\ The schema-10 journal at path, never created or changed. Its log lines
 \ name it `[Omabox journal]`, as Rust's status redacts the path.
 : OPEN-READ ( str -- journal )
    {: path:str :}
@@ -1113,13 +1148,6 @@ private
    {: w write :}
    w JSON:RESET write execute JSON:WRITTEN$ ;
 
-\ op could not read path's stored value, as code says.
-: UNPROCESSED ( n str str -- )
-   {: code op:str path:str :}
-   op OPERATION s" could not process the record for `" LOG:TEXT+
-   path LOG:TEXT+ s" `: " LOG:TEXT+ code LOG:CODE+ LOG:;LINE
-   E-JSON throw ;
-
 \ Runs a MODEL read that replaces the seed it is given; a stored value
 \ MODEL cannot read is op's E-JSON on path.
 : DECODE ( R [ R -- R ] str str -- R )
@@ -1143,7 +1171,6 @@ private
 : DROP-REMOTE ( MODEL:observation<MODEL:remote> -- ) drop ;
 : DROP-FINGERPRINT ( MODEL:fingerprint -- ) drop ;
 : DROP-HASH ( DROPBOX:hash -- ) drop ;
-: DROP-BASELINE ( MODEL:baseline -- ) drop ;
 : DROP-OPERATION ( MODEL:operation -- ) drop ;
 : DROP-BLOCKAGE ( MODEL:blockage -- ) drop ;
 : DROP-CONFLICT ( MODEL:conflict -- ) drop ;
@@ -2276,12 +2303,6 @@ $FFFFFFFF constant U32-MAX
 
 \ ---- stored values -------------------------------------------------
 
-: DECODE-BASELINE ( str MODEL:path ^ARENA:arena -- MODEL:baseline )
-   {: json:str path ar :}
-   MODEL-BASELINE:ABSENT
-   [: DROP-BASELINE json ar MODEL:JSON>BASELINE ;]
-   s" deserialize baseline" path MODEL:PATH>STR DECODE ;
-
 : OPERATION-AS
    ( str MODEL:path ^ARENA:arena str -- MODEL:operation )
    {: json:str path ar op:str :}
@@ -2297,10 +2318,6 @@ $FFFFFFFF constant U32-MAX
    MODEL-BLOCKAGE:STAGE-OCCUPIED
    [: DROP-BLOCKAGE json ar MODEL:JSON>BLOCKAGE ;]
    s" deserialize block reason" path MODEL:PATH>STR DECODE ;
-
-: ENCODE-BASELINE ( MODEL:baseline ^JSON:writer -- str )
-   {: b w :}
-   w [: b swap MODEL:BASELINE>JSON ;] ENCODE ;
 
 : ENCODE-OPERATION ( MODEL:operation ^JSON:writer -- str )
    {: o w :}
@@ -2346,14 +2363,24 @@ $FFFFFFFF constant U32-MAX
 
 \ ---- baselines -----------------------------------------------------
 
+\ The baseline in columns col to col+2: its kind, content and revision.
+: BASELINE-COPY
+   ( SQLITE:statement n ^ARENA:arena
+     -- SQLITE:statement MODEL:baseline )
+   {: col ar :}
+   col SQLITE:COL-INT KIND-DIRECTORY = if
+      MODEL-BASELINE:DIRECTORY exit
+   then
+   col 1+ ar TEXT-COPY DROPBOX:>HASH {: h:DROPBOX:hash :}
+   col 2 + ar TEXT-COPY DROPBOX:>REV {: v:DROPBOX:rev :}
+   h v MODEL-REMOTE:MAKE MODEL-BASELINE:PRESENT ;
+
 : BASELINE-ROW
-   ( SQLITE:statement MODEL:path ^ARENA:arena
+   ( SQLITE:statement ^ARENA:arena
      -- option<MODEL:baseline> SQLITE:statement )
-   {: path ar :}
+   {: ar :}
    SQLITE:STEP 0= if NO-BASELINE swap exit then
-   0 SQLITE:COL-TEXT path ar DECODE-BASELINE {: b :}
-   b ABSENT? if NO-BASELINE swap exit then
-   b OPTION:SOME swap ;
+   0 ar BASELINE-COPY OPTION:SOME swap ;
 
 : PATH-ROW
    ( SQLITE:statement ^VEC:vector<MODEL:path> ^ARENA:arena
@@ -2368,7 +2395,8 @@ public
    {: j path ar :}
    path ar MODEL:FOLD {: k :}
    j >CONNECTION
-   s" SELECT baseline_json FROM baselines WHERE canonical_path = ?1" [: k MODEL:KEY>STR 1 SQLITE:BIND-BLOB path ar BASELINE-ROW ;]
+   s" SELECT kind, content, revision FROM baselines
+      WHERE canonical_path = ?1" [: k MODEL:KEY>STR 1 SQLITE:BIND-BLOB ar BASELINE-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
 \ Every path with a baseline, in the order of its bytes.
@@ -2376,8 +2404,8 @@ public
    {: j ar :}
    ar [type] MODEL:path NEW-VECTOR {: paths :}
    j >CONNECTION
-   s\" SELECT path FROM baselines WHERE baseline_json != '\"Absent\"'
-      ORDER BY path" [: begin SQLITE:STEP while paths ar PATH-ROW repeat ;]
+   s" SELECT path FROM baselines ORDER BY path"
+   [: begin SQLITE:STEP while paths ar PATH-ROW repeat ;]
    SQLITE:WITH-STATEMENT
    paths ;
 
@@ -2386,8 +2414,8 @@ public
    ( journal MODEL:key ^ARENA:arena -- option<MODEL:path> )
    {: j k ar :}
    j >CONNECTION
-   s\" SELECT path FROM baselines
-      WHERE canonical_path = ?1 AND baseline_json != '\"Absent\"'" [: k MODEL:KEY>STR 1 SQLITE:BIND-BLOB ar SPELLING-ROW ;]
+   s" SELECT path FROM baselines WHERE canonical_path = ?1"
+   [: k MODEL:KEY>STR 1 SQLITE:BIND-BLOB ar SPELLING-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
 private
@@ -2514,9 +2542,8 @@ private
 \ Each held key once, in byte order. The UNION merges the four tables'
 \ canonical-path indexes, so the statement streams.
 : KNOWN-KEYS ( -- str )
-   s\" WITH keys(k) AS (
+   s" WITH keys(k) AS (
          SELECT canonical_path FROM baselines
-            WHERE baseline_json != '\"Absent\"'
          UNION SELECT canonical_path FROM local_observations
          UNION SELECT canonical_path FROM remote_observations
          UNION SELECT canonical_path FROM plans
@@ -2528,7 +2555,7 @@ private
 \ What each key of keys holds. || makes text of a blob; the CAST keeps
 \ the subtree's bounds, the key then "/" and the key then "0", bytes.
 : KNOWN-SELECT ( -- str )
-   s\" SELECT keys.k, b.path, b.baseline_json,
+   s" SELECT keys.k, b.path, b.kind, b.content, b.revision,
          l.path, l.observation_json,
          (SELECT count(*) FROM local_observations c
             WHERE c.canonical_path = keys.k),
@@ -2541,7 +2568,6 @@ private
                AND s.canonical_path < CAST(keys.k || '0' AS BLOB))
       FROM keys
       LEFT JOIN baselines b ON b.canonical_path = keys.k
-         AND b.baseline_json != '\"Absent\"'
       LEFT JOIN local_observations l ON l.path = (
          SELECT m.path FROM local_observations m
          WHERE m.canonical_path = keys.k ORDER BY m.path LIMIT 1)
@@ -2561,41 +2587,40 @@ private
 create EVERY-KNOWN KNOWN-KEYS KNOWN-SELECT LAY-BOTH
 create ONE-KNOWN ONE-KEY KNOWN-SELECT LAY-BOTH
 
-\ Columns 1 and 2, NULL where no baseline is.
+\ Columns 1 to 4, NULL where no baseline is.
 : KNOWN-BASELINE
    ( SQLITE:statement ^ARENA:arena
      -- SQLITE:statement option<path-baseline> )
    {: ar :}
    1 SQLITE:COL-NULL? if NO-PATH-BASELINE exit then
    1 ar PATH-COPY {: p :}
-   2 SQLITE:COL-TEXT p ar DECODE-BASELINE {: b :}
-   b ABSENT? if NO-PATH-BASELINE exit then
+   2 ar BASELINE-COPY {: b :}
    p b JOURNAL-PATH--BASELINE:MAKE OPTION:SOME ;
 
-\ Columns 3 and 4, NULL where no local row is.
+\ Columns 5 and 6, NULL where no local row is.
 : KNOWN-LOCAL
    ( SQLITE:statement ^ARENA:arena
      -- SQLITE:statement option<MODEL:local-record> )
    {: ar :}
-   3 SQLITE:COL-NULL? if NO-LOCAL exit then
-   3 ar PATH-COPY {: p :}
-   4 SQLITE:COL-TEXT p MODEL:PATH>STR ar LOCAL-OBSERVATION-OF
+   5 SQLITE:COL-NULL? if NO-LOCAL exit then
+   5 ar PATH-COPY {: p :}
+   6 SQLITE:COL-TEXT p MODEL:PATH>STR ar LOCAL-OBSERVATION-OF
    {: o :}
    p o MODEL-LOCAL--RECORD:MAKE OPTION:SOME ;
 
-\ Columns 6 and 7, NULL where no remote row is.
+\ Columns 8 and 9, NULL where no remote row is.
 : KNOWN-REMOTE
    ( SQLITE:statement MODEL:key ^ARENA:arena
      -- SQLITE:statement option<MODEL:remote-record> )
    {: k ar :}
-   6 SQLITE:COL-NULL? if NO-REMOTE exit then
-   6 ar PATH-COPY {: p :}
-   7 SQLITE:COL-TEXT p MODEL:PATH>STR ar REMOTE-OBSERVATION-OF
+   8 SQLITE:COL-NULL? if NO-REMOTE exit then
+   8 ar PATH-COPY {: p :}
+   9 SQLITE:COL-TEXT p MODEL:PATH>STR ar REMOTE-OBSERVATION-OF
    {: o :}
    k p o MODEL-REMOTE--RECORD:MAKE OPTION:SOME ;
 
 : KNOWN-SUBTREE ( SQLITE:statement -- SQLITE:statement MODEL:subtree )
-   9 SQLITE:COL-INT 0= if MODEL-SUBTREE:EMPTY exit then
+   11 SQLITE:COL-INT 0= if MODEL-SUBTREE:EMPTY exit then
    MODEL-SUBTREE:OCCUPIED ;
 
 \ The row of a KNOWN-SELECT statement, decoded into ar.
@@ -2605,10 +2630,10 @@ create ONE-KNOWN ONE-KEY KNOWN-SELECT LAY-BOTH
    0 ar KEY-COPY {: k :}
    ar KNOWN-BASELINE {: b :}
    ar KNOWN-LOCAL {: l :}
-   5 SQLITE:COL-INT {: n :}
+   7 SQLITE:COL-INT {: n :}
    k ar KNOWN-REMOTE {: r :}
    KNOWN-SUBTREE {: s :}
-   8 SQLITE:COL-INT 0<> {: live:bool :}
+   10 SQLITE:COL-INT 0<> {: live:bool :}
    k b l n r s live JOURNAL-KNOWN--PATH:MAKE ;
 
 : KNOWN-ROWS
@@ -2942,28 +2967,53 @@ create BLOCKED-QUERY PLAN-SELECT BLOCKED-WHERE LAY-BOTH
    SQLITE:WITH-STATEMENT ;
 
 : UPSERT-BASELINE ( -- str )
-   s" INSERT INTO baselines(path, baseline_json, canonical_path)
-      VALUES (?1, ?2, ?3)
+   s" INSERT INTO baselines(path, canonical_path, kind, content, revision)
+      VALUES (?1, ?2, ?3, ?4, ?5)
       ON CONFLICT(canonical_path) DO UPDATE SET
          path = excluded.path,
-         baseline_json = excluded.baseline_json
+         kind = excluded.kind,
+         content = excluded.content,
+         revision = excluded.revision
       WHERE baselines.path != excluded.path
-         OR baselines.baseline_json != excluded.baseline_json" ;
+         OR baselines.kind != excluded.kind
+         OR baselines.content IS NOT excluded.content
+         OR baselines.revision IS NOT excluded.revision" ;
 
-\ An absent baseline removes the path's row; an unchanged one writes
-\ nothing.
-: WRITE-BASELINE
-   ( SQLITE:connection MODEL:path MODEL:baseline ^ARENA:arena
-     ^JSON:writer -- )
-   {: c path b ar w :}
-   path ar MODEL:FOLD {: k :}
-   b ABSENT? if c k FORGET exit then
+\ Binds UPSERT-BASELINE's kind, content and revision, ?3 to ?5.
+: BIND-PRESENT ( SQLITE:statement MODEL:remote -- SQLITE:statement )
+   MODEL-REMOTE:UNMAKE {: h v :}
+   KIND-PRESENT 3 SQLITE:BIND-INT
+   h DROPBOX:HASH>STR 4 SQLITE:BIND-TEXT
+   v DROPBOX:REV>STR 5 SQLITE:BIND-TEXT ;
+
+: BIND-DIRECTORY ( SQLITE:statement -- SQLITE:statement )
+   KIND-DIRECTORY 3 SQLITE:BIND-INT
+   4 SQLITE:BIND-NULL 5 SQLITE:BIND-NULL ;
+
+\ The path's row, its kind, content and revision bound by bind; an
+\ unchanged row writes nothing.
+: PUT-BASELINE
+   ( SQLITE:connection MODEL:path MODEL:key
+     [ SQLITE:statement -- SQLITE:statement ] -- )
+   {: c path k bind :}
    c UPSERT-BASELINE
     [: path MODEL:PATH>STR 1 SQLITE:BIND-BLOB
-      b w ENCODE-BASELINE 2 SQLITE:BIND-TEXT
-      k MODEL:KEY>STR 3 SQLITE:BIND-BLOB
-      SQLITE:STEP drop ;]
+      k MODEL:KEY>STR 2 SQLITE:BIND-BLOB
+      bind execute SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT ;
+
+\ An absent baseline removes the path's row.
+: WRITE-BASELINE
+   ( SQLITE:connection MODEL:path MODEL:baseline ^ARENA:arena -- )
+   {: c path b ar :}
+   path ar MODEL:FOLD {: k :}
+   b MATCH MODEL:baseline
+      absent OF c k FORGET ENDOF
+      present OF
+         {: r :} c path k [: r BIND-PRESENT ;] PUT-BASELINE
+      ENDOF
+      directory OF c path k [: BIND-DIRECTORY ;] PUT-BASELINE ENDOF
+   ;MATCH ;
 
 : RETIRE-CONFLICTS ( SQLITE:connection MODEL:key -- )
    {: c k :}
@@ -2972,20 +3022,20 @@ create BLOCKED-QUERY PLAN-SELECT BLOCKED-WHERE LAY-BOTH
 
 : AGREED
    ( SQLITE:connection MODEL:path MODEL:key MODEL:baseline ^ARENA:arena
-     ^JSON:writer -- noop-write )
-   {: c path k b ar w :}
-   c path b ar w WRITE-BASELINE
+     -- noop-write )
+   {: c path k b ar :}
+   c path b ar WRITE-BASELINE
    c k RETIRE-CONFLICTS
    construct noop-write recorded ;
 
 : RECORD-NOOP-IN
    ( SQLITE:connection MODEL:path MODEL:baseline ^ARENA:arena
-     ^JSON:writer -- noop-write )
-   {: c path b ar w :}
+     -- noop-write )
+   {: c path b ar :}
    path ar MODEL:FOLD {: k :}
    c k LIVE-PLAN MATCH option
       some OF construct noop-write live-plan ENDOF
-      none OF c path k b ar w AGREED ENDOF
+      none OF c path k b ar AGREED ENDOF
    ;MATCH ;
 
 \ The plan read inside the transaction that wrote or found it; none is
@@ -3058,10 +3108,10 @@ create BLOCKED-QUERY PLAN-SELECT BLOCKED-WHERE LAY-BOTH
 
 : NOOP-ENTRY
    ( SQLITE:connection path-baseline ^VEC:vector<MODEL:path>
-     ^ARENA:arena ^JSON:writer -- n )
-   {: c e live ar w :}
+     ^ARENA:arena -- n )
+   {: c e live ar :}
    e JOURNAL-PATH--BASELINE:UNMAKE {: path b :}
-   c path b ar w RECORD-NOOP-IN MATCH noop-write
+   c path b ar RECORD-NOOP-IN MATCH noop-write
       recorded OF 1 ENDOF
       live-plan OF drop path live VEC:PUSH ! 0 ENDOF
    ;MATCH ;
@@ -3078,10 +3128,10 @@ create BLOCKED-QUERY PLAN-SELECT BLOCKED-WHERE LAY-BOTH
 
 : NOOPS-IN
    ( SQLITE:connection ^VEC:vector<path-baseline>
-     ^VEC:vector<MODEL:path> ^ARENA:arena ^JSON:writer -- n )
-   {: c noops live ar w :}
+     ^VEC:vector<MODEL:path> ^ARENA:arena -- n )
+   {: c noops live ar :}
    0 noops VEC:COUNT 0 ?do
-      c noops i VEC:AT @ live ar w NOOP-ENTRY +
+      c noops i VEC:AT @ live ar NOOP-ENTRY +
    loop ;
 
 : PLANS-IN
@@ -3097,7 +3147,7 @@ create BLOCKED-QUERY PLAN-SELECT BLOCKED-WHERE LAY-BOTH
      ^VEC:vector<path-plan> ^VEC:vector<MODEL:path> ^ARENA:arena
      ^JSON:writer -- reconciliation-write )
    {: c noops plans live ar w :}
-   c noops live ar w NOOPS-IN {: n :}
+   c noops live ar NOOPS-IN {: n :}
    c plans live ar w PLANS-IN {: p :}
    n p live JOURNAL-RECONCILIATION--WRITE:MAKE ;
 
@@ -3109,7 +3159,7 @@ public
    ( journal MODEL:path MODEL:baseline ^ARENA:arena -- noop-write )
    {: j path b ar :}
    j >CONNECTION {: c :}
-   c [: c path b ar [: RECORD-NOOP-IN ;] ENCODING ;]
+   c [: c path b ar RECORD-NOOP-IN ;]
    SQLITE:WITH-TRANSACTION ;
 
 \ Commits an ordered plan before an effect executor sees it; a live
@@ -3573,14 +3623,14 @@ STRUCTURE operation-state
 \ path's conflicts are resolved.
 : COMPLETE-FINAL
    ( SQLITE:connection operation-id operation-state MODEL:operation
-     MODEL:baseline ^ARENA:arena ^JSON:writer -- operation-completion )
-   {: c id s o b ar w :}
+     MODEL:baseline ^ARENA:arena -- operation-completion )
+   {: c id s o b ar :}
    o b OPERATION-MATCHES-BASELINE? 0= if
       construct operation-completion baseline-mismatch exit
    then
    s OPERATION-STATE-UNMAKE {: plan ordinal done:bool path json:str :}
    c id MARK-COMPLETED
-   c path b ar w WRITE-BASELINE
+   c path b ar WRITE-BASELINE
    c path ar MODEL:FOLD RETIRE-CONFLICTS
    c plan FINISH-PLAN
    c plan START-RECOVERY-RETENTION
@@ -3590,9 +3640,8 @@ STRUCTURE operation-state
 \ baseline, the final one with its own.
 : COMPLETE-IN-ORDER
    ( SQLITE:connection operation-id operation-state MODEL:operation
-     option<MODEL:baseline> ^ARENA:arena ^JSON:writer
-     -- operation-completion )
-   {: c id s o b ar w :}
+     option<MODEL:baseline> ^ARENA:arena -- operation-completion )
+   {: c id s o b ar :}
    c s LATER? if
       b SOME-BASELINE? if
          construct operation-completion unexpected-baseline exit
@@ -3602,39 +3651,38 @@ STRUCTURE operation-state
    then
    b MATCH option
       none OF construct operation-completion baseline-required ENDOF
-      some OF {: r :} c id s o r ar w COMPLETE-FINAL ENDOF
+      some OF {: r :} c id s o r ar COMPLETE-FINAL ENDOF
    ;MATCH ;
 
 : COMPLETE-FOUND
    ( SQLITE:connection operation-id operation-state
-     option<MODEL:baseline> ^ARENA:arena ^JSON:writer
-     -- operation-completion )
-   {: c id s b ar w :}
+     option<MODEL:baseline> ^ARENA:arena -- operation-completion )
+   {: c id s b ar :}
    s OPERATION-STATE-UNMAKE {: plan ordinal done:bool path json:str :}
    done if construct operation-completion already-completed exit then
    json path ar DECODE-OPERATION {: o :}
    c s EARLIER MATCH option
       some OF construct operation-completion waiting-for-earlier-operation
       ENDOF
-      none OF c id s o b ar w COMPLETE-IN-ORDER ENDOF
+      none OF c id s o b ar COMPLETE-IN-ORDER ENDOF
    ;MATCH ;
 
 : COMPLETE-OPERATION-IN
    ( SQLITE:connection operation-id option<MODEL:baseline> ^ARENA:arena
-     ^JSON:writer -- operation-completion )
-   {: c id b ar w :}
+     -- operation-completion )
+   {: c id b ar :}
    c id ar READ-STEP MATCH option
       none OF construct operation-completion not-found ENDOF
-      some OF {: s :} c id s b ar w COMPLETE-FOUND ENDOF
+      some OF {: s :} c id s b ar COMPLETE-FOUND ENDOF
    ;MATCH ;
 
 : COMPLETE-ALL
    ( SQLITE:connection ^VEC:vector<operation-baseline>
-     ^VEC:vector<operation-completion> ^ARENA:arena ^JSON:writer -- )
-   {: c finals outcomes ar w :}
+     ^VEC:vector<operation-completion> ^ARENA:arena -- )
+   {: c finals outcomes ar :}
    finals VEC:COUNT 0 ?do
       finals i VEC:AT @ JOURNAL-OPERATION--BASELINE:UNMAKE {: id b :}
-      c id b OPTION:SOME ar w COMPLETE-OPERATION-IN outcomes VEC:PUSH !
+      c id b OPTION:SOME ar COMPLETE-OPERATION-IN outcomes VEC:PUSH !
    loop ;
 
 
@@ -3696,7 +3744,7 @@ public
      -- operation-completion )
    {: j id b ar :}
    j >CONNECTION {: c :}
-   c [: c id b ar [: COMPLETE-OPERATION-IN ;] ENCODING ;]
+   c [: c id b ar COMPLETE-OPERATION-IN ;]
    SQLITE:WITH-TRANSACTION ;
 
 \ Completes independent final operations in one transaction: all, or
@@ -3708,7 +3756,7 @@ public
    ar [type] operation-completion NEW-VECTOR {: outcomes :}
    finals VEC:COUNT 0= if outcomes exit then
    j >CONNECTION {: c :}
-   c [: c finals outcomes ar [: COMPLETE-ALL ;] ENCODING ;]
+   c [: c finals outcomes ar COMPLETE-ALL ;]
    SQLITE:WITH-TRANSACTION
    outcomes ;
 

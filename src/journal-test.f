@@ -1,9 +1,11 @@
-\ journal-test.f - JOURNAL's open, schema 9, bindings, inventories,
+\ journal-test.f - JOURNAL's open, schema 10, bindings, inventories,
 \ baselines, plans, completions, conflicts and recoveries on journals
-\ under TMPDIR: a new journal's sqlite_master and user_version against
-\ src/oracle/schema.tsv as a set; versions 1, 7 and 10 refused unchanged;
-\ src/oracle/journal.sqlite3, a schema-8 journal, migrated with its local
-\ observations keyed by their folded paths, and, without its
+\ under TMPDIR: a new journal's sqlite_master against
+\ src/oracle/schema.tsv as a set, but for the baselines table, which is
+\ migrations/0010.sql's, and its user_version 10; versions 1, 7 and 11
+\ refused unchanged; src/oracle/journal.sqlite3, a schema-8 journal,
+\ migrated to 10 with its local observations keyed by their folded
+\ paths and its baselines in typed columns, and, without its
 \ remote_directories index, left at schema 8 with every row when the
 \ migration fails; a local scan published as its difference, every
 \ unchanged row keeping its rowid and the hashes of another generation
@@ -36,12 +38,17 @@
 \ its src/daemon.rs under their names, which
 \ build each decision the Rust ones ask the planner for as
 \ src/oracle/plan.tsv holds it. Habu opens no
-\ schema-6 file, so the version-six tests start from a schema-9 journal
+\ schema-6 file, so the version-six tests start from a schema-10 journal
 \ holding the row migration 7 leaves for a schema-6 root, birth and
 \ subvolume NULL, and the baseline the Rust tests' version_six_with_root
 \ writes. A copy of the oracle journal with a value MODEL cannot read
-\ in one row of each stored family is refused by the word that reads
-\ it, as E-JSON naming the row's path. Each case removes its directory;
+\ in one row of each stored JSON family is refused by the word that
+\ reads it, as E-JSON naming the row's path; at schema 9, a baseline
+\ refuses the migration so, leaving the file at 9 with every row. The
+\ oracle at schema 9 migrates a present, a directory and an absent
+\ baseline, the absent one gone, and the migration converts each of a
+\ list of texts exactly when MODEL's JSON reader reads it, to the
+\ baseline it reads. Each case removes its directory;
 \ a refusal's log line is captured in it, checked and removed.
 \ Run from the repository root: hb --load src/journal-test.f </dev/null
 require src/lib/error.f
@@ -152,13 +159,22 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    BODY BODY-U @ >str LINE u 2 + >str CONTAINS? ;
 
 
-\ The oracle journal copied to path and migrated to schema 9 in one
-\ transaction, its completed work kept.
-: MIGRATED-ORACLE ( str -- )
+\ The oracle journal copied to path and brought to schema 9 in one
+\ transaction.
+: NINE-ORACLE ( str -- )
    {: p:str :}
    s" src/oracle/journal.sqlite3" p FS:COPY-FILE-STREAM
    p SQLITE:OPEN {: c :}
    c [: c MIGRATE-LOCAL-OBSERVATIONS ;] SQLITE:WITH-TRANSACTION
+   c SQLITE:CLOSE ;
+
+\ The oracle journal copied to path and migrated to schema 10, its
+\ completed work kept.
+: MIGRATED-ORACLE ( str -- )
+   {: p:str :}
+   p NINE-ORACLE
+   p SQLITE:OPEN {: c :}
+   c [: c MIGRATE-TYPED-COLUMNS ;] SQLITE:WITH-TRANSACTION
    c SQLITE:CLOSE ;
 
 
@@ -318,11 +334,13 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
 
 \ ---- the journal's rows ------------------------------------------
 
+\ Every row but the baselines table's, as schema.tsv writes one.
 : SCHEMA-SQL ( -- str )
    s" SELECT type || char(9) || name || char(9) || tbl_name || char(9)
          || coalesce(replace(replace(replace(sql, '\', '\\'),
             char(10), '\n'), char(9), '\t'), '')
-      FROM sqlite_master" ;
+      FROM sqlite_master
+      WHERE NOT (type = 'table' AND name = 'baselines')" ;
 
 \ Counts the rows, each a line of BODY.
 : SCHEMA-ROWS ( n SQLITE:statement -- n SQLITE:statement )
@@ -337,6 +355,23 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    0 SQLITE:COL-TEXT str> {: a:^ u :}
    a BODY u BYTE-COPY
    u swap ;
+
+\ Whether BODY holds the first row's text.
+: BODY-HOLDS ( SQLITE:statement -- bool SQLITE:statement )
+   SQLITE:STEP drop 0 SQLITE:COL-TEXT {: t:str :}
+   BODY BODY-U @ >str t CONTAINS? swap ;
+
+\ The journal's schema is schema.tsv's but for the baselines table,
+\ which is migrations/0010.sql's, and its version is 10.
+: SCHEMA-10 ( journal -- )
+   >CONNECTION {: c :}
+   s" src/oracle/schema.tsv" ORACLE
+   0 c SCHEMA-SQL [: SCHEMA-ROWS ;] SQLITE:WITH-STATEMENT 25 T=
+   c VERSION 10 T=
+   s" migrations/0010.sql" ORACLE
+   c s" SELECT sql FROM sqlite_master
+      WHERE type = 'table' AND name = 'baselines'" [: BODY-HOLDS ;]
+   SQLITE:WITH-STATEMENT TTRUE ;
 
 : VERSIONED ( str n -- )
    {: p:str v :}
@@ -385,6 +420,24 @@ variable SCANNED       \ query plan rows that scan the table
 : REMOTE-FILE ( str str -- MODEL:remote )
    {: c:str r:str :}
    c CONTENT r DROPBOX:>REV MODEL-REMOTE:MAKE ;
+
+: NO-BASELINE? ( option<MODEL:baseline> -- bool )
+   MATCH option
+      none OF true ENDOF
+      some OF drop false ENDOF
+   ;MATCH ;
+
+: BASELINE-HELD? ( option<MODEL:baseline> MODEL:baseline -- bool )
+   {: want :}
+   MATCH option
+      none OF false ENDOF
+      some OF want MODEL:BASELINE= ENDOF
+   ;MATCH ;
+
+\ The oracle journal's baseline at Docs/A.txt.
+: ORACLE-FILE ( -- MODEL:baseline )
+   s" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+   s" 5f0a1b2c3d4e" REMOTE-FILE MODEL-BASELINE:PRESENT ;
 
 : PRESENT-REMOTE ( str str -- MODEL:observation<MODEL:remote> )
    REMOTE-FILE MODEL-OBSERVATION:PRESENT ;
@@ -727,24 +780,21 @@ variable SCANNED       \ query plan rows that scan the table
 
 : NEW-JOURNAL-HAS-THE-ORACLE-SCHEMA ( ^ARENA:arena -- )
    {: ar :}
-   s" a new journal's schema is schema.tsv's" T-LABEL
+   s" a new journal's schema is schema.tsv's and 0010.sql's" T-LABEL
    s" src/oracle/schema.tsv" ORACLE
+   BODY BODY-U @ >str 10 COUNT-CHAR 28 T=
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
-   0 j >CONNECTION SCHEMA-SQL [: SCHEMA-ROWS ;] SQLITE:WITH-STATEMENT
-   26 T=
-   j >CONNECTION VERSION 9 T=
-   s\" user_version\t9" HELD? TTRUE
-   BODY BODY-U @ >str 10 COUNT-CHAR 28 T=
+   j SCHEMA-10
    j CLOSE
    d GONE ;
 
 : OTHER-VERSIONS-ARE-REFUSED-UNCHANGED ( ^ARENA:arena -- )
    {: ar :}
-   s" versions 1, 7 and 10 are refused unchanged" T-LABEL
+   s" versions 1, 7 and 11 are refused unchanged" T-LABEL
    1 ar REFUSED
    7 ar REFUSED
-   10 ar REFUSED ;
+   11 ar REFUSED ;
 
 : ORACLE-JOURNAL-HOLDS-ITS-BINDINGS ( ^ARENA:arena -- )
    {: ar :}
@@ -774,14 +824,14 @@ variable SCANNED       \ query plan rows that scan the table
 
 : ORACLE-JOURNAL-IS-MIGRATED ( ^ARENA:arena -- )
    {: ar :}
-   s" the oracle journal migrates to schema.tsv's schema" T-LABEL
-   s" src/oracle/schema.tsv" ORACLE
+   s" the oracle journal migrates to schema 10" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    s" src/oracle/journal.sqlite3" p FS:COPY-FILE-STREAM
    p OPEN {: j :}
-   0 j >CONNECTION SCHEMA-SQL [: SCHEMA-ROWS ;] SQLITE:WITH-STATEMENT
-   26 T=
-   j >CONNECTION VERSION 9 T=
+   j SCHEMA-10
+   j s" Docs" DISPLAY ar BASELINE MODEL-BASELINE:DIRECTORY
+   BASELINE-HELD? TTRUE
+   j s" Docs/A.txt" DISPLAY ar BASELINE ORACLE-FILE BASELINE-HELD? TTRUE
    0 j >CONNECTION
    s" SELECT path, canonical_path FROM local_observations"
    [: ar FOLDED-ROWS ;] SQLITE:WITH-STATEMENT 3 T=
@@ -1132,7 +1182,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    ( ^ARENA:arena -- )
    {: ar :}
    s" journal_rejects_newer_schema_without_changing_its_version" T-LABEL
-   10 ar REFUSED ;
+   11 ar REFUSED ;
 
 : JOURNAL-SCHEMA-AND-PAYLOAD-COLUMNS-ARE-NOT-SECRET-BEARING
    ( ^ARENA:arena -- )
@@ -2114,10 +2164,8 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 \ A row of each family at its own key, every value a directory, each
 \ canonical path as MODEL:FOLD gives it.
 : KNOWN-FIXTURE ( -- str )
-   s\" INSERT INTO baselines(path, baseline_json, canonical_path)
-         SELECT CAST(column1 AS BLOB), column2, CAST(column3 AS BLOB)
-         FROM (VALUES ('Base', '\"Directory\"', 'base'),
-            ('gone', '\"Absent\"', 'gone'));
+   s\" INSERT INTO baselines(path, canonical_path, kind)
+         VALUES (CAST('Base' AS BLOB), CAST('base' AS BLOB), 1);
       INSERT INTO local_observations(path, observation_json,
             canonical_path)
          SELECT CAST(column1 AS BLOB), '\"Directory\"',
@@ -2206,7 +2254,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    SB$ ar COPIED ;
 
 \ The fixture's keys in byte order: "a.txt" before "a/b" ('.' before
-\ '/'), and neither the Absent baseline nor the completed plan.
+\ '/'), and not the completed plan.
 : KNOWN-WANT ( ^ARENA:arena -- str )
    {: ar :}
    SB-RESET
@@ -2374,19 +2422,6 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    MATCH noop-write
       recorded OF false ENDOF
       live-plan OF id ID= ENDOF
-   ;MATCH ;
-
-: NO-BASELINE? ( option<MODEL:baseline> -- bool )
-   MATCH option
-      none OF true ENDOF
-      some OF drop false ENDOF
-   ;MATCH ;
-
-: BASELINE-HELD? ( option<MODEL:baseline> MODEL:baseline -- bool )
-   {: want :}
-   MATCH option
-      none OF false ENDOF
-      some OF want MODEL:BASELINE= ENDOF
    ;MATCH ;
 
 : STATUS-N ( record-status -- n )
@@ -3269,7 +3304,7 @@ variable CRAFT
 : KEPT ( -- MODEL:baseline )
    s" kept" s" rev-kept" REMOTE-FILE MODEL-BASELINE:PRESENT ;
 
-\ A schema-9 journal holding a schema-6 root's row, as migration 7
+\ A schema-10 journal holding a schema-6 root's row, as migration 7
 \ copies it, and the baseline version_six_with_root writes.
 : LEGACY ( str ^ARENA:arena -- )
    {: p:str ar :}
@@ -3279,7 +3314,7 @@ variable CRAFT
          singleton, canonical_path, inode, generation
       ) VALUES (1, CAST('/sync/root' AS BLOB), X'0000000000000002', 3)"
    SQLITE:EXEC
-   c KEPT-PATH KEPT ar [: WRITE-BASELINE ;] ENCODING
+   c KEPT-PATH KEPT ar WRITE-BASELINE
    c SQLITE:CLOSE ;
 
 : OBSERVED ( -- MODEL:local-record )
@@ -3314,7 +3349,7 @@ variable CRAFT
    r ar LOCAL-ROOT-BINDING LEGACY-ROOT RECORD-HELD? TTRUE
    r CLOSE
    p OPEN {: j :}
-   j >CONNECTION VERSION 9 T=
+   j >CONNECTION VERSION 10 T=
    j ar LOCAL-ROOT-BINDING LEGACY-ROOT RECORD-HELD? TTRUE
    s" observed.txt" 10 ar LOCAL-HASH {: hash :}
    j LEGACY-ROOT >BINDING OBSERVED ar ONE-LOCAL hash ar ONE-HASH
@@ -4161,15 +4196,150 @@ variable CRAFT
 : HELD-PENDING-RECOVERIES ( -- )
    HELD-JOURNAL @ HELD-ARENA @ PENDING-RECOVERIES drop ;
 
-: AN-UNKNOWN-BASELINE-IS-REFUSED ( ^ARENA:arena -- )
+: PLANT-AT ( str str -- )
+   {: sql:str p:str :}
+   p SQLITE:OPEN {: c :}
+   c sql SQLITE:EXEC
+   c SQLITE:CLOSE ;
+
+\ At schema 9, a baseline MODEL cannot read refuses the migration.
+: AN-UNKNOWN-BASELINE-REFUSES-THE-MIGRATION ( ^ARENA:arena -- )
    {: ar :}
-   s" an unknown stored baseline is refused" T-LABEL
+   s" an unknown stored baseline refuses the migration" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p NINE-ORACLE
    s\" UPDATE baselines SET baseline_json = '{\"Future\":1}'
-      WHERE hex(path) = hex('Docs')" ar PLANTED {: d:str :}
-   [: HELD-JOURNAL @ s" Docs" HELD-ARENA @ CANONICAL HELD-ARENA @
-      KNOWN-PATH-AT drop ;] d s" deserialize baseline" s" Docs" ar
+      WHERE hex(path) = hex('Docs')" p PLANT-AT
+   p SUBJECT !
+   [: SUBJECT @ OPEN CLOSE ;] d s" deserialize baseline" s" Docs" ar
    UNREADABLE
-   d PLANTED-GONE ;
+   p VERSION-AT 9 T=
+   p SQLITE:OPEN {: c :}
+   c s\" SELECT count(*) FROM baselines
+      WHERE baseline_json = '{\"Future\":1}'" QUERY-INT 1 T=
+   c s" SELECT count(*) FROM baselines" QUERY-INT 2 T=
+   c s" SELECT count(*) FROM sqlite_master
+      WHERE name = 'converted_baselines'" QUERY-INT 0 T=
+   c SQLITE:CLOSE
+   d GONE ;
+
+\ A present, a directory and an absent baseline at schema 9 migrate; the
+\ absent one's row goes.
+: A-SCHEMA-9-JOURNAL-MIGRATES-ITS-BASELINES ( ^ARENA:arena -- )
+   {: ar :}
+   s" a schema-9 journal migrates each kind of baseline" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p NINE-ORACLE
+   s\" INSERT INTO baselines(path, baseline_json, canonical_path)
+      VALUES (CAST('Old/Gone.txt' AS BLOB), '\"Absent\"',
+         CAST('old/gone.txt' AS BLOB))" p PLANT-AT
+   p OPEN {: j :}
+   j >CONNECTION VERSION 10 T=
+   j s" Docs" DISPLAY ar BASELINE MODEL-BASELINE:DIRECTORY
+   BASELINE-HELD? TTRUE
+   j s" Docs/A.txt" DISPLAY ar BASELINE ORACLE-FILE BASELINE-HELD? TTRUE
+   j >CONNECTION s" SELECT count(*) FROM baselines
+      WHERE path = CAST('Old/Gone.txt' AS BLOB)" QUERY-INT 0 T=
+   j >CONNECTION s" SELECT count(*) FROM baselines" QUERY-INT 2 T=
+   j CLOSE
+   d GONE ;
+
+: SEED-DROP ( MODEL:baseline -- ) drop ;
+
+\ The baseline MODEL reads from the text, none for absent, and whether
+\ MODEL refuses the text.
+: CODEC-READ ( str ^ARENA:arena -- option<MODEL:baseline> bool )
+   {: t:str ar :}
+   MODEL-BASELINE:ABSENT [: SEED-DROP t ar MODEL:JSON>BASELINE ;] catch
+   {: b code :}
+   code 0<> if code MODEL:E-STORED T= NO-BASELINE true exit then
+   b ABSENT? if NO-BASELINE false exit then
+   b OPTION:SOME false ;
+
+\ The text as Docs's baseline at schema 9 in c, migrated, then rolled
+\ back: the baseline read back, and whether the migration refused it.
+: MIGRATION-READ
+   ( SQLITE:connection str str ^ARENA:arena
+     -- option<MODEL:baseline> bool )
+   {: c t:str f:str ar :}
+   c s" UPDATE baselines SET baseline_json = ?1
+      WHERE path = CAST('Docs' AS BLOB)" [: t 1 SQLITE:BIND-TEXT RAN ;]
+   SQLITE:WITH-STATEMENT
+   c s" BEGIN" SQLITE:EXEC
+   [: c MIGRATE-TYPED-COLUMNS ;] f ar STDERR:CAPTURING {: code e:str :}
+   code 0<> if
+      code E-JSON T=  e s" deserialize baseline" CONTAINS? TTRUE
+      c s" ROLLBACK" SQLITE:EXEC  NO-BASELINE true exit
+   then
+   c s" SELECT kind, content, revision FROM baselines
+      WHERE path = CAST('Docs' AS BLOB)" [: ar BASELINE-ROW ;]
+   SQLITE:WITH-STATEMENT {: b :}
+   c s" ROLLBACK" SQLITE:EXEC
+   b false ;
+
+: SAME-BASELINE? ( option<MODEL:baseline> option<MODEL:baseline> -- bool )
+   {: want :}
+   MATCH option
+      none OF want NO-BASELINE? ENDOF
+      some OF {: b :} want b BASELINE-HELD? ENDOF
+   ;MATCH ;
+
+\ The migration refuses the text exactly when MODEL does, and else
+\ reads the baseline MODEL reads.
+: CONVERTS ( SQLITE:connection str str ^ARENA:arena -- )
+   {: c t:str f:str ar :}
+   t T-LABEL
+   t ar CODEC-READ {: want refused:bool :}
+   c t f ar MIGRATION-READ {: got refuses:bool :}
+   refused bool>n refuses bool>n T=
+   got want SAME-BASELINE? TTRUE ;
+
+: READ-TEXTS ( SQLITE:connection str ^ARENA:arena -- )
+   {: c f:str ar :}
+   c s\" \"Directory\"" f ar CONVERTS
+   c s\" \"Absent\"" f ar CONVERTS
+   c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\"}}" f ar CONVERTS
+   c s\"  \"Directory\" " f ar CONVERTS
+   c s\" \"Dir\\u0065ctory\"" f ar CONVERTS
+   c s\" {\"Pr\\u0065sent\":{\"c\\u006fntent\":\"h\\u0041\",\"revision\":\"r\"}}" f ar CONVERTS
+   c s\" {\"Present\":{\"revision\":\"r\",\"x\":[1,{\"y\":null}],\"content\":\"h\"}}" f ar CONVERTS
+   c s\" {\"Present\":{\"content\":\"\",\"revision\":\"\"}}" f ar CONVERTS
+   c s\" {\"Present\":{\"content\":\"\\ud83d\\ude00\",\"revision\":\"r\"}}" f ar CONVERTS
+   c s\" {\"Present\":{\"content\":\"a\\u0000b\",\"revision\":\"r\"}}" f ar CONVERTS ;
+
+: REFUSED-TEXTS ( SQLITE:connection str ^ARENA:arena -- )
+   {: c f:str ar :}
+   c s\" \"Present\"" f ar CONVERTS
+   c s\" {\"Directory\":null}" f ar CONVERTS
+   c s\" {\"Absent\":null}" f ar CONVERTS
+   c s" not json" f ar CONVERTS
+   c s\" {\"Present\":{\"content\":\"h\"}}" f ar CONVERTS
+   c s\" {\"Present\":{\"content\":\"h\",\"content\":\"h\",\"revision\":\"r\"}}" f ar CONVERTS
+   c s\" {\"Present\":{\"content\":1,\"revision\":\"r\"}}" f ar CONVERTS
+   c s\" {\"Present\":{\"content\":\"h\",\"revision\":null}}" f ar CONVERTS
+   c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\"},\"x\":1}" f ar CONVERTS
+   c s\" {'Present':{\"content\":\"h\",\"revision\":\"r\"}}" f ar CONVERTS
+   c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\",}}" f ar CONVERTS
+   c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\"}} x" f ar CONVERTS
+   c s" []" f ar CONVERTS
+   c s\" {\"Present\":[]}" f ar CONVERTS
+   c s\" \"directory\"" f ar CONVERTS
+   c s\" \"Directory\\u0000\"" f ar CONVERTS
+   c s\" {\"Future\":1}" f ar CONVERTS
+   c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\",\"n\":123456789012345678901234567890}}" f ar CONVERTS
+   c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\",\"x\":{\"a\":1,\"a\":2}}}" f ar CONVERTS ;
+
+\ Each text as Docs's baseline of a schema-9 journal.
+: THE-MIGRATION-CONVERTS-WHAT-MODEL-READS ( ^ARENA:arena -- )
+   {: ar :}
+   ar JOURNAL-AT {: d:str p:str :}
+   p NINE-ORACLE
+   d s" stderr.txt" ar INSIDE {: f:str :}
+   p SQLITE:OPEN {: c :}
+   c f ar READ-TEXTS
+   c f ar REFUSED-TEXTS
+   c SQLITE:CLOSE
+   d GONE ;
 
 \ Plan 2's only operation, which PENDING-PLANS reads.
 : AN-UNKNOWN-OPERATION-IS-REFUSED ( ^ARENA:arena -- )
@@ -4325,7 +4495,9 @@ variable CRAFT
    ar BLOCKED-PLAN-UPLOAD-PAYLOADS-STAY-REFERENCED
    ar JOURNAL-PLAN-CONFLICT-COMPLETES-ONCE-WITHOUT-ADVANCING-BASELINE
    ar LIVE-PLAN-AT-ANSWERS-ONLY-A-LIVE-PLAN
-   ar AN-UNKNOWN-BASELINE-IS-REFUSED
+   ar AN-UNKNOWN-BASELINE-REFUSES-THE-MIGRATION
+   ar A-SCHEMA-9-JOURNAL-MIGRATES-ITS-BASELINES
+   ar THE-MIGRATION-CONVERTS-WHAT-MODEL-READS
    ar AN-UNKNOWN-OPERATION-IS-REFUSED
    ar AN-UNKNOWN-OBSERVATION-IS-REFUSED
    ar AN-UNKNOWN-BLOCKAGE-IS-REFUSED
