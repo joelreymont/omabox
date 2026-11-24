@@ -16,7 +16,7 @@
 \ visited once in path order, then gone; what a visit observes
 \ published, and a reused hash it confirms; a discarded subtree
 \ dropped from the scan but for its cached hashes, which publish;
-\ CACHED-HASH's lookup by path;
+\ the jobs a resolve moves to the reused hashes, and those it keeps;
 \ a scan's batch holding main's lock through its 512 writes and
 \ committing at the next, no transaction left open by a throw out of
 \ WITH-SCAN, a visit holding no lock of the batch before it, and a scan
@@ -1804,6 +1804,24 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 : LISTED-COUNTED ( scan str MODEL:stat -- scan )
    {: p:str st :} 1 ROWS-SEEN +! ;
 
+\ After LOCAL-HASH's times, and in SCAN-RESOLVE's table seconds 100.
+: RESOLVE-CUTOFF ( -- option<MODEL:cutoff> )
+   100 500 MODEL-CUTOFF:MAKE OPTION:SOME ;
+
+: NO-CUTOFF ( -- option<MODEL:cutoff> ) OPTION:NONE ;
+
+: JOB-OF ( scan MODEL:hash-record -- scan )
+   MODEL-HASH--RECORD:UNMAKE {: p:MODEL:path f h :}
+   p MODEL:PATH>STR f SCAN-JOB ;
+
+\ The record, which the cache held before the scan, as a job resolved
+\ into a reused hash.
+: CACHE-REUSED ( scan MODEL:hash-record -- scan )
+   {: r :}
+   r JOB-OF
+   r MODEL-HASH--RECORD:UNMAKE {: p:MODEL:path f h :}
+   p MODEL:PATH>STR RESOLVE-CUTOFF SCAN-RESOLVE ;
+
 \ The scan's reused hashes, jobs and listed directories are all visited.
 : NOTHING-LEFT ( scan -- scan )
    0 ROWS-SEEN !
@@ -1817,7 +1835,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    {: ar :}
    s" old.txt" s" old" PRESENT-LOCAL LOCAL-RECORD SCAN-OBSERVE
    s" old.txt" 10 ar LOCAL-HASH SCAN-HASH
-   s" old.txt" 10 ar LOCAL-HASH SCAN-REUSE
+   s" old.txt" 10 ar LOCAL-HASH CACHE-REUSED
    s" old.txt" 10 MARKED-FINGERPRINT SCAN-JOB
    s" old.txt" 10 MARKED-STAT SCAN-LISTED ;
 
@@ -1835,6 +1853,8 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    s" WITH-SCAN empties the previous scan" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p ar ACTIVE-JOURNAL {: j b :}
+   s" old.txt" 10 ar LOCAL-HASH {: old-hash :}
+   j b ar LOCALS old-hash ar ONE-HASH PUBLISH-LOCAL-SCAN TTRUE
    j [: ar OLD-SCANNED ;] WITH-SCAN
    s" new.txt" s" new" PRESENT-LOCAL LOCAL-RECORD {: new :}
    s" new.txt" 20 ar LOCAL-HASH {: new-hash :}
@@ -1881,16 +1901,25 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 
 : REUSES-VISITED ( scan ^ARENA:arena -- scan )
    {: ar :}
-   s" a-b" 1 ar LOCAL-HASH SCAN-REUSE
-   s" a/x" 2 ar LOCAL-HASH SCAN-REUSE
-   s" a" 3 ar LOCAL-HASH SCAN-REUSE
+   s" a-b" 1 ar LOCAL-HASH CACHE-REUSED
+   s" a/x" 2 ar LOCAL-HASH CACHE-REUSED
+   s" a" 3 ar LOCAL-HASH CACHE-REUSED
    0 ROWS-SEEN !  [: ar REUSE-SEEN ;] EACH-SCAN-REUSE  ROWS-SEEN @ 3 T=
    0 ROWS-SEEN !  [: REUSE-COUNTED ;] EACH-SCAN-REUSE  ROWS-SEEN @ 0 T= ;
 
 : EACH-SCAN-REUSE-VISITS-EACH-ROW-ONCE-IN-PATH-ORDER ( ^ARENA:arena -- )
    {: ar :}
    s" EACH-SCAN-REUSE visits each row once in path order" T-LABEL
-   ar [: [: ar REUSES-VISITED ;] WITH-SCAN ;] ON-NEW-JOURNAL ;
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   ar HASHES {: v :}
+   s" a-b" 1 ar LOCAL-HASH v HASH+
+   s" a/x" 2 ar LOCAL-HASH v HASH+
+   s" a" 3 ar LOCAL-HASH v HASH+
+   j b ar LOCALS v PUBLISH-LOCAL-SCAN TTRUE
+   j [: ar REUSES-VISITED ;] WITH-SCAN
+   j CLOSE
+   d GONE ;
 
 : JOBS-VISITED ( scan -- scan )
    s" a-b" 1 MARKED-FINGERPRINT SCAN-JOB
@@ -1925,7 +1954,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 : CONFIRMED-PUBLISHED
    ( scan local-root-binding ^ARENA:arena -- scan )
    {: b ar :}
-   s" a.txt" 10 ar LOCAL-HASH SCAN-REUSE
+   s" a.txt" 10 ar LOCAL-HASH CACHE-REUSED
    [: CONFIRMED ;] EACH-SCAN-REUSE
    b PUBLISH-SCAN TTRUE ;
 
@@ -1935,6 +1964,8 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    s" a visit publishes what it observes and hashes" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p ar ACTIVE-JOURNAL {: j b :}
+   j b ar LOCALS s" a.txt" 10 ar LOCAL-HASH ar ONE-HASH
+   PUBLISH-LOCAL-SCAN TTRUE
    j [: b ar CONFIRMED-PUBLISHED ;] WITH-SCAN
    j s" a.txt" s" a" PRESENT-LOCAL LOCAL-RECORD
    s" a.txt" 10 ar LOCAL-HASH ar SCAN-HELD
@@ -1956,7 +1987,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    s" a/x" s" x" PRESENT-LOCAL LOCAL-RECORD EVERYWHERE
    s" a-b" s" b" PRESENT-LOCAL LOCAL-RECORD EVERYWHERE
    s" ab" s" c" PRESENT-LOCAL LOCAL-RECORD EVERYWHERE
-   s" a/y" 5 ar LOCAL-HASH SCAN-REUSE
+   s" a/y" 5 ar LOCAL-HASH CACHE-REUSED
    s" a/z" 6 ar LOCAL-HASH SCAN-HASH
    s" a" SCAN-DISCARD
    0 ROWS-SEEN !  [: JOB-KEPT ;] EACH-SCAN-JOB  ROWS-SEEN @ 2 T=
@@ -1969,6 +2000,8 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    s" SCAN-DISCARD drops the subtree but keeps its hashes" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p ar ACTIVE-JOURNAL {: j b :}
+   j b ar LOCALS s" a/y" 5 ar LOCAL-HASH ar ONE-HASH
+   PUBLISH-LOCAL-SCAN TTRUE
    j [: b ar DISCARD-PUBLISHED ;] WITH-SCAN
    ar LOCALS {: obs :}  ar HASHES {: hashes :}
    s" a-b" s" b" PRESENT-LOCAL LOCAL-RECORD obs LOCAL+
@@ -1980,26 +2013,132 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    j CLOSE
    d GONE ;
 
-: DROP-HASH-RECORD ( MODEL:hash-record -- ) drop ;
+\ ---- SCAN-RESOLVE's table
 
-\ a.txt's hash is the one published; b.txt has an empty record.
-: LOOKED-UP-IN ( scan MODEL:hash-record ^ARENA:arena -- scan )
-   {: want ar :}
-   s" a.txt" ar CACHED-HASH TTRUE {: r :}
-   r want MODEL:HASH-RECORD= TTRUE
-   s" b.txt" ar CACHED-HASH TFALSE
-   NO-HASH-RECORD MODEL:HASH-RECORD= TTRUE ;
+\ Inode 7 and size 8, modified then changed at the times given.
+: TIMES-PRINT ( n n n n -- MODEL:fingerprint )
+   {: ms mn cs cn :}
+   7 8 ms mn cs cn MODEL-FINGERPRINT:MAKE ;
 
-: CACHED-HASH-ANSWERS-THE-PUBLISHED-HASH ( ^ARENA:arena -- )
+\ The cache's fingerprint at "f" in most rows of SCAN-RESOLVE's table.
+: BASE-PRINT ( -- MODEL:fingerprint ) 50 5 60 6 TIMES-PRINT ;
+
+\ BASE-PRINT with field k, 0 the inode to 5 the changed nanoseconds,
+\ one more.
+: SHIFTED ( n -- MODEL:fingerprint )
+   {: k :}
+   BASE-PRINT MODEL-FINGERPRINT:UNMAKE {: i s ms mn cs cn :}
+   k 0 = if i 1+ else i then  k 1 = if s 1+ else s then
+   k 2 = if ms 1+ else ms then  k 3 = if mn 1+ else mn then
+   k 4 = if cs 1+ else cs then  k 5 = if cn 1+ else cn then
+   MODEL-FINGERPRINT:MAKE ;
+
+\ Publishes the fingerprint as the cache's only record, at "f".
+: CACHE-HOLDS ( MODEL:fingerprint ^ARENA:arena -- MODEL:hash-record )
+   {: f ar :}
+   s" f" DISPLAY f ar A-HASH MODEL-HASH--RECORD:MAKE {: r :}
+   THE-JOURNAL @ THE-BINDING @ ar LOCALS r ar ONE-HASH
+   PUBLISH-LOCAL-SCAN TTRUE
+   r ;
+
+: REUSE-WANTED ( scan MODEL:hash-record MODEL:hash-record -- scan bool )
+   {: r want :}
+   r want MODEL:HASH-RECORD= TTRUE  1 ROWS-SEEN +!  false ;
+
+: FLAG-COUNT ( bool -- n ) if 1 else 0 then ;
+
+\ The job at "f" resolved under o moves to the reused hashes as want
+\ when moved holds, and else stays a job.
+: ROW-RESOLVED
+   ( scan MODEL:fingerprint option<MODEL:cutoff> MODEL:hash-record bool
+     -- scan )
+   {: f o:option<MODEL:cutoff> want moved:bool :}
+   s" f" f SCAN-JOB  s" " o SCAN-RESOLVE
+   0 ROWS-SEEN !  [: want REUSE-WANTED ;] EACH-SCAN-REUSE
+   ROWS-SEEN @ moved FLAG-COUNT T=
+   0 ROWS-SEEN !  [: JOB-COUNTED ;] EACH-SCAN-JOB
+   ROWS-SEEN @ moved 0= FLAG-COUNT T= ;
+
+\ A scan's job at "f" with the fingerprint, resolved under o.
+: RESOLVES
+   ( MODEL:hash-record MODEL:fingerprint option<MODEL:cutoff> bool -- )
+   {: want f o:option<MODEL:cutoff> moved:bool :}
+   THE-JOURNAL @ [: f o want moved ROW-RESOLVED ;] WITH-SCAN ;
+
+\ The cache and the job share the fingerprint.
+: SAME-ROW
+   ( MODEL:fingerprint option<MODEL:cutoff> bool ^ARENA:arena -- )
+   {: f o:option<MODEL:cutoff> moved:bool ar :}
+   f ar CACHE-HOLDS f o moved RESOLVES ;
+
+\ The job's fingerprint differs from the cache's in field k.
+: SHIFTED-ROW ( n ^ARENA:arena -- )
+   {: k ar :}
+   BASE-PRINT ar CACHE-HOLDS k SHIFTED RESOLVE-CUTOFF false RESOLVES ;
+
+\ The cache's record at "f" is another generation's.
+: GENERATION-ROW ( ^ARENA:arena -- )
    {: ar :}
-   s" CACHED-HASH answers the published hash" T-LABEL
+   BASE-PRINT ar CACHE-HOLDS {: r :}
+   THE-JOURNAL @ >CONNECTION
+   s" UPDATE local_hash_cache SET root_generation = root_generation + 1"
+   SQLITE:EXEC
+   r BASE-PRINT RESOLVE-CUTOFF false RESOLVES ;
+
+: RESOLVED-PATH ( n -- str ) 0= if s" a" exit then s" a/x" ;
+
+: UNRESOLVED-PATH ( n -- str ) 0= if s" a-b" exit then s" b" ;
+
+: MOVED-SEEN ( scan MODEL:hash-record ^ARENA:arena -- scan bool )
+   {: r ar :}
+   r MODEL-HASH--RECORD:UNMAKE {: p:MODEL:path f h :}
+   p MODEL:PATH>STR [: RESOLVED-PATH ;] SEEN-AT {: k :}
+   k RESOLVED-PATH k 2 + ar LOCAL-HASH r MODEL:HASH-RECORD= TTRUE
+   false ;
+
+: STAYED-SEEN ( scan str MODEL:fingerprint -- scan )
+   {: p:str f :}
+   p [: UNRESOLVED-PATH ;] SEEN-AT drop ;
+
+\ Resolving "a" moves the jobs at "a" and "a/x" alone.
+: SUBTREE-RESOLVED ( scan ^ARENA:arena -- scan )
+   {: ar :}
+   s" a" 2 ar LOCAL-HASH JOB-OF  s" a/x" 3 ar LOCAL-HASH JOB-OF
+   s" a-b" 4 ar LOCAL-HASH JOB-OF  s" b" 5 ar LOCAL-HASH JOB-OF
+   s" a" RESOLVE-CUTOFF SCAN-RESOLVE
+   0 ROWS-SEEN !  [: ar MOVED-SEEN ;] EACH-SCAN-REUSE  ROWS-SEEN @ 2 T=
+   0 ROWS-SEEN !  [: STAYED-SEEN ;] EACH-SCAN-JOB  ROWS-SEEN @ 2 T= ;
+
+\ The cache holds "a", "a/x", "a-b" and "b", each a job of the scan.
+: SUBTREE-ROW ( ^ARENA:arena -- )
+   {: ar :}
+   ar HASHES {: v :}
+   s" a" 2 ar LOCAL-HASH v HASH+  s" a/x" 3 ar LOCAL-HASH v HASH+
+   s" a-b" 4 ar LOCAL-HASH v HASH+  s" b" 5 ar LOCAL-HASH v HASH+
+   THE-JOURNAL @ THE-BINDING @ ar LOCALS v PUBLISH-LOCAL-SCAN TTRUE
+   THE-JOURNAL @ [: ar SUBTREE-RESOLVED ;] WITH-SCAN ;
+
+\ Each row: the fingerprint the cache and the job share, the cutoff and
+\ whether the job moves; then a field apart, another generation, "a".
+: SCAN-RESOLVE-MOVES-ONLY-REUSABLE-HASHES ( ^ARENA:arena -- )
+   {: ar :}
+   s" SCAN-RESOLVE moves only reusable hashes" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
-   p ar ACTIVE-JOURNAL {: j b :}
-   s" a.txt" s" a" PRESENT-LOCAL LOCAL-RECORD {: r :}
-   s" a.txt" 10 ar LOCAL-HASH {: h :}
-   j b r ar ONE-LOCAL h ar ONE-HASH PUBLISH-LOCAL-SCAN TTRUE
-   j [: h ar LOOKED-UP-IN ;] WITH-SCAN
-   j CLOSE
+   p ar ACTIVE-JOURNAL THE-BINDING ! THE-JOURNAL !
+   50 5 60 6 TIMES-PRINT RESOLVE-CUTOFF true ar SAME-ROW
+   100 499 60 6 TIMES-PRINT RESOLVE-CUTOFF true ar SAME-ROW
+   100 500 60 6 TIMES-PRINT RESOLVE-CUTOFF false ar SAME-ROW
+   50 5 100 499 TIMES-PRINT RESOLVE-CUTOFF true ar SAME-ROW
+   50 5 100 500 TIMES-PRINT RESOLVE-CUTOFF false ar SAME-ROW
+   50 1000000000 60 6 TIMES-PRINT RESOLVE-CUTOFF false ar SAME-ROW
+   50 -1 60 6 TIMES-PRINT RESOLVE-CUTOFF false ar SAME-ROW
+   50 5 60 1000000000 TIMES-PRINT RESOLVE-CUTOFF false ar SAME-ROW
+   50 5 60 -1 TIMES-PRINT RESOLVE-CUTOFF false ar SAME-ROW
+   50 5 60 6 TIMES-PRINT NO-CUTOFF false ar SAME-ROW
+   6 0 ?do i ar SHIFTED-ROW loop
+   ar GENERATION-ROW
+   ar SUBTREE-ROW
+   THE-JOURNAL @ CLOSE
    d GONE ;
 
 \ Another connection takes the journal at SUBJECT for writing, waiting
@@ -2018,18 +2157,13 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 : JOBS-WRITTEN ( scan n -- scan )
    0 ?do s" a" 1 MARKED-FINGERPRINT SCAN-JOB loop ;
 
-\ CACHED-HASH reads main, in the open batch if there is one; it finds
-\ no hash for "a.txt".
-: LOOKED-UP-NONE ( scan ^ARENA:arena -- scan )
-   {: ar :}
-   s" a.txt" ar CACHED-HASH TFALSE DROP-HASH-RECORD ;
-
-\ A write opens the batch and a lookup reads main into it; the batch holds
-\ main through BATCH-BOUND writes, and the write past them commits it.
+\ A write opens the batch and a resolve, a write too, reads main into it;
+\ the batch holds main through BATCH-BOUND writes, and the write past
+\ them commits it.
 : BOUNDED-BATCH ( scan str ^ARENA:arena -- scan )
    {: d:str ar :}
-   1 JOBS-WRITTEN ar LOOKED-UP-NONE
-   BATCH-BOUND 1 - JOBS-WRITTEN
+   1 JOBS-WRITTEN s" " RESOLVE-CUTOFF SCAN-RESOLVE
+   BATCH-BOUND 2 - JOBS-WRITTEN
    [: EXCLUSIVE ;] SQLITE:E-SQL d s" database is locked" ar LOGGED
    1 JOBS-WRITTEN
    [: EXCLUSIVE ;] d ar SILENT ;
@@ -2044,11 +2178,10 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    j CLOSE
    d GONE ;
 
-\ A write opens the batch and a lookup reads main into it, then the
+\ A write opens the batch and a resolve reads main into it, then the
 \ body throws.
-: THROWN-SCAN ( scan ^ARENA:arena -- scan )
-   {: ar :}
-   1 JOBS-WRITTEN ar LOOKED-UP-NONE
+: THROWN-SCAN ( scan -- scan )
+   1 JOBS-WRITTEN s" " RESOLVE-CUTOFF SCAN-RESOLVE
    E-INVALID-STATE throw ;
 
 : A-THROW-OUT-OF-WITH-SCAN-LEAVES-NO-TRANSACTION-OPEN ( ^ARENA:arena -- )
@@ -2057,7 +2190,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    ar JOURNAL-AT {: d:str p:str :}
    p ar ACTIVE-JOURNAL {: j b :}
    p SUBJECT !  j THE-JOURNAL !
-   [: j [: ar THROWN-SCAN ;] WITH-SCAN ;] E-INVALID-STATE TTHROWSQ
+   [: j [: THROWN-SCAN ;] WITH-SCAN ;] E-INVALID-STATE TTHROWSQ
    [: NONE-OPEN ;] d ar SILENT
    [: EXCLUSIVE ;] d ar SILENT
    j CLOSE
@@ -2072,12 +2205,12 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    BATCH-BOUND 1 + 0 ?do h SCAN-HASH loop
    [: EXCLUSIVE ;] d ar SILENT ;
 
-\ A write opens the batch and a lookup reads main into it before the
+\ A write opens the batch and a resolve reads main into it before the
 \ one job's visit.
 : VISITED-UNLOCKED ( scan str ^ARENA:arena -- scan )
    {: d:str ar :}
    s" a.txt" 10 ar LOCAL-HASH {: h :}
-   1 JOBS-WRITTEN ar LOOKED-UP-NONE
+   1 JOBS-WRITTEN s" " RESOLVE-CUTOFF SCAN-RESOLVE
    [: h d ar UNLOCKED-VISIT ;] EACH-SCAN-JOB ;
 
 : A-VISIT-HOLDS-NO-LOCK-OF-THE-BATCH-BEFORE-IT ( ^ARENA:arena -- )
@@ -4463,21 +4596,31 @@ variable CRAFT
    $7FFFFFFFFFFFFFFF 6 -7 8 -9 10 MODEL-FINGERPRINT:MAKE
    ar A-HASH MODEL-HASH--RECORD:MAKE ;
 
-: HASH-GONE ( scan str ^ARENA:arena -- scan )
-   CACHED-HASH TFALSE DROP-HASH-RECORD ;
+: HASH-HELD ( ^VEC:vector<MODEL:hash-record> MODEL:hash-record -- )
+   {: v r :}
+   false v VEC:COUNT 0 ?do v i VEC:AT @ r MODEL:HASH-RECORD= or loop
+   TTRUE ;
 
-\ CACHED-HASH answers the rows that convert as their records and no
-\ other.
-: HASHES-MIGRATED ( scan ^ARENA:arena -- scan )
-   {: ar :}
-   s" Kept" ar CACHED-HASH TTRUE
-   s" Kept" 10 ar LOCAL-HASH MODEL:HASH-RECORD= TTRUE
-   s" Spaced" ar CACHED-HASH TTRUE
-   ar SPACED-RECORD MODEL:HASH-RECORD= TTRUE
-   s" Malformed" ar HASH-GONE  s" Missing" ar HASH-GONE
-   s" Repeated" ar HASH-GONE  s" Upper" ar HASH-GONE
-   s" Nul" ar HASH-GONE  s" Negative" ar HASH-GONE
-   s" Big" ar HASH-GONE ;
+: AT-PATH? ( MODEL:hash-record str -- bool )
+   {: r p:str :}
+   r MODEL-HASH--RECORD:UNMAKE {: q:MODEL:path f h :}
+   q MODEL:PATH>STR p STR:= ;
+
+: HASH-GONE ( ^VEC:vector<MODEL:hash-record> str -- )
+   {: v p:str :}
+   false v VEC:COUNT 0 ?do v i VEC:AT @ p AT-PATH? or loop TFALSE ;
+
+\ The active root's cache holds the rows that convert as their records
+\ and no other.
+: HASHES-MIGRATED ( journal ^ARENA:arena -- )
+   {: j ar :}
+   j ar LOCAL-HASH-CACHE {: v :}
+   v s" Kept" 10 ar LOCAL-HASH HASH-HELD
+   v ar SPACED-RECORD HASH-HELD
+   v s" Malformed" HASH-GONE  v s" Missing" HASH-GONE
+   v s" Repeated" HASH-GONE  v s" Upper" HASH-GONE
+   v s" Nul" HASH-GONE  v s" Negative" HASH-GONE
+   v s" Big" HASH-GONE ;
 
 \ The rows that convert join the oracle's one; the others go.
 : A-SCHEMA-9-JOURNAL-MIGRATES-ITS-HASH-CACHE ( ^ARENA:arena -- )
@@ -4490,7 +4633,7 @@ variable CRAFT
    j >CONNECTION VERSION 10 T=
    j >CONNECTION s" SELECT count(*) FROM local_hash_cache" QUERY-INT
    3 T=
-   j [: ar HASHES-MIGRATED ;] WITH-SCAN
+   j ar HASHES-MIGRATED
    j CLOSE
    d GONE ;
 
@@ -4905,7 +5048,7 @@ variable CRAFT
    ar EACH-SCAN-LISTED-VISITS-EACH-ROW-ONCE-IN-PATH-ORDER
    ar A-VISIT-PUBLISHES-WHAT-IT-OBSERVES-AND-HASHES
    ar SCAN-DISCARD-DROPS-THE-SUBTREE-BUT-KEEPS-ITS-HASHES
-   ar CACHED-HASH-ANSWERS-THE-PUBLISHED-HASH
+   ar SCAN-RESOLVE-MOVES-ONLY-REUSABLE-HASHES
    ar A-BATCH-COMMITS-AT-ITS-BOUND
    ar A-THROW-OUT-OF-WITH-SCAN-LEAVES-NO-TRANSACTION-OPEN
    ar A-VISIT-HOLDS-NO-LOCK-OF-THE-BATCH-BEFORE-IT

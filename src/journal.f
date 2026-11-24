@@ -1380,8 +1380,8 @@ private
 
 \ ---- the local scan ------------------------------------------------
 
-\ A scan's batch: the transaction a write opens and later writes and lookups
-\ join, so temp is not flushed nor main's lock retaken at each.
+\ A scan's batch: the transaction a write opens and later writes join, so
+\ temp is not flushed nor main's lock retaken at each.
 ENUM batch-state none open ;ENUM
 \ What the scan does next: a write; commit, before an EACH-ROW's SELECT,
 \ a publish or its body's return; close, its scope closing.
@@ -1402,16 +1402,15 @@ public
 
 \ A scan's rows lie in temp tables: scan_observations and scan_hashes,
 \ which it publishes, and scan_cached, scan_jobs and scan_listed, which
-\ hold reused hashes, files to hash and listed directories until visited.
+\ hold reused hashes, files to hash and listed directories until visited;
+\ a job SCAN-RESOLVE finds reusable in the hash cache moves to scan_cached.
 \ Its batch lies under its statements.
 STRUCTURE scan OPAQUE
    FIELD batch ^batch
    FIELD observe-insert SQLITE:statement
    FIELD hash-insert SQLITE:statement
-   FIELD reuse-insert SQLITE:statement
    FIELD job-insert SQLITE:statement
    FIELD listed-insert SQLITE:statement
-   FIELD cached-lookup SQLITE:statement
    FIELD journal journal
    FIELD arena ^ARENA:arena
 ;STRUCTURE
@@ -1509,10 +1508,6 @@ $2F constant SLASH
    7 SQLITE:COL-INT {: cs :}  8 SQLITE:COL-INT {: cn :}
    p d i m s ms mn cs cn MODEL-STAT:MAKE ;
 
-: NO-HASH-RECORD ( -- MODEL:hash-record )
-   s" " MODEL:>PATH MODEL:NO-FINGERPRINT MODEL:NO-HASH
-   MODEL-HASH--RECORD:MAKE ;
-
 \ A row of the hash cache or temp.scan_cached as the record its columns
 \ hold; the path and content are copied into ar.
 : REUSE-ROW
@@ -1525,16 +1520,6 @@ $2F constant SLASH
    5 SQLITE:COL-INT {: cs :}  6 SQLITE:COL-INT {: cn :}
    7 ar TEXT-COPY DROPBOX:>HASH {: h:DROPBOX:hash :}
    p i s ms mn cs cn MODEL-FINGERPRINT:MAKE h MODEL-HASH--RECORD:MAKE ;
-
-\ The row is copied before the statement is reset for the next lookup.
-: LOOKED-UP
-   ( SQLITE:statement str ^ARENA:arena
-     -- SQLITE:statement MODEL:hash-record bool )
-   {: p:str ar :}
-   p 1 SQLITE:BIND-BLOB
-   SQLITE:STEP 0= if SQLITE:RESET NO-HASH-RECORD false exit then
-   ar REUSE-ROW {: r :}
-   SQLITE:RESET r true ;
 
 : LOCAL-RECORDS=
    ( ^VEC:vector<MODEL:local-record> ^VEC:vector<MODEL:local-record>
@@ -1565,12 +1550,6 @@ $2F constant SLASH
          changed_seconds, changed_nanoseconds, content_hash
       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)" ;
 
-: REUSE-SCAN ( -- str )
-   s" INSERT OR REPLACE INTO temp.scan_cached(
-         path, inode, size, modified_seconds, modified_nanoseconds,
-         changed_seconds, changed_nanoseconds, content_hash
-      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)" ;
-
 : JOB-SCAN ( -- str )
    s" INSERT OR REPLACE INTO temp.scan_jobs(
          path, inode, size, modified_seconds, modified_nanoseconds,
@@ -1582,12 +1561,6 @@ $2F constant SLASH
          path, dev, inode, mode, size, modified_seconds,
          modified_nanoseconds, changed_seconds, changed_nanoseconds
       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)" ;
-
-: CACHED-SCAN ( -- str )
-   s" SELECT path, inode, size, modified_seconds, modified_nanoseconds,
-         changed_seconds, changed_nanoseconds, content_hash
-      FROM local_hash_cache WHERE path = ?1 AND root_generation =
-         (SELECT generation FROM local_root_binding WHERE singleton = 1)" ;
 
 : SCAN-TABLES ( -- str )
    s" CREATE TABLE IF NOT EXISTS temp.scan_observations(
@@ -1706,8 +1679,8 @@ FSM:DEFINE BATCHING ( ^batch ) batch-state batch-input
 
 : SCAN-BATCH ( scan -- scan ^batch )
    SCAN-UNMAKE {: j ar :}
-   >r >r >r >r >r >r {: b :}
-   b r> r> r> r> r> r> j ar SCAN-MAKE b ;
+   >r >r >r >r {: b :}
+   b r> r> r> r> j ar SCAN-MAKE b ;
 
 : SCAN-STEPPED ( scan batch-input -- scan )
    {: i:batch-input :}
@@ -1721,73 +1694,53 @@ FSM:DEFINE BATCHING ( ^batch ) batch-state batch-input
 \ body returns.
 : BATCHED-SCAN
    ( R SQLITE:statement SQLITE:statement SQLITE:statement
-     SQLITE:statement SQLITE:statement SQLITE:statement journal
-     [ R scan -- S scan ] ^ARENA:arena ^batch
+     SQLITE:statement journal [ R scan -- S scan ] ^ARENA:arena ^batch
      -- S SQLITE:statement SQLITE:statement SQLITE:statement
-     SQLITE:statement SQLITE:statement SQLITE:statement )
+     SQLITE:statement )
    {: j body ar b :}
-   >r >r >r >r >r >r b r> r> r> r> r> r>
+   >r >r >r >r b r> r> r> r>
    j ar SCAN-MAKE body execute COMMITTING
    SCAN-UNMAKE drop drop
-   >r >r >r >r >r >r drop r> r> r> r> r> r> ;
+   >r >r >r >r drop r> r> r> r> ;
 
 \ BATCHED-SCAN with its batch in ba, closed however body ends.
 : BATCH-KEPT
    ( R SQLITE:statement SQLITE:statement SQLITE:statement
-     SQLITE:statement SQLITE:statement SQLITE:statement journal
-     [ R scan -- S scan ] ^ARENA:arena ^ARENA:arena
+     SQLITE:statement journal [ R scan -- S scan ] ^ARENA:arena
+     ^ARENA:arena
      -- S SQLITE:statement SQLITE:statement SQLITE:statement
-     SQLITE:statement SQLITE:statement SQLITE:statement )
+     SQLITE:statement )
    {: j body ar ba :}
    j >CONNECTION ba NEW-BATCH {: b :}
    j body ar b [: BATCHED-SCAN ;] [: b CLOSED ;] finally ;
 
 : SCANNING
    ( R SQLITE:statement SQLITE:statement SQLITE:statement
-     SQLITE:statement SQLITE:statement SQLITE:statement journal
-     [ R scan -- S scan ] ^ARENA:arena
-     -- S SQLITE:statement SQLITE:statement SQLITE:statement
-     SQLITE:statement SQLITE:statement SQLITE:statement )
-   [: BATCH-KEPT ;] ARENA:WITH ;
-
-: LOOKUP-PREPARED
-   ( R SQLITE:statement SQLITE:statement SQLITE:statement
-     SQLITE:statement SQLITE:statement journal [ R scan -- S scan ]
-     -- S SQLITE:statement SQLITE:statement SQLITE:statement
-     SQLITE:statement SQLITE:statement )
-   {: j body :}
-   j >CONNECTION CACHED-SCAN [: j body [: SCANNING ;] ARENA:WITH ;]
-   SQLITE:WITH-STATEMENT ;
-
-: LISTED-PREPARED
-   ( R SQLITE:statement SQLITE:statement SQLITE:statement
-     SQLITE:statement journal [ R scan -- S scan ]
+     SQLITE:statement journal [ R scan -- S scan ] ^ARENA:arena
      -- S SQLITE:statement SQLITE:statement SQLITE:statement
      SQLITE:statement )
-   {: j body :}
-   j >CONNECTION LISTED-SCAN [: j body LOOKUP-PREPARED ;]
-   SQLITE:WITH-STATEMENT ;
+   [: BATCH-KEPT ;] ARENA:WITH ;
 
-: JOB-PREPARED
+: LISTED-PREPARED
    ( R SQLITE:statement SQLITE:statement SQLITE:statement journal
      [ R scan -- S scan ]
      -- S SQLITE:statement SQLITE:statement SQLITE:statement )
    {: j body :}
-   j >CONNECTION JOB-SCAN [: j body LISTED-PREPARED ;]
+   j >CONNECTION LISTED-SCAN [: j body [: SCANNING ;] ARENA:WITH ;]
    SQLITE:WITH-STATEMENT ;
 
-: REUSE-PREPARED
+: JOB-PREPARED
    ( R SQLITE:statement SQLITE:statement journal [ R scan -- S scan ]
      -- S SQLITE:statement SQLITE:statement )
    {: j body :}
-   j >CONNECTION REUSE-SCAN [: j body JOB-PREPARED ;]
+   j >CONNECTION JOB-SCAN [: j body LISTED-PREPARED ;]
    SQLITE:WITH-STATEMENT ;
 
 : HASH-PREPARED
    ( R SQLITE:statement journal [ R scan -- S scan ]
      -- S SQLITE:statement )
    {: j body :}
-   j >CONNECTION HASH-SCAN [: j body REUSE-PREPARED ;]
+   j >CONNECTION HASH-SCAN [: j body JOB-PREPARED ;]
    SQLITE:WITH-STATEMENT ;
 
 : SCAN-JOURNAL ( scan -- scan journal )
@@ -1828,7 +1781,7 @@ FSM:DEFINE BATCHING ( ^batch ) batch-state batch-input
 : HASH-COPIED ( scan MODEL:hash-record -- scan )
    {: r :}
    WRITING SCAN-UNMAKE {: j ar :}
-   >r >r >r >r  r RECORD-INSERTED  r> r> r> r>
+   >r >r  r RECORD-INSERTED  r> r>
    j ar SCAN-MAKE ;
 
 \ The statement waits on the return stack while body runs; a hash body
@@ -1894,6 +1847,51 @@ FSM:DEFINE BATCHING ( ^batch ) batch-state batch-input
       WHERE path = ?1 OR (path >= ?2 AND path < ?3)" SUBTREE-RAN
    c p lo hi s" DELETE FROM temp.scan_listed
       WHERE path = ?1 OR (path >= ?2 AND path < ?3)" SUBTREE-RAN ;
+
+\ ?1 and [?2, ?3) bound the jobs as SUBTREE-RAN's do, but ?1 "" takes
+\ every job; (?4, ?5) is the cutoff, seconds then nanoseconds.
+: RESOLVE-SCAN ( -- str )
+   s" INSERT OR REPLACE INTO temp.scan_cached(
+         path, inode, size, modified_seconds, modified_nanoseconds,
+         changed_seconds, changed_nanoseconds, content_hash
+      ) SELECT c.path, c.inode, c.size, c.modified_seconds,
+         c.modified_nanoseconds, c.changed_seconds,
+         c.changed_nanoseconds, c.content_hash
+      FROM temp.scan_jobs AS j JOIN local_hash_cache AS c
+         ON c.path = j.path AND c.root_generation =
+            (SELECT generation FROM local_root_binding
+               WHERE singleton = 1)
+      WHERE (?1 = x'' OR j.path = ?1 OR (j.path >= ?2 AND j.path < ?3))
+         AND c.inode = j.inode AND c.size = j.size
+         AND c.modified_seconds = j.modified_seconds
+         AND c.modified_nanoseconds = j.modified_nanoseconds
+         AND c.changed_seconds = j.changed_seconds
+         AND c.changed_nanoseconds = j.changed_nanoseconds
+         AND c.modified_nanoseconds >= 0
+         AND c.modified_nanoseconds < 1000000000
+         AND (c.modified_seconds < ?4 OR (c.modified_seconds = ?4
+            AND c.modified_nanoseconds < ?5))
+         AND c.changed_nanoseconds >= 0
+         AND c.changed_nanoseconds < 1000000000
+         AND (c.changed_seconds < ?4 OR (c.changed_seconds = ?4
+            AND c.changed_nanoseconds < ?5))" ;
+
+: RESOLVED-SCAN ( -- str )
+   s" DELETE FROM temp.scan_jobs
+      WHERE (?1 = x'' OR path = ?1 OR (path >= ?2 AND path < ?3))
+         AND path IN (SELECT path FROM temp.scan_cached)" ;
+
+: JOBS-RESOLVED
+   ( SQLITE:connection str MODEL:cutoff ^ARENA:arena -- )
+   {: c p:str cut:MODEL:cutoff ar :}
+   p SLASH ar SUFFIXED {: lo:str :}
+   p SLASH 1+ ar SUFFIXED {: hi:str :}
+   cut MODEL-CUTOFF:UNMAKE {: s ns :}
+   c RESOLVE-SCAN [:
+      p 1 SQLITE:BIND-BLOB lo 2 SQLITE:BIND-BLOB hi 3 SQLITE:BIND-BLOB
+      s 4 SQLITE:BIND-INT ns 5 SQLITE:BIND-INT RAN
+   ;] SQLITE:WITH-STATEMENT
+   c p lo hi RESOLVED-SCAN SUBTREE-RAN ;
 
 : OBSERVATIONS-DIFFERENCE ( -- str )
    s" DELETE FROM local_observations WHERE NOT EXISTS (
@@ -1981,33 +1979,25 @@ public
 : SCAN-OBSERVE ( scan MODEL:local-record -- scan )
    {: r :}
    WRITING SCAN-UNMAKE {: j ar :}
-   >r >r >r >r >r
+   >r >r >r
    r ar LOCAL-INSERTED ar ARENA:RESET
-   r> r> r> r> r>
+   r> r> r>
    j ar SCAN-MAKE ;
 
 \ Records the hash in the scan, replacing one at its path.
 : SCAN-HASH ( scan MODEL:hash-record -- scan )
    {: r :}
    WRITING SCAN-UNMAKE {: j ar :}
-   >r >r >r >r
+   >r >r
    r HASH-INSERTED
-   r> r> r> r>
+   r> r>
    j ar SCAN-MAKE ;
 
-\ Records a cached hash the walk reused, as CACHED-HASH answered it,
-\ replacing one at its path.
-: SCAN-REUSE ( scan MODEL:hash-record -- scan )
-   {: r :}
-   WRITING SCAN-UNMAKE {: j ar :}
-   >r >r >r  r RECORD-INSERTED  r> r> r>
-   j ar SCAN-MAKE ;
-
-\ Records a file no cached hash covers, replacing one at its path.
+\ Records a file to hash, replacing one at its path.
 : SCAN-JOB ( scan str MODEL:fingerprint -- scan )
    {: p:str f :}
    WRITING SCAN-UNMAKE {: j ar :}
-   >r >r  p f JOB-INSERTED  r> r>
+   >r  p f JOB-INSERTED  r>
    j ar SCAN-MAKE ;
 
 \ Records a directory the walk listed, with its stat before the listing,
@@ -2015,7 +2005,7 @@ public
 : SCAN-LISTED ( scan str MODEL:stat -- scan )
    {: p:str st :}
    WRITING SCAN-UNMAKE {: j ar :}
-   >r  p st LISTED-INSERTED  r>
+   p st LISTED-INSERTED
    j ar SCAN-MAKE ;
 
 \ An EACH-SCAN word's row is valid only during body, which reads no journal
@@ -2053,23 +2043,28 @@ public
    s" DELETE FROM temp.scan_listed" EACH-ROW ;
 
 \ Forgets the path, never the root "", and every path beneath it. A
-\ cached hash among them matched its file's fingerprint when the walk
-\ took it, so it is kept as a published hash: dropping it would rehash
-\ an untouched subtree on every later pass.
+\ cached hash among them matched its file's fingerprint when the scan
+\ resolved it, so it is kept as a published hash: dropping it would
+\ rehash an untouched subtree on every later pass.
 : SCAN-DISCARD ( scan str -- scan )
    {: p:str :}
    WRITING SCAN-UNMAKE {: j ar :}
    j >CONNECTION p ar DISCARDED ar ARENA:RESET
    j ar SCAN-MAKE ;
 
-\ The hash the active root's cache holds for the path, copied into ar;
-\ false, with an empty record, when it holds none.
-: CACHED-HASH
-   ( scan str ^ARENA:arena -- scan MODEL:hash-record bool )
-   {: p:str ar :}
-   SCAN-UNMAKE {: j sa :}
-   p ar LOOKED-UP {: r found :}
-   j sa SCAN-MAKE r found ;
+\ Each job at or beneath the path, every job for the root "", whose
+\ file the active root's cache holds with the same fingerprint, changed
+\ before the cutoff, becomes a reused hash; with no cutoff, none does.
+: SCAN-RESOLVE ( scan str option<MODEL:cutoff> -- scan )
+   {: p:str o:option<MODEL:cutoff> :}
+   o MATCH option
+      none OF ENDOF
+      some OF {: c:MODEL:cutoff :}
+         WRITING SCAN-UNMAKE {: j ar :}
+         j >CONNECTION p c ar JOBS-RESOLVED ar ARENA:RESET
+         j ar SCAN-MAKE
+      ENDOF
+   ;MATCH ;
 
 \ Makes the local inventory and the active root's hash cache the scan's
 \ in one transaction, after the open batch commits; false, nothing

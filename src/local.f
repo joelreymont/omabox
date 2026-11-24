@@ -998,23 +998,16 @@ ENUM name-entry
 3 constant RACY-WINDOW
 1000000000 constant NS-PER-S
 
-\ The time a reusable hash's file was last changed before.
-STRUCTURE cutoff
-   FIELD seconds n
-   FIELD nanoseconds n
-;STRUCTURE
-
 STRUCTURE scanned-hash
    FIELD record MODEL:hash-record
    FIELD reusable bool
 ;STRUCTURE
 
-\ The walk's settings, which no step changes: lookup holds one file's
-\ cache answer at a time, and any device but root-device is out of scope.
+\ The walk's settings, which no step changes: any device but
+\ root-device is out of scope.
 STRUCTURE scan-context
-   FIELD cutoff option<cutoff>
+   FIELD cutoff option<MODEL:cutoff>
    FIELD root-device n
-   FIELD lookup ^ARENA:arena
 ;STRUCTURE
 
 \ An enumerated root whose files are still to hash; it owns root-fd.
@@ -1041,15 +1034,15 @@ private
 
 \ Rust's hash_cache_cutoff, from seconds since the epoch: Habu's clock reads
 \ no finer, and the second's start only makes fewer hashes reusable.
-: HASH-CACHE-CUTOFF ( n -- option<cutoff> )
+: HASH-CACHE-CUTOFF ( n -- option<MODEL:cutoff> )
    {: now:n :}
    now RACY-WINDOW - {: s:n :}
    s 0 < if OPTION:NONE exit then
-   s 0 CUTOFF-MAKE OPTION:SOME ;
+   s 0 MODEL-CUTOFF:MAKE OPTION:SOME ;
 
-: TIMESTAMP-IS-BEFORE ( n n cutoff -- bool )
-   {: s:n ns:n c:cutoff :}
-   c CUTOFF-UNMAKE {: cs:n cns:n :}
+: TIMESTAMP-IS-BEFORE ( n n MODEL:cutoff -- bool )
+   {: s:n ns:n c:MODEL:cutoff :}
+   c MODEL-CUTOFF:UNMAKE {: cs:n cns:n :}
    ns 0 < ns NS-PER-S >= or if false exit then
    s cs < if true exit then
    s cs = ns cns < and ;
@@ -1063,17 +1056,17 @@ private
    {: p:MODEL:path f:MODEL:fingerprint c:DROPBOX:hash :}
    p MODEL:PATH>STR ;
 
-: HASH-IS-REUSABLE ( MODEL:hash-record option<cutoff> -- bool )
-   {: r:MODEL:hash-record o:option<cutoff> :}
+: HASH-IS-REUSABLE ( MODEL:hash-record option<MODEL:cutoff> -- bool )
+   {: r:MODEL:hash-record o:option<MODEL:cutoff> :}
    r RECORD-FINGERPRINT MODEL-FINGERPRINT:UNMAKE {: i s ms mn cs cn :}
    o MATCH option
       none OF false ENDOF
-      some OF {: c:cutoff :}
+      some OF {: c:MODEL:cutoff :}
          ms mn c TIMESTAMP-IS-BEFORE cs cn c TIMESTAMP-IS-BEFORE and
       ENDOF
    ;MATCH ;
 
-: CURRENT-HASH-CACHE-CUTOFF ( -- option<cutoff> )
+: CURRENT-HASH-CACHE-CUTOFF ( -- option<MODEL:cutoff> )
    epoch-seconds HASH-CACHE-CUTOFF ;
 
 \ ---- records
@@ -1230,43 +1223,6 @@ private
       LIST-PATHS ;] catch {: code:n :}
    code 0<> if drop none then code STEP-CODE ;
 
-\ The path's cached hash, in ar, and whether it still describes the
-\ file and the cutoff lets it be reused.
-: REUSABLE-HASH
-   ( JOURNAL:scan scan-context str MODEL:fingerprint ^ARENA:arena
-     -- JOURNAL:scan MODEL:hash-record bool )
-   {: cx:scan-context path:str print:MODEL:fingerprint ar:^ARENA:arena :}
-   cx SCAN-CONTEXT-UNMAKE
-   {: cut:option<cutoff> dev:n lookup:^ARENA:arena :}
-   path ar JOURNAL:CACHED-HASH
-   {: r:MODEL:hash-record found:bool :}
-   found 0= if r false exit then
-   r RECORD-FINGERPRINT print SAME-FINGERPRINT?
-   r cut HASH-IS-REUSABLE and {: ok:bool :}
-   r ok ;
-
-\ The file as a cached hash in ar or as a file to hash; a reused record
-\ matched the walk's in every field, so it goes on as the cache holds it.
-: COLLECT-IN
-   ( JOURNAL:scan ^ARENA:arena str MODEL:fingerprint scan-context
-     -- JOURNAL:scan )
-   {: ar:^ARENA:arena path:str print:MODEL:fingerprint
-      cx:scan-context :}
-   cx path print ar REUSABLE-HASH
-   {: r:MODEL:hash-record reused:bool :}
-   reused if r JOURNAL:SCAN-REUSE exit then
-   path print JOURNAL:SCAN-JOB ;
-
-\ COLLECT-IN in cx's lookup arena, reset once the journal copied what it
-\ records, so no listing holds an answer per file.
-: COLLECT-FILE
-   ( JOURNAL:scan str MODEL:fingerprint scan-context -- JOURNAL:scan )
-   {: path:str print:MODEL:fingerprint cx:scan-context :}
-   cx SCAN-CONTEXT-UNMAKE
-   {: cut:option<cutoff> dev:n lookup:^ARENA:arena :}
-   lookup path print cx COLLECT-IN
-   lookup ARENA:RESET ;
-
 \ FILE-FINGERPRINT of the walk's stat as a step; after a throw
 \ ENTRY-CODE? names, NO-FINGERPRINT and the code.
 : PRINT-STEP ( MODEL:stat str -- MODEL:fingerprint n )
@@ -1275,17 +1231,16 @@ private
    catch {: code:n :}
    code 0<> if drop NO-FINGERPRINT then code STEP-CODE ;
 
-\ A reserved artifact publishes unsupported; any other file is collected,
+\ A reserved artifact publishes unsupported; any other file is a job,
 \ or answers the code its step threw.
-: SCAN-FILE
-   ( JOURNAL:scan str str MODEL:stat scan-context -- JOURNAL:scan n )
-   {: name:str path:str st:MODEL:stat cx:scan-context :}
+: SCAN-FILE ( JOURNAL:scan str str MODEL:stat -- JOURNAL:scan n )
+   {: name:str path:str st:MODEL:stat :}
    name RESERVED-ARTIFACT? if
       path MODEL-UNKNOWN--REASON:UNSUPPORTED UNKNOWN 0 exit
    then
    st path PRINT-STEP {: print:MODEL:fingerprint code:n :}
    code 0<> if code exit then
-   path print cx COLLECT-FILE 0 ;
+   path print JOURNAL:SCAN-JOB 0 ;
 
 \ SCAN-DIRECTORY, which the walk reaches again below a directory.
 defer SCAN-SUBTREE
@@ -1314,11 +1269,15 @@ defer SCAN-SUBTREE
    ( JOURNAL:scan fd str str MODEL:stat scan-context
      -- JOURNAL:scan n )
    {: dir:fd name:str path:str probe:MODEL:stat cx:scan-context :}
+   cx SCAN-CONTEXT-UNMAKE {: cut:option<MODEL:cutoff> dev:n :}
    dir name path probe DIRECTORY-STEP {: child:fd code:n :}
    code 0<> if code exit then
    [: child path cx SCAN-SUBTREE ;] [: child DISCARD ;] finally
    {: walked:n :}
-   walked 0<> if path JOURNAL:SCAN-DISCARD walked exit then
+   walked 0<> if
+      path cut JOURNAL:SCAN-RESOLVE path JOURNAL:SCAN-DISCARD
+      walked exit
+   then
    path MODEL:>PATH DIRECTORY-OBSERVATION MODEL-LOCAL--RECORD:MAKE
    JOURNAL:SCAN-OBSERVE 0 ;
 
@@ -1328,12 +1287,11 @@ defer SCAN-SUBTREE
    ( JOURNAL:scan MODEL:stat fd str str scan-context
      -- JOURNAL:scan n )
    {: st:MODEL:stat dir:fd name:str path:str cx:scan-context :}
-   cx SCAN-CONTEXT-UNMAKE
-   {: cut:option<cutoff> dev:n lookup:^ARENA:arena :}
+   cx SCAN-CONTEXT-UNMAKE {: cut:option<MODEL:cutoff> dev:n :}
    st STAT-DEV dev <> if
       path MODEL-UNKNOWN--REASON:UNSUPPORTED UNKNOWN 0 exit
    then
-   st REGULAR? if name path st cx SCAN-FILE exit then
+   st REGULAR? if name path st SCAN-FILE exit then
    st DIRECTORY? if dir name path st cx SCAN-SUBDIRECTORY exit then
    path UNSUPPORTED-STEP ;
 
@@ -1434,8 +1392,8 @@ SUBTREE-INSTALL
 
 \ The open file's hash, which must match the fingerprint the walk took.
 : HASH-OPENED-FILE
-   ( fd str MODEL:fingerprint MODEL:stat [ -- option<cutoff> ] ^ARENA:arena
-     -- scanned-hash )
+   ( fd str MODEL:fingerprint MODEL:stat [ -- option<MODEL:cutoff> ]
+     ^ARENA:arena -- scanned-hash )
    {: f:fd path:str want:MODEL:fingerprint opened:MODEL:stat q
       ar:^ARENA:arena :}
    opened path FILE-FINGERPRINT want SAME-FINGERPRINT? 0= if
@@ -1452,7 +1410,7 @@ SUBTREE-INSTALL
    r r q execute HASH-IS-REUSABLE SCANNED-HASH-MAKE ;
 
 : HASH-SCAN-FILE
-   ( fd str MODEL:fingerprint [ -- option<cutoff> ] ^ARENA:arena
+   ( fd str MODEL:fingerprint [ -- option<MODEL:cutoff> ] ^ARENA:arena
      -- scanned-hash )
    {: root:fd path:str want:MODEL:fingerprint q ar:^ARENA:arena :}
    root path s" open enumerated scan file" E-IO E-UNSUPPORTED
@@ -1462,7 +1420,7 @@ SUBTREE-INSTALL
 \ HASH-SCAN-FILE under ENTRY-CODE?; after a throw, NO-SCANNED-HASH and the
 \ code.
 : HASH-STEP
-   ( fd str MODEL:fingerprint [ -- option<cutoff> ] ^ARENA:arena
+   ( fd str MODEL:fingerprint [ -- option<MODEL:cutoff> ] ^ARENA:arena
      -- scanned-hash n )
    {: root:fd path:str want:MODEL:fingerprint q ar:^ARENA:arena :}
    NO-SCANNED-HASH [: DROP-SCANNED-HASH
@@ -1485,7 +1443,7 @@ SUBTREE-INSTALL
 
 \ Every failure here concerns the job's own path.
 : HASH-JOB
-   ( JOURNAL:scan str MODEL:fingerprint fd [ -- option<cutoff> ]
+   ( JOURNAL:scan str MODEL:fingerprint fd [ -- option<MODEL:cutoff> ]
      ^ARENA:arena -- JOURNAL:scan )
    {: path:str want:MODEL:fingerprint root:fd q ar:^ARENA:arena :}
    root path want q ar HASH-STEP {: h:scanned-hash code:n :}
@@ -1494,7 +1452,8 @@ SUBTREE-INSTALL
 
 \ Rust's hash_scan_files, one job at a time, each hashed in ar.
 : HASH-JOBS
-   ( JOURNAL:scan ^ARENA:arena fd [ -- option<cutoff> ] -- JOURNAL:scan )
+   ( JOURNAL:scan ^ARENA:arena fd [ -- option<MODEL:cutoff> ]
+     -- JOURNAL:scan )
    {: ar:^ARENA:arena root:fd q :}
    [: ar ARENA:RESET root q ar HASH-JOB ;] JOURNAL:EACH-SCAN-JOB ;
 
@@ -1635,7 +1594,7 @@ SUBTREE-INSTALL
 \ then every listed directory, each in path byte order, and checks the
 \ root.
 : FINISH
-   ( JOURNAL:scan str fd MODEL:stat [ -- option<cutoff> ]
+   ( JOURNAL:scan str fd MODEL:stat [ -- option<MODEL:cutoff> ]
      -- JOURNAL:scan )
    {: root:str rfd:fd before:MODEL:stat q :}
    [: rfd q HASH-JOBS ;] ARENA:WITH
@@ -1647,7 +1606,7 @@ SUBTREE-INSTALL
 \ open: none where JOURNAL finds a stand-in there. It closes the pending
 \ scan's root.
 : FINISH-BOUND-SCAN-AT
-   ( JOURNAL:scan pending-scan [ -- option<cutoff> ] JOURNAL:journal
+   ( JOURNAL:scan pending-scan [ -- option<MODEL:cutoff> ] JOURNAL:journal
      -- JOURNAL:scan option<JOURNAL:local-root-binding> )
    {: ps:pending-scan q j :}
    ps PENDING-SCAN-UNMAKE
@@ -1661,19 +1620,20 @@ SUBTREE-INSTALL
    {: code:n :}
    code 0<> if code throw then ;
 
-\ The walk from the root, with one lookup arena for the whole pass.
-: WALK-ROOT ( JOURNAL:scan fd option<cutoff> n -- JOURNAL:scan )
-   {: rfd:fd cut:option<cutoff> dev:n :}
-   [: >r rfd s" " cut dev r> SCAN-CONTEXT-MAKE
-      SCAN-DIRECTORY ROOT-WALKED ;] ARENA:WITH ;
+\ The walk from the root, then the cutoff's reuse of every cached
+\ hash the walk's files match.
+: WALK-ROOT ( JOURNAL:scan fd option<MODEL:cutoff> n -- JOURNAL:scan )
+   {: rfd:fd cut:option<MODEL:cutoff> dev:n :}
+   rfd s" " cut dev SCAN-CONTEXT-MAKE SCAN-DIRECTORY ROOT-WALKED
+   s" " cut JOURNAL:SCAN-RESOLVE ;
 
 \ Rust's enumerate_scan_on_device: every entry on device into the scan;
 \ any other device is an unsupported subtree. A failure of the root's own
 \ throws and closes the root.
 : ENUMERATE-SCAN-ON-DEVICE
-   ( JOURNAL:scan str fd MODEL:stat option<cutoff> n ^ARENA:arena
+   ( JOURNAL:scan str fd MODEL:stat option<MODEL:cutoff> n ^ARENA:arena
      -- JOURNAL:scan pending-scan )
-   {: root:str rfd:fd before:MODEL:stat cut:option<cutoff> dev:n
+   {: root:str rfd:fd before:MODEL:stat cut:option<MODEL:cutoff> dev:n
       ar:^ARENA:arena :}
    rfd [: rfd cut dev WALK-ROOT ;] CLOSING
    root rfd before ar PENDING-SCAN-MAKE ;
@@ -1685,9 +1645,9 @@ SUBTREE-INSTALL
    CLOSING ;
 
 : ENUMERATE-SCAN
-   ( JOURNAL:scan str option<cutoff> ^ARENA:arena
+   ( JOURNAL:scan str option<MODEL:cutoff> ^ARENA:arena
      -- JOURNAL:scan pending-scan )
-   {: p:str cut:option<cutoff> ar:^ARENA:arena :}
+   {: p:str cut:option<MODEL:cutoff> ar:^ARENA:arena :}
    p ar KEEP {: root:str :}
    p s" open sync root for scan" OPEN-ABSOLUTE-DIRECTORY {: rfd:fd :}
    rfd p ROOT-STAT {: before:MODEL:stat :}
@@ -1739,10 +1699,10 @@ private
    LOCAL-SCAN--PUBLICATION:PUBLISHED ;
 
 : SCAN-PUBLISHED
-   ( JOURNAL:scan JOURNAL:journal str option<cutoff>
-     [ -- option<cutoff> ] ^ARENA:arena
+   ( JOURNAL:scan JOURNAL:journal str option<MODEL:cutoff>
+     [ -- option<MODEL:cutoff> ] ^ARENA:arena
      -- scan-publication JOURNAL:scan )
-   {: j p:str cut:option<cutoff> q ar:^ARENA:arena :}
+   {: j p:str cut:option<MODEL:cutoff> q ar:^ARENA:arena :}
    p cut ar ENUMERATE-SCAN q j FINISH-BOUND-SCAN-AT
    MATCH option
       none OF ROOT-CHANGED ENDOF
@@ -1757,9 +1717,9 @@ private
 \ decides which cached hashes the walk reuses, q which hashes it computes
 \ stay reusable.
 : SCAN-AND-PUBLISH-AT
-   ( JOURNAL:journal str option<cutoff> [ -- option<cutoff> ]
+   ( JOURNAL:journal str option<MODEL:cutoff> [ -- option<MODEL:cutoff> ]
      ^ARENA:arena -- scan-publication )
-   {: j p:str cut:option<cutoff> q ar:^ARENA:arena :}
+   {: j p:str cut:option<MODEL:cutoff> q ar:^ARENA:arena :}
    j [: j p cut q ar SCAN-PUBLISHED ;] JOURNAL:WITH-SCAN ;
 
 public

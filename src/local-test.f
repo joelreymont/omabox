@@ -481,10 +481,10 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
 : ZEROS ( -- str )
    s" 0000000000000000000000000000000000000000000000000000000000000000" ;
 
-: NO-CUTOFF ( -- option<cutoff> ) OPTION:NONE ;
+: NO-CUTOFF ( -- option<MODEL:cutoff> ) OPTION:NONE ;
 
-: STABLE ( -- option<cutoff> )
-   $7FFFFFFFFFFFFFFF 999999999 CUTOFF-MAKE OPTION:SOME ;
+: STABLE ( -- option<MODEL:cutoff> )
+   $7FFFFFFFFFFFFFFF 999999999 MODEL-CUTOFF:MAKE OPTION:SOME ;
 
 : NO-CACHE ( -- ^VEC:vector<MODEL:hash-record> )
    AR @ [type] MODEL:hash-record NEW-VEC ;
@@ -536,28 +536,29 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
 \ Rust's scan_and_publish_at: ROOT$ scanned with the journal's cache and
 \ published to it; cut decides which cached hashes the walk reuses, q
 \ which hashes it computes stay reusable. The inventory published.
-: CACHED-SCAN ( option<cutoff> [ -- option<cutoff> ]
+: CACHED-SCAN ( option<MODEL:cutoff> [ -- option<MODEL:cutoff> ]
      -- ^VEC:vector<MODEL:local-record> )
-   {: cut:option<cutoff> q :}
+   {: cut:option<MODEL:cutoff> q :}
    JNL @ ROOT$ cut q AR @ SCAN-AND-PUBLISH-AT ROOT-CHANGED? TFALSE
    INVENTORY ;
 
 \ CACHED-SCAN, computed hashes reusable before the current cutoff.
-: SCAN-AT ( option<cutoff> -- ^VEC:vector<MODEL:local-record> )
+: SCAN-AT ( option<MODEL:cutoff> -- ^VEC:vector<MODEL:local-record> )
    [: CURRENT-HASH-CACHE-CUTOFF ;] CACHED-SCAN ;
 
 : ROOT-SCAN ( -- ^VEC:vector<MODEL:local-record> ) NO-CUTOFF SCAN-AT ;
 
 \ ROOT$ enumerated into the scan with the journal's cache; cut decides
 \ which cached hashes the walk reuses.
-: ENUMERATE ( JOURNAL:scan option<cutoff> -- JOURNAL:scan pending-scan )
-   {: cut:option<cutoff> :}
+: ENUMERATE
+   ( JOURNAL:scan option<MODEL:cutoff> -- JOURNAL:scan pending-scan )
+   {: cut:option<MODEL:cutoff> :}
    ROOT$ cut AR @ ENUMERATE-SCAN ;
 
 \ Finishes the pending scan and publishes it; q decides which hashes it
 \ computes stay reusable.
 : FINISH-SCAN-AT
-   ( JOURNAL:scan pending-scan [ -- option<cutoff> ] -- JOURNAL:scan )
+   ( JOURNAL:scan pending-scan [ -- option<MODEL:cutoff> ] -- JOURNAL:scan )
    {: ps:pending-scan q :}
    ps q JNL @ FINISH-BOUND-SCAN-AT MATCH option
       none OF false TTRUE ENDOF
@@ -818,7 +819,7 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
    s" recent.txt" s" actual bytes" WRITE
    s" recent.txt" FINGERPRINT-AT {: f:MODEL:fingerprint :}
    f MODEL-FINGERPRINT:UNMAKE {: i sz ms mn cs cn :}
-   ms mn CUTOFF-MAKE OPTION:SOME {: cut:option<cutoff> :}
+   ms mn MODEL-CUTOFF:MAKE OPTION:SOME {: cut:option<MODEL:cutoff> :}
    s" recent.txt" f ZEROS TEST-CACHE SEED
    cut [: NO-CUTOFF ;] CACHED-SCAN {: s :}
    s s" recent.txt" SCANNED-CONTENT s" actual bytes" IDENTITY T$=
@@ -1107,18 +1108,25 @@ variable CAUGHT
    ( JOURNAL:scan MODEL:hash-record -- JOURNAL:scan bool )
    RECORD-PATH s" before.txt" T$= false ;
 
-\ A cached hash taken before "sub" stays to revalidate; one beneath it
-\ is kept as a published hash, and its file to hash and observations
-\ leave with it.
+\ The record's file as a job.
+: CACHED-JOB ( JOURNAL:scan MODEL:hash-record -- JOURNAL:scan )
+   {: r:MODEL:hash-record :}
+   r RECORD-PATH r RECORD-FINGERPRINT JOURNAL:SCAN-JOB ;
+
+\ Resolved as the walk resolves them, a cached hash beneath "sub" is
+\ kept as a published hash, and its file to hash and observations leave
+\ with it; one before "sub" stays to revalidate.
 : TRUNCATED ( JOURNAL:scan -- JOURNAL:scan )
-   s" before.txt" TEST-RECORD JOURNAL:SCAN-REUSE
+   s" before.txt" TEST-RECORD CACHED-JOB
    s" sub" MODEL:>PATH DIRECTORY-OBSERVATION MODEL-LOCAL--RECORD:MAKE
    JOURNAL:SCAN-OBSERVE
-   s" sub/kept.txt" TEST-RECORD JOURNAL:SCAN-REUSE
+   s" sub/kept.txt" TEST-RECORD CACHED-JOB
    s" sub/fresh.txt" 2 5 3 0 3 0 MODEL-FINGERPRINT:MAKE
    JOURNAL:SCAN-JOB
+   s" sub" STABLE JOURNAL:SCAN-RESOLVE
    s" sub" JOURNAL:SCAN-DISCARD
    s" sub" MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN
+   s" " STABLE JOURNAL:SCAN-RESOLVE
    JOURNAL:SCAN-COUNTS {: jobs:n cached:n :}
    jobs 0 T= cached 1 T=
    [: BEFORE-CACHED ;] JOURNAL:EACH-SCAN-REUSE
@@ -1128,6 +1136,10 @@ variable CAUGHT
 \ confirms it, so the published cache holds just the kept one.
 : TRUNCATING-A-FAILED-ENTRY-KEEPS-ITS-VALIDATED-HASHES ( -- )
    s" truncating_a_failed_entry_keeps_its_validated_hashes" T-LABEL
+   NO-CACHE {: cache :}
+   s" before.txt" TEST-RECORD cache VEC:PUSH !
+   s" sub/kept.txt" TEST-RECORD cache VEC:PUSH !
+   cache SEED
    [: TRUNCATED ;] SCANNED {: o :}
    REUSABLE {: r :}
    r VEC:COUNT 1 T=
@@ -1402,8 +1414,8 @@ variable RAISED-ERRNO
    [: STAND-IN-PUBLISHES-NOTHING ;] WITH-JOURNAL ;
 
 \ Rust's scan_and_publish_at with all_cache_entries_stable completing.
-: PUBLISH-STABLE ( JOURNAL:journal str option<cutoff> -- )
-   {: j p:str cut:option<cutoff> :}
+: PUBLISH-STABLE ( JOURNAL:journal str option<MODEL:cutoff> -- )
+   {: j p:str cut:option<MODEL:cutoff> :}
    j p AT AR @ KEEP cut [: STABLE ;] AR @ SCAN-AND-PUBLISH-AT
    ROOT-CHANGED? TFALSE ;
 

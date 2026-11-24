@@ -125,6 +125,12 @@ STRUCTURE fingerprint
    FIELD changed-nanoseconds n
 ;STRUCTURE
 
+\ The time a reusable hash's file was last changed before.
+STRUCTURE cutoff
+   FIELD seconds n
+   FIELD nanoseconds n
+;STRUCTURE
+
 \ What fstat says of an open entry.
 STRUCTURE stat
    FIELD dev n
