@@ -653,12 +653,6 @@ variable SCANNED       \ query plan rows that scan the table
 
 \ ---- the Rust version's lines ------------------------------------
 
-\ The text of a JSON string without its quotes.
-: NAME-PUT ( n str -- n )
-   {: at s:str :}
-   s str> {: a:^ u :}
-   a 1+ u 2 - >str at PUT ;
-
 : LOCAL-FILE-PUT ( n MODEL:local -- n )
    {: at l :}
    l MODEL-LOCAL:UNMAKE DROPBOX:HASH>STR {: h:str :}
@@ -673,60 +667,57 @@ variable SCANNED       \ query plan rows that scan the table
    s" ), revision: DropboxRevision(" swap PUT
    v DROPBOX:REV>STR swap PUT-QUOTED s" ) }" swap PUT ;
 
-\ Rust names a reason as serde does, the name MODEL's writer quotes.
-: UNKNOWN-PUT ( n MODEL:unknown-reason ^JSON:writer -- n )
-   {: at r w :}
+\ Rust names a reason as serde does.
+: UNKNOWN-PUT ( n MODEL:unknown-reason -- n )
+   {: at r :}
    s" Unknown(" at PUT
-   w [: r swap MODEL:UNKNOWN-REASON>JSON ;] ENCODE NAME-PUT
+   r MATCH MODEL:unknown-reason
+      incomplete OF s" Incomplete" ENDOF
+      inaccessible OF s" Inaccessible" ENDOF
+      unavailable OF s" Unavailable" ENDOF
+      stale OF s" Stale" ENDOF
+      cursor-reset OF s" CursorReset" ENDOF
+      unsupported OF s" Unsupported" ENDOF
+   ;MATCH swap PUT
    s" )" swap PUT ;
 
-: LOCAL-OBSERVATION-PUT
-   ( n MODEL:observation<MODEL:local> ^JSON:writer -- n )
-   {: at o w :}
+: LOCAL-OBSERVATION-PUT ( n MODEL:observation<MODEL:local> -- n )
+   {: at o :}
    o MATCH MODEL:observation
       present OF
          s" Present(" at PUT swap LOCAL-FILE-PUT s" )" swap PUT
       ENDOF
-      unknown OF {: r :} at r w UNKNOWN-PUT ENDOF
-      directory OF
-         at w [: o swap MODEL:LOCAL-OBSERVATION>JSON ;] ENCODE NAME-PUT
-      ENDOF
-      absent OF
-         at w [: o swap MODEL:LOCAL-OBSERVATION>JSON ;] ENCODE NAME-PUT
-      ENDOF
+      unknown OF {: r :} at r UNKNOWN-PUT ENDOF
+      directory OF s" Directory" at PUT ENDOF
+      absent OF s" ConfirmedAbsent" at PUT ENDOF
    ;MATCH ;
 
-: REMOTE-OBSERVATION-PUT
-   ( n MODEL:observation<MODEL:remote> ^JSON:writer -- n )
-   {: at o w :}
+: REMOTE-OBSERVATION-PUT ( n MODEL:observation<MODEL:remote> -- n )
+   {: at o :}
    o MATCH MODEL:observation
       present OF
          s" Present(" at PUT swap REMOTE-FILE-PUT s" )" swap PUT
       ENDOF
-      unknown OF {: r :} at r w UNKNOWN-PUT ENDOF
-      directory OF
-         at w [: o swap MODEL:REMOTE-OBSERVATION>JSON ;] ENCODE NAME-PUT
-      ENDOF
-      absent OF
-         at w [: o swap MODEL:REMOTE-OBSERVATION>JSON ;] ENCODE NAME-PUT
-      ENDOF
+      unknown OF {: r :} at r UNKNOWN-PUT ENDOF
+      directory OF s" Directory" at PUT ENDOF
+      absent OF s" ConfirmedAbsent" at PUT ENDOF
    ;MATCH ;
 
-: LOCAL-RECORD-PUT ( n MODEL:local-record ^JSON:writer -- n )
-   {: at r w :}
+: LOCAL-RECORD-PUT ( n MODEL:local-record -- n )
+   {: at r :}
    r MODEL-LOCAL--RECORD:UNMAKE {: p:MODEL:path o :}
    s" LocalObservationRecord { path: " at PUT
    p MODEL:PATH>STR swap PUT-QUOTED
-   s" , observation: " swap PUT o w LOCAL-OBSERVATION-PUT
+   s" , observation: " swap PUT o LOCAL-OBSERVATION-PUT
    s"  }" swap PUT ;
 
-: REMOTE-RECORD-PUT ( n MODEL:remote-record ^JSON:writer -- n )
-   {: at r w :}
+: REMOTE-RECORD-PUT ( n MODEL:remote-record -- n )
+   {: at r :}
    r MODEL-REMOTE--RECORD:UNMAKE {: k:MODEL:key p:MODEL:path o :}
    s" RemoteObservationRecord { canonical_path: CanonicalPath(" at PUT
    k MODEL:KEY>STR swap PUT-QUOTED
    s" ), path: " swap PUT p MODEL:PATH>STR swap PUT-QUOTED
-   s" , observation: " swap PUT o w REMOTE-OBSERVATION-PUT
+   s" , observation: " swap PUT o REMOTE-OBSERVATION-PUT
    s"  }" swap PUT ;
 
 : SEPARATED ( n n -- n )
@@ -734,16 +725,16 @@ variable SCANNED       \ query plan rows that scan the table
    i 0 > if s" , " at PUT exit then
    at ;
 
-: LOCALS-PUT ( n ^VEC:vector<MODEL:local-record> ^JSON:writer -- n )
-   {: at v w :}
+: LOCALS-PUT ( n ^VEC:vector<MODEL:local-record> -- n )
+   {: at v :}
    s" [" at PUT
-   v VEC:COUNT 0 ?do i SEPARATED v i VEC:AT @ w LOCAL-RECORD-PUT loop
+   v VEC:COUNT 0 ?do i SEPARATED v i VEC:AT @ LOCAL-RECORD-PUT loop
    s" ]" swap PUT ;
 
-: REMOTES-PUT ( n ^VEC:vector<MODEL:remote-record> ^JSON:writer -- n )
-   {: at v w :}
+: REMOTES-PUT ( n ^VEC:vector<MODEL:remote-record> -- n )
+   {: at v :}
    s" [" at PUT
-   v VEC:COUNT 0 ?do i SEPARATED v i VEC:AT @ w REMOTE-RECORD-PUT loop
+   v VEC:COUNT 0 ?do i SEPARATED v i VEC:AT @ REMOTE-RECORD-PUT loop
    s" ]" swap PUT ;
 
 : CURSOR-PUT ( option<DROPBOX:cursor> n -- n )
@@ -756,30 +747,29 @@ variable SCANNED       \ query plan rows that scan the table
       ENDOF
    ;MATCH ;
 
-: LOCAL-INVENTORY-DEBUG
-   ( ^VEC:vector<MODEL:local-record> ^JSON:writer -- str )
-   {: v w :}
-   s\" local_inventory\t" 0 PUT v w LOCALS-PUT {: u :}
+: LOCAL-INVENTORY-DEBUG ( ^VEC:vector<MODEL:local-record> -- str )
+   {: v :}
+   s\" local_inventory\t" 0 PUT v LOCALS-PUT {: u :}
    0 u WANT-PART ;
 
 : REMOTE-CURSOR-DEBUG ( option<DROPBOX:cursor> -- str )
    s\" remote_cursor\t" 0 PUT CURSOR-PUT {: u :}
    0 u WANT-PART ;
 
-: REMOTE-INVENTORY-DEBUG ( remote-inventory ^JSON:writer -- str )
-   {: inv w :}
+: REMOTE-INVENTORY-DEBUG ( remote-inventory -- str )
+   {: inv :}
    inv JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur v :}
    cur s\" remote_inventory\tRemoteInventory { cursor: " 0 PUT
    CURSOR-PUT
-   s" , observations: " swap PUT v w REMOTES-PUT
+   s" , observations: " swap PUT v REMOTES-PUT
    s"  }" swap PUT {: u :}
    0 u WANT-PART ;
 
-: INVENTORY-LINES ( journal ^ARENA:arena ^JSON:writer -- )
-   {: j ar w :}
-   j ar LOCAL-INVENTORY w LOCAL-INVENTORY-DEBUG HELD? TTRUE
+: INVENTORY-LINES ( journal ^ARENA:arena -- )
+   {: j ar :}
+   j ar LOCAL-INVENTORY LOCAL-INVENTORY-DEBUG HELD? TTRUE
    j ar REMOTE-CURSOR REMOTE-CURSOR-DEBUG HELD? TTRUE
-   j ar REMOTE-INVENTORY w REMOTE-INVENTORY-DEBUG HELD? TTRUE ;
+   j ar REMOTE-INVENTORY REMOTE-INVENTORY-DEBUG HELD? TTRUE ;
 
 
 \ ---- test-only words of the Rust version -------------------------
@@ -1289,7 +1279,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    ar JOURNAL-AT {: d:str p:str :}
    s" src/oracle/journal.sqlite3" p FS:COPY-FILE-STREAM
    p OPEN {: j :}
-   j ar [: INVENTORY-LINES ;] ENCODING
+   j ar INVENTORY-LINES
    j CLOSE
    d GONE ;
 
@@ -4637,18 +4627,6 @@ variable CRAFT
    j CLOSE
    d GONE ;
 
-: SEED-DROP ( MODEL:baseline -- ) drop ;
-
-\ The baseline MODEL reads from the text, none for absent, and whether
-\ MODEL refuses the text.
-: CODEC-READ ( str ^ARENA:arena -- option<MODEL:baseline> bool )
-   {: t:str ar :}
-   MODEL-BASELINE:ABSENT [: SEED-DROP t ar MODEL:JSON>BASELINE ;] catch
-   {: b code :}
-   code 0<> if code MODEL:E-STORED T= NO-BASELINE true exit then
-   b ABSENT? if NO-BASELINE false exit then
-   b OPTION:SOME false ;
-
 \ The text set by the update at schema 9 in c, then migrated, in one
 \ transaction: whether the migration refused it as op's, rolled back,
 \ or else left the transaction open. f takes the refusal's log.
@@ -4685,65 +4663,76 @@ variable CRAFT
       some OF {: b :} want b BASELINE-HELD? ENDOF
    ;MATCH ;
 
-\ The migration refuses the text exactly when MODEL does, and else
-\ reads the baseline MODEL reads.
-: CONVERTS ( SQLITE:connection str str ^ARENA:arena -- )
+\ The migration takes the text, and reads back the baseline
+\ serde reads from it, want, none for absent.
+: CONVERTS
+   ( SQLITE:connection str option<MODEL:baseline> str ^ARENA:arena
+     -- )
+   {: c t:str want f:str ar :}
+   t T-LABEL
+   c t f ar MIGRATION-READ {: got refuses:bool :}
+   refuses TFALSE
+   got want SAME-BASELINE? TTRUE ;
+
+\ The migration refuses the text.
+: BASELINE-REFUSES ( SQLITE:connection str str ^ARENA:arena -- )
    {: c t:str f:str ar :}
    t T-LABEL
-   t ar CODEC-READ {: want refused:bool :}
    c t f ar MIGRATION-READ {: got refuses:bool :}
-   refused bool>n refuses bool>n T=
-   got want SAME-BASELINE? TTRUE ;
+   refuses TTRUE
+   got NO-BASELINE? TTRUE ;
+
+\ The expected file baseline of that content and revision.
+: FILE-BASELINE ( str str -- option<MODEL:baseline> )
+   REMOTE-FILE MODEL-BASELINE:PRESENT OPTION:SOME ;
+
+: DIRECTORY-BASELINE ( -- option<MODEL:baseline> )
+   MODEL-BASELINE:DIRECTORY OPTION:SOME ;
 
 : READ-TEXTS ( SQLITE:connection str ^ARENA:arena -- )
    {: c f:str ar :}
-   c s\" \"Directory\"" f ar CONVERTS
-   c s\" \"Absent\"" f ar CONVERTS
-   c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\"}}" f ar CONVERTS
-   c s\"  \"Directory\" " f ar CONVERTS
-   c s\" \"Dir\\u0065ctory\"" f ar CONVERTS
-   c s\" {\"Pr\\u0065sent\":{\"c\\u006fntent\":\"h\\u0041\",\"revision\":\"r\"}}" f ar CONVERTS
-   c s\" {\"Present\":{\"revision\":\"r\",\"x\":[1,{\"y\":null}],\"content\":\"h\"}}" f ar CONVERTS
-   c s\" {\"Present\":{\"content\":\"\",\"revision\":\"\"}}" f ar CONVERTS
-   c s\" {\"Present\":{\"content\":\"\\ud83d\\ude00\",\"revision\":\"r\"}}" f ar CONVERTS
-   c s\" {\"Present\":{\"content\":\"a\\u0000b\",\"revision\":\"r\"}}" f ar CONVERTS ;
+   c s\" \"Directory\"" DIRECTORY-BASELINE f ar CONVERTS
+   c s\" \"Absent\"" NO-BASELINE f ar CONVERTS
+   c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\"}}"
+   s" h" s" r" FILE-BASELINE f ar CONVERTS
+   c s\"  \"Directory\" " DIRECTORY-BASELINE f ar CONVERTS
+   c s\" \"Dir\\u0065ctory\"" DIRECTORY-BASELINE f ar CONVERTS
+   c s\" {\"Pr\\u0065sent\":{\"c\\u006fntent\":\"h\\u0041\",\"revision\":\"r\"}}"
+   s" hA" s" r" FILE-BASELINE f ar CONVERTS
+   c s\" {\"Present\":{\"revision\":\"r\",\"x\":[1,{\"y\":null}],\"content\":\"h\"}}"
+   s" h" s" r" FILE-BASELINE f ar CONVERTS
+   c s\" {\"Present\":{\"content\":\"\",\"revision\":\"\"}}"
+   s" " s" " FILE-BASELINE f ar CONVERTS
+   c s\" {\"Present\":{\"content\":\"\\ud83d\\ude00\",\"revision\":\"r\"}}"
+   s\" \xF0\x9F\x98\x80" s" r" FILE-BASELINE f ar CONVERTS
+   c s\" {\"Present\":{\"content\":\"a\\u0000b\",\"revision\":\"r\"}}"
+   s\" a\x00b" s" r" FILE-BASELINE f ar CONVERTS
+   c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\",\"n\":123456789012345678901234567890}}"
+   s" h" s" r" FILE-BASELINE f ar CONVERTS
+   c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\",\"x\":{\"a\":1,\"a\":2}}}"
+   s" h" s" r" FILE-BASELINE f ar CONVERTS ;
 
+\ serde reads a unit variant as an object, {"Directory":null}, but
+\ no version writes one; here and below the migration refuses it.
 : REFUSED-TEXTS ( SQLITE:connection str ^ARENA:arena -- )
    {: c f:str ar :}
-   c s\" \"Present\"" f ar CONVERTS
-   c s\" {\"Directory\":null}" f ar CONVERTS
-   c s\" {\"Absent\":null}" f ar CONVERTS
-   c s" not json" f ar CONVERTS
-   c s\" {\"Present\":{\"content\":\"h\"}}" f ar CONVERTS
-   c s\" {\"Present\":{\"content\":\"h\",\"content\":\"h\",\"revision\":\"r\"}}" f ar CONVERTS
-   c s\" {\"Present\":{\"content\":1,\"revision\":\"r\"}}" f ar CONVERTS
-   c s\" {\"Present\":{\"content\":\"h\",\"revision\":null}}" f ar CONVERTS
-   c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\"},\"x\":1}" f ar CONVERTS
-   c s\" {'Present':{\"content\":\"h\",\"revision\":\"r\"}}" f ar CONVERTS
-   c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\",}}" f ar CONVERTS
-   c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\"}} x" f ar CONVERTS
-   c s" []" f ar CONVERTS
-   c s\" {\"Present\":[]}" f ar CONVERTS
-   c s\" \"directory\"" f ar CONVERTS
-   c s\" \"Directory\\u0000\"" f ar CONVERTS
-   c s\" {\"Future\":1}" f ar CONVERTS
-   c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\",\"n\":123456789012345678901234567890}}" f ar CONVERTS
-   c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\",\"x\":{\"a\":1,\"a\":2}}}" f ar CONVERTS ;
-
-: REMOTE-SEED-DROP ( MODEL:observation<MODEL:remote> -- ) drop ;
-
-\ Docs's record with the observation MODEL reads from the text, none
-\ for absent, and whether MODEL refuses the text.
-: REMOTE-CODEC-READ
-   ( str ^ARENA:arena -- option<MODEL:remote-record> bool )
-   {: t:str ar :}
-   ABSENT-REMOTE
-   [: REMOTE-SEED-DROP t ar MODEL:JSON>REMOTE-OBSERVATION ;] catch
-   {: o code :}
-   code 0<> if code MODEL:E-STORED T= NO-REMOTE true exit then
-   o ABSENT-REMOTE MODEL:REMOTE-OBSERVATION= if NO-REMOTE false exit then
-   s" docs" ar CANONICAL s" Docs" DISPLAY o MODEL-REMOTE--RECORD:MAKE
-   OPTION:SOME false ;
+   c s\" \"Present\"" f ar BASELINE-REFUSES
+   c s\" {\"Directory\":null}" f ar BASELINE-REFUSES
+   c s\" {\"Absent\":null}" f ar BASELINE-REFUSES
+   c s" not json" f ar BASELINE-REFUSES
+   c s\" {\"Present\":{\"content\":\"h\"}}" f ar BASELINE-REFUSES
+   c s\" {\"Present\":{\"content\":\"h\",\"content\":\"h\",\"revision\":\"r\"}}" f ar BASELINE-REFUSES
+   c s\" {\"Present\":{\"content\":1,\"revision\":\"r\"}}" f ar BASELINE-REFUSES
+   c s\" {\"Present\":{\"content\":\"h\",\"revision\":null}}" f ar BASELINE-REFUSES
+   c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\"},\"x\":1}" f ar BASELINE-REFUSES
+   c s\" {'Present':{\"content\":\"h\",\"revision\":\"r\"}}" f ar BASELINE-REFUSES
+   c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\",}}" f ar BASELINE-REFUSES
+   c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\"}} x" f ar BASELINE-REFUSES
+   c s" []" f ar BASELINE-REFUSES
+   c s\" {\"Present\":[]}" f ar BASELINE-REFUSES
+   c s\" \"directory\"" f ar BASELINE-REFUSES
+   c s\" \"Directory\\u0000\"" f ar BASELINE-REFUSES
+   c s\" {\"Future\":1}" f ar BASELINE-REFUSES ;
 
 \ The text as Docs's remote observation at schema 9 in c, migrated,
 \ then rolled back: its record read back, and whether the migration
@@ -4770,75 +4759,92 @@ variable CRAFT
       some OF {: r :} want r REMOTE-IS? ENDOF
    ;MATCH ;
 
-\ The migration refuses the text exactly when MODEL does, and else
-\ reads the remote observation MODEL reads.
-: REMOTE-CONVERTS ( SQLITE:connection str str ^ARENA:arena -- )
+\ The migration takes the text, and reads back Docs's record of
+\ the remote observation serde reads from it, want, none for
+\ absent.
+: REMOTE-CONVERTS
+   ( SQLITE:connection str option<MODEL:remote-record> str
+     ^ARENA:arena -- )
+   {: c t:str want f:str ar :}
+   t T-LABEL
+   c t f ar REMOTE-MIGRATION-READ {: got refuses:bool :}
+   refuses TFALSE
+   got want SAME-REMOTE? TTRUE ;
+
+\ The migration refuses the text.
+: REMOTE-REFUSES ( SQLITE:connection str str ^ARENA:arena -- )
    {: c t:str f:str ar :}
    t T-LABEL
-   t ar REMOTE-CODEC-READ {: want refused:bool :}
    c t f ar REMOTE-MIGRATION-READ {: got refuses:bool :}
-   refused bool>n refuses bool>n T=
-   got want SAME-REMOTE? TTRUE ;
+   refuses TTRUE
+   got NO-REMOTE? TTRUE ;
+
+\ Docs's expected record of the remote observation.
+: DOCS-REMOTE
+   ( MODEL:observation<MODEL:remote> ^ARENA:arena
+     -- option<MODEL:remote-record> )
+   {: o ar :}
+   s" docs" ar CANONICAL s" Docs" DISPLAY o MODEL-REMOTE--RECORD:MAKE
+   OPTION:SOME ;
 
 : REMOTE-READ-TEXTS ( SQLITE:connection str ^ARENA:arena -- )
    {: c f:str ar :}
-   c s\" \"Directory\"" f ar REMOTE-CONVERTS
-   c s\" \"ConfirmedAbsent\"" f ar REMOTE-CONVERTS
+   c s\" \"Directory\"" REMOTE-DIRECTORY ar DOCS-REMOTE
+   f ar REMOTE-CONVERTS
+   c s\" \"ConfirmedAbsent\"" NO-REMOTE f ar REMOTE-CONVERTS
    c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\"}}"
+   s" h" s" r" PRESENT-REMOTE ar DOCS-REMOTE f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":\"Incomplete\"}"
+   MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN-REMOTE ar DOCS-REMOTE
    f ar REMOTE-CONVERTS
-   c s\" {\"Unknown\":\"Incomplete\"}" f ar REMOTE-CONVERTS
-   c s\" {\"Unknown\":\"Inaccessible\"}" f ar REMOTE-CONVERTS
-   c s\" {\"Unknown\":\"Unavailable\"}" f ar REMOTE-CONVERTS
-   c s\" {\"Unknown\":\"Stale\"}" f ar REMOTE-CONVERTS
-   c s\" {\"Unknown\":\"CursorReset\"}" f ar REMOTE-CONVERTS
-   c s\" {\"Unknown\":\"Unsupported\"}" f ar REMOTE-CONVERTS
-   c s\"  { \"Unknown\" : \"Stale\" } " f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":\"Inaccessible\"}"
+   MODEL-UNKNOWN--REASON:INACCESSIBLE UNKNOWN-REMOTE ar DOCS-REMOTE
+   f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":\"Unavailable\"}"
+   MODEL-UNKNOWN--REASON:UNAVAILABLE UNKNOWN-REMOTE ar DOCS-REMOTE
+   f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":\"Stale\"}"
+   MODEL-UNKNOWN--REASON:STALE UNKNOWN-REMOTE ar DOCS-REMOTE
+   f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":\"CursorReset\"}"
+   MODEL-UNKNOWN--REASON:CURSOR-RESET UNKNOWN-REMOTE ar DOCS-REMOTE
+   f ar REMOTE-CONVERTS
+   c s\" {\"Unknown\":\"Unsupported\"}"
+   MODEL-UNKNOWN--REASON:UNSUPPORTED UNKNOWN-REMOTE ar DOCS-REMOTE
+   f ar REMOTE-CONVERTS
+   c s\"  { \"Unknown\" : \"Stale\" } "
+   MODEL-UNKNOWN--REASON:STALE UNKNOWN-REMOTE ar DOCS-REMOTE
+   f ar REMOTE-CONVERTS
    c s\" {\"Unkn\\u006fwn\":\"St\\u0061le\"}"
+   MODEL-UNKNOWN--REASON:STALE UNKNOWN-REMOTE ar DOCS-REMOTE
    f ar REMOTE-CONVERTS
-   c s\" \"Confirmed\\u0041bsent\"" f ar REMOTE-CONVERTS ;
+   c s\" \"Confirmed\\u0041bsent\"" NO-REMOTE f ar REMOTE-CONVERTS ;
 
 : REMOTE-REFUSED-TEXTS ( SQLITE:connection str ^ARENA:arena -- )
    {: c f:str ar :}
-   c s\" \"Absent\"" f ar REMOTE-CONVERTS
-   c s\" \"Unknown\"" f ar REMOTE-CONVERTS
-   c s\" \"Present\"" f ar REMOTE-CONVERTS
-   c s\" {\"Directory\":null}" f ar REMOTE-CONVERTS
-   c s\" {\"ConfirmedAbsent\":null}" f ar REMOTE-CONVERTS
-   c s\" {\"Unknown\":null}" f ar REMOTE-CONVERTS
-   c s\" {\"Unknown\":\"stale\"}" f ar REMOTE-CONVERTS
-   c s\" {\"Unknown\":\"Future\"}" f ar REMOTE-CONVERTS
-   c s\" {\"Unknown\":\"\"}" f ar REMOTE-CONVERTS
-   c s\" {\"Unknown\":\"Stale\\u0000\"}" f ar REMOTE-CONVERTS
-   c s\" {\"Unknown\":{\"Stale\":null}}" f ar REMOTE-CONVERTS
-   c s\" {\"Unknown\":[\"Stale\"]}" f ar REMOTE-CONVERTS
-   c s\" {\"Unknown\":3}" f ar REMOTE-CONVERTS
-   c s\" {\"Unknown\":\"Stale\",\"x\":1}" f ar REMOTE-CONVERTS
+   c s\" \"Absent\"" f ar REMOTE-REFUSES
+   c s\" \"Unknown\"" f ar REMOTE-REFUSES
+   c s\" \"Present\"" f ar REMOTE-REFUSES
+   c s\" {\"Directory\":null}" f ar REMOTE-REFUSES
+   c s\" {\"ConfirmedAbsent\":null}" f ar REMOTE-REFUSES
+   c s\" {\"Unknown\":null}" f ar REMOTE-REFUSES
+   c s\" {\"Unknown\":\"stale\"}" f ar REMOTE-REFUSES
+   c s\" {\"Unknown\":\"Future\"}" f ar REMOTE-REFUSES
+   c s\" {\"Unknown\":\"\"}" f ar REMOTE-REFUSES
+   c s\" {\"Unknown\":\"Stale\\u0000\"}" f ar REMOTE-REFUSES
+   c s\" {\"Unknown\":{\"Stale\":null}}" f ar REMOTE-REFUSES
+   c s\" {\"Unknown\":[\"Stale\"]}" f ar REMOTE-REFUSES
+   c s\" {\"Unknown\":3}" f ar REMOTE-REFUSES
+   c s\" {\"Unknown\":\"Stale\",\"x\":1}" f ar REMOTE-REFUSES
    c s\" {\"Unknown\":\"Stale\",\"Unknown\":\"Stale\"}"
-   f ar REMOTE-CONVERTS
-   c s\" {\"Unknown\":\"Stale\"} x" f ar REMOTE-CONVERTS
-   c s\" {\"Unknown\":\"Stale\",}" f ar REMOTE-CONVERTS
-   c s\" {'Unknown':\"Stale\"}" f ar REMOTE-CONVERTS
+   f ar REMOTE-REFUSES
+   c s\" {\"Unknown\":\"Stale\"} x" f ar REMOTE-REFUSES
+   c s\" {\"Unknown\":\"Stale\",}" f ar REMOTE-REFUSES
+   c s\" {'Unknown':\"Stale\"}" f ar REMOTE-REFUSES
    c s\" {\"Present\":{\"content\":\"h\"}}"
-   f ar REMOTE-CONVERTS
-   c s\" {\"Future\":1}" f ar REMOTE-CONVERTS
-   c s" not json" f ar REMOTE-CONVERTS ;
-
-: LOCAL-SEED-DROP ( MODEL:observation<MODEL:local> -- ) drop ;
-
-\ Docs's record with the observation MODEL reads from the text: none
-\ for absent, and unknown, Incomplete, where MODEL refuses the text.
-: LOCAL-CODEC-READ ( str ^ARENA:arena -- option<MODEL:local-record> )
-   {: t:str ar :}
-   ABSENT-LOCAL
-   [: LOCAL-SEED-DROP t ar MODEL:JSON>LOCAL-OBSERVATION ;] catch
-   {: o code :}
-   code 0<> if
-      code MODEL:E-STORED T=
-      s" Docs" MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN-AT
-      OPTION:SOME exit
-   then
-   o ABSENT-LOCAL MODEL:LOCAL-OBSERVATION= if NO-LOCAL exit then
-   s" Docs" o LOCAL-RECORD OPTION:SOME ;
+   f ar REMOTE-REFUSES
+   c s\" {\"Future\":1}" f ar REMOTE-REFUSES
+   c s" not json" f ar REMOTE-REFUSES ;
 
 \ The text as Docs's local observation at schema 9 in c, migrated,
 \ then rolled back: its record read back. The migration never refuses
@@ -4865,77 +4871,107 @@ variable CRAFT
       some OF {: r :} want r LOCAL-IS? ENDOF
    ;MATCH ;
 
-\ The migration reads the observation MODEL reads from the text, and
-\ unknown, Incomplete, where MODEL refuses it.
-: LOCAL-CONVERTS ( SQLITE:connection str str ^ARENA:arena -- )
-   {: c t:str f:str ar :}
+\ The migration reads back want, Docs's record of the local
+\ observation serde reads from the text, none for absent.
+: LOCAL-CONVERTS
+   ( SQLITE:connection str option<MODEL:local-record> str
+     ^ARENA:arena -- )
+   {: c t:str want f:str ar :}
    t T-LABEL
-   t ar LOCAL-CODEC-READ {: want :}
    c t f ar LOCAL-MIGRATION-READ want SAME-LOCAL? TTRUE ;
+
+\ Docs's expected record of the local observation.
+: DOCS-LOCAL
+   ( MODEL:observation<MODEL:local> -- option<MODEL:local-record> )
+   {: o :} s" Docs" o LOCAL-RECORD OPTION:SOME ;
+
+\ A refused text reads as Docs's unknown record, Incomplete.
+: LOCAL-REFUSED ( SQLITE:connection str str ^ARENA:arena -- )
+   {: c t:str f:str ar :}
+   c t MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN-LOCAL DOCS-LOCAL
+   f ar LOCAL-CONVERTS ;
 
 : LOCAL-READ-TEXTS ( SQLITE:connection str ^ARENA:arena -- )
    {: c f:str ar :}
-   c s\" \"Directory\"" f ar LOCAL-CONVERTS
-   c s\" \"ConfirmedAbsent\"" f ar LOCAL-CONVERTS
-   c s\" {\"Present\":{\"content\":\"h\"}}" f ar LOCAL-CONVERTS
-   c s\" {\"Unknown\":\"Incomplete\"}" f ar LOCAL-CONVERTS
-   c s\" {\"Unknown\":\"Inaccessible\"}" f ar LOCAL-CONVERTS
-   c s\" {\"Unknown\":\"Unavailable\"}" f ar LOCAL-CONVERTS
-   c s\" {\"Unknown\":\"Stale\"}" f ar LOCAL-CONVERTS
-   c s\" {\"Unknown\":\"CursorReset\"}" f ar LOCAL-CONVERTS
-   c s\" {\"Unknown\":\"Unsupported\"}" f ar LOCAL-CONVERTS
-   c s\"  { \"Unknown\" : \"Stale\" } " f ar LOCAL-CONVERTS
+   c s\" \"Directory\"" LOCAL-DIRECTORY DOCS-LOCAL f ar LOCAL-CONVERTS
+   c s\" \"ConfirmedAbsent\"" NO-LOCAL f ar LOCAL-CONVERTS
+   c s\" {\"Present\":{\"content\":\"h\"}}"
+   s" h" PRESENT-LOCAL DOCS-LOCAL f ar LOCAL-CONVERTS
+   c s\" {\"Unknown\":\"Incomplete\"}"
+   MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN-LOCAL DOCS-LOCAL
+   f ar LOCAL-CONVERTS
+   c s\" {\"Unknown\":\"Inaccessible\"}"
+   MODEL-UNKNOWN--REASON:INACCESSIBLE UNKNOWN-LOCAL DOCS-LOCAL
+   f ar LOCAL-CONVERTS
+   c s\" {\"Unknown\":\"Unavailable\"}"
+   MODEL-UNKNOWN--REASON:UNAVAILABLE UNKNOWN-LOCAL DOCS-LOCAL
+   f ar LOCAL-CONVERTS
+   c s\" {\"Unknown\":\"Stale\"}"
+   MODEL-UNKNOWN--REASON:STALE UNKNOWN-LOCAL DOCS-LOCAL
+   f ar LOCAL-CONVERTS
+   c s\" {\"Unknown\":\"CursorReset\"}"
+   MODEL-UNKNOWN--REASON:CURSOR-RESET UNKNOWN-LOCAL DOCS-LOCAL
+   f ar LOCAL-CONVERTS
+   c s\" {\"Unknown\":\"Unsupported\"}"
+   MODEL-UNKNOWN--REASON:UNSUPPORTED UNKNOWN-LOCAL DOCS-LOCAL
+   f ar LOCAL-CONVERTS
+   c s\"  { \"Unknown\" : \"Stale\" } "
+   MODEL-UNKNOWN--REASON:STALE UNKNOWN-LOCAL DOCS-LOCAL
+   f ar LOCAL-CONVERTS
    c s\" {\"Unkn\\u006fwn\":\"St\\u0061le\"}"
+   MODEL-UNKNOWN--REASON:STALE UNKNOWN-LOCAL DOCS-LOCAL
    f ar LOCAL-CONVERTS
-   c s\" \"Confirmed\\u0041bsent\"" f ar LOCAL-CONVERTS
-   c s\" \"Dir\\u0065ctory\"" f ar LOCAL-CONVERTS
+   c s\" \"Confirmed\\u0041bsent\"" NO-LOCAL f ar LOCAL-CONVERTS
+   c s\" \"Dir\\u0065ctory\"" LOCAL-DIRECTORY DOCS-LOCAL
+   f ar LOCAL-CONVERTS
    c s\" {\"Pr\\u0065sent\":{\"c\\u006fntent\":\"h\\u0041\"}}"
-   f ar LOCAL-CONVERTS
+   s" hA" PRESENT-LOCAL DOCS-LOCAL f ar LOCAL-CONVERTS
    c s\" {\"Present\":{\"x\":[1,{\"y\":null}],\"content\":\"h\"}}"
-   f ar LOCAL-CONVERTS
+   s" h" PRESENT-LOCAL DOCS-LOCAL f ar LOCAL-CONVERTS
    c s\" {\"Present\":{\"content\":\"h\",\"revision\":\"r\"}}"
-   f ar LOCAL-CONVERTS
-   c s\" {\"Present\":{\"content\":\"\"}}" f ar LOCAL-CONVERTS
+   s" h" PRESENT-LOCAL DOCS-LOCAL f ar LOCAL-CONVERTS
+   c s\" {\"Present\":{\"content\":\"\"}}"
+   s" " PRESENT-LOCAL DOCS-LOCAL f ar LOCAL-CONVERTS
    c s\" {\"Present\":{\"content\":\"\\ud83d\\ude00\"}}"
-   f ar LOCAL-CONVERTS
+   s\" \xF0\x9F\x98\x80" PRESENT-LOCAL DOCS-LOCAL f ar LOCAL-CONVERTS
    c s\" {\"Present\":{\"content\":\"a\\u0000b\"}}"
-   f ar LOCAL-CONVERTS ;
+   s\" a\x00b" PRESENT-LOCAL DOCS-LOCAL f ar LOCAL-CONVERTS
+   c s\" {\"Present\":{\"content\":\"\",\"x\":{\"a\":1,\"a\":2}}}"
+   s" " PRESENT-LOCAL DOCS-LOCAL f ar LOCAL-CONVERTS
+   c s\" {\"Present\":{\"content\":\"\",\"n\":1234567890123456789012}}"
+   s" " PRESENT-LOCAL DOCS-LOCAL f ar LOCAL-CONVERTS ;
 
 : LOCAL-REFUSED-TEXTS ( SQLITE:connection str ^ARENA:arena -- )
    {: c f:str ar :}
-   c s\" \"Absent\"" f ar LOCAL-CONVERTS
-   c s\" \"Unknown\"" f ar LOCAL-CONVERTS
-   c s\" \"Present\"" f ar LOCAL-CONVERTS
-   c s\" \"directory\"" f ar LOCAL-CONVERTS
-   c s\" \"Directory\\u0000\"" f ar LOCAL-CONVERTS
-   c s\" {\"Directory\":null}" f ar LOCAL-CONVERTS
-   c s\" {\"ConfirmedAbsent\":null}" f ar LOCAL-CONVERTS
-   c s\" {\"Unknown\":null}" f ar LOCAL-CONVERTS
-   c s\" {\"Unknown\":\"stale\"}" f ar LOCAL-CONVERTS
-   c s\" {\"Unknown\":\"Future\"}" f ar LOCAL-CONVERTS
-   c s\" {\"Unknown\":\"Stale\",\"x\":1}" f ar LOCAL-CONVERTS
-   c s\" {\"Present\":{}}" f ar LOCAL-CONVERTS
-   c s\" {\"Present\":[]}" f ar LOCAL-CONVERTS
-   c s\" {\"Present\":{\"content\":1}}" f ar LOCAL-CONVERTS
-   c s\" {\"Present\":{\"content\":null}}" f ar LOCAL-CONVERTS
+   c s\" \"Absent\"" f ar LOCAL-REFUSED
+   c s\" \"Unknown\"" f ar LOCAL-REFUSED
+   c s\" \"Present\"" f ar LOCAL-REFUSED
+   c s\" \"directory\"" f ar LOCAL-REFUSED
+   c s\" \"Directory\\u0000\"" f ar LOCAL-REFUSED
+   c s\" {\"Directory\":null}" f ar LOCAL-REFUSED
+   c s\" {\"ConfirmedAbsent\":null}" f ar LOCAL-REFUSED
+   c s\" {\"Unknown\":null}" f ar LOCAL-REFUSED
+   c s\" {\"Unknown\":\"stale\"}" f ar LOCAL-REFUSED
+   c s\" {\"Unknown\":\"Future\"}" f ar LOCAL-REFUSED
+   c s\" {\"Unknown\":\"Stale\",\"x\":1}" f ar LOCAL-REFUSED
+   c s\" {\"Present\":{}}" f ar LOCAL-REFUSED
+   c s\" {\"Present\":[]}" f ar LOCAL-REFUSED
+   c s\" {\"Present\":{\"content\":1}}" f ar LOCAL-REFUSED
+   c s\" {\"Present\":{\"content\":null}}" f ar LOCAL-REFUSED
    c s\" {\"Present\":{\"content\":\"h\",\"content\":\"h\"}}"
-   f ar LOCAL-CONVERTS
+   f ar LOCAL-REFUSED
    c s\" {\"Present\":{\"content\":\"h\"},\"x\":1}"
-   f ar LOCAL-CONVERTS
-   c s\" {'Present':{\"content\":\"h\"}}" f ar LOCAL-CONVERTS
-   c s\" {\"Present\":{\"content\":\"h\",}}" f ar LOCAL-CONVERTS
-   c s\" {\"Present\":{\"content\":\"h\"}} x" f ar LOCAL-CONVERTS
-   c s\" {\"Present\":{\"content\":\"\",\"x\":{\"a\":1,\"a\":2}}}"
-   f ar LOCAL-CONVERTS
-   c s\" {\"Present\":{\"content\":\"\",\"n\":1234567890123456789012}}"
-   f ar LOCAL-CONVERTS
-   c s" []" f ar LOCAL-CONVERTS
-   c s\" {\"Future\":1}" f ar LOCAL-CONVERTS
-   c s" not json" f ar LOCAL-CONVERTS ;
+   f ar LOCAL-REFUSED
+   c s\" {'Present':{\"content\":\"h\"}}" f ar LOCAL-REFUSED
+   c s\" {\"Present\":{\"content\":\"h\",}}" f ar LOCAL-REFUSED
+   c s\" {\"Present\":{\"content\":\"h\"}} x" f ar LOCAL-REFUSED
+   c s" []" f ar LOCAL-REFUSED
+   c s\" {\"Future\":1}" f ar LOCAL-REFUSED
+   c s" not json" f ar LOCAL-REFUSED ;
 
 \ Each text as Docs's baseline, then as its remote and its local
 \ observation, of a schema-9 journal.
-: THE-MIGRATION-CONVERTS-WHAT-MODEL-READS ( ^ARENA:arena -- )
+: THE-MIGRATION-CONVERTS-OR-REFUSES-EACH-TEXT ( ^ARENA:arena -- )
    {: ar :}
    ar JOURNAL-AT {: d:str p:str :}
    p NINE-ORACLE
@@ -5085,7 +5121,7 @@ variable CRAFT
    ar A-SCHEMA-9-JOURNAL-MIGRATES-ITS-REMOTE-OBSERVATIONS
    ar A-SCHEMA-9-JOURNAL-MIGRATES-ITS-LOCAL-OBSERVATIONS
    ar A-SCHEMA-9-JOURNAL-MIGRATES-ITS-HASH-CACHE
-   ar THE-MIGRATION-CONVERTS-WHAT-MODEL-READS
+   ar THE-MIGRATION-CONVERTS-OR-REFUSES-EACH-TEXT
    ar AN-UNKNOWN-OPERATION-IS-REFUSED
    ar AN-UNKNOWN-BLOCKAGE-IS-REFUSED
    ar AN-UNKNOWN-CONFLICT-IS-REFUSED

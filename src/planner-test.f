@@ -1,8 +1,8 @@
 \ planner-test.f - PLANNER's PLAN on every line of src/oracle/plan.tsv,
 \ the Rust version's answers: the line's baseline, local and remote
-\ observations, read with MODEL's readers, and its subtree go through
-\ PLAN, and the decision is written in the line's own form and compared
-\ with the rest of the line.
+\ observations, read with this file's readers, and its subtree go
+\ through PLAN, and the decision is written in the line's own form and
+\ compared with the rest of the line.
 \ Run from the repository root: hb --load src/planner-test.f </dev/null
 require src/lib/arena.f
 require src/lib/string.f
@@ -43,6 +43,133 @@ TYPED-VARIABLE W JSON:writer
    dup s\" \"Empty\"" STR:= if drop MODEL-SUBTREE:EMPTY exit then
    s\" \"Occupied\"" T$= MODEL-SUBTREE:OCCUPIED ;
 
+\ The readers below take the forms plan.tsv holds and no
+\ others; each answers its value and whether it took it.
+
+: COPIED ( str ^ARENA:arena -- str )
+   {: s ar :}
+   s str> {: a:^ u:n :}
+   ar u ARENA:ALLOC drop {: dst:^ :}
+   a dst u BYTE-COPY
+   dst u >str ;
+
+\ A string's decoded bytes, copied into AR.
+: STRING-OF ( JSON:value -- str bool )
+   {: v :}
+   v JSON:STRING? 0= if s" " false exit then
+   v [: AR @ COPIED ;] JSON:WITH-STRING true ;
+
+: MEMBER-OF ( JSON:value str -- str bool )
+   JSON:FIND MATCH option
+      none OF s" " false ENDOF
+      some OF STRING-OF ENDOF
+   ;MATCH ;
+
+: COUNTED ( n JSON:value JSON:value -- n )
+   {: k:n name:JSON:value v:JSON:value :} k 1+ ;
+
+: MEMBERS ( JSON:value -- n )
+   {: v :} 0 v [: COUNTED ;] JSON:EACH-MEMBER ;
+
+: OBJECT-OF? ( JSON:value n -- bool )
+   {: v n:n :}
+   v JSON:OBJECT? if v MEMBERS n = exit then
+   false ;
+
+\ An externally tagged variant's payload, or the value itself
+\ when it is not an object of that one member.
+: TAGGED ( JSON:value str -- JSON:value bool )
+   {: v name:str :}
+   v 1 OBJECT-OF? 0= if v false exit then
+   v name JSON:FIND MATCH option
+      none OF v false ENDOF
+      some OF true ENDOF
+   ;MATCH ;
+
+: LOCAL-OF ( JSON:value -- local bool )
+   {: v :}
+   v 1 OBJECT-OF? {: ok:bool :}
+   ok if v s" content" MEMBER-OF else s" " false then
+   {: c:str ok2:bool :}
+   c DROPBOX:>HASH MODEL-LOCAL:MAKE ok ok2 and ;
+
+: REMOTE-OF ( JSON:value -- remote bool )
+   {: v :}
+   v 2 OBJECT-OF? {: ok:bool :}
+   ok if v s" content" MEMBER-OF else s" " false then
+   {: c:str ok2:bool :}
+   ok if v s" revision" MEMBER-OF else s" " false then
+   {: r:str ok3:bool :}
+   c DROPBOX:>HASH r DROPBOX:>REV MODEL-REMOTE:MAKE
+   ok ok2 and ok3 and ;
+
+: REASON-OF ( JSON:value -- unknown-reason bool )
+   {: v :}
+   v s" Incomplete" JSON:STRING= if
+      MODEL-UNKNOWN--REASON:INCOMPLETE true exit then
+   v s" Inaccessible" JSON:STRING= if
+      MODEL-UNKNOWN--REASON:INACCESSIBLE true exit then
+   v s" Unavailable" JSON:STRING= if
+      MODEL-UNKNOWN--REASON:UNAVAILABLE true exit then
+   v s" Stale" JSON:STRING= if
+      MODEL-UNKNOWN--REASON:STALE true exit then
+   v s" CursorReset" JSON:STRING= if
+      MODEL-UNKNOWN--REASON:CURSOR-RESET true exit then
+   v s" Unsupported" JSON:STRING= if
+      MODEL-UNKNOWN--REASON:UNSUPPORTED true exit then
+   MODEL-UNKNOWN--REASON:INCOMPLETE false ;
+
+: BASELINE-OF ( JSON:value -- baseline bool )
+   {: v :}
+   v s" Absent" JSON:STRING= if
+      MODEL-BASELINE:ABSENT true exit then
+   v s" Directory" JSON:STRING= if
+      MODEL-BASELINE:DIRECTORY true exit then
+   v s" Present" TAGGED {: p ok:bool :}
+   p REMOTE-OF {: f ok2:bool :}
+   f MODEL-BASELINE:PRESENT ok ok2 and ;
+
+: LOCAL-OBSERVATION-OF ( JSON:value -- observation<local> bool )
+   {: v :}
+   v s" ConfirmedAbsent" JSON:STRING= if
+      MODEL-OBSERVATION:ABSENT true exit then
+   v s" Directory" JSON:STRING= if
+      MODEL-OBSERVATION:DIRECTORY true exit then
+   v s" Unknown" TAGGED {: u ok:bool :}
+   ok if u REASON-OF swap MODEL-OBSERVATION:UNKNOWN swap exit then
+   v s" Present" TAGGED {: p ok2:bool :}
+   p LOCAL-OF {: f ok3:bool :}
+   f MODEL-OBSERVATION:PRESENT ok2 ok3 and ;
+
+: REMOTE-OBSERVATION-OF ( JSON:value -- observation<remote> bool )
+   {: v :}
+   v s" ConfirmedAbsent" JSON:STRING= if
+      MODEL-OBSERVATION:ABSENT true exit then
+   v s" Directory" JSON:STRING= if
+      MODEL-OBSERVATION:DIRECTORY true exit then
+   v s" Unknown" TAGGED {: u ok:bool :}
+   ok if u REASON-OF swap MODEL-OBSERVATION:UNKNOWN swap exit then
+   v s" Present" TAGGED {: p ok2:bool :}
+   p REMOTE-OF {: f ok3:bool :}
+   f MODEL-OBSERVATION:PRESENT ok2 ok3 and ;
+
+\ A column no reader took fails a check naming its text.
+: TOOK ( bool str str -- )
+   {: ok:bool t:str what:str :}
+   ok 0= if t what T$= then ;
+
+: BASELINE-IN ( str -- baseline )
+   {: t :} t JSON:PARSE BASELINE-OF t s" a baseline" TOOK ;
+
+: LOCAL-IN ( str -- observation<local> )
+   {: t :}
+   t JSON:PARSE LOCAL-OBSERVATION-OF t s" a local observation" TOOK ;
+
+: REMOTE-IN ( str -- observation<remote> )
+   {: t :}
+   t JSON:PARSE REMOTE-OBSERVATION-OF
+   t s" a remote observation" TOOK ;
+
 \ The four inputs from a line's columns, then the columns after them.
 : INPUTS ( str -- baseline observation<local>
    observation<remote> subtree str )
@@ -50,17 +177,14 @@ TYPED-VARIABLE W JSON:writer
    t1 COLUMN {: l t2 :}
    t2 COLUMN {: r t3 :}
    t3 COLUMN {: s t4 :}
-   b AR @ JSON>BASELINE
-   l AR @ JSON>LOCAL-OBSERVATION
-   r AR @ JSON>REMOTE-OBSERVATION
-   s SUBTREE t4 ;
+   b BASELINE-IN l LOCAL-IN r REMOTE-IN s SUBTREE t4 ;
 
 \ Each word below takes a decision's payload, the line's decision
 \ column and the columns after it.
 : NOOP-IS ( baseline str str -- )
    {: v k j :}
    k s" noop" T$=
-   j [: v swap BASELINE>JSON ;] WRITES ;
+   j BASELINE-IN v BASELINE= TTRUE ;
 
 : OPERATE-IS ( operation str str -- )
    {: v k j :}
