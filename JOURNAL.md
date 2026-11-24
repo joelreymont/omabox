@@ -2319,3 +2319,43 @@ Observations for the blog:
 - The test that read freed memory passed on master. Rust's borrow checker
   would have refused it; Habu ran it. A test of freeing has to watch the
   allocator, not ask the freed object.
+
+## 2026-11-24: two flaky suites and a check that said too little
+
+Landing Omabox's port to the new string meant landing Habu work too, and
+three things in Habu's own test suites were not what they seemed.
+
+Two suites failed now and then: http in about 1 of 3 runs, model in about
+1 of 6. Neither was retried away; each was hunted to its cause.
+- http: stopping the server sometimes took 10 s instead of its bound. The
+  stop's wait woke from its timer before `mono-ns` said the deadline had
+  come, saw no timer left, and waited for a parked task's 10 s park to
+  end. On arm64 Linux, `mono-ns` read the CPU's raw counter, but every
+  kernel timer Habu waits on runs on CLOCK_MONOTONIC, which NTP slews:
+  here about 5 ppm fast. A 60 s timer woke 225 µs early by `mono-ns`; the
+  two clocks were 2.8 days apart. `mono-ns` now reads CLOCK_MONOTONIC, as
+  x64 already did; macOS keeps the counter its own timers use. A new test
+  fails on the old engine, and 12 loaded runs pass where 2 of 6 failed.
+  The read now costs about 150 ns instead of 3 (a system call, not a
+  register), but every caller sits beside a wait or an I/O call.
+- model: the fake model server's four workers wrote their replies into
+  one shared buffer. A worker gave up its turn before its reply had gone
+  out, and the next one overwrote it, so the client read a broken reply.
+  Each worker now has its own buffer.
+
+The third was quieter. Habu's source checker reads a file ahead of the
+run and stops where it can no longer tell what the code means. It stopped
+at the first `CALLBACK:` declaration (TLS has one), so nothing after it
+was checked, and the stop was reported like a harmless deferral: the
+check exited 0. A stopped check now says so in its text, its JSON and its
+exit status, and `CALLBACK:` is declared to the checker, so files with
+callbacks are checked to the end.
+
+Observations for the blog:
+- A flaky test is a bug report with poor handwriting. Both of these were
+  real: one in the runtime's clock, one in a test server's sharing.
+- Rust's `Instant` reads CLOCK_MONOTONIC through the vDSO, so a Rust
+  program would not have had this mismatch. Habu's engine reads clocks
+  itself, so it owns the choice of clock and the bugs that follow from it.
+- A checker that stops silently gives the same green as one that checked
+  everything. "Clean" has to mean "read to the end".
