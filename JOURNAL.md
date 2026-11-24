@@ -2249,3 +2249,35 @@ Observations for the blog:
 - A platform build choice cost us a second time today. SQLite's STAT4,
   like its secure delete before, shows in no code and only in a
   measurement.
+
+## 2026-11-24: one store, one instruction
+
+The table of 2026-11-23 named one cost in Habu's own compiler: the code it
+emits calls `!` rather than storing inline. A profile of the decode put
+about 9% of its samples in that call. Tier 0, the compiler every
+definition goes through, writes a fixed list of simple operations
+straight into machine code. `!` and `c!` were not on it, so each store
+wrote the values held in registers back to the in-memory stack, called
+the primitive, popped the address and the value, stored, and returned.
+The primitive checked nothing; tier 0 simply had no store of its own.
+Now each is one instruction: `str` or `strb` on ARM64, `mov` on x86-64,
+`i64.store` or `i64.store8` in WebAssembly. On ARM64 a store went from
+3.77 to 0.66 ns, and decoding the tree-sized records got 11 to 15%
+faster. The other two targets were not measured.
+
+Observations for the blog:
+- A self-hosted compiler shows its own change late. The first rebuilt
+  engine still carried libraries compiled by the old compiler, so its
+  profile showed the call at 8.9% as before; only the second generation,
+  compiled by the first, showed none. Evidence for a compiler change has
+  to come from a generation the change compiled.
+- The installed Habu could not build current master, which needed a
+  primitive and a checker rule the installed engine lacked. It took two
+  intermediate builds, at the commits that add them, to reach master.
+  Rust's toolchain arrives as a binary; a self-hosted language carries
+  its bootstrap chain with it.
+- The change broke a test that had nothing to do with stores. The engine's
+  code shrank by 64 KB, two freed holes in the address space merged into
+  one 128 KB gap, a memory pool's first chunk landed there, and a probe
+  that notices new mappings only inside the holes it freed noticed it.
+  The fix went into the test, which now maps the pool before it measures.
