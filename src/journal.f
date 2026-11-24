@@ -2716,12 +2716,22 @@ private
 
 \ ---- plans ---------------------------------------------------------
 
-: PLAN-QUERY ( -- str )
+: PLAN-SELECT ( -- str )
    s" SELECT plans.id, plans.path, plans.status, plans.blocked_json,
          plans.retry_at, operations.id, operations.ordinal,
          operations.operation_json, operations.status
-      FROM plans JOIN operations ON operations.plan_id = plans.id
-      WHERE plans.status = ?1 ORDER BY plans.id, operations.ordinal" ;
+      FROM plans JOIN operations ON operations.plan_id = plans.id" ;
+
+: PENDING-WHERE ( -- str )
+   s"  WHERE plans.status = 'pending' ORDER BY plans.id, operations.ordinal" ;
+
+: BLOCKED-WHERE ( -- str )
+   s"  WHERE plans.status = 'blocked' ORDER BY plans.id, operations.ordinal" ;
+
+\ The status is a literal: one_live_plan_per_path is partial on it, so a
+\ bound status would re-prepare the statement at every bind.
+create PENDING-QUERY PLAN-SELECT PENDING-WHERE LAY-BOTH
+create BLOCKED-QUERY PLAN-SELECT BLOCKED-WHERE LAY-BOTH
 
 : PATH-INVALID ( str MODEL:path str -- )
    {: op:str path d:str :}
@@ -2840,7 +2850,7 @@ private
    s json retry op path ar DECODE-PLAN-STATUS {: status :}
    id path ops status JOURNAL-PLAN--RECORD:MAKE plans VEC:PUSH ! ;
 
-\ A row of PLAN-QUERY: its operation joins the last plan when the row is
+\ A row of a plans query: its operation joins the last plan when the row is
 \ that plan's, else starts a new one.
 : PLAN-ROW
    ( SQLITE:statement ^VEC:vector<plan-record> str ^ARENA:arena
@@ -2855,15 +2865,14 @@ private
    then
    plans id path planned op ar NEW-PLAN-ROW ;
 
-\ Every plan whose status is the text, each one's operations in order.
+\ Every plan the query text answers, each one's operations in order.
 : READ-PLANS-WITH-STATUS
    ( SQLITE:connection str str ^ARENA:arena
      -- ^VEC:vector<plan-record> )
-   {: c s:str op:str ar :}
+   {: c q:str op:str ar :}
    ar [type] plan-record NEW-VECTOR {: plans :}
-   c PLAN-QUERY
-    [: s 1 SQLITE:BIND-TEXT
-      begin SQLITE:STEP while plans op ar PLAN-ROW repeat ;]
+   c q
+    [: begin SQLITE:STEP while plans op ar PLAN-ROW repeat ;]
    SQLITE:WITH-STATEMENT
    plans ;
 
@@ -3130,14 +3139,14 @@ public
 \ order.
 : PENDING-PLANS ( journal ^ARENA:arena -- ^VEC:vector<plan-record> )
    {: j ar :}
-   j >CONNECTION s" pending" s" read pending plans" ar
+   j >CONNECTION PENDING-QUERY TEXT s" read pending plans" ar
    READ-PLANS-WITH-STATUS ;
 
 \ Every plan a classified failure holds, by id, each one's operations in
 \ order.
 : BLOCKED-PLANS ( journal ^ARENA:arena -- ^VEC:vector<plan-record> )
    {: j ar :}
-   j >CONNECTION s" blocked" s" read blocked plans" ar
+   j >CONNECTION BLOCKED-QUERY TEXT s" read blocked plans" ar
    READ-PLANS-WITH-STATUS ;
 
 \ The plan with this id as the journal holds it now, if any.
