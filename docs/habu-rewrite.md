@@ -49,28 +49,29 @@ watcher comes only for a measured need.
 
 | Package | Does | Rust |
 |---|---|---|
-| `MODEL` | domain types; stored JSON byte-identical to serde's | `model.rs` |
+| `MODEL` | domain types; the JSON the journal stores, byte-identical to serde's | `model.rs` |
 | `PLANNER` | `PLAN`, a decision table | `planner.rs` |
 | `CONFIG` | paths, `config.toml`, the instance lock | `config.rs` |
 | `STATUS` | `status.json`, rewritten every 20 s by its own task | `runtime_status.rs` |
-| `JOURNAL` | schema 9; a listing publishes in one transaction | `journal.rs` |
+| `JOURNAL` | schema 10; a listing publishes in one transaction | `journal.rs` |
 | `LOCAL` | scan, hash, stage, install, guarded delete | `local.rs` |
 | `AUTH` | the credential record, PKCE | `auth.rs` |
 | `REPLAY` | pending plans: intent, guard, effect, complete | `recovery.rs` |
 | `RECONCILE` | `PASS`: list, scan, plan, replay, download | `reconcile.rs` |
 | `DAEMON` | `RUN`, and one table of failure dispositions | `daemon.rs` |
 
-- **Journal.** Opens schema 9, creates it from `migrations/` or migrates 8 to
-  it; refuses every other version. Schema 9 keys local observations by
-  canonical path, as the user chose on 2026-11-18; the Rust version cannot
+- **Journal.** Opens schema 10, creates it from `migrations/` or migrates 8
+  or 9 to it; refuses every other version. It keys local observations by
+  canonical path, as the user chose on 2026-11-18, and holds baselines,
+  observations and the hash cache in typed columns; the Rust version cannot
   open it.
 - **Values.** `MODEL` holds types, equality and JSON, no state. A display path
   and its Dropbox identity, `FOLD`'s answer, are `DEFTYPE`s over `str`; the
   hash, revision and cursor roles are `DROPBOX`'s. A value travels by value;
   its strings are borrowed, and a reader copies them into the arena the caller
-  passes, one per pass. Each stored column type has a writer and a reader of
-  serde's bytes; a stored value this version cannot read throws
-  `MODEL:E-STORED`.
+  passes, one per pass. Operations, conflicts, blockages and a recovery's
+  content are stored as serde's bytes, each with a writer and a reader; a
+  stored value this version cannot read throws `MODEL:E-STORED`.
 - **Decisions.** A no-op carries only its baseline, a block is unknown or
   occupied, and an operating decision carries one operation: production reads
   no more (`src/reconcile.rs:1085-1300`). `PLAN` is a nested `MATCH`, its

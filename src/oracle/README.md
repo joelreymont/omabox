@@ -1,7 +1,7 @@
 # The Rust version's test answers
 
-- `json.tsv`: `<type>.<variant>`, then serde's JSON for it; `.escapes`
-  lines pin string escapes.
+- `json.tsv`: `<type>.<variant>`, then serde's JSON for it, for each
+  type Omabox stores as JSON; `.escapes` lines pin string escapes.
 - `plan.tsv`: the planner's inputs (baseline, local, remote, subtree) as
   JSON, then its decision.
 - `fold.tsv`: a display path in hex, then `CanonicalPath::from_display` of
@@ -20,4 +20,6 @@
 
 Written by `OMABOX_ORACLE=<dir> cargo test oracle -- --ignored` at `rust`
 commit `e3c161352d0ddca750059a1ef7aea4f7c7cce811` (`src/journal/oracle.rs`),
-but for `schema.tsv`'s schema-9 rows, read from a journal `OPEN` creates.
+but for `schema.tsv`'s schema-9 rows, read from a journal `OPEN` creates,
+and for the `json.tsv` lines of types Omabox no longer stores as JSON,
+removed.

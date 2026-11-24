@@ -2,13 +2,15 @@
 \ "Values"): a display path and its Dropbox identity, what each side holds
 \ at a path, the last state both agreed on, and the planner's operations,
 \ conflicts and decisions, with their equality and display text, the
-\ records the journal and the local scan share, and the stored values'
-\ JSON, written byte for byte as the Rust version's serde_json writes it
-\ and read as serde_json reads any value either version stored. A reader
-\ refuses a struct written as an array, a variant with no payload written
-\ as an object and a skipped member holding a lone surrogate escape: serde
-\ reads them and no writer makes them. The writers give serde_json's bytes
-\ only on a compact writer that does not escape non-ASCII.
+\ records the journal and the local scan share, and the JSON of what the
+\ journal still stores as text: operations, conflicts, blockages and a
+\ recovery's content, written byte for byte as the Rust version's
+\ serde_json writes it and read as serde_json reads any value either
+\ version stored. A reader refuses a struct written as an array, a variant
+\ with no payload written as an object and a skipped member holding a lone
+\ surrogate escape: serde reads them and no writer makes them. The writers
+\ give serde_json's bytes only on a compact writer that does not escape
+\ non-ASCII.
 \ FOLD is Rust's CanonicalPath::from_display over Path::iter: a path that
 \ starts with "/" yields the root, else one that starts with "." then "/" or
 \ its end yields ".", and the components after it skip empty and "." ones.
@@ -672,34 +674,6 @@ public
 private
 
 \ The names Rust gives a family's variants, by index; empty past them.
-: BASELINE-NAME ( n -- str )
-   case
-      0 of s" Absent" endof
-      1 of s" Present" endof
-      2 of s" Directory" endof
-      s" " swap
-   endcase ;
-
-: REASON-NAME ( n -- str )
-   case
-      0 of s" Incomplete" endof
-      1 of s" Inaccessible" endof
-      2 of s" Unavailable" endof
-      3 of s" Stale" endof
-      4 of s" CursorReset" endof
-      5 of s" Unsupported" endof
-      s" " swap
-   endcase ;
-
-: OBSERVATION-NAME ( n -- str )
-   case
-      0 of s" Present" endof
-      1 of s" Directory" endof
-      2 of s" ConfirmedAbsent" endof
-      3 of s" Unknown" endof
-      s" " swap
-   endcase ;
-
 : OPERATION-NAME ( n -- str )
    case
       0 of s" CreateLocalDirectory" endof
@@ -737,16 +711,6 @@ private
       6 of s" RemoteObject" endof
       7 of s" ConflictCopyOccupied" endof
       s" " swap
-   endcase ;
-
-: >REASON ( n -- unknown-reason )
-   case
-      0 of MODEL-UNKNOWN--REASON:INCOMPLETE endof
-      1 of MODEL-UNKNOWN--REASON:INACCESSIBLE endof
-      2 of MODEL-UNKNOWN--REASON:UNAVAILABLE endof
-      3 of MODEL-UNKNOWN--REASON:STALE endof
-      4 of MODEL-UNKNOWN--REASON:CURSOR-RESET endof
-      MODEL-UNKNOWN--REASON:UNSUPPORTED swap
    endcase ;
 
 \ The next member's key, after a comma unless it is the first.
@@ -790,53 +754,6 @@ public
    s" content" KEY+ c swap HASH>JSON
    s" revision" KEY+ r swap REV>JSON
    JSON:WRITE-OBJECT-END ;
-
-: BASELINE>JSON ( baseline ^JSON:writer -- ^JSON:writer )
-   {: v:baseline w :}
-   v MATCH baseline
-      absent OF w 0 BASELINE-NAME JSON:WRITE-STRING ENDOF
-      present OF w 1 BASELINE-NAME TAGGED+ REMOTE>JSON
-         JSON:WRITE-OBJECT-END ENDOF
-      directory OF w 2 BASELINE-NAME JSON:WRITE-STRING ENDOF
-   ;MATCH ;
-
-: UNKNOWN-REASON>JSON ( unknown-reason ^JSON:writer -- ^JSON:writer )
-   swap REASON-INDEX REASON-NAME JSON:WRITE-STRING ;
-
-private
-
-\ An observation's variants but present, the same for either side.
-: UNKNOWN+ ( unknown-reason ^JSON:writer -- ^JSON:writer )
-   3 OBSERVATION-NAME TAGGED+ UNKNOWN-REASON>JSON
-   JSON:WRITE-OBJECT-END ;
-
-: DIRECTORY+ ( ^JSON:writer -- ^JSON:writer )
-   1 OBSERVATION-NAME JSON:WRITE-STRING ;
-
-: ABSENT+ ( ^JSON:writer -- ^JSON:writer )
-   2 OBSERVATION-NAME JSON:WRITE-STRING ;
-
-public
-
-: LOCAL-OBSERVATION>JSON ( observation<local> ^JSON:writer -- ^JSON:writer )
-   {: v:observation<local> w :}
-   v MATCH observation
-      present OF w 0 OBSERVATION-NAME TAGGED+ LOCAL>JSON
-         JSON:WRITE-OBJECT-END ENDOF
-      directory OF w DIRECTORY+ ENDOF
-      absent OF w ABSENT+ ENDOF
-      unknown OF w UNKNOWN+ ENDOF
-   ;MATCH ;
-
-: REMOTE-OBSERVATION>JSON ( observation<remote> ^JSON:writer -- ^JSON:writer )
-   {: v:observation<remote> w :}
-   v MATCH observation
-      present OF w 0 OBSERVATION-NAME TAGGED+ REMOTE>JSON
-         JSON:WRITE-OBJECT-END ENDOF
-      directory OF w DIRECTORY+ ENDOF
-      absent OF w ABSENT+ ENDOF
-      unknown OF w UNKNOWN+ ENDOF
-   ;MATCH ;
 
 private
 
@@ -1034,37 +951,6 @@ ARENA CURSORS JSON:cursor
 : REMOTE-AT ( ^u8 n str reading -- remote )
    {: r:reading :} r MEMBER r READ-REMOTE ;
 
-: READ-BASELINE ( ^u8 n reading -- baseline )
-   {: r:reading :}
-   [: BASELINE-NAME ;] r TAGGED {: i:n p:^ pu:n :}
-   i 1 = if p pu r READ-REMOTE MODEL-BASELINE:PRESENT exit then
-   p pu UNIT
-   i 0 = if MODEL-BASELINE:ABSENT exit then
-   MODEL-BASELINE:DIRECTORY ;
-
-: READ-REASON ( ^u8 n reading -- unknown-reason )
-   {: r:reading :}
-   [: REASON-NAME ;] r TAGGED {: i:n p:^ pu:n :}
-   p pu UNIT i >REASON ;
-
-: READ-LOCAL-OBSERVATION ( ^u8 n reading -- observation<local> )
-   {: r:reading :}
-   [: OBSERVATION-NAME ;] r TAGGED {: i:n p:^ pu:n :}
-   i 0 = if p pu r READ-LOCAL MODEL-OBSERVATION:PRESENT exit then
-   i 3 = if p pu r READ-REASON MODEL-OBSERVATION:UNKNOWN exit then
-   p pu UNIT
-   i 1 = if MODEL-OBSERVATION:DIRECTORY exit then
-   MODEL-OBSERVATION:ABSENT ;
-
-: READ-REMOTE-OBSERVATION ( ^u8 n reading -- observation<remote> )
-   {: r:reading :}
-   [: OBSERVATION-NAME ;] r TAGGED {: i:n p:^ pu:n :}
-   i 0 = if p pu r READ-REMOTE MODEL-OBSERVATION:PRESENT exit then
-   i 3 = if p pu r READ-REASON MODEL-OBSERVATION:UNKNOWN exit then
-   p pu UNIT
-   i 1 = if MODEL-OBSERVATION:DIRECTORY exit then
-   MODEL-OBSERVATION:ABSENT ;
-
 : DIRECTORY-OPERATION ( n -- operation )
    case
       0 of MODEL-OPERATION:CREATE-LOCAL-DIRECTORY endof
@@ -1154,19 +1040,10 @@ public
 
 private
 
-: NO-REV ( -- DROPBOX:rev ) NONE DROPBOX:>REV ;
 : NO-LOCAL ( -- local ) NO-HASH MODEL-LOCAL:MAKE ;
-: NO-REMOTE ( -- remote ) NO-HASH NO-REV MODEL-REMOTE:MAKE ;
 
 \ A seed's typed drop, which types the read that replaces it.
 : DROP-HASH ( DROPBOX:hash -- ) drop ;
-: DROP-REV ( DROPBOX:rev -- ) drop ;
-: DROP-LOCAL ( local -- ) drop ;
-: DROP-REMOTE ( remote -- ) drop ;
-: DROP-BASELINE ( baseline -- ) drop ;
-: DROP-REASON ( unknown-reason -- ) drop ;
-: DROP-LOCAL-OBSERVATION ( observation<local> -- ) drop ;
-: DROP-REMOTE-OBSERVATION ( observation<remote> -- ) drop ;
 : DROP-OPERATION ( operation -- ) drop ;
 : DROP-CONFLICT ( conflict -- ) drop ;
 : DROP-BLOCKAGE ( blockage -- ) drop ;
@@ -1177,40 +1054,6 @@ public
 : JSON>HASH ( str ^ARENA:arena -- DROPBOX:hash )
    {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
    NO-HASH r [: DROP-HASH s str> r READ-HASH ;] GUARDED ;
-
-: JSON>REV ( str ^ARENA:arena -- DROPBOX:rev )
-   {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
-   NO-REV r [: DROP-REV s str> r READ-REV ;] GUARDED ;
-
-: JSON>LOCAL ( str ^ARENA:arena -- local )
-   {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
-   NO-LOCAL r [: DROP-LOCAL s str> r READ-LOCAL ;] GUARDED ;
-
-: JSON>REMOTE ( str ^ARENA:arena -- remote )
-   {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
-   NO-REMOTE r [: DROP-REMOTE s str> r READ-REMOTE ;] GUARDED ;
-
-: JSON>BASELINE ( str ^ARENA:arena -- baseline )
-   {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
-   MODEL-BASELINE:ABSENT r
-   [: DROP-BASELINE s str> r READ-BASELINE ;] GUARDED ;
-
-: JSON>UNKNOWN-REASON ( str ^ARENA:arena -- unknown-reason )
-   {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
-   MODEL-UNKNOWN--REASON:STALE r
-   [: DROP-REASON s str> r READ-REASON ;] GUARDED ;
-
-: JSON>LOCAL-OBSERVATION ( str ^ARENA:arena -- observation<local> )
-   {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
-   MODEL-OBSERVATION:DIRECTORY r
-   [: DROP-LOCAL-OBSERVATION s str> r READ-LOCAL-OBSERVATION ;]
-   GUARDED ;
-
-: JSON>REMOTE-OBSERVATION ( str ^ARENA:arena -- observation<remote> )
-   {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
-   MODEL-OBSERVATION:DIRECTORY r
-   [: DROP-REMOTE-OBSERVATION s str> r READ-REMOTE-OBSERVATION ;]
-   GUARDED ;
 
 : JSON>OPERATION ( str ^ARENA:arena -- operation )
    {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}

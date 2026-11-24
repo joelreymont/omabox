@@ -5,8 +5,8 @@
 \ equality words on one equal and one unequal pair, and the observation,
 \ fingerprint and record ones on values that differ in one field or
 \ variant; each display word on every variant against model.rs's text;
-\ every line of src/oracle/json.tsv through the JSON writers and readers,
-\ and the readers' acceptance and refusals.
+\ every line of src/oracle/json.tsv through the JSON writers and the
+\ readers that remain, and the readers' acceptance and refusals.
 \ Run from the repository root: hb --load src/model-test.f </dev/null
 require src/lib/arena.f
 require src/lib/string.f
@@ -458,43 +458,6 @@ TYPED-VARIABLE W JSON:writer
 : REMOTE1 ( bool -- MODEL:remote )
    {: e:bool :} e C1 e V1 MODEL-REMOTE:MAKE ;
 
-: BASELINE-OF ( str bool -- MODEL:baseline )
-   {: v e:bool :}
-   v s" Absent" STR:= if MODEL-BASELINE:ABSENT exit then
-   v s" Directory" STR:= if MODEL-BASELINE:DIRECTORY exit then
-   e REMOTE0 MODEL-BASELINE:PRESENT ;
-
-: REASON-OF ( str -- MODEL:unknown-reason )
-   {: v :}
-   v s" Incomplete" STR:= if MODEL-UNKNOWN--REASON:INCOMPLETE exit then
-   v s" Inaccessible" STR:= if
-      MODEL-UNKNOWN--REASON:INACCESSIBLE exit then
-   v s" Unavailable" STR:= if
-      MODEL-UNKNOWN--REASON:UNAVAILABLE exit then
-   v s" Stale" STR:= if MODEL-UNKNOWN--REASON:STALE exit then
-   v s" CursorReset" STR:= if
-      MODEL-UNKNOWN--REASON:CURSOR-RESET exit then
-   MODEL-UNKNOWN--REASON:UNSUPPORTED ;
-
-\ An Unknown observation's label names its reason after a period.
-: UNKNOWN-REASON-OF ( str -- MODEL:unknown-reason )
-   str> {: v:^ vu:n :}
-   v 8 + vu 8 - >str REASON-OF ;
-
-: LOCAL-OBSERVATION-OF ( str bool -- MODEL:observation<MODEL:local> )
-   {: v e:bool :}
-   v s" ConfirmedAbsent" STR:= if MODEL-OBSERVATION:ABSENT exit then
-   v s" Directory" STR:= if MODEL-OBSERVATION:DIRECTORY exit then
-   v s" Present" STR:= if e LOCAL0 MODEL-OBSERVATION:PRESENT exit then
-   v UNKNOWN-REASON-OF MODEL-OBSERVATION:UNKNOWN ;
-
-: REMOTE-OBSERVATION-OF ( str bool -- MODEL:observation<MODEL:remote> )
-   {: v e:bool :}
-   v s" ConfirmedAbsent" STR:= if MODEL-OBSERVATION:ABSENT exit then
-   v s" Directory" STR:= if MODEL-OBSERVATION:DIRECTORY exit then
-   v s" Present" STR:= if e REMOTE0 MODEL-OBSERVATION:PRESENT exit then
-   v UNKNOWN-REASON-OF MODEL-OBSERVATION:UNKNOWN ;
-
 : DIRECTORY-OPERATION-OF ( str -- MODEL:operation )
    {: v :}
    v s" CreateLocalDirectory" STR:= if
@@ -556,12 +519,6 @@ TYPED-VARIABLE W JSON:writer
 
 \ One line's checks: its variant label, whether it is an .escapes line,
 \ and its JSON.
-: BASELINE-LINE ( str bool str -- )
-   {: v e:bool j :}
-   j [: v e BASELINE-OF swap MODEL:BASELINE>JSON ;] WRITES
-   j [: j AR @ MODEL:JSON>BASELINE
-      swap MODEL:BASELINE>JSON ;] WRITES ;
-
 : BLOCKAGE-LINE ( str bool str -- )
    {: v e:bool j :}
    j [: v e BLOCKAGE-OF swap MODEL:BLOCKAGE>JSON ;] WRITES
@@ -582,47 +539,21 @@ TYPED-VARIABLE W JSON:writer
 
 : REV-LINE ( str bool str -- )
    {: v e:bool j :}
-   j [: e V0 swap MODEL:REV>JSON ;] WRITES
-   j [: j AR @ MODEL:JSON>REV
-      swap MODEL:REV>JSON ;] WRITES ;
+   j [: e V0 swap MODEL:REV>JSON ;] WRITES ;
 
 : LOCAL-LINE ( str bool str -- )
    {: v e:bool j :}
-   j [: e LOCAL0 swap MODEL:LOCAL>JSON ;] WRITES
-   j [: j AR @ MODEL:JSON>LOCAL
-      swap MODEL:LOCAL>JSON ;] WRITES ;
+   j [: e LOCAL0 swap MODEL:LOCAL>JSON ;] WRITES ;
 
 : REMOTE-LINE ( str bool str -- )
    {: v e:bool j :}
-   j [: e REMOTE0 swap MODEL:REMOTE>JSON ;] WRITES
-   j [: j AR @ MODEL:JSON>REMOTE
-      swap MODEL:REMOTE>JSON ;] WRITES ;
-
-: LOCAL-OBSERVATION-LINE ( str bool str -- )
-   {: v e:bool j :}
-   j [: v e LOCAL-OBSERVATION-OF
-      swap MODEL:LOCAL-OBSERVATION>JSON ;] WRITES
-   j [: j AR @ MODEL:JSON>LOCAL-OBSERVATION
-      swap MODEL:LOCAL-OBSERVATION>JSON ;] WRITES ;
-
-: REMOTE-OBSERVATION-LINE ( str bool str -- )
-   {: v e:bool j :}
-   j [: v e REMOTE-OBSERVATION-OF
-      swap MODEL:REMOTE-OBSERVATION>JSON ;] WRITES
-   j [: j AR @ MODEL:JSON>REMOTE-OBSERVATION
-      swap MODEL:REMOTE-OBSERVATION>JSON ;] WRITES ;
+   j [: e REMOTE0 swap MODEL:REMOTE>JSON ;] WRITES ;
 
 : OPERATION-LINE ( str bool str -- )
    {: v e:bool j :}
    j [: v e OPERATION-OF swap MODEL:OPERATION>JSON ;] WRITES
    j [: j AR @ MODEL:JSON>OPERATION
       swap MODEL:OPERATION>JSON ;] WRITES ;
-
-: REASON-LINE ( str bool str -- )
-   {: v e:bool j :}
-   j [: v REASON-OF swap MODEL:UNKNOWN-REASON>JSON ;] WRITES
-   j [: j AR @ MODEL:JSON>UNKNOWN-REASON
-      swap MODEL:UNKNOWN-REASON>JSON ;] WRITES ;
 
 \ A label's type, then its variant and whether it is an .escapes line.
 : LABEL ( str -- str str bool )
@@ -641,17 +572,13 @@ TYPED-VARIABLE W JSON:writer
    line str> {: l:^ lu:n :}
    l next + lu next - >str {: j :}
    v e j
-   t s" Baseline" STR:= if BASELINE-LINE exit then
    t s" BlockReason" STR:= if BLOCKAGE-LINE exit then
    t s" Conflict" STR:= if CONFLICT-LINE exit then
    t s" ContentIdentity" STR:= if HASH-LINE exit then
    t s" DropboxRevision" STR:= if REV-LINE exit then
    t s" LocalFile" STR:= if LOCAL-LINE exit then
-   t s" LocalObservation" STR:= if LOCAL-OBSERVATION-LINE exit then
    t s" Operation" STR:= if OPERATION-LINE exit then
    t s" RemoteFile" STR:= if REMOTE-LINE exit then
-   t s" RemoteObservation" STR:= if REMOTE-OBSERVATION-LINE exit then
-   t s" UnknownReason" STR:= if REASON-LINE exit then
    drop drop drop s" a json.tsv type" s" none" T$= ;
 
 : JSON-FROM ( str n -- n )
@@ -671,15 +598,10 @@ TYPED-VARIABLE W JSON:writer
 
 
 \ Each text reads as the value the second text, serde's bytes, holds.
-: READS-REMOTE ( str str -- )
+: READS-OPERATION ( str str -- )
    {: s j :}
-   j [: s AR @ MODEL:JSON>REMOTE
-      swap MODEL:REMOTE>JSON ;] WRITES ;
-
-: READS-BASELINE ( str str -- )
-   {: s j :}
-   j [: s AR @ MODEL:JSON>BASELINE
-      swap MODEL:BASELINE>JSON ;] WRITES ;
+   j [: s AR @ MODEL:JSON>OPERATION
+      swap MODEL:OPERATION>JSON ;] WRITES ;
 
 : READS-HASH ( str str -- )
    {: s j :}
@@ -690,25 +612,23 @@ TYPED-VARIABLE W JSON:writer
 \ unknown member with its value, as serde reads them.
 : ACCEPTED-CASE ( -- )
    s" reader accepts" T-LABEL
-   s\"  \t\r\n{ \"revision\" : \"r\" ,\n\"content\":\"c\" } \n"
-   s\" {\"content\":\"c\",\"revision\":\"r\"}" READS-REMOTE
-   s\" {\"Pre\\u0073ent\":{\"c\\u006Fntent\":\"\\u0063\",\"revision\":\"\\/\"}}"
-   s\" {\"Present\":{\"content\":\"c\",\"revision\":\"/\"}}" READS-BASELINE
+   s\"  \t\r\n{ \"InstallLocal\" : { \"source\" : { \"revision\" : \"r\" ,\n\"content\":\"c\" } } } \n"
+   s\" {\"InstallLocal\":{\"source\":{\"content\":\"c\",\"revision\":\"r\"}}}"
+   READS-OPERATION
+   s\" {\"Inst\\u0061llLocal\":{\"s\\u006Furce\":{\"c\\u006Fntent\":\"\\u0063\",\"revision\":\"\\/\"}}}"
+   s\" {\"InstallLocal\":{\"source\":{\"content\":\"c\",\"revision\":\"/\"}}}"
+   READS-OPERATION
    s\" \"\\ud83d\\ude00\\b\\f\\n\\r\\t\\u001f\\u00e9\""
    s\" \"\xF0\x9F\x98\x80\\b\\f\\n\\r\\t\\u001f\xC3\xA9\"" READS-HASH
-   s\" {\"Present\":{\"content\":\"c\",\"revision\":\"r\",\"extra\":[]}}"
-   s\" {\"Present\":{\"content\":\"c\",\"revision\":\"r\"}}" READS-BASELINE ;
+   s\" {\"InstallLocal\":{\"source\":{\"content\":\"c\",\"revision\":\"r\",\"extra\":[]}}}"
+   s\" {\"InstallLocal\":{\"source\":{\"content\":\"c\",\"revision\":\"r\"}}}"
+   READS-OPERATION ;
 
 
 \ Each text a reader refuses with E-STORED.
-: REFUSES-REMOTE ( str -- )
+: REFUSES-OPERATION ( str -- )
    {: s :}
-   [: s AR @ MODEL:JSON>REMOTE drop ;]
-   MODEL:E-STORED TTHROWSQ ;
-
-: REFUSES-BASELINE ( str -- )
-   {: s :}
-   [: s AR @ MODEL:JSON>BASELINE drop ;]
+   [: s AR @ MODEL:JSON>OPERATION drop ;]
    MODEL:E-STORED TTHROWSQ ;
 
 : REFUSES-BLOCKAGE ( str -- )
@@ -723,28 +643,35 @@ TYPED-VARIABLE W JSON:writer
 
 : REFUSED-CASE ( -- )
    s" reader refuses" T-LABEL
-   s\" \"Gone\"" REFUSES-BASELINE
-   s\" {\"content\":\"c\"}" REFUSES-REMOTE
-   s\" {\"content\":\"c\",\"revision\":\"r\",\"content\":\"c\"}" REFUSES-REMOTE
-   s\" {\"content\":\"c\",\"revision\":\"r\",\"c\\u006fntent\":\"d\"}" REFUSES-REMOTE
-   s\" {\"content\":1,\"revision\":\"r\"}" REFUSES-REMOTE
-   s\" \"Present\"" REFUSES-BASELINE
+   s\" \"Gone\"" REFUSES-OPERATION
+   s\" {\"InstallLocal\":{\"source\":{\"content\":\"c\"}}}"
+   REFUSES-OPERATION
+   s\" {\"InstallLocal\":{\"source\":{\"content\":\"c\",\"revision\":\"r\",\"content\":\"c\"}}}"
+   REFUSES-OPERATION
+   s\" {\"InstallLocal\":{\"source\":{\"content\":\"c\",\"revision\":\"r\",\"c\\u006fntent\":\"d\"}}}"
+   REFUSES-OPERATION
+   s\" {\"InstallLocal\":{\"source\":{\"content\":1,\"revision\":\"r\"}}}"
+   REFUSES-OPERATION
+   s\" \"InstallLocal\"" REFUSES-OPERATION
    s\" {\"DownloadUnavailable\":{\"status\":\"409\"}}" REFUSES-BLOCKAGE
    s\" {\"DownloadUnavailable\":{\"status\":409.0}}" REFUSES-BLOCKAGE
    s\" {\"DownloadUnavailable\":{\"status\":65536}}" REFUSES-BLOCKAGE
    s\" {\"DownloadUnavailable\":{\"status\":-1}}" REFUSES-BLOCKAGE
    s\" {\"DownloadUnavailable\":{\"status\":-0}}" REFUSES-BLOCKAGE
-   s\" \"Absent\" x" REFUSES-BASELINE
-   s\" \"Absent\"\"Absent\"" REFUSES-BASELINE
+   s\" \"CreateLocalDirectory\" x" REFUSES-OPERATION
+   s\" \"CreateLocalDirectory\"\"CreateLocalDirectory\""
+   REFUSES-OPERATION
    s\" \"\xFF\"" REFUSES-HASH
    s\" \"\xC3\"" REFUSES-HASH
    s\" \"\\ud800\"" REFUSES-HASH
-   s\" [\"c\",\"r\"]" REFUSES-REMOTE
-   s\" {\"Present\":[\"c\",\"r\"]}" REFUSES-BASELINE
-   s\" {\"Absent\":null}" REFUSES-BASELINE
-   s\" {\"Absent\":null,\"Directory\":null}" REFUSES-BASELINE
-   s\" {}" REFUSES-BASELINE
-   s" " REFUSES-BASELINE ;
+   s\" {\"InstallLocal\":{\"source\":[\"c\",\"r\"]}}" REFUSES-OPERATION
+   s\" {\"InstallLocal\":[{\"content\":\"c\",\"revision\":\"r\"}]}"
+   REFUSES-OPERATION
+   s\" {\"CreateLocalDirectory\":null}" REFUSES-OPERATION
+   s\" {\"CreateLocalDirectory\":null,\"CreateRemoteDirectory\":null}"
+   REFUSES-OPERATION
+   s\" {}" REFUSES-OPERATION
+   s" " REFUSES-OPERATION ;
 
 : CASES ( -- )
    FOLD-CASE
