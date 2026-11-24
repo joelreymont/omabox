@@ -62,28 +62,19 @@ public
 
 EXPORT LOCAL-RECORDS=
 
-private
-
-: HASH-ROW
-   ( SQLITE:statement ^ARENA:arena
-     -- SQLITE:statement MODEL:hash-record )
-   {: ar :}
-   0 SQLITE:COL-BLOB ar BYTES-PATH {: p:MODEL:path :}
-   1 SQLITE:COL-TEXT {: json:str :}
-   p json ar HASH-OF ;
-
-public
-
 \ The hashes verified for the active root, by path.
 : LOCAL-HASH-CACHE
    ( journal ^ARENA:arena -- ^VEC:vector<MODEL:hash-record> )
    {: j ar :}
    ar ARENA:ALLOCATOR 0 [type] MODEL:hash-record VEC:NEW {: v :}
-   j >CONNECTION s" SELECT cache.path, cache.hash_json
+   j >CONNECTION s" SELECT cache.path, cache.inode, cache.size,
+         cache.modified_seconds, cache.modified_nanoseconds,
+         cache.changed_seconds, cache.changed_nanoseconds,
+         cache.content_hash
       FROM local_hash_cache AS cache
       JOIN local_root_binding AS root
          ON root.singleton = 1 AND cache.root_generation = root.generation
-      ORDER BY cache.path" [: begin SQLITE:STEP while ar HASH-ROW v VEC:PUSH ! repeat ;]
+      ORDER BY cache.path" [: begin SQLITE:STEP while ar REUSE-ROW v VEC:PUSH ! repeat ;]
    SQLITE:WITH-STATEMENT
    v ;
 

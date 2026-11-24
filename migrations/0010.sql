@@ -1,11 +1,13 @@
 -- Baselines, remote and local observations hold their kind, content and
--- revision, which a local observation lacks, in typed columns. A kind is
+-- revision, which a local observation lacks, in typed columns, and the
+-- hash cache its fingerprint and content hash. A kind is
 -- the number MODEL gives an observation's form: present 0, directory 1,
 -- absent 2, unknown 3 plus its reason's index. Each converted_ table holds
 -- its version-nine rows converted, the kind NULL where MODEL's JSON reader
 -- refuses the text; the program refuses the migration on such a row, then
 -- drops both tables and sets the version. A local row MODEL cannot read is
--- kept as unknown instead.
+-- kept as unknown instead, and a hash cache row that does not convert is
+-- dropped: the next scan hashes its file again.
 CREATE TABLE converted_baselines (
     path BLOB PRIMARY KEY NOT NULL,
     canonical_path BLOB NOT NULL,
@@ -185,3 +187,62 @@ FROM (
 WHERE kind != 2;
 
 DROP TABLE local_observations_9;
+
+-- A hash cache value is an object holding fingerprint, an object, and
+-- content, a string, once each; the fingerprint holds its six members
+-- once each, as integers, and inode, size and both nanoseconds are not
+-- negative. Other members are skipped. A u64 above SQLite's largest
+-- integer reads as a real, so its row is dropped. The content is 64
+-- lowercase hex digits; length counts characters to the first NUL, so
+-- the content's bytes are counted too.
+ALTER TABLE local_hash_cache RENAME TO local_hash_cache_9;
+
+CREATE TABLE local_hash_cache (
+    root_generation INTEGER NOT NULL CHECK (root_generation >= 1),
+    path BLOB NOT NULL,
+    inode INTEGER NOT NULL,
+    size INTEGER NOT NULL,
+    modified_seconds INTEGER NOT NULL,
+    modified_nanoseconds INTEGER NOT NULL,
+    changed_seconds INTEGER NOT NULL,
+    changed_nanoseconds INTEGER NOT NULL,
+    content_hash TEXT NOT NULL CHECK (length(content_hash) = 64
+        AND length(CAST(content_hash AS BLOB)) = 64
+        AND content_hash NOT GLOB '*[^0-9a-f]*'),
+    PRIMARY KEY (root_generation, path)
+) STRICT;
+
+INSERT INTO local_hash_cache(root_generation, path, inode, size,
+    modified_seconds, modified_nanoseconds, changed_seconds,
+    changed_nanoseconds, content_hash)
+SELECT root_generation, path,
+    hash_json ->> '$.fingerprint.inode',
+    hash_json ->> '$.fingerprint.size',
+    hash_json ->> '$.fingerprint.modified_seconds',
+    hash_json ->> '$.fingerprint.modified_nanoseconds',
+    hash_json ->> '$.fingerprint.changed_seconds',
+    hash_json ->> '$.fingerprint.changed_nanoseconds',
+    hash_json ->> '$.content'
+FROM local_hash_cache_9
+WHERE CASE WHEN json_valid(hash_json) THEN
+    json_type(hash_json) = 'object'
+    AND (SELECT count(*) = 2 AND count(DISTINCT key) = 2
+            AND sum(key = 'fingerprint' AND type = 'object') = 1
+            AND sum(key = 'content' AND type = 'text'
+                AND length(atom) = 64
+                AND length(CAST(atom AS BLOB)) = 64
+                AND atom NOT GLOB '*[^0-9a-f]*') = 1
+        FROM json_each(hash_json)
+        WHERE key IN ('fingerprint', 'content'))
+    AND (SELECT count(*) = 6 AND count(DISTINCT key) = 6
+            AND sum(type = 'integer' AND typeof(atom) = 'integer'
+                AND (atom >= 0
+                    OR key IN ('modified_seconds', 'changed_seconds')))
+                = 6
+        FROM json_each(hash_json, '$.fingerprint')
+        WHERE key IN ('inode', 'size', 'modified_seconds',
+            'modified_nanoseconds', 'changed_seconds',
+            'changed_nanoseconds'))
+END;
+
+DROP TABLE local_hash_cache_9;

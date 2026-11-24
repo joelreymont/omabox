@@ -1230,31 +1230,31 @@ private
       LIST-PATHS ;] catch {: code:n :}
    code 0<> if drop none then code STEP-CODE ;
 
-\ The path's cached hash and its stored text, both in ar, and whether it
-\ still describes the file and the cutoff lets it be reused.
+\ The path's cached hash, in ar, and whether it still describes the
+\ file and the cutoff lets it be reused.
 : REUSABLE-HASH
    ( JOURNAL:scan scan-context str MODEL:fingerprint ^ARENA:arena
-     -- JOURNAL:scan MODEL:hash-record str bool )
+     -- JOURNAL:scan MODEL:hash-record bool )
    {: cx:scan-context path:str print:MODEL:fingerprint ar:^ARENA:arena :}
    cx SCAN-CONTEXT-UNMAKE
    {: cut:option<cutoff> dev:n lookup:^ARENA:arena :}
    path ar JOURNAL:CACHED-HASH
-   {: r:MODEL:hash-record json:str found:bool :}
-   found 0= if r json false exit then
+   {: r:MODEL:hash-record found:bool :}
+   found 0= if r false exit then
    r RECORD-FINGERPRINT print SAME-FINGERPRINT?
    r cut HASH-IS-REUSABLE and {: ok:bool :}
-   r json ok ;
+   r ok ;
 
 \ The file as a cached hash in ar or as a file to hash; a reused record
-\ matched the walk's in every field, so it goes on as the cache's text.
+\ matched the walk's in every field, so it goes on as the cache holds it.
 : COLLECT-IN
    ( JOURNAL:scan ^ARENA:arena str MODEL:fingerprint scan-context
      -- JOURNAL:scan )
    {: ar:^ARENA:arena path:str print:MODEL:fingerprint
       cx:scan-context :}
    cx path print ar REUSABLE-HASH
-   {: r:MODEL:hash-record json:str reused:bool :}
-   reused if r json JOURNAL:SCAN-REUSE exit then
+   {: r:MODEL:hash-record reused:bool :}
+   reused if r JOURNAL:SCAN-REUSE exit then
    path print JOURNAL:SCAN-JOB ;
 
 \ COLLECT-IN in cx's lookup arena, reset once the journal copied what it
@@ -1516,7 +1516,7 @@ SUBTREE-INSTALL
    code 0<> if drop false then code ;
 
 \ A cached hash still true publishes present and answers true: it stays
-\ reusable, as the text the cache stored.
+\ reusable.
 : REVALIDATE-CACHED
    ( JOURNAL:scan MODEL:hash-record fd -- JOURNAL:scan bool )
    {: r:MODEL:hash-record root:fd :}

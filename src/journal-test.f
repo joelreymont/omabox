@@ -2,21 +2,21 @@
 \ baselines, plans, completions, conflicts and recoveries on journals
 \ under TMPDIR: a new journal's sqlite_master against
 \ src/oracle/schema.tsv as a set, but for the baselines,
-\ remote_observations and local_observations tables, which are
-\ migrations/0010.sql's, and its user_version 10; versions 1, 7 and 11
-\ refused unchanged; src/oracle/journal.sqlite3, a schema-8 journal,
-\ migrated to 10 with its local observations keyed by their folded
-\ paths and its baselines, remote and local observations in typed
-\ columns, and, without its
+\ remote_observations, local_observations and local_hash_cache tables,
+\ which are migrations/0010.sql's, and its user_version 10; versions
+\ 1, 7 and 11 refused unchanged; src/oracle/journal.sqlite3, a schema-8
+\ journal, migrated to 10 with its local observations keyed by their
+\ folded paths and its baselines, remote and local observations and
+\ hash cache in typed columns, and, without its
 \ remote_directories index, left at schema 8 with every row when the
 \ migration fails; a local scan published as its difference, every
 \ unchanged row keeping its rowid and the hashes of another generation
 \ dropped, emptied by WITH-SCAN, and writing nothing for a root that is
 \ not active; a scan's reused hashes, jobs and listed directories each
 \ visited once in path order, then gone; what a visit observes
-\ published, and a reused hash it confirms as the text the cache
-\ stored; a discarded subtree dropped from the scan but for its cached
-\ hashes, which publish; CACHED-HASH's lookup by path, with the text;
+\ published, and a reused hash it confirms; a discarded subtree
+\ dropped from the scan but for its cached hashes, which publish;
+\ CACHED-HASH's lookup by path;
 \ a scan's batch holding main's lock through its 512 writes and
 \ committing at the next, no transaction left open by a throw out of
 \ WITH-SCAN, a visit holding no lock of the batch before it, and a scan
@@ -50,7 +50,8 @@
 \ remote observation refuses the migration so, leaving the file at 9
 \ with every row. The oracle at schema 9 migrates a baseline, a remote
 \ and a local observation of each kind, the absent ones gone and a
-\ local one MODEL cannot read kept as unknown, and the migration
+\ local one MODEL cannot read kept as unknown, and its hash cache, the
+\ rows that do not convert gone; the migration
 \ converts each of a list of texts exactly when MODEL's JSON reader
 \ reads it, to the value it reads, a local text it refuses to unknown.
 \ Each case removes its directory;
@@ -79,11 +80,13 @@ require src/test-journal.f
 package JOURNAL
 private
 
-8192 constant CAP
-CAP BUFFER: BODY       \ an oracle file, after a newline
-CAP BUFFER: LINE       \ a line looked for in BODY
-CAP BUFFER: WANT       \ a binding as the Rust version prints it
-variable BODY-U
+TYPED-VARIABLE BODY-V ^VEC:vector<u8>  \ an oracle file
+TYPED-VARIABLE LINE-V ^VEC:vector<u8>  \ a line looked for in it
+TYPED-VARIABLE WANT-V ^VEC:vector<u8>  \ a binding as Rust prints it
+: BODY ( -- ^VEC:vector<u8> ) BODY-V @ ;
+: LINE ( -- ^VEC:vector<u8> ) LINE-V @ ;
+: WANT ( -- ^VEC:vector<u8> ) WANT-V @ ;
+: BYTES$ ( ^VEC:vector<u8> -- str ) VEC:SPAN SPAN:$ ;
 $1A4 constant MODE-SHARED
 $140 constant MODE-SEALED          \ 0500
 $1C0 constant MODE-DIR-OWNER       \ 0700
@@ -148,20 +151,26 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
 
 \ ---- the oracle files --------------------------------------------
 
+\ BODY holds the file at path, after a newline when lead is true.
+: READ-BODY ( str bool -- )
+   {: p:str lead:bool :}
+   BODY 0 VEC:RESIZE
+   lead if 10 BODY VEC:PUSH c! then
+   p FS:FILE-SIZE {: u :}
+   BODY u VEC:EXTEND SPAN:$ str> drop {: a:^ :}
+   p a u FS:READ-ALL {: got :}
+   BODY BODY VEC:COUNT u - got + VEC:RESIZE ;
+
 \ BODY holds a newline, then the file at path.
-: ORACLE ( str -- )
-   {: p:str :}
-   10 BODY c!
-   p BODY 1+ CAP 1- FS:READ-ALL 1+ BODY-U ! ;
+: ORACLE ( str -- ) true READ-BODY ;
 
 
 \ BODY holds the text as a whole line.
 : HELD? ( str -- bool )
-   str> {: a:^ u :}
-   10 LINE c!
-   a LINE 1+ u BYTE-COPY
-   10 LINE u + 1+ c!
-   BODY BODY-U @ >str LINE u 2 + >str CONTAINS? ;
+   {: t:str :}
+   LINE 0 VEC:RESIZE
+   10 LINE VEC:PUSH c!  t str> LINE VEC:APPEND  10 LINE VEC:PUSH c!
+   BODY BYTES$ LINE BYTES$ CONTAINS? ;
 
 
 \ The oracle journal copied to path and brought to schema 9 in one
@@ -183,11 +192,17 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    c SQLITE:CLOSE ;
 
 
+\ Writes the text at WANT's byte at, cutting what follows; answers
+\ the byte after it.
 : PUT ( str n -- n )
    {: s:str at :}
-   s str> {: a:^ u :}
-   a WANT at + u BYTE-COPY
-   at u + ;
+   WANT at VEC:RESIZE
+   s str> WANT VEC:APPEND
+   WANT VEC:COUNT ;
+
+\ WANT's bytes from i up to j.
+: WANT-PART ( n n -- str )
+   {: i j :} WANT BYTES$ str> drop i + j i - >str ;
 
 : PUT-N ( n n -- n ) {: v at :} v FMT:INT$ at PUT ;
 
@@ -207,7 +222,7 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    s" , remote_root: " swap PUT
    root swap PUT-QUOTED
    s"  })" swap PUT {: u :}
-   WANT u >str ;
+   0 u WANT-PART ;
 
 : BIRTH-DEBUG ( option<birth-time> n -- n )
    {: at :}
@@ -239,7 +254,7 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    s" , subvolume: " swap PUT  sub swap SUBVOLUME-DEBUG
    s"  }, generation: " swap PUT  g swap PUT-N
    s"  })" swap PUT {: u :}
-   WANT u >str ;
+   0 u WANT-PART ;
 
 : DROPBOX-HELD? ( option<dropbox-binding> -- bool )
    MATCH option
@@ -339,15 +354,17 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
 
 \ ---- the journal's rows ------------------------------------------
 
-\ Every row but the baselines, remote_observations and
-\ local_observations tables', as schema.tsv writes one.
+\ Every row but the baselines, remote_observations,
+\ local_observations and local_hash_cache tables', as schema.tsv
+\ writes one.
 : SCHEMA-SQL ( -- str )
    s" SELECT type || char(9) || name || char(9) || tbl_name || char(9)
          || coalesce(replace(replace(replace(sql, '\', '\\'),
             char(10), '\n'), char(9), '\t'), '')
       FROM sqlite_master
       WHERE NOT (type = 'table' AND name IN
-         ('baselines', 'remote_observations', 'local_observations'))" ;
+         ('baselines', 'remote_observations', 'local_observations',
+            'local_hash_cache'))" ;
 
 \ Counts the rows, each a line of BODY.
 : SCHEMA-ROWS ( n SQLITE:statement -- n SQLITE:statement )
@@ -357,24 +374,23 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    repeat ;
 
 \ Every table's and index's name and SQL, lower case, in BODY.
-: SCHEMA-TEXT ( SQLITE:statement -- n SQLITE:statement )
+: SCHEMA-TEXT ( SQLITE:statement -- SQLITE:statement )
    SQLITE:STEP drop
-   0 SQLITE:COL-TEXT str> {: a:^ u :}
-   a BODY u BYTE-COPY
-   u swap ;
+   BODY 0 VEC:RESIZE
+   0 SQLITE:COL-TEXT str> BODY VEC:APPEND ;
 
 \ Whether BODY holds the first row's text.
 : BODY-HOLDS ( SQLITE:statement -- bool SQLITE:statement )
    SQLITE:STEP drop 0 SQLITE:COL-TEXT {: t:str :}
-   BODY BODY-U @ >str t CONTAINS? swap ;
+   BODY BYTES$ t CONTAINS? swap ;
 
 \ The journal's schema is schema.tsv's but for the baselines,
-\ remote_observations and local_observations tables, which are
-\ migrations/0010.sql's, and its version is 10.
+\ remote_observations, local_observations and local_hash_cache
+\ tables, which are migrations/0010.sql's, and its version is 10.
 : SCHEMA-10 ( journal -- )
    >CONNECTION {: c :}
    s" src/oracle/schema.tsv" ORACLE
-   0 c SCHEMA-SQL [: SCHEMA-ROWS ;] SQLITE:WITH-STATEMENT 23 T=
+   0 c SCHEMA-SQL [: SCHEMA-ROWS ;] SQLITE:WITH-STATEMENT 22 T=
    c VERSION 10 T=
    s" migrations/0010.sql" ORACLE
    c s" SELECT sql FROM sqlite_master
@@ -385,13 +401,16 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    [: BODY-HOLDS ;] SQLITE:WITH-STATEMENT TTRUE
    c s" SELECT sql FROM sqlite_master
       WHERE type = 'table' AND name = 'local_observations'"
+   [: BODY-HOLDS ;] SQLITE:WITH-STATEMENT TTRUE
+   c s" SELECT sql FROM sqlite_master
+      WHERE type = 'table' AND name = 'local_hash_cache'"
    [: BODY-HOLDS ;] SQLITE:WITH-STATEMENT TTRUE ;
 
 : VERSIONED ( str n -- )
    {: p:str v :}
    p SQLITE:OPEN {: c :}
    s" PRAGMA user_version = " 0 PUT v swap PUT-N {: u :}
-   c WANT u >str SQLITE:EXEC
+   c 0 u WANT-PART SQLITE:EXEC
    c SQLITE:CLOSE ;
 
 : VERSION-AT ( str -- n )
@@ -741,11 +760,11 @@ variable SCANNED       \ query plan rows that scan the table
    ( ^VEC:vector<MODEL:local-record> ^JSON:writer -- str )
    {: v w :}
    s\" local_inventory\t" 0 PUT v w LOCALS-PUT {: u :}
-   WANT u >str ;
+   0 u WANT-PART ;
 
 : REMOTE-CURSOR-DEBUG ( option<DROPBOX:cursor> -- str )
    s\" remote_cursor\t" 0 PUT CURSOR-PUT {: u :}
-   WANT u >str ;
+   0 u WANT-PART ;
 
 : REMOTE-INVENTORY-DEBUG ( remote-inventory ^JSON:writer -- str )
    {: inv w :}
@@ -754,7 +773,7 @@ variable SCANNED       \ query plan rows that scan the table
    CURSOR-PUT
    s" , observations: " swap PUT v w REMOTES-PUT
    s"  }" swap PUT {: u :}
-   WANT u >str ;
+   0 u WANT-PART ;
 
 : INVENTORY-LINES ( journal ^ARENA:arena ^JSON:writer -- )
    {: j ar w :}
@@ -803,7 +822,7 @@ variable SCANNED       \ query plan rows that scan the table
    {: ar :}
    s" a new journal's schema is schema.tsv's and 0010.sql's" T-LABEL
    s" src/oracle/schema.tsv" ORACLE
-   BODY BODY-U @ >str 10 COUNT-CHAR 28 T=
+   BODY BYTES$ 10 COUNT-CHAR 28 T=
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
    j SCHEMA-10
@@ -860,6 +879,12 @@ variable SCANNED       \ query plan rows that scan the table
 : LOCKED-LOCAL ( -- MODEL:observation<MODEL:local> )
    MODEL-UNKNOWN--REASON:INACCESSIBLE MODEL-OBSERVATION:UNKNOWN ;
 
+\ The oracle journal's hash of Docs/A.txt.
+: ORACLE-HASH ( -- MODEL:hash-record )
+   s" Docs/A.txt" DISPLAY
+   4243 0 1700000100 500 1700000200 600 MODEL-FINGERPRINT:MAKE
+   ORACLE-REMOTE MODEL-REMOTE:UNMAKE drop MODEL-HASH--RECORD:MAKE ;
+
 \ The oracle journal's three local records, by path.
 : ORACLE-LOCALS ( ^ARENA:arena -- ^VEC:vector<MODEL:local-record> )
    LOCALS {: v :}
@@ -882,6 +907,7 @@ variable SCANNED       \ query plan rows that scan the table
    s" SELECT path, canonical_path FROM local_observations"
    [: ar FOLDED-ROWS ;] SQLITE:WITH-STATEMENT 3 T=
    j ar LOCAL-INVENTORY ar ORACLE-LOCALS LOCAL-RECORDS= TTRUE
+   j ar LOCAL-HASH-CACHE ORACLE-HASH ar ONE-HASH HASH-RECORDS= TTRUE
    j ar REMOTE-INVENTORY JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur v :}
    v VEC:COUNT 3 T=
    v ar ORACLE-REMOTES? TTRUE
@@ -1052,8 +1078,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    s" these bytes are text, not a SQLite database's" ;
 
 : GARBAGE-KEPT? ( str -- bool )
-   BODY CAP FS:READ-ALL {: u :}
-   BODY u >str GARBAGE STR= ;
+   false READ-BODY BODY BYTES$ GARBAGE STR= ;
 
 : GARBAGE-FILE-IS-CORRUPT ( ^ARENA:arena -- )
    {: ar :}
@@ -1243,8 +1268,8 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    j >CONNECTION
    s" SELECT lower(group_concat(name || ' ' || sql, char(10)))
       FROM sqlite_master
-      WHERE type IN ('table', 'index') AND sql IS NOT NULL" [: SCHEMA-TEXT ;] SQLITE:WITH-STATEMENT {: u :}
-   BODY u >str {: b:str :}
+      WHERE type IN ('table', 'index') AND sql IS NOT NULL" [: SCHEMA-TEXT ;] SQLITE:WITH-STATEMENT
+   BODY BYTES$ {: b:str :}
    b s" oauth" CONTAINS? TFALSE
    b s" credential" CONTAINS? TFALSE
    b s" access_token" CONTAINS? TFALSE
@@ -1370,7 +1395,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
 : SUBTREE-PLAN-SQL ( -- str )
    s" EXPLAIN QUERY PLAN " 0 PUT
    DELETE-REMOTE-DESCENDANTS swap PUT {: u :}
-   WANT u >str ;
+   0 u WANT-PART ;
 
 : REMOTE-DELTA-DELETES-ONLY-THE-NAMED-SUBTREE ( ^ARENA:arena -- )
    {: ar :}
@@ -1557,8 +1582,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
          SELECT rowid AS id, path, kind, content
          FROM local_observations;
       CREATE TEMP TABLE noted_hashes AS
-         SELECT rowid AS id, root_generation, path, hash_json
-         FROM local_hash_cache;" SQLITE:EXEC ;
+         SELECT rowid AS id, * FROM local_hash_cache;" SQLITE:EXEC ;
 
 \ The observation rows noted that remain with their rowid, the rows
 \ added since, and the rows noted that are gone.
@@ -1580,14 +1604,14 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
 : HASHES-MOVED ( journal -- n n n )
    >CONNECTION {: c :}
    c s" SELECT COUNT(*) FROM (
-         SELECT rowid, root_generation, path, hash_json FROM local_hash_cache
+         SELECT rowid, * FROM local_hash_cache
          INTERSECT SELECT * FROM noted_hashes)" QUERY-INT
    c s" SELECT COUNT(*) FROM (
-         SELECT rowid, root_generation, path, hash_json FROM local_hash_cache
+         SELECT rowid, * FROM local_hash_cache
          EXCEPT SELECT * FROM noted_hashes)" QUERY-INT
    c s" SELECT COUNT(*) FROM (
          SELECT * FROM noted_hashes EXCEPT
-         SELECT rowid, root_generation, path, hash_json FROM local_hash_cache)"
+         SELECT rowid, * FROM local_hash_cache)"
    QUERY-INT ;
 
 \ The counts OBSERVATIONS-MOVED and HASHES-MOVED answer are the ones given.
@@ -1690,8 +1714,11 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    s" b.txt" s" b" 2 obs hashes ar SCAN+
    j b obs hashes PUBLISH-LOCAL-SCAN TTRUE
    j >CONNECTION
-   s" INSERT INTO local_hash_cache(root_generation, path, hash_json)
-      SELECT root_generation + 1, path, hash_json FROM local_hash_cache"
+   s" INSERT INTO local_hash_cache
+      SELECT root_generation + 1, path, inode, size, modified_seconds,
+         modified_nanoseconds, changed_seconds, changed_nanoseconds,
+         content_hash
+      FROM local_hash_cache"
    SQLITE:EXEC
    j ROWS-NOTED
    j b obs hashes PUBLISH-LOCAL-SCAN TTRUE
@@ -1771,14 +1798,6 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 : REUSE-COUNTED ( scan MODEL:hash-record -- scan bool )
    {: r :} 1 ROWS-SEEN +! false ;
 
-\ SCAN-REUSE of the record with the text MODEL writes for it, as the
-\ cache stores it.
-: REUSED ( scan MODEL:hash-record ^ARENA:arena -- scan )
-   {: r ar :}
-   SCAN-UNMAKE {: j w sa :}
-   w [: r swap MODEL:HASH-VALUE>JSON ;] ENCODE ar COPIED {: json:str :}
-   j w sa SCAN-MAKE r json SCAN-REUSE ;
-
 : JOB-COUNTED ( scan str MODEL:fingerprint -- scan )
    {: p:str f :} 1 ROWS-SEEN +! ;
 
@@ -1798,7 +1817,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    {: ar :}
    s" old.txt" s" old" PRESENT-LOCAL LOCAL-RECORD SCAN-OBSERVE
    s" old.txt" 10 ar LOCAL-HASH SCAN-HASH
-   s" old.txt" 10 ar LOCAL-HASH ar REUSED
+   s" old.txt" 10 ar LOCAL-HASH SCAN-REUSE
    s" old.txt" 10 MARKED-FINGERPRINT SCAN-JOB
    s" old.txt" 10 MARKED-STAT SCAN-LISTED ;
 
@@ -1862,9 +1881,9 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 
 : REUSES-VISITED ( scan ^ARENA:arena -- scan )
    {: ar :}
-   s" a-b" 1 ar LOCAL-HASH ar REUSED
-   s" a/x" 2 ar LOCAL-HASH ar REUSED
-   s" a" 3 ar LOCAL-HASH ar REUSED
+   s" a-b" 1 ar LOCAL-HASH SCAN-REUSE
+   s" a/x" 2 ar LOCAL-HASH SCAN-REUSE
+   s" a" 3 ar LOCAL-HASH SCAN-REUSE
    0 ROWS-SEEN !  [: ar REUSE-SEEN ;] EACH-SCAN-REUSE  ROWS-SEEN @ 3 T=
    0 ROWS-SEEN !  [: REUSE-COUNTED ;] EACH-SCAN-REUSE  ROWS-SEEN @ 0 T= ;
 
@@ -1903,30 +1922,14 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    p s" a" PRESENT-LOCAL MODEL-LOCAL--RECORD:MAKE SCAN-OBSERVE
    true ;
 
-\ a.txt's hash at marker 10 spaced as MODEL never writes it.
-: SPACED-HASH ( -- str )
-   s\" { \"fingerprint\": { \"inode\": 11, \"size\": 12,
-      \"modified_seconds\": 1, \"modified_nanoseconds\": 10,
-      \"changed_seconds\": 2, \"changed_nanoseconds\": 10 },
-      \"content\":
-      \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" }" ;
-
-\ The local hash cache's rows stored as the text.
-: STORED-AS ( journal str -- n )
-   {: j a:str :}
-   j >CONNECTION
-   s" SELECT COUNT(*) FROM local_hash_cache WHERE hash_json = ?1"
-   [: a 1 SQLITE:BIND-TEXT INT-ROW ;] SQLITE:WITH-STATEMENT ;
-
 : CONFIRMED-PUBLISHED
    ( scan local-root-binding ^ARENA:arena -- scan )
    {: b ar :}
-   s" a.txt" 10 ar LOCAL-HASH SPACED-HASH SCAN-REUSE
+   s" a.txt" 10 ar LOCAL-HASH SCAN-REUSE
    [: CONFIRMED ;] EACH-SCAN-REUSE
    b PUBLISH-SCAN TTRUE ;
 
-\ The confirmed hash publishes as the text the cache stored, never
-\ encoded again.
+\ The confirmed hash publishes.
 : A-VISIT-PUBLISHES-WHAT-IT-OBSERVES-AND-HASHES ( ^ARENA:arena -- )
    {: ar :}
    s" a visit publishes what it observes and hashes" T-LABEL
@@ -1935,7 +1938,6 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    j [: b ar CONFIRMED-PUBLISHED ;] WITH-SCAN
    j s" a.txt" s" a" PRESENT-LOCAL LOCAL-RECORD
    s" a.txt" 10 ar LOCAL-HASH ar SCAN-HELD
-   j SPACED-HASH STORED-AS 1 T=
    j CLOSE
    d GONE ;
 
@@ -1954,7 +1956,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
    s" a/x" s" x" PRESENT-LOCAL LOCAL-RECORD EVERYWHERE
    s" a-b" s" b" PRESENT-LOCAL LOCAL-RECORD EVERYWHERE
    s" ab" s" c" PRESENT-LOCAL LOCAL-RECORD EVERYWHERE
-   s" a/y" 5 ar LOCAL-HASH ar REUSED
+   s" a/y" 5 ar LOCAL-HASH SCAN-REUSE
    s" a/z" 6 ar LOCAL-HASH SCAN-HASH
    s" a" SCAN-DISCARD
    0 ROWS-SEEN !  [: JOB-KEPT ;] EACH-SCAN-JOB  ROWS-SEEN @ 2 T=
@@ -1980,14 +1982,13 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 
 : DROP-HASH-RECORD ( MODEL:hash-record -- ) drop ;
 
-\ a.txt's hash comes with the text it is stored as; b.txt has neither.
+\ a.txt's hash is the one published; b.txt has an empty record.
 : LOOKED-UP-IN ( scan MODEL:hash-record ^ARENA:arena -- scan )
    {: want ar :}
-   s" a.txt" ar CACHED-HASH TTRUE {: r json:str :}
+   s" a.txt" ar CACHED-HASH TTRUE {: r :}
    r want MODEL:HASH-RECORD= TTRUE
-   SCAN-JOURNAL json STORED-AS 1 T=
-   s" b.txt" ar CACHED-HASH TFALSE {: empty:str :}
-   empty STR:len 0 T= DROP-HASH-RECORD ;
+   s" b.txt" ar CACHED-HASH TFALSE
+   NO-HASH-RECORD MODEL:HASH-RECORD= TTRUE ;
 
 : CACHED-HASH-ANSWERS-THE-PUBLISHED-HASH ( ^ARENA:arena -- )
    {: ar :}
@@ -2021,8 +2022,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 \ no hash for "a.txt".
 : LOOKED-UP-NONE ( scan ^ARENA:arena -- scan )
    {: ar :}
-   s" a.txt" ar CACHED-HASH TFALSE {: none:str :}
-   none STR:len 0 T= DROP-HASH-RECORD ;
+   s" a.txt" ar CACHED-HASH TFALSE DROP-HASH-RECORD ;
 
 \ A write opens the batch and a lookup reads main into it; the batch holds
 \ main through BATCH-BOUND writes, and the write past them commits it.
@@ -2095,7 +2095,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN body was given
 : TEMP-CAPPED ( SQLITE:connection n -- )
    {: c n :}
    s" PRAGMA temp.max_page_count = " 0 PUT  n swap PUT-N {: u :}
-   c WANT u >str SQLITE:EXEC ;
+   c 0 u WANT-PART SQLITE:EXEC ;
 
 \ Jobs at new paths fill the scan's temporary database, capped at its
 \ size, until a write fails.
@@ -2627,7 +2627,7 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    {: j a:str ar :}
    s" baseline(" 0 PUT  a swap PUT  s\" )\t" swap PUT {: at :}
    j a DISPLAY ar BASELINE at BASELINE-DEBUG {: v :}
-   WANT v >str ;
+   0 v WANT-PART ;
 
 : PATHS-LINE ( ^VEC:vector<MODEL:path> -- str )
    {: paths :}
@@ -2637,7 +2637,7 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
       paths i VEC:AT @ MODEL:PATH>STR swap PUT-QUOTED
    loop
    s" ]" swap PUT {: u :}
-   WANT u >str ;
+   0 u WANT-PART ;
 
 : ORACLE-JOURNAL-HOLDS-ITS-BASELINES ( ^ARENA:arena -- )
    {: ar :}
@@ -2702,7 +2702,7 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
       found i VEC:AT @ swap RECORD-DEBUG
    loop
    s" ]" swap PUT {: u :}
-   WANT u >str ;
+   0 u WANT-PART ;
 
 : ORACLE-JOURNAL-HOLDS-ITS-CONFLICTS ( ^ARENA:arena -- )
    {: ar :}
@@ -2982,7 +2982,7 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
       plans i VEC:AT @ swap PLAN-DEBUG
    loop
    s" ]" swap PUT {: v :}
-   WANT v >str ;
+   0 v WANT-PART ;
 
 : CONTENT-LINE ( ^VEC:vector<DROPBOX:hash> -- str )
    {: hashes :}
@@ -2992,7 +2992,7 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
       hashes i VEC:AT @ swap HASH-DEBUG
    loop
    s" ]" swap PUT {: u :}
-   WANT u >str ;
+   0 u WANT-PART ;
 
 \ Two statuses alike as the Rust version prints them, which names each
 \ field: the first is printed at WANT, the second after it.
@@ -3000,7 +3000,7 @@ TYPED-VARIABLE FINALS ^VEC:vector<operation-baseline>
    {: a b :}
    a 0 STATUS-DEBUG {: u :}
    b u STATUS-DEBUG {: v :}
-   WANT u >str WANT u + v u - >str STR= ;
+   0 u WANT-PART u v WANT-PART STR= ;
 
 : ORACLE-JOURNAL-HOLDS-ITS-PLANS ( ^ARENA:arena -- )
    {: ar :}
@@ -3481,14 +3481,14 @@ variable CRAFT
       found i VEC:AT @ swap RECOVERY-DEBUG
    loop
    s" ]" swap PUT {: v :}
-   WANT v >str ;
+   0 v WANT-PART ;
 
 \ Two records alike as the Rust version prints them, every field named.
 : RECOVERY= ( recovery-record recovery-record -- bool )
    {: a b :}
    a 0 RECOVERY-DEBUG {: u :}
    b u RECOVERY-DEBUG {: v :}
-   WANT u >str WANT u + v u - >str STR= ;
+   0 u WANT-PART u v WANT-PART STR= ;
 
 \ retained_at in completed_recoveries is the clock journal.sqlite3 was
 \ written at, which the file holds.
@@ -4216,7 +4216,7 @@ variable CRAFT
    path swap PUT  s" `: " swap PUT
    MODEL:E-STORED swap PUT-N  s"  " swap PUT
    MODEL:E-STORED ERROR:NAME$ swap PUT {: u :}
-   WANT u >str ;
+   0 u WANT-PART ;
 
 \ The reader throws E-JSON after one line naming op, path and cause.
 : UNREADABLE ( [ -- ] str str str ^ARENA:arena -- )
@@ -4231,9 +4231,6 @@ variable CRAFT
    HELD-JOURNAL @ HELD-ARENA @ BLOCKED-PLANS drop ;
 
 : HELD-CONFLICTS ( -- ) HELD-JOURNAL @ HELD-ARENA @ CONFLICTS drop ;
-
-: HELD-HASH-CACHE ( -- )
-   HELD-JOURNAL @ HELD-ARENA @ LOCAL-HASH-CACHE drop ;
 
 : HELD-PENDING-RECOVERIES ( -- )
    HELD-JOURNAL @ HELD-ARENA @ PENDING-RECOVERIES drop ;
@@ -4426,6 +4423,74 @@ variable CRAFT
    s" Future" MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN-AT {: f :}
    j s" future" ar CANONICAL ar LOCAL-AT f LOCAL-IS? TTRUE
    j s" gone" ar CANONICAL ar LOCAL-AT NO-LOCAL? TTRUE
+   j CLOSE
+   d GONE ;
+
+\ Hash cache rows of generation 1 as schema 9 holds them, each a
+\ fingerprint, where # stands for its four time members, and content,
+\ where * stands for 63 a's: Kept and Spaced convert, then one row each
+\ of malformed text, a missing member, a repeated member, content not
+\ 64 lowercase hex digits, with a NUL past them, a negative size and an
+\ inode above SQLite's largest integer.
+: EVERY-HASH-KIND ( -- str )
+   s\" INSERT INTO local_hash_cache(root_generation, path, hash_json)
+      SELECT 1, CAST(column1 AS BLOB),
+         '{\"fingerprint\":' || replace(column2, '#',
+            '\"modified_seconds\":1,\"modified_nanoseconds\":10,'
+            || '\"changed_seconds\":2,\"changed_nanoseconds\":10')
+         || ',\"content\":\"'
+         || replace(column3, '*', printf('%.63c', 'a')) || '\"}'
+      FROM (VALUES ('Kept', '{\"inode\":11,\"size\":12,#}', 'a*'),
+         ('Spaced', '{ \"changed_nanoseconds\" : 10,
+            \"inode\" : 9223372036854775807, \"device\" : [3],
+            \"size\" : 6, \"modified_seconds\" : -7,
+            \"modified_nanoseconds\" : 8, \"changed_seconds\" : -9 }',
+            'a*'),
+         ('Malformed', '{\"inode\":11,\"size\":12,#', 'a*'),
+         ('Missing', '{\"inode\":11,#}', 'a*'),
+         ('Repeated', '{\"inode\":11,\"size\":12,\"size\":12,#}',
+            'a*'),
+         ('Upper', '{\"inode\":11,\"size\":12,#}', 'A*'),
+         ('Nul', '{\"inode\":11,\"size\":12,#}', 'a*\\u0000'),
+         ('Negative', '{\"inode\":11,\"size\":-12,#}', 'a*'),
+         ('Big', '{\"inode\":9223372036854775808,\"size\":12,#}',
+            'a*'))" ;
+
+\ EVERY-HASH-KIND's Spaced row as its record.
+: SPACED-RECORD ( ^ARENA:arena -- MODEL:hash-record )
+   {: ar :}
+   s" Spaced" DISPLAY
+   $7FFFFFFFFFFFFFFF 6 -7 8 -9 10 MODEL-FINGERPRINT:MAKE
+   ar A-HASH MODEL-HASH--RECORD:MAKE ;
+
+: HASH-GONE ( scan str ^ARENA:arena -- scan )
+   CACHED-HASH TFALSE DROP-HASH-RECORD ;
+
+\ CACHED-HASH answers the rows that convert as their records and no
+\ other.
+: HASHES-MIGRATED ( scan ^ARENA:arena -- scan )
+   {: ar :}
+   s" Kept" ar CACHED-HASH TTRUE
+   s" Kept" 10 ar LOCAL-HASH MODEL:HASH-RECORD= TTRUE
+   s" Spaced" ar CACHED-HASH TTRUE
+   ar SPACED-RECORD MODEL:HASH-RECORD= TTRUE
+   s" Malformed" ar HASH-GONE  s" Missing" ar HASH-GONE
+   s" Repeated" ar HASH-GONE  s" Upper" ar HASH-GONE
+   s" Nul" ar HASH-GONE  s" Negative" ar HASH-GONE
+   s" Big" ar HASH-GONE ;
+
+\ The rows that convert join the oracle's one; the others go.
+: A-SCHEMA-9-JOURNAL-MIGRATES-ITS-HASH-CACHE ( ^ARENA:arena -- )
+   {: ar :}
+   s" a schema-9 journal migrates its hash cache" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p NINE-ORACLE
+   EVERY-HASH-KIND p PLANT-AT
+   p OPEN {: j :}
+   j >CONNECTION VERSION 10 T=
+   j >CONNECTION s" SELECT count(*) FROM local_hash_cache" QUERY-INT
+   3 T=
+   j [: ar HASHES-MIGRATED ;] WITH-SCAN
    j CLOSE
    d GONE ;
 
@@ -4771,16 +4836,6 @@ variable CRAFT
    ar UNREADABLE
    d PLANTED-GONE ;
 
-\ A hash value is an object with a fingerprint and content, not a sum.
-: AN-UNREADABLE-HASH-VALUE-IS-REFUSED ( ^ARENA:arena -- )
-   {: ar :}
-   s" an unreadable stored hash value is refused" T-LABEL
-   s\" UPDATE local_hash_cache SET hash_json = '{\"Future\":1}'
-      WHERE hex(path) = hex('Docs/A.txt')" ar PLANTED {: d:str :}
-   [: HELD-HASH-CACHE ;] d s" deserialize local hash cache"
-   s" Docs/A.txt" ar UNREADABLE
-   d PLANTED-GONE ;
-
 \ Recovery 1, the pending one, whose content is a JSON string; the line
 \ names its original path.
 : AN-UNREADABLE-RECOVERY-CONTENT-IS-REFUSED ( ^ARENA:arena -- )
@@ -4886,18 +4941,23 @@ variable CRAFT
    ar AN-UNKNOWN-REMOTE-OBSERVATION-REFUSES-THE-MIGRATION
    ar A-SCHEMA-9-JOURNAL-MIGRATES-ITS-REMOTE-OBSERVATIONS
    ar A-SCHEMA-9-JOURNAL-MIGRATES-ITS-LOCAL-OBSERVATIONS
+   ar A-SCHEMA-9-JOURNAL-MIGRATES-ITS-HASH-CACHE
    ar THE-MIGRATION-CONVERTS-WHAT-MODEL-READS
    ar AN-UNKNOWN-OPERATION-IS-REFUSED
    ar AN-UNKNOWN-BLOCKAGE-IS-REFUSED
    ar AN-UNKNOWN-CONFLICT-IS-REFUSED
-   ar AN-UNREADABLE-HASH-VALUE-IS-REFUSED
    ar AN-UNREADABLE-RECOVERY-CONTENT-IS-REFUSED ;
 
 
 : TESTS ( -- )
    T-RESET
    ARENA:NEW {: ar :}
-   [: ar CASES ;] [: ar ARENA:RELEASE ;] finally
+   HEAP:ALLOCATOR 0 [type] u8 VEC:NEW BODY-V !
+   HEAP:ALLOCATOR 0 [type] u8 VEC:NEW LINE-V !
+   HEAP:ALLOCATOR 0 [type] u8 VEC:NEW WANT-V !
+   [: ar CASES ;]
+   [: BODY VEC:DELETE LINE VEC:DELETE WANT VEC:DELETE
+      ar ARENA:RELEASE ;] finally
    s" journal-test: " type T-CASES FMT:.INT s"  checks" type cr
    T-REPORT ;
 

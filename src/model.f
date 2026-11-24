@@ -26,8 +26,6 @@
 \ borrowed; FOLD lays its answer, and a JSON reader the strings it reads,
 \ in the arena the caller passes. A JSON writer appends to the caller's
 \ open JSON writer.
-\ TASK-LOCAL: the seen buffers and value cells JSON>HASH-VALUE and
-\ JSON>FINGERPRINT fill, TASK:+USERS rows.
 
 require src/lib/type/deftype.f
 require src/lib/string.f
@@ -35,7 +33,6 @@ require src/lib/arena.f
 require src/lib/unicode.f
 require src/lib/utf8-scalar.f
 require src/lib/error.f
-require src/lib/task.f
 require src/lib/json.f
 require src/dropbox.f
 
@@ -899,27 +896,6 @@ public
          s" local" KEY+ LOCAL>JSON ;FIELDS+ ENDOF
    ;MATCH ;
 
-: FINGERPRINT>JSON ( fingerprint ^JSON:writer -- ^JSON:writer )
-   {: v:fingerprint w :}
-   v MODEL-FINGERPRINT:UNMAKE {: ino:n size:n ms:n mn:n cs:n cn:n :}
-   w JSON:WRITE-OBJECT-START
-   s" inode" KEY+ ino JSON:WRITE-U64
-   s" size" KEY+ size JSON:WRITE-U64
-   s" modified_seconds" KEY+ ms JSON:WRITE-INT
-   s" modified_nanoseconds" KEY+ mn JSON:WRITE-U64
-   s" changed_seconds" KEY+ cs JSON:WRITE-INT
-   s" changed_nanoseconds" KEY+ cn JSON:WRITE-U64
-   JSON:WRITE-OBJECT-END ;
-
-\ Rust's LocalHashValue, the stored half of a hash record.
-: HASH-VALUE>JSON ( hash-record ^JSON:writer -- ^JSON:writer )
-   {: v:hash-record w :}
-   v MODEL-HASH--RECORD:UNMAKE {: p:path f:fingerprint c:DROPBOX:hash :}
-   w JSON:WRITE-OBJECT-START
-   s" fingerprint" KEY+ f swap FINGERPRINT>JSON
-   s" content" KEY+ c swap HASH>JSON
-   JSON:WRITE-OBJECT-END ;
-
 private
 
 : UNIT-BLOCKAGE+ ( ^JSON:writer n -- ^JSON:writer )
@@ -972,7 +948,7 @@ ARENA CURSORS JSON:cursor
    READING-UNMAKE drop {: c :} str> c JSON:READ-MEMBER$ ;
 
 \ A word ending -HERE decodes the value at the reader's token and leaves the
-\ reader on the value's last token, where READ-LISTED takes it back.
+\ reader on the value's last token.
 
 \ The string at the reader's token, decoded and copied into the arena;
 \ its text as written bounds it.
@@ -996,10 +972,6 @@ ARENA CURSORS JSON:cursor
 
 : READ-I64 ( ^u8 n reading -- n )
    OPEN drop I64-HERE {: v:n :} JSON:READ-FINISH v ;
-
-\ A value at or above 2^63 is a negative cell, its 64 bits.
-: U64-HERE ( JSON:reader -- JSON:reader n )
-   JSON:READ-TOKEN JSON:T-INT EXPECT JSON:READ-U64 ;
 
 : READ-U16 ( ^u8 n reading -- u16 )
    READ-I64 {: v:n :}
@@ -1133,57 +1105,6 @@ ARENA CURSORS JSON:cursor
    i 0 = if MODEL-CONFLICT:INITIAL exit then
    MODEL-CONFLICT:DIVERGENT ;
 
-\ Each list ends in `*`, as serde skips unknown members, and requires every
-\ other name, so the cells never answer an earlier row's values.
-: FINGERPRINT-NAMES ( -- str )
-   s" inode size modified_seconds modified_nanoseconds changed_seconds changed_nanoseconds *" ;
-
-: VALUE-NAMES ( -- str ) s" fingerprint content *" ;
-
-\ The fingerprint is read while the hash value's list is open, so each list
-\ has its own seen buffer.
-FINGERPRINT-NAMES str> JSON:SEEN-BYTES constant FINGERPRINT-SEEN-BYTES
-FINGERPRINT-SEEN-BYTES TASK:+USERS FINGERPRINT-SEEN u8
-VALUE-NAMES str> JSON:SEEN-BYTES constant VALUE-SEEN-BYTES
-VALUE-SEEN-BYTES TASK:+USERS VALUE-SEEN u8
-
-6 TASK:+USERS FINGERPRINT-FIELDS n
-1 TASK:+USERS VALUE-FINGERPRINT fingerprint
-1 TASK:+USERS VALUE-CONTENT DROPBOX:hash
-
-\ A seen buffer zeroed for its object's first READ-LISTED.
-: CLEARED ( ^u8 n -- ^u8 )
-   {: a:^ u:n :} u 0 ?do 0 a i + c! loop a ;
-
-\ The fingerprint's seconds may be negative.
-: SIGNED? ( n -- bool ) dup 2 = swap 4 = or ;
-
-\ The fingerprint object at the reader's token; the reader is left on its
-\ `}`.
-: FINGERPRINT-HERE ( JSON:reader -- JSON:reader fingerprint )
-   JSON:READ-TOKEN JSON:T-OBJ EXPECT
-   0 FINGERPRINT-SEEN FINGERPRINT-SEEN-BYTES CLEARED {: seen:^ :}
-   begin FINGERPRINT-NAMES str> seen JSON:READ-LISTED dup 0< 0= while
-      {: i:n :} i SIGNED? if I64-HERE else U64-HERE then
-      i FINGERPRINT-FIELDS !
-   repeat drop
-   0 FINGERPRINT-FIELDS @ 1 FINGERPRINT-FIELDS @ 2 FINGERPRINT-FIELDS @
-   3 FINGERPRINT-FIELDS @ 4 FINGERPRINT-FIELDS @ 5 FINGERPRINT-FIELDS @
-   MODEL-FINGERPRINT:MAKE ;
-
-: READ-FINGERPRINT ( ^u8 n reading -- fingerprint )
-   OPEN drop FINGERPRINT-HERE {: f:fingerprint :} JSON:READ-FINISH f ;
-
-: READ-HASH-VALUE ( ^u8 n reading -- fingerprint DROPBOX:hash )
-   {: t:^ u:n r:reading :}
-   t u r OPEN JSON:T-OBJ EXPECT
-   0 VALUE-SEEN VALUE-SEEN-BYTES CLEARED {: seen:^ :}
-   begin VALUE-NAMES str> seen JSON:READ-LISTED dup 0< 0= while
-      0= if FINGERPRINT-HERE 0 VALUE-FINGERPRINT !
-      else r STRING-HERE DROPBOX:>HASH 0 VALUE-CONTENT ! then
-   repeat drop
-   JSON:READ-FINISH 0 VALUE-FINGERPRINT @ 0 VALUE-CONTENT @ ;
-
 : UNIT-BLOCKAGE ( n -- blockage )
    case
       0 of MODEL-BLOCKAGE:UNSUPPORTED-FILE-SIZE endof
@@ -1242,7 +1163,6 @@ private
 : DROP-REMOTE-OBSERVATION ( observation<remote> -- ) drop ;
 : DROP-OPERATION ( operation -- ) drop ;
 : DROP-CONFLICT ( conflict -- ) drop ;
-: DROP-FINGERPRINT ( fingerprint -- ) drop ;
 : DROP-BLOCKAGE ( blockage -- ) drop ;
 
 public
@@ -1295,17 +1215,6 @@ public
    {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
    NO-LOCAL MODEL-CONFLICT:REMOTE-DELETED r
    [: DROP-CONFLICT s str> r READ-CONFLICT ;] GUARDED ;
-
-: JSON>FINGERPRINT ( str ^ARENA:arena -- fingerprint )
-   {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
-   NO-FINGERPRINT r
-   [: DROP-FINGERPRINT s str> r READ-FINGERPRINT ;] GUARDED ;
-
-\ Rust's LocalHashValue: a hash record's fingerprint and content.
-: JSON>HASH-VALUE ( str ^ARENA:arena -- fingerprint DROPBOX:hash )
-   {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
-   NO-FINGERPRINT NO-HASH r
-   [: DROP-HASH DROP-FINGERPRINT s str> r READ-HASH-VALUE ;] GUARDED ;
 
 : JSON>BLOCKAGE ( str ^ARENA:arena -- blockage )
    {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}

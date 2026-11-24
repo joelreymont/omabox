@@ -1103,13 +1103,6 @@ variable CAUGHT
    p MODEL:>PATH 2 5 3 0 3 0 MODEL-FINGERPRINT:MAKE
    TEST-CONTENT DROPBOX:>HASH MODEL-HASH--RECORD:MAKE ;
 
-\ TEST-RECORD's fingerprint and content as the cache stores them.
-: TEST-JSON ( -- str )
-   s\" {\"fingerprint\":{\"inode\":2,\"size\":5,
-      \"modified_seconds\":3,\"modified_nanoseconds\":0,
-      \"changed_seconds\":3,\"changed_nanoseconds\":0},\"content\":
-      \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}" ;
-
 : BEFORE-CACHED
    ( JOURNAL:scan MODEL:hash-record -- JOURNAL:scan bool )
    RECORD-PATH s" before.txt" T$= false ;
@@ -1118,10 +1111,10 @@ variable CAUGHT
 \ is kept as a published hash, and its file to hash and observations
 \ leave with it.
 : TRUNCATED ( JOURNAL:scan -- JOURNAL:scan )
-   s" before.txt" TEST-RECORD TEST-JSON JOURNAL:SCAN-REUSE
+   s" before.txt" TEST-RECORD JOURNAL:SCAN-REUSE
    s" sub" MODEL:>PATH DIRECTORY-OBSERVATION MODEL-LOCAL--RECORD:MAKE
    JOURNAL:SCAN-OBSERVE
-   s" sub/kept.txt" TEST-RECORD TEST-JSON JOURNAL:SCAN-REUSE
+   s" sub/kept.txt" TEST-RECORD JOURNAL:SCAN-REUSE
    s" sub/fresh.txt" 2 5 3 0 3 0 MODEL-FINGERPRINT:MAKE
    JOURNAL:SCAN-JOB
    s" sub" JOURNAL:SCAN-DISCARD

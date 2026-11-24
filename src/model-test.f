@@ -458,9 +458,6 @@ TYPED-VARIABLE W JSON:writer
 : REMOTE1 ( bool -- MODEL:remote )
    {: e:bool :} e C1 e V1 MODEL-REMOTE:MAKE ;
 
-: FINGERPRINT ( -- MODEL:fingerprint )
-   -1 12345 -1 999999999 $7FFFFFFFFFFFFFFF 0 MODEL-FINGERPRINT:MAKE ;
-
 : BASELINE-OF ( str bool -- MODEL:baseline )
    {: v e:bool :}
    v s" Absent" STR= if MODEL-BASELINE:ABSENT exit then
@@ -557,10 +554,6 @@ TYPED-VARIABLE W JSON:writer
    v s" RemoteObject" STR= if MODEL-BLOCKAGE:REMOTE-OBJECT exit then
    MODEL-BLOCKAGE:CONFLICT-COPY-OCCUPIED ;
 
-: HASH-RECORD ( MODEL:fingerprint DROPBOX:hash -- MODEL:hash-record )
-   {: f:MODEL:fingerprint c:DROPBOX:hash :}
-   s" x" MODEL:>PATH f c MODEL-HASH--RECORD:MAKE ;
-
 \ One line's checks: its variant label, whether it is an .escapes line,
 \ and its JSON.
 : BASELINE-LINE ( str bool str -- )
@@ -604,13 +597,6 @@ TYPED-VARIABLE W JSON:writer
    j [: e REMOTE0 swap MODEL:REMOTE>JSON ;] WRITES
    j [: j AR @ MODEL:JSON>REMOTE
       swap MODEL:REMOTE>JSON ;] WRITES ;
-
-: HASH-VALUE-LINE ( str bool str -- )
-   {: v e:bool j :}
-   j [: FINGERPRINT e C0 HASH-RECORD
-      swap MODEL:HASH-VALUE>JSON ;] WRITES
-   j [: j AR @ MODEL:JSON>HASH-VALUE HASH-RECORD
-      swap MODEL:HASH-VALUE>JSON ;] WRITES ;
 
 : LOCAL-OBSERVATION-LINE ( str bool str -- )
    {: v e:bool j :}
@@ -661,7 +647,6 @@ TYPED-VARIABLE W JSON:writer
    t s" ContentIdentity" STR= if HASH-LINE exit then
    t s" DropboxRevision" STR= if REV-LINE exit then
    t s" LocalFile" STR= if LOCAL-LINE exit then
-   t s" LocalHashValue" STR= if HASH-VALUE-LINE exit then
    t s" LocalObservation" STR= if LOCAL-OBSERVATION-LINE exit then
    t s" Operation" STR= if OPERATION-LINE exit then
    t s" RemoteFile" STR= if REMOTE-LINE exit then
@@ -696,23 +681,10 @@ TYPED-VARIABLE W JSON:writer
    j [: s AR @ MODEL:JSON>BASELINE
       swap MODEL:BASELINE>JSON ;] WRITES ;
 
-: READS-FINGERPRINT ( str str -- )
-   {: s j :}
-   j [: s AR @ MODEL:JSON>FINGERPRINT
-      swap MODEL:FINGERPRINT>JSON ;] WRITES ;
-
-: READS-HASH-VALUE ( str str -- )
-   {: s j :}
-   j [: s AR @ MODEL:JSON>HASH-VALUE HASH-RECORD
-      swap MODEL:HASH-VALUE>JSON ;] WRITES ;
-
 : READS-HASH ( str str -- )
    {: s j :}
    j [: s AR @ MODEL:JSON>HASH
       swap MODEL:HASH>JSON ;] WRITES ;
-
-: FP$ ( -- str )
-   s\" {\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":5,\"changed_nanoseconds\":6}" ;
 
 \ Whitespace between tokens, members in any order, any escape, and an
 \ unknown member with its value, as serde reads them.
@@ -724,10 +696,6 @@ TYPED-VARIABLE W JSON:writer
    s\" {\"Present\":{\"content\":\"c\",\"revision\":\"/\"}}" READS-BASELINE
    s\" \"\\ud83d\\ude00\\b\\f\\n\\r\\t\\u001f\\u00e9\""
    s\" \"\xF0\x9F\x98\x80\\b\\f\\n\\r\\t\\u001f\xC3\xA9\"" READS-HASH
-   s\" {\"device\":7,\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":5,\"changed_nanoseconds\":6}"
-   FP$ READS-FINGERPRINT
-   s\" {\"changed_nanoseconds\":6,\"device\":{\"a\":[1,null,true]},\"changed_seconds\":5,\"modified_nanoseconds\":4,\"modified_seconds\":-3,\"size\":2,\"device\":\"x\",\"inode\":1}"
-   FP$ READS-FINGERPRINT
    s\" {\"Present\":{\"content\":\"c\",\"revision\":\"r\",\"extra\":[]}}"
    s\" {\"Present\":{\"content\":\"c\",\"revision\":\"r\"}}" READS-BASELINE ;
 
@@ -748,30 +716,10 @@ TYPED-VARIABLE W JSON:writer
    [: s AR @ MODEL:JSON>BLOCKAGE drop ;]
    MODEL:E-STORED TTHROWSQ ;
 
-: REFUSES-FINGERPRINT ( str -- )
-   {: s :}
-   [: s AR @ MODEL:JSON>FINGERPRINT drop ;]
-   MODEL:E-STORED TTHROWSQ ;
-
-: REFUSES-HASH-VALUE ( str -- )
-   {: s :}
-   [: s AR @ MODEL:JSON>HASH-VALUE drop drop ;]
-   MODEL:E-STORED TTHROWSQ ;
-
 : REFUSES-HASH ( str -- )
    {: s :}
    [: s AR @ MODEL:JSON>HASH drop ;]
    MODEL:E-STORED TTHROWSQ ;
-
-\ A fingerprint whose inode is the given number's text.
-: FP-INODE$ ( str -- str )
-   str> {: d:^ du:n :}
-   s\" {\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":5,\"changed_nanoseconds\":6,\"inode\":"
-   str> {: a:^ au:n :}
-   AR @ au du + 1+ ARENA:ALLOC drop {: b:^ :}
-   a b au BYTE-COPY d b au + du BYTE-COPY
-   $7D b au + du + c!
-   b au du + 1+ >str ;
 
 : REFUSED-CASE ( -- )
    s" reader refuses" T-LABEL
@@ -786,10 +734,6 @@ TYPED-VARIABLE W JSON:writer
    s\" {\"DownloadUnavailable\":{\"status\":65536}}" REFUSES-BLOCKAGE
    s\" {\"DownloadUnavailable\":{\"status\":-1}}" REFUSES-BLOCKAGE
    s\" {\"DownloadUnavailable\":{\"status\":-0}}" REFUSES-BLOCKAGE
-   s" -1" FP-INODE$ REFUSES-FINGERPRINT
-   s" 18446744073709551616" FP-INODE$ REFUSES-FINGERPRINT
-   s\" {\"inode\":1,\"size\":2,\"modified_seconds\":9223372036854775808,\"modified_nanoseconds\":4,\"changed_seconds\":5,\"changed_nanoseconds\":6}"
-   REFUSES-FINGERPRINT
    s\" \"Absent\" x" REFUSES-BASELINE
    s\" \"Absent\"\"Absent\"" REFUSES-BASELINE
    s\" \"\xFF\"" REFUSES-HASH
@@ -801,44 +745,6 @@ TYPED-VARIABLE W JSON:writer
    s\" {\"Absent\":null,\"Directory\":null}" REFUSES-BASELINE
    s\" {}" REFUSES-BASELINE
    s" " REFUSES-BASELINE ;
-
-: HV$ ( -- str )
-   s\" {\"fingerprint\":{\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":5,\"changed_nanoseconds\":6},\"content\":\"c\"}" ;
-
-: HASH-VALUE-ORDER-CASE ( -- )
-   s" hash value reads its members in any order" T-LABEL
-   s\" {\"content\":\"c\",\"fingerprint\":{\"changed_nanoseconds\":6,\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":5}}"
-   HV$ READS-HASH-VALUE ;
-
-: HASH-VALUE-UNKNOWN-CASE ( -- )
-   s" hash value skips an unknown member, repeated or not" T-LABEL
-   s\" {\"device\":[1],\"fingerprint\":{\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":5,\"changed_nanoseconds\":6},\"device\":{\"content\":7},\"content\":\"c\"}"
-   HV$ READS-HASH-VALUE ;
-
-: HASH-VALUE-REPEATED-CASE ( -- )
-   s" hash value and fingerprint refuse a repeated member" T-LABEL
-   s\" {\"fingerprint\":{\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":5,\"changed_nanoseconds\":6},\"content\":\"c\",\"cont\\u0065nt\":\"c\"}"
-   REFUSES-HASH-VALUE
-   s\" {\"fingerprint\":{\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":5,\"changed_nanoseconds\":6},\"content\":\"c\",\"fingerprint\":{}}"
-   REFUSES-HASH-VALUE
-   s\" {\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":5,\"changed_nanoseconds\":6,\"s\\u0069ze\":2}"
-   REFUSES-FINGERPRINT ;
-
-: FINGERPRINT-SIGNED-CASE ( -- )
-   s" fingerprint's changed seconds is signed" T-LABEL
-   s\" {\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":-5,\"changed_nanoseconds\":6}"
-   dup READS-FINGERPRINT
-   s\" {\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":9223372036854775808,\"changed_nanoseconds\":6}"
-   REFUSES-FINGERPRINT ;
-
-\ The cells keep the previous row's values, so a missing member must not
-\ read them.
-: HASH-VALUE-MISSING-CASE ( -- )
-   s" hash value refuses a missing member after a full one" T-LABEL
-   HV$ HV$ READS-HASH-VALUE
-   s\" {\"fingerprint\":{\"inode\":1,\"size\":2,\"modified_seconds\":-3,\"modified_nanoseconds\":4,\"changed_seconds\":5,\"changed_nanoseconds\":6}}"
-   REFUSES-HASH-VALUE ;
-
 
 : CASES ( -- )
    FOLD-CASE
@@ -855,9 +761,7 @@ TYPED-VARIABLE W JSON:writer
    UNKNOWN-TEXT-CASE
    s" OPERATION$" T-LABEL DIRECTORY-TEXT-CASE FILE-TEXT-CASE
    CONFLICT-TEXT-CASE
-   JSON-CASE ACCEPTED-CASE REFUSED-CASE
-   HASH-VALUE-ORDER-CASE HASH-VALUE-UNKNOWN-CASE HASH-VALUE-REPEATED-CASE
-   FINGERPRINT-SIGNED-CASE HASH-VALUE-MISSING-CASE ;
+   JSON-CASE ACCEPTED-CASE REFUSED-CASE ;
 
 public
 

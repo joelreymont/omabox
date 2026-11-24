@@ -22,8 +22,6 @@ DropboxRevision.value	"5f0a1b2c3d4e"
 DropboxRevision.value.escapes	"\"\\\u0001é "
 LocalFile.value	{"content":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
 LocalFile.value.escapes	{"content":"\"\\\u0001é "}
-LocalHashValue.value	{"fingerprint":{"inode":18446744073709551615,"size":12345,"modified_seconds":-1,"modified_nanoseconds":999999999,"changed_seconds":9223372036854775807,"changed_nanoseconds":0},"content":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
-LocalHashValue.value.escapes	{"fingerprint":{"inode":18446744073709551615,"size":12345,"modified_seconds":-1,"modified_nanoseconds":999999999,"changed_seconds":9223372036854775807,"changed_nanoseconds":0},"content":"\"\\\u0001é "}
 LocalObservation.ConfirmedAbsent	"ConfirmedAbsent"
 LocalObservation.Directory	"Directory"
 LocalObservation.Present	{"Present":{"content":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}}
