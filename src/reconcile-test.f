@@ -7,8 +7,19 @@
 \   collision once naming both spellings, then renamed alike in either
 \   order, to a path neither spelling holds
 \ - known_path_merge_matches_set_union, over sampled path sets written
-\   as baselines and local and remote rows, which
-\   JOURNAL:EACH-KNOWN-PATH visits
+\   as baselines and local and remote directories, which
+\   JOURNAL:EACH-UNSETTLED-PATH visits but the paths all three hold,
+\   which it counts settled
+\ - DECIDING-SKIPS-ONLY-SETTLED-KEYS: one key for each combination of
+\   baseline (none, file, directory), local (none, the baseline's file,
+\   another, a directory, two spellings), remote (none, a file of equal
+\   or other content and revision, a directory), live plan, conflict
+\   and a remote directory beneath: JOURNAL:EACH-UNSETTLED-PATH visits
+\   only held keys, not one only a conflict holds, which deciding finds
+\   no spelling for; every held key it skips is a no-op deciding only
+\   counts,
+\   four are settled, and their count plus the visited keys' counted
+\   no-ops is the count of deciding every held key.
 \ - remaining_operation_comparison_ignores_a_completed_prefix
 \ - pending_only_paths_are_visited_as_absent_without_creating_a_baseline,
 \   deciding a journal that holds only the pending plan
@@ -696,11 +707,29 @@ variable SEED
    rr REMOTE-SOME? bool>n rp p HOLDS? bool>n T=
    p ar COPIED MODEL:>KEY merged VEC:PUSH ! ;
 
+\ A directory at the path on all three sides is settled.
+: SETTLED?
+   ( ^VEC:vector<str> ^VEC:vector<str> ^VEC:vector<str> str -- bool )
+   {: bp lp rp p:str :}
+   bp p HOLDS? lp p HOLDS? and rp p HOLDS? and ;
+
+\ The paths all three samples hold.
+: SETTLED-COUNT
+   ( ^VEC:vector<str> ^VEC:vector<str> ^VEC:vector<str> -- n )
+   {: bp lp rp :}
+   0 bp VEC:COUNT 0 ?do
+      bp lp rp bp i VEC:AT @ SETTLED? if 1+ then
+   loop ;
+
+\ The keys of the paths but the settled.
 : KEYS-INTO
-   ( ^VEC:vector<str> ^VEC:vector<MODEL:key> ^ARENA:arena -- )
-   {: paths keys ar :}
+   ( ^VEC:vector<str> ^VEC:vector<MODEL:key> ^VEC:vector<str>
+     ^VEC:vector<str> ^VEC:vector<str> ^ARENA:arena -- )
+   {: paths keys bp lp rp ar :}
    paths VEC:COUNT 0 ?do
-      paths i VEC:AT @ ar CANONICAL keys VEC:PUSH !
+      bp lp rp paths i VEC:AT @ SETTLED? 0= if
+         paths i VEC:AT @ ar CANONICAL keys VEC:PUSH !
+      then
    loop ;
 
 \ Key x sorts before key y.
@@ -716,13 +745,14 @@ variable SEED
    then
    k out VEC:PUSH ! ;
 
-\ The union's keys, sorted by bytes, without repeats.
+\ The union's keys but the settled, sorted by bytes, without repeats.
 : EXPECTED
    ( ^VEC:vector<str> ^VEC:vector<str> ^VEC:vector<str> ^ARENA:arena
      -- ^VEC:vector<MODEL:key> )
    {: bp lp rp ar :}
    ar ARENA:ALLOCATOR 0 [type] MODEL:key VEC:NEW {: all :}
-   bp all ar KEYS-INTO lp all ar KEYS-INTO rp all ar KEYS-INTO
+   bp all bp lp rp ar KEYS-INTO lp all bp lp rp ar KEYS-INTO
+   rp all bp lp rp ar KEYS-INTO
    all VEC:COUNT [: all KEY< ;] ar ORDER {: idx :}
    ar ARENA:ALLOCATOR 0 [type] MODEL:key VEC:NEW {: out :}
    idx VEC:COUNT 0 ?do all idx i VEC:AT @ VEC:AT @ out PUSH-NEW loop
@@ -751,15 +781,16 @@ variable SEED
    paths VEC:COUNT 0 ?do v paths i VEC:AT @ DIRECTORY+ loop
    v ;
 
-\ The keys JOURNAL:EACH-KNOWN-PATH visits, in order, each checked.
+\ The keys JOURNAL:EACH-UNSETTLED-PATH visits, in order, each checked,
+\ and the settled count it answers.
 : WALKED
    ( JOURNAL:journal ^VEC:vector<str> ^VEC:vector<str>
-     ^VEC:vector<str> ^ARENA:arena -- ^VEC:vector<MODEL:key> )
+     ^VEC:vector<str> ^ARENA:arena -- ^VEC:vector<MODEL:key> n )
    {: j bp lp rp ar :}
    ar ARENA:ALLOCATOR 0 [type] MODEL:key VEC:NEW {: merged :}
    [: j swap [: bp lp rp merged ar CHECK-VISIT ;]
-      JOURNAL:EACH-KNOWN-PATH ;] ARENA:WITH
-   merged ;
+      JOURNAL:EACH-UNSETTLED-PATH ;] ARENA:WITH {: n:n :}
+   merged n ;
 
 \ One sample of the proptest, written into the rooted journal.
 : MERGE-SAMPLE
@@ -771,7 +802,8 @@ variable SEED
    j bp ar SEED-DIRECTORY-BASELINES
    j ar JOURNAL:BASELINE-PATHS VEC:COUNT bp VEC:COUNT T=
    d j b lp ar LOCAL-DIRECTORIES rp ar REMOTE-DIRECTORIES
-   [: bp lp rp ar WALKED bp lp rp ar EXPECTED SAME-KEYS ;]
+   [: bp lp rp ar WALKED bp lp rp SETTLED-COUNT T=
+      bp lp rp ar EXPECTED SAME-KEYS ;]
    ar SIDES-IN ;
 
 : KNOWN-PATH-MERGE-MATCHES-SET-UNION ( ^ARENA:arena -- )
@@ -779,6 +811,192 @@ variable SEED
    s" known_path_merge_matches_set_union" T-LABEL
    7 SEED !
    24 0 ?do [: ar MERGE-SAMPLE ;] ar WITH-ROOTED loop ;
+
+\ ---- deciding skips only settled keys -----------------------------
+
+720 constant COMBOS
+
+variable SETTLED-N
+variable YIELD-NOOPS
+variable ALL-NOOPS
+
+\ The prefix, the combination's index and the suffix, in ar.
+: COMBO$ ( str n str ^ARENA:arena -- str )
+   {: pre:str x:n post:str ar :}
+   SB-RESET pre SB-APPEND x FMT:INT$ SB-APPEND post SB-APPEND
+   SB$ ar COPIED ;
+
+: COMBO-PATH ( n ^ARENA:arena -- str ) {: x:n ar :} s" k" x s" " ar COMBO$ ;
+
+: ALPHA ( ^ARENA:arena -- DROPBOX:hash ) {: ar :} s" alpha" ar IDENTITY ;
+: BETA ( ^ARENA:arena -- DROPBOX:hash ) {: ar :} s" beta" ar IDENTITY ;
+
+\ Combination x's fields: the baseline below 3, the local below 5, the
+\ remote below 6, then live, conflict and beneath, each below 2.
+: BASE-KIND ( n -- n ) 3 mod ;
+: LOCAL-KIND ( n -- n ) 3 / 5 mod ;
+: REMOTE-KIND ( n -- n ) 15 / 6 mod ;
+: LIVE-COMBO? ( n -- bool ) 90 / 2 mod 0<> ;
+: CONFLICT-COMBO? ( n -- bool ) 180 / 2 mod 0<> ;
+: BENEATH-COMBO? ( n -- bool ) 360 / 2 mod 0<> ;
+
+\ Alpha or beta at rev-a or rev-b, by y's bits.
+: REMOTE-COMBO ( n ^ARENA:arena -- MODEL:remote )
+   {: y:n ar :}
+   y 2 / 0= if ar ALPHA else ar BETA then
+   y 2 mod 0= if s" rev-a" else s" rev-b" then DROPBOX:>REV
+   MODEL-REMOTE:MAKE ;
+
+\ No baseline, alpha at rev-a, or a directory.
+: COMBO-BASELINE ( JOURNAL:journal n ^ARENA:arena -- )
+   {: j x:n ar :}
+   x BASE-KIND 0= if exit then
+   x BASE-KIND 1 = if
+      0 ar REMOTE-COMBO MODEL-BASELINE:PRESENT
+   else MODEL-BASELINE:DIRECTORY then {: base :}
+   j x ar COMBO-PATH DISPLAY base ar JOURNAL:RECORD-NOOP
+   NOOP-RECORDED? TTRUE ;
+
+\ A live plan creating the remote directory.
+: COMBO-PLAN ( JOURNAL:journal n ^ARENA:arena -- )
+   {: j x:n ar :}
+   x LIVE-COMBO? 0= if exit then
+   ar OPERATIONS {: ops :}
+   MODEL-OPERATION:CREATE-REMOTE-DIRECTORY ops VEC:PUSH !
+   j x ar COMBO-PATH DISPLAY ops JOURNAL-OPERATION--PLAN:MAKE ar
+   JOURNAL:RECORD-PLAN RECORDED drop ;
+
+: COMBO-CONFLICT ( JOURNAL:journal n ^ARENA:arena -- )
+   {: j x:n ar :}
+   x CONFLICT-COMBO? 0= if exit then
+   j x ar COMBO-PATH DISPLAY ar ALPHA MODEL-LOCAL:MAKE
+   MODEL-CONFLICT:REMOTE-DELETED ar JOURNAL:RECORD-CONFLICT drop ;
+
+: ALPHA+ ( ^VEC:vector<MODEL:local-record> str ^ARENA:arena -- )
+   {: ls p:str ar :}
+   ls p ar ALPHA MODEL-LOCAL:MAKE LOCAL-PRESENT LOCAL+ ;
+
+\ No local row, alpha, beta, a directory, or alpha at two spellings.
+: COMBO-LOCALS
+   ( ^VEC:vector<MODEL:local-record> n ^ARENA:arena -- )
+   {: ls x:n ar :}
+   x ar COMBO-PATH {: p:str :}
+   x LOCAL-KIND {: k:n :}
+   k 1 = if ls p ar ALPHA+ exit then
+   k 2 = if ls p ar BETA MODEL-LOCAL:MAKE LOCAL-PRESENT LOCAL+ exit then
+   k 3 = if ls p DIRECTORY+ exit then
+   k 4 = if ls p ar ALPHA+ ls s" K" x s" " ar COMBO$ ar ALPHA+ then ;
+
+\ No remote row, a file of REMOTE-COMBO's, or a directory; and a
+\ directory beneath.
+: COMBO-REMOTES
+   ( ^VEC:vector<MODEL:remote-record> n ^ARENA:arena -- )
+   {: rs x:n ar :}
+   x BENEATH-COMBO? if
+      rs s" k" x s" /c" ar COMBO$ REMOTE-DIRECTORY ar REMOTE+
+   then
+   x REMOTE-KIND {: k:n :}
+   k 0= if exit then
+   x ar COMBO-PATH {: p:str :}
+   k 5 = if rs p REMOTE-DIRECTORY ar REMOTE+ exit then
+   rs p k 1- ar REMOTE-COMBO REMOTE-PRESENT ar REMOTE+ ;
+
+\ The keys the journal held before the statement skipped the settled: a
+\ baseline's, a local or remote row's, or a live plan's.
+: COMBO-KEYS ( ^VEC:vector<MODEL:key> n ^ARENA:arena -- )
+   {: held x:n ar :}
+   x BASE-KIND 0<> x LOCAL-KIND 0<> or x REMOTE-KIND 0<> or
+   x LIVE-COMBO? or if
+      x ar COMBO-PATH ar CANONICAL held VEC:PUSH !
+   then
+   x BENEATH-COMBO? if
+      s" k" x s" /c" ar COMBO$ ar CANONICAL held VEC:PUSH !
+   then ;
+
+\ Every combination written into the rooted journal, its held keys in
+\ held.
+: WRITE-COMBOS
+   ( JOURNAL:journal JOURNAL:local-root-binding ^VEC:vector<MODEL:key>
+     ^ARENA:arena -- )
+   {: j b held ar :}
+   ar LOCAL-RECORDS {: ls :}
+   ar REMOTE-RECORDS {: rs :}
+   COMBOS 0 ?do
+      j i ar COMBO-BASELINE j i ar COMBO-PLAN j i ar COMBO-CONFLICT
+      ls i ar COMBO-LOCALS rs i ar COMBO-REMOTES held i ar COMBO-KEYS
+   loop
+   j b ls ar LOCALS-PUBLISHED
+   j s" cursor" DROPBOX:>CURSOR rs JOURNAL:PUBLISH-REMOTE-INVENTORY ;
+
+\ Whether deciding the known path only counts a no-op; a case collision
+\ decides nothing, so it does not.
+: COUNTED-NOOP? ( JOURNAL:known-path ^planning ^ARENA:arena -- bool )
+   {: kp pl ar :}
+   false [: drop kp kp pl ar KNOWN-DECISION pl COUNTED? ;] catch
+   {: code:n :}
+   code 0<> if
+      code E-CASE-COLLISION <> if code throw then
+      drop false
+   then ;
+
+\ The vector holds the key.
+: KEY-IN? ( ^VEC:vector<MODEL:key> MODEL:key -- bool )
+   {: v k :}
+   false v VEC:COUNT 0 ?do v i VEC:AT @ k MODEL:KEY= or loop ;
+
+\ A key the statement yields, one held, kept in the planning's arena.
+: YIELD-STEP
+   ( JOURNAL:known-path ^planning ^VEC:vector<MODEL:key>
+     ^VEC:vector<MODEL:key> ^ARENA:arena -- )
+   {: kp pl seen held ar :}
+   kp KNOWN-KEY KEY-BYTES pl ARENA-OF SAVED MODEL:>KEY {: k :}
+   held k KEY-IN? TTRUE
+   k seen VEC:PUSH !
+   kp pl ar COUNTED-NOOP? if 1 YIELD-NOOPS +! then ;
+
+\ The scratch arena first, as ARENA:WITH passes it.
+: YIELD-IN
+   ( ^ARENA:arena ^planning ^VEC:vector<MODEL:key>
+     ^VEC:vector<MODEL:key> -- )
+   {: scratch pl seen held :}
+   pl JOURNAL-OF scratch [: pl seen held scratch YIELD-STEP ;]
+   JOURNAL:EACH-UNSETTLED-PATH SETTLED-N ! ;
+
+\ A held key decided as the walk before did; one the statement skipped
+\ must be a counted no-op.
+: DECIDE-HELD
+   ( ^planning MODEL:key ^VEC:vector<MODEL:key> ^ARENA:arena -- )
+   {: pl k seen ar :}
+   pl JOURNAL-OF k ar JOURNAL:KNOWN-PATH-AT pl ar COUNTED-NOOP?
+   {: c:bool :}
+   seen k KEY-IN? 0= if c TTRUE then
+   c if 1 ALL-NOOPS +! then ;
+
+: SETTLED-CHECKS
+   ( JOURNAL:journal ^VEC:vector<MODEL:key> ^ARENA:arena -- )
+   {: j held ar :}
+   ar ARENA:ALLOCATOR 0 [type] MODEL:key VEC:NEW {: seen :}
+   0 YIELD-NOOPS ! 0 ALL-NOOPS !
+   j ar PLANNING-OVER {: walk :}
+   [: walk seen held YIELD-IN ;] ARENA:WITH
+   j ar PLANNING-OVER {: all :}
+   held VEC:COUNT 0 ?do all held i VEC:AT @ seen ar DECIDE-HELD loop ;
+
+\ Both passes log each of the 144 two-spelling keys' collision once.
+: SKIPS-ONLY-SETTLED
+   ( str JOURNAL:journal JOURNAL:local-root-binding ^ARENA:arena -- )
+   {: d:str j b ar :}
+   ar ARENA:ALLOCATOR 0 [type] MODEL:key VEC:NEW {: held :}
+   j b held ar WRITE-COMBOS
+   d [: j held ar SETTLED-CHECKS ;] ar LOGGED {: t:str :}
+   t 10 STR:COUNT-CHAR 288 T=
+   SETTLED-N @ 4 T=
+   SETTLED-N @ YIELD-NOOPS @ + ALL-NOOPS @ T= ;
+
+: DECIDING-SKIPS-ONLY-SETTLED-KEYS ( ^ARENA:arena -- )
+   {: ar :}
+   s" deciding skips only settled keys" T-LABEL
+   [: ar SKIPS-ONLY-SETTLED ;] ar WITH-ROOTED ;
 
 : NO-BASELINE ( -- option<MODEL:baseline> ) OPTION:NONE ;
 
@@ -6505,6 +6723,7 @@ TYPED-VARIABLE RACED str
    ar ABSENT-PATHS-ARE-SPELLED-WITH-LOCAL-ANCESTOR-CASING
    ar LOCAL-CASE-VARIANTS-NEVER-COLLAPSE-INTO-ONE-OBSERVATION
    ar KNOWN-PATH-MERGE-MATCHES-SET-UNION
+   ar DECIDING-SKIPS-ONLY-SETTLED-KEYS
    ar REMAINING-OPERATION-COMPARISON-IGNORES-A-COMPLETED-PREFIX
    ar PENDING-ONLY-PATHS-ARE-VISITED-AS-ABSENT-WITHOUT-CREATING-A-BASELINE
    ar A-PATH-BELOW-AN-UNKNOWN-DIRECTORY-INHERITS-ITS-REASON

@@ -3063,11 +3063,12 @@ ARENA PLANNINGS planning
    then
    k KEY-BYTES pl ARENA-OF SAVED MODEL:>KEY kept VEC:PUSH ! ;
 
-\ The scratch arena first, as ARENA:WITH passes it.
+\ The scratch arena first, as ARENA:WITH passes it; the settled keys the
+\ journal skips are counted no-ops.
 : WALK-IN ( ^ARENA:arena ^planning ^VEC:vector<MODEL:key> -- )
    {: scratch pl kept :}
    pl JOURNAL-OF scratch [: pl kept scratch WALK-STEP ;]
-   JOURNAL:EACH-KNOWN-PATH ;
+   JOURNAL:EACH-UNSETTLED-PATH pl PLANNING-NOOP-COUNT +! ;
 
 \ The keys of the journal's known paths a pass must decide again, in
 \ byte order; a pass's memory grows with its changes, not the tree.

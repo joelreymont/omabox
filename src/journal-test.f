@@ -30,7 +30,8 @@
 \ the keys EACH-LOCAL-COLLISION visits, in MODEL:KEY-CMP's order, and
 \ LOCAL-COUNT and LOCAL-AT over published scans; REMOTE-AT at held and
 \ unheld keys; LIVE-PLAN-AT at a pending, a blocked, a completed and an
-\ unheld key; the keys EACH-KNOWN-PATH visits, in byte order, and
+\ unheld key; the keys EACH-UNSETTLED-PATH visits, in byte order, none
+\ settled, and
 \ KNOWN-PATH-AT at a held key and at keys nothing holds, and its subtree
 \ as Rust's reconcile.rs remote_subtree_holds_only_true_descendants has it;
 \ UNKNOWN-LOCALS and UNKNOWN-REMOTES answering only the unknown records of
@@ -2338,10 +2339,11 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
    n FMT:INT$ SB-APPEND s"  " SB-APPEND
    r k KNOWN-REMOTE-PUT t SUBTREE-PUT live LIVE-PUT ;
 
-\ KNOWN-PUT's text of the keys EACH-KNOWN-PATH visits in ar.
+\ KNOWN-PUT's text of the keys EACH-UNSETTLED-PATH visits in ar; the
+\ fixture settles no key.
 : KNOWN-VISITS ( journal ^ARENA:arena -- str )
    {: j ar :}
-   SB-RESET j ar [: KNOWN-PUT ;] EACH-KNOWN-PATH SB$ ;
+   SB-RESET j ar [: KNOWN-PUT ;] EACH-UNSETTLED-PATH 0 T= SB$ ;
 
 : KNOWN-AT$ ( journal str ^ARENA:arena -- str )
    {: j k:str ar :}

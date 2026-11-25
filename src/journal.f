@@ -352,15 +352,16 @@ private
 : DELETE-MODE? ( SQLITE:statement -- bool SQLITE:statement )
    SQLITE:STEP drop 0 SQLITE:COL-TEXT s" delete" STR:=CI swap ;
 
-\ The daemon holds its connection for life, so each of its databases keeps
-\ 64 KiB of pages, not SQLite's 2 MB; the OS page cache holds the rest.
+\ The daemon holds its connection for life, so the main database keeps
+\ 128 KiB of pages and the temporary one 64 KiB, not SQLite's 2 MB each;
+\ the OS page cache holds the rest.
 \ The temporary database journals in memory, so a failed scan write
 \ rolls back, and does not zero freed pages, which would journal every
 \ page a pass's DELETE of its scan tables frees.
 : CONFIGURE-WRITABLE ( journal -- )
    {: j :}
    j >CONNECTION {: c :}
-   c s" PRAGMA cache_size = -64" SQLITE:EXEC
+   c s" PRAGMA cache_size = -128" SQLITE:EXEC
    c s" PRAGMA temp.cache_size = -64" SQLITE:EXEC
    c s" PRAGMA temp.journal_mode = MEMORY" SQLITE:EXEC
    c s" PRAGMA temp.secure_delete = OFF" SQLITE:EXEC
@@ -2682,15 +2683,39 @@ private
 
 : NO-PATH-BASELINE ( -- option<path-baseline> ) OPTION:NONE ;
 
-\ Each held key once, in byte order. The UNION merges the four tables'
-\ canonical-path indexes, so the statement streams.
+\ Each held key once, in byte order, but the settled: one baseline, one
+\ remote row and exactly one local row, all three directories or all three
+\ files of the baseline's content and the remote one of its revision, with
+\ no live plan and no conflict at the key. A key only a conflict holds
+\ is no known path. NOT INDEXED keeps the scan of baselines in key
+\ order; lone and rone are the keys only a local or only a remote row
+\ holds, so no sorter holds the tree.
 : KNOWN-KEYS ( -- str )
-   s" WITH keys(k) AS (
-         SELECT canonical_path FROM baselines
+   s" WITH lone(k) AS (
+         SELECT canonical_path FROM local_observations
+         EXCEPT SELECT canonical_path FROM baselines ORDER BY 1),
+      rone(k) AS (
+         SELECT canonical_path FROM remote_observations
+         EXCEPT SELECT canonical_path FROM baselines ORDER BY 1),
+      keys(k) AS (
+         SELECT b.canonical_path FROM baselines b NOT INDEXED
+         LEFT JOIN local_observations l
+            ON l.canonical_path = b.canonical_path
+         LEFT JOIN remote_observations r
+            ON r.canonical_path = b.canonical_path
+         WHERE NOT ((b.kind = 1 AND r.kind = 1 AND l.kind = 1)
+            OR (b.kind = 0 AND r.kind = 0 AND l.kind = 0
+               AND l.content = b.content AND r.content = b.content
+               AND r.revision = b.revision)) IS 1
+         UNION SELECT k FROM lone
+         UNION SELECT k FROM rone
          UNION SELECT canonical_path FROM local_observations
-         UNION SELECT canonical_path FROM remote_observations
+            GROUP BY canonical_path HAVING count(*) > 1
          UNION SELECT canonical_path FROM plans
             WHERE status IN ('pending', 'blocked')
+         UNION SELECT c.canonical_path FROM conflicts c
+            WHERE EXISTS (SELECT 1 FROM baselines o
+               WHERE o.canonical_path = c.canonical_path)
          ORDER BY 1) " ;
 
 : ONE-KEY ( -- str ) s" WITH keys(k) AS (SELECT ?1) " ;
@@ -2777,11 +2802,14 @@ create ONE-KNOWN ONE-KEY KNOWN-SELECT LAY-BOTH
    13 SQLITE:COL-INT 0<> {: live:bool :}
    k b l n r s live JOURNAL-KNOWN--PATH:MAKE ;
 
+\ Visits each row; n counts the rows that hold a baseline.
 : KNOWN-ROWS
    ( SQLITE:statement ^ARENA:arena [ known-path -- ]
-     -- SQLITE:statement )
+     -- n SQLITE:statement )
    {: ar visit :}
+   0 swap
    begin SQLITE:STEP while
+      1 SQLITE:COL-NULL? 0= if swap 1+ swap then
       ar ARENA:RESET ar KNOWN-ROW visit execute
    repeat ;
 
@@ -2795,12 +2823,16 @@ create ONE-KNOWN ONE-KEY KNOWN-SELECT LAY-BOTH
 
 public
 
-\ Each held key in byte order, decoded into ar, which is reset before
-\ each.
-: EACH-KNOWN-PATH ( journal ^ARENA:arena [ known-path -- ] -- )
+\ Each held key but the settled, as KNOWN-KEYS has them, in byte order,
+\ decoded into ar, which is reset before each; n is the settled keys'
+\ count: the baselines' count less the visited keys that hold one.
+: EACH-UNSETTLED-PATH ( journal ^ARENA:arena [ known-path -- ] -- n )
    {: j ar visit :}
-   j >CONNECTION EVERY-KNOWN TEXT [: ar visit KNOWN-ROWS ;]
-   SQLITE:WITH-STATEMENT ;
+   j >CONNECTION {: c :}
+   c s" SELECT count(*) FROM baselines" QUERY-INT {: all:n :}
+   c EVERY-KNOWN TEXT [: ar visit KNOWN-ROWS ;]
+   SQLITE:WITH-STATEMENT {: held:n :}
+   all held - ;
 
 \ What the journal holds at the key, decoded into ar.
 : KNOWN-PATH-AT ( journal MODEL:key ^ARENA:arena -- known-path )
