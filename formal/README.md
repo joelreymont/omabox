@@ -122,9 +122,11 @@ the pending events are heard, unless a loss is queued.
 what it reads exists and never makes again what the run holds, so the journal
 opens only under the instance lock, systemd hears the daemon is ready only once
 both are held, and a pass or a long poll runs only on a session validated
-against the journal's binding; the long poll follows only a complete pass; and
-only a failure that stops ends the run, while one that continues waits and
-tries its state again, a failed long poll from syncing.
+against the journal's binding; the long poll follows only a complete pass; a
+pass that rested leads to resting (`RestsAfterRest`), the only state that hears
+local changes, which settle before the next pass; and only a failure that stops
+ends the run, while one that continues waits and tries its state again, a
+failed long poll or settling from syncing.
 
 `Downloading` checks one files/download transfer as `DOWNLOADING` reads it: no
 byte of the file reaches the body's reader before the answer's rev, content

@@ -23,6 +23,7 @@ Lines == {
     <<"validating", "ok", "syncing">>,
     <<"validating", "retry", "validating">>,
     <<"validating", "stop", "stopped">>,
+    <<"syncing", "rested", "resting">>,
     <<"syncing", "clean", "polling">>,
     <<"syncing", "dirty", "polling">>,
     <<"syncing", "fresh", "syncing">>,
@@ -30,6 +31,16 @@ Lines == {
     <<"syncing", "stop", "stopped">>,
     <<"polling", "ok", "syncing">>,
     <<"polling", "retry", "syncing">>,
-    <<"polling", "stop", "stopped">>
+    <<"polling", "stop", "stopped">>,
+    <<"resting", "changed", "syncing">>,
+    <<"resting", "quiet", "resting">>,
+    <<"resting", "due", "syncing">>,
+    <<"resting", "stirred", "settling">>,
+    <<"resting", "retry", "syncing">>,
+    <<"resting", "stop", "stopped">>,
+    <<"settling", "heard", "settling">>,
+    <<"settling", "quiet", "syncing">>,
+    <<"settling", "retry", "syncing">>,
+    <<"settling", "stop", "stopped">>
 }
 ====

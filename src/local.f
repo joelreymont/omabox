@@ -1375,12 +1375,25 @@ FSM:DEFINE WATCHING ( ^watch ) watch-state watch-event
    drop j w construct watch-event lost STEPPED
    code INOTIFY:E-INOTIFY <> if code throw then 0 ;
 
-\ due once the last full publication is SCAN-STANDS-S old, else start.
-: START-EVENT ( ^watch -- watch-event )
+public
+
+\ Armed, with its last full publication SCAN-STANDS-S old: the next scan
+\ lists the whole tree.
+: WATCH-DUE? ( ^watch -- bool )
    {: w :}
-   NOW-S w WATCH-STAMP @ - SCAN-STANDS-S >= if
-      construct watch-event due exit
-   then
+   w ARMED? 0= if false exit then
+   NOW-S w WATCH-STAMP @ - SCAN-STANDS-S >= ;
+
+\ Armed with no folder stirred: nothing heard waits for a listing.
+: WATCH-STILL? ( JOURNAL:journal ^watch -- bool )
+   {: j w :}
+   w ARMED? 0= if false exit then
+   j JOURNAL:STIRRED? 0= ;
+
+private
+
+: START-EVENT ( ^watch -- watch-event )
+   WATCH-DUE? if construct watch-event due exit then
    construct watch-event start ;
 
 \ A blind watch opens an instance: arming, or still blind if refused or

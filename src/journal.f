@@ -1504,6 +1504,11 @@ public
       ORDER BY path LIMIT 1" [: ar STIRRED-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
+\ Whether any folder is stirred.
+: STIRRED? ( journal -- bool )
+   >CONNECTION s" SELECT 1 FROM temp.watches WHERE mark = 1 LIMIT 1"
+   [: SQLITE:STEP swap ;] SQLITE:WITH-STATEMENT ;
+
 private
 
 

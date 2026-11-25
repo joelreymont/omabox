@@ -9,7 +9,9 @@
 \ time.
 \ RUN is the daemon: the machine DAEMON-RUN prepares, locks, opens the
 \ journal, tells systemd it is ready, then syncs and long-polls until a
-\ failure stops it, and RUN answers the exit status.
+\ failure stops it, and RUN answers the exit status. After a pass that
+\ rested it waits for a change, Dropbox's or local; a local one settles
+\ before the next pass.
 \ STORAGE CLASS. PROCESS-WIDE: the binding a rotated refresh token is
 \ stored with. CALLER-OWNED: a retry schedule, and a session in the
 \ arena its caller passes. RUN owns an arena for the process; its
@@ -27,6 +29,7 @@ require src/lib/adt/option.f
 require src/lib/systemd.f
 require src/lib/task.f
 require src/lib/time.f
+require src/lib/fd.f
 require src/lib/ffi-abi.f
 require src/dropbox.f
 require src/journal.f
@@ -381,14 +384,20 @@ ENUM account-check
 
 ENUM daemon-state DERIVE eq
    preparing locking opening notifying configuring
-   starting validating syncing polling stopped ;ENUM
+   starting validating syncing polling resting settling stopped ;ENUM
 
 ENUM step-event ok retry stop ;ENUM
-\ clean and dirty: a complete pass without and with sync errors.
-ENUM sync-event clean dirty fresh retry stop ;ENUM
+\ clean and dirty: a complete pass without and with sync errors; rested:
+\ a clean one that changed nothing, with the watch still.
+ENUM sync-event DERIVE eq rested clean dirty fresh retry stop ;ENUM
+\ What a wait for changes ends in: Dropbox changed or not, the hourly
+\ full scan due, or a local change (stirred).
+ENUM listen-event changed quiet due stirred retry stop ;ENUM
+\ A settling wait: the watch heard more, or the root kept still.
+ENUM settle-event heard quiet retry stop ;ENUM
 
 \ code is 0 for a failure a step answered; backoff the s the last long
-\ poll asked for, 0 for none.
+\ poll asked for, 0 for none; settling the MONO-NS reading as it began.
 STRUCTURE run DERIVE addr
    FIELD arena ^ARENA:arena
    FIELD preparing ^ARENA:arena
@@ -412,6 +421,9 @@ STRUCTURE run DERIVE addr
    FIELD code n
    FIELD backoff n
    FIELD passed sync-event
+   FIELD listened listen-event
+   FIELD settled settle-event
+   FIELD settling n
 ;STRUCTURE
 
 ARENA RUNS run
@@ -484,10 +496,13 @@ FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
    construct sync-event retry ;
 
 \ ok if step on x succeeds, else its failure weighed.
-: TRIED-STEP ( ^run [ ^run -- bool ] -- step-event )
-   {: x step :}
-   x step TRIED if construct step-event ok exit then
+: ATTEMPT-STEP ( ^run [ ^run -- bool ] [ n -- failure ] -- step-event )
+   {: x step map :}
+   x step map ATTEMPT if construct step-event ok exit then
    x WEIGH ;
+
+: TRIED-STEP ( ^run [ ^run -- bool ] -- step-event )
+   [: CODE-FAILURE ;] ATTEMPT-STEP ;
 
 \ ---- the process's states
 
@@ -733,12 +748,15 @@ FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
    s"  sync_errors=" LOG:TEXT+ e LOG:INT+
    s"  conflicts=" LOG:TEXT+ c LOG:INT+ LOG:;LINE ;
 
-: COMPLETED ( RECONCILE:report -- sync-event )
-   {: rep :}
+: COMPLETED ( RECONCILE:report ^run -- sync-event )
+   {: rep x :}
    rep REPORT-LOGGED
-   rep RECONCILE-REPORT:UNMAKE drop {: r n p b e c :}
-   e 0= if construct sync-event clean exit then
-   construct sync-event dirty ;
+   rep RECONCILE-REPORT:UNMAKE {: r n p b e c s:bool :}
+   e 0<> if construct sync-event dirty exit then
+   s x JOURNAL@ x RUN-WATCH @ LOCAL:WATCH-STILL? and if
+      construct sync-event rested exit
+   then
+   construct sync-event clean ;
 
 : RECONCILED ( ^run -- sync-event )
    {: x :}
@@ -749,7 +767,7 @@ FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
    p CONFIG:UPLOAD-STAGING-DIRECTORY CONFIG:ABS-PATH>STR
    p CONFIG:RECOVERY-DIRECTORY CONFIG:ABS-PATH>STR
    x RUN-PASSES @ RECONCILE:PASS MATCH RECONCILE:outcome
-      complete OF COMPLETED ENDOF
+      complete OF x COMPLETED ENDOF
       fresh OF construct sync-event fresh ENDOF
       root-changed OF
          0 ROOT-UNAVAILABLE x FAILED x WEIGH-PASS
@@ -795,7 +813,8 @@ FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
 
 \ ---- polling
 
-\ The backoff the last long poll asked for, waited once.
+\ The backoff the last long poll asked for, waited once; then the phase
+\ is the pass's: waiting, or error after a dirty pass.
 : BACKED-OFF ( ^run -- )
    {: x :}
    x RUN-BACKOFF @ {: secs :}
@@ -804,7 +823,11 @@ FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
    LOG:INFO s" daemon" LOG:LINE s" honoring Dropbox backoff seconds=" LOG:TEXT+
    secs LOG:INT+ LOG:;LINE
    STATUS-PHASE:BACKOFF x PHASE!
-   secs 1000 * x SLEEP ;
+   secs 1000 * x SLEEP
+   x RUN-PASSED @ construct sync-event dirty SYNC-EVENT-EQ if
+      x DIRTIED exit
+   then
+   STATUS-PHASE:WAITING x PHASE! ;
 
 : RESET? ( DROPBOX:reply -- bool )
    MATCH DROPBOX:reply
@@ -821,28 +844,104 @@ FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
    r RESET? if true exit then
    r x CLIENT@ REPLY-FAILURE x FAIL ;
 
-\ None, a poll a local change ended, completes a cycle, so a pass runs.
-: CURSOR-POLLED ( DROPBOX:cursor ^run -- bool )
-   {: k:DROPBOX:cursor x :}
+\ What a reply WOKEN accepts says: changed when Dropbox changed or
+\ reset the cursor, as a reset's pass must list again.
+: REPLIED ( DROPBOX:reply ^run -- listen-event )
+   {: r x :}
+   r RESET? x CLIENT@ DROPBOX:CHANGED? or if
+      construct listen-event changed exit
+   then
+   construct listen-event quiet ;
+
+\ The long poll, which descriptor f, when given, ends as stirred; its
+\ event goes in listened.
+: CURSOR-POLLED ( DROPBOX:cursor option<fd> ^run -- bool )
+   {: k:DROPBOX:cursor f:option<fd> x :}
    RELEASE-HEAP
-   k DROPBOX:CURSOR>STR LONG-POLL-S OPTION:NONE x CLIENT@ DROPBOX:WAIT
-   MATCH option
-      some OF x WOKEN ENDOF
-      none OF true ENDOF
+   k DROPBOX:CURSOR>STR LONG-POLL-S f
+   x CLIENT@ DROPBOX:WAIT MATCH option
+      some OF {: r:DROPBOX:reply :}
+         r x REPLIED x RUN-LISTENED !  r x WOKEN
+      ENDOF
+      none OF construct listen-event stirred x RUN-LISTENED ! true ENDOF
    ;MATCH ;
 
-\ The cursor stays in the pass's arena until the next pass ends.
-: POLLED ( ^run -- bool )
-   {: x :}
-   x JOURNAL@ x RUN-PASSES @ JOURNAL:REMOTE-CURSOR MATCH option
+\ The cursor lives only for the poll.
+: POLLED ( option<fd> ^run -- bool )
+   {: f:option<fd> x :}
+   [: x JOURNAL@ swap JOURNAL:REMOTE-CURSOR MATCH option
       none OF CURSOR ENVIRONMENTAL x FAIL ENDOF
-      some OF x CURSOR-POLLED ENDOF
-   ;MATCH ;
+      some OF f x CURSOR-POLLED ENDOF
+   ;MATCH ;] ARENA:WITH ;
 
+\ After any backoff, the long poll without the watch's descriptor.
 : POLL ( ^run -- step-event )
    {: x :}
    x BACKED-OFF
-   x [: POLLED ;] TRIED-STEP ;
+   x [: drop OPTION:NONE x POLLED ;] TRIED-STEP ;
+
+\ The event the long poll put in listened, or its failure weighed.
+: LISTENED ( step-event ^run -- listen-event )
+   {: x :}
+   MATCH step-event
+      ok OF x RUN-LISTENED @ ENDOF
+      retry OF construct listen-event retry ENDOF
+      stop OF construct listen-event stop ENDOF
+   ;MATCH ;
+
+\ After any backoff: due once the watch's full scan is old, else the
+\ event of a long poll that the watch's descriptor ends.
+: LISTEN ( ^run -- listen-event )
+   {: x :}
+   x BACKED-OFF
+   x RUN-WATCH @ LOCAL:WATCH-DUE? if
+      construct listen-event due exit
+   then
+   x [: RUN-WATCH @ LOCAL:WATCH-FD x POLLED ;] TRIED-STEP
+   x LISTENED ;
+
+\ Settling begins; LONG-POLL-S counts from now.
+: STIRRED ( ^run -- ) TIME:MONO-NS swap RUN-SETTLING ! ;
+
+\ quiet once LONG-POLL-S has passed since settling began, else heard;
+\ the wait before it adds at most SETTLE-S.
+: STILL ( ^run -- settle-event )
+   RUN-SETTLING @ TIME:ELAPSED-MS LONG-POLL-S 1000 * >= if
+      construct settle-event quiet exit
+   then
+   construct settle-event heard ;
+
+\ quiet if the watch's descriptor f keeps still for SETTLE-S; else the
+\ events are heard, stirring their folders, and the settling goes on.
+: STIRS ( fd ^run -- settle-event )
+   {: f:fd x :}
+   f LOCAL:SETTLE-S 1000 * FD:READABLE-WITHIN 0= if
+      construct settle-event quiet exit
+   then
+   x JOURNAL@ x RUN-WATCH @ LOCAL:WATCH-HEAR drop
+   x STILL ;
+
+\ Puts the settling's event in settled: quiet at once while blind.
+: SETTLED ( ^run -- bool )
+   {: x :}
+   x RUN-WATCH @ LOCAL:WATCH-FD MATCH option
+      none OF construct settle-event quiet ENDOF
+      some OF x STIRS ENDOF
+   ;MATCH x RUN-SETTLED ! true ;
+
+\ A failed wait for the watch is the sync root's, which clears.
+: SETTLE-FAILURE ( n -- failure )
+   {: c :}
+   c E-FS-IO = if SYNC-ROOT ENVIRONMENTAL exit then
+   c CODE-FAILURE ;
+
+: SETTLE ( ^run -- settle-event )
+   {: x :}
+   x [: SETTLED ;] [: SETTLE-FAILURE ;] ATTEMPT-STEP MATCH step-event
+      ok OF x RUN-SETTLED @ ENDOF
+      retry OF construct settle-event retry ENDOF
+      stop OF construct settle-event stop ENDOF
+   ;MATCH ;
 
 \ Rust's cycle_completed.
 : CYCLED ( ^run -- ) RUN-SCHEDULE RESET ;
@@ -901,7 +1000,7 @@ FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
 : EXIT-STATUS ( ^run -- n ) DISPOSITION@ EXIT-CODE ;
 
 \ Rust's run, run_owned and run_session: a failure that stops ends the run;
-\ any other waits and tries its state again, polling's from syncing.
+\ any other waits and tries its state again, a wait for changes from syncing.
 FSM:DEFINE DAEMON-RUN ( ^run ) daemon-state step-event
    IN preparing  PREPARE
       ok     -                >locking
@@ -932,15 +1031,28 @@ FSM:DEFINE DAEMON-RUN ( ^run ) daemon-state step-event
       retry  WAITED           >validating
       stop   -                >stopped
    IN syncing  SYNC ( sync-event )
-      clean  CLEANED          >polling
-      dirty  DIRTIED          >polling
-      fresh  REOBSERVE        >syncing
-      retry  WAITED           >syncing
-      stop   -                >stopped
+      rested   CLEANED        >resting
+      clean    CLEANED        >polling
+      dirty    DIRTIED        >polling
+      fresh    REOBSERVE      >syncing
+      retry    WAITED         >syncing
+      stop     -              >stopped
    IN polling  POLL
-      ok     CYCLED           >syncing
-      retry  WAITED           >syncing
-      stop   -                >stopped
+      ok       CYCLED         >syncing
+      retry    WAITED         >syncing
+      stop     -              >stopped
+   IN resting  LISTEN ( listen-event )
+      changed  CYCLED         >syncing
+      quiet    CYCLED         >resting
+      due      CYCLED         >syncing
+      stirred  STIRRED        >settling
+      retry    WAITED         >syncing
+      stop     -              >stopped
+   IN settling  SETTLE ( settle-event )
+      heard    -              >settling
+      quiet    CYCLED         >syncing
+      retry    WAITED         >syncing
+      stop     -              >stopped
    FINAL stopped  STOP
 ;DEFINE
 

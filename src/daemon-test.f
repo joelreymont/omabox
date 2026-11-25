@@ -13,6 +13,8 @@
 \   download slot coordinator
 \ - local_and_nested_failures_keep_their_intended_policy
 \ - local_root_failures_name_their_own_cause, a removed root inspected
+\ - settle_failure_waits, Rust having none: a failed wait for the watch
+\   waits and tries again
 \ Account validation, against the fake Dropbox of test-dropbox.f on
 \ test-client.f's clients, each holding its first access token:
 \ - a restricted remote root, root-unavailable through VALIDATE.
@@ -32,7 +34,18 @@
 \ - root_inspection_failure_is_unavailable_only_for_a_stand_in
 \ - stand_in_without_birth_time_leaves_the_root_unavailable, /sys/kernel
 \ - syncing_backs_off_and_stops_on_a_refused_refresh, Rust having none:
-\   DAEMON-RUN from a clean pass through a backed-off poll to the stop
+\   DAEMON-RUN from a pass that rests through a backed-off poll, waiting
+\   again once the backoff ends, to the stop
+\ - resting_waits_for_dropbox_without_a_pass, Rust having none
+\ - a_local_change_ends_the_rest, Rust having none: a file moved into the
+\   root while the fake holds the long poll's answer settles, then uploads
+\ - a_due_watch_ends_the_rest, Rust having none: the hourly full scan
+\   runs a pass without a long poll
+\ - polling_ignores_local_changes, Rust having none: a file written
+\   during polling's long poll leaves the poll to Dropbox's answer
+\ - an_unlistable_folder_keeps_the_daemon_polling, Rust having none: a
+\   change heard in a folder made unreadable while resting ends the
+\   rest; the pass that cannot list it polls instead of resting
 \ The table against its model, through TEST-FORMAL:HOLDS:
 \ - formal_holds_the_daemon_table, DAEMON-RUN and formal/DaemonRun.tla
 \ Run from the repository root: hb --load src/daemon-test.f </dev/null
@@ -58,6 +71,19 @@ require src/lib/aio.f
 require src/test-dropbox.f
 require src/test-client.f
 require src/test-formal.f
+
+\ LOCAL reopened to make a watch's full scan due.
+package LOCAL
+private
+
+\ The watch's last full publication SCAN-STANDS-S older.
+: WATCH-AGED ( ^watch -- )
+   {: w :}
+   w WATCH-STAMP @ SCAN-STANDS-S - w WATCH-STAMP ! ;
+
+public
+EXPORT WATCH-AGED
+;package
 
 \ DAEMON reopened for the private words the tests call.
 package DAEMON
@@ -179,6 +205,12 @@ TYPED-VARIABLE LINK REPLAY:link
    f SYNC-ROOT TEXT=
    d FS:REMOVE-TREE ;
 
+: SETTLE-FAILURE-WAITS ( -- )
+   s" settle_failure_waits" T-LABEL
+   E-FS-IO SETTLE-FAILURE {: f :}
+   f FAILURE-UNMAKE {: d u:str :} d STOPS? TFALSE
+   f SYNC-ROOT TEXT= ;
+
 : POLICY-CASES ( ^ARENA:arena -- )
    {: ar :}
    RETRY-SCHEDULE-DOUBLES-CAPS-AND-HONORS-BOUNDED-SERVER-DELAYS
@@ -188,7 +220,8 @@ TYPED-VARIABLE LINK REPLAY:link
    k REFRESH-REJECTION-AND-BINDING-REJECTION-EXIT-FOR-USER-ACTION
    k DROPBOX:CLOSE
    LOCAL-AND-NESTED-FAILURES-KEEP-THEIR-INTENDED-POLICY
-   ar LOCAL-ROOT-FAILURES-NAME-THEIR-OWN-CAUSE ;
+   ar LOCAL-ROOT-FAILURES-NAME-THEIR-OWN-CAUSE
+   SETTLE-FAILURE-WAITS ;
 
 
 \ ---- run ----
@@ -215,6 +248,8 @@ variable DROPPED
 : AT-NOTIFYING ( -- daemon-state ) construct daemon-state notifying ;
 : AT-SYNCING ( -- daemon-state ) construct daemon-state syncing ;
 : AT-POLLING ( -- daemon-state ) construct daemon-state polling ;
+: AT-RESTING ( -- daemon-state ) construct daemon-state resting ;
+: AT-SETTLING ( -- daemon-state ) construct daemon-state settling ;
 
 \ One step from s, which must reach want.
 : STEP-TO ( daemon-state ^run daemon-state -- daemon-state )
@@ -479,12 +514,25 @@ private
 3 constant BACKOFF-S            \ the backoff the long poll asks for
 TYPED-VARIABLE CYCLE-DIR str
 TYPED-VARIABLE CYCLE-ARENA ^ARENA:arena
+variable WAITING-SEEN           \ the long poll after the backoff ran
 
-: CLEAN? ( sync-event -- bool )
+: RESTED? ( sync-event -- bool )
    MATCH sync-event
-      clean OF true ENDOF
+      rested OF true ENDOF
+      clean OF false ENDOF
       dirty OF false ENDOF
       fresh OF false ENDOF
+      retry OF false ENDOF
+      stop OF false ENDOF
+   ;MATCH ;
+
+\ Whether the watch's descriptor ended the long poll.
+: STIRRED-POLL? ( listen-event -- bool )
+   MATCH listen-event
+      changed OF false ENDOF
+      quiet OF false ENDOF
+      due OF false ENDOF
+      stirred OF true ENDOF
       retry OF false ENDOF
       stop OF false ENDOF
    ;MATCH ;
@@ -494,16 +542,22 @@ TYPED-VARIABLE CYCLE-ARENA ^ARENA:arena
    s" /oauth2/token" 400 s" " s" " S\" {\qerror\q:\qinvalid_grant\q}"
    TEST-DROPBOX:ROUTE-SCRIPT! ;
 
-\ The backoff's wait, after a clean pass: the status shows backoff and
-\ no error. Then every access token expires and the next refresh is
-\ refused, which the next pass meets.
+\ On the fake's task, in the long poll after the backoff: the status shows
+\ waiting; then tokens expire and the refresh the next pass needs is refused.
+: WAITING-POLL ( -- )
+   CYCLE-DIR @ S\" \qphase\q:\qwaiting\q" CYCLE-ARENA @ STATUS-HAS
+   true WAITING-SEEN !
+   TEST-DROPBOX:EXPIRE REFRESH-REFUSED ;
+
+\ The backoff's wait, after a pass that rested: the status shows backoff
+\ and no error.
 : BACKOFF-NAP ( n -- )
    NAP
    CYCLE-DIR @ S\" \qphase\q:\qbackoff\q" CYCLE-ARENA @ STATUS-HAS
    CYCLE-DIR @ S\" \qlast_error\q:null" CYCLE-ARENA @ STATUS-HAS
-   TEST-DROPBOX:EXPIRE REFRESH-REFUSED ;
+   [: WAITING-POLL ;] TEST-DROPBOX:DURING-POLL! ;
 
-\ Two passes' listing pages, both empty, and a long poll that answers
+\ Two passes' listing pages, both empty, and long polls that answer
 \ changes with a backoff.
 : CYCLE-SCRIPT ( -- )
    TEST-DROPBOX:RESET
@@ -532,10 +586,11 @@ TYPED-VARIABLE CYCLE-ARENA ^ARENA:arena
    {: car d root:str :}
    car d root CYCLE-RUN {: x :}
    CYCLE-SCRIPT
-   d CYCLE-DIR ! car CYCLE-ARENA ! 0 NAPS !
+   d CYCLE-DIR ! car CYCLE-ARENA ! 0 NAPS ! false WAITING-SEEN !
    x AT-SYNCING DAEMON-RUN
    NAPS @ 1 T= 0 BACKOFF-S 1000 * NAPPED=
-   x RUN-PASSED @ CLEAN? TTRUE
+   WAITING-SEEN @ TTRUE
+   x RUN-PASSED @ RESTED? TTRUE
    d S\" \qphase\q:\qstopped\q" car STATUS-HAS
    d BINDING car STATUS-HAS
    x EXIT-STATUS 78 T= ;
@@ -550,6 +605,173 @@ TYPED-VARIABLE CYCLE-ARENA ^ARENA:arena
    root FS:REMOVE-TREE
    d FS:REMOVE-TREE ;
 
+\ ---- resting and settling
+
+TYPED-VARIABLE REST-FILE str
+TYPED-VARIABLE STAGED-FILE str
+TASK:SEMAPHORE HELD-POLL
+
+\ A cycle's run whose waits never sleep, with the fake's script: the
+\ listing page a, an empty one and a long poll that answers no changes.
+: LISTED-RUN ( ^ARENA:arena str str str -- ^run )
+   {: car d root:str a:str :}
+   car d root CYCLE-RUN {: x :}
+   [: NAP ;] x RUN-WAIT !
+   TEST-DROPBOX:RESET
+   a s" cursor-1" false TEST-DROPBOX:PAGE!
+   s" []" s" cursor-2" false TEST-DROPBOX:PAGE!
+   false 0 TEST-DROPBOX:POLL!
+   x ;
+
+\ A LISTED-RUN whose first listing page is empty too.
+: REST-RUN ( ^ARENA:arena str str -- ^run ) s" []" LISTED-RUN ;
+
+: LIST+ ( -- ) s" /2/files/list_folder" SB-APPEND ;
+: POLL+ ( -- ) s"  /2/files/list_folder/longpoll" SB-APPEND ;
+: CONTINUE+ ( -- ) s"  /2/files/list_folder/continue" SB-APPEND ;
+
+\ A pass rests; a quiet long poll keeps it resting, with no listing and
+\ the retry schedule reset; a changed one runs a pass, which rests again.
+: RESTS-UNTIL-CHANGED ( ^ARENA:arena str str -- )
+   {: car d root:str :}
+   car d root REST-RUN {: x :}
+   AT-SYNCING x AT-RESTING STEP-TO
+   0 x RUN-SCHEDULE ADVANCE drop
+   x AT-RESTING STEP-TO
+   x RUN-SCHEDULE SCHEDULE-NEXT @ RETRY-BASE T=
+   TEST-DROPBOX:SEEN$ SB-RESET LIST+ POLL+ SB$ T$=
+   true 0 TEST-DROPBOX:POLL!
+   x AT-SYNCING STEP-TO x AT-RESTING STEP-TO drop
+   TEST-DROPBOX:SEEN$ SB-RESET LIST+ POLL+ POLL+ CONTINUE+ SB$ T$=
+   NAPS @ 0 T= ;
+
+: RESTING-WAITS-FOR-DROPBOX-WITHOUT-A-PASS ( ^ARENA:arena -- )
+   {: ar :}
+   s" resting_waits_for_dropbox_without_a_pass" T-LABEL
+   ar CASE-DIR {: d:str :}
+   ar CASE-DIR {: root:str :}
+   [: d root RESTS-UNTIL-CHANGED ;] WITH-CASE
+   root FS:REMOVE-TREE
+   d FS:REMOVE-TREE ;
+
+\ On the fake's task, in the long poll: the staged file renamed into the
+\ root, one IN_MOVED_TO; then the answer held until the case lets it go.
+: WRITE-HELD ( -- )
+   STAGED-FILE @ REST-FILE @ FS:RENAME-FILE
+   HELD-POLL TASK:WAIT-SEM ;
+
+\ Resting, the move ends the long poll; the root settles once the watch
+\ hears it and once it keeps still, then a pass uploads the file.
+: STIRRED-TO-A-PASS ( ^ARENA:arena str str -- )
+   {: car d root:str :}
+   car d root REST-RUN {: x :}
+   root s" file.txt" car TEST-CLIENT:INSIDE REST-FILE !
+   d s" file.txt" car TEST-CLIENT:INSIDE STAGED-FILE !
+   STAGED-FILE @ s" local" FS:WRITE-ALL
+   AT-SYNCING x AT-RESTING STEP-TO
+   [: WRITE-HELD ;] TEST-DROPBOX:DURING-POLL!
+   x AT-SETTLING STEP-TO
+   HELD-POLL TASK:SIGNAL-SEM
+   x AT-SETTLING STEP-TO x AT-SYNCING STEP-TO
+   x AT-POLLING STEP-TO drop
+   TEST-DROPBOX:SEEN$ SB-RESET LIST+ POLL+ CONTINUE+
+   s"  /2/files/upload" SB-APPEND SB$ T$=
+   NAPS @ 0 T= ;
+
+: A-LOCAL-CHANGE-ENDS-THE-REST ( ^ARENA:arena -- )
+   {: ar :}
+   s" a_local_change_ends_the_rest" T-LABEL
+   ar CASE-DIR {: d:str :}
+   ar CASE-DIR {: root:str :}
+   0 HELD-POLL TASK:SEMAPHORE-INIT
+   [: d root STIRRED-TO-A-PASS ;] WITH-CASE
+   HELD-POLL TASK:SEMAPHORE-DESTROY
+   root FS:REMOVE-TREE
+   d FS:REMOVE-TREE ;
+
+\ Resting, the watch's full scan due: a pass runs with no long poll.
+: DUE-TO-A-PASS ( ^ARENA:arena str str -- )
+   {: car d root:str :}
+   car d root REST-RUN {: x :}
+   AT-SYNCING x AT-RESTING STEP-TO
+   x RUN-WATCH @ LOCAL:WATCH-AGED
+   x AT-SYNCING STEP-TO drop
+   TEST-DROPBOX:SEEN$ SB-RESET LIST+ SB$ T$=
+   NAPS @ 0 T= ;
+
+: A-DUE-WATCH-ENDS-THE-REST ( ^ARENA:arena -- )
+   {: ar :}
+   s" a_due_watch_ends_the_rest" T-LABEL
+   ar CASE-DIR {: d:str :}
+   ar CASE-DIR {: root:str :}
+   [: d root DUE-TO-A-PASS ;] WITH-CASE
+   root FS:REMOVE-TREE
+   d FS:REMOVE-TREE ;
+
+\ How long WRITE-STILL holds the long poll's answer.
+500 constant STILL-MS
+
+\ On the fake's task, during the long poll: a file written in the root,
+\ then the answer held STILL-MS, long after the descriptor turns readable.
+: WRITE-STILL ( -- )
+   REST-FILE @ s" local" FS:WRITE-ALL
+   STILL-MS SLEEPS ;
+
+\ A pass that uploads does not rest; a write during polling's long poll
+\ leaves it to Dropbox's answer, which runs a pass with no settling.
+: POLLED-PAST-A-WRITE ( ^ARENA:arena str str -- )
+   {: car d root:str :}
+   car d root REST-RUN {: x :}
+   root s" file.txt" car TEST-CLIENT:INSIDE s" local" FS:WRITE-ALL
+   AT-SYNCING x AT-POLLING STEP-TO
+   root s" later.txt" car TEST-CLIENT:INSIDE REST-FILE !
+   [: WRITE-STILL ;] TEST-DROPBOX:DURING-POLL!
+   x AT-SYNCING STEP-TO drop
+   x RUN-LISTENED @ STIRRED-POLL? TFALSE
+   NAPS @ 0 T= ;
+
+: POLLING-IGNORES-LOCAL-CHANGES ( ^ARENA:arena -- )
+   {: ar :}
+   s" polling_ignores_local_changes" T-LABEL
+   ar CASE-DIR {: d:str :}
+   ar CASE-DIR {: root:str :}
+   [: d root POLLED-PAST-A-WRITE ;] WITH-CASE
+   root FS:REMOVE-TREE
+   d FS:REMOVE-TREE ;
+
+448 constant MODE-0700
+
+\ Resting, a change in sub made before the long poll the fake holds ends
+\ the rest; the pass cannot list sub, so the change waits and the run polls.
+: UNLISTED-TO-A-POLL ( ^ARENA:arena str str str -- )
+   {: car d root:str sub:str :}
+   sub FS:MAKE-DIR
+   car d root
+   S\" [{\q.tag\q:\qfolder\q,\qname\q:\qsub\q,\qid\q:\qid:sub\q,\qpath_lower\q:\q/root/sub\q,\qpath_display\q:\q/root/sub\q}]"
+   LISTED-RUN {: x :}
+   sub s" file.txt" car TEST-CLIENT:INSIDE REST-FILE !
+   AT-SYNCING x AT-RESTING STEP-TO
+   REST-FILE @ s" local" FS:WRITE-ALL  sub 0 FS:CHMOD-MODE
+   [: HELD-POLL TASK:WAIT-SEM ;] TEST-DROPBOX:DURING-POLL!
+   x AT-SETTLING STEP-TO
+   HELD-POLL TASK:SIGNAL-SEM
+   x AT-SETTLING STEP-TO x AT-SYNCING STEP-TO
+   x AT-POLLING STEP-TO drop
+   NAPS @ 0 T= ;
+
+: AN-UNLISTABLE-FOLDER-KEEPS-THE-DAEMON-POLLING ( ^ARENA:arena -- )
+   {: ar :}
+   s" an_unlistable_folder_keeps_the_daemon_polling" T-LABEL
+   ar CASE-DIR {: d:str :}
+   ar CASE-DIR {: root:str :}
+   root s" sub" ar TEST-CLIENT:INSIDE {: sub:str :}
+   0 HELD-POLL TASK:SEMAPHORE-INIT
+   [: d root sub UNLISTED-TO-A-POLL ;] WITH-CASE
+   HELD-POLL TASK:SEMAPHORE-DESTROY
+   sub MODE-0700 FS:CHMOD-MODE
+   root FS:REMOVE-TREE
+   d FS:REMOVE-TREE ;
+
 \ The cases that need no Dropbox, then those against the fake under
 \ AIO's loop.
 : RUN-SERVED ( ^ARENA:arena -- )
@@ -558,7 +780,12 @@ TYPED-VARIABLE CYCLE-ARENA ^ARENA:arena
    s" " TEST-DROPBOX:ROOT!
    ar DURABLE-BINDING-IS-REQUIRED-AND-AUTHORITATIVE
    ar REPEATED-LONG-POLL-RETRIES-RETAIN-THE-SESSION-AND-ESCALATE-AFTER-CLEAN-SYNC-PASSES
-   ar SYNCING-BACKS-OFF-AND-STOPS-ON-A-REFUSED-REFRESH ;
+   ar SYNCING-BACKS-OFF-AND-STOPS-ON-A-REFUSED-REFRESH
+   0 NAPS ! ar RESTING-WAITS-FOR-DROPBOX-WITHOUT-A-PASS
+   0 NAPS ! ar A-LOCAL-CHANGE-ENDS-THE-REST
+   0 NAPS ! ar A-DUE-WATCH-ENDS-THE-REST
+   0 NAPS ! ar POLLING-IGNORES-LOCAL-CHANGES
+   0 NAPS ! ar AN-UNLISTABLE-FOLDER-KEEPS-THE-DAEMON-POLLING ;
 
 \ AUTH reads its credential from a directory under TMPDIR.
 : RUN-CASES ( ^ARENA:arena -- )

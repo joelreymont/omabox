@@ -2,39 +2,50 @@
 \* The daemon's run, DAEMON-RUN in src/daemon.f. It prepares its paths,
 \* takes the instance lock, opens the journal, tells systemd it is ready,
 \* validates its configuration, starts a Dropbox session and validates it,
-\* then syncs and long-polls. A failure that continues waits and tries its
-\* state again, a failed long poll from syncing; one that stops ends the
-\* run. held is what the run has made that a later step reads; failure is
-\* the last failure's disposition, continues (retry, environmental) or
-\* stops (user-action, invariant), none before one; pass is how the last
-\* pass that completed or met local changes ended, none before one.
+\* then syncs and long-polls. Resting is polling after a pass that rested,
+\* changed nothing with the watch armed and no folder stirred: only a
+\* Dropbox change, a local change or the hourly full scan runs the next
+\* pass. Settling waits, after a local change, until the root keeps still
+\* or LONG-POLL-S has passed.
+\* A failure that continues waits and tries its state again, a failed long
+\* poll or settling from syncing; one that stops ends the run. held is
+\* what the run has made that a later step reads; failure is the last
+\* failure's disposition, continues (retry, environmental) or stops
+\* (user-action, invariant), none before one; pass is how the last pass
+\* that completed or met local changes ended, none before one.
 
 States == {"preparing", "locking", "opening", "notifying", "configuring",
-    "starting", "validating", "syncing", "polling", "stopped"}
+    "starting", "validating", "syncing", "polling", "resting", "settling",
+    "stopped"}
 Tried == States \ {"stopped"}
+Waiting == {"polling", "resting", "settling"}
 
 \* What each state's step reads or relies on: the lock keeps a second
 \* daemon off the journal, readiness tells systemd both are held, and a
 \* pass or a long poll runs only on a session validated against the
-\* journal's binding.
+\* journal's binding; settling stirs the journal's watch records.
 Needs == [preparing |-> {}, locking |-> {"paths"},
     opening |-> {"paths", "lock"}, notifying |-> {"lock", "journal"},
     configuring |-> {"paths"}, starting |-> {"journal", "config"},
     validating |-> {"journal", "session"},
     syncing |-> {"journal", "config", "validated"},
-    polling |-> {"journal", "validated"}, stopped |-> {}]
+    polling |-> {"journal", "validated"},
+    resting |-> {"journal", "validated"}, settling |-> {"journal"},
+    stopped |-> {}]
 
 \* What each state's step makes when it succeeds.
 Gives == [preparing |-> {"paths"}, locking |-> {"lock"},
     opening |-> {"journal"}, notifying |-> {}, configuring |-> {"config"},
     starting |-> {"session"}, validating |-> {"validated"},
-    syncing |-> {}, polling |-> {}, stopped |-> {}]
+    syncing |-> {}, polling |-> {}, resting |-> {}, settling |-> {},
+    stopped |-> {}]
 
-\* Where each step that succeeds goes; a pass's are Complete and Fresh.
+\* Where each step that succeeds goes; a pass's are Complete, Rest and
+\* Fresh, a wait's Cycle, Stir and Wait.
 After == [preparing |-> "locking", locking |-> "opening",
     opening |-> "notifying", notifying |-> "configuring",
     configuring |-> "starting", starting |-> "validating",
-    validating |-> "syncing", polling |-> "syncing"]
+    validating |-> "syncing"]
 
 VARIABLES state, held, failure, pass
 
@@ -59,15 +70,41 @@ Complete ==
     /\ pass' = "complete"
     /\ UNCHANGED <<held, failure>>
 
+\* A pass that completed and changed nothing, the watch armed, none stirred.
+Rest ==
+    /\ state = "syncing"
+    /\ state' = "resting"
+    /\ pass' = "rested"
+    /\ UNCHANGED <<held, failure>>
+
 \* Local state changed during the pass, which runs again.
 Fresh ==
     /\ state = "syncing"
     /\ pass' = "fresh"
     /\ UNCHANGED <<state, held, failure>>
 
+\* Dropbox changed, the hourly full scan is due, a long poll from polling
+\* ended, or the root kept still: a pass runs.
+Cycle ==
+    /\ state \in Waiting
+    /\ state' = "syncing"
+    /\ UNCHANGED <<held, failure, pass>>
+
+\* A local change ends the wait; the root settles before the pass.
+Stir ==
+    /\ state = "resting"
+    /\ state' = "settling"
+    /\ UNCHANGED <<held, failure, pass>>
+
+\* Resting through a long poll that found no change, or settling on while
+\* the watch hears more.
+Wait ==
+    /\ state \in {"resting", "settling"}
+    /\ UNCHANGED vars
+
 Retry ==
     /\ state \in Tried
-    /\ state' = IF state = "polling" THEN "syncing" ELSE state
+    /\ state' = IF state \in Waiting THEN "syncing" ELSE state
     /\ failure' = "continues"
     /\ UNCHANGED <<held, pass>>
 
@@ -77,7 +114,8 @@ Stop ==
     /\ failure' = "stops"
     /\ UNCHANGED <<held, pass>>
 
-Next == Ok \/ Complete \/ Fresh \/ Retry \/ Stop
+Next == Ok \/ Complete \/ Rest \/ Fresh \/ Cycle \/ Stir \/ Wait \/ Retry
+    \/ Stop
 
 Spec == Init /\ [][Next]_vars
 
@@ -86,9 +124,14 @@ Spec == Init /\ [][Next]_vars
 \* the run holds none.
 Ordered == Needs[state] \subseteq held /\ Gives[state] \cap held = {}
 
-\* The daemon long-polls only after a pass completed; a pass that found
-\* local changes, or failed, runs again first.
-PollsAfterPass == state = "polling" => pass = "complete"
+\* The daemon long-polls or settles only after a pass completed; a pass
+\* that found local changes, or failed, runs again first.
+PollsAfterPass ==
+    /\ state = "polling" => pass = "complete"
+    /\ state \in {"resting", "settling"} => pass \in {"complete", "rested"}
+
+\* The daemon rests only after a pass that rested.
+RestsAfterRest == state = "resting" => pass = "rested"
 
 \* Only a failure that stops ends the run; STOP and the exit status read
 \* it.
