@@ -1672,18 +1672,18 @@ $2F constant SLASH
       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)" ;
 
 \ The stored observations and the active generation's cached hashes
-\ after the path ?1, merged by path; a hash row's kind is NO-KIND.
+\ from the path ?1 on, merged by path; a hash row's kind is NO-KIND.
 \ Both selects read in index order, so SQLite merges them unsorted.
 : STREAM-SCAN ( -- str )
    s" SELECT path, kind, content, NULL, NULL, NULL, NULL, NULL, NULL
-      FROM local_observations WHERE path > ?1
+      FROM local_observations WHERE path >= ?1
       UNION ALL
       SELECT path, -1, content_hash, inode, size, modified_seconds,
          modified_nanoseconds, changed_seconds, changed_nanoseconds
       FROM local_hash_cache
       WHERE root_generation = (SELECT generation
             FROM local_root_binding WHERE singleton = 1)
-         AND path > ?1
+         AND path >= ?1
       ORDER BY 1" ;
 
 : SCAN-TABLES ( -- str )
@@ -1774,10 +1774,21 @@ $2F constant SLASH
    st ROW-AHEAD? 0= if false exit then
    0 SQLITE:COL-BLOB st STORED-PATH @ STR:= ;
 
-\ The stream reset, then resumed after the held path.
+\ s followed by the byte b, laid in ar.
+: SUFFIXED ( str n ^ARENA:arena -- str )
+   {: s:str b ar :}
+   s str> {: a:^ u:n :}
+   ar u 1+ ARENA:ALLOC drop {: dst:^ :}
+   a dst u BYTE-COPY
+   b dst u + c!
+   dst u 1+ >str ;
+
+\ The stream reset, then resumed at the least path above the held one:
+\ the held path followed by a zero byte.
 : RESUMED ( SQLITE:statement ^stored -- SQLITE:statement )
    {: st :}
-   SQLITE:RESET st STORED-PATH @ 1 SQLITE:BIND-BLOB
+   st STORED-PATH @ 0 st STORED-GROUP @ SUFFIXED {: k:str :}
+   SQLITE:RESET k 1 SQLITE:BIND-BLOB
    0 st STORED-ROWS ! st STEPPED ;
 
 \ The rows at the path the stream stands on, held as the group.
@@ -1797,11 +1808,29 @@ $2F constant SLASH
    st ROW-AHEAD? 0= if exit then
    st STORED-ROWS @ BATCH-BOUND >= if st RESUMED then ;
 
+\ The stream reset and resumed at the path k, its first group held.
+: SOUGHT ( SQLITE:statement str ^stored -- SQLITE:statement )
+   {: k:str st :}
+   SQLITE:RESET k 1 SQLITE:BIND-BLOB
+   0 st STORED-ROWS ! st STEPPED st NEXT-GROUP ;
+
 \ The stream from the first stored path, its first group held.
 : STREAM-OPENED ( SQLITE:statement ^stored -- SQLITE:statement )
    {: st :}
-   s" " 1 SQLITE:BIND-BLOB
-   0 st STORED-ROWS ! st STEPPED st NEXT-GROUP ;
+   s" " st SOUGHT ;
+
+\ The group held dropped, staging nothing; the stream reads main no
+\ more.
+: GROUP-DROPPED ( SQLITE:statement ^stored -- SQLITE:statement )
+   {: st :}
+   SQLITE:RESET construct stored-state ended st STORED-STATE ! ;
+
+\ The first path beneath the folder at p, laid in ar: p then "/", and
+\ "" for the root's "".
+: RANGE-START ( str ^ARENA:arena -- str )
+   {: p:str ar :}
+   p str> nip 0= if p exit then
+   p SLASH ar SUFFIXED ;
 
 \ Whether a group is held below p.
 : BELOW? ( str ^stored -- bool )
@@ -2196,7 +2225,8 @@ public
 
 \ Runs body over a scan that starts empty, to publish with PUBLISH-SCAN;
 \ body hands the scan back. The walk's SCAN-FILE and SCAN-SEEN calls
-\ come first, in path byte order, and end at EACH-SCAN-JOB or
+\ come first, in path byte order through the whole walk or within each
+\ range from SCAN-FROM to SCAN-TO, and end at EACH-SCAN-JOB or
 \ PUBLISH-SCAN. However body ends, by returning or by a throw, every
 \ folder it marked listed and did not publish is stirred again.
 : WITH-SCAN ( R journal [ R scan -- S scan ] -- S )
@@ -2232,6 +2262,39 @@ public
    p st AT? if r st ar SEEN-REACHED
    else r true false ar SEEN-STAGED then
    r UNKNOWN-RECORD? if p st UNKNOWN-HELD then
+   st j ar SCAN-MAKE ;
+
+\ The folder at p, not entered, at its subtree's turn: stored groups
+\ below p then "/" the walk passed over are gone; those beneath p stay.
+: SCAN-SKIP ( scan str -- scan )
+   {: p:str :}
+   SCAN-UNMAKE {: st j ar :}
+   p SLASH ar SUFFIXED st PASSED-BELOW
+   p SLASH 1+ ar SUFFIXED {: past:str :}
+   past st BELOW? if past st SOUGHT then
+   ar ARENA:RESET
+   st j ar SCAN-MAKE ;
+
+\ Starts the range of the folder at p, "" the root's: the group held is
+\ dropped, staging nothing, and the stream starts anew beneath p.
+: SCAN-FROM ( scan str -- scan )
+   {: p:str :}
+   SCAN-UNMAKE {: st j ar :}
+   st STORED-UNKNOWN @ 0 VEC:RESIZE
+   st STORED-PREFIXES @ 0 VEC:RESIZE
+   p ar RANGE-START st SOUGHT
+   ar ARENA:RESET
+   st j ar SCAN-MAKE ;
+
+\ Ends the range of the folder at p: stored groups beneath p the walk
+\ passed over are gone, and the stream stops until the next SCAN-FROM.
+: SCAN-TO ( scan str -- scan )
+   {: p:str :}
+   SCAN-UNMAKE {: st j ar :}
+   p str> nip 0= if st STREAM-ENDED
+   else p SLASH 1+ ar SUFFIXED st PASSED-BELOW then
+   st GROUP-DROPPED
+   ar ARENA:RESET
    st j ar SCAN-MAKE ;
 
 \ Records the observation in the scan, replacing one at its path.

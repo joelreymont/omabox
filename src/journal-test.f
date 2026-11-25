@@ -20,7 +20,10 @@
 \ but cached hashes kept; the cached hashes SCAN-FILE reuses and those
 \ it hashes again; no transaction left open by a throw out of
 \ WITH-SCAN, a visit holding no lock of the scan before it, and a scan
-\ that fills its temporary database leaving the next scan whole;
+\ that fills its temporary database leaving the next scan whole; a
+\ folder skipped at its subtree's turn keeping its stored rows, and the
+\ rows the walk passed over before it staged gone; a range,
+\ one or two in a scan, merging only beneath its folder;
 \ watched folders clean once a published scan listed them, stirred
 \ again when a scan ends unpublished or refused, answered stirred in
 \ path byte order, replaced, forgotten and reset;
@@ -2045,6 +2048,215 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
    j b ar MANY-STORED
    j [: ar NONE-STAGED ;] WITH-SCAN
    j [: ar ONE-GONE ;] WITH-SCAN
+   j CLOSE
+   d GONE ;
+
+\ ---- skips and ranges
+
+\ The stored tree: the directory "a" over the file "a/x", its hash
+\ cached, and the file "a/y"; the files "a-b" and "b", hashes cached.
+: SKIP-STORED ( journal local-root-binding ^ARENA:arena -- )
+   {: j b ar :}
+   ar LOCALS {: obs :}  ar HASHES {: hashes :}
+   s" a" DIRECTORY-LOCAL obs LOCAL+
+   s" a-b" 1 obs hashes ar CACHED+
+   s" a/x" 2 obs hashes ar CACHED+
+   s" a/y" 3 ar LOCAL-HASH CACHED-FILE obs LOCAL+
+   s" b" 4 obs hashes ar CACHED+
+   j b obs hashes PUBLISH-LOCAL-SCAN TTRUE ;
+
+\ The walk sees "a" and "a-b" unchanged, skips "a" at its subtree's
+\ turn, then sees "b" become a directory: only "b" is staged, its hash
+\ gone.
+: SKIP-WALKED ( scan local-root-binding ^ARENA:arena -- scan )
+   {: b ar :}
+   s" a" DIRECTORY-LOCAL SCAN-SEEN
+   s" a-b" 1 ar WALKED-FILE
+   s" a" SCAN-SKIP
+   s" b" DIRECTORY-LOCAL SCAN-SEEN
+   WALK-ENDED SCAN-COUNTS {: jobs:n staged:n hashes:n :}
+   jobs 0 T= staged 1 T= hashes 1 T=
+   b PUBLISH-SCAN TTRUE ;
+
+\ The rows beneath "a" and the hash at "a/x" stay.
+: SKIP-PUBLISHED ( journal ^ARENA:arena -- )
+   {: j ar :}
+   ar LOCALS {: obs :}  ar HASHES {: hashes :}
+   s" a" DIRECTORY-LOCAL obs LOCAL+
+   s" a-b" 1 obs hashes ar CACHED+
+   s" a/x" 2 obs hashes ar CACHED+
+   s" a/y" 3 ar LOCAL-HASH CACHED-FILE obs LOCAL+
+   s" b" DIRECTORY-LOCAL obs LOCAL+
+   j ar LOCAL-INVENTORY obs LOCAL-RECORDS= TTRUE
+   j ar LOCAL-HASH-CACHE hashes HASH-RECORDS= TTRUE ;
+
+: A-SKIPPED-FOLDER-KEEPS-ITS-STORED-ROWS ( ^ARENA:arena -- )
+   {: ar :}
+   s" a skipped folder keeps its stored rows" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   j b ar SKIP-STORED
+   j [: b ar SKIP-WALKED ;] WITH-SCAN
+   j ar SKIP-PUBLISHED
+   j CLOSE
+   d GONE ;
+
+\ The stored tree: the directory "a" over the file "a/x"; the files
+\ "a-b" and "b". Each file's hash is cached.
+: PASSED-STORED ( journal local-root-binding ^ARENA:arena -- )
+   {: j b ar :}
+   ar LOCALS {: obs :}  ar HASHES {: hashes :}
+   s" a" DIRECTORY-LOCAL obs LOCAL+
+   s" a-b" 1 obs hashes ar CACHED+
+   s" a/x" 2 obs hashes ar CACHED+
+   s" b" 3 obs hashes ar CACHED+
+   j b obs hashes PUBLISH-LOCAL-SCAN TTRUE ;
+
+\ The walk sees "a", never "a-b", skips "a" at its subtree's turn, then
+\ sees "b" unchanged: only "a-b" is staged gone, with its hash.
+: PASSED-WALKED ( scan local-root-binding ^ARENA:arena -- scan )
+   {: b ar :}
+   s" a" DIRECTORY-LOCAL SCAN-SEEN
+   s" a" SCAN-SKIP
+   s" b" 3 ar WALKED-FILE
+   WALK-ENDED SCAN-COUNTS {: jobs:n staged:n hashes:n :}
+   jobs 0 T= staged 1 T= hashes 1 T=
+   b PUBLISH-SCAN TTRUE ;
+
+\ "a-b" and its hash are gone; "a/x" and its hash stay.
+: PASSED-PUBLISHED ( journal ^ARENA:arena -- )
+   {: j ar :}
+   ar LOCALS {: obs :}  ar HASHES {: hashes :}
+   s" a" DIRECTORY-LOCAL obs LOCAL+
+   s" a/x" 2 obs hashes ar CACHED+
+   s" b" 3 obs hashes ar CACHED+
+   j ar LOCAL-INVENTORY obs LOCAL-RECORDS= TTRUE
+   j ar LOCAL-HASH-CACHE hashes HASH-RECORDS= TTRUE ;
+
+: A-SKIP-STAGES-GONE-WHAT-THE-WALK-PASSED-OVER ( ^ARENA:arena -- )
+   {: ar :}
+   s" a skip stages gone what the walk passed over" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   j b ar PASSED-STORED
+   j [: b ar PASSED-WALKED ;] WITH-SCAN
+   j ar PASSED-PUBLISHED
+   j CLOSE
+   d GONE ;
+
+\ p, "/" and q, laid in ar.
+: JOINED ( str str ^ARENA:arena -- str )
+   {: p:str q:str ar :}
+   p str> {: pa:^ pu:n :}  q str> {: qa:^ qu:n :}
+   ar pu qu + 1+ ARENA:ALLOC drop {: dst:^ :}
+   pa dst pu BYTE-COPY
+   [char] / dst pu + c!
+   qa dst pu + 1+ qu BYTE-COPY
+   dst pu qu + 1+ >str ;
+
+\ The folder f as stored, markers from m: the directories f and "f/w",
+\ the files "f/w/k", "f/x", "f/y" and "f/z", their hashes cached.
+: TREE-STORED+
+   ( str n ^VEC:vector<MODEL:local-record>
+     ^VEC:vector<MODEL:hash-record> ^ARENA:arena -- )
+   {: f:str m obs hashes ar :}
+   f DIRECTORY-LOCAL obs LOCAL+
+   f s" w" ar JOINED DIRECTORY-LOCAL obs LOCAL+
+   f s" w/k" ar JOINED m 1+ obs hashes ar CACHED+
+   f s" x" ar JOINED m 2 + obs hashes ar CACHED+
+   f s" y" ar JOINED m 3 + obs hashes ar CACHED+
+   f s" z" ar JOINED m 4 + obs hashes ar CACHED+ ;
+
+\ The folder f once its range is walked: "f/x" hashed again by its
+\ visit, "f/y" gone, the rest as stored.
+: TREE-WALKED+
+   ( str n ^VEC:vector<MODEL:local-record>
+     ^VEC:vector<MODEL:hash-record> ^ARENA:arena -- )
+   {: f:str m obs hashes ar :}
+   f DIRECTORY-LOCAL obs LOCAL+
+   f s" w" ar JOINED DIRECTORY-LOCAL obs LOCAL+
+   f s" w/k" ar JOINED m 1+ obs hashes ar CACHED+
+   f s" x" ar JOINED m 9 + ar B-RECORD {: h :}
+   h CACHED-FILE obs LOCAL+  h hashes HASH+
+   f s" z" ar JOINED m 4 + obs hashes ar CACHED+ ;
+
+\ The stored tree: the file "a", the folder "d" from marker 10, the
+\ file "e" and the folder "h" from marker 20.
+: RANGES-STORED ( journal local-root-binding ^ARENA:arena -- )
+   {: j b ar :}
+   ar LOCALS {: obs :}  ar HASHES {: hashes :}
+   s" a" 1 obs hashes ar CACHED+
+   s" d" 10 obs hashes ar TREE-STORED+
+   s" e" 2 obs hashes ar CACHED+
+   s" h" 20 obs hashes ar TREE-STORED+
+   j b obs hashes PUBLISH-LOCAL-SCAN TTRUE ;
+
+\ The range of the folder f, markers from m: the walk sees "f/w" and
+\ skips it at its subtree's turn, sees "f/x" changed and "f/z" as
+\ stored, and misses "f/y".
+: RANGE-WALKED ( scan str n ^ARENA:arena -- scan )
+   {: f:str m ar :}
+   f SCAN-FROM
+   f s" w" ar JOINED {: w:str :}
+   w DIRECTORY-LOCAL SCAN-SEEN
+   w SCAN-SKIP
+   f s" x" ar JOINED m 9 + ar WALKED-FILE
+   f s" z" ar JOINED m 4 + ar WALKED-FILE
+   f SCAN-TO ;
+
+\ After n ranges the walk's end stages nothing more: a job at each
+\ "f/x", each "f/y" gone and the hashes at both; the visits hash each
+\ "f/x", then the scan is published.
+: RANGES-PUBLISHED ( scan local-root-binding n ^ARENA:arena -- scan )
+   {: b n ar :}
+   WALK-ENDED SCAN-COUNTS {: jobs:n staged:n hashes:n :}
+   jobs n T= staged n T= hashes n 2 * T=
+   [: ar MERGE-VISIT ;] EACH-SCAN-JOB
+   b PUBLISH-SCAN TTRUE ;
+
+: ONE-RANGE ( scan local-root-binding ^ARENA:arena -- scan )
+   {: b ar :}
+   s" d" 10 ar RANGE-WALKED
+   b 1 ar RANGES-PUBLISHED ;
+
+: TWO-RANGES ( scan local-root-binding ^ARENA:arena -- scan )
+   {: b ar :}
+   s" d" 10 ar RANGE-WALKED
+   s" h" 20 ar RANGE-WALKED
+   b 2 ar RANGES-PUBLISHED ;
+
+\ The published rows: "d" walked, and "h" walked when both holds, else
+\ as stored; "a" and "e" as stored.
+: RANGES-HELD ( journal bool ^ARENA:arena -- )
+   {: j both:bool ar :}
+   ar LOCALS {: obs :}  ar HASHES {: hashes :}
+   s" a" 1 obs hashes ar CACHED+
+   s" d" 10 obs hashes ar TREE-WALKED+
+   s" e" 2 obs hashes ar CACHED+
+   both if s" h" 20 obs hashes ar TREE-WALKED+
+   else s" h" 20 obs hashes ar TREE-STORED+ then
+   j ar LOCAL-INVENTORY obs LOCAL-RECORDS= TTRUE
+   j ar LOCAL-HASH-CACHE hashes HASH-RECORDS= TTRUE ;
+
+: A-RANGE-MERGES-ONLY-BENEATH-ITS-FOLDER ( ^ARENA:arena -- )
+   {: ar :}
+   s" a range merges only beneath its folder" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   j b ar RANGES-STORED
+   j [: b ar ONE-RANGE ;] WITH-SCAN
+   j false ar RANGES-HELD
+   j CLOSE
+   d GONE ;
+
+: TWO-RANGES-IN-ONE-SCAN-MERGE-EACH-FOLDER ( ^ARENA:arena -- )
+   {: ar :}
+   s" two ranges in one scan merge each folder" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   j b ar RANGES-STORED
+   j [: b ar TWO-RANGES ;] WITH-SCAN
+   j true ar RANGES-HELD
    j CLOSE
    d GONE ;
 
@@ -5222,6 +5434,10 @@ variable CRAFT
    ar A-VISIT-PUBLISHES-WHAT-IT-OBSERVES-AND-HASHES
    ar THE-SCAN-STAGES-ONLY-WHAT-DIFFERS
    ar A-STORED-STREAM-RESUMES-PAST-ITS-BOUND
+   ar A-SKIPPED-FOLDER-KEEPS-ITS-STORED-ROWS
+   ar A-SKIP-STAGES-GONE-WHAT-THE-WALK-PASSED-OVER
+   ar A-RANGE-MERGES-ONLY-BENEATH-ITS-FOLDER
+   ar TWO-RANGES-IN-ONE-SCAN-MERGE-EACH-FOLDER
    ar SCAN-FILE-REUSES-ONLY-REUSABLE-HASHES
    ar A-THROW-OUT-OF-WITH-SCAN-LEAVES-NO-TRANSACTION-OPEN
    ar A-VISIT-HOLDS-NO-LOCK-OF-THE-SCAN-BEFORE-IT
