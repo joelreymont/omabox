@@ -11,8 +11,8 @@
 \ LOCAL-HASH-CACHE answers the active root's hash cache,
 \ PUBLISH-LOCAL-SCAN publishes given observations and hashes as one
 \ scan, and SCAN-COUNTS answers how many files a scan has still to hash
-\ and cached hashes still to revalidate. Tests alone load this file;
-\ nothing in the program calls these words.
+\ and how many observations and hashes it staged. Tests alone load this
+\ file; nothing in the program calls these words.
 \ STORAGE CLASS. CALLER-OWNED, as JOURNAL's: a record answered lies in the
 \ arena the caller passes. TASK-LOCAL: the bytes CHANGE-COUNTER reads,
 \ TASK:+USERS rows.
@@ -90,12 +90,13 @@ EXPORT LOCAL-RECORDS=
       b PUBLISH-SCAN swap
    ;] WITH-SCAN ;
 
-\ The scan's files still to hash, then its cached hashes still to
-\ revalidate; both stay in the scan.
-: SCAN-COUNTS ( scan -- scan n n )
+\ The scan's files still to hash, then the observations and the hashes
+\ it staged, gone ones among them; all stay in the scan.
+: SCAN-COUNTS ( scan -- scan n n n )
    SCAN-JOURNAL >CONNECTION {: c :}
    c s" SELECT COUNT(*) FROM temp.scan_jobs" QUERY-INT
-   c s" SELECT COUNT(*) FROM temp.scan_cached" QUERY-INT ;
+   c s" SELECT COUNT(*) FROM temp.scan_observations" QUERY-INT
+   c s" SELECT COUNT(*) FROM temp.scan_hashes" QUERY-INT ;
 
 private
 
