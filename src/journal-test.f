@@ -21,6 +21,9 @@
 \ it hashes again; no transaction left open by a throw out of
 \ WITH-SCAN, a visit holding no lock of the scan before it, and a scan
 \ that fills its temporary database leaving the next scan whole;
+\ watched folders clean once a published scan listed them, stirred
+\ again when a scan ends unpublished or refused, answered stirred in
+\ path byte order, replaced, forgotten and reset;
 \ src/oracle/journal.sqlite3, copied and opened, giving journal.tsv's
 \ Dropbox and local root bindings, local and remote inventories, remote
 \ cursor, baselines, baseline paths, pending and blocked plans, pending
@@ -2227,6 +2230,156 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
    j b r ar ONE-LOCAL h ar ONE-HASH PUBLISH-LOCAL-SCAN TTRUE
    j ar LOCAL-INVENTORY r ar ONE-LOCAL LOCAL-RECORDS= TTRUE
    j ar LOCAL-HASH-CACHE h ar ONE-HASH HASH-RECORDS= TTRUE
+   j CLOSE
+   d GONE ;
+
+
+\ ---- watched folders ---------------------------------------------
+
+: STIRRED-AT? ( option<stirred> n str -- bool )
+   {: n p:str :}
+   MATCH option
+      none OF false ENDOF
+      some OF
+         JOURNAL-STIRRED:UNMAKE {: wd q:str :}
+         wd n = q p STR:= and
+      ENDOF
+   ;MATCH ;
+
+: NONE-STIRRED? ( option<stirred> -- bool )
+   MATCH option
+      none OF true ENDOF
+      some OF drop false ENDOF
+   ;MATCH ;
+
+: WATCH-COUNT ( journal -- n )
+   >CONNECTION s" SELECT COUNT(*) FROM temp.watches" QUERY-INT ;
+
+: MARK-1 ( journal -- n )
+   >CONNECTION s" SELECT mark FROM temp.watches WHERE wd = 1" QUERY-INT ;
+
+\ Lists wd 1's folder and publishes the scan.
+: LISTED-PUBLISHED ( scan journal local-root-binding -- scan )
+   {: j b :}
+   j 1 WATCH-LISTED  b PUBLISH-SCAN TTRUE ;
+
+: A-PUBLISHED-LISTED-FOLDER-IS-CLEAN ( ^ARENA:arena -- )
+   {: ar :}
+   s" a recorded, listed and published folder is clean" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   j 1 s" a" WATCH-RECORD
+   j 1 s" a" WATCH-CLEAN? TFALSE
+   j [: j b LISTED-PUBLISHED ;] WITH-SCAN
+   j 1 s" a" WATCH-CLEAN? TTRUE
+   j 1 s" b" WATCH-CLEAN? TFALSE
+   j 2 s" a" WATCH-CLEAN? TFALSE
+   j ar NEXT-STIRRED NONE-STIRRED? TTRUE
+   j CLOSE
+   d GONE ;
+
+\ Lists wd 1's folder, then the body throws.
+: LISTED-THROWN ( scan journal -- scan )
+   1 WATCH-LISTED  E-INVALID-STATE throw ;
+
+: AN-UNPUBLISHED-SCAN-STIRS-WHAT-IT-LISTED ( ^ARENA:arena -- )
+   {: ar :}
+   s" a scan that ends unpublished stirs what it listed" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   j 1 s" a" WATCH-RECORD
+   j [: j b LISTED-PUBLISHED ;] WITH-SCAN
+   j [: j 1 WATCH-LISTED ;] WITH-SCAN
+   j ar NEXT-STIRRED 1 s" a" STIRRED-AT? TTRUE
+   j [: j b LISTED-PUBLISHED ;] WITH-SCAN
+   [: j [: j LISTED-THROWN ;] WITH-SCAN ;] E-INVALID-STATE TTHROWSQ
+   j ar NEXT-STIRRED 1 s" a" STIRRED-AT? TTRUE
+   j CLOSE
+   d GONE ;
+
+\ Lists wd 1's folder; publishing for a root that is not active leaves
+\ it listed.
+: LISTED-STALE ( scan journal ^ARENA:arena -- scan )
+   {: j ar :}
+   j 1 WATCH-LISTED
+   s" /stale" 4 LOCAL-ROOT PUBLISH-SCAN TFALSE
+   j MARK-1 2 T=
+   j ar NEXT-STIRRED NONE-STIRRED? TTRUE ;
+
+: A-REFUSED-PUBLICATION-LEAVES-THE-MARKS ( ^ARENA:arena -- )
+   {: ar :}
+   s" a refused publication leaves the marks" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   j 1 s" a" WATCH-RECORD
+   j [: j ar LISTED-STALE ;] WITH-SCAN
+   j MARK-1 1 T=
+   j ar NEXT-STIRRED 1 s" a" STIRRED-AT? TTRUE
+   j CLOSE
+   d GONE ;
+
+\ Lists every folder and publishes the scan.
+: ALL-PUBLISHED ( scan journal local-root-binding -- scan )
+   {: j b :}
+   j 1 WATCH-LISTED  j 2 WATCH-LISTED  j 3 WATCH-LISTED
+   b PUBLISH-SCAN TTRUE ;
+
+\ Stirs a/x, then a-b, then lists them in the order NEXT-STIRRED
+\ answers them, a-b stirred again once listed.
+: STIRS-LISTED ( scan journal ^ARENA:arena -- scan )
+   {: j ar :}
+   j 1 WATCH-STIR
+   j ar NEXT-STIRRED 1 s" a/x" STIRRED-AT? TTRUE
+   j 2 WATCH-STIR
+   j ar NEXT-STIRRED 2 s" a-b" STIRRED-AT? TTRUE
+   j 2 WATCH-LISTED
+   j ar NEXT-STIRRED 1 s" a/x" STIRRED-AT? TTRUE
+   j 2 WATCH-STIR
+   j ar NEXT-STIRRED 2 s" a-b" STIRRED-AT? TTRUE
+   j 2 WATCH-LISTED
+   j 1 WATCH-LISTED
+   j ar NEXT-STIRRED NONE-STIRRED? TTRUE ;
+
+: NEXT-STIRRED-ANSWERS-IN-PATH-ORDER ( ^ARENA:arena -- )
+   {: ar :}
+   s" NEXT-STIRRED answers stirred folders in path order" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   j 1 s" a/x" WATCH-RECORD
+   j 2 s" a-b" WATCH-RECORD
+   j 3 s" a" WATCH-RECORD
+   j ar NEXT-STIRRED 3 s" a" STIRRED-AT? TTRUE
+   j [: j b ALL-PUBLISHED ;] WITH-SCAN
+   j ar NEXT-STIRRED NONE-STIRRED? TTRUE
+   j [: j ar STIRS-LISTED ;] WITH-SCAN
+   j ar NEXT-STIRRED 2 s" a-b" STIRRED-AT? TTRUE
+   j CLOSE
+   d GONE ;
+
+: WATCH-RECORDS-ARE-REPLACED-AND-FORGOTTEN ( ^ARENA:arena -- )
+   {: ar :}
+   s" watch records are replaced, stirred and forgotten" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   j 1 s" a" WATCH-RECORD
+   j 2 s" b" WATCH-RECORD
+   j [: j b ALL-PUBLISHED ;] WITH-SCAN
+   j 9 WATCH-STIR
+   j WATCH-COUNT 2 T=
+   j ar NEXT-STIRRED NONE-STIRRED? TTRUE
+   j 1 s" c" WATCH-RECORD
+   j WATCH-COUNT 2 T=
+   j 1 s" a" WATCH-CLEAN? TFALSE
+   j ar NEXT-STIRRED 1 s" c" STIRRED-AT? TTRUE
+   j 1 WATCH-FORGET
+   j WATCH-COUNT 1 T=
+   j ar NEXT-STIRRED NONE-STIRRED? TTRUE
+   j 2 s" b" WATCH-CLEAN? TTRUE
+   j 3 s" " WATCH-RECORD
+   j ar NEXT-STIRRED 3 s" " STIRRED-AT? TTRUE
+   j WATCHES-RESET
+   j WATCH-COUNT 0 T=
+   j 2 s" b" WATCH-CLEAN? TFALSE
    j CLOSE
    d GONE ;
 
@@ -5073,6 +5226,11 @@ variable CRAFT
    ar A-THROW-OUT-OF-WITH-SCAN-LEAVES-NO-TRANSACTION-OPEN
    ar A-VISIT-HOLDS-NO-LOCK-OF-THE-SCAN-BEFORE-IT
    ar A-FULL-SCAN-LEAVES-THE-NEXT-SCAN-WHOLE
+   ar A-PUBLISHED-LISTED-FOLDER-IS-CLEAN
+   ar AN-UNPUBLISHED-SCAN-STIRS-WHAT-IT-LISTED
+   ar A-REFUSED-PUBLICATION-LEAVES-THE-MARKS
+   ar NEXT-STIRRED-ANSWERS-IN-PATH-ORDER
+   ar WATCH-RECORDS-ARE-REPLACED-AND-FORGOTTEN
    ar ORACLE-JOURNAL-HOLDS-ITS-BASELINES
    ar JOURNAL-REOPEN-EXPOSES-INTENT-WITHOUT-ADVANCING-BASELINE
    ar RECONCILIATION-DECISIONS-COMMIT-ATOMICALLY

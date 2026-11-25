@@ -357,7 +357,8 @@ private
 \ the OS page cache holds the rest.
 \ The temporary database journals in memory, so a failed scan write
 \ rolls back, and does not zero freed pages, which would journal every
-\ page a pass's DELETE of its scan tables frees.
+\ page a pass's DELETE of its scan tables frees. temp.watches holds each
+\ watched folder's watch descriptor, journal path and mark.
 : CONFIGURE-WRITABLE ( journal -- )
    {: j :}
    j >CONNECTION {: c :}
@@ -365,6 +366,13 @@ private
    c s" PRAGMA temp.cache_size = -64" SQLITE:EXEC
    c s" PRAGMA temp.journal_mode = MEMORY" SQLITE:EXEC
    c s" PRAGMA temp.secure_delete = OFF" SQLITE:EXEC
+   c s" CREATE TABLE IF NOT EXISTS temp.watches(
+         wd INTEGER PRIMARY KEY,
+         path BLOB NOT NULL,
+         mark INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS temp.watches_stirred
+         ON watches(path) WHERE mark = 1" SQLITE:EXEC
    c s" PRAGMA foreign_keys = ON" SQLITE:EXEC
    c s" PRAGMA main.journal_mode = DELETE" [: DELETE-MODE? ;]
    SQLITE:WITH-STATEMENT 0= if
@@ -1379,6 +1387,100 @@ public
 private
 
 
+\ ---- watched folders -----------------------------------------------
+
+\ A watched folder's record: its watch descriptor, its journal path (the
+\ root ""), and its mark: 0 clean, 1 stirred, 2 listed by the running scan.
+
+public
+
+\ A stirred folder's watch descriptor and journal path.
+STRUCTURE stirred
+   FIELD wd n
+   FIELD path str
+;STRUCTURE
+
+private
+
+\ Runs the statement on wd n, bound to ?1.
+: ON-WD ( journal n str -- )
+   {: j n sql:str :}
+   j >CONNECTION sql [: n 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT ;
+
+: CLEAN-ROW ( SQLITE:statement -- bool SQLITE:statement )
+   SQLITE:STEP swap ;
+
+: NO-STIRRED ( -- option<stirred> ) OPTION:NONE ;
+
+: STIRRED-ROW
+   ( SQLITE:statement ^ARENA:arena
+     -- option<stirred> SQLITE:statement )
+   {: ar :}
+   SQLITE:STEP 0= if NO-STIRRED swap exit then
+   0 SQLITE:COL-INT {: n :}
+   1 ar BLOB-COPY {: p:str :}
+   n p JOURNAL-STIRRED:MAKE OPTION:SOME swap ;
+
+\ Every folder the scan listed is stirred again: the scan ended unpublished.
+: LISTED-STIRRED ( journal -- )
+   >CONNECTION s" UPDATE temp.watches SET mark = 1 WHERE mark = 2"
+   SQLITE:EXEC ;
+
+\ Every folder the scan listed is clean: its publication is committing.
+: LISTED-CLEANED ( journal -- )
+   >CONNECTION s" UPDATE temp.watches SET mark = 0 WHERE mark = 2"
+   SQLITE:EXEC ;
+
+public
+
+\ Forgets every watched folder.
+: WATCHES-RESET ( journal -- )
+   >CONNECTION s" DELETE FROM temp.watches" SQLITE:EXEC ;
+
+\ Records wd n watching the folder at path str, stirred, replacing the
+\ record of wd n.
+: WATCH-RECORD ( journal n str -- )
+   {: j n p:str :}
+   j >CONNECTION
+   s" INSERT OR REPLACE INTO temp.watches(wd, path, mark)
+      VALUES (?1, ?2, 1)"
+   [: n 1 SQLITE:BIND-INT p 2 SQLITE:BIND-BLOB SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT ;
+
+\ Whether wd n watches the folder at path str and a published scan
+\ listed it with nothing stirred since.
+: WATCH-CLEAN? ( journal n str -- bool )
+   {: j n p:str :}
+   j >CONNECTION
+   s" SELECT 1 FROM temp.watches WHERE wd = ?1 AND path = ?2 AND mark = 0"
+   [: n 1 SQLITE:BIND-INT p 2 SQLITE:BIND-BLOB CLEAN-ROW ;]
+   SQLITE:WITH-STATEMENT ;
+
+\ Marks wd n's folder stirred; an unrecorded wd changes nothing.
+: WATCH-STIR ( journal n -- )
+   s" UPDATE temp.watches SET mark = 1 WHERE wd = ?1" ON-WD ;
+
+\ Marks wd n's folder listed by the running scan.
+: WATCH-LISTED ( journal n -- )
+   s" UPDATE temp.watches SET mark = 2 WHERE wd = ?1" ON-WD ;
+
+\ Forgets wd n's record.
+: WATCH-FORGET ( journal n -- )
+   s" DELETE FROM temp.watches WHERE wd = ?1" ON-WD ;
+
+\ The stirred folder first in path byte order, its path in ar; none when
+\ no folder is stirred.
+: NEXT-STIRRED ( journal ^ARENA:arena -- option<stirred> )
+   {: j ar :}
+   j >CONNECTION
+   s" SELECT wd, path FROM temp.watches WHERE mark = 1
+      ORDER BY path LIMIT 1" [: ar STIRRED-ROW ;]
+   SQLITE:WITH-STATEMENT ;
+
+private
+
+
 \ ---- the local scan ------------------------------------------------
 
 \ Where the stored stream stands: ended, no group held; last, a group
@@ -2082,17 +2184,27 @@ $2F constant SLASH
       some OF j b ACTIVE-DIFFERENCE ENDOF
    ;MATCH ;
 
+\ BOUND-DIFFERENCE, with every folder the scan listed made clean when it
+\ publishes.
+: PUBLISHED ( journal local-root-binding ^ARENA:arena -- bool )
+   {: j b ar :}
+   j b ar BOUND-DIFFERENCE {: done:bool :}
+   done if j LISTED-CLEANED then
+   done ;
+
 public
 
 \ Runs body over a scan that starts empty, to publish with PUBLISH-SCAN;
 \ body hands the scan back. The walk's SCAN-FILE and SCAN-SEEN calls
 \ come first, in path byte order, and end at EACH-SCAN-JOB or
-\ PUBLISH-SCAN.
+\ PUBLISH-SCAN. However body ends, by returning or by a throw, every
+\ folder it marked listed and did not publish is stirred again.
 : WITH-SCAN ( R journal [ R scan -- S scan ] -- S )
    {: j body :}
-   j >CONNECTION SCAN-TABLES SQLITE:EXEC
-   j >CONNECTION OBSERVE-SCAN [: j body HASH-PREPARED ;]
-   SQLITE:WITH-STATEMENT ;
+   [: j >CONNECTION SCAN-TABLES SQLITE:EXEC
+      j >CONNECTION OBSERVE-SCAN [: j body HASH-PREPARED ;]
+      SQLITE:WITH-STATEMENT ;]
+   [: j LISTED-STIRRED ;] finally ;
 
 \ The file the walk found at p with the fingerprint: nothing is staged
 \ when the active root's cache holds the fingerprint, both its times
@@ -2154,14 +2266,14 @@ public
    s" DELETE FROM temp.scan_jobs" EACH-ROW ;
 
 \ The walk over, applies what the scan staged to the local inventory
-\ and the active root's hash cache in one transaction, which an
-\ unchanged tree leaves without a write; false, nothing written, when
-\ binding is no longer the active root.
+\ and the active root's hash cache, and makes every folder it listed
+\ clean, in one transaction, which an unchanged tree leaves without a
+\ write; false, nothing written, when binding is no longer the active root.
 : PUBLISH-SCAN ( scan local-root-binding -- scan bool )
    {: b :}
    WALK-ENDED
    SCAN-JOURNAL {: j :}
-   j >CONNECTION [: j b [: BOUND-DIFFERENCE ;] ARENA:WITH ;]
+   j >CONNECTION [: j b [: PUBLISHED ;] ARENA:WITH ;]
    SQLITE:WITH-TRANSACTION ;
 
 private
