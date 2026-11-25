@@ -1263,9 +1263,10 @@ ARENA WATCHES watch
 \ The instance is already in the watch, with no watch added yet.
 : ARM ( ^watch -- ) WATCH-JOURNAL @ JOURNAL:WATCHES-RESET ;
 
+\ The records go before the instance: a failed reset leaves both.
 : BLIND ( ^watch -- )
    {: w :}
-   w CLOSED  w WATCH-JOURNAL @ JOURNAL:WATCHES-RESET
+   w WATCH-JOURNAL @ JOURNAL:WATCHES-RESET  w CLOSED
    NO-WD w WATCH-ROOT-WD ! ;
 
 \ An armed watch logs its next refusal, whatever errno was last logged.
@@ -1360,6 +1361,8 @@ FSM:DEFINE WATCHING ( ^watch ) watch-state watch-event
    j wd JOURNAL:WATCH-STIR ;
 
 \ The loss is stepped once the reads are done: it closes the instance.
+\ Any throw while hearing loses the events read, so it steps lost too; a
+\ failed read then answers 0, and any other throw is rethrown.
 : HEARD-ALL ( JOURNAL:journal ^watch fd -- n )
    {: j w f:fd :}
    false w WATCH-LOSS !
@@ -1367,8 +1370,8 @@ FSM:DEFINE WATCHING ( ^watch ) watch-state watch-event
    code 0= if
       w WATCH-LOSS @ if j w construct watch-event lost STEPPED then exit
    then
-   drop code INOTIFY:E-INOTIFY <> if code throw then
-   j w construct watch-event lost STEPPED 0 ;
+   drop j w construct watch-event lost STEPPED
+   code INOTIFY:E-INOTIFY <> if code throw then 0 ;
 
 \ due once the last full publication is SCAN-STANDS-S old, else start.
 : START-EVENT ( ^watch -- watch-event )

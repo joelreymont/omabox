@@ -15,7 +15,8 @@
 \ entry, and a converted denial logs nothing, that WATCHING's lines are
 \ formal/LocalWatch.tla's, through TEST-FORMAL:HOLDS, which runs TLC, and
 \ that a real watch hears changes in its folders, goes blind when its
-\ root moves or is in doubt, and arms anew once a full scan's listings
+\ root moves, its queue overflows, a throw cuts its hearing short or its
+\ root is in doubt, and arms anew once a full scan's listings
 \ no longer stand; that upload stage collection
 \ removes only verified unreferenced content; then each stage outcome,
 \ each inspected download stage, a stage marker set, read and removed, a
@@ -337,6 +338,19 @@ EXPORT WRITE-STAGE-OUTCOME
 EXPORT RESTORE-OR-PRESERVE-CHANGED-GUARD
 EXPORT CONFLICT-NAME
 EXPORT RENAME-CASE-VARIANT-WITH
+;package
+
+\ JOURNAL reopened: a scan case makes its watch records refuse a stir.
+package JOURNAL
+public
+
+\ Every later stir of the journal's watch records fails; a reset still
+\ empties them.
+: STIRS-REFUSED ( journal -- )
+   >CONNECTION
+   s" CREATE TEMP TRIGGER stirs_refused BEFORE UPDATE ON watches
+      BEGIN SELECT RAISE(ABORT, 'stir refused'); END" SQLITE:EXEC ;
+
 ;package
 
 \ LOCAL reopened for its scan's cases, which name its private types.
@@ -1993,6 +2007,54 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    s s" b/y" SCANNED-CONTENT s" y2" IDENTITY T$=
    WATCHER @ WATCH-FD FD-SOME? TTRUE ;
 
+\ The decimal number str leads with.
+: LEADING ( str -- n )
+   str> {: a:^ u:n :}
+   0 u 0 ?do
+      a i + c@ {: b:n :}
+      b [char] 0 < b [char] 9 > or if unloop exit then
+      10 * b [char] 0 - +
+   loop ;
+
+\ How many events an instance's queue holds before it overflows.
+: QUEUE-CAP ( -- n )
+   s" /proc/sys/fs/inotify/max_queued_events" READ-BUF 64 FS:READ-ALL
+   READ-BUF swap >str LEADING ;
+
+\ More changes in a than the instance's queue holds: a file written and
+\ removed, two events at least, as many times as the queue holds.
+: OVERFLOWING ( -- )
+   QUEUE-CAP 0 ?do s" a/f" s" f" WRITE  s" a/f" REMOVE loop ;
+
+\ An overflow heard blinds the watch: the next scan, in full, lists b,
+\ whose write went unheard.
+: AN-OVERFLOW-BLINDS-THE-WATCH ( -- )
+   s" an_overflow_blinds_the_watch" T-LABEL
+   s" a" MKDIR s" b" MKDIR s" b/y" s" y1" WRITE
+   PUBLISH
+   s" b/y" s" y2" WRITE  WATCHER @ DRAINED  OVERFLOWING
+   JNL @ WATCHER @ WATCH-HEAR drop
+   WATCHER @ STATE$ s" blind" T$=
+   WATCHER @ WATCH-INSTANCE @ FD-SOME? TFALSE
+   PUBLISH
+   INVENTORY s" b/y" SCANNED-CONTENT s" y2" IDENTITY T$= ;
+
+variable HEARD-CODE
+
+\ A write in a heard while the watch records refuse a stir: WATCH-HEAR
+\ rethrows the stir's failure, and the events it read are gone, so the
+\ watch is blind.
+: A-THROW-WHILE-HEARING-BLINDS-THE-WATCH ( -- )
+   s" a_throw_while_hearing_blinds_the_watch" T-LABEL
+   s" a" MKDIR
+   PUBLISH
+   JNL @ JOURNAL:STIRS-REFUSED  s" a/x" s" x1" WRITE
+   [: [: JNL @ WATCHER @ WATCH-HEAR drop ;] catch HEARD-CODE ! ;]
+   STDERR-OF s" stir refused" STR:COUNT-SUB 1 T=
+   HEARD-CODE @ SQLITE:E-SQL T=
+   WATCHER @ STATE$ s" blind" T$=
+   WATCHER @ WATCH-INSTANCE @ FD-SOME? TFALSE ;
+
 : CASES ( -- )
    [: SCAN-PUBLISHES-EMPTY-AND-NESTED-DIRECTORIES ;] IN-SCAN-CASE
    [: FILE-LOCKED-AFTER-ENUMERATION-IS-INACCESSIBLE ;] IN-SCAN-CASE
@@ -2052,6 +2114,8 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    [: ATTRIBUTES-ARE-LABELLED ;] IN-CASE
    FORMAL-HOLDS-THE-WATCH-TABLE
    [: A-WATCH-HEARS-ITS-FOLDERS-AND-BLINDS-ON-A-LOSS ;] IN-CASE
+   [: AN-OVERFLOW-BLINDS-THE-WATCH ;] IN-SCAN-CASE
+   [: A-THROW-WHILE-HEARING-BLINDS-THE-WATCH ;] IN-SCAN-CASE
    [: A-REFUSED-WATCH-LOGS-ONCE-PER-ARMING ;] IN-CASE
    [: A-PUBLISHED-SCAN-ARMS-THE-WATCH ;] IN-SCAN-CASE
    [: A-ROOT-CHANGED-SCAN-LEAVES-NO-FOLDER-CLEAN ;] IN-SCAN-CASE
