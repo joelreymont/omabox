@@ -41,9 +41,10 @@ General code goes into Habu's `src/lib`; sync policy stays here.
 These take a string as one `str`, as the rest of Habu does, except the
 `FS-ANCHORED` words, which take `^u8 n`.
 
-SHA-256 is already in Habu core (`src/core/sha256.f`). Inotify is not added:
-the daemon rescans after each 30 s long poll, as the Rust one does, and a
-watcher comes only for a measured need.
+SHA-256 is already in Habu core (`src/core/sha256.f`). A scan lists only the
+folders inotify named since the last scan listed them. It lists the whole
+tree, as the Rust daemon does every pass, at startup, after inotify's queue
+overflows or it refuses, and hourly.
 
 ## Omabox packages
 

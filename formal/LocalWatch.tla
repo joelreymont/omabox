@@ -2,13 +2,14 @@
 \* LOCAL's watch of a sync root's folders: WATCHING in src/local.f.
 \* state is the table's state and ev the event of the step a move takes,
 \* None for a move that steps nothing. Each folder has a journal record
-\* (none, clean, stirred, or listed by the running scan) and a kernel
-\* watch while the instance is open. A change in a folder queues an
-\* event when it is watched, else none; an overflow drops the event and
-\* queues a loss; a folder replaced loses its watch and queues an
+\* (none, clean, stirred, or listed or tried by the running scan) and a
+\* kernel watch while the instance is open. A change in a folder queues
+\* an event when it is watched, else none; an overflow drops the event
+\* and queues a loss; a folder replaced loses its watch and queues an
 \* ignored event. Hearing stirs, forgets or steps lost. A scan starts
 \* per the table, lists every folder unless armed, then only the folders
-\* not clean, adds each one's watch before listing it, and publishes or
+\* not clean, adds each one's watch before listing it (a listing that
+\* fails leaves it tried, stirred once the scan ends), and publishes or
 \* is abandoned; a scan that throws ends with no step. dirty holds the
 \* folders changed since their last published listing, fresh those the
 \* running scan listed with no change since.
@@ -18,7 +19,7 @@ States == {"blind", "arming", "armed"}
 Events ==
     {"start", "due", "published", "refused", "abandoned", "lost", "doubt"}
 None == "none"
-Records == {"none", "clean", "stirred", "listed"}
+Records == {"none", "clean", "stirred", "listed", "tried"}
 Phases == {"idle", "starting", "opening", "listing"}
 
 VARIABLES state, ev, rec, watched, queued, forgot, overflow,
@@ -180,6 +181,17 @@ ListBlind(f) ==
     /\ UNCHANGED <<state, rec, kernel>>
     /\ Listed(f)
 
+\* f's watch added, then its listing fails: f is tried, not listed.
+ListFailed(f) ==
+    /\ phase = "listing" /\ f \in todo
+    /\ state # "blind"
+    /\ watched' = [watched EXCEPT ![f] = TRUE]
+    /\ rec' = [rec EXCEPT ![f] = "tried"]
+    /\ ev' = None
+    /\ todo' = todo \ {f}
+    /\ UNCHANGED <<state, queued, forgot, overflow>>
+    /\ UNCHANGED <<dirty, fresh, phase>>
+
 \* inotify refuses f's watch; f is still listed.
 Refuse(f) ==
     /\ phase = "listing" /\ f \in todo
@@ -187,21 +199,26 @@ Refuse(f) ==
     /\ Step("refused", rec)
     /\ Listed(f)
 
-Cleaned(f) == IF rec[f] = "listed" THEN "clean" ELSE rec[f]
-Restirred(f) == IF rec[f] = "listed" THEN "stirred" ELSE rec[f]
+Cleaned(f) ==
+    CASE rec[f] = "listed" -> "clean"
+      [] rec[f] = "tried" -> "stirred"
+      [] OTHER -> rec[f]
+Restirred(f) ==
+    IF rec[f] \in {"listed", "tried"} THEN "stirred" ELSE rec[f]
 
 Ended ==
     /\ phase' = "idle" /\ todo' = {}
     /\ fresh' = Unwatched
 
-\* PUBLISH-SCAN's commit cleans what the scan listed.
+\* PUBLISH-SCAN's commit cleans what the scan listed and stirs what it
+\* tried.
 Publish ==
     /\ phase = "listing" /\ todo = {}
     /\ Step("published", [f \in Folders |-> Cleaned(f)])
     /\ dirty' = [f \in Folders |-> dirty[f] /\ ~fresh[f]]
     /\ Ended
 
-\* WITH-SCAN stirs again what an unpublished scan listed.
+\* WITH-SCAN stirs again what an unpublished scan listed or tried.
 Abandon ==
     /\ phase = "listing"
     /\ Step("abandoned", [f \in Folders |-> Restirred(f)])
@@ -218,7 +235,7 @@ Throw ==
 Next ==
     \/ \E f \in Folders :
         Change(f) \/ Overflow(f) \/ Replace(f)
-        \/ List(f) \/ ListBlind(f) \/ Refuse(f)
+        \/ List(f) \/ ListFailed(f) \/ ListBlind(f) \/ Refuse(f)
     \/ Hear \/ Lose \/ Doubt
     \/ Begin \/ StartArmed \/ StartArming \/ StartBlind \/ Open
     \/ Publish \/ Abandon \/ Throw
