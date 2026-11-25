@@ -357,8 +357,8 @@ private
 \ the OS page cache holds the rest.
 \ The temporary database journals in memory, so a failed scan write
 \ rolls back, and does not zero freed pages, which would journal every
-\ page a pass's DELETE of its scan tables frees. temp.watches holds each
-\ watched folder's watch descriptor, journal path and mark.
+\ page a pass's DELETE of its scan tables frees. temp.watches holds one
+\ record per watched folder: its watch descriptor, journal path and mark.
 : CONFIGURE-WRITABLE ( journal -- )
    {: j :}
    j >CONNECTION {: c :}
@@ -371,6 +371,8 @@ private
          path BLOB NOT NULL,
          mark INTEGER NOT NULL
       );
+      CREATE UNIQUE INDEX IF NOT EXISTS temp.watches_path
+         ON watches(path);
       CREATE INDEX IF NOT EXISTS temp.watches_stirred
          ON watches(path) WHERE mark = 1" SQLITE:EXEC
    c s" PRAGMA foreign_keys = ON" SQLITE:EXEC
@@ -1448,8 +1450,8 @@ public
 : WATCHES-RESET ( journal -- )
    >CONNECTION s" DELETE FROM temp.watches" SQLITE:EXEC ;
 
-\ Records wd n watching the folder at path str, replacing the record of
-\ wd n; the running scan tries the folder until WATCH-LISTED.
+\ Records wd n watching the folder at path str, replacing any record of
+\ wd n or at str; the running scan tries the folder until WATCH-LISTED.
 : WATCH-RECORD ( journal n str -- )
    {: j n p:str :}
    j >CONNECTION
@@ -1458,12 +1460,17 @@ public
    [: n 1 SQLITE:BIND-INT p 2 SQLITE:BIND-BLOB SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT ;
 
-\ Whether wd n watches the folder at path str and a published scan
-\ listed it with nothing stirred since.
+\ Whether wd n watches folder str, which a published scan listed with
+\ nothing stirred since and which is the root or published a directory.
 : WATCH-CLEAN? ( journal n str -- bool )
    {: j n p:str :}
    j >CONNECTION
-   s" SELECT 1 FROM temp.watches WHERE wd = ?1 AND path = ?2 AND mark = 0"
+   s" SELECT 1 FROM temp.watches AS w
+      WHERE w.wd = ?1 AND w.path = ?2 AND w.mark = 0
+         AND (length(w.path) = 0 OR EXISTS (
+            SELECT 1 FROM local_observations AS o
+            WHERE o.path = w.path AND o.kind = 1
+         ))"
    [: n 1 SQLITE:BIND-INT p 2 SQLITE:BIND-BLOB CLEAN-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
@@ -2311,14 +2318,15 @@ public
    st GROUP-DROPPED
    st j ar SCAN-MAKE ;
 
-\ Whether the scan has staged the observation at p gone.
-: SCAN-GONE? ( scan str -- scan bool )
+\ Whether the scan has staged an observation at p, of any kind.
+: SCAN-STAGED? ( scan str -- scan bool )
    {: p:str :}
    SCAN-UNMAKE {: st j ar :}
    j >CONNECTION
-   s" SELECT 1 FROM temp.scan_observations WHERE path = ?1 AND kind = 2"
-   [: p 1 SQLITE:BIND-BLOB CLEAN-ROW ;] SQLITE:WITH-STATEMENT {: gone:bool :}
-   st j ar SCAN-MAKE gone ;
+   s" SELECT 1 FROM temp.scan_observations WHERE path = ?1"
+   [: p 1 SQLITE:BIND-BLOB CLEAN-ROW ;] SQLITE:WITH-STATEMENT
+   {: staged:bool :}
+   st j ar SCAN-MAKE staged ;
 
 \ Ends the range of the folder at p: stored groups beneath p the walk
 \ passed over are gone, and the stream stops until the next SCAN-FROM.

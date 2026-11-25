@@ -1426,15 +1426,6 @@ FSM:DEFINE WATCHING ( ^watch ) watch-state watch-event
 : WATCH-ABANDONED ( JOURNAL:journal ^watch -- )
    construct watch-event abandoned STEPPED ;
 
-\ Forgets wd's record and removes its watch from the instance, if any.
-: WATCH-DROP ( JOURNAL:journal ^watch n -- )
-   {: j w wd:n :}
-   j wd JOURNAL:WATCH-FORGET
-   w WATCH-INSTANCE @ MATCH option
-      none OF ENDOF
-      some OF wd INOTIFY:UNWATCH ENDOF
-   ;MATCH ;
-
 public
 
 \ A blind watch; its arena's reset or release closes its instance.
@@ -1869,20 +1860,29 @@ SUBTREE-INSTALL
    ;] catch {: code:n :}
    code 0<> if drop unlisted then code STEP-CODE ;
 
-\ The open folder at p, watched by wd: its direct children merged with
-\ the stored rows in its range, and each folder they lead to not clean.
+\ The listed folder at p staged a directory, unless p is the root's "",
+\ which has no row.
+: FOLDER-RESTATED ( JOURNAL:scan str -- JOURNAL:scan )
+   {: p:str :}
+   p STR:LEN 0= if exit then
+   p MODEL:>PATH DIRECTORY-OBSERVATION MODEL-LOCAL--RECORD:MAKE
+   JOURNAL:SCAN-OBSERVE ;
+
+\ The open folder at p, watched by wd, restated with its direct children
+\ merged with its range's stored rows; each folder they lead to not clean.
 : STIRRED-WATCHED
    ( JOURNAL:scan fd n str scan-context ^ARENA:arena -- JOURNAL:scan )
    {: dir:fd wd:n p:str cx:scan-context ar:^ARENA:arena :}
    cx SCAN-CONTEXT-UNMAKE {: cut:option<MODEL:cutoff> dev:n j w :}
    dir wd p cx ar STIRRED-NAMES {: names code:n :}
    code 0<> if j wd JOURNAL:WATCH-TRIED exit then
+   p FOLDER-RESTATED
    p JOURNAL:SCAN-FROM
    dir p names cx ar SCAN-NAMES
    p JOURNAL:SCAN-TO ;
 
 \ The open folder at p watched anew: wd, its record's, lists it; another
-\ wd drops the record, or puts the watch in doubt for the root.
+\ wd leaves the record tried, or puts the watch in doubt for the root.
 : STIRRED-ADDED
    ( JOURNAL:scan fd n str scan-context ^ARENA:arena -- JOURNAL:scan )
    {: dir:fd wd:n p:str cx:scan-context ar:^ARENA:arena :}
@@ -1891,28 +1891,24 @@ SUBTREE-INSTALL
       none OF ENDOF
       some OF {: got:n :}
          got wd = if dir wd p cx ar STIRRED-WATCHED
-         else p STR:LEN 0= if j w WATCH-DOUBT else j w wd WATCH-DROP then
+         else p STR:LEN 0= if j w WATCH-DOUBT
+         else j wd JOURNAL:WATCH-TRIED then
          then
       ENDOF
    ;MATCH ;
 
 \ The stirred record of wd, folder p, opened from the root rfd and
-\ listed; staged gone by the scan, replaced or missing, it is dropped,
-\ else a failure leaves it tried. Every outcome leaves the record not
-\ stirred, or the watch blind.
+\ listed; staged already by the scan, missing or failing, it is tried.
+\ Every outcome leaves the record not stirred, or the watch blind.
 : STIRRED-LISTED
    ( JOURNAL:scan fd n str scan-context ^ARENA:arena -- JOURNAL:scan )
    {: rfd:fd wd:n p:str cx:scan-context ar:^ARENA:arena :}
    cx SCAN-CONTEXT-UNMAKE {: cut:option<MODEL:cutoff> dev:n j w :}
-   p JOURNAL:SCAN-GONE? if j w wd WATCH-DROP exit then
+   p JOURNAL:SCAN-STAGED? if j wd JOURNAL:WATCH-TRIED exit then
    rfd p STIRRED-OPEN {: opened:option<fd> code:n :}
-   code 0<> if
-      FS:ERRNO REPLACED? if j w wd WATCH-DROP
-      else j wd JOURNAL:WATCH-TRIED then
-      exit
-   then
+   code 0<> if j wd JOURNAL:WATCH-TRIED exit then
    opened MATCH option
-      none OF j w wd WATCH-DROP ENDOF
+      none OF j wd JOURNAL:WATCH-TRIED ENDOF
       some OF {: dir:fd :}
          [: dir wd p cx ar STIRRED-ADDED ;] [: dir DISCARD ;] finally
       ENDOF

@@ -2477,16 +2477,26 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
 : MARK-1 ( journal -- n )
    >CONNECTION s" SELECT mark FROM temp.watches WHERE wd = 1" QUERY-INT ;
 
-\ Lists wd 1's folder and publishes the scan.
+\ Stores the folders a and b as directories, as their parent's listing
+\ does.
+: FOLDERS-STORED ( journal local-root-binding ^ARENA:arena -- )
+   {: j b ar :}
+   ar LOCALS {: v :}
+   s" a" DIRECTORY-LOCAL v LOCAL+  s" b" DIRECTORY-LOCAL v LOCAL+
+   j b v ar HASHES PUBLISH-LOCAL-SCAN TTRUE ;
+
+\ Lists wd 1's folder and publishes the scan, its stream stopped so the
+\ stored rows stay.
 : LISTED-PUBLISHED ( scan journal local-root-binding -- scan )
    {: j b :}
-   j 1 WATCH-LISTED  b PUBLISH-SCAN TTRUE ;
+   SCAN-STOP  j 1 WATCH-LISTED  b PUBLISH-SCAN TTRUE ;
 
 : A-PUBLISHED-LISTED-FOLDER-IS-CLEAN ( ^ARENA:arena -- )
    {: ar :}
    s" a recorded, listed and published folder is clean" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p ar ACTIVE-JOURNAL {: j b :}
+   j b ar FOLDERS-STORED
    j 1 s" a" WATCH-RECORD
    j 1 s" a" WATCH-CLEAN? TFALSE
    j [: j b LISTED-PUBLISHED ;] WITH-SCAN
@@ -2537,10 +2547,10 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
    j CLOSE
    d GONE ;
 
-\ Lists every folder and publishes the scan.
+\ Lists every folder and publishes the scan, its stream stopped.
 : ALL-PUBLISHED ( scan journal local-root-binding -- scan )
    {: j b :}
-   j 1 WATCH-LISTED  j 2 WATCH-LISTED  j 3 WATCH-LISTED
+   SCAN-STOP  j 1 WATCH-LISTED  j 2 WATCH-LISTED  j 3 WATCH-LISTED
    b PUBLISH-SCAN TTRUE ;
 
 \ Stirs a/x, then a-b, then lists them in the order NEXT-STIRRED
@@ -2582,6 +2592,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
    s" watch records are replaced, stirred and forgotten" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p ar ACTIVE-JOURNAL {: j b :}
+   j b ar FOLDERS-STORED
    j 1 s" a" WATCH-RECORD
    j 2 s" b" WATCH-RECORD
    j [: j b ALL-PUBLISHED ;] WITH-SCAN
@@ -2608,10 +2619,11 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
    j CLOSE
    d GONE ;
 
-\ Tries wd 1's folder, lists wd 2's and publishes the scan.
+\ Tries wd 1's folder, lists wd 2's and publishes the scan, its stream
+\ stopped.
 : TRIED-PUBLISHED ( scan journal local-root-binding -- scan )
    {: j b :}
-   j 1 WATCH-TRIED  j 2 WATCH-LISTED  b PUBLISH-SCAN TTRUE ;
+   SCAN-STOP  j 1 WATCH-TRIED  j 2 WATCH-LISTED  b PUBLISH-SCAN TTRUE ;
 
 \ Tries wd 2's folder, then the body throws.
 : TRIED-THROWN ( scan journal -- scan )
@@ -2622,6 +2634,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
    s" a tried folder is stirred after its scan" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p ar ACTIVE-JOURNAL {: j b :}
+   j b ar FOLDERS-STORED
    j 1 s" a" WATCH-RECORD
    j 2 s" b" WATCH-RECORD
    j [: j b ALL-PUBLISHED ;] WITH-SCAN
@@ -2641,7 +2654,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
    {: b :}
    SCAN-STOP  s" " SCAN-FROM
    s" h" DIRECTORY-LOCAL SCAN-SEEN  s" h" SCAN-SKIP
-   s" d" SCAN-GONE? TTRUE  s" h" SCAN-GONE? TFALSE
+   s" d" SCAN-STAGED? TTRUE  s" h" SCAN-STAGED? TFALSE
    s" " SCAN-TO  b PUBLISH-SCAN TTRUE ;
 
 : A-PUBLISHED-SCAN-FORGETS-THE-RECORDS-OF-FOLDERS-IT-DROPS

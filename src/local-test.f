@@ -1807,8 +1807,8 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    JNL @ WATCHER @ s" a" CLEAN? TTRUE
    JNL @ WATCHER @ s" a/b" CLEAN? TTRUE ;
 
-\ a/b moved out of the root: a's listing drops its rows, and a/b's
-\ record, its path gone, is dropped.
+\ a/b moved out of the root: a's listing drops its rows, and the
+\ publication forgets a/b's record, its path staged gone.
 : MOVED-OUT ( -- )
    s" a/b" AT MOVED$ FS:RENAME-FILE
    PUBLISH
@@ -1825,7 +1825,7 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    [: MOVED-OUT ;] [: MOVED$ FS:REMOVE-TREE ;] finally ;
 
 \ a/b moved out and back: the walk enters a/b anew, and a/b/c's record,
-\ dropped with its rows, does not keep a/b/c from being listed.
+\ forgotten with its rows, does not keep a/b/c from being listed.
 : MOVED-BACK ( -- )
    s" a/b" AT MOVED$ FS:RENAME-FILE
    PUBLISH
@@ -1842,8 +1842,8 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    PUBLISH
    [: MOVED-BACK ;] [: MOVED$ FS:REMOVE-TREE ;] finally ;
 
-\ a/b moved out and made anew: a's listing lists the new a/b, and the
-\ old record, another wd at its path, is dropped.
+\ a/b moved out and made anew: a's listing lists the new a/b, whose
+\ record replaces the old one, another wd at its path.
 : MADE-ANEW ( -- )
    s" a/b" AT MOVED$ FS:RENAME-FILE
    s" a/b" MKDIR s" a/b/y" s" y1" WRITE
@@ -1895,6 +1895,80 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    ;MATCH
    PUBLISH
    JNL @ WATCHER @ s" d" CLEAN? TTRUE ;
+
+\ a's record stirred, as a write in a would.
+: A-STIRRED ( -- ) JNL @ WATCHER @ s" a" ADDED-WD JOURNAL:WATCH-STIR ;
+
+\ a listed as if on another device publishes a/b unknown and a/b/x gone;
+\ a/b's record, clean before, does not keep a/b from being listed again.
+: A-FOLDER-PUBLISHED-UNKNOWN-IS-LISTED-WHEN-IT-RETURNS ( -- )
+   s" a_folder_published_unknown_is_listed_when_it_returns" T-LABEL
+   s" a" MKDIR s" a/b" MKDIR s" a/b/x" s" x1" WRITE
+   PUBLISH
+   JNL @ WATCHER @ s" a/b" CLEAN? TTRUE
+   A-STIRRED
+   [: SCANNED-ACROSS-DEVICES ;] SCANNED {: across :}
+   across s" a/b" UNSUPPORTED-KIND SEEN
+   across s" a/b/x" MISSING SEEN
+   A-STIRRED
+   PUBLISH
+   INVENTORY {: s :}
+   s s" a/b" DIRECTORY SEEN
+   s s" a/b/x" SCANNED-CONTENT s" x1" IDENTITY T$= ;
+
+\ d, replaced between the walk's stat and its open, is incomplete and
+\ stirred; the root's events read unheard, only d's rescan restates d.
+: A-STIRRED-FOLDER-RESTATES-ITS-OWN-ROW ( -- )
+   s" a_stirred_folder_restates_its_own_row" T-LABEL
+   s" d" MKDIR
+   PUBLISH
+   [: REPLACED-BEFORE-ITS-OPEN ;] SCANNED s" d" INCOMPLETE SEEN
+   JNL @ STIRRED$ s" d" T$=
+   WATCHER @ DRAINED
+   PUBLISH
+   INVENTORY {: s :}
+   s s" d" DIRECTORY SEEN
+   s s" d/x" PRESENT SEEN ;
+
+\ d's write heard, a/b moved out before the scan opens d and back after
+\ it; the moves' events, read unheard, stand for ones heard later.
+: AWAY-DURING-THE-SCAN ( -- )
+   s" a/b/c/d/x" s" x2" WRITE
+   JNL @ WATCHER @ WATCH-HEAR 1 >= TTRUE
+   JNL @ STIRRED$ s" a/b/c/d" T$=
+   s" a/b" AT MOVED$ FS:RENAME-FILE  WATCHER @ DRAINED
+   PUBLISH
+   MOVED$ s" a/b" AT FS:RENAME-FILE
+   PUBLISH
+   INVENTORY s" a/b/c/d/x" SCANNED-CONTENT s" x2" IDENTITY T$= ;
+
+: A-STIRRED-FOLDER-AWAY-DURING-ITS-SCAN-IS-LISTED-WHEN-BACK ( -- )
+   s" a_stirred_folder_away_during_its_scan_is_listed_when_back" T-LABEL
+   s" a" MKDIR s" a/b" MKDIR s" a/b/c" MKDIR s" a/b/c/d" MKDIR
+   s" a/b/c/d/x" s" x1" WRITE
+   PUBLISH
+   [: AWAY-DURING-THE-SCAN ;] [: MOVED$ FS:REMOVE-TREE ;] finally ;
+
+\ a/b's write heard, a/b replaced unheard: its scan meets another wd,
+\ and a's listing then records the new a/b in the old one's place.
+: LOOK-ALIKE ( -- )
+   s" a/b/x" s" x2" WRITE
+   JNL @ WATCHER @ WATCH-HEAR 1 >= TTRUE  JNL @ STIRRED$ s" a/b" T$=
+   s" a/b" AT MOVED$ FS:RENAME-FILE
+   s" a/b" MKDIR s" a/b/y" s" y1" WRITE  WATCHER @ DRAINED
+   PUBLISH
+   A-STIRRED
+   PUBLISH
+   JNL @ STIRRED$ s" -" T$=
+   INVENTORY {: s :}
+   s s" a/b/y" SCANNED-CONTENT s" y1" IDENTITY T$=
+   s s" a/b/x" MISSING SEEN ;
+
+: A-LOOK-ALIKE-FOLDER-LEAVES-ONE-RECORD ( -- )
+   s" a_look_alike_folder_leaves_one_record" T-LABEL
+   s" a" MKDIR s" a/b" MKDIR s" a/b/x" s" x1" WRITE
+   PUBLISH
+   [: LOOK-ALIKE ;] [: MOVED$ FS:REMOVE-TREE ;] finally ;
 
 \ The watch's instance swapped for a pipe, which inotify refuses: the
 \ instance the real one was is closed first.
@@ -1989,6 +2063,12 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    [: A-REPLACED-FOLDER-IS-LISTED-ANEW ;] IN-SCAN-CASE
    [: AN-INACCESSIBLE-STIRRED-FOLDER-IS-TRIED ;] IN-SCAN-CASE
    [: A-FOLDER-REPLACED-AT-ITS-OPEN-IS-TRIED ;] IN-SCAN-CASE
+   [: A-FOLDER-PUBLISHED-UNKNOWN-IS-LISTED-WHEN-IT-RETURNS ;]
+   IN-SCAN-CASE
+   [: A-STIRRED-FOLDER-RESTATES-ITS-OWN-ROW ;] IN-SCAN-CASE
+   [: A-STIRRED-FOLDER-AWAY-DURING-ITS-SCAN-IS-LISTED-WHEN-BACK ;]
+   IN-SCAN-CASE
+   [: A-LOOK-ALIKE-FOLDER-LEAVES-ONE-RECORD ;] IN-SCAN-CASE
    [: A-BLINDED-SCAN-RERUNS-IN-FULL ;] IN-SCAN-CASE ;
 
 public
