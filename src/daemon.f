@@ -450,11 +450,12 @@ PROCESS-SYMBOLS
 FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
 ;FUNCTION
 
-\ Freed heap pages go back to the system before the daemon blocks: glibc
-\ returns only the heap's top by itself.
-: RELEASE-HEAP ( -- ) 0 MALLOC-TRIM drop ;
+\ Freed heap pages and the arenas' spare chunks go back to the system
+\ before the daemon blocks: glibc returns only the heap's top by itself,
+\ and Habu keeps released arena chunks for reuse.
+: RELEASE-MEMORY ( -- ) 0 MALLOC-TRIM drop ARENA:TRIM ;
 
-: SLEEP ( n ^run -- ) RELEASE-HEAP RUN-WAIT @ execute ;
+: SLEEP ( n ^run -- ) RELEASE-MEMORY RUN-WAIT @ execute ;
 
 : FAILED ( n failure ^run -- )
    {: code f x :}
@@ -857,7 +858,7 @@ FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
 \ event goes in listened.
 : CURSOR-POLLED ( DROPBOX:cursor option<fd> ^run -- bool )
    {: k:DROPBOX:cursor f:option<fd> x :}
-   RELEASE-HEAP
+   RELEASE-MEMORY
    k DROPBOX:CURSOR>STR LONG-POLL-S f
    x CLIENT@ DROPBOX:WAIT MATCH option
       some OF {: r:DROPBOX:reply :}
