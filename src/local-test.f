@@ -1880,6 +1880,22 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    PUBLISH
    INVENTORY s" a/y" SCANNED-CONTENT s" y1" IDENTITY T$= ;
 
+\ d replaced between the walk's stat and its open: the scan that refuses
+\ it leaves the new d's record stirred, so the next scan lists it.
+: A-FOLDER-REPLACED-AT-ITS-OPEN-IS-TRIED ( -- )
+   s" a_folder_replaced_at_its_open_is_tried" T-LABEL
+   s" d" MKDIR
+   PUBLISH
+   [: ANOTHER-INODE-AT-THE-OPEN ;] SCANNED drop
+   JNL @ AR @ JOURNAL:NEXT-STIRRED MATCH option
+      none OF false TTRUE ENDOF
+      some OF JOURNAL-STIRRED:UNMAKE {: wd:n p:str :}
+         p s" d" T$=  wd WATCHER @ s" d" ADDED-WD T=
+      ENDOF
+   ;MATCH
+   PUBLISH
+   JNL @ WATCHER @ s" d" CLEAN? TTRUE ;
+
 \ The watch's instance swapped for a pipe, which inotify refuses: the
 \ instance the real one was is closed first.
 : UNWATCHABLE ( ^watch -- )
@@ -1972,6 +1988,7 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    [: A-FOLDER-MOVED-OUT-AND-BACK-IS-LISTED-AGAIN ;] IN-SCAN-CASE
    [: A-REPLACED-FOLDER-IS-LISTED-ANEW ;] IN-SCAN-CASE
    [: AN-INACCESSIBLE-STIRRED-FOLDER-IS-TRIED ;] IN-SCAN-CASE
+   [: A-FOLDER-REPLACED-AT-ITS-OPEN-IS-TRIED ;] IN-SCAN-CASE
    [: A-BLINDED-SCAN-RERUNS-IN-FULL ;] IN-SCAN-CASE ;
 
 public

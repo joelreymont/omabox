@@ -1609,25 +1609,26 @@ STRUCTURE scan-context
    before SAME-OBSERVATION 0= if s" scan directory" p CHANGED then ;
 
 \ The open directory, checked to be the one the walk's stat found, and
-\ its LISTED-STILL. The record of wd, the one its caller's WATCH-ADD
-\ answered, is stirred until the listing ends, so a listing that throws
-\ leaves it stirred; no wd lists it all the same.
+\ its LISTED-STILL; no wd lists it all the same. The record of wd, the
+\ one its caller's WATCH-ADD answered, is tried before the check, so a
+\ throw once the watch is added leaves it tried.
 : CHECKED-LISTING
    ( fd str MODEL:stat option<n> scan-context ^ARENA:arena
      -- ^VEC:vector<str> )
    {: child:fd p:str probe:MODEL:stat added:option<n> cx:scan-context
       ar:^ARENA:arena :}
+   cx SCAN-CONTEXT-UNMAKE {: cut:option<MODEL:cutoff> dev:n j w :}
+   added MATCH option
+      none OF ENDOF
+      some OF {: wd:n :} j wd p JOURNAL:WATCH-RECORD ENDOF
+   ;MATCH
    child p s" inspect directory before scan" STAT-FD
    {: before:MODEL:stat :}
    before probe SAME-INODE 0= if s" open scanned directory" p CHANGED then
-   cx SCAN-CONTEXT-UNMAKE {: cut:option<MODEL:cutoff> dev:n j w :}
+   child p before ar LISTED-STILL
    added MATCH option
-      none OF child p before ar LISTED-STILL ENDOF
-      some OF {: wd:n :}
-         j wd p JOURNAL:WATCH-RECORD
-         child p before ar LISTED-STILL
-         j wd JOURNAL:WATCH-LISTED
-      ENDOF
+      none OF ENDOF
+      some OF {: wd:n :} j wd JOURNAL:WATCH-LISTED ENDOF
    ;MATCH ;
 
 : NO-NAMES ( -- option<^VEC:vector<str>> ) OPTION:NONE ;
