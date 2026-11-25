@@ -2188,27 +2188,11 @@ private
    JSON:WRITE-OBJECT-END JSON:CLOSE ;
 
 
-\ Whether the fault is NEXT-UNLESS's descriptor's.
-: WAKE? ( HTTPC:fault -- bool )
-   MATCH HTTPC:fault
-      resolve OF false ENDOF
-      connect OF false ENDOF
-      handshake OF false ENDOF
-      trust OF false ENDOF
-      send OF false ENDOF
-      receive OF false ENDOF
-      cut OF false ENDOF
-      timeout OF false ENDOF
-      malformed OF false ENDOF
-      oversize OF false ENDOF
-      woken OF true ENDOF
-   ;MATCH ;
-
-
+\ Whether NEXT-UNLESS's descriptor ended the client's last call.
 : WOKEN? ( ^client -- bool )
    CLIENT-FAILURE @ MATCH option
       none OF false ENDOF
-      some OF WAKE? ENDOF
+      some OF HTTPC-FAULT:WOKEN HTTPC-FAULT:EQ ENDOF
    ;MATCH ;
 
 
