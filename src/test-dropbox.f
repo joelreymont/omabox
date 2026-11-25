@@ -129,6 +129,14 @@ TYPED-VARIABLE TOKEN-CUTTING bool
    s dst cap SPAN:MAKE SPAN:COPY s STR:len ;
 
 
+TYPED-VARIABLE UNESCAPED ^VEC:vector<u8>
+: UNESCAPER ( -- ) HEAP:ALLOCATOR 0 [type] u8 VEC:NEW UNESCAPED ! ;
+UNESCAPER
+
+\ Decodes the reader's string into a buffer of cap bytes and answers its length.
+: READ-INTO ( JSON:reader ^u8 n -- JSON:reader n )
+   {: d:^ cap:n :} UNESCAPED @ JSON:READ-STR d cap STORE ;
+
 : AT ( ^u8 n n -- ^u8 n )
    {: base:^ cap:n i:n :}
    base i cap * + cap ;
@@ -523,7 +531,7 @@ variable FORM-AT
    PARSER q HTTP:BODY$ JSON:READ-INIT
    JSON:READ-NEXT JSON:T-OBJ = if
       s" path" JSON:READ-FIND-KEY if
-         ASKED PATH-CAP JSON:READ-STR ASKED-U !
+         ASKED PATH-CAP READ-INTO ASKED-U !
       then
    then
    JSON:READ-FINISH ;
@@ -589,7 +597,7 @@ variable HELD-U
    PARSER q HTTP:BODY$ JSON:READ-INIT
    JSON:READ-NEXT JSON:T-OBJ = if
       s" parent_rev" JSON:READ-FIND-KEY if
-         WANT NAME-CAP JSON:READ-STR WANT-U ! JSON:READ-FINISH true exit
+         WANT NAME-CAP READ-INTO WANT-U ! JSON:READ-FINISH true exit
       then
    then
    JSON:READ-FINISH false ;
@@ -601,7 +609,7 @@ variable HELD-U
    0 HELD-U !
    PARSER i ENTRY$ JSON:READ-INIT
    JSON:READ-NEXT JSON:T-OBJ = if
-      s" rev" JSON:READ-FIND-KEY if HELD NAME-CAP JSON:READ-STR HELD-U ! then
+      s" rev" JSON:READ-FIND-KEY if HELD NAME-CAP READ-INTO HELD-U ! then
    then
    JSON:READ-FINISH HELD HELD-U @ >str ;
 
@@ -938,7 +946,7 @@ TYPED-VARIABLE DURING [ -- ]
       PARSER v JSON:READ-INIT
       JSON:READ-NEXT JSON:T-OBJ = if
          s" path" JSON:READ-FIND-KEY if
-            ASKED PATH-CAP JSON:READ-STR ASKED-U !
+            ASKED PATH-CAP READ-INTO ASKED-U !
          then
       then
       JSON:READ-FINISH
@@ -958,7 +966,7 @@ TYPED-VARIABLE DURING [ -- ]
    PARSER e JSON:READ-INIT
    JSON:READ-NEXT JSON:T-OBJ = if
       s" rev" JSON:READ-FIND-KEY if
-         REV-SEEN NAME-CAP JSON:READ-STR REV-SEEN-U !
+         REV-SEEN NAME-CAP READ-INTO REV-SEEN-U !
       then
    then
    JSON:READ-FINISH
@@ -1262,14 +1270,14 @@ variable SESSIONS
 \ A string member's value into the ARG- field its key names.
 : ARG-STRING ( JSON:reader -- JSON:reader )
    ARG-KEY ARG-KEY-U @ >str {: k :}
-   k s" path" STR:= if ARG-PATH PATH-CAP JSON:READ-STR ARG-PATH-U ! exit then
+   k s" path" STR:= if ARG-PATH PATH-CAP READ-INTO ARG-PATH-U ! exit then
    k s" mode" STR:= k s" .tag" STR:= or
-   if ARG-MODE NAME-CAP JSON:READ-STR ARG-MODE-U ! exit then
-   k s" update" STR:= if ARG-REV NAME-CAP JSON:READ-STR ARG-REV-U ! exit then
+   if ARG-MODE NAME-CAP READ-INTO ARG-MODE-U ! exit then
+   k s" update" STR:= if ARG-REV NAME-CAP READ-INTO ARG-REV-U ! exit then
    k s" content_hash" STR:=
-   if ARG-HASH NAME-CAP JSON:READ-STR ARG-HASH-U ! exit then
+   if ARG-HASH NAME-CAP READ-INTO ARG-HASH-U ! exit then
    k s" session_id" STR:=
-   if ARG-SESSION NAME-CAP JSON:READ-STR ARG-SESSION-U ! then ;
+   if ARG-SESSION NAME-CAP READ-INTO ARG-SESSION-U ! then ;
 
 
 : ARG-VALUE ( JSON:reader n -- JSON:reader )
@@ -1286,7 +1294,7 @@ variable SESSIONS
 \ Every member of the object just opened, and of the objects in it.
 : ARG-MEMBERS ( JSON:reader -- JSON:reader )
    begin JSON:READ-NEXT dup JSON:T-KEY = while
-      drop ARG-KEY NAME-CAP JSON:READ-STR ARG-KEY-U !
+      drop ARG-KEY NAME-CAP READ-INTO ARG-KEY-U !
       JSON:READ-NEXT dup JSON:T-OBJ = if drop RECURSE else ARG-VALUE then
    repeat drop ;
 

@@ -177,13 +177,13 @@ ARENA CURSORS JSON:cursor
    {: t:str c :}
    c t JSON:READ-INIT JSON:READ-NEXT ;
 
-\ A string's decoded bytes, copied into the arena; its text bounds them.
+\ A string's decoded bytes, in a vector in the arena sized to its text,
+\ which bounds them.
 : READ-STRING ( str ^JSON:cursor ^ARENA:arena -- str )
    {: t:str c ar :}
    t c OPEN JSON:T-STR EXPECT
-   ar t STR:len ARENA:ALLOC {: d:^ du:n :}
-   d du JSON:READ-STR {: len:n :}
-   JSON:READ-FINISH d len >str ;
+   ar ARENA:ALLOCATOR t STR:len [type] u8 VEC:NEW JSON:READ-STR {: s:str :}
+   JSON:READ-FINISH s ;
 
 \ serde's u8: an integer with no sign, up to 255.
 : READ-VERSION ( str ^JSON:cursor -- n )

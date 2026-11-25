@@ -36,6 +36,7 @@ require src/lib/unicode.f
 require src/lib/utf8-scalar.f
 require src/lib/error.f
 require src/lib/json.f
+require src/lib/vector.f
 require src/dropbox.f
 
 package MODEL
@@ -916,14 +917,13 @@ ARENA CURSORS JSON:cursor
 \ A word ending -HERE decodes the value at the reader's token and leaves the
 \ reader on the value's last token.
 
-\ The string at the reader's token, decoded and copied into the arena;
-\ its text as written bounds it.
+\ The string at the reader's token, decoded into a vector in the arena
+\ sized to its text as written, which bounds it.
 : STRING-HERE ( JSON:reader reading -- JSON:reader str )
    {: r:reading :}
    JSON:READ-TOKEN JSON:T-STR EXPECT
    JSON:READ-SPAN$ STR:len {: u:n :}
-   r READING-UNMAKE nip u ARENA:ALLOC {: d:^ du:n :}
-   d du JSON:READ-STR {: len:n :} d len >str ;
+   r READING-UNMAKE nip ARENA:ALLOCATOR u [type] u8 VEC:NEW JSON:READ-STR ;
 
 : READ-STRING ( str reading -- str )
    {: t:str r:reading :}
