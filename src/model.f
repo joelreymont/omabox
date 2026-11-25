@@ -188,6 +188,7 @@ private
 
 $2F constant SLASH
 $2E constant DOT
+$80 constant ASCII-LIMIT
 
 : ROOT? ( str -- bool )
    str> {: p:^ u:n :}
@@ -528,11 +529,9 @@ private
    u xu < if false exit then
    p u + xu - xu >str x STR:=CI ;
 
-public
-
 \ Dropbox's documented temporary-file prefixes and metadata suffixes, the
 \ suffixes in any ASCII case (help.dropbox.com/en-en/sync/files-not-syncing).
-: EXCLUDED-NAME? ( str -- bool )
+: DOCUMENTED? ( str -- bool )
    {: p :}
    p s" ~$" STR:STARTS-WITH? if true exit then
    p s" .~" STR:STARTS-WITH? if true exit then
@@ -542,6 +541,27 @@ public
    p s\" icon\r" SUFFIX-CI? if true exit then
    p s" .dropbox" SUFFIX-CI? if true exit then
    p s" .dropbox.attr" SUFFIX-CI? ;
+
+\ Some byte is past ASCII, where only Unicode lowering finds the case.
+: WIDE? ( str -- bool )
+   str> {: p:^ u:n :}
+   u 0 ?do p i + c@ ASCII-LIMIT < 0= if true unloop exit then loop
+   false ;
+
+\ For ARENA:WITH: the name's lowercase is a documented name.
+: LOWER-DOCUMENTED? ( str ^ARENA:arena -- bool )
+   {: s:str ar :}
+   s LOWERED-BYTES {: size:n :}
+   ar size ARENA:ALLOC drop {: dst:^ :}
+   s dst size LOWER-INTO {: u:n :}
+   dst u >str DOCUMENTED? ;
+
+public
+
+\ The name's lowercase, as FOLD keys it, is a documented name.
+: EXCLUDED-NAME? ( str -- bool )
+   dup WIDE? 0= if DOCUMENTED? exit then
+   [: LOWER-DOCUMENTED? ;] ARENA:WITH ;
 
 private
 

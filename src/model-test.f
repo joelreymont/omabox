@@ -155,6 +155,7 @@ TYPED-VARIABLE AR ^ARENA:arena
    s" documented_names_and_descendants_are_excluded" T-LABEL
    s" .DS_Store" EXCLUDED
    s" folder/DESKTOP.INI" EXCLUDED
+   s\" folder/DES\xe2\x84\xaaTOP.INI" EXCLUDED
    s" folder/Thumbs.db" EXCLUDED
    s\" folder/Icon\r" EXCLUDED
    s" folder/.dropbox" EXCLUDED
