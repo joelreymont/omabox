@@ -87,17 +87,35 @@ recover; a drive that ends without failure or launch was not asked for one, a
 halt or release stopped a unit it first saw holding the lock, and a halt
 cleared a failed state it last saw.
 
-`LocalWatch` checks LOCAL's watch, `WATCHING` in `src/local.f`, over folders
-each with a journal record (none, clean, stirred, or listed by the running
-scan) and a kernel watch. A change in a watched folder queues an event while
-the watch is not blind, else is lost; an overflow drops an event and queues a
-loss; a replaced folder loses its watch. A scan starts as the table says,
-lists every folder unless the watch is armed and only the folders not clean
-when it is, and publishes, is abandoned or throws. No change hides behind a
-clean record: a folder changed since its last published listing is never
-clean unless the kernel still holds its event or a loss, so the next scan
-lists it again; a blind watch holds no record, and only an armed one a clean
-record.
+`LocalWatch` checks LOCAL's watch, `WATCHING` in `src/local.f`, over the
+root, a folder in it and one in that, so a clean folder can vouch for a child
+the walk skips. Each folder has a journal record (none, clean, stirred, or
+listed or tried by the running scan), a kernel watch, a published row (a
+directory, unknown or gone) over stored rows that are current unless a
+publication dropped them, and what the running scan stages at its path. A
+change in a watched folder queues an event while the watch is not blind, else
+is lost; an overflow drops an event and queues a loss; a folder replaced by a
+look-alike loses its watch and changes its parent; a folder moved away during
+a scan and back changes its parent, and both watches hear it. Hearing runs
+before a scan, and a throw while hearing steps lost. A scan starts as the
+table says and walks: a full one from the root, an armed one from each stirred
+record in path order, each entering a folder its listing leads to unless the
+folder's record is clean, which takes the record's own watch and a directory
+row. A listing that cannot reach a child before adding its watch publishes it
+unknown, stages its rows gone and leaves its record as it was; one that finds
+the child changing once its watch is added publishes it unknown and leaves it
+tried. A stirred folder's listing restates its own row; a stirred record
+already staged, missing, replaced or answered by another wd stays tried, and a
+tried record is stirred again once the scan ends. The scan publishes, is
+abandoned or throws; a publication forgets the records at paths it staged
+gone, and a recorded wd replaces any record at its path. A blind watch holds
+no record and only an armed one a clean record, never at a gone row; a folder
+that vouches for its subtree has a directory row and current rows beneath
+it. A listing that adds a new wd at a path leaves the old wd's pending
+IN-IGNORED no record to forget. No change below a clean folder stays unrecorded:
+before an armed watch's scan, every folder whose stored rows may be wrong lies
+beneath an unknown row or is reached by the walk from a stirred record once
+the pending events are heard, unless a loss is queued.
 
 `DaemonRun` checks the daemon's run, `DAEMON-RUN`: each step runs only once
 what it reads exists and never makes again what the run holds, so the journal
