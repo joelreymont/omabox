@@ -1381,18 +1381,22 @@ private
 
 \ ---- the local scan ------------------------------------------------
 
+\ Where the stored stream stands: ended, no group held; last, a group
+\ held and the stream past its end; more, a group held and the stream on
+\ the row after it.
+ENUM stored-state ended last more ;ENUM
+
 \ The stored rows a scan merges the walk against, read in path byte
 \ order: the group held is the observation and the active generation's
 \ cached hash at one path, kind NO-KIND and content "" for no
-\ observation; ahead tells whether the stream stands on a row past it,
-\ and rows counts the rows read since the stream's reset. group holds
-\ path, content and digest, the cached hash. The walk never sees a path
-\ beneath an unknown entry; prefixes holds the lengths of the unknown
-\ paths, each a prefix of the last one, unknown, beneath which a stored
-\ row may still lie.
+\ observation; state tells whether a group is held and whether the
+\ stream stands on a row past it, and rows counts the rows read since
+\ the stream's reset. group holds path, content and digest, the cached
+\ hash. The walk never sees a path beneath an unknown entry; prefixes
+\ holds the lengths of the unknown paths, each a prefix of the last one,
+\ unknown, beneath which a stored row may still lie.
 STRUCTURE stored DERIVE addr
-   FIELD held bool
-   FIELD ahead bool
+   FIELD state stored-state
    FIELD rows n
    FIELD path str
    FIELD kind n
@@ -1514,19 +1518,6 @@ $2F constant SLASH
    5 SQLITE:COL-INT {: cs :}  6 SQLITE:COL-INT {: cn :}
    p i s ms mn cs cn MODEL-FINGERPRINT:MAKE ;
 
-\ A row of the hash cache as the record its columns hold; the path and
-\ content are copied into ar.
-: REUSE-ROW
-   ( SQLITE:statement ^ARENA:arena
-     -- SQLITE:statement MODEL:hash-record )
-   {: ar :}
-   0 SQLITE:COL-BLOB ar BYTES-PATH {: p:MODEL:path :}
-   1 SQLITE:COL-INT {: i :}  2 SQLITE:COL-INT {: s :}
-   3 SQLITE:COL-INT {: ms :}  4 SQLITE:COL-INT {: mn :}
-   5 SQLITE:COL-INT {: cs :}  6 SQLITE:COL-INT {: cn :}
-   7 ar TEXT-COPY DROPBOX:>HASH {: h:DROPBOX:hash :}
-   p i s ms mn cs cn MODEL-FINGERPRINT:MAKE h MODEL-HASH--RECORD:MAKE ;
-
 : LOCAL-RECORDS=
    ( ^VEC:vector<MODEL:local-record> ^VEC:vector<MODEL:local-record>
      -- bool )
@@ -1625,11 +1616,31 @@ $2F constant SLASH
 
 \ ---- the stored stream
 
-\ Steps the stream; at its end it is reset, so it reads main no more.
+\ Whether a group is held.
+: GROUP-HELD? ( ^stored -- bool )
+   STORED-STATE @ MATCH stored-state
+      ended OF false ENDOF
+      last OF true ENDOF
+      more OF true ENDOF
+   ;MATCH ;
+
+\ Whether the stream stands on a row past the group held.
+: ROW-AHEAD? ( ^stored -- bool )
+   STORED-STATE @ MATCH stored-state
+      ended OF false ENDOF
+      last OF false ENDOF
+      more OF true ENDOF
+   ;MATCH ;
+
+\ Steps the stream: more on a row, else last; at its end it is reset,
+\ so it reads main no more.
 : STEPPED ( SQLITE:statement ^stored -- SQLITE:statement )
    {: st :}
-   SQLITE:STEP dup st STORED-AHEAD !
-   if 1 st STORED-ROWS +! exit then
+   SQLITE:STEP if
+      construct stored-state more st STORED-STATE !
+      1 st STORED-ROWS +! exit
+   then
+   construct stored-state last st STORED-STATE !
    SQLITE:RESET ;
 
 \ The cached hash the stream stands on, held, its text in the group.
@@ -1658,7 +1669,7 @@ $2F constant SLASH
 \ Whether the stream stands on another row at the held path.
 : SAME-PATH? ( SQLITE:statement ^stored -- SQLITE:statement bool )
    {: st :}
-   st STORED-AHEAD @ 0= if false exit then
+   st ROW-AHEAD? 0= if false exit then
    0 SQLITE:COL-BLOB st STORED-PATH @ STR:= ;
 
 \ The stream reset, then resumed after the held path.
@@ -1676,12 +1687,12 @@ $2F constant SLASH
    false st STORED-CACHED !
    begin st ROW-HELD st STEPPED st SAME-PATH? 0= until ;
 
-\ Holds the next group, none past the last.
+\ Holds the next group, none past the last: ended from last.
 : NEXT-GROUP ( SQLITE:statement ^stored -- SQLITE:statement )
    {: st :}
-   st STORED-AHEAD @ dup st STORED-HELD ! 0= if exit then
+   st ROW-AHEAD? 0= if construct stored-state ended st STORED-STATE ! exit then
    st GROUP-READ
-   st STORED-AHEAD @ 0= if exit then
+   st ROW-AHEAD? 0= if exit then
    st STORED-ROWS @ BATCH-BOUND >= if st RESUMED then ;
 
 \ The stream from the first stored path, its first group held.
@@ -1693,7 +1704,7 @@ $2F constant SLASH
 \ Whether a group is held below p.
 : BELOW? ( str ^stored -- bool )
    {: p:str st :}
-   st STORED-HELD @ 0= if false exit then
+   st GROUP-HELD? 0= if false exit then
    st STORED-PATH @ {: h:str :}
    h p STR:= if false exit then
    h p STR:< ;
@@ -1701,7 +1712,7 @@ $2F constant SLASH
 \ Whether the group held is at p.
 : AT? ( str ^stored -- bool )
    {: p:str st :}
-   st STORED-HELD @ 0= if false exit then
+   st GROUP-HELD? 0= if false exit then
    st STORED-PATH @ p STR:= ;
 
 \ ---- unknown paths
@@ -1752,20 +1763,6 @@ $2F constant SLASH
 
 \ ---- the merge
 
-\ Whether the time, its nanoseconds a count below a second, is before
-\ the cutoff.
-: BEFORE? ( n n MODEL:cutoff -- bool )
-   {: s:n ns:n c:MODEL:cutoff :}
-   c MODEL-CUTOFF:UNMAKE {: cs:n cns:n :}
-   ns 0 < ns NS-PER-S >= or if false exit then
-   s cs < if true exit then
-   s cs = ns cns < and ;
-
-: PRINT-BEFORE? ( MODEL:fingerprint MODEL:cutoff -- bool )
-   {: f c:MODEL:cutoff :}
-   f MODEL-FINGERPRINT:UNMAKE {: i s ms mn cs cn :}
-   ms mn c BEFORE? cs cn c BEFORE? and ;
-
 \ Whether the held cache is the file's: its fingerprint is the file's,
 \ both times before the cutoff; with no cutoff, none is.
 : CACHE-AGREES? ( MODEL:fingerprint option<MODEL:cutoff> ^stored -- bool )
@@ -1774,7 +1771,7 @@ $2F constant SLASH
    f st STORED-PRINT @ MODEL:FINGERPRINT= 0= if false exit then
    o MATCH option
       none OF false ENDOF
-      some OF f swap PRINT-BEFORE? ENDOF
+      some OF f swap MODEL:BEFORE? ENDOF
    ;MATCH ;
 
 \ Whether the held observation is a file of the cached hash.
@@ -1857,7 +1854,7 @@ $2F constant SLASH
      -- SQLITE:statement SQLITE:statement SQLITE:statement
      SQLITE:statement )
    {: st :}
-   begin st STORED-HELD @ while st GROUP-PASSED repeat ;
+   begin st GROUP-HELD? while st GROUP-PASSED repeat ;
 
 \ The cached hash staged as the observation at p.
 : CACHE-STAGED
@@ -1918,7 +1915,7 @@ $2F constant SLASH
 : NEW-STORED ( ^ARENA:arena ^ARENA:arena -- ^stored )
    {: sa ga :}
    sa STORES-NEW {: st :}
-   false st STORED-HELD !  false st STORED-AHEAD !  0 st STORED-ROWS !
+   construct stored-state ended st STORED-STATE !  0 st STORED-ROWS !
    ga st STORED-GROUP !
    sa ARENA:ALLOCATOR 0 [type] u8 VEC:NEW st STORED-UNKNOWN !
    sa ARENA:ALLOCATOR 0 [type] n VEC:NEW st STORED-PREFIXES !

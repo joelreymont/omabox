@@ -133,6 +133,29 @@ STRUCTURE cutoff
    FIELD nanoseconds n
 ;STRUCTURE
 
+private
+
+1000000000 constant NS-PER-S
+
+\ Whether the time is before the cutoff; nanoseconds outside 0 to a
+\ second are not.
+: TIME-BEFORE? ( n n cutoff -- bool )
+   {: s:n ns:n c:cutoff :}
+   c MODEL-CUTOFF:UNMAKE {: cs:n cns:n :}
+   ns 0 < ns NS-PER-S >= or if false exit then
+   s cs < if true exit then
+   s cs = ns cns < and ;
+
+public
+
+\ Whether the fingerprint's modification and status change times are
+\ both before the cutoff, a nanosecond count outside 0 to a second
+\ answering false.
+: BEFORE? ( fingerprint cutoff -- bool )
+   {: f c:cutoff :}
+   f MODEL-FINGERPRINT:UNMAKE {: i s ms mn cs cn :}
+   ms mn c TIME-BEFORE? cs cn c TIME-BEFORE? and ;
+
 \ What fstat says of an open entry.
 STRUCTURE stat
    FIELD dev n

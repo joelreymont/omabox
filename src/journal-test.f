@@ -1985,6 +1985,66 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
    j CLOSE
    d GONE ;
 
+\ ---- the stored stream's bound
+
+\ Files enough that their rows, two each, pass BATCH-BOUND more than
+\ once.
+600 constant MANY-FILES
+
+\ The file left out of the second walk: "1400", read after the stream's
+\ first reset.
+400 constant LEFT-OUT
+
+\ The n-th file's path: "1000" on, in byte order.
+: MANY-PATH ( n ^ARENA:arena -- str )
+   {: n ar :}
+   n 1000 + FMT:INT$ ar COPIED ;
+
+\ Each file with its hash cached.
+: MANY-STORED ( journal local-root-binding ^ARENA:arena -- )
+   {: j b ar :}
+   ar LOCALS {: obs :}  ar HASHES {: hashes :}
+   MANY-FILES 0 ?do i ar MANY-PATH i 1+ obs hashes ar CACHED+ loop
+   j b obs hashes PUBLISH-LOCAL-SCAN TTRUE ;
+
+\ The walk over each file unchanged but the skip-th, which it leaves
+\ out; -1 leaves none out.
+: MANY-WALKED ( scan n ^ARENA:arena -- scan )
+   {: skip ar :}
+   MANY-FILES 0 ?do
+      i skip <> if i ar MANY-PATH i 1+ ar WALKED-FILE then
+   loop
+   WALK-ENDED ;
+
+\ The unchanged walk stages nothing.
+: NONE-STAGED ( scan ^ARENA:arena -- scan )
+   {: ar :}
+   -1 ar MANY-WALKED SCAN-COUNTS {: jobs:n staged:n hashes:n :}
+   jobs 0 T= staged 0 T= hashes 0 T= ;
+
+\ The walk without LEFT-OUT stages it, and only it, gone.
+: ONE-GONE ( scan ^ARENA:arena -- scan )
+   {: ar :}
+   LEFT-OUT ar MANY-WALKED SCAN-COUNTS {: jobs:n staged:n hashes:n :}
+   jobs 0 T= staged 1 T= hashes 1 T=
+   SCAN-JOURNAL >CONNECTION {: c :}
+   c s" SELECT COUNT(*) FROM temp.scan_observations
+      WHERE CAST(path AS TEXT) = '1400' AND kind = 2" QUERY-INT 1 T=
+   c s" SELECT COUNT(*) FROM temp.scan_hashes
+      WHERE CAST(path AS TEXT) = '1400' AND content_hash IS NULL"
+   QUERY-INT 1 T= ;
+
+: A-STORED-STREAM-RESUMES-PAST-ITS-BOUND ( ^ARENA:arena -- )
+   {: ar :}
+   s" a stored stream resumes past its bound" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   j b ar MANY-STORED
+   j [: ar NONE-STAGED ;] WITH-SCAN
+   j [: ar ONE-GONE ;] WITH-SCAN
+   j CLOSE
+   d GONE ;
+
 \ ---- the reuse table
 
 \ Inode 7 and size 8, modified then changed at the times given.
@@ -5008,6 +5068,7 @@ variable CRAFT
    ar EACH-SCAN-JOB-VISITS-EACH-ROW-ONCE-IN-PATH-ORDER
    ar A-VISIT-PUBLISHES-WHAT-IT-OBSERVES-AND-HASHES
    ar THE-SCAN-STAGES-ONLY-WHAT-DIFFERS
+   ar A-STORED-STREAM-RESUMES-PAST-ITS-BOUND
    ar SCAN-FILE-REUSES-ONLY-REUSABLE-HASHES
    ar A-THROW-OUT-OF-WITH-SCAN-LEAVES-NO-TRANSACTION-OPEN
    ar A-VISIT-HOLDS-NO-LOCK-OF-THE-SCAN-BEFORE-IT

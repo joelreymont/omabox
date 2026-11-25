@@ -3064,7 +3064,11 @@ ARENA PLANNINGS planning
    k KEY-BYTES pl ARENA-OF SAVED MODEL:>KEY kept VEC:PUSH ! ;
 
 \ The scratch arena first, as ARENA:WITH passes it; the settled keys the
-\ journal skips are counted no-ops.
+\ journal skips are counted no-ops. None of them is excluded: a
+\ published scan stages gone every local row the walk passes
+\ (GROUP-PASSED), the walk passes every excluded name, and a pass plans
+\ only after a publication, so an excluded key never holds the local row
+\ a settled key needs.
 : WALK-IN ( ^ARENA:arena ^planning ^VEC:vector<MODEL:key> -- )
    {: scratch pl kept :}
    pl JOURNAL-OF scratch [: pl kept scratch WALK-STEP ;]

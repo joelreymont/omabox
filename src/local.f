@@ -995,7 +995,6 @@ ENUM name-entry
 \ the hash: more than FAT's two-second mtime tick. The cache needs coherent
 \ local metadata; stale network metadata is not supported.
 3 constant RACY-WINDOW
-1000000000 constant NS-PER-S
 
 STRUCTURE scanned-hash
    FIELD record MODEL:hash-record
@@ -1048,13 +1047,6 @@ private
    s 0 < if OPTION:NONE exit then
    s 0 MODEL-CUTOFF:MAKE OPTION:SOME ;
 
-: TIMESTAMP-IS-BEFORE ( n n MODEL:cutoff -- bool )
-   {: s:n ns:n c:MODEL:cutoff :}
-   c MODEL-CUTOFF:UNMAKE {: cs:n cns:n :}
-   ns 0 < ns NS-PER-S >= or if false exit then
-   s cs < if true exit then
-   s cs = ns cns < and ;
-
 : RECORD-FINGERPRINT ( MODEL:hash-record -- MODEL:fingerprint )
    MODEL-HASH--RECORD:UNMAKE
    {: p:MODEL:path f:MODEL:fingerprint c:DROPBOX:hash :} f ;
@@ -1066,12 +1058,9 @@ private
 
 : HASH-IS-REUSABLE ( MODEL:hash-record option<MODEL:cutoff> -- bool )
    {: r:MODEL:hash-record o:option<MODEL:cutoff> :}
-   r RECORD-FINGERPRINT MODEL-FINGERPRINT:UNMAKE {: i s ms mn cs cn :}
    o MATCH option
       none OF false ENDOF
-      some OF {: c:MODEL:cutoff :}
-         ms mn c TIMESTAMP-IS-BEFORE cs cn c TIMESTAMP-IS-BEFORE and
-      ENDOF
+      some OF r RECORD-FINGERPRINT swap MODEL:BEFORE? ENDOF
    ;MATCH ;
 
 : CURRENT-HASH-CACHE-CUTOFF ( -- option<MODEL:cutoff> )

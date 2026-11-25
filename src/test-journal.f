@@ -62,6 +62,23 @@ public
 
 EXPORT LOCAL-RECORDS=
 
+private
+
+\ A row of the hash cache as the record its columns hold; the path and
+\ content are copied into ar.
+: REUSE-ROW
+   ( SQLITE:statement ^ARENA:arena
+     -- SQLITE:statement MODEL:hash-record )
+   {: ar :}
+   0 SQLITE:COL-BLOB ar BYTES-PATH {: p:MODEL:path :}
+   1 SQLITE:COL-INT {: i :}  2 SQLITE:COL-INT {: s :}
+   3 SQLITE:COL-INT {: ms :}  4 SQLITE:COL-INT {: mn :}
+   5 SQLITE:COL-INT {: cs :}  6 SQLITE:COL-INT {: cn :}
+   7 ar TEXT-COPY DROPBOX:>HASH {: h:DROPBOX:hash :}
+   p i s ms mn cs cn MODEL-FINGERPRINT:MAKE h MODEL-HASH--RECORD:MAKE ;
+
+public
+
 \ The hashes verified for the active root, by path.
 : LOCAL-HASH-CACHE
    ( journal ^ARENA:arena -- ^VEC:vector<MODEL:hash-record> )
