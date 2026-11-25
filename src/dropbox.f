@@ -2839,7 +2839,7 @@ HEAP RUNS run
       ready OF r RUN-CHUNK ! ENDOF
       timed-out OF r s" the stage's read timed out" STAGE-FAILED ENDOF
       cancelled OF r s" the stage's read was cancelled" STAGE-FAILED ENDOF
-      refused OF r swap READ-REFUSED ENDOF
+      rejected OF r swap READ-REFUSED ENDOF
    ;MATCH ;
 
 
