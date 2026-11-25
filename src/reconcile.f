@@ -2742,8 +2742,8 @@ STRUCTURE known-conflict
    FIELD conflict MODEL:conflict
 ;STRUCTURE
 
-\ One planning pass: Rust's report (noop-count, planned, conflict-count) and
-\ blocked_paths (held, keys may repeat); collisions are the held collisions.
+\ One planning pass: Rust's report (noop-count, planned, conflict-count),
+\ blocked_paths (held, keys may repeat), held collisions, held new copies.
 STRUCTURE planning DERIVE addr
    FIELD run ^run
    FIELD conflicts ^VEC:vector<known-conflict>
@@ -2751,6 +2751,7 @@ STRUCTURE planning DERIVE addr
    FIELD noop-count n
    FIELD planned n
    FIELD conflict-count n
+   FIELD held-copies n
    FIELD held ^VEC:vector<MODEL:key>
    FIELD collisions ^VEC:vector<MODEL:key>
    FIELD noops ^VEC:vector<JOURNAL:path-baseline>
@@ -3289,7 +3290,10 @@ ENUM live-step held superseded fresh root-changed ;ENUM
          pl JOURNAL-OF path c pl ARENA-OF JOURNAL:RECORD-CONFLICT drop
          1 pl PLANNING-CONFLICT-COUNT +! construct pass-event ok
       ENDOF
-      blocked OF drop pl k HELD+ construct pass-event ok ENDOF
+      blocked OF
+         drop pl k HELD+ 1 pl PLANNING-HELD-COPIES +!
+         construct pass-event ok
+      ENDOF
       source-changed OF construct pass-event fresh ENDOF
    ;MATCH ;
 
@@ -3409,8 +3413,8 @@ ENUM live-step held superseded fresh root-changed ;ENUM
 
 public
 
-\ Rust's ReconcileReport: blocked counts the distinct live paths,
-\ sync-errors the distinct paths replay could not settle.
+\ Rust's ReconcileReport: blocked counts distinct live paths, sync-errors
+\ unsettled ones.
 STRUCTURE report
    FIELD replayed n
    FIELD noops n
@@ -3418,6 +3422,7 @@ STRUCTURE report
    FIELD blocked n
    FIELD sync-errors n
    FIELD conflicts n
+   FIELD rested bool
 ;STRUCTURE
 
 \ Rust's ReconcileOutcome: fresh asks for a new scan at once,
@@ -3627,19 +3632,30 @@ ENUM pass-state DERIVE eq
    x PASS-RECOVERED @ REPLAY-REPLAY--REPORT:COMPLETED-OPERATIONS @
    x PASS-APPLIED @ REPLAY-REPLAY--REPORT:COMPLETED-OPERATIONS @ + ;
 
-: FILL-REPORT ( ^pass -- )
-   {: x :}
+\ True with no replay, plan, conflict, held copy, collision or live plan.
+: RESTED? ( bool ^pass -- bool )
+   {: live:bool x :}
+   x PASS-PLANNING @ {: pl :}
+   x REPLAYED 0= pl PLANNING-PLANNED @ 0= and
+   pl PLANNING-CONFLICT-COUNT @ 0= and
+   pl PLANNING-HELD-COPIES @ 0= and
+   pl PLANNING-COLLISIONS @ VEC:COUNT 0= and live 0= and ;
+
+: FILL-REPORT ( bool ^pass -- )
+   {: live:bool x :}
    x PASS-PLANNING @ {: pl :}
    x REPLAYED pl PLANNING-NOOP-COUNT @ pl PLANNING-PLANNED @
    x HELD-COUNT x SYNC-ERROR-COUNT pl PLANNING-CONFLICT-COUNT @
-   RECONCILE-REPORT:MAKE x PASS-REPORT ! ;
+   live x RESTED? RECONCILE-REPORT:MAKE x PASS-REPORT ! ;
 
-\ Every live plan's path is held, the ones planning kept included.
-: HOLD-LIVE ( ^pass -- )
+\ Every live plan's path is held, the ones planning kept included;
+\ answers whether any live plan remains.
+: HOLD-LIVE ( ^pass -- bool )
    {: x :}
    x PASS-PLANNING @ {: pl :}
    x PASS-RUN @ LIVE-PLANS {: v :}
-   v VEC:COUNT 0 ?do pl v i VEC:AT @ PENDING-KEY HELD+ loop ;
+   v VEC:COUNT 0 ?do pl v i VEC:AT @ PENDING-KEY HELD+ loop
+   v VEC:COUNT 0<> ;
 
 : RETAINED? ( DROPBOX:hash ^VEC:vector<DROPBOX:hash> -- bool )
    {: h:DROPBOX:hash kept :}

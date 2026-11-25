@@ -191,6 +191,9 @@
 \   line logged, while other.txt syncs in the same pass.
 \ - A-HELD-COLLISION-HOLDS-THE-PATHS-BENEATH-IT: the refused copy also
 \   holds the local file node/inner.txt, unplanned and unstaged.
+\ - A-REFUSED-CONFLICT-COPY-PREVENTS-REST: a new divergent conflict whose
+\   Dropbox copy's download is refused 409 records no conflict, and the
+\   pass does not rest.
 \ Directory deletions against the fake Dropbox, Rust's tests of the same
 \ names, with no account request:
 \ - remote_directory_deletion_removes_local_directories_deepest_first
@@ -3225,8 +3228,13 @@ TYPED-VARIABLE RACED-INSTALL str
 
 : REPORTS ( report -- )
    RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
-   replayed 2 T= planned 2 T= blocked 0 T= conflicts 0 T= ;
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n
+      rested:bool :}
+   replayed 2 T= planned 2 T= blocked 0 T= conflicts 0 T=
+   rested TFALSE ;
+
+: RESTED-IN ( report -- bool )
+   RECONCILE-REPORT:UNMAKE {: r:n o:n p:n b:n e:n c:n s:bool :} s ;
 
 \ The baseline at path p is present as rem.
 : BASELINE-AT ( ^run str MODEL:remote -- )
@@ -3265,6 +3273,8 @@ TYPED-VARIABLE RACED-INSTALL str
    x RUN-JOURNAL @ ar JOURNAL:CONFLICTS VEC:COUNT 0 T=
    TEST-DROPBOX:SEEN$ PASS-SEEN$ T$=
    s" /upload.txt" UPLOAD$ ar UPLOAD-SENT
+   s" upload.txt" s" 01701" UPLOAD$ s" cursor-rested" ar LISTED-ALONE
+   x rec PASSED COMPLETE RESTED-IN TTRUE
    d x STEP-GONE ;
 
 : PASS-CASES ( ^ARENA:arena -- )
@@ -3312,20 +3322,24 @@ TYPED-VARIABLE RACED-INSTALL str
 
 : STALE-NOOPED ( report -- )
    RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n
+      rested:bool :}
    noops 1 T= blocked 0 T= ;
 
 \ The report's planned, replayed and blocked counts are p, r and b.
 : COUNTED ( report n n n -- )
    {: p:n r:n b:n :}
    RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n
+      rested:bool :}
    planned p T= replayed r T= blocked b T= ;
 
+\ Nothing planned or replayed, yet the kept plan stays live: no rest.
 : STALE-BLOCKED ( report -- )
    RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
-   blocked 1 T= ;
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n
+      rested:bool :}
+   planned 0 T= replayed 0 T= blocked 1 T= rested TFALSE ;
 
 \ Rust's listings: file.txt current on the first page, then two
 \ empty continuations; the fake holds it for the upload.
@@ -3432,11 +3446,11 @@ TYPED-VARIABLE RACED-INSTALL str
 \ ---- download blocks against the fake Dropbox ----------------------
 
 : REPLAYED-IN ( report -- n )
-   RECONCILE-REPORT:UNMAKE {: r:n o:n p:n b:n e:n c:n :} r ;
+   RECONCILE-REPORT:UNMAKE {: r:n o:n p:n b:n e:n c:n s:bool :} r ;
 : PLANNED-IN ( report -- n )
-   RECONCILE-REPORT:UNMAKE {: r:n o:n p:n b:n e:n c:n :} p ;
+   RECONCILE-REPORT:UNMAKE {: r:n o:n p:n b:n e:n c:n s:bool :} p ;
 : BLOCKED-IN ( report -- n )
-   RECONCILE-REPORT:UNMAKE {: r:n o:n p:n b:n e:n c:n :} b ;
+   RECONCILE-REPORT:UNMAKE {: r:n o:n p:n b:n e:n c:n s:bool :} b ;
 
 : BLOCKED-STATUS? ( JOURNAL:plan-record -- bool )
    STATUS-OF MATCH JOURNAL:plan-status
@@ -3815,7 +3829,8 @@ TYPED-VARIABLE RACED-INSTALL str
 
 : SETTLED-REPORT ( report -- )
    RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n
+      rested:bool :}
    blocked 0 T= errors 0 T= ;
 
 \ Rust's assert_corrupt_upload_stage_recovers, the plan blocked before
@@ -3859,7 +3874,8 @@ TYPED-VARIABLE RACED-INSTALL str
 
 : SPECIAL-REPORT ( report -- )
    RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n
+      rested:bool :}
    blocked 1 T= errors 1 T= ;
 
 \ The one blocked plan is blocked.txt's, for its occupied stage.
@@ -3903,7 +3919,8 @@ TYPED-VARIABLE RACED-INSTALL str
 
 : CHANGED-REPORT ( report -- )
    RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n
+      rested:bool :}
    replayed 1 T= ;
 
 : CHANGED-UPLOAD-SUPERSEDES-A-REJECTED-PLAN-BEFORE-DEADLINE
@@ -4087,7 +4104,8 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
 
 : COPY-CONFLICTS ( report -- n )
    RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n
+      rested:bool :}
    conflicts ;
 
 : CONFLICTS-OF ( ^run -- ^VEC:vector<JOURNAL:conflict-record> )
@@ -4538,7 +4556,8 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
 
 : SIBLING-REPORTS ( report -- )
    RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n
+      rested:bool :}
    planned 1 T= replayed 1 T= conflicts 0 T= blocked 0 T= ;
 
 : SIBLING-DELETE$ ( -- str )
@@ -4651,7 +4670,8 @@ $1C0 constant OWNER-ACCESS
 
 : LOCKED-REPORTS ( report -- )
    RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n
+      rested:bool :}
    planned 1 T= replayed 1 T= blocked 2 T= conflicts 0 T= ;
 
 : INACCESSIBLE-DIRECTORY-NEVER-DELETES-ITS-DROPBOX-CONTENTS
@@ -4776,7 +4796,8 @@ $1C0 constant OWNER-ACCESS
 
 : EDITS-REPORTED ( report -- )
    RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n
+      rested:bool :}
    planned 2 T=
    \ Departure 2: b's download installs in the pass, so it is replayed
    \ and not blocked.
@@ -5016,12 +5037,14 @@ $1C0 constant OWNER-ACCESS
 : SETTLED ( report n -- )
    {: k:n :}
    RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n
+      rested:bool :}
    noops k T= planned 0 T= ;
 
 : JOURNAL-CREATED ( report -- )
    RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n
+      rested:bool :}
    planned 1 T= replayed 1 T= ;
 
 : DELTA-FOLDER-WITH-MISCASED-PARENTS-IS-CREATED-INSIDE-THE-LOCAL-TREE
@@ -5124,7 +5147,8 @@ $1C0 constant OWNER-ACCESS
 
 : NOOP-REPORTS ( report -- )
    RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n
+      rested:bool :}
    noops 1 T= planned 0 T= replayed 0 T= ;
 
 \ The inventory's one record, keyed and spelled report.txt.
@@ -5346,7 +5370,8 @@ $1C0 constant OWNER-ACCESS
 
 : KEPT-REPORTS ( report -- )
    RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n
+      rested:bool :}
    planned 2 T= conflicts 0 T= ;
 
 \ Foo.txt replaced by the newer bytes, the variant kept.
@@ -5509,7 +5534,8 @@ $1C0 constant OWNER-ACCESS
 \ The complete pass's replayed and planned counts.
 : REPLAYED-PLANNED ( outcome -- n n )
    COMPLETE RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n
+      rested:bool :}
    replayed planned ;
 
 : KIND-OF ( MODEL:baseline -- str )
@@ -5835,6 +5861,15 @@ $180 constant MODE-0600
 : REFUSE-COPY ( -- )
    409 s" " s" " LOOKUP-NOT-FOUND$ TEST-DROPBOX:SCRIPT! ;
 
+\ Nothing planned or replayed, node alone held: the held collision
+\ is all that prevents rest.
+: STILL-HELD ( report -- )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n
+      rested:bool :}
+   planned 0 T= replayed 0 T= blocked 1 T= conflicts 0 T=
+   rested TFALSE ;
+
 : A-REFUSED-COLLISION-COPY-HOLDS-ITS-PATH ( ^ARENA:arena -- )
    {: ar :}
    s" a refused collision copy holds its path" T-LABEL
@@ -5845,6 +5880,29 @@ $180 constant MODE-0600
    s" rev-held" COLLIDED$ TEST-DROPBOX:CONTENT!
    [: REFUSE-COPY ;] TEST-DROPBOX:DURING-LISTING!
    d x rec s" download_unavailable 409" NODE-HELD
+   [: REFUSE-COPY ;] TEST-DROPBOX:DURING-LISTING!
+   s" held-again" ar EMPTY-PAGE
+   x rec PASSED COMPLETE STILL-HELD
+   d x STEP-GONE ;
+
+\ Nothing planned, replayed or recorded: the new conflict's held copy is
+\ all that prevents rest.
+: COPY-UNRESTED ( report -- )
+   RECONCILE-REPORT:UNMAKE
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n
+      rested:bool :}
+   planned 0 T= replayed 0 T= conflicts 0 T= rested TFALSE ;
+
+: A-REFUSED-CONFLICT-COPY-PREVENTS-REST ( ^ARENA:arena -- )
+   {: ar :}
+   s" a refused conflict copy prevents rest" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" cursor-refused" DIVERGED
+   s" rev-remote" DIVERGED-REMOTE$ TEST-DROPBOX:CONTENT!
+   [: REFUSE-COPY ;] TEST-DROPBOX:DURING-LISTING!
+   x rec PASSED COMPLETE COPY-UNRESTED
    d x STEP-GONE ;
 
 : AN-UNVERIFIED-COLLISION-COPY-HOLDS-ITS-PATH ( ^ARENA:arena -- )
@@ -5884,6 +5942,7 @@ $180 constant MODE-0600
    ar OCCUPIED-COLLISION-STAGE-USES-THE-NEXT-SYNCHRONIZED-NAME
    ar CHANGED-DROPBOX-FILE-DURING-DIRECTORY-CONVERSION-REPLANS-WITHOUT-A-CONFLICT-ROW
    ar A-REFUSED-COLLISION-COPY-HOLDS-ITS-PATH
+   ar A-REFUSED-CONFLICT-COPY-PREVENTS-REST
    ar AN-UNVERIFIED-COLLISION-COPY-HOLDS-ITS-PATH
    ar A-HELD-COLLISION-HOLDS-THE-PATHS-BENEATH-IT ;
 
@@ -5975,7 +6034,8 @@ $180 constant MODE-0600
    x s" gone/child" SEED-DIRECTORY-BASELINE
    s" directories-deleted" ar EMPTY-PAGE
    x rec PASSED COMPLETE RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n
+      rested:bool :}
    planned 2 T= replayed 2 T=
    x s" gone" IN-ROOT FS:EXISTS? TFALSE
    x s" gone" NO-BASELINE? TTRUE
@@ -6205,7 +6265,8 @@ TYPED-VARIABLE RACED str
 \ The report's replayed and sync-errors.
 : REPLAYED-ERRORS ( report -- n n )
    RECONCILE-REPORT:UNMAKE
-   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n :}
+   {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n
+      rested:bool :}
    replayed errors ;
 
 \ Rust's replay_local_operations: the pending plans' local operations

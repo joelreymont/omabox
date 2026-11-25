@@ -724,7 +724,7 @@ FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
    ;MATCH ;
 
 : REPORT-LOGGED ( RECONCILE:report -- )
-   RECONCILE-REPORT:UNMAKE {: r n p b e c :}
+   RECONCILE-REPORT:UNMAKE drop {: r n p b e c :}
    LOG:INFO s" daemon" LOG:LINE s" reconciliation pass completed" LOG:TEXT+
    s"  replayed_operations=" LOG:TEXT+ r LOG:INT+
    s"  noops=" LOG:TEXT+ n LOG:INT+
@@ -736,7 +736,7 @@ FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
 : COMPLETED ( RECONCILE:report -- sync-event )
    {: rep :}
    rep REPORT-LOGGED
-   rep RECONCILE-REPORT:UNMAKE {: r n p b e c :}
+   rep RECONCILE-REPORT:UNMAKE drop {: r n p b e c :}
    e 0= if construct sync-event clean exit then
    construct sync-event dirty ;
 
