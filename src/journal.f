@@ -1474,9 +1474,12 @@ public
    [: n 1 SQLITE:BIND-INT p 2 SQLITE:BIND-BLOB CLEAN-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
-\ Marks wd n's folder stirred; an unrecorded wd changes nothing.
-: WATCH-STIR ( journal n -- )
-   s" UPDATE temp.watches SET mark = 1 WHERE wd = ?1" ON-WD ;
+\ Marks wd n's folder stirred; false when no record has wd n.
+: WATCH-STIR ( journal n -- bool )
+   {: j n :}
+   j >CONNECTION
+   s" UPDATE temp.watches SET mark = 1 WHERE wd = ?1 RETURNING wd"
+   [: n 1 SQLITE:BIND-INT SQLITE:STEP swap ;] SQLITE:WITH-STATEMENT ;
 
 \ Marks wd n's folder listed by the running scan.
 : WATCH-LISTED ( journal n -- )

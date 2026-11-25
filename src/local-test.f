@@ -340,7 +340,8 @@ EXPORT CONFLICT-NAME
 EXPORT RENAME-CASE-VARIANT-WITH
 ;package
 
-\ JOURNAL reopened: a scan case makes its watch records refuse a stir.
+\ JOURNAL reopened: a scan case makes its watch records refuse a stir or
+\ a delete.
 package JOURNAL
 public
 
@@ -350,6 +351,16 @@ public
    >CONNECTION
    s" CREATE TEMP TRIGGER stirs_refused BEFORE UPDATE ON watches
       BEGIN SELECT RAISE(ABORT, 'stir refused'); END" SQLITE:EXEC ;
+
+\ Every later delete of the journal's watch records fails, a reset's too,
+\ until DELETES-ALLOWED.
+: DELETES-REFUSED ( journal -- )
+   >CONNECTION
+   s" CREATE TEMP TRIGGER deletes_refused BEFORE DELETE ON watches
+      BEGIN SELECT RAISE(ABORT, 'delete refused'); END" SQLITE:EXEC ;
+
+: DELETES-ALLOWED ( journal -- )
+   >CONNECTION s" DROP TRIGGER temp.deletes_refused" SQLITE:EXEC ;
 
 ;package
 
@@ -1668,7 +1679,7 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    j awd JOURNAL:WATCH-LISTED
    s" a/f.txt" REMOVE  s" a" AT FS:REMOVE-DIR
    j w WATCH-HEAR 1 >= TTRUE  j STIRRED$ s" " T$=
-   j rwd JOURNAL:WATCH-LISTED  j awd JOURNAL:WATCH-STIR
+   j rwd JOURNAL:WATCH-LISTED  j awd JOURNAL:WATCH-STIR TFALSE
    j STIRRED$ s" -" T$= ;
 
 \ The root moved away blinds the watch; it is moved back.
@@ -1884,7 +1895,7 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    PUBLISH
    WATCHER @ s" a" ADDED-WD {: awd:n :}
    s" a/y" s" y1" WRITE  s" a" DENY  WATCHER @ DRAINED
-   JNL @ awd JOURNAL:WATCH-STIR
+   JNL @ awd JOURNAL:WATCH-STIR TTRUE
    PUBLISH
    INVENTORY {: s :}
    s s" a/x" SCANNED-CONTENT s" x1" IDENTITY T$=
@@ -1911,7 +1922,8 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    JNL @ WATCHER @ s" d" CLEAN? TTRUE ;
 
 \ a's record stirred, as a write in a would.
-: A-STIRRED ( -- ) JNL @ WATCHER @ s" a" ADDED-WD JOURNAL:WATCH-STIR ;
+: A-STIRRED ( -- )
+   JNL @ WATCHER @ s" a" ADDED-WD JOURNAL:WATCH-STIR TTRUE ;
 
 \ a listed as if on another device publishes a/b unknown and a/b/x gone;
 \ a/b's record, clean before, does not keep a/b from being listed again.
@@ -2055,6 +2067,51 @@ variable HEARD-CODE
    WATCHER @ STATE$ s" blind" T$=
    WATCHER @ WATCH-INSTANCE @ FD-SOME? TFALSE ;
 
+variable ARM-CODE
+
+\ The watch records refuse a delete: the root in doubt still blinds the
+\ armed watch; the next scan's start, whose arming forgets them, throws
+\ and leaves it blind with no instance. Allowed again, a scan arms it.
+: A-FAILED-ARM-LEAVES-THE-WATCH-BLIND ( -- )
+   s" a_failed_arm_leaves_the_watch_blind" T-LABEL
+   s" a" MKDIR
+   PUBLISH
+   JNL @ JOURNAL:DELETES-REFUSED
+   JNL @ WATCHER @ WATCH-DOUBT
+   WATCHER @ STATE$ s" blind" T$=
+   WATCHER @ WATCH-INSTANCE @ FD-SOME? TFALSE
+   [: [: PUBLISH ;] catch ARM-CODE ! ;]
+   STDERR-OF s" delete refused" STR:COUNT-SUB 1 T=
+   ARM-CODE @ SQLITE:E-SQL T=
+   WATCHER @ STATE$ s" blind" T$=
+   WATCHER @ WATCH-INSTANCE @ FD-SOME? TFALSE
+   JNL @ JOURNAL:DELETES-ALLOWED
+   PUBLISH
+   WATCHER @ WATCH-FD FD-SOME? TTRUE ;
+
+FS:PATHZ-CAP BUFFER: MOVED-AT-BUF
+
+\ The name below MOVED$.
+: MOVED-AT ( str -- str )
+   {: p:str :}
+   MOVED$ p MOVED-AT-BUF FS:JOIN-PATH MOVED-AT-BUF swap >str ;
+
+\ a/b moved out of the root and published, its record forgotten: the
+\ first write in it is heard and unwatches it, so the second is not.
+: UNWATCHED-OUT ( -- )
+   s" a/b" AT MOVED$ FS:RENAME-FILE
+   PUBLISH
+   s" x" MOVED-AT s" x1" FS:WRITE-ALL
+   JNL @ WATCHER @ WATCH-HEAR 1 >= TTRUE  JNL @ STIRRED$ s" -" T$=
+   s" y" MOVED-AT s" y1" FS:WRITE-ALL
+   JNL @ WATCHER @ WATCH-HEAR 0 T= ;
+
+: A-FOLDER-MOVED-OUT-IS-UNWATCHED-WHEN-IT-SPEAKS ( -- )
+   s" a_folder_moved_out_is_unwatched_when_it_speaks" T-LABEL
+   s" a" MKDIR s" a/b" MKDIR
+   PUBLISH
+   [: UNWATCHED-OUT ;] [: MOVED$ FS:REMOVE-TREE ;] finally ;
+
 : CASES ( -- )
    [: SCAN-PUBLISHES-EMPTY-AND-NESTED-DIRECTORIES ;] IN-SCAN-CASE
    [: FILE-LOCKED-AFTER-ENUMERATION-IS-INACCESSIBLE ;] IN-SCAN-CASE
@@ -2116,6 +2173,7 @@ variable HEARD-CODE
    [: A-WATCH-HEARS-ITS-FOLDERS-AND-BLINDS-ON-A-LOSS ;] IN-CASE
    [: AN-OVERFLOW-BLINDS-THE-WATCH ;] IN-SCAN-CASE
    [: A-THROW-WHILE-HEARING-BLINDS-THE-WATCH ;] IN-SCAN-CASE
+   [: A-FAILED-ARM-LEAVES-THE-WATCH-BLIND ;] IN-SCAN-CASE
    [: A-REFUSED-WATCH-LOGS-ONCE-PER-ARMING ;] IN-CASE
    [: A-PUBLISHED-SCAN-ARMS-THE-WATCH ;] IN-SCAN-CASE
    [: A-ROOT-CHANGED-SCAN-LEAVES-NO-FOLDER-CLEAN ;] IN-SCAN-CASE
@@ -2123,6 +2181,7 @@ variable HEARD-CODE
    [: AN-UNCHANGED-TREE-RESCANS-WITHOUT-A-WRITE ;] IN-SCAN-CASE
    [: A-STIRRED-FOLDER-BELOW-A-CLEAN-ONE-IS-LISTED ;] IN-SCAN-CASE
    [: A-FOLDER-MOVED-OUT-IS-DROPPED ;] IN-SCAN-CASE
+   [: A-FOLDER-MOVED-OUT-IS-UNWATCHED-WHEN-IT-SPEAKS ;] IN-SCAN-CASE
    [: A-FOLDER-MOVED-OUT-AND-BACK-IS-LISTED-AGAIN ;] IN-SCAN-CASE
    [: A-REPLACED-FOLDER-IS-LISTED-ANEW ;] IN-SCAN-CASE
    [: AN-INACCESSIBLE-STIRRED-FOLDER-IS-TRIED ;] IN-SCAN-CASE

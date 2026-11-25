@@ -2557,13 +2557,13 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
 \ answers them, a-b stirred again once listed.
 : STIRS-LISTED ( scan journal ^ARENA:arena -- scan )
    {: j ar :}
-   j 1 WATCH-STIR
+   j 1 WATCH-STIR TTRUE
    j ar NEXT-STIRRED 1 s" a/x" STIRRED-AT? TTRUE
-   j 2 WATCH-STIR
+   j 2 WATCH-STIR TTRUE
    j ar NEXT-STIRRED 2 s" a-b" STIRRED-AT? TTRUE
    j 2 WATCH-LISTED
    j ar NEXT-STIRRED 1 s" a/x" STIRRED-AT? TTRUE
-   j 2 WATCH-STIR
+   j 2 WATCH-STIR TTRUE
    j ar NEXT-STIRRED 2 s" a-b" STIRRED-AT? TTRUE
    j 2 WATCH-LISTED
    j 1 WATCH-LISTED
@@ -2578,7 +2578,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
    j 2 s" a-b" WATCH-RECORD
    j 3 s" a" WATCH-RECORD
    j ar NEXT-STIRRED NONE-STIRRED? TTRUE
-   j 1 WATCH-STIR  j 2 WATCH-STIR  j 3 WATCH-STIR
+   j 1 WATCH-STIR TTRUE  j 2 WATCH-STIR TTRUE  j 3 WATCH-STIR TTRUE
    j ar NEXT-STIRRED 3 s" a" STIRRED-AT? TTRUE
    j [: j b ALL-PUBLISHED ;] WITH-SCAN
    j ar NEXT-STIRRED NONE-STIRRED? TTRUE
@@ -2596,14 +2596,14 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
    j 1 s" a" WATCH-RECORD
    j 2 s" b" WATCH-RECORD
    j [: j b ALL-PUBLISHED ;] WITH-SCAN
-   j 9 WATCH-STIR
+   j 9 WATCH-STIR TFALSE
    j WATCH-COUNT 2 T=
    j ar NEXT-STIRRED NONE-STIRRED? TTRUE
    j 1 s" c" WATCH-RECORD
    j WATCH-COUNT 2 T=
    j 1 s" a" WATCH-CLEAN? TFALSE
    j ar NEXT-STIRRED NONE-STIRRED? TTRUE
-   j 1 WATCH-STIR
+   j 1 WATCH-STIR TTRUE
    j ar NEXT-STIRRED 1 s" c" STIRRED-AT? TTRUE
    j 1 WATCH-FORGET
    j WATCH-COUNT 1 T=
@@ -2611,7 +2611,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
    j 2 s" b" WATCH-CLEAN? TTRUE
    j 3 s" " WATCH-RECORD
    j ar NEXT-STIRRED NONE-STIRRED? TTRUE
-   j 3 WATCH-STIR
+   j 3 WATCH-STIR TTRUE
    j ar NEXT-STIRRED 3 s" " STIRRED-AT? TTRUE
    j WATCHES-RESET
    j WATCH-COUNT 0 T=

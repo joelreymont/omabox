@@ -1263,11 +1263,11 @@ ARENA WATCHES watch
 \ The instance is already in the watch, with no watch added yet.
 : ARM ( ^watch -- ) WATCH-JOURNAL @ JOURNAL:WATCHES-RESET ;
 
-\ The records go before the instance: a failed reset leaves both.
+\ Going blind writes nothing, so it cannot fail;
+\ the records are read by nothing until ARM forgets them.
 : BLIND ( ^watch -- )
    {: w :}
-   w WATCH-JOURNAL @ JOURNAL:WATCHES-RESET  w CLOSED
-   NO-WD w WATCH-ROOT-WD ! ;
+   w CLOSED  NO-WD w WATCH-ROOT-WD ! ;
 
 \ An armed watch logs its next refusal, whatever errno was last logged.
 : STAMP ( ^watch -- )
@@ -1352,13 +1352,15 @@ FSM:DEFINE WATCHING ( ^watch ) watch-state watch-event
    m INOTIFY:IN-DELETE-SELF INOTIFY:IN-MOVE-SELF or
    INOTIFY:IN-IGNORED or SET? ;
 
-\ One event read; after a loss the rest are dropped.
-: HEARD ( n n JOURNAL:journal ^watch -- )
-   {: wd:n m:n j w :}
+\ One event read; after a loss the rest are dropped, and a wd with no
+\ record is unwatched.
+: HEARD ( n n JOURNAL:journal ^watch fd -- )
+   {: wd:n m:n j w f:fd :}
    w WATCH-LOSS @ if exit then
    w wd m LOSS? if true w WATCH-LOSS ! exit then
    m INOTIFY:IN-IGNORED SET? if j wd JOURNAL:WATCH-FORGET exit then
-   j wd JOURNAL:WATCH-STIR ;
+   j wd JOURNAL:WATCH-STIR if exit then
+   f wd INOTIFY:UNWATCH ;
 
 \ The loss is stepped once the reads are done: it closes the instance.
 \ Any throw while hearing loses the events read, so it steps lost too; a
@@ -1366,7 +1368,7 @@ FSM:DEFINE WATCHING ( ^watch ) watch-state watch-event
 : HEARD-ALL ( JOURNAL:journal ^watch fd -- n )
    {: j w f:fd :}
    false w WATCH-LOSS !
-   0 [: drop f [: j w HEARD ;] INOTIFY:EACH ;] catch {: code:n :}
+   0 [: drop f [: j w f HEARD ;] INOTIFY:EACH ;] catch {: code:n :}
    code 0= if
       w WATCH-LOSS @ if j w construct watch-event lost STEPPED then exit
    then
@@ -1381,14 +1383,16 @@ FSM:DEFINE WATCHING ( ^watch ) watch-state watch-event
    then
    construct watch-event start ;
 
-\ A blind watch opens an instance: arming, or still blind if refused.
+\ A blind watch opens an instance: arming, or still blind if refused or
+\ if the start throws, which closes the instance and is rethrown.
 : OPENED ( JOURNAL:journal ^watch -- )
    {: j w :}
    INOTIFY:OPEN MATCH option
       none OF j w construct watch-event refused STEPPED ENDOF
       some OF
          OPTION:SOME w WATCH-INSTANCE !
-         j w construct watch-event start STEPPED
+         [: j w construct watch-event start STEPPED ;] catch {: code:n :}
+         code 0<> if w CLOSED code throw then
       ENDOF
    ;MATCH ;
 
@@ -1445,7 +1449,8 @@ public
    NO-FD ;
 
 \ Stirs or forgets the records the pending events name; answers how many
-\ it read, 0 while blind or after a read failure, which blinds it.
+\ it read, 0 while blind or after a read failure. Any failure while
+\ hearing blinds the watch; one but a read failure is rethrown.
 : WATCH-HEAR ( JOURNAL:journal ^watch -- n )
    {: j w :}
    w WATCH-INSTANCE @ MATCH option
@@ -1918,11 +1923,12 @@ SUBTREE-INSTALL
    ;MATCH ;
 
 \ STIRRED-LISTED of the first stirred record, its path in ar; true once
-\ none is stirred.
+\ none is stirred. Records are read only while armed: blinded, it is done.
 : STIRRED-NEXT
    ( JOURNAL:scan ^ARENA:arena fd scan-context -- JOURNAL:scan bool )
    {: ar:^ARENA:arena rfd:fd cx:scan-context :}
    cx SCAN-CONTEXT-UNMAKE {: cut:option<MODEL:cutoff> dev:n j w :}
+   w ARMED? 0= if true exit then
    j ar JOURNAL:NEXT-STIRRED MATCH option
       none OF true ENDOF
       some OF JOURNAL-STIRRED:UNMAKE {: wd:n p:str :}
