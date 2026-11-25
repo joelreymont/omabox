@@ -532,11 +532,13 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
 : REUSABLE ( -- ^VEC:vector<MODEL:hash-record> )
    JNL @ AR @ JOURNAL:LOCAL-HASH-CACHE ;
 
-\ Makes the records the journal's hash cache, its inventory empty.
+\ Makes the records the journal's hash cache, its inventory empty. No
+\ watch hears that write, so the watch is put in doubt, as an activation does.
 : SEED ( ^VEC:vector<MODEL:hash-record> -- )
    {: cache :}
    JNL @ BOUND @ AR @ [type] MODEL:local-record NEW-VEC cache
-   JOURNAL:PUBLISH-LOCAL-SCAN TTRUE ;
+   JOURNAL:PUBLISH-LOCAL-SCAN TTRUE
+   JNL @ WATCHER @ WATCH-DOUBT ;
 
 \ Rust's scan_and_publish_at: ROOT$ scanned with the journal's cache and
 \ published to it; cut decides which cached hashes the walk reuses, q
@@ -1738,7 +1740,7 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    JNL @ WATCHER @ PUBLISHED-ARMED ;
 
 \ With a stand-in active, a scan of the root ends root-changed: the
-\ watch stays armed, and the folders it listed are stirred again.
+\ watch stays armed, and the activation left no folder clean.
 : ABANDONED-STIRRED ( JOURNAL:journal ^watch -- )
    {: j w :}
    j w PUBLISHED-ARMED
@@ -1747,8 +1749,8 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    w WATCH-FD FD-SOME? TTRUE
    j w s" " CLEAN? TFALSE  j w s" a" CLEAN? TFALSE ;
 
-: AN-UNPUBLISHED-SCAN-LEAVES-ITS-FOLDERS-STIRRED ( -- )
-   s" an_unpublished_scan_leaves_its_folders_stirred" T-LABEL
+: A-ROOT-CHANGED-SCAN-LEAVES-NO-FOLDER-CLEAN ( -- )
+   s" a_root_changed_scan_leaves_no_folder_clean" T-LABEL
    s" a" MKDIR
    JNL @ WATCHER @ ABANDONED-STIRRED ;
 
@@ -1778,6 +1780,110 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    s" a" MKDIR s" a-b" MKDIR s" b" MKDIR
    s" a/x" s" x1" WRITE s" a-b/c" s" c" WRITE s" b/y" s" y1" WRITE
    JNL @ WATCHER @ CLEAN-SKIPPED ;
+
+\ The case's root scanned and published through the case's watch.
+: PUBLISH ( -- )
+   JNL @ ROOT$ WATCHER @ AR @ SCAN-AND-PUBLISH ROOT-CHANGED? TFALSE ;
+
+\ The armed watch's rescan with nothing stirred lists no folder, so the
+\ stored rows stay and the journal's file is not written.
+: AN-UNCHANGED-TREE-RESCANS-WITHOUT-A-WRITE ( -- )
+   s" an_unchanged_tree_rescans_without_a_write" T-LABEL
+   s" a" MKDIR s" a/x" s" x1" WRITE
+   PUBLISH
+   JNL @ JOURNAL:CHANGE-COUNTER {: before :}
+   PUBLISH
+   JNL @ JOURNAL:CHANGE-COUNTER before T=
+   INVENTORY s" a/x" SCANNED-CONTENT s" x1" IDENTITY T$= ;
+
+\ A write in a/b stirs a/b alone, which is listed beneath clean a.
+: A-STIRRED-FOLDER-BELOW-A-CLEAN-ONE-IS-LISTED ( -- )
+   s" a_stirred_folder_below_a_clean_one_is_listed" T-LABEL
+   s" a" MKDIR s" a/b" MKDIR s" a/b/x" s" x1" WRITE
+   PUBLISH
+   s" a/b/x" s" x2" WRITE
+   PUBLISH
+   INVENTORY s" a/b/x" SCANNED-CONTENT s" x2" IDENTITY T$=
+   JNL @ WATCHER @ s" a" CLEAN? TTRUE
+   JNL @ WATCHER @ s" a/b" CLEAN? TTRUE ;
+
+\ a/b moved out of the root: a's listing drops its rows, and a/b's
+\ record, its path gone, is dropped.
+: MOVED-OUT ( -- )
+   s" a/b" AT MOVED$ FS:RENAME-FILE
+   PUBLISH
+   INVENTORY {: s :}
+   s s" a" DIRECTORY SEEN
+   s s" a/b" MISSING SEEN  s s" a/b/x" MISSING SEEN
+   s ORDERED
+   JNL @ STIRRED$ s" -" T$= ;
+
+: A-FOLDER-MOVED-OUT-IS-DROPPED ( -- )
+   s" a_folder_moved_out_is_dropped" T-LABEL
+   s" a" MKDIR s" a/b" MKDIR s" a/b/x" s" x1" WRITE
+   PUBLISH
+   [: MOVED-OUT ;] [: MOVED$ FS:REMOVE-TREE ;] finally ;
+
+\ a/b moved out and made anew: a's listing lists the new a/b, and the
+\ old record, another wd at its path, is dropped.
+: MADE-ANEW ( -- )
+   s" a/b" AT MOVED$ FS:RENAME-FILE
+   s" a/b" MKDIR s" a/b/y" s" y1" WRITE
+   PUBLISH
+   INVENTORY {: s :}
+   s s" a/b/y" SCANNED-CONTENT s" y1" IDENTITY T$=
+   s s" a/b/x" MISSING SEEN
+   s ORDERED
+   JNL @ STIRRED$ s" -" T$=
+   JNL @ WATCHER @ s" a/b" CLEAN? TTRUE ;
+
+: A-REPLACED-FOLDER-IS-LISTED-ANEW ( -- )
+   s" a_replaced_folder_is_listed_anew" T-LABEL
+   s" a" MKDIR s" a/b" MKDIR s" a/b/x" s" x1" WRITE
+   PUBLISH
+   [: MADE-ANEW ;] [: MOVED$ FS:REMOVE-TREE ;] finally ;
+
+\ A stirred folder that cannot be opened keeps its stored rows and stays
+\ stirred; once it opens, it is listed.
+: AN-INACCESSIBLE-STIRRED-FOLDER-IS-TRIED ( -- )
+   s" an_inaccessible_stirred_folder_is_tried" T-LABEL
+   ROOT-USER? if exit then
+   s" a" MKDIR s" a/x" s" x1" WRITE
+   PUBLISH
+   WATCHER @ s" a" ADDED-WD {: awd:n :}
+   s" a/y" s" y1" WRITE  s" a" DENY  WATCHER @ DRAINED
+   JNL @ awd JOURNAL:WATCH-STIR
+   PUBLISH
+   INVENTORY {: s :}
+   s s" a/x" SCANNED-CONTENT s" x1" IDENTITY T$=
+   s s" a/y" MISSING SEEN
+   JNL @ STIRRED$ s" a" T$=
+   s" a" ALLOW
+   PUBLISH
+   INVENTORY s" a/y" SCANNED-CONTENT s" y1" IDENTITY T$= ;
+
+\ The watch's instance swapped for a pipe, which inotify refuses: the
+\ instance the real one was is closed first.
+: UNWATCHABLE ( ^watch -- )
+   {: w :}
+   w CLOSED
+   FD:PIPE {: r:fd wr:fd :}
+   wr DISCARD  r OPTION:SOME w WATCH-INSTANCE ! ;
+
+\ b, heard stirred, is refused its watch: the blinded scan is taken again
+\ in full, which lists a, whose write went unheard.
+: A-BLINDED-SCAN-RERUNS-IN-FULL ( -- )
+   s" a_blinded_scan_reruns_in_full" T-LABEL
+   s" a" MKDIR s" b" MKDIR s" a/x" s" x1" WRITE s" b/y" s" y1" WRITE
+   PUBLISH
+   s" a/x" s" x2" WRITE  WATCHER @ DRAINED  s" b/y" s" y2" WRITE
+   JNL @ WATCHER @ WATCH-HEAR 1 >= TTRUE
+   WATCHER @ UNWATCHABLE
+   [: PUBLISH ;] STDERR-OF REFUSALS 1 T=
+   INVENTORY {: s :}
+   s s" a/x" SCANNED-CONTENT s" x2" IDENTITY T$=
+   s s" b/y" SCANNED-CONTENT s" y2" IDENTITY T$=
+   WATCHER @ WATCH-FD FD-SOME? TTRUE ;
 
 : CASES ( -- )
    [: SCAN-PUBLISHES-EMPTY-AND-NESTED-DIRECTORIES ;] IN-SCAN-CASE
@@ -1840,8 +1946,14 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    [: A-WATCH-HEARS-ITS-FOLDERS-AND-BLINDS-ON-A-LOSS ;] IN-CASE
    [: A-REFUSED-WATCH-LOGS-ONCE-PER-ARMING ;] IN-CASE
    [: A-PUBLISHED-SCAN-ARMS-THE-WATCH ;] IN-SCAN-CASE
-   [: AN-UNPUBLISHED-SCAN-LEAVES-ITS-FOLDERS-STIRRED ;] IN-SCAN-CASE
-   [: A-SCAN-SKIPS-A-CLEAN-FOLDER ;] IN-SCAN-CASE ;
+   [: A-ROOT-CHANGED-SCAN-LEAVES-NO-FOLDER-CLEAN ;] IN-SCAN-CASE
+   [: A-SCAN-SKIPS-A-CLEAN-FOLDER ;] IN-SCAN-CASE
+   [: AN-UNCHANGED-TREE-RESCANS-WITHOUT-A-WRITE ;] IN-SCAN-CASE
+   [: A-STIRRED-FOLDER-BELOW-A-CLEAN-ONE-IS-LISTED ;] IN-SCAN-CASE
+   [: A-FOLDER-MOVED-OUT-IS-DROPPED ;] IN-SCAN-CASE
+   [: A-REPLACED-FOLDER-IS-LISTED-ANEW ;] IN-SCAN-CASE
+   [: AN-INACCESSIBLE-STIRRED-FOLDER-IS-TRIED ;] IN-SCAN-CASE
+   [: A-BLINDED-SCAN-RERUNS-IN-FULL ;] IN-SCAN-CASE ;
 
 public
 

@@ -3522,10 +3522,12 @@ TYPED-VARIABLE RACED-INSTALL str
    {: d:str x :}
    d s" journal.sqlite3" x RUN-ARENA @ INSIDE ;
 
-\ The run's journal opened again from its file in d.
+\ The run's journal opened again from its file in d. Its new connection
+\ holds no watch records, as after a restart, so the run's watch is doubted.
 : OPENED-AGAIN ( str ^run -- )
    {: d:str x :}
-   d x JOURNAL-FILE JOURNAL:OPEN x RUN-JOURNAL ! ;
+   d x JOURNAL-FILE JOURNAL:OPEN x RUN-JOURNAL !
+   x RUN-JOURNAL @ x RUN-WATCH @ LOCAL:WATCH-DOUBT ;
 
 \ The run's journal closed and opened again from its file in d.
 : REOPENED ( str ^run -- )

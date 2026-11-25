@@ -995,6 +995,90 @@ ENUM name-entry
    ;MATCH
    dir p s" sync installed file entry" SYNC-DIRECTORY ;
 
+\ ---- parents
+
+\ An open parent below the root, as Rust's (OwnedFd, OsString, PathBuf):
+\ its descriptor, then the last component and the parent's path, both
+\ spans of the path opened.
+STRUCTURE parent-dir
+   FIELD fd fd
+   FIELD name str
+   FIELD path str
+;STRUCTURE
+
+: DROP-DIR ( option<fd> -- ) drop ;
+
+: DUPLICATE-ROOT ( fd str -- fd )
+   {: root:fd p:str :}
+   -1 >FD [: drop root FD:DUPLICATE ;]
+   [: s" duplicate sync root descriptor" p IO-FAILURE ;] FS-FAILS ;
+
+\ Makes the directory p names in dir and syncs dir's entry; one that
+\ exists by now is used as it is.
+: MAKE-PARENT ( fd str str -- )
+   {: dir:fd name:str p:str :}
+   dir name FS:MODE-PRIVATE-DIR FS:TRY-MAKE-DIR-AT if
+      dir p s" sync newly created parent directory entry"
+      SYNC-DIRECTORY exit
+   then
+   FS:ERRNO FS:EEXIST = if exit then
+   dir name s" create download parent directory" p IO-FAILURE-AT ;
+
+\ The directory made and opened, then synced; a throw closes it.
+: MADE-DIRECTORY ( fd str str -- fd )
+   {: dir:fd name:str p:str :}
+   dir name p MAKE-PARENT
+   dir name p OPEN-DIRECTORY-AT {: next:fd :}
+   next [: next p s" sync newly created directory" SYNC-DIRECTORY ;]
+   CLOSING next ;
+
+\ After an open in dir failed: none for a missing name without create,
+\ else the directory made.
+: MISSING-DIRECTORY ( fd str str bool -- option<fd> )
+   {: dir:fd name:str p:str create:bool :}
+   FS:ERRNO FS:ENOENT <> if
+      dir name s" open root-confined directory" p IO-FAILURE-AT
+   then
+   create 0= if OPTION:NONE exit then
+   dir name p MADE-DIRECTORY OPTION:SOME ;
+
+: OPEN-COMPONENT ( fd str str bool -- option<fd> )
+   {: dir:fd name:str p:str create:bool :}
+   dir name FS:TRY-OPEN-DIR-AT MATCH option
+      none OF dir name p create MISSING-DIRECTORY ENDOF
+      some OF OPTION:SOME ENDOF
+   ;MATCH ;
+
+\ Opens each component of p from at on in the directory before
+\ it, dir first; each closes once the next opens or a throw passes.
+: DESCEND-PARENTS ( fd str n bool -- option<fd> )
+   {: dir:fd p:str at:n create:bool :}
+   p at NEXT-COMPONENT {: from:n to:n found:bool :}
+   found 0= if dir OPTION:SOME exit then
+   OPTION:NONE dir
+   [: DROP-DIR dir p from to PART p 0 to PART create OPEN-COMPONENT ;]
+   CLOSING dir DISCARD
+   MATCH option
+      none OF OPTION:NONE ENDOF
+      some OF p to create RECURSE ENDOF
+   ;MATCH ;
+
+\ Rust's open_parent: the parent of p's last component below the root,
+\ none when a directory on the way is missing; create makes those
+\ directories, each synced with its entry.
+: OPEN-PARENT ( fd str bool -- option<parent-dir> )
+   {: root:fd p:str create:bool :}
+   p SAFE-COMPONENTS drop
+   p SPLIT-LAST {: parent:n from:n to:n :}
+   root p DUPLICATE-ROOT p 0 parent PART 0 create DESCEND-PARENTS
+   MATCH option
+      none OF OPTION:NONE ENDOF
+      some OF {: f:fd :}
+         f p from to PART p 0 parent PART PARENT-DIR-MAKE
+         OPTION:SOME
+      ENDOF
+   ;MATCH ;
+
 \ ---- the scan
 
 \ Seconds a hash's file must have kept still before the cache may reuse
@@ -1341,6 +1425,15 @@ FSM:DEFINE WATCHING ( ^watch ) watch-state watch-event
 
 : WATCH-ABANDONED ( JOURNAL:journal ^watch -- )
    construct watch-event abandoned STEPPED ;
+
+\ Forgets wd's record and removes its watch from the instance, if any.
+: WATCH-DROP ( JOURNAL:journal ^watch n -- )
+   {: j w wd:n :}
+   j wd JOURNAL:WATCH-FORGET
+   w WATCH-INSTANCE @ MATCH option
+      none OF ENDOF
+      some OF wd INOTIFY:UNWATCH ENDOF
+   ;MATCH ;
 
 public
 
@@ -1749,6 +1842,99 @@ defer SCAN-SUBTREE
 : SUBTREE-INSTALL ( -- ) [: SCAN-NAMES ;] is SCAN-SUBTREE ;
 SUBTREE-INSTALL
 
+\ ---- the stirred folders
+
+\ The folder at p opened from the root, no-follow per component, and 0;
+\ none where a component is missing. After a throw ENTRY-CODE? names,
+\ none and the code.
+: STIRRED-OPEN ( fd str -- option<fd> n )
+   {: rfd:fd p:str :}
+   NO-FD [: DROP-DIR
+      [: rfd p DUPLICATE-ROOT p 0 false DESCEND-PARENTS ;]
+      ['] ENTRY-CODE? WITH-CONVERTS
+   ;] catch {: code:n :}
+   code 0<> if drop NO-FD then code STEP-CODE ;
+
+\ The open folder's CHECKED-LISTING by wd, its own stat the probe, and 0;
+\ after a throw ENTRY-CODE? names, nothing listed and the code.
+: STIRRED-NAMES
+   ( fd n str scan-context ^ARENA:arena -- ^VEC:vector<str> n )
+   {: dir:fd wd:n p:str cx:scan-context ar:^ARENA:arena :}
+   ar [type] str NEW-VEC {: unlisted :}
+   unlisted [: drop
+      [: dir p  dir p s" inspect stirred directory" STAT-FD
+         wd OPTION:SOME cx ar CHECKED-LISTING ;]
+      ['] ENTRY-CODE? WITH-CONVERTS
+   ;] catch {: code:n :}
+   code 0<> if drop unlisted then code STEP-CODE ;
+
+\ The open folder at p, watched by wd: its direct children merged with
+\ the stored rows in its range, and each folder they lead to not clean.
+: STIRRED-WATCHED
+   ( JOURNAL:scan fd n str scan-context ^ARENA:arena -- JOURNAL:scan )
+   {: dir:fd wd:n p:str cx:scan-context ar:^ARENA:arena :}
+   cx SCAN-CONTEXT-UNMAKE {: cut:option<MODEL:cutoff> dev:n j w :}
+   dir wd p cx ar STIRRED-NAMES {: names code:n :}
+   code 0<> if j wd JOURNAL:WATCH-TRIED exit then
+   p JOURNAL:SCAN-FROM
+   dir p names cx ar SCAN-NAMES
+   p JOURNAL:SCAN-TO ;
+
+\ The open folder at p watched anew: wd, its record's, lists it; another
+\ wd drops the record, or puts the watch in doubt for the root.
+: STIRRED-ADDED
+   ( JOURNAL:scan fd n str scan-context ^ARENA:arena -- JOURNAL:scan )
+   {: dir:fd wd:n p:str cx:scan-context ar:^ARENA:arena :}
+   cx SCAN-CONTEXT-UNMAKE {: cut:option<MODEL:cutoff> dev:n j w :}
+   w dir p WATCH-ADD MATCH option
+      none OF ENDOF
+      some OF {: got:n :}
+         got wd = if dir wd p cx ar STIRRED-WATCHED
+         else p STR:LEN 0= if j w WATCH-DOUBT else j w wd WATCH-DROP then
+         then
+      ENDOF
+   ;MATCH ;
+
+\ The stirred record of wd, folder p, opened from the root rfd and
+\ listed; replaced or missing, it is dropped, else a failure leaves it
+\ tried. Every outcome leaves the record not stirred, or the watch blind.
+: STIRRED-LISTED
+   ( JOURNAL:scan fd n str scan-context ^ARENA:arena -- JOURNAL:scan )
+   {: rfd:fd wd:n p:str cx:scan-context ar:^ARENA:arena :}
+   cx SCAN-CONTEXT-UNMAKE {: cut:option<MODEL:cutoff> dev:n j w :}
+   rfd p STIRRED-OPEN {: opened:option<fd> code:n :}
+   code 0<> if
+      FS:ERRNO REPLACED? if j w wd WATCH-DROP
+      else j wd JOURNAL:WATCH-TRIED then
+      exit
+   then
+   opened MATCH option
+      none OF j w wd WATCH-DROP ENDOF
+      some OF {: dir:fd :}
+         [: dir wd p cx ar STIRRED-ADDED ;] [: dir DISCARD ;] finally
+      ENDOF
+   ;MATCH ;
+
+\ STIRRED-LISTED of the first stirred record, its path in ar; true once
+\ none is stirred.
+: STIRRED-NEXT
+   ( JOURNAL:scan ^ARENA:arena fd scan-context -- JOURNAL:scan bool )
+   {: ar:^ARENA:arena rfd:fd cx:scan-context :}
+   cx SCAN-CONTEXT-UNMAKE {: cut:option<MODEL:cutoff> dev:n j w :}
+   j ar JOURNAL:NEXT-STIRRED MATCH option
+      none OF true ENDOF
+      some OF JOURNAL-STIRRED:UNMAKE {: wd:n p:str :}
+         rfd wd p cx ar STIRRED-LISTED false
+      ENDOF
+   ;MATCH ;
+
+\ The armed watch's walk: only the stirred folders, in path byte order,
+\ and what they lead to; every other stored row stays.
+: WALK-STIRRED ( JOURNAL:scan fd scan-context -- JOURNAL:scan )
+   {: rfd:fd cx:scan-context :}
+   JOURNAL:SCAN-STOP
+   begin [: rfd cx STIRRED-NEXT ;] ARENA:WITH until ;
+
 \ ---- the hash stage
 
 : NO-SCANNED-HASH ( -- scanned-hash )
@@ -1870,17 +2056,20 @@ SUBTREE-INSTALL
    rfd s" " names cx ar SCAN-NAMES ;
 
 \ The walk from the root, every path in byte order, each folder it lists
-\ watched and its record in j.
+\ watched and its record in j. While the watch is armed it lists only the
+\ stirred folders and what they lead to.
 : WALK-ROOT
    ( JOURNAL:scan fd MODEL:stat option<MODEL:cutoff> n JOURNAL:journal
      ^watch -- JOURNAL:scan )
    {: rfd:fd before:MODEL:stat cut:option<MODEL:cutoff> dev:n j w :}
    cut dev j w SCAN-CONTEXT-MAKE {: cx:scan-context :}
+   w ARMED? if rfd cx WALK-STIRRED exit then
    [: rfd before cx ROOT-LISTED ;] ARENA:WITH ;
 
-\ Rust's enumerate_scan_on_device: every entry on device into the scan;
-\ any other device is an unsupported subtree. A failure of the root's own
-\ throws and closes the root.
+\ Rust's enumerate_scan_on_device: every entry on device into the scan,
+\ or, while the watch is armed, those in the stirred folders and what
+\ they lead to; any other device is an unsupported subtree. A failure of
+\ the root's own throws and closes the root.
 : ENUMERATE-SCAN-ON-DEVICE
    ( JOURNAL:scan str fd MODEL:stat option<MODEL:cutoff> n JOURNAL:journal
      ^watch ^ARENA:arena -- JOURNAL:scan pending-scan )
@@ -1949,19 +2138,42 @@ private
    b JOURNAL:PUBLISH-SCAN 0= if ROOT-CHANGED exit then
    LOCAL-SCAN--PUBLICATION:PUBLISHED ;
 
+\ The scan, published unless the walk blinded a watch armed at its start:
+\ then none, its root closed and nothing published.
 : SCAN-PUBLISHED
    ( JOURNAL:scan JOURNAL:journal str ^watch option<MODEL:cutoff>
      [ -- option<MODEL:cutoff> ] ^ARENA:arena
-     -- scan-publication JOURNAL:scan )
+     -- option<scan-publication> JOURNAL:scan )
    {: j p:str w cut:option<MODEL:cutoff> q ar:^ARENA:arena :}
-   p cut j w ar ENUMERATE-SCAN q j FINISH-BOUND-SCAN-AT
+   w ARMED? {: armed:bool :}
+   p cut j w ar ENUMERATE-SCAN {: ps:pending-scan :}
+   armed w ARMED? 0= and if
+      ps PENDING-SCAN-UNMAKE
+      {: root:str rfd:fd before:MODEL:stat pa:^ARENA:arena :}
+      rfd DISCARD  OPTION:NONE swap exit
+   then
+   ps q j FINISH-BOUND-SCAN-AT
    MATCH option
       none OF ROOT-CHANGED ENDOF
       some OF j p ar PUBLISH-BOUND ENDOF
-   ;MATCH swap ;
+   ;MATCH OPTION:SOME swap ;
 
-\ The complete root through no-follow, descriptor-relative stats and
-\ directory opens, scanned into the journal's scan words and published.
+\ The watch starts the scan, taken again at once while it answers none:
+\ the blinded watch makes the next one full.
+: SCAN-STARTED
+   ( JOURNAL:journal str ^watch option<MODEL:cutoff>
+     [ -- option<MODEL:cutoff> ] ^ARENA:arena -- scan-publication )
+   {: j p:str w cut:option<MODEL:cutoff> q ar:^ARENA:arena :}
+   j w WATCH-STARTED drop
+   j [: j p w cut q ar SCAN-PUBLISHED ;] JOURNAL:WITH-SCAN
+   MATCH option
+      none OF j p w cut q ar RECURSE ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+\ The root through no-follow, descriptor-relative stats and directory
+\ opens, scanned into the journal's scan words and published; while the
+\ watch is armed, only the stirred folders and what they lead to.
 \ An inaccessible, changing, symlinked or special entry publishes as
 \ unknown with nothing beneath it, so a partial walk never passes for
 \ confirmed absence; only the root's own failures fail the scan. cut
@@ -1974,9 +2186,7 @@ private
      [ -- option<MODEL:cutoff> ] ^ARENA:arena -- scan-publication )
    {: j p:str w cut:option<MODEL:cutoff> q ar:^ARENA:arena :}
    j w WATCH-HEAR drop
-   j w WATCH-STARTED drop
-   j [: j p w cut q ar SCAN-PUBLISHED ;] JOURNAL:WITH-SCAN
-   {: pub:scan-publication :}
+   j p w cut q ar SCAN-STARTED {: pub:scan-publication :}
    pub MATCH scan-publication
       published OF j w WATCH-PUBLISHED ENDOF
       root-changed OF j w WATCH-ABANDONED ENDOF
@@ -1986,7 +2196,8 @@ private
 public
 
 \ p scanned with the journal's hash cache and published to it, in ar;
-\ the watch hears the scan's folders.
+\ the watch hears the scan's folders, and while it is armed the scan
+\ lists only the stirred folders and what they lead to.
 : SCAN-AND-PUBLISH
    ( JOURNAL:journal str ^watch ^ARENA:arena -- scan-publication )
    {: j p:str w ar:^ARENA:arena :}
@@ -1994,90 +2205,6 @@ public
    SCAN-AND-PUBLISH-AT ;
 
 private
-
-\ ---- parents
-
-\ An open parent below the root, as Rust's (OwnedFd, OsString, PathBuf):
-\ its descriptor, then the last component and the parent's path, both
-\ spans of the path opened.
-STRUCTURE parent-dir
-   FIELD fd fd
-   FIELD name str
-   FIELD path str
-;STRUCTURE
-
-: DROP-DIR ( option<fd> -- ) drop ;
-
-: DUPLICATE-ROOT ( fd str -- fd )
-   {: root:fd p:str :}
-   -1 >FD [: drop root FD:DUPLICATE ;]
-   [: s" duplicate sync root descriptor" p IO-FAILURE ;] FS-FAILS ;
-
-\ Makes the directory p names in dir and syncs dir's entry; one that
-\ exists by now is used as it is.
-: MAKE-PARENT ( fd str str -- )
-   {: dir:fd name:str p:str :}
-   dir name FS:MODE-PRIVATE-DIR FS:TRY-MAKE-DIR-AT if
-      dir p s" sync newly created parent directory entry"
-      SYNC-DIRECTORY exit
-   then
-   FS:ERRNO FS:EEXIST = if exit then
-   dir name s" create download parent directory" p IO-FAILURE-AT ;
-
-\ The directory made and opened, then synced; a throw closes it.
-: MADE-DIRECTORY ( fd str str -- fd )
-   {: dir:fd name:str p:str :}
-   dir name p MAKE-PARENT
-   dir name p OPEN-DIRECTORY-AT {: next:fd :}
-   next [: next p s" sync newly created directory" SYNC-DIRECTORY ;]
-   CLOSING next ;
-
-\ After an open in dir failed: none for a missing name without create,
-\ else the directory made.
-: MISSING-DIRECTORY ( fd str str bool -- option<fd> )
-   {: dir:fd name:str p:str create:bool :}
-   FS:ERRNO FS:ENOENT <> if
-      dir name s" open root-confined directory" p IO-FAILURE-AT
-   then
-   create 0= if OPTION:NONE exit then
-   dir name p MADE-DIRECTORY OPTION:SOME ;
-
-: OPEN-COMPONENT ( fd str str bool -- option<fd> )
-   {: dir:fd name:str p:str create:bool :}
-   dir name FS:TRY-OPEN-DIR-AT MATCH option
-      none OF dir name p create MISSING-DIRECTORY ENDOF
-      some OF OPTION:SOME ENDOF
-   ;MATCH ;
-
-\ Opens each component of p from at on in the directory before
-\ it, dir first; each closes once the next opens or a throw passes.
-: DESCEND-PARENTS ( fd str n bool -- option<fd> )
-   {: dir:fd p:str at:n create:bool :}
-   p at NEXT-COMPONENT {: from:n to:n found:bool :}
-   found 0= if dir OPTION:SOME exit then
-   OPTION:NONE dir
-   [: DROP-DIR dir p from to PART p 0 to PART create OPEN-COMPONENT ;]
-   CLOSING dir DISCARD
-   MATCH option
-      none OF OPTION:NONE ENDOF
-      some OF p to create RECURSE ENDOF
-   ;MATCH ;
-
-\ Rust's open_parent: the parent of p's last component below the root,
-\ none when a directory on the way is missing; create makes those
-\ directories, each synced with its entry.
-: OPEN-PARENT ( fd str bool -- option<parent-dir> )
-   {: root:fd p:str create:bool :}
-   p SAFE-COMPONENTS drop
-   p SPLIT-LAST {: parent:n from:n to:n :}
-   root p DUPLICATE-ROOT p 0 parent PART 0 create DESCEND-PARENTS
-   MATCH option
-      none OF OPTION:NONE ENDOF
-      some OF {: f:fd :}
-         f p from to PART p 0 parent PART PARENT-DIR-MAKE
-         OPTION:SOME
-      ENDOF
-   ;MATCH ;
 
 \ ---- download stages
 
