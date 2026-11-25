@@ -436,9 +436,16 @@ ARENA PENDINGS pending
    d k c QUERY {: e:^ :}
    d e d - >str ;
 
+\ The u bytes at b, u at most a cell, from one ENTROPY:RANDOM cell.
+: CELL-BYTES ( ^u8 n -- )
+   {: b:^ u:n :}
+   ENTROPY:RANDOM {: r:n :}
+   u 0 ?do r i 8 * rshift $FF and b i + c! loop ;
+
 : RANDOM ( ^u8 n -- )
    {: b:^ u:n :}
-   [: b u ENTROPY:FILL ;] catch {: code:n :}
+   [: u 0 ?do b i + u i - CELL min CELL-BYTES CELL +loop ;] catch
+   {: code:n :}
    code ENTROPY:E-FILL = if E-RANDOM FAIL then
    code 0<> if code throw then ;
 
