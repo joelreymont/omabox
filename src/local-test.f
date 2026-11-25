@@ -1668,6 +1668,39 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    s" a" MKDIR
    [: WATCHED ;] WITH-JOURNAL ;
 
+\ No descriptor, which inotify refuses to watch.
+: NO-DESCRIPTOR ( -- fd ) -1 >FD ;
+
+\ Folder a's watch, refused: none.
+: REFUSED-ADD ( ^watch -- )
+   NO-DESCRIPTOR s" a" WATCH-ADD WD-OF -1 T= ;
+
+\ How many refusals a log holds.
+: REFUSALS ( str -- n ) s" inotify refused" STR:COUNT-SUB ;
+
+\ An armed watch refused logs it and blinds; arming, it is refused with
+\ the same errno, logged already.
+: REFUSED-TWICE ( JOURNAL:journal ^watch -- )
+   {: j w :}
+   j w REARMED  w REFUSED-ADD  w WATCH-FD FD-SOME? TFALSE
+   j w WATCH-STARTED TFALSE  w STATE$ s" arming" T$=
+   w REFUSED-ADD  w STATE$ s" blind" T$= ;
+
+\ Armed anew and refused with the same errno, it logs again.
+: REFUSED-AFTER-ARMING ( JOURNAL:journal ^watch -- )
+   {: j w :}
+   j w REARMED  w REFUSED-ADD  w WATCH-FD FD-SOME? TFALSE ;
+
+: REFUSALS-LOGGED ( JOURNAL:journal -- )
+   {: j :}
+   AR @ NEW-WATCH {: w :}
+   [: j w REFUSED-TWICE ;] STDERR-OF REFUSALS 1 T=
+   [: j w REFUSED-AFTER-ARMING ;] STDERR-OF REFUSALS 1 T= ;
+
+: A-REFUSED-WATCH-LOGS-ONCE-PER-ARMING ( -- )
+   s" a_refused_watch_logs_once_per_arming" T-LABEL
+   [: REFUSALS-LOGGED ;] WITH-JOURNAL ;
+
 : CASES ( -- )
    [: SCAN-PUBLISHES-EMPTY-AND-NESTED-DIRECTORIES ;] IN-SCAN-CASE
    [: FILE-LOCKED-AFTER-ENUMERATION-IS-INACCESSIBLE ;] IN-SCAN-CASE
@@ -1726,7 +1759,8 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    [: CONVERTED-DENIAL-LOGS-NOTHING ;] IN-CASE
    [: ATTRIBUTES-ARE-LABELLED ;] IN-CASE
    FORMAL-HOLDS-THE-WATCH-TABLE
-   [: A-WATCH-HEARS-ITS-FOLDERS-AND-BLINDS-ON-A-LOSS ;] IN-CASE ;
+   [: A-WATCH-HEARS-ITS-FOLDERS-AND-BLINDS-ON-A-LOSS ;] IN-CASE
+   [: A-REFUSED-WATCH-LOGS-ONCE-PER-ARMING ;] IN-CASE ;
 
 public
 

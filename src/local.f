@@ -1604,7 +1604,8 @@ ENUM watch-event start due published refused abandoned lost doubt ;ENUM
 public
 
 \ A sync root's inotify watch, stepped by WATCHING; it holds an instance
-\ while arming or armed, none while blind.
+\ while arming or armed, none while blind. Its loss is set while
+\ WATCH-HEAR reads: an event said others were lost.
 STRUCTURE watch OPAQUE DERIVE addr
    FIELD state watch-state
    FIELD event watch-event
@@ -1613,6 +1614,7 @@ STRUCTURE watch OPAQUE DERIVE addr
    FIELD root-wd option<n>
    FIELD stamp n
    FIELD refusal n
+   FIELD loss bool
 ;STRUCTURE
 
 \ Seconds a changed folder must keep still before a scan lists it: past
@@ -1627,9 +1629,6 @@ private
 1000000000 constant NS-PER-S
 
 ARENA WATCHES watch
-
-\ Set while WATCH-HEAR reads: an event said others were lost.
-TYPED-VARIABLE LOSS bool
 
 : NO-FD ( -- option<fd> ) OPTION:NONE ;
 : NO-WD ( -- option<n> ) OPTION:NONE ;
@@ -1663,7 +1662,10 @@ TYPED-VARIABLE LOSS bool
    w CLOSED  w WATCH-JOURNAL @ JOURNAL:WATCHES-RESET
    NO-WD w WATCH-ROOT-WD ! ;
 
-: STAMP ( ^watch -- ) NOW-S swap WATCH-STAMP ! ;
+\ An armed watch logs its next refusal, whatever errno was last logged.
+: STAMP ( ^watch -- )
+   {: w :}
+   NOW-S w WATCH-STAMP !  0 w WATCH-REFUSAL ! ;
 
 \ Logs FS:ERRNO, inotify's refusal, unless it is the one last logged.
 : REFUSED ( ^watch -- )
@@ -1675,32 +1677,35 @@ TYPED-VARIABLE LOSS bool
    e FS:ERRNO$ LOG:TEXT+ LOG:;LINE
    e w WATCH-REFUSAL ! ;
 
+\ Logs the refusal while FS:ERRNO is still inotify's, then blinds.
+: REFUSED-BLIND ( ^watch -- ) dup REFUSED BLIND ;
+
 \ After formal/LocalWatch.tla.
 FSM:DEFINE WATCHING ( ^watch ) watch-state watch-event
    IN blind  SENSED
-      start      ARM      >arming
-      refused    REFUSED  >blind
-      due        -        >blind
-      published  -        >blind
-      abandoned  -        >blind
-      lost       -        >blind
-      doubt      -        >blind
+      start      ARM            >arming
+      refused    REFUSED        >blind
+      due        -              >blind
+      published  -              >blind
+      abandoned  -              >blind
+      lost       -              >blind
+      doubt      -              >blind
    IN arming  SENSED
-      published  STAMP    >armed
-      start      BLIND    >blind
-      due        BLIND    >blind
-      refused    BLIND    >blind
-      abandoned  BLIND    >blind
-      lost       BLIND    >blind
-      doubt      BLIND    >blind
+      published  STAMP          >armed
+      start      BLIND          >blind
+      due        BLIND          >blind
+      refused    REFUSED-BLIND  >blind
+      abandoned  BLIND          >blind
+      lost       BLIND          >blind
+      doubt      BLIND          >blind
    IN armed  SENSED
-      start      -        >armed
-      published  -        >armed
-      abandoned  -        >armed
-      due        BLIND    >blind
-      refused    BLIND    >blind
-      lost       BLIND    >blind
-      doubt      BLIND    >blind
+      start      -              >armed
+      published  -              >armed
+      abandoned  -              >armed
+      due        BLIND          >blind
+      refused    REFUSED-BLIND  >blind
+      lost       BLIND          >blind
+      doubt      BLIND          >blind
 ;DEFINE
 
 \ The journal goes in the watch for the step's actions.
@@ -1743,18 +1748,18 @@ FSM:DEFINE WATCHING ( ^watch ) watch-state watch-event
 \ One event read; after a loss the rest are dropped.
 : HEARD ( n n JOURNAL:journal ^watch -- )
    {: wd:n m:n j w :}
-   LOSS @ if exit then
-   w wd m LOSS? if true LOSS ! exit then
+   w WATCH-LOSS @ if exit then
+   w wd m LOSS? if true w WATCH-LOSS ! exit then
    m INOTIFY:IN-IGNORED SET? if j wd JOURNAL:WATCH-FORGET exit then
    j wd JOURNAL:WATCH-STIR ;
 
 \ The loss is stepped once the reads are done: it closes the instance.
 : HEARD-ALL ( JOURNAL:journal ^watch fd -- n )
    {: j w f:fd :}
-   false LOSS !
+   false w WATCH-LOSS !
    0 [: drop f [: j w HEARD ;] INOTIFY:EACH ;] catch {: code:n :}
    code 0= if
-      LOSS @ if j w construct watch-event lost STEPPED then exit
+      w WATCH-LOSS @ if j w construct watch-event lost STEPPED then exit
    then
    drop code INOTIFY:E-INOTIFY <> if code throw then
    j w construct watch-event lost STEPPED 0 ;
@@ -1800,8 +1805,8 @@ FSM:DEFINE WATCHING ( ^watch ) watch-state watch-event
    w ARMING? if j w construct watch-event start STEPPED then
    j w OPENED false ;
 
-\ The wd watching folder p, open as dir; none while blind or refused,
-\ which blinds the watch.
+\ The wd watching folder p, open as dir; none while blind or refused. A
+\ refusal is logged and blinds the watch.
 : WATCH-ADD ( ^watch fd str -- option<n> )
    {: w dir:fd p:str :}
    w WATCH-INSTANCE @ MATCH option
@@ -1822,7 +1827,7 @@ public
    [: CLOSED ;] WATCHES-NEW-DISPOSE {: w :}
    construct watch-state blind w WATCH-STATE !
    NO-FD w WATCH-INSTANCE !  NO-WD w WATCH-ROOT-WD !
-   0 w WATCH-STAMP !  0 w WATCH-REFUSAL !  w ;
+   0 w WATCH-STAMP !  0 w WATCH-REFUSAL !  false w WATCH-LOSS !  w ;
 
 \ The instance, readable when events are pending, while armed; else none.
 : WATCH-FD ( ^watch -- option<fd> )
