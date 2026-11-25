@@ -12,7 +12,11 @@
 \ facts, a denied rename's names both directories, one on a directory
 \ already closed gives none of its facts, a denied directory creation's
 \ names its parent and no entry, an existing directory's denial gives its
-\ entry, and a converted denial logs nothing; that upload stage collection
+\ entry, and a converted denial logs nothing, that WATCHING's lines are
+\ formal/LocalWatch.tla's, through TEST-FORMAL:HOLDS, which runs TLC, and
+\ that a real watch hears changes in its folders, goes blind when its
+\ root moves or is in doubt, and arms anew once a full scan's listings
+\ no longer stand; that upload stage collection
 \ removes only verified unreferenced content; then each stage outcome,
 \ each inspected download stage, a stage marker set, read and removed, a
 \ second mark failing with one xattr line on stderr, each upload stage
@@ -65,6 +69,7 @@ require src/journal.f
 require src/test-journal.f
 require src/local.f
 require src/test-client.f
+require src/test-formal.f
 
 \ LOCAL reopened for the stream a fragmenting reader feeds, its stage
 \ words, and the names of its private results' variants.
@@ -1557,6 +1562,112 @@ variable RAISED-ERRNO
    s" first" MKDIR s" second" MKDIR
    [: OPENS-ONLY-THE-ACTIVE-ROOT ;] WITH-JOURNAL ;
 
+\ ---- the watch
+
+: FORMAL-HOLDS-THE-WATCH-TABLE ( -- )
+   s" formal_holds_the_watch_table" T-LABEL
+   s" src/local.f" s" WATCHING" s" LocalWatch" AR @
+   TEST-FORMAL:HOLDS ;
+
+: STATE$ ( ^watch -- str )
+   WATCH-STATE @ MATCH watch-state
+      blind OF s" blind" ENDOF
+      arming OF s" arming" ENDOF
+      armed OF s" armed" ENDOF
+   ;MATCH ;
+
+: FD-SOME? ( option<fd> -- bool )
+   MATCH option
+      none OF false ENDOF
+      some OF drop true ENDOF
+   ;MATCH ;
+
+\ The wd, -1 for none.
+: WD-OF ( option<n> -- n )
+   MATCH option
+      none OF -1 ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+\ The first stirred folder's path; "-" for none.
+: STIRRED$ ( JOURNAL:journal -- str )
+   AR @ JOURNAL:NEXT-STIRRED MATCH option
+      none OF s" -" ENDOF
+      some OF JOURNAL-STIRRED:UNMAKE {: wd:n p:str :} p ENDOF
+   ;MATCH ;
+
+\ Folder p's watch added, recorded and listed, as a scan's walk does.
+: ADD-LISTED ( JOURNAL:journal ^watch str -- n )
+   {: j w p:str :}
+   p STR:LEN 0= if ROOT$ else p AT then
+   s" open watched folder" OPEN-ROOT {: f:fd :}
+   w f p WATCH-ADD WD-OF {: wd:n :}
+   f DISCARD  wd 0 >= TTRUE
+   j wd p JOURNAL:WATCH-RECORD  j wd JOURNAL:WATCH-LISTED  wd ;
+
+\ A full scan of the root alone, published.
+: REARMED ( JOURNAL:journal ^watch -- )
+   {: j w :}
+   j w WATCH-STARTED TFALSE
+   j w s" " ADD-LISTED drop  j w WATCH-PUBLISHED
+   w WATCH-FD FD-SOME? TTRUE ;
+
+FS:PATHZ-CAP BUFFER: MOVED-BUF
+
+\ The case's root with ".moved" after it.
+: MOVED$ ( -- str )
+   ROOT$ {: r:str :}  s" .moved" {: x:str :}
+   r STR:DATA MOVED-BUF r STR:LEN BYTE-COPY
+   x STR:DATA MOVED-BUF r STR:LEN + x STR:LEN BYTE-COPY
+   MOVED-BUF r STR:LEN x STR:LEN + >str ;
+
+\ A new watch arms through a full scan of the root and a; a write in a
+\ stirs a; a removed, its record goes and the root is stirred.
+: HEARS ( JOURNAL:journal ^watch -- )
+   {: j w :}
+   j w WATCH-STARTED TFALSE  w STATE$ s" arming" T$=
+   j w s" " ADD-LISTED {: rwd:n :}
+   j w s" a" ADD-LISTED {: awd:n :}
+   j w WATCH-PUBLISHED  w WATCH-FD FD-SOME? TTRUE
+   s" a/f.txt" s" bytes" WRITE
+   j w WATCH-HEAR 1 >= TTRUE  j STIRRED$ s" a" T$=
+   j awd JOURNAL:WATCH-LISTED
+   s" a/f.txt" REMOVE  s" a" AT FS:REMOVE-DIR
+   j w WATCH-HEAR 1 >= TTRUE  j STIRRED$ s" " T$=
+   j rwd JOURNAL:WATCH-LISTED  j awd JOURNAL:WATCH-STIR
+   j STIRRED$ s" -" T$= ;
+
+\ The root moved away blinds the watch; it is moved back.
+: MOVES-ROOT ( JOURNAL:journal ^watch -- )
+   {: j w :}
+   ROOT$ MOVED$ FS:RENAME-FILE
+   j w WATCH-HEAR 1 >= TTRUE  w WATCH-FD FD-SOME? TFALSE
+   MOVED$ ROOT$ FS:RENAME-FILE ;
+
+: DOUBTS ( JOURNAL:journal ^watch -- )
+   {: j w :}
+   j w REARMED  j w WATCH-DOUBT  w WATCH-FD FD-SOME? TFALSE ;
+
+\ An armed watch's scan is incremental until its full scan's listings
+\ stand SCAN-STANDS-S; then a new instance arms through a full one.
+: RESTARTS ( JOURNAL:journal ^watch -- )
+   {: j w :}
+   j w REARMED  j w WATCH-STARTED TTRUE  w STATE$ s" armed" T$=
+   w WATCH-STAMP @ SCAN-STANDS-S - w WATCH-STAMP !
+   j w WATCH-STARTED TFALSE  w STATE$ s" arming" T$=
+   w WATCH-INSTANCE @ FD-SOME? TTRUE
+   j w WATCH-ABANDONED  w WATCH-INSTANCE @ FD-SOME? TFALSE ;
+
+: WATCHED ( JOURNAL:journal -- )
+   {: j :}
+   AR @ NEW-WATCH {: w :}
+   j w HEARS  j w MOVES-ROOT  j w DOUBTS  j w RESTARTS ;
+
+: A-WATCH-HEARS-ITS-FOLDERS-AND-BLINDS-ON-A-LOSS ( -- )
+   s" a_watch_hears_its_folders_and_blinds_on_a_loss" T-LABEL
+   s" a" MKDIR
+   [: WATCHED ;] WITH-JOURNAL ;
+
 : CASES ( -- )
    [: SCAN-PUBLISHES-EMPTY-AND-NESTED-DIRECTORIES ;] IN-SCAN-CASE
    [: FILE-LOCKED-AFTER-ENUMERATION-IS-INACCESSIBLE ;] IN-SCAN-CASE
@@ -1613,7 +1724,9 @@ variable RAISED-ERRNO
    [: CREATE-DIRECTORY-DENIED-GIVES-ITS-DIRECTORY ;] IN-CASE
    [: EXISTING-DIRECTORY-DENIED-GIVES-ITS-ENTRY ;] IN-CASE
    [: CONVERTED-DENIAL-LOGS-NOTHING ;] IN-CASE
-   [: ATTRIBUTES-ARE-LABELLED ;] IN-CASE ;
+   [: ATTRIBUTES-ARE-LABELLED ;] IN-CASE
+   FORMAL-HOLDS-THE-WATCH-TABLE
+   [: A-WATCH-HEARS-ITS-FOLDERS-AND-BLINDS-ON-A-LOSS ;] IN-CASE ;
 
 public
 

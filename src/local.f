@@ -38,14 +38,18 @@
 \ rows; a failure that concerns one entry publishes that entry as
 \ unknown, and nothing beneath it is observed. It then hashes the files
 \ to hash and checks the root is the one it opened.
+\ A watch hears through inotify which folders changed since a published
+\ scan listed them, in the journal's watch records; WATCHING says when a
+\ scan may list only those: never blind, and not past SCAN-STANDS-S.
 \ STORAGE CLASS. PROCESS-WIDE: the content hasher, its read buffer, the
 \ name hasher, the marker and slot state buffers, the slot name and path
 \ buffers, a lease's slot table, the byte a partial's end is probed with,
 \ the directory listing context, the predicate of the innermost
-\ WITH-CONVERTS and DENIED-PATH; one task syncs, so one uses them at a
-\ time. CALLER-OWNED: every descriptor answered, the hashes, names,
-\ paths, vectors, staged uploads and partials laid in the caller's arena,
-\ the paths a stage's result names and a lease's slot directory.
+\ WITH-CONVERTS, DENIED-PATH and the loss WATCH-HEAR notes; one task
+\ syncs, so one uses them at a time. CALLER-OWNED: every descriptor
+\ answered, the hashes, names, paths, vectors, staged uploads, partials
+\ and watches laid in the caller's arena, the paths a stage's result
+\ names and a lease's slot directory.
 
 require src/lib/error.f
 require src/lib/string.f
@@ -59,6 +63,8 @@ require src/lib/fs-mutate.f
 require src/lib/fs-anchored.f
 require src/lib/fs-statx.f
 require src/lib/fs-list.f
+require src/lib/inotify.f
+require src/lib/time.f
 require src/lib/allocator.f
 require src/lib/fd.f
 require src/lib/xattr.f
@@ -1582,6 +1588,262 @@ SUBTREE-INSTALL
    p s" open sync root for scan" OPEN-ABSOLUTE-DIRECTORY {: rfd:fd :}
    rfd p ROOT-STAT {: before:MODEL:stat :}
    root rfd before cut before STAT-DEV ar ENUMERATE-SCAN-ON-DEVICE ;
+
+\ ---- the watch
+
+\ blind: no instance, so a scan lists every folder; arming: a full scan
+\ lists under a new instance; armed: a clean record's folder stands as
+\ the last published scan listed it.
+ENUM watch-state blind arming armed ;ENUM
+
+\ What a watch's step senses: a scan starts, or starts SCAN-STANDS-S
+\ after the last full publication; a scan published; inotify refused; a
+\ scan was abandoned; events were lost; the root is in doubt.
+ENUM watch-event start due published refused abandoned lost doubt ;ENUM
+
+public
+
+\ A sync root's inotify watch, stepped by WATCHING; it holds an instance
+\ while arming or armed, none while blind.
+STRUCTURE watch OPAQUE DERIVE addr
+   FIELD state watch-state
+   FIELD event watch-event
+   FIELD journal JOURNAL:journal
+   FIELD instance option<fd>
+   FIELD root-wd option<n>
+   FIELD stamp n
+   FIELD refusal n
+;STRUCTURE
+
+\ Seconds a changed folder must keep still before a scan lists it: past
+\ RACY-WINDOW, so a file is not hashed mid-write and hashed again.
+RACY-WINDOW 1 + constant SETTLE-S
+
+private
+
+\ Seconds a full scan's listings stand: links, mapped writes, mounts and
+\ remote filesystems change folders without an event.
+3600 constant SCAN-STANDS-S
+1000000000 constant NS-PER-S
+
+ARENA WATCHES watch
+
+\ Set while WATCH-HEAR reads: an event said others were lost.
+TYPED-VARIABLE LOSS bool
+
+: NO-FD ( -- option<fd> ) OPTION:NONE ;
+: NO-WD ( -- option<n> ) OPTION:NONE ;
+: NOW-S ( -- n ) TIME:MONO-NS NS-PER-S / ;
+: SET? ( n n -- bool ) and 0<> ;
+
+\ What a watch hears of a folder. EXCL-UNLINK: no events of an entry
+\ once it is unlinked.
+: WATCH-MASK ( -- n )
+   INOTIFY:IN-MODIFY INOTIFY:IN-CLOSE-WRITE or
+   INOTIFY:IN-ATTRIB or INOTIFY:IN-CREATE or INOTIFY:IN-DELETE or
+   INOTIFY:IN-MOVED-FROM or INOTIFY:IN-MOVED-TO or
+   INOTIFY:IN-MOVE-SELF or INOTIFY:IN-EXCL-UNLINK or ;
+
+\ Closing the instance drops every watch it holds.
+: CLOSED ( ^watch -- )
+   {: w :}
+   w WATCH-INSTANCE @ MATCH option
+      none OF ENDOF
+      some OF DISCARD ENDOF
+   ;MATCH
+   NO-FD w WATCH-INSTANCE ! ;
+
+: SENSED ( ^watch -- watch-event ) WATCH-EVENT @ ;
+
+\ The instance is already in the watch, with no watch added yet.
+: ARM ( ^watch -- ) WATCH-JOURNAL @ JOURNAL:WATCHES-RESET ;
+
+: BLIND ( ^watch -- )
+   {: w :}
+   w CLOSED  w WATCH-JOURNAL @ JOURNAL:WATCHES-RESET
+   NO-WD w WATCH-ROOT-WD ! ;
+
+: STAMP ( ^watch -- ) NOW-S swap WATCH-STAMP ! ;
+
+\ Logs FS:ERRNO, inotify's refusal, unless it is the one last logged.
+: REFUSED ( ^watch -- )
+   {: w :}
+   FS:ERRNO {: e:n :}
+   e w WATCH-REFUSAL @ = if exit then
+   LOG:WARN s" local" LOG:LINE
+   s" inotify refused; every scan lists the whole tree: " LOG:TEXT+
+   e FS:ERRNO$ LOG:TEXT+ LOG:;LINE
+   e w WATCH-REFUSAL ! ;
+
+\ After formal/LocalWatch.tla.
+FSM:DEFINE WATCHING ( ^watch ) watch-state watch-event
+   IN blind  SENSED
+      start      ARM      >arming
+      refused    REFUSED  >blind
+      due        -        >blind
+      published  -        >blind
+      abandoned  -        >blind
+      lost       -        >blind
+      doubt      -        >blind
+   IN arming  SENSED
+      published  STAMP    >armed
+      start      BLIND    >blind
+      due        BLIND    >blind
+      refused    BLIND    >blind
+      abandoned  BLIND    >blind
+      lost       BLIND    >blind
+      doubt      BLIND    >blind
+   IN armed  SENSED
+      start      -        >armed
+      published  -        >armed
+      abandoned  -        >armed
+      due        BLIND    >blind
+      refused    BLIND    >blind
+      lost       BLIND    >blind
+      doubt      BLIND    >blind
+;DEFINE
+
+\ The journal goes in the watch for the step's actions.
+: STEPPED ( JOURNAL:journal ^watch watch-event -- )
+   {: j w e :}
+   j w WATCH-JOURNAL !  e w WATCH-EVENT !
+   w w WATCH-STATE @ WATCHING-STEP drop w WATCH-STATE ! ;
+
+: ARMED? ( ^watch -- bool )
+   WATCH-STATE @ MATCH watch-state
+      blind OF false ENDOF
+      arming OF false ENDOF
+      armed OF true ENDOF
+   ;MATCH ;
+
+: ARMING? ( ^watch -- bool )
+   WATCH-STATE @ MATCH watch-state
+      blind OF false ENDOF
+      arming OF true ENDOF
+      armed OF false ENDOF
+   ;MATCH ;
+
+: ROOT-WD? ( ^watch n -- bool )
+   {: w wd:n :}
+   w WATCH-ROOT-WD @ MATCH option
+      none OF false ENDOF
+      some OF wd = ENDOF
+   ;MATCH ;
+
+\ An overflow, an unmount, or the root deleted, moved or unwatched.
+: LOSS? ( ^watch n n -- bool )
+   {: w wd:n m:n :}
+   m INOTIFY:IN-Q-OVERFLOW INOTIFY:IN-UNMOUNT or SET? if
+      true exit
+   then
+   w wd ROOT-WD? 0= if false exit then
+   m INOTIFY:IN-DELETE-SELF INOTIFY:IN-MOVE-SELF or
+   INOTIFY:IN-IGNORED or SET? ;
+
+\ One event read; after a loss the rest are dropped.
+: HEARD ( n n JOURNAL:journal ^watch -- )
+   {: wd:n m:n j w :}
+   LOSS @ if exit then
+   w wd m LOSS? if true LOSS ! exit then
+   m INOTIFY:IN-IGNORED SET? if j wd JOURNAL:WATCH-FORGET exit then
+   j wd JOURNAL:WATCH-STIR ;
+
+\ The loss is stepped once the reads are done: it closes the instance.
+: HEARD-ALL ( JOURNAL:journal ^watch fd -- n )
+   {: j w f:fd :}
+   false LOSS !
+   0 [: drop f [: j w HEARD ;] INOTIFY:EACH ;] catch {: code:n :}
+   code 0= if
+      LOSS @ if j w construct watch-event lost STEPPED then exit
+   then
+   drop code INOTIFY:E-INOTIFY <> if code throw then
+   j w construct watch-event lost STEPPED 0 ;
+
+\ due once the last full publication is SCAN-STANDS-S old, else start.
+: START-EVENT ( ^watch -- watch-event )
+   {: w :}
+   NOW-S w WATCH-STAMP @ - SCAN-STANDS-S >= if
+      construct watch-event due exit
+   then
+   construct watch-event start ;
+
+\ A blind watch opens an instance: arming, or still blind if refused.
+: OPENED ( JOURNAL:journal ^watch -- )
+   {: j w :}
+   INOTIFY:OPEN MATCH option
+      none OF j w construct watch-event refused STEPPED ENDOF
+      some OF
+         OPTION:SOME w WATCH-INSTANCE !
+         j w construct watch-event start STEPPED
+      ENDOF
+   ;MATCH ;
+
+\ The wd of a watch added on dir, the root's when p is "".
+: ADDED ( ^watch fd fd str -- option<n> )
+   {: w f:fd dir:fd p:str :}
+   f dir WATCH-MASK INOTIFY:WATCH MATCH option
+      none OF
+         w WATCH-JOURNAL @ w construct watch-event refused STEPPED
+         NO-WD
+      ENDOF
+      some OF {: wd:n :}
+         p STR:LEN 0= if wd OPTION:SOME w WATCH-ROOT-WD ! then
+         wd OPTION:SOME
+      ENDOF
+   ;MATCH ;
+
+\ A scan starts; true when it may list only the folders not clean.
+: WATCH-STARTED ( JOURNAL:journal ^watch -- bool )
+   {: j w :}
+   w ARMED? if j w w START-EVENT STEPPED then
+   w ARMED? if true exit then
+   w ARMING? if j w construct watch-event start STEPPED then
+   j w OPENED false ;
+
+\ The wd watching folder p, open as dir; none while blind or refused,
+\ which blinds the watch.
+: WATCH-ADD ( ^watch fd str -- option<n> )
+   {: w dir:fd p:str :}
+   w WATCH-INSTANCE @ MATCH option
+      none OF NO-WD ENDOF
+      some OF {: f:fd :} w f dir p ADDED ENDOF
+   ;MATCH ;
+
+: WATCH-PUBLISHED ( JOURNAL:journal ^watch -- )
+   construct watch-event published STEPPED ;
+
+: WATCH-ABANDONED ( JOURNAL:journal ^watch -- )
+   construct watch-event abandoned STEPPED ;
+
+public
+
+\ A blind watch; its arena's reset or release closes its instance.
+: NEW-WATCH ( ^ARENA:arena -- ^watch )
+   [: CLOSED ;] WATCHES-NEW-DISPOSE {: w :}
+   construct watch-state blind w WATCH-STATE !
+   NO-FD w WATCH-INSTANCE !  NO-WD w WATCH-ROOT-WD !
+   0 w WATCH-STAMP !  0 w WATCH-REFUSAL !  w ;
+
+\ The instance, readable when events are pending, while armed; else none.
+: WATCH-FD ( ^watch -- option<fd> )
+   {: w :}
+   w ARMED? if w WATCH-INSTANCE @ exit then
+   NO-FD ;
+
+\ Stirs or forgets the records the pending events name; answers how many
+\ it read, 0 while blind or after a read failure, which blinds it.
+: WATCH-HEAR ( JOURNAL:journal ^watch -- n )
+   {: j w :}
+   w WATCH-INSTANCE @ MATCH option
+      none OF 0 ENDOF
+      some OF {: f:fd :} j w f HEARD-ALL ENDOF
+   ;MATCH ;
+
+\ The root may be another generation: the watch goes blind.
+: WATCH-DOUBT ( JOURNAL:journal ^watch -- )
+   construct watch-event doubt STEPPED ;
+
+private
 
 \ ---- publishing
 

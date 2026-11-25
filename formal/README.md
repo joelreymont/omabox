@@ -87,6 +87,18 @@ recover; a drive that ends without failure or launch was not asked for one, a
 halt or release stopped a unit it first saw holding the lock, and a halt
 cleared a failed state it last saw.
 
+`LocalWatch` checks LOCAL's watch, `WATCHING` in `src/local.f`, over folders
+each with a journal record (none, clean, stirred, or listed by the running
+scan) and a kernel watch. A change in a watched folder queues an event while
+the watch is not blind, else is lost; an overflow drops an event and queues a
+loss; a replaced folder loses its watch. A scan starts as the table says,
+lists every folder unless the watch is armed and only the folders not clean
+when it is, and publishes, is abandoned or throws. No change hides behind a
+clean record: a folder changed since its last published listing is never
+clean unless the kernel still holds its event or a loss, so the next scan
+lists it again; a blind watch holds no record, and only an armed one a clean
+record.
+
 `DaemonRun` checks the daemon's run, `DAEMON-RUN`: each step runs only once
 what it reads exists and never makes again what the run holds, so the journal
 opens only under the instance lock, systemd hears the daemon is ready only once
@@ -127,6 +139,7 @@ tlc -config DirectoryDeletion.cfg DirectoryDeletion.tla
 tlc -config RemoteLifecycle.cfg RemoteLifecycle.tla
 tlc -config ServiceDrive.cfg ServiceDrive.tla
 tlc -config DaemonRun.cfg DaemonRun.tla
+tlc -config LocalWatch.cfg LocalWatch.tla
 tlc -config Downloading.cfg Downloading.tla
 tlc -config UploadSession.cfg UploadSession.tla
 ```
@@ -140,6 +153,7 @@ model's steps follow that table:
 - `src/replay-test.f`: `LOCAL-LIFECYCLE` (`LocalLifecycle`) and
   `REMOTE-LIFECYCLE` (`RemoteLifecycle`);
 - `src/service-test.f`: `DRIVING` (`ServiceDrive`);
+- `src/local-test.f`: `WATCHING` (`LocalWatch`);
 - `src/daemon-test.f`: `DAEMON-RUN` (`DaemonRun`);
 - `src/dropbox-test.f`: `DOWNLOADING` (`Downloading`) and `SESSION`
   (`UploadSession`).
