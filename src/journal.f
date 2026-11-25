@@ -995,7 +995,8 @@ private
 \ ---- activation ----------------------------------------------------
 
 \ A new root carries none of the old one's history: live plans, their
-\ recovery intents, baselines, observations, hashes and conflicts go.
+\ recovery intents, baselines, observations, hashes, conflicts and the
+\ watched folders, whose clean marks vouch for those observations, go.
 : RETIRE ( SQLITE:connection -- )
    s" DELETE FROM recovery_records
       WHERE status = 'pending' OR operation_id IN (
@@ -1011,6 +1012,7 @@ private
       DELETE FROM local_observations;
       DELETE FROM local_hash_cache;
       DELETE FROM conflicts;
+      DELETE FROM temp.watches;
       DELETE FROM legacy_local_root_adoption WHERE singleton = 1;"
    SQLITE:EXEC ;
 

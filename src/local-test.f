@@ -555,11 +555,11 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
 : ROOT-SCAN ( -- ^VEC:vector<MODEL:local-record> ) NO-CUTOFF SCAN-AT ;
 
 \ ROOT$ enumerated into the scan with the journal's cache; cut decides
-\ which cached hashes the walk reuses.
+\ which cached hashes the walk reuses. A blind watch meets no clean record.
 : ENUMERATE
    ( JOURNAL:scan option<MODEL:cutoff> -- JOURNAL:scan pending-scan )
    {: cut:option<MODEL:cutoff> :}
-   ROOT$ cut JNL @ WATCHER @ AR @ ENUMERATE-SCAN ;
+   ROOT$ cut JNL @ AR @ NEW-WATCH AR @ ENUMERATE-SCAN ;
 
 \ Finishes the pending scan and publishes it; q decides which hashes it
 \ computes stay reusable.
@@ -1018,15 +1018,14 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
    s s" a/b/c" PRESENT SEEN
    [: ALL-CACHED ;] SCANNED PUBLISHED 9 T= ;
 
-\ The rescan stages nothing, and its publish changes no stored row: its
-\ three changes mark clean the folders it listed, the root, d and e.
+\ The rescan stages nothing, and its publish changes no row.
 : REPUBLISHED-UNCHANGED ( JOURNAL:scan -- JOURNAL:scan )
    STABLE ENUMERATE {: ps:pending-scan :}
    JOURNAL:SCAN-COUNTS {: jobs:n staged:n hashes:n :}
    jobs 0 T= staged 0 T= hashes 0 T=
    JNL @ JOURNAL:TOTAL-CHANGES {: before:n :}
    ps [: STABLE ;] FINISH-SCAN-AT
-   JNL @ JOURNAL:TOTAL-CHANGES before 3 + T= ;
+   JNL @ JOURNAL:TOTAL-CHANGES before T= ;
 
 : AN-UNCHANGED-TREE-STAGES-AND-WRITES-NOTHING ( -- )
    s" an_unchanged_tree_stages_and_writes_nothing" T-LABEL
@@ -1753,6 +1752,33 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    s" a" MKDIR
    JNL @ WATCHER @ ABANDONED-STIRRED ;
 
+\ Reads the instance's pending events unheard: no record is stirred.
+: DRAINED ( ^watch -- )
+   WATCH-INSTANCE @ MATCH option
+      none OF false TTRUE ENDOF
+      some OF [: 2drop ;] INOTIFY:EACH drop ENDOF
+   ;MATCH ;
+
+\ a's write goes unheard, so the rescan does not list a and keeps its
+\ stored rows; b's write is heard, so b is listed anew.
+: CLEAN-SKIPPED ( JOURNAL:journal ^watch -- )
+   {: j w :}
+   j ROOT$ w AR @ SCAN-AND-PUBLISH ROOT-CHANGED? TFALSE
+   s" a/x" s" x2" WRITE  w DRAINED  s" b/y" s" y2" WRITE
+   j ROOT$ w AR @ SCAN-AND-PUBLISH ROOT-CHANGED? TFALSE
+   INVENTORY {: s :}
+   s s" b/y" SCANNED-CONTENT s" y2" IDENTITY T$=
+   s s" a/x" SCANNED-CONTENT s" x1" IDENTITY T$=
+   s s" a-b/c" SCANNED-CONTENT s" c" IDENTITY T$=
+   s ORDERED
+   j w s" a" CLEAN? TTRUE  j w s" b" CLEAN? TTRUE ;
+
+: A-SCAN-SKIPS-A-CLEAN-FOLDER ( -- )
+   s" a_scan_skips_a_clean_folder" T-LABEL
+   s" a" MKDIR s" a-b" MKDIR s" b" MKDIR
+   s" a/x" s" x1" WRITE s" a-b/c" s" c" WRITE s" b/y" s" y1" WRITE
+   JNL @ WATCHER @ CLEAN-SKIPPED ;
+
 : CASES ( -- )
    [: SCAN-PUBLISHES-EMPTY-AND-NESTED-DIRECTORIES ;] IN-SCAN-CASE
    [: FILE-LOCKED-AFTER-ENUMERATION-IS-INACCESSIBLE ;] IN-SCAN-CASE
@@ -1814,7 +1840,8 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    [: A-WATCH-HEARS-ITS-FOLDERS-AND-BLINDS-ON-A-LOSS ;] IN-CASE
    [: A-REFUSED-WATCH-LOGS-ONCE-PER-ARMING ;] IN-CASE
    [: A-PUBLISHED-SCAN-ARMS-THE-WATCH ;] IN-SCAN-CASE
-   [: AN-UNPUBLISHED-SCAN-LEAVES-ITS-FOLDERS-STIRRED ;] IN-SCAN-CASE ;
+   [: AN-UNPUBLISHED-SCAN-LEAVES-ITS-FOLDERS-STIRRED ;] IN-SCAN-CASE
+   [: A-SCAN-SKIPS-A-CLEAN-FOLDER ;] IN-SCAN-CASE ;
 
 public
 

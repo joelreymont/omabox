@@ -1015,12 +1015,12 @@ STRUCTURE pending-scan
    FIELD arena ^ARENA:arena
 ;STRUCTURE
 
-\ A listed directory whose subtree the walk has still to enter; it owns
-\ fd and arena, which hold the names.
+\ A directory whose subtree the walk has still to reach; it owns fd and
+\ arena, which hold the names, none for a folder the walk does not enter.
 STRUCTURE held-dir
    FIELD fd fd
    FIELD path str
-   FIELD names ^VEC:vector<str>
+   FIELD names option<^VEC:vector<str>>
    FIELD arena ^ARENA:arena
 ;STRUCTURE
 
@@ -1374,7 +1374,7 @@ private
 
 \ The walk's settings, which no step changes: any device but
 \ root-device is out of scope. The walk adds the watch on every folder
-\ it lists and records its wd in the journal.
+\ it meets and enters only those whose record is not clean.
 STRUCTURE scan-context
    FIELD cutoff option<MODEL:cutoff>
    FIELD root-device n
@@ -1515,18 +1515,20 @@ STRUCTURE scan-context
    child p s" inspect directory after scan" STAT-FD
    before SAME-OBSERVATION 0= if s" scan directory" p CHANGED then ;
 
-\ The open directory, checked to be the one the walk's stat found, then
-\ watched and its LISTED-STILL. Its wd's record is stirred until the
-\ listing ends, so a listing that throws leaves it stirred; a blind or
-\ refused watch lists it all the same.
+\ The open directory, checked to be the one the walk's stat found, and
+\ its LISTED-STILL. The record of wd, the one its caller's WATCH-ADD
+\ answered, is stirred until the listing ends, so a listing that throws
+\ leaves it stirred; no wd lists it all the same.
 : CHECKED-LISTING
-   ( fd str MODEL:stat scan-context ^ARENA:arena -- ^VEC:vector<str> )
-   {: child:fd p:str probe:MODEL:stat cx:scan-context ar:^ARENA:arena :}
+   ( fd str MODEL:stat option<n> scan-context ^ARENA:arena
+     -- ^VEC:vector<str> )
+   {: child:fd p:str probe:MODEL:stat added:option<n> cx:scan-context
+      ar:^ARENA:arena :}
    child p s" inspect directory before scan" STAT-FD
    {: before:MODEL:stat :}
    before probe SAME-INODE 0= if s" open scanned directory" p CHANGED then
    cx SCAN-CONTEXT-UNMAKE {: cut:option<MODEL:cutoff> dev:n j w :}
-   w child p WATCH-ADD MATCH option
+   added MATCH option
       none OF child p before ar LISTED-STILL ENDOF
       some OF {: wd:n :}
          j wd p JOURNAL:WATCH-RECORD
@@ -1535,29 +1537,44 @@ STRUCTURE scan-context
       ENDOF
    ;MATCH ;
 
+: NO-NAMES ( -- option<^VEC:vector<str>> ) OPTION:NONE ;
+
+\ The open directory watched: none, nothing listed, when its record at p
+\ is clean; else some of its CHECKED-LISTING.
+: WATCHED-LISTING
+   ( fd str MODEL:stat scan-context ^ARENA:arena
+     -- option<^VEC:vector<str>> )
+   {: child:fd p:str probe:MODEL:stat cx:scan-context ar:^ARENA:arena :}
+   cx SCAN-CONTEXT-UNMAKE {: cut:option<MODEL:cutoff> dev:n j w :}
+   w child p WATCH-ADD {: added:option<n> :}
+   added MATCH option
+      none OF false ENDOF
+      some OF {: wd:n :} j wd p JOURNAL:WATCH-CLEAN? ENDOF
+   ;MATCH if NO-NAMES exit then
+   child p probe added cx ar CHECKED-LISTING OPTION:SOME ;
+
 \ The directory at name, opened from dir where the walk's stat found it,
-\ and its CHECKED-LISTING; a throw closes it.
+\ and its WATCHED-LISTING; a throw closes it.
 : OPENED-LISTING
    ( fd str str MODEL:stat scan-context ^ARENA:arena
-     -- fd ^VEC:vector<str> )
+     -- fd option<^VEC:vector<str>> )
    {: dir:fd name:str p:str probe:MODEL:stat cx:scan-context
       ar:^ARENA:arena :}
    dir name p OPEN-DIRECTORY-AT {: child:fd :}
-   ar [type] str NEW-VEC child
-   [: drop child p probe cx ar CHECKED-LISTING ;] CLOSING
+   NO-NAMES child
+   [: drop child p probe cx ar WATCHED-LISTING ;] CLOSING
    child swap ;
 
-\ OPENED-LISTING and 0; after any throw, -1, an empty vector in ar and
-\ the code. The caller, which owns ar, releases it once the vector is
-\ dropped, then STEP-CODE decides the code.
+\ OPENED-LISTING and 0; after any throw, -1, none and the code. The
+\ caller, which owns ar, releases it, then STEP-CODE decides the code.
 : LISTING-STEP
    ( fd str str MODEL:stat scan-context ^ARENA:arena
-     -- fd ^VEC:vector<str> n )
+     -- fd option<^VEC:vector<str>> n )
    {: dir:fd name:str p:str probe:MODEL:stat cx:scan-context
       ar:^ARENA:arena :}
-   -1 >FD ar [type] str NEW-VEC
+   -1 >FD NO-NAMES
    [: 2drop dir name p probe cx ar OPENED-LISTING ;] catch {: code:n :}
-   code 0<> if 2drop -1 >FD ar [type] str NEW-VEC then
+   code 0<> if 2drop -1 >FD NO-NAMES then
    code ;
 
 \ SCAN-NAMES, which the walk reaches again below a directory.
@@ -1583,7 +1600,20 @@ defer SCAN-SUBTREE
    {: f:fd t:str names ar:^ARENA:arena :}
    p t PAST-SUBTREE? ;
 
-\ The last held directory's subtree, then its descriptor and arena.
+\ The subtree of the folder at p; one not entered, the stored stream
+\ resumed past it.
+: HELD-SUBTREE
+   ( JOURNAL:scan fd str option<^VEC:vector<str>> scan-context
+     ^ARENA:arena -- JOURNAL:scan )
+   {: child:fd p:str names:option<^VEC:vector<str>> cx:scan-context
+      ar:^ARENA:arena :}
+   names MATCH option
+      none OF p JOURNAL:SCAN-SKIP ENDOF
+      some OF {: listed :} child p listed cx ar SCAN-SUBTREE ENDOF
+   ;MATCH ;
+
+\ The last held directory's subtree, or SCAN-SKIP of one not entered,
+\ then its descriptor and arena released.
 : DESCEND-TOP
    ( JOURNAL:scan ^VEC:vector<held-dir> scan-context -- JOURNAL:scan )
    {: v cx:scan-context :}
@@ -1591,7 +1621,7 @@ defer SCAN-SUBTREE
    v k VEC:AT @ HELD-DIR-UNMAKE
    {: child:fd p:str names ar:^ARENA:arena :}
    v k VEC:RESIZE
-   [: child p names cx ar SCAN-SUBTREE ;]
+   [: child p names cx ar HELD-SUBTREE ;]
    [: child ar HELD-RELEASED ;] finally ;
 
 \ Each held subtree p does not sort below.
@@ -1606,9 +1636,10 @@ defer SCAN-SUBTREE
    {: v cx:scan-context :}
    begin v VEC:COUNT 0 > while v cx DESCEND-TOP repeat ;
 
-\ A directory: listed where the walk's stat found it, held, then seen at
-\ its name; its subtree waits in held for SCAN-NAMES. A failed listing
-\ releases its arena, then answers the step's code.
+\ A directory: listed where the walk's stat found it unless its record
+\ is clean, held, then seen at its name; its subtree waits in held for
+\ SCAN-NAMES. A failed listing releases its arena, then answers the
+\ step's code.
 : SCAN-SUBDIRECTORY
    ( JOURNAL:scan fd str str MODEL:stat scan-context ^VEC:vector<held-dir>
      -- JOURNAL:scan n )
@@ -1827,12 +1858,15 @@ SUBTREE-INSTALL
 
 \ ---- enumerating
 
-\ The root, listed in ar, and its names walked.
+\ The root, watched and listed in ar whatever its record, and its names
+\ walked.
 : ROOT-LISTED
    ( JOURNAL:scan ^ARENA:arena fd MODEL:stat scan-context
      -- JOURNAL:scan )
    {: ar:^ARENA:arena rfd:fd before:MODEL:stat cx:scan-context :}
-   rfd s" " before cx ar CHECKED-LISTING {: names :}
+   cx SCAN-CONTEXT-UNMAKE {: cut:option<MODEL:cutoff> dev:n j w :}
+   w rfd s" " WATCH-ADD {: added:option<n> :}
+   rfd s" " before added cx ar CHECKED-LISTING {: names :}
    rfd s" " names cx ar SCAN-NAMES ;
 
 \ The walk from the root, every path in byte order, each folder it lists
