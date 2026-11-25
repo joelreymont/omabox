@@ -400,8 +400,8 @@ holds no constant values. Three more things a C programmer never sees:
 My brief for the HTTP date parser stated RFC 9110's 50-year rule for RFC 850
 years and then gave an example that broke it (in 2026, `70` means 2070, not
 1970). The worker followed the rule. The review then found the rule itself
-applied to years, not timestamps, so from 2050 on `20` would read as 2020
-instead of 2120.
+applied to years, not timestamps, so a date in the year exactly 50 years
+ahead, but more than 50 years away, read as the future instead of the past.
 
 Observation for the blog: an example in a brief is code that nothing runs.
 
@@ -409,8 +409,8 @@ Observation for the blog: an example in a brief is code that nothing runs.
 
 Habu's CURL:LOST? left out TLS handshake failures (libcurl's 35) on purpose,
 and a test asserted it. omabox retries what LOST? accepts, so a connection
-reset during the handshake would not be retried, where the Rust version's
-reqwest retried every connect error. A failed handshake sends no request,
+reset during the handshake would not be retried, where the Rust version
+retried every HTTP client failure. A failed handshake sends no request,
 so retrying it is always safe; LOST? now takes 35 and the test says why.
 
 ## 2026-11-15: Where the interpreter meets the checker
@@ -627,9 +627,9 @@ source tree but missing from the running engine, until the engine was
 rebuilt (8 s). In Rust, a new library function is available once the
 crate builds; here the library and the engine are released together.
 
-Rust's integers come in widths; Habu's cell is one signed 64-bit word.
+Rust has a `u64`; Habu's widest integer is the signed 64-bit cell.
 A file's inode is a `u64`, and serde writes one at or above 2^63 as a
-20-digit number. Habu's JSON gained `WRITE-U64` and `READ-U64`. The
+number no signed cell can hold. Habu's JSON gained `WRITE-U64` and `READ-U64`. The
 review of that lane found the reader's overflow check used a signed
 compare, so a total above 2^63 wrapped; a failing test showed it before
 the fix.
@@ -645,8 +645,8 @@ checked `catch` must leave the stack the same shape whether the code
 threw or not, so each reader is given a placeholder value of the type it
 reads. Rust's `?` returns early instead and needs no placeholder.
 
-Rust's file code gets its flags from the standard library
-(`OpenOptions::create_new`, `custom_flags(O_NOFOLLOW)`). Habu's file
+Rust's file code gets its flags from the standard library and rustix
+(`OpenOptions::create_new`, `OFlags::NOFOLLOW`). Habu's file
 words do not yet cover everything the daemon needs, so the CONFIG lane
 bound `open`, `mkdir`, `chmod` and `flock` from libc itself. Those
 bindings belong in Habu's library; the review decides where.
@@ -732,7 +732,8 @@ an enum variant takes any type a struct field takes.
 Rust's reconcile asks `upload_source_changed(&error, path)`. That
 function matches the error's variant, its path and the name of the
 operation that failed, and it decides whether a failure means "look
-again" or "report it". A Habu throw carries only a number. Two stage
+again" or "report it". A Habu throw carries a code and at most a text, nothing a caller can
+match on. Two stage
 races share E-CHANGED with a source race, so no test on the code could
 tell them apart. In Habu the throw site decides: the source's open and
 the race checks on the source now throw E-SOURCE-CHANGED, and the
@@ -863,8 +864,8 @@ quotation input borrowed, and that is what cost the extra public type.
 
 The stage-name fold hit the same limit as `upload_source_changed`
 before it. LOCAL threw E-OCCUPIED both for an object at a stage's name
-and for one at the destination. A Habu throw carries only its code, so
-the caller could not tell which was blocked. Rust's plan blocks the
+and for one at the destination. A Habu throw carries nothing a caller can
+match on, so the caller could not tell which was blocked. Rust's plan blocks the
 stage alone and goes on. The stage name's case is now an outcome,
 destination-occupied, and no longer a throw.
 
@@ -899,8 +900,8 @@ that pauses after 10 bytes now kills it.
 A download that fails its range, length or result checks used to
 throw E-ANSWER, the code every other unparseable answer throws. Rust
 maps those to DownloadVerificationFailed, which the caller turns into
-a block on that path. A Habu throw carries only its code, so a private
-code, E-UNVERIFIED, marks this case. DOWNLOAD catches only that code
+a block on that path. A Habu throw carries nothing a caller can match
+on, so a private code, E-UNVERIFIED, marks this case. DOWNLOAD catches only that code
 and answers `refused unverified`, a reply the caller can match. This is
 the third time the code-only throw has turned a Rust error variant into
 an outcome. The stage name in LOCAL and the upload source were the
@@ -1089,10 +1090,11 @@ held open by a gated fake becomes a plan whose binding is still live.
 A root swapped while the gate is held needs the fake to run the swap
 on its own task during the download.
 
-The six-input limit on a word shaped a data structure. The worker
-could not build one record per download (seven fields), so it built
+Habu's guidance to keep a word to five or six inputs shaped a data
+structure. Reading it as a limit, the worker did not build one record
+per download (seven fields), so it built
 one record per step and set the plan and operation before each run.
-Rust's struct literal has no such limit; Habu's rule pushed the code
+Rust's struct literal has no such guidance; Habu's pushed the code
 toward one mutable context, which the machine then owns.
 
 The private namespace clashed again, this time between the code and
@@ -1322,9 +1324,9 @@ outside its brief, and the lead folded those by hand. Minutes later, the
 first DAEMON lane wrote `COPIED` again in a new test file. The shared file
 already exports that word, but nothing in that lane's brief named it.
 A shared helper saves nothing if the next agent does not know it exists.
-Rust has the same problem in principle. In practice, an editor or
-`rust-analyzer` finds the helper as you type, and a Forth file shows no
-such completion.
+Rust has the same problem in principle. Both have a completer, `rust-analyzer`
+and Habu's language server, that offers the helper as you type, but an
+agent writing a file from a brief uses neither.
 
 The DAEMON's failure table shows how the two languages carry failures.
 Rust's daemon sorts the variants of nine error enums, 115 in all, into
@@ -1349,9 +1351,10 @@ two test styles:
 Both compiled, so the merge had to choose between them. The in-package
 style had a defect that only the next lane would have hit: its test
 runner was a word called `RUN` inside DAEMON, and the next lane adds
-`DAEMON:RUN`. The test's `RUN` would have shadowed the daemon's without
-a warning. Rust has one convention, `mod tests` with `use super::*`, and
-a duplicate name would not compile.
+`DAEMON:RUN`. Habu refuses a second `RUN` in one package, so that lane
+would have had to rename the test's runner. Rust has one convention,
+`mod tests` with `use super::*`, where a local `run` silently shadows the
+parent's.
 
 Reading the account answer, one lane noticed that Habu takes the root
 namespace from any tag of Dropbox's `root_info` union. Rust takes it only
@@ -1424,8 +1427,8 @@ attempt". The same lane found the second percent encoder in the tree:
 DROPBOX had written its token bodies with RFC 3986's unreserved set since
 the first port, while the SDK writes them form-urlencoded. No real token or
 key contains a byte where the two differ, so no test could have caught it.
-Two lanes wrote the same encoder because the library had none. In Rust,
-`url::form_urlencoded` is one `use` away.
+Two lanes wrote the same encoder because the library had none. In Rust, the
+`form_urlencoded` crate is one dependency line and one `use` away.
 
 Moving the link into DROPBOX turned up a borrow that Habu does not check.
 ACCOUNT-ID and ROOT-NAMESPACE are spans into the client's answer buffer,
@@ -1486,9 +1489,9 @@ Getting a value out of a `catch` shows where Habu's checker and Rust's
 `Result` part. `catch` takes its seed as a cell, and an enum value is
 not one, so the setup code that reads a journal's prior binding keeps
 it in a one-slot arena to carry it past the catch; the reviewer's
-simpler seed did not check. And a word that always throws cannot say
-so: the shared existence check needs an unreachable `code throw` after
-calling its failure word, or the checker reports a stale read. Rust's
+simpler seed did not check. And a quotation's type cannot say that it
+always throws: the shared existence check needs an unreachable
+`code throw` after calling the failure word it is passed, or the checker reports a stale read. Rust's
 `?` and its `!` type cover both without a line.
 
 One review finding was wrong about Rust. It read the deleted-root rule
@@ -1696,7 +1699,7 @@ process's own private memory, from smaps_rollup, was 92 MB, against
 about 4 MB of anonymous memory for a daemon that has not uploaded.
 
 The cause was one option. `CURL:BODY!` sets CURLOPT_COPYPOSTFIELDS, so
-libcurl copied every upload chunk into a malloc of its own. A malloc above
+libcurl copied every upload chunk into a malloc of its own. Freeing a block above
 glibc's mmap threshold raises that threshold, so the next chunk's copy
 came from the heap, and the heap kept the freed copies. A reproducer that
 uploads through the fake Dropbox showed a 50,688 kB heap with under
@@ -1840,8 +1843,8 @@ two added rows and an empty file. The master built with the stage then
 rebuilt itself byte for byte.
 
 Observation for the blog: Rust bootstraps the same way (stage0 builds
-stage1, stage1 builds stage2), but rustup ships stage0 prebuilt and pinned,
-so a contributor rarely sees it. A self-hosting Habu that agents rebuild
+stage1, stage1 builds stage2), but its build downloads a pinned, prebuilt
+stage0, so a contributor rarely sees it. A self-hosting Habu that agents rebuild
 many times a day meets it whenever a change alters what the compiler
 carries, and the agent has to recognize the failure as a bootstrap order
 and not a bug in the change.
@@ -2478,8 +2481,8 @@ Observations for the blog:
   already failed; what the new check added was a chunk whose arena had
   grown before release. Breaking the code settled what reading could not.
 - `jj squash ... | tail -0` lost three squashes without a word. GNU
-  `tail -n 0` exits without reading, so the writer died of SIGPIPE
-  before it recorded its operation. Silence output with `/dev/null`.
+  `tail -n 0` exits without reading, so jj met a closed pipe and
+  stopped before it recorded its operation. Silence output with `/dev/null`.
 
 ## 2026-11-25: why poll at all
 
