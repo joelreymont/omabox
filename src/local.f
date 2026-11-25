@@ -1896,12 +1896,14 @@ SUBTREE-INSTALL
    ;MATCH ;
 
 \ The stirred record of wd, folder p, opened from the root rfd and
-\ listed; replaced or missing, it is dropped, else a failure leaves it
-\ tried. Every outcome leaves the record not stirred, or the watch blind.
+\ listed; staged gone by the scan, replaced or missing, it is dropped,
+\ else a failure leaves it tried. Every outcome leaves the record not
+\ stirred, or the watch blind.
 : STIRRED-LISTED
    ( JOURNAL:scan fd n str scan-context ^ARENA:arena -- JOURNAL:scan )
    {: rfd:fd wd:n p:str cx:scan-context ar:^ARENA:arena :}
    cx SCAN-CONTEXT-UNMAKE {: cut:option<MODEL:cutoff> dev:n j w :}
+   p JOURNAL:SCAN-GONE? if j w wd WATCH-DROP exit then
    rfd p STIRRED-OPEN {: opened:option<fd> code:n :}
    code 0<> if
       FS:ERRNO REPLACED? if j w wd WATCH-DROP

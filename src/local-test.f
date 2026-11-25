@@ -1824,6 +1824,24 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    PUBLISH
    [: MOVED-OUT ;] [: MOVED$ FS:REMOVE-TREE ;] finally ;
 
+\ a/b moved out and back: the walk enters a/b anew, and a/b/c's record,
+\ dropped with its rows, does not keep a/b/c from being listed.
+: MOVED-BACK ( -- )
+   s" a/b" AT MOVED$ FS:RENAME-FILE
+   PUBLISH
+   MOVED$ s" a/b" AT FS:RENAME-FILE
+   PUBLISH
+   INVENTORY {: s :}
+   s s" a/b/c/x" SCANNED-CONTENT s" x1" IDENTITY T$=
+   s ORDERED
+   JNL @ WATCHER @ s" a/b/c" CLEAN? TTRUE ;
+
+: A-FOLDER-MOVED-OUT-AND-BACK-IS-LISTED-AGAIN ( -- )
+   s" a_folder_moved_out_and_back_is_listed_again" T-LABEL
+   s" a" MKDIR s" a/b" MKDIR s" a/b/c" MKDIR s" a/b/c/x" s" x1" WRITE
+   PUBLISH
+   [: MOVED-BACK ;] [: MOVED$ FS:REMOVE-TREE ;] finally ;
+
 \ a/b moved out and made anew: a's listing lists the new a/b, and the
 \ old record, another wd at its path, is dropped.
 : MADE-ANEW ( -- )
@@ -1951,6 +1969,7 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    [: AN-UNCHANGED-TREE-RESCANS-WITHOUT-A-WRITE ;] IN-SCAN-CASE
    [: A-STIRRED-FOLDER-BELOW-A-CLEAN-ONE-IS-LISTED ;] IN-SCAN-CASE
    [: A-FOLDER-MOVED-OUT-IS-DROPPED ;] IN-SCAN-CASE
+   [: A-FOLDER-MOVED-OUT-AND-BACK-IS-LISTED-AGAIN ;] IN-SCAN-CASE
    [: A-REPLACED-FOLDER-IS-LISTED-ANEW ;] IN-SCAN-CASE
    [: AN-INACCESSIBLE-STIRRED-FOLDER-IS-TRIED ;] IN-SCAN-CASE
    [: A-BLINDED-SCAN-RERUNS-IN-FULL ;] IN-SCAN-CASE ;

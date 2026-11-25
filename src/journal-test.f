@@ -2635,6 +2635,32 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
    j CLOSE
    d GONE ;
 
+\ Walks the root's range seeing and skipping "h" alone, so "d" and the
+\ rows beneath it are staged gone, then publishes the scan.
+: H-ALONE-PUBLISHED ( scan local-root-binding -- scan )
+   {: b :}
+   SCAN-STOP  s" " SCAN-FROM
+   s" h" DIRECTORY-LOCAL SCAN-SEEN  s" h" SCAN-SKIP
+   s" d" SCAN-GONE? TTRUE  s" h" SCAN-GONE? TFALSE
+   s" " SCAN-TO  b PUBLISH-SCAN TTRUE ;
+
+: A-PUBLISHED-SCAN-FORGETS-THE-RECORDS-OF-FOLDERS-IT-DROPS
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" a published scan forgets the records of folders it drops" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   j 1 s" d" WATCH-RECORD
+   j 2 s" h" WATCH-RECORD
+   j [: j b ALL-PUBLISHED ;] WITH-SCAN
+   j b ar RANGES-STORED
+   j [: b H-ALONE-PUBLISHED ;] WITH-SCAN
+   j 1 s" d" WATCH-CLEAN? TFALSE
+   j 2 s" h" WATCH-CLEAN? TTRUE
+   j ar NEXT-STIRRED NONE-STIRRED? TTRUE
+   j CLOSE
+   d GONE ;
+
 \ Stops the stream and publishes the scan, which writes nothing.
 : STOPPED-PUBLISHED ( scan journal local-root-binding -- scan )
    {: j b :}
@@ -5516,6 +5542,7 @@ variable CRAFT
    ar NEXT-STIRRED-ANSWERS-IN-PATH-ORDER
    ar WATCH-RECORDS-ARE-REPLACED-AND-FORGOTTEN
    ar A-TRIED-FOLDER-IS-STIRRED-AFTER-ITS-SCAN
+   ar A-PUBLISHED-SCAN-FORGETS-THE-RECORDS-OF-FOLDERS-IT-DROPS
    ar A-STOPPED-SCAN-PUBLISHES-NOTHING
    ar ORACLE-JOURNAL-HOLDS-ITS-BASELINES
    ar JOURNAL-REOPEN-EXPOSES-INTENT-WITHOUT-ADVANCING-BASELINE
