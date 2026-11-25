@@ -815,11 +815,15 @@ FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
    r RESET? if true exit then
    r x CLIENT@ REPLY-FAILURE x FAIL ;
 
+\ None, a poll a local change ended, completes a cycle, so a pass runs.
 : CURSOR-POLLED ( DROPBOX:cursor ^run -- bool )
    {: k:DROPBOX:cursor x :}
    RELEASE-HEAP
-   k DROPBOX:CURSOR>STR LONG-POLL-S x CLIENT@ DROPBOX:WAIT
-   x WOKEN ;
+   k DROPBOX:CURSOR>STR LONG-POLL-S OPTION:NONE x CLIENT@ DROPBOX:WAIT
+   MATCH option
+      some OF x WOKEN ENDOF
+      none OF true ENDOF
+   ;MATCH ;
 
 \ The cursor stays in the pass's arena until the next pass ends.
 : POLLED ( ^run -- bool )

@@ -15,7 +15,7 @@
 \ on, and one holding restricted folders, among them), COMPLETE? of each
 \ kind of entry, the probe of a folder (one a continue page whose cursor
 \ did not advance interrupts, one stopped at its first entry), the long
-\ poll,
+\ poll (one a readable descriptor ends, one answered before it is),
 \ downloads, whose body reads through READ-BODY (whole, resumed, a 416
 \ at the end, a body that throws before or after its end, one left
 \ unread while the server holds the rest, one in two chunks read 7 or
@@ -81,6 +81,9 @@ require src/lib/memory.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
 require src/lib/test/stderr.f
+require src/lib/adt/option.f
+require src/lib/fd.f
+require src/lib/task.f
 require src/test-formal.f
 require src/dropbox.f
 require src/test-dropbox.f
@@ -275,6 +278,15 @@ TYPED-VARIABLE AR ^ARENA:arena
       refused OF e DROPBOX-ERROR:EQ ENDOF
       retry OF drop false ENDOF
       unlinked OF false ENDOF
+   ;MATCH ;
+
+
+\ DROPBOX:WAIT with no descriptor, which answers some reply.
+: LONG-POLL ( str n ^DROPBOX:client -- DROPBOX:reply )
+   {: k secs:n c :}
+   k secs OPTION:NONE c DROPBOX:WAIT MATCH option
+      some OF ENDOF
+      none OF false ASSERT DROPBOX-REPLY:UNLINKED ENDOF
    ;MATCH ;
 
 
@@ -476,7 +488,7 @@ variable REFUSALS
    SB-RESET s" Bearer " SB-APPEND TEST-DROPBOX:ISSUED$ SB-APPEND
    TEST-DROPBOX:AUTH$ SB$ T$=
    false 0 TEST-DROPBOX:POLL!
-   s" c3" 30 MAIN @ DROPBOX:WAIT DROPBOX:DONE? ASSERT
+   s" c3" 30 MAIN @ LONG-POLL DROPBOX:DONE? ASSERT
    MAIN @ DROPBOX:CHANGED? TFALSE
    TEST-DROPBOX:SEEN$
    s" /2/users/get_current_account /oauth2/token /2/users/get_current_account /2/files/list_folder/longpoll" T$=
@@ -564,7 +576,7 @@ TYPED-VARIABLE OWN ^DROPBOX:client
    s" dead-token" s" ns-root" RECORDED-CLIENT {: dead :}
    dead UNLINKED-LOGGED
    503 s" " s" " s" " TEST-DROPBOX:SCRIPT!
-   s" c5" 30 dead DROPBOX:WAIT RETRY-MS 0 T=
+   s" c5" 30 dead LONG-POLL RETRY-MS 0 T=
    s" /x.txt" s" " dead DROPBOX:DELETE UNLINKED? ASSERT
    TEST-DROPBOX:SEEN$ s" /oauth2/token /2/files/list_folder/longpoll" T$=
    dead DROPBOX:CLOSE ;
@@ -1246,7 +1258,7 @@ variable WIDEST
 
 : WAITED ( bool n -- )
    LISTING TEST-DROPBOX:POLL!
-   s" c3" 30 MAIN @ DROPBOX:WAIT DROPBOX:DONE? ASSERT
+   s" c3" 30 MAIN @ LONG-POLL DROPBOX:DONE? ASSERT
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder/longpoll" T$=
    s" /2/files/list_folder/longpoll" TEST-DROPBOX:BODIES-TO$
    S\" {\qcursor\q:\qc3\q,\qtimeout\q:30}" T$=
@@ -1279,11 +1291,81 @@ variable WIDEST
    429 s" Retry-After" s" 17"
    S\" {\qerror_summary\q:\qtoo_many_requests/...\q,\qerror\q:{\qreason\q:{\q.tag\q:\qtoo_many_requests\q},\qretry_after\q:1}}"
    TEST-DROPBOX:SCRIPT!
-   s" c3" 30 MAIN @ DROPBOX:WAIT DROPBOX-ERROR:RESET REFUSED? ASSERT
+   s" c3" 30 MAIN @ LONG-POLL DROPBOX-ERROR:RESET REFUSED? ASSERT
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder/longpoll" T$=
-   s" c4" 30 MAIN @ DROPBOX:WAIT RETRY-MS 17000 T=
+   s" c4" 30 MAIN @ LONG-POLL RETRY-MS 17000 T=
    TEST-DROPBOX:SEEN$
    s" /2/files/list_folder/longpoll /2/files/list_folder/longpoll" T$= ;
+
+
+\ ---- a long poll a descriptor ends
+
+\ The pipe a long poll is given, as fd numbers, and the semaphore the fake
+\ holds its answer on.
+variable WAKE-R
+variable WAKE-W
+TASK:SEMAPHORE HOLD
+
+
+: PIPED ( -- ) FD:PIPE-PAIR FD>N WAKE-W ! FD>N WAKE-R ! ;
+: UNPIPED ( -- ) WAKE-R @ close WAKE-W @ close ;
+\ Makes the pipe's read end readable; the fake's hooks run it.
+: STIR ( -- ) WAKE-W @ >FD s" x" FD:WRITE-FULL ;
+: STIR-HELD ( -- ) STIR HOLD TASK:WAIT-SEM ;
+
+
+: WAKE ( -- option<fd> ) WAKE-R @ >FD OPTION:SOME ;
+\ A long poll on c3 the pipe's read end ends.
+: WAKEABLE ( -- option<DROPBOX:reply> )
+   s" c3" 30 WAKE MAIN @ DROPBOX:WAIT ;
+
+
+: WOKEN? ( option<DROPBOX:reply> -- bool )
+   MATCH option
+      none OF true ENDOF
+      some OF DROPBOX:DONE? drop false ENDOF
+   ;MATCH ;
+
+
+: SOME-DONE? ( option<DROPBOX:reply> -- bool )
+   MATCH option
+      none OF false ENDOF
+      some OF DROPBOX:DONE? ENDOF
+   ;MATCH ;
+
+
+: TWO-POLLS ( -- )
+   TEST-DROPBOX:SEEN$
+   s" /2/files/list_folder/longpoll /2/files/list_folder/longpoll" T$= ;
+
+
+\ The pipe turns readable while the fake holds the answer: the long poll
+\ answers none and logs nothing; the next one dials again and answers.
+: WOKEN-CASE ( -- )
+   s" a readable descriptor ends the long poll" T-LABEL
+   LISTING false 0 TEST-DROPBOX:POLL!
+   0 HOLD TASK:SEMAPHORE-INIT PIPED
+   [: STIR-HELD ;] TEST-DROPBOX:DURING-POLL!
+   [: WAKEABLE WOKEN? OUTCOME ! ;] LOGGED 0 T=
+   HOLD TASK:SIGNAL-SEM
+   OUTCOME @ TTRUE ERR$ s" " T$=
+   UNPIPED PIPED
+   WAKEABLE SOME-DONE? ASSERT
+   MAIN @ DROPBOX:CHANGED? TFALSE
+   TWO-POLLS UNPIPED HOLD TASK:SEMAPHORE-DESTROY ;
+
+
+\ An answer with the pipe never readable, and one sent before the pipe
+\ turns readable, are some done.
+: UNWOKEN-CASE ( -- )
+   s" an answer before the descriptor stirs ends the long poll" T-LABEL
+   LISTING true 0 TEST-DROPBOX:POLL! PIPED
+   WAKEABLE SOME-DONE? ASSERT
+   MAIN @ DROPBOX:CHANGED? TTRUE
+   [: STIR ;] TEST-DROPBOX:AFTER-POLL!
+   WAKEABLE SOME-DONE? ASSERT
+   MAIN @ DROPBOX:CHANGED? TTRUE
+   TWO-POLLS UNPIPED ;
 
 
 \ ---- files/download
@@ -1349,7 +1431,7 @@ variable READ-COUNT
 : POLLED ( ^DROPBOX:client -- )
    {: c :}
    LISTING false 0 TEST-DROPBOX:POLL!
-   s" c3" 30 c DROPBOX:WAIT DROPBOX:DONE? ASSERT ;
+   s" c3" 30 c LONG-POLL DROPBOX:DONE? ASSERT ;
 
 
 \ A whole download of the alphabet file on c, read to its end.
@@ -2155,7 +2237,7 @@ variable AGAIN-CODE
    GOT$ s" d/sync+ d/sync/folder+ f/sync/alpha.txt+ f/sync/paper-" T$=
    MAIN @ DROPBOX:CURSOR s" cursor-b" T$=
    true 2 TEST-DROPBOX:POLL!
-   s" cursor-b" 30 MAIN @ DROPBOX:WAIT DROPBOX:DONE? ASSERT
+   s" cursor-b" 30 MAIN @ LONG-POLL DROPBOX:DONE? ASSERT
    MAIN @ DROPBOX:CHANGED? TTRUE
    MAIN @ DROPBOX:BACKOFF 2 T=
    ALPHABET
@@ -3056,6 +3138,7 @@ TYPED-VARIABLE FAULT fault
    PROBE-STALL-CASE PROBE-FIRST-CASE UNDOWNLOADABLE-LISTED-CASE
    INCOMPLETE-LISTED-CASE RESTRICTED-LISTED-CASE INCOMPLETE-KINDS-CASE
    POLL-CASE REUSED-CASE LONG-POLL-EXPOSES-RESET-AND-RATE-LIMIT-OUTCOMES
+   WOKEN-CASE UNWOKEN-CASE
    DOWNLOAD-CASES
    DELETE-CONFLICT-CASE DELETE-MISSING-CASE DELETE-GONE-CASE
    LOST-DELETE-CASE DELETE-ELSEWHERE-CASE DELETE-REV-CASE

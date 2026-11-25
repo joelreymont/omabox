@@ -50,6 +50,7 @@ require src/lib/net/httpc.f
 require src/lib/memory.f
 require src/lib/aio.f
 require src/lib/fsm.f
+require src/lib/adt/option.f
 require src/lib/unicode.f
 require src/lib/date.f
 require src/lib/type/deftype.f
@@ -443,11 +444,20 @@ HEAP:ALLOCATOR VEC-ALLOC !
    buf BLEN got + BUF:N>BLEN buf BUF:LEN! ;
 
 
+\ HTTPC:NEXT, or with some descriptor HTTPC:NEXT-UNLESS on it.
+: NEXT-READ ( option<fd> ^HTTPC:conn ^u8 len -- HTTPC:chunk-result )
+   {: w:option<fd> h a:^ u:len :}
+   w MATCH option
+      none OF h a u HTTPC:NEXT ENDOF
+      some OF {: f:fd :} h a u f HTTPC:NEXT-UNLESS ENDOF
+   ;MATCH ;
+
+
 \ One read; true once the transfer ended, its status or failure kept.
-: STEP ( ^HTTPC:conn ^client -- bool )
-   {: h c :}
+: STEP ( option<fd> ^HTTPC:conn ^client -- bool )
+   {: w:option<fd> h c :}
    c CLIENT-ANSWER @ {: buf :}
-   h buf ROOM HTTPC:NEXT MATCH HTTPC:chunk-result
+   w h buf ROOM NEXT-READ MATCH HTTPC:chunk-result
       chunk OF LEN>N buf ADVANCE drop false ENDOF
       response OF c CLIENT-STATUS ! true ENDOF
       failed OF OPTION:SOME c CLIENT-FAILURE ! true ENDOF
@@ -476,12 +486,13 @@ HEAP:ALLOCATOR VEC-ALLOC !
    code throw ;
 
 
-\ Sends the prepared request and reads its answer whole. Nothing after the
-\ read that ended the transfer throws, so a throw finds it in flight.
-: TRANSFER ( ^client -- )
-   {: c :}
+\ Sends the prepared request and reads its answer whole, every read through
+\ NEXT-READ with w. Nothing after the read that ended the transfer throws,
+\ so a throw finds it in flight.
+: TRANSFER ( option<fd> ^client -- )
+   {: w:option<fd> c :}
    c STARTED {: h :}
-   h [: begin h c STEP until ;] [: false ;] READ-OUT ;
+   h [: begin w h c STEP until ;] [: false ;] READ-OUT ;
 
 
 \ ---- reading headers
@@ -976,7 +987,7 @@ HEAP:ALLOCATOR VEC-ALLOC !
    c c CLIENT-API-CONN PREPARE {: h :}
    h s" Content-Type: application/x-www-form-urlencoded" HTTPC:HEADER+
    c form execute str> SPAN:MAKE c CLIENT-OUT !
-   c TRANSFER ;
+   OPTION:NONE c TRANSFER ;
 
 
 \ A new access token for the refresh token.
@@ -1060,7 +1071,9 @@ private
 
 
 \ The whole answer read and classified.
-: RECEIVED ( ^client -- verdict ) dup TRANSFER CLASSIFY ;
+: RECEIVED ( ^client -- verdict )
+   {: c :}
+   OPTION:NONE c TRANSFER c CLASSIFY ;
 
 
 \ A POST to <api>/2/<route>; body sets the route's headers and body.
@@ -2175,18 +2188,53 @@ private
    JSON:WRITE-OBJECT-END JSON:CLOSE ;
 
 
+\ Whether the fault is NEXT-UNLESS's descriptor's.
+: WAKE? ( HTTPC:fault -- bool )
+   MATCH HTTPC:fault
+      resolve OF false ENDOF
+      connect OF false ENDOF
+      handshake OF false ENDOF
+      trust OF false ENDOF
+      send OF false ENDOF
+      receive OF false ENDOF
+      cut OF false ENDOF
+      timeout OF false ENDOF
+      malformed OF false ENDOF
+      oversize OF false ENDOF
+      woken OF true ENDOF
+   ;MATCH ;
+
+
+: WOKEN? ( ^client -- bool )
+   CLIENT-FAILURE @ MATCH option
+      none OF false ENDOF
+      some OF WAKE? ENDOF
+   ;MATCH ;
+
+
 \ The body is silent until Dropbox answers, so only the whole call is
-\ bounded: the timeout asked for, Dropbox's slack and ours.
-: LONG-POLL ( ^client n -- verdict )
-   {: c secs:n :}
+\ bounded: the timeout asked for, Dropbox's slack and ours. None when w
+\ was readable first: the transfer is hung up, never classified.
+: LONG-POLL ( option<fd> ^client n -- option<verdict> )
+   {: w:option<fd> c secs:n :}
    s" files/list_folder/longpoll" str> SPAN:MAKE c CLIENT-ROUTE !
    false c CLIENT-QUIET !
    c LINE-CLEAR c s" /2/files/list_folder/longpoll" LINE+
    c c CLIENT-NOTIFY-CONN PREPARE {: h :}
    h secs SLACK + GRACE + 1000 * 0 HTTPC:DEADLINES!
    h c JSON-BODY
-   c TRANSFER
-   c CLASSIFY ;
+   w c TRANSFER
+   c WOKEN? if OPTION:NONE exit then
+   c CLASSIFY OPTION:SOME ;
+
+
+: POLL-REPLY ( verdict ^client -- reply )
+   {: v:verdict c :}
+   v MATCH verdict
+      answer OF ENDOF
+      rejected OF c s" a long poll refused a token" E-AUTH FAILED ENDOF
+   ;MATCH
+   c [: POLL-READ ;] ANSWERED ;
 
 public
 
@@ -2220,15 +2268,16 @@ public
 : CURSOR ( ^client -- str ) CLIENT-MARK @ BUF$ ;
 
 
-\ files/list_folder/longpoll on the cursor for at most secs seconds.
-: WAIT ( str n ^client -- reply )
-   {: k secs:n c :}
+\ files/list_folder/longpoll on the cursor for at most secs seconds. None
+\ when the descriptor given was readable before Dropbox answered: the poll
+\ is hung up, nothing logged, and the next WAIT dials again.
+: WAIT ( str n option<fd> ^client -- option<reply> )
+   {: k secs:n w:option<fd> c :}
    k secs c POLL-BODY
-   c secs LONG-POLL MATCH verdict
-      answer OF ENDOF
-      rejected OF c s" a long poll refused a token" E-AUTH FAILED ENDOF
-   ;MATCH
-   c [: POLL-READ ;] ANSWERED ;
+   w c secs LONG-POLL MATCH option
+      none OF OPTION:NONE ENDOF
+      some OF c POLL-REPLY OPTION:SOME ENDOF
+   ;MATCH ;
 
 
 : CHANGED? ( ^client -- bool ) CLIENT-CHANGES @ ;

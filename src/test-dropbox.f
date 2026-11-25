@@ -15,8 +15,9 @@
 \ be, as invalid until RESET; the refresh still issues them. DENY refuses
 \ every call that carries a token 403 until RESET. A call must carry the
 \ Path-Root ROOT! expects, none when that is empty, else it answers 422.
-\ DURING-DOWNLOAD! hooks a quotation into the next download, and
-\ DURING-LISTING! into the next listing call.
+\ DURING-DOWNLOAD! hooks a quotation into the next download,
+\ DURING-LISTING! into the next listing call, DURING-POLL! into the next
+\ long poll before it answers and AFTER-POLL! after.
 \ Scripted answers go before a route's own: a call takes the first left
 \ bound to its path, else, an API call only, the first left bound to none.
 \ ARG-SCRIPT! also binds one to a text the call's Dropbox-API-Arg must
@@ -28,7 +29,8 @@
 \ STORAGE CLASS. PROCESS-WIDE: one worker serves every request, so its handler
 \ alone writes the state while a test waits on its call, and the test sets it
 \ between calls; only RESUME-BODY sets it during one, and the
-\ DURING-DOWNLOAD! and DURING-LISTING! hooks run on the fake's task. A
+\ DURING-DOWNLOAD!, DURING-LISTING!, DURING-POLL! and AFTER-POLL! hooks run
+\ on the fake's task. A
 \ body stays in its buffer, as HTTP:BODY! borrows it, until the next
 \ request.
 
@@ -785,7 +787,8 @@ variable HELD-U
 \ ---- list_folder, list_folder/continue and list_folder/longpoll
 
 \ Pages go out in order, one per listing call, each with its status; the
-\ long poll answers POLLED every time.
+\ long poll answers POLLED every time; while SENDING, on the connection it
+\ takes over, and then runs AFTER-POLL's hook.
 STRUCTURE page DERIVE addr
    FIELD start n
    FIELD len n
@@ -802,6 +805,11 @@ variable POLLED-U
 : NO-HOOK ( -- ) ;
 TYPED-VARIABLE ON-LISTING [ -- ]
 ' NO-HOOK ON-LISTING !
+TYPED-VARIABLE ON-POLL [ -- ]
+' NO-HOOK ON-POLL !
+TYPED-VARIABLE AFTER-POLL [ -- ]
+' NO-HOOK AFTER-POLL !
+TYPED-VARIABLE SENDING bool
 
 
 : PAGES-MADE ( -- )
@@ -836,16 +844,41 @@ PAGES-MADE
    a i PAGE$ ANSWER! ;
 
 
+: POLLED$ ( -- str ) POLLED POLLED-U @ >str ;
+
+
+\ POLLED as a whole answer that closes its connection.
+: POLL-ANSWER$ ( -- str )
+   SB-RESET S\" HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+   SB-APPEND s" Content-Length: " SB-APPEND POLLED-U @ FMT:SB-INT
+   S\" \r\nConnection: close\r\n\r\n" SB-APPEND POLLED$ SB-APPEND SB$ ;
+
+
+\ POLLED sent on the request's connection, then the hook, then a close.
+: SENT-THEN ( HTTP:request [ -- ] -- )
+   {: q:HTTP:request hook :}
+   q HTTP:TAKE-OVER drop {: conn:TCP4:connection :}
+   conn POLL-ANSWER$ TCP4:WRITE CLOSED
+   hook execute
+   conn TCP4:CLOSE CLOSED ;
+
+
 : LONGPOLL ( HTTP:request HTTP:response -- )
    {: q:HTTP:request a:HTTP:response :}
+   ON-POLL @ ['] NO-HOOK ON-POLL ! execute
    POLLED-U @ 0= if a UNSET! exit then
-   a POLLED POLLED-U @ >str ANSWER! ;
+   SENDING @ if
+      false SENDING ! AFTER-POLL @ ['] NO-HOOK AFTER-POLL !
+      q swap SENT-THEN exit
+   then
+   a POLLED$ ANSWER! ;
 
 
 : LISTING-RESET ( -- )
    PAGE-TEXT BUF:CLEAR PAGES @ 0 VEC:RESIZE
    0 PAGE-SERVED ! 0 POLLED-U !
-   ['] NO-HOOK ON-LISTING ! ;
+   ['] NO-HOOK ON-LISTING ! ['] NO-HOOK ON-POLL !
+   ['] NO-HOOK AFTER-POLL ! false SENDING ! ;
 
 
 \ Opens the next page, with this status, at the end of PAGE-TEXT.
@@ -1505,8 +1538,9 @@ $2100000 constant UPLOAD-CAP
 \ Forgets the script, the entries, the kept bytes, the pages, the long
 \ poll's answer, the sessions, the revs uploads took, a download's fault, a
 \ SKEW, a LOSE, the CUTs, a CUT-TOKEN, a GARBLE, a code GRANT! set, a
-\ ROTATE!, a REVOKE, a DENY, a DURING-DOWNLOAD! or DURING-LISTING! hook
-\ and what was sent; the tokens and the root stay.
+\ ROTATE!, a REVOKE, a DENY, a DURING-DOWNLOAD!, DURING-LISTING!,
+\ DURING-POLL! or AFTER-POLL! hook and what was sent; the tokens and the
+\ root stay.
 : RESET ( -- )
    0 SCRIPTS ! 0 FILES ! 0 CONTENTS ! 0 SESSIONS ! 0 REVS !
    0 GRANT-CODE-U ! 0 ROTATED-U !
@@ -1652,6 +1686,16 @@ $2100000 constant UPLOAD-CAP
 \ The next listing call runs the quotation once, on the fake's task,
 \ once it is admitted and before it answers.
 : DURING-LISTING! ( [ -- ] -- ) ON-LISTING ! ;
+
+
+\ The next long poll runs the quotation once, on the fake's task, before
+\ it answers.
+: DURING-POLL! ( [ -- ] -- ) ON-POLL ! ;
+
+
+\ The next long poll that has an answer sends it, runs the quotation once
+\ on the fake's task, then closes its connection.
+: AFTER-POLL! ( [ -- ] -- ) AFTER-POLL ! true SENDING ! ;
 
 
 \ ---- files/download
