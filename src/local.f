@@ -1094,11 +1094,6 @@ private
 : SEEN-UNKNOWN ( JOURNAL:scan str MODEL:unknown-reason -- JOURNAL:scan )
    UNKNOWN-RECORD JOURNAL:SCAN-SEEN ;
 
-: OBSERVATION-PATH ( MODEL:local-record -- str )
-   MODEL-LOCAL--RECORD:UNMAKE
-   {: p:MODEL:path o:MODEL:observation<MODEL:local> :}
-   p MODEL:PATH>STR ;
-
 \ ---- order
 
 : KEY-LESS ( n n [ n -- str ] -- bool )
@@ -1131,17 +1126,6 @@ private
 : ENTRY-STEP ( [ -- ] -- n )
    {: step :}
    [: step execute ;] catch STEP-CODE ;
-
-\ STAT-FD as a step; after a throw ENTRY-CODE? names, NO-STAT and the
-\ code.
-: STAT-STEP ( fd str str -- MODEL:stat n )
-   {: f:fd p:str o:str :}
-   NO-STAT [: DROP-STAT f p o STAT-FD ;] catch {: code:n :}
-   code 0<> if drop NO-STAT then code STEP-CODE ;
-
-: CHANGED-STEP ( str str -- n )
-   {: o:str p:str :}
-   [: o p CHANGED ;] ENTRY-STEP ;
 
 : IO-STEP ( str str -- n )
    {: o:str p:str :}
@@ -1253,21 +1237,22 @@ private
    {: v :}
    begin v VEC:COUNT 0 > while v TOP-RELEASED repeat ;
 
-\ The directory's stat after its listing must be the one before.
-: KEPT-STILL ( fd str MODEL:stat -- )
-   {: child:fd p:str before:MODEL:stat :}
+\ The open directory's paths, listed into ar; its stat after the listing
+\ must be before, the one taken before it.
+: LISTED-STILL ( fd str MODEL:stat ^ARENA:arena -- ^VEC:vector<str> )
+   {: child:fd p:str before:MODEL:stat ar:^ARENA:arena :}
+   child p s" open directory stream" s" read directory" ar LIST-PATHS
    child p s" inspect directory after scan" STAT-FD
    before SAME-OBSERVATION 0= if s" scan directory" p CHANGED then ;
 
 \ The open directory, checked to be the one the walk's stat found, then
-\ listed into ar and checked to have kept still while it was: its paths.
+\ its LISTED-STILL.
 : CHECKED-LISTING ( fd str MODEL:stat ^ARENA:arena -- ^VEC:vector<str> )
    {: child:fd p:str probe:MODEL:stat ar:^ARENA:arena :}
    child p s" inspect directory before scan" STAT-FD
    {: before:MODEL:stat :}
    before probe SAME-INODE 0= if s" open scanned directory" p CHANGED then
-   child p s" open directory stream" s" read directory" ar LIST-PATHS
-   child p before KEPT-STILL ;
+   child p before ar LISTED-STILL ;
 
 \ The directory at name, opened from dir where the walk's stat found it,
 \ and its CHECKED-LISTING; a throw closes it.
@@ -1279,15 +1264,16 @@ private
    [: drop child p probe ar CHECKED-LISTING ;] CLOSING
    child swap ;
 
-\ OPENED-LISTING as a step; after a throw ENTRY-CODE? names, -1, an
-\ empty vector and the code, ar released.
+\ OPENED-LISTING and 0; after any throw, -1, an empty vector in ar and
+\ the code. The caller, which owns ar, releases it once the vector is
+\ dropped, then STEP-CODE decides the code.
 : LISTING-STEP
    ( fd str str MODEL:stat ^ARENA:arena -- fd ^VEC:vector<str> n )
    {: dir:fd name:str p:str probe:MODEL:stat ar:^ARENA:arena :}
    -1 >FD ar [type] str NEW-VEC
    [: 2drop dir name p probe ar OPENED-LISTING ;] catch {: code:n :}
-   code 0<> if 2drop -1 >FD ar [type] str NEW-VEC ar ARENA:RELEASE then
-   code STEP-CODE ;
+   code 0<> if 2drop -1 >FD ar [type] str NEW-VEC then
+   code ;
 
 \ SCAN-NAMES, which the walk reaches again below a directory.
 defer SCAN-SUBTREE
@@ -1336,14 +1322,17 @@ defer SCAN-SUBTREE
    begin v VEC:COUNT 0 > while v cx DESCEND-TOP repeat ;
 
 \ A directory: listed where the walk's stat found it, held, then seen at
-\ its name; its subtree waits in held for SCAN-NAMES.
+\ its name; its subtree waits in held for SCAN-NAMES. A failed listing
+\ releases its arena, then answers the step's code.
 : SCAN-SUBDIRECTORY
    ( JOURNAL:scan fd str str MODEL:stat ^VEC:vector<held-dir>
      -- JOURNAL:scan n )
    {: dir:fd name:str path:str probe:MODEL:stat held :}
    ARENA:NEW {: ar:^ARENA:arena :}
    dir name path probe ar LISTING-STEP {: child:fd names code:n :}
-   code 0<> if code exit then
+   code 0<> if
+      child names 2drop ar ARENA:RELEASE code STEP-CODE exit
+   then
    child path names ar HELD-DIR-MAKE held VEC:PUSH !
    path MODEL:>PATH DIRECTORY-OBSERVATION MODEL-LOCAL--RECORD:MAKE
    JOURNAL:SCAN-SEEN 0 ;

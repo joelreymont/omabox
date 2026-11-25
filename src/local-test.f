@@ -606,6 +606,11 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
 
 : PUBLISHED ( ^VEC:vector<MODEL:local-record> -- n ) VEC:COUNT ;
 
+: OBSERVATION-PATH ( MODEL:local-record -- str )
+   MODEL-LOCAL--RECORD:UNMAKE
+   {: p:MODEL:path o:MODEL:observation<MODEL:local> :}
+   p MODEL:PATH>STR ;
+
 \ The observation of the path, none where the inventory holds none.
 : FIND
    ( ^VEC:vector<MODEL:local-record> str
@@ -695,6 +700,219 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
    [: LOCKED-AFTER-ENUMERATION ;] SCANNED {: s :}
    s s" locked.txt" INACCESSIBLE SEEN
    s s" stable.txt" PRESENT SEEN ;
+
+\ ---- files that change before hashing
+
+\ The walk enumerates "nested/a-missing", which is gone when its job
+\ hashes.
+: REMOVED-BEFORE-HASHING ( JOURNAL:scan -- JOURNAL:scan )
+   NO-CUTOFF ENUMERATE {: ps:pending-scan :}
+   s" nested/a-missing" REMOVE
+   ps FINISH-SCAN ;
+
+: NEW-FILE-REMOVED-BEFORE-HASHING-IS-INCOMPLETE ( -- )
+   s" new_file_removed_before_hashing_is_incomplete" T-LABEL
+   s" nested" MKDIR
+   s" kept" s" kept" WRITE
+   s" nested/a-missing" s" a" WRITE
+   [: REMOVED-BEFORE-HASHING ;] SCANNED {: s :}
+   s s" nested" DIRECTORY SEEN
+   s s" nested/a-missing" INCOMPLETE SEEN
+   s s" kept" PRESENT SEEN
+   s PUBLISHED 3 T= ;
+
+\ The stored file's new bytes make it a job, and its cached hash is not
+\ kept once the job finds the file gone.
+: STORED-FILE-CHANGED-THEN-REMOVED-BEFORE-HASHING-IS-INCOMPLETE ( -- )
+   s" stored_file_changed_then_removed_before_hashing_is_incomplete"
+   T-LABEL
+   s" nested" MKDIR
+   s" kept" s" kept" WRITE
+   s" nested/a-missing" s" a" WRITE
+   NO-CUTOFF [: STABLE ;] CACHED-SCAN PUBLISHED 3 T=
+   s" nested/a-missing" s" longer bytes" WRITE
+   [: REMOVED-BEFORE-HASHING ;] SCANNED {: s :}
+   s s" nested" DIRECTORY SEEN
+   s s" nested/a-missing" INCOMPLETE SEEN
+   s s" kept" PRESENT SEEN
+   s PUBLISHED 3 T=
+   REUSABLE s" nested/a-missing" HOLDS? TFALSE ;
+
+\ A stable rescan reuses every hash, so it stages no job, and the file
+\ is removed after the walk.
+: REMOVED-AFTER-THE-WALK ( JOURNAL:scan -- JOURNAL:scan )
+   STABLE ENUMERATE {: ps:pending-scan :}
+   JOURNAL:SCAN-COUNTS {: jobs:n staged:n hashes:n :}
+   jobs 0 T= staged 0 T= hashes 0 T=
+   s" nested/a-missing" REMOVE
+   ps [: STABLE ;] FINISH-SCAN-AT ;
+
+\ The walk's observation stands until the next scan finds the file gone.
+: CACHED-FILE-REMOVED-AFTER-THE-WALK-STAYS-UNTIL-THE-NEXT-SCAN ( -- )
+   s" cached_file_removed_after_the_walk_stays_until_the_next_scan"
+   T-LABEL
+   s" nested" MKDIR
+   s" nested/a-missing" s" a" WRITE
+   NO-CUTOFF [: STABLE ;] CACHED-SCAN PUBLISHED 2 T=
+   [: REMOVED-AFTER-THE-WALK ;] SCANNED {: s :}
+   s s" nested/a-missing" PRESENT SEEN
+   STABLE [: STABLE ;] CACHED-SCAN {: t :}
+   t s" nested/a-missing" MISSING SEEN
+   t s" nested" DIRECTORY SEEN
+   REUSABLE s" nested/a-missing" HOLDS? TFALSE ;
+
+\ The walk enumerates "nested/a-missing", which is a symlink to "kept"
+\ when its job opens it.
+: LINKED-BEFORE-HASHING ( JOURNAL:scan -- JOURNAL:scan )
+   NO-CUTOFF ENUMERATE {: ps:pending-scan :}
+   s" nested/a-missing" REMOVE
+   s" kept" TARGET-AT s" nested/a-missing" AT FS:MAKE-SYMLINK
+   ps FINISH-SCAN ;
+
+: FILE-REPLACED-BY-A-SYMLINK-BEFORE-HASHING-IS-INCOMPLETE ( -- )
+   s" file_replaced_by_a_symlink_before_hashing_is_incomplete" T-LABEL
+   s" nested" MKDIR
+   s" kept" s" kept" WRITE
+   s" nested/a-missing" s" a" WRITE
+   [: LINKED-BEFORE-HASHING ;] SCANNED {: s :}
+   s s" nested/a-missing" INCOMPLETE SEEN
+   s s" kept" PRESENT SEEN ;
+
+\ A stable scan with "locked" and "locked-x" unreadable.
+: DENIED-SCAN ( -- ^VEC:vector<MODEL:local-record> )
+   s" locked" DENY s" locked-x" DENY
+   [: STABLE [: STABLE ;] CACHED-SCAN ;]
+   [: s" locked" ALLOW s" locked-x" ALLOW ;] finally ;
+
+\ Every hash the cache holds is reused: no job, and the six stored rows
+\ beneath the two directories staged.
+: ALL-HASHES-REUSED ( JOURNAL:scan -- JOURNAL:scan )
+   STABLE ENUMERATE {: ps:pending-scan :}
+   JOURNAL:SCAN-COUNTS {: jobs:n staged:n hashes:n :}
+   jobs 0 T= staged 6 T= hashes 0 T=
+   ps [: STABLE ;] FINISH-SCAN-AT ;
+
+\ The rows beneath an unreadable directory leave the inventory, but
+\ their cached hashes stay for the scan that can read them again.
+: STORED-ROWS-BENEATH-DENIED-DIRECTORIES-KEEP-THEIR-HASHES ( -- )
+   s" stored_rows_beneath_denied_directories_keep_their_hashes" T-LABEL
+   s" locked" MKDIR s" locked/secret.txt" s" secret" WRITE
+   s" locked/sub" MKDIR s" locked/sub/deep.txt" s" deep" WRITE
+   s" locked-x" MKDIR s" locked-x/other.txt" s" other" WRITE
+   s" open.txt" s" open" WRITE
+   NO-CUTOFF [: STABLE ;] CACHED-SCAN PUBLISHED 7 T=
+   REUSABLE VEC:COUNT 4 T=
+   DENIED-SCAN {: s :}
+   s s" locked" INACCESSIBLE SEEN
+   s s" locked-x" INACCESSIBLE SEEN
+   s s" locked/secret.txt" MISSING SEEN
+   s s" locked/sub" MISSING SEEN
+   s s" locked/sub/deep.txt" MISSING SEEN
+   s s" locked-x/other.txt" MISSING SEEN
+   s s" open.txt" PRESENT SEEN
+   s PUBLISHED 3 T=
+   REUSABLE VEC:COUNT 4 T=
+   [: ALL-HASHES-REUSED ;] SCANNED {: t :}
+   t PUBLISHED 7 T=
+   t s" locked/sub/deep.txt" PRESENT SEEN
+   t s" locked-x/other.txt" PRESENT SEEN
+   REUSABLE VEC:COUNT 4 T= ;
+
+\ ---- a listed directory's guards
+
+: TEST-ROOT ( -- fd ) ROOT$ s" open test scan root" OPEN-ROOT ;
+
+\ The walk's no-follow stat of the name in dir.
+: WALK-STAT ( fd str -- MODEL:stat ) FS:TRY-STAT-AT TTRUE BUF-STAT ;
+
+: HELD-DIRS ( -- ^VEC:vector<held-dir> ) AR @ [type] held-dir NEW-VEC ;
+
+\ "d" moved aside to "moved", which keeps its inode from reuse.
+: D-MOVED ( -- ) s" d" TARGET-AT s" moved" AT FS:RENAME-FILE ;
+
+\ "d" moved aside, a new directory holding "d/x" in its place.
+: D-REPLACED ( -- ) D-MOVED s" d" MKDIR s" d/x" s" x" WRITE ;
+
+\ "d" moved aside, a symlink to the directory "target" in its place.
+: D-LINKED ( -- )
+   s" target" MKDIR s" target/x" s" x" WRITE
+   D-MOVED s" target" TARGET-AT s" d" AT FS:MAKE-SYMLINK ;
+
+: A-DIRECTORY-GROWN-SINCE-ITS-STAT-HAS-CHANGED ( -- )
+   s" a_directory_grown_since_its_stat_has_changed" T-LABEL
+   s" d" MKDIR
+   TEST-ROOT {: root:fd :}
+   root s" d" s" d" OPEN-DIRECTORY-AT {: child:fd :}
+   child s" d" s" inspect test directory" STAT-FD {: before:MODEL:stat :}
+   s" d/new" s" new" WRITE
+   [: child s" d" before AR @ LISTED-STILL drop ;] ['] ENTRY-CODE? CONVERTING
+   E-CHANGED T=
+   child DISCARD root DISCARD ;
+
+\ The kind the walk publishes for a nonzero code, MISSING for 0.
+: CODE-KIND ( n -- n )
+   {: code:n :}
+   code 0= if MISSING exit then
+   code WALK-UNKNOWN REASON-KIND ;
+
+\ SCAN-SUBDIRECTORY of "d" by the probe, quiet as the walk is: its code
+\ and the kind the walk publishes for it; nothing is held.
+: SUBDIRECTORY-REFUSED ( JOURNAL:scan fd MODEL:stat -- JOURNAL:scan n n )
+   {: root:fd probe:MODEL:stat :}
+   HELD-DIRS {: held :}
+   [: root s" d" s" d" probe held SCAN-SUBDIRECTORY ;]
+   ['] ENTRY-CODE? WITH-CONVERTS {: code:n :}
+   code code CODE-KIND
+   held VEC:COUNT 0 T= held ALL-RELEASED ;
+
+: ANOTHER-INODE-AT-THE-OPEN ( JOURNAL:scan -- JOURNAL:scan )
+   TEST-ROOT {: root:fd :}
+   root s" d" WALK-STAT {: probe:MODEL:stat :}
+   D-REPLACED
+   root probe SUBDIRECTORY-REFUSED INCOMPLETE T= E-CHANGED T=
+   root DISCARD ;
+
+: A-DIRECTORY-OF-ANOTHER-INODE-IS-NOT-HELD ( -- )
+   s" a_directory_of_another_inode_is_not_held" T-LABEL
+   s" d" MKDIR
+   [: ANOTHER-INODE-AT-THE-OPEN ;] SCANNED drop ;
+
+\ The open refuses the symlink, so the target is never opened.
+: A-SYMLINK-AT-THE-OPEN ( JOURNAL:scan -- JOURNAL:scan )
+   TEST-ROOT {: root:fd :}
+   root s" d" WALK-STAT {: probe:MODEL:stat :}
+   D-LINKED
+   root probe SUBDIRECTORY-REFUSED INCOMPLETE T= E-IO T=
+   root DISCARD ;
+
+: A-DIRECTORY-NOW-A-SYMLINK-IS-NEVER-LISTED ( -- )
+   s" a_directory_now_a_symlink_is_never_listed" T-LABEL
+   s" d" MKDIR
+   [: A-SYMLINK-AT-THE-OPEN ;] SCANNED drop ;
+
+\ "d" walked by the stat taken before it was replaced, its code
+\ published as SCAN-NAME publishes it, then every subtree held, and the
+\ scan finished.
+: REPLACED-BEFORE-ITS-OPEN ( JOURNAL:scan -- JOURNAL:scan )
+   TEST-ROOT {: root:fd :}
+   root ROOT$ ROOT-STAT {: before:MODEL:stat :}
+   root s" d" WALK-STAT {: probe:MODEL:stat :}
+   D-REPLACED
+   NO-CUTOFF before STAT-DEV SCAN-CONTEXT-MAKE {: cx:scan-context :}
+   HELD-DIRS {: held :}
+   [: probe root s" d" s" d" cx held SCAN-PROBED ;]
+   ['] ENTRY-CODE? WITH-CONVERTS {: code:n :}
+   code 0<> if s" d" code WALK-UNKNOWN SEEN-UNKNOWN then
+   held cx ENTERED-ALL
+   ROOT$ AR @ KEEP root before AR @ PENDING-SCAN-MAKE FINISH-SCAN ;
+
+: A-DIRECTORY-REPLACED-BEFORE-ITS-OPEN-IS-INCOMPLETE ( -- )
+   s" a_directory_replaced_before_its_open_is_incomplete" T-LABEL
+   s" d" MKDIR
+   [: REPLACED-BEFORE-ITS-OPEN ;] SCANNED {: s :}
+   s s" d" INCOMPLETE SEEN
+   s s" d/x" MISSING SEEN
+   s PUBLISHED 1 T= ;
 
 : ENUMERATE-SCAN-ACROSS-DEVICES
    ( JOURNAL:scan str ^ARENA:arena -- JOURNAL:scan pending-scan )
@@ -1342,6 +1560,19 @@ variable RAISED-ERRNO
 : CASES ( -- )
    [: SCAN-PUBLISHES-EMPTY-AND-NESTED-DIRECTORIES ;] IN-SCAN-CASE
    [: FILE-LOCKED-AFTER-ENUMERATION-IS-INACCESSIBLE ;] IN-SCAN-CASE
+   [: NEW-FILE-REMOVED-BEFORE-HASHING-IS-INCOMPLETE ;] IN-SCAN-CASE
+   [: STORED-FILE-CHANGED-THEN-REMOVED-BEFORE-HASHING-IS-INCOMPLETE ;]
+   IN-SCAN-CASE
+   [: CACHED-FILE-REMOVED-AFTER-THE-WALK-STAYS-UNTIL-THE-NEXT-SCAN ;]
+   IN-SCAN-CASE
+   [: FILE-REPLACED-BY-A-SYMLINK-BEFORE-HASHING-IS-INCOMPLETE ;]
+   IN-SCAN-CASE
+   [: STORED-ROWS-BENEATH-DENIED-DIRECTORIES-KEEP-THEIR-HASHES ;]
+   IN-SCAN-CASE
+   [: A-DIRECTORY-GROWN-SINCE-ITS-STAT-HAS-CHANGED ;] IN-SCAN-CASE
+   [: A-DIRECTORY-OF-ANOTHER-INODE-IS-NOT-HELD ;] IN-SCAN-CASE
+   [: A-DIRECTORY-NOW-A-SYMLINK-IS-NEVER-LISTED ;] IN-SCAN-CASE
+   [: A-DIRECTORY-REPLACED-BEFORE-ITS-OPEN-IS-INCOMPLETE ;] IN-SCAN-CASE
    [: OBJECTS-ON-ANOTHER-DEVICE-ARE-UNSUPPORTED-AND-UNSCANNED ;]
    IN-SCAN-CASE
    [: CHANGING-FILES-ARE-UNKNOWN-WITHOUT-HIDING-STABLE-FILES ;]
