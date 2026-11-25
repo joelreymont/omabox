@@ -2,11 +2,13 @@
 \ Rust version's status.rs. RENDER reads a journal read-only and lists
 \ what needs attention: each pending plan, its operations left and the
 \ next one's description; each blocked plan and why; each path either
-\ side observed as unknown; each pending recovery copy. An excluded path
-\ is left out, but for a recovery copy. No account, namespace, root,
-\ cursor, content, revision, recovery path or conflict is shown. A file
-\ that is absent or holds no Dropbox binding is not set up. The journal
-\ is never created, migrated or written.
+\ side observed as unknown; each folder deleted here whose Dropbox
+\ folder still holds entries, which sync holds; each pending recovery
+\ copy. An excluded path is left out, but for a recovery copy. No
+\ account, namespace, root, cursor, content, revision, recovery path
+\ or conflict is shown. A file that is absent or holds no Dropbox
+\ binding is not set up. The journal is never created, migrated or
+\ written.
 \ The lines are sorted by path as Rust's Path::cmp orders paths, by
 \ component, then by text. An absolute path shows as
 \ "(invalid synchronized path)", the empty one as ".", and bytes that
@@ -321,6 +323,18 @@ ARENA SLOTS JOURNAL:journal
    j ar JOURNAL:UNKNOWN-REMOTES {: rs :}
    rs VEC:COUNT 0 ?do rs i VEC:AT @ ar v REMOTE+ loop ;
 
+: HELD$ ( -- str )
+   s" deleted here, kept on Dropbox: its Dropbox folder still holds entries" ;
+
+: HELD+ ( MODEL:path ^ARENA:arena ^VEC:vector<entry> -- )
+   {: path ar v :}
+   path MODEL:EXCLUDED? if exit then
+   path HELD$ ar v ENTRY+ ;
+
+: HELD-ENTRIES ( JOURNAL:journal ^ARENA:arena ^VEC:vector<entry> -- )
+   {: j ar v :}
+   j ar [: ar v HELD+ ;] JOURNAL:EACH-HELD-DELETION ;
+
 : RECOVERY+ ( JOURNAL:recovery-record ^ARENA:arena ^VEC:vector<entry> -- )
    {: r ar v :}
    r JOURNAL-RECOVERY--RECORD:UNMAKE {: id op path copy h s kept :}
@@ -339,6 +353,7 @@ ARENA SLOTS JOURNAL:journal
    [: j ar v BLOCKED-ENTRIES ;] s" read blocked sync plans" GUARDED
    [: j ar v LOCAL-ENTRIES ;] s" read local observations" GUARDED
    [: j ar v REMOTE-ENTRIES ;] s" read remote observations" GUARDED
+   [: j ar v HELD-ENTRIES ;] s" read held local deletions" GUARDED
    [: j ar v RECOVERY-ENTRIES ;]
    s" read pending recovery copies" GUARDED
    v ;

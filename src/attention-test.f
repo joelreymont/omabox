@@ -4,9 +4,11 @@
 \ - status_never_initializes_or_migrates_a_journal
 \ - status_diagnostics_redact_the_absolute_journal_path, over the lines
 \   JOURNAL and ATTENTION log, which name `[Omabox journal]`
-\ and one of its own:
+\ and its own:
 \ - A-JOURNAL-BELOW-A-FILE-IS-UNINSPECTABLE: ENOTDIR from stat is
 \   E-INSPECT, its two lines logged, ENOTDIR left in FS:ERRNO.
+\ - ONLY-HELD-FOLDER-DELETIONS-SHOW: d-held shows; e-empty (empty on
+\   Dropbox), u/f (below unknown u) and x.dropbox (excluded) do not.
 \ Each case runs in a directory of its own under TMPDIR and removes it;
 \ a refusal's log lines are captured there, checked and removed.
 \ Run from the repository root: hb --load src/attention-test.f </dev/null
@@ -105,6 +107,9 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
 : REMOTE-UNKNOWN
    ( MODEL:unknown-reason -- MODEL:observation<MODEL:remote> )
    MODEL-OBSERVATION:UNKNOWN ;
+
+: REMOTE-DIRECTORY ( -- MODEL:observation<MODEL:remote> )
+   MODEL-OBSERVATION:DIRECTORY ;
 
 : BOUND? ( JOURNAL:dropbox-binding-write -- bool )
    MATCH JOURNAL:dropbox-binding-write
@@ -339,12 +344,99 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
    rest STR:len 0 T=
    d GONE ;
 
+
+\ ---- held local deletions -------------------------------------------
+
+: NOOP-RECORDED? ( JOURNAL:noop-write -- bool )
+   MATCH JOURNAL:noop-write
+      recorded OF true ENDOF
+      live-plan OF drop false ENDOF
+   ;MATCH ;
+
+\ A directory baseline at each path.
+: FOLDERS ( ^VEC:vector<MODEL:path> JOURNAL:journal ^ARENA:arena -- )
+   {: paths j ar :}
+   paths VEC:COUNT 0 ?do
+      j paths i VEC:AT @ MODEL-BASELINE:DIRECTORY ar JOURNAL:RECORD-NOOP
+      NOOP-RECORDED? TTRUE
+   loop ;
+
+: REMOTE+ ( str MODEL:observation<MODEL:remote> ^VEC:vector<MODEL:remote-record>
+     ^ARENA:arena -- )
+   {: p:str o v ar :}
+   p PATH {: path :}
+   path ar MODEL:FOLD path o MODEL-REMOTE--RECORD:MAKE v VEC:PUSH ! ;
+
+: DROPBOX-FOLDER ( str ^VEC:vector<MODEL:remote-record> ^ARENA:arena -- )
+   {: p:str v ar :}
+   p REMOTE-DIRECTORY v ar REMOTE+ ;
+
+: DROPBOX-FILE ( str ^VEC:vector<MODEL:remote-record> ^ARENA:arena -- )
+   {: p:str v ar :}
+   p s" held-content" s" held-revision" REMOTE MODEL-OBSERVATION:PRESENT
+   v ar REMOTE+ ;
+
+: REMOTES ( ^ARENA:arena -- ^VEC:vector<MODEL:remote-record> )
+   ARENA:ALLOCATOR 0 [type] MODEL:remote-record VEC:NEW ;
+
+: PUBLISHED
+   ( JOURNAL:journal ^VEC:vector<MODEL:remote-record> -- )
+   {: j v :}
+   j s" held-cursor" DROPBOX:>CURSOR v JOURNAL:PUBLISH-REMOTE-INVENTORY ;
+
+: HELD-FOLDER
+   ( ^VEC:vector<MODEL:path> ^VEC:vector<MODEL:remote-record>
+     ^ARENA:arena -- )
+   {: bs rs ar :}
+   s" d-held" PATH bs VEC:PUSH !
+   s" d-held" rs ar DROPBOX-FOLDER
+   s" d-held/x.txt" rs ar DROPBOX-FILE ;
+
+\ The status of a journal holding baselines bs, the local scan of the
+\ unknown paths us and the remote inventory rs.
+: HELD-STATUS
+   ( ^VEC:vector<MODEL:path> ^VEC:vector<MODEL:path>
+     ^VEC:vector<MODEL:remote-record> str ^ARENA:arena -- str )
+   {: bs us rs d:str ar :}
+   d s" journal.sqlite3" ar INSIDE {: p:str :}
+   p JOURNAL:OPEN {: j :}
+   j ar BIND
+   us j ar LOCALS
+   j rs PUBLISHED
+   bs j ar FOLDERS
+   j JOURNAL:CLOSE
+   p ar ATTENTION:RENDER ;
+
+: HELD-UNKNOWN$ ( -- str )
+   s\" Omabox status:\n- d-held: deleted here, kept on Dropbox: its Dropbox folder still holds entries\n- u: local status unknown: path is inaccessible\n" ;
+
+: ONLY-HELD-FOLDER-DELETIONS-SHOW ( ^ARENA:arena -- )
+   {: ar :}
+   s" ONLY-HELD-FOLDER-DELETIONS-SHOW" T-LABEL
+   ar SCRATCH {: d:str :}
+   ar PATHS {: bs :}  ar PATHS {: us :}  ar REMOTES {: rs :}
+   bs rs ar HELD-FOLDER
+   s" e-empty" PATH bs VEC:PUSH !
+   s" e-empty" rs ar DROPBOX-FOLDER
+   s" u/f" PATH bs VEC:PUSH !
+   s" u" PATH us VEC:PUSH !
+   s" u" rs ar DROPBOX-FOLDER
+   s" u/f" rs ar DROPBOX-FOLDER
+   s" u/f/y.txt" rs ar DROPBOX-FILE
+   s" x.dropbox" PATH bs VEC:PUSH !
+   s" x.dropbox" rs ar DROPBOX-FOLDER
+   s" x.dropbox/z.txt" rs ar DROPBOX-FILE
+   bs us rs d ar HELD-STATUS
+   HELD-UNKNOWN$ T$=
+   d GONE ;
+
 : CASES ( ^ARENA:arena -- )
    {: ar :}
    ar STATUS-SNAPSHOT-IS-SORTED-AND-OMITS-INTERNAL-VALUES
    ar STATUS-NEVER-INITIALIZES-OR-MIGRATES-A-JOURNAL
    ar STATUS-DIAGNOSTICS-REDACT-THE-ABSOLUTE-JOURNAL-PATH
-   ar A-JOURNAL-BELOW-A-FILE-IS-UNINSPECTABLE ;
+   ar A-JOURNAL-BELOW-A-FILE-IS-UNINSPECTABLE
+   ar ONLY-HELD-FOLDER-DELETIONS-SHOW ;
 
 : TESTS ( -- )
    T-RESET

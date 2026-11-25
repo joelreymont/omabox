@@ -2842,6 +2842,37 @@ public
 
 private
 
+: HELD-ROWS
+   ( SQLITE:statement ^ARENA:arena [ MODEL:path -- ]
+     -- SQLITE:statement )
+   {: ar visit :}
+   begin SQLITE:STEP while 0 ar PATH-COPY visit execute repeat ;
+
+public
+
+\ Each baseline directory the planner holds undeleted, by key, its path in
+\ ar: no local row at or unknown above it; entries beneath on Dropbox.
+: EACH-HELD-DELETION ( journal ^ARENA:arena [ MODEL:path -- ] -- )
+   {: j ar visit :}
+   j >CONNECTION
+   s" WITH unknown(c) AS MATERIALIZED (SELECT canonical_path
+         FROM local_observations WHERE kind >= 3)
+      SELECT b.path FROM baselines b
+      JOIN remote_observations r ON r.canonical_path = b.canonical_path
+      WHERE b.kind = 1 AND r.kind = 1
+         AND NOT EXISTS (SELECT 1 FROM local_observations l
+            WHERE l.canonical_path = b.canonical_path)
+         AND EXISTS (SELECT 1 FROM remote_observations s
+            WHERE s.canonical_path > CAST(b.canonical_path || '/' AS BLOB)
+               AND s.canonical_path < CAST(b.canonical_path || '0' AS BLOB))
+         AND NOT EXISTS (SELECT 1 FROM unknown u
+            WHERE b.canonical_path > CAST(u.c || '/' AS BLOB)
+               AND b.canonical_path < CAST(u.c || '0' AS BLOB))
+      ORDER BY b.canonical_path" [: ar visit HELD-ROWS ;]
+   SQLITE:WITH-STATEMENT ;
+
+private
+
 
 \ ---- a case-collision rename ---------------------------------------
 

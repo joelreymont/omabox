@@ -6052,6 +6052,13 @@ $180 constant MODE-0600
    TEST-DROPBOX:SEEN$ s" /2/files/create_folder_v2" STR:CONTAINS? TFALSE
    d x STEP-GONE ;
 
+: BOUND-ANY ( JOURNAL:dropbox-binding-write -- )
+   MATCH JOURNAL:dropbox-binding-write
+      bound OF ENDOF
+      already-bound OF ENDOF
+      mismatch OF drop ENDOF
+   ;MATCH ;
+
 : LOCAL-DIRECTORY-DELETION-WAITS-FOR-UNSYNCHRONIZED-DROPBOX-ENTRIES
    ( ^ARENA:arena -- )
    {: ar :}
@@ -6069,6 +6076,13 @@ $180 constant MODE-0600
    x s" docs" FOLDER-BASELINE-AT
    x PENDING-OF VEC:COUNT 0 T=
    TEST-DROPBOX:SEEN$ LIST$ T$=
+   x RUN-JOURNAL @ s" dbid:account" s" namespace" s" "
+   JOURNAL-DROPBOX--BINDING:MAKE ar JOURNAL:BIND-DROPBOX-ROOT BOUND-ANY
+   x RUN-JOURNAL @ JOURNAL:CLOSE
+   d x JOURNAL-FILE x RUN-ARENA @ ATTENTION:RENDER
+   s\" \n- docs: deleted here, kept on Dropbox: its Dropbox folder still holds entries\n"
+   STR:CONTAINS? TTRUE
+   d x OPENED-AGAIN
    d x STEP-GONE ;
 
 \ The listing, then the probe, with no delete between or after.
@@ -6556,13 +6570,6 @@ TYPED-VARIABLE RACED str
    d x STEP-GONE ;
 
 : EXCLUDED-LOCAL$ ( -- str ) s" preserved excluded local bytes" ;
-
-: BOUND-ANY ( JOURNAL:dropbox-binding-write -- )
-   MATCH JOURNAL:dropbox-binding-write
-      bound OF ENDOF
-      already-bound OF ENDOF
-      mismatch OF drop ENDOF
-   ;MATCH ;
 
 \ Pending excluded plans on both sides, retired by a remote replay of
 \ the reopened journal that sends nothing.
