@@ -397,11 +397,12 @@ private
    {: ls rs body ar :}
    [: ls rs body ar SIDES-IN ;] ar WITH-ROOTED ;
 
-\ A planning over the journal, in a run that holds only it and ar.
+\ A planning over the journal, in a run that holds only it, a blind
+\ watch and ar.
 : PLANNING-OVER ( JOURNAL:journal ^ARENA:arena -- ^planning )
    {: j ar :}
    ar RUNS-NEW {: x :}
-   j x RUN-JOURNAL ! ar x RUN-ARENA !
+   j x RUN-JOURNAL ! ar LOCAL:NEW-WATCH x RUN-WATCH ! ar x RUN-ARENA !
    x NEW-PLANNING ;
 
 \ The planning over the journal once the records are its local
@@ -2426,7 +2427,7 @@ READ-CAP BUFFER: READ-BUF
    l ;
 
 \ A case's directory under TMPDIR, holding root, staging and a journal
-\ bound to the root, and a pass over them.
+\ bound to the root, and a pass over them with its own watch in ar.
 : STEP-RUN ( ^ARENA:arena -- str ^run )
    {: ar :}
    s" reconcile-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
@@ -2437,10 +2438,16 @@ READ-CAP BUFFER: READ-BUF
    j r JOURNAL:INSPECT ar JOURNAL:ACTIVATE-LOCAL-ROOT drop
    ar RUNS-NEW {: x :}
    j x RUN-JOURNAL ! d ar STEP-LINK x RUN-LINK !
+   ar LOCAL:NEW-WATCH x RUN-WATCH !
    r x RUN-ROOT ! s x RUN-STAGING ! ar x RUN-ARENA !
    d x ;
 
-: STEP-GONE ( str ^run -- ) RUN-JOURNAL @ GONE ;
+\ Removes the case: its watch goes blind, closing its inotify instance,
+\ then its journal closes and its directory goes.
+: STEP-GONE ( str ^run -- )
+   {: d:str x :}
+   x RUN-JOURNAL @ x RUN-WATCH @ LOCAL:WATCH-DOUBT
+   d x RUN-JOURNAL @ GONE ;
 
 : PENDING-OF ( ^run -- ^VEC:vector<JOURNAL:plan-record> )
    {: x :}
@@ -3194,8 +3201,8 @@ TYPED-VARIABLE RACED-INSTALL str
 \ PASS over the run, with the recovery directory rec.
 : PASSED ( ^run str -- outcome )
    {: x rec:str :}
-   x RUN-JOURNAL @ x RUN-LINK @ x RUN-ROOT @ x RUN-STAGING @ rec
-   x RUN-ARENA @ PASS ;
+   x RUN-JOURNAL @ x RUN-LINK @ x RUN-WATCH @ x RUN-ROOT @ x RUN-STAGING @
+   rec x RUN-ARENA @ PASS ;
 
 \ The one listing page, cursor k: /<p> at rev v with b's identity.
 : LISTED-ALONE ( str str str str ^ARENA:arena -- )
@@ -5086,7 +5093,8 @@ $1C0 constant OWNER-ACCESS
 \ Rust's scan_and_publish of the run's root, which publishes.
 : SCAN-PUBLISHED ( ^run -- ^VEC:vector<MODEL:local-record> )
    {: x :}
-   x RUN-JOURNAL @ x ROOT$ x RUN-ARENA @ LOCAL:SCAN-AND-PUBLISH
+   x RUN-JOURNAL @ x ROOT$ x RUN-WATCH @ x RUN-ARENA @
+   LOCAL:SCAN-AND-PUBLISH
    MATCH LOCAL:scan-publication
       published OF
          x RUN-JOURNAL @ x RUN-ARENA @ JOURNAL:LOCAL-INVENTORY

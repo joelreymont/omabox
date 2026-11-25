@@ -373,11 +373,18 @@ FS:PATHZ-CAP BUFFER: JOINED
    pre FS:MKTEMP-DIR str> {: p:^ u:n :}
    p buf u BYTE-COPY u ;
 
-\ Runs q in a new root under TMPDIR, which it then removes.
+\ The case's watch, blind until a scan starts.
+TYPED-VARIABLE WATCHER ^watch
+
+\ Runs q in a new root under TMPDIR with a new watch in WATCHER; the root
+\ is then removed and the watch's arena released, which closes its
+\ instance.
 : IN-CASE ( [ -- ] -- )
    {: q :}
    s" local-scan-test" ROOT-BUF TEMP-DIR ROOT-U !
-   [: q execute ;] [: ROOT$ FS:REMOVE-TREE ;] finally ;
+   ARENA:NEW {: war :}
+   war NEW-WATCH WATCHER !
+   [: q execute ;] [: ROOT$ FS:REMOVE-TREE war ARENA:RELEASE ;] finally ;
 
 FS:PATHZ-CAP BUFFER: OUTSIDE-BUF
 variable OUTSIDE-U
@@ -537,7 +544,8 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
 : CACHED-SCAN ( option<MODEL:cutoff> [ -- option<MODEL:cutoff> ]
      -- ^VEC:vector<MODEL:local-record> )
    {: cut:option<MODEL:cutoff> q :}
-   JNL @ ROOT$ cut q AR @ SCAN-AND-PUBLISH-AT ROOT-CHANGED? TFALSE
+   JNL @ ROOT$ WATCHER @ cut q AR @ SCAN-AND-PUBLISH-AT
+   ROOT-CHANGED? TFALSE
    INVENTORY ;
 
 \ CACHED-SCAN, computed hashes reusable before the current cutoff.
@@ -551,7 +559,7 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
 : ENUMERATE
    ( JOURNAL:scan option<MODEL:cutoff> -- JOURNAL:scan pending-scan )
    {: cut:option<MODEL:cutoff> :}
-   ROOT$ cut AR @ ENUMERATE-SCAN ;
+   ROOT$ cut JNL @ WATCHER @ AR @ ENUMERATE-SCAN ;
 
 \ Finishes the pending scan and publishes it; q decides which hashes it
 \ computes stay reusable.
@@ -865,7 +873,9 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
 : SUBDIRECTORY-REFUSED ( JOURNAL:scan fd MODEL:stat -- JOURNAL:scan n n )
    {: root:fd probe:MODEL:stat :}
    HELD-DIRS {: held :}
-   [: root s" d" s" d" probe held SCAN-SUBDIRECTORY ;]
+   NO-CUTOFF probe STAT-DEV JNL @ WATCHER @ SCAN-CONTEXT-MAKE
+   {: cx:scan-context :}
+   [: root s" d" s" d" probe cx held SCAN-SUBDIRECTORY ;]
    ['] ENTRY-CODE? WITH-CONVERTS {: code:n :}
    code code CODE-KIND
    held VEC:COUNT 0 T= held ALL-RELEASED ;
@@ -903,7 +913,8 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
    root ROOT$ ROOT-STAT {: before:MODEL:stat :}
    root s" d" WALK-STAT {: probe:MODEL:stat :}
    D-REPLACED
-   NO-CUTOFF before STAT-DEV SCAN-CONTEXT-MAKE {: cx:scan-context :}
+   NO-CUTOFF before STAT-DEV JNL @ WATCHER @ SCAN-CONTEXT-MAKE
+   {: cx:scan-context :}
    HELD-DIRS {: held :}
    [: probe root s" d" s" d" cx held SCAN-PROBED ;]
    ['] ENTRY-CODE? WITH-CONVERTS {: code:n :}
@@ -925,7 +936,7 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
    p ar KEEP {: root:str :}
    p s" open sync root for scan" OPEN-ABSOLUTE-DIRECTORY {: rfd:fd :}
    rfd p ROOT-STAT {: before:MODEL:stat :}
-   root rfd before NO-CUTOFF before STAT-DEV 1 xor ar
+   root rfd before NO-CUTOFF before STAT-DEV 1 xor JNL @ WATCHER @ ar
    ENUMERATE-SCAN-ON-DEVICE ;
 
 : SCANNED-ACROSS-DEVICES ( JOURNAL:scan -- JOURNAL:scan )
@@ -1007,14 +1018,15 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
    s s" a/b/c" PRESENT SEEN
    [: ALL-CACHED ;] SCANNED PUBLISHED 9 T= ;
 
-\ The rescan stages nothing, and its publish changes no row.
+\ The rescan stages nothing, and its publish changes no stored row: its
+\ three changes mark clean the folders it listed, the root, d and e.
 : REPUBLISHED-UNCHANGED ( JOURNAL:scan -- JOURNAL:scan )
    STABLE ENUMERATE {: ps:pending-scan :}
    JOURNAL:SCAN-COUNTS {: jobs:n staged:n hashes:n :}
    jobs 0 T= staged 0 T= hashes 0 T=
    JNL @ JOURNAL:TOTAL-CHANGES {: before:n :}
    ps [: STABLE ;] FINISH-SCAN-AT
-   JNL @ JOURNAL:TOTAL-CHANGES before T= ;
+   JNL @ JOURNAL:TOTAL-CHANGES before 3 + T= ;
 
 : AN-UNCHANGED-TREE-STAGES-AND-WRITES-NOTHING ( -- )
    s" an_unchanged_tree_stages_and_writes_nothing" T-LABEL
@@ -1499,7 +1511,7 @@ variable RAISED-ERRNO
    {: j :}
    j STAND-IN-ROOT AR @ JOURNAL:ACTIVATE-LOCAL-ROOT drop
    j AR @ JOURNAL:LOCAL-INVENTORY {: before :}
-   [: j STAND-IN$ AR @ SCAN-AND-PUBLISH ROOT-CHANGED? TTRUE
+   [: j STAND-IN$ WATCHER @ AR @ SCAN-AND-PUBLISH ROOT-CHANGED? TTRUE
       j STAND-IN$ OPEN-ACTIVE-ROOT NO-ROOT? TTRUE ;] STDERR-OF
    str> nip 0 T=
    j AR @ JOURNAL:LOCAL-INVENTORY before JOURNAL:LOCAL-RECORDS= TTRUE ;
@@ -1513,7 +1525,7 @@ variable RAISED-ERRNO
 \ Rust's scan_and_publish_at with all_cache_entries_stable completing.
 : PUBLISH-STABLE ( JOURNAL:journal str option<MODEL:cutoff> -- )
    {: j p:str cut:option<MODEL:cutoff> :}
-   j p AT AR @ KEEP cut [: STABLE ;] AR @ SCAN-AND-PUBLISH-AT
+   j p AT AR @ KEEP WATCHER @ cut [: STABLE ;] AR @ SCAN-AND-PUBLISH-AT
    ROOT-CHANGED? TFALSE ;
 
 : REPUBLISHES-NOTHING ( JOURNAL:journal -- )
@@ -1596,13 +1608,20 @@ variable RAISED-ERRNO
       some OF JOURNAL-STIRRED:UNMAKE {: wd:n p:str :} p ENDOF
    ;MATCH ;
 
-\ Folder p's watch added, recorded and listed, as a scan's walk does.
-: ADD-LISTED ( JOURNAL:journal ^watch str -- n )
-   {: j w p:str :}
+\ The wd of folder p's watch, added on the folder opened anew; -1 for
+\ none. The same inode answers the same wd.
+: ADDED-WD ( ^watch str -- n )
+   {: w p:str :}
    p STR:LEN 0= if ROOT$ else p AT then
    s" open watched folder" OPEN-ROOT {: f:fd :}
    w f p WATCH-ADD WD-OF {: wd:n :}
-   f DISCARD  wd 0 >= TTRUE
+   f DISCARD  wd ;
+
+\ Folder p's watch added, recorded and listed, as a scan's walk does.
+: ADD-LISTED ( JOURNAL:journal ^watch str -- n )
+   {: j w p:str :}
+   w p ADDED-WD {: wd:n :}
+   wd 0 >= TTRUE
    j wd p JOURNAL:WATCH-RECORD  j wd JOURNAL:WATCH-LISTED  wd ;
 
 \ A full scan of the root alone, published.
@@ -1701,6 +1720,39 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    s" a_refused_watch_logs_once_per_arming" T-LABEL
    [: REFUSALS-LOGGED ;] WITH-JOURNAL ;
 
+\ Whether folder p's record is clean by the wd its watch answers again.
+: CLEAN? ( JOURNAL:journal ^watch str -- bool )
+   {: j w p:str :}
+   j w p ADDED-WD p JOURNAL:WATCH-CLEAN? ;
+
+\ A scan of the root publishes; the watch is armed, the root and a clean.
+: PUBLISHED-ARMED ( JOURNAL:journal ^watch -- )
+   {: j w :}
+   j ROOT$ w AR @ SCAN-AND-PUBLISH ROOT-CHANGED? TFALSE
+   w WATCH-FD FD-SOME? TTRUE
+   j w s" " CLEAN? TTRUE  j w s" a" CLEAN? TTRUE ;
+
+: A-PUBLISHED-SCAN-ARMS-THE-WATCH ( -- )
+   s" a_published_scan_arms_the_watch" T-LABEL
+   s" a" MKDIR
+   JNL @ WATCHER @ PUBLISHED-ARMED
+   JNL @ WATCHER @ PUBLISHED-ARMED ;
+
+\ With a stand-in active, a scan of the root ends root-changed: the
+\ watch stays armed, and the folders it listed are stirred again.
+: ABANDONED-STIRRED ( JOURNAL:journal ^watch -- )
+   {: j w :}
+   j w PUBLISHED-ARMED
+   j STAND-IN-ROOT AR @ JOURNAL:ACTIVATE-LOCAL-ROOT drop
+   j ROOT$ w AR @ SCAN-AND-PUBLISH ROOT-CHANGED? TTRUE
+   w WATCH-FD FD-SOME? TTRUE
+   j w s" " CLEAN? TFALSE  j w s" a" CLEAN? TFALSE ;
+
+: AN-UNPUBLISHED-SCAN-LEAVES-ITS-FOLDERS-STIRRED ( -- )
+   s" an_unpublished_scan_leaves_its_folders_stirred" T-LABEL
+   s" a" MKDIR
+   JNL @ WATCHER @ ABANDONED-STIRRED ;
+
 : CASES ( -- )
    [: SCAN-PUBLISHES-EMPTY-AND-NESTED-DIRECTORIES ;] IN-SCAN-CASE
    [: FILE-LOCKED-AFTER-ENUMERATION-IS-INACCESSIBLE ;] IN-SCAN-CASE
@@ -1760,7 +1812,9 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    [: ATTRIBUTES-ARE-LABELLED ;] IN-CASE
    FORMAL-HOLDS-THE-WATCH-TABLE
    [: A-WATCH-HEARS-ITS-FOLDERS-AND-BLINDS-ON-A-LOSS ;] IN-CASE
-   [: A-REFUSED-WATCH-LOGS-ONCE-PER-ARMING ;] IN-CASE ;
+   [: A-REFUSED-WATCH-LOGS-ONCE-PER-ARMING ;] IN-CASE
+   [: A-PUBLISHED-SCAN-ARMS-THE-WATCH ;] IN-SCAN-CASE
+   [: AN-UNPUBLISHED-SCAN-LEAVES-ITS-FOLDERS-STIRRED ;] IN-SCAN-CASE ;
 
 public
 

@@ -1007,13 +1007,6 @@ STRUCTURE scanned-hash
    FIELD reusable bool
 ;STRUCTURE
 
-\ The walk's settings, which no step changes: any device but
-\ root-device is out of scope.
-STRUCTURE scan-context
-   FIELD cutoff option<MODEL:cutoff>
-   FIELD root-device n
-;STRUCTURE
-
 \ An enumerated root whose files are still to hash; it owns root-fd.
 STRUCTURE pending-scan
    FIELD root str
@@ -1117,477 +1110,6 @@ private
    idx ;
 
 : STR@ ( ^str -- str ) @ ;
-
-\ ---- the walk's steps
-
-\ The code a step threw, 0 for none, when ENTRY-CODE? names it with
-\ FS:ERRNO; any other code throws on.
-: STEP-CODE ( n -- n )
-   {: code:n :}
-   code 0= if 0 exit then
-   code FS:ERRNO ENTRY-CODE? 0= if code throw then
-   code ;
-
-\ Runs step, a filesystem step: no catch may hold the linear scan.
-: ENTRY-STEP ( [ -- ] -- n )
-   {: step :}
-   [: step execute ;] catch STEP-CODE ;
-
-: IO-STEP ( str str -- n )
-   {: o:str p:str :}
-   [: o p IO-FAILURE ;] ENTRY-STEP ;
-
-: UNSUPPORTED-STEP ( str -- n )
-   {: p:str :}
-   [: p E-UNSUPPORTED UNSUPPORTED-FAILS ;] ENTRY-STEP ;
-
-\ ---- the walk
-
-: STAT-DEV ( MODEL:stat -- n ) MODEL-STAT:UNMAKE {: d i m s ms mn cs cn :} d ;
-
-: DIRECTORY? ( MODEL:stat -- bool )
-   MODEL-STAT:UNMAKE {: d i m s ms mn cs cn :}
-   m FS:S-IFMT and FS:S-IFDIR = ;
-
-: SAME-FINGERPRINT? ( MODEL:fingerprint MODEL:fingerprint -- bool )
-   {: a:MODEL:fingerprint b:MODEL:fingerprint :}
-   a b SAME-HASHED-CONTENT 0= if false exit then
-   a MODEL-FINGERPRINT:UNMAKE {: i s ms mn cs cn :}
-   b MODEL-FINGERPRINT:UNMAKE {: i2 s2 ms2 mn2 cs2 cn2 :}
-   cs cs2 = cn cn2 = and ;
-
-\ p and the relative q joined as Rust's Path::join joins them, laid anew in
-\ the arena; an empty q answers p, where Rust appends a "/".
-: JOIN ( str str ^ARENA:arena -- str )
-   {: p:str q:str ar:^ARENA:arena :}
-   p str> nip {: u:n :}
-   q str> nip {: qu:n :}
-   u 0= qu 0= or p FS:JOIN-SEPARATED? or {: bare:bool :}
-   bare if 0 else 1 then {: sep:n :}
-   ar u sep + qu + ARENA:ALLOC {: dst:^ size:n :}
-   p dst 0 PUT {: at:n :}
-   s" /" 0 sep PART dst at PUT {: at2:n :}
-   q dst at2 PUT drop
-   dst size >str ;
-
-\ The name, the last component of a path below parent.
-: NAME-OF ( str str -- str )
-   {: path:str parent:str :}
-   path str> nip {: u:n :}
-   parent str> nip {: pu:n :}
-   pu 0= if path exit then
-   path pu 1+ u PART ;
-
-\ Pushes the path of the entry, a name in parent, laid in ar, onto v.
-: LIST-ONE ( str u8 str ^ARENA:arena ^VEC:vector<str> -- )
-   {: name:str type:u8 parent:str ar:^ARENA:arena v :}
-   parent name ar JOIN v VEC:PUSH ! ;
-
-: LISTED ( fd str ^ARENA:arena ^VEC:vector<str> -- )
-   {: dir:fd parent:str ar:^ARENA:arena v :}
-   dir [: parent ar v LIST-ONE ;] FS-LIST:EACH-TYPED-AT ;
-
-: LIST-FAILURE ( n str str str -- )
-   {: code:n open:str read:str p:str :}
-   code FS-LIST:E-OPEN = if open p IO-FAILURE then
-   code E-FS-LIST-LAST >= code E-FS-LIST-FIRST <= and if
-      read p IO-FAILURE
-   then
-   code throw ;
-
-\ The paths of the entries in dir, but . and .., in the order listed; a
-\ failed listing is an io failure named by the open or the read text.
-: LIST-PATHS ( fd str str str ^ARENA:arena -- ^VEC:vector<str> )
-   {: dir:fd parent:str open:str read:str ar:^ARENA:arena :}
-   ar [type] str NEW-VEC {: v :}
-   0 FS:CAUSE!
-   [: dir parent ar v LISTED ;] catch {: code:n :}
-   code 0<> if code open read parent LIST-FAILURE then
-   v ;
-
-\ FILE-FINGERPRINT of the walk's stat as a step; after a throw
-\ ENTRY-CODE? names, NO-FINGERPRINT and the code.
-: PRINT-STEP ( MODEL:stat str -- MODEL:fingerprint n )
-   {: st:MODEL:stat path:str :}
-   NO-FINGERPRINT [: DROP-FINGERPRINT st path FILE-FINGERPRINT ;]
-   catch {: code:n :}
-   code 0<> if drop NO-FINGERPRINT then code STEP-CODE ;
-
-\ A reserved artifact is seen unsupported; any other file merges with
-\ the stored rows, or answers the code its step threw.
-: SCAN-REGULAR
-   ( JOURNAL:scan str str MODEL:stat option<MODEL:cutoff>
-     -- JOURNAL:scan n )
-   {: name:str path:str st:MODEL:stat cut:option<MODEL:cutoff> :}
-   name RESERVED-ARTIFACT? if
-      path MODEL-UNKNOWN--REASON:UNSUPPORTED SEEN-UNKNOWN 0 exit
-   then
-   st path PRINT-STEP {: print:MODEL:fingerprint code:n :}
-   code 0<> if code exit then
-   path print cut JOURNAL:SCAN-FILE 0 ;
-
-: HELD-RELEASED ( fd ^ARENA:arena -- )
-   {: f:fd ar:^ARENA:arena :}
-   f DISCARD ar ARENA:RELEASE ;
-
-\ Releases the last directory held.
-: TOP-RELEASED ( ^VEC:vector<held-dir> -- )
-   {: v :}
-   v VEC:COUNT 1- {: k:n :}
-   v k VEC:AT @ HELD-DIR-UNMAKE {: f:fd p:str names ar:^ARENA:arena :}
-   v k VEC:RESIZE
-   f ar HELD-RELEASED ;
-
-\ Releases every directory still held.
-: ALL-RELEASED ( ^VEC:vector<held-dir> -- )
-   {: v :}
-   begin v VEC:COUNT 0 > while v TOP-RELEASED repeat ;
-
-\ The open directory's paths, listed into ar; its stat after the listing
-\ must be before, the one taken before it.
-: LISTED-STILL ( fd str MODEL:stat ^ARENA:arena -- ^VEC:vector<str> )
-   {: child:fd p:str before:MODEL:stat ar:^ARENA:arena :}
-   child p s" open directory stream" s" read directory" ar LIST-PATHS
-   child p s" inspect directory after scan" STAT-FD
-   before SAME-OBSERVATION 0= if s" scan directory" p CHANGED then ;
-
-\ The open directory, checked to be the one the walk's stat found, then
-\ its LISTED-STILL.
-: CHECKED-LISTING ( fd str MODEL:stat ^ARENA:arena -- ^VEC:vector<str> )
-   {: child:fd p:str probe:MODEL:stat ar:^ARENA:arena :}
-   child p s" inspect directory before scan" STAT-FD
-   {: before:MODEL:stat :}
-   before probe SAME-INODE 0= if s" open scanned directory" p CHANGED then
-   child p before ar LISTED-STILL ;
-
-\ The directory at name, opened from dir where the walk's stat found it,
-\ and its CHECKED-LISTING; a throw closes it.
-: OPENED-LISTING
-   ( fd str str MODEL:stat ^ARENA:arena -- fd ^VEC:vector<str> )
-   {: dir:fd name:str p:str probe:MODEL:stat ar:^ARENA:arena :}
-   dir name p OPEN-DIRECTORY-AT {: child:fd :}
-   ar [type] str NEW-VEC child
-   [: drop child p probe ar CHECKED-LISTING ;] CLOSING
-   child swap ;
-
-\ OPENED-LISTING and 0; after any throw, -1, an empty vector in ar and
-\ the code. The caller, which owns ar, releases it once the vector is
-\ dropped, then STEP-CODE decides the code.
-: LISTING-STEP
-   ( fd str str MODEL:stat ^ARENA:arena -- fd ^VEC:vector<str> n )
-   {: dir:fd name:str p:str probe:MODEL:stat ar:^ARENA:arena :}
-   -1 >FD ar [type] str NEW-VEC
-   [: 2drop dir name p probe ar OPENED-LISTING ;] catch {: code:n :}
-   code 0<> if 2drop -1 >FD ar [type] str NEW-VEC then
-   code ;
-
-\ SCAN-NAMES, which the walk reaches again below a directory.
-defer SCAN-SUBTREE
-   ( JOURNAL:scan fd str ^VEC:vector<str> scan-context ^ARENA:arena
-     -- JOURNAL:scan )
-
-\ Whether p sorts after every path beneath t: anywhere but at t followed
-\ by a byte below "/".
-: PAST-SUBTREE? ( str str -- bool )
-   {: p:str t:str :}
-   p str> {: pa:^u8 pu:n :}
-   t str> nip {: tu:n :}
-   pu tu <= if true exit then
-   pa tu >str t STR:= 0= if true exit then
-   pa tu + c@ SLASH > ;
-
-\ Whether the last held directory's subtree comes before p.
-: TOP-DUE? ( str ^VEC:vector<held-dir> -- bool )
-   {: p:str v :}
-   v VEC:COUNT 0= if false exit then
-   v v VEC:COUNT 1- VEC:AT @ HELD-DIR-UNMAKE
-   {: f:fd t:str names ar:^ARENA:arena :}
-   p t PAST-SUBTREE? ;
-
-\ The last held directory's subtree, then its descriptor and arena.
-: DESCEND-TOP
-   ( JOURNAL:scan ^VEC:vector<held-dir> scan-context -- JOURNAL:scan )
-   {: v cx:scan-context :}
-   v VEC:COUNT 1- {: k:n :}
-   v k VEC:AT @ HELD-DIR-UNMAKE
-   {: child:fd p:str names ar:^ARENA:arena :}
-   v k VEC:RESIZE
-   [: child p names cx ar SCAN-SUBTREE ;]
-   [: child ar HELD-RELEASED ;] finally ;
-
-\ Each held subtree p does not sort below.
-: ENTERED-DUE
-   ( JOURNAL:scan str ^VEC:vector<held-dir> scan-context
-     -- JOURNAL:scan )
-   {: p:str v cx:scan-context :}
-   begin p v TOP-DUE? while v cx DESCEND-TOP repeat ;
-
-: ENTERED-ALL
-   ( JOURNAL:scan ^VEC:vector<held-dir> scan-context -- JOURNAL:scan )
-   {: v cx:scan-context :}
-   begin v VEC:COUNT 0 > while v cx DESCEND-TOP repeat ;
-
-\ A directory: listed where the walk's stat found it, held, then seen at
-\ its name; its subtree waits in held for SCAN-NAMES. A failed listing
-\ releases its arena, then answers the step's code.
-: SCAN-SUBDIRECTORY
-   ( JOURNAL:scan fd str str MODEL:stat ^VEC:vector<held-dir>
-     -- JOURNAL:scan n )
-   {: dir:fd name:str path:str probe:MODEL:stat held :}
-   ARENA:NEW {: ar:^ARENA:arena :}
-   dir name path probe ar LISTING-STEP {: child:fd names code:n :}
-   code 0<> if
-      child names 2drop ar ARENA:RELEASE code STEP-CODE exit
-   then
-   child path names ar HELD-DIR-MAKE held VEC:PUSH !
-   path MODEL:>PATH DIRECTORY-OBSERVATION MODEL-LOCAL--RECORD:MAKE
-   JOURNAL:SCAN-SEEN 0 ;
-
-\ The entry by the walk's stat. One on another volume is seen as a
-\ symlink is, never synchronized, with nothing beneath it observed.
-: SCAN-PROBED
-   ( JOURNAL:scan MODEL:stat fd str str scan-context
-     ^VEC:vector<held-dir> -- JOURNAL:scan n )
-   {: st:MODEL:stat dir:fd name:str path:str cx:scan-context held :}
-   cx SCAN-CONTEXT-UNMAKE {: cut:option<MODEL:cutoff> dev:n :}
-   st STAT-DEV dev <> if
-      path MODEL-UNKNOWN--REASON:UNSUPPORTED SEEN-UNKNOWN 0 exit
-   then
-   st REGULAR? if name path st cut SCAN-REGULAR exit then
-   st DIRECTORY? if dir name path st held SCAN-SUBDIRECTORY exit then
-   path UNSUPPORTED-STEP ;
-
-\ Rust's scan_entry: one no-follow stat of name, then 0 or the code
-\ that says why it cannot be observed, which SCAN-NAME publishes.
-: SCAN-ENTRY
-   ( JOURNAL:scan fd str str scan-context ^VEC:vector<held-dir>
-     -- JOURNAL:scan n )
-   {: dir:fd name:str path:str cx:scan-context held :}
-   dir name FS:TRY-STAT-AT 0= if
-      s" inspect directory entry" path IO-STEP exit
-   then
-   BUF-STAT dir name path cx held SCAN-PROBED ;
-
-\ Rust's entry_unknown and io_unknown_reason: the reason code, thrown
-\ while one entry was observed, publishes; wrong is what an object that is
-\ not a regular file means to the caller. Any code ENTRY-CODE? does not
-\ name is the scan's, rethrown.
-: ENTRY-UNKNOWN ( n MODEL:unknown-reason -- MODEL:unknown-reason )
-   {: code:n wrong:MODEL:unknown-reason :}
-   code FS:ERRNO ENTRY-CODE? 0= if code throw then
-   code E-UNSUPPORTED = if wrong exit then
-   code E-CHANGED = if MODEL-UNKNOWN--REASON:INCOMPLETE exit then
-   code E-UNREADABLE = if MODEL-UNKNOWN--REASON:INACCESSIBLE exit then
-   FS:ERRNO REPLACED? if MODEL-UNKNOWN--REASON:INCOMPLETE exit then
-   MODEL-UNKNOWN--REASON:INACCESSIBLE ;
-
-\ Rust's walk_unknown: an entry the walk meets.
-: WALK-UNKNOWN ( n -- MODEL:unknown-reason )
-   MODEL-UNKNOWN--REASON:UNSUPPORTED ENTRY-UNKNOWN ;
-
-\ Rust's revisited_unknown: an object whose type the walk recorded, so a
-\ different one now is a replacement.
-: REVISITED-UNKNOWN ( n -- MODEL:unknown-reason )
-   MODEL-UNKNOWN--REASON:INCOMPLETE ENTRY-UNKNOWN ;
-
-\ One entry never fails the pass: it is seen as unknown, and a directory
-\ that is, changed while it was listed among them, is not entered. LOCAL
-\ logs no failure ENTRY-CODE? names while the entry is walked.
-: SCAN-NAME
-   ( JOURNAL:scan fd str str scan-context ^VEC:vector<held-dir>
-     -- JOURNAL:scan )
-   {: dir:fd path:str parent:str cx:scan-context held :}
-   path parent NAME-OF {: name:str :}
-   name MODEL:EXCLUDED-NAME? if exit then
-   [: dir name path cx held SCAN-ENTRY ;] ['] ENTRY-CODE? WITH-CONVERTS
-   {: code:n :}
-   code 0= if exit then
-   path code WALK-UNKNOWN SEEN-UNKNOWN ;
-
-\ Each held subtree p does not sort below, then p.
-: SCAN-STEP
-   ( JOURNAL:scan fd str str scan-context ^VEC:vector<held-dir>
-     -- JOURNAL:scan )
-   {: dir:fd p:str parent:str cx:scan-context held :}
-   p held cx ENTERED-DUE
-   dir p parent cx held SCAN-NAME ;
-
-\ The names in byte order, each held directory's subtree before the
-\ first later name that does not sort below it, so every path reaches
-\ JOURNAL in path byte order.
-: NAMES-WALKED
-   ( JOURNAL:scan fd str ^VEC:vector<str> scan-context ^ARENA:arena
-     ^VEC:vector<held-dir> -- JOURNAL:scan )
-   {: dir:fd path:str names cx:scan-context ar:^ARENA:arena held :}
-   names VEC:COUNT [: names swap VEC:AT STR@ path NAME-OF ;] ar ORDER
-   {: idx :}
-   idx VEC:COUNT 0 ?do
-      dir names idx i VEC:AT @ VEC:AT @ path cx held SCAN-STEP
-   loop
-   held cx ENTERED-ALL ;
-
-\ NAMES-WALKED of a directory's names, which live in ar with their
-\ order; a throw releases every directory still held.
-: SCAN-NAMES
-   ( JOURNAL:scan fd str ^VEC:vector<str> scan-context ^ARENA:arena
-     -- JOURNAL:scan )
-   {: dir:fd path:str names cx:scan-context ar:^ARENA:arena :}
-   ar [type] held-dir NEW-VEC {: held :}
-   [: dir path names cx ar held NAMES-WALKED ;]
-   [: held ALL-RELEASED ;] finally ;
-
-: SUBTREE-INSTALL ( -- ) [: SCAN-NAMES ;] is SCAN-SUBTREE ;
-SUBTREE-INSTALL
-
-\ ---- the hash stage
-
-: NO-SCANNED-HASH ( -- scanned-hash )
-   s" " MODEL:>PATH NO-FINGERPRINT NO-HASH MODEL-HASH--RECORD:MAKE
-   false SCANNED-HASH-MAKE ;
-
-: DROP-SCANNED-HASH ( scanned-hash -- ) drop ;
-
-\ The open file's hash, which must match the fingerprint the walk took.
-: HASH-OPENED-FILE
-   ( fd str MODEL:fingerprint MODEL:stat [ -- option<MODEL:cutoff> ]
-     ^ARENA:arena -- scanned-hash )
-   {: f:fd path:str want:MODEL:fingerprint opened:MODEL:stat q
-      ar:^ARENA:arena :}
-   opened path FILE-FINGERPRINT want SAME-FINGERPRINT? 0= if
-      s" open enumerated scan file" path CHANGED
-   then
-   f path s" hash local scan file" opened ar E-UNSUPPORTED E-CHANGED
-   HASH-STABLE-FILE-FROM-STAT
-   {: c:DROPBOX:hash print:MODEL:fingerprint :}
-   print want SAME-FINGERPRINT? 0= if
-      s" hash enumerated scan file" path CHANGED
-   then
-   path MODEL:>PATH print c MODEL-HASH--RECORD:MAKE
-   {: r:MODEL:hash-record :}
-   r r q execute HASH-IS-REUSABLE SCANNED-HASH-MAKE ;
-
-: HASH-SCAN-FILE
-   ( fd str MODEL:fingerprint [ -- option<MODEL:cutoff> ] ^ARENA:arena
-     -- scanned-hash )
-   {: root:fd path:str want:MODEL:fingerprint q ar:^ARENA:arena :}
-   root path s" open enumerated scan file" E-IO E-UNSUPPORTED
-   OPEN-RELATIVE-REGULAR-WITH-STAT {: f:fd opened:MODEL:stat :}
-   [: f path want opened q ar HASH-OPENED-FILE ;] [: f DISCARD ;] finally ;
-
-\ HASH-SCAN-FILE under ENTRY-CODE?; after a throw, NO-SCANNED-HASH and the
-\ code.
-: HASH-STEP
-   ( fd str MODEL:fingerprint [ -- option<MODEL:cutoff> ] ^ARENA:arena
-     -- scanned-hash n )
-   {: root:fd path:str want:MODEL:fingerprint q ar:^ARENA:arena :}
-   NO-SCANNED-HASH [: DROP-SCANNED-HASH
-      [: root path want q ar HASH-SCAN-FILE ;] ['] ENTRY-CODE? WITH-CONVERTS
-   ;] catch {: code:n :}
-   code 0<> if drop NO-SCANNED-HASH then code ;
-
-\ The hash's file publishes present.
-: OBSERVE-PRESENT ( JOURNAL:scan MODEL:hash-record -- JOURNAL:scan )
-   MODEL-HASH--RECORD:UNMAKE
-   {: p:MODEL:path f:MODEL:fingerprint c:DROPBOX:hash :}
-   p c MODEL-LOCAL:MAKE PRESENT-OBSERVATION MODEL-LOCAL--RECORD:MAKE
-   JOURNAL:SCAN-OBSERVE ;
-
-\ A confirmed hash publishes present, and its record when reusable.
-: PUBLISH-HASH ( JOURNAL:scan scanned-hash -- JOURNAL:scan )
-   SCANNED-HASH-UNMAKE {: r:MODEL:hash-record ok:bool :}
-   r OBSERVE-PRESENT
-   ok if r JOURNAL:SCAN-HASH then ;
-
-\ Every failure here concerns the job's own path.
-: HASH-JOB
-   ( JOURNAL:scan str MODEL:fingerprint fd [ -- option<MODEL:cutoff> ]
-     ^ARENA:arena -- JOURNAL:scan )
-   {: path:str want:MODEL:fingerprint root:fd q ar:^ARENA:arena :}
-   root path want q ar HASH-STEP {: h:scanned-hash code:n :}
-   code 0= if h PUBLISH-HASH exit then
-   path code REVISITED-UNKNOWN UNKNOWN ;
-
-\ Rust's hash_scan_files, one job at a time, each hashed in ar.
-: HASH-JOBS
-   ( JOURNAL:scan ^ARENA:arena fd [ -- option<MODEL:cutoff> ]
-     -- JOURNAL:scan )
-   {: ar:^ARENA:arena root:fd q :}
-   [: ar ARENA:RESET root q ar HASH-JOB ;] JOURNAL:EACH-SCAN-JOB ;
-
-\ ---- finishing
-
-\ The configured path must still name the root the scan opened.
-: VERIFY-ROOT ( str MODEL:stat -- )
-   {: root:str before:MODEL:stat :}
-   root s" reopen sync root after scan" OPEN-ABSOLUTE-DIRECTORY {: f:fd :}
-   [: f root s" verify sync root binding after scan" STAT-FD ;]
-   [: f DISCARD ;] finally
-   before SAME-INODE
-   0= if s" verify complete local scan root" root CHANGED then ;
-
-\ Rust's finish_scan_at: hashes the files the walk staged, in path byte
-\ order, then checks the root.
-: FINISH
-   ( JOURNAL:scan str fd MODEL:stat [ -- option<MODEL:cutoff> ]
-     -- JOURNAL:scan )
-   {: root:str rfd:fd before:MODEL:stat q :}
-   [: rfd q HASH-JOBS ;] ARENA:WITH
-   root before VERIFY-ROOT ;
-
-\ FINISH, then the root's binding, read from its descriptor while that is
-\ open: none where JOURNAL finds a stand-in there. It closes the pending
-\ scan's root.
-: FINISH-BOUND-SCAN-AT
-   ( JOURNAL:scan pending-scan [ -- option<MODEL:cutoff> ] JOURNAL:journal
-     -- JOURNAL:scan option<JOURNAL:local-root-binding> )
-   {: ps:pending-scan q j :}
-   ps PENDING-SCAN-UNMAKE
-   {: root:str rfd:fd before:MODEL:stat ar:^ARENA:arena :}
-   [: root rfd before q FINISH root rfd j ar JOURNAL:INSPECT-ROOT-AT ;]
-   [: rfd DISCARD ;] finally ;
-
-\ ---- enumerating
-
-\ The root, listed in ar, and its names walked.
-: ROOT-LISTED
-   ( JOURNAL:scan ^ARENA:arena fd MODEL:stat scan-context
-     -- JOURNAL:scan )
-   {: ar:^ARENA:arena rfd:fd before:MODEL:stat cx:scan-context :}
-   rfd s" " before ar CHECKED-LISTING {: names :}
-   rfd s" " names cx ar SCAN-NAMES ;
-
-\ The walk from the root, every path in byte order.
-: WALK-ROOT
-   ( JOURNAL:scan fd MODEL:stat option<MODEL:cutoff> n -- JOURNAL:scan )
-   {: rfd:fd before:MODEL:stat cut:option<MODEL:cutoff> dev:n :}
-   cut dev SCAN-CONTEXT-MAKE {: cx:scan-context :}
-   [: rfd before cx ROOT-LISTED ;] ARENA:WITH ;
-
-\ Rust's enumerate_scan_on_device: every entry on device into the scan;
-\ any other device is an unsupported subtree. A failure of the root's own
-\ throws and closes the root.
-: ENUMERATE-SCAN-ON-DEVICE
-   ( JOURNAL:scan str fd MODEL:stat option<MODEL:cutoff> n ^ARENA:arena
-     -- JOURNAL:scan pending-scan )
-   {: root:str rfd:fd before:MODEL:stat cut:option<MODEL:cutoff> dev:n
-      ar:^ARENA:arena :}
-   rfd [: rfd before cut dev WALK-ROOT ;] CLOSING
-   root rfd before ar PENDING-SCAN-MAKE ;
-
-: ROOT-STAT ( fd str -- MODEL:stat )
-   {: rfd:fd p:str :}
-   NO-STAT rfd
-   [: DROP-STAT rfd p s" inspect sync root before scan" STAT-FD ;]
-   CLOSING ;
-
-: ENUMERATE-SCAN
-   ( JOURNAL:scan str option<MODEL:cutoff> ^ARENA:arena
-     -- JOURNAL:scan pending-scan )
-   {: p:str cut:option<MODEL:cutoff> ar:^ARENA:arena :}
-   p ar KEEP {: root:str :}
-   p s" open sync root for scan" OPEN-ABSOLUTE-DIRECTORY {: rfd:fd :}
-   rfd p ROOT-STAT {: before:MODEL:stat :}
-   root rfd before cut before STAT-DEV ar ENUMERATE-SCAN-ON-DEVICE ;
 
 \ ---- the watch
 
@@ -1850,6 +1372,504 @@ public
 
 private
 
+\ The walk's settings, which no step changes: any device but
+\ root-device is out of scope. The walk adds the watch on every folder
+\ it lists and records its wd in the journal.
+STRUCTURE scan-context
+   FIELD cutoff option<MODEL:cutoff>
+   FIELD root-device n
+   FIELD journal JOURNAL:journal
+   FIELD watch ^watch
+;STRUCTURE
+
+\ ---- the walk's steps
+
+\ The code a step threw, 0 for none, when ENTRY-CODE? names it with
+\ FS:ERRNO; any other code throws on.
+: STEP-CODE ( n -- n )
+   {: code:n :}
+   code 0= if 0 exit then
+   code FS:ERRNO ENTRY-CODE? 0= if code throw then
+   code ;
+
+\ Runs step, a filesystem step: no catch may hold the linear scan.
+: ENTRY-STEP ( [ -- ] -- n )
+   {: step :}
+   [: step execute ;] catch STEP-CODE ;
+
+: IO-STEP ( str str -- n )
+   {: o:str p:str :}
+   [: o p IO-FAILURE ;] ENTRY-STEP ;
+
+: UNSUPPORTED-STEP ( str -- n )
+   {: p:str :}
+   [: p E-UNSUPPORTED UNSUPPORTED-FAILS ;] ENTRY-STEP ;
+
+\ ---- the walk
+
+: STAT-DEV ( MODEL:stat -- n ) MODEL-STAT:UNMAKE {: d i m s ms mn cs cn :} d ;
+
+: DIRECTORY? ( MODEL:stat -- bool )
+   MODEL-STAT:UNMAKE {: d i m s ms mn cs cn :}
+   m FS:S-IFMT and FS:S-IFDIR = ;
+
+: SAME-FINGERPRINT? ( MODEL:fingerprint MODEL:fingerprint -- bool )
+   {: a:MODEL:fingerprint b:MODEL:fingerprint :}
+   a b SAME-HASHED-CONTENT 0= if false exit then
+   a MODEL-FINGERPRINT:UNMAKE {: i s ms mn cs cn :}
+   b MODEL-FINGERPRINT:UNMAKE {: i2 s2 ms2 mn2 cs2 cn2 :}
+   cs cs2 = cn cn2 = and ;
+
+\ p and the relative q joined as Rust's Path::join joins them, laid anew in
+\ the arena; an empty q answers p, where Rust appends a "/".
+: JOIN ( str str ^ARENA:arena -- str )
+   {: p:str q:str ar:^ARENA:arena :}
+   p str> nip {: u:n :}
+   q str> nip {: qu:n :}
+   u 0= qu 0= or p FS:JOIN-SEPARATED? or {: bare:bool :}
+   bare if 0 else 1 then {: sep:n :}
+   ar u sep + qu + ARENA:ALLOC {: dst:^ size:n :}
+   p dst 0 PUT {: at:n :}
+   s" /" 0 sep PART dst at PUT {: at2:n :}
+   q dst at2 PUT drop
+   dst size >str ;
+
+\ The name, the last component of a path below parent.
+: NAME-OF ( str str -- str )
+   {: path:str parent:str :}
+   path str> nip {: u:n :}
+   parent str> nip {: pu:n :}
+   pu 0= if path exit then
+   path pu 1+ u PART ;
+
+\ Pushes the path of the entry, a name in parent, laid in ar, onto v.
+: LIST-ONE ( str u8 str ^ARENA:arena ^VEC:vector<str> -- )
+   {: name:str type:u8 parent:str ar:^ARENA:arena v :}
+   parent name ar JOIN v VEC:PUSH ! ;
+
+: LISTED ( fd str ^ARENA:arena ^VEC:vector<str> -- )
+   {: dir:fd parent:str ar:^ARENA:arena v :}
+   dir [: parent ar v LIST-ONE ;] FS-LIST:EACH-TYPED-AT ;
+
+: LIST-FAILURE ( n str str str -- )
+   {: code:n open:str read:str p:str :}
+   code FS-LIST:E-OPEN = if open p IO-FAILURE then
+   code E-FS-LIST-LAST >= code E-FS-LIST-FIRST <= and if
+      read p IO-FAILURE
+   then
+   code throw ;
+
+\ The paths of the entries in dir, but . and .., in the order listed; a
+\ failed listing is an io failure named by the open or the read text.
+: LIST-PATHS ( fd str str str ^ARENA:arena -- ^VEC:vector<str> )
+   {: dir:fd parent:str open:str read:str ar:^ARENA:arena :}
+   ar [type] str NEW-VEC {: v :}
+   0 FS:CAUSE!
+   [: dir parent ar v LISTED ;] catch {: code:n :}
+   code 0<> if code open read parent LIST-FAILURE then
+   v ;
+
+\ FILE-FINGERPRINT of the walk's stat as a step; after a throw
+\ ENTRY-CODE? names, NO-FINGERPRINT and the code.
+: PRINT-STEP ( MODEL:stat str -- MODEL:fingerprint n )
+   {: st:MODEL:stat path:str :}
+   NO-FINGERPRINT [: DROP-FINGERPRINT st path FILE-FINGERPRINT ;]
+   catch {: code:n :}
+   code 0<> if drop NO-FINGERPRINT then code STEP-CODE ;
+
+\ A reserved artifact is seen unsupported; any other file merges with
+\ the stored rows, or answers the code its step threw.
+: SCAN-REGULAR
+   ( JOURNAL:scan str str MODEL:stat option<MODEL:cutoff>
+     -- JOURNAL:scan n )
+   {: name:str path:str st:MODEL:stat cut:option<MODEL:cutoff> :}
+   name RESERVED-ARTIFACT? if
+      path MODEL-UNKNOWN--REASON:UNSUPPORTED SEEN-UNKNOWN 0 exit
+   then
+   st path PRINT-STEP {: print:MODEL:fingerprint code:n :}
+   code 0<> if code exit then
+   path print cut JOURNAL:SCAN-FILE 0 ;
+
+: HELD-RELEASED ( fd ^ARENA:arena -- )
+   {: f:fd ar:^ARENA:arena :}
+   f DISCARD ar ARENA:RELEASE ;
+
+\ Releases the last directory held.
+: TOP-RELEASED ( ^VEC:vector<held-dir> -- )
+   {: v :}
+   v VEC:COUNT 1- {: k:n :}
+   v k VEC:AT @ HELD-DIR-UNMAKE {: f:fd p:str names ar:^ARENA:arena :}
+   v k VEC:RESIZE
+   f ar HELD-RELEASED ;
+
+\ Releases every directory still held.
+: ALL-RELEASED ( ^VEC:vector<held-dir> -- )
+   {: v :}
+   begin v VEC:COUNT 0 > while v TOP-RELEASED repeat ;
+
+\ The open directory's paths, listed into ar; its stat after the listing
+\ must be before, the one taken before it.
+: LISTED-STILL ( fd str MODEL:stat ^ARENA:arena -- ^VEC:vector<str> )
+   {: child:fd p:str before:MODEL:stat ar:^ARENA:arena :}
+   child p s" open directory stream" s" read directory" ar LIST-PATHS
+   child p s" inspect directory after scan" STAT-FD
+   before SAME-OBSERVATION 0= if s" scan directory" p CHANGED then ;
+
+\ The open directory, checked to be the one the walk's stat found, then
+\ watched and its LISTED-STILL. Its wd's record is stirred until the
+\ listing ends, so a listing that throws leaves it stirred; a blind or
+\ refused watch lists it all the same.
+: CHECKED-LISTING
+   ( fd str MODEL:stat scan-context ^ARENA:arena -- ^VEC:vector<str> )
+   {: child:fd p:str probe:MODEL:stat cx:scan-context ar:^ARENA:arena :}
+   child p s" inspect directory before scan" STAT-FD
+   {: before:MODEL:stat :}
+   before probe SAME-INODE 0= if s" open scanned directory" p CHANGED then
+   cx SCAN-CONTEXT-UNMAKE {: cut:option<MODEL:cutoff> dev:n j w :}
+   w child p WATCH-ADD MATCH option
+      none OF child p before ar LISTED-STILL ENDOF
+      some OF {: wd:n :}
+         j wd p JOURNAL:WATCH-RECORD
+         child p before ar LISTED-STILL
+         j wd JOURNAL:WATCH-LISTED
+      ENDOF
+   ;MATCH ;
+
+\ The directory at name, opened from dir where the walk's stat found it,
+\ and its CHECKED-LISTING; a throw closes it.
+: OPENED-LISTING
+   ( fd str str MODEL:stat scan-context ^ARENA:arena
+     -- fd ^VEC:vector<str> )
+   {: dir:fd name:str p:str probe:MODEL:stat cx:scan-context
+      ar:^ARENA:arena :}
+   dir name p OPEN-DIRECTORY-AT {: child:fd :}
+   ar [type] str NEW-VEC child
+   [: drop child p probe cx ar CHECKED-LISTING ;] CLOSING
+   child swap ;
+
+\ OPENED-LISTING and 0; after any throw, -1, an empty vector in ar and
+\ the code. The caller, which owns ar, releases it once the vector is
+\ dropped, then STEP-CODE decides the code.
+: LISTING-STEP
+   ( fd str str MODEL:stat scan-context ^ARENA:arena
+     -- fd ^VEC:vector<str> n )
+   {: dir:fd name:str p:str probe:MODEL:stat cx:scan-context
+      ar:^ARENA:arena :}
+   -1 >FD ar [type] str NEW-VEC
+   [: 2drop dir name p probe cx ar OPENED-LISTING ;] catch {: code:n :}
+   code 0<> if 2drop -1 >FD ar [type] str NEW-VEC then
+   code ;
+
+\ SCAN-NAMES, which the walk reaches again below a directory.
+defer SCAN-SUBTREE
+   ( JOURNAL:scan fd str ^VEC:vector<str> scan-context ^ARENA:arena
+     -- JOURNAL:scan )
+
+\ Whether p sorts after every path beneath t: anywhere but at t followed
+\ by a byte below "/".
+: PAST-SUBTREE? ( str str -- bool )
+   {: p:str t:str :}
+   p str> {: pa:^u8 pu:n :}
+   t str> nip {: tu:n :}
+   pu tu <= if true exit then
+   pa tu >str t STR:= 0= if true exit then
+   pa tu + c@ SLASH > ;
+
+\ Whether the last held directory's subtree comes before p.
+: TOP-DUE? ( str ^VEC:vector<held-dir> -- bool )
+   {: p:str v :}
+   v VEC:COUNT 0= if false exit then
+   v v VEC:COUNT 1- VEC:AT @ HELD-DIR-UNMAKE
+   {: f:fd t:str names ar:^ARENA:arena :}
+   p t PAST-SUBTREE? ;
+
+\ The last held directory's subtree, then its descriptor and arena.
+: DESCEND-TOP
+   ( JOURNAL:scan ^VEC:vector<held-dir> scan-context -- JOURNAL:scan )
+   {: v cx:scan-context :}
+   v VEC:COUNT 1- {: k:n :}
+   v k VEC:AT @ HELD-DIR-UNMAKE
+   {: child:fd p:str names ar:^ARENA:arena :}
+   v k VEC:RESIZE
+   [: child p names cx ar SCAN-SUBTREE ;]
+   [: child ar HELD-RELEASED ;] finally ;
+
+\ Each held subtree p does not sort below.
+: ENTERED-DUE
+   ( JOURNAL:scan str ^VEC:vector<held-dir> scan-context
+     -- JOURNAL:scan )
+   {: p:str v cx:scan-context :}
+   begin p v TOP-DUE? while v cx DESCEND-TOP repeat ;
+
+: ENTERED-ALL
+   ( JOURNAL:scan ^VEC:vector<held-dir> scan-context -- JOURNAL:scan )
+   {: v cx:scan-context :}
+   begin v VEC:COUNT 0 > while v cx DESCEND-TOP repeat ;
+
+\ A directory: listed where the walk's stat found it, held, then seen at
+\ its name; its subtree waits in held for SCAN-NAMES. A failed listing
+\ releases its arena, then answers the step's code.
+: SCAN-SUBDIRECTORY
+   ( JOURNAL:scan fd str str MODEL:stat scan-context ^VEC:vector<held-dir>
+     -- JOURNAL:scan n )
+   {: dir:fd name:str path:str probe:MODEL:stat cx:scan-context held :}
+   ARENA:NEW {: ar:^ARENA:arena :}
+   dir name path probe cx ar LISTING-STEP {: child:fd names code:n :}
+   code 0<> if
+      child names 2drop ar ARENA:RELEASE code STEP-CODE exit
+   then
+   child path names ar HELD-DIR-MAKE held VEC:PUSH !
+   path MODEL:>PATH DIRECTORY-OBSERVATION MODEL-LOCAL--RECORD:MAKE
+   JOURNAL:SCAN-SEEN 0 ;
+
+\ The entry by the walk's stat. One on another volume is seen as a
+\ symlink is, never synchronized, with nothing beneath it observed.
+: SCAN-PROBED
+   ( JOURNAL:scan MODEL:stat fd str str scan-context
+     ^VEC:vector<held-dir> -- JOURNAL:scan n )
+   {: st:MODEL:stat dir:fd name:str path:str cx:scan-context held :}
+   cx SCAN-CONTEXT-UNMAKE {: cut:option<MODEL:cutoff> dev:n j w :}
+   st STAT-DEV dev <> if
+      path MODEL-UNKNOWN--REASON:UNSUPPORTED SEEN-UNKNOWN 0 exit
+   then
+   st REGULAR? if name path st cut SCAN-REGULAR exit then
+   st DIRECTORY? if dir name path st cx held SCAN-SUBDIRECTORY exit then
+   path UNSUPPORTED-STEP ;
+
+\ Rust's scan_entry: one no-follow stat of name, then 0 or the code
+\ that says why it cannot be observed, which SCAN-NAME publishes.
+: SCAN-ENTRY
+   ( JOURNAL:scan fd str str scan-context ^VEC:vector<held-dir>
+     -- JOURNAL:scan n )
+   {: dir:fd name:str path:str cx:scan-context held :}
+   dir name FS:TRY-STAT-AT 0= if
+      s" inspect directory entry" path IO-STEP exit
+   then
+   BUF-STAT dir name path cx held SCAN-PROBED ;
+
+\ Rust's entry_unknown and io_unknown_reason: the reason code, thrown
+\ while one entry was observed, publishes; wrong is what an object that is
+\ not a regular file means to the caller. Any code ENTRY-CODE? does not
+\ name is the scan's, rethrown.
+: ENTRY-UNKNOWN ( n MODEL:unknown-reason -- MODEL:unknown-reason )
+   {: code:n wrong:MODEL:unknown-reason :}
+   code FS:ERRNO ENTRY-CODE? 0= if code throw then
+   code E-UNSUPPORTED = if wrong exit then
+   code E-CHANGED = if MODEL-UNKNOWN--REASON:INCOMPLETE exit then
+   code E-UNREADABLE = if MODEL-UNKNOWN--REASON:INACCESSIBLE exit then
+   FS:ERRNO REPLACED? if MODEL-UNKNOWN--REASON:INCOMPLETE exit then
+   MODEL-UNKNOWN--REASON:INACCESSIBLE ;
+
+\ Rust's walk_unknown: an entry the walk meets.
+: WALK-UNKNOWN ( n -- MODEL:unknown-reason )
+   MODEL-UNKNOWN--REASON:UNSUPPORTED ENTRY-UNKNOWN ;
+
+\ Rust's revisited_unknown: an object whose type the walk recorded, so a
+\ different one now is a replacement.
+: REVISITED-UNKNOWN ( n -- MODEL:unknown-reason )
+   MODEL-UNKNOWN--REASON:INCOMPLETE ENTRY-UNKNOWN ;
+
+\ One entry never fails the pass: it is seen as unknown, and a directory
+\ that is, changed while it was listed among them, is not entered. LOCAL
+\ logs no failure ENTRY-CODE? names while the entry is walked.
+: SCAN-NAME
+   ( JOURNAL:scan fd str str scan-context ^VEC:vector<held-dir>
+     -- JOURNAL:scan )
+   {: dir:fd path:str parent:str cx:scan-context held :}
+   path parent NAME-OF {: name:str :}
+   name MODEL:EXCLUDED-NAME? if exit then
+   [: dir name path cx held SCAN-ENTRY ;] ['] ENTRY-CODE? WITH-CONVERTS
+   {: code:n :}
+   code 0= if exit then
+   path code WALK-UNKNOWN SEEN-UNKNOWN ;
+
+\ Each held subtree p does not sort below, then p.
+: SCAN-STEP
+   ( JOURNAL:scan fd str str scan-context ^VEC:vector<held-dir>
+     -- JOURNAL:scan )
+   {: dir:fd p:str parent:str cx:scan-context held :}
+   p held cx ENTERED-DUE
+   dir p parent cx held SCAN-NAME ;
+
+\ The names in byte order, each held directory's subtree before the
+\ first later name that does not sort below it, so every path reaches
+\ JOURNAL in path byte order.
+: NAMES-WALKED
+   ( JOURNAL:scan fd str ^VEC:vector<str> scan-context ^ARENA:arena
+     ^VEC:vector<held-dir> -- JOURNAL:scan )
+   {: dir:fd path:str names cx:scan-context ar:^ARENA:arena held :}
+   names VEC:COUNT [: names swap VEC:AT STR@ path NAME-OF ;] ar ORDER
+   {: idx :}
+   idx VEC:COUNT 0 ?do
+      dir names idx i VEC:AT @ VEC:AT @ path cx held SCAN-STEP
+   loop
+   held cx ENTERED-ALL ;
+
+\ NAMES-WALKED of a directory's names, which live in ar with their
+\ order; a throw releases every directory still held.
+: SCAN-NAMES
+   ( JOURNAL:scan fd str ^VEC:vector<str> scan-context ^ARENA:arena
+     -- JOURNAL:scan )
+   {: dir:fd path:str names cx:scan-context ar:^ARENA:arena :}
+   ar [type] held-dir NEW-VEC {: held :}
+   [: dir path names cx ar held NAMES-WALKED ;]
+   [: held ALL-RELEASED ;] finally ;
+
+: SUBTREE-INSTALL ( -- ) [: SCAN-NAMES ;] is SCAN-SUBTREE ;
+SUBTREE-INSTALL
+
+\ ---- the hash stage
+
+: NO-SCANNED-HASH ( -- scanned-hash )
+   s" " MODEL:>PATH NO-FINGERPRINT NO-HASH MODEL-HASH--RECORD:MAKE
+   false SCANNED-HASH-MAKE ;
+
+: DROP-SCANNED-HASH ( scanned-hash -- ) drop ;
+
+\ The open file's hash, which must match the fingerprint the walk took.
+: HASH-OPENED-FILE
+   ( fd str MODEL:fingerprint MODEL:stat [ -- option<MODEL:cutoff> ]
+     ^ARENA:arena -- scanned-hash )
+   {: f:fd path:str want:MODEL:fingerprint opened:MODEL:stat q
+      ar:^ARENA:arena :}
+   opened path FILE-FINGERPRINT want SAME-FINGERPRINT? 0= if
+      s" open enumerated scan file" path CHANGED
+   then
+   f path s" hash local scan file" opened ar E-UNSUPPORTED E-CHANGED
+   HASH-STABLE-FILE-FROM-STAT
+   {: c:DROPBOX:hash print:MODEL:fingerprint :}
+   print want SAME-FINGERPRINT? 0= if
+      s" hash enumerated scan file" path CHANGED
+   then
+   path MODEL:>PATH print c MODEL-HASH--RECORD:MAKE
+   {: r:MODEL:hash-record :}
+   r r q execute HASH-IS-REUSABLE SCANNED-HASH-MAKE ;
+
+: HASH-SCAN-FILE
+   ( fd str MODEL:fingerprint [ -- option<MODEL:cutoff> ] ^ARENA:arena
+     -- scanned-hash )
+   {: root:fd path:str want:MODEL:fingerprint q ar:^ARENA:arena :}
+   root path s" open enumerated scan file" E-IO E-UNSUPPORTED
+   OPEN-RELATIVE-REGULAR-WITH-STAT {: f:fd opened:MODEL:stat :}
+   [: f path want opened q ar HASH-OPENED-FILE ;] [: f DISCARD ;] finally ;
+
+\ HASH-SCAN-FILE under ENTRY-CODE?; after a throw, NO-SCANNED-HASH and the
+\ code.
+: HASH-STEP
+   ( fd str MODEL:fingerprint [ -- option<MODEL:cutoff> ] ^ARENA:arena
+     -- scanned-hash n )
+   {: root:fd path:str want:MODEL:fingerprint q ar:^ARENA:arena :}
+   NO-SCANNED-HASH [: DROP-SCANNED-HASH
+      [: root path want q ar HASH-SCAN-FILE ;] ['] ENTRY-CODE? WITH-CONVERTS
+   ;] catch {: code:n :}
+   code 0<> if drop NO-SCANNED-HASH then code ;
+
+\ The hash's file publishes present.
+: OBSERVE-PRESENT ( JOURNAL:scan MODEL:hash-record -- JOURNAL:scan )
+   MODEL-HASH--RECORD:UNMAKE
+   {: p:MODEL:path f:MODEL:fingerprint c:DROPBOX:hash :}
+   p c MODEL-LOCAL:MAKE PRESENT-OBSERVATION MODEL-LOCAL--RECORD:MAKE
+   JOURNAL:SCAN-OBSERVE ;
+
+\ A confirmed hash publishes present, and its record when reusable.
+: PUBLISH-HASH ( JOURNAL:scan scanned-hash -- JOURNAL:scan )
+   SCANNED-HASH-UNMAKE {: r:MODEL:hash-record ok:bool :}
+   r OBSERVE-PRESENT
+   ok if r JOURNAL:SCAN-HASH then ;
+
+\ Every failure here concerns the job's own path.
+: HASH-JOB
+   ( JOURNAL:scan str MODEL:fingerprint fd [ -- option<MODEL:cutoff> ]
+     ^ARENA:arena -- JOURNAL:scan )
+   {: path:str want:MODEL:fingerprint root:fd q ar:^ARENA:arena :}
+   root path want q ar HASH-STEP {: h:scanned-hash code:n :}
+   code 0= if h PUBLISH-HASH exit then
+   path code REVISITED-UNKNOWN UNKNOWN ;
+
+\ Rust's hash_scan_files, one job at a time, each hashed in ar.
+: HASH-JOBS
+   ( JOURNAL:scan ^ARENA:arena fd [ -- option<MODEL:cutoff> ]
+     -- JOURNAL:scan )
+   {: ar:^ARENA:arena root:fd q :}
+   [: ar ARENA:RESET root q ar HASH-JOB ;] JOURNAL:EACH-SCAN-JOB ;
+
+\ ---- finishing
+
+\ The configured path must still name the root the scan opened.
+: VERIFY-ROOT ( str MODEL:stat -- )
+   {: root:str before:MODEL:stat :}
+   root s" reopen sync root after scan" OPEN-ABSOLUTE-DIRECTORY {: f:fd :}
+   [: f root s" verify sync root binding after scan" STAT-FD ;]
+   [: f DISCARD ;] finally
+   before SAME-INODE
+   0= if s" verify complete local scan root" root CHANGED then ;
+
+\ Rust's finish_scan_at: hashes the files the walk staged, in path byte
+\ order, then checks the root.
+: FINISH
+   ( JOURNAL:scan str fd MODEL:stat [ -- option<MODEL:cutoff> ]
+     -- JOURNAL:scan )
+   {: root:str rfd:fd before:MODEL:stat q :}
+   [: rfd q HASH-JOBS ;] ARENA:WITH
+   root before VERIFY-ROOT ;
+
+\ FINISH, then the root's binding, read from its descriptor while that is
+\ open: none where JOURNAL finds a stand-in there. It closes the pending
+\ scan's root.
+: FINISH-BOUND-SCAN-AT
+   ( JOURNAL:scan pending-scan [ -- option<MODEL:cutoff> ] JOURNAL:journal
+     -- JOURNAL:scan option<JOURNAL:local-root-binding> )
+   {: ps:pending-scan q j :}
+   ps PENDING-SCAN-UNMAKE
+   {: root:str rfd:fd before:MODEL:stat ar:^ARENA:arena :}
+   [: root rfd before q FINISH root rfd j ar JOURNAL:INSPECT-ROOT-AT ;]
+   [: rfd DISCARD ;] finally ;
+
+\ ---- enumerating
+
+\ The root, listed in ar, and its names walked.
+: ROOT-LISTED
+   ( JOURNAL:scan ^ARENA:arena fd MODEL:stat scan-context
+     -- JOURNAL:scan )
+   {: ar:^ARENA:arena rfd:fd before:MODEL:stat cx:scan-context :}
+   rfd s" " before cx ar CHECKED-LISTING {: names :}
+   rfd s" " names cx ar SCAN-NAMES ;
+
+\ The walk from the root, every path in byte order, each folder it lists
+\ watched and its record in j.
+: WALK-ROOT
+   ( JOURNAL:scan fd MODEL:stat option<MODEL:cutoff> n JOURNAL:journal
+     ^watch -- JOURNAL:scan )
+   {: rfd:fd before:MODEL:stat cut:option<MODEL:cutoff> dev:n j w :}
+   cut dev j w SCAN-CONTEXT-MAKE {: cx:scan-context :}
+   [: rfd before cx ROOT-LISTED ;] ARENA:WITH ;
+
+\ Rust's enumerate_scan_on_device: every entry on device into the scan;
+\ any other device is an unsupported subtree. A failure of the root's own
+\ throws and closes the root.
+: ENUMERATE-SCAN-ON-DEVICE
+   ( JOURNAL:scan str fd MODEL:stat option<MODEL:cutoff> n JOURNAL:journal
+     ^watch ^ARENA:arena -- JOURNAL:scan pending-scan )
+   {: root:str rfd:fd before:MODEL:stat cut:option<MODEL:cutoff> dev:n
+      j w ar:^ARENA:arena :}
+   rfd [: rfd before cut dev j w WALK-ROOT ;] CLOSING
+   root rfd before ar PENDING-SCAN-MAKE ;
+
+: ROOT-STAT ( fd str -- MODEL:stat )
+   {: rfd:fd p:str :}
+   NO-STAT rfd
+   [: DROP-STAT rfd p s" inspect sync root before scan" STAT-FD ;]
+   CLOSING ;
+
+: ENUMERATE-SCAN
+   ( JOURNAL:scan str option<MODEL:cutoff> JOURNAL:journal ^watch
+     ^ARENA:arena -- JOURNAL:scan pending-scan )
+   {: p:str cut:option<MODEL:cutoff> j w ar:^ARENA:arena :}
+   p ar KEEP {: root:str :}
+   p s" open sync root for scan" OPEN-ABSOLUTE-DIRECTORY {: rfd:fd :}
+   rfd p ROOT-STAT {: before:MODEL:stat :}
+   root rfd before cut before STAT-DEV j w ar ENUMERATE-SCAN-ON-DEVICE ;
+
 \ ---- publishing
 
 : ROOT-CHANGED ( -- scan-publication )
@@ -1896,11 +1916,11 @@ private
    LOCAL-SCAN--PUBLICATION:PUBLISHED ;
 
 : SCAN-PUBLISHED
-   ( JOURNAL:scan JOURNAL:journal str option<MODEL:cutoff>
+   ( JOURNAL:scan JOURNAL:journal str ^watch option<MODEL:cutoff>
      [ -- option<MODEL:cutoff> ] ^ARENA:arena
      -- scan-publication JOURNAL:scan )
-   {: j p:str cut:option<MODEL:cutoff> q ar:^ARENA:arena :}
-   p cut ar ENUMERATE-SCAN q j FINISH-BOUND-SCAN-AT
+   {: j p:str w cut:option<MODEL:cutoff> q ar:^ARENA:arena :}
+   p cut j w ar ENUMERATE-SCAN q j FINISH-BOUND-SCAN-AT
    MATCH option
       none OF ROOT-CHANGED ENDOF
       some OF j p ar PUBLISH-BOUND ENDOF
@@ -1912,20 +1932,31 @@ private
 \ unknown with nothing beneath it, so a partial walk never passes for
 \ confirmed absence; only the root's own failures fail the scan. cut
 \ decides which cached hashes the walk reuses, q which hashes it computes
-\ stay reusable.
+\ stay reusable. The watch first hears the pending events and starts the
+\ scan, which watches every folder it lists; a published scan steps it
+\ published, a root-changed one abandoned, and a throw steps it nothing.
 : SCAN-AND-PUBLISH-AT
-   ( JOURNAL:journal str option<MODEL:cutoff> [ -- option<MODEL:cutoff> ]
-     ^ARENA:arena -- scan-publication )
-   {: j p:str cut:option<MODEL:cutoff> q ar:^ARENA:arena :}
-   j [: j p cut q ar SCAN-PUBLISHED ;] JOURNAL:WITH-SCAN ;
+   ( JOURNAL:journal str ^watch option<MODEL:cutoff>
+     [ -- option<MODEL:cutoff> ] ^ARENA:arena -- scan-publication )
+   {: j p:str w cut:option<MODEL:cutoff> q ar:^ARENA:arena :}
+   j w WATCH-HEAR drop
+   j w WATCH-STARTED drop
+   j [: j p w cut q ar SCAN-PUBLISHED ;] JOURNAL:WITH-SCAN
+   {: pub:scan-publication :}
+   pub MATCH scan-publication
+      published OF j w WATCH-PUBLISHED ENDOF
+      root-changed OF j w WATCH-ABANDONED ENDOF
+   ;MATCH
+   pub ;
 
 public
 
-\ p scanned with the journal's hash cache and published to it, in ar.
+\ p scanned with the journal's hash cache and published to it, in ar;
+\ the watch hears the scan's folders.
 : SCAN-AND-PUBLISH
-   ( JOURNAL:journal str ^ARENA:arena -- scan-publication )
-   {: j p:str ar:^ARENA:arena :}
-   j p CURRENT-HASH-CACHE-CUTOFF [: CURRENT-HASH-CACHE-CUTOFF ;] ar
+   ( JOURNAL:journal str ^watch ^ARENA:arena -- scan-publication )
+   {: j p:str w ar:^ARENA:arena :}
+   j p w CURRENT-HASH-CACHE-CUTOFF [: CURRENT-HASH-CACHE-CUTOFF ;] ar
    SCAN-AND-PUBLISH-AT ;
 
 private

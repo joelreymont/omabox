@@ -1821,6 +1821,7 @@ FSM:DEFINE INVENTORY-PUBLICATION ( ^refresh ) listing-state listing-event
 STRUCTURE run DERIVE addr
    FIELD journal JOURNAL:journal
    FIELD link ^REPLAY:link
+   FIELD watch ^LOCAL:watch
    FIELD root str
    FIELD staging str
    FIELD arena ^ARENA:arena
@@ -3489,13 +3490,13 @@ ENUM pass-state DERIVE eq
 : DROP-SCAN ( LOCAL:scan-publication -- ) drop ;
 : SCAN-CONVERTS? ( n n -- bool ) drop LOCAL:E-CHANGED = ;
 
-\ LOCAL:SCAN-AND-PUBLISH of the root and 0, or NO-SCAN and the code it
-\ threw.
+\ LOCAL:SCAN-AND-PUBLISH of the root under the run's watch and 0, or
+\ NO-SCAN and the code it threw.
 : SCANNED ( ^pass -- LOCAL:scan-publication n )
    {: x :}
    x PASS-RUN @ {: r :}
-   NO-SCAN [: DROP-SCAN [: r RUN-JOURNAL @ r ROOT$ r RUN-ARENA @
-         LOCAL:SCAN-AND-PUBLISH ;]
+   NO-SCAN [: DROP-SCAN [: r RUN-JOURNAL @ r ROOT$ r RUN-WATCH @
+         r RUN-ARENA @ LOCAL:SCAN-AND-PUBLISH ;]
       ['] SCAN-CONVERTS? LOCAL:WITH-CONVERTS ;] catch {: code:n :}
    code 0<> if drop NO-SCAN then code ;
 
@@ -3692,10 +3693,11 @@ FSM:DEFINE SYNC-PASS ( ^pass ) pass-state pass-event
 ;DEFINE
 
 : NEW-RUN
-   ( JOURNAL:journal ^REPLAY:link str str ^ARENA:arena -- ^run )
-   {: j l root:str staging:str ar :}
+   ( JOURNAL:journal ^REPLAY:link ^LOCAL:watch str str ^ARENA:arena
+     -- ^run )
+   {: j l w root:str staging:str ar :}
    ar RUNS-NEW {: r :}
-   j r RUN-JOURNAL ! l r RUN-LINK !
+   j r RUN-JOURNAL ! l r RUN-LINK ! w r RUN-WATCH !
    root r RUN-ROOT ! staging r RUN-STAGING ! ar r RUN-ARENA !
    r ;
 
@@ -3713,11 +3715,13 @@ FSM:DEFINE SYNC-PASS ( ^pass ) pass-state pass-event
 public
 
 \ Rust's reconcile_once: replays the plans of earlier passes,
-\ publishes both complete inventories and plans every known path once.
+\ publishes both complete inventories and plans every known path once;
+\ the local scan runs under the watch, which outlives the pass.
 : PASS
-   ( JOURNAL:journal ^REPLAY:link str str str ^ARENA:arena -- outcome )
-   {: j l root:str staging:str recovery:str ar :}
-   j l root staging ar NEW-RUN {: r :}
+   ( JOURNAL:journal ^REPLAY:link ^LOCAL:watch str str str ^ARENA:arena
+     -- outcome )
+   {: j l w root:str staging:str recovery:str ar :}
+   j l w root staging ar NEW-RUN {: r :}
    ar PASSES-NEW {: x :}
    r x PASS-RUN ! recovery x PASS-RECOVERY !
    construct pass-state settling

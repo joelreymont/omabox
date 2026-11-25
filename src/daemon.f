@@ -406,6 +406,7 @@ STRUCTURE run DERIVE addr
    FIELD dropbox DROPBOX:config
    FIELD session ^session
    FIELD link ^REPLAY:link
+   FIELD watch ^LOCAL:watch
    FIELD schedule schedule
    FIELD failure failure
    FIELD code n
@@ -697,10 +698,14 @@ FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
    s" initialized a new local sync-root generation generation=" LOG:TEXT+
    g LOG:INT+ LOG:;LINE ;
 
+\ A new generation puts the watch in doubt: its folders may be another
+\ root's.
 : ACTIVATION ( JOURNAL:local-root-activation ^run -- bool )
    {: x :}
    MATCH JOURNAL:local-root-activation
-      activated OF GENERATION-LOGGED true ENDOF
+      activated OF
+         GENERATION-LOGGED x JOURNAL@ x RUN-WATCH @ LOCAL:WATCH-DOUBT true
+      ENDOF
       current OF drop true ENDOF
       unavailable OF drop drop ROOT-UNAVAILABLE x FAIL ENDOF
    ;MATCH ;
@@ -739,7 +744,8 @@ FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
    {: x :}
    x RUN-CONFIG @ {: c :}
    c CONFIG:PATHS {: p :}
-   x JOURNAL@ x RUN-LINK @ c CONFIG:SYNC-ROOT CONFIG:ABS-PATH>STR
+   x JOURNAL@ x RUN-LINK @ x RUN-WATCH @
+   c CONFIG:SYNC-ROOT CONFIG:ABS-PATH>STR
    p CONFIG:UPLOAD-STAGING-DIRECTORY CONFIG:ABS-PATH>STR
    p CONFIG:RECOVERY-DIRECTORY CONFIG:ABS-PATH>STR
    x RUN-PASSES @ RECONCILE:PASS MATCH RECONCILE:outcome
@@ -941,7 +947,8 @@ FSM:DEFINE DAEMON-RUN ( ^run ) daemon-state step-event
 \ ---- the process
 
 \ The lock's and the journal's holders are made once, empty, so a failed
-\ attempt to lock or open allocates nothing.
+\ attempt to lock or open allocates nothing. The watch lives in ar across
+\ passes; ar's release closes its instance.
 : NEW-RUN ( ^STATUS:status [ n -- ] ^ARENA:arena -- ^run )
    {: s w ar :}
    ar RUNS-NEW {: x :}
@@ -954,6 +961,7 @@ FSM:DEFINE DAEMON-RUN ( ^run ) daemon-state step-event
    ar ARENA:NEW-IN x RUN-CONFIGURING !
    ar ARENA:NEW-IN x RUN-SESSIONS !
    ar ARENA:NEW-IN x RUN-PASSES !
+   ar LOCAL:NEW-WATCH x RUN-WATCH !
    w x RUN-WAIT !
    s x RUN-STATUS !
    x RUN-SCHEDULE RESET
