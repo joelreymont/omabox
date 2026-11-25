@@ -520,7 +520,7 @@ variable FORM-AT
 : ASK ( HTTP:request -- )
    {: q:HTTP:request :}
    0 ASKED-U !
-   PARSER q HTTP:BODY$ str> JSON:READ-INIT
+   PARSER q HTTP:BODY$ JSON:READ-INIT
    JSON:READ-NEXT JSON:T-OBJ = if
       s" path" JSON:READ-FIND-KEY if
          ASKED PATH-CAP JSON:READ-STR ASKED-U !
@@ -586,7 +586,7 @@ variable HELD-U
 : PARENT ( HTTP:request -- bool )
    {: q:HTTP:request :}
    0 WANT-U !
-   PARSER q HTTP:BODY$ str> JSON:READ-INIT
+   PARSER q HTTP:BODY$ JSON:READ-INIT
    JSON:READ-NEXT JSON:T-OBJ = if
       s" parent_rev" JSON:READ-FIND-KEY if
          WANT NAME-CAP JSON:READ-STR WANT-U ! JSON:READ-FINISH true exit
@@ -599,7 +599,7 @@ variable HELD-U
 : HELD$ ( n -- str )
    {: i:n :}
    0 HELD-U !
-   PARSER i ENTRY$ str> JSON:READ-INIT
+   PARSER i ENTRY$ JSON:READ-INIT
    JSON:READ-NEXT JSON:T-OBJ = if
       s" rev" JSON:READ-FIND-KEY if HELD NAME-CAP JSON:READ-STR HELD-U ! then
    then
@@ -935,7 +935,7 @@ TYPED-VARIABLE DURING [ -- ]
    v ARG-SENT!
    0 ASKED-U !
    sent if
-      PARSER v str> JSON:READ-INIT
+      PARSER v JSON:READ-INIT
       JSON:READ-NEXT JSON:T-OBJ = if
          s" path" JSON:READ-FIND-KEY if
             ASKED PATH-CAP JSON:READ-STR ASKED-U !
@@ -955,7 +955,7 @@ TYPED-VARIABLE DURING [ -- ]
 : ENTRY-REV ( str -- str )
    {: e :}
    0 REV-SEEN-U !
-   PARSER e str> JSON:READ-INIT
+   PARSER e JSON:READ-INIT
    JSON:READ-NEXT JSON:T-OBJ = if
       s" rev" JSON:READ-FIND-KEY if
          REV-SEEN NAME-CAP JSON:READ-STR REV-SEEN-U !
@@ -1298,7 +1298,7 @@ variable SESSIONS
    q s" Dropbox-API-Arg" HTTP:HEADER-OF$ {: v sent:bool :}
    v ARG-SENT!
    sent 0= if exit then
-   PARSER v str> JSON:READ-INIT
+   PARSER v JSON:READ-INIT
    JSON:READ-NEXT JSON:T-OBJ = if ARG-MEMBERS then
    JSON:READ-FINISH ;
 

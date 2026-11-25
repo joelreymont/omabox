@@ -240,7 +240,7 @@ ENUM verdict
    {: s buf :} s str> BUF:N>BLEN buf BUF:APPEND-SPAN ;
 : BYTES$ ( ^VEC:vector<u8> -- str ) VEC:SPAN SPAN:$ ;
 : BYTES+ ( str ^VEC:vector<u8> -- )
-   {: s v :} s str> v VEC:APPEND ;
+   VEC:APPEND ;
 : PUSH ( n ^VEC:vector<u8> -- ) VEC:PUSH c! ;
 : ANSWER$ ( ^client -- str ) CLIENT-ANSWER @ BUF$ ;
 : TAG$ ( ^client -- str ) CLIENT-OUTER @ SPAN:$ ;
@@ -610,7 +610,7 @@ HEAP:ALLOCATOR VEC-ALLOC !
    VEC-ALLOC @ 0 [type] u8 VEC:NEW {: v:^ :}
    c CLIENT-VALUES @ VEC:DELETE  v c CLIENT-VALUES !
    v c ANSWER$ STR:len VEC:RESERVE
-   c CLIENT-CURSOR c ANSWER$ str> JSON:READ-INIT
+   c CLIENT-CURSOR c ANSWER$ JSON:READ-INIT
    VALUE OBJECT c member MEMBERS
    JSON:READ-FINISH c ;
 

@@ -66,7 +66,7 @@ TYPED-VARIABLE ACTION [ -- ]
    {: s:str a:str dest :}
    READ-CODE @ 0<> if READ-CODE @ throw then
    PRESENT @ 0= if false exit then
-   HELD HELD-U @ dest VEC:APPEND
+   HELD HELD-U @ >str dest VEC:APPEND
    true ;
 
 : REC-WRITE ( str str str -- )

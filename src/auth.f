@@ -173,42 +173,42 @@ ARENA CURSORS JSON:cursor
 : EXPECT ( n n -- ) <> if E-JSON throw then ;
 
 \ A reader on text, and its first token.
-: OPEN ( ^u8 n ^JSON:cursor -- JSON:reader n )
-   {: t:^ u:n c :}
-   c t u JSON:READ-INIT JSON:READ-NEXT ;
+: OPEN ( str ^JSON:cursor -- JSON:reader n )
+   {: t:str c :}
+   c t JSON:READ-INIT JSON:READ-NEXT ;
 
 \ A string's decoded bytes, copied into the arena; its text bounds them.
-: READ-STRING ( ^u8 n ^JSON:cursor ^ARENA:arena -- str )
-   {: t:^ u:n c ar :}
-   t u c OPEN JSON:T-STR EXPECT
-   ar u ARENA:ALLOC {: d:^ du:n :}
+: READ-STRING ( str ^JSON:cursor ^ARENA:arena -- str )
+   {: t:str c ar :}
+   t c OPEN JSON:T-STR EXPECT
+   ar t STR:len ARENA:ALLOC {: d:^ du:n :}
    d du JSON:READ-STR {: len:n :}
    JSON:READ-FINISH d len >str ;
 
 \ serde's u8: an integer with no sign, up to 255.
-: READ-VERSION ( ^u8 n ^JSON:cursor -- n )
-   {: t:^ u:n c :}
-   t u c OPEN JSON:T-INT EXPECT
-   JSON:READ-ANY-SPAN$ {: a:^ au:n :}
-   a c@ [char] - = au 3 > or if E-JSON throw then
+: READ-VERSION ( str ^JSON:cursor -- n )
+   {: t:str c :}
+   t c OPEN JSON:T-INT EXPECT
+   JSON:READ-ANY-SPAN$ {: a:str :}
+   a STR:data c@ [char] - = a STR:len 3 > or if E-JSON throw then
    JSON:READ-INT {: v:n :}
    JSON:READ-FINISH
    v 255 > if E-JSON throw then
    v ;
 
-: STRING-AT ( ^u8 n str ^JSON:cursor ^ARENA:arena -- str )
-   {: c ar :} str> c JSON:READ-MEMBER$ c ar READ-STRING ;
+: STRING-AT ( str str ^JSON:cursor ^ARENA:arena -- str )
+   {: c ar :} c JSON:READ-MEMBER$ c ar READ-STRING ;
 
 \ LoadedSecret: the version, the binding and the refresh token.
 : READ-RECORD
-   ( ^u8 n ^JSON:cursor ^ARENA:arena -- n JOURNAL:dropbox-binding str )
-   {: t:^ u:n c ar :}
-   t u s" version" str> c JSON:READ-MEMBER$ c READ-VERSION
-   t u s" account_id" c ar STRING-AT
-   t u s" root_namespace_id" c ar STRING-AT
-   t u s" remote_root" c ar STRING-AT
+   ( str ^JSON:cursor ^ARENA:arena -- n JOURNAL:dropbox-binding str )
+   {: t:str c ar :}
+   t s" version" c JSON:READ-MEMBER$ c READ-VERSION
+   t s" account_id" c ar STRING-AT
+   t s" root_namespace_id" c ar STRING-AT
+   t s" remote_root" c ar STRING-AT
    JOURNAL-DROPBOX--BINDING:MAKE
-   t u s" refresh_token" c ar STRING-AT ;
+   t s" refresh_token" c ar STRING-AT ;
 
 \ The category a refusal is logged with: E-JSON-READ-EOF the text's end,
 \ another reader code its syntax; E-JSON its data, and JSON:E-MEMBER, a
@@ -236,9 +236,8 @@ ARENA CURSORS JSON:cursor
 \ stack's shape; a refusal leaves the cursor owning nothing.
 : DECODE ( str ^ARENA:arena -- n JOURNAL:dropbox-binding str )
    {: s:str ar :}
-   s str> {: t:^ u:n :}
    ar CURSORS-NEW {: c :}
-   0 NO-BINDING NO-STR [: DROP-SEED t u c ar READ-RECORD ;] catch
+   0 NO-BINDING NO-STR [: DROP-SEED s c ar READ-RECORD ;] catch
    {: code:n :}
    code 0= if exit then
    c JSON:READ-DISPOSE
@@ -298,7 +297,7 @@ SECRET-TOOL
    PROCESS-STDIO:NULL room PROCESS-STDIO:PIPE PROCESS-STDIO:NULL
    PROCESS:RUN {: u:len eu:len status :}
    status FAILED? if SECRET:E-UNAVAILABLE throw then
-   room SPAN:$ STR:data u LEN>N dest VEC:APPEND
+   room u LEN>N SPAN:TAKE SPAN:$ dest VEC:APPEND
    true ;
 
 \ `secret-tool store`, the value its stdin.

@@ -170,7 +170,7 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
 : HELD? ( str -- bool )
    {: t:str :}
    LINE 0 VEC:RESIZE
-   10 LINE VEC:PUSH c!  t str> LINE VEC:APPEND  10 LINE VEC:PUSH c!
+   10 LINE VEC:PUSH c!  t LINE VEC:APPEND  10 LINE VEC:PUSH c!
    BODY BYTES$ LINE BYTES$ STR:CONTAINS? ;
 
 
@@ -198,7 +198,7 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
 : PUT ( str n -- n )
    {: s:str at :}
    WANT at VEC:RESIZE
-   s str> WANT VEC:APPEND
+   s WANT VEC:APPEND
    WANT VEC:COUNT ;
 
 \ WANT's bytes from i up to j.
@@ -378,7 +378,7 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
 : SCHEMA-TEXT ( SQLITE:statement -- SQLITE:statement )
    SQLITE:STEP drop
    BODY 0 VEC:RESIZE
-   0 SQLITE:COL-TEXT str> BODY VEC:APPEND ;
+   0 SQLITE:COL-TEXT BODY VEC:APPEND ;
 
 \ Whether BODY holds the first row's text.
 : BODY-HOLDS ( SQLITE:statement -- bool SQLITE:statement )
