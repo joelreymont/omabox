@@ -2447,3 +2447,66 @@ Observations for the blog:
 - `jj squash ... | tail -0` lost three squashes without a word. GNU
   `tail -n 0` exits without reading, so the writer died of SIGPIPE
   before it recorded its operation. Silence output with `/dev/null`.
+
+## 2026-11-25: why poll at all
+
+The user asked the question the plan had deferred: "why are we scanning
+and rescanning instead of usign inotify api or similar file monitoring
+api? do we need to poll like that?" Neither daemon watches files. Each
+long poll to Dropbox returns within 30 s, and each return walks the whole
+tree: 3,459 directories and 12,763 files, 0.31 s of CPU for Rust, about
+82 times an hour while nothing changes. A local edit waits up to 30 s to
+be noticed.
+
+The user's design: rescan only the folders the events name, wake the
+daemon as soon as a local change happens, and scan the whole tree only at
+startup, after a queue overflow and once an hour. The hourly backstop
+stays because inotify cannot see everything an unprivileged service would
+need: measured on this kernel, a write through a hard link in an unwatched
+directory raises nothing, and a write through a memory mapping raises only
+CLOSE_WRITE, at unmap. Nothing records changes made while the daemon is
+stopped, so startup scans too.
+
+The design came back larger than the user's three lines. Three cuts made it
+smaller without losing a case:
+- A local event ends the long poll; the next pass dials again. Keeping the
+  poll in flight across a pass would have needed a resumable HTTP head
+  read and a new lifecycle row in Habu's HTTP client.
+- The hour is checked each time the long poll returns (within 30 s plus
+  Dropbox's jitter of up to 90 s), not by a deadline inside the wait.
+- The wait for a quiet tree is one poll(2) on the inotify descriptor; no
+  new library word.
+What stayed: watch records in a temp table (a heap map would cost 285 kB
+of the 2.27 MB budget), a mark per folder for "listed but not yet
+published" so an abandoned scan loses nothing, and a 4 s settle so a file
+is not hashed while it is still being written.
+
+Measurements that settled the scan's other half:
+- The deciding statement that skips settled keys runs in 17.9 ms on a
+  performance core with a UNION of index-ordered selects. The same
+  predicate as a FULL JOIN built two tree-sized ephemeral tables.
+- The ordered walk with a merge against the stored rows costs 63.5 ms (P)
+  and 170.4 ms (E) on the live-shaped tree, against Rust's whole pass at
+  131 and 276 ms. Sorting each folder's names instead of their joined
+  paths cut the sort by a factor of 3.7: every joined path in a folder
+  shares the folder's prefix, and the comparison paid for it every time.
+
+Observations for the blog:
+- A one-word fix sat on a stack that had not landed. Habu renamed `STR=`
+  to `STR:=` while the scan work was in flight, so master no longer built
+  on the installed Habu; only the unlanded stack carried the port. A
+  library moving under an application is the price of building both at
+  once.
+- Exclusion was decided three ways: the scan checked the name in ASCII
+  case, deciding checked the folded key, replay checked the display path.
+  `DESKTOP.INI` spelled with U+212A KELVIN SIGN lowercases to
+  `desktop.ini`, so the scan synced a file deciding called excluded. Rust
+  has the same split. Now the name's lowercase decides, the same lowering
+  the key uses.
+- A live count showed two folders blocked on every pass, and I briefed a
+  hunt for a planner bug. There was none: my SQL compared a BLOB key with
+  TEXT built by `||`, matched nothing, and reported the folders empty on
+  Dropbox. They hold 22 entries of a kind Dropbox will not download, so
+  deleting them there would destroy data, and the planner is right to
+  hold them. The worker's CAST found what mine missed. The real defect was
+  smaller: status never says the deletion is held.
