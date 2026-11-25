@@ -108,10 +108,11 @@ tried. A stirred folder's listing restates its own row; a stirred record
 already staged, missing, replaced or answered by another wd stays tried, and a
 tried record is stirred again once the scan ends. The scan publishes, is
 abandoned or throws; a publication forgets the records at paths it staged
-gone, and a recorded wd replaces any record at its path. A blind watch holds
-no record and only an armed one a clean record, never at a gone row; a folder
-that vouches for its subtree has a directory row and current rows beneath
-it. A listing that adds a new wd at a path leaves the old wd's pending
+gone, and a recorded wd replaces any record at its path. The model drops a
+blind watch's records at once, as nothing reads them until ARM forgets them;
+only an armed watch holds a clean record, never at a gone row; a folder that
+vouches for its subtree has a directory row and current rows beneath it. A
+listing that adds a new wd at a path leaves the old wd's pending
 IN-IGNORED no record to forget. No change below a clean folder stays unrecorded:
 before an armed watch's scan, every folder whose stored rows may be wrong lies
 beneath an unknown row or is reached by the walk from a stirred record once

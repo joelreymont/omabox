@@ -440,10 +440,10 @@ TypeOK ==
     /\ staged["root"] \in {"none", "seen", "listed"}
     /\ away \subseteq Children
 
-\* Only a published scan cleans a record, a blind watch holds none, a
-\* clean record is never at a gone row, and a folder that vouches for
-\* what the walk skips beneath it has a directory row and current rows
-\* beneath it.
+\* Only a published scan cleans a record; a blind watch holds none, as the
+\* model drops what nothing reads; a clean record is never at a gone row,
+\* and a folder that vouches for what the walk skips beneath it has a
+\* directory row and current rows beneath it.
 Clean ==
     /\ state = "blind" => rec = NoRecords /\ watched = Unwatched
     /\ \A f \in Folders :

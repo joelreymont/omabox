@@ -1434,11 +1434,12 @@ private
    s" UPDATE temp.watches SET mark = 1 WHERE mark IN (2, 3)" SQLITE:EXEC ;
 
 \ Every folder the scan listed is clean, every one it tried stirred again
-\ and every one it staged gone forgotten: its publication is committing.
+\ and every one at a path it staged as no folder (a file, gone or
+\ unsupported) forgotten: its publication is committing.
 : LISTED-CLEANED ( journal -- )
    >CONNECTION
    s" DELETE FROM temp.watches WHERE path IN (
-         SELECT path FROM temp.scan_observations WHERE kind = 2
+         SELECT path FROM temp.scan_observations WHERE kind IN (0, 2, 8)
       );
       UPDATE temp.watches
       SET mark = CASE mark WHEN 2 THEN 0 ELSE 1 END WHERE mark IN (2, 3)"
@@ -1461,16 +1462,16 @@ public
    SQLITE:WITH-STATEMENT ;
 
 \ Whether wd n watches folder str, which a published scan listed with
-\ nothing stirred since and which is the root or published a directory.
+\ nothing stirred since and published a directory.
 : WATCH-CLEAN? ( journal n str -- bool )
    {: j n p:str :}
    j >CONNECTION
    s" SELECT 1 FROM temp.watches AS w
       WHERE w.wd = ?1 AND w.path = ?2 AND w.mark = 0
-         AND (length(w.path) = 0 OR EXISTS (
+         AND EXISTS (
             SELECT 1 FROM local_observations AS o
             WHERE o.path = w.path AND o.kind = 1
-         ))"
+         )"
    [: n 1 SQLITE:BIND-INT p 2 SQLITE:BIND-BLOB CLEAN-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
@@ -2239,7 +2240,8 @@ $2F constant SLASH
    ;MATCH ;
 
 \ BOUND-DIFFERENCE; on publishing, the folders the scan listed are clean,
-\ those it tried stirred again and those it staged gone forgotten.
+\ those it tried stirred again and those it staged as no folder
+\ forgotten.
 : PUBLISHED ( journal local-root-binding ^ARENA:arena -- bool )
    {: j b ar :}
    j b ar BOUND-DIFFERENCE {: done:bool :}
@@ -2375,9 +2377,9 @@ public
 
 \ The walk over, applies what the scan staged to the local inventory
 \ and the active root's hash cache, makes every folder it listed clean
-\ and forgets every one it staged gone, in one transaction, which an
-\ unchanged tree leaves without a write; false, nothing written, when
-\ binding is no longer the active root.
+\ and forgets every one it staged as no folder, in one transaction,
+\ which an unchanged tree leaves without a write; false, nothing
+\ written, when binding is no longer the active root.
 : PUBLISH-SCAN ( scan local-root-binding -- scan bool )
    {: b :}
    WALK-ENDED

@@ -1751,12 +1751,13 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    {: j w p:str :}
    j w p ADDED-WD p JOURNAL:WATCH-CLEAN? ;
 
-\ A scan of the root publishes; the watch is armed, the root and a clean.
+\ A scan of the root publishes; the watch is armed, a clean and no
+\ record, the root's included, stirred.
 : PUBLISHED-ARMED ( JOURNAL:journal ^watch -- )
    {: j w :}
    j ROOT$ w AR @ SCAN-AND-PUBLISH ROOT-CHANGED? TFALSE
    w WATCH-FD FD-SOME? TTRUE
-   j w s" " CLEAN? TTRUE  j w s" a" CLEAN? TTRUE ;
+   j w s" a" CLEAN? TTRUE  j STIRRED$ s" -" T$= ;
 
 : A-PUBLISHED-SCAN-ARMS-THE-WATCH ( -- )
    s" a_published_scan_arms_the_watch" T-LABEL
@@ -1765,14 +1766,14 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    JNL @ WATCHER @ PUBLISHED-ARMED ;
 
 \ With a stand-in active, a scan of the root ends root-changed: the
-\ watch stays armed, and the activation left no folder clean.
+\ watch stays armed, and the activation left a not clean.
 : ABANDONED-STIRRED ( JOURNAL:journal ^watch -- )
    {: j w :}
    j w PUBLISHED-ARMED
    j STAND-IN-ROOT AR @ JOURNAL:ACTIVATE-LOCAL-ROOT drop
    j ROOT$ w AR @ SCAN-AND-PUBLISH ROOT-CHANGED? TTRUE
    w WATCH-FD FD-SOME? TTRUE
-   j w s" " CLEAN? TFALSE  j w s" a" CLEAN? TFALSE ;
+   j w s" a" CLEAN? TFALSE ;
 
 : A-ROOT-CHANGED-SCAN-LEAVES-NO-FOLDER-CLEAN ( -- )
    s" a_root_changed_scan_leaves_no_folder_clean" T-LABEL
@@ -1941,6 +1942,18 @@ FS:PATHZ-CAP BUFFER: MOVED-BUF
    INVENTORY {: s :}
    s s" a/b" DIRECTORY SEEN
    s s" a/b/x" SCANNED-CONTENT s" x1" IDENTITY T$= ;
+
+\ a and a/b stirred, a listed as if on another device: a's listing
+\ stages a/b unsupported, so a/b is tried, not listed over as a folder.
+: A-STIRRED-FOLDER-STAGED-UNKNOWN-IS-NOT-LISTED-OVER ( -- )
+   s" a_stirred_folder_staged_unknown_is_not_listed_over" T-LABEL
+   s" a" MKDIR s" a/b" MKDIR s" a/b/x" s" x1" WRITE
+   PUBLISH
+   A-STIRRED
+   JNL @ WATCHER @ s" a/b" ADDED-WD JOURNAL:WATCH-STIR TTRUE
+   [: SCANNED-ACROSS-DEVICES ;] SCANNED {: across :}
+   across s" a/b" UNSUPPORTED-KIND SEEN
+   across s" a/b/x" MISSING SEEN ;
 
 \ d, replaced between the walk's stat and its open, is incomplete and
 \ stirred; the root's events read unheard, only d's rescan restates d.
@@ -2112,6 +2125,34 @@ FS:PATHZ-CAP BUFFER: MOVED-AT-BUF
    PUBLISH
    [: UNWATCHED-OUT ;] [: MOVED$ FS:REMOVE-TREE ;] finally ;
 
+\ a/b moved out of the root, mk leaving a non-folder at its name, and
+\ published: its record is forgotten, so the first write in it is heard
+\ and unwatches it, and the second is not.
+: REUSED-OUT ( [ -- ] -- )
+   {: mk :}
+   s" a/b" AT MOVED$ FS:RENAME-FILE
+   mk execute
+   PUBLISH
+   s" x" MOVED-AT s" x1" FS:WRITE-ALL
+   JNL @ WATCHER @ WATCH-HEAR 1 >= TTRUE
+   s" y" MOVED-AT s" y1" FS:WRITE-ALL
+   JNL @ WATCHER @ WATCH-HEAR 0 T= ;
+
+\ A new folder a/b published, then REUSED-OUT; what mk left at a/b and
+\ the moved folder are removed.
+: NAME-REUSED ( [ -- ] -- )
+   {: mk :}
+   s" a/b" MKDIR
+   PUBLISH
+   [: mk REUSED-OUT ;]
+   [: MOVED$ FS:REMOVE-TREE  s" a/b" AT FS:REMOVE-FILE ;] finally ;
+
+: A-FOLDER-MOVED-OUT-WITH-ITS-NAME-REUSED-IS-UNWATCHED ( -- )
+   s" a_folder_moved_out_with_its_name_reused_is_unwatched" T-LABEL
+   s" a" MKDIR
+   [: MOVED$ s" a/b" AT FS:MAKE-SYMLINK ;] NAME-REUSED
+   [: s" a/b" s" f" WRITE ;] NAME-REUSED ;
+
 : CASES ( -- )
    [: SCAN-PUBLISHES-EMPTY-AND-NESTED-DIRECTORIES ;] IN-SCAN-CASE
    [: FILE-LOCKED-AFTER-ENUMERATION-IS-INACCESSIBLE ;] IN-SCAN-CASE
@@ -2182,12 +2223,15 @@ FS:PATHZ-CAP BUFFER: MOVED-AT-BUF
    [: A-STIRRED-FOLDER-BELOW-A-CLEAN-ONE-IS-LISTED ;] IN-SCAN-CASE
    [: A-FOLDER-MOVED-OUT-IS-DROPPED ;] IN-SCAN-CASE
    [: A-FOLDER-MOVED-OUT-IS-UNWATCHED-WHEN-IT-SPEAKS ;] IN-SCAN-CASE
+   [: A-FOLDER-MOVED-OUT-WITH-ITS-NAME-REUSED-IS-UNWATCHED ;]
+   IN-SCAN-CASE
    [: A-FOLDER-MOVED-OUT-AND-BACK-IS-LISTED-AGAIN ;] IN-SCAN-CASE
    [: A-REPLACED-FOLDER-IS-LISTED-ANEW ;] IN-SCAN-CASE
    [: AN-INACCESSIBLE-STIRRED-FOLDER-IS-TRIED ;] IN-SCAN-CASE
    [: A-FOLDER-REPLACED-AT-ITS-OPEN-IS-TRIED ;] IN-SCAN-CASE
    [: A-FOLDER-PUBLISHED-UNKNOWN-IS-LISTED-WHEN-IT-RETURNS ;]
    IN-SCAN-CASE
+   [: A-STIRRED-FOLDER-STAGED-UNKNOWN-IS-NOT-LISTED-OVER ;] IN-SCAN-CASE
    [: A-STIRRED-FOLDER-RESTATES-ITS-OWN-ROW ;] IN-SCAN-CASE
    [: A-STIRRED-FOLDER-AWAY-DURING-ITS-SCAN-IS-LISTED-WHEN-BACK ;]
    IN-SCAN-CASE
