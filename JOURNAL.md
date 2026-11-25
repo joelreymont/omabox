@@ -2510,3 +2510,53 @@ Observations for the blog:
   deleting them there would destroy data, and the planner is right to
   hold them. The worker's CAST found what mine missed. The real defect was
   smaller: status never says the deletion is held.
+
+## 2026-11-25: reviews that break the code on purpose
+
+Two Habu lanes landed for the watching design: inotify events reported
+per watch, and an HTTP wait that a second descriptor can end. Every unit
+test passed. The reviewer then deleted lines and re-ran them:
+- Deleting the line that makes a new request forget the wake descriptor
+  passed every test. The follow-up request in the test was plain HTTP on
+  loopback, where neither connect nor write ever waits, so the stale
+  descriptor was never polled. Over TLS the handshake waits, and the new
+  test fails on that mutant.
+- Checking the wake descriptor before the socket also passed. On plain
+  HTTP the client always reads before it polls, so the socket is never
+  readable at a poll. TLS 1.3 makes the case deterministic: mbedTLS reads
+  the first session ticket, keeps it and asks to wait, with the second
+  ticket and the answer still on the socket. A wake-first poll drops a
+  received answer; the test now shows it.
+- Reading inotify once instead of until empty passed, because the test's
+  events fit in one 4096-byte read. Forty events of 224 bytes now do not.
+  The overflow test had to alternate creating and removing one file: the
+  kernel merges an event equal to the one queued just before it, so
+  16,385 creates of the same kind never overflow anything.
+
+The same habit caught three Omabox defects before they landed:
+- The deciding statement that skips settled keys, settled by measurement,
+  also yielded a key only a conflict held. The old walk never visited
+  one; the new one threw "canonical path has no display spelling", so
+  every pass would have failed once a conflicted path was gone on both
+  sides. An exhaustive test over 720 combinations of baseline, local,
+  remote, plan and conflict found it.
+- `omabox status` tested each held folder against every local row: 5.4 s
+  at the live tree's size when a large folder is unreadable, exactly when
+  a user runs status. Collecting the unknown rows once made it 0.009 s.
+- A watch mark written inside a transaction that later rolls back would
+  leave a changed folder marked clean. Watch writes are now autocommit,
+  and only the publishing transaction moves marks.
+
+Observations for the blog:
+- An agent's "all tests pass" says what ran, not what is tested. Mutation
+  by hand, one line at a time, is cheap, and it turned four of a
+  reviewer's suspicions into failing tests.
+- Habu's full suite came back 315 of 316. The red case was a library
+  build rejected by another agent's in-flight string campaign, already
+  filed and claimed. Running the one test on plain master, which failed
+  the same way, took a minute and settled whose it was.
+- Library and application move together, and that has a price. The
+  string campaign changed `VEC:APPEND` and four JSON reader words, so
+  Omabox no longer builds on Habu master, and installing the new Habu
+  waits for a port. Rust would pin a crate version and upgrade on its own
+  schedule; here the library's churn arrives with its fixes.
