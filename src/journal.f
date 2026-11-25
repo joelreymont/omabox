@@ -1392,7 +1392,8 @@ private
 \ ---- watched folders -----------------------------------------------
 
 \ A watched folder's record: its watch descriptor, its journal path (the
-\ root ""), and its mark: 0 clean, 1 stirred, 2 listed by the running scan.
+\ root ""), and its mark: 0 clean, 1 stirred, 2 listed by the running scan,
+\ 3 tried by the running scan.
 
 public
 
@@ -1424,14 +1425,18 @@ private
    1 ar BLOB-COPY {: p:str :}
    n p JOURNAL-STIRRED:MAKE OPTION:SOME swap ;
 
-\ Every folder the scan listed is stirred again: the scan ended unpublished.
+\ Every folder the scan listed or tried is stirred again: the scan ended
+\ unpublished.
 : LISTED-STIRRED ( journal -- )
-   >CONNECTION s" UPDATE temp.watches SET mark = 1 WHERE mark = 2"
-   SQLITE:EXEC ;
+   >CONNECTION
+   s" UPDATE temp.watches SET mark = 1 WHERE mark IN (2, 3)" SQLITE:EXEC ;
 
-\ Every folder the scan listed is clean: its publication is committing.
+\ Every folder the scan listed is clean and every folder it tried is
+\ stirred again: its publication is committing.
 : LISTED-CLEANED ( journal -- )
-   >CONNECTION s" UPDATE temp.watches SET mark = 0 WHERE mark = 2"
+   >CONNECTION
+   s" UPDATE temp.watches
+      SET mark = CASE mark WHEN 2 THEN 0 ELSE 1 END WHERE mark IN (2, 3)"
    SQLITE:EXEC ;
 
 public
@@ -1440,13 +1445,13 @@ public
 : WATCHES-RESET ( journal -- )
    >CONNECTION s" DELETE FROM temp.watches" SQLITE:EXEC ;
 
-\ Records wd n watching the folder at path str, stirred, replacing the
-\ record of wd n.
+\ Records wd n watching the folder at path str, replacing the record of
+\ wd n; the running scan tries the folder until WATCH-LISTED.
 : WATCH-RECORD ( journal n str -- )
    {: j n p:str :}
    j >CONNECTION
    s" INSERT OR REPLACE INTO temp.watches(wd, path, mark)
-      VALUES (?1, ?2, 1)"
+      VALUES (?1, ?2, 3)"
    [: n 1 SQLITE:BIND-INT p 2 SQLITE:BIND-BLOB SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT ;
 
@@ -1466,6 +1471,11 @@ public
 \ Marks wd n's folder listed by the running scan.
 : WATCH-LISTED ( journal n -- )
    s" UPDATE temp.watches SET mark = 2 WHERE wd = ?1" ON-WD ;
+
+\ Marks wd n's folder tried by the running scan, stirred again once the
+\ scan ends; an unrecorded wd changes nothing.
+: WATCH-TRIED ( journal n -- )
+   s" UPDATE temp.watches SET mark = 3 WHERE wd = ?1" ON-WD ;
 
 \ Forgets wd n's record.
 : WATCH-FORGET ( journal n -- )
@@ -2215,8 +2225,8 @@ $2F constant SLASH
       some OF j b ACTIVE-DIFFERENCE ENDOF
    ;MATCH ;
 
-\ BOUND-DIFFERENCE, with every folder the scan listed made clean when it
-\ publishes.
+\ BOUND-DIFFERENCE, with every folder the scan listed made clean and
+\ every folder it tried stirred again when it publishes.
 : PUBLISHED ( journal local-root-binding ^ARENA:arena -- bool )
    {: j b ar :}
    j b ar BOUND-DIFFERENCE {: done:bool :}
@@ -2229,8 +2239,9 @@ public
 \ body hands the scan back. The walk's SCAN-FILE and SCAN-SEEN calls
 \ come first, in path byte order through the whole walk or within each
 \ range from SCAN-FROM to SCAN-TO, and end at EACH-SCAN-JOB or
-\ PUBLISH-SCAN. However body ends, by returning or by a throw, every
-\ folder it marked listed and did not publish is stirred again.
+\ PUBLISH-SCAN; a scan of ranges alone calls SCAN-STOP first. However
+\ body ends, by returning or by a throw, every folder it marked listed or
+\ tried and did not publish is stirred again.
 : WITH-SCAN ( R journal [ R scan -- S scan ] -- S )
    {: j body :}
    [: j >CONNECTION SCAN-TABLES SQLITE:EXEC
@@ -2286,6 +2297,15 @@ public
    st STORED-PREFIXES @ 0 VEC:RESIZE
    p ar RANGE-START st SOUGHT
    ar ARENA:RESET
+   st j ar SCAN-MAKE ;
+
+\ Stops the stream, staging nothing, until the next SCAN-FROM, so stored
+\ rows outside the ranges that follow stay.
+: SCAN-STOP ( scan -- scan )
+   SCAN-UNMAKE {: st j ar :}
+   st STORED-UNKNOWN @ 0 VEC:RESIZE
+   st STORED-PREFIXES @ 0 VEC:RESIZE
+   st GROUP-DROPPED
    st j ar SCAN-MAKE ;
 
 \ Ends the range of the folder at p: stored groups beneath p the walk

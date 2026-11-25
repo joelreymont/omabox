@@ -2180,16 +2180,23 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
    h CACHED-FILE obs LOCAL+  h hashes HASH+
    f s" z" ar JOINED m 4 + obs hashes ar CACHED+ ;
 
-\ The stored tree: the file "a", the folder "d" from marker 10, the
-\ file "e" and the folder "h" from marker 20.
-: RANGES-STORED ( journal local-root-binding ^ARENA:arena -- )
-   {: j b ar :}
+\ The stored tree's rows: the file "a", the folder "d" from marker 10,
+\ the file "e" and the folder "h" from marker 20.
+: STORED-RANGES
+   ( ^ARENA:arena
+     -- ^VEC:vector<MODEL:local-record> ^VEC:vector<MODEL:hash-record> )
+   {: ar :}
    ar LOCALS {: obs :}  ar HASHES {: hashes :}
    s" a" 1 obs hashes ar CACHED+
    s" d" 10 obs hashes ar TREE-STORED+
    s" e" 2 obs hashes ar CACHED+
    s" h" 20 obs hashes ar TREE-STORED+
-   j b obs hashes PUBLISH-LOCAL-SCAN TTRUE ;
+   obs hashes ;
+
+\ Publishes the stored tree.
+: RANGES-STORED ( journal local-root-binding ^ARENA:arena -- )
+   {: j b ar :}
+   j b ar STORED-RANGES PUBLISH-LOCAL-SCAN TTRUE ;
 
 \ The range of the folder f, markers from m: the walk sees "f/w" and
 \ skips it at its subtree's turn, sees "f/x" changed and "f/z" as
@@ -2560,6 +2567,8 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
    j 1 s" a/x" WATCH-RECORD
    j 2 s" a-b" WATCH-RECORD
    j 3 s" a" WATCH-RECORD
+   j ar NEXT-STIRRED NONE-STIRRED? TTRUE
+   j 1 WATCH-STIR  j 2 WATCH-STIR  j 3 WATCH-STIR
    j ar NEXT-STIRRED 3 s" a" STIRRED-AT? TTRUE
    j [: j b ALL-PUBLISHED ;] WITH-SCAN
    j ar NEXT-STIRRED NONE-STIRRED? TTRUE
@@ -2582,16 +2591,75 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
    j 1 s" c" WATCH-RECORD
    j WATCH-COUNT 2 T=
    j 1 s" a" WATCH-CLEAN? TFALSE
+   j ar NEXT-STIRRED NONE-STIRRED? TTRUE
+   j 1 WATCH-STIR
    j ar NEXT-STIRRED 1 s" c" STIRRED-AT? TTRUE
    j 1 WATCH-FORGET
    j WATCH-COUNT 1 T=
    j ar NEXT-STIRRED NONE-STIRRED? TTRUE
    j 2 s" b" WATCH-CLEAN? TTRUE
    j 3 s" " WATCH-RECORD
+   j ar NEXT-STIRRED NONE-STIRRED? TTRUE
+   j 3 WATCH-STIR
    j ar NEXT-STIRRED 3 s" " STIRRED-AT? TTRUE
    j WATCHES-RESET
    j WATCH-COUNT 0 T=
    j 2 s" b" WATCH-CLEAN? TFALSE
+   j CLOSE
+   d GONE ;
+
+\ Tries wd 1's folder, lists wd 2's and publishes the scan.
+: TRIED-PUBLISHED ( scan journal local-root-binding -- scan )
+   {: j b :}
+   j 1 WATCH-TRIED  j 2 WATCH-LISTED  b PUBLISH-SCAN TTRUE ;
+
+\ Tries wd 2's folder, then the body throws.
+: TRIED-THROWN ( scan journal -- scan )
+   2 WATCH-TRIED  E-INVALID-STATE throw ;
+
+: A-TRIED-FOLDER-IS-STIRRED-AFTER-ITS-SCAN ( ^ARENA:arena -- )
+   {: ar :}
+   s" a tried folder is stirred after its scan" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   j 1 s" a" WATCH-RECORD
+   j 2 s" b" WATCH-RECORD
+   j [: j b ALL-PUBLISHED ;] WITH-SCAN
+   j [: j b TRIED-PUBLISHED ;] WITH-SCAN
+   j ar NEXT-STIRRED 1 s" a" STIRRED-AT? TTRUE
+   j 2 s" b" WATCH-CLEAN? TTRUE
+   [: j [: j TRIED-THROWN ;] WITH-SCAN ;] E-INVALID-STATE TTHROWSQ
+   j ar NEXT-STIRRED 1 s" a" STIRRED-AT? TTRUE
+   j [: j b LISTED-PUBLISHED ;] WITH-SCAN
+   j ar NEXT-STIRRED 2 s" b" STIRRED-AT? TTRUE
+   j CLOSE
+   d GONE ;
+
+\ Stops the stream and publishes the scan, which writes nothing.
+: STOPPED-PUBLISHED ( scan journal local-root-binding -- scan )
+   {: j b :}
+   SCAN-STOP
+   j TOTAL-CHANGES {: before :}
+   b PUBLISH-SCAN TTRUE
+   j TOTAL-CHANGES before T= ;
+
+\ Stops the stream, then walks and publishes the range of "d".
+: STOPPED-RANGE ( scan local-root-binding ^ARENA:arena -- scan )
+   {: b ar :}
+   SCAN-STOP  b ar ONE-RANGE ;
+
+: A-STOPPED-SCAN-PUBLISHES-NOTHING ( ^ARENA:arena -- )
+   {: ar :}
+   s" a stopped scan publishes nothing" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p ar ACTIVE-JOURNAL {: j b :}
+   j b ar RANGES-STORED
+   j [: j b STOPPED-PUBLISHED ;] WITH-SCAN
+   ar STORED-RANGES {: obs hashes :}
+   j ar LOCAL-INVENTORY obs LOCAL-RECORDS= TTRUE
+   j ar LOCAL-HASH-CACHE hashes HASH-RECORDS= TTRUE
+   j [: b ar STOPPED-RANGE ;] WITH-SCAN
+   j false ar RANGES-HELD
    j CLOSE
    d GONE ;
 
@@ -5447,6 +5515,8 @@ variable CRAFT
    ar A-REFUSED-PUBLICATION-LEAVES-THE-MARKS
    ar NEXT-STIRRED-ANSWERS-IN-PATH-ORDER
    ar WATCH-RECORDS-ARE-REPLACED-AND-FORGOTTEN
+   ar A-TRIED-FOLDER-IS-STIRRED-AFTER-ITS-SCAN
+   ar A-STOPPED-SCAN-PUBLISHES-NOTHING
    ar ORACLE-JOURNAL-HOLDS-ITS-BASELINES
    ar JOURNAL-REOPEN-EXPOSES-INTENT-WITHOUT-ADVANCING-BASELINE
    ar RECONCILIATION-DECISIONS-COMMIT-ATOMICALLY
