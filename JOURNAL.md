@@ -2596,3 +2596,63 @@ Observations for the blog:
   Omabox no longer builds on Habu master, and installing the new Habu
   waits for a port. Rust would pin a crate version and upgrade on its own
   schedule; here the library's churn arrives with its fixes.
+
+## 2026-11-25: what "idle" means, and what the models could not see
+
+The daemon now rests: after a pass that changed nothing it waits for
+Dropbox or for the watch, instead of a pass every 30 s. Rust never did
+this. Its loop polled, ran a pass, and polled again, so it never had to
+decide that nothing was left to do. Every defect the reviews found in
+resting was a case where "nothing to do" was wrong:
+- A new conflict whose copy download was refused recorded no plan, no
+  collision and no counted conflict, so the pass looked idle and the
+  retry every 30 s stopped. A held collision already prevented rest; its
+  sibling did not.
+- A folder heard changing whose listing failed (an I/O error, an
+  unmount) was left stirred, but nothing was staged, so the pass rested
+  and the change waited for the hourly scan.
+- With the watch's descriptor in every long poll, a pass that failed a
+  download woke itself: the stage file it wrote in the root made the
+  descriptor readable at once, and the retry ran every few seconds
+  instead of after the long poll. Only resting, after a pass that wrote
+  nothing, now hears local changes.
+- A watched folder moved out of the tree, with a symlink or a file left
+  at its name, kept its record: the publication forgot records only at
+  paths staged gone. Events in the moved folder woke the daemon until the
+  hourly scan.
+
+TLC checked both models after the changes, and the watch model needed
+two fixes of its own before it held. Records in the model were keyed by
+folder, so an old watch's IN_IGNORED forgot the record of the look-alike
+that replaced it; the code keys them by watch descriptor and has no such
+bug. And a strengthened invariant demanded that every folder above a
+clean one have a directory row, which a harmless state breaks. Neither
+defect was in the code; both were in what I wrote down about it.
+
+None of the four resting defects could have been found by the models.
+The daemon's model has no watch, and the watch's model has no outside
+of the tree, no files and no wakes. A model proves what it states. The
+reviews found what nobody had stated.
+
+Observations for the blog:
+- Adding an idle state to a polling loop is not an optimization; it is a
+  new claim, "nothing is pending", that every subsystem must now be
+  able to answer. Rust's version never made the claim and so never had
+  these bugs, at the cost of a Dropbox listing every 30 s forever.
+- A test that writes a file during a long poll and expects one settling
+  step raced: one write is three inotify events, and the daemon could
+  wake on the first and hear the rest a step later. Making the change
+  before the poll raced too, against a fake that answered at once.
+  Moving the file in with one rename, and holding the fake's answer
+  until the daemon heard the change, made both exact. Async Rust tests
+  have the same trap; nothing in either language prevents it.
+- The test that polling ignores local changes passed with the bug put
+  back. Polling has one way to succeed, so the state it ends in cannot
+  show what ended the poll. Asserting the event that ended it, quiet
+  rather than stirred, made it fail on the bug. A test of an absence has
+  to observe the cause, not the outcome.
+- Habu's checker deferred a whole body when a quotation reading a local
+  reached a word it could not judge, and the deferral outranked every
+  refusal, so `--verify-only` passed code the load refused. The fix
+  keeps the open escape as its own flag, judged last. A type checker
+  that defers is only as strict as the order it ranks its verdicts in.
