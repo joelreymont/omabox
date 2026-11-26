@@ -2656,3 +2656,71 @@ Observations for the blog:
   refusal, so `--verify-only` passed code the load refused. The fix
   keeps the open escape as its own flag, judged last. A type checker
   that defers is only as strict as the order it ranks its verdicts in.
+
+## 2026-11-25: two fixes for one checker defect, and the first idle hour
+
+Habu's checker refused a quotation that reads a local when it was handed
+to a word whose body the check had left to the run. Omabox met this in
+replay.f. Maki met it eighteen times. Another agent and I each fixed it in
+Habu on the same afternoon, from the two consumers, without knowing about
+the other. Theirs landed first. My rebase found the overlap only as
+conflicts in 23 places across three files. The two fixes worked
+differently:
+- Theirs marks the block of each such quotation "left to the run", and
+  defers the whole body when a reading quotation meets it.
+- Mine opened an "escape" at the call and judged it after every refusal.
+  So a body still failed where the load fails it.
+
+I dropped my commit and ran my seven tests against theirs. Three programs
+that the load refuses passed `--verify-only`:
+- a mismatch after the call;
+- a mismatch at the call itself;
+- a reading quotation at RECURSE.
+
+Those went to the other agent as a reproducer, and it took them within
+minutes.
+
+The daemon went live on the new build for its first idle hour:
+- Five idle minutes cost no CPU the kernel could count (under 10 ms). The
+  previous build averaged 2.1% of a core over 30 hours: a full pass every
+  44 s.
+- Startup and its first full pass took 0.73 s of CPU.
+- Anonymous memory is 2,336 kB, 64 kB over the 2,272 kB of the build
+  measured two days ago.
+
+The 64 kB was my own speed-up from the day before. Habu's arenas had been
+mapping a fresh 16 KiB first chunk on every NEW. To save the system calls,
+RELEASE now keeps up to four of them, zeroed, for the next NEW. On this
+kernel's 16 KiB pages that is four resident pages, held forever by a
+daemon that has stopped allocating. A sandboxed copy of the daemon showed
+the watch-and-rest changes added nothing: with and without them, it idled
+at 2,192 to 2,208 kB. The cure has the same shape as `malloc_trim`:
+ARENA:TRIM unmaps the spares, and the daemon calls it with `malloc_trim`
+just before it blocks.
+
+The next morning, after the restart onto that build:
+- Idle anonymous memory: 2,272 kB, back on budget. The heap still moves
+  by a page or two (1,072 to 1,104 kB) with what the last wake-up did.
+- Startup and its first pass: 0.28 s of CPU, against 0.73 s the day
+  before. Habu's newer code generation also made each binary about
+  196 kB smaller.
+- The hourly full scan of the live tree took 0.26 s. Rust's pass took
+  0.31 s every 30 s; this one runs once an hour.
+- Over the 14.8 idle hours before the restart, the old build used 8.8 s
+  of CPU: 0.017% of a core, against 2.1% before the watch.
+
+Observations for the blog:
+- A speed-up in a library can be a memory cost in a program that idles.
+  The benchmark that justified the spare chunks ran 100,000 arenas in a
+  loop, where keeping four pages is free. The daemon spends most of its
+  life waiting, and there the same four pages are nearly 3% of what it
+  holds.
+- Two agents fixing one defect from two consumers is the cost of not
+  coordinating, and the rebase is where it shows up. Neither of us had
+  claimed it anywhere the other would see. Comparing the tests was worth
+  more than the duplicate work cost: each fix had a case the other lacked.
+- A memory figure is a choice of what to count. smaps counts the
+  daemon's code pages as private, because only one process maps its file:
+  1.95 MB that appear and vanish with the page cache. Counted that way the
+  daemon holds 4.30 MB. The budget was set on anonymous pages, so only
+  that figure compares.
