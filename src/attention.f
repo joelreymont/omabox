@@ -1,12 +1,13 @@
 \ attention.f - package ATTENTION: the text `omabox status` shows, the
 \ Rust version's status.rs. RENDER reads a journal read-only and lists
 \ what needs attention: each pending plan, its operations left and the
-\ next one's description; each blocked plan and why; each path either
+\ next one's description; each blocked plan and why; each new conflict
+\ whose copies cannot be placed and why; each path either
 \ side observed as unknown; each folder deleted here whose Dropbox
 \ folder still holds entries, which sync holds; each pending recovery
 \ copy. An excluded path is left out, but for a recovery copy. No
 \ account, namespace, root, cursor, content, revision, recovery path
-\ or conflict is shown. A file that is absent or holds no Dropbox
+\ or recorded conflict is shown. A file that is absent or holds no Dropbox
 \ binding is not set up. The journal is never created, migrated or
 \ written.
 \ The lines are sorted by path as Rust's Path::cmp orders paths, by
@@ -269,6 +270,19 @@ ARENA SLOTS JOURNAL:journal
    j ar JOURNAL:BLOCKED-PLANS {: plans :}
    plans VEC:COUNT 0 ?do plans i VEC:AT @ ar v BLOCKED+ loop ;
 
+: CONFLICT-BLOCK+
+   ( JOURNAL:conflict-block ^ARENA:arena ^VEC:vector<entry> -- )
+   {: b ar v :}
+   b JOURNAL-CONFLICT--BLOCK:UNMAKE {: path why at:n :}
+   path MODEL:EXCLUDED? if exit then
+   path why ar BLOCKED-DETAIL ar v ENTRY+ ;
+
+: CONFLICT-BLOCK-ENTRIES
+   ( JOURNAL:journal ^ARENA:arena ^VEC:vector<entry> -- )
+   {: j ar v :}
+   j ar JOURNAL:CONFLICT-BLOCKS {: bs :}
+   bs VEC:COUNT 0 ?do bs i VEC:AT @ ar v CONFLICT-BLOCK+ loop ;
+
 \ The reason's text after the side's words, when the observation was
 \ unknown.
 : UNKNOWN+
@@ -351,6 +365,7 @@ ARENA SLOTS JOURNAL:journal
    ar ARENA:ALLOCATOR 0 [type] entry VEC:NEW {: v :}
    [: j ar v PENDING-ENTRIES ;] s" read pending sync plans" GUARDED
    [: j ar v BLOCKED-ENTRIES ;] s" read blocked sync plans" GUARDED
+   [: j ar v CONFLICT-BLOCK-ENTRIES ;] s" read blocked conflicts" GUARDED
    [: j ar v LOCAL-ENTRIES ;] s" read local observations" GUARDED
    [: j ar v REMOTE-ENTRIES ;] s" read remote observations" GUARDED
    [: j ar v HELD-ENTRIES ;] s" read held local deletions" GUARDED

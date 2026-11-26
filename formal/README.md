@@ -91,6 +91,11 @@ rebuilds, multi-page failures, crashes, retries, and atomic publication. Partial
 pages and failed attempts must leave the prior durable inventory and cursor
 unchanged; deleting durable entries requires a complete validated publication.
 
+`ConflictPlacement` checks one new conflict's step, `CONFLICT-PLACEMENT`, and
+the sweep after it: copies are prepared only for an unrecorded conflict whose
+block is due or absent, and a block is left exactly when the step ended with a
+taken copy name or stage place, or early with its block kept.
+
 `ServiceDrive` checks one drive of the user unit toward each goal, `DRIVING` in
 `src/service.f`. Any observation may read any state, and any step may fail, a
 command before or after it was spawned. A start or restart follows a clear and
@@ -170,6 +175,7 @@ tlc -config ScanCoordination.cfg ScanCoordination.tla
 tlc -config SyncBehavior.cfg SyncBehavior.tla
 tlc -config SyncPass.cfg SyncPass.tla
 tlc -config InventoryPublication.cfg InventoryPublication.tla
+tlc -config ConflictPlacement.cfg ConflictPlacement.tla
 tlc -config DirectoryDeletion.cfg DirectoryDeletion.tla
 tlc -config RemoteLifecycle.cfg RemoteLifecycle.tla
 tlc -config ServiceDrive.cfg ServiceDrive.tla
@@ -184,7 +190,8 @@ table's lines and runs TLC on `<Model>Follows.tla`, which states that the
 model's steps follow that table:
 
 - `src/reconcile-test.f`: `INVENTORY-PUBLICATION` (`InventoryPublication`),
-  `DOWNLOAD-EXECUTOR` (`DownloadExecutor`) and `SYNC-PASS` (`SyncPass`);
+  `DOWNLOAD-EXECUTOR` (`DownloadExecutor`), `SYNC-PASS` (`SyncPass`) and
+  `CONFLICT-PLACEMENT` (`ConflictPlacement`);
 - `src/replay-test.f`: `LOCAL-LIFECYCLE` (`LocalLifecycle`) and
   `REMOTE-LIFECYCLE` (`RemoteLifecycle`);
 - `src/service-test.f`: `DRIVING` (`ServiceDrive`);

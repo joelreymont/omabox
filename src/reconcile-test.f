@@ -188,6 +188,20 @@
 \ - A-CONFLICTED-DOWNLOAD-REUSES-ITS-STAGE: a staged download plan whose
 \   install finds new local bytes ends as their conflict, its stage
 \   becomes the remote copy, read-only and unmarked, with no download.
+\ - NEW-CONFLICT-WAITS-OUT-ITS-TAKEN-COPY-NAME: a new divergent
+\   conflict whose local copy name an unreadable file holds records one
+\   block, why and a retry time an hour after its pass; the next pass,
+\   the name free and the edit's hash kept, reads and writes
+\   less than the 1 MiB local edit, as /proc/self/io counts, places
+\   nothing and keeps the block; once it is due, both copies are placed
+\   and recorded and the block goes. Root skips it.
+\ - A-PATH-NO-LONGER-CONFLICTING-LOSES-ITS-BLOCK: its local edit made
+\   Dropbox's, the path's block goes, the occupant kept. Root skips it.
+\ - A-PATH-HELD-OTHERWISE-LOSES-ITS-BLOCK: a blocked path made unknown,
+\   a dangling symlink, is held and its block goes. Root skips it.
+\ - A-REFUSED-NEW-CONFLICT-WRITES-NO-BLOCK: a new divergent conflict
+\   whose Dropbox copy's download answers 409 is held with no block and
+\   no copies recorded; the next pass, the download served, places both.
 \ Restricted and same-named entries against the fake Dropbox, Rust's
 \ tests of the same names, with no account request and the fake's own
 \ delete_v2 and upload answers, its upload at rev 01701:
@@ -278,6 +292,8 @@
 \ - formal_holds_the_download_table, DOWNLOAD-EXECUTOR and
 \   formal/DownloadExecutor.tla
 \ - formal_holds_the_pass_table, SYNC-PASS and formal/SyncPass.tla
+\ - formal_holds_the_placement_table, CONFLICT-PLACEMENT and
+\   formal/ConflictPlacement.tla
 \ Run from the repository root: hb --load src/reconcile-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -296,6 +312,7 @@ require src/lib/span.f
 require src/lib/xattr.f
 require src/lib/aio.f
 require src/lib/time.f
+require src/lib/task.f
 require src/lib/json/pointer.f
 require src/lib/json/equal.f
 require src/test-formal.f
@@ -4967,6 +4984,216 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    DOWNLOAD$ TEST-DROPBOX:CALLS 0 T=
    d x STEP-GONE ;
 
+\ ---- a new conflict whose copies cannot be placed -----------------
+
+1048576 constant BIG-SIZE
+512 constant IO-CAP
+IO-CAP BUFFER: IO-BUF
+
+\ The decimal number the bytes start with.
+: DIGITS ( ^u8 n -- n )
+   {: a:^ u:n :}
+   0 u 0 ?do
+      a i + c@ dup 48 < over 57 > or if drop unloop exit then
+      48 - swap 10 * +
+   loop ;
+
+\ The count after name in /proc/self/io, the bytes this process has
+\ read or written through system calls; -1 when it is missing.
+: IO-COUNT ( str -- n )
+   {: name:str :}
+   s" /proc/self/io" IO-BUF IO-CAP FS:READ-ALL {: u:n :}
+   name str> {: na:^ nu:n :}
+   u nu - 0 ?do
+      IO-BUF i + nu >str name STR:= if
+         IO-BUF i + nu + u i - nu - DIGITS unloop exit
+      then
+   loop
+   -1 ;
+
+: READ-COUNT ( -- n ) s" rchar: " IO-COUNT ;
+: WRITE-COUNT ( -- n ) s" wchar: " IO-COUNT ;
+
+\ BIG-SIZE bytes, each B.
+: BIG$ ( ^ARENA:arena -- str )
+   BIG-SIZE ARENA:ALLOC {: a:^ u:n :}
+   u 0 ?do 66 a i + c! loop
+   a u >str ;
+
+\ The content hash of the file at path f; IDENTITY's pipe holds no
+\ more than 64 KiB.
+: FILE-IDENTITY ( str ^ARENA:arena -- DROPBOX:hash )
+   {: f:str ar :}
+   f FS:OPEN-SIZED {: fd:fd n:n ok:bool :}
+   ok TTRUE
+   fd ar LOCAL:DROPBOX-CONTENT-HASH fd FS:CLOSE-DIR ;
+
+\ c-diverged.txt diverged with cursor k and local edit b, a file Omabox
+\ cannot read at its local copy's name; the copy's path.
+: TAKEN-DIVERGED ( ^run str str -- str )
+   {: x k:str b:str :}
+   x RUN-ARENA @ {: ar :}
+   x k DIVERGED
+   x s" c-diverged.txt" IN-ROOT {: p:str :}
+   p b FS:WRITE-ALL
+   s" c-diverged.txt" LOCAL-CONFLICT--SIDE:LOCAL p ar FILE-IDENTITY ar
+   LOCAL:CONFLICT-RELATIVE-PATH {: rel:str :}
+   x rel IN-ROOT {: lc:str :}
+   lc USER-FILE$ FS:WRITE-ALL
+   lc 0 FS:CHMOD-MODE
+   lc ;
+
+: BLOCKS-OF ( ^run -- ^VEC:vector<JOURNAL:conflict-block> )
+   {: x :}
+   x RUN-JOURNAL @ x RUN-ARENA @ JOURNAL:CONFLICT-BLOCKS ;
+
+\ The run's one conflict block, c-diverged.txt's for its taken copy
+\ name; its retry time.
+: ONE-BLOCK ( ^run -- n )
+   BLOCKS-OF {: v :}
+   v VEC:COUNT 1 T=
+   v VEC:COUNT 1 <> if 0 exit then
+   v 0 VEC:AT @ JOURNAL-CONFLICT--BLOCK:UNMAKE {: path why at:n :}
+   path MODEL:PATH>STR s" c-diverged.txt" T$=
+   SB-RESET why REASON+ SB$ s" conflict-copy-occupied" T$=
+   at ;
+
+\ c-diverged.txt's block due now.
+: BLOCK-DUE ( ^run -- )
+   {: x :}
+   x RUN-JOURNAL @ s" c-diverged.txt" MODEL:>PATH
+   MODEL-BLOCKAGE:CONFLICT-COPY-OCCUPIED 0 x RUN-ARENA @
+   JOURNAL:BLOCK-NEW-CONFLICT ;
+
+\ The first pass records the block an hour after it ran; it holds the
+\ path and the unreadable occupant.
+: BLOCKED-ONCE ( ^run str -- n )
+   {: x rec:str :}
+   epoch-seconds {: t0:n :}
+   x rec PASSED COMPLETE {: rep :}
+   epoch-seconds {: t1:n :}
+   rep COPY-CONFLICTS 0 T=
+   rep BLOCKED-IN 2 T=
+   x CONFLICTS-OF VEC:COUNT 0 T=
+   x ONE-BLOCK {: at:n :}
+   at t0 JOURNAL:BLOCK-RETRY-SECONDS + >= TTRUE
+   at t1 JOURNAL:BLOCK-RETRY-SECONDS + <= TTRUE
+   at ;
+
+\ Before its retry time a pass reads and writes less than the edit's
+\ size, though the copy's name is free; the block stays.
+: WAITS-UNREAD ( ^run str str n -- )
+   {: x rec:str lc:str at:n :}
+   lc FS:REMOVE-FILE
+   READ-COUNT {: r0:n :}  WRITE-COUNT {: w0:n :}
+   r0 0 >= TTRUE
+   x rec PASSED COMPLETE {: rep :}
+   READ-COUNT r0 - BIG-SIZE < TTRUE
+   WRITE-COUNT w0 - BIG-SIZE < TTRUE
+   rep BLOCKED-IN 1 T=
+   rep COPY-CONFLICTS 0 T=
+   x ONE-BLOCK at T=
+   lc FS:EXISTS? TFALSE
+   x CONFLICTS-OF VEC:COUNT 0 T= ;
+
+: NEW-CONFLICT-WAITS-OUT-ITS-TAKEN-COPY-NAME ( ^ARENA:arena -- )
+   {: ar :}
+   s" a new conflict whose copy name is taken waits for its retry time"
+   T-LABEL
+   \ Root reads a mode-000 file.
+   FS:EUID 0 = if exit then
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   ar BIG$ {: b:str :}
+   x s" cursor-taken" b TAKEN-DIVERGED {: lc:str :}
+   \ Its change time past LOCAL's racy window, the first pass's scan
+   \ keeps its hash and a later scan reuses it.
+   4100 >MS TASK:SLEEP
+   s" rev-remote" DIVERGED-REMOTE$ TEST-DROPBOX:CONTENT!
+   [: ;] ar ENTRIES s" cursor-taken" false PAGE
+   [: ;] ar ENTRIES s" cursor-taken" false PAGE
+   x rec BLOCKED-ONCE {: at:n :}
+   x rec lc at WAITS-UNREAD
+   \ Due, both copies are placed and recorded, and the block goes.
+   x BLOCK-DUE
+   x rec PASSED COMPLETE {: rep :}
+   rep COPY-CONFLICTS 1 T=
+   rep BLOCKED-IN 0 T=
+   lc FS:FILE-SIZE BIG-SIZE T=
+   x LOCAL-CONFLICT--SIDE:REMOTE DIVERGED-REMOTE$ DIVERGED-COPY
+   DIVERGED-REMOTE$ HOLDS-BYTES
+   x CONFLICTS-OF VEC:COUNT 1 T=
+   x BLOCKS-OF VEC:COUNT 0 T=
+   d x STEP-GONE ;
+
+: A-PATH-NO-LONGER-CONFLICTING-LOSES-ITS-BLOCK ( ^ARENA:arena -- )
+   {: ar :}
+   s" a path no longer conflicting loses its conflict block" T-LABEL
+   FS:EUID 0 = if exit then
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" cursor-settled" DIVERGED-LOCAL$ TAKEN-DIVERGED {: lc:str :}
+   [: ;] ar ENTRIES s" cursor-settled" false PAGE
+   x rec BLOCKED-ONCE drop
+   \ The local edit now matches Dropbox's.
+   x s" c-diverged.txt" IN-ROOT DIVERGED-REMOTE$ FS:WRITE-ALL
+   x rec PASSED COMPLETE {: rep :}
+   \ Only the unreadable occupant is held.
+   rep BLOCKED-IN 1 T=
+   rep COPY-CONFLICTS 0 T=
+   x BLOCKS-OF VEC:COUNT 0 T=
+   x CONFLICTS-OF VEC:COUNT 0 T=
+   lc $180 FS:CHMOD-MODE
+   lc USER-FILE$ HOLDS-BYTES
+   d x STEP-GONE ;
+
+: A-PATH-HELD-OTHERWISE-LOSES-ITS-BLOCK ( ^ARENA:arena -- )
+   {: ar :}
+   s" a path held for another reason loses its conflict block" T-LABEL
+   FS:EUID 0 = if exit then
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" cursor-unknown" DIVERGED-LOCAL$ TAKEN-DIVERGED {: lc:str :}
+   [: ;] ar ENTRIES s" cursor-unknown" false PAGE
+   x rec BLOCKED-ONCE drop
+   \ A dangling symlink makes the path unknown, held before it conflicts.
+   x s" c-diverged.txt" IN-ROOT {: p:str :}
+   p FS:REMOVE-FILE
+   s" missing-target" p FS:MAKE-SYMLINK
+   x rec PASSED COMPLETE {: rep :}
+   rep BLOCKED-IN 2 T=
+   rep COPY-CONFLICTS 0 T=
+   x BLOCKS-OF VEC:COUNT 0 T=
+   x CONFLICTS-OF VEC:COUNT 0 T=
+   d x STEP-GONE ;
+
+: A-REFUSED-NEW-CONFLICT-WRITES-NO-BLOCK ( ^ARENA:arena -- )
+   {: ar :}
+   s" a refused new conflict is held and writes no block" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" cursor-refused" DIVERGED
+   s" rev-remote" DIVERGED-REMOTE$ TEST-DROPBOX:CONTENT!
+   \ The first download of rev-remote alone answers 409.
+   DOWNLOAD$ s" rev-remote" 409 s" " s" " LOOKUP-NOT-FOUND$
+   TEST-DROPBOX:ARG-SCRIPT!
+   [: ;] ar ENTRIES s" cursor-refused" false PAGE
+   x rec PASSED COMPLETE {: rep :}
+   rep BLOCKED-IN 1 T=
+   rep COPY-CONFLICTS 0 T=
+   x BLOCKS-OF VEC:COUNT 0 T=
+   x rec PASSED COMPLETE {: second :}
+   second COPY-CONFLICTS 1 T=
+   x LOCAL-CONFLICT--SIDE:LOCAL DIVERGED-LOCAL$ DIVERGED-COPY
+   DIVERGED-LOCAL$ HOLDS-BYTES
+   x LOCAL-CONFLICT--SIDE:REMOTE DIVERGED-REMOTE$ DIVERGED-COPY
+   DIVERGED-REMOTE$ HOLDS-BYTES
+   d x STEP-GONE ;
+
 : CONFLICTS-CASES ( ^ARENA:arena -- )
    {: ar :}
    ar REPLAY-BLOCKS-A-CONFLICT-WHOSE-LOCAL-COPY-NAME-IS-OCCUPIED
@@ -4975,6 +5202,10 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    ar OCCUPIED-DROPBOX-CONFLICT-COPY-NAME-BLOCKS-ONLY-ITS-PATH
    ar CONFLICT-ON-A-PLAN-BLOCKED-FOR-ITS-SIZE-IS-PREPARED-AT-ONCE
    ar DIRECTORY-AT-DROPBOX-CONFLICT-COPY-NAME-BLOCKS-ONLY-ITS-PATH
+   ar NEW-CONFLICT-WAITS-OUT-ITS-TAKEN-COPY-NAME
+   ar A-PATH-NO-LONGER-CONFLICTING-LOSES-ITS-BLOCK
+   ar A-PATH-HELD-OTHERWISE-LOSES-ITS-BLOCK
+   ar A-REFUSED-NEW-CONFLICT-WRITES-NO-BLOCK
    ar A-CONFLICTED-DOWNLOAD-REUSES-ITS-STAGE ;
 
 \ ---- restricted and same-named entries against the fake Dropbox ----
@@ -7442,6 +7673,12 @@ TYPED-VARIABLE STAND-IN-UPLOAD str
    s" src/reconcile.f" s" SYNC-PASS" s" SyncPass" ar
    TEST-FORMAL:HOLDS ;
 
+: FORMAL-HOLDS-THE-PLACEMENT-TABLE ( ^ARENA:arena -- )
+   {: ar :}
+   s" formal_holds_the_placement_table" T-LABEL
+   s" src/reconcile.f" s" CONFLICT-PLACEMENT" s" ConflictPlacement" ar
+   TEST-FORMAL:HOLDS ;
+
 
 : CASES ( ^ARENA:arena -- )
    {: ar :}
@@ -7464,7 +7701,8 @@ TYPED-VARIABLE STAND-IN-UPLOAD str
    ar LISTING-CASES
    ar FORMAL-HOLDS-THE-LISTING-TABLE
    ar FORMAL-HOLDS-THE-DOWNLOAD-TABLE
-   ar FORMAL-HOLDS-THE-PASS-TABLE ;
+   ar FORMAL-HOLDS-THE-PASS-TABLE
+   ar FORMAL-HOLDS-THE-PLACEMENT-TABLE ;
 
 
 : RUN ( -- )

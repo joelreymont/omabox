@@ -9,6 +9,9 @@
 \   E-INSPECT, its two lines logged, ENOTDIR left in FS:ERRNO.
 \ - ONLY-HELD-FOLDER-DELETIONS-SHOW: d-held shows; e-empty (empty on
 \   Dropbox), u/f (below unknown u) and x.dropbox (excluded) do not.
+\ - A-BLOCKED-NEW-CONFLICT-SHOWS: c-diverged.txt, a new conflict whose
+\   copy name is taken, shows with why; x.dropbox/c.txt (excluded) does
+\   not.
 \ Each case runs in a directory of its own under TMPDIR and removes it;
 \ a refusal's log lines are captured there, checked and removed.
 \ Run from the repository root: hb --load src/attention-test.f </dev/null
@@ -309,7 +312,7 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
    p ATTENTION:E-JOURNAL d ar REFUSED drop {: e:str :}
    e s" absolute-journal-path-sentinel" STR:CONTAINS? TFALSE
    e FIRST-LINE swap
-   s" journal: journal `[Omabox journal]` has unsupported schema version 0; supported version is 11"
+   s" journal: journal `[Omabox journal]` has unsupported schema version 0; supported version is 12"
    STR:ENDS-WITH? TTRUE
    FIRST-LINE swap
    s" attention: could not open the journal read-only" STR:ENDS-WITH? TTRUE
@@ -423,13 +426,33 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
    HELD-UNKNOWN$ T$=
    d GONE ;
 
+\ c-diverged.txt's new conflict, its copy name taken.
+: BLOCKED-CONFLICT$ ( -- str )
+   s\" Omabox status:\n- c-diverged.txt: blocked sync: another file holds this path's conflict copy name; retry is scheduled\n" ;
+
+: A-BLOCKED-NEW-CONFLICT-SHOWS ( ^ARENA:arena -- )
+   {: ar :}
+   s" A-BLOCKED-NEW-CONFLICT-SHOWS" T-LABEL
+   ar SCRATCH {: d:str :}
+   d s" journal.sqlite3" ar INSIDE {: p:str :}
+   p JOURNAL:OPEN {: j :}
+   j ar BIND
+   j s" c-diverged.txt" PATH MODEL-BLOCKAGE:CONFLICT-COPY-OCCUPIED
+   1700000000 ar JOURNAL:BLOCK-NEW-CONFLICT
+   j s" x.dropbox/c.txt" PATH MODEL-BLOCKAGE:CONFLICT-COPY-OCCUPIED
+   1700000000 ar JOURNAL:BLOCK-NEW-CONFLICT
+   j JOURNAL:CLOSE
+   p ar ATTENTION:RENDER BLOCKED-CONFLICT$ T$=
+   d GONE ;
+
 : CASES ( ^ARENA:arena -- )
    {: ar :}
    ar STATUS-SNAPSHOT-IS-SORTED-AND-OMITS-INTERNAL-VALUES
    ar STATUS-NEVER-INITIALIZES-OR-MIGRATES-A-JOURNAL
    ar STATUS-DIAGNOSTICS-REDACT-THE-ABSOLUTE-JOURNAL-PATH
    ar A-JOURNAL-BELOW-A-FILE-IS-UNINSPECTABLE
-   ar ONLY-HELD-FOLDER-DELETIONS-SHOW ;
+   ar ONLY-HELD-FOLDER-DELETIONS-SHOW
+   ar A-BLOCKED-NEW-CONFLICT-SHOWS ;
 
 : TESTS ( -- )
    T-RESET

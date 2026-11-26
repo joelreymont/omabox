@@ -2854,8 +2854,8 @@ STRUCTURE known-conflict
    FIELD conflict MODEL:conflict
 ;STRUCTURE
 
-\ One planning pass: Rust's report (noop-count, planned, conflict-count),
-\ blocked_paths (held, keys may repeat), held collisions, held new copies.
+\ One planning pass: Rust's report (noop-count, planned, conflict-count) and
+\ blocked_paths (held, keys may repeat); waiting, new conflicts on a block.
 STRUCTURE planning DERIVE addr
    FIELD run ^run
    FIELD conflicts ^VEC:vector<known-conflict>
@@ -2866,6 +2866,7 @@ STRUCTURE planning DERIVE addr
    FIELD held-copies n
    FIELD held ^VEC:vector<MODEL:key>
    FIELD collisions ^VEC:vector<MODEL:key>
+   FIELD waiting ^VEC:vector<MODEL:key>
    FIELD noops ^VEC:vector<JOURNAL:path-baseline>
    FIELD plans ^VEC:vector<JOURNAL:path-plan>
    FIELD decisions ^VEC:vector<path-decision>
@@ -2949,6 +2950,7 @@ ARENA PLANNINGS planning
    r KNOWN-CONFLICTS pl PLANNING-CONFLICTS !
    ar [type] MODEL:key NEW-VECTOR pl PLANNING-HELD !
    ar [type] MODEL:key NEW-VECTOR pl PLANNING-COLLISIONS !
+   ar [type] MODEL:key NEW-VECTOR pl PLANNING-WAITING !
    ar [type] JOURNAL:path-baseline NEW-VECTOR pl PLANNING-NOOPS !
    ar [type] JOURNAL:path-plan NEW-VECTOR pl PLANNING-PLANS !
    ar [type] path-decision NEW-VECTOR pl PLANNING-DECISIONS !
@@ -3394,32 +3396,130 @@ ENUM live-step held superseded fresh root-changed ;ENUM
       root-changed OF construct pass-event root-changed ENDOF
    ;MATCH ;
 
-: NEW-COPIES
-   ( REPLAY:copy-outcome ^planning MODEL:key MODEL:path MODEL:conflict
-     -- pass-event )
-   {: pl k path c :}
-   MATCH REPLAY:copy-outcome
-      ready OF
-         pl JOURNAL-OF path c pl ARENA-OF JOURNAL:RECORD-CONFLICT drop
-         1 pl PLANNING-CONFLICT-COUNT +! construct pass-event ok
+\ A new conflict being placed, and the planning's answer once it ends.
+STRUCTURE placement DERIVE addr
+   FIELD planning ^planning
+   FIELD key MODEL:key
+   FIELD path MODEL:path
+   FIELD conflict MODEL:conflict
+   FIELD reason MODEL:blockage
+   FIELD answer pass-event
+;STRUCTURE
+
+ARENA PLACEMENTS placement
+
+ENUM placement-state deciding preparing ended ;ENUM
+ENUM placement-start recorded early open ;ENUM
+ENUM placement-copies placed taken refused changed unrooted ;ENUM
+
+: PLANNING-OF ( ^placement -- ^planning ) PLACEMENT-PLANNING @ ;
+
+\ A block at the key whose retry time has not come.
+: EARLY? ( ^planning MODEL:key -- bool )
+   {: pl k :}
+   pl JOURNAL-OF k pl ARENA-OF JOURNAL:CONFLICT-BLOCK-AT MATCH option
+      none OF false ENDOF
+      some OF
+         JOURNAL-CONFLICT--BLOCK:UNMAKE {: path why at:n :}
+         at pl PLANNING-NOW @ >
       ENDOF
-      blocked OF
-         drop pl k HELD+ 1 pl PLANNING-HELD-COPIES +!
-         construct pass-event ok
-      ENDOF
-      source-changed OF construct pass-event fresh ENDOF
    ;MATCH ;
 
-\ A recorded conflict was prepared once; its copies now belong to the
-\ user, who may edit, move, or delete them.
+: PLACE-START ( ^placement -- placement-start )
+   {: x :}
+   x PLANNING-OF {: pl :}
+   x PLACEMENT-KEY @ {: k :}
+   pl k x PLACEMENT-CONFLICT @ CONFLICT-RECORDED? if
+      construct placement-start recorded exit
+   then
+   pl k EARLY? if construct placement-start early exit then
+   construct placement-start open ;
+
+\ A taken copy name or stage place waits for its retry time; any other
+\ blockage is refused.
+: PLACE-BLOCKED ( MODEL:blockage ^placement -- placement-copies )
+   {: why x :}
+   why x PLACEMENT-REASON !
+   why PLACE-TAKEN? if construct placement-copies taken exit then
+   construct placement-copies refused ;
+
+: COPIES-OF
+   ( REPLAY:copy-outcome ^placement -- placement-copies )
+   {: x :}
+   MATCH REPLAY:copy-outcome
+      ready OF construct placement-copies placed ENDOF
+      blocked OF x PLACE-BLOCKED ENDOF
+      source-changed OF construct placement-copies changed ENDOF
+   ;MATCH ;
+
+: PLACE-COPIES ( ^placement -- placement-copies )
+   {: x :}
+   x PLANNING-OF PLANNING-RUN @ x PLACEMENT-PATH @ x PLACEMENT-CONFLICT @
+   PREPARE-CONFLICT MATCH option
+      none OF construct placement-copies unrooted ENDOF
+      some OF x COPIES-OF ENDOF
+   ;MATCH ;
+
+: RECORD-NEW ( ^placement -- )
+   {: x :}
+   x PLANNING-OF {: pl :}
+   pl JOURNAL-OF x PLACEMENT-PATH @ x PLACEMENT-CONFLICT @ pl ARENA-OF
+   JOURNAL:RECORD-CONFLICT drop
+   1 pl PLANNING-CONFLICT-COUNT +! ;
+
+: HOLD-NEW ( ^placement -- )
+   {: x :}
+   x PLANNING-OF {: pl :}
+   pl x PLACEMENT-KEY @ HELD+ 1 pl PLANNING-HELD-COPIES +! ;
+
+\ Held, and its block left for STALE-BLOCKS to keep.
+: WAIT-NEW ( ^placement -- )
+   {: x :}
+   x HOLD-NEW
+   x PLACEMENT-KEY @ x PLANNING-OF PLANNING-WAITING @ VEC:PUSH ! ;
+
+\ Held and waiting until an hour from now.
+: BLOCK-NEW ( ^placement -- )
+   {: x :}
+   x PLANNING-OF {: pl :}
+   pl PLANNING-NOW @ JOURNAL:BLOCK-RETRY-SECONDS + {: at:n :}
+   pl JOURNAL-OF x PLACEMENT-PATH @ x PLACEMENT-REASON @ at pl ARENA-OF
+   JOURNAL:BLOCK-NEW-CONFLICT
+   x WAIT-NEW ;
+
+: STALE-NEW ( ^placement -- )
+   construct pass-event fresh swap PLACEMENT-ANSWER ! ;
+
+: UNROOT-NEW ( ^placement -- )
+   construct pass-event root-changed swap PLACEMENT-ANSWER ! ;
+
+\ One new conflict's copies, after formal/ConflictPlacement.tla; once
+\ STALE-BLOCKS has run, a block is left exactly when the step waited.
+FSM:DEFINE CONFLICT-PLACEMENT ( ^placement ) placement-state placement-start
+   IN deciding  PLACE-START
+      recorded  -         >ended
+      early     WAIT-NEW  >ended
+      open      -         >preparing
+   IN preparing  PLACE-COPIES ( placement-copies )
+      placed    RECORD-NEW  >ended
+      taken     BLOCK-NEW   >ended
+      refused   HOLD-NEW    >ended
+      changed   STALE-NEW   >ended
+      unrooted  UNROOT-NEW  >ended
+   FINAL ended  -
+;DEFINE
+
+\ A recorded conflict's copies are the user's to edit, move or delete;
+\ one whose copies wait out a block is held, nothing staged or hashed.
 : NEW-CONFLICT
    ( ^planning MODEL:key MODEL:path MODEL:conflict -- pass-event )
    {: pl k path c :}
-   pl k c CONFLICT-RECORDED? if construct pass-event ok exit then
-   pl PLANNING-RUN @ path c PREPARE-CONFLICT MATCH option
-      none OF construct pass-event root-changed ENDOF
-      some OF pl k path c NEW-COPIES ENDOF
-   ;MATCH ;
+   pl ARENA-OF PLACEMENTS-NEW {: x :}
+   pl x PLACEMENT-PLANNING !  k x PLACEMENT-KEY !
+   path x PLACEMENT-PATH !  c x PLACEMENT-CONFLICT !
+   construct pass-event ok x PLACEMENT-ANSWER !
+   x construct placement-state deciding CONFLICT-PLACEMENT
+   x PLACEMENT-ANSWER @ ;
 
 \ A collision whose copy is blocked holds its path and its subtree.
 : NEW-COLLISION
@@ -3498,6 +3598,25 @@ ENUM live-step held superseded fresh root-changed ;ENUM
    loop
    construct pass-event ok ;
 
+\ Whether this pass left the key waiting.
+: WAITING? ( ^planning MODEL:key -- bool )
+   {: pl k :}
+   pl PLANNING-WAITING @ {: v :}
+   v VEC:COUNT 0 ?do
+      k v i VEC:AT @ MODEL:KEY= if true unloop exit then
+   loop
+   false ;
+
+\ A conflict block goes unless this pass left its path waiting; a path
+\ placed, refused, held otherwise or no longer conflicting loses it.
+: STALE-BLOCKS ( ^planning -- )
+   {: pl :}
+   pl JOURNAL-OF pl ARENA-OF JOURNAL:CONFLICT-BLOCK-KEYS {: v :}
+   v VEC:COUNT 0 ?do
+      v i VEC:AT @ {: k :}
+      pl k WAITING? 0= if pl JOURNAL-OF k JOURNAL:UNBLOCK-CONFLICT then
+   loop ;
+
 \ Rust's record_reconciliation and what reconcile_published takes from
 \ its answer; a path a live plan kept is held.
 : RECORD-PLANNING ( ^planning -- )
@@ -3509,7 +3628,8 @@ ENUM live-step held superseded fresh root-changed ;ENUM
    plans pl PLANNING-PLANNED !
    live VEC:COUNT 0 ?do
       pl live i VEC:AT @ pl ARENA-OF MODEL:FOLD HELD+
-   loop ;
+   loop
+   pl STALE-BLOCKS ;
 
 \ Rust's reconcile_published from its start to record_reconciliation:
 \ every known path decided and prepared, then the no-ops and plans

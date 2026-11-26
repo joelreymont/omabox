@@ -1,10 +1,10 @@
-\ journal.f - package JOURNAL: the sync journal, a SQLite file at schema 11
+\ journal.f - package JOURNAL: the sync journal, a SQLite file at schema 12
 \ (rust src/journal.rs at schema 8), and the Dropbox account and local root
 \ it is bound to. OPEN makes the file 0600 without following a link,
-\ creates schema 11 in a new one and migrates schema 8, 9 or 10 to it, each
-\ in one transaction, from migrations/, whose texts this file lays in the
-\ program as it loads; any version but 0 and 8 to 11 is refused unchanged,
-\ and OPEN-READ refuses any but 11. A SQLite failure is SQLITE's throw, passed
+\ creates schema 12 in a new one and migrates schema 8, 9, 10 or 11 to
+\ it, each in one transaction, from migrations/, whose texts this file
+\ lays in the program as it loads; any version but 0 and 8 to 12 is
+\ refused unchanged, and OPEN-READ refuses any but 12. A SQLite failure is SQLITE's throw, passed
 \ up unchanged. JOURNAL's own failures are logged once with the Rust
 \ version's text, then thrown as its codes. E-FILE, E-DISK-FULL and E-ROOT
 \ leave the host errno in FS:ERRNO, 0 where there is none; E-DISK-FULL is
@@ -13,15 +13,16 @@
 \ a subvolume a new device number at every mount, so the device is none
 \ of it. A binding with no birth time is one a version-6 journal recorded;
 \ an activation whose path and inode match it upgrades it in place.
-\ A baseline, a plan, a conflict and a local observation are keyed by
-\ the canonical path MODEL:FOLD gives the display path. A baseline, a
-\ remote and a local observation, a hash record and an upload session
-\ are stored in typed columns; every other stored value is written and
-\ read by MODEL's JSON words. A value MODEL cannot read, a version-nine
-\ baseline or remote observation refusing the migration included, is
-\ logged with the record's path and its cause and thrown as E-JSON; a
-\ version-nine local observation is kept as unknown, and a version-nine
-\ hash cache row that does not convert is dropped.
+\ A baseline, a plan, a conflict, a conflict block and a local
+\ observation are keyed by the canonical path MODEL:FOLD gives the
+\ display path. A baseline, a remote and a local observation, a hash
+\ record and an upload session are stored in typed columns; every other
+\ stored value is written and read by MODEL's JSON words. A value MODEL
+\ cannot read, a version-nine baseline or remote observation refusing
+\ the migration included, is logged with the record's path and its
+\ cause and thrown as E-JSON; a version-nine local observation is kept
+\ as unknown, and a version-nine hash cache row that does not convert is
+\ dropped.
 \ Each write to the file is one immediate transaction, and the remote
 \ cursor and inventory are read in one deferred one.
 \ A local scan merges the walk, in path byte order, with the stored local
@@ -130,7 +131,7 @@ ENUM local-root-activation
 
 private
 
-11 constant SCHEMA
+12 constant SCHEMA
 5000 constant BUSY-MS
 $180 constant MODE-OWNER            \ 0600
 $1FF constant MODE-BITS
@@ -222,6 +223,7 @@ s" migrations/0008.sql" create V8 LAY
 s" migrations/0009.sql" create V9 LAY
 s" migrations/0010.sql" create V10 LAY
 s" migrations/0011.sql" create V11 LAY
+s" migrations/0012.sql" create V12 LAY
 
 : TEXT ( ^n -- str )
    {: p:^n :}
@@ -470,14 +472,15 @@ private
    c MIGRATE-BLOCKED-PLANS
    c V7 RUN  c V8 RUN ;
 
-\ Schema v, 0, 8, 9 or 10, brought to SCHEMA by each migration it lacks;
-\ migration 11 adds the upload sessions and sets the version.
+\ Schema v, 0 or 8 to 11, brought to SCHEMA by each migration it lacks;
+\ 0011.sql and 0012.sql each set the version.
 : MIGRATE ( SQLITE:connection n -- )
    {: c v :}
    v 0= if c CREATE-SCHEMA then
    v 9 < if c MIGRATE-LOCAL-OBSERVATIONS then
    v 10 < if c MIGRATE-TYPED-COLUMNS then
-   c V11 RUN ;
+   v 11 < if c V11 RUN then
+   c V12 RUN ;
 
 : WRITABLE ( journal -- )
    {: j :}
@@ -486,7 +489,7 @@ private
    [: j >PATH MODE-OWNER FS:CHMOD-MODE ;]
    s" restrict journal permissions" j >PATH FILE-IO
    c VERSION {: v :}
-   v 0<> v 8 <> and v 9 <> and v 10 <> and v SCHEMA <> and if
+   v 0<> v 8 <> and v 9 <> and v 10 <> and v 11 <> and v SCHEMA <> and if
       j >PATH v UNSUPPORTED
    then
    j CONFIGURE-WRITABLE
@@ -575,15 +578,14 @@ private
 
 public
 
-\ The journal at path, schema 11 created in a new or empty file or
-\ migrated from 8, 9 or 10, and its completed work pruned; another version is
-\ refused, the file unchanged.
+\ The journal at path: schema 12 created in a new or empty file or migrated
+\ from 8 to 11, completed work pruned; any other version refused unchanged.
 : OPEN ( str -- journal )
    {: path:str :}
    path OWNER-ONLY
    path SQLITE:OPEN path JOURNAL-MAKE [: READY ;] SET-UP ;
 
-\ The schema-11 journal at path, never created or changed. Its log lines
+\ The schema-12 journal at path, never created or changed. Its log lines
 \ name it `[Omabox journal]`, as Rust's status redacts the path.
 : OPEN-READ ( str -- journal )
    {: path:str :}
@@ -1027,13 +1029,8 @@ private
 
 \ ---- activation ----------------------------------------------------
 
-\ A new root carries none of the old one's history: live plans, their
-\ recovery intents and upload sessions, completed plans with an
-\ operation that installs a Dropbox file, baselines, observations,
-\ hashes, conflicts and the watched folders, whose clean marks vouch
-\ for those observations, go. A completed plan's operations go first,
-\ so the plans delete takes the completed ones left without any; the
-\ verified stages they leave stay in the old root, as live plans' do.
+\ A new root carries none of the old one's history; the watched folders go
+\ too, as their clean marks vouch for the old observations.
 : RETIRE ( SQLITE:connection -- )
    s" DELETE FROM recovery_records
       WHERE status = 'pending' OR operation_id IN (
@@ -1076,6 +1073,7 @@ private
       DELETE FROM local_observations;
       DELETE FROM local_hash_cache;
       DELETE FROM conflicts;
+      DELETE FROM conflict_blocks;
       DELETE FROM temp.watches;
       DELETE FROM legacy_local_root_adoption WHERE singleton = 1;"
    SQLITE:EXEC ;
@@ -4448,6 +4446,127 @@ public
    {: j id :}
    j >CONNECTION {: c :}
    c [: c id RETIRE-SESSION ;] SQLITE:WITH-TRANSACTION ;
+
+
+\ ---- conflict blocks ------------------------------------------------
+
+public
+
+\ A new conflict's copies blocked: why, and retry-at, seconds since the
+\ epoch.
+STRUCTURE conflict-block
+   FIELD path MODEL:path
+   FIELD reason MODEL:blockage
+   FIELD retry-at n
+;STRUCTURE
+
+private
+
+: NO-BLOCK ( -- option<conflict-block> ) OPTION:NONE ;
+
+\ The block in columns 0 to 2: its path, reason and retry time.
+: BLOCK-COPY
+   ( SQLITE:statement ^ARENA:arena -- SQLITE:statement conflict-block )
+   {: ar :}
+   0 ar PATH-COPY {: path :}
+   1 SQLITE:COL-TEXT path ar DECODE-BLOCKAGE {: why :}
+   2 SQLITE:COL-INT {: at :}
+   at 0 < if
+      s" read conflict block" path
+      s" conflict block has a negative retry time" PATH-INVALID
+   then
+   path why at JOURNAL-CONFLICT--BLOCK:MAKE ;
+
+: BLOCK-ROW
+   ( SQLITE:statement ^ARENA:arena
+     -- option<conflict-block> SQLITE:statement )
+   {: ar :}
+   SQLITE:STEP 0= if NO-BLOCK swap exit then
+   ar BLOCK-COPY OPTION:SOME swap ;
+
+: BLOCK-ROWS
+   ( SQLITE:statement ^VEC:vector<conflict-block> ^ARENA:arena
+     -- SQLITE:statement )
+   {: v ar :}
+   begin SQLITE:STEP while ar BLOCK-COPY v VEC:PUSH ! repeat ;
+
+: BLOCK-KEYS
+   ( SQLITE:statement ^VEC:vector<MODEL:key> ^ARENA:arena
+     -- SQLITE:statement )
+   {: v ar :}
+   begin SQLITE:STEP while 0 ar KEY-COPY v VEC:PUSH ! repeat ;
+
+: BLOCKING-CONFLICT
+   ( SQLITE:connection MODEL:path MODEL:blockage n ^ARENA:arena
+     ^JSON:writer -- )
+   {: c path why at ar w :}
+   why w ENCODE-BLOCKAGE {: js:str :}
+   path ar MODEL:FOLD {: k :}
+   c s" INSERT INTO conflict_blocks(
+         canonical_path, path, blocked_json, retry_at
+      ) VALUES (?1, ?2, ?3, ?4)
+      ON CONFLICT(canonical_path) DO UPDATE SET path = ?2,
+         blocked_json = ?3, retry_at = ?4" [: k MODEL:KEY>STR 1 SQLITE:BIND-BLOB
+      path MODEL:PATH>STR 2 SQLITE:BIND-BLOB
+      js 3 SQLITE:BIND-TEXT
+      at 4 SQLITE:BIND-INT
+      SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT ;
+
+: UNBLOCKING-CONFLICT ( SQLITE:connection MODEL:key -- )
+   {: c k :}
+   c s" DELETE FROM conflict_blocks WHERE canonical_path = ?1" [: k MODEL:KEY>STR 1 SQLITE:BIND-BLOB SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT ;
+
+public
+
+\ Records the new conflict at path blocked for why until at, seconds
+\ since the epoch, replacing any block at its canonical path.
+: BLOCK-NEW-CONFLICT
+   ( journal MODEL:path MODEL:blockage n ^ARENA:arena -- )
+   {: j path why at ar :}
+   at 0 < if
+      s" block conflict" path
+      s" retry time exceeds the supported range" PATH-INVALID
+   then
+   j >CONNECTION {: c :}
+   c [: c path why at ar [: BLOCKING-CONFLICT ;] ENCODING ;]
+   SQLITE:WITH-TRANSACTION ;
+
+\ The conflict block at canonical path k, if any.
+: CONFLICT-BLOCK-AT
+   ( journal MODEL:key ^ARENA:arena -- option<conflict-block> )
+   {: j k ar :}
+   j >CONNECTION
+   s" SELECT path, blocked_json, retry_at FROM conflict_blocks
+      WHERE canonical_path = ?1" [: k MODEL:KEY>STR 1 SQLITE:BIND-BLOB ar BLOCK-ROW ;]
+   SQLITE:WITH-STATEMENT ;
+
+\ Every conflict block, by canonical path.
+: CONFLICT-BLOCKS ( journal ^ARENA:arena -- ^VEC:vector<conflict-block> )
+   {: j ar :}
+   ar [type] conflict-block NEW-VECTOR {: v :}
+   j >CONNECTION
+   s" SELECT path, blocked_json, retry_at FROM conflict_blocks
+      ORDER BY canonical_path" [: v ar BLOCK-ROWS ;]
+   SQLITE:WITH-STATEMENT
+   v ;
+
+\ The canonical path of every conflict block, in order.
+: CONFLICT-BLOCK-KEYS ( journal ^ARENA:arena -- ^VEC:vector<MODEL:key> )
+   {: j ar :}
+   ar [type] MODEL:key NEW-VECTOR {: v :}
+   j >CONNECTION
+   s" SELECT canonical_path FROM conflict_blocks
+      ORDER BY canonical_path" [: v ar BLOCK-KEYS ;]
+   SQLITE:WITH-STATEMENT
+   v ;
+
+\ Forgets the conflict block at canonical path k, if any.
+: UNBLOCK-CONFLICT ( journal MODEL:key -- )
+   {: j k :}
+   j >CONNECTION {: c :}
+   c [: c k UNBLOCKING-CONFLICT ;] SQLITE:WITH-TRANSACTION ;
 
 
 \ ---- recoveries: values ---------------------------------------------
