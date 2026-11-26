@@ -316,7 +316,7 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
    p ATTENTION:E-JOURNAL d ar REFUSED drop {: e:str :}
    e s" absolute-journal-path-sentinel" STR:CONTAINS? TFALSE
    e FIRST-LINE swap
-   s" journal: journal `[Omabox journal]` has unsupported schema version 0; supported version is 10"
+   s" journal: journal `[Omabox journal]` has unsupported schema version 0; supported version is 11"
    STR:ENDS-WITH? TTRUE
    FIRST-LINE swap
    s" attention: could not open the journal read-only" STR:ENDS-WITH? TTRUE
