@@ -2724,3 +2724,13 @@ Observations for the blog:
   1.95 MB that appear and vanish with the page cache. Counted that way the
   daemon holds 4.30 MB. The budget was set on anonymous pages, so only
   that figure compares.
+
+Sixteen passes overnight came between the hourly scans, each with nothing
+to do, and I could not explain them. The daemon logs every failed poll, and
+none had failed. An inotify watch of my own over the tree, beside the
+daemon's, then saw no local event before the next one, while the remote
+cursor in the journal moved. Dropbox had said "changed", and the listing
+it led to held nothing this machine needed. Telling a real change elsewhere
+from Dropbox's own churn takes a listing, so each such pass is the price of
+the long poll: 0.16 s of CPU, a few times an hour while the account is in
+use.
