@@ -193,7 +193,6 @@ STRUCTURE client OPAQUE DERIVE addr
    FIELD holds SPAN:span<u8>
    FIELD values ^VEC:vector<u8>
    FIELD writer JSON:writer
-   FIELD cursor JSON:cursor
    FIELD route SPAN:span<u8>
    FIELD quiet bool
    FIELD status n
@@ -570,61 +569,54 @@ HEAP:ALLOCATOR VEC-ALLOC !
 
 \ ---- reading answers
 
-: VALUE ( JSON:reader -- JSON:reader n ) JSON:READ-NEXT ;
-: SKIP ( JSON:reader -- JSON:reader ) JSON:READ-NEXT drop JSON:READ-SKIP-VALUE ;
+\ The string decoded into values. READ-ANSWER reserves values for the
+\ whole answer first, so a span taken here never moves.
+: STRING ( JSON:value ^client -- SPAN:span<u8> )
+   {: v c :}
+   v JSON:STRING? 0= if E-ANSWER throw then
+   c CLIENT-VALUES @ {: o:^ :}
+   o VEC:COUNT {: at:n :}
+   v o JSON:APPEND-STRING
+   o VEC:SPAN at SPAN:SKIP ;
 
 
-: OBJECT ( JSON:reader n -- JSON:reader )
-   JSON:T-OBJ <> if E-ANSWER throw then ;
+\ Whether a number is written as an integer: digits after an optional
+\ minus, no fraction or exponent.
+: WHOLE? ( JSON:value -- bool )
+   JSON:TEXT$ {: t :}
+   t s" -" STR:STARTS-WITH? 0= if t STR:DIGITS? exit then
+   t str> {: a:^ u:n :}
+   a 1 + u 1 - >str STR:DIGITS? ;
 
 
-\ The current string or key decoded into values. READ-ANSWER reserves values
-\ for the whole answer first, so a span taken here never moves.
-: DECODE ( JSON:reader ^client -- JSON:reader SPAN:span<u8> )
-   {: c :}
-   JSON:READ-TOKEN dup JSON:T-STR = swap JSON:T-KEY = or
-   0= if E-ANSWER throw then
-   c CLIENT-VALUES @ {: v:^ :}
-   v VEC:COUNT {: at:n :}
-   v JSON:READ-STR-APPEND
-   v VEC:SPAN at SPAN:SKIP ;
+: INT ( JSON:value -- n )
+   {: v :}
+   v WHOLE? 0= if E-ANSWER throw then
+   v JSON:>N ;
 
 
-: STRING ( JSON:reader ^client -- JSON:reader SPAN:span<u8> )
-   {: c :}
-   VALUE drop c DECODE ;
+: BOOLEAN ( JSON:value -- bool )
+   {: v :}
+   v JSON:BOOL? 0= if E-ANSWER throw then
+   v JSON:>BOOL ;
 
 
-: INT ( JSON:reader -- JSON:reader n )
-   VALUE JSON:T-INT <> if E-ANSWER throw then
-   JSON:READ-INT ;
-
-
-: BOOLEAN ( JSON:reader -- JSON:reader bool )
-   VALUE dup JSON:T-TRUE = if drop true exit then
-   JSON:T-FALSE <> if E-ANSWER throw then
-   false ;
-
-
-\ The members of the object just opened, each read by `member` at its key.
-: MEMBERS ( JSON:reader ^client [ JSON:reader ^client -- JSON:reader ] -- JSON:reader )
-   {: c member :}
-   begin JSON:READ-NEXT dup JSON:T-KEY = while
-      drop c member execute
-   repeat
-   JSON:T-OBJ-END <> if E-ANSWER throw then ;
+\ The members of the object, each read by `member` at its name in one
+\ pass.
+: MEMBERS ( JSON:value ^client [ JSON:value JSON:value ^client -- ] -- )
+   {: v c member :}
+   v JSON:OBJECT? 0= if E-ANSWER throw then
+   v [: c member execute ;] JSON:EACH-MEMBER ;
 
 
 \ Each answer's values get a block of their own, so the room a large answer
 \ took is freed with the next.
-: READ-ANSWER ( ^client [ JSON:reader ^client -- JSON:reader ] -- ^client )
+: READ-ANSWER ( ^client [ JSON:value JSON:value ^client -- ] -- ^client )
    {: c member :}
    VEC-ALLOC @ 0 [type] u8 VEC:NEW {: v:^ :}
    c CLIENT-VALUES @ VEC:DELETE  v c CLIENT-VALUES !
    v c ANSWER$ STR:len VEC:RESERVE
-   c CLIENT-CURSOR c ANSWER$ JSON:READ-INIT
-   VALUE OBJECT c member MEMBERS
-   JSON:READ-FINISH c ;
+   c ANSWER$ JSON:PARSE c member MEMBERS c ;
 
 
 \ Whether code says the answer does not parse: a JSON read code or
@@ -641,18 +633,17 @@ HEAP:ALLOCATOR VEC-ALLOC !
    code E-ANSWER = code E-UNUSABLE = or ;
 
 
-\ Whether the answer is one JSON object `member` reads; a failure leaves
-\ the cursor disposed, and any other code, such as a memory fault, goes on.
-: PARSES? ( ^client [ JSON:reader ^client -- JSON:reader ] -- bool )
+\ Whether the answer is one JSON object `member` reads; any other code,
+\ such as a memory fault, goes on.
+: PARSES? ( ^client [ JSON:value JSON:value ^client -- ] -- bool )
    {: c member :}
    c [: member READ-ANSWER ;] catch {: code:n :} drop
    code 0= if true exit then
-   c CLIENT-CURSOR JSON:READ-DISPOSE
    code UNPARSED? 0= if code throw then
    false ;
 
 
-: PARSE ( ^client [ JSON:reader ^client -- JSON:reader ] -- )
+: PARSE ( ^client [ JSON:value JSON:value ^client -- ] -- )
    {: c member :}
    c member PARSES? if exit then
    c s" an answer that does not parse" E-ANSWER FAILED ;
@@ -660,31 +651,27 @@ HEAP:ALLOCATOR VEC-ALLOC !
 
 \ ---- error bodies
 
-: LEAF-MEMBER ( JSON:reader ^client -- JSON:reader )
-   {: c :}
-   s" .tag" JSON:READ-STR-EQ? if c STRING c CLIENT-LEAF ! exit then
-   SKIP ;
+: LEAF-MEMBER ( JSON:value JSON:value ^client -- )
+   {: k v c :}
+   k s" .tag" JSON:STRING= if v c STRING c CLIENT-LEAF ! then ;
 
 
-: ERROR-MEMBER ( JSON:reader ^client -- JSON:reader )
-   {: c :}
-   s" .tag" JSON:READ-STR-EQ? if c STRING c CLIENT-OUTER ! exit then
-   s" retry_after" JSON:READ-STR-EQ? if INT c CLIENT-WAIT ! exit then
-   s" correct_offset" JSON:READ-STR-EQ? if INT c CLIENT-CORRECT ! exit then
-   c DECODE {: name:SPAN:span<u8> :}
-   VALUE JSON:T-OBJ = if
-      c [: LEAF-MEMBER ;] MEMBERS
-      name c CLIENT-LEAF-NAME ! exit
-   then
-   JSON:READ-SKIP-VALUE ;
+: ERROR-MEMBER ( JSON:value JSON:value ^client -- )
+   {: k v c :}
+   k s" .tag" JSON:STRING= if v c STRING c CLIENT-OUTER ! exit then
+   k s" retry_after" JSON:STRING= if v INT c CLIENT-WAIT ! exit then
+   k s" correct_offset" JSON:STRING= if v INT c CLIENT-CORRECT ! exit then
+   v JSON:OBJECT? 0= if exit then
+   v c [: LEAF-MEMBER ;] MEMBERS
+   k c STRING c CLIENT-LEAF-NAME ! ;
 
 
 \ `error` is a string in an OAuth answer and a union object in an API one.
-: ERROR-TOP ( JSON:reader ^client -- JSON:reader )
-   {: c :}
-   s" error" JSON:READ-STR-EQ? 0= if SKIP exit then
-   VALUE dup JSON:T-STR = if drop c DECODE c CLIENT-OUTER ! exit then
-   OBJECT c [: ERROR-MEMBER ;] MEMBERS ;
+: ERROR-TOP ( JSON:value JSON:value ^client -- )
+   {: k v c :}
+   k s" error" JSON:STRING= 0= if exit then
+   v JSON:STRING? if v c STRING c CLIENT-OUTER ! exit then
+   v c [: ERROR-MEMBER ;] MEMBERS ;
 
 
 : ERROR-READ? ( ^client -- bool )
@@ -862,17 +849,17 @@ HEAP:ALLOCATOR VEC-ALLOC !
    v BYTES$ ;
 
 
-: ISSUED-MEMBER ( JSON:reader ^client -- JSON:reader )
-   {: c :}
-   s" access_token" JSON:READ-STR-EQ? 0= if SKIP exit then
-   c STRING c CLIENT-ISSUED ! ;
+: ISSUED-MEMBER ( JSON:value JSON:value ^client -- )
+   {: k v c :}
+   k s" access_token" JSON:STRING= 0= if exit then
+   v c STRING c CLIENT-ISSUED ! ;
 
 
 \ A token answer's members: access_token and refresh_token.
-: GRANTED-MEMBER ( JSON:reader ^client -- JSON:reader )
-   {: c :}
-   s" refresh_token" JSON:READ-STR-EQ? 0= if c ISSUED-MEMBER exit then
-   c STRING c CLIENT-GRANTED ! ;
+: GRANTED-MEMBER ( JSON:value JSON:value ^client -- )
+   {: k v c :}
+   k s" refresh_token" JSON:STRING= 0= if k v c ISSUED-MEMBER exit then
+   v c STRING c CLIENT-GRANTED ! ;
 
 
 : REPLACED ( SPAN:span<u8> ^n -- )
@@ -1098,20 +1085,20 @@ private
 
 \ ---- the routes' answers
 
-: ROOT-MEMBER ( JSON:reader ^client -- JSON:reader )
-   {: c :}
-   s" .tag" JSON:READ-STR-EQ? if
-      c STRING c CLIENT-ROOT-TAG ! true c CLIENT-TAGGED ! exit
+: ROOT-MEMBER ( JSON:value JSON:value ^client -- )
+   {: k v c :}
+   k s" .tag" JSON:STRING= if
+      v c STRING c CLIENT-ROOT-TAG ! true c CLIENT-TAGGED ! exit
    then
-   s" root_namespace_id" JSON:READ-STR-EQ? 0= if SKIP exit then
-   c STRING c CLIENT-NAMESPACE ! ;
+   k s" root_namespace_id" JSON:STRING= 0= if exit then
+   v c STRING c CLIENT-NAMESPACE ! ;
 
 
-: ACCOUNT-MEMBER ( JSON:reader ^client -- JSON:reader )
-   {: c :}
-   s" account_id" JSON:READ-STR-EQ? if c STRING c CLIENT-ACCOUNT ! exit then
-   s" root_info" JSON:READ-STR-EQ? 0= if SKIP exit then
-   VALUE OBJECT c [: ROOT-MEMBER ;] MEMBERS ;
+: ACCOUNT-MEMBER ( JSON:value JSON:value ^client -- )
+   {: k v c :}
+   k s" account_id" JSON:STRING= if v c STRING c CLIENT-ACCOUNT ! exit then
+   k s" root_info" JSON:STRING= 0= if exit then
+   v c [: ROOT-MEMBER ;] MEMBERS ;
 
 
 \ Whether root_info's tag is user or team, the roots that carry a namespace.
@@ -1134,11 +1121,11 @@ private
    if c s" no root_namespace_id" E-ANSWER FAILED then ;
 
 
-: KIND-OF ( JSON:reader -- JSON:reader kind )
-   VALUE JSON:T-STR <> if E-ANSWER throw then
-   s" file" JSON:READ-STR-EQ? if construct kind file exit then
-   s" folder" JSON:READ-STR-EQ? if construct kind folder exit then
-   s" deleted" JSON:READ-STR-EQ? if construct kind deleted exit then
+: KIND-OF ( JSON:value -- kind )
+   {: v :}
+   v s" file" JSON:STRING= if construct kind file exit then
+   v s" folder" JSON:STRING= if construct kind folder exit then
+   v s" deleted" JSON:STRING= if construct kind deleted exit then
    E-ANSWER throw ;
 
 
@@ -1210,52 +1197,51 @@ private
 
 \ is_downloadable into the entry; a symlink_info read before it keeps
 \ it false.
-: DOWNLOADABLE ( JSON:reader ^entry -- JSON:reader )
-   {: e :}
-   BOOLEAN e DROPBOX-ENTRY:DOWNLOADABLE @ and
+: DOWNLOADABLE ( JSON:value ^entry -- )
+   {: v e :}
+   v BOOLEAN e DROPBOX-ENTRY:DOWNLOADABLE @ and
    e DROPBOX-ENTRY:DOWNLOADABLE ! ;
 
 
-\ Whether the key is FolderSharingInfo's no_access or traverse_only.
-: BARRED? ( JSON:reader -- JSON:reader bool )
-   s" no_access" JSON:READ-STR-EQ? if true exit then
-   s" traverse_only" JSON:READ-STR-EQ? ;
+\ Whether the name is FolderSharingInfo's no_access or traverse_only.
+: BARRED? ( JSON:value -- bool )
+   {: k :}
+   k s" no_access" JSON:STRING= if true exit then
+   k s" traverse_only" JSON:STRING= ;
 
 
 \ Either member true marks the entry; any other is skipped.
-: SHARING-MEMBER ( JSON:reader ^client -- JSON:reader )
-   {: c :}
-   BARRED? 0= if SKIP exit then
+: SHARING-MEMBER ( JSON:value JSON:value ^client -- )
+   {: k v c :}
+   k BARRED? 0= if exit then
    c CLIENT-ENTRY {: e :}
-   BOOLEAN e DROPBOX-ENTRY:RESTRICTED @ or e DROPBOX-ENTRY:RESTRICTED ! ;
+   v BOOLEAN e DROPBOX-ENTRY:RESTRICTED @ or e DROPBOX-ENTRY:RESTRICTED ! ;
 
 
-: SHARING ( JSON:reader ^client -- JSON:reader )
-   {: c :}
-   VALUE OBJECT c [: SHARING-MEMBER ;] MEMBERS ;
+: SHARING ( JSON:value ^client -- )
+   [: SHARING-MEMBER ;] MEMBERS ;
 
 
 \ The members both shapes hold.
-: FIELD-MEMBER ( JSON:reader ^client -- JSON:reader )
-   {: c :}
+: FIELD-MEMBER ( JSON:value JSON:value ^client -- )
+   {: k v c :}
    c CLIENT-ENTRY {: e :}
-   s" path_lower" JSON:READ-STR-EQ? if c STRING e DROPBOX-ENTRY:LOWER ! exit then
-   s" path_display" JSON:READ-STR-EQ? if c STRING e DROPBOX-ENTRY:DISPLAY ! exit then
-   s" rev" JSON:READ-STR-EQ? if c STRING e DROPBOX-ENTRY:REV ! exit then
-   s" content_hash" JSON:READ-STR-EQ? if c STRING e DROPBOX-ENTRY:CONTENT-HASH ! exit then
-   s" size" JSON:READ-STR-EQ? if INT e DROPBOX-ENTRY:SIZE ! exit then
-   s" is_downloadable" JSON:READ-STR-EQ? if e DOWNLOADABLE exit then
-   s" symlink_info" JSON:READ-STR-EQ? if SKIP false e DROPBOX-ENTRY:DOWNLOADABLE ! exit then
-   s" sharing_info" JSON:READ-STR-EQ? if c SHARING exit then
-   SKIP ;
+   k s" path_lower" JSON:STRING= if v c STRING e DROPBOX-ENTRY:LOWER ! exit then
+   k s" path_display" JSON:STRING= if v c STRING e DROPBOX-ENTRY:DISPLAY ! exit then
+   k s" rev" JSON:STRING= if v c STRING e DROPBOX-ENTRY:REV ! exit then
+   k s" content_hash" JSON:STRING= if v c STRING e DROPBOX-ENTRY:CONTENT-HASH ! exit then
+   k s" size" JSON:STRING= if v INT e DROPBOX-ENTRY:SIZE ! exit then
+   k s" is_downloadable" JSON:STRING= if v e DOWNLOADABLE exit then
+   k s" symlink_info" JSON:STRING= if false e DROPBOX-ENTRY:DOWNLOADABLE ! exit then
+   k s" sharing_info" JSON:STRING= if v c SHARING then ;
 
 
-: TAGGED-MEMBER ( JSON:reader ^client -- JSON:reader )
-   {: c :}
-   s" .tag" JSON:READ-STR-EQ? if
-      KIND-OF c CLIENT-ENTRY DROPBOX-ENTRY:KIND ! true c CLIENT-TAGGED ! exit
+: TAGGED-MEMBER ( JSON:value JSON:value ^client -- )
+   {: k v c :}
+   k s" .tag" JSON:STRING= if
+      v KIND-OF c CLIENT-ENTRY DROPBOX-ENTRY:KIND ! true c CLIENT-TAGGED ! exit
    then
-   c FIELD-MEMBER ;
+   k v c FIELD-MEMBER ;
 
 
 \ restricted kept for a folder alone, once its members are read: a
@@ -1274,26 +1260,26 @@ private
    false c CLIENT-TAGGED ! ;
 
 
-\ A plain record of kind k, its object just opened, read into the entry.
-: PLAIN-OBJECT ( JSON:reader ^client kind -- JSON:reader )
-   {: c k:kind :}
+\ A plain record of kind k, an object, read into the entry.
+: PLAIN-OBJECT ( JSON:value ^client kind -- )
+   {: v c k:kind :}
    c k ENTRY-OPEN
-   c [: FIELD-MEMBER ;] MEMBERS c ENTRY-CLOSE ;
+   v c [: FIELD-MEMBER ;] MEMBERS c ENTRY-CLOSE ;
 
 
-\ A Metadata union, its object just opened, read into the entry: one with
-\ no `.tag` has no kind, and is never taken for a deleted entry.
-: TAGGED-OBJECT ( JSON:reader ^client -- JSON:reader )
-   {: c :}
+\ A Metadata union, an object, read into the entry: one with no `.tag`
+\ has no kind, and is never taken for a deleted entry.
+: TAGGED-OBJECT ( JSON:value ^client -- )
+   {: v c :}
    c construct kind deleted ENTRY-OPEN
-   c [: TAGGED-MEMBER ;] MEMBERS c ENTRY-CLOSE
+   v c [: TAGGED-MEMBER ;] MEMBERS c ENTRY-CLOSE
    c CLIENT-TAGGED @ 0= if E-ANSWER throw then ;
 
 
 \ The answer's entry, as `member` finds it with the entry open at kind k,
 \ with both its paths. An entry left at deleted with no `.tag` read, as a
 \ union with none or an answer with no entry is, fails.
-: ENTRY-FOUND ( ^client kind [ JSON:reader ^client -- JSON:reader ] -- )
+: ENTRY-FOUND ( ^client kind [ JSON:value JSON:value ^client -- ] -- )
    {: c k:kind member :}
    c k ENTRY-OPEN
    c member PARSE c ENTRY-CLOSE
@@ -1305,7 +1291,7 @@ private
 
 \ As ENTRY-FOUND for a mutation's answer, a file or folder: fails a deleted
 \ entry, and a downloadable file without its rev or hash.
-: ENTRY-PARSE ( ^client kind [ JSON:reader ^client -- JSON:reader ] -- )
+: ENTRY-PARSE ( ^client kind [ JSON:value JSON:value ^client -- ] -- )
    {: c k:kind member :}
    c k member ENTRY-FOUND
    c CLIENT-ENTRY {: e :}
@@ -1929,7 +1915,6 @@ public
    {: c :}
    c REST
    c CLIENT-NOTIFY-CONN HTTPC:CLOSE
-   c CLIENT-CURSOR JSON:READ-DISPOSE
    c UNBUFFERED ;
 
 
@@ -1998,37 +1983,41 @@ private
    c CLIENT-GOT @ bit or c CLIENT-GOT ! ;
 
 
-\ Each object of the array that opens next, read by `entry` once opened.
-: ENTRIES ( JSON:reader ^client [ JSON:reader ^client -- JSON:reader ] -- JSON:reader )
-   {: c entry :}
-   VALUE JSON:T-ARR <> if E-ANSWER throw then
-   begin VALUE dup JSON:T-OBJ = while
-      drop c entry execute
-   repeat
-   JSON:T-ARR-END <> if E-ANSWER throw then ;
+\ An element of the entries, read by `entry`; it is an object.
+: ELEMENT ( JSON:value ^client [ JSON:value ^client -- ] -- )
+   {: v c entry :}
+   v JSON:OBJECT? 0= if E-ANSWER throw then
+   v c entry execute ;
+
+
+\ Each element of the array, an object, read by `entry`.
+: ENTRIES ( JSON:value ^client [ JSON:value ^client -- ] -- )
+   {: v c entry :}
+   v JSON:ARRAY? 0= if E-ANSWER throw then
+   v [: c entry ELEMENT ;] JSON:EACH ;
 
 
 \ A listing's entry needs both its paths; a file Dropbox described
 \ incompletely is handed as it is.
-: LISTED ( JSON:reader ^client -- JSON:reader )
-   {: c :}
-   c TAGGED-OBJECT
+: LISTED ( JSON:value ^client -- )
+   {: v c :}
+   v c TAGGED-OBJECT
    c CLIENT-ENTRY PATHS? 0= if
       c s" Dropbox listing contained an invalid or out-of-root path"
       E-UNUSABLE FAILED
    then ;
 
 
-: PAGE-MEMBER ( JSON:reader ^client -- JSON:reader )
-   {: c :}
-   s" entries" JSON:READ-STR-EQ? if
-      c [: LISTED ;] ENTRIES c GOT-ENTRIES GOT exit
+: PAGE-MEMBER ( JSON:value JSON:value ^client -- )
+   {: k v c :}
+   k s" entries" JSON:STRING= if
+      v c [: LISTED ;] ENTRIES c GOT-ENTRIES GOT exit
    then
-   s" cursor" JSON:READ-STR-EQ? if
-      c STRING c CLIENT-PAGE ! c GOT-CURSOR GOT exit
+   k s" cursor" JSON:STRING= if
+      v c STRING c CLIENT-PAGE ! c GOT-CURSOR GOT exit
    then
-   s" has_more" JSON:READ-STR-EQ? 0= if SKIP exit then
-   BOOLEAN c CLIENT-MORE ! c GOT-MORE GOT ;
+   k s" has_more" JSON:STRING= 0= if exit then
+   v BOOLEAN c CLIENT-MORE ! c GOT-MORE GOT ;
 
 
 \ Reads a page and checks it has entries, cursor and has_more.
@@ -2055,16 +2044,16 @@ private
    c STALE? if c s" a cursor that did not advance" E-UNUSABLE FAILED then ;
 
 
-: HANDED ( JSON:reader ^client [ ^entry -- ] -- JSON:reader )
-   {: c each :}
-   c TAGGED-OBJECT
+: HANDED ( JSON:value ^client [ ^entry -- ] -- )
+   {: v c each :}
+   v c TAGGED-OBJECT
    c CLIENT-ENTRY each execute ;
 
 
-: HAND-MEMBER ( JSON:reader ^client [ ^entry -- ] -- JSON:reader )
-   {: c each :}
-   s" entries" JSON:READ-STR-EQ? 0= if SKIP exit then
-   c [: each HANDED ;] ENTRIES ;
+: HAND-MEMBER ( JSON:value JSON:value ^client [ ^entry -- ] -- )
+   {: k v c each :}
+   k s" entries" JSON:STRING= 0= if exit then
+   v c [: each HANDED ;] ENTRIES ;
 
 
 \ A done page: checked whole, its cursor kept in sent, then read again to
@@ -2153,13 +2142,13 @@ private
    c CONTINUE construct probe empty true ;
 
 
-: POLL-MEMBER ( JSON:reader ^client -- JSON:reader )
-   {: c :}
-   s" changes" JSON:READ-STR-EQ? if
-      BOOLEAN c CLIENT-CHANGES ! c GOT-CHANGES GOT exit
+: POLL-MEMBER ( JSON:value JSON:value ^client -- )
+   {: k v c :}
+   k s" changes" JSON:STRING= if
+      v BOOLEAN c CLIENT-CHANGES ! c GOT-CHANGES GOT exit
    then
-   s" backoff" JSON:READ-STR-EQ? 0= if SKIP exit then
-   INT c CLIENT-BACKOFF ! ;
+   k s" backoff" JSON:STRING= 0= if exit then
+   v INT c CLIENT-BACKOFF ! ;
 
 
 : POLL-READ ( ^client -- )
@@ -2278,16 +2267,16 @@ private
 \ delete_v2 and create_folder_v2 answer the entry as `metadata`: delete_v2
 \ a Metadata union, create_folder_v2 a plain FolderMetadata. The entry
 \ opens at deleted, so an answer with no `metadata` fails.
-: DELETED-MEMBER ( JSON:reader ^client -- JSON:reader )
-   {: c :}
-   s" metadata" JSON:READ-STR-EQ? 0= if SKIP exit then
-   VALUE OBJECT c TAGGED-OBJECT ;
+: DELETED-MEMBER ( JSON:value JSON:value ^client -- )
+   {: k v c :}
+   k s" metadata" JSON:STRING= 0= if exit then
+   v c TAGGED-OBJECT ;
 
 
-: MADE-MEMBER ( JSON:reader ^client -- JSON:reader )
-   {: c :}
-   s" metadata" JSON:READ-STR-EQ? 0= if SKIP exit then
-   VALUE OBJECT c construct kind folder PLAIN-OBJECT ;
+: MADE-MEMBER ( JSON:value JSON:value ^client -- )
+   {: k v c :}
+   k s" metadata" JSON:STRING= 0= if exit then
+   v c construct kind folder PLAIN-OBJECT ;
 
 
 \ Each reads the answer's entry and answers whether it is at the path;
@@ -2975,10 +2964,10 @@ HEAP RUNS run
    c TAG$ s" lookup_failed" STR:= c LEAF$ GONE-TAG? and ;
 
 
-: SESSION-MEMBER ( JSON:reader ^client ^run -- JSON:reader )
-   {: c r :}
-   s" session_id" JSON:READ-STR-EQ? 0= if SKIP exit then
-   c STRING SPAN:$ str> {: a:^ u:n :}
+: SESSION-MEMBER ( JSON:value JSON:value ^client ^run -- )
+   {: k v c r :}
+   k s" session_id" JSON:STRING= 0= if exit then
+   v c STRING SPAN:$ str> {: a:^ u:n :}
    u 0= u ID-CAP > or if E-ANSWER throw then
    a r RUN-ID CELLS64>BYTES u BYTE-COPY
    u r RUN-ID-U ! ;

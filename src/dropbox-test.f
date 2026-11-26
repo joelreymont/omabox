@@ -113,13 +113,19 @@ TYPED-VARIABLE PROBE config
    PROBE ar OPEN ;
 
 
+\ A member whose read faults on memory.
+: FAULTING ( JSON:value JSON:value ^client -- )
+   {: k v c :}
+   EXIT-STATUS:MEMORY-FAULT throw ;
+
+
 \ A reader's memory fault reaches PARSE's caller as itself.
 : FAULT-CASE ( -- )
    s" a reader's own code" T-LABEL
    ARENA:NEW {: ar :}
    s" " ar PROBED {: c :}
    s\" {\"a\":1}" str> BUF:N>BLEN c CLIENT-ANSWER @ BUF:REPLACE
-   [: c [: drop EXIT-STATUS:MEMORY-FAULT throw ;] PARSE ;]
+   [: c [: FAULTING ;] PARSE ;]
    EXIT-STATUS:MEMORY-FAULT TTHROWSQ
    c CLOSE
    ar ARENA:RELEASE ;
