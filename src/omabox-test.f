@@ -57,10 +57,11 @@
 \   bound through the recording store, systemctl Rust's script for
 \   the test under TMPDIR, and the log captured in a file there
 \ - bind_stores_the_token_and_binds_an_unbound_journal,
-\   bind_stores_the_token_for_a_journal_bound_to_the_login and
-\   bind_refuses_a_journal_bound_elsewhere, Omabox's own: Rust's
-\   fixture's journal, with a recording store bound in place of the
-\   keyring
+\   bind_stores_the_token_for_a_journal_bound_to_the_login,
+\   bind_refuses_a_journal_bound_elsewhere and
+\   bind_writes_the_token_to_a_new_credential_file, Omabox's own:
+\   Rust's fixture's journal, with a recording store bound in place of
+\   the keyring, the credential file under TMPDIR
 \ - exchanged_passes_a_token_dropbox_issues,
 \   exchanged_refuses_a_token_dropbox_does_not_issue,
 \   linked_refuses_an_unavailable_account,
@@ -83,7 +84,10 @@
 \ set_root_interrupted_during_recovery_finishes_it and
 \ set_root_revives_a_failed_service, Omabox's own: that program's
 \ set-root over Rust's fixture, its systemctl a script on PATH whose
-\ stop, start or reset-failed sends the signal to the CLI, or none
+\ stop, start or reset-failed sends the signal to the CLI, or none, and
+\ setup_refuses_a_taken_credential_file_before_the_login, Omabox's own:
+\ that program's setup of an existing file and of a dangling link under
+\ TMPDIR, HOME, the XDG homes and an empty PATH directory there
 \ - formal_holds_the_release_window_tables: RELEASING and CLOSING
 \   against formal/ReleaseWindow.tla through TEST-FORMAL:HOLDS, which
 \   runs TLC
@@ -198,7 +202,7 @@ TYPED-VARIABLE SHOWN str
       logs OF s" logs" SB-APPEND ENDOF
       set-root OF s" set-root " SB-APPEND SB-APPEND ENDOF
       setup OF
-         SETUP-OPTIONS-UNMAKE drop s" setup " SB-APPEND SB-APPEND
+         SETUP-OPTIONS-UNMAKE drop drop s" setup " SB-APPEND SB-APPEND
       ENDOF
    ;MATCH SB$ ;
 
@@ -210,7 +214,7 @@ TYPED-VARIABLE SHOWN str
 
 \ Options no setup form parses to, for a command other than setup.
 : NOT-SETUP ( -- setup-options )
-   s" not setup" NO-INITIAL SETUP-OPTIONS-MAKE ;
+   s" not setup" NO-INITIAL NO-STR SETUP-OPTIONS-MAKE ;
 
 \ The setup options PARSE answers for the arguments.
 : SETUP-PARSED ( -- setup-options )
@@ -252,16 +256,19 @@ TYPED-VARIABLE SHOWN str
 
 \ Rust's derived PartialEq of SetupOptions.
 : OPTIONS= ( setup-options setup-options -- bool )
-   SETUP-OPTIONS-UNMAKE {: br bi :}
-   SETUP-OPTIONS-UNMAKE {: ar ai :}
-   ar br STR:= ai bi INITIALS= and ;
+   SETUP-OPTIONS-UNMAKE {: br bi bc :}
+   SETUP-OPTIONS-UNMAKE {: ar ai ac :}
+   ar br STR:= ai bi INITIALS= and ac bc STRS= and ;
 
 : SETUP-ACCEPTS ( setup-options -- ) SETUP-PARSED OPTIONS= TTRUE ;
 
-\ The remote root and initial config.
+\ The remote root, initial config and credential file.
+: FILE-OPTIONS ( str option<initial-config> option<str> -- setup-options )
+   SETUP-OPTIONS-MAKE ;
+
+\ The remote root and initial config, for the Secret Service.
 : OPTIONS ( str option<initial-config> -- setup-options )
-   {: r:str i :}
-   r i SETUP-OPTIONS-MAKE ;
+   NO-STR FILE-OPTIONS ;
 
 \ The sync root and app key of a setup driven by flags.
 : FLAGS ( option<str> str -- option<initial-config> )
@@ -287,6 +294,16 @@ TYPED-VARIABLE SHOWN str
    SETUP-ACCEPTS
    s" setup" s" --app-key" TWO s" key" ARG+
    s" " NO-STR s" key" FLAGS OPTIONS SETUP-ACCEPTS
+   s" setup" s" --app-key" TWO s" key" ARG+
+   s" --credential-file" ARG+ s" /tmp/credential" ARG+
+   s" " NO-STR s" key" FLAGS s" /tmp/credential" SOME-STR FILE-OPTIONS
+   SETUP-ACCEPTS
+   s" setup" s" --credential-file" TWO s" /tmp/credential" ARG+
+   s" " NO-INITIAL s" /tmp/credential" SOME-STR FILE-OPTIONS SETUP-ACCEPTS
+   s" setup" s" --remote-root" TWO s" /Work" ARG+
+   s" --credential-file" ARG+ s" /tmp/credential" ARG+
+   s" /Work" NO-INITIAL s" /tmp/credential" SOME-STR FILE-OPTIONS
+   SETUP-ACCEPTS
    s" service" s" restart" TWO
    SERVICE-ACTION:RESTART SERVICE-COMMAND ACCEPTS
    s" logs" ONE construct command logs ACCEPTS
@@ -340,6 +357,13 @@ TYPED-VARIABLE SHOWN str
    s" service" s" unknown" TWO s" unknown service action" p ar REJECTS
    s" setup" s" --sync-root" TWO s" /tmp/Dropbox" ARG+
    s" flag-driven setup requires --app-key" p ar REJECTS
+   s" setup" s" --credential-file" TWO s" /tmp/credential" ARG+
+   s" --sync-root" ARG+ s" /tmp/Dropbox" ARG+
+   s" flag-driven setup requires --app-key" p ar REJECTS
+   s" setup" s" --remote-root" TWO s" /Work" ARG+
+   s" flag-driven setup requires --app-key" p ar REJECTS
+   s" setup" s" --credential-file" TWO s" " ARG+
+   s" the credential file must not be empty" p ar REJECTS
    s" setup" s" --sync-root" TWO s" /tmp/Dropbox" ARG+
    s" --app-key" ARG+ s" key" ARG+
    s" --app-secret" ARG+ s" secret" ARG+
@@ -360,6 +384,10 @@ TYPED-VARIABLE SHOWN str
    s" setup" s" --app-key" TWO
    s" a setup option is missing its value" p ar REJECTS
    s" setup" s" --app-key" TWO s" key" ARG+ s" --app-key" ARG+
+   s" a setup option was provided more than once" p ar REJECTS
+   s" setup" s" --app-key" TWO s" key" ARG+
+   s" --credential-file" ARG+ s" /tmp/a" ARG+
+   s" --credential-file" ARG+ s" /tmp/b" ARG+
    s" a setup option was provided more than once" p ar REJECTS
    s" setup" s" -h" TWO ROOT-FAULT$ p ar REJECTS
    s" setup" s" Work" TWO ROOT-FAULT$ p ar REJECTS
@@ -1524,13 +1552,15 @@ variable REC-WRITES
 
 ' REC-READ ' REC-WRITE ' REC-ERASE SECRET:STORE!
 
-\ A login for /Sync of the account, holding the token bind-refresh.
+\ A login for /Sync of the account, holding the token bind-refresh,
+\ for the Secret Service.
 : LOGIN ( str ^ARENA:arena -- ^authorized )
    {: ac:str ar :}
    ar LOGINS-NEW {: a :}
    ac s" namespace" s" /Sync"
    JOURNAL-DROPBOX--BINDING:MAKE a AUTHORIZED-BINDING !
    s" bind-refresh" a AUTHORIZED-REFRESH-TOKEN !
+   NO-STR a AUTHORIZED-CREDENTIAL-FILE !
    a ;
 
 \ Setup's change of c, writing no config, released from s: the account's
@@ -1749,6 +1779,24 @@ variable REC-WRITES
    c other ar BOUND-TO? TTRUE
    d FS:REMOVE-TREE ;
 
+\ The record LOGIN's binding and token make.
+: LOGIN-RECORD ( -- str )
+   s\" {\"version\":1,\"refresh_token\":\"bind-refresh\",\"account_id\":\"account\",\"root_namespace_id\":\"namespace\",\"remote_root\":\"/Sync\"}" ;
+
+: BIND-WRITES-THE-TOKEN-TO-A-NEW-CREDENTIAL-FILE ( ^ARENA:arena -- )
+   {: ar :}
+   s" bind_writes_the_token_to_a_new_credential_file" T-LABEL
+   ar LOADED-FIXTURE {: d c p :}
+   d s" credential" ar INSIDE {: f :}
+   s" account" ar LOGIN {: a :}
+   f OPTION:SOME a AUTHORIZED-CREDENTIAL-FILE !
+   c a p ar BIND-RUN {: code:n e:str :}
+   code 0 T=
+   REC-WRITES @ 0 T=
+   f FILE-TEXT LOGIN-RECORD T$=
+   c a AUTHORIZED-BINDING @ ar BOUND-TO? TTRUE
+   d FS:REMOVE-TREE ;
+
 \ The code and log of xt, captured in a file under TMPDIR.
 : LOGGED ( [ -- ] ^ARENA:arena -- n str )
    {: xt ar :}
@@ -1852,12 +1900,14 @@ variable REC-WRITES
          ar LINKED-REFUSES-AN-ACCOUNT-OF-ANOTHER-ROOT-TAG ;]
       [: TEST-DROPBOX:STOP ;] finally ;] DROPBOX:WITH-LOOP ;
 
-\ BIND's three arms, then the login's steps against the fake.
+\ BIND's three arms, its credential file, setup's refusal of a taken
+\ one, then the login's steps against the fake.
 : LOGIN-CASES ( ^ARENA:arena -- )
    {: ar :}
    ar BIND-STORES-THE-TOKEN-AND-BINDS-AN-UNBOUND-JOURNAL
    ar BIND-STORES-THE-TOKEN-FOR-A-JOURNAL-BOUND-TO-THE-LOGIN
    ar BIND-REFUSES-A-JOURNAL-BOUND-ELSEWHERE
+   ar BIND-WRITES-THE-TOKEN-TO-A-NEW-CREDENTIAL-FILE
    ar SERVED ;
 
 
@@ -2072,6 +2122,59 @@ variable REC-WRITES
    x ar STORED-ROOT second T$=
    d FS:REMOVE-TREE ;
 
+\ The built program's setup of the stored config for the credential
+\ file f, HOME, the XDG homes and an empty PATH directory in d: stdout's
+\ and stderr's lengths in OUT and ERR, and its exit code, -1 for one
+\ that did not exit.
+: BUILT-SETUP ( str str str ^ARENA:arena -- len len n )
+   {: bin f d ar :}
+   PROC-ARGV-ENV-RESET
+   bin PROC-ARGV+ s" setup" PROC-ARGV+ s" --credential-file" PROC-ARGV+
+   f PROC-ARGV+
+   d s" bin" ar INSIDE {: b :}
+   b FS:MAKE-DIRS
+   s" PATH" b PROC-ENV+
+   s" HOME" d PROC-ENV+
+   s" XDG_CONFIG_HOME" d s" config" ar INSIDE PROC-ENV+
+   s" XDG_STATE_HOME" d s" state" ar INSIDE PROC-ENV+
+   s" /usr/bin/env" OUT CAP >LEN ERR CAP >LEN
+   RUN-MS >MS RUN-ARGV-ENV-CAPTURE-OUTCOME
+   MATCH PROCESS:ending
+      exited OF ENDOF
+      signaled OF drop -1 ENDOF
+      timeout OF -1 ENDOF
+   ;MATCH ;
+
+\ The built program's setup for the credential file f, refused with
+\ FILE-CHECKED's line and FILE-FAILED's two before any login.
+: FILE-REFUSED ( str str str ^ARENA:arena -- )
+   {: bin f d ar :}
+   bin f d ar BUILT-SETUP {: outu:len erru:len got:n :}
+   ERR erru LEN>N >str {: e :}
+   e LINES 3 T=
+   e s" cannot create the credential file " STR:CONTAINS? TTRUE
+   e f STR:CONTAINS? TTRUE
+   e FS:EEXIST FS:ERRNO$ STR:CONTAINS? TTRUE
+   e s" could not write the credential file" LOGGED? TTRUE
+   e s" help: Name a new file in a writable folder, then retry setup."
+   LOGGED? TTRUE
+   outu LEN>N 0 T=
+   got 1 T= ;
+
+: SETUP-REFUSES-A-TAKEN-CREDENTIAL-FILE-BEFORE-THE-LOGIN
+   ( str ^ARENA:arena -- )
+   {: bin ar :}
+   s" setup_refuses_a_taken_credential_file_before_the_login" T-LABEL
+   ar TEMPORARY {: d :}
+   d s" existing" ar INSIDE {: f :}
+   f s" kept" FS:WRITE-ALL
+   bin f d ar FILE-REFUSED
+   f FILE-TEXT s" kept" T$=
+   d s" dangling" ar INSIDE {: l :}
+   d s" nowhere" ar INSIDE l FS:MAKE-SYMLINK
+   bin l d ar FILE-REFUSED
+   d FS:REMOVE-TREE ;
+
 : RUN-BUILT ( str ^ARENA:arena -- )
    {: bin ar :}
    bin VERSION-PRINTED
@@ -2082,7 +2185,8 @@ variable REC-WRITES
    bin ar SET-ROOT-KILLED-WITH-A-FAILED-RESTART-KEEPS-THE-CHANGE
    bin ar SET-ROOT-INTERRUPTED-WITHOUT-RESTART-TELLS-THE-CHANGE-FAILED
    bin ar SET-ROOT-INTERRUPTED-DURING-RECOVERY-FINISHES-IT
-   bin ar SET-ROOT-REVIVES-A-FAILED-SERVICE ;
+   bin ar SET-ROOT-REVIVES-A-FAILED-SERVICE
+   bin ar SETUP-REFUSES-A-TAKEN-CREDENTIAL-FILE-BEFORE-THE-LOGIN ;
 
 : PROGRAM ( ^ARENA:arena -- )
    {: ar :}

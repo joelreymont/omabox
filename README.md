@@ -45,6 +45,29 @@ configuration or SQLite journal. The package installs `omabox` and `omaboxd` in
 `/usr/share/omabox/omarchy/plugins/local.omabox`, and two pacman hooks with
 their script.
 
+Headless hosts: where the login keyring stays locked, Secret Service can
+neither store nor give back the credential. Run setup with
+`--credential-file PATH`, which writes the credential to `PATH`, a new
+owner-only file, instead. Seal `PATH` for the user service with the
+credential ID `dropbox-credentials-v1`:
+`systemd-creds encrypt --user --name=dropbox-credentials-v1 PATH SEALED`,
+delete `PATH`, and pass the sealed file to the unit with a drop-in
+(`systemctl --user edit omabox.service`):
+
+```ini
+[Service]
+LoadCredentialEncrypted=dropbox-credentials-v1:SEALED
+```
+
+`LoadCredential=` passes a file's bytes unchanged, so it takes only the
+plain file, as in `LoadCredential=dropbox-credentials-v1:/path/to/plain-file`;
+a sealed file goes only with `LoadCredentialEncrypted=`.
+`omaboxd` then reads the credential from `$CREDENTIALS_DIRECTORY` and never
+asks Secret Service. To log in again, run
+`omabox setup --credential-file PATH [--remote-root ROOT]`, which keeps the
+stored configuration and writes the new credential to `PATH`, a new file;
+seal it and replace the unit's credential the same way.
+
 Enable the widget if wanted:
 
 ```bash

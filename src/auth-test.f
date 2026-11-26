@@ -17,9 +17,18 @@
 \ cannot write as UTF-8; a record of 8191 bytes read back, one of 8192
 \ bytes or more, written or read; and version 2. Each refusal's log
 \ line is captured in TMPDIR, checked to be one line with its text and
-\ not the word sentinel, and removed. A login's URL for RFC 7636's
-\ example verifier, written out by dropbox-sdk 0.20.3's rules, and two
-\ STARTs' verifiers.
+\ not the word sentinel, and removed. The credential file and the
+\ directory store BIND-FOR binds, which BIND calls with
+\ CREDENTIALS_DIRECTORY's value, as the test cannot set it: a record
+\ WRITE-FILE writes to a new owner-only file that LOAD reads back
+\ from the file dropbox-credentials-v1 of the bound directory; a
+\ WRITE-FILE onto an existing file, refused and logged, leaving its
+\ bytes; a directory without the file loaded as unavailable; a file of
+\ 8192 bytes or more refused; unset or empty, the store that runs a
+\ program; and a path where no directory is, logged, binding a store
+\ whose LOAD answers unavailable and whose STORE throws SECRET:E-ACCESS.
+\ A login's URL for RFC 7636's example verifier, written out by
+\ dropbox-sdk 0.20.3's rules, and two STARTs' verifiers.
 \ Run from the repository root: hb --load src/auth-test.f </dev/null
 require src/lib/arena.f
 require src/lib/span.f
@@ -257,7 +266,7 @@ FILL-FILLER
    s\" {\"version\":1,\"refresh_token\":\"utf8-sentinel\xFF\",\"account_id\":\"account\",\"root_namespace_id\":\"namespace\",\"remote_root\":\"\"}"
    HOLD
    [: LOADS ;] E-UTF8
-   s" Secret Service returned an invalid Omabox Dropbox credential encoding"
+   s" the credential store returned an invalid Omabox Dropbox credential encoding"
    LOGGED ;
 
 : SECRET-TOOL-DATA-ERROR-DIAGNOSTICS-DO-NOT-ECHO-OUTPUT ( -- )
@@ -329,7 +338,7 @@ FILL-FILLER
    s\" {\"version\":2,\"refresh_token\":\"version-sentinel\",\"account_id\":\"account\",\"root_namespace_id\":\"namespace\",\"remote_root\":\"/Root\"}"
    HOLD
    [: LOADS ;] E-VERSION
-   s" Secret Service returned unsupported Omabox credential version 2"
+   s" the credential store returned unsupported Omabox credential version 2"
    LOGGED ;
 
 \ A store's exit 3, and its exit 1 before reading a value no pipe holds,
@@ -354,6 +363,113 @@ FILL-FILLER
    [: s" unavailable-sentinel" STORE-TOKEN ;] SECRET:E-UNAVAILABLE TTHROWSQ
    0 WRITE-CODE !
    WRITES @ 0 T= ;
+
+
+\ ---- the credential file and the directory store --------------------
+
+: ITEM$ ( -- str ) s" dropbox-credentials-v1" ;
+
+TYPED-VARIABLE TARGET str    \ the path a LOGGED action takes
+
+\ DIR/name, a new directory.
+: SUBDIR ( str -- str ) UNDER {: d:str :} d FS:MAKE-DIR d ;
+
+\ DIR/name/dropbox-credentials-v1, in AR.
+: ITEM-IN ( str -- str )
+   str> {: n:^ nu:n :}
+   ITEM$ str> {: i:^ iu:n :}
+   nu 1+ iu + {: u:n :}
+   AR @ u ARENA:ALLOC drop {: p:^ :}
+   n p nu BYTE-COPY
+   [char] / p nu + c!
+   i p nu 1+ + iu BYTE-COPY
+   p u >str UNDER ;
+
+\ The binding BINDING makes and the token.
+: CHECK-STORED ( JOURNAL:dropbox-binding str -- )
+   {: b token:str :}
+   b JOURNAL-DROPBOX--BINDING:UNMAKE {: a:str n:str r:str :}
+   s" account-id" a T$=
+   s" namespace-id" n T$=
+   s" /Root" r T$=
+   s" file-token" token T$= ;
+
+: STORED-FOUND ( lookup -- )
+   MATCH lookup
+      found OF CHECK-STORED ENDOF
+      unavailable OF false TTRUE ENDOF
+   ;MATCH ;
+
+: WRITE-FILE-WRITES-WHAT-THE-DIRECTORY-STORE-LOADS ( ^ARENA:arena -- )
+   {: ar :}
+   s" write_file_writes_what_the_directory_store_loads" T-LABEL
+   s" creds" SUBDIR {: d:str :}
+   s" creds" ITEM-IN {: p:str :}
+   BINDING s" file-token" p WRITE-FILE
+   \ The umask applies: no group or other bits, the owner's read and write.
+   p FS:STAT-MODE {: m:n :}
+   m $3F and 0 T=
+   m $180 and $180 T=
+   d BIND-FOR
+   ar LOAD STORED-FOUND
+   RECORDING ;
+
+: WRITE-FILE-REFUSES-AN-EXISTING-FILE ( -- )
+   s" write_file_refuses_an_existing_file" T-LABEL
+   s" existing" UNDER TARGET !
+   s" existing" s" existing-bytes" HOLDS
+   [: BINDING s" overwrite-sentinel" TARGET @ WRITE-FILE ;] SECRET:E-ACCESS
+   s" credential operation `store Dropbox credential` failed on" LOGGED
+   s" existing" TAKEN s" existing-bytes" T$= ;
+
+: A-DIRECTORY-WITHOUT-THE-FILE-LOADS-UNAVAILABLE ( ^ARENA:arena -- )
+   {: ar :}
+   s" a_directory_without_the_file_loads_unavailable" T-LABEL
+   s" no-creds" SUBDIR BIND-FOR
+   ar LOAD UNAVAILABLE TTRUE
+   RECORDING ;
+
+: A-CREDENTIAL-FILE-OF-8192-BYTES-OR-MORE-IS-TOO-LARGE ( -- )
+   s" a_credential_file_of_8192_bytes_or_more_is_too_large" T-LABEL
+   s" large-creds" SUBDIR BIND-FOR
+   s" large-creds" ITEM-IN {: p:str :}
+   p FILLER CAP >str FS:WRITE-ALL
+   [: LOADS ;] E-TOO-LARGE s" exceeds the supported size" LOGGED
+   p FILLER CAP 1+ >str FS:WRITE-ALL
+   [: LOADS ;] E-TOO-LARGE s" exceeds the supported size" LOGGED
+   RECORDING ;
+
+\ A directory binds the directory store; unset or empty, BIND-FOR binds
+\ the store that runs PROGRAM.
+: CREDENTIALS-DIRECTORY-CHOOSES-THE-DIRECTORY-STORE ( ^ARENA:arena -- )
+   {: ar :}
+   s" credentials_directory_chooses_the_directory_store" T-LABEL
+   s" env-creds" SUBDIR {: d:str :}
+   BINDING s" file-token" s" env-creds" ITEM-IN WRITE-FILE
+   s" env-fake.out"
+   s\" {\"version\":1,\"refresh_token\":\"lookup-token\",\"account_id\":\"account\",\"root_namespace_id\":\"namespace\",\"remote_root\":\"/Root\"}"
+   HOLDS
+   s" env-fake.status" s" 0" HOLDS
+   s" env-fake" UNDER {: f:str :}
+   f LOOKUP-FAKE FS:WRITE-ALL f FS:CHMOD-X f PROGRAM !
+   d BIND-FOR
+   ar LOAD STORED-FOUND
+   NULL-PTR 0 >str BIND-FOR
+   ar LOAD FOUND
+   d BIND-FOR
+   ar LOAD STORED-FOUND
+   s" " BIND-FOR
+   ar LOAD FOUND
+   RECORDING ;
+
+: NO-DIRECTORY-BINDS-A-REFUSING-STORE ( ^ARENA:arena -- )
+   {: ar :}
+   s" no_directory_binds_a_refusing_store" T-LABEL
+   s" no-such-dir" UNDER TARGET !
+   [: TARGET @ BIND-FOR ;] 0 s" no directory is there" LOGGED
+   ar LOAD UNAVAILABLE TTRUE
+   [: s" refused-sentinel" STORE-TOKEN ;] SECRET:E-ACCESS TTHROWSQ
+   RECORDING ;
 
 
 \ RFC 7636 appendix B's verifier and its challenge. The key holds a
@@ -402,6 +518,12 @@ FILL-FILLER
    SECRET-TOOL-OUTPUT-OF-8192-BYTES-OR-MORE-IS-TOO-LARGE
    STORED-CREDENTIAL-VERSION-2-IS-UNSUPPORTED
    STORE-FAILURE-NAMES-THE-CREDENTIAL-OPERATION
+   ar WRITE-FILE-WRITES-WHAT-THE-DIRECTORY-STORE-LOADS
+   WRITE-FILE-REFUSES-AN-EXISTING-FILE
+   ar A-DIRECTORY-WITHOUT-THE-FILE-LOADS-UNAVAILABLE
+   A-CREDENTIAL-FILE-OF-8192-BYTES-OR-MORE-IS-TOO-LARGE
+   ar CREDENTIALS-DIRECTORY-CHOOSES-THE-DIRECTORY-STORE
+   ar NO-DIRECTORY-BINDS-A-REFUSING-STORE
    ar PKCE-AUTHORIZATION-USES-OFFLINE-CODE-FLOW
    ar START-DRAWS-A-FRESH-VERIFIER ;
 

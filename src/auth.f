@@ -1,6 +1,9 @@
 \ auth.f - package AUTH: the Dropbox credential in the Secret Service
 \ (rust src/auth.rs RefreshTokenStore), through SECRET, read and written
-\ by running `secret-tool`, as Rust's is. The item is the one whose
+\ by running `secret-tool`, as Rust's is, or, under systemd with
+\ credentials passed, read from SECRET:DIR-BIND's store over their
+\ directory, the item the file dropbox-credentials-v1. WRITE-FILE writes
+\ such a file for setup. The Secret Service's item is the one whose
 \ attributes application and kind hold org.omarchy.omabox and
 \ dropbox-credentials-v1, so either version reads what the other stored.
 \ Its value is serde_json's compact record of the version, 1, the
@@ -10,16 +13,19 @@
 \ refuses records serde reads and no writer makes: one written as an
 \ array, one whose skipped member holds a lone surrogate escape or a
 \ repeated member name, and one that repeats a skipped member's name.
-\ AUTH's failures, its store's included, are logged once with the Rust
-\ version's text, then thrown as its codes. No log line holds a string
+\ AUTH's failures, the Secret Service store's included, are logged once
+\ with the Rust version's text, then thrown as its codes; the directory
+\ store's read faults are logged by SECRET, and its refusal to store is
+\ thrown unlogged, for the caller to report. No log line holds a string
 \ of the record, only an unsupported version's number.
 \ START begins a browser login (rust OAuthClient::begin): a PKCE verifier
 \ of 32 random bytes, and the URL dropbox-sdk 0.20.3's AuthorizeUrlBuilder
 \ builds for it, byte for byte.
-\ STORAGE CLASS. PROCESS-WIDE: PROGRAM, written before BIND and only read
-\ by a call. CALLER-OWNED: the strings LOAD answers, the record it read,
-\ and START's login, lie in the arena the caller passes; a lookup's
-\ output, in its own arena.
+\ STORAGE CLASS. PROCESS-WIDE: PROGRAM, written before BIND and only
+\ read by a call; the store BIND binds, and its directory, SECRET keeps.
+\ CALLER-OWNED: the strings LOAD answers, the record it read, and
+\ START's login, lie in the arena the caller passes; a lookup's output,
+\ and WRITE-FILE's record, in their own arenas.
 HB-TARGET-LINUX? HB-TARGET-LINUX-X86-64? or ?TARGET
 require src/lib/error.f
 require src/lib/string.f
@@ -29,6 +35,7 @@ require src/lib/log.f
 require src/lib/utf8-scalar.f
 require src/lib/vector.f
 require src/lib/secret.f
+require src/lib/secret/dir.f
 require src/lib/process.f
 require src/lib/entropy.f
 require src/lib/base64.f
@@ -37,6 +44,9 @@ require src/lib/json/write.f
 require src/lib/json/value.f
 require src/lib/json/read.f
 require src/lib/spawn.f
+require src/lib/fs.f
+require src/lib/fs-mutate.f
+require src/lib/fd.f
 require src/journal.f
 
 package AUTH
@@ -45,14 +55,15 @@ public
 -100600 constant E-FIRST
 -100699 constant E-LAST
 -100600
-   s" Secret Service returned an invalid Omabox Dropbox credential record"
+   s" the credential store returned an invalid Omabox Dropbox credential record"
    ERROR:CODE E-JSON
 -100601
-   s" Secret Service returned an invalid Omabox Dropbox credential encoding"
+   s" the credential store returned an invalid Omabox Dropbox credential encoding"
    ERROR:CODE E-UTF8
 -100602 s" Omabox Dropbox credential record exceeds the supported size"
    ERROR:CODE E-TOO-LARGE
--100603 s" Secret Service returned unsupported Omabox credential version"
+-100603
+   s" the credential store returned unsupported Omabox credential version"
    ERROR:CODE E-VERSION
 -100604 s" could not generate a secure OAuth proof" ERROR:CODE E-RANDOM
 
@@ -354,6 +365,78 @@ SECRET-TOOL
 \ AUTH never erases: an operation this store cannot do.
 : ITEM-ERASE ( str str -- bool ) drop drop SECRET:E-CONFIG throw ;
 
+public
+
+\ Binds the Secret Service store for the whole process, before any
+\ other AUTH word: the CLI's, as the CLI never reads the credential.
+: BIND-SECRET-TOOL ( -- )
+   [: ITEM-READ ;] [: ITEM-WRITE ;] [: ITEM-ERASE ;] SECRET:STORE! ;
+
+private
+
+
+\ ---- the credential file: setup's write ------------------------------
+
+\ The record in one new owner-only file, which systemd then passes to
+\ the daemon as a credential. Its failures are logged once with the
+\ path and their cause, as E-ACCESS.
+
+\ The cause of an FS failure: its errno's text, else the code's.
+: FILE-CAUSE$ ( n n -- str )
+   {: code:n cause:n :}
+   cause 0<> if cause FS:ERRNO$ exit then
+   code ERROR:TEXT$ ;
+
+: FILE-FAULT? ( n -- bool )
+   {: code:n :}
+   code E-FS-OPEN = code E-FS-IO = or code E-FS-PATH = or ;
+
+\ An FS failure of the write to the file at the path, logged with the
+\ note after its cause, is E-ACCESS; any other code passes up unlogged.
+: FILE-CAUGHT ( n n str str -- )
+   {: code:n cause:n p:str note:str :}
+   code FILE-FAULT? 0= if code throw then
+   LOG-OPEN s" credential operation `" LOG:TEXT+ STORING LOG:TEXT+
+   s" ` failed on " LOG:TEXT+ p LOG:TEXT+ s" : " LOG:TEXT+
+   code cause FILE-CAUSE$ LOG:TEXT+ note LOG:TEXT+ LOG:;LINE
+   SECRET:E-ACCESS throw ;
+
+\ The note for a removal's code: none if the partial file went.
+: REMOVAL$ ( n -- str )
+   0= if NO-STR exit then
+   s" ; the partial file remains" ;
+
+\ A new owner-only file at the path; a failure goes to FILE-CAUGHT.
+: CREATED ( str -- fd )
+   {: p:str :}
+   0 FS:CAUSE!
+   -1 >FD
+   [: drop p FS:MODE-PRIVATE-FILE FS:CREATE-NEW ;] catch {: code:n :}
+   code 0<> if code FS:ERRNO p NO-STR FILE-CAUGHT then ;
+
+\ The value written to the open file, which is closed whatever
+\ happens; a failure leaves its cause in FS:ERRNO.
+: FILLED ( fd str -- )
+   {: f:fd v:str :}
+   0 FS:CAUSE!
+   [: f v FD:WRITE-FULL ;] catch {: code:n :}
+   FS:ERRNO {: cause:n :}
+   f FD>N close
+   cause FS:CAUSE!
+   code 0<> if code throw then ;
+
+\ The record, made first, in a new file at the path; a failure once the
+\ file exists removes it, or its log line says the partial file remains.
+: FILE-RECORD ( JOURNAL:dropbox-binding str str ^ARENA:arena -- )
+   {: b token:str p:str ar :}
+   b token ar RECORD {: r:str :}
+   p CREATED {: f:fd :}
+   [: f r FILLED ;] catch {: code:n :}
+   code 0= if exit then
+   FS:ERRNO {: cause:n :}
+   [: p FS:REMOVE-FILE ;] catch {: kept:n :}
+   code cause p kept REMOVAL$ FILE-CAUGHT ;
+
 
 \ ---- the login -----------------------------------------------------
 
@@ -436,16 +519,44 @@ ARENA PENDINGS pending
    b bu >str v vu SPAN:MAKE BASE64:ENCODE-URL {: n:n :}
    v n >str ;
 
+\ The store a rejected directory binds: a read is unavailable, so LOAD
+\ answers unavailable, and a write or an erase is refused.
+: REFUSED-READ ( str str ^VEC:vector<u8> -- bool )
+   drop drop drop SECRET:E-UNAVAILABLE throw ;
+
+: REFUSED-WRITE ( str str str -- ) drop drop drop SECRET:E-ACCESS throw ;
+
+: REFUSED-ERASE ( str str -- bool ) drop drop SECRET:E-ACCESS throw ;
+
+: BIND-REFUSING ( -- )
+   [: REFUSED-READ ;] [: REFUSED-WRITE ;] [: REFUSED-ERASE ;] SECRET:STORE! ;
+
+\ BIND for the directory's path: its store; unset or empty, the Secret
+\ Service; a directory SECRET rejects (logged), the refusing store.
+: BIND-FOR ( str -- )
+   {: dir:str :}
+   dir STR:DATA NULL-PTR = dir STR:LEN 0= or if
+      BIND-SECRET-TOOL exit
+   then
+   [: dir SERVICE SECRET:DIR-BIND ;] catch {: code:n :}
+   code 0= if exit then
+   code SECRET:E-CONFIG <> if code throw then
+   BIND-REFUSING ;
+
 public
 
-\ Binds the credential store, one `secret-tool` run per call, for the
-\ whole process: a program's entry calls it once, before any AUTH word.
-: BIND ( -- )
-   [: ITEM-READ ;] [: ITEM-WRITE ;] [: ITEM-ERASE ;] SECRET:STORE! ;
+\ Binds the credential store for the whole process from
+\ CREDENTIALS_DIRECTORY, once, at the daemon's entry before any AUTH word.
+: BIND ( -- ) s" CREDENTIALS_DIRECTORY" GETENV BIND-FOR ;
 
 \ Stores the binding and the refresh token, replacing the item's value.
 : STORE ( JOURNAL:dropbox-binding str -- )
    [: WRITE-RECORD ;] ARENA:WITH ;
+
+\ Writes the binding and the refresh token to a new owner-only file at
+\ the path, whatever store is bound; an FS failure is SECRET:E-ACCESS.
+: WRITE-FILE ( JOURNAL:dropbox-binding str str -- )
+   [: FILE-RECORD ;] ARENA:WITH ;
 
 \ The binding and the refresh token, copied into the arena.
 : LOAD ( ^ARENA:arena -- lookup )

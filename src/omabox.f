@@ -111,30 +111,54 @@ private
 \ Appends the line and its LF.
 : LINE+ ( str -- ) SB-APPEND 10 SB-APPEND-C ;
 
-\ Rust's HELP, with the usage lines of the commands PARSE knows.
-: HELP-TEXT ( -- str )
-   SB-RESET
-   s" Omabox synchronizes a local directory with Dropbox." LINE+
-   s" " LINE+
-   s" Usage:" LINE+
-   s"   omabox setup [REMOTE_ROOT]" LINE+
-   s"   omabox setup --app-key KEY [--sync-root PATH]" SB-APPEND
-   s"  [--remote-root ROOT]" LINE+
-   s"   omabox status" LINE+
-   s"   omabox pause|resume" LINE+
-   s"   omabox settings [--json]" LINE+
-   s"   omabox settings set-root PATH" LINE+
-   s"   omabox service start|stop|restart|enable|disable|status" LINE+
-   s"   omabox logs" LINE+
-   s"   omabox --help" LINE+
-   s"   omabox --version" LINE+
-   s" " LINE+
+\ Appends the text to the vector.
+: PUT ( ^VEC:vector<u8> str -- ^VEC:vector<u8> ) over VEC:APPEND ;
+
+\ Appends the line and its LF to the vector.
+: PUT-LINE ( ^VEC:vector<u8> str -- ^VEC:vector<u8> )
+   PUT 10 over VEC:PUSH c! ;
+
+\ Rust's HELP, with the usage lines of the commands PARSE knows, in the
+\ arena.
+: HELP-TEXT ( ^ARENA:arena -- str )
+   {: ar :}
+   ar ARENA:ALLOCATOR 0 [type] u8 VEC:NEW
+   s" Omabox synchronizes a local directory with Dropbox." PUT-LINE
+   s" " PUT-LINE
+   s" Usage:" PUT-LINE
+   s"   omabox setup [REMOTE_ROOT]" PUT-LINE
+   s"   omabox setup --app-key KEY [--sync-root PATH]" PUT
+   s"  [--remote-root ROOT] [--credential-file PATH]" PUT-LINE
+   s"   omabox setup --credential-file PATH [--remote-root ROOT]" PUT-LINE
+   s"   omabox status" PUT-LINE
+   s"   omabox pause|resume" PUT-LINE
+   s"   omabox settings [--json]" PUT-LINE
+   s"   omabox settings set-root PATH" PUT-LINE
+   s"   omabox service start|stop|restart|enable|disable|status" PUT-LINE
+   s"   omabox logs" PUT-LINE
+   s"   omabox --help" PUT-LINE
+   s"   omabox --version" PUT-LINE
+   s" " PUT-LINE
    s" Setup with --app-key syncs ~/Dropbox, creating it if missing,"
-   SB-APPEND s"  unless --sync-root" LINE+
+   PUT s"  unless --sync-root" PUT-LINE
    s" names another existing directory. The Dropbox app key is"
-   SB-APPEND s"  public. Omabox never" LINE+
-   s" requests or stores an app secret." LINE+
-   SB$ ;
+   PUT s"  public. Omabox never" PUT-LINE
+   s" requests or stores an app secret." PUT-LINE
+   s" With --credential-file, setup writes the credential to PATH, a"
+   PUT s"  new" PUT-LINE
+   s" owner-only file, instead of Secret Service. Seal it for the user"
+   PUT s"  service:" PUT-LINE
+   s"   systemd-creds encrypt --user --name=dropbox-credentials-v1"
+   PUT s"  PATH SEALED" PUT-LINE
+   s" and pass the sealed file to the unit:" PUT-LINE
+   s"   LoadCredentialEncrypted=dropbox-credentials-v1:SEALED" PUT-LINE
+   s" LoadCredential= passes a file unchanged, so it takes only the"
+   PUT s"  plain file:" PUT-LINE
+   s"   LoadCredential=dropbox-credentials-v1:/path/to/plain-file" PUT-LINE
+   s" Without --app-key, setup logs in again for the stored"
+   PUT s"  configuration" PUT-LINE
+   s" and writes the new credential to PATH." PUT-LINE
+   VEC:SPAN SPAN:$ ;
 
 : VERSION-LINE ( -- str )
    SB-RESET s" omabox " SB-APPEND RELEASE:VERSION$ LINE+ SB$ ;
@@ -149,11 +173,12 @@ STRUCTURE initial-config
    FIELD app-key str
 ;STRUCTURE
 
-\ Rust's SetupOptions: the remote root, empty for the account's own, and
-\ the initial config of a setup driven by flags.
+\ Rust's SetupOptions: an empty remote root is the account's own, no
+\ initial config the stored one, no credential file Secret Service.
 STRUCTURE setup-options
    FIELD remote-root str
    FIELD initial option<initial-config>
+   FIELD credential-file option<str>
 ;STRUCTURE
 
 \ Rust's Command, the forms this program parses. It derives no eq: a
@@ -170,10 +195,12 @@ ENUM command
 ;ENUM
 
 \ Rust's Authorized: a Dropbox login checked against the account and
-\ root, not yet stored.
+\ root, not yet stored, and the file setup stores it in, none for the
+\ Secret Service.
 STRUCTURE authorized DERIVE addr
    FIELD binding JOURNAL:dropbox-binding
    FIELD refresh-token str
+   FIELD credential-file option<str>
 ;STRUCTURE
 
 \ Rust's AUTHORIZATION_CODE_LIMIT, in bytes.
@@ -557,55 +584,81 @@ ARENA JOURNALS JOURNAL:journal
    ;MATCH ;
 
 \ The option at index at and its value taken into the sync root, app
-\ key and remote root given so far.
-: STEP ( option<str> option<str> option<str> n [ n -- str ] n
-     -- option<str> option<str> option<str> )
-   {: sync key remote argc:n arg at:n :}
+\ key, remote root and credential file given so far.
+: STEP
+   ( option<str> option<str> option<str> option<str> n [ n -- str ] n
+     -- option<str> option<str> option<str> option<str> )
+   {: sync key remote file argc:n arg at:n :}
    at arg execute {: o:str :}
    o UTF8:VALID? 0= if s" setup options must be valid UTF-8" USAGE then
    o s" --sync-root" STR:= if
-      sync UNSET argc arg at VALUE OPTION:SOME key remote exit
+      sync UNSET argc arg at VALUE OPTION:SOME key remote file exit
    then
    o s" --app-key" STR:= if
       key UNSET sync argc arg at VALUE
       s" the Dropbox app key must be valid UTF-8" VALID-ARG OPTION:SOME
-      remote exit
+      remote file exit
    then
    o s" --remote-root" STR:= if
-      remote UNSET sync key argc arg at VALUE REMOTE-ROOT OPTION:SOME exit
+      remote UNSET sync key argc arg at VALUE REMOTE-ROOT OPTION:SOME
+      file exit
+   then
+   o s" --credential-file" STR:= if
+      file UNSET sync key remote argc arg at VALUE
+      s" the credential file must be valid UTF-8" VALID-ARG {: f:str :}
+      f STR:LEN 0= if s" the credential file must not be empty" USAGE then
+      f OPTION:SOME exit
    then
    s" unknown setup option" USAGE ;
 
-\ The sync root, app key and remote root the options from index 1 give.
-: SETUP-FLAGS ( n [ n -- str ] -- option<str> option<str> option<str> )
+\ The sync root, app key, remote root and credential file the options
+\ from index 1 give.
+: SETUP-FLAGS ( n [ n -- str ]
+     -- option<str> option<str> option<str> option<str> )
    {: argc:n arg :}
-   NO-STR NO-STR NO-STR
+   NO-STR NO-STR NO-STR NO-STR
    argc 1 ?do argc arg i STEP 2 +loop ;
-
-: FLAGGED ( option<str> option<str> option<str> -- setup-options )
-   {: sync key remote :}
-   key MATCH option
-      some OF ENDOF
-      none OF s" flag-driven setup requires --app-key" USAGE ENDOF
-   ;MATCH {: k :}
-   remote MATCH option
-      some OF ENDOF
-      none OF s" " ENDOF
-   ;MATCH
-   sync k INITIAL-CONFIG-MAKE OPTION:SOME SETUP-OPTIONS-MAKE ;
 
 : NO-INITIAL ( -- option<initial-config> ) OPTION:NONE ;
 
-\ Setup of the stored configuration, for the remote root.
-: STORED-SETUP ( str -- setup-options ) NO-INITIAL SETUP-OPTIONS-MAKE ;
+\ Refuses flags given without --app-key unless they name a credential
+\ file and no sync root.
+: KEYLESS-CHECKED ( option<str> option<str> -- )
+   {: sync file :}
+   sync MATCH option some OF drop true ENDOF none OF false ENDOF ;MATCH
+   file MATCH option some OF drop false ENDOF none OF true ENDOF ;MATCH
+   or if s" flag-driven setup requires --app-key" USAGE then ;
+
+\ Setup of the stored configuration, for the remote root, writing the
+\ credential to the file, none for the Secret Service.
+: STORED-SETUP ( str option<str> -- setup-options )
+   {: r:str file :}
+   r NO-INITIAL file SETUP-OPTIONS-MAKE ;
+
+\ The setup the flags give: with --app-key, a new config; without, the
+\ stored config, for flags that name a credential file.
+: FLAGGED
+   ( option<str> option<str> option<str> option<str> -- setup-options )
+   {: sync key remote file :}
+   remote MATCH option
+      some OF ENDOF
+      none OF s" " ENDOF
+   ;MATCH {: r:str :}
+   key MATCH option
+      some OF
+         {: k:str :}
+         r sync k INITIAL-CONFIG-MAKE OPTION:SOME file SETUP-OPTIONS-MAKE
+      ENDOF
+      none OF sync file KEYLESS-CHECKED r file STORED-SETUP ENDOF
+   ;MATCH ;
 
 \ Rust's parse_setup over the whole argument list, index 0 being setup.
 : PARSE-SETUP ( n [ n -- str ] -- setup-options )
    {: argc:n arg :}
-   argc 1 = if s" " STORED-SETUP exit then
+   argc 1 = if s" " NO-STR STORED-SETUP exit then
    argc 2 = if
       1 arg execute OPTION-ARG? 0= if
-         1 arg execute REMOTE-ROOT STORED-SETUP exit
+         1 arg execute REMOTE-ROOT NO-STR STORED-SETUP exit
       then
    then
    argc arg SETUP-FLAGS FLAGGED ;
@@ -1119,13 +1172,16 @@ ARENA JOURNALS JOURNAL:journal
       r cl a ar KEEP-LOGIN ;] [: cl DROPBOX:CLOSE ;] finally ;
 
 \ Rust's authorize: a browser login whose code, read from stdin, is
-\ exchanged and checked against the remote root r.
-: AUTHORIZE ( ^CONFIG:config str ^ARENA:arena -- ^authorized )
-   {: c r ar :}
+\ exchanged and checked against the remote root r, to be stored in the
+\ credential file f, none for the Secret Service.
+: AUTHORIZE ( ^CONFIG:config str option<str> ^ARENA:arena
+     -- ^authorized )
+   {: c r f ar :}
    c CONFIG:APP-KEY ar STARTED {: p :}
    p ar PROMPT
    FD:STDIN ar READ-CODE {: ac :}
    ar LOGINS-NEW {: a :}
+   f a AUTHORIZED-CREDENTIAL-FILE !
    [: c ac p r a ar LINK-LOGIN ;] DROPBOX:WITH-LOOP
    a ;
 
@@ -1173,13 +1229,40 @@ ARENA PRIORS prior
    code s" bind the journal to Dropbox" JOURNAL-FAILED ;
 
 \ AUTH:STORE of the binding and refresh token in a.
-: TOKEN-STORED ( ^authorized -- )
+: KEYRING-STORED ( ^authorized -- )
    {: a :}
    [: a AUTHORIZED-BINDING @ a AUTHORIZED-REFRESH-TOKEN @ AUTH:STORE ;]
    catch {: code:n :}
    code 0= if exit then
    code AUTH-CODE? 0= if code throw then
    s" store the Dropbox refresh token" AUTH-FAILED ;
+
+\ The credential file cannot be written: after a line naming it and why.
+: FILE-FAILED ( -- )
+   FS:ERRNO {: cause:n :}
+   LOG-OPEN s" could not write the credential file" LOG:TEXT+
+   s" Name a new file in a writable folder, then retry setup." HELP
+   E-AUTH cause FAIL ;
+
+\ AUTH:WRITE-FILE of the binding and refresh token in a to the file p.
+: FILE-STORED ( ^authorized str -- )
+   {: a p:str :}
+   [: a AUTHORIZED-BINDING @ a AUTHORIZED-REFRESH-TOKEN @ p
+      AUTH:WRITE-FILE ;]
+   catch {: code:n :}
+   code 0= if exit then
+   code SECRET:E-ACCESS = if FILE-FAILED then
+   code AUTH-CODE? 0= if code throw then
+   s" store the Dropbox refresh token" AUTH-FAILED ;
+
+\ The login a stored in its credential file, else in the Secret
+\ Service.
+: TOKEN-STORED ( ^authorized -- )
+   {: a :}
+   a AUTHORIZED-CREDENTIAL-FILE @ MATCH option
+      some OF {: p:str :} a p FILE-STORED ENDOF
+      none OF a KEYRING-STORED ENDOF
+   ;MATCH ;
 
 : BOUND-IN ( JOURNAL:journal ^authorized ^ARENA:arena -- )
    {: j a ar :}
@@ -1484,15 +1567,56 @@ FSM:DEFINE CLOSING ( ^window ) close-state heard
    r ar ROOT-DONE {: done :}
    c p r CHANGE-SYNC-ROOT s" the sync-root change" done ar RELEASED ;
 
+\ The folder holding the path: what precedes its last slash, / where
+\ that slash leads, . where there is none.
+: PARENT-OF ( str -- str )
+   {: p:str :}
+   p STR:LEN begin dup 0 > while
+      dup 1- p STR:DATA + c@ FS:SLASH = if
+         1- dup 0= if drop s" /" exit then
+         p STR:DATA swap >str exit
+      then
+      1-
+   repeat
+   drop s" ." ;
+
+\ The errno that stops setup creating the credential file, else 0: a path
+\ FS cannot spell, an entry there, dangling link included, or no folder.
+: FILE-FAULT ( str -- n )
+   {: p:str :}
+   p FS:PATHZ? 0= if FS:ENAMETOOLONG exit then
+   p FS:TRY-LSTAT if FS:EEXIST exit then
+   p PARENT-OF {: d:str :}
+   d FS:DIR? if 0 exit then
+   d FS:TRY-STAT if FS:ENOTDIR exit then
+   FS:ENOENT ;
+
+\ Refuses, before any login, a credential file setup cannot create.
+\ WRITE-FILE's exclusive create still decides.
+: FILE-CHECKED ( option<str> -- )
+   MATCH option
+      some OF
+         {: p:str :}
+         p FILE-FAULT {: cause:n :}
+         cause 0<> if
+            LOG-OPEN s" cannot create the credential file " LOG:TEXT+
+            p LOG:TEXT+ s" : " LOG:TEXT+ cause FS:ERRNO$ LOG:TEXT+ LOG:;LINE
+            cause FS:CAUSE! FILE-FAILED
+         then
+      ENDOF
+      none OF ENDOF
+   ;MATCH ;
+
 \ Rust's setup: the login runs while the service syncs, as it waits on
 \ the browser; the bind and the config's write run with it released.
 : SETUP ( setup-options ^SERVICE:commands ^ARENA:arena -- )
    {: o s ar :}
-   o SETUP-OPTIONS-UNMAKE {: r i :}
+   o SETUP-OPTIONS-UNMAKE {: r i f :}
+   f FILE-CHECKED
    HOME-ENV ar HOME-WIDGET
    i ar SETUP-CONFIG {: c w:bool :}
    c STATE-PREPARED
-   c r ar AUTHORIZE {: a :}
+   c r f ar AUTHORIZE {: a :}
    s c w a CHANGE-SETUP s" setup" s" Omabox setup is complete" ar
    RELEASED ;
 
@@ -1517,7 +1641,7 @@ FSM:DEFINE CLOSING ( ^window ) close-state heard
 : PERFORM ( command ^ARENA:arena -- )
    {: cmd ar :}
    cmd MATCH command
-      help OF HELP-TEXT WRITE-OUT ENDOF
+      help OF ar HELP-TEXT WRITE-OUT ENDOF
       version OF VERSION-LINE WRITE-OUT ENDOF
       status OF ar XDG ar STATUS-TEXT WRITE-OUT ENDOF
       settings OF
@@ -1532,7 +1656,7 @@ FSM:DEFINE CLOSING ( ^window ) close-state heard
    ;MATCH ;
 
 : RUN ( -- )
-   AUTH:BIND
+   AUTH:BIND-SECRET-TOOL
    SCRIPT-ARGC [: SCRIPT-ARGV$ ;] PARSE {: cmd :}
    [: cmd swap PERFORM ;] ARENA:WITH ;
 

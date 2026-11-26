@@ -508,6 +508,7 @@ FUNCTION: MALLOC-TRIM malloc_trim ( n -- i32 )
 
 \ ---- the process's states
 
+\ Loads the config and prepares its paths.
 : PREPARED ( ^run -- bool )
    {: x :}
    x RUN-PREPARING @ {: ar :}

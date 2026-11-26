@@ -6,12 +6,18 @@
 \   writing to /dev/full
 \ - initialized_journal_and_held_lock_precede_readiness
 \ - unavailable_root_still_signals_readiness, its three fixtures
+\ - rejected_credentials_directory_still_signals_readiness, Omabox's
+\   own: CREDENTIALS_DIRECTORY a path where nothing is
+\ - malformed_credential_stops_for_renewal, Omabox's own:
+\   CREDENTIALS_DIRECTORY holding a credential that is not JSON
 \ A fixture is Rust's StartupFixture: config, state, runtime, an empty
 \ PATH directory, the sync root, config.toml and a bound notify socket,
 \ in a directory under TMPDIR that the case removes. The child's
 \ environment holds only XDG_CONFIG_HOME, XDG_STATE_HOME,
-\ XDG_RUNTIME_DIR, PATH and NOTIFY_SOCKET, and its stdio is /dev/null;
-\ SIGKILL stops it, as Rust's Child::kill does, and the case reaps it.
+\ XDG_RUNTIME_DIR, PATH and NOTIFY_SOCKET, with CREDENTIALS_DIRECTORY
+\ in two cases, and its stdio is /dev/null;
+\ SIGKILL stops a child still running, as Rust's Child::kill does, and
+\ the case reaps it.
 \ Run from the repository root: hb --load src/omaboxd-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -72,6 +78,10 @@ PATH-CAP BUFFER: JOINED
    s" The configured sync folder is temporarily unavailable." ;
 : CONFIGURATION-INVALID ( -- str )
    s" Omabox configuration needs attention." ;
+: CREDENTIALS ( -- str )
+   s" Dropbox credentials are temporarily unavailable." ;
+: CREDENTIAL-INVALID ( -- str )
+   s" Dropbox credentials need to be renewed." ;
 
 
 \ ---- the build ----
@@ -283,8 +293,9 @@ ARENA FIXTURES fixture
 
 \ ---- the child ----
 
-: SPAWNED ( ^fixture str -- )
-   {: x bin :}
+\ The child, its environment the fixture's and what q adds.
+: SPAWNED-WITH ( ^fixture str [ PROCESS:request -- PROCESS:request ] -- )
+   {: x bin q :}
    S\" /dev/null\z" str> drop O-RDWR 0 open {: null :}
    null 0 >= TTRUE
    bin PROCESS:NEW PROCESS:HERMETIC
@@ -293,11 +304,14 @@ ARENA FIXTURES fixture
    s" XDG_RUNTIME_DIR" x FIXTURE-RUNTIME @ PROCESS:ENV
    s" PATH" x FIXTURE-COMMAND-PATH @ PROCESS:ENV
    s" NOTIFY_SOCKET" x FIXTURE-NOTIFY-PATH @ PROCESS:ENV
+   q execute
    0 >FD null >FD PROCESS:FD
    1 >FD null >FD PROCESS:FD
    2 >FD null >FD PROCESS:FD
    PROCESS:SPAWN PID>N x FIXTURE-PID !
    null close ;
+
+: SPAWNED ( ^fixture str -- ) [: ;] SPAWNED-WITH ;
 
 : ENDED? ( PROCESS:ending -- bool )
    MATCH PROCESS:ending
@@ -418,6 +432,40 @@ ARENA FIXTURES fixture
    [: bin true UNAVAILABLE ;] WITH-FIXTURE
    [: bin CONTAINING ;] WITH-FIXTURE ;
 
+\ A credentials directory where nothing is: past readiness the daemon
+\ runs on, its status saying the credential is unavailable.
+: UNCREDENTIALED ( ^fixture ^ARENA:arena str -- )
+   {: x ar bin :}
+   x FIXTURE-DIR @ s" no-credentials" ar TEST-CLIENT:INSIDE {: c :}
+   x bin [: s" CREDENTIALS_DIRECTORY" c PROCESS:ENV ;] SPAWNED-WITH
+   x READY
+   x CREDENTIALS ar AWAITED TTRUE
+   x RUNNING? TTRUE
+   x TERMINATE drop ;
+
+: REJECTED-CREDENTIALS-DIRECTORY-STILL-SIGNALS-READINESS ( str -- )
+   {: bin :}
+   s" rejected_credentials_directory_still_signals_readiness" T-LABEL
+   [: bin UNCREDENTIALED ;] WITH-FIXTURE ;
+
+\ A credentials directory whose credential is not JSON: past readiness
+\ the daemon exits for the user's action, its status asking for renewal.
+: MALFORMED ( ^fixture ^ARENA:arena str -- )
+   {: x ar bin :}
+   x FIXTURE-DIR @ s" credentials" ar MADE {: c :}
+   c s" dropbox-credentials-v1" ar TEST-CLIENT:INSIDE s" not json"
+   FS:WRITE-ALL
+   x bin [: s" CREDENTIALS_DIRECTORY" c PROCESS:ENV ;] SPAWNED-WITH
+   x READY
+   x SETTLED
+   x TERMINATE EXIT-USER-ACTION T=
+   x CREDENTIAL-INVALID ar SAYS? TTRUE ;
+
+: MALFORMED-CREDENTIAL-STOPS-FOR-RENEWAL ( str -- )
+   {: bin :}
+   s" malformed_credential_stops_for_renewal" T-LABEL
+   [: bin MALFORMED ;] WITH-FIXTURE ;
+
 
 \ ---- the suite ----
 
@@ -426,7 +474,9 @@ ARENA FIXTURES fixture
    bin SELF-CHECK-IGNORES-UNAVAILABLE-CONFIGURATION-AND-PRINTS-VERSION
    bin SELF-CHECK-FAILS-ON-A-FULL-STDOUT
    bin INITIALIZED-JOURNAL-AND-HELD-LOCK-PRECEDE-READINESS
-   bin UNAVAILABLE-ROOT-STILL-SIGNALS-READINESS ;
+   bin UNAVAILABLE-ROOT-STILL-SIGNALS-READINESS
+   bin REJECTED-CREDENTIALS-DIRECTORY-STILL-SIGNALS-READINESS
+   bin MALFORMED-CREDENTIAL-STOPS-FOR-RENEWAL ;
 
 : SUITE ( ^ARENA:arena -- )
    {: ar :}
