@@ -107,10 +107,13 @@ cleared a failed state it last saw.
 
 `ReleaseWindow` checks a change while the unit is released, `RELEASING` in
 `src/omabox.f`, and the window's end, `CLOSING`: the release drive, the
-change and the restore drive each may fail, and a SIGINT, SIGTERM or SIGHUP
-may arrive at any time from just before the release drive until the window
-closes after the restore drive, when the signals take their default again and
-`SIGNAL:RELEASE` answers one delivered after the last take. The change runs
+change, the restore drive and the recovery drive each may fail, and a SIGINT,
+SIGTERM or SIGHUP may arrive at any time from just before the release drive
+until the window closes after the restore drive and, when due, the recovery
+drive, when the signals take their default again and `SIGNAL:RELEASE`
+answers one delivered after the last take. The recovery drive is due only
+when no signal was taken, the change was made and the restore succeeded
+without launching the unit. The change runs
 only after a release that succeeded and before any signal is delivered; every
 path out runs the restore drive; and the CLI dies of the signal exactly when
 one was taken, the window's close included.

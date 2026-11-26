@@ -7,6 +7,8 @@ Lines == {
     <<"released", "interrupted", "restoring">>,
     <<"changing", "ok", "restoring">>,
     <<"changing", "failed", "restoring">>,
-    <<"changing", "interrupted", "restoring">>
+    <<"changing", "interrupted", "restoring">>,
+    <<"restoring", "due", "recovered">>,
+    <<"restoring", "skip", "recovered">>
 }
 ====

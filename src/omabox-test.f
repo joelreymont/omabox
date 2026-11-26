@@ -79,9 +79,11 @@
 \ set_root_interrupted_by_sighup_restores_the_service,
 \ set_root_killed_during_restart_keeps_the_change,
 \ set_root_killed_with_a_failed_restart_keeps_the_change and
-\ set_root_interrupted_without_restart_tells_the_change_failed, Omabox's
-\ own: that program's set-root over Rust's fixture, its systemctl a
-\ script on PATH whose stop or start sends the signal to the CLI
+\ set_root_interrupted_without_restart_tells_the_change_failed,
+\ set_root_interrupted_during_recovery_finishes_it and
+\ set_root_revives_a_failed_service, Omabox's own: that program's
+\ set-root over Rust's fixture, its systemctl a script on PATH whose
+\ stop, start or reset-failed sends the signal to the CLI, or none
 \ - formal_holds_the_release_window_tables: RELEASING and CLOSING
 \   against formal/ReleaseWindow.tla through TEST-FORMAL:HOLDS, which
 \   runs TLC
@@ -1894,23 +1896,24 @@ variable REC-WRITES
    erru LEN>N 0 T= ;
 
 \ A shell line that sends the signal sig, as kill names it, to the CLI
-\ that ran the script when the verb is v.
+\ that ran the script when the verb is v; none for an empty v.
 : KILLING ( str str ^ARENA:arena -- str )
    {: sig:str v:str ar :}
+   v STR:LEN 0= if s" " exit then
    SB-RESET S\" [ \"$2\" != " SB-APPEND v SB-APPEND s"  ] || kill -" SB-APPEND
    sig SB-APPEND S\"  \"$PPID\"\n" SB-APPEND SB$ ar ARENA:COPY ;
 
-\ A stateful systemctl in d/bin, the unit active; its verb v sends the
-\ signal sig, as kill names it, to the CLI that ran it, and its start
-\ exits with the code start.
-: INTERRUPTING ( str str str n ^ARENA:arena -- str )
-   {: d sig:str v:str start:n ar :}
+\ A stateful systemctl in d/bin, the unit first in the state i: its verb v
+\ sends sig, as kill names it, to the CLI, and its start exits with start.
+\ An empty v sends no signal.
+: INTERRUPTING ( str str str str n ^ARENA:arena -- str )
+   {: d i:str sig:str v:str start:n ar :}
    d s" bin" ar INSIDE {: b :}
    b FS:MAKE-DIR
    b s" systemctl" ar INSIDE {: sys :}
    d s" unit-state" ar INSIDE {: state :}
    d s" service.log" ar INSIDE {: log :}
-   state S\" active\n" FS:WRITE-ALL
+   SB-RESET i LINE+ state SB$ FS:WRITE-ALL
    sig v ar KILLING {: w :}
    SB-RESET S\" #!/bin/sh\n" SB-APPEND state log start 0 w SCRIPT+
    sys SB$ FS:WRITE-ALL
@@ -1929,9 +1932,9 @@ variable REC-WRITES
 \ The built program's set-root of second over the fixture in d, its
 \ systemctl from INTERRUPTING: stdout's and stderr's lengths in OUT and
 \ ERR, and the signal that ended it.
-: SET-ROOT-KILLED ( str str str str str n ^ARENA:arena -- len len n )
-   {: bin d second sig:str v:str start:n ar :}
-   d sig v start ar INTERRUPTING {: b :}
+: SET-ROOT-KILLED ( str str str str str str n ^ARENA:arena -- len len n )
+   {: bin d second i:str sig:str v:str start:n ar :}
+   d i sig v start ar INTERRUPTING {: b :}
    PROC-ARGV-ENV-RESET
    s" --default-signal=HUP,INT,TERM" PROC-ARGV+ bin PROC-ARGV+
    s" settings" PROC-ARGV+ s" set-root" PROC-ARGV+ second PROC-ARGV+
@@ -1951,7 +1954,8 @@ variable REC-WRITES
    ar FIXTURE {: d x first :}
    d s" second" ar INSIDE {: second :}
    second FS:MAKE-DIR
-   bin d second sig v 0 ar SET-ROOT-KILLED {: outu:len erru:len got:n :}
+   bin d second s" active" sig v 0 ar SET-ROOT-KILLED
+   {: outu:len erru:len got:n :}
    outu LEN>N 0 T=
    got want T=
    d s" service.log" ar INSIDE FILE-TEXT
@@ -1984,7 +1988,7 @@ variable REC-WRITES
    ar FIXTURE {: d x first :}
    d s" second" ar INSIDE {: second :}
    second FS:MAKE-DIR
-   bin d second s" TERM" s" start" 0 ar SET-ROOT-KILLED
+   bin d second s" active" s" TERM" s" start" 0 ar SET-ROOT-KILLED
    {: outu:len erru:len got:n :}
    ERR erru LEN>N >str s" The change is kept" STR:CONTAINS? TFALSE
    outu LEN>N 0 T=
@@ -2000,7 +2004,7 @@ variable REC-WRITES
    ar FIXTURE {: d x first :}
    d s" second" ar INSIDE {: second :}
    second FS:MAKE-DIR
-   bin d second s" TERM" s" start" 1 ar SET-ROOT-KILLED
+   bin d second s" active" s" TERM" s" start" 1 ar SET-ROOT-KILLED
    {: outu:len erru:len got:n :}
    ERR erru LEN>N >str {: e :}
    e s" The change is kept" STR:CONTAINS? TTRUE
@@ -2016,13 +2020,52 @@ variable REC-WRITES
    ar FIXTURE {: d x first :}
    d s" second" ar INSIDE {: second :}
    second FS:MAKE-DIR
-   bin d second s" INT" s" stop" 1 ar SET-ROOT-KILLED
+   bin d second s" active" s" INT" s" stop" 1 ar SET-ROOT-KILLED
    {: outu:len erru:len got:n :}
    ERR erru LEN>N >str {: e :}
    e s" could not be restarted" STR:CONTAINS? TTRUE
    e s" The change is kept" STR:CONTAINS? TFALSE
    got 2 T=
    x ar STORED-ROOT first T$=
+   d FS:REMOVE-TREE ;
+
+\ The unit starts failed, so only the recover drive runs reset-failed;
+\ its SIGTERM waits until that drive has started the unit.
+: SET-ROOT-INTERRUPTED-DURING-RECOVERY-FINISHES-IT ( str ^ARENA:arena -- )
+   {: bin ar :}
+   s" set_root_interrupted_during_recovery_finishes_it" T-LABEL
+   ar FIXTURE {: d x first :}
+   d s" second" ar INSIDE {: second :}
+   second FS:MAKE-DIR
+   bin d second s" failed" s" TERM" s" reset-failed" 0 ar
+   SET-ROOT-KILLED {: outu:len erru:len got:n :}
+   d s" service.log" ar INSIDE FILE-TEXT
+   S\" show\nshow\nreset-failed\nstart\n" T$=
+   d s" unit-state" ar INSIDE FILE-TEXT S\" active\n" T$=
+   outu LEN>N 0 T=
+   ERR erru LEN>N >str s" The change is kept" STR:CONTAINS? TFALSE
+   got 15 T=
+   x ar STORED-ROOT second T$=
+   d FS:REMOVE-TREE ;
+
+\ The unit starts failed and nothing signals, so the recover drive's
+\ start is the note on stdout.
+: SET-ROOT-REVIVES-A-FAILED-SERVICE ( str ^ARENA:arena -- )
+   {: bin ar :}
+   s" set_root_revives_a_failed_service" T-LABEL
+   ar FIXTURE {: d x first :}
+   d s" second" ar INSIDE {: second :}
+   second FS:MAKE-DIR
+   bin d second s" failed" s" " s" " 0 ar SET-ROOT-KILLED
+   {: outu:len erru:len got:n :}
+   OUT outu LEN>N >str s" The stopped service has been started again."
+   STR:CONTAINS? TTRUE
+   erru LEN>N 0 T=
+   got -1 T=
+   d s" service.log" ar INSIDE FILE-TEXT
+   S\" reset-failed\nstart\n" STR:ENDS-WITH? TTRUE
+   d s" unit-state" ar INSIDE FILE-TEXT S\" active\n" T$=
+   x ar STORED-ROOT second T$=
    d FS:REMOVE-TREE ;
 
 : RUN-BUILT ( str ^ARENA:arena -- )
@@ -2033,7 +2076,9 @@ variable REC-WRITES
    bin ar SET-ROOT-INTERRUPTED-BY-SIGHUP-RESTORES-THE-SERVICE
    bin ar SET-ROOT-KILLED-DURING-RESTART-KEEPS-THE-CHANGE
    bin ar SET-ROOT-KILLED-WITH-A-FAILED-RESTART-KEEPS-THE-CHANGE
-   bin ar SET-ROOT-INTERRUPTED-WITHOUT-RESTART-TELLS-THE-CHANGE-FAILED ;
+   bin ar SET-ROOT-INTERRUPTED-WITHOUT-RESTART-TELLS-THE-CHANGE-FAILED
+   bin ar SET-ROOT-INTERRUPTED-DURING-RECOVERY-FINISHES-IT
+   bin ar SET-ROOT-REVIVES-A-FAILED-SERVICE ;
 
 : PROGRAM ( ^ARENA:arena -- )
    {: ar :}

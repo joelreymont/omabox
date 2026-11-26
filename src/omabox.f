@@ -23,10 +23,11 @@
 \ and under the daemon lock, the journal bound, the refresh token
 \ stored and a new config written. DROPBOX's calls run under AIO's loop,
 \ started for them alone.
-\ From just before the release until the restore drive has run, SIGINT,
-\ SIGTERM and SIGHUP are caught through SIGNAL's pipe: one ends the window
-\ at its next step as a failure would, and after the restore drive the CLI
-\ dies of it, with the status its default gives.
+\ From just before the release until the window closes after the restore
+\ drive and any recovery drive, SIGINT, SIGTERM and SIGHUP are caught
+\ through SIGNAL's pipe: one ends the window at its next step as a failure
+\ would, and once the window closes the CLI dies of it, with the status its
+\ default gives.
 \ STORAGE CLASS. CALLER-OWNED: a command's service commands, drive
 \ record, released window, configuration, text, lock, default root,
 \ authorization code, root binding, Dropbox client, login and journal
@@ -736,16 +737,6 @@ ARENA JOURNALS JOURNAL:journal
       ENDOF
    ;MATCH ;
 
-\ The change may fix the fatal cause of a unit the release left failed:
-\ unless the restore launched it, a recover drive answers whether it did.
-: RECOVERED ( ^SERVICE:commands bool str ^ARENA:arena -- bool )
-   {: c launched:bool d:str ar :}
-   launched if false exit then
-   ar DRIVENS-NEW {: v :}
-   c SERVICE-GOAL:RECOVER v SERVICE:DRIVE-RECORDED
-   0<> if d START-AFTER-CHANGE then
-   v SERVICE-DRIVEN:LAUNCHED @ ;
-
 : NOTE ( bool -- str )
    if s"  The stopped service has been started again." exit then s" " ;
 
@@ -755,18 +746,6 @@ ARENA JOURNALS JOURNAL:journal
    {: d:str recovered:bool left ar :}
    d ar ARENA:COPY s" ." ar FOLLOWED recovered NOTE ar FOLLOWED
    S\" \n" ar FOLLOWED left REPORT-OUT ;
-
-\ Rust's match on the change's outcome and the restore's: c the
-\ commands, n the change's name, d its done text.
-: DECIDED ( ^SERVICE:commands str str
-     ^VEC:vector<STALE:leftover> n bool n ^ARENA:arena -- )
-   {: c n:str d:str left changed:n
-      launched:bool restored:n ar :}
-   changed 0<> restored 0<> and if n CHANGE-AND-RESTORE then
-   changed 0<> if changed throw then
-   restored 0<> if d START-AFTER-CHANGE then
-   c launched d ar RECOVERED {: recovered:bool :}
-   d recovered left ar DONE-OUT ;
 
 
 \ ---- setup's local steps
@@ -1276,26 +1255,28 @@ ENUM change
    ;VARIANT
 ;ENUM
 
-\ Each state is named for the step that ran last: released the release
-\ drive, changing the change, restoring the restore drive.
-ENUM window-state released changing restoring ;ENUM
+\ Each state names the step that ran last: the release drive, the change,
+\ the restore drive, or the recovery drive or its skip.
+ENUM window-state released changing restoring recovered ;ENUM
 
 \ What a step answered; interrupted, whatever it answered, once a SIGINT,
 \ SIGTERM or SIGHUP has been taken in the window.
 ENUM outcome ok failed interrupted ;ENUM
 
+\ The recovery drive is due exactly when no signal is taken, the change
+\ was made, and the restore answered 0 without launching the unit.
+ENUM recovery due skip ;ENUM
+
 \ The closed window, and its two ends: the change's end told, or death
 \ by the signal taken.
 ENUM close-state closed decided died ;ENUM
 
-\ What the window had come to when it closed: no signal taken; a signal
-\ taken, the service restored; or taken, the service not restarted, and
-\ the change made or not.
-ENUM heard quiet signaled kept unmade ;ENUM
+\ The window's end, quiet or by a signal taken, the service back (restore
+\ and any recovery answered 0) or not, and the change made or not.
+ENUM heard done refused stuck broken signaled kept unmade ;ENUM
 
-\ changed holds the release's code until the change runs; left holds the
-\ made change's leftovers, null until the change is made; signal is the
-\ first signal taken, 0 for none.
+\ changed is the release's code until the change runs; left is null until
+\ the change is made, signal and recovered 0 until one is taken or runs.
 STRUCTURE window DERIVE addr
    FIELD commands ^SERVICE:commands
    FIELD change change
@@ -1308,6 +1289,8 @@ STRUCTURE window DERIVE addr
    FIELD launched bool
    FIELD restored n
    FIELD signal n
+   FIELD recovered n
+   FIELD revived bool
 ;STRUCTURE
 
 ARENA WINDOWS window
@@ -1359,6 +1342,24 @@ ARENA WINDOWS window
    launched w WINDOW-LAUNCHED !
    restored w WINDOW-RESTORED ! ;
 
+: AT-RESTORED ( ^window -- recovery )
+   {: w :}
+   w TAKEN
+   w WINDOW-LAUNCHED @ if construct recovery skip exit then
+   w WINDOW-SIGNAL @ 0= w WINDOW-CHANGED @ 0= and
+   w WINDOW-RESTORED @ 0= and
+   if construct recovery due exit then
+   construct recovery skip ;
+
+\ The change may fix the fatal cause of a unit the release left failed:
+\ the recover drive answers whether it did.
+: RECOVER ( ^window -- )
+   {: w :}
+   w WINDOW-ARENA @ DRIVENS-NEW {: v :}
+   w WINDOW-COMMANDS @ SERVICE-GOAL:RECOVER v SERVICE:DRIVE-RECORDED
+   w WINDOW-RECOVERED !
+   v SERVICE-DRIVEN:LAUNCHED @ w WINDOW-REVIVED ! ;
+
 \ RELEASED's steps, after formal/ReleaseWindow.tla.
 FSM:DEFINE RELEASING ( ^window ) window-state outcome
    IN released  AT-STEP
@@ -1369,7 +1370,10 @@ FSM:DEFINE RELEASING ( ^window ) window-state outcome
       ok           RESTORE  >restoring
       failed       RESTORE  >restoring
       interrupted  RESTORE  >restoring
-   FINAL restoring  -
+   IN restoring  AT-RESTORED ( recovery )
+      due   RECOVER  >recovered
+      skip  -        >recovered
+   FINAL recovered  -
 ;DEFINE
 
 : STEPS ( ^window -- )
@@ -1386,11 +1390,17 @@ FSM:DEFINE RELEASING ( ^window ) window-state outcome
    w WINDOW-SIGNAL @ 0<> if exit then
    sig w WINDOW-SIGNAL ! ;
 
-: DECIDE ( ^window -- )
+\ The made change's done text, and the note of a unit it revived.
+: DONE ( ^window -- )
    {: w :}
-   w WINDOW-COMMANDS @ w WINDOW-NAME @ w WINDOW-DONE @ w WINDOW-LEFT @
-   w WINDOW-CHANGED @ w WINDOW-LAUNCHED @ w WINDOW-RESTORED @
-   w WINDOW-ARENA @ DECIDED ;
+   w WINDOW-DONE @ w WINDOW-REVIVED @ w WINDOW-LEFT @ w WINDOW-ARENA @
+   DONE-OUT ;
+
+: REFUSED ( ^window -- ) WINDOW-CHANGED @ throw ;
+
+: STUCK ( ^window -- ) WINDOW-DONE @ START-AFTER-CHANGE ;
+
+: BROKEN ( ^window -- ) WINDOW-NAME @ CHANGE-AND-RESTORE ;
 
 \ SIGNAL:DIE-OF without its RELEASE, which closed the window: the exit
 \ actions, then death by the signal taken.
@@ -1408,17 +1418,35 @@ FSM:DEFINE RELEASING ( ^window ) window-state outcome
 : UNMADE ( ^window -- )
    {: w :} w WINDOW-NAME @ CHANGE-AND-RESTORE-TOLD w SIGNALED ;
 
+: QUIET-HEARD ( bool bool -- heard )
+   {: back:bool made:bool :}
+   back if
+      made if construct heard done exit then
+      construct heard refused exit
+   then
+   made if construct heard stuck exit then
+   construct heard broken ;
+
+: SIGNAL-HEARD ( bool bool -- heard )
+   {: back:bool made:bool :}
+   back if construct heard signaled exit then
+   made if construct heard kept exit then
+   construct heard unmade ;
+
 : AT-CLOSED ( ^window -- heard )
    {: w :}
-   w WINDOW-SIGNAL @ 0= if construct heard quiet exit then
-   w WINDOW-RESTORED @ 0= if construct heard signaled exit then
-   w WINDOW-LEFT @ NULL-PTR <> if construct heard kept exit then
-   construct heard unmade ;
+   w WINDOW-RESTORED @ 0= w WINDOW-RECOVERED @ 0= and
+   w WINDOW-LEFT @ NULL-PTR <>
+   w WINDOW-SIGNAL @ 0= if QUIET-HEARD exit then
+   SIGNAL-HEARD ;
 
 \ The closed window's end, after formal/ReleaseWindow.tla.
 FSM:DEFINE CLOSING ( ^window ) close-state heard
    IN closed  AT-CLOSED
-      quiet     DECIDE    >decided
+      done      DONE      >decided
+      refused   REFUSED   >decided
+      stuck     STUCK     >decided
+      broken    BROKEN    >decided
       signaled  SIGNALED  >died
       kept      KEPT      >died
       unmade    UNMADE    >died
