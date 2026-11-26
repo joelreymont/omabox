@@ -1416,19 +1416,6 @@ public
    ar j >CONNECTION
    s" SELECT cursor FROM remote_inventory WHERE singleton = 1" [: CURSOR-ROW ;] SQLITE:WITH-STATEMENT ;
 
-\ The display path of the directory or restricted folder Dropbox holds
-\ at the key, held or not; none for a file or nothing. A held key's
-\ observation is unsupported, so at most one table answers.
-: REMOTE-DIRECTORY-AT
-   ( journal MODEL:key ^ARENA:arena -- option<MODEL:path> )
-   {: j k ar :}
-   j >CONNECTION
-   s" SELECT path FROM remote_shadows
-      WHERE canonical_path = ?1 AND kind IN (1, 4)
-      UNION ALL SELECT path FROM remote_observations
-      WHERE canonical_path = ?1 AND kind IN (1, 4)" [: k MODEL:KEY>STR 1 SQLITE:BIND-BLOB ar SPELLING-ROW ;]
-   SQLITE:WITH-STATEMENT ;
-
 private
 
 : SNAPSHOT ( journal ^ARENA:arena -- remote-inventory )
@@ -2556,6 +2543,37 @@ private
             AND lower < CAST(?1 || '0' AS BLOB))" [: s 1 SQLITE:BIND-BLOB SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT ;
 
+\ The hold in the statement's row: lower, canonical_path, path.
+: HOLD-ROW
+   ( SQLITE:statement ^ARENA:arena
+     -- SQLITE:statement remote-inventory-change )
+   {: ar :}
+   0 ar PATH-COPY {: l :}
+   1 ar BLOB-COPY MODEL:>KEY {: k :}
+   2 ar PATH-COPY {: p :}
+   l k p JOURNAL-REMOTE--INVENTORY--CHANGE:HOLD ;
+
+public
+
+\ The stored holds of the key and of every key beneath it, each a
+\ hold change, by lower.
+: SUBTREE-HOLDS
+   ( journal MODEL:key ^ARENA:arena
+     -- ^VEC:vector<remote-inventory-change> )
+   {: j k ar :}
+   ar ARENA:ALLOCATOR 0 [type] remote-inventory-change VEC:NEW {: v :}
+   k ar MODEL:SUBTREE-RANGE {: lo:str hi:str :}
+   j >CONNECTION s" SELECT lower, canonical_path, path FROM remote_mismatches
+      WHERE canonical_path = ?1
+         OR (canonical_path >= ?2 AND canonical_path < ?3)
+      ORDER BY lower" [: k MODEL:KEY>STR 1 SQLITE:BIND-BLOB
+      lo 2 SQLITE:BIND-BLOB hi 3 SQLITE:BIND-BLOB
+      begin SQLITE:STEP while ar HOLD-ROW v VEC:PUSH ! repeat ;]
+   SQLITE:WITH-STATEMENT
+   v ;
+
+private
+
 \ Hides each held key's record behind an unsupported one, kind 8,
 \ spelled as the key's hold of least lower spells it.
 : SETTLE ( SQLITE:connection -- )
@@ -3054,6 +3072,21 @@ public
    j >CONNECTION
    s" SELECT canonical_path, path, kind, content, revision
       FROM remote_observations WHERE canonical_path = ?1" [: k MODEL:KEY>STR 1 SQLITE:BIND-BLOB ar REMOTE-AT-ROW ;]
+   SQLITE:WITH-STATEMENT ;
+
+\ The record the listing left at the canonical path beneath any hold:
+\ a held key's shadow, an unheld key's observation; none at a key only
+\ a hold makes.
+: REMOTE-LISTED-AT
+   ( journal MODEL:key ^ARENA:arena -- option<MODEL:remote-record> )
+   {: j k ar :}
+   j >CONNECTION
+   s" SELECT canonical_path, path, kind, content, revision
+      FROM remote_shadows WHERE canonical_path = ?1
+      UNION ALL SELECT canonical_path, path, kind, content, revision
+      FROM remote_observations WHERE canonical_path = ?1
+         AND NOT EXISTS (SELECT 1 FROM remote_mismatches
+            WHERE canonical_path = ?1)" [: k MODEL:KEY>STR 1 SQLITE:BIND-BLOB ar REMOTE-AT-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
 private

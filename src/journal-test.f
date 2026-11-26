@@ -42,7 +42,7 @@
 \ LOCAL-COUNT and LOCAL-AT over published scans; REMOTE-AT at held and
 \ unheld keys; a key a delta's or a listing's hold shows unsupported,
 \ spelled as the hold's path, its record, a directory
-\ REMOTE-DIRECTORY-AT finds, back at the unhold, the hold gone with an
+\ REMOTE-LISTED-AT finds, back at the unhold, the hold gone with an
 \ unhold or a subtree deletion above its lower, and a hold on a key its
 \ lower or its path does not fold to refused; LIVE-PLAN-AT at a
 \ pending, a blocked, a completed and an
@@ -714,18 +714,6 @@ variable SCANNED       \ query plan rows that scan the table
    v 0 VEC:AT @ MODEL-REMOTE--RECORD:UNMAKE {: k p o2 :}
    o o2 MODEL:REMOTE-OBSERVATION= ;
 
-: DIRECTORY-IS? ( option<MODEL:path> str -- bool )
-   {: p:str :}
-   MATCH option
-      none OF false ENDOF
-      some OF MODEL:PATH>STR p STR:= ENDOF
-   ;MATCH ;
-
-: NO-DIRECTORY? ( option<MODEL:path> -- bool )
-   MATCH option
-      none OF true ENDOF
-      some OF drop false ENDOF
-   ;MATCH ;
 
 : SUBTREE-PLAN-ROW ( SQLITE:statement -- SQLITE:statement )
    3 SQLITE:COL-TEXT {: a:str :}
@@ -1567,27 +1555,6 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    s" shared" s" Shared" INACCESSIBLE ar REMOTE-RECORD v REMOTE+
    v ;
 
-: DIRECTORY-AT
-   ( journal str ^ARENA:arena -- option<MODEL:path> )
-   {: j k:str ar :}
-   j k ar CANONICAL ar REMOTE-DIRECTORY-AT ;
-
-\ Rust's remote_directory_paths_include_restricted_folders, one key
-\ at a time.
-: REMOTE-DIRECTORY-AT-INCLUDES-RESTRICTED-FOLDERS ( ^ARENA:arena -- )
-   {: ar :}
-   s" remote_directory_paths_include_restricted_folders" T-LABEL
-   ar JOURNAL-AT {: d:str p:str :}
-   p OPEN {: j :}
-   j s" cursor" CURSOR ar RESTRICTED-SAMPLE ar DELTA
-   PUBLISH-REMOTE-INVENTORY
-   j s" docs" ar DIRECTORY-AT s" Docs" DIRECTORY-IS? TTRUE
-   j s" shared" ar DIRECTORY-AT s" Shared" DIRECTORY-IS? TTRUE
-   j s" docs/a.txt" ar DIRECTORY-AT NO-DIRECTORY? TTRUE
-   j s" absent" ar DIRECTORY-AT NO-DIRECTORY? TTRUE
-   j CLOSE
-   d GONE ;
-
 \ Whether the answer is the record.
 : REMOTE-IS? ( option<MODEL:remote-record> MODEL:remote-record -- bool )
    {: want :}
@@ -1733,7 +1700,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
 
 : A-LISTING-HOLDS-A-DIRECTORY-KEY ( ^ARENA:arena -- )
    {: ar :}
-   s" a listing's hold hides a directory REMOTE-DIRECTORY-AT still finds"
+   s" a listing's hold hides a directory REMOTE-LISTED-AT still finds"
    T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
@@ -1741,7 +1708,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    j s" cursor" CURSOR dir ar ONE-REMOTE
    s" Ꭰ" ar HOLD-AT ar ONE-CHANGE PUBLISH-REMOTE-INVENTORY
    j s" ꭰ" ar REMOTE-AT-KEY s" ꭰ" ar HELD-RECORD REMOTE-IS? TTRUE
-   j s" ꭰ" ar DIRECTORY-AT s" ꭰ" DIRECTORY-IS? TTRUE
+   j s" ꭰ" ar CANONICAL ar REMOTE-LISTED-AT dir REMOTE-IS? TTRUE
    j s" cursor-unhold" s" Ꭰ" ar UNHOLD-AT ar CHANGED
    j s" ꭰ" ar REMOTE-AT-KEY dir REMOTE-IS? TTRUE
    j CLOSE
@@ -6198,7 +6165,6 @@ TYPED-VARIABLE HELD-OPERATION operation-id
    ar REMOTE-DELTA-MUTATES-ONLY-CHANGED-ROWS-AND-CURSOR
    ar REMOTE-DELTA-DELETES-ONLY-THE-NAMED-SUBTREE
    ar REMOTE-DELTA-ENSURED-DIRECTORY-KEEPS-AN-UNKNOWN-FOLDER
-   ar REMOTE-DIRECTORY-AT-INCLUDES-RESTRICTED-FOLDERS
    ar REMOTE-AT-ANSWERS-THE-RECORD-AT-A-KEY
    ar A-HOLD-HIDES-THE-RECORD-UNTIL-ITS-UNHOLD
    ar A-HELD-KEY-OUTLIVES-ITS-OWN-DELETION

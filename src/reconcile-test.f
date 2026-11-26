@@ -66,6 +66,9 @@
 \   unsupported at the lower path, their ancestors respelled, each handed
 \   on once with its key; a deleted one deletes there, handed on to
 \   none.
+\ - A-HOLD-IS-RE-ADDED-ONCE: a listing of /Docs and /Docs/U+13A0.txt,
+\   then a delta of three files in /Docs: the stored hold is re-added
+\   once, not once for each file's /Docs.
 \ - MISMATCHED-RESTRICTED-FOLDER-DROPS-ITS-CHILDREN: a restricted folder
 \   whose display path folds elsewhere is unsupported and its listed
 \   children go.
@@ -119,6 +122,25 @@
 \ - SHARED-FOLD-KEEPS-ITS-FOLDERS-SPELLING: a full listing, then a delta,
 \   of /Docs and /Docs/U+13A0.txt: the key docs/U+AB70.txt is held
 \   unsupported as Docs/U+AB70.txt, and one line logged names it.
+\ - HOLD-RESPELLED-WHEN-ITS-FOLDER-GOES: a full listing of /U+AB70Dir,
+\   the key's own, and /U+13A0dir, which folds to it, then a delta
+\   deleting the first: the key U+AB70dir is held unsupported as
+\   U+AB70Dir, then as U+AB70dir, as a full listing of /U+13A0dir alone
+\   spells it, and one line logged names /U+13A0dir.
+\ - HOLD-RESPELLED-WHEN-ITS-FOLDER-RETURNS: the same, then a delta
+\   listing /U+AB70DIR: the key is held as U+AB70DIR, as a full listing
+\   of both folders spells it.
+\ - INFERRED-PARENT-KEEPS-A-HOLDS-SPELLING: a full listing of /docs
+\   as /Other and /docs/U+13A0dir as /Docs/U+13A0dir, then a delta of
+\   /docs/new as /Docs/New: the key docs/U+AB70dir is held as
+\   docs/U+AB70dir throughout, as a full listing of all three spells it.
+\ - AN-INFERRED-PARENT-RESPELLS-A-HOLD: a full listing of /U+13A0dir,
+\   then a delta of /U+AB70dir/new as /U+AB70Dir/New: the key U+AB70dir
+\   is held as U+AB70Dir, as a full listing of both spells it.
+\ - AN-UNSUPPORTED-PARENT-GIVES-NO-CASING: a full listing of /docs as
+\   /Other and /docs/U+13A0dir as /Docs/U+13A0dir, then a delta of
+\   /docs/U+AB70dir as /Docs/U+AB70Dir: the key docs/U+AB70dir is held
+\   as docs/U+AB70Dir, as a full listing of all three spells it.
 \ - MISMATCH-LOGGED-ONCE-AFTER-A-FAILED-PAGE: a delta whose later page
 \   fails lists a mismatched file, then the next delta lists it and
 \   publishes: it is unsupported, and one line logged names it.
@@ -2021,6 +2043,36 @@ ARENA LISTED DROPBOX:entry
    s" Docs|Docs/Good.txt|Docs/odd|" T$=
    d j GONE ;
 
+: HOLD-COUNT ( ^VEC:vector<JOURNAL:remote-inventory-change> -- n )
+   {: cs :}
+   0 cs VEC:COUNT 0 ?do
+      cs i VEC:AT @ MATCH JOURNAL:remote-inventory-change
+         upsert OF drop ENDOF
+         ensure-directory OF drop ENDOF
+         delete-subtree OF drop ENDOF
+         hold OF drop drop drop 1+ ENDOF
+         unhold OF drop drop ENDOF
+      ;MATCH
+   loop ;
+
+: A-HOLD-IS-RE-ADDED-ONCE ( ^ARENA:arena -- )
+   {: ar :}
+   s" a hold is re-added once" T-LABEL
+   ar CASE-JOURNAL {: d:str j :}
+   s" " ar LISTING-AT {: root :}
+   ar NO-CHANGES {: v :}
+   s" /docs" s" /Docs" ar FOLDER-ENTRY root v ar APPENDED
+   S\" /docs/\xe1\x8e\xa0.txt" S\" /Docs/\xe1\x8e\xa0.txt" ar FILE-ENTRY
+   root v ar APPENDED
+   v j ar LISTING-PUBLISHED
+   ar NO-CHANGES {: w :}
+   s" /docs/a.txt" s" /Docs/a.txt" ar FILE-ENTRY root w ar APPENDED
+   s" /docs/b.txt" s" /Docs/b.txt" ar FILE-ENTRY root w ar APPENDED
+   s" /docs/c.txt" s" /Docs/c.txt" ar FILE-ENTRY root w ar APPENDED
+   w HOLD-COUNT 0 T=
+   w j ar NORMALIZE-INVENTORY-CHANGES HOLD-COUNT 1 T=
+   d j GONE ;
+
 : MISMATCHED-RESTRICTED-FOLDER-DROPS-ITS-CHILDREN ( ^ARENA:arena -- )
    {: ar :}
    s" mismatched restricted folder drops its children" T-LABEL
@@ -2889,6 +2941,121 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
    s" /2/files/list_folder /2/files/list_folder/continue" T$=
    d j GONE ;
 
+\ /U+AB70dir as /U+AB70Dir, the key's own, and /U+13A0dir, which
+\ folds to its key, in SB as JSON.
+: SHARED-DIRS-JSON+ ( -- )
+   S\" /\xea\xad\xb0dir" S\" /\xea\xad\xb0Dir" FOLDER-JSON+ COMMA+
+   S\" /\xe1\x8e\xa0dir" S\" /\xe1\x8e\xa0dir" FOLDER-JSON+ ;
+
+\ The journal holds U+AB70dir unsupported, spelled s, and nothing
+\ else, with the cursor k.
+: DIR-HELD ( JOURNAL:journal str str ^ARENA:arena -- )
+   {: j k:str s:str ar :}
+   ar REMOTE-RECORDS {: want :}
+   s MODEL-UNKNOWN--REASON:UNSUPPORTED REMOTE-UNKNOWN ar RECORD-AT
+   want VEC:PUSH !
+   j k want ar HOLDS ;
+
+: HOLD-RESPELLED-WHEN-ITS-FOLDER-GOES ( ^ARENA:arena -- )
+   {: ar :}
+   s" hold respelled when its folder goes" T-LABEL
+   TEST-DROPBOX:RESET
+   ar CASE-JOURNAL {: d:str j :}
+   [: SHARED-DIRS-JSON+ ;] ar ENTRIES s" first" false PAGE
+   [: S\" /\xea\xad\xb0dir" S\" /\xea\xad\xb0Dir" DELETED-JSON+ ;]
+   ar ENTRIES s" second" false PAGE
+   d [: j TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK ar REFRESHED
+        j s" first" S\" \xea\xad\xb0Dir" ar DIR-HELD
+        j TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK ar REFRESHED ;]
+   ar LOGGED {: t:str :}
+   t 10 STR:COUNT-CHAR 1 T=
+   t S\" `/\xe1\x8e\xa0dir` is not its own lowercase" STR:CONTAINS? TTRUE
+   j s" second" S\" \xea\xad\xb0dir" ar DIR-HELD
+   TEST-DROPBOX:SEEN$
+   s" /2/files/list_folder /2/files/list_folder/continue" T$=
+   d j GONE ;
+
+: HOLD-RESPELLED-WHEN-ITS-FOLDER-RETURNS ( ^ARENA:arena -- )
+   {: ar :}
+   s" hold respelled when its folder returns" T-LABEL
+   TEST-DROPBOX:RESET
+   ar CASE-JOURNAL {: d:str j :}
+   [: SHARED-DIRS-JSON+ ;] ar ENTRIES s" first" false PAGE
+   [: S\" /\xea\xad\xb0dir" S\" /\xea\xad\xb0Dir" DELETED-JSON+ ;]
+   ar ENTRIES s" second" false PAGE
+   [: S\" /\xea\xad\xb0dir" S\" /\xea\xad\xb0DIR" FOLDER-JSON+ ;]
+   ar ENTRIES s" third" false PAGE
+   d [: j TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK ar REFRESHED
+        j TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK ar REFRESHED
+        j s" second" S\" \xea\xad\xb0dir" ar DIR-HELD
+        j TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK ar REFRESHED ;]
+   ar LOGGED {: t:str :}
+   t 10 STR:COUNT-CHAR 1 T=
+   t S\" `/\xe1\x8e\xa0dir` is not its own lowercase" STR:CONTAINS? TTRUE
+   j s" third" S\" \xea\xad\xb0DIR" ar DIR-HELD
+   d j GONE ;
+
+: HELD-PATH ( JOURNAL:journal str ^ARENA:arena -- str )
+   {: j k:str ar :}
+   j k MODEL:>KEY ar JOURNAL:REMOTE-AT MATCH option
+      none OF s" missing" ENDOF
+      some OF MODEL-REMOTE--RECORD:UNMAKE {: rk rp ro :} rp PATH$ ENDOF
+   ;MATCH ;
+
+: INFERRED-PARENT-KEEPS-A-HOLDS-SPELLING ( ^ARENA:arena -- )
+   {: ar :}
+   s" inferred parent keeps a hold's spelling" T-LABEL
+   TEST-DROPBOX:RESET
+   ar CASE-JOURNAL {: d:str j :}
+   [: s" /docs" s" /Other" FOLDER-JSON+ COMMA+
+      S\" /docs/\xe1\x8e\xa0dir" S\" /Docs/\xe1\x8e\xa0dir" FOLDER-JSON+ ;]
+   ar ENTRIES s" first" false PAGE
+   [: s" /docs/new" s" /Docs/New" FOLDER-JSON+ ;] ar ENTRIES s" second" false PAGE
+   d [: j TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK ar REFRESHED
+        j S\" docs/\xea\xad\xb0dir" ar HELD-PATH S\" docs/\xea\xad\xb0dir" T$=
+        j TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK ar REFRESHED ;]
+   ar LOGGED drop
+   j S\" docs/\xea\xad\xb0dir" ar HELD-PATH S\" docs/\xea\xad\xb0dir" T$=
+   d j GONE ;
+
+\ A delta after the listing first, then the same key in a fresh
+\ journal's full listing of full: both spelled alike.
+: DELTA-AS-LISTING ( [ -- ] [ -- ] [ -- ] str str ^ARENA:arena -- )
+   {: first delta full k:str label:str ar :}
+   label T-LABEL
+   TEST-DROPBOX:RESET
+   ar CASE-JOURNAL {: d:str j :}
+   ar CASE-JOURNAL {: od:str oracle :}
+   first ar ENTRIES s" first" false PAGE
+   delta ar ENTRIES s" second" false PAGE
+   full ar ENTRIES s" third" false PAGE
+   d [: j TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK ar REFRESHED
+        j TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK ar REFRESHED
+        oracle TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK ar REFRESHED ;]
+   ar LOGGED drop
+   j k ar HELD-PATH oracle k ar HELD-PATH T$=
+   d j GONE od oracle GONE ;
+
+: AN-INFERRED-PARENT-RESPELLS-A-HOLD ( ^ARENA:arena -- )
+   {: ar :}
+   [: S\" /\xe1\x8e\xa0dir" S\" /\xe1\x8e\xa0dir" FOLDER-JSON+ ;]
+   [: S\" /\xea\xad\xb0dir/new" S\" /\xea\xad\xb0Dir/New" FOLDER-JSON+ ;]
+   [: S\" /\xe1\x8e\xa0dir" S\" /\xe1\x8e\xa0dir" FOLDER-JSON+ COMMA+
+      S\" /\xea\xad\xb0dir/new" S\" /\xea\xad\xb0Dir/New" FOLDER-JSON+ ;]
+   S\" \xea\xad\xb0dir" s" an inferred parent respells a hold" ar
+   DELTA-AS-LISTING ;
+
+: AN-UNSUPPORTED-PARENT-GIVES-NO-CASING ( ^ARENA:arena -- )
+   {: ar :}
+   [: s" /docs" s" /Other" FOLDER-JSON+ COMMA+
+      S\" /docs/\xe1\x8e\xa0dir" S\" /Docs/\xe1\x8e\xa0dir" FOLDER-JSON+ ;]
+   [: S\" /docs/\xea\xad\xb0dir" S\" /Docs/\xea\xad\xb0Dir" FOLDER-JSON+ ;]
+   [: s" /docs" s" /Other" FOLDER-JSON+ COMMA+
+      S\" /docs/\xe1\x8e\xa0dir" S\" /Docs/\xe1\x8e\xa0dir" FOLDER-JSON+ COMMA+
+      S\" /docs/\xea\xad\xb0dir" S\" /Docs/\xea\xad\xb0Dir" FOLDER-JSON+ ;]
+   S\" docs/\xea\xad\xb0dir" s" an unsupported parent gives no casing" ar
+   DELTA-AS-LISTING ;
+
 : MISMATCH-LOGGED-ONCE-AFTER-A-FAILED-PAGE ( ^ARENA:arena -- )
    {: ar :}
    s" mismatch logged once after a failed page" T-LABEL
@@ -2976,6 +3143,11 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
    ar MISMATCHED-ENTRY-PUBLISHES-AS-UNSUPPORTED
    ar UNLOWERED-PATH-PUBLISHES-AT-ITS-FOLD
    ar SHARED-FOLD-KEEPS-ITS-FOLDERS-SPELLING
+   ar HOLD-RESPELLED-WHEN-ITS-FOLDER-GOES
+   ar HOLD-RESPELLED-WHEN-ITS-FOLDER-RETURNS
+   ar INFERRED-PARENT-KEEPS-A-HOLDS-SPELLING
+   ar AN-INFERRED-PARENT-RESPELLS-A-HOLD
+   ar AN-UNSUPPORTED-PARENT-GIVES-NO-CASING
    ar MISMATCH-LOGGED-ONCE-AFTER-A-FAILED-PAGE
    ar EXTRA-COMPONENT-PUBLISHES-AS-UNSUPPORTED
    ar UNLOWERED-ROOT-LISTS-ITS-ENTRIES ;
@@ -7975,6 +8147,7 @@ TYPED-VARIABLE STAND-IN-UPLOAD str
    ar DIRECTORY-RECORDS-NORMALIZE-INCONSISTENT-CHILD-ANCESTOR-CASING
    ar DELTA-NEVER-RESPELLS-A-DIRECTORY-THAT-STILL-EXISTS
    ar LISTING-KEEPS-MISMATCHED-PATHS-UNSUPPORTED
+   ar A-HOLD-IS-RE-ADDED-ONCE
    ar MISMATCHED-RESTRICTED-FOLDER-DROPS-ITS-CHILDREN
    ar TWO-SPELLINGS-SHARE-ONE-KEY
    ar A-DELETED-UNLOWERED-FOLDER-LEAVES-NO-RECORD

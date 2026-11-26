@@ -1427,11 +1427,14 @@ STRUCTURE casing
       ENDOF
    ;MATCH ;
 
-: FOLDER-WRITE? ( JOURNAL:remote-inventory-change -- bool )
-   CHANGE-RECORD MATCH option
+: FOLDER-RECORD? ( option<MODEL:remote-record> -- bool )
+   MATCH option
       none OF false ENDOF
       some OF REMOTE-OBSERVATION SPELLS-FOLDER? ENDOF
    ;MATCH ;
+
+: FOLDER-WRITE? ( JOURNAL:remote-inventory-change -- bool )
+   CHANGE-RECORD FOLDER-RECORD? ;
 
 \ Change x against y by key.
 : CHANGE-CMP ( n n ^VEC:vector<JOURNAL:remote-inventory-change> -- n )
@@ -1543,6 +1546,15 @@ STRUCTURE casing
       unhold OF drop drop held ENDOF
    ;MATCH ;
 
+: RUN-APPLIED
+   ( option<MODEL:remote-record> n n n ^VEC:vector<n>
+     ^VEC:vector<JOURNAL:remote-inventory-change>
+     -- option<MODEL:remote-record> )
+   {: held from:n end:n last:n ws cs :}
+   held end from ?do
+      ws i VEC:AT @ dup last > if cs swap VEC:AT @ APPLIED else drop then
+   loop ;
+
 \ Replays the run of writes from i numbered after the last delete over
 \ their key, pushing the record they leave; the index after the run.
 : KEY-RECORD
@@ -1551,9 +1563,7 @@ STRUCTURE casing
    {: from:n ws cs ds out :}
    ws from cs KEY-RUN-END {: end:n :}
    ws from cs NTH-KEY ds cs LAST-DELETE {: last:n :}
-   NO-RECORD end from ?do
-      ws i VEC:AT @ dup last > if cs swap VEC:AT @ APPLIED else drop then
-   loop
+   NO-RECORD from end last ws cs RUN-APPLIED
    MATCH option
       none OF ENDOF
       some OF out VEC:PUSH ! ENDOF
@@ -1680,19 +1690,6 @@ STRUCTURE casing
    out ar NORMALIZE-INVENTORY-RECORDS
    out ;
 
-\ The journal directory at k keeps its spelling while no delete is
-\ over it.
-: KEPT-CASING
-   ( MODEL:key JOURNAL:journal ^VEC:vector<n>
-     ^VEC:vector<JOURNAL:remote-inventory-change> ^VEC:vector<casing>
-     ^ARENA:arena -- )
-   {: k j ds cs cv ar :}
-   k ds cs LAST-DELETE 0 >= if exit then
-   j k ar JOURNAL:REMOTE-DIRECTORY-AT MATCH option
-      none OF ENDOF
-      some OF {: p :} k p cv ar INSERT-DIRECTORY-CASING ENDOF
-   ;MATCH ;
-
 \ Pushes the key of each of k's ancestors, outermost first, then k.
 : LINEAGE+ ( MODEL:key ^VEC:vector<MODEL:key> -- )
    {: k v :}
@@ -1733,67 +1730,44 @@ STRUCTURE casing
    v idx at 1- VEC:AT @ VEC:AT @ v idx at VEC:AT @ VEC:AT @
    MODEL:KEY= 0= ;
 
-\ The kept casings at every key a change spells and at each of a hold's
-\ ancestors, each once: a hold's ancestors past those its lower path
-\ shares are other entries' holds, not writes.
-: KEPT-CASINGS
+\ The record whose spelling the folder at k takes. A folder the journal
+\ lists keeps its spelling until a delete is over it, as the stored
+\ paths beneath it are spelled so; otherwise the writes at k after the
+\ last delete over k apply to what the journal lists there, as they
+\ will when the journal applies them.
+: SPELLING-RECORD
+   ( MODEL:key JOURNAL:journal ^VEC:vector<n> ^VEC:vector<n>
+     ^VEC:vector<JOURNAL:remote-inventory-change> ^ARENA:arena
+     -- option<MODEL:remote-record> )
+   {: k j ws ds cs ar :}
+   k ds cs LAST-DELETE {: last:n :}
+   last 0 >= if NO-RECORD else j k ar JOURNAL:REMOTE-LISTED-AT then
+   {: held :}
+   held FOLDER-RECORD? if held exit then
+   k KEY-BYTES ws VEC:COUNT [: ws swap cs NTH-KEY ;] FIND-BYTES
+   {: from:n :}
+   from ws VEC:COUNT = if held exit then
+   held from ws from cs KEY-RUN-END last ws cs RUN-APPLIED ;
+
+: DELTA-CASINGS
    ( JOURNAL:journal ^VEC:vector<n>
-     ^VEC:vector<JOURNAL:remote-inventory-change> ^VEC:vector<casing>
-     ^ARENA:arena -- )
-   {: j ds cs cv ar :}
+     ^VEC:vector<JOURNAL:remote-inventory-change> ^ARENA:arena
+     -- ^VEC:vector<casing> )
+   {: j ds cs ar :}
+   cs [: WRITE? ;] ar KEYED-NUMBERS {: ws :}
    cs ar SPELLED-KEYS {: ks :}
    ks VEC:COUNT [: ks KEY-NTH-CMP ;] ar STABLE-ORDER {: idx :}
+   ar NO-CASINGS {: cv :}
    idx VEC:COUNT 0 ?do
       i idx ks FIRST-OF-KEY? if
-         ks idx i VEC:AT @ VEC:AT @ j ds cs cv ar KEPT-CASING
+         ks idx i VEC:AT @ VEC:AT @ j ws ds cs ar SPELLING-RECORD
+         MATCH option
+            none OF ENDOF
+            some OF cv ar RECORD-CASING ENDOF
+         ;MATCH
       then
-   loop ;
-
-: WRITE-CASING
-   ( JOURNAL:remote-inventory-change ^VEC:vector<casing> ^ARENA:arena
-     -- )
-   {: c cv ar :}
-   c CHANGE-RECORD MATCH option
-      none OF ENDOF
-      some OF MODEL-REMOTE--RECORD:UNMAKE {: k p o :}
-         k p cv ar INSERT-DIRECTORY-CASING
-      ENDOF
-   ;MATCH ;
-
-\ The casing of the run of folder writes from i: its first numbered
-\ after the last delete over the key; the index after the run.
-: RUN-CASING
-   ( n ^VEC:vector<n> ^VEC:vector<JOURNAL:remote-inventory-change>
-     ^VEC:vector<n> ^VEC:vector<casing> ^ARENA:arena -- n )
-   {: from:n ws cs ds cv ar :}
-   ws from cs KEY-RUN-END {: end:n :}
-   ws from cs NTH-KEY ds cs LAST-DELETE {: last:n :}
-   from end [: ws swap VEC:AT @ last <= ;] SORT:PARTITION-POINT
-   {: at:n :}
-   at end < if cs ws at VEC:AT @ VEC:AT @ cv ar WRITE-CASING then
-   end ;
-
-\ Casing x against y by key.
-: CASING-CMP ( n n ^VEC:vector<casing> -- n )
-   {: x:n y:n cv :}
-   cv x VEC:AT @ CASING-KEY cv y VEC:AT @ CASING-KEY MODEL:KEY-CMP ;
-
-: FIRST-CASING+ ( casing ^VEC:vector<casing> -- )
-   {: c out :}
-   out VEC:COUNT {: u:n :}
-   u 0 > if
-      out u 1- VEC:AT @ CASING-KEY c CASING-KEY MODEL:KEY= if exit then
-   then
-   c out VEC:PUSH ! ;
-
-\ The casings by key, the first of each key's.
-: UNIQUE-CASINGS
-   ( ^VEC:vector<casing> ^ARENA:arena -- ^VEC:vector<casing> )
-   {: cv ar :}
-   cv VEC:COUNT [: cv CASING-CMP ;] ar STABLE-ORDER {: idx :}
-   ar NO-CASINGS {: out :}
-   idx VEC:COUNT 0 ?do cv idx i VEC:AT @ VEC:AT @ out FIRST-CASING+ loop
-   out ;
+   loop
+   cv ;
 
 \ A hold respelled by the casings; any other change as it is.
 : RESPELL-HOLD
@@ -1827,19 +1801,127 @@ STRUCTURE casing
       unhold OF drop drop c ENDOF
    ;MATCH ;
 
-\ Rust's normalize_inventory_changes: a directory keeps the journal's
-\ spelling until a delete is over it, then takes the first after.
-: NORMALIZE-INVENTORY-CHANGES
+\ Whether the lower path l is at the bytes s or beneath them, as the
+\ journal drops a hold under a delete or an unhold there.
+: LOWER-AT? ( MODEL:path str -- bool )
+   {: l s:str :}
+   l PATH$ MODEL:>KEY {: lk :}
+   s MODEL:>KEY {: sk :}
+   lk sk MODEL:KEY= lk sk MODEL:BENEATH? or ;
+
+\ Whether the change leaves the hold of the entry at lower l as it
+\ was: it holds nothing at l and unholds or deletes nothing over l.
+: KEEPS-HOLD? ( JOURNAL:remote-inventory-change MODEL:path -- bool )
+   {: c l :}
+   c MATCH JOURNAL:remote-inventory-change
+      upsert OF drop true ENDOF
+      ensure-directory OF drop true ENDOF
+      delete-subtree OF KEY-BYTES {: s:str :} l s LOWER-AT? 0= ENDOF
+      hold OF drop drop PATH$ l PATH$ STR:= 0= ENDOF
+      unhold OF drop PATH$ {: s:str :} l s LOWER-AT? 0= ENDOF
+   ;MATCH ;
+
+\ Whether the changes up to the one numbered at, it included, leave
+\ the hold of the entry at lower l as the journal stores it.
+: HOLD-LEFT?
+   ( n MODEL:path ^VEC:vector<JOURNAL:remote-inventory-change> -- bool )
+   {: at:n l cs :}
+   at 1+ 0 ?do
+      cs i VEC:AT @ l KEEPS-HOLD? 0= if false unloop exit then
+   loop
+   true ;
+
+\ The stored hold h, when the changes up to the one numbered at leave
+\ it, as its entry's listing writes it (HOLD+): its record spelled as
+\ its key, for the casings to respell.
+: RELISTED+
+   ( JOURNAL:remote-inventory-change n
+     ^VEC:vector<JOURNAL:remote-inventory-change>
+     ^VEC:vector<JOURNAL:remote-inventory-change> -- )
+   {: h at:n cs out :}
+   h MATCH JOURNAL:remote-inventory-change
+      upsert OF drop ENDOF
+      ensure-directory OF drop ENDOF
+      delete-subtree OF drop ENDOF
+      hold OF drop {: l k :}
+         at l cs HOLD-LEFT? if
+            l k k KEY-BYTES MODEL:>PATH
+            JOURNAL-REMOTE--INVENTORY--CHANGE:HOLD out VEC:PUSH !
+         then
+      ENDOF
+      unhold OF drop drop ENDOF
+   ;MATCH ;
+
+\ A delete or a folder write can change the spelling of the folders
+\ above the stored holds at or beneath its key.
+: RESPELLS-HOLDS? ( JOURNAL:remote-inventory-change -- bool )
+   {: c :}
+   c DELETE? c FOLDER-WRITE? or ;
+
+\ Whether a key in v, sorted by key, is above k.
+: UNDER-ANY? ( MODEL:key ^VEC:vector<MODEL:key> -- bool )
+   {: k v :}
+   k KEY-BYTES {: s:str :}
+   s str> {: p:^ u:n :}
+   u 0 ?do
+      p i + c@ SEPARATOR = if
+         s 0 i PART v VEC:COUNT [: v swap VEC:AT @ ;] FIND-BYTES
+         v VEC:COUNT < if true unloop exit then
+      then
+   loop
+   false ;
+
+: ROOT+
+   ( n ^VEC:vector<n> ^VEC:vector<JOURNAL:remote-inventory-change>
+     ^VEC:vector<MODEL:key> -- n )
+   {: at:n ns cs v :}
+   ns at cs NTH-KEY {: k :}
+   k v UNDER-ANY? 0= if k v VEC:PUSH ! then
+   ns at cs KEY-RUN-END ;
+
+\ The keys of the changes that respell holds, none beneath another. A
+\ key's ancestor need not be the key before it (a, a-, a/x), so
+\ UNDER-ANY? searches every root.
+: RESPELLING-ROOTS
+   ( ^VEC:vector<JOURNAL:remote-inventory-change> ^ARENA:arena
+     -- ^VEC:vector<MODEL:key> )
+   {: cs ar :}
+   cs [: RESPELLS-HOLDS? ;] ar KEYED-NUMBERS {: ns :}
+   ar ARENA:ALLOCATOR 0 [type] MODEL:key VEC:NEW {: v :}
+   0 begin dup ns VEC:COUNT < while ns cs v ROOT+ repeat drop
+   v ;
+
+: KEPT-HOLDS+
+   ( MODEL:key n ^VEC:vector<JOURNAL:remote-inventory-change>
+     JOURNAL:journal ^VEC:vector<JOURNAL:remote-inventory-change>
+     ^ARENA:arena -- )
+   {: k last:n cs j out ar :}
+   j k ar JOURNAL:SUBTREE-HOLDS {: hs :}
+   hs VEC:COUNT 0 ?do hs i VEC:AT @ last cs out RELISTED+ loop ;
+
+\ The changes, then each stored hold at or beneath their roots that no
+\ change replaces or removes, once, to be respelled. Last is a safe
+\ place: hold changes touch only the holds, the journal settles after
+\ the whole delta, and every hold takes the delta's final casings.
+: WITH-KEPT-HOLDS
    ( ^VEC:vector<JOURNAL:remote-inventory-change> JOURNAL:journal
      ^ARENA:arena -- ^VEC:vector<JOURNAL:remote-inventory-change> )
    {: cs j ar :}
-   cs ar LATEST-DELETES {: ds :}
-   cs [: FOLDER-WRITE? ;] ar KEYED-NUMBERS {: ws :}
-   ar NO-CASINGS {: all :}
-   j ds cs all ar KEPT-CASINGS
-   0 begin dup ws VEC:COUNT < while ws cs ds all ar RUN-CASING repeat
-   drop
-   all ar UNIQUE-CASINGS {: cv :}
+   ar ARENA:ALLOCATOR 0 [type] JOURNAL:remote-inventory-change VEC:NEW
+   {: out :}
+   cs VEC:COUNT 0 ?do cs i VEC:AT @ out VEC:PUSH ! loop
+   cs ar RESPELLING-ROOTS {: roots :}
+   roots VEC:COUNT 0 ?do
+      roots i VEC:AT @ cs VEC:COUNT 1- cs j out ar KEPT-HOLDS+
+   loop
+   out ;
+
+: NORMALIZE-INVENTORY-CHANGES
+   ( ^VEC:vector<JOURNAL:remote-inventory-change> JOURNAL:journal
+     ^ARENA:arena -- ^VEC:vector<JOURNAL:remote-inventory-change> )
+   {: listed j ar :}
+   listed j ar WITH-KEPT-HOLDS {: cs :}
+   j cs ar LATEST-DELETES cs ar DELTA-CASINGS {: cv :}
    ar ARENA:ALLOCATOR cs VEC:COUNT
    [type] JOURNAL:remote-inventory-change VEC:NEW {: out :}
    cs VEC:COUNT 0 ?do
