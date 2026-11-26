@@ -848,11 +848,6 @@ private
 
 public
 
-\ The identity of the root the descriptor names, path its canonical path.
-: FROM-STATX ( str fd -- local-root-binding )
-   {: path:str dir:fd :}
-   path path dir IDENTITY FROM-STATX-FIELDS ;
-
 \ The identity of the directory at the canonical path, opened without
 \ following a link; any failure but a birth time's is E-ROOT.
 : INSPECT ( str -- local-root-binding )
@@ -1009,8 +1004,8 @@ private
 
 public
 
-\ FROM-STATX's identity of the descriptor's directory, or none where its
-\ filesystem reports no birth time and it stands in for the root.
+\ The identity of the root the descriptor names, path its canonical path;
+\ none where its filesystem has no birth time and it stands in for the root.
 : INSPECT-ROOT-AT
    ( str fd journal ^ARENA:arena -- option<local-root-binding> )
    {: path:str dir:fd j ar :}
