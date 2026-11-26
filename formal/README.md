@@ -96,7 +96,8 @@ unchanged; deleting durable entries requires a complete validated publication.
 `ConflictPlacement` checks one new conflict's step, `CONFLICT-PLACEMENT`, and
 the sweep after it: copies are prepared only for an unrecorded conflict whose
 block is due or absent, and a block is left exactly when the step ended with a
-taken copy name or stage place, or early with its block kept.
+taken copy name or stage place, or early with its block kept. With no sweep
+after it, as after a crash, only a step that took a name or place wrote one.
 
 `ServiceDrive` checks one drive of the user unit toward each goal, `DRIVING` in
 `src/service.f`. Any observation may read any state, and any step may fail, a
