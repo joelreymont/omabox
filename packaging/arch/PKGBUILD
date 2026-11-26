@@ -1,5 +1,5 @@
 pkgname=omabox
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='Dropbox sync for Omarchy: a headless daemon, a CLI and a bar widget'
 arch=(aarch64)
@@ -10,7 +10,7 @@ depends=(glibc libmbedtls.so=23-64 libmbedx509.so=9-64 libtfpsacrypto.so=2-64
 makedepends=(git)
 # Habu's programs have no section headers to strip or split.
 options=(!strip !debug)
-_habu=fc02aaa7acfcbc7fcf55ea50a6f702cad52e0e4f
+_habu=646c5eb2ed5bc90a5382bb9113db21375b22636a
 source=("omabox::git+https://github.com/joelreymont/omabox.git#tag=v$pkgver"
         "habu::git+https://github.com/joelreymont/habu.git#commit=$_habu")
 sha256sums=(SKIP SKIP)
