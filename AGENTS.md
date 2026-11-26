@@ -10,6 +10,8 @@ rewrite and `JOURNAL.md` records it.
 - Keep real local files; do not implement a virtual filesystem.
 - Keep the daemon headless and CLI/QML concerns separate.
 - Prefer the smallest direct mechanism. Add architecture only for a measured need.
+- Keep the idle daemon's heap to a few hundred kilobytes, a megabyte or two at
+  most. What glibc's per-thread malloc cache keeps (about 110 kB) is accepted.
 
 ## Safety
 
