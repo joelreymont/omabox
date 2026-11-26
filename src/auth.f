@@ -32,6 +32,7 @@ require src/lib/secret.f
 require src/lib/process.f
 require src/lib/entropy.f
 require src/lib/base64.f
+require src/lib/uri.f
 require src/journal.f
 
 package AUTH
@@ -378,37 +379,17 @@ ARENA PENDINGS pending
    BASE$ STR:len TYPE$ STR:len + CHALLENGE$ STR:len +
    METHOD$ STR:len + ;
 
-\ The byte form_urlencoded writes as +.
-32 constant SPACE
-
-\ form_urlencoded's bytes kept as they are.
-: KEPT? ( n -- bool )
-   {: b:n :}
-   b STR:ALNUM? b [char] * = or b [char] - = or
-   b [char] . = or b [char] _ = or ;
-
-: HEX ( n -- n ) dup 10 < if [char] 0 + else 55 + then ;
-
 \ Copies the bytes to p; answers the address after them.
 : PUT ( ^u8 str -- ^u8 )
    {: p:^ s:str :}
    s str> {: a:^ u:n :}
    a p u BYTE-COPY p u + ;
 
-\ A byte as form_urlencoded writes it: kept, a space as +, or %XX.
-: FORM-BYTE ( ^u8 n -- ^u8 )
-   {: p:^ b:n :}
-   b KEPT? if b p c! p 1 + exit then
-   b SPACE = if [char] + p c! p 1 + exit then
-   [char] % p c!
-   b 4 rshift HEX p 1 + c!
-   b 15 and HEX p 2 + c!
-   p 3 + ;
-
+\ Writes the bytes to p form-encoded, as form_urlencoded does; answers the
+\ address after them.
 : FORM ( ^u8 str -- ^u8 )
    {: p:^ s:str :}
-   s str> {: a:^ u:n :}
-   p u 0 ?do a i + c@ FORM-BYTE loop ;
+   s p s URI:FORM-LEN SPAN:MAKE URI:FORM-ENCODE p + ;
 
 \ The SDK's PKCE challenge: the verifier's SHA-256 in unpadded base64url.
 : CHALLENGE ( str ^ARENA:arena -- str )

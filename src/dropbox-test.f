@@ -2185,6 +2185,20 @@ variable AGAIN-CODE
    link DROPBOX:CLOSE ;
 
 
+\ A refresh token's bytes reach Dropbox as form_urlencoded writes them: `~`
+\ escaped, `*` as it is and a space as `+`.
+: FORM-BYTES-CASE ( -- )
+   s" refresh token form-encoded" T-LABEL
+   TEST-DROPBOX:RESET
+   s" fake-key" s" a~b*c d" TEST-DROPBOX:ACCEPT!
+   s" a~b*c d" s" ns-root" RECORDED-CLIENT {: odd :}
+   odd DROPBOX:ACCOUNT DROPBOX:DONE? ASSERT
+   s" /oauth2/token" TEST-DROPBOX:BODIES-TO$
+   s" grant_type=refresh_token&refresh_token=a%7Eb*c+d&client_id=fake-key" T$=
+   odd DROPBOX:CLOSE
+   s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT! ;
+
+
 \ OUTCOME: OWN's exchange of a dead code answered unlinked.
 : DEAD-EXCHANGE ( -- )
    s" dead-code" s" fake-verifier" OWN @ DROPBOX:EXCHANGE UNLINKED?
@@ -3147,6 +3161,7 @@ TYPED-VARIABLE FAULT fault
    WAITED-DELETE-CASE GARBLED-DELETE-CASE
    LOST-REFRESH-CASE
    EXCHANGE-CASE DEAD-CODE-CASE RESERVED-REFRESH-CASE RESERVED-CODE-CASE
+   FORM-BYTES-CASE
    OAUTH-LISTING-LONGPOLL-AND-EXACT-DOWNLOAD-USE-DOCUMENTED-PROTOCOL
    LINK-CASES
    UPLOAD-CASES DROPBOX:THROW-CASES

@@ -53,6 +53,7 @@ require src/lib/fsm.f
 require src/lib/adt/option.f
 require src/lib/unicode.f
 require src/lib/date.f
+require src/lib/uri.f
 require src/lib/type/deftype.f
 require src/version.f
 
@@ -836,28 +837,16 @@ HEAP:ALLOCATOR VEC-ALLOC !
 
 \ ---- the token
 
-: UNRESERVED? ( n -- bool )
-   {: b:n :}
-   b STR:DIGIT? b STR:ASCII-LOWER dup 97 >= swap 122 <= and or
-   b 45 = or b 46 = or b 95 = or b 126 = or ;
-
-
-: HEX ( n -- n ) dup 10 < if 48 + else 55 + then ;
-
-
-: BYTE+ ( n ^VEC:vector<u8> -- )
-   {: b:n v :}
-   b UNRESERVED? if b v PUSH exit then
-   37 v PUSH
-   b 4 rshift HEX v PUSH
-   b 15 and HEX v PUSH ;
-
-
-\ Percent-encodes all but RFC 3986's unreserved bytes.
+\ Appends the bytes form-encoded, as URI:FORM-ENCODE writes them; they may be
+\ the vector's own, though growth moves the block.
 : ENCODED+ ( str ^VEC:vector<u8> -- )
-   {: s v :}
-   s str> {: a:^ u:n :}
-   u 0 ?do a i + c@ v BYTE+ loop ;
+   {: s:str v:^ :}
+   s URI:FORM-LEN {: len:n :}
+   v VEC:COUNT {: at:n :}
+   v at len + s STR:DATA VEC:MAKE-ROOM {: src:^ :}
+   v at len + VEC:ENSURE
+   src s STR:LEN >str v VEC:BYTES STR:DATA at + len SPAN:MAKE
+   URI:FORM-ENCODE drop ;
 
 
 \ The refresh's form body, in the line buffer: HTTPC:HEADER+ copied each
