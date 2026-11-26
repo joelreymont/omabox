@@ -132,6 +132,7 @@ require src/lib/adt/option.f
 require src/lib/fs-list.f
 require src/lib/aio.f
 require src/lib/ffi-abi.f
+require src/lib/sqlite.f
 require src/dropbox.f
 require src/test-dropbox.f
 require src/model.f
