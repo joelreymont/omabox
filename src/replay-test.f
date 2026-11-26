@@ -641,7 +641,7 @@ create TIMES 32 allot
 : REPLAYED
    ( JOURNAL:journal str ^ARENA:arena -- ^REPLAY:replay-report )
    {: j root:str ar :}
-   root s" open test root" LOCAL:OPEN-ROOT {: f:fd :}
+   root FS:OPEN-DIR {: f:fd :}
    [: j f root j ar JOURNAL:PENDING-PLANS ar
       REPLAY:REPLAY-LOCAL-PLANS-AT ;]
    [: f FS:CLOSE-DIR ;] finally ;
@@ -755,13 +755,19 @@ $140 constant MODE-NO-WRITE
       destination-occupied OF drop LOCAL:E-OCCUPIED throw ENDOF
    ;MATCH ;
 
+\ The file at p below the open root staged as an upload in s.
+: STAGED-BELOW ( fd str str ^ARENA:arena -- ^LOCAL:staged-upload )
+   {: root:fd s:str p:str ar :}
+   root p ar LOCAL:OBSERVE-UPLOAD-SOURCE-AT {: c:DROPBOX:hash :}
+   root p s c ar LOCAL:STAGE-UPLOAD-AT UPLOAD-OF ;
+
 \ The file at p below the root, written and staged as an upload.
 : STAGED
    ( str str str ^ARENA:arena -- ^LOCAL:staged-upload )
    {: r:str s:str p:str ar :}
    r p ar TEST-CLIENT:INSIDE s" local edit" FS:WRITE-ALL
-   r p ar LOCAL:OBSERVE-UPLOAD-SOURCE {: c:DROPBOX:hash :}
-   r p s c ar LOCAL:STAGE-UPLOAD UPLOAD-OF ;
+   r FS:OPEN-DIR {: root:fd :}
+   [: root s p ar STAGED-BELOW ;] [: root FS:CLOSE-DIR ;] finally ;
 
 \ The absolute path of p's local conflict copy holding the upload.
 : COPY-NAME
@@ -791,7 +797,7 @@ $140 constant MODE-NO-WRITE
       source-changed OF s" source-changed" s" " ENDOF
    ;MATCH ;
 
-: OPEN-ROOT ( str -- fd ) s" open test sync root" LOCAL:OPEN-ROOT ;
+: OPEN-ROOT ( str -- fd ) FS:OPEN-DIR ;
 
 \ The local conflict copy of p, written below the root r.
 : LOCAL-COPY$
@@ -1904,7 +1910,7 @@ TYPED-VARIABLE SENT ^LOCAL:staged-upload
      ^ARENA:arena -- str str str )
    {: j plan r:str s:str want ar :}
    0 SENDS !
-   r s" open test root" LOCAL:OPEN-ROOT {: f:fd :}
+   r OPEN-ROOT {: f:fd :}
    j f r plan ar OFFLINE ar REPLAY:PASS-OVER {: p :}
    s p REPLAY:PASS-STAGING !
    [: want p [: SEND REPLAY:APPLY-EVENT-DONE ;] REPLAY:PREPARE-UPLOAD
@@ -1915,12 +1921,19 @@ TYPED-VARIABLE SENT ^LOCAL:staged-upload
 : EDITED ( str ^ARENA:arena -- )
    s" notes.txt" swap TEST-CLIENT:INSIDE s" local edit" FS:WRITE-ALL ;
 
+\ The content of notes.txt below the root r.
+: NOTES-HASH ( str ^ARENA:arena -- DROPBOX:hash )
+   {: r:str ar :}
+   r OPEN-ROOT {: root:fd :}
+   [: root s" notes.txt" ar LOCAL:OBSERVE-UPLOAD-SOURCE-AT ;]
+   [: root FS:CLOSE-DIR ;] finally ;
+
 : PREPARE-UPLOAD-SENDS-THE-STAGE ( ^ARENA:arena -- )
    {: ar :}
    s" prepare upload sends the stage" T-LABEL
    ar UPLOAD-DIRS {: d:str r:str s:str j :}
    r ar EDITED
-   r s" notes.txt" ar LOCAL:OBSERVE-UPLOAD-SOURCE {: want :}
+   r ar NOTES-HASH {: want :}
    j want ar UPLOAD-PLAN {: plan :}
    j plan r s want ar PREPARED s" -" T$= s" -" T$= s" done" T$=
    SENDS @ 1 T=
@@ -1949,7 +1962,7 @@ TYPED-VARIABLE SENT ^LOCAL:staged-upload
    s" prepare upload holds an occupied stage" T-LABEL
    ar UPLOAD-DIRS {: d:str r:str s:str j :}
    r ar EDITED
-   r s" notes.txt" ar LOCAL:OBSERVE-UPLOAD-SOURCE {: want :}
+   r ar NOTES-HASH {: want :}
    s want DROPBOX:HASH>STR ar TEST-CLIENT:INSIDE {: k:str :}
    k FS:MAKE-DIR
    j want ar UPLOAD-PLAN {: plan :}

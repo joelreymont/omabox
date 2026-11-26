@@ -530,7 +530,7 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
 \ Rust's fingerprint: the file's below the case's root.
 : FINGERPRINT-AT ( str -- MODEL:fingerprint )
    {: p:str :}
-   ROOT$ s" open test scan root" OPEN-ROOT {: root:fd :}
+   ROOT$ s" open test scan root" OPEN-ABSOLUTE-DIRECTORY {: root:fd :}
    root p s" open test scan file" E-IO E-UNSUPPORTED
    OPEN-RELATIVE-REGULAR {: f:fd :}
    f p s" inspect test scan file" STAT-FD p FILE-FINGERPRINT
@@ -860,7 +860,7 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
 
 \ ---- a listed directory's guards
 
-: TEST-ROOT ( -- fd ) ROOT$ s" open test scan root" OPEN-ROOT ;
+: TEST-ROOT ( -- fd ) ROOT$ s" open test scan root" OPEN-ABSOLUTE-DIRECTORY ;
 
 \ The walk's no-follow stat of the name in dir.
 : WALK-STAT ( fd str -- MODEL:stat ) FS:TRY-STAT-AT TTRUE BUF-STAT ;
@@ -1238,7 +1238,7 @@ create CHAIN-BUF CHAIN-LEN allot
    s" unreadable_regular_file_is_reported_as_unreadable" T-LABEL
    ROOT-USER? if exit then
    s" locked.txt" s" locked" WRITE
-   ROOT$ s" open test root" OPEN-ROOT {: root:fd :}
+   ROOT$ s" open test root" OPEN-ABSOLUTE-DIRECTORY {: root:fd :}
    s" locked.txt" DENY
    [: [: root HASH-LOCKED ;] E-UNREADABLE TTHROWSQ ;] STDERR-OF
    s" local path `locked.txt` is a file Omabox cannot read" STR:CONTAINS?
@@ -1258,7 +1258,7 @@ variable CAUGHT
    ROOT-USER? if exit then
    s" closed" MKDIR
    s" closed/file.txt" s" inside" WRITE
-   s" closed" AT s" open test parent" OPEN-ROOT {: parent:fd :}
+   s" closed" AT s" open test parent" OPEN-ABSOLUTE-DIRECTORY {: parent:fd :}
    s" closed" AT MODE-0600 FS:CHMOD-MODE
    [: [: parent HASH-BELOW ;]
       [: FS:ERRNO CAUGHT ! s" closed" ALLOW ;] finally
@@ -1639,7 +1639,7 @@ variable RAISED-ERRNO
 : ADDED-WD ( ^watch str -- n )
    {: w p:str :}
    p STR:LEN 0= if ROOT$ else p AT then
-   s" open watched folder" OPEN-ROOT {: f:fd :}
+   s" open watched folder" OPEN-ABSOLUTE-DIRECTORY {: f:fd :}
    w f p WATCH-ADD WD-OF {: wd:n :}
    f DISCARD  wd ;
 
@@ -2283,7 +2283,7 @@ FS:PATHZ-CAP BUFFER: JOINED
 \ Runs q on the case directory's fd, then removes the directory.
 : IN-CASE-DIR ( [ fd -- ] -- )
    {: q :}
-   CASE-DIR ROOT$ s" open test root" LOCAL:OPEN-ROOT {: root:fd :}
+   CASE-DIR ROOT$ FS:OPEN-DIR {: root:fd :}
    [: root q execute ;]
    [: root FS:CLOSE-DIR ROOT$ FS:REMOVE-TREE ;] finally ;
 
@@ -2321,7 +2321,7 @@ FS:PATHZ-CAP BUFFER: JOINED
 : ENTRY-EXISTENCE-NEVER-FOLLOWS-SYMLINKS-AND-TREATS-PROBE-FAILURES-AS-UNCONFIRMED
    ( -- )
    CASE-DIR ENTRY-TREE
-   ROOT$ s" open test root" LOCAL:OPEN-ROOT {: root:fd :}
+   ROOT$ FS:OPEN-DIR {: root:fd :}
    [: root ENTRY-CHECKS root DENIED ;]
    [: root FS:CLOSE-DIR ROOT$ FS:REMOVE-TREE ;] finally ;
 
@@ -2656,7 +2656,9 @@ FS:PATHZ-CAP BUFFER: LOG-AT
 : UPLOAD-STAGE
    ( str DROPBOX:hash -- LOCAL:stage-outcome<^LOCAL:staged-upload> )
    {: name:str want:DROPBOX:hash :}
-   UPLOAD-ROOT name STAGING want AR @ LOCAL:STAGE-UPLOAD ;
+   UPLOAD-ROOT FS:OPEN-DIR {: root:fd :}
+   [: root name STAGING want AR @ LOCAL:STAGE-UPLOAD-AT ;]
+   [: root FS:CLOSE-DIR ;] finally ;
 
 \ The hash of what the stage's verified descriptor reads.
 : VERIFIED$ ( ^LOCAL:staged-upload -- str )
@@ -2736,7 +2738,7 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    code 0<> if code throw then
    n 0 T= ;
 
-\ Each outcome STAGE-UPLOAD answers, from one source file.
+\ Each outcome STAGE-UPLOAD-AT answers, from one source file.
 : UPLOAD-OUTCOME-CASES ( -- )
    UPLOAD-DIRS
    s" root/source" s" source bytes" PUT-FILE
@@ -3051,7 +3053,7 @@ variable SYNC-U
    s" sync" AT FS:MAKE-DIR
    s" sync" AT str> {: p:^ u:n :}
    p SYNC-BUF u BYTE-COPY u SYNC-U !
-   SYNC$ s" open test sync root" LOCAL:OPEN-ROOT {: root:fd :}
+   SYNC$ FS:OPEN-DIR {: root:fd :}
    [: root q execute ;] [: root FS:CLOSE-DIR ;] finally ;
 
 \ Runs q on a sync root in the case directory, which holds the slots as

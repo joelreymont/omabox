@@ -211,6 +211,10 @@
 \ - NEW-CONFLICT-ANSWERS-A-REPLACED-ROOT: NEW-CONFLICT, the root replaced
 \   after its file is written, answers root-changed, recording no conflict
 \   and copying nothing into the replacement.
+\ - ROOT-SWAP-DURING-PLANNING-STAGES-NOTHING-FROM-THE-STAND-IN: a pass
+\   whose root is swapped while a conflict's Dropbox copy downloads
+\   records the conflict, then ends root-changed at the next path's
+\   upload, the stand-in as the swap left it and nothing staged from it.
 \ - rejected_paths_do_not_stop_unrelated_sync_or_report_progress, with
 \   replayed 2 as its download installs in the pass, and no account
 \   request
@@ -2698,6 +2702,16 @@ READ-CAP BUFFER: READ-BUF
       destination-occupied OF drop false ENDOF
    ;MATCH ;
 
+\ Runs q on the run's root, opened as the journal's active root.
+: IN-ACTIVE-ROOT ( R ^run [ R fd -- S ] -- S )
+   {: x q :}
+   x RUN-JOURNAL @ x ROOT$ LOCAL:OPEN-ACTIVE-ROOT MATCH option
+      none OF s" test expected the run's root active" 1 die ENDOF
+      some OF {: root:fd :}
+         [: root q execute ;] [: root FS:CLOSE-DIR ;] finally
+      ENDOF
+   ;MATCH ;
+
 \ The pipe's bytes, of identity c, staged as target t's download.
 : STAGE-FROM ( fd ^run str DROPBOX:hash fd -- bool )
    {: root:fd x t:str c:DROPBOX:hash rd:fd :}
@@ -2736,9 +2750,7 @@ READ-CAP BUFFER: READ-BUF
 \ plan to install it.
 : OCCUPIED ( ^run -- str JOURNAL:plan-record )
    {: x :}
-   x ROOT$ s" open test root" LOCAL:OPEN-ROOT {: root:fd :}
-   [: root x s" occupied.txt" EXPECTED$ PRESTAGED ;]
-   [: root FS:CLOSE-DIR ;] finally
+   x [: x s" occupied.txt" EXPECTED$ PRESTAGED ;] IN-ACTIVE-ROOT
    x STAGE-PATH {: sp:str :}
    sp FS:REMOVE-FILE sp OCCUPANT$ FS:WRITE-ALL
    EXPECTED$ s" occupied-stage-revision" x RUN-ARENA @ REMOTE-FILE
@@ -2998,9 +3010,8 @@ TYPED-VARIABLE CANARY str
    x p STEP-IDENTITY {: id :}
    x STAGING$ id [: TEST-CLIENT:UNPROTECTED ;] LOCAL:LEASE-DOWNLOAD-SLOT TEST-CLIENT:LEASED
    {: l :}
-   x ROOT$ s" open test root" LOCAL:OPEN-ROOT {: root:fd :}
-   [: root x RUN-ROOT @ s" a.bin" c l x RUN-ARENA @ TEST-CLIENT:CHECKPOINTED ;]
-   [: root FS:CLOSE-DIR ;] finally ;
+   x [: x RUN-ROOT @ s" a.bin" c l x RUN-ARENA @ TEST-CLIENT:CHECKPOINTED ;]
+   IN-ACTIVE-ROOT ;
 
 : PLAN-BLOCKED? ( JOURNAL:plan-block -- bool )
    MATCH JOURNAL:plan-block
@@ -3408,9 +3419,7 @@ TYPED-VARIABLE RACED-INSTALL str
 \ The stage of removed.txt's obsolete download, holding other bytes.
 : OBSOLETE-STAGE ( ^run -- str )
    {: x :}
-   x ROOT$ s" open test root" LOCAL:OPEN-ROOT {: root:fd :}
-   [: root x s" removed.txt" OBSOLETE$ PRESTAGED ;]
-   [: root FS:CLOSE-DIR ;] finally
+   x [: x s" removed.txt" OBSOLETE$ PRESTAGED ;] IN-ACTIVE-ROOT
    x STAGE-PATH {: sp:str :}
    sp $180 FS:CHMOD-MODE
    sp UNRELATED-STAGE$ FS:WRITE-ALL
@@ -3780,7 +3789,8 @@ TYPED-VARIABLE RACED-INSTALL str
 \ Rust's stage_upload of path p's content c; answers the stage.
 : UPLOAD-STAGE ( ^run str DROPBOX:hash -- str )
    {: x p:str c:DROPBOX:hash :}
-   x ROOT$ p x STAGING$ c x RUN-ARENA @ LOCAL:STAGE-UPLOAD
+   x [: p x STAGING$ c x RUN-ARENA @ LOCAL:STAGE-UPLOAD-AT ;]
+   IN-ACTIVE-ROOT
    UPLOAD-STAGED? TTRUE
    x RUN-STAGING @ c DROPBOX:HASH>STR x RUN-ARENA @ TEST-CLIENT:INSIDE ;
 
@@ -3989,10 +3999,8 @@ TYPED-VARIABLE RACED-INSTALL str
 \ Rust's replay_remote_operations below the run's root.
 : REMOTE-REPLAYED ( ^run -- ^REPLAY:replay-report )
    {: x :}
-   x ROOT$ s" open test root" LOCAL:OPEN-ROOT {: root:fd :}
-   [: x RUN-JOURNAL @ x RUN-LINK @ root x ROOT$ x STAGING$
-      x RUN-ARENA @ REPLAY:REPLAY-REMOTE-OPERATIONS-AT ;]
-   [: root FS:CLOSE-DIR ;] finally ;
+   x [: x RUN-JOURNAL @ x RUN-LINK @ rot x ROOT$ x STAGING$
+      x RUN-ARENA @ REPLAY:REPLAY-REMOTE-OPERATIONS-AT ;] IN-ACTIVE-ROOT ;
 
 \ The path a fresh-observation entry names, else the empty string.
 : FRESH-AT$ ( REPLAY:replay-blocked -- str )
@@ -5724,9 +5732,7 @@ $180 constant MODE-0600
 \ holding other bytes; its path.
 : OCCUPIED-COPY-STAGE ( ^run str -- str )
    {: x v:str :}
-   x ROOT$ s" open test root" LOCAL:OPEN-ROOT {: root:fd :}
-   [: root x v OCCUPIED-COPY$ PRESTAGED ;]
-   [: root FS:CLOSE-DIR ;] finally
+   x [: x v OCCUPIED-COPY$ PRESTAGED ;] IN-ACTIVE-ROOT
    x STAGE-AMONG {: sp:str :}
    sp MODE-0600 FS:CHMOD-MODE
    sp UNRELATED-STAGE$ FS:WRITE-ALL
@@ -6272,10 +6278,8 @@ TYPED-VARIABLE RACED str
 \ below the run's root.
 : LOCAL-REPLAYED ( ^run -- ^REPLAY:replay-report )
    {: x :}
-   x ROOT$ s" open test root" LOCAL:OPEN-ROOT {: root:fd :}
-   [: x RUN-JOURNAL @ root x ROOT$ x PENDING-OF x RUN-ARENA @
-      REPLAY:REPLAY-LOCAL-PLANS-AT ;]
-   [: root FS:CLOSE-DIR ;] finally ;
+   x [: x RUN-JOURNAL @ swap x ROOT$ x PENDING-OF x RUN-ARENA @
+      REPLAY:REPLAY-LOCAL-PLANS-AT ;] IN-ACTIVE-ROOT ;
 
 : REJECTION$ ( MODEL:blockage -- str )
    MATCH MODEL:blockage
@@ -6351,6 +6355,48 @@ TYPED-VARIABLE RACED str
    x NO-CONFLICT-RECORD
    x ROOT$ S\" c-diverged.txt\nkeep.txt" NAMES-ARE
    d s" old-root/c-diverged.txt" ar TEST-CLIENT:INSIDE DIVERGED-LOCAL$ HOLDS-BYTES
+   d x STEP-GONE ;
+
+: SWAP-LOCAL$ ( -- str ) s" local side of a conflict across a swap" ;
+: SWAP-REMOTE$ ( -- str ) s" Dropbox side of a conflict across a swap" ;
+: STAND-IN$ ( -- str ) s" upload bytes the stand-in also holds" ;
+
+\ The stand-in's later.txt; the swap writes it on the fake's task.
+TYPED-VARIABLE STAND-IN-UPLOAD str
+
+\ SWAP-ROOT, the stand-in then holding later.txt's bytes.
+: SWAP-WITH-UPLOAD ( -- )
+   SWAP-ROOT STAND-IN-UPLOAD @ STAND-IN$ FS:WRITE-ALL ;
+
+\ earlier.txt's conflict copies its Dropbox side, whose download swaps
+\ the root; later.txt, a new file, is then decided against a root that
+\ is no longer the journal's.
+: ROOT-SWAP-DURING-PLANNING-STAGES-NOTHING-FROM-THE-STAND-IN
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" root swap during planning stages nothing from the stand-in"
+   T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   d x SWAP-AT
+   x s" later.txt" IN-ROOT STAND-IN-UPLOAD !
+   x s" earlier.txt" IN-ROOT SWAP-LOCAL$ FS:WRITE-ALL
+   x s" later.txt" IN-ROOT STAND-IN$ FS:WRITE-ALL
+   s" earlier.txt" s" rev-swap-conflict" SWAP-REMOTE$ ar SERVES
+   s" earlier.txt" s" rev-swap-conflict" SWAP-REMOTE$ s" swap-planning"
+   ar LISTED-ALONE
+   [: SWAP-WITH-UPLOAD ;] TEST-DROPBOX:DURING-DOWNLOAD!
+   x rec PASSED OUTCOME-KIND$ s" root-changed" T$=
+   x ROOT$ S\" canary.txt\nlater.txt" NAMES-ARE
+   CANARY @ CANARY$ HOLDS-BYTES
+   STAND-IN-UPLOAD @ STAND-IN$ HOLDS-BYTES
+   x STAGING$ STAND-IN$ ar IDENTITY DROPBOX:HASH>STR ar TEST-CLIENT:INSIDE
+   FS:EXISTS? TFALSE
+   OLD-ROOT @ s" later.txt" ar TEST-CLIENT:INSIDE STAND-IN$ HOLDS-BYTES
+   x CONFLICTS-OF VEC:COUNT 1 T=
+   x PENDING-OF VEC:COUNT 0 T=
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/download" T$=
    d x STEP-GONE ;
 
 : INVALID-NAME$ ( -- str ) s\" invalid-\xFF.txt" ;
@@ -6736,6 +6782,7 @@ TYPED-VARIABLE RACED str
    {: ar :}
    ar REPLACED-LOCAL-ROOT-NEVER-REPLAYS-PENDING-DELETION
    ar NEW-CONFLICT-ANSWERS-A-REPLACED-ROOT
+   ar ROOT-SWAP-DURING-PLANNING-STAGES-NOTHING-FROM-THE-STAND-IN
    ar REJECTED-PATHS-DO-NOT-STOP-UNRELATED-SYNC-OR-REPORT-PROGRESS
    ar DOCUMENTED-EXCLUSIONS-PRESERVE-PAYLOADS-WHILE-ORDINARY-SIBLINGS-SYNC
    ar EXCLUDED-PENDING-AND-BLOCKED-WORK-IS-RETIRED-ACROSS-REOPEN-WITHOUT-EFFECTS ;

@@ -1838,8 +1838,8 @@ ENUM prepared-upload
    VARIANT occupied ;VARIANT
 ;ENUM
 
-\ Rust's Prepared<()>.
-ENUM prepared ready fresh ;ENUM
+\ Rust's Prepared<()>; root-changed is its LocalRootChanged error.
+ENUM prepared ready fresh root-changed ;ENUM
 
 : NO-STAGE ( -- LOCAL:stage-outcome<^LOCAL:staged-upload> )
    s" " LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED ;
@@ -1852,31 +1852,32 @@ ENUM prepared ready fresh ;ENUM
    drop dup LOCAL:E-OCCUPIED = swap LOCAL:E-SOURCE-CHANGED = or ;
 : SOURCE-CHANGED? ( n n -- bool ) drop LOCAL:E-SOURCE-CHANGED = ;
 
-\ LOCAL:STAGE-UPLOAD of path's content c and 0, or NO-STAGE and the code
-\ it threw.
+\ LOCAL:STAGE-UPLOAD-AT of path's content c below the open root and 0,
+\ or NO-STAGE and the code it threw.
 : STAGE-LOCAL
-   ( ^run MODEL:path DROPBOX:hash
+   ( ^run fd MODEL:path DROPBOX:hash
      -- LOCAL:stage-outcome<^LOCAL:staged-upload> n )
-   {: r path c :}
-   NO-STAGE [: DROP-STAGE [: r ROOT$ path PATH$ r STAGING$ c
-         r RUN-ARENA @ LOCAL:STAGE-UPLOAD ;]
+   {: r root:fd path c :}
+   NO-STAGE [: DROP-STAGE [: root path PATH$ r STAGING$ c
+         r RUN-ARENA @ LOCAL:STAGE-UPLOAD-AT ;]
       ['] STAGE-CONVERTS? LOCAL:WITH-CONVERTS ;] catch {: code:n :}
    code 0<> if drop NO-STAGE then code ;
 
-\ The upload source's content now and 0, or NO-HASH and the code it threw.
-: OBSERVE-SOURCE ( ^run MODEL:path -- DROPBOX:hash n )
-   {: r path :}
-   NO-HASH [: DROP-HASH [: r ROOT$ path PATH$ r RUN-ARENA @
-         LOCAL:OBSERVE-UPLOAD-SOURCE ;]
+\ The upload source's content now, below the open root, and 0, or
+\ NO-HASH and the code it threw.
+: OBSERVE-SOURCE ( ^run fd MODEL:path -- DROPBOX:hash n )
+   {: r root:fd path :}
+   NO-HASH [: DROP-HASH [: root path PATH$ r RUN-ARENA @
+         LOCAL:OBSERVE-UPLOAD-SOURCE-AT ;]
       ['] SOURCE-CHANGED? LOCAL:WITH-CONVERTS ;] catch {: code:n :}
    code 0<> if drop NO-HASH then code ;
 
 \ An already staged upload is ready while its source still holds c.
 : RECHECK
-   ( ^LOCAL:staged-upload ^run MODEL:path DROPBOX:hash
+   ( ^LOCAL:staged-upload ^run fd MODEL:path DROPBOX:hash
      -- prepared-upload )
-   {: stage r path c :}
-   r path OBSERVE-SOURCE {: code:n :}
+   {: stage r root:fd path c :}
+   r root path OBSERVE-SOURCE {: code:n :}
    code 0= if
       c DROPBOX:HASH= 0= if construct prepared-upload fresh exit then
       stage construct prepared-upload ready exit
@@ -1886,14 +1887,16 @@ ENUM prepared ready fresh ;ENUM
    then
    code throw ;
 
-\ Rust's prepare_local: path's content staged for upload.
-: PREPARE-LOCAL ( ^run MODEL:path DROPBOX:hash -- prepared-upload )
-   {: r path c :}
-   r path c STAGE-LOCAL {: code:n :}
+\ Rust's prepare_local: path's content below the open root staged for
+\ upload.
+: PREPARE-LOCAL
+   ( ^run fd MODEL:path DROPBOX:hash -- prepared-upload )
+   {: r root:fd path c :}
+   r root path c STAGE-LOCAL {: code:n :}
    code 0= if
       MATCH LOCAL:stage-outcome
          staged OF construct prepared-upload ready ENDOF
-         already-staged OF r path c RECHECK ENDOF
+         already-staged OF r root path c RECHECK ENDOF
          content-changed OF drop construct prepared-upload fresh ENDOF
          destination-occupied OF
             drop construct prepared-upload occupied
@@ -1910,11 +1913,22 @@ ENUM prepared ready fresh ;ENUM
    code throw ;
 
 \ An occupied stage path still records the plan.
-: PREPARE-UPLOAD ( ^run MODEL:path DROPBOX:hash -- prepared )
+: UPLOAD-BELOW ( ^run fd MODEL:path DROPBOX:hash -- prepared )
    PREPARE-LOCAL MATCH prepared-upload
       ready OF drop construct prepared ready ENDOF
       fresh OF construct prepared fresh ENDOF
       occupied OF construct prepared ready ENDOF
+   ;MATCH ;
+
+\ The upload staged below the active root; root-changed if it is not.
+: PREPARE-UPLOAD ( ^run MODEL:path DROPBOX:hash -- prepared )
+   {: r path c :}
+   r RUN-JOURNAL @ r ROOT$ LOCAL:OPEN-ACTIVE-ROOT MATCH option
+      none OF construct prepared root-changed ENDOF
+      some OF {: root:fd :}
+         [: r root path c UPLOAD-BELOW ;]
+         [: root FS:CLOSE-DIR ;] finally
+      ENDOF
    ;MATCH ;
 
 \ Rust's prepare_plan for a decision's one operation.
@@ -1983,7 +1997,7 @@ ENUM prepared ready fresh ;ENUM
       none OF REPLAY-COPY--OUTCOME:READY ENDOF
       some OF
          MODEL-LOCAL:UNMAKE {: want :}
-         r path want PREPARE-LOCAL r root path STAGED-COPY
+         r root path want PREPARE-LOCAL r root path STAGED-COPY
       ENDOF
    ;MATCH ;
 
@@ -3279,6 +3293,7 @@ ENUM live-step held superseded fresh root-changed ;ENUM
    pl PLANNING-RUN @ path op PREPARE-OPERATION MATCH prepared
       ready OF pl path op pl ARENA-OF ONE-OPERATION PUSH-PLAN ENDOF
       fresh OF construct pass-event fresh ENDOF
+      root-changed OF construct pass-event root-changed ENDOF
    ;MATCH ;
 
 : NEW-COPIES

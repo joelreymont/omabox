@@ -765,9 +765,6 @@ SHA256-CTX-BYTES BUFFER: NAME-CTX
 
 public
 
-\ The sync root's directory, o naming the operation that opens it.
-: OPEN-ROOT ( str str -- fd ) OPEN-ABSOLUTE-DIRECTORY ;
-
 : OPEN-PRIVATE-DIRECTORY ( str str -- fd ) OPEN-ABSOLUTE-DIRECTORY ;
 
 private
@@ -2739,10 +2736,6 @@ private
    ;MATCH if STAGE-WRITE-REUSED exit then
    root r dir name p want ar STAGE-FROM-SOURCE ;
 
-: NO-UPLOAD-OUTCOME ( -- stage-outcome<^staged-upload> )
-   s" " LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED ;
-: DROP-UPLOAD-OUTCOME ( stage-outcome<^staged-upload> -- ) drop ;
-
 public
 
 \ Copies the regular file r below the root into the staging directory s,
@@ -2762,16 +2755,6 @@ public
    dir DISCARD
    [: s want ar NEW-STAGED-UPLOAD ;] MAP-STAGE-WRITE ;
 
-\ STAGE-UPLOAD-AT below the sync root at the absolute path.
-: STAGE-UPLOAD
-   ( str str str DROPBOX:hash ^ARENA:arena
-     -- stage-outcome<^staged-upload> )
-   {: rp:str r:str s:str want:DROPBOX:hash ar:^ARENA:arena :}
-   rp s" open sync root for upload staging" OPEN-ROOT {: root:fd :}
-   NO-UPLOAD-OUTCOME root
-   [: DROP-UPLOAD-OUTCOME root r s want ar STAGE-UPLOAD-AT ;] CLOSING
-   root DISCARD ;
-
 \ The content hash of the regular file r below the root, as it is now; a
 \ source that changes while it is read throws E-SOURCE-CHANGED.
 : OBSERVE-UPLOAD-SOURCE-AT ( fd str ^ARENA:arena -- DROPBOX:hash )
@@ -2780,14 +2763,6 @@ public
    NO-HASH src [: DROP-HASH src r s" verify upload source" ar
       E-SOURCE-CHANGED E-SOURCE-CHANGED HASH-STABLE-FILE ;] CLOSING
    src DISCARD ;
-
-\ OBSERVE-UPLOAD-SOURCE-AT below the sync root at the absolute path.
-: OBSERVE-UPLOAD-SOURCE ( str str ^ARENA:arena -- DROPBOX:hash )
-   {: rp:str r:str ar:^ARENA:arena :}
-   rp s" open sync root for upload observation" OPEN-ROOT {: root:fd :}
-   NO-HASH root [: DROP-HASH root r ar OBSERVE-UPLOAD-SOURCE-AT ;]
-   CLOSING
-   root DISCARD ;
 
 private
 
