@@ -105,6 +105,16 @@ recover; a drive that ends without failure or launch was not asked for one, a
 halt or release stopped a unit it first saw holding the lock, and a halt
 cleared a failed state it last saw.
 
+`ReleaseWindow` checks a change while the unit is released, `RELEASING` in
+`src/omabox.f`, and the window's end, `CLOSING`: the release drive, the
+change and the restore drive each may fail, and a SIGINT, SIGTERM or SIGHUP
+may arrive at any time from just before the release drive until the window
+closes after the restore drive, when the signals take their default again and
+`SIGNAL:RELEASE` answers one delivered after the last take. The change runs
+only after a release that succeeded and before any signal is delivered; every
+path out runs the restore drive; and the CLI dies of the signal exactly when
+one was taken, the window's close included.
+
 `LocalWatch` checks LOCAL's watch, `WATCHING` in `src/local.f`, over the
 root, a folder in it and one in that, so a clean folder can vouch for a child
 the walk skips. Each folder has a journal record (none, clean, stirred, or
@@ -179,6 +189,7 @@ tlc -config ConflictPlacement.cfg ConflictPlacement.tla
 tlc -config DirectoryDeletion.cfg DirectoryDeletion.tla
 tlc -config RemoteLifecycle.cfg RemoteLifecycle.tla
 tlc -config ServiceDrive.cfg ServiceDrive.tla
+tlc -config ReleaseWindow.cfg ReleaseWindow.tla
 tlc -config DaemonRun.cfg DaemonRun.tla
 tlc -config LocalWatch.cfg LocalWatch.tla
 tlc -config Downloading.cfg Downloading.tla
@@ -195,6 +206,8 @@ model's steps follow that table:
 - `src/replay-test.f`: `LOCAL-LIFECYCLE` (`LocalLifecycle`) and
   `REMOTE-LIFECYCLE` (`RemoteLifecycle`);
 - `src/service-test.f`: `DRIVING` (`ServiceDrive`);
+- `src/omabox-test.f`: `RELEASING` (`ReleaseWindow`) and `CLOSING`
+  (`ReleaseWindowClose`, whose Follows extends `ReleaseWindow`);
 - `src/local-test.f`: `WATCHING` (`LocalWatch`);
 - `src/daemon-test.f`: `DAEMON-RUN` (`DaemonRun`);
 - `src/dropbox-test.f`: `DOWNLOADING` (`Downloading`) and `SESSION`

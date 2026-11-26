@@ -31,10 +31,12 @@
 \   logs each verb and answers show with the row's state
 \ - restore_goal_restores_only_after_a_spawned_release
 \ - a_change_runs_while_the_service_is_released,
-\   a_failed_change_still_restores_the_service, where E-IO stands in for
-\   Rust's InvalidAuthorizationCode, and
-\   a_failed_release_skips_the_change_and_restores, each systemctl Rust's
-\   stateful script in a directory of its own under TMPDIR
+\   a_failed_change_still_restores_the_service, where a held daemon lock
+\   stands in for Rust's InvalidAuthorizationCode, and
+\   a_failed_release_skips_the_change_and_restores, each set-root over
+\   Rust's fixture, systemctl Rust's stateful script in a directory of its
+\   own under TMPDIR; the first's script also records, at each verb,
+\   whether the config names the new root yet
 \ - set_root_retires_live_intent_and_preserves_payloads,
 \   set_root_starts_a_failed_service_after_the_change,
 \   set_root_restarts_a_starting_service,
@@ -51,9 +53,9 @@
 \   a_failed_change_and_restore_render_both,
 \   setup_releases_the_lock_before_starting_a_failed_service and the
 \   setup half of a_completed_change_reports_a_failed_start, each over
-\   Rust's fixture with COMPLETE-SETUP and a bind that does nothing as
-\   the change, systemctl Rust's script for the test under TMPDIR, and
-\   the log captured in a file there
+\   Rust's fixture with setup's change, writing no config, of a login
+\   bound through the recording store, systemctl Rust's script for
+\   the test under TMPDIR, and the log captured in a file there
 \ - bind_stores_the_token_and_binds_an_unbound_journal,
 \   bind_stores_the_token_for_a_journal_bound_to_the_login and
 \   bind_refuses_a_journal_bound_elsewhere, Omabox's own: Rust's
@@ -71,11 +73,22 @@
 \ - an_unexpected_code_is_logged, Omabox's own: UNEXPECTED of a Habu
 \   library code and of an OMABOX code, its log in a file under TMPDIR
 \ and the program built with README's command into a directory under
-\ TMPDIR, whose --version prints its name and version and exits 0.
+\ TMPDIR, whose --version prints its name and version and exits 0, and
+\ set_root_interrupted_by_sigint_restores_the_service,
+\ set_root_interrupted_by_sigterm_restores_the_service,
+\ set_root_interrupted_by_sighup_restores_the_service,
+\ set_root_killed_during_restart_keeps_the_change,
+\ set_root_killed_with_a_failed_restart_keeps_the_change and
+\ set_root_interrupted_without_restart_tells_the_change_failed, Omabox's
+\ own: that program's set-root over Rust's fixture, its systemctl a
+\ script on PATH whose stop or start sends the signal to the CLI
+\ - formal_holds_the_release_window_tables: RELEASING and CLOSING
+\   against formal/ReleaseWindow.tla through TEST-FORMAL:HOLDS, which
+\   runs TLC
 \ White-box: OMABOX is reopened for PARSE, HOME-ROOT, HOME-WIDGET,
 \ COMPLETE-SETUP, READ-CODE, RUN-SERVICE, STATUS-TEXT, SETTINGS-TEXT,
-\ RESTORE-GOAL, RELEASED, SET-ROOT, UNEXPECTED, EXCHANGED, LINKED and
-\ BIND.
+\ RESTORE-GOAL, RELEASED, CHANGE-SETUP, SET-ROOT, UNEXPECTED, EXCHANGED,
+\ LINKED and BIND.
 \ Run from the repository root: hb --load src/omabox-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -107,6 +120,7 @@ require src/omabox.f
 require src/test-dropbox.f
 require src/test-client.f
 require src/auth.f
+require src/test-formal.f
 
 package OMABOX
 private
@@ -123,11 +137,6 @@ PATH-CAP BUFFER: JOINED
 
 \ The text a command answered under a capture.
 TYPED-VARIABLE SHOWN str
-
-\ The service trace a change saw, and how many changes ran.
-TYPED-VARIABLE DURING-LOG str
-TYPED-VARIABLE DURING-STATE str
-variable CHANGES
 
 600000 constant BUILD-MS
 10000 constant RUN-MS
@@ -903,20 +912,32 @@ variable CHANGES
    start CODE+ S\" ; printf '%s\\n' active > " SB-APPEND
    state QUOTED+ S\"  ;;\nesac\nexit 0\n" SB-APPEND ;
 
-\ Rust's stateful_systemctl: answers a new directory and its commands;
-\ the unit's state is in unit-state, each verb in service.log.
-: STATEFUL ( str n n ^ARENA:arena -- str ^SERVICE:commands )
-   {: i:str start:n stop:n ar :}
+\ A stateful systemctl's script, appended: it logs each verb to log,
+\ runs the shell line w, then answers the verb over the unit state in
+\ state, stop and start exiting with their codes.
+: SCRIPT+ ( str str n n str -- )
+   {: state log start:n stop:n w:str :}
+   S\" printf '%s\\n' \"$2\" >> " SB-APPEND
+   log QUOTED+ S\" \n" SB-APPEND w SB-APPEND
+   state stop SETTLING+ state start STARTING+ ;
+
+\ Rust's stateful_systemctl, running the shell line w after it logs each
+\ verb: a new directory, holding unit-state and service.log, and commands.
+: WATCHING ( str n n str ^ARENA:arena -- str ^SERVICE:commands )
+   {: i:str start:n stop:n w:str ar :}
    ar TEMPORARY {: d :}
    d s" unit-state" ar INSIDE {: state :}
    d s" systemctl" ar INSIDE {: sys :}
    d s" service.log" ar INSIDE {: log :}
    SB-RESET i LINE+ state SB$ FS:WRITE-ALL
-   SB-RESET S\" printf '%s\\n' \"$2\" >> " SB-APPEND
-   log QUOTED+ S\" \n" SB-APPEND
-   state stop SETTLING+ state start STARTING+
+   SB-RESET state log start stop w SCRIPT+
    sys SB$ FS:WRITE-ALL
    d sys s" /unused/journalctl" ar SERVICE:SCRIPTS ;
+
+\ Rust's stateful_systemctl.
+: STATEFUL ( str n n ^ARENA:arena -- str ^SERVICE:commands )
+   {: i:str start:n stop:n ar :}
+   i start stop s" " ar WATCHING ;
 
 \ Rust's service_trace: the service log and the unit state.
 : TRACE ( str ^ARENA:arena -- str str )
@@ -924,56 +945,70 @@ variable CHANGES
    d s" service.log" ar INSIDE FILE-TEXT ar ARENA:COPY
    d s" unit-state" ar INSIDE FILE-TEXT ar ARENA:COPY ;
 
-: NO-LEFTOVERS ( ^ARENA:arena -- ^VEC:vector<STALE:leftover> )
-   ARENA:ALLOCATOR 0 [type] STALE:leftover VEC:NEW ;
+\ SET-ROOT of root over the XDG with the commands, its log captured in
+\ DIR/stderr.txt: the code and the log.
+: SET ( str ^CONFIG:xdg ^SERVICE:commands str ^ARENA:arena -- n str )
+   {: root x c d ar :}
+   d s" stderr.txt" ar INSIDE {: p :}
+   [: root x c ar SET-ROOT ;] p ar STDERR:CAPTURING ;
 
-\ A change that keeps the trace it sees in d and leaves nothing behind.
-: WATCHED ( str ^ARENA:arena -- ^VEC:vector<STALE:leftover> )
-   {: d ar :}
-   CHANGES @ 1+ CHANGES !
-   d ar TRACE DURING-STATE ! DURING-LOG !
-   ar NO-LEFTOVERS ;
+\ A shell line that appends the verb $2 and whether the config file f
+\ names the root r to the file at w.
+: CHANGE-SEEN ( str str str ^ARENA:arena -- str )
+   {: f:str r:str w:str ar :}
+   SB-RESET r SB-APPEND S\" \q" SB-APPEND SB$ ar ARENA:COPY {: n :}
+   SB-RESET s" if grep -qF " SB-APPEND n QUOTED+ s"  " SB-APPEND f QUOTED+
+   S\" ; then echo \"$2 changed\"; else echo \"$2 unchanged\"; fi >> "
+   SB-APPEND w QUOTED+ S\" \n" SB-APPEND SB$ ar ARENA:COPY ;
 
-\ A change that fails, as Rust's InvalidAuthorizationCode stands for.
-: REFUSED ( ^ARENA:arena -- ^VEC:vector<STALE:leftover> )
-   drop E-IO throw ;
-
-\ Setup, released from c around the change.
-: SETUP-RELEASED ( ^SERVICE:commands
-     [ ^ARENA:arena -- ^VEC:vector<STALE:leftover> ] ^ARENA:arena -- )
-   {: c change ar :}
-   c s" setup" s" Omabox setup is complete" change ar RELEASED ;
-
-\ From the unit's state, the trace the change saw, then the one after.
-: RUNS-RELEASED ( str str str str ^ARENA:arena -- )
-   {: i:str b:str s:str a:str ar :}
-   i 0 0 ar STATEFUL {: d c :}
-   0 CHANGES !
-   [: c [: d swap WATCHED ;] ar SETUP-RELEASED ;] catch 0 T=
-   CHANGES @ 1 T=
-   DURING-LOG @ b T$=
-   DURING-STATE @ s T$=
-   d ar TRACE {: log state :}
+\ set-root to DIR/second from a unit in the state i: w the verbs as the
+\ config stood at each, a the service log; the unit ends active.
+: RUNS-RELEASED ( str str str ^ARENA:arena -- )
+   {: i:str w:str a:str ar :}
+   ar FIXTURE {: d x first :}
+   d s" second" ar INSIDE {: second :}
+   second FS:MAKE-DIR
+   d s" watch.log" ar INSIDE {: watch :}
+   x ar CONFIG:RESOLVE-PRIVATE ar CONFIG:CONFIG-FILE CONFIG:ABS-PATH>STR
+   second watch ar CHANGE-SEEN {: line :}
+   i 0 0 line ar WATCHING {: sd c :}
+   second x c d ar SET {: code:n e:str :}
+   code 0 T=
+   x ar STORED second T$=
+   watch FILE-TEXT w T$=
+   sd ar TRACE {: log state :}
    log a T$=
    state S\" active\n" T$=
+   sd FS:REMOVE-TREE
    d FS:REMOVE-TREE ;
 
 : A-CHANGE-RUNS-WHILE-THE-SERVICE-IS-RELEASED ( ^ARENA:arena -- )
    {: ar :}
    s" a_change_runs_while_the_service_is_released" T-LABEL
-   s" active" S\" show\nstop\n" S\" inactive\n"
+   s" active"
+   S\" show unchanged\nstop unchanged\nreset-failed changed\nstart changed\n"
    S\" show\nstop\nreset-failed\nstart\n" ar RUNS-RELEASED
-   s" failed" S\" show\n" S\" failed\n"
+   s" failed"
+   S\" show unchanged\nshow changed\nreset-failed changed\nstart changed\n"
    S\" show\nshow\nreset-failed\nstart\n" ar RUNS-RELEASED ;
 
+\ The change refused under a held daemon lock.
 : A-FAILED-CHANGE-STILL-RESTORES-THE-SERVICE ( ^ARENA:arena -- )
    {: ar :}
    s" a_failed_change_still_restores_the_service" T-LABEL
-   s" active" 0 0 ar STATEFUL {: d c :}
-   [: c [: REFUSED ;] ar SETUP-RELEASED ;] catch E-IO T=
-   d ar TRACE {: log state :}
+   ar FIXTURE {: d x first :}
+   d s" second" ar INSIDE {: second :}
+   second FS:MAKE-DIR
+   x ar CONFIG:RESOLVE-PRIVATE CONFIG:LOCK {: held :}
+   s" active" 0 0 ar STATEFUL {: sd c :}
+   second x c d ar SET {: code:n e:str :}
+   held CONFIG:UNLOCK
+   code E-LOCK T=
+   x ar STORED first T$=
+   sd ar TRACE {: log state :}
    log S\" show\nstop\nreset-failed\nstart\n" T$=
    state S\" active\n" T$=
+   sd FS:REMOVE-TREE
    d FS:REMOVE-TREE ;
 
 \ list-units runs once the stop fails, to tell an unloaded unit from a
@@ -981,17 +1016,18 @@ variable CHANGES
 : A-FAILED-RELEASE-SKIPS-THE-CHANGE-AND-RESTORES ( ^ARENA:arena -- )
    {: ar :}
    s" a_failed_release_skips_the_change_and_restores" T-LABEL
-   s" active" 0 1 ar STATEFUL {: d c :}
-   d s" stderr.txt" ar INSIDE {: p :}
-   0 CHANGES !
-   [: c [: d swap WATCHED ;] ar SETUP-RELEASED ;] p ar
-   STDERR:CAPTURING {: code:n e:str :}
-   CHANGES @ 0 T=
+   ar FIXTURE {: d x first :}
+   d s" second" ar INSIDE {: second :}
+   second FS:MAKE-DIR
+   s" active" 0 1 ar STATEFUL {: sd c :}
+   second x c d ar SET {: code:n e:str :}
    code SERVICE:E-UNSUCCESSFUL T=
    e s" service: " STR:CONTAINS? TTRUE
-   d ar TRACE {: log state :}
+   x ar STORED first T$=
+   sd ar TRACE {: log state :}
    log S\" show\nstop\nlist-units\nreset-failed\nstart\n" T$=
    state S\" active\n" T$=
+   sd FS:REMOVE-TREE
    d FS:REMOVE-TREE ;
 
 
@@ -1002,12 +1038,6 @@ variable CHANGES
    {: ar :}
    s" /unused/systemctl" s" /unused/journalctl" ar SERVICE:SCRIPTS ;
 
-\ SET-ROOT of root over the XDG with the commands, its log captured in
-\ DIR/stderr.txt: the code and the log.
-: SET ( str ^CONFIG:xdg ^SERVICE:commands str ^ARENA:arena -- n str )
-   {: root x c d ar :}
-   d s" stderr.txt" ar INSIDE {: p :}
-   [: root x c ar SET-ROOT ;] p ar STDERR:CAPTURING ;
 
 : CONFIG-ERRORS-SHOW-THEIR-OWN-HELP ( ^ARENA:arena -- )
    {: ar :}
@@ -1467,19 +1497,44 @@ variable CHANGES
 
 \ ---- setup with the service released
 
-\ Rust's change in these tests: COMPLETE-SETUP of the config c, writing
-\ no config, with a bind that does nothing.
-: SETUP-CHANGE ( ^CONFIG:config ^ARENA:arena
-     -- ^VEC:vector<STALE:leftover> )
-   {: c ar :}
-   c false [: ;] ar COMPLETE-SETUP ;
+\ A recording store, bound before any SECRET call: no case reaches the
+\ keyring. REC holds the last record written.
+CAP BUFFER: REC
+variable REC-U
+variable REC-WRITES
 
-\ Setup released from s around SETUP-CHANGE of c: its code and the log,
-\ captured in p.
+: REC-READ ( str str ^VEC:vector<u8> -- bool )
+   {: s:str a:str dest:^VEC:vector<u8> :}
+   false ;
+
+: REC-WRITE ( str str str -- )
+   {: s:str a:str vs:str :}
+   vs str> {: v:^ vu:n :}
+   vu CAP min {: k:n :}
+   v REC k BYTE-COPY k REC-U !
+   1 REC-WRITES +! ;
+
+: REC-ERASE ( str str -- bool ) {: s:str a:str :} false ;
+
+' REC-READ ' REC-WRITE ' REC-ERASE SECRET:STORE!
+
+\ A login for /Sync of the account, holding the token bind-refresh.
+: LOGIN ( str ^ARENA:arena -- ^authorized )
+   {: ac:str ar :}
+   ar LOGINS-NEW {: a :}
+   ac s" namespace" s" /Sync"
+   JOURNAL-DROPBOX--BINDING:MAKE a AUTHORIZED-BINDING !
+   s" bind-refresh" a AUTHORIZED-REFRESH-TOKEN !
+   a ;
+
+\ Setup's change of c, writing no config, released from s: the account's
+\ login bound, its code and the log captured in p.
 : SETUP-RUN ( ^SERVICE:commands ^CONFIG:config str ^ARENA:arena
      -- n str )
    {: s c p ar :}
-   [: s [: c swap SETUP-CHANGE ;] ar SETUP-RELEASED ;]
+   s" account" ar LOGIN {: a :}
+   [: s c false a CHANGE-SETUP s" setup" s" Omabox setup is complete" ar
+      RELEASED ;]
    p ar STDERR:CAPTURING ;
 
 \ Rust's fixture's config, loaded, and the log file in its directory.
@@ -1618,36 +1673,6 @@ variable CHANGES
 
 
 \ ---- setup's login and bind
-
-\ A recording store, bound before any SECRET call: no case reaches the
-\ keyring. REC holds the last record written.
-CAP BUFFER: REC
-variable REC-U
-variable REC-WRITES
-
-: REC-READ ( str str ^VEC:vector<u8> -- bool )
-   {: s:str a:str dest:^VEC:vector<u8> :}
-   false ;
-
-: REC-WRITE ( str str str -- )
-   {: s:str a:str vs:str :}
-   vs str> {: v:^ vu:n :}
-   vu CAP min {: k:n :}
-   v REC k BYTE-COPY k REC-U !
-   1 REC-WRITES +! ;
-
-: REC-ERASE ( str str -- bool ) {: s:str a:str :} false ;
-
-' REC-READ ' REC-WRITE ' REC-ERASE SECRET:STORE!
-
-\ A login for /Sync of the account, holding the token bind-refresh.
-: LOGIN ( str ^ARENA:arena -- ^authorized )
-   {: ac:str ar :}
-   ar LOGINS-NEW {: a :}
-   ac s" namespace" s" /Sync"
-   JOURNAL-DROPBOX--BINDING:MAKE a AUTHORIZED-BINDING !
-   s" bind-refresh" a AUTHORIZED-REFRESH-TOKEN !
-   a ;
 
 : JOURNAL-OF ( ^CONFIG:config -- str )
    CONFIG:PATHS CONFIG:JOURNAL-FILE CONFIG:ABS-PATH>STR ;
@@ -1868,12 +1893,164 @@ variable REC-WRITES
    OUT outu LEN>N >str S\" omabox 0.1.0\n" T$=
    erru LEN>N 0 T= ;
 
+\ A shell line that sends the signal sig, as kill names it, to the CLI
+\ that ran the script when the verb is v.
+: KILLING ( str str ^ARENA:arena -- str )
+   {: sig:str v:str ar :}
+   SB-RESET S\" [ \"$2\" != " SB-APPEND v SB-APPEND s"  ] || kill -" SB-APPEND
+   sig SB-APPEND S\"  \"$PPID\"\n" SB-APPEND SB$ ar ARENA:COPY ;
+
+\ A stateful systemctl in d/bin, the unit active; its verb v sends the
+\ signal sig, as kill names it, to the CLI that ran it, and its start
+\ exits with the code start.
+: INTERRUPTING ( str str str n ^ARENA:arena -- str )
+   {: d sig:str v:str start:n ar :}
+   d s" bin" ar INSIDE {: b :}
+   b FS:MAKE-DIR
+   b s" systemctl" ar INSIDE {: sys :}
+   d s" unit-state" ar INSIDE {: state :}
+   d s" service.log" ar INSIDE {: log :}
+   state S\" active\n" FS:WRITE-ALL
+   sig v ar KILLING {: w :}
+   SB-RESET S\" #!/bin/sh\n" SB-APPEND state log start 0 w SCRIPT+
+   sys SB$ FS:WRITE-ALL
+   sys FS:CHMOD-X
+   b ;
+
+\ The signal that ended a process; -1 for one that exited or ran out
+\ its time.
+: KILLED-BY ( PROCESS:ending -- n )
+   MATCH PROCESS:ending
+      exited OF drop -1 ENDOF
+      signaled OF ENDOF
+      timeout OF -1 ENDOF
+   ;MATCH ;
+
+\ The built program's set-root of second over the fixture in d, its
+\ systemctl from INTERRUPTING: stdout's and stderr's lengths in OUT and
+\ ERR, and the signal that ended it.
+: SET-ROOT-KILLED ( str str str str str n ^ARENA:arena -- len len n )
+   {: bin d second sig:str v:str start:n ar :}
+   d sig v start ar INTERRUPTING {: b :}
+   PROC-ARGV-ENV-RESET
+   s" --default-signal=HUP,INT,TERM" PROC-ARGV+ bin PROC-ARGV+
+   s" settings" PROC-ARGV+ s" set-root" PROC-ARGV+ second PROC-ARGV+
+   SB-RESET b SB-APPEND s" :/usr/bin:/bin" SB-APPEND s" PATH" SB$ PROC-ENV+
+   s" HOME" d PROC-ENV+
+   s" XDG_CONFIG_HOME" d s" config" ar INSIDE PROC-ENV+
+   s" XDG_STATE_HOME" d s" state" ar INSIDE PROC-ENV+
+   s" /usr/bin/env" OUT CAP >LEN ERR CAP >LEN
+   RUN-MS >MS RUN-ARGV-ENV-CAPTURE-OUTCOME
+   KILLED-BY ;
+
+\ The built program's set-root, its systemctl sending sig from the verb
+\ v before the change: the change skipped, the unit active again, death
+\ by the signal.
+: INTERRUPTED ( str str str n ^ARENA:arena -- )
+   {: bin sig:str v:str want:n ar :}
+   ar FIXTURE {: d x first :}
+   d s" second" ar INSIDE {: second :}
+   second FS:MAKE-DIR
+   bin d second sig v 0 ar SET-ROOT-KILLED {: outu:len erru:len got:n :}
+   outu LEN>N 0 T=
+   got want T=
+   d s" service.log" ar INSIDE FILE-TEXT
+   S\" show\nstop\nreset-failed\nstart\n" T$=
+   d s" unit-state" ar INSIDE FILE-TEXT S\" active\n" T$=
+   x ar STORED-ROOT first T$=
+   d FS:REMOVE-TREE ;
+
+: SET-ROOT-INTERRUPTED-BY-SIGINT-RESTORES-THE-SERVICE
+   ( str ^ARENA:arena -- )
+   {: bin ar :}
+   s" set_root_interrupted_by_sigint_restores_the_service" T-LABEL
+   bin s" INT" s" stop" 2 ar INTERRUPTED ;
+
+: SET-ROOT-INTERRUPTED-BY-SIGTERM-RESTORES-THE-SERVICE
+   ( str ^ARENA:arena -- )
+   {: bin ar :}
+   s" set_root_interrupted_by_sigterm_restores_the_service" T-LABEL
+   bin s" TERM" s" stop" 15 ar INTERRUPTED ;
+
+: SET-ROOT-INTERRUPTED-BY-SIGHUP-RESTORES-THE-SERVICE
+   ( str ^ARENA:arena -- )
+   {: bin ar :}
+   s" set_root_interrupted_by_sighup_restores_the_service" T-LABEL
+   bin s" HUP" s" stop" 1 ar INTERRUPTED ;
+
+: SET-ROOT-KILLED-DURING-RESTART-KEEPS-THE-CHANGE ( str ^ARENA:arena -- )
+   {: bin ar :}
+   s" set_root_killed_during_restart_keeps_the_change" T-LABEL
+   ar FIXTURE {: d x first :}
+   d s" second" ar INSIDE {: second :}
+   second FS:MAKE-DIR
+   bin d second s" TERM" s" start" 0 ar SET-ROOT-KILLED
+   {: outu:len erru:len got:n :}
+   ERR erru LEN>N >str s" The change is kept" STR:CONTAINS? TFALSE
+   outu LEN>N 0 T=
+   got 15 T=
+   d s" unit-state" ar INSIDE FILE-TEXT S\" active\n" T$=
+   x ar STORED-ROOT second T$=
+   d FS:REMOVE-TREE ;
+
+: SET-ROOT-KILLED-WITH-A-FAILED-RESTART-KEEPS-THE-CHANGE
+   ( str ^ARENA:arena -- )
+   {: bin ar :}
+   s" set_root_killed_with_a_failed_restart_keeps_the_change" T-LABEL
+   ar FIXTURE {: d x first :}
+   d s" second" ar INSIDE {: second :}
+   second FS:MAKE-DIR
+   bin d second s" TERM" s" start" 1 ar SET-ROOT-KILLED
+   {: outu:len erru:len got:n :}
+   ERR erru LEN>N >str {: e :}
+   e s" The change is kept" STR:CONTAINS? TTRUE
+   e s" could not be restarted" STR:CONTAINS? TFALSE
+   got 15 T=
+   x ar STORED-ROOT second T$=
+   d FS:REMOVE-TREE ;
+
+: SET-ROOT-INTERRUPTED-WITHOUT-RESTART-TELLS-THE-CHANGE-FAILED
+   ( str ^ARENA:arena -- )
+   {: bin ar :}
+   s" set_root_interrupted_without_restart_tells_the_change_failed" T-LABEL
+   ar FIXTURE {: d x first :}
+   d s" second" ar INSIDE {: second :}
+   second FS:MAKE-DIR
+   bin d second s" INT" s" stop" 1 ar SET-ROOT-KILLED
+   {: outu:len erru:len got:n :}
+   ERR erru LEN>N >str {: e :}
+   e s" could not be restarted" STR:CONTAINS? TTRUE
+   e s" The change is kept" STR:CONTAINS? TFALSE
+   got 2 T=
+   x ar STORED-ROOT first T$=
+   d FS:REMOVE-TREE ;
+
+: RUN-BUILT ( str ^ARENA:arena -- )
+   {: bin ar :}
+   bin VERSION-PRINTED
+   bin ar SET-ROOT-INTERRUPTED-BY-SIGINT-RESTORES-THE-SERVICE
+   bin ar SET-ROOT-INTERRUPTED-BY-SIGTERM-RESTORES-THE-SERVICE
+   bin ar SET-ROOT-INTERRUPTED-BY-SIGHUP-RESTORES-THE-SERVICE
+   bin ar SET-ROOT-KILLED-DURING-RESTART-KEEPS-THE-CHANGE
+   bin ar SET-ROOT-KILLED-WITH-A-FAILED-RESTART-KEEPS-THE-CHANGE
+   bin ar SET-ROOT-INTERRUPTED-WITHOUT-RESTART-TELLS-THE-CHANGE-FAILED ;
+
 : PROGRAM ( ^ARENA:arena -- )
    {: ar :}
    ar TEMPORARY {: d :}
    d s" omabox" ar INSIDE {: bin :}
-   [: bin BUILT? if bin VERSION-PRINTED then ;]
+   [: bin BUILT? if bin ar RUN-BUILT then ;]
    [: d FS:REMOVE-TREE ;] finally ;
+
+
+\ ---- the window's table against its model
+
+: FORMAL-HOLDS-THE-RELEASE-WINDOW-TABLES ( ^ARENA:arena -- )
+   {: ar :}
+   s" formal_holds_the_release_window_tables" T-LABEL
+   s" src/omabox.f" s" RELEASING" s" ReleaseWindow" ar TEST-FORMAL:HOLDS
+   s" src/omabox.f" s" CLOSING" s" ReleaseWindowClose" ar
+   TEST-FORMAL:HOLDS ;
 
 
 \ ---- the suite
@@ -1916,7 +2093,8 @@ variable REC-WRITES
    ar SETUP-RELEASES-THE-LOCK-BEFORE-STARTING-A-FAILED-SERVICE
    ar AN-UNEXPECTED-CODE-IS-LOGGED
    ar LOGIN-CASES
-   ar PROGRAM ;
+   ar PROGRAM
+   ar FORMAL-HOLDS-THE-RELEASE-WINDOW-TABLES ;
 
 : RUN-SUITE ( -- )
    T-RESET

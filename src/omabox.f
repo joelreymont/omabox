@@ -23,12 +23,18 @@
 \ and under the daemon lock, the journal bound, the refresh token
 \ stored and a new config written. DROPBOX's calls run under AIO's loop,
 \ started for them alone.
+\ From just before the release until the restore drive has run, SIGINT,
+\ SIGTERM and SIGHUP are caught through SIGNAL's pipe: one ends the window
+\ at its next step as a failure would, and after the restore drive the CLI
+\ dies of it, with the status its default gives.
 \ STORAGE CLASS. CALLER-OWNED: a command's service commands, drive
-\ record, configuration, text, lock, default root, authorization code,
-\ root binding, Dropbox client, login and journal live in an arena the
-\ run holds, as does every text holding a path, the app key or the
-\ login URL; help and the version line alone, whose text is fixed, are
-\ built in string.f's task-local builder.
+\ record, released window, configuration, text, lock, default root,
+\ authorization code, root binding, Dropbox client, login and journal
+\ live in an arena the run holds, as does every text holding a path,
+\ the app key or the login URL; help and the version line alone, whose
+\ text is fixed, are built in string.f's task-local builder.
+\ PROCESS-WIDE: SIGNAL's facility, set up by RELEASED and released when
+\ the window closes, on the main thread.
 require src/lib/error.f
 require src/lib/string.f
 require src/lib/arena.f
@@ -42,6 +48,10 @@ require src/lib/unicode/class.f
 require src/lib/vector.f
 require src/lib/secret.f
 require src/lib/json/write.f
+require src/lib/signal.f
+require src/lib/at-exit.f
+require src/lib/process.f
+require src/lib/fsm.f
 require src/config.f
 require src/auth.f
 require src/journal.f
@@ -228,25 +238,37 @@ ARENA JOURNALS JOURNAL:journal
    s" Use `omabox settings` for human-readable output." HELP
    LOG:;LINE 0 FS:CAUSE! E-SERIALIZE-OUTPUT throw ;
 
-\ Rust's ChangeAndRestore, after the change's lines and the restore's.
-: CHANGE-AND-RESTORE ( str -- )
+\ Rust's ChangeAndRestore's line for the change c.
+: CHANGE-AND-RESTORE-TOLD ( str -- )
    {: c:str :}
-   FS:ERRNO {: cause:n :}
    LOG-OPEN c LOG:TEXT+
    s"  failed, and the Omabox service could not be restarted;"
    LOG:TEXT+
    s"  run `omabox resume` once the errors above are fixed" LOG:TEXT+
-   LOG:;LINE cause FS:CAUSE! E-CHANGE-AND-RESTORE throw ;
+   LOG:;LINE ;
+
+\ Rust's ChangeAndRestore, after the change's lines and the restore's.
+: CHANGE-AND-RESTORE ( str -- )
+   {: c:str :}
+   FS:ERRNO {: cause:n :}
+   c CHANGE-AND-RESTORE-TOLD
+   cause FS:CAUSE! E-CHANGE-AND-RESTORE throw ;
+
+\ Rust's StartAfterChange's error and help lines for the done text d.
+: START-AFTER-CHANGE-TOLD ( str -- )
+   {: d:str :}
+   LOG-OPEN d LOG:TEXT+
+   s" , but the Omabox service could not be started or checked"
+   LOG:TEXT+
+   s" The change is kept. Run `omabox status` and `omabox logs` to see why, then `omabox resume`."
+   HELP LOG:;LINE ;
 
 \ Rust's StartAfterChange for the done text, after the drive's lines.
 : START-AFTER-CHANGE ( str -- )
    {: d:str :}
    FS:ERRNO {: cause:n :}
-   LOG-OPEN d LOG:TEXT+
-   s" , but the Omabox service could not be started or checked"
-   LOG:TEXT+
-   s" The change is kept. Run `omabox status` and `omabox logs` to see why, then `omabox resume`."
-   HELP LOG:;LINE cause FS:CAUSE! E-START-AFTER-CHANGE throw ;
+   d START-AFTER-CHANGE-TOLD
+   cause FS:CAUSE! E-START-AFTER-CHANGE throw ;
 
 \ Ends the help line, then throws code with cause as FS:ERRNO.
 : FAIL ( n n -- )
@@ -701,16 +723,6 @@ ARENA JOURNALS JOURNAL:journal
    v SERVICE-DRIVEN:ACTED @ 0= if OPTION:NONE exit then
    v SERVICE-DRIVEN:FIRST @ SERVICE-GOAL:RESTORE OPTION:SOME ;
 
-\ The change's leftovers and code, 0 for none; it runs only after the
-\ release, whose code r is the change's when it failed.
-: CHANGED ( n [ ^ARENA:arena -- ^VEC:vector<STALE:leftover> ]
-     ^ARENA:arena -- ^VEC:vector<STALE:leftover> n )
-   {: r:n change ar :}
-   r 0<> if NULL-PTR r exit then
-   NULL-PTR [: drop ar change execute ;] catch {: left code:n :}
-   code 0= if left 0 exit then
-   NULL-PTR code ;
-
 \ Whether the restore drive launched the unit, and its code; a release
 \ that spawned nothing has nothing to restore.
 : RESTORED ( ^SERVICE:commands ^SERVICE:driven ^ARENA:arena -- bool n )
@@ -755,17 +767,6 @@ ARENA JOURNALS JOURNAL:journal
    restored 0<> if d START-AFTER-CHANGE then
    c launched d ar RECOVERED {: recovered:bool :}
    d recovered left ar DONE-OUT ;
-
-\ Rust's change_while_released: releases the unit, runs the change
-\ named n, restores the unit; d states the finished change.
-: RELEASED ( ^SERVICE:commands str str
-     [ ^ARENA:arena -- ^VEC:vector<STALE:leftover> ] ^ARENA:arena -- )
-   {: c n:str d:str change ar :}
-   ar DRIVENS-NEW {: v :}
-   c SERVICE-GOAL:RELEASE v SERVICE:DRIVE-RECORDED
-   change ar CHANGED {: left changed:n :}
-   c v ar RESTORED {: launched:bool restored:n :}
-   c n d left changed launched restored ar DECIDED ;
 
 
 \ ---- setup's local steps
@@ -1053,18 +1054,6 @@ ARENA JOURNALS JOURNAL:journal
    s" Omabox sync root is now " ar ARENA:COPY
    r CONFIG:SYNC-ROOT CONFIG:ABS-PATH>STR ar FOLLOWED ;
 
-\ Rust's set_sync_root: the root validated against the stored config,
-\ then changed while the service c is released.
-: SET-ROOT ( str ^CONFIG:xdg ^SERVICE:commands ^ARENA:arena -- )
-   {: root x c ar :}
-   x s" load configuration for sync-root change" ar DOCUMENT {: d :}
-   x s" resolve state paths for sync-root change" ar STATE-PATHS {: p :}
-   x root d CONFIG:DOCUMENT-KEY s" validate the new sync root" ar
-   VALIDATED {: r :}
-   r ar ROOT-DONE {: done :}
-   c s" the sync-root change" done [: p r rot CHANGE-ROOT ;] ar
-   RELEASED ;
-
 
 \ ---- the login
 
@@ -1274,6 +1263,199 @@ ARENA PRIORS prior
    {: c w:bool a ar :}
    c w [: c a ar BIND ;] ar COMPLETE-SETUP ;
 
+
+\ ---- the window while the service is released
+
+\ What changes while the service is released. setup's write asks for a
+\ new config file; its login is bound and its token stored.
+ENUM change
+   VARIANT sync-root FIELD paths ^CONFIG:paths FIELD config ^CONFIG:config
+   ;VARIANT
+   VARIANT setup FIELD config ^CONFIG:config FIELD write bool
+      FIELD login ^authorized
+   ;VARIANT
+;ENUM
+
+\ Each state is named for the step that ran last: released the release
+\ drive, changing the change, restoring the restore drive.
+ENUM window-state released changing restoring ;ENUM
+
+\ What a step answered; interrupted, whatever it answered, once a SIGINT,
+\ SIGTERM or SIGHUP has been taken in the window.
+ENUM outcome ok failed interrupted ;ENUM
+
+\ The closed window, and its two ends: the change's end told, or death
+\ by the signal taken.
+ENUM close-state closed decided died ;ENUM
+
+\ What the window had come to when it closed: no signal taken; a signal
+\ taken, the service restored; or taken, the service not restarted, and
+\ the change made or not.
+ENUM heard quiet signaled kept unmade ;ENUM
+
+\ changed holds the release's code until the change runs; left holds the
+\ made change's leftovers, null until the change is made; signal is the
+\ first signal taken, 0 for none.
+STRUCTURE window DERIVE addr
+   FIELD commands ^SERVICE:commands
+   FIELD change change
+   FIELD name str
+   FIELD done str
+   FIELD arena ^ARENA:arena
+   FIELD driven ^SERVICE:driven
+   FIELD left ^VEC:vector<STALE:leftover>
+   FIELD changed n
+   FIELD launched bool
+   FIELD restored n
+   FIELD signal n
+;STRUCTURE
+
+ARENA WINDOWS window
+
+\ The change made, its leftovers in ar.
+: CHANGE-MADE ( change ^ARENA:arena -- ^VEC:vector<STALE:leftover> )
+   {: ch ar :}
+   ch MATCH change
+      sync-root OF {: p r :} p r ar CHANGE-ROOT ENDOF
+      setup OF {: c w:bool a :} c w a ar COMPLETED ENDOF
+   ;MATCH ;
+
+\ The change's leftovers and code, 0 for none.
+: CHANGED ( change ^ARENA:arena -- ^VEC:vector<STALE:leftover> n )
+   {: ch ar :}
+   NULL-PTR [: drop ch ar CHANGE-MADE ;] catch {: left code:n :}
+   code 0= if left 0 exit then
+   NULL-PTR code ;
+
+\ Keeps the first signal delivered, if none is kept yet.
+: TAKEN ( ^window -- )
+   {: w :}
+   w WINDOW-SIGNAL @ 0<> if exit then
+   SIGNAL:TAKE MATCH SIGNAL:signal-result
+      signal OF w WINDOW-SIGNAL ! ENDOF
+      timeout OF ENDOF
+   ;MATCH ;
+
+\ The outcome of a step that answered the code.
+: OUTCOME ( n ^window -- outcome )
+   {: code:n w :}
+   w WINDOW-SIGNAL @ 0<> if construct outcome interrupted exit then
+   code 0<> if construct outcome failed exit then
+   construct outcome ok ;
+
+: AT-STEP ( ^window -- outcome )
+   {: w :} w TAKEN w WINDOW-CHANGED @ w OUTCOME ;
+
+: CHANGE ( ^window -- )
+   {: w :}
+   w WINDOW-CHANGE @ w WINDOW-ARENA @ CHANGED {: left changed:n :}
+   left w WINDOW-LEFT !
+   changed w WINDOW-CHANGED ! ;
+
+: RESTORE ( ^window -- )
+   {: w :}
+   w WINDOW-COMMANDS @ w WINDOW-DRIVEN @ w WINDOW-ARENA @ RESTORED
+   {: launched:bool restored:n :}
+   launched w WINDOW-LAUNCHED !
+   restored w WINDOW-RESTORED ! ;
+
+\ RELEASED's steps, after formal/ReleaseWindow.tla.
+FSM:DEFINE RELEASING ( ^window ) window-state outcome
+   IN released  AT-STEP
+      ok           CHANGE   >changing
+      failed       RESTORE  >restoring
+      interrupted  RESTORE  >restoring
+   IN changing  AT-STEP
+      ok           RESTORE  >restoring
+      failed       RESTORE  >restoring
+      interrupted  RESTORE  >restoring
+   FINAL restoring  -
+;DEFINE
+
+: STEPS ( ^window -- )
+   {: w :}
+   w WINDOW-COMMANDS @ SERVICE-GOAL:RELEASE w WINDOW-DRIVEN @
+   SERVICE:DRIVE-RECORDED w WINDOW-CHANGED !
+   w construct window-state released RELEASING ;
+
+\ The window closes: RELEASE answers a signal delivered after the last
+\ TAKE, which becomes the window's when it took none.
+: SHUT ( ^window -- )
+   {: w :}
+   SIGNAL:RELEASE {: sig:n :}
+   w WINDOW-SIGNAL @ 0<> if exit then
+   sig w WINDOW-SIGNAL ! ;
+
+: DECIDE ( ^window -- )
+   {: w :}
+   w WINDOW-COMMANDS @ w WINDOW-NAME @ w WINDOW-DONE @ w WINDOW-LEFT @
+   w WINDOW-CHANGED @ w WINDOW-LAUNCHED @ w WINDOW-RESTORED @
+   w WINDOW-ARENA @ DECIDED ;
+
+\ SIGNAL:DIE-OF without its RELEASE, which closed the window: the exit
+\ actions, then death by the signal taken.
+: SIGNALED ( ^window -- )
+   WINDOW-SIGNAL @ {: sig:n :}
+   AT-EXIT:RUN-NOW
+   getpid >PID sig PROCESS:KILL-RAW drop
+   s" " 128 sig + die ;
+
+\ The made change's START-AFTER-CHANGE text, then death by the signal.
+: KEPT ( ^window -- )
+   {: w :} w WINDOW-DONE @ START-AFTER-CHANGE-TOLD w SIGNALED ;
+
+\ The unmade change's CHANGE-AND-RESTORE text, then death by the signal.
+: UNMADE ( ^window -- )
+   {: w :} w WINDOW-NAME @ CHANGE-AND-RESTORE-TOLD w SIGNALED ;
+
+: AT-CLOSED ( ^window -- heard )
+   {: w :}
+   w WINDOW-SIGNAL @ 0= if construct heard quiet exit then
+   w WINDOW-RESTORED @ 0= if construct heard signaled exit then
+   w WINDOW-LEFT @ NULL-PTR <> if construct heard kept exit then
+   construct heard unmade ;
+
+\ The closed window's end, after formal/ReleaseWindow.tla.
+FSM:DEFINE CLOSING ( ^window ) close-state heard
+   IN closed  AT-CLOSED
+      quiet     DECIDE    >decided
+      signaled  SIGNALED  >died
+      kept      KEPT      >died
+      unmade    UNMADE    >died
+   FINAL decided  -
+   FINAL died  -
+;DEFINE
+
+\ Rust's change_while_released: releases the unit, makes the change named
+\ n and restores the unit; d states the finished change.
+: RELEASED ( ^SERVICE:commands change str str ^ARENA:arena -- )
+   {: c ch n:str d:str ar :}
+   ar DRIVENS-NEW {: v :}
+   ar WINDOWS-NEW {: w :}
+   c w WINDOW-COMMANDS !
+   ch w WINDOW-CHANGE !
+   n w WINDOW-NAME !
+   d w WINDOW-DONE !
+   ar w WINDOW-ARENA !
+   v w WINDOW-DRIVEN !
+   SIGNAL:CATCH-STOPS
+   [: w STEPS ;] [: w SHUT ;] finally
+   w construct close-state closed CLOSING ;
+
+
+\ ---- the changes
+
+\ Rust's set_sync_root: the root validated against the stored config,
+\ then changed while the service c is released.
+: SET-ROOT ( str ^CONFIG:xdg ^SERVICE:commands ^ARENA:arena -- )
+   {: root x c ar :}
+   x s" load configuration for sync-root change" ar DOCUMENT {: d :}
+   x s" resolve state paths for sync-root change" ar STATE-PATHS {: p :}
+   x root d CONFIG:DOCUMENT-KEY s" validate the new sync root" ar
+   VALIDATED {: r :}
+   r ar ROOT-DONE {: done :}
+   c p r CHANGE-SYNC-ROOT s" the sync-root change" done ar RELEASED ;
+
 \ Rust's setup: the login runs while the service syncs, as it waits on
 \ the browser; the bind and the config's write run with it released.
 : SETUP ( setup-options ^SERVICE:commands ^ARENA:arena -- )
@@ -1283,8 +1465,8 @@ ARENA PRIORS prior
    i ar SETUP-CONFIG {: c w:bool :}
    c STATE-PREPARED
    c r ar AUTHORIZE {: a :}
-   s s" setup" s" Omabox setup is complete"
-   [: >r c w a r> COMPLETED ;] ar RELEASED ;
+   s c w a CHANGE-SETUP s" setup" s" Omabox setup is complete" ar
+   RELEASED ;
 
 
 \ ---- running
