@@ -2,7 +2,7 @@
 
 Native, ARM64-first Dropbox sync for Omarchy in Habu, against Dropbox's
 documented API and OAuth flow. `docs/habu-rewrite.md` is the plan for the
-rewrite and `JOURNAL.md` records it.
+rewrite and `JOURNAL.md` records it; the journal is closed, so add no entries.
 
 ## Scope
 
