@@ -8,6 +8,7 @@ Walks(l) ==
     CASE l[1] = "single" -> Send(l[2])
       [] l[1] = "starting" -> Start(l[2])
       [] l[1] = "appending" -> Append(l[2])
+      [] l[1] = "checkpointing" -> Checkpoint(l[2])
       [] l[1] = "finishing" -> Finish(l[2])
       [] l[1] = "verifying" -> Confirm(l[2])
       [] l[1] = "restarting" -> Restart(l[2])

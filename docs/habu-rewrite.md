@@ -54,15 +54,15 @@ overflows or it refuses, and hourly.
 | `PLANNER` | `PLAN`, a decision table | `planner.rs` |
 | `CONFIG` | paths, `config.toml`, the instance lock | `config.rs` |
 | `STATUS` | `status.json`, rewritten every 20 s by its own task | `runtime_status.rs` |
-| `JOURNAL` | schema 10; a listing publishes in one transaction | `journal.rs` |
+| `JOURNAL` | schema 11; a listing publishes in one transaction | `journal.rs` |
 | `LOCAL` | scan, hash, stage, install, guarded delete | `local.rs` |
 | `AUTH` | the credential record, PKCE | `auth.rs` |
 | `REPLAY` | pending plans: intent, guard, effect, complete | `recovery.rs` |
 | `RECONCILE` | `PASS`: list, scan, plan, replay, download | `reconcile.rs` |
 | `DAEMON` | `RUN`, and one table of failure dispositions | `daemon.rs` |
 
-- **Journal.** Opens schema 10, creates it from `migrations/` or migrates 8
-  or 9 to it; refuses every other version. It keys local observations by
+- **Journal.** Opens schema 11, creates it from `migrations/` or migrates 8,
+  9 or 10 to it; refuses every other version. It keys local observations by
   canonical path, as the user chose on 2026-11-18, and holds baselines,
   observations and the hash cache in typed columns; the Rust version cannot
   open it.
@@ -109,7 +109,9 @@ overflows or it refuses, and hourly.
   whose download fails for its path. An upload Dropbox refuses for a content
   hash mismatch blocks its path too, where Rust ends the pass.
 - **Upload progress.** `DROPBOX:UPLOAD` takes a quotation `[ n -- ]`, called
-  with the bytes Dropbox has accepted.
+  with the bytes Dropbox has accepted, and one `[ str n -- ]`, called at each
+  accepted append with the session's id and the bytes it confirmed, which
+  REPLAY checkpoints in the journal's upload session record.
 - **Install.** An Arch package (`packaging/arch`) replaces Rust's `omabox
   install`, `upgrade` and `uninstall`. Apart from Rust, an upgrade cannot roll
   back: the previous package file makepkg built is the way back. `omabox

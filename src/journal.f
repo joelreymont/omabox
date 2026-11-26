@@ -1,10 +1,10 @@
-\ journal.f - package JOURNAL: the sync journal, a SQLite file at schema 10
+\ journal.f - package JOURNAL: the sync journal, a SQLite file at schema 11
 \ (rust src/journal.rs at schema 8), and the Dropbox account and local root
 \ it is bound to. OPEN makes the file 0600 without following a link,
-\ creates schema 10 in a new one and migrates schema 8 or 9 to it, each in
-\ one transaction, from migrations/, whose texts this file lays in the
-\ program as it loads; any version but 0, 8, 9 and 10 is refused unchanged,
-\ and OPEN-READ refuses any but 10. A SQLite failure is SQLITE's throw, passed
+\ creates schema 11 in a new one and migrates schema 8, 9 or 10 to it, each
+\ in one transaction, from migrations/, whose texts this file lays in the
+\ program as it loads; any version but 0 and 8 to 11 is refused unchanged,
+\ and OPEN-READ refuses any but 11. A SQLite failure is SQLITE's throw, passed
 \ up unchanged. JOURNAL's own failures are logged once with the Rust
 \ version's text, then thrown as its codes. E-FILE, E-DISK-FULL and E-ROOT
 \ leave the host errno in FS:ERRNO, 0 where there is none; E-DISK-FULL is
@@ -15,13 +15,13 @@
 \ an activation whose path and inode match it upgrades it in place.
 \ A baseline, a plan, a conflict and a local observation are keyed by
 \ the canonical path MODEL:FOLD gives the display path. A baseline, a
-\ remote and a local observation and a hash record are stored in typed
-\ columns; every other stored value is written and read by MODEL's JSON
-\ words. A value MODEL cannot read, a version-nine baseline or remote
-\ observation refusing the migration included, is logged with the
-\ record's path and its cause and thrown as E-JSON; a version-nine local
-\ observation is kept as unknown, and a version-nine hash cache row that
-\ does not convert is dropped.
+\ remote and a local observation, a hash record and an upload session
+\ are stored in typed columns; every other stored value is written and
+\ read by MODEL's JSON words. A value MODEL cannot read, a version-nine
+\ baseline or remote observation refusing the migration included, is
+\ logged with the record's path and its cause and thrown as E-JSON; a
+\ version-nine local observation is kept as unknown, and a version-nine
+\ hash cache row that does not convert is dropped.
 \ Each write to the file is one immediate transaction, and the remote
 \ cursor and inventory are read in one deferred one.
 \ A local scan merges the walk, in path byte order, with the stored local
@@ -130,7 +130,7 @@ ENUM local-root-activation
 
 private
 
-10 constant SCHEMA
+11 constant SCHEMA
 5000 constant BUSY-MS
 $180 constant MODE-OWNER            \ 0600
 $1FF constant MODE-BITS
@@ -228,6 +228,7 @@ s" migrations/0007.sql" create V7 LAY
 s" migrations/0008.sql" create V8 LAY
 s" migrations/0009.sql" create V9 LAY
 s" migrations/0010.sql" create V10 LAY
+s" migrations/0011.sql" create V11 LAY
 
 : TEXT ( ^n -- str )
    {: p:^n :}
@@ -476,12 +477,14 @@ private
    c MIGRATE-BLOCKED-PLANS
    c V7 RUN  c V8 RUN ;
 
-\ Schema v, 0, 8 or 9, brought to SCHEMA by each migration it lacks.
+\ Schema v, 0, 8, 9 or 10, brought to SCHEMA by each migration it lacks;
+\ migration 11 adds the upload sessions and sets the version.
 : MIGRATE ( SQLITE:connection n -- )
    {: c v :}
    v 0= if c CREATE-SCHEMA then
    v 9 < if c MIGRATE-LOCAL-OBSERVATIONS then
-   c MIGRATE-TYPED-COLUMNS ;
+   v 10 < if c MIGRATE-TYPED-COLUMNS then
+   c V11 RUN ;
 
 : WRITABLE ( journal -- )
    {: j :}
@@ -490,7 +493,7 @@ private
    [: j >PATH MODE-OWNER FS:CHMOD-MODE ;]
    s" restrict journal permissions" j >PATH FILE-IO
    c VERSION {: v :}
-   v 0<> v 8 <> and v 9 <> and v SCHEMA <> and if
+   v 0<> v 8 <> and v 9 <> and v 10 <> and v SCHEMA <> and if
       j >PATH v UNSUPPORTED
    then
    j CONFIGURE-WRITABLE
@@ -498,9 +501,20 @@ private
    c [: c v MIGRATE ;] SQLITE:WITH-TRANSACTION ;
 
 \ Deletes each completed plan no pending or unretained recovery record
-\ holds, operations first: both deletes select the same plans.
+\ holds, its operations' upload sessions first, then its operations: the
+\ three deletes select the same plans.
 : PRUNE ( SQLITE:connection -- n )
    {: c :}
+   c s" DELETE FROM upload_sessions WHERE operation_id IN (
+         SELECT operations.id FROM operations WHERE plan_id IN (
+            SELECT plans.id FROM plans WHERE plans.status = 'completed'
+            AND NOT EXISTS (
+               SELECT 1 FROM operations JOIN recovery_records
+                  ON recovery_records.operation_id = operations.id
+               WHERE operations.plan_id = plans.id
+                  AND (recovery_records.status = 'pending'
+                     OR recovery_records.retained_at IS NULL))))"
+   SQLITE:EXEC
    c s" DELETE FROM operations WHERE plan_id IN (
          SELECT plans.id FROM plans WHERE plans.status = 'completed'
          AND NOT EXISTS (
@@ -522,8 +536,9 @@ private
 
 public
 
-\ Removes completed plans and their operations that no pending recovery
-\ needs; completed recovery records stay. Answers the plans removed.
+\ Removes completed plans, their operations and their operations'
+\ upload sessions, that no pending recovery needs; completed recovery
+\ records stay. Answers the plans removed.
 : PRUNE-COMPLETED-WORK ( journal -- n )
    >CONNECTION {: c :}
    c [: c PRUNE ;] SQLITE:WITH-TRANSACTION ;
@@ -544,15 +559,15 @@ private
 
 public
 
-\ The journal at path, schema 10 created in a new or empty file or
-\ migrated from 8 or 9, and its completed work pruned; another version is
+\ The journal at path, schema 11 created in a new or empty file or
+\ migrated from 8, 9 or 10, and its completed work pruned; another version is
 \ refused, the file unchanged.
 : OPEN ( str -- journal )
    {: path:str :}
    path OWNER-ONLY
    path SQLITE:OPEN path JOURNAL-MAKE [: READY ;] SET-UP ;
 
-\ The schema-10 journal at path, never created or changed. Its log lines
+\ The schema-11 journal at path, never created or changed. Its log lines
 \ name it `[Omabox journal]`, as Rust's status redacts the path.
 : OPEN-READ ( str -- journal )
    {: path:str :}
@@ -997,11 +1012,17 @@ private
 \ ---- activation ----------------------------------------------------
 
 \ A new root carries none of the old one's history: live plans, their
-\ recovery intents, baselines, observations, hashes, conflicts and the
-\ watched folders, whose clean marks vouch for those observations, go.
+\ recovery intents and upload sessions, baselines, observations,
+\ hashes, conflicts and the watched folders, whose clean marks vouch
+\ for those observations, go.
 : RETIRE ( SQLITE:connection -- )
    s" DELETE FROM recovery_records
       WHERE status = 'pending' OR operation_id IN (
+         SELECT operations.id FROM operations
+         JOIN plans ON plans.id = operations.plan_id
+         WHERE plans.status IN ('pending', 'blocked')
+      );
+      DELETE FROM upload_sessions WHERE operation_id IN (
          SELECT operations.id FROM operations
          JOIN plans ON plans.id = operations.plan_id
          WHERE plans.status IN ('pending', 'blocked')
@@ -3924,6 +3945,20 @@ STRUCTURE operation-state
 
 \ ---- the writes they share -----------------------------------------
 
+\ The operation's upload session, if any, forgotten.
+: RETIRE-SESSION ( SQLITE:connection operation-id -- )
+   {: c id :}
+   c s" DELETE FROM upload_sessions WHERE operation_id = ?1" [: id OPERATION-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT ;
+
+\ The upload sessions of the plan's operations forgotten.
+: RETIRE-SESSIONS ( SQLITE:connection plan-id -- )
+   {: c id :}
+   c s" DELETE FROM upload_sessions WHERE operation_id IN (
+         SELECT id FROM operations WHERE plan_id = ?1
+      )" [: id PLAN-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT ;
+
 : FINISH-PLAN ( SQLITE:connection plan-id -- )
    {: c id :}
    c s" UPDATE plans
@@ -3941,9 +3976,11 @@ STRUCTURE operation-state
          )" [: id PLAN-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT ;
 
-\ The plan and every operation of it completed, its baseline unchanged.
+\ The plan and every operation of it completed, its baseline unchanged,
+\ and their upload sessions forgotten.
 : RETIRE-PLAN ( SQLITE:connection plan-id -- )
    {: c id :}
+   c id RETIRE-SESSIONS
    c s" UPDATE operations SET status = 'completed' WHERE plan_id = ?1" [: id PLAN-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT
    c id FINISH-PLAN
@@ -4030,9 +4067,11 @@ STRUCTURE operation-state
       INT-ROW ;]
    SQLITE:WITH-STATEMENT 0<> ;
 
-\ The operation completed, and the legacy recovery intent it had.
+\ The operation completed, the legacy recovery intent it had, and its
+\ upload session forgotten.
 : MARK-COMPLETED ( SQLITE:connection operation-id -- )
    {: c id :}
+   c id RETIRE-SESSION
    c s" UPDATE operations SET status = 'completed' WHERE id = ?1" [: id OPERATION-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
    SQLITE:WITH-STATEMENT
    c s" UPDATE recovery_records SET status = 'completed'
@@ -4214,6 +4253,92 @@ public
    s" SELECT id, path, conflict_json FROM conflicts ORDER BY id" [: begin SQLITE:STEP while found ar CONFLICT-ROW repeat ;]
    SQLITE:WITH-STATEMENT
    found ;
+
+
+\ ---- upload sessions ------------------------------------------------
+
+\ The upload session Dropbox holds open for an operation: its id, the
+\ bytes Dropbox confirmed, the upload's length and the content hash of
+\ its bytes. Completing the operation, a conflict or supersession of its
+\ plan, a new root's activation and the prune that removes the operation
+\ forget it; blocking and unblocking the plan keep it.
+STRUCTURE upload-session
+   FIELD id str
+   FIELD offset n
+   FIELD length n
+   FIELD content DROPBOX:hash
+;STRUCTURE
+
+private
+
+: NO-SESSION ( -- option<upload-session> ) OPTION:NONE ;
+
+: SESSION-ROW
+   ( SQLITE:statement ^ARENA:arena
+     -- option<upload-session> SQLITE:statement )
+   {: ar :}
+   SQLITE:STEP 0= if NO-SESSION swap exit then
+   0 ar TEXT-COPY {: sid:str :}
+   1 SQLITE:COL-INT {: at :}
+   2 SQLITE:COL-INT {: u :}
+   3 ar TEXT-COPY DROPBOX:>HASH {: h:DROPBOX:hash :}
+   sid at u h JOURNAL-UPLOAD--SESSION:MAKE OPTION:SOME swap ;
+
+: UPSERT-SESSION ( -- str )
+   s" INSERT INTO upload_sessions(
+         operation_id, session_id, confirmed_offset, length, content
+      ) VALUES (?1, ?2, ?3, ?4, ?5)
+      ON CONFLICT(operation_id) DO UPDATE SET
+         session_id = excluded.session_id,
+         confirmed_offset = excluded.confirmed_offset,
+         length = excluded.length,
+         content = excluded.content" ;
+
+\ An offset past the length, an empty id or an operation the journal
+\ does not hold is SQLITE's throw.
+: SESSION-WRITTEN
+   ( SQLITE:connection operation-id str n n DROPBOX:hash -- )
+   {: c id sid:str at u h:DROPBOX:hash :}
+   c UPSERT-SESSION
+   [: id OPERATION-ID>N 1 SQLITE:BIND-INT
+      sid 2 SQLITE:BIND-TEXT
+      at 3 SQLITE:BIND-INT
+      u 4 SQLITE:BIND-INT
+      h DROPBOX:HASH>STR 5 SQLITE:BIND-TEXT
+      SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT ;
+
+public
+
+\ The operation's recorded upload session, if any.
+: UPLOAD-SESSION
+   ( journal operation-id ^ARENA:arena -- option<upload-session> )
+   {: j id ar :}
+   j >CONNECTION
+   s" SELECT session_id, confirmed_offset, length, content
+      FROM upload_sessions WHERE operation_id = ?1"
+   [: id OPERATION-ID>N 1 SQLITE:BIND-INT ar SESSION-ROW ;]
+   SQLITE:WITH-STATEMENT ;
+
+\ Records that Dropbox confirmed offset bytes of the operation's upload
+\ of length bytes with the content hash in the session named by the
+\ string, replacing what the operation held. A content hash that is not
+\ Dropbox's is never recorded.
+: CHECKPOINT-UPLOAD
+   ( journal operation-id str n n DROPBOX:hash -- )
+   {: j id sid:str at u h:DROPBOX:hash :}
+   h DROPBOX:HASH>STR DROPBOX:CONTENT-HASH? 0= if
+      s" checkpoint upload session" j >PATH
+      s" upload content is not a Dropbox content hash" INVALID
+   then
+   j >CONNECTION {: c :}
+   c [: c id sid at u h SESSION-WRITTEN ;] SQLITE:WITH-TRANSACTION ;
+
+\ Forgets the operation's upload session, if any.
+: RETIRE-UPLOAD ( journal operation-id -- )
+   {: j id :}
+   j >CONNECTION {: c :}
+   c [: c id RETIRE-SESSION ;] SQLITE:WITH-TRANSACTION ;
 
 
 \ ---- recoveries: values ---------------------------------------------

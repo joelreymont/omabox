@@ -1,11 +1,13 @@
-\ journal-test.f - JOURNAL's open, schema 10, bindings, inventories,
-\ baselines, plans, completions, conflicts and recoveries on journals
-\ under TMPDIR: a new journal's sqlite_master against
-\ src/oracle/schema.tsv as a set, but for the baselines,
+\ journal-test.f - JOURNAL's open, schema 11, bindings, inventories,
+\ baselines, plans, completions, conflicts, recoveries and upload
+\ sessions on journals under TMPDIR: a new journal's sqlite_master
+\ against src/oracle/schema.tsv as a set, but for the baselines,
 \ remote_observations, local_observations and local_hash_cache tables,
-\ which are migrations/0010.sql's, and its user_version 10; versions
-\ 1, 7 and 11 refused unchanged; src/oracle/journal.sqlite3, a schema-8
-\ journal, migrated to 10 with its local observations keyed by their
+\ which are migrations/0010.sql's, and the upload_sessions table,
+\ migrations/0011.sql's, and its user_version 11; versions 1, 7 and 12
+\ refused unchanged; a schema-10 journal migrated to 11;
+\ src/oracle/journal.sqlite3, a schema-8 journal, migrated to 11 with
+\ its local observations keyed by their
 \ folded paths and its baselines, remote and local observations and
 \ hash cache in typed columns, and, without its
 \ remote_directories index, left at schema 8 with every row when the
@@ -48,7 +50,7 @@
 \ its src/daemon.rs under their names, which
 \ build each decision the Rust ones ask the planner for as
 \ src/oracle/plan.tsv holds it. Habu opens no
-\ schema-6 file, so the version-six tests start from a schema-10 journal
+\ schema-6 file, so the version-six tests start from a schema-11 journal
 \ holding the row migration 7 leaves for a schema-6 root, birth and
 \ subvolume NULL, and the baseline the Rust tests' version_six_with_root
 \ writes. A copy of the oracle journal with a value MODEL cannot read
@@ -61,6 +63,12 @@
 \ rows that do not convert gone; the migration
 \ converts each of a list of texts exactly when MODEL's JSON reader
 \ reads it, to the value it reads, a local text it refuses to unknown.
+\ An upload session checkpointed, replaced, read across a reopen and
+\ retired; a checkpoint of content that is not a Dropbox hash refused;
+\ the session forgotten by its operation's completion, its plan's
+\ conflict or supersession and a new root's activation, removed by the
+\ prune that removes its operation, and kept by a completion that waits
+\ and by blocking and unblocking its plan.
 \ Each case removes its directory;
 \ a refusal's log line is captured in it, checked and removed.
 \ Run from the repository root: hb --load src/journal-test.f </dev/null
@@ -189,13 +197,22 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    c [: c MIGRATE-LOCAL-OBSERVATIONS ;] SQLITE:WITH-TRANSACTION
    c SQLITE:CLOSE ;
 
-\ The oracle journal copied to path and migrated to schema 10, its
-\ completed work kept.
-: MIGRATED-ORACLE ( str -- )
+\ The oracle journal copied to path and brought to schema 10 in one
+\ transaction.
+: TEN-ORACLE ( str -- )
    {: p:str :}
    p NINE-ORACLE
    p SQLITE:OPEN {: c :}
    c [: c MIGRATE-TYPED-COLUMNS ;] SQLITE:WITH-TRANSACTION
+   c SQLITE:CLOSE ;
+
+\ The oracle journal copied to path and migrated to schema 11, its
+\ completed work kept.
+: MIGRATED-ORACLE ( str -- )
+   {: p:str :}
+   p TEN-ORACLE
+   p SQLITE:OPEN {: c :}
+   c [: c 10 MIGRATE ;] SQLITE:WITH-TRANSACTION
    c SQLITE:CLOSE ;
 
 
@@ -362,8 +379,8 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
 \ ---- the journal's rows ------------------------------------------
 
 \ Every row but the baselines, remote_observations,
-\ local_observations and local_hash_cache tables', as schema.tsv
-\ writes one.
+\ local_observations, local_hash_cache and upload_sessions tables', as
+\ schema.tsv writes one.
 : SCHEMA-SQL ( -- str )
    s" SELECT type || char(9) || name || char(9) || tbl_name || char(9)
          || coalesce(replace(replace(replace(sql, '\', '\\'),
@@ -371,7 +388,7 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
       FROM sqlite_master
       WHERE NOT (type = 'table' AND name IN
          ('baselines', 'remote_observations', 'local_observations',
-            'local_hash_cache'))" ;
+            'local_hash_cache', 'upload_sessions'))" ;
 
 \ Counts the rows, each a line of BODY.
 : SCHEMA-ROWS ( n SQLITE:statement -- n SQLITE:statement )
@@ -393,12 +410,17 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
 
 \ The journal's schema is schema.tsv's but for the baselines,
 \ remote_observations, local_observations and local_hash_cache
-\ tables, which are migrations/0010.sql's, and its version is 10.
-: SCHEMA-10 ( journal -- )
+\ tables, which are migrations/0010.sql's, and the upload_sessions
+\ table, which is migrations/0011.sql's, and its version is 11.
+: SCHEMA-11 ( journal -- )
    >CONNECTION {: c :}
    s" src/oracle/schema.tsv" ORACLE
    0 c SCHEMA-SQL [: SCHEMA-ROWS ;] SQLITE:WITH-STATEMENT 22 T=
-   c VERSION 10 T=
+   c VERSION 11 T=
+   s" migrations/0011.sql" ORACLE
+   c s" SELECT sql FROM sqlite_master
+      WHERE type = 'table' AND name = 'upload_sessions'" [: BODY-HOLDS ;]
+   SQLITE:WITH-STATEMENT TTRUE
    s" migrations/0010.sql" ORACLE
    c s" SELECT sql FROM sqlite_master
       WHERE type = 'table' AND name = 'baselines'" [: BODY-HOLDS ;]
@@ -821,21 +843,22 @@ variable SCANNED       \ query plan rows that scan the table
 
 : NEW-JOURNAL-HAS-THE-ORACLE-SCHEMA ( ^ARENA:arena -- )
    {: ar :}
-   s" a new journal's schema is schema.tsv's and 0010.sql's" T-LABEL
+   s" a new journal's schema is schema.tsv's, 0010.sql's and 0011.sql's"
+   T-LABEL
    s" src/oracle/schema.tsv" ORACLE
    BODY BYTES$ 10 STR:COUNT-CHAR 28 T=
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
-   j SCHEMA-10
+   j SCHEMA-11
    j CLOSE
    d GONE ;
 
 : OTHER-VERSIONS-ARE-REFUSED-UNCHANGED ( ^ARENA:arena -- )
    {: ar :}
-   s" versions 1, 7 and 11 are refused unchanged" T-LABEL
+   s" versions 1, 7 and 12 are refused unchanged" T-LABEL
    1 ar REFUSED
    7 ar REFUSED
-   11 ar REFUSED ;
+   12 ar REFUSED ;
 
 : ORACLE-JOURNAL-HOLDS-ITS-BINDINGS ( ^ARENA:arena -- )
    {: ar :}
@@ -896,11 +919,11 @@ variable SCANNED       \ query plan rows that scan the table
 
 : ORACLE-JOURNAL-IS-MIGRATED ( ^ARENA:arena -- )
    {: ar :}
-   s" the oracle journal migrates to schema 10" T-LABEL
+   s" the oracle journal migrates to schema 11" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    s" src/oracle/journal.sqlite3" p FS:COPY-FILE-STREAM
    p OPEN {: j :}
-   j SCHEMA-10
+   j SCHEMA-11
    j s" Docs" DISPLAY ar BASELINE MODEL-BASELINE:DIRECTORY
    BASELINE-HELD? TTRUE
    j s" Docs/A.txt" DISPLAY ar BASELINE ORACLE-FILE BASELINE-HELD? TTRUE
@@ -1258,7 +1281,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    ( ^ARENA:arena -- )
    {: ar :}
    s" journal_rejects_newer_schema_without_changing_its_version" T-LABEL
-   11 ar REFUSED ;
+   12 ar REFUSED ;
 
 : JOURNAL-SCHEMA-AND-PAYLOAD-COLUMNS-ARE-NOT-SECRET-BEARING
    ( ^ARENA:arena -- )
@@ -3933,7 +3956,7 @@ variable CRAFT
 : KEPT ( -- MODEL:baseline )
    s" kept" s" rev-kept" REMOTE-FILE MODEL-BASELINE:PRESENT ;
 
-\ A schema-10 journal holding a schema-6 root's row, as migration 7
+\ A schema-11 journal holding a schema-6 root's row, as migration 7
 \ copies it, and the baseline version_six_with_root writes.
 : LEGACY ( str ^ARENA:arena -- )
    {: p:str ar :}
@@ -3978,7 +4001,7 @@ variable CRAFT
    r ar LOCAL-ROOT-BINDING LEGACY-ROOT RECORD-HELD? TTRUE
    r CLOSE
    p OPEN {: j :}
-   j >CONNECTION VERSION 10 T=
+   j >CONNECTION VERSION 11 T=
    j ar LOCAL-ROOT-BINDING LEGACY-ROOT RECORD-HELD? TTRUE
    s" observed.txt" 10 ar LOCAL-HASH {: hash :}
    j LEGACY-ROOT >BINDING OBSERVED ar ONE-LOCAL hash ar ONE-HASH
@@ -4774,6 +4797,218 @@ variable CRAFT
    d GONE ;
 
 
+\ ---- upload sessions ----------------------------------------------
+
+\ A Dropbox content hash, as a session's record holds one.
+: SESSION-CONTENT ( -- DROPBOX:hash )
+   s" 9eb62f609dee341fdcc4521fd6d5a78d9e5c5bb36d844618d9e8d1b32f28ba95"
+   CONTENT ;
+
+1000 constant SESSION-LENGTH
+TYPED-VARIABLE HELD-OPERATION operation-id
+
+: SESSION-ROWS ( journal -- n )
+   >CONNECTION s" SELECT COUNT(*) FROM upload_sessions" QUERY-INT ;
+
+\ The session sid confirmed at of SESSION-LENGTH bytes of the operation's
+\ upload.
+: CHECKPOINTED ( journal operation-id str n -- )
+   {: j id sid:str at :}
+   j id sid at SESSION-LENGTH SESSION-CONTENT CHECKPOINT-UPLOAD ;
+
+\ The record is sid's at offset at of SESSION-LENGTH bytes of
+\ SESSION-CONTENT.
+: SESSION-AT? ( option<upload-session> str n -- bool )
+   {: sid:str at :}
+   MATCH option
+      none OF false ENDOF
+      some OF
+         JOURNAL-UPLOAD--SESSION:UNMAKE {: i:str o u h :}
+         i sid SAME? o at = and u SESSION-LENGTH = and
+         h SESSION-CONTENT HASH= and
+      ENDOF
+   ;MATCH ;
+
+: SESSION-NONE? ( option<upload-session> -- bool )
+   MATCH option
+      none OF true ENDOF
+      some OF drop false ENDOF
+   ;MATCH ;
+
+\ A pending plan uploading to the path.
+: UPLOADING ( journal str ^ARENA:arena -- plan-record )
+   {: j a:str ar :}
+   s" upload" UPLOAD-DECISION ar OPERATIONS {: ops :}
+   j a DISPLAY ops ar RECORD-PLAN RECORDED-PLAN ;
+
+\ A plan uploading to the path, its operation's session checkpointed.
+: CHECKPOINTED-PLAN ( journal str ^ARENA:arena -- plan-record )
+   {: j a:str ar :}
+   j a ar UPLOADING {: plan :}
+   j plan FIRST-ID s" session-a" 100 CHECKPOINTED
+   j plan FIRST-ID ar UPLOAD-SESSION s" session-a" 100 SESSION-AT? TTRUE
+   plan ;
+
+: AN-UPLOAD-SESSION-IS-CHECKPOINTED-READ-AND-RETIRED ( ^ARENA:arena -- )
+   {: ar :}
+   s" an upload session is checkpointed, read and retired" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j s" big.bin" ar UPLOADING FIRST-ID {: id :}
+   j id ar UPLOAD-SESSION SESSION-NONE? TTRUE
+   j id s" session-a" 100 CHECKPOINTED
+   j id ar UPLOAD-SESSION s" session-a" 100 SESSION-AT? TTRUE
+   j id s" session-a" 600 CHECKPOINTED
+   j id ar UPLOAD-SESSION s" session-a" 600 SESSION-AT? TTRUE
+   j id s" session-b" 200 CHECKPOINTED
+   j id ar UPLOAD-SESSION s" session-b" 200 SESSION-AT? TTRUE
+   j SESSION-ROWS 1 T=
+   j CLOSE
+   p OPEN {: k :}
+   k id ar UPLOAD-SESSION s" session-b" 200 SESSION-AT? TTRUE
+   k id RETIRE-UPLOAD
+   k id ar UPLOAD-SESSION SESSION-NONE? TTRUE
+   k id RETIRE-UPLOAD
+   k SESSION-ROWS 0 T=
+   k CLOSE
+   d GONE ;
+
+\ A content identity that is not a Dropbox content hash is refused,
+\ logged once, and the record stays as it was.
+: A-CHECKPOINT-REFUSES-OTHER-CONTENT ( ^ARENA:arena -- )
+   {: ar :}
+   s" a checkpoint refuses content that is not a Dropbox hash" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j s" big.bin" ar CHECKPOINTED-PLAN FIRST-ID {: id :}
+   j HELD-JOURNAL !  id HELD-OPERATION !
+   [: HELD-JOURNAL @ HELD-OPERATION @ s" session-c" 300 SESSION-LENGTH
+      s" big" CONTENT CHECKPOINT-UPLOAD ;]
+   E-INVALID-STATE d s" upload content is not a Dropbox content hash" ar
+   LOGGED
+   j id ar UPLOAD-SESSION s" session-a" 100 SESSION-AT? TTRUE
+   j CLOSE
+   d GONE ;
+
+\ Completing a non-final operation forgets its session and keeps the
+\ later one's; the final one's goes with its plan. A completion that
+\ waits for an earlier operation keeps it.
+: COMPLETING-AN-OPERATION-FORGETS-ITS-UPLOAD-SESSION ( ^ARENA:arena -- )
+   {: ar :}
+   s" completing an operation forgets its upload session" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   s" replace.txt" DISPLAY {: path :}
+   s" new" s" rev-server" REMOTE-FILE MODEL-BASELINE:PRESENT {: target :}
+   s" old" s" rev-current" REMOTE-FILE s" new" ar PRESERVED-REPLACE
+   {: ops :}
+   p OPEN {: j :}
+   j path ops ar RECORD-PLAN RECORDED-PLAN {: plan :}
+   plan 0 NTH-ID {: first :}
+   plan 1 NTH-ID {: second :}
+   j first s" session-a" 100 CHECKPOINTED
+   j second s" session-b" 200 CHECKPOINTED
+   j second target OPTION:SOME ar COMPLETE-OPERATION first WAITING-FOR?
+   TTRUE
+   j second ar UPLOAD-SESSION s" session-b" 200 SESSION-AT? TTRUE
+   j first NO-BASELINE ar COMPLETE-OPERATION COMPLETION-N 6 T=
+   j first ar UPLOAD-SESSION SESSION-NONE? TTRUE
+   j second ar UPLOAD-SESSION s" session-b" 200 SESSION-AT? TTRUE
+   j second target OPTION:SOME ar COMPLETE-OPERATION COMPLETION-N 7 T=
+   j SESSION-ROWS 0 T=
+   j CLOSE
+   d GONE ;
+
+: A-CONFLICT-FORGETS-ITS-PLANS-UPLOAD-SESSION ( ^ARENA:arena -- )
+   {: ar :}
+   s" a conflict forgets its plan's upload session" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j s" big.bin" ar CHECKPOINTED-PLAN {: plan :}
+   j plan >ID DIVERGENT ar FINISH-PLAN-WITH-CONFLICT
+   CONFLICT-COMPLETION-N 2 T=
+   j plan FIRST-ID ar UPLOAD-SESSION SESSION-NONE? TTRUE
+   j SESSION-ROWS 0 T=
+   j CLOSE
+   d GONE ;
+
+: SUPERSESSION-FORGETS-ITS-PLANS-UPLOAD-SESSION ( ^ARENA:arena -- )
+   {: ar :}
+   s" supersession forgets its plan's upload session" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j s" big.bin" ar CHECKPOINTED-PLAN {: plan :}
+   j plan >ID ar SUPERSEDE-PLAN SUPERSEDED? TTRUE
+   j plan FIRST-ID ar UPLOAD-SESSION SESSION-NONE? TTRUE
+   j SESSION-ROWS 0 T=
+   j CLOSE
+   d GONE ;
+
+\ A new root's activation purges the prior root's live plans, their
+\ sessions with them.
+: ACTIVATION-PURGES-THE-PRIOR-ROOTS-UPLOAD-SESSIONS ( ^ARENA:arena -- )
+   {: ar :}
+   s" a new root's activation purges the prior root's upload sessions"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j s" /sync/first" 2 LOCAL-ROOT ar ACTIVATE-LOCAL-ROOT ACTIVATED
+   j s" big.bin" ar CHECKPOINTED-PLAN {: plan :}
+   j s" /sync/second" 4 LOCAL-ROOT ar ACTIVATE-LOCAL-ROOT ACTIVATED
+   j ar PENDING-PLANS VEC:COUNT 0 T=
+   j plan FIRST-ID ar UPLOAD-SESSION SESSION-NONE? TTRUE
+   j SESSION-ROWS 0 T=
+   j CLOSE
+   d GONE ;
+
+\ Every transaction that completes an operation forgets its session, so
+\ a completed operation holds one only when checkpointed after it
+\ completed; the prune that removes it removes the session too.
+: PRUNING-REMOVES-THE-OPERATIONS-UPLOAD-SESSION ( ^ARENA:arena -- )
+   {: ar :}
+   s" pruning removes the operation's upload session" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j s" big.bin" ar UPLOADING {: plan :}
+   s" upload" s" rev-server" REMOTE-FILE MODEL-BASELINE:PRESENT
+   {: uploaded :}
+   j plan FIRST-ID uploaded OPTION:SOME ar COMPLETE-OPERATION
+   COMPLETION-N 7 T=
+   j plan FIRST-ID s" session-a" 100 CHECKPOINTED
+   j SESSION-ROWS 1 T=
+   j PRUNE-COMPLETED-WORK 1 T=
+   j plan FIRST-ID ar UPLOAD-SESSION SESSION-NONE? TTRUE
+   j SESSION-ROWS 0 T=
+   j CLOSE
+   d GONE ;
+
+: BLOCKING-AND-UNBLOCKING-KEEP-THE-UPLOAD-SESSION ( ^ARENA:arena -- )
+   {: ar :}
+   s" blocking and unblocking keep the upload session" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j s" big.bin" ar CHECKPOINTED-PLAN {: plan :}
+   j plan >ID MODEL-BLOCKAGE:REMOTE-OBJECT 1700000000 ar BLOCK-PLAN
+   BLOCK-N 2 T=
+   j plan FIRST-ID ar UPLOAD-SESSION s" session-a" 100 SESSION-AT? TTRUE
+   j plan >ID ar UNBLOCK-PLAN UNBLOCK-N 2 T=
+   j plan FIRST-ID ar UPLOAD-SESSION s" session-a" 100 SESSION-AT? TTRUE
+   j CLOSE
+   d GONE ;
+
+\ A schema-10 journal gains the empty upload session table.
+: A-SCHEMA-10-JOURNAL-MIGRATES-TO-11 ( ^ARENA:arena -- )
+   {: ar :}
+   s" a schema-10 journal migrates to schema 11" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p TEN-ORACLE
+   p VERSION-AT 10 T=
+   p OPEN {: j :}
+   j SCHEMA-11
+   j SESSION-ROWS 0 T=
+   j CLOSE
+   d GONE ;
+
+
 \ ---- stored values MODEL cannot read -----------------------------
 
 \ The oracle journal, copied into a case's directory and opened, with
@@ -4854,7 +5089,7 @@ variable CRAFT
       VALUES (CAST('Old/Gone.txt' AS BLOB), '\"Absent\"',
          CAST('old/gone.txt' AS BLOB))" p PLANT-AT
    p OPEN {: j :}
-   j >CONNECTION VERSION 10 T=
+   j >CONNECTION VERSION 11 T=
    j s" Docs" DISPLAY ar BASELINE MODEL-BASELINE:DIRECTORY
    BASELINE-HELD? TTRUE
    j s" Docs/A.txt" DISPLAY ar BASELINE ORACLE-FILE BASELINE-HELD? TTRUE
@@ -4921,7 +5156,7 @@ variable CRAFT
    p NINE-ORACLE
    EVERY-REMOTE-KIND p PLANT-AT
    p OPEN {: j :}
-   j >CONNECTION VERSION 10 T=
+   j >CONNECTION VERSION 11 T=
    j ar REMOTE-INVENTORY JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur v :}
    v VEC:COUNT 8 T=
    v ar ORACLE-REMOTES? TTRUE
@@ -4999,7 +5234,7 @@ variable CRAFT
    p NINE-ORACLE
    EVERY-LOCAL-KIND p PLANT-AT
    p OPEN {: j :}
-   j >CONNECTION VERSION 10 T=
+   j >CONNECTION VERSION 11 T=
    j ar LOCAL-INVENTORY ar MIGRATED-LOCALS LOCAL-RECORDS= TTRUE
    s" Future" MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN-AT {: f :}
    j s" future" ar CANONICAL ar LOCAL-AT f LOCAL-IS? TTRUE
@@ -5078,7 +5313,7 @@ variable CRAFT
    p NINE-ORACLE
    EVERY-HASH-KIND p PLANT-AT
    p OPEN {: j :}
-   j >CONNECTION VERSION 10 T=
+   j >CONNECTION VERSION 11 T=
    j >CONNECTION s" SELECT count(*) FROM local_hash_cache" QUERY-INT
    3 T=
    j ar HASHES-MIGRATED
@@ -5593,7 +5828,16 @@ variable CRAFT
    ar AN-UNKNOWN-OPERATION-IS-REFUSED
    ar AN-UNKNOWN-BLOCKAGE-IS-REFUSED
    ar AN-UNKNOWN-CONFLICT-IS-REFUSED
-   ar AN-UNREADABLE-RECOVERY-CONTENT-IS-REFUSED ;
+   ar AN-UNREADABLE-RECOVERY-CONTENT-IS-REFUSED
+   ar AN-UPLOAD-SESSION-IS-CHECKPOINTED-READ-AND-RETIRED
+   ar A-CHECKPOINT-REFUSES-OTHER-CONTENT
+   ar COMPLETING-AN-OPERATION-FORGETS-ITS-UPLOAD-SESSION
+   ar A-CONFLICT-FORGETS-ITS-PLANS-UPLOAD-SESSION
+   ar SUPERSESSION-FORGETS-ITS-PLANS-UPLOAD-SESSION
+   ar ACTIVATION-PURGES-THE-PRIOR-ROOTS-UPLOAD-SESSIONS
+   ar PRUNING-REMOVES-THE-OPERATIONS-UPLOAD-SESSION
+   ar BLOCKING-AND-UNBLOCKING-KEEP-THE-UPLOAD-SESSION
+   ar A-SCHEMA-10-JOURNAL-MIGRATES-TO-11 ;
 
 
 : TESTS ( -- )

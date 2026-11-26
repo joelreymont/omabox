@@ -141,8 +141,9 @@ a finish. Dropbox takes an append only at its session's offset and commits only
 the whole stage over the upload's revision; a call may have acted though its
 answer does not say so, a session may be gone at any call, and get_metadata may
 not show an upload Dropbox holds. The upload answers done only while Dropbox
-holds its complete entry at its path, counts as accepted only chunks its
-session holds, and, resending a chunk once and restarting once, ends.
+holds its complete entry at its path, counts as accepted, and checkpoints at
+each accepted append, only chunks its session holds, and, resending a chunk
+once and restarting once, ends.
 
 Run the models from this directory with `tlc`, the TLA+ tools' model
 checker on PATH:

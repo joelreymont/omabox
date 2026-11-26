@@ -103,7 +103,9 @@ ENUM probe empty occupied interrupted ;ENUM
                 \ rev, content hash, offset; the body: its offset, the
                 \ size, the fetch
 : READ-BODY     ( ^u8 n ^fetch -- n )       \ bytes read, 0 at the end
-: UPLOAD        ( ^upload ^client [ n -- ] -- reply )  \ bytes accepted
+: UPLOAD        ( ^upload ^client [ n -- ] [ str n -- ] -- reply )
+                \ bytes accepted; at each accepted append, the
+                \ session's id and the bytes it confirmed
 : DELETE        ( ^u8 n ^u8 n ^client -- reply )  \ path, rev
 : CREATE-FOLDER ( ^u8 n ^client -- reply )  \ path
 : ENTRY         ( ^client -- ^entry )
@@ -264,12 +266,14 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
       unsure  ANSWER-UNVERIFIED  >ended
       failed  ANSWER-REPLY       >ended
    IN appending  APPEND-SENSE ( append-event )
-      stored    CHUNK-ADVANCE      >appending
-      complete  CHUNK-ADVANCE      >finishing
+      stored    CHUNK-ADVANCE      >checkpointing
       unsure    -                  >appending    \ resent once
       cut       ANSWER-UNVERIFIED  >ended        \ unsure twice
       gone      -                  >restarting
       failed    ANSWER-REPLY       >ended
+   IN checkpointing  CHECKPOINT-SENSE ( checkpoint-event )
+      more   -  >appending     \ after DRIVE's checkpoint
+      whole  -  >finishing
    IN finishing  FINISH-SENSE ( finish-event )
       committed  ANSWER-DONE        >ended
       untrusted  ANSWER-UNVERIFIED  >ended
@@ -289,6 +293,10 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
 ;DEFINE
 ```
 
+- **Each accepted append stops at `checkpointing`.** `DRIVE` hands the
+  caller's checkpoint quotation the session's id and the bytes it
+  confirmed, as `DRIVEN` hands a download's body, then steps on. No record
+  holds the quotation, so the caller's may read its locals.
 - **`stored`** also covers `incorrect_offset` whose correct offset equals
   the chunk's end: a resent chunk Dropbox already had. Any other correct
   offset, or a closed or missing session, is **`gone`**, and the upload starts
@@ -304,7 +312,7 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
   sends the whole file's hash here, and every upload over 32 MiB fails (a
   hypothesis, consistent with 6 of 6 failures).
 - An upload does not resume across calls. A `retry` starts over on the next
-  pass.
+  pass. REPLAY records each checkpoint in the journal.
 
 ## Kept out of it
 

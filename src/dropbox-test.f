@@ -34,7 +34,9 @@
 \ deleted entry, and one answered at another path, unavailable),
 \ Dropbox's content hash and uploads,
 \ whose stages are written under TMPDIR and removed once open, so no run
-\ leaves one; a mutation, session start or finish lost or answered 503
+\ leaves one; a checkpoint at each accepted append with its session and
+\ offset, the restarted session's after a closed one, and none for a
+\ single upload; a mutation, session start or finish lost or answered 503
 \ with no wait, an append lost twice, a session gone twice, a mutation
 \ Dropbox answers at another path, a delete it answers with a file at
 \ another rev, a delete's answer that does not parse, and an upload's or
@@ -2283,6 +2285,11 @@ variable STAGE-U
 create EXPECTED 64 allot
 variable SHOWN
 variable SHOWS
+\ UPLOAD's checkpoints: the session and offset of the last, and the calls.
+create CHECKED-ID 64 allot
+variable CHECKED-ID-U
+variable CHECKED
+variable CHECKS
 \ The count of accepted bytes at which FAULT strikes, -1 for none, and
 \ the strikes left there.
 variable FAULT-AT
@@ -2411,9 +2418,19 @@ TYPED-VARIABLE FAULT fault
    STRIKE ;
 
 
+: CHECKPOINTED ( str n -- )
+   {: sid:str n:n :}
+   sid str> 64 min {: a:^ u:n :}
+   a CHECKED-ID u BYTE-COPY u CHECKED-ID-U !
+   n CHECKED ! 1 CHECKS +! ;
+
+
+: CHECKED-ID$ ( -- str ) CHECKED-ID CHECKED-ID-U @ >str ;
+
+
 : SEND ( -- DROPBOX:reply )
-   0 SHOWN ! 0 SHOWS !
-   UP TEST-CLIENT:MAIN @ [: PROGRESSED ;] DROPBOX:UPLOAD ;
+   0 SHOWN ! 0 SHOWS ! 0 CHECKED-ID-U ! 0 CHECKED ! 0 CHECKS !
+   UP TEST-CLIENT:MAIN @ [: PROGRESSED ;] [: CHECKPOINTED ;] DROPBOX:UPLOAD ;
 
 
 : ENTRY-HASH$ ( -- str )
@@ -2432,7 +2449,7 @@ TYPED-VARIABLE FAULT fault
    e DROPBOX-ENTRY:LOWER @ SPAN:$ s" /docs/up.txt" T$=
    e DROPBOX-ENTRY:SIZE @ 12 T=
    ENTRY-HASH$ EXPECTED$ T$=
-   SHOWN @ 12 T= SHOWS @ 1 T=
+   SHOWN @ 12 T= SHOWS @ 1 T= CHECKS @ 0 T=
    TEST-DROPBOX:SEEN$ s" /2/files/upload" T$=
    TEST-DROPBOX:TYPE-SENT$ s" application/octet-stream" T$=
    SB-RESET S\" {\qpath\q:\q/Docs/Up.txt\q,\qmode\q:\qadd\q," SB-APPEND
@@ -2708,6 +2725,7 @@ TYPED-VARIABLE FAULT fault
    SB-RESET S-START S-APPEND S-APPEND S-FINISH
    -1 construct fault cut FAULTED
    SHOWS @ 2 T= SHOWN @ CHUNK 1+ T=
+   CHECKS @ 2 T= CHECKED @ CHUNK 1+ T= CHECKED-ID$ s" fake-session-0" T$=
    SB-RESET S\" {\qcursor\q:{\qsession_id\q:\qfake-session-0\q," SB-APPEND
    S\" \qoffset\q:" SB-APPEND CHUNK 1+ FMT:SB-INT
    S\" },\qcommit\q:{\qpath\q:\q/Big.bin\q,\qmode\q:\qadd\q," SB-APPEND
@@ -2731,7 +2749,8 @@ TYPED-VARIABLE FAULT fault
    s" closed session" T-LABEL
    SB-RESET S-START S-APPEND S-APPEND S-RESTART S-APPEND S-APPEND
    S-FINISH
-   CHUNK construct fault close FAULTED ;
+   CHUNK construct fault close FAULTED
+   CHECKS @ 3 T= CHECKED @ CHUNK 1+ T= CHECKED-ID$ s" fake-session-1" T$= ;
 
 
 \ incorrect_offset short of the chunk's end: Dropbox does not hold the

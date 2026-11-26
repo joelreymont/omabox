@@ -984,9 +984,12 @@ ENUM expectation
    VARIANT delete-folder ;VARIANT
 ;ENUM
 
-\ One upload; rev is the rev it replaces, empty to create, and done the
-\ bytes Dropbox has accepted.
+\ One upload; rev is the rev it replaces, empty to create, done the
+\ bytes Dropbox has accepted, and journal and operation where its upload
+\ session is checkpointed.
 STRUCTURE sending DERIVE addr
+   FIELD journal JOURNAL:journal
+   FIELD operation JOURNAL:operation-id
    FIELD link ^link
    FIELD target str
    FIELD path MODEL:path
@@ -1355,11 +1358,18 @@ private
    up DROPBOX-UPLOAD:REV !
    up ;
 
+\ UPLOAD's checkpoint: the session named by the string confirmed n
+\ bytes of the stage.
+: CHECKPOINTED ( str n ^sending -- )
+   {: sid:str n s :}
+   s SENDING-JOURNAL @ s SENDING-OPERATION @ sid n s SENDING-SIZE @
+   s DESIRED JOURNAL:CHECKPOINT-UPLOAD ;
+
 \ The upload; a finished transfer follows on every exit.
 : PUT ( ^sending -- DROPBOX:reply )
    {: s :}
    [: s UPLOAD-OF s SENDING-LINK @ CLIENT [: s SENT ;]
-      DROPBOX:UPLOAD ;]
+      [: s CHECKPOINTED ;] DROPBOX:UPLOAD ;]
    [: s FINISHED ;] finally ;
 
 : UPLOADED ( ^sending -- mutation-outcome )
@@ -1390,20 +1400,23 @@ private
    [: s SIZED ;] [: f DISCARD ;] finally ;
 
 : NEW-SENDING
-   ( str ^link MODEL:path ^LOCAL:staged-upload DROPBOX:rev
-     ^ARENA:arena -- ^sending )
-   {: t:str l path up rev:DROPBOX:rev ar :}
+   ( str JOURNAL:journal JOURNAL:operation-id ^link MODEL:path
+     ^LOCAL:staged-upload DROPBOX:rev ^ARENA:arena -- ^sending )
+   {: t:str j id l path up rev:DROPBOX:rev ar :}
    ar SENDINGS-NEW {: s :}
+   j s SENDING-JOURNAL ! id s SENDING-OPERATION !
    t s SENDING-TARGET ! l s SENDING-LINK ! path s SENDING-PATH !
    up s SENDING-STAGE ! rev s SENDING-REV ! ar s SENDING-ARENA !
    s ;
 
-\ Rust's create_file, or replace_file of the rev unless it is empty.
+\ Rust's create_file, or replace_file of the rev unless it is empty; each
+\ append Dropbox accepts is checkpointed as the operation's upload
+\ session in the journal.
 : REMOTE-UPLOAD
-   ( ^link MODEL:path ^LOCAL:staged-upload DROPBOX:rev ^ARENA:arena
-     -- mutation-outcome )
-   {: l path up rev:DROPBOX:rev ar :}
-   l path ar [: l path up rev ar NEW-SENDING OPENED ;] TARGETED ;
+   ( JOURNAL:journal JOURNAL:operation-id ^link MODEL:path
+     ^LOCAL:staged-upload DROPBOX:rev ^ARENA:arena -- mutation-outcome )
+   {: j id l path up rev:DROPBOX:rev ar :}
+   l path ar [: j id l path up rev ar NEW-SENDING OPENED ;] TARGETED ;
 
 
 \ ---- delete folder
@@ -2505,8 +2518,9 @@ ENUM file-mutation add replace ;ENUM
 
 : SEND-NEW ( ^LOCAL:staged-upload ^pass -- apply-event )
    {: up r :}
-   r [: r PASS-LINK @ r RUN-PATH up NO-REV r PASS-ARENA @
-      REMOTE-UPLOAD up FILE-MUTATION-ADD r APPLY-FILE-MUTATION ;]
+   r [: r PASS-JOURNAL @ r PASS-OPERATION @ OPERATION-ID r PASS-LINK @
+      r RUN-PATH up NO-REV r PASS-ARENA @ REMOTE-UPLOAD
+      up FILE-MUTATION-ADD r APPLY-FILE-MUTATION ;]
    ENSURE-REMOTE-PARENTS ;
 
 : FILE-CREATE ( DROPBOX:hash ^pass -- apply-event )
@@ -2515,7 +2529,8 @@ ENUM file-mutation add replace ;ENUM
 
 : SEND-OVER ( ^LOCAL:staged-upload DROPBOX:rev ^pass -- apply-event )
    {: up v:DROPBOX:rev r :}
-   r PASS-LINK @ r RUN-PATH up v r PASS-ARENA @ REMOTE-UPLOAD
+   r PASS-JOURNAL @ r PASS-OPERATION @ OPERATION-ID r PASS-LINK @
+   r RUN-PATH up v r PASS-ARENA @ REMOTE-UPLOAD
    up FILE-MUTATION-REPLACE r APPLY-FILE-MUTATION ;
 
 : FILE-REPLACE ( DROPBOX:hash DROPBOX:rev ^pass -- apply-event )

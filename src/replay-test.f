@@ -57,7 +57,11 @@
 \   finished transfer is sent; one refused as a conflict with its own
 \   bytes at the path is read back as applied; a read-back incomplete
 \   file is rejected, and an incomplete upload answer is read back;
-\   Rust's verification_without_a_lowercase_path_is_invalid_metadata.
+\   Rust's verification_without_a_lowercase_path_is_invalid_metadata; a
+\   single upload records no session in the journal, and a session
+\   upload of two appends records the session once after each, at its
+\   confirmed offset, the record left holding the session, the whole
+\   length and the upload's content hash.
 \ - REMOTE-DELETE-FILE without a rev throws E-INVALID-STATE, logging
 \   once, with no request; one refused as a conflict for a path now gone
 \   is read back as applied.
@@ -762,13 +766,20 @@ $140 constant MODE-NO-WRITE
    root p ar LOCAL:OBSERVE-UPLOAD-SOURCE-AT {: c:DROPBOX:hash :}
    root p s c ar LOCAL:STAGE-UPLOAD-AT UPLOAD-OF ;
 
+\ The file at p below the root, written with the bytes and staged as an
+\ upload.
+: STAGED-AS
+   ( str str str str ^ARENA:arena -- ^LOCAL:staged-upload )
+   {: r:str s:str p:str b:str ar :}
+   r p ar TEST-CLIENT:INSIDE b FS:WRITE-ALL
+   r FS:OPEN-DIR {: root:fd :}
+   [: root s p ar STAGED-BELOW ;] [: root FS:CLOSE-DIR ;] finally ;
+
 \ The file at p below the root, written and staged as an upload.
 : STAGED
    ( str str str ^ARENA:arena -- ^LOCAL:staged-upload )
    {: r:str s:str p:str ar :}
-   r p ar TEST-CLIENT:INSIDE s" local edit" FS:WRITE-ALL
-   r FS:OPEN-DIR {: root:fd :}
-   [: root s p ar STAGED-BELOW ;] [: root FS:CLOSE-DIR ;] finally ;
+   r s p s" local edit" ar STAGED-AS ;
 
 \ The absolute path of p's local conflict copy holding the upload.
 : COPY-NAME
@@ -1311,11 +1322,34 @@ STATUS-CAP BUFFER: STATUS-BUF
    {: rt:str ar want:str :}
    rt ar STATUS-TEXT want STR:CONTAINS? TTRUE ;
 
+: FIRST-ID ( JOURNAL:plan-record -- JOURNAL:operation-id )
+   JOURNAL-PLAN--RECORD:UNMAKE {: id p ops s :}
+   ops 0 VEC:AT @ JOURNAL-PLANNED--OPERATION:UNMAKE {: i o x st :} i ;
+
+\ A journal in the case's directory d holding one plan, the upload of the
+\ stage to a, and that upload's operation.
+: UPLOAD-JOURNAL
+   ( str str ^LOCAL:staged-upload ^ARENA:arena
+     -- JOURNAL:journal JOURNAL:operation-id )
+   {: d:str a:str up ar :}
+   d s" journal.sqlite3" ar TEST-CLIENT:INSIDE JOURNAL:OPEN {: j :}
+   up LOCAL:UPLOAD-CONTENT MODEL-OPERATION:CREATE-REMOTE {: o :}
+   j a TEST-CLIENT:DISPLAY o ar TEST-CLIENT:ONE-PLAN ar
+   JOURNAL:RECORD-PLAN NEW-PLAN {: plan :}
+   j plan FIRST-ID ;
+
+: NO-SESSION? ( option<JOURNAL:upload-session> -- bool )
+   MATCH option
+      none OF true ENDOF
+      some OF drop false ENDOF
+   ;MATCH ;
+
 : UPLOAD-NOTES
-   ( ^REPLAY:link ^LOCAL:staged-upload ^ARENA:arena
-     -- REPLAY:mutation-outcome )
-   {: l up ar :}
-   l s" notes.txt" TEST-CLIENT:DISPLAY up s" " AS-REV ar REPLAY:REMOTE-UPLOAD ;
+   ( JOURNAL:journal JOURNAL:operation-id ^REPLAY:link
+     ^LOCAL:staged-upload ^ARENA:arena -- REPLAY:mutation-outcome )
+   {: j id l up ar :}
+   j id l s" notes.txt" TEST-CLIENT:DISPLAY up s" " AS-REV ar
+   REPLAY:REMOTE-UPLOAD ;
 
 : APPLIED-FILE ( REPLAY:mutation-outcome -- MODEL:remote )
    MATCH REPLAY:mutation-outcome
@@ -1340,7 +1374,8 @@ STATUS-CAP BUFFER: STATUS-BUF
    st l REPLAY-LINK:STATUS !
    ar CONFLICT-DIRS {: d:str r:str s:str :}
    r s s" notes.txt" ar STAGED {: up :}
-   l up ar UPLOAD-NOTES APPLIED-FILE MODEL-REMOTE:UNMAKE {: c v :}
+   d s" notes.txt" up ar UPLOAD-JOURNAL {: j id :}
+   j id l up ar UPLOAD-NOTES APPLIED-FILE MODEL-REMOTE:UNMAKE {: c v :}
    c DROPBOX:HASH>STR up LOCAL:UPLOAD-CONTENT DROPBOX:HASH>STR
    T$=
    v DROPBOX:REV>STR s" 01701" T$=
@@ -1348,7 +1383,8 @@ STATUS-CAP BUFFER: STATUS-BUF
    S\" {\qdirection\q:\qupload\q,\qpath\q:\qnotes.txt\q,\qbytes_done\q:10,\qbytes_total\q:10}"
    SHOWS
    TEST-DROPBOX:SEEN$ s" /2/files/upload" T$=
-   d GONE rt GONE ;
+   j id ar JOURNAL:UPLOAD-SESSION NO-SESSION? TTRUE
+   j JOURNAL:CLOSE d GONE rt GONE ;
 
 \ A transfer of notes.txt with 3 of 10 bytes sent.
 : PART-SENT ( ^STATUS:status -- )
@@ -1367,13 +1403,14 @@ STATUS-CAP BUFFER: STATUS-BUF
    st l REPLAY-LINK:STATUS !
    ar CONFLICT-DIRS {: d:str r:str s:str :}
    r s s" notes.txt" ar STAGED {: up :}
+   d s" notes.txt" up ar UPLOAD-JOURNAL {: j id :}
    st PART-SENT
-   l up ar UPLOAD-NOTES s" precondition-changed" s" file" GIVES
+   j id l up ar UPLOAD-NOTES s" precondition-changed" s" file" GIVES
    rt ar
    S\" {\qdirection\q:\qupload\q,\qpath\q:\qnotes.txt\q,\qbytes_done\q:0,\qbytes_total\q:10}"
    SHOWS
    TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
-   d GONE rt GONE ;
+   j JOURNAL:CLOSE d GONE rt GONE ;
 
 : A-HELD-UPLOAD-IS-READ-BACK ( ^REPLAY:link ^ARENA:arena -- )
    {: l ar :}
@@ -1383,13 +1420,14 @@ STATUS-CAP BUFFER: STATUS-BUF
    st l REPLAY-LINK:STATUS !
    ar CONFLICT-DIRS {: d:str r:str s:str :}
    r s s" notes.txt" ar STAGED {: up :}
+   d s" notes.txt" up ar UPLOAD-JOURNAL {: j id :}
    up LOCAL:UPLOAD-CONTENT DROPBOX:HASH>STR {: h:str :}
    s" /notes.txt" s" /notes.txt" s" 0150" h 10 TEST-DROPBOX:FILE!
-   l up ar UPLOAD-NOTES APPLIED-FILE MODEL-REMOTE:UNMAKE {: c v :}
+   j id l up ar UPLOAD-NOTES APPLIED-FILE MODEL-REMOTE:UNMAKE {: c v :}
    c DROPBOX:HASH>STR h T$=
    v DROPBOX:REV>STR s" 0150" T$=
    TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
-   d GONE rt GONE ;
+   j JOURNAL:CLOSE d GONE rt GONE ;
 
 : A-READ-BACK-INCOMPLETE-FILE-IS-REJECTED ( ^REPLAY:link ^ARENA:arena -- )
    {: l ar :}
@@ -1402,9 +1440,10 @@ STATUS-CAP BUFFER: STATUS-BUF
    st l REPLAY-LINK:STATUS !
    ar CONFLICT-DIRS {: d:str r:str s:str :}
    r s s" notes.txt" ar STAGED {: up :}
-   l up ar UPLOAD-NOTES s" rejected" s" rejected-by-dropbox" GIVES
+   d s" notes.txt" up ar UPLOAD-JOURNAL {: j id :}
+   j id l up ar UPLOAD-NOTES s" rejected" s" rejected-by-dropbox" GIVES
    TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
-   d GONE rt GONE ;
+   j JOURNAL:CLOSE d GONE rt GONE ;
 
 : AN-INCOMPLETE-UPLOAD-ANSWER-IS-READ-BACK
    ( ^REPLAY:link ^ARENA:arena -- )
@@ -1415,17 +1454,18 @@ STATUS-CAP BUFFER: STATUS-BUF
    st l REPLAY-LINK:STATUS !
    ar CONFLICT-DIRS {: d:str r:str s:str :}
    r s s" notes.txt" ar STAGED {: up :}
+   d s" notes.txt" up ar UPLOAD-JOURNAL {: j id :}
    up LOCAL:UPLOAD-CONTENT DROPBOX:HASH>STR {: h:str :}
    SB-RESET
    S\" {\qname\q:\qnotes.txt\q,\qid\q:\qid:n\q,\qpath_lower\q:\q/notes.txt\q,\qpath_display\q:\q/notes.txt\q,\qrev\q:\q01701\q,\qsize\q:10,\qcontent_hash\q:\q"
    SB-APPEND h SB-APPEND S\" \q,\qis_downloadable\q:false}" SB-APPEND
    200 s" " s" " SB$ TEST-DROPBOX:SCRIPT!
    s" /notes.txt" s" /notes.txt" s" 01702" h 10 TEST-DROPBOX:FILE!
-   l up ar UPLOAD-NOTES APPLIED-FILE MODEL-REMOTE:UNMAKE {: c v :}
+   j id l up ar UPLOAD-NOTES APPLIED-FILE MODEL-REMOTE:UNMAKE {: c v :}
    c DROPBOX:HASH>STR h T$=
    v DROPBOX:REV>STR s" 01702" T$=
    TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
-   d GONE rt GONE ;
+   j JOURNAL:CLOSE d GONE rt GONE ;
 
 : DROP-OUTCOME ( REPLAY:mutation-outcome -- ) drop ;
 
@@ -1442,9 +1482,12 @@ STATUS-CAP BUFFER: STATUS-BUF
    SB-APPEND h SB-APPEND S\" \q,\qis_downloadable\q:true}" SB-APPEND
    200 s" " s" " SB$ TEST-DROPBOX:SCRIPT! ;
 
-: UPLOAD-BAD ( ^REPLAY:link ^LOCAL:staged-upload ^ARENA:arena -- )
-   {: l up ar :}
-   l s" bad.txt" TEST-CLIENT:DISPLAY up s" " AS-REV ar REPLAY:REMOTE-UPLOAD
+: UPLOAD-BAD
+   ( JOURNAL:journal JOURNAL:operation-id ^REPLAY:link
+     ^LOCAL:staged-upload ^ARENA:arena -- )
+   {: j id l up ar :}
+   j id l s" bad.txt" TEST-CLIENT:DISPLAY up s" " AS-REV ar
+   REPLAY:REMOTE-UPLOAD
    DROP-OUTCOME ;
 
 : VERIFICATION-WITHOUT-A-LOWERCASE-PATH-IS-INVALID-METADATA
@@ -1456,8 +1499,10 @@ STATUS-CAP BUFFER: STATUS-BUF
    st l REPLAY-LINK:STATUS !
    ar CONFLICT-DIRS {: d:str r:str s:str :}
    r s s" bad.txt" ar STAGED {: up :}
+   d s" bad.txt" up ar UPLOAD-JOURNAL {: j id :}
    up LOCAL:UPLOAD-CONTENT DROPBOX:HASH>STR MOVED-AND-UNPATHED
-   d [: [: l up ar UPLOAD-BAD ;] DROPBOX:E-UNUSABLE TTHROWSQ ;] ar LOGGED
+   d [: [: j id l up ar UPLOAD-BAD ;] DROPBOX:E-UNUSABLE TTHROWSQ ;] ar
+   LOGGED
    {: t:str :}
    t LINE-COUNT 1 T=
    t s" files/get_metadata answered 200: an incomplete entry"
@@ -1465,7 +1510,98 @@ STATUS-CAP BUFFER: STATUS-BUF
    TEST-DROPBOX:SEEN$ s" /2/files/upload /2/files/get_metadata" T$=
    s" /2/files/get_metadata" TEST-DROPBOX:BODIES-TO$
    S\" {\qpath\q:\q/bad.txt\q,\qinclude_deleted\q:true}" T$=
-   d GONE rt GONE ;
+   j JOURNAL:CLOSE d GONE rt GONE ;
+
+\ DROPBOX's CHUNK-SIZE: a session's append.
+$2000000 constant CHUNK
+
+\ big.bin below the root, one byte over a chunk, staged as an upload.
+: BIG-STAGED ( str str ^ARENA:arena -- ^LOCAL:staged-upload )
+   {: r:str s:str ar :}
+   CHUNK 1+ MEM:BYTES-ALLOC-LEN MEM:ALLOC-BYTES
+   {: a:^ cap:NUM:alloc-byte-len :}
+   CHUNK 1+ 0 ?do i 255 and a i + c! loop
+   [: r s s" big.bin" a CHUNK 1+ >str ar STAGED-AS ;]
+   [: a cap MEM:RELEASE-BYTES ;] finally ;
+
+\ The journal at p logs each write of an upload session in checkpoints,
+\ through a connection of its own.
+: CHECKPOINTS-LOGGED ( str -- )
+   SQLITE:OPEN {: c :}
+   c s" CREATE TABLE checkpoints (
+         seq INTEGER PRIMARY KEY,
+         session_id TEXT NOT NULL,
+         confirmed_offset INTEGER NOT NULL
+      );
+      CREATE TRIGGER checkpoint_inserted AFTER INSERT ON upload_sessions
+      BEGIN
+         INSERT INTO checkpoints(session_id, confirmed_offset)
+         VALUES (new.session_id, new.confirmed_offset);
+      END;
+      CREATE TRIGGER checkpoint_updated AFTER UPDATE ON upload_sessions
+      BEGIN
+         INSERT INTO checkpoints(session_id, confirmed_offset)
+         VALUES (new.session_id, new.confirmed_offset);
+      END;" SQLITE:EXEC
+   c SQLITE:CLOSE ;
+
+: LOG-HOLDS ( SQLITE:statement -- bool SQLITE:statement )
+   SQLITE:STEP drop 0 SQLITE:COL-TEXT SB$ STR:= swap ;
+
+\ The checkpoints the journal at p logged, in order, are SB's text.
+: CHECKPOINTS-ARE ( str -- bool )
+   SQLITE:OPEN {: c :}
+   c s" SELECT coalesce(group_concat(entry, ' '), '') FROM (
+         SELECT session_id || '@' || confirmed_offset AS entry
+         FROM checkpoints ORDER BY seq
+      )" [: LOG-HOLDS ;] SQLITE:WITH-STATEMENT
+   c SQLITE:CLOSE ;
+
+\ The session fake-session-0 confirmed bytes of the upload.
+: CHECKPOINT+ ( n -- )
+   s" fake-session-0@" SB-APPEND FMT:SB-INT ;
+
+: SESSION-HELD?
+   ( option<JOURNAL:upload-session> ^LOCAL:staged-upload -- bool )
+   {: up :}
+   MATCH option
+      none OF false ENDOF
+      some OF
+         JOURNAL-UPLOAD--SESSION:UNMAKE {: sid:str at u h:DROPBOX:hash :}
+         sid s" fake-session-0" STR:=
+         at CHUNK 1+ = and  u CHUNK 1+ = and
+         h DROPBOX:HASH>STR up LOCAL:UPLOAD-CONTENT DROPBOX:HASH>STR STR:=
+         and
+      ENDOF
+   ;MATCH ;
+
+\ A file one byte over a chunk goes in two appends: the journal records
+\ the session once after each, at its confirmed offset.
+: A-SESSION-UPLOAD-CHECKPOINTS-EACH-APPEND
+   ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   s" a session upload checkpoints each accepted append" T-LABEL
+   TEST-DROPBOX:RESET
+   ar RUNTIME-STATUS {: rt:str st :}
+   st l REPLAY-LINK:STATUS !
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r s ar BIG-STAGED {: up :}
+   d s" big.bin" up ar UPLOAD-JOURNAL {: j id :}
+   d s" journal.sqlite3" ar TEST-CLIENT:INSIDE {: p:str :}
+   p CHECKPOINTS-LOGGED
+   j id l s" big.bin" TEST-CLIENT:DISPLAY up s" " AS-REV ar
+   REPLAY:REMOTE-UPLOAD
+   APPLIED-FILE MODEL-REMOTE:UNMAKE {: c v :}
+   c DROPBOX:HASH>STR up LOCAL:UPLOAD-CONTENT DROPBOX:HASH>STR T$=
+   SB-RESET CHUNK CHECKPOINT+ s"  " SB-APPEND CHUNK 1+ CHECKPOINT+
+   p CHECKPOINTS-ARE TTRUE
+   j id ar JOURNAL:UPLOAD-SESSION up SESSION-HELD? TTRUE
+   SB-RESET s" /2/files/upload_session/start" SB-APPEND
+   s"  /2/files/upload_session/append_v2" SB-APPEND
+   s"  /2/files/upload_session/append_v2" SB-APPEND
+   s"  /2/files/upload_session/finish" SB-APPEND
+   TEST-DROPBOX:SEEN$ SB$ T$=
+   j JOURNAL:CLOSE d GONE rt GONE ;
 
 : A-FILE-DELETE-WITHOUT-A-REV-IS-REFUSED ( ^REPLAY:link ^ARENA:arena -- )
    {: l ar :}
@@ -1506,6 +1642,7 @@ STATUS-CAP BUFFER: STATUS-BUF
    l ar A-READ-BACK-INCOMPLETE-FILE-IS-REJECTED
    l ar AN-INCOMPLETE-UPLOAD-ANSWER-IS-READ-BACK
    l ar VERIFICATION-WITHOUT-A-LOWERCASE-PATH-IS-INVALID-METADATA
+   l ar A-SESSION-UPLOAD-CHECKPOINTS-EACH-APPEND
    l ar A-FILE-DELETE-WITHOUT-A-REV-IS-REFUSED
    l ar A-GONE-FILE-IS-READ-BACK ;
 
@@ -1514,10 +1651,6 @@ STATUS-CAP BUFFER: STATUS-BUF
 
 : PLAN-PATH ( JOURNAL:plan-record -- MODEL:path )
    JOURNAL-PLAN--RECORD:UNMAKE {: id p o s :} p ;
-
-: FIRST-ID ( JOURNAL:plan-record -- JOURNAL:operation-id )
-   JOURNAL-PLAN--RECORD:UNMAKE {: id p ops s :}
-   ops 0 VEC:AT @ JOURNAL-PLANNED--OPERATION:UNMAKE {: i o x st :} i ;
 
 \ A pending plan of the one operation o at path a.
 : PLANNED

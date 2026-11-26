@@ -10,7 +10,9 @@
 \* upload's own content. A call may have acted though its answer does not
 \* say so, a session may be gone at any call, and get_metadata may not show
 \* an upload Dropbox holds; another client's edit reaches the run only so.
-\* A throw leaves UPLOAD with no answer and is not a step.
+\* A throw leaves UPLOAD with no answer and is not a step. At
+\* checkpointing DRIVE hands the caller the session's id and accepted, then
+\* steps on; that call changes nothing here.
 EXTENDS Naturals
 
 VARIABLES step, size, remote, offset, accepted, resent, restarted, answer
@@ -40,7 +42,7 @@ Took ==
     \/ offset = accepted /\ offset' = offset + 1
     \/ offset = accepted + 1 /\ offset' = offset
 \* CHUNK-ADVANCE.
-Advance(t) == accepted' = accepted + 1 /\ resent' = FALSE /\ step' = t /\ UNCHANGED answer
+Advance == accepted' = accepted + 1 /\ resent' = FALSE /\ step' = "checkpointing" /\ UNCHANGED answer
 \* REWIND.
 Rewind == accepted' = 0 /\ resent' = FALSE /\ step' = "starting" /\ UNCHANGED answer
 \* The ANSWER- words; ANSWER-DONE also counts the whole stage accepted.
@@ -72,13 +74,20 @@ Start(e) ==
 \* APPEND-SENSE sends the chunk after accepted; UNSURE-AGAIN resends it once.
 Append(e) ==
     /\ step = "appending"
-    /\ CASE e = "stored" -> Took /\ accepted + 1 < size /\ Advance("appending")
-         [] e = "complete" -> Took /\ accepted + 1 = size /\ Advance("finishing")
+    /\ CASE e = "stored" -> Took /\ Advance
          [] e = "unsure" -> ~resent /\ resent' = TRUE /\ Taken /\ step' = "appending" /\ UNCHANGED <<accepted, answer>>
          [] e = "cut" -> resent /\ Taken /\ End("unverified") /\ UNCHANGED resent
          [] e = "gone" -> step' = "restarting" /\ UNCHANGED <<offset, accepted, resent, answer>>
          [] e = "failed" -> Taken /\ End("reply") /\ UNCHANGED resent
     /\ UNCHANGED <<size, remote, restarted>>
+
+\* CHECKPOINT-SENSE: the next chunk, or the finish once the session holds
+\* the whole stage.
+Checkpoint(e) ==
+    /\ step = "checkpointing"
+    /\ CASE e = "more" -> accepted < size /\ step' = "appending"
+         [] e = "whole" -> accepted = size /\ step' = "finishing"
+    /\ UNCHANGED <<size, remote, offset, accepted, resent, restarted, answer>>
 
 \* FINISH-GONE?: lookup_failed, the session gone, which a finish Dropbox
 \* took may leave.
@@ -108,7 +117,8 @@ Restart(e) ==
 Next ==
     \/ \E e \in {"committed", "untrusted", "unsure", "failed"} : Send(e)
     \/ \E e \in {"opened", "unsure", "failed"} : Start(e)
-    \/ \E e \in {"stored", "complete", "unsure", "cut", "gone", "failed"} : Append(e)
+    \/ \E e \in {"stored", "unsure", "cut", "gone", "failed"} : Append(e)
+    \/ \E e \in {"more", "whole"} : Checkpoint(e)
     \/ \E e \in {"committed", "untrusted", "unsure", "gone", "failed"} : Finish(e)
     \/ \E e \in {"same", "elsewhere", "wait", "other", "unlinked"} : Confirm(e)
     \/ \E e \in {"once", "twice"} : Restart(e)
@@ -116,7 +126,7 @@ Next ==
 Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 
 TypeOK ==
-    /\ step \in {"single", "starting", "appending", "finishing", "verifying", "restarting", "ended"}
+    /\ step \in {"single", "starting", "appending", "checkpointing", "finishing", "verifying", "restarting", "ended"}
     /\ size \in 1..2
     /\ remote \in {"before", "after"}
     /\ offset \in 0..2
@@ -129,10 +139,10 @@ TypeOK ==
 \* while Dropbox holds the upload's complete entry at its path.
 Verified == answer = "done" => remote = "after"
 
-\* The run counts as accepted, and SHOW reports, only chunks its session
-\* holds: HELD? adopts an offset only at the chunk's end, and an unsure
-\* append advances nothing.
-Accepted == step \in {"appending", "finishing"} => accepted <= offset
+\* The run counts as accepted, and SHOW reports and the checkpoint is
+\* handed, only chunks its session holds: HELD? adopts an offset only at
+\* the chunk's end, and an unsure append advances nothing.
+Accepted == step \in {"appending", "checkpointing", "finishing"} => accepted <= offset
 
 \* UNSURE-AGAIN resends a chunk once and RESTART-SENSE restarts once, so
 \* DRIVE's loop ends.

@@ -2986,11 +2986,13 @@ HEAP RUNS run
 
 \ ---- the machine
 
-ENUM upload-step
-   single starting appending finishing verifying restarting ended ;ENUM
+ENUM upload-step DERIVE eq
+   single starting appending checkpointing finishing verifying restarting
+   ended ;ENUM
 ENUM send-event committed untrusted unsure failed ;ENUM
 ENUM start-event opened unsure failed ;ENUM
-ENUM append-event stored complete unsure cut gone failed ;ENUM
+ENUM append-event stored unsure cut gone failed ;ENUM
+ENUM checkpoint-event more whole ;ENUM
 ENUM finish-event committed untrusted unsure gone failed ;ENUM
 ENUM confirm-event same elsewhere wait other unlinked ;ENUM
 ENUM restart-event once twice ;ENUM
@@ -3022,13 +3024,6 @@ ENUM restart-event once twice ;ENUM
    construct start-event failed ;
 
 
-: ACCEPTED ( ^run -- append-event )
-   {: r :}
-   r RUN-ACCEPTED @ r RUN-CHUNK @ + r SIZE =
-   if construct append-event complete exit then
-   construct append-event stored ;
-
-
 : UNSURE-AGAIN ( ^run -- append-event )
    {: r :}
    r RUN-RESENT @ if construct append-event cut exit then
@@ -3044,9 +3039,9 @@ ENUM restart-event once twice ;ENUM
    r RUN-CHUNK @ 0= if r SHORT then
    r APPEND-SENT {: rep:reply :}
    rep r RUN-LAST !
-   rep DONE? if r ACCEPTED exit then
+   rep DONE? if construct append-event stored exit then
    rep c UNSURE? if r UNSURE-AGAIN exit then
-   rep r HELD? if r ACCEPTED exit then
+   rep r HELD? if construct append-event stored exit then
    rep c APPEND-GONE? if construct append-event gone exit then
    construct append-event failed ;
 
@@ -3118,10 +3113,20 @@ ENUM restart-event once twice ;ENUM
 : ANSWER-REPLY ( ^run -- ) {: r :} r RUN-LAST @ r RUN-ANSWER ! ;
 
 
+\ The accepted append's bytes confirmed: the session's id and accepted
+\ are what DRIVE hands the checkpoint at checkpointing.
 : CHUNK-ADVANCE ( ^run -- )
    {: r :}
    r RUN-CHUNK @ r RUN-ACCEPTED +!
    false r RUN-RESENT ! ;
+
+
+\ After the checkpoint: more of the stage to append, or the whole of it
+\ held, to finish.
+: CHECKPOINT-SENSE ( ^run -- checkpoint-event )
+   {: r :}
+   r RUN-ACCEPTED @ r SIZE = if construct checkpoint-event whole exit then
+   construct checkpoint-event more ;
 
 
 : REWIND ( ^run -- )
@@ -3129,7 +3134,9 @@ ENUM restart-event once twice ;ENUM
    0 r RUN-ACCEPTED ! false r RUN-RESENT ! ;
 
 
-\ One upload, after formal/UploadSession.tla. A finish whose session is
+\ One upload, after formal/UploadSession.tla. Each accepted append stops
+\ at checkpointing, where DRIVE hands the caller's checkpoint the
+\ session's id and the bytes it confirmed. A finish whose session is
 \ gone may have been committed: verifying starts over unless get_metadata
 \ shows the upload's complete entry at its path.
 FSM:DEFINE SESSION ( ^run ) upload-step send-event
@@ -3143,12 +3150,14 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
       unsure  ANSWER-UNVERIFIED  >ended
       failed  ANSWER-REPLY       >ended
    IN appending  APPEND-SENSE ( append-event )
-      stored    CHUNK-ADVANCE      >appending
-      complete  CHUNK-ADVANCE      >finishing
+      stored    CHUNK-ADVANCE      >checkpointing
       unsure    -                  >appending
       cut       ANSWER-UNVERIFIED  >ended
       gone      -                  >restarting
       failed    ANSWER-REPLY       >ended
+   IN checkpointing  CHECKPOINT-SENSE ( checkpoint-event )
+      more   -  >appending
+      whole  -  >finishing
    IN finishing  FINISH-SENSE ( finish-event )
       committed  ANSWER-DONE        >ended
       untrusted  ANSWER-UNVERIFIED  >ended
@@ -3198,20 +3207,37 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
    at progress execute ;
 
 
-: DRIVE ( ^run [ n -- ] -- reply )
-   {: r progress :}
+\ At checkpointing, hands the checkpoint the session's id and the bytes
+\ it confirmed, then steps on.
+: CHECKPOINTED ( upload-step ^run [ str n -- ] -- upload-step )
+   {: s:upload-step r checkpoint :}
+   s construct upload-step checkpointing UPLOAD-STEP-EQ if
+      r SESSION$ r RUN-ACCEPTED @ checkpoint execute
+   then
+   s ;
+
+
+: DRIVE ( ^run [ n -- ] [ str n -- ] -- reply )
+   {: r progress checkpoint :}
    r FIRST
-   begin r swap SESSION-STEP r progress SHOW until
+   begin
+      r checkpoint CHECKPOINTED
+      r swap SESSION-STEP r progress SHOW
+   until
    drop r RUN-ANSWER @ ;
 
 public
 
 \ files/upload of the stage, or an upload session for one over 32 MiB.
 \ progress is called with the bytes Dropbox has accepted each time that
-\ count changes. On done, ENTRY holds the entry Dropbox committed.
-: UPLOAD ( ^upload ^client [ n -- ] -- reply )
-   {: up c progress :}
+\ count changes. checkpoint is called once per append Dropbox accepts,
+\ before the next call, with the session's id, valid until it returns,
+\ and the bytes the session has confirmed; a single files/upload never
+\ calls it. On done, ENTRY holds the entry Dropbox committed.
+: UPLOAD ( ^upload ^client [ n -- ] [ str n -- ] -- reply )
+   {: up c progress checkpoint :}
    RUNS-NEW {: r :}
-   [: r up c RUN-INIT r progress DRIVE ;] [: r RELEASED ;] finally ;
+   [: r up c RUN-INIT r progress checkpoint DRIVE ;] [: r RELEASED ;]
+   finally ;
 
 ;package
