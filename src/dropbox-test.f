@@ -221,7 +221,7 @@ TYPED-VARIABLE DROPBOX-TEST:OFFERED-CAP NUM:alloc-byte-len
    {: buf cap:NUM:alloc-byte-len :}
    60000 HOST-TIMEOUT {: rc:n idx:n :}
    rc 0<> if rc idx exit then
-   idx HOST-CANCEL {: refused:n :}
+   idx HOST-CANCEL drop {: refused:n :}
    refused 0<> if refused idx exit then
    buf cap idx DROPBOX-TEST:HOLDS 0 idx ;
 
