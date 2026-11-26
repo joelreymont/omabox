@@ -194,7 +194,6 @@ EXPORT APPLY-FILE-MUTATION
 EXPORT APPLY-DELETE-MUTATION
 ;package
 
-using TEST-CLIENT
 package REPLAY-TEST
 private
 
@@ -204,15 +203,15 @@ private
 \ A case's directory and the journal path in it.
 : JOURNAL-AT ( ^ARENA:arena -- str str )
    {: ar :}
-   s" replay-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
-   d d s" journal.sqlite3" ar INSIDE ;
+   s" replay-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d:str :}
+   d d s" journal.sqlite3" ar TEST-CLIENT:INSIDE ;
 
 \ Rust's RetentionFixture: a case's directory, the journal path in it
 \ and its recovery directory, made.
 : FIXTURE ( ^ARENA:arena -- str str str )
    {: ar :}
    ar JOURNAL-AT {: d:str p:str :}
-   d s" recovery" ar INSIDE {: r:str :}
+   d s" recovery" ar TEST-CLIENT:INSIDE {: r:str :}
    r FS:MAKE-DIR
    d p r ;
 
@@ -222,7 +221,7 @@ private
 \ q must leave empty: q logs nothing.
 : QUIETLY ( str [ -- ] ^ARENA:arena -- )
    {: d:str q ar :}
-   d s" stderr.txt" ar INSIDE {: e:str :}
+   d s" stderr.txt" ar TEST-CLIENT:INSIDE {: e:str :}
    e STDERR:CAPTURE
    [: q execute ;] [: STDERR:;CAPTURE ;] finally
    e FS:FILE-SIZE 0 T=
@@ -264,12 +263,12 @@ private
    MATCH JOURNAL:plan-write
       recorded OF ENDOF
       already-live OF
-         drop s" test path unexpectedly had a pending plan" FAILED
+         drop s" test path unexpectedly had a pending plan" TEST-CLIENT:FAILED
       ENDOF
    ;MATCH ;
 
 : NOT-RECORDED ( -- )
-   s" test recovery intent was not recorded" FAILED ;
+   s" test recovery intent was not recorded" TEST-CLIENT:FAILED ;
 
 : NEW-RECOVERY ( JOURNAL:recovery-write -- JOURNAL:recovery-record )
    MATCH JOURNAL:recovery-write
@@ -302,7 +301,7 @@ private
    ( JOURNAL:journal str str DROPBOX:hash ^ARENA:arena
      -- JOURNAL:plan-record JOURNAL:recovery-record )
    {: j r:str a:str c ar :}
-   a DISPLAY {: original :}
+   a TEST-CLIENT:DISPLAY {: original :}
    j original c ar PRESERVED-DELETE ar JOURNAL:RECORD-PLAN NEW-PLAN
    {: plan :}
    r original c ar REPLAY:DESTINATION {: copy :}
@@ -376,7 +375,7 @@ private
 : STARTED ( JOURNAL:recovery-record -- n )
    JOURNAL-RECOVERY--RECORD:UNMAKE {: id op p q c s at :}
    at MATCH option
-      none OF s" test recovery retention did not start" FAILED ENDOF
+      none OF s" test recovery retention did not start" TEST-CLIENT:FAILED ENDOF
       some OF ENDOF
    ;MATCH ;
 
@@ -447,8 +446,8 @@ create TIMES 32 allot
    s" retire excluded plans supersedes only excluded plans" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p JOURNAL:OPEN {: j :}
-   j s" folder/.DS_Store" ar RECORD
-   j s" folder/notes.md" ar RECORD
+   j s" folder/.DS_Store" ar TEST-CLIENT:RECORD
+   j s" folder/notes.md" ar TEST-CLIENT:RECORD
    j ar JOURNAL:PENDING-PLANS {: plans :}
    plans VEC:COUNT 2 T=
    j plans ar REPLAY:RETIRE-EXCLUDED-PLANS
@@ -541,7 +540,7 @@ create TIMES 32 allot
    {: cp corrupt :}
    j cp corrupt ar COMPLETE-RECOVERY-AND-PLAN
    j r ar NONREGULAR {: nonregular :}
-   r s" unknown-orphan" ar INSIDE {: orphan:str :}
+   r s" unknown-orphan" ar TEST-CLIENT:INSIDE {: orphan:str :}
    orphan s" unknown bytes" FS:WRITE-ALL
    j r epoch-seconds REPLAY:COMPLETED-RECOVERY-RETENTION +
    REPLAY:PRUNE-COMPLETED-RECOVERIES-AT 0 T=
@@ -622,7 +621,7 @@ create TIMES 32 allot
      ^ARENA:arena -- )
    {: j a:str ops ar :}
    ops JOURNAL-OPERATION--PLAN:MAKE {: plan :}
-   j a DISPLAY plan ar JOURNAL:RECORD-PLAN RECORDED? TTRUE ;
+   j a TEST-CLIENT:DISPLAY plan ar JOURNAL:RECORD-PLAN TEST-CLIENT:RECORDED? TTRUE ;
 
 \ The content hash of the bytes "old".
 : OLD ( -- DROPBOX:hash )
@@ -634,7 +633,7 @@ create TIMES 32 allot
 
 \ The case's sync root, made in its directory d.
 : ROOT-IN ( str ^ARENA:arena -- str )
-   s" root" swap INSIDE {: root:str :}
+   s" root" swap TEST-CLIENT:INSIDE {: root:str :}
    root FS:MAKE-DIR
    root ;
 
@@ -688,7 +687,7 @@ create TIMES 32 allot
    T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    d ar ROOT-IN {: root:str :}
-   root s" legacy.txt" ar INSIDE {: f:str :}
+   root s" legacy.txt" ar TEST-CLIENT:INSIDE {: f:str :}
    f s" old" FS:WRITE-ALL
    ar OPS {: ops :}
    OLD MODEL-LOCAL:MAKE MODEL-OPERATION:PRESERVE-LOCAL ops OP+
@@ -719,15 +718,15 @@ create TIMES 32 allot
    s" a local object blocks only its plan" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    d ar ROOT-IN {: root:str :}
-   root s" taken.txt" ar INSIDE FS:MAKE-DIR
+   root s" taken.txt" ar TEST-CLIENT:INSIDE FS:MAKE-DIR
    ar OPS {: ops :}
    OLD-REMOTE MODEL-OPERATION:INSTALL-LOCAL ops OP+
    p JOURNAL:OPEN {: j :}
    j s" taken.txt" ops ar RECORD-OPS
-   j s" made" ar RECORD
+   j s" made" ar TEST-CLIENT:RECORD
    d [: j root ar REPLAYED TAKEN-BLOCKED ;] ar QUIETLY
-   root s" made" ar INSIDE FS:EXISTS? TTRUE
-   j s" made" DISPLAY ar JOURNAL:BASELINE DIRECTORY? TTRUE
+   root s" made" ar TEST-CLIENT:INSIDE FS:EXISTS? TTRUE
+   j s" made" TEST-CLIENT:DISPLAY ar JOURNAL:BASELINE DIRECTORY? TTRUE
    j ar JOURNAL:PENDING-PLANS s" taken.txt" ONLY-AT
    j JOURNAL:CLOSE
    d GONE ;
@@ -741,9 +740,9 @@ $140 constant MODE-NO-WRITE
 \ A case's directory, and the sync root and upload staging made in it.
 : CONFLICT-DIRS ( ^ARENA:arena -- str str str )
    {: ar :}
-   s" replay-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
-   d s" root" ar INSIDE {: r:str :}
-   d s" staging" ar INSIDE {: s:str :}
+   s" replay-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d:str :}
+   d s" root" ar TEST-CLIENT:INSIDE {: r:str :}
+   d s" staging" ar TEST-CLIENT:INSIDE {: s:str :}
    r FS:MAKE-DIR s FS:MAKE-DIR
    d r s ;
 
@@ -760,7 +759,7 @@ $140 constant MODE-NO-WRITE
 : STAGED
    ( str str str ^ARENA:arena -- ^LOCAL:staged-upload )
    {: r:str s:str p:str ar :}
-   r p ar INSIDE s" local edit" FS:WRITE-ALL
+   r p ar TEST-CLIENT:INSIDE s" local edit" FS:WRITE-ALL
    r p ar LOCAL:OBSERVE-UPLOAD-SOURCE {: c:DROPBOX:hash :}
    r p s c ar LOCAL:STAGE-UPLOAD UPLOAD-OF ;
 
@@ -770,7 +769,7 @@ $140 constant MODE-NO-WRITE
    {: r:str p:str up ar :}
    p LOCAL-CONFLICT--SIDE:LOCAL up LOCAL:UPLOAD-CONTENT ar
    LOCAL:CONFLICT-RELATIVE-PATH {: c:str :}
-   r c ar INSIDE ;
+   r c ar TEST-CLIENT:INSIDE ;
 
 : REASON$ ( MODEL:blockage -- str )
    MATCH MODEL:blockage
@@ -799,7 +798,7 @@ $140 constant MODE-NO-WRITE
    ( str str ^LOCAL:staged-upload ^ARENA:arena -- str str )
    {: r:str p:str up ar :}
    r OPEN-ROOT {: root:fd :}
-   [: root r p DISPLAY up ar
+   [: root r p TEST-CLIENT:DISPLAY up ar
       REPLAY:MATERIALIZE-LOCAL-CONFLICT-AT OUTCOME$ ;]
    [: root FS:CLOSE-DIR ;] finally ;
 
@@ -826,7 +825,7 @@ $140 constant MODE-NO-WRITE
    QUIETLY
    c FS:REMOVE-DIR
    r up c ar UNREADABLE-COPY
-   r s" notes.d" ar INSIDE FS:MAKE-DIR
+   r s" notes.d" ar TEST-CLIENT:INSIDE FS:MAKE-DIR
    r s" notes.txt" up ar LOCAL-COPY$ s" " T$= s" ready" T$=
    d GONE ;
 
@@ -834,7 +833,7 @@ $140 constant MODE-NO-WRITE
 : DENIED-COPY ( str ^LOCAL:staged-upload ^ARENA:arena -- )
    {: r:str up ar :}
    r OPEN-ROOT {: root:fd :}
-   [: root r s" dir/notes.txt" DISPLAY up ar
+   [: root r s" dir/notes.txt" TEST-CLIENT:DISPLAY up ar
       REPLAY:MATERIALIZE-LOCAL-CONFLICT-AT drop ;] LOCAL:E-IO TTHROWSQ
    FS:ERRNO FS:EACCES T=
    root FS:CLOSE-DIR ;
@@ -844,7 +843,7 @@ $140 constant MODE-NO-WRITE
    {: ar :}
    s" a_denied_operation_at_the_copy_name_does_not_occupy_it" T-LABEL
    ar CONFLICT-DIRS {: d:str r:str s:str :}
-   r s" dir" ar INSIDE {: dir:str :}
+   r s" dir" ar TEST-CLIENT:INSIDE {: dir:str :}
    dir FS:MAKE-DIR
    r s s" dir/notes.txt" ar STAGED {: up :}
    dir MODE-NO-WRITE FS:CHMOD-MODE
@@ -971,7 +970,7 @@ $140 constant MODE-NO-WRITE
 : STOPS ( DROPBOX:error ^REPLAY:link -- )
    {: e l :}
    [: e l REPLAY:REJECTION drop ;] REPLAY:E-DROPBOX TTHROWSQ
-   l REPLAY-LINK:REPLY @ e REFUSAL? TTRUE ;
+   l REPLAY-LINK:REPLY @ e TEST-CLIENT:REFUSAL? TTRUE ;
 
 : PATH-REFUSALS ( ^REPLAY:link -- )
    {: l :}
@@ -995,7 +994,7 @@ $140 constant MODE-NO-WRITE
 : REJECTION-COVERS-EVERY-DROPBOX-ERROR ( ^ARENA:arena -- )
    {: ar :}
    s" rejection covers every Dropbox error" T-LABEL
-   MAIN @ s" " ar NEW-LINK {: l :}
+   TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK {: l :}
    l PATH-REFUSALS
    DROPBOX-ERROR:CONFLICT l STOPS
    DROPBOX-ERROR:RESET l STOPS
@@ -1056,7 +1055,7 @@ $140 constant MODE-NO-WRITE
    {: e l w:str st:n :}
    e DROPBOX-REPLY:REFUSED l REPLAY-LINK:REPLY !
    REPLAY:E-DROPBOX l w st BLOCKS-AS
-   l REPLAY-LINK:REPLY @ e REFUSAL? TTRUE ;
+   l REPLAY-LINK:REPLY @ e TEST-CLIENT:REFUSAL? TTRUE ;
 
 : UNAVAILABLE-409 ( DROPBOX:error ^REPLAY:link -- )
    s" download-unavailable" 409 REFUSED-AS ;
@@ -1095,7 +1094,7 @@ $140 constant MODE-NO-WRITE
    ( ^ARENA:arena -- )
    {: ar :}
    s" download_failures_separate_path_blocks_from_global_errors" T-LABEL
-   MAIN @ s" " ar NEW-LINK {: l :}
+   TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK {: l :}
    l PATH-DOWNLOADS
    DROPBOX-ERROR:CONFLICT l PASS-WIDE
    DROPBOX-ERROR:RESET l PASS-WIDE
@@ -1110,7 +1109,7 @@ $140 constant MODE-NO-WRITE
 
 : TARGET$ ( ^REPLAY:link str ^ARENA:arena -- str )
    {: l p:str ar :}
-   l p DISPLAY ar REPLAY:TARGET MATCH option
+   l p TEST-CLIENT:DISPLAY ar REPLAY:TARGET MATCH option
       some OF ENDOF
       none OF s" none" ENDOF
    ;MATCH ;
@@ -1120,7 +1119,7 @@ $140 constant MODE-NO-WRITE
    {: l p:str ar :}
    l p ar TARGET$ s" none" T$=
    TEST-DROPBOX:RESET
-   l p DISPLAY ar REPLAY:REMOTE-CREATE-FOLDER
+   l p TEST-CLIENT:DISPLAY ar REPLAY:REMOTE-CREATE-FOLDER
    s" rejected" s" invalid-path" GIVES
    TEST-DROPBOX:SEEN$ s" " T$= ;
 
@@ -1135,9 +1134,9 @@ $140 constant MODE-NO-WRITE
 : TARGET-JOINS-THE-ROOT-AND-REJECTS-INVALID-PATHS ( ^ARENA:arena -- )
    {: ar :}
    s" target joins the root and rejects invalid paths" T-LABEL
-   MAIN @ s" /Sync" ar NEW-LINK {: l :}
+   TEST-CLIENT:MAIN @ s" /Sync" ar TEST-CLIENT:NEW-LINK {: l :}
    l s" a/B.txt" ar TARGET$ s" /Sync/a/B.txt" T$=
-   MAIN @ s" " ar NEW-LINK {: top :}
+   TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK {: top :}
    top s" a" ar TARGET$ s" /a" T$=
    top s" .a/b..c/ d" ar TARGET$ s" /.a/b..c/ d" T$=
    l ar INVALID-FORMS ;
@@ -1157,13 +1156,13 @@ $140 constant MODE-NO-WRITE
 
 : DELETE-F ( ^REPLAY:link ^ARENA:arena -- REPLAY:mutation-outcome )
    {: l ar :}
-   l s" f" DISPLAY ar REPLAY:REMOTE-DELETE-FOLDER ;
+   l s" f" TEST-CLIENT:DISPLAY ar REPLAY:REMOTE-DELETE-FOLDER ;
 
 : AN-EMPTY-FOLDER-IS-DELETED ( ^REPLAY:link ^ARENA:arena -- )
    {: l ar :}
    s" an empty folder is deleted" T-LABEL
    TEST-DROPBOX:RESET
-   l s" f" DISPLAY ar REPLAY:REMOTE-CREATE-FOLDER
+   l s" f" TEST-CLIENT:DISPLAY ar REPLAY:REMOTE-CREATE-FOLDER
    s" applied" s" folder" GIVES
    false OWN-PAGE
    l ar DELETE-F s" applied" s" absent" GIVES
@@ -1175,9 +1174,9 @@ $140 constant MODE-NO-WRITE
    {: l ar :}
    s" a held folder is read back" T-LABEL
    TEST-DROPBOX:RESET
-   l s" f" DISPLAY ar REPLAY:REMOTE-CREATE-FOLDER
+   l s" f" TEST-CLIENT:DISPLAY ar REPLAY:REMOTE-CREATE-FOLDER
    s" applied" s" folder" GIVES
-   l s" f" DISPLAY ar REPLAY:REMOTE-CREATE-FOLDER
+   l s" f" TEST-CLIENT:DISPLAY ar REPLAY:REMOTE-CREATE-FOLDER
    s" applied" s" folder" GIVES
    TEST-DROPBOX:SEEN$
    s" /2/files/create_folder_v2 /2/files/create_folder_v2 /2/files/get_metadata"
@@ -1206,7 +1205,7 @@ $140 constant MODE-NO-WRITE
 \ in the arena.
 : LOGGED ( str [ -- ] ^ARENA:arena -- str )
    {: d:str q ar :}
-   q d s" stderr.txt" ar INSIDE ar STDERR:CAPTURING
+   q d s" stderr.txt" ar TEST-CLIENT:INSIDE ar STDERR:CAPTURING
    {: code:n t:str :}
    code 0<> if code throw then
    t ;
@@ -1218,7 +1217,7 @@ $140 constant MODE-NO-WRITE
    {: l ar :}
    503 s" " s" " s" {}" TEST-DROPBOX:SCRIPT!
    [: l ar DELETE-F drop ;] REPLAY:E-DROPBOX TTHROWSQ
-   l REPLAY-LINK:REPLY @ RETRY? TTRUE ;
+   l REPLAY-LINK:REPLY @ TEST-CLIENT:RETRY? TTRUE ;
 
 : PROBE-RESTRICTED ( ^REPLAY:link ^ARENA:arena -- )
    {: l ar :}
@@ -1278,8 +1277,8 @@ $140 constant MODE-NO-WRITE
    {: l ar :}
    s" folder_delete_probe_outcomes_are_classified_per_path" T-LABEL
    TEST-DROPBOX:RESET
-   s" replay-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
-   l s" f" DISPLAY ar REPLAY:REMOTE-CREATE-FOLDER
+   s" replay-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d:str :}
+   l s" f" TEST-CLIENT:DISPLAY ar REPLAY:REMOTE-CREATE-FOLDER
    s" applied" s" folder" GIVES
    l ar PROBE-UNREACHED l ar PROBE-RESTRICTED l ar PROBE-RESET
    l ar PROBE-STALLED l ar PROBE-LATER-ENTRY l ar PROBE-OWN-ENTRY
@@ -1289,7 +1288,7 @@ $140 constant MODE-NO-WRITE
 
 : RUNTIME-STATUS ( ^ARENA:arena -- str ^STATUS:status )
    {: ar :}
-   s" replay-test" FS:MKTEMP-DIR ar COPIED {: rt:str :}
+   s" replay-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: rt:str :}
    rt rt ar STATUS:NEW ;
 
 4096 constant STATUS-CAP
@@ -1298,7 +1297,7 @@ STATUS-CAP BUFFER: STATUS-BUF
 \ status.json's text below the runtime directory rt.
 : STATUS-TEXT ( str ^ARENA:arena -- str )
    {: rt:str ar :}
-   rt s" omabox/status.json" ar INSIDE
+   rt s" omabox/status.json" ar TEST-CLIENT:INSIDE
    STATUS-BUF STATUS-CAP FS:READ-ALL {: u:n :} STATUS-BUF u >str ;
 
 : SHOWS ( str ^ARENA:arena str -- )
@@ -1309,21 +1308,21 @@ STATUS-CAP BUFFER: STATUS-BUF
    ( ^REPLAY:link ^LOCAL:staged-upload ^ARENA:arena
      -- REPLAY:mutation-outcome )
    {: l up ar :}
-   l s" notes.txt" DISPLAY up s" " AS-REV ar REPLAY:REMOTE-UPLOAD ;
+   l s" notes.txt" TEST-CLIENT:DISPLAY up s" " AS-REV ar REPLAY:REMOTE-UPLOAD ;
 
 : APPLIED-FILE ( REPLAY:mutation-outcome -- MODEL:remote )
    MATCH REPLAY:mutation-outcome
       applied OF
          MATCH REPLAY:remote-path-state
-            absent OF s" applied absent" FAILED ENDOF
+            absent OF s" applied absent" TEST-CLIENT:FAILED ENDOF
             file OF ENDOF
-            folder OF s" applied folder" FAILED ENDOF
-            unsupported OF s" applied unsupported" FAILED ENDOF
+            folder OF s" applied folder" TEST-CLIENT:FAILED ENDOF
+            unsupported OF s" applied unsupported" TEST-CLIENT:FAILED ENDOF
          ;MATCH
       ENDOF
-      pending OF s" pending" FAILED ENDOF
-      precondition-changed OF drop s" changed" FAILED ENDOF
-      rejected OF drop s" rejected" FAILED ENDOF
+      pending OF s" pending" TEST-CLIENT:FAILED ENDOF
+      precondition-changed OF drop s" changed" TEST-CLIENT:FAILED ENDOF
+      rejected OF drop s" rejected" TEST-CLIENT:FAILED ENDOF
    ;MATCH ;
 
 : AN-UPLOAD-SENDS-ITS-TRANSFER ( ^REPLAY:link ^ARENA:arena -- )
@@ -1438,7 +1437,7 @@ STATUS-CAP BUFFER: STATUS-BUF
 
 : UPLOAD-BAD ( ^REPLAY:link ^LOCAL:staged-upload ^ARENA:arena -- )
    {: l up ar :}
-   l s" bad.txt" DISPLAY up s" " AS-REV ar REPLAY:REMOTE-UPLOAD
+   l s" bad.txt" TEST-CLIENT:DISPLAY up s" " AS-REV ar REPLAY:REMOTE-UPLOAD
    DROP-OUTCOME ;
 
 : VERIFICATION-WITHOUT-A-LOWERCASE-PATH-IS-INVALID-METADATA
@@ -1465,8 +1464,8 @@ STATUS-CAP BUFFER: STATUS-BUF
    {: l ar :}
    s" a file delete without a revision is refused" T-LABEL
    TEST-DROPBOX:RESET
-   s" replay-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
-   d [: [: l s" notes.txt" DISPLAY s" " AS-REV ar
+   s" replay-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d:str :}
+   d [: [: l s" notes.txt" TEST-CLIENT:DISPLAY s" " AS-REV ar
          REPLAY:REMOTE-DELETE-FILE DROP-OUTCOME ;]
       REPLAY:E-INVALID-STATE TTHROWSQ ;] ar LOGGED {: t:str :}
    t LINE-COUNT 1 T=
@@ -1482,13 +1481,13 @@ STATUS-CAP BUFFER: STATUS-BUF
    409 s" " s" "
    S\" {\qerror_summary\q:\qpath_write/conflict/file/...\q,\qerror\q:{\q.tag\q:\qpath_write\q,\qpath_write\q:{\q.tag\q:\qconflict\q,\qconflict\q:{\q.tag\q:\qfile\q}}}}"
    TEST-DROPBOX:SCRIPT!
-   l s" notes.txt" DISPLAY s" 0150" AS-REV ar REPLAY:REMOTE-DELETE-FILE
+   l s" notes.txt" TEST-CLIENT:DISPLAY s" 0150" AS-REV ar REPLAY:REMOTE-DELETE-FILE
    s" applied" s" absent" GIVES
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/get_metadata" T$= ;
 
 : REMOTE-CASES ( ^ARENA:arena -- )
    {: ar :}
-   MAIN @ s" " ar NEW-LINK {: l :}
+   TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK {: l :}
    l ar AN-EMPTY-FOLDER-IS-DELETED
    l ar A-HELD-FOLDER-IS-READ-BACK
    l ar AN-OCCUPIED-FOLDER-IS-KEPT
@@ -1518,7 +1517,7 @@ STATUS-CAP BUFFER: STATUS-BUF
    ( JOURNAL:journal str MODEL:operation ^ARENA:arena
      -- JOURNAL:plan-record )
    {: j a:str o ar :}
-   j a DISPLAY o ar ONE-PLAN ar JOURNAL:RECORD-PLAN NEW-PLAN ;
+   j a TEST-CLIENT:DISPLAY o ar TEST-CLIENT:ONE-PLAN ar JOURNAL:RECORD-PLAN NEW-PLAN ;
 
 ARENA OFFLINE-LINKS REPLAY:link
 
@@ -1611,7 +1610,7 @@ ARENA OFFLINE-LINKS REPLAY:link
    {: j ar :}
    j ar JOURNAL:PENDING-PLANS VEC:COUNT 0<> if s" pending" exit then
    j ar JOURNAL:BLOCKED-PLANS VEC:COUNT 0<> if s" blocked" exit then
-   j s" f" DISPLAY ar JOURNAL:BASELINE BASELINE$ ;
+   j s" f" TEST-CLIENT:DISPLAY ar JOURNAL:BASELINE BASELINE$ ;
 
 : UNSUPPORTED-SIZE-STAYS-BLOCKED-ACROSS-REOPEN ( ^ARENA:arena -- )
    {: ar :}
@@ -1624,7 +1623,7 @@ ARENA OFFLINE-LINKS REPLAY:link
    REPLAY-REPLAY--BLOCKED:SYNC-ERROR r REPLAY:PERSIST-REMOTE-BLOCK
    BLOCK$ s" unsupported-file-size" T$= s" durable-plan" T$=
    j JOURNAL:CLOSE
-   d s" journal.sqlite3" ar INSIDE JOURNAL:OPEN {: again :}
+   d s" journal.sqlite3" ar TEST-CLIENT:INSIDE JOURNAL:OPEN {: again :}
    again s" unsupported-file-size" ar HELD-AS MEM-MAX-N T=
    again ar JOURNAL:PENDING-PLANS VEC:COUNT 0 T=
    again JOURNAL:CLOSE
@@ -1756,7 +1755,7 @@ ARENA OFFLINE-LINKS REPLAY:link
 \ and completing it replaces.
 : SEEDED ( JOURNAL:journal str ^ARENA:arena -- )
    {: j p:str ar :}
-   j p DISPLAY OLD-REMOTE MODEL-BASELINE:PRESENT ar
+   j p TEST-CLIENT:DISPLAY OLD-REMOTE MODEL-BASELINE:PRESENT ar
    JOURNAL:RECORD-NOOP MATCH JOURNAL:noop-write
       recorded OF true ENDOF
       live-plan OF drop false ENDOF
@@ -1885,7 +1884,7 @@ TYPED-VARIABLE SENT ^LOCAL:staged-upload
 : UPLOAD-DIRS ( ^ARENA:arena -- str str str JOURNAL:journal )
    {: ar :}
    ar CONFLICT-DIRS {: d:str r:str s:str :}
-   d s" journal.sqlite3" ar INSIDE JOURNAL:OPEN {: j :}
+   d s" journal.sqlite3" ar TEST-CLIENT:INSIDE JOURNAL:OPEN {: j :}
    d r s j ;
 
 : UPLOAD-PLAN
@@ -1914,7 +1913,7 @@ TYPED-VARIABLE SENT ^LOCAL:staged-upload
 
 \ The target's bytes, "local edit", written below the root r.
 : EDITED ( str ^ARENA:arena -- )
-   s" notes.txt" swap INSIDE s" local edit" FS:WRITE-ALL ;
+   s" notes.txt" swap TEST-CLIENT:INSIDE s" local edit" FS:WRITE-ALL ;
 
 : PREPARE-UPLOAD-SENDS-THE-STAGE ( ^ARENA:arena -- )
    {: ar :}
@@ -1951,7 +1950,7 @@ TYPED-VARIABLE SENT ^LOCAL:staged-upload
    ar UPLOAD-DIRS {: d:str r:str s:str j :}
    r ar EDITED
    r s" notes.txt" ar LOCAL:OBSERVE-UPLOAD-SOURCE {: want :}
-   s want DROPBOX:HASH>STR ar INSIDE {: k:str :}
+   s want DROPBOX:HASH>STR ar TEST-CLIENT:INSIDE {: k:str :}
    k FS:MAKE-DIR
    j want ar UPLOAD-PLAN {: plan :}
    j plan r s want ar PREPARED
@@ -1966,7 +1965,7 @@ TYPED-VARIABLE SENT ^LOCAL:staged-upload
    {: ar :}
    s" prepare upload retires a source that will not open" T-LABEL
    ar UPLOAD-DIRS {: d:str r:str s:str j :}
-   r s" notes.txt" ar INSIDE FS:MAKE-DIR
+   r s" notes.txt" ar TEST-CLIENT:INSIDE FS:MAKE-DIR
    j OLD ar UPLOAD-PLAN {: plan :}
    d [: j plan r s OLD ar PREPARED
       s" -" T$= s" fresh-observation-required" T$= s" blocked" T$= ;]
@@ -1998,11 +1997,11 @@ TYPED-VARIABLE SENT ^LOCAL:staged-upload
    {: ar :}
    s" fake-key" s" live-token" TEST-DROPBOX:ACCEPT!
    s" " TEST-DROPBOX:ROOT!
-   ar OPENED MAIN !
-   ACCOUNTED
+   ar TEST-CLIENT:OPENED TEST-CLIENT:MAIN !
+   TEST-CLIENT:ACCOUNTED
    [: ar TARGET-JOINS-THE-ROOT-AND-REJECTS-INVALID-PATHS
       ar REMOTE-CASES ;]
-   [: MAIN @ DROPBOX:CLOSE ;] finally ;
+   [: TEST-CLIENT:MAIN @ DROPBOX:CLOSE ;] finally ;
 
 
 \ ---- the download bridge -------------------------------------------
@@ -2037,7 +2036,7 @@ CAP BUFFER: TEXT
    {: d:str t:str rem:MODEL:remote :}
    1 1 t rem LOCAL:NEW-SLOT-IDENTITY
    {: id:LOCAL:download-slot-identity :}
-   d id [: UNPROTECTED ;] LOCAL:LEASE-DOWNLOAD-SLOT ;
+   d id [: TEST-CLIENT:UNPROTECTED ;] LOCAL:LEASE-DOWNLOAD-SLOT ;
 
 \ STAGE-EXACT-DOWNLOAD-AT of p's remote below the root r, open as root.
 : STAGED-AT
@@ -2045,7 +2044,7 @@ CAP BUFFER: TEXT
      ^ARENA:arena -- LOCAL:stage-outcome<n> )
    {: root:fd r:str p:str rem:MODEL:remote
       lease:option<LOCAL:download-slot-lease> ar :}
-   LINK root r p DISPLAY rem lease s" " ar
+   LINK root r p TEST-CLIENT:DISPLAY rem lease s" " ar
    REPLAY:STAGE-EXACT-DOWNLOAD-AT ;
 
 : DROP-STAGE ( LOCAL:stage-outcome<n> -- ) drop ;
@@ -2075,9 +2074,9 @@ CAP BUFFER: TEXT
       lease:option<LOCAL:download-slot-lease> ar :}
    [: root r p rem lease ar STAGED-AT DROP-STAGE ;]
    REPLAY:E-DROPBOX TTHROWSQ
-   LINK REPLAY-LINK:REPLY @ RETRY? TTRUE ;
+   LINK REPLAY-LINK:REPLY @ TEST-CLIENT:RETRY? TTRUE ;
 
-: SEEN ( n -- ) DOWNLOADS$ TEST-DROPBOX:SEEN$ swap T$= ;
+: SEEN ( n -- ) TEST-CLIENT:DOWNLOADS$ TEST-DROPBOX:SEEN$ swap T$= ;
 
 : ALPHABET ( -- str ) s" abcdefghijklmnopqrstuvwxyz" ;
 
@@ -2094,7 +2093,7 @@ CAP BUFFER: TEXT
    n str> {: np:^ nu:n :}
    nu 22 >= TTRUE
    np 22 >str s" .omabox-download-slot-" T$=
-   d n ar INSIDE ;
+   d n ar TEST-CLIENT:INSIDE ;
 
 variable HELD
 
@@ -2129,7 +2128,7 @@ variable HELD
 : STAGE-HASH ( str ^ARENA:arena -- DROPBOX:hash )
    {: r:str ar :}
    r TEXT CAP FS-LIST:NAMES {: u:n :}
-   r TEXT u >str ar INSIDE FS:OPEN-SIZED TTRUE drop {: f:fd :}
+   r TEXT u >str ar TEST-CLIENT:INSIDE FS:OPEN-SIZED TTRUE drop {: f:fd :}
    f ar LOCAL:DROPBOX-CONTENT-HASH f FS:CLOSE-DIR ;
 
 \ A reader of the pipe's bytes into LOCAL.
@@ -2168,7 +2167,7 @@ variable HELD
 \ The file at p below r holds b.
 : HOLDS ( str str str ^ARENA:arena -- )
    {: r:str p:str b:str ar :}
-   r p ar INSIDE TEXT CAP FS:READ-ALL {: u:n :}
+   r p ar TEST-CLIENT:INSIDE TEXT CAP FS:READ-ALL {: u:n :}
    TEXT u >str b T$= ;
 
 : EXACT-DOWNLOAD-RETRY-REUSES-A-STAGE-WITHOUT-CONSUMING-THE-BODY
@@ -2195,8 +2194,8 @@ variable HELD
 : SET-ASIDE ( str str ^ARENA:arena -- )
    {: d:str r:str ar :}
    r TEXT CAP FS-LIST:NAMES {: u:n :}
-   r TEXT u >str ar INSIDE STAGE-AT !
-   d s" aside" ar INSIDE ASIDE !
+   r TEXT u >str ar TEST-CLIENT:INSIDE STAGE-AT !
+   d s" aside" ar TEST-CLIENT:INSIDE ASIDE !
    STAGE-AT @ ASIDE @ FS:RENAME-FILE ;
 
 \ A fresh client refreshes its token first, and stores the rotated
@@ -2204,10 +2203,10 @@ variable HELD
 : RACED ( fd str MODEL:remote ^ARENA:arena -- LOCAL:stage-outcome<n> )
    {: root:fd r:str rem:MODEL:remote ar :}
    s" replay-refresh-2" TEST-DROPBOX:ROTATE!
-   [: RETURNED ;] s" replay-refresh" s" " ar CLIENT-ON {: c :}
+   [: RETURNED ;] s" replay-refresh" s" " ar TEST-CLIENT:CLIENT-ON {: c :}
    c LINKED
    [: root r s" raced.txt" rem NO-LEASE ar STAGED-AT ;]
-   [: c DROPBOX:CLOSE MAIN @ LINKED
+   [: c DROPBOX:CLOSE TEST-CLIENT:MAIN @ LINKED
       s" fake-key" s" replay-refresh" TEST-DROPBOX:ACCEPT! ;] finally ;
 
 : EXACT-DOWNLOAD-STAGE-RACE-PRESERVES-VERIFIED-STAGE ( ^ARENA:arena -- )
@@ -2278,13 +2277,13 @@ variable HELD
    {: ar :}
    s" a 416 at the partial's length finishes the stage, unread" T-LABEL
    TEST-DROPBOX:RESET
-   s" " ar PAST-HASH {: c:DROPBOX:hash :}
+   s" " ar TEST-CLIENT:PAST-HASH {: c:DROPBOX:hash :}
    c s" full-revision" REMOTE-OF {: rem:MODEL:remote :}
    ar CONFLICT-DIRS {: d:str r:str s:str :}
    r OPEN-ROOT {: root:fd :}
-   d s" full.bin" rem LEASE-FOR LEASED {: l:LOCAL:download-slot-lease :}
-   root r s" full.bin" c l ar CHECKPOINTED
-   416 s" Content-Range" CHECKPOINT UNSATISFIED$ s" "
+   d s" full.bin" rem LEASE-FOR TEST-CLIENT:LEASED {: l:LOCAL:download-slot-lease :}
+   root r s" full.bin" c l ar TEST-CLIENT:CHECKPOINTED
+   416 s" Content-Range" TEST-CLIENT:CHECKPOINT UNSATISFIED$ s" "
    TEST-DROPBOX:SCRIPT!
    root r s" full.bin" rem l OPTION:SOME ar STAGED-AT s" staged" AS
    1 SEEN
@@ -2293,7 +2292,7 @@ variable HELD
 
 \ The last download asked the bytes from CHECKPOINT on.
 : RESUMED-RANGE ( -- )
-   SB-RESET s" bytes=" SB-APPEND CHECKPOINT FMT:SB-INT s" -" SB-APPEND
+   SB-RESET s" bytes=" SB-APPEND TEST-CLIENT:CHECKPOINT FMT:SB-INT s" -" SB-APPEND
    SB$ TEST-DROPBOX:RANGE-SENT$ T$= ;
 
 \ The last download asked for rev v.
@@ -2318,12 +2317,12 @@ variable HELD
    ar CONFLICT-DIRS {: d:str r:str s:str :}
    r OPEN-ROOT {: root:fd :}
    d s" restart.bin" rem LEASE-FOR {: l:option<LOCAL:download-slot-lease> :}
-   root r s" restart.bin" c l LEASED ar CHECKPOINTED
+   root r s" restart.bin" c l TEST-CLIENT:LEASED ar TEST-CLIENT:CHECKPOINTED
    d ar SLOT-PATH {: slot:str :}
    TEST-DROPBOX:LOSE
    root r s" restart.bin" rem l ar STOPPED
    slot HOLDERS 0 T=
-   slot FS:FILE-SIZE CHECKPOINT T=
+   slot FS:FILE-SIZE TEST-CLIENT:CHECKPOINT T=
    RESUMED-RANGE
    s" restart-revision" ASKED-REV
    root r s" restart.bin" rem l ar STAGED-AT s" staged" AS
@@ -2343,9 +2342,9 @@ variable HELD
       l:option<LOCAL:download-slot-lease> ar :}
    d [: [: root r s" resume.bin" rem l ar STAGED-AT DROP-STAGE ;]
       REPLAY:E-DROPBOX TTHROWSQ ;] ar LOGGED LINE-COUNT 1 T=
-   LINK REPLAY-LINK:REPLY @ DROPBOX-ERROR:UNVERIFIED REFUSAL? TTRUE
-   d ar SLOT-PATH FS:FILE-SIZE CHECKPOINT T=
-   r s" resume.bin" ar INSIDE FS:TRY-STAT TFALSE
+   LINK REPLAY-LINK:REPLY @ DROPBOX-ERROR:UNVERIFIED TEST-CLIENT:REFUSAL? TTRUE
+   d ar SLOT-PATH FS:FILE-SIZE TEST-CLIENT:CHECKPOINT T=
+   r s" resume.bin" ar TEST-CLIENT:INSIDE FS:TRY-STAT TFALSE
    RESUMED-RANGE s" resume-revision" ASKED-REV ;
 
 \ Rust's eight bad answers in its order: a 200 with no range or body, a
@@ -2361,12 +2360,12 @@ variable HELD
    TEST-DROPBOX:SKEW root d r rem l ar REFUSED-RESUME
    TEST-DROPBOX:CLIP root d r rem l ar REFUSED-RESUME
    TEST-DROPBOX:INFLATE root d r rem l ar REFUSED-RESUME
-   s" /resume.bin" s" different-revision" ALPHABET c SERVES-PAST
+   s" /resume.bin" s" different-revision" ALPHABET c TEST-CLIENT:SERVES-PAST
    s" different-revision" TEST-DROPBOX:MISFILE
    root d r rem l ar REFUSED-RESUME
    s" different resumed bytes" ar HASH-OF DROPBOX:HASH>STR
    TEST-DROPBOX:MISHASH root d r rem l ar REFUSED-RESUME
-   CHECKPOINT 1- TEST-DROPBOX:MISSIZE
+   TEST-CLIENT:CHECKPOINT 1- TEST-DROPBOX:MISSIZE
    root d r rem l ar REFUSED-RESUME
    TEST-DROPBOX:EMPTY root d r rem l ar REFUSED-RESUME ;
 
@@ -2375,17 +2374,17 @@ variable HELD
    {: ar :}
    s" interrupted_exact_download_resumes_only_from_a_valid_range" T-LABEL
    TEST-DROPBOX:RESET
-   ALPHABET ar PAST-HASH {: c:DROPBOX:hash :}
-   s" /resume.bin" s" resume-revision" ALPHABET c SERVES-PAST
+   ALPHABET ar TEST-CLIENT:PAST-HASH {: c:DROPBOX:hash :}
+   s" /resume.bin" s" resume-revision" ALPHABET c TEST-CLIENT:SERVES-PAST
    c s" resume-revision" REMOTE-OF {: rem:MODEL:remote :}
    ar CONFLICT-DIRS {: d:str r:str s:str :}
    r OPEN-ROOT {: root:fd :}
    d s" resume.bin" rem LEASE-FOR {: l:option<LOCAL:download-slot-lease> :}
-   root r s" resume.bin" c l LEASED ar CHECKPOINTED
+   root r s" resume.bin" c l TEST-CLIENT:LEASED ar TEST-CLIENT:CHECKPOINTED
    d ar SLOT-PATH {: slot:str :}
    TEST-DROPBOX:LOSE
    root r s" resume.bin" rem l ar STOPPED
-   slot FS:FILE-SIZE CHECKPOINT T=
+   slot FS:FILE-SIZE TEST-CLIENT:CHECKPOINT T=
    s" resume-revision" ASKED-REV
    root d r rem l c ar BAD-RESUMES
    root r s" resume.bin" rem l ar STAGED-AT s" staged" AS
@@ -2398,7 +2397,7 @@ variable HELD
 \ The status file's text.
 : STATUS$ ( ^ARENA:arena -- str )
    {: ar :}
-   RUNTIME @ s" omabox/status.json" ar INSIDE
+   RUNTIME @ s" omabox/status.json" ar TEST-CLIENT:INSIDE
    TEXT CAP FS:READ-ALL TEXT swap >str ;
 
 : PART-SHOWN$ ( -- str )
@@ -2414,7 +2413,7 @@ variable HELD
    s" /docs/progress.txt" s" progress-revision" ALPHABET c SERVES
    c s" progress-revision" REMOTE-OF {: rem:MODEL:remote :}
    ar CONFLICT-DIRS {: d:str r:str s:str :}
-   r s" docs" ar INSIDE FS:MAKE-DIR
+   r s" docs" ar TEST-CLIENT:INSIDE FS:MAKE-DIR
    r OPEN-ROOT {: root:fd :}
    TEST-DROPBOX:CUT-BODY
    root r s" docs/progress.txt" rem NO-LEASE ar STOPPED
@@ -2437,7 +2436,7 @@ variable HELD
    ( str str MODEL:remote ^ARENA:arena -- str str )
    {: r:str p:str rem:MODEL:remote ar :}
    r OPEN-ROOT {: root:fd :}
-   [: LINK root r p DISPLAY rem ar
+   [: LINK root r p TEST-CLIENT:DISPLAY rem ar
       REPLAY:MATERIALIZE-REMOTE-CONFLICT-AT OUTCOME$ ;]
    [: root FS:CLOSE-DIR ;] finally ;
 
@@ -2454,7 +2453,7 @@ variable HELD
 : COPY-AT$
    ( fd str str str MODEL:remote ^ARENA:arena -- str )
    {: root:fd r:str t:str p:str rem:MODEL:remote ar :}
-   LINK root r t DISPLAY p DISPLAY rem ar
+   LINK root r t TEST-CLIENT:DISPLAY p TEST-CLIENT:DISPLAY rem ar
    REPLAY:MATERIALIZE-REMOTE-COPY-AT EXACT$ ;
 
 : THEIRS ( -- str ) s" Dropbox's side of the conflict" ;
@@ -2483,7 +2482,7 @@ variable HELD
    s" a directory or other bytes at the copy's name block it" T-LABEL
    ar THEIRS-SERVED {: c:DROPBOX:hash rem:MODEL:remote :}
    ar CONFLICT-DIRS {: d:str r:str s:str :}
-   r s" notes.txt" c ar REMOTE-COPY ar INSIDE {: k:str :}
+   r s" notes.txt" c ar REMOTE-COPY ar TEST-CLIENT:INSIDE {: k:str :}
    k FS:MAKE-DIR
    d [: r s" notes.txt" rem ar REMOTE-COPY$ BLOCKED-OCCUPIED ;] ar
    QUIETLY
@@ -2531,8 +2530,8 @@ variable HELD
    r OPEN-ROOT {: root:fd :}
    root r s" moved.txt" s" notes.txt" rem ar COPY-AT$ s" ready" T$=
    r s" moved.txt" THEIRS ar HOLDS
-   r s" notes.txt" ar INSIDE FS:TRY-STAT TFALSE
-   r s" taken.txt" ar INSIDE s" other bytes" FS:WRITE-ALL
+   r s" notes.txt" ar TEST-CLIENT:INSIDE FS:TRY-STAT TFALSE
+   r s" taken.txt" ar TEST-CLIENT:INSIDE s" other bytes" FS:WRITE-ALL
    root r s" taken.txt" s" notes.txt" rem ar COPY-AT$
    s" destination-changed" T$=
    r s" taken.txt" s" other bytes" ar HOLDS
@@ -2584,7 +2583,7 @@ ARENA FILE-CASES file-case
      -- JOURNAL:plan-record )
    {: j k up ar :}
    k up ar KIND-OPS JOURNAL-OPERATION--PLAN:MAKE {: plan :}
-   j s" notes.txt" DISPLAY plan ar JOURNAL:RECORD-PLAN NEW-PLAN ;
+   j s" notes.txt" TEST-CLIENT:DISPLAY plan ar JOURNAL:RECORD-PLAN NEW-PLAN ;
 
 \ A case of the kind: notes.txt written and staged below a fresh root
 \ over SEEDED's baseline, and the kind's plan for it.
@@ -2636,7 +2635,7 @@ ARENA FILE-CASES file-case
    j ar JOURNAL:BLOCKED-PLANS VEC:COUNT 0<> if s" blocked" exit then
    j ar JOURNAL:CONFLICTS {: v :}
    v VEC:COUNT 0<> if v 0 VEC:AT @ RECORDED$ exit then
-   j s" notes.txt" DISPLAY ar JOURNAL:BASELINE REV$ ;
+   j s" notes.txt" TEST-CLIENT:DISPLAY ar JOURNAL:BASELINE REV$ ;
 
 \ Whether the case's plan is the kind k.
 : KIND? ( ^file-case plan-kind -- bool )
@@ -2698,7 +2697,7 @@ ARENA FILE-CASES file-case
    {: c p:str b:str there:bool ar :}
    c FILE-CASE-ROOT @ {: r:str :}
    there if r p b ar HOLDS exit then
-   r p ar INSIDE FS:TRY-STAT TFALSE ;
+   r p ar TEST-CLIENT:INSIDE FS:TRY-STAT TFALSE ;
 
 \ The case's local copy holds the upload when l is set, and its
 \ remote copy THEIRS when m is set; an unset one is not on disk.
@@ -2854,7 +2853,7 @@ ARENA FILE-CASES file-case
 \ A directory at the copy p below the case's root.
 : TAKEN ( ^file-case str ^ARENA:arena -- str )
    {: c p:str ar :}
-   c FILE-CASE-ROOT @ p ar INSIDE {: k:str :}
+   c FILE-CASE-ROOT @ p ar TEST-CLIENT:INSIDE {: k:str :}
    k FS:MAKE-DIR
    k ;
 
@@ -2944,7 +2943,7 @@ ARENA FILE-CASES file-case
    s" download-unavailable" ar UNCOPIED {: c t:str :}
    t LINE-COUNT 2 T= t d STR:CONTAINS? TTRUE
    s" download_unavailable " SB-RESET SB-APPEND st FMT:INT$ SB-APPEND
-   SB$ ar COPIED BLOCKED-LINE t swap STR:CONTAINS? TTRUE
+   SB$ ar TEST-CLIENT:COPIED BLOCKED-LINE t swap STR:CONTAINS? TTRUE
    c FILE-CASE-JOURNAL @ ar HELD-STATUS st T=
    c ENDED ;
 
@@ -2990,7 +2989,7 @@ ARENA FILE-CASES file-case
    ar THEIRS-SERVED {: h rem :}
    s" /2/files/download" 503 s" " s" " s" " TEST-DROPBOX:ROUTE-SCRIPT!
    rem REPLAY:E-DROPBOX ar COPY-FAILED {: c :}
-   LINK REPLAY-LINK:REPLY @ RETRY? TTRUE
+   LINK REPLAY-LINK:REPLY @ TEST-CLIENT:RETRY? TTRUE
    c true false ar COPIES
    1 SEEN
    c ENDED ;
@@ -3003,10 +3002,10 @@ ARENA FILE-CASES file-case
    ar THEIRS-SERVED {: h rem :}
    s" /oauth2/token" 400 s" " s" "
    S\" {\qerror\q:\qinvalid_request\q}" TEST-DROPBOX:ROUTE-SCRIPT!
-   [: KEEP-NONE ;] s" replay-refresh" s" " ar CLIENT-ON {: k :}
+   [: KEEP-NONE ;] s" replay-refresh" s" " ar TEST-CLIENT:CLIENT-ON {: k :}
    k LINKED
    [: rem DROPBOX:E-BAD-REQUEST ar COPY-FAILED ENDED ;]
-   [: k DROPBOX:CLOSE MAIN @ LINKED ;] finally ;
+   [: k DROPBOX:CLOSE TEST-CLIENT:MAIN @ LINKED ;] finally ;
 
 : APPLY-DELETE-MUTATION-COVERS-EVERY-OUTCOME ( ^ARENA:arena -- )
    {: ar :}
@@ -3080,20 +3079,20 @@ ARENA FILE-CASES file-case
 
 : BASELINE-FILE ( option<MODEL:baseline> -- MODEL:remote )
    MATCH option
-      none OF s" no baseline" FAILED ENDOF
+      none OF s" no baseline" TEST-CLIENT:FAILED ENDOF
       some OF
          MATCH MODEL:baseline
-            absent OF s" an absent baseline" FAILED ENDOF
+            absent OF s" an absent baseline" TEST-CLIENT:FAILED ENDOF
             present OF ENDOF
-            directory OF s" a directory baseline" FAILED ENDOF
+            directory OF s" a directory baseline" TEST-CLIENT:FAILED ENDOF
          ;MATCH
       ENDOF
    ;MATCH ;
 
 \ The fake holds a folder at p.
 : FOLDER-AT ( str -- )
-   MAIN @ DROPBOX:METADATA DROPBOX:DONE? TTRUE
-   MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:KIND @ DROPBOX-KIND:FOLDER
+   TEST-CLIENT:MAIN @ DROPBOX:METADATA DROPBOX:DONE? TTRUE
+   TEST-CLIENT:MAIN @ DROPBOX:ENTRY DROPBOX-ENTRY:KIND @ DROPBOX-KIND:FOLDER
    DROPBOX-KIND:EQ TTRUE ;
 
 : REMOTE-REPLAY-CREATES-NESTED-PARENTS-BEFORE-THE-FILE
@@ -3102,16 +3101,16 @@ ARENA FILE-CASES file-case
    s" remote_replay_creates_nested_parents_before_the_file" T-LABEL
    TEST-DROPBOX:RESET
    ar UPLOAD-DIRS {: d:str r:str s:str j :}
-   r s" one" ar INSIDE {: one:str :} one FS:MAKE-DIR
-   one s" two" ar INSIDE {: two:str :} two FS:MAKE-DIR
-   two s" file.txt" ar INSIDE s" nested bytes" FS:WRITE-ALL
+   r s" one" ar TEST-CLIENT:INSIDE {: one:str :} one FS:MAKE-DIR
+   one s" two" ar TEST-CLIENT:INSIDE {: two:str :} two FS:MAKE-DIR
+   two s" file.txt" ar TEST-CLIENT:INSIDE s" nested bytes" FS:WRITE-ALL
    s" nested bytes" ar HASH-OF {: c:DROPBOX:hash :}
    j s" one/two/file.txt" c MODEL-OPERATION:CREATE-REMOTE ar PLANNED
    drop
    j r s ar REMOTE-REPLAYED {: rep :}
    rep COMPLETED 1 T=
    rep BLOCKS VEC:COUNT 0 T=
-   j s" one/two/file.txt" DISPLAY ar JOURNAL:BASELINE BASELINE-FILE
+   j s" one/two/file.txt" TEST-CLIENT:DISPLAY ar JOURNAL:BASELINE BASELINE-FILE
    MODEL-REMOTE:UNMAKE {: h v :}
    h DROPBOX:HASH>STR c DROPBOX:HASH>STR T$=
    v DROPBOX:REV>STR s" 01701" T$=
@@ -3133,7 +3132,7 @@ ARENA FILE-CASES file-case
 : GONE-PLAN ( ^ARENA:arena -- str str str JOURNAL:journal )
    {: ar :}
    ar UPLOAD-DIRS {: d:str r:str s:str j :}
-   j s" gone" DISPLAY MODEL-BASELINE:DIRECTORY ar JOURNAL:RECORD-NOOP
+   j s" gone" TEST-CLIENT:DISPLAY MODEL-BASELINE:DIRECTORY ar JOURNAL:RECORD-NOOP
    NOOP-RECORDED? TTRUE
    j s" gone" MODEL-OPERATION:DELETE-REMOTE-DIRECTORY ar PLANNED drop
    d r s j ;
@@ -3149,7 +3148,7 @@ ARENA FILE-CASES file-case
    j r s ar REMOTE-REPLAYED {: rep :}
    rep COMPLETED 1 T=
    rep BLOCKS VEC:COUNT 0 T=
-   j s" gone" DISPLAY ar JOURNAL:BASELINE NO-BASELINE? TTRUE
+   j s" gone" TEST-CLIENT:DISPLAY ar JOURNAL:BASELINE NO-BASELINE? TTRUE
    j ar JOURNAL:PENDING-PLANS VEC:COUNT 0 T=
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$=
    j JOURNAL:CLOSE
@@ -3201,7 +3200,7 @@ ARENA FILE-CASES file-case
    rep COMPLETED 0 T=
    rep BLOCKS VEC:COUNT 1 T=
    rep BLOCKS 0 VEC:AT @ s" gone" FRESH-AT? TTRUE
-   j s" gone" DISPLAY ar JOURNAL:BASELINE DIRECTORY? TTRUE
+   j s" gone" TEST-CLIENT:DISPLAY ar JOURNAL:BASELINE DIRECTORY? TTRUE
    j ar JOURNAL:PENDING-PLANS VEC:COUNT 0 T=
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/get_metadata" T$=
    j JOURNAL:CLOSE
@@ -3232,7 +3231,7 @@ ARENA FILE-CASES file-case
 \ read back absent: the plan stays pending and the pass goes on.
 : CREATE-PENDING ( str str JOURNAL:journal ^ARENA:arena -- )
    {: r:str s:str j ar :}
-   r s" create.txt" ar INSIDE s" desired bytes" FS:WRITE-ALL
+   r s" create.txt" ar TEST-CLIENT:INSIDE s" desired bytes" FS:WRITE-ALL
    s" desired bytes" ar HASH-OF {: want:DROPBOX:hash :}
    j s" create.txt" want MODEL-OPERATION:CREATE-REMOTE ar PLANNED drop
    TEST-DROPBOX:RESET TEST-DROPBOX:CUT
@@ -3249,11 +3248,11 @@ ARENA FILE-CASES file-case
    T-LABEL
    TEST-DROPBOX:RESET
    ar UPLOAD-DIRS {: d:str r:str s:str j :}
-   d s" recovery" ar INSIDE {: rec:str :} rec FS:MAKE-DIR
+   d s" recovery" ar TEST-CLIENT:INSIDE {: rec:str :} rec FS:MAKE-DIR
    d r s rec j ar DELETE-REPLAYED
    r s j ar CREATE-PENDING
    j JOURNAL:CLOSE
-   d s" journal.sqlite3" ar INSIDE JOURNAL:OPEN {: again :}
+   d s" journal.sqlite3" ar TEST-CLIENT:INSIDE JOURNAL:OPEN {: again :}
    again ar JOURNAL:PENDING-PLANS VEC:COUNT 1 T=
    again JOURNAL:CLOSE
    d GONE ;
@@ -3284,9 +3283,9 @@ ARENA FILE-CASES file-case
 : REPLACE-PLAN ( JOURNAL:journal str ^ARENA:arena -- )
    {: j r:str ar :}
    s" common bytes" ar HASH-OF s" old-rev" REMOTE-OF {: old :}
-   j s" replace.txt" DISPLAY old MODEL-BASELINE:PRESENT ar
+   j s" replace.txt" TEST-CLIENT:DISPLAY old MODEL-BASELINE:PRESENT ar
    JOURNAL:RECORD-NOOP NOOP-RECORDED? TTRUE
-   r s" replace.txt" ar INSIDE s" new local bytes" FS:WRITE-ALL
+   r s" replace.txt" ar TEST-CLIENT:INSIDE s" new local bytes" FS:WRITE-ALL
    j s" replace.txt" s" new local bytes" ar HASH-OF s" old-rev" AS-REV
    MODEL-OPERATION:REPLACE-REMOTE ar PLANNED drop ;
 
@@ -3343,7 +3342,7 @@ variable SIDES
    rep COMPLETED 1 T=
    rep BLOCKS VEC:COUNT 0 T=
    j ar JOURNAL:PENDING-PLANS VEC:COUNT 0 T=
-   j s" replace.txt" DISPLAY ar JOURNAL:BASELINE BASELINE-FILE
+   j s" replace.txt" TEST-CLIENT:DISPLAY ar JOURNAL:BASELINE BASELINE-FILE
    MODEL-REMOTE:UNMAKE {: h v :}
    h DROPBOX:HASH>STR
    s" common bytes" ar HASH-OF DROPBOX:HASH>STR T$=
@@ -3391,7 +3390,7 @@ variable SIDES
    503 s" " s" " s" {}" TEST-DROPBOX:SCRIPT!
    ar GONE-PLAN {: d:str r:str s:str j :}
    [: j r s ar REMOTE-REPLAYED drop ;] REPLAY:E-DROPBOX TTHROWSQ
-   LINK REPLAY-LINK:REPLY @ RETRY? TTRUE
+   LINK REPLAY-LINK:REPLY @ TEST-CLIENT:RETRY? TTRUE
    j ar JOURNAL:PENDING-PLANS VEC:COUNT 1 T=
    j ar JOURNAL:BLOCKED-PLANS VEC:COUNT 0 T=
    s" restricted_content" LOOKUP-ERROR
@@ -3402,7 +3401,7 @@ variable SIDES
    TTRUE
    j ar JOURNAL:PENDING-PLANS VEC:COUNT 0 T=
    j ar JOURNAL:BLOCKED-PLANS VEC:COUNT 1 T=
-   j s" gone" DISPLAY ar JOURNAL:BASELINE DIRECTORY? TTRUE
+   j s" gone" TEST-CLIENT:DISPLAY ar JOURNAL:BASELINE DIRECTORY? TTRUE
    TEST-DROPBOX:SEEN$ s" /2/files/list_folder /2/files/list_folder" T$=
    j JOURNAL:CLOSE
    d GONE ;
@@ -3444,7 +3443,7 @@ variable SIDES
    t RUNS-AS$ STR:CONTAINS? TTRUE
    j ar JOURNAL:BLOCKED-PLANS VEC:COUNT 0 T=
    j ar JOURNAL:PENDING-PLANS VEC:COUNT 1 T=
-   r ar LOCAL-SIDE ar INSIDE FS:TRY-STAT TFALSE
+   r ar LOCAL-SIDE ar TEST-CLIENT:INSIDE FS:TRY-STAT TFALSE
    r s" replace.txt" s" new local bytes" ar HOLDS
    s" /2/files/upload /2/files/get_metadata" {: w:str :}
    w str> nip {: wu:n :}
@@ -3479,7 +3478,7 @@ variable SIDES
    j s" rejected_by_dropbox" ar HELD-AS drop
    j ar HELD-AT-A
    j ar JOURNAL:PENDING-PLANS VEC:COUNT 0 T=
-   j s" b" DISPLAY ar JOURNAL:BASELINE DIRECTORY? TTRUE
+   j s" b" TEST-CLIENT:DISPLAY ar JOURNAL:BASELINE DIRECTORY? TTRUE
    TEST-DROPBOX:SEEN$ s" /2/files/delete_v2 /2/files/create_folder_v2"
    T$=
    j JOURNAL:CLOSE
@@ -3493,7 +3492,7 @@ variable SIDES
    ar UPLOAD-DIRS {: d:str r:str s:str j :}
    j r ar REPLACE-PLAN
    s" new local bytes" ar HASH-OF DROPBOX:HASH>STR {: h:str :}
-   s h ar INSIDE FS:MAKE-DIR
+   s h ar TEST-CLIENT:INSIDE FS:MAKE-DIR
    j r s ar REMOTE-REPLAYED {: rep :}
    rep COMPLETED 0 T=
    rep BLOCKS VEC:COUNT 1 T=
@@ -3550,21 +3549,21 @@ variable SIDES
 \ runtime directory of its own.
 : LINKING ( ^ARENA:arena -- )
    {: ar :}
-   [: KEEP-NONE ;] s" replay-refresh" s" " ar CLIENT-ON MAIN !
-   MAIN @ LINKED
+   [: KEEP-NONE ;] s" replay-refresh" s" " ar TEST-CLIENT:CLIENT-ON TEST-CLIENT:MAIN !
+   TEST-CLIENT:MAIN @ LINKED
    s" " LINK REPLAY-LINK:ROOT !
-   s" replay-status" FS:MKTEMP-DIR ar COPIED RUNTIME !
+   s" replay-status" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED RUNTIME !
    RUNTIME @ ar STATUS:NEW LINK REPLAY-LINK:STATUS !
-   MAIN @ DROPBOX:ACCOUNT DROPBOX:DONE? TTRUE ;
+   TEST-CLIENT:MAIN @ DROPBOX:ACCOUNT DROPBOX:DONE? TTRUE ;
 
 : BRIDGE-SERVED ( ^ARENA:arena -- )
    {: ar :}
    s" fake-key" s" replay-refresh" TEST-DROPBOX:ACCEPT!
    s" " TEST-DROPBOX:ROOT!
-   FILL-XS
+   TEST-CLIENT:FILL-XS
    ar LINKING
    [: ar BRIDGE-CASES ar LOOP-CASES ;]
-   [: MAIN @ DROPBOX:CLOSE RUNTIME @ GONE ;] finally ;
+   [: TEST-CLIENT:MAIN @ DROPBOX:CLOSE RUNTIME @ GONE ;] finally ;
 
 
 \ The mutation, bridge and remote replay cases against one fake Dropbox,
@@ -3622,4 +3621,3 @@ variable SIDES
 RUN
 
 ;package
-;using

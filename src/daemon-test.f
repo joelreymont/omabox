@@ -812,7 +812,6 @@ EXPORT POLICY-CASES
 EXPORT RUN-CASES
 ;package
 
-using TEST-CLIENT
 package DAEMON-TEST
 private
 
@@ -834,9 +833,9 @@ private
 \ A case's directory and the journal opened in it.
 : CASE-JOURNAL ( ^ARENA:arena -- str JOURNAL:journal )
    {: ar :}
-   s" daemon-test" FS:MKTEMP-DIR ar COPIED {: d:str :}
+   s" daemon-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d:str :}
    SB-RESET d SB-APPEND s" /journal.sqlite3" SB-APPEND
-   d SB$ ar COPIED JOURNAL:OPEN ;
+   d SB$ ar TEST-CLIENT:COPIED JOURNAL:OPEN ;
 
 : CASE-GONE ( str JOURNAL:journal -- )
    JOURNAL:CLOSE FS:REMOVE-TREE ;
@@ -851,9 +850,9 @@ private
    {: ar :}
    s" a restricted root is unavailable" T-LABEL
    ar CASE-JOURNAL {: d:str j :}
-   ar TOKENED {: c :}
+   ar TEST-CLIENT:TOKENED {: c :}
    TEST-DROPBOX:RESET
-   s" /2/files/get_metadata" 200 s" " s" " s" no_access" RESTRICTED$
+   s" /2/files/get_metadata" 200 s" " s" " s" no_access" TEST-CLIENT:RESTRICTED$
    TEST-DROPBOX:ROUTE-SCRIPT!
    j c s" /Sync" BINDING-AT ar DAEMON:OWNED-SESSION ar DAEMON:VALIDATE
    DAEMON:CHECK$ s" root-unavailable" T$=
@@ -866,7 +865,7 @@ private
    s" journal_binding_mismatch_blocks_inventory_before_listing" T-LABEL
    ar CASE-JOURNAL {: d:str j :}
    j ANOTHER ar JOURNAL:BIND-DROPBOX-ROOT drop
-   ar TOKENED {: c :}
+   ar TEST-CLIENT:TOKENED {: c :}
    TEST-DROPBOX:RESET
    j c s" " BINDING-AT ar DAEMON:OWNED-SESSION ar DAEMON:VALIDATE
    DAEMON:CHECK$ s" journal-binding-changed" T$=
@@ -880,8 +879,8 @@ private
    T-LABEL
    s" " BINDING-AT {: b :}
    ar CASE-JOURNAL {: d:str j :}
-   ar TOKENED {: c1 :}
-   ar TOKENED {: c2 :}
+   ar TEST-CLIENT:TOKENED {: c1 :}
+   ar TEST-CLIENT:TOKENED {: c2 :}
    TEST-DROPBOX:RESET
    c1 b ar DAEMON:OWNED-SESSION {: s1 :}
    j s1 ar DAEMON:VALIDATE DAEMON:CHECK$ s" valid" T$=
@@ -903,7 +902,7 @@ private
    {: ar :}
    s" failed_account_validation_is_retried_by_the_same_client" T-LABEL
    ar CASE-JOURNAL {: d:str j :}
-   ar TOKENED {: c :}
+   ar TEST-CLIENT:TOKENED {: c :}
    TEST-DROPBOX:RESET
    ACCOUNT-ROUTE$ 500 s" " s" "
    S\" {\qerror\q:{\q.tag\q:\qother\q}}" TEST-DROPBOX:ROUTE-SCRIPT!
@@ -953,4 +952,3 @@ private
 RUN
 
 ;package
-;using
