@@ -165,7 +165,10 @@
 \ Then that the pass retires the verified stage of a superseded download
 \ plan, of one that ended before it and of an ended replace-local plan,
 \ forgetting each plan; keeps a stage a blocked plan for the same path
-\ and content holds, but not one for other content; and keeps a plan
+\ and content holds, but not one for other content; retires a conflict
+\ copy's recorded stage once its conflict ended, keeping it, and the
+\ stage of a plan that ended at the copy's name with its content, while
+\ a blocked plan at its conflicted path stands; and keeps a plan
 \ whose stage's directory refuses the removal, one line logged for its
 \ path in each of two passes, while other.txt downloads:
 \ - a_superseded_download_plan_retires_its_verified_stage
@@ -173,6 +176,9 @@
 \ - an_ended_replace_plan_retires_its_verified_stage
 \ - a_live_plan_keeps_the_stage_of_its_path_and_content
 \ - a_live_plan_for_other_content_does_not_keep_the_stage
+\ - an_ended_conflicts_copy_stage_is_retired
+\ - a_live_plan_keeps_its_conflicts_copy_stage
+\ - a_held_conflicts_copy_keeps_an_ended_plans_stage
 \ - a_failed_retirement_keeps_its_plan_while_the_pass_goes_on
 \ Download blocks against the fake Dropbox, Rust's tests of the same
 \ names, each download installing in the pass and no account request:
@@ -4141,6 +4147,85 @@ TYPED-VARIABLE RACED-INSTALL str
    DOWNLOAD$ TEST-DROPBOX:CALLS 0 T=
    d x STEP-GONE ;
 
+: COPY-STAGES-UNHELD ( ^run -- n )
+   {: x :}
+   x RUN-JOURNAL @ x RUN-ARENA @ JOURNAL:UNHELD-COPY-STAGES VEC:COUNT ;
+
+\ copy.txt's stage of OBSOLETE$, made and recorded as a remote conflict
+\ copy's stage for the conflicted path k.
+: COPY-STAGE-FOR ( ^run str -- str )
+   {: x k:str :}
+   x RUN-ARENA @ {: ar :}
+   x s" copy.txt" OBSOLETE$ VERIFIED-STAGE {: sp:str :}
+   x RUN-JOURNAL @ s" copy.txt" TEST-CLIENT:DISPLAY OBSOLETE$ ar IDENTITY
+   k ar CANONICAL JOURNAL:RECORD-COPY-STAGE
+   sp ;
+
+\ A conflict copy's recorded stage whose conflict ended, with no plan
+\ or conflict block at its path, is removed and forgotten in the next
+\ pass.
+: AN-ENDED-CONFLICTS-COPY-STAGE-IS-RETIRED ( ^ARENA:arena -- )
+   {: ar :}
+   s" an_ended_conflicts_copy_stage_is_retired" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" ended.txt" COPY-STAGE-FOR {: sp:str :}
+   x COPY-STAGES-UNHELD 1 T=
+   s" both-absent" ar EMPTY-PAGE
+   x rec PASSED COMPLETE drop
+   sp FS:EXISTS? TFALSE
+   x COPY-STAGES-UNHELD 0 T=
+   DOWNLOAD$ TEST-DROPBOX:CALLS 0 T=
+   d x STEP-GONE ;
+
+\ A conflict copy's recorded stage stays while a blocked plan at its
+\ conflicted path may still install the copy.
+: A-LIVE-PLAN-KEEPS-ITS-CONFLICTS-COPY-STAGE ( ^ARENA:arena -- )
+   {: ar :}
+   s" a_live_plan_keeps_its_conflicts_copy_stage" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" held.txt" COPY-STAGE-FOR {: sp:str :}
+   ar STALE-REMOTE {: rem :}
+   x s" held.txt" rem INSTALLING {: live :}
+   x live BLOCKED-AHEAD
+   s" held.txt" s" stale-revision" OBSOLETE$ s" held-listed" ar
+   LISTED-ALONE
+   x rec PASSED COMPLETE drop
+   x BLOCKED-OF VEC:COUNT 1 T=
+   sp FS:EXISTS? TTRUE
+   sp OBSOLETE$ HOLDS-BYTES
+   DOWNLOAD$ TEST-DROPBOX:CALLS 0 T=
+   d x STEP-GONE ;
+
+\ A download plan that ended at a conflict copy's own name, with the
+\ copy's content, leaves its stage, the copy's too, while a blocked plan
+\ at the copy's conflicted path may still install the copy; the plan
+\ stays for a later pass.
+: A-HELD-CONFLICTS-COPY-KEEPS-AN-ENDED-PLANS-STAGE ( ^ARENA:arena -- )
+   {: ar :}
+   s" a_held_conflicts_copy_keeps_an_ended_plans_stage" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" held.txt" COPY-STAGE-FOR {: sp:str :}
+   ar STALE-REMOTE {: rem :}
+   x x s" copy.txt" rem INSTALLING rem ENDED
+   x s" held.txt" rem INSTALLING {: live :}
+   x live BLOCKED-AHEAD
+   s" held.txt" s" stale-revision" OBSOLETE$ s" held-listed" ar
+   LISTED-ALONE
+   x rec PASSED COMPLETE drop
+   x BLOCKED-OF VEC:COUNT 1 T=
+   sp FS:EXISTS? TTRUE
+   sp OBSOLETE$ HOLDS-BYTES
+   x DOWNLOADS-ENDED 1 T=
+   x COPY-STAGES-UNHELD 0 T=
+   DOWNLOAD$ TEST-DROPBOX:CALLS 0 T=
+   d x STEP-GONE ;
+
 : REFUSED$ ( -- str ) s" Dropbox bytes beside the refused stage" ;
 
 \ The one entry of the root's directory p, the stage PRESTAGED made.
@@ -4216,6 +4301,9 @@ TYPED-VARIABLE RACED-INSTALL str
    ar AN-ENDED-REPLACE-PLAN-RETIRES-ITS-VERIFIED-STAGE
    ar A-LIVE-PLAN-KEEPS-THE-STAGE-OF-ITS-PATH-AND-CONTENT
    ar A-LIVE-PLAN-FOR-OTHER-CONTENT-DOES-NOT-KEEP-THE-STAGE
+   ar AN-ENDED-CONFLICTS-COPY-STAGE-IS-RETIRED
+   ar A-LIVE-PLAN-KEEPS-ITS-CONFLICTS-COPY-STAGE
+   ar A-HELD-CONFLICTS-COPY-KEEPS-AN-ENDED-PLANS-STAGE
    ar A-FAILED-RETIREMENT-KEEPS-ITS-PLAN-WHILE-THE-PASS-GOES-ON ;
 
 \ ---- download blocks against the fake Dropbox ----------------------

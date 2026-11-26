@@ -1,10 +1,10 @@
-\ journal.f - package JOURNAL: the sync journal, a SQLite file at schema 13
+\ journal.f - package JOURNAL: the sync journal, a SQLite file at schema 14
 \ (rust src/journal.rs at schema 8), and the Dropbox account and local root
 \ it is bound to. OPEN makes the file 0600 without following a link,
-\ creates schema 13 in a new one and migrates schema 8 to 12 to it, each
+\ creates schema 14 in a new one and migrates schema 8 to 13 to it, each
 \ in one transaction, from migrations/, whose texts this file lays in the
-\ program as it loads; any version but 0 and 8 to 13 is refused
-\ unchanged, and OPEN-READ refuses any but 13. A SQLite failure is
+\ program as it loads; any version but 0 and 8 to 14 is refused
+\ unchanged, and OPEN-READ refuses any but 14. A SQLite failure is
 \ SQLITE's throw, passed up unchanged. JOURNAL's own failures are logged
 \ once with the Rust version's text, then thrown as its codes. E-FILE,
 \ E-DISK-FULL and E-ROOT leave the host errno in FS:ERRNO, 0 where there
@@ -131,7 +131,7 @@ ENUM local-root-activation
 
 private
 
-13 constant SCHEMA
+14 constant SCHEMA
 5000 constant BUSY-MS
 $180 constant MODE-OWNER            \ 0600
 $1FF constant MODE-BITS
@@ -225,6 +225,7 @@ s" migrations/0010.sql" create V10 LAY
 s" migrations/0011.sql" create V11 LAY
 s" migrations/0012.sql" create V12 LAY
 s" migrations/0013.sql" create V13 LAY
+s" migrations/0014.sql" create V14 LAY
 
 : TEXT ( ^n -- str )
    {: p:^n :}
@@ -473,8 +474,8 @@ private
    c MIGRATE-BLOCKED-PLANS
    c V7 RUN  c V8 RUN ;
 
-\ Schema v, 0 or 8 to 12, brought to SCHEMA by each migration it lacks;
-\ 0011.sql, 0012.sql and 0013.sql each set the version.
+\ Schema v, 0 or 8 to 13, brought to SCHEMA by each migration it lacks;
+\ 0011.sql to 0014.sql each set the version.
 : MIGRATE ( SQLITE:connection n -- )
    {: c v :}
    v 0= if c CREATE-SCHEMA then
@@ -482,7 +483,8 @@ private
    v 10 < if c MIGRATE-TYPED-COLUMNS then
    v 11 < if c V11 RUN then
    v 12 < if c V12 RUN then
-   c V13 RUN ;
+   v 13 < if c V13 RUN then
+   c V14 RUN ;
 
 : WRITABLE ( journal -- )
    {: j :}
@@ -491,7 +493,8 @@ private
    [: j >PATH MODE-OWNER FS:CHMOD-MODE ;]
    s" restrict journal permissions" j >PATH FILE-IO
    c VERSION {: v :}
-   v 0<> v 8 <> and v 9 <> and v 10 <> and v 11 <> and v 12 <> and v SCHEMA <> and if
+   v 0<> v 8 <> and v 9 <> and v 10 <> and v 11 <> and v 12 <> and
+   v 13 <> and v SCHEMA <> and if
       j >PATH v UNSUPPORTED
    then
    j CONFIGURE-WRITABLE
@@ -580,14 +583,14 @@ private
 
 public
 
-\ The journal at path: schema 13 created in a new or empty file or migrated
-\ from 8 to 12, completed work pruned; any other version refused unchanged.
+\ The journal at path: schema 14 created in a new or empty file or migrated
+\ from 8 to 13, completed work pruned; any other version refused unchanged.
 : OPEN ( str -- journal )
    {: path:str :}
    path OWNER-ONLY
    path SQLITE:OPEN path JOURNAL-MAKE [: READY ;] SET-UP ;
 
-\ The schema-13 journal at path, never created or changed. Its log lines
+\ The schema-14 journal at path, never created or changed. Its log lines
 \ name it `[Omabox journal]`, as Rust's status redacts the path.
 : OPEN-READ ( str -- journal )
    {: path:str :}
@@ -1076,6 +1079,7 @@ private
       DELETE FROM local_hash_cache;
       DELETE FROM conflicts;
       DELETE FROM conflict_blocks;
+      DELETE FROM copy_stages;
       DELETE FROM temp.watches;
       DELETE FROM legacy_local_root_adoption WHERE singleton = 1;"
    SQLITE:EXEC ;
@@ -3811,6 +3815,109 @@ public
 : PLAN-OF ( journal plan-id ^ARENA:arena -- option<plan-record> )
    {: j id ar :}
    j >CONNECTION id ar READ-PLAN ;
+
+\ A remote conflict copy's verified stage that may be on disk: target the
+\ copy's path, content the hash staged, key the canonical path of the
+\ conflicted path whose live plan or conflict block may install it.
+STRUCTURE copy-stage
+   FIELD target MODEL:path
+   FIELD content DROPBOX:hash
+   FIELD key MODEL:key
+;STRUCTURE
+
+private
+
+: STAGE-WRITTEN
+   ( SQLITE:connection MODEL:path DROPBOX:hash MODEL:key -- )
+   {: c target h:DROPBOX:hash k :}
+   c s" INSERT INTO copy_stages(target, content, canonical_path)
+      VALUES (?1, ?2, ?3) ON CONFLICT(target, content) DO NOTHING"
+   [: target MODEL:PATH>STR 1 SQLITE:BIND-BLOB
+      h DROPBOX:HASH>STR 2 SQLITE:BIND-TEXT
+      k MODEL:KEY>STR 3 SQLITE:BIND-BLOB
+      SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT ;
+
+\ The stage in columns 0 to 2: its target, content and key.
+: STAGE-COPY
+   ( SQLITE:statement ^ARENA:arena -- SQLITE:statement copy-stage )
+   {: ar :}
+   0 ar PATH-COPY {: target :}
+   1 ar TEXT-COPY DROPBOX:>HASH {: h:DROPBOX:hash :}
+   2 ar KEY-COPY {: k :}
+   target h k JOURNAL-COPY--STAGE:MAKE ;
+
+: STAGE-ROWS
+   ( SQLITE:statement ^VEC:vector<copy-stage> ^ARENA:arena
+     -- SQLITE:statement )
+   {: v ar :}
+   begin SQLITE:STEP while ar STAGE-COPY v VEC:PUSH ! repeat ;
+
+: STAGE-FORGOTTEN ( SQLITE:connection MODEL:path DROPBOX:hash -- )
+   {: c target h:DROPBOX:hash :}
+   c s" DELETE FROM copy_stages WHERE target = ?1 AND content = ?2"
+   [: target MODEL:PATH>STR 1 SQLITE:BIND-BLOB
+      h DROPBOX:HASH>STR 2 SQLITE:BIND-TEXT
+      SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT ;
+
+public
+
+\ Commits that a stage of content for the copy at target may be on disk,
+\ held by canonical path k; a stage already recorded keeps its key.
+: RECORD-COPY-STAGE ( journal MODEL:path DROPBOX:hash MODEL:key -- )
+   {: j target h:DROPBOX:hash k :}
+   j >CONNECTION {: c :}
+   c [: c target h k STAGE-WRITTEN ;] SQLITE:WITH-TRANSACTION ;
+
+\ The keys that hold a stage: those of a pending or blocked plan or of a
+\ conflict block. Both copy-stage queries read this one definition, so a
+\ stage either query calls held the other never retires. The status is a
+\ literal, as at PENDING-QUERY.
+: HELD-WITH ( -- str )
+   s" WITH held AS (SELECT canonical_path FROM plans
+         WHERE status IN ('pending', 'blocked')
+      UNION SELECT canonical_path FROM conflict_blocks) " ;
+
+: UNHELD-SELECT ( -- str )
+   s" SELECT target, content, canonical_path FROM copy_stages
+      WHERE canonical_path NOT IN (SELECT canonical_path FROM held)
+      ORDER BY target, content" ;
+
+: HELD-SELECT ( -- str )
+   s" SELECT 1 FROM copy_stages WHERE target = ?1 AND content = ?2
+      AND canonical_path IN (SELECT canonical_path FROM held)" ;
+
+create UNHELD-QUERY HELD-WITH UNHELD-SELECT LAY-BOTH
+create HELD-QUERY HELD-WITH HELD-SELECT LAY-BOTH
+
+\ Every recorded stage whose key has no pending or blocked plan and no
+\ conflict block, by target: nothing may install it any more.
+: UNHELD-COPY-STAGES
+   ( journal ^ARENA:arena -- ^VEC:vector<copy-stage> )
+   {: j ar :}
+   ar [type] copy-stage NEW-VECTOR {: v :}
+   j >CONNECTION UNHELD-QUERY TEXT [: v ar STAGE-ROWS ;]
+   SQLITE:WITH-STATEMENT
+   v ;
+
+\ Whether a stage of content for the copy at target is recorded with its
+\ key held by a pending or blocked plan or a conflict block: something
+\ may still install it.
+: COPY-STAGE-HELD? ( journal MODEL:path DROPBOX:hash -- bool )
+   {: j target h:DROPBOX:hash :}
+   j >CONNECTION HELD-QUERY TEXT
+   [: target MODEL:PATH>STR 1 SQLITE:BIND-BLOB
+      h DROPBOX:HASH>STR 2 SQLITE:BIND-TEXT
+      SQLITE:STEP swap ;]
+   SQLITE:WITH-STATEMENT ;
+
+\ Forgets the stage recorded for target and content, if any; the caller
+\ removes it from disk first.
+: FORGET-COPY-STAGE ( journal MODEL:path DROPBOX:hash -- )
+   {: j target h:DROPBOX:hash :}
+   j >CONNECTION {: c :}
+   c [: c target h STAGE-FORGOTTEN ;] SQLITE:WITH-TRANSACTION ;
 
 private
 

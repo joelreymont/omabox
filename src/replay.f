@@ -1876,11 +1876,13 @@ public
 private
 
 \ One remote copy: the remote's bytes at target t, its transfer shown as
-\ path, whose verified stage it may take; writable: t ends writable, not
-\ read-only; held: the codes that say t's own name is held, an answer,
-\ not a failure; reason: why Dropbox refused the download; answer: the
-\ copy's outcome once the machine ends.
+\ path, whose verified stage it may take; journal: where the copy's own
+\ stage is recorded; writable: t ends writable, not read-only; held: the
+\ codes that say t's own name is held, an answer, not a failure; reason:
+\ why Dropbox refused the download; answer: the copy's outcome once the
+\ machine ends.
 STRUCTURE copying DERIVE addr
+   FIELD journal JOURNAL:journal
    FIELD link ^link
    FIELD root fd
    FIELD root-path str
@@ -1909,10 +1911,11 @@ ENUM copy-input placed missing held changed occupied ;ENUM
 ENUM fetch-input staged mismatch held refused occupied ;ENUM
 
 : NEW-COPYING
-   ( ^link fd str MODEL:path MODEL:path MODEL:remote bool
+   ( JOURNAL:journal ^link fd str MODEL:path MODEL:path MODEL:remote bool
      [ n n -- bool ] ^ARENA:arena -- ^copying )
-   {: k root:fd r:str t path rem w:bool held ar :}
+   {: j k root:fd r:str t path rem w:bool held ar :}
    ar COPYINGS-NEW {: x :}
+   j x COPYING-JOURNAL !
    k x COPYING-LINK ! root x COPYING-ROOT ! r x COPYING-ROOT-PATH !
    t x COPYING-TARGET ! path x COPYING-PATH ! rem x COPYING-REMOTE !
    w x COPYING-WRITABLE ! held x COPYING-HELD !
@@ -1990,9 +1993,13 @@ ENUM fetch-input staged mismatch held refused occupied ;ENUM
       some OF x COPYING-REASON ! construct fetch-input refused ENDOF
    ;MATCH ;
 
-\ The remote's bytes downloaded into the copy's own stage.
+\ The remote's bytes downloaded into the copy's own stage, recorded in
+\ the journal first; a failure to record passes up, so no download
+\ starts unrecorded.
 : FETCH-COPY ( ^copying -- fetch-input )
    {: x :}
+   x COPYING-JOURNAL @ x COPYING-TARGET @ x COPY-WANT
+   x COPYING-PATH @ x COPYING-ARENA @ MODEL:FOLD JOURNAL:RECORD-COPY-STAGE
    NO-COPY-STAGE [: DROP-COPY-STAGE x STAGE-COPY ;] catch {: code:n :}
    code 0= if STAGE-INPUT exit then
    drop code x FETCH-FAILED ;
@@ -2066,19 +2073,19 @@ public
 \ path, or path's verified stage beside t, renamed; writable, never over
 \ a file; blocked by any failure DOWNLOAD-BLOCKAGE classifies.
 : MATERIALIZE-REMOTE-COPY-AT
-   ( ^link fd str MODEL:path MODEL:path MODEL:remote ^ARENA:arena
-     -- exact-copy-outcome )
-   {: k root:fd r:str t path rem ar :}
-   k root r t path rem true ['] NEVER-HELD ar NEW-COPYING COPY-RUN ;
+   ( JOURNAL:journal ^link fd str MODEL:path MODEL:path MODEL:remote
+     ^ARENA:arena -- exact-copy-outcome )
+   {: j k root:fd r:str t path rem ar :}
+   j k root r t path rem true ['] NEVER-HELD ar NEW-COPYING COPY-RUN ;
 
 \ Rust's materialize_remote_conflict_at, below the open root at path r,
 \ read-only; an occupied name or a blocked download blocks it.
 : MATERIALIZE-REMOTE-CONFLICT-AT
-   ( ^link fd str MODEL:path MODEL:remote ^ARENA:arena
+   ( JOURNAL:journal ^link fd str MODEL:path MODEL:remote ^ARENA:arena
      -- copy-outcome )
-   {: k root:fd r:str path rem ar :}
+   {: j k root:fd r:str path rem ar :}
    path rem ar REMOTE-COPY-PATH {: copy :}
-   k root r copy path rem false ['] NAME-HELD? ar NEW-COPYING {: x :}
+   j k root r copy path rem false ['] NAME-HELD? ar NEW-COPYING {: x :}
    [: x COPY-RUN path >CONFLICT-OUTCOME ;]
    ['] NAME-HELD? LOCAL:WITH-CONVERTS ;
 
@@ -2346,7 +2353,7 @@ ENUM file-mutation add replace ;ENUM
 \ The remote's bytes as the run's remote conflict copy.
 : KEEP-REMOTE ( MODEL:remote ^pass -- option<replay-blocked> )
    {: rem r :}
-   r PASS-LINK @ r RUN-ROOT r RUN-PATH rem r PASS-ARENA @
+   r PASS-JOURNAL @ r PASS-LINK @ r RUN-ROOT r RUN-PATH rem r PASS-ARENA @
    MATERIALIZE-REMOTE-CONFLICT-AT r UNPLACED-COPY ;
 
 : LOCAL-SIDE ( ^LOCAL:staged-upload -- MODEL:local )

@@ -2236,7 +2236,7 @@ ENUM prepared ready fresh root-changed ;ENUM
    c CONFLICT-REMOTE MATCH option
       none OF REPLAY-COPY--OUTCOME:READY ENDOF
       some OF
-         {: rem :} r RUN-LINK @ root r ROOT$ path rem
+         {: rem :} r RUN-JOURNAL @ r RUN-LINK @ root r ROOT$ path rem
          r RUN-ARENA @ REPLAY:MATERIALIZE-REMOTE-CONFLICT-AT
       ENDOF
    ;MATCH ;
@@ -2337,7 +2337,7 @@ ENUM prepared-collision
    ( fd ^run MODEL:path MODEL:remote ^VEC:vector<MODEL:path>
      MODEL:path -- option<prepared-collision> )
    {: root:fd r path rem ex dst :}
-   r RUN-LINK @ root r ROOT$ dst path rem r RUN-ARENA @
+   r RUN-JOURNAL @ r RUN-LINK @ root r ROOT$ dst path rem r RUN-ARENA @
    REPLAY:MATERIALIZE-REMOTE-COPY-AT
    path rem r RUN-ARENA @ COPY-ANSWER MATCH option
       none OF dst ex VEC:PUSH ! NO-COLLISION ENDOF
@@ -4097,13 +4097,14 @@ ENUM pass-state DERIVE eq
    s" could not retire the verified download stage of `" LOG:TEXT+
    t LOG:TEXT+ s" `, errno " LOG:TEXT+ e LOG:INT+ LOG:;LINE ;
 
-\ Whether path's stage of src is settled: held by the live plan at
-\ path, or absent. A failure keeps it unsettled, for the next pass.
+\ Whether path's stage of content c is settled: held by the live plan
+\ at path, or absent. A conflict copy's record of it whose key is held
+\ keeps it unsettled, and so does a failure, for the next pass.
 : STAGE-SETTLED?
-   ( fd ^run ^VEC:vector<str> MODEL:path MODEL:remote -- bool )
-   {: root:fd r logged path src :}
-   src SOURCE-CONTENT {: c :}
+   ( fd ^run ^VEC:vector<str> MODEL:path DROPBOX:hash -- bool )
+   {: root:fd r logged path c:DROPBOX:hash :}
    r path c LIVE-HOLDS? if true exit then
+   r RUN-JOURNAL @ path c JOURNAL:COPY-STAGE-HELD? if false exit then
    root r ROOT$ path MODEL:PATH>STR c r RUN-ARENA @
    LOCAL:RETIRE-DOWNLOAD-STAGE MATCH LOCAL:stage-retirement
       absent OF true ENDOF
@@ -4118,23 +4119,40 @@ ENUM pass-state DERIVE eq
    true ops VEC:COUNT 0 ?do
       ops i VEC:AT @ INSTALLED-SOURCE MATCH option
          none OF ENDOF
-         some OF {: src :} root r logged path src STAGE-SETTLED? and ENDOF
+         some OF
+            {: src :} root r logged path src SOURCE-CONTENT STAGE-SETTLED?
+            and
+         ENDOF
       ;MATCH
    loop
    if r RUN-JOURNAL @ id JOURNAL:FORGET-COMPLETED-PLAN then ;
 
+\ A conflict copy's recorded stage that nothing may install any more,
+\ removed, then forgotten once settled.
+: COPY-STAGE-RETIRED
+   ( fd ^run ^VEC:vector<str> JOURNAL:copy-stage -- )
+   {: root:fd r logged s :}
+   s JOURNAL-COPY--STAGE:UNMAKE {: target c:DROPBOX:hash k :}
+   root r logged target c STAGE-SETTLED?
+   if r RUN-JOURNAL @ target c JOURNAL:FORGET-COPY-STAGE then ;
+
 : RETIRE-ROOTED ( fd ^run -- )
    {: root:fd r :}
    r RUN-JOURNAL @ r RUN-ARENA @ JOURNAL:COMPLETED-DOWNLOAD-PLANS {: done :}
-   done VEC:COUNT 0= if exit then
+   r RUN-JOURNAL @ r RUN-ARENA @ JOURNAL:UNHELD-COPY-STAGES {: copies :}
+   done VEC:COUNT 0= copies VEC:COUNT 0= and if exit then
    r RUN-ARENA @ [type] str NEW-VECTOR {: logged :}
    done VEC:COUNT 0 ?do root r logged done i VEC:AT @ RETIRE-STAGES-OF
+   loop
+   copies VEC:COUNT 0 ?do root r logged copies i VEC:AT @ COPY-STAGE-RETIRED
    loop ;
 
 \ Each completed download plan's verified stages removed, unless a live
-\ plan holds the same path and content, then the plan forgotten; a plan
-\ whose retirement failed stays for the next pass, as all do while the
-\ configured root is not the active one.
+\ plan holds the same path and content, then the plan forgotten; a stage
+\ a held conflict copy's record names stays, and its plan with it; so too
+\ each conflict copy's recorded stage that nothing may install any more,
+\ then its record. A plan or stage whose retirement failed stays for the
+\ next pass, as all do while the configured root is not the active one.
 : RETIRE-STAGES ( ^run -- )
    {: r :}
    r RUN-JOURNAL @ r ROOT$ LOCAL:OPEN-ACTIVE-ROOT MATCH option
@@ -4144,8 +4162,8 @@ ENUM pass-state DERIVE eq
       ENDOF
    ;MATCH ;
 
-\ Rust's reconcile_published after its last replay, with the ended download plans'
-\ stages retired first: the journal pruned, the report filled, the unreferenced upload stages removed.
+\ Rust's reconcile_published after its last replay, the stages retired
+\ first: the journal pruned, the report filled, the upload stages swept.
 : FINISH ( ^pass -- )
    {: x :}
    x JOURNAL@ {: j :}

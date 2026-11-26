@@ -79,8 +79,10 @@
 \   eight bad answers are each refused unverified, logged once, the slot
 \   at its checkpoint; a download's progress, then finished, in a status
 \   under TMPDIR.
-\ - MATERIALIZE-REMOTE-CONFLICT-AT downloads the copy once, then is ready
-\   with no request, the copy read-only and unmarked; a directory or
+\ - MATERIALIZE-REMOTE-CONFLICT-AT downloads the copy once, its stage
+\   recorded unheld under the path's key, then is ready with no request,
+\   the copy read-only and unmarked; one whose download Dropbox refuses
+\   is blocked, logged once, its stage still recorded; a directory or
 \   other bytes at the copy's name block it conflict-copy-occupied,
 \   logging nothing; other bytes at its stage block it stage-occupied,
 \   logged once, with no request; the path's verified stage becomes the
@@ -2585,12 +2587,13 @@ variable HELD
    {: p:str c:DROPBOX:hash ar :}
    p LOCAL-CONFLICT--SIDE:REMOTE c ar LOCAL:CONFLICT-RELATIVE-PATH ;
 
-\ p's remote conflict copy, written below the root r.
+\ p's remote conflict copy, written below the root r, its stage recorded
+\ in j.
 : REMOTE-COPY$
-   ( str str MODEL:remote ^ARENA:arena -- str str )
-   {: r:str p:str rem:MODEL:remote ar :}
+   ( JOURNAL:journal str str MODEL:remote ^ARENA:arena -- str str )
+   {: j r:str p:str rem:MODEL:remote ar :}
    r OPEN-ROOT {: root:fd :}
-   [: LINK root r p TEST-CLIENT:DISPLAY rem ar
+   [: j LINK root r p TEST-CLIENT:DISPLAY rem ar
       REPLAY:MATERIALIZE-REMOTE-CONFLICT-AT OUTCOME$ ;]
    [: root FS:CLOSE-DIR ;] finally ;
 
@@ -2603,11 +2606,12 @@ variable HELD
       blocked OF drop s" blocked" ENDOF
    ;MATCH ;
 
-\ The remote's exact copy at t below the root r, shown as p.
+\ The remote's exact copy at t below the root r, shown as p, its stage
+\ recorded in j.
 : COPY-AT$
-   ( fd str str str MODEL:remote ^ARENA:arena -- str )
-   {: root:fd r:str t:str p:str rem:MODEL:remote ar :}
-   LINK root r t TEST-CLIENT:DISPLAY p TEST-CLIENT:DISPLAY rem ar
+   ( JOURNAL:journal fd str str str MODEL:remote ^ARENA:arena -- str )
+   {: j root:fd r:str t:str p:str rem:MODEL:remote ar :}
+   j LINK root r t TEST-CLIENT:DISPLAY p TEST-CLIENT:DISPLAY rem ar
    REPLAY:MATERIALIZE-REMOTE-COPY-AT EXACT$ ;
 
 : THEIRS ( -- str ) s" Dropbox's side of the conflict" ;
@@ -2640,16 +2644,30 @@ variable HELD
    MARKER-ABSENT? TTRUE
    f FS:CLOSE-DIR ;
 
+\ j's one unheld copy stage is notes.txt's remote copy's stage of c,
+\ held by notes.txt's canonical path.
+: COPY-STAGE-RECORDED ( JOURNAL:journal DROPBOX:hash ^ARENA:arena -- )
+   {: j c:DROPBOX:hash ar :}
+   j ar JOURNAL:UNHELD-COPY-STAGES {: v :}
+   v VEC:COUNT 1 T=
+   v 0 VEC:AT @ JOURNAL-COPY--STAGE:UNMAKE {: t:MODEL:path h:DROPBOX:hash k :}
+   t MODEL:PATH>STR s" notes.txt" c ar REMOTE-COPY T$=
+   h c DROPBOX:HASH= TTRUE
+   k s" notes.txt" TEST-CLIENT:DISPLAY ar MODEL:FOLD MODEL:KEY= TTRUE ;
+
 : A-REMOTE-CONFLICT-COPY-DOWNLOADS-ONCE ( ^ARENA:arena -- )
    {: ar :}
    s" a remote conflict copy downloads once, then is ready" T-LABEL
    ar THEIRS-SERVED {: c:DROPBOX:hash rem:MODEL:remote :}
    ar CONFLICT-DIRS {: d:str r:str s:str :}
-   r s" notes.txt" rem ar REMOTE-COPY$ s" " T$= s" ready" T$=
-   r s" notes.txt" rem ar REMOTE-COPY$ s" " T$= s" ready" T$=
+   d s" journal.sqlite3" ar TEST-CLIENT:INSIDE JOURNAL:OPEN {: j :}
+   j r s" notes.txt" rem ar REMOTE-COPY$ s" " T$= s" ready" T$=
+   j r s" notes.txt" rem ar REMOTE-COPY$ s" " T$= s" ready" T$=
    1 SEEN
    r s" notes.txt" c ar REMOTE-COPY THEIRS ar HOLDS
    r s" notes.txt" c ar REMOTE-COPY ar TEST-CLIENT:INSIDE SEALED
+   j c ar COPY-STAGE-RECORDED
+   j JOURNAL:CLOSE
    d GONE ;
 
 \ The stage of notes.txt's download of c below the root r, if any.
@@ -2668,16 +2686,18 @@ variable HELD
    s" the path's verified stage becomes its remote copy" T-LABEL
    ar THEIRS-SERVED {: c:DROPBOX:hash rem:MODEL:remote :}
    ar CONFLICT-DIRS {: d:str r:str s:str :}
+   d s" journal.sqlite3" ar TEST-CLIENT:INSIDE JOURNAL:OPEN {: j :}
    r OPEN-ROOT {: root:fd :}
    root r s" notes.txt" THEIRS c ar PRESTAGED s" staged" AS
    root FS:CLOSE-DIR
    r s" notes.txt" ar TEST-CLIENT:INSIDE s" our side" FS:WRITE-ALL
-   r s" notes.txt" rem ar REMOTE-COPY$ s" " T$= s" ready" T$=
+   j r s" notes.txt" rem ar REMOTE-COPY$ s" " T$= s" ready" T$=
    0 SEEN
    r s" notes.txt" c ar REMOTE-COPY THEIRS ar HOLDS
    r s" notes.txt" c ar REMOTE-COPY ar TEST-CLIENT:INSIDE SEALED
    r c ar NOTES-STAGE s" none" T$=
    r s" notes.txt" s" our side" ar HOLDS
+   j JOURNAL:CLOSE
    d GONE ;
 
 : AN-OCCUPIED-REMOTE-COPY-NAME-BLOCKS-IT ( ^ARENA:arena -- )
@@ -2685,21 +2705,23 @@ variable HELD
    s" a directory or other bytes at the copy's name block it" T-LABEL
    ar THEIRS-SERVED {: c:DROPBOX:hash rem:MODEL:remote :}
    ar CONFLICT-DIRS {: d:str r:str s:str :}
+   d s" journal.sqlite3" ar TEST-CLIENT:INSIDE JOURNAL:OPEN {: j :}
    r OPEN-ROOT {: root:fd :}
    root r s" notes.txt" THEIRS c ar PRESTAGED s" staged" AS
    root FS:CLOSE-DIR
    r s" notes.txt" c ar REMOTE-COPY ar TEST-CLIENT:INSIDE {: k:str :}
    k FS:MAKE-DIR
-   d [: r s" notes.txt" rem ar REMOTE-COPY$ BLOCKED-OCCUPIED ;] ar
+   d [: j r s" notes.txt" rem ar REMOTE-COPY$ BLOCKED-OCCUPIED ;] ar
    QUIETLY
    k FS:REMOVE-DIR
    k s" other bytes" FS:WRITE-ALL
-   d [: r s" notes.txt" rem ar REMOTE-COPY$ BLOCKED-OCCUPIED ;] ar
+   d [: j r s" notes.txt" rem ar REMOTE-COPY$ BLOCKED-OCCUPIED ;] ar
    QUIETLY
    r s" notes.txt" c ar REMOTE-COPY s" other bytes" ar HOLDS
    \ The path's verified stage stays, and nothing is downloaded.
    0 SEEN
    r c ar NOTES-STAGE s" already-staged" T$=
+   j JOURNAL:CLOSE
    d GONE ;
 
 \ The log t holds the line once and nothing else.
@@ -2717,18 +2739,20 @@ variable HELD
    s" other bytes at the copy's stage block it" T-LABEL
    ar THEIRS-SERVED {: c:DROPBOX:hash rem:MODEL:remote :}
    ar CONFLICT-DIRS {: d:str r:str s:str :}
+   d s" journal.sqlite3" ar TEST-CLIENT:INSIDE JOURNAL:OPEN {: j :}
    r OPEN-ROOT {: root:fd :}
    s" notes.txt" c ar REMOTE-COPY {: k:str :}
    root r k THEIRS c ar PRESTAGED s" staged" AS
    root FS:CLOSE-DIR
    d r ar SET-ASIDE
    STAGE-AT @ s" other bytes" FS:WRITE-ALL
-   d [: r s" notes.txt" rem ar REMOTE-COPY$
+   d [: j r s" notes.txt" rem ar REMOTE-COPY$
       s" stage-occupied" T$= s" blocked" T$= ;] ar LOGGED
    s" stage_occupied" BLOCKED-LINE LOGS-ONCE
    0 SEEN
    STAGE-AT @ TEXT CAP FS:READ-ALL {: u:n :}
    TEXT u >str s" other bytes" T$=
+   j JOURNAL:CLOSE
    d GONE ;
 
 : A-REMOTE-COPY-INSTALLS-AT-ITS-TARGET ( ^ARENA:arena -- )
@@ -2736,16 +2760,18 @@ variable HELD
    s" a remote copy installs at its target, never over a file" T-LABEL
    ar THEIRS-SERVED {: c:DROPBOX:hash rem:MODEL:remote :}
    ar CONFLICT-DIRS {: d:str r:str s:str :}
+   d s" journal.sqlite3" ar TEST-CLIENT:INSIDE JOURNAL:OPEN {: j :}
    r OPEN-ROOT {: root:fd :}
-   root r s" moved.txt" s" notes.txt" rem ar COPY-AT$ s" ready" T$=
+   j root r s" moved.txt" s" notes.txt" rem ar COPY-AT$ s" ready" T$=
    r s" moved.txt" THEIRS ar HOLDS
    r s" notes.txt" ar TEST-CLIENT:INSIDE FS:TRY-STAT TFALSE
    r s" taken.txt" ar TEST-CLIENT:INSIDE s" other bytes" FS:WRITE-ALL
-   root r s" taken.txt" s" notes.txt" rem ar COPY-AT$
+   j root r s" taken.txt" s" notes.txt" rem ar COPY-AT$
    s" destination-changed" T$=
    r s" taken.txt" s" other bytes" ar HOLDS
    1 SEEN
    root FS:CLOSE-DIR
+   j JOURNAL:CLOSE
    d GONE ;
 
 \ ---- file and delete applies --------------------------------------
@@ -3140,6 +3166,23 @@ ARENA FILE-CASES file-case
    t s" download_unavailable 409" BLOCKED-LINE LOGS-ONCE
    c FILE-CASE-JOURNAL @ ar HELD-STATUS 409 T=
    c ENDED ;
+
+\ A remote conflict copy whose download Dropbox refuses is blocked, its
+\ stage recorded before the request.
+: A-REFUSED-REMOTE-COPY-KEEPS-ITS-STAGE-RECORD ( ^ARENA:arena -- )
+   {: ar :}
+   s" a refused remote copy's download keeps its stage's record" T-LABEL
+   ar THEIRS-SERVED {: c:DROPBOX:hash rem:MODEL:remote :}
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   d s" journal.sqlite3" ar TEST-CLIENT:INSIDE JOURNAL:OPEN {: j :}
+   s" path" s" restricted_content" REFUSAL
+   d [: j r s" notes.txt" rem ar REMOTE-COPY$
+      s" other" T$= s" blocked" T$= ;] ar LOGGED
+   s" download_unavailable 409" BLOCKED-LINE LOGS-ONCE
+   1 SEEN
+   j c ar COPY-STAGE-RECORDED
+   j JOURNAL:CLOSE
+   d GONE ;
 
 \ The copy's download Dropbox answers st with the body b: the plan
 \ is held download-unavailable st, logged once by DROPBOX as d and
@@ -3747,6 +3790,7 @@ variable SIDES
    ar A-REMOTE-EDIT-KEEPS-THE-DELETED-FILE
    ar AN-OCCUPIED-COPY-NAME-HOLDS-THE-PLAN
    ar A-REFUSED-REMOTE-SIDE-HOLDS-ONLY-ITS-PLAN
+   ar A-REFUSED-REMOTE-COPY-KEEPS-ITS-STAGE-RECORD
    ar A-REJECTED-REMOTE-SIDE-HOLDS-ONLY-ITS-PLAN
    ar A-MISSING-REMOTE-SIDE-HOLDS-ONLY-ITS-PLAN
    ar AN-UNVERIFIED-REMOTE-SIDE-HOLDS-ONLY-ITS-PLAN
