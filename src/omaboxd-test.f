@@ -21,13 +21,17 @@ require src/lib/test.f
 require src/lib/test/stderr.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
-require src/lib/ffi-abi.f
 require src/lib/process.f
 require src/lib/process-argv.f
 require src/lib/process-env.f
 require src/lib/engine-candidate.f
 require src/lib/task.f
 require src/lib/time.f
+require src/lib/num-types.f
+require src/lib/heap.f
+require src/lib/vector.f
+require src/lib/net/udp.f
+require src/core/exit-status.f
 require src/config.f
 require src/journal.f
 require src/test-client.f
@@ -41,9 +45,7 @@ CAP BUFFER: OUT
 CAP BUFFER: ERR
 CAP BUFFER: SEEN
 32 constant GOT-CAP
-GOT-CAP BUFFER: GOT
 PATH-CAP BUFFER: JOINED
-110 BUFFER: ADDR                \ a sockaddr_un
 
 600000 constant BUILD-MS
 10000 constant SELF-CHECK-MS
@@ -53,15 +55,15 @@ PATH-CAP BUFFER: JOINED
 10 constant NAP-MS
 78 constant EXIT-USER-ACTION
 
-PROCESS-SYMBOLS
-FUNCTION: SOCKET-CALL socket ( n n n -- i32 ) ;FUNCTION
-FUNCTION: BIND-CALL bind ( n ^u8 n -- i32 ) ;FUNCTION
-FUNCTION: RECV-CALL recv ( n ^u8 n n -- n ) ;FUNCTION
-
-1 constant AF-UNIX
-$80002 constant DGRAM-CLOEXEC   \ SOCK_DGRAM | SOCK_CLOEXEC
-$40 constant MSG-DONTWAIT
 2 constant O-RDWR
+
+: CAP-LEN ( n -- NUM:byte-len )
+   NUM:BYTE-LEN MATCH option
+      none OF
+         s" omaboxd-test: negative capacity" EXIT-STATUS:FAILURE die
+      ENDOF
+      some OF ENDOF
+   ;MATCH ;
 
 \ The status's last_error texts.
 : SYNC-ROOT ( -- str )
@@ -174,21 +176,12 @@ ARENA FIXTURES fixture
 : MADE ( str str ^ARENA:arena -- str )
    TEST-CLIENT:INSIDE dup FS:MAKE-DIR ;
 
-\ sockaddr_un for path; answers its length.
-: ADDRESS ( str -- n )
-   {: s:str :}
-   s str> {: p:^ u:n :}
-   u 108 < TTRUE
-   AF-UNIX ADDR c! 0 ADDR 1 + c!
-   p ADDR 2 + u BYTE-COPY 0 ADDR 2 + u + c!
-   u 3 + ;
-
+\ A datagram socket bound at the path, or -1 when the bind failed.
 : BOUND ( str -- n )
-   {: p :}
-   AF-UNIX DGRAM-CLOEXEC 0 SOCKET-CALL {: fd :}
-   fd 0 >= TTRUE
-   fd ADDR p ADDRESS BIND-CALL 0 T=
-   fd ;
+   UDP:BIND MATCH UDP:open-result
+      opened OF UDP:SOCKET>N ENDOF
+      failed OF UDP:ERRNO>N drop -1 ENDOF
+   ;MATCH dup 0 >= TTRUE ;
 
 \ config.toml as Rust's Config::write_new writes it.
 : WRITE-CONFIG ( ^fixture ^ARENA:arena -- )
@@ -233,16 +226,39 @@ ARENA FIXTURES fixture
 : JOURNAL$ ( ^fixture -- str )
    PATHS CONFIG:JOURNAL-FILE CONFIG:ABS-PATH>STR ;
 
-\ The bytes of one datagram in GOT, or -1 when none came within n ms.
-: RECEIVED ( ^fixture n -- n )
-   {: x ms :}
+\ One datagram appended to the vector, after a wait of at most n ms for
+\ one to queue: the suite runs no AIO loop, so UDP:RECEIVE makes one try.
+: RECEIVED ( ^fixture ^VEC:vector<u8> n -- UDP:receive-result )
+   {: x v:^ ms :}
    x FIXTURE-NOTIFY @ {: fd :}
-   fd >FD ms >MS PROCESS:POLL-IN COUNT>N 0 <= if -1 exit then
-   fd GOT GOT-CAP MSG-DONTWAIT RECV-CALL ;
+   fd >FD ms >MS PROCESS:POLL-IN drop
+   fd UDP:>SOCKET v GOT-CAP CAP-LEN 0 >MS UDP:RECEIVE ;
 
+: FRESH ( -- ^VEC:vector<u8> ) HEAP:ALLOCATOR 0 [type] u8 VEC:NEW ;
+
+\ The child's datagram is READY=1.
 : READY ( ^fixture -- )
-   READY-MS RECEIVED {: n :}
-   GOT n 0 max >str s" READY=1" T$= ;
+   {: x :}
+   FRESH {: v:^ :}
+   x v READY-MS RECEIVED MATCH UDP:receive-result
+      packet OF drop v VEC:BYTES s" READY=1" T$= ENDOF
+      truncated OF drop s" readiness: truncated" T-FAIL-AS ENDOF
+      timeout OF s" readiness: none came" T-FAIL-AS ENDOF
+      failed OF UDP:ERRNO>N drop s" readiness: receive failed" T-FAIL-AS ENDOF
+   ;MATCH
+   v VEC:DELETE ;
+
+\ No datagram came within QUIET-MS.
+: SILENT ( ^fixture -- )
+   {: x :}
+   FRESH {: v:^ :}
+   x v QUIET-MS RECEIVED MATCH UDP:receive-result
+      packet OF drop false ENDOF
+      truncated OF drop false ENDOF
+      timeout OF true ENDOF
+      failed OF UDP:ERRNO>N drop false ENDOF
+   ;MATCH TTRUE
+   v VEC:DELETE ;
 
 \ The lock is another daemon's: CONFIG:LOCK refuses it.
 : LOCK-HELD ( ^fixture ^ARENA:arena -- )
@@ -311,7 +327,10 @@ ARENA FIXTURES fixture
 : GONE ( ^fixture -- )
    {: x :}
    x FIXTURE-PID @ 0 > if x TERMINATE drop then
-   x FIXTURE-NOTIFY @ close
+   x FIXTURE-NOTIFY @ UDP:>SOCKET UDP:CLOSE MATCH UDP:status
+      ok OF ENDOF
+      failed OF UDP:ERRNO>N drop s" notify socket: close failed" T-FAIL-AS ENDOF
+   ;MATCH
    x FIXTURE-DIR @ FS:REMOVE-TREE ;
 
 : FIXTURED ( [ ^fixture ^ARENA:arena -- ] ^ARENA:arena -- )
@@ -386,7 +405,7 @@ ARENA FIXTURES fixture
    x bin SPAWNED
    x SETTLED
    x TERMINATE EXIT-USER-ACTION T=
-   x QUIET-MS RECEIVED -1 T=
+   x SILENT
    x FIXTURE-STATE-HOME @ FS:EXISTS? TFALSE
    x CONFIGURATION-INVALID ar SAYS? TTRUE ;
 
