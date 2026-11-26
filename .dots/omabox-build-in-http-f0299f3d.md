@@ -1,9 +1,9 @@
 ---
-title: Build in HTTP, TLS, Unicode and notify as Rust does
+title: Build in Unicode case mapping as Rust does
 status: open
 priority: 2
 issue-type: task
 created-at: "2026-11-17T09:38:02.987847+02:00"
 ---
 
-Problem: omaboxd loads libcurl with OpenSSL, libunistring and libsystemd at run time (40 libraries, 27.8 MB beyond what the Rust daemon loads), where Rust compiles in its HTTP client and TLS (ureq, rustls), std's Unicode tables, and writes NOTIFY_SOCKET itself (JOURNAL.md, 'binary size and build time, measured twice'). Goal: Habu's own implementations of these, as Rust's; libsecret stays a system library. Acceptance: the running omaboxd maps none of libcurl, libssl, libcrypto, libunistring or libsystemd; every suite passes; the journal records the new size and footprint. Depends: the user's go-ahead (2026-11-17: dot it, implement after the release); the Habu library work it needs, in Habu's repository. Claim: unassigned.
+Problem: omaboxd still loads libunistring at run time, because Habu's src/lib/unicode.f maps a non-ASCII name's case through u8_casefold and u8_tolower, where Rust uses std's own Unicode tables. Goal: Habu's own case mapping, as Rust's. Acceptance: the running omaboxd maps no libunistring and the package does not depend on it; every suite passes. Depends: the Habu library work it needs, in Habu's repository. Claim: unassigned.
