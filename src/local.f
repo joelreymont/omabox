@@ -627,12 +627,16 @@ SHA256-CTX-BYTES BUFFER: NAME-CTX
    p xu >str x STR:= 0= if false exit then
    p xu + u xu - >str DROPBOX:CONTENT-HASH? ;
 
+public
+
 \ A name only LOCAL makes: a download, displaced or deleted file's.
 : RESERVED-ARTIFACT? ( str -- bool )
    {: p:str :}
    p s" .omabox-download-" PREFIXED-HASH? if true exit then
    p s" .omabox-displaced-" PREFIXED-HASH? if true exit then
    p s" .omabox-deleted-" PREFIXED-HASH? ;
+
+private
 
 : CONFLICT-NAME
    ( str conflict-side DROPBOX:hash ^ARENA:arena -- str )

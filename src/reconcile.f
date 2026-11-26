@@ -3619,12 +3619,18 @@ ENUM pass-state DERIVE eq
       v idx i 1- VEC:AT @ NTH$ v idx i VEC:AT @ NTH$ STR:= 0= if 1+ then
    loop ;
 
+\ Whether the key names one of LOCAL's own files: held, never counted.
+: OWN-ARTIFACT? ( MODEL:key -- bool )
+   MODEL:KEY>STR SPLIT-NAME nip LOCAL:RESERVED-ARTIFACT? ;
+
+\ The distinct held keys, LOCAL's own files not counted.
 : HELD-COUNT ( ^pass -- n )
    {: x :}
    x ARENA@ [type] str NEW-VECTOR {: v :}
    x PASS-PLANNING @ PLANNING-HELD @ {: held :}
    held VEC:COUNT 0 ?do
-      held i VEC:AT @ MODEL:KEY>STR v VEC:PUSH !
+      held i VEC:AT @ {: k :}
+      k OWN-ARTIFACT? 0= if k MODEL:KEY>STR v VEC:PUSH ! then
    loop
    v x ARENA@ DISTINCT ;
 

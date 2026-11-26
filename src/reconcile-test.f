@@ -221,6 +221,9 @@
 \ - documented_exclusions_preserve_payloads_while_ordinary_siblings_sync,
 \   with no account request
 \ - excluded_pending_and_blocked_work_is_retired_across_reopen_without_effects
+\ - A-VERIFIED-DOWNLOAD-STAGE-IS-NO-BLOCKED-PATH: a pass beside a synced
+\   file holds Omabox's verified download stage, yet reports blocked 0,
+\   uploads nothing and keeps the stage.
 \ The tables against their models, through TEST-FORMAL:HOLDS:
 \ - formal_holds_the_listing_table, INVENTORY-PUBLICATION and
 \   formal/InventoryPublication.tla
@@ -6780,6 +6783,27 @@ TYPED-VARIABLE STAND-IN-UPLOAD str
    d x rem BLOCKED-RETIRES
    d x STEP-GONE ;
 
+: OWN-STAGE$ ( -- str ) s" staged download bytes" ;
+: SYNCED$ ( -- str ) s" synced local bytes" ;
+
+: A-VERIFIED-DOWNLOAD-STAGE-IS-NO-BLOCKED-PATH ( ^ARENA:arena -- )
+   {: ar :}
+   s" a verified download stage is no blocked path" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x [: x s" incoming.txt" OWN-STAGE$ PRESTAGED ;] IN-ACTIVE-ROOT
+   x STAGE-PATH {: sp:str :}
+   SYNCED$ s" rev-synced" ar REMOTE-FILE {: rem :}
+   x s" synced.txt" SYNCED$ WRITE-IN
+   x s" synced.txt" rem SEED-BASELINE
+   s" synced.txt" s" rev-synced" SYNCED$ s" cursor-synced" ar
+   LISTED-ALONE
+   x rec PASSED COMPLETE BLOCKED-IN 0 T=
+   UPLOAD-ROUTE$ TEST-DROPBOX:CALLS 0 T=
+   sp OWN-STAGE$ HOLDS-BYTES
+   d x STEP-GONE ;
+
 : ROOT-AND-EXCLUSIONS-CASES ( ^ARENA:arena -- )
    {: ar :}
    ar REPLACED-LOCAL-ROOT-NEVER-REPLAYS-PENDING-DELETION
@@ -6787,7 +6811,8 @@ TYPED-VARIABLE STAND-IN-UPLOAD str
    ar ROOT-SWAP-DURING-PLANNING-STAGES-NOTHING-FROM-THE-STAND-IN
    ar REJECTED-PATHS-DO-NOT-STOP-UNRELATED-SYNC-OR-REPORT-PROGRESS
    ar DOCUMENTED-EXCLUSIONS-PRESERVE-PAYLOADS-WHILE-ORDINARY-SIBLINGS-SYNC
-   ar EXCLUDED-PENDING-AND-BLOCKED-WORK-IS-RETIRED-ACROSS-REOPEN-WITHOUT-EFFECTS ;
+   ar EXCLUDED-PENDING-AND-BLOCKED-WORK-IS-RETIRED-ACROSS-REOPEN-WITHOUT-EFFECTS
+   ar A-VERIFIED-DOWNLOAD-STAGE-IS-NO-BLOCKED-PATH ;
 
 : SERVED ( ^ARENA:arena -- )
    {: ar :}
