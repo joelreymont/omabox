@@ -118,7 +118,6 @@ create OUT TEXT-CAP allot
 variable OUT-U
 create ASKED PATH-CAP allot
 variable ASKED-U
-TYPED-VARIABLE PARSER JSON:cursor
 TYPED-VARIABLE LOSING bool
 variable CUTS
 TYPED-VARIABLE GARBLING bool
@@ -131,13 +130,28 @@ TYPED-VARIABLE TOKEN-CUTTING bool
    s dst cap SPAN:MAKE SPAN:COPY s STR:len ;
 
 
-TYPED-VARIABLE UNESCAPED ^VEC:vector<u8>
-: UNESCAPER ( -- ) HEAP:ALLOCATOR 0 [type] u8 VEC:NEW UNESCAPED ! ;
-UNESCAPER
+\ Decodes a string value into a buffer of cap bytes and answers its
+\ length; any other value throws E-MEMBER.
+: STRING-INTO ( JSON:value ^u8 n -- n )
+   {: v d:^ cap:n :}
+   v [: d cap STORE ;] JSON:WITH-STRING ;
 
-\ Decodes the reader's string into a buffer of cap bytes and answers its length.
-: READ-INTO ( JSON:reader ^u8 n -- JSON:reader n )
-   {: d:^ cap:n :} UNESCAPED @ JSON:READ-STR d cap STORE ;
+\ The member of that name of a text that is one JSON value, none when
+\ the value is no object or lacks it.
+: MEMBER ( str str -- option<JSON:value> )
+   {: text name :}
+   text JSON:PARSE {: v :}
+   v JSON:OBJECT? 0= if OPTION:NONE exit then
+   v name JSON:FIND ;
+
+\ The string member of that name into a buffer of cap bytes, as
+\ STRING-INTO, and its length; 0 when MEMBER finds none.
+: MEMBER-INTO ( str str ^u8 n -- n )
+   {: text name d:^ cap:n :}
+   text name MEMBER MATCH option
+     none OF 0 ENDOF
+     some OF d cap STRING-INTO ENDOF
+   ;MATCH ;
 
 : AT ( ^u8 n n -- ^u8 n )
    {: base:^ cap:n i:n :}
@@ -530,13 +544,7 @@ variable FORM-AT
 : ASK ( HTTP:request -- )
    {: q:HTTP:request :}
    0 ASKED-U !
-   PARSER q HTTP:BODY$ JSON:READ-INIT
-   JSON:READ-NEXT JSON:T-OBJ = if
-      s" path" JSON:READ-FIND-KEY if
-         ASKED PATH-CAP READ-INTO ASKED-U !
-      then
-   then
-   JSON:READ-FINISH ;
+   q HTTP:BODY$ s" path" ASKED PATH-CAP MEMBER-INTO ASKED-U ! ;
 
 
 \ Dropbox's paths ignore case; this fake folds ASCII alone.
@@ -596,24 +604,18 @@ variable HELD-U
 : PARENT ( HTTP:request -- bool )
    {: q:HTTP:request :}
    0 WANT-U !
-   PARSER q HTTP:BODY$ JSON:READ-INIT
-   JSON:READ-NEXT JSON:T-OBJ = if
-      s" parent_rev" JSON:READ-FIND-KEY if
-         WANT NAME-CAP READ-INTO WANT-U ! JSON:READ-FINISH true exit
-      then
-   then
-   JSON:READ-FINISH false ;
+   q HTTP:BODY$ s" parent_rev" MEMBER MATCH option
+     none OF false ENDOF
+     some OF WANT NAME-CAP STRING-INTO WANT-U ! true ENDOF
+   ;MATCH ;
 
 
 \ The rev of entry i, empty for a folder.
 : HELD$ ( n -- str )
    {: i:n :}
    0 HELD-U !
-   PARSER i ENTRY$ JSON:READ-INIT
-   JSON:READ-NEXT JSON:T-OBJ = if
-      s" rev" JSON:READ-FIND-KEY if HELD NAME-CAP READ-INTO HELD-U ! then
-   then
-   JSON:READ-FINISH HELD HELD-U @ >str ;
+   i ENTRY$ s" rev" HELD NAME-CAP MEMBER-INTO HELD-U !
+   HELD HELD-U @ >str ;
 
 
 \ Entry i goes; the last entry takes its slot.
@@ -975,15 +977,7 @@ TYPED-VARIABLE DURING [ -- ]
    q s" Dropbox-API-Arg" HTTP:HEADER-OF$ {: v sent:bool :}
    v ARG-SENT!
    0 ASKED-U !
-   sent if
-      PARSER v JSON:READ-INIT
-      JSON:READ-NEXT JSON:T-OBJ = if
-         s" path" JSON:READ-FIND-KEY if
-            ASKED PATH-CAP READ-INTO ASKED-U !
-         then
-      then
-      JSON:READ-FINISH
-   then ;
+   sent if v s" path" ASKED PATH-CAP MEMBER-INTO ASKED-U ! then ;
 
 
 : REV$ ( -- str )
@@ -996,13 +990,7 @@ TYPED-VARIABLE DURING [ -- ]
 : ENTRY-REV ( str -- str )
    {: e :}
    0 REV-SEEN-U !
-   PARSER e JSON:READ-INIT
-   JSON:READ-NEXT JSON:T-OBJ = if
-      s" rev" JSON:READ-FIND-KEY if
-         REV-SEEN NAME-CAP READ-INTO REV-SEEN-U !
-      then
-   then
-   JSON:READ-FINISH
+   e s" rev" REV-SEEN NAME-CAP MEMBER-INTO REV-SEEN-U !
    REV-SEEN REV-SEEN-U @ >str ;
 
 
@@ -1301,35 +1289,46 @@ variable SESSIONS
 
 
 \ A string member's value into the ARG- field its key names.
-: ARG-STRING ( JSON:reader -- JSON:reader )
+: ARG-STRING ( JSON:value -- )
+   {: v :}
    ARG-KEY ARG-KEY-U @ >str {: k :}
-   k s" path" STR:= if ARG-PATH PATH-CAP READ-INTO ARG-PATH-U ! exit then
+   k s" path" STR:= if v ARG-PATH PATH-CAP STRING-INTO ARG-PATH-U ! exit then
    k s" mode" STR:= k s" .tag" STR:= or
-   if ARG-MODE NAME-CAP READ-INTO ARG-MODE-U ! exit then
-   k s" update" STR:= if ARG-REV NAME-CAP READ-INTO ARG-REV-U ! exit then
+   if v ARG-MODE NAME-CAP STRING-INTO ARG-MODE-U ! exit then
+   k s" update" STR:= if v ARG-REV NAME-CAP STRING-INTO ARG-REV-U ! exit then
    k s" content_hash" STR:=
-   if ARG-HASH NAME-CAP READ-INTO ARG-HASH-U ! exit then
+   if v ARG-HASH NAME-CAP STRING-INTO ARG-HASH-U ! exit then
    k s" session_id" STR:=
-   if ARG-SESSION NAME-CAP READ-INTO ARG-SESSION-U ! then ;
+   if v ARG-SESSION NAME-CAP STRING-INTO ARG-SESSION-U ! then ;
 
 
-: ARG-VALUE ( JSON:reader n -- JSON:reader )
-   {: t:n :}
-   t JSON:T-STR = if ARG-STRING exit then
-   t JSON:T-INT = if
-      ARG-KEY ARG-KEY-U @ >str s" offset" STR:=
-      if JSON:READ-INT ARG-OFFSET ! then
-      exit
-   then
-   JSON:READ-SKIP-VALUE ;
+: INT-BYTE? ( u8 -- bool )  dup STR:DIGIT? swap [char] - = or ;
+
+\ Whether a number is written with no fraction and no exponent.
+: INT-WRITTEN? ( JSON:value -- bool )
+   {: v :}
+   v JSON:NUMBER? 0= if false exit then
+   v JSON:TEXT$ {: t :}
+   t STR:LEN 0 ?do
+      t STR:DATA i + c@ INT-BYTE? 0= if false unloop exit then
+   loop true ;
 
 
-\ Every member of the object just opened, and of the objects in it.
-: ARG-MEMBERS ( JSON:reader -- JSON:reader )
-   begin JSON:READ-NEXT dup JSON:T-KEY = while
-      drop ARG-KEY NAME-CAP READ-INTO ARG-KEY-U !
-      JSON:READ-NEXT dup JSON:T-OBJ = if drop RECURSE else ARG-VALUE then
-   repeat drop ;
+\ A string, or a number written whole under offset, read; any other
+\ value skipped.
+: ARG-VALUE ( JSON:value -- )
+   {: v :}
+   v JSON:STRING? if v ARG-STRING exit then
+   v INT-WRITTEN? 0= if exit then
+   ARG-KEY ARG-KEY-U @ >str s" offset" STR:=
+   if v JSON:>N ARG-OFFSET ! then ;
+
+
+\ Every member of an object, and of the objects in it.
+: ARG-MEMBERS ( JSON:value -- )
+   [: swap ARG-KEY NAME-CAP STRING-INTO ARG-KEY-U !
+      dup JSON:OBJECT? if RECURSE else ARG-VALUE then ;]
+   JSON:EACH-MEMBER ;
 
 
 : ARG-READ ( HTTP:request -- )
@@ -1339,9 +1338,8 @@ variable SESSIONS
    q s" Dropbox-API-Arg" HTTP:HEADER-OF$ {: v sent:bool :}
    v ARG-SENT!
    sent 0= if exit then
-   PARSER v JSON:READ-INIT
-   JSON:READ-NEXT JSON:T-OBJ = if ARG-MEMBERS then
-   JSON:READ-FINISH ;
+   v JSON:PARSE {: j :}
+   j JSON:OBJECT? if j ARG-MEMBERS then ;
 
 
 : LOWERED$ ( -- str )
