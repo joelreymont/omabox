@@ -2734,3 +2734,51 @@ it led to held nothing this machine needed. Telling a real change elsewhere
 from Dropbox's own churn takes a listing, so each such pass is the price of
 the long poll: 0.16 s of CPU, a few times an hour while the account is in
 use.
+
+## 2026-11-26: thirteen lanes, a heap that was glibc's, and a host chain
+
+The heap that crept by a few hundred bytes a pass was not ours. With
+glibc's per-thread cache turned off, in-use bytes stayed at 425 kB through
+264 sandboxed passes; with it on they settled at 538 kB. The cache keeps
+freed chunks per thread, and `malloc_trim` does not reach them. The user
+took the 110 kB as the price of a fast malloc, and the budget is now a rule
+in AGENTS.md.
+
+Thirteen lanes ran at once against one master: three for the move to JSON
+values, one each for form encoding, the readiness datagram and prefix-only
+calls, and seven fixes from the September review. The six ports landed on
+their tests alone and merged without a conflict. All seven fixes stopped at
+least once, each on a question about design.
+
+Two lanes stopped on the same checker rule. Each wanted a record to hold a
+quotation that reads a local, which Habu refuses (`E-LOCAL-ESCAPE`): one to
+call back with each upload checkpoint, one to carry the change that `setup`
+makes while the service is stopped. Rust would accept both with a lifetime
+on the struct. In Habu there is no way to scope a record to a block, so the
+design moved instead. The setup change became a sum type the machine
+matches. The checkpoint became a state in the upload table, which the
+driver answers as it already answers "streaming". Both read better than the
+callbacks did, and both put one more step where the model sees it.
+
+Keeping Habu at its latest master cost a bisection. Master had moved 115
+commits past what the installed `hb` could build. One commit adds a file to
+the boot list and calls it in the same change, so no host before it can
+build it, and no revision exists in history to bridge it. Five intermediate
+hosts, one of them a hand-made cut, carried 8d9c9162 to fb17ab33; the
+chain then reached its fixpoint at the second generation. Habu's own
+answer is a seed that a current host cross-builds. Its next master moved
+the test library and made every file require what it calls, so Omabox needs
+a port before it builds again.
+
+Observations for the blog:
+- A checker that refuses a pattern outright costs a redesign where Rust
+  would cost an annotation. Here both redesigns were improvements, which
+  is not guaranteed.
+- Parsing to values instead of walking a cursor made one behaviour
+  stricter: a repeated member name is now an error. Nothing Omabox writes
+  or Dropbox sends repeats one, so the stricter parser stays.
+- Dropbox's lowercase and Habu's can disagree. U+13A0 is uppercase in
+  Habu's tables, so a Dropbox `path_lower` holding it is not lowercase to
+  Habu, and the journal's key check refused it on every later delta. The
+  fix keys every remote entry by Habu's fold of `path_lower`, so both sides
+  use one definition of "the same name".
