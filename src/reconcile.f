@@ -1060,11 +1060,11 @@ ENUM file-copy-origin
 
 \ ---- listing changes -----------------------------------------------
 
-\ Rust's DropboxRoot: the configured root, lowercase, and its count of
+\ Rust's DropboxRoot: the configured root, its fold, and its count of
 \ components.
 STRUCTURE listing-root
    FIELD path str
-   FIELD lower str
+   FIELD fold str
    FIELD depth n
 ;STRUCTURE
 
@@ -1088,14 +1088,10 @@ STRUCTURE casing
    d str> nip 0<> if s"  `" LOG:TEXT+ d LOG:TEXT+ s" `" LOG:TEXT+ then
    LOG:;LINE E-LISTING throw ;
 
-\ The valid UTF-8 bytes lowercased, in the arena.
-: LOWERED ( str ^ARENA:arena -- str )
+\ The bytes folded as a path, in the arena.
+: FOLDED ( str ^ARENA:arena -- str )
    {: s:str ar :}
-   s str> nip 0= if s" " exit then
-   s UNICODE:LOWERED-BYTES {: size:n :}
-   ar size ARENA:ALLOC drop {: dst:^ :}
-   s dst size UNICODE:LOWER drop
-   dst size >str ;
+   s MODEL:>PATH ar MODEL:FOLD KEY-BYTES ;
 
 \ Rust's DropboxRoot::new over the binding's remote root.
 : NEW-LISTING-ROOT ( str ^ARENA:arena -- listing-root )
@@ -1103,28 +1099,21 @@ STRUCTURE casing
    s DROPBOX:ROOT-PATH? 0= if
       DROPBOX:E-ROOT-PATH ERROR:TEXT$ LISTING-FAILED
    then
-   s s ar LOWERED s SEPARATOR STR:COUNT-CHAR LISTING-ROOT-MAKE ;
+   s s ar FOLDED s SEPARATOR STR:COUNT-CHAR LISTING-ROOT-MAKE ;
 
-: ROOT-LOWER ( listing-root -- str )
-   LISTING-ROOT-UNMAKE {: p:str l:str depth:n :} l ;
+: ROOT-FOLD ( listing-root -- str )
+   LISTING-ROOT-UNMAKE {: p:str f:str depth:n :} f ;
 
 : ROOT-DEPTH ( listing-root -- n )
-   LISTING-ROOT-UNMAKE {: p:str l:str depth:n :} depth ;
+   LISTING-ROOT-UNMAKE {: p:str f:str depth:n :} depth ;
 
-\ Whether the display path lowercases to the lower one, both valid
-\ UTF-8 as Rust's strings are.
-: LOWERS? ( str str -- bool )
-   {: l:str d:str :}
-   l UTF8:VALID? d UTF8:VALID? and 0= if false exit then
-   d l UNICODE:LOWERS-TO? ;
-
-\ The index of the key in the lower path: past the root's lower path
+\ The index of the key in the folded lower path: past the root's fold
 \ and a separator, or -1.
 : KEY-START ( str str -- n )
-   {: ls:str rl:str :}
+   {: ls:str rf:str :}
    ls str> {: l:^ lu:n :}
-   rl str> nip {: ru:n :}
-   ls rl STR:STARTS-WITH? 0= if -1 exit then
+   rf str> nip {: ru:n :}
+   ls rf STR:STARTS-WITH? 0= if -1 exit then
    lu ru <= if -1 exit then
    l ru + c@ SEPARATOR <> if -1 exit then
    ru 1+ ;
@@ -1139,31 +1128,49 @@ STRUCTURE casing
       then
    loop drop -1 ;
 
-\ Whether key and path bytes have as many components, none invalid.
-: FITTING? ( str str -- bool )
-   {: k:str p:str :}
-   k SEPARATOR STR:COUNT-CHAR p SEPARATOR STR:COUNT-CHAR <>
-   if false exit then
-   k DROPBOX:INVALID-PARTS? p DROPBOX:INVALID-PARTS? or 0= ;
-
-\ Rust's relative_paths: the key and display path beneath the root of
-\ the entry's lower and display paths, in the arena.
-: RELATIVE-PATHS
-   ( str str listing-root ^ARENA:arena -- MODEL:key MODEL:path )
+\ The key, the fold of the lower path l beneath the root, in the arena;
+\ d names the entry if l is outside the root or has an invalid part.
+: LOWER-KEY ( str str listing-root ^ARENA:arena -- MODEL:key )
    {: l:str d:str root ar :}
-   l root ROOT-LOWER KEY-START {: ks:n :}
-   d root ROOT-DEPTH 1+ PAST-SEPARATORS {: ps:n :}
-   l d LOWERS? ks 0 >= and ps 0 >= and 0= if d BAD-PATH then
-   l ks l str> nip PART {: k:str :}
-   d ps d str> nip PART {: p:str :}
-   k p FITTING? 0= if d BAD-PATH then
-   k ar ARENA:COPY MODEL:>KEY p ar ARENA:COPY MODEL:>PATH ;
+   l DROPBOX:ROOT-PATH? 0= if d BAD-PATH then
+   l ar FOLDED {: f:str :}
+   f root ROOT-FOLD KEY-START {: ks:n :}
+   ks 0 < if d BAD-PATH then
+   f ks f str> nip PART MODEL:>KEY ;
 
-: OWN-ENTRY? ( ^DROPBOX:entry listing-root -- bool )
-   {: e root :}
-   root ROOT-LOWER {: r:str :}
+\ The display path d past the root's depth, empty when d has no part
+\ there.
+: DISPLAY-PART ( str listing-root -- str )
+   {: d:str root :}
+   d root ROOT-DEPTH 1+ PAST-SEPARATORS {: ps:n :}
+   ps 0 < if s" " exit then
+   d ps d str> nip PART ;
+
+\ Whether the display part p spells the key k; an empty one never does.
+: FITTING? ( MODEL:key str ^ARENA:arena -- bool )
+   {: k p:str ar :}
+   k KEY-BYTES SEPARATOR STR:COUNT-CHAR p SEPARATOR STR:COUNT-CHAR <>
+   if false exit then
+   p DROPBOX:INVALID-PARTS? if false exit then
+   p MODEL:>PATH ar MODEL:FOLD k MODEL:KEY= ;
+
+\ Whether the key k is the lower path l's own part beneath the root.
+: OWN-KEY? ( MODEL:key str listing-root -- bool )
+   {: k l:str root :}
+   l root ROOT-DEPTH 1+ PAST-SEPARATORS {: ls:n :}
+   ls 0 < if false exit then
+   k KEY-BYTES l ls l str> nip PART STR:= ;
+
+\ Whether the entry is the root's own: its lower path, valid, folds to
+\ the root's fold.
+: OWN-ENTRY? ( ^DROPBOX:entry listing-root ^ARENA:arena -- bool )
+   {: e root ar :}
+   root ROOT-FOLD {: r:str :}
    r str> nip 0= if false exit then
-   e DROPBOX-ENTRY:LOWER @ SPAN:$ r STR:= ;
+   e DROPBOX-ENTRY:LOWER @ SPAN:$ {: l:str :}
+   l SEPARATOR STR:COUNT-CHAR root ROOT-DEPTH <> if false exit then
+   l DROPBOX:ROOT-PATH? 0= if false exit then
+   l ar FOLDED r STR:= ;
 
 
 : RESTRICTED-ROOT ( ^DROPBOX:entry -- )
@@ -1233,12 +1240,13 @@ STRUCTURE casing
    k p o MODEL-REMOTE--RECORD:MAKE
    JOURNAL-REMOTE--INVENTORY--CHANGE:UPSERT v VEC:PUSH ! ;
 
+: UNSUPPORTED-REMOTE ( -- MODEL:observation<MODEL:remote> )
+   MODEL-UNKNOWN--REASON:UNSUPPORTED MODEL-OBSERVATION:UNKNOWN ;
+
 : FILE-OBSERVATION
    ( ^DROPBOX:entry ^ARENA:arena -- MODEL:observation<MODEL:remote> )
    {: e ar :}
-   e DROPBOX-ENTRY:DOWNLOADABLE @ 0= if
-      MODEL-UNKNOWN--REASON:UNSUPPORTED MODEL-OBSERVATION:UNKNOWN exit
-   then
+   e DROPBOX-ENTRY:DOWNLOADABLE @ 0= if UNSUPPORTED-REMOTE exit then
    e DROPBOX:COMPLETE? 0= if
       MODEL-UNKNOWN--REASON:INCOMPLETE MODEL-OBSERVATION:UNKNOWN exit
    then
@@ -1266,18 +1274,59 @@ STRUCTURE casing
       deleted OF k v DELETE+ ENDOF
    ;MATCH ;
 
-\ Rust's append_entry_changes for one entry, which a listing calls for
-\ each.
+: UNSUPPORTED-KEY+
+   ( ^DROPBOX:entry MODEL:key
+     ^VEC:vector<JOURNAL:remote-inventory-change>
+     [ ^DROPBOX:entry MODEL:key -- ] -- )
+   {: e k v mismatched :}
+   UNSUPPORTED-REMOTE k k KEY-BYTES MODEL:>PATH v UPSERT+
+   e k mismatched execute ;
+
+\ A deleted entry deletes at its own key; at a key it shares, it is
+\ unsupported there.
+: DELETED-MISMATCHED
+   ( ^DROPBOX:entry MODEL:key
+     ^VEC:vector<JOURNAL:remote-inventory-change> bool
+     [ ^DROPBOX:entry MODEL:key -- ] -- )
+   {: e k v own:bool mismatched :}
+   own if k v DELETE+ exit then
+   e k v mismatched UNSUPPORTED-KEY+ ;
+
+\ A file or folder unsupported at the key, spelled as the key, then
+\ mismatched on it and the key; own tells whether the key is the
+\ entry's own.
+: APPEND-MISMATCHED
+   ( ^DROPBOX:entry MODEL:key
+     ^VEC:vector<JOURNAL:remote-inventory-change> bool
+     [ ^DROPBOX:entry MODEL:key -- ] -- )
+   {: e k v own:bool mismatched :}
+   e DROPBOX-ENTRY:KIND @ MATCH DROPBOX:kind
+      file OF k v DELETE+ e k v mismatched UNSUPPORTED-KEY+ ENDOF
+      folder OF
+         e DROPBOX-ENTRY:RESTRICTED @ if k v DELETE+ then
+         e k v mismatched UNSUPPORTED-KEY+
+      ENDOF
+      deleted OF e k v own mismatched DELETED-MISMATCHED ENDOF
+   ;MATCH ;
+
+\ Rust's append_entry_changes for one entry, paths UTF-8 as Rust's are;
+\ mismatched runs on an entry whose parts do not fold to its own key.
 : APPEND-ENTRY-CHANGES
    ( ^DROPBOX:entry listing-root
-     ^VEC:vector<JOURNAL:remote-inventory-change> ^ARENA:arena -- )
-   {: e root v ar :}
+     ^VEC:vector<JOURNAL:remote-inventory-change> ^ARENA:arena
+     [ ^DROPBOX:entry MODEL:key -- ] -- )
+   {: e root v ar mismatched :}
    e DROPBOX-ENTRY:LOWER @ SPAN:$ {: l:str :}
    e DROPBOX-ENTRY:DISPLAY @ SPAN:$ {: d:str :}
-   l str> nip 0= d str> nip 0= or if d BAD-PATH then
-   e root OWN-ENTRY? if e ROOT-ENTRY exit then
-   l d root ar RELATIVE-PATHS {: k p :}
-   e k p v ar APPEND-OBSERVED ;
+   l str> nip 0= if d BAD-PATH then
+   e root ar OWN-ENTRY? if e ROOT-ENTRY exit then
+   l d root ar LOWER-KEY {: k :}
+   d root DISPLAY-PART {: p:str :}
+   k l root OWN-KEY? {: own:bool :}
+   own k p ar FITTING? and 0= if
+      e k v own mismatched APPEND-MISMATCHED exit
+   then
+   e k p ar ARENA:COPY MODEL:>PATH v ar APPEND-OBSERVED ;
 
 : CHANGE-KEY ( JOURNAL:remote-inventory-change -- MODEL:key )
    MATCH JOURNAL:remote-inventory-change
@@ -1681,8 +1730,16 @@ STRUCTURE casing
 
 \ ---- the listing ---------------------------------------------------
 
+\ A mismatched entry's display and lower paths and its key, in the
+\ refresh's arena.
+STRUCTURE mismatch
+   FIELD display str
+   FIELD lower str
+   FIELD key MODEL:key
+;STRUCTURE
+
 \ One refresh of the remote inventory: cursor is the journal's, changes
-\ the current listing's entries.
+\ and mismatches the current listing's entries.
 STRUCTURE refresh DERIVE addr
    FIELD journal JOURNAL:journal
    FIELD link ^REPLAY:link
@@ -1690,6 +1747,7 @@ STRUCTURE refresh DERIVE addr
    FIELD arena ^ARENA:arena
    FIELD cursor DROPBOX:cursor
    FIELD changes ^VEC:vector<JOURNAL:remote-inventory-change>
+   FIELD mismatches ^VEC:vector<mismatch>
 ;STRUCTURE
 
 ARENA REFRESHES refresh
@@ -1712,23 +1770,66 @@ ENUM listed done ;ENUM
    REFRESH-LINK @ REPLAY-LINK:CLIENT @ ;
 
 : LISTING-PATH ( listing-root -- str )
-   LISTING-ROOT-UNMAKE {: p:str l:str depth:n :} p ;
+   LISTING-ROOT-UNMAKE {: p:str f:str depth:n :} p ;
 
 \ The cursor of the listing the client finished last.
 : LISTED-CURSOR ( ^refresh -- DROPBOX:cursor )
    CLIENT DROPBOX:CURSOR DROPBOX:>CURSOR ;
 
-\ Every listing starts with no changes, so a reset drops the delta's.
+\ Every listing starts with no changes or mismatches, so a reset drops
+\ the delta's.
 : FRESH ( ^refresh -- )
    {: r :}
-   r REFRESH-ARENA @ ARENA:ALLOCATOR 0
-   [type] JOURNAL:remote-inventory-change VEC:NEW
-   r REFRESH-CHANGES ! ;
+   r REFRESH-ARENA @ ARENA:ALLOCATOR {: a :}
+   a 0 [type] JOURNAL:remote-inventory-change VEC:NEW
+   r REFRESH-CHANGES !
+   a 0 [type] mismatch VEC:NEW r REFRESH-MISMATCHES ! ;
+
+\ The entry's paths and key, kept past its page.
+: MISMATCH+ ( ^DROPBOX:entry MODEL:key ^refresh -- )
+   {: e k r :}
+   r REFRESH-ARENA @ {: ar :}
+   e DROPBOX-ENTRY:DISPLAY @ SPAN:$ ar ARENA:COPY
+   e DROPBOX-ENTRY:LOWER @ SPAN:$ ar ARENA:COPY
+   k MISMATCH-MAKE r REFRESH-MISMATCHES @ VEC:PUSH ! ;
+
+: MISMATCH-LOG ( mismatch -- )
+   MISMATCH-UNMAKE {: d:str l:str k :}
+   LOG:WARN s" reconcile" LOG:LINE s" Dropbox path `" LOG:TEXT+
+   d l STR:= if
+      l LOG:TEXT+ s" ` is not its own lowercase" LOG:TEXT+
+   else
+      d LOG:TEXT+ s" ` does not fold to `" LOG:TEXT+
+      l LOG:TEXT+ s" `" LOG:TEXT+
+   then
+   s" ; it is kept unsupported" LOG:TEXT+ LOG:;LINE ;
+
+: UNSUPPORTED-HELD? ( MODEL:key ^refresh -- bool )
+   {: k r :}
+   k KEY-BYTES r REFRESH-JOURNAL @ r REFRESH-ARENA @ REMOTE-REASON-AT
+   MATCH option
+      none OF false ENDOF
+      some OF UNSUPPORTED-REASON? ENDOF
+   ;MATCH ;
+
+\ Logs a mismatched entry unless an earlier pass published its key
+\ unsupported.
+: MISMATCHED ( mismatch ^refresh -- )
+   {: m r :}
+   m MISMATCH-UNMAKE {: d:str l:str k :}
+   k r UNSUPPORTED-HELD? if exit then
+   m MISMATCH-LOG ;
+
+\ Logs the listing's mismatched entries, before the journal holds them.
+: MISMATCHES-LOG ( ^refresh -- )
+   {: r :}
+   r REFRESH-MISMATCHES @ {: ms :}
+   ms VEC:COUNT 0 ?do ms i VEC:AT @ r MISMATCHED loop ;
 
 : ENTRY+ ( ^DROPBOX:entry ^refresh -- )
    {: e r :}
    e r REFRESH-ROOT @ r REFRESH-CHANGES @ r REFRESH-ARENA @
-   APPEND-ENTRY-CHANGES ;
+   [: r MISMATCH+ ;] APPEND-ENTRY-CHANGES ;
 
 : STORED ( ^refresh -- stored-cursor )
    {: r :}
@@ -1777,12 +1878,14 @@ ENUM listed done ;ENUM
    {: r :}
    r REFRESH-CHANGES @ r REFRESH-JOURNAL @ r REFRESH-ARENA @
    NORMALIZE-INVENTORY-CHANGES {: cs :}
+   r MISMATCHES-LOG
    r REFRESH-JOURNAL @ r LISTED-CURSOR cs
    JOURNAL:APPLY-REMOTE-INVENTORY-DELTA ;
 
 : PUBLISH ( ^refresh -- )
    {: r :}
    r REFRESH-CHANGES @ r REFRESH-ARENA @ INVENTORY-RECORDS {: rs :}
+   r MISMATCHES-LOG
    r REFRESH-JOURNAL @ r LISTED-CURSOR rs
    JOURNAL:PUBLISH-REMOTE-INVENTORY ;
 

@@ -59,15 +59,28 @@
 \ - folders_are_directories_and_non_downloadable_files_are_unknown
 \ - directory_records_normalize_inconsistent_child_ancestor_casing
 \ - delta_never_respells_a_directory_that_still_exists
-\ - listing_rejects_mismatched_canonical_and_display_paths, its one
-\   line logged
 \ - listing_classifies_the_remote_roots_own_entry, each refusal's one
 \   line logged
+\ - LISTING-KEEPS-MISMATCHED-PATHS-UNSUPPORTED: a file and a folder
+\   whose display path does not lowercase to the lower one are
+\   unsupported at the lower path, their ancestors respelled, each handed
+\   on once with its key; a deleted one deletes there, handed on to
+\   none.
+\ - MISMATCHED-RESTRICTED-FOLDER-DROPS-ITS-CHILDREN: a restricted folder
+\   whose display path folds elsewhere is unsupported and its listed
+\   children go.
+\ - TWO-SPELLINGS-SHARE-ONE-KEY: /U+13A0.txt, uppercase in Habu's tables,
+\   as both its paths, then /U+AB70.txt, its lowercase: the first is
+\   handed on with the key U+AB70.txt, which the second's record holds;
+\   a delete of the first keeps the key's record, unsupported, and a
+\   delete of the second removes its own.
 \ - LISTING-REJECTS-AN-INVALID-CONFIGURED-ROOT: a/b, /a/, /a//b and a
 \   root that is not UTF-8 each throw E-LISTING, one line logged.
 \ - LISTING-REJECTS-AN-ENTRY-WITHOUT-PATHS and
 \   LISTING-REJECTS-A-PATH-THAT-IS-NOT-UTF-8, an 0xFF byte: E-LISTING,
 \   one line logged, naming no path for the first.
+\ - LISTING-REJECTS-AN-INVALID-OR-OUT-OF-ROOT-ENTRY: /a//b.txt, and
+\   /other/x below the root /Sync: E-LISTING, one line logged.
 \ The listing against the fake Dropbox, Rust's tests of the same names,
 \ the fake's requests standing for Rust's refresh result:
 \ - cursor_reset_rebuilds_before_one_complete_publication
@@ -80,6 +93,25 @@
 \   entries in pages of 2 000 within 5 s, the time printed
 \ - incomplete_downloadable_metadata_publishes_as_unknown_incomplete
 \ - restricted_later_page_publishes_as_unknown_inaccessible
+\ - MISMATCHED-ENTRY-PUBLISHES-AS-UNSUPPORTED: a full listing of a good
+\   file and one whose display path does not lowercase to its lower
+\   path, then a delta listing the second again: the good one is
+\   present, the other unsupported at its lower path, and one line
+\   logged names it.
+\ - UNLOWERED-PATH-PUBLISHES-AT-ITS-FOLD: two deltas each list /U+13A0.txt,
+\   uppercase in Habu's tables, as both its display and lower path; each
+\   publishes it unsupported at the key U+AB70.txt, and one line logged
+\   names it.
+\ - MISMATCH-LOGGED-ONCE-AFTER-A-FAILED-PAGE: a delta whose later page
+\   fails lists a mismatched file, then the next delta lists it and
+\   publishes: it is unsupported, and one line logged names it.
+\ - EXTRA-COMPONENT-PUBLISHES-AS-UNSUPPORTED: a full listing of a good
+\   file and one whose display path has a component more than its lower
+\   path: the good one is present, the other unsupported at its lower
+\   path, and one line logged names it.
+\ - UNLOWERED-ROOT-LISTS-ITS-ENTRIES: a full listing of the root
+\   /U+13A0, its lower path unlowered as well, with its own entry, a
+\   file and a folder: both are published beneath it.
 \ The replay step against the fake Dropbox, Rust's tests of the same
 \ names, one REPLAY-STEP standing for one drive_replay:
 \ - worker_verification_mismatch_durably_blocks_its_plan
@@ -1728,9 +1760,30 @@ ARENA LISTED DROPBOX:entry
    {: p:str ar :}
    p ar NEW-LISTING-ROOT ;
 
+\ A text that grows in the arena.
+: NO-TEXT ( ^ARENA:arena -- ^VEC:vector<u8> )
+   ARENA:ALLOCATOR 0 [type] u8 VEC:NEW ;
+
+: TEXT+ ( ^VEC:vector<u8> str -- )
+   {: v s:str :}
+   s str> {: a:^ u:n :}
+   v VEC:COUNT {: at:n :}
+   v at u + VEC:RESIZE
+   a v at VEC:AT u BYTE-COPY ;
+
+: TEXT>STR ( ^VEC:vector<u8> -- str )
+   {: v :}
+   v 0 VEC:AT v VEC:COUNT >str ;
+
 : NO-CHANGES
    ( ^ARENA:arena -- ^VEC:vector<JOURNAL:remote-inventory-change> )
    ARENA:ALLOCATOR 0 [type] JOURNAL:remote-inventory-change VEC:NEW ;
+
+\ The entry's changes; a mismatched entry is not logged.
+: APPENDED
+   ( ^DROPBOX:entry listing-root
+     ^VEC:vector<JOURNAL:remote-inventory-change> ^ARENA:arena -- )
+   [: 2drop ;] APPEND-ENTRY-CHANGES ;
 
 \ The record at the key in a listing's records.
 : RECORD-IN
@@ -1795,11 +1848,11 @@ ARENA LISTED DROPBOX:entry
    T-LABEL
    s" " ar LISTING-AT {: root :}
    ar NO-CHANGES {: v :}
-   s" /folder" s" /Folder" ar FOLDER-ENTRY root v ar APPEND-ENTRY-CHANGES
+   s" /folder" s" /Folder" ar FOLDER-ENTRY root v ar APPENDED
    s" /paper" s" /Paper" ar FILE-ENTRY {: paper :}
    false paper DROPBOX-ENTRY:DOWNLOADABLE !
    s" " str> SPAN:MAKE paper DROPBOX-ENTRY:CONTENT-HASH !
-   paper root v ar APPEND-ENTRY-CHANGES
+   paper root v ar APPENDED
    v ar INVENTORY-RECORDS {: rs :}
    rs VEC:COUNT 2 T=
    rs s" folder" ar CANONICAL OBSERVED-IN REMOTE-DIRECTORY
@@ -1815,11 +1868,11 @@ ARENA LISTED DROPBOX:entry
    T-LABEL
    s" " ar LISTING-AT {: root :}
    ar NO-CHANGES {: v :}
-   s" /apps" s" /apps" ar FOLDER-ENTRY root v ar APPEND-ENTRY-CHANGES
+   s" /apps" s" /apps" ar FOLDER-ENTRY root v ar APPENDED
    s" /apps/day one/entry.doentry" s" /Apps/day one/Entry.doentry"
-   ar FILE-ENTRY root v ar APPEND-ENTRY-CHANGES
+   ar FILE-ENTRY root v ar APPENDED
    s" /apps/day one" s" /Apps/Day One" ar FOLDER-ENTRY
-   root v ar APPEND-ENTRY-CHANGES
+   root v ar APPENDED
    v ar INVENTORY-RECORDS {: rs :}
    rs s" apps" ar PATH-OF s" apps" T$=
    rs s" apps/day one" ar PATH-OF s" apps/Day One" T$=
@@ -1847,40 +1900,121 @@ ARENA LISTED DROPBOX:entry
    j ar EXISTING
    s" " ar LISTING-AT {: root :}
    ar NO-CHANGES {: v :}
-   s" /apps" s" /apps" ar FOLDER-ENTRY root v ar APPEND-ENTRY-CHANGES
+   s" /apps" s" /apps" ar FOLDER-ENTRY root v ar APPENDED
    s" /apps/day one/journal" s" /apps/day one/Journal" ar FOLDER-ENTRY
-   root v ar APPEND-ENTRY-CHANGES
+   root v ar APPENDED
    v j ar DELTA-PATHS s" Apps|Apps|Apps/Day One|Apps/Day One/Journal|" T$=
    ar NO-CHANGES {: w :}
    s" /apps/day one" s" /apps/day one" ar DELETED-ENTRY
-   root w ar APPEND-ENTRY-CHANGES
+   root w ar APPENDED
    s" /apps/day one" s" /apps/DAY ONE" ar FOLDER-ENTRY
-   root w ar APPEND-ENTRY-CHANGES
+   root w ar APPENDED
    w j ar DELTA-PATHS s" Apps|Apps/DAY ONE|" T$=
    ar NO-CHANGES {: x :}
-   s" /apps" s" /apps" ar DELETED-ENTRY root x ar APPEND-ENTRY-CHANGES
+   s" /apps" s" /apps" ar DELETED-ENTRY root x ar APPENDED
    s" /apps/day one/journal" s" /APPS/DAY ONE/Journal" ar FOLDER-ENTRY
-   root x ar APPEND-ENTRY-CHANGES
+   root x ar APPENDED
    x j ar DELTA-PATHS s" APPS|APPS/DAY ONE|APPS/DAY ONE/Journal|" T$=
    ar NO-CHANGES {: y :}
-   s" /apps" s" /apps" ar FOLDER-ENTRY root y ar APPEND-ENTRY-CHANGES
+   s" /apps" s" /apps" ar FOLDER-ENTRY root y ar APPENDED
    y j ar DELTA-PATHS s" Apps|" T$=
    d j GONE ;
 
-: LISTING-REJECTS-MISMATCHED-CANONICAL-AND-DISPLAY-PATHS
-   ( ^ARENA:arena -- )
+\ The keys a mismatched entry was handed on with, each then |.
+: MISMATCHED+ ( ^DROPBOX:entry MODEL:key ^VEC:vector<u8> -- )
+   {: e k t :}
+   t k KEY-BYTES TEXT+ t s" |" TEXT+ ;
+
+: LISTING-KEEPS-MISMATCHED-PATHS-UNSUPPORTED ( ^ARENA:arena -- )
    {: ar :}
-   s" listing_rejects_mismatched_canonical_and_display_paths" T-LABEL
-   s" reconcile-test" FS:MKTEMP-DIR ar ARENA:COPY {: d:str :}
+   s" listing keeps mismatched paths unsupported" T-LABEL
+   s" " ar LISTING-AT {: root :}
+   ar NO-TEXT {: t :}
+   ar NO-CHANGES {: v :}
+   s" /docs" s" /Docs" ar FOLDER-ENTRY root v ar APPENDED
+   s" /report.txt" s" /Different.txt" ar FILE-ENTRY
+   root v ar [: t MISMATCHED+ ;] APPEND-ENTRY-CHANGES
+   s" /docs/odd" s" /Docs/Even" ar FOLDER-ENTRY
+   root v ar [: t MISMATCHED+ ;] APPEND-ENTRY-CHANGES
+   s" /docs/good.txt" s" /Docs/Good.txt" ar FILE-ENTRY root v ar APPENDED
+   t TEXT>STR s" report.txt|docs/odd|" T$=
+   v ar INVENTORY-RECORDS {: rs :}
+   rs RECORD-PATHS$ s" Docs|Docs/Good.txt|Docs/odd|report.txt|" T$=
+   rs s" report.txt" ar CANONICAL OBSERVED-IN
+   MODEL-UNKNOWN--REASON:UNSUPPORTED REMOTE-UNKNOWN
+   MODEL:REMOTE-OBSERVATION= TTRUE
+   rs s" docs/odd" ar CANONICAL OBSERVED-IN
+   MODEL-UNKNOWN--REASON:UNSUPPORTED REMOTE-UNKNOWN
+   MODEL:REMOTE-OBSERVATION= TTRUE
+   s" /report.txt" s" /Gone.txt" ar DELETED-ENTRY
+   root v ar [: t MISMATCHED+ ;] APPEND-ENTRY-CHANGES
+   t TEXT>STR s" report.txt|docs/odd|" T$=
+   v ar INVENTORY-RECORDS RECORD-PATHS$
+   s" Docs|Docs/Good.txt|Docs/odd|" T$= ;
+
+: MISMATCHED-RESTRICTED-FOLDER-DROPS-ITS-CHILDREN ( ^ARENA:arena -- )
+   {: ar :}
+   s" mismatched restricted folder drops its children" T-LABEL
    s" " ar LISTING-AT {: root :}
    ar NO-CHANGES {: v :}
-   s" /report.txt" s" /Different.txt" ar FILE-ENTRY {: e :}
-   d [: [: e root v ar APPEND-ENTRY-CHANGES ;] E-LISTING TTHROWSQ ;]
-   ar LOGGED {: t:str :}
-   t 10 STR:COUNT-CHAR 1 T=
-   t s" invalid or out-of-root path `/Different.txt`" STR:CONTAINS? TTRUE
-   v ar INVENTORY-RECORDS VEC:COUNT 0 T=
-   d FS:REMOVE-TREE ;
+   s" /docs/odd" s" /Docs/odd" ar FOLDER-ENTRY root v ar APPENDED
+   s" /docs/odd/a.txt" s" /Docs/odd/A.txt" ar FILE-ENTRY
+   root v ar APPENDED
+   s" /docs/odd" s" /Docs/Even" ar FOLDER-ENTRY {: e :}
+   true e DROPBOX-ENTRY:RESTRICTED !
+   e root v ar APPENDED
+   v ar INVENTORY-RECORDS {: rs :}
+   rs RECORD-PATHS$ s" Docs|Docs/odd|" T$=
+   rs s" docs/odd" ar CANONICAL OBSERVED-IN
+   MODEL-UNKNOWN--REASON:UNSUPPORTED REMOTE-UNKNOWN
+   MODEL:REMOTE-OBSERVATION= TTRUE ;
+
+\ /U+13A0.txt, uppercase in Habu's tables, and /U+AB70.txt, its
+\ lowercase, whose key is U+AB70.txt.
+: UNLOWERED$ ( -- str ) S\" /\xe1\x8e\xa0.txt" ;
+: LOWERED$ ( -- str ) S\" /\xea\xad\xb0.txt" ;
+: LOWERED-KEY$ ( -- str ) S\" \xea\xad\xb0.txt" ;
+
+\ Changes for /U+13A0.txt, then /U+AB70.txt, each as both its paths;
+\ the keys handed on go to t.
+: BOTH-SPELLINGS
+   ( ^VEC:vector<u8> listing-root ^ARENA:arena
+     -- ^VEC:vector<JOURNAL:remote-inventory-change> )
+   {: t root ar :}
+   ar NO-CHANGES {: v :}
+   UNLOWERED$ UNLOWERED$ ar FILE-ENTRY
+   root v ar [: t MISMATCHED+ ;] APPEND-ENTRY-CHANGES
+   LOWERED$ LOWERED$ ar FILE-ENTRY
+   root v ar [: t MISMATCHED+ ;] APPEND-ENTRY-CHANGES
+   v ;
+
+\ The changes' one record is at U+AB70.txt; whether it is unsupported.
+: LOWERED-UNSUPPORTED?
+   ( ^VEC:vector<JOURNAL:remote-inventory-change> ^ARENA:arena
+     -- bool )
+   {: v ar :}
+   v ar INVENTORY-RECORDS {: rs :}
+   rs RECORD-PATHS$ S\" \xea\xad\xb0.txt|" T$=
+   rs LOWERED-KEY$ ar CANONICAL OBSERVED-IN
+   MODEL-UNKNOWN--REASON:UNSUPPORTED REMOTE-UNKNOWN
+   MODEL:REMOTE-OBSERVATION= ;
+
+: TWO-SPELLINGS-SHARE-ONE-KEY ( ^ARENA:arena -- )
+   {: ar :}
+   s" two spellings share one key" T-LABEL
+   s" " ar LISTING-AT {: root :}
+   ar NO-TEXT {: t :}
+   t root ar BOTH-SPELLINGS {: v :}
+   v ar LOWERED-UNSUPPORTED? TFALSE
+   UNLOWERED$ UNLOWERED$ ar DELETED-ENTRY
+   root v ar [: t MISMATCHED+ ;] APPEND-ENTRY-CHANGES
+   v ar LOWERED-UNSUPPORTED? TTRUE
+   t root ar BOTH-SPELLINGS {: w :}
+   LOWERED$ LOWERED$ ar DELETED-ENTRY
+   root w ar [: t MISMATCHED+ ;] APPEND-ENTRY-CHANGES
+   w ar INVENTORY-RECORDS VEC:COUNT 0 T=
+   t TEXT>STR
+   S\" \xea\xad\xb0.txt|\xea\xad\xb0.txt|\xea\xad\xb0.txt|" T$= ;
 
 \ The configured root p refused: E-LISTING and its one line.
 : ROOT-PATH-REFUSED ( str str ^ARENA:arena -- )
@@ -1902,19 +2036,23 @@ ARENA LISTED DROPBOX:entry
    s\" /a\xFF" d ar ROOT-PATH-REFUSED
    d FS:REMOVE-TREE ;
 
-\ The entry e refused as an invalid path: E-LISTING, its one line,
-\ nothing listed; the line's text.
-: ENTRY-REFUSED ( ^DROPBOX:entry str ^ARENA:arena -- str )
-   {: e d:str ar :}
-   s" " ar LISTING-AT {: root :}
+\ The entry e refused below the root as an invalid path: E-LISTING, its
+\ one line, nothing listed; the line's text.
+: ENTRY-REFUSED-AT
+   ( ^DROPBOX:entry listing-root str ^ARENA:arena -- str )
+   {: e root d:str ar :}
    ar NO-CHANGES {: v :}
-   d [: [: e root v ar APPEND-ENTRY-CHANGES ;] E-LISTING TTHROWSQ ;]
+   d [: [: e root v ar APPENDED ;] E-LISTING TTHROWSQ ;]
    ar LOGGED {: t:str :}
    t 10 STR:COUNT-CHAR 1 T=
    t s" Dropbox listing contained an invalid or out-of-root path"
    STR:CONTAINS? TTRUE
    v ar INVENTORY-RECORDS VEC:COUNT 0 T=
    t ;
+
+: ENTRY-REFUSED ( ^DROPBOX:entry str ^ARENA:arena -- str )
+   {: e d:str ar :}
+   e s" " ar LISTING-AT d ar ENTRY-REFUSED-AT ;
 
 : LISTING-REJECTS-AN-ENTRY-WITHOUT-PATHS ( ^ARENA:arena -- )
    {: ar :}
@@ -1932,6 +2070,15 @@ ARENA LISTED DROPBOX:entry
    d ar ENTRY-REFUSED drop
    d FS:REMOVE-TREE ;
 
+: LISTING-REJECTS-AN-INVALID-OR-OUT-OF-ROOT-ENTRY ( ^ARENA:arena -- )
+   {: ar :}
+   s" listing rejects an invalid or out-of-root entry" T-LABEL
+   s" reconcile-test" FS:MKTEMP-DIR ar ARENA:COPY {: d:str :}
+   s" /a//b.txt" s" /a//b.txt" ar FILE-ENTRY d ar ENTRY-REFUSED drop
+   s" /other/x" s" /other/x" ar FILE-ENTRY s" /Sync" ar LISTING-AT
+   d ar ENTRY-REFUSED-AT drop
+   d FS:REMOVE-TREE ;
+
 \ The root's own entry e refused with its text t: E-LISTING, one line
 \ naming t, and nothing listed after Old.
 : ROOT-REFUSED ( ^DROPBOX:entry str str ^ARENA:arena -- )
@@ -1939,10 +2086,10 @@ ARENA LISTED DROPBOX:entry
    s" /Sync" ar LISTING-AT {: root :}
    ar NO-CHANGES {: v :}
    s" /sync/old" s" /Sync/Old" ar FOLDER-ENTRY
-   root v ar APPEND-ENTRY-CHANGES
+   root v ar APPENDED
    s" /sync/child" s" /Sync/Child" ar FOLDER-ENTRY {: child :}
-   d [: [: e root v ar APPEND-ENTRY-CHANGES
-         child root v ar APPEND-ENTRY-CHANGES ;] E-LISTING TTHROWSQ ;]
+   d [: [: e root v ar APPENDED
+         child root v ar APPENDED ;] E-LISTING TTHROWSQ ;]
    ar LOGGED {: g:str :}
    g 10 STR:COUNT-CHAR 1 T=
    g t STR:CONTAINS? TTRUE
@@ -1955,9 +2102,9 @@ ARENA LISTED DROPBOX:entry
    {: ar :}
    s" /Sync" ar LISTING-AT {: root :}
    ar NO-CHANGES {: v :}
-   s" /sync" s" /Sync" ar FOLDER-ENTRY root v ar APPEND-ENTRY-CHANGES
+   s" /sync" s" /Sync" ar FOLDER-ENTRY root v ar APPENDED
    s" /sync/child" s" /Sync/Child" ar FOLDER-ENTRY
-   root v ar APPEND-ENTRY-CHANGES
+   root v ar APPENDED
    v ar INVENTORY-RECORDS RECORD-PATHS$ s" Child|" T$= ;
 
 : LISTING-CLASSIFIES-THE-REMOTE-ROOTS-OWN-ENTRY ( ^ARENA:arena -- )
@@ -2262,21 +2409,6 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
       rs i VEC:AT @ want i VEC:AT @ MODEL:REMOTE-RECORD= TTRUE
    loop ;
 
-\ A text that grows in the arena.
-: NO-TEXT ( ^ARENA:arena -- ^VEC:vector<u8> )
-   ARENA:ALLOCATOR 0 [type] u8 VEC:NEW ;
-
-: TEXT+ ( ^VEC:vector<u8> str -- )
-   {: v s:str :}
-   s str> {: a:^ u:n :}
-   v VEC:COUNT {: at:n :}
-   v at u + VEC:RESIZE
-   a v at VEC:AT u BYTE-COPY ;
-
-: TEXT>STR ( ^VEC:vector<u8> -- str )
-   {: v :}
-   v 0 VEC:AT v VEC:COUNT >str ;
-
 \ Rust's large listing's entry at the index: the folder /bulk, then
 \ /bulk/00001.txt on at rev-bulk with the identity h; in SB.
 : BULK-ENTRY ( n DROPBOX:hash ^ARENA:arena -- str )
@@ -2431,6 +2563,144 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
    s" /2/files/list_folder/continue /2/files/list_folder/continue" T$=
    d j GONE ;
 
+: MISMATCHED-ENTRY-PUBLISHES-AS-UNSUPPORTED ( ^ARENA:arena -- )
+   {: ar :}
+   s" mismatched entry publishes as unsupported" T-LABEL
+   TEST-DROPBOX:RESET
+   s" good bytes" ar IDENTITY {: h:DROPBOX:hash :}
+   ar CASE-JOURNAL {: d:str j :}
+   [: s" /good.txt" s" /Good.txt" s" rev-good" h FILE-JSON+ COMMA+
+      s" /report.txt" s" /Different.txt" s" rev-odd" h FILE-JSON+ ;]
+   ar ENTRIES s" first" false PAGE
+   [: s" /report.txt" s" /Different.txt" s" rev-odd" h FILE-JSON+ ;]
+   ar ENTRIES s" second" false PAGE
+   d [: j TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK ar REFRESHED
+        j TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK ar REFRESHED ;]
+   ar LOGGED {: t:str :}
+   t 10 STR:COUNT-CHAR 1 T=
+   t s" `/Different.txt` does not fold to `/report.txt`"
+   STR:CONTAINS? TTRUE
+   ar REMOTE-RECORDS {: want :}
+   s" Good.txt" h s" rev-good" PRESENT-AT ar RECORD-AT want VEC:PUSH !
+   s" report.txt" MODEL-UNKNOWN--REASON:UNSUPPORTED REMOTE-UNKNOWN
+   ar RECORD-AT want VEC:PUSH !
+   j s" second" want ar HOLDS
+   TEST-DROPBOX:SEEN$
+   s" /2/files/list_folder /2/files/list_folder/continue" T$=
+   d j GONE ;
+
+\ /U+13A0.txt, in SB as JSON at the revision r.
+: UNLOWERED-JSON+ ( str DROPBOX:hash -- )
+   {: r:str h:DROPBOX:hash :}
+   S\" /\xe1\x8e\xa0.txt" S\" /\xe1\x8e\xa0.txt" r h FILE-JSON+ ;
+
+\ The journal holds Old.txt and U+AB70.txt unsupported, with the
+\ cursor k.
+: UNLOWERED-HELD
+   ( JOURNAL:journal str MODEL:remote-record ^ARENA:arena -- )
+   {: j k:str old ar :}
+   ar REMOTE-RECORDS {: want :}
+   old want VEC:PUSH !
+   LOWERED-KEY$ MODEL-UNKNOWN--REASON:UNSUPPORTED REMOTE-UNKNOWN
+   ar RECORD-AT want VEC:PUSH !
+   j k want ar HOLDS ;
+
+: UNLOWERED-PATH-PUBLISHES-AT-ITS-FOLD ( ^ARENA:arena -- )
+   {: ar :}
+   s" unlowered path publishes at its fold" T-LABEL
+   TEST-DROPBOX:RESET
+   s" cherokee bytes" ar IDENTITY {: h:DROPBOX:hash :}
+   s" Old.txt" STALE ar RECORD-AT {: old :}
+   ar CASE-JOURNAL {: d:str j :}
+   j s" durable" old ar PUBLISHED
+   [: s" rev-a" h UNLOWERED-JSON+ ;] ar ENTRIES s" first" false PAGE
+   [: s" rev-b" h UNLOWERED-JSON+ ;] ar ENTRIES s" second" false PAGE
+   d [: j TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK ar REFRESHED
+        j s" first" old ar UNLOWERED-HELD
+        j TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK ar REFRESHED ;]
+   ar LOGGED {: t:str :}
+   t 10 STR:COUNT-CHAR 1 T=
+   t S\" `/\xe1\x8e\xa0.txt` is not its own lowercase; it is kept"
+   STR:CONTAINS? TTRUE
+   j s" second" old ar UNLOWERED-HELD
+   TEST-DROPBOX:SEEN$
+   s" /2/files/list_folder/continue /2/files/list_folder/continue" T$=
+   d j GONE ;
+
+: MISMATCH-LOGGED-ONCE-AFTER-A-FAILED-PAGE ( ^ARENA:arena -- )
+   {: ar :}
+   s" mismatch logged once after a failed page" T-LABEL
+   TEST-DROPBOX:RESET
+   s" odd bytes" ar IDENTITY {: h:DROPBOX:hash :}
+   s" Old.txt" STALE ar RECORD-AT {: old :}
+   ar CASE-JOURNAL {: d:str j :}
+   j s" durable" old ar PUBLISHED
+   [: s" /report.txt" s" /Different.txt" s" rev-odd" h FILE-JSON+ ;]
+   ar ENTRIES {: e:str :}
+   SB-RESET S\" {\qentries\q:" SB-APPEND e SB-APPEND
+   S\" ,\qcursor\q:\qnext\q,\qhas_more\q:true}" SB-APPEND
+   CONTINUE$ 200 s" " s" " SB$ TEST-DROPBOX:ROUTE-SCRIPT!
+   UNAVAILABLE!
+   e s" second" false PAGE
+   d [: [: j TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK ar REFRESHED ;]
+        REPLAY:E-DROPBOX TTHROWSQ
+        j TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK ar REFRESHED ;]
+   ar LOGGED {: t:str :}
+   t 10 STR:COUNT-CHAR 1 T=
+   t s" `/Different.txt` does not fold to `/report.txt`"
+   STR:CONTAINS? TTRUE
+   ar REMOTE-RECORDS {: want :}
+   old want VEC:PUSH !
+   s" report.txt" MODEL-UNKNOWN--REASON:UNSUPPORTED REMOTE-UNKNOWN
+   ar RECORD-AT want VEC:PUSH !
+   j s" second" want ar HOLDS
+   d j GONE ;
+
+: EXTRA-COMPONENT-PUBLISHES-AS-UNSUPPORTED ( ^ARENA:arena -- )
+   {: ar :}
+   s" extra component publishes as unsupported" T-LABEL
+   TEST-DROPBOX:RESET
+   s" good bytes" ar IDENTITY {: h:DROPBOX:hash :}
+   ar CASE-JOURNAL {: d:str j :}
+   [: s" /good.txt" s" /Good.txt" s" rev-good" h FILE-JSON+ COMMA+
+      s" /report.txt" s" /Extra/Report.txt" s" rev-odd" h FILE-JSON+ ;]
+   ar ENTRIES s" first" false PAGE
+   d [: j TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK ar REFRESHED ;]
+   ar LOGGED {: t:str :}
+   t 10 STR:COUNT-CHAR 1 T=
+   t s" `/Extra/Report.txt` does not fold to `/report.txt`"
+   STR:CONTAINS? TTRUE
+   ar REMOTE-RECORDS {: want :}
+   s" Good.txt" h s" rev-good" PRESENT-AT ar RECORD-AT want VEC:PUSH !
+   s" report.txt" MODEL-UNKNOWN--REASON:UNSUPPORTED REMOTE-UNKNOWN
+   ar RECORD-AT want VEC:PUSH !
+   j s" first" want ar HOLDS
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$=
+   d j GONE ;
+
+\ The root /U+13A0, uppercase in Habu's tables.
+: UNLOWERED-ROOT$ ( -- str ) S\" /\xe1\x8e\xa0" ;
+
+: UNLOWERED-ROOT-LISTS-ITS-ENTRIES ( ^ARENA:arena -- )
+   {: ar :}
+   s" unlowered root lists its entries" T-LABEL
+   TEST-DROPBOX:RESET
+   s" cherokee root bytes" ar IDENTITY {: h:DROPBOX:hash :}
+   ar CASE-JOURNAL {: d:str j :}
+   [: UNLOWERED-ROOT$ UNLOWERED-ROOT$ FOLDER-JSON+ COMMA+
+      S\" /\xe1\x8e\xa0/a.txt" S\" /\xe1\x8e\xa0/A.txt" s" rev-a" h
+      FILE-JSON+ COMMA+
+      S\" /\xe1\x8e\xa0/docs" S\" /\xe1\x8e\xa0/Docs" FOLDER-JSON+ ;]
+   ar ENTRIES s" first" false PAGE
+   j TEST-CLIENT:MAIN @ UNLOWERED-ROOT$ ar TEST-CLIENT:NEW-LINK
+   UNLOWERED-ROOT$ ar LISTING-AT ar REFRESH-INVENTORY
+   ar REMOTE-RECORDS {: want :}
+   s" A.txt" h s" rev-a" PRESENT-AT ar RECORD-AT want VEC:PUSH !
+   s" Docs" REMOTE-DIRECTORY ar RECORD-AT want VEC:PUSH !
+   j s" first" want ar HOLDS
+   TEST-DROPBOX:SEEN$ s" /2/files/list_folder" T$=
+   d j GONE ;
+
 : REFRESH-CASES ( ^ARENA:arena -- )
    {: ar :}
    ar CURSOR-RESET-REBUILDS-BEFORE-ONE-COMPLETE-PUBLICATION
@@ -2440,7 +2710,12 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
    ar ONE-FILE-CURSOR-DELTA-UPDATES-A-LARGE-INVENTORY-WITHOUT-A-FULL-LISTING
    ar LARGE-FULL-LISTING-BUILDS-ITS-INVENTORY-IN-LINEAR-TIME
    ar INCOMPLETE-DOWNLOADABLE-METADATA-PUBLISHES-AS-UNKNOWN-INCOMPLETE
-   ar RESTRICTED-LATER-PAGE-PUBLISHES-AS-UNKNOWN-INACCESSIBLE ;
+   ar RESTRICTED-LATER-PAGE-PUBLISHES-AS-UNKNOWN-INACCESSIBLE
+   ar MISMATCHED-ENTRY-PUBLISHES-AS-UNSUPPORTED
+   ar UNLOWERED-PATH-PUBLISHES-AT-ITS-FOLD
+   ar MISMATCH-LOGGED-ONCE-AFTER-A-FAILED-PAGE
+   ar EXTRA-COMPONENT-PUBLISHES-AS-UNSUPPORTED
+   ar UNLOWERED-ROOT-LISTS-ITS-ENTRIES ;
 
 
 \ ---- the replay step against the fake Dropbox ---------------------
@@ -7139,10 +7414,13 @@ TYPED-VARIABLE STAND-IN-UPLOAD str
    ar FOLDERS-ARE-DIRECTORIES-AND-NON-DOWNLOADABLE-FILES-ARE-UNKNOWN
    ar DIRECTORY-RECORDS-NORMALIZE-INCONSISTENT-CHILD-ANCESTOR-CASING
    ar DELTA-NEVER-RESPELLS-A-DIRECTORY-THAT-STILL-EXISTS
-   ar LISTING-REJECTS-MISMATCHED-CANONICAL-AND-DISPLAY-PATHS
+   ar LISTING-KEEPS-MISMATCHED-PATHS-UNSUPPORTED
+   ar MISMATCHED-RESTRICTED-FOLDER-DROPS-ITS-CHILDREN
+   ar TWO-SPELLINGS-SHARE-ONE-KEY
    ar LISTING-REJECTS-AN-INVALID-CONFIGURED-ROOT
    ar LISTING-REJECTS-AN-ENTRY-WITHOUT-PATHS
    ar LISTING-REJECTS-A-PATH-THAT-IS-NOT-UTF-8
+   ar LISTING-REJECTS-AN-INVALID-OR-OUT-OF-ROOT-ENTRY
    ar LISTING-CLASSIFIES-THE-REMOTE-ROOTS-OWN-ENTRY
    ar DROPBOX-SERVED ;
 

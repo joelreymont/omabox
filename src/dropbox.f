@@ -1314,9 +1314,9 @@ private
    construct kind file [: FIELD-MEMBER ;] ENTRY-PARSE ;
 
 
-\ Whether the entry's path_lower is the path's full lowercase.
+\ Whether the entry's path_lower and the path have the same full lowercase.
 : AT? ( str ^client -- bool )
-   CLIENT-ENTRY DROPBOX-ENTRY:LOWER @ SPAN:$ UNICODE:LOWERS-TO? ;
+   CLIENT-ENTRY DROPBOX-ENTRY:LOWER @ SPAN:$ UNICODE:LOWER= ;
 
 
 \ done stands for an entry at the path; one elsewhere is refused

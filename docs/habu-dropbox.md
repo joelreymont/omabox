@@ -9,7 +9,8 @@ cursor and upload session. The signatures below are not checked yet.
 ```forth
 \ Dropbox's 409 error tags that omabox decides on; any other tag
 \ is `other`, and its text goes in the log line. `path-mismatch`
-\ is no tag: an entry whose path_lower is not the path's full lowercase.
+\ is no tag: an entry whose path_lower and the path have different full
+\ lowercases.
 \ Nor is `unverified`: a download whose answer fails its checks or does
 \ not parse, or a mutation Dropbox may have applied or whose answer is
 \ not its intended entry.

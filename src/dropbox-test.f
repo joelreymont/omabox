@@ -1,8 +1,9 @@
 \ dropbox-test.f - DROPBOX's client core against the fake Dropbox of
 \ test-dropbox.f on a loopback port: the account (one whose root_info
 \ carries a tag other than user or team), metadata (of a file that
-\ is not downloadable, of a symlink, of a file with no content hash and of
-\ an entry at another path among them), the Path-Root header, the token's
+\ is not downloadable, of a symlink, of a file with no content hash, of
+\ an entry at another path and of one whose path_lower keeps U+13A0 among
+\ them), the Path-Root header, the token's
 \ refresh, its rotation and the store that keeps it, a refresh that fails
 \ a download and leaves no status, a rejected grant, a rejected client's
 \ delete after a long poll answered 503, a revoked token,
@@ -472,6 +473,25 @@ variable REFUSALS
    s" /docs/a" TEST-CLIENT:MAIN @ DROPBOX:METADATA
    DROPBOX-ERROR:PATH-MISMATCH REFUSED? ASSERT
    TEST-DROPBOX:SEEN$ s" /2/files/get_metadata" T$= ;
+
+
+\ Dropbox's path_lower keeps U+13A0, whose full lowercase is U+AB70; it
+\ and the path /Ꭰ.txt have the same full lowercase, so the entry is at
+\ the path, and one at /b.txt is not.
+: METADATA-CASEFOLD-CASE ( -- )
+   s" metadata of an entry whose path_lower keeps U+13A0" T-LABEL
+   TEST-DROPBOX:RESET
+   200 s" " s" "
+   S\" {\q.tag\q:\qfolder\q,\qname\q:\q\xe1\x8e\xa0.txt\q,\qid\q:\qid:c\q,\qpath_lower\q:\q/\xe1\x8e\xa0.txt\q,\qpath_display\q:\q/\xe1\x8e\xa0.txt\q}"
+   TEST-DROPBOX:SCRIPT!
+   S\" /\xe1\x8e\xa0.txt" TEST-CLIENT:MAIN @ DROPBOX:METADATA DROPBOX:DONE? ASSERT
+   s" metadata of an entry at /b.txt for /Ꭰ.txt" T-LABEL
+   TEST-DROPBOX:RESET
+   200 s" " s" "
+   S\" {\q.tag\q:\qfolder\q,\qname\q:\qb.txt\q,\qid\q:\qid:b\q,\qpath_lower\q:\q/b.txt\q,\qpath_display\q:\q/b.txt\q}"
+   TEST-DROPBOX:SCRIPT!
+   S\" /\xe1\x8e\xa0.txt" TEST-CLIENT:MAIN @ DROPBOX:METADATA
+   DROPBOX-ERROR:PATH-MISMATCH REFUSED? ASSERT ;
 
 
 : ROOT-CASE ( -- )
@@ -2037,14 +2057,13 @@ variable AGAIN-CODE
    NO-LOOKUP ;
 
 
-\ A delete answered with the entry at /Ä.txt as its path_lower, not the
-\ full lowercase.
+\ A delete answered with the entry at /b.txt as its path_lower.
 : DELETE-ELSEWHERE-CASE ( -- )
    s" delete answered at another path" T-LABEL
    TEST-DROPBOX:RESET
    S\" /\xc3\x84.txt" s" rev-a" DELETED-FILE
    200 s" " s" "
-   S\" {\qmetadata\q:{\q.tag\q:\qfile\q,\qpath_lower\q:\q/\xc3\x84.txt\q,\qpath_display\q:\q/\xc3\x84.txt\q,\qrev\q:\qrev-a\q,\qsize\q:0,\qcontent_hash\q:\qe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\q}}"
+   S\" {\qmetadata\q:{\q.tag\q:\qfile\q,\qpath_lower\q:\q/b.txt\q,\qpath_display\q:\q/\xc3\x84.txt\q,\qrev\q:\qrev-a\q,\qsize\q:0,\qcontent_hash\q:\qe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\q}}"
    TEST-DROPBOX:SCRIPT!
    S\" /\xc3\x84.txt" s" rev-a" TEST-CLIENT:MAIN @ DROPBOX:DELETE UNVERIFIED? ASSERT
    NO-LOOKUP ;
@@ -2087,11 +2106,13 @@ variable AGAIN-CODE
    NO-LOOKUP ;
 
 
-\ The fake answers the folder's path as its path_lower, which for /Ä is
-\ not the full lowercase.
+\ A create-folder of /Ä answered with the folder at /b as its path_lower.
 : FOLDER-ELSEWHERE-CASE ( -- )
    s" create-folder answered at another path" T-LABEL
    TEST-DROPBOX:RESET
+   s" /2/files/create_folder_v2" 200 s" " s" "
+   S\" {\qmetadata\q:{\qname\q:\qb\q,\qid\q:\qid:b\q,\qpath_lower\q:\q/b\q,\qpath_display\q:\q/b\q}}"
+   TEST-DROPBOX:ROUTE-SCRIPT!
    S\" /\xc3\x84" TEST-CLIENT:MAIN @ DROPBOX:CREATE-FOLDER UNVERIFIED? ASSERT
    NO-LOOKUP ;
 
@@ -2382,6 +2403,18 @@ TYPED-VARIABLE FAULT fault
    200 s" " s" " SB$ TEST-DROPBOX:SCRIPT! ;
 
 
+\ The next call to the route answers the upload's file, n bytes with its
+\ content hash, at /b.txt.
+: ELSEWHERE! ( str n -- )
+   {: r n:n :}
+   SB-RESET
+   S\" {\qname\q:\qb.txt\q,\qid\q:\qid:b\q,\qpath_lower\q:\q/b.txt\q,\qpath_display\q:\q/b.txt\q,\qrev\q:\q0170b\q,\qsize\q:"
+   SB-APPEND n FMT:INT$ SB-APPEND
+   S\" ,\qcontent_hash\q:\q" SB-APPEND EXPECTED$ SB-APPEND
+   S\" \q,\qis_downloadable\q:true}" SB-APPEND
+   r 200 s" " s" " SB$ TEST-DROPBOX:ROUTE-SCRIPT! ;
+
+
 \ The next call refused with incorrect_offset at 0, short of any chunk's end.
 : OFFSET! ( -- )
    409 s" " s" "
@@ -2537,12 +2570,13 @@ TYPED-VARIABLE FAULT fault
 : SEND-LOGGED ( -- n ) [: SEND DROPBOX:DONE? drop ;] LOGGED ;
 
 
-\ The fake lowers ASCII alone, so its path_lower folds equal to the upload
-\ path but is not its full lowercase.
+\ An upload to /Docs/CAFÉ.txt answered with its file at /b.txt as its
+\ path_lower.
 : OTHER-CASE-CASE ( -- )
-   s" committed path of another case" T-LABEL
+   s" committed path elsewhere" T-LABEL
    TEST-DROPBOX:RESET -1 FAULT-AT !
    s" cafe.txt" STAGE! s" hello cafe" S\" /Docs/CAF\xc3\x89.txt" s" " STAGED
+   s" /2/files/upload" 10 ELSEWHERE!
    SEND UNVERIFIED? ASSERT
    NO-LOOKUP
    UNSTAGED ;
@@ -2834,12 +2868,14 @@ TYPED-VARIABLE FAULT fault
    EXPECTED$ str> SPAN:MAKE UP DROPBOX-UPLOAD:CONTENT-HASH ! ;
 
 
-\ The fake lowers ASCII alone, so the finish's path_lower is not /É.bin's
-\ full lowercase.
+\ A session upload to /É.bin whose finish is answered with its file at
+\ /b.txt as its path_lower.
 : FINISH-ELSEWHERE-CASE ( -- )
    s" finish answered at another path" T-LABEL
    S\" /\xc3\x89.bin" str> SPAN:MAKE UP DROPBOX-UPLOAD:PATH !
-   -1 construct fault cut 1 STRUCK UNVERIFIED? ASSERT
+   -1 FAULT-AT ! TEST-DROPBOX:RESET
+   s" /2/files/upload_session/finish" CHUNK 1+ ELSEWHERE!
+   SEND UNVERIFIED? ASSERT
    SB-RESET S-START S-APPEND S-APPEND S-FINISH
    TEST-DROPBOX:SEEN$ SB$ T$=
    s" /Big.bin" str> SPAN:MAKE UP DROPBOX-UPLOAD:PATH ! ;
@@ -3166,7 +3202,7 @@ TYPED-VARIABLE FAULT fault
    ACCOUNT-CASE OTHER-ROOT-CASE FILE-CASE BUILT-PATH-CASE MISSING-CASE
    ROOT-CASE
    LOST-READ-CASE UNDOWNLOADABLE-CASE SYMLINK-CASE INCOMPLETE-CASE
-   METADATA-ELSEWHERE-CASE
+   METADATA-ELSEWHERE-CASE METADATA-CASEFOLD-CASE
    SDK-EXPIRY-REFRESH-REISSUES-THE-ROUTE-WITH-THE-SAME-CLIENT
    REJECTED-GRANT-CASE REJECTED-POLL-CASE REVOKED-CASE DENIED-CASE
    STORED-FIRST-CASE UNSTORED-CASE UNROTATED-CASE SCRIPTED-REFRESH-CASE
