@@ -434,6 +434,8 @@ variable DROPPED
    d car STATUS:DETACHED car RUN-IN-DIR {: x j :}
    j s" cursor" DROPBOX:>CURSOR
    car ARENA:ALLOCATOR 0 [type] MODEL:remote-record VEC:NEW
+   car ARENA:ALLOCATOR 0
+   [type] JOURNAL:remote-inventory-change VEC:NEW
    JOURNAL:PUBLISH-REMOTE-INVENTORY
    x RUN-SESSIONS @ {: sar :}
    sar TEST-CLIENT:OPENED EXPECTED sar OWNED-SESSION {: s :}

@@ -70,10 +70,24 @@
 \   whose display path folds elsewhere is unsupported and its listed
 \   children go.
 \ - TWO-SPELLINGS-SHARE-ONE-KEY: /U+13A0.txt, uppercase in Habu's tables,
-\   as both its paths, then /U+AB70.txt, its lowercase: the first is
-\   handed on with the key U+AB70.txt, which the second's record holds;
-\   a delete of the first keeps the key's record, unsupported, and a
-\   delete of the second removes its own.
+\   and /U+AB70.txt, its lowercase, each as both its paths and listed in
+\   either order, leave their key U+AB70.txt unsupported, only the first
+\   handed on with it; a delta deleting the first then leaves the
+\   second's record, and one deleting the second leaves the key
+\   unsupported until a later one deletes the first.
+\ - A-DELETED-UNLOWERED-FOLDER-LEAVES-NO-RECORD: /U+13A0dir and
+\   /U+13A0dir/a.txt, each as both its paths, published by a full
+\   listing or applied by a delta, then a delta deleting /U+13A0dir:
+\   no record is left.
+\ - A-RELISTED-HOLD-KEEPS-ITS-FOLDERS-CASING: a delta lists /U+AB70Dir
+\   and /U+13A0dir, a second relists /U+13A0dir alone: the one record
+\   is spelled U+AB70Dir.
+\ - A-HELD-CHILD-SPELLS-ITS-HELD-FOLDER: a delta lists /U+AB70Dir and
+\   /U+13A0dir, a second lists /U+13A0dir/a.txt alone: its record is
+\   spelled U+AB70Dir/a.txt.
+\ - FITTING-FOLDER-REPLACES-ITS-UNSUPPORTED-RECORD: a delta lists /docs
+\   as /Other, unsupported at its own key, then a delta lists it as
+\   /Docs: the key's record is the folder's directory.
 \ - LISTING-REJECTS-AN-INVALID-CONFIGURED-ROOT: a/b, /a/, /a//b and a
 \   root that is not UTF-8 each throw E-LISTING, one line logged.
 \ - LISTING-REJECTS-AN-ENTRY-WITHOUT-PATHS and
@@ -102,6 +116,9 @@
 \   uppercase in Habu's tables, as both its display and lower path; each
 \   publishes it unsupported at the key U+AB70.txt, and one line logged
 \   names it.
+\ - SHARED-FOLD-KEEPS-ITS-FOLDERS-SPELLING: a full listing, then a delta,
+\   of /Docs and /Docs/U+13A0.txt: the key docs/U+AB70.txt is held
+\   unsupported as Docs/U+AB70.txt, and one line logged names it.
 \ - MISMATCH-LOGGED-ONCE-AFTER-A-FAILED-PAGE: a delta whose later page
 \   fails lists a mismatched file, then the next delta lists it and
 \   publishes: it is unsupported, and one line logged names it.
@@ -402,6 +419,10 @@ private
 : REMOTE-RECORDS ( ^ARENA:arena -- ^VEC:vector<MODEL:remote-record> )
    ARENA:ALLOCATOR 0 [type] MODEL:remote-record VEC:NEW ;
 
+: NO-CHANGES
+   ( ^ARENA:arena -- ^VEC:vector<JOURNAL:remote-inventory-change> )
+   ARENA:ALLOCATOR 0 [type] JOURNAL:remote-inventory-change VEC:NEW ;
+
 : LOCAL-DIRECTORY ( -- MODEL:observation<MODEL:local> )
    MODEL-OBSERVATION:DIRECTORY ;
 
@@ -464,7 +485,8 @@ private
      [ JOURNAL:journal -- ] ^ARENA:arena -- )
    {: d:str j b ls rs body ar :}
    j b ls ar LOCALS-PUBLISHED
-   j s" cursor" DROPBOX:>CURSOR rs JOURNAL:PUBLISH-REMOTE-INVENTORY
+   j s" cursor" DROPBOX:>CURSOR rs ar NO-CHANGES
+   JOURNAL:PUBLISH-REMOTE-INVENTORY
    j body execute ;
 
 \ The body runs on a rooted case journal holding the records as its
@@ -1005,7 +1027,8 @@ variable ALL-NOOPS
       ls i ar COMBO-LOCALS rs i ar COMBO-REMOTES held i ar COMBO-KEYS
    loop
    j b ls ar LOCALS-PUBLISHED
-   j s" cursor" DROPBOX:>CURSOR rs JOURNAL:PUBLISH-REMOTE-INVENTORY ;
+   j s" cursor" DROPBOX:>CURSOR rs ar NO-CHANGES
+   JOURNAL:PUBLISH-REMOTE-INVENTORY ;
 
 \ Whether deciding the known path only counts a no-op; a case collision
 \ decides nothing, so it does not.
@@ -1331,7 +1354,7 @@ variable ALL-NOOPS
    j ls rs s" Docs/Notes" ar KEPT-DIRECTORY+
    j ls rs s" Music" ar KEPT-DIRECTORY+
    j b ls ar LOCALS-PUBLISHED
-   j s" cursor" DROPBOX:>CURSOR rs
+   j s" cursor" DROPBOX:>CURSOR rs ar NO-CHANGES
    JOURNAL:PUBLISH-REMOTE-INVENTORY ;
 
 : NOOPS-WALKED
@@ -1792,10 +1815,6 @@ ARENA LISTED DROPBOX:entry
    {: v :}
    v 0 VEC:AT v VEC:COUNT >str ;
 
-: NO-CHANGES
-   ( ^ARENA:arena -- ^VEC:vector<JOURNAL:remote-inventory-change> )
-   ARENA:ALLOCATOR 0 [type] JOURNAL:remote-inventory-change VEC:NEW ;
-
 \ The entry's changes; a mismatched entry is not logged.
 : APPENDED
    ( ^DROPBOX:entry listing-root
@@ -1902,7 +1921,7 @@ ARENA LISTED DROPBOX:entry
    ar REMOTE-RECORDS {: rs :}
    rs s" Apps" REMOTE-DIRECTORY ar REMOTE+
    rs s" Apps/Day One" REMOTE-DIRECTORY ar REMOTE+
-   j s" cursor" DROPBOX:>CURSOR rs
+   j s" cursor" DROPBOX:>CURSOR rs ar NO-CHANGES
    JOURNAL:PUBLISH-REMOTE-INVENTORY ;
 
 : DELTA-PATHS
@@ -1942,9 +1961,33 @@ ARENA LISTED DROPBOX:entry
    {: e k t :}
    t k KEY-BYTES TEXT+ t s" |" TEXT+ ;
 
+\ The full listing's changes published as the case journal's inventory.
+: LISTING-PUBLISHED
+   ( ^VEC:vector<JOURNAL:remote-inventory-change> JOURNAL:journal
+     ^ARENA:arena -- )
+   {: v j ar :}
+   j s" cursor" DROPBOX:>CURSOR v ar INVENTORY-RECORDS v
+   JOURNAL:PUBLISH-REMOTE-INVENTORY ;
+
+\ The delta's changes applied to the case journal.
+: DELTA-APPLIED
+   ( ^VEC:vector<JOURNAL:remote-inventory-change> JOURNAL:journal
+     ^ARENA:arena -- )
+   {: v j ar :}
+   v j ar NORMALIZE-INVENTORY-CHANGES {: cs :}
+   j s" cursor-delta" DROPBOX:>CURSOR cs
+   JOURNAL:APPLY-REMOTE-INVENTORY-DELTA ;
+
+\ The case journal's remote records, by key.
+: JOURNAL-RECORDS
+   ( JOURNAL:journal ^ARENA:arena -- ^VEC:vector<MODEL:remote-record> )
+   JOURNAL:REMOTE-INVENTORY JOURNAL-REMOTE--INVENTORY:UNMAKE
+   {: cur v :} v ;
+
 : LISTING-KEEPS-MISMATCHED-PATHS-UNSUPPORTED ( ^ARENA:arena -- )
    {: ar :}
    s" listing keeps mismatched paths unsupported" T-LABEL
+   ar CASE-JOURNAL {: d:str j :}
    s" " ar LISTING-AT {: root :}
    ar NO-TEXT {: t :}
    ar NO-CHANGES {: v :}
@@ -1955,7 +1998,8 @@ ARENA LISTED DROPBOX:entry
    root v ar [: t MISMATCHED+ ;] APPEND-ENTRY-CHANGES
    s" /docs/good.txt" s" /Docs/Good.txt" ar FILE-ENTRY root v ar APPENDED
    t TEXT>STR s" report.txt|docs/odd|" T$=
-   v ar INVENTORY-RECORDS {: rs :}
+   v j ar LISTING-PUBLISHED
+   j ar JOURNAL-RECORDS {: rs :}
    rs RECORD-PATHS$ s" Docs|Docs/Good.txt|Docs/odd|report.txt|" T$=
    rs s" report.txt" ar CANONICAL OBSERVED-IN
    MODEL-UNKNOWN--REASON:UNSUPPORTED REMOTE-UNKNOWN
@@ -1966,12 +2010,15 @@ ARENA LISTED DROPBOX:entry
    s" /report.txt" s" /Gone.txt" ar DELETED-ENTRY
    root v ar [: t MISMATCHED+ ;] APPEND-ENTRY-CHANGES
    t TEXT>STR s" report.txt|docs/odd|" T$=
-   v ar INVENTORY-RECORDS RECORD-PATHS$
-   s" Docs|Docs/Good.txt|Docs/odd|" T$= ;
+   v j ar LISTING-PUBLISHED
+   j ar JOURNAL-RECORDS RECORD-PATHS$
+   s" Docs|Docs/Good.txt|Docs/odd|" T$=
+   d j GONE ;
 
 : MISMATCHED-RESTRICTED-FOLDER-DROPS-ITS-CHILDREN ( ^ARENA:arena -- )
    {: ar :}
    s" mismatched restricted folder drops its children" T-LABEL
+   ar CASE-JOURNAL {: d:str j :}
    s" " ar LISTING-AT {: root :}
    ar NO-CHANGES {: v :}
    s" /docs/odd" s" /Docs/odd" ar FOLDER-ENTRY root v ar APPENDED
@@ -1980,11 +2027,13 @@ ARENA LISTED DROPBOX:entry
    s" /docs/odd" s" /Docs/Even" ar FOLDER-ENTRY {: e :}
    true e DROPBOX-ENTRY:RESTRICTED !
    e root v ar APPENDED
-   v ar INVENTORY-RECORDS {: rs :}
+   v j ar LISTING-PUBLISHED
+   j ar JOURNAL-RECORDS {: rs :}
    rs RECORD-PATHS$ s" Docs|Docs/odd|" T$=
    rs s" docs/odd" ar CANONICAL OBSERVED-IN
    MODEL-UNKNOWN--REASON:UNSUPPORTED REMOTE-UNKNOWN
-   MODEL:REMOTE-OBSERVATION= TTRUE ;
+   MODEL:REMOTE-OBSERVATION= TTRUE
+   d j GONE ;
 
 \ /U+13A0.txt, uppercase in Habu's tables, and /U+AB70.txt, its
 \ lowercase, whose key is U+AB70.txt.
@@ -1992,46 +2041,198 @@ ARENA LISTED DROPBOX:entry
 : LOWERED$ ( -- str ) S\" /\xea\xad\xb0.txt" ;
 : LOWERED-KEY$ ( -- str ) S\" \xea\xad\xb0.txt" ;
 
-\ Changes for /U+13A0.txt, then /U+AB70.txt, each as both its paths;
-\ the keys handed on go to t.
-: BOTH-SPELLINGS
-   ( ^VEC:vector<u8> listing-root ^ARENA:arena
+\ The changes of the file at p, as both its paths; the keys handed on
+\ go to t.
+: SPELLING+
+   ( str ^VEC:vector<JOURNAL:remote-inventory-change> ^VEC:vector<u8>
+     listing-root ^ARENA:arena -- )
+   {: p:str v t root ar :}
+   p p ar FILE-ENTRY root v ar [: t MISMATCHED+ ;] APPEND-ENTRY-CHANGES ;
+
+\ A listing of the file at p, then of the one at q.
+: BOTH-LISTED
+   ( str str ^VEC:vector<u8> listing-root ^ARENA:arena
      -- ^VEC:vector<JOURNAL:remote-inventory-change> )
-   {: t root ar :}
+   {: p:str q:str t root ar :}
    ar NO-CHANGES {: v :}
-   UNLOWERED$ UNLOWERED$ ar FILE-ENTRY
-   root v ar [: t MISMATCHED+ ;] APPEND-ENTRY-CHANGES
-   LOWERED$ LOWERED$ ar FILE-ENTRY
-   root v ar [: t MISMATCHED+ ;] APPEND-ENTRY-CHANGES
+   p v t root ar SPELLING+
+   q v t root ar SPELLING+
    v ;
 
-\ The changes' one record is at U+AB70.txt; whether it is unsupported.
-: LOWERED-UNSUPPORTED?
-   ( ^VEC:vector<JOURNAL:remote-inventory-change> ^ARENA:arena
-     -- bool )
-   {: v ar :}
-   v ar INVENTORY-RECORDS {: rs :}
-   rs RECORD-PATHS$ S\" \xea\xad\xb0.txt|" T$=
-   rs LOWERED-KEY$ ar CANONICAL OBSERVED-IN
-   MODEL-UNKNOWN--REASON:UNSUPPORTED REMOTE-UNKNOWN
-   MODEL:REMOTE-OBSERVATION= ;
+\ A delta deleting the file at p, as both its paths, applied to j.
+: SPELLING-DELETED
+   ( str JOURNAL:journal ^VEC:vector<u8> listing-root ^ARENA:arena -- )
+   {: p:str j t root ar :}
+   ar NO-CHANGES {: v :}
+   p p ar DELETED-ENTRY root v ar [: t MISMATCHED+ ;] APPEND-ENTRY-CHANGES
+   v j ar DELTA-APPLIED ;
+
+: AT-LOWERED
+   ( JOURNAL:journal ^ARENA:arena -- option<MODEL:remote-record> )
+   {: j ar :}
+   j LOWERED-KEY$ ar CANONICAL ar JOURNAL:REMOTE-AT ;
+
+\ Whether the journal's record at U+AB70.txt is r.
+: LOWERED-IS? ( JOURNAL:journal MODEL:remote-record ^ARENA:arena -- bool )
+   {: j r ar :}
+   j ar AT-LOWERED MATCH option
+      none OF false ENDOF
+      some OF r MODEL:REMOTE-RECORD= ENDOF
+   ;MATCH ;
+
+: NONE-LOWERED? ( JOURNAL:journal ^ARENA:arena -- bool )
+   AT-LOWERED MATCH option
+      none OF true ENDOF
+      some OF drop false ENDOF
+   ;MATCH ;
+
+\ The unsupported record a hold shows at U+AB70.txt.
+: HELD-LOWERED ( ^ARENA:arena -- MODEL:remote-record )
+   {: ar :}
+   ar REMOTE-RECORDS {: rs :}
+   rs LOWERED-KEY$ MODEL-UNKNOWN--REASON:UNSUPPORTED REMOTE-UNKNOWN ar
+   REMOTE+
+   rs 0 VEC:AT @ ;
+
+\ The present record /U+AB70.txt alone lists.
+: OWN-LOWERED ( listing-root ^ARENA:arena -- MODEL:remote-record )
+   {: root ar :}
+   ar NO-CHANGES {: v :}
+   LOWERED$ LOWERED$ ar FILE-ENTRY root v ar APPENDED
+   v ar INVENTORY-RECORDS 0 VEC:AT @ ;
+
+\ The listing v holds U+AB70.txt unsupported; a delta deleting
+\ /U+13A0.txt then leaves /U+AB70.txt's record.
+: UNLOWERED-DELETED
+   ( ^VEC:vector<JOURNAL:remote-inventory-change> ^VEC:vector<u8>
+     listing-root ^ARENA:arena -- )
+   {: v t root ar :}
+   ar CASE-JOURNAL {: d:str j :}
+   v j ar LISTING-PUBLISHED
+   j ar HELD-LOWERED ar LOWERED-IS? TTRUE
+   UNLOWERED$ j t root ar SPELLING-DELETED
+   j root ar OWN-LOWERED ar LOWERED-IS? TTRUE
+   d j GONE ;
+
+\ After the listing v, a delta deleting /U+AB70.txt leaves U+AB70.txt
+\ unsupported, and a later one deleting /U+13A0.txt leaves no record.
+: LOWERED-DELETED
+   ( ^VEC:vector<JOURNAL:remote-inventory-change> ^VEC:vector<u8>
+     listing-root ^ARENA:arena -- )
+   {: v t root ar :}
+   ar CASE-JOURNAL {: d:str j :}
+   v j ar LISTING-PUBLISHED
+   LOWERED$ j t root ar SPELLING-DELETED
+   j ar HELD-LOWERED ar LOWERED-IS? TTRUE
+   UNLOWERED$ j t root ar SPELLING-DELETED
+   j ar NONE-LOWERED? TTRUE
+   d j GONE ;
 
 : TWO-SPELLINGS-SHARE-ONE-KEY ( ^ARENA:arena -- )
    {: ar :}
    s" two spellings share one key" T-LABEL
    s" " ar LISTING-AT {: root :}
    ar NO-TEXT {: t :}
-   t root ar BOTH-SPELLINGS {: v :}
-   v ar LOWERED-UNSUPPORTED? TFALSE
-   UNLOWERED$ UNLOWERED$ ar DELETED-ENTRY
-   root v ar [: t MISMATCHED+ ;] APPEND-ENTRY-CHANGES
-   v ar LOWERED-UNSUPPORTED? TTRUE
-   t root ar BOTH-SPELLINGS {: w :}
-   LOWERED$ LOWERED$ ar DELETED-ENTRY
-   root w ar [: t MISMATCHED+ ;] APPEND-ENTRY-CHANGES
-   w ar INVENTORY-RECORDS VEC:COUNT 0 T=
-   t TEXT>STR
-   S\" \xea\xad\xb0.txt|\xea\xad\xb0.txt|\xea\xad\xb0.txt|" T$= ;
+   UNLOWERED$ LOWERED$ t root ar BOTH-LISTED {: v :}
+   LOWERED$ UNLOWERED$ t root ar BOTH-LISTED {: w :}
+   v t root ar UNLOWERED-DELETED
+   w t root ar UNLOWERED-DELETED
+   v t root ar LOWERED-DELETED
+   w t root ar LOWERED-DELETED
+   t TEXT>STR S\" \xea\xad\xb0.txt|\xea\xad\xb0.txt|" T$= ;
+
+\ /U+13A0dir, uppercase in Habu's tables, and its file a.txt.
+: UNLOWERED-DIR$ ( -- str ) S\" /\xe1\x8e\xa0dir" ;
+: UNLOWERED-CHILD$ ( -- str ) S\" /\xe1\x8e\xa0dir/a.txt" ;
+
+\ /U+AB70dir, U+13A0dir's lowercase, as /U+AB70Dir.
+: LOWERED-DIR-ENTRY ( ^ARENA:arena -- ^DROPBOX:entry )
+   {: ar :}
+   S\" /\xea\xad\xb0dir" S\" /\xea\xad\xb0Dir" ar FOLDER-ENTRY ;
+
+\ /U+13A0dir and /U+13A0dir/a.txt, each as both its paths, published
+\ when full, else applied as a delta; a delta deleting the folder
+\ then leaves no record.
+: UNLOWERED-FOLDER-DELETED ( bool ^ARENA:arena -- )
+   {: full:bool ar :}
+   ar CASE-JOURNAL {: d:str j :}
+   s" " ar LISTING-AT {: root :}
+   ar NO-CHANGES {: v :}
+   UNLOWERED-DIR$ UNLOWERED-DIR$ ar FOLDER-ENTRY root v ar APPENDED
+   UNLOWERED-CHILD$ UNLOWERED-CHILD$ ar FILE-ENTRY root v ar APPENDED
+   full if v j ar LISTING-PUBLISHED else v j ar DELTA-APPLIED then
+   ar NO-CHANGES {: w :}
+   UNLOWERED-DIR$ UNLOWERED-DIR$ ar DELETED-ENTRY root w ar APPENDED
+   w j ar DELTA-APPLIED
+   j ar JOURNAL-RECORDS RECORD-PATHS$ s" " T$=
+   d j GONE ;
+
+: A-DELETED-UNLOWERED-FOLDER-LEAVES-NO-RECORD ( ^ARENA:arena -- )
+   {: ar :}
+   s" a deleted unlowered folder leaves no record" T-LABEL
+   true ar UNLOWERED-FOLDER-DELETED
+   false ar UNLOWERED-FOLDER-DELETED ;
+
+\ A case journal after a delta listing /U+AB70Dir and /U+13A0dir.
+: BOTH-DIRS-APPLIED ( listing-root ^ARENA:arena -- str JOURNAL:journal )
+   {: root ar :}
+   ar CASE-JOURNAL {: d:str j :}
+   ar NO-CHANGES {: v :}
+   ar LOWERED-DIR-ENTRY root v ar APPENDED
+   UNLOWERED-DIR$ UNLOWERED-DIR$ ar FOLDER-ENTRY root v ar APPENDED
+   v j ar DELTA-APPLIED
+   d j ;
+
+: A-RELISTED-HOLD-KEEPS-ITS-FOLDERS-CASING ( ^ARENA:arena -- )
+   {: ar :}
+   s" a relisted hold keeps its folder's casing" T-LABEL
+   s" " ar LISTING-AT {: root :}
+   root ar BOTH-DIRS-APPLIED {: d:str j :}
+   ar NO-CHANGES {: w :}
+   UNLOWERED-DIR$ UNLOWERED-DIR$ ar FOLDER-ENTRY root w ar APPENDED
+   w j ar DELTA-APPLIED
+   j ar JOURNAL-RECORDS RECORD-PATHS$ S\" \xea\xad\xb0Dir|" T$=
+   d j GONE ;
+
+: A-HELD-CHILD-SPELLS-ITS-HELD-FOLDER ( ^ARENA:arena -- )
+   {: ar :}
+   s" a held child spells its held folder" T-LABEL
+   s" " ar LISTING-AT {: root :}
+   root ar BOTH-DIRS-APPLIED {: d:str j :}
+   ar NO-CHANGES {: w :}
+   UNLOWERED-CHILD$ UNLOWERED-CHILD$ ar FILE-ENTRY root w ar APPENDED
+   w j ar DELTA-APPLIED
+   j ar JOURNAL-RECORDS S\" \xea\xad\xb0dir/a.txt" ar PATH-OF
+   S\" \xea\xad\xb0Dir/a.txt" T$=
+   d j GONE ;
+
+\ Whether the journal's record at the key bytes k is r.
+: RECORD-AT-KEY?
+   ( JOURNAL:journal str MODEL:remote-record ^ARENA:arena -- bool )
+   {: j k:str r ar :}
+   j k ar CANONICAL ar JOURNAL:REMOTE-AT MATCH option
+      none OF false ENDOF
+      some OF r MODEL:REMOTE-RECORD= ENDOF
+   ;MATCH ;
+
+: FITTING-FOLDER-REPLACES-ITS-UNSUPPORTED-RECORD ( ^ARENA:arena -- )
+   {: ar :}
+   s" fitting folder replaces its unsupported record" T-LABEL
+   ar CASE-JOURNAL {: d:str j :}
+   s" " ar LISTING-AT {: root :}
+   s" docs" ar CANONICAL {: k :}
+   ar NO-CHANGES {: v :}
+   s" /docs" s" /Other" ar FOLDER-ENTRY root v ar APPENDED
+   v j ar DELTA-APPLIED
+   j s" docs" k s" docs" MODEL:>PATH
+   MODEL-UNKNOWN--REASON:UNSUPPORTED REMOTE-UNKNOWN
+   MODEL-REMOTE--RECORD:MAKE ar RECORD-AT-KEY? TTRUE
+   ar NO-CHANGES {: w :}
+   s" /docs" s" /Docs" ar FOLDER-ENTRY root w ar APPENDED
+   w j ar DELTA-APPLIED
+   j s" docs" k s" Docs" MODEL:>PATH REMOTE-DIRECTORY
+   MODEL-REMOTE--RECORD:MAKE ar RECORD-AT-KEY? TTRUE
+   d j GONE ;
 
 \ The configured root p refused: E-LISTING and its one line.
 : ROOT-PATH-REFUSED ( str str ^ARENA:arena -- )
@@ -2191,7 +2392,8 @@ ARENA LISTED DROPBOX:entry
    ( JOURNAL:journal str MODEL:remote-record ^ARENA:arena -- )
    {: j k:str o ar :}
    ar REMOTE-RECORDS {: rs :} o rs VEC:PUSH !
-   j k DROPBOX:>CURSOR rs JOURNAL:PUBLISH-REMOTE-INVENTORY ;
+   j k DROPBOX:>CURSOR rs ar NO-CHANGES
+   JOURNAL:PUBLISH-REMOTE-INVENTORY ;
 
 : CURSOR-IS? ( option<DROPBOX:cursor> str -- bool )
    {: a:str :}
@@ -2487,6 +2689,7 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
    s" new inventory bytes" ar IDENTITY {: h:DROPBOX:hash :}
    ar CASE-JOURNAL {: d:str j :}
    j s" cursor-old" DROPBOX:>CURSOR old 10000 ar BULK-RECORDS
+   ar NO-CHANGES
    JOURNAL:PUBLISH-REMOTE-INVENTORY
    [: s" /bulk/05000.txt" s" /Bulk/05000.txt" s" rev-new" h
       FILE-JSON+ ;] ar ENTRIES
@@ -2644,6 +2847,42 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
    s" /2/files/list_folder/continue /2/files/list_folder/continue" T$=
    d j GONE ;
 
+\ /Docs and /Docs/U+13A0.txt, in SB as JSON at the revision r.
+: DOCS-UNLOWERED-JSON+ ( str DROPBOX:hash -- )
+   {: r:str h:DROPBOX:hash :}
+   s" /docs" s" /Docs" FOLDER-JSON+ COMMA+
+   S\" /docs/\xe1\x8e\xa0.txt" S\" /Docs/\xe1\x8e\xa0.txt" r h FILE-JSON+ ;
+
+\ The journal holds Docs and docs/U+AB70.txt unsupported, spelled as
+\ Docs/U+AB70.txt, with the cursor k.
+: DOCS-HELD ( JOURNAL:journal str ^ARENA:arena -- )
+   {: j k:str ar :}
+   ar REMOTE-RECORDS {: want :}
+   s" Docs" REMOTE-DIRECTORY ar RECORD-AT want VEC:PUSH !
+   S\" Docs/\xea\xad\xb0.txt" MODEL-UNKNOWN--REASON:UNSUPPORTED
+   REMOTE-UNKNOWN ar RECORD-AT want VEC:PUSH !
+   j k want ar HOLDS ;
+
+: SHARED-FOLD-KEEPS-ITS-FOLDERS-SPELLING ( ^ARENA:arena -- )
+   {: ar :}
+   s" shared fold keeps its folders' spelling" T-LABEL
+   TEST-DROPBOX:RESET
+   s" cherokee bytes" ar IDENTITY {: h:DROPBOX:hash :}
+   ar CASE-JOURNAL {: d:str j :}
+   [: s" rev-a" h DOCS-UNLOWERED-JSON+ ;] ar ENTRIES s" first" false PAGE
+   [: s" rev-b" h DOCS-UNLOWERED-JSON+ ;] ar ENTRIES s" second" false PAGE
+   d [: j TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK ar REFRESHED
+        j s" first" ar DOCS-HELD
+        j TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK ar REFRESHED ;]
+   ar LOGGED {: t:str :}
+   t 10 STR:COUNT-CHAR 1 T=
+   t S\" `/Docs/\xe1\x8e\xa0.txt` does not fold to `/docs/\xe1\x8e\xa0.txt`"
+   STR:CONTAINS? TTRUE
+   j s" second" ar DOCS-HELD
+   TEST-DROPBOX:SEEN$
+   s" /2/files/list_folder /2/files/list_folder/continue" T$=
+   d j GONE ;
+
 : MISMATCH-LOGGED-ONCE-AFTER-A-FAILED-PAGE ( ^ARENA:arena -- )
    {: ar :}
    s" mismatch logged once after a failed page" T-LABEL
@@ -2730,6 +2969,7 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
    ar RESTRICTED-LATER-PAGE-PUBLISHES-AS-UNKNOWN-INACCESSIBLE
    ar MISMATCHED-ENTRY-PUBLISHES-AS-UNSUPPORTED
    ar UNLOWERED-PATH-PUBLISHES-AT-ITS-FOLD
+   ar SHARED-FOLD-KEEPS-ITS-FOLDERS-SPELLING
    ar MISMATCH-LOGGED-ONCE-AFTER-A-FAILED-PAGE
    ar EXTRA-COMPONENT-PUBLISHES-AS-UNSUPPORTED
    ar UNLOWERED-ROOT-LISTS-ITS-ENTRIES ;
@@ -5277,6 +5517,7 @@ IO-CAP BUFFER: IO-BUF
    rs s" Shared/notes.txt" notes REMOTE-PRESENT ar REMOTE+
    rs s" Shared/keep.txt" keep REMOTE-PRESENT ar REMOTE+
    x RUN-JOURNAL @ s" cursor-accessible" DROPBOX:>CURSOR rs
+   ar NO-CHANGES
    JOURNAL:PUBLISH-REMOTE-INVENTORY ;
 
 \ Shared's notes and keep, observed on both sides, then notes removed
@@ -7648,6 +7889,10 @@ TYPED-VARIABLE STAND-IN-UPLOAD str
    ar LISTING-KEEPS-MISMATCHED-PATHS-UNSUPPORTED
    ar MISMATCHED-RESTRICTED-FOLDER-DROPS-ITS-CHILDREN
    ar TWO-SPELLINGS-SHARE-ONE-KEY
+   ar A-DELETED-UNLOWERED-FOLDER-LEAVES-NO-RECORD
+   ar A-RELISTED-HOLD-KEEPS-ITS-FOLDERS-CASING
+   ar A-HELD-CHILD-SPELLS-ITS-HELD-FOLDER
+   ar FITTING-FOLDER-REPLACES-ITS-UNSUPPORTED-RECORD
    ar LISTING-REJECTS-AN-INVALID-CONFIGURED-ROOT
    ar LISTING-REJECTS-AN-ENTRY-WITHOUT-PATHS
    ar LISTING-REJECTS-A-PATH-THAT-IS-NOT-UTF-8

@@ -1,13 +1,15 @@
-\ journal-test.f - JOURNAL's open, schema 12, bindings, inventories,
+\ journal-test.f - JOURNAL's open, schema 13, bindings, inventories,
 \ baselines, plans, completions, conflicts, recoveries and upload
 \ sessions on journals under TMPDIR: a new journal's sqlite_master
 \ against src/oracle/schema.tsv as a set, but for the baselines,
 \ remote_observations, local_observations and local_hash_cache tables,
 \ which are migrations/0010.sql's, the upload_sessions table,
-\ migrations/0011.sql's, and conflict_blocks, 0012.sql's, and its
-\ user_version 12; versions 1, 7 and 13 refused unchanged; a schema-10
-\ and a schema-11 journal migrated to 12; src/oracle/journal.sqlite3, a
-\ schema-8 journal, migrated to 12 with its local observations keyed by their
+\ migrations/0011.sql's, conflict_blocks, 0012.sql's, and
+\ remote_mismatches and remote_shadows, 0013.sql's, and its
+\ user_version 13; versions 1, 7 and 14 refused unchanged; a schema-10,
+\ a schema-11 and a schema-12 journal migrated to 13;
+\ src/oracle/journal.sqlite3, a schema-8 journal, migrated to 13 with
+\ its local observations keyed by their
 \ folded paths and its baselines, remote and local observations and
 \ hash cache in typed columns, and, without its
 \ remote_directories index, left at schema 8 with every row when the
@@ -37,7 +39,12 @@
 \ opens, unchanged; a failed open's E-FILE leaving EACCES in FS:ERRNO;
 \ the keys EACH-LOCAL-COLLISION visits, in MODEL:KEY-CMP's order, and
 \ LOCAL-COUNT and LOCAL-AT over published scans; REMOTE-AT at held and
-\ unheld keys; LIVE-PLAN-AT at a pending, a blocked, a completed and an
+\ unheld keys; a key a delta's or a listing's hold shows unsupported,
+\ spelled as the hold's path, its record, a directory
+\ REMOTE-DIRECTORY-AT finds, back at the unhold, the hold gone with an
+\ unhold or a subtree deletion above its lower, and a hold on a key its
+\ lower or its path does not fold to refused; LIVE-PLAN-AT at a
+\ pending, a blocked, a completed and an
 \ unheld key; a completed download plan kept by every prune, the one at
 \ open included, until it is forgotten or a new root's activation
 \ deletes it, and a completed upload plan not;
@@ -53,7 +60,7 @@
 \ its src/daemon.rs under their names, which
 \ build each decision the Rust ones ask the planner for as
 \ src/oracle/plan.tsv holds it. Habu opens no
-\ schema-6 file, so the version-six tests start from a schema-12 journal
+\ schema-6 file, so the version-six tests start from a schema-13 journal
 \ holding the row migration 7 leaves for a schema-6 root, birth and
 \ subvolume NULL, and the baseline the Rust tests' version_six_with_root
 \ writes. A copy of the oracle journal with a value MODEL cannot read
@@ -218,7 +225,16 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    c [: c V11 RUN ;] SQLITE:WITH-TRANSACTION
    c SQLITE:CLOSE ;
 
-\ The oracle journal copied to path and migrated to schema 12, its
+\ The oracle journal copied to path and brought to schema 12 in one
+\ transaction.
+: TWELVE-ORACLE ( str -- )
+   {: p:str :}
+   p ELEVEN-ORACLE
+   p SQLITE:OPEN {: c :}
+   c [: c V12 RUN ;] SQLITE:WITH-TRANSACTION
+   c SQLITE:CLOSE ;
+
+\ The oracle journal copied to path and migrated to schema 13, its
 \ completed work kept.
 : MIGRATED-ORACLE ( str -- )
    {: p:str :}
@@ -390,8 +406,9 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
 
 \ ---- the journal's rows ------------------------------------------
 
-\ Every row but those of the tables 0010.sql to 0012.sql define and of
-\ conflict_blocks' index, as schema.tsv writes one.
+\ Every row but those of the tables 0010.sql to 0013.sql define and of
+\ the indexes on 0012.sql's and 0013.sql's tables, as schema.tsv writes
+\ one.
 : SCHEMA-SQL ( -- str )
    s" SELECT type || char(9) || name || char(9) || tbl_name || char(9)
          || coalesce(replace(replace(replace(sql, '\', '\\'),
@@ -400,7 +417,8 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
       WHERE NOT (type = 'table' AND name IN
          ('baselines', 'remote_observations', 'local_observations',
             'local_hash_cache', 'upload_sessions'))
-         AND tbl_name <> 'conflict_blocks'" ;
+         AND tbl_name NOT IN
+            ('conflict_blocks', 'remote_mismatches', 'remote_shadows')" ;
 
 \ Counts the rows, each a line of BODY.
 : SCHEMA-ROWS ( n SQLITE:statement -- n SQLITE:statement )
@@ -421,12 +439,12 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    BODY BYTES$ t STR:CONTAINS? swap ;
 
 \ The journal's schema is schema.tsv's but for the tables 0010.sql to
-\ 0012.sql define, which are theirs, and its version is 12.
-: SCHEMA-12 ( journal -- )
+\ 0013.sql define, which are theirs, and its version is 13.
+: SCHEMA-13 ( journal -- )
    >CONNECTION {: c :}
    s" src/oracle/schema.tsv" ORACLE
    0 c SCHEMA-SQL [: SCHEMA-ROWS ;] SQLITE:WITH-STATEMENT 22 T=
-   c VERSION 12 T=
+   c VERSION 13 T=
    s" migrations/0011.sql" ORACLE
    c s" SELECT sql FROM sqlite_master
       WHERE type = 'table' AND name = 'upload_sessions'" [: BODY-HOLDS ;]
@@ -447,6 +465,16 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
    s" migrations/0012.sql" ORACLE
    c s" SELECT sql FROM sqlite_master
       WHERE type = 'table' AND name = 'conflict_blocks'" [: BODY-HOLDS ;]
+   SQLITE:WITH-STATEMENT TTRUE
+   s" migrations/0013.sql" ORACLE
+   c s" SELECT sql FROM sqlite_master
+      WHERE type = 'table' AND name = 'remote_mismatches'" [: BODY-HOLDS ;]
+   SQLITE:WITH-STATEMENT TTRUE
+   c s" SELECT sql FROM sqlite_master
+      WHERE type = 'index' AND name = 'remote_mismatches_by_canonical_path'"
+   [: BODY-HOLDS ;] SQLITE:WITH-STATEMENT TTRUE
+   c s" SELECT sql FROM sqlite_master
+      WHERE type = 'table' AND name = 'remote_shadows'" [: BODY-HOLDS ;]
    SQLITE:WITH-STATEMENT TTRUE ;
 
 : VERSIONED ( str n -- )
@@ -857,31 +885,42 @@ variable SCANNED       \ query plan rows that scan the table
 
 : NEW-JOURNAL-HAS-THE-ORACLE-SCHEMA ( ^ARENA:arena -- )
    {: ar :}
-   s" a new journal's schema is schema.tsv's and 0010.sql's to 0012.sql's"
+   s" a new journal's schema is schema.tsv's and 0010.sql's to 0013.sql's"
    T-LABEL
    s" src/oracle/schema.tsv" ORACLE
    BODY BYTES$ 10 STR:COUNT-CHAR 28 T=
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
-   j SCHEMA-12
+   j SCHEMA-13
    j CLOSE
    d GONE ;
 
 : OTHER-VERSIONS-ARE-REFUSED-UNCHANGED ( ^ARENA:arena -- )
    {: ar :}
-   s" versions 1, 7 and 13 are refused unchanged" T-LABEL
+   s" versions 1, 7 and 14 are refused unchanged" T-LABEL
    1 ar REFUSED
    7 ar REFUSED
-   13 ar REFUSED ;
+   14 ar REFUSED ;
 
 : SCHEMA-11-JOURNAL-IS-MIGRATED ( ^ARENA:arena -- )
    {: ar :}
-   s" a schema-11 journal migrates to schema 12" T-LABEL
+   s" a schema-11 journal migrates to schema 13" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p ELEVEN-ORACLE
    p VERSION-AT 11 T=
    p OPEN {: j :}
-   j SCHEMA-12
+   j SCHEMA-13
+   j CLOSE
+   d GONE ;
+
+: SCHEMA-12-JOURNAL-IS-MIGRATED ( ^ARENA:arena -- )
+   {: ar :}
+   s" a schema-12 journal migrates to schema 13" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p TWELVE-ORACLE
+   p VERSION-AT 12 T=
+   p OPEN {: j :}
+   j SCHEMA-13
    j CLOSE
    d GONE ;
 
@@ -944,11 +983,11 @@ variable SCANNED       \ query plan rows that scan the table
 
 : ORACLE-JOURNAL-IS-MIGRATED ( ^ARENA:arena -- )
    {: ar :}
-   s" the oracle journal migrates to schema 12" T-LABEL
+   s" the oracle journal migrates to schema 13" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    s" src/oracle/journal.sqlite3" p FS:COPY-FILE-STREAM
    p OPEN {: j :}
-   j SCHEMA-12
+   j SCHEMA-13
    j s" Docs" DISPLAY ar BASELINE MODEL-BASELINE:DIRECTORY
    BASELINE-HELD? TTRUE
    j s" Docs/A.txt" DISPLAY ar BASELINE ORACLE-FILE BASELINE-HELD? TTRUE
@@ -1306,7 +1345,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    ( ^ARENA:arena -- )
    {: ar :}
    s" journal_rejects_newer_schema_without_changing_its_version" T-LABEL
-   13 ar REFUSED ;
+   14 ar REFUSED ;
 
 : JOURNAL-SCHEMA-AND-PAYLOAD-COLUMNS-ARE-NOT-SECRET-BEARING
    ( ^ARENA:arena -- )
@@ -1344,7 +1383,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
 
 : PUBLISH-DUPLICATES ( -- )
    THE-JOURNAL @ s" cursor-new" CURSOR THE-REMOTES @
-   PUBLISH-REMOTE-INVENTORY ;
+   SUBJECT-ARENA @ DELTA PUBLISH-REMOTE-INVENTORY ;
 
 : JOURNAL-REMOTE-INVENTORY-AND-CURSOR-PUBLISH-ATOMICALLY
    ( ^ARENA:arena -- )
@@ -1354,13 +1393,13 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    p OPEN {: j :}
    s" old.txt" s" old.txt" s" old" s" rev-old" PRESENT-REMOTE ar
    REMOTE-RECORD ar ONE-REMOTE {: old :}
-   j s" cursor-old" CURSOR old PUBLISH-REMOTE-INVENTORY
+   j s" cursor-old" CURSOR old ar DELTA PUBLISH-REMOTE-INVENTORY
    ar REMOTES {: dups :}
    s" duplicate.txt" s" duplicate.txt" REMOTE-DIRECTORY ar
    REMOTE-RECORD dups REMOTE+
    s" duplicate.txt" s" duplicate.txt" s" new" s" rev-new" PRESENT-REMOTE
    ar REMOTE-RECORD dups REMOTE+
-   j THE-JOURNAL !  dups THE-REMOTES !
+   j THE-JOURNAL !  dups THE-REMOTES !  ar SUBJECT-ARENA !
    [: PUBLISH-DUPLICATES ;] SQLITE:E-SQL d s" UNIQUE constraint failed"
    ar LOGGED
    j ar REMOTE-INVENTORY JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur v :}
@@ -1408,7 +1447,8 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    s" remote_delta_mutates_only_changed_rows_and_cursor" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
-   j s" cursor-old" CURSOR ar BULK PUBLISH-REMOTE-INVENTORY
+   j s" cursor-old" CURSOR ar BULK ar DELTA
+   PUBLISH-REMOTE-INVENTORY
    j TOTAL-CHANGES {: before-empty :}
    j s" cursor-empty" CURSOR ar DELTA APPLY-REMOTE-INVENTORY-DELTA
    j TOTAL-CHANGES before-empty - 1 T=
@@ -1451,7 +1491,8 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    s" remote_delta_deletes_only_the_named_subtree" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
-   j s" cursor-old" CURSOR ar SUBTREE-SAMPLE PUBLISH-REMOTE-INVENTORY
+   j s" cursor-old" CURSOR ar SUBTREE-SAMPLE ar DELTA
+   PUBLISH-REMOTE-INVENTORY
    0 INDEXED !  0 SCANNED !
    j >CONNECTION SUBTREE-PLAN-SQL [: SUBTREE-PLAN ;]
    SQLITE:WITH-STATEMENT
@@ -1481,7 +1522,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
    j s" cursor-old" CURSOR INACCESSIBLE ar SHARED ar ONE-REMOTE
-   PUBLISH-REMOTE-INVENTORY
+   ar DELTA PUBLISH-REMOTE-INVENTORY
    j s" cursor-ensure" CURSOR REMOTE-DIRECTORY ar SHARED ENSURE
    ar ONE-CHANGE APPLY-REMOTE-INVENTORY-DELTA
    j ar REMOTE-INVENTORY INACCESSIBLE HOLDS-ONLY? TTRUE
@@ -1512,7 +1553,8 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    s" remote_directory_paths_include_restricted_folders" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
-   j s" cursor" CURSOR ar RESTRICTED-SAMPLE PUBLISH-REMOTE-INVENTORY
+   j s" cursor" CURSOR ar RESTRICTED-SAMPLE ar DELTA
+   PUBLISH-REMOTE-INVENTORY
    j s" docs" ar DIRECTORY-AT s" Docs" DIRECTORY-IS? TTRUE
    j s" shared" ar DIRECTORY-AT s" Shared" DIRECTORY-IS? TTRUE
    j s" docs/a.txt" ar DIRECTORY-AT NO-DIRECTORY? TTRUE
@@ -1539,11 +1581,200 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
    ar RESTRICTED-SAMPLE {: v :}
-   j s" cursor" CURSOR v PUBLISH-REMOTE-INVENTORY
+   j s" cursor" CURSOR v ar DELTA PUBLISH-REMOTE-INVENTORY
    j s" docs/a.txt" ar CANONICAL ar REMOTE-AT v 1 VEC:AT @ REMOTE-IS?
    TTRUE
    j s" shared" ar CANONICAL ar REMOTE-AT v 2 VEC:AT @ REMOTE-IS? TTRUE
    j s" absent" ar CANONICAL ar REMOTE-AT NO-REMOTE? TTRUE
+   j CLOSE
+   d GONE ;
+
+\ "Ꭰ", U+13A0, folds to "ꭰ", U+AB70, which Dropbox keeps as its own
+\ fold: an entry at lower "Ꭰ.txt" holds the key "ꭰ.txt".
+: SHARED-LOWER ( -- str ) s" Ꭰ.txt" ;
+: SHARED-OWN ( -- str ) s" ꭰ.txt" ;
+\ A spelling of SHARED-OWN's key other than its bytes.
+: SHARED-SPELLED ( -- str ) s" ꭰ.TXT" ;
+
+: HOLD ( MODEL:path MODEL:key MODEL:path -- remote-inventory-change )
+   construct remote-inventory-change hold ;
+
+: UNHOLD ( MODEL:path MODEL:key -- remote-inventory-change )
+   construct remote-inventory-change unhold ;
+
+\ The hold of the entry at lower l, on l's fold, spelled as its bytes.
+: HOLD-AT ( str ^ARENA:arena -- remote-inventory-change )
+   {: l:str ar :}
+   l ar CANONICAL {: k :}
+   l DISPLAY k k MODEL:KEY>STR DISPLAY HOLD ;
+
+: UNHOLD-AT ( str ^ARENA:arena -- remote-inventory-change )
+   {: l:str ar :}
+   l DISPLAY l ar CANONICAL UNHOLD ;
+
+: UNSUPPORTED-REMOTE ( -- MODEL:observation<MODEL:remote> )
+   MODEL-UNKNOWN--REASON:UNSUPPORTED MODEL-OBSERVATION:UNKNOWN ;
+
+\ The unsupported record HOLD-AT's hold shows at the key k, its path
+\ k's bytes.
+: HELD-RECORD ( str ^ARENA:arena -- MODEL:remote-record )
+   {: k:str ar :}
+   k ar CANONICAL {: key:MODEL:key :}
+   key key MODEL:KEY>STR DISPLAY UNSUPPORTED-REMOTE
+   MODEL-REMOTE--RECORD:MAKE ;
+
+: OWN-FILE ( ^ARENA:arena -- MODEL:remote-record )
+   {: ar :}
+   SHARED-OWN SHARED-OWN OLD-FILE ar REMOTE-RECORD ;
+
+\ Applies the one change, with the cursor s.
+: CHANGED ( journal str remote-inventory-change ^ARENA:arena -- )
+   {: j s:str c ar :}
+   j s CURSOR c ar ONE-CHANGE APPLY-REMOTE-INVENTORY-DELTA ;
+
+: REMOTE-AT-KEY
+   ( journal str ^ARENA:arena -- option<MODEL:remote-record> )
+   {: j k:str ar :}
+   j k ar CANONICAL ar REMOTE-AT ;
+
+: PUBLISHED-ALONE ( journal MODEL:remote-record ^ARENA:arena -- )
+   {: j r ar :}
+   j s" cursor" CURSOR r ar ONE-REMOTE ar DELTA
+   PUBLISH-REMOTE-INVENTORY ;
+
+: A-HOLD-HIDES-THE-RECORD-UNTIL-ITS-UNHOLD ( ^ARENA:arena -- )
+   {: ar :}
+   s" a hold hides the key's record until its unhold" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   ar OWN-FILE {: f :}
+   j f ar PUBLISHED-ALONE
+   SHARED-OWN ar CANONICAL {: k :}
+   SHARED-SPELLED DISPLAY {: sp :}
+   j s" cursor-hold" SHARED-LOWER DISPLAY k sp HOLD ar CHANGED
+   j SHARED-OWN ar REMOTE-AT-KEY k sp UNSUPPORTED-REMOTE
+   MODEL-REMOTE--RECORD:MAKE REMOTE-IS? TTRUE
+   j s" cursor-unhold" SHARED-LOWER ar UNHOLD-AT ar CHANGED
+   j SHARED-OWN ar REMOTE-AT-KEY f REMOTE-IS? TTRUE
+   j CLOSE
+   d GONE ;
+
+: A-HELD-KEY-OUTLIVES-ITS-OWN-DELETION ( ^ARENA:arena -- )
+   {: ar :}
+   s" a held key stays unsupported past its own entry's deletion"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j ar OWN-FILE ar PUBLISHED-ALONE
+   j s" cursor-hold" SHARED-LOWER ar HOLD-AT ar CHANGED
+   j s" cursor-delete" SHARED-OWN ar CANONICAL DELETE-SUBTREE ar CHANGED
+   j SHARED-OWN ar REMOTE-AT-KEY SHARED-OWN ar HELD-RECORD REMOTE-IS?
+   TTRUE
+   j s" cursor-unhold" SHARED-LOWER ar UNHOLD-AT ar CHANGED
+   j SHARED-OWN ar REMOTE-AT-KEY NO-REMOTE? TTRUE
+   j CLOSE
+   d GONE ;
+
+\ "Ꭰ/x.txt" holds "ꭰ/x.txt"; the unhold of "Ꭰ" releases it.
+: AN-UNHOLD-RELEASES-THE-HOLDS-BENEATH-IT ( ^ARENA:arena -- )
+   {: ar :}
+   s" an unhold releases the holds beneath its lower" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j s" cursor" CURSOR ar REMOTES ar DELTA PUBLISH-REMOTE-INVENTORY
+   j s" cursor-hold" s" Ꭰ/x.txt" ar HOLD-AT ar CHANGED
+   j s" ꭰ/x.txt" ar REMOTE-AT-KEY s" ꭰ/x.txt" ar HELD-RECORD
+   REMOTE-IS? TTRUE
+   j s" cursor-unhold" s" Ꭰ" ar UNHOLD-AT ar CHANGED
+   j s" ꭰ/x.txt" ar REMOTE-AT-KEY NO-REMOTE? TTRUE
+   j CLOSE
+   d GONE ;
+
+\ "d/Ꭰ.txt" holds "d/ꭰ.txt"; the deletion of "d" releases it.
+: A-SUBTREE-DELETION-RELEASES-THE-HOLDS-BENEATH-IT ( ^ARENA:arena -- )
+   {: ar :}
+   s" a subtree deletion releases the holds beneath its key" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j s" d" s" d" REMOTE-DIRECTORY ar REMOTE-RECORD ar PUBLISHED-ALONE
+   j s" cursor-hold" s" d/Ꭰ.txt" ar HOLD-AT ar CHANGED
+   j s" d/ꭰ.txt" ar REMOTE-AT-KEY s" d/ꭰ.txt" ar HELD-RECORD
+   REMOTE-IS? TTRUE
+   j s" cursor-delete" s" d" ar CANONICAL DELETE-SUBTREE ar CHANGED
+   j s" d/ꭰ.txt" ar REMOTE-AT-KEY NO-REMOTE? TTRUE
+   j CLOSE
+   d GONE ;
+
+: A-LISTING-HOLDS-A-DIRECTORY-KEY ( ^ARENA:arena -- )
+   {: ar :}
+   s" a listing's hold hides a directory REMOTE-DIRECTORY-AT still finds"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   s" ꭰ" s" ꭰ" REMOTE-DIRECTORY ar REMOTE-RECORD {: dir :}
+   j s" cursor" CURSOR dir ar ONE-REMOTE
+   s" Ꭰ" ar HOLD-AT ar ONE-CHANGE PUBLISH-REMOTE-INVENTORY
+   j s" ꭰ" ar REMOTE-AT-KEY s" ꭰ" ar HELD-RECORD REMOTE-IS? TTRUE
+   j s" ꭰ" ar DIRECTORY-AT s" ꭰ" DIRECTORY-IS? TTRUE
+   j s" cursor-unhold" s" Ꭰ" ar UNHOLD-AT ar CHANGED
+   j s" ꭰ" ar REMOTE-AT-KEY dir REMOTE-IS? TTRUE
+   j CLOSE
+   d GONE ;
+
+\ The hold of "other.txt" on the key "ꭰ.txt", which it does not fold to.
+: STRAY-HOLD ( ^ARENA:arena -- ^VEC:vector<remote-inventory-change> )
+   {: ar :}
+   SHARED-OWN ar CANONICAL {: k :}
+   s" other.txt" DISPLAY k k MODEL:KEY>STR DISPLAY HOLD ar ONE-CHANGE ;
+
+: PUBLISH-STRAY-HOLD ( -- )
+   THE-JOURNAL @ s" cursor-new" CURSOR THE-REMOTES @
+   SUBJECT-ARENA @ STRAY-HOLD PUBLISH-REMOTE-INVENTORY ;
+
+: A-HOLD-ON-ANOTHER-FOLD-IS-REFUSED ( ^ARENA:arena -- )
+   {: ar :}
+   s" a hold on a key its lower does not fold to is refused" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   ar OWN-FILE {: f :}
+   j f ar PUBLISHED-ALONE
+   j THE-JOURNAL !  ar REMOTES THE-REMOTES !  ar SUBJECT-ARENA !
+   [: PUBLISH-STRAY-HOLD ;] E-INVALID-STATE d
+   s" canonical path does not match display path" ar LOGGED
+   j ar REMOTE-INVENTORY JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur v :}
+   cur s" cursor" CURSOR-IS? TTRUE
+   v f ar ONE-REMOTE REMOTES= TTRUE
+   j >CONNECTION s" SELECT count(*) FROM remote_mismatches" QUERY-INT
+   0 T=
+   j CLOSE
+   d GONE ;
+
+\ The hold of SHARED-LOWER on its key, its record spelled "other.txt".
+: MISSPELLED-HOLD
+   ( ^ARENA:arena -- ^VEC:vector<remote-inventory-change> )
+   {: ar :}
+   SHARED-LOWER DISPLAY SHARED-OWN ar CANONICAL s" other.txt" DISPLAY HOLD
+   ar ONE-CHANGE ;
+
+: PUBLISH-MISSPELLED-HOLD ( -- )
+   THE-JOURNAL @ s" cursor-new" CURSOR THE-REMOTES @
+   SUBJECT-ARENA @ MISSPELLED-HOLD PUBLISH-REMOTE-INVENTORY ;
+
+: A-HOLD-SPELLED-AS-ANOTHER-KEY-IS-REFUSED ( ^ARENA:arena -- )
+   {: ar :}
+   s" a hold whose path does not fold to its key is refused" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   ar OWN-FILE {: f :}
+   j f ar PUBLISHED-ALONE
+   j THE-JOURNAL !  ar REMOTES THE-REMOTES !  ar SUBJECT-ARENA !
+   [: PUBLISH-MISSPELLED-HOLD ;] E-INVALID-STATE d
+   s" `other.txt`: canonical path does not match display path" ar LOGGED
+   j ar REMOTE-INVENTORY JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur v :}
+   cur s" cursor" CURSOR-IS? TTRUE
+   v f ar ONE-REMOTE REMOTES= TTRUE
+   j >CONNECTION s" SELECT count(*) FROM remote_mismatches" QUERY-INT
+   0 T=
    j CLOSE
    d GONE ;
 
@@ -1616,7 +1847,8 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
    j ar MIXED-LOCALS PUBLISH-LOCAL-INVENTORY
-   j s" cursor" CURSOR ar MIXED-REMOTES PUBLISH-REMOTE-INVENTORY
+   j s" cursor" CURSOR ar MIXED-REMOTES ar DELTA
+   PUBLISH-REMOTE-INVENTORY
    j ar UNKNOWN-LOCALS ar UNKNOWN-SAMPLE-LOCALS LOCAL-RECORDS= TTRUE
    j ar UNKNOWN-REMOTES ar UNKNOWN-SAMPLE-REMOTES REMOTES= TTRUE
    j CLOSE
@@ -2994,7 +3226,8 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
    s" remote_subtree_holds_only_true_descendants" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
-   j s" cursor" CURSOR ar DESCENDANTS PUBLISH-REMOTE-INVENTORY
+   j s" cursor" CURSOR ar DESCENDANTS ar DELTA
+   PUBLISH-REMOTE-INVENTORY
    j s" report" ar SUBTREE-AT s" occupied " T$=
    j s" reports" ar SUBTREE-AT s" occupied " T$=
    j s" deep" ar SUBTREE-AT s" occupied " T$=
@@ -3981,7 +4214,7 @@ variable CRAFT
 : KEPT ( -- MODEL:baseline )
    s" kept" s" rev-kept" REMOTE-FILE MODEL-BASELINE:PRESENT ;
 
-\ A schema-12 journal holding a schema-6 root's row, as migration 7
+\ A schema-13 journal holding a schema-6 root's row, as migration 7
 \ copies it, and the baseline version_six_with_root writes.
 : LEGACY ( str ^ARENA:arena -- )
    {: p:str ar :}
@@ -4026,7 +4259,7 @@ variable CRAFT
    r ar LOCAL-ROOT-BINDING LEGACY-ROOT RECORD-HELD? TTRUE
    r CLOSE
    p OPEN {: j :}
-   j >CONNECTION VERSION 12 T=
+   j >CONNECTION VERSION 13 T=
    j ar LOCAL-ROOT-BINDING LEGACY-ROOT RECORD-HELD? TTRUE
    s" observed.txt" 10 ar LOCAL-HASH {: hash :}
    j LEGACY-ROOT >BINDING OBSERVED ar ONE-LOCAL hash ar ONE-HASH
@@ -4776,7 +5009,8 @@ variable CRAFT
    PUBLISH-LOCAL-INVENTORY
    s" tracked.txt" s" tracked.txt" agreed MODEL-OBSERVATION:PRESENT ar
    REMOTE-RECORD {: remote :}
-   j s" cursor-kept" CURSOR remote ar ONE-REMOTE PUBLISH-REMOTE-INVENTORY
+   j s" cursor-kept" CURSOR remote ar ONE-REMOTE ar DELTA
+   PUBLISH-REMOTE-INVENTORY
    j s" old-root-conflict.txt" DISPLAY DIVERGENT ar RECORD-CONFLICT drop
    remote ;
 
@@ -5080,14 +5314,14 @@ TYPED-VARIABLE HELD-OPERATION operation-id
    d GONE ;
 
 \ A schema-10 journal gains the empty upload session table.
-: A-SCHEMA-10-JOURNAL-MIGRATES-TO-12 ( ^ARENA:arena -- )
+: A-SCHEMA-10-JOURNAL-MIGRATES-TO-13 ( ^ARENA:arena -- )
    {: ar :}
-   s" a schema-10 journal migrates to schema 12" T-LABEL
+   s" a schema-10 journal migrates to schema 13" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p TEN-ORACLE
    p VERSION-AT 10 T=
    p OPEN {: j :}
-   j SCHEMA-12
+   j SCHEMA-13
    j SESSION-ROWS 0 T=
    j CLOSE
    d GONE ;
@@ -5173,7 +5407,7 @@ TYPED-VARIABLE HELD-OPERATION operation-id
       VALUES (CAST('Old/Gone.txt' AS BLOB), '\"Absent\"',
          CAST('old/gone.txt' AS BLOB))" p PLANT-AT
    p OPEN {: j :}
-   j >CONNECTION VERSION 12 T=
+   j >CONNECTION VERSION 13 T=
    j s" Docs" DISPLAY ar BASELINE MODEL-BASELINE:DIRECTORY
    BASELINE-HELD? TTRUE
    j s" Docs/A.txt" DISPLAY ar BASELINE ORACLE-FILE BASELINE-HELD? TTRUE
@@ -5240,7 +5474,7 @@ TYPED-VARIABLE HELD-OPERATION operation-id
    p NINE-ORACLE
    EVERY-REMOTE-KIND p PLANT-AT
    p OPEN {: j :}
-   j >CONNECTION VERSION 12 T=
+   j >CONNECTION VERSION 13 T=
    j ar REMOTE-INVENTORY JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur v :}
    v VEC:COUNT 8 T=
    v ar ORACLE-REMOTES? TTRUE
@@ -5318,7 +5552,7 @@ TYPED-VARIABLE HELD-OPERATION operation-id
    p NINE-ORACLE
    EVERY-LOCAL-KIND p PLANT-AT
    p OPEN {: j :}
-   j >CONNECTION VERSION 12 T=
+   j >CONNECTION VERSION 13 T=
    j ar LOCAL-INVENTORY ar MIGRATED-LOCALS LOCAL-RECORDS= TTRUE
    s" Future" MODEL-UNKNOWN--REASON:INCOMPLETE UNKNOWN-AT {: f :}
    j s" future" ar CANONICAL ar LOCAL-AT f LOCAL-IS? TTRUE
@@ -5397,7 +5631,7 @@ TYPED-VARIABLE HELD-OPERATION operation-id
    p NINE-ORACLE
    EVERY-HASH-KIND p PLANT-AT
    p OPEN {: j :}
-   j >CONNECTION VERSION 12 T=
+   j >CONNECTION VERSION 13 T=
    j >CONNECTION s" SELECT count(*) FROM local_hash_cache" QUERY-INT
    3 T=
    j ar HASHES-MIGRATED
@@ -5811,6 +6045,7 @@ TYPED-VARIABLE HELD-OPERATION operation-id
    ar ORACLE-JOURNAL-HOLDS-ITS-BINDINGS
    ar ORACLE-JOURNAL-IS-MIGRATED
    ar SCHEMA-11-JOURNAL-IS-MIGRATED
+   ar SCHEMA-12-JOURNAL-IS-MIGRATED
    ar FAILED-MIGRATION-LEAVES-SCHEMA-8
    ar WRITABLE-JOURNAL-CREATES-OWNER-ONLY-DATABASE
    ar READ-ONLY-JOURNAL-PRESERVES-EXISTING-PERMISSIONS
@@ -5847,6 +6082,13 @@ TYPED-VARIABLE HELD-OPERATION operation-id
    ar REMOTE-DELTA-ENSURED-DIRECTORY-KEEPS-AN-UNKNOWN-FOLDER
    ar REMOTE-DIRECTORY-AT-INCLUDES-RESTRICTED-FOLDERS
    ar REMOTE-AT-ANSWERS-THE-RECORD-AT-A-KEY
+   ar A-HOLD-HIDES-THE-RECORD-UNTIL-ITS-UNHOLD
+   ar A-HELD-KEY-OUTLIVES-ITS-OWN-DELETION
+   ar AN-UNHOLD-RELEASES-THE-HOLDS-BENEATH-IT
+   ar A-SUBTREE-DELETION-RELEASES-THE-HOLDS-BENEATH-IT
+   ar A-LISTING-HOLDS-A-DIRECTORY-KEY
+   ar A-HOLD-ON-ANOTHER-FOLD-IS-REFUSED
+   ar A-HOLD-SPELLED-AS-ANOTHER-KEY-IS-REFUSED
    ar UNKNOWN-OBSERVATIONS-ARE-READ-ALONE
    ar JOURNAL-LOCAL-SCAN-REPLACES-INVENTORY-AND-HASHES-ATOMICALLY
    ar EACH-LOCAL-COLLISION-VISITS-IN-KEY-ORDER
@@ -5924,7 +6166,7 @@ TYPED-VARIABLE HELD-OPERATION operation-id
    ar ACTIVATION-PURGES-THE-PRIOR-ROOTS-COMPLETED-DOWNLOAD-PLANS
    ar PRUNING-REMOVES-THE-OPERATIONS-UPLOAD-SESSION
    ar BLOCKING-AND-UNBLOCKING-KEEP-THE-UPLOAD-SESSION
-   ar A-SCHEMA-10-JOURNAL-MIGRATES-TO-12 ;
+   ar A-SCHEMA-10-JOURNAL-MIGRATES-TO-13 ;
 
 
 : TESTS ( -- )

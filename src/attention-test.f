@@ -151,6 +151,8 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
    p ar MODEL:FOLD p MODEL-UNKNOWN--REASON:STALE REMOTE-UNKNOWN
    MODEL-REMOTE--RECORD:MAKE v VEC:PUSH !
    j s" cursor-must-not-render" DROPBOX:>CURSOR v
+   ar ARENA:ALLOCATOR 0
+   [type] JOURNAL:remote-inventory-change VEC:NEW
    JOURNAL:PUBLISH-REMOTE-INVENTORY ;
 
 : RECORDED ( JOURNAL:plan-write -- JOURNAL:plan-record )
@@ -312,7 +314,7 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
    p ATTENTION:E-JOURNAL d ar REFUSED drop {: e:str :}
    e s" absolute-journal-path-sentinel" STR:CONTAINS? TFALSE
    e FIRST-LINE swap
-   s" journal: journal `[Omabox journal]` has unsupported schema version 0; supported version is 12"
+   s" journal: journal `[Omabox journal]` has unsupported schema version 0; supported version is 13"
    STR:ENDS-WITH? TTRUE
    FIRST-LINE swap
    s" attention: could not open the journal read-only" STR:ENDS-WITH? TTRUE
@@ -376,9 +378,12 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
    ARENA:ALLOCATOR 0 [type] MODEL:remote-record VEC:NEW ;
 
 : PUBLISHED
-   ( JOURNAL:journal ^VEC:vector<MODEL:remote-record> -- )
-   {: j v :}
-   j s" held-cursor" DROPBOX:>CURSOR v JOURNAL:PUBLISH-REMOTE-INVENTORY ;
+   ( JOURNAL:journal ^VEC:vector<MODEL:remote-record> ^ARENA:arena -- )
+   {: j v ar :}
+   j s" held-cursor" DROPBOX:>CURSOR v
+   ar ARENA:ALLOCATOR 0
+   [type] JOURNAL:remote-inventory-change VEC:NEW
+   JOURNAL:PUBLISH-REMOTE-INVENTORY ;
 
 : HELD-FOLDER
    ( ^VEC:vector<MODEL:path> ^VEC:vector<MODEL:remote-record>
@@ -398,7 +403,7 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
    p JOURNAL:OPEN {: j :}
    j ar BIND
    us j ar LOCALS
-   j rs PUBLISHED
+   j rs ar PUBLISHED
    bs j ar FOLDERS
    j JOURNAL:CLOSE
    p ar ATTENTION:RENDER ;

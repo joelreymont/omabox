@@ -54,15 +54,15 @@ overflows or it refuses, and hourly.
 | `PLANNER` | `PLAN`, a decision table | `planner.rs` |
 | `CONFIG` | paths, `config.toml`, the instance lock | `config.rs` |
 | `STATUS` | `status.json`, rewritten every 20 s by its own task | `runtime_status.rs` |
-| `JOURNAL` | schema 12; a listing publishes in one transaction | `journal.rs` |
+| `JOURNAL` | schema 13; a listing publishes in one transaction | `journal.rs` |
 | `LOCAL` | scan, hash, stage, install, guarded delete | `local.rs` |
 | `AUTH` | the credential record, PKCE | `auth.rs` |
 | `REPLAY` | pending plans: intent, guard, effect, complete | `recovery.rs` |
 | `RECONCILE` | `PASS`: list, scan, plan, replay, download | `reconcile.rs` |
 | `DAEMON` | `RUN`, and one table of failure dispositions | `daemon.rs` |
 
-- **Journal.** Opens schema 12, creates it from `migrations/` or migrates
-  schemas 8 to 11 to it; refuses every other version. It keys local observations by
+- **Journal.** Opens schema 13, creates it from `migrations/` or migrates
+  schemas 8 to 12 to it; refuses every other version. It keys local observations by
   canonical path, as the user chose on 2026-11-18, and holds baselines,
   observations and the hash cache in typed columns; the Rust version cannot
   open it.

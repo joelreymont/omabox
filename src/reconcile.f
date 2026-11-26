@@ -1138,13 +1138,12 @@ STRUCTURE casing
    ks 0 < if d BAD-PATH then
    f ks f str> nip PART MODEL:>KEY ;
 
-\ The display path d past the root's depth, empty when d has no part
-\ there.
-: DISPLAY-PART ( str listing-root -- str )
-   {: d:str root :}
-   d root ROOT-DEPTH 1+ PAST-SEPARATORS {: ps:n :}
+\ The path past the root's depth, empty when it has no part there.
+: ROOT-PART ( str listing-root -- str )
+   {: p:str root :}
+   p root ROOT-DEPTH 1+ PAST-SEPARATORS {: ps:n :}
    ps 0 < if s" " exit then
-   d ps d str> nip PART ;
+   p ps p str> nip PART ;
 
 \ Whether the display part p spells the key k; an empty one never does.
 : FITTING? ( MODEL:key str ^ARENA:arena -- bool )
@@ -1154,12 +1153,13 @@ STRUCTURE casing
    p DROPBOX:INVALID-PARTS? if false exit then
    p MODEL:>PATH ar MODEL:FOLD k MODEL:KEY= ;
 
-\ Whether the key k is the lower path l's own part beneath the root.
+\ Whether the key k is the lower path l's own part beneath the root; an
+\ empty part never is.
 : OWN-KEY? ( MODEL:key str listing-root -- bool )
    {: k l:str root :}
-   l root ROOT-DEPTH 1+ PAST-SEPARATORS {: ls:n :}
-   ls 0 < if false exit then
-   k KEY-BYTES l ls l str> nip PART STR:= ;
+   l root ROOT-PART {: lp:str :}
+   lp STR:len 0= if false exit then
+   k KEY-BYTES lp STR:= ;
 
 \ Whether the entry is the root's own: its lower path, valid, folds to
 \ the root's fold.
@@ -1282,35 +1282,79 @@ STRUCTURE casing
    UNSUPPORTED-REMOTE k k KEY-BYTES MODEL:>PATH v UPSERT+
    e k mismatched execute ;
 
-\ A deleted entry deletes at its own key; at a key it shares, it is
-\ unsupported there.
-: DELETED-MISMATCHED
+\ An entry at its own key whose display does not spell it: its record
+\ there is unsupported, so a later upsert of the key replaces it.
+: OWN-MISMATCHED
    ( ^DROPBOX:entry MODEL:key
-     ^VEC:vector<JOURNAL:remote-inventory-change> bool
+     ^VEC:vector<JOURNAL:remote-inventory-change>
      [ ^DROPBOX:entry MODEL:key -- ] -- )
-   {: e k v own:bool mismatched :}
-   own if k v DELETE+ exit then
-   e k v mismatched UNSUPPORTED-KEY+ ;
-
-\ A file or folder unsupported at the key, spelled as the key, then
-\ mismatched on it and the key; own tells whether the key is the
-\ entry's own.
-: APPEND-MISMATCHED
-   ( ^DROPBOX:entry MODEL:key
-     ^VEC:vector<JOURNAL:remote-inventory-change> bool
-     [ ^DROPBOX:entry MODEL:key -- ] -- )
-   {: e k v own:bool mismatched :}
+   {: e k v mismatched :}
    e DROPBOX-ENTRY:KIND @ MATCH DROPBOX:kind
       file OF k v DELETE+ e k v mismatched UNSUPPORTED-KEY+ ENDOF
       folder OF
          e DROPBOX-ENTRY:RESTRICTED @ if k v DELETE+ then
          e k v mismatched UNSUPPORTED-KEY+
       ENDOF
-      deleted OF e k v own mismatched DELETED-MISMATCHED ENDOF
+      deleted OF k v DELETE+ ENDOF
+   ;MATCH ;
+
+\ The end of the first component of the key bytes ks that is not the
+\ path bytes ls's, or ks's length when every one is.
+: DIFFERING-END ( str str -- n )
+   {: ks:str ls:str :}
+   0 begin
+      ks swap NEXT-SEPARATOR >r
+      r@ ks str> nip < if ls ks 0 r@ 1+ PART STR:STARTS-WITH?
+      else false then
+   while r> 1+ repeat r> ;
+
+\ The folders at the ancestors of k whose bytes l shares, spelled as k,
+\ and the entry at lower l's hold on k, its record spelled as k; then
+\ mismatched runs on the entry and k. An ancestor past the first
+\ component l does not share is another entry's hold, not a folder of
+\ its own, so it gets no record here.
+: HOLD+
+   ( ^DROPBOX:entry MODEL:path MODEL:key
+     ^VEC:vector<JOURNAL:remote-inventory-change>
+     [ ^DROPBOX:entry MODEL:key -- ] -- )
+   {: e l k v mismatched :}
+   k KEY-BYTES {: ks:str :}
+   ks 0 ks l PATH$ DIFFERING-END PART {: as:str :}
+   as MODEL:>KEY as MODEL:>PATH v APPEND-PARENT-FOLDERS
+   l k ks MODEL:>PATH JOURNAL-REMOTE--INVENTORY--CHANGE:HOLD
+   v VEC:PUSH !
+   e k mismatched execute ;
+
+\ The holds of the entry at lower l and of every entry beneath it go.
+: UNHOLD+
+   ( MODEL:path MODEL:key
+     ^VEC:vector<JOURNAL:remote-inventory-change> -- )
+   {: l k v :}
+   l k JOURNAL-REMOTE--INVENTORY--CHANGE:UNHOLD v VEC:PUSH ! ;
+
+\ An entry at lower l whose key k is not l's own fold: it holds k
+\ unsupported rather than writing a record there, so the record of k's
+\ own entry, if any, outlives it, and k stays unsupported while any
+\ entry holds it. A deleted entry holds nothing and is not handed on.
+: SHARED-MISMATCHED
+   ( ^DROPBOX:entry MODEL:path MODEL:key
+     ^VEC:vector<JOURNAL:remote-inventory-change>
+     [ ^DROPBOX:entry MODEL:key -- ] -- )
+   {: e l k v mismatched :}
+   e DROPBOX-ENTRY:KIND @ MATCH DROPBOX:kind
+      file OF l k v UNHOLD+ e l k v mismatched HOLD+ ENDOF
+      folder OF
+         e DROPBOX-ENTRY:RESTRICTED @ if l k v UNHOLD+ then
+         e l k v mismatched HOLD+
+      ENDOF
+      deleted OF l k v UNHOLD+ ENDOF
    ;MATCH ;
 
 \ Rust's append_entry_changes for one entry, paths UTF-8 as Rust's are;
-\ mismatched runs on an entry whose parts do not fold to its own key.
+\ an entry is observed at its key only when the key is its lower part's
+\ own and its display spells it. Else it is unsupported at its own key
+\ or holds a key that is not its own, and mismatched runs on it unless
+\ it is deleted.
 : APPEND-ENTRY-CHANGES
    ( ^DROPBOX:entry listing-root
      ^VEC:vector<JOURNAL:remote-inventory-change> ^ARENA:arena
@@ -1321,10 +1365,12 @@ STRUCTURE casing
    l str> nip 0= if d BAD-PATH then
    e root ar OWN-ENTRY? if e ROOT-ENTRY exit then
    l d root ar LOWER-KEY {: k :}
-   d root DISPLAY-PART {: p:str :}
+   d root ROOT-PART {: p:str :}
    k l root OWN-KEY? {: own:bool :}
    own k p ar FITTING? and 0= if
-      e k v own mismatched APPEND-MISMATCHED exit
+      own if e k v mismatched OWN-MISMATCHED exit then
+      e l root ROOT-PART ar ARENA:COPY MODEL:>PATH k v mismatched
+      SHARED-MISMATCHED exit
    then
    e k p ar ARENA:COPY MODEL:>PATH v ar APPEND-OBSERVED ;
 
@@ -1333,6 +1379,8 @@ STRUCTURE casing
       upsert OF REMOTE-KEY ENDOF
       ensure-directory OF REMOTE-KEY ENDOF
       delete-subtree OF ENDOF
+      hold OF drop nip ENDOF
+      unhold OF nip ENDOF
    ;MATCH ;
 
 : CHANGE-RECORD
@@ -1341,15 +1389,24 @@ STRUCTURE casing
       upsert OF OPTION:SOME ENDOF
       ensure-directory OF OPTION:SOME ENDOF
       delete-subtree OF drop OPTION:NONE ENDOF
+      hold OF drop drop drop OPTION:NONE ENDOF
+      unhold OF drop drop OPTION:NONE ENDOF
    ;MATCH ;
 
 : DELETE? ( JOURNAL:remote-inventory-change -- bool )
-   CHANGE-RECORD MATCH option
-      none OF true ENDOF
-      some OF drop false ENDOF
+   MATCH JOURNAL:remote-inventory-change
+      upsert OF drop false ENDOF
+      ensure-directory OF drop false ENDOF
+      delete-subtree OF drop true ENDOF
+      hold OF drop drop drop false ENDOF
+      unhold OF drop drop false ENDOF
    ;MATCH ;
 
-: WRITE? ( JOURNAL:remote-inventory-change -- bool ) DELETE? 0= ;
+: WRITE? ( JOURNAL:remote-inventory-change -- bool )
+   CHANGE-RECORD MATCH option
+      none OF false ENDOF
+      some OF drop true ENDOF
+   ;MATCH ;
 
 \ Rust's spells_folder: a folder's or a restricted folder's spelling
 \ is authoritative for its descendants.
@@ -1482,6 +1539,8 @@ STRUCTURE casing
       upsert OF OPTION:SOME ENDOF
       ensure-directory OF held ENSURED ENDOF
       delete-subtree OF drop held ENDOF
+      hold OF drop drop drop held ENDOF
+      unhold OF drop drop held ENDOF
    ;MATCH ;
 
 \ Replays the run of writes from i numbered after the last delete over
@@ -1634,18 +1693,61 @@ STRUCTURE casing
       some OF {: p :} k p cv ar INSERT-DIRECTORY-CASING ENDOF
    ;MATCH ;
 
-\ The kept casings at the writes' keys, each once; a write's ancestors
-\ are writes too (UPSERT+), so these are every key a casing is asked at.
+\ Pushes the key of each of k's ancestors, outermost first, then k.
+: LINEAGE+ ( MODEL:key ^VEC:vector<MODEL:key> -- )
+   {: k v :}
+   k KEY-BYTES {: s:str :}
+   s str> {: p:^ u:n :}
+   u 0 ?do
+      p i + c@ SEPARATOR = if s 0 i PART MODEL:>KEY v VEC:PUSH ! then
+   loop
+   k v VEC:PUSH ! ;
+
+\ The keys the changes spell and each hold's ancestors' keys, repeats
+\ kept; a write's ancestors are writes too (APPEND-PARENT-FOLDERS).
+: SPELLED-KEYS
+   ( ^VEC:vector<JOURNAL:remote-inventory-change> ^ARENA:arena
+     -- ^VEC:vector<MODEL:key> )
+   {: cs ar :}
+   ar ARENA:ALLOCATOR 0 [type] MODEL:key VEC:NEW {: v :}
+   cs VEC:COUNT 0 ?do
+      cs i VEC:AT @ MATCH JOURNAL:remote-inventory-change
+         upsert OF REMOTE-KEY v VEC:PUSH ! ENDOF
+         ensure-directory OF REMOTE-KEY v VEC:PUSH ! ENDOF
+         delete-subtree OF drop ENDOF
+         hold OF drop nip v LINEAGE+ ENDOF
+         unhold OF drop drop ENDOF
+      ;MATCH
+   loop
+   v ;
+
+\ Key x against y.
+: KEY-NTH-CMP ( n n ^VEC:vector<MODEL:key> -- n )
+   {: x:n y:n v :}
+   v x VEC:AT @ v y VEC:AT @ MODEL:KEY-CMP ;
+
+\ Whether the key at i in the order idx is not the one before it.
+: FIRST-OF-KEY? ( n ^VEC:vector<n> ^VEC:vector<MODEL:key> -- bool )
+   {: at:n idx v :}
+   at 0= if true exit then
+   v idx at 1- VEC:AT @ VEC:AT @ v idx at VEC:AT @ VEC:AT @
+   MODEL:KEY= 0= ;
+
+\ The kept casings at every key a change spells and at each of a hold's
+\ ancestors, each once: a hold's ancestors past those its lower path
+\ shares are other entries' holds, not writes.
 : KEPT-CASINGS
    ( JOURNAL:journal ^VEC:vector<n>
      ^VEC:vector<JOURNAL:remote-inventory-change> ^VEC:vector<casing>
      ^ARENA:arena -- )
    {: j ds cs cv ar :}
-   cs [: WRITE? ;] ar KEYED-NUMBERS {: ws :}
-   0 begin dup ws VEC:COUNT < while
-      ws over cs NTH-KEY j ds cs cv ar KEPT-CASING
-      ws swap cs KEY-RUN-END
-   repeat drop ;
+   cs ar SPELLED-KEYS {: ks :}
+   ks VEC:COUNT [: ks KEY-NTH-CMP ;] ar STABLE-ORDER {: idx :}
+   idx VEC:COUNT 0 ?do
+      i idx ks FIRST-OF-KEY? if
+         ks idx i VEC:AT @ VEC:AT @ j ds cs cv ar KEPT-CASING
+      then
+   loop ;
 
 : WRITE-CASING
    ( JOURNAL:remote-inventory-change ^VEC:vector<casing> ^ARENA:arena
@@ -1693,6 +1795,22 @@ STRUCTURE casing
    idx VEC:COUNT 0 ?do cv idx i VEC:AT @ VEC:AT @ out FIRST-CASING+ loop
    out ;
 
+\ A hold respelled by the casings; any other change as it is.
+: RESPELL-HOLD
+   ( JOURNAL:remote-inventory-change ^VEC:vector<casing> ^ARENA:arena
+     -- JOURNAL:remote-inventory-change )
+   {: c cv ar :}
+   c MATCH JOURNAL:remote-inventory-change
+      upsert OF drop c ENDOF
+      ensure-directory OF drop c ENDOF
+      delete-subtree OF drop c ENDOF
+      hold OF {: l k p :}
+         l k k p cv ar NORMALIZED-REMOTE-PATH
+         JOURNAL-REMOTE--INVENTORY--CHANGE:HOLD
+      ENDOF
+      unhold OF drop drop c ENDOF
+   ;MATCH ;
+
 : RESPELL-CHANGE
    ( JOURNAL:remote-inventory-change ^VEC:vector<casing> ^ARENA:arena
      -- JOURNAL:remote-inventory-change )
@@ -1705,6 +1823,8 @@ STRUCTURE casing
          JOURNAL-REMOTE--INVENTORY--CHANGE:ENSURE-DIRECTORY
       ENDOF
       delete-subtree OF drop c ENDOF
+      hold OF drop drop drop c cv ar RESPELL-HOLD ENDOF
+      unhold OF drop drop c ENDOF
    ;MATCH ;
 
 \ Rust's normalize_inventory_changes: a directory keeps the journal's
@@ -1882,11 +2002,21 @@ ENUM listed done ;ENUM
    r REFRESH-JOURNAL @ r LISTED-CURSOR cs
    JOURNAL:APPLY-REMOTE-INVENTORY-DELTA ;
 
+\ Publishes the listing's records and its changes, its holds respelled
+\ in place by the records' casing so a hold spells its folders as they
+\ do; the journal stores the records and only checks that each of the
+\ changes' writes folds to its key, which respelling does not change.
 : PUBLISH ( ^refresh -- )
    {: r :}
-   r REFRESH-CHANGES @ r REFRESH-ARENA @ INVENTORY-RECORDS {: rs :}
+   r REFRESH-CHANGES @ {: cs :}
+   r REFRESH-ARENA @ {: ar :}
+   cs ar INVENTORY-RECORDS {: rs :}
+   rs ar DIRECTORY-CASING {: cv :}
+   cs VEC:COUNT 0 ?do
+      cs i VEC:AT @ cv ar RESPELL-HOLD cs i VEC:AT !
+   loop
    r MISMATCHES-LOG
-   r REFRESH-JOURNAL @ r LISTED-CURSOR rs
+   r REFRESH-JOURNAL @ r LISTED-CURSOR rs cs
    JOURNAL:PUBLISH-REMOTE-INVENTORY ;
 
 \ Rust's refresh_inventory, after formal/InventoryPublication.tla: a

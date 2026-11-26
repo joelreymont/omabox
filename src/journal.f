@@ -1,14 +1,14 @@
-\ journal.f - package JOURNAL: the sync journal, a SQLite file at schema 12
+\ journal.f - package JOURNAL: the sync journal, a SQLite file at schema 13
 \ (rust src/journal.rs at schema 8), and the Dropbox account and local root
 \ it is bound to. OPEN makes the file 0600 without following a link,
-\ creates schema 12 in a new one and migrates schema 8, 9, 10 or 11 to
-\ it, each in one transaction, from migrations/, whose texts this file
-\ lays in the program as it loads; any version but 0 and 8 to 12 is
-\ refused unchanged, and OPEN-READ refuses any but 12. A SQLite failure is SQLITE's throw, passed
-\ up unchanged. JOURNAL's own failures are logged once with the Rust
-\ version's text, then thrown as its codes. E-FILE, E-DISK-FULL and E-ROOT
-\ leave the host errno in FS:ERRNO, 0 where there is none; E-DISK-FULL is
-\ E-FILE on ENOSPC.
+\ creates schema 13 in a new one and migrates schema 8 to 12 to it, each
+\ in one transaction, from migrations/, whose texts this file lays in the
+\ program as it loads; any version but 0 and 8 to 13 is refused
+\ unchanged, and OPEN-READ refuses any but 13. A SQLite failure is
+\ SQLITE's throw, passed up unchanged. JOURNAL's own failures are logged
+\ once with the Rust version's text, then thrown as its codes. E-FILE,
+\ E-DISK-FULL and E-ROOT leave the host errno in FS:ERRNO, 0 where there
+\ is none; E-DISK-FULL is E-FILE on ENOSPC.
 \ A root binding is the root's inode, birth time and subvolume: btrfs gives
 \ a subvolume a new device number at every mount, so the device is none
 \ of it. A binding with no birth time is one a version-6 journal recorded;
@@ -131,7 +131,7 @@ ENUM local-root-activation
 
 private
 
-12 constant SCHEMA
+13 constant SCHEMA
 5000 constant BUSY-MS
 $180 constant MODE-OWNER            \ 0600
 $1FF constant MODE-BITS
@@ -224,6 +224,7 @@ s" migrations/0009.sql" create V9 LAY
 s" migrations/0010.sql" create V10 LAY
 s" migrations/0011.sql" create V11 LAY
 s" migrations/0012.sql" create V12 LAY
+s" migrations/0013.sql" create V13 LAY
 
 : TEXT ( ^n -- str )
    {: p:^n :}
@@ -472,15 +473,16 @@ private
    c MIGRATE-BLOCKED-PLANS
    c V7 RUN  c V8 RUN ;
 
-\ Schema v, 0 or 8 to 11, brought to SCHEMA by each migration it lacks;
-\ 0011.sql and 0012.sql each set the version.
+\ Schema v, 0 or 8 to 12, brought to SCHEMA by each migration it lacks;
+\ 0011.sql, 0012.sql and 0013.sql each set the version.
 : MIGRATE ( SQLITE:connection n -- )
    {: c v :}
    v 0= if c CREATE-SCHEMA then
    v 9 < if c MIGRATE-LOCAL-OBSERVATIONS then
    v 10 < if c MIGRATE-TYPED-COLUMNS then
    v 11 < if c V11 RUN then
-   c V12 RUN ;
+   v 12 < if c V12 RUN then
+   c V13 RUN ;
 
 : WRITABLE ( journal -- )
    {: j :}
@@ -489,7 +491,7 @@ private
    [: j >PATH MODE-OWNER FS:CHMOD-MODE ;]
    s" restrict journal permissions" j >PATH FILE-IO
    c VERSION {: v :}
-   v 0<> v 8 <> and v 9 <> and v 10 <> and v 11 <> and v SCHEMA <> and if
+   v 0<> v 8 <> and v 9 <> and v 10 <> and v 11 <> and v 12 <> and v SCHEMA <> and if
       j >PATH v UNSUPPORTED
    then
    j CONFIGURE-WRITABLE
@@ -578,14 +580,14 @@ private
 
 public
 
-\ The journal at path: schema 12 created in a new or empty file or migrated
-\ from 8 to 11, completed work pruned; any other version refused unchanged.
+\ The journal at path: schema 13 created in a new or empty file or migrated
+\ from 8 to 12, completed work pruned; any other version refused unchanged.
 : OPEN ( str -- journal )
    {: path:str :}
    path OWNER-ONLY
    path SQLITE:OPEN path JOURNAL-MAKE [: READY ;] SET-UP ;
 
-\ The schema-12 journal at path, never created or changed. Its log lines
+\ The schema-13 journal at path, never created or changed. Its log lines
 \ name it `[Omabox journal]`, as Rust's status redacts the path.
 : OPEN-READ ( str -- journal )
    {: path:str :}
@@ -1239,10 +1241,17 @@ STRUCTURE remote-inventory
 
 \ One step of a cursor continuation. ensure-directory adds a missing
 \ ancestor and never replaces a stored path or an unknown observation.
+\ hold: the entry at lower, which folds to key but is not key's own,
+\ holds key unsupported, its record spelled path; unhold: the entry at
+\ lower and every one beneath it hold nothing.
 ENUM remote-inventory-change
    VARIANT upsert FIELD record MODEL:remote-record ;VARIANT
    VARIANT ensure-directory FIELD record MODEL:remote-record ;VARIANT
    VARIANT delete-subtree FIELD key MODEL:key ;VARIANT
+   VARIANT hold
+      FIELD lower MODEL:path FIELD key MODEL:key FIELD path MODEL:path
+   ;VARIANT
+   VARIANT unhold FIELD lower MODEL:path FIELD key MODEL:key ;VARIANT
 ;ENUM
 
 private
@@ -1404,12 +1413,15 @@ public
    s" SELECT cursor FROM remote_inventory WHERE singleton = 1" [: CURSOR-ROW ;] SQLITE:WITH-STATEMENT ;
 
 \ The display path of the directory or restricted folder Dropbox holds
-\ at the key; none for a file or nothing.
+\ at the key, held or not; none for a file or nothing. A held key's
+\ observation is unsupported, so at most one table answers.
 : REMOTE-DIRECTORY-AT
    ( journal MODEL:key ^ARENA:arena -- option<MODEL:path> )
    {: j k ar :}
    j >CONNECTION
-   s" SELECT path FROM remote_observations
+   s" SELECT path FROM remote_shadows
+      WHERE canonical_path = ?1 AND kind IN (1, 4)
+      UNION ALL SELECT path FROM remote_observations
       WHERE canonical_path = ?1 AND kind IN (1, 4)" [: k MODEL:KEY>STR 1 SQLITE:BIND-BLOB ar SPELLING-ROW ;]
    SQLITE:WITH-STATEMENT ;
 
@@ -2520,24 +2532,76 @@ private
       ON CONFLICT(singleton) DO UPDATE SET cursor = excluded.cursor" [: cur DROPBOX:CURSOR>STR 1 SQLITE:BIND-TEXT RAN ;]
    SQLITE:WITH-STATEMENT ;
 
+\ An entry holds one key: its row at lower is replaced.
+: HOLD-WRITTEN ( SQLITE:connection MODEL:path MODEL:key MODEL:path -- )
+   {: c l:MODEL:path k:MODEL:key p:MODEL:path :}
+   c s" INSERT INTO remote_mismatches(lower, canonical_path, path)
+      VALUES (?1, ?2, ?3)
+      ON CONFLICT(lower) DO UPDATE SET
+         canonical_path = excluded.canonical_path, path = excluded.path" [: l MODEL:PATH>STR 1 SQLITE:BIND-BLOB
+      k MODEL:KEY>STR 2 SQLITE:BIND-BLOB
+      p MODEL:PATH>STR 3 SQLITE:BIND-BLOB SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT ;
+
+\ The holds of the entries at the bytes or beneath them.
+: HOLDS-DELETED ( SQLITE:connection str -- )
+   {: c s:str :}
+   c s" DELETE FROM remote_mismatches
+      WHERE lower = ?1
+         OR (lower > CAST(?1 || '/' AS BLOB)
+            AND lower < CAST(?1 || '0' AS BLOB))" [: s 1 SQLITE:BIND-BLOB SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT ;
+
+\ Hides each held key's record behind an unsupported one, kind 8,
+\ spelled as the key's hold of least lower spells it.
+: SETTLE ( SQLITE:connection -- )
+   s" INSERT INTO remote_shadows(
+         canonical_path, path, kind, content, revision)
+      SELECT canonical_path, path, kind, content, revision
+      FROM remote_observations WHERE canonical_path IN
+         (SELECT canonical_path FROM remote_mismatches);
+      DELETE FROM remote_observations WHERE canonical_path IN
+         (SELECT canonical_path FROM remote_mismatches);
+      INSERT INTO remote_observations(canonical_path, path, kind)
+      SELECT canonical_path, path, 8 FROM remote_mismatches AS m
+      WHERE lower = (SELECT min(lower) FROM remote_mismatches
+         WHERE canonical_path = m.canonical_path);" SQLITE:EXEC ;
+
+\ Undoes SETTLE while remote_mismatches holds the keys SETTLE saw.
+: UNSETTLE ( SQLITE:connection -- )
+   s" DELETE FROM remote_observations WHERE canonical_path IN
+         (SELECT canonical_path FROM remote_mismatches);
+      INSERT INTO remote_observations(
+         canonical_path, path, kind, content, revision)
+      SELECT canonical_path, path, kind, content, revision
+      FROM remote_shadows;
+      DELETE FROM remote_shadows;" SQLITE:EXEC ;
+
+\ A listing's change to the holds; its records are written already.
+: HOLDS-APPLIED ( remote-inventory-change SQLITE:connection -- )
+   {: c :}
+   MATCH remote-inventory-change
+      upsert OF drop ENDOF
+      ensure-directory OF drop ENDOF
+      delete-subtree OF {: k :} c k MODEL:KEY>STR HOLDS-DELETED ENDOF
+      hold OF {: l k p :} c l k p HOLD-WRITTEN ENDOF
+      unhold OF
+         drop {: l :} c l MODEL:PATH>STR HOLDS-DELETED
+      ENDOF
+   ;MATCH ;
+
 : REMOTE-WRITTEN
    ( SQLITE:connection DROPBOX:cursor
-     ^VEC:vector<MODEL:remote-record> -- )
-   {: c cur:DROPBOX:cursor v :}
-   c s" DELETE FROM remote_observations" SQLITE:EXEC
+     ^VEC:vector<MODEL:remote-record>
+     ^VEC:vector<remote-inventory-change> -- )
+   {: c cur:DROPBOX:cursor v cs :}
+   c s" DELETE FROM remote_observations;
+      DELETE FROM remote_mismatches;
+      DELETE FROM remote_shadows;" SQLITE:EXEC
    c INSERT-REMOTE [: v REMOTE-INSERTS ;] SQLITE:WITH-STATEMENT
+   cs VEC:COUNT 0 ?do cs i VEC:AT @ c HOLDS-APPLIED loop
+   c SETTLE
    c cur PUBLISH-CURSOR ;
-
-public
-
-\ Replaces the remote inventory and its cursor in one transaction.
-: PUBLISH-REMOTE-INVENTORY
-   ( journal DROPBOX:cursor ^VEC:vector<MODEL:remote-record> -- )
-   {: j cur:DROPBOX:cursor v :}
-   j >CONNECTION {: c :}
-   c [: c cur v REMOTE-WRITTEN ;] SQLITE:WITH-TRANSACTION ;
-
-private
 
 : DELTA-INVALID ( str str -- )
    {: path:str detail:str :}
@@ -2572,12 +2636,27 @@ private
    k MODEL:KEY>STR
    s" subtree deletion path is empty" DELTA-INVALID ;
 
+\ A hold's key is its lower's fold, and its lower names an entry.
+: CHECK-HOLD ( MODEL:path MODEL:key ^ARENA:arena -- )
+   {: l:MODEL:path k:MODEL:key ar :}
+   l MODEL:PATH>STR {: s:str :}
+   s STR:len 0<> if l ar MODEL:FOLD k MODEL:KEY= if exit then then
+   s s" canonical path does not match display path" DELTA-INVALID ;
+
 : CHECK-CHANGE ( remote-inventory-change ^ARENA:arena -- )
    {: ar :}
    MATCH remote-inventory-change
       upsert OF ar CHECK-KEY ENDOF
       ensure-directory OF ar CHECK-ENSURED ENDOF
       delete-subtree OF CHECK-SUBTREE ENDOF
+      hold OF {: l:MODEL:path k:MODEL:key p:MODEL:path :}
+         l k ar CHECK-HOLD
+         p ar MODEL:FOLD k MODEL:KEY= 0= if
+            p MODEL:PATH>STR
+            s" canonical path does not match display path" DELTA-INVALID
+         then
+      ENDOF
+      unhold OF ar CHECK-HOLD ENDOF
    ;MATCH ;
 
 : DELTA-CHECKED
@@ -2598,7 +2677,8 @@ private
    c DELETE-REMOTE-DESCENDANTS
     [: lo 1 SQLITE:BIND-BLOB hi 2 SQLITE:BIND-BLOB
       SQLITE:STEP drop ;]
-   SQLITE:WITH-STATEMENT ;
+   SQLITE:WITH-STATEMENT
+   c k MODEL:KEY>STR HOLDS-DELETED ;
 
 : CHANGE-APPLIED
    ( remote-inventory-change SQLITE:connection ^ARENA:arena -- )
@@ -2609,13 +2689,19 @@ private
          {: r :} c r ENSURE-REMOTE RECORD-WRITTEN
       ENDOF
       delete-subtree OF {: k :} c k ar SUBTREE-DELETED ENDOF
+      hold OF {: l k p :} c l k p HOLD-WRITTEN ENDOF
+      unhold OF
+         drop {: l :} c l MODEL:PATH>STR HOLDS-DELETED
+      ENDOF
    ;MATCH ;
 
 : DELTA-WRITTEN
    ( SQLITE:connection DROPBOX:cursor
      ^VEC:vector<remote-inventory-change> ^ARENA:arena -- )
    {: c cur:DROPBOX:cursor v ar :}
+   c UNSETTLE
    v VEC:COUNT 0 ?do v i VEC:AT @ c ar CHANGE-APPLIED loop
+   c SETTLE
    c cur PUBLISH-CURSOR ;
 
 \ Every change is checked before the transaction begins.
@@ -2634,6 +2720,27 @@ public
    ( journal DROPBOX:cursor ^VEC:vector<remote-inventory-change> -- )
    {: j cur:DROPBOX:cursor v :}
    j >CONNECTION cur v [: DELTA-APPLIED ;] ARENA:WITH ;
+
+private
+
+\ Every change is checked before the transaction begins.
+: LISTING-APPLIED
+   ( SQLITE:connection DROPBOX:cursor
+     ^VEC:vector<MODEL:remote-record>
+     ^VEC:vector<remote-inventory-change> ^ARENA:arena -- )
+   {: c cur:DROPBOX:cursor v cs ar :}
+   cs ar DELTA-CHECKED
+   c [: c cur v cs REMOTE-WRITTEN ;] SQLITE:WITH-TRANSACTION ;
+
+public
+
+\ Replaces the remote inventory, the holds its changes leave and its
+\ cursor in one transaction.
+: PUBLISH-REMOTE-INVENTORY
+   ( journal DROPBOX:cursor ^VEC:vector<MODEL:remote-record>
+     ^VEC:vector<remote-inventory-change> -- )
+   {: j cur:DROPBOX:cursor v cs :}
+   j >CONNECTION cur v cs [: LISTING-APPLIED ;] ARENA:WITH ;
 
 
 \ ---- baselines and plans: values -----------------------------------
