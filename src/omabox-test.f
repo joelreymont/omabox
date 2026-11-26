@@ -115,6 +115,7 @@ require src/lib/secret.f
 require src/dropbox.f
 require src/model.f
 require src/journal.f
+require src/test-journal.f
 require src/planner.f
 require src/stale.f
 require src/config.f
@@ -762,9 +763,7 @@ TYPED-VARIABLE SHOWN str
    sp ar MODEL:FOLD sp MODEL-UNKNOWN--REASON:STALE REMOTE-UNKNOWN
    MODEL-REMOTE--RECORD:MAKE v VEC:PUSH !
    j s" remote-cursor" DROPBOX:>CURSOR v
-   ar ARENA:ALLOCATOR 0
-   [type] JOURNAL:remote-inventory-change VEC:NEW
-   JOURNAL:PUBLISH-REMOTE-INVENTORY
+   JOURNAL:UPSERT-REMOTE-RECORDS
    j JOURNAL:CLOSE ;
 
 : STATUS-REPORTS-THE-JOURNAL-WHEN-THE-ROOT-IS-UNAVAILABLE
@@ -1485,9 +1484,7 @@ TYPED-VARIABLE SHOWN str
    rp ar MODEL:FOLD rp rf MODEL-OBSERVATION:PRESENT
    MODEL-REMOTE--RECORD:MAKE v VEC:PUSH !
    j s" remote-cursor" DROPBOX:>CURSOR v
-   ar ARENA:ALLOCATOR 0
-   [type] JOURNAL:remote-inventory-change VEC:NEW
-   JOURNAL:PUBLISH-REMOTE-INVENTORY ;
+   JOURNAL:UPSERT-REMOTE-RECORDS ;
 
 : CURSOR-IS? ( option<DROPBOX:cursor> str -- bool )
    {: a:str :}

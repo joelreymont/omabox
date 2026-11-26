@@ -44,7 +44,10 @@
 \ spelled as the hold's path, its record, a directory
 \ REMOTE-LISTED-AT finds, back at the unhold, the hold gone with an
 \ unhold or a subtree deletion above its lower, and a hold on a key its
-\ lower or its path does not fold to refused; LIVE-PLAN-AT at a
+\ lower or its path does not fold to refused; a full listing staged in
+\ two batches publishing its records, holds and cursor, each path
+\ spelled by its folders, and one thrown after a batch publishing
+\ nothing and leaving the next one empty staging; LIVE-PLAN-AT at a
 \ pending, a blocked, a completed and an
 \ unheld key; a completed download plan kept by every prune, the one at
 \ open included, until it is forgotten or a new root's activation
@@ -667,6 +670,21 @@ variable SCANNED       \ query plan rows that scan the table
      -- ^VEC:vector<remote-inventory-change> )
    {: c ar :}
    ar DELTA {: v :} c v CHANGE+ v ;
+
+\ The upsert of each record, in order.
+: UPSERTS
+   ( ^VEC:vector<MODEL:remote-record> ^ARENA:arena
+     -- ^VEC:vector<remote-inventory-change> )
+   {: v ar :}
+   ar DELTA {: cs :}
+   v VEC:COUNT 0 ?do v i VEC:AT @ UPSERT cs CHANGE+ loop
+   cs ;
+
+\ Publishes the changes as a full listing staged in one batch, with the
+\ cursor s.
+: LISTED ( journal str ^VEC:vector<remote-inventory-change> -- )
+   {: j s:str cs :}
+   j [: j cs STAGE-LISTING s CURSOR ;] WITH-REMOTE-LISTING ;
 
 
 \ ---- inventories' answers ----------------------------------------
@@ -1395,10 +1413,12 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    j CLOSE
    d GONE ;
 
-: PUBLISH-DUPLICATES ( -- )
-   THE-JOURNAL @ s" cursor-new" CURSOR THE-REMOTES @
-   SUBJECT-ARENA @ DELTA PUBLISH-REMOTE-INVENTORY ;
+: PUBLISH-REFUSED ( -- )
+   THE-JOURNAL @ s" cursor-new" THE-REMOTES @ SUBJECT-ARENA @ UPSERTS
+   LISTED ;
 
+\ The staging takes an absent record and remote_observations refuses
+\ it, so the publication fails after it has begun.
 : JOURNAL-REMOTE-INVENTORY-AND-CURSOR-PUBLISH-ATOMICALLY
    ( ^ARENA:arena -- )
    {: ar :}
@@ -1407,14 +1427,14 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    p OPEN {: j :}
    s" old.txt" s" old.txt" s" old" s" rev-old" PRESENT-REMOTE ar
    REMOTE-RECORD ar ONE-REMOTE {: old :}
-   j s" cursor-old" CURSOR old ar DELTA PUBLISH-REMOTE-INVENTORY
-   ar REMOTES {: dups :}
-   s" duplicate.txt" s" duplicate.txt" REMOTE-DIRECTORY ar
-   REMOTE-RECORD dups REMOTE+
-   s" duplicate.txt" s" duplicate.txt" s" new" s" rev-new" PRESENT-REMOTE
-   ar REMOTE-RECORD dups REMOTE+
-   j THE-JOURNAL !  dups THE-REMOTES !  ar SUBJECT-ARENA !
-   [: PUBLISH-DUPLICATES ;] SQLITE:E-SQL d s" UNIQUE constraint failed"
+   j s" cursor-old" old ar UPSERTS LISTED
+   ar REMOTES {: refused :}
+   s" new.txt" s" new.txt" s" new" s" rev-new" PRESENT-REMOTE
+   ar REMOTE-RECORD refused REMOTE+
+   s" absent.txt" s" absent.txt" ABSENT-REMOTE ar REMOTE-RECORD
+   refused REMOTE+
+   j THE-JOURNAL !  refused THE-REMOTES !  ar SUBJECT-ARENA !
+   [: PUBLISH-REFUSED ;] SQLITE:E-SQL d s" CHECK constraint failed"
    ar LOGGED
    j ar REMOTE-INVENTORY JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur v :}
    cur s" cursor-old" CURSOR-IS? TTRUE
@@ -1461,8 +1481,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    s" remote_delta_mutates_only_changed_rows_and_cursor" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
-   j s" cursor-old" CURSOR ar BULK ar DELTA
-   PUBLISH-REMOTE-INVENTORY
+   j s" cursor-old" ar BULK ar UPSERTS LISTED
    j TOTAL-CHANGES {: before-empty :}
    j s" cursor-empty" CURSOR ar DELTA APPLY-REMOTE-INVENTORY-DELTA
    j TOTAL-CHANGES before-empty - 1 T=
@@ -1505,8 +1524,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    s" remote_delta_deletes_only_the_named_subtree" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
-   j s" cursor-old" CURSOR ar SUBTREE-SAMPLE ar DELTA
-   PUBLISH-REMOTE-INVENTORY
+   j s" cursor-old" ar SUBTREE-SAMPLE ar UPSERTS LISTED
    0 INDEXED !  0 SCANNED !
    j >CONNECTION SUBTREE-PLAN-SQL [: SUBTREE-PLAN ;]
    SQLITE:WITH-STATEMENT
@@ -1535,8 +1553,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    s" remote_delta_ensured_directory_keeps_an_unknown_folder" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
-   j s" cursor-old" CURSOR INACCESSIBLE ar SHARED ar ONE-REMOTE
-   ar DELTA PUBLISH-REMOTE-INVENTORY
+   j s" cursor-old" INACCESSIBLE ar SHARED UPSERT ar ONE-CHANGE LISTED
    j s" cursor-ensure" CURSOR REMOTE-DIRECTORY ar SHARED ENSURE
    ar ONE-CHANGE APPLY-REMOTE-INVENTORY-DELTA
    j ar REMOTE-INVENTORY INACCESSIBLE HOLDS-ONLY? TTRUE
@@ -1574,7 +1591,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
    ar RESTRICTED-SAMPLE {: v :}
-   j s" cursor" CURSOR v ar DELTA PUBLISH-REMOTE-INVENTORY
+   j s" cursor" v ar UPSERTS LISTED
    j s" docs/a.txt" ar CANONICAL ar REMOTE-AT v 1 VEC:AT @ REMOTE-IS?
    TTRUE
    j s" shared" ar CANONICAL ar REMOTE-AT v 2 VEC:AT @ REMOTE-IS? TTRUE
@@ -1632,8 +1649,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
 
 : PUBLISHED-ALONE ( journal MODEL:remote-record ^ARENA:arena -- )
    {: j r ar :}
-   j s" cursor" CURSOR r ar ONE-REMOTE ar DELTA
-   PUBLISH-REMOTE-INVENTORY ;
+   j s" cursor" r UPSERT ar ONE-CHANGE LISTED ;
 
 : A-HOLD-HIDES-THE-RECORD-UNTIL-ITS-UNHOLD ( ^ARENA:arena -- )
    {: ar :}
@@ -1674,7 +1690,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    s" an unhold releases the holds beneath its lower" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
-   j s" cursor" CURSOR ar REMOTES ar DELTA PUBLISH-REMOTE-INVENTORY
+   j s" cursor" ar DELTA LISTED
    j s" cursor-hold" s" Ꭰ/x.txt" ar HOLD-AT ar CHANGED
    j s" ꭰ/x.txt" ar REMOTE-AT-KEY s" ꭰ/x.txt" ar HELD-RECORD
    REMOTE-IS? TTRUE
@@ -1705,8 +1721,9 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
    s" ꭰ" s" ꭰ" REMOTE-DIRECTORY ar REMOTE-RECORD {: dir :}
-   j s" cursor" CURSOR dir ar ONE-REMOTE
-   s" Ꭰ" ar HOLD-AT ar ONE-CHANGE PUBLISH-REMOTE-INVENTORY
+   dir UPSERT ar ONE-CHANGE {: cs :}
+   s" Ꭰ" ar HOLD-AT cs CHANGE+
+   j s" cursor" cs LISTED
    j s" ꭰ" ar REMOTE-AT-KEY s" ꭰ" ar HELD-RECORD REMOTE-IS? TTRUE
    j s" ꭰ" ar CANONICAL ar REMOTE-LISTED-AT dir REMOTE-IS? TTRUE
    j s" cursor-unhold" s" Ꭰ" ar UNHOLD-AT ar CHANGED
@@ -1721,8 +1738,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    s" other.txt" DISPLAY k k MODEL:KEY>STR DISPLAY HOLD ar ONE-CHANGE ;
 
 : PUBLISH-STRAY-HOLD ( -- )
-   THE-JOURNAL @ s" cursor-new" CURSOR THE-REMOTES @
-   SUBJECT-ARENA @ STRAY-HOLD PUBLISH-REMOTE-INVENTORY ;
+   THE-JOURNAL @ s" cursor-new" SUBJECT-ARENA @ STRAY-HOLD LISTED ;
 
 : A-HOLD-ON-ANOTHER-FOLD-IS-REFUSED ( ^ARENA:arena -- )
    {: ar :}
@@ -1731,7 +1747,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    p OPEN {: j :}
    ar OWN-FILE {: f :}
    j f ar PUBLISHED-ALONE
-   j THE-JOURNAL !  ar REMOTES THE-REMOTES !  ar SUBJECT-ARENA !
+   j THE-JOURNAL !  ar SUBJECT-ARENA !
    [: PUBLISH-STRAY-HOLD ;] E-INVALID-STATE d
    s" canonical path does not match display path" ar LOGGED
    j ar REMOTE-INVENTORY JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur v :}
@@ -1750,8 +1766,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    ar ONE-CHANGE ;
 
 : PUBLISH-MISSPELLED-HOLD ( -- )
-   THE-JOURNAL @ s" cursor-new" CURSOR THE-REMOTES @
-   SUBJECT-ARENA @ MISSPELLED-HOLD PUBLISH-REMOTE-INVENTORY ;
+   THE-JOURNAL @ s" cursor-new" SUBJECT-ARENA @ MISSPELLED-HOLD LISTED ;
 
 : A-HOLD-SPELLED-AS-ANOTHER-KEY-IS-REFUSED ( ^ARENA:arena -- )
    {: ar :}
@@ -1760,7 +1775,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    p OPEN {: j :}
    ar OWN-FILE {: f :}
    j f ar PUBLISHED-ALONE
-   j THE-JOURNAL !  ar REMOTES THE-REMOTES !  ar SUBJECT-ARENA !
+   j THE-JOURNAL !  ar SUBJECT-ARENA !
    [: PUBLISH-MISSPELLED-HOLD ;] E-INVALID-STATE d
    s" `other.txt`: canonical path does not match display path" ar LOGGED
    j ar REMOTE-INVENTORY JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur v :}
@@ -1770,6 +1785,199 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    0 T=
    j CLOSE
    d GONE ;
+
+\ ---- a full listing's staging
+
+\ The first column of the query's first row, in BODY.
+: QUERY-TEXT ( journal str -- str )
+   {: j q:str :}
+   j >CONNECTION q [: SCHEMA-TEXT ;] SQLITE:WITH-STATEMENT
+   BODY BYTES$ ;
+
+\ Each remote observation as "key path kind content revision;", by key.
+: OBSERVATIONS-TEXT ( journal -- str )
+   s" SELECT ifnull(group_concat(canonical_path || ' ' || path || ' '
+         || kind || ' ' || ifnull(content, '-') || ' '
+         || ifnull(revision, '-') || ';', '' ORDER BY canonical_path), '')
+      FROM remote_observations" QUERY-TEXT ;
+
+\ Each hold as "lower key path;", by lower.
+: HOLDS-TEXT ( journal -- str )
+   s" SELECT ifnull(group_concat(lower || ' ' || canonical_path || ' '
+         || path || ';', '' ORDER BY lower), '')
+      FROM remote_mismatches" QUERY-TEXT ;
+
+: SHADOW-COUNT ( journal -- n )
+   >CONNECTION s" SELECT count(*) FROM remote_shadows" QUERY-INT ;
+
+: STAGING-COUNT ( journal -- n )
+   >CONNECTION s" SELECT count(*) FROM temp.sqlite_master
+      WHERE name LIKE 'listing%'" QUERY-INT ;
+
+: CURSOR-NOW? ( journal str ^ARENA:arena -- bool )
+   {: j s:str ar :}
+   j ar REMOTE-INVENTORY JOURNAL-REMOTE--INVENTORY:UNMAKE {: cur v :}
+   cur s CURSOR-IS? ;
+
+\ The upsert of a file at key k spelled p, c its content and revision.
+: LISTED-FILE ( str str str ^ARENA:arena -- remote-inventory-change )
+   {: k:str p:str c:str ar :}
+   k p c c PRESENT-REMOTE ar REMOTE-RECORD UPSERT ;
+
+: LISTED-FOLDER ( str str ^ARENA:arena -- remote-inventory-change )
+   {: k:str p:str ar :}
+   k p REMOTE-DIRECTORY ar REMOTE-RECORD UPSERT ;
+
+: ENSURED-FOLDER ( str str ^ARENA:arena -- remote-inventory-change )
+   {: k:str p:str ar :}
+   k p REMOTE-DIRECTORY ar REMOTE-RECORD ENSURE ;
+
+\ "a-" sorts between "a" and "a/x"; "Docs/Ꭰ.txt" holds "docs/ꭰ.txt";
+\ "Ꭰ/x.txt" holds "ꭰ/x.txt" until the unhold of "Ꭰ". The absent
+\ records, which remote_observations refuses, are gone by publication:
+\ "gone/c.txt" with its subtree, "shared/c.txt" replaced.
+: FIRST-BATCH ( ^ARENA:arena -- ^VEC:vector<remote-inventory-change> )
+   {: ar :}
+   ar DELTA {: v :}
+   s" a" s" A" ar LISTED-FOLDER v CHANGE+
+   s" a-" s" a-" s" c" ar LISTED-FILE v CHANGE+
+   s" a/x" s" a/x" s" x" ar LISTED-FILE v CHANGE+
+   s" docs" s" Docs" ar LISTED-FOLDER v CHANGE+
+   s" docs/a.txt" s" docs/a.txt" s" a" ar LISTED-FILE v CHANGE+
+   s" x.txt" s" x.txt" s" old" ar LISTED-FILE v CHANGE+
+   s" gone" s" gone" ar LISTED-FOLDER v CHANGE+
+   s" gone/b.txt" s" gone/b.txt" s" b" ar LISTED-FILE v CHANGE+
+   s" gone/sub" s" gone/sub" ar LISTED-FOLDER v CHANGE+
+   s" gone/c.txt" s" gone/c.txt" ABSENT-REMOTE ar REMOTE-RECORD UPSERT
+   v CHANGE+
+   s" shared" s" Shared" INACCESSIBLE ar REMOTE-RECORD UPSERT v CHANGE+
+   s" shared/c.txt" s" shared/c.txt" ABSENT-REMOTE ar REMOTE-RECORD UPSERT
+   v CHANGE+
+   s" Docs/Ꭰ.txt" ar HOLD-AT v CHANGE+
+   s" Ꭰ/x.txt" ar HOLD-AT v CHANGE+
+   v ;
+
+: SECOND-BATCH ( ^ARENA:arena -- ^VEC:vector<remote-inventory-change> )
+   {: ar :}
+   ar DELTA {: v :}
+   s" x.txt" s" X.txt" s" new" ar LISTED-FILE v CHANGE+
+   s" gone" ar CANONICAL DELETE-SUBTREE v CHANGE+
+   s" shared" s" shared" ar ENSURED-FOLDER v CHANGE+
+   s" docs" s" docs" ar ENSURED-FOLDER v CHANGE+
+   s" new" s" new" ar ENSURED-FOLDER v CHANGE+
+   s" Ꭰ" ar UNHOLD-AT v CHANGE+
+   s" shared/c.txt" s" shared/c.txt" s" c2" ar LISTED-FILE v CHANGE+
+   v ;
+
+: WANT-LISTED ( -- str )
+   s" a A 1 - -;" 0 PUT
+   s" a- a- 0 c c;" swap PUT
+   s" a/x A/x 0 x x;" swap PUT
+   s" docs Docs 1 - -;" swap PUT
+   s" docs/a.txt Docs/a.txt 0 a a;" swap PUT
+   s" docs/ꭰ.txt Docs/ꭰ.txt 8 - -;" swap PUT
+   s" new new 1 - -;" swap PUT
+   s" shared Shared 4 - -;" swap PUT
+   s" shared/c.txt Shared/c.txt 0 c2 c2;" swap PUT
+   s" x.txt X.txt 0 new new;" swap PUT {: u :}
+   0 u WANT-PART ;
+
+: A-STAGED-LISTING-PUBLISHES-ITS-RECORDS-AND-HOLDS ( ^ARENA:arena -- )
+   {: ar :}
+   s" a listing staged in two batches publishes its records and holds"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j [: j ar FIRST-BATCH STAGE-LISTING j ar SECOND-BATCH STAGE-LISTING
+      s" cursor-listed" CURSOR ;] WITH-REMOTE-LISTING
+   j OBSERVATIONS-TEXT WANT-LISTED T$=
+   j HOLDS-TEXT s" Docs/Ꭰ.txt docs/ꭰ.txt Docs/ꭰ.txt;" T$=
+   j SHADOW-COUNT 0 T=
+   j s" cursor-listed" ar CURSOR-NOW? TTRUE
+   j STAGING-COUNT 0 T=
+   j CLOSE
+   d GONE ;
+
+: STAGED-THEN-THROWN ( journal ^ARENA:arena -- DROPBOX:cursor )
+   {: j ar :}
+   ar DELTA {: v :}
+   s" new.txt" s" new.txt" s" new" ar LISTED-FILE v CHANGE+
+   s" Ꭰ.txt" ar HOLD-AT v CHANGE+
+   j v STAGE-LISTING
+   E-INVALID-STATE throw ;
+
+: ONE-FILE-LISTED ( journal str str ^ARENA:arena -- )
+   {: j k:str c:str ar :}
+   j [: j k k c ar LISTED-FILE ar ONE-CHANGE STAGE-LISTING
+      c CURSOR ;] WITH-REMOTE-LISTING ;
+
+: A-THROWN-LISTING-PUBLISHES-NOTHING ( ^ARENA:arena -- )
+   {: ar :}
+   s" a listing thrown after a batch publishes nothing" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j s" old.txt" s" old" ar ONE-FILE-LISTED
+   [: j [: j ar STAGED-THEN-THROWN ;] WITH-REMOTE-LISTING ;]
+   E-INVALID-STATE TTHROWSQ
+   j OBSERVATIONS-TEXT s" old.txt old.txt 0 old old;" T$=
+   j HOLDS-TEXT s" " T$=
+   j s" old" ar CURSOR-NOW? TTRUE
+   j STAGING-COUNT 0 T=
+   j s" other.txt" s" other" ar ONE-FILE-LISTED
+   j OBSERVATIONS-TEXT s" other.txt other.txt 0 other other;" T$=
+   j HOLDS-TEXT s" " T$=
+   j s" other" ar CURSOR-NOW? TTRUE
+   j CLOSE
+   d GONE ;
+
+\ The listing q publishes over "old.txt" is refused, logging t, and
+\ leaves the published inventory and cursor as they were.
+: LISTING-REFUSED ( [ -- ] str ^ARENA:arena -- )
+   {: q t:str ar :}
+   ar JOURNAL-AT {: d:str p:str :}
+   p OPEN {: j :}
+   j s" old.txt" s" old" ar ONE-FILE-LISTED
+   j THE-JOURNAL !  ar SUBJECT-ARENA !
+   q E-INVALID-STATE d t ar LOGGED
+   j OBSERVATIONS-TEXT s" old.txt old.txt 0 old old;" T$=
+   j HOLDS-TEXT s" " T$=
+   j s" old" ar CURSOR-NOW? TTRUE
+   j STAGING-COUNT 0 T=
+   j CLOSE
+   d GONE ;
+
+\ A folder at "a/..", whose path has no name, and a file beneath it.
+: NAMELESS-FOLDER
+   ( ^ARENA:arena -- ^VEC:vector<remote-inventory-change> )
+   {: ar :}
+   ar DELTA {: v :}
+   s" a/.." s" a/.." ar LISTED-FOLDER v CHANGE+
+   s" a/../x" s" a/../x" s" x" ar LISTED-FILE v CHANGE+
+   v ;
+
+: PUBLISH-NAMELESS-FOLDER ( -- )
+   THE-JOURNAL @ s" cursor-new" SUBJECT-ARENA @ NAMELESS-FOLDER LISTED ;
+
+: A-STAGED-FOLDER-WITHOUT-A-NAME-IS-REFUSED ( ^ARENA:arena -- )
+   {: ar :}
+   s" a staged folder whose path has no name is refused" T-LABEL
+   [: PUBLISH-NAMELESS-FOLDER ;]
+   s" `a/..`: a folder's path has no name" ar LISTING-REFUSED ;
+
+\ MODEL:FOLD skips an empty part, so "a//b" folds to "a/b" and staging
+\ takes it, but its parts are not its key's.
+: EMPTY-PART ( ^ARENA:arena -- ^VEC:vector<remote-inventory-change> )
+   {: ar :}
+   s" a/b" s" a//b" s" b" ar LISTED-FILE ar ONE-CHANGE ;
+
+: PUBLISH-EMPTY-PART ( -- )
+   THE-JOURNAL @ s" cursor-new" SUBJECT-ARENA @ EMPTY-PART LISTED ;
+
+: A-STAGED-PATH-WITH-AN-EMPTY-PART-IS-REFUSED ( ^ARENA:arena -- )
+   {: ar :}
+   s" a staged path with an empty part is refused" T-LABEL
+   [: PUBLISH-EMPTY-PART ;]
+   s" `a//b`: its parts are not its canonical path's" ar LISTING-REFUSED ;
 
 : UNKNOWN-LOCAL
    ( MODEL:unknown-reason -- MODEL:observation<MODEL:local> )
@@ -1840,8 +2048,7 @@ variable SEEN          \ FS:ERRNO as OPEN's throw left it
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
    j ar MIXED-LOCALS PUBLISH-LOCAL-INVENTORY
-   j s" cursor" CURSOR ar MIXED-REMOTES ar DELTA
-   PUBLISH-REMOTE-INVENTORY
+   j s" cursor" ar MIXED-REMOTES ar UPSERTS LISTED
    j ar UNKNOWN-LOCALS ar UNKNOWN-SAMPLE-LOCALS LOCAL-RECORDS= TTRUE
    j ar UNKNOWN-REMOTES ar UNKNOWN-SAMPLE-REMOTES REMOTES= TTRUE
    j CLOSE
@@ -3219,8 +3426,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
    s" remote_subtree_holds_only_true_descendants" T-LABEL
    ar JOURNAL-AT {: d:str p:str :}
    p OPEN {: j :}
-   j s" cursor" CURSOR ar DESCENDANTS ar DELTA
-   PUBLISH-REMOTE-INVENTORY
+   j s" cursor" ar DESCENDANTS ar UPSERTS LISTED
    j s" report" ar SUBTREE-AT s" occupied " T$=
    j s" reports" ar SUBTREE-AT s" occupied " T$=
    j s" deep" ar SUBTREE-AT s" occupied " T$=
@@ -5071,8 +5277,7 @@ variable CRAFT
    PUBLISH-LOCAL-INVENTORY
    s" tracked.txt" s" tracked.txt" agreed MODEL-OBSERVATION:PRESENT ar
    REMOTE-RECORD {: remote :}
-   j s" cursor-kept" CURSOR remote ar ONE-REMOTE ar DELTA
-   PUBLISH-REMOTE-INVENTORY
+   j s" cursor-kept" remote UPSERT ar ONE-CHANGE LISTED
    j s" old-root-conflict.txt" DISPLAY DIVERGENT ar RECORD-CONFLICT drop
    remote ;
 
@@ -6173,6 +6378,10 @@ TYPED-VARIABLE HELD-OPERATION operation-id
    ar A-LISTING-HOLDS-A-DIRECTORY-KEY
    ar A-HOLD-ON-ANOTHER-FOLD-IS-REFUSED
    ar A-HOLD-SPELLED-AS-ANOTHER-KEY-IS-REFUSED
+   ar A-STAGED-LISTING-PUBLISHES-ITS-RECORDS-AND-HOLDS
+   ar A-THROWN-LISTING-PUBLISHES-NOTHING
+   ar A-STAGED-FOLDER-WITHOUT-A-NAME-IS-REFUSED
+   ar A-STAGED-PATH-WITH-AN-EMPTY-PART-IS-REFUSED
    ar UNKNOWN-OBSERVATIONS-ARE-READ-ALONE
    ar JOURNAL-LOCAL-SCAN-REPLACES-INVENTORY-AND-HASHES-ATOMICALLY
    ar EACH-LOCAL-COLLISION-VISITS-IN-KEY-ORDER

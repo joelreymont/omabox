@@ -30,6 +30,10 @@
 \ tables only what differs: the rows that changed and the paths and
 \ hashes gone. Its publish applies them in SQL, so an unchanged row keeps
 \ its rowid and an unchanged scan writes nothing.
+\ A full listing stages its changes in temporary tables too, a batch per
+\ transaction, as the rows they leave; its publish streams those rows
+\ into the remote inventory, each path spelled at every part by the
+\ folder staged at the key up to it.
 \ STORAGE CLASS. CALLER-OWNED: a journal OPEN makes borrows its path
 \ until CLOSE, and a binding INSPECT answers borrows its path; every
 \ string and vector a reader answers lies in the arena the caller passes.
@@ -2460,11 +2464,6 @@ private
 
 \ ---- the remote inventory ------------------------------------------
 
-: INSERT-REMOTE ( -- str )
-   s" INSERT INTO remote_observations(
-         path, canonical_path, kind, content, revision
-      ) VALUES (?1, ?2, ?3, ?4, ?5)" ;
-
 : UPSERT-REMOTE ( -- str )
    s" INSERT INTO remote_observations(
          path, canonical_path, kind, content, revision
@@ -2510,12 +2509,6 @@ private
       absent OF KIND-ABSENT BIND-KIND ENDOF
       unknown OF REASON-KIND BIND-KIND ENDOF
    ;MATCH ;
-
-: REMOTE-INSERTS
-   ( SQLITE:statement ^VEC:vector<MODEL:remote-record>
-     -- SQLITE:statement )
-   {: v :}
-   v VEC:COUNT 0 ?do v i VEC:AT @ BIND-REMOTE RAN loop ;
 
 : PUBLISH-CURSOR ( SQLITE:connection DROPBOX:cursor -- )
    {: c cur:DROPBOX:cursor :}
@@ -2598,32 +2591,6 @@ private
       SELECT canonical_path, path, kind, content, revision
       FROM remote_shadows;
       DELETE FROM remote_shadows;" SQLITE:EXEC ;
-
-\ A listing's change to the holds; its records are written already.
-: HOLDS-APPLIED ( remote-inventory-change SQLITE:connection -- )
-   {: c :}
-   MATCH remote-inventory-change
-      upsert OF drop ENDOF
-      ensure-directory OF drop ENDOF
-      delete-subtree OF {: k :} c k MODEL:KEY>STR HOLDS-DELETED ENDOF
-      hold OF {: l k p :} c l k p HOLD-WRITTEN ENDOF
-      unhold OF
-         drop {: l :} c l MODEL:PATH>STR HOLDS-DELETED
-      ENDOF
-   ;MATCH ;
-
-: REMOTE-WRITTEN
-   ( SQLITE:connection DROPBOX:cursor
-     ^VEC:vector<MODEL:remote-record>
-     ^VEC:vector<remote-inventory-change> -- )
-   {: c cur:DROPBOX:cursor v cs :}
-   c s" DELETE FROM remote_observations;
-      DELETE FROM remote_mismatches;
-      DELETE FROM remote_shadows;" SQLITE:EXEC
-   c INSERT-REMOTE [: v REMOTE-INSERTS ;] SQLITE:WITH-STATEMENT
-   cs VEC:COUNT 0 ?do cs i VEC:AT @ c HOLDS-APPLIED loop
-   c SETTLE
-   c cur PUBLISH-CURSOR ;
 
 : DELTA-INVALID ( str str -- )
    {: path:str detail:str :}
@@ -2745,24 +2712,259 @@ public
 
 private
 
+
+\ ---- a full listing's staging --------------------------------------
+
+\ Staged observations carry no CHECK, so a later change may replace or delete
+\ a record remote_observations refuses; publication refuses only what is left.
+: LISTING-TABLES ( journal -- )
+   >CONNECTION
+   s" CREATE TABLE IF NOT EXISTS temp.listing_observations(
+         canonical_path BLOB PRIMARY KEY NOT NULL,
+         path BLOB NOT NULL,
+         kind INTEGER NOT NULL,
+         content TEXT,
+         revision TEXT
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS temp.listing_mismatches(
+         lower BLOB PRIMARY KEY NOT NULL,
+         canonical_path BLOB NOT NULL,
+         path BLOB NOT NULL
+      ) STRICT;
+      DELETE FROM temp.listing_observations;
+      DELETE FROM temp.listing_mismatches;" SQLITE:EXEC ;
+
+: CLEAR-LISTING ( journal -- )
+   >CONNECTION
+   s" DROP TABLE IF EXISTS temp.listing_observations;
+      DROP TABLE IF EXISTS temp.listing_mismatches;" SQLITE:EXEC ;
+
+: STAGED-UPSERT ( -- str )
+   s" INSERT OR REPLACE INTO temp.listing_observations(
+         path, canonical_path, kind, content, revision
+      ) VALUES (?1, ?2, ?3, ?4, ?5)" ;
+
+\ A staged row keeps its spelling, and an unknown one, kind 3 on, its
+\ observation.
+: STAGED-ENSURE ( -- str )
+   s" INSERT INTO temp.listing_observations(
+         path, canonical_path, kind, content, revision
+      ) VALUES (?1, ?2, ?3, ?4, ?5)
+      ON CONFLICT(canonical_path) DO UPDATE SET
+         kind = 1, content = NULL, revision = NULL
+      WHERE listing_observations.kind < 3" ;
+
+\ The staged holds of the entries at the bytes or beneath them.
+: STAGED-HOLDS-DELETED ( SQLITE:connection str -- )
+   {: c s:str :}
+   c s" DELETE FROM temp.listing_mismatches
+      WHERE lower = ?1
+         OR (lower > CAST(?1 || '/' AS BLOB)
+            AND lower < CAST(?1 || '0' AS BLOB))" [: s 1 SQLITE:BIND-BLOB SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT ;
+
+: STAGED-SUBTREE-DELETED
+   ( SQLITE:connection MODEL:key ^ARENA:arena -- )
+   {: c k:MODEL:key ar :}
+   k ar MODEL:SUBTREE-RANGE {: lo:str hi:str :}
+   c s" DELETE FROM temp.listing_observations
+      WHERE canonical_path = ?1
+         OR (canonical_path >= ?2 AND canonical_path < ?3)" [: k MODEL:KEY>STR 1 SQLITE:BIND-BLOB
+      lo 2 SQLITE:BIND-BLOB hi 3 SQLITE:BIND-BLOB SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT
+   c k MODEL:KEY>STR STAGED-HOLDS-DELETED ;
+
+\ An entry holds one key: its staged row at lower is replaced.
+: STAGED-HOLD ( SQLITE:connection MODEL:path MODEL:key MODEL:path -- )
+   {: c l:MODEL:path k:MODEL:key p:MODEL:path :}
+   c s" INSERT OR REPLACE INTO temp.listing_mismatches(
+         lower, canonical_path, path
+      ) VALUES (?1, ?2, ?3)" [: l MODEL:PATH>STR 1 SQLITE:BIND-BLOB
+      k MODEL:KEY>STR 2 SQLITE:BIND-BLOB
+      p MODEL:PATH>STR 3 SQLITE:BIND-BLOB SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT ;
+
+: STAGE-CHANGE
+   ( remote-inventory-change SQLITE:connection ^ARENA:arena -- )
+   {: c ar :}
+   MATCH remote-inventory-change
+      upsert OF {: r :} c r STAGED-UPSERT RECORD-WRITTEN ENDOF
+      ensure-directory OF
+         {: r :} c r STAGED-ENSURE RECORD-WRITTEN
+      ENDOF
+      delete-subtree OF {: k :} c k ar STAGED-SUBTREE-DELETED ENDOF
+      hold OF {: l k p :} c l k p STAGED-HOLD ENDOF
+      unhold OF
+         drop {: l :} c l MODEL:PATH>STR STAGED-HOLDS-DELETED
+      ENDOF
+   ;MATCH ;
+
 \ Every change is checked before the transaction begins.
-: LISTING-APPLIED
-   ( SQLITE:connection DROPBOX:cursor
-     ^VEC:vector<MODEL:remote-record>
-     ^VEC:vector<remote-inventory-change> ^ARENA:arena -- )
-   {: c cur:DROPBOX:cursor v cs ar :}
-   cs ar DELTA-CHECKED
-   c [: c cur v cs REMOTE-WRITTEN ;] SQLITE:WITH-TRANSACTION ;
+: BATCH-STAGED
+   ( SQLITE:connection ^VEC:vector<remote-inventory-change>
+     ^ARENA:arena -- )
+   {: c v ar :}
+   v ar DELTA-CHECKED
+   c [: v VEC:COUNT 0 ?do v i VEC:AT @ c ar STAGE-CHANGE loop ;]
+   SQLITE:WITH-TRANSACTION ;
+
+: LISTING-INVALID ( str str -- )
+   {: path:str detail:str :}
+   s" publish remote inventory listing" path detail INVALID ;
+
+\ A part Path::file_name does not skip: neither empty nor ".".
+: NAMED? ( str -- bool )
+   {: s:str :}
+   s STR:len 0<> s s" ." STR:= 0= and ;
+
+\ The index of the last separator before at, or -1.
+: SEPARATOR-BEFORE ( str n -- n )
+   {: s:str at:n :}
+   s str> drop {: p:^ :}
+   at begin 1- dup 0 >= while
+      dup p + c@ SLASH = if exit then
+   repeat ;
+
+\ The last part NAMED? accepts before at, else empty.
+: NAME-BEFORE ( str n -- str )
+   {: s:str at:n :}
+   s at SEPARATOR-BEFORE {: sep:n :}
+   s str> drop sep 1+ + at sep 1+ - >str {: part:str :}
+   part NAMED? if part exit then
+   sep 0 < if s" " exit then
+   s sep RECURSE ;
+
+\ Path::file_name of a folder's path, its casing.
+: FOLDER-NAME ( str -- str )
+   {: p:str :}
+   p p STR:len NAME-BEFORE {: name:str :}
+   name STR:len 0= name s" .." STR:= or if
+      p s" a folder's path has no name" LISTING-INVALID
+   then
+   name ;
+
+\ The spelling of the folder or restricted folder staged at a key.
+: FOLDER-SPELLING ( -- str )
+   s" SELECT path FROM temp.listing_observations
+      WHERE canonical_path = ?1 AND kind IN (1, 4)" ;
+
+\ Appends the part, after a separator unless out is empty.
+: PART+ ( str ^VEC:vector<u8> -- )
+   {: s:str out :}
+   out VEC:COUNT 0 > if SLASH out VEC:PUSH c! then
+   s out VEC:APPEND ;
+
+\ Appends the casing of the folder staged at the key bytes, if one is;
+\ whether one is.
+: CASING+
+   ( SQLITE:statement str ^VEC:vector<u8>
+     -- SQLITE:statement bool )
+   {: k:str out :}
+   k 1 SQLITE:BIND-BLOB SQLITE:STEP if
+      0 SQLITE:COL-BLOB FOLDER-NAME out PART+ true
+   else false then
+   >r SQLITE:RESET r> ;
+
+\ Appends each part of the key from ki, spelled by its casing, else as
+\ the path's part from pi.
+: SPELLED-FROM
+   ( SQLITE:statement str str n n ^VEC:vector<u8> -- SQLITE:statement )
+   {: ks:str ps:str ki:n pi:n out :}
+   ks SLASH ki STR:SPLIT-NEXT drop {: kp:str kn:n :}
+   ps SLASH pi STR:SPLIT-NEXT drop {: pp:str pn:n :}
+   ks str> drop kn 1- >str out CASING+ 0= if pp out PART+ then
+   kn ks STR:len > if exit then
+   ks ps kn pn out RECURSE ;
+
+\ Each part of the path takes the casing of the folder staged at the
+\ key up to it, if one is.
+: LISTING-PATH
+   ( SQLITE:statement MODEL:key MODEL:path ^ARENA:arena
+     -- SQLITE:statement MODEL:path )
+   {: k:MODEL:key p:MODEL:path ar :}
+   k MODEL:KEY>STR {: ks:str :}
+   p MODEL:PATH>STR {: ps:str :}
+   ks SLASH STR:COUNT-CHAR ps SLASH STR:COUNT-CHAR <> if
+      ps s" its parts are not its canonical path's" LISTING-INVALID
+   then
+   ar ARENA:ALLOCATOR 0 [type] u8 VEC:NEW {: out :}
+   ks ps 0 0 out SPELLED-FROM
+   out VEC:BYTES MODEL:>PATH ;
+
+\ Writes the select's row, its id, key and path, with the path respelled;
+\ the statements are FOLDER-SPELLING's, the write's and the select's.
+: ROW-PUBLISHED
+   ( SQLITE:statement SQLITE:statement SQLITE:statement ^ARENA:arena
+     -- SQLITE:statement SQLITE:statement SQLITE:statement )
+   {: ar :}
+   0 SQLITE:COL-BLOB {: id:str :}
+   1 SQLITE:COL-BLOB MODEL:>KEY {: k :}
+   2 SQLITE:COL-BLOB MODEL:>PATH {: p :}
+   rot k p ar LISTING-PATH {: q :}
+   rot q MODEL:PATH>STR 1 SQLITE:BIND-BLOB id 2 SQLITE:BIND-BLOB RAN
+   rot ;
+
+: ROWS-PUBLISHED
+   ( SQLITE:statement SQLITE:statement SQLITE:statement ^ARENA:arena
+     -- SQLITE:statement SQLITE:statement SQLITE:statement )
+   {: ar :}
+   begin SQLITE:STEP while ar ROW-PUBLISHED ar ARENA:RESET repeat ;
+
+\ Each row select answers written through write, one row's scratch in
+\ ar at a time.
+: LISTED-ROWS ( SQLITE:connection str str ^ARENA:arena -- )
+   {: c write:str select:str ar :}
+   c FOLDER-SPELLING [: c write [: c select [: ar ROWS-PUBLISHED ;]
+      SQLITE:WITH-STATEMENT ;] SQLITE:WITH-STATEMENT ;]
+   SQLITE:WITH-STATEMENT ;
+
+: LISTED-OBSERVATIONS ( -- str str )
+   s" INSERT INTO remote_observations(
+         path, canonical_path, kind, content, revision)
+      SELECT ?1, canonical_path, kind, content, revision
+      FROM temp.listing_observations WHERE canonical_path = ?2"
+   s" SELECT canonical_path, canonical_path, path
+      FROM temp.listing_observations" ;
+
+: LISTED-HOLDS ( -- str str )
+   s" INSERT INTO remote_mismatches(lower, canonical_path, path)
+      SELECT lower, canonical_path, ?1
+      FROM temp.listing_mismatches WHERE lower = ?2"
+   s" SELECT lower, canonical_path, path
+      FROM temp.listing_mismatches" ;
+
+: LISTING-WRITTEN
+   ( SQLITE:connection DROPBOX:cursor ^ARENA:arena -- )
+   {: c cur:DROPBOX:cursor ar :}
+   c s" DELETE FROM remote_observations;
+      DELETE FROM remote_mismatches;
+      DELETE FROM remote_shadows;" SQLITE:EXEC
+   c LISTED-OBSERVATIONS ar LISTED-ROWS
+   c LISTED-HOLDS ar LISTED-ROWS
+   c SETTLE
+   c cur PUBLISH-CURSOR ;
+
+: PUBLISH-LISTING ( journal DROPBOX:cursor -- )
+   {: j cur:DROPBOX:cursor :}
+   j >CONNECTION {: c :}
+   c [: c cur [: LISTING-WRITTEN ;] ARENA:WITH ;]
+   SQLITE:WITH-TRANSACTION ;
 
 public
 
-\ Replaces the remote inventory, the holds its changes leave and its
-\ cursor in one transaction.
-: PUBLISH-REMOTE-INVENTORY
-   ( journal DROPBOX:cursor ^VEC:vector<MODEL:remote-record>
-     ^VEC:vector<remote-inventory-change> -- )
-   {: j cur:DROPBOX:cursor v cs :}
-   j >CONNECTION cur v cs [: LISTING-APPLIED ;] ARENA:WITH ;
+\ body stages a full listing with STAGE-LISTING and answers its cursor;
+\ one transaction then replaces the inventory, holds and cursor with it.
+: WITH-REMOTE-LISTING ( journal [ -- DROPBOX:cursor ] -- )
+   {: j body :}
+   [: j LISTING-TABLES j body execute PUBLISH-LISTING ;]
+   [: j CLEAR-LISTING ;] finally ;
+
+\ Applies a batch of a full listing's changes to its staging, in order,
+\ in one transaction; only inside WITH-REMOTE-LISTING.
+: STAGE-LISTING
+   ( journal ^VEC:vector<remote-inventory-change> -- )
+   {: j v :}
+   j >CONNECTION v [: BATCH-STAGED ;] ARENA:WITH ;
 
 
 \ ---- baselines and plans: values -----------------------------------
@@ -3767,7 +3969,7 @@ create DOWNLOADED-QUERY PLAN-SELECT DOWNLOADED-WHERE LAY-BOTH
      ^VEC:vector<MODEL:path> ^ARENA:arena -- n )
    {: c noops live ar :}
    0 noops VEC:COUNT 0 ?do
-      c noops i VEC:AT @ live ar NOOP-ENTRY +
+      c noops i VEC:AT @ live ar NOOP-ENTRY + ar ARENA:RESET
    loop ;
 
 : PLANS-IN
@@ -3775,7 +3977,7 @@ create DOWNLOADED-QUERY PLAN-SELECT DOWNLOADED-WHERE LAY-BOTH
      ^VEC:vector<MODEL:path> ^ARENA:arena ^JSON:writer -- n )
    {: c plans live ar w :}
    0 plans VEC:COUNT 0 ?do
-      c plans i VEC:AT @ live ar w PLAN-ENTRY +
+      c plans i VEC:AT @ live ar w PLAN-ENTRY + ar ARENA:RESET
    loop ;
 
 : RECONCILED
@@ -3808,7 +4010,7 @@ public
    SQLITE:WITH-TRANSACTION ;
 
 \ Commits every journal-only decision of one complete observation
-\ together: all, or none when one throws.
+\ together: all, or none when one throws. The answer's vector is in ar.
 : RECORD-RECONCILIATION
    ( journal ^VEC:vector<path-baseline> ^VEC:vector<path-plan>
      ^ARENA:arena -- reconciliation-write )
@@ -3818,8 +4020,9 @@ public
       0 0 live JOURNAL-RECONCILIATION--WRITE:MAKE exit
    then
    j >CONNECTION {: c :}
-   c [: c noops plans live ar [: RECONCILED ;] ENCODING ;]
-   SQLITE:WITH-TRANSACTION ;
+   ar ARENA:NEW-IN {: row :}
+   [: c [: c noops plans live row [: RECONCILED ;] ENCODING ;]
+      SQLITE:WITH-TRANSACTION ;] [: row ARENA:RELEASE ;] finally ;
 
 \ Every plan awaiting its next effect, by id, each one's operations in
 \ order.

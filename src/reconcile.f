@@ -3,14 +3,17 @@
 \ and run their downloads, one at a time. A journal answer the pass
 \ refuses is logged once with the Rust version's text, naming the path,
 \ then thrown as E-INVALID-STATE.
-\ A listing's entries become inventory changes, numbered in order. The
-\ last delete over a key is the largest number among the deletes at it
-\ or an ancestor, a binary search per prefix, and a key's record or
-\ directory spelling comes from its writes numbered after that delete:
-\ no change is replayed against the whole inventory.
+\ A listing's entries become inventory changes. A full listing's go to
+\ the journal's staging a batch at a time. A delta's are numbered in
+\ order: the last delete over a key is the largest number among the
+\ deletes at it or an ancestor, a binary search per prefix, and a
+\ folder's spelling comes from its key's writes numbered after that
+\ delete: no change is replayed against the whole inventory.
 \ STORAGE CLASS. No state of its own. CALLER-OWNED: every value a pass
-\ keeps lies in the arena the caller passes; the walk of known paths
-\ reads each row in an arena of its own, released when the walk ends.
+\ keeps lies in the arena the caller passes; the walk of known paths,
+\ each known path's decision, each download, each listing batch and each
+\ stage retirement use an arena of their own, released or reset when
+\ they end.
 
 require src/lib/error.f
 require src/lib/string.f
@@ -1555,21 +1558,6 @@ STRUCTURE casing
       ws i VEC:AT @ dup last > if cs swap VEC:AT @ APPLIED else drop then
    loop ;
 
-\ Replays the run of writes from i numbered after the last delete over
-\ their key, pushing the record they leave; the index after the run.
-: KEY-RECORD
-   ( n ^VEC:vector<n> ^VEC:vector<JOURNAL:remote-inventory-change>
-     ^VEC:vector<n> ^VEC:vector<MODEL:remote-record> -- n )
-   {: from:n ws cs ds out :}
-   ws from cs KEY-RUN-END {: end:n :}
-   ws from cs NTH-KEY ds cs LAST-DELETE {: last:n :}
-   NO-RECORD from end last ws cs RUN-APPLIED
-   MATCH option
-      none OF ENDOF
-      some OF out VEC:PUSH ! ENDOF
-   ;MATCH
-   end ;
-
 : CASING-KEY ( casing -- MODEL:key ) CASING-UNMAKE {: k s:str :} k ;
 
 : NO-CASINGS ( ^ARENA:arena -- ^VEC:vector<casing> )
@@ -1589,15 +1577,6 @@ STRUCTURE casing
    {: r cv ar :}
    r MODEL-REMOTE--RECORD:UNMAKE {: k p o :}
    o SPELLS-FOLDER? if k p cv ar INSERT-DIRECTORY-CASING then ;
-
-\ Rust's directory_casing over records sorted by key, so by key.
-: DIRECTORY-CASING
-   ( ^VEC:vector<MODEL:remote-record> ^ARENA:arena
-     -- ^VEC:vector<casing> )
-   {: rs ar :}
-   ar NO-CASINGS {: cv :}
-   rs VEC:COUNT 0 ?do rs i VEC:AT @ cv ar RECORD-CASING loop
-   cv ;
 
 \ The casing at these key bytes among casings sorted by key, if any.
 : CASING-AT ( str ^VEC:vector<casing> -- option<str> )
@@ -1667,28 +1646,6 @@ STRUCTURE casing
    {: r cv ar :}
    r MODEL-REMOTE--RECORD:UNMAKE {: k p o :}
    k k p cv ar NORMALIZED-REMOTE-PATH o MODEL-REMOTE--RECORD:MAKE ;
-
-\ Rust's normalize_inventory_records over records sorted by key.
-: NORMALIZE-INVENTORY-RECORDS
-   ( ^VEC:vector<MODEL:remote-record> ^ARENA:arena -- )
-   {: rs ar :}
-   rs ar DIRECTORY-CASING {: cv :}
-   rs VEC:COUNT 0 ?do
-      rs i VEC:AT @ cv ar RESPELL-RECORD rs i VEC:AT !
-   loop ;
-
-\ Rust's apply_entries over a full listing's changes, then
-\ normalize_inventory_records: the records by key.
-: INVENTORY-RECORDS
-   ( ^VEC:vector<JOURNAL:remote-inventory-change> ^ARENA:arena
-     -- ^VEC:vector<MODEL:remote-record> )
-   {: cs ar :}
-   cs ar LATEST-DELETES {: ds :}
-   cs [: WRITE? ;] ar KEYED-NUMBERS {: ws :}
-   ar ARENA:ALLOCATOR 0 [type] MODEL:remote-record VEC:NEW {: out :}
-   0 begin dup ws VEC:COUNT < while ws cs ds out KEY-RECORD repeat drop
-   out ar NORMALIZE-INVENTORY-RECORDS
-   out ;
 
 \ Pushes the key of each of k's ancestors, outermost first, then k.
 : LINEAGE+ ( MODEL:key ^VEC:vector<MODEL:key> -- )
@@ -1940,8 +1897,8 @@ STRUCTURE mismatch
    FIELD key MODEL:key
 ;STRUCTURE
 
-\ One refresh of the remote inventory: cursor is the journal's, changes
-\ and mismatches the current listing's entries.
+\ One refresh: cursor is the journal's, mismatches the listing's, changes
+\ a delta's entries or a full listing's current batch.
 STRUCTURE refresh DERIVE addr
    FIELD journal JOURNAL:journal
    FIELD link ^REPLAY:link
@@ -1993,7 +1950,8 @@ ENUM listed done ;ENUM
    r REFRESH-ARENA @ {: ar :}
    e DROPBOX-ENTRY:DISPLAY @ SPAN:$ ar ARENA:COPY
    e DROPBOX-ENTRY:LOWER @ SPAN:$ ar ARENA:COPY
-   k MISMATCH-MAKE r REFRESH-MISMATCHES @ VEC:PUSH ! ;
+   k KEY-BYTES ar ARENA:COPY MODEL:>KEY
+   MISMATCH-MAKE r REFRESH-MISMATCHES @ VEC:PUSH ! ;
 
 : MISMATCH-LOG ( mismatch -- )
    MISMATCH-UNMAKE {: d:str l:str k :}
@@ -2055,10 +2013,10 @@ ENUM listed done ;ENUM
    ;MATCH ;
 
 \ A reset here is another reply: the full listing cannot restart.
-: FULL-REPLY ( DROPBOX:reply ^refresh -- listed )
+: FULL-REPLY ( DROPBOX:reply ^refresh -- )
    {: y:DROPBOX:reply r :}
    y MATCH DROPBOX:reply
-      done OF construct listed done ENDOF
+      done OF ENDOF
       refused OF drop y r REFRESH-LINK @ REPLAY:STOP-PASS ENDOF
       retry OF drop y r REFRESH-LINK @ REPLAY:STOP-PASS ENDOF
       unlinked OF y r REFRESH-LINK @ REPLAY:STOP-PASS ENDOF
@@ -2070,11 +2028,46 @@ ENUM listed done ;ENUM
    r REFRESH-CURSOR @ DROPBOX:CURSOR>STR r CLIENT
    [: r ENTRY+ ;] DROPBOX:CHANGES r DELTA-REPLY ;
 
+\ A full listing's changes go to the journal's staging this many at a
+\ time.
+512 constant LISTING-BATCH
+
+: NEW-BATCH ( ^refresh ^ARENA:arena -- )
+   {: r b :}
+   b ARENA:ALLOCATOR 0 [type] JOURNAL:remote-inventory-change VEC:NEW
+   r REFRESH-CHANGES ! ;
+
+: STAGE-BATCH ( ^refresh ^ARENA:arena -- )
+   {: r b :}
+   r REFRESH-JOURNAL @ r REFRESH-CHANGES @ JOURNAL:STAGE-LISTING
+   b ARENA:RESET
+   r b NEW-BATCH ;
+
+\ The entry's changes and their bytes go in the batch's arena b.
+: BATCH-ENTRY+ ( ^DROPBOX:entry ^refresh ^ARENA:arena -- )
+   {: e r b :}
+   e r REFRESH-ROOT @ r REFRESH-CHANGES @ b
+   [: r MISMATCH+ ;] APPEND-ENTRY-CHANGES
+   r REFRESH-CHANGES @ VEC:COUNT LISTING-BATCH >= if r b STAGE-BATCH then ;
+
+\ FULL-REPLY returns only on done; its throw out of the staging leaves
+\ the inventory and its cursor as they were.
+: LISTING-STAGED ( ^refresh ^ARENA:arena -- )
+   {: r b :}
+   r b NEW-BATCH
+   r REFRESH-JOURNAL @
+   [: r REFRESH-ROOT @ LISTING-PATH r CLIENT
+      [: r b BATCH-ENTRY+ ;] DROPBOX:LIST r FULL-REPLY
+      r b STAGE-BATCH
+      r MISMATCHES-LOG
+      r LISTED-CURSOR ;]
+   JOURNAL:WITH-REMOTE-LISTING ;
+
 : LISTED ( ^refresh -- listed )
    {: r :}
    r FRESH
-   r REFRESH-ROOT @ LISTING-PATH r CLIENT
-   [: r ENTRY+ ;] DROPBOX:LIST r FULL-REPLY ;
+   r [: LISTING-STAGED ;] ARENA:WITH
+   construct listed done ;
 
 : APPLY-DELTA ( ^refresh -- )
    {: r :}
@@ -2083,23 +2076,6 @@ ENUM listed done ;ENUM
    r MISMATCHES-LOG
    r REFRESH-JOURNAL @ r LISTED-CURSOR cs
    JOURNAL:APPLY-REMOTE-INVENTORY-DELTA ;
-
-\ Publishes the listing's records and its changes, its holds respelled
-\ in place by the records' casing so a hold spells its folders as they
-\ do; the journal stores the records and only checks that each of the
-\ changes' writes folds to its key, which respelling does not change.
-: PUBLISH ( ^refresh -- )
-   {: r :}
-   r REFRESH-CHANGES @ {: cs :}
-   r REFRESH-ARENA @ {: ar :}
-   cs ar INVENTORY-RECORDS {: rs :}
-   rs ar DIRECTORY-CASING {: cv :}
-   cs VEC:COUNT 0 ?do
-      cs i VEC:AT @ cv ar RESPELL-HOLD cs i VEC:AT !
-   loop
-   r MISMATCHES-LOG
-   r REFRESH-JOURNAL @ r LISTED-CURSOR rs cs
-   JOURNAL:PUBLISH-REMOTE-INVENTORY ;
 
 \ Rust's refresh_inventory, after formal/InventoryPublication.tla: a
 \ stored cursor's changes apply as one delta, else a full listing
@@ -2113,7 +2089,7 @@ FSM:DEFINE INVENTORY-PUBLICATION ( ^refresh ) listing-state listing-event
       done   APPLY-DELTA  >published
       reset  -            >full
    IN full  LISTED ( listed )
-      done  PUBLISH  >published
+      done  -  >published
    FINAL published  -
 ;DEFINE
 
@@ -2136,6 +2112,8 @@ STRUCTURE run DERIVE addr
    FIELD staging str
    FIELD arena ^ARENA:arena
 ;STRUCTURE
+
+ARENA RUNS run
 
 : ROOT$ ( ^run -- str ) RUN-ROOT @ ;
 : STAGING$ ( ^run -- str ) RUN-STAGING @ ;
@@ -2719,7 +2697,85 @@ STRUCTURE download-operation
       completed OF ENDOF
    ;MATCH ;
 
-\ The step's download, one at a time; reason is why FETCH blocked it.
+: KEEP-PATH ( MODEL:path ^ARENA:arena -- MODEL:path )
+   {: path ar :}
+   path MODEL:PATH>STR ar ARENA:COPY MODEL:>PATH ;
+
+: KEEP-HASH ( DROPBOX:hash ^ARENA:arena -- DROPBOX:hash )
+   {: c ar :}
+   c DROPBOX:HASH>STR ar ARENA:COPY DROPBOX:>HASH ;
+
+: KEEP-ACTUAL
+   ( option<DROPBOX:hash> ^ARENA:arena -- option<DROPBOX:hash> )
+   {: a ar :}
+   a MATCH option
+      none OF a ENDOF
+      some OF ar KEEP-HASH OPTION:SOME ENDOF
+   ;MATCH ;
+
+: KEEP-REASON ( MODEL:blockage ^ARENA:arena -- MODEL:blockage )
+   {: b ar :}
+   b MATCH MODEL:blockage
+      remote-rejected OF
+         ar ARENA:COPY MODEL-BLOCKAGE:REMOTE-REJECTED
+      ENDOF
+      unsupported-file-size OF b ENDOF
+      download-unavailable OF drop b ENDOF
+      download-verification-failed OF b ENDOF
+      stage-occupied OF b ENDOF
+      local-object-in-way OF b ENDOF
+      remote-object OF b ENDOF
+      conflict-copy-occupied OF b ENDOF
+   ;MATCH ;
+
+\ The entry with its bytes copied into the arena.
+: KEEP-BLOCKED
+   ( REPLAY:replay-blocked ^ARENA:arena -- REPLAY:replay-blocked )
+   {: b ar :}
+   b MATCH REPLAY:replay-blocked
+      durable-plan OF {: path why :}
+         path ar KEEP-PATH why ar KEEP-REASON
+         REPLAY-REPLAY--BLOCKED:DURABLE-PLAN
+      ENDOF
+      local-object OF
+         ar KEEP-PATH REPLAY-REPLAY--BLOCKED:LOCAL-OBJECT
+      ENDOF
+      fresh-observation-required OF
+         ar KEEP-PATH REPLAY-REPLAY--BLOCKED:FRESH-OBSERVATION-REQUIRED
+      ENDOF
+      download-required OF {: path c :}
+         path ar KEEP-PATH c ar KEEP-HASH
+         REPLAY-REPLAY--BLOCKED:DOWNLOAD-REQUIRED
+      ENDOF
+      stage-destination-occupied OF
+         ar ARENA:COPY REPLAY-REPLAY--BLOCKED:STAGE-DESTINATION-OCCUPIED
+      ENDOF
+      precondition-changed OF {: path a :}
+         path ar KEEP-PATH a ar KEEP-ACTUAL
+         REPLAY-REPLAY--BLOCKED:PRECONDITION-CHANGED
+      ENDOF
+      remote-operation OF
+         ar KEEP-PATH REPLAY-REPLAY--BLOCKED:REMOTE-OPERATION
+      ENDOF
+      remote-pending OF
+         ar KEEP-PATH REPLAY-REPLAY--BLOCKED:REMOTE-PENDING
+      ENDOF
+      remote-object OF
+         ar KEEP-PATH REPLAY-REPLAY--BLOCKED:REMOTE-OBJECT
+      ENDOF
+      sync-error OF {: path why :}
+         path ar KEEP-PATH why REPLAY-REPLAY--BLOCKED:SYNC-ERROR
+      ENDOF
+   ;MATCH ;
+
+\ The report's entries copied into the arena, in place.
+: KEEP-BLOCKS ( ^REPLAY:replay-report ^ARENA:arena -- )
+   {: rep ar :}
+   rep BLOCKS {: bs :}
+   bs VEC:COUNT 0 ?do bs i VEC:AT @ ar KEEP-BLOCKED bs i VEC:AT ! loop ;
+
+\ The step's download, one at a time; reason is why FETCH blocked it;
+\ arena holds what one download allocates, reset when it ends.
 STRUCTURE download DERIVE addr
    FIELD run ^run
    FIELD root fd
@@ -2729,6 +2785,7 @@ STRUCTURE download DERIVE addr
    FIELD live ^VEC:vector<LOCAL:binding>
    FIELD report ^REPLAY:replay-report
    FIELD reason MODEL:blockage
+   FIELD arena ^ARENA:arena
 ;STRUCTURE
 
 ARENA DOWNLOADS download
@@ -2745,7 +2802,8 @@ ENUM root-check active changed ;ENUM
    r RUN-ARENA @ DOWNLOADS-NEW {: x :}
    r x DOWNLOAD-RUN ! root x DOWNLOAD-ROOT !
    gen x DOWNLOAD-GENERATION ! live x DOWNLOAD-LIVE !
-   rep x DOWNLOAD-REPORT ! x ;
+   rep x DOWNLOAD-REPORT ! r RUN-ARENA @ ARENA:NEW-IN x DOWNLOAD-ARENA !
+   x ;
 
 : WANTED-SOURCE ( ^download -- MODEL:remote )
    DOWNLOAD-WANTED @ DOWNLOAD-OPERATION-UNMAKE {: id src :} src ;
@@ -2776,7 +2834,7 @@ ENUM root-check active changed ;ENUM
    x DOWNLOAD-RUN @ {: r :}
    NO-FETCH [: DROP-FETCH [: r RUN-LINK @ x DOWNLOAD-ROOT @ r ROOT$
          x DOWNLOAD-PLAN @ PLAN-PATH x WANTED-SOURCE lease r STAGING$
-         r RUN-ARENA @ REPLAY:STAGE-EXACT-DOWNLOAD-AT ;]
+         x DOWNLOAD-ARENA @ REPLAY:STAGE-EXACT-DOWNLOAD-AT ;]
       ['] FETCH-CONVERTS? LOCAL:WITH-CONVERTS ;] catch {: code:n :}
    code 0<> if drop NO-FETCH then code ;
 
@@ -2825,7 +2883,7 @@ ENUM root-check active changed ;ENUM
    {: x :}
    x DOWNLOAD-RUN @ {: r :}
    x DOWNLOAD-PLAN @ {: p :}
-   r RUN-JOURNAL @ p ID-OF r RUN-ARENA @ JOURNAL:PLAN-OF
+   r RUN-JOURNAL @ p ID-OF x DOWNLOAD-ARENA @ JOURNAL:PLAN-OF
    MATCH option
       none OF
          p PLAN-PATH s" installing download has no journal plan" INVALID
@@ -2839,17 +2897,19 @@ ENUM root-check active changed ;ENUM
    rep REPLAY-REPLAY--REPORT:COMPLETED-OPERATIONS @ 0= if exit then
    r RUN-LINK @ REPLAY-LINK:STATUS @ STATUS:COMPLETED ;
 
-\ The staged download installed at once.
+\ The staged download installed at once; its report's entries outlive
+\ the download's arena in the step's.
 : INSTALL ( ^download -- )
    {: x :}
    x DOWNLOAD-RUN @ {: r :}
-   r RUN-ARENA @ ARENA:ALLOCATOR 0 [type] JOURNAL:plan-record
-   VEC:NEW {: one :}
+   x DOWNLOAD-ARENA @ {: ar :}
+   ar ARENA:ALLOCATOR 0 [type] JOURNAL:plan-record VEC:NEW {: one :}
    x CURRENT-PLAN one VEC:PUSH !
-   r RUN-JOURNAL @ x DOWNLOAD-ROOT @ r ROOT$ one r RUN-ARENA @
+   r RUN-JOURNAL @ x DOWNLOAD-ROOT @ r ROOT$ one ar
    REPLAY:REPLAY-LOCAL-PLANS-AT {: rep :}
    rep r INSTALL-DONE
-   r one one r RUN-ARENA @ PATH-ORDER rep RECORD-LOCAL-BLOCKS
+   r one one ar PATH-ORDER rep RECORD-LOCAL-BLOCKS
+   rep r RUN-ARENA @ KEEP-BLOCKS
    rep x DOWNLOAD-REPORT @ ADD-REPORT ;
 
 : BLOCK ( ^download -- )
@@ -2963,9 +3023,7 @@ ENUM replay-step
 : UNROOTED? ( download-state -- bool )
    construct download-state unrooted DOWNLOAD-STATE-EQ ;
 
-\ The download of the pending plan at path, which a download-required
-\ entry names; answers its final state. by-path is PATH-ORDER's.
-: RUN-DOWNLOAD
+: EXECUTE-AT
    ( ^download ^VEC:vector<JOURNAL:plan-record> ^VEC:vector<n>
      MODEL:path -- download-state )
    {: x pending by-path path :}
@@ -2980,6 +3038,15 @@ ENUM replay-step
          ;MATCH
       ENDOF
    ;MATCH ;
+
+\ The download of the pending plan at path, which a download-required
+\ entry names; answers its final state. by-path is PATH-ORDER's.
+: RUN-DOWNLOAD
+   ( ^download ^VEC:vector<JOURNAL:plan-record> ^VEC:vector<n>
+     MODEL:path -- download-state )
+   {: x pending by-path path :}
+   [: x pending by-path path EXECUTE-AT ;]
+   [: x DOWNLOAD-ARENA @ ARENA:RESET ;] finally ;
 
 \ The downloads in order, the root checked first and again before
 \ each install; false: the root changed, and no later download ran.
@@ -3070,6 +3137,7 @@ STRUCTURE known-conflict
 \ blocked_paths (held, keys may repeat); waiting, new conflicts on a block.
 STRUCTURE planning DERIVE addr
    FIELD run ^run
+   FIELD pass ^ARENA:arena
    FIELD conflicts ^VEC:vector<known-conflict>
    FIELD now n
    FIELD noop-count n
@@ -3153,12 +3221,22 @@ ARENA PLANNINGS planning
    [: v swap VEC:AT @ out VEC:PUSH ! ;] GATHER
    out ;
 
+\ The run with a child of its arena as its own: the item arena, reset
+\ after each known path and released when PLAN-PATHS returns.
+: ITEM-RUN ( ^run -- ^run )
+   {: r :}
+   r RUN-ARENA @ {: ar :}
+   ar RUNS-NEW {: v :}
+   r @ v !
+   ar ARENA:NEW-IN v RUN-ARENA !
+   v ;
+
 \ A pass's planning over the known conflicts.
 : NEW-PLANNING ( ^run -- ^planning )
    {: r :}
    r RUN-ARENA @ {: ar :}
    ar PLANNINGS-NEW {: pl :}
-   r pl PLANNING-RUN !
+   ar pl PLANNING-PASS !
    r KNOWN-CONFLICTS pl PLANNING-CONFLICTS !
    ar [type] MODEL:key NEW-VECTOR pl PLANNING-HELD !
    ar [type] MODEL:key NEW-VECTOR pl PLANNING-COLLISIONS !
@@ -3166,9 +3244,136 @@ ARENA PLANNINGS planning
    ar [type] JOURNAL:path-baseline NEW-VECTOR pl PLANNING-NOOPS !
    ar [type] JOURNAL:path-plan NEW-VECTOR pl PLANNING-PLANS !
    ar [type] path-decision NEW-VECTOR pl PLANNING-DECISIONS !
+   r ITEM-RUN pl PLANNING-RUN !
    pl ;
 
 : ARENA-OF ( ^planning -- ^ARENA:arena ) PLANNING-RUN @ RUN-ARENA @ ;
+\ The arena of all the planning keeps.
+: PASS-ARENA ( ^planning -- ^ARENA:arena ) PLANNING-PASS @ ;
+
+\ ---- copies into the pass arena ------------------------------------
+
+: COPY-KEY ( MODEL:key ^ARENA:arena -- MODEL:key )
+   swap MODEL:KEY>STR swap ARENA:COPY MODEL:>KEY ;
+
+: COPY-PATH ( MODEL:path ^ARENA:arena -- MODEL:path )
+   swap MODEL:PATH>STR swap ARENA:COPY MODEL:>PATH ;
+
+: COPY-HASH ( DROPBOX:hash ^ARENA:arena -- DROPBOX:hash )
+   swap DROPBOX:HASH>STR swap ARENA:COPY DROPBOX:>HASH ;
+
+: COPY-REV ( DROPBOX:rev ^ARENA:arena -- DROPBOX:rev )
+   swap DROPBOX:REV>STR swap ARENA:COPY DROPBOX:>REV ;
+
+: COPY-LOCAL ( MODEL:local ^ARENA:arena -- MODEL:local )
+   swap MODEL-LOCAL:UNMAKE swap COPY-HASH MODEL-LOCAL:MAKE ;
+
+: COPY-REMOTE ( MODEL:remote ^ARENA:arena -- MODEL:remote )
+   {: rem ar :}
+   rem MODEL-REMOTE:UNMAKE {: c v :}
+   c ar COPY-HASH v ar COPY-REV MODEL-REMOTE:MAKE ;
+
+: COPY-BASELINE ( MODEL:baseline ^ARENA:arena -- MODEL:baseline )
+   {: b ar :}
+   b MATCH MODEL:baseline
+      absent OF MODEL-BASELINE:ABSENT ENDOF
+      present OF ar COPY-REMOTE MODEL-BASELINE:PRESENT ENDOF
+      directory OF MODEL-BASELINE:DIRECTORY ENDOF
+   ;MATCH ;
+
+: COPY-OPERATION ( MODEL:operation ^ARENA:arena -- MODEL:operation )
+   {: op ar :}
+   op MATCH MODEL:operation
+      create-local-directory OF
+         MODEL-OPERATION:CREATE-LOCAL-DIRECTORY
+      ENDOF
+      create-remote-directory OF
+         MODEL-OPERATION:CREATE-REMOTE-DIRECTORY
+      ENDOF
+      delete-local-directory OF
+         MODEL-OPERATION:DELETE-LOCAL-DIRECTORY
+      ENDOF
+      delete-remote-directory OF
+         MODEL-OPERATION:DELETE-REMOTE-DIRECTORY
+      ENDOF
+      create-remote OF
+         ar COPY-HASH MODEL-OPERATION:CREATE-REMOTE
+      ENDOF
+      install-local OF
+         ar COPY-REMOTE MODEL-OPERATION:INSTALL-LOCAL
+      ENDOF
+      preserve-local OF
+         ar COPY-LOCAL MODEL-OPERATION:PRESERVE-LOCAL
+      ENDOF
+      replace-local OF
+         {: rem c :} rem ar COPY-REMOTE c ar COPY-HASH
+         MODEL-OPERATION:REPLACE-LOCAL
+      ENDOF
+      delete-local OF
+         ar COPY-HASH MODEL-OPERATION:DELETE-LOCAL
+      ENDOF
+      preserve-remote OF
+         ar COPY-REMOTE MODEL-OPERATION:PRESERVE-REMOTE
+      ENDOF
+      replace-remote OF
+         {: c v :} c ar COPY-HASH v ar COPY-REV
+         MODEL-OPERATION:REPLACE-REMOTE
+      ENDOF
+      delete-remote OF
+         ar COPY-REV MODEL-OPERATION:DELETE-REMOTE
+      ENDOF
+   ;MATCH ;
+
+: COPY-SIDES
+   ( MODEL:local MODEL:remote ^ARENA:arena -- MODEL:local MODEL:remote )
+   {: l rem ar :}
+   l ar COPY-LOCAL rem ar COPY-REMOTE ;
+
+: COPY-CONFLICT ( MODEL:conflict ^ARENA:arena -- MODEL:conflict )
+   {: c ar :}
+   c MATCH MODEL:conflict
+      initial OF ar COPY-SIDES MODEL-CONFLICT:INITIAL ENDOF
+      divergent OF ar COPY-SIDES MODEL-CONFLICT:DIVERGENT ENDOF
+      local-deleted OF
+         ar COPY-REMOTE MODEL-CONFLICT:LOCAL-DELETED
+      ENDOF
+      remote-deleted OF
+         ar COPY-LOCAL MODEL-CONFLICT:REMOTE-DELETED
+      ENDOF
+   ;MATCH ;
+
+: COPY-COLLISION ( MODEL:collision ^ARENA:arena -- MODEL:collision )
+   {: col ar :}
+   col MATCH MODEL:collision
+      local-file OF ar COPY-LOCAL MODEL-COLLISION:LOCAL-FILE ENDOF
+      local-dir OF ar COPY-REMOTE MODEL-COLLISION:LOCAL-DIR ENDOF
+   ;MATCH ;
+
+: COPY-DECISION ( MODEL:decision ^ARENA:arena -- MODEL:decision )
+   {: d ar :}
+   d MATCH MODEL:decision
+      noop OF ar COPY-BASELINE MODEL-DECISION:NOOP ENDOF
+      operate OF ar COPY-OPERATION MODEL-DECISION:OPERATE ENDOF
+      blocked OF MODEL-DECISION:BLOCKED ENDOF
+      conflicted OF ar COPY-CONFLICT MODEL-DECISION:CONFLICTED ENDOF
+      collided OF ar COPY-COLLISION MODEL-DECISION:COLLIDED ENDOF
+   ;MATCH ;
+
+: COPY-PATH-DECISION ( path-decision ^ARENA:arena -- path-decision )
+   {: pd ar :}
+   pd PATH-DECISION-UNMAKE {: k path same d :}
+   k ar COPY-KEY path ar COPY-PATH same d ar COPY-DECISION
+   PATH-DECISION-MAKE ;
+
+: COPY-PLAN
+   ( JOURNAL:operation-plan ^ARENA:arena -- JOURNAL:operation-plan )
+   {: plan ar :}
+   plan JOURNAL-OPERATION--PLAN:UNMAKE {: ops :}
+   ar [type] MODEL:operation NEW-VECTOR {: out :}
+   ops VEC:COUNT 0 ?do
+      ops i VEC:AT @ ar COPY-OPERATION out VEC:PUSH !
+   loop
+   out JOURNAL-OPERATION--PLAN:MAKE ;
 : JOURNAL-OF ( ^planning -- JOURNAL:journal )
    PLANNING-RUN @ RUN-JOURNAL @ ;
 
@@ -3210,7 +3415,7 @@ ARENA PLANNINGS planning
 \ Rust's blocked_paths.insert.
 : HELD+ ( ^planning MODEL:key -- )
    {: pl k :}
-   k pl PLANNING-HELD @ VEC:PUSH ! ;
+   k pl PASS-ARENA COPY-KEY pl PLANNING-HELD @ VEC:PUSH ! ;
 
 \ Rust's no-op rule: one that keeps the baseline at a path with no
 \ conflict is only counted; any other is recorded.
@@ -3223,7 +3428,8 @@ ARENA PLANNINGS planning
    same pl k ONLY-COUNTED? if
       1 pl PLANNING-NOOP-COUNT +! exit
    then
-   path base JOURNAL-PATH--BASELINE:MAKE
+   pl PASS-ARENA {: ar :}
+   path ar COPY-PATH base ar COPY-BASELINE JOURNAL-PATH--BASELINE:MAKE
    pl PLANNING-NOOPS @ VEC:PUSH ! ;
 
 : BASELINE-OF ( option<JOURNAL:path-baseline> -- MODEL:baseline )
@@ -3322,14 +3528,19 @@ ARENA PLANNINGS planning
       collided OF drop OPTION:NONE ENDOF
    ;MATCH ;
 
+: KEEP-DECISION ( ^planning path-decision -- )
+   {: pl pd :}
+   pd pl PASS-ARENA COPY-PATH-DECISION
+   pl PLANNING-DECISIONS @ VEC:PUSH ! ;
+
 \ A no-op at a key no live plan holds is settled now; any other
 \ decision waits for DECIDE.
 : FILE-DECISION ( ^planning path-decision bool -- )
    {: pl pd live:bool :}
    pd PATH-DECISION-UNMAKE {: k path same d :}
-   live if pd pl PLANNING-DECISIONS @ VEC:PUSH ! exit then
+   live if pl pd KEEP-DECISION exit then
    d NOOP-OF MATCH option
-      none OF pd pl PLANNING-DECISIONS @ VEC:PUSH ! ENDOF
+      none OF pl pd KEEP-DECISION ENDOF
       some OF {: base :} pl k path base same NOOP ENDOF
    ;MATCH ;
 
@@ -3389,7 +3600,7 @@ ARENA PLANNINGS planning
    kp kp pl ar KNOWN-DECISION pl COUNTED? if
       1 pl PLANNING-NOOP-COUNT +! exit
    then
-   k KEY-BYTES pl ARENA-OF ARENA:COPY MODEL:>KEY kept VEC:PUSH ! ;
+   k pl PASS-ARENA COPY-KEY kept VEC:PUSH ! ;
 
 \ The scratch arena first, as ARENA:WITH passes it; the settled keys the
 \ journal skips are counted no-ops. None of them is excluded: a
@@ -3406,7 +3617,7 @@ ARENA PLANNINGS planning
 \ byte order; a pass's memory grows with its changes, not the tree.
 : KNOWN-WALK ( ^planning -- ^VEC:vector<MODEL:key> )
    {: pl :}
-   pl ARENA-OF [type] MODEL:key NEW-VECTOR {: kept :}
+   pl PASS-ARENA [type] MODEL:key NEW-VECTOR {: kept :}
    [: pl kept WALK-IN ;] ARENA:WITH
    kept ;
 
@@ -3421,9 +3632,11 @@ ARENA PLANNINGS planning
 : DECIDE-ALL ( ^planning -- )
    {: pl :}
    pl KNOWN-WALK {: kept :}
-   kept VEC:COUNT 0 ?do pl kept i VEC:AT @ DECIDE-KEPT loop
+   kept VEC:COUNT 0 ?do
+      pl kept i VEC:AT @ DECIDE-KEPT pl ARENA-OF ARENA:RESET
+   loop
    pl PLANNING-DECISIONS @ {: v :}
-   pl ARENA-OF {: ar :}
+   pl PASS-ARENA {: ar :}
    ar [type] path-decision NEW-VECTOR {: out :}
    v VEC:COUNT [: v DECISION-CMP ;] ar STABLE-ORDER
    [: v swap VEC:AT @ out VEC:PUSH ! ;] GATHER
@@ -3596,7 +3809,9 @@ ENUM live-step held superseded fresh root-changed ;ENUM
    pl PLANNING-RUN @ ROOT-ACTIVE? 0= if
       construct pass-event root-changed exit
    then
-   path plan JOURNAL-PATH--PLAN:MAKE pl PLANNING-PLANS @ VEC:PUSH !
+   pl PASS-ARENA {: ar :}
+   path ar COPY-PATH plan ar COPY-PLAN JOURNAL-PATH--PLAN:MAKE
+   pl PLANNING-PLANS @ VEC:PUSH !
    construct pass-event ok ;
 
 : NEW-OPERATE
@@ -3688,7 +3903,9 @@ ENUM placement-copies placed taken refused changed unrooted ;ENUM
 : WAIT-NEW ( ^placement -- )
    {: x :}
    x HOLD-NEW
-   x PLACEMENT-KEY @ x PLANNING-OF PLANNING-WAITING @ VEC:PUSH ! ;
+   x PLANNING-OF {: pl :}
+   x PLACEMENT-KEY @ pl PASS-ARENA COPY-KEY
+   pl PLANNING-WAITING @ VEC:PUSH ! ;
 
 \ Held and waiting until an hour from now.
 : BLOCK-NEW ( ^placement -- )
@@ -3742,7 +3959,8 @@ FSM:DEFINE CONFLICT-PLACEMENT ( ^placement ) placement-state placement-start
       root-changed OF construct pass-event root-changed ENDOF
       fresh OF construct pass-event fresh ENDOF
       blocked OF
-         drop k pl PLANNING-COLLISIONS @ VEC:PUSH !
+         drop k pl PASS-ARENA COPY-KEY
+         pl PLANNING-COLLISIONS @ VEC:PUSH !
          pl k HELD+ construct pass-event ok
       ENDOF
       plan OF {: plan :} pl path plan PUSH-PLAN ENDOF
@@ -3806,7 +4024,8 @@ FSM:DEFINE CONFLICT-PLACEMENT ( ^placement ) placement-state placement-start
    {: pl :}
    pl PLANNING-DECISIONS @ {: v :}
    v VEC:COUNT 0 ?do
-      pl v i VEC:AT @ DECIDE dup OK? 0= if unloop exit then drop
+      pl v i VEC:AT @ DECIDE pl ARENA-OF ARENA:RESET
+      dup OK? 0= if unloop exit then drop
    loop
    construct pass-event ok ;
 
@@ -3846,12 +4065,17 @@ FSM:DEFINE CONFLICT-PLACEMENT ( ^placement ) placement-state placement-start
 \ Rust's reconcile_published from its start to record_reconciliation:
 \ every known path decided and prepared, then the no-ops and plans
 \ recorded together, unless planning ended early.
-: PLAN-PATHS ( ^run -- ^planning pass-event )
-   NEW-PLANNING {: pl :}
+: PLAN-IN ( ^planning -- pass-event )
+   {: pl :}
    pl DECIDE-ALL
    epoch-seconds pl PLANNING-NOW !
-   pl pl DECIDE-EACH dup OK? 0= if exit then
+   pl DECIDE-EACH dup OK? 0= if exit then
    drop pl RECORD-PLANNING construct pass-event ok ;
+
+: PLAN-PATHS ( ^run -- ^planning pass-event )
+   NEW-PLANNING {: pl :}
+   [: pl PLAN-IN ;] [: pl ARENA-OF ARENA:RELEASE ;] finally {: ev :}
+   pl ev ;
 
 
 \ ---- the pass ------------------------------------------------------
@@ -3879,8 +4103,6 @@ ENUM outcome
 ;ENUM
 
 private
-
-ARENA RUNS run
 
 \ One pass; each field is set by the state that makes it.
 STRUCTURE pass DERIVE addr
@@ -4157,9 +4379,8 @@ ENUM pass-state DERIVE eq
 
 \ Whether the live plan at path, spelled as path is, installs content
 \ c: the stage of both is one file, that plan's now.
-: LIVE-HOLDS? ( ^run MODEL:path DROPBOX:hash -- bool )
-   {: r path c :}
-   r RUN-ARENA @ {: ar :}
+: LIVE-HOLDS? ( ^run MODEL:path DROPBOX:hash ^ARENA:arena -- bool )
+   {: r path c ar :}
    r RUN-JOURNAL @ path ar MODEL:FOLD ar JOURNAL:LIVE-PLAN-AT
    MATCH option
       none OF false ENDOF
@@ -4167,14 +4388,14 @@ ENUM pass-state DERIVE eq
    ;MATCH ;
 
 \ The first failed retirement at path this pass is logged, with errno
-\ e; logged holds the paths logged.
-: RETIRE-FAILED ( ^VEC:vector<str> MODEL:path n -- )
-   {: logged path e:n :}
+\ e; logged, in arena ar, holds the paths logged.
+: RETIRE-FAILED ( ^VEC:vector<str> MODEL:path n ^ARENA:arena -- )
+   {: logged path e:n ar :}
    path MODEL:PATH>STR {: t:str :}
    logged VEC:COUNT 0 ?do
       logged i VEC:AT @ t STR:= if unloop exit then
    loop
-   t logged VEC:PUSH !
+   t ar ARENA:COPY logged VEC:PUSH !
    LOG:WARN s" reconcile" LOG:LINE
    s" could not retire the verified download stage of `" LOG:TEXT+
    t LOG:TEXT+ s" `, errno " LOG:TEXT+ e LOG:INT+ LOG:;LINE ;
@@ -4183,27 +4404,29 @@ ENUM pass-state DERIVE eq
 \ at path, or absent. A conflict copy's record of it whose key is held
 \ keeps it unsettled, and so does a failure, for the next pass.
 : STAGE-SETTLED?
-   ( fd ^run ^VEC:vector<str> MODEL:path DROPBOX:hash -- bool )
-   {: root:fd r logged path c:DROPBOX:hash :}
-   r path c LIVE-HOLDS? if true exit then
+   ( fd ^run ^VEC:vector<str> MODEL:path DROPBOX:hash ^ARENA:arena
+     -- bool )
+   {: root:fd r logged path c:DROPBOX:hash ar :}
+   r path c ar LIVE-HOLDS? if true exit then
    r RUN-JOURNAL @ path c JOURNAL:COPY-STAGE-HELD? if false exit then
-   root r ROOT$ path MODEL:PATH>STR c r RUN-ARENA @
+   root r ROOT$ path MODEL:PATH>STR c ar
    LOCAL:RETIRE-DOWNLOAD-STAGE MATCH LOCAL:stage-retirement
       absent OF true ENDOF
-      failed OF {: e:n :} logged path e RETIRE-FAILED false ENDOF
+      failed OF {: e:n :}
+         logged path e r RUN-ARENA @ RETIRE-FAILED false
+      ENDOF
    ;MATCH ;
 
 \ The completed plan forgotten once each of its stages is settled.
 : RETIRE-STAGES-OF
-   ( fd ^run ^VEC:vector<str> JOURNAL:plan-record -- )
-   {: root:fd r logged p :}
+   ( fd ^run ^VEC:vector<str> JOURNAL:plan-record ^ARENA:arena -- )
+   {: root:fd r logged p ar :}
    p JOURNAL-PLAN--RECORD:UNMAKE {: id path ops s :}
    true ops VEC:COUNT 0 ?do
       ops i VEC:AT @ INSTALLED-SOURCE MATCH option
          none OF ENDOF
-         some OF
-            {: src :} root r logged path src SOURCE-CONTENT STAGE-SETTLED?
-            and
+         some OF {: src :}
+            root r logged path src SOURCE-CONTENT ar STAGE-SETTLED? and
          ENDOF
       ;MATCH
    loop
@@ -4212,10 +4435,10 @@ ENUM pass-state DERIVE eq
 \ A conflict copy's recorded stage that nothing may install any more,
 \ removed, then forgotten once settled.
 : COPY-STAGE-RETIRED
-   ( fd ^run ^VEC:vector<str> JOURNAL:copy-stage -- )
-   {: root:fd r logged s :}
+   ( fd ^run ^VEC:vector<str> JOURNAL:copy-stage ^ARENA:arena -- )
+   {: root:fd r logged s ar :}
    s JOURNAL-COPY--STAGE:UNMAKE {: target c:DROPBOX:hash k :}
-   root r logged target c STAGE-SETTLED?
+   root r logged target c ar STAGE-SETTLED?
    if r RUN-JOURNAL @ target c JOURNAL:FORGET-COPY-STAGE then ;
 
 : RETIRE-ROOTED ( fd ^run -- )
@@ -4224,10 +4447,15 @@ ENUM pass-state DERIVE eq
    r RUN-JOURNAL @ r RUN-ARENA @ JOURNAL:UNHELD-COPY-STAGES {: copies :}
    done VEC:COUNT 0= copies VEC:COUNT 0= and if exit then
    r RUN-ARENA @ [type] str NEW-VECTOR {: logged :}
-   done VEC:COUNT 0 ?do root r logged done i VEC:AT @ RETIRE-STAGES-OF
+   r RUN-ARENA @ ARENA:NEW-IN {: each :}
+   done VEC:COUNT 0 ?do
+      root r logged done i VEC:AT @ each RETIRE-STAGES-OF each ARENA:RESET
    loop
-   copies VEC:COUNT 0 ?do root r logged copies i VEC:AT @ COPY-STAGE-RETIRED
-   loop ;
+   copies VEC:COUNT 0 ?do
+      root r logged copies i VEC:AT @ each COPY-STAGE-RETIRED
+      each ARENA:RESET
+   loop
+   each ARENA:RELEASE ;
 
 \ Each completed download plan's verified stages removed, unless a live
 \ plan holds the same path and content, then the plan forgotten; a stage

@@ -1,6 +1,7 @@
 \ test-journal.f - JOURNAL's words for tests, never production: the Rust
 \ version's test-only words (rust src/journal.rs, #[cfg(test)]), a
-\ private comparison exported, and readers and writers of the local scan.
+\ private comparison exported, readers and writers of the local scan,
+\ and a writer of the remote inventory.
 \ RECORD-RECOVERY-INTENT commits the recovery intent an older Omabox
 \ version recorded before a destructive operation, answering a
 \ recovery-write, COMPLETE-RECOVERY completes a recovery record,
@@ -10,9 +11,11 @@
 \ two local inventories hold equal records in the same order,
 \ LOCAL-HASH-CACHE answers the active root's hash cache,
 \ PUBLISH-LOCAL-SCAN publishes given observations and hashes as one
-\ scan, and SCAN-COUNTS answers how many files a scan has still to hash
-\ and how many observations and hashes it staged. Tests alone load this
-\ file; nothing in the program calls these words.
+\ scan, SCAN-COUNTS answers how many files a scan has still to hash
+\ and how many observations and hashes it staged, and
+\ UPSERT-REMOTE-RECORDS applies given remote records as one delta's
+\ upserts. Tests alone load this file; nothing in the program calls
+\ these words.
 \ STORAGE CLASS. CALLER-OWNED, as JOURNAL's: a record answered lies in the
 \ arena the caller passes. TASK-LOCAL: the bytes CHANGE-COUNTER reads,
 \ TASK:+USERS rows.
@@ -114,6 +117,26 @@ public
    c s" SELECT COUNT(*) FROM temp.scan_jobs" QUERY-INT
    c s" SELECT COUNT(*) FROM temp.scan_observations" QUERY-INT
    c s" SELECT COUNT(*) FROM temp.scan_hashes" QUERY-INT ;
+
+private
+
+\ The records' upserts, built in ar, applied with the cursor.
+: UPSERTS-APPLIED
+   ( journal DROPBOX:cursor ^VEC:vector<MODEL:remote-record>
+     ^ARENA:arena -- )
+   {: j cur:DROPBOX:cursor v ar :}
+   ar ARENA:ALLOCATOR 0 [type] remote-inventory-change VEC:NEW {: cs :}
+   v VEC:COUNT 0 ?do
+      v i VEC:AT @ construct remote-inventory-change upsert cs VEC:PUSH !
+   loop
+   j cur cs APPLY-REMOTE-INVENTORY-DELTA ;
+
+public
+
+\ One upsert per record, in order, applied with the cursor as a delta.
+: UPSERT-REMOTE-RECORDS
+   ( journal DROPBOX:cursor ^VEC:vector<MODEL:remote-record> -- )
+   [: UPSERTS-APPLIED ;] ARENA:WITH ;
 
 private
 

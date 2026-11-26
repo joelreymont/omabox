@@ -151,6 +151,13 @@
 \ - UNLOWERED-ROOT-LISTS-ITS-ENTRIES: a full listing of the root
 \   /U+13A0, its lower path unlowered as well, with its own entry, a
 \   file and a folder: both are published beneath it.
+\ - A-FULL-LISTING-STAGES-ITS-BATCHES: a full listing of the folder
+\   /bulk as /Bulk and 1 999 files in it, more than two batches, then a
+\   page of /bulk/child.txt as /BULK/Child.txt: every entry is
+\   published with the last page's cursor, the child as Bulk/Child.txt.
+\ - A-REFUSED-PAGE-KEEPS-THE-INVENTORY: after a cursor reset, a full
+\   listing whose first page stages a batch and whose next page is
+\   refused leaves the inventory and its cursor as they were.
 \ The replay step against the fake Dropbox, Rust's tests of the same
 \ names, one REPLAY-STEP standing for one drive_replay:
 \ - worker_verification_mismatch_durably_blocks_its_plan
@@ -513,8 +520,7 @@ private
      [ JOURNAL:journal -- ] ^ARENA:arena -- )
    {: d:str j b ls rs body ar :}
    j b ls ar LOCALS-PUBLISHED
-   j s" cursor" DROPBOX:>CURSOR rs ar NO-CHANGES
-   JOURNAL:PUBLISH-REMOTE-INVENTORY
+   j s" cursor" DROPBOX:>CURSOR rs JOURNAL:UPSERT-REMOTE-RECORDS
    j body execute ;
 
 \ The body runs on a rooted case journal holding the records as its
@@ -1055,8 +1061,7 @@ variable ALL-NOOPS
       ls i ar COMBO-LOCALS rs i ar COMBO-REMOTES held i ar COMBO-KEYS
    loop
    j b ls ar LOCALS-PUBLISHED
-   j s" cursor" DROPBOX:>CURSOR rs ar NO-CHANGES
-   JOURNAL:PUBLISH-REMOTE-INVENTORY ;
+   j s" cursor" DROPBOX:>CURSOR rs JOURNAL:UPSERT-REMOTE-RECORDS ;
 
 \ Whether deciding the known path only counts a no-op; a case collision
 \ decides nothing, so it does not.
@@ -1079,7 +1084,7 @@ variable ALL-NOOPS
    ( JOURNAL:known-path ^planning ^VEC:vector<MODEL:key>
      ^VEC:vector<MODEL:key> ^ARENA:arena -- )
    {: kp pl seen held ar :}
-   kp KNOWN-KEY KEY-BYTES pl ARENA-OF ARENA:COPY MODEL:>KEY {: k :}
+   kp KNOWN-KEY KEY-BYTES pl PASS-ARENA ARENA:COPY MODEL:>KEY {: k :}
    held k KEY-IN? TTRUE
    k seen VEC:PUSH !
    kp pl ar COUNTED-NOOP? if 1 YIELD-NOOPS +! then ;
@@ -1382,8 +1387,7 @@ variable ALL-NOOPS
    j ls rs s" Docs/Notes" ar KEPT-DIRECTORY+
    j ls rs s" Music" ar KEPT-DIRECTORY+
    j b ls ar LOCALS-PUBLISHED
-   j s" cursor" DROPBOX:>CURSOR rs ar NO-CHANGES
-   JOURNAL:PUBLISH-REMOTE-INVENTORY ;
+   j s" cursor" DROPBOX:>CURSOR rs JOURNAL:UPSERT-REMOTE-RECORDS ;
 
 : NOOPS-WALKED
    ( str JOURNAL:journal JOURNAL:local-root-binding ^ARENA:arena -- )
@@ -1905,6 +1909,30 @@ ARENA LISTED DROPBOX:entry
    loop
    SB$ ;
 
+\ The full listing's changes published as the case journal's inventory.
+: LISTING-PUBLISHED
+   ( ^VEC:vector<JOURNAL:remote-inventory-change> JOURNAL:journal
+     ^ARENA:arena -- )
+   {: v j ar :}
+   j [: j v JOURNAL:STAGE-LISTING s" cursor" DROPBOX:>CURSOR ;]
+   JOURNAL:WITH-REMOTE-LISTING ;
+
+\ The case journal's remote records, by key.
+: JOURNAL-RECORDS
+   ( JOURNAL:journal ^ARENA:arena -- ^VEC:vector<MODEL:remote-record> )
+   JOURNAL:REMOTE-INVENTORY JOURNAL-REMOTE--INVENTORY:UNMAKE
+   {: cur v :} v ;
+
+\ The records the full listing v publishes in a journal of its own.
+: LISTED-RECORDS
+   ( ^VEC:vector<JOURNAL:remote-inventory-change> ^ARENA:arena
+     -- ^VEC:vector<MODEL:remote-record> )
+   {: v ar :}
+   ar CASE-JOURNAL {: d:str j :}
+   v j ar LISTING-PUBLISHED
+   j ar JOURNAL-RECORDS
+   d j GONE ;
+
 : FOLDERS-ARE-DIRECTORIES-AND-NON-DOWNLOADABLE-FILES-ARE-UNKNOWN
    ( ^ARENA:arena -- )
    {: ar :}
@@ -1917,7 +1945,7 @@ ARENA LISTED DROPBOX:entry
    false paper DROPBOX-ENTRY:DOWNLOADABLE !
    s" " str> SPAN:MAKE paper DROPBOX-ENTRY:CONTENT-HASH !
    paper root v ar APPENDED
-   v ar INVENTORY-RECORDS {: rs :}
+   v ar LISTED-RECORDS {: rs :}
    rs VEC:COUNT 2 T=
    rs s" folder" ar CANONICAL OBSERVED-IN REMOTE-DIRECTORY
    MODEL:REMOTE-OBSERVATION= TTRUE
@@ -1937,7 +1965,7 @@ ARENA LISTED DROPBOX:entry
    ar FILE-ENTRY root v ar APPENDED
    s" /apps/day one" s" /Apps/Day One" ar FOLDER-ENTRY
    root v ar APPENDED
-   v ar INVENTORY-RECORDS {: rs :}
+   v ar LISTED-RECORDS {: rs :}
    rs s" apps" ar PATH-OF s" apps" T$=
    rs s" apps/day one" ar PATH-OF s" apps/Day One" T$=
    rs s" apps/day one/entry.doentry" ar PATH-OF
@@ -1949,8 +1977,7 @@ ARENA LISTED DROPBOX:entry
    ar REMOTE-RECORDS {: rs :}
    rs s" Apps" REMOTE-DIRECTORY ar REMOTE+
    rs s" Apps/Day One" REMOTE-DIRECTORY ar REMOTE+
-   j s" cursor" DROPBOX:>CURSOR rs ar NO-CHANGES
-   JOURNAL:PUBLISH-REMOTE-INVENTORY ;
+   j s" cursor" DROPBOX:>CURSOR rs JOURNAL:UPSERT-REMOTE-RECORDS ;
 
 : DELTA-PATHS
    ( ^VEC:vector<JOURNAL:remote-inventory-change> JOURNAL:journal
@@ -1989,14 +2016,6 @@ ARENA LISTED DROPBOX:entry
    {: e k t :}
    t k KEY-BYTES TEXT+ t s" |" TEXT+ ;
 
-\ The full listing's changes published as the case journal's inventory.
-: LISTING-PUBLISHED
-   ( ^VEC:vector<JOURNAL:remote-inventory-change> JOURNAL:journal
-     ^ARENA:arena -- )
-   {: v j ar :}
-   j s" cursor" DROPBOX:>CURSOR v ar INVENTORY-RECORDS v
-   JOURNAL:PUBLISH-REMOTE-INVENTORY ;
-
 \ The delta's changes applied to the case journal.
 : DELTA-APPLIED
    ( ^VEC:vector<JOURNAL:remote-inventory-change> JOURNAL:journal
@@ -2005,12 +2024,6 @@ ARENA LISTED DROPBOX:entry
    v j ar NORMALIZE-INVENTORY-CHANGES {: cs :}
    j s" cursor-delta" DROPBOX:>CURSOR cs
    JOURNAL:APPLY-REMOTE-INVENTORY-DELTA ;
-
-\ The case journal's remote records, by key.
-: JOURNAL-RECORDS
-   ( JOURNAL:journal ^ARENA:arena -- ^VEC:vector<MODEL:remote-record> )
-   JOURNAL:REMOTE-INVENTORY JOURNAL-REMOTE--INVENTORY:UNMAKE
-   {: cur v :} v ;
 
 : LISTING-KEEPS-MISMATCHED-PATHS-UNSUPPORTED ( ^ARENA:arena -- )
    {: ar :}
@@ -2157,7 +2170,7 @@ ARENA LISTED DROPBOX:entry
    {: root ar :}
    ar NO-CHANGES {: v :}
    LOWERED$ LOWERED$ ar FILE-ENTRY root v ar APPENDED
-   v ar INVENTORY-RECORDS 0 VEC:AT @ ;
+   v ar LISTED-RECORDS 0 VEC:AT @ ;
 
 \ The listing v holds U+AB70.txt unsupported; a delta deleting
 \ /U+13A0.txt then leaves /U+AB70.txt's record.
@@ -2323,7 +2336,7 @@ ARENA LISTED DROPBOX:entry
    t 10 STR:COUNT-CHAR 1 T=
    t s" Dropbox listing contained an invalid or out-of-root path"
    STR:CONTAINS? TTRUE
-   v ar INVENTORY-RECORDS VEC:COUNT 0 T=
+   v ar LISTED-RECORDS VEC:COUNT 0 T=
    t ;
 
 : ENTRY-REFUSED ( ^DROPBOX:entry str ^ARENA:arena -- str )
@@ -2369,7 +2382,7 @@ ARENA LISTED DROPBOX:entry
    ar LOGGED {: g:str :}
    g 10 STR:COUNT-CHAR 1 T=
    g t STR:CONTAINS? TTRUE
-   v ar INVENTORY-RECORDS {: rs :}
+   v ar LISTED-RECORDS {: rs :}
    rs RECORD-PATHS$ s" Old|" T$=
    rs s" old" ar CANONICAL OBSERVED-IN REMOTE-DIRECTORY
    MODEL:REMOTE-OBSERVATION= TTRUE ;
@@ -2381,7 +2394,7 @@ ARENA LISTED DROPBOX:entry
    s" /sync" s" /Sync" ar FOLDER-ENTRY root v ar APPENDED
    s" /sync/child" s" /Sync/Child" ar FOLDER-ENTRY
    root v ar APPENDED
-   v ar INVENTORY-RECORDS RECORD-PATHS$ s" Child|" T$= ;
+   v ar LISTED-RECORDS RECORD-PATHS$ s" Child|" T$= ;
 
 : LISTING-CLASSIFIES-THE-REMOTE-ROOTS-OWN-ENTRY ( ^ARENA:arena -- )
    {: ar :}
@@ -2450,8 +2463,7 @@ ARENA LISTED DROPBOX:entry
    ( JOURNAL:journal str MODEL:remote-record ^ARENA:arena -- )
    {: j k:str o ar :}
    ar REMOTE-RECORDS {: rs :} o rs VEC:PUSH !
-   j k DROPBOX:>CURSOR rs ar NO-CHANGES
-   JOURNAL:PUBLISH-REMOTE-INVENTORY ;
+   j k DROPBOX:>CURSOR rs JOURNAL:UPSERT-REMOTE-RECORDS ;
 
 : CURSOR-IS? ( option<DROPBOX:cursor> str -- bool )
    {: a:str :}
@@ -2747,8 +2759,7 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
    s" new inventory bytes" ar IDENTITY {: h:DROPBOX:hash :}
    ar CASE-JOURNAL {: d:str j :}
    j s" cursor-old" DROPBOX:>CURSOR old 10000 ar BULK-RECORDS
-   ar NO-CHANGES
-   JOURNAL:PUBLISH-REMOTE-INVENTORY
+   JOURNAL:UPSERT-REMOTE-RECORDS
    [: s" /bulk/05000.txt" s" /Bulk/05000.txt" s" rev-new" h
       FILE-JSON+ ;] ar ENTRIES
    s" cursor-new" false PAGE
@@ -2783,6 +2794,54 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
    rs s" Bulk/19999.txt" h s" rev-bulk" PRESENT-AT OBSERVED? TTRUE
    \ Rust's Published: one full listing.
    TEST-DROPBOX:SEEN$ BULK-PAGES LISTED$ T$=
+   d j GONE ;
+
+: A-FULL-LISTING-STAGES-ITS-BATCHES ( ^ARENA:arena -- )
+   {: ar :}
+   s" a full listing stages its batches" T-LABEL
+   TEST-DROPBOX:RESET
+   s" batched listing bytes" ar IDENTITY {: h:DROPBOX:hash :}
+   ar CASE-JOURNAL {: d:str j :}
+   0 h ar BULK-PAGE s" batched-0" true PAGE
+   [: s" /bulk/child.txt" s" /BULK/Child.txt" s" rev-child" h
+      FILE-JSON+ ;] ar ENTRIES
+   s" batched-1" false PAGE
+   j TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK ar REFRESHED
+   ar REMOTE-RECORDS {: want :}
+   s" Bulk" REMOTE-DIRECTORY ar RECORD-AT want VEC:PUSH !
+   BULK-PAGE-SIZE 1 ?do
+      s" Bulk" i BULK$ ar ARENA:COPY h s" rev-bulk" PRESENT-AT
+      ar RECORD-AT want VEC:PUSH !
+   loop
+   s" Bulk/Child.txt" h s" rev-child" PRESENT-AT ar RECORD-AT
+   want VEC:PUSH !
+   j s" batched-1" want ar HOLDS
+   TEST-DROPBOX:SEEN$ 2 LISTED$ T$=
+   d j GONE ;
+
+: A-REFUSED-PAGE-KEEPS-THE-INVENTORY ( ^ARENA:arena -- )
+   {: ar :}
+   s" a refused page keeps the inventory" T-LABEL
+   TEST-DROPBOX:RESET
+   s" durable old bytes" ar IDENTITY ar OLD-RECORD {: old :}
+   s" staged bulk bytes" ar IDENTITY {: h:DROPBOX:hash :}
+   ar CASE-JOURNAL {: d:str j :}
+   j s" durable-cursor" old ar PUBLISHED
+   \ The continuations take the scripts in order; list_folder the page.
+   CONTINUE$ 409 s" " s" "
+   S\" {\qerror_summary\q:\qreset/\q,\qerror\q:{\q.tag\q:\qreset\q}}"
+   TEST-DROPBOX:ROUTE-SCRIPT!
+   CONTINUE$ 409 s" " s" "
+   S\" {\qerror_summary\q:\qother/\q,\qerror\q:{\q.tag\q:\qother\q}}"
+   TEST-DROPBOX:ROUTE-SCRIPT!
+   0 h ar BULK-PAGE s" staged-0" true PAGE
+   TEST-CLIENT:MAIN @ s" " ar TEST-CLIENT:NEW-LINK {: l :}
+   [: j l ar REFRESHED ;] REPLAY:E-DROPBOX TTHROWSQ
+   l REPLAY-LINK:REPLY @ DROPBOX-ERROR:OTHER TEST-CLIENT:REFUSAL? TTRUE
+   j s" durable-cursor" old ar KEPT
+   TEST-DROPBOX:SEEN$
+   s" /2/files/list_folder/continue /2/files/list_folder /2/files/list_folder/continue"
+   T$=
    d j GONE ;
 
 : INCOMPLETE-DOWNLOADABLE-METADATA-PUBLISHES-AS-UNKNOWN-INCOMPLETE
@@ -3138,6 +3197,8 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
    ar FAILED-LATER-PAGE-CANNOT-PUBLISH-PARTIAL-LISTING-AS-ABSENCE
    ar ONE-FILE-CURSOR-DELTA-UPDATES-A-LARGE-INVENTORY-WITHOUT-A-FULL-LISTING
    ar LARGE-FULL-LISTING-BUILDS-ITS-INVENTORY-IN-LINEAR-TIME
+   ar A-FULL-LISTING-STAGES-ITS-BATCHES
+   ar A-REFUSED-PAGE-KEEPS-THE-INVENTORY
    ar INCOMPLETE-DOWNLOADABLE-METADATA-PUBLISHES-AS-UNKNOWN-INCOMPLETE
    ar RESTRICTED-LATER-PAGE-PUBLISHES-AS-UNKNOWN-INACCESSIBLE
    ar MISMATCHED-ENTRY-PUBLISHES-AS-UNSUPPORTED
@@ -5777,8 +5838,7 @@ IO-CAP BUFFER: IO-BUF
    rs s" Shared/notes.txt" notes REMOTE-PRESENT ar REMOTE+
    rs s" Shared/keep.txt" keep REMOTE-PRESENT ar REMOTE+
    x RUN-JOURNAL @ s" cursor-accessible" DROPBOX:>CURSOR rs
-   ar NO-CHANGES
-   JOURNAL:PUBLISH-REMOTE-INVENTORY ;
+   JOURNAL:UPSERT-REMOTE-RECORDS ;
 
 \ Shared's notes and keep, observed on both sides, then notes removed
 \ and keep edited in the root.

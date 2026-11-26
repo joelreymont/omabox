@@ -151,9 +151,7 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
    p ar MODEL:FOLD p MODEL-UNKNOWN--REASON:STALE REMOTE-UNKNOWN
    MODEL-REMOTE--RECORD:MAKE v VEC:PUSH !
    j s" cursor-must-not-render" DROPBOX:>CURSOR v
-   ar ARENA:ALLOCATOR 0
-   [type] JOURNAL:remote-inventory-change VEC:NEW
-   JOURNAL:PUBLISH-REMOTE-INVENTORY ;
+   JOURNAL:UPSERT-REMOTE-RECORDS ;
 
 : RECORDED ( JOURNAL:plan-write -- JOURNAL:plan-record )
    MATCH JOURNAL:plan-write
@@ -377,13 +375,10 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
 : REMOTES ( ^ARENA:arena -- ^VEC:vector<MODEL:remote-record> )
    ARENA:ALLOCATOR 0 [type] MODEL:remote-record VEC:NEW ;
 
-: PUBLISHED
-   ( JOURNAL:journal ^VEC:vector<MODEL:remote-record> ^ARENA:arena -- )
-   {: j v ar :}
+: PUBLISHED ( JOURNAL:journal ^VEC:vector<MODEL:remote-record> -- )
+   {: j v :}
    j s" held-cursor" DROPBOX:>CURSOR v
-   ar ARENA:ALLOCATOR 0
-   [type] JOURNAL:remote-inventory-change VEC:NEW
-   JOURNAL:PUBLISH-REMOTE-INVENTORY ;
+   JOURNAL:UPSERT-REMOTE-RECORDS ;
 
 : HELD-FOLDER
    ( ^VEC:vector<MODEL:path> ^VEC:vector<MODEL:remote-record>
@@ -403,7 +398,7 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
    p JOURNAL:OPEN {: j :}
    j ar BIND
    us j ar LOCALS
-   j rs ar PUBLISHED
+   j rs PUBLISHED
    bs j ar FOLDERS
    j JOURNAL:CLOSE
    p ar ATTENTION:RENDER ;
