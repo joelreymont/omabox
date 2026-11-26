@@ -370,7 +370,7 @@ variable FORM-AT
 : PLAIN? ( n -- bool )
    {: b:n :}
    b STR:DIGIT? b STR:ASCII-LOWER dup 97 >= swap 122 <= and or
-   b 45 = or b 46 = or b 95 = or b 126 = or b 42 = or ;
+   b 45 = or b 46 = or b 95 = or b 42 = or ;
 
 
 \ The byte a %XX at the offset names and the offset after it; -1 for a
