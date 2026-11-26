@@ -500,9 +500,11 @@ private
    v SCHEMA = if exit then
    c [: c v MIGRATE ;] SQLITE:WITH-TRANSACTION ;
 
-\ Deletes each completed plan no pending or unretained recovery record
-\ holds, its operations' upload sessions first, then its operations: the
-\ three deletes select the same plans.
+\ Deletes each completed plan that no pending or unretained recovery
+\ record holds and none of whose operations installs a Dropbox file, its
+\ operations' upload sessions first, then its operations: the three
+\ deletes select the same plans. A plan with such an operation waits for
+\ FORGET-COMPLETED-PLAN, after its stage is retired.
 : PRUNE ( SQLITE:connection -- n )
    {: c :}
    c s" DELETE FROM upload_sessions WHERE operation_id IN (
@@ -513,7 +515,14 @@ private
                   ON recovery_records.operation_id = operations.id
                WHERE operations.plan_id = plans.id
                   AND (recovery_records.status = 'pending'
-                     OR recovery_records.retained_at IS NULL))))"
+                     OR recovery_records.retained_at IS NULL))
+            AND NOT EXISTS (
+               SELECT 1 FROM operations AS d WHERE d.plan_id = plans.id
+                  AND json_valid(d.operation_json)
+                  AND (json_type(d.operation_json, '$.InstallLocal')
+                        IS NOT NULL
+                     OR json_type(d.operation_json, '$.ReplaceLocal')
+                        IS NOT NULL))))"
    SQLITE:EXEC
    c s" DELETE FROM operations WHERE plan_id IN (
          SELECT plans.id FROM plans WHERE plans.status = 'completed'
@@ -522,7 +531,13 @@ private
                ON recovery_records.operation_id = operations.id
             WHERE operations.plan_id = plans.id
                AND (recovery_records.status = 'pending'
-                  OR recovery_records.retained_at IS NULL)))"
+                  OR recovery_records.retained_at IS NULL))
+         AND NOT EXISTS (
+            SELECT 1 FROM operations AS d WHERE d.plan_id = plans.id
+               AND json_valid(d.operation_json)
+               AND (json_type(d.operation_json, '$.InstallLocal') IS NOT NULL
+                  OR json_type(d.operation_json, '$.ReplaceLocal')
+                     IS NOT NULL)))"
    SQLITE:EXEC
    c s" DELETE FROM plans WHERE plans.status = 'completed'
       AND NOT EXISTS (
@@ -530,7 +545,13 @@ private
             ON recovery_records.operation_id = operations.id
          WHERE operations.plan_id = plans.id
             AND (recovery_records.status = 'pending'
-               OR recovery_records.retained_at IS NULL))"
+               OR recovery_records.retained_at IS NULL))
+      AND NOT EXISTS (
+         SELECT 1 FROM operations AS d WHERE d.plan_id = plans.id
+            AND json_valid(d.operation_json)
+            AND (json_type(d.operation_json, '$.InstallLocal') IS NOT NULL
+               OR json_type(d.operation_json, '$.ReplaceLocal')
+                  IS NOT NULL))"
    SQLITE:EXEC
    c SQLITE:CHANGES ;
 
@@ -538,7 +559,9 @@ public
 
 \ Removes completed plans, their operations and their operations'
 \ upload sessions, that no pending recovery needs; completed recovery
-\ records stay. Answers the plans removed.
+\ records stay, and so does every completed plan with an operation that
+\ installs a Dropbox file, until FORGET-COMPLETED-PLAN. Answers the
+\ plans removed.
 : PRUNE-COMPLETED-WORK ( journal -- n )
    >CONNECTION {: c :}
    c [: c PRUNE ;] SQLITE:WITH-TRANSACTION ;
@@ -1012,9 +1035,12 @@ private
 \ ---- activation ----------------------------------------------------
 
 \ A new root carries none of the old one's history: live plans, their
-\ recovery intents and upload sessions, baselines, observations,
+\ recovery intents and upload sessions, completed plans with an
+\ operation that installs a Dropbox file, baselines, observations,
 \ hashes, conflicts and the watched folders, whose clean marks vouch
-\ for those observations, go.
+\ for those observations, go. A completed plan's operations go first,
+\ so the plans delete takes the completed ones left without any; the
+\ verified stages they leave stay in the old root, as live plans' do.
 : RETIRE ( SQLITE:connection -- )
    s" DELETE FROM recovery_records
       WHERE status = 'pending' OR operation_id IN (
@@ -1031,6 +1057,28 @@ private
          SELECT id FROM plans WHERE status IN ('pending', 'blocked')
       );
       DELETE FROM plans WHERE status IN ('pending', 'blocked');
+      DELETE FROM upload_sessions WHERE operation_id IN (
+         SELECT operations.id FROM operations
+         JOIN plans ON plans.id = operations.plan_id
+         WHERE plans.status = 'completed' AND EXISTS (
+            SELECT 1 FROM operations AS d WHERE d.plan_id = plans.id
+               AND json_valid(d.operation_json)
+               AND (json_type(d.operation_json, '$.InstallLocal') IS NOT NULL
+                  OR json_type(d.operation_json, '$.ReplaceLocal')
+                     IS NOT NULL))
+      );
+      DELETE FROM operations WHERE plan_id IN (
+         SELECT plans.id FROM plans WHERE plans.status = 'completed'
+         AND EXISTS (
+            SELECT 1 FROM operations AS d WHERE d.plan_id = plans.id
+               AND json_valid(d.operation_json)
+               AND (json_type(d.operation_json, '$.InstallLocal') IS NOT NULL
+                  OR json_type(d.operation_json, '$.ReplaceLocal')
+                     IS NOT NULL))
+      );
+      DELETE FROM plans WHERE status = 'completed' AND NOT EXISTS (
+         SELECT 1 FROM operations WHERE operations.plan_id = plans.id
+      );
       DELETE FROM baselines;
       DELETE FROM local_observations;
       DELETE FROM local_hash_cache;
@@ -3208,6 +3256,18 @@ private
 create PENDING-QUERY PLAN-SELECT PENDING-WHERE LAY-BOTH
 create BLOCKED-QUERY PLAN-SELECT BLOCKED-WHERE LAY-BOTH
 
+\ Completed plans with an operation that installs a Dropbox file, run or not.
+: DOWNLOADED-WHERE ( -- str )
+   s"  WHERE plans.status = 'completed' AND EXISTS (
+         SELECT 1 FROM operations AS d WHERE d.plan_id = plans.id
+            AND json_valid(d.operation_json)
+            AND (json_type(d.operation_json, '$.InstallLocal') IS NOT NULL
+               OR json_type(d.operation_json, '$.ReplaceLocal')
+                  IS NOT NULL))
+      ORDER BY plans.id, operations.ordinal" ;
+
+create DOWNLOADED-QUERY PLAN-SELECT DOWNLOADED-WHERE LAY-BOTH
+
 : PATH-INVALID ( str MODEL:path str -- )
    {: op:str path d:str :}
    op path MODEL:PATH>STR d INVALID ;
@@ -3640,6 +3700,15 @@ public
    j >CONNECTION BLOCKED-QUERY TEXT s" read blocked plans" ar
    READ-PLANS-WITH-STATUS ;
 
+\ Every completed plan not yet forgotten with an operation that installs
+\ a Dropbox file, by id, each one's operations in order: its verified
+\ stage may remain.
+: COMPLETED-DOWNLOAD-PLANS
+   ( journal ^ARENA:arena -- ^VEC:vector<plan-record> )
+   {: j ar :}
+   j >CONNECTION DOWNLOADED-QUERY TEXT
+   s" read completed download plans" ar READ-PLANS-WITH-STATUS ;
+
 \ The plan with this id as the journal holds it now, if any.
 : PLAN-OF ( journal plan-id ^ARENA:arena -- option<plan-record> )
    {: j id ar :}
@@ -3986,6 +4055,45 @@ STRUCTURE operation-state
    c id FINISH-PLAN
    c id START-RECOVERY-RETENTION ;
 
+\ Deletes the plan with this id, its operations' upload sessions first,
+\ then its operations, when it is completed and no pending or unretained
+\ recovery record holds it.
+: FORGET-PLAN ( SQLITE:connection plan-id -- )
+   {: c id :}
+   c s" DELETE FROM upload_sessions WHERE operation_id IN (
+         SELECT operations.id FROM operations WHERE plan_id IN (
+            SELECT plans.id FROM plans
+            WHERE plans.id = ?1 AND plans.status = 'completed'
+            AND NOT EXISTS (
+               SELECT 1 FROM operations JOIN recovery_records
+                  ON recovery_records.operation_id = operations.id
+               WHERE operations.plan_id = plans.id
+                  AND (recovery_records.status = 'pending'
+                     OR recovery_records.retained_at IS NULL))))"
+   [: id PLAN-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT
+   c s" DELETE FROM operations WHERE plan_id IN (
+         SELECT plans.id FROM plans
+         WHERE plans.id = ?1 AND plans.status = 'completed'
+         AND NOT EXISTS (
+            SELECT 1 FROM operations JOIN recovery_records
+               ON recovery_records.operation_id = operations.id
+            WHERE operations.plan_id = plans.id
+               AND (recovery_records.status = 'pending'
+                  OR recovery_records.retained_at IS NULL)))"
+   [: id PLAN-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT
+   c s" DELETE FROM plans WHERE plans.id = ?1
+      AND plans.status = 'completed'
+      AND NOT EXISTS (
+         SELECT 1 FROM operations JOIN recovery_records
+            ON recovery_records.operation_id = operations.id
+         WHERE operations.plan_id = plans.id
+            AND (recovery_records.status = 'pending'
+               OR recovery_records.retained_at IS NULL))"
+   [: id PLAN-ID>N 1 SQLITE:BIND-INT SQLITE:STEP drop ;]
+   SQLITE:WITH-STATEMENT ;
+
 \ The new conflict's id.
 : INSERT-CONFLICT
    ( SQLITE:connection MODEL:path MODEL:conflict ^ARENA:arena
@@ -4228,6 +4336,14 @@ public
    j >CONNECTION {: c :}
    c [: c id x ar [: FINISH-WITH-CONFLICT-IN ;] ENCODING ;]
    SQLITE:WITH-TRANSACTION ;
+
+\ Deletes the completed plan with this id, its operations and their
+\ upload sessions, unless a pending or unretained recovery record holds
+\ it; a live plan, or one already gone, is left as it is.
+: FORGET-COMPLETED-PLAN ( journal plan-id -- )
+   {: j id :}
+   j >CONNECTION {: c :}
+   c [: c id FORGET-PLAN ;] SQLITE:WITH-TRANSACTION ;
 
 \ Retires a stale live plan without advancing or deleting its baseline.
 : SUPERSEDE-PLAN ( journal plan-id ^ARENA:arena -- plan-supersede )

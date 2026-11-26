@@ -113,6 +113,18 @@
 \   the upload's argument, whose hash the fake checks, for its body
 \ - an_unknown_observation_does_not_retire_a_stale_install
 \ - a_pending_only_path_retires_without_fetching_obsolete_bytes
+\ Then that the pass retires the verified stage of a superseded download
+\ plan, of one that ended before it and of an ended replace-local plan,
+\ forgetting each plan; keeps a stage a blocked plan for the same path
+\ and content holds, but not one for other content; and keeps a plan
+\ whose stage's directory refuses the removal, one line logged for its
+\ path in each of two passes, while other.txt downloads:
+\ - a_superseded_download_plan_retires_its_verified_stage
+\ - an_ended_download_plan_retires_its_verified_stage
+\ - an_ended_replace_plan_retires_its_verified_stage
+\ - a_live_plan_keeps_the_stage_of_its_path_and_content
+\ - a_live_plan_for_other_content_does_not_keep_the_stage
+\ - a_failed_retirement_keeps_its_plan_while_the_pass_goes_on
 \ Download blocks against the fake Dropbox, Rust's tests of the same
 \ names, each download installing in the pass and no account request:
 \ - unavailable_download_blocks_only_its_plan_while_siblings_finish
@@ -3449,12 +3461,224 @@ TYPED-VARIABLE RACED-INSTALL str
    DOWNLOAD$ TEST-DROPBOX:CALLS 0 T=
    d x STEP-GONE ;
 
+\ The verified stage PRESTAGED made of b for path p, the root empty
+\ before it.
+: VERIFIED-STAGE ( ^run str str -- str )
+   {: x p:str b:str :}
+   x [: x p b PRESTAGED ;] IN-ACTIVE-ROOT
+   x STAGE-PATH ;
+
+: DOWNLOADS-ENDED ( ^run -- n )
+   {: x :}
+   x RUN-JOURNAL @ x RUN-ARENA @ JOURNAL:COMPLETED-DOWNLOAD-PLANS
+   VEC:COUNT ;
+
+\ The stale install a matching observation supersedes leaves no stage.
+: A-SUPERSEDED-DOWNLOAD-PLAN-RETIRES-ITS-VERIFIED-STAGE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" a_superseded_download_plan_retires_its_verified_stage" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" file.txt" OBSOLETE$ VERIFIED-STAGE {: sp:str :}
+   x s" file.txt" IN-ROOT MATCHING$ FS:WRITE-ALL
+   x s" file.txt" STALE-INSTALL
+   ar MATCHING-PAGES
+   x rec PASSED COMPLETE drop
+   x PENDING-OF VEC:COUNT 0 T=
+   x BLOCKED-OF VEC:COUNT 0 T=
+   sp FS:EXISTS? TFALSE
+   x DOWNLOADS-ENDED 0 T=
+   x s" file.txt" IN-ROOT MATCHING$ HOLDS-BYTES
+   d x STEP-GONE ;
+
+\ The pending download of plan p completed with its source as baseline.
+: ENDED ( ^run JOURNAL:plan-record MODEL:remote -- )
+   {: x p rem :}
+   p PENDING-DOWNLOAD MATCH option
+      none OF s" reconcile-test: the plan downloads nothing" TEST-CLIENT:FAILED ENDOF
+      some OF DOWNLOAD-OPERATION-UNMAKE {: id src :}
+         x RUN-JOURNAL @ id rem MODEL-BASELINE:PRESENT OPTION:SOME
+         x RUN-ARENA @ JOURNAL:COMPLETE-OPERATION drop
+      ENDOF
+   ;MATCH ;
+
+\ A download plan completed before the pass, its verified stage still
+\ beside its target, loses the stage in the next pass.
+: AN-ENDED-DOWNLOAD-PLAN-RETIRES-ITS-VERIFIED-STAGE ( ^ARENA:arena -- )
+   {: ar :}
+   s" an_ended_download_plan_retires_its_verified_stage" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" ended.txt" OBSOLETE$ VERIFIED-STAGE {: sp:str :}
+   ar STALE-REMOTE {: rem :}
+   x x s" ended.txt" rem INSTALLING rem ENDED
+   x DOWNLOADS-ENDED 1 T=
+   s" both-absent" ar EMPTY-PAGE
+   x rec PASSED COMPLETE drop
+   sp FS:EXISTS? TFALSE
+   x DOWNLOADS-ENDED 0 T=
+   DOWNLOAD$ TEST-DROPBOX:CALLS 0 T=
+   d x STEP-GONE ;
+
+\ Rust's plan of one replace-local operation of rem over content e,
+\ recorded pending at path a.
+: REPLACING
+   ( ^run str MODEL:remote DROPBOX:hash -- JOURNAL:plan-record )
+   {: x a:str rem e :}
+   x RUN-ARENA @ {: ar :}
+   rem e MODEL-OPERATION:REPLACE-LOCAL ar TEST-CLIENT:ONE-PLAN {: plan :}
+   x RUN-JOURNAL @ a TEST-CLIENT:DISPLAY plan ar JOURNAL:RECORD-PLAN
+   WRITTEN TTRUE ;
+
+\ A replace-local plan completed before the pass loses its verified
+\ stage as an install-local one does.
+: AN-ENDED-REPLACE-PLAN-RETIRES-ITS-VERIFIED-STAGE ( ^ARENA:arena -- )
+   {: ar :}
+   s" an_ended_replace_plan_retires_its_verified_stage" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" replaced.txt" OBSOLETE$ VERIFIED-STAGE {: sp:str :}
+   ar STALE-REMOTE {: rem :}
+   x x s" replaced.txt" rem STALE-LOCAL$ ar IDENTITY REPLACING rem ENDED
+   x DOWNLOADS-ENDED 1 T=
+   s" both-absent" ar EMPTY-PAGE
+   x rec PASSED COMPLETE drop
+   sp FS:EXISTS? TFALSE
+   x DOWNLOADS-ENDED 0 T=
+   DOWNLOAD$ TEST-DROPBOX:CALLS 0 T=
+   d x STEP-GONE ;
+
+\ A superseded plan's stage that a blocked plan for the same path and
+\ content holds stays, the superseded plan forgotten.
+: A-LIVE-PLAN-KEEPS-THE-STAGE-OF-ITS-PATH-AND-CONTENT
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" a_live_plan_keeps_the_stage_of_its_path_and_content" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" held.txt" OBSOLETE$ VERIFIED-STAGE {: sp:str :}
+   ar STALE-REMOTE {: rem :}
+   x s" held.txt" rem INSTALLING {: old :}
+   x RUN-JOURNAL @ old ID-OF ar JOURNAL:SUPERSEDE-PLAN drop
+   x s" held.txt" rem INSTALLING {: live :}
+   x live BLOCKED-AHEAD
+   s" held.txt" s" stale-revision" OBSOLETE$ s" held-listed" ar
+   LISTED-ALONE
+   x rec PASSED COMPLETE drop
+   x BLOCKED-OF VEC:COUNT 1 T=
+   sp FS:EXISTS? TTRUE
+   sp OBSOLETE$ HOLDS-BYTES
+   x DOWNLOADS-ENDED 0 T=
+   DOWNLOAD$ TEST-DROPBOX:CALLS 0 T=
+   d x STEP-GONE ;
+
+\ A superseded plan's stage stays no longer for a blocked plan at the
+\ same path with other content: the stage is removed, the superseded
+\ plan forgotten.
+: A-LIVE-PLAN-FOR-OTHER-CONTENT-DOES-NOT-KEEP-THE-STAGE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" a_live_plan_for_other_content_does_not_keep_the_stage" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" held.txt" OBSOLETE$ VERIFIED-STAGE {: sp:str :}
+   ar STALE-REMOTE {: rem :}
+   x s" held.txt" rem INSTALLING {: old :}
+   x RUN-JOURNAL @ old ID-OF ar JOURNAL:SUPERSEDE-PLAN drop
+   MATCHING$ s" current-revision" ar REMOTE-FILE {: now :}
+   x s" held.txt" now INSTALLING {: live :}
+   x live BLOCKED-AHEAD
+   s" held.txt" s" current-revision" MATCHING$ s" held-listed" ar
+   LISTED-ALONE
+   x rec PASSED COMPLETE drop
+   x BLOCKED-OF VEC:COUNT 1 T=
+   sp FS:EXISTS? TFALSE
+   x DOWNLOADS-ENDED 0 T=
+   DOWNLOAD$ TEST-DROPBOX:CALLS 0 T=
+   d x STEP-GONE ;
+
+: REFUSED$ ( -- str ) s" Dropbox bytes beside the refused stage" ;
+
+\ The one entry of the root's directory p, the stage PRESTAGED made.
+: STAGE-IN ( ^run str -- str )
+   {: x p:str :}
+   x p IN-ROOT {: dir:str :}
+   dir READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
+   READ-BUF u >str ONE-NAME? TTRUE
+   READ-BUF u >str s" .omabox-download-" STR:STARTS-WITH? TTRUE
+   dir READ-BUF u >str x RUN-ARENA @ TEST-CLIENT:INSIDE ;
+
+\ The one listing page, cursor k: the folder /ro and /other.txt at
+\ rev-other with REFUSED$'s identity.
+: REFUSED-PAGE ( str ^ARENA:arena -- )
+   {: k:str ar :}
+   REFUSED$ ar IDENTITY {: h:DROPBOX:hash :}
+   [: s" /ro" s" /ro" FOLDER-JSON+ COMMA+
+      s" /other.txt" s" /other.txt" s" rev-other" h FILE-JSON+ ;]
+   ar ENTRIES k false PAGE ;
+
+\ The warning the pass logs for ro/ended.txt's refused stage.
+: REFUSED-LINE ( -- str )
+   SB-RESET
+   s" could not retire the verified download stage of `ro/ended.txt`, errno "
+   SB-APPEND FS:EACCES FMT:SB-INT SB$ ;
+
+\ A pass over the run logs one line, the refused retirement's, and
+\ keeps the ended plan and its stage at sp.
+: REFUSED-PASS ( str ^run str str -- )
+   {: d:str x rec:str sp:str :}
+   d [: x rec PASSED COMPLETE drop ;] x RUN-ARENA @ LOGGED {: t:str :}
+   t 10 STR:COUNT-CHAR 1 T=
+   t REFUSED-LINE STR:CONTAINS? TTRUE
+   x DOWNLOADS-ENDED 1 T=
+   sp FS:EXISTS? TTRUE ;
+
+\ A stage whose directory refuses its removal, as DENIED-RETIREMENT in
+\ local-test sets up, keeps its ended plan for the next pass, one line
+\ logged for its path in each of two passes; other.txt downloads in the
+\ first pass all the same.
+: A-FAILED-RETIREMENT-KEEPS-ITS-PLAN-WHILE-THE-PASS-GOES-ON
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" a_failed_retirement_keeps_its_plan_while_the_pass_goes_on" T-LABEL
+   FS:EUID 0= if exit then
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" ro" IN-ROOT {: ro:str :}
+   ro FS:MAKE-DIR
+   x [: x s" ro/ended.txt" OBSOLETE$ PRESTAGED ;] IN-ACTIVE-ROOT
+   x s" ro" STAGE-IN {: sp:str :}
+   ar STALE-REMOTE {: rem :}
+   x x s" ro/ended.txt" rem INSTALLING rem ENDED
+   s" other.txt" s" rev-other" REFUSED$ ar SERVES
+   s" ro-listed" ar REFUSED-PAGE
+   s" ro-again" ar EMPTY-PAGE
+   ro $140 FS:CHMOD-MODE
+   [: d x rec sp REFUSED-PASS
+      x s" other.txt" IN-ROOT REFUSED$ HOLDS-BYTES
+      d x rec sp REFUSED-PASS ;]
+   [: ro FS:MODE-PRIVATE-DIR FS:CHMOD-MODE ;] finally
+   d x STEP-GONE ;
+
 : STALE-CASES ( ^ARENA:arena -- )
    {: ar :}
    ar MATCHING-OBSERVATIONS-RETIRE-A-STALE-INSTALL-AND-LATER-EDITS-SYNC
    ar A-CHANGED-SAFE-OPERATION-REPLACES-A-STALE-INSTALL-IN-THE-SAME-PASS
    ar AN-UNKNOWN-OBSERVATION-DOES-NOT-RETIRE-A-STALE-INSTALL
-   ar A-PENDING-ONLY-PATH-RETIRES-WITHOUT-FETCHING-OBSOLETE-BYTES ;
+   ar A-PENDING-ONLY-PATH-RETIRES-WITHOUT-FETCHING-OBSOLETE-BYTES
+   ar A-SUPERSEDED-DOWNLOAD-PLAN-RETIRES-ITS-VERIFIED-STAGE
+   ar AN-ENDED-DOWNLOAD-PLAN-RETIRES-ITS-VERIFIED-STAGE
+   ar AN-ENDED-REPLACE-PLAN-RETIRES-ITS-VERIFIED-STAGE
+   ar A-LIVE-PLAN-KEEPS-THE-STAGE-OF-ITS-PATH-AND-CONTENT
+   ar A-LIVE-PLAN-FOR-OTHER-CONTENT-DOES-NOT-KEEP-THE-STAGE
+   ar A-FAILED-RETIREMENT-KEEPS-ITS-PLAN-WHILE-THE-PASS-GOES-ON ;
 
 \ ---- download blocks against the fake Dropbox ----------------------
 

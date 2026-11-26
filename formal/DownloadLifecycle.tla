@@ -29,7 +29,8 @@ VARIABLES
     userOwned,
     response, responseStart, fullyVerified,
     stage, stageRoot, stageOp, stageFromFullVerification,
-    installed, installedFromFullVerification, baseline, runner
+    installed, installedFromFullVerification, baseline, runner,
+    endedOp
 
 vars ==
     <<journal, planRoot, planOp, nextOp, currentRoot,
@@ -38,7 +39,7 @@ vars ==
       userOwned,
       response, responseStart, fullyVerified,
       stage, stageRoot, stageOp, stageFromFullVerification,
-      installed, installedFromFullVerification, baseline, runner>>
+      installed, installedFromFullVerification, baseline, runner, endedOp>>
 
 ModelSymmetry ==
     { [value \in Slots \cup Paths |->
@@ -84,6 +85,7 @@ Init ==
     /\ installedFromFullVerification = [path \in Paths |-> FALSE]
     /\ baseline = [path \in Paths |-> "Absent"]
     /\ runner = "Stopped"
+    /\ endedOp = [path \in Paths |-> 0]
 
 Start ==
     /\ runner = "Stopped"
@@ -94,13 +96,16 @@ Start ==
           written, durableBytes, advertised, contentGood, advertisedGood,
           userOwned, response, responseStart, fullyVerified,
           stage, stageRoot, stageOp, stageFromFullVerification,
-          installed, installedFromFullVerification, baseline>>
+          installed, installedFromFullVerification, baseline, endedOp>>
 
+\* Omabox keeps nothing of an old root: activation forgets every ended
+\* plan, and a verified stage in the old root stays there.
 SwitchRoot ==
     /\ runner = "Running"
     /\ \A path \in Paths: journal[path] # "Pending"
     /\ currentRoot = InitialRoot
     /\ currentRoot' = ChangedRoot
+    /\ endedOp' = [path \in Paths |-> 0]
     /\ UNCHANGED
         <<journal, planRoot, planOp, nextOp,
           slotKind, slotPath, slotRoot, slotOp,
@@ -123,20 +128,24 @@ RecordPlan(path) ==
           written, durableBytes, advertised, contentGood, advertisedGood,
           userOwned, response, responseStart, fullyVerified,
           stage, stageRoot, stageOp, stageFromFullVerification,
-          installed, installedFromFullVerification, baseline, runner>>
+          installed, installedFromFullVerification, baseline, runner, endedOp>>
 
-\* Superseding one plan leaves its known partial durable and stale. Work for
-\* another path continues independently.
+\* Superseding or ending one plan without its install leaves its known
+\* partial durable and stale, and its verified stage, if any, beside its
+\* target. The journal keeps the ended plan's record, endedOp, through
+\* every prune and crash until ForgetEnded. Work for another path
+\* continues independently.
 AbandonPlan(path) ==
     /\ runner = "Running"
     /\ journal[path] = "Pending"
     /\ ~installed[path]
-    /\ stage[path] = "Missing"
+    /\ endedOp[path] = 0
     /\ \A slot \in Slots:
         slotPath[slot] = path => response[slot] = "Idle"
     /\ journal' = [journal EXCEPT ![path] = "None"]
     /\ planRoot' = [planRoot EXCEPT ![path] = NoRoot]
     /\ planOp' = [planOp EXCEPT ![path] = 0]
+    /\ endedOp' = [endedOp EXCEPT ![path] = planOp[path]]
     /\ fullyVerified' = [slot \in Slots |->
         IF slotPath[slot] = path THEN FALSE ELSE fullyVerified[slot]]
     /\ UNCHANGED
@@ -147,10 +156,50 @@ AbandonPlan(path) ==
           stage, stageRoot, stageOp, stageFromFullVerification,
           installed, installedFromFullVerification, baseline, runner>>
 
+\* FINISH removes the ended plan's verified stage in the current root and
+\* syncs its directory; the journal still keeps the ended plan's record.
+RemoveEndedStage(path) ==
+    /\ runner = "Running"
+    /\ endedOp[path] # 0
+    /\ stage[path] = "Verified"
+    /\ stageOp[path] = endedOp[path]
+    /\ stageRoot[path] = currentRoot
+    /\ stage' = [stage EXCEPT ![path] = "Missing"]
+    /\ stageRoot' = [stageRoot EXCEPT ![path] = NoRoot]
+    /\ stageOp' = [stageOp EXCEPT ![path] = 0]
+    /\ stageFromFullVerification' =
+        [stageFromFullVerification EXCEPT ![path] = FALSE]
+    /\ UNCHANGED
+        <<journal, planRoot, planOp, nextOp, currentRoot,
+          slotKind, slotPath, slotRoot, slotOp,
+          written, durableBytes, advertised, contentGood, advertisedGood,
+          userOwned, response, responseStart, fullyVerified,
+          installed, installedFromFullVerification, baseline, runner, endedOp>>
+
+\* FINISH then forgets the ended plan's record once no verified stage of
+\* that plan remains.
+ForgetEnded(path) ==
+    /\ runner = "Running"
+    /\ endedOp[path] # 0
+    /\ ~(stage[path] = "Verified" /\ stageOp[path] = endedOp[path])
+    /\ endedOp' = [endedOp EXCEPT ![path] = 0]
+    /\ UNCHANGED
+        <<journal, planRoot, planOp, nextOp, currentRoot,
+          slotKind, slotPath, slotRoot, slotOp,
+          written, durableBytes, advertised, contentGood, advertisedGood,
+          userOwned, response, responseStart, fullyVerified,
+          stage, stageRoot, stageOp, stageFromFullVerification,
+          installed, installedFromFullVerification, baseline, runner>>
+
+\* A stage in another root is out of view: the current root's stage lives
+\* in another directory, so staging there overwrites the model's stage.
+NoCurrentStage(path) ==
+    stage[path] = "Missing" \/ stageRoot[path] # currentRoot
+
 LeaseSlot(path, slot) ==
     /\ runner = "Running"
     /\ journal[path] = "Pending"
-    /\ stage[path] = "Missing"
+    /\ NoCurrentStage(path)
     /\ ~installed[path]
     /\ \A other \in Slots: ~CurrentSlotFor(path, other)
     /\ slotKind[slot] = "Free"
@@ -163,7 +212,7 @@ LeaseSlot(path, slot) ==
           written, durableBytes, advertised, contentGood, advertisedGood,
           userOwned, response, responseStart, fullyVerified,
           stage, stageRoot, stageOp, stageFromFullVerification,
-          installed, installedFromFullVerification, baseline, runner>>
+          installed, installedFromFullVerification, baseline, runner, endedOp>>
 
 \* An unrecognized existing slot belongs to the user or another process. Once
 \* observed, no lifecycle action may rename, truncate, or remove it.
@@ -179,7 +228,7 @@ OccupyUnknownSlot(slot) ==
           written, durableBytes, advertised, contentGood, advertisedGood,
           response, responseStart, fullyVerified,
           stage, stageRoot, stageOp, stageFromFullVerification,
-          installed, installedFromFullVerification, baseline, runner>>
+          installed, installedFromFullVerification, baseline, runner, endedOp>>
 
 OpenRange(path, slot, start) ==
     /\ runner = "Running"
@@ -199,7 +248,7 @@ OpenRange(path, slot, start) ==
           written, durableBytes, advertised, contentGood, advertisedGood,
           userOwned, fullyVerified,
           stage, stageRoot, stageOp, stageFromFullVerification,
-          installed, installedFromFullVerification, baseline, runner>>
+          installed, installedFromFullVerification, baseline, runner, endedOp>>
 
 AppendBlock(path, slot, good) ==
     /\ runner = "Running"
@@ -214,7 +263,7 @@ AppendBlock(path, slot, good) ==
           durableBytes, advertised, advertisedGood, userOwned,
           response, responseStart, fullyVerified,
           stage, stageRoot, stageOp, stageFromFullVerification,
-          installed, installedFromFullVerification, baseline, runner>>
+          installed, installedFromFullVerification, baseline, runner, endedOp>>
 
 SyncData(path, slot) ==
     /\ runner = "Running"
@@ -228,7 +277,7 @@ SyncData(path, slot) ==
           written, advertised, contentGood, advertisedGood, userOwned,
           response, responseStart, fullyVerified,
           stage, stageRoot, stageOp, stageFromFullVerification,
-          installed, installedFromFullVerification, baseline, runner>>
+          installed, installedFromFullVerification, baseline, runner, endedOp>>
 
 \* Data reaches durable storage before its resumable offset is advertised.
 AdvertiseCheckpoint(path, slot) ==
@@ -245,7 +294,7 @@ AdvertiseCheckpoint(path, slot) ==
           written, durableBytes, contentGood, userOwned,
           response, responseStart, fullyVerified,
           stage, stageRoot, stageOp, stageFromFullVerification,
-          installed, installedFromFullVerification, baseline, runner>>
+          installed, installedFromFullVerification, baseline, runner, endedOp>>
 
 CloseExactRange(path, slot) ==
     /\ runner = "Running"
@@ -261,7 +310,7 @@ CloseExactRange(path, slot) ==
           written, durableBytes, advertised, contentGood, advertisedGood,
           userOwned, fullyVerified,
           stage, stageRoot, stageOp, stageFromFullVerification,
-          installed, installedFromFullVerification, baseline, runner>>
+          installed, installedFromFullVerification, baseline, runner, endedOp>>
 
 RejectWrongRange(path, slot) ==
     /\ runner = "Running"
@@ -275,7 +324,7 @@ RejectWrongRange(path, slot) ==
           written, durableBytes, advertised, contentGood, advertisedGood,
           userOwned, fullyVerified,
           stage, stageRoot, stageOp, stageFromFullVerification,
-          installed, installedFromFullVerification, baseline, runner>>
+          installed, installedFromFullVerification, baseline, runner, endedOp>>
 
 VerifyFullContent(path, slot) ==
     /\ runner = "Running"
@@ -292,7 +341,7 @@ VerifyFullContent(path, slot) ==
           written, durableBytes, advertised, contentGood, advertisedGood,
           userOwned, response, responseStart,
           stage, stageRoot, stageOp, stageFromFullVerification,
-          installed, installedFromFullVerification, baseline, runner>>
+          installed, installedFromFullVerification, baseline, runner, endedOp>>
 
 ClearKnownSlot(slot) ==
     /\ slotKind' = [slotKind EXCEPT ![slot] = "Free"]
@@ -319,7 +368,7 @@ DiscardStaleSlot(path, slot) ==
     /\ UNCHANGED
         <<journal, planRoot, planOp, nextOp, currentRoot, userOwned,
           stage, stageRoot, stageOp, stageFromFullVerification,
-          installed, installedFromFullVerification, baseline, runner>>
+          installed, installedFromFullVerification, baseline, runner, endedOp>>
 
 \* This durable boundary abstracts both a same-filesystem rename and a
 \* completed cross-filesystem copy. A crash occurs before or after it.
@@ -327,7 +376,7 @@ PromoteVerifiedSlot(path, slot) ==
     /\ runner = "Running"
     /\ CurrentSlotFor(path, slot)
     /\ fullyVerified[slot]
-    /\ stage[path] = "Missing"
+    /\ NoCurrentStage(path)
     /\ ClearKnownSlot(slot)
     /\ stage' = [stage EXCEPT ![path] = "Verified"]
     /\ stageRoot' = [stageRoot EXCEPT ![path] = planRoot[path]]
@@ -336,7 +385,7 @@ PromoteVerifiedSlot(path, slot) ==
         [stageFromFullVerification EXCEPT ![path] = TRUE]
     /\ UNCHANGED
         <<journal, planRoot, planOp, nextOp, currentRoot, userOwned,
-          installed, installedFromFullVerification, baseline, runner>>
+          installed, installedFromFullVerification, baseline, runner, endedOp>>
 
 Install(path) ==
     /\ runner = "Running"
@@ -359,7 +408,7 @@ Install(path) ==
           slotKind, slotPath, slotRoot, slotOp,
           written, durableBytes, advertised, contentGood, advertisedGood,
           userOwned, response, responseStart, fullyVerified,
-          baseline, runner>>
+          baseline, runner, endedOp>>
 
 Complete(path) ==
     /\ runner = "Running"
@@ -373,7 +422,7 @@ Complete(path) ==
           written, durableBytes, advertised, contentGood, advertisedGood,
           userOwned, response, responseStart, fullyVerified,
           stage, stageRoot, stageOp, stageFromFullVerification,
-          installed, installedFromFullVerification, runner>>
+          installed, installedFromFullVerification, runner, endedOp>>
 
 \* Recovery trusts only the advertised checkpoint. Both synchronized but
 \* unadvertised bytes and unsynchronized tail bytes are truncated for every
@@ -395,7 +444,7 @@ Crash ==
           slotKind, slotPath, slotRoot, slotOp,
           advertised, advertisedGood, userOwned,
           stage, stageRoot, stageOp, stageFromFullVerification,
-          installed, installedFromFullVerification, baseline>>
+          installed, installedFromFullVerification, baseline, endedOp>>
 
 Next ==
     \/ Start
@@ -404,6 +453,8 @@ Next ==
     \/ \E path \in Paths:
         \/ RecordPlan(path)
         \/ AbandonPlan(path)
+        \/ RemoveEndedStage(path)
+        \/ ForgetEnded(path)
         \/ Install(path)
         \/ Complete(path)
     \/ \E slot \in Slots: OccupyUnknownSlot(slot)
@@ -450,19 +501,24 @@ TypeOK ==
     /\ installedFromFullVerification \in [Paths -> BOOLEAN]
     /\ baseline \in [Paths -> Baselines]
     /\ runner \in Runners
+    /\ endedOp \in [Paths -> 0..MaxOperations]
 
 PlansWellFormed ==
     \A path \in Paths:
         /\ (journal[path] = "None") =>
             /\ planRoot[path] = NoRoot
             /\ planOp[path] = 0
-            /\ stage[path] = "Missing"
+            /\ (stage[path] = "Missing" \/ stageRoot[path] # currentRoot
+                \/ endedOp[path] # 0)
             /\ ~installed[path]
             /\ baseline[path] = "Absent"
         /\ (journal[path] # "None") =>
             /\ planRoot[path] \in Roots
             /\ planOp[path] \in Operations
             /\ planOp[path] < nextOp[path]
+        /\ (endedOp[path] # 0) =>
+            /\ endedOp[path] < nextOp[path]
+            /\ endedOp[path] # planOp[path]
 
 SlotsWellFormed ==
     \A slot \in Slots:
@@ -512,10 +568,9 @@ ExactRangeContinuation ==
 
 PendingOperationsAuthorizeEffects ==
     /\ \A path \in Paths:
-        (stage[path] = "Verified") =>
+        (stage[path] = "Verified" /\ stageOp[path] = planOp[path]) =>
             /\ journal[path] = "Pending"
             /\ stageRoot[path] = planRoot[path]
-            /\ stageOp[path] = planOp[path]
             /\ stageFromFullVerification[path]
     /\ \A slot \in Slots:
         (response[slot] # "Idle" \/ fullyVerified[slot]) => CurrentSlot(slot)
@@ -528,6 +583,17 @@ StaleBindingsCannotAdvance ==
             /\ written[slot] = MaxBlocks
             /\ advertised[slot] = MaxBlocks
             /\ contentGood[slot]
+
+\* Every verified stage in the current root has a plan record: its live
+\* plan's, or the ended plan's the journal keeps until RemoveEndedStage
+\* removes the stage.
+VerifiedStagesHaveRecords ==
+    \A path \in Paths:
+        (stage[path] = "Verified" /\ stageRoot[path] = currentRoot) =>
+            \/ /\ journal[path] = "Pending"
+               /\ stageOp[path] = planOp[path]
+            \/ /\ endedOp[path] # 0
+               /\ stageOp[path] = endedOp[path]
 
 UnknownOccupantsArePreserved ==
     userOwned \subseteq {slot \in Slots : slotKind[slot] = "Unknown"}

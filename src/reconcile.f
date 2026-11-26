@@ -3688,11 +3688,125 @@ ENUM pass-state DERIVE eq
    loop
    false ;
 
-\ Rust's reconcile_published after its last replay: the journal
-\ pruned, the report filled, then the unreferenced stages removed.
+\ ---- stage retirement
+
+: NO-SOURCE ( -- option<MODEL:remote> ) OPTION:NONE ;
+
+\ The Dropbox file the operation installs or installed, whatever its
+\ status: its verified stage may lie beside its target.
+: INSTALLED-SOURCE ( JOURNAL:planned-operation -- option<MODEL:remote> )
+   JOURNAL-PLANNED--OPERATION:UNMAKE {: id at o s :}
+   o MATCH MODEL:operation
+      create-local-directory OF NO-SOURCE ENDOF
+      create-remote-directory OF NO-SOURCE ENDOF
+      delete-local-directory OF NO-SOURCE ENDOF
+      delete-remote-directory OF NO-SOURCE ENDOF
+      create-remote OF drop NO-SOURCE ENDOF
+      install-local OF OPTION:SOME ENDOF
+      preserve-local OF drop NO-SOURCE ENDOF
+      replace-local OF drop OPTION:SOME ENDOF
+      delete-local OF drop NO-SOURCE ENDOF
+      preserve-remote OF drop NO-SOURCE ENDOF
+      replace-remote OF drop drop NO-SOURCE ENDOF
+      delete-remote OF drop NO-SOURCE ENDOF
+   ;MATCH ;
+
+: SOURCE-CONTENT ( MODEL:remote -- DROPBOX:hash )
+   MODEL-REMOTE:UNMAKE {: c v :} c ;
+
+\ Whether one of the plan's operations installs content c.
+: INSTALLS? ( JOURNAL:plan-record DROPBOX:hash -- bool )
+   {: p c :}
+   p JOURNAL-PLAN--RECORD:UNMAKE {: id path ops s :}
+   ops VEC:COUNT 0 ?do
+      ops i VEC:AT @ INSTALLED-SOURCE MATCH option
+         none OF ENDOF
+         some OF
+            SOURCE-CONTENT c DROPBOX:HASH= if true unloop exit then
+         ENDOF
+      ;MATCH
+   loop
+   false ;
+
+\ Whether the live plan at path, spelled as path is, installs content
+\ c: the stage of both is one file, that plan's now.
+: LIVE-HOLDS? ( ^run MODEL:path DROPBOX:hash -- bool )
+   {: r path c :}
+   r RUN-ARENA @ {: ar :}
+   r RUN-JOURNAL @ path ar MODEL:FOLD ar JOURNAL:LIVE-PLAN-AT
+   MATCH option
+      none OF false ENDOF
+      some OF {: p :} p path PATH-PLAN? p c INSTALLS? and ENDOF
+   ;MATCH ;
+
+\ The first failed retirement at path this pass is logged, with errno
+\ e; logged holds the paths logged.
+: RETIRE-FAILED ( ^VEC:vector<str> MODEL:path n -- )
+   {: logged path e:n :}
+   path MODEL:PATH>STR {: t:str :}
+   logged VEC:COUNT 0 ?do
+      logged i VEC:AT @ t STR:= if unloop exit then
+   loop
+   t logged VEC:PUSH !
+   LOG:WARN s" reconcile" LOG:LINE
+   s" could not retire the verified download stage of `" LOG:TEXT+
+   t LOG:TEXT+ s" `, errno " LOG:TEXT+ e LOG:INT+ LOG:;LINE ;
+
+\ Whether path's stage of src is settled: held by the live plan at
+\ path, or absent. A failure keeps it unsettled, for the next pass.
+: STAGE-SETTLED?
+   ( fd ^run ^VEC:vector<str> MODEL:path MODEL:remote -- bool )
+   {: root:fd r logged path src :}
+   src SOURCE-CONTENT {: c :}
+   r path c LIVE-HOLDS? if true exit then
+   root r ROOT$ path MODEL:PATH>STR c r RUN-ARENA @
+   LOCAL:RETIRE-DOWNLOAD-STAGE MATCH LOCAL:stage-retirement
+      absent OF true ENDOF
+      failed OF {: e:n :} logged path e RETIRE-FAILED false ENDOF
+   ;MATCH ;
+
+\ The completed plan forgotten once each of its stages is settled.
+: RETIRE-STAGES-OF
+   ( fd ^run ^VEC:vector<str> JOURNAL:plan-record -- )
+   {: root:fd r logged p :}
+   p JOURNAL-PLAN--RECORD:UNMAKE {: id path ops s :}
+   true ops VEC:COUNT 0 ?do
+      ops i VEC:AT @ INSTALLED-SOURCE MATCH option
+         none OF ENDOF
+         some OF {: src :} root r logged path src STAGE-SETTLED? and ENDOF
+      ;MATCH
+   loop
+   if r RUN-JOURNAL @ id JOURNAL:FORGET-COMPLETED-PLAN then ;
+
+: RETIRE-ROOTED ( fd ^run -- )
+   {: root:fd r :}
+   r RUN-JOURNAL @ r RUN-ARENA @ JOURNAL:COMPLETED-DOWNLOAD-PLANS {: done :}
+   done VEC:COUNT 0= if exit then
+   r RUN-ARENA @ [type] str NEW-VECTOR {: logged :}
+   done VEC:COUNT 0 ?do root r logged done i VEC:AT @ RETIRE-STAGES-OF
+   loop ;
+
+\ Each completed download plan's verified stages removed, unless a live
+\ plan holds the same path and content, then the plan forgotten; a plan
+\ whose retirement failed stays for the next pass, as all do while the
+\ configured root is not the active one.
+: RETIRE-STAGES ( ^run -- )
+   {: r :}
+   r RUN-JOURNAL @ r ROOT$ LOCAL:OPEN-ACTIVE-ROOT MATCH option
+      none OF ENDOF
+      some OF {: root:fd :}
+         [: root r RETIRE-ROOTED ;] [: root FS:CLOSE-DIR ;] finally
+      ENDOF
+   ;MATCH ;
+
+\ Rust's reconcile_published after its last replay, with the ended download plans'
+\ stages retired first: the journal pruned, the report filled, the unreferenced upload stages removed.
 : FINISH ( ^pass -- )
    {: x :}
    x JOURNAL@ {: j :}
+   \ Retirement runs here, after every download of the pass has ended: RECOVER and
+   \ APPLY run each to its end, one at a time, so no download holds a stage now.
+   x PASS-RUN @ RETIRE-STAGES
    j JOURNAL:PRUNE-COMPLETED-WORK drop
    j x PASS-RECOVERY @ REPLAY:PRUNE-COMPLETED-RECOVERIES drop
 

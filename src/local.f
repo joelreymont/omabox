@@ -4459,6 +4459,82 @@ STRUCTURE install
       destination-occupied OF STAGE-CLEANUP-DESTINATION-OCCUPIED ENDOF
    ;MATCH ;
 
+public
+
+\ What RETIRE-DOWNLOAD-STAGE did. absent: no owned verified stage
+\ remains at its name, removed with its directory synced, never there,
+\ or its parent missing or not a directory, any other file there kept;
+\ failed: the file system refused, with errno, 0 where none was kept.
+ENUM stage-retirement
+   VARIANT absent ;VARIANT
+   VARIANT failed FIELD errno n ;VARIANT
+;ENUM
+
+private
+
+: RETIRE-ABSENT ( -- stage-retirement ) LOCAL-STAGE--RETIREMENT:ABSENT ;
+: DROP-RETIREMENT ( stage-retirement -- ) drop ;
+
+\ LOCAL logs no retirement failure: the caller logs a failed one,
+\ once for its path; one that passes on is logged where it is caught.
+: RETIREMENT-CONVERTS? ( n n -- bool ) 2drop true ;
+
+\ The codes a retirement answers rather than passes on: those of a file
+\ system that refused or changed under it.
+: RETIREMENT-CODE? ( n -- bool )
+   {: code:n :}
+   code E-CHANGED = code E-UNSUPPORTED = or code E-UNREADABLE = or
+   code E-IO = or code E-DISK-FULL = or ;
+
+\ REMOVE-VERIFIED-STAGE at the name in dir, its path sp, for target t,
+\ then dir synced.
+: RETIRE-IN
+   ( fd str str str DROPBOX:hash ^ARENA:arena -- stage-retirement )
+   {: dir:fd name:str sp:str t:str want:DROPBOX:hash
+      ar:^ARENA:arena :}
+   dir name want sp t ar REMOVE-VERIFIED-STAGE drop
+   dir sp s" sync retired download stage" SYNC-DIRECTORY
+   RETIRE-ABSENT ;
+
+\ RETIRE-IN in t's parent below the root, absent when a directory on
+\ the way is missing.
+: RETIRE-BELOW
+   ( fd str str DROPBOX:hash ^ARENA:arena -- stage-retirement )
+   {: root:fd r:str t:str want:DROPBOX:hash ar:^ARENA:arena :}
+   root t false OPEN-PARENT MATCH option
+      none OF RETIRE-ABSENT ENDOF
+      some OF PARENT-DIR-UNMAKE {: dir:fd last:str rel:str :}
+         r rel t want ar STAGE-PATHS {: name:str sp:str :}
+         RETIRE-ABSENT dir
+         [: DROP-RETIREMENT dir name sp t want ar RETIRE-IN ;] CLOSING
+         dir DISCARD
+      ENDOF
+   ;MATCH ;
+
+public
+
+\ Removes target t's owned verified download stage of want below the
+\ root, whose path is r, and syncs its directory, LOCAL logging nothing;
+\ a file at the stage's name that is not that stage stays. Answers
+\ absent when the stage is removed or not there, or when a directory on
+\ the way is missing or not a directory, as an errno REPLACED? names
+\ says; failed, with the errno, for any other E-CHANGED, E-UNSUPPORTED,
+\ E-UNREADABLE, E-IO or E-DISK-FULL; any other code passes on.
+: RETIRE-DOWNLOAD-STAGE
+   ( fd str str DROPBOX:hash ^ARENA:arena -- stage-retirement )
+   {: root:fd r:str t:str want:DROPBOX:hash ar:^ARENA:arena :}
+   0 FS:CAUSE!
+   RETIRE-ABSENT [: DROP-RETIREMENT [: root r t want ar RETIRE-BELOW ;]
+      ['] RETIREMENT-CONVERTS? WITH-CONVERTS ;] catch {: code:n :}
+   code 0= if exit then
+   drop
+   code RETIREMENT-CODE? 0= if code throw then
+   FS:ERRNO {: e:n :}
+   e REPLACED? if RETIRE-ABSENT exit then
+   e LOCAL-STAGE--RETIREMENT:FAILED ;
+
+private
+
 \ Removes target's guard for c when it holds c; other bytes are kept.
 : REMOVE-GUARD-IF-VERIFIED ( fd str DROPBOX:hash ^ARENA:arena -- )
    {: dir:fd t:str c:DROPBOX:hash ar:^ARENA:arena :}

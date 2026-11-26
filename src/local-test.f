@@ -36,7 +36,8 @@
 \ partial, keeps a swapped replacement and fails in a slot directory it
 \ cannot search; that slots lease through a symlinked state home; then
 \ local.rs's install tests, each install outcome, an install a directory
-\ or an unreadable file at its stage's name blocks, each replacement
+\ or an unreadable file at its stage's name blocks, each retirement of
+\ a download stage, each replacement
 \ preparation, that a complete disposable download closes its parent,
 \ and the scan lock test's half without the lock: a disposable partial
 \ appended is staged and leaves its staging directory empty; then that
@@ -3606,6 +3607,55 @@ variable REMAINING
    s" an object at a stage's name blocks only its install" T-LABEL
    [: dup DIRECTORY-STAGE UNREADABLE-STAGE ;] IN-CASE-DIR ;
 
+: RETIREMENT$ ( LOCAL:stage-retirement -- str n )
+   MATCH LOCAL:stage-retirement
+      absent OF s" absent" 0 ENDOF
+      failed OF {: e:n :} s" failed" e ENDOF
+   ;MATCH ;
+
+\ RETIRE-DOWNLOAD-STAGE of t's stage of "remote" below the case's
+\ directory, whose fd is root.
+: RETIRE ( fd str -- str n )
+   {: root:fd t:str :}
+   t T-LABEL
+   root ROOT$ t WANT AR @ LOCAL:RETIRE-DOWNLOAD-STAGE RETIREMENT$ ;
+
+\ A missing stage, a missing parent and a file in the parent's place
+\ are absent; an owned stage is removed and then absent; a file at the
+\ stage's name that is not the stage is absent and kept.
+: RETIRED-OR-ABSENT ( fd -- )
+   {: root:fd :}
+   TARGET STAGE-NAME$ {: sn:str :}
+   root TARGET RETIRE 0 T= s" absent" T$=
+   root s" gone/target.txt" RETIRE 0 T= s" absent" T$=
+   s" file" s" not a directory" PUT-FILE
+   root s" file/target.txt" RETIRE 0 T= s" absent" T$=
+   s" file" READ$ s" not a directory" T$=
+   root TARGET STAGE-REMOTE
+   root sn LOCAL:ENTRY-EXISTS-AT TTRUE
+   root TARGET RETIRE 0 T= s" absent" T$=
+   root sn LOCAL:ENTRY-EXISTS-AT TFALSE
+   sn s" other" PUT-FILE
+   root TARGET RETIRE 0 T= s" absent" T$=
+   sn READ$ s" other" T$= ;
+
+\ A directory that refuses the removal fails it with its errno and
+\ keeps the stage.
+: DENIED-RETIREMENT ( fd -- )
+   {: root:fd :}
+   LOCAL:ROOT-USER? if exit then
+   TARGET STAGE-NAME$ {: sn:str :}
+   root TARGET STAGE-REMOTE
+   ROOT$ $140 FS:CHMOD-MODE
+   [: root TARGET RETIRE FS:EACCES T= s" failed" T$= ;]
+   [: ROOT$ MODE-0700 FS:CHMOD-MODE ;] finally
+   root sn LOCAL:ENTRY-EXISTS-AT TTRUE ;
+
+: EACH-STAGE-RETIREMENT-IS-REACHED ( -- )
+   s" each stage retirement is reached" T-LABEL
+   [: RETIRED-OR-ABSENT ;] IN-CASE-DIR
+   [: DENIED-RETIREMENT ;] IN-CASE-DIR ;
+
 : PREPARE-CASES ( fd -- )
    {: root:fd :}
    s" prep.txt" s" old" PUT-FILE
@@ -4249,6 +4299,7 @@ FS:PATHZ-CAP BUFFER: SLOT-FILE-BUF
    RENAMED-DOWNLOAD-REQUIRES-ITS-OWNERSHIP-MARKER
    EACH-INSTALL-OUTCOME-IS-REACHED
    OBJECT-AT-STAGE-NAME-BLOCKS-ONLY-ITS-INSTALL
+   EACH-STAGE-RETIREMENT-IS-REACHED
    EACH-REPLACEMENT-PREPARATION-IS-REACHED
    COMPLETE-DISPOSABLE-DOWNLOAD-CLOSES-ITS-PARENT
    DISPOSABLE-DOWNLOAD-BODY-DOES-NOT-HOLD-THE-SCAN-LOCK

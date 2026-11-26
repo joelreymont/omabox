@@ -38,7 +38,10 @@
 \ the keys EACH-LOCAL-COLLISION visits, in MODEL:KEY-CMP's order, and
 \ LOCAL-COUNT and LOCAL-AT over published scans; REMOTE-AT at held and
 \ unheld keys; LIVE-PLAN-AT at a pending, a blocked, a completed and an
-\ unheld key; the keys EACH-UNSETTLED-PATH visits, in byte order, none
+\ unheld key; a completed download plan kept by every prune, the one at
+\ open included, until it is forgotten or a new root's activation
+\ deletes it, and a completed upload plan not;
+\ the keys EACH-UNSETTLED-PATH visits, in byte order, none
 \ settled, and
 \ KNOWN-PATH-AT at a held key and at keys nothing holds, and its subtree
 \ as Rust's reconcile.rs remote_subtree_holds_only_true_descendants has it;
@@ -4408,6 +4411,40 @@ variable CRAFT
    j CLOSE
    d GONE ;
 
+\ A completed download plan outlives every prune, the one at open
+\ included, until FORGET-COMPLETED-PLAN; a completed upload plan does
+\ not, and a live plan is never forgotten.
+: COMPLETED-DOWNLOAD-PLANS-WAIT-TO-BE-FORGOTTEN ( ^ARENA:arena -- )
+   {: ar :}
+   s" completed_download_plans_wait_to_be_forgotten" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   s" upload" UPLOAD-DECISION ar OPERATIONS {: upload :}
+   s" download" s" rev-download" REMOTE-FILE DOWNLOAD-DECISION
+   ar OPERATIONS {: download :}
+   p OPEN {: j :}
+   j s" upload.txt" DISPLAY upload ar RECORD-PLAN RECORDED-PLAN >ID
+   {: up :}
+   j s" download.txt" DISPLAY download ar RECORD-PLAN RECORDED-PLAN >ID
+   {: down :}
+   j ar COMPLETED-DOWNLOAD-PLANS VEC:COUNT 0 T=
+   j down FORGET-COMPLETED-PLAN
+   j >CONNECTION down ar READ-PLAN PLAN-GONE? TFALSE
+   j up ar SUPERSEDE-PLAN SUPERSEDED? TTRUE
+   j down ar SUPERSEDE-PLAN SUPERSEDED? TTRUE
+   j CLOSE
+   p OPEN {: k :}
+   k >CONNECTION up ar READ-PLAN PLAN-GONE? TTRUE
+   k ar COMPLETED-DOWNLOAD-PLANS {: kept :}
+   kept VEC:COUNT 1 T=
+   kept 0 VEC:AT @ >ID down ID= TTRUE
+   k PRUNE-COMPLETED-WORK 0 T=
+   k ar COMPLETED-DOWNLOAD-PLANS VEC:COUNT 1 T=
+   k down FORGET-COMPLETED-PLAN
+   k >CONNECTION down ar READ-PLAN PLAN-GONE? TTRUE
+   k ar COMPLETED-DOWNLOAD-PLANS VEC:COUNT 0 T=
+   k CLOSE
+   d GONE ;
+
 \ The recovery copy, completed before its plan finishes, starts no
 \ retention until then.
 : COPY-UNRETAINED ( journal recovery-record MODEL:path ^ARENA:arena -- )
@@ -4957,6 +4994,28 @@ TYPED-VARIABLE HELD-OPERATION operation-id
    j ar PENDING-PLANS VEC:COUNT 0 T=
    j plan FIRST-ID ar UPLOAD-SESSION SESSION-NONE? TTRUE
    j SESSION-ROWS 0 T=
+   j CLOSE
+   d GONE ;
+
+\ A new root's activation deletes the prior root's completed download
+\ plan, which no prune would.
+: ACTIVATION-PURGES-THE-PRIOR-ROOTS-COMPLETED-DOWNLOAD-PLANS
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" a new root's activation purges the prior root's completed download plans"
+   T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   s" download" s" rev-download" REMOTE-FILE DOWNLOAD-DECISION
+   ar OPERATIONS {: download :}
+   p OPEN {: j :}
+   j s" /sync/first" 2 LOCAL-ROOT ar ACTIVATE-LOCAL-ROOT ACTIVATED
+   j s" download.txt" DISPLAY download ar RECORD-PLAN RECORDED-PLAN >ID
+   {: down :}
+   j down ar SUPERSEDE-PLAN SUPERSEDED? TTRUE
+   j ar COMPLETED-DOWNLOAD-PLANS VEC:COUNT 1 T=
+   j s" /sync/second" 4 LOCAL-ROOT ar ACTIVATE-LOCAL-ROOT ACTIVATED
+   j >CONNECTION down ar READ-PLAN PLAN-GONE? TTRUE
+   j ar COMPLETED-DOWNLOAD-PLANS VEC:COUNT 0 T=
    j CLOSE
    d GONE ;
 
@@ -5816,6 +5875,7 @@ TYPED-VARIABLE HELD-OPERATION operation-id
    ar JOURNAL-DESTRUCTIVE-COMPLETION-RETIRES-LEGACY-RECOVERY-ACROSS-REOPEN
    ar BLOCKING-REPORTS-MISSING-AND-FINISHED-PLANS-WITHOUT-CHANGING-THEM
    ar BLOCKED-PLAN-UPLOAD-PAYLOADS-STAY-REFERENCED
+   ar COMPLETED-DOWNLOAD-PLANS-WAIT-TO-BE-FORGOTTEN
    ar JOURNAL-PLAN-CONFLICT-COMPLETES-ONCE-WITHOUT-ADVANCING-BASELINE
    ar LIVE-PLAN-AT-ANSWERS-ONLY-A-LIVE-PLAN
    ar AN-UNKNOWN-BASELINE-REFUSES-THE-MIGRATION
@@ -5835,6 +5895,7 @@ TYPED-VARIABLE HELD-OPERATION operation-id
    ar A-CONFLICT-FORGETS-ITS-PLANS-UPLOAD-SESSION
    ar SUPERSESSION-FORGETS-ITS-PLANS-UPLOAD-SESSION
    ar ACTIVATION-PURGES-THE-PRIOR-ROOTS-UPLOAD-SESSIONS
+   ar ACTIVATION-PURGES-THE-PRIOR-ROOTS-COMPLETED-DOWNLOAD-PLANS
    ar PRUNING-REMOVES-THE-OPERATIONS-UPLOAD-SESSION
    ar BLOCKING-AND-UNBLOCKING-KEEP-THE-UPLOAD-SESSION
    ar A-SCHEMA-10-JOURNAL-MIGRATES-TO-11 ;

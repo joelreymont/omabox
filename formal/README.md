@@ -3,7 +3,9 @@
 `DownloadLifecycle` checks two concurrent exact-download lifecycles sharing
 exactly four resumable slots. It covers durable checkpoints, exact range
 continuation, crash truncation, stale root and operation bindings, unknown slot
-occupants, full verification, promotion, installation, and journal completion.
+occupants, full verification, promotion, installation, journal completion, and
+the retirement of an ended plan's verified stage, whose record the journal keeps
+until then.
 
 `MutationLifecycle` checks replacement and deletion across journal recording,
 verified staging, same-directory displacement, user races, crashes, replay, and
