@@ -9,7 +9,8 @@
 \ themselves, checkpointed and promoted into their stages, their installs
 \ over a target that still holds what the journal expects, and the
 \ conditional deletes of local files, the directories a sync creates and
-\ deletes, the conflict copies it writes, and the non-overwriting renames
+\ deletes, the conflict copies it writes or installs from a verified
+\ stage, and the non-overwriting renames
 \ of a case variant or a file to its copy name.
 \ A relative path splits as Rust's Path::components splits it: empty and "."
 \ components past the first are skipped, and an empty, absolute or leading "."
@@ -2328,6 +2329,15 @@ $100 constant MODE-READ-ONLY
       other OF false ENDOF
    ;MATCH ;
 
+\ Whether the file at path p carries a stage marker of any value.
+: STAGE-MARKED? ( fd str -- bool )
+   {: f:fd p:str :}
+   f s" " p READ-DOWNLOAD-MARKER MATCH download-marker
+      missing OF false ENDOF
+      expected OF true ENDOF
+      other OF true ENDOF
+   ;MATCH ;
+
 \ ---- staging
 
 \ Fills the span from read; a file failure there is a stage read's.
@@ -4301,8 +4311,9 @@ ENUM stage-cleanup
 ;ENUM
 
 \ An install in its open parent: the parent's descriptor and path, the
-\ stage's name and path, the target's last component and path, the
-\ content installed and the arena the names are laid in.
+\ stage's name and path, the target's last component and path, the path
+\ whose stage is installed, the content installed, whether the target
+\ ends writable and the arena the names are laid in.
 STRUCTURE install
    FIELD parent fd
    FIELD parent-path str
@@ -4310,7 +4321,9 @@ STRUCTURE install
    FIELD stage-path str
    FIELD target-name str
    FIELD target str
+   FIELD source str
    FIELD desired DROPBOX:hash
+   FIELD writable bool
    FIELD arena ^ARENA:arena
 ;STRUCTURE
 
@@ -4373,10 +4386,12 @@ STRUCTURE install
    f DOWNLOAD-STAGE-XATTR p s" clear installed download marker"
    REMOVE-XATTR ;
 
-\ Syncs the installed file; one still marked as LOCAL's is released first.
-: FINISH-INSTALLED-DOWNLOAD ( fd str bool -- )
-   {: f:fd p:str owned:bool :}
-   owned if f p RELEASE-OWNED-DOWNLOAD then
+\ Syncs the installed file; one still marked is released first, and one
+\ not writable is made read-only.
+: FINISH-INSTALLED-DOWNLOAD ( fd str bool bool -- )
+   {: f:fd p:str marked:bool writable:bool :}
+   marked if f p RELEASE-OWNED-DOWNLOAD then
+   writable 0= if f p s" make installed copy read-only" READ-ONLY then
    f p s" sync installed download" SYNC-FILE ;
 
 \ Whether the stage's file holds its verified bytes under the name.
@@ -4387,68 +4402,70 @@ STRUCTURE install
    print SAME-HASHED-CONTENT 0= if false exit then
    f dir name p NAMED-INODE-MATCHES ;
 
-\ Whether the renamed stage is the owned download of want at the name.
+\ Whether the renamed stage is src's owned download of want at the name.
 : OWNED-RENAME?
-   ( verified-download-stage fd str str DROPBOX:hash ^ARENA:arena
+   ( verified-download-stage fd str str str DROPBOX:hash ^ARENA:arena
      -- bool )
-   {: s:verified-download-stage dir:fd name:str p:str
+   {: s:verified-download-stage dir:fd name:str p:str src:str
       want:DROPBOX:hash ar:^ARENA:arena :}
-   p want ar STAGE-MARKER {: m:str :}
+   src want ar STAGE-MARKER {: m:str :}
    s dir name p s" verify renamed download content" BOUND?
    0= if false exit then
    s VERIFIED-DOWNLOAD-STAGE-UNMAKE {: f:fd print:MODEL:fingerprint :}
    f m p READ-DOWNLOAD-MARKER EXPECTED? ;
 
-\ Releases and syncs the stage renamed to the name, which must be the
-\ owned download of want before and after.
+\ Releases and syncs src's stage renamed to the name, which must be its
+\ owned download of want before and after; read-only unless writable.
 : SYNC-RENAMED-DOWNLOAD
-   ( verified-download-stage fd str str DROPBOX:hash ^ARENA:arena -- )
-   {: s:verified-download-stage dir:fd name:str p:str
-      want:DROPBOX:hash ar:^ARENA:arena :}
-   s dir name p want ar OWNED-RENAME? 0= if
+   ( verified-download-stage fd str str str DROPBOX:hash bool
+     ^ARENA:arena -- )
+   {: s:verified-download-stage dir:fd name:str p:str src:str
+      want:DROPBOX:hash writable:bool ar:^ARENA:arena :}
+   s dir name p src want ar OWNED-RENAME? 0= if
       s" verify renamed download ownership" p CHANGED
    then
    dir p s" sync installed download rename" SYNC-DIRECTORY
    s VERIFIED-DOWNLOAD-STAGE-UNMAKE {: f:fd print:MODEL:fingerprint :}
-   f p true FINISH-INSTALLED-DOWNLOAD
+   f p true writable FINISH-INSTALLED-DOWNLOAD
    s dir name p s" verify installed download content" BOUND? 0= if
       s" verify installed download binding" p CHANGED
    then ;
 
-\ Finishes the open installed file when its content actual is want.
-: FINISH-IF-WANTED
-   ( fd DROPBOX:hash str DROPBOX:hash ^ARENA:arena -- )
-   {: f:fd actual:DROPBOX:hash p:str want:DROPBOX:hash
-      ar:^ARENA:arena :}
+\ Finishes the open installed file when its content actual is want; any
+\ stage's marker there is released, as an interrupted install of a stage
+\ staged for another path leaves it.
+: FINISH-IF-WANTED ( fd DROPBOX:hash str DROPBOX:hash bool -- )
+   {: f:fd actual:DROPBOX:hash p:str want:DROPBOX:hash writable:bool :}
    actual want SAME-CONTENT? 0= if
       s" verify installed download" p CHANGED
    then
-   p want ar STAGE-MARKER {: m:str :}
-   f m p READ-DOWNLOAD-MARKER EXPECTED? {: owned:bool :}
-   f p owned FINISH-INSTALLED-DOWNLOAD ;
+   f p STAGE-MARKED? {: marked:bool :}
+   f p marked writable FINISH-INSTALLED-DOWNLOAD ;
 
 \ Syncs the download installed at the name, which must hold want, and
-\ its entry; a file still marked as LOCAL's is released first.
+\ its entry; a file still marked is released first, and one not
+\ writable is made read-only.
 : SYNC-INSTALLED-DOWNLOAD
-   ( fd str str DROPBOX:hash ^ARENA:arena -- )
-   {: dir:fd name:str p:str want:DROPBOX:hash ar:^ARENA:arena :}
+   ( fd str str DROPBOX:hash bool ^ARENA:arena -- )
+   {: dir:fd name:str p:str want:DROPBOX:hash writable:bool
+      ar:^ARENA:arena :}
    s" verify installed download" {: o:str :}
    dir name p o ar OPEN-AND-HASH-IF-PRESENT MATCH option
       none OF o p CHANGED ENDOF
       some OF HASHED-UNMAKE
          {: f:fd c:DROPBOX:hash print:MODEL:fingerprint :}
-         [: f c p want ar FINISH-IF-WANTED ;] [: f DISCARD ;] finally
+         [: f c p want writable FINISH-IF-WANTED ;] [: f DISCARD ;] finally
       ENDOF
    ;MATCH
    dir p s" sync installed download entry" SYNC-DIRECTORY ;
 
-\ Removes the owned stage of want at the name in dir; another file
+\ Removes src's owned stage of want at the name in dir; another file
 \ there is kept.
 : REMOVE-VERIFIED-STAGE
    ( fd str DROPBOX:hash str str ^ARENA:arena -- stage-cleanup )
-   {: dir:fd name:str want:DROPBOX:hash p:str t:str
+   {: dir:fd name:str want:DROPBOX:hash p:str src:str
       ar:^ARENA:arena :}
-   dir name p t want ar INSPECT-DOWNLOAD-STAGE
+   dir name p src want ar INSPECT-DOWNLOAD-STAGE
    MATCH download-stage
       missing OF STAGE-CLEANUP-REMOVED-OR-ABSENT ENDOF
       verified OF VERIFIED-DOWNLOAD-STAGE-UNMAKE
@@ -4610,29 +4627,29 @@ private
 \ ---- an install's steps
 
 : DESIRED ( install -- DROPBOX:hash )
-   INSTALL-UNMAKE {: dir dp sn sp tn t want ar :} want ;
+   INSTALL-UNMAKE {: dir dp sn sp tn t src want w ar :} want ;
 
 \ The content at x's target now; o names the operation.
 : TARGET-HASH ( install str -- option<DROPBOX:hash> )
    {: x:install o:str :}
-   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t src want w ar :}
    dir tn t o ar HASH-AT-IF-PRESENT ;
 
 \ Syncs x's parent; o names the operation.
 : SYNC-PARENT ( install str -- )
    {: x:install o:str :}
-   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t src want w ar :}
    dir t o SYNC-DIRECTORY ;
 
 \ Removes the name in x's parent; o names the operation.
 : REMOVE-IN-PARENT ( install str str -- )
    {: x:install g:str o:str :}
-   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t src want w ar :}
    dir g o t REMOVE-AT ;
 
 : INSPECT-INSTALL-STAGE ( install -- download-stage )
-   INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
-   dir sn sp t want ar INSPECT-DOWNLOAD-STAGE ;
+   INSTALL-UNMAKE {: dir dp sn sp tn t src want w ar :}
+   dir sn sp src want ar INSPECT-DOWNLOAD-STAGE ;
 
 \ Runs q on x's verified stage, closing it after; with none, or other
 \ bytes at the stage's name, the install answers that.
@@ -4652,9 +4669,9 @@ private
 
 \ x's target holds its content: syncs it and removes the stage.
 : CLEAN-INSTALLED ( install -- stage-cleanup )
-   INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
-   dir tn t want ar SYNC-INSTALLED-DOWNLOAD
-   dir sn want sp t ar REMOVE-VERIFIED-STAGE ;
+   INSTALL-UNMAKE {: dir dp sn sp tn t src want w ar :}
+   dir tn t want w ar SYNC-INSTALLED-DOWNLOAD
+   dir sn want sp src ar REMOVE-VERIFIED-STAGE ;
 
 \ Runs q once the stage is gone; other bytes at its name answer the
 \ install.
@@ -4668,7 +4685,7 @@ private
 
 : REMOVE-INSTALL-GUARD ( install DROPBOX:hash -- )
    {: x:install c:DROPBOX:hash :}
-   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t src want w ar :}
    dir t c ar REMOVE-GUARD-IF-VERIFIED ;
 
 : DROP-INSTALLED-GUARD ( install option<DROPBOX:hash> -- )
@@ -4705,10 +4722,10 @@ private
 : RENAME-STAGE-INTO-ABSENT-TARGET
    ( install verified-download-stage -- install-outcome )
    {: x:install s:verified-download-stage :}
-   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t src want w ar :}
    s sp VERIFY-DOWNLOAD-STAGE-BEFORE-RENAME
    dir sn dir tn FS:TRY-RENAME-NEW-AT if
-      s dir tn t want ar SYNC-RENAMED-DOWNLOAD
+      s dir tn t src want w ar SYNC-RENAMED-DOWNLOAD
       INSTALLED exit
    then
    FS:ERRNO {: e:n :}
@@ -4768,8 +4785,8 @@ private
 : REPLACED
    ( verified-download-stage install str -- install-outcome )
    {: s:verified-download-stage x:install g:str :}
-   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
-   s dir tn t want ar SYNC-RENAMED-DOWNLOAD
+   x INSTALL-UNMAKE {: dir dp sn sp tn t src want w ar :}
+   s dir tn t src want w ar SYNC-RENAMED-DOWNLOAD
    x g s" remove displaced install guard" REMOVE-IN-PARENT
    x s" sync completed replacement" SYNC-PARENT
    INSTALLED ;
@@ -4778,7 +4795,7 @@ private
 : RENAME-REPLACEMENT
    ( verified-download-stage install DROPBOX:hash -- install-outcome )
    {: s:verified-download-stage x:install c:DROPBOX:hash :}
-   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t src want w ar :}
    t c ar GUARD-NAME {: g:str :}
    s sp VERIFY-DOWNLOAD-STAGE-BEFORE-RENAME
    dir sn dir tn FS:TRY-RENAME-NEW-AT if
@@ -4801,7 +4818,7 @@ private
 
 : PREPARE-INSTALL ( install DROPBOX:hash -- replacement-preparation )
    {: x:install c:DROPBOX:hash :}
-   x INSTALL-UNMAKE {: dir dp sn sp tn t want ar :}
+   x INSTALL-UNMAKE {: dir dp sn sp tn t src want w ar :}
    dir dp tn t c ar PREPARE-REPLACEMENT-AT ;
 
 : REPLACE-WITH-STAGE
@@ -4829,16 +4846,17 @@ private
       some OF {: c:DROPBOX:hash :} x c INSTALL-REPLACEMENT ENDOF
    ;MATCH ;
 
-\ The install of t's content want in the parent f, opened at rel below
-\ the root at r.
+\ The install of t's content want from the stage staged for src in the
+\ parent f, opened at rel below the root at r; t ends read-only unless
+\ writable is true.
 : INSTALL-OF
-   ( fd str str str str DROPBOX:hash ^ARENA:arena -- install )
-   {: f:fd tn:str rel:str r:str t:str want:DROPBOX:hash
-      ar:^ARENA:arena :}
+   ( fd str str str str str DROPBOX:hash bool ^ARENA:arena -- install )
+   {: f:fd tn:str rel:str r:str t:str src:str want:DROPBOX:hash
+      writable:bool ar:^ARENA:arena :}
    r rel ar JOIN {: dp:str :}
-   s" download" t want ar INTERNAL-NAME {: sn:str :}
+   s" download" src want ar INTERNAL-NAME {: sn:str :}
    dp sn ar JOIN {: sp:str :}
-   f dp sn sp tn t want ar
+   f dp sn sp tn t src want writable ar
    INSTALL-MAKE ;
 
 public
@@ -4857,8 +4875,30 @@ public
    root t false OPEN-PARENT MATCH option
       none OF DOWNLOAD-REQUIRED ENDOF
       some OF PARENT-DIR-UNMAKE {: f:fd name:str rel:str :}
-         [: f name rel r t want ar INSTALL-OF
+         [: f name rel r t t want true ar INSTALL-OF
             expected INSTALL-IN-PARENT ;]
+         [: f DISCARD ;] finally
+      ENDOF
+   ;MATCH ;
+
+\ Renames the verified stage of want staged for src, t itself or a
+\ sibling, to t below the root fd, whose path is r, never over an entry.
+\ A stage staged for a path in another directory is not beside t, so the
+\ install answers that a download is required.
+\ t ends unmarked, and read-only unless writable is true.
+\ t holding want already is installed, src's stage beside it removed;
+\ other bytes at t or at the stage's name are kept.
+\ E-UNSUPPORTED or E-UNREADABLE is about t's own name.
+: INSTALL-COPY-AT
+   ( fd str str str DROPBOX:hash bool ^ARENA:arena -- install-outcome )
+   {: root:fd r:str src:str t:str want:DROPBOX:hash writable:bool
+      ar:^ARENA:arena :}
+   want s" install copy" REQUIRE-CONTENT-HASH
+   root t false OPEN-PARENT MATCH option
+      none OF DOWNLOAD-REQUIRED ENDOF
+      some OF PARENT-DIR-UNMAKE {: f:fd name:str rel:str :}
+         [: f name rel r t src want writable ar INSTALL-OF
+            ABSENT INSTALL-IN-PARENT ;]
          [: f DISCARD ;] finally
       ENDOF
    ;MATCH ;

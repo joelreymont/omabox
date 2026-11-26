@@ -80,9 +80,12 @@
 \   at its checkpoint; a download's progress, then finished, in a status
 \   under TMPDIR.
 \ - MATERIALIZE-REMOTE-CONFLICT-AT downloads the copy once, then is ready
-\   with no request; a directory or other bytes at the copy's name
-\   block it conflict-copy-occupied, logging nothing; other bytes at
-\   its stage block it stage-occupied, logged once, with no request.
+\   with no request, the copy read-only and unmarked; a directory or
+\   other bytes at the copy's name block it conflict-copy-occupied,
+\   logging nothing; other bytes at its stage block it stage-occupied,
+\   logged once, with no request; the path's verified stage becomes the
+\   copy, read-only and unmarked, with no request, and stays when other
+\   bytes hold the copy's name.
 \   MATERIALIZE-REMOTE-COPY-AT installs at a target apart from the
 \   source path, and answers destination-changed for other bytes there.
 \ - APPLY-FILE-MUTATION and APPLY-DELETE-MUTATION over every mutation
@@ -116,6 +119,8 @@
 \   TLC finds formal/LocalLifecycle.tla's steps follow them.
 \ - REMOTE-LIFECYCLE's lines are formal/RemoteLifecycleTable.tla's,
 \   and TLC finds formal/RemoteLifecycle.tla's steps follow them.
+\ - REMOTE-COPY's lines are formal/RemoteCopyTable.tla's, and TLC
+\   finds formal/RemoteCopy.tla's steps follow them.
 \ Run from the repository root: hb --load src/replay-test.f </dev/null
 require src/lib/error.f
 require src/lib/arena.f
@@ -130,6 +135,7 @@ require src/lib/fd.f
 require src/lib/vector.f
 require src/lib/adt/option.f
 require src/lib/fs-list.f
+require src/lib/xattr.f
 require src/lib/aio.f
 require src/lib/ffi-abi.f
 require src/lib/sqlite.f
@@ -2614,6 +2620,26 @@ variable HELD
    s" /notes.txt" s" theirs-revision" THEIRS c SERVES
    c c s" theirs-revision" REMOTE-OF ;
 
+\ The attribute LOCAL marks an owned download stage with, on disk.
+: STAGE-XATTR$ ( -- str ) s" user.omabox.download-stage-v1" ;
+
+: MARKER-ABSENT? ( XATTR:got -- bool )
+   MATCH XATTR:got
+      absent OF true ENDOF
+      value OF drop false ENDOF
+      oversize OF false ENDOF
+   ;MATCH ;
+
+\ The file at p is read-only to its owner alone and carries no stage
+\ marker.
+: SEALED ( str -- )
+   {: p:str :}
+   p FS:TRY-STAT TTRUE FS:STAT-MODE@ $1FF and $100 T=
+   p FS:OPEN-SIZED TTRUE drop {: f:fd :}
+   f STAGE-XATTR$ TEXT CAP SPAN:MAKE XATTR:GET
+   MARKER-ABSENT? TTRUE
+   f FS:CLOSE-DIR ;
+
 : A-REMOTE-CONFLICT-COPY-DOWNLOADS-ONCE ( ^ARENA:arena -- )
    {: ar :}
    s" a remote conflict copy downloads once, then is ready" T-LABEL
@@ -2623,6 +2649,35 @@ variable HELD
    r s" notes.txt" rem ar REMOTE-COPY$ s" " T$= s" ready" T$=
    1 SEEN
    r s" notes.txt" c ar REMOTE-COPY THEIRS ar HOLDS
+   r s" notes.txt" c ar REMOTE-COPY ar TEST-CLIENT:INSIDE SEALED
+   d GONE ;
+
+\ The stage of notes.txt's download of c below the root r, if any.
+: NOTES-STAGE ( str DROPBOX:hash ^ARENA:arena -- str )
+   {: r:str c:DROPBOX:hash ar :}
+   r OPEN-ROOT {: root:fd :}
+   [: root r s" notes.txt" c ar LOCAL:EXISTING-DOWNLOAD-STAGE-AT
+      MATCH option
+         none OF s" none" ENDOF
+         some OF STAGE$ drop ENDOF
+      ;MATCH ;]
+   [: root FS:CLOSE-DIR ;] finally ;
+
+: A-PATHS-STAGE-BECOMES-ITS-REMOTE-COPY ( ^ARENA:arena -- )
+   {: ar :}
+   s" the path's verified stage becomes its remote copy" T-LABEL
+   ar THEIRS-SERVED {: c:DROPBOX:hash rem:MODEL:remote :}
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r OPEN-ROOT {: root:fd :}
+   root r s" notes.txt" THEIRS c ar PRESTAGED s" staged" AS
+   root FS:CLOSE-DIR
+   r s" notes.txt" ar TEST-CLIENT:INSIDE s" our side" FS:WRITE-ALL
+   r s" notes.txt" rem ar REMOTE-COPY$ s" " T$= s" ready" T$=
+   0 SEEN
+   r s" notes.txt" c ar REMOTE-COPY THEIRS ar HOLDS
+   r s" notes.txt" c ar REMOTE-COPY ar TEST-CLIENT:INSIDE SEALED
+   r c ar NOTES-STAGE s" none" T$=
+   r s" notes.txt" s" our side" ar HOLDS
    d GONE ;
 
 : AN-OCCUPIED-REMOTE-COPY-NAME-BLOCKS-IT ( ^ARENA:arena -- )
@@ -2630,6 +2685,9 @@ variable HELD
    s" a directory or other bytes at the copy's name block it" T-LABEL
    ar THEIRS-SERVED {: c:DROPBOX:hash rem:MODEL:remote :}
    ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r OPEN-ROOT {: root:fd :}
+   root r s" notes.txt" THEIRS c ar PRESTAGED s" staged" AS
+   root FS:CLOSE-DIR
    r s" notes.txt" c ar REMOTE-COPY ar TEST-CLIENT:INSIDE {: k:str :}
    k FS:MAKE-DIR
    d [: r s" notes.txt" rem ar REMOTE-COPY$ BLOCKED-OCCUPIED ;] ar
@@ -2639,6 +2697,9 @@ variable HELD
    d [: r s" notes.txt" rem ar REMOTE-COPY$ BLOCKED-OCCUPIED ;] ar
    QUIETLY
    r s" notes.txt" c ar REMOTE-COPY s" other bytes" ar HOLDS
+   \ The path's verified stage stays, and nothing is downloaded.
+   0 SEEN
+   r c ar NOTES-STAGE s" already-staged" T$=
    d GONE ;
 
 \ The log t holds the line once and nothing else.
@@ -3679,6 +3740,7 @@ variable SIDES
    ar AN-OCCUPIED-REMOTE-COPY-NAME-BLOCKS-IT
    ar AN-OCCUPIED-REMOTE-COPY-STAGE-BLOCKS-IT
    ar A-REMOTE-COPY-INSTALLS-AT-ITS-TARGET
+   ar A-PATHS-STAGE-BECOMES-ITS-REMOTE-COPY
    ar APPLY-FILE-MUTATION-COVERS-EVERY-OUTCOME
    ar A-CHANGED-FILE-KEEPS-BOTH-SIDES
    ar A-DELETED-REMOTE-KEEPS-THE-LOCAL-SIDE
@@ -3737,6 +3799,12 @@ variable SIDES
    s" src/replay.f" s" REMOTE-LIFECYCLE" s" RemoteLifecycle" ar
    TEST-FORMAL:HOLDS ;
 
+: FORMAL-HOLDS-THE-REMOTE-COPY-TABLE ( ^ARENA:arena -- )
+   {: ar :}
+   s" formal holds the remote copy table" T-LABEL
+   s" src/replay.f" s" REMOTE-COPY" s" RemoteCopy" ar
+   TEST-FORMAL:HOLDS ;
+
 
 : CASES ( ^ARENA:arena -- )
    {: ar :}
@@ -3756,7 +3824,8 @@ variable SIDES
    ar REMOTE-REPLAY-CASES
    ar DROPBOX-CASES
    ar FORMAL-HOLDS-THE-LOCAL-TABLE
-   ar FORMAL-HOLDS-THE-REMOTE-TABLE ;
+   ar FORMAL-HOLDS-THE-REMOTE-TABLE
+   ar FORMAL-HOLDS-THE-REMOTE-COPY-TABLE ;
 
 
 : RUN ( -- )

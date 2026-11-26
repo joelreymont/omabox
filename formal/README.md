@@ -75,6 +75,17 @@ The journal completes an operation only once Dropbox holds its effect or its
 plan retired, operations reach Dropbox in plan order, and nothing is sent for
 a plan that completed or retired.
 
+`RemoteCopy` checks one remote copy of a path's Dropbox bytes, `REMOTE-COPY`'s
+lines, a pass at a time until its conflict is recorded: the copy's own verified
+stage, else the one the path's download left beside it, is renamed to the
+copy's name still marked and then released, else the bytes are downloaded into
+the copy's own stage and installed. At any point the user may write at the
+copy's free name or at either stage's name. It requires that a ready copy
+holds the remote's bytes, that those bytes once held stay at a name or a stage
+unless the user overwrites them, that other bytes or an entry Omabox cannot
+replace are never replaced, and that nothing is downloaded while a verified
+stage holds the bytes.
+
 `InventoryPublication` checks fresh listings, cursor deltas, reset-triggered
 rebuilds, multi-page failures, crashes, retries, and atomic publication. Partial
 pages and failed attempts must leave the prior durable inventory and cursor

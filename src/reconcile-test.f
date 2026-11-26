@@ -152,6 +152,10 @@
 \ - occupied_dropbox_conflict_copy_name_blocks_only_its_path
 \ - conflict_on_a_plan_blocked_for_its_size_is_prepared_at_once
 \ - directory_at_dropbox_conflict_copy_name_blocks_only_its_path
+\ Conflicts against the fake Dropbox that Rust has no test for:
+\ - A-CONFLICTED-DOWNLOAD-REUSES-ITS-STAGE: a staged download plan whose
+\   install finds new local bytes ends as their conflict, its stage
+\   becomes the remote copy, read-only and unmarked, with no download.
 \ Restricted and same-named entries against the fake Dropbox, Rust's
 \ tests of the same names, with no account request and the fake's own
 \ delete_v2 and upload answers, its upload at rev 01701:
@@ -256,6 +260,8 @@ require src/lib/vector.f
 require src/lib/adt/option.f
 require src/lib/fs-anchored.f
 require src/lib/fs-list.f
+require src/lib/span.f
+require src/lib/xattr.f
 require src/lib/aio.f
 require src/lib/time.f
 require src/lib/json/pointer.f
@@ -4537,6 +4543,8 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x CONFLICTS-OF {: recorded :}
    recorded VEC:COUNT 1 T=
    rc DIVERGED-REMOTE$ HOLDS-BYTES
+   \ The copy is read-only; the user makes it writable to edit it.
+   rc $180 FS:CHMOD-MODE
    rc EDITED-COPY$ FS:WRITE-ALL
    x UNRELATED-WRITTEN
    x rec PASSED COMPLETE {: second :}
@@ -4621,6 +4629,69 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    x rep s" 01701" DIVERGED-HELD
    d x STEP-GONE ;
 
+: STAGE-XATTR$ ( -- str ) s" user.omabox.download-stage-v1" ;
+
+: MARKER-ABSENT? ( XATTR:got -- bool )
+   MATCH XATTR:got
+      absent OF true ENDOF
+      value OF drop false ENDOF
+      oversize OF false ENDOF
+   ;MATCH ;
+
+\ The file at p is read-only to its owner alone and carries no stage
+\ marker, the attribute LOCAL marks an owned download stage with.
+: SEALED ( str -- )
+   {: p:str :}
+   p FS:TRY-STAT TTRUE FS:STAT-MODE@ $1FF and MODE-0400 T=
+   p FS:OPEN-SIZED TTRUE drop {: f:fd :}
+   f STAGE-XATTR$ READ-BUF READ-CAP SPAN:MAKE XATTR:GET
+   MARKER-ABSENT? TTRUE
+   f FS:CLOSE-DIR ;
+
+: STAGE-KEPT? ( option<LOCAL:stage-outcome<n>> -- bool )
+   MATCH option
+      none OF false ENDOF
+      some OF MATCH LOCAL:stage-outcome
+            staged OF drop false ENDOF
+            already-staged OF drop true ENDOF
+            content-changed OF drop false ENDOF
+            destination-occupied OF drop false ENDOF
+         ;MATCH
+      ENDOF
+   ;MATCH ;
+
+\ Whether replace.txt's verified stage of the new remote bytes is there.
+: REPLACE-STAGED? ( ^run -- bool )
+   {: x :}
+   x [: x ROOT$ s" replace.txt" NEW-REMOTE$ x RUN-ARENA @ IDENTITY
+      x RUN-ARENA @ LOCAL:EXISTING-DOWNLOAD-STAGE-AT STAGE-KEPT? ;]
+   IN-ACTIVE-ROOT ;
+
+\ replace.txt's download, planned and staged, finds new local bytes
+\ there when it installs, so the pass that replays it plans a conflict.
+: DOWNLOAD-OVERTAKEN ( ^run str -- )
+   {: x k:str :}
+   x RUN-ARENA @ {: ar :}
+   k ar REPLACE-LISTED
+   x s" replace.txt" NEW-REMOTE$ s" current-rev" ar REMOTE-FILE
+   INSTALLING drop
+   x [: x s" replace.txt" NEW-REMOTE$ PRESTAGED ;] IN-ACTIVE-ROOT
+   x s" replace.txt" IN-ROOT NEW-LOCAL$ FS:WRITE-ALL ;
+
+: A-CONFLICTED-DOWNLOAD-REUSES-ITS-STAGE ( ^ARENA:arena -- )
+   {: ar :}
+   s" a download plan that ends as a conflict reuses its stage" T-LABEL
+   TEST-DROPBOX:RESET
+   ar STEP-RUN {: d:str x :}
+   d x PASS-READY {: rec:str :}
+   x s" cursor-reuse" DOWNLOAD-OVERTAKEN
+   x rec PASSED COMPLETE COPY-CONFLICTS 1 T=
+   x REPLACE-PREPARED
+   x REMOTE-COPY SEALED
+   x REPLACE-STAGED? TFALSE
+   DOWNLOAD$ TEST-DROPBOX:CALLS 0 T=
+   d x STEP-GONE ;
+
 : CONFLICTS-CASES ( ^ARENA:arena -- )
    {: ar :}
    ar REPLAY-BLOCKS-A-CONFLICT-WHOSE-LOCAL-COPY-NAME-IS-OCCUPIED
@@ -4628,7 +4699,8 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
    ar RECORDED-CONFLICT-LEAVES-AN-EDITED-COPY-ALONE
    ar OCCUPIED-DROPBOX-CONFLICT-COPY-NAME-BLOCKS-ONLY-ITS-PATH
    ar CONFLICT-ON-A-PLAN-BLOCKED-FOR-ITS-SIZE-IS-PREPARED-AT-ONCE
-   ar DIRECTORY-AT-DROPBOX-CONFLICT-COPY-NAME-BLOCKS-ONLY-ITS-PATH ;
+   ar DIRECTORY-AT-DROPBOX-CONFLICT-COPY-NAME-BLOCKS-ONLY-ITS-PATH
+   ar A-CONFLICTED-DOWNLOAD-REUSES-ITS-STAGE ;
 
 \ ---- restricted and same-named entries against the fake Dropbox ----
 

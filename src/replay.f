@@ -18,9 +18,10 @@
 \ E-INVALID-STATE. A failed retention or upload-stage syscall is logged
 \ once, by LOCAL, and thrown as LOCAL's E-IO, or E-DISK-FULL on ENOSPC.
 \ STORAGE CLASS. No state of its own. CALLER-OWNED: a report, its
-\ vector, a replay pass's context, a download's bridge, and every value
-\ a journal step or a conflict copy reads lie in the arena the caller
-\ passes. A retention pass lays its values in an arena of its own.
+\ vector, a replay pass's context, a download's bridge, a remote copy's
+\ context, and every value a journal step or a conflict copy reads lie in
+\ the arena the caller passes. A retention pass lays its values in an
+\ arena of its own.
 \ Retention, the conflict copies, an upload and the bridge close every
 \ descriptor they open, on every exit.
 
@@ -1753,87 +1754,7 @@ public
 
 private
 
-: EXACT-READY ( -- exact-copy-outcome )
-   construct exact-copy-outcome ready ;
-: EXACT-OCCUPIED ( -- exact-copy-outcome )
-   construct exact-copy-outcome stage-occupied ;
-: SOME-EXACT ( exact-copy-outcome -- option<exact-copy-outcome> )
-   OPTION:SOME ;
-: NO-EXACT ( -- option<exact-copy-outcome> ) OPTION:NONE ;
 : NO-LEASE ( -- option<LOCAL:download-slot-lease> ) OPTION:NONE ;
-
-\ An install's answer; none: no verified stage to install.
-: INSTALL-ANSWER
-   ( LOCAL:install-outcome -- option<exact-copy-outcome> )
-   MATCH LOCAL:install-outcome
-      installed OF EXACT-READY SOME-EXACT ENDOF
-      already-installed OF EXACT-READY SOME-EXACT ENDOF
-      download-required OF NO-EXACT ENDOF
-      stage-destination-occupied OF drop EXACT-OCCUPIED SOME-EXACT ENDOF
-      precondition-changed OF
-         drop construct exact-copy-outcome destination-changed
-         SOME-EXACT
-      ENDOF
-   ;MATCH ;
-
-\ A stage's answer; none: staged, to install.
-: STAGE-ANSWER
-   ( LOCAL:stage-outcome<n> -- option<exact-copy-outcome> )
-   MATCH LOCAL:stage-outcome
-      staged OF drop NO-EXACT ENDOF
-      already-staged OF drop NO-EXACT ENDOF
-      content-changed OF
-         drop construct exact-copy-outcome content-changed SOME-EXACT
-      ENDOF
-      destination-occupied OF drop EXACT-OCCUPIED SOME-EXACT ENDOF
-   ;MATCH ;
-
-: REQUIRED
-   ( option<exact-copy-outcome> MODEL:path -- exact-copy-outcome )
-   {: path :}
-   MATCH option
-      none OF
-         path s" verified exact Dropbox download disappeared" INVALID
-      ENDOF
-      some OF ENDOF
-   ;MATCH ;
-
-\ Installs t's verified stage of c; nothing at t is replaced.
-: INSTALLED-COPY
-   ( fd str MODEL:path DROPBOX:hash ^ARENA:arena
-     -- option<exact-copy-outcome> )
-   {: root:fd r:str t c ar :}
-   root r t MODEL:PATH>STR c NO-CONTENT ar
-   LOCAL:INSTALL-DOWNLOAD-AT INSTALL-ANSWER ;
-
-: STAGED-COPY
-   ( ^link fd str MODEL:path MODEL:path MODEL:remote ^ARENA:arena
-     -- option<exact-copy-outcome> )
-   {: k root:fd r:str t path rem ar :}
-   k root r t path rem NO-LEASE s" " ar
-   STAGE-EXACT-DOWNLOAD-FOR-AT STAGE-ANSWER ;
-
-: STAGED-THEN-INSTALLED
-   ( ^link fd str MODEL:path MODEL:path MODEL:remote ^ARENA:arena
-     -- exact-copy-outcome )
-   {: k root:fd r:str t path rem ar :}
-   rem MODEL-REMOTE:UNMAKE {: c v :}
-   k root r t path rem ar STAGED-COPY MATCH option
-      none OF root r t c ar INSTALLED-COPY path REQUIRED ENDOF
-      some OF ENDOF
-   ;MATCH ;
-
-\ Rust's ensure_exact_copy_at: the remote's exact bytes at target t,
-\ staged when no verified stage is there, its transfer shown as path.
-: EXACT-COPY-AT
-   ( ^link fd str MODEL:path MODEL:path MODEL:remote ^ARENA:arena
-     -- exact-copy-outcome )
-   {: k root:fd r:str t path rem ar :}
-   rem MODEL-REMOTE:UNMAKE {: c v :}
-   root r t c ar INSTALLED-COPY MATCH option
-      none OF k root r t path rem ar STAGED-THEN-INSTALLED ENDOF
-      some OF ENDOF
-   ;MATCH ;
 
 \ A blocked download's reason: its blockage's variant in snake case,
 \ with an unavailable download's status or a rejection's tag.
@@ -1961,37 +1882,212 @@ public
 
 private
 
-: DROP-EXACT ( exact-copy-outcome -- ) drop ;
+\ One remote copy: the remote's bytes at target t, its transfer shown as
+\ path, whose verified stage it may take; writable: t ends writable, not
+\ read-only; held: the codes that say t's own name is held, an answer,
+\ not a failure; reason: why Dropbox refused the download; answer: the
+\ copy's outcome once the machine ends.
+STRUCTURE copying DERIVE addr
+   FIELD link ^link
+   FIELD root fd
+   FIELD root-path str
+   FIELD target MODEL:path
+   FIELD path MODEL:path
+   FIELD remote MODEL:remote
+   FIELD writable bool
+   FIELD held [ n n -- bool ]
+   FIELD reason MODEL:blockage
+   FIELD answer exact-copy-outcome
+   FIELD arena ^ARENA:arena
+;STRUCTURE
+
+ARENA COPYINGS copying
+
+ENUM copy-state
+   own reusing fetching installing
+   ready taken stage-held unverified refused lost ;ENUM
+\ What installing a verified stage at the copy's name came to: placed,
+\ no stage to install, other bytes at the stage's name, other bytes at
+\ the copy's name, or an entry there Omabox cannot replace.
+ENUM copy-input placed missing held changed occupied ;ENUM
+\ What staging the download came to: staged, bytes that did not verify,
+\ other bytes at the stage's name, Dropbox refusing it for its path, or
+\ an entry at the copy's name Omabox cannot replace.
+ENUM fetch-input staged mismatch held refused occupied ;ENUM
+
+: NEW-COPYING
+   ( ^link fd str MODEL:path MODEL:path MODEL:remote bool
+     [ n n -- bool ] ^ARENA:arena -- ^copying )
+   {: k root:fd r:str t path rem w:bool held ar :}
+   ar COPYINGS-NEW {: x :}
+   k x COPYING-LINK ! root x COPYING-ROOT ! r x COPYING-ROOT-PATH !
+   t x COPYING-TARGET ! path x COPYING-PATH ! rem x COPYING-REMOTE !
+   w x COPYING-WRITABLE ! held x COPYING-HELD !
+   ar x COPYING-ARENA ! x ;
+
+: COPY-WANT ( ^copying -- DROPBOX:hash )
+   COPYING-REMOTE @ MODEL-REMOTE:UNMAKE {: c v :} c ;
+
+\ Whether code, thrown about t's own name, says the copy's name is held.
+: HELD-AT? ( n ^copying -- bool )
+   {: code:n x :}
+   code FS:ERRNO x COPYING-HELD @ execute ;
+
+: DROP-INSTALLED-COPY ( LOCAL:install-outcome -- ) drop ;
+
+\ The verified stage staged for src installed as the copy.
+: INSTALL-FROM ( ^copying str -- LOCAL:install-outcome )
+   {: x src:str :}
+   x COPYING-ROOT @ x COPYING-ROOT-PATH @ src
+   x COPYING-TARGET @ MODEL:PATH>STR x COPY-WANT
+   x COPYING-WRITABLE @ x COPYING-ARENA @ LOCAL:INSTALL-COPY-AT ;
+
+: INSTALL-INPUT ( LOCAL:install-outcome -- copy-input )
+   MATCH LOCAL:install-outcome
+      installed OF construct copy-input placed ENDOF
+      already-installed OF construct copy-input placed ENDOF
+      download-required OF construct copy-input missing ENDOF
+      stage-destination-occupied OF drop construct copy-input held ENDOF
+      precondition-changed OF drop construct copy-input changed ENDOF
+   ;MATCH ;
+
+: COPY-FROM ( ^copying str -- copy-input )
+   {: x src:str :}
+   LOCAL-INSTALL--OUTCOME:INSTALLED
+   [: DROP-INSTALLED-COPY x src INSTALL-FROM ;] catch {: code:n :}
+   code 0= if INSTALL-INPUT exit then
+   drop code x HELD-AT? if construct copy-input occupied exit then
+   code throw ;
+
+\ The verified stage staged for the copy's own name, installed.
+: OWN ( ^copying -- copy-input )
+   {: x :}
+   x x COPYING-TARGET @ MODEL:PATH>STR COPY-FROM ;
+
+\ The verified stage the path's download left beside the copy, installed.
+: REUSE ( ^copying -- copy-input )
+   {: x :}
+   x x COPYING-PATH @ MODEL:PATH>STR COPY-FROM ;
+
+: NO-COPY-STAGE ( -- LOCAL:stage-outcome<n> )
+   s" " LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED ;
+: DROP-COPY-STAGE ( LOCAL:stage-outcome<n> -- ) drop ;
+
+: STAGE-COPY ( ^copying -- LOCAL:stage-outcome<n> )
+   {: x :}
+   x COPYING-LINK @ x COPYING-ROOT @ x COPYING-ROOT-PATH @
+   x COPYING-TARGET @ x COPYING-PATH @ x COPYING-REMOTE @ NO-LEASE s" "
+   x COPYING-ARENA @ STAGE-EXACT-DOWNLOAD-FOR-AT ;
+
+: STAGE-INPUT ( LOCAL:stage-outcome<n> -- fetch-input )
+   MATCH LOCAL:stage-outcome
+      staged OF drop construct fetch-input staged ENDOF
+      already-staged OF drop construct fetch-input staged ENDOF
+      content-changed OF drop construct fetch-input mismatch ENDOF
+      destination-occupied OF drop construct fetch-input held ENDOF
+   ;MATCH ;
+
+\ A failed download: a code that says t's name is held is occupied; one
+\ DOWNLOAD-BLOCKAGE classifies is refused; any other passes up.
+: FETCH-FAILED ( n ^copying -- fetch-input )
+   {: code:n x :}
+   code x HELD-AT? if construct fetch-input occupied exit then
+   code x COPYING-LINK @ DOWNLOAD-BLOCKAGE MATCH option
+      none OF code throw ENDOF
+      some OF x COPYING-REASON ! construct fetch-input refused ENDOF
+   ;MATCH ;
+
+\ The remote's bytes downloaded into the copy's own stage.
+: FETCH-COPY ( ^copying -- fetch-input )
+   {: x :}
+   NO-COPY-STAGE [: DROP-COPY-STAGE x STAGE-COPY ;] catch {: code:n :}
+   code 0= if STAGE-INPUT exit then
+   drop code x FETCH-FAILED ;
+
+: COPY-ANSWERED ( exact-copy-outcome ^copying -- ) COPYING-ANSWER ! ;
+
+: ANSWER-READY ( ^copying -- )
+   construct exact-copy-outcome ready swap COPY-ANSWERED ;
+: ANSWER-TAKEN ( ^copying -- )
+   construct exact-copy-outcome destination-changed swap COPY-ANSWERED ;
+: ANSWER-STAGE-HELD ( ^copying -- )
+   construct exact-copy-outcome stage-occupied swap COPY-ANSWERED ;
+: ANSWER-UNVERIFIED ( ^copying -- )
+   construct exact-copy-outcome content-changed swap COPY-ANSWERED ;
+: ANSWER-REFUSED ( ^copying -- )
+   {: x :}
+   x COPYING-REASON @ construct exact-copy-outcome blocked
+   x COPY-ANSWERED ;
+: COPY-LOST ( ^copying -- )
+   COPYING-PATH @ s" verified exact Dropbox download disappeared" INVALID ;
+
+\ One remote copy, after formal/RemoteCopy.tla: a verified stage staged
+\ for the copy's own name is installed; else the one the path's download
+\ left beside it, by a rename in their directory; else the bytes are
+\ downloaded into the copy's own stage and installed. An entry at the
+\ copy's name is never replaced.
+FSM:DEFINE REMOTE-COPY ( ^copying ) copy-state copy-input
+   IN own  OWN
+      placed    -  >ready
+      missing   -  >reusing
+      held      -  >stage-held
+      changed   -  >taken
+      occupied  -  >taken
+   IN reusing  REUSE
+      placed    -  >ready
+      missing   -  >fetching
+      held      -  >fetching
+      changed   -  >taken
+      occupied  -  >taken
+   IN fetching  FETCH-COPY ( fetch-input )
+      staged    -  >installing
+      mismatch  -  >unverified
+      held      -  >stage-held
+      refused   -  >refused
+      occupied  -  >taken
+   IN installing  OWN
+      placed    -  >ready
+      missing   -  >lost
+      held      -  >stage-held
+      changed   -  >taken
+      occupied  -  >taken
+   FINAL ready       ANSWER-READY
+   FINAL taken       ANSWER-TAKEN
+   FINAL stage-held  ANSWER-STAGE-HELD
+   FINAL unverified  ANSWER-UNVERIFIED
+   FINAL refused     ANSWER-REFUSED
+   FINAL lost        COPY-LOST
+;DEFINE
+
+: COPY-RUN ( ^copying -- exact-copy-outcome )
+   {: x :}
+   construct copy-state own
+   begin x swap REMOTE-COPY-STEP until drop
+   x COPYING-ANSWER @ ;
+
+: NEVER-HELD ( n n -- bool ) 2drop false ;
 
 public
 
-\ Rust's materialize_remote_copy_at: the remote's bytes at t, shown as path,
-\ never over a file; blocked by any failure DOWNLOAD-BLOCKAGE classifies.
+\ Rust's materialize_remote_copy_at: the remote's bytes at t, shown as
+\ path, or path's verified stage beside t, renamed; writable, never over
+\ a file; blocked by any failure DOWNLOAD-BLOCKAGE classifies.
 : MATERIALIZE-REMOTE-COPY-AT
    ( ^link fd str MODEL:path MODEL:path MODEL:remote ^ARENA:arena
      -- exact-copy-outcome )
    {: k root:fd r:str t path rem ar :}
-   EXACT-READY [: DROP-EXACT k root r t path rem ar
-      EXACT-COPY-AT ;] catch {: code:n :}
-   code 0= if exit then
-   drop code k DOWNLOAD-BLOCKAGE MATCH option
-      none OF code throw ENDOF
-      some OF construct exact-copy-outcome blocked ENDOF
-   ;MATCH ;
+   k root r t path rem true ['] NEVER-HELD ar NEW-COPYING COPY-RUN ;
 
-\ Rust's materialize_remote_conflict_at, below the open root at path r;
-\ an occupied name or a blocked download blocks it.
+\ Rust's materialize_remote_conflict_at, below the open root at path r,
+\ read-only; an occupied name or a blocked download blocks it.
 : MATERIALIZE-REMOTE-CONFLICT-AT
    ( ^link fd str MODEL:path MODEL:remote ^ARENA:arena
      -- copy-outcome )
    {: k root:fd r:str path rem ar :}
    path rem ar REMOTE-COPY-PATH {: copy :}
-   COPY-OCCUPIED [: DROP-COPY [: k root r copy path rem ar
-         MATERIALIZE-REMOTE-COPY-AT path >CONFLICT-OUTCOME ;]
-      ['] NAME-HELD? LOCAL:WITH-CONVERTS ;] catch {: code:n :}
-   code 0= if exit then
-   drop code FS:ERRNO NAME-HELD? if COPY-OCCUPIED exit then
-   code throw ;
+   k root r copy path rem false ['] NAME-HELD? ar NEW-COPYING {: x :}
+   [: x COPY-RUN path >CONFLICT-OUTCOME ;]
+   ['] NAME-HELD? LOCAL:WITH-CONVERTS ;
 
 
 \ ---- remote replay -------------------------------------------------

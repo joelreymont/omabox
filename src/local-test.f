@@ -35,7 +35,10 @@
 \ installed and read back at its target; that a restart empties its
 \ partial, keeps a swapped replacement and fails in a slot directory it
 \ cannot search; that slots lease through a symlinked state home; then
-\ local.rs's install tests, each install outcome, an install a directory
+\ local.rs's install tests, each install outcome, a stage installed as
+\ a read-only copy beside it, never over a file, released and sealed
+\ after an install interrupted after its rename or its release, and
+\ a copy installed already dropping its own stage, an install a directory
 \ or an unreadable file at its stage's name blocks, each retirement of
 \ a download stage, each replacement
 \ preparation, that a complete disposable download closes its parent,
@@ -272,7 +275,7 @@ private
    root t false OPEN-PARENT MATCH option
       none OF E-CHANGED throw ENDOF
       some OF PARENT-DIR-UNMAKE {: f:fd name:str rel:str :}
-         [: f name rel r t want ar INSTALL-OF w RENAME-MUTATED ;]
+         [: f name rel r t t want true ar INSTALL-OF w RENAME-MUTATED ;]
          [: f DISCARD ;] finally
       ENDOF
    ;MATCH ;
@@ -299,7 +302,7 @@ private
    f t s" inspect test download" STAT-FD t FILE-FINGERPRINT
    {: print:MODEL:fingerprint :}
    f print VERIFIED-DOWNLOAD-STAGE-MAKE {: s:verified-download-stage :}
-   [: s dir t t want ar SYNC-RENAMED-DOWNLOAD ;]
+   [: s dir t t t want true ar SYNC-RENAMED-DOWNLOAD ;]
    E-CHANGED TTHROWSQ ;
 
 public
@@ -3496,7 +3499,7 @@ variable REMAINING
    f LOCAL:DOWNLOAD-PARTIAL-XATTR XATTR:ERASE f FD:SYNC ;
 
 : SYNC-INSTALLED ( fd -- )
-   TARGET TARGET INSTALLED-BYTES HASH-OF AR @
+   TARGET TARGET INSTALLED-BYTES HASH-OF true AR @
    LOCAL:SYNC-INSTALLED-DOWNLOAD ;
 
 : CLEANED-UP ( fd fd -- )
@@ -3529,12 +3532,102 @@ variable REMAINING
    TARGET s" remote" PUT-FILE
    root TARGET OPEN-AT {: f:fd :}
    [: f root TARGET WANT AR @ LOCAL:RENAMED-WITHOUT-MARKER
-      root TARGET TARGET WANT AR @ LOCAL:SYNC-INSTALLED-DOWNLOAD ;]
+      root TARGET TARGET WANT true AR @ LOCAL:SYNC-INSTALLED-DOWNLOAD ;]
    [: f FS:CLOSE-DIR ;] finally ;
 
 : RENAMED-DOWNLOAD-REQUIRES-ITS-OWNERSHIP-MARKER ( -- )
    s" renamed_download_requires_its_ownership_marker" T-LABEL
    [: UNMARKED-RENAME ;] IN-CASE-DIR ;
+
+: COPY-NAME ( -- str ) s" copy.txt" ;
+
+\ INSTALL-COPY-AT of "remote" staged for src at COPY-NAME, read-only.
+: COPY-INSTALL ( fd str -- str str )
+   {: root:fd src:str :}
+   root ROOT$ src COPY-NAME WANT false AR @ LOCAL:INSTALL-COPY-AT INSTALL$ ;
+
+\ The copy holds "remote", read-only to its owner alone and unmarked.
+: SEALED-COPY ( fd -- )
+   {: root:fd :}
+   COPY-NAME READ$ s" remote" T$=
+   root COPY-NAME OPEN-AT {: f:fd :}
+   [: f TARGET WANT AR @ LOCAL:STAGE-MARKER COPY-NAME LOCAL:MARKER$
+      s" missing" T$=
+      f PARTIAL? TFALSE
+      f FS:FD-STAT FS:STAT-MODE@ $1FF and $100 T= ;]
+   [: f FS:CLOSE-DIR ;] finally ;
+
+\ Unmarks the file at f and leaves it writable, as a release does.
+: UNMARK-WRITABLE ( fd -- )
+   {: f:fd :}
+   f FS:MODE-PRIVATE-FILE FD:MODE!
+   f LOCAL:DOWNLOAD-PARTIAL-XATTR XATTR:ERASE
+   f LOCAL:DOWNLOAD-STAGE-XATTR XATTR:ERASE f FD:SYNC ;
+
+\ The copy as a crash leaves it: still marked as TARGET's stage after
+\ the rename, or, with unmarked, unmarked and writable after its release
+\ and before it is made read-only.
+: INTERRUPT-COPY ( fd bool -- )
+   {: root:fd unmarked:bool :}
+   root COPY-NAME OPEN-AT {: f:fd :}
+   [: unmarked if f UNMARK-WRITABLE then
+      f TARGET WANT AR @ LOCAL:STAGE-MARKER COPY-NAME LOCAL:MARKER$
+      unmarked if s" missing" T$= else s" expected" T$= then
+      f FS:FD-STAT FS:STAT-MODE@ $1FF and
+      unmarked if FS:MODE-PRIVATE-FILE T= else $100 T= then ;]
+   [: f FS:CLOSE-DIR ;] finally ;
+
+\ TARGET's stage renamed to the copy's name, its install interrupted
+\ as INTERRUPT-COPY leaves it, is sealed when the copy is installed
+\ again from its own stage, as OWN installs it.
+: INTERRUPTED-COPY ( fd bool -- )
+   {: root:fd unmarked:bool :}
+   root TARGET STAGE-REMOTE
+   root TARGET STAGE-NAME$ root COPY-NAME FS:TRY-RENAME-AT TTRUE
+   root unmarked INTERRUPT-COPY
+   root COPY-NAME COPY-INSTALL s" " T$= s" already-installed" T$=
+   root SEALED-COPY
+   root COPY-NAME COPY-INSTALL s" " T$= s" already-installed" T$=
+   root SEALED-COPY ;
+
+\ The copy's own stage beside a copy that holds its bytes already is
+\ removed when the copy is installed from it, and the copy sealed.
+: OWN-STAGE-BESIDE-COPY ( fd -- )
+   {: root:fd :}
+   root COPY-NAME STAGE-REMOTE
+   COPY-NAME s" remote" PUT-FILE
+   COPY-NAME STAGE-NAME$ AT FS:TRY-STAT TTRUE
+   root COPY-NAME COPY-INSTALL s" " T$= s" already-installed" T$=
+   root SEALED-COPY
+   COPY-NAME STAGE-NAME$ AT FS:TRY-STAT TFALSE ;
+
+\ TARGET's stage becomes the copy, read-only, which is then installed;
+\ with it gone no stage is left, and other bytes at its name are kept.
+: STAGE-BECOMES-COPY ( fd -- )
+   {: root:fd :}
+   root TARGET STAGE-REMOTE
+   root TARGET COPY-INSTALL s" " T$= s" installed" T$=
+   root SEALED-COPY
+   TARGET STAGE-NAME$ AT FS:TRY-STAT TFALSE
+   root TARGET COPY-INSTALL s" " T$= s" already-installed" T$=
+   COPY-NAME AT FS:REMOVE-FILE
+   root TARGET COPY-INSTALL s" " T$= s" download-required" T$=
+   COPY-NAME s" other bytes" PUT-FILE
+   root TARGET STAGE-REMOTE
+   root TARGET COPY-INSTALL
+   s" other bytes" IDENTITY T$= s" precondition-changed" T$=
+   COPY-NAME READ$ s" other bytes" T$=
+   TARGET STAGE-NAME$ READ$ s" remote" T$= ;
+
+: A-STAGE-INSTALLS-AS-A-READ-ONLY-COPY ( -- )
+   s" a stage installs as a read-only copy, never over a file" T-LABEL
+   [: STAGE-BECOMES-COPY ;] IN-CASE-DIR
+   s" a copy interrupted after its rename is released" T-LABEL
+   [: false INTERRUPTED-COPY ;] IN-CASE-DIR
+   s" a copy interrupted after its release is made read-only" T-LABEL
+   [: true INTERRUPTED-COPY ;] IN-CASE-DIR
+   s" a copy installed already drops its own stage" T-LABEL
+   [: OWN-STAGE-BESIDE-COPY ;] IN-CASE-DIR ;
 
 \ An absent target: none staged, then installed and installed again.
 : ABSENT-OUTCOMES ( fd -- )
@@ -4297,6 +4390,7 @@ FS:PATHZ-CAP BUFFER: SLOT-FILE-BUF
    INSTALL-REJECTS-STAGE-CHANGED-THROUGH-A-PREEXISTING-WRITER
    INSTALLED-DOWNLOAD-CLEANUP-REPLAYS-AROUND-PARTIAL-MARKER-REMOVAL
    RENAMED-DOWNLOAD-REQUIRES-ITS-OWNERSHIP-MARKER
+   A-STAGE-INSTALLS-AS-A-READ-ONLY-COPY
    EACH-INSTALL-OUTCOME-IS-REACHED
    OBJECT-AT-STAGE-NAME-BLOCKS-ONLY-ITS-INSTALL
    EACH-STAGE-RETIREMENT-IS-REACHED
