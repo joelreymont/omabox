@@ -1006,13 +1006,6 @@ ARENA UPLOADS DROPBOX:upload
 
 : CLIENT ( ^link -- ^DROPBOX:client ) REPLAY-LINK:CLIENT @ ;
 
-: COPIED ( str ^ARENA:arena -- str )
-   {: s:str ar :}
-   s str> {: a:^ u:n :}
-   ar u ARENA:ALLOC drop {: dst:^ :}
-   a dst u BYTE-COPY
-   dst u >str ;
-
 : IS? ( DROPBOX:error DROPBOX:error -- bool ) DROPBOX-ERROR:EQ ;
 
 
@@ -1213,8 +1206,8 @@ public
 \ The entry's file, its strings copied into the arena.
 : REMOTE-OF ( ^DROPBOX:entry ^ARENA:arena -- MODEL:remote )
    {: e ar :}
-   e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$ ar COPIED DROPBOX:>HASH
-   e DROPBOX-ENTRY:REV @ SPAN:$ ar COPIED DROPBOX:>REV
+   e DROPBOX-ENTRY:CONTENT-HASH @ SPAN:$ ar ARENA:COPY DROPBOX:>HASH
+   e DROPBOX-ENTRY:REV @ SPAN:$ ar ARENA:COPY DROPBOX:>REV
    MODEL-REMOTE:MAKE ;
 
 private

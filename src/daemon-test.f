@@ -193,7 +193,7 @@ TYPED-VARIABLE LINK REPLAY:link
 : LOCAL-ROOT-FAILURES-NAME-THEIR-OWN-CAUSE ( ^ARENA:arena -- )
    {: ar :}
    s" local_root_failures_name_their_own_cause" T-LABEL
-   s" daemon-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d:str :}
+   s" daemon-test" FS:MKTEMP-DIR ar ARENA:COPY {: d:str :}
    d s" Dropbox" ar TEST-CLIENT:INSIDE {: root:str :}
    root FS:MAKE-DIR
    d s" journal.sqlite3" ar TEST-CLIENT:INSIDE JOURNAL:OPEN {: j :}
@@ -270,7 +270,7 @@ variable DROPPED
 
 \ A case's directory under TMPDIR.
 : CASE-DIR ( ^ARENA:arena -- str )
-   s" daemon-test" FS:MKTEMP-DIR swap TEST-CLIENT:COPIED ;
+   s" daemon-test" FS:MKTEMP-DIR swap ARENA:COPY ;
 
 \ The status DIR/omabox/status.json holds the text t.
 : STATUS-HAS ( str str ^ARENA:arena -- )
@@ -836,9 +836,9 @@ private
 \ A case's directory and the journal opened in it.
 : CASE-JOURNAL ( ^ARENA:arena -- str JOURNAL:journal )
    {: ar :}
-   s" daemon-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d:str :}
+   s" daemon-test" FS:MKTEMP-DIR ar ARENA:COPY {: d:str :}
    SB-RESET d SB-APPEND s" /journal.sqlite3" SB-APPEND
-   d SB$ ar TEST-CLIENT:COPIED JOURNAL:OPEN ;
+   d SB$ ar ARENA:COPY JOURNAL:OPEN ;
 
 : CASE-GONE ( str JOURNAL:journal -- )
    JOURNAL:CLOSE FS:REMOVE-TREE ;

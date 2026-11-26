@@ -1088,14 +1088,6 @@ STRUCTURE casing
    d str> nip 0<> if s"  `" LOG:TEXT+ d LOG:TEXT+ s" `" LOG:TEXT+ then
    LOG:;LINE E-LISTING throw ;
 
-: SAVED ( str ^ARENA:arena -- str )
-   {: s:str ar :}
-   s str> {: p:^ u:n :}
-   u 0= if s" " exit then
-   ar u ARENA:ALLOC drop {: dst:^ :}
-   p dst u BYTE-COPY
-   dst u >str ;
-
 \ The valid UTF-8 bytes lowercased, in the arena.
 : LOWERED ( str ^ARENA:arena -- str )
    {: s:str ar :}
@@ -1165,7 +1157,7 @@ STRUCTURE casing
    l ks l str> nip PART {: k:str :}
    d ps d str> nip PART {: p:str :}
    k p FITTING? 0= if d BAD-PATH then
-   k ar SAVED MODEL:>KEY p ar SAVED MODEL:>PATH ;
+   k ar ARENA:COPY MODEL:>KEY p ar ARENA:COPY MODEL:>PATH ;
 
 : OWN-ENTRY? ( ^DROPBOX:entry listing-root -- bool )
    {: e root :}
@@ -3080,7 +3072,7 @@ ARENA PLANNINGS planning
    kp kp pl ar KNOWN-DECISION pl COUNTED? if
       1 pl PLANNING-NOOP-COUNT +! exit
    then
-   k KEY-BYTES pl ARENA-OF SAVED MODEL:>KEY kept VEC:PUSH ! ;
+   k KEY-BYTES pl ARENA-OF ARENA:COPY MODEL:>KEY kept VEC:PUSH ! ;
 
 \ The scratch arena first, as ARENA:WITH passes it; the settled keys the
 \ journal skips are counted no-ops. None of them is excluded: a

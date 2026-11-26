@@ -118,7 +118,7 @@ TYPED-VARIABLE SUBJECT-ARENA ^ARENA:arena
 
 : SCRATCH ( ^ARENA:arena -- str )
    {: ar :}
-   s" journal-test" FS:MKTEMP-DIR ar COPIED ;
+   s" journal-test" FS:MKTEMP-DIR ar ARENA:COPY ;
 
 
 \ dir/name.
@@ -2030,7 +2030,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
 \ The n-th file's path: "1000" on, in byte order.
 : MANY-PATH ( n ^ARENA:arena -- str )
    {: n ar :}
-   n 1000 + FMT:INT$ ar COPIED ;
+   n 1000 + FMT:INT$ ar ARENA:COPY ;
 
 \ Each file with its hash cached.
 : MANY-STORED ( journal local-root-binding ^ARENA:arena -- )
@@ -2761,7 +2761,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
    ( journal [ ^VEC:vector<MODEL:local-record> -- bool ] ^ARENA:arena
      -- str )
    {: j v ar :}
-   SB-RESET j ar v EACH-LOCAL-COLLISION SB$ ar COPIED ;
+   SB-RESET j ar v EACH-LOCAL-COLLISION SB$ ar ARENA:COPY ;
 
 : KEY-BEFORE? ( str str ^ARENA:arena -- bool )
    {: a:str b:str ar :}
@@ -2906,7 +2906,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
 : KNOWN-AT$ ( journal str ^ARENA:arena -- str )
    {: j k:str ar :}
    SB-RESET j k ar CANONICAL ar KNOWN-PATH-AT KNOWN-PUT
-   SB$ ar COPIED ;
+   SB$ ar ARENA:COPY ;
 
 \ The fixture's keys in byte order: "a.txt" before "a/b" ('.' before
 \ '/'), and not the completed plan.
@@ -2922,7 +2922,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
    s" live - - 0 - empty live|" SB-APPEND
    s" local - local 1 - empty -|" SB-APPEND
    s" pair - Pair 2 - empty -|" SB-APPEND
-   SB$ ar COPIED ;
+   SB$ ar ARENA:COPY ;
 
 \ Each held key once, in byte order, with its least local path; at one
 \ key the same, and only the subtree where nothing holds the key.
@@ -2933,7 +2933,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
    p OPEN {: j :}
    j >CONNECTION KNOWN-FIXTURE SQLITE:EXEC
    ar KNOWN-WANT {: w:str :}
-   j [: KNOWN-VISITS ;] ARENA:WITH ar COPIED w T$=
+   j [: KNOWN-VISITS ;] ARENA:WITH ar ARENA:COPY w T$=
    j s" Pair" ar KNOWN-AT$ s" pair - Pair 2 - empty -|" T$=
    j s" a" ar KNOWN-AT$ s" a - - 0 A occupied -|" T$=
    j s" gone" ar KNOWN-AT$ s" gone - - 0 - empty -|" T$=
@@ -3848,7 +3848,7 @@ variable CRAFT
 \ The stage-occupied blockage's stored JSON, copied into the arena.
 : BLOCKAGE-JSON ( ^ARENA:arena ^JSON:writer -- str )
    {: ar w :}
-   MODEL-BLOCKAGE:STAGE-OCCUPIED w ENCODE-BLOCKAGE ar COPIED ;
+   MODEL-BLOCKAGE:STAGE-OCCUPIED w ENCODE-BLOCKAGE ar ARENA:COPY ;
 
 : PLAN-STATUS-DECODING-NAMES-THE-STATE-IT-REJECTS ( ^ARENA:arena -- )
    {: ar :}

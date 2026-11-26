@@ -135,22 +135,15 @@ variable CHANGES
 
 \ ---- paths, laid in the suite's arena
 
-: COPIED ( str ^ARENA:arena -- str )
-   {: s:str ar :}
-   s str> {: a:^ u:n :}
-   ar u ARENA:ALLOC {: d:^ du:n :}
-   a d u BYTE-COPY
-   d du >str ;
-
 \ dir/name.
 : INSIDE ( str str ^ARENA:arena -- str )
    {: d n:str ar :}
    SB-RESET d SB-APPEND s" /" SB-APPEND n SB-APPEND
-   SB$ ar COPIED ;
+   SB$ ar ARENA:COPY ;
 
 \ A new directory under TMPDIR.
 : TEMPORARY ( ^ARENA:arena -- str )
-   s" omabox-test-" FS:MKTEMP-DIR swap COPIED ;
+   s" omabox-test-" FS:MKTEMP-DIR swap ARENA:COPY ;
 
 \ The file's text, empty where there is no file.
 : FILE-TEXT ( str -- str )
@@ -200,7 +193,7 @@ variable CHANGES
 
 : ACCEPTS-IN ( command ^ARENA:arena -- )
    {: c ar :}
-   c COMMAND$ ar COPIED PARSED COMMAND$ T$= ;
+   c COMMAND$ ar ARENA:COPY PARSED COMMAND$ T$= ;
 
 : ACCEPTS ( command -- ) {: c :} [: c swap ACCEPTS-IN ;] ARENA:WITH ;
 
@@ -928,8 +921,8 @@ variable CHANGES
 \ Rust's service_trace: the service log and the unit state.
 : TRACE ( str ^ARENA:arena -- str str )
    {: d ar :}
-   d s" service.log" ar INSIDE FILE-TEXT ar COPIED
-   d s" unit-state" ar INSIDE FILE-TEXT ar COPIED ;
+   d s" service.log" ar INSIDE FILE-TEXT ar ARENA:COPY
+   d s" unit-state" ar INSIDE FILE-TEXT ar ARENA:COPY ;
 
 : NO-LEFTOVERS ( ^ARENA:arena -- ^VEC:vector<STALE:leftover> )
    ARENA:ALLOCATOR 0 [type] STALE:leftover VEC:NEW ;
@@ -1303,7 +1296,7 @@ variable CHANGES
    second FS:MAKE-DIR
    x ar PATHS-OF {: paths :}
    paths ar CONFIG:CONFIG-FILE CONFIG:ABS-PATH>STR {: file :}
-   file FILE-TEXT ar COPIED {: original :}
+   file FILE-TEXT ar ARENA:COPY {: original :}
    paths CONFIG:LOCK {: held :}
    d s" inactive" ar FAKED {: c log :}
    second x c d ar SET {: code:n e:str :}
@@ -1568,7 +1561,7 @@ variable CHANGES
    {: l ar :}
    SB-RESET S\"   show) printf '%s\\n' failed ;;\n" SB-APPEND
    s"   start) exec flock -n " SB-APPEND l QUOTED+
-   S\"  true ;;\n" SB-APPEND SB$ ar COPIED ;
+   S\"  true ;;\n" SB-APPEND SB$ ar ARENA:COPY ;
 
 : SETUP-RELEASES-THE-LOCK-BEFORE-STARTING-A-FAILED-SERVICE
    ( ^ARENA:arena -- )
@@ -1609,7 +1602,7 @@ variable CHANGES
 \ "the command failed unexpectedly (", LOG:CODE+ of E-FS-IO, ")".
 : UNEXPECTED-LINE ( ^ARENA:arena -- str )
    {: ar :}
-   s" the command failed unexpectedly (" ar KEPT
+   s" the command failed unexpectedly (" ar ARENA:COPY
    E-FS-IO FMT:INT$ ar FOLLOWED s"  E-FS-IO: " ar FOLLOWED
    E-FS-IO ERROR:TEXT$ ar FOLLOWED s" )" ar FOLLOWED ;
 

@@ -174,13 +174,6 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
 
 \ ---- strings and paths
 
-: COPY ( str ^ARENA:arena -- str )
-   {: s ar :}
-   s str> {: a:^ u:n :}
-   ar u ARENA:ALLOC drop {: d:^ :}
-   a d u BYTE-COPY
-   d u >str ;
-
 : ABSOLUTE? ( str -- bool )
    str> {: a:^ u:n :}
    u 0= if false exit then
@@ -260,7 +253,7 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
 \ An absolute name replaces the base.
 : JOIN ( abs-path str ^ARENA:arena -- abs-path )
    {: base name ar :}
-   name ABSOLUTE? if name ar COPY >ABS-PATH exit then
+   name ABSOLUTE? if name ar ARENA:COPY >ABS-PATH exit then
    base ABS-PATH>STR str> {: b:^ bu:n :}
    name str> {: n:^ nu:n :}
    b bu SEP {: sep:n :}
@@ -460,7 +453,7 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
    s FS:>PATHZ ROW FS:PATHZ-CAP realpath {: u:n :}
    u -2 = if FS:ENAMETOOLONG FS:CAUSE! OPTION:NONE exit then
    u 0 < if FFI:ERRNO FS:CAUSE! OPTION:NONE exit then
-   ROW u >str ar COPY >ABS-PATH OPTION:SOME ;
+   ROW u >str ar ARENA:COPY >ABS-PATH OPTION:SOME ;
 
 public
 
@@ -470,7 +463,7 @@ public
    s PASSABLE? 0= if OPTION:NONE exit then
    s FS:>PATHZ ROW FS:PATHZ-CAP readlink {: u:n :}
    u 0 < if OPTION:NONE exit then
-   ROW u >str ar COPY OPTION:SOME ;
+   ROW u >str ar ARENA:COPY OPTION:SOME ;
 
 private
 
@@ -1088,7 +1081,7 @@ ARENA READERS reader
    key BLANK-KEY? if EMPTY-APP-KEY then
    ar DOCUMENTS-NEW {: d :}
    p d DOCUMENT-SYNC-ROOT !
-   key ar COPY d DOCUMENT-DROPBOX-APP-KEY !
+   key ar ARENA:COPY d DOCUMENT-DROPBOX-APP-KEY !
    d ;
 
 public

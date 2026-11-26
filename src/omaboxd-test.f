@@ -207,7 +207,7 @@ ARENA FIXTURES fixture
 : NEW-FIXTURE ( ^ARENA:arena -- ^fixture )
    {: ar :}
    ar FIXTURES-NEW {: x :}
-   s" omaboxd-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d :}
+   s" omaboxd-test" FS:MKTEMP-DIR ar ARENA:COPY {: d :}
    d x FIXTURE-DIR !
    -1 x FIXTURE-ENDED !
    d s" config" ar TEST-CLIENT:INSIDE x FIXTURE-CONFIG-HOME !
@@ -430,7 +430,7 @@ ARENA FIXTURES fixture
 
 : SUITE ( ^ARENA:arena -- )
    {: ar :}
-   s" omaboxd-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d :}
+   s" omaboxd-test" FS:MKTEMP-DIR ar ARENA:COPY {: d :}
    d s" bin" ar MADE s" omaboxd" ar TEST-CLIENT:INSIDE {: bin :}
    [: bin BUILT? if bin CASES then ;]
    [: d FS:REMOVE-TREE ;] finally ;

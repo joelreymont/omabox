@@ -17,14 +17,6 @@ require src/lib/test-fsm.f
 
 package TEST-FORMAL
 
-\ The bytes, copied into the arena.
-: KEPT ( str ^ARENA:arena -- str )
-   {: s:str ar :}
-   s STR:len {: u:n :}
-   ar u ARENA:ALLOC drop {: b:^ :}
-   s STR:data b u BYTE-COPY
-   b u >str ;
-
 \ The file at the path, whole, in the arena.
 : FILE$ ( str ^ARENA:arena -- str )
    {: p:str ar :}
@@ -57,7 +49,7 @@ public
    t STR:len 0= if exit then
    SB-RESET s" formal/" SB-APPEND m SB-APPEND s" Table.tla" SB-APPEND
    SB$ ar FILE$ t T$=
-   s" test-formal" FS:MKTEMP-DIR ar KEPT {: d:str :}
+   s" test-formal" FS:MKTEMP-DIR ar ARENA:COPY {: d:str :}
    [: d m FOLLOWS-RUN ;] CMD:WITH-COMMAND
    d FS:REMOVE-TREE ;
 

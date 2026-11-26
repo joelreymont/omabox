@@ -125,13 +125,6 @@ private
    op l LEFTOVER-OPERATION !
    e l LEFTOVER-ERRNO ! ;
 
-: COPY ( str ^ARENA:arena -- str )
-   {: s ar :}
-   s str> {: a:^ u:n :}
-   ar u ARENA:ALLOC drop {: d:^ :}
-   a d u BYTE-COPY
-   d u >str ;
-
 \ directory/name laid in the arena, as Rust's Path::join lays it.
 : JOINED ( str str ^ARENA:arena -- str )
    {: dir name ar :}
@@ -176,7 +169,7 @@ private
    {: name p s names scratch :}
    name p s OWNER MATCH option
       none OF ENDOF
-      some OF DEAD? if name scratch COPY names VEC:PUSH ! then ENDOF
+      some OF DEAD? if name scratch ARENA:COPY names VEC:PUSH ! then ENDOF
    ;MATCH ;
 
 \ Each name a dead process owns, kept in the scratch arena.

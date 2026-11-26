@@ -148,14 +148,7 @@ $7FFFFFFFFFFFFFFF constant INT-MAX  \ SQLite's largest integer
 
 \ ---- stored rows ---------------------------------------------------
 
-: COPIED ( str ^ARENA:arena -- str )
-   {: s ar :}
-   s str> {: a:^ u:n :}
-   ar u ARENA:ALLOC drop {: dst:^ :}
-   a dst u BYTE-COPY
-   dst u >str ;
-
-: BYTES-PATH ( str ^ARENA:arena -- MODEL:path ) COPIED MODEL:>PATH ;
+: BYTES-PATH ( str ^ARENA:arena -- MODEL:path ) ARENA:COPY MODEL:>PATH ;
 
 \ Runs the statement's row, reset for the next.
 : RAN ( SQLITE:statement -- SQLITE:statement )
@@ -609,11 +602,11 @@ private
 
 : TEXT-COPY ( SQLITE:statement n ^ARENA:arena -- SQLITE:statement str )
    {: col ar :}
-   col SQLITE:COL-TEXT ar COPIED ;
+   col SQLITE:COL-TEXT ar ARENA:COPY ;
 
 : BLOB-COPY ( SQLITE:statement n ^ARENA:arena -- SQLITE:statement str )
    {: col ar :}
-   col SQLITE:COL-BLOB ar COPIED ;
+   col SQLITE:COL-BLOB ar ARENA:COPY ;
 
 
 \ ---- the Dropbox binding -------------------------------------------
@@ -1261,7 +1254,7 @@ private
 
 \ ---- stored columns ------------------------------------------------
 
-: BYTES-KEY ( str ^ARENA:arena -- MODEL:key ) COPIED MODEL:>KEY ;
+: BYTES-KEY ( str ^ARENA:arena -- MODEL:key ) ARENA:COPY MODEL:>KEY ;
 
 : ON-VECTOR ( R ^VEC:vector<u8> [ R ^JSON:writer -- S ] -- S )
    {: v body :}
@@ -1852,7 +1845,7 @@ $2F constant SLASH
    5 SQLITE:COL-INT {: ms :}  6 SQLITE:COL-INT {: mn :}
    7 SQLITE:COL-INT {: cs :}  8 SQLITE:COL-INT {: cn :}
    i s ms mn cs cn MODEL-FINGERPRINT:MAKE st STORED-PRINT !
-   2 SQLITE:COL-TEXT st STORED-GROUP @ COPIED st STORED-DIGEST !
+   2 SQLITE:COL-TEXT st STORED-GROUP @ ARENA:COPY st STORED-DIGEST !
    true st STORED-CACHED ! ;
 
 \ The observation of kind k the stream stands on, held.
@@ -1860,7 +1853,7 @@ $2F constant SLASH
    {: k st :}
    k st STORED-KIND !
    2 SQLITE:COL-NULL? if exit then
-   2 SQLITE:COL-TEXT st STORED-GROUP @ COPIED st STORED-CONTENT ! ;
+   2 SQLITE:COL-TEXT st STORED-GROUP @ ARENA:COPY st STORED-CONTENT ! ;
 
 : ROW-HELD ( SQLITE:statement ^stored -- SQLITE:statement )
    {: st :}
@@ -1895,7 +1888,7 @@ $2F constant SLASH
 : GROUP-READ ( SQLITE:statement ^stored -- SQLITE:statement )
    {: st :}
    st STORED-GROUP @ ARENA:RESET
-   0 SQLITE:COL-BLOB st STORED-GROUP @ COPIED st STORED-PATH !
+   0 SQLITE:COL-BLOB st STORED-GROUP @ ARENA:COPY st STORED-PATH !
    NO-KIND st STORED-KIND !  s" " st STORED-CONTENT !
    false st STORED-CACHED !
    begin st ROW-HELD st STEPPED st SAME-PATH? 0= until ;

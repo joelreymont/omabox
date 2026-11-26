@@ -43,13 +43,6 @@ public
 \ Ends the run: the case cannot go on.
 : FAILED ( str -- ) EXIT-STATUS:FAILURE die ;
 
-: COPIED ( str ^ARENA:arena -- str )
-   {: s:str ar :}
-   s str> {: a:^ u:n :}
-   ar u ARENA:ALLOC drop {: dst:^ :}
-   a dst u BYTE-COPY
-   dst u >str ;
-
 \ dir/name.
 : INSIDE ( str str ^ARENA:arena -- str )
    {: d:str s:str ar :}
@@ -155,7 +148,7 @@ public
 : NEW-LINK ( ^DROPBOX:client str ^ARENA:arena -- ^REPLAY:link )
    {: c r:str ar :}
    ar LINKS-NEW {: l :}
-   c l REPLAY-LINK:CLIENT ! r ar COPIED l REPLAY-LINK:ROOT !
+   c l REPLAY-LINK:CLIENT ! r ar ARENA:COPY l REPLAY-LINK:ROOT !
    l ;
 
 : RETRY? ( DROPBOX:reply -- bool )
@@ -265,7 +258,7 @@ public
    HASHING DROPBOX:HASH-BEGIN
    CHECKPOINT XS-SIZE / 0 ?do XS XS-SIZE HASHING DROPBOX:HASH-FEED loop
    t str> HASHING DROPBOX:HASH-FEED
-   HASHING DROPBOX:HASH-END ar COPIED DROPBOX:>HASH ;
+   HASHING DROPBOX:HASH-END ar ARENA:COPY DROPBOX:>HASH ;
 
 \ The fake's p at rev v, of content c: CHECKPOINT bytes it does not
 \ keep, then t, so its download from the start answers 500.

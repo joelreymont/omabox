@@ -178,13 +178,6 @@ private
 
 \ ---- the commands
 
-: KEEP ( str ^ARENA:arena -- str )
-   {: s ar :}
-   s STR:len {: u:n :}
-   ar u ARENA:ALLOC {: d:^ du:n :}
-   s STR:data d u BYTE-COPY
-   d du >str ;
-
 : LAUNCHING ( launch launch ^ARENA:arena -- ^commands )
    {: s j ar :}
    ar COMMAND-SETS-NEW {: c :}
@@ -208,8 +201,8 @@ public
 \ a test's subprocesses deterministic.
 : SCRIPTS ( str str ^ARENA:arena -- ^commands )
    {: s j ar :}
-   s ar KEEP SERVICE-LAUNCH:SCRIPT
-   j ar KEEP SERVICE-LAUNCH:SCRIPT
+   s ar ARENA:COPY SERVICE-LAUNCH:SCRIPT
+   j ar ARENA:COPY SERVICE-LAUNCH:SCRIPT
    ar LAUNCHING ;
 
 private

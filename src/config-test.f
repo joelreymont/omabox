@@ -111,11 +111,7 @@ variable CAUSE
 
 \ ---- strings and paths, laid in the case's arena
 
-: KEEP ( str -- str )
-   str> {: a:^ u:n :}
-   AR @ u ARENA:ALLOC {: d:^ du:n :}
-   a d u BYTE-COPY
-   d du >str ;
+: KEEP ( str -- str ) AR @ ARENA:COPY ;
 
 : CAT ( str str -- str )
    {: a b :}

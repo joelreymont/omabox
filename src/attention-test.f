@@ -39,13 +39,6 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
 
 \ ---- a case's directory --------------------------------------------
 
-: COPIED ( str ^ARENA:arena -- str )
-   {: s:str ar :}
-   s str> {: a:^ u:n :}
-   ar u ARENA:ALLOC drop {: dst:^ :}
-   a dst u BYTE-COPY
-   dst u >str ;
-
 \ dir/name.
 : INSIDE ( str str ^ARENA:arena -- str )
    {: d:str n:str ar :}
@@ -59,7 +52,7 @@ variable CAUSE      \ FS:ERRNO as RENDER left it
 
 : SCRATCH ( ^ARENA:arena -- str )
    {: ar :}
-   s" attention-test" FS:MKTEMP-DIR ar COPIED ;
+   s" attention-test" FS:MKTEMP-DIR ar ARENA:COPY ;
 
 : GONE ( str -- ) FS:REMOVE-TREE ;
 

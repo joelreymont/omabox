@@ -503,13 +503,6 @@ STRUCTURE hashed
 TYPED-VARIABLE HASHER DROPBOX:hasher
 IO-SIZE BUFFER: IO-BUF
 
-\ Copies the bytes into the arena.
-: KEEP ( str ^ARENA:arena -- str )
-   {: s:str ar:^ARENA:arena :}
-   s str> {: p:^ u:n :}
-   ar u ARENA:ALLOC drop {: dst:^ :}
-   p dst u BYTE-COPY dst u >str ;
-
 \ Dropbox's content hash of what read gives: read fills the span it is
 \ handed and answers the bytes it put there, 0 at the end. The hasher
 \ composes each 4 MiB block's digest.
@@ -519,7 +512,7 @@ IO-SIZE BUFFER: IO-BUF
    begin IO-BUF IO-SIZE read execute dup 0 > while
       IO-BUF swap HASHER DROPBOX:HASH-FEED
    repeat drop
-   HASHER DROPBOX:HASH-END ar KEEP DROPBOX:>HASH ;
+   HASHER DROPBOX:HASH-END ar ARENA:COPY DROPBOX:>HASH ;
 
 public
 
@@ -2112,7 +2105,7 @@ SUBTREE-INSTALL
    ( JOURNAL:scan str option<MODEL:cutoff> JOURNAL:journal ^watch
      ^ARENA:arena -- JOURNAL:scan pending-scan )
    {: p:str cut:option<MODEL:cutoff> j w ar:^ARENA:arena :}
-   p ar KEEP {: root:str :}
+   p ar ARENA:COPY {: root:str :}
    p s" open sync root for scan" OPEN-ABSOLUTE-DIRECTORY {: rfd:fd :}
    rfd p ROOT-STAT {: before:MODEL:stat :}
    root rfd before cut before STAT-DEV j w ar ENUMERATE-SCAN-ON-DEVICE ;
@@ -3584,7 +3577,7 @@ private
    {: src dir:fd r:str rel:str t:str want:DROPBOX:hash
       ar:^ARENA:arena :}
    r rel t want ar STAGE-PATHS {: name:str sp:str :}
-   t ar KEEP {: target:str :}
+   t ar ARENA:COPY {: target:str :}
    src execute dir name sp target want
    DOWNLOAD-LOCATION-MAKE ;
 
@@ -4003,7 +3996,7 @@ private
 \ Rust's DownloadPartial::finish.
 : FINISH-PARTIAL ( ^download-partial ^ARENA:arena -- stage-outcome<n> )
    {: x ar:^ARENA:arena :}
-   x DOWNLOAD-PARTIAL-AGGREGATE DROPBOX:HASH-END ar KEEP DROPBOX:>HASH
+   x DOWNLOAD-PARTIAL-AGGREGATE DROPBOX:HASH-END ar ARENA:COPY DROPBOX:>HASH
    {: actual:DROPBOX:hash :}
    actual x DOWNLOAD-PARTIAL-LOCATION EXPECTED@ SAME-CONTENT? 0= if
       x actual MISMATCHED exit
@@ -4065,7 +4058,7 @@ private
 : SLOT-SOURCE ( download-slot-lease ^ARENA:arena -- download-source )
    {: lease:download-slot-lease ar:^ARENA:arena :}
    lease DOWNLOAD-SLOT-LEASE-UNMAKE {: d:str slot:n b:binding :}
-   slot DOWNLOAD-SLOT-NAME ar KEEP {: name:str :}
+   slot DOWNLOAD-SLOT-NAME ar ARENA:COPY {: name:str :}
    d name ar JOIN {: path:str :}
    d s" open resumable download slot directory"
    OPEN-PRIVATE-DIRECTORY name path b DOWNLOAD-SOURCE-RESUMABLE ;

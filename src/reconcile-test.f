@@ -289,9 +289,9 @@ private
 \ A case's directory, made under TMPDIR, and its journal.
 : CASE-JOURNAL ( ^ARENA:arena -- str JOURNAL:journal )
    {: ar :}
-   s" reconcile-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d:str :}
+   s" reconcile-test" FS:MKTEMP-DIR ar ARENA:COPY {: d:str :}
    SB-RESET d SB-APPEND s" /journal.sqlite3" SB-APPEND
-   d SB$ ar TEST-CLIENT:COPIED JOURNAL:OPEN ;
+   d SB$ ar ARENA:COPY JOURNAL:OPEN ;
 
 : GONE ( str JOURNAL:journal -- )
    JOURNAL:CLOSE FS:REMOVE-TREE ;
@@ -598,7 +598,7 @@ variable SEED
 : LOGGED ( str [ -- ] ^ARENA:arena -- str )
    {: d:str q ar :}
    SB-RESET d SB-APPEND s" /stderr.txt" SB-APPEND
-   q SB$ ar TEST-CLIENT:COPIED ar STDERR:CAPTURING {: code:n t:str :}
+   q SB$ ar ARENA:COPY ar STDERR:CAPTURING {: code:n t:str :}
    code 0<> if code throw then
    t ;
 
@@ -651,8 +651,8 @@ variable SEED
    {: d:str j b ar :}
    s" abcdefghijklmnopqrstuvwxyz" 24 RANDOM 1+ ar SAMPLE {: stem:str :}
    SB-RESET stem SB-APPEND s" .txt" SB-APPEND
-   SB$ ar TEST-CLIENT:COPIED {: lower:str :}
-   lower ar TEST-CLIENT:COPIED {: upper:str :}
+   SB$ ar ARENA:COPY {: lower:str :}
+   lower ar ARENA:COPY {: upper:str :}
    upper str> 0 ?do dup i + c@ STR:ASCII-UPPER over i + c! loop drop
    ar LOCAL-RECORDS {: rs :}
    rs lower DIRECTORY+ rs upper DIRECTORY+
@@ -735,7 +735,7 @@ variable SEED
    br BASELINE-SOME? bool>n bp p HOLDS? bool>n T=
    lr LOCAL-SOME? bool>n lp p HOLDS? bool>n T=
    rr REMOTE-SOME? bool>n rp p HOLDS? bool>n T=
-   p ar TEST-CLIENT:COPIED MODEL:>KEY merged VEC:PUSH ! ;
+   p ar ARENA:COPY MODEL:>KEY merged VEC:PUSH ! ;
 
 \ A directory at the path on all three sides is settled.
 : SETTLED?
@@ -854,7 +854,7 @@ variable ALL-NOOPS
 : COMBO$ ( str n str ^ARENA:arena -- str )
    {: pre:str x:n post:str ar :}
    SB-RESET pre SB-APPEND x FMT:INT$ SB-APPEND post SB-APPEND
-   SB$ ar TEST-CLIENT:COPIED ;
+   SB$ ar ARENA:COPY ;
 
 : COMBO-PATH ( n ^ARENA:arena -- str ) {: x:n ar :} s" k" x s" " ar COMBO$ ;
 
@@ -979,7 +979,7 @@ variable ALL-NOOPS
    ( JOURNAL:known-path ^planning ^VEC:vector<MODEL:key>
      ^VEC:vector<MODEL:key> ^ARENA:arena -- )
    {: kp pl seen held ar :}
-   kp KNOWN-KEY KEY-BYTES pl ARENA-OF SAVED MODEL:>KEY {: k :}
+   kp KNOWN-KEY KEY-BYTES pl ARENA-OF ARENA:COPY MODEL:>KEY {: k :}
    held k KEY-IN? TTRUE
    k seen VEC:PUSH !
    kp pl ar COUNTED-NOOP? if 1 YIELD-NOOPS +! then ;
@@ -1594,7 +1594,7 @@ variable ALL-NOOPS
 \ Dir/a.txt and dir/b.txt.
 : FIXTURE ( ^ARENA:arena -- str str )
    {: ar :}
-   s" reconcile-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d:str :}
+   s" reconcile-test" FS:MKTEMP-DIR ar ARENA:COPY {: d:str :}
    d s" root" ar TEST-CLIENT:INSIDE {: r:str :}
    r FS:MAKE-DIR
    r s" Dir" ar MAKE-AT
@@ -1871,7 +1871,7 @@ ARENA LISTED DROPBOX:entry
    ( ^ARENA:arena -- )
    {: ar :}
    s" listing_rejects_mismatched_canonical_and_display_paths" T-LABEL
-   s" reconcile-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d:str :}
+   s" reconcile-test" FS:MKTEMP-DIR ar ARENA:COPY {: d:str :}
    s" " ar LISTING-AT {: root :}
    ar NO-CHANGES {: v :}
    s" /report.txt" s" /Different.txt" ar FILE-ENTRY {: e :}
@@ -1895,7 +1895,7 @@ ARENA LISTED DROPBOX:entry
 : LISTING-REJECTS-AN-INVALID-CONFIGURED-ROOT ( ^ARENA:arena -- )
    {: ar :}
    s" listing rejects an invalid configured root" T-LABEL
-   s" reconcile-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d:str :}
+   s" reconcile-test" FS:MKTEMP-DIR ar ARENA:COPY {: d:str :}
    s" a/b" d ar ROOT-PATH-REFUSED
    s" /a/" d ar ROOT-PATH-REFUSED
    s" /a//b" d ar ROOT-PATH-REFUSED
@@ -1919,7 +1919,7 @@ ARENA LISTED DROPBOX:entry
 : LISTING-REJECTS-AN-ENTRY-WITHOUT-PATHS ( ^ARENA:arena -- )
    {: ar :}
    s" listing rejects an entry without paths" T-LABEL
-   s" reconcile-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d:str :}
+   s" reconcile-test" FS:MKTEMP-DIR ar ARENA:COPY {: d:str :}
    s" " s" " ar FILE-ENTRY d ar ENTRY-REFUSED {: t:str :}
    t s" `" STR:CONTAINS? TFALSE
    d FS:REMOVE-TREE ;
@@ -1927,7 +1927,7 @@ ARENA LISTED DROPBOX:entry
 : LISTING-REJECTS-A-PATH-THAT-IS-NOT-UTF-8 ( ^ARENA:arena -- )
    {: ar :}
    s" listing rejects a path that is not UTF-8" T-LABEL
-   s" reconcile-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d:str :}
+   s" reconcile-test" FS:MKTEMP-DIR ar ARENA:COPY {: d:str :}
    s\" /report\xFF.txt" s\" /report\xFF.txt" ar FILE-ENTRY
    d ar ENTRY-REFUSED drop
    d FS:REMOVE-TREE ;
@@ -1963,7 +1963,7 @@ ARENA LISTED DROPBOX:entry
 : LISTING-CLASSIFIES-THE-REMOTE-ROOTS-OWN-ENTRY ( ^ARENA:arena -- )
    {: ar :}
    s" listing_classifies_the_remote_roots_own_entry" T-LABEL
-   s" reconcile-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d:str :}
+   s" reconcile-test" FS:MKTEMP-DIR ar ARENA:COPY {: d:str :}
    ar ROOT-ACCEPTED
    s" /sync" s" /Sync" ar DELETED-ENTRY
    s" configured Dropbox root is unavailable" d ar ROOT-REFUSED
@@ -2002,7 +2002,7 @@ ARENA LISTED DROPBOX:entry
 \ The entries q appends, as a JSON array in the arena.
 : ENTRIES ( [ -- ] ^ARENA:arena -- str )
    {: q ar :}
-   SB-RESET s" [" SB-APPEND q execute s" ]" SB-APPEND SB$ ar TEST-CLIENT:COPIED ;
+   SB-RESET s" [" SB-APPEND q execute s" ]" SB-APPEND SB$ ar ARENA:COPY ;
 
 : PAGE ( str str bool -- )
    {: e:str k:str more:bool :}
@@ -2232,7 +2232,7 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
    ar REMOTE-RECORDS {: rs :}
    s" Bulk" REMOTE-DIRECTORY ar RECORD-AT rs VEC:PUSH !
    u 1 ?do
-      s" Bulk" i BULK$ ar TEST-CLIENT:COPIED h s" rev-old" PRESENT-AT
+      s" Bulk" i BULK$ ar ARENA:COPY h s" rev-old" PRESENT-AT
       ar RECORD-AT rs VEC:PUSH !
    loop
    rs ;
@@ -2282,8 +2282,8 @@ BULK-SIZE BULK-PAGE-SIZE / constant BULK-PAGES
 : BULK-ENTRY ( n DROPBOX:hash ^ARENA:arena -- str )
    {: x:n h:DROPBOX:hash ar :}
    x 0= if SB-RESET s" /bulk" s" /Bulk" FOLDER-JSON+ SB$ exit then
-   s" /bulk" x BULK$ ar TEST-CLIENT:COPIED {: l:str :}
-   s" /Bulk" x BULK$ ar TEST-CLIENT:COPIED {: d:str :}
+   s" /bulk" x BULK$ ar ARENA:COPY {: l:str :}
+   s" /Bulk" x BULK$ ar ARENA:COPY {: d:str :}
    SB-RESET l d s" rev-bulk" h FILE-JSON+ SB$ ;
 
 \ Rust's page k of the large listing: its entries' JSON array.
@@ -2459,7 +2459,7 @@ READ-CAP BUFFER: READ-BUF
 \ bound to the root, and a pass over them with its own watch in ar.
 : STEP-RUN ( ^ARENA:arena -- str ^run )
    {: ar :}
-   s" reconcile-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d:str :}
+   s" reconcile-test" FS:MKTEMP-DIR ar ARENA:COPY {: d:str :}
    d s" root" ar TEST-CLIENT:INSIDE {: r:str :}
    d s" staging" ar TEST-CLIENT:INSIDE {: s:str :}
    r FS:MAKE-DIR s FS:MAKE-DIR
@@ -2503,13 +2503,13 @@ READ-CAP BUFFER: READ-BUF
 
 : NUMBERED ( str n ^ARENA:arena -- str )
    {: a:str k:n ar :}
-   SB-RESET a SB-APPEND k FMT:SB-INT SB$ ar TEST-CLIENT:COPIED ;
+   SB-RESET a SB-APPEND k FMT:SB-INT SB$ ar ARENA:COPY ;
 
 \ The fake's file /<p> at rev v with b's identity and size.
 : FILE-AT ( str str str ^ARENA:arena -- )
    {: p:str v:str b:str ar :}
    b ar IDENTITY DROPBOX:HASH>STR {: h:str :}
-   SB-RESET s" /" SB-APPEND p SB-APPEND SB$ ar TEST-CLIENT:COPIED {: l:str :}
+   SB-RESET s" /" SB-APPEND p SB-APPEND SB$ ar ARENA:COPY {: l:str :}
    l l v h b str> nip TEST-DROPBOX:FILE! ;
 
 \ The fake serves b as rev v of /<p>.
@@ -2632,7 +2632,7 @@ READ-CAP BUFFER: READ-BUF
    MISMATCH$ s" expected-revision" ar REMOTE-FILE {: rem :}
    x s" mismatch.txt" rem INSTALLING drop
    SB-RESET s" durable-plan mismatch.txt " SB-APPEND w SB-APPEND
-   SB$ ar TEST-CLIENT:COPIED {: e:str :}
+   SB$ ar ARENA:COPY {: e:str :}
    x REPLAY-STEP REPORTED e REPORTS? TTRUE
    x PENDING-OF VEC:COUNT 0 T=
    x BLOCKED-OF {: held :}
@@ -2785,7 +2785,7 @@ READ-CAP BUFFER: READ-BUF
    {: p sp:str ar :}
    SB-RESET s" stage-destination-occupied " SB-APPEND
    p ID-OF JOURNAL:PLAN-ID>N FMT:SB-INT
-   s"  " SB-APPEND sp SB-APPEND SB$ ar TEST-CLIENT:COPIED ;
+   s"  " SB-APPEND sp SB-APPEND SB$ ar ARENA:COPY ;
 
 : OCCUPIED-DOWNLOAD-STAGE-IS-DURABLY-BLOCKED-WITHOUT-OVERWRITE-OR-REQUEST
    ( ^ARENA:arena -- )
@@ -2814,7 +2814,7 @@ READ-CAP BUFFER: READ-BUF
 : BATCH ( n ^ARENA:arena -- str str )
    {: k:n ar :}
    s" batch-" k ar NUMBERED {: v:str :}
-   SB-RESET v SB-APPEND s" .txt" SB-APPEND SB$ ar TEST-CLIENT:COPIED v ;
+   SB-RESET v SB-APPEND s" .txt" SB-APPEND SB$ ar ARENA:COPY v ;
 
 \ The fake serves batch file k's bytes, the last's only past a byte it
 \ does not keep, so its download from the start answers 500.
@@ -3244,7 +3244,7 @@ TYPED-VARIABLE RACED-INSTALL str
 : LISTED-ALONE ( str str str str ^ARENA:arena -- )
    {: p:str v:str b:str k:str ar :}
    b ar IDENTITY {: h:DROPBOX:hash :}
-   SB-RESET s" /" SB-APPEND p SB-APPEND SB$ ar TEST-CLIENT:COPIED {: l:str :}
+   SB-RESET s" /" SB-APPEND p SB-APPEND SB$ ar ARENA:COPY {: l:str :}
    [: l l v h FILE-JSON+ ;] ar ENTRIES k false PAGE ;
 
 \ Rust's fixture: upload.txt in the root, download.txt served and on
@@ -5026,7 +5026,7 @@ $1C0 constant OWNER-ACCESS
    q s" .omabox-conflict-" STR:STARTS-WITH? if
       x RUN-ROOT @ q x RUN-ARENA @ TEST-CLIENT:INSIDE
       READ-BUF READ-CAP FS:READ-ALL READ-BUF swap >str
-      x RUN-ARENA @ TEST-CLIENT:COPIED v VEC:PUSH !
+      x RUN-ARENA @ ARENA:COPY v VEC:PUSH !
    then
    next ;
 
@@ -5060,7 +5060,7 @@ $1C0 constant OWNER-ACCESS
    x RUN-ARENA @ {: ar :}
    ar ARENA:ALLOCATOR 0 [type] str VEC:NEW {: v :}
    x ROOT$ READ-BUF READ-CAP FS-LIST:NAMES {: u:n :}
-   READ-BUF u >str ar TEST-CLIENT:COPIED {: ns:str :}
+   READ-BUF u >str ar ARENA:COPY {: ns:str :}
    0 begin ns swap x v CONFLICT-COPY+ dup 0< until drop
    v COPIES-SORTED v ;
 
@@ -5816,7 +5816,7 @@ $1C0 constant OWNER-ACCESS
    {: o:str b:str s:str ar :}
    b ar IDENTITY DROPBOX:HASH>STR 0 12 PART {: h:str :}
    SB-RESET s" node (" SB-APPEND o SB-APPEND s"  " SB-APPEND
-   h SB-APPEND s SB-APPEND s" )" SB-APPEND SB$ ar TEST-CLIENT:COPIED ;
+   h SB-APPEND s SB-APPEND s" )" SB-APPEND SB$ ar ARENA:COPY ;
 
 : NODE-DIR ( ^run -- ) s" node" IN-ROOT FS:MAKE-DIR ;
 
@@ -5919,7 +5919,7 @@ $1C0 constant OWNER-ACCESS
    SB-RESET S\" {\qentries\q:[" SB-APPEND
    s" /node" s" /node" FOLDER-JSON+
    S\" ],\qcursor\q:\qremote-directory\q,\qhas_more\q:false}" SB-APPEND
-   SB$ ar TEST-CLIENT:COPIED {: page:str :}
+   SB$ ar ARENA:COPY {: page:str :}
    s" /2/files/upload" 200 s" " s" " page TEST-DROPBOX:ROUTE-SCRIPT!
    s" /" low ar JOIN-BYTES s" /" v ar JOIN-BYTES
    s" rev-dropbox-copy" h DROPBOX-FILE$ str> nip TEST-DROPBOX:FILE! ;
@@ -6300,7 +6300,7 @@ $180 constant MODE-0600
    {: ar :}
    ar [type] str NEW-VECTOR {: v :}
    LIST$ TEST-DROPBOX:CALLS 1 ?do
-      LIST$ TEST-DROPBOX:BODIES-TO$ i WORD-AT ar TEST-CLIENT:COPIED v VEC:PUSH !
+      LIST$ TEST-DROPBOX:BODIES-TO$ i WORD-AT ar ARENA:COPY v VEC:PUSH !
    loop
    v ;
 

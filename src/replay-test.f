@@ -215,7 +215,7 @@ private
 \ A case's directory and the journal path in it.
 : JOURNAL-AT ( ^ARENA:arena -- str str )
    {: ar :}
-   s" replay-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d:str :}
+   s" replay-test" FS:MKTEMP-DIR ar ARENA:COPY {: d:str :}
    d d s" journal.sqlite3" ar TEST-CLIENT:INSIDE ;
 
 \ Rust's RetentionFixture: a case's directory, the journal path in it
@@ -752,7 +752,7 @@ $140 constant MODE-NO-WRITE
 \ A case's directory, and the sync root and upload staging made in it.
 : CONFLICT-DIRS ( ^ARENA:arena -- str str str )
    {: ar :}
-   s" replay-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d:str :}
+   s" replay-test" FS:MKTEMP-DIR ar ARENA:COPY {: d:str :}
    d s" root" ar TEST-CLIENT:INSIDE {: r:str :}
    d s" staging" ar TEST-CLIENT:INSIDE {: s:str :}
    r FS:MAKE-DIR s FS:MAKE-DIR
@@ -1302,7 +1302,7 @@ $140 constant MODE-NO-WRITE
    {: l ar :}
    s" folder_delete_probe_outcomes_are_classified_per_path" T-LABEL
    TEST-DROPBOX:RESET
-   s" replay-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d:str :}
+   s" replay-test" FS:MKTEMP-DIR ar ARENA:COPY {: d:str :}
    l s" f" TEST-CLIENT:DISPLAY ar REPLAY:REMOTE-CREATE-FOLDER
    s" applied" s" folder" GIVES
    l ar PROBE-UNREACHED l ar PROBE-RESTRICTED l ar PROBE-RESET
@@ -1313,7 +1313,7 @@ $140 constant MODE-NO-WRITE
 
 : RUNTIME-STATUS ( ^ARENA:arena -- str ^STATUS:status )
    {: ar :}
-   s" replay-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: rt:str :}
+   s" replay-test" FS:MKTEMP-DIR ar ARENA:COPY {: rt:str :}
    rt rt ar STATUS:NEW ;
 
 4096 constant STATUS-CAP
@@ -1614,7 +1614,7 @@ $2000000 constant CHUNK
    {: l ar :}
    s" a file delete without a revision is refused" T-LABEL
    TEST-DROPBOX:RESET
-   s" replay-test" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED {: d:str :}
+   s" replay-test" FS:MKTEMP-DIR ar ARENA:COPY {: d:str :}
    d [: [: l s" notes.txt" TEST-CLIENT:DISPLAY s" " AS-REV ar
          REPLAY:REMOTE-DELETE-FILE DROP-OUTCOME ;]
       REPLAY:E-INVALID-STATE TTHROWSQ ;] ar LOGGED {: t:str :}
@@ -3152,7 +3152,7 @@ ARENA FILE-CASES file-case
    s" download-unavailable" ar UNCOPIED {: c t:str :}
    t LINE-COUNT 2 T= t d STR:CONTAINS? TTRUE
    s" download_unavailable " SB-RESET SB-APPEND st FMT:INT$ SB-APPEND
-   SB$ ar TEST-CLIENT:COPIED BLOCKED-LINE t swap STR:CONTAINS? TTRUE
+   SB$ ar ARENA:COPY BLOCKED-LINE t swap STR:CONTAINS? TTRUE
    c FILE-CASE-JOURNAL @ ar HELD-STATUS st T=
    c ENDED ;
 
@@ -3762,7 +3762,7 @@ variable SIDES
    [: KEEP-NONE ;] s" replay-refresh" s" " ar TEST-CLIENT:CLIENT-ON TEST-CLIENT:MAIN !
    TEST-CLIENT:MAIN @ LINKED
    s" " LINK REPLAY-LINK:ROOT !
-   s" replay-status" FS:MKTEMP-DIR ar TEST-CLIENT:COPIED RUNTIME !
+   s" replay-status" FS:MKTEMP-DIR ar ARENA:COPY RUNTIME !
    RUNTIME @ ar STATUS:NEW LINK REPLAY-LINK:STATUS !
    TEST-CLIENT:MAIN @ DROPBOX:ACCOUNT DROPBOX:DONE? TTRUE ;
 

@@ -25,11 +25,7 @@ $C0 constant UNREADABLE
 TYPED-VARIABLE AR ^ARENA:arena
 TYPED-VARIABLE DIR str
 
-: KEEP ( str -- str )
-   str> {: a:^ u:n :}
-   AR @ u ARENA:ALLOC drop {: d:^ :}
-   a d u BYTE-COPY
-   d u >str ;
+: KEEP ( str -- str ) AR @ ARENA:COPY ;
 
 \ base/name laid in the case's arena.
 : UNDER ( str str -- str )

@@ -47,18 +47,11 @@ TYPED-VARIABLE W JSON:writer
 \ The readers below take the forms plan.tsv holds and no
 \ others; each answers its value and whether it took it.
 
-: COPIED ( str ^ARENA:arena -- str )
-   {: s ar :}
-   s str> {: a:^ u:n :}
-   ar u ARENA:ALLOC drop {: dst:^ :}
-   a dst u BYTE-COPY
-   dst u >str ;
-
 \ A string's decoded bytes, copied into AR.
 : STRING-OF ( JSON:value -- str bool )
    {: v :}
    v JSON:STRING? 0= if s" " false exit then
-   v [: AR @ COPIED ;] JSON:WITH-STRING true ;
+   v [: AR @ ARENA:COPY ;] JSON:WITH-STRING true ;
 
 : MEMBER-OF ( JSON:value str -- str bool )
    JSON:FIND MATCH option

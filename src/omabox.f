@@ -633,15 +633,7 @@ ARENA JOURNALS JOURNAL:journal
 
 \ ---- status and settings
 
-\ The bytes copied into the arena.
-: KEPT ( str ^ARENA:arena -- str )
-   {: s:str ar :}
-   s str> {: a:^ u:n :}
-   ar u ARENA:ALLOC {: d:^ du:n :}
-   a d u BYTE-COPY
-   d du >str ;
-
-\ The str s, then the str t, copied into the arena as KEPT copies; s
+\ The str s, then the str t, copied into the arena as ARENA:COPY copies; s
 \ stays as it was.
 : FOLLOWED ( str str ^ARENA:arena -- str )
    {: s:str t:str ar :}
@@ -663,7 +655,7 @@ ARENA JOURNALS JOURNAL:journal
 
 : SETTINGS-LINES ( ^CONFIG:document ^ARENA:arena -- str )
    {: d ar :}
-   s" Sync root: " ar KEPT
+   s" Sync root: " ar ARENA:COPY
    d CONFIG:DOCUMENT-ROOT CONFIG:ABS-PATH>STR ar FOLLOWED
    S\" \nDropbox app key: " ar FOLLOWED
    d CONFIG:DOCUMENT-KEY ar FOLLOWED S\" \n" ar FOLLOWED ;
@@ -749,7 +741,7 @@ ARENA JOURNALS JOURNAL:journal
 \ built in ar.
 : DONE-OUT ( str bool ^VEC:vector<STALE:leftover> ^ARENA:arena -- )
    {: d:str recovered:bool left ar :}
-   d ar KEPT s" ." ar FOLLOWED recovered NOTE ar FOLLOWED
+   d ar ARENA:COPY s" ." ar FOLLOWED recovered NOTE ar FOLLOWED
    S\" \n" ar FOLLOWED left REPORT-OUT ;
 
 \ Rust's match on the change's outcome and the restore's: c the
@@ -1058,7 +1050,7 @@ ARENA JOURNALS JOURNAL:journal
 \ "Omabox sync root is now {root}", kept in the arena.
 : ROOT-DONE ( ^CONFIG:config ^ARENA:arena -- str )
    {: r ar :}
-   s" Omabox sync root is now " ar KEPT
+   s" Omabox sync root is now " ar ARENA:COPY
    r CONFIG:SYNC-ROOT CONFIG:ABS-PATH>STR ar FOLLOWED ;
 
 \ Rust's set_sync_root: the root validated against the stored config,
@@ -1087,7 +1079,7 @@ ARENA JOURNALS JOURNAL:journal
 \ Rust's prompt for the login p, on stdout, built in ar.
 : PROMPT ( ^AUTH:pending ^ARENA:arena -- )
    {: p ar :}
-   S\" Open this URL in a browser:\n" ar KEPT p AUTH:URL ar FOLLOWED
+   S\" Open this URL in a browser:\n" ar ARENA:COPY p AUTH:URL ar FOLLOWED
    S\" \n\nPaste the authorization code: " ar FOLLOWED WRITE-OUT ;
 
 \ The token store of a client that keeps nothing.
@@ -1146,7 +1138,7 @@ ARENA JOURNALS JOURNAL:journal
    {: r cl a ar :}
    cl DROPBOX:ACCOUNT-ID cl DROPBOX:ROOT-NAMESPACE
    r JOURNAL-DROPBOX--BINDING:MAKE a AUTHORIZED-BINDING !
-   cl DROPBOX:REFRESH-TOKEN ar KEPT a AUTHORIZED-REFRESH-TOKEN ! ;
+   cl DROPBOX:REFRESH-TOKEN ar ARENA:COPY a AUTHORIZED-REFRESH-TOKEN ! ;
 
 \ The code ac exchanged for the login p and checked against the root
 \ r, kept in a; the client is closed on every path out.

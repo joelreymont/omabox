@@ -489,7 +489,7 @@ FS:PATHZ-CAP BUFFER: JOURNAL-FILE
 \ Runs q on the journal in JOURNAL-DIR$, then closes it.
 : OPENED-JOURNAL ( [ JOURNAL:journal -- ] -- )
    {: q :}
-   JOURNAL-PATH AR @ KEEP JOURNAL:OPEN {: j :}
+   JOURNAL-PATH AR @ ARENA:COPY JOURNAL:OPEN {: j :}
    [: j q execute ;] [: j JOURNAL:CLOSE ;] finally ;
 
 \ Runs q on a journal in a new directory under TMPDIR, outside the
@@ -505,7 +505,7 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
 
 : ACTIVATE-ROOT ( JOURNAL:journal -- )
    {: j :}
-   ROOT$ AR @ KEEP JOURNAL:INSPECT {: b :}
+   ROOT$ AR @ ARENA:COPY JOURNAL:INSPECT {: b :}
    j b AR @ JOURNAL:ACTIVATE-LOCAL-ROOT drop
    j JNL ! b BOUND ! ;
 
@@ -956,7 +956,7 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
    ['] ENTRY-CODE? WITH-CONVERTS {: code:n :}
    code 0<> if s" d" code WALK-UNKNOWN SEEN-UNKNOWN then
    held cx ENTERED-ALL
-   ROOT$ AR @ KEEP root before AR @ PENDING-SCAN-MAKE FINISH-SCAN ;
+   ROOT$ AR @ ARENA:COPY root before AR @ PENDING-SCAN-MAKE FINISH-SCAN ;
 
 : A-DIRECTORY-REPLACED-BEFORE-ITS-OPEN-IS-INCOMPLETE ( -- )
    s" a_directory_replaced_before_its_open_is_incomplete" T-LABEL
@@ -969,7 +969,7 @@ TYPED-VARIABLE BOUND JOURNAL:local-root-binding
 : ENUMERATE-SCAN-ACROSS-DEVICES
    ( JOURNAL:scan str ^ARENA:arena -- JOURNAL:scan pending-scan )
    {: p:str ar:^ARENA:arena :}
-   p ar KEEP {: root:str :}
+   p ar ARENA:COPY {: root:str :}
    p s" open sync root for scan" OPEN-ABSOLUTE-DIRECTORY {: rfd:fd :}
    rfd p ROOT-STAT {: before:MODEL:stat :}
    root rfd before NO-CUTOFF before STAT-DEV 1 xor JNL @ WATCHER @ ar
@@ -1520,7 +1520,7 @@ variable RAISED-ERRNO
 \ Activates the directory at the name below the case's root.
 : ACTIVATE ( JOURNAL:journal str -- )
    {: j p:str :}
-   p AT AR @ KEEP JOURNAL:INSPECT {: b :}
+   p AT AR @ ARENA:COPY JOURNAL:INSPECT {: b :}
    j b AR @ JOURNAL:ACTIVATE-LOCAL-ROOT drop ;
 
 : NO-SUBVOLUME ( -- option<n> ) OPTION:NONE ;
@@ -1560,7 +1560,7 @@ variable RAISED-ERRNO
 \ Rust's scan_and_publish_at with all_cache_entries_stable completing.
 : PUBLISH-STABLE ( JOURNAL:journal str option<MODEL:cutoff> -- )
    {: j p:str cut:option<MODEL:cutoff> :}
-   j p AT AR @ KEEP WATCHER @ cut [: STABLE ;] AR @ SCAN-AND-PUBLISH-AT
+   j p AT AR @ ARENA:COPY WATCHER @ cut [: STABLE ;] AR @ SCAN-AND-PUBLISH-AT
    ROOT-CHANGED? TFALSE ;
 
 : REPUBLISHES-NOTHING ( JOURNAL:journal -- )
