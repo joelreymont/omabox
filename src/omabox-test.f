@@ -462,7 +462,7 @@ TYPED-VARIABLE SHOWN str
    home OPTION:SOME E-WIDGET-TAKEN p ar WIDGET-REFUSED
    link s" /elsewhere" ar LINKS-TO ;
 
-\ A folder at link is refused and kept with what it holds.
+\ A folder at link with no manifest is refused and kept with what it holds.
 : FOLDER-KEPT ( str str str ^ARENA:arena -- )
    {: home link p ar :}
    link FS:REMOVE-FILE
@@ -471,6 +471,36 @@ TYPED-VARIABLE SHOWN str
    home OPTION:SOME E-WIDGET-TAKEN p ar WIDGET-REFUSED
    link FS:SYMLINK? TFALSE
    kept FS:DIR? TTRUE ;
+
+: OTHER-MANIFEST ( -- str ) s\" {\"id\": \"local.other\"}" ;
+
+: OWN-MANIFEST ( -- str )
+   s\" {\"id\": \"local.omabox\", \"name\": \"Omabox\"}" ;
+
+\ The folder at link, given a manifest naming another id, is refused and
+\ kept with its manifest.
+: OTHER-ID-KEPT ( str str str ^ARENA:arena -- )
+   {: home link p ar :}
+   link s" manifest.json" ar INSIDE {: m :}
+   m OTHER-MANIFEST FS:WRITE-ALL
+   home OPTION:SOME E-WIDGET-TAKEN p ar WIDGET-REFUSED
+   link FS:SYMLINK? TFALSE
+   m FILE-TEXT OTHER-MANIFEST T$= ;
+
+\ The folder at link, given a manifest naming local.omabox, is the widget
+\ Rust's setup installed: accepted and kept as it is, with no link made.
+: OWN-FOLDER-KEPT ( str str ^ARENA:arena -- )
+   {: home link ar :}
+   link s" manifest.json" ar INSIDE {: m :}
+   link s" Widget.qml" ar INSIDE {: q :}
+   m OWN-MANIFEST FS:WRITE-ALL
+   q s" Item {}" FS:WRITE-ALL
+   home OPTION:SOME ar HOME-WIDGET
+   link FS:SYMLINK? TFALSE
+   link FS:DIR? TTRUE
+   m FILE-TEXT OWN-MANIFEST T$=
+   q FILE-TEXT s" Item {}" T$=
+   link s" kept" ar INSIDE FS:DIR? TTRUE ;
 
 : THE-WIDGET-LINK-IS-MADE-ONCE-AND-NEVER-REPLACES-AN-ENTRY
    ( ^ARENA:arena -- )
@@ -484,6 +514,8 @@ TYPED-VARIABLE SHOWN str
    home link ar LINKED-ONCE
    home link p ar OTHER-LINK-KEPT
    home link p ar FOLDER-KEPT
+   home link p ar OTHER-ID-KEPT
+   home link ar OWN-FOLDER-KEPT
    d FS:REMOVE-TREE ;
 
 \ A file at home/.config is refused and kept.

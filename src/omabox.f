@@ -49,6 +49,8 @@ require src/lib/unicode/class.f
 require src/lib/vector.f
 require src/lib/secret.f
 require src/lib/json/write.f
+require src/lib/json/value.f
+require src/lib/json/read.f
 require src/lib/signal.f
 require src/lib/at-exit.f
 require src/lib/process.f
@@ -891,15 +893,46 @@ ARENA JOURNALS JOURNAL:journal
    home [: NO-HOME ;] ABSOLUTE-HOME
    s" .config/omarchy/plugins" ar IN-DIR ;
 
-\ Whether link is the widget's link; false only where readlink answers
-\ ENOENT. Another link, a file or a folder (EINVAL) is WIDGET-TAKEN.
+\ Whether the open manifest of size bytes is a JSON object whose "id"
+\ is the string "local.omabox"; file is closed whatever it answers.
+: OWN-MANIFEST? ( fd n ^ARENA:arena -- bool )
+   {: file:fd size:n ar :}
+   NULL-PTR [: drop ar size ARENA:ALLOC drop ;] catch {: b code:n :}
+   code 0<> if file FD>N FS:CLOSE-FD drop then
+   code 0<> if code throw then
+   file b size FS:READ-SIZED
+   b size >str JSON:PARSE {: v :}
+   v JSON:OBJECT? 0= if false exit then
+   v s" id" JSON:FIND MATCH option
+      some OF s" local.omabox" JSON:STRING= ENDOF
+      none OF false ENDOF
+   ;MATCH ;
+
+\ Whether link is a folder whose manifest.json OWN-MANIFEST? accepts,
+\ as Rust's setup installed; one it cannot read or parse is false.
+: WIDGET-FOLDER? ( str ^ARENA:arena -- bool )
+   {: link ar :}
+   link s" manifest.json" ar IN-DIR {: p :}
+   false [: drop p FS:OPEN-SIZED if ar OWN-MANIFEST? else 2drop false then ;]
+   catch {: own code:n :}
+   code 0= if own exit then
+   code E-FS-OPEN = code E-FS-STAT = or code E-FS-IO = or code E-FS-PATH = or
+   code E-MEM-MAP = or if false exit then
+   code JSON:INPUT-FAULT? code JSON:E-MEMBER = or if false exit then
+   code throw ;
+
+\ Whether the widget is at link: its link, or a folder WIDGET-FOLDER?
+\ accepts; false only for ENOENT. Anything else there is WIDGET-TAKEN.
 : WIDGET-THERE? ( str ^ARENA:arena -- bool )
    {: link ar :}
    link ar CONFIG:READLINK MATCH option
       some OF WIDGET STR:= 0= if link WIDGET-TAKEN then true ENDOF
       none OF false ENDOF
    ;MATCH if true exit then
-   FS:ERRNO FS:EINVAL = if link WIDGET-TAKEN then
+   FS:ERRNO FS:EINVAL = if
+      link ar WIDGET-FOLDER? if true exit then
+      link WIDGET-TAKEN
+   then
    FS:ERRNO FS:ENOENT <> if link FS:ERRNO LINK-FAILED then
    false ;
 
@@ -910,7 +943,8 @@ ARENA JOURNALS JOURNAL:journal
    {: code:n :}
    code 0<> if link code FS-CAUSE LINK-FAILED then ;
 
-\ The widget linked under the home, where its link is not already there.
+\ The widget linked under the home, where its link, or the folder Rust's
+\ setup installed in its place, is not already there.
 : HOME-WIDGET ( option<str> ^ARENA:arena -- )
    {: home ar :}
    home ar PLUGINS-DIR {: dir :}
