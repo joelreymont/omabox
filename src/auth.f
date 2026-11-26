@@ -7,8 +7,9 @@
 \ refresh token and the Dropbox binding, under 8192 bytes. LOAD reads it
 \ as serde reads Rust's LoadedSecret: members in any order, an unknown
 \ one skipped, one absent, repeated or of another type refused. It
-\ refuses two records serde reads and no writer makes: one written as an
-\ array, and one whose skipped member holds a lone surrogate escape.
+\ refuses records serde reads and no writer makes: one written as an
+\ array, one whose skipped member holds a lone surrogate escape or a
+\ repeated member name, and one that repeats a skipped member's name.
 \ AUTH's failures, its store's included, are logged once with the Rust
 \ version's text, then thrown as its codes. No log line holds a string
 \ of the record, only an unsupported version's number.
@@ -166,50 +167,45 @@ ARENA WRITERS JSON:writer
 
 \ ---- the record read -----------------------------------------------
 
-\ Each member is found by JSON:READ-MEMBER$ searching the record's text
-\ for its key, with the one cursor, which owns nothing after a read.
+\ The record is parsed once, which refuses a repeated member name at any
+\ depth, and each member is taken by GET.
 
-ARENA CURSORS JSON:cursor
-
-: EXPECT ( n n -- ) <> if E-JSON throw then ;
-
-\ A reader on text, and its first token.
-: OPEN ( str ^JSON:cursor -- JSON:reader n )
-   {: t:str c :}
-   c t JSON:READ-INIT JSON:READ-NEXT ;
+: EXPECT ( bool -- ) 0= if E-JSON throw then ;
 
 \ A string's decoded bytes, in a vector in the arena sized to its text,
 \ which bounds them.
-: READ-STRING ( str ^JSON:cursor ^ARENA:arena -- str )
-   {: t:str c ar :}
-   t c OPEN JSON:T-STR EXPECT
-   ar ARENA:ALLOCATOR t STR:len [type] u8 VEC:NEW JSON:READ-STR {: s:str :}
-   JSON:READ-FINISH s ;
+: READ-STRING ( JSON:value ^ARENA:arena -- str )
+   {: v ar :}
+   v JSON:STRING? EXPECT
+   ar ARENA:ALLOCATOR 0 [type] u8 VEC:NEW {: s :}
+   s v JSON:TEXT$ STR:len VEC:RESERVE
+   v s JSON:APPEND-STRING
+   s VEC:BYTES ;
 
-\ serde's u8: an integer with no sign, up to 255.
-: READ-VERSION ( str ^JSON:cursor -- n )
-   {: t:str c :}
-   t c OPEN JSON:T-INT EXPECT
-   JSON:READ-ANY-SPAN$ {: a:str :}
-   a STR:data c@ [char] - = a STR:len 3 > or if E-JSON throw then
-   JSON:READ-INT {: v:n :}
-   JSON:READ-FINISH
-   v 255 > if E-JSON throw then
-   v ;
+\ serde's u8: an integer with no sign, up to 255, so digits alone.
+: READ-VERSION ( JSON:value -- n )
+   {: v :}
+   v JSON:TEXT$ {: a:str :}
+   a STR:DIGITS? EXPECT
+   a STR:len 3 <= EXPECT
+   v JSON:>N {: n:n :}
+   n 255 <= EXPECT
+   n ;
 
-: STRING-AT ( str str ^JSON:cursor ^ARENA:arena -- str )
-   {: c ar :} c JSON:READ-MEMBER$ c ar READ-STRING ;
+: STRING-AT ( JSON:value str ^ARENA:arena -- str )
+   {: ar :} JSON:GET ar READ-STRING ;
 
 \ LoadedSecret: the version, the binding and the refresh token.
 : READ-RECORD
-   ( str ^JSON:cursor ^ARENA:arena -- n JOURNAL:dropbox-binding str )
-   {: t:str c ar :}
-   t s" version" c JSON:READ-MEMBER$ c READ-VERSION
-   t s" account_id" c ar STRING-AT
-   t s" root_namespace_id" c ar STRING-AT
-   t s" remote_root" c ar STRING-AT
+   ( str ^ARENA:arena -- n JOURNAL:dropbox-binding str )
+   {: t:str ar :}
+   t JSON:PARSE {: v :}
+   v s" version" JSON:GET READ-VERSION
+   v s" account_id" ar STRING-AT
+   v s" root_namespace_id" ar STRING-AT
+   v s" remote_root" ar STRING-AT
    JOURNAL-DROPBOX--BINDING:MAKE
-   t s" refresh_token" c ar STRING-AT ;
+   v s" refresh_token" ar STRING-AT ;
 
 \ The category a refusal is logged with: E-JSON-READ-EOF the text's end,
 \ another reader code its syntax; E-JSON its data, and JSON:E-MEMBER, a
@@ -234,14 +230,12 @@ ARENA CURSORS JSON:cursor
 : DROP-SEED ( n JOURNAL:dropbox-binding str -- ) drop drop drop ;
 
 \ READ-RECORD, replacing the seed it is given, as catch keeps the
-\ stack's shape; a refusal leaves the cursor owning nothing.
+\ stack's shape.
 : DECODE ( str ^ARENA:arena -- n JOURNAL:dropbox-binding str )
    {: s:str ar :}
-   ar CURSORS-NEW {: c :}
-   0 NO-BINDING NO-STR [: DROP-SEED s c ar READ-RECORD ;] catch
+   0 NO-BINDING NO-STR [: DROP-SEED s ar READ-RECORD ;] catch
    {: code:n :}
    code 0= if exit then
-   c JSON:READ-DISPOSE
    code REFUSAL? if code CATEGORY REFUSED then
    code throw ;
 

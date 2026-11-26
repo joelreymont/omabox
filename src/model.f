@@ -7,8 +7,9 @@
 \ recovery's content, written byte for byte as the Rust version's
 \ serde_json writes it and read as serde_json reads any value either
 \ version stored. A reader refuses a struct written as an array, a variant
-\ with no payload written as an object and a skipped member holding a lone
-\ surrogate escape: serde reads them and no writer makes them. The writers
+\ with no payload written as an object, a skipped member holding a lone
+\ surrogate escape or a repeated member name, and a skipped member's name
+\ repeated: serde reads them and no writer makes them. The writers
 \ give serde_json's bytes only on a compact writer that does not escape
 \ non-ASCII.
 \ FOLD is Rust's CanonicalPath::from_display over Path::iter: a path that
@@ -888,111 +889,107 @@ public
 
 private
 
-\ MEMBER searches an object's text for one member, so members come in any
-\ order; each search reads the text to the end and reuses one cursor.
+\ A read parses the text once, which refuses a repeated member name at
+\ any depth, and takes each member by GET, so members come in any order.
 
-\ The cursor a read reuses and the arena that takes its strings.
-STRUCTURE reading
-   FIELD cursor ^JSON:cursor
-   FIELD arena ^ARENA:arena
-;STRUCTURE
+: EXPECT ( bool -- ) 0= if E-STORED throw then ;
 
-ARENA CURSORS JSON:cursor
+\ The string's decoded bytes, in a vector in the arena sized to its text
+\ as written, which bounds them.
+: READ-STRING ( JSON:value ^ARENA:arena -- str )
+   {: v ar:^ARENA:arena :}
+   v JSON:STRING? EXPECT
+   ar ARENA:ALLOCATOR 0 [type] u8 VEC:NEW {: s :}
+   s v JSON:TEXT$ STR:len VEC:RESERVE
+   v s JSON:APPEND-STRING
+   s VEC:BYTES ;
 
-: READING ( ^ARENA:arena -- reading )
-   {: ar:^ARENA:arena :}
-   ar CURSORS-NEW ar READING-MAKE ;
+\ Whether a number is written as an integer: a minus at most, then digits.
+: INT-TEXT? ( str -- bool )
+   {: t:str :}
+   t STR:data {: a:^ :}  t STR:len {: u:n :}
+   u 0<> if a c@ [char] - = if a 1+ u 1- >str STR:DIGITS? exit then then
+   t STR:DIGITS? ;
 
-: EXPECT ( n n -- ) <> if E-STORED throw then ;
+\ serde_json reads -0, a fraction or an exponent as a float, which no
+\ integer field takes.
+: READ-I64 ( JSON:value -- n )
+   {: v :}
+   v JSON:TEXT$ {: t:str :}
+   t INT-TEXT? EXPECT
+   t s" -0" STR:= if E-STORED throw then
+   v JSON:>N ;
 
-\ A reader on text, and its first token.
-: OPEN ( str reading -- JSON:reader n )
-   {: t:str r:reading :}
-   r READING-UNMAKE drop t JSON:READ-INIT JSON:READ-NEXT ;
-
-\ The text of the object's member named by the second string.
-: MEMBER ( str str reading -- str )
-   READING-UNMAKE drop JSON:READ-MEMBER$ ;
-
-\ A word ending -HERE decodes the value at the reader's token and leaves the
-\ reader on the value's last token.
-
-\ The string at the reader's token, decoded into a vector in the arena
-\ sized to its text as written, which bounds it.
-: STRING-HERE ( JSON:reader reading -- JSON:reader str )
-   {: r:reading :}
-   JSON:READ-TOKEN JSON:T-STR EXPECT
-   JSON:READ-SPAN$ STR:len {: u:n :}
-   r READING-UNMAKE nip ARENA:ALLOCATOR u [type] u8 VEC:NEW JSON:READ-STR ;
-
-: READ-STRING ( str reading -- str )
-   {: t:str r:reading :}
-   t r OPEN drop r STRING-HERE {: s:str :}
-   JSON:READ-FINISH s ;
-
-\ serde_json reads -0 as a float, which no integer field takes.
-: I64-HERE ( JSON:reader -- JSON:reader n )
-   JSON:READ-TOKEN JSON:T-INT EXPECT
-   JSON:READ-SPAN$ s" -0" STR:= if E-STORED throw then
-   JSON:READ-INT ;
-
-: READ-I64 ( str reading -- n )
-   OPEN drop I64-HERE {: v:n :} JSON:READ-FINISH v ;
-
-: READ-U16 ( str reading -- u16 )
+: READ-U16 ( JSON:value -- u16 )
    READ-I64 {: v:n :}
    v 0 < v $FFFF > or if E-STORED throw then
    v ;
 
-\ The index whose name the current string or key decodes to, from i on.
-: INDEX ( JSON:reader [ n -- str ] n -- JSON:reader n )
-   {: names i:n :}
+\ The index whose name the string decodes to, from i on.
+: INDEX ( JSON:value [ n -- str ] n -- n )
+   {: v names i:n :}
    i names execute {: a :}
    a STR:len 0= if E-STORED throw then
-   a JSON:READ-STR-EQ? if i exit then
-   names i 1+ RECURSE ;
+   v a JSON:STRING= if i exit then
+   v names i 1+ RECURSE ;
 
-\ An externally tagged enum's variant index and the text of its payload,
-\ empty for a variant written as its name alone.
-: TAGGED ( str [ n -- str ] reading -- n str )
-   {: t:str names r:reading :}
-   t r OPEN dup JSON:T-STR = if
-      drop names 0 INDEX {: i:n :} JSON:READ-FINISH i s" " exit
-   then
-   JSON:T-OBJ EXPECT JSON:READ-NEXT JSON:T-KEY EXPECT
-   names 0 INDEX {: i:n :}
-   JSON:READ-NEXT drop JSON:READ-ANY-SPAN$ {: p:str :}
-   JSON:READ-NEXT JSON:T-OBJ-END EXPECT
-   JSON:READ-FINISH i p ;
+\ After k members, the one member's variant index and payload; a second
+\ member is refused.
+: ONLY-MEMBER
+   ( n n JSON:value JSON:value JSON:value [ n -- str ] -- n n JSON:value )
+   {: k:n i:n p name v names :}
+   k 0<> if E-STORED throw then
+   1 name names 0 INDEX v ;
+
+\ An externally tagged enum's variant index and its payload, none for a
+\ variant written as its name alone.
+: TAGGED ( JSON:value [ n -- str ] -- n option<JSON:value> )
+   {: t names :}
+   t JSON:STRING? if t names 0 INDEX OPTION:NONE exit then
+   t JSON:OBJECT? EXPECT
+   0 0 t t [: names ONLY-MEMBER ;] JSON:EACH-MEMBER {: k:n i:n p :}
+   k 0= if E-STORED throw then
+   i p OPTION:SOME ;
 
 \ A variant with no payload is written as its name alone.
-: UNIT ( str -- ) STR:len 0<> if E-STORED throw then ;
+: UNIT ( option<JSON:value> -- )
+   MATCH option
+     none OF ENDOF
+     some OF drop E-STORED throw ENDOF
+   ;MATCH ;
 
-: READ-HASH ( str reading -- DROPBOX:hash )
+\ A variant with a payload is written as an object holding it.
+: PAYLOAD ( option<JSON:value> -- JSON:value )
+   MATCH option
+     none OF E-STORED throw ENDOF
+     some OF ENDOF
+   ;MATCH ;
+
+: READ-HASH ( JSON:value ^ARENA:arena -- DROPBOX:hash )
    READ-STRING DROPBOX:>HASH ;
 
-: READ-REV ( str reading -- DROPBOX:rev )
+: READ-REV ( JSON:value ^ARENA:arena -- DROPBOX:rev )
    READ-STRING DROPBOX:>REV ;
 
-: HASH-AT ( str str reading -- DROPBOX:hash )
-   {: r:reading :} r MEMBER r READ-HASH ;
+: HASH-AT ( JSON:value str ^ARENA:arena -- DROPBOX:hash )
+   {: ar:^ARENA:arena :} JSON:GET ar READ-HASH ;
 
-: REV-AT ( str str reading -- DROPBOX:rev )
-   {: r:reading :} r MEMBER r READ-REV ;
+: REV-AT ( JSON:value str ^ARENA:arena -- DROPBOX:rev )
+   {: ar:^ARENA:arena :} JSON:GET ar READ-REV ;
 
-: READ-LOCAL ( str reading -- local )
-   {: r:reading :} s" content" r HASH-AT MODEL-LOCAL:MAKE ;
+: READ-LOCAL ( JSON:value ^ARENA:arena -- local )
+   {: ar:^ARENA:arena :} s" content" ar HASH-AT MODEL-LOCAL:MAKE ;
 
-: READ-REMOTE ( str reading -- remote )
-   {: t:str r:reading :}
-   t s" content" r HASH-AT
-   t s" revision" r REV-AT MODEL-REMOTE:MAKE ;
+: READ-REMOTE ( JSON:value ^ARENA:arena -- remote )
+   {: v ar:^ARENA:arena :}
+   v s" content" ar HASH-AT
+   v s" revision" ar REV-AT MODEL-REMOTE:MAKE ;
 
-: LOCAL-AT ( str str reading -- local )
-   {: r:reading :} r MEMBER r READ-LOCAL ;
+: LOCAL-AT ( JSON:value str ^ARENA:arena -- local )
+   {: ar:^ARENA:arena :} JSON:GET ar READ-LOCAL ;
 
-: REMOTE-AT ( str str reading -- remote )
-   {: r:reading :} r MEMBER r READ-REMOTE ;
+: REMOTE-AT ( JSON:value str ^ARENA:arena -- remote )
+   {: ar:^ARENA:arena :} JSON:GET ar READ-REMOTE ;
 
 : DIRECTORY-OPERATION ( n -- operation )
    case
@@ -1002,41 +999,41 @@ ARENA CURSORS JSON:cursor
       MODEL-OPERATION:DELETE-REMOTE-DIRECTORY swap
    endcase ;
 
-\ An operation on a file, variant index 4 on, from its payload's text.
-: FILE-OPERATION ( str n reading -- operation )
-   {: t:str i:n r:reading :}
-   i 4 = if t s" content" r HASH-AT
+\ An operation on a file, variant index 4 on, from its payload.
+: FILE-OPERATION ( JSON:value n ^ARENA:arena -- operation )
+   {: t i:n ar:^ARENA:arena :}
+   i 4 = if t s" content" ar HASH-AT
       MODEL-OPERATION:CREATE-REMOTE exit then
-   i 5 = if t s" source" r REMOTE-AT
+   i 5 = if t s" source" ar REMOTE-AT
       MODEL-OPERATION:INSTALL-LOCAL exit then
-   i 6 = if t s" file" r LOCAL-AT
+   i 6 = if t s" file" ar LOCAL-AT
       MODEL-OPERATION:PRESERVE-LOCAL exit then
-   i 7 = if t s" source" r REMOTE-AT
-      t s" expected_content" r HASH-AT
+   i 7 = if t s" source" ar REMOTE-AT
+      t s" expected_content" ar HASH-AT
       MODEL-OPERATION:REPLACE-LOCAL exit then
-   i 8 = if t s" expected_content" r HASH-AT
+   i 8 = if t s" expected_content" ar HASH-AT
       MODEL-OPERATION:DELETE-LOCAL exit then
-   i 9 = if t s" file" r REMOTE-AT
+   i 9 = if t s" file" ar REMOTE-AT
       MODEL-OPERATION:PRESERVE-REMOTE exit then
-   i 10 = if t s" content" r HASH-AT
-      t s" expected_revision" r REV-AT
+   i 10 = if t s" content" ar HASH-AT
+      t s" expected_revision" ar REV-AT
       MODEL-OPERATION:REPLACE-REMOTE exit then
-   t s" expected_revision" r REV-AT MODEL-OPERATION:DELETE-REMOTE ;
+   t s" expected_revision" ar REV-AT MODEL-OPERATION:DELETE-REMOTE ;
 
-: READ-OPERATION ( str reading -- operation )
-   {: r:reading :}
-   [: OPERATION-NAME ;] r TAGGED {: i:n p:str :}
+: READ-OPERATION ( JSON:value ^ARENA:arena -- operation )
+   {: ar:^ARENA:arena :}
+   [: OPERATION-NAME ;] TAGGED {: i:n p :}
    i 4 < if p UNIT i DIRECTORY-OPERATION exit then
-   p i r FILE-OPERATION ;
+   p PAYLOAD i ar FILE-OPERATION ;
 
-: READ-CONFLICT ( str reading -- conflict )
-   {: r:reading :}
-   [: CONFLICT-NAME ;] r TAGGED {: i:n p:str :}
-   i 2 = if p s" remote" r REMOTE-AT
+: READ-CONFLICT ( JSON:value ^ARENA:arena -- conflict )
+   {: ar:^ARENA:arena :}
+   [: CONFLICT-NAME ;] TAGGED PAYLOAD {: i:n p :}
+   i 2 = if p s" remote" ar REMOTE-AT
       MODEL-CONFLICT:LOCAL-DELETED exit then
-   i 3 = if p s" local" r LOCAL-AT
+   i 3 = if p s" local" ar LOCAL-AT
       MODEL-CONFLICT:REMOTE-DELETED exit then
-   p s" local" r LOCAL-AT p s" remote" r REMOTE-AT
+   p s" local" ar LOCAL-AT p s" remote" ar REMOTE-AT
    i 0 = if MODEL-CONFLICT:INITIAL exit then
    MODEL-CONFLICT:DIVERGENT ;
 
@@ -1050,12 +1047,12 @@ ARENA CURSORS JSON:cursor
       MODEL-BLOCKAGE:CONFLICT-COPY-OCCUPIED swap
    endcase ;
 
-: READ-BLOCKAGE ( str reading -- blockage )
-   {: r:reading :}
-   [: BLOCKAGE-NAME ;] r TAGGED {: i:n p:str :}
-   i 1 = if p s" tag" r MEMBER r READ-STRING
+: READ-BLOCKAGE ( JSON:value ^ARENA:arena -- blockage )
+   {: ar:^ARENA:arena :}
+   [: BLOCKAGE-NAME ;] TAGGED {: i:n p :}
+   i 1 = if p PAYLOAD s" tag" JSON:GET ar READ-STRING
       MODEL-BLOCKAGE:REMOTE-REJECTED exit then
-   i 2 = if p s" status" r MEMBER r READ-U16
+   i 2 = if p PAYLOAD s" status" JSON:GET READ-U16
       MODEL-BLOCKAGE:DOWNLOAD-UNAVAILABLE exit then
    p UNIT i UNIT-BLOCKAGE ;
 
@@ -1067,12 +1064,11 @@ ARENA CURSORS JSON:cursor
    code ;
 
 \ Runs a read that replaces its seed, as catch keeps the stack's shape; a
-\ failure frees what the cursor owns and a refused text throws E-STORED.
-: GUARDED ( R reading [ R -- R ] -- R )
-   {: r:reading q :}
+\ refused text throws E-STORED.
+: GUARDED ( R [ R -- R ] -- R )
+   {: q :}
    [: q execute ;] catch {: code:n :}
    code 0= if exit then
-   r READING-UNMAKE drop JSON:READ-DISPOSE
    code STORED-CODE throw ;
 
 public
@@ -1093,24 +1089,24 @@ private
 
 public
 
-\ Each reader copies its strings, and its cursor, into ARENA.
+\ Each reader copies its strings into ARENA.
 : JSON>HASH ( str ^ARENA:arena -- DROPBOX:hash )
-   {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
-   NO-HASH r [: DROP-HASH s r READ-HASH ;] GUARDED ;
+   {: s:str ar:^ARENA:arena :}
+   NO-HASH [: DROP-HASH s JSON:PARSE ar READ-HASH ;] GUARDED ;
 
 : JSON>OPERATION ( str ^ARENA:arena -- operation )
-   {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
-   MODEL-OPERATION:CREATE-LOCAL-DIRECTORY r
-   [: DROP-OPERATION s r READ-OPERATION ;] GUARDED ;
+   {: s:str ar:^ARENA:arena :}
+   MODEL-OPERATION:CREATE-LOCAL-DIRECTORY
+   [: DROP-OPERATION s JSON:PARSE ar READ-OPERATION ;] GUARDED ;
 
 : JSON>CONFLICT ( str ^ARENA:arena -- conflict )
-   {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
-   NO-LOCAL MODEL-CONFLICT:REMOTE-DELETED r
-   [: DROP-CONFLICT s r READ-CONFLICT ;] GUARDED ;
+   {: s:str ar:^ARENA:arena :}
+   NO-LOCAL MODEL-CONFLICT:REMOTE-DELETED
+   [: DROP-CONFLICT s JSON:PARSE ar READ-CONFLICT ;] GUARDED ;
 
 : JSON>BLOCKAGE ( str ^ARENA:arena -- blockage )
-   {: s:str ar:^ARENA:arena :} ar READING {: r:reading :}
-   MODEL-BLOCKAGE:STAGE-OCCUPIED r
-   [: DROP-BLOCKAGE s r READ-BLOCKAGE ;] GUARDED ;
+   {: s:str ar:^ARENA:arena :}
+   MODEL-BLOCKAGE:STAGE-OCCUPIED
+   [: DROP-BLOCKAGE s JSON:PARSE ar READ-BLOCKAGE ;] GUARDED ;
 
 ;package
