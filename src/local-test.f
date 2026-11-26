@@ -49,7 +49,7 @@
 \ a parent's name limit is none when it is missing. A case that makes
 \ files works in its own directory under TMPDIR and removes it.
 \ Run from the repository root: hb --load src/local-test.f </dev/null
-require src/lib/test.f
+require src/lib/test/assert.f
 require src/lib/test/stderr.f
 require src/lib/fmt.f
 require src/lib/arena.f
@@ -63,6 +63,11 @@ require src/lib/fs-list.f
 require src/lib/fd.f
 require src/lib/xattr.f
 require src/lib/adt/option.f
+require src/lib/sqlite.f
+require src/lib/ffi-abi.f
+require src/lib/vector.f
+require src/lib/log.f
+require src/lib/inotify.f
 require src/dropbox.f
 require src/model.f
 require src/config.f

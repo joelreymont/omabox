@@ -81,7 +81,7 @@ require src/lib/error.f
 require src/lib/arena.f
 require src/lib/string.f
 require src/lib/fmt.f
-require src/lib/test.f
+require src/lib/test/assert.f
 require src/lib/test/stderr.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
@@ -92,6 +92,7 @@ require src/lib/process-argv.f
 require src/lib/process-env.f
 require src/lib/engine-candidate.f
 require src/lib/vector.f
+require src/lib/secret.f
 require src/dropbox.f
 require src/model.f
 require src/journal.f
@@ -105,6 +106,7 @@ require src/version.f
 require src/omabox.f
 require src/test-dropbox.f
 require src/test-client.f
+require src/auth.f
 
 package OMABOX
 private

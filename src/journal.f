@@ -52,9 +52,9 @@ require src/lib/sqlite.f
 require src/lib/fsm.f
 require src/lib/type/deftype.f
 require src/lib/byte-buffer.f
-require src/lib/json.f
 require src/lib/vector.f
 require src/lib/heap.f
+require src/lib/json/write.f
 require src/dropbox.f
 require src/model.f
 

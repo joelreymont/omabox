@@ -73,7 +73,7 @@ require src/lib/fmt.f
 require src/lib/arena.f
 require src/lib/span.f
 require src/lib/string.f
-require src/lib/test.f
+require src/lib/test/assert.f
 require src/lib/test/stderr.f
 require src/lib/test/mapped.f
 require src/lib/test/counting-allocator.f
@@ -84,10 +84,14 @@ require src/lib/test/stderr.f
 require src/lib/adt/option.f
 require src/lib/fd.f
 require src/lib/task.f
+require src/lib/heap.f
+require src/lib/net/httpc.f
+require src/lib/log.f
 require src/test-formal.f
 require src/dropbox.f
 require src/test-dropbox.f
 require src/test-client.f
+require src/version.f
 
 \ DROPBOX reopened for the throws no answer of the fake reaches: a reader
 \ that faults, and an OPEN that fails once its buffers exist.

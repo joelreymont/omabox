@@ -17,7 +17,7 @@
 require src/lib/arena.f
 require src/lib/string.f
 require src/lib/fmt.f
-require src/lib/test.f
+require src/lib/test/assert.f
 require src/lib/test/stderr.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f

@@ -32,7 +32,6 @@ require src/lib/byte-buffer.f
 require src/lib/vector.f
 require src/lib/heap.f
 require src/lib/arena.f
-require src/lib/json.f
 require src/lib/log.f
 require src/lib/task.f
 require src/lib/adt/option.f
@@ -44,6 +43,7 @@ require src/lib/fd.f
 require src/lib/fmt.f
 require src/lib/utf8-scalar.f
 require src/lib/utf8-lossy.f
+require src/lib/json/write.f
 
 package STATUS
 public

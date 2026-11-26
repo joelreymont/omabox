@@ -36,8 +36,10 @@ require src/lib/arena.f
 require src/lib/unicode.f
 require src/lib/utf8-scalar.f
 require src/lib/error.f
-require src/lib/json.f
 require src/lib/vector.f
+require src/lib/json/write.f
+require src/lib/json/value.f
+require src/lib/json/read.f
 require src/dropbox.f
 
 package MODEL

@@ -37,7 +37,6 @@
 require src/lib/string.f
 require src/lib/span.f
 require src/lib/fmt.f
-require src/lib/json.f
 require src/lib/adt/option.f
 require src/lib/task.f
 require src/lib/time.f
@@ -46,6 +45,10 @@ require src/lib/vector.f
 require src/lib/heap.f
 require src/lib/net/tcp4.f
 require src/lib/net/http.f
+require src/lib/json/value.f
+require src/lib/net/http-response.f
+require src/lib/net/http-request.f
+require src/lib/net/http-router.f
 require src/dropbox.f
 
 package TEST-DROPBOX

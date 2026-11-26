@@ -53,7 +53,7 @@ require src/lib/error.f
 require src/lib/arena.f
 require src/lib/string.f
 require src/lib/fmt.f
-require src/lib/test.f
+require src/lib/test/assert.f
 require src/lib/test/stderr.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
@@ -68,6 +68,9 @@ require src/status.f
 require src/config.f
 require src/lib/secret/dir.f
 require src/lib/aio.f
+require src/lib/secret.f
+require src/lib/vector.f
+require src/lib/task.f
 require src/test-dropbox.f
 require src/test-client.f
 require src/test-formal.f

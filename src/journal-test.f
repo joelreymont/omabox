@@ -68,15 +68,15 @@ require src/lib/error.f
 require src/lib/arena.f
 require src/lib/string.f
 require src/lib/fmt.f
-require src/lib/test.f
+require src/lib/test/assert.f
 require src/lib/test/stderr.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
 require src/lib/fs-anchored.f
 require src/lib/fs-statx.f
 require src/lib/sqlite.f
-require src/lib/json.f
 require src/lib/vector.f
+require src/lib/heap.f
 require src/dropbox.f
 require src/model.f
 require src/journal.f

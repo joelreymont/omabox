@@ -25,10 +25,11 @@ require src/lib/arena.f
 require src/lib/span.f
 require src/lib/string.f
 require src/lib/vector.f
-require src/lib/test.f
+require src/lib/test/assert.f
 require src/lib/fs.f
 require src/lib/fmt.f
 require src/lib/adt/option.f
+require src/lib/ffi-abi.f
 require src/dropbox.f
 require src/test-dropbox.f
 require src/model.f

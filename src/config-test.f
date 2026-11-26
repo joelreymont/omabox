@@ -20,7 +20,7 @@ require src/lib/arena.f
 require src/lib/string.f
 require src/lib/memory.f
 require src/lib/adt/option.f
-require src/lib/test.f
+require src/lib/test/assert.f
 require src/lib/test/stderr.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
@@ -29,6 +29,7 @@ require src/lib/process.f
 require src/lib/fs-list.f
 require src/lib/fmt.f
 require src/lib/vector.f
+require src/lib/spawn.f
 require src/stale.f
 require src/config.f
 

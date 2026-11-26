@@ -23,12 +23,15 @@ require src/lib/utf8-scalar.f
 require src/lib/unicode.f
 require src/lib/fmt.f
 require src/lib/fs-anchored.f
+require src/lib/fsm.f
+require src/lib/fs.f
 require src/model.f
 require src/planner.f
 require src/journal.f
 require src/local.f
 require src/dropbox.f
 require src/replay.f
+require src/status.f
 
 package RECONCILE
 public

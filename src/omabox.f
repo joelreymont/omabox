@@ -40,7 +40,8 @@ require src/lib/fs-mutate.f
 require src/lib/utf8-scalar.f
 require src/lib/unicode/class.f
 require src/lib/vector.f
-require src/lib/json.f
+require src/lib/secret.f
+require src/lib/json/write.f
 require src/config.f
 require src/auth.f
 require src/journal.f

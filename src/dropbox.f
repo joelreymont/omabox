@@ -43,7 +43,6 @@ require src/lib/byte-buffer.f
 require src/lib/vector.f
 require src/lib/heap.f
 require src/lib/arena.f
-require src/lib/json.f
 require src/lib/fmt.f
 require src/lib/log.f
 require src/lib/net/httpc.f
@@ -55,6 +54,10 @@ require src/lib/unicode.f
 require src/lib/date.f
 require src/lib/uri.f
 require src/lib/type/deftype.f
+require src/lib/json/write.f
+require src/lib/json/value.f
+require src/lib/json/read.f
+require src/lib/utf8-scalar.f
 require src/version.f
 
 package DROPBOX

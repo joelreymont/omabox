@@ -23,7 +23,7 @@ require src/lib/fs.f
 require src/lib/task.f
 require src/lib/adt/option.f
 require src/lib/sqlite.f
-require src/lib/json.f
+require src/lib/vector.f
 require src/dropbox.f
 require src/model.f
 require src/journal.f

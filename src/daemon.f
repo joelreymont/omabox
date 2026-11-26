@@ -36,6 +36,7 @@ require src/journal.f
 require src/config.f
 require src/local.f
 require src/lib/secret.f
+require src/lib/fsm.f
 require src/auth.f
 require src/replay.f
 require src/reconcile.f

@@ -17,7 +17,7 @@ require src/lib/error.f
 require src/lib/arena.f
 require src/lib/string.f
 require src/lib/fmt.f
-require src/lib/test.f
+require src/lib/test/assert.f
 require src/lib/test/stderr.f
 require src/lib/fs.f
 require src/lib/fs-mutate.f
@@ -31,11 +31,13 @@ require src/lib/num-types.f
 require src/lib/heap.f
 require src/lib/vector.f
 require src/lib/net/udp.f
+require src/lib/spawn.f
 require src/core/exit-status.f
 require src/config.f
 require src/journal.f
 require src/test-client.f
 require src/omaboxd.f
+require src/version.f
 
 package OMABOXD-TEST
 private

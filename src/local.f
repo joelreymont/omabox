@@ -70,6 +70,7 @@ require src/lib/fd.f
 require src/lib/xattr.f
 require src/lib/vector.f
 require src/lib/sort.f
+require src/lib/fsm.f
 require src/dropbox.f
 require src/model.f
 require src/journal.f
