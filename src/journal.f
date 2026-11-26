@@ -1627,9 +1627,8 @@ private
 $2F constant SLASH
 -1 constant NO-KIND
 
-\ The most rows the stored stream reads, a group's last finishing,
-\ before it is reset and resumed after the group: main stays read
-\ locked no longer than they take to merge.
+\ The most rows the stored stream reads, finishing a group, before it resets,
+\ so main stays read locked only that long; and a plan batch's most plans.
 512 constant BATCH-BOUND
 
 \ Binds a local observation's kind to ?2 and NULL content to ?4.
@@ -3309,22 +3308,17 @@ private
 
 : NO-PATH-BASELINE ( -- option<path-baseline> ) OPTION:NONE ;
 
-\ Each held key once, in byte order, but the settled: one baseline, one
-\ remote row and exactly one local row, all three directories or all three
-\ files of the baseline's content and the remote one of its revision, with
-\ no live plan and no conflict at the key. A key only a conflict holds
-\ is no known path. NOT INDEXED keeps the scan of baselines in key
-\ order; lone and rone are the keys only a local or only a remote row
-\ holds, so no sorter holds the tree.
+\ Fills temp.unsettled with each key a row holds but a conflict alone, less the
+\ settled: baseline, remote and local agree, with no live plan or conflict.
 : KNOWN-KEYS ( -- str )
    s" WITH lone(k) AS (
          SELECT canonical_path FROM local_observations
-         EXCEPT SELECT canonical_path FROM baselines ORDER BY 1),
+         EXCEPT SELECT canonical_path FROM baselines),
       rone(k) AS (
          SELECT canonical_path FROM remote_observations
-         EXCEPT SELECT canonical_path FROM baselines ORDER BY 1),
+         EXCEPT SELECT canonical_path FROM baselines),
       keys(k) AS (
-         SELECT b.canonical_path FROM baselines b NOT INDEXED
+         SELECT b.canonical_path FROM baselines b
          LEFT JOIN local_observations l
             ON l.canonical_path = b.canonical_path
          LEFT JOIN remote_observations r
@@ -3341,8 +3335,7 @@ private
             WHERE status IN ('pending', 'blocked')
          UNION SELECT c.canonical_path FROM conflicts c
             WHERE EXISTS (SELECT 1 FROM baselines o
-               WHERE o.canonical_path = c.canonical_path)
-         ORDER BY 1) " ;
+               WHERE o.canonical_path = c.canonical_path)) " ;
 
 : ONE-KEY ( -- str ) s" WITH keys(k) AS (SELECT ?1) " ;
 
@@ -3378,7 +3371,20 @@ private
    a here au BYTE-COPY  au allot
    b here bu BYTE-COPY  bu allot align ;
 
-create EVERY-KNOWN KNOWN-KEYS KNOWN-SELECT LAY-BOTH
+\ KNOWN-KEYS' keys into temp.unsettled.
+: UNSETTLED-INSERT ( -- str )
+   s" INSERT INTO temp.unsettled SELECT k FROM keys" ;
+
+\ The least unsettled key, then the least above ?1.
+: FIRST-KEY ( -- str )
+   s" WITH keys(k) AS (SELECT k FROM temp.unsettled ORDER BY k LIMIT 1) " ;
+: NEXT-KEY ( -- str )
+   s" WITH keys(k) AS (SELECT k FROM temp.unsettled WHERE k > ?1
+      ORDER BY k LIMIT 1) " ;
+
+create FILL-UNSETTLED KNOWN-KEYS UNSETTLED-INSERT LAY-BOTH
+create FIRST-KNOWN FIRST-KEY KNOWN-SELECT LAY-BOTH
+create NEXT-KNOWN NEXT-KEY KNOWN-SELECT LAY-BOTH
 create ONE-KNOWN ONE-KEY KNOWN-SELECT LAY-BOTH
 
 \ Columns 1 to 4, NULL where no baseline is.
@@ -3428,17 +3434,6 @@ create ONE-KNOWN ONE-KEY KNOWN-SELECT LAY-BOTH
    13 SQLITE:COL-INT 0<> {: live:bool :}
    k b l n r s live JOURNAL-KNOWN--PATH:MAKE ;
 
-\ Visits each row; n counts the rows that hold a baseline.
-: KNOWN-ROWS
-   ( SQLITE:statement ^ARENA:arena [ known-path -- ]
-     -- n SQLITE:statement )
-   {: ar visit :}
-   0 swap
-   begin SQLITE:STEP while
-      1 SQLITE:COL-NULL? 0= if swap 1+ swap then
-      ar ARENA:RESET ar KNOWN-ROW visit execute
-   repeat ;
-
 \ ONE-KEY's statement answers one row.
 : KNOWN-ROW-AT
    ( SQLITE:statement MODEL:key ^ARENA:arena
@@ -3447,17 +3442,90 @@ create ONE-KNOWN ONE-KEY KNOWN-SELECT LAY-BOTH
    k MODEL:KEY>STR 1 SQLITE:BIND-BLOB
    SQLITE:STEP drop ar KNOWN-ROW swap ;
 
+\ The table of the keys a walk visits, made empty; the walk empties it
+\ after.
+: UNSETTLED-TABLE ( SQLITE:connection -- )
+   s" CREATE TABLE IF NOT EXISTS temp.unsettled(
+         k BLOB PRIMARY KEY NOT NULL
+      ) WITHOUT ROWID;
+      DELETE FROM temp.unsettled" SQLITE:EXEC ;
+
+: CLEAR-UNSETTLED ( SQLITE:connection -- )
+   s" DELETE FROM temp.unsettled" SQLITE:EXEC ;
+
+: NO-KNOWN ( -- option<known-path> ) OPTION:NONE ;
+
+\ FIRST-KNOWN's row, decoded into ar after its reset; none past the
+\ last.
+: FIRST-ROW
+   ( SQLITE:statement ^ARENA:arena
+     -- option<known-path> SQLITE:statement )
+   {: ar :}
+   SQLITE:STEP 0= if NO-KNOWN swap exit then
+   ar ARENA:RESET ar KNOWN-ROW OPTION:SOME swap ;
+
+\ NEXT-KNOWN's row above kp's key, decoded into ar after its reset;
+\ kp and false past the last. The binding copies the key.
+: NEXT-ROW
+   ( SQLITE:statement known-path ^ARENA:arena
+     -- known-path bool SQLITE:statement )
+   {: kp ar :}
+   kp JOURNAL-KNOWN--PATH:UNMAKE {: k b l n:n r t live:bool :}
+   k MODEL:KEY>STR 1 SQLITE:BIND-BLOB
+   SQLITE:STEP 0= if kp false rot exit then
+   ar ARENA:RESET ar KNOWN-ROW true rot ;
+
+: FIRST-UNSETTLED ( SQLITE:connection ^ARENA:arena -- option<known-path> )
+   {: c ar :}
+   c FIRST-KNOWN TEXT [: ar FIRST-ROW ;] SQLITE:WITH-STATEMENT ;
+
+: NEXT-UNSETTLED
+   ( SQLITE:connection known-path ^ARENA:arena -- known-path bool )
+   {: c kp ar :}
+   c NEXT-KNOWN TEXT [: kp ar NEXT-ROW ;] SQLITE:WITH-STATEMENT ;
+
+\ 1 when the row held a baseline, else 0.
+: BASELINES-IN ( known-path -- n )
+   JOURNAL-KNOWN--PATH:UNMAKE {: k b l n:n r t live:bool :}
+   b MATCH option
+      none OF 0 ENDOF
+      some OF drop 1 ENDOF
+   ;MATCH ;
+
+\ Visits kp and each unsettled key above it, no statement open, until the
+\ visitor answers false; n counts the visited keys that held a baseline.
+: VISIT-FROM
+   ( SQLITE:connection known-path ^ARENA:arena [ known-path -- bool ]
+     -- n )
+   {: c kp ar visit :}
+   0 kp
+   begin
+      dup BASELINES-IN rot + swap
+      dup visit execute if c swap ar NEXT-UNSETTLED else false then
+   while repeat
+   drop ;
+
+: VISIT-UNSETTLED
+   ( SQLITE:connection ^ARENA:arena [ known-path -- bool ] -- n )
+   {: c ar visit :}
+   c FILL-UNSETTLED RUN
+   c ar FIRST-UNSETTLED MATCH option
+      none OF 0 ENDOF
+      some OF {: kp :} c kp ar visit VISIT-FROM ENDOF
+   ;MATCH ;
+
 public
 
-\ Each held key but the settled, as KNOWN-KEYS has them, in byte order,
-\ decoded into ar, which is reset before each; n is the settled keys'
-\ count: the baselines' count less the visited keys that hold one.
-: EACH-UNSETTLED-PATH ( journal ^ARENA:arena [ known-path -- ] -- n )
+\ Visits each unsettled key in byte order, decoded into ar, reset before each;
+\ visit may write the journal. n counts the settled keys unless visit stopped.
+: EACH-UNSETTLED-PATH
+   ( journal ^ARENA:arena [ known-path -- bool ] -- n )
    {: j ar visit :}
    j >CONNECTION {: c :}
    c s" SELECT count(*) FROM baselines" QUERY-INT {: all:n :}
-   c EVERY-KNOWN TEXT [: ar visit KNOWN-ROWS ;]
-   SQLITE:WITH-STATEMENT {: held:n :}
+   c UNSETTLED-TABLE
+   [: c ar visit VISIT-UNSETTLED ;] [: c CLEAR-UNSETTLED ;] finally
+   {: held:n :}
    all held - ;
 
 \ What the journal holds at the key, decoded into ar.
@@ -3577,28 +3645,41 @@ private
          operations.operation_json, operations.status
       FROM plans JOIN operations ON operations.plan_id = plans.id" ;
 
-: PENDING-WHERE ( -- str )
-   s"  WHERE plans.status = 'pending' ORDER BY plans.id, operations.ordinal" ;
+\ A batch's plans are the subselect's: at most ?2 above id ?1, by id.
+: PENDING-IN ( -- str )
+   s"  WHERE plans.id IN (SELECT p.id FROM plans AS p
+         WHERE p.status = 'pending' AND p.id > ?1
+         ORDER BY p.id LIMIT ?2)
+      ORDER BY plans.id, operations.ordinal" ;
 
-: BLOCKED-WHERE ( -- str )
-   s"  WHERE plans.status = 'blocked' ORDER BY plans.id, operations.ordinal" ;
+: BLOCKED-IN ( -- str )
+   s"  WHERE plans.id IN (SELECT p.id FROM plans AS p
+         WHERE p.status = 'blocked' AND p.id > ?1
+         ORDER BY p.id LIMIT ?2)
+      ORDER BY plans.id, operations.ordinal" ;
 
 \ The status is a literal: one_live_plan_per_path is partial on it, so a
 \ bound status would re-prepare the statement at every bind.
-create PENDING-QUERY PLAN-SELECT PENDING-WHERE LAY-BOTH
-create BLOCKED-QUERY PLAN-SELECT BLOCKED-WHERE LAY-BOTH
+create PENDING-QUERY PLAN-SELECT PENDING-IN LAY-BOTH
+create BLOCKED-QUERY PLAN-SELECT BLOCKED-IN LAY-BOTH
+
+: TALLY-ROW ( SQLITE:statement -- n n SQLITE:statement )
+   SQLITE:STEP drop 0 SQLITE:COL-INT swap 1 SQLITE:COL-INT swap ;
 
 \ Completed plans with an operation that installs a Dropbox file, run or not.
-: DOWNLOADED-WHERE ( -- str )
-   s"  WHERE plans.status = 'completed' AND EXISTS (
-         SELECT 1 FROM operations AS d WHERE d.plan_id = plans.id
-            AND json_valid(d.operation_json)
-            AND (json_type(d.operation_json, '$.InstallLocal') IS NOT NULL
-               OR json_type(d.operation_json, '$.ReplaceLocal')
-                  IS NOT NULL))
+: DOWNLOADED-IN ( -- str )
+   s"  WHERE plans.id IN (SELECT p.id FROM plans AS p
+         WHERE p.status = 'completed' AND p.id > ?1 AND EXISTS (
+            SELECT 1 FROM operations AS d WHERE d.plan_id = p.id
+               AND json_valid(d.operation_json)
+               AND (json_type(d.operation_json, '$.InstallLocal')
+                     IS NOT NULL
+                  OR json_type(d.operation_json, '$.ReplaceLocal')
+                     IS NOT NULL))
+         ORDER BY p.id LIMIT ?2)
       ORDER BY plans.id, operations.ordinal" ;
 
-create DOWNLOADED-QUERY PLAN-SELECT DOWNLOADED-WHERE LAY-BOTH
+create DOWNLOADED-QUERY PLAN-SELECT DOWNLOADED-IN LAY-BOTH
 
 : PATH-INVALID ( str MODEL:path str -- )
    {: op:str path d:str :}
@@ -3705,6 +3786,11 @@ create DOWNLOADED-QUERY PLAN-SELECT DOWNLOADED-WHERE LAY-BOTH
    u 0= if false exit then
    plans u 1- VEC:AT @ >ID id ID= ;
 
+\ The id the next batch reads above: the batch's last plan's.
+: LAST-ID ( ^VEC:vector<plan-record> -- option<plan-id> )
+   {: plans :}
+   plans plans VEC:COUNT 1- VEC:AT @ >ID OPTION:SOME ;
+
 : NEW-PLAN-ROW
    ( SQLITE:statement ^VEC:vector<plan-record> plan-id MODEL:path
      planned-operation str ^ARENA:arena -- SQLITE:statement )
@@ -3732,14 +3818,26 @@ create DOWNLOADED-QUERY PLAN-SELECT DOWNLOADED-WHERE LAY-BOTH
    then
    plans id path planned op ar NEW-PLAN-ROW ;
 
-\ Every plan the query text answers, each one's operations in order.
-: READ-PLANS-WITH-STATUS
-   ( SQLITE:connection str str ^ARENA:arena
+\ The id a batch reads above; none reads from the first plan, as SQLite
+\ numbers plans from 1.
+: ABOVE-ID ( option<plan-id> -- n )
+   MATCH option
+      none OF 0 ENDOF
+      some OF PLAN-ID>N ENDOF
+   ;MATCH ;
+
+: BATCH-BIND
+   ( SQLITE:statement option<plan-id> -- SQLITE:statement )
+   ABOVE-ID 1 SQLITE:BIND-INT BATCH-BOUND 2 SQLITE:BIND-INT ;
+
+\ The query's batch above the id, each plan's operations in order.
+: READ-BATCH
+   ( SQLITE:connection str option<plan-id> str ^ARENA:arena
      -- ^VEC:vector<plan-record> )
-   {: c q:str op:str ar :}
+   {: c q:str above op:str ar :}
    ar [type] plan-record NEW-VECTOR {: plans :}
-   c q
-    [: begin SQLITE:STEP while plans op ar PLAN-ROW repeat ;]
+   c q [: above BATCH-BIND
+      begin SQLITE:STEP while plans op ar PLAN-ROW repeat ;]
    SQLITE:WITH-STATEMENT
    plans ;
 
@@ -3986,26 +4084,8 @@ create DOWNLOADED-QUERY PLAN-SELECT DOWNLOADED-WHERE LAY-BOTH
 
 public
 
-\ Records a planner-approved baseline that needs no effect, unless a
-\ live plan owns the path; the path's conflicts are resolved.
-: RECORD-NOOP
-   ( journal MODEL:path MODEL:baseline ^ARENA:arena -- noop-write )
-   {: j path b ar :}
-   j >CONNECTION {: c :}
-   c [: c path b ar RECORD-NOOP-IN ;]
-   SQLITE:WITH-TRANSACTION ;
-
-\ Commits an ordered plan before an effect executor sees it; a live
-\ plan the path already owns is answered instead.
-: RECORD-PLAN
-   ( journal MODEL:path operation-plan ^ARENA:arena -- plan-write )
-   {: j path plan ar :}
-   j >CONNECTION {: c :}
-   c [: c path plan ar [: RECORD-PLAN-IN ;] ENCODING ;]
-   SQLITE:WITH-TRANSACTION ;
-
-\ Commits every journal-only decision of one complete observation
-\ together: all, or none when one throws. The answer's vector is in ar.
+\ Commits a batch of journal-only decisions together: all, or none
+\ when one throws. The answer's vector is in ar.
 : RECORD-RECONCILIATION
    ( journal ^VEC:vector<path-baseline> ^VEC:vector<path-plan>
      ^ARENA:arena -- reconciliation-write )
@@ -4019,28 +4099,50 @@ public
    [: c [: c noops plans live row [: RECONCILED ;] ENCODING ;]
       SQLITE:WITH-TRANSACTION ;] [: row ARENA:RELEASE ;] finally ;
 
-\ Every plan awaiting its next effect, by id, each one's operations in
-\ order.
-: PENDING-PLANS ( journal ^ARENA:arena -- ^VEC:vector<plan-record> )
-   {: j ar :}
-   j >CONNECTION PENDING-QUERY TEXT s" read pending plans" ar
-   READ-PLANS-WITH-STATUS ;
+\ At most BATCH-BOUND plans awaiting their next effect whose id is above
+\ the one given (all, for none), by id, each one's operations in order.
+: PENDING-BATCH
+   ( journal option<plan-id> ^ARENA:arena -- ^VEC:vector<plan-record> )
+   {: j above ar :}
+   j >CONNECTION PENDING-QUERY TEXT above s" read pending plans" ar
+   READ-BATCH ;
 
-\ Every plan a classified failure holds, by id, each one's operations in
-\ order.
-: BLOCKED-PLANS ( journal ^ARENA:arena -- ^VEC:vector<plan-record> )
-   {: j ar :}
-   j >CONNECTION BLOCKED-QUERY TEXT s" read blocked plans" ar
-   READ-PLANS-WITH-STATUS ;
+\ The live plans, pending or blocked, and the blocked ones among them.
+: LIVE-TALLY ( journal -- n n )
+   >CONNECTION
+   s" SELECT count(*), count(*) FILTER (WHERE status = 'blocked')
+      FROM plans WHERE status IN ('pending', 'blocked')"
+   [: TALLY-ROW ;] SQLITE:WITH-STATEMENT ;
 
-\ Every completed plan not yet forgotten with an operation that installs
-\ a Dropbox file, by id, each one's operations in order: its verified
-\ stage may remain.
-: COMPLETED-DOWNLOAD-PLANS
-   ( journal ^ARENA:arena -- ^VEC:vector<plan-record> )
-   {: j ar :}
-   j >CONNECTION DOWNLOADED-QUERY TEXT
-   s" read completed download plans" ar READ-PLANS-WITH-STATUS ;
+\ At most BATCH-BOUND plans a classified failure holds, above the id as
+\ PENDING-BATCH reads.
+: BLOCKED-BATCH
+   ( journal option<plan-id> ^ARENA:arena -- ^VEC:vector<plan-record> )
+   {: j above ar :}
+   j >CONNECTION BLOCKED-QUERY TEXT above s" read blocked plans" ar
+   READ-BATCH ;
+
+\ At most BATCH-BOUND completed, unforgotten plans that install a Dropbox
+\ file, above the id, as PENDING-BATCH: a verified stage of each may remain.
+: DOWNLOADED-BATCH
+   ( journal option<plan-id> ^ARENA:arena -- ^VEC:vector<plan-record> )
+   {: j above ar :}
+   j >CONNECTION DOWNLOADED-QUERY TEXT above
+   s" read completed download plans" ar READ-BATCH ;
+
+\ Works each batch of read in ar, above the last plan of the one before, taken
+\ before work may shrink it: true at an empty batch, false once work answers so.
+: EACH-BATCH
+   ( journal
+     [ journal option<plan-id> ^ARENA:arena -- ^VEC:vector<plan-record> ]
+     [ ^VEC:vector<plan-record> ^ARENA:arena -- bool ] ^ARENA:arena
+     -- bool )
+   {: j read work ar :}
+   NO-PLAN-ID begin
+      j swap ar read execute
+      dup VEC:COUNT 0= if drop true exit then
+      dup LAST-ID swap ar work execute 0= if drop false exit then
+   again ;
 
 \ The plan with this id as the journal holds it now, if any.
 : PLAN-OF ( journal plan-id ^ARENA:arena -- option<plan-record> )

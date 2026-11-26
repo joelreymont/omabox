@@ -7,7 +7,7 @@
 \ serves, ACCOUNTED takes its first access token, NEW-LINK makes a
 \ REPLAY link on a client below a root, and DOWNLOADS$ is the fake's
 \ record of downloads. RECORD journals a pending plan at a path.
-\ UNPROTECTED protects no binding and LEASED takes a lease that must
+\ UNPROTECTED protects no slot and LEASED takes a lease that must
 \ exist. CHECKPOINTED leaves a slot holding a durable checkpoint of
 \ CHECKPOINT "x" bytes, FILL-XS writes those bytes, and PAST-HASH and
 \ SERVES-PAST give the fake a file of them followed by a tail. SOCKET-AT
@@ -34,6 +34,7 @@ require src/dropbox.f
 require src/test-dropbox.f
 require src/model.f
 require src/journal.f
+require src/test-journal.f
 require src/local.f
 require src/replay.f
 
@@ -193,7 +194,7 @@ public
 
 \ ---- download slot leases
 
-: UNPROTECTED ( LOCAL:binding -- bool ) drop false ;
+: UNPROTECTED ( LOCAL:binding n -- bool ) drop drop false ;
 
 : LEASED
    ( option<LOCAL:download-slot-lease> -- LOCAL:download-slot-lease )

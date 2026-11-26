@@ -242,11 +242,17 @@ ARENA SLOTS JOURNAL:journal
    path MODEL:EXCLUDED? if exit then
    path ops ar PENDING-DETAIL ar v ENTRY+ ;
 
+: PENDING-PLANS+
+   ( ^VEC:vector<JOURNAL:plan-record> ^ARENA:arena ^VEC:vector<entry>
+     -- )
+   {: plans ar v :}
+   plans VEC:COUNT 0 ?do plans i VEC:AT @ ar v PENDING+ loop ;
+
 : PENDING-ENTRIES
    ( JOURNAL:journal ^ARENA:arena ^VEC:vector<entry> -- )
    {: j ar v :}
-   j ar JOURNAL:PENDING-PLANS {: plans :}
-   plans VEC:COUNT 0 ?do plans i VEC:AT @ ar v PENDING+ loop ;
+   j [: JOURNAL:PENDING-BATCH ;] [: v PENDING-PLANS+ true ;] ar
+   JOURNAL:EACH-BATCH drop ;
 
 : BLOCKED-DETAIL ( MODEL:blockage ^ARENA:arena -- str )
    {: why ar :}
@@ -264,11 +270,17 @@ ARENA SLOTS JOURNAL:journal
       completed OF ENDOF
    ;MATCH ;
 
+: BLOCKED-PLANS+
+   ( ^VEC:vector<JOURNAL:plan-record> ^ARENA:arena ^VEC:vector<entry>
+     -- )
+   {: plans ar v :}
+   plans VEC:COUNT 0 ?do plans i VEC:AT @ ar v BLOCKED+ loop ;
+
 : BLOCKED-ENTRIES
    ( JOURNAL:journal ^ARENA:arena ^VEC:vector<entry> -- )
    {: j ar v :}
-   j ar JOURNAL:BLOCKED-PLANS {: plans :}
-   plans VEC:COUNT 0 ?do plans i VEC:AT @ ar v BLOCKED+ loop ;
+   j [: JOURNAL:BLOCKED-BATCH ;] [: v BLOCKED-PLANS+ true ;] ar
+   JOURNAL:EACH-BATCH drop ;
 
 : CONFLICT-BLOCK+
    ( JOURNAL:conflict-block ^ARENA:arena ^VEC:vector<entry> -- )

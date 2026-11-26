@@ -61,6 +61,22 @@ private
    E-INVALID-STATE throw ;
 
 
+\ ---- plan batches --------------------------------------------------
+
+\ Works each batch read answers in a child of ar, reset after each:
+\ true once a batch is empty, false once work answers false.
+: EACH-BATCH
+   ( JOURNAL:journal
+     [ JOURNAL:journal option<JOURNAL:plan-id> ^ARENA:arena
+       -- ^VEC:vector<JOURNAL:plan-record> ]
+     [ ^VEC:vector<JOURNAL:plan-record> ^ARENA:arena -- bool ]
+     ^ARENA:arena -- bool )
+   {: j read work ar :}
+   ar ARENA:NEW-IN {: b :}
+   [: j read [: work execute b ARENA:RESET ;] b JOURNAL:EACH-BATCH ;]
+   [: b ARENA:RELEASE ;] finally ;
+
+
 \ ---- known paths ---------------------------------------------------
 
 $2F constant SEPARATOR
@@ -98,7 +114,7 @@ $2E constant PERIOD
    0 ops VEC:COUNT 0 ?do ops i VEC:AT @ want MATCHED loop
    want VEC:COUNT = ;
 
-\ A path's decision as a pass orders it before recording it.
+\ A path's decision as DECIDE acts on it.
 STRUCTURE path-decision
    FIELD key MODEL:key
    FIELD path MODEL:path
@@ -170,41 +186,6 @@ STRUCTURE path-decision
    0 s [: v VEC:PUSH ! ;] EACH-COMPONENT drop
    v ;
 
-\ One more component.
-: COMPONENT+ ( n str -- n ) drop 1+ ;
-
-: PATH-DEPTH ( MODEL:path -- n )
-   0 swap MODEL:PATH>STR [: COMPONENT+ ;] EACH-COMPONENT ;
-
-\ Rust's Ordering of two cells: -1, 0 or 1.
-: CMP ( n n -- n )
-   {: x:n y:n :}
-   x y < if -1 exit then
-   x y > if 1 exit then
-   0 ;
-
-: DECISION-PARTS ( path-decision -- MODEL:key n bool )
-   PATH-DECISION-UNMAKE {: k path same d :}
-   k path PATH-DEPTH d LOCAL-DIRECTORY-DELETE? ;
-
-: ORDER-PATH-DECISIONS ( path-decision path-decision -- n )
-   {: a b :}
-   a DECISION-PARTS {: ak ad:n adel:bool :}
-   b DECISION-PARTS {: bk bd:n bdel:bool :}
-   adel bdel and if bd ad CMP else
-      adel if 1 exit then
-      bdel if -1 exit then
-      ad bd CMP
-   then
-   dup 0<> if exit then
-   drop ak bk MODEL:KEY-CMP ;
-
-\ A pending plan and its path's key.
-STRUCTURE pending-plan
-   FIELD key MODEL:key
-   FIELD plan JOURNAL:plan-record
-;STRUCTURE
-
 : RECORD-PATH ( MODEL:local-record -- MODEL:path )
    MODEL-LOCAL--RECORD:UNMAKE {: p o :} p ;
 
@@ -214,9 +195,6 @@ STRUCTURE pending-plan
 : REMOTE-OBSERVATION
    ( MODEL:remote-record -- MODEL:observation<MODEL:remote> )
    MODEL-REMOTE--RECORD:UNMAKE {: k p o :} o ;
-
-: PENDING-KEY ( pending-plan -- MODEL:key )
-   PENDING-PLAN-UNMAKE {: k p :} k ;
 
 : KEY-BYTES ( MODEL:key -- str ) MODEL:KEY>STR ;
 
@@ -822,15 +800,22 @@ STRUCTURE case-variant-move
    {: j plans k ar :}
    plans VEC:COUNT 0 ?do j plans i VEC:AT @ k ar SUPERSEDE-IF-UNDER loop ;
 
+\ A batch's plans at key k or beneath it retired.
+: SUPERSEDE-BATCH
+   ( ^VEC:vector<JOURNAL:plan-record> ^ARENA:arena JOURNAL:journal
+     MODEL:key -- bool )
+   {: plans ar j k :}
+   j plans k ar SUPERSEDE-ALL-UNDER true ;
+
 \ Retires every live plan, pending or blocked, at the source's identity
-\ or beneath it, both read before any is retired.
+\ or beneath it, a batch at a time.
 : SUPERSEDE-BENEATH ( JOURNAL:journal MODEL:path ^ARENA:arena -- )
    {: j source ar :}
    source ar MODEL:FOLD {: k :}
-   j ar JOURNAL:PENDING-PLANS {: pending :}
-   j ar JOURNAL:BLOCKED-PLANS {: blocked :}
-   j pending k ar SUPERSEDE-ALL-UNDER
-   j blocked k ar SUPERSEDE-ALL-UNDER ;
+   j [: JOURNAL:PENDING-BATCH ;] [: j k SUPERSEDE-BATCH ;] ar
+   EACH-BATCH drop
+   j [: JOURNAL:BLOCKED-BATCH ;] [: j k SUPERSEDE-BATCH ;] ar
+   EACH-BATCH drop ;
 
 : RENAMED ( MODEL:path -- case-collision-resolution )
    construct case-collision-resolution renamed ;
@@ -2575,81 +2560,48 @@ STRUCTURE download-operation
    plans at VEC:AT @ {: p :}
    p p id DOWNLOAD-PLAN? SOME-PLAN ;
 
-\ Rust's pending_download_slot_identity, for a root of generation gen.
+\ Rust's pending_download_slot_identity, for a root of generation gen
+\ and the download's plan.
 : SLOT-IDENTITY
-   ( n MODEL:path download-operation
+   ( n MODEL:path download-operation JOURNAL:plan-id
      -- LOCAL:download-slot-identity )
-   {: gen:n path d :}
+   {: gen:n path d plan :}
    d DOWNLOAD-OPERATION-UNMAKE {: id src :}
-   gen id JOURNAL:OPERATION-ID>N path PATH$ src
+   gen plan JOURNAL:PLAN-ID>N id JOURNAL:OPERATION-ID>N path PATH$ src
    LOCAL:NEW-SLOT-IDENTITY ;
 
-: ADD-BINDING
-   ( ^VEC:vector<LOCAL:binding> n JOURNAL:plan-record -- )
-   {: live gen:n p :}
-   p PENDING-DOWNLOAD MATCH option
-      none OF ENDOF
-      some OF {: d :}
-         gen p PLAN-PATH d SLOT-IDENTITY LOCAL:SLOT-BINDING
-         live VEC:PUSH !
-      ENDOF
-   ;MATCH ;
-
-: ADD-BINDINGS
-   ( ^VEC:vector<LOCAL:binding> n ^VEC:vector<JOURNAL:plan-record> -- )
-   {: live gen:n plans :}
-   plans VEC:COUNT 0 ?do live gen plans i VEC:AT @ ADD-BINDING loop ;
-
-\ The slot bindings of the pending and the blocked plans' downloads,
-\ which no other download's lease may take (replay_pending_at).
-: LIVE-BINDINGS
-   ( n ^VEC:vector<JOURNAL:plan-record>
-     ^VEC:vector<JOURNAL:plan-record> ^ARENA:arena
-     -- ^VEC:vector<LOCAL:binding> )
-   {: gen:n pending blocked ar :}
-   ar ARENA:ALLOCATOR 0 [type] LOCAL:binding VEC:NEW {: live :}
-   live gen pending ADD-BINDINGS
-   live gen blocked ADD-BINDINGS
-   live ;
-
-: LIVE? ( LOCAL:binding ^VEC:vector<LOCAL:binding> -- bool )
-   {: b live :}
-   live VEC:COUNT 0 ?do
-      live i VEC:AT @ b LOCAL:BINDING= if true unloop exit then
-   loop
-   false ;
-
 \ Holds the plan until its retry time; Rust accepts every answer.
-: BLOCK-UNTIL-RETRY ( ^run JOURNAL:plan-id MODEL:blockage -- )
-   {: r id why :}
+: BLOCK-UNTIL-RETRY
+   ( ^run JOURNAL:plan-id MODEL:blockage ^ARENA:arena -- )
+   {: r id why ar :}
    r RUN-JOURNAL @ id why epoch-seconds JOURNAL:BLOCK-RETRY-SECONDS +
-   r RUN-ARENA @ JOURNAL:BLOCK-PLAN MATCH JOURNAL:plan-block
+   ar JOURNAL:BLOCK-PLAN MATCH JOURNAL:plan-block
       not-found OF ENDOF
       already-completed OF ENDOF
       blocked OF ENDOF
    ;MATCH ;
 
 : BLOCK-FOUND
-   ( ^run option<JOURNAL:plan-record> MODEL:blockage -- )
-   {: r found why :}
+   ( ^run option<JOURNAL:plan-record> MODEL:blockage ^ARENA:arena -- )
+   {: r found why ar :}
    found MATCH option
       none OF ENDOF
-      some OF {: p :} r p ID-OF why BLOCK-UNTIL-RETRY ENDOF
+      some OF {: p :} r p ID-OF why ar BLOCK-UNTIL-RETRY ENDOF
    ;MATCH ;
 
 \ The plans are sorted by id; by-path is their PATH-ORDER.
 : RECORD-BLOCK
    ( ^run ^VEC:vector<JOURNAL:plan-record> ^VEC:vector<n>
-     REPLAY:replay-blocked -- )
-   {: r plans by-path b :}
+     REPLAY:replay-blocked ^ARENA:arena -- )
+   {: r plans by-path b ar :}
    b MATCH REPLAY:replay-blocked
       stage-destination-occupied OF drop {: id :}
          r plans id FIND-DOWNLOAD-PLAN
-         MODEL-BLOCKAGE:STAGE-OCCUPIED BLOCK-FOUND
+         MODEL-BLOCKAGE:STAGE-OCCUPIED ar BLOCK-FOUND
       ENDOF
       local-object OF {: path :}
          r plans by-path path FIND-PATH-PLAN
-         MODEL-BLOCKAGE:LOCAL-OBJECT-IN-WAY BLOCK-FOUND
+         MODEL-BLOCKAGE:LOCAL-OBJECT-IN-WAY ar BLOCK-FOUND
       ENDOF
       durable-plan OF drop drop ENDOF
       fresh-observation-required OF drop ENDOF
@@ -2669,110 +2621,47 @@ STRUCTURE download-operation
 \ local object blocked are held durably.
 : RECORD-LOCAL-BLOCKS
    ( ^run ^VEC:vector<JOURNAL:plan-record> ^VEC:vector<n>
-     ^REPLAY:replay-report -- )
-   {: r plans by-path rep :}
+     ^REPLAY:replay-report ^ARENA:arena -- )
+   {: r plans by-path rep ar :}
    rep BLOCKS {: bs :}
    bs VEC:COUNT 0 ?do
-      r plans by-path bs i VEC:AT @ RECORD-BLOCK
+      r plans by-path bs i VEC:AT @ ar RECORD-BLOCK
    loop ;
 
-: ADD-REPORT ( ^REPLAY:replay-report ^REPLAY:replay-report -- )
-   {: from into :}
-   from REPLAY-REPLAY--REPORT:COMPLETED-OPERATIONS @
-   into REPLAY-REPLAY--REPORT:COMPLETED-OPERATIONS +!
-   from BLOCKS {: bs :}
-   bs VEC:COUNT 0 ?do bs i VEC:AT @ into BLOCKS VEC:PUSH ! loop ;
-
-: ADD-DURABLE ( MODEL:path MODEL:blockage ^REPLAY:replay-report -- )
-   {: path why rep :}
-   path why REPLAY-REPLAY--BLOCKED:DURABLE-PLAN rep BLOCKS VEC:PUSH ! ;
-
-\ A blocked plan's entry in the report.
-: ADD-BLOCKED ( JOURNAL:plan-record ^REPLAY:replay-report -- )
-   {: p rep :}
-   p JOURNAL-PLAN--RECORD:UNMAKE {: id path ops s :}
-   s MATCH JOURNAL:plan-status
-      pending OF ENDOF
-      blocked OF drop {: why :} path why rep ADD-DURABLE ENDOF
-      completed OF ENDOF
+: FRESH-REQUIRED? ( REPLAY:replay-blocked -- bool )
+   MATCH REPLAY:replay-blocked
+      durable-plan OF drop drop false ENDOF
+      local-object OF drop false ENDOF
+      fresh-observation-required OF drop true ENDOF
+      download-required OF drop drop false ENDOF
+      stage-destination-occupied OF drop drop false ENDOF
+      precondition-changed OF drop drop false ENDOF
+      remote-operation OF drop false ENDOF
+      remote-pending OF drop false ENDOF
+      remote-object OF drop false ENDOF
+      sync-error OF drop drop false ENDOF
    ;MATCH ;
 
-: KEEP-PATH ( MODEL:path ^ARENA:arena -- MODEL:path )
-   {: path ar :}
-   path MODEL:PATH>STR ar ARENA:COPY MODEL:>PATH ;
+: ASKS-FRESH? ( ^REPLAY:replay-report -- bool )
+   BLOCKS {: bs :}
+   bs VEC:COUNT 0 ?do
+      bs i VEC:AT @ FRESH-REQUIRED? if true unloop exit then
+   loop
+   false ;
 
-: KEEP-HASH ( DROPBOX:hash ^ARENA:arena -- DROPBOX:hash )
-   {: c ar :}
-   c DROPBOX:HASH>STR ar ARENA:COPY DROPBOX:>HASH ;
+\ The step's running count: the operations its replays completed, and
+\ whether an entry asked for a fresh observation.
+STRUCTURE tally DERIVE addr
+   FIELD completed n
+   FIELD fresh bool
+;STRUCTURE
 
-: KEEP-ACTUAL
-   ( option<DROPBOX:hash> ^ARENA:arena -- option<DROPBOX:hash> )
-   {: a ar :}
-   a MATCH option
-      none OF a ENDOF
-      some OF ar KEEP-HASH OPTION:SOME ENDOF
-   ;MATCH ;
+ARENA TALLIES tally
 
-: KEEP-REASON ( MODEL:blockage ^ARENA:arena -- MODEL:blockage )
-   {: b ar :}
-   b MATCH MODEL:blockage
-      remote-rejected OF
-         ar ARENA:COPY MODEL-BLOCKAGE:REMOTE-REJECTED
-      ENDOF
-      unsupported-file-size OF b ENDOF
-      download-unavailable OF drop b ENDOF
-      download-verification-failed OF b ENDOF
-      stage-occupied OF b ENDOF
-      local-object-in-way OF b ENDOF
-      remote-object OF b ENDOF
-      conflict-copy-occupied OF b ENDOF
-   ;MATCH ;
-
-\ The entry with its bytes copied into the arena.
-: KEEP-BLOCKED
-   ( REPLAY:replay-blocked ^ARENA:arena -- REPLAY:replay-blocked )
-   {: b ar :}
-   b MATCH REPLAY:replay-blocked
-      durable-plan OF {: path why :}
-         path ar KEEP-PATH why ar KEEP-REASON
-         REPLAY-REPLAY--BLOCKED:DURABLE-PLAN
-      ENDOF
-      local-object OF
-         ar KEEP-PATH REPLAY-REPLAY--BLOCKED:LOCAL-OBJECT
-      ENDOF
-      fresh-observation-required OF
-         ar KEEP-PATH REPLAY-REPLAY--BLOCKED:FRESH-OBSERVATION-REQUIRED
-      ENDOF
-      download-required OF {: path c :}
-         path ar KEEP-PATH c ar KEEP-HASH
-         REPLAY-REPLAY--BLOCKED:DOWNLOAD-REQUIRED
-      ENDOF
-      stage-destination-occupied OF
-         ar ARENA:COPY REPLAY-REPLAY--BLOCKED:STAGE-DESTINATION-OCCUPIED
-      ENDOF
-      precondition-changed OF {: path a :}
-         path ar KEEP-PATH a ar KEEP-ACTUAL
-         REPLAY-REPLAY--BLOCKED:PRECONDITION-CHANGED
-      ENDOF
-      remote-operation OF
-         ar KEEP-PATH REPLAY-REPLAY--BLOCKED:REMOTE-OPERATION
-      ENDOF
-      remote-pending OF
-         ar KEEP-PATH REPLAY-REPLAY--BLOCKED:REMOTE-PENDING
-      ENDOF
-      remote-object OF
-         ar KEEP-PATH REPLAY-REPLAY--BLOCKED:REMOTE-OBJECT
-      ENDOF
-      sync-error OF {: path why :}
-         path ar KEEP-PATH why REPLAY-REPLAY--BLOCKED:SYNC-ERROR
-      ENDOF
-   ;MATCH ;
-
-\ The report's entries copied into the arena, in place.
-: KEEP-BLOCKS ( ^REPLAY:replay-report ^ARENA:arena -- )
-   {: rep ar :}
-   rep BLOCKS {: bs :}
-   bs VEC:COUNT 0 ?do bs i VEC:AT @ ar KEEP-BLOCKED bs i VEC:AT ! loop ;
+: ADD-COUNT ( ^REPLAY:replay-report ^tally -- )
+   {: rep t :}
+   rep REPLAY-REPLAY--REPORT:COMPLETED-OPERATIONS @ t TALLY-COMPLETED +!
+   rep ASKS-FRESH? if true t TALLY-FRESH ! then ;
 
 \ The step's download, one at a time; reason is why FETCH blocked it;
 \ arena holds what one download allocates, reset when it ends.
@@ -2782,8 +2671,7 @@ STRUCTURE download DERIVE addr
    FIELD generation n
    FIELD plan JOURNAL:plan-record
    FIELD wanted download-operation
-   FIELD live ^VEC:vector<LOCAL:binding>
-   FIELD report ^REPLAY:replay-report
+   FIELD tally ^tally
    FIELD reason MODEL:blockage
    FIELD arena ^ARENA:arena
 ;STRUCTURE
@@ -2795,26 +2683,53 @@ ENUM download-state DERIVE eq
 ENUM fetched staged blocked ;ENUM
 ENUM root-check active changed ;ENUM
 
-: NEW-DOWNLOAD
-   ( ^run fd n ^VEC:vector<LOCAL:binding> ^REPLAY:replay-report
-     -- ^download )
-   {: r root:fd gen:n live rep :}
+: NEW-DOWNLOAD ( ^run fd n ^tally -- ^download )
+   {: r root:fd gen:n t :}
    r RUN-ARENA @ DOWNLOADS-NEW {: x :}
    r x DOWNLOAD-RUN ! root x DOWNLOAD-ROOT !
-   gen x DOWNLOAD-GENERATION ! live x DOWNLOAD-LIVE !
-   rep x DOWNLOAD-REPORT ! r RUN-ARENA @ ARENA:NEW-IN x DOWNLOAD-ARENA !
+   gen x DOWNLOAD-GENERATION !
+   t x DOWNLOAD-TALLY ! r RUN-ARENA @ ARENA:NEW-IN x DOWNLOAD-ARENA !
    x ;
 
 : WANTED-SOURCE ( ^download -- MODEL:remote )
    DOWNLOAD-WANTED @ DOWNLOAD-OPERATION-UNMAKE {: id src :} src ;
 
+\ Whether plan p, pending or blocked, still has a download whose slot
+\ binding, for the download's generation, is b.
+: LIVE-PLAN-SLOT? ( ^download LOCAL:binding JOURNAL:plan-record -- bool )
+   {: x b p :}
+   p JOURNAL-PLAN--RECORD:UNMAKE {: id path ops s :}
+   s MATCH JOURNAL:plan-status
+      pending OF true ENDOF
+      blocked OF {: why at:n :} true ENDOF
+      completed OF false ENDOF
+   ;MATCH 0= if false exit then
+   p PENDING-DOWNLOAD MATCH option
+      none OF false ENDOF
+      some OF {: d :}
+         x DOWNLOAD-GENERATION @ path d id SLOT-IDENTITY
+         LOCAL:SLOT-BINDING b LOCAL:BINDING=
+      ENDOF
+   ;MATCH ;
+
+\ Whether the slot of binding b and plan id holds a live plan's
+\ download, which no other download's lease may take (replay_pending_at).
+: LIVE-SLOT? ( LOCAL:binding n ^download -- bool )
+   {: b id:n x :}
+   x DOWNLOAD-RUN @ RUN-JOURNAL @ id JOURNAL:>PLAN-ID
+   x DOWNLOAD-ARENA @ JOURNAL:PLAN-OF MATCH option
+      none OF false ENDOF
+      some OF {: p :} x b p LIVE-PLAN-SLOT? ENDOF
+   ;MATCH ;
+
 \ The slot the download's partial is kept in, if one can be leased.
 : LEASE ( ^download -- option<LOCAL:download-slot-lease> )
    {: x :}
-   x DOWNLOAD-GENERATION @ x DOWNLOAD-PLAN @ PLAN-PATH
-   x DOWNLOAD-WANTED @ SLOT-IDENTITY {: id :}
+   x DOWNLOAD-PLAN @ {: p :}
+   x DOWNLOAD-GENERATION @ p PLAN-PATH x DOWNLOAD-WANTED @ p ID-OF
+   SLOT-IDENTITY {: id :}
    x DOWNLOAD-RUN @ STAGING$ id
-   [: x DOWNLOAD-LIVE @ LIVE? ;] LOCAL:LEASE-DOWNLOAD-SLOT ;
+   [: x LIVE-SLOT? ;] LOCAL:LEASE-DOWNLOAD-SLOT ;
 
 : NO-FETCH ( -- LOCAL:stage-outcome<n> )
    s" " LOCAL-STAGE--OUTCOME:DESTINATION-OCCUPIED ;
@@ -2897,8 +2812,7 @@ ENUM root-check active changed ;ENUM
    rep REPLAY-REPLAY--REPORT:COMPLETED-OPERATIONS @ 0= if exit then
    r RUN-LINK @ REPLAY-LINK:STATUS @ STATUS:COMPLETED ;
 
-\ The staged download installed at once; its report's entries outlive
-\ the download's arena in the step's.
+\ The staged download installed at once.
 : INSTALL ( ^download -- )
    {: x :}
    x DOWNLOAD-RUN @ {: r :}
@@ -2908,15 +2822,13 @@ ENUM root-check active changed ;ENUM
    r RUN-JOURNAL @ x DOWNLOAD-ROOT @ r ROOT$ one ar
    REPLAY:REPLAY-LOCAL-PLANS-AT {: rep :}
    rep r INSTALL-DONE
-   r one one ar PATH-ORDER rep RECORD-LOCAL-BLOCKS
-   rep r RUN-ARENA @ KEEP-BLOCKS
-   rep x DOWNLOAD-REPORT @ ADD-REPORT ;
+   r one one ar PATH-ORDER rep ar RECORD-LOCAL-BLOCKS
+   rep x DOWNLOAD-TALLY @ ADD-COUNT ;
 
 : BLOCK ( ^download -- )
    {: x :}
-   x DOWNLOAD-PLAN @ {: p :}
-   x DOWNLOAD-RUN @ p ID-OF x DOWNLOAD-REASON @ BLOCK-UNTIL-RETRY
-   p PLAN-PATH x DOWNLOAD-REASON @ x DOWNLOAD-REPORT @ ADD-DURABLE ;
+   x DOWNLOAD-RUN @ x DOWNLOAD-PLAN @ ID-OF x DOWNLOAD-REASON @
+   x DOWNLOAD-ARENA @ BLOCK-UNTIL-RETRY ;
 
 : ROOT-ACTIVE? ( ^run -- bool )
    {: r :}
@@ -2948,26 +2860,27 @@ FSM:DEFINE DOWNLOAD-EXECUTOR ( ^download ) download-state fetched
 \ The step's answer; root-changed is Rust's LocalRootChanged error.
 ENUM replay-step
    VARIANT root-changed ;VARIANT
-   VARIANT report FIELD report ^REPLAY:replay-report ;VARIANT
+   VARIANT report FIELD completed n FIELD fresh bool ;VARIANT
 ;ENUM
 
 : UNROOTED ( -- replay-step ) construct replay-step root-changed ;
 
-\ The plans' excluded ones retired.
+\ The plans' excluded ones retired and taken out of them.
 : RETIRED
-   ( ^run ^VEC:vector<JOURNAL:plan-record>
-     -- ^VEC:vector<JOURNAL:plan-record> )
-   {: r plans :}
-   r RUN-JOURNAL @ plans r RUN-ARENA @ REPLAY:RETIRE-EXCLUDED-PLANS
-   plans ;
+   ( ^run ^VEC:vector<JOURNAL:plan-record> ^ARENA:arena -- )
+   {: r plans ar :}
+   r RUN-JOURNAL @ plans ar REPLAY:RETIRE-EXCLUDED-PLANS ;
 
-: BLOCKED-NOW ( ^run -- ^VEC:vector<JOURNAL:plan-record> )
-   {: r :}
-   r r RUN-JOURNAL @ r RUN-ARENA @ JOURNAL:BLOCKED-PLANS RETIRED ;
+: RETIRED-BATCH
+   ( ^VEC:vector<JOURNAL:plan-record> ^ARENA:arena ^run -- bool )
+   {: plans ar r :}
+   r plans ar RETIRED true ;
 
-: PENDING-NOW ( ^run -- ^VEC:vector<JOURNAL:plan-record> )
+\ Each excluded blocked plan retired.
+: RETIRE-BLOCKED ( ^run -- )
    {: r :}
-   r r RUN-JOURNAL @ r RUN-ARENA @ JOURNAL:PENDING-PLANS RETIRED ;
+   r RUN-JOURNAL @ [: JOURNAL:BLOCKED-BATCH ;] [: r RETIRED-BATCH ;]
+   r RUN-ARENA @ EACH-BATCH drop ;
 
 : DOWNLOAD-PATH ( REPLAY:replay-blocked -- option<MODEL:path> )
    MATCH REPLAY:replay-blocked
@@ -3063,59 +2976,73 @@ ENUM replay-step
    loop
    true ;
 
-\ The pending plans' local replay with its blocks recorded, then an
-\ entry for each blocked plan.
+\ The pending plans' local replay with its blocks recorded.
 : LOCAL-REPORT
    ( ^run fd ^VEC:vector<JOURNAL:plan-record> ^VEC:vector<n>
-     ^VEC:vector<JOURNAL:plan-record> -- ^REPLAY:replay-report )
-   {: r root:fd pending by-path blocked :}
-   r RUN-JOURNAL @ root r ROOT$ pending r RUN-ARENA @
+     ^ARENA:arena -- ^REPLAY:replay-report )
+   {: r root:fd pending by-path ar :}
+   r RUN-JOURNAL @ root r ROOT$ pending ar
    REPLAY:REPLAY-LOCAL-PLANS-AT {: rep :}
-   r pending by-path rep RECORD-LOCAL-BLOCKS
-   blocked VEC:COUNT 0 ?do blocked i VEC:AT @ rep ADD-BLOCKED loop
+   r pending by-path rep ar RECORD-LOCAL-BLOCKS
    rep ;
 
-\ The pending plans' Dropbox operations, once the root is checked.
-: REMOTE-REPORT ( ^run fd ^REPLAY:replay-report -- replay-step )
-   {: r root:fd rep :}
+\ A batch of pending plans replayed locally, then its downloads run;
+\ false: the root changed.
+: LOCAL-BATCH
+   ( ^VEC:vector<JOURNAL:plan-record> ^ARENA:arena ^download -- bool )
+   {: pending ar x :}
+   x DOWNLOAD-RUN @ {: r :}
+   r pending ar RETIRED
+   pending ar PATH-ORDER {: by-path :}
+   r x DOWNLOAD-ROOT @ pending by-path ar LOCAL-REPORT {: rep :}
+   rep ar TAKE-DOWNLOADS {: paths :}
+   rep x DOWNLOAD-TALLY @ ADD-COUNT
+   x pending by-path paths RUN-DOWNLOADS ;
+
+: REMOTE-BATCH
+   ( ^VEC:vector<JOURNAL:plan-record> ^ARENA:arena ^run fd ^tally
+     -- bool )
+   {: pending ar r root:fd t :}
+   r RUN-JOURNAL @ r RUN-LINK @ root r ROOT$ r STAGING$ pending ar
+   REPLAY:REPLAY-REMOTE-OPERATIONS-AT t ADD-COUNT true ;
+
+\ The pending plans' Dropbox operations, once the root is checked,
+\ read afresh: they follow the local replay's completions.
+: REMOTE-REPORT ( ^run fd ^tally -- replay-step )
+   {: r root:fd t :}
    r ROOT-ACTIVE? 0= if UNROOTED exit then
-   r RUN-JOURNAL @ r RUN-LINK @ root r ROOT$ r STAGING$
-   r RUN-ARENA @ REPLAY:REPLAY-REMOTE-OPERATIONS-AT rep ADD-REPORT
-   rep construct replay-step report ;
+   r RUN-JOURNAL @ [: JOURNAL:PENDING-BATCH ;]
+   [: r root t REMOTE-BATCH ;] r RUN-ARENA @ EACH-BATCH drop
+   t TALLY-COMPLETED @ t TALLY-FRESH @ construct replay-step report ;
 
 \ The step below the root's descriptor, of generation gen.
-: STEP-AT
-   ( ^run fd n ^VEC:vector<JOURNAL:plan-record> -- replay-step )
-   {: r root:fd gen:n blocked :}
-   r PENDING-NOW {: pending :}
-   pending r RUN-ARENA @ PATH-ORDER {: by-path :}
-   gen pending blocked r RUN-ARENA @ LIVE-BINDINGS {: live :}
-   r root pending by-path blocked LOCAL-REPORT {: rep :}
-   rep r RUN-ARENA @ TAKE-DOWNLOADS {: paths :}
-   r root gen live rep NEW-DOWNLOAD {: x :}
-   x pending by-path paths RUN-DOWNLOADS 0= if UNROOTED exit then
-   r root rep REMOTE-REPORT ;
+: STEP-AT ( ^run fd n -- replay-step )
+   {: r root:fd gen:n :}
+   r RUN-ARENA @ TALLIES-NEW {: t :}
+   r root gen t NEW-DOWNLOAD {: x :}
+   r RUN-JOURNAL @ [: JOURNAL:PENDING-BATCH ;] [: x LOCAL-BATCH ;]
+   r RUN-ARENA @ EACH-BATCH 0= if UNROOTED exit then
+   r root t REMOTE-REPORT ;
 
-: STEP-BELOW
-   ( ^run fd ^VEC:vector<JOURNAL:plan-record> -- replay-step )
-   {: r root:fd blocked :}
+: STEP-BELOW ( ^run fd -- replay-step )
+   {: r root:fd :}
    r RUN-JOURNAL @ r RUN-ARENA @ JOURNAL:LOCAL-ROOT-BINDING
    MATCH option
       none OF UNROOTED ENDOF
       some OF JOURNAL-LOCAL--ROOT--RECORD:UNMAKE {: b gen:n :}
-         r root gen blocked STEP-AT
+         r root gen STEP-AT
       ENDOF
    ;MATCH ;
 
-\ Rust's replay_pending_at: the plans of earlier passes replayed and
-\ their downloads run one at a time, then their Dropbox operations.
+\ Earlier passes' plans replayed locally, their downloads run one at a time,
+\ then their Dropbox operations; excluded blocked plans are retired first.
 : REPLAY-STEP ( ^run -- replay-step )
    {: r :}
-   r BLOCKED-NOW {: blocked :}
+   r RETIRE-BLOCKED
    r RUN-JOURNAL @ r ROOT$ LOCAL:OPEN-ACTIVE-ROOT MATCH option
       none OF UNROOTED ENDOF
       some OF {: root:fd :}
-         [: r root blocked STEP-BELOW ;]
+         [: r root STEP-BELOW ;]
          [: root FS:CLOSE-DIR ;] finally
       ENDOF
    ;MATCH ;
@@ -3133,23 +3060,26 @@ STRUCTURE known-conflict
    FIELD conflict MODEL:conflict
 ;STRUCTURE
 
-\ One planning pass: Rust's report (noop-count, planned, conflict-count) and
-\ blocked_paths (held, keys may repeat); waiting, new conflicts on a block.
+\ batch holds the no-ops and plans not yet recorded; deferred, the keys end to
+\ end (starts, each one's offset) of directory deletes awaiting their subtree.
 STRUCTURE planning DERIVE addr
    FIELD run ^run
    FIELD pass ^ARENA:arena
+   FIELD batch ^ARENA:arena
    FIELD conflicts ^VEC:vector<known-conflict>
    FIELD now n
    FIELD noop-count n
    FIELD planned n
    FIELD conflict-count n
    FIELD held-copies n
-   FIELD held ^VEC:vector<MODEL:key>
+   FIELD held n
    FIELD collisions ^VEC:vector<MODEL:key>
    FIELD waiting ^VEC:vector<MODEL:key>
    FIELD noops ^VEC:vector<JOURNAL:path-baseline>
    FIELD plans ^VEC:vector<JOURNAL:path-plan>
-   FIELD decisions ^VEC:vector<path-decision>
+   FIELD deferred ^VEC:vector<u8>
+   FIELD starts ^VEC:vector<n>
+   FIELD answer pass-event
 ;STRUCTURE
 
 ARENA PLANNINGS planning
@@ -3158,39 +3088,19 @@ ARENA PLANNINGS planning
    {: ar w :}
    ar ARENA:ALLOCATOR 0 w VEC:NEW ;
 
+\ Planning records its no-ops and plans this many at a time.
+512 constant PLAN-BATCH
+
+: EMPTY-BATCH ( ^planning -- )
+   {: pl :}
+   pl PLANNING-BATCH @ {: ar :}
+   ar [type] JOURNAL:path-baseline NEW-VECTOR pl PLANNING-NOOPS !
+   ar [type] JOURNAL:path-plan NEW-VECTOR pl PLANNING-PLANS ! ;
+
 \ Runs q on each index in turn.
 : GATHER ( ^VEC:vector<n> [ n -- ] -- )
    {: idx q :}
    idx VEC:COUNT 0 ?do idx i VEC:AT @ q execute loop ;
-
-: KEY-PLAN
-   ( JOURNAL:plan-record ^VEC:vector<pending-plan> ^ARENA:arena -- )
-   {: plan v ar :}
-   plan PLAN-PATH ar MODEL:FOLD plan PENDING-PLAN-MAKE v VEC:PUSH ! ;
-
-: KEY-PLANS
-   ( ^VEC:vector<JOURNAL:plan-record> ^VEC:vector<pending-plan>
-     ^ARENA:arena -- )
-   {: plans v ar :}
-   plans VEC:COUNT 0 ?do plans i VEC:AT @ v ar KEY-PLAN loop ;
-
-: PLAN-CMP ( n n ^VEC:vector<pending-plan> -- n )
-   {: x:n y:n v :}
-   v x VEC:AT @ PENDING-KEY v y VEC:AT @ PENDING-KEY MODEL:KEY-CMP ;
-
-\ Rust's live map: the pending plans, then the blocked ones, keyed by
-\ path.
-: LIVE-PLANS ( ^run -- ^VEC:vector<pending-plan> )
-   {: r :}
-   r RUN-JOURNAL @ {: j :}
-   r RUN-ARENA @ {: ar :}
-   ar [type] pending-plan NEW-VECTOR {: v :}
-   j ar JOURNAL:PENDING-PLANS v ar KEY-PLANS
-   j ar JOURNAL:BLOCKED-PLANS v ar KEY-PLANS
-   ar [type] pending-plan NEW-VECTOR {: out :}
-   v VEC:COUNT [: v PLAN-CMP ;] ar STABLE-ORDER
-   [: v swap VEC:AT @ out VEC:PUSH ! ;] GATHER
-   out ;
 
 : CONFLICT-KEY ( known-conflict -- MODEL:key )
    KNOWN-CONFLICT-UNMAKE {: k c :} k ;
@@ -3238,12 +3148,13 @@ ARENA PLANNINGS planning
    ar PLANNINGS-NEW {: pl :}
    ar pl PLANNING-PASS !
    r KNOWN-CONFLICTS pl PLANNING-CONFLICTS !
-   ar [type] MODEL:key NEW-VECTOR pl PLANNING-HELD !
+   ar ARENA:NEW-IN pl PLANNING-BATCH !
    ar [type] MODEL:key NEW-VECTOR pl PLANNING-COLLISIONS !
    ar [type] MODEL:key NEW-VECTOR pl PLANNING-WAITING !
-   ar [type] JOURNAL:path-baseline NEW-VECTOR pl PLANNING-NOOPS !
-   ar [type] JOURNAL:path-plan NEW-VECTOR pl PLANNING-PLANS !
-   ar [type] path-decision NEW-VECTOR pl PLANNING-DECISIONS !
+   pl EMPTY-BATCH
+   ar [type] u8 NEW-VECTOR pl PLANNING-DEFERRED !
+   ar [type] n NEW-VECTOR pl PLANNING-STARTS !
+   construct pass-event ok pl PLANNING-ANSWER !
    r ITEM-RUN pl PLANNING-RUN !
    pl ;
 
@@ -3251,7 +3162,7 @@ ARENA PLANNINGS planning
 \ The arena of all the planning keeps.
 : PASS-ARENA ( ^planning -- ^ARENA:arena ) PLANNING-PASS @ ;
 
-\ ---- copies into the pass arena ------------------------------------
+\ ---- copies into an arena -----------------------------------------
 
 : COPY-KEY ( MODEL:key ^ARENA:arena -- MODEL:key )
    swap MODEL:KEY>STR swap ARENA:COPY MODEL:>KEY ;
@@ -3324,47 +3235,6 @@ ARENA PLANNINGS planning
       ENDOF
    ;MATCH ;
 
-: COPY-SIDES
-   ( MODEL:local MODEL:remote ^ARENA:arena -- MODEL:local MODEL:remote )
-   {: l rem ar :}
-   l ar COPY-LOCAL rem ar COPY-REMOTE ;
-
-: COPY-CONFLICT ( MODEL:conflict ^ARENA:arena -- MODEL:conflict )
-   {: c ar :}
-   c MATCH MODEL:conflict
-      initial OF ar COPY-SIDES MODEL-CONFLICT:INITIAL ENDOF
-      divergent OF ar COPY-SIDES MODEL-CONFLICT:DIVERGENT ENDOF
-      local-deleted OF
-         ar COPY-REMOTE MODEL-CONFLICT:LOCAL-DELETED
-      ENDOF
-      remote-deleted OF
-         ar COPY-LOCAL MODEL-CONFLICT:REMOTE-DELETED
-      ENDOF
-   ;MATCH ;
-
-: COPY-COLLISION ( MODEL:collision ^ARENA:arena -- MODEL:collision )
-   {: col ar :}
-   col MATCH MODEL:collision
-      local-file OF ar COPY-LOCAL MODEL-COLLISION:LOCAL-FILE ENDOF
-      local-dir OF ar COPY-REMOTE MODEL-COLLISION:LOCAL-DIR ENDOF
-   ;MATCH ;
-
-: COPY-DECISION ( MODEL:decision ^ARENA:arena -- MODEL:decision )
-   {: d ar :}
-   d MATCH MODEL:decision
-      noop OF ar COPY-BASELINE MODEL-DECISION:NOOP ENDOF
-      operate OF ar COPY-OPERATION MODEL-DECISION:OPERATE ENDOF
-      blocked OF MODEL-DECISION:BLOCKED ENDOF
-      conflicted OF ar COPY-CONFLICT MODEL-DECISION:CONFLICTED ENDOF
-      collided OF ar COPY-COLLISION MODEL-DECISION:COLLIDED ENDOF
-   ;MATCH ;
-
-: COPY-PATH-DECISION ( path-decision ^ARENA:arena -- path-decision )
-   {: pd ar :}
-   pd PATH-DECISION-UNMAKE {: k path same d :}
-   k ar COPY-KEY path ar COPY-PATH same d ar COPY-DECISION
-   PATH-DECISION-MAKE ;
-
 : COPY-PLAN
    ( JOURNAL:operation-plan ^ARENA:arena -- JOURNAL:operation-plan )
    {: plan ar :}
@@ -3412,10 +3282,32 @@ ARENA PLANNINGS planning
    {: pl k c :}
    pl k [: c MODEL:CONFLICT= ;] ANY-AT? ;
 
+\ Whether the key names one of LOCAL's own files: held, never counted.
+: OWN-ARTIFACT? ( MODEL:key -- bool )
+   MODEL:KEY>STR SPLIT-NAME nip LOCAL:RESERVED-ARTIFACT? ;
+
 \ Rust's blocked_paths.insert.
 : HELD+ ( ^planning MODEL:key -- )
    {: pl k :}
-   k pl PASS-ARENA COPY-KEY pl PLANNING-HELD @ VEC:PUSH ! ;
+   k OWN-ARTIFACT? 0= if 1 pl PLANNING-HELD +! then ;
+
+\ Records the batch's no-ops and plans; a path whose live plan was kept is held.
+: RECORD-BATCH ( ^planning -- )
+   {: pl :}
+   pl PLANNING-BATCH @ {: ar :}
+   pl JOURNAL-OF pl PLANNING-NOOPS @ pl PLANNING-PLANS @ ar
+   JOURNAL:RECORD-RECONCILIATION
+   JOURNAL-RECONCILIATION--WRITE:UNMAKE {: noops:n plans:n live :}
+   noops pl PLANNING-NOOP-COUNT +!
+   plans pl PLANNING-PLANNED +!
+   live VEC:COUNT 0 ?do pl live i VEC:AT @ ar MODEL:FOLD HELD+ loop
+   ar ARENA:RESET
+   pl EMPTY-BATCH ;
+
+: BATCH+ ( ^planning -- )
+   {: pl :}
+   pl PLANNING-NOOPS @ VEC:COUNT pl PLANNING-PLANS @ VEC:COUNT +
+   PLAN-BATCH >= if pl RECORD-BATCH then ;
 
 \ Rust's no-op rule: one that keeps the baseline at a path with no
 \ conflict is only counted; any other is recorded.
@@ -3428,9 +3320,10 @@ ARENA PLANNINGS planning
    same pl k ONLY-COUNTED? if
       1 pl PLANNING-NOOP-COUNT +! exit
    then
-   pl PASS-ARENA {: ar :}
+   pl PLANNING-BATCH @ {: ar :}
    path ar COPY-PATH base ar COPY-BASELINE JOURNAL-PATH--BASELINE:MAKE
-   pl PLANNING-NOOPS @ VEC:PUSH ! ;
+   pl PLANNING-NOOPS @ VEC:PUSH !
+   pl BATCH+ ;
 
 : BASELINE-OF ( option<JOURNAL:path-baseline> -- MODEL:baseline )
    MATCH option
@@ -3528,22 +3421,6 @@ ARENA PLANNINGS planning
       collided OF drop OPTION:NONE ENDOF
    ;MATCH ;
 
-: KEEP-DECISION ( ^planning path-decision -- )
-   {: pl pd :}
-   pd pl PASS-ARENA COPY-PATH-DECISION
-   pl PLANNING-DECISIONS @ VEC:PUSH ! ;
-
-\ A no-op at a key no live plan holds is settled now; any other
-\ decision waits for DECIDE.
-: FILE-DECISION ( ^planning path-decision bool -- )
-   {: pl pd live:bool :}
-   pd PATH-DECISION-UNMAKE {: k path same d :}
-   live if pl pd KEEP-DECISION exit then
-   d NOOP-OF MATCH option
-      none OF pl pd KEEP-DECISION ENDOF
-      some OF {: base :} pl k path base same NOOP ENDOF
-   ;MATCH ;
-
 \ More than one local spelling of a key is a collision unless all are
 \ unsupported, which infer nothing: the known path's least stands for them.
 : CHECK-LOCALS ( MODEL:key n ^planning ^ARENA:arena -- )
@@ -3570,17 +3447,6 @@ ARENA PLANNINGS planning
    k n pl ar CHECK-LOCALS
    br BASELINE-OF lr rr t pl k ar DECISION-AT ;
 
-\ Rust's closure over each known path in reconcile_published.
-: KNOWN-PATH ( JOURNAL:known-path ^planning -- )
-   {: kp pl :}
-   kp JOURNAL-KNOWN--PATH:UNMAKE {: k br lr n:n rr t live:bool :}
-   k EXCLUDED-KEY? if exit then
-   pl ARENA-OF {: ar :}
-   kp pl ar KNOWN-DECISION {: d :}
-   d br BASELINE-OF KEEPS-BASELINE? {: same:bool :}
-   k br lr rr pl ar SHOWN-PATH {: path :}
-   pl k path same d PATH-DECISION-MAKE live FILE-DECISION ;
-
 \ Whether NOOP would only count the decision at the known path: a
 \ no-op that keeps the baseline at a key no live plan or conflict holds.
 : COUNTED? ( JOURNAL:known-path MODEL:decision ^planning -- bool )
@@ -3589,58 +3455,15 @@ ARENA PLANNINGS planning
    live if false exit then
    d br BASELINE-OF KEEPS-BASELINE? pl k ONLY-COUNTED? ;
 
-\ A known path decided in the scratch arena ar: one NOOP would only
-\ count is counted, any other key kept, copied into the pass's arena.
-: WALK-STEP
-   ( JOURNAL:known-path ^planning ^VEC:vector<MODEL:key> ^ARENA:arena
-     -- )
-   {: kp pl kept ar :}
-   kp KNOWN-KEY {: k :}
-   k EXCLUDED-KEY? if exit then
-   kp kp pl ar KNOWN-DECISION pl COUNTED? if
-      1 pl PLANNING-NOOP-COUNT +! exit
-   then
-   k pl PASS-ARENA COPY-KEY kept VEC:PUSH ! ;
-
-\ The scratch arena first, as ARENA:WITH passes it; the settled keys the
-\ journal skips are counted no-ops. None of them is excluded: a
-\ published scan stages gone every local row the walk passes
-\ (GROUP-PASSED), the walk passes every excluded name, and a pass plans
-\ only after a publication, so an excluded key never holds the local row
-\ a settled key needs.
-: WALK-IN ( ^ARENA:arena ^planning ^VEC:vector<MODEL:key> -- )
-   {: scratch pl kept :}
-   pl JOURNAL-OF scratch [: pl kept scratch WALK-STEP ;]
-   JOURNAL:EACH-UNSETTLED-PATH pl PLANNING-NOOP-COUNT +! ;
-
-\ The keys of the journal's known paths a pass must decide again, in
-\ byte order; a pass's memory grows with its changes, not the tree.
-: KNOWN-WALK ( ^planning -- ^VEC:vector<MODEL:key> )
-   {: pl :}
-   pl PASS-ARENA [type] MODEL:key NEW-VECTOR {: kept :}
-   [: pl kept WALK-IN ;] ARENA:WITH
-   kept ;
-
-: DECIDE-KEPT ( ^planning MODEL:key -- )
-   {: pl k :}
-   pl JOURNAL-OF k pl ARENA-OF JOURNAL:KNOWN-PATH-AT pl KNOWN-PATH ;
-
-: DECISION-CMP ( n n ^VEC:vector<path-decision> -- n )
-   {: x:n y:n v :}
-   v x VEC:AT @ v y VEC:AT @ ORDER-PATH-DECISIONS ;
-
-: DECIDE-ALL ( ^planning -- )
-   {: pl :}
-   pl KNOWN-WALK {: kept :}
-   kept VEC:COUNT 0 ?do
-      pl kept i VEC:AT @ DECIDE-KEPT pl ARENA-OF ARENA:RESET
-   loop
-   pl PLANNING-DECISIONS @ {: v :}
-   pl PASS-ARENA {: ar :}
-   ar [type] path-decision NEW-VECTOR {: out :}
-   v VEC:COUNT [: v DECISION-CMP ;] ar STABLE-ORDER
-   [: v swap VEC:AT @ out VEC:PUSH ! ;] GATHER
-   out pl PLANNING-DECISIONS ! ;
+\ The decision d at a known path, with the path's spelling, in ar.
+: PATH-DECISION-OF
+   ( JOURNAL:known-path MODEL:decision ^planning ^ARENA:arena
+     -- path-decision )
+   {: kp d pl ar :}
+   kp JOURNAL-KNOWN--PATH:UNMAKE {: k br lr n:n rr t live:bool :}
+   d br BASELINE-OF KEEPS-BASELINE? {: same:bool :}
+   k br lr rr pl ar SHOWN-PATH {: path :}
+   k path same d PATH-DECISION-MAKE ;
 
 \ Rust's Operations(plan): a decision's operate carries one operation.
 : ONE-OPERATION
@@ -3809,9 +3632,10 @@ ENUM live-step held superseded fresh root-changed ;ENUM
    pl PLANNING-RUN @ ROOT-ACTIVE? 0= if
       construct pass-event root-changed exit
    then
-   pl PASS-ARENA {: ar :}
+   pl PLANNING-BATCH @ {: ar :}
    path ar COPY-PATH plan ar COPY-PLAN JOURNAL-PATH--PLAN:MAKE
    pl PLANNING-PLANS @ VEC:PUSH !
+   pl BATCH+
    construct pass-event ok ;
 
 : NEW-OPERATE
@@ -4001,7 +3825,8 @@ FSM:DEFINE CONFLICT-PLACEMENT ( ^placement ) placement-state placement-start
    loop
    false ;
 
-\ A path beneath a held collision is held, its live plan kept.
+\ A path beneath a held collision is held, its live plan kept; any other
+\ decision is acted on: its live plan's step, else a new one.
 : DECIDE ( ^planning path-decision -- pass-event )
    {: pl pd :}
    pl pd DECISION-KEY UNDER-HELD? if
@@ -4019,15 +3844,114 @@ FSM:DEFINE CONFLICT-PLACEMENT ( ^placement ) placement-state placement-start
       root-changed OF false ENDOF
    ;MATCH ;
 
-\ Each decision in order; the first answer but ok ends planning.
-: DECIDE-EACH ( ^planning -- pass-event )
+\ ---- the walk ------------------------------------------------------
+
+: DEFER-KEY ( ^planning MODEL:key -- )
+   {: pl k :}
+   pl PLANNING-DEFERRED @ {: bytes :}
+   bytes VEC:COUNT pl PLANNING-STARTS @ VEC:PUSH !
+   k MODEL:KEY>STR bytes VEC:APPEND ;
+
+: DEFERRED? ( ^planning -- bool ) PLANNING-STARTS @ VEC:COUNT 0<> ;
+
+\ The key last deferred, a view of deferred's bytes.
+: DEFERRED-TOP ( ^planning -- MODEL:key )
    {: pl :}
-   pl PLANNING-DECISIONS @ {: v :}
-   v VEC:COUNT 0 ?do
-      pl v i VEC:AT @ DECIDE pl ARENA-OF ARENA:RESET
-      dup OK? 0= if unloop exit then drop
-   loop
+   pl PLANNING-STARTS @ {: starts :}
+   starts starts VEC:COUNT 1- VEC:AT @ {: at:n :}
+   pl PLANNING-DEFERRED @ VEC:BYTES str> {: p:^ u:n :}
+   p at + u at - >str MODEL:>KEY ;
+
+: DEFERRED-POP ( ^planning -- )
+   {: pl :}
+   pl PLANNING-STARTS @ {: starts :}
+   starts VEC:COUNT 1- {: top:n :}
+   pl PLANNING-DEFERRED @ starts top VEC:AT @ VEC:RESIZE
+   starts top VEC:RESIZE ;
+
+\ Whether the walk at k is past d's subtree: d is no proper prefix of k followed
+\ by a byte up to "/", as is each key beneath d or between d and its subtree.
+: PASSED? ( MODEL:key MODEL:key -- bool )
+   {: d k :}
+   d MODEL:KEY>STR str> {: p:^ u:n :}
+   k MODEL:KEY>STR str> {: q:^ v:n :}
+   v u <= if true exit then
+   p u >str q u >str STR:= 0= if true exit then
+   q u + c@ SEPARATOR > ;
+
+\ The deferred key last pushed, read again, popped and decided.
+: DECIDE-TOP ( ^planning -- pass-event )
+   {: pl :}
+   pl ARENA-OF {: ar :}
+   pl JOURNAL-OF pl DEFERRED-TOP ar JOURNAL:KNOWN-PATH-AT {: kp :}
+   pl DEFERRED-POP
+   kp pl ar KNOWN-DECISION {: d :}
+   pl kp d pl ar PATH-DECISION-OF DECIDE ;
+
+\ The deferred deletes whose subtrees the walk at k has passed, deepest
+\ first; the first answer but ok ends them.
+: DECIDE-PASSED ( ^planning MODEL:key -- pass-event )
+   {: pl k :}
+   begin pl DEFERRED? if pl DEFERRED-TOP k PASSED? else false then while
+      pl DECIDE-TOP dup OK? 0= if exit then drop
+   repeat
    construct pass-event ok ;
+
+\ The deletes still deferred when the walk ends, deepest first, the item
+\ arena reset after each; the first answer but ok ends them.
+: DECIDE-REST ( ^planning -- pass-event )
+   {: pl :}
+   begin pl DEFERRED? while
+      pl DECIDE-TOP pl ARENA-OF ARENA:RESET
+      dup OK? 0= if exit then drop
+   repeat
+   construct pass-event ok ;
+
+\ A local directory delete waits on deferred until the walk passes its subtree;
+\ a no-op at a key no live plan holds settles now; any other goes to DECIDE.
+: FILE-DECISION ( ^planning path-decision bool -- pass-event )
+   {: pl pd live:bool :}
+   pd PATH-DECISION-UNMAKE {: k path same d :}
+   d LOCAL-DIRECTORY-DELETE? if
+      pl k DEFER-KEY construct pass-event ok exit
+   then
+   live if pl pd DECIDE exit then
+   d NOOP-OF MATCH option
+      none OF pl pd DECIDE ENDOF
+      some OF
+         {: base :} pl k path base same NOOP construct pass-event ok
+      ENDOF
+   ;MATCH ;
+
+\ Rust's closure over each known path in reconcile_published, acted on
+\ at once: a no-op NOOP would only count is counted.
+: DECIDE-KNOWN ( JOURNAL:known-path ^planning -- pass-event )
+   {: kp pl :}
+   kp JOURNAL-KNOWN--PATH:UNMAKE {: k br lr n:n rr t live:bool :}
+   k EXCLUDED-KEY? if construct pass-event ok exit then
+   pl ARENA-OF {: ar :}
+   kp pl ar KNOWN-DECISION {: d :}
+   kp d pl COUNTED? if
+      1 pl PLANNING-NOOP-COUNT +! construct pass-event ok exit
+   then
+   pl kp d pl ar PATH-DECISION-OF live FILE-DECISION ;
+
+\ The walk's visitor at a key: the deferred deletes it has passed, then
+\ the key; false once planning ends early, its answer kept.
+: KNOWN-STEP ( JOURNAL:known-path ^planning -- bool )
+   {: kp pl :}
+   pl kp KNOWN-KEY DECIDE-PASSED
+   dup OK? if drop kp pl DECIDE-KNOWN then
+   dup pl PLANNING-ANSWER ! OK? ;
+
+\ Decides each unsettled key once, in key order, then the deferred deletes; the
+\ skipped settled keys are no-ops, as no published scan keeps an excluded one.
+: DECIDE-WALK ( ^planning -- pass-event )
+   {: pl :}
+   pl JOURNAL-OF pl ARENA-OF [: pl KNOWN-STEP ;]
+   JOURNAL:EACH-UNSETTLED-PATH pl PLANNING-NOOP-COUNT +!
+   pl PLANNING-ANSWER @ dup OK? 0= if exit then
+   drop pl DECIDE-REST ;
 
 \ Whether this pass left the key waiting.
 : WAITING? ( ^planning MODEL:key -- bool )
@@ -4048,28 +3972,18 @@ FSM:DEFINE CONFLICT-PLACEMENT ( ^placement ) placement-state placement-start
       pl k WAITING? 0= if pl JOURNAL-OF k JOURNAL:UNBLOCK-CONFLICT then
    loop ;
 
-\ Rust's record_reconciliation and what reconcile_published takes from
-\ its answer; a path a live plan kept is held.
+\ The last batch recorded, then the conflict blocks this pass left.
 : RECORD-PLANNING ( ^planning -- )
    {: pl :}
-   pl JOURNAL-OF pl PLANNING-NOOPS @ pl PLANNING-PLANS @ pl ARENA-OF
-   JOURNAL:RECORD-RECONCILIATION
-   JOURNAL-RECONCILIATION--WRITE:UNMAKE {: noops:n plans:n live :}
-   noops pl PLANNING-NOOP-COUNT +!
-   plans pl PLANNING-PLANNED !
-   live VEC:COUNT 0 ?do
-      pl live i VEC:AT @ pl ARENA-OF MODEL:FOLD HELD+
-   loop
+   pl RECORD-BATCH
    pl STALE-BLOCKS ;
 
-\ Rust's reconcile_published from its start to record_reconciliation:
-\ every known path decided and prepared, then the no-ops and plans
-\ recorded together, unless planning ended early.
+\ Every known path decided and prepared, the no-ops and plans recorded a batch
+\ at a time; an early end leaves the last batch unrecorded.
 : PLAN-IN ( ^planning -- pass-event )
    {: pl :}
-   pl DECIDE-ALL
    epoch-seconds pl PLANNING-NOW !
-   pl DECIDE-EACH dup OK? 0= if exit then
+   pl DECIDE-WALK dup OK? 0= if exit then
    drop pl RECORD-PLANNING construct pass-event ok ;
 
 : PLAN-PATHS ( ^run -- ^planning pass-event )
@@ -4082,8 +3996,8 @@ FSM:DEFINE CONFLICT-PLACEMENT ( ^placement ) placement-state placement-start
 
 public
 
-\ Rust's ReconcileReport: blocked counts distinct live paths, sync-errors
-\ unsettled ones.
+\ Rust's ReconcileReport: blocked counts planning's holds, sync-errors
+\ the plans the pass leaves blocked.
 STRUCTURE report
    FIELD replayed n
    FIELD noops n
@@ -4108,9 +4022,9 @@ private
 STRUCTURE pass DERIVE addr
    FIELD run ^run
    FIELD recovery str
-   FIELD recovered ^REPLAY:replay-report
+   FIELD recovered n
    FIELD planning ^planning
-   FIELD applied ^REPLAY:replay-report
+   FIELD applied n
    FIELD report report
 ;STRUCTURE
 
@@ -4154,7 +4068,7 @@ ENUM pass-state DERIVE eq
    {: x :}
    x PASS-RUN @ REPLAY-STEP MATCH replay-step
       root-changed OF construct step-event root-changed ENDOF
-      report OF x PASS-RECOVERED ! construct step-event ok ENDOF
+      report OF drop x PASS-RECOVERED ! construct step-event ok ENDOF
    ;MATCH ;
 
 : NO-SCAN ( -- LOCAL:scan-publication )
@@ -4202,34 +4116,13 @@ ENUM pass-state DERIVE eq
    x PASS-RUN @ PLAN-PATHS {: pl ev :}
    pl x PASS-PLANNING ! ev ;
 
-: FRESH-REQUIRED? ( REPLAY:replay-blocked -- bool )
-   MATCH REPLAY:replay-blocked
-      durable-plan OF drop drop false ENDOF
-      local-object OF drop false ENDOF
-      fresh-observation-required OF drop true ENDOF
-      download-required OF drop drop false ENDOF
-      stage-destination-occupied OF drop drop false ENDOF
-      precondition-changed OF drop drop false ENDOF
-      remote-operation OF drop false ENDOF
-      remote-pending OF drop false ENDOF
-      remote-object OF drop false ENDOF
-      sync-error OF drop drop false ENDOF
-   ;MATCH ;
-
-: ASKS-FRESH? ( ^REPLAY:replay-report -- bool )
-   BLOCKS {: bs :}
-   bs VEC:COUNT 0 ?do
-      bs i VEC:AT @ FRESH-REQUIRED? if true unloop exit then
-   loop
-   false ;
-
 : APPLY ( ^pass -- pass-event )
    {: x :}
    x PASS-RUN @ REPLAY-STEP MATCH replay-step
       root-changed OF construct pass-event root-changed ENDOF
-      report OF {: rep :}
-         rep x PASS-APPLIED !
-         rep ASKS-FRESH? if
+      report OF {: n fresh:bool :}
+         n x PASS-APPLIED !
+         fresh if
             construct pass-event fresh
          else
             construct pass-event ok
@@ -4237,73 +4130,12 @@ ENUM pass-state DERIVE eq
       ENDOF
    ;MATCH ;
 
-\ Rust's replay_sync_error_path.
-: SYNC-ERROR-PATH ( REPLAY:replay-blocked -- option<MODEL:path> )
-   MATCH REPLAY:replay-blocked
-      durable-plan OF drop OPTION:SOME ENDOF
-      local-object OF drop NO-PATH ENDOF
-      fresh-observation-required OF drop NO-PATH ENDOF
-      download-required OF drop drop NO-PATH ENDOF
-      stage-destination-occupied OF drop drop NO-PATH ENDOF
-      precondition-changed OF drop drop NO-PATH ENDOF
-      remote-operation OF drop NO-PATH ENDOF
-      remote-pending OF drop NO-PATH ENDOF
-      remote-object OF drop NO-PATH ENDOF
-      sync-error OF drop OPTION:SOME ENDOF
-   ;MATCH ;
-
-: NTH$ ( ^VEC:vector<str> n -- str ) VEC:AT @ ;
-
-: NTH< ( n n ^VEC:vector<str> -- bool )
-   {: x:n y:n v :}
-   v x NTH$ v y NTH$ STR:< ;
-
-\ How many distinct byte strings v holds, counted in STR:< order.
-: DISTINCT ( ^VEC:vector<str> ^ARENA:arena -- n )
-   {: v ar :}
-   v VEC:COUNT {: k:n :}
-   k 0= if 0 exit then
-   k [: v NTH< ;] ar ORDER {: idx :}
-   1 k 1 ?do
-      v idx i 1- VEC:AT @ NTH$ v idx i VEC:AT @ NTH$ STR:= 0= if 1+ then
-   loop ;
-
-\ Whether the key names one of LOCAL's own files: held, never counted.
-: OWN-ARTIFACT? ( MODEL:key -- bool )
-   MODEL:KEY>STR SPLIT-NAME nip LOCAL:RESERVED-ARTIFACT? ;
-
-\ The distinct held keys, LOCAL's own files not counted.
-: HELD-COUNT ( ^pass -- n )
-   {: x :}
-   x ARENA@ [type] str NEW-VECTOR {: v :}
-   x PASS-PLANNING @ PLANNING-HELD @ {: held :}
-   held VEC:COUNT 0 ?do
-      held i VEC:AT @ {: k :}
-      k OWN-ARTIFACT? 0= if k MODEL:KEY>STR v VEC:PUSH ! then
-   loop
-   v x ARENA@ DISTINCT ;
-
-: ERROR-PATHS+ ( ^REPLAY:replay-report ^VEC:vector<str> -- )
-   {: rep v :}
-   rep BLOCKS {: bs :}
-   bs VEC:COUNT 0 ?do
-      bs i VEC:AT @ SYNC-ERROR-PATH MATCH option
-         none OF ENDOF
-         some OF MODEL:PATH>STR v VEC:PUSH ! ENDOF
-      ;MATCH
-   loop ;
-
-: SYNC-ERROR-COUNT ( ^pass -- n )
-   {: x :}
-   x ARENA@ [type] str NEW-VECTOR {: v :}
-   x PASS-RECOVERED @ v ERROR-PATHS+
-   x PASS-APPLIED @ v ERROR-PATHS+
-   v x ARENA@ DISTINCT ;
+\ The keys held, LOCAL's own files not counted.
+: HELD-COUNT ( ^pass -- n ) PASS-PLANNING @ PLANNING-HELD @ ;
 
 : REPLAYED ( ^pass -- n )
    {: x :}
-   x PASS-RECOVERED @ REPLAY-REPLAY--REPORT:COMPLETED-OPERATIONS @
-   x PASS-APPLIED @ REPLAY-REPLAY--REPORT:COMPLETED-OPERATIONS @ + ;
+   x PASS-RECOVERED @ x PASS-APPLIED @ + ;
 
 \ True with no replay, plan, conflict, held copy, collision or live plan.
 : RESTED? ( bool ^pass -- bool )
@@ -4314,21 +4146,14 @@ ENUM pass-state DERIVE eq
    pl PLANNING-HELD-COPIES @ 0= and
    pl PLANNING-COLLISIONS @ VEC:COUNT 0= and live 0= and ;
 
-: FILL-REPORT ( bool ^pass -- )
-   {: live:bool x :}
-   x PASS-PLANNING @ {: pl :}
-   x REPLAYED pl PLANNING-NOOP-COUNT @ pl PLANNING-PLANNED @
-   x HELD-COUNT x SYNC-ERROR-COUNT pl PLANNING-CONFLICT-COUNT @
-   live x RESTED? RECONCILE-REPORT:MAKE x PASS-REPORT ! ;
-
-\ Every live plan's path is held, the ones planning kept included;
-\ answers whether any live plan remains.
-: HOLD-LIVE ( ^pass -- bool )
+\ Sync errors are the plans the pass leaves blocked.
+: FILL-REPORT ( ^pass -- )
    {: x :}
    x PASS-PLANNING @ {: pl :}
-   x PASS-RUN @ LIVE-PLANS {: v :}
-   v VEC:COUNT 0 ?do pl v i VEC:AT @ PENDING-KEY HELD+ loop
-   v VEC:COUNT 0<> ;
+   x JOURNAL@ JOURNAL:LIVE-TALLY {: live:n stuck:n :}
+   x REPLAYED pl PLANNING-NOOP-COUNT @ pl PLANNING-PLANNED @
+   x HELD-COUNT stuck pl PLANNING-CONFLICT-COUNT @
+   live 0<> x RESTED? RECONCILE-REPORT:MAKE x PASS-REPORT ! ;
 
 : RETAINED? ( DROPBOX:hash ^VEC:vector<DROPBOX:hash> -- bool )
    {: h:DROPBOX:hash kept :}
@@ -4441,16 +4266,22 @@ ENUM pass-state DERIVE eq
    root r logged target c ar STAGE-SETTLED?
    if r RUN-JOURNAL @ target c JOURNAL:FORGET-COPY-STAGE then ;
 
-: RETIRE-ROOTED ( fd ^run -- )
-   {: root:fd r :}
-   r RUN-JOURNAL @ r RUN-ARENA @ JOURNAL:COMPLETED-DOWNLOAD-PLANS {: done :}
-   r RUN-JOURNAL @ r RUN-ARENA @ JOURNAL:UNHELD-COPY-STAGES {: copies :}
-   done VEC:COUNT 0= copies VEC:COUNT 0= and if exit then
-   r RUN-ARENA @ [type] str NEW-VECTOR {: logged :}
-   r RUN-ARENA @ ARENA:NEW-IN {: each :}
+: RETIRE-BATCH
+   ( ^VEC:vector<JOURNAL:plan-record> ^ARENA:arena fd ^run
+     ^VEC:vector<str> ^ARENA:arena -- bool )
+   {: done ar root:fd r logged each :}
    done VEC:COUNT 0 ?do
       root r logged done i VEC:AT @ each RETIRE-STAGES-OF each ARENA:RESET
    loop
+   true ;
+
+: RETIRE-ROOTED ( fd ^run -- )
+   {: root:fd r :}
+   r RUN-ARENA @ [type] str NEW-VECTOR {: logged :}
+   r RUN-ARENA @ ARENA:NEW-IN {: each :}
+   r RUN-JOURNAL @ [: JOURNAL:DOWNLOADED-BATCH ;]
+   [: root r logged each RETIRE-BATCH ;] r RUN-ARENA @ EACH-BATCH drop
+   r RUN-JOURNAL @ r RUN-ARENA @ JOURNAL:UNHELD-COPY-STAGES {: copies :}
    copies VEC:COUNT 0 ?do
       root r logged copies i VEC:AT @ each COPY-STAGE-RETIRED
       each ARENA:RESET
@@ -4484,7 +4315,6 @@ ENUM pass-state DERIVE eq
    j x PASS-RECOVERY @ REPLAY:PRUNE-COMPLETED-RECOVERIES drop
 
    j x ARENA@ JOURNAL:PENDING-UPLOAD-CONTENT {: kept :}
-   x HOLD-LIVE
    x FILL-REPORT
    x PASS-RUN @ STAGING$ [: kept RETAINED? ;] x ARENA@
    LOCAL:REMOVE-UNREFERENCED-UPLOAD-STAGES drop ;

@@ -49,7 +49,9 @@
 \ spelled by its folders, and one thrown after a batch publishing
 \ nothing and leaving the next one empty staging; LIVE-PLAN-AT at a
 \ pending, a blocked, a completed and an
-\ unheld key; a completed download plan kept by every prune, the one at
+\ unheld key; a batch of pending, of blocked and of completed download
+\ plans ending at BATCH-BOUND with its last plan whole, the next batch
+\ above it; a completed download plan kept by every prune, the one at
 \ open included, until it is forgotten or a new root's activation
 \ deletes it, and a completed upload plan not;
 \ the keys EACH-UNSETTLED-PATH visits, in byte order, none
@@ -3355,7 +3357,7 @@ variable ROWS-SEEN       \ rows an EACH-SCAN-JOB body was given
 \ fixture settles no key.
 : KNOWN-VISITS ( journal ^ARENA:arena -- str )
    {: j ar :}
-   SB-RESET j ar [: KNOWN-PUT ;] EACH-UNSETTLED-PATH 0 T= SB$ ;
+   SB-RESET j ar [: KNOWN-PUT true ;] EACH-UNSETTLED-PATH 0 T= SB$ ;
 
 : KNOWN-AT$ ( journal str ^ARENA:arena -- str )
    {: j k:str ar :}
@@ -4216,9 +4218,8 @@ variable CRAFT
    {: j a:str plan ar :}
    j a DISPLAY plan ar RECORD-PLAN RECORDED-PLAN drop ;
 
-\ The Rust test also counts the statements pending_plans runs, by
-\ rusqlite's trace. SQLITE has no trace hook; PENDING-PLANS reads in
-\ READ-PLANS-WITH-STATUS's one WITH-STATEMENT.
+\ SQLITE has no trace hook to count statements as the Rust test does;
+\ PENDING-BATCH reads its batch in READ-BATCH's one WITH-STATEMENT.
 : PENDING-PLANS-READS-EVERY-PLAN-AND-OPERATION-IN-ONE-QUERY
    ( ^ARENA:arena -- )
    {: ar :}
@@ -4237,9 +4238,67 @@ variable CRAFT
    j s" c.txt" upload ar RECORD-UPLOAD
    j s" d.txt" DISPLAY ordered ar RECORD-PLAN RECORDED-PLAN
    >OPERATIONS VEC:COUNT 1 > TTRUE
-   j ar PENDING-PLANS {: plans :}
+   j OPTION:NONE ar PENDING-BATCH {: plans :}
    plans VEC:COUNT 4 T=
    plans IN-ORDER? TTRUE
+   j CLOSE
+   d GONE ;
+
+\ ---- plan batches across their bound
+
+\ A download plan at the n-th of MANY-PATH's paths; the last of the first
+\ batch preserves a local file before its install.
+: BATCHED-PLAN
+   ( journal n operation-plan operation-plan ^ARENA:arena -- plan-id )
+   {: j n one two ar :}
+   n BATCH-BOUND 1- = if two else one then {: plan :}
+   j n ar MANY-PATH DISPLAY plan ar RECORD-PLAN RECORDED-PLAN >ID ;
+
+\ read's batch from none holds BATCH-BOUND plans in order, its last with
+\ both operations; above that last id, only the next plan; above that, none.
+: SPLIT-AT-BOUND
+   ( journal
+     [ journal option<plan-id> ^ARENA:arena -- ^VEC:vector<plan-record> ]
+     ^ARENA:arena -- )
+   {: j read ar :}
+   j NO-PLAN-ID ar read execute {: first :}
+   first VEC:COUNT BATCH-BOUND T=
+   first IN-ORDER? TTRUE
+   first BATCH-BOUND 1- VEC:AT @ {: top :}
+   top >OPERATIONS VEC:COUNT 2 T=
+   j top >ID OPTION:SOME ar read execute {: later :}
+   later VEC:COUNT 1 T=
+   later 0 VEC:AT @ {: rest :}
+   rest >ID PLAN-ID>N top >ID PLAN-ID>N > TTRUE
+   rest >OPERATIONS VEC:COUNT 1 T=
+   j rest >ID OPTION:SOME ar read execute VEC:COUNT 0 T= ;
+
+\ A batch ends at its bound, never inside a plan, and the next starts
+\ above it, for pending, blocked and completed download plans.
+: PLAN-BATCHES-SPLIT-WHOLE-AT-THEIR-BOUND ( ^ARENA:arena -- )
+   {: ar :}
+   s" plan batches split whole at their bound" T-LABEL
+   ar JOURNAL-AT {: d:str p:str :}
+   s" download" s" rev-download" REMOTE-FILE {: rem :}
+   rem DOWNLOAD-DECISION ar OPERATIONS {: one :}
+   ar [type] MODEL:operation NEW-VECTOR {: ops :}
+   s" displaced" CONTENT MODEL-LOCAL:MAKE MODEL-OPERATION:PRESERVE-LOCAL
+   ops VEC:PUSH !
+   rem MODEL-OPERATION:INSTALL-LOCAL ops VEC:PUSH !
+   ops JOURNAL-OPERATION--PLAN:MAKE {: two :}
+   MODEL-BLOCKAGE:LOCAL-OBJECT-IN-WAY {: why :}
+   ar [type] plan-id NEW-VECTOR {: ids :}
+   p OPEN {: j :}
+   BATCH-BOUND 1+ 0 ?do j i one two ar BATCHED-PLAN ids VEC:PUSH ! loop
+   j [: PENDING-BATCH ;] ar SPLIT-AT-BOUND
+   ids VEC:COUNT 0 ?do
+      j ids i VEC:AT @ why 1700000000 ar BLOCK-PLAN drop
+   loop
+   j [: BLOCKED-BATCH ;] ar SPLIT-AT-BOUND
+   ids VEC:COUNT 0 ?do
+      j ids i VEC:AT @ ar SUPERSEDE-PLAN SUPERSEDED? TTRUE
+   loop
+   j [: DOWNLOADED-BATCH ;] ar SPLIT-AT-BOUND
    j CLOSE
    d GONE ;
 
@@ -6423,6 +6482,7 @@ TYPED-VARIABLE HELD-OPERATION operation-id
    ar BLOCKING-A-PLAN-HIDES-IT-FROM-PENDING-WORK-ACROSS-REOPEN
    ar A-BLOCKED-PATH-KEEPS-ITS-PLAN-INSTEAD-OF-GAINING-A-SECOND-ONE
    ar PENDING-PLANS-READS-EVERY-PLAN-AND-OPERATION-IN-ONE-QUERY
+   ar PLAN-BATCHES-SPLIT-WHOLE-AT-THEIR-BOUND
    ar A-PLAN-WITHOUT-OPERATIONS-IS-REFUSED
    ar PLAN-STATUS-DECODING-NAMES-THE-STATE-IT-REJECTS
    ar ORACLE-JOURNAL-HOLDS-ITS-CONFLICTS

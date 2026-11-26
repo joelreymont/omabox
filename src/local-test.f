@@ -128,7 +128,8 @@ private
 : LEASE-OF ( option<download-slot-lease> -- n binding bool )
    MATCH option
       none OF -1 0 0 0 0 BINDING-MAKE false ENDOF
-      some OF DOWNLOAD-SLOT-LEASE-UNMAKE {: d:str slot:n b:binding :}
+      some OF DOWNLOAD-SLOT-LEASE-UNMAKE
+         {: d:str slot:n b:binding plan:n :}
          slot b true
       ENDOF
    ;MATCH ;
@@ -136,22 +137,39 @@ private
 : STATE-APART ( option<download-slot-state> -- binding n bool )
    MATCH option
       none OF 0 0 0 0 BINDING-MAKE 0 false ENDOF
-      some OF DOWNLOAD-SLOT-STATE-UNMAKE true ENDOF
+      some OF DOWNLOAD-SLOT-STATE-UNMAKE
+         {: b:binding plan:option<n> at:n :}
+         b at true
+      ENDOF
    ;MATCH ;
 
 \ The slot's state apart: its binding, its offset and true.
 : SLOT-STATE-OF ( fd str -- binding n bool )
    READ-DOWNLOAD-SLOT-STATE STATE-APART ;
 
-\ The state encoded and decoded again, apart.
+\ The state of plan 1 encoded and decoded again, apart.
 : STATE-ROUND-TRIP ( binding n -- binding n bool )
-   DOWNLOAD-SLOT-STATE-MAKE ENCODE-DOWNLOAD-SLOT-STATE
+   {: b:binding at:n :}
+   b 1 OPTION:SOME at DOWNLOAD-SLOT-STATE-MAKE ENCODE-DOWNLOAD-SLOT-STATE
    DECODE-DOWNLOAD-SLOT-STATE STATE-APART ;
 
-\ The slot state's bytes for the binding at offset, valid until the
-\ next encode.
-: STATE-BYTES ( binding n -- str )
-   DOWNLOAD-SLOT-STATE-MAKE ENCODE-DOWNLOAD-SLOT-STATE ;
+\ The slot state's bytes for the binding and plan id at offset, valid
+\ until the next encode.
+: STATE-BYTES ( binding n n -- str )
+   {: b:binding plan:n at:n :}
+   b plan N>PLAN at DOWNLOAD-SLOT-STATE-MAKE ENCODE-DOWNLOAD-SLOT-STATE ;
+
+V1-STATE-LENGTH BUFFER: V1-BUF
+
+\ A v1 state's bytes for the binding at offset: the v1 prefix, the
+\ binding, then the offset; valid until the next.
+: V1-STATE-BYTES ( binding n -- str )
+   {: b:binding at:n :}
+   V1-OWNER-PREFIX str> {: x:^ xu:n :}
+   x V1-BUF xu BYTE-COPY
+   b V1-BUF xu + BINDING>BYTES
+   at V1-BUF xu + 32 + BE!
+   V1-BUF V1-STATE-LENGTH >str ;
 
 32 BUFFER: FILLED
 
@@ -199,7 +217,7 @@ private
    {: x :}
    x DOWNLOAD-PARTIAL-LOCATION {: loc :}
    loc SOURCE@ MATCH download-source
-      resumable OF {: slots:fd name:str path:str b:binding :}
+      resumable OF {: slots:fd name:str path:str b:binding plan:n :}
          slots name loc TARGET-DIR@ loc STAGE-NAME@
          FS:TRY-RENAME-NEW-AT
       ENDOF
@@ -211,9 +229,10 @@ private
    {: x :}
    x PARTIAL-FILE 0 FD:RESIZE
    x DOWNLOAD-PARTIAL-LOCATION SOURCE@ MATCH download-source
-      resumable OF {: slots:fd name:str path:str b:binding :}
+      resumable OF {: slots:fd name:str path:str b:binding plan:n :}
          x PARTIAL-FILE DOWNLOAD-PARTIAL-XATTR
-         b 0 DOWNLOAD-SLOT-STATE-MAKE ENCODE-DOWNLOAD-SLOT-STATE XATTR:SET
+         b plan OPTION:SOME 0 DOWNLOAD-SLOT-STATE-MAKE
+         ENCODE-DOWNLOAD-SLOT-STATE XATTR:SET
       ENDOF
       disposable OF {: p:str :} ENDOF
    ;MATCH
@@ -325,6 +344,7 @@ EXPORT LEASE-OF
 EXPORT SLOT-STATE-OF
 EXPORT STATE-ROUND-TRIP
 EXPORT STATE-BYTES
+EXPORT V1-STATE-BYTES
 EXPORT FILLED-BINDING
 EXPORT OPENED-SLOT
 EXPORT STAGE-NAME
@@ -2828,21 +2848,25 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    hu 2 / 0 ?do h i 2 * + HEX-BYTE UNHEXED i + c! loop
    UNHEXED hu 2 / >str ;
 
-\ Rust's DownloadSlotIdentity::new and encode_download_slot_state; the
-\ binding is sha256sum of Rust's input for this download.
-: SLOT-BYTES-ARE-RUSTS ( -- )
-   s" slot identity and state bytes are the Rust daemon's" T-LABEL
+\ The binding is Rust's DownloadSlotIdentity::new, sha256sum of Rust's
+\ input for this download; the state is the v2 layout around it.
+: SLOT-BYTES-ARE-V2 ( -- )
+   s" slot binding is the Rust daemon's and its state is v2" T-LABEL
    s" 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
    DROPBOX:>HASH s" 015f1a2b3c4d" DROPBOX:>REV
    MODEL-REMOTE:MAKE {: r:MODEL:remote :}
-   7 42 s" Docs/a.txt" r LOCAL:NEW-SLOT-IDENTITY LOCAL:SLOT-BINDING
-   $0102030405060708 LOCAL:STATE-BYTES str> {: p:^ u:n :}
-   u 63 T=
-   p 23 >str s" omabox-download-slot-v1" T$=
+   7 9 42 s" Docs/a.txt" r LOCAL:NEW-SLOT-IDENTITY
+   {: id:LOCAL:download-slot-identity :}
+   id LOCAL:SLOT-PLAN 9 T=
+   id LOCAL:SLOT-BINDING 9 $0102030405060708 LOCAL:STATE-BYTES
+   str> {: p:^ u:n :}
+   u 71 T=
+   p 23 >str s" omabox-download-slot-v2" T$=
    p 23 + 32 >str
    s" 5ab14b7f1ecd878a5ce03fa13ad45efd36df5aad8c4bef0129fefdc17a4b9430"
    UNHEX T$=
-   p 55 + 8 >str s" 0102030405060708" UNHEX T$= ;
+   p 55 + 8 >str s" 0000000000000009" UNHEX T$=
+   p 63 + 8 >str s" 0102030405060708" UNHEX T$= ;
 
 \ Rust's range is 0 to 1024 checkpoints and a block; its boundaries are
 \ 0, each checkpoint and the bytes either side of it, and the last.
@@ -2867,32 +2891,33 @@ FS:PATHZ-CAP BUFFER: LOG-AT
    d TEXT-BUF xu + du BYTE-COPY
    TEXT-BUF xu du + >str ;
 
-\ Rust's test_slot_identity: target t's download of c at "revision-<op>".
+\ Rust's test_slot_identity: target t's download of c at "revision-<op>",
+\ its plan's id op.
 : SLOT-IDENTITY
    ( str DROPBOX:hash n n -- LOCAL:download-slot-identity )
    {: t:str c:DROPBOX:hash generation:n op:n :}
    c s" revision-" op NUMBERED DROPBOX:>REV MODEL-REMOTE:MAKE
    {: r:MODEL:remote :}
-   generation op t r LOCAL:NEW-SLOT-IDENTITY ;
+   generation op op t r LOCAL:NEW-SLOT-IDENTITY ;
 
 : DOWNLOAD ( -- DROPBOX:hash ) s" download" HASH-OF ;
 
 \ The lease of the case directory's slots for the identity, apart.
 : LEASE
-   ( str DROPBOX:hash n n [ LOCAL:binding -- bool ]
+   ( str DROPBOX:hash n n [ LOCAL:binding n -- bool ]
      -- n LOCAL:binding bool )
    {: t:str c:DROPBOX:hash generation:n op:n protected :}
    t c generation op SLOT-IDENTITY {: id:LOCAL:download-slot-identity :}
    ROOT$ id protected LOCAL:LEASE-DOWNLOAD-SLOT LOCAL:LEASE-OF ;
 
 TYPED-VARIABLE HELD-BINDING LOCAL:binding
-: HELD? ( LOCAL:binding -- bool ) HELD-BINDING @ LOCAL:BINDING= ;
+: HELD? ( LOCAL:binding n -- bool ) drop HELD-BINDING @ LOCAL:BINDING= ;
 
 4 TYPED-BUFFER LEASED LOCAL:binding
 variable LEASED-COUNT
 
-: LEASED? ( LOCAL:binding -- bool )
-   {: b:LOCAL:binding :}
+: LEASED? ( LOCAL:binding n -- bool )
+   {: b:LOCAL:binding plan:n :}
    LEASED-COUNT @ 0 ?do
       i LEASED @ b LOCAL:BINDING= if true unloop exit then
    loop false ;
@@ -2992,6 +3017,45 @@ variable FILES
    s" stale_slot_is_rebound_across_root_and_operation_identity" T-LABEL
    [: STALE-SLOTS ;] IN-CASE-DIR ;
 
+: PROTECT-ALL ( LOCAL:binding n -- bool ) drop drop true ;
+
+\ Slot 0 holds partial bytes under a v1 state, as Rust's or this daemon's
+\ before, bound to b at offset 0.
+: V1-SLOT ( fd LOCAL:binding -- )
+   {: root:fd b:LOCAL:binding :}
+   0 SLOT-AT s" partial download bytes" FS:WRITE-ALL
+   root 0 LOCAL:DOWNLOAD-SLOT-NAME OPEN-AT {: f:fd :}
+   [: f LOCAL:DOWNLOAD-PARTIAL-XATTR b 0 LOCAL:V1-STATE-BYTES XATTR:SET ;]
+   [: f FS:CLOSE-DIR ;] finally ;
+
+\ A v1 state has no plan, so no predicate protects it.
+: V1-TAKEN ( fd -- )
+   {: root:fd :}
+   root 7 LOCAL:FILLED-BINDING V1-SLOT
+   TARGET DOWNLOAD 1 1 [: PROTECT-ALL ;] LEASE
+   {: slot:n b:LOCAL:binding found:bool :}
+   found TTRUE slot 0 T=
+   root 0 b EMPTY-SLOT ;
+
+: V1-SLOT-IS-TAKEN-UNPROTECTED ( -- )
+   s" v1 slot is taken by another download's lease" T-LABEL
+   [: V1-TAKEN ;] IN-CASE-DIR ;
+
+\ The v1 slot bound to the lease's own download is leased to it whole.
+: V1-RESUMED ( fd -- )
+   {: root:fd :}
+   TARGET DOWNLOAD 1 1 SLOT-IDENTITY LOCAL:SLOT-BINDING {: own:LOCAL:binding :}
+   root own V1-SLOT
+   TARGET DOWNLOAD 1 1 [: PROTECT-ALL ;] LEASE
+   {: slot:n b:LOCAL:binding found:bool :}
+   found TTRUE slot 0 T= b own LOCAL:BINDING= TTRUE
+   0 SLOT-AT s" partial download bytes" HOLDS
+   root 0 LOCAL:DOWNLOAD-SLOT-NAME own 0 STATE-AT ;
+
+: V1-SLOT-IS-RESUMED-BY-ITS-DOWNLOAD ( -- )
+   s" v1 slot is resumed by its own download's lease" T-LABEL
+   [: V1-RESUMED ;] IN-CASE-DIR ;
+
 FS:PATHZ-CAP BUFFER: JOINED2
 32 BUFFER: SLOT-NAME-BUF
 variable SLOT-NAME-U
@@ -3025,7 +3089,7 @@ variable SLOT-PATH-U
 \ The reset of the slot open at f, with the swap before its truncate.
 : SWAP-RESET ( fd fd LOCAL:binding -- bool )
    {: f:fd root:fd b:LOCAL:binding :}
-   f root SLOT$ SLOT-PATH$ b [: SWAP-SLOT ;]
+   f root SLOT$ SLOT-PATH$ b 1 OPTION:SOME [: SWAP-SLOT ;]
    LOCAL:RESET-DOWNLOAD-SLOT-FILE-WITH LOCAL:TAKEN? ;
 
 \ prepare_download_slot_at answers a fresh lease's slot opened, which
@@ -4372,11 +4436,13 @@ FS:PATHZ-CAP BUFFER: SLOT-FILE-BUF
    UNSAFE-PARENT-PATH-FAILS
    UNREADABLE-HASH-INPUT-FAILS
    DOWNLOAD-CHECKPOINT-STATE-ENCODES-THE-LAST-COMPLETE-BOUNDARY
-   SLOT-BYTES-ARE-RUSTS
+   SLOT-BYTES-ARE-V2
    PARTIAL-RESET-NEVER-MUTATES-A-SWAPPED-REPLACEMENT
    DOWNLOAD-SLOT-POOL-HAS-FOUR-FIXED-PATHS-WITHOUT-OVERFLOW
    PROTECTED-DOWNLOAD-SLOT-KEEPS-ITS-BINDING-AND-BYTES
    STALE-SLOT-IS-REBOUND-ACROSS-ROOT-AND-OPERATION-IDENTITY
+   V1-SLOT-IS-TAKEN-UNPROTECTED
+   V1-SLOT-IS-RESUMED-BY-ITS-DOWNLOAD
    INTERRUPTED-DOWNLOADS-RESUME-FROM-DURABLE-BOUNDARIES
    COMPLETED-PARTIAL-RECOVERS-BEFORE-AND-AFTER-RENAME
    CORRUPT-COMPLETED-PARTIAL-RESTARTS-ONLY-WHEN-OWNED

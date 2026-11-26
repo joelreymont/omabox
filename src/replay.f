@@ -2723,15 +2723,14 @@ FSM:DEFINE REMOTE-LIFECYCLE ( ^pass ) remote-state remote-event
 
 public
 
-\ Replays the pending plans' Dropbox operations below root path r,
-\ staging uploads in s; each completion is written as it happens.
+\ Replays the plans' Dropbox operations below root path r, staging
+\ uploads in s; each completion is written as it happens.
 : REPLAY-REMOTE-OPERATIONS-AT
-   ( JOURNAL:journal ^link fd str str ^ARENA:arena
-     -- ^replay-report )
-   {: j l root:fd r:str s:str ar :}
+   ( JOURNAL:journal ^link fd str str
+     ^VEC:vector<JOURNAL:plan-record> ^ARENA:arena -- ^replay-report )
+   {: j l root:fd r:str s:str plans ar :}
    j root r ar NEW-PASS {: run :}
    l run PASS-LINK ! s run PASS-STAGING !
-   j ar JOURNAL:PENDING-PLANS {: plans :}
    plans VEC:COUNT 0 ?do
       plans i VEC:AT @ run REPLAY-REMOTE-PLAN
    loop

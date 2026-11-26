@@ -2190,7 +2190,7 @@ CAP BUFFER: TEXT
 : LEASE-FOR
    ( str str MODEL:remote -- option<LOCAL:download-slot-lease> )
    {: d:str t:str rem:MODEL:remote :}
-   1 1 t rem LOCAL:NEW-SLOT-IDENTITY
+   1 1 1 t rem LOCAL:NEW-SLOT-IDENTITY
    {: id:LOCAL:download-slot-identity :}
    d id [: TEST-CLIENT:UNPROTECTED ;] LOCAL:LEASE-DOWNLOAD-SLOT ;
 
@@ -3317,7 +3317,8 @@ ARENA FILE-CASES file-case
    ( JOURNAL:journal str str ^ARENA:arena -- ^REPLAY:replay-report )
    {: j r:str s:str ar :}
    r OPEN-ROOT {: f:fd :}
-   [: j LINK f r s ar REPLAY:REPLAY-REMOTE-OPERATIONS-AT ;]
+   [: j LINK f r s j ar JOURNAL:PENDING-PLANS ar
+      REPLAY:REPLAY-REMOTE-OPERATIONS-AT ;]
    [: f FS:CLOSE-DIR ;] finally ;
 
 \ The next API call is refused 409 with Rust's lookup_error of the tag.
@@ -3664,8 +3665,8 @@ variable SIDES
 : COPY-DENIED ( JOURNAL:journal str str ^ARENA:arena -- )
    {: j r:str s:str ar :}
    r OPEN-ROOT {: f:fd :}
-   [: [: j LINK f r s ar REPLAY:REPLAY-REMOTE-OPERATIONS-AT
-         drop ;] LOCAL:E-IO TTHROWSQ
+   [: [: j LINK f r s j ar JOURNAL:PENDING-PLANS ar
+         REPLAY:REPLAY-REMOTE-OPERATIONS-AT drop ;] LOCAL:E-IO TTHROWSQ
       FS:ERRNO FS:EACCES T= ;]
    [: f FS:CLOSE-DIR ;] finally ;
 

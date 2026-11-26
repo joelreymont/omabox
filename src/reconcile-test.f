@@ -28,15 +28,20 @@
 \ - names_that_neighbor_the_separator_are_not_ancestors
 \ - an_unknown_ancestor_blocks_a_deletion_on_either_side
 \ - baseline_only_paths_are_included_in_confirmed_absence
-\ - ORDER-PATH-DECISIONS puts an upload at depth 3 first, then local
-\   directory deletes at depths 2 and 1, deepest first.
+\ - PLANS-RECORD-DELETES-AFTER-AND-CREATES-BEFORE-THEIR-SUBTREES: PLAN
+\   records a, a/b and a/b/c.txt's local deletes and a.txt's, n's and
+\   n/f.txt's creates in key order but each local directory delete after
+\   every plan beneath it.
+\ - A-DELETE-DEFERRED-ACROSS-A-BATCH-FOLLOWS-ITS-SUBTREE: PLAN records
+\   the local deletes of d's WIDE-CHILDREN files, one plan each, a batch
+\   recorded among them, then d's after every one.
 \ - AN-EXCLUDED-ANCESTOR-LENDS-NO-REASON-OR-SPELLING: an unknown local
 \   record at Cache.dropbox leaves cache.dropbox/x absent and spelled
 \   as the candidate, where one at Locked lends both.
 \ - A-WALK-COUNTS-EVERY-KEPT-BASELINE: Docs, Docs/Notes and Music, each
-\   a directory on both sides and in the baseline: the walk keeps no
-\   key, and deciding files no decision and no no-op record and counts
-\   three no-ops.
+\   a directory on both sides and in the baseline: the walk visits no
+\   key, and deciding records no plan and no no-op and counts three
+\   no-ops.
 \ - DECIDING-KEEPS-THE-RUN-RULE, Rust's
 \   local_map_keeps_one_unsupported_spelling: unsupported link and Link
 \   decide Link alone.
@@ -762,7 +767,7 @@ variable SEED
    ar LOCAL-RECORDS {: rs :}
    rs lower DIRECTORY+ rs upper DIRECTORY+
    j b rs ar LOCALS-PLANNING {: pl :}
-   d [: [: pl DECIDE-ALL ;] E-CASE-COLLISION TTHROWSQ ;] ar
+   d [: [: pl DECIDE-WALK drop ;] E-CASE-COLLISION TTHROWSQ ;] ar
    LOGGED {: t:str :}
    t 10 STR:COUNT-CHAR 1 T=
    t upper lower COLLISION$ STR:CONTAINS? TTRUE
@@ -923,7 +928,7 @@ variable SEED
      ^VEC:vector<str> ^ARENA:arena -- ^VEC:vector<MODEL:key> n )
    {: j bp lp rp ar :}
    ar ARENA:ALLOCATOR 0 [type] MODEL:key VEC:NEW {: merged :}
-   [: j swap [: bp lp rp merged ar CHECK-VISIT ;]
+   [: j swap [: bp lp rp merged ar CHECK-VISIT true ;]
       JOURNAL:EACH-UNSETTLED-PATH ;] ARENA:WITH {: n:n :}
    merged n ;
 
@@ -954,6 +959,10 @@ variable SEED
 variable SETTLED-N
 variable YIELD-NOOPS
 variable ALL-NOOPS
+variable VISITS
+
+\ A walk's visitor that counts its keys in VISITS.
+: COUNT-VISIT ( JOURNAL:known-path -- bool ) drop 1 VISITS +! true ;
 
 \ The prefix, the combination's index and the suffix, in ar.
 : COMBO$ ( str n str ^ARENA:arena -- str )
@@ -1094,7 +1103,7 @@ variable ALL-NOOPS
    ( ^ARENA:arena ^planning ^VEC:vector<MODEL:key>
      ^VEC:vector<MODEL:key> -- )
    {: scratch pl seen held :}
-   pl JOURNAL-OF scratch [: pl seen held scratch YIELD-STEP ;]
+   pl JOURNAL-OF scratch [: pl seen held scratch YIELD-STEP true ;]
    JOURNAL:EACH-UNSETTLED-PATH SETTLED-N ! ;
 
 \ A held key decided as the walk before did; one the statement skipped
@@ -1163,6 +1172,18 @@ variable ALL-NOOPS
    plan original REMAINING-OPERATIONS-MATCH? TFALSE
    d j GONE ;
 
+\ A walk's visitor at the pending plan's path, which it decides absent
+\ on every side.
+: ABSENT-VISIT ( JOURNAL:known-path ^planning MODEL:path -- bool )
+   {: kp pl path :}
+   pl ARENA-OF {: ar :}
+   kp COUNT-VISIT drop
+   kp KNOWN-KEY path ar MODEL:FOLD MODEL:KEY= TTRUE
+   kp pl ar KNOWN-DECISION {: dec :}
+   dec MODEL-BASELINE:ABSENT LOCAL-ABSENT REMOTE-ABSENT
+   MODEL-SUBTREE:EMPTY PLANNER:PLAN MODEL:DECISION= TTRUE
+   dec NOOP? TTRUE true ;
+
 : PENDING-ONLY-PATHS-ARE-VISITED-AS-ABSENT-WITHOUT-CREATING-A-BASELINE
    ( ^ARENA:arena -- )
    {: ar :}
@@ -1174,15 +1195,10 @@ variable ALL-NOOPS
    MODEL-OPERATION:INSTALL-LOCAL ar TEST-CLIENT:ONE-PLAN {: plan :}
    j path plan ar JOURNAL:RECORD-PLAN RECORDED drop
    j ar PLANNING-OVER {: pl :}
-   pl DECIDE-ALL
-   pl PLANNING-DECISIONS @ {: decisions :}
-   decisions VEC:COUNT 1 T=
-   decisions 0 VEC:AT @ PATH-DECISION-UNMAKE
-   {: k shown same dec :}
-   k path ar MODEL:FOLD MODEL:KEY= TTRUE
-   dec MODEL-BASELINE:ABSENT LOCAL-ABSENT REMOTE-ABSENT
-   MODEL-SUBTREE:EMPTY PLANNER:PLAN MODEL:DECISION= TTRUE
-   dec NOOP? TTRUE
+   0 VISITS !
+   j pl ARENA-OF [: pl path ABSENT-VISIT ;] JOURNAL:EACH-UNSETTLED-PATH
+   0 T=
+   VISITS @ 1 T=
    j path ar JOURNAL:BASELINE STORED-SOME? TFALSE
    d j GONE ;
 
@@ -1394,13 +1410,13 @@ variable ALL-NOOPS
    {: d:str j b ar :}
    j b ar KEPT-DIRECTORIES
    j ar PLANNING-OVER {: pl :}
-   pl KNOWN-WALK VEC:COUNT 0 T=
-   pl PLANNING-NOOP-COUNT @ 3 T=
-   j ar PLANNING-OVER {: all :}
-   all DECIDE-ALL
-   all PLANNING-DECISIONS @ VEC:COUNT 0 T=
-   all PLANNING-NOOPS @ VEC:COUNT 0 T=
-   all PLANNING-NOOP-COUNT @ 3 T= ;
+   0 VISITS !
+   j pl ARENA-OF [: COUNT-VISIT ;] JOURNAL:EACH-UNSETTLED-PATH 3 T=
+   VISITS @ 0 T=
+   pl DECIDE-WALK OK? TTRUE
+   pl PLANNING-PLANS @ VEC:COUNT 0 T=
+   pl PLANNING-NOOPS @ VEC:COUNT 0 T=
+   pl PLANNING-NOOP-COUNT @ 3 T= ;
 
 : A-WALK-COUNTS-EVERY-KEPT-BASELINE ( ^ARENA:arena -- )
    {: ar :}
@@ -1410,47 +1426,140 @@ variable ALL-NOOPS
 : DECISION-PATH$ ( path-decision -- str )
    PATH-DECISION-UNMAKE {: k path same dec :} path PATH$ ;
 
+\ A walk's visitor whose key decides the spelling Link.
+: LINK-VISIT ( JOURNAL:known-path ^planning -- bool )
+   {: kp pl :}
+   pl ARENA-OF {: ar :}
+   kp COUNT-VISIT drop
+   kp pl ar KNOWN-DECISION {: d :}
+   kp d pl ar PATH-DECISION-OF DECISION-PATH$ s" Link" T$= true ;
+
 : UNSUPPORTED-PAIR
    ( str JOURNAL:journal JOURNAL:local-root-binding ^ARENA:arena -- )
    {: d:str j b ar :}
    ar LOCAL-RECORDS {: ls :}
    ls s" link" UNSUPPORTED+ ls s" Link" UNSUPPORTED+
    j b ls ar LOCALS-PLANNING {: pl :}
-   pl DECIDE-ALL
-   pl PLANNING-DECISIONS @ {: v :}
-   v VEC:COUNT 1 T=
-   v 0 VEC:AT @ DECISION-PATH$ s" Link" T$= ;
+   0 VISITS !
+   j pl ARENA-OF [: pl LINK-VISIT ;] JOURNAL:EACH-UNSETTLED-PATH drop
+   VISITS @ 1 T= ;
 
 : DECIDING-KEEPS-THE-RUN-RULE ( ^ARENA:arena -- )
    {: ar :}
    s" deciding keeps the run rule" T-LABEL
    [: ar UNSUPPORTED-PAIR ;] ar WITH-ROOTED ;
 
-\ A path decision at the path, its key folded.
-: DECIDED ( str MODEL:decision ^ARENA:arena -- path-decision )
-   {: p:str d ar :}
-   p ar CANONICAL p TEST-CLIENT:DISPLAY false d PATH-DECISION-MAKE ;
+\ Baselines and local directories a and a/b and the file a/b/c.txt,
+\ which Dropbox no longer holds; Dropbox holds only a.txt, n and n/f.txt.
+: NESTED-SIDES
+   ( JOURNAL:journal JOURNAL:local-root-binding ^ARENA:arena -- )
+   {: j b ar :}
+   ar LOCAL-RECORDS {: ls :}
+   ar REMOTE-RECORDS {: rs :}
+   s" c" s" rev-c" ar REMOTE-FILE MODEL-BASELINE:PRESENT {: c :}
+   j s" a" TEST-CLIENT:DISPLAY MODEL-BASELINE:DIRECTORY ar
+   JOURNAL:RECORD-NOOP NOOP-RECORDED? TTRUE
+   j s" a/b" TEST-CLIENT:DISPLAY MODEL-BASELINE:DIRECTORY ar
+   JOURNAL:RECORD-NOOP NOOP-RECORDED? TTRUE
+   j s" a/b/c.txt" TEST-CLIENT:DISPLAY c ar
+   JOURNAL:RECORD-NOOP NOOP-RECORDED? TTRUE
+   ls s" a" DIRECTORY+ ls s" a/b" DIRECTORY+
+   ls s" a/b/c.txt" s" c" ar PRESENT+
+   rs s" a.txt" s" t" s" rev-t" ar REMOTE-FILE REMOTE-PRESENT ar REMOTE+
+   rs s" n" REMOTE-DIRECTORY ar REMOTE+
+   rs s" n/f.txt" s" f" s" rev-f" ar REMOTE-FILE REMOTE-PRESENT ar REMOTE+
+   j b ls ar LOCALS-PUBLISHED
+   j s" cursor" DROPBOX:>CURSOR rs JOURNAL:UPSERT-REMOTE-RECORDS ;
 
-: DECISION-PATH ( path-decision -- str )
-   PATH-DECISION-UNMAKE {: k path same d :} path PATH$ ;
+\ PLAN in a pass whose run holds the journal, rooted at d.
+: PLANNED-AT ( str JOURNAL:journal ^ARENA:arena -- pass-event )
+   {: d:str j ar :}
+   ar RUNS-NEW {: x :}
+   j x RUN-JOURNAL ! ar LOCAL:NEW-WATCH x RUN-WATCH ! ar x RUN-ARENA !
+   d x RUN-ROOT !
+   ar PASSES-NEW {: p :}
+   x p PASS-RUN !
+   p PLAN ;
 
-: DECISION< ( n n ^VEC:vector<path-decision> -- bool )
-   {: x:n y:n v :}
-   v x VEC:AT @ v y VEC:AT @ ORDER-PATH-DECISIONS 0 < ;
+: PLAN-PATH+ ( JOURNAL:plan-record -- )
+   JOURNAL-PLAN--RECORD:UNMAKE {: id p o s :}
+   p PATH$ SB-APPEND s"  " SB-APPEND ;
 
-: PATH-DECISIONS-ORDER-DELETES-LAST-AND-DEEPEST-FIRST ( ^ARENA:arena -- )
+\ The pending plans' paths by id, each followed by a space, in ar.
+: PENDING-ORDER$ ( JOURNAL:journal ^ARENA:arena -- str )
+   {: j ar :}
+   j ar JOURNAL:PENDING-PLANS {: v :}
+   SB-RESET v VEC:COUNT 0 ?do v i VEC:AT @ PLAN-PATH+ loop
+   SB$ ar ARENA:COPY ;
+
+: RECORDS-IN-KEY-ORDER
+   ( str JOURNAL:journal JOURNAL:local-root-binding ^ARENA:arena -- )
+   {: d:str j b ar :}
+   j b ar NESTED-SIDES
+   d j ar PLANNED-AT OK? TTRUE
+   j ar PENDING-ORDER$ s" a.txt a/b/c.txt a/b a n n/f.txt " T$= ;
+
+: PLANS-RECORD-DELETES-AFTER-AND-CREATES-BEFORE-THEIR-SUBTREES
+   ( ^ARENA:arena -- )
    {: ar :}
-   s" path decisions order deletes last and deepest first" T-LABEL
-   ar ARENA:ALLOCATOR 0 [type] path-decision VEC:NEW {: v :}
-   MODEL-OPERATION:DELETE-LOCAL-DIRECTORY MODEL-DECISION:OPERATE {: del :}
-   s" a" del ar DECIDED v VEC:PUSH !
-   s" a/b" del ar DECIDED v VEC:PUSH !
-   s" a/b/c.txt" s" c" ar IDENTITY MODEL-OPERATION:CREATE-REMOTE
-   MODEL-DECISION:OPERATE ar DECIDED v VEC:PUSH !
-   v VEC:COUNT [: v DECISION< ;] ar ORDER {: idx :}
-   v idx 0 VEC:AT @ VEC:AT @ DECISION-PATH s" a/b/c.txt" T$=
-   v idx 1 VEC:AT @ VEC:AT @ DECISION-PATH s" a/b" T$=
-   v idx 2 VEC:AT @ VEC:AT @ DECISION-PATH s" a" T$= ;
+   s" plans record deletes after and creates before their subtrees"
+   T-LABEL
+   [: ar RECORDS-IN-KEY-ORDER ;] ar WITH-ROOTED ;
+
+: PLAN-PATH$ ( ^VEC:vector<JOURNAL:plan-record> n -- str )
+   VEC:AT @ JOURNAL-PLAN--RECORD:UNMAKE {: id p o s :} p PATH$ ;
+
+: NUMBERED ( str n ^ARENA:arena -- str )
+   {: a:str k:n ar :}
+   SB-RESET a SB-APPEND k FMT:SB-INT SB$ ar ARENA:COPY ;
+
+\ Children enough that a batch is recorded inside their parent's subtree.
+PLAN-BATCH 1+ constant WIDE-CHILDREN
+
+\ The k-th child: d/1000 on, in key order.
+: WIDE-CHILD ( n ^ARENA:arena -- str )
+   {: k:n ar :}
+   s" d/" k 1000 + ar NUMBERED ;
+
+: WIDE-CHILD+
+   ( JOURNAL:journal ^VEC:vector<MODEL:local-record> MODEL:baseline
+     DROPBOX:hash n ^ARENA:arena -- )
+   {: j ls c h:DROPBOX:hash k:n ar :}
+   k ar WIDE-CHILD {: p:str :}
+   j p TEST-CLIENT:DISPLAY c ar JOURNAL:RECORD-NOOP NOOP-RECORDED? TTRUE
+   ls p h MODEL-LOCAL:MAKE LOCAL-PRESENT LOCAL+ ;
+
+\ Baselines and local records of the directory d and its WIDE-CHILDREN
+\ files, none of which Dropbox holds.
+: WIDE-SIDES
+   ( JOURNAL:journal JOURNAL:local-root-binding ^ARENA:arena -- )
+   {: j b ar :}
+   ar LOCAL-RECORDS {: ls :}
+   s" c" s" rev-c" ar REMOTE-FILE MODEL-BASELINE:PRESENT {: c :}
+   s" c" ar IDENTITY {: h:DROPBOX:hash :}
+   j s" d" TEST-CLIENT:DISPLAY MODEL-BASELINE:DIRECTORY ar
+   JOURNAL:RECORD-NOOP NOOP-RECORDED? TTRUE
+   ls s" d" DIRECTORY+
+   WIDE-CHILDREN 0 ?do j ls c h i ar WIDE-CHILD+ loop
+   j b ls ar LOCALS-PUBLISHED
+   j s" cursor" DROPBOX:>CURSOR ar REMOTE-RECORDS
+   JOURNAL:UPSERT-REMOTE-RECORDS ;
+
+: WIDE-PLANNED
+   ( str JOURNAL:journal JOURNAL:local-root-binding ^ARENA:arena -- )
+   {: d:str j b ar :}
+   j b ar WIDE-SIDES
+   d j ar PLANNED-AT OK? TTRUE
+   j ar JOURNAL:PENDING-PLANS {: v :}
+   v VEC:COUNT WIDE-CHILDREN 1+ T=
+   WIDE-CHILDREN 0 ?do v i PLAN-PATH$ i ar WIDE-CHILD T$= loop
+   v WIDE-CHILDREN PLAN-PATH$ s" d" T$= ;
+
+: A-DELETE-DEFERRED-ACROSS-A-BATCH-FOLLOWS-ITS-SUBTREE
+   ( ^ARENA:arena -- )
+   {: ar :}
+   s" a delete deferred across a batch follows its subtree" T-LABEL
+   [: ar WIDE-PLANNED ;] ar WITH-ROOTED ;
 
 
 \ ---- case collisions ------------------------------------------------
@@ -1737,9 +1846,6 @@ variable ALL-NOOPS
       changed OF s" changed " swap PATH$ ar JOIN-BYTES ENDOF
       root-changed OF s" root-changed" ENDOF
    ;MATCH ;
-
-: PLAN-PATH$ ( ^VEC:vector<JOURNAL:plan-record> n -- str )
-   VEC:AT @ JOURNAL-PLAN--RECORD:UNMAKE {: id p o s :} p PATH$ ;
 
 : RENAMES-ONE ( str str ^ARENA:arena -- )
    {: d:str r:str ar :}
@@ -3272,10 +3378,6 @@ READ-CAP BUFFER: READ-BUF
    x RUN-JOURNAL @ a TEST-CLIENT:DISPLAY plan ar JOURNAL:RECORD-PLAN
    WRITTEN TTRUE ;
 
-: NUMBERED ( str n ^ARENA:arena -- str )
-   {: a:str k:n ar :}
-   SB-RESET a SB-APPEND k FMT:SB-INT SB$ ar ARENA:COPY ;
-
 \ The fake's file /<p> at rev v with b's identity and size.
 : FILE-AT ( str str str ^ARENA:arena -- )
    {: p:str v:str b:str ar :}
@@ -3291,10 +3393,10 @@ READ-CAP BUFFER: READ-BUF
 
 : DOWNLOAD$ ( -- str ) s" /2/files/download" ;
 
-: REPORTED ( replay-step -- ^REPLAY:replay-report )
+: REPORTED ( replay-step -- n )
    MATCH replay-step
       root-changed OF s" the replay step lost its root" TEST-CLIENT:FAILED ENDOF
-      report OF ENDOF
+      report OF drop ENDOF
    ;MATCH ;
 
 : STEPPED ( ^run -- ) REPLAY-STEP REPORTED drop ;
@@ -3402,14 +3504,12 @@ READ-CAP BUFFER: READ-BUF
    ar STEP-RUN {: d:str x :}
    MISMATCH$ s" expected-revision" ar REMOTE-FILE {: rem :}
    x s" mismatch.txt" rem INSTALLING drop
-   SB-RESET s" durable-plan mismatch.txt " SB-APPEND w SB-APPEND
-   SB$ ar ARENA:COPY {: e:str :}
-   x REPLAY-STEP REPORTED e REPORTS? TTRUE
+   x STEPPED
    x PENDING-OF VEC:COUNT 0 T=
    x BLOCKED-OF {: held :}
    held VEC:COUNT 1 T=
    held 0 VEC:AT @ HELD-FOR$ w T$=
-   x REPLAY-STEP REPORTED COMPLETED 0 T=
+   x REPLAY-STEP REPORTED 0 T=
    TEST-DROPBOX:SEEN$ DOWNLOAD$ T$=
    d x STEP-GONE ;
 
@@ -3551,13 +3651,6 @@ READ-CAP BUFFER: READ-BUF
    {: rem :}
    sp x s" occupied.txt" rem INSTALLING ;
 
-\ Rust's StageDestinationOccupied for the plan p at the stage sp.
-: OCCUPIED-ENTRY ( JOURNAL:plan-record str ^ARENA:arena -- str )
-   {: p sp:str ar :}
-   SB-RESET s" stage-destination-occupied " SB-APPEND
-   p ID-OF JOURNAL:PLAN-ID>N FMT:SB-INT
-   s"  " SB-APPEND sp SB-APPEND SB$ ar ARENA:COPY ;
-
 : OCCUPIED-DOWNLOAD-STAGE-IS-DURABLY-BLOCKED-WITHOUT-OVERWRITE-OR-REQUEST
    ( ^ARENA:arena -- )
    {: ar :}
@@ -3565,9 +3658,8 @@ READ-CAP BUFFER: READ-BUF
    T-LABEL
    TEST-DROPBOX:RESET
    ar STEP-RUN {: d:str x :}
-   x OCCUPIED {: sp:str p :}
-   p sp ar OCCUPIED-ENTRY {: e:str :}
-   x REPLAY-STEP REPORTED e REPORTS? TTRUE
+   x OCCUPIED drop {: sp:str :}
+   x STEPPED
    sp OCCUPANT$ HOLDS-BYTES
    x PENDING-OF VEC:COUNT 0 T=
    x BLOCKED-OF {: held :}
@@ -3685,7 +3777,7 @@ $100 constant MODE-0400
    x s" fallback.txt" rem INSTALLING drop
    s" Dropbox could not be reached."
    x RUN-LINK @ REPLAY-LINK:STATUS @ STATUS:ERROR
-   x REPLAY-STEP REPORTED COMPLETED 1 T=
+   x REPLAY-STEP REPORTED 1 T=
    d s" omabox/status.json" ar TEST-CLIENT:INSIDE READ-BUF READ-CAP FS:READ-ALL
    {: u:n :}
    READ-BUF u >str S\" \qlast_error\q:null" STR:CONTAINS? TTRUE
@@ -3722,7 +3814,7 @@ TYPED-VARIABLE CANARY str
 : ROOT-CHANGED? ( replay-step -- bool )
    MATCH replay-step
       root-changed OF true ENDOF
-      report OF drop false ENDOF
+      report OF drop drop false ENDOF
    ;MATCH ;
 
 \ The new root holds canary.txt alone, with its bytes.
@@ -3794,7 +3886,7 @@ TYPED-VARIABLE CANARY str
    x GENERATION {: gen:n :}
    p PENDING-DOWNLOAD MATCH option
       none OF s" reconcile-test: no download" TEST-CLIENT:FAILED ENDOF
-      some OF {: d :} gen p PLAN-PATH d SLOT-IDENTITY ENDOF
+      some OF {: d :} gen p PLAN-PATH d p ID-OF SLOT-IDENTITY ENDOF
    ;MATCH ;
 
 \ Plan p's slot, leased as the step leases it, holding a checkpoint of
@@ -3930,7 +4022,7 @@ TYPED-VARIABLE CANARY str
    rem MODEL-OPERATION:INSTALL-LOCAL ar TWO-PLAN {: plan :}
    x RUN-JOURNAL @ s" legacy.txt" TEST-CLIENT:DISPLAY plan ar JOURNAL:RECORD-PLAN
    WRITTEN TTRUE drop
-   x REPLAY-STEP REPORTED COMPLETED 2 T=
+   x REPLAY-STEP REPORTED 2 T=
    x s" legacy.txt" IN-ROOT LEGACY$ HOLDS-BYTES
    d x STEP-GONE ;
 
@@ -3954,9 +4046,8 @@ TYPED-VARIABLE RACED-INSTALL str
    [: RACE-INSTALL ;] TEST-DROPBOX:DURING-DOWNLOAD!
    s" Dropbox could not be reached."
    x RUN-LINK @ REPLAY-LINK:STATUS @ STATUS:ERROR
-   x REPLAY-STEP REPORTED {: rep :}
-   rep COMPLETED 0 T=
-   rep BLOCKS VEC:COUNT 1 T=
+   x REPLAY-STEP REPORTED 0 T=
+   x PENDING-OF VEC:COUNT 1 T=
    d s" omabox/status.json" ar TEST-CLIENT:INSIDE READ-BUF READ-CAP FS:READ-ALL
    {: u:n :}
    READ-BUF u >str s" Dropbox could not be reached." STR:CONTAINS? TTRUE
@@ -4069,7 +4160,7 @@ TYPED-VARIABLE RACED-INSTALL str
    ar STEP-RUN {: d:str x :}
    d x BOTH-WAYS {: rec:str :}
    x rec PASSED COMPLETE REPORTS
-   x REPLAY-STEP REPORTED COMPLETED 0 T=
+   x REPLAY-STEP REPORTED 0 T=
    x s" download.txt" IN-ROOT REMOTE$ HOLDS-BYTES
    x s" download.txt" REMOTE$ s" rev-download" ar REMOTE-FILE BASELINE-AT
    x s" upload.txt" UPLOAD$ s" 01701" ar REMOTE-FILE BASELINE-AT
@@ -4618,10 +4709,6 @@ TYPED-VARIABLE RACED-INSTALL str
    s" download-unavailable " st x RUN-ARENA @ NUMBERED {: w:str :}
    held 0 VEC:AT @ HELD-FOR$ w T$= ;
 
-: UNAVAILABLE-ENTRY ( n ^ARENA:arena -- str )
-   {: st:n ar :}
-   s" durable-plan blocked.txt download-unavailable " st ar NUMBERED ;
-
 \ Rust's five requests but the account call; the fake serves good.txt's
 \ bytes only to an argument naming rev-good.
 : ISOLATION-SEEN$ ( -- str )
@@ -4645,13 +4732,13 @@ TYPED-VARIABLE RACED-INSTALL str
    x RUN-JOURNAL @ JOURNAL:CLOSE
    d x OPENED-AGAIN ;
 
-\ Over a reopened journal, a step reports the block and sends nothing.
+\ Over a reopened journal, a step keeps the block and sends nothing.
 : BLOCK-KEPT ( str ^run n -- )
    {: d:str x st:n :}
    d x REOPENED
    TEST-DROPBOX:RESET
-   x REPLAY-STEP REPORTED st x RUN-ARENA @ UNAVAILABLE-ENTRY
-   REPORTS? TTRUE
+   x STEPPED
+   x st BLOCKED-ALONE
    TEST-DROPBOX:SEEN$ s" " T$= ;
 
 \ Rust's assert_download_failure_blocks_only_its_plan: the answer q
@@ -4664,10 +4751,9 @@ TYPED-VARIABLE RACED-INSTALL str
    d x ISOLATED {: rec:str :}
    \ Rust counts the upload; good.txt's download installs in the pass.
    x rec PASSED COMPLETE REPLAYED-IN 2 T=
-   x REPLAY-STEP REPORTED {: settled :}
+   x STEPPED
    x ISOLATION-FILES
    x st BLOCKED-ALONE
-   settled st ar UNAVAILABLE-ENTRY REPORTS? TTRUE
    TEST-DROPBOX:SEEN$ ISOLATION-SEEN$ T$=
    d x st BLOCK-KEPT
    d x STEP-GONE ;
@@ -4717,7 +4803,7 @@ TYPED-VARIABLE RACED-INSTALL str
    x DUE-BLOCKED
    \ Rust's later replay completes it; it installs in the pass.
    x rec PASSED COMPLETE REPLAYED-IN 1 T=
-   x REPLAY-STEP REPORTED COMPLETED 0 T=
+   x REPLAY-STEP REPORTED 0 T=
    x s" due.txt" IN-ROOT DUE$ HOLDS-BYTES
    x BLOCKED-OF VEC:COUNT 0 T=
    x PENDING-OF VEC:COUNT 0 T=
@@ -4969,11 +5055,13 @@ TYPED-VARIABLE RACED-INSTALL str
    s" foreign-stage-target" sp FS:MAKE-SYMLINK
    sp ;
 
+\ blocked.txt's plan is new this pass and blocks as it applies: planning
+\ held no path, and one plan is left blocked.
 : SPECIAL-REPORT ( report -- )
    RECONCILE-REPORT:UNMAKE
    {: replayed:n noops:n planned:n blocked:n errors:n conflicts:n
       rested:bool :}
-   blocked 1 T= errors 1 T= ;
+   blocked 0 T= errors 1 T= ;
 
 \ The one blocked plan is blocked.txt's, for its occupied stage.
 : STAGE-HELD ( ^run -- )
@@ -5088,6 +5176,7 @@ TYPED-VARIABLE RACED-INSTALL str
 : REMOTE-REPLAYED ( ^run -- ^REPLAY:replay-report )
    {: x :}
    x [: x RUN-JOURNAL @ x RUN-LINK @ rot x ROOT$ x STAGING$
+      x RUN-JOURNAL @ x RUN-ARENA @ JOURNAL:PENDING-PLANS
       x RUN-ARENA @ REPLAY:REPLAY-REMOTE-OPERATIONS-AT ;] IN-ACTIVE-ROOT ;
 
 \ The path a fresh-observation entry names, else the empty string.
@@ -6235,7 +6324,7 @@ $1C0 constant OWNER-ACCESS
    x EDITS-LOCAL ar EDITS-REMOTE
    x rec PASSED COMPLETE EDITS-REPORTED
    \ Departure 2: no download is left for a later step to complete.
-   x REPLAY-STEP REPORTED COMPLETED 0 T=
+   x REPLAY-STEP REPORTED 0 T=
    x s" a-local-update.txt" IN-ROOT LOCAL-EDIT$ HOLDS-BYTES
    x s" b-remote-update.txt" IN-ROOT REMOTE-EDIT$ HOLDS-BYTES
    x s" c-diverged.txt" IN-ROOT DIVERGED-LOCAL$ HOLDS-BYTES
@@ -6383,12 +6472,12 @@ $1C0 constant OWNER-ACCESS
    x rec PASSED PASS-ANY
    \ Departure 2: the download installed in the pass, so the step that
    \ follows completes none.
-   x REPLAY-STEP REPORTED COMPLETED 0 T=
+   x REPLAY-STEP REPORTED 0 T=
    x s" apps/Entry.doentry" IN-ROOT ENTRY-BYTES$ HOLDS-BYTES
    x s" Apps" IN-ROOT FS:EXISTS? TFALSE
    x rec PASSED COMPLETE drop
    \ Departure 2, as above.
-   x REPLAY-STEP REPORTED COMPLETED 0 T=
+   x REPLAY-STEP REPORTED 0 T=
    x s" apps/Second.doentry" IN-ROOT ENTRY-BYTES$ HOLDS-BYTES
    x PENDING-OF VEC:COUNT 0 T=
    UNWRITTEN
@@ -6504,9 +6593,12 @@ $1C0 constant OWNER-ACCESS
       ENDOF
    ;MATCH ;
 
-\ The last replay step's report holds no blocked entry.
+\ After a replay step, no plan is blocked or still pending.
 : STEP-UNBLOCKED ( ^run -- )
-   REPLAY-STEP REPORTED BLOCKS VEC:COUNT 0 T= ;
+   {: x :}
+   x STEPPED
+   x BLOCKED-OF VEC:COUNT 0 T=
+   x PENDING-OF VEC:COUNT 0 T= ;
 
 : SAME$ ( -- str ) s" same bytes across a case-only change" ;
 
@@ -6692,6 +6784,22 @@ $1C0 constant OWNER-ACCESS
    s" invoice" HOLDS-BYTES
    x s" credit (case variant)/expenses (case variant)/receipt.pdf"
    IN-ROOT s" receipt" HOLDS-BYTES ;
+
+: NTH$ ( ^VEC:vector<str> n -- str ) VEC:AT @ ;
+
+: NTH< ( n n ^VEC:vector<str> -- bool )
+   {: x:n y:n v :}
+   v x NTH$ v y NTH$ STR:< ;
+
+\ How many distinct byte strings v holds, counted in STR:< order.
+: DISTINCT ( ^VEC:vector<str> ^ARENA:arena -- n )
+   {: v ar :}
+   v VEC:COUNT {: k:n :}
+   k 0= if 0 exit then
+   k [: v NTH< ;] ar ORDER {: idx :}
+   1 k 1 ?do
+      v idx i 1- VEC:AT @ NTH$ v idx i VEC:AT @ NTH$ STR:= 0= if 1+ then
+   loop ;
 
 \ Rust's to_lowercase of each path is its key here: no two records'
 \ paths fold to one.
@@ -8117,7 +8225,7 @@ TYPED-VARIABLE STAND-IN-UPLOAD str
    s\" Omabox has no recorded work needing attention.\n" T$=
    d x OPENED-AGAIN
    TEST-DROPBOX:RESET
-   x REPLAY-STEP REPORTED COMPLETED 0 T=
+   x REPLAY-STEP REPORTED 0 T=
    x PENDING-OF VEC:COUNT 0 T=
    x BLOCKED-OF VEC:COUNT 0 T=
    x s" Desktop.ini" rem BASELINE-AT
@@ -8262,7 +8370,8 @@ TYPED-VARIABLE STAND-IN-UPLOAD str
    ar BASELINE-ONLY-PATHS-ARE-INCLUDED-IN-CONFIRMED-ABSENCE
    ar A-WALK-COUNTS-EVERY-KEPT-BASELINE
    ar DECIDING-KEEPS-THE-RUN-RULE
-   ar PATH-DECISIONS-ORDER-DELETES-LAST-AND-DEEPEST-FIRST
+   ar PLANS-RECORD-DELETES-AFTER-AND-CREATES-BEFORE-THEIR-SUBTREES
+   ar A-DELETE-DEFERRED-ACROSS-A-BATCH-FOLLOWS-ITS-SUBTREE
    ar CASE-COLLISION-CASES
    ar LISTING-CASES
    ar FORMAL-HOLDS-THE-LISTING-TABLE

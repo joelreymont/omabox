@@ -2917,15 +2917,20 @@ private
 
 \ ---- download slots
 
-\ The Rust daemon's names and sizes, so either resumes the other's
-\ partials.
+\ The slot state's xattr; the Rust daemon's name, whose v1 states this
+\ daemon reads with no plan.
 : DOWNLOAD-PARTIAL-XATTR ( -- str ) s" user.omabox.download-partial-v1" ;
 \ 64 MiB, a whole number of Dropbox's 4 MiB blocks.
 $4000000 constant DOWNLOAD-CHECKPOINT-BYTES
-: DOWNLOAD-SLOT-OWNER-PREFIX ( -- str ) s" omabox-download-slot-v1" ;
-\ The owner prefix, the binding's 32 bytes, then the offset big-endian.
-DOWNLOAD-SLOT-OWNER-PREFIX str> nip 32 + 8 +
+: DOWNLOAD-SLOT-OWNER-PREFIX ( -- str ) s" omabox-download-slot-v2" ;
+\ The owner prefix, the binding's 32 bytes, the plan id (0 for none), then
+\ the offset, each big-endian.
+DOWNLOAD-SLOT-OWNER-PREFIX str> nip 32 + 8 + 8 +
    constant DOWNLOAD-SLOT-STATE-LENGTH
+\ A v1 state, the Rust daemon's: the v1 prefix, the binding, then the offset;
+\ no plan, so its own download resumes it by binding and no lease protects it.
+: V1-OWNER-PREFIX ( -- str ) s" omabox-download-slot-v1" ;
+V1-OWNER-PREFIX str> nip 32 + 8 + constant V1-STATE-LENGTH
 \ The slots are this many fixed files, so a partial either daemon left in
 \ any of them is found.
 4 constant MAX-PARALLEL-DOWNLOADS
@@ -2941,15 +2946,19 @@ STRUCTURE binding OPAQUE
    FIELD b3 n
 ;STRUCTURE
 
-\ The download a slot is bound to.
-STRUCTURE download-slot-identity OPAQUE FIELD binding binding ;STRUCTURE
+\ The download a slot is bound to, and its plan's id.
+STRUCTURE download-slot-identity OPAQUE
+   FIELD binding binding
+   FIELD plan n
+;STRUCTURE
 
 \ A slot leased to one download: the caller's slot directory, the slot's
-\ number and the download's binding.
+\ number, the download's binding and its plan's id.
 STRUCTURE download-slot-lease OPAQUE
    FIELD directory str
    FIELD slot n
    FIELD binding binding
+   FIELD plan n
 ;STRUCTURE
 
 private
@@ -2962,6 +2971,7 @@ ENUM download-source
       FIELD name str
       FIELD path str
       FIELD binding binding
+      FIELD plan n
    ;VARIANT
    VARIANT disposable FIELD path str ;VARIANT
 ;ENUM
@@ -2998,9 +3008,11 @@ ENUM download-preparation
 
 private
 
-\ A slot's owner and the bytes of its partial known durable.
+\ A slot's owner, its plan's id unless the state is v1, and the bytes of
+\ its partial known durable.
 STRUCTURE download-slot-state
    FIELD binding binding
+   FIELD plan option<n>
    FIELD offset n
 ;STRUCTURE
 
@@ -3009,7 +3021,7 @@ ARENA PARTIALS download-partial
 \ The source's path: a slot's, or an unnamed file's display path.
 : SOURCE-PATH ( download-source -- str )
    MATCH download-source
-      resumable OF {: dir:fd name:str path:str b:binding :} path
+      resumable OF {: dir:fd name:str path:str b:binding plan:n :} path
       ENDOF
       disposable OF ENDOF
    ;MATCH ;
@@ -3046,13 +3058,11 @@ public
    b BINDING-UNMAKE {: b0:n b1:n b2:n b3:n :}
    a0 b0 = a1 b1 = and a2 b2 = and a3 b3 = and ;
 
-\ Rust's DownloadSlotIdentity::new for a root's generation, an operation
-\ and its target: the SHA-256 of the lease's tag, the generation and the
-\ operation big-endian, the target, the rev and the content, the last
-\ three NUL-separated.
+\ The binding, v1's, is the SHA-256 of the tag, the generation and operation
+\ big-endian, then target, rev and content NUL-separated; it omits the plan id.
 : NEW-SLOT-IDENTITY
-   ( n n str MODEL:remote -- download-slot-identity )
-   {: generation:n operation:n t:str r:MODEL:remote :}
+   ( n n n str MODEL:remote -- download-slot-identity )
+   {: generation:n plan:n operation:n t:str r:MODEL:remote :}
    r MODEL-REMOTE:UNMAKE {: c:DROPBOX:hash rev:DROPBOX:rev :}
    NAME-CTX SHA256-BEGIN
    s" omabox-download-slot-lease-v1" FEED
@@ -3060,10 +3070,13 @@ public
    t FEED NUL 1 >str FEED rev DROPBOX:REV>STR FEED
    NUL 1 >str FEED c DROPBOX:HASH>STR FEED
    NAME-CTX NAME-DIGEST SHA256-END
-   NAME-DIGEST BYTES>BINDING DOWNLOAD-SLOT-IDENTITY-MAKE ;
+   NAME-DIGEST BYTES>BINDING plan DOWNLOAD-SLOT-IDENTITY-MAKE ;
 
 : SLOT-BINDING ( download-slot-identity -- binding )
-   DOWNLOAD-SLOT-IDENTITY-UNMAKE ;
+   DOWNLOAD-SLOT-IDENTITY-UNMAKE {: b:binding plan:n :} b ;
+
+: SLOT-PLAN ( download-slot-identity -- n )
+   DOWNLOAD-SLOT-IDENTITY-UNMAKE {: b:binding plan:n :} plan ;
 
 private
 
@@ -3071,24 +3084,50 @@ private
 
 DOWNLOAD-SLOT-STATE-LENGTH BUFFER: STATE-BUF
 
+: PLAN>N ( option<n> -- n )
+   MATCH option
+      none OF 0 ENDOF
+      some OF ENDOF
+   ;MATCH ;
+
+: NO-PLAN ( -- option<n> ) OPTION:NONE ;
+
+: N>PLAN ( n -- option<n> )
+   {: id:n :}
+   id 0= if NO-PLAN exit then
+   id OPTION:SOME ;
+
 \ The xattr's bytes, valid until the next encode or read.
 : ENCODE-DOWNLOAD-SLOT-STATE ( download-slot-state -- str )
-   DOWNLOAD-SLOT-STATE-UNMAKE {: b:binding offset:n :}
+   DOWNLOAD-SLOT-STATE-UNMAKE {: b:binding plan:option<n> offset:n :}
    DOWNLOAD-SLOT-OWNER-PREFIX str> {: x:^ xu:n :}
    x STATE-BUF xu BYTE-COPY
    b STATE-BUF xu + BINDING>BYTES
-   offset STATE-BUF xu + 32 + BE!
+   plan PLAN>N STATE-BUF xu + 32 + BE!
+   offset STATE-BUF xu + 40 + BE!
    STATE-BUF DOWNLOAD-SLOT-STATE-LENGTH >str ;
+
+\ Whether s is of length u and begins with the prefix x.
+: STATE-FORM? ( str str n -- bool )
+   {: s:str x:str u:n :}
+   s str> {: p:^ su:n :}
+   su u <> if false exit then
+   p x str> nip >str x STR:= ;
 
 : DECODE-DOWNLOAD-SLOT-STATE ( str -- option<download-slot-state> )
    {: s:str :}
-   s str> {: p:^ u:n :}
-   DOWNLOAD-SLOT-OWNER-PREFIX {: x:str :}
-   x str> nip {: xu:n :}
-   u DOWNLOAD-SLOT-STATE-LENGTH <> if OPTION:NONE exit then
-   p xu >str x STR:= 0= if OPTION:NONE exit then
-   p xu + BYTES>BINDING p xu + 32 + BE@
-   DOWNLOAD-SLOT-STATE-MAKE OPTION:SOME ;
+   s str> drop {: p:^ :}
+   s DOWNLOAD-SLOT-OWNER-PREFIX DOWNLOAD-SLOT-STATE-LENGTH STATE-FORM? if
+      p DOWNLOAD-SLOT-OWNER-PREFIX str> nip + {: q:^ :}
+      q BYTES>BINDING q 32 + BE@ N>PLAN q 40 + BE@
+      DOWNLOAD-SLOT-STATE-MAKE OPTION:SOME exit
+   then
+   s V1-OWNER-PREFIX V1-STATE-LENGTH STATE-FORM? if
+      p V1-OWNER-PREFIX str> nip + {: q:^ :}
+      q BYTES>BINDING NO-PLAN q 32 + BE@
+      DOWNLOAD-SLOT-STATE-MAKE OPTION:SOME exit
+   then
+   OPTION:NONE ;
 
 : STATE-GOT ( XATTR:got -- option<download-slot-state> )
    MATCH XATTR:got
@@ -3111,7 +3150,8 @@ DOWNLOAD-SLOT-STATE-LENGTH BUFFER: STATE-BUF
    {: s:option<download-slot-state> b:binding :}
    s MATCH option
       none OF false ENDOF
-      some OF DOWNLOAD-SLOT-STATE-UNMAKE {: held:binding at:n :}
+      some OF DOWNLOAD-SLOT-STATE-UNMAKE
+         {: held:binding was:option<n> at:n :}
          held b BINDING=
       ENDOF
    ;MATCH ;
@@ -3120,7 +3160,7 @@ DOWNLOAD-SLOT-STATE-LENGTH BUFFER: STATE-BUF
 : DOWNLOAD-SLOT-MATCHES ( fd ^download-location -- bool )
    {: f:fd loc :}
    loc DOWNLOAD-LOCATION-SOURCE @ MATCH download-source
-      resumable OF {: dir:fd name:str path:str b:binding :}
+      resumable OF {: dir:fd name:str path:str b:binding plan:n :}
          f path READ-DOWNLOAD-SLOT-STATE b SLOT-BOUND?
       ENDOF
       disposable OF {: path:str :} false ENDOF
@@ -3211,11 +3251,11 @@ ENUM download-slot-open
    -1 >FD [: drop dir FS:TEMP-AT ;]
    [: dir s" " o p IO-FAILURE-AT ;] FS-FAILS ;
 
-\ Binds the unnamed file at offset 0 and names it; false when the name
-\ is taken.
-: INSTALL-SLOT ( fd fd str str binding -- bool )
-   {: f:fd dir:fd name:str p:str b:binding :}
-   f DOWNLOAD-PARTIAL-XATTR b 0 DOWNLOAD-SLOT-STATE-MAKE
+\ Binds the unnamed file to b and plan at offset 0 and names it; false
+\ when the name is taken.
+: INSTALL-SLOT ( fd fd str str binding option<n> -- bool )
+   {: f:fd dir:fd name:str p:str b:binding plan:option<n> :}
+   f DOWNLOAD-PARTIAL-XATTR b plan 0 DOWNLOAD-SLOT-STATE-MAKE
    ENCODE-DOWNLOAD-SLOT-STATE true p s" mark resumed download slot"
    SET-XATTR
    f p s" sync new resumed download slot" SYNC-FILE
@@ -3228,22 +3268,23 @@ ENUM download-slot-open
       IO-FAILURE-AT
    then false ;
 
-\ A new slot at the name in dir bound to b; none when the name is taken.
-: CREATE-DOWNLOAD-SLOT ( fd str str binding -- option<fd> )
-   {: dir:fd name:str p:str b:binding :}
+\ A new slot at the name in dir bound to b and plan; none when the name
+\ is taken.
+: CREATE-DOWNLOAD-SLOT ( fd str str binding option<n> -- option<fd> )
+   {: dir:fd name:str p:str b:binding plan:option<n> :}
    dir p s" create resumed download slot" UNNAMED-FILE {: f:fd :}
-   false f [: drop f dir name p b INSTALL-SLOT ;] CLOSING
+   false f [: drop f dir name p b plan INSTALL-SLOT ;] CLOSING
    if f OPTION:SOME exit then
    f DISCARD OPTION:NONE ;
 
-\ Empties the open slot c and binds it to b at offset 0, its stage marker
-\ cleared; true when its name still holds it then.
-: CLEAR-SLOT ( fd fd str str binding -- bool )
-   {: c:fd dir:fd name:str p:str b:binding :}
+\ Empties the open slot c and binds it to b and plan at offset 0, its
+\ stage marker cleared; true when its name still holds it then.
+: CLEAR-SLOT ( fd fd str str binding option<n> -- bool )
+   {: c:fd dir:fd name:str p:str b:binding plan:option<n> :}
    [: c 0 FD:RESIZE ;]
    [: s" truncate resumed download slot for reuse" p IO-FAILURE ;]
    FS-FAILS
-   c DOWNLOAD-PARTIAL-XATTR b 0 DOWNLOAD-SLOT-STATE-MAKE
+   c DOWNLOAD-PARTIAL-XATTR b plan 0 DOWNLOAD-SLOT-STATE-MAKE
    ENCODE-DOWNLOAD-SLOT-STATE false p
    s" reset resumed download slot checkpoint" SET-XATTR
    c p s" sync reset resumed download slot" SYNC-FILE
@@ -3253,43 +3294,44 @@ ENUM download-slot-open
    c dir name p NAMED-INODE-MATCHES ;
 
 \ Runs before, then clears c, when c is held's inode.
-: REBIND-SLOT ( fd fd fd str str binding [ -- ] -- bool )
-   {: held:fd c:fd dir:fd name:str p:str b:binding before :}
+: REBIND-SLOT ( fd fd fd str str binding option<n> [ -- ] -- bool )
+   {: held:fd c:fd dir:fd name:str p:str b:binding plan:option<n> before :}
    held p s" inspect held resumed download slot" STAT-FD
    c p s" inspect reusable resumed download slot" STAT-FD
    SAME-INODE 0= if false exit then
    before [: s" reset resumed download slot" p IO-FAILURE ;] FS-FAILS
-   c dir name p b CLEAR-SLOT ;
+   c dir name p b plan CLEAR-SLOT ;
 
 \ The slot named again, rebound, when it is still held's inode; a throw
 \ closes it.
-: REBIND-OPENED ( fd fd fd str str binding [ -- ] -- option<fd> )
-   {: held:fd c:fd dir:fd name:str p:str b:binding before :}
+: REBIND-OPENED
+   ( fd fd fd str str binding option<n> [ -- ] -- option<fd> )
+   {: held:fd c:fd dir:fd name:str p:str b:binding plan:option<n> before :}
    false c
-   [: drop held c dir name p b before REBIND-SLOT ;] CLOSING
+   [: drop held c dir name p b plan before REBIND-SLOT ;] CLOSING
    if c OPTION:SOME exit then
    c DISCARD OPTION:NONE ;
 
-: REBIND-NAMED ( fd fd str str binding [ -- ] -- option<fd> )
-   {: held:fd dir:fd name:str p:str b:binding before :}
+: REBIND-NAMED
+   ( fd fd str str binding option<n> [ -- ] -- option<fd> )
+   {: held:fd dir:fd name:str p:str b:binding plan:option<n> before :}
    dir name p OPEN-DOWNLOAD-SLOT MATCH download-slot-open
       missing OF OPTION:NONE ENDOF
-      file OF {: c:fd :} held c dir name p b before REBIND-OPENED
+      file OF {: c:fd :} held c dir name p b plan before REBIND-OPENED
       ENDOF
       occupied OF OPTION:NONE ENDOF
    ;MATCH ;
 
-\ Rust's reset_download_slot_file_with: the slot held, a partial whose
-\ name in dir still names it, reopened, emptied and bound to b at offset
-\ 0; before runs just ahead of the truncate. None when held carries no
-\ state or its name holds another entry, which stays as it is.
+\ Reopens held's partial under name in dir, runs before, empties it and binds
+\ b and plan; none, leaving it as is, when held has no state or name moved on.
 : RESET-DOWNLOAD-SLOT-FILE-WITH
-   ( fd fd str str binding [ -- ] -- option<fd> )
-   {: held:fd dir:fd name:str p:str b:binding before :}
+   ( fd fd str str binding option<n> [ -- ] -- option<fd> )
+   {: held:fd dir:fd name:str p:str b:binding plan:option<n> before :}
    held p READ-DOWNLOAD-SLOT-STATE MATCH option
       none OF OPTION:NONE ENDOF
-      some OF DOWNLOAD-SLOT-STATE-UNMAKE {: was:binding at:n :}
-         held dir name p b before REBIND-NAMED
+      some OF DOWNLOAD-SLOT-STATE-UNMAKE
+         {: was:binding owner:option<n> at:n :}
+         held dir name p b plan before REBIND-NAMED
       ENDOF
    ;MATCH ;
 
@@ -3298,8 +3340,9 @@ ENUM download-slot-open
 : RESET-DOWNLOAD-SLOT ( fd ^download-location -- option<fd> )
    {: f:fd loc :}
    loc DOWNLOAD-LOCATION-SOURCE @ MATCH download-source
-      resumable OF {: dir:fd name:str path:str b:binding :}
-         f dir name path b [: ;] RESET-DOWNLOAD-SLOT-FILE-WITH
+      resumable OF {: dir:fd name:str path:str b:binding plan:n :}
+         f dir name path b plan OPTION:SOME [: ;]
+         RESET-DOWNLOAD-SLOT-FILE-WITH
       ENDOF
       disposable OF {: path:str :} OPTION:NONE ENDOF
    ;MATCH ;
@@ -3331,8 +3374,18 @@ MAX-PARALLEL-DOWNLOADS TYPED-BUFFER SLOTS available-download-slot
    {: slot:n usable:bool :}
    slot NOT-OWNED usable AVAILABLE-DOWNLOAD-SLOT-MAKE ;
 
-\ The open slot's state, usable unless protected says its binding is.
-: SLOT-STATE ( n fd str [ binding -- bool ] -- available-download-slot )
+\ Whether a slot of binding b and plan may be taken: one with no plan
+\ always, else unless protected says its binding and plan are.
+: UNPROTECTED? ( binding option<n> [ binding n -- bool ] -- bool )
+   {: b:binding plan:option<n> protected :}
+   plan MATCH option
+      none OF true ENDOF
+      some OF {: id:n :} b id protected execute 0= ENDOF
+   ;MATCH ;
+
+\ The open slot's state, usable unless it is protected.
+: SLOT-STATE
+   ( n fd str [ binding n -- bool ] -- available-download-slot )
    {: slot:n f:fd p:str protected :}
    f p s" inspect resumed download slot" STAT-FD REGULAR? 0= if
       f DISCARD slot false UNOWNED exit
@@ -3340,19 +3393,21 @@ MAX-PARALLEL-DOWNLOADS TYPED-BUFFER SLOTS available-download-slot
    f p READ-DOWNLOAD-SLOT-STATE MATCH option
       none OF f DISCARD slot false UNOWNED ENDOF
       some OF {: s:download-slot-state :}
-         s DOWNLOAD-SLOT-STATE-UNMAKE {: b:binding at:n :}
-         b protected execute 0= {: usable:bool :}
+         s DOWNLOAD-SLOT-STATE-UNMAKE
+         {: b:binding plan:option<n> at:n :}
+         b plan protected UNPROTECTED? {: usable:bool :}
          slot f s OWNED-SLOT-MAKE OPTION:SOME usable
          AVAILABLE-DOWNLOAD-SLOT-MAKE
       ENDOF
    ;MATCH ;
 
-: OWNED ( n fd str [ binding -- bool ] -- available-download-slot )
+: OWNED ( n fd str [ binding n -- bool ] -- available-download-slot )
    {: slot:n f:fd p:str protected :}
    slot false UNOWNED f
    [: DROP-AVAILABLE slot f p protected SLOT-STATE ;] CLOSING ;
 
-: SCAN-SLOT ( fd str n [ binding -- bool ] -- available-download-slot )
+: SCAN-SLOT
+   ( fd str n [ binding n -- bool ] -- available-download-slot )
    {: dir:fd d:str slot:n protected :}
    d slot DOWNLOAD-SLOT-PATH {: p:str :}
    dir slot DOWNLOAD-SLOT-NAME p OPEN-DOWNLOAD-SLOT
@@ -3383,7 +3438,7 @@ MAX-PARALLEL-DOWNLOADS TYPED-BUFFER SLOTS available-download-slot
    MAX-PARALLEL-DOWNLOADS 0 ?do i SLOT-OWNED@ CLOSE-OWNED loop
    CLEAR-SLOTS ;
 
-: SCAN-SLOTS ( fd str [ binding -- bool ] -- )
+: SCAN-SLOTS ( fd str [ binding n -- bool ] -- )
    {: dir:fd d:str protected :}
    MAX-PARALLEL-DOWNLOADS 0 ?do
       dir d i protected SCAN-SLOT i SLOTS !
@@ -3398,16 +3453,16 @@ MAX-PARALLEL-DOWNLOADS TYPED-BUFFER SLOTS available-download-slot
       ENDOF
    ;MATCH ;
 
-: NEW-LEASE ( str n binding -- option<download-slot-lease> )
-   {: d:str slot:n b:binding :}
-   d slot b DOWNLOAD-SLOT-LEASE-MAKE OPTION:SOME ;
+: NEW-LEASE ( str n binding n -- option<download-slot-lease> )
+   {: d:str slot:n b:binding plan:n :}
+   d slot b plan DOWNLOAD-SLOT-LEASE-MAKE OPTION:SOME ;
 
-\ The first slot whose partial is bound to b, claimed.
-: BOUND-SLOT ( str binding -- option<download-slot-lease> )
-   {: d:str b:binding :}
+\ The first slot whose partial is bound to b, claimed for b and plan.
+: BOUND-SLOT ( str binding n -- option<download-slot-lease> )
+   {: d:str b:binding plan:n :}
    MAX-PARALLEL-DOWNLOADS 0 ?do
       i SLOT-OWNED@ b OWNED-BY? if
-         i CLAIMED d i b NEW-LEASE unloop exit
+         i CLAIMED d i b plan NEW-LEASE unloop exit
       then
    loop OPTION:NONE ;
 
@@ -3418,37 +3473,44 @@ MAX-PARALLEL-DOWNLOADS TYPED-BUFFER SLOTS available-download-slot
       some OF DISCARD true ENDOF
    ;MATCH ;
 
-\ Rebinds the slot's partial to b, or makes the slot bound to b.
-: TAKE-SLOT ( fd str n binding -- bool )
-   {: dir:fd d:str slot:n b:binding :}
+\ Rebinds the slot's partial to b and plan, or makes the slot bound to
+\ them.
+: TAKE-SLOT ( fd str n binding n -- bool )
+   {: dir:fd d:str slot:n b:binding plan:n :}
    d slot DOWNLOAD-SLOT-PATH {: p:str :}
+   plan OPTION:SOME {: owner:option<n> :}
    slot SLOT-OWNED@ MATCH option
-      none OF dir slot DOWNLOAD-SLOT-NAME p b CREATE-DOWNLOAD-SLOT ENDOF
+      none OF
+         dir slot DOWNLOAD-SLOT-NAME p b owner CREATE-DOWNLOAD-SLOT
+      ENDOF
       some OF OWNED-SLOT-UNMAKE {: f:fd s:download-slot-state :}
-         f dir slot DOWNLOAD-SLOT-NAME p b [: ;]
+         f dir slot DOWNLOAD-SLOT-NAME p b owner [: ;]
          RESET-DOWNLOAD-SLOT-FILE-WITH
       ENDOF
    ;MATCH TAKEN? ;
 
-\ The first usable slot that takes b; each one tried is used up.
-: CLAIM-SLOT ( fd str binding -- option<download-slot-lease> )
-   {: dir:fd d:str b:binding :}
+\ The first usable slot that takes b and plan; each one tried is used up.
+: CLAIM-SLOT ( fd str binding n -- option<download-slot-lease> )
+   {: dir:fd d:str b:binding plan:n :}
    MAX-PARALLEL-DOWNLOADS 0 ?do
       i SLOT-USABLE@ if
          i CLAIMED
-         dir d i b TAKE-SLOT if d i b NEW-LEASE unloop exit then
+         dir d i b plan TAKE-SLOT if
+            d i b plan NEW-LEASE unloop exit
+         then
       then
    loop OPTION:NONE ;
 
-\ Empties a usable slot's partial, its binding kept.
+\ Empties a usable slot's partial, its binding and plan kept.
 : FREE-SLOT ( fd str n -- )
    {: dir:fd d:str slot:n :}
    d slot DOWNLOAD-SLOT-PATH {: p:str :}
    slot SLOT-OWNED@ MATCH option
       none OF ENDOF
       some OF OWNED-SLOT-UNMAKE {: f:fd s:download-slot-state :}
-         s DOWNLOAD-SLOT-STATE-UNMAKE {: b:binding at:n :}
-         f dir slot DOWNLOAD-SLOT-NAME p b [: ;]
+         s DOWNLOAD-SLOT-STATE-UNMAKE
+         {: b:binding plan:option<n> at:n :}
+         f dir slot DOWNLOAD-SLOT-NAME p b plan [: ;]
          RESET-DOWNLOAD-SLOT-FILE-WITH TAKEN? drop
       ENDOF
    ;MATCH ;
@@ -3460,29 +3522,28 @@ MAX-PARALLEL-DOWNLOADS TYPED-BUFFER SLOTS available-download-slot
    loop ;
 
 : LEASE-IN
-   ( fd str binding [ binding -- bool ] -- option<download-slot-lease> )
-   {: dir:fd d:str b:binding protected :}
+   ( fd str binding n [ binding n -- bool ]
+     -- option<download-slot-lease> )
+   {: dir:fd d:str b:binding plan:n protected :}
    dir d protected SCAN-SLOTS
-   d b BOUND-SLOT MATCH option
-      none OF dir d b CLAIM-SLOT ENDOF
+   d b plan BOUND-SLOT MATCH option
+      none OF dir d b plan CLAIM-SLOT ENDOF
       some OF OPTION:SOME ENDOF
    ;MATCH
    dir d FREE-SLOTS ;
 
 public
 
-\ Rust's lease_download_slots for one download: the slot in directory d
-\ whose partial is bound to it, else the first free or unprotected one,
-\ rebound to it; none when no slot can be. Every other unprotected partial
-\ is emptied, its binding kept. The lease holds d's span.
+\ Leases d's slot bound to the download, else the first free or unprotected one,
+\ emptying other unprotected partials; protected asks only slots with a plan.
 : LEASE-DOWNLOAD-SLOT
-   ( str download-slot-identity [ binding -- bool ]
+   ( str download-slot-identity [ binding n -- bool ]
      -- option<download-slot-lease> )
    {: d:str id:download-slot-identity protected :}
    d s" open resumable download slot directory" OPEN-PRIVATE-DIRECTORY
    {: dir:fd :}
    CLEAR-SLOTS
-   [: dir d id SLOT-BINDING protected LEASE-IN ;]
+   [: dir d id SLOT-BINDING id SLOT-PLAN protected LEASE-IN ;]
    [: CLOSE-SLOTS dir DISCARD ;] finally ;
 
 private
@@ -3672,7 +3733,7 @@ private
 
 : RESUMABLE? ( download-source -- bool )
    MATCH download-source
-      resumable OF {: dir:fd name:str path:str b:binding :} true ENDOF
+      resumable OF {: dir:fd name:str path:str b:binding plan:n :} true ENDOF
       disposable OF {: path:str :} false ENDOF
    ;MATCH ;
 
@@ -3688,7 +3749,9 @@ private
    {: src:download-source dir:fd name:str sp:str t:str want:DROPBOX:hash :}
    dir DISCARD
    src MATCH download-source
-      resumable OF {: slots:fd n:str p:str b:binding :} slots DISCARD ENDOF
+      resumable OF {: slots:fd n:str p:str b:binding plan:n :}
+         slots DISCARD
+      ENDOF
       disposable OF {: p:str :} ENDOF
    ;MATCH ;
 
@@ -3866,7 +3929,7 @@ private
    ( fd ^download-location [ -- ] ^ARENA:arena -- stage-outcome<n> )
    {: f:fd loc before ar:^ARENA:arena :}
    loc SOURCE@ MATCH download-source
-      resumable OF {: slots:fd name:str path:str b:binding :}
+      resumable OF {: slots:fd name:str path:str b:binding plan:n :}
          f loc before ar slots name path MOVE-SLOT
       ENDOF
       disposable OF {: p:str :}
@@ -3944,10 +4007,11 @@ private
    {: x :}
    x PARTIAL-FILE {: f:fd :}
    x DOWNLOAD-PARTIAL-LOCATION SOURCE@ MATCH download-source
-      resumable OF {: slots:fd name:str path:str b:binding :}
+      resumable OF {: slots:fd name:str path:str b:binding plan:n :}
          f path s" sync resumed download checkpoint" SYNC-FILE
          f DOWNLOAD-PARTIAL-XATTR
-         b x DOWNLOAD-PARTIAL-OFFSET @ DOWNLOAD-SLOT-STATE-MAKE
+         b plan OPTION:SOME x DOWNLOAD-PARTIAL-OFFSET @
+         DOWNLOAD-SLOT-STATE-MAKE
          ENCODE-DOWNLOAD-SLOT-STATE false path
          s" record resumed download checkpoint" SET-XATTR
          f path s" sync resumed download checkpoint marker" SYNC-FILE
@@ -4057,16 +4121,16 @@ private
 \ slot's name and path laid in the arena before it opens.
 : SLOT-SOURCE ( download-slot-lease ^ARENA:arena -- download-source )
    {: lease:download-slot-lease ar:^ARENA:arena :}
-   lease DOWNLOAD-SLOT-LEASE-UNMAKE {: d:str slot:n b:binding :}
+   lease DOWNLOAD-SLOT-LEASE-UNMAKE {: d:str slot:n b:binding plan:n :}
    slot DOWNLOAD-SLOT-NAME ar ARENA:COPY {: name:str :}
    d name ar JOIN {: path:str :}
    d s" open resumable download slot directory"
-   OPEN-PRIVATE-DIRECTORY name path b DOWNLOAD-SOURCE-RESUMABLE ;
+   OPEN-PRIVATE-DIRECTORY name path b plan DOWNLOAD-SOURCE-RESUMABLE ;
 
 \ The source's slot opened; an unnamed file has none.
 : SLOT-OPEN ( download-source -- download-slot-open )
    MATCH download-source
-      resumable OF {: slots:fd name:str path:str b:binding :}
+      resumable OF {: slots:fd name:str path:str b:binding plan:n :}
          slots name path OPEN-DOWNLOAD-SLOT
       ENDOF
       disposable OF {: p:str :} DOWNLOAD-SLOT-OPEN-MISSING ENDOF
@@ -4163,7 +4227,7 @@ private
    ( ^download-partial download-slot-state binding n ^ARENA:arena
      -- download-preparation )
    {: x s:download-slot-state b:binding length:n ar:^ARENA:arena :}
-   s DOWNLOAD-SLOT-STATE-UNMAKE {: held:binding at:n :}
+   s DOWNLOAD-SLOT-STATE-UNMAKE {: held:binding plan:option<n> at:n :}
    held b BINDING= 0= if EPHEMERAL exit then
    x at length ar RESUME-MARKED ;
 
@@ -4184,7 +4248,7 @@ private
    ( download-preparation download-slot-lease ^ARENA:arena
      -- download-preparation )
    {: p:download-preparation lease:download-slot-lease ar:^ARENA:arena :}
-   lease DOWNLOAD-SLOT-LEASE-UNMAKE {: d:str slot:n b:binding :}
+   lease DOWNLOAD-SLOT-LEASE-UNMAKE {: d:str slot:n b:binding plan:n :}
    p MATCH download-preparation
       ready OF {: x :}
          [: x b ar RESUME-SLOT ;] [: x CLOSE-PARTIAL ;] PREPARING

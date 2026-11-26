@@ -12,10 +12,13 @@
 \ LOCAL-HASH-CACHE answers the active root's hash cache,
 \ PUBLISH-LOCAL-SCAN publishes given observations and hashes as one
 \ scan, SCAN-COUNTS answers how many files a scan has still to hash
-\ and how many observations and hashes it staged, and
+\ and how many observations and hashes it staged,
 \ UPSERT-REMOTE-RECORDS applies given remote records as one delta's
-\ upserts. Tests alone load this file; nothing in the program calls
-\ these words.
+\ upserts, RECORD-NOOP commits one no-op, answering a noop-write,
+\ RECORD-PLAN commits one plan, answering a plan-write, and
+\ PENDING-PLANS, BLOCKED-PLANS and COMPLETED-DOWNLOAD-PLANS answer
+\ every plan their batch readers read. Tests alone load this file;
+\ nothing in the program calls these words.
 \ STORAGE CLASS. CALLER-OWNED, as JOURNAL's: a record answered lies in the
 \ arena the caller passes. TASK-LOCAL: the bytes CHANGE-COUNTER reads,
 \ TASK:+USERS rows.
@@ -425,5 +428,57 @@ public
    j >CONNECTION {: c :}
    c [: c id copy ar [: RECORD-RECOVERY-INTENT-IN ;] ENCODING ;]
    SQLITE:WITH-TRANSACTION ;
+
+\ Records a planner-approved baseline that needs no effect, unless a
+\ live plan owns the path; the path's conflicts are resolved.
+: RECORD-NOOP
+   ( journal MODEL:path MODEL:baseline ^ARENA:arena -- noop-write )
+   {: j path b ar :}
+   j >CONNECTION {: c :}
+   c [: c path b ar RECORD-NOOP-IN ;]
+   SQLITE:WITH-TRANSACTION ;
+
+\ Commits an ordered plan before an effect executor sees it; a live
+\ plan the path already owns is answered instead.
+: RECORD-PLAN
+   ( journal MODEL:path operation-plan ^ARENA:arena -- plan-write )
+   {: j path plan ar :}
+   j >CONNECTION {: c :}
+   c [: c path plan ar [: RECORD-PLAN-IN ;] ENCODING ;]
+   SQLITE:WITH-TRANSACTION ;
+
+private
+
+\ The batch appended to all.
+: PLANS+ ( ^VEC:vector<plan-record> ^VEC:vector<plan-record> -- )
+   {: batch all :}
+   batch VEC:COUNT 0 ?do batch i VEC:AT @ all VEC:PUSH ! loop ;
+
+public
+
+\ Every plan awaiting its next effect, by id, each one's operations in
+\ order.
+: PENDING-PLANS ( journal ^ARENA:arena -- ^VEC:vector<plan-record> )
+   {: j ar :}
+   ar [type] plan-record NEW-VECTOR {: all :}
+   j [: PENDING-BATCH ;] [: drop all PLANS+ true ;] ar
+   EACH-BATCH drop all ;
+
+\ Every plan a classified failure holds, by id, each one's operations in
+\ order.
+: BLOCKED-PLANS ( journal ^ARENA:arena -- ^VEC:vector<plan-record> )
+   {: j ar :}
+   ar [type] plan-record NEW-VECTOR {: all :}
+   j [: BLOCKED-BATCH ;] [: drop all PLANS+ true ;] ar
+   EACH-BATCH drop all ;
+
+\ Every completed, unforgotten plan that installs a Dropbox file, by id, each
+\ one's operations in order: its verified stage may remain.
+: COMPLETED-DOWNLOAD-PLANS
+   ( journal ^ARENA:arena -- ^VEC:vector<plan-record> )
+   {: j ar :}
+   ar [type] plan-record NEW-VECTOR {: all :}
+   j [: DOWNLOADED-BATCH ;] [: drop all PLANS+ true ;] ar
+   EACH-BATCH drop all ;
 
 ;package
