@@ -600,7 +600,7 @@ TYPED-VARIABLE SHOWN str
 \ The bytes left in the pipe; closes it.
 : REST ( fd -- n )
    {: f:fd :}
-   0 begin f FD>N SEEN CAP read dup 0 > while + repeat drop
+   0 begin f FD>N SEEN CAP SPAN:MAKE read dup 0 > while + repeat drop
    f FD>N close ;
 
 \ READ-CODE of the bytes from a pipe, captured in p: the code, the text

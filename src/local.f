@@ -306,7 +306,7 @@ FS:PATHZ-CAP BUFFER: DENIED-PATH
 \ cannot give it.
 : PATH+ ( fd -- )
    {: dir:fd :}
-   0 [: drop dir DENIED-PATH FS:PATHZ-CAP FS:FD-PATH ;] catch
+   0 [: drop dir DENIED-PATH FS:PATHZ-CAP SPAN:MAKE FS:FD-PATH ;] catch
    {: code:n :}
    code 0= if s"  " LOG:TEXT+ DENIED-PATH swap >str QUOTED+ exit then
    drop code E-FS-STAT = code E-FS-CAPACITY = or if exit then

@@ -6471,7 +6471,7 @@ $1C0 constant OWNER-ACCESS
 
 \ The target the symlink at f holds.
 : LINK-TARGET$ ( str -- str )
-   FS:>PATHZ READ-BUF READ-CAP readlink {: u:n :}
+   FS:>PATHZ READ-BUF READ-CAP SPAN:MAKE readlink {: u:n :}
    u 0< if s" the symlink did not read" TEST-CLIENT:FAILED then
    READ-BUF u >str ;
 

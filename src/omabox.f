@@ -969,7 +969,7 @@ ARENA JOURNALS JOURNAL:journal
    {: f:fd b:^ cap:n :}
    0 begin dup cap < while
       {: len:n :}
-      f FD>N b len + cap len - read {: k:n :}
+      f FD>N b len + cap len - SPAN:MAKE read {: k:n :}
       k 0= if len exit then
       k 0 < if
          FS:ERRNO FD:EINTR# <> if s" read the authorization code" IO-FAILED then

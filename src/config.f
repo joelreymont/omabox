@@ -450,7 +450,7 @@ FS:PATHZ-CAP TASK:+USERS LINK-ROW u8
 : CANONICAL ( str ^ARENA:arena -- option<abs-path> )
    {: s ar :}
    s PASSABLE? 0= if OPTION:NONE exit then
-   s FS:>PATHZ ROW FS:PATHZ-CAP realpath {: u:n :}
+   s FS:>PATHZ ROW FS:PATHZ-CAP SPAN:MAKE realpath {: u:n :}
    u -2 = if FS:ENAMETOOLONG FS:CAUSE! OPTION:NONE exit then
    u 0 < if FFI:ERRNO FS:CAUSE! OPTION:NONE exit then
    ROW u >str ar ARENA:COPY >ABS-PATH OPTION:SOME ;
@@ -461,7 +461,7 @@ public
 : READLINK ( str ^ARENA:arena -- option<str> )
    {: s ar :}
    s PASSABLE? 0= if OPTION:NONE exit then
-   s FS:>PATHZ ROW FS:PATHZ-CAP readlink {: u:n :}
+   s FS:>PATHZ ROW FS:PATHZ-CAP SPAN:MAKE readlink {: u:n :}
    u 0 < if OPTION:NONE exit then
    ROW u >str ar ARENA:COPY OPTION:SOME ;
 
@@ -490,7 +490,7 @@ private
    begin
       {: b:^ len:n cap:n :}
       b len cap ar GROWN {: d:^ dcap:n :}
-      fd d len + dcap len - read {: got:n :}
+      fd d len + dcap len - SPAN:MAKE read {: got:n :}
       got 0= if d len >str exit then
       got 0 < if FS:ERRNO EINTR <> if p READ-FAILED then then
       d len got 0 max + dcap
