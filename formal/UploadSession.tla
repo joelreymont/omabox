@@ -12,19 +12,39 @@
 \* an upload Dropbox holds; another client's edit reaches the run only so.
 \* A throw leaves UPLOAD with no answer and is not a step. At
 \* checkpointing DRIVE hands the caller the session's id and accepted, then
-\* steps on; that call changes nothing here.
+\* steps on; that call changes nothing here. A run may resume the session
+\* such a checkpoint recorded before a crash, which may have lost the last
+\* checkpoint or a finish's answer.
 EXTENDS Naturals
 
 VARIABLES step, size, remote, offset, accepted, resent, restarted, answer
 vars == <<step, size, remote, offset, accepted, resent, restarted, answer>>
 
-\* FIRST: a stage of one chunk goes single.
-Init ==
-    /\ size \in 1..2
+\* FIRST: a stage of one chunk goes single, a larger one starts a session.
+Fresh ==
     /\ step = IF size = 1 THEN "single" ELSE "starting"
-    /\ remote = "before"
+    /\ remote \in {"before", "after"}
     /\ offset = 0
     /\ accepted = 0
+
+\* FIRST with a record of accepted chunks: appending the rest, Dropbox
+\* holding the next chunk too when its checkpoint was lost, or confirming
+\* the whole stage. A finish whose answer was lost may have committed
+\* either way.
+Resumed ==
+    /\ size > 1
+    /\ accepted \in 1..size
+    /\ IF accepted < size
+       THEN /\ step = "appending"
+            /\ remote \in {"before", "after"}
+            /\ offset \in {accepted, accepted + 1}
+       ELSE /\ step = "confirming"
+            /\ remote \in {"before", "after"}
+            /\ offset = size
+
+Init ==
+    /\ size \in 1..2
+    /\ Fresh \/ Resumed
     /\ resent = FALSE
     /\ restarted = FALSE
     /\ answer = "none"
@@ -107,6 +127,16 @@ Confirm(e) ==
          [] e = "unlinked" -> End("unlinked")
     /\ UNCHANGED <<size, remote, offset, resent, restarted>>
 
+\* CONFIRM-SENSE before a resumed finish: other finishes the session.
+Confirming(e) ==
+    /\ step = "confirming"
+    /\ CASE e = "same" -> remote = "after" /\ End("done")
+         [] e = "elsewhere" -> End("mismatch")
+         [] e = "wait" -> End("reply")
+         [] e = "other" -> step' = "finishing" /\ UNCHANGED <<accepted, answer>>
+         [] e = "unlinked" -> End("unlinked")
+    /\ UNCHANGED <<size, remote, offset, resent, restarted>>
+
 \* RESTART-SENSE allows one restart.
 Restart(e) ==
     /\ step = "restarting"
@@ -121,12 +151,13 @@ Next ==
     \/ \E e \in {"more", "whole"} : Checkpoint(e)
     \/ \E e \in {"committed", "untrusted", "unsure", "gone", "failed"} : Finish(e)
     \/ \E e \in {"same", "elsewhere", "wait", "other", "unlinked"} : Confirm(e)
+    \/ \E e \in {"same", "elsewhere", "wait", "other", "unlinked"} : Confirming(e)
     \/ \E e \in {"once", "twice"} : Restart(e)
 
 Spec == Init /\ [][Next]_vars /\ WF_vars(Next)
 
 TypeOK ==
-    /\ step \in {"single", "starting", "appending", "checkpointing", "finishing", "verifying", "restarting", "ended"}
+    /\ step \in {"single", "starting", "appending", "checkpointing", "finishing", "verifying", "confirming", "restarting", "ended"}
     /\ size \in 1..2
     /\ remote \in {"before", "after"}
     /\ offset \in 0..2

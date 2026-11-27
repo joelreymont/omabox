@@ -2600,14 +2600,18 @@ public
 
 -100006 s" the upload's stage could not be read whole" ERROR:CODE E-STAGE
 
-\ fd is the verified stage, read from 0; content-hash its Dropbox
-\ content hash; rev empty to add only while the path is absent.
+\ fd is the verified stage; content-hash its Dropbox content hash; rev
+\ empty to add only while the path is absent. session is a recorded
+\ session's id, empty for none, and confirmed the bytes of the stage it
+\ confirmed, at most size.
 STRUCTURE upload DERIVE addr
    FIELD fd fd
    FIELD size n
    FIELD content-hash SPAN:span<u8>
    FIELD path SPAN:span<u8>
    FIELD rev SPAN:span<u8>
+   FIELD session SPAN:span<u8>
+   FIELD confirmed n
 ;STRUCTURE
 
 private
@@ -2987,8 +2991,8 @@ HEAP RUNS run
 \ ---- the machine
 
 ENUM upload-step DERIVE eq
-   single starting appending checkpointing finishing verifying restarting
-   ended ;ENUM
+   single starting appending checkpointing finishing verifying confirming
+   restarting ended ;ENUM
 ENUM send-event committed untrusted unsure failed ;ENUM
 ENUM start-event opened unsure failed ;ENUM
 ENUM append-event stored unsure cut gone failed ;ENUM
@@ -3138,7 +3142,9 @@ ENUM restart-event once twice ;ENUM
 \ at checkpointing, where DRIVE hands the caller's checkpoint the
 \ session's id and the bytes it confirmed. A finish whose session is
 \ gone may have been committed: verifying starts over unless get_metadata
-\ shows the upload's complete entry at its path.
+\ shows the upload's complete entry at its path. A recorded session that
+\ holds the whole stage may have been finished by a lost call: confirming
+\ ends done when get_metadata shows that entry, and finishes otherwise.
 FSM:DEFINE SESSION ( ^run ) upload-step send-event
    IN single  SEND-SENSE
       committed  ANSWER-DONE        >ended
@@ -3170,6 +3176,12 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
       wait       ANSWER-REPLY     >ended
       other      -                >restarting
       unlinked   ANSWER-UNLINKED  >ended
+   IN confirming  CONFIRM-SENSE ( confirm-event )
+      same       ANSWER-DONE      >ended
+      elsewhere  ANSWER-MISMATCH  >ended
+      wait       ANSWER-REPLY     >ended
+      other      -                >finishing
+      unlinked   ANSWER-UNLINKED  >ended
    IN restarting  RESTART-SENSE ( restart-event )
       once   REWIND             >starting
       twice  ANSWER-UNVERIFIED  >ended
@@ -3194,9 +3206,32 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
    r RUNS-RELEASE ;
 
 
+\ The recorded session's id; one empty or over ID-CAP names no session.
+: RECORD$ ( ^run -- str ) RUN-UP @ DROPBOX-UPLOAD:SESSION @ SPAN:$ ;
+: RECORDED? ( ^run -- bool )
+   RECORD$ STR:len {: u:n :}
+   u 0<> u ID-CAP <= and ;
+
+
+\ The run takes over the recorded session at the bytes it confirmed.
+: RESUME ( ^run -- )
+   {: r :}
+   r RECORD$ str> {: a:^ u:n :}
+   a r RUN-ID CELLS64>BYTES u BYTE-COPY
+   u r RUN-ID-U !
+   r RUN-UP @ DROPBOX-UPLOAD:CONFIRMED @ r RUN-ACCEPTED ! ;
+
+
+\ A stage of one chunk goes single; a larger one resumes its recorded
+\ session, appending the rest or confirming a whole one, else starts.
 : FIRST ( ^run -- upload-step )
-   SIZE CHUNK-SIZE > if construct upload-step starting exit then
-   construct upload-step single ;
+   {: r :}
+   r SIZE CHUNK-SIZE <= if construct upload-step single exit then
+   r RECORDED? 0= if construct upload-step starting exit then
+   r RESUME
+   r RUN-ACCEPTED @ r SIZE <
+   if construct upload-step appending exit then
+   construct upload-step confirming ;
 
 
 : SHOW ( ^run [ n -- ] -- )
@@ -3228,12 +3263,14 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
 
 public
 
-\ files/upload of the stage, or an upload session for one over 32 MiB.
-\ progress is called with the bytes Dropbox has accepted each time that
-\ count changes. checkpoint is called once per append Dropbox accepts,
-\ before the next call, with the session's id, valid until it returns,
-\ and the bytes the session has confirmed; a single files/upload never
-\ calls it. On done, ENTRY holds the entry Dropbox committed.
+\ files/upload of the stage, or an upload session for one over 32 MiB,
+\ the upload's recorded one resumed. progress is called with the bytes
+\ Dropbox has accepted, a resumed count starting at the confirmed ones,
+\ each time that count changes. checkpoint is called once per append
+\ Dropbox accepts, before the next call, with the session's id, valid
+\ until it returns, and the bytes the session has confirmed; a single
+\ files/upload never calls it. On done, ENTRY holds the entry Dropbox
+\ committed.
 : UPLOAD ( ^upload ^client [ n -- ] [ str n -- ] -- reply )
    {: up c progress checkpoint :}
    RUNS-NEW {: r :}

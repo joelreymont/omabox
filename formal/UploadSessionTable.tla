@@ -26,6 +26,11 @@ Lines == {
     <<"verifying", "wait", "ended">>,
     <<"verifying", "other", "restarting">>,
     <<"verifying", "unlinked", "ended">>,
+    <<"confirming", "same", "ended">>,
+    <<"confirming", "elsewhere", "ended">>,
+    <<"confirming", "wait", "ended">>,
+    <<"confirming", "other", "finishing">>,
+    <<"confirming", "unlinked", "ended">>,
     <<"restarting", "once", "starting">>,
     <<"restarting", "twice", "ended">>
 }

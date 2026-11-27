@@ -2369,7 +2369,9 @@ TYPED-VARIABLE FAULT fault
    b str> HASHED str> EXPECTED swap BYTE-COPY
    EXPECTED 64 SPAN:MAKE UP DROPBOX-UPLOAD:CONTENT-HASH !
    p str> SPAN:MAKE UP DROPBOX-UPLOAD:PATH !
-   r str> SPAN:MAKE UP DROPBOX-UPLOAD:REV ! ;
+   r str> SPAN:MAKE UP DROPBOX-UPLOAD:REV !
+   s" " str> SPAN:MAKE UP DROPBOX-UPLOAD:SESSION !
+   0 UP DROPBOX-UPLOAD:CONFIRMED ! ;
 
 
 : UNSTAGED ( -- ) UP DROPBOX-UPLOAD:FD @ FD>N close ;
@@ -2960,6 +2962,215 @@ TYPED-VARIABLE FAULT fault
    TEST-DROPBOX:SEEN$ SB$ T$= ;
 
 
+\ ---- resuming a recorded session
+
+: S-METADATA ( -- ) s"  /2/files/get_metadata" SB-APPEND ;
+
+
+\ UPLOAD's reply with UP resuming the session the string names at n
+\ confirmed bytes, on the fake's sessions as the last upload left them;
+\ UP then holds no record again.
+: RESUMED ( str n -- DROPBOX:reply )
+   {: sid:str n:n :}
+   sid str> SPAN:MAKE UP DROPBOX-UPLOAD:SESSION !
+   n UP DROPBOX-UPLOAD:CONFIRMED !
+   -1 FAULT-AT !
+   SEND
+   s" " str> SPAN:MAKE UP DROPBOX-UPLOAD:SESSION !
+   0 UP DROPBOX-UPLOAD:CONFIRMED ! ;
+
+
+\ The checkpoints of the last upload: their count, then the last's
+\ session and bytes.
+: CHECKPOINTS ( n str n -- )
+   {: k:n sid:str n:n :}
+   CHECKS @ k T= CHECKED-ID$ sid T$= CHECKED @ n T= ;
+
+
+\ Two appends and a finish whose answer is cut before Dropbox runs it:
+\ fake-session-0 holds the whole stage, uncommitted.
+: FINISH-CUT ( -- )
+   CHUNK 1+ construct fault cut 1 STRUCK UNVERIFIED? ASSERT
+   2 s" fake-session-0" CHUNK 1+ CHECKPOINTS ;
+
+
+\ One append, then the second's answer lost twice: resumed at CHUNK, the
+\ rest goes in one append and a finish, with no start.
+: RESUMED-APPEND-CASE ( -- )
+   s" resumed after one append" T-LABEL
+   CHUNK construct fault cut-twice 1 STRUCK UNVERIFIED? ASSERT
+   1 s" fake-session-0" CHUNK CHECKPOINTS
+   s" fake-session-0" CHUNK RESUMED DROPBOX:DONE? ASSERT
+   ENTRY-HASH$ EXPECTED$ T$=
+   SHOWS @ 1 T= SHOWN @ CHUNK 1+ T=
+   1 s" fake-session-0" CHUNK 1+ CHECKPOINTS
+   SB-RESET S-START S-APPEND S-APPEND S-APPEND S-APPEND S-FINISH
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
+
+
+\ Two appends, then a finish Dropbox committed whose answer was lost:
+\ resumed with the whole stage confirmed, get_metadata finds the upload
+\ and no finish is sent.
+: RESUMED-COMMITTED-CASE ( -- )
+   s" resumed after a lost finish" T-LABEL
+   CHUNK 1+ construct fault lose 1 STRUCK UNVERIFIED? ASSERT
+   2 s" fake-session-0" CHUNK 1+ CHECKPOINTS
+   s" fake-session-0" CHUNK 1+ RESUMED DROPBOX:DONE? ASSERT
+   ENTRY-HASH$ EXPECTED$ T$=
+   SHOWS @ 1 T= SHOWN @ CHUNK 1+ T= CHECKS @ 0 T=
+   SB-RESET S-START S-APPEND S-APPEND S-FINISH S-METADATA
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
+
+
+\ Resumed with the whole stage confirmed, Dropbox not holding the upload:
+\ get_metadata, then the finish.
+: RESUMED-UNCOMMITTED-CASE ( -- )
+   s" resumed whole, not committed" T-LABEL
+   FINISH-CUT
+   s" fake-session-0" CHUNK 1+ RESUMED DROPBOX:DONE? ASSERT
+   ENTRY-HASH$ EXPECTED$ T$=
+   CHECKS @ 0 T=
+   SB-RESET S-START S-APPEND S-APPEND S-FINISH S-METADATA S-FINISH
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
+
+
+\ Resumed whole, get_metadata asking to wait: its retry, with no finish.
+: RESUMED-BUSY-CASE ( -- )
+   s" resumed whole, confirmation busy" T-LABEL
+   FINISH-CUT BUSY!
+   s" fake-session-0" CHUNK 1+ RESUMED RETRY-MS 3000 T=
+   SB-RESET S-START S-APPEND S-APPEND S-FINISH S-METADATA
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
+
+
+: SEND-RESUMED-UNLINKED ( -- )
+   s" fake-session-0" CHUNK 1+ RESUMED UNLINKED? OUTCOME ! ;
+
+
+\ Resumed whole, get_metadata refused 403: unlinked, with no finish.
+: RESUMED-DENIED-CASE ( -- )
+   s" resumed whole, confirmation denied" T-LABEL
+   FINISH-CUT TEST-DROPBOX:DENY
+   false OUTCOME !
+   [: SEND-RESUMED-UNLINKED ;] LOGGED 0 T=
+   OUTCOME @ TTRUE
+   s" error dropbox: files/get_metadata unlinked: 403" LOGGED? TTRUE
+   SB-RESET S-START S-APPEND S-APPEND S-FINISH S-METADATA
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
+
+
+\ The next get_metadata answers the upload's file at /b.txt; unlike a
+\ finish's answer, it carries its .tag.
+: METADATA-ELSEWHERE! ( -- )
+   SB-RESET
+   S\" {\q.tag\q:\qfile\q,\qname\q:\qb.txt\q,\qid\q:\qid:b\q,\qpath_lower\q:\q/b.txt\q,\qpath_display\q:\q/b.txt\q,\qrev\q:\q0170b\q,\qsize\q:"
+   SB-APPEND CHUNK 1+ FMT:INT$ SB-APPEND
+   S\" ,\qcontent_hash\q:\q" SB-APPEND EXPECTED$ SB-APPEND
+   S\" \q,\qis_downloadable\q:true}" SB-APPEND
+   s" /2/files/get_metadata" 200 s" " s" " SB$ TEST-DROPBOX:ROUTE-SCRIPT! ;
+
+
+\ Resumed whole, get_metadata showing the upload's file at /b.txt: a
+\ path mismatch, with no finish.
+: RESUMED-ELSEWHERE-CASE ( -- )
+   s" resumed whole, confirmed elsewhere" T-LABEL
+   FINISH-CUT METADATA-ELSEWHERE!
+   s" fake-session-0" CHUNK 1+ RESUMED
+   DROPBOX-ERROR:PATH-MISMATCH REFUSED? ASSERT
+   SB-RESET S-START S-APPEND S-APPEND S-FINISH S-METADATA
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
+
+
+\ A record one chunk behind Dropbox, its last checkpoint lost: the
+\ append's incorrect_offset at the chunk's end is taken as stored.
+: RESUMED-BEHIND-CASE ( -- )
+   s" resumed one chunk behind" T-LABEL
+   FINISH-CUT
+   s" fake-session-0" CHUNK RESUMED DROPBOX:DONE? ASSERT
+   ENTRY-HASH$ EXPECTED$ T$=
+   1 s" fake-session-0" CHUNK 1+ CHECKPOINTS
+   SB-RESET S-START S-APPEND S-APPEND S-FINISH S-APPEND S-FINISH
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
+
+
+\ A record below Dropbox's offset, short of the chunk's end: the session
+\ is gone and a new one carries the upload.
+: RESUMED-BELOW-CASE ( -- )
+   s" resumed below Dropbox's offset" T-LABEL
+   FINISH-CUT
+   s" fake-session-0" 0 RESUMED DROPBOX:DONE? ASSERT
+   ENTRY-HASH$ EXPECTED$ T$=
+   2 s" fake-session-1" CHUNK 1+ CHECKPOINTS
+   SB-RESET S-START S-APPEND S-APPEND S-FINISH
+   S-APPEND S-RESTART S-APPEND S-APPEND S-FINISH
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
+
+
+: APPEND-UNAVAILABLE! ( -- )
+   s" /2/files/upload_session/append_v2" 503 s" " s" " s" "
+   TEST-DROPBOX:ROUTE-SCRIPT! ;
+
+
+\ A record above Dropbox's offset: fake-session-0 holds nothing, its
+\ first append answered 503 twice, and the record says CHUNK. The
+\ session is gone and a new one carries the upload.
+: RESUMED-ABOVE-CASE ( -- )
+   s" resumed above Dropbox's offset" T-LABEL
+   TEST-DROPBOX:RESET -1 FAULT-AT !
+   APPEND-UNAVAILABLE! APPEND-UNAVAILABLE!
+   SEND UNVERIFIED? ASSERT CHECKS @ 0 T=
+   s" fake-session-0" CHUNK RESUMED DROPBOX:DONE? ASSERT
+   ENTRY-HASH$ EXPECTED$ T$=
+   2 s" fake-session-1" CHUNK 1+ CHECKPOINTS
+   SB-RESET S-START S-APPEND S-APPEND
+   S-APPEND S-RESTART S-APPEND S-APPEND S-FINISH
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
+
+
+\ A session Dropbox never opened: gone, and a new one carries the upload.
+: RESUMED-UNKNOWN-CASE ( -- )
+   s" resumed an unknown session" T-LABEL
+   TEST-DROPBOX:RESET
+   s" fake-session-5" CHUNK RESUMED DROPBOX:DONE? ASSERT
+   ENTRY-HASH$ EXPECTED$ T$=
+   2 s" fake-session-0" CHUNK 1+ CHECKPOINTS
+   SB-RESET s" /2/files/upload_session/append_v2" SB-APPEND
+   S-RESTART S-APPEND S-APPEND S-FINISH
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
+
+
+\ An empty id names no session, whatever bytes it says it confirmed: the
+\ upload starts one and appends from 0.
+: UNRECORDED-CASE ( -- )
+   s" no recorded session" T-LABEL
+   TEST-DROPBOX:RESET
+   s" " CHUNK RESUMED DROPBOX:DONE? ASSERT
+   ENTRY-HASH$ EXPECTED$ T$=
+   2 s" fake-session-0" CHUNK 1+ CHECKPOINTS
+   SB-RESET S-START S-APPEND S-APPEND S-FINISH
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
+
+
+\ An id of 513 bytes, one over the run's 512-byte room, names no session:
+\ the upload starts one and appends from 0.
+: OVERSIZED-ID-CASE ( -- )
+   s" recorded id over the cap" T-LABEL
+   TEST-DROPBOX:RESET
+   SB-RESET 513 0 ?do s" x" SB-APPEND loop
+   SB$ CHUNK RESUMED DROPBOX:DONE? ASSERT
+   ENTRY-HASH$ EXPECTED$ T$=
+   2 s" fake-session-0" CHUNK 1+ CHECKPOINTS
+   SB-RESET S-START S-APPEND S-APPEND S-FINISH
+   TEST-DROPBOX:SEEN$ SB$ T$= ;
+
+
+: RESUMED-CASES ( -- )
+   RESUMED-APPEND-CASE RESUMED-COMMITTED-CASE RESUMED-UNCOMMITTED-CASE
+   RESUMED-BUSY-CASE RESUMED-DENIED-CASE RESUMED-ELSEWHERE-CASE
+   RESUMED-BEHIND-CASE RESUMED-BELOW-CASE RESUMED-ABOVE-CASE
+   RESUMED-UNKNOWN-CASE UNRECORDED-CASE OVERSIZED-ID-CASE ;
+
+
 : UPLOAD-CASES ( -- )
    HASH-CASE SINGLE-CASES
    BIG-STAGED
@@ -2969,7 +3180,7 @@ TYPED-VARIABLE FAULT fault
    CUT-APPEND-CASE CLOSED-TWICE-CASE
    MISMATCH-CASE FINISH-ELSEWHERE-CASE GARBLED-FINISH-CASE BUSY-FINISH-CASE
    UNAVAILABLE-START-CASE UNAVAILABLE-APPEND-CASE UNAVAILABLE-FINISH-CASE
-   WAITED-APPEND-CASE
+   WAITED-APPEND-CASE RESUMED-CASES
    ENDED-EARLY-CASE
    UNSTAGED ;
 

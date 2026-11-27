@@ -1340,6 +1340,32 @@ private
    then
    v s DESIRED EXPECTATION-REPLACE-FILE ;
 
+: RECORD ( ^sending -- option<JOURNAL:upload-session> )
+   {: s :}
+   s SENDING-JOURNAL @ s SENDING-OPERATION @ s SENDING-ARENA @
+   JOURNAL:UPLOAD-SESSION ;
+
+\ The upload takes the record's session at its confirmed bytes when the
+\ record is of the stage's bytes: its length and its content.
+: TAKEN ( JOURNAL:upload-session ^DROPBOX:upload ^sending -- )
+   {: up s :}
+   JOURNAL-UPLOAD--SESSION:UNMAKE {: sid:str at u h:DROPBOX:hash :}
+   u s SENDING-SIZE @ <> if exit then
+   h s DESIRED DROPBOX:HASH= 0= if exit then
+   sid str> SPAN:MAKE up DROPBOX-UPLOAD:SESSION !
+   at up DROPBOX-UPLOAD:CONFIRMED ! ;
+
+\ An upload without a session starts one, whose first checkpoint
+\ replaces the operation's record.
+: RECORDED ( ^DROPBOX:upload ^sending -- )
+   {: up s :}
+   s" " str> SPAN:MAKE up DROPBOX-UPLOAD:SESSION !
+   0 up DROPBOX-UPLOAD:CONFIRMED !
+   s RECORD MATCH option
+      none OF ENDOF
+      some OF up s TAKEN ENDOF
+   ;MATCH ;
+
 : UPLOAD-OF ( ^sending -- ^DROPBOX:upload )
    {: s :}
    s SENDING-ARENA @ UPLOADS-NEW {: up :}
@@ -1350,6 +1376,7 @@ private
    s SENDING-TARGET @ str> SPAN:MAKE up DROPBOX-UPLOAD:PATH !
    s SENDING-REV @ DROPBOX:REV>STR str> SPAN:MAKE
    up DROPBOX-UPLOAD:REV !
+   up s RECORDED
    up ;
 
 \ UPLOAD's checkpoint: the session named by the string confirmed n
@@ -1403,9 +1430,10 @@ private
    up s SENDING-STAGE ! rev s SENDING-REV ! ar s SENDING-ARENA !
    s ;
 
-\ Rust's create_file, or replace_file of the rev unless it is empty; each
-\ append Dropbox accepts is checkpointed as the operation's upload
-\ session in the journal.
+\ Rust's create_file, or replace_file of the rev unless it is empty; the
+\ operation's upload session recorded in the journal for the stage's
+\ bytes is resumed, and each append Dropbox accepts is checkpointed as
+\ that session.
 : REMOTE-UPLOAD
    ( JOURNAL:journal JOURNAL:operation-id ^link MODEL:path
      ^LOCAL:staged-upload DROPBOX:rev ^ARENA:arena -- mutation-outcome )

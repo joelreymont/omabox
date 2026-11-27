@@ -177,7 +177,10 @@ answer does not say so, a session may be gone at any call, and get_metadata may
 not show an upload Dropbox holds. The upload answers done only while Dropbox
 holds its complete entry at its path, counts as accepted, and checkpoints at
 each accepted append, only chunks its session holds, and, resending a chunk
-once and restarting once, ends.
+once and restarting once, ends. A run may also resume a recorded session:
+appending from its confirmed chunks with Dropbox holding one more when a crash
+lost the last checkpoint, or confirming a whole one that a lost finish may have
+committed.
 
 Run the models from this directory with `tlc`, the TLA+ tools' model
 checker on PATH:

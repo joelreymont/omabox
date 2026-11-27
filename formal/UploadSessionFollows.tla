@@ -11,6 +11,7 @@ Walks(l) ==
       [] l[1] = "checkpointing" -> Checkpoint(l[2])
       [] l[1] = "finishing" -> Finish(l[2])
       [] l[1] = "verifying" -> Confirm(l[2])
+      [] l[1] = "confirming" -> Confirming(l[2])
       [] l[1] = "restarting" -> Restart(l[2])
 Line(l) == step = l[1] /\ step' = l[3]
 Follows ==

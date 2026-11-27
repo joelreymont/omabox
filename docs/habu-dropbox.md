@@ -132,11 +132,13 @@ STRUCTURE entry
 ;STRUCTURE
 
 STRUCTURE upload
-   FIELD fd fd          \ the verified stage, read from 0
+   FIELD fd fd          \ the verified stage
    FIELD size n
    FIELD hash ...       \ its Dropbox content hash
    FIELD path ...
    FIELD rev ...        \ empty: add only if absent
+   FIELD session ...    \ a recorded session's id, empty for none
+   FIELD confirmed n    \ the stage's bytes that session confirmed
 ;STRUCTURE
 
 \ Dropbox's content hash: SHA-256 over the joined SHA-256 digests
@@ -287,6 +289,12 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
       wait       ANSWER-REPLY     >ended      \ get_metadata's retry
       other      -                >restarting
       unlinked   ANSWER-UNLINKED  >ended
+   IN confirming  CONFIRM-SENSE ( confirm-event )
+      same       ANSWER-DONE      >ended      \ a lost finish committed it
+      elsewhere  ANSWER-MISMATCH  >ended
+      wait       ANSWER-REPLY     >ended
+      other      -                >finishing
+      unlinked   ANSWER-UNLINKED  >ended
    IN restarting  RESTART-SENSE ( restart-event )
       once   REWIND             >starting     \ once per UPLOAD
       twice  ANSWER-UNVERIFIED  >ended
@@ -312,8 +320,15 @@ FSM:DEFINE SESSION ( ^run ) upload-step send-event
   instead by the content hash of the entry Dropbox commits. The Rust version
   sends the whole file's hash here, and every upload over 32 MiB fails (a
   hypothesis, consistent with 6 of 6 failures).
-- An upload does not resume across calls. A `retry` starts over on the next
-  pass. REPLAY records each checkpoint in the journal.
+- **A recorded session is resumed.** The caller hands UPLOAD a session's
+  id and the bytes it confirmed, which REPLAY reads from the journal's
+  record of its checkpoints. `FIRST` then skips the start: it appends from
+  the confirmed bytes, or, all of them confirmed, goes to **`confirming`**,
+  which asks `get_metadata` before finishing, since a finish whose answer
+  was lost may have committed the upload. Dropbox one chunk ahead of the
+  record, a checkpoint lost to a crash, answers `stored`; any other offset,
+  or a session Dropbox no longer holds, is `gone`, and the upload starts
+  over once with a new session.
 
 ## Kept out of it
 
@@ -395,6 +410,11 @@ The tests run against a fake Dropbox on `net/http.f`, in the style of
     complete entry, else restarted, and unverified when gone again; a
     confirmation that must wait answers its `retry`, and one refused 403
     `unlinked`;
+  - a recorded session resumed: after one append, sending only the rest
+    with no start; whole after a lost finish, done with no finish when
+    Dropbox holds it, else finished; one chunk behind Dropbox, stored;
+    below or above Dropbox's offset, or unknown, restarted with a new
+    session; and an empty id, started;
 - **delete and create-folder:** a conflict, refused with no `get_metadata`
   even where the path is already gone or a folder; not found; a lost one,
   one answered 503 with no wait, one answered at another path, a delete

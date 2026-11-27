@@ -1612,6 +1612,90 @@ $2000000 constant CHUNK
    TEST-DROPBOX:SEEN$ SB$ T$=
    j JOURNAL:CLOSE d GONE rt GONE ;
 
+: UPLOAD-BIG
+   ( JOURNAL:journal JOURNAL:operation-id ^REPLAY:link
+     ^LOCAL:staged-upload ^ARENA:arena -- REPLAY:mutation-outcome )
+   {: j id l up ar :}
+   j id l s" big.bin" TEST-CLIENT:DISPLAY up s" " AS-REV ar
+   REPLAY:REMOTE-UPLOAD ;
+
+\ Dropbox refuses the append at CHUNK before it takes effect: the upload
+\ ends with fake-session-0 open at CHUNK.
+: SECOND-APPEND-REFUSED ( -- )
+   SB-RESET S\" \qoffset\q:" SB-APPEND CHUNK FMT:SB-INT
+   s" /2/files/upload_session/append_v2" SB$ 409 s" " s" "
+   S\" {\qerror_summary\q:\qother/\q,\qerror\q:{\q.tag\q:\qother\q}}"
+   TEST-DROPBOX:ARG-SCRIPT! ;
+
+\ A session upload's calls in SB: a start, n appends and a finish.
+: SESSION-CALLS ( n -- )
+   SB-RESET s" /2/files/upload_session/start" SB-APPEND
+   0 ?do s"  /2/files/upload_session/append_v2" SB-APPEND loop
+   s"  /2/files/upload_session/finish" SB-APPEND ;
+
+\ The journal records fake-session-0 open at CHUNK: the next upload
+\ resumes it with one append and a finish, no start, and checkpoints
+\ the whole stage.
+: A-RECORDED-SESSION-IS-RESUMED ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   s" a recorded upload session is resumed" T-LABEL
+   TEST-DROPBOX:RESET
+   ar RUNTIME-STATUS {: rt:str st :}
+   st l REPLAY-LINK:STATUS !
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r s ar BIG-STAGED {: up :}
+   d s" big.bin" up ar UPLOAD-JOURNAL {: j id :}
+   d s" journal.sqlite3" ar TEST-CLIENT:INSIDE {: p:str :}
+   p CHECKPOINTS-LOGGED
+   SECOND-APPEND-REFUSED
+   j id l up ar UPLOAD-BIG s" rejected" s" rejected-by-dropbox" GIVES
+   j id l up ar UPLOAD-BIG APPLIED-FILE MODEL-REMOTE:UNMAKE {: c v :}
+   c DROPBOX:HASH>STR up LOCAL:UPLOAD-CONTENT DROPBOX:HASH>STR T$=
+   SB-RESET CHUNK CHECKPOINT+ s"  " SB-APPEND CHUNK 1+ CHECKPOINT+
+   p CHECKPOINTS-ARE TTRUE
+   j id ar JOURNAL:UPLOAD-SESSION up SESSION-HELD? TTRUE
+   3 SESSION-CALLS TEST-DROPBOX:SEEN$ SB$ T$=
+   j JOURNAL:CLOSE d GONE rt GONE ;
+
+\ The journal records a session of other bytes: the upload starts its
+\ own, whose checkpoints replace the record.
+: A-RECORD-OF-OTHER-BYTES-IS-REPLACED ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   s" a record of other bytes is replaced" T-LABEL
+   TEST-DROPBOX:RESET
+   ar RUNTIME-STATUS {: rt:str st :}
+   st l REPLAY-LINK:STATUS !
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r s ar BIG-STAGED {: up :}
+   d s" big.bin" up ar UPLOAD-JOURNAL {: j id :}
+   j id s" stale-session" CHUNK CHUNK 1+
+   s" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+   AS-HASH JOURNAL:CHECKPOINT-UPLOAD
+   j id l up ar UPLOAD-BIG APPLIED-FILE MODEL-REMOTE:UNMAKE {: c v :}
+   c DROPBOX:HASH>STR up LOCAL:UPLOAD-CONTENT DROPBOX:HASH>STR T$=
+   j id ar JOURNAL:UPLOAD-SESSION up SESSION-HELD? TTRUE
+   2 SESSION-CALLS TEST-DROPBOX:SEEN$ SB$ T$=
+   j JOURNAL:CLOSE d GONE rt GONE ;
+
+\ The journal records a session of the stage's content hash at another
+\ length: the upload starts its own, whose checkpoints replace the record.
+: A-RECORD-OF-OTHER-LENGTH-IS-REPLACED ( ^REPLAY:link ^ARENA:arena -- )
+   {: l ar :}
+   s" a record of another length is replaced" T-LABEL
+   TEST-DROPBOX:RESET
+   ar RUNTIME-STATUS {: rt:str st :}
+   st l REPLAY-LINK:STATUS !
+   ar CONFLICT-DIRS {: d:str r:str s:str :}
+   r s ar BIG-STAGED {: up :}
+   d s" big.bin" up ar UPLOAD-JOURNAL {: j id :}
+   j id s" stale-session" CHUNK CHUNK 2 + up LOCAL:UPLOAD-CONTENT
+   JOURNAL:CHECKPOINT-UPLOAD
+   j id l up ar UPLOAD-BIG APPLIED-FILE MODEL-REMOTE:UNMAKE {: c v :}
+   c DROPBOX:HASH>STR up LOCAL:UPLOAD-CONTENT DROPBOX:HASH>STR T$=
+   j id ar JOURNAL:UPLOAD-SESSION up SESSION-HELD? TTRUE
+   2 SESSION-CALLS TEST-DROPBOX:SEEN$ SB$ T$=
+   j JOURNAL:CLOSE d GONE rt GONE ;
+
 : A-FILE-DELETE-WITHOUT-A-REV-IS-REFUSED ( ^REPLAY:link ^ARENA:arena -- )
    {: l ar :}
    s" a file delete without a revision is refused" T-LABEL
@@ -1652,6 +1736,9 @@ $2000000 constant CHUNK
    l ar AN-INCOMPLETE-UPLOAD-ANSWER-IS-READ-BACK
    l ar VERIFICATION-WITHOUT-A-LOWERCASE-PATH-IS-INVALID-METADATA
    l ar A-SESSION-UPLOAD-CHECKPOINTS-EACH-APPEND
+   l ar A-RECORDED-SESSION-IS-RESUMED
+   l ar A-RECORD-OF-OTHER-BYTES-IS-REPLACED
+   l ar A-RECORD-OF-OTHER-LENGTH-IS-REPLACED
    l ar A-FILE-DELETE-WITHOUT-A-REV-IS-REFUSED
    l ar A-GONE-FILE-IS-READ-BACK ;
 
