@@ -248,10 +248,10 @@
 \ - NEW-CONFLICT-WAITS-OUT-ITS-TAKEN-COPY-NAME: a new divergent
 \   conflict whose local copy name an unreadable file holds records one
 \   block, why and a retry time an hour after its pass; the next pass,
-\   the name free and the edit's hash kept, reads and writes
-\   less than the 1 MiB local edit, as /proc/self/io counts, places
-\   nothing and keeps the block; once it is due, both copies are placed
-\   and recorded and the block goes. Root skips it.
+\   the name free and the edit's hash kept, reads none of the edit and
+\   writes nothing in the root, as inotify sees, places nothing and
+\   keeps the block; once it is due, both copies are placed and
+\   recorded and the block goes. Root skips it.
 \ - A-PATH-NO-LONGER-CONFLICTING-LOSES-ITS-BLOCK: its local edit made
 \   Dropbox's, the path's block goes, the occupant kept. Root skips it.
 \ - A-PATH-HELD-OTHERWISE-LOSES-ITS-BLOCK: a blocked path made unknown,
@@ -364,6 +364,7 @@ require src/lib/fd.f
 require src/lib/vector.f
 require src/lib/adt/option.f
 require src/lib/fs-anchored.f
+require src/lib/inotify.f
 require src/lib/fs-list.f
 require src/lib/span.f
 require src/lib/xattr.f
@@ -5637,33 +5638,6 @@ ENUM copy-occupant different-file unreadable-file ;ENUM
 \ ---- a new conflict whose copies cannot be placed -----------------
 
 1048576 constant BIG-SIZE
-512 constant IO-CAP
-IO-CAP BUFFER: IO-BUF
-
-\ The decimal number the bytes start with.
-: DIGITS ( ^u8 n -- n )
-   {: a:^ u:n :}
-   0 u 0 ?do
-      a i + c@ dup 48 < over 57 > or if drop unloop exit then
-      48 - swap 10 * +
-   loop ;
-
-\ The count after name in /proc/self/io, the bytes this process has
-\ read or written through system calls; -1 when it is missing.
-: IO-COUNT ( str -- n )
-   {: name:str :}
-   s" /proc/self/io" IO-BUF IO-CAP FS:READ-ALL {: u:n :}
-   name str> {: na:^ nu:n :}
-   u nu - 0 ?do
-      IO-BUF i + nu >str name STR:= if
-         IO-BUF i + nu + u i - nu - DIGITS unloop exit
-      then
-   loop
-   -1 ;
-
-: READ-COUNT ( -- n ) s" rchar: " IO-COUNT ;
-: WRITE-COUNT ( -- n ) s" wchar: " IO-COUNT ;
-
 \ BIG-SIZE bytes, each B.
 : BIG$ ( ^ARENA:arena -- str )
    BIG-SIZE ARENA:ALLOC {: a:^ u:n :}
@@ -5730,16 +5704,38 @@ IO-CAP BUFFER: IO-BUF
    at t1 JOURNAL:BLOCK-RETRY-SECONDS + <= TTRUE
    at ;
 
-\ Before its retry time a pass reads and writes less than the edit's
-\ size, though the copy's name is free; the block stays.
+: WATCHED ( fd fd n -- )
+   INOTIFY:WATCH MATCH option
+      none OF s" test expected an inotify watch" 1 die ENDOF
+      some OF drop ENDOF
+   ;MATCH ;
+
+\ A nonblocking inotify instance watching file for a read and dir for a
+\ file created, written or moved into it.
+: WATCHING ( fd fd -- fd )
+   {: dir:fd file:fd :}
+   INOTIFY:OPEN MATCH option
+      none OF s" test expected an inotify instance" 1 die ENDOF
+      some OF {: ino:fd :}
+         ino dir INOTIFY:IN-CREATE INOTIFY:IN-MODIFY or
+         INOTIFY:IN-MOVED-TO or INOTIFY:IN-CLOSE-WRITE or WATCHED
+         ino file INOTIFY:IN-ACCESS WATCHED
+         ino
+      ENDOF
+   ;MATCH ;
+
+\ Before its retry time a pass, though the copy's name is free, reads
+\ none of the edit and writes nothing in the root; the block stays.
 : WAITS-UNREAD ( ^run str str n -- )
    {: x rec:str lc:str at:n :}
    lc FS:REMOVE-FILE
-   READ-COUNT {: r0:n :}  WRITE-COUNT {: w0:n :}
-   r0 0 >= TTRUE
+   x RUN-ROOT @ FS:OPEN-DIR {: dir:fd :}
+   x s" c-diverged.txt" IN-ROOT FS:OPEN-SIZED nip {: edit:fd ok:bool :}
+   ok TTRUE
+   dir edit WATCHING {: ino:fd :}
    x rec PASSED COMPLETE {: rep :}
-   READ-COUNT r0 - BIG-SIZE < TTRUE
-   WRITE-COUNT w0 - BIG-SIZE < TTRUE
+   ino [: 2drop ;] INOTIFY:EACH 0 T=
+   ino FS:CLOSE-DIR  edit FS:CLOSE-DIR  dir FS:CLOSE-DIR
    rep BLOCKED-IN 1 T=
    rep COPY-CONFLICTS 0 T=
    x ONE-BLOCK at T=
