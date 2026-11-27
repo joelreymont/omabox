@@ -1975,7 +1975,7 @@ variable REC-WRITES
    RUN-MS >MS RUN-ARGV-ENV-CAPTURE-OUTCOME
    PROCESS:ENDING>RC RC>N {: outu:len erru:len rc:n :}
    rc 0 T=
-   OUT outu LEN>N >str S\" omabox 0.2.0\n" T$=
+   OUT outu LEN>N >str S\" omabox 0.2.1\n" T$=
    erru LEN>N 0 T= ;
 
 \ A shell line that sends the signal sig, as kill names it, to the CLI
