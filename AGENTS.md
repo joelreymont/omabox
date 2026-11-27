@@ -47,3 +47,6 @@ rewrite and `JOURNAL.md` records it; the journal is closed, so add no entries.
   replacement.
 - Make no releases: no version tags or packages. Ship by building `omaboxd`
   and `omabox` with the installed Habu and putting them in `~/.local/bin`.
+- Ship each change to the daemon or CLI once it lands, without asking: put
+  the new binaries in `~/.local/bin`, then restart `omabox.service`. Ask
+  before attaching a debugger to the live daemon or signalling it to debug.
