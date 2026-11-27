@@ -85,6 +85,11 @@ overflows or it refuses, and hourly.
 - **One task does the sync.** Downloads and hashing run one at a time, and a
   staged download installs at once. The Rust daemon's four download workers
   and parallel hashing come back only for a measured need.
+- **Memory.** A pass holds no inventory. It walks the known paths a key at a
+  time and keeps only what is not a no-op, records its plans in batches and
+  reads them back a batch at a time. Each path's decision, each download and
+  each listing batch has an arena of its own, reset when it ends, so a pass's
+  memory does not grow with the tree.
 - **Failures.** A path's failure becomes its plan's block at the call that
   meets it; a transport, journal or root failure ends the pass, and so does a
   local write the system denies, once `LOCAL` has logged the directory that
